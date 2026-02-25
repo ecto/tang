@@ -1,0 +1,18 @@
+[package]
+name = "tang-la"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Dynamic linear algebra — DVec, DMat, decompositions"
+
+[features]
+default = ["std"]
+std = ["tang/std"]
+faer = ["dep:faer"]
+
+[dependencies]
+tang = { workspace = true }
+faer = { version = "0.24", optional = true }
+
+[dev-dependencies]
+approx = "0.5"

@@ -1,0 +1,24 @@
+[package]
+name = "tang"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Math library for physical reality — geometry, spatial algebra, autodiff"
+
+[features]
+default = ["std"]
+std = []
+bytemuck = ["dep:bytemuck"]
+serde = ["dep:serde"]
+exact = ["dep:robust", "std"]
+libm = ["dep:libm"]
+
+[dependencies]
+bytemuck = { version = "1.14", features = ["derive"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+robust = { version = "1.1", optional = true }
+libm = { version = "0.2", optional = true }
+paste = "1"
+
+[dev-dependencies]
+approx = "0.5"

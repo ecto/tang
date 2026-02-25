@@ -1,0 +1,13 @@
+[package]
+name = "tang-ad"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reverse-mode automatic differentiation"
+
+[dependencies]
+tang = { workspace = true }
+tang-la = { workspace = true }
+
+[dev-dependencies]
+approx = "0.5"

@@ -1,0 +1,26 @@
+[package]
+name = "tang-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GPU compute via wgpu — SpMV, batch ops, tensor kernels"
+
+[dependencies]
+tang = { workspace = true }
+tang-sparse = { workspace = true }
+bytemuck = { version = "1.14", features = ["derive"] }
+
+[features]
+default = []
+wgpu = ["dep:wgpu", "dep:pollster"]
+
+[dependencies.wgpu]
+version = "24"
+optional = true
+
+[dependencies.pollster]
+version = "0.4"
+optional = true
+
+[dev-dependencies]
+approx = "0.5"

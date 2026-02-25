@@ -1,20 +1,27 @@
-[package]
-name = "tang"
+[workspace]
+resolver = "2"
+members = [
+    "crates/tang",
+    "crates/tang-la",
+    "crates/tang-ad",
+    "crates/tang-sparse",
+    "crates/tang-gpu",
+    "crates/tang-tensor",
+    "crates/tang-optim",
+    "crates/tang-train",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Math library for physical reality — geometry, spatial algebra, autodiff"
 
-[features]
-default = []
-bytemuck = ["dep:bytemuck"]
-serde = ["dep:serde"]
-exact = ["dep:robust"]
-
-[dependencies]
-bytemuck = { version = "1.14", features = ["derive"], optional = true }
-serde = { version = "1", features = ["derive"], optional = true }
-robust = { version = "1.1", optional = true }
-
-[dev-dependencies]
-approx = "0.5"
+[workspace.dependencies]
+tang = { path = "crates/tang" }
+tang-la = { path = "crates/tang-la" }
+tang-ad = { path = "crates/tang-ad" }
+tang-sparse = { path = "crates/tang-sparse" }
+tang-gpu = { path = "crates/tang-gpu" }
+tang-tensor = { path = "crates/tang-tensor" }
+tang-optim = { path = "crates/tang-optim" }
+tang-train = { path = "crates/tang-train" }

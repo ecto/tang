@@ -1,0 +1,16 @@
+[package]
+name = "tang-train"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Computational graph, parameter management, training loop"
+
+[dependencies]
+tang = { workspace = true }
+tang-la = { workspace = true }
+tang-ad = { workspace = true }
+tang-tensor = { workspace = true }
+tang-optim = { workspace = true }
+
+[dev-dependencies]
+approx = "0.5"
