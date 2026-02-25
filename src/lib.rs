@@ -1,4 +1,4 @@
-//! kern-math — Math library for physical reality
+//! tang — Math library for physical reality
 //!
 //! Unified math foundation for geometry kernels, physics engines, and
 //! differentiable simulation. Generic over scalar type to support f32, f64,

@@ -12,7 +12,7 @@ use core::ops::{Add, Sub, Mul, Div, Neg, AddAssign, SubAssign, MulAssign, DivAss
 ///
 /// # Example
 /// ```
-/// use kern_math::{Dual, Vec3, Scalar};
+/// use tang::{Dual, Vec3, Scalar};
 ///
 /// // f(x) = x² at x = 3
 /// let x = Dual::var(3.0_f64);

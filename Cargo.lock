@@ -38,16 +38,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kern-math"
-version = "0.1.0"
-dependencies = [
- "approx",
- "bytemuck",
- "robust",
- "serde",
-]
-
-[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -119,6 +109,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "tang"
+version = "0.1.0"
+dependencies = [
+ "approx",
+ "bytemuck",
+ "robust",
+ "serde",
 ]
 
 [[package]]
