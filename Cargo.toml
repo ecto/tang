@@ -1,0 +1,20 @@
+[package]
+name = "kern-math"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Math library for physical reality — geometry, spatial algebra, autodiff"
+
+[features]
+default = []
+bytemuck = ["dep:bytemuck"]
+serde = ["dep:serde"]
+exact = ["dep:robust"]
+
+[dependencies]
+bytemuck = { version = "1.14", features = ["derive"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+robust = { version = "1.1", optional = true }
+
+[dev-dependencies]
+approx = "0.5"
