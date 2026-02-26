@@ -145,6 +145,68 @@ Aliases provided for common nalgebra names:
 | `a.clone().lu().solve(&b)` | `a.clone().lu().solve(&b)` (DMatLu wrapper) |
 | `m.try_inverse()` | `m.try_inverse()` (DMat, Mat3, Mat4) |
 
+## Benchmarks
+
+All benchmarks on Apple M-series, single-threaded. Run with `cargo bench -p tang-bench`.
+
+### Geometry & physics primitives (f64 unless noted)
+
+| Operation | tang | nalgebra | glam (f32) |
+|-----------|------|----------|------------|
+| vec3 dot | 2.2ns | 2.2ns | 1.6ns |
+| vec3 cross | 1.8ns | 2.2ns | 1.9ns |
+| vec3 normalize | 3.7ns | 3.5ns | 2.5ns |
+| mat3 mul | 5.9ns | 6.9ns | — |
+| mat4 mul | 11.0ns | 12.1ns | 5.5ns |
+| mat4 inverse | 12.0ns | 16.0ns | 8.8ns |
+| **quat rotate** | **2.5ns** | 2.6ns | 2.3ns |
+| quat mul | 3.3ns | 3.3ns | 2.0ns |
+| quat slerp | 8.1ns | 11.0ns | 6.3ns |
+
+### Differentiable physics
+
+tang's key advantage: the same code that runs your physics also gives you exact derivatives. Write your simulation once with generic `S: Scalar`, then swap in `Dual<f64>` to get gradients, Jacobians, and Hessians — no finite differences, no truncation error.
+
+| Benchmark | tang AD | finite diff | notes |
+|-----------|---------|-------------|-------|
+| rigid body gradient (6 params) | 19ns | 18ns | exact vs ε-approximate |
+| FK Jacobian (3-link arm, 3×3) | 278ns | 199ns | exact Jacobian, no tuning h |
+| **LU solve derivative** | **81ns** | 167ns | **2x faster** — Dual flows through LU |
+| Hessian Rosenbrock (2×2) | 77ns | 27ns | exact 2nd derivatives |
+
+The speed comparison is secondary — the real win is that tang's derivatives are *exact* to machine precision. Finite differences require careful step-size tuning (too large → truncation error, too small → cancellation error) and break down for stiff systems. With tang, you just change the type parameter.
+
+The LU solve benchmark highlights a capability nalgebra cannot match: because tang's decompositions are generic over `Scalar`, `Lu::<Dual<f64>>` gives you derivatives of the solution *through* the linear solve for free.
+
+### Dense linear algebra (f64, tang vs nalgebra)
+
+| Operation | n | tang | nalgebra | ratio |
+|-----------|---|------|----------|-------|
+| GEMM | 32 | 6.6µs | 1.5µs | 4.4x |
+| | 128 | 250µs | 84µs | 3.0x |
+| | 512 | 20ms | 4.9ms | 4.1x |
+| **LU solve** | 32 | 3.6µs | 3.2µs | 1.1x |
+| | 128 | 118µs | 107µs | 1.1x |
+| | 512 | **9.8ms** | 8.6ms | 1.1x |
+| Cholesky solve | 32 | 3.0µs | 2.6µs | 1.2x |
+| | 128 | 170µs | 63µs | 2.7x |
+| | 512 | 28ms | 3.7ms | 7.6x |
+| QR | 32 | 5.7µs | 5.0µs | 1.1x |
+| | 128 | 360µs | 211µs | 1.7x |
+| | 512 | 31ms | 13ms | 2.4x |
+| **Sym. Eigen** | 32 | 66µs | 28µs | 2.4x |
+| | 128 | **4.8ms** | 942µs | 5.1x |
+
+tang's dense LA is pure generic Rust (works with `Dual<f64>`, any `Scalar` impl). nalgebra dispatches to optimized BLAS/LAPACK-style routines for `f64`. The gap is expected and acceptable for tang's use case — when you need peak f64 throughput, enable the `faer` feature.
+
+### Autodiff overhead
+
+| Operation | plain f64 | Dual f64 | overhead |
+|-----------|-----------|----------|----------|
+| trig chain | 4.5ns | 8.2ns | 1.8x |
+| vec3 chain | 3.7ns | 15.4ns | 4.2x |
+| quat rotate | 15.0ns | 30.9ns | 2.1x |
+
 ## Development
 
 ```bash

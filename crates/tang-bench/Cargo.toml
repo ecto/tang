@@ -19,6 +19,10 @@ harness = false
 name = "autodiff"
 harness = false
 
+[[bench]]
+name = "differentiable"
+harness = false
+
 [dependencies]
 tang    = { workspace = true, features = ["std"] }
 tang-la = { workspace = true, features = ["std"] }
