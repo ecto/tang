@@ -21,6 +21,12 @@ impl<S: Scalar> Point3<S> {
     #[inline]
     pub fn to_vec(self) -> Vec3<S> { Vec3::new(self.x, self.y, self.z) }
 
+    /// Alias for [`to_vec()`](Self::to_vec) as a field-like accessor (nalgebra compatibility).
+    ///
+    /// nalgebra's `Point3.coords` returns the underlying `Vector3`.
+    #[inline]
+    pub fn coords(self) -> Vec3<S> { self.to_vec() }
+
     #[inline]
     pub fn from_vec(v: Vec3<S>) -> Self { Self::new(v.x, v.y, v.z) }
 
@@ -49,6 +55,11 @@ impl<S: Scalar> Point3<S> {
 
 impl<S: Scalar> Default for Point3<S> {
     fn default() -> Self { Self::origin() }
+}
+
+impl<S: Scalar> From<Vec3<S>> for Point3<S> {
+    #[inline]
+    fn from(v: Vec3<S>) -> Self { Self::from_vec(v) }
 }
 
 // Point - Point = Vec
@@ -85,6 +96,46 @@ impl<S: Scalar> SubAssign<Vec3<S>> for Point3<S> {
     #[inline] fn sub_assign(&mut self, rhs: Vec3<S>) {
         self.x -= rhs.x; self.y -= rhs.y; self.z -= rhs.z;
     }
+}
+
+// nalgebra compatibility: reference-based operators.
+impl<S: Scalar> Sub for &Point3<S> {
+    type Output = Vec3<S>;
+    #[inline] fn sub(self, rhs: &Point3<S>) -> Vec3<S> { *self - *rhs }
+}
+
+impl<S: Scalar> Add<&Vec3<S>> for &Point3<S> {
+    type Output = Point3<S>;
+    #[inline] fn add(self, rhs: &Vec3<S>) -> Point3<S> { *self + *rhs }
+}
+
+impl<S: Scalar> Sub<&Vec3<S>> for &Point3<S> {
+    type Output = Point3<S>;
+    #[inline] fn sub(self, rhs: &Vec3<S>) -> Point3<S> { *self - *rhs }
+}
+
+// Mixed ref/value: &Point3 - Point3
+impl<S: Scalar> Sub<Point3<S>> for &Point3<S> {
+    type Output = Vec3<S>;
+    #[inline] fn sub(self, rhs: Point3<S>) -> Vec3<S> { *self - rhs }
+}
+
+// Mixed ref/value: Point3 - &Point3
+impl<S: Scalar> Sub<&Point3<S>> for Point3<S> {
+    type Output = Vec3<S>;
+    #[inline] fn sub(self, rhs: &Point3<S>) -> Vec3<S> { self - *rhs }
+}
+
+// Mixed ref/value: &Point3 + Vec3
+impl<S: Scalar> Add<Vec3<S>> for &Point3<S> {
+    type Output = Point3<S>;
+    #[inline] fn add(self, rhs: Vec3<S>) -> Point3<S> { *self + rhs }
+}
+
+// Mixed ref/value: &Point3 - Vec3
+impl<S: Scalar> Sub<Vec3<S>> for &Point3<S> {
+    type Output = Point3<S>;
+    #[inline] fn sub(self, rhs: Vec3<S>) -> Point3<S> { *self - rhs }
 }
 
 impl<S: Scalar> core::fmt::Display for Point3<S> {

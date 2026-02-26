@@ -215,6 +215,16 @@ impl<S: Scalar> Mat4<S> {
     }
 }
 
+// nalgebra compatibility: index by (row, col) tuple.
+impl<S: Scalar> core::ops::Index<(usize, usize)> for Mat4<S> {
+    type Output = S;
+    #[inline]
+    fn index(&self, (row, col): (usize, usize)) -> &S {
+        let c = match col { 0 => &self.c0, 1 => &self.c1, 2 => &self.c2, _ => &self.c3 };
+        match row { 0 => &c.x, 1 => &c.y, 2 => &c.z, _ => &c.w }
+    }
+}
+
 impl<S: Scalar> Default for Mat4<S> {
     fn default() -> Self { Self::identity() }
 }

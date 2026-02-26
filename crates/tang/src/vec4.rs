@@ -46,6 +46,12 @@ impl<S: Scalar> Vec4<S> {
     }
 }
 
+// nalgebra compatibility: `v.dot(&w)` works via Into.
+impl<S: Scalar> From<&Vec4<S>> for Vec4<S> {
+    #[inline]
+    fn from(v: &Vec4<S>) -> Self { *v }
+}
+
 impl<S: Scalar> Default for Vec4<S> {
     fn default() -> Self { Self::zero() }
 }

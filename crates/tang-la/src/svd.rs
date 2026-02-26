@@ -166,6 +166,32 @@ impl<S: Scalar> Svd<S> {
         result
     }
 
+    /// Alias for `&self.s` (nalgebra compatibility).
+    ///
+    /// nalgebra uses `svd.singular_values` as a field; tang stores them in `svd.s`.
+    #[inline]
+    pub fn singular_values(&self) -> &DVec<S> { &self.s }
+
+    /// Alias for `Some(&self.vt)` (nalgebra compatibility).
+    ///
+    /// nalgebra uses `svd.v_t` as `Option<DMatrix>`. tang always computes V^T.
+    #[inline]
+    pub fn v_t(&self) -> Option<&DMat<S>> { Some(&self.vt) }
+
+    /// Alias for `Some(&self.u)` (nalgebra compatibility).
+    ///
+    /// nalgebra uses `svd.u` as `Option<DMatrix>`. tang always computes U.
+    #[inline]
+    pub fn u(&self) -> Option<&DMat<S>> { Some(&self.u) }
+
+    /// Solve Ax = b in the least-squares sense via pseudoinverse.
+    ///
+    /// Equivalent to `x = A⁺ * b` where singular values below `tol` are treated as zero.
+    pub fn solve(&self, rhs: &DVec<S>, tol: S) -> Result<DVec<S>, &'static str> {
+        let pinv = self.pseudoinverse(tol);
+        Ok(pinv.mul_vec(rhs))
+    }
+
     /// Reconstruct the original matrix: U * diag(s) * V^T
     pub fn reconstruct(&self) -> DMat<S> {
         let m = self.u.nrows();

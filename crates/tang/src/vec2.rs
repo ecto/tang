@@ -25,16 +25,28 @@ impl<S: Scalar> Vec2<S> {
     #[inline]
     pub fn y() -> Self { Self::new(S::ZERO, S::ONE) }
 
+    /// Alias for [`zero()`](Self::zero) (nalgebra compatibility).
     #[inline]
-    pub fn dot(self, rhs: Self) -> S {
+    pub fn zeros() -> Self { Self::zero() }
+
+    /// Dot product. Accepts both owned and borrowed args (nalgebra compatibility).
+    #[inline]
+    pub fn dot(self, rhs: impl Into<Self>) -> S {
+        let rhs = rhs.into();
         self.x * rhs.x + self.y * rhs.y
     }
 
-    /// 2D cross product (returns scalar = signed area of parallelogram)
+    /// 2D cross product (returns scalar = signed area of parallelogram).
+    /// Accepts both owned and borrowed args (nalgebra compatibility).
     #[inline]
-    pub fn cross(self, rhs: Self) -> S {
+    pub fn cross(self, rhs: impl Into<Self>) -> S {
+        let rhs = rhs.into();
         self.x * rhs.y - self.y * rhs.x
     }
+
+    /// Alias for [`norm_sq()`](Self::norm_sq) (nalgebra compatibility).
+    #[inline]
+    pub fn norm_squared(self) -> S { self.norm_sq() }
 
     #[inline]
     pub fn norm_sq(self) -> S { self.dot(self) }
@@ -66,6 +78,12 @@ impl<S: Scalar> Vec2<S> {
 
 impl<S: Scalar> Default for Vec2<S> {
     fn default() -> Self { Self::zero() }
+}
+
+// nalgebra compatibility: `v.dot(&w)` works via Into.
+impl<S: Scalar> From<&Vec2<S>> for Vec2<S> {
+    #[inline]
+    fn from(v: &Vec2<S>) -> Self { *v }
 }
 
 impl<S: Scalar> Add for Vec2<S> {
@@ -111,6 +129,17 @@ impl<S: Scalar> SubAssign for Vec2<S> {
 
 impl<S: Scalar> MulAssign<S> for Vec2<S> {
     #[inline] fn mul_assign(&mut self, rhs: S) { self.x *= rhs; self.y *= rhs; }
+}
+
+// Scalar * Vec2 (commutative)
+impl Mul<Vec2<f64>> for f64 {
+    type Output = Vec2<f64>;
+    #[inline] fn mul(self, rhs: Vec2<f64>) -> Vec2<f64> { rhs * self }
+}
+
+impl Mul<Vec2<f32>> for f32 {
+    type Output = Vec2<f32>;
+    #[inline] fn mul(self, rhs: Vec2<f32>) -> Vec2<f32> { rhs * self }
 }
 
 #[cfg(test)]

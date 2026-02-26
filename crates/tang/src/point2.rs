@@ -76,6 +76,28 @@ impl<S: Scalar> SubAssign<Vec2<S>> for Point2<S> {
     #[inline] fn sub_assign(&mut self, rhs: Vec2<S>) { self.x -= rhs.x; self.y -= rhs.y; }
 }
 
+// nalgebra compatibility: reference-based operators.
+impl<S: Scalar> Sub for &Point2<S> {
+    type Output = Vec2<S>;
+    #[inline] fn sub(self, rhs: &Point2<S>) -> Vec2<S> { *self - *rhs }
+}
+
+impl<S: Scalar> Add<&Vec2<S>> for &Point2<S> {
+    type Output = Point2<S>;
+    #[inline] fn add(self, rhs: &Vec2<S>) -> Point2<S> { *self + *rhs }
+}
+
+impl<S: Scalar> Sub<&Vec2<S>> for &Point2<S> {
+    type Output = Point2<S>;
+    #[inline] fn sub(self, rhs: &Vec2<S>) -> Point2<S> { *self - *rhs }
+}
+
+// Mixed ref/value: &Point2 - Point2
+impl<S: Scalar> Sub<Point2<S>> for &Point2<S> {
+    type Output = Vec2<S>;
+    #[inline] fn sub(self, rhs: Point2<S>) -> Vec2<S> { *self - rhs }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

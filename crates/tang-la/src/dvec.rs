@@ -30,6 +30,19 @@ impl<S: Scalar> DVec<S> {
         Self { data: s.to_vec() }
     }
 
+    /// Create from an iterator, taking exactly `n` elements.
+    pub fn from_iterator(n: usize, iter: impl IntoIterator<Item = S>) -> Self {
+        let data: Vec<S> = iter.into_iter().take(n).collect();
+        assert_eq!(data.len(), n, "DVec::from_iterator: iterator yielded fewer than {n} elements");
+        Self { data }
+    }
+
+    /// Alias for [`from_slice()`](Self::from_slice) (nalgebra compatibility).
+    ///
+    /// nalgebra's `DVector::from_column_slice(s)` is equivalent to `DVec::from_slice(s)`.
+    #[inline]
+    pub fn from_column_slice(data: &[S]) -> Self { Self::from_slice(data) }
+
     #[inline]
     pub fn len(&self) -> usize { self.data.len() }
 

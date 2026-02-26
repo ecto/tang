@@ -90,6 +90,61 @@ use tang_la::{DVec, DMat, Lu};
 use tang_ad::grad;
 ```
 
+## nalgebra Compatibility
+
+tang provides drop-in compatibility aliases so you can migrate from nalgebra with minimal call-site changes.
+
+### Type mapping
+
+| nalgebra | tang / tang-la |
+|----------|---------------|
+| `Vector2<f64>` | `Vec2<f64>` |
+| `Vector3<f64>` | `Vec3<f64>` |
+| `Vector4<f64>` | `Vec4<f64>` |
+| `Point3<f64>` | `Point3<f64>` |
+| `Unit<Vector3<f64>>` | `Dir3<f64>` |
+| `Matrix3<f64>` | `Mat3<f64>` |
+| `Matrix4<f64>` | `Mat4<f64>` |
+| `UnitQuaternion<f64>` | `Quat<f64>` |
+| `DVector<f64>` | `DVec<f64>` |
+| `DMatrix<f64>` | `DMat<f64>` |
+
+### API compatibility
+
+Both by-value and by-reference calling conventions work:
+
+```rust
+// nalgebra style (by-ref) — works
+v.dot(&w);
+v.cross(&w);
+
+// tang style (by-value) — also works
+v.dot(w);
+v.cross(w);
+```
+
+Aliases provided for common nalgebra names:
+
+| nalgebra | tang equivalent |
+|----------|----------------|
+| `Vec3::zeros()` | `Vec3::zero()` (+ `zeros()` alias) |
+| `v.norm_squared()` | `v.norm_sq()` (+ `norm_squared()` alias) |
+| `Unit::new_normalize(v)` | `Dir3::new(v)` (+ `new_normalize()` alias) |
+| `dir.as_ref()` | `dir.as_ref()` (AsRef + Deref to Vec3) |
+| `Mat3::from_diagonal(&v)` | `Mat3::diagonal(v)` (+ `from_diagonal(&v)` alias) |
+| `m[(i,j)]` | Index for Mat3, Mat4, DMat (+ IndexMut for DMat) |
+| `DMatrix::identity(n, n)` | `DMat::identity(n)` |
+| `DVector::from_column_slice(s)` | `DVec::from_slice(s)` (+ `from_column_slice()` alias) |
+| `DVector::from_iterator(n, it)` | `DVec::from_iterator(n, it)` |
+| `DMatrix::from_iterator(r, c, it)` | `DMat::from_iterator(r, c, it)` |
+| `DMatrix::from_row_slice(r, c, s)` | `DMat::from_row_slice(r, c, s)` |
+| `m.symmetric_eigen()` | `m.symmetric_eigen()` (method on DMat) |
+| `m.svd(true, true)` | `m.svd(true, true)` (method on DMat) |
+| `svd.singular_values` | `svd.s` (+ `.singular_values()` accessor) |
+| `svd.v_t` | `svd.vt` (+ `.v_t()` accessor) |
+| `a.clone().lu().solve(&b)` | `a.clone().lu().solve(&b)` (DMatLu wrapper) |
+| `m.try_inverse()` | `m.try_inverse()` (DMat, Mat3, Mat4) |
+
 ## Development
 
 ```bash

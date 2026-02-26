@@ -1,5 +1,5 @@
 use crate::{Scalar, Vec3};
-use core::ops::{Add, Sub, Mul, Neg};
+use core::ops::{Add, Sub, Mul, Neg, Index};
 
 /// 3x3 matrix, column-major storage.
 ///
@@ -65,6 +65,12 @@ impl<S: Scalar> Mat3<S> {
             S::ZERO, S::ZERO, d.z,
         )
     }
+
+    /// Alias for [`diagonal()`](Self::diagonal) accepting a reference (nalgebra compatibility).
+    ///
+    /// nalgebra's `Matrix3::from_diagonal(&v)` is equivalent to `Mat3::diagonal(v)`.
+    #[inline]
+    pub fn from_diagonal(d: &Vec3<S>) -> Self { Self::diagonal(*d) }
 
     /// Element access (row, col)
     #[inline]
@@ -192,6 +198,19 @@ impl<S: Scalar> Mat3<S> {
     }
 }
 
+// nalgebra compatibility: index by (row, col) tuple.
+impl<S: Scalar> Index<(usize, usize)> for Mat3<S> {
+    type Output = S;
+    #[inline]
+    fn index(&self, (row, col): (usize, usize)) -> &S {
+        match col {
+            0 => match row { 0 => &self.c0.x, 1 => &self.c0.y, _ => &self.c0.z },
+            1 => match row { 0 => &self.c1.x, 1 => &self.c1.y, _ => &self.c1.z },
+            _ => match row { 0 => &self.c2.x, 1 => &self.c2.y, _ => &self.c2.z },
+        }
+    }
+}
+
 impl<S: Scalar> Default for Mat3<S> {
     fn default() -> Self { Self::identity() }
 }
@@ -234,6 +253,12 @@ impl<S: Scalar> Mul<Vec3<S>> for Mat3<S> {
 impl<S: Scalar> Mul for Mat3<S> {
     type Output = Self;
     #[inline] fn mul(self, rhs: Self) -> Self { self.mul_mat(&rhs) }
+}
+
+// nalgebra compatibility: Mat3 * &Vec3
+impl<S: Scalar> Mul<&Vec3<S>> for Mat3<S> {
+    type Output = Vec3<S>;
+    #[inline] fn mul(self, rhs: &Vec3<S>) -> Vec3<S> { self.mul_vec(*rhs) }
 }
 
 #[cfg(test)]

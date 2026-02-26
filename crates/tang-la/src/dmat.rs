@@ -1,6 +1,6 @@
 use tang::Scalar;
 use crate::DVec;
-use core::ops::{Add, Sub, Mul, Neg, Index};
+use core::ops::{Add, Sub, Mul, Neg, Index, IndexMut};
 use alloc::vec::Vec;
 
 /// Heap-allocated column-major matrix.
@@ -39,6 +39,21 @@ impl<S: Scalar> DMat<S> {
     /// Identity matrix.
     pub fn identity(n: usize) -> Self {
         Self::from_fn(n, n, |i, j| if i == j { S::ONE } else { S::ZERO })
+    }
+
+    /// Create from an iterator in column-major order (nalgebra compatibility).
+    ///
+    /// nalgebra's `DMatrix::from_iterator(nrows, ncols, iter)` fills column-major.
+    pub fn from_iterator(nrows: usize, ncols: usize, iter: impl IntoIterator<Item = S>) -> Self {
+        let data: Vec<S> = iter.into_iter().take(nrows * ncols).collect();
+        assert_eq!(data.len(), nrows * ncols, "DMat::from_iterator: iterator yielded fewer than expected");
+        Self::from_raw(nrows, ncols, data)
+    }
+
+    /// Create from row-major data slice.
+    pub fn from_row_slice(nrows: usize, ncols: usize, data: &[S]) -> Self {
+        assert_eq!(data.len(), nrows * ncols, "DMat: data length mismatch");
+        Self::from_fn(nrows, ncols, |i, j| data[i * ncols + j])
     }
 
     /// Diagonal matrix from a vector.
@@ -178,6 +193,62 @@ impl<S: Scalar> DMat<S> {
     pub fn submatrix(&self, row_start: usize, col_start: usize, nrows: usize, ncols: usize) -> Self {
         Self::from_fn(nrows, ncols, |i, j| self.get(row_start + i, col_start + j))
     }
+
+    // -- nalgebra compatibility --
+
+    /// Alias for [`col_vec()`](Self::col_vec) (nalgebra compatibility).
+    ///
+    /// nalgebra uses `.column(j).into_owned()`.
+    pub fn column(&self, j: usize) -> DVec<S> { self.col_vec(j) }
+
+    /// Compute eigendecomposition (nalgebra compatibility).
+    ///
+    /// nalgebra uses `h.symmetric_eigen()`. tang-la equivalent: `SymmetricEigen::new(&h)`.
+    pub fn symmetric_eigen(&self) -> crate::SymmetricEigen<S> {
+        crate::SymmetricEigen::new(self)
+    }
+
+    /// Compute SVD (nalgebra compatibility).
+    ///
+    /// nalgebra uses `m.svd(true, true)`. The bool args are ignored since
+    /// tang-la always computes both U and V.
+    pub fn svd(&self, _compute_u: bool, _compute_v: bool) -> crate::Svd<S> {
+        crate::Svd::new(self)
+    }
+
+    /// Compute the matrix inverse via LU decomposition (nalgebra compatibility).
+    ///
+    /// nalgebra uses `m.try_inverse()`.
+    pub fn try_inverse(&self) -> Option<Self> {
+        assert!(self.is_square(), "DMat::try_inverse: not square");
+        let n = self.nrows;
+        let lu = crate::Lu::new(self)?;
+        let mut inv = DMat::zeros(n, n);
+        for j in 0..n {
+            let mut e = DVec::zeros(n);
+            e[j] = S::ONE;
+            let col = lu.solve(&e);
+            for i in 0..n {
+                inv.set(i, j, col[i]);
+            }
+        }
+        Some(inv)
+    }
+
+    /// Compute LU decomposition and solve (nalgebra compatibility).
+    ///
+    /// nalgebra uses `a.clone().lu().solve(&b)` returning `Option<DVec>`.
+    pub fn lu(self) -> DMatLu<S> { DMatLu(self) }
+}
+
+/// Wrapper for nalgebra-compatible LU chaining: `a.clone().lu().solve(&b)`.
+pub struct DMatLu<S>(DMat<S>);
+
+impl<S: Scalar> DMatLu<S> {
+    /// Solve Ax = b, returning None if singular.
+    pub fn solve(&self, b: &DVec<S>) -> Option<DVec<S>> {
+        crate::Lu::new(&self.0).map(|lu| lu.solve(b))
+    }
 }
 
 impl<S: Scalar> Index<(usize, usize)> for DMat<S> {
@@ -185,6 +256,13 @@ impl<S: Scalar> Index<(usize, usize)> for DMat<S> {
     #[inline]
     fn index(&self, (row, col): (usize, usize)) -> &S {
         &self.data[col * self.nrows + row]
+    }
+}
+
+impl<S: Scalar> IndexMut<(usize, usize)> for DMat<S> {
+    #[inline]
+    fn index_mut(&mut self, (row, col): (usize, usize)) -> &mut S {
+        &mut self.data[col * self.nrows + row]
     }
 }
 

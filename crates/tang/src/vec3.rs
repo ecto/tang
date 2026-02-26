@@ -1,4 +1,5 @@
 use crate::Scalar;
+use core::iter::Sum;
 use core::ops::{Add, Sub, Mul, Div, Neg, AddAssign, SubAssign, MulAssign};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -17,6 +18,10 @@ impl<S: Scalar> Vec3<S> {
     #[inline]
     pub fn zero() -> Self { Self::new(S::ZERO, S::ZERO, S::ZERO) }
 
+    /// Alias for [`zero()`](Self::zero) (nalgebra compatibility).
+    #[inline]
+    pub fn zeros() -> Self { Self::zero() }
+
     #[inline]
     pub fn splat(v: S) -> Self { Self::new(v, v, v) }
 
@@ -29,13 +34,17 @@ impl<S: Scalar> Vec3<S> {
     #[inline]
     pub fn z() -> Self { Self::new(S::ZERO, S::ZERO, S::ONE) }
 
+    /// Dot product. Accepts both owned and borrowed args (nalgebra compatibility).
     #[inline]
-    pub fn dot(self, rhs: Self) -> S {
+    pub fn dot(self, rhs: impl Into<Self>) -> S {
+        let rhs = rhs.into();
         self.x * rhs.x + self.y * rhs.y + self.z * rhs.z
     }
 
+    /// Cross product. Accepts both owned and borrowed args (nalgebra compatibility).
     #[inline]
-    pub fn cross(self, rhs: Self) -> Self {
+    pub fn cross(self, rhs: impl Into<Self>) -> Self {
+        let rhs = rhs.into();
         Self::new(
             self.y * rhs.z - self.z * rhs.y,
             self.z * rhs.x - self.x * rhs.z,
@@ -45,6 +54,10 @@ impl<S: Scalar> Vec3<S> {
 
     #[inline]
     pub fn norm_sq(self) -> S { self.dot(self) }
+
+    /// Alias for [`norm_sq()`](Self::norm_sq) (nalgebra compatibility).
+    #[inline]
+    pub fn norm_squared(self) -> S { self.norm_sq() }
 
     #[inline]
     pub fn norm(self) -> S { self.norm_sq().sqrt() }
@@ -123,6 +136,12 @@ impl<S: Scalar> From<[S; 3]> for Vec3<S> {
     fn from(a: [S; 3]) -> Self { Self::new(a[0], a[1], a[2]) }
 }
 
+// nalgebra compatibility: `v.dot(&w)` and `v.cross(&w)` work via Into.
+impl<S: Scalar> From<&Vec3<S>> for Vec3<S> {
+    #[inline]
+    fn from(v: &Vec3<S>) -> Self { *v }
+}
+
 impl<S: Scalar> From<Vec3<S>> for [S; 3] {
     fn from(v: Vec3<S>) -> Self { [v.x, v.y, v.z] }
 }
@@ -187,6 +206,61 @@ impl Mul<Vec3<f64>> for f64 {
 impl Mul<Vec3<f32>> for f32 {
     type Output = Vec3<f32>;
     #[inline] fn mul(self, rhs: Vec3<f32>) -> Vec3<f32> { rhs * self }
+}
+
+// Scalar * &Vec3 (nalgebra compatibility — used with Dir3::as_ref())
+impl Mul<&Vec3<f64>> for f64 {
+    type Output = Vec3<f64>;
+    #[inline] fn mul(self, rhs: &Vec3<f64>) -> Vec3<f64> { *rhs * self }
+}
+
+impl Mul<&Vec3<f32>> for f32 {
+    type Output = Vec3<f32>;
+    #[inline] fn mul(self, rhs: &Vec3<f32>) -> Vec3<f32> { *rhs * self }
+}
+
+// Reference-based operators for ergonomic mixed-ref arithmetic.
+impl<S: Scalar> Add for &Vec3<S> {
+    type Output = Vec3<S>;
+    #[inline] fn add(self, rhs: &Vec3<S>) -> Vec3<S> { *self + *rhs }
+}
+
+impl<S: Scalar> Sub for &Vec3<S> {
+    type Output = Vec3<S>;
+    #[inline] fn sub(self, rhs: &Vec3<S>) -> Vec3<S> { *self - *rhs }
+}
+
+impl<S: Scalar> Add<Vec3<S>> for &Vec3<S> {
+    type Output = Vec3<S>;
+    #[inline] fn add(self, rhs: Vec3<S>) -> Vec3<S> { *self + rhs }
+}
+
+impl<S: Scalar> Sub<Vec3<S>> for &Vec3<S> {
+    type Output = Vec3<S>;
+    #[inline] fn sub(self, rhs: Vec3<S>) -> Vec3<S> { *self - rhs }
+}
+
+impl<S: Scalar> Add<&Vec3<S>> for Vec3<S> {
+    type Output = Vec3<S>;
+    #[inline] fn add(self, rhs: &Vec3<S>) -> Vec3<S> { self + *rhs }
+}
+
+impl<S: Scalar> Sub<&Vec3<S>> for Vec3<S> {
+    type Output = Vec3<S>;
+    #[inline] fn sub(self, rhs: &Vec3<S>) -> Vec3<S> { self - *rhs }
+}
+
+// Sum for iterators (e.g. normals.iter().copied().sum::<Vec3>())
+impl<S: Scalar> Sum for Vec3<S> {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.fold(Self::zero(), |a, b| a + b)
+    }
+}
+
+impl<'a, S: Scalar> Sum<&'a Vec3<S>> for Vec3<S> {
+    fn sum<I: Iterator<Item = &'a Self>>(iter: I) -> Self {
+        iter.fold(Self::zero(), |a, b| a + *b)
+    }
 }
 
 impl<S: Scalar> core::fmt::Display for Vec3<S> {
