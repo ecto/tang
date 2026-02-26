@@ -1,0 +1,936 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>tang — math for physical reality</title>
+  <meta name="description" content="Scalar-generic Rust math library — exact derivatives, spatial algebra, dense LA, optimizers, and training. no_std, WASM-ready.">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            bg: '#09090b',
+            surface: '#18181b',
+            border: '#27272a',
+            txt: '#fafafa',
+            muted: '#71717a',
+            accent: '#F59E0B',
+          },
+          fontFamily: {
+            sans: ['Inter', 'system-ui', 'sans-serif'],
+            mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'Monaco', 'Consolas', 'monospace'],
+          },
+        },
+      },
+    }
+  </script>
+  <style>
+    body { background: #09090b; color: #fafafa; }
+    ::selection { background: #F59E0B33; color: #F59E0B; }
+
+    /* code highlighting — Monokai palette */
+    .kw { color: #F92672; }      /* keywords */
+    .ty { color: #66D9EF; }      /* types */
+    .str { color: #E6DB74; }     /* strings */
+    .cm { color: #75715E; }      /* comments */
+    .fn { color: #A6E22E; }      /* functions */
+    .num { color: #AE81FF; }     /* numbers */
+    .op { color: #F8F8F2; }      /* operators */
+    .mac { color: #66D9EF; font-style: italic; } /* macros */
+
+    /* stack bars */
+    .stack-bar {
+      transition: all 0.2s ease;
+    }
+    .stack-bar:hover {
+      transform: translateX(4px);
+    }
+    .stack-bar .stack-code {
+      opacity: 0.7;
+    }
+    .stack-bar:hover .stack-code {
+      opacity: 1;
+    }
+
+    /* stack visualizations */
+    .stack-viz {
+      align-items: center;
+      justify-content: center;
+      min-width: 200px;
+      max-width: 240px;
+      opacity: 0.6;
+      transition: opacity 0.2s ease;
+    }
+    .stack-bar:hover .stack-viz {
+      opacity: 1;
+    }
+
+    /* benchmark bars */
+    .bench-bar {
+      height: 6px;
+      border-radius: 3px;
+      background: #F59E0B;
+      transition: width 0.6s ease;
+    }
+
+    /* copy button */
+    .copy-btn:hover { background: #27272a; }
+    .copy-btn:active { transform: scale(0.95); }
+
+    /* card hover */
+    .use-card {
+      transition: border-color 0.2s ease, transform 0.2s ease;
+    }
+    .use-card:hover {
+      border-color: #F59E0B44;
+      transform: translateY(-2px);
+    }
+  </style>
+</head>
+<body class="font-sans antialiased">
+
+  <!-- ═══════════════════════════════════════════════ -->
+  <!-- // hero                                        -->
+  <!-- ═══════════════════════════════════════════════ -->
+  <section class="min-h-[90vh] flex flex-col justify-center px-6">
+    <div class="max-w-5xl mx-auto w-full">
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-12 items-center mb-12">
+        <!-- Left: text -->
+        <div>
+          <h1 class="text-6xl sm:text-8xl font-bold tracking-tight mb-4">
+            tang<span class="text-accent">.</span>
+          </h1>
+          <p class="text-xl sm:text-2xl text-muted mb-10">math for physical reality.</p>
+
+          <div class="flex flex-wrap gap-4">
+            <button onclick="navigator.clipboard.writeText('cargo add tang')" class="copy-btn flex items-center gap-2 bg-surface border border-border rounded-lg px-5 py-3 font-mono text-sm hover:border-accent/40 transition-colors">
+              <span class="text-muted">$</span>
+              <span>cargo add tang</span>
+              <svg class="w-4 h-4 text-muted ml-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
+            </button>
+            <a href="https://github.com/ecto/tang" class="flex items-center gap-2 bg-surface border border-border rounded-lg px-5 py-3 text-sm hover:border-accent/40 transition-colors">
+              GitHub
+              <span class="text-muted">→</span>
+            </a>
+            <a href="https://www.youtube.com/watch?v=M3ujv8xdK2w" class="flex items-center gap-2 bg-surface border border-border rounded-lg px-5 py-3 text-sm hover:border-accent/40 transition-colors">
+              quick mafs
+              <span class="text-muted">→</span>
+            </a>
+          </div>
+        </div>
+
+        <!-- Right: Dual number visualization -->
+        <div class="relative">
+          <div class="bg-surface border border-border rounded-xl overflow-hidden">
+            <div class="flex items-center gap-2 px-4 py-2.5 border-b border-border">
+              <span class="font-mono text-xs text-muted">Dual&lt;f64&gt;</span>
+              <span class="text-xs text-muted/60 ml-auto">f(x) = x &middot; sin(x)</span>
+            </div>
+            <div id="dual-viz" class="w-full" style="height: 320px; background: #18181b;"></div>
+            <div id="dual-readout" class="flex gap-6 px-4 py-3 border-t border-border font-mono text-xs">
+              <div><span class="text-muted">x =</span> <span id="ro-x" class="text-txt">0.00</span></div>
+              <div><span class="text-muted">val =</span> <span id="ro-val" class="text-accent">0.00</span></div>
+              <div><span class="text-muted">dual =</span> <span id="ro-dual" class="text-[#A6E22E]">0.00</span></div>
+            </div>
+          </div>
+          <p class="text-muted text-xs mt-3 leading-relaxed">Evaluating <code class="font-mono text-accent">f(x) = x&middot;sin(x)</code> with <code class="font-mono text-accent">Dual&lt;f64&gt;</code> computes the <span class="text-txt">value</span> and <span class="text-[#A6E22E]">exact derivative</span> in a single pass — no finite differences, no symbolic engine. The green tangent line is the <code class="font-mono text-accent">dual</code> field: the slope that falls out for free.</p>
+        </div>
+      </div>
+
+      <div class="bg-surface border border-border rounded-xl p-6 overflow-x-auto">
+<pre class="font-mono text-sm leading-relaxed"><span class="kw">use</span> <span class="ty">tang</span>::*;
+<span class="kw">use</span> <span class="ty">tang_la</span>::{<span class="ty">DVec</span>, <span class="ty">DMat</span>, <span class="ty">Svd</span>};
+<span class="kw">use</span> <span class="ty">tang_ad</span>::{<span class="ty">Tape</span>, <span class="fn">grad</span>};
+<span class="kw">use</span> <span class="ty">tang_optim</span>::<span class="ty">Adam</span>;
+
+<span class="cm">// Dual numbers give you exact derivatives for free</span>
+<span class="kw">let</span> x = <span class="ty">Dual</span>::<span class="fn">new</span>(<span class="num">2.0</span>, <span class="num">1.0</span>);
+<span class="kw">let</span> y = (x * x).<span class="fn">sin</span>();  <span class="cm">// y.dual = cos(x²) · 2x</span>
+
+<span class="cm">// Reverse-mode AD for large parameter spaces</span>
+<span class="kw">let</span> loss = |x: &amp;[<span class="ty">f64</span>]| x[<span class="num">0</span>]*x[<span class="num">0</span>] + x[<span class="num">1</span>]*x[<span class="num">1</span>] + x[<span class="num">2</span>]*x[<span class="num">2</span>];
+<span class="kw">let</span> g = <span class="fn">grad</span>(loss, &amp;[<span class="num">1.0</span>, <span class="num">2.0</span>, <span class="num">3.0</span>]);  <span class="cm">// [2, 4, 6]</span>
+
+<span class="cm">// Dense linear algebra — LU, SVD, Cholesky, QR, Eigen</span>
+<span class="kw">let</span> a = <span class="ty">DMat</span>::<span class="fn">from_fn</span>(<span class="num">3</span>, <span class="num">3</span>, |i, j| <span class="kw">if</span> i == j { <span class="num">2.0</span> } <span class="kw">else</span> { -<span class="num">1.0</span> });
+<span class="kw">let</span> svd = <span class="ty">Svd</span>::<span class="fn">new</span>(&amp;a);
+
+<span class="cm">// The same Scalar trait flows through everything</span>
+<span class="kw">let</span> q = <span class="ty">Quat</span>::<span class="fn">axis_angle</span>(<span class="ty">Dir3</span>::Z, core::f64::consts::<span class="num">FRAC_PI_2</span>);
+<span class="kw">let</span> v = q.<span class="fn">rotate</span>(<span class="ty">Vec3</span>::<span class="fn">new</span>(<span class="num">1.0</span>, <span class="num">0.0</span>, <span class="num">0.0</span>));  <span class="cm">// ≈ (0, 1, 0)</span></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════ -->
+  <!-- // the-scalar-trick                            -->
+  <!-- ═══════════════════════════════════════════════ -->
+  <section class="px-6 py-24">
+    <div class="max-w-5xl mx-auto">
+      <p class="font-mono text-muted text-sm mb-3">// the-scalar-trick</p>
+      <h2 class="text-3xl sm:text-4xl font-bold mb-4">One trait. Three powers.</h2>
+      <p class="text-muted text-lg mb-12 max-w-2xl">Write your math once with <code class="text-accent font-mono text-base">S: Scalar</code>. Swap the type to change what it does.</p>
+
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <!-- Compute -->
+        <div class="bg-surface border border-border rounded-xl p-5">
+          <div class="flex items-center gap-2 mb-4">
+            <span class="w-2 h-2 rounded-full bg-green-500"></span>
+            <span class="font-mono text-sm font-semibold">Compute</span>
+          </div>
+<pre class="font-mono text-xs leading-relaxed"><span class="kw">fn</span> <span class="fn">spring_energy</span>&lt;<span class="ty">S</span>: <span class="ty">Scalar</span>&gt;(
+    k: <span class="ty">S</span>, x: <span class="ty">S</span>
+) -&gt; <span class="ty">S</span> {
+    k * x * x * <span class="ty">S</span>::<span class="fn">from_f64</span>(<span class="num">0.5</span>)
+}
+
+<span class="fn">spring_energy</span>(<span class="num">10.0_f64</span>, <span class="num">0.3</span>)
+<span class="cm">// → 0.45</span></pre>
+        </div>
+
+        <!-- Differentiate -->
+        <div class="bg-surface border border-accent/30 rounded-xl p-5">
+          <div class="flex items-center gap-2 mb-4">
+            <span class="w-2 h-2 rounded-full bg-accent"></span>
+            <span class="font-mono text-sm font-semibold text-accent">Differentiate</span>
+          </div>
+<pre class="font-mono text-xs leading-relaxed"><span class="cm">// same function, different type</span>
+<span class="kw">let</span> x = <span class="ty">Dual</span>::<span class="fn">var</span>(<span class="num">0.3</span>);
+
+<span class="fn">spring_energy</span>(<span class="num">10.0</span>.<span class="fn">into</span>(), x)
+<span class="cm">// → Dual {</span>
+<span class="cm">//     val:  0.45,  // energy</span>
+<span class="cm">//     dual: 3.0,   // ∂E/∂x = kx</span>
+<span class="cm">// }</span></pre>
+        </div>
+
+        <!-- Bound -->
+        <div class="bg-surface border border-border rounded-xl p-5 opacity-50">
+          <div class="flex items-center gap-2 mb-4">
+            <span class="w-2 h-2 rounded-full bg-muted"></span>
+            <span class="font-mono text-sm font-semibold text-muted">Bound <span class="text-xs ml-1">(planned)</span></span>
+          </div>
+<pre class="font-mono text-xs leading-relaxed text-muted"><span class="cm">// interval arithmetic</span>
+<span class="kw">let</span> x = <span class="ty">Interval</span>::<span class="fn">new</span>(<span class="num">0.28</span>, <span class="num">0.32</span>);
+
+<span class="fn">spring_energy</span>(<span class="num">10.0</span>.<span class="fn">into</span>(), x)
+<span class="cm">// → Interval {</span>
+<span class="cm">//     lo: 0.392,</span>
+<span class="cm">//     hi: 0.512,</span>
+<span class="cm">// }</span></pre>
+        </div>
+      </div>
+
+      <p class="text-muted mt-8 text-center italic">One trait. Same code. Exact derivatives. No tape, no graph tracing.</p>
+    </div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════ -->
+  <!-- // the-stack                                   -->
+  <!-- ═══════════════════════════════════════════════ -->
+  <section class="px-6 py-24">
+    <div class="max-w-5xl mx-auto">
+      <p class="font-mono text-muted text-sm mb-3">// the-stack</p>
+      <h2 class="text-3xl sm:text-4xl font-bold mb-4">8 crates. One coherent stack.</h2>
+      <p class="text-muted text-lg mb-12 max-w-2xl">Each layer builds on the last. Use only what you need.</p>
+
+      <div class="space-y-2">
+        <!-- tang-train -->
+        <a href="https://github.com/ecto/tang/tree/main/crates/tang-train" class="block no-underline text-inherit">
+        <div class="stack-bar bg-surface border border-border rounded-lg px-5 py-4 cursor-pointer lg:flex lg:gap-6">
+          <div class="flex-1 min-w-0">
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-3">
+                <span class="font-mono text-sm font-semibold text-accent">tang-train</span>
+                <span class="text-muted text-sm hidden sm:inline">Module trait, layers, loss functions</span>
+              </div>
+              <span class="text-xs text-muted font-mono">top</span>
+            </div>
+            <div class="stack-code mt-3">
+<pre class="font-mono text-xs leading-relaxed text-muted"><span class="kw">let mut</span> model = <span class="ty">Sequential</span>::<span class="fn">new</span>(vec![
+    <span class="ty">Box</span>::<span class="fn">new</span>(<span class="ty">Linear</span>::<span class="fn">new</span>(<span class="num">784</span>, <span class="num">128</span>, <span class="num">42</span>)),
+    <span class="ty">Box</span>::<span class="fn">new</span>(<span class="ty">ReLU</span>),
+    <span class="ty">Box</span>::<span class="fn">new</span>(<span class="ty">Linear</span>::<span class="fn">new</span>(<span class="num">128</span>, <span class="num">10</span>, <span class="num">43</span>)),
+]);
+<span class="kw">let</span> pred = model.<span class="fn">forward</span>(&amp;input);
+<span class="kw">let</span> loss = <span class="fn">cross_entropy_loss</span>(&amp;pred, &amp;targets);</pre>
+            </div>
+          </div>
+          <div class="stack-viz hidden lg:flex">
+            <svg viewBox="0 0 200 120" width="200" height="120" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <!-- 3-layer neural net: 784→128→10 -->
+              <!-- Input layer (4 nodes) -->
+              <circle cx="30" cy="20" r="6" stroke="#71717a" stroke-width="1.5"/>
+              <circle cx="30" cy="45" r="6" stroke="#71717a" stroke-width="1.5"/>
+              <circle cx="30" cy="70" r="6" stroke="#71717a" stroke-width="1.5"/>
+              <circle cx="30" cy="95" r="6" stroke="#71717a" stroke-width="1.5"/>
+              <!-- Hidden layer (3 nodes) -->
+              <circle cx="100" cy="30" r="6" stroke="#F59E0B" stroke-width="1.5" fill="#F59E0B22"/>
+              <circle cx="100" cy="60" r="6" stroke="#F59E0B" stroke-width="1.5" fill="#F59E0B22"/>
+              <circle cx="100" cy="90" r="6" stroke="#F59E0B" stroke-width="1.5" fill="#F59E0B22"/>
+              <!-- Output layer (2 nodes) -->
+              <circle cx="170" cy="45" r="6" stroke="#F59E0B" stroke-width="1.5" fill="#F59E0B44"/>
+              <circle cx="170" cy="75" r="6" stroke="#F59E0B" stroke-width="1.5" fill="#F59E0B44"/>
+              <!-- Connections: input→hidden -->
+              <line x1="36" y1="20" x2="94" y2="30" stroke="#71717a" stroke-width="0.5" opacity="0.4"/>
+              <line x1="36" y1="20" x2="94" y2="60" stroke="#71717a" stroke-width="0.5" opacity="0.4"/>
+              <line x1="36" y1="20" x2="94" y2="90" stroke="#71717a" stroke-width="0.5" opacity="0.4"/>
+              <line x1="36" y1="45" x2="94" y2="30" stroke="#71717a" stroke-width="0.5" opacity="0.4"/>
+              <line x1="36" y1="45" x2="94" y2="60" stroke="#71717a" stroke-width="0.5" opacity="0.4"/>
+              <line x1="36" y1="45" x2="94" y2="90" stroke="#71717a" stroke-width="0.5" opacity="0.4"/>
+              <line x1="36" y1="70" x2="94" y2="30" stroke="#71717a" stroke-width="0.5" opacity="0.4"/>
+              <line x1="36" y1="70" x2="94" y2="60" stroke="#71717a" stroke-width="0.5" opacity="0.4"/>
+              <line x1="36" y1="70" x2="94" y2="90" stroke="#71717a" stroke-width="0.5" opacity="0.4"/>
+              <line x1="36" y1="95" x2="94" y2="30" stroke="#71717a" stroke-width="0.5" opacity="0.4"/>
+              <line x1="36" y1="95" x2="94" y2="60" stroke="#71717a" stroke-width="0.5" opacity="0.4"/>
+              <line x1="36" y1="95" x2="94" y2="90" stroke="#71717a" stroke-width="0.5" opacity="0.4"/>
+              <!-- Connections: hidden→output -->
+              <line x1="106" y1="30" x2="164" y2="45" stroke="#F59E0B" stroke-width="0.5" opacity="0.5"/>
+              <line x1="106" y1="30" x2="164" y2="75" stroke="#F59E0B" stroke-width="0.5" opacity="0.5"/>
+              <line x1="106" y1="60" x2="164" y2="45" stroke="#F59E0B" stroke-width="0.5" opacity="0.5"/>
+              <line x1="106" y1="60" x2="164" y2="75" stroke="#F59E0B" stroke-width="0.5" opacity="0.5"/>
+              <line x1="106" y1="90" x2="164" y2="45" stroke="#F59E0B" stroke-width="0.5" opacity="0.5"/>
+              <line x1="106" y1="90" x2="164" y2="75" stroke="#F59E0B" stroke-width="0.5" opacity="0.5"/>
+              <!-- Labels -->
+              <text x="30" y="115" text-anchor="middle" fill="#71717a" font-size="8" font-family="monospace">784</text>
+              <text x="100" y="115" text-anchor="middle" fill="#F59E0B" font-size="8" font-family="monospace">128</text>
+              <text x="170" y="115" text-anchor="middle" fill="#F59E0B" font-size="8" font-family="monospace">10</text>
+            </svg>
+          </div>
+        </div>
+        </a>
+
+        <!-- tang-optim -->
+        <a href="https://github.com/ecto/tang/tree/main/crates/tang-optim" class="block no-underline text-inherit">
+        <div class="stack-bar bg-surface border border-border rounded-lg px-5 py-4 cursor-pointer lg:flex lg:gap-6">
+          <div class="flex-1 min-w-0">
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-3">
+                <span class="font-mono text-sm font-semibold text-accent">tang-optim</span>
+                <span class="text-muted text-sm hidden sm:inline">SGD, Adam/AdamW, L-BFGS, Newton, Levenberg-Marquardt</span>
+              </div>
+            </div>
+            <div class="stack-code mt-3">
+<pre class="font-mono text-xs leading-relaxed text-muted"><span class="cm">// nonlinear least-squares: min ||r(x)||²</span>
+<span class="kw">let</span> lm = <span class="ty">LevenbergMarquardt</span>::<span class="fn">new</span>();
+<span class="kw">let</span> x = lm.<span class="fn">minimize</span>(&amp;x0, residual_fn, jacobian_fn);
+
+<span class="cm">// or gradient-based with Adam</span>
+<span class="kw">let mut</span> opt = <span class="ty">Adam</span>::<span class="fn">new</span>(<span class="num">0.001</span>);
+opt.<span class="fn">step</span>(&amp;<span class="kw">mut</span> params, &amp;grads);</pre>
+            </div>
+          </div>
+          <div class="stack-viz hidden lg:flex">
+            <svg viewBox="0 0 200 120" width="200" height="120" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <!-- Contour lines + optimization trajectory -->
+              <ellipse cx="100" cy="60" rx="90" ry="50" stroke="#27272a" stroke-width="1"/>
+              <ellipse cx="100" cy="60" rx="70" ry="38" stroke="#27272a" stroke-width="1"/>
+              <ellipse cx="100" cy="60" rx="50" ry="26" stroke="#27272a" stroke-width="1"/>
+              <ellipse cx="100" cy="60" rx="30" ry="15" stroke="#27272a" stroke-width="1"/>
+              <ellipse cx="100" cy="60" rx="12" ry="6" stroke="#27272a" stroke-width="1"/>
+              <!-- Zigzag optimization path -->
+              <polyline points="25,30 55,78 72,42 88,68 96,54 100,60" stroke="#F59E0B" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+              <!-- Trajectory dots -->
+              <circle cx="25" cy="30" r="3" fill="#71717a"/>
+              <circle cx="55" cy="78" r="2.5" fill="#F59E0B" opacity="0.5"/>
+              <circle cx="72" cy="42" r="2.5" fill="#F59E0B" opacity="0.6"/>
+              <circle cx="88" cy="68" r="2" fill="#F59E0B" opacity="0.7"/>
+              <circle cx="96" cy="54" r="2" fill="#F59E0B" opacity="0.85"/>
+              <circle cx="100" cy="60" r="3" fill="#F59E0B"/>
+              <!-- Min label -->
+              <text x="100" y="76" text-anchor="middle" fill="#F59E0B" font-size="8" font-family="monospace">min</text>
+            </svg>
+          </div>
+        </div>
+        </a>
+
+        <!-- tang-tensor -->
+        <a href="https://github.com/ecto/tang/tree/main/crates/tang-tensor" class="block no-underline text-inherit">
+        <div class="stack-bar bg-surface border border-border rounded-lg px-5 py-4 cursor-pointer lg:flex lg:gap-6">
+          <div class="flex-1 min-w-0">
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-3">
+                <span class="font-mono text-sm font-semibold text-accent">tang-tensor</span>
+                <span class="text-muted text-sm hidden sm:inline">N-d arrays with broadcasting, slicing, matmul, reductions</span>
+              </div>
+            </div>
+            <div class="stack-code mt-3">
+<pre class="font-mono text-xs leading-relaxed text-muted"><span class="kw">let</span> x = <span class="ty">Tensor</span>::<span class="fn">from_fn</span>(<span class="ty">Shape</span>::<span class="fn">from_slice</span>(&amp;[<span class="num">32</span>, <span class="num">784</span>]), |idx| <span class="cm">/* ... */</span>);
+<span class="kw">let</span> w = <span class="ty">Tensor</span>::<span class="fn">zeros</span>(<span class="ty">Shape</span>::<span class="fn">from_slice</span>(&amp;[<span class="num">784</span>, <span class="num">128</span>]));
+<span class="kw">let</span> h = x.<span class="fn">matmul</span>(&amp;w);         <span class="cm">// [32, 128]</span>
+<span class="kw">let</span> flat = h.<span class="fn">reshape</span>(<span class="ty">Shape</span>::<span class="fn">from_slice</span>(&amp;[<span class="num">4096</span>]));</pre>
+            </div>
+          </div>
+          <div class="stack-viz hidden lg:flex">
+            <svg viewBox="0 0 200 120" width="200" height="120" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <!-- 3D isometric blocks: [32,784] × [784,128] → [32,128] -->
+              <!-- Block A -->
+              <path d="M10,75 L10,55 L30,45 L50,55 L50,75 L30,85 Z" fill="#71717a22" stroke="#71717a" stroke-width="1"/>
+              <path d="M10,55 L30,45 L50,55 L30,65 Z" fill="#71717a33"/>
+              <text x="30" y="78" text-anchor="middle" fill="#71717a" font-size="6" font-family="monospace">32×784</text>
+              <!-- × symbol -->
+              <text x="62" y="68" text-anchor="middle" fill="#71717a" font-size="12" font-family="monospace">×</text>
+              <!-- Block B -->
+              <path d="M74,75 L74,40 L94,30 L114,40 L114,75 L94,85 Z" fill="#F59E0B22" stroke="#F59E0B" stroke-width="1"/>
+              <path d="M74,40 L94,30 L114,40 L94,50 Z" fill="#F59E0B33"/>
+              <text x="94" y="78" text-anchor="middle" fill="#F59E0B" font-size="6" font-family="monospace">784×128</text>
+              <!-- → arrow -->
+              <line x1="122" y1="60" x2="138" y2="60" stroke="#71717a" stroke-width="1.5"/>
+              <polyline points="135,56 139,60 135,64" stroke="#71717a" stroke-width="1.5" fill="none"/>
+              <!-- Block C (result) -->
+              <path d="M146,75 L146,58 L166,48 L186,58 L186,75 L166,85 Z" fill="#F59E0B44" stroke="#F59E0B" stroke-width="1.5"/>
+              <path d="M146,58 L166,48 L186,58 L166,68 Z" fill="#F59E0B55"/>
+              <text x="166" y="78" text-anchor="middle" fill="#F59E0B" font-size="6" font-family="monospace">32×128</text>
+            </svg>
+          </div>
+        </div>
+        </a>
+
+        <!-- tang-gpu -->
+        <a href="https://github.com/ecto/tang/tree/main/crates/tang-gpu" class="block no-underline text-inherit">
+        <div class="stack-bar bg-surface border border-border rounded-lg px-5 py-4 cursor-pointer lg:flex lg:gap-6">
+          <div class="flex-1 min-w-0">
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-3">
+                <span class="font-mono text-sm font-semibold text-accent">tang-gpu</span>
+                <span class="text-muted text-sm hidden sm:inline">GPU compute via wgpu — SpMV, batch ops, tensor kernels</span>
+              </div>
+            </div>
+            <div class="stack-code mt-3">
+<pre class="font-mono text-xs leading-relaxed text-muted"><span class="kw">let</span> device = <span class="ty">GpuDevice</span>::<span class="fn">new</span>().<span class="kw">await</span>;
+<span class="kw">let</span> a_gpu = device.<span class="fn">upload</span>(&amp;sparse_a);
+<span class="kw">let</span> y = device.<span class="fn">spmv</span>(&amp;a_gpu, &amp;x); <span class="cm">// GPU SpMV kernel</span></pre>
+            </div>
+          </div>
+          <div class="stack-viz hidden lg:flex">
+            <svg viewBox="0 0 200 120" width="200" height="120" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <!-- Pipeline: CPU → GPU → CPU -->
+              <!-- CPU box left -->
+              <rect x="8" y="35" width="48" height="50" rx="4" stroke="#71717a" stroke-width="1.5" fill="#71717a11"/>
+              <text x="32" y="55" text-anchor="middle" fill="#71717a" font-size="9" font-family="monospace" font-weight="600">CPU</text>
+              <text x="32" y="70" text-anchor="middle" fill="#71717a" font-size="6" font-family="monospace">upload</text>
+              <!-- Arrow right -->
+              <line x1="60" y1="60" x2="74" y2="60" stroke="#F59E0B" stroke-width="1.5"/>
+              <polyline points="71,56 75,60 71,64" stroke="#F59E0B" stroke-width="1.5" fill="none"/>
+              <!-- GPU box center (highlighted) -->
+              <rect x="78" y="25" width="48" height="70" rx="4" stroke="#F59E0B" stroke-width="2" fill="#F59E0B11"/>
+              <text x="102" y="50" text-anchor="middle" fill="#F59E0B" font-size="10" font-family="monospace" font-weight="700">GPU</text>
+              <!-- GPU cores grid -->
+              <rect x="87" y="58" width="6" height="6" rx="1" fill="#F59E0B" opacity="0.6"/>
+              <rect x="95" y="58" width="6" height="6" rx="1" fill="#F59E0B" opacity="0.6"/>
+              <rect x="103" y="58" width="6" height="6" rx="1" fill="#F59E0B" opacity="0.6"/>
+              <rect x="111" y="58" width="6" height="6" rx="1" fill="#F59E0B" opacity="0.6"/>
+              <rect x="87" y="68" width="6" height="6" rx="1" fill="#F59E0B" opacity="0.4"/>
+              <rect x="95" y="68" width="6" height="6" rx="1" fill="#F59E0B" opacity="0.4"/>
+              <rect x="103" y="68" width="6" height="6" rx="1" fill="#F59E0B" opacity="0.4"/>
+              <rect x="111" y="68" width="6" height="6" rx="1" fill="#F59E0B" opacity="0.4"/>
+              <rect x="87" y="78" width="6" height="6" rx="1" fill="#F59E0B" opacity="0.3"/>
+              <rect x="95" y="78" width="6" height="6" rx="1" fill="#F59E0B" opacity="0.3"/>
+              <rect x="103" y="78" width="6" height="6" rx="1" fill="#F59E0B" opacity="0.3"/>
+              <rect x="111" y="78" width="6" height="6" rx="1" fill="#F59E0B" opacity="0.3"/>
+              <!-- Arrow right -->
+              <line x1="130" y1="60" x2="144" y2="60" stroke="#F59E0B" stroke-width="1.5"/>
+              <polyline points="141,56 145,60 141,64" stroke="#F59E0B" stroke-width="1.5" fill="none"/>
+              <!-- CPU box right -->
+              <rect x="148" y="35" width="48" height="50" rx="4" stroke="#71717a" stroke-width="1.5" fill="#71717a11"/>
+              <text x="172" y="55" text-anchor="middle" fill="#71717a" font-size="9" font-family="monospace" font-weight="600">CPU</text>
+              <text x="172" y="70" text-anchor="middle" fill="#71717a" font-size="6" font-family="monospace">download</text>
+            </svg>
+          </div>
+        </div>
+        </a>
+
+        <!-- tang-sparse -->
+        <a href="https://github.com/ecto/tang/tree/main/crates/tang-sparse" class="block no-underline text-inherit">
+        <div class="stack-bar bg-surface border border-border rounded-lg px-5 py-4 cursor-pointer lg:flex lg:gap-6">
+          <div class="flex-1 min-w-0">
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-3">
+                <span class="font-mono text-sm font-semibold text-accent">tang-sparse</span>
+                <span class="text-muted text-sm hidden sm:inline">Sparse matrices — CSR, CSC, COO, SpMV</span>
+              </div>
+            </div>
+            <div class="stack-code mt-3">
+<pre class="font-mono text-xs leading-relaxed text-muted"><span class="kw">let mut</span> coo = <span class="ty">CooMatrix</span>::<span class="fn">new</span>(<span class="num">1000</span>, <span class="num">1000</span>);
+coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">0</span>, <span class="num">2.0</span>);  coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">1</span>, <span class="num">-1.0</span>);
+<span class="kw">let</span> csr = coo.<span class="fn">to_csr</span>();        <span class="cm">// compressed sparse row</span>
+<span class="kw">let</span> y = csr.<span class="fn">spmv</span>(&amp;x);          <span class="cm">// O(nnz) mat-vec</span></pre>
+            </div>
+          </div>
+          <div class="stack-viz hidden lg:flex">
+            <svg viewBox="0 0 200 120" width="200" height="120" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <!-- 8×8 sparsity pattern grid -->
+              <!-- Grid lines -->
+              <g stroke="#27272a" stroke-width="0.5">
+                <line x1="50" y1="12" x2="50" y2="108"/><line x1="62" y1="12" x2="62" y2="108"/>
+                <line x1="74" y1="12" x2="74" y2="108"/><line x1="86" y1="12" x2="86" y2="108"/>
+                <line x1="98" y1="12" x2="98" y2="108"/><line x1="110" y1="12" x2="110" y2="108"/>
+                <line x1="122" y1="12" x2="122" y2="108"/><line x1="134" y1="12" x2="134" y2="108"/>
+                <line x1="146" y1="12" x2="146" y2="108"/>
+                <line x1="50" y1="12" x2="146" y2="12"/><line x1="50" y1="24" x2="146" y2="24"/>
+                <line x1="50" y1="36" x2="146" y2="36"/><line x1="50" y1="48" x2="146" y2="48"/>
+                <line x1="50" y1="60" x2="146" y2="60"/><line x1="50" y1="72" x2="146" y2="72"/>
+                <line x1="50" y1="84" x2="146" y2="84"/><line x1="50" y1="96" x2="146" y2="96"/>
+                <line x1="50" y1="108" x2="146" y2="108"/>
+              </g>
+              <!-- Nonzero entries (banded pattern) — amber dots -->
+              <!-- Diagonal -->
+              <circle cx="56" cy="18" r="3.5" fill="#F59E0B"/>
+              <circle cx="68" cy="30" r="3.5" fill="#F59E0B"/>
+              <circle cx="80" cy="42" r="3.5" fill="#F59E0B"/>
+              <circle cx="92" cy="54" r="3.5" fill="#F59E0B"/>
+              <circle cx="104" cy="66" r="3.5" fill="#F59E0B"/>
+              <circle cx="116" cy="78" r="3.5" fill="#F59E0B"/>
+              <circle cx="128" cy="90" r="3.5" fill="#F59E0B"/>
+              <circle cx="140" cy="102" r="3.5" fill="#F59E0B"/>
+              <!-- Off-diagonal (upper) -->
+              <circle cx="68" cy="18" r="2.5" fill="#71717a"/>
+              <circle cx="80" cy="30" r="2.5" fill="#71717a"/>
+              <circle cx="92" cy="42" r="2.5" fill="#71717a"/>
+              <circle cx="104" cy="54" r="2.5" fill="#71717a"/>
+              <circle cx="116" cy="66" r="2.5" fill="#71717a"/>
+              <circle cx="128" cy="78" r="2.5" fill="#71717a"/>
+              <circle cx="140" cy="90" r="2.5" fill="#71717a"/>
+              <!-- Off-diagonal (lower) -->
+              <circle cx="56" cy="30" r="2.5" fill="#71717a"/>
+              <circle cx="68" cy="42" r="2.5" fill="#71717a"/>
+              <circle cx="80" cy="54" r="2.5" fill="#71717a"/>
+              <circle cx="92" cy="66" r="2.5" fill="#71717a"/>
+              <circle cx="104" cy="78" r="2.5" fill="#71717a"/>
+              <circle cx="116" cy="90" r="2.5" fill="#71717a"/>
+              <circle cx="128" cy="102" r="2.5" fill="#71717a"/>
+              <!-- Label -->
+              <text x="18" y="64" text-anchor="middle" fill="#71717a" font-size="7" font-family="monospace">nnz</text>
+              <text x="18" y="74" text-anchor="middle" fill="#F59E0B" font-size="7" font-family="monospace">= 22</text>
+            </svg>
+          </div>
+        </div>
+        </a>
+
+        <!-- tang-ad -->
+        <a href="https://github.com/ecto/tang/tree/main/crates/tang-ad" class="block no-underline text-inherit">
+        <div class="stack-bar bg-surface border border-border rounded-lg px-5 py-4 cursor-pointer lg:flex lg:gap-6">
+          <div class="flex-1 min-w-0">
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-3">
+                <span class="font-mono text-sm font-semibold text-accent">tang-ad</span>
+                <span class="text-muted text-sm hidden sm:inline">Reverse-mode autodiff — tape, grad, jacobian, hessian</span>
+              </div>
+            </div>
+            <div class="stack-code mt-3">
+<pre class="font-mono text-xs leading-relaxed text-muted"><span class="kw">let</span> tape = <span class="ty">Tape</span>::<span class="fn">new</span>();
+<span class="kw">let</span> (a, b) = (tape.<span class="fn">var</span>(<span class="num">3.0</span>), tape.<span class="fn">var</span>(<span class="num">5.0</span>));
+<span class="kw">let</span> loss = &amp;a * &amp;b + (&amp;a).<span class="fn">sin</span>();
+<span class="kw">let</span> grads = loss.<span class="fn">backward</span>();   <span class="cm">// ∂loss/∂a, ∂loss/∂b — one pass</span>
+
+<span class="cm">// or: one-liner gradient, jacobian, hessian</span>
+<span class="kw">let</span> g = <span class="fn">grad</span>(|x| &amp;x[<span class="num">0</span>] * &amp;x[<span class="num">1</span>], &amp;[<span class="num">3.0</span>, <span class="num">5.0</span>]); <span class="cm">// [5.0, 3.0]</span></pre>
+            </div>
+          </div>
+          <div class="stack-viz hidden lg:flex">
+            <svg viewBox="0 0 200 120" width="200" height="120" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <!-- Computation graph DAG -->
+              <!-- Input nodes -->
+              <circle cx="25" cy="30" r="10" stroke="#71717a" stroke-width="1.5" fill="#71717a11"/>
+              <text x="25" y="33" text-anchor="middle" fill="#71717a" font-size="8" font-family="monospace">a</text>
+              <circle cx="25" cy="80" r="10" stroke="#71717a" stroke-width="1.5" fill="#71717a11"/>
+              <text x="25" y="83" text-anchor="middle" fill="#71717a" font-size="8" font-family="monospace">b</text>
+              <!-- × node -->
+              <circle cx="75" cy="55" r="10" stroke="#F59E0B" stroke-width="1.5" fill="#F59E0B11"/>
+              <text x="75" y="59" text-anchor="middle" fill="#F59E0B" font-size="10" font-family="monospace">×</text>
+              <!-- sin node -->
+              <circle cx="75" cy="20" r="10" stroke="#F59E0B" stroke-width="1.5" fill="#F59E0B11"/>
+              <text x="75" y="23" text-anchor="middle" fill="#F59E0B" font-size="7" font-family="monospace">sin</text>
+              <!-- + node -->
+              <circle cx="125" cy="38" r="10" stroke="#F59E0B" stroke-width="1.5" fill="#F59E0B22"/>
+              <text x="125" y="42" text-anchor="middle" fill="#F59E0B" font-size="10" font-family="monospace">+</text>
+              <!-- loss node -->
+              <circle cx="170" cy="38" r="12" stroke="#F59E0B" stroke-width="2" fill="#F59E0B33"/>
+              <text x="170" y="41" text-anchor="middle" fill="#F59E0B" font-size="7" font-family="monospace" font-weight="600">loss</text>
+              <!-- Forward edges -->
+              <line x1="35" y1="35" x2="65" y2="50" stroke="#71717a" stroke-width="1"/>
+              <line x1="35" y1="75" x2="65" y2="60" stroke="#71717a" stroke-width="1"/>
+              <line x1="35" y1="25" x2="65" y2="22" stroke="#71717a" stroke-width="1"/>
+              <line x1="85" y1="50" x2="115" y2="42" stroke="#71717a" stroke-width="1"/>
+              <line x1="85" y1="24" x2="115" y2="34" stroke="#71717a" stroke-width="1"/>
+              <line x1="135" y1="38" x2="158" y2="38" stroke="#71717a" stroke-width="1"/>
+              <!-- Backward gradient arrows (dashed green) -->
+              <line x1="158" y1="44" x2="137" y2="44" stroke="#A6E22E" stroke-width="1" stroke-dasharray="3,2"/>
+              <line x1="115" y1="44" x2="87" y2="56" stroke="#A6E22E" stroke-width="1" stroke-dasharray="3,2"/>
+              <line x1="115" y1="36" x2="87" y2="26" stroke="#A6E22E" stroke-width="1" stroke-dasharray="3,2"/>
+              <line x1="65" y1="52" x2="37" y2="36" stroke="#A6E22E" stroke-width="1" stroke-dasharray="3,2"/>
+              <line x1="65" y1="58" x2="37" y2="76" stroke="#A6E22E" stroke-width="1" stroke-dasharray="3,2"/>
+              <line x1="65" y1="20" x2="37" y2="26" stroke="#A6E22E" stroke-width="1" stroke-dasharray="3,2"/>
+              <!-- Label -->
+              <text x="170" y="62" text-anchor="middle" fill="#A6E22E" font-size="6" font-family="monospace">∇ backward</text>
+            </svg>
+          </div>
+        </div>
+        </a>
+
+        <!-- tang-la -->
+        <a href="https://github.com/ecto/tang/tree/main/crates/tang-la" class="block no-underline text-inherit">
+        <div class="stack-bar bg-surface border border-border rounded-lg px-5 py-4 cursor-pointer lg:flex lg:gap-6">
+          <div class="flex-1 min-w-0">
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-3">
+                <span class="font-mono text-sm font-semibold text-accent">tang-la</span>
+                <span class="text-muted text-sm hidden sm:inline">Dynamic linear algebra — DVec, DMat, LU, SVD, Cholesky, QR, Eigen</span>
+              </div>
+            </div>
+            <div class="stack-code mt-3">
+<pre class="font-mono text-xs leading-relaxed text-muted"><span class="kw">let</span> a = <span class="ty">DMat</span>::<span class="fn">from_fn</span>(<span class="num">100</span>, <span class="num">100</span>, |i, j| <span class="kw">if</span> i == j { <span class="num">2.0</span> } <span class="kw">else if</span> (i <span class="kw">as</span> <span class="ty">i64</span> - j <span class="kw">as</span> <span class="ty">i64</span>).<span class="fn">abs</span>() == <span class="num">1</span> { <span class="num">-1.0</span> } <span class="kw">else</span> { <span class="num">0.0</span> });
+<span class="kw">let</span> x = <span class="ty">Lu</span>::<span class="fn">new</span>(&amp;a).<span class="fn">unwrap</span>().<span class="fn">solve</span>(&amp;b);  <span class="cm">// direct solve</span>
+<span class="kw">let</span> svd = <span class="ty">Svd</span>::<span class="fn">new</span>(&amp;a);                  <span class="cm">// A = UΣVᵀ</span>
+<span class="kw">let</span> eig = <span class="ty">SymmetricEigen</span>::<span class="fn">new</span>(&amp;a);       <span class="cm">// eigenvalues + vectors</span></pre>
+            </div>
+          </div>
+          <div class="stack-viz hidden lg:flex">
+            <svg viewBox="0 0 200 120" width="200" height="120" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <!-- 5×5 matrix heatmap — tridiagonal pattern -->
+              <!-- Grid cells -->
+              <g>
+                <!-- Row 0 -->
+                <rect x="50" y="14" width="18" height="18" rx="2" fill="#F59E0B" opacity="0.8"/>
+                <rect x="70" y="14" width="18" height="18" rx="2" fill="#71717a" opacity="0.5"/>
+                <rect x="90" y="14" width="18" height="18" rx="2" fill="#18181b" stroke="#27272a" stroke-width="0.5"/>
+                <rect x="110" y="14" width="18" height="18" rx="2" fill="#18181b" stroke="#27272a" stroke-width="0.5"/>
+                <rect x="130" y="14" width="18" height="18" rx="2" fill="#18181b" stroke="#27272a" stroke-width="0.5"/>
+                <!-- Row 1 -->
+                <rect x="50" y="34" width="18" height="18" rx="2" fill="#71717a" opacity="0.5"/>
+                <rect x="70" y="34" width="18" height="18" rx="2" fill="#F59E0B" opacity="0.8"/>
+                <rect x="90" y="34" width="18" height="18" rx="2" fill="#71717a" opacity="0.5"/>
+                <rect x="110" y="34" width="18" height="18" rx="2" fill="#18181b" stroke="#27272a" stroke-width="0.5"/>
+                <rect x="130" y="34" width="18" height="18" rx="2" fill="#18181b" stroke="#27272a" stroke-width="0.5"/>
+                <!-- Row 2 -->
+                <rect x="50" y="54" width="18" height="18" rx="2" fill="#18181b" stroke="#27272a" stroke-width="0.5"/>
+                <rect x="70" y="54" width="18" height="18" rx="2" fill="#71717a" opacity="0.5"/>
+                <rect x="90" y="54" width="18" height="18" rx="2" fill="#F59E0B" opacity="0.8"/>
+                <rect x="110" y="54" width="18" height="18" rx="2" fill="#71717a" opacity="0.5"/>
+                <rect x="130" y="54" width="18" height="18" rx="2" fill="#18181b" stroke="#27272a" stroke-width="0.5"/>
+                <!-- Row 3 -->
+                <rect x="50" y="74" width="18" height="18" rx="2" fill="#18181b" stroke="#27272a" stroke-width="0.5"/>
+                <rect x="70" y="74" width="18" height="18" rx="2" fill="#18181b" stroke="#27272a" stroke-width="0.5"/>
+                <rect x="90" y="74" width="18" height="18" rx="2" fill="#71717a" opacity="0.5"/>
+                <rect x="110" y="74" width="18" height="18" rx="2" fill="#F59E0B" opacity="0.8"/>
+                <rect x="130" y="74" width="18" height="18" rx="2" fill="#71717a" opacity="0.5"/>
+                <!-- Row 4 -->
+                <rect x="50" y="94" width="18" height="18" rx="2" fill="#18181b" stroke="#27272a" stroke-width="0.5"/>
+                <rect x="70" y="94" width="18" height="18" rx="2" fill="#18181b" stroke="#27272a" stroke-width="0.5"/>
+                <rect x="90" y="94" width="18" height="18" rx="2" fill="#18181b" stroke="#27272a" stroke-width="0.5"/>
+                <rect x="110" y="94" width="18" height="18" rx="2" fill="#71717a" opacity="0.5"/>
+                <rect x="130" y="94" width="18" height="18" rx="2" fill="#F59E0B" opacity="0.8"/>
+              </g>
+              <!-- Label -->
+              <text x="109" y="9" text-anchor="middle" fill="#71717a" font-size="7" font-family="monospace">A = LU</text>
+            </svg>
+          </div>
+        </div>
+        </a>
+
+        <!-- tang (core) -->
+        <a href="https://github.com/ecto/tang/tree/main/crates/tang" class="block no-underline text-inherit">
+        <div class="stack-bar bg-surface border border-accent/40 rounded-lg px-5 py-4 cursor-pointer lg:flex lg:gap-6">
+          <div class="flex-1 min-w-0">
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-3">
+                <span class="font-mono text-sm font-semibold text-accent">tang</span>
+                <span class="text-muted text-sm hidden sm:inline">Vec2/3/4, Mat3/4, Quat, Transform, Dual&lt;S&gt;, spatial algebra</span>
+              </div>
+              <span class="text-xs text-muted font-mono">foundation</span>
+            </div>
+            <div class="stack-code mt-3">
+<pre class="font-mono text-xs leading-relaxed text-muted"><span class="cm">// one function, three scalar types</span>
+<span class="kw">fn</span> <span class="fn">spring</span>&lt;S: <span class="ty">Scalar</span>&gt;(k: S, x: S) -&gt; S { k * x * x * S::<span class="fn">from_f64</span>(<span class="num">0.5</span>) }
+
+<span class="fn">spring</span>(<span class="num">10.0_f64</span>, <span class="num">0.3</span>);                     <span class="cm">// → 0.45</span>
+<span class="fn">spring</span>(<span class="ty">Dual</span>::<span class="fn">cst</span>(<span class="num">10.0</span>), <span class="ty">Dual</span>::<span class="fn">var</span>(<span class="num">0.3</span>));    <span class="cm">// → 0.45 + 3.0ε (exact derivative)</span>
+
+<span class="kw">let</span> q = <span class="ty">Quat</span>::<span class="fn">from_axis_angle</span>(<span class="ty">Vec3</span>::<span class="fn">z</span>(), <span class="num">PI</span> / <span class="num">4.0</span>);
+<span class="kw">let</span> t = <span class="ty">Transform</span>::<span class="fn">new</span>(<span class="ty">Mat3</span>::<span class="fn">from_quat</span>(q), <span class="ty">Vec3</span>::<span class="fn">new</span>(<span class="num">1.0</span>, <span class="num">2.0</span>, <span class="num">3.0</span>));</pre>
+            </div>
+          </div>
+          <div class="stack-viz hidden lg:flex">
+            <svg viewBox="0 0 200 120" width="200" height="120" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <!-- Unit circle with vector rotation by 45° -->
+              <!-- Circle -->
+              <circle cx="90" cy="60" r="45" stroke="#27272a" stroke-width="1"/>
+              <!-- Axes -->
+              <line x1="35" y1="60" x2="145" y2="60" stroke="#27272a" stroke-width="0.5"/>
+              <line x1="90" y1="10" x2="90" y2="110" stroke="#27272a" stroke-width="0.5"/>
+              <!-- Original vector (muted, along x) -->
+              <line x1="90" y1="60" x2="135" y2="60" stroke="#71717a" stroke-width="1.5"/>
+              <circle cx="135" cy="60" r="2.5" fill="#71717a"/>
+              <!-- Rotated vector (amber, 45° CCW) -->
+              <line x1="90" y1="60" x2="122" y2="28" stroke="#F59E0B" stroke-width="2"/>
+              <circle cx="122" cy="28" r="3" fill="#F59E0B"/>
+              <!-- Arc arrow showing rotation -->
+              <path d="M 120 60 A 30 30 0 0 0 111 36" stroke="#F59E0B" stroke-width="1" fill="none"/>
+              <polyline points="113,38 111,35 108,38" stroke="#F59E0B" stroke-width="1" fill="none"/>
+              <!-- Labels -->
+              <text x="140" y="56" fill="#71717a" font-size="7" font-family="monospace">v</text>
+              <text x="127" y="26" fill="#F59E0B" font-size="7" font-family="monospace">Qv</text>
+              <text x="160" y="86" fill="#71717a" font-size="7" font-family="monospace">45°</text>
+            </svg>
+          </div>
+        </div>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════ -->
+  <!-- // benchmarks                                  -->
+  <!-- ═══════════════════════════════════════════════ -->
+  <section class="px-6 py-24">
+    <div class="max-w-5xl mx-auto">
+      <p class="font-mono text-muted text-sm mb-3">// benchmarks</p>
+      <h2 class="text-3xl sm:text-4xl font-bold mb-4">Measured, not marketed.</h2>
+      <p class="text-muted text-lg mb-4 max-w-2xl">Apple M-series, single-threaded. <code class="font-mono text-sm text-accent">cargo bench -p tang-bench</code></p>
+      <p class="mb-12"><a href="https://github.com/ecto/tang/tree/main/crates/tang-bench" class="text-accent text-sm hover:underline font-mono">view benchmark source →</a></p>
+
+      <!-- Geometry primitives chart -->
+      <div class="mb-20">
+        <h3 class="font-mono text-lg font-semibold mb-2">Geometry &amp; physics primitives <span class="text-muted text-sm font-normal">(f64 unless noted)</span></h3>
+        <p class="text-muted text-sm mb-8">Lower is better. glam uses f32 (SIMD).</p>
+        <div class="bg-surface border border-border rounded-xl p-6 overflow-hidden">
+          <div id="bench-geom-container" class="w-full" style="min-height: 480px;"></div>
+        </div>
+        <div class="flex flex-wrap gap-6 mt-4 text-xs font-mono">
+          <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#F59E0B"></span> tang</span>
+          <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#71717a"></span> nalgebra</span>
+          <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#3B82F6"></span> glam (f32)</span>
+        </div>
+      </div>
+
+      <!-- Differentiable physics chart -->
+      <div class="mb-20">
+        <h3 class="font-mono text-lg font-semibold mb-2">Differentiable physics</h3>
+        <p class="text-muted text-sm mb-8 max-w-2xl">tang AD gives <em>exact</em> derivatives. Finite differences are ε-approximate and require step-size tuning.</p>
+        <div class="bg-surface border border-border rounded-xl p-6 overflow-hidden">
+          <div id="bench-ad-container" class="w-full" style="min-height: 200px;"></div>
+        </div>
+        <div class="flex flex-wrap gap-6 mt-4 text-xs font-mono">
+          <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#F59E0B"></span> tang AD (exact)</span>
+          <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#71717a"></span> finite diff (approximate)</span>
+        </div>
+        <p class="text-muted text-sm mt-4 max-w-2xl italic">The speed comparison is secondary — the real win is machine-precision derivatives with zero tuning. Finite differences break down for stiff systems.</p>
+      </div>
+
+      <!-- Dense LA chart -->
+      <div>
+        <h3 class="font-mono text-lg font-semibold mb-2">Dense linear algebra <span class="text-muted text-sm font-normal">(f64, tang vs nalgebra)</span></h3>
+        <p class="text-muted text-sm mb-8 max-w-2xl">tang is pure generic Rust — works with <code class="font-mono text-accent">Dual&lt;f64&gt;</code>, any <code class="font-mono text-accent">Scalar</code>. nalgebra dispatches to BLAS-style routines. For peak f64, enable the <code class="font-mono text-accent">faer</code> feature.</p>
+        <div class="bg-surface border border-border rounded-xl p-6 overflow-hidden">
+          <div id="bench-la-container" class="w-full" style="min-height: 420px;"></div>
+        </div>
+        <div class="flex flex-wrap gap-6 mt-4 text-xs font-mono">
+          <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#F59E0B"></span> tang</span>
+          <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#71717a"></span> nalgebra</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Charts rendered by loon WASM (see viz.loon), math by tang WASM -->
+  <script type="module" src="./boot.js"></script>
+
+  <!-- ═══════════════════════════════════════════════ -->
+  <!-- // use-cases                                   -->
+  <!-- ═══════════════════════════════════════════════ -->
+  <section class="px-6 py-24">
+    <div class="max-w-5xl mx-auto">
+      <p class="font-mono text-muted text-sm mb-3">// use-cases</p>
+      <h2 class="text-3xl sm:text-4xl font-bold mb-12">Built for real systems.</h2>
+
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <!-- Geometry Kernels -->
+        <div class="use-card bg-surface border border-border rounded-xl p-6">
+          <div class="text-2xl mb-3">⬡</div>
+          <h3 class="font-semibold text-lg mb-2">Geometry Kernels</h3>
+          <p class="text-muted text-sm mb-4">BRep, NURBS, mesh ops. The types CAD needs.</p>
+<pre class="font-mono text-xs leading-relaxed"><span class="kw">let</span> n = <span class="ty">Vec3</span>::<span class="fn">new</span>(<span class="num">0.0</span>, <span class="num">0.0</span>, <span class="num">1.0</span>);
+<span class="kw">let</span> t = <span class="ty">Transform</span>::<span class="fn">rotation</span>(
+    <span class="ty">Quat</span>::<span class="fn">axis_angle</span>(<span class="ty">Dir3</span>::Z, <span class="num">PI</span>/<span class="num">4.0</span>)
+);</pre>
+        </div>
+
+        <!-- Physics Engines -->
+        <div class="use-card bg-surface border border-border rounded-xl p-6">
+          <div class="text-2xl mb-3">◎</div>
+          <h3 class="font-semibold text-lg mb-2">Physics Engines</h3>
+          <p class="text-muted text-sm mb-4">Spatial algebra, screw theory, inertia tensors.</p>
+<pre class="font-mono text-xs leading-relaxed"><span class="kw">let</span> i = <span class="ty">SpatialInertia</span>::<span class="fn">new</span>(
+    mass, com, inertia
+);
+<span class="kw">let</span> f = i.<span class="fn">apply</span>(&amp;accel);</pre>
+        </div>
+
+        <!-- Robotics -->
+        <div class="use-card bg-surface border border-border rounded-xl p-6">
+          <div class="text-2xl mb-3">⚙</div>
+          <h3 class="font-semibold text-lg mb-2">Robotics</h3>
+          <p class="text-muted text-sm mb-4">Differentiable FK/IK, exact Jacobians for free.</p>
+<pre class="font-mono text-xs leading-relaxed"><span class="cm">// exact Jacobian via Dual</span>
+<span class="kw">let</span> j = <span class="fn">jacobian</span>(
+    |q| <span class="fn">forward_kinematics</span>(q),
+    &amp;joint_angles
+);</pre>
+        </div>
+
+        <!-- ML / Differentiable Programming -->
+        <div class="use-card bg-surface border border-border rounded-xl p-6">
+          <div class="text-2xl mb-3">∇</div>
+          <h3 class="font-semibold text-lg mb-2">ML / Differentiable Programming</h3>
+          <p class="text-muted text-sm mb-4">Same types train your nets and run your sim.</p>
+<pre class="font-mono text-xs leading-relaxed"><span class="kw">let</span> g = <span class="fn">grad</span>(
+    |x| <span class="fn">mse_loss</span>(&amp;<span class="fn">predict</span>(x), &amp;target),
+    &amp;params
+);</pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════ -->
+  <!-- // migration                                   -->
+  <!-- ═══════════════════════════════════════════════ -->
+  <section class="px-6 py-24">
+    <div class="max-w-5xl mx-auto">
+      <p class="font-mono text-muted text-sm mb-3">// migration</p>
+      <h2 class="text-3xl sm:text-4xl font-bold mb-4">Coming from nalgebra?</h2>
+      <p class="text-muted text-lg mb-12 max-w-2xl">Drop-in aliases. Minimal call-site changes.</p>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+        <!-- Type mapping -->
+        <div>
+          <h3 class="font-mono text-sm text-muted mb-4">Type mapping</h3>
+          <div class="bg-surface border border-border rounded-xl overflow-hidden">
+            <table class="w-full text-sm">
+              <thead>
+                <tr class="border-b border-border">
+                  <th class="p-3 text-left font-mono text-muted font-normal">nalgebra</th>
+                  <th class="p-3 text-left font-mono text-accent font-normal">tang</th>
+                </tr>
+              </thead>
+              <tbody class="font-mono">
+                <tr class="border-b border-border/50"><td class="p-3 text-muted">Vector3&lt;f64&gt;</td><td class="p-3">Vec3&lt;f64&gt;</td></tr>
+                <tr class="border-b border-border/50"><td class="p-3 text-muted">Point3&lt;f64&gt;</td><td class="p-3">Point3&lt;f64&gt;</td></tr>
+                <tr class="border-b border-border/50"><td class="p-3 text-muted">Unit&lt;Vector3&gt;</td><td class="p-3">Dir3&lt;f64&gt;</td></tr>
+                <tr class="border-b border-border/50"><td class="p-3 text-muted">Matrix4&lt;f64&gt;</td><td class="p-3">Mat4&lt;f64&gt;</td></tr>
+                <tr class="border-b border-border/50"><td class="p-3 text-muted">UnitQuaternion</td><td class="p-3">Quat&lt;f64&gt;</td></tr>
+                <tr class="border-b border-border/50"><td class="p-3 text-muted">DVector&lt;f64&gt;</td><td class="p-3">DVec&lt;f64&gt;</td></tr>
+                <tr><td class="p-3 text-muted">DMatrix&lt;f64&gt;</td><td class="p-3">DMat&lt;f64&gt;</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- API compat -->
+        <div>
+          <h3 class="font-mono text-sm text-muted mb-4">API compatibility</h3>
+          <div class="bg-surface border border-border rounded-xl p-5 mb-4">
+<pre class="font-mono text-xs leading-relaxed"><span class="cm">// nalgebra style — works</span>
+v.<span class="fn">dot</span>(&amp;w);
+v.<span class="fn">cross</span>(&amp;w);
+
+<span class="cm">// tang style — also works</span>
+v.<span class="fn">dot</span>(w);
+v.<span class="fn">cross</span>(w);</pre>
+          </div>
+          <div class="bg-surface border border-border rounded-xl overflow-hidden">
+            <table class="w-full text-sm">
+              <thead>
+                <tr class="border-b border-border">
+                  <th class="p-3 text-left font-mono text-muted font-normal">nalgebra</th>
+                  <th class="p-3 text-left font-mono text-accent font-normal">tang</th>
+                </tr>
+              </thead>
+              <tbody class="font-mono text-xs">
+                <tr class="border-b border-border/50"><td class="p-3 text-muted">Vec3::zeros()</td><td class="p-3">Vec3::zero() <span class="text-muted">+ alias</span></td></tr>
+                <tr class="border-b border-border/50"><td class="p-3 text-muted">v.norm_squared()</td><td class="p-3">v.norm_sq() <span class="text-muted">+ alias</span></td></tr>
+                <tr class="border-b border-border/50"><td class="p-3 text-muted">Unit::new_normalize(v)</td><td class="p-3">Dir3::new(v) <span class="text-muted">+ alias</span></td></tr>
+                <tr class="border-b border-border/50"><td class="p-3 text-muted">m.try_inverse()</td><td class="p-3">m.try_inverse()</td></tr>
+                <tr class="border-b border-border/50"><td class="p-3 text-muted">m.symmetric_eigen()</td><td class="p-3">m.symmetric_eigen()</td></tr>
+                <tr><td class="p-3 text-muted">a.clone().lu().solve(&amp;b)</td><td class="p-3">a.clone().lu().solve(&amp;b)</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════ -->
+  <!-- // targets                                     -->
+  <!-- ═══════════════════════════════════════════════ -->
+  <section class="px-6 py-24">
+    <div class="max-w-5xl mx-auto">
+      <p class="font-mono text-muted text-sm mb-3">// targets</p>
+      <h2 class="text-3xl sm:text-4xl font-bold mb-12">Runs everywhere.</h2>
+
+      <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <details class="bg-surface border border-border rounded-xl group">
+          <summary class="p-5 cursor-pointer list-none flex items-center justify-between">
+            <div class="flex items-center gap-3">
+              <span class="bg-green-500/10 text-green-400 text-xs font-mono px-2 py-1 rounded">no_std</span>
+              <span class="font-semibold">Embedded</span>
+            </div>
+            <svg class="w-4 h-4 text-muted transition-transform group-open:rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
+          </summary>
+          <div class="px-5 pb-5 text-muted text-sm">
+            Every crate is <code class="font-mono text-accent">#![no_std]</code> with <code class="font-mono text-accent">alloc</code>. Run tang on microcontrollers, in kernels, anywhere without a standard library. No heavyweight dependencies — core types are hand-rolled <code class="font-mono text-accent">#[repr(C)]</code>.
+          </div>
+        </details>
+
+        <details class="bg-surface border border-border rounded-xl group">
+          <summary class="p-5 cursor-pointer list-none flex items-center justify-between">
+            <div class="flex items-center gap-3">
+              <span class="bg-purple-500/10 text-purple-400 text-xs font-mono px-2 py-1 rounded">wasm32</span>
+              <span class="font-semibold">Browser &amp; Edge</span>
+            </div>
+            <svg class="w-4 h-4 text-muted transition-transform group-open:rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
+          </summary>
+          <div class="px-5 pb-5 text-muted text-sm">
+            Compiles to WebAssembly with zero changes. The same geometry kernel that runs natively also runs in the browser at near-native speed. Used by <a href="https://vcad.io" class="text-accent hover:underline">vcad</a> for client-side CAD.
+          </div>
+        </details>
+
+        <details class="bg-surface border border-border rounded-xl group">
+          <summary class="p-5 cursor-pointer list-none flex items-center justify-between">
+            <div class="flex items-center gap-3">
+              <span class="bg-accent/10 text-accent text-xs font-mono px-2 py-1 rounded">wgpu</span>
+              <span class="font-semibold">GPU Compute</span>
+            </div>
+            <svg class="w-4 h-4 text-muted transition-transform group-open:rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
+          </summary>
+          <div class="px-5 pb-5 text-muted text-sm">
+            <code class="font-mono text-accent">tang-gpu</code> provides wgpu compute shaders for sparse matrix-vector products, batch operations, and tensor kernels. Cross-platform GPU acceleration on Vulkan, Metal, DX12, and WebGPU.
+          </div>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════ -->
+  <!-- // footer                                      -->
+  <!-- ═══════════════════════════════════════════════ -->
+  <footer class="px-6 py-24 border-t border-border">
+    <div class="max-w-5xl mx-auto text-center">
+      <p class="font-mono text-lg mb-2">tang is <a href="https://github.com/ecto/tang/blob/main/LICENSE" class="text-accent hover:underline">MIT licensed</a>.</p>
+      <p class="text-muted mb-8">built for <a href="https://vcad.io" class="text-accent hover:underline">vcad</a>. usable by everyone.</p>
+      <a href="https://github.com/ecto/tang" class="inline-flex items-center gap-2 text-muted hover:text-txt transition-colors">
+        <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>
+        GitHub
+      </a>
+    </div>
+  </footer>
+
+</body>
+</html>

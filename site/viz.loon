@@ -1,0 +1,146 @@
+; viz.loon — tang landing page visualizations
+; renders SVG for dual-number viz + benchmark charts
+; math computed by tang WASM, rendering by loon
+
+; ─── dual number visualization ───
+
+[fn render-dual-viz [curve-path-d]
+  [let root [dom.query-selector "#dual-viz"]]
+  [dom.set-inner-html root [str
+    "<svg viewBox='0 0 800 320' width='100%' height='100%' xmlns='http://www.w3.org/2000/svg'>"
+    "<g opacity='0.3'>"
+    "<line x1='100' y1='0' x2='100' y2='320' stroke='#27272a'/>"
+    "<line x1='200' y1='0' x2='200' y2='320' stroke='#27272a'/>"
+    "<line x1='300' y1='0' x2='300' y2='320' stroke='#27272a'/>"
+    "<line x1='400' y1='0' x2='400' y2='320' stroke='#27272a'/>"
+    "<line x1='500' y1='0' x2='500' y2='320' stroke='#27272a'/>"
+    "<line x1='600' y1='0' x2='600' y2='320' stroke='#27272a'/>"
+    "<line x1='700' y1='0' x2='700' y2='320' stroke='#27272a'/>"
+    "<line x1='0' y1='46' x2='800' y2='46' stroke='#27272a'/>"
+    "<line x1='0' y1='91' x2='800' y2='91' stroke='#27272a'/>"
+    "<line x1='0' y1='137' x2='800' y2='137' stroke='#27272a'/>"
+    "<line x1='0' y1='183' x2='800' y2='183' stroke='#27272a'/>"
+    "<line x1='0' y1='229' x2='800' y2='229' stroke='#27272a'/>"
+    "<line x1='0' y1='274' x2='800' y2='274' stroke='#27272a'/>"
+    "</g>"
+    "<line x1='400' y1='0' x2='400' y2='320' stroke='#71717a' stroke-width='0.5'/>"
+    "<line x1='0' y1='183' x2='800' y2='183' stroke='#71717a' stroke-width='0.5'/>"
+    "<path d='" curve-path-d "' fill='none' stroke='#F59E0B' stroke-width='2.5' stroke-linecap='round'/>"
+    "<line id='tangent-line' x1='0' y1='0' x2='0' y2='0' stroke='#A6E22E' stroke-width='1.5' stroke-dasharray='6 4' stroke-linecap='round'/>"
+    "<circle id='dual-point' cx='0' cy='0' r='5' fill='#fafafa' stroke='#F59E0B' stroke-width='2'/>"
+    "<text id='slope-label' x='0' y='0' fill='#71717a' font-size='11' font-family='ui-monospace, monospace'>slope = 0.00</text>"
+    "</svg>"]]]
+
+; ─── geometry benchmarks ───
+; 3-bar chart: tang (amber) / nalgebra (gray) / glam (blue)
+
+[fn geom-bar [y label tw nw gw tl nl gl]
+  ; y=row top, label=op name, tw/nw/gw=bar widths, tl/nl/gl=labels
+  [str
+    "<text x='128' y='" [+ y 30] "' text-anchor='end' fill='#71717a' font-size='11' font-family='ui-monospace,monospace' dominant-baseline='middle'>" label "</text>"
+    "<rect x='140' y='" [+ y 6] "' width='" tw "' height='16' fill='#F59E0B' rx='3'/>"
+    "<text x='" [+ 146 tw] "' y='" [+ y 14] "' fill='#fafafa' font-size='10' font-family='ui-monospace,monospace' dominant-baseline='middle'>" tl "</text>"
+    "<rect x='140' y='" [+ y 25] "' width='" nw "' height='16' fill='#71717a' rx='3'/>"
+    "<text x='" [+ 146 nw] "' y='" [+ y 33] "' fill='#a1a1aa' font-size='10' font-family='ui-monospace,monospace' dominant-baseline='middle'>" nl "</text>"
+    [if [> gw 0.0]
+      [str
+        "<rect x='140' y='" [+ y 44] "' width='" gw "' height='16' fill='#3B82F6' rx='3'/>"
+        "<text x='" [+ 146 gw] "' y='" [+ y 52] "' fill='#93c5fd' font-size='10' font-family='ui-monospace,monospace' dominant-baseline='middle'>" gl "</text>"]
+      ""]]]
+
+[fn render-geom-chart []
+  [let root [dom.query-selector "#bench-geom-container"]]
+  ; max value ~18.5ns, scale = 580/18.5 ≈ 31.4 px per ns
+  [let s 31.4]
+  [dom.set-inner-html root [str
+    "<svg viewBox='0 0 800 570' width='100%' xmlns='http://www.w3.org/2000/svg'>"
+    [geom-bar 0   "vec3 dot"       [* 2.2 s] [* 2.2 s] [* 1.6 s] "2.2ns" "2.2ns" "1.6ns"]
+    [geom-bar 63  "vec3 cross"     [* 1.8 s] [* 2.2 s] [* 1.9 s] "1.8ns" "2.2ns" "1.9ns"]
+    [geom-bar 126 "vec3 normalize" [* 3.7 s] [* 3.5 s] [* 2.5 s] "3.7ns" "3.5ns" "2.5ns"]
+    [geom-bar 189 "mat3 mul"       [* 5.9 s] [* 6.9 s] 0.0        "5.9ns" "6.9ns" ""]
+    [geom-bar 252 "mat4 mul"       [* 11.0 s] [* 12.1 s] [* 5.5 s] "11.0ns" "12.1ns" "5.5ns"]
+    [geom-bar 315 "mat4 inverse"   [* 12.0 s] [* 16.0 s] [* 8.8 s] "12.0ns" "16.0ns" "8.8ns"]
+    [geom-bar 378 "quat rotate"    [* 2.5 s] [* 2.6 s] [* 2.3 s] "2.5ns" "2.6ns" "2.3ns"]
+    [geom-bar 441 "quat mul"       [* 3.3 s] [* 3.3 s] [* 2.0 s] "3.3ns" "3.3ns" "2.0ns"]
+    [geom-bar 504 "quat slerp"     [* 8.1 s] [* 11.0 s] [* 6.3 s] "8.1ns" "11.0ns" "6.3ns"]
+    "</svg>"]]]
+
+; ─── AD benchmarks ───
+; 2-bar chart: tang AD (amber) / finite diff (gray)
+
+[fn ad-bar [y label tw nw tl nl]
+  [str
+    "<text x='148' y='" [+ y 22] "' text-anchor='end' fill='#71717a' font-size='11' font-family='ui-monospace,monospace' dominant-baseline='middle'>" label "</text>"
+    "<rect x='160' y='" [+ y 6] "' width='" tw "' height='18' fill='#F59E0B' rx='3'/>"
+    "<text x='" [+ 166 tw] "' y='" [+ y 15] "' fill='#fafafa' font-size='10' font-family='ui-monospace,monospace' dominant-baseline='middle'>" tl "</text>"
+    "<rect x='160' y='" [+ y 28] "' width='" nw "' height='18' fill='#71717a' rx='3'/>"
+    "<text x='" [+ 166 nw] "' y='" [+ y 37] "' fill='#a1a1aa' font-size='10' font-family='ui-monospace,monospace' dominant-baseline='middle'>" nl "</text>"]]
+
+[fn render-ad-chart []
+  [let root [dom.query-selector "#bench-ad-container"]]
+  ; max value ~300ns, scale = 540/300 = 1.8 px per ns
+  [let s 1.8]
+  [dom.set-inner-html root [str
+    "<svg viewBox='0 0 800 210' width='100%' xmlns='http://www.w3.org/2000/svg'>"
+    [ad-bar 0   "rigid body grad"  [* 19.0 s] [* 18.0 s]  "19ns (exact)"     "18ns (approx)"]
+    [ad-bar 52  "FK Jacobian"      [* 278.0 s] [* 199.0 s] "278ns (exact)"    "199ns (approx)"]
+    [ad-bar 104 "LU solve deriv"   [* 81.0 s] [* 167.0 s]  "81ns (exact)"     "167ns (approx)"]
+    [ad-bar 156 "Hessian 2x2"     [* 77.0 s] [* 27.0 s]   "77ns (exact 2nd)" "27ns (approx)"]
+    "</svg>"]]]
+
+; ─── dense LA benchmarks ───
+; 2-bar per row, grouped by operation, log-ish scale per group
+
+[fn la-pair [y label tw nw tl nl ratio ratio-color]
+  [str
+    "<text x='118' y='" [+ y 18] "' text-anchor='end' fill='#52525b' font-size='9' font-family='ui-monospace,monospace' dominant-baseline='middle'>" label "</text>"
+    "<rect x='130' y='" [+ y 4] "' width='" tw "' height='12' fill='#F59E0B' rx='2'/>"
+    "<text x='" [+ 136 tw] "' y='" [+ y 10] "' fill='#fafafa' font-size='9' font-family='ui-monospace,monospace' dominant-baseline='middle'>" tl "</text>"
+    "<rect x='130' y='" [+ y 19] "' width='" nw "' height='12' fill='#71717a' rx='2'/>"
+    "<text x='" [+ 136 nw] "' y='" [+ y 25] "' fill='#a1a1aa' font-size='9' font-family='ui-monospace,monospace' dominant-baseline='middle'>" nl "</text>"
+    "<text x='740' y='" [+ y 18] "' fill='" ratio-color "' font-size='9' font-family='ui-monospace,monospace' dominant-baseline='middle'>" ratio "</text>"]]
+
+[fn render-la-chart []
+  [let root [dom.query-selector "#bench-la-container"]]
+  [let cw 560.0]
+  [dom.set-inner-html root [str
+    "<svg viewBox='0 0 800 580' width='100%' xmlns='http://www.w3.org/2000/svg'>"
+
+    ; GEMM
+    "<text x='118' y='12' text-anchor='end' fill='#71717a' font-size='12' font-family='ui-monospace,monospace' font-weight='600'>GEMM</text>"
+    [la-pair 20  "n=32"  [* [/ 6.6 8.0] cw]   [* [/ 1.5 8.0] cw]   "6.6µs" "1.5µs" "4.4x" "#71717a"]
+    [la-pair 56  "n=128" [* [/ 250.0 300.0] cw] [* [/ 84.0 300.0] cw] "250µs" "84µs" "3.0x" "#71717a"]
+    [la-pair 92  "n=512" [* [/ 20.0 24.0] cw]  [* [/ 4.9 24.0] cw]  "20ms" "4.9ms" "4.1x" "#71717a"]
+
+    ; LU solve
+    "<text x='118' y='142' text-anchor='end' fill='#71717a' font-size='12' font-family='ui-monospace,monospace' font-weight='600'>LU solve</text>"
+    [la-pair 150 "n=32"  [* [/ 3.6 4.5] cw]   [* [/ 3.2 4.5] cw]   "3.6µs" "3.2µs" "1.1x" "#22c55e"]
+    [la-pair 186 "n=128" [* [/ 118.0 140.0] cw] [* [/ 107.0 140.0] cw] "118µs" "107µs" "1.1x" "#22c55e"]
+    [la-pair 222 "n=512" [* [/ 9.8 12.0] cw]  [* [/ 8.6 12.0] cw]  "9.8ms" "8.6ms" "1.1x" "#22c55e"]
+
+    ; Cholesky
+    "<text x='118' y='272' text-anchor='end' fill='#71717a' font-size='12' font-family='ui-monospace,monospace' font-weight='600'>Cholesky</text>"
+    [la-pair 280 "n=32"  [* [/ 3.0 4.0] cw]   [* [/ 2.6 4.0] cw]   "3.0µs" "2.6µs" "1.2x" "#71717a"]
+    [la-pair 316 "n=128" [* [/ 170.0 200.0] cw] [* [/ 63.0 200.0] cw] "170µs" "63µs" "2.7x" "#71717a"]
+    [la-pair 352 "n=512" [* [/ 28.0 32.0] cw]  [* [/ 3.7 32.0] cw]  "28ms" "3.7ms" "7.6x" "#ef4444"]
+
+    ; QR
+    "<text x='118' y='402' text-anchor='end' fill='#71717a' font-size='12' font-family='ui-monospace,monospace' font-weight='600'>QR</text>"
+    [la-pair 410 "n=32"  [* [/ 5.7 7.0] cw]   [* [/ 5.0 7.0] cw]   "5.7µs" "5.0µs" "1.1x" "#22c55e"]
+    [la-pair 446 "n=128" [* [/ 360.0 420.0] cw] [* [/ 211.0 420.0] cw] "360µs" "211µs" "1.7x" "#71717a"]
+    [la-pair 482 "n=512" [* [/ 31.0 36.0] cw]  [* [/ 13.0 36.0] cw]  "31ms" "13ms" "2.4x" "#71717a"]
+
+    ; Sym. Eigen
+    "<text x='118' y='532' text-anchor='end' fill='#71717a' font-size='12' font-family='ui-monospace,monospace' font-weight='600'>Sym. Eigen</text>"
+    [la-pair 540 "n=32"  [* [/ 66.0 80.0] cw]  [* [/ 28.0 80.0] cw]  "66µs" "28µs" "2.4x" "#71717a"]
+    [la-pair 576 "n=128" [* [/ 4800.0 5600.0] cw] [* [/ 942.0 5600.0] cw] "4.8ms" "942µs" "5.1x" "#ef4444"]
+
+    "</svg>"]]]
+
+; ─── main ───
+
+[fn main [curve-path-d]
+  [render-dual-viz curve-path-d]
+  [render-geom-chart]
+  [render-ad-chart]
+  [render-la-chart]]
