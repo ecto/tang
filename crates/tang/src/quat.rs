@@ -144,10 +144,12 @@ impl<S: Scalar> Quat<S> {
     }
 
     /// Rotate a vector by this quaternion: q * v * q^-1
+    ///
+    /// Uses the optimized two-cross-product formula (~18 ops vs ~40 for full Hamilton product).
+    #[inline]
     pub fn rotate(&self, v: Vec3<S>) -> Vec3<S> {
-        let qv = Quat { w: S::ZERO, v };
-        let result = self.mul(&qv).mul(&self.conjugate());
-        result.v
+        let t = self.v.cross(v) * S::TWO;
+        v + t * self.w + self.v.cross(t)
     }
 
     /// Spherical linear interpolation

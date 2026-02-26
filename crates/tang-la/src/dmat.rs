@@ -90,6 +90,21 @@ impl<S: Scalar> DMat<S> {
     #[inline]
     pub fn as_slice(&self) -> &[S] { &self.data }
 
+    /// Mutable raw column-major data.
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [S] { &mut self.data }
+
+    /// Mutable column slice.
+    #[inline]
+    pub fn col_mut(&mut self, j: usize) -> &mut [S] {
+        let start = j * self.nrows;
+        &mut self.data[start..start + self.nrows]
+    }
+
+    /// Mutable access to underlying storage.
+    #[inline]
+    pub fn data_mut(&mut self) -> &mut Vec<S> { &mut self.data }
+
     /// Column slice.
     pub fn col(&self, j: usize) -> &[S] {
         let start = j * self.nrows;
@@ -133,15 +148,26 @@ impl<S: Scalar> DMat<S> {
     /// Matrix-matrix product: C = A * B.
     pub fn mul_mat(&self, rhs: &DMat<S>) -> DMat<S> {
         assert_eq!(self.ncols, rhs.nrows, "DMat mul_mat: dimension mismatch");
-        let mut c = DMat::zeros(self.nrows, rhs.ncols);
-        for j in 0..rhs.ncols {
-            for k in 0..self.ncols {
-                let b_kj = rhs.get(k, j);
-                for i in 0..self.nrows {
-                    *c.get_mut(i, j) = c.get(i, j) + self.get(i, k) * b_kj;
+        let m = self.nrows;
+        let n = rhs.ncols;
+        let p = self.ncols;
+        let mut c = DMat::zeros(m, n);
+
+        let a = self.as_slice();
+        let b = rhs.as_slice();
+        let c_data = c.as_mut_slice();
+
+        for j in 0..n {
+            let c_col = j * m;
+            for k in 0..p {
+                let b_kj = b[j * rhs.nrows + k];
+                let a_col = k * m;
+                for i in 0..m {
+                    c_data[c_col + i] = c_data[c_col + i] + a[a_col + i] * b_kj;
                 }
             }
         }
+
         c
     }
 

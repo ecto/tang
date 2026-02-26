@@ -23,10 +23,11 @@ impl<S: Scalar> Lu<S> {
 
         for k in 0..n {
             // Find pivot: largest |a[i][k]| for i >= k
+            let col_k = lu.col(k);
             let mut max_val = S::ZERO;
             let mut max_row = k;
             for i in k..n {
-                let v = lu.get(i, k).abs();
+                let v = col_k[i].abs();
                 if v > max_val {
                     max_val = v;
                     max_row = i;
@@ -43,14 +44,21 @@ impl<S: Scalar> Lu<S> {
                 swaps += 1;
             }
 
-            let pivot = lu.get(k, k);
-            let pivot_inv = pivot.recip();
+            let pivot_inv = lu.get(k, k).recip();
+
+            // Compute factors for column k
+            let col_k_mut = lu.col_mut(k);
             for i in (k + 1)..n {
-                let factor = lu.get(i, k) * pivot_inv;
-                lu.set(i, k, factor);
-                for j in (k + 1)..n {
-                    let val = lu.get(i, j) - factor * lu.get(k, j);
-                    lu.set(i, j, val);
+                col_k_mut[i] = col_k_mut[i] * pivot_inv;
+            }
+
+            // Update submatrix: for each column j > k, col_j[i] -= factor[i] * col_j[k]
+            let data = lu.data_mut();
+            for j in (k + 1)..n {
+                let row_k_val = data[j * n + k]; // lu[k, j]
+                for i in (k + 1)..n {
+                    let factor = data[k * n + i]; // lu[i, k] (the factor)
+                    data[j * n + i] = data[j * n + i] - factor * row_k_val;
                 }
             }
         }
