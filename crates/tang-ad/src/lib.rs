@@ -13,8 +13,8 @@ mod var;
 pub use tape::Tape;
 pub use var::Var;
 
-use tang_la::{DVec, DMat};
 use alloc::vec::Vec;
+use tang_la::{DMat, DVec};
 /// Compute gradient of scalar-valued function via reverse-mode AD.
 ///
 /// Returns gradient vector where `grad[i]` = ∂f/∂x_i.
@@ -137,9 +137,7 @@ mod tests {
     #[test]
     fn jacobian_fwd_linear() {
         // f(x, y) = (x + y, x - y)
-        let j = jacobian_fwd(|x| {
-            alloc::vec![x[0] + x[1], x[0] - x[1]]
-        }, &[1.0, 2.0]);
+        let j = jacobian_fwd(|x| alloc::vec![x[0] + x[1], x[0] - x[1]], &[1.0, 2.0]);
         assert_eq!(j.get(0, 0), 1.0);
         assert_eq!(j.get(0, 1), 1.0);
         assert_eq!(j.get(1, 0), 1.0);
@@ -150,9 +148,10 @@ mod tests {
     fn hessian_quadratic() {
         // f(x, y) = x^2 + 2*x*y + y^2
         // H = [[2, 2], [2, 2]]
-        let h = hessian(|x| {
-            x[0] * x[0] + x[0] * x[1] * tang::Dual::from_f64(2.0) + x[1] * x[1]
-        }, &[1.0, 1.0]);
+        let h = hessian(
+            |x| x[0] * x[0] + x[0] * x[1] * tang::Dual::from_f64(2.0) + x[1] * x[1],
+            &[1.0, 1.0],
+        );
         assert!((h.get(0, 0) - 2.0).abs() < 1e-10);
         assert!((h.get(0, 1) - 2.0).abs() < 1e-10);
         assert!((h.get(1, 0) - 2.0).abs() < 1e-10);
@@ -163,9 +162,11 @@ mod tests {
     fn jvp_simple() {
         // f(x, y) = (x*y, x+y), J = [[y, x], [1, 1]]
         // Jv at (3,5), v=(1,0): (5, 1)
-        let result = jvp(|x| {
-            alloc::vec![x[0] * x[1], x[0] + x[1]]
-        }, &[3.0, 5.0], &[1.0, 0.0]);
+        let result = jvp(
+            |x| alloc::vec![x[0] * x[1], x[0] + x[1]],
+            &[3.0, 5.0],
+            &[1.0, 0.0],
+        );
         assert!((result[0] - 5.0).abs() < 1e-10);
         assert!((result[1] - 1.0).abs() < 1e-10);
     }

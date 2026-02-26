@@ -1,5 +1,5 @@
 use crate::Scalar;
-use core::ops::{Add, Sub, Mul, Div, Neg, AddAssign, SubAssign, MulAssign};
+use core::ops::{Add, AddAssign, Div, Mul, MulAssign, Neg, Sub, SubAssign};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
@@ -11,23 +11,35 @@ pub struct Vec2<S> {
 
 impl<S: Scalar> Vec2<S> {
     #[inline]
-    pub fn new(x: S, y: S) -> Self { Self { x, y } }
+    pub fn new(x: S, y: S) -> Self {
+        Self { x, y }
+    }
 
     #[inline]
-    pub fn zero() -> Self { Self::new(S::ZERO, S::ZERO) }
+    pub fn zero() -> Self {
+        Self::new(S::ZERO, S::ZERO)
+    }
 
     #[inline]
-    pub fn splat(v: S) -> Self { Self::new(v, v) }
+    pub fn splat(v: S) -> Self {
+        Self::new(v, v)
+    }
 
     #[inline]
-    pub fn x() -> Self { Self::new(S::ONE, S::ZERO) }
+    pub fn x() -> Self {
+        Self::new(S::ONE, S::ZERO)
+    }
 
     #[inline]
-    pub fn y() -> Self { Self::new(S::ZERO, S::ONE) }
+    pub fn y() -> Self {
+        Self::new(S::ZERO, S::ONE)
+    }
 
     /// Alias for [`zero()`](Self::zero) (nalgebra compatibility).
     #[inline]
-    pub fn zeros() -> Self { Self::zero() }
+    pub fn zeros() -> Self {
+        Self::zero()
+    }
 
     /// Dot product. Accepts both owned and borrowed args (nalgebra compatibility).
     #[inline]
@@ -46,16 +58,24 @@ impl<S: Scalar> Vec2<S> {
 
     /// Alias for [`norm_sq()`](Self::norm_sq) (nalgebra compatibility).
     #[inline]
-    pub fn norm_squared(self) -> S { self.norm_sq() }
+    pub fn norm_squared(self) -> S {
+        self.norm_sq()
+    }
 
     #[inline]
-    pub fn norm_sq(self) -> S { self.dot(self) }
+    pub fn norm_sq(self) -> S {
+        self.dot(self)
+    }
 
     #[inline]
-    pub fn norm(self) -> S { self.norm_sq().sqrt() }
+    pub fn norm(self) -> S {
+        self.norm_sq().sqrt()
+    }
 
     #[inline]
-    pub fn normalize(self) -> Self { self / self.norm() }
+    pub fn normalize(self) -> Self {
+        self / self.norm()
+    }
 
     #[inline]
     pub fn lerp(self, other: Self, t: S) -> Self {
@@ -63,7 +83,9 @@ impl<S: Scalar> Vec2<S> {
     }
 
     #[inline]
-    pub fn perp(self) -> Self { Self::new(-self.y, self.x) }
+    pub fn perp(self) -> Self {
+        Self::new(-self.y, self.x)
+    }
 
     #[inline]
     pub fn component_min(self, other: Self) -> Self {
@@ -77,69 +99,98 @@ impl<S: Scalar> Vec2<S> {
 }
 
 impl<S: Scalar> Default for Vec2<S> {
-    fn default() -> Self { Self::zero() }
+    fn default() -> Self {
+        Self::zero()
+    }
 }
 
 // nalgebra compatibility: `v.dot(&w)` works via Into.
 impl<S: Scalar> From<&Vec2<S>> for Vec2<S> {
     #[inline]
-    fn from(v: &Vec2<S>) -> Self { *v }
+    fn from(v: &Vec2<S>) -> Self {
+        *v
+    }
 }
 
 impl<S: Scalar> Add for Vec2<S> {
     type Output = Self;
-    #[inline] fn add(self, rhs: Self) -> Self {
+    #[inline]
+    fn add(self, rhs: Self) -> Self {
         Self::new(self.x + rhs.x, self.y + rhs.y)
     }
 }
 
 impl<S: Scalar> Sub for Vec2<S> {
     type Output = Self;
-    #[inline] fn sub(self, rhs: Self) -> Self {
+    #[inline]
+    fn sub(self, rhs: Self) -> Self {
         Self::new(self.x - rhs.x, self.y - rhs.y)
     }
 }
 
 impl<S: Scalar> Neg for Vec2<S> {
     type Output = Self;
-    #[inline] fn neg(self) -> Self { Self::new(-self.x, -self.y) }
+    #[inline]
+    fn neg(self) -> Self {
+        Self::new(-self.x, -self.y)
+    }
 }
 
 impl<S: Scalar> Mul<S> for Vec2<S> {
     type Output = Self;
-    #[inline] fn mul(self, rhs: S) -> Self {
+    #[inline]
+    fn mul(self, rhs: S) -> Self {
         Self::new(self.x * rhs, self.y * rhs)
     }
 }
 
 impl<S: Scalar> Div<S> for Vec2<S> {
     type Output = Self;
-    #[inline] fn div(self, rhs: S) -> Self {
+    #[inline]
+    fn div(self, rhs: S) -> Self {
         Self::new(self.x / rhs, self.y / rhs)
     }
 }
 
 impl<S: Scalar> AddAssign for Vec2<S> {
-    #[inline] fn add_assign(&mut self, rhs: Self) { self.x += rhs.x; self.y += rhs.y; }
+    #[inline]
+    fn add_assign(&mut self, rhs: Self) {
+        self.x += rhs.x;
+        self.y += rhs.y;
+    }
 }
 
 impl<S: Scalar> SubAssign for Vec2<S> {
-    #[inline] fn sub_assign(&mut self, rhs: Self) { self.x -= rhs.x; self.y -= rhs.y; }
+    #[inline]
+    fn sub_assign(&mut self, rhs: Self) {
+        self.x -= rhs.x;
+        self.y -= rhs.y;
+    }
 }
 
 impl<S: Scalar> MulAssign<S> for Vec2<S> {
-    #[inline] fn mul_assign(&mut self, rhs: S) { self.x *= rhs; self.y *= rhs; }
+    #[inline]
+    fn mul_assign(&mut self, rhs: S) {
+        self.x *= rhs;
+        self.y *= rhs;
+    }
 }
 
 // Scalar * Vec2 (commutative)
 impl Mul<Vec2<f64>> for f64 {
     type Output = Vec2<f64>;
-    #[inline] fn mul(self, rhs: Vec2<f64>) -> Vec2<f64> { rhs * self }
+    #[inline]
+    fn mul(self, rhs: Vec2<f64>) -> Vec2<f64> {
+        rhs * self
+    }
 }
 
 impl Mul<Vec2<f32>> for f32 {
     type Output = Vec2<f32>;
-    #[inline] fn mul(self, rhs: Vec2<f32>) -> Vec2<f32> { rhs * self }
+    #[inline]
+    fn mul(self, rhs: Vec2<f32>) -> Vec2<f32> {
+        rhs * self
+    }
 }
 
 #[cfg(test)]

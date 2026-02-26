@@ -1,6 +1,6 @@
-use tang::Scalar;
 use crate::CsrMatrix;
 use alloc::vec::Vec;
+use tang::Scalar;
 
 /// Coordinate (triplet) format for assembling sparse matrices.
 ///
@@ -15,12 +15,19 @@ pub struct CooMatrix<S> {
 
 impl<S: Scalar> CooMatrix<S> {
     pub fn new(nrows: usize, ncols: usize) -> Self {
-        Self { nrows, ncols, rows: Vec::new(), cols: Vec::new(), vals: Vec::new() }
+        Self {
+            nrows,
+            ncols,
+            rows: Vec::new(),
+            cols: Vec::new(),
+            vals: Vec::new(),
+        }
     }
 
     pub fn with_capacity(nrows: usize, ncols: usize, nnz: usize) -> Self {
         Self {
-            nrows, ncols,
+            nrows,
+            ncols,
             rows: Vec::with_capacity(nnz),
             cols: Vec::with_capacity(nnz),
             vals: Vec::with_capacity(nnz),
@@ -35,7 +42,9 @@ impl<S: Scalar> CooMatrix<S> {
         self.vals.push(val);
     }
 
-    pub fn nnz(&self) -> usize { self.rows.len() }
+    pub fn nnz(&self) -> usize {
+        self.rows.len()
+    }
 
     /// Convert to CSR format (summing duplicate entries).
     pub fn to_csr(&self) -> CsrMatrix<S> {

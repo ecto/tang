@@ -1,6 +1,6 @@
-use tang::Scalar;
-use core::ops::{Add, Sub, Mul, Neg, Index, IndexMut, AddAssign, SubAssign, MulAssign};
 use alloc::vec::Vec;
+use core::ops::{Add, AddAssign, Index, IndexMut, Mul, MulAssign, Neg, Sub, SubAssign};
+use tang::Scalar;
 
 /// Heap-allocated vector of scalars.
 #[derive(Clone, Debug, PartialEq)]
@@ -17,12 +17,16 @@ impl<S: Scalar> DVec<S> {
 
     /// Create a zero vector of given length.
     pub fn zeros(n: usize) -> Self {
-        Self { data: alloc::vec![S::ZERO; n] }
+        Self {
+            data: alloc::vec![S::ZERO; n],
+        }
     }
 
     /// Create from a function.
     pub fn from_fn(n: usize, f: impl Fn(usize) -> S) -> Self {
-        Self { data: (0..n).map(f).collect() }
+        Self {
+            data: (0..n).map(f).collect(),
+        }
     }
 
     /// Create from a slice.
@@ -33,7 +37,11 @@ impl<S: Scalar> DVec<S> {
     /// Create from an iterator, taking exactly `n` elements.
     pub fn from_iterator(n: usize, iter: impl IntoIterator<Item = S>) -> Self {
         let data: Vec<S> = iter.into_iter().take(n).collect();
-        assert_eq!(data.len(), n, "DVec::from_iterator: iterator yielded fewer than {n} elements");
+        assert_eq!(
+            data.len(),
+            n,
+            "DVec::from_iterator: iterator yielded fewer than {n} elements"
+        );
         Self { data }
     }
 
@@ -41,22 +49,34 @@ impl<S: Scalar> DVec<S> {
     ///
     /// nalgebra's `DVector::from_column_slice(s)` is equivalent to `DVec::from_slice(s)`.
     #[inline]
-    pub fn from_column_slice(data: &[S]) -> Self { Self::from_slice(data) }
+    pub fn from_column_slice(data: &[S]) -> Self {
+        Self::from_slice(data)
+    }
 
     #[inline]
-    pub fn len(&self) -> usize { self.data.len() }
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
 
     #[inline]
-    pub fn is_empty(&self) -> bool { self.data.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
 
     #[inline]
-    pub fn as_slice(&self) -> &[S] { &self.data }
+    pub fn as_slice(&self) -> &[S] {
+        &self.data
+    }
 
     #[inline]
-    pub fn as_mut_slice(&mut self) -> &mut [S] { &mut self.data }
+    pub fn as_mut_slice(&mut self) -> &mut [S] {
+        &mut self.data
+    }
 
     #[inline]
-    pub fn into_vec(self) -> Vec<S> { self.data }
+    pub fn into_vec(self) -> Vec<S> {
+        self.data
+    }
 
     /// Dot product.
     pub fn dot(&self, other: &DVec<S>) -> S {
@@ -139,12 +159,16 @@ impl<S: Scalar> DVec<S> {
 impl<S: Scalar> Index<usize> for DVec<S> {
     type Output = S;
     #[inline]
-    fn index(&self, i: usize) -> &S { &self.data[i] }
+    fn index(&self, i: usize) -> &S {
+        &self.data[i]
+    }
 }
 
 impl<S: Scalar> IndexMut<usize> for DVec<S> {
     #[inline]
-    fn index_mut(&mut self, i: usize) -> &mut S { &mut self.data[i] }
+    fn index_mut(&mut self, i: usize) -> &mut S {
+        &mut self.data[i]
+    }
 }
 
 impl<S: Scalar> Add for &DVec<S> {

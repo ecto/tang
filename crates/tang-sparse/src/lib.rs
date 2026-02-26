@@ -4,10 +4,10 @@
 
 extern crate alloc;
 
-mod csr;
-mod csc;
 mod coo;
+mod csc;
+mod csr;
 
-pub use csr::CsrMatrix;
-pub use csc::CscMatrix;
 pub use coo::CooMatrix;
+pub use csc::CscMatrix;
+pub use csr::CsrMatrix;

@@ -1,6 +1,6 @@
 //! Shared helpers for tang benchmarks: seeded RNG, input generators.
 
-use tang::{Vec3, Mat3, Mat4, Quat};
+use tang::{Mat3, Mat4, Quat, Vec3};
 use tang_la::{DMat, DVec};
 
 /// Simple xoshiro256** PRNG for reproducible benchmarks (no rand dependency in lib).
@@ -53,54 +53,94 @@ pub fn make_rng() -> Rng {
 
 pub fn random_tang_vec3f32(n: usize) -> Vec<Vec3<f32>> {
     let mut rng = make_rng();
-    (0..n).map(|_| Vec3::new(rng.f32(), rng.f32(), rng.f32())).collect()
+    (0..n)
+        .map(|_| Vec3::new(rng.f32(), rng.f32(), rng.f32()))
+        .collect()
 }
 
 pub fn random_tang_vec3f64(n: usize) -> Vec<Vec3<f64>> {
     let mut rng = make_rng();
-    (0..n).map(|_| Vec3::new(rng.f64(), rng.f64(), rng.f64())).collect()
+    (0..n)
+        .map(|_| Vec3::new(rng.f64(), rng.f64(), rng.f64()))
+        .collect()
 }
 
 pub fn random_tang_mat3f64(n: usize) -> Vec<Mat3<f64>> {
     let mut rng = make_rng();
-    (0..n).map(|_| {
-        Mat3::new(
-            rng.f64(), rng.f64(), rng.f64(),
-            rng.f64(), rng.f64(), rng.f64(),
-            rng.f64(), rng.f64(), rng.f64(),
-        )
-    }).collect()
+    (0..n)
+        .map(|_| {
+            Mat3::new(
+                rng.f64(),
+                rng.f64(),
+                rng.f64(),
+                rng.f64(),
+                rng.f64(),
+                rng.f64(),
+                rng.f64(),
+                rng.f64(),
+                rng.f64(),
+            )
+        })
+        .collect()
 }
 
 pub fn random_tang_mat4f64(n: usize) -> Vec<Mat4<f64>> {
     let mut rng = make_rng();
-    (0..n).map(|_| {
-        Mat4::new(
-            rng.f64(), rng.f64(), rng.f64(), rng.f64(),
-            rng.f64(), rng.f64(), rng.f64(), rng.f64(),
-            rng.f64(), rng.f64(), rng.f64(), rng.f64(),
-            rng.f64(), rng.f64(), rng.f64(), rng.f64(),
-        )
-    }).collect()
+    (0..n)
+        .map(|_| {
+            Mat4::new(
+                rng.f64(),
+                rng.f64(),
+                rng.f64(),
+                rng.f64(),
+                rng.f64(),
+                rng.f64(),
+                rng.f64(),
+                rng.f64(),
+                rng.f64(),
+                rng.f64(),
+                rng.f64(),
+                rng.f64(),
+                rng.f64(),
+                rng.f64(),
+                rng.f64(),
+                rng.f64(),
+            )
+        })
+        .collect()
 }
 
 pub fn random_tang_mat4f32(n: usize) -> Vec<Mat4<f32>> {
     let mut rng = make_rng();
-    (0..n).map(|_| {
-        Mat4::new(
-            rng.f32(), rng.f32(), rng.f32(), rng.f32(),
-            rng.f32(), rng.f32(), rng.f32(), rng.f32(),
-            rng.f32(), rng.f32(), rng.f32(), rng.f32(),
-            rng.f32(), rng.f32(), rng.f32(), rng.f32(),
-        )
-    }).collect()
+    (0..n)
+        .map(|_| {
+            Mat4::new(
+                rng.f32(),
+                rng.f32(),
+                rng.f32(),
+                rng.f32(),
+                rng.f32(),
+                rng.f32(),
+                rng.f32(),
+                rng.f32(),
+                rng.f32(),
+                rng.f32(),
+                rng.f32(),
+                rng.f32(),
+                rng.f32(),
+                rng.f32(),
+                rng.f32(),
+                rng.f32(),
+            )
+        })
+        .collect()
 }
 
 pub fn random_tang_quat(n: usize) -> Vec<Quat<f64>> {
     let mut rng = make_rng();
-    (0..n).map(|_| {
-        Quat::new(rng.f64(), rng.f64(), rng.f64(), rng.f64()).normalize()
-    }).collect()
+    (0..n)
+        .map(|_| Quat::new(rng.f64(), rng.f64(), rng.f64(), rng.f64()).normalize())
+        .collect()
 }
 
 // --- DMat/DVec generators ---
@@ -144,34 +184,48 @@ pub fn random_f32_triples(n: usize) -> Vec<[f32; 3]> {
 
 pub fn random_f64_quads(n: usize) -> Vec<[f64; 4]> {
     let mut rng = make_rng();
-    (0..n).map(|_| [rng.f64(), rng.f64(), rng.f64(), rng.f64()]).collect()
+    (0..n)
+        .map(|_| [rng.f64(), rng.f64(), rng.f64(), rng.f64()])
+        .collect()
 }
 
 pub fn random_f64_mat4s(n: usize) -> Vec<[f64; 16]> {
     let mut rng = make_rng();
-    (0..n).map(|_| {
-        let mut m = [0.0f64; 16];
-        for v in &mut m { *v = rng.f64(); }
-        m
-    }).collect()
+    (0..n)
+        .map(|_| {
+            let mut m = [0.0f64; 16];
+            for v in &mut m {
+                *v = rng.f64();
+            }
+            m
+        })
+        .collect()
 }
 
 pub fn random_f32_mat4s(n: usize) -> Vec<[f32; 16]> {
     let mut rng = make_rng();
-    (0..n).map(|_| {
-        let mut m = [0.0f32; 16];
-        for v in &mut m { *v = rng.f32(); }
-        m
-    }).collect()
+    (0..n)
+        .map(|_| {
+            let mut m = [0.0f32; 16];
+            for v in &mut m {
+                *v = rng.f32();
+            }
+            m
+        })
+        .collect()
 }
 
 pub fn random_f64_mat3s(n: usize) -> Vec<[f64; 9]> {
     let mut rng = make_rng();
-    (0..n).map(|_| {
-        let mut m = [0.0f64; 9];
-        for v in &mut m { *v = rng.f64(); }
-        m
-    }).collect()
+    (0..n)
+        .map(|_| {
+            let mut m = [0.0f64; 9];
+            for v in &mut m {
+                *v = rng.f64();
+            }
+            m
+        })
+        .collect()
 }
 
 pub fn random_f64_flat(size: usize) -> Vec<f64> {
@@ -193,7 +247,9 @@ pub fn random_spd_flat(size: usize) -> Vec<f64> {
                 // a is column-major: a[k + i*size] = A[k][i]
                 sum += a[i * size + k] * a[j * size + k]; // A^T[i][k] * A[k][j]
             }
-            if i == j { sum += 0.1; }
+            if i == j {
+                sum += 0.1;
+            }
             result[j * size + i] = sum; // column-major
         }
     }

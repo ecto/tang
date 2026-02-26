@@ -140,9 +140,7 @@ fn mat3_determinant(c: &mut Criterion) {
     group.bench_function("nalgebra", |b| {
         let d = random_f64_mat3s(1);
         let m = nalgebra::Matrix3::new(
-            d[0][0], d[0][1], d[0][2],
-            d[0][3], d[0][4], d[0][5],
-            d[0][6], d[0][7], d[0][8],
+            d[0][0], d[0][1], d[0][2], d[0][3], d[0][4], d[0][5], d[0][6], d[0][7], d[0][8],
         );
         b.iter(|| black_box(black_box(m).determinant()))
     });
@@ -154,20 +152,12 @@ fn mat3_inverse(c: &mut Criterion) {
     let mut group = c.benchmark_group("mat3/inverse");
 
     group.bench_function("tang", |b| {
-        let m = tang::Mat3::new(
-            1.0, 2.0, 3.0,
-            0.0, 1.0, 4.0,
-            5.0, 6.0, 0.0,
-        );
+        let m = tang::Mat3::new(1.0, 2.0, 3.0, 0.0, 1.0, 4.0, 5.0, 6.0, 0.0);
         b.iter(|| black_box(black_box(m).try_inverse()))
     });
 
     group.bench_function("nalgebra", |b| {
-        let m = nalgebra::Matrix3::new(
-            1.0, 2.0, 3.0,
-            0.0, 1.0, 4.0,
-            5.0, 6.0, 0.0,
-        );
+        let m = nalgebra::Matrix3::new(1.0, 2.0, 3.0, 0.0, 1.0, 4.0, 5.0, 6.0, 0.0);
         b.iter(|| black_box(black_box(m).try_inverse()))
     });
 
@@ -186,14 +176,10 @@ fn mat3_mul(c: &mut Criterion) {
     group.bench_function("nalgebra", |b| {
         let d = random_f64_mat3s(2);
         let a = nalgebra::Matrix3::new(
-            d[0][0], d[0][1], d[0][2],
-            d[0][3], d[0][4], d[0][5],
-            d[0][6], d[0][7], d[0][8],
+            d[0][0], d[0][1], d[0][2], d[0][3], d[0][4], d[0][5], d[0][6], d[0][7], d[0][8],
         );
         let v = nalgebra::Matrix3::new(
-            d[1][0], d[1][1], d[1][2],
-            d[1][3], d[1][4], d[1][5],
-            d[1][6], d[1][7], d[1][8],
+            d[1][0], d[1][1], d[1][2], d[1][3], d[1][4], d[1][5], d[1][6], d[1][7], d[1][8],
         );
         b.iter(|| black_box(black_box(a) * black_box(v)))
     });
@@ -212,9 +198,7 @@ fn mat3_transpose(c: &mut Criterion) {
     group.bench_function("nalgebra", |b| {
         let d = random_f64_mat3s(1);
         let m = nalgebra::Matrix3::new(
-            d[0][0], d[0][1], d[0][2],
-            d[0][3], d[0][4], d[0][5],
-            d[0][6], d[0][7], d[0][8],
+            d[0][0], d[0][1], d[0][2], d[0][3], d[0][4], d[0][5], d[0][6], d[0][7], d[0][8],
         );
         b.iter(|| black_box(black_box(m).transpose()))
     });
@@ -254,30 +238,21 @@ fn mat4_inverse(c: &mut Criterion) {
 
     group.bench_function("tang", |b| {
         let m = tang::Mat4::new(
-            1.0, 0.0, 2.0, 1.0,
-            0.0, 1.0, 0.0, 3.0,
-            2.0, 0.0, 1.0, 0.0,
-            1.0, 3.0, 0.0, 1.0,
+            1.0, 0.0, 2.0, 1.0, 0.0, 1.0, 0.0, 3.0, 2.0, 0.0, 1.0, 0.0, 1.0, 3.0, 0.0, 1.0,
         );
         b.iter(|| black_box(black_box(m).try_inverse()))
     });
 
     group.bench_function("nalgebra", |b| {
         let m = nalgebra::Matrix4::new(
-            1.0, 0.0, 2.0, 1.0,
-            0.0, 1.0, 0.0, 3.0,
-            2.0, 0.0, 1.0, 0.0,
-            1.0, 3.0, 0.0, 1.0,
+            1.0, 0.0, 2.0, 1.0, 0.0, 1.0, 0.0, 3.0, 2.0, 0.0, 1.0, 0.0, 1.0, 3.0, 0.0, 1.0,
         );
         b.iter(|| black_box(black_box(m).try_inverse()))
     });
 
     group.bench_function("glam", |b| {
         let m = glam::Mat4::from_cols_array(&[
-            1.0, 0.0, 2.0, 1.0,
-            0.0, 1.0, 0.0, 3.0,
-            2.0, 0.0, 1.0, 0.0,
-            1.0, 3.0, 0.0, 1.0,
+            1.0, 0.0, 2.0, 1.0, 0.0, 1.0, 0.0, 3.0, 2.0, 0.0, 1.0, 0.0, 1.0, 3.0, 0.0, 1.0,
         ]);
         b.iter(|| black_box(black_box(m).inverse()))
     });
@@ -344,19 +319,34 @@ fn quat_from_axis_angle(c: &mut Criterion) {
     group.bench_function("tang", |b| {
         let axis = tang::Vec3::new(0.0, 0.0, 1.0);
         let angle = 1.2f64;
-        b.iter(|| black_box(tang::Quat::from_axis_angle(black_box(axis), black_box(angle))))
+        b.iter(|| {
+            black_box(tang::Quat::from_axis_angle(
+                black_box(axis),
+                black_box(angle),
+            ))
+        })
     });
 
     group.bench_function("nalgebra", |b| {
         let axis = nalgebra::Unit::new_normalize(nalgebra::Vector3::new(0.0, 0.0, 1.0));
         let angle = 1.2f64;
-        b.iter(|| black_box(nalgebra::UnitQuaternion::from_axis_angle(&black_box(axis), black_box(angle))))
+        b.iter(|| {
+            black_box(nalgebra::UnitQuaternion::from_axis_angle(
+                &black_box(axis),
+                black_box(angle),
+            ))
+        })
     });
 
     group.bench_function("glam", |b| {
         let axis = glam::Vec3::new(0.0, 0.0, 1.0);
         let angle = 1.2f32;
-        b.iter(|| black_box(glam::Quat::from_axis_angle(black_box(axis), black_box(angle))))
+        b.iter(|| {
+            black_box(glam::Quat::from_axis_angle(
+                black_box(axis),
+                black_box(angle),
+            ))
+        })
     });
 
     group.finish();
@@ -540,7 +530,8 @@ fn workload_transform_points(c: &mut Criterion) {
     });
 
     group.bench_function("glam", |b| {
-        let m = glam::Mat4::from_rotation_z(0.5f32) * glam::Mat4::from_translation(glam::Vec3::new(1.0, 2.0, 3.0));
+        let m = glam::Mat4::from_rotation_z(0.5f32)
+            * glam::Mat4::from_translation(glam::Vec3::new(1.0, 2.0, 3.0));
         let data = random_f32_triples(n);
         let points: Vec<glam::Vec3> = data
             .iter()

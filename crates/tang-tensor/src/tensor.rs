@@ -1,7 +1,7 @@
+use crate::Shape;
 use alloc::vec::Vec;
 use tang::Scalar;
-use tang_la::{DVec, DMat};
-use crate::Shape;
+use tang_la::{DMat, DVec};
 
 /// N-dimensional tensor with CPU storage.
 #[derive(Debug, Clone)]
@@ -16,7 +16,11 @@ impl<S: Scalar> Tensor<S> {
     pub fn new(data: Vec<S>, shape: Shape) -> Self {
         let strides = shape.contiguous_strides();
         debug_assert_eq!(data.len(), shape.numel());
-        Self { data, shape, strides }
+        Self {
+            data,
+            shape,
+            strides,
+        }
     }
 
     /// Create a tensor filled with zeros.
@@ -50,7 +54,11 @@ impl<S: Scalar> Tensor<S> {
                 idx[d] = 0;
             }
         }
-        Self { data, shape, strides }
+        Self {
+            data,
+            shape,
+            strides,
+        }
     }
 
     /// Scalar tensor.
@@ -63,12 +71,24 @@ impl<S: Scalar> Tensor<S> {
         Self::new(s.to_vec(), Shape::from_slice(&[s.len()]))
     }
 
-    pub fn shape(&self) -> &Shape { &self.shape }
-    pub fn strides(&self) -> &[usize] { &self.strides }
-    pub fn ndim(&self) -> usize { self.shape.ndim() }
-    pub fn numel(&self) -> usize { self.shape.numel() }
-    pub fn data(&self) -> &[S] { &self.data }
-    pub fn data_mut(&mut self) -> &mut [S] { &mut self.data }
+    pub fn shape(&self) -> &Shape {
+        &self.shape
+    }
+    pub fn strides(&self) -> &[usize] {
+        &self.strides
+    }
+    pub fn ndim(&self) -> usize {
+        self.shape.ndim()
+    }
+    pub fn numel(&self) -> usize {
+        self.shape.numel()
+    }
+    pub fn data(&self) -> &[S] {
+        &self.data
+    }
+    pub fn data_mut(&mut self) -> &mut [S] {
+        &mut self.data
+    }
 
     /// Whether strides match contiguous layout.
     pub fn is_contiguous(&self) -> bool {
@@ -78,7 +98,10 @@ impl<S: Scalar> Tensor<S> {
     /// Flat index from multi-index.
     fn flat_index(&self, idx: &[usize]) -> usize {
         debug_assert_eq!(idx.len(), self.ndim());
-        idx.iter().zip(self.strides.iter()).map(|(i, s)| i * s).sum()
+        idx.iter()
+            .zip(self.strides.iter())
+            .map(|(i, s)| i * s)
+            .sum()
     }
 
     /// Get element by multi-index.
@@ -94,7 +117,11 @@ impl<S: Scalar> Tensor<S> {
 
     /// Reshape to new shape (must have same numel). Returns a new contiguous tensor.
     pub fn reshape(&self, new_shape: Shape) -> Self {
-        assert_eq!(self.shape.numel(), new_shape.numel(), "reshape: incompatible sizes");
+        assert_eq!(
+            self.shape.numel(),
+            new_shape.numel(),
+            "reshape: incompatible sizes"
+        );
         let data = if self.is_contiguous() {
             self.data.clone()
         } else {
@@ -149,8 +176,12 @@ impl<S: Scalar> Tensor<S> {
     pub fn zip_with(&self, other: &Self, f: impl Fn(S, S) -> S) -> Self {
         if self.shape == other.shape {
             // Fast path: same shape
-            let data: Vec<S> = self.data.iter().zip(other.data.iter())
-                .map(|(&a, &b)| f(a, b)).collect();
+            let data: Vec<S> = self
+                .data
+                .iter()
+                .zip(other.data.iter())
+                .map(|(&a, &b)| f(a, b))
+                .collect();
             return Self::new(data, self.shape.clone());
         }
 
@@ -206,11 +237,21 @@ impl<S: Scalar> Tensor<S> {
 
     // --- Transcendentals ---
 
-    pub fn exp(&self) -> Self { self.map(|v| v.exp()) }
-    pub fn ln(&self) -> Self { self.map(|v| v.ln()) }
-    pub fn tanh(&self) -> Self { self.map(|v| v.tanh()) }
-    pub fn abs(&self) -> Self { self.map(|v| v.abs()) }
-    pub fn sqrt(&self) -> Self { self.map(|v| v.sqrt()) }
+    pub fn exp(&self) -> Self {
+        self.map(|v| v.exp())
+    }
+    pub fn ln(&self) -> Self {
+        self.map(|v| v.ln())
+    }
+    pub fn tanh(&self) -> Self {
+        self.map(|v| v.tanh())
+    }
+    pub fn abs(&self) -> Self {
+        self.map(|v| v.abs())
+    }
+    pub fn sqrt(&self) -> Self {
+        self.map(|v| v.sqrt())
+    }
 
     /// ReLU activation.
     pub fn relu(&self) -> Self {
@@ -222,7 +263,10 @@ impl<S: Scalar> Tensor<S> {
 
     /// Sum all elements.
     pub fn sum(&self) -> S {
-        self.data.iter().copied().fold(S::from_f64(0.0), |a, b| a + b)
+        self.data
+            .iter()
+            .copied()
+            .fold(S::from_f64(0.0), |a, b| a + b)
     }
 
     /// Mean of all elements.
@@ -234,7 +278,9 @@ impl<S: Scalar> Tensor<S> {
     pub fn max(&self) -> S {
         let mut m = self.data[0];
         for &v in &self.data[1..] {
-            if v > m { m = v; }
+            if v > m {
+                m = v;
+            }
         }
         m
     }

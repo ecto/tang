@@ -12,7 +12,9 @@ impl Shape {
     }
 
     pub fn from_slice(dims: &[usize]) -> Self {
-        Self { dims: dims.to_vec() }
+        Self {
+            dims: dims.to_vec(),
+        }
     }
 
     pub fn scalar() -> Self {
@@ -51,8 +53,16 @@ impl Shape {
         let n = a.ndim().max(b.ndim());
         let mut result = Vec::with_capacity(n);
         for i in 0..n {
-            let da = if i < n - a.ndim() { 1 } else { a.dims[i - (n - a.ndim())] };
-            let db = if i < n - b.ndim() { 1 } else { b.dims[i - (n - b.ndim())] };
+            let da = if i < n - a.ndim() {
+                1
+            } else {
+                a.dims[i - (n - a.ndim())]
+            };
+            let db = if i < n - b.ndim() {
+                1
+            } else {
+                b.dims[i - (n - b.ndim())]
+            };
             if da == db {
                 result.push(da);
             } else if da == 1 {

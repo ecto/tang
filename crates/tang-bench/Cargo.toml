@@ -23,10 +23,15 @@ harness = false
 name = "differentiable"
 harness = false
 
+[[bench]]
+name = "expr_graph"
+harness = false
+
 [dependencies]
-tang    = { workspace = true, features = ["std"] }
-tang-la = { workspace = true, features = ["std"] }
-tang-ad = { workspace = true }
+tang      = { workspace = true, features = ["std"] }
+tang-la   = { workspace = true, features = ["std"] }
+tang-ad   = { workspace = true }
+tang-expr = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

@@ -1,4 +1,4 @@
-use crate::{Scalar, Vec3, Point3, Mat3, Mat4, Dir3, Quat};
+use crate::{Dir3, Mat3, Mat4, Point3, Quat, Scalar, Vec3};
 
 /// Rigid body transform (isometry): rotation + translation.
 ///
@@ -18,7 +18,10 @@ pub struct Transform<S> {
 impl<S: Scalar> Transform<S> {
     #[inline]
     pub fn new(rotation: Mat3<S>, translation: Vec3<S>) -> Self {
-        Self { rotation, translation }
+        Self {
+            rotation,
+            translation,
+        }
     }
 
     #[inline]
@@ -44,9 +47,15 @@ impl<S: Scalar> Transform<S> {
         Self::new(q.to_matrix(), t)
     }
 
-    pub fn rot_x(angle: S) -> Self { Self::from_rotation(Mat3::rotation_x(angle)) }
-    pub fn rot_y(angle: S) -> Self { Self::from_rotation(Mat3::rotation_y(angle)) }
-    pub fn rot_z(angle: S) -> Self { Self::from_rotation(Mat3::rotation_z(angle)) }
+    pub fn rot_x(angle: S) -> Self {
+        Self::from_rotation(Mat3::rotation_x(angle))
+    }
+    pub fn rot_y(angle: S) -> Self {
+        Self::from_rotation(Mat3::rotation_y(angle))
+    }
+    pub fn rot_z(angle: S) -> Self {
+        Self::from_rotation(Mat3::rotation_z(angle))
+    }
 
     pub fn rot_axis(axis: Vec3<S>, angle: S) -> Self {
         Self::from_rotation(Mat3::rotation_axis(axis, angle))
@@ -117,7 +126,9 @@ impl<S: Scalar> Transform<S> {
 }
 
 impl<S: Scalar> Default for Transform<S> {
-    fn default() -> Self { Self::identity() }
+    fn default() -> Self {
+        Self::identity()
+    }
 }
 
 #[cfg(test)]
@@ -126,10 +137,7 @@ mod tests {
 
     #[test]
     fn inverse_roundtrip() {
-        let t = Transform::new(
-            Mat3::rotation_z(1.0),
-            Vec3::new(1.0, 2.0, 3.0),
-        );
+        let t = Transform::new(Mat3::rotation_z(1.0), Vec3::new(1.0, 2.0, 3.0));
         let ti = t.inverse();
         let id = t.compose(&ti);
         let p = Point3::new(5.0, 6.0, 7.0);

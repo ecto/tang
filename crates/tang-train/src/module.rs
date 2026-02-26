@@ -1,6 +1,6 @@
+use crate::Parameter;
 use alloc::vec::Vec;
 use tang_tensor::Tensor;
-use crate::Parameter;
 
 /// Trait for neural network modules.
 pub trait Module {

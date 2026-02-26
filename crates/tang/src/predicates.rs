@@ -17,18 +17,36 @@ pub enum Sign {
 
 impl Sign {
     pub fn from_f64(v: f64) -> Self {
-        if v > 0.0 { Sign::Positive }
-        else if v < 0.0 { Sign::Negative }
-        else { Sign::Zero }
+        if v > 0.0 {
+            Sign::Positive
+        } else if v < 0.0 {
+            Sign::Negative
+        } else {
+            Sign::Zero
+        }
     }
 
-    pub fn is_positive(self) -> bool { self == Sign::Positive }
-    pub fn is_negative(self) -> bool { self == Sign::Negative }
-    pub fn is_zero(self) -> bool { self == Sign::Zero }
+    pub fn is_positive(self) -> bool {
+        self == Sign::Positive
+    }
+    pub fn is_negative(self) -> bool {
+        self == Sign::Negative
+    }
+    pub fn is_zero(self) -> bool {
+        self == Sign::Zero
+    }
 }
 
-fn c2(p: &Point2<f64>) -> robust::Coord<f64> { robust::Coord { x: p.x, y: p.y } }
-fn c3(p: &Point3<f64>) -> robust::Coord3D<f64> { robust::Coord3D { x: p.x, y: p.y, z: p.z } }
+fn c2(p: &Point2<f64>) -> robust::Coord<f64> {
+    robust::Coord { x: p.x, y: p.y }
+}
+fn c3(p: &Point3<f64>) -> robust::Coord3D<f64> {
+    robust::Coord3D {
+        x: p.x,
+        y: p.y,
+        z: p.z,
+    }
+}
 
 /// Orientation of point `c` relative to directed line `a → b`.
 /// Positive = left (CCW), Negative = right (CW), Zero = collinear.
@@ -49,7 +67,11 @@ pub fn incircle(a: &Point2<f64>, b: &Point2<f64>, c: &Point2<f64>, d: &Point2<f6
 
 /// Is point `e` inside the circumsphere of tetrahedron `abcd`?
 pub fn insphere(
-    a: &Point3<f64>, b: &Point3<f64>, c: &Point3<f64>, d: &Point3<f64>, e: &Point3<f64>,
+    a: &Point3<f64>,
+    b: &Point3<f64>,
+    c: &Point3<f64>,
+    d: &Point3<f64>,
+    e: &Point3<f64>,
 ) -> Sign {
     Sign::from_f64(robust::insphere(c3(a), c3(b), c3(c), c3(d), c3(e)))
 }
@@ -57,22 +79,20 @@ pub fn insphere(
 // Derived predicates
 
 pub fn point_on_segment_2d(p: &Point2<f64>, a: &Point2<f64>, b: &Point2<f64>) -> bool {
-    if !orient2d(a, b, p).is_zero() { return false; }
+    if !orient2d(a, b, p).is_zero() {
+        return false;
+    }
     let d = *b - *a;
     let t = *p - *a;
     let dot = d.dot(t);
     dot >= 0.0 && dot <= d.norm_sq()
 }
 
-pub fn point_on_plane(
-    p: &Point3<f64>, a: &Point3<f64>, b: &Point3<f64>, c: &Point3<f64>,
-) -> bool {
+pub fn point_on_plane(p: &Point3<f64>, a: &Point3<f64>, b: &Point3<f64>, c: &Point3<f64>) -> bool {
     orient3d(a, b, c, p).is_zero()
 }
 
-pub fn are_coplanar(
-    a: &Point3<f64>, b: &Point3<f64>, c: &Point3<f64>, d: &Point3<f64>,
-) -> bool {
+pub fn are_coplanar(a: &Point3<f64>, b: &Point3<f64>, c: &Point3<f64>, d: &Point3<f64>) -> bool {
     orient3d(a, b, c, d).is_zero()
 }
 
@@ -82,13 +102,13 @@ pub fn are_collinear_2d(a: &Point2<f64>, b: &Point2<f64>, c: &Point2<f64>) -> bo
 
 /// Which side of line `a → b` is point `p` on?
 /// Returns None if `p` is at an endpoint (for ray-casting use).
-pub fn point_side_of_line(
-    p: &Point2<f64>, a: &Point2<f64>, b: &Point2<f64>,
-) -> Option<Sign> {
+pub fn point_side_of_line(p: &Point2<f64>, a: &Point2<f64>, b: &Point2<f64>) -> Option<Sign> {
     let eps = 1e-10;
     let d_a = p.distance_sq(*a);
     let d_b = p.distance_sq(*b);
-    if d_a < eps || d_b < eps { return None; }
+    if d_a < eps || d_b < eps {
+        return None;
+    }
     Some(orient2d(a, b, p))
 }
 

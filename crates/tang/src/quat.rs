@@ -1,4 +1,4 @@
-use crate::{Scalar, Vec3, Mat3};
+use crate::{Mat3, Scalar, Vec3};
 
 /// Quaternion: w + xi + yj + zk
 ///
@@ -16,12 +16,18 @@ pub struct Quat<S> {
 impl<S: Scalar> Quat<S> {
     #[inline]
     pub fn new(w: S, x: S, y: S, z: S) -> Self {
-        Self { w, v: Vec3::new(x, y, z) }
+        Self {
+            w,
+            v: Vec3::new(x, y, z),
+        }
     }
 
     #[inline]
     pub fn identity() -> Self {
-        Self { w: S::ONE, v: Vec3::zero() }
+        Self {
+            w: S::ONE,
+            v: Vec3::zero(),
+        }
     }
 
     /// Quaternion from axis-angle representation
@@ -37,11 +43,16 @@ impl<S: Scalar> Quat<S> {
     }
 
     #[inline]
-    pub fn norm(&self) -> S { self.norm_sq().sqrt() }
+    pub fn norm(&self) -> S {
+        self.norm_sq().sqrt()
+    }
 
     pub fn normalize(&self) -> Self {
         let n = self.norm();
-        Self { w: self.w / n, v: self.v / n }
+        Self {
+            w: self.w / n,
+            v: self.v / n,
+        }
     }
 
     /// Quaternion multiplication (Hamilton product)
@@ -55,7 +66,10 @@ impl<S: Scalar> Quat<S> {
     /// Conjugate (inverse for unit quaternions)
     #[inline]
     pub fn conjugate(&self) -> Self {
-        Self { w: self.w, v: -self.v }
+        Self {
+            w: self.w,
+            v: -self.v,
+        }
     }
 
     /// Convert to 3x3 rotation matrix
@@ -67,9 +81,15 @@ impl<S: Scalar> Quat<S> {
         let w = self.w;
 
         Mat3::new(
-            S::ONE - two * (y * y + z * z), two * (x * y - w * z),         two * (x * z + w * y),
-            two * (x * y + w * z),         S::ONE - two * (x * x + z * z), two * (y * z - w * x),
-            two * (x * z - w * y),         two * (y * z + w * x),         S::ONE - two * (x * x + y * y),
+            S::ONE - two * (y * y + z * z),
+            two * (x * y - w * z),
+            two * (x * z + w * y),
+            two * (x * y + w * z),
+            S::ONE - two * (x * x + z * z),
+            two * (y * z - w * x),
+            two * (x * z - w * y),
+            two * (y * z + w * x),
+            S::ONE - two * (x * x + y * y),
         )
     }
 
@@ -124,11 +144,17 @@ impl<S: Scalar> Quat<S> {
     pub fn exp(omega: &Vec3<S>) -> Quat<S> {
         let angle = omega.norm();
         if angle < S::EPSILON {
-            return Quat { w: S::ONE, v: *omega * S::HALF };
+            return Quat {
+                w: S::ONE,
+                v: *omega * S::HALF,
+            };
         }
         let half_angle = angle * S::HALF;
         let (s, c) = half_angle.sin_cos();
-        Quat { w: c, v: *omega * (s / angle) }
+        Quat {
+            w: c,
+            v: *omega * (s / angle),
+        }
     }
 
     /// Logarithmic map: SO(3) → so(3)
@@ -159,7 +185,10 @@ impl<S: Scalar> Quat<S> {
 
         // Ensure shortest path
         if dot < S::ZERO {
-            other = Quat { w: -other.w, v: -other.v };
+            other = Quat {
+                w: -other.w,
+                v: -other.v,
+            };
             dot = -dot;
         }
 
@@ -168,7 +197,8 @@ impl<S: Scalar> Quat<S> {
             return Quat {
                 w: self.w + (other.w - self.w) * t,
                 v: self.v + (other.v - self.v) * t,
-            }.normalize();
+            }
+            .normalize();
         }
 
         let theta = dot.acos();
@@ -184,7 +214,9 @@ impl<S: Scalar> Quat<S> {
 }
 
 impl<S: Scalar> Default for Quat<S> {
-    fn default() -> Self { Self::identity() }
+    fn default() -> Self {
+        Self::identity()
+    }
 }
 
 #[cfg(test)]
@@ -212,10 +244,7 @@ mod tests {
 
     #[test]
     fn matrix_roundtrip() {
-        let q = Quat::from_axis_angle(
-            Vec3::new(1.0, 1.0, 1.0).normalize(),
-            1.2,
-        );
+        let q = Quat::from_axis_angle(Vec3::new(1.0, 1.0, 1.0).normalize(), 1.2);
         let m = q.to_matrix();
         let q2 = Quat::from_matrix(&m);
         // Quaternions are equivalent up to sign

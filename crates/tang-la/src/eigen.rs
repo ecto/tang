@@ -1,7 +1,7 @@
-use tang::Scalar;
-use crate::{DVec, DMat};
-use alloc::vec::Vec;
+use crate::{DMat, DVec};
 use alloc::vec;
+use alloc::vec::Vec;
+use tang::Scalar;
 
 /// Eigendecomposition of a symmetric matrix: A = V * diag(λ) * V^T
 ///
@@ -32,12 +32,19 @@ impl<S: Scalar> SymmetricEigen<S> {
 
         // Sort eigenvalues ascending and reorder eigenvectors
         let mut indices: Vec<usize> = (0..n).collect();
-        indices.sort_by(|&a, &b| diag[a].partial_cmp(&diag[b]).unwrap_or(core::cmp::Ordering::Equal));
+        indices.sort_by(|&a, &b| {
+            diag[a]
+                .partial_cmp(&diag[b])
+                .unwrap_or(core::cmp::Ordering::Equal)
+        });
 
         let eigenvalues = DVec::from_fn(n, |i| diag[indices[i]]);
         let eigenvectors = DMat::from_fn(n, n, |i, j| q.get(i, indices[j]));
 
-        Self { eigenvalues, eigenvectors }
+        Self {
+            eigenvalues,
+            eigenvectors,
+        }
     }
 
     /// Classical Jacobi eigenvalue algorithm — robust for small matrices.
@@ -89,7 +96,9 @@ impl<S: Scalar> SymmetricEigen<S> {
             d.set(q, p, S::ZERO);
 
             for i in 0..n {
-                if i == p || i == q { continue; }
+                if i == p || i == q {
+                    continue;
+                }
                 let dip = d.get(i, p);
                 let diq = d.get(i, q);
                 d.set(i, p, c * dip - s * diq);
@@ -112,7 +121,10 @@ impl<S: Scalar> SymmetricEigen<S> {
         let eigenvalues = DVec::from_fn(n, |i| eigs[i].0);
         let eigenvectors = DMat::from_fn(n, n, |i, j| v.get(i, eigs[j].1));
 
-        Self { eigenvalues, eigenvectors }
+        Self {
+            eigenvalues,
+            eigenvectors,
+        }
     }
 
     /// Householder tridiagonalization of symmetric matrix.
@@ -134,7 +146,11 @@ impl<S: Scalar> SymmetricEigen<S> {
             }
 
             let x_norm = x_norm_sq.sqrt();
-            let alpha = if a.get(k + 1, k) >= S::ZERO { -x_norm } else { x_norm };
+            let alpha = if a.get(k + 1, k) >= S::ZERO {
+                -x_norm
+            } else {
+                x_norm
+            };
 
             // Householder vector: v = x - alpha * e1
             // v[k+1] = a[k+1,k] - alpha, v[i] = a[i,k] for i > k+1
@@ -327,9 +343,7 @@ mod tests {
 
     #[test]
     fn diagonal_matrix() {
-        let a = DMat::from_fn(3, 3, |i, j| {
-            if i == j { (i + 1) as f64 } else { 0.0 }
-        });
+        let a = DMat::from_fn(3, 3, |i, j| if i == j { (i + 1) as f64 } else { 0.0 });
         let eig = SymmetricEigen::new(&a);
         assert!((eig.eigenvalues[0] - 1.0).abs() < 1e-10);
         assert!((eig.eigenvalues[1] - 2.0).abs() < 1e-10);
@@ -345,8 +359,14 @@ mod tests {
         let recon = eig.reconstruct();
         for i in 0..3 {
             for j in 0..3 {
-                assert!((recon.get(i, j) - a.get(i, j)).abs() < 1e-8,
-                    "mismatch at ({}, {}): {} vs {}", i, j, recon.get(i, j), a.get(i, j));
+                assert!(
+                    (recon.get(i, j) - a.get(i, j)).abs() < 1e-8,
+                    "mismatch at ({}, {}): {} vs {}",
+                    i,
+                    j,
+                    recon.get(i, j),
+                    a.get(i, j)
+                );
             }
         }
     }
@@ -361,17 +381,20 @@ mod tests {
         for i in 0..3 {
             for j in 0..3 {
                 let expected = if i == j { 1.0 } else { 0.0 };
-                assert!((vtv.get(i, j) - expected).abs() < 1e-8,
-                    "V^T V mismatch at ({}, {}): {}", i, j, vtv.get(i, j));
+                assert!(
+                    (vtv.get(i, j) - expected).abs() < 1e-8,
+                    "V^T V mismatch at ({}, {}): {}",
+                    i,
+                    j,
+                    vtv.get(i, j)
+                );
             }
         }
     }
 
     #[test]
     fn jacobi_small() {
-        let a = DMat::from_fn(2, 2, |i, j| {
-            [[3.0, 1.0], [1.0, 2.0]][i][j]
-        });
+        let a = DMat::from_fn(2, 2, |i, j| [[3.0, 1.0], [1.0, 2.0]][i][j]);
         let eig = SymmetricEigen::jacobi(&a);
         let expected_0 = (5.0 - 5.0_f64.sqrt()) / 2.0;
         let expected_1 = (5.0 + 5.0_f64.sqrt()) / 2.0;
@@ -383,8 +406,11 @@ mod tests {
     fn larger_matrix() {
         let n = 5;
         let a = DMat::from_fn(n, n, |i, j| {
-            if i == j { (i + 1) as f64 * 2.0 }
-            else { 1.0 / ((i as f64 - j as f64).abs() + 1.0) }
+            if i == j {
+                (i + 1) as f64 * 2.0
+            } else {
+                1.0 / ((i as f64 - j as f64).abs() + 1.0)
+            }
         });
         let a = DMat::from_fn(n, n, |i, j| (a.get(i, j) + a.get(j, i)) * 0.5);
 
@@ -392,8 +418,14 @@ mod tests {
         let recon = eig.reconstruct();
         for i in 0..n {
             for j in 0..n {
-                assert!((recon.get(i, j) - a.get(i, j)).abs() < 1e-8,
-                    "mismatch at ({}, {}): {} vs {}", i, j, recon.get(i, j), a.get(i, j));
+                assert!(
+                    (recon.get(i, j) - a.get(i, j)).abs() < 1e-8,
+                    "mismatch at ({}, {}): {} vs {}",
+                    i,
+                    j,
+                    recon.get(i, j),
+                    a.get(i, j)
+                );
             }
         }
 
@@ -401,8 +433,13 @@ mod tests {
         for i in 0..n {
             for j in 0..n {
                 let expected = if i == j { 1.0 } else { 0.0 };
-                assert!((vtv.get(i, j) - expected).abs() < 1e-8,
-                    "V^T V mismatch at ({}, {}): {}", i, j, vtv.get(i, j));
+                assert!(
+                    (vtv.get(i, j) - expected).abs() < 1e-8,
+                    "V^T V mismatch at ({}, {}): {}",
+                    i,
+                    j,
+                    vtv.get(i, j)
+                );
             }
         }
     }
@@ -411,8 +448,11 @@ mod tests {
     fn medium_matrix_10x10() {
         let n = 10;
         let a = DMat::from_fn(n, n, |i, j| {
-            if i == j { (i + 1) as f64 * 3.0 }
-            else { 1.0 / ((i as f64 - j as f64).abs() + 0.5) }
+            if i == j {
+                (i + 1) as f64 * 3.0
+            } else {
+                1.0 / ((i as f64 - j as f64).abs() + 0.5)
+            }
         });
         let a = DMat::from_fn(n, n, |i, j| (a.get(i, j) + a.get(j, i)) * 0.5);
 
@@ -420,8 +460,14 @@ mod tests {
         let recon = eig.reconstruct();
         for i in 0..n {
             for j in 0..n {
-                assert!((recon.get(i, j) - a.get(i, j)).abs() < 1e-6,
-                    "mismatch at ({}, {}): {} vs {}", i, j, recon.get(i, j), a.get(i, j));
+                assert!(
+                    (recon.get(i, j) - a.get(i, j)).abs() < 1e-6,
+                    "mismatch at ({}, {}): {} vs {}",
+                    i,
+                    j,
+                    recon.get(i, j),
+                    a.get(i, j)
+                );
             }
         }
     }

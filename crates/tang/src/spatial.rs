@@ -1,5 +1,5 @@
-use crate::{Scalar, Vec3, Mat3, Transform, skew};
-use core::ops::{Add, Sub, Mul, Neg};
+use crate::{skew, Mat3, Scalar, Transform, Vec3};
+use core::ops::{Add, Mul, Neg, Sub};
 
 /// Spatial (6D) vector — represents either a twist (motion) or wrench (force).
 ///
@@ -61,39 +61,51 @@ impl<S: Scalar> SpatialVec<S> {
     /// Convert to a flat [S; 6] array
     #[inline]
     pub fn as_array(&self) -> [S; 6] {
-        [self.angular.x, self.angular.y, self.angular.z,
-         self.linear.x, self.linear.y, self.linear.z]
+        [
+            self.angular.x,
+            self.angular.y,
+            self.angular.z,
+            self.linear.x,
+            self.linear.y,
+            self.linear.z,
+        ]
     }
 }
 
 impl<S: Scalar> Default for SpatialVec<S> {
-    fn default() -> Self { Self::zero() }
+    fn default() -> Self {
+        Self::zero()
+    }
 }
 
 impl<S: Scalar> Add for SpatialVec<S> {
     type Output = Self;
-    #[inline] fn add(self, rhs: Self) -> Self {
+    #[inline]
+    fn add(self, rhs: Self) -> Self {
         Self::new(self.angular + rhs.angular, self.linear + rhs.linear)
     }
 }
 
 impl<S: Scalar> Sub for SpatialVec<S> {
     type Output = Self;
-    #[inline] fn sub(self, rhs: Self) -> Self {
+    #[inline]
+    fn sub(self, rhs: Self) -> Self {
         Self::new(self.angular - rhs.angular, self.linear - rhs.linear)
     }
 }
 
 impl<S: Scalar> Neg for SpatialVec<S> {
     type Output = Self;
-    #[inline] fn neg(self) -> Self {
+    #[inline]
+    fn neg(self) -> Self {
         Self::new(-self.angular, -self.linear)
     }
 }
 
 impl<S: Scalar> Mul<S> for SpatialVec<S> {
     type Output = Self;
-    #[inline] fn mul(self, rhs: S) -> Self {
+    #[inline]
+    fn mul(self, rhs: S) -> Self {
         Self::new(self.angular * rhs, self.linear * rhs)
     }
 }
@@ -122,7 +134,12 @@ pub struct SpatialMat<S> {
 impl<S: Scalar> SpatialMat<S> {
     #[inline]
     pub fn new(ul: Mat3<S>, ur: Mat3<S>, ll: Mat3<S>, lr: Mat3<S>) -> Self {
-        Self { upper_left: ul, upper_right: ur, lower_left: ll, lower_right: lr }
+        Self {
+            upper_left: ul,
+            upper_right: ur,
+            lower_left: ll,
+            lower_right: lr,
+        }
     }
 
     #[inline]
@@ -133,7 +150,12 @@ impl<S: Scalar> SpatialMat<S> {
 
     #[inline]
     pub fn identity() -> Self {
-        Self::new(Mat3::identity(), Mat3::zero(), Mat3::zero(), Mat3::identity())
+        Self::new(
+            Mat3::identity(),
+            Mat3::zero(),
+            Mat3::zero(),
+            Mat3::identity(),
+        )
     }
 
     /// Multiply by a spatial vector (block matrix-vector product)
@@ -168,7 +190,8 @@ impl<S: Scalar> SpatialMat<S> {
 
 impl<S: Scalar> Add for SpatialMat<S> {
     type Output = Self;
-    #[inline] fn add(self, rhs: Self) -> Self {
+    #[inline]
+    fn add(self, rhs: Self) -> Self {
         Self::new(
             self.upper_left + rhs.upper_left,
             self.upper_right + rhs.upper_right,
@@ -180,7 +203,8 @@ impl<S: Scalar> Add for SpatialMat<S> {
 
 impl<S: Scalar> Sub for SpatialMat<S> {
     type Output = Self;
-    #[inline] fn sub(self, rhs: Self) -> Self {
+    #[inline]
+    fn sub(self, rhs: Self) -> Self {
         Self::new(
             self.upper_left - rhs.upper_left,
             self.upper_right - rhs.upper_right,
@@ -192,31 +216,44 @@ impl<S: Scalar> Sub for SpatialMat<S> {
 
 impl<S: Scalar> Neg for SpatialMat<S> {
     type Output = Self;
-    #[inline] fn neg(self) -> Self {
-        Self::new(-self.upper_left, -self.upper_right, -self.lower_left, -self.lower_right)
+    #[inline]
+    fn neg(self) -> Self {
+        Self::new(
+            -self.upper_left,
+            -self.upper_right,
+            -self.lower_left,
+            -self.lower_right,
+        )
     }
 }
 
 impl<S: Scalar> Mul<S> for SpatialMat<S> {
     type Output = Self;
-    #[inline] fn mul(self, rhs: S) -> Self {
+    #[inline]
+    fn mul(self, rhs: S) -> Self {
         Self::new(
-            self.upper_left * rhs, self.upper_right * rhs,
-            self.lower_left * rhs, self.lower_right * rhs,
+            self.upper_left * rhs,
+            self.upper_right * rhs,
+            self.lower_left * rhs,
+            self.lower_right * rhs,
         )
     }
 }
 
 impl<S: Scalar> Mul<SpatialVec<S>> for SpatialMat<S> {
     type Output = SpatialVec<S>;
-    #[inline] fn mul(self, rhs: SpatialVec<S>) -> SpatialVec<S> {
+    #[inline]
+    fn mul(self, rhs: SpatialVec<S>) -> SpatialVec<S> {
         self.mul_vec(&rhs)
     }
 }
 
 impl<S: Scalar> Mul for SpatialMat<S> {
     type Output = Self;
-    #[inline] fn mul(self, rhs: Self) -> Self { self.mul_mat(&rhs) }
+    #[inline]
+    fn mul(self, rhs: Self) -> Self {
+        self.mul_mat(&rhs)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -239,17 +276,29 @@ pub struct SpatialTransform<S> {
 
 impl<S: Scalar> SpatialTransform<S> {
     #[inline]
-    pub fn new(rot: Mat3<S>, pos: Vec3<S>) -> Self { Self { rot, pos } }
+    pub fn new(rot: Mat3<S>, pos: Vec3<S>) -> Self {
+        Self { rot, pos }
+    }
 
     #[inline]
-    pub fn identity() -> Self { Self::new(Mat3::identity(), Vec3::zero()) }
+    pub fn identity() -> Self {
+        Self::new(Mat3::identity(), Vec3::zero())
+    }
 
     #[inline]
-    pub fn from_translation(pos: Vec3<S>) -> Self { Self::new(Mat3::identity(), pos) }
+    pub fn from_translation(pos: Vec3<S>) -> Self {
+        Self::new(Mat3::identity(), pos)
+    }
 
-    pub fn rot_x(angle: S) -> Self { Self::new(Mat3::rotation_x(angle), Vec3::zero()) }
-    pub fn rot_y(angle: S) -> Self { Self::new(Mat3::rotation_y(angle), Vec3::zero()) }
-    pub fn rot_z(angle: S) -> Self { Self::new(Mat3::rotation_z(angle), Vec3::zero()) }
+    pub fn rot_x(angle: S) -> Self {
+        Self::new(Mat3::rotation_x(angle), Vec3::zero())
+    }
+    pub fn rot_y(angle: S) -> Self {
+        Self::new(Mat3::rotation_y(angle), Vec3::zero())
+    }
+    pub fn rot_z(angle: S) -> Self {
+        Self::new(Mat3::rotation_z(angle), Vec3::zero())
+    }
 
     pub fn rot_axis(axis: Vec3<S>, angle: S) -> Self {
         Self::new(Mat3::rotation_axis(axis, angle), Vec3::zero())
@@ -274,12 +323,7 @@ impl<S: Scalar> SpatialTransform<S> {
     /// ```
     pub fn to_motion_matrix(&self) -> SpatialMat<S> {
         let px = skew(&self.pos);
-        SpatialMat::new(
-            self.rot,
-            Mat3::zero(),
-            -self.rot.mul_mat(&px),
-            self.rot,
-        )
+        SpatialMat::new(self.rot, Mat3::zero(), -self.rot.mul_mat(&px), self.rot)
     }
 
     /// 6x6 force transform matrix (for forces/torques)
@@ -289,12 +333,7 @@ impl<S: Scalar> SpatialTransform<S> {
     /// ```
     pub fn to_force_matrix(&self) -> SpatialMat<S> {
         let px = skew(&self.pos);
-        SpatialMat::new(
-            self.rot,
-            -self.rot.mul_mat(&px),
-            Mat3::zero(),
-            self.rot,
-        )
+        SpatialMat::new(self.rot, -self.rot.mul_mat(&px), Mat3::zero(), self.rot)
     }
 
     /// Apply to a motion vector (twist) without building the 6x6 matrix
@@ -318,10 +357,7 @@ impl<S: Scalar> SpatialTransform<S> {
     pub fn inv_apply_motion(&self, v: &SpatialVec<S>) -> SpatialVec<S> {
         let rt = self.rot.transpose();
         let w = rt.mul_vec(v.angular);
-        SpatialVec::new(
-            w,
-            rt.mul_vec(v.linear) + self.pos.cross(w),
-        )
+        SpatialVec::new(w, rt.mul_vec(v.linear) + self.pos.cross(w))
     }
 
     /// Inverse-apply to a force vector: X^{-T} * f
@@ -354,7 +390,9 @@ impl<S: Scalar> SpatialTransform<S> {
 }
 
 impl<S: Scalar> Default for SpatialTransform<S> {
-    fn default() -> Self { Self::identity() }
+    fn default() -> Self {
+        Self::identity()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -386,21 +424,13 @@ impl<S: Scalar> SpatialInertia<S> {
     /// Uniform rod along Y axis
     pub fn rod(mass: S, length: S) -> Self {
         let i = mass * length * length / S::from_i32(12);
-        Self::new(
-            mass,
-            Vec3::zero(),
-            Mat3::diagonal(Vec3::new(i, S::ZERO, i)),
-        )
+        Self::new(mass, Vec3::zero(), Mat3::diagonal(Vec3::new(i, S::ZERO, i)))
     }
 
     /// Uniform solid sphere
     pub fn sphere(mass: S, radius: S) -> Self {
         let i = S::TWO * mass * radius * radius / S::from_i32(5);
-        Self::new(
-            mass,
-            Vec3::zero(),
-            Mat3::diagonal(Vec3::new(i, i, i)),
-        )
+        Self::new(mass, Vec3::zero(), Mat3::diagonal(Vec3::new(i, i, i)))
     }
 
     /// Convert to 6x6 spatial inertia matrix (block-structured)
@@ -461,10 +491,7 @@ mod tests {
 
     #[test]
     fn spatial_transform_inverse_roundtrip() {
-        let x = SpatialTransform::new(
-            Mat3::rotation_z(1.0),
-            Vec3::new(1.0, 2.0, 3.0),
-        );
+        let x = SpatialTransform::new(Mat3::rotation_z(1.0), Vec3::new(1.0, 2.0, 3.0));
         let v = SpatialVec::new(Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0));
         let forward = x.apply_motion(&v);
         let back = x.inv_apply_motion(&forward);
@@ -474,10 +501,7 @@ mod tests {
 
     #[test]
     fn spatial_mat_block_structure() {
-        let x = SpatialTransform::new(
-            Mat3::rotation_z(0.5),
-            Vec3::new(1.0, 0.0, 0.0),
-        );
+        let x = SpatialTransform::new(Mat3::rotation_z(0.5), Vec3::new(1.0, 0.0, 0.0));
         let motion_mat = x.to_motion_matrix();
         // Upper-right block should be zero for motion transforms
         assert_eq!(motion_mat.upper_right, Mat3::zero());

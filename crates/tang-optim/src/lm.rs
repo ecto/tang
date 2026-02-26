@@ -1,4 +1,4 @@
-use tang_la::{DVec, DMat, Lu};
+use tang_la::{DMat, DVec, Lu};
 
 /// Levenberg-Marquardt optimizer for nonlinear least-squares.
 ///
@@ -12,16 +12,15 @@ pub struct LevenbergMarquardt {
 
 impl LevenbergMarquardt {
     pub fn new() -> Self {
-        Self { max_iter: 100, tol: 1e-10, lambda_init: 1e-3 }
+        Self {
+            max_iter: 100,
+            tol: 1e-10,
+            lambda_init: 1e-3,
+        }
     }
 
     /// Minimize ||r(x)||^2 given residual and Jacobian functions.
-    pub fn minimize<R, J>(
-        &self,
-        x0: &DVec<f64>,
-        residual_fn: R,
-        jacobian_fn: J,
-    ) -> DVec<f64>
+    pub fn minimize<R, J>(&self, x0: &DVec<f64>, residual_fn: R, jacobian_fn: J) -> DVec<f64>
     where
         R: Fn(&DVec<f64>) -> DVec<f64>,
         J: Fn(&DVec<f64>) -> DMat<f64>,
@@ -103,6 +102,10 @@ mod tests {
             |x| DVec::from_slice(&[x[0] * x[0] - 4.0]),
             |x| DMat::from_fn(1, 1, |_, _| 2.0 * x[0]),
         );
-        assert!((result[0] - 2.0).abs() < 1e-6, "expected 2.0, got {}", result[0]);
+        assert!(
+            (result[0] - 2.0).abs() < 1e-6,
+            "expected 2.0, got {}",
+            result[0]
+        );
     }
 }

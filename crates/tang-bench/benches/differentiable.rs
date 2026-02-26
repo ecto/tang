@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use tang::{Dual, Scalar, Vec3, Quat};
+use tang::{Dual, Quat, Scalar, Vec3};
 use tang_la::{DMat, DVec, Lu};
 
 // ---------------------------------------------------------------------------
@@ -87,10 +87,7 @@ fn fk_jacobian(c: &mut Criterion) {
     // tang: jacobian_fwd — exact Jacobian via forward-mode AD
     group.bench_function("tang_jacobian_fwd", |b| {
         b.iter(|| {
-            let j = tang_ad::jacobian_fwd(
-                |x| fk_planar(black_box(x)),
-                black_box(&angles),
-            );
+            let j = tang_ad::jacobian_fwd(|x| fk_planar(black_box(x)), black_box(&angles));
             black_box(j)
         })
     });
@@ -200,10 +197,7 @@ fn hessian_rosenbrock(c: &mut Criterion) {
     // tang: hessian() via Dual<Dual<f64>> — exact second derivatives
     group.bench_function("tang_hessian", |b| {
         b.iter(|| {
-            let h = tang_ad::hessian(
-                |x| rosenbrock(black_box(x)),
-                black_box(&x0),
-            );
+            let h = tang_ad::hessian(|x| rosenbrock(black_box(x)), black_box(&x0));
             black_box(h)
         })
     });
@@ -220,12 +214,16 @@ fn hessian_rosenbrock(c: &mut Criterion) {
                     let mut xpm = black_box(x0);
                     let mut xmp = black_box(x0);
                     let mut xmm = black_box(x0);
-                    xpp[i] += h; xpp[j] += h;
-                    xpm[i] += h; xpm[j] -= h;
-                    xmp[i] -= h; xmp[j] += h;
-                    xmm[i] -= h; xmm[j] -= h;
-                    hess[i * n + j] = (rosenbrock(&xpp) - rosenbrock(&xpm)
-                        - rosenbrock(&xmp) + rosenbrock(&xmm))
+                    xpp[i] += h;
+                    xpp[j] += h;
+                    xpm[i] += h;
+                    xpm[j] -= h;
+                    xmp[i] -= h;
+                    xmp[j] += h;
+                    xmm[i] -= h;
+                    xmm[j] -= h;
+                    hess[i * n + j] = (rosenbrock(&xpp) - rosenbrock(&xpm) - rosenbrock(&xmp)
+                        + rosenbrock(&xmm))
                         / (4.0 * h * h);
                 }
             }

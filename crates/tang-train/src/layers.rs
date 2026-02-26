@@ -1,12 +1,12 @@
+use crate::{Module, Parameter};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use tang_tensor::{Tensor, Shape};
-use crate::{Parameter, Module};
+use tang_tensor::{Shape, Tensor};
 
 /// Fully-connected (dense) linear layer: y = xW^T + b
 pub struct Linear {
-    pub weight: Parameter,  // [out_features, in_features]
-    pub bias: Parameter,    // [out_features]
+    pub weight: Parameter, // [out_features, in_features]
+    pub bias: Parameter,   // [out_features]
 }
 
 impl Linear {
@@ -86,10 +86,16 @@ impl Module for Sequential {
     }
 
     fn parameters(&self) -> Vec<&Parameter> {
-        self.layers.iter().flat_map(|l: &Box<dyn Module>| l.parameters()).collect()
+        self.layers
+            .iter()
+            .flat_map(|l: &Box<dyn Module>| l.parameters())
+            .collect()
     }
 
     fn parameters_mut(&mut self) -> Vec<&mut Parameter> {
-        self.layers.iter_mut().flat_map(|l: &mut Box<dyn Module>| l.parameters_mut()).collect()
+        self.layers
+            .iter_mut()
+            .flat_map(|l: &mut Box<dyn Module>| l.parameters_mut())
+            .collect()
     }
 }

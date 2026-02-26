@@ -1,5 +1,5 @@
 use crate::Scalar;
-use core::ops::{Add, Sub, Mul, Div, Neg, AddAssign, SubAssign, MulAssign};
+use core::ops::{Add, AddAssign, Div, Mul, MulAssign, Neg, Sub, SubAssign};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
@@ -13,13 +13,19 @@ pub struct Vec4<S> {
 
 impl<S: Scalar> Vec4<S> {
     #[inline]
-    pub fn new(x: S, y: S, z: S, w: S) -> Self { Self { x, y, z, w } }
+    pub fn new(x: S, y: S, z: S, w: S) -> Self {
+        Self { x, y, z, w }
+    }
 
     #[inline]
-    pub fn zero() -> Self { Self::new(S::ZERO, S::ZERO, S::ZERO, S::ZERO) }
+    pub fn zero() -> Self {
+        Self::new(S::ZERO, S::ZERO, S::ZERO, S::ZERO)
+    }
 
     #[inline]
-    pub fn splat(v: S) -> Self { Self::new(v, v, v, v) }
+    pub fn splat(v: S) -> Self {
+        Self::new(v, v, v, v)
+    }
 
     #[inline]
     pub fn dot(self, rhs: Self) -> S {
@@ -27,10 +33,14 @@ impl<S: Scalar> Vec4<S> {
     }
 
     #[inline]
-    pub fn norm_sq(self) -> S { self.dot(self) }
+    pub fn norm_sq(self) -> S {
+        self.dot(self)
+    }
 
     #[inline]
-    pub fn norm(self) -> S { self.norm_sq().sqrt() }
+    pub fn norm(self) -> S {
+        self.norm_sq().sqrt()
+    }
 
     /// Truncate to Vec3 (drop w)
     #[inline]
@@ -49,67 +59,102 @@ impl<S: Scalar> Vec4<S> {
 // nalgebra compatibility: `v.dot(&w)` works via Into.
 impl<S: Scalar> From<&Vec4<S>> for Vec4<S> {
     #[inline]
-    fn from(v: &Vec4<S>) -> Self { *v }
+    fn from(v: &Vec4<S>) -> Self {
+        *v
+    }
 }
 
 impl<S: Scalar> Default for Vec4<S> {
-    fn default() -> Self { Self::zero() }
+    fn default() -> Self {
+        Self::zero()
+    }
 }
 
 impl<S: Scalar> Add for Vec4<S> {
     type Output = Self;
-    #[inline] fn add(self, rhs: Self) -> Self {
-        Self::new(self.x + rhs.x, self.y + rhs.y, self.z + rhs.z, self.w + rhs.w)
+    #[inline]
+    fn add(self, rhs: Self) -> Self {
+        Self::new(
+            self.x + rhs.x,
+            self.y + rhs.y,
+            self.z + rhs.z,
+            self.w + rhs.w,
+        )
     }
 }
 
 impl<S: Scalar> Sub for Vec4<S> {
     type Output = Self;
-    #[inline] fn sub(self, rhs: Self) -> Self {
-        Self::new(self.x - rhs.x, self.y - rhs.y, self.z - rhs.z, self.w - rhs.w)
+    #[inline]
+    fn sub(self, rhs: Self) -> Self {
+        Self::new(
+            self.x - rhs.x,
+            self.y - rhs.y,
+            self.z - rhs.z,
+            self.w - rhs.w,
+        )
     }
 }
 
 impl<S: Scalar> Neg for Vec4<S> {
     type Output = Self;
-    #[inline] fn neg(self) -> Self { Self::new(-self.x, -self.y, -self.z, -self.w) }
+    #[inline]
+    fn neg(self) -> Self {
+        Self::new(-self.x, -self.y, -self.z, -self.w)
+    }
 }
 
 impl<S: Scalar> Mul<S> for Vec4<S> {
     type Output = Self;
-    #[inline] fn mul(self, rhs: S) -> Self {
+    #[inline]
+    fn mul(self, rhs: S) -> Self {
         Self::new(self.x * rhs, self.y * rhs, self.z * rhs, self.w * rhs)
     }
 }
 
 impl<S: Scalar> Div<S> for Vec4<S> {
     type Output = Self;
-    #[inline] fn div(self, rhs: S) -> Self {
+    #[inline]
+    fn div(self, rhs: S) -> Self {
         Self::new(self.x / rhs, self.y / rhs, self.z / rhs, self.w / rhs)
     }
 }
 
 impl<S: Scalar> AddAssign for Vec4<S> {
-    #[inline] fn add_assign(&mut self, rhs: Self) {
-        self.x += rhs.x; self.y += rhs.y; self.z += rhs.z; self.w += rhs.w;
+    #[inline]
+    fn add_assign(&mut self, rhs: Self) {
+        self.x += rhs.x;
+        self.y += rhs.y;
+        self.z += rhs.z;
+        self.w += rhs.w;
     }
 }
 
 impl<S: Scalar> SubAssign for Vec4<S> {
-    #[inline] fn sub_assign(&mut self, rhs: Self) {
-        self.x -= rhs.x; self.y -= rhs.y; self.z -= rhs.z; self.w -= rhs.w;
+    #[inline]
+    fn sub_assign(&mut self, rhs: Self) {
+        self.x -= rhs.x;
+        self.y -= rhs.y;
+        self.z -= rhs.z;
+        self.w -= rhs.w;
     }
 }
 
 impl<S: Scalar> MulAssign<S> for Vec4<S> {
-    #[inline] fn mul_assign(&mut self, rhs: S) {
-        self.x *= rhs; self.y *= rhs; self.z *= rhs; self.w *= rhs;
+    #[inline]
+    fn mul_assign(&mut self, rhs: S) {
+        self.x *= rhs;
+        self.y *= rhs;
+        self.z *= rhs;
+        self.w *= rhs;
     }
 }
 
 impl<S: Scalar> Vec4<S> {
     #[inline]
-    pub fn normalize(self) -> Self { self / self.norm() }
+    pub fn normalize(self) -> Self {
+        self / self.norm()
+    }
 
     #[inline]
     pub fn lerp(self, other: Self, t: S) -> Self {

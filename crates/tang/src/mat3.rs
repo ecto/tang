@@ -1,5 +1,5 @@
 use crate::{Scalar, Vec3};
-use core::ops::{Add, Sub, Mul, Neg, Index};
+use core::ops::{Add, Index, Mul, Neg, Sub};
 
 /// 3x3 matrix, column-major storage.
 ///
@@ -25,11 +25,7 @@ impl<S: Scalar> Mat3<S> {
     /// | m20 m21 m22 |
     /// ```
     #[inline]
-    pub fn new(
-        m00: S, m01: S, m02: S,
-        m10: S, m11: S, m12: S,
-        m20: S, m21: S, m22: S,
-    ) -> Self {
+    pub fn new(m00: S, m01: S, m02: S, m10: S, m11: S, m12: S, m20: S, m21: S, m22: S) -> Self {
         Self {
             c0: Vec3::new(m00, m10, m20),
             c1: Vec3::new(m01, m11, m21),
@@ -51,18 +47,30 @@ impl<S: Scalar> Mat3<S> {
     #[inline]
     pub fn identity() -> Self {
         Self::new(
-            S::ONE,  S::ZERO, S::ZERO,
-            S::ZERO, S::ONE,  S::ZERO,
-            S::ZERO, S::ZERO, S::ONE,
+            S::ONE,
+            S::ZERO,
+            S::ZERO,
+            S::ZERO,
+            S::ONE,
+            S::ZERO,
+            S::ZERO,
+            S::ZERO,
+            S::ONE,
         )
     }
 
     #[inline]
     pub fn diagonal(d: Vec3<S>) -> Self {
         Self::new(
-            d.x,     S::ZERO, S::ZERO,
-            S::ZERO, d.y,     S::ZERO,
-            S::ZERO, S::ZERO, d.z,
+            d.x,
+            S::ZERO,
+            S::ZERO,
+            S::ZERO,
+            d.y,
+            S::ZERO,
+            S::ZERO,
+            S::ZERO,
+            d.z,
         )
     }
 
@@ -70,22 +78,40 @@ impl<S: Scalar> Mat3<S> {
     ///
     /// nalgebra's `Matrix3::from_diagonal(&v)` is equivalent to `Mat3::diagonal(v)`.
     #[inline]
-    pub fn from_diagonal(d: &Vec3<S>) -> Self { Self::diagonal(*d) }
+    pub fn from_diagonal(d: &Vec3<S>) -> Self {
+        Self::diagonal(*d)
+    }
 
     /// Element access (row, col)
     #[inline]
     pub fn get(&self, row: usize, col: usize) -> S {
         match col {
-            0 => match row { 0 => self.c0.x, 1 => self.c0.y, _ => self.c0.z },
-            1 => match row { 0 => self.c1.x, 1 => self.c1.y, _ => self.c1.z },
-            _ => match row { 0 => self.c2.x, 1 => self.c2.y, _ => self.c2.z },
+            0 => match row {
+                0 => self.c0.x,
+                1 => self.c0.y,
+                _ => self.c0.z,
+            },
+            1 => match row {
+                0 => self.c1.x,
+                1 => self.c1.y,
+                _ => self.c1.z,
+            },
+            _ => match row {
+                0 => self.c2.x,
+                1 => self.c2.y,
+                _ => self.c2.z,
+            },
         }
     }
 
     /// Column access
     #[inline]
     pub fn col(&self, i: usize) -> Vec3<S> {
-        match i { 0 => self.c0, 1 => self.c1, _ => self.c2 }
+        match i {
+            0 => self.c0,
+            1 => self.c1,
+            _ => self.c2,
+        }
     }
 
     /// Row access
@@ -97,22 +123,23 @@ impl<S: Scalar> Mat3<S> {
     #[inline]
     pub fn transpose(&self) -> Self {
         Self::new(
-            self.c0.x, self.c0.y, self.c0.z,
-            self.c1.x, self.c1.y, self.c1.z,
-            self.c2.x, self.c2.y, self.c2.z,
+            self.c0.x, self.c0.y, self.c0.z, self.c1.x, self.c1.y, self.c1.z, self.c2.x, self.c2.y,
+            self.c2.z,
         )
     }
 
     #[inline]
     pub fn determinant(&self) -> S {
         self.c0.x * (self.c1.y * self.c2.z - self.c2.y * self.c1.z)
-        - self.c1.x * (self.c0.y * self.c2.z - self.c2.y * self.c0.z)
-        + self.c2.x * (self.c0.y * self.c1.z - self.c1.y * self.c0.z)
+            - self.c1.x * (self.c0.y * self.c2.z - self.c2.y * self.c0.z)
+            + self.c2.x * (self.c0.y * self.c1.z - self.c1.y * self.c0.z)
     }
 
     pub fn try_inverse(&self) -> Option<Self> {
         let det = self.determinant();
-        if det.abs() < S::EPSILON { return None; }
+        if det.abs() < S::EPSILON {
+            return None;
+        }
         let inv_det = det.recip();
         Some(Self::new(
             (self.c1.y * self.c2.z - self.c2.y * self.c1.z) * inv_det,
@@ -158,31 +185,19 @@ impl<S: Scalar> Mat3<S> {
     /// Rotation matrix about X axis
     pub fn rotation_x(angle: S) -> Self {
         let (s, c) = angle.sin_cos();
-        Self::new(
-            S::ONE, S::ZERO, S::ZERO,
-            S::ZERO, c,      -s,
-            S::ZERO, s,       c,
-        )
+        Self::new(S::ONE, S::ZERO, S::ZERO, S::ZERO, c, -s, S::ZERO, s, c)
     }
 
     /// Rotation matrix about Y axis
     pub fn rotation_y(angle: S) -> Self {
         let (s, c) = angle.sin_cos();
-        Self::new(
-            c,       S::ZERO, s,
-            S::ZERO, S::ONE,  S::ZERO,
-            -s,      S::ZERO, c,
-        )
+        Self::new(c, S::ZERO, s, S::ZERO, S::ONE, S::ZERO, -s, S::ZERO, c)
     }
 
     /// Rotation matrix about Z axis
     pub fn rotation_z(angle: S) -> Self {
         let (s, c) = angle.sin_cos();
-        Self::new(
-            c,  -s,     S::ZERO,
-            s,   c,     S::ZERO,
-            S::ZERO, S::ZERO, S::ONE,
-        )
+        Self::new(c, -s, S::ZERO, s, c, S::ZERO, S::ZERO, S::ZERO, S::ONE)
     }
 
     /// Rotation matrix about an arbitrary axis (Rodrigues' formula)
@@ -191,9 +206,15 @@ impl<S: Scalar> Mat3<S> {
         let t = S::ONE - c;
         let Vec3 { x, y, z } = axis;
         Self::new(
-            t * x * x + c,     t * x * y - s * z, t * x * z + s * y,
-            t * x * y + s * z, t * y * y + c,     t * y * z - s * x,
-            t * x * z - s * y, t * y * z + s * x, t * z * z + c,
+            t * x * x + c,
+            t * x * y - s * z,
+            t * x * z + s * y,
+            t * x * y + s * z,
+            t * y * y + c,
+            t * y * z - s * x,
+            t * x * z - s * y,
+            t * y * z + s * x,
+            t * z * z + c,
         )
     }
 }
@@ -204,41 +225,59 @@ impl<S: Scalar> Index<(usize, usize)> for Mat3<S> {
     #[inline]
     fn index(&self, (row, col): (usize, usize)) -> &S {
         match col {
-            0 => match row { 0 => &self.c0.x, 1 => &self.c0.y, _ => &self.c0.z },
-            1 => match row { 0 => &self.c1.x, 1 => &self.c1.y, _ => &self.c1.z },
-            _ => match row { 0 => &self.c2.x, 1 => &self.c2.y, _ => &self.c2.z },
+            0 => match row {
+                0 => &self.c0.x,
+                1 => &self.c0.y,
+                _ => &self.c0.z,
+            },
+            1 => match row {
+                0 => &self.c1.x,
+                1 => &self.c1.y,
+                _ => &self.c1.z,
+            },
+            _ => match row {
+                0 => &self.c2.x,
+                1 => &self.c2.y,
+                _ => &self.c2.z,
+            },
         }
     }
 }
 
 impl<S: Scalar> Default for Mat3<S> {
-    fn default() -> Self { Self::identity() }
+    fn default() -> Self {
+        Self::identity()
+    }
 }
 
 impl<S: Scalar> Add for Mat3<S> {
     type Output = Self;
-    #[inline] fn add(self, rhs: Self) -> Self {
+    #[inline]
+    fn add(self, rhs: Self) -> Self {
         Self::from_cols(self.c0 + rhs.c0, self.c1 + rhs.c1, self.c2 + rhs.c2)
     }
 }
 
 impl<S: Scalar> Sub for Mat3<S> {
     type Output = Self;
-    #[inline] fn sub(self, rhs: Self) -> Self {
+    #[inline]
+    fn sub(self, rhs: Self) -> Self {
         Self::from_cols(self.c0 - rhs.c0, self.c1 - rhs.c1, self.c2 - rhs.c2)
     }
 }
 
 impl<S: Scalar> Neg for Mat3<S> {
     type Output = Self;
-    #[inline] fn neg(self) -> Self {
+    #[inline]
+    fn neg(self) -> Self {
         Self::from_cols(-self.c0, -self.c1, -self.c2)
     }
 }
 
 impl<S: Scalar> Mul<S> for Mat3<S> {
     type Output = Self;
-    #[inline] fn mul(self, rhs: S) -> Self {
+    #[inline]
+    fn mul(self, rhs: S) -> Self {
         Self::from_cols(self.c0 * rhs, self.c1 * rhs, self.c2 * rhs)
     }
 }
@@ -246,19 +285,28 @@ impl<S: Scalar> Mul<S> for Mat3<S> {
 // Mat3 * Vec3
 impl<S: Scalar> Mul<Vec3<S>> for Mat3<S> {
     type Output = Vec3<S>;
-    #[inline] fn mul(self, rhs: Vec3<S>) -> Vec3<S> { self.mul_vec(rhs) }
+    #[inline]
+    fn mul(self, rhs: Vec3<S>) -> Vec3<S> {
+        self.mul_vec(rhs)
+    }
 }
 
 // Mat3 * Mat3
 impl<S: Scalar> Mul for Mat3<S> {
     type Output = Self;
-    #[inline] fn mul(self, rhs: Self) -> Self { self.mul_mat(&rhs) }
+    #[inline]
+    fn mul(self, rhs: Self) -> Self {
+        self.mul_mat(&rhs)
+    }
 }
 
 // nalgebra compatibility: Mat3 * &Vec3
 impl<S: Scalar> Mul<&Vec3<S>> for Mat3<S> {
     type Output = Vec3<S>;
-    #[inline] fn mul(self, rhs: &Vec3<S>) -> Vec3<S> { self.mul_vec(*rhs) }
+    #[inline]
+    fn mul(self, rhs: &Vec3<S>) -> Vec3<S> {
+        self.mul_vec(*rhs)
+    }
 }
 
 #[cfg(test)]
@@ -274,11 +322,7 @@ mod tests {
 
     #[test]
     fn transpose() {
-        let m = Mat3::new(
-            1.0, 2.0, 3.0,
-            4.0, 5.0, 6.0,
-            7.0, 8.0, 9.0,
-        );
+        let m = Mat3::new(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0);
         let mt = m.transpose();
         assert_eq!(mt.get(0, 1), 4.0);
         assert_eq!(mt.get(1, 0), 2.0);
@@ -286,11 +330,7 @@ mod tests {
 
     #[test]
     fn inverse() {
-        let m = Mat3::new(
-            1.0, 2.0, 3.0,
-            0.0, 1.0, 4.0,
-            5.0, 6.0, 0.0,
-        );
+        let m = Mat3::new(1.0, 2.0, 3.0, 0.0, 1.0, 4.0, 5.0, 6.0, 0.0);
         let mi = m.try_inverse().unwrap();
         let prod = m * mi;
         let id = Mat3::<f64>::identity();

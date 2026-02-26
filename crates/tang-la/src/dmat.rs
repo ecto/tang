@@ -1,7 +1,7 @@
-use tang::Scalar;
 use crate::DVec;
-use core::ops::{Add, Sub, Mul, Neg, Index, IndexMut};
 use alloc::vec::Vec;
+use core::ops::{Add, Index, IndexMut, Mul, Neg, Sub};
+use tang::Scalar;
 
 /// Heap-allocated column-major matrix.
 ///
@@ -33,7 +33,11 @@ impl<S: Scalar> DMat<S> {
 
     /// Zero matrix.
     pub fn zeros(nrows: usize, ncols: usize) -> Self {
-        Self { data: alloc::vec![S::ZERO; nrows * ncols], nrows, ncols }
+        Self {
+            data: alloc::vec![S::ZERO; nrows * ncols],
+            nrows,
+            ncols,
+        }
     }
 
     /// Identity matrix.
@@ -46,7 +50,11 @@ impl<S: Scalar> DMat<S> {
     /// nalgebra's `DMatrix::from_iterator(nrows, ncols, iter)` fills column-major.
     pub fn from_iterator(nrows: usize, ncols: usize, iter: impl IntoIterator<Item = S>) -> Self {
         let data: Vec<S> = iter.into_iter().take(nrows * ncols).collect();
-        assert_eq!(data.len(), nrows * ncols, "DMat::from_iterator: iterator yielded fewer than expected");
+        assert_eq!(
+            data.len(),
+            nrows * ncols,
+            "DMat::from_iterator: iterator yielded fewer than expected"
+        );
         Self::from_raw(nrows, ncols, data)
     }
 
@@ -63,10 +71,14 @@ impl<S: Scalar> DMat<S> {
     }
 
     #[inline]
-    pub fn nrows(&self) -> usize { self.nrows }
+    pub fn nrows(&self) -> usize {
+        self.nrows
+    }
 
     #[inline]
-    pub fn ncols(&self) -> usize { self.ncols }
+    pub fn ncols(&self) -> usize {
+        self.ncols
+    }
 
     /// Element access (row, col).
     #[inline]
@@ -88,11 +100,15 @@ impl<S: Scalar> DMat<S> {
 
     /// Raw column-major data.
     #[inline]
-    pub fn as_slice(&self) -> &[S] { &self.data }
+    pub fn as_slice(&self) -> &[S] {
+        &self.data
+    }
 
     /// Mutable raw column-major data.
     #[inline]
-    pub fn as_mut_slice(&mut self) -> &mut [S] { &mut self.data }
+    pub fn as_mut_slice(&mut self) -> &mut [S] {
+        &mut self.data
+    }
 
     /// Mutable column slice.
     #[inline]
@@ -103,7 +119,9 @@ impl<S: Scalar> DMat<S> {
 
     /// Mutable access to underlying storage.
     #[inline]
-    pub fn data_mut(&mut self) -> &mut Vec<S> { &mut self.data }
+    pub fn data_mut(&mut self) -> &mut Vec<S> {
+        &mut self.data
+    }
 
     /// Column slice.
     pub fn col(&self, j: usize) -> &[S] {
@@ -202,11 +220,15 @@ impl<S: Scalar> DMat<S> {
 
     /// Is this matrix square?
     #[inline]
-    pub fn is_square(&self) -> bool { self.nrows == self.ncols }
+    pub fn is_square(&self) -> bool {
+        self.nrows == self.ncols
+    }
 
     /// Swap two rows.
     pub fn swap_rows(&mut self, a: usize, b: usize) {
-        if a == b { return; }
+        if a == b {
+            return;
+        }
         for j in 0..self.ncols {
             let va = self.get(a, j);
             let vb = self.get(b, j);
@@ -216,7 +238,13 @@ impl<S: Scalar> DMat<S> {
     }
 
     /// Extract a submatrix.
-    pub fn submatrix(&self, row_start: usize, col_start: usize, nrows: usize, ncols: usize) -> Self {
+    pub fn submatrix(
+        &self,
+        row_start: usize,
+        col_start: usize,
+        nrows: usize,
+        ncols: usize,
+    ) -> Self {
         Self::from_fn(nrows, ncols, |i, j| self.get(row_start + i, col_start + j))
     }
 
@@ -225,7 +253,9 @@ impl<S: Scalar> DMat<S> {
     /// Alias for [`col_vec()`](Self::col_vec) (nalgebra compatibility).
     ///
     /// nalgebra uses `.column(j).into_owned()`.
-    pub fn column(&self, j: usize) -> DVec<S> { self.col_vec(j) }
+    pub fn column(&self, j: usize) -> DVec<S> {
+        self.col_vec(j)
+    }
 
     /// Compute eigendecomposition (nalgebra compatibility).
     ///
@@ -264,7 +294,9 @@ impl<S: Scalar> DMat<S> {
     /// Compute LU decomposition and solve (nalgebra compatibility).
     ///
     /// nalgebra uses `a.clone().lu().solve(&b)` returning `Option<DVec>`.
-    pub fn lu(self) -> DMatLu<S> { DMatLu(self) }
+    pub fn lu(self) -> DMatLu<S> {
+        DMatLu(self)
+    }
 }
 
 /// Wrapper for nalgebra-compatible LU chaining: `a.clone().lu().solve(&b)`.
@@ -297,7 +329,9 @@ impl<S: Scalar> Add for &DMat<S> {
     fn add(self, rhs: &DMat<S>) -> DMat<S> {
         assert_eq!(self.nrows, rhs.nrows);
         assert_eq!(self.ncols, rhs.ncols);
-        DMat::from_fn(self.nrows, self.ncols, |i, j| self.get(i, j) + rhs.get(i, j))
+        DMat::from_fn(self.nrows, self.ncols, |i, j| {
+            self.get(i, j) + rhs.get(i, j)
+        })
     }
 }
 
@@ -306,7 +340,9 @@ impl<S: Scalar> Sub for &DMat<S> {
     fn sub(self, rhs: &DMat<S>) -> DMat<S> {
         assert_eq!(self.nrows, rhs.nrows);
         assert_eq!(self.ncols, rhs.ncols);
-        DMat::from_fn(self.nrows, self.ncols, |i, j| self.get(i, j) - rhs.get(i, j))
+        DMat::from_fn(self.nrows, self.ncols, |i, j| {
+            self.get(i, j) - rhs.get(i, j)
+        })
     }
 }
 
@@ -319,12 +355,16 @@ impl<S: Scalar> Neg for &DMat<S> {
 
 impl<S: Scalar> Mul<&DVec<S>> for &DMat<S> {
     type Output = DVec<S>;
-    fn mul(self, rhs: &DVec<S>) -> DVec<S> { self.mul_vec(rhs) }
+    fn mul(self, rhs: &DVec<S>) -> DVec<S> {
+        self.mul_vec(rhs)
+    }
 }
 
 impl<S: Scalar> Mul for &DMat<S> {
     type Output = DMat<S>;
-    fn mul(self, rhs: &DMat<S>) -> DMat<S> { self.mul_mat(rhs) }
+    fn mul(self, rhs: &DMat<S>) -> DMat<S> {
+        self.mul_mat(rhs)
+    }
 }
 
 #[cfg(test)]

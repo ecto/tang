@@ -1,5 +1,5 @@
 use core::fmt;
-use core::ops::{Add, Sub, Mul, Div, Neg, AddAssign, SubAssign, MulAssign, DivAssign};
+use core::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 
 /// Trait for scalar types that can be used throughout kern-math.
 ///
@@ -76,102 +76,378 @@ pub trait Scalar:
 // Dispatch via a helper trait to keep the macro clean.
 #[cfg(feature = "std")]
 mod float_ops {
-    #[inline(always)] pub fn sqrt_f32(x: f32) -> f32 { x.sqrt() }
-    #[inline(always)] pub fn sqrt_f64(x: f64) -> f64 { x.sqrt() }
-    #[inline(always)] pub fn abs_f32(x: f32) -> f32 { x.abs() }
-    #[inline(always)] pub fn abs_f64(x: f64) -> f64 { x.abs() }
-    #[inline(always)] pub fn sin_f32(x: f32) -> f32 { x.sin() }
-    #[inline(always)] pub fn sin_f64(x: f64) -> f64 { x.sin() }
-    #[inline(always)] pub fn cos_f32(x: f32) -> f32 { x.cos() }
-    #[inline(always)] pub fn cos_f64(x: f64) -> f64 { x.cos() }
-    #[inline(always)] pub fn tan_f32(x: f32) -> f32 { x.tan() }
-    #[inline(always)] pub fn tan_f64(x: f64) -> f64 { x.tan() }
-    #[inline(always)] pub fn asin_f32(x: f32) -> f32 { x.asin() }
-    #[inline(always)] pub fn asin_f64(x: f64) -> f64 { x.asin() }
-    #[inline(always)] pub fn acos_f32(x: f32) -> f32 { x.acos() }
-    #[inline(always)] pub fn acos_f64(x: f64) -> f64 { x.acos() }
-    #[inline(always)] pub fn atan2_f32(y: f32, x: f32) -> f32 { y.atan2(x) }
-    #[inline(always)] pub fn atan2_f64(y: f64, x: f64) -> f64 { y.atan2(x) }
-    #[inline(always)] pub fn sin_cos_f32(x: f32) -> (f32, f32) { x.sin_cos() }
-    #[inline(always)] pub fn sin_cos_f64(x: f64) -> (f64, f64) { x.sin_cos() }
-    #[inline(always)] pub fn floor_f32(x: f32) -> f32 { x.floor() }
-    #[inline(always)] pub fn floor_f64(x: f64) -> f64 { x.floor() }
-    #[inline(always)] pub fn ceil_f32(x: f32) -> f32 { x.ceil() }
-    #[inline(always)] pub fn ceil_f64(x: f64) -> f64 { x.ceil() }
-    #[inline(always)] pub fn round_f32(x: f32) -> f32 { x.round() }
-    #[inline(always)] pub fn round_f64(x: f64) -> f64 { x.round() }
-    #[inline(always)] pub fn exp_f32(x: f32) -> f32 { x.exp() }
-    #[inline(always)] pub fn exp_f64(x: f64) -> f64 { x.exp() }
-    #[inline(always)] pub fn ln_f32(x: f32) -> f32 { x.ln() }
-    #[inline(always)] pub fn ln_f64(x: f64) -> f64 { x.ln() }
-    #[inline(always)] pub fn powf_f32(x: f32, p: f32) -> f32 { x.powf(p) }
-    #[inline(always)] pub fn powf_f64(x: f64, p: f64) -> f64 { x.powf(p) }
-    #[inline(always)] pub fn tanh_f32(x: f32) -> f32 { x.tanh() }
-    #[inline(always)] pub fn tanh_f64(x: f64) -> f64 { x.tanh() }
-    #[inline(always)] pub fn sinh_f32(x: f32) -> f32 { x.sinh() }
-    #[inline(always)] pub fn sinh_f64(x: f64) -> f64 { x.sinh() }
-    #[inline(always)] pub fn cosh_f32(x: f32) -> f32 { x.cosh() }
-    #[inline(always)] pub fn cosh_f64(x: f64) -> f64 { x.cosh() }
-    #[inline(always)] pub fn acosh_f32(x: f32) -> f32 { x.acosh() }
-    #[inline(always)] pub fn acosh_f64(x: f64) -> f64 { x.acosh() }
-    #[inline(always)] pub fn asinh_f32(x: f32) -> f32 { x.asinh() }
-    #[inline(always)] pub fn asinh_f64(x: f64) -> f64 { x.asinh() }
-    #[inline(always)] pub fn atanh_f32(x: f32) -> f32 { x.atanh() }
-    #[inline(always)] pub fn atanh_f64(x: f64) -> f64 { x.atanh() }
-    #[inline(always)] pub fn copysign_f32(x: f32, s: f32) -> f32 { x.copysign(s) }
-    #[inline(always)] pub fn copysign_f64(x: f64, s: f64) -> f64 { x.copysign(s) }
-    #[inline(always)] pub fn powi_f32(x: f32, n: i32) -> f32 { x.powi(n) }
-    #[inline(always)] pub fn powi_f64(x: f64, n: i32) -> f64 { x.powi(n) }
+    #[inline(always)]
+    pub fn sqrt_f32(x: f32) -> f32 {
+        x.sqrt()
+    }
+    #[inline(always)]
+    pub fn sqrt_f64(x: f64) -> f64 {
+        x.sqrt()
+    }
+    #[inline(always)]
+    pub fn abs_f32(x: f32) -> f32 {
+        x.abs()
+    }
+    #[inline(always)]
+    pub fn abs_f64(x: f64) -> f64 {
+        x.abs()
+    }
+    #[inline(always)]
+    pub fn sin_f32(x: f32) -> f32 {
+        x.sin()
+    }
+    #[inline(always)]
+    pub fn sin_f64(x: f64) -> f64 {
+        x.sin()
+    }
+    #[inline(always)]
+    pub fn cos_f32(x: f32) -> f32 {
+        x.cos()
+    }
+    #[inline(always)]
+    pub fn cos_f64(x: f64) -> f64 {
+        x.cos()
+    }
+    #[inline(always)]
+    pub fn tan_f32(x: f32) -> f32 {
+        x.tan()
+    }
+    #[inline(always)]
+    pub fn tan_f64(x: f64) -> f64 {
+        x.tan()
+    }
+    #[inline(always)]
+    pub fn asin_f32(x: f32) -> f32 {
+        x.asin()
+    }
+    #[inline(always)]
+    pub fn asin_f64(x: f64) -> f64 {
+        x.asin()
+    }
+    #[inline(always)]
+    pub fn acos_f32(x: f32) -> f32 {
+        x.acos()
+    }
+    #[inline(always)]
+    pub fn acos_f64(x: f64) -> f64 {
+        x.acos()
+    }
+    #[inline(always)]
+    pub fn atan2_f32(y: f32, x: f32) -> f32 {
+        y.atan2(x)
+    }
+    #[inline(always)]
+    pub fn atan2_f64(y: f64, x: f64) -> f64 {
+        y.atan2(x)
+    }
+    #[inline(always)]
+    pub fn sin_cos_f32(x: f32) -> (f32, f32) {
+        x.sin_cos()
+    }
+    #[inline(always)]
+    pub fn sin_cos_f64(x: f64) -> (f64, f64) {
+        x.sin_cos()
+    }
+    #[inline(always)]
+    pub fn floor_f32(x: f32) -> f32 {
+        x.floor()
+    }
+    #[inline(always)]
+    pub fn floor_f64(x: f64) -> f64 {
+        x.floor()
+    }
+    #[inline(always)]
+    pub fn ceil_f32(x: f32) -> f32 {
+        x.ceil()
+    }
+    #[inline(always)]
+    pub fn ceil_f64(x: f64) -> f64 {
+        x.ceil()
+    }
+    #[inline(always)]
+    pub fn round_f32(x: f32) -> f32 {
+        x.round()
+    }
+    #[inline(always)]
+    pub fn round_f64(x: f64) -> f64 {
+        x.round()
+    }
+    #[inline(always)]
+    pub fn exp_f32(x: f32) -> f32 {
+        x.exp()
+    }
+    #[inline(always)]
+    pub fn exp_f64(x: f64) -> f64 {
+        x.exp()
+    }
+    #[inline(always)]
+    pub fn ln_f32(x: f32) -> f32 {
+        x.ln()
+    }
+    #[inline(always)]
+    pub fn ln_f64(x: f64) -> f64 {
+        x.ln()
+    }
+    #[inline(always)]
+    pub fn powf_f32(x: f32, p: f32) -> f32 {
+        x.powf(p)
+    }
+    #[inline(always)]
+    pub fn powf_f64(x: f64, p: f64) -> f64 {
+        x.powf(p)
+    }
+    #[inline(always)]
+    pub fn tanh_f32(x: f32) -> f32 {
+        x.tanh()
+    }
+    #[inline(always)]
+    pub fn tanh_f64(x: f64) -> f64 {
+        x.tanh()
+    }
+    #[inline(always)]
+    pub fn sinh_f32(x: f32) -> f32 {
+        x.sinh()
+    }
+    #[inline(always)]
+    pub fn sinh_f64(x: f64) -> f64 {
+        x.sinh()
+    }
+    #[inline(always)]
+    pub fn cosh_f32(x: f32) -> f32 {
+        x.cosh()
+    }
+    #[inline(always)]
+    pub fn cosh_f64(x: f64) -> f64 {
+        x.cosh()
+    }
+    #[inline(always)]
+    pub fn acosh_f32(x: f32) -> f32 {
+        x.acosh()
+    }
+    #[inline(always)]
+    pub fn acosh_f64(x: f64) -> f64 {
+        x.acosh()
+    }
+    #[inline(always)]
+    pub fn asinh_f32(x: f32) -> f32 {
+        x.asinh()
+    }
+    #[inline(always)]
+    pub fn asinh_f64(x: f64) -> f64 {
+        x.asinh()
+    }
+    #[inline(always)]
+    pub fn atanh_f32(x: f32) -> f32 {
+        x.atanh()
+    }
+    #[inline(always)]
+    pub fn atanh_f64(x: f64) -> f64 {
+        x.atanh()
+    }
+    #[inline(always)]
+    pub fn copysign_f32(x: f32, s: f32) -> f32 {
+        x.copysign(s)
+    }
+    #[inline(always)]
+    pub fn copysign_f64(x: f64, s: f64) -> f64 {
+        x.copysign(s)
+    }
+    #[inline(always)]
+    pub fn powi_f32(x: f32, n: i32) -> f32 {
+        x.powi(n)
+    }
+    #[inline(always)]
+    pub fn powi_f64(x: f64, n: i32) -> f64 {
+        x.powi(n)
+    }
 }
 
 #[cfg(all(not(feature = "std"), feature = "libm"))]
 mod float_ops {
-    #[inline(always)] pub fn sqrt_f32(x: f32) -> f32 { libm::sqrtf(x) }
-    #[inline(always)] pub fn sqrt_f64(x: f64) -> f64 { libm::sqrt(x) }
-    #[inline(always)] pub fn abs_f32(x: f32) -> f32 { libm::fabsf(x) }
-    #[inline(always)] pub fn abs_f64(x: f64) -> f64 { libm::fabs(x) }
-    #[inline(always)] pub fn sin_f32(x: f32) -> f32 { libm::sinf(x) }
-    #[inline(always)] pub fn sin_f64(x: f64) -> f64 { libm::sin(x) }
-    #[inline(always)] pub fn cos_f32(x: f32) -> f32 { libm::cosf(x) }
-    #[inline(always)] pub fn cos_f64(x: f64) -> f64 { libm::cos(x) }
-    #[inline(always)] pub fn tan_f32(x: f32) -> f32 { libm::tanf(x) }
-    #[inline(always)] pub fn tan_f64(x: f64) -> f64 { libm::tan(x) }
-    #[inline(always)] pub fn asin_f32(x: f32) -> f32 { libm::asinf(x) }
-    #[inline(always)] pub fn asin_f64(x: f64) -> f64 { libm::asin(x) }
-    #[inline(always)] pub fn acos_f32(x: f32) -> f32 { libm::acosf(x) }
-    #[inline(always)] pub fn acos_f64(x: f64) -> f64 { libm::acos(x) }
-    #[inline(always)] pub fn atan2_f32(y: f32, x: f32) -> f32 { libm::atan2f(y, x) }
-    #[inline(always)] pub fn atan2_f64(y: f64, x: f64) -> f64 { libm::atan2(y, x) }
-    #[inline(always)] pub fn sin_cos_f32(x: f32) -> (f32, f32) { libm::sincosf(x) }
-    #[inline(always)] pub fn sin_cos_f64(x: f64) -> (f64, f64) { libm::sincos(x) }
-    #[inline(always)] pub fn floor_f32(x: f32) -> f32 { libm::floorf(x) }
-    #[inline(always)] pub fn floor_f64(x: f64) -> f64 { libm::floor(x) }
-    #[inline(always)] pub fn ceil_f32(x: f32) -> f32 { libm::ceilf(x) }
-    #[inline(always)] pub fn ceil_f64(x: f64) -> f64 { libm::ceil(x) }
-    #[inline(always)] pub fn round_f32(x: f32) -> f32 { libm::roundf(x) }
-    #[inline(always)] pub fn round_f64(x: f64) -> f64 { libm::round(x) }
-    #[inline(always)] pub fn exp_f32(x: f32) -> f32 { libm::expf(x) }
-    #[inline(always)] pub fn exp_f64(x: f64) -> f64 { libm::exp(x) }
-    #[inline(always)] pub fn ln_f32(x: f32) -> f32 { libm::logf(x) }
-    #[inline(always)] pub fn ln_f64(x: f64) -> f64 { libm::log(x) }
-    #[inline(always)] pub fn powf_f32(x: f32, p: f32) -> f32 { libm::powf(x, p) }
-    #[inline(always)] pub fn powf_f64(x: f64, p: f64) -> f64 { libm::pow(x, p) }
-    #[inline(always)] pub fn tanh_f32(x: f32) -> f32 { libm::tanhf(x) }
-    #[inline(always)] pub fn tanh_f64(x: f64) -> f64 { libm::tanh(x) }
-    #[inline(always)] pub fn sinh_f32(x: f32) -> f32 { libm::sinhf(x) }
-    #[inline(always)] pub fn sinh_f64(x: f64) -> f64 { libm::sinh(x) }
-    #[inline(always)] pub fn cosh_f32(x: f32) -> f32 { libm::coshf(x) }
-    #[inline(always)] pub fn cosh_f64(x: f64) -> f64 { libm::cosh(x) }
-    #[inline(always)] pub fn acosh_f32(x: f32) -> f32 { libm::acoshf(x) }
-    #[inline(always)] pub fn acosh_f64(x: f64) -> f64 { libm::acosh(x) }
-    #[inline(always)] pub fn asinh_f32(x: f32) -> f32 { libm::asinhf(x) }
-    #[inline(always)] pub fn asinh_f64(x: f64) -> f64 { libm::asinh(x) }
-    #[inline(always)] pub fn atanh_f32(x: f32) -> f32 { libm::atanhf(x) }
-    #[inline(always)] pub fn atanh_f64(x: f64) -> f64 { libm::atanh(x) }
-    #[inline(always)] pub fn copysign_f32(x: f32, s: f32) -> f32 { libm::copysignf(x, s) }
-    #[inline(always)] pub fn copysign_f64(x: f64, s: f64) -> f64 { libm::copysign(x, s) }
-    #[inline(always)] pub fn powi_f32(x: f32, n: i32) -> f32 { libm::powf(x, n as f32) }
-    #[inline(always)] pub fn powi_f64(x: f64, n: i32) -> f64 { libm::pow(x, n as f64) }
+    #[inline(always)]
+    pub fn sqrt_f32(x: f32) -> f32 {
+        libm::sqrtf(x)
+    }
+    #[inline(always)]
+    pub fn sqrt_f64(x: f64) -> f64 {
+        libm::sqrt(x)
+    }
+    #[inline(always)]
+    pub fn abs_f32(x: f32) -> f32 {
+        libm::fabsf(x)
+    }
+    #[inline(always)]
+    pub fn abs_f64(x: f64) -> f64 {
+        libm::fabs(x)
+    }
+    #[inline(always)]
+    pub fn sin_f32(x: f32) -> f32 {
+        libm::sinf(x)
+    }
+    #[inline(always)]
+    pub fn sin_f64(x: f64) -> f64 {
+        libm::sin(x)
+    }
+    #[inline(always)]
+    pub fn cos_f32(x: f32) -> f32 {
+        libm::cosf(x)
+    }
+    #[inline(always)]
+    pub fn cos_f64(x: f64) -> f64 {
+        libm::cos(x)
+    }
+    #[inline(always)]
+    pub fn tan_f32(x: f32) -> f32 {
+        libm::tanf(x)
+    }
+    #[inline(always)]
+    pub fn tan_f64(x: f64) -> f64 {
+        libm::tan(x)
+    }
+    #[inline(always)]
+    pub fn asin_f32(x: f32) -> f32 {
+        libm::asinf(x)
+    }
+    #[inline(always)]
+    pub fn asin_f64(x: f64) -> f64 {
+        libm::asin(x)
+    }
+    #[inline(always)]
+    pub fn acos_f32(x: f32) -> f32 {
+        libm::acosf(x)
+    }
+    #[inline(always)]
+    pub fn acos_f64(x: f64) -> f64 {
+        libm::acos(x)
+    }
+    #[inline(always)]
+    pub fn atan2_f32(y: f32, x: f32) -> f32 {
+        libm::atan2f(y, x)
+    }
+    #[inline(always)]
+    pub fn atan2_f64(y: f64, x: f64) -> f64 {
+        libm::atan2(y, x)
+    }
+    #[inline(always)]
+    pub fn sin_cos_f32(x: f32) -> (f32, f32) {
+        libm::sincosf(x)
+    }
+    #[inline(always)]
+    pub fn sin_cos_f64(x: f64) -> (f64, f64) {
+        libm::sincos(x)
+    }
+    #[inline(always)]
+    pub fn floor_f32(x: f32) -> f32 {
+        libm::floorf(x)
+    }
+    #[inline(always)]
+    pub fn floor_f64(x: f64) -> f64 {
+        libm::floor(x)
+    }
+    #[inline(always)]
+    pub fn ceil_f32(x: f32) -> f32 {
+        libm::ceilf(x)
+    }
+    #[inline(always)]
+    pub fn ceil_f64(x: f64) -> f64 {
+        libm::ceil(x)
+    }
+    #[inline(always)]
+    pub fn round_f32(x: f32) -> f32 {
+        libm::roundf(x)
+    }
+    #[inline(always)]
+    pub fn round_f64(x: f64) -> f64 {
+        libm::round(x)
+    }
+    #[inline(always)]
+    pub fn exp_f32(x: f32) -> f32 {
+        libm::expf(x)
+    }
+    #[inline(always)]
+    pub fn exp_f64(x: f64) -> f64 {
+        libm::exp(x)
+    }
+    #[inline(always)]
+    pub fn ln_f32(x: f32) -> f32 {
+        libm::logf(x)
+    }
+    #[inline(always)]
+    pub fn ln_f64(x: f64) -> f64 {
+        libm::log(x)
+    }
+    #[inline(always)]
+    pub fn powf_f32(x: f32, p: f32) -> f32 {
+        libm::powf(x, p)
+    }
+    #[inline(always)]
+    pub fn powf_f64(x: f64, p: f64) -> f64 {
+        libm::pow(x, p)
+    }
+    #[inline(always)]
+    pub fn tanh_f32(x: f32) -> f32 {
+        libm::tanhf(x)
+    }
+    #[inline(always)]
+    pub fn tanh_f64(x: f64) -> f64 {
+        libm::tanh(x)
+    }
+    #[inline(always)]
+    pub fn sinh_f32(x: f32) -> f32 {
+        libm::sinhf(x)
+    }
+    #[inline(always)]
+    pub fn sinh_f64(x: f64) -> f64 {
+        libm::sinh(x)
+    }
+    #[inline(always)]
+    pub fn cosh_f32(x: f32) -> f32 {
+        libm::coshf(x)
+    }
+    #[inline(always)]
+    pub fn cosh_f64(x: f64) -> f64 {
+        libm::cosh(x)
+    }
+    #[inline(always)]
+    pub fn acosh_f32(x: f32) -> f32 {
+        libm::acoshf(x)
+    }
+    #[inline(always)]
+    pub fn acosh_f64(x: f64) -> f64 {
+        libm::acosh(x)
+    }
+    #[inline(always)]
+    pub fn asinh_f32(x: f32) -> f32 {
+        libm::asinhf(x)
+    }
+    #[inline(always)]
+    pub fn asinh_f64(x: f64) -> f64 {
+        libm::asinh(x)
+    }
+    #[inline(always)]
+    pub fn atanh_f32(x: f32) -> f32 {
+        libm::atanhf(x)
+    }
+    #[inline(always)]
+    pub fn atanh_f64(x: f64) -> f64 {
+        libm::atanh(x)
+    }
+    #[inline(always)]
+    pub fn copysign_f32(x: f32, s: f32) -> f32 {
+        libm::copysignf(x, s)
+    }
+    #[inline(always)]
+    pub fn copysign_f64(x: f64, s: f64) -> f64 {
+        libm::copysign(x, s)
+    }
+    #[inline(always)]
+    pub fn powi_f32(x: f32, n: i32) -> f32 {
+        libm::powf(x, n as f32)
+    }
+    #[inline(always)]
+    pub fn powi_f64(x: f64, n: i32) -> f64 {
+        libm::pow(x, n as f64)
+    }
 }
 
 macro_rules! impl_scalar_float {
@@ -232,12 +508,34 @@ macro_rules! impl_scalar_float {
     };
 }
 
-impl_scalar_float!(f32, f32, 0.0, 1.0, 2.0, 0.5,
-    core::f32::consts::PI, core::f32::consts::TAU, core::f32::consts::FRAC_PI_2,
-    f32::EPSILON, f32::INFINITY, f32::NEG_INFINITY);
-impl_scalar_float!(f64, f64, 0.0, 1.0, 2.0, 0.5,
-    core::f64::consts::PI, core::f64::consts::TAU, core::f64::consts::FRAC_PI_2,
-    f64::EPSILON, f64::INFINITY, f64::NEG_INFINITY);
+impl_scalar_float!(
+    f32,
+    f32,
+    0.0,
+    1.0,
+    2.0,
+    0.5,
+    core::f32::consts::PI,
+    core::f32::consts::TAU,
+    core::f32::consts::FRAC_PI_2,
+    f32::EPSILON,
+    f32::INFINITY,
+    f32::NEG_INFINITY
+);
+impl_scalar_float!(
+    f64,
+    f64,
+    0.0,
+    1.0,
+    2.0,
+    0.5,
+    core::f64::consts::PI,
+    core::f64::consts::TAU,
+    core::f64::consts::FRAC_PI_2,
+    f64::EPSILON,
+    f64::INFINITY,
+    f64::NEG_INFINITY
+);
 
 #[cfg(test)]
 mod tests {

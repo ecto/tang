@@ -41,7 +41,16 @@ pub fn curve_svg_path(
 /// Convert math coordinates to SVG pixel coordinates.
 /// Returns [sx, sy].
 #[wasm_bindgen]
-pub fn to_svg(x: f64, y: f64, x_min: f64, x_max: f64, y_min: f64, y_max: f64, w: f64, h: f64) -> Box<[f64]> {
+pub fn to_svg(
+    x: f64,
+    y: f64,
+    x_min: f64,
+    x_max: f64,
+    y_min: f64,
+    y_max: f64,
+    w: f64,
+    h: f64,
+) -> Box<[f64]> {
     let sx = (x - x_min) / (x_max - x_min) * w;
     let sy = h - (y - y_min) / (y_max - y_min) * h;
     Box::new([sx, sy])

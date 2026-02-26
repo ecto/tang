@@ -10,18 +10,18 @@ extern crate std;
 
 extern crate alloc;
 
-mod dvec;
-mod dmat;
-mod lu;
-mod svd;
 mod cholesky;
-mod qr;
+mod dmat;
+mod dvec;
 mod eigen;
+mod lu;
+mod qr;
+mod svd;
 
-pub use dvec::DVec;
-pub use dmat::DMat;
-pub use lu::Lu;
-pub use svd::Svd;
 pub use cholesky::Cholesky;
-pub use qr::Qr;
+pub use dmat::DMat;
+pub use dvec::DVec;
 pub use eigen::SymmetricEigen;
+pub use lu::Lu;
+pub use qr::Qr;
+pub use svd::Svd;

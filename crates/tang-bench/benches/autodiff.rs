@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use tang::{Dual, Scalar, Vec3, Quat};
+use tang::{Dual, Quat, Scalar, Vec3};
 
 /// Geometric test function: rotate unit-x around z by theta, return norm.
 /// Norm of a rotated unit vector is always 1.0, but the compiler can't know that.
@@ -48,7 +48,11 @@ fn forward_dual_vec3_chain(c: &mut Criterion) {
 
     group.bench_function("dual_f64", |b| {
         let a = Vec3::new(Dual::var(1.0f64), Dual::constant(2.0), Dual::constant(3.0));
-        let v = Vec3::new(Dual::constant(0.5), Dual::constant(-1.0), Dual::constant(0.7));
+        let v = Vec3::new(
+            Dual::constant(0.5),
+            Dual::constant(-1.0),
+            Dual::constant(0.7),
+        );
         b.iter(|| {
             let c = black_box(a).cross(black_box(v));
             let n = c.normalize();
@@ -80,11 +84,14 @@ fn reverse_grad_scalar(c: &mut Criterion) {
 
     group.bench_function("reverse_ad", |b| {
         b.iter(|| {
-            let g = tang_ad::grad(|x| {
-                let s = x[0].sin();
-                let c = (&x[0] + &x[0]).cos();
-                &(&s * &s) + &c
-            }, &[1.5]);
+            let g = tang_ad::grad(
+                |x| {
+                    let s = x[0].sin();
+                    let c = (&x[0] + &x[0]).cos();
+                    &(&s * &s) + &c
+                },
+                &[1.5],
+            );
             black_box(g)
         })
     });
@@ -118,22 +125,28 @@ fn hessian_dual_dual(c: &mut Criterion) {
 
     group.bench_function("1d", |b| {
         b.iter(|| {
-            let h = tang_ad::hessian(|x| {
-                let s = x[0].sin();
-                let two: Dual<Dual<f64>> = Scalar::from_f64(2.0);
-                let c = (x[0] * two).cos();
-                s * s + c
-            }, &[1.5]);
+            let h = tang_ad::hessian(
+                |x| {
+                    let s = x[0].sin();
+                    let two: Dual<Dual<f64>> = Scalar::from_f64(2.0);
+                    let c = (x[0] * two).cos();
+                    s * s + c
+                },
+                &[1.5],
+            );
             black_box(h)
         })
     });
 
     group.bench_function("2d", |b| {
         b.iter(|| {
-            let h = tang_ad::hessian(|x| {
-                let three: Dual<Dual<f64>> = Scalar::from_f64(3.0);
-                x[0] * x[0] + x[0] * x[1] * three + x[1] * x[1]
-            }, &[1.0, 2.0]);
+            let h = tang_ad::hessian(
+                |x| {
+                    let three: Dual<Dual<f64>> = Scalar::from_f64(3.0);
+                    x[0] * x[0] + x[0] * x[1] * three + x[1] * x[1]
+                },
+                &[1.0, 2.0],
+            );
             black_box(h)
         })
     });

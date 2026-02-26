@@ -14,15 +14,25 @@ pub struct Adam {
 impl Adam {
     pub fn new(lr: f64) -> Self {
         Self {
-            lr, beta1: 0.9, beta2: 0.999, epsilon: 1e-8,
-            m: None, v: None, t: 0,
+            lr,
+            beta1: 0.9,
+            beta2: 0.999,
+            epsilon: 1e-8,
+            m: None,
+            v: None,
+            t: 0,
         }
     }
 
     pub fn with_betas(lr: f64, beta1: f64, beta2: f64) -> Self {
         Self {
-            lr, beta1, beta2, epsilon: 1e-8,
-            m: None, v: None, t: 0,
+            lr,
+            beta1,
+            beta2,
+            epsilon: 1e-8,
+            m: None,
+            v: None,
+            t: 0,
         }
     }
 
@@ -53,7 +63,10 @@ pub struct AdamW {
 
 impl AdamW {
     pub fn new(lr: f64, weight_decay: f64) -> Self {
-        Self { inner: Adam::new(lr), weight_decay }
+        Self {
+            inner: Adam::new(lr),
+            weight_decay,
+        }
     }
 
     pub fn step(&mut self, params: &mut DVec<f64>, grad: &DVec<f64>) {
@@ -79,6 +92,10 @@ mod tests {
             let g = DVec::from_slice(&[2.0 * params[0]]);
             opt.step(&mut params, &g);
         }
-        assert!(params[0].abs() < 0.01, "should converge near 0, got {}", params[0]);
+        assert!(
+            params[0].abs() < 0.01,
+            "should converge near 0, got {}",
+            params[0]
+        );
     }
 }

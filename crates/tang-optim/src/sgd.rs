@@ -9,11 +9,19 @@ pub struct Sgd {
 
 impl Sgd {
     pub fn new(lr: f64) -> Self {
-        Self { lr, momentum: 0.0, velocity: None }
+        Self {
+            lr,
+            momentum: 0.0,
+            velocity: None,
+        }
     }
 
     pub fn with_momentum(lr: f64, momentum: f64) -> Self {
-        Self { lr, momentum, velocity: None }
+        Self {
+            lr,
+            momentum,
+            velocity: None,
+        }
     }
 
     /// Update parameters: params -= lr * grad (with momentum).

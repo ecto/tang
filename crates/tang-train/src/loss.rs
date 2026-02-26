@@ -46,7 +46,9 @@ pub fn cross_entropy_loss(logits: &Tensor<f64>, targets: &Tensor<f64>) -> f64 {
         let mut max_val = logits.get(&[b, 0]);
         for c in 1..num_classes {
             let v = logits.get(&[b, c]);
-            if v > max_val { max_val = v; }
+            if v > max_val {
+                max_val = v;
+            }
         }
         let mut log_sum_exp = 0.0f64;
         for c in 0..num_classes {

@@ -1,5 +1,5 @@
-use alloc::vec::Vec;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::cell::RefCell;
 
 /// An operation recorded on the tape.

@@ -16,14 +16,18 @@ impl<S: Scalar> Dir3<S> {
     /// Create from a vector, normalizing it. Panics if zero-length.
     #[inline]
     pub fn new(v: Vec3<S>) -> Self {
-        Self { inner: v.normalize() }
+        Self {
+            inner: v.normalize(),
+        }
     }
 
     /// Alias for [`new()`](Self::new) (nalgebra compatibility).
     ///
     /// nalgebra's `Unit::new_normalize(v)` is equivalent to `Dir3::new(v)`.
     #[inline]
-    pub fn new_normalize(v: Vec3<S>) -> Self { Self::new(v) }
+    pub fn new_normalize(v: Vec3<S>) -> Self {
+        Self::new(v)
+    }
 
     /// Create from a vector, normalizing it. Returns None if zero-length.
     #[inline]
@@ -42,65 +46,93 @@ impl<S: Scalar> Dir3<S> {
 
     /// The underlying vector (always unit length)
     #[inline]
-    pub fn as_vec(&self) -> &Vec3<S> { &self.inner }
+    pub fn as_vec(&self) -> &Vec3<S> {
+        &self.inner
+    }
 
     /// Consume and return the inner vector
     #[inline]
-    pub fn into_inner(self) -> Vec3<S> { self.inner }
+    pub fn into_inner(self) -> Vec3<S> {
+        self.inner
+    }
 
     #[inline]
-    pub fn x() -> Self { Self { inner: Vec3::x() } }
+    pub fn x() -> Self {
+        Self { inner: Vec3::x() }
+    }
 
     #[inline]
-    pub fn y() -> Self { Self { inner: Vec3::y() } }
+    pub fn y() -> Self {
+        Self { inner: Vec3::y() }
+    }
 
     #[inline]
-    pub fn z() -> Self { Self { inner: Vec3::z() } }
+    pub fn z() -> Self {
+        Self { inner: Vec3::z() }
+    }
 
     /// Negate the direction
     #[inline]
-    pub fn neg(self) -> Self { Self { inner: -self.inner } }
+    pub fn neg(self) -> Self {
+        Self { inner: -self.inner }
+    }
 
     /// Dot product with another direction
     #[inline]
-    pub fn dot(self, other: Dir3<S>) -> S { self.inner.dot(other.inner) }
+    pub fn dot(self, other: Dir3<S>) -> S {
+        self.inner.dot(other.inner)
+    }
 
     /// Cross product with another direction (result may not be unit length)
     #[inline]
-    pub fn cross(self, other: Dir3<S>) -> Vec3<S> { self.inner.cross(other.inner) }
+    pub fn cross(self, other: Dir3<S>) -> Vec3<S> {
+        self.inner.cross(other.inner)
+    }
 }
 
 impl<S: Scalar> core::ops::Neg for Dir3<S> {
     type Output = Self;
     #[inline]
-    fn neg(self) -> Self { Self { inner: -self.inner } }
+    fn neg(self) -> Self {
+        Self { inner: -self.inner }
+    }
 }
 
 // The key improvement: Dir3 derefs to Vec3
 impl<S: Scalar> Deref for Dir3<S> {
     type Target = Vec3<S>;
     #[inline]
-    fn deref(&self) -> &Vec3<S> { &self.inner }
+    fn deref(&self) -> &Vec3<S> {
+        &self.inner
+    }
 }
 
 // nalgebra compatibility: AsRef and From for seamless Dir3 → Vec3 coercion.
 impl<S: Scalar> AsRef<Vec3<S>> for Dir3<S> {
     #[inline]
-    fn as_ref(&self) -> &Vec3<S> { &self.inner }
+    fn as_ref(&self) -> &Vec3<S> {
+        &self.inner
+    }
 }
 
 impl<S: Scalar> From<Dir3<S>> for Vec3<S> {
     #[inline]
-    fn from(d: Dir3<S>) -> Vec3<S> { d.inner }
+    fn from(d: Dir3<S>) -> Vec3<S> {
+        d.inner
+    }
 }
 
 impl<S: Scalar> From<&Dir3<S>> for Vec3<S> {
     #[inline]
-    fn from(d: &Dir3<S>) -> Vec3<S> { d.inner }
+    fn from(d: &Dir3<S>) -> Vec3<S> {
+        d.inner
+    }
 }
 
 impl<S: Scalar> PartialEq for Dir3<S> {
-    fn eq(&self, other: &Self) -> bool { self.inner == other.inner }
+    fn eq(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
 }
 
 impl<S: Scalar> core::fmt::Display for Dir3<S> {

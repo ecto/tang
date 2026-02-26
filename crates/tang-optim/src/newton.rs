@@ -1,4 +1,4 @@
-use tang_la::{DVec, DMat, Lu};
+use tang_la::{DMat, DVec, Lu};
 
 /// Newton's method with line search.
 pub struct Newton {
@@ -8,17 +8,15 @@ pub struct Newton {
 
 impl Newton {
     pub fn new() -> Self {
-        Self { max_iter: 100, tol: 1e-10 }
+        Self {
+            max_iter: 100,
+            tol: 1e-10,
+        }
     }
 
     /// Minimize f(x) given gradient and Hessian functions.
     /// Returns the minimizer.
-    pub fn minimize<G, H>(
-        &self,
-        x0: &DVec<f64>,
-        grad_fn: G,
-        hessian_fn: H,
-    ) -> DVec<f64>
+    pub fn minimize<G, H>(&self, x0: &DVec<f64>, grad_fn: G, hessian_fn: H) -> DVec<f64>
     where
         G: Fn(&DVec<f64>) -> DVec<f64>,
         H: Fn(&DVec<f64>) -> DMat<f64>,

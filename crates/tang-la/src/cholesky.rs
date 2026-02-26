@@ -1,5 +1,5 @@
+use crate::{DMat, DVec};
 use tang::Scalar;
-use crate::{DVec, DMat};
 
 /// Cholesky decomposition: A = L * L^T for symmetric positive definite matrices.
 pub struct Cholesky<S> {
@@ -39,7 +39,9 @@ impl<S: Scalar> Cholesky<S> {
     }
 
     /// The lower-triangular factor L.
-    pub fn l(&self) -> &DMat<S> { &self.l }
+    pub fn l(&self) -> &DMat<S> {
+        &self.l
+    }
 
     /// Solve Ax = b via L L^T x = b.
     pub fn solve(&self, b: &DVec<S>) -> DVec<S> {
@@ -88,9 +90,7 @@ mod tests {
     #[test]
     fn solve_spd() {
         // A = [4 2; 2 3] is SPD
-        let a = DMat::from_fn(2, 2, |i, j| {
-            [[4.0, 2.0], [2.0, 3.0]][i][j]
-        });
+        let a = DMat::from_fn(2, 2, |i, j| [[4.0, 2.0], [2.0, 3.0]][i][j]);
         let b = DVec::from_slice(&[1.0, 2.0]);
         let chol = Cholesky::new(&a).unwrap();
         let x = chol.solve(&b);
@@ -102,17 +102,13 @@ mod tests {
 
     #[test]
     fn not_spd() {
-        let a = DMat::from_fn(2, 2, |i, j| {
-            [[1.0, 2.0], [2.0, 1.0]][i][j]
-        });
+        let a = DMat::from_fn(2, 2, |i, j| [[1.0, 2.0], [2.0, 1.0]][i][j]);
         assert!(Cholesky::new(&a).is_none());
     }
 
     #[test]
     fn determinant() {
-        let a = DMat::from_fn(2, 2, |i, j| {
-            [[4.0, 2.0], [2.0, 3.0]][i][j]
-        });
+        let a = DMat::from_fn(2, 2, |i, j| [[4.0, 2.0], [2.0, 3.0]][i][j]);
         let chol = Cholesky::new(&a).unwrap();
         assert!((chol.det() - 8.0).abs() < 1e-10);
     }

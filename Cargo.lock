@@ -2014,6 +2014,7 @@ dependencies = [
  "rand 0.8.5",
  "tang",
  "tang-ad",
+ "tang-expr",
  "tang-la",
 ]
 

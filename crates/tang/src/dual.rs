@@ -1,6 +1,6 @@
 use crate::Scalar;
 use core::fmt;
-use core::ops::{Add, Sub, Mul, Div, Neg, AddAssign, SubAssign, MulAssign, DivAssign};
+use core::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 
 /// Forward-mode automatic differentiation via dual numbers.
 ///
@@ -31,7 +31,10 @@ impl<S: Scalar> Dual<S> {
     /// Constant (derivative = 0)
     #[inline]
     pub fn constant(real: S) -> Self {
-        Self { real, dual: S::ZERO }
+        Self {
+            real,
+            dual: S::ZERO,
+        }
     }
 
     /// Variable (derivative = 1)
@@ -48,7 +51,9 @@ impl<S: Scalar> Dual<S> {
 }
 
 impl<S: Scalar> PartialEq for Dual<S> {
-    fn eq(&self, other: &Self) -> bool { self.real == other.real }
+    fn eq(&self, other: &Self) -> bool {
+        self.real == other.real
+    }
 }
 
 impl<S: Scalar> PartialOrd for Dual<S> {
@@ -58,7 +63,9 @@ impl<S: Scalar> PartialOrd for Dual<S> {
 }
 
 impl<S: Scalar> Default for Dual<S> {
-    fn default() -> Self { Self::constant(S::ZERO) }
+    fn default() -> Self {
+        Self::constant(S::ZERO)
+    }
 }
 
 impl<S: Scalar> fmt::Display for Dual<S> {
@@ -74,21 +81,30 @@ impl<S: Scalar> fmt::Display for Dual<S> {
 
 impl<S: Scalar> Add for Dual<S> {
     type Output = Self;
-    #[inline] fn add(self, rhs: Self) -> Self {
-        Self { real: self.real + rhs.real, dual: self.dual + rhs.dual }
+    #[inline]
+    fn add(self, rhs: Self) -> Self {
+        Self {
+            real: self.real + rhs.real,
+            dual: self.dual + rhs.dual,
+        }
     }
 }
 
 impl<S: Scalar> Sub for Dual<S> {
     type Output = Self;
-    #[inline] fn sub(self, rhs: Self) -> Self {
-        Self { real: self.real - rhs.real, dual: self.dual - rhs.dual }
+    #[inline]
+    fn sub(self, rhs: Self) -> Self {
+        Self {
+            real: self.real - rhs.real,
+            dual: self.dual - rhs.dual,
+        }
     }
 }
 
 impl<S: Scalar> Mul for Dual<S> {
     type Output = Self;
-    #[inline] fn mul(self, rhs: Self) -> Self {
+    #[inline]
+    fn mul(self, rhs: Self) -> Self {
         Self {
             real: self.real * rhs.real,
             dual: self.real * rhs.dual + self.dual * rhs.real,
@@ -98,7 +114,8 @@ impl<S: Scalar> Mul for Dual<S> {
 
 impl<S: Scalar> Div for Dual<S> {
     type Output = Self;
-    #[inline] fn div(self, rhs: Self) -> Self {
+    #[inline]
+    fn div(self, rhs: Self) -> Self {
         let inv = rhs.real.recip();
         Self {
             real: self.real * inv,
@@ -109,25 +126,34 @@ impl<S: Scalar> Div for Dual<S> {
 
 impl<S: Scalar> Neg for Dual<S> {
     type Output = Self;
-    #[inline] fn neg(self) -> Self {
-        Self { real: -self.real, dual: -self.dual }
+    #[inline]
+    fn neg(self) -> Self {
+        Self {
+            real: -self.real,
+            dual: -self.dual,
+        }
     }
 }
 
 impl<S: Scalar> AddAssign for Dual<S> {
-    #[inline] fn add_assign(&mut self, rhs: Self) {
-        self.real += rhs.real; self.dual += rhs.dual;
+    #[inline]
+    fn add_assign(&mut self, rhs: Self) {
+        self.real += rhs.real;
+        self.dual += rhs.dual;
     }
 }
 
 impl<S: Scalar> SubAssign for Dual<S> {
-    #[inline] fn sub_assign(&mut self, rhs: Self) {
-        self.real -= rhs.real; self.dual -= rhs.dual;
+    #[inline]
+    fn sub_assign(&mut self, rhs: Self) {
+        self.real -= rhs.real;
+        self.dual -= rhs.dual;
     }
 }
 
 impl<S: Scalar> MulAssign for Dual<S> {
-    #[inline] fn mul_assign(&mut self, rhs: Self) {
+    #[inline]
+    fn mul_assign(&mut self, rhs: Self) {
         let new_dual = self.real * rhs.dual + self.dual * rhs.real;
         self.real *= rhs.real;
         self.dual = new_dual;
@@ -135,7 +161,8 @@ impl<S: Scalar> MulAssign for Dual<S> {
 }
 
 impl<S: Scalar> DivAssign for Dual<S> {
-    #[inline] fn div_assign(&mut self, rhs: Self) {
+    #[inline]
+    fn div_assign(&mut self, rhs: Self) {
         *self = *self / rhs;
     }
 }
@@ -143,46 +170,97 @@ impl<S: Scalar> DivAssign for Dual<S> {
 /// Implement Scalar for Dual<S> — this is what makes all kern-math types
 /// automatically differentiable.
 impl<S: Scalar> Scalar for Dual<S> {
-    const ZERO: Self = Dual { real: S::ZERO, dual: S::ZERO };
-    const ONE: Self = Dual { real: S::ONE, dual: S::ZERO };
-    const TWO: Self = Dual { real: S::TWO, dual: S::ZERO };
-    const HALF: Self = Dual { real: S::HALF, dual: S::ZERO };
-    const PI: Self = Dual { real: S::PI, dual: S::ZERO };
-    const TAU: Self = Dual { real: S::TAU, dual: S::ZERO };
-    const FRAC_PI_2: Self = Dual { real: S::FRAC_PI_2, dual: S::ZERO };
-    const EPSILON: Self = Dual { real: S::EPSILON, dual: S::ZERO };
-    const INFINITY: Self = Dual { real: S::INFINITY, dual: S::ZERO };
-    const NEG_INFINITY: Self = Dual { real: S::NEG_INFINITY, dual: S::ZERO };
+    const ZERO: Self = Dual {
+        real: S::ZERO,
+        dual: S::ZERO,
+    };
+    const ONE: Self = Dual {
+        real: S::ONE,
+        dual: S::ZERO,
+    };
+    const TWO: Self = Dual {
+        real: S::TWO,
+        dual: S::ZERO,
+    };
+    const HALF: Self = Dual {
+        real: S::HALF,
+        dual: S::ZERO,
+    };
+    const PI: Self = Dual {
+        real: S::PI,
+        dual: S::ZERO,
+    };
+    const TAU: Self = Dual {
+        real: S::TAU,
+        dual: S::ZERO,
+    };
+    const FRAC_PI_2: Self = Dual {
+        real: S::FRAC_PI_2,
+        dual: S::ZERO,
+    };
+    const EPSILON: Self = Dual {
+        real: S::EPSILON,
+        dual: S::ZERO,
+    };
+    const INFINITY: Self = Dual {
+        real: S::INFINITY,
+        dual: S::ZERO,
+    };
+    const NEG_INFINITY: Self = Dual {
+        real: S::NEG_INFINITY,
+        dual: S::ZERO,
+    };
 
     // d/dx sqrt(x) = 1/(2*sqrt(x))
-    #[inline] fn sqrt(self) -> Self {
+    #[inline]
+    fn sqrt(self) -> Self {
         let r = self.real.sqrt();
-        Dual { real: r, dual: self.dual / (S::TWO * r) }
+        Dual {
+            real: r,
+            dual: self.dual / (S::TWO * r),
+        }
     }
 
     // d/dx |x| = sign(x)
-    #[inline] fn abs(self) -> Self {
-        Dual { real: self.real.abs(), dual: self.dual * self.real.signum() }
+    #[inline]
+    fn abs(self) -> Self {
+        Dual {
+            real: self.real.abs(),
+            dual: self.dual * self.real.signum(),
+        }
     }
 
     // d/dx sin(x) = cos(x)
-    #[inline] fn sin(self) -> Self {
-        Dual { real: self.real.sin(), dual: self.dual * self.real.cos() }
+    #[inline]
+    fn sin(self) -> Self {
+        Dual {
+            real: self.real.sin(),
+            dual: self.dual * self.real.cos(),
+        }
     }
 
     // d/dx cos(x) = -sin(x)
-    #[inline] fn cos(self) -> Self {
-        Dual { real: self.real.cos(), dual: -self.dual * self.real.sin() }
+    #[inline]
+    fn cos(self) -> Self {
+        Dual {
+            real: self.real.cos(),
+            dual: -self.dual * self.real.sin(),
+        }
     }
 
     // d/dx tan(x) = 1/cos²(x)
-    #[inline] fn tan(self) -> Self {
+    #[inline]
+    fn tan(self) -> Self {
         let c = self.real.cos();
-        Dual { real: self.real.tan(), dual: self.dual / (c * c) }
+        Dual {
+            real: self.real.tan(),
+            dual: self.dual / (c * c),
+        }
     }
 
     // d/dx asin(x) = 1/sqrt(1-x²)
-    #[inline] fn asin(self) -> Self {
+    #[inline]
+    fn asin(self) -> Self {
         Dual {
             real: self.real.asin(),
             dual: self.dual / (S::ONE - self.real * self.real).sqrt(),
@@ -190,7 +268,8 @@ impl<S: Scalar> Scalar for Dual<S> {
     }
 
     // d/dx acos(x) = -1/sqrt(1-x²)
-    #[inline] fn acos(self) -> Self {
+    #[inline]
+    fn acos(self) -> Self {
         Dual {
             real: self.real.acos(),
             dual: -self.dual / (S::ONE - self.real * self.real).sqrt(),
@@ -198,7 +277,8 @@ impl<S: Scalar> Scalar for Dual<S> {
     }
 
     // d/dx atan2(y,x) requires both partials
-    #[inline] fn atan2(self, other: Self) -> Self {
+    #[inline]
+    fn atan2(self, other: Self) -> Self {
         let denom = self.real * self.real + other.real * other.real;
         Dual {
             real: self.real.atan2(other.real),
@@ -206,37 +286,64 @@ impl<S: Scalar> Scalar for Dual<S> {
         }
     }
 
-    #[inline] fn sin_cos(self) -> (Self, Self) {
+    #[inline]
+    fn sin_cos(self) -> (Self, Self) {
         let (s, c) = self.real.sin_cos();
         (
-            Dual { real: s, dual: self.dual * c },
-            Dual { real: c, dual: -self.dual * s },
+            Dual {
+                real: s,
+                dual: self.dual * c,
+            },
+            Dual {
+                real: c,
+                dual: -self.dual * s,
+            },
         )
     }
 
-    #[inline] fn min(self, other: Self) -> Self {
-        if self.real < other.real { self } else { other }
+    #[inline]
+    fn min(self, other: Self) -> Self {
+        if self.real < other.real {
+            self
+        } else {
+            other
+        }
     }
 
-    #[inline] fn max(self, other: Self) -> Self {
-        if self.real > other.real { self } else { other }
+    #[inline]
+    fn max(self, other: Self) -> Self {
+        if self.real > other.real {
+            self
+        } else {
+            other
+        }
     }
 
-    #[inline] fn clamp(self, lo: Self, hi: Self) -> Self {
+    #[inline]
+    fn clamp(self, lo: Self, hi: Self) -> Self {
         self.max(lo).min(hi)
     }
 
-    #[inline] fn recip(self) -> Self {
+    #[inline]
+    fn recip(self) -> Self {
         let inv = self.real.recip();
-        Dual { real: inv, dual: -self.dual * inv * inv }
+        Dual {
+            real: inv,
+            dual: -self.dual * inv * inv,
+        }
     }
 
-    #[inline] fn powi(self, n: i32) -> Self {
+    #[inline]
+    fn powi(self, n: i32) -> Self {
         let r = self.real.powi(n);
-        Dual { real: r, dual: self.dual * S::from_i32(n) * self.real.powi(n - 1) }
+        Dual {
+            real: r,
+            dual: self.dual * S::from_i32(n) * self.real.powi(n - 1),
+        }
     }
 
-    #[inline] fn copysign(self, sign: Self) -> Self {
+    #[inline]
+    fn copysign(self, sign: Self) -> Self {
         let flipped = self.real.signum() != sign.real.signum();
         Dual {
             real: self.real.copysign(sign.real),
@@ -244,27 +351,46 @@ impl<S: Scalar> Scalar for Dual<S> {
         }
     }
 
-    #[inline] fn signum(self) -> Self {
+    #[inline]
+    fn signum(self) -> Self {
         Dual::constant(self.real.signum())
     }
 
-    #[inline] fn floor(self) -> Self { Dual::constant(self.real.floor()) }
-    #[inline] fn ceil(self) -> Self { Dual::constant(self.real.ceil()) }
-    #[inline] fn round(self) -> Self { Dual::constant(self.real.round()) }
+    #[inline]
+    fn floor(self) -> Self {
+        Dual::constant(self.real.floor())
+    }
+    #[inline]
+    fn ceil(self) -> Self {
+        Dual::constant(self.real.ceil())
+    }
+    #[inline]
+    fn round(self) -> Self {
+        Dual::constant(self.real.round())
+    }
 
     // d/dx exp(x) = exp(x)
-    #[inline] fn exp(self) -> Self {
+    #[inline]
+    fn exp(self) -> Self {
         let e = self.real.exp();
-        Dual { real: e, dual: self.dual * e }
+        Dual {
+            real: e,
+            dual: self.dual * e,
+        }
     }
 
     // d/dx ln(x) = 1/x
-    #[inline] fn ln(self) -> Self {
-        Dual { real: self.real.ln(), dual: self.dual / self.real }
+    #[inline]
+    fn ln(self) -> Self {
+        Dual {
+            real: self.real.ln(),
+            dual: self.dual / self.real,
+        }
     }
 
     // d/dx x^p = p * x^(p-1) * dx + x^p * ln(x) * dp
-    #[inline] fn powf(self, p: Self) -> Self {
+    #[inline]
+    fn powf(self, p: Self) -> Self {
         let val = self.real.powf(p.real);
         Dual {
             real: val,
@@ -273,23 +399,36 @@ impl<S: Scalar> Scalar for Dual<S> {
     }
 
     // d/dx tanh(x) = 1 - tanh²(x)
-    #[inline] fn tanh(self) -> Self {
+    #[inline]
+    fn tanh(self) -> Self {
         let t = self.real.tanh();
-        Dual { real: t, dual: self.dual * (S::ONE - t * t) }
+        Dual {
+            real: t,
+            dual: self.dual * (S::ONE - t * t),
+        }
     }
 
     // d/dx sinh(x) = cosh(x)
-    #[inline] fn sinh(self) -> Self {
-        Dual { real: self.real.sinh(), dual: self.dual * self.real.cosh() }
+    #[inline]
+    fn sinh(self) -> Self {
+        Dual {
+            real: self.real.sinh(),
+            dual: self.dual * self.real.cosh(),
+        }
     }
 
     // d/dx cosh(x) = sinh(x)
-    #[inline] fn cosh(self) -> Self {
-        Dual { real: self.real.cosh(), dual: self.dual * self.real.sinh() }
+    #[inline]
+    fn cosh(self) -> Self {
+        Dual {
+            real: self.real.cosh(),
+            dual: self.dual * self.real.sinh(),
+        }
     }
 
     // d/dx acosh(x) = 1/sqrt(x²-1)
-    #[inline] fn acosh(self) -> Self {
+    #[inline]
+    fn acosh(self) -> Self {
         Dual {
             real: self.real.acosh(),
             dual: self.dual / (self.real * self.real - S::ONE).sqrt(),
@@ -297,7 +436,8 @@ impl<S: Scalar> Scalar for Dual<S> {
     }
 
     // d/dx asinh(x) = 1/sqrt(x²+1)
-    #[inline] fn asinh(self) -> Self {
+    #[inline]
+    fn asinh(self) -> Self {
         Dual {
             real: self.real.asinh(),
             dual: self.dual / (self.real * self.real + S::ONE).sqrt(),
@@ -305,16 +445,26 @@ impl<S: Scalar> Scalar for Dual<S> {
     }
 
     // d/dx atanh(x) = 1/(1-x²)
-    #[inline] fn atanh(self) -> Self {
+    #[inline]
+    fn atanh(self) -> Self {
         Dual {
             real: self.real.atanh(),
             dual: self.dual / (S::ONE - self.real * self.real),
         }
     }
 
-    #[inline] fn from_f64(v: f64) -> Self { Dual::constant(S::from_f64(v)) }
-    #[inline] fn to_f64(self) -> f64 { self.real.to_f64() }
-    #[inline] fn from_i32(v: i32) -> Self { Dual::constant(S::from_i32(v)) }
+    #[inline]
+    fn from_f64(v: f64) -> Self {
+        Dual::constant(S::from_f64(v))
+    }
+    #[inline]
+    fn to_f64(self) -> f64 {
+        self.real.to_f64()
+    }
+    #[inline]
+    fn from_i32(v: i32) -> Self {
+        Dual::constant(S::from_i32(v))
+    }
 }
 
 #[cfg(test)]
@@ -349,7 +499,7 @@ mod tests {
     fn derivative_of_sin() {
         let x = Dual::var(0.0_f64);
         let y = x.sin();
-        assert!(y.real.abs() < 1e-10);     // sin(0) = 0
+        assert!(y.real.abs() < 1e-10); // sin(0) = 0
         assert!((y.dual - 1.0).abs() < 1e-10); // cos(0) = 1
     }
 

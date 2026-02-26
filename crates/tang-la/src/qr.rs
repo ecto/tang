@@ -1,6 +1,6 @@
-use tang::Scalar;
-use crate::{DVec, DMat};
+use crate::{DMat, DVec};
 use alloc::vec::Vec;
+use tang::Scalar;
 
 /// QR decomposition via Householder reflections: A = Q * R
 pub struct Qr<S> {
@@ -84,7 +84,9 @@ impl<S: Scalar> Qr<S> {
         let mut q = DMat::identity(m);
 
         for j in (0..k).rev() {
-            if self.qr.get(j, j) == S::ZERO { continue; }
+            if self.qr.get(j, j) == S::ZERO {
+                continue;
+            }
             for col in j..m {
                 let mut s = S::ZERO;
                 for i in j..m {
@@ -111,7 +113,9 @@ impl<S: Scalar> Qr<S> {
         // Apply Q^T to b
         let mut x = DVec::from_slice(b.as_slice());
         for k in 0..n.min(m) {
-            if self.qr.get(k, k) == S::ZERO { continue; }
+            if self.qr.get(k, k) == S::ZERO {
+                continue;
+            }
             let mut s = S::ZERO;
             for i in k..m {
                 s += self.qr.get(i, k) * x[i];
@@ -179,8 +183,14 @@ mod tests {
         let recon = q.mul_mat(&r);
         for i in 0..3 {
             for j in 0..2 {
-                assert!((recon.get(i, j) - a.get(i, j)).abs() < 1e-10,
-                    "mismatch at ({}, {}): {} vs {}", i, j, recon.get(i, j), a.get(i, j));
+                assert!(
+                    (recon.get(i, j) - a.get(i, j)).abs() < 1e-10,
+                    "mismatch at ({}, {}): {} vs {}",
+                    i,
+                    j,
+                    recon.get(i, j),
+                    a.get(i, j)
+                );
             }
         }
     }

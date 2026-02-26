@@ -1,6 +1,6 @@
-use tang::Scalar;
-use crate::{DVec, DMat};
+use crate::{DMat, DVec};
 use alloc::vec::Vec;
+use tang::Scalar;
 
 /// LU decomposition with partial pivoting: PA = LU
 pub struct Lu<S> {
@@ -134,9 +134,7 @@ mod tests {
     fn solve_simple() {
         // [2 1] [x]   [5]    x=2, y=1
         // [1 3] [y] = [5]
-        let a = DMat::from_fn(2, 2, |i, j| {
-            [[2.0, 1.0], [1.0, 3.0]][i][j]
-        });
+        let a = DMat::from_fn(2, 2, |i, j| [[2.0, 1.0], [1.0, 3.0]][i][j]);
         let b = DVec::from_slice(&[5.0, 5.0]);
         let lu = Lu::new(&a).unwrap();
         let x = lu.solve(&b);
@@ -146,9 +144,7 @@ mod tests {
 
     #[test]
     fn determinant() {
-        let a = DMat::from_fn(2, 2, |i, j| {
-            [[3.0, 7.0], [1.0, -4.0]][i][j]
-        });
+        let a = DMat::from_fn(2, 2, |i, j| [[3.0, 7.0], [1.0, -4.0]][i][j]);
         let lu = Lu::new(&a).unwrap();
         assert!((lu.det() - (-19.0)).abs() < 1e-10);
     }
@@ -164,17 +160,20 @@ mod tests {
         for i in 0..3 {
             for j in 0..3 {
                 let expected = if i == j { 1.0 } else { 0.0 };
-                assert!((prod.get(i, j) - expected).abs() < 1e-10,
-                    "mismatch at ({}, {}): {}", i, j, prod.get(i, j));
+                assert!(
+                    (prod.get(i, j) - expected).abs() < 1e-10,
+                    "mismatch at ({}, {}): {}",
+                    i,
+                    j,
+                    prod.get(i, j)
+                );
             }
         }
     }
 
     #[test]
     fn singular_returns_none() {
-        let a = DMat::from_fn(2, 2, |i, j| {
-            [[1.0, 2.0], [2.0, 4.0]][i][j]
-        });
+        let a = DMat::from_fn(2, 2, |i, j| [[1.0, 2.0], [2.0, 4.0]][i][j]);
         assert!(Lu::new(&a).is_none());
     }
 }

@@ -1,7 +1,7 @@
 use crate::Tape;
 use alloc::sync::Arc;
 use alloc::vec;
-use core::ops::{Add, Sub, Mul, Div, Neg};
+use core::ops::{Add, Div, Mul, Neg, Sub};
 use tang_la::DVec;
 
 /// A variable tracked on the AD tape.
@@ -18,7 +18,9 @@ pub struct Var {
 impl Var {
     /// The current value.
     #[inline]
-    pub fn value(&self) -> f64 { self.value }
+    pub fn value(&self) -> f64 {
+        self.value
+    }
 
     /// Compute gradients via reverse-mode AD.
     ///
@@ -32,7 +34,9 @@ impl Var {
         // Reverse sweep
         for i in (0..n).rev() {
             let adj = adjoints[i];
-            if adj == 0.0 { continue; }
+            if adj == 0.0 {
+                continue;
+            }
             let op = &ops[i];
             if op.num_inputs >= 1 {
                 adjoints[op.inputs[0]] += adj * op.partials[0];
@@ -47,12 +51,14 @@ impl Var {
 
     /// Sine.
     pub fn sin(&self) -> Var {
-        self.tape.unary(self.index, self.value.sin(), self.value.cos())
+        self.tape
+            .unary(self.index, self.value.sin(), self.value.cos())
     }
 
     /// Cosine.
     pub fn cos(&self) -> Var {
-        self.tape.unary(self.index, self.value.cos(), -self.value.sin())
+        self.tape
+            .unary(self.index, self.value.cos(), -self.value.sin())
     }
 
     /// Exponential.
@@ -63,7 +69,8 @@ impl Var {
 
     /// Natural log.
     pub fn ln(&self) -> Var {
-        self.tape.unary(self.index, self.value.ln(), 1.0 / self.value)
+        self.tape
+            .unary(self.index, self.value.ln(), 1.0 / self.value)
     }
 
     /// Square root.
@@ -74,7 +81,8 @@ impl Var {
 
     /// Absolute value.
     pub fn abs(&self) -> Var {
-        self.tape.unary(self.index, self.value.abs(), self.value.signum())
+        self.tape
+            .unary(self.index, self.value.abs(), self.value.signum())
     }
 
     /// Tanh.
@@ -86,7 +94,8 @@ impl Var {
     /// Power.
     pub fn powf(&self, p: f64) -> Var {
         let val = self.value.powf(p);
-        self.tape.unary(self.index, val, p * self.value.powf(p - 1.0))
+        self.tape
+            .unary(self.index, val, p * self.value.powf(p - 1.0))
     }
 
     /// Create a constant (no gradient).
@@ -109,21 +118,29 @@ impl Var {
 impl Add for &Var {
     type Output = Var;
     fn add(self, rhs: &Var) -> Var {
-        self.tape.binary(self.index, rhs.index, self.value + rhs.value, 1.0, 1.0)
+        self.tape
+            .binary(self.index, rhs.index, self.value + rhs.value, 1.0, 1.0)
     }
 }
 
 impl Sub for &Var {
     type Output = Var;
     fn sub(self, rhs: &Var) -> Var {
-        self.tape.binary(self.index, rhs.index, self.value - rhs.value, 1.0, -1.0)
+        self.tape
+            .binary(self.index, rhs.index, self.value - rhs.value, 1.0, -1.0)
     }
 }
 
 impl Mul for &Var {
     type Output = Var;
     fn mul(self, rhs: &Var) -> Var {
-        self.tape.binary(self.index, rhs.index, self.value * rhs.value, rhs.value, self.value)
+        self.tape.binary(
+            self.index,
+            rhs.index,
+            self.value * rhs.value,
+            rhs.value,
+            self.value,
+        )
     }
 }
 
@@ -151,27 +168,37 @@ impl Neg for &Var {
 // Owned variants
 impl Add for Var {
     type Output = Var;
-    fn add(self, rhs: Var) -> Var { (&self) + (&rhs) }
+    fn add(self, rhs: Var) -> Var {
+        (&self) + (&rhs)
+    }
 }
 
 impl Sub for Var {
     type Output = Var;
-    fn sub(self, rhs: Var) -> Var { (&self) - (&rhs) }
+    fn sub(self, rhs: Var) -> Var {
+        (&self) - (&rhs)
+    }
 }
 
 impl Mul for Var {
     type Output = Var;
-    fn mul(self, rhs: Var) -> Var { (&self) * (&rhs) }
+    fn mul(self, rhs: Var) -> Var {
+        (&self) * (&rhs)
+    }
 }
 
 impl Div for Var {
     type Output = Var;
-    fn div(self, rhs: Var) -> Var { (&self) / (&rhs) }
+    fn div(self, rhs: Var) -> Var {
+        (&self) / (&rhs)
+    }
 }
 
 impl Neg for Var {
     type Output = Var;
-    fn neg(self) -> Var { -(&self) }
+    fn neg(self) -> Var {
+        -(&self)
+    }
 }
 
 // Scalar * Var and Var * scalar convenience
@@ -184,7 +211,9 @@ impl Mul<f64> for &Var {
 
 impl Mul<f64> for Var {
     type Output = Var;
-    fn mul(self, rhs: f64) -> Var { (&self) * rhs }
+    fn mul(self, rhs: f64) -> Var {
+        (&self) * rhs
+    }
 }
 
 impl Add<f64> for &Var {
@@ -196,7 +225,9 @@ impl Add<f64> for &Var {
 
 impl Add<f64> for Var {
     type Output = Var;
-    fn add(self, rhs: f64) -> Var { (&self) + rhs }
+    fn add(self, rhs: f64) -> Var {
+        (&self) + rhs
+    }
 }
 
 #[cfg(test)]

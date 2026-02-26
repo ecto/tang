@@ -1,5 +1,5 @@
 use crate::{Scalar, Vec2};
-use core::ops::{Add, Sub, AddAssign, SubAssign};
+use core::ops::{Add, AddAssign, Sub, SubAssign};
 
 /// A point in 2D space (distinct from Vec2 — points have position, vectors have direction).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -12,22 +12,34 @@ pub struct Point2<S> {
 
 impl<S: Scalar> Point2<S> {
     #[inline]
-    pub fn new(x: S, y: S) -> Self { Self { x, y } }
+    pub fn new(x: S, y: S) -> Self {
+        Self { x, y }
+    }
 
     #[inline]
-    pub fn origin() -> Self { Self::new(S::ZERO, S::ZERO) }
+    pub fn origin() -> Self {
+        Self::new(S::ZERO, S::ZERO)
+    }
 
     #[inline]
-    pub fn to_vec(self) -> Vec2<S> { Vec2::new(self.x, self.y) }
+    pub fn to_vec(self) -> Vec2<S> {
+        Vec2::new(self.x, self.y)
+    }
 
     #[inline]
-    pub fn from_vec(v: Vec2<S>) -> Self { Self::new(v.x, v.y) }
+    pub fn from_vec(v: Vec2<S>) -> Self {
+        Self::new(v.x, v.y)
+    }
 
     #[inline]
-    pub fn distance(self, other: Self) -> S { (other - self).norm() }
+    pub fn distance(self, other: Self) -> S {
+        (other - self).norm()
+    }
 
     #[inline]
-    pub fn distance_sq(self, other: Self) -> S { (other - self).norm_sq() }
+    pub fn distance_sq(self, other: Self) -> S {
+        (other - self).norm_sq()
+    }
 
     #[inline]
     pub fn lerp(self, other: Self, t: S) -> Self {
@@ -41,13 +53,16 @@ impl<S: Scalar> Point2<S> {
 }
 
 impl<S: Scalar> Default for Point2<S> {
-    fn default() -> Self { Self::origin() }
+    fn default() -> Self {
+        Self::origin()
+    }
 }
 
 // Point - Point = Vec
 impl<S: Scalar> Sub for Point2<S> {
     type Output = Vec2<S>;
-    #[inline] fn sub(self, rhs: Self) -> Vec2<S> {
+    #[inline]
+    fn sub(self, rhs: Self) -> Vec2<S> {
         Vec2::new(self.x - rhs.x, self.y - rhs.y)
     }
 }
@@ -55,7 +70,8 @@ impl<S: Scalar> Sub for Point2<S> {
 // Point + Vec = Point
 impl<S: Scalar> Add<Vec2<S>> for Point2<S> {
     type Output = Self;
-    #[inline] fn add(self, rhs: Vec2<S>) -> Self {
+    #[inline]
+    fn add(self, rhs: Vec2<S>) -> Self {
         Self::new(self.x + rhs.x, self.y + rhs.y)
     }
 }
@@ -63,39 +79,60 @@ impl<S: Scalar> Add<Vec2<S>> for Point2<S> {
 // Point - Vec = Point
 impl<S: Scalar> Sub<Vec2<S>> for Point2<S> {
     type Output = Self;
-    #[inline] fn sub(self, rhs: Vec2<S>) -> Self {
+    #[inline]
+    fn sub(self, rhs: Vec2<S>) -> Self {
         Self::new(self.x - rhs.x, self.y - rhs.y)
     }
 }
 
 impl<S: Scalar> AddAssign<Vec2<S>> for Point2<S> {
-    #[inline] fn add_assign(&mut self, rhs: Vec2<S>) { self.x += rhs.x; self.y += rhs.y; }
+    #[inline]
+    fn add_assign(&mut self, rhs: Vec2<S>) {
+        self.x += rhs.x;
+        self.y += rhs.y;
+    }
 }
 
 impl<S: Scalar> SubAssign<Vec2<S>> for Point2<S> {
-    #[inline] fn sub_assign(&mut self, rhs: Vec2<S>) { self.x -= rhs.x; self.y -= rhs.y; }
+    #[inline]
+    fn sub_assign(&mut self, rhs: Vec2<S>) {
+        self.x -= rhs.x;
+        self.y -= rhs.y;
+    }
 }
 
 // nalgebra compatibility: reference-based operators.
 impl<S: Scalar> Sub for &Point2<S> {
     type Output = Vec2<S>;
-    #[inline] fn sub(self, rhs: &Point2<S>) -> Vec2<S> { *self - *rhs }
+    #[inline]
+    fn sub(self, rhs: &Point2<S>) -> Vec2<S> {
+        *self - *rhs
+    }
 }
 
 impl<S: Scalar> Add<&Vec2<S>> for &Point2<S> {
     type Output = Point2<S>;
-    #[inline] fn add(self, rhs: &Vec2<S>) -> Point2<S> { *self + *rhs }
+    #[inline]
+    fn add(self, rhs: &Vec2<S>) -> Point2<S> {
+        *self + *rhs
+    }
 }
 
 impl<S: Scalar> Sub<&Vec2<S>> for &Point2<S> {
     type Output = Point2<S>;
-    #[inline] fn sub(self, rhs: &Vec2<S>) -> Point2<S> { *self - *rhs }
+    #[inline]
+    fn sub(self, rhs: &Vec2<S>) -> Point2<S> {
+        *self - *rhs
+    }
 }
 
 // Mixed ref/value: &Point2 - Point2
 impl<S: Scalar> Sub<Point2<S>> for &Point2<S> {
     type Output = Vec2<S>;
-    #[inline] fn sub(self, rhs: Point2<S>) -> Vec2<S> { *self - rhs }
+    #[inline]
+    fn sub(self, rhs: Point2<S>) -> Vec2<S> {
+        *self - rhs
+    }
 }
 
 #[cfg(test)]

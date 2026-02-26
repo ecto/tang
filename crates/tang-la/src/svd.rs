@@ -1,6 +1,6 @@
-use tang::Scalar;
-use crate::{DVec, DMat};
+use crate::{DMat, DVec};
 use alloc::vec::Vec;
+use tang::Scalar;
 
 /// Singular Value Decomposition: A = U * Σ * V^T
 ///
@@ -102,7 +102,9 @@ impl<S: Scalar> Svd<S> {
                 }
             }
 
-            if converged { break; }
+            if converged {
+                break;
+            }
         }
 
         // Extract singular values = norms of U columns
@@ -125,13 +127,21 @@ impl<S: Scalar> Svd<S> {
 
         // Sort singular values descending
         let mut order: Vec<usize> = (0..n).collect();
-        order.sort_by(|&a, &b| sigma[b].partial_cmp(&sigma[a]).unwrap_or(core::cmp::Ordering::Equal));
+        order.sort_by(|&a, &b| {
+            sigma[b]
+                .partial_cmp(&sigma[a])
+                .unwrap_or(core::cmp::Ordering::Equal)
+        });
 
         let s = DVec::from_fn(n, |i| sigma[order[i]]);
         let u_sorted = DMat::from_fn(m, n, |i, j| u.get(i, order[j]));
         let vt_sorted = DMat::from_fn(n, n, |i, j| v.get(j, order[i]));
 
-        Svd { u: u_sorted, s, vt: vt_sorted }
+        Svd {
+            u: u_sorted,
+            s,
+            vt: vt_sorted,
+        }
     }
 
     /// Rank (number of significant singular values).
@@ -147,7 +157,11 @@ impl<S: Scalar> Svd<S> {
 
         // Σ⁺: invert non-tiny singular values
         let s_inv = DVec::from_fn(k, |i| {
-            if self.s[i] > tol { self.s[i].recip() } else { S::ZERO }
+            if self.s[i] > tol {
+                self.s[i].recip()
+            } else {
+                S::ZERO
+            }
         });
 
         // V * diag(s_inv) * U^T
@@ -170,19 +184,25 @@ impl<S: Scalar> Svd<S> {
     ///
     /// nalgebra uses `svd.singular_values` as a field; tang stores them in `svd.s`.
     #[inline]
-    pub fn singular_values(&self) -> &DVec<S> { &self.s }
+    pub fn singular_values(&self) -> &DVec<S> {
+        &self.s
+    }
 
     /// Alias for `Some(&self.vt)` (nalgebra compatibility).
     ///
     /// nalgebra uses `svd.v_t` as `Option<DMatrix>`. tang always computes V^T.
     #[inline]
-    pub fn v_t(&self) -> Option<&DMat<S>> { Some(&self.vt) }
+    pub fn v_t(&self) -> Option<&DMat<S>> {
+        Some(&self.vt)
+    }
 
     /// Alias for `Some(&self.u)` (nalgebra compatibility).
     ///
     /// nalgebra uses `svd.u` as `Option<DMatrix>`. tang always computes U.
     #[inline]
-    pub fn u(&self) -> Option<&DMat<S>> { Some(&self.u) }
+    pub fn u(&self) -> Option<&DMat<S>> {
+        Some(&self.u)
+    }
 
     /// Solve Ax = b in the least-squares sense via pseudoinverse.
     ///
@@ -232,8 +252,14 @@ mod tests {
         let recon = svd.reconstruct();
         for i in 0..3 {
             for j in 0..2 {
-                assert!((recon.get(i, j) - a.get(i, j)).abs() < 1e-8,
-                    "mismatch at ({}, {}): {} vs {}", i, j, recon.get(i, j), a.get(i, j));
+                assert!(
+                    (recon.get(i, j) - a.get(i, j)).abs() < 1e-8,
+                    "mismatch at ({}, {}): {} vs {}",
+                    i,
+                    j,
+                    recon.get(i, j),
+                    a.get(i, j)
+                );
             }
         }
     }
@@ -245,11 +271,13 @@ mod tests {
         let b = DMat::from_fn(3, 2, |_i, j| (j + 1) as f64);
         let _m = a.mul_mat(&b.transpose()).submatrix(0, 0, 3, 2);
         // Actually, let's use a clearer rank-1 example
-        let r1 = DMat::from_fn(3, 2, |i, j| {
-            [[1.0, 2.0], [2.0, 4.0], [3.0, 6.0]][i][j]
-        });
+        let r1 = DMat::from_fn(3, 2, |i, j| [[1.0, 2.0], [2.0, 4.0], [3.0, 6.0]][i][j]);
         let svd = Svd::new(&r1);
-        assert!(svd.rank(1e-10) == 1, "rank should be 1, got {}", svd.rank(1e-10));
+        assert!(
+            svd.rank(1e-10) == 1,
+            "rank should be 1, got {}",
+            svd.rank(1e-10)
+        );
     }
 
     #[test]
@@ -259,17 +287,21 @@ mod tests {
         let recon = svd.reconstruct();
         for i in 0..2 {
             for j in 0..3 {
-                assert!((recon.get(i, j) - a.get(i, j)).abs() < 1e-8,
-                    "mismatch at ({}, {}): {} vs {}", i, j, recon.get(i, j), a.get(i, j));
+                assert!(
+                    (recon.get(i, j) - a.get(i, j)).abs() < 1e-8,
+                    "mismatch at ({}, {}): {} vs {}",
+                    i,
+                    j,
+                    recon.get(i, j),
+                    a.get(i, j)
+                );
             }
         }
     }
 
     #[test]
     fn pseudoinverse() {
-        let a = DMat::from_fn(3, 2, |i, j| {
-            [[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]][i][j]
-        });
+        let a = DMat::from_fn(3, 2, |i, j| [[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]][i][j]);
         let svd = Svd::new(&a);
         let pinv = svd.pseudoinverse(1e-10);
         // A⁺ * A should be I(2×2)

@@ -18,44 +18,40 @@ extern crate std;
 
 extern crate alloc;
 
+mod dir3;
+mod dual;
+mod mat3;
+mod mat4;
+mod point2;
+mod point3;
+mod quat;
 mod scalar;
+mod spatial;
+mod transform;
 mod vec2;
 mod vec3;
 mod vec4;
-mod point2;
-mod point3;
-mod dir3;
-mod mat3;
-mod mat4;
-mod quat;
-mod transform;
-mod spatial;
-mod dual;
 
 #[cfg(feature = "exact")]
 pub mod predicates;
 
+pub use dir3::Dir3;
+pub use dual::Dual;
+pub use mat3::Mat3;
+pub use mat4::Mat4;
+pub use point2::Point2;
+pub use point3::Point3;
+pub use quat::Quat;
 pub use scalar::Scalar;
+pub use spatial::{SpatialInertia, SpatialMat, SpatialTransform, SpatialVec};
+pub use transform::Transform;
 pub use vec2::Vec2;
 pub use vec3::Vec3;
 pub use vec4::Vec4;
-pub use point2::Point2;
-pub use point3::Point3;
-pub use dir3::Dir3;
-pub use mat3::Mat3;
-pub use mat4::Mat4;
-pub use quat::Quat;
-pub use transform::Transform;
-pub use spatial::{SpatialVec, SpatialMat, SpatialTransform, SpatialInertia};
-pub use dual::Dual;
 
 /// Cross-product matrix [v]× such that [v]× w = v × w
 pub fn skew<S: Scalar>(v: &Vec3<S>) -> Mat3<S> {
-    Mat3::new(
-        S::ZERO, -v.z,    v.y,
-        v.z,     S::ZERO, -v.x,
-        -v.y,    v.x,     S::ZERO,
-    )
+    Mat3::new(S::ZERO, -v.z, v.y, v.z, S::ZERO, -v.x, -v.y, v.x, S::ZERO)
 }
 
 pub const GRAVITY: f64 = 9.81;

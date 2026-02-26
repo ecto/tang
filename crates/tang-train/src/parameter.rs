@@ -1,5 +1,5 @@
 use alloc::vec::Vec;
-use tang_tensor::{Tensor, Shape};
+use tang_tensor::{Shape, Tensor};
 
 /// A trainable parameter — a tensor with an associated gradient buffer.
 pub struct Parameter {
@@ -30,9 +30,13 @@ impl Parameter {
 
         for _ in 0..n {
             // Simple LCG-based normal approximation (Box-Muller)
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let u1 = (state >> 11) as f64 / (1u64 << 53) as f64;
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let u2 = (state >> 11) as f64 / (1u64 << 53) as f64;
 
             let u1 = u1.max(1e-15); // avoid log(0)

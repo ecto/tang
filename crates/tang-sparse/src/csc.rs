@@ -1,18 +1,20 @@
+use alloc::vec::Vec;
 use tang::Scalar;
 use tang_la::DVec;
-use alloc::vec::Vec;
 
 /// Compressed Sparse Column matrix.
 pub struct CscMatrix<S> {
     pub nrows: usize,
     pub ncols: usize,
-    pub col_ptrs: Vec<usize>,   // length ncols + 1
+    pub col_ptrs: Vec<usize>,    // length ncols + 1
     pub row_indices: Vec<usize>, // length nnz
     pub values: Vec<S>,          // length nnz
 }
 
 impl<S: Scalar> CscMatrix<S> {
-    pub fn nnz(&self) -> usize { self.values.len() }
+    pub fn nnz(&self) -> usize {
+        self.values.len()
+    }
 
     /// Sparse matrix-vector product: y = A * x
     pub fn spmv(&self, x: &DVec<S>) -> DVec<S> {
@@ -67,7 +69,13 @@ impl<S: Scalar> CscMatrix<S> {
             }
         }
 
-        Self { nrows, ncols, col_ptrs: col_counts, row_indices, values }
+        Self {
+            nrows,
+            ncols,
+            col_ptrs: col_counts,
+            row_indices,
+            values,
+        }
     }
 }
 
