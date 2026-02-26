@@ -1,0 +1,9 @@
+[package]
+name = "tang-expr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RISC expression graph for symbolic computation, differentiation, and compilation"
+
+[dependencies]
+tang = { workspace = true, features = ["std"] }

@@ -10,6 +10,8 @@ members = [
     "crates/tang-optim",
     "crates/tang-train",
     "crates/tang-bench",
+    "crates/tang-site-wasm",
+    "crates/tang-expr",
 ]
 
 [workspace.package]
@@ -26,3 +28,4 @@ tang-gpu = { path = "crates/tang-gpu" }
 tang-tensor = { path = "crates/tang-tensor" }
 tang-optim = { path = "crates/tang-optim" }
 tang-train = { path = "crates/tang-train" }
+tang-expr = { path = "crates/tang-expr" }

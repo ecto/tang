@@ -2018,6 +2018,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tang-expr"
+version = "0.1.0"
+dependencies = [
+ "tang",
+]
+
+[[package]]
 name = "tang-gpu"
 version = "0.1.0"
 dependencies = [
@@ -2046,6 +2053,14 @@ dependencies = [
  "tang",
  "tang-ad",
  "tang-la",
+]
+
+[[package]]
+name = "tang-site-wasm"
+version = "0.1.0"
+dependencies = [
+ "tang",
+ "wasm-bindgen",
 ]
 
 [[package]]
