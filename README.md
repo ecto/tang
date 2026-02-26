@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="site/tang-mascot.svg" alt="tang mascot" width="120">
+</p>
+
 # tang
 
 Math for physical reality. The shared foundation beneath geometry kernels, physics engines, and the full design→simulate→manufacture→deploy loop.

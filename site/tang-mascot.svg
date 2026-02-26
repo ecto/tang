@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
+  <!-- Body -->
+  <circle cx="100" cy="110" r="60" fill="#FF8C00"/>
+  <!-- Subtle highlight -->
+  <ellipse cx="85" cy="85" rx="30" ry="25" fill="#FFA033" opacity="0.6"/>
+  <!-- Tiny shine -->
+  <circle cx="75" cy="78" r="8" fill="#FFB84D" opacity="0.5"/>
+
+  <!-- Navel dimple -->
+  <circle cx="100" cy="155" r="6" fill="#E07800" opacity="0.4"/>
+
+  <!-- Stem -->
+  <path d="M100 50 Q98 40 100 30" stroke="#5D4E37" stroke-width="4" fill="none" stroke-linecap="round"/>
+
+  <!-- Leaf left -->
+  <path d="M98 38 Q80 25 72 32 Q78 42 98 42" fill="#4CAF50"/>
+  <path d="M98 40 Q82 32 74 33" stroke="#388E3C" stroke-width="0.8" fill="none"/>
+
+  <!-- Leaf right -->
+  <path d="M102 36 Q118 22 126 28 Q120 40 102 40" fill="#66BB6A"/>
+  <path d="M102 38 Q116 28 124 28" stroke="#388E3C" stroke-width="0.8" fill="none"/>
+
+  <!-- Eyes -->
+  <ellipse cx="82" cy="105" rx="7" ry="8" fill="#2D1B00"/>
+  <ellipse cx="118" cy="105" rx="7" ry="8" fill="#2D1B00"/>
+  <!-- Eye shine -->
+  <circle cx="85" cy="102" r="3" fill="white" opacity="0.8"/>
+  <circle cx="121" cy="102" r="3" fill="white" opacity="0.8"/>
+
+  <!-- Cheeks -->
+  <ellipse cx="68" cy="120" rx="10" ry="7" fill="#FF6B6B" opacity="0.3"/>
+  <ellipse cx="132" cy="120" rx="10" ry="7" fill="#FF6B6B" opacity="0.3"/>
+
+  <!-- Smile -->
+  <path d="M88 125 Q100 140 112 125" stroke="#2D1B00" stroke-width="3" fill="none" stroke-linecap="round"/>
+
+  <!-- Little feet -->
+  <ellipse cx="82" cy="168" rx="12" ry="6" fill="#E07800"/>
+  <ellipse cx="118" cy="168" rx="12" ry="6" fill="#E07800"/>
+</svg>
