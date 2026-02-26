@@ -172,6 +172,28 @@ impl<S: Scalar> Mat4<S> {
         )
     }
 
+    /// Determinant via cofactor expansion.
+    #[inline]
+    pub fn determinant(&self) -> S {
+        let m = |r, c| self.get(r, c);
+
+        let s0 = m(0,0) * m(1,1) - m(1,0) * m(0,1);
+        let s1 = m(0,0) * m(1,2) - m(1,0) * m(0,2);
+        let s2 = m(0,0) * m(1,3) - m(1,0) * m(0,3);
+        let s3 = m(0,1) * m(1,2) - m(1,1) * m(0,2);
+        let s4 = m(0,1) * m(1,3) - m(1,1) * m(0,3);
+        let s5 = m(0,2) * m(1,3) - m(1,2) * m(0,3);
+
+        let c5 = m(2,2) * m(3,3) - m(3,2) * m(2,3);
+        let c4 = m(2,1) * m(3,3) - m(3,1) * m(2,3);
+        let c3 = m(2,1) * m(3,2) - m(3,1) * m(2,2);
+        let c2 = m(2,0) * m(3,3) - m(3,0) * m(2,3);
+        let c1 = m(2,0) * m(3,2) - m(3,0) * m(2,2);
+        let c0 = m(2,0) * m(3,1) - m(3,0) * m(2,1);
+
+        s0 * c5 - s1 * c4 + s2 * c3 + s3 * c2 - s4 * c1 + s5 * c0
+    }
+
     /// 4x4 matrix inverse via cofactor expansion
     pub fn try_inverse(&self) -> Option<Self> {
         let m = |r, c| self.get(r, c);
@@ -307,6 +329,16 @@ mod tests {
                     "mismatch at ({}, {}): {} vs {}", r, c, prod.get(r, c), id.get(r, c));
             }
         }
+    }
+
+    #[test]
+    fn determinant() {
+        let id = Mat4::<f64>::identity();
+        assert!((id.determinant() - 1.0).abs() < 1e-10);
+        let m = Mat4::translation(1.0, 2.0, 3.0) * Mat4::rotation_z(0.5);
+        assert!((m.determinant() - 1.0).abs() < 1e-10);
+        let s = Mat4::scale(2.0, 3.0, 4.0);
+        assert!((s.determinant() - 24.0).abs() < 1e-10);
     }
 
     #[test]

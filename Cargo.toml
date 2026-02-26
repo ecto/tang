@@ -9,6 +9,7 @@ members = [
     "crates/tang-tensor",
     "crates/tang-optim",
     "crates/tang-train",
+    "crates/tang-bench",
 ]
 
 [workspace.package]
