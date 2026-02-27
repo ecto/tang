@@ -82,7 +82,7 @@ pub use device::{GpuDevice, GpuError};
 pub use kernel::KernelCache;
 pub use module::{GpuAdam, GpuLinear, GpuModule, GpuTrainModule};
 pub use nn::{add_tensors, bias_add, gelu, relu, relu_backward, softmax, GpuAttention, GpuLayerNorm, GpuTransformerBlock};
-pub use train::{gpu_mse_loss, GpuDataLoader, GpuReLULayer, GpuSequential, GpuTrainer};
+pub use train::{gpu_cross_entropy_loss, gpu_mse_loss, GpuDataLoader, GpuReLULayer, GpuSequential, GpuTanhLayer, GpuTrainer};
 pub use realize::{map_elementwise, map_elementwise_multi};
 pub use reduce::{reduce_max, reduce_mean, reduce_sum, reduce_sum_all};
 pub use safetensors::{load_safetensors, save_safetensors};

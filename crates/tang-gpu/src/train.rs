@@ -9,6 +9,70 @@ use crate::reduce::reduce_sum_all;
 use crate::tensor::GpuTensor;
 
 // ---------------------------------------------------------------------------
+// GpuTanhLayer
+// ---------------------------------------------------------------------------
+
+/// Tanh activation layer with cached output for backward.
+pub struct GpuTanhLayer {
+    cached_output: Option<GpuTensor>,
+}
+
+impl GpuTanhLayer {
+    pub fn new() -> Self {
+        Self { cached_output: None }
+    }
+}
+
+impl GpuTrainModule for GpuTanhLayer {
+    fn forward_train(
+        &mut self,
+        device: &GpuDevice,
+        cache: &mut KernelCache,
+        input: &GpuTensor,
+    ) -> GpuTensor {
+        let output = map_elementwise(device, cache, &[input], |args| {
+            use tang::Scalar;
+            args[0].tanh()
+        });
+        self.cached_output = Some(output.clone_gpu_batched(device, cache));
+        output
+    }
+
+    fn backward(
+        &mut self,
+        device: &GpuDevice,
+        cache: &mut KernelCache,
+        grad_output: &GpuTensor,
+    ) -> GpuTensor {
+        // d/dx tanh(x) = 1 - tanh(x)^2
+        let output = self.cached_output.as_ref().expect("must call forward_train before backward");
+        map_elementwise(device, cache, &[grad_output, output], |args| {
+            use tang::Scalar;
+            use tang_expr::ExprId;
+            let grad = args[0];
+            let out = args[1];
+            grad * (ExprId::from_f64(1.0) - out * out)
+        })
+    }
+
+    fn parameters(&self) -> Vec<&GpuTensor> {
+        vec![]
+    }
+
+    fn parameters_mut(&mut self) -> Vec<&mut GpuTensor> {
+        vec![]
+    }
+
+    fn gradients(&self) -> Vec<Option<&GpuTensor>> {
+        vec![]
+    }
+
+    fn zero_grad(&mut self) {
+        self.cached_output = None;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // GpuReLULayer
 // ---------------------------------------------------------------------------
 
@@ -155,6 +219,69 @@ pub fn gpu_mse_loss(
     let grad = diff.scale(device, cache, scale);
 
     (loss, grad)
+}
+
+// ---------------------------------------------------------------------------
+// gpu_cross_entropy_loss
+// ---------------------------------------------------------------------------
+
+/// Compute cross-entropy loss and its gradient on GPU.
+///
+/// `pred` has shape `[batch, num_classes]` (logits) or `[num_classes]`.
+/// `target` has shape `[batch, 1]` (class indices as f32) or `[1]`.
+///
+/// Returns `(loss_tensor, grad_tensor)` where loss is a `[1]` scalar and
+/// grad has the same shape as `pred`.
+pub fn gpu_cross_entropy_loss(
+    device: &GpuDevice,
+    cache: &mut KernelCache,
+    pred: &GpuTensor,
+    target: &GpuTensor,
+) -> (GpuTensor, GpuTensor) {
+    cache.flush(device);
+    let logits_data = pred.buffer.to_vec_sync(device);
+    let target_data = target.buffer.to_vec_sync(device);
+
+    let (batch, num_classes) = if pred.ndim() == 2 {
+        (pred.shape()[0], pred.shape()[1])
+    } else {
+        (1, pred.shape()[0])
+    };
+
+    let mut total_loss = 0.0f32;
+    let mut grad = vec![0.0f32; batch * num_classes];
+
+    for b in 0..batch {
+        let offset = b * num_classes;
+        let row = &logits_data[offset..offset + num_classes];
+        let target_idx = target_data[b] as usize;
+
+        // Numerically stable softmax
+        let max_val = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exp: Vec<f32> = row.iter().map(|&x| (x - max_val).exp()).collect();
+        let sum: f32 = exp.iter().sum();
+        let probs: Vec<f32> = exp.iter().map(|&e| e / sum).collect();
+
+        // Loss = -log(prob[target])
+        total_loss += -probs[target_idx].max(1e-12).ln();
+
+        // Grad = softmax - one_hot(target)
+        for c in 0..num_classes {
+            grad[offset + c] = probs[c];
+        }
+        grad[offset + target_idx] -= 1.0;
+    }
+
+    // Average over batch
+    let avg_loss = total_loss / batch as f32;
+    let inv_batch = 1.0 / batch as f32;
+    for g in &mut grad {
+        *g *= inv_batch;
+    }
+
+    let loss = GpuTensor::from_slice(device, &[avg_loss], &[1]);
+    let grad_tensor = GpuTensor::from_slice(device, &grad, pred.shape());
+    (loss, grad_tensor)
 }
 
 // ---------------------------------------------------------------------------

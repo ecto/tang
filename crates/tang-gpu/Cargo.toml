@@ -16,6 +16,9 @@ safetensors = { workspace = true }
 [[example]]
 name = "physics_surrogate"
 
+[[example]]
+name = "quantum_poet"
+
 [dev-dependencies]
 approx = "0.5"
 tang-expr = { workspace = true }
