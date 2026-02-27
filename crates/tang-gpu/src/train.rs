@@ -5,6 +5,7 @@ use crate::kernel::KernelCache;
 use crate::module::{GpuAdam, GpuTrainModule};
 use crate::nn::{relu, relu_backward};
 use crate::realize::map_elementwise;
+use crate::reduce::reduce_sum_all;
 use crate::tensor::GpuTensor;
 
 // ---------------------------------------------------------------------------
@@ -128,13 +129,14 @@ impl GpuTrainModule for GpuSequential {
 
 /// Compute MSE loss and its gradient on GPU.
 ///
-/// Returns `(loss_scalar, grad_tensor)` where `grad = 2/n * (pred - target)`.
+/// Returns `(loss_tensor, grad_tensor)` where loss is a [1] scalar tensor
+/// and `grad = 2/n * (pred - target)`. No CPU readback — loss stays on GPU.
 pub fn gpu_mse_loss(
     device: &GpuDevice,
     cache: &mut KernelCache,
     pred: &GpuTensor,
     target: &GpuTensor,
-) -> (f32, GpuTensor) {
+) -> (GpuTensor, GpuTensor) {
     let n = pred.numel();
     assert_eq!(n, target.numel());
 
@@ -144,10 +146,9 @@ pub fn gpu_mse_loss(
     // squared = diff^2
     let sq = map_elementwise(device, cache, &[&diff], |args| args[0] * args[0]);
 
-    // mean of squared errors (flush pending commands before CPU readback)
-    cache.flush(device);
-    let sq_data = sq.buffer.to_vec_sync(device);
-    let loss = sq_data.iter().sum::<f32>() / n as f32;
+    // loss = sum(sq) / n — entirely on GPU, no readback
+    let sum = reduce_sum_all(device, cache, &sq);
+    let loss = sum.scale(device, cache, 1.0 / n as f32);
 
     // grad = 2/n * diff
     let scale = 2.0 / n as f32;
@@ -256,7 +257,7 @@ impl GpuDataLoader {
 /// Training loop that mirrors tang-train's Trainer.
 pub struct GpuTrainer {
     optimizer: GpuAdam,
-    loss_fn: fn(&GpuDevice, &mut KernelCache, &GpuTensor, &GpuTensor) -> (f32, GpuTensor),
+    loss_fn: fn(&GpuDevice, &mut KernelCache, &GpuTensor, &GpuTensor) -> (GpuTensor, GpuTensor),
     num_epochs: usize,
 }
 
@@ -272,7 +273,7 @@ impl GpuTrainer {
     /// Set a custom loss function.
     pub fn with_loss_fn(
         mut self,
-        f: fn(&GpuDevice, &mut KernelCache, &GpuTensor, &GpuTensor) -> (f32, GpuTensor),
+        f: fn(&GpuDevice, &mut KernelCache, &GpuTensor, &GpuTensor) -> (GpuTensor, GpuTensor),
     ) -> Self {
         self.loss_fn = f;
         self
@@ -293,8 +294,7 @@ impl GpuTrainer {
 
         for _ in 0..self.num_epochs {
             loader.reset();
-            let mut total_loss = 0.0f32;
-            let mut n_batches = 0;
+            let mut batch_losses: Vec<GpuTensor> = Vec::new();
 
             while let Some((input, target)) = loader.next_batch(device) {
                 // Zero gradients
@@ -303,10 +303,9 @@ impl GpuTrainer {
                 // Forward
                 let pred = model.forward_train(device, cache, &input);
 
-                // Loss
-                let (loss, grad) = (self.loss_fn)(device, cache, &pred, &target);
-                total_loss += loss;
-                n_batches += 1;
+                // Loss — stays on GPU as a [1] scalar tensor
+                let (loss_tensor, grad) = (self.loss_fn)(device, cache, &pred, &target);
+                batch_losses.push(loss_tensor);
 
                 // Backward
                 model.backward(device, cache, &grad);
@@ -326,7 +325,17 @@ impl GpuTrainer {
                 self.optimizer.step(device, cache, &mut params, &grads);
             }
 
-            epoch_losses.push(total_loss / n_batches.max(1) as f32);
+            // Flush once per epoch, then read back all loss scalars
+            cache.flush(device);
+            let n_batches = batch_losses.len().max(1);
+            let total_loss: f32 = batch_losses
+                .iter()
+                .map(|t| t.to_vec_sync(device)[0])
+                .sum();
+            epoch_losses.push(total_loss / n_batches as f32);
+
+            // Re-enable batching for next epoch
+            cache.begin_batch();
         }
 
         epoch_losses

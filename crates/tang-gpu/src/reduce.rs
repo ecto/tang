@@ -34,6 +34,19 @@ pub fn reduce_mean(
     reduce_op(device, cache, input, axis, ReduceOp::Mean)
 }
 
+/// Sum all elements to a single scalar [1] tensor, entirely on GPU.
+pub fn reduce_sum_all(
+    device: &GpuDevice,
+    cache: &mut KernelCache,
+    input: &GpuTensor,
+) -> GpuTensor {
+    let mut t = reduce_sum(device, cache, input, 0);
+    while t.numel() > 1 {
+        t = reduce_sum(device, cache, &t, 0);
+    }
+    t
+}
+
 #[derive(Clone, Copy)]
 enum ReduceOp {
     Sum,
