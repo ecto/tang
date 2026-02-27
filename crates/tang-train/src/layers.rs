@@ -1,4 +1,4 @@
-use crate::{Module, Parameter};
+use crate::{Module, Parameter, Rng};
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -295,7 +295,7 @@ impl<S: Scalar> Module<S> for Embedding<S> {
 pub struct Dropout<S: Scalar> {
     pub p: f64,
     pub training: bool,
-    rng_state: u64,
+    rng: Rng,
     cached_mask: Option<Tensor<S>>,
 }
 
@@ -305,16 +305,9 @@ impl<S: Scalar> Dropout<S> {
         Self {
             p,
             training: true,
-            rng_state: seed,
+            rng: Rng::new(seed),
             cached_mask: None,
         }
-    }
-
-    fn next_random(&mut self) -> f64 {
-        self.rng_state = self.rng_state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        (self.rng_state >> 11) as f64 / (1u64 << 53) as f64
     }
 }
 
@@ -330,7 +323,7 @@ impl<S: Scalar> Module<S> for Dropout<S> {
 
         let mask_data: Vec<S> = (0..input.numel())
             .map(|_| {
-                if self.next_random() >= self.p {
+                if !self.rng.bernoulli(self.p) {
                     scale
                 } else {
                     zero
@@ -357,6 +350,10 @@ impl<S: Scalar> Module<S> for Dropout<S> {
 
     fn parameters_mut(&mut self) -> Vec<&mut Parameter<S>> {
         Vec::new()
+    }
+
+    fn set_training(&mut self, training: bool) {
+        self.training = training;
     }
 }
 
@@ -423,5 +420,11 @@ impl<S: Scalar> Module<S> for Sequential<S> {
                     .map(move |(name, param)| (alloc::format!("{}.{}", i, name), param))
             })
             .collect()
+    }
+
+    fn set_training(&mut self, training: bool) {
+        for layer in &mut self.layers {
+            layer.set_training(training);
+        }
     }
 }

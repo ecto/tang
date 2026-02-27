@@ -367,6 +367,67 @@ fn test_named_parameters_sequential() {
 }
 
 #[test]
+fn test_set_training_propagates_through_sequential() {
+    let mut model = Sequential::<f64>::new(vec![
+        Box::new(Linear::new(4, 8, 42)),
+        Box::new(Dropout::new(0.5, 99)),
+        Box::new(Linear::new(8, 2, 137)),
+        Box::new(Dropout::new(0.3, 77)),
+    ]);
+
+    // Default: training=true — dropout should zero some elements
+    let input = Tensor::new(vec![1.0; 4], Shape::from_slice(&[1, 4]));
+    let _out_train = model.forward(&input);
+
+    // Switch to eval
+    model.set_training(false);
+    let out_eval1 = model.forward(&input);
+    let out_eval2 = model.forward(&input);
+
+    // Eval outputs must be deterministic (no dropout randomness)
+    for (&a, &b) in out_eval1.data().iter().zip(out_eval2.data().iter()) {
+        assert!(
+            (a - b).abs() < 1e-10,
+            "eval mode should be deterministic: {} vs {}",
+            a,
+            b,
+        );
+    }
+
+    // Switch back to training — output should differ from eval (with high probability)
+    model.set_training(true);
+    let out_train2 = model.forward(&input);
+    let differs = out_train2
+        .data()
+        .iter()
+        .zip(out_eval1.data().iter())
+        .any(|(&a, &b)| (a - b).abs() > 1e-10);
+    assert!(
+        differs,
+        "training mode output should differ from eval mode (dropout active)",
+    );
+}
+
+#[test]
+fn test_dropout_identity_when_not_training() {
+    let mut dropout = Dropout::<f64>::new(0.5, 42);
+    dropout.set_training(false);
+
+    let input = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0], Shape::from_slice(&[1, 5]));
+    let output = dropout.forward(&input);
+
+    // In eval mode, output == input exactly
+    for (&a, &b) in input.data().iter().zip(output.data().iter()) {
+        assert!(
+            (a - b).abs() < 1e-10,
+            "dropout eval should be identity: {} vs {}",
+            a,
+            b,
+        );
+    }
+}
+
+#[test]
 fn test_state_dict_roundtrip() {
     let mut model = Sequential::<f64>::new(vec![
         Box::new(Linear::new(3, 5, 42)),

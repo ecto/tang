@@ -66,6 +66,13 @@ pub trait Module<S: Scalar> {
         }
     }
 
+    /// Switch between training and eval mode.
+    ///
+    /// Layers like [`Dropout`] change behavior depending on mode.
+    /// [`Sequential`] propagates to all children. The default impl
+    /// is a no-op, which is correct for stateless layers like Linear/ReLU/Tanh.
+    fn set_training(&mut self, _training: bool) {}
+
     /// Zero all gradients.
     fn zero_grad(&mut self) {
         for p in self.parameters_mut() {

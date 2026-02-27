@@ -50,6 +50,7 @@ mod module;
 mod optimizer;
 mod parameter;
 pub mod pinn;
+mod rng;
 mod trainer;
 
 pub use data::{DataLoader, Dataset, TensorDataset};
@@ -60,4 +61,5 @@ pub use loss::{
 pub use module::Module;
 pub use optimizer::{ModuleAdam, ModuleSgd, Optimizer};
 pub use parameter::Parameter;
+pub use rng::Rng;
 pub use trainer::{LossFn, Trainer};
