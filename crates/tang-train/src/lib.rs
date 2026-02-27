@@ -56,9 +56,10 @@ mod trainer;
 
 pub use data::{DataLoader, Dataset, TensorDataset};
 pub use layers::{
-    AdaptiveAvgPool2d, AvgPool2d, BatchNorm2d, Conv1d, Conv2d, Dropout, Embedding,
-    GroupedQueryAttention, LayerNorm, Linear, MaxPool2d, MultiHeadAttention, RMSNorm, ReLU,
-    RotaryEmbedding, Sequential, SiLU, Tanh, TransformerBlock, GELU,
+    AdaptiveAvgPool2d, AvgPool2d, BatchNorm2d, Conv1d, Conv2d, ConvTranspose2d, Dropout,
+    Embedding, GroupNorm, GroupedQueryAttention, InstanceNorm, LayerNorm, Linear, LoRA, LSTM,
+    MaxPool2d, MultiHeadAttention, RMSNorm, ReLU, RotaryEmbedding, Sequential,
+    SiLU, SlidingWindowAttention, Tanh, TransformerBlock, Upsample, UpsampleMode, GRU, GELU,
 };
 pub use loss::{
     cross_entropy_loss, cross_entropy_loss_grad, huber_loss, mse_loss, mse_loss_grad, softmax,

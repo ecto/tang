@@ -1,9 +1,10 @@
 use tang_tensor::{Shape, Tensor};
 use tang_train::{
-    mse_loss, mse_loss_grad, AdaptiveAvgPool2d, AvgPool2d, BatchNorm2d, Conv1d, Conv2d, Dropout,
-    Embedding, GroupedQueryAttention, LayerNorm, Linear, MaxPool2d, Module, ModuleAdam, ModuleSgd,
-    MultiHeadAttention, Optimizer, RMSNorm, ReLU, RotaryEmbedding, Sequential, SiLU, Tanh,
-    TransformerBlock, GELU,
+    mse_loss, mse_loss_grad, AdaptiveAvgPool2d, AvgPool2d, BatchNorm2d, Conv1d, Conv2d,
+    ConvTranspose2d, Dropout, Embedding, GroupNorm, GroupedQueryAttention, InstanceNorm,
+    LayerNorm, Linear, LoRA, LSTM, MaxPool2d, Module, ModuleAdam, ModuleSgd,
+    MultiHeadAttention, Optimizer, RMSNorm, ReLU, RotaryEmbedding, Sequential, SiLU,
+    SlidingWindowAttention, Tanh, TransformerBlock, Upsample, UpsampleMode, GRU, GELU,
 };
 
 #[test]
@@ -1244,4 +1245,260 @@ fn test_batchnorm2d_backward_gradient_check() {
             }
         }
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 5 tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_conv_transpose2d_upsample() {
+    // ConvTranspose2d with stride=2 should roughly double spatial dims
+    let mut ct = ConvTranspose2d::<f64>::with_options(1, 1, 3, 2, 1, 1, 42);
+    // Input: [1, 1, 2, 2]
+    let input = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0_f64]);
+    let input = input.reshape(Shape::from_slice(&[1, 1, 2, 2]));
+    let output = ct.forward(&input);
+    // Output should be [1, 1, 4, 4] with stride=2, padding=1, output_padding=1
+    assert_eq!(output.shape().dims(), &[1, 1, 4, 4]);
+}
+
+#[test]
+fn test_conv_transpose2d_backward_runs() {
+    let mut ct = ConvTranspose2d::<f64>::with_options(1, 1, 3, 2, 1, 1, 42);
+    let input = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], Shape::from_slice(&[1, 1, 2, 2]));
+    let output = ct.forward(&input);
+    let grad = Tensor::ones(output.shape().clone());
+    let grad_input = ct.backward(&grad);
+    assert_eq!(grad_input.shape().dims(), &[1, 1, 2, 2]);
+}
+
+#[test]
+fn test_upsample_nearest() {
+    let mut up = Upsample::nearest(2);
+    // [1, 1, 2, 2] -> [1, 1, 4, 4]
+    let input = Tensor::new(vec![1.0, 2.0, 3.0, 4.0_f64], Shape::from_slice(&[1, 1, 2, 2]));
+    let output = up.forward(&input);
+    assert_eq!(output.shape().dims(), &[1, 1, 4, 4]);
+    // Each 2x2 block should be the same value
+    assert_eq!(output.get(&[0, 0, 0, 0]), 1.0);
+    assert_eq!(output.get(&[0, 0, 0, 1]), 1.0);
+    assert_eq!(output.get(&[0, 0, 1, 0]), 1.0);
+    assert_eq!(output.get(&[0, 0, 1, 1]), 1.0);
+    assert_eq!(output.get(&[0, 0, 2, 2]), 4.0);
+}
+
+#[test]
+fn test_upsample_bilinear() {
+    let mut up = Upsample::bilinear(2);
+    let input = Tensor::new(vec![0.0, 1.0, 0.0, 1.0_f64], Shape::from_slice(&[1, 1, 2, 2]));
+    let output = up.forward(&input);
+    assert_eq!(output.shape().dims(), &[1, 1, 4, 4]);
+    // Bilinear should produce smooth interpolation
+    // Values should all be between 0 and 1
+    for i in 0..4 {
+        for j in 0..4 {
+            let v = output.get(&[0, 0, i, j]);
+            assert!(v >= -0.01 && v <= 1.01, "bilinear out of range: {v} at [{i},{j}]");
+        }
+    }
+}
+
+#[test]
+fn test_upsample_nearest_backward() {
+    let mut up = Upsample::nearest(2);
+    let input = Tensor::new(vec![1.0, 2.0, 3.0, 4.0_f64], Shape::from_slice(&[1, 1, 2, 2]));
+    let _output = up.forward(&input);
+    let grad_out = Tensor::<f64>::ones(Shape::from_slice(&[1, 1, 4, 4]));
+    let grad_in = up.backward(&grad_out);
+    assert_eq!(grad_in.shape().dims(), &[1, 1, 2, 2]);
+    // Each input pixel receives 4 gradient contributions (2x2 block)
+    assert_eq!(grad_in.get(&[0, 0, 0, 0]), 4.0);
+}
+
+#[test]
+fn test_group_norm_forward() {
+    // 2 groups, 4 channels -> 2 channels per group
+    let mut gn = GroupNorm::<f64>::new(2, 4);
+    // [batch=1, channels=4, H=2, W=2]
+    let input = Tensor::new(
+        (0..16).map(|i| i as f64).collect(),
+        Shape::from_slice(&[1, 4, 2, 2]),
+    );
+    let output = gn.forward(&input);
+    assert_eq!(output.shape().dims(), &[1, 4, 2, 2]);
+
+    // Check that each group is approximately normalized (mean ~0, std ~1)
+    // Group 0: channels 0,1 (8 values), Group 1: channels 2,3 (8 values)
+    let mut group0_sum = 0.0;
+    for c in 0..2 {
+        for h in 0..2 {
+            for w in 0..2 {
+                group0_sum += output.get(&[0, c, h, w]);
+            }
+        }
+    }
+    assert!((group0_sum / 8.0).abs() < 0.01, "group0 mean should be ~0, got {}", group0_sum / 8.0);
+}
+
+#[test]
+fn test_group_norm_backward() {
+    let mut gn = GroupNorm::<f64>::new(2, 4);
+    let input = Tensor::new(
+        (0..16).map(|i| i as f64).collect(),
+        Shape::from_slice(&[1, 4, 2, 2]),
+    );
+    let _output = gn.forward(&input);
+    let grad = Tensor::ones(Shape::from_slice(&[1, 4, 2, 2]));
+    let grad_input = gn.backward(&grad);
+    assert_eq!(grad_input.shape().dims(), &[1, 4, 2, 2]);
+}
+
+#[test]
+fn test_instance_norm() {
+    let mut inorm = InstanceNorm::<f64>::new(4);
+    let input = Tensor::new(
+        (0..16).map(|i| i as f64).collect(),
+        Shape::from_slice(&[1, 4, 2, 2]),
+    );
+    let output = inorm.forward(&input);
+    assert_eq!(output.shape().dims(), &[1, 4, 2, 2]);
+
+    // InstanceNorm = GroupNorm with groups == channels
+    // Each channel should be independently normalized
+    for c in 0..4 {
+        let mut sum = 0.0;
+        for h in 0..2 {
+            for w in 0..2 {
+                sum += output.get(&[0, c, h, w]);
+            }
+        }
+        assert!((sum / 4.0).abs() < 0.01, "channel {c} mean should be ~0");
+    }
+}
+
+#[test]
+fn test_lstm_forward_shape() {
+    let mut lstm = LSTM::<f64>::new(4, 8, 42);
+    // [seq_len=3, input_size=4]
+    let input = Tensor::new(
+        (0..12).map(|i| i as f64 * 0.1).collect(),
+        Shape::from_slice(&[3, 4]),
+    );
+    let output = lstm.forward(&input);
+    assert_eq!(output.shape().dims(), &[3, 8]);
+}
+
+#[test]
+fn test_lstm_backward_runs() {
+    let mut lstm = LSTM::<f64>::new(4, 8, 42);
+    let input = Tensor::new(
+        (0..12).map(|i| i as f64 * 0.1).collect(),
+        Shape::from_slice(&[3, 4]),
+    );
+    let _output = lstm.forward(&input);
+    let grad = Tensor::ones(Shape::from_slice(&[3, 8]));
+    let grad_input = lstm.backward(&grad);
+    assert_eq!(grad_input.shape().dims(), &[3, 4]);
+    // Check that weight grads were accumulated
+    assert!(lstm.weight_ih.grad.is_some());
+    assert!(lstm.weight_hh.grad.is_some());
+}
+
+#[test]
+fn test_lstm_parameters() {
+    let lstm = LSTM::<f64>::new(4, 8, 42);
+    assert_eq!(lstm.parameters().len(), 4);
+    let named = lstm.named_parameters();
+    let names: Vec<_> = named.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(names.contains(&"weight_ih"));
+    assert!(names.contains(&"weight_hh"));
+}
+
+#[test]
+fn test_gru_forward_shape() {
+    let mut gru = GRU::<f64>::new(4, 8, 42);
+    let input = Tensor::new(
+        (0..12).map(|i| i as f64 * 0.1).collect(),
+        Shape::from_slice(&[3, 4]),
+    );
+    let output = gru.forward(&input);
+    assert_eq!(output.shape().dims(), &[3, 8]);
+}
+
+#[test]
+fn test_gru_backward_runs() {
+    let mut gru = GRU::<f64>::new(4, 8, 42);
+    let input = Tensor::new(
+        (0..12).map(|i| i as f64 * 0.1).collect(),
+        Shape::from_slice(&[3, 4]),
+    );
+    let _output = gru.forward(&input);
+    let grad = Tensor::ones(Shape::from_slice(&[3, 8]));
+    let grad_input = gru.backward(&grad);
+    assert_eq!(grad_input.shape().dims(), &[3, 4]);
+    assert!(gru.weight_ih.grad.is_some());
+}
+
+#[test]
+fn test_sliding_window_attention_forward() {
+    let mut swa = SlidingWindowAttention::<f64>::new(8, 2, 3, 42);
+    // [seq_len=5, d_model=8]
+    let input = Tensor::new(
+        (0..40).map(|i| i as f64 * 0.01).collect(),
+        Shape::from_slice(&[5, 8]),
+    );
+    let output = swa.forward(&input);
+    assert_eq!(output.shape().dims(), &[5, 8]);
+}
+
+#[test]
+fn test_sliding_window_attention_parameters() {
+    let swa = SlidingWindowAttention::<f64>::new(8, 2, 3, 42);
+    // Should have 4 linear layers * 2 params each = 8 params
+    assert_eq!(swa.parameters().len(), 8);
+}
+
+#[test]
+fn test_lora_forward() {
+    let base = Linear::<f64>::new(4, 8, 42);
+    let mut lora = LoRA::new(base, 2, 2.0, 99);
+    let input = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], Shape::from_slice(&[4]));
+    let output = lora.forward(&input);
+    assert_eq!(output.shape().dims(), &[8]);
+}
+
+#[test]
+fn test_lora_batched_forward() {
+    let mut lora = LoRA::<f64>::from_dims(4, 8, 2, 2.0, 42);
+    let input = Tensor::new(
+        (0..12).map(|i| i as f64 * 0.1).collect(),
+        Shape::from_slice(&[3, 4]),
+    );
+    let output = lora.forward(&input);
+    assert_eq!(output.shape().dims(), &[3, 8]);
+}
+
+#[test]
+fn test_lora_only_adapters_trainable() {
+    let lora = LoRA::<f64>::from_dims(4, 8, 2, 2.0, 42);
+    // Only lora_a and lora_b should be returned as parameters
+    assert_eq!(lora.parameters().len(), 2);
+    let named = lora.named_parameters();
+    let names: Vec<_> = named.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(names.contains(&"lora_a"));
+    assert!(names.contains(&"lora_b"));
+}
+
+#[test]
+fn test_lora_backward_runs() {
+    let mut lora = LoRA::<f64>::from_dims(4, 8, 2, 2.0, 42);
+    let input = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], Shape::from_slice(&[4]));
+    let _output = lora.forward(&input);
+    let grad = Tensor::ones(Shape::from_slice(&[8]));
+    let grad_input = lora.backward(&grad);
+    assert_eq!(grad_input.shape().dims(), &[4]);
+    // LoRA grads should be accumulated
+    assert!(lora.lora_a.grad.is_some());
+    assert!(lora.lora_b.grad.is_some());
 }
