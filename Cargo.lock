@@ -5044,6 +5044,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tang-infer"
+version = "0.1.0"
+dependencies = [
+ "tang",
+ "tang-tensor",
+ "tang-train",
+]
+
+[[package]]
 name = "tang-la"
 version = "0.1.0"
 dependencies = [
@@ -5102,6 +5111,8 @@ name = "tang-site-wasm"
 version = "0.1.0"
 dependencies = [
  "tang",
+ "tang-tensor",
+ "tang-train",
  "wasm-bindgen",
 ]
 

@@ -2120,6 +2120,7 @@ impl<S: Scalar> Module<S> for RMSNorm<S> {
 pub struct RotaryEmbedding<S: Scalar> {
     dim: usize,
     max_seq_len: usize,
+    #[allow(dead_code)]
     base: f64,
     cos_cache: Tensor<S>, // [max_seq_len, dim/2]
     sin_cache: Tensor<S>, // [max_seq_len, dim/2]
@@ -2173,8 +2174,6 @@ impl<S: Scalar> RotaryEmbedding<S> {
             offset + seq_len <= self.max_seq_len,
             "sequence exceeds max_seq_len"
         );
-        let half = self.dim / 2;
-
         Tensor::from_fn(x.shape().clone(), |idx| {
             let pos = idx[0];
             let d = idx[1];

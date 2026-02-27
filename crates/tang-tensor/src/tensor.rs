@@ -305,7 +305,6 @@ impl<S: Scalar> Tensor<S> {
     pub fn softmax(&self, axis: usize) -> Self {
         assert!(axis < self.ndim());
         let axis_size = self.shape[axis];
-        let ndim = self.ndim();
 
         // For each "row" along the axis, subtract max then exponentiate
         Self::from_fn(self.shape.clone(), |idx| {
