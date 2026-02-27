@@ -31,56 +31,77 @@ let v = q.rotate(Vec3::new(1.0, 0.0, 0.0)); // ≈ (0, 1, 0)
 
 ## Crates
 
-| Crate | Description |
-|-------|-------------|
-| **[`tang`](crates/tang)** | Core types — `Vec2/3/4`, `Mat3/4`, `Quat`, `Transform`, `Dual<S>`, spatial algebra |
-| **[`tang-la`](crates/tang-la)** | Dynamic linear algebra — `DVec`, `DMat`, LU, SVD, Cholesky, QR, eigendecomposition |
-| **[`tang-ad`](crates/tang-ad)** | Reverse-mode autodiff — tape, `grad`, `jacobian`, `hessian`, VJP, JVP |
-| **[`tang-sparse`](crates/tang-sparse)** | Sparse matrices — CSR, CSC, COO, SpMV |
-| **[`tang-gpu`](crates/tang-gpu)** | GPU compute & training via wgpu — fused kernels, matmul, backward passes, trainer |
-| **[`tang-optim`](crates/tang-optim)** | Optimizers — SGD, Adam/AdamW, L-BFGS, Newton, Levenberg-Marquardt |
-| **[`tang-tensor`](crates/tang-tensor)** | N-d arrays — broadcasting, slicing, matmul, reductions |
-| **[`tang-train`](crates/tang-train)** | Training — `Module` trait, layers, loss functions |
+### Core math
+
+| Crate | What it does |
+|-------|--------------|
+| **[`tang`](crates/tang)** | `Vec2/3/4`, `Mat3/4`, `Quat`, `Transform`, `Dual<S>`, spatial algebra — all generic over `Scalar` |
+| **[`tang-la`](crates/tang-la)** | `DVec`, `DMat`, LU, SVD, Cholesky, QR, eigendecomposition — heap-allocated, generic over `Scalar` |
+| **[`tang-sparse`](crates/tang-sparse)** | CSR, CSC, COO sparse matrices with SpMV |
+
+### Differentiation
+
+| Crate | What it does |
+|-------|--------------|
+| **[`tang-ad`](crates/tang-ad)** | Reverse-mode autodiff — `grad`, `jacobian`, `hessian`, VJP, JVP |
+| **[`tang-expr`](crates/tang-expr)** | Symbolic expression graphs — trace, differentiate, simplify, compile to native closures or WGSL shaders |
+
+### Compute & arrays
+
+| Crate | What it does |
+|-------|--------------|
+| **[`tang-tensor`](crates/tang-tensor)** | N-d arrays with broadcasting, reductions, matmul |
+| **[`tang-gpu`](crates/tang-gpu)** | GPU compute via wgpu — fused kernels from `tang-expr`, tiled matmul, full training pipeline on Metal/Vulkan/DX12 |
+
+### Optimization & training
+
+| Crate | What it does |
+|-------|--------------|
+| **[`tang-optim`](crates/tang-optim)** | SGD, Adam/AdamW, L-BFGS, Newton, Levenberg-Marquardt |
+| **[`tang-train`](crates/tang-train)** | `Module` trait, layers (Linear → Transformer), loss functions, schedulers, PINN support |
+
+### Ecosystem
+
+| Crate | What it does |
+|-------|--------------|
+| **[`tang-safetensors`](crates/tang-safetensors)** | Load/save HuggingFace safetensors format (F16, BF16, F32, F64) |
+| **[`tang-hub`](crates/tang-hub)** | Download pretrained models + tokenizers from HuggingFace Hub |
+| **[`tang-mesh`](crates/tang-mesh)** | Distributed compute — ship expression graphs over QUIC, data/pipeline/tensor parallelism |
+| **[`tang-bench`](crates/tang-bench)** | Benchmark suite — geometry, LA, autodiff, GPU, vs nalgebra/glam |
 
 ## Architecture
 
 ```
-tang/
-├── crates/
-│   ├── tang/            # Scalar, Vec, Mat, Quat, Transform, Dual, spatial
-│   ├── tang-la/         # DVec, DMat, LU, SVD, Cholesky, QR, Eigen
-│   ├── tang-ad/         # Reverse-mode AD tape
-│   ├── tang-sparse/     # CSR, CSC, COO
-│   ├── tang-gpu/        # wgpu compute backend
-│   ├── tang-optim/      # Gradient and second-order optimizers
-│   ├── tang-tensor/     # N-d arrays with broadcasting
-│   └── tang-train/      # Modules, layers, loss functions
-└── benches/
+                          tang
+                    ┌───────┴───────┐
+                 tang-la          tang-expr
+              ┌────┼────┐        ┌──┴──┐
+        tang-sparse  tang-ad  tang-gpu  │
+                        │      ↗       │
+                   tang-optim  tang-tensor
+                        │     ╱  │      │
+                   tang-train    │   tang-mesh
+                                 │
+                       tang-safetensors
+                                 │
+                              tang-hub
 ```
 
-### Dependency Graph
-
-```
-tang ← tang-la ← tang-sparse
-          ↑           ↑
-       tang-ad     tang-gpu
-          ↑           ↑
-       tang-tensor ───┘
-          ↑
-       tang-optim
-          ↑
-       tang-train
-```
+Arrows point from dependee → dependent. Two independent trees (`tang-la` for algebra, `tang-expr` for symbolic computation) converge at `tang-tensor` and `tang-gpu`.
 
 ## Design
 
 **One `Scalar` trait.** `f32`, `f64`, and `Dual<S>` all implement `Scalar`. Write your physics once, get exact derivatives by swapping the type parameter. Forward-mode for small systems, reverse-mode for large ones.
+
+**Two paths to GPU.** `tang-expr` traces Rust math into a symbolic DAG, then compiles to WGSL. `tang-gpu` dispatches the compiled kernels. Element-wise chains fuse into a single kernel automatically.
 
 **`no_std` throughout.** Every crate is `#![no_std]` with `alloc`. Use tang on embedded, in WASM, wherever.
 
 **No heavyweight dependencies.** Core types are hand-rolled `#[repr(C)]` with optional `bytemuck` and `serde` support. Dense LA is native Rust, generic over `Scalar`. An optional `faer` feature enables world-class f64 performance.
 
 **Physics-native ML.** The same types that run your constraint solver and physics engine also train your neural nets. `tang-tensor` → `tang-ad` → `tang-optim` → `tang-train` is a complete differentiable programming stack.
+
+**Distributed by default.** `tang-mesh` ships expression graphs — not tensors — over QUIC. Each worker compiles locally to its own GPU backend. Data-parallel, pipeline-parallel, and tensor-parallel strategies with fault tolerance.
 
 ## Quick Start
 
@@ -262,6 +283,7 @@ theory seeks the truth...
 ```bash
 cargo test --workspace
 cargo test --workspace --all-features
+cargo bench -p tang-bench
 ```
 
 ## License
