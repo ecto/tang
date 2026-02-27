@@ -1,0 +1,10 @@
+[package]
+name = "tang-onnx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ONNX model import/export for tang"
+
+[dependencies]
+tang-tensor = { workspace = true }
+tang-train = { workspace = true }

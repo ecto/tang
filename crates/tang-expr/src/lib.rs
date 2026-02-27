@@ -37,7 +37,7 @@ pub mod sparsity;
 pub mod wgsl;
 
 pub use graph::ExprGraph;
-pub use node::ExprId;
+pub use node::{ExprId, Node};
 
 use std::cell::RefCell;
 

@@ -1,0 +1,9 @@
+[package]
+name = "tang-compile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Graph optimization and compilation passes for tang"
+
+[dependencies]
+tang-expr = { workspace = true }

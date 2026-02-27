@@ -8,6 +8,7 @@ use crate::node::{ExprId, Node};
 ///
 /// Identical subexpressions always return the same `ExprId` — this gives
 /// automatic common subexpression elimination (CSE) for free.
+#[derive(Clone)]
 pub struct ExprGraph {
     nodes: Vec<Node>,
     intern: HashMap<Node, ExprId>,

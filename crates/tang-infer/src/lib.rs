@@ -25,6 +25,7 @@
 extern crate alloc;
 
 mod kv_cache;
+mod profile;
 mod quantize;
 mod sampling;
 
@@ -34,4 +35,5 @@ pub use quantize::{
     q8_matvec, quantize_matrix_q4, quantize_matrix_q8, quantize_q4, quantize_q8,
     quantize_tensor_q4, quantize_tensor_q8, Q4Block, Q8Block, QuantizedQ4, QuantizedQ8,
 };
+pub use profile::{LayerProfile, Profiler};
 pub use sampling::{generate, Sampler, SamplingConfig};
