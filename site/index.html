@@ -44,6 +44,20 @@
     .op { color: #F8F8F2; }      /* operators */
     .mac { color: #66D9EF; font-style: italic; } /* macros */
 
+    /* warm card glow — replaces hard borders */
+    .glow {
+      box-shadow: 0 2px 24px rgba(245, 158, 11, 0.04), 0 0 0 1px rgba(245, 158, 11, 0.07);
+      transition: box-shadow 0.2s ease, transform 0.2s ease;
+    }
+    @media (hover: hover) {
+      .glow:hover {
+        box-shadow: 0 4px 32px rgba(245, 158, 11, 0.1), 0 0 0 1px rgba(245, 158, 11, 0.14);
+      }
+    }
+    .glow-strong {
+      box-shadow: 0 4px 32px rgba(245, 158, 11, 0.08), 0 0 0 1px rgba(245, 158, 11, 0.12);
+    }
+
     /* stack bars */
     .stack-bar {
       transition: all 0.2s ease;
@@ -51,6 +65,7 @@
     @media (hover: hover) {
       .stack-bar:hover {
         transform: translateX(4px);
+        box-shadow: 0 4px 32px rgba(245, 158, 11, 0.1), 0 0 0 1px rgba(245, 158, 11, 0.14);
       }
     }
     .stack-bar .stack-code {
@@ -91,12 +106,25 @@
 
     /* card hover */
     .use-card {
-      transition: border-color 0.2s ease, transform 0.2s ease;
+      box-shadow: 0 2px 24px rgba(245, 158, 11, 0.04), 0 0 0 1px rgba(245, 158, 11, 0.07);
+      transition: box-shadow 0.2s ease, transform 0.2s ease;
     }
     @media (hover: hover) {
       .use-card:hover {
-        border-color: #F59E0B44;
+        box-shadow: 0 8px 40px rgba(245, 158, 11, 0.12), 0 0 0 1px rgba(245, 158, 11, 0.18);
         transform: translateY(-2px);
+      }
+    }
+
+    /* example cards */
+    .example-card {
+      box-shadow: 0 2px 24px rgba(245, 158, 11, 0.04), 0 0 0 1px rgba(245, 158, 11, 0.07);
+      transition: box-shadow 0.2s ease, transform 0.2s ease;
+    }
+    @media (hover: hover) {
+      .example-card:hover {
+        box-shadow: 0 8px 40px rgba(245, 158, 11, 0.1), 0 0 0 1px rgba(245, 158, 11, 0.15);
+        transform: translateY(-1px);
       }
     }
   </style>
@@ -120,16 +148,16 @@
           <p class="text-xl sm:text-2xl text-muted mb-10">math for physical reality.</p>
 
           <div class="flex flex-wrap gap-3 sm:gap-4">
-            <button onclick="navigator.clipboard.writeText('cargo add tang')" class="copy-btn flex items-center gap-2 bg-surface border border-border rounded-lg px-4 py-2.5 sm:px-5 sm:py-3 font-mono text-sm hover:border-accent/40 transition-colors">
+            <button onclick="navigator.clipboard.writeText('cargo add tang')" class="copy-btn flex items-center gap-2 bg-surface rounded-xl glow px-4 py-2.5 sm:px-5 sm:py-3 font-mono text-sm hover:bg-accent/10 transition-all">
               <span class="text-muted">$</span>
               <span>cargo add tang</span>
               <svg class="w-4 h-4 text-muted ml-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
             </button>
-            <a href="https://github.com/ecto/tang" class="flex items-center gap-2 bg-surface border border-border rounded-lg px-4 py-2.5 sm:px-5 sm:py-3 text-sm hover:border-accent/40 transition-colors">
+            <a href="https://github.com/ecto/tang" class="flex items-center gap-2 bg-surface rounded-xl glow px-4 py-2.5 sm:px-5 sm:py-3 text-sm hover:bg-accent/10 transition-all">
               GitHub
               <span class="text-muted">→</span>
             </a>
-            <a href="https://www.youtube.com/watch?v=M3ujv8xdK2w" class="flex items-center gap-2 bg-surface border border-border rounded-lg px-4 py-2.5 sm:px-5 sm:py-3 text-sm hover:border-accent/40 transition-colors">
+            <a href="https://www.youtube.com/watch?v=M3ujv8xdK2w" class="flex items-center gap-2 bg-surface rounded-xl glow px-4 py-2.5 sm:px-5 sm:py-3 text-sm hover:bg-accent/10 transition-all">
               quick mafs
               <span class="text-muted">→</span>
             </a>
@@ -138,13 +166,13 @@
 
         <!-- Right: Dual number visualization -->
         <div class="relative">
-          <div class="bg-surface border border-border rounded-xl overflow-hidden">
-            <div class="flex items-center gap-2 px-4 py-2.5 border-b border-border">
+          <div class="bg-surface rounded-2xl glow overflow-hidden">
+            <div class="flex items-center gap-2 px-4 py-2.5 border-b border-white/5">
               <span class="font-mono text-xs text-muted">Dual&lt;f64&gt;</span>
               <span class="text-xs text-muted/60 ml-auto">f(x) = x &middot; sin(x)</span>
             </div>
             <div id="dual-viz" class="w-full h-[240px] sm:h-[320px]" style="background: #18181b;"></div>
-            <div id="dual-readout" class="flex gap-6 px-4 py-3 border-t border-border font-mono text-xs">
+            <div id="dual-readout" class="flex gap-6 px-4 py-3 border-t border-white/5 font-mono text-xs">
               <div><span class="text-muted">x =</span> <span id="ro-x" class="text-txt">0.00</span></div>
               <div><span class="text-muted">val =</span> <span id="ro-val" class="text-accent">0.00</span></div>
               <div><span class="text-muted">dual =</span> <span id="ro-dual" class="text-[#A6E22E]">0.00</span></div>
@@ -154,7 +182,7 @@
         </div>
       </div>
 
-      <div class="bg-surface border border-border rounded-xl p-4 sm:p-6 overflow-x-auto">
+      <div class="bg-surface rounded-2xl glow p-4 sm:p-6 overflow-x-auto">
 <pre class="font-mono text-xs sm:text-sm leading-relaxed"><span class="kw">use</span> <span class="ty">tang</span>::*;
 <span class="kw">use</span> <span class="ty">tang_la</span>::{<span class="ty">DVec</span>, <span class="ty">DMat</span>, <span class="ty">Svd</span>};
 <span class="kw">use</span> <span class="ty">tang_ad</span>::{<span class="ty">Tape</span>, <span class="fn">grad</span>};
@@ -184,13 +212,13 @@
   <!-- ═══════════════════════════════════════════════ -->
   <section class="px-4 sm:px-6 py-16 sm:py-24">
     <div class="max-w-5xl mx-auto">
-      <p class="font-mono text-muted text-sm mb-3">// the-scalar-trick</p>
-      <h2 class="text-3xl sm:text-4xl font-bold mb-4">One trait. Three powers.</h2>
+      <p class="font-mono text-accent/40 text-sm mb-3">// the-scalar-trick</p>
+      <h2 class="text-3xl sm:text-4xl font-bold mb-4">One trait. Three powers<span class="text-accent">.</span></h2>
       <p class="text-muted text-lg mb-12 max-w-2xl">Write your math once with <code class="text-accent font-mono text-base">S: Scalar</code>. Swap the type to change what it does.</p>
 
       <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
         <!-- Compute -->
-        <div class="bg-surface border border-border rounded-xl p-4 sm:p-5 overflow-x-auto">
+        <div class="bg-surface rounded-2xl glow p-4 sm:p-5 overflow-x-auto">
           <div class="flex items-center gap-2 mb-4">
             <span class="w-2 h-2 rounded-full bg-green-500"></span>
             <span class="font-mono text-sm font-semibold">Compute</span>
@@ -206,7 +234,7 @@
         </div>
 
         <!-- Differentiate -->
-        <div class="bg-surface border border-accent/30 rounded-xl p-4 sm:p-5 overflow-x-auto">
+        <div class="bg-surface rounded-2xl glow-strong p-4 sm:p-5 overflow-x-auto">
           <div class="flex items-center gap-2 mb-4">
             <span class="w-2 h-2 rounded-full bg-accent"></span>
             <span class="font-mono text-sm font-semibold text-accent">Differentiate</span>
@@ -222,7 +250,7 @@
         </div>
 
         <!-- Bound -->
-        <div class="bg-surface border border-border rounded-xl p-4 sm:p-5 opacity-50 overflow-x-auto">
+        <div class="bg-surface rounded-2xl glow p-4 sm:p-5 opacity-50 overflow-x-auto">
           <div class="flex items-center gap-2 mb-4">
             <span class="w-2 h-2 rounded-full bg-muted"></span>
             <span class="font-mono text-sm font-semibold text-muted">Bound <span class="text-xs ml-1">(planned)</span></span>
@@ -247,14 +275,14 @@
   <!-- ═══════════════════════════════════════════════ -->
   <section class="px-4 sm:px-6 py-16 sm:py-24">
     <div class="max-w-5xl mx-auto">
-      <p class="font-mono text-muted text-sm mb-3">// the-stack</p>
-      <h2 class="text-3xl sm:text-4xl font-bold mb-4">8 crates. One coherent stack.</h2>
+      <p class="font-mono text-accent/40 text-sm mb-3">// the-stack</p>
+      <h2 class="text-3xl sm:text-4xl font-bold mb-4">8 crates. One coherent stack<span class="text-accent">.</span></h2>
       <p class="text-muted text-lg mb-12 max-w-2xl">Each layer builds on the last. Use only what you need.</p>
 
       <div class="space-y-2">
         <!-- tang-train -->
         <a href="https://github.com/ecto/tang/tree/main/crates/tang-train" class="block no-underline text-inherit">
-        <div class="stack-bar bg-surface border border-border rounded-lg px-4 py-3 sm:px-5 sm:py-4 cursor-pointer lg:flex lg:gap-6">
+        <div class="stack-bar bg-surface rounded-xl glow px-4 py-3 sm:px-5 sm:py-4 cursor-pointer lg:flex lg:gap-6">
           <div class="flex-1 min-w-0">
             <div class="flex items-center justify-between">
               <div class="flex items-center gap-3">
@@ -319,7 +347,7 @@
 
         <!-- tang-optim -->
         <a href="https://github.com/ecto/tang/tree/main/crates/tang-optim" class="block no-underline text-inherit">
-        <div class="stack-bar bg-surface border border-border rounded-lg px-4 py-3 sm:px-5 sm:py-4 cursor-pointer lg:flex lg:gap-6">
+        <div class="stack-bar bg-surface rounded-xl glow px-4 py-3 sm:px-5 sm:py-4 cursor-pointer lg:flex lg:gap-6">
           <div class="flex-1 min-w-0">
             <div class="flex items-center justify-between">
               <div class="flex items-center gap-3">
@@ -363,7 +391,7 @@ opt.<span class="fn">step</span>(&amp;<span class="kw">mut</span> params, &amp;g
 
         <!-- tang-tensor -->
         <a href="https://github.com/ecto/tang/tree/main/crates/tang-tensor" class="block no-underline text-inherit">
-        <div class="stack-bar bg-surface border border-border rounded-lg px-4 py-3 sm:px-5 sm:py-4 cursor-pointer lg:flex lg:gap-6">
+        <div class="stack-bar bg-surface rounded-xl glow px-4 py-3 sm:px-5 sm:py-4 cursor-pointer lg:flex lg:gap-6">
           <div class="flex-1 min-w-0">
             <div class="flex items-center justify-between">
               <div class="flex items-center gap-3">
@@ -405,18 +433,22 @@ opt.<span class="fn">step</span>(&amp;<span class="kw">mut</span> params, &amp;g
 
         <!-- tang-gpu -->
         <a href="https://github.com/ecto/tang/tree/main/crates/tang-gpu" class="block no-underline text-inherit">
-        <div class="stack-bar bg-surface border border-border rounded-lg px-4 py-3 sm:px-5 sm:py-4 cursor-pointer lg:flex lg:gap-6">
+        <div class="stack-bar bg-surface rounded-xl glow px-4 py-3 sm:px-5 sm:py-4 cursor-pointer lg:flex lg:gap-6">
           <div class="flex-1 min-w-0">
             <div class="flex items-center justify-between">
               <div class="flex items-center gap-3">
                 <span class="font-mono text-sm font-semibold text-accent">tang-gpu</span>
-                <span class="text-muted text-sm hidden sm:inline">GPU compute via wgpu — SpMV, batch ops, tensor kernels</span>
+                <span class="text-muted text-sm hidden sm:inline">GPU compute &amp; training via wgpu — fused kernels, matmul, backward, trainer</span>
               </div>
             </div>
             <div class="stack-code mt-3 overflow-x-auto">
-<pre class="font-mono text-xs leading-relaxed text-muted"><span class="kw">let</span> device = <span class="ty">GpuDevice</span>::<span class="fn">new</span>().<span class="kw">await</span>;
-<span class="kw">let</span> a_gpu = device.<span class="fn">upload</span>(&amp;sparse_a);
-<span class="kw">let</span> y = device.<span class="fn">spmv</span>(&amp;a_gpu, &amp;x); <span class="cm">// GPU SpMV kernel</span></pre>
+<pre class="font-mono text-xs leading-relaxed text-muted"><span class="kw">let mut</span> model = <span class="ty">GpuSequential</span>::<span class="fn">new</span>(<span class="fn">vec!</span>[
+    <span class="ty">Box</span>::<span class="fn">new</span>(<span class="ty">GpuLinear</span>::<span class="fn">kaiming</span>(&amp;dev, <span class="num">2</span>, <span class="num">8</span>, <span class="num">42</span>)),
+    <span class="ty">Box</span>::<span class="fn">new</span>(<span class="ty">GpuReLULayer</span>::<span class="fn">new</span>()),
+    <span class="ty">Box</span>::<span class="fn">new</span>(<span class="ty">GpuLinear</span>::<span class="fn">kaiming</span>(&amp;dev, <span class="num">8</span>, <span class="num">1</span>, <span class="num">43</span>)),
+]);
+<span class="kw">let</span> losses = <span class="ty">GpuTrainer</span>::<span class="fn">new</span>(<span class="num">0.01</span>, <span class="num">500</span>)
+    .<span class="fn">fit</span>(&amp;dev, &amp;<span class="kw">mut</span> cache, &amp;<span class="kw">mut</span> model, &amp;<span class="kw">mut</span> loader);</pre>
             </div>
           </div>
           <div class="stack-viz flex mt-3 lg:mt-0">
@@ -459,7 +491,7 @@ opt.<span class="fn">step</span>(&amp;<span class="kw">mut</span> params, &amp;g
 
         <!-- tang-sparse -->
         <a href="https://github.com/ecto/tang/tree/main/crates/tang-sparse" class="block no-underline text-inherit">
-        <div class="stack-bar bg-surface border border-border rounded-lg px-4 py-3 sm:px-5 sm:py-4 cursor-pointer lg:flex lg:gap-6">
+        <div class="stack-bar bg-surface rounded-xl glow px-4 py-3 sm:px-5 sm:py-4 cursor-pointer lg:flex lg:gap-6">
           <div class="flex-1 min-w-0">
             <div class="flex items-center justify-between">
               <div class="flex items-center gap-3">
@@ -526,7 +558,7 @@ coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">0
 
         <!-- tang-ad -->
         <a href="https://github.com/ecto/tang/tree/main/crates/tang-ad" class="block no-underline text-inherit">
-        <div class="stack-bar bg-surface border border-border rounded-lg px-4 py-3 sm:px-5 sm:py-4 cursor-pointer lg:flex lg:gap-6">
+        <div class="stack-bar bg-surface rounded-xl glow px-4 py-3 sm:px-5 sm:py-4 cursor-pointer lg:flex lg:gap-6">
           <div class="flex-1 min-w-0">
             <div class="flex items-center justify-between">
               <div class="flex items-center gap-3">
@@ -587,7 +619,7 @@ coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">0
 
         <!-- tang-la -->
         <a href="https://github.com/ecto/tang/tree/main/crates/tang-la" class="block no-underline text-inherit">
-        <div class="stack-bar bg-surface border border-border rounded-lg px-4 py-3 sm:px-5 sm:py-4 cursor-pointer lg:flex lg:gap-6">
+        <div class="stack-bar bg-surface rounded-xl glow px-4 py-3 sm:px-5 sm:py-4 cursor-pointer lg:flex lg:gap-6">
           <div class="flex-1 min-w-0">
             <div class="flex items-center justify-between">
               <div class="flex items-center gap-3">
@@ -647,7 +679,7 @@ coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">0
 
         <!-- tang (core) -->
         <a href="https://github.com/ecto/tang/tree/main/crates/tang" class="block no-underline text-inherit">
-        <div class="stack-bar bg-surface border border-accent/40 rounded-lg px-4 py-3 sm:px-5 sm:py-4 cursor-pointer lg:flex lg:gap-6">
+        <div class="stack-bar bg-surface rounded-xl glow-strong px-4 py-3 sm:px-5 sm:py-4 cursor-pointer lg:flex lg:gap-6">
           <div class="flex-1 min-w-0">
             <div class="flex items-center justify-between">
               <div class="flex items-center gap-3">
@@ -701,8 +733,8 @@ coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">0
   <!-- ═══════════════════════════════════════════════ -->
   <section class="px-4 sm:px-6 py-16 sm:py-24">
     <div class="max-w-5xl mx-auto">
-      <p class="font-mono text-muted text-sm mb-3">// benchmarks</p>
-      <h2 class="text-3xl sm:text-4xl font-bold mb-4">Measured, not marketed.</h2>
+      <p class="font-mono text-accent/40 text-sm mb-3">// benchmarks</p>
+      <h2 class="text-3xl sm:text-4xl font-bold mb-4">Measured, not marketed<span class="text-accent">.</span></h2>
       <p class="text-muted text-lg mb-4 max-w-2xl">Apple M-series, single-threaded. <code class="font-mono text-sm text-accent">cargo bench -p tang-bench</code></p>
       <p class="mb-12"><a href="https://github.com/ecto/tang/tree/main/crates/tang-bench" class="text-accent text-sm hover:underline font-mono">view benchmark source →</a></p>
 
@@ -710,10 +742,10 @@ coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">0
       <div class="mb-12 sm:mb-20">
         <h3 class="font-mono text-base sm:text-lg font-semibold mb-2">Geometry &amp; physics primitives <span class="text-muted text-xs sm:text-sm font-normal">(f64 unless noted)</span></h3>
         <p class="text-muted text-sm mb-8">Lower is better.<span class="hidden sm:inline"> glam uses f32 (SIMD).</span></p>
-        <div class="hidden sm:block bg-surface border border-border rounded-xl p-3 sm:p-6 overflow-x-auto">
+        <div class="hidden sm:block bg-surface rounded-2xl glow p-3 sm:p-6 overflow-x-auto">
           <div id="bench-geom-container" class="min-w-[500px] w-full"></div>
         </div>
-        <div class="sm:hidden bg-surface border border-border rounded-xl p-3">
+        <div class="sm:hidden bg-surface rounded-2xl glow p-3">
           <div id="bench-geom-compact" class="w-full"></div>
         </div>
         <div class="hidden sm:flex flex-wrap gap-6 mt-4 text-xs font-mono">
@@ -731,10 +763,10 @@ coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">0
       <div class="mb-12 sm:mb-20">
         <h3 class="font-mono text-base sm:text-lg font-semibold mb-2">Differentiable physics</h3>
         <p class="text-muted text-sm mb-8 max-w-2xl">tang AD gives <em>exact</em> derivatives. Finite differences are ε-approximate and require step-size tuning.</p>
-        <div class="hidden sm:block bg-surface border border-border rounded-xl p-3 sm:p-6 overflow-x-auto">
+        <div class="hidden sm:block bg-surface rounded-2xl glow p-3 sm:p-6 overflow-x-auto">
           <div id="bench-ad-container" class="min-w-[500px] w-full"></div>
         </div>
-        <div class="sm:hidden bg-surface border border-border rounded-xl p-3">
+        <div class="sm:hidden bg-surface rounded-2xl glow p-3">
           <div id="bench-ad-compact" class="w-full"></div>
         </div>
         <div class="flex flex-wrap gap-4 sm:gap-6 mt-4 text-xs font-mono">
@@ -748,16 +780,67 @@ coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">0
       <div>
         <h3 class="font-mono text-base sm:text-lg font-semibold mb-2">Dense linear algebra <span class="text-muted text-xs sm:text-sm font-normal">(f64, tang vs nalgebra)</span></h3>
         <p class="text-muted text-sm mb-8 max-w-2xl">tang is pure generic Rust — works with <code class="font-mono text-accent">Dual&lt;f64&gt;</code>, any <code class="font-mono text-accent">Scalar</code>. nalgebra dispatches to BLAS-style routines.<span class="hidden sm:inline"> For peak f64, enable the <code class="font-mono text-accent">faer</code> feature.</span></p>
-        <div class="hidden sm:block bg-surface border border-border rounded-xl p-3 sm:p-6 overflow-x-auto">
+        <div class="hidden sm:block bg-surface rounded-2xl glow p-3 sm:p-6 overflow-x-auto">
           <div id="bench-la-container" class="min-w-[500px] w-full"></div>
         </div>
-        <div class="sm:hidden bg-surface border border-border rounded-xl p-3">
+        <div class="sm:hidden bg-surface rounded-2xl glow p-3">
           <div id="bench-la-compact" class="w-full"></div>
         </div>
         <div class="flex flex-wrap gap-4 sm:gap-6 mt-4 text-xs font-mono">
           <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#F59E0B"></span> tang</span>
           <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#71717a"></span> nalgebra</span>
         </div>
+      </div>
+
+      <!-- GPU training pipeline -->
+      <div class="mt-12 sm:mt-20">
+        <h3 class="font-mono text-base sm:text-lg font-semibold mb-2">GPU training pipeline <span class="text-muted text-xs sm:text-sm font-normal">(tang-gpu, Apple M-series Metal)</span></h3>
+        <p class="text-muted text-sm mb-8 max-w-2xl"><code class="font-mono text-accent">tang-gpu</code> end-to-end training: forward, loss, backward, Adam update — all via wgpu compute shaders.</p>
+        <div class="bg-surface rounded-2xl glow p-3 sm:p-6 overflow-x-auto">
+          <table class="w-full text-sm min-w-[400px]">
+            <thead>
+              <tr class="border-b border-white/5">
+                <th class="p-2.5 sm:p-3 text-left font-mono text-muted font-normal">Operation</th>
+                <th class="p-2.5 sm:p-3 text-right font-mono text-accent font-normal">time</th>
+              </tr>
+            </thead>
+            <tbody class="font-mono text-xs">
+              <tr class="border-b border-white/[0.03]">
+                <td class="p-3">matmul 16&times;16</td>
+                <td class="p-3 text-right text-accent">124&micro;s</td>
+              </tr>
+              <tr class="border-b border-white/[0.03]">
+                <td class="p-3">matmul 128&times;128</td>
+                <td class="p-3 text-right text-accent">127&micro;s</td>
+              </tr>
+              <tr class="border-b border-white/[0.03]">
+                <td class="p-3">fused (a+b)&sup2; &times;4096</td>
+                <td class="p-3 text-right text-accent">2.9ms</td>
+              </tr>
+              <tr class="border-b border-white/[0.03]">
+                <td class="p-3">Linear fwd [4,128]&rarr;[4,64]</td>
+                <td class="p-3 text-right text-accent">6.2ms</td>
+              </tr>
+              <tr class="border-b border-white/[0.03]">
+                <td class="p-3">Linear bwd [4,128]&rarr;[4,64]</td>
+                <td class="p-3 text-right text-accent">3.4ms</td>
+              </tr>
+              <tr class="border-b border-white/[0.03]">
+                <td class="p-3">Sequential(2&rarr;8&rarr;1) fwd+bwd</td>
+                <td class="p-3 text-right text-accent">28ms</td>
+              </tr>
+              <tr class="border-b border-white/[0.03]">
+                <td class="p-3">MSE loss (64 elements)</td>
+                <td class="p-3 text-right text-accent">8.4ms</td>
+              </tr>
+              <tr>
+                <td class="p-3">XOR training step (4 samples)</td>
+                <td class="p-3 text-right text-accent">60ms</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="text-muted text-sm mt-4 max-w-2xl italic">Matmul is dispatch-bound at small sizes (~124&micro;s constant for 16&ndash;128). A full training step includes forward, loss, backward, and Adam update for a 3-layer network.</p>
       </div>
     </div>
   </section>
@@ -770,12 +853,12 @@ coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">0
   <!-- ═══════════════════════════════════════════════ -->
   <section class="px-4 sm:px-6 py-16 sm:py-24">
     <div class="max-w-5xl mx-auto">
-      <p class="font-mono text-muted text-sm mb-3">// use-cases</p>
-      <h2 class="text-3xl sm:text-4xl font-bold mb-12">Built for real systems.</h2>
+      <p class="font-mono text-accent/40 text-sm mb-3">// use-cases</p>
+      <h2 class="text-3xl sm:text-4xl font-bold mb-12">Built for real systems<span class="text-accent">.</span></h2>
 
       <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <!-- Geometry Kernels -->
-        <div class="use-card bg-surface border border-border rounded-xl p-4 sm:p-6 overflow-x-auto">
+        <div class="use-card bg-surface rounded-2xl glow p-4 sm:p-6 overflow-x-auto">
           <div class="text-2xl mb-3">⬡</div>
           <h3 class="font-semibold text-lg mb-2">Geometry Kernels</h3>
           <p class="text-muted text-sm mb-4">BRep, NURBS, mesh ops. The types CAD needs.</p>
@@ -786,7 +869,7 @@ coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">0
         </div>
 
         <!-- Physics Engines -->
-        <div class="use-card bg-surface border border-border rounded-xl p-4 sm:p-6 overflow-x-auto">
+        <div class="use-card bg-surface rounded-2xl glow p-4 sm:p-6 overflow-x-auto">
           <div class="text-2xl mb-3">◎</div>
           <h3 class="font-semibold text-lg mb-2">Physics Engines</h3>
           <p class="text-muted text-sm mb-4">Spatial algebra, screw theory, inertia tensors.</p>
@@ -797,7 +880,7 @@ coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">0
         </div>
 
         <!-- Robotics -->
-        <div class="use-card bg-surface border border-border rounded-xl p-4 sm:p-6 overflow-x-auto">
+        <div class="use-card bg-surface rounded-2xl glow p-4 sm:p-6 overflow-x-auto">
           <div class="text-2xl mb-3">⚙</div>
           <h3 class="font-semibold text-lg mb-2">Robotics</h3>
           <p class="text-muted text-sm mb-4">Differentiable FK/IK, exact Jacobians for free.</p>
@@ -809,7 +892,7 @@ coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">0
         </div>
 
         <!-- ML / Differentiable Programming -->
-        <div class="use-card bg-surface border border-border rounded-xl p-4 sm:p-6 overflow-x-auto">
+        <div class="use-card bg-surface rounded-2xl glow p-4 sm:p-6 overflow-x-auto">
           <div class="text-2xl mb-3">∇</div>
           <h3 class="font-semibold text-lg mb-2">ML / Differentiable Programming</h3>
           <p class="text-muted text-sm mb-4">Same types train your nets and run your sim.</p>
@@ -827,29 +910,29 @@ coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">0
   <!-- ═══════════════════════════════════════════════ -->
   <section class="px-4 sm:px-6 py-16 sm:py-24">
     <div class="max-w-5xl mx-auto">
-      <p class="font-mono text-muted text-sm mb-3">// migration</p>
-      <h2 class="text-3xl sm:text-4xl font-bold mb-4">Coming from nalgebra?</h2>
+      <p class="font-mono text-accent/40 text-sm mb-3">// migration</p>
+      <h2 class="text-3xl sm:text-4xl font-bold mb-4">Coming from nalgebra<span class="text-accent">?</span></h2>
       <p class="text-muted text-lg mb-12 max-w-2xl">Drop-in aliases. Minimal call-site changes.</p>
 
       <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
         <!-- Type mapping -->
         <div>
           <h3 class="font-mono text-sm text-muted mb-4">Type mapping</h3>
-          <div class="bg-surface border border-border rounded-xl overflow-x-auto">
+          <div class="bg-surface rounded-2xl glow overflow-x-auto">
             <table class="w-full text-sm min-w-[320px]">
               <thead>
-                <tr class="border-b border-border">
+                <tr class="border-b border-white/5">
                   <th class="p-2.5 sm:p-3 text-left font-mono text-muted font-normal">nalgebra</th>
                   <th class="p-2.5 sm:p-3 text-left font-mono text-accent font-normal">tang</th>
                 </tr>
               </thead>
               <tbody class="font-mono">
-                <tr class="border-b border-border/50"><td class="p-3 text-muted">Vector3&lt;f64&gt;</td><td class="p-3">Vec3&lt;f64&gt;</td></tr>
-                <tr class="border-b border-border/50"><td class="p-3 text-muted">Point3&lt;f64&gt;</td><td class="p-3">Point3&lt;f64&gt;</td></tr>
-                <tr class="border-b border-border/50"><td class="p-3 text-muted">Unit&lt;Vector3&gt;</td><td class="p-3">Dir3&lt;f64&gt;</td></tr>
-                <tr class="border-b border-border/50"><td class="p-3 text-muted">Matrix4&lt;f64&gt;</td><td class="p-3">Mat4&lt;f64&gt;</td></tr>
-                <tr class="border-b border-border/50"><td class="p-3 text-muted">UnitQuaternion</td><td class="p-3">Quat&lt;f64&gt;</td></tr>
-                <tr class="border-b border-border/50"><td class="p-3 text-muted">DVector&lt;f64&gt;</td><td class="p-3">DVec&lt;f64&gt;</td></tr>
+                <tr class="border-b border-white/[0.03]"><td class="p-3 text-muted">Vector3&lt;f64&gt;</td><td class="p-3">Vec3&lt;f64&gt;</td></tr>
+                <tr class="border-b border-white/[0.03]"><td class="p-3 text-muted">Point3&lt;f64&gt;</td><td class="p-3">Point3&lt;f64&gt;</td></tr>
+                <tr class="border-b border-white/[0.03]"><td class="p-3 text-muted">Unit&lt;Vector3&gt;</td><td class="p-3">Dir3&lt;f64&gt;</td></tr>
+                <tr class="border-b border-white/[0.03]"><td class="p-3 text-muted">Matrix4&lt;f64&gt;</td><td class="p-3">Mat4&lt;f64&gt;</td></tr>
+                <tr class="border-b border-white/[0.03]"><td class="p-3 text-muted">UnitQuaternion</td><td class="p-3">Quat&lt;f64&gt;</td></tr>
+                <tr class="border-b border-white/[0.03]"><td class="p-3 text-muted">DVector&lt;f64&gt;</td><td class="p-3">DVec&lt;f64&gt;</td></tr>
                 <tr><td class="p-3 text-muted">DMatrix&lt;f64&gt;</td><td class="p-3">DMat&lt;f64&gt;</td></tr>
               </tbody>
             </table>
@@ -859,7 +942,7 @@ coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">0
         <!-- API compat -->
         <div>
           <h3 class="font-mono text-sm text-muted mb-4">API compatibility</h3>
-          <div class="bg-surface border border-border rounded-xl p-4 sm:p-5 mb-4 overflow-x-auto">
+          <div class="bg-surface rounded-2xl glow p-4 sm:p-5 mb-4 overflow-x-auto">
 <pre class="font-mono text-xs leading-relaxed"><span class="cm">// nalgebra style — works</span>
 v.<span class="fn">dot</span>(&amp;w);
 v.<span class="fn">cross</span>(&amp;w);
@@ -868,20 +951,20 @@ v.<span class="fn">cross</span>(&amp;w);
 v.<span class="fn">dot</span>(w);
 v.<span class="fn">cross</span>(w);</pre>
           </div>
-          <div class="bg-surface border border-border rounded-xl overflow-x-auto">
+          <div class="bg-surface rounded-2xl glow overflow-x-auto">
             <table class="w-full text-sm min-w-[320px]">
               <thead>
-                <tr class="border-b border-border">
+                <tr class="border-b border-white/5">
                   <th class="p-2.5 sm:p-3 text-left font-mono text-muted font-normal">nalgebra</th>
                   <th class="p-2.5 sm:p-3 text-left font-mono text-accent font-normal">tang</th>
                 </tr>
               </thead>
               <tbody class="font-mono text-xs">
-                <tr class="border-b border-border/50"><td class="p-3 text-muted">Vec3::zeros()</td><td class="p-3">Vec3::zero() <span class="text-muted">+ alias</span></td></tr>
-                <tr class="border-b border-border/50"><td class="p-3 text-muted">v.norm_squared()</td><td class="p-3">v.norm_sq() <span class="text-muted">+ alias</span></td></tr>
-                <tr class="border-b border-border/50"><td class="p-3 text-muted">Unit::new_normalize(v)</td><td class="p-3">Dir3::new(v) <span class="text-muted">+ alias</span></td></tr>
-                <tr class="border-b border-border/50"><td class="p-3 text-muted">m.try_inverse()</td><td class="p-3">m.try_inverse()</td></tr>
-                <tr class="border-b border-border/50"><td class="p-3 text-muted">m.symmetric_eigen()</td><td class="p-3">m.symmetric_eigen()</td></tr>
+                <tr class="border-b border-white/[0.03]"><td class="p-3 text-muted">Vec3::zeros()</td><td class="p-3">Vec3::zero() <span class="text-muted">+ alias</span></td></tr>
+                <tr class="border-b border-white/[0.03]"><td class="p-3 text-muted">v.norm_squared()</td><td class="p-3">v.norm_sq() <span class="text-muted">+ alias</span></td></tr>
+                <tr class="border-b border-white/[0.03]"><td class="p-3 text-muted">Unit::new_normalize(v)</td><td class="p-3">Dir3::new(v) <span class="text-muted">+ alias</span></td></tr>
+                <tr class="border-b border-white/[0.03]"><td class="p-3 text-muted">m.try_inverse()</td><td class="p-3">m.try_inverse()</td></tr>
+                <tr class="border-b border-white/[0.03]"><td class="p-3 text-muted">m.symmetric_eigen()</td><td class="p-3">m.symmetric_eigen()</td></tr>
                 <tr><td class="p-3 text-muted">a.clone().lu().solve(&amp;b)</td><td class="p-3">a.clone().lu().solve(&amp;b)</td></tr>
               </tbody>
             </table>
@@ -896,11 +979,11 @@ v.<span class="fn">cross</span>(w);</pre>
   <!-- ═══════════════════════════════════════════════ -->
   <section class="px-4 sm:px-6 py-16 sm:py-24">
     <div class="max-w-5xl mx-auto">
-      <p class="font-mono text-muted text-sm mb-3">// targets</p>
-      <h2 class="text-3xl sm:text-4xl font-bold mb-12">Runs everywhere.</h2>
+      <p class="font-mono text-accent/40 text-sm mb-3">// targets</p>
+      <h2 class="text-3xl sm:text-4xl font-bold mb-12">Runs everywhere<span class="text-accent">.</span></h2>
 
       <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
-        <details class="bg-surface border border-border rounded-xl group">
+        <details class="bg-surface rounded-2xl glow group">
           <summary class="p-5 cursor-pointer list-none flex items-center justify-between">
             <div class="flex items-center gap-3">
               <span class="bg-green-500/10 text-green-400 text-xs font-mono px-2 py-1 rounded">no_std</span>
@@ -913,7 +996,7 @@ v.<span class="fn">cross</span>(w);</pre>
           </div>
         </details>
 
-        <details class="bg-surface border border-border rounded-xl group">
+        <details class="bg-surface rounded-2xl glow group">
           <summary class="p-5 cursor-pointer list-none flex items-center justify-between">
             <div class="flex items-center gap-3">
               <span class="bg-purple-500/10 text-purple-400 text-xs font-mono px-2 py-1 rounded">wasm32</span>
@@ -926,7 +1009,7 @@ v.<span class="fn">cross</span>(w);</pre>
           </div>
         </details>
 
-        <details class="bg-surface border border-border rounded-xl group">
+        <details class="bg-surface rounded-2xl glow group">
           <summary class="p-5 cursor-pointer list-none flex items-center justify-between">
             <div class="flex items-center gap-3">
               <span class="bg-accent/10 text-accent text-xs font-mono px-2 py-1 rounded">wgpu</span>
@@ -935,7 +1018,7 @@ v.<span class="fn">cross</span>(w);</pre>
             <svg class="w-4 h-4 text-muted transition-transform group-open:rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
           </summary>
           <div class="px-5 pb-5 text-muted text-sm">
-            <code class="font-mono text-accent">tang-gpu</code> provides wgpu compute shaders for sparse matrix-vector products, batch operations, and tensor kernels. Cross-platform GPU acceleration on Vulkan, Metal, DX12, and WebGPU.
+            <code class="font-mono text-accent">tang-gpu</code> provides wgpu compute shaders for fused elementwise kernels, tiled matmul, and a full training pipeline with backward passes, data loading, and Adam optimization. Cross-platform GPU acceleration on Vulkan, Metal, DX12, and WebGPU.
           </div>
         </details>
       </div>
@@ -947,11 +1030,11 @@ v.<span class="fn">cross</span>(w);</pre>
   <!-- ═══════════════════════════════════════════════ -->
   <section class="px-4 sm:px-6 py-16 sm:py-24">
     <div class="max-w-5xl mx-auto">
-      <p class="font-mono text-muted text-sm mb-3">// examples</p>
-      <h2 class="text-3xl sm:text-4xl font-bold mb-4">See it train.</h2>
+      <p class="font-mono text-accent/40 text-sm mb-3">// examples</p>
+      <h2 class="text-3xl sm:text-4xl font-bold mb-4">See it train<span class="text-accent">.</span></h2>
       <p class="text-muted text-lg mb-12 max-w-2xl">End-to-end examples that run out of the box.</p>
 
-      <div class="bg-surface border border-border rounded-xl p-4 sm:p-6 overflow-x-auto">
+      <div class="bg-surface rounded-2xl glow p-4 sm:p-6 overflow-x-auto">
         <div class="flex items-center gap-3 mb-4">
           <span class="bg-accent/10 text-accent text-xs font-mono px-2 py-1 rounded">tang-train</span>
           <h3 class="font-semibold text-lg">The Quantum Poet</h3>
@@ -991,13 +1074,114 @@ theory seeks the truth.</pre>
         </div>
         <a href="https://github.com/ecto/tang/blob/main/crates/tang-train/examples/quantum_poet.rs" class="text-accent hover:underline text-sm font-mono">quantum_poet.rs &rarr;</a>
       </div>
+
+      <!-- Example grid -->
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+
+        <!-- Symbolic Regression -->
+        <div class="example-card bg-surface rounded-2xl p-4 sm:p-6 overflow-x-auto">
+          <div class="flex items-center gap-3 mb-3">
+            <span class="bg-accent/10 text-accent text-xs font-mono px-2 py-1 rounded">tang-expr</span>
+            <h3 class="font-semibold">Symbolic Regression</h3>
+          </div>
+          <p class="text-muted text-sm mb-4">Genetic programming over expression graphs. Evolves a population of symbolic trees to rediscover <code class="font-mono text-accent">x&sup2;&middot;sin(x)</code> from noisy data.</p>
+<pre class="font-mono text-xs leading-relaxed mb-3"><span class="cm">// evolve expression trees using ExprGraph</span>
+<span class="kw">let</span> fit = <span class="fn">fitness</span>(&amp;expr, &amp;data); <span class="cm">// MSE + complexity</span>
+<span class="kw">let</span> child = <span class="fn">mutate_grow</span>(parent, &amp;<span class="kw">mut</span> rng);
+<span class="kw">let</span> dx = g.<span class="fn">diff</span>(simplified, <span class="num">0</span>); <span class="cm">// symbolic derivative</span></pre>
+          <div class="bg-[#1a1a2e] rounded-lg p-3 mb-3">
+<pre class="font-mono text-[11px] leading-relaxed text-green-400"><span class="text-muted">$</span> cargo run --example symbolic_regression -p tang-expr
+
+gen   1: best fitness = 0.485  expr = (sin(x0) * (x0 * x0))
+gen  50: best fitness = 0.051
+gen 100: best fitness = 0.051
+
+best expression: (sin(x0) * (x0 * x0))
+symbolic derivative: d/dx [...] = ...</pre>
+          </div>
+          <a href="https://github.com/ecto/tang/blob/main/crates/tang-expr/examples/symbolic_regression.rs" class="text-accent hover:underline text-sm font-mono">symbolic_regression.rs &rarr;</a>
+        </div>
+
+        <!-- PINN Poisson -->
+        <div class="example-card bg-surface rounded-2xl p-4 sm:p-6 overflow-x-auto">
+          <div class="flex items-center gap-3 mb-3">
+            <span class="bg-accent/10 text-accent text-xs font-mono px-2 py-1 rounded">tang-train</span>
+            <h3 class="font-semibold">PINN: Poisson Equation</h3>
+          </div>
+          <p class="text-muted text-sm mb-4">Physics-informed neural network solving <code class="font-mono text-accent">-&nabla;&sup2;u = f</code> on [0,1]&sup2;. Forward pass generic over <code class="font-mono text-accent">S: Scalar</code> &mdash; works with <code class="font-mono text-accent">Dual&lt;Dual&lt;f64&gt;&gt;</code> for second derivatives.</p>
+<pre class="font-mono text-xs leading-relaxed mb-3"><span class="cm">// same forward pass computes f64 or Dual&lt;Dual&lt;f64&gt;&gt;</span>
+<span class="kw">fn</span> <span class="fn">forward</span>&lt;<span class="ty">S</span>: <span class="ty">Scalar</span>&gt;(&amp;<span class="kw">self</span>, input: &amp;<span class="ty">Tensor</span>&lt;<span class="ty">S</span>&gt;) -&gt; <span class="ty">S</span>;
+<span class="kw">let</span> lap = <span class="fn">laplacian</span>(|inp| net.<span class="fn">forward</span>(inp), &amp;pt);</pre>
+          <div class="bg-[#1a1a2e] rounded-lg p-3 mb-3">
+<pre class="font-mono text-[11px] leading-relaxed text-green-400"><span class="text-muted">$</span> cargo run --example pinn_poisson -p tang-train
+
+epoch   1: loss = 54.203
+epoch 800: loss = 0.003
+
+verification on 10x10 grid:
+  max error: 0.011
+  avg error: 0.005
+SUCCESS: max error &lt; 0.05</pre>
+          </div>
+          <a href="https://github.com/ecto/tang/blob/main/crates/tang-train/examples/pinn_poisson.rs" class="text-accent hover:underline text-sm font-mono">pinn_poisson.rs &rarr;</a>
+        </div>
+
+        <!-- Physics Surrogate -->
+        <div class="example-card bg-surface rounded-2xl p-4 sm:p-6 overflow-x-auto">
+          <div class="flex items-center gap-3 mb-3">
+            <span class="bg-accent/10 text-accent text-xs font-mono px-2 py-1 rounded">tang-gpu</span>
+            <h3 class="font-semibold">Physics Surrogate</h3>
+          </div>
+          <p class="text-muted text-sm mb-4">Train a GPU network to approximate a 10-body gravitational potential built from expression graphs. Auto-diff for &part;V/&part;x, &part;V/&part;y. Benchmarks expression graph vs CPU vs GPU inference.</p>
+<pre class="font-mono text-xs leading-relaxed mb-3"><span class="cm">// symbolic potential → train CPU → transfer to GPU</span>
+<span class="kw">let</span> (g, v, dvdx, dvdy) = <span class="fn">build_potential_graph</span>();
+<span class="kw">let</span> losses = <span class="ty">Trainer</span>::<span class="fn">new</span>(&amp;<span class="kw">mut</span> cpu_model, ...).<span class="fn">fit</span>(...);
+<span class="kw">let</span> _gpu_out = gpu_model.<span class="fn">forward_train</span>(&amp;dev, ...);</pre>
+          <div class="bg-[#1a1a2e] rounded-lg p-3 mb-3">
+<pre class="font-mono text-[11px] leading-relaxed text-green-400"><span class="text-muted">$</span> cargo run --example physics_surrogate -p tang-gpu
+
+expression graph:    7.49ms
+CPU network:       682.06ms
+GPU network:         1.05ms
+
+speedup (expr&rarr;GPU): 7.1x
+speedup (CPU&rarr;GPU):  649.6x</pre>
+          </div>
+          <a href="https://github.com/ecto/tang/blob/main/crates/tang-gpu/examples/physics_surrogate.rs" class="text-accent hover:underline text-sm font-mono">physics_surrogate.rs &rarr;</a>
+        </div>
+
+        <!-- Distributed Training -->
+        <div class="example-card bg-surface rounded-2xl p-4 sm:p-6 overflow-x-auto">
+          <div class="flex items-center gap-3 mb-3">
+            <span class="bg-accent/10 text-accent text-xs font-mono px-2 py-1 rounded">tang-mesh</span>
+            <h3 class="font-semibold">Distributed Training</h3>
+          </div>
+          <p class="text-muted text-sm mb-4">Two in-process workers each get a shard of sin(x) data. Gradient allreduce at coordinator. Ships graphs, not tensors.</p>
+<pre class="font-mono text-xs leading-relaxed mb-3"><span class="cm">// build model as WireGraph, compile on workers</span>
+<span class="kw">let</span> graph = <span class="fn">build_model_graph</span>(); <span class="cm">// w1*sin(w2*x+w3)+w4</span>
+coordinator.<span class="fn">compile_all</span>(&amp;graph).<span class="kw">await</span>;
+<span class="kw">let</span> reduced = allreduce.<span class="fn">reduce</span>(&amp;[g0, g1]);</pre>
+          <div class="bg-[#1a1a2e] rounded-lg p-3 mb-3">
+<pre class="font-mono text-[11px] leading-relaxed text-green-400"><span class="text-muted">$</span> cargo run --example distributed_sin -p tang-mesh
+
+workers: 2 (in-process channel transport)
+epoch   1: loss = 0.167  w1=0.517 w2=0.812
+epoch 200: loss = 0.000  w1=1.000 w2=1.000
+
+fitted:  w1=1.0001, w2=0.9998, w3=-0.0002, w4=0.0001
+target:  w1=1.0000, w2=1.0000, w3=0.0000, w4=0.0000</pre>
+          </div>
+          <a href="https://github.com/ecto/tang/blob/main/crates/tang-mesh/examples/distributed_sin.rs" class="text-accent hover:underline text-sm font-mono">distributed_sin.rs &rarr;</a>
+        </div>
+
+      </div>
     </div>
   </section>
 
   <!-- ═══════════════════════════════════════════════ -->
   <!-- // footer                                      -->
   <!-- ═══════════════════════════════════════════════ -->
-  <footer class="px-4 sm:px-6 py-16 sm:py-24 border-t border-border">
+  <footer class="px-4 sm:px-6 py-16 sm:py-24">
     <div class="max-w-5xl mx-auto text-center">
       <p class="font-mono text-lg mb-2">tang is <a href="https://github.com/ecto/tang/blob/main/LICENSE" class="text-accent hover:underline">MIT licensed</a>.</p>
       <p class="text-muted mb-8">built for <a href="https://vcad.io" class="text-accent hover:underline">vcad</a>. usable by everyone.</p>
