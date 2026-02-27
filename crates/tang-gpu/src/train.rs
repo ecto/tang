@@ -470,6 +470,145 @@ impl GpuTrainer {
 }
 
 // ---------------------------------------------------------------------------
+// GradScaler — mixed-precision training support
+// ---------------------------------------------------------------------------
+
+/// Gradient scaler for mixed-precision training (AMP-style).
+///
+/// Scales the loss up before backward pass to prevent gradient underflow in
+/// low-precision computations, then scales gradients back down before the
+/// optimizer step. Dynamically adjusts the scale factor based on whether
+/// gradients contain inf/NaN.
+///
+/// # Usage
+/// ```ignore
+/// let mut scaler = GradScaler::new();
+/// let scaled_loss = scaler.scale_loss(device, cache, &loss);
+/// // ... backward with scaled_loss ...
+/// if scaler.unscale_and_step(device, cache, &mut optimizer, &mut params, &grads) {
+///     // step was applied
+/// }
+/// scaler.update();
+/// ```
+pub struct GradScaler {
+    /// Current scale factor (starts high, adjusts dynamically)
+    scale: f32,
+    /// Factor to grow scale by when no overflow detected
+    growth_factor: f32,
+    /// Factor to shrink scale by when overflow detected
+    backoff_factor: f32,
+    /// Number of consecutive successful steps before growing scale
+    growth_interval: u32,
+    /// Counter of consecutive successful steps
+    growth_step: u32,
+    /// Whether the last step had an overflow
+    found_inf: bool,
+}
+
+impl GradScaler {
+    /// Create a new gradient scaler with default settings.
+    ///
+    /// Default: initial scale = 65536, growth_factor = 2, backoff = 0.5,
+    /// growth_interval = 2000 steps.
+    pub fn new() -> Self {
+        Self {
+            scale: 65536.0,
+            growth_factor: 2.0,
+            backoff_factor: 0.5,
+            growth_interval: 2000,
+            growth_step: 0,
+            found_inf: false,
+        }
+    }
+
+    /// Create with custom initial scale.
+    pub fn with_scale(initial_scale: f32) -> Self {
+        Self {
+            scale: initial_scale,
+            ..Self::new()
+        }
+    }
+
+    /// Current scale factor.
+    pub fn get_scale(&self) -> f32 {
+        self.scale
+    }
+
+    /// Scale the loss tensor for backward pass.
+    pub fn scale_loss(
+        &self,
+        device: &GpuDevice,
+        cache: &mut KernelCache,
+        loss: &GpuTensor,
+    ) -> GpuTensor {
+        loss.scale(device, cache, self.scale)
+    }
+
+    /// Unscale gradients by 1/scale, check for inf/NaN, and optionally step the optimizer.
+    ///
+    /// Returns true if the optimizer step was applied (no overflow detected).
+    /// Returns false if overflow was detected (optimizer step skipped).
+    pub fn unscale_and_step(
+        &mut self,
+        device: &GpuDevice,
+        cache: &mut KernelCache,
+        optimizer: &mut GpuAdam,
+        params: &mut [&mut GpuTensor],
+        grads: &[GpuTensor],
+    ) -> bool {
+        let inv_scale = 1.0 / self.scale;
+
+        // Unscale gradients and check for inf/NaN
+        let mut unscaled_grads = Vec::with_capacity(grads.len());
+        let mut has_inf = false;
+
+        for grad in grads {
+            let unscaled = grad.scale(device, cache, inv_scale);
+            cache.flush(device);
+            let data = unscaled.to_vec_sync(device);
+            if data.iter().any(|&v| v.is_infinite() || v.is_nan()) {
+                has_inf = true;
+                break;
+            }
+            unscaled_grads.push(unscaled);
+        }
+
+        self.found_inf = has_inf;
+
+        if has_inf {
+            // Skip optimizer step
+            return false;
+        }
+
+        // Apply optimizer step with unscaled gradients
+        optimizer.step(device, cache, params, &unscaled_grads);
+        true
+    }
+
+    /// Update the scale factor after a training step.
+    ///
+    /// Call this after `unscale_and_step` each iteration.
+    pub fn update(&mut self) {
+        if self.found_inf {
+            self.scale *= self.backoff_factor;
+            self.growth_step = 0;
+        } else {
+            self.growth_step += 1;
+            if self.growth_step >= self.growth_interval {
+                self.scale *= self.growth_factor;
+                self.growth_step = 0;
+            }
+        }
+    }
+}
+
+impl Default for GradScaler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

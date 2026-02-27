@@ -82,7 +82,7 @@ pub use device::{GpuDevice, GpuError};
 pub use kernel::KernelCache;
 pub use module::{GpuAdam, GpuLinear, GpuModule, GpuTrainModule};
 pub use nn::{add_tensors, bias_add, gelu, relu, relu_backward, softmax, GpuAttention, GpuLayerNorm, GpuTransformerBlock};
-pub use train::{gpu_cross_entropy_loss, gpu_mse_loss, GpuDataLoader, GpuReLULayer, GpuSequential, GpuTanhLayer, GpuTrainer};
+pub use train::{gpu_cross_entropy_loss, gpu_mse_loss, GradScaler, GpuDataLoader, GpuReLULayer, GpuSequential, GpuTanhLayer, GpuTrainer};
 pub use realize::{map_elementwise, map_elementwise_multi};
 pub use reduce::{reduce_max, reduce_mean, reduce_sum, reduce_sum_all};
 pub use safetensors::{load_safetensors, save_safetensors};
@@ -234,8 +234,9 @@ mod tests {
     #[test]
     fn softmax_sums_to_one() {
         let device = get_device();
+        let mut cache = KernelCache::new();
         let input = GpuTensor::from_slice(&device, &[1.0, 2.0, 3.0, 4.0], &[4]);
-        let output = softmax(&device, &input);
+        let output = softmax(&device, &mut cache, &input);
         let result = output.to_vec_sync(&device);
         let sum: f32 = result.iter().sum();
         assert!(
@@ -249,11 +250,29 @@ mod tests {
     }
 
     #[test]
+    fn softmax_2d_rows() {
+        let device = get_device();
+        let mut cache = KernelCache::new();
+        // 2 rows of 3 elements each
+        let input = GpuTensor::from_slice(&device, &[1.0, 2.0, 3.0, 10.0, 0.0, 0.0], &[2, 3]);
+        let output = softmax(&device, &mut cache, &input);
+        let result = output.to_vec_sync(&device);
+        // Each row should sum to 1
+        let row1_sum: f32 = result[0..3].iter().sum();
+        let row2_sum: f32 = result[3..6].iter().sum();
+        assert!((row1_sum - 1.0).abs() < 1e-5, "row1 sum = {row1_sum}");
+        assert!((row2_sum - 1.0).abs() < 1e-5, "row2 sum = {row2_sum}");
+        // Row 2: token 0 should dominate
+        assert!(result[3] > 0.99, "row2[0] should dominate, got {}", result[3]);
+    }
+
+    #[test]
     fn layer_norm_output() {
         let device = get_device();
+        let mut cache = KernelCache::new();
         let ln = GpuLayerNorm::new(&device, 4, 1e-5);
         let input = GpuTensor::from_slice(&device, &[1.0, 2.0, 3.0, 4.0], &[4]);
-        let output = ln.forward(&device, &input);
+        let output = ln.forward(&device, &mut cache, &input);
         let result = output.to_vec_sync(&device);
 
         // Mean should be approximately 0

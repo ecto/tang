@@ -59,48 +59,125 @@ impl KernelCache {
         }
     }
 
-    /// Get or compile a pipeline for the given WGSL source.
-    fn get_or_compile(&mut self, device: &GpuDevice, wgsl: &str) -> &CachedPipeline {
-        let hash = Self::hash_wgsl(wgsl);
+    /// Get or compile a pipeline with the standard 3-binding layout
+    /// (read storage, read-write storage, uniform). Public for custom dispatch patterns.
+    pub(crate) fn get_or_compile_custom(&mut self, device: &GpuDevice, wgsl: &str, hash: u64) -> &CachedPipeline {
+        self.pipelines.entry(hash).or_insert_with(|| {
+            Self::compile_standard_3(device, wgsl)
+        })
+    }
+
+    fn compile_standard_3(device: &GpuDevice, wgsl: &str) -> CachedPipeline {
+        let module = device
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("tang-gpu kernel"),
+                source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+            });
+
+        let bind_group_layout =
+            device
+                .device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("tang-gpu bgl"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+
+        let pipeline_layout =
+            device
+                .device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("tang-gpu pipeline layout"),
+                    bind_group_layouts: &[&bind_group_layout],
+                    push_constant_ranges: &[],
+                });
+
+        let pipeline =
+            device
+                .device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("tang-gpu pipeline"),
+                    layout: Some(&pipeline_layout),
+                    module: &module,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+
+        CachedPipeline {
+            pipeline,
+            bind_group_layout,
+        }
+    }
+
+    /// Get or compile a pipeline with 5-binding layout:
+    /// 0=read, 1=read, 2=read, 3=read_write, 4=uniform.
+    /// Used for layer norm (input, weight, bias, output, params).
+    pub(crate) fn get_or_compile_5bind(&mut self, device: &GpuDevice, wgsl: &str, hash: u64) -> &CachedPipeline {
         self.pipelines.entry(hash).or_insert_with(|| {
             let module = device
                 .device
                 .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("tang-gpu kernel"),
+                    label: Some("tang-gpu kernel 5bind"),
                     source: wgpu::ShaderSource::Wgsl(wgsl.into()),
                 });
+
+            fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
+                wgpu::BindGroupLayoutEntry {
+                    binding,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }
+            }
 
             let bind_group_layout =
                 device
                     .device
                     .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                        label: Some("tang-gpu bgl"),
+                        label: Some("tang-gpu bgl 5bind"),
                         entries: &[
-                            // binding 0: inputs (read-only storage)
+                            storage_entry(0, true),
+                            storage_entry(1, true),
+                            storage_entry(2, true),
+                            storage_entry(3, false),
                             wgpu::BindGroupLayoutEntry {
-                                binding: 0,
-                                visibility: wgpu::ShaderStages::COMPUTE,
-                                ty: wgpu::BindingType::Buffer {
-                                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                                    has_dynamic_offset: false,
-                                    min_binding_size: None,
-                                },
-                                count: None,
-                            },
-                            // binding 1: outputs (read-write storage)
-                            wgpu::BindGroupLayoutEntry {
-                                binding: 1,
-                                visibility: wgpu::ShaderStages::COMPUTE,
-                                ty: wgpu::BindingType::Buffer {
-                                    ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                    has_dynamic_offset: false,
-                                    min_binding_size: None,
-                                },
-                                count: None,
-                            },
-                            // binding 2: params (uniform)
-                            wgpu::BindGroupLayoutEntry {
-                                binding: 2,
+                                binding: 4,
                                 visibility: wgpu::ShaderStages::COMPUTE,
                                 ty: wgpu::BindingType::Buffer {
                                     ty: wgpu::BufferBindingType::Uniform,
@@ -116,7 +193,7 @@ impl KernelCache {
                 device
                     .device
                     .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                        label: Some("tang-gpu pipeline layout"),
+                        label: Some("tang-gpu pipeline layout 5bind"),
                         bind_group_layouts: &[&bind_group_layout],
                         push_constant_ranges: &[],
                     });
@@ -125,7 +202,7 @@ impl KernelCache {
                 device
                     .device
                     .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                        label: Some("tang-gpu pipeline"),
+                        label: Some("tang-gpu pipeline 5bind"),
                         layout: Some(&pipeline_layout),
                         module: &module,
                         entry_point: Some("main"),
@@ -137,6 +214,14 @@ impl KernelCache {
                 pipeline,
                 bind_group_layout,
             }
+        })
+    }
+
+    /// Get or compile a pipeline for the given WGSL source.
+    fn get_or_compile(&mut self, device: &GpuDevice, wgsl: &str) -> &CachedPipeline {
+        let hash = Self::hash_wgsl(wgsl);
+        self.pipelines.entry(hash).or_insert_with(|| {
+            Self::compile_standard_3(device, wgsl)
         })
     }
 
@@ -203,6 +288,80 @@ impl KernelCache {
         }
 
         self.submit_or_enqueue(device, encoder.finish());
+    }
+
+    /// Get or compile a pipeline with 4-binding layout:
+    /// 0=read, 1=read, 2=read_write, 3=uniform. Public for custom dispatch.
+    pub(crate) fn get_or_compile_rr_w(&mut self, device: &GpuDevice, wgsl: &str, hash: u64) -> &CachedPipeline {
+        self.pipelines.entry(hash).or_insert_with(|| {
+            let module = device
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("tang-gpu kernel rr_w"),
+                    source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+                });
+
+            fn bgl_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
+                wgpu::BindGroupLayoutEntry {
+                    binding,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }
+            }
+
+            let bind_group_layout =
+                device
+                    .device
+                    .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                        label: Some("tang-gpu bgl rr_w cached"),
+                        entries: &[
+                            bgl_entry(0, true),
+                            bgl_entry(1, true),
+                            bgl_entry(2, false),
+                            wgpu::BindGroupLayoutEntry {
+                                binding: 3,
+                                visibility: wgpu::ShaderStages::COMPUTE,
+                                ty: wgpu::BindingType::Buffer {
+                                    ty: wgpu::BufferBindingType::Uniform,
+                                    has_dynamic_offset: false,
+                                    min_binding_size: None,
+                                },
+                                count: None,
+                            },
+                        ],
+                    });
+
+            let pipeline_layout =
+                device
+                    .device
+                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("tang-gpu pipeline layout rr_w"),
+                        bind_group_layouts: &[&bind_group_layout],
+                        push_constant_ranges: &[],
+                    });
+
+            let pipeline =
+                device
+                    .device
+                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                        label: Some("tang-gpu pipeline rr_w"),
+                        layout: Some(&pipeline_layout),
+                        module: &module,
+                        entry_point: Some("main"),
+                        compilation_options: Default::default(),
+                        cache: None,
+                    });
+
+            CachedPipeline {
+                pipeline,
+                bind_group_layout,
+            }
+        })
     }
 
     /// Dispatch with 2 read-only inputs + 1 read-write output + uniform params.

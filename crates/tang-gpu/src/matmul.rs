@@ -5,11 +5,15 @@ use crate::device::GpuDevice;
 use crate::kernel::KernelCache;
 use crate::tensor::GpuTensor;
 
+use std::hash::{Hash, Hasher};
+
 const TILE_SIZE: u32 = 16;
 
 /// GPU matrix multiply: C = A @ B.
 ///
 /// A: [M, K], B: [K, N] -> C: [M, N]
+///
+/// Uses a cached tiled WGSL kernel with 16x16 shared-memory tiles.
 pub fn matmul(
     device: &GpuDevice,
     cache: &mut KernelCache,
@@ -24,9 +28,20 @@ pub fn matmul(
     let n = b.shape()[1];
 
     let wgsl = matmul_wgsl();
+    let out_buf = GpuBuffer::uninit(device, m * n);
 
-    // Pack dimensions into a uniform buffer
+    // Use the KernelCache's 4-binding layout (same as dispatch_rr_w)
+    // but with custom 2D workgroup dispatch
     let dims_data: [u32; 4] = [m as u32, n as u32, k as u32, 0];
+
+    let hash = {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        wgsl.hash(&mut hasher);
+        hasher.finish()
+    };
+
+    let cached = cache.get_or_compile_rr_w(device, &wgsl, hash);
+
     use wgpu::util::DeviceExt;
     let dims_buf = device
         .device
@@ -36,60 +51,9 @@ pub fn matmul(
             usage: wgpu::BufferUsages::UNIFORM,
         });
 
-    let out_buf = GpuBuffer::uninit(device, m * n);
-
-    // Create shader and pipeline
-    let module = device
-        .device
-        .create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("matmul shader"),
-            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
-        });
-
-    let bind_group_layout =
-        device
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("matmul bgl"),
-                entries: &[
-                    bgl_entry(0, true),
-                    bgl_entry(1, true),
-                    bgl_entry(2, false),
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                ],
-            });
-
-    let pipeline_layout = device
-        .device
-        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("matmul pipeline layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
-        });
-
-    let pipeline = device
-        .device
-        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("matmul pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &module,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-
     let bind_group = device.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("matmul bind group"),
-        layout: &bind_group_layout,
+        layout: &cached.bind_group_layout,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
@@ -121,7 +85,7 @@ pub fn matmul(
             label: Some("matmul compute"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&pipeline);
+        pass.set_pipeline(&cached.pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         let wg_x = (n as u32).div_ceil(TILE_SIZE);
         let wg_y = (m as u32).div_ceil(TILE_SIZE);
@@ -133,19 +97,6 @@ pub fn matmul(
     GpuTensor {
         buffer: out_buf,
         shape: vec![m, n],
-    }
-}
-
-fn bgl_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage { read_only },
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
     }
 }
 
