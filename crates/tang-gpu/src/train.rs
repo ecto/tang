@@ -1,0 +1,498 @@
+//! GPU training infrastructure: layers, sequential model, data loader, trainer.
+
+use crate::device::GpuDevice;
+use crate::kernel::KernelCache;
+use crate::module::{GpuAdam, GpuTrainModule};
+use crate::nn::{relu, relu_backward};
+use crate::realize::map_elementwise;
+use crate::tensor::GpuTensor;
+
+// ---------------------------------------------------------------------------
+// GpuReLULayer
+// ---------------------------------------------------------------------------
+
+/// ReLU activation layer with cached input for backward.
+pub struct GpuReLULayer {
+    cached_input: Option<GpuTensor>,
+}
+
+impl GpuReLULayer {
+    pub fn new() -> Self {
+        Self { cached_input: None }
+    }
+}
+
+impl GpuTrainModule for GpuReLULayer {
+    fn forward_train(
+        &mut self,
+        device: &GpuDevice,
+        cache: &mut KernelCache,
+        input: &GpuTensor,
+    ) -> GpuTensor {
+        self.cached_input = Some(input.clone_gpu_batched(device, cache));
+        relu(device, cache, input)
+    }
+
+    fn backward(
+        &mut self,
+        device: &GpuDevice,
+        cache: &mut KernelCache,
+        grad_output: &GpuTensor,
+    ) -> GpuTensor {
+        let input = self.cached_input.as_ref().expect("must call forward_train before backward");
+        relu_backward(device, cache, input, grad_output)
+    }
+
+    fn parameters(&self) -> Vec<&GpuTensor> {
+        vec![]
+    }
+
+    fn parameters_mut(&mut self) -> Vec<&mut GpuTensor> {
+        vec![]
+    }
+
+    fn gradients(&self) -> Vec<Option<&GpuTensor>> {
+        vec![]
+    }
+
+    fn zero_grad(&mut self) {
+        self.cached_input = None;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GpuSequential
+// ---------------------------------------------------------------------------
+
+/// Sequential container: chains layers left-to-right for forward,
+/// right-to-left for backward.
+pub struct GpuSequential {
+    layers: Vec<Box<dyn GpuTrainModule>>,
+}
+
+impl GpuSequential {
+    pub fn new(layers: Vec<Box<dyn GpuTrainModule>>) -> Self {
+        Self { layers }
+    }
+}
+
+impl GpuTrainModule for GpuSequential {
+    fn forward_train(
+        &mut self,
+        device: &GpuDevice,
+        cache: &mut KernelCache,
+        input: &GpuTensor,
+    ) -> GpuTensor {
+        let mut x = input.clone_gpu_batched(device, cache);
+        for layer in &mut self.layers {
+            x = layer.forward_train(device, cache, &x);
+        }
+        x
+    }
+
+    fn backward(
+        &mut self,
+        device: &GpuDevice,
+        cache: &mut KernelCache,
+        grad_output: &GpuTensor,
+    ) -> GpuTensor {
+        let mut grad = grad_output.clone_gpu_batched(device, cache);
+        for layer in self.layers.iter_mut().rev() {
+            grad = layer.backward(device, cache, &grad);
+        }
+        grad
+    }
+
+    fn parameters(&self) -> Vec<&GpuTensor> {
+        self.layers.iter().flat_map(|l| l.parameters()).collect()
+    }
+
+    fn parameters_mut(&mut self) -> Vec<&mut GpuTensor> {
+        self.layers.iter_mut().flat_map(|l| l.parameters_mut()).collect()
+    }
+
+    fn gradients(&self) -> Vec<Option<&GpuTensor>> {
+        self.layers.iter().flat_map(|l| l.gradients()).collect()
+    }
+
+    fn zero_grad(&mut self) {
+        for layer in &mut self.layers {
+            layer.zero_grad();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// gpu_mse_loss
+// ---------------------------------------------------------------------------
+
+/// Compute MSE loss and its gradient on GPU.
+///
+/// Returns `(loss_scalar, grad_tensor)` where `grad = 2/n * (pred - target)`.
+pub fn gpu_mse_loss(
+    device: &GpuDevice,
+    cache: &mut KernelCache,
+    pred: &GpuTensor,
+    target: &GpuTensor,
+) -> (f32, GpuTensor) {
+    let n = pred.numel();
+    assert_eq!(n, target.numel());
+
+    // diff = pred - target
+    let diff = map_elementwise(device, cache, &[pred, target], |args| args[0] - args[1]);
+
+    // squared = diff^2
+    let sq = map_elementwise(device, cache, &[&diff], |args| args[0] * args[0]);
+
+    // mean of squared errors (flush pending commands before CPU readback)
+    cache.flush(device);
+    let sq_data = sq.buffer.to_vec_sync(device);
+    let loss = sq_data.iter().sum::<f32>() / n as f32;
+
+    // grad = 2/n * diff
+    let scale = 2.0 / n as f32;
+    let grad = diff.scale(device, cache, scale);
+
+    (loss, grad)
+}
+
+// ---------------------------------------------------------------------------
+// GpuDataLoader
+// ---------------------------------------------------------------------------
+
+/// Batched data loader that uploads CPU data to GPU per batch.
+pub struct GpuDataLoader {
+    inputs: Vec<f32>,
+    targets: Vec<f32>,
+    input_dim: usize,
+    target_dim: usize,
+    n_samples: usize,
+    batch_size: usize,
+    position: usize,
+}
+
+impl GpuDataLoader {
+    /// Create a data loader from flat f32 arrays.
+    ///
+    /// `inputs` has shape [n_samples, input_dim] flattened row-major.
+    /// `targets` has shape [n_samples, target_dim] flattened row-major.
+    pub fn new(
+        inputs: Vec<f32>,
+        targets: Vec<f32>,
+        input_dim: usize,
+        target_dim: usize,
+        batch_size: usize,
+    ) -> Self {
+        let n_samples = inputs.len() / input_dim;
+        assert_eq!(inputs.len(), n_samples * input_dim);
+        assert_eq!(targets.len(), n_samples * target_dim);
+        Self {
+            inputs,
+            targets,
+            input_dim,
+            target_dim,
+            n_samples,
+            batch_size,
+            position: 0,
+        }
+    }
+
+    /// Reset to the beginning of the dataset.
+    pub fn reset(&mut self) {
+        self.position = 0;
+    }
+
+    /// Get the next batch as GPU tensors, or None if exhausted.
+    pub fn next_batch(&mut self, device: &GpuDevice) -> Option<(GpuTensor, GpuTensor)> {
+        if self.position >= self.n_samples {
+            return None;
+        }
+        let end = (self.position + self.batch_size).min(self.n_samples);
+        let batch = end - self.position;
+
+        let in_start = self.position * self.input_dim;
+        let in_end = end * self.input_dim;
+        let tgt_start = self.position * self.target_dim;
+        let tgt_end = end * self.target_dim;
+
+        let in_shape = if batch == 1 {
+            vec![self.input_dim]
+        } else {
+            vec![batch, self.input_dim]
+        };
+        let tgt_shape = if batch == 1 {
+            vec![self.target_dim]
+        } else {
+            vec![batch, self.target_dim]
+        };
+
+        let input = GpuTensor::from_slice(device, &self.inputs[in_start..in_end], &in_shape);
+        let target = GpuTensor::from_slice(device, &self.targets[tgt_start..tgt_end], &tgt_shape);
+
+        self.position = end;
+        Some((input, target))
+    }
+
+    /// Number of samples.
+    pub fn len(&self) -> usize {
+        self.n_samples
+    }
+
+    /// Whether the loader is empty.
+    pub fn is_empty(&self) -> bool {
+        self.n_samples == 0
+    }
+
+    /// Number of batches per epoch.
+    pub fn n_batches(&self) -> usize {
+        (self.n_samples + self.batch_size - 1) / self.batch_size
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GpuTrainer
+// ---------------------------------------------------------------------------
+
+/// Training loop that mirrors tang-train's Trainer.
+pub struct GpuTrainer {
+    optimizer: GpuAdam,
+    loss_fn: fn(&GpuDevice, &mut KernelCache, &GpuTensor, &GpuTensor) -> (f32, GpuTensor),
+    num_epochs: usize,
+}
+
+impl GpuTrainer {
+    pub fn new(lr: f32, num_epochs: usize) -> Self {
+        Self {
+            optimizer: GpuAdam::new(lr),
+            loss_fn: gpu_mse_loss,
+            num_epochs,
+        }
+    }
+
+    /// Set a custom loss function.
+    pub fn with_loss_fn(
+        mut self,
+        f: fn(&GpuDevice, &mut KernelCache, &GpuTensor, &GpuTensor) -> (f32, GpuTensor),
+    ) -> Self {
+        self.loss_fn = f;
+        self
+    }
+
+    /// Train the model and return per-epoch average losses.
+    pub fn fit(
+        &mut self,
+        device: &GpuDevice,
+        cache: &mut KernelCache,
+        model: &mut dyn GpuTrainModule,
+        loader: &mut GpuDataLoader,
+    ) -> Vec<f32> {
+        let mut epoch_losses = Vec::with_capacity(self.num_epochs);
+
+        // Enable command batching for the training loop
+        cache.begin_batch();
+
+        for _ in 0..self.num_epochs {
+            loader.reset();
+            let mut total_loss = 0.0f32;
+            let mut n_batches = 0;
+
+            while let Some((input, target)) = loader.next_batch(device) {
+                // Zero gradients
+                model.zero_grad();
+
+                // Forward
+                let pred = model.forward_train(device, cache, &input);
+
+                // Loss
+                let (loss, grad) = (self.loss_fn)(device, cache, &pred, &target);
+                total_loss += loss;
+                n_batches += 1;
+
+                // Backward
+                model.backward(device, cache, &grad);
+
+                // Collect grads (GPU-side copy, no readback)
+                let grads: Vec<GpuTensor> = model
+                    .gradients()
+                    .into_iter()
+                    .map(|g| {
+                        let g = g.expect("gradient missing after backward");
+                        g.clone_gpu_batched(device, cache)
+                    })
+                    .collect();
+
+                // Update params in-place
+                let mut params = model.parameters_mut();
+                self.optimizer.step(device, cache, &mut params, &grads);
+            }
+
+            epoch_losses.push(total_loss / n_batches.max(1) as f32);
+        }
+
+        epoch_losses
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::module::{GpuLinear, GpuModule};
+
+    fn get_device() -> GpuDevice {
+        GpuDevice::new_sync().expect("GPU device required for tests")
+    }
+
+    #[test]
+    fn linear_forward_backward_gradient_check() {
+        let device = get_device();
+        let mut cache = KernelCache::new();
+
+        // Create a simple linear layer: 2 -> 3
+        let mut linear = GpuLinear::new(
+            &device,
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            &[0.1, 0.2, 0.3],
+            2,
+            3,
+        );
+
+        let input = GpuTensor::from_slice(&device, &[1.0, 0.5], &[2]);
+
+        // Forward
+        let output = linear.forward_train(&device, &mut cache, &input);
+        let out_data = output.to_vec_sync(&device);
+        // y = W @ x + b = [1*1+2*0.5+0.1, 3*1+4*0.5+0.2, 5*1+6*0.5+0.3] = [2.1, 5.2, 8.3]
+        assert!((out_data[0] - 2.1).abs() < 0.01, "out[0]={}", out_data[0]);
+        assert!((out_data[1] - 5.2).abs() < 0.01, "out[1]={}", out_data[1]);
+        assert!((out_data[2] - 8.3).abs() < 0.01, "out[2]={}", out_data[2]);
+
+        // Backward with grad_output = [1, 1, 1]
+        let grad_out = GpuTensor::from_slice(&device, &[1.0, 1.0, 1.0], &[3]);
+        let grad_input = linear.backward(&device, &mut cache, &grad_out);
+
+        // Numerical gradient check for input
+        let eps = 1e-3;
+        let in_data = vec![1.0f32, 0.5];
+        let gi_data = grad_input.to_vec_sync(&device);
+
+        for dim in 0..2 {
+            let mut plus = in_data.clone();
+            plus[dim] += eps;
+            let mut minus = in_data.clone();
+            minus[dim] -= eps;
+
+            let out_p = linear.forward(
+                &device,
+                &mut cache,
+                &GpuTensor::from_slice(&device, &plus, &[2]),
+            );
+            let out_m = linear.forward(
+                &device,
+                &mut cache,
+                &GpuTensor::from_slice(&device, &minus, &[2]),
+            );
+
+            let p_data = out_p.to_vec_sync(&device);
+            let m_data = out_m.to_vec_sync(&device);
+            // sum of outputs (since grad_out = [1,1,1])
+            let numerical_grad: f32 =
+                p_data.iter().zip(m_data.iter()).map(|(p, m)| (p - m) / (2.0 * eps)).sum();
+            assert!(
+                (gi_data[dim] - numerical_grad).abs() < 0.05,
+                "input grad[{dim}]: analytical={}, numerical={}",
+                gi_data[dim],
+                numerical_grad
+            );
+        }
+    }
+
+    #[test]
+    fn sequential_forward_backward_shapes() {
+        let device = get_device();
+        let mut cache = KernelCache::new();
+
+        let mut model = GpuSequential::new(vec![
+            Box::new(GpuLinear::kaiming(&device, 2, 4, 42)),
+            Box::new(GpuReLULayer::new()),
+            Box::new(GpuLinear::kaiming(&device, 4, 1, 43)),
+        ]);
+
+        // Batched forward
+        let input = GpuTensor::from_slice(&device, &[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+        let output = model.forward_train(&device, &mut cache, &input);
+        assert_eq!(output.shape(), &[2, 1]);
+
+        // Backward
+        let grad = GpuTensor::from_slice(&device, &[1.0, 1.0], &[2, 1]);
+        let grad_input = model.backward(&device, &mut cache, &grad);
+        assert_eq!(grad_input.shape(), &[2, 2]);
+    }
+
+    #[test]
+    fn data_loader_batching() {
+        let device = get_device();
+
+        // 5 samples, input_dim=2, target_dim=1, batch_size=2
+        let inputs = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
+        let targets = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+
+        let mut loader = GpuDataLoader::new(inputs, targets, 2, 1, 2);
+        assert_eq!(loader.len(), 5);
+        assert_eq!(loader.n_batches(), 3);
+
+        // Batch 1: 2 samples
+        let (inp, tgt) = loader.next_batch(&device).unwrap();
+        assert_eq!(inp.shape(), &[2, 2]);
+        assert_eq!(tgt.shape(), &[2, 1]);
+
+        // Batch 2: 2 samples
+        let (inp, tgt) = loader.next_batch(&device).unwrap();
+        assert_eq!(inp.shape(), &[2, 2]);
+        assert_eq!(tgt.shape(), &[2, 1]);
+
+        // Batch 3: 1 remaining sample
+        let (inp, tgt) = loader.next_batch(&device).unwrap();
+        assert_eq!(inp.shape(), &[2]);
+        assert_eq!(tgt.shape(), &[1]);
+
+        // Exhausted
+        assert!(loader.next_batch(&device).is_none());
+
+        // Reset and iterate again
+        loader.reset();
+        assert!(loader.next_batch(&device).is_some());
+    }
+
+    #[test]
+    fn xor_training_convergence() {
+        let device = get_device();
+        let mut cache = KernelCache::new();
+
+        // XOR dataset
+        let inputs = vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0];
+        let targets = vec![0.0, 1.0, 1.0, 0.0];
+
+        let mut loader = GpuDataLoader::new(inputs, targets, 2, 1, 4);
+
+        let mut model = GpuSequential::new(vec![
+            Box::new(GpuLinear::kaiming(&device, 2, 8, 123)),
+            Box::new(GpuReLULayer::new()),
+            Box::new(GpuLinear::kaiming(&device, 8, 1, 456)),
+        ]);
+
+        let mut trainer = GpuTrainer::new(0.01, 500);
+        let losses = trainer.fit(&device, &mut cache, &mut model, &mut loader);
+
+        // Loss should decrease significantly
+        let first = losses[0];
+        let last = *losses.last().unwrap();
+        assert!(
+            last < first * 0.1,
+            "XOR training did not converge: first_loss={first}, last_loss={last}"
+        );
+    }
+}
