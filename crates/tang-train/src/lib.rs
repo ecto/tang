@@ -55,7 +55,10 @@ mod scheduler;
 mod trainer;
 
 pub use data::{DataLoader, Dataset, TensorDataset};
-pub use layers::{Conv1d, Conv2d, Dropout, Embedding, Linear, ReLU, Sequential, Tanh};
+pub use layers::{
+    Conv1d, Conv2d, Dropout, Embedding, LayerNorm, Linear, MultiHeadAttention, ReLU, Sequential,
+    Tanh, TransformerBlock,
+};
 pub use loss::{
     cross_entropy_loss, cross_entropy_loss_grad, huber_loss, mse_loss, mse_loss_grad, softmax,
 };

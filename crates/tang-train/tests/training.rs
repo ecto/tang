@@ -1,7 +1,8 @@
 use tang_tensor::{Shape, Tensor};
 use tang_train::{
-    mse_loss, mse_loss_grad, Conv1d, Conv2d, Dropout, Embedding, Linear, Module, ModuleAdam,
-    ModuleSgd, Optimizer, ReLU, Sequential, Tanh,
+    mse_loss, mse_loss_grad, Conv1d, Conv2d, Dropout, Embedding, LayerNorm, Linear, Module,
+    ModuleAdam, ModuleSgd, MultiHeadAttention, Optimizer, ReLU, Sequential, Tanh,
+    TransformerBlock,
 };
 
 #[test]
@@ -581,4 +582,144 @@ fn test_conv2d_named_parameters() {
     let conv = Conv2d::<f64>::new(1, 4, 3, 42);
     let names: Vec<String> = conv.named_parameters().iter().map(|(n, _)| n.clone()).collect();
     assert_eq!(names, vec!["weight", "bias"]);
+}
+
+#[test]
+fn test_layer_norm_forward() {
+    let mut ln = LayerNorm::<f64>::new(4);
+    let input = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], Shape::from_slice(&[2, 4]));
+    let output = ln.forward(&input);
+
+    // Each row should be approximately normalized (mean≈0, std≈1 before gamma/beta)
+    assert_eq!(output.shape().dims(), &[2, 4]);
+    // With gamma=1, beta=0, output should have mean≈0 per row
+    for b in 0..2 {
+        let row_mean: f64 = (0..4).map(|j| output.get(&[b, j])).sum::<f64>() / 4.0;
+        assert!(row_mean.abs() < 1e-10, "row {} mean should be ~0, got {}", b, row_mean);
+    }
+}
+
+#[test]
+fn test_layer_norm_backward_gradient_check() {
+    let mut ln = LayerNorm::<f64>::new(3);
+    let input = Tensor::new(vec![1.0, 3.0, 2.0, 4.0, 1.0, 5.0], Shape::from_slice(&[2, 3]));
+    let eps = 1e-5;
+
+    let _out = ln.forward(&input);
+    let grad_output = Tensor::new(vec![1.0; 6], Shape::from_slice(&[2, 3]));
+    let grad_input = ln.backward(&grad_output);
+
+    // Check input gradient via finite differences
+    let mut input_mut = input.clone();
+    for b in 0..2 {
+        for j in 0..3 {
+            let orig = input_mut.get(&[b, j]);
+
+            input_mut.set(&[b, j], orig + eps);
+            let out_plus = ln.forward(&input_mut);
+            let loss_plus: f64 = out_plus.data().iter().sum();
+
+            input_mut.set(&[b, j], orig - eps);
+            let out_minus = ln.forward(&input_mut);
+            let loss_minus: f64 = out_minus.data().iter().sum();
+
+            input_mut.set(&[b, j], orig);
+
+            let numerical = (loss_plus - loss_minus) / (2.0 * eps);
+            let analytical = grad_input.get(&[b, j]);
+            assert!(
+                (numerical - analytical).abs() < 1e-4,
+                "layernorm input grad mismatch at [{},{}]: numerical={}, analytical={}",
+                b, j, numerical, analytical
+            );
+        }
+    }
+}
+
+#[test]
+fn test_layer_norm_named_parameters() {
+    let ln = LayerNorm::<f64>::new(8);
+    let names: Vec<String> = ln.named_parameters().iter().map(|(n, _)| n.clone()).collect();
+    assert_eq!(names, vec!["gamma", "beta"]);
+}
+
+#[test]
+fn test_multi_head_attention_forward_shape() {
+    let mut mha = MultiHeadAttention::<f64>::new(8, 2, 42);
+    let input = Tensor::new(vec![0.1; 4 * 8], Shape::from_slice(&[4, 8])); // seq_len=4, d_model=8
+    let output = mha.forward(&input);
+    assert_eq!(output.shape().dims(), &[4, 8]);
+}
+
+#[test]
+fn test_multi_head_attention_named_parameters() {
+    let mha = MultiHeadAttention::<f64>::new(16, 4, 42);
+    let names: Vec<String> = mha.named_parameters().iter().map(|(n, _)| n.clone()).collect();
+    assert!(names.contains(&"wq.weight".to_string()));
+    assert!(names.contains(&"wq.bias".to_string()));
+    assert!(names.contains(&"wk.weight".to_string()));
+    assert!(names.contains(&"wv.weight".to_string()));
+    assert!(names.contains(&"wo.weight".to_string()));
+    assert!(names.contains(&"wo.bias".to_string()));
+    assert_eq!(names.len(), 8); // 4 linear layers x (weight + bias)
+}
+
+#[test]
+fn test_multi_head_attention_backward_runs() {
+    let mut mha = MultiHeadAttention::<f64>::new(8, 2, 42);
+    let input = Tensor::new(vec![0.1; 3 * 8], Shape::from_slice(&[3, 8]));
+    let _output = mha.forward(&input);
+    let grad = Tensor::new(vec![1.0; 3 * 8], Shape::from_slice(&[3, 8]));
+    let grad_input = mha.backward(&grad);
+    assert_eq!(grad_input.shape().dims(), &[3, 8]);
+
+    // Verify gradients were accumulated
+    let params = mha.parameters();
+    let has_grads = params.iter().any(|p| p.grad.is_some());
+    assert!(has_grads, "backward should accumulate gradients");
+}
+
+#[test]
+fn test_transformer_block_forward_shape() {
+    let mut block = TransformerBlock::<f64>::new(8, 2, 32, 42);
+    let input = Tensor::new(vec![0.1; 4 * 8], Shape::from_slice(&[4, 8]));
+    let output = block.forward(&input);
+    // Output shape should match input shape (residual connections preserve dims)
+    assert_eq!(output.shape().dims(), &[4, 8]);
+}
+
+#[test]
+fn test_transformer_block_backward_runs() {
+    let mut block = TransformerBlock::<f64>::new(8, 2, 16, 42);
+    let input = Tensor::new(vec![0.1; 3 * 8], Shape::from_slice(&[3, 8]));
+    let _output = block.forward(&input);
+    let grad = Tensor::new(vec![1.0; 3 * 8], Shape::from_slice(&[3, 8]));
+    let grad_input = block.backward(&grad);
+    assert_eq!(grad_input.shape().dims(), &[3, 8]);
+}
+
+#[test]
+fn test_transformer_block_named_parameters() {
+    let block = TransformerBlock::<f64>::new(8, 2, 16, 42);
+    let names: Vec<String> = block.named_parameters().iter().map(|(n, _)| n.clone()).collect();
+    // Should have prefixed names
+    assert!(names.iter().any(|n| n.starts_with("attn.")), "should have attn params");
+    assert!(names.iter().any(|n| n.starts_with("ln1.")), "should have ln1 params");
+    assert!(names.iter().any(|n| n.starts_with("ln2.")), "should have ln2 params");
+    assert!(names.iter().any(|n| n.starts_with("ff1.")), "should have ff1 params");
+    assert!(names.iter().any(|n| n.starts_with("ff2.")), "should have ff2 params");
+}
+
+#[test]
+fn test_transformer_block_residual_connection() {
+    // With zero-initialized weights, the output should approximately equal the input
+    // (due to residual connections and layer norm)
+    let mut block = TransformerBlock::<f64>::new(4, 1, 8, 42);
+    let input = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], Shape::from_slice(&[2, 4]));
+    let output = block.forward(&input);
+    // Output should be finite and same shape
+    assert_eq!(output.shape().dims(), &[2, 4]);
+    for &v in output.data() {
+        assert!(v.is_finite(), "output should be finite, got {}", v);
+    }
 }

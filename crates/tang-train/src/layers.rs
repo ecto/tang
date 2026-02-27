@@ -637,6 +637,628 @@ impl<S: Scalar> Module<S> for Conv2d<S> {
     }
 }
 
+/// Layer normalization over the last dimension.
+///
+/// Input: `[batch, features]`
+/// Output: `[batch, features]`
+///
+/// Normalizes each row to zero mean and unit variance, then applies
+/// a learnable affine transform (gamma * x + beta).
+pub struct LayerNorm<S: Scalar> {
+    pub gamma: Parameter<S>, // [features]
+    pub beta: Parameter<S>,  // [features]
+    eps: f64,
+    features: usize,
+    cached_input: Option<Tensor<S>>,
+    cached_norm: Option<Tensor<S>>, // (input - mean) / std
+}
+
+impl<S: Scalar> LayerNorm<S> {
+    pub fn new(features: usize) -> Self {
+        Self {
+            gamma: Parameter::new(Tensor::ones(Shape::from_slice(&[features]))),
+            beta: Parameter::new(Tensor::zeros(Shape::from_slice(&[features]))),
+            eps: 1e-5,
+            features,
+            cached_input: None,
+            cached_norm: None,
+        }
+    }
+}
+
+impl<S: Scalar> Module<S> for LayerNorm<S> {
+    fn forward(&mut self, input: &Tensor<S>) -> Tensor<S> {
+        assert_eq!(input.ndim(), 2, "LayerNorm input must be [batch, features]");
+        let batch = input.shape()[0];
+        let features = input.shape()[1];
+        assert_eq!(features, self.features);
+
+        self.cached_input = Some(input.clone());
+
+        let eps = S::from_f64(self.eps);
+        let n = S::from_f64(features as f64);
+
+        // Compute per-row mean and variance, then normalize
+        let mut norm_data = alloc::vec![S::ZERO; batch * features];
+        let mut out_data = alloc::vec![S::ZERO; batch * features];
+
+        for b in 0..batch {
+            // mean
+            let mut mean = S::ZERO;
+            for f in 0..features {
+                mean += input.get(&[b, f]);
+            }
+            mean = mean / n;
+
+            // variance
+            let mut var = S::ZERO;
+            for f in 0..features {
+                let diff = input.get(&[b, f]) - mean;
+                var += diff * diff;
+            }
+            var = var / n;
+
+            let inv_std = (var + eps).sqrt();
+
+            for f in 0..features {
+                let x_norm = (input.get(&[b, f]) - mean) / inv_std;
+                norm_data[b * features + f] = x_norm;
+                out_data[b * features + f] =
+                    self.gamma.data.get(&[f]) * x_norm + self.beta.data.get(&[f]);
+            }
+        }
+
+        let norm = Tensor::new(norm_data, input.shape().clone());
+        self.cached_norm = Some(norm);
+        Tensor::new(out_data, input.shape().clone())
+    }
+
+    fn backward(&mut self, grad_output: &Tensor<S>) -> Tensor<S> {
+        let input = self
+            .cached_input
+            .as_ref()
+            .expect("must call forward before backward");
+        let cached_norm = self
+            .cached_norm
+            .as_ref()
+            .expect("must call forward before backward");
+
+        let batch = input.shape()[0];
+        let features = input.shape()[1];
+        let eps = S::from_f64(self.eps);
+        let n = S::from_f64(features as f64);
+
+        // grad_gamma[f] = sum over batch of (grad_output[b,f] * cached_norm[b,f])
+        let grad_gamma = Tensor::from_fn(Shape::from_slice(&[features]), |idx| {
+            let f = idx[0];
+            let mut sum = S::ZERO;
+            for b in 0..batch {
+                sum += grad_output.get(&[b, f]) * cached_norm.get(&[b, f]);
+            }
+            sum
+        });
+        self.gamma.accumulate_grad(&grad_gamma);
+
+        // grad_beta[f] = sum over batch of grad_output[b,f]
+        let grad_beta = Tensor::from_fn(Shape::from_slice(&[features]), |idx| {
+            let f = idx[0];
+            let mut sum = S::ZERO;
+            for b in 0..batch {
+                sum += grad_output.get(&[b, f]);
+            }
+            sum
+        });
+        self.beta.accumulate_grad(&grad_beta);
+
+        // grad_input: standard layer norm backward
+        // dy_hat[b,f] = grad_output[b,f] * gamma[f]
+        // grad_input[b,f] = (1/std) * (dy_hat - mean(dy_hat) - x_norm * mean(dy_hat * x_norm))
+        //   where means are over the feature dimension
+        Tensor::from_fn(input.shape().clone(), |idx| {
+            let b = idx[0];
+            let f = idx[1];
+
+            // Recompute std for this row
+            let mut mean = S::ZERO;
+            for j in 0..features {
+                mean += input.get(&[b, j]);
+            }
+            mean = mean / n;
+
+            let mut var = S::ZERO;
+            for j in 0..features {
+                let diff = input.get(&[b, j]) - mean;
+                var += diff * diff;
+            }
+            var = var / n;
+            let inv_std = S::from_f64(1.0) / (var + eps).sqrt();
+
+            // dy_hat = grad_output * gamma (scaled gradient)
+            // Compute mean(dy_hat) and mean(dy_hat * x_norm) over features
+            let mut mean_dy = S::ZERO;
+            let mut mean_dy_xn = S::ZERO;
+            for j in 0..features {
+                let dy_hat = grad_output.get(&[b, j]) * self.gamma.data.get(&[j]);
+                mean_dy += dy_hat;
+                mean_dy_xn += dy_hat * cached_norm.get(&[b, j]);
+            }
+            mean_dy = mean_dy / n;
+            mean_dy_xn = mean_dy_xn / n;
+
+            let dy_hat = grad_output.get(&[b, f]) * self.gamma.data.get(&[f]);
+            (dy_hat - mean_dy - cached_norm.get(&[b, f]) * mean_dy_xn) * inv_std
+        })
+    }
+
+    fn parameters(&self) -> Vec<&Parameter<S>> {
+        alloc::vec![&self.gamma, &self.beta]
+    }
+
+    fn parameters_mut(&mut self) -> Vec<&mut Parameter<S>> {
+        alloc::vec![&mut self.gamma, &mut self.beta]
+    }
+
+    fn named_parameters(&self) -> Vec<(String, &Parameter<S>)> {
+        alloc::vec![
+            (String::from("gamma"), &self.gamma),
+            (String::from("beta"), &self.beta),
+        ]
+    }
+
+    fn named_parameters_mut(&mut self) -> Vec<(String, &mut Parameter<S>)> {
+        alloc::vec![
+            (String::from("gamma"), &mut self.gamma),
+            (String::from("beta"), &mut self.beta),
+        ]
+    }
+}
+
+/// Multi-head scaled dot-product attention.
+///
+/// Input: `[seq_len, d_model]` (single sequence)
+/// Output: `[seq_len, d_model]`
+///
+/// Computes Q, K, V projections, splits into heads, applies scaled dot-product
+/// attention per head, concatenates, and projects output.
+pub struct MultiHeadAttention<S: Scalar> {
+    wq: Linear<S>,
+    wk: Linear<S>,
+    wv: Linear<S>,
+    wo: Linear<S>,
+    num_heads: usize,
+    head_dim: usize,
+    d_model: usize,
+    cached_q: Option<Tensor<S>>,
+    cached_k: Option<Tensor<S>>,
+    cached_v: Option<Tensor<S>>,
+    cached_attn: Option<Tensor<S>>, // softmax weights [num_heads, seq_len, seq_len]
+    cached_input: Option<Tensor<S>>,
+}
+
+impl<S: Scalar> MultiHeadAttention<S> {
+    pub fn new(d_model: usize, num_heads: usize, seed: u64) -> Self {
+        assert!(
+            d_model % num_heads == 0,
+            "d_model must be divisible by num_heads"
+        );
+        let head_dim = d_model / num_heads;
+        Self {
+            wq: Linear::new(d_model, d_model, seed),
+            wk: Linear::new(d_model, d_model, seed.wrapping_add(1)),
+            wv: Linear::new(d_model, d_model, seed.wrapping_add(2)),
+            wo: Linear::new(d_model, d_model, seed.wrapping_add(3)),
+            num_heads,
+            head_dim,
+            d_model,
+            cached_q: None,
+            cached_k: None,
+            cached_v: None,
+            cached_attn: None,
+            cached_input: None,
+        }
+    }
+
+    /// Softmax per row of a [rows, cols] tensor.
+    fn softmax_2d(input: &Tensor<S>) -> Tensor<S> {
+        let rows = input.shape()[0];
+        let cols = input.shape()[1];
+        let mut data = alloc::vec![S::ZERO; rows * cols];
+        for r in 0..rows {
+            // Numerical stability: subtract row max
+            let mut max_val = input.get(&[r, 0]);
+            for c in 1..cols {
+                let v = input.get(&[r, c]);
+                if v > max_val {
+                    max_val = v;
+                }
+            }
+            let mut sum = S::ZERO;
+            for c in 0..cols {
+                let e = (input.get(&[r, c]) - max_val).exp();
+                data[r * cols + c] = e;
+                sum += e;
+            }
+            for c in 0..cols {
+                data[r * cols + c] = data[r * cols + c] / sum;
+            }
+        }
+        Tensor::new(data, input.shape().clone())
+    }
+}
+
+impl<S: Scalar> Module<S> for MultiHeadAttention<S> {
+    fn forward(&mut self, input: &Tensor<S>) -> Tensor<S> {
+        assert_eq!(input.ndim(), 2, "MultiHeadAttention input must be [seq_len, d_model]");
+        let seq_len = input.shape()[0];
+        assert_eq!(input.shape()[1], self.d_model);
+
+        self.cached_input = Some(input.clone());
+
+        // Project Q, K, V: [seq_len, d_model] -> [seq_len, d_model]
+        let q_full = self.wq.forward(input);
+        let k_full = self.wk.forward(input);
+        let v_full = self.wv.forward(input);
+
+        self.cached_q = Some(q_full.clone());
+        self.cached_k = Some(k_full.clone());
+        self.cached_v = Some(v_full.clone());
+
+        let scale = S::from_f64(1.0 / (self.head_dim as f64).sqrt());
+
+        // For each head, extract [seq_len, head_dim], compute attention, store results
+        // attn_weights: [num_heads, seq_len, seq_len]
+        let mut attn_data = alloc::vec![S::ZERO; self.num_heads * seq_len * seq_len];
+        // concat output: [seq_len, d_model]
+        let mut out_data = alloc::vec![S::ZERO; seq_len * self.d_model];
+
+        for h in 0..self.num_heads {
+            let offset = h * self.head_dim;
+
+            // Extract Q_h, K_h: [seq_len, head_dim]
+            let q_h = Tensor::from_fn(
+                Shape::from_slice(&[seq_len, self.head_dim]),
+                |idx| q_full.get(&[idx[0], offset + idx[1]]),
+            );
+            let k_h = Tensor::from_fn(
+                Shape::from_slice(&[seq_len, self.head_dim]),
+                |idx| k_full.get(&[idx[0], offset + idx[1]]),
+            );
+            let v_h = Tensor::from_fn(
+                Shape::from_slice(&[seq_len, self.head_dim]),
+                |idx| v_full.get(&[idx[0], offset + idx[1]]),
+            );
+
+            // scores = Q_h @ K_h^T / sqrt(head_dim) -> [seq_len, seq_len]
+            let scores = q_h.matmul(&k_h.transpose()).scale(scale);
+
+            // softmax per row
+            let attn_weights = Self::softmax_2d(&scores);
+
+            // Store attention weights for backward
+            for i in 0..seq_len {
+                for j in 0..seq_len {
+                    attn_data[h * seq_len * seq_len + i * seq_len + j] =
+                        attn_weights.get(&[i, j]);
+                }
+            }
+
+            // attn_out = attn_weights @ V_h -> [seq_len, head_dim]
+            let attn_out = attn_weights.matmul(&v_h);
+
+            // Write into concat output at the right offset
+            for i in 0..seq_len {
+                for d in 0..self.head_dim {
+                    out_data[i * self.d_model + offset + d] = attn_out.get(&[i, d]);
+                }
+            }
+        }
+
+        self.cached_attn = Some(Tensor::new(
+            attn_data,
+            Shape::from_slice(&[self.num_heads, seq_len, seq_len]),
+        ));
+
+        // concat: [seq_len, d_model] -> output projection
+        let concat = Tensor::new(out_data, Shape::from_slice(&[seq_len, self.d_model]));
+        self.wo.forward(&concat)
+    }
+
+    fn backward(&mut self, grad_output: &Tensor<S>) -> Tensor<S> {
+        let q_full = self.cached_q.as_ref().expect("must call forward before backward");
+        let k_full = self.cached_k.as_ref().expect("must call forward before backward");
+        let v_full = self.cached_v.as_ref().expect("must call forward before backward");
+        let attn = self.cached_attn.as_ref().expect("must call forward before backward");
+
+        let seq_len = q_full.shape()[0];
+        let scale = S::from_f64(1.0 / (self.head_dim as f64).sqrt());
+
+        // Backward through Wo: grad_concat = wo.backward(grad_output)
+        let grad_concat = self.wo.backward(grad_output);
+
+        // Accumulate gradients for Q, K, V projections
+        let mut grad_q_full = alloc::vec![S::ZERO; seq_len * self.d_model];
+        let mut grad_k_full = alloc::vec![S::ZERO; seq_len * self.d_model];
+        let mut grad_v_full = alloc::vec![S::ZERO; seq_len * self.d_model];
+
+        for h in 0..self.num_heads {
+            let offset = h * self.head_dim;
+
+            // Extract cached head tensors
+            let v_h = Tensor::from_fn(
+                Shape::from_slice(&[seq_len, self.head_dim]),
+                |idx| v_full.get(&[idx[0], offset + idx[1]]),
+            );
+            let q_h = Tensor::from_fn(
+                Shape::from_slice(&[seq_len, self.head_dim]),
+                |idx| q_full.get(&[idx[0], offset + idx[1]]),
+            );
+            let k_h = Tensor::from_fn(
+                Shape::from_slice(&[seq_len, self.head_dim]),
+                |idx| k_full.get(&[idx[0], offset + idx[1]]),
+            );
+
+            // Extract attention weights for this head: [seq_len, seq_len]
+            let attn_h = Tensor::from_fn(
+                Shape::from_slice(&[seq_len, seq_len]),
+                |idx| attn.get(&[h, idx[0], idx[1]]),
+            );
+
+            // grad_concat_h: [seq_len, head_dim]
+            let grad_concat_h = Tensor::from_fn(
+                Shape::from_slice(&[seq_len, self.head_dim]),
+                |idx| grad_concat.get(&[idx[0], offset + idx[1]]),
+            );
+
+            // Backward through attn_out = attn_h @ V_h
+            // grad_attn_h = grad_concat_h @ V_h^T  -> [seq_len, seq_len]
+            let grad_attn_h = grad_concat_h.matmul(&v_h.transpose());
+            // grad_v_h = attn_h^T @ grad_concat_h   -> [seq_len, head_dim]
+            let grad_v_h = attn_h.transpose().matmul(&grad_concat_h);
+
+            // Backward through softmax: grad_scores
+            // For softmax: dL/ds_i = sum_j (dL/da_j * a_j * (delta_ij - a_i))
+            //            = a_i * (dL/da_i - sum_j(dL/da_j * a_j))
+            let grad_scores = Tensor::from_fn(
+                Shape::from_slice(&[seq_len, seq_len]),
+                |idx| {
+                    let (i, j) = (idx[0], idx[1]);
+                    let a_ij = attn_h.get(&[i, j]);
+                    // dot = sum_k (grad_attn_h[i,k] * attn_h[i,k])
+                    let mut dot = S::ZERO;
+                    for k in 0..seq_len {
+                        dot += grad_attn_h.get(&[i, k]) * attn_h.get(&[i, k]);
+                    }
+                    a_ij * (grad_attn_h.get(&[i, j]) - dot)
+                },
+            );
+
+            // Backward through scores = Q_h @ K_h^T * scale
+            let grad_scores_scaled = grad_scores.scale(scale);
+
+            // grad_q_h = grad_scores_scaled @ K_h  -> [seq_len, head_dim]
+            let grad_q_h = grad_scores_scaled.matmul(&k_h);
+            // grad_k_h = grad_scores_scaled^T @ Q_h -> [seq_len, head_dim]
+            let grad_k_h = grad_scores_scaled.transpose().matmul(&q_h);
+
+            // Scatter back to full gradients
+            for i in 0..seq_len {
+                for d in 0..self.head_dim {
+                    grad_q_full[i * self.d_model + offset + d] += grad_q_h.get(&[i, d]);
+                    grad_k_full[i * self.d_model + offset + d] += grad_k_h.get(&[i, d]);
+                    grad_v_full[i * self.d_model + offset + d] += grad_v_h.get(&[i, d]);
+                }
+            }
+        }
+
+        let grad_q = Tensor::new(grad_q_full, Shape::from_slice(&[seq_len, self.d_model]));
+        let grad_k = Tensor::new(grad_k_full, Shape::from_slice(&[seq_len, self.d_model]));
+        let grad_v = Tensor::new(grad_v_full, Shape::from_slice(&[seq_len, self.d_model]));
+
+        // Backward through Wq, Wk, Wv projections
+        let grad_input_q = self.wq.backward(&grad_q);
+        let grad_input_k = self.wk.backward(&grad_k);
+        let grad_input_v = self.wv.backward(&grad_v);
+
+        // All three projections share the same input, so gradients add
+        grad_input_q.add(&grad_input_k).add(&grad_input_v)
+    }
+
+    fn parameters(&self) -> Vec<&Parameter<S>> {
+        let mut params = self.wq.parameters();
+        params.extend(self.wk.parameters());
+        params.extend(self.wv.parameters());
+        params.extend(self.wo.parameters());
+        params
+    }
+
+    fn parameters_mut(&mut self) -> Vec<&mut Parameter<S>> {
+        let mut params = self.wq.parameters_mut();
+        params.extend(self.wk.parameters_mut());
+        params.extend(self.wv.parameters_mut());
+        params.extend(self.wo.parameters_mut());
+        params
+    }
+
+    fn named_parameters(&self) -> Vec<(String, &Parameter<S>)> {
+        let mut params = Vec::new();
+        for (name, p) in self.wq.named_parameters() {
+            params.push((alloc::format!("wq.{}", name), p));
+        }
+        for (name, p) in self.wk.named_parameters() {
+            params.push((alloc::format!("wk.{}", name), p));
+        }
+        for (name, p) in self.wv.named_parameters() {
+            params.push((alloc::format!("wv.{}", name), p));
+        }
+        for (name, p) in self.wo.named_parameters() {
+            params.push((alloc::format!("wo.{}", name), p));
+        }
+        params
+    }
+
+    fn named_parameters_mut(&mut self) -> Vec<(String, &mut Parameter<S>)> {
+        let mut params = Vec::new();
+        for (name, p) in self.wq.named_parameters_mut() {
+            params.push((alloc::format!("wq.{}", name), p));
+        }
+        for (name, p) in self.wk.named_parameters_mut() {
+            params.push((alloc::format!("wk.{}", name), p));
+        }
+        for (name, p) in self.wv.named_parameters_mut() {
+            params.push((alloc::format!("wv.{}", name), p));
+        }
+        for (name, p) in self.wo.named_parameters_mut() {
+            params.push((alloc::format!("wo.{}", name), p));
+        }
+        params
+    }
+}
+
+/// Pre-norm transformer block.
+///
+/// Input: `[seq_len, d_model]`
+/// Output: `[seq_len, d_model]`
+///
+/// Architecture (pre-norm):
+/// ```text
+/// x -> LayerNorm -> MultiHeadAttention -> + residual -> LayerNorm -> FFN -> + residual
+/// ```
+pub struct TransformerBlock<S: Scalar> {
+    attn: MultiHeadAttention<S>,
+    ln1: LayerNorm<S>,
+    ln2: LayerNorm<S>,
+    ff1: Linear<S>,
+    ff2: Linear<S>,
+    relu: ReLU<S>,
+    cached_residual1: Option<Tensor<S>>,
+    cached_residual2: Option<Tensor<S>>,
+}
+
+impl<S: Scalar> TransformerBlock<S> {
+    pub fn new(d_model: usize, num_heads: usize, ff_dim: usize, seed: u64) -> Self {
+        Self {
+            attn: MultiHeadAttention::new(d_model, num_heads, seed),
+            ln1: LayerNorm::new(d_model),
+            ln2: LayerNorm::new(d_model),
+            ff1: Linear::new(d_model, ff_dim, seed.wrapping_add(10)),
+            ff2: Linear::new(ff_dim, d_model, seed.wrapping_add(11)),
+            relu: ReLU::new(),
+            cached_residual1: None,
+            cached_residual2: None,
+        }
+    }
+}
+
+impl<S: Scalar> Module<S> for TransformerBlock<S> {
+    fn forward(&mut self, input: &Tensor<S>) -> Tensor<S> {
+        // Pre-norm: LN before attention/FFN
+        let residual1 = input.clone();
+
+        let x = self.ln1.forward(input);
+        let x = self.attn.forward(&x);
+        let x = x.add(&residual1);
+
+        self.cached_residual1 = Some(residual1);
+
+        let residual2 = x.clone();
+
+        let x = self.ln2.forward(&x);
+        let x = self.ff1.forward(&x);
+        let x = self.relu.forward(&x);
+        let x = self.ff2.forward(&x);
+        let x = x.add(&residual2);
+
+        self.cached_residual2 = Some(residual2);
+
+        x
+    }
+
+    fn backward(&mut self, grad_output: &Tensor<S>) -> Tensor<S> {
+        // Backward through second residual: x = ff_out + residual2
+        // grad flows to both branches
+        let grad_ff = grad_output.clone();
+        let grad_res2 = grad_output.clone();
+
+        // Backward through FFN: ff2 -> relu -> ff1 -> ln2
+        let grad = self.ff2.backward(&grad_ff);
+        let grad = self.relu.backward(&grad);
+        let grad = self.ff1.backward(&grad);
+        let grad = self.ln2.backward(&grad);
+
+        // Add residual2 gradient
+        let grad = grad.add(&grad_res2);
+
+        // Backward through first residual: x = attn_out + residual1
+        let grad_attn = grad.clone();
+        let grad_res1 = grad.clone();
+
+        // Backward through attention -> ln1
+        let grad = self.attn.backward(&grad_attn);
+        let grad = self.ln1.backward(&grad);
+
+        // Add residual1 gradient
+        grad.add(&grad_res1)
+    }
+
+    fn parameters(&self) -> Vec<&Parameter<S>> {
+        let mut params = self.attn.parameters();
+        params.extend(self.ln1.parameters());
+        params.extend(self.ln2.parameters());
+        params.extend(self.ff1.parameters());
+        params.extend(self.ff2.parameters());
+        params
+    }
+
+    fn parameters_mut(&mut self) -> Vec<&mut Parameter<S>> {
+        let mut params = self.attn.parameters_mut();
+        params.extend(self.ln1.parameters_mut());
+        params.extend(self.ln2.parameters_mut());
+        params.extend(self.ff1.parameters_mut());
+        params.extend(self.ff2.parameters_mut());
+        params
+    }
+
+    fn named_parameters(&self) -> Vec<(String, &Parameter<S>)> {
+        let mut params = Vec::new();
+        for (name, p) in self.attn.named_parameters() {
+            params.push((alloc::format!("attn.{}", name), p));
+        }
+        for (name, p) in self.ln1.named_parameters() {
+            params.push((alloc::format!("ln1.{}", name), p));
+        }
+        for (name, p) in self.ln2.named_parameters() {
+            params.push((alloc::format!("ln2.{}", name), p));
+        }
+        for (name, p) in self.ff1.named_parameters() {
+            params.push((alloc::format!("ff1.{}", name), p));
+        }
+        for (name, p) in self.ff2.named_parameters() {
+            params.push((alloc::format!("ff2.{}", name), p));
+        }
+        params
+    }
+
+    fn named_parameters_mut(&mut self) -> Vec<(String, &mut Parameter<S>)> {
+        let mut params = Vec::new();
+        for (name, p) in self.attn.named_parameters_mut() {
+            params.push((alloc::format!("attn.{}", name), p));
+        }
+        for (name, p) in self.ln1.named_parameters_mut() {
+            params.push((alloc::format!("ln1.{}", name), p));
+        }
+        for (name, p) in self.ln2.named_parameters_mut() {
+            params.push((alloc::format!("ln2.{}", name), p));
+        }
+        for (name, p) in self.ff1.named_parameters_mut() {
+            params.push((alloc::format!("ff1.{}", name), p));
+        }
+        for (name, p) in self.ff2.named_parameters_mut() {
+            params.push((alloc::format!("ff2.{}", name), p));
+        }
+        params
+    }
+}
+
 /// Sequential container — chains modules in order.
 pub struct Sequential<S: Scalar> {
     layers: Vec<Box<dyn Module<S>>>,
