@@ -259,6 +259,81 @@ impl<S: Scalar> Tensor<S> {
         self.map(|v| if v > zero { v } else { zero })
     }
 
+    /// Sigmoid activation: 1 / (1 + exp(-x))
+    pub fn sigmoid(&self) -> Self {
+        let one = S::from_f64(1.0);
+        self.map(|v| one / (one + (S::from_f64(0.0) - v).exp()))
+    }
+
+    /// SiLU (Swish) activation: x * sigmoid(x)
+    pub fn silu(&self) -> Self {
+        let one = S::from_f64(1.0);
+        self.map(|v| v * (one / (one + (S::from_f64(0.0) - v).exp())))
+    }
+
+    /// LeakyReLU activation: x if x > 0, else alpha * x
+    pub fn leaky_relu(&self, alpha: f64) -> Self {
+        let zero = S::from_f64(0.0);
+        let a = S::from_f64(alpha);
+        self.map(|v| if v > zero { v } else { a * v })
+    }
+
+    /// ELU activation: x if x > 0, else alpha * (exp(x) - 1)
+    pub fn elu(&self, alpha: f64) -> Self {
+        let zero = S::from_f64(0.0);
+        let one = S::from_f64(1.0);
+        let a = S::from_f64(alpha);
+        self.map(|v| if v > zero { v } else { a * (v.exp() - one) })
+    }
+
+    /// Mish activation: x * tanh(softplus(x)) = x * tanh(ln(1 + exp(x)))
+    pub fn mish(&self) -> Self {
+        let one = S::from_f64(1.0);
+        self.map(|v| v * (one + v.exp()).ln().tanh())
+    }
+
+    /// GELU activation (exact): x * Phi(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    pub fn gelu(&self) -> Self {
+        let half = S::from_f64(0.5);
+        let one = S::from_f64(1.0);
+        let coeff = S::from_f64(0.7978845608028654); // sqrt(2/pi)
+        let k = S::from_f64(0.044715);
+        self.map(|v| half * v * (one + (coeff * (v + k * v * v * v)).tanh()))
+    }
+
+    /// Softmax along last axis (for 1-D or per-row for 2-D). Numerically stable.
+    pub fn softmax(&self, axis: usize) -> Self {
+        assert!(axis < self.ndim());
+        let axis_size = self.shape[axis];
+        let ndim = self.ndim();
+
+        // For each "row" along the axis, subtract max then exponentiate
+        Self::from_fn(self.shape.clone(), |idx| {
+            // Find max along axis
+            let mut max_val = {
+                let mut first_idx: Vec<usize> = idx.to_vec();
+                first_idx[axis] = 0;
+                self.get(&first_idx)
+            };
+            for k in 1..axis_size {
+                let mut probe = idx.to_vec();
+                probe[axis] = k;
+                let v = self.get(&probe);
+                if v > max_val {
+                    max_val = v;
+                }
+            }
+            // Compute exp(x - max) and sum
+            let mut sum = S::from_f64(0.0);
+            for k in 0..axis_size {
+                let mut probe = idx.to_vec();
+                probe[axis] = k;
+                sum += (self.get(&probe) - max_val).exp();
+            }
+            (self.get(idx) - max_val).exp() / sum
+        })
+    }
+
     // --- Reductions ---
 
     /// Sum all elements.
@@ -507,6 +582,95 @@ mod tests {
 
         let e = Tensor::from_slice(&[0.0_f64]).exp();
         assert!((e.get(&[0]) - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn tensor_sigmoid() {
+        let t = Tensor::from_slice(&[0.0_f64]);
+        assert!((t.sigmoid().get(&[0]) - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn tensor_silu() {
+        // silu(0) = 0 * sigmoid(0) = 0
+        let t = Tensor::from_slice(&[0.0_f64, 1.0]);
+        let s = t.silu();
+        assert!(s.get(&[0]).abs() < 1e-10);
+        // silu(1) = 1 * sigmoid(1) ≈ 0.7311
+        assert!((s.get(&[1]) - 0.7310585786).abs() < 1e-5);
+    }
+
+    #[test]
+    fn tensor_leaky_relu() {
+        let t = Tensor::from_slice(&[-2.0, 0.0, 1.0]);
+        let r = t.leaky_relu(0.01);
+        assert!((r.get(&[0]) - (-0.02)).abs() < 1e-10);
+        assert_eq!(r.get(&[1]), 0.0);
+        assert_eq!(r.get(&[2]), 1.0);
+    }
+
+    #[test]
+    fn tensor_elu() {
+        let t = Tensor::from_slice(&[-1.0, 0.0, 1.0]);
+        let r = t.elu(1.0);
+        // elu(-1) = 1.0 * (exp(-1) - 1) ≈ -0.6321
+        assert!((r.get(&[0]) - (-0.6321205588)).abs() < 1e-5);
+        assert_eq!(r.get(&[1]), 0.0);
+        assert_eq!(r.get(&[2]), 1.0);
+    }
+
+    #[test]
+    fn tensor_mish() {
+        let t = Tensor::from_slice(&[0.0_f64, 1.0]);
+        let m = t.mish();
+        // mish(0) = 0 * tanh(ln(2)) ≈ 0
+        assert!(m.get(&[0]).abs() < 1e-10);
+        // mish(1) ≈ 0.8651
+        assert!((m.get(&[1]) - 0.86509838).abs() < 1e-4);
+    }
+
+    #[test]
+    fn tensor_gelu() {
+        let t = Tensor::from_slice(&[0.0_f64, 1.0, -1.0]);
+        let g = t.gelu();
+        // gelu(0) = 0
+        assert!(g.get(&[0]).abs() < 1e-10);
+        // gelu(1) ≈ 0.8412
+        assert!((g.get(&[1]) - 0.8412).abs() < 1e-3);
+        // gelu(-1) ≈ -0.1588
+        assert!((g.get(&[2]) - (-0.1588)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn tensor_softmax() {
+        let t = Tensor::from_slice(&[1.0, 2.0, 3.0]);
+        let s = t.softmax(0);
+        assert!((s.sum() - 1.0).abs() < 1e-10);
+        // Values should be monotonically increasing
+        assert!(s.get(&[0]) < s.get(&[1]));
+        assert!(s.get(&[1]) < s.get(&[2]));
+    }
+
+    #[test]
+    fn tensor_softmax_2d() {
+        // Each row should sum to 1
+        let t = Tensor::new(
+            alloc::vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0],
+            Shape::from_slice(&[2, 3]),
+        );
+        let s = t.softmax(1);
+        for r in 0..2 {
+            let row_sum: f64 = (0..3).map(|c| s.get(&[r, c])).sum();
+            assert!((row_sum - 1.0).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn tensor_softmax_stability() {
+        // Large values shouldn't overflow
+        let t = Tensor::from_slice(&[1000.0, 1001.0, 1002.0]);
+        let s = t.softmax(0);
+        assert!((s.sum() - 1.0).abs() < 1e-10);
     }
 
     #[test]

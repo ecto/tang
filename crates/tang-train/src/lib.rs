@@ -56,8 +56,9 @@ mod trainer;
 
 pub use data::{DataLoader, Dataset, TensorDataset};
 pub use layers::{
-    Conv1d, Conv2d, Dropout, Embedding, LayerNorm, Linear, MultiHeadAttention, ReLU, Sequential,
-    Tanh, TransformerBlock,
+    Conv1d, Conv2d, Dropout, Embedding, GroupedQueryAttention, LayerNorm, Linear,
+    MultiHeadAttention, RMSNorm, ReLU, RotaryEmbedding, Sequential, SiLU, Tanh, TransformerBlock,
+    GELU,
 };
 pub use loss::{
     cross_entropy_loss, cross_entropy_loss_grad, huber_loss, mse_loss, mse_loss_grad, softmax,

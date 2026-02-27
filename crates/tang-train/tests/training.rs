@@ -1,8 +1,8 @@
 use tang_tensor::{Shape, Tensor};
 use tang_train::{
-    mse_loss, mse_loss_grad, Conv1d, Conv2d, Dropout, Embedding, LayerNorm, Linear, Module,
-    ModuleAdam, ModuleSgd, MultiHeadAttention, Optimizer, ReLU, Sequential, Tanh,
-    TransformerBlock,
+    mse_loss, mse_loss_grad, Conv1d, Conv2d, Dropout, Embedding, GroupedQueryAttention, LayerNorm,
+    Linear, Module, ModuleAdam, ModuleSgd, MultiHeadAttention, Optimizer, RMSNorm, ReLU,
+    RotaryEmbedding, Sequential, SiLU, Tanh, TransformerBlock, GELU,
 };
 
 #[test]
@@ -722,4 +722,243 @@ fn test_transformer_block_residual_connection() {
     for &v in output.data() {
         assert!(v.is_finite(), "output should be finite, got {}", v);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1 modules: SiLU, GELU, RMSNorm, RoPE, GQA
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_silu_forward_backward() {
+    let mut silu = SiLU::<f64>::new();
+    let input = Tensor::from_slice(&[-1.0, 0.0, 1.0, 2.0]);
+    let output = silu.forward(&input);
+
+    // silu(0) = 0
+    assert!(output.get(&[1]).abs() < 1e-10);
+    // silu(1) ≈ 0.7311
+    assert!((output.get(&[2]) - 0.7310585786).abs() < 1e-5);
+
+    // Backward: gradient check
+    let grad_out = Tensor::from_slice(&[1.0, 1.0, 1.0, 1.0]);
+    let grad_in = silu.backward(&grad_out);
+
+    // Finite difference check
+    let eps = 1e-5;
+    for i in 0..4 {
+        let mut inp_plus = input.clone();
+        inp_plus.data_mut()[i] += eps;
+        let out_plus = inp_plus.silu();
+
+        let mut inp_minus = input.clone();
+        inp_minus.data_mut()[i] -= eps;
+        let out_minus = inp_minus.silu();
+
+        let numerical = (out_plus.get(&[i]) - out_minus.get(&[i])) / (2.0 * eps);
+        assert!(
+            (grad_in.get(&[i]) - numerical).abs() < 1e-4,
+            "silu grad mismatch at {}: analytical={}, numerical={}",
+            i, grad_in.get(&[i]), numerical
+        );
+    }
+}
+
+#[test]
+fn test_gelu_forward_backward() {
+    let mut gelu = GELU::<f64>::new();
+    let input = Tensor::from_slice(&[-1.0, 0.0, 1.0]);
+    let output = gelu.forward(&input);
+
+    // gelu(0) = 0
+    assert!(output.get(&[1]).abs() < 1e-10);
+
+    let grad_out = Tensor::from_slice(&[1.0, 1.0, 1.0]);
+    let grad_in = gelu.backward(&grad_out);
+
+    let eps = 1e-5;
+    for i in 0..3 {
+        let mut inp_plus = input.clone();
+        inp_plus.data_mut()[i] += eps;
+        let out_plus = inp_plus.gelu();
+
+        let mut inp_minus = input.clone();
+        inp_minus.data_mut()[i] -= eps;
+        let out_minus = inp_minus.gelu();
+
+        let numerical = (out_plus.get(&[i]) - out_minus.get(&[i])) / (2.0 * eps);
+        assert!(
+            (grad_in.get(&[i]) - numerical).abs() < 1e-4,
+            "gelu grad mismatch at {}: analytical={}, numerical={}",
+            i, grad_in.get(&[i]), numerical
+        );
+    }
+}
+
+#[test]
+fn test_gelu_approximate() {
+    let mut gelu_approx = GELU::<f64>::approximate();
+    let input = Tensor::from_slice(&[0.0, 1.0, -1.0]);
+    let output = gelu_approx.forward(&input);
+    assert!(output.get(&[0]).abs() < 1e-10);
+
+    let grad_out = Tensor::from_slice(&[1.0, 1.0, 1.0]);
+    let _grad_in = gelu_approx.backward(&grad_out);
+}
+
+#[test]
+fn test_rms_norm_forward() {
+    let mut rms = RMSNorm::<f64>::new(4);
+    let input = Tensor::new(
+        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        Shape::from_slice(&[2, 4]),
+    );
+    let output = rms.forward(&input);
+    assert_eq!(output.shape().dims(), &[2, 4]);
+
+    // With weight=1, output should be x / rms(x)
+    // Row 0: rms = sqrt((1+4+9+16)/4) = sqrt(7.5)
+    let rms_val = (7.5_f64 + 1e-6).sqrt();
+    assert!((output.get(&[0, 0]) - 1.0 / rms_val).abs() < 1e-5);
+}
+
+#[test]
+fn test_rms_norm_backward_gradient_check() {
+    let mut rms = RMSNorm::<f64>::new(3);
+    let input = Tensor::new(
+        vec![1.0, 3.0, 2.0, 4.0, 1.0, 5.0],
+        Shape::from_slice(&[2, 3]),
+    );
+    let eps = 1e-5;
+
+    let _out = rms.forward(&input);
+    let grad_output = Tensor::new(vec![1.0; 6], Shape::from_slice(&[2, 3]));
+    let grad_input = rms.backward(&grad_output);
+
+    let mut input_mut = input.clone();
+    for b in 0..2 {
+        for j in 0..3 {
+            let orig = input_mut.get(&[b, j]);
+
+            input_mut.set(&[b, j], orig + eps);
+            let out_plus = rms.forward(&input_mut);
+            let loss_plus: f64 = out_plus.data().iter().sum();
+
+            input_mut.set(&[b, j], orig - eps);
+            let out_minus = rms.forward(&input_mut);
+            let loss_minus: f64 = out_minus.data().iter().sum();
+
+            input_mut.set(&[b, j], orig);
+
+            let numerical = (loss_plus - loss_minus) / (2.0 * eps);
+            let analytical = grad_input.get(&[b, j]);
+            assert!(
+                (numerical - analytical).abs() < 1e-3,
+                "rmsnorm input grad mismatch at [{},{}]: numerical={}, analytical={}",
+                b, j, numerical, analytical
+            );
+        }
+    }
+}
+
+#[test]
+fn test_rms_norm_named_parameters() {
+    let rms = RMSNorm::<f64>::new(8);
+    let names: Vec<String> = rms.named_parameters().iter().map(|(n, _)| n.clone()).collect();
+    assert_eq!(names, vec!["weight"]);
+}
+
+#[test]
+fn test_rope_basic() {
+    let rope = RotaryEmbedding::<f64>::new(4, 32);
+
+    // Create input [seq_len=2, dim=4]
+    let input = Tensor::new(
+        vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+        Shape::from_slice(&[2, 4]),
+    );
+    let rotated = rope.apply(&input, 0);
+    assert_eq!(rotated.shape().dims(), &[2, 4]);
+
+    // Position 0 should not change (cos(0)=1, sin(0)=0)
+    assert!((rotated.get(&[0, 0]) - 1.0).abs() < 1e-10);
+    assert!((rotated.get(&[0, 1])).abs() < 1e-10);
+
+    // Position 1 should be rotated
+    // The rotation should change values since sin(theta) != 0
+    let changed = (0..4).any(|d| (rotated.get(&[1, d]) - input.get(&[1, d])).abs() > 1e-5);
+    assert!(changed, "RoPE should rotate position 1");
+}
+
+#[test]
+fn test_rope_relative_position() {
+    let rope = RotaryEmbedding::<f64>::new(4, 64);
+
+    // Two identical vectors at different positions should produce different dot products
+    // that encode relative position
+    let q = Tensor::new(vec![1.0, 0.0, 0.0, 1.0], Shape::from_slice(&[1, 4]));
+    let k = q.clone();
+
+    let q_rot_0 = rope.apply(&q, 0);
+    let k_rot_0 = rope.apply(&k, 0);
+    let q_rot_5 = rope.apply(&q, 5);
+    let k_rot_5 = rope.apply(&k, 5);
+
+    // Same relative position (0,0) vs (5,5) should give same dot product
+    let dot_same_0: f64 = (0..4).map(|d| q_rot_0.get(&[0, d]) * k_rot_0.get(&[0, d])).sum();
+    let dot_same_5: f64 = (0..4).map(|d| q_rot_5.get(&[0, d]) * k_rot_5.get(&[0, d])).sum();
+    assert!(
+        (dot_same_0 - dot_same_5).abs() < 1e-10,
+        "same relative position should give same dot product: {} vs {}",
+        dot_same_0, dot_same_5
+    );
+}
+
+#[test]
+fn test_gqa_forward_shape() {
+    // Standard MHA: num_kv_heads == num_heads
+    let mut gqa = GroupedQueryAttention::<f64>::new(8, 4, 4, 42);
+    let input = Tensor::new(vec![0.1; 3 * 8], Shape::from_slice(&[3, 8]));
+    let output = gqa.forward(&input);
+    assert_eq!(output.shape().dims(), &[3, 8]);
+}
+
+#[test]
+fn test_gqa_multi_query() {
+    // MQA: num_kv_heads == 1
+    let mut gqa = GroupedQueryAttention::<f64>::new(8, 4, 1, 42);
+    let input = Tensor::new(vec![0.1; 3 * 8], Shape::from_slice(&[3, 8]));
+    let output = gqa.forward(&input);
+    assert_eq!(output.shape().dims(), &[3, 8]);
+}
+
+#[test]
+fn test_gqa_grouped() {
+    // GQA: 8 Q heads, 2 KV heads (groups of 4)
+    let mut gqa = GroupedQueryAttention::<f64>::new(16, 8, 2, 42);
+    let input = Tensor::new(vec![0.1; 4 * 16], Shape::from_slice(&[4, 16]));
+    let output = gqa.forward(&input);
+    assert_eq!(output.shape().dims(), &[4, 16]);
+}
+
+#[test]
+fn test_gqa_backward_runs() {
+    let mut gqa = GroupedQueryAttention::<f64>::new(8, 4, 2, 42);
+    let input = Tensor::new(vec![0.1; 3 * 8], Shape::from_slice(&[3, 8]));
+    let _output = gqa.forward(&input);
+    let grad = Tensor::new(vec![1.0; 3 * 8], Shape::from_slice(&[3, 8]));
+    let grad_input = gqa.backward(&grad);
+    assert_eq!(grad_input.shape().dims(), &[3, 8]);
+
+    let has_grads = gqa.parameters().iter().any(|p| p.grad.is_some());
+    assert!(has_grads, "GQA backward should accumulate gradients");
+}
+
+#[test]
+fn test_gqa_named_parameters() {
+    let gqa = GroupedQueryAttention::<f64>::new(8, 4, 2, 42);
+    let names: Vec<String> = gqa.named_parameters().iter().map(|(n, _)| n.clone()).collect();
+    assert!(names.contains(&"wq.weight".to_string()));
+    assert!(names.contains(&"wk.weight".to_string()));
+    assert!(names.contains(&"wv.weight".to_string()));
+    assert!(names.contains(&"wo.weight".to_string()));
 }

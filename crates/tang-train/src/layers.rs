@@ -1259,6 +1259,648 @@ impl<S: Scalar> Module<S> for TransformerBlock<S> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SiLU (Swish) activation module
+// ---------------------------------------------------------------------------
+
+/// SiLU activation (x * sigmoid(x)), used in LLaMA/Mistral FFN.
+pub struct SiLU<S: Scalar> {
+    cached_input: Option<Tensor<S>>,
+}
+
+impl<S: Scalar> SiLU<S> {
+    pub fn new() -> Self {
+        Self { cached_input: None }
+    }
+}
+
+impl<S: Scalar> Default for SiLU<S> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<S: Scalar> Module<S> for SiLU<S> {
+    fn forward(&mut self, input: &Tensor<S>) -> Tensor<S> {
+        self.cached_input = Some(input.clone());
+        input.silu()
+    }
+
+    fn backward(&mut self, grad_output: &Tensor<S>) -> Tensor<S> {
+        let input = self
+            .cached_input
+            .as_ref()
+            .expect("must call forward before backward");
+        // d/dx silu(x) = sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x))
+        //              = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+        let one = S::from_f64(1.0);
+        let sig = input.sigmoid();
+        let dsilu = Tensor::from_fn(input.shape().clone(), |idx| {
+            let s = sig.get(idx);
+            let x = input.get(idx);
+            s * (one + x * (one - s))
+        });
+        grad_output.mul(&dsilu)
+    }
+
+    fn parameters(&self) -> Vec<&Parameter<S>> {
+        Vec::new()
+    }
+    fn parameters_mut(&mut self) -> Vec<&mut Parameter<S>> {
+        Vec::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GELU activation module (exact and approximate)
+// ---------------------------------------------------------------------------
+
+/// GELU activation with exact or tanh-approximate mode.
+pub struct GELU<S: Scalar> {
+    approximate: bool,
+    cached_input: Option<Tensor<S>>,
+    _marker: core::marker::PhantomData<S>,
+}
+
+impl<S: Scalar> GELU<S> {
+    /// Create GELU with exact computation.
+    pub fn new() -> Self {
+        Self {
+            approximate: false,
+            cached_input: None,
+            _marker: core::marker::PhantomData,
+        }
+    }
+
+    /// Create GELU with tanh approximation (used by many pretrained models).
+    pub fn approximate() -> Self {
+        Self {
+            approximate: true,
+            cached_input: None,
+            _marker: core::marker::PhantomData,
+        }
+    }
+}
+
+impl<S: Scalar> Default for GELU<S> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<S: Scalar> Module<S> for GELU<S> {
+    fn forward(&mut self, input: &Tensor<S>) -> Tensor<S> {
+        self.cached_input = Some(input.clone());
+        input.gelu()
+    }
+
+    fn backward(&mut self, grad_output: &Tensor<S>) -> Tensor<S> {
+        let input = self
+            .cached_input
+            .as_ref()
+            .expect("must call forward before backward");
+        let half = S::from_f64(0.5);
+        let one = S::from_f64(1.0);
+        let coeff = S::from_f64(0.7978845608028654); // sqrt(2/pi)
+        let k = S::from_f64(0.044715);
+
+        if self.approximate {
+            // d/dx gelu_approx(x) = 0.5 * (1 + t) + 0.5 * x * (1 - t^2) * coeff * (1 + 3*k*x^2)
+            // where t = tanh(coeff * (x + k * x^3))
+            let three_k = S::from_f64(3.0 * 0.044715);
+            let dgelu = Tensor::from_fn(input.shape().clone(), |idx| {
+                let x = input.get(idx);
+                let inner = coeff * (x + k * x * x * x);
+                let t = inner.tanh();
+                half * (one + t) + half * x * (one - t * t) * coeff * (one + three_k * x * x)
+            });
+            grad_output.mul(&dgelu)
+        } else {
+            // Same formula — the forward uses the tanh approximation in both cases
+            let three_k = S::from_f64(3.0 * 0.044715);
+            let dgelu = Tensor::from_fn(input.shape().clone(), |idx| {
+                let x = input.get(idx);
+                let inner = coeff * (x + k * x * x * x);
+                let t = inner.tanh();
+                half * (one + t) + half * x * (one - t * t) * coeff * (one + three_k * x * x)
+            });
+            grad_output.mul(&dgelu)
+        }
+    }
+
+    fn parameters(&self) -> Vec<&Parameter<S>> {
+        Vec::new()
+    }
+    fn parameters_mut(&mut self) -> Vec<&mut Parameter<S>> {
+        Vec::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RMSNorm — used by LLaMA, Mistral, Gemma
+// ---------------------------------------------------------------------------
+
+/// Root Mean Square Layer Normalization.
+///
+/// `y = x / sqrt(mean(x^2) + eps) * weight`
+///
+/// Simpler and faster than LayerNorm — no mean subtraction or bias.
+pub struct RMSNorm<S: Scalar> {
+    pub weight: Parameter<S>, // [features]
+    eps: f64,
+    features: usize,
+    cached_input: Option<Tensor<S>>,
+    cached_rms: Option<Tensor<S>>, // [batch] — rms values per row
+}
+
+impl<S: Scalar> RMSNorm<S> {
+    pub fn new(features: usize) -> Self {
+        Self {
+            weight: Parameter::new(Tensor::ones(Shape::from_slice(&[features]))),
+            eps: 1e-6,
+            features,
+            cached_input: None,
+            cached_rms: None,
+        }
+    }
+}
+
+impl<S: Scalar> Module<S> for RMSNorm<S> {
+    fn forward(&mut self, input: &Tensor<S>) -> Tensor<S> {
+        assert_eq!(input.ndim(), 2, "RMSNorm input must be [batch, features]");
+        let batch = input.shape()[0];
+        let features = input.shape()[1];
+        assert_eq!(features, self.features);
+
+        self.cached_input = Some(input.clone());
+
+        let eps = S::from_f64(self.eps);
+        let n = S::from_f64(features as f64);
+
+        let mut rms_data = alloc::vec![S::ZERO; batch];
+        let mut out_data = alloc::vec![S::ZERO; batch * features];
+
+        for b in 0..batch {
+            // mean(x^2)
+            let mut sq_sum = S::ZERO;
+            for f in 0..features {
+                let x = input.get(&[b, f]);
+                sq_sum += x * x;
+            }
+            let rms = (sq_sum / n + eps).sqrt();
+            rms_data[b] = rms;
+
+            for f in 0..features {
+                let x_norm = input.get(&[b, f]) / rms;
+                out_data[b * features + f] = self.weight.data.get(&[f]) * x_norm;
+            }
+        }
+
+        self.cached_rms = Some(Tensor::new(rms_data, Shape::from_slice(&[batch])));
+        Tensor::new(out_data, input.shape().clone())
+    }
+
+    fn backward(&mut self, grad_output: &Tensor<S>) -> Tensor<S> {
+        let input = self
+            .cached_input
+            .as_ref()
+            .expect("must call forward before backward");
+        let rms = self
+            .cached_rms
+            .as_ref()
+            .expect("must call forward before backward");
+
+        let batch = input.shape()[0];
+        let features = input.shape()[1];
+        let n = S::from_f64(features as f64);
+
+        // Gradient w.r.t. weight: sum over batch of grad_output * (x / rms)
+        let mut grad_weight = alloc::vec![S::ZERO; features];
+        let mut grad_input_data = alloc::vec![S::ZERO; batch * features];
+
+        for b in 0..batch {
+            let r = rms.get(&[b]);
+            let inv_r = S::from_f64(1.0) / r;
+
+            // Accumulate weight gradient
+            for f in 0..features {
+                let x_norm = input.get(&[b, f]) * inv_r;
+                grad_weight[f] += grad_output.get(&[b, f]) * x_norm;
+            }
+
+            // grad_input: need to backprop through x / rms(x) * weight
+            // d/dx_i (x_i / rms * w_i) considering rms depends on all x
+            // = w_i / rms - w_i * x_i * (x_i / (n * rms^3))... simplified:
+            // = (w * grad_out) / rms - x * dot(w * grad_out, x) / (n * rms^3)
+            let mut dot = S::ZERO;
+            for f in 0..features {
+                dot += self.weight.data.get(&[f]) * grad_output.get(&[b, f]) * input.get(&[b, f]);
+            }
+
+            for f in 0..features {
+                let w_grad = self.weight.data.get(&[f]) * grad_output.get(&[b, f]);
+                grad_input_data[b * features + f] =
+                    (w_grad - input.get(&[b, f]) * dot / (n * r * r)) * inv_r;
+            }
+        }
+
+        // Accumulate weight gradient
+        let grad_w = Tensor::new(grad_weight, Shape::from_slice(&[features]));
+        self.weight.accumulate_grad(&grad_w);
+
+        Tensor::new(grad_input_data, input.shape().clone())
+    }
+
+    fn parameters(&self) -> Vec<&Parameter<S>> {
+        alloc::vec![&self.weight]
+    }
+
+    fn parameters_mut(&mut self) -> Vec<&mut Parameter<S>> {
+        alloc::vec![&mut self.weight]
+    }
+
+    fn named_parameters(&self) -> Vec<(String, &Parameter<S>)> {
+        alloc::vec![(String::from("weight"), &self.weight)]
+    }
+
+    fn named_parameters_mut(&mut self) -> Vec<(String, &mut Parameter<S>)> {
+        alloc::vec![(String::from("weight"), &mut self.weight)]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rotary Position Embedding (RoPE)
+// ---------------------------------------------------------------------------
+
+/// Rotary Position Embedding — applies position-dependent rotation to Q and K.
+///
+/// Used by LLaMA, Mistral, GPT-NeoX. Encodes relative position information
+/// by rotating pairs of dimensions by position-dependent angles.
+pub struct RotaryEmbedding<S: Scalar> {
+    dim: usize,
+    max_seq_len: usize,
+    base: f64,
+    cos_cache: Tensor<S>, // [max_seq_len, dim/2]
+    sin_cache: Tensor<S>, // [max_seq_len, dim/2]
+}
+
+impl<S: Scalar> RotaryEmbedding<S> {
+    pub fn new(dim: usize, max_seq_len: usize) -> Self {
+        Self::with_base(dim, max_seq_len, 10000.0)
+    }
+
+    pub fn with_base(dim: usize, max_seq_len: usize, base: f64) -> Self {
+        assert!(dim % 2 == 0, "RoPE dim must be even");
+        let half = dim / 2;
+
+        // Precompute cos/sin tables: theta_i = 1 / base^(2i/dim)
+        let cos_cache = Tensor::from_fn(
+            Shape::from_slice(&[max_seq_len, half]),
+            |idx| {
+                let pos = idx[0] as f64;
+                let i = idx[1] as f64;
+                let theta = pos / base.powf(2.0 * i / dim as f64);
+                S::from_f64(theta.cos())
+            },
+        );
+        let sin_cache = Tensor::from_fn(
+            Shape::from_slice(&[max_seq_len, half]),
+            |idx| {
+                let pos = idx[0] as f64;
+                let i = idx[1] as f64;
+                let theta = pos / base.powf(2.0 * i / dim as f64);
+                S::from_f64(theta.sin())
+            },
+        );
+
+        Self {
+            dim,
+            max_seq_len,
+            base,
+            cos_cache,
+            sin_cache,
+        }
+    }
+
+    /// Apply RoPE to a tensor of shape [seq_len, dim].
+    /// Rotates pairs (x[2i], x[2i+1]) by position-dependent angle.
+    pub fn apply(&self, x: &Tensor<S>, offset: usize) -> Tensor<S> {
+        assert_eq!(x.ndim(), 2);
+        let seq_len = x.shape()[0];
+        assert_eq!(x.shape()[1], self.dim);
+        assert!(
+            offset + seq_len <= self.max_seq_len,
+            "sequence exceeds max_seq_len"
+        );
+        let half = self.dim / 2;
+
+        Tensor::from_fn(x.shape().clone(), |idx| {
+            let pos = idx[0];
+            let d = idx[1];
+            let pair = d / 2;
+            let cos_val = self.cos_cache.get(&[offset + pos, pair]);
+            let sin_val = self.sin_cache.get(&[offset + pos, pair]);
+
+            if d % 2 == 0 {
+                // x_even * cos - x_odd * sin
+                x.get(&[pos, d]) * cos_val - x.get(&[pos, d + 1]) * sin_val
+            } else {
+                // x_even * sin + x_odd * cos
+                x.get(&[pos, d - 1]) * sin_val + x.get(&[pos, d]) * cos_val
+            }
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Grouped-Query Attention (GQA)
+// ---------------------------------------------------------------------------
+
+/// Grouped-Query Attention — generalizes MHA, MQA, and standard attention.
+///
+/// - `num_kv_heads == num_heads`: standard multi-head attention
+/// - `num_kv_heads == 1`: multi-query attention (MQA)
+/// - `1 < num_kv_heads < num_heads`: grouped-query attention (GQA)
+///
+/// Used by LLaMA 2 70B, Mistral, etc. for efficient inference.
+pub struct GroupedQueryAttention<S: Scalar> {
+    wq: Linear<S>,
+    wk: Linear<S>,
+    wv: Linear<S>,
+    wo: Linear<S>,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    d_model: usize,
+    cached_q: Option<Tensor<S>>,
+    cached_k: Option<Tensor<S>>,
+    cached_v: Option<Tensor<S>>,
+    cached_attn: Option<Tensor<S>>,
+    cached_input: Option<Tensor<S>>,
+}
+
+impl<S: Scalar> GroupedQueryAttention<S> {
+    pub fn new(
+        d_model: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        seed: u64,
+    ) -> Self {
+        assert!(
+            num_heads % num_kv_heads == 0,
+            "num_heads must be divisible by num_kv_heads"
+        );
+        let head_dim = d_model / num_heads;
+        let kv_dim = num_kv_heads * head_dim;
+
+        Self {
+            wq: Linear::new(d_model, d_model, seed),
+            wk: Linear::new(d_model, kv_dim, seed.wrapping_add(1)),
+            wv: Linear::new(d_model, kv_dim, seed.wrapping_add(2)),
+            wo: Linear::new(d_model, d_model, seed.wrapping_add(3)),
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            d_model,
+            cached_q: None,
+            cached_k: None,
+            cached_v: None,
+            cached_attn: None,
+            cached_input: None,
+        }
+    }
+
+    /// Softmax per row of a [rows, cols] tensor.
+    fn softmax_2d(input: &Tensor<S>) -> Tensor<S> {
+        let rows = input.shape()[0];
+        let cols = input.shape()[1];
+        let mut data = alloc::vec![S::ZERO; rows * cols];
+        for r in 0..rows {
+            let mut max_val = input.get(&[r, 0]);
+            for c in 1..cols {
+                let v = input.get(&[r, c]);
+                if v > max_val {
+                    max_val = v;
+                }
+            }
+            let mut sum = S::ZERO;
+            for c in 0..cols {
+                let e = (input.get(&[r, c]) - max_val).exp();
+                data[r * cols + c] = e;
+                sum += e;
+            }
+            for c in 0..cols {
+                data[r * cols + c] = data[r * cols + c] / sum;
+            }
+        }
+        Tensor::new(data, input.shape().clone())
+    }
+}
+
+impl<S: Scalar> Module<S> for GroupedQueryAttention<S> {
+    fn forward(&mut self, input: &Tensor<S>) -> Tensor<S> {
+        assert_eq!(input.ndim(), 2, "GQA input must be [seq_len, d_model]");
+        let seq_len = input.shape()[0];
+        assert_eq!(input.shape()[1], self.d_model);
+
+        self.cached_input = Some(input.clone());
+
+        let q_full = self.wq.forward(input);  // [seq_len, d_model]
+        let k_full = self.wk.forward(input);  // [seq_len, kv_dim]
+        let v_full = self.wv.forward(input);  // [seq_len, kv_dim]
+
+        self.cached_q = Some(q_full.clone());
+        self.cached_k = Some(k_full.clone());
+        self.cached_v = Some(v_full.clone());
+
+        let scale = S::from_f64(1.0 / (self.head_dim as f64).sqrt());
+        let heads_per_kv = self.num_heads / self.num_kv_heads;
+
+        let mut attn_data = alloc::vec![S::ZERO; self.num_heads * seq_len * seq_len];
+        let mut out_data = alloc::vec![S::ZERO; seq_len * self.d_model];
+
+        for h in 0..self.num_heads {
+            let q_offset = h * self.head_dim;
+            let kv_group = h / heads_per_kv;
+            let kv_offset = kv_group * self.head_dim;
+
+            let q_h = Tensor::from_fn(
+                Shape::from_slice(&[seq_len, self.head_dim]),
+                |idx| q_full.get(&[idx[0], q_offset + idx[1]]),
+            );
+            let k_h = Tensor::from_fn(
+                Shape::from_slice(&[seq_len, self.head_dim]),
+                |idx| k_full.get(&[idx[0], kv_offset + idx[1]]),
+            );
+            let v_h = Tensor::from_fn(
+                Shape::from_slice(&[seq_len, self.head_dim]),
+                |idx| v_full.get(&[idx[0], kv_offset + idx[1]]),
+            );
+
+            let scores = q_h.matmul(&k_h.transpose()).scale(scale);
+            let attn_weights = Self::softmax_2d(&scores);
+
+            for i in 0..seq_len {
+                for j in 0..seq_len {
+                    attn_data[h * seq_len * seq_len + i * seq_len + j] =
+                        attn_weights.get(&[i, j]);
+                }
+            }
+
+            let attn_out = attn_weights.matmul(&v_h);
+            for i in 0..seq_len {
+                for d in 0..self.head_dim {
+                    out_data[i * self.d_model + q_offset + d] = attn_out.get(&[i, d]);
+                }
+            }
+        }
+
+        self.cached_attn = Some(Tensor::new(
+            attn_data,
+            Shape::from_slice(&[self.num_heads, seq_len, seq_len]),
+        ));
+
+        let concat = Tensor::new(out_data, Shape::from_slice(&[seq_len, self.d_model]));
+        self.wo.forward(&concat)
+    }
+
+    fn backward(&mut self, grad_output: &Tensor<S>) -> Tensor<S> {
+        let q_full = self.cached_q.as_ref().expect("must call forward before backward");
+        let k_full = self.cached_k.as_ref().expect("must call forward before backward");
+        let v_full = self.cached_v.as_ref().expect("must call forward before backward");
+        let attn = self.cached_attn.as_ref().expect("must call forward before backward");
+
+        let seq_len = q_full.shape()[0];
+        let kv_dim = self.num_kv_heads * self.head_dim;
+        let scale = S::from_f64(1.0 / (self.head_dim as f64).sqrt());
+        let heads_per_kv = self.num_heads / self.num_kv_heads;
+
+        let grad_concat = self.wo.backward(grad_output);
+
+        let mut grad_q_full = alloc::vec![S::ZERO; seq_len * self.d_model];
+        let mut grad_k_full = alloc::vec![S::ZERO; seq_len * kv_dim];
+        let mut grad_v_full = alloc::vec![S::ZERO; seq_len * kv_dim];
+
+        for h in 0..self.num_heads {
+            let q_offset = h * self.head_dim;
+            let kv_group = h / heads_per_kv;
+            let kv_offset = kv_group * self.head_dim;
+
+            let v_h = Tensor::from_fn(
+                Shape::from_slice(&[seq_len, self.head_dim]),
+                |idx| v_full.get(&[idx[0], kv_offset + idx[1]]),
+            );
+            let q_h = Tensor::from_fn(
+                Shape::from_slice(&[seq_len, self.head_dim]),
+                |idx| q_full.get(&[idx[0], q_offset + idx[1]]),
+            );
+            let k_h = Tensor::from_fn(
+                Shape::from_slice(&[seq_len, self.head_dim]),
+                |idx| k_full.get(&[idx[0], kv_offset + idx[1]]),
+            );
+
+            let attn_h = Tensor::from_fn(
+                Shape::from_slice(&[seq_len, seq_len]),
+                |idx| attn.get(&[h, idx[0], idx[1]]),
+            );
+
+            let grad_concat_h = Tensor::from_fn(
+                Shape::from_slice(&[seq_len, self.head_dim]),
+                |idx| grad_concat.get(&[idx[0], q_offset + idx[1]]),
+            );
+
+            let grad_attn_h = grad_concat_h.matmul(&v_h.transpose());
+            let grad_v_h = attn_h.transpose().matmul(&grad_concat_h);
+
+            let grad_scores = Tensor::from_fn(
+                Shape::from_slice(&[seq_len, seq_len]),
+                |idx| {
+                    let (i, j) = (idx[0], idx[1]);
+                    let a_ij = attn_h.get(&[i, j]);
+                    let mut dot = S::ZERO;
+                    for k in 0..seq_len {
+                        dot += grad_attn_h.get(&[i, k]) * attn_h.get(&[i, k]);
+                    }
+                    a_ij * (grad_attn_h.get(&[i, j]) - dot)
+                },
+            );
+
+            let grad_scores_scaled = grad_scores.scale(scale);
+            let grad_q_h = grad_scores_scaled.matmul(&k_h);
+            let grad_k_h = grad_scores_scaled.transpose().matmul(&q_h);
+
+            for i in 0..seq_len {
+                for d in 0..self.head_dim {
+                    grad_q_full[i * self.d_model + q_offset + d] += grad_q_h.get(&[i, d]);
+                    // KV grads accumulate across all Q heads sharing this KV group
+                    grad_k_full[i * kv_dim + kv_offset + d] += grad_k_h.get(&[i, d]);
+                    grad_v_full[i * kv_dim + kv_offset + d] += grad_v_h.get(&[i, d]);
+                }
+            }
+        }
+
+        let grad_q = Tensor::new(grad_q_full, Shape::from_slice(&[seq_len, self.d_model]));
+        let grad_k = Tensor::new(grad_k_full, Shape::from_slice(&[seq_len, kv_dim]));
+        let grad_v = Tensor::new(grad_v_full, Shape::from_slice(&[seq_len, kv_dim]));
+
+        let grad_input_q = self.wq.backward(&grad_q);
+        let grad_input_k = self.wk.backward(&grad_k);
+        let grad_input_v = self.wv.backward(&grad_v);
+
+        grad_input_q.add(&grad_input_k).add(&grad_input_v)
+    }
+
+    fn parameters(&self) -> Vec<&Parameter<S>> {
+        let mut params = self.wq.parameters();
+        params.extend(self.wk.parameters());
+        params.extend(self.wv.parameters());
+        params.extend(self.wo.parameters());
+        params
+    }
+
+    fn parameters_mut(&mut self) -> Vec<&mut Parameter<S>> {
+        let mut params = self.wq.parameters_mut();
+        params.extend(self.wk.parameters_mut());
+        params.extend(self.wv.parameters_mut());
+        params.extend(self.wo.parameters_mut());
+        params
+    }
+
+    fn named_parameters(&self) -> Vec<(String, &Parameter<S>)> {
+        let mut params = Vec::new();
+        for (name, p) in self.wq.named_parameters() {
+            params.push((alloc::format!("wq.{}", name), p));
+        }
+        for (name, p) in self.wk.named_parameters() {
+            params.push((alloc::format!("wk.{}", name), p));
+        }
+        for (name, p) in self.wv.named_parameters() {
+            params.push((alloc::format!("wv.{}", name), p));
+        }
+        for (name, p) in self.wo.named_parameters() {
+            params.push((alloc::format!("wo.{}", name), p));
+        }
+        params
+    }
+
+    fn named_parameters_mut(&mut self) -> Vec<(String, &mut Parameter<S>)> {
+        let mut params = Vec::new();
+        for (name, p) in self.wq.named_parameters_mut() {
+            params.push((alloc::format!("wq.{}", name), p));
+        }
+        for (name, p) in self.wk.named_parameters_mut() {
+            params.push((alloc::format!("wk.{}", name), p));
+        }
+        for (name, p) in self.wv.named_parameters_mut() {
+            params.push((alloc::format!("wv.{}", name), p));
+        }
+        for (name, p) in self.wo.named_parameters_mut() {
+            params.push((alloc::format!("wo.{}", name), p));
+        }
+        params
+    }
+}
+
 /// Sequential container — chains modules in order.
 pub struct Sequential<S: Scalar> {
     layers: Vec<Box<dyn Module<S>>>,
