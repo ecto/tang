@@ -34,6 +34,7 @@ pub fn reduce_mean(
     reduce_op(device, cache, input, axis, ReduceOp::Mean)
 }
 
+#[derive(Clone, Copy)]
 enum ReduceOp {
     Sum,
     Max,
@@ -50,9 +51,6 @@ fn reduce_op(
     let shape = input.shape();
     assert!(axis < shape.len(), "reduce: axis out of bounds");
 
-    // Flush pending GPU commands before CPU readback
-    cache.flush(device);
-
     let axis_size = shape[axis];
     let mut out_shape: Vec<usize> = shape.to_vec();
     out_shape.remove(axis);
@@ -61,66 +59,72 @@ fn reduce_op(
     }
     let out_numel: usize = out_shape.iter().product();
 
-    // Compute strides of input
-    let ndim = shape.len();
-    let mut strides = vec![1usize; ndim];
-    for i in (0..ndim - 1).rev() {
-        strides[i] = strides[i + 1] * shape[i + 1];
-    }
-    let axis_stride = strides[axis];
+    // inner_size = product of dimensions after the axis
+    let inner_size: usize = shape[axis + 1..].iter().product();
 
-    // For simplicity, do the reduction on CPU using downloaded data.
-    // This is fine for moderate sizes — GPU reduction with atomics
-    // would be the next optimization.
-    let data = input.buffer.to_vec_sync(device);
+    let out = GpuTensor::uninit(device, &out_shape);
 
-    let mut out_data = vec![0.0f32; out_numel];
-
-    // For each output element, reduce across the axis
-    let out_strides = {
-        let mut s = vec![1usize; out_shape.len()];
-        for i in (0..out_shape.len().saturating_sub(1)).rev() {
-            s[i] = s[i + 1] * out_shape[i + 1];
-        }
-        s
+    // op_code: 0 = sum, 1 = max, 2 = mean
+    let op_code = match op {
+        ReduceOp::Sum => 0u32,
+        ReduceOp::Max => 1,
+        ReduceOp::Mean => 2,
     };
 
-    for (out_idx, out_val) in out_data.iter_mut().enumerate() {
-        // Convert flat out_idx to multi-index in output shape
-        let mut remaining = out_idx;
-        let mut in_base = 0usize;
-        for (d, &stride) in out_strides.iter().enumerate() {
-            let coord = remaining / stride;
-            remaining %= stride;
-            // Map output dim back to input dim
-            let in_dim = if d < axis { d } else { d + 1 };
-            in_base += coord * strides[in_dim];
-        }
+    let wgsl = r#"// Reduce along an axis: one thread per output element
 
-        let init = match op {
-            ReduceOp::Sum | ReduceOp::Mean => 0.0f32,
-            ReduceOp::Max => f32::NEG_INFINITY,
-        };
+struct Params {
+    count: u32,
+    axis_size: u32,
+    inner_size: u32,
+    op_code: u32,
+}
 
-        let mut acc = init;
-        for k in 0..axis_size {
-            let val = data[in_base + k * axis_stride];
-            match op {
-                ReduceOp::Sum | ReduceOp::Mean => acc += val,
-                ReduceOp::Max => {
-                    if val > acc {
-                        acc = val;
-                    }
-                }
-            }
-        }
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
 
-        if matches!(op, ReduceOp::Mean) {
-            acc /= axis_size as f32;
-        }
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.count) { return; }
 
-        *out_val = acc;
+    let outer_idx = idx / params.inner_size;
+    let inner_idx = idx % params.inner_size;
+    let base = outer_idx * (params.axis_size * params.inner_size) + inner_idx;
+    let stride = params.inner_size;
+
+    var acc: f32;
+    if (params.op_code == 1u) {
+        acc = -3.402823e+38; // f32 MIN
+    } else {
+        acc = 0.0;
     }
 
-    GpuTensor::from_slice(device, &out_data, &out_shape)
+    for (var k: u32 = 0u; k < params.axis_size; k = k + 1u) {
+        let val = input[base + k * stride];
+        if (params.op_code == 1u) {
+            acc = max(acc, val);
+        } else {
+            acc = acc + val;
+        }
+    }
+
+    if (params.op_code == 2u) {
+        acc = acc / f32(params.axis_size);
+    }
+
+    output[idx] = acc;
+}
+"#;
+
+    cache.dispatch_with_params(
+        device,
+        wgsl,
+        &input.buffer,
+        &out.buffer,
+        &[out_numel as u32, axis_size as u32, inner_size as u32, op_code],
+    );
+
+    out
 }
