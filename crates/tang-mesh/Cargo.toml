@@ -1,0 +1,42 @@
+[package]
+name = "tang-mesh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Distributed expression graph execution for tang"
+
+[features]
+default = []
+mdns = ["dep:mdns-sd"]
+
+[dependencies]
+tang = { workspace = true }
+tang-expr = { workspace = true }
+tang-gpu = { workspace = true }
+tang-tensor = { workspace = true }
+
+# Networking
+iroh = { workspace = true }
+tarpc = { workspace = true }
+tokio = { workspace = true }
+
+# Async utilities
+futures-util = "0.3"
+pin-project = "1"
+tokio-util = { version = "0.7", features = ["codec"] }
+tokio-serde = { version = "0.9", features = ["json"] }
+serde_json = "1"
+
+# Serialization
+serde = { workspace = true }
+postcard = { workspace = true }
+
+# Observability
+tracing = { workspace = true }
+
+# Optional LAN discovery
+mdns-sd = { version = "0.11", optional = true }
+
+[dev-dependencies]
+approx = "0.5"
+tokio = { version = "1", features = ["full", "test-util"] }
