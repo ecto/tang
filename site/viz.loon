@@ -137,10 +137,76 @@
 
     "</svg>"]]]
 
+; ─── compact charts (mobile) ───
+
+[fn geom-bar-c [y label tw nw tl nl]
+  [str
+    "<text x='88' y='" [+ y 18] "' text-anchor='end' fill='#71717a' font-size='12' font-family='ui-monospace,monospace' dominant-baseline='middle'>" label "</text>"
+    "<rect x='96' y='" [+ y 4] "' width='" tw "' height='14' fill='#F59E0B' rx='2'/>"
+    "<text x='" [+ 102 tw] "' y='" [+ y 11] "' fill='#fafafa' font-size='10' font-family='ui-monospace,monospace' dominant-baseline='middle'>" tl "</text>"
+    "<rect x='96' y='" [+ y 22] "' width='" nw "' height='14' fill='#71717a' rx='2'/>"
+    "<text x='" [+ 102 nw] "' y='" [+ y 29] "' fill='#a1a1aa' font-size='10' font-family='ui-monospace,monospace' dominant-baseline='middle'>" nl "</text>"]]
+
+[fn render-geom-chart-compact []
+  [let root [dom.query-selector "#bench-geom-compact"]]
+  [let s 16.0]
+  [dom.set-inner-html root [str
+    "<svg viewBox='0 0 400 225' width='100%' xmlns='http://www.w3.org/2000/svg'>"
+    [geom-bar-c 0   "mat4 inv"    [* 12.0 s] [* 16.0 s]  "12ns"   "16ns"]
+    [geom-bar-c 44  "mat4 mul"    [* 11.0 s] [* 12.1 s]  "11ns"   "12.1ns"]
+    [geom-bar-c 88  "quat slerp"  [* 8.1 s]  [* 11.0 s]  "8.1ns"  "11ns"]
+    [geom-bar-c 132 "mat3 mul"    [* 5.9 s]  [* 6.9 s]   "5.9ns"  "6.9ns"]
+    [geom-bar-c 176 "normalize"   [* 3.7 s]  [* 3.5 s]   "3.7ns"  "3.5ns"]
+    "</svg>"]]]
+
+[fn ad-bar-c [y label tw nw tl nl]
+  [str
+    "<text x='88' y='" [+ y 18] "' text-anchor='end' fill='#71717a' font-size='12' font-family='ui-monospace,monospace' dominant-baseline='middle'>" label "</text>"
+    "<rect x='96' y='" [+ y 4] "' width='" tw "' height='14' fill='#F59E0B' rx='2'/>"
+    "<text x='" [+ 102 tw] "' y='" [+ y 11] "' fill='#fafafa' font-size='10' font-family='ui-monospace,monospace' dominant-baseline='middle'>" tl "</text>"
+    "<rect x='96' y='" [+ y 22] "' width='" nw "' height='14' fill='#71717a' rx='2'/>"
+    "<text x='" [+ 102 nw] "' y='" [+ y 29] "' fill='#a1a1aa' font-size='10' font-family='ui-monospace,monospace' dominant-baseline='middle'>" nl "</text>"]]
+
+[fn render-ad-chart-compact []
+  [let root [dom.query-selector "#bench-ad-compact"]]
+  [let s 0.95]
+  [dom.set-inner-html root [str
+    "<svg viewBox='0 0 400 200' width='100%' xmlns='http://www.w3.org/2000/svg'>"
+    [ad-bar-c 0   "rigid body"  [* 19.0 s]  [* 18.0 s]  "19ns"  "18ns"]
+    [ad-bar-c 48  "FK Jacobian" [* 278.0 s] [* 199.0 s] "278ns" "199ns"]
+    [ad-bar-c 96  "LU deriv"    [* 81.0 s]  [* 167.0 s] "81ns"  "167ns"]
+    [ad-bar-c 144 "Hessian"     [* 77.0 s]  [* 27.0 s]  "77ns"  "27ns"]
+    "</svg>"]]]
+
+[fn la-pair-c [y label tw nw tl nl ratio ratio-color]
+  [str
+    "<text x='68' y='" [+ y 18] "' text-anchor='end' fill='#52525b' font-size='11' font-family='ui-monospace,monospace' dominant-baseline='middle'>" label "</text>"
+    "<rect x='76' y='" [+ y 4] "' width='" tw "' height='14' fill='#F59E0B' rx='2'/>"
+    "<text x='" [+ 82 tw] "' y='" [+ y 11] "' fill='#fafafa' font-size='10' font-family='ui-monospace,monospace' dominant-baseline='middle'>" tl "</text>"
+    "<rect x='76' y='" [+ y 22] "' width='" nw "' height='14' fill='#71717a' rx='2'/>"
+    "<text x='" [+ 82 nw] "' y='" [+ y 29] "' fill='#a1a1aa' font-size='10' font-family='ui-monospace,monospace' dominant-baseline='middle'>" nl "</text>"
+    "<text x='390' y='" [+ y 18] "' text-anchor='end' fill='" ratio-color "' font-size='10' font-family='ui-monospace,monospace' dominant-baseline='middle'>" ratio "</text>"]]
+
+[fn render-la-chart-compact []
+  [let root [dom.query-selector "#bench-la-compact"]]
+  [let cw 240.0]
+  [dom.set-inner-html root [str
+    "<svg viewBox='0 0 400 240' width='100%' xmlns='http://www.w3.org/2000/svg'>"
+    "<text x='68' y='12' text-anchor='end' fill='#71717a' font-size='11' font-family='ui-monospace,monospace' font-weight='600'>n = 128</text>"
+    [la-pair-c 20  "GEMM"      [* [/ 250.0 300.0] cw] [* [/ 84.0 300.0] cw]    "250µs"  "84µs"  "3.0x" "#71717a"]
+    [la-pair-c 64  "LU"        [* [/ 118.0 140.0] cw] [* [/ 107.0 140.0] cw]   "118µs"  "107µs" "1.1x" "#22c55e"]
+    [la-pair-c 108 "Cholesky"  [* [/ 170.0 200.0] cw] [* [/ 63.0 200.0] cw]    "170µs"  "63µs"  "2.7x" "#71717a"]
+    [la-pair-c 152 "QR"        [* [/ 360.0 420.0] cw] [* [/ 211.0 420.0] cw]   "360µs"  "211µs" "1.7x" "#71717a"]
+    [la-pair-c 196 "Eigen"     [* [/ 4800.0 5600.0] cw] [* [/ 942.0 5600.0] cw] "4.8ms"  "942µs" "5.1x" "#ef4444"]
+    "</svg>"]]]
+
 ; ─── main ───
 
 [fn main [curve-path-d]
   [render-dual-viz curve-path-d]
   [render-geom-chart]
   [render-ad-chart]
-  [render-la-chart]]
+  [render-la-chart]
+  [render-geom-chart-compact]
+  [render-ad-chart-compact]
+  [render-la-chart-compact]]

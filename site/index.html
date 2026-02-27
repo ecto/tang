@@ -48,8 +48,10 @@
     .stack-bar {
       transition: all 0.2s ease;
     }
-    .stack-bar:hover {
-      transform: translateX(4px);
+    @media (hover: hover) {
+      .stack-bar:hover {
+        transform: translateX(4px);
+      }
     }
     .stack-bar .stack-code {
       opacity: 0.7;
@@ -62,10 +64,14 @@
     .stack-viz {
       align-items: center;
       justify-content: center;
-      min-width: 200px;
-      max-width: 240px;
       opacity: 0.6;
       transition: opacity 0.2s ease;
+    }
+    @media (min-width: 1024px) {
+      .stack-viz {
+        min-width: 200px;
+        max-width: 240px;
+      }
     }
     .stack-bar:hover .stack-viz {
       opacity: 1;
@@ -87,9 +93,11 @@
     .use-card {
       transition: border-color 0.2s ease, transform 0.2s ease;
     }
-    .use-card:hover {
-      border-color: #F59E0B44;
-      transform: translateY(-2px);
+    @media (hover: hover) {
+      .use-card:hover {
+        border-color: #F59E0B44;
+        transform: translateY(-2px);
+      }
     }
   </style>
 </head>
@@ -98,30 +106,30 @@
   <!-- ═══════════════════════════════════════════════ -->
   <!-- // hero                                        -->
   <!-- ═══════════════════════════════════════════════ -->
-  <section class="min-h-[90vh] flex flex-col justify-center px-6">
+  <section class="min-h-[70vh] sm:min-h-[90vh] flex flex-col justify-center px-4 sm:px-6">
     <div class="max-w-5xl mx-auto w-full">
-      <div class="grid grid-cols-1 lg:grid-cols-2 gap-12 items-center mb-12">
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 sm:gap-12 items-center mb-8 sm:mb-12">
         <!-- Left: text -->
         <div>
-          <div class="flex items-center gap-5 mb-4">
-            <img src="tang-mascot.svg" alt="tang mascot" class="w-20 h-20 sm:w-24 sm:h-24 drop-shadow-lg" />
-            <h1 class="text-6xl sm:text-8xl font-bold tracking-tight">
+          <div class="flex items-center gap-4 sm:gap-5 mb-4">
+            <img src="tang-mascot.svg" alt="tang mascot" class="w-16 h-16 sm:w-24 sm:h-24 drop-shadow-lg" />
+            <h1 class="text-5xl sm:text-8xl font-bold tracking-tight">
               tang<span class="text-accent">.</span>
             </h1>
           </div>
           <p class="text-xl sm:text-2xl text-muted mb-10">math for physical reality.</p>
 
-          <div class="flex flex-wrap gap-4">
-            <button onclick="navigator.clipboard.writeText('cargo add tang')" class="copy-btn flex items-center gap-2 bg-surface border border-border rounded-lg px-5 py-3 font-mono text-sm hover:border-accent/40 transition-colors">
+          <div class="flex flex-wrap gap-3 sm:gap-4">
+            <button onclick="navigator.clipboard.writeText('cargo add tang')" class="copy-btn flex items-center gap-2 bg-surface border border-border rounded-lg px-4 py-2.5 sm:px-5 sm:py-3 font-mono text-sm hover:border-accent/40 transition-colors">
               <span class="text-muted">$</span>
               <span>cargo add tang</span>
               <svg class="w-4 h-4 text-muted ml-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
             </button>
-            <a href="https://github.com/ecto/tang" class="flex items-center gap-2 bg-surface border border-border rounded-lg px-5 py-3 text-sm hover:border-accent/40 transition-colors">
+            <a href="https://github.com/ecto/tang" class="flex items-center gap-2 bg-surface border border-border rounded-lg px-4 py-2.5 sm:px-5 sm:py-3 text-sm hover:border-accent/40 transition-colors">
               GitHub
               <span class="text-muted">→</span>
             </a>
-            <a href="https://www.youtube.com/watch?v=M3ujv8xdK2w" class="flex items-center gap-2 bg-surface border border-border rounded-lg px-5 py-3 text-sm hover:border-accent/40 transition-colors">
+            <a href="https://www.youtube.com/watch?v=M3ujv8xdK2w" class="flex items-center gap-2 bg-surface border border-border rounded-lg px-4 py-2.5 sm:px-5 sm:py-3 text-sm hover:border-accent/40 transition-colors">
               quick mafs
               <span class="text-muted">→</span>
             </a>
@@ -135,7 +143,7 @@
               <span class="font-mono text-xs text-muted">Dual&lt;f64&gt;</span>
               <span class="text-xs text-muted/60 ml-auto">f(x) = x &middot; sin(x)</span>
             </div>
-            <div id="dual-viz" class="w-full" style="height: 320px; background: #18181b;"></div>
+            <div id="dual-viz" class="w-full h-[240px] sm:h-[320px]" style="background: #18181b;"></div>
             <div id="dual-readout" class="flex gap-6 px-4 py-3 border-t border-border font-mono text-xs">
               <div><span class="text-muted">x =</span> <span id="ro-x" class="text-txt">0.00</span></div>
               <div><span class="text-muted">val =</span> <span id="ro-val" class="text-accent">0.00</span></div>
@@ -146,8 +154,8 @@
         </div>
       </div>
 
-      <div class="bg-surface border border-border rounded-xl p-6 overflow-x-auto">
-<pre class="font-mono text-sm leading-relaxed"><span class="kw">use</span> <span class="ty">tang</span>::*;
+      <div class="bg-surface border border-border rounded-xl p-4 sm:p-6 overflow-x-auto">
+<pre class="font-mono text-xs sm:text-sm leading-relaxed"><span class="kw">use</span> <span class="ty">tang</span>::*;
 <span class="kw">use</span> <span class="ty">tang_la</span>::{<span class="ty">DVec</span>, <span class="ty">DMat</span>, <span class="ty">Svd</span>};
 <span class="kw">use</span> <span class="ty">tang_ad</span>::{<span class="ty">Tape</span>, <span class="fn">grad</span>};
 <span class="kw">use</span> <span class="ty">tang_optim</span>::<span class="ty">Adam</span>;
@@ -174,7 +182,7 @@
   <!-- ═══════════════════════════════════════════════ -->
   <!-- // the-scalar-trick                            -->
   <!-- ═══════════════════════════════════════════════ -->
-  <section class="px-6 py-24">
+  <section class="px-4 sm:px-6 py-16 sm:py-24">
     <div class="max-w-5xl mx-auto">
       <p class="font-mono text-muted text-sm mb-3">// the-scalar-trick</p>
       <h2 class="text-3xl sm:text-4xl font-bold mb-4">One trait. Three powers.</h2>
@@ -182,7 +190,7 @@
 
       <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
         <!-- Compute -->
-        <div class="bg-surface border border-border rounded-xl p-5">
+        <div class="bg-surface border border-border rounded-xl p-4 sm:p-5 overflow-x-auto">
           <div class="flex items-center gap-2 mb-4">
             <span class="w-2 h-2 rounded-full bg-green-500"></span>
             <span class="font-mono text-sm font-semibold">Compute</span>
@@ -198,7 +206,7 @@
         </div>
 
         <!-- Differentiate -->
-        <div class="bg-surface border border-accent/30 rounded-xl p-5">
+        <div class="bg-surface border border-accent/30 rounded-xl p-4 sm:p-5 overflow-x-auto">
           <div class="flex items-center gap-2 mb-4">
             <span class="w-2 h-2 rounded-full bg-accent"></span>
             <span class="font-mono text-sm font-semibold text-accent">Differentiate</span>
@@ -214,7 +222,7 @@
         </div>
 
         <!-- Bound -->
-        <div class="bg-surface border border-border rounded-xl p-5 opacity-50">
+        <div class="bg-surface border border-border rounded-xl p-4 sm:p-5 opacity-50 overflow-x-auto">
           <div class="flex items-center gap-2 mb-4">
             <span class="w-2 h-2 rounded-full bg-muted"></span>
             <span class="font-mono text-sm font-semibold text-muted">Bound <span class="text-xs ml-1">(planned)</span></span>
@@ -237,7 +245,7 @@
   <!-- ═══════════════════════════════════════════════ -->
   <!-- // the-stack                                   -->
   <!-- ═══════════════════════════════════════════════ -->
-  <section class="px-6 py-24">
+  <section class="px-4 sm:px-6 py-16 sm:py-24">
     <div class="max-w-5xl mx-auto">
       <p class="font-mono text-muted text-sm mb-3">// the-stack</p>
       <h2 class="text-3xl sm:text-4xl font-bold mb-4">8 crates. One coherent stack.</h2>
@@ -246,7 +254,7 @@
       <div class="space-y-2">
         <!-- tang-train -->
         <a href="https://github.com/ecto/tang/tree/main/crates/tang-train" class="block no-underline text-inherit">
-        <div class="stack-bar bg-surface border border-border rounded-lg px-5 py-4 cursor-pointer lg:flex lg:gap-6">
+        <div class="stack-bar bg-surface border border-border rounded-lg px-4 py-3 sm:px-5 sm:py-4 cursor-pointer lg:flex lg:gap-6">
           <div class="flex-1 min-w-0">
             <div class="flex items-center justify-between">
               <div class="flex items-center gap-3">
@@ -255,7 +263,7 @@
               </div>
               <span class="text-xs text-muted font-mono">top</span>
             </div>
-            <div class="stack-code mt-3">
+            <div class="stack-code mt-3 overflow-x-auto">
 <pre class="font-mono text-xs leading-relaxed text-muted"><span class="kw">let mut</span> model = <span class="ty">Sequential</span>::<span class="fn">new</span>(vec![
     <span class="ty">Box</span>::<span class="fn">new</span>(<span class="ty">Linear</span>::<span class="fn">new</span>(<span class="num">784</span>, <span class="num">128</span>, <span class="num">42</span>)),
     <span class="ty">Box</span>::<span class="fn">new</span>(<span class="ty">ReLU</span>),
@@ -265,8 +273,8 @@
 <span class="kw">let</span> loss = <span class="fn">cross_entropy_loss</span>(&amp;pred, &amp;targets);</pre>
             </div>
           </div>
-          <div class="stack-viz hidden lg:flex">
-            <svg viewBox="0 0 200 120" width="200" height="120" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <div class="stack-viz flex mt-3 lg:mt-0">
+            <svg viewBox="0 0 200 120" class="w-[140px] h-[84px] lg:w-[200px] lg:h-[120px]" fill="none" xmlns="http://www.w3.org/2000/svg">
               <!-- 3-layer neural net: 784→128→10 -->
               <!-- Input layer (4 nodes) -->
               <circle cx="30" cy="20" r="6" stroke="#71717a" stroke-width="1.5"/>
@@ -311,7 +319,7 @@
 
         <!-- tang-optim -->
         <a href="https://github.com/ecto/tang/tree/main/crates/tang-optim" class="block no-underline text-inherit">
-        <div class="stack-bar bg-surface border border-border rounded-lg px-5 py-4 cursor-pointer lg:flex lg:gap-6">
+        <div class="stack-bar bg-surface border border-border rounded-lg px-4 py-3 sm:px-5 sm:py-4 cursor-pointer lg:flex lg:gap-6">
           <div class="flex-1 min-w-0">
             <div class="flex items-center justify-between">
               <div class="flex items-center gap-3">
@@ -319,7 +327,7 @@
                 <span class="text-muted text-sm hidden sm:inline">SGD, Adam/AdamW, L-BFGS, Newton, Levenberg-Marquardt</span>
               </div>
             </div>
-            <div class="stack-code mt-3">
+            <div class="stack-code mt-3 overflow-x-auto">
 <pre class="font-mono text-xs leading-relaxed text-muted"><span class="cm">// nonlinear least-squares: min ||r(x)||²</span>
 <span class="kw">let</span> lm = <span class="ty">LevenbergMarquardt</span>::<span class="fn">new</span>();
 <span class="kw">let</span> x = lm.<span class="fn">minimize</span>(&amp;x0, residual_fn, jacobian_fn);
@@ -329,8 +337,8 @@
 opt.<span class="fn">step</span>(&amp;<span class="kw">mut</span> params, &amp;grads);</pre>
             </div>
           </div>
-          <div class="stack-viz hidden lg:flex">
-            <svg viewBox="0 0 200 120" width="200" height="120" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <div class="stack-viz flex mt-3 lg:mt-0">
+            <svg viewBox="0 0 200 120" class="w-[140px] h-[84px] lg:w-[200px] lg:h-[120px]" fill="none" xmlns="http://www.w3.org/2000/svg">
               <!-- Contour lines + optimization trajectory -->
               <ellipse cx="100" cy="60" rx="90" ry="50" stroke="#27272a" stroke-width="1"/>
               <ellipse cx="100" cy="60" rx="70" ry="38" stroke="#27272a" stroke-width="1"/>
@@ -355,7 +363,7 @@ opt.<span class="fn">step</span>(&amp;<span class="kw">mut</span> params, &amp;g
 
         <!-- tang-tensor -->
         <a href="https://github.com/ecto/tang/tree/main/crates/tang-tensor" class="block no-underline text-inherit">
-        <div class="stack-bar bg-surface border border-border rounded-lg px-5 py-4 cursor-pointer lg:flex lg:gap-6">
+        <div class="stack-bar bg-surface border border-border rounded-lg px-4 py-3 sm:px-5 sm:py-4 cursor-pointer lg:flex lg:gap-6">
           <div class="flex-1 min-w-0">
             <div class="flex items-center justify-between">
               <div class="flex items-center gap-3">
@@ -363,15 +371,15 @@ opt.<span class="fn">step</span>(&amp;<span class="kw">mut</span> params, &amp;g
                 <span class="text-muted text-sm hidden sm:inline">N-d arrays with broadcasting, slicing, matmul, reductions</span>
               </div>
             </div>
-            <div class="stack-code mt-3">
+            <div class="stack-code mt-3 overflow-x-auto">
 <pre class="font-mono text-xs leading-relaxed text-muted"><span class="kw">let</span> x = <span class="ty">Tensor</span>::<span class="fn">from_fn</span>(<span class="ty">Shape</span>::<span class="fn">from_slice</span>(&amp;[<span class="num">32</span>, <span class="num">784</span>]), |idx| <span class="cm">/* ... */</span>);
 <span class="kw">let</span> w = <span class="ty">Tensor</span>::<span class="fn">zeros</span>(<span class="ty">Shape</span>::<span class="fn">from_slice</span>(&amp;[<span class="num">784</span>, <span class="num">128</span>]));
 <span class="kw">let</span> h = x.<span class="fn">matmul</span>(&amp;w);         <span class="cm">// [32, 128]</span>
 <span class="kw">let</span> flat = h.<span class="fn">reshape</span>(<span class="ty">Shape</span>::<span class="fn">from_slice</span>(&amp;[<span class="num">4096</span>]));</pre>
             </div>
           </div>
-          <div class="stack-viz hidden lg:flex">
-            <svg viewBox="0 0 200 120" width="200" height="120" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <div class="stack-viz flex mt-3 lg:mt-0">
+            <svg viewBox="0 0 200 120" class="w-[140px] h-[84px] lg:w-[200px] lg:h-[120px]" fill="none" xmlns="http://www.w3.org/2000/svg">
               <!-- 3D isometric blocks: [32,784] × [784,128] → [32,128] -->
               <!-- Block A -->
               <path d="M10,75 L10,55 L30,45 L50,55 L50,75 L30,85 Z" fill="#71717a22" stroke="#71717a" stroke-width="1"/>
@@ -397,7 +405,7 @@ opt.<span class="fn">step</span>(&amp;<span class="kw">mut</span> params, &amp;g
 
         <!-- tang-gpu -->
         <a href="https://github.com/ecto/tang/tree/main/crates/tang-gpu" class="block no-underline text-inherit">
-        <div class="stack-bar bg-surface border border-border rounded-lg px-5 py-4 cursor-pointer lg:flex lg:gap-6">
+        <div class="stack-bar bg-surface border border-border rounded-lg px-4 py-3 sm:px-5 sm:py-4 cursor-pointer lg:flex lg:gap-6">
           <div class="flex-1 min-w-0">
             <div class="flex items-center justify-between">
               <div class="flex items-center gap-3">
@@ -405,14 +413,14 @@ opt.<span class="fn">step</span>(&amp;<span class="kw">mut</span> params, &amp;g
                 <span class="text-muted text-sm hidden sm:inline">GPU compute via wgpu — SpMV, batch ops, tensor kernels</span>
               </div>
             </div>
-            <div class="stack-code mt-3">
+            <div class="stack-code mt-3 overflow-x-auto">
 <pre class="font-mono text-xs leading-relaxed text-muted"><span class="kw">let</span> device = <span class="ty">GpuDevice</span>::<span class="fn">new</span>().<span class="kw">await</span>;
 <span class="kw">let</span> a_gpu = device.<span class="fn">upload</span>(&amp;sparse_a);
 <span class="kw">let</span> y = device.<span class="fn">spmv</span>(&amp;a_gpu, &amp;x); <span class="cm">// GPU SpMV kernel</span></pre>
             </div>
           </div>
-          <div class="stack-viz hidden lg:flex">
-            <svg viewBox="0 0 200 120" width="200" height="120" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <div class="stack-viz flex mt-3 lg:mt-0">
+            <svg viewBox="0 0 200 120" class="w-[140px] h-[84px] lg:w-[200px] lg:h-[120px]" fill="none" xmlns="http://www.w3.org/2000/svg">
               <!-- Pipeline: CPU → GPU → CPU -->
               <!-- CPU box left -->
               <rect x="8" y="35" width="48" height="50" rx="4" stroke="#71717a" stroke-width="1.5" fill="#71717a11"/>
@@ -451,7 +459,7 @@ opt.<span class="fn">step</span>(&amp;<span class="kw">mut</span> params, &amp;g
 
         <!-- tang-sparse -->
         <a href="https://github.com/ecto/tang/tree/main/crates/tang-sparse" class="block no-underline text-inherit">
-        <div class="stack-bar bg-surface border border-border rounded-lg px-5 py-4 cursor-pointer lg:flex lg:gap-6">
+        <div class="stack-bar bg-surface border border-border rounded-lg px-4 py-3 sm:px-5 sm:py-4 cursor-pointer lg:flex lg:gap-6">
           <div class="flex-1 min-w-0">
             <div class="flex items-center justify-between">
               <div class="flex items-center gap-3">
@@ -459,15 +467,15 @@ opt.<span class="fn">step</span>(&amp;<span class="kw">mut</span> params, &amp;g
                 <span class="text-muted text-sm hidden sm:inline">Sparse matrices — CSR, CSC, COO, SpMV</span>
               </div>
             </div>
-            <div class="stack-code mt-3">
+            <div class="stack-code mt-3 overflow-x-auto">
 <pre class="font-mono text-xs leading-relaxed text-muted"><span class="kw">let mut</span> coo = <span class="ty">CooMatrix</span>::<span class="fn">new</span>(<span class="num">1000</span>, <span class="num">1000</span>);
 coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">0</span>, <span class="num">2.0</span>);  coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">1</span>, <span class="num">-1.0</span>);
 <span class="kw">let</span> csr = coo.<span class="fn">to_csr</span>();        <span class="cm">// compressed sparse row</span>
 <span class="kw">let</span> y = csr.<span class="fn">spmv</span>(&amp;x);          <span class="cm">// O(nnz) mat-vec</span></pre>
             </div>
           </div>
-          <div class="stack-viz hidden lg:flex">
-            <svg viewBox="0 0 200 120" width="200" height="120" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <div class="stack-viz flex mt-3 lg:mt-0">
+            <svg viewBox="0 0 200 120" class="w-[140px] h-[84px] lg:w-[200px] lg:h-[120px]" fill="none" xmlns="http://www.w3.org/2000/svg">
               <!-- 8×8 sparsity pattern grid -->
               <!-- Grid lines -->
               <g stroke="#27272a" stroke-width="0.5">
@@ -518,7 +526,7 @@ coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">0
 
         <!-- tang-ad -->
         <a href="https://github.com/ecto/tang/tree/main/crates/tang-ad" class="block no-underline text-inherit">
-        <div class="stack-bar bg-surface border border-border rounded-lg px-5 py-4 cursor-pointer lg:flex lg:gap-6">
+        <div class="stack-bar bg-surface border border-border rounded-lg px-4 py-3 sm:px-5 sm:py-4 cursor-pointer lg:flex lg:gap-6">
           <div class="flex-1 min-w-0">
             <div class="flex items-center justify-between">
               <div class="flex items-center gap-3">
@@ -526,7 +534,7 @@ coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">0
                 <span class="text-muted text-sm hidden sm:inline">Reverse-mode autodiff — tape, grad, jacobian, hessian</span>
               </div>
             </div>
-            <div class="stack-code mt-3">
+            <div class="stack-code mt-3 overflow-x-auto">
 <pre class="font-mono text-xs leading-relaxed text-muted"><span class="kw">let</span> tape = <span class="ty">Tape</span>::<span class="fn">new</span>();
 <span class="kw">let</span> (a, b) = (tape.<span class="fn">var</span>(<span class="num">3.0</span>), tape.<span class="fn">var</span>(<span class="num">5.0</span>));
 <span class="kw">let</span> loss = &amp;a * &amp;b + (&amp;a).<span class="fn">sin</span>();
@@ -536,8 +544,8 @@ coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">0
 <span class="kw">let</span> g = <span class="fn">grad</span>(|x| &amp;x[<span class="num">0</span>] * &amp;x[<span class="num">1</span>], &amp;[<span class="num">3.0</span>, <span class="num">5.0</span>]); <span class="cm">// [5.0, 3.0]</span></pre>
             </div>
           </div>
-          <div class="stack-viz hidden lg:flex">
-            <svg viewBox="0 0 200 120" width="200" height="120" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <div class="stack-viz flex mt-3 lg:mt-0">
+            <svg viewBox="0 0 200 120" class="w-[140px] h-[84px] lg:w-[200px] lg:h-[120px]" fill="none" xmlns="http://www.w3.org/2000/svg">
               <!-- Computation graph DAG -->
               <!-- Input nodes -->
               <circle cx="25" cy="30" r="10" stroke="#71717a" stroke-width="1.5" fill="#71717a11"/>
@@ -579,7 +587,7 @@ coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">0
 
         <!-- tang-la -->
         <a href="https://github.com/ecto/tang/tree/main/crates/tang-la" class="block no-underline text-inherit">
-        <div class="stack-bar bg-surface border border-border rounded-lg px-5 py-4 cursor-pointer lg:flex lg:gap-6">
+        <div class="stack-bar bg-surface border border-border rounded-lg px-4 py-3 sm:px-5 sm:py-4 cursor-pointer lg:flex lg:gap-6">
           <div class="flex-1 min-w-0">
             <div class="flex items-center justify-between">
               <div class="flex items-center gap-3">
@@ -587,15 +595,15 @@ coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">0
                 <span class="text-muted text-sm hidden sm:inline">Dynamic linear algebra — DVec, DMat, LU, SVD, Cholesky, QR, Eigen</span>
               </div>
             </div>
-            <div class="stack-code mt-3">
+            <div class="stack-code mt-3 overflow-x-auto">
 <pre class="font-mono text-xs leading-relaxed text-muted"><span class="kw">let</span> a = <span class="ty">DMat</span>::<span class="fn">from_fn</span>(<span class="num">100</span>, <span class="num">100</span>, |i, j| <span class="kw">if</span> i == j { <span class="num">2.0</span> } <span class="kw">else if</span> (i <span class="kw">as</span> <span class="ty">i64</span> - j <span class="kw">as</span> <span class="ty">i64</span>).<span class="fn">abs</span>() == <span class="num">1</span> { <span class="num">-1.0</span> } <span class="kw">else</span> { <span class="num">0.0</span> });
 <span class="kw">let</span> x = <span class="ty">Lu</span>::<span class="fn">new</span>(&amp;a).<span class="fn">unwrap</span>().<span class="fn">solve</span>(&amp;b);  <span class="cm">// direct solve</span>
 <span class="kw">let</span> svd = <span class="ty">Svd</span>::<span class="fn">new</span>(&amp;a);                  <span class="cm">// A = UΣVᵀ</span>
 <span class="kw">let</span> eig = <span class="ty">SymmetricEigen</span>::<span class="fn">new</span>(&amp;a);       <span class="cm">// eigenvalues + vectors</span></pre>
             </div>
           </div>
-          <div class="stack-viz hidden lg:flex">
-            <svg viewBox="0 0 200 120" width="200" height="120" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <div class="stack-viz flex mt-3 lg:mt-0">
+            <svg viewBox="0 0 200 120" class="w-[140px] h-[84px] lg:w-[200px] lg:h-[120px]" fill="none" xmlns="http://www.w3.org/2000/svg">
               <!-- 5×5 matrix heatmap — tridiagonal pattern -->
               <!-- Grid cells -->
               <g>
@@ -639,7 +647,7 @@ coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">0
 
         <!-- tang (core) -->
         <a href="https://github.com/ecto/tang/tree/main/crates/tang" class="block no-underline text-inherit">
-        <div class="stack-bar bg-surface border border-accent/40 rounded-lg px-5 py-4 cursor-pointer lg:flex lg:gap-6">
+        <div class="stack-bar bg-surface border border-accent/40 rounded-lg px-4 py-3 sm:px-5 sm:py-4 cursor-pointer lg:flex lg:gap-6">
           <div class="flex-1 min-w-0">
             <div class="flex items-center justify-between">
               <div class="flex items-center gap-3">
@@ -648,7 +656,7 @@ coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">0
               </div>
               <span class="text-xs text-muted font-mono">foundation</span>
             </div>
-            <div class="stack-code mt-3">
+            <div class="stack-code mt-3 overflow-x-auto">
 <pre class="font-mono text-xs leading-relaxed text-muted"><span class="cm">// one function, three scalar types</span>
 <span class="kw">fn</span> <span class="fn">spring</span>&lt;S: <span class="ty">Scalar</span>&gt;(k: S, x: S) -&gt; S { k * x * x * S::<span class="fn">from_f64</span>(<span class="num">0.5</span>) }
 
@@ -659,8 +667,8 @@ coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">0
 <span class="kw">let</span> t = <span class="ty">Transform</span>::<span class="fn">new</span>(<span class="ty">Mat3</span>::<span class="fn">from_quat</span>(q), <span class="ty">Vec3</span>::<span class="fn">new</span>(<span class="num">1.0</span>, <span class="num">2.0</span>, <span class="num">3.0</span>));</pre>
             </div>
           </div>
-          <div class="stack-viz hidden lg:flex">
-            <svg viewBox="0 0 200 120" width="200" height="120" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <div class="stack-viz flex mt-3 lg:mt-0">
+            <svg viewBox="0 0 200 120" class="w-[140px] h-[84px] lg:w-[200px] lg:h-[120px]" fill="none" xmlns="http://www.w3.org/2000/svg">
               <!-- Unit circle with vector rotation by 45° -->
               <!-- Circle -->
               <circle cx="90" cy="60" r="45" stroke="#27272a" stroke-width="1"/>
@@ -691,7 +699,7 @@ coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">0
   <!-- ═══════════════════════════════════════════════ -->
   <!-- // benchmarks                                  -->
   <!-- ═══════════════════════════════════════════════ -->
-  <section class="px-6 py-24">
+  <section class="px-4 sm:px-6 py-16 sm:py-24">
     <div class="max-w-5xl mx-auto">
       <p class="font-mono text-muted text-sm mb-3">// benchmarks</p>
       <h2 class="text-3xl sm:text-4xl font-bold mb-4">Measured, not marketed.</h2>
@@ -699,41 +707,54 @@ coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">0
       <p class="mb-12"><a href="https://github.com/ecto/tang/tree/main/crates/tang-bench" class="text-accent text-sm hover:underline font-mono">view benchmark source →</a></p>
 
       <!-- Geometry primitives chart -->
-      <div class="mb-20">
-        <h3 class="font-mono text-lg font-semibold mb-2">Geometry &amp; physics primitives <span class="text-muted text-sm font-normal">(f64 unless noted)</span></h3>
-        <p class="text-muted text-sm mb-8">Lower is better. glam uses f32 (SIMD).</p>
-        <div class="bg-surface border border-border rounded-xl p-6 overflow-hidden">
-          <div id="bench-geom-container" class="w-full" style="min-height: 480px;"></div>
+      <div class="mb-12 sm:mb-20">
+        <h3 class="font-mono text-base sm:text-lg font-semibold mb-2">Geometry &amp; physics primitives <span class="text-muted text-xs sm:text-sm font-normal">(f64 unless noted)</span></h3>
+        <p class="text-muted text-sm mb-8">Lower is better.<span class="hidden sm:inline"> glam uses f32 (SIMD).</span></p>
+        <div class="hidden sm:block bg-surface border border-border rounded-xl p-3 sm:p-6 overflow-x-auto">
+          <div id="bench-geom-container" class="min-w-[500px] w-full"></div>
         </div>
-        <div class="flex flex-wrap gap-6 mt-4 text-xs font-mono">
+        <div class="sm:hidden bg-surface border border-border rounded-xl p-3">
+          <div id="bench-geom-compact" class="w-full"></div>
+        </div>
+        <div class="hidden sm:flex flex-wrap gap-6 mt-4 text-xs font-mono">
           <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#F59E0B"></span> tang</span>
           <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#71717a"></span> nalgebra</span>
           <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#3B82F6"></span> glam (f32)</span>
         </div>
+        <div class="sm:hidden flex flex-wrap gap-4 mt-4 text-xs font-mono">
+          <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#F59E0B"></span> tang</span>
+          <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#71717a"></span> nalgebra</span>
+        </div>
       </div>
 
       <!-- Differentiable physics chart -->
-      <div class="mb-20">
-        <h3 class="font-mono text-lg font-semibold mb-2">Differentiable physics</h3>
+      <div class="mb-12 sm:mb-20">
+        <h3 class="font-mono text-base sm:text-lg font-semibold mb-2">Differentiable physics</h3>
         <p class="text-muted text-sm mb-8 max-w-2xl">tang AD gives <em>exact</em> derivatives. Finite differences are ε-approximate and require step-size tuning.</p>
-        <div class="bg-surface border border-border rounded-xl p-6 overflow-hidden">
-          <div id="bench-ad-container" class="w-full" style="min-height: 200px;"></div>
+        <div class="hidden sm:block bg-surface border border-border rounded-xl p-3 sm:p-6 overflow-x-auto">
+          <div id="bench-ad-container" class="min-w-[500px] w-full"></div>
         </div>
-        <div class="flex flex-wrap gap-6 mt-4 text-xs font-mono">
+        <div class="sm:hidden bg-surface border border-border rounded-xl p-3">
+          <div id="bench-ad-compact" class="w-full"></div>
+        </div>
+        <div class="flex flex-wrap gap-4 sm:gap-6 mt-4 text-xs font-mono">
           <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#F59E0B"></span> tang AD (exact)</span>
-          <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#71717a"></span> finite diff (approximate)</span>
+          <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#71717a"></span> finite diff (approx)</span>
         </div>
         <p class="text-muted text-sm mt-4 max-w-2xl italic">The speed comparison is secondary — the real win is machine-precision derivatives with zero tuning. Finite differences break down for stiff systems.</p>
       </div>
 
       <!-- Dense LA chart -->
       <div>
-        <h3 class="font-mono text-lg font-semibold mb-2">Dense linear algebra <span class="text-muted text-sm font-normal">(f64, tang vs nalgebra)</span></h3>
-        <p class="text-muted text-sm mb-8 max-w-2xl">tang is pure generic Rust — works with <code class="font-mono text-accent">Dual&lt;f64&gt;</code>, any <code class="font-mono text-accent">Scalar</code>. nalgebra dispatches to BLAS-style routines. For peak f64, enable the <code class="font-mono text-accent">faer</code> feature.</p>
-        <div class="bg-surface border border-border rounded-xl p-6 overflow-hidden">
-          <div id="bench-la-container" class="w-full" style="min-height: 420px;"></div>
+        <h3 class="font-mono text-base sm:text-lg font-semibold mb-2">Dense linear algebra <span class="text-muted text-xs sm:text-sm font-normal">(f64, tang vs nalgebra)</span></h3>
+        <p class="text-muted text-sm mb-8 max-w-2xl">tang is pure generic Rust — works with <code class="font-mono text-accent">Dual&lt;f64&gt;</code>, any <code class="font-mono text-accent">Scalar</code>. nalgebra dispatches to BLAS-style routines.<span class="hidden sm:inline"> For peak f64, enable the <code class="font-mono text-accent">faer</code> feature.</span></p>
+        <div class="hidden sm:block bg-surface border border-border rounded-xl p-3 sm:p-6 overflow-x-auto">
+          <div id="bench-la-container" class="min-w-[500px] w-full"></div>
         </div>
-        <div class="flex flex-wrap gap-6 mt-4 text-xs font-mono">
+        <div class="sm:hidden bg-surface border border-border rounded-xl p-3">
+          <div id="bench-la-compact" class="w-full"></div>
+        </div>
+        <div class="flex flex-wrap gap-4 sm:gap-6 mt-4 text-xs font-mono">
           <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#F59E0B"></span> tang</span>
           <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#71717a"></span> nalgebra</span>
         </div>
@@ -747,14 +768,14 @@ coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">0
   <!-- ═══════════════════════════════════════════════ -->
   <!-- // use-cases                                   -->
   <!-- ═══════════════════════════════════════════════ -->
-  <section class="px-6 py-24">
+  <section class="px-4 sm:px-6 py-16 sm:py-24">
     <div class="max-w-5xl mx-auto">
       <p class="font-mono text-muted text-sm mb-3">// use-cases</p>
       <h2 class="text-3xl sm:text-4xl font-bold mb-12">Built for real systems.</h2>
 
       <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <!-- Geometry Kernels -->
-        <div class="use-card bg-surface border border-border rounded-xl p-6">
+        <div class="use-card bg-surface border border-border rounded-xl p-4 sm:p-6 overflow-x-auto">
           <div class="text-2xl mb-3">⬡</div>
           <h3 class="font-semibold text-lg mb-2">Geometry Kernels</h3>
           <p class="text-muted text-sm mb-4">BRep, NURBS, mesh ops. The types CAD needs.</p>
@@ -765,7 +786,7 @@ coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">0
         </div>
 
         <!-- Physics Engines -->
-        <div class="use-card bg-surface border border-border rounded-xl p-6">
+        <div class="use-card bg-surface border border-border rounded-xl p-4 sm:p-6 overflow-x-auto">
           <div class="text-2xl mb-3">◎</div>
           <h3 class="font-semibold text-lg mb-2">Physics Engines</h3>
           <p class="text-muted text-sm mb-4">Spatial algebra, screw theory, inertia tensors.</p>
@@ -776,7 +797,7 @@ coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">0
         </div>
 
         <!-- Robotics -->
-        <div class="use-card bg-surface border border-border rounded-xl p-6">
+        <div class="use-card bg-surface border border-border rounded-xl p-4 sm:p-6 overflow-x-auto">
           <div class="text-2xl mb-3">⚙</div>
           <h3 class="font-semibold text-lg mb-2">Robotics</h3>
           <p class="text-muted text-sm mb-4">Differentiable FK/IK, exact Jacobians for free.</p>
@@ -788,7 +809,7 @@ coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">0
         </div>
 
         <!-- ML / Differentiable Programming -->
-        <div class="use-card bg-surface border border-border rounded-xl p-6">
+        <div class="use-card bg-surface border border-border rounded-xl p-4 sm:p-6 overflow-x-auto">
           <div class="text-2xl mb-3">∇</div>
           <h3 class="font-semibold text-lg mb-2">ML / Differentiable Programming</h3>
           <p class="text-muted text-sm mb-4">Same types train your nets and run your sim.</p>
@@ -804,7 +825,7 @@ coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">0
   <!-- ═══════════════════════════════════════════════ -->
   <!-- // migration                                   -->
   <!-- ═══════════════════════════════════════════════ -->
-  <section class="px-6 py-24">
+  <section class="px-4 sm:px-6 py-16 sm:py-24">
     <div class="max-w-5xl mx-auto">
       <p class="font-mono text-muted text-sm mb-3">// migration</p>
       <h2 class="text-3xl sm:text-4xl font-bold mb-4">Coming from nalgebra?</h2>
@@ -814,12 +835,12 @@ coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">0
         <!-- Type mapping -->
         <div>
           <h3 class="font-mono text-sm text-muted mb-4">Type mapping</h3>
-          <div class="bg-surface border border-border rounded-xl overflow-hidden">
-            <table class="w-full text-sm">
+          <div class="bg-surface border border-border rounded-xl overflow-x-auto">
+            <table class="w-full text-sm min-w-[320px]">
               <thead>
                 <tr class="border-b border-border">
-                  <th class="p-3 text-left font-mono text-muted font-normal">nalgebra</th>
-                  <th class="p-3 text-left font-mono text-accent font-normal">tang</th>
+                  <th class="p-2.5 sm:p-3 text-left font-mono text-muted font-normal">nalgebra</th>
+                  <th class="p-2.5 sm:p-3 text-left font-mono text-accent font-normal">tang</th>
                 </tr>
               </thead>
               <tbody class="font-mono">
@@ -838,7 +859,7 @@ coo.<span class="fn">push</span>(<span class="num">0</span>, <span class="num">0
         <!-- API compat -->
         <div>
           <h3 class="font-mono text-sm text-muted mb-4">API compatibility</h3>
-          <div class="bg-surface border border-border rounded-xl p-5 mb-4">
+          <div class="bg-surface border border-border rounded-xl p-4 sm:p-5 mb-4 overflow-x-auto">
 <pre class="font-mono text-xs leading-relaxed"><span class="cm">// nalgebra style — works</span>
 v.<span class="fn">dot</span>(&amp;w);
 v.<span class="fn">cross</span>(&amp;w);
@@ -847,12 +868,12 @@ v.<span class="fn">cross</span>(&amp;w);
 v.<span class="fn">dot</span>(w);
 v.<span class="fn">cross</span>(w);</pre>
           </div>
-          <div class="bg-surface border border-border rounded-xl overflow-hidden">
-            <table class="w-full text-sm">
+          <div class="bg-surface border border-border rounded-xl overflow-x-auto">
+            <table class="w-full text-sm min-w-[320px]">
               <thead>
                 <tr class="border-b border-border">
-                  <th class="p-3 text-left font-mono text-muted font-normal">nalgebra</th>
-                  <th class="p-3 text-left font-mono text-accent font-normal">tang</th>
+                  <th class="p-2.5 sm:p-3 text-left font-mono text-muted font-normal">nalgebra</th>
+                  <th class="p-2.5 sm:p-3 text-left font-mono text-accent font-normal">tang</th>
                 </tr>
               </thead>
               <tbody class="font-mono text-xs">
@@ -873,7 +894,7 @@ v.<span class="fn">cross</span>(w);</pre>
   <!-- ═══════════════════════════════════════════════ -->
   <!-- // targets                                     -->
   <!-- ═══════════════════════════════════════════════ -->
-  <section class="px-6 py-24">
+  <section class="px-4 sm:px-6 py-16 sm:py-24">
     <div class="max-w-5xl mx-auto">
       <p class="font-mono text-muted text-sm mb-3">// targets</p>
       <h2 class="text-3xl sm:text-4xl font-bold mb-12">Runs everywhere.</h2>
@@ -924,7 +945,7 @@ v.<span class="fn">cross</span>(w);</pre>
   <!-- ═══════════════════════════════════════════════ -->
   <!-- // footer                                      -->
   <!-- ═══════════════════════════════════════════════ -->
-  <footer class="px-6 py-24 border-t border-border">
+  <footer class="px-4 sm:px-6 py-16 sm:py-24 border-t border-border">
     <div class="max-w-5xl mx-auto text-center">
       <p class="font-mono text-lg mb-2">tang is <a href="https://github.com/ecto/tang/blob/main/LICENSE" class="text-accent hover:underline">MIT licensed</a>.</p>
       <p class="text-muted mb-8">built for <a href="https://vcad.io" class="text-accent hover:underline">vcad</a>. usable by everyone.</p>
