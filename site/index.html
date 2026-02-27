@@ -943,6 +943,58 @@ v.<span class="fn">cross</span>(w);</pre>
   </section>
 
   <!-- ═══════════════════════════════════════════════ -->
+  <!-- // examples                                    -->
+  <!-- ═══════════════════════════════════════════════ -->
+  <section class="px-4 sm:px-6 py-16 sm:py-24">
+    <div class="max-w-5xl mx-auto">
+      <p class="font-mono text-muted text-sm mb-3">// examples</p>
+      <h2 class="text-3xl sm:text-4xl font-bold mb-4">See it train.</h2>
+      <p class="text-muted text-lg mb-12 max-w-2xl">End-to-end examples that run out of the box.</p>
+
+      <div class="bg-surface border border-border rounded-xl p-4 sm:p-6 overflow-x-auto">
+        <div class="flex items-center gap-3 mb-4">
+          <span class="bg-accent/10 text-accent text-xs font-mono px-2 py-1 rounded">tang-train</span>
+          <h3 class="font-semibold text-lg">The Quantum Poet</h3>
+        </div>
+        <p class="text-muted text-sm mb-4">A character-level text generator trained on physics haikus. Builds a dataset, trains a 21K-parameter neural net with cross-entropy loss, and generates new poetry &mdash; all in one file.</p>
+<pre class="font-mono text-xs leading-relaxed mb-4"><span class="cm">// build the model</span>
+<span class="kw">let mut</span> model = <span class="ty">Sequential</span>::&lt;<span class="ty">f64</span>&gt;::<span class="fn">new</span>(<span class="fn">vec!</span>[
+    <span class="ty">Box</span>::<span class="fn">new</span>(<span class="ty">Linear</span>::<span class="fn">new</span>(<span class="num">240</span>, <span class="num">64</span>, <span class="num">42</span>)),
+    <span class="ty">Box</span>::<span class="fn">new</span>(<span class="ty">Tanh</span>::<span class="fn">new</span>()),
+    <span class="ty">Box</span>::<span class="fn">new</span>(<span class="ty">Linear</span>::<span class="fn">new</span>(<span class="num">64</span>, <span class="num">64</span>, <span class="num">137</span>)),
+    <span class="ty">Box</span>::<span class="fn">new</span>(<span class="ty">Tanh</span>::<span class="fn">new</span>()),
+    <span class="ty">Box</span>::<span class="fn">new</span>(<span class="ty">Linear</span>::<span class="fn">new</span>(<span class="num">64</span>, <span class="num">30</span>, <span class="num">256</span>)),
+]);
+
+<span class="cm">// train</span>
+<span class="kw">let</span> losses = <span class="ty">Trainer</span>::<span class="fn">new</span>(&amp;<span class="kw">mut</span> model, <span class="ty">ModuleAdam</span>::<span class="fn">new</span>(<span class="num">0.005</span>))
+    .<span class="fn">loss_fn</span>(|p, t| (<span class="fn">cross_entropy_loss</span>(p, t), <span class="fn">cross_entropy_loss_grad</span>(p, t)))
+    .<span class="fn">epochs</span>(<span class="num">200</span>)
+    .<span class="fn">fit</span>(&amp;<span class="kw">mut</span> loader);</pre>
+        <div class="bg-[#1a1a2e] rounded-lg p-4 mb-4">
+<pre class="font-mono text-xs leading-relaxed text-green-400"><span class="text-muted">$</span> cargo run --example quantum_poet -p tang-train
+
+=== The Quantum Poet ===
+
+corpus: 1491 chars, 1483 training samples
+model: 21534 parameters
+
+training...
+  epoch   1: loss = 2.9453
+  epoch  20: loss = 0.0916
+  epoch 200: loss = 0.0207
+
+--- seed: "quantum " ---
+quantum fields vibrate below,
+dimensions curl up and hide,
+theory seeks the truth.</pre>
+        </div>
+        <a href="https://github.com/ecto/tang/blob/main/crates/tang-train/examples/quantum_poet.rs" class="text-accent hover:underline text-sm font-mono">quantum_poet.rs &rarr;</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════ -->
   <!-- // footer                                      -->
   <!-- ═══════════════════════════════════════════════ -->
   <footer class="px-4 sm:px-6 py-16 sm:py-24 border-t border-border">

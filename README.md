@@ -211,10 +211,39 @@ tang's dense LA is pure generic Rust (works with `Dual<f64>`, any `Scalar` impl)
 | vec3 chain | 3.7ns | 15.4ns | 4.2x |
 | quat rotate | 15.0ns | 30.9ns | 2.1x |
 
+## Examples
+
+### The Quantum Poet
+
+A character-level text generator trained on physics haikus. Demonstrates the full `tang-train` pipeline — dataset construction, sequential model, cross-entropy loss, Adam optimizer, and text generation.
+
+```bash
+cargo run --example quantum_poet -p tang-train
+```
+
+```
+=== The Quantum Poet ===
+
+corpus: 1491 chars, 1483 training samples, 8 parameters window
+model: 21534 parameters
+
+training...
+  epoch   1: loss = 2.9453
+  epoch  20: loss = 0.0916
+  epoch 200: loss = 0.0207
+
+--- seed: "quantum " ---
+quantum fields vibrate below,
+dimensions curl up and hide,
+theory seeks the truth...
+```
+
+~21K parameters, trains in seconds on CPU. See [`crates/tang-train/examples/quantum_poet.rs`](crates/tang-train/examples/quantum_poet.rs).
+
 ## Development
 
 ```bash
-cargo test --workspace        # 141 tests
+cargo test --workspace
 cargo test --workspace --all-features
 ```
 
