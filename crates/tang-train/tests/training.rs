@@ -1,7 +1,7 @@
 use tang_tensor::{Shape, Tensor};
 use tang_train::{
-    mse_loss, mse_loss_grad, Dropout, Embedding, Linear, Module, ModuleAdam, ModuleSgd, Optimizer,
-    ReLU, Sequential, Tanh,
+    mse_loss, mse_loss_grad, Conv1d, Conv2d, Dropout, Embedding, Linear, Module, ModuleAdam,
+    ModuleSgd, Optimizer, ReLU, Sequential, Tanh,
 };
 
 #[test]
@@ -454,4 +454,131 @@ fn test_state_dict_roundtrip() {
     for (&a, &b) in out1.data().iter().zip(out2.data().iter()) {
         assert!((a - b).abs() < 1e-10, "state_dict roundtrip mismatch: {} vs {}", a, b);
     }
+}
+
+#[test]
+fn test_conv1d_forward_shape() {
+    let mut conv = Conv1d::<f64>::new(3, 4, 3, 42); // in=3, out=4, kernel=3
+    let input = Tensor::new(vec![0.0; 2 * 3 * 10], Shape::from_slice(&[2, 3, 10]));
+    let output = conv.forward(&input);
+    assert_eq!(output.shape().dims(), &[2, 4, 8]); // out_len = 10 - 3 + 1 = 8
+}
+
+#[test]
+fn test_conv2d_forward_shape() {
+    let mut conv = Conv2d::<f64>::new(1, 4, 3, 42); // in=1, out=4, 3x3 kernel
+    let input = Tensor::new(vec![0.0; 1 * 1 * 5 * 5], Shape::from_slice(&[1, 1, 5, 5]));
+    let output = conv.forward(&input);
+    assert_eq!(output.shape().dims(), &[1, 4, 3, 3]); // 5-3+1 = 3
+}
+
+#[test]
+fn test_conv1d_backward_gradient_check() {
+    // Small conv: 1 in_channel, 1 out_channel, kernel_size=2, input length=3
+    let mut conv = Conv1d::<f64>::new(1, 1, 2, 42);
+    let input = Tensor::new(vec![1.0, 2.0, 3.0], Shape::from_slice(&[1, 1, 3]));
+    let eps = 1e-5;
+
+    // Forward + backward with grad_output = all ones
+    let _output = conv.forward(&input);
+    // out_len = 3 - 2 + 1 = 2
+    let grad_output = Tensor::new(vec![1.0, 1.0], Shape::from_slice(&[1, 1, 2]));
+    conv.backward(&grad_output);
+
+    // Check weight gradients numerically
+    let weight_grad = conv.weight.grad.clone().unwrap();
+    for oc in 0..1 {
+        for ic in 0..1 {
+            for k in 0..2 {
+                let orig = conv.weight.data.get(&[oc, ic, k]);
+
+                conv.weight.data.set(&[oc, ic, k], orig + eps);
+                conv.weight.grad = None;
+                let out_plus = conv.forward(&input);
+                let loss_plus: f64 = out_plus.data().iter().sum();
+
+                conv.weight.data.set(&[oc, ic, k], orig - eps);
+                let out_minus = conv.forward(&input);
+                let loss_minus: f64 = out_minus.data().iter().sum();
+
+                conv.weight.data.set(&[oc, ic, k], orig);
+
+                let numerical = (loss_plus - loss_minus) / (2.0 * eps);
+                let analytical = weight_grad.get(&[oc, ic, k]);
+                assert!(
+                    (numerical - analytical).abs() < 1e-4,
+                    "conv1d weight grad mismatch at [{},{},{}]: numerical={}, analytical={}",
+                    oc, ic, k, numerical, analytical
+                );
+            }
+        }
+    }
+
+    // Check bias gradients numerically
+    let bias_grad = conv.bias.grad.clone().unwrap();
+    for oc in 0..1 {
+        let orig = conv.bias.data.get(&[oc]);
+
+        conv.bias.data.set(&[oc], orig + eps);
+        let out_plus = conv.forward(&input);
+        let loss_plus: f64 = out_plus.data().iter().sum();
+
+        conv.bias.data.set(&[oc], orig - eps);
+        let out_minus = conv.forward(&input);
+        let loss_minus: f64 = out_minus.data().iter().sum();
+
+        conv.bias.data.set(&[oc], orig);
+
+        let numerical = (loss_plus - loss_minus) / (2.0 * eps);
+        let analytical = bias_grad.get(&[oc]);
+        assert!(
+            (numerical - analytical).abs() < 1e-4,
+            "conv1d bias grad mismatch at [{}]: numerical={}, analytical={}",
+            oc, numerical, analytical
+        );
+    }
+
+    // Check input gradients numerically
+    let _output = conv.forward(&input);
+    conv.zero_grad();
+    let grad_input = conv.backward(&grad_output);
+
+    let mut input_mut = input.clone();
+    for ic in 0..1 {
+        for i in 0..3 {
+            let orig = input_mut.get(&[0, ic, i]);
+
+            input_mut.set(&[0, ic, i], orig + eps);
+            let out_plus = conv.forward(&input_mut);
+            let loss_plus: f64 = out_plus.data().iter().sum();
+
+            input_mut.set(&[0, ic, i], orig - eps);
+            let out_minus = conv.forward(&input_mut);
+            let loss_minus: f64 = out_minus.data().iter().sum();
+
+            input_mut.set(&[0, ic, i], orig);
+
+            let numerical = (loss_plus - loss_minus) / (2.0 * eps);
+            let analytical = grad_input.get(&[0, ic, i]);
+            assert!(
+                (numerical - analytical).abs() < 1e-4,
+                "conv1d input grad mismatch at [0,{},{}]: numerical={}, analytical={}",
+                ic, i, numerical, analytical
+            );
+        }
+    }
+}
+
+#[test]
+fn test_conv1d_named_parameters() {
+    let conv = Conv1d::<f64>::new(2, 3, 3, 42);
+    let names: Vec<String> = conv.named_parameters().iter().map(|(n, _)| n.clone()).collect();
+    assert_eq!(names, vec!["weight", "bias"]);
+}
+
+#[test]
+fn test_conv2d_named_parameters() {
+    let conv = Conv2d::<f64>::new(1, 4, 3, 42);
+    let names: Vec<String> = conv.named_parameters().iter().map(|(n, _)| n.clone()).collect();
+    assert_eq!(names, vec!["weight", "bias"]);
 }

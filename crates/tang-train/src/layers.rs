@@ -357,6 +357,286 @@ impl<S: Scalar> Module<S> for Dropout<S> {
     }
 }
 
+/// 1D convolution layer (cross-correlation, no padding, stride=1).
+///
+/// Input: `[batch, in_channels, length]`
+/// Output: `[batch, out_channels, length - kernel_size + 1]`
+pub struct Conv1d<S: Scalar> {
+    pub weight: Parameter<S>, // [out_channels, in_channels, kernel_size]
+    pub bias: Parameter<S>,   // [out_channels]
+    in_channels: usize,
+    out_channels: usize,
+    kernel_size: usize,
+    cached_input: Option<Tensor<S>>,
+}
+
+impl<S: Scalar> Conv1d<S> {
+    pub fn new(in_channels: usize, out_channels: usize, kernel_size: usize, seed: u64) -> Self {
+        Self {
+            weight: Parameter::randn(
+                Shape::from_slice(&[out_channels, in_channels, kernel_size]),
+                seed,
+            ),
+            bias: Parameter::new(Tensor::zeros(Shape::from_slice(&[out_channels]))),
+            in_channels,
+            out_channels,
+            kernel_size,
+            cached_input: None,
+        }
+    }
+}
+
+impl<S: Scalar> Module<S> for Conv1d<S> {
+    fn forward(&mut self, input: &Tensor<S>) -> Tensor<S> {
+        assert_eq!(input.ndim(), 3, "Conv1d input must be [batch, in_channels, length]");
+        let batch = input.shape()[0];
+        let ic = input.shape()[1];
+        assert_eq!(ic, self.in_channels);
+        let length = input.shape()[2];
+        assert!(length >= self.kernel_size, "input length must be >= kernel_size");
+        let out_len = length - self.kernel_size + 1;
+
+        self.cached_input = Some(input.clone());
+
+        Tensor::from_fn(
+            Shape::from_slice(&[batch, self.out_channels, out_len]),
+            |idx| {
+                let (b, oc, pos) = (idx[0], idx[1], idx[2]);
+                let mut sum = self.bias.data.get(&[oc]);
+                for c in 0..self.in_channels {
+                    for k in 0..self.kernel_size {
+                        sum += self.weight.data.get(&[oc, c, k]) * input.get(&[b, c, pos + k]);
+                    }
+                }
+                sum
+            },
+        )
+    }
+
+    fn backward(&mut self, grad_output: &Tensor<S>) -> Tensor<S> {
+        let input = self
+            .cached_input
+            .as_ref()
+            .expect("must call forward before backward");
+        let batch = input.shape()[0];
+        let length = input.shape()[2];
+        let out_len = length - self.kernel_size + 1;
+
+        // grad_weight[oc][ic][k] = sum over b,pos of grad_output[b][oc][pos] * input[b][ic][pos+k]
+        let grad_w = Tensor::from_fn(self.weight.data.shape().clone(), |idx| {
+            let (oc, ic, k) = (idx[0], idx[1], idx[2]);
+            let mut sum = S::ZERO;
+            for b in 0..batch {
+                for pos in 0..out_len {
+                    sum += grad_output.get(&[b, oc, pos]) * input.get(&[b, ic, pos + k]);
+                }
+            }
+            sum
+        });
+        self.weight.accumulate_grad(&grad_w);
+
+        // grad_bias[oc] = sum over b,pos of grad_output[b][oc][pos]
+        let grad_b = Tensor::from_fn(self.bias.data.shape().clone(), |idx| {
+            let oc = idx[0];
+            let mut sum = S::ZERO;
+            for b in 0..batch {
+                for pos in 0..out_len {
+                    sum += grad_output.get(&[b, oc, pos]);
+                }
+            }
+            sum
+        });
+        self.bias.accumulate_grad(&grad_b);
+
+        // grad_input[b][ic][i] = sum over oc,k of weight[oc][ic][k] * grad_output[b][oc][i-k]
+        // where 0 <= i-k < out_len
+        Tensor::from_fn(input.shape().clone(), |idx| {
+            let (b, ic, i) = (idx[0], idx[1], idx[2]);
+            let mut sum = S::ZERO;
+            for oc in 0..self.out_channels {
+                for k in 0..self.kernel_size {
+                    if i >= k && (i - k) < out_len {
+                        sum += self.weight.data.get(&[oc, ic, k])
+                            * grad_output.get(&[b, oc, i - k]);
+                    }
+                }
+            }
+            sum
+        })
+    }
+
+    fn parameters(&self) -> Vec<&Parameter<S>> {
+        alloc::vec![&self.weight, &self.bias]
+    }
+
+    fn parameters_mut(&mut self) -> Vec<&mut Parameter<S>> {
+        alloc::vec![&mut self.weight, &mut self.bias]
+    }
+
+    fn named_parameters(&self) -> Vec<(String, &Parameter<S>)> {
+        alloc::vec![
+            (String::from("weight"), &self.weight),
+            (String::from("bias"), &self.bias),
+        ]
+    }
+
+    fn named_parameters_mut(&mut self) -> Vec<(String, &mut Parameter<S>)> {
+        alloc::vec![
+            (String::from("weight"), &mut self.weight),
+            (String::from("bias"), &mut self.bias),
+        ]
+    }
+}
+
+/// 2D convolution layer (cross-correlation, no padding, stride=1).
+///
+/// Input: `[batch, in_channels, height, width]`
+/// Output: `[batch, out_channels, height - kh + 1, width - kw + 1]`
+pub struct Conv2d<S: Scalar> {
+    pub weight: Parameter<S>, // [out_channels, in_channels, kh, kw]
+    pub bias: Parameter<S>,   // [out_channels]
+    in_channels: usize,
+    out_channels: usize,
+    kernel_size: usize,
+    cached_input: Option<Tensor<S>>,
+}
+
+impl<S: Scalar> Conv2d<S> {
+    pub fn new(in_channels: usize, out_channels: usize, kernel_size: usize, seed: u64) -> Self {
+        Self {
+            weight: Parameter::randn(
+                Shape::from_slice(&[out_channels, in_channels, kernel_size, kernel_size]),
+                seed,
+            ),
+            bias: Parameter::new(Tensor::zeros(Shape::from_slice(&[out_channels]))),
+            in_channels,
+            out_channels,
+            kernel_size,
+            cached_input: None,
+        }
+    }
+}
+
+impl<S: Scalar> Module<S> for Conv2d<S> {
+    fn forward(&mut self, input: &Tensor<S>) -> Tensor<S> {
+        assert_eq!(input.ndim(), 4, "Conv2d input must be [batch, in_channels, height, width]");
+        let batch = input.shape()[0];
+        let ic = input.shape()[1];
+        assert_eq!(ic, self.in_channels);
+        let height = input.shape()[2];
+        let width = input.shape()[3];
+        let kh = self.kernel_size;
+        let kw = self.kernel_size;
+        assert!(height >= kh && width >= kw, "spatial dims must be >= kernel_size");
+        let out_h = height - kh + 1;
+        let out_w = width - kw + 1;
+
+        self.cached_input = Some(input.clone());
+
+        Tensor::from_fn(
+            Shape::from_slice(&[batch, self.out_channels, out_h, out_w]),
+            |idx| {
+                let (b, oc, oh, ow) = (idx[0], idx[1], idx[2], idx[3]);
+                let mut sum = self.bias.data.get(&[oc]);
+                for c in 0..self.in_channels {
+                    for ki in 0..kh {
+                        for kj in 0..kw {
+                            sum += self.weight.data.get(&[oc, c, ki, kj])
+                                * input.get(&[b, c, oh + ki, ow + kj]);
+                        }
+                    }
+                }
+                sum
+            },
+        )
+    }
+
+    fn backward(&mut self, grad_output: &Tensor<S>) -> Tensor<S> {
+        let input = self
+            .cached_input
+            .as_ref()
+            .expect("must call forward before backward");
+        let batch = input.shape()[0];
+        let height = input.shape()[2];
+        let width = input.shape()[3];
+        let kh = self.kernel_size;
+        let kw = self.kernel_size;
+        let out_h = height - kh + 1;
+        let out_w = width - kw + 1;
+
+        // grad_weight[oc][ic][ki][kj] = sum over b,oh,ow of grad_output[b][oc][oh][ow] * input[b][ic][oh+ki][ow+kj]
+        let grad_w = Tensor::from_fn(self.weight.data.shape().clone(), |idx| {
+            let (oc, ic, ki, kj) = (idx[0], idx[1], idx[2], idx[3]);
+            let mut sum = S::ZERO;
+            for b in 0..batch {
+                for oh in 0..out_h {
+                    for ow in 0..out_w {
+                        sum += grad_output.get(&[b, oc, oh, ow])
+                            * input.get(&[b, ic, oh + ki, ow + kj]);
+                    }
+                }
+            }
+            sum
+        });
+        self.weight.accumulate_grad(&grad_w);
+
+        // grad_bias[oc] = sum over b,oh,ow of grad_output[b][oc][oh][ow]
+        let grad_b = Tensor::from_fn(self.bias.data.shape().clone(), |idx| {
+            let oc = idx[0];
+            let mut sum = S::ZERO;
+            for b in 0..batch {
+                for oh in 0..out_h {
+                    for ow in 0..out_w {
+                        sum += grad_output.get(&[b, oc, oh, ow]);
+                    }
+                }
+            }
+            sum
+        });
+        self.bias.accumulate_grad(&grad_b);
+
+        // grad_input[b][ic][i][j] = sum over oc,ki,kj of weight[oc][ic][ki][kj] * grad_output[b][oc][i-ki][j-kj]
+        // where 0 <= i-ki < out_h and 0 <= j-kj < out_w
+        Tensor::from_fn(input.shape().clone(), |idx| {
+            let (b, ic, i, j) = (idx[0], idx[1], idx[2], idx[3]);
+            let mut sum = S::ZERO;
+            for oc in 0..self.out_channels {
+                for ki in 0..kh {
+                    for kj in 0..kw {
+                        if i >= ki && (i - ki) < out_h && j >= kj && (j - kj) < out_w {
+                            sum += self.weight.data.get(&[oc, ic, ki, kj])
+                                * grad_output.get(&[b, oc, i - ki, j - kj]);
+                        }
+                    }
+                }
+            }
+            sum
+        })
+    }
+
+    fn parameters(&self) -> Vec<&Parameter<S>> {
+        alloc::vec![&self.weight, &self.bias]
+    }
+
+    fn parameters_mut(&mut self) -> Vec<&mut Parameter<S>> {
+        alloc::vec![&mut self.weight, &mut self.bias]
+    }
+
+    fn named_parameters(&self) -> Vec<(String, &Parameter<S>)> {
+        alloc::vec![
+            (String::from("weight"), &self.weight),
+            (String::from("bias"), &self.bias),
+        ]
+    }
+
+    fn named_parameters_mut(&mut self) -> Vec<(String, &mut Parameter<S>)> {
+        alloc::vec![
+            (String::from("weight"), &mut self.weight),
+            (String::from("bias"), &mut self.bias),
+        ]
+    }
+}
+
 /// Sequential container — chains modules in order.
 pub struct Sequential<S: Scalar> {
     layers: Vec<Box<dyn Module<S>>>,
