@@ -53,7 +53,7 @@ pub mod pinn;
 mod trainer;
 
 pub use data::{DataLoader, Dataset, TensorDataset};
-pub use layers::{Linear, ReLU, Sequential, Tanh};
+pub use layers::{Dropout, Embedding, Linear, ReLU, Sequential, Tanh};
 pub use loss::{
     cross_entropy_loss, cross_entropy_loss_grad, huber_loss, mse_loss, mse_loss_grad, softmax,
 };

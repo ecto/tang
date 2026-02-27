@@ -224,6 +224,22 @@ fn main() {
         losses.last().copied().unwrap_or(0.0)
     );
 
+    // --- Save & reload weights ------------------------------------------------
+
+    let save_path = std::path::Path::new("quantum_poet.safetensors");
+    let state = model.state_dict();
+    let map: std::collections::HashMap<String, Tensor<f64>> = state.into_iter().collect();
+    tang_safetensors::save(&map, save_path).unwrap();
+    println!("saved model to {}\n", save_path.display());
+
+    // Load into a fresh model to prove it works
+    let loaded = tang_safetensors::load(save_path).unwrap();
+    let state: Vec<(String, Tensor<f64>)> = loaded.into_iter().collect();
+    model.load_state_dict(&state);
+
+    // Clean up
+    std::fs::remove_file(save_path).ok();
+
     // --- Generate text --------------------------------------------------------
 
     let seeds = ["entropy ", "spacetim", "quantum ", "the vacu"];

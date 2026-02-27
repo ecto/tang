@@ -17,3 +17,4 @@ name = "quantum_poet"
 
 [dev-dependencies]
 approx = "0.5"
+tang-safetensors = { workspace = true }
