@@ -1,8 +1,9 @@
 use tang_tensor::{Shape, Tensor};
 use tang_train::{
-    mse_loss, mse_loss_grad, Conv1d, Conv2d, Dropout, Embedding, GroupedQueryAttention, LayerNorm,
-    Linear, Module, ModuleAdam, ModuleSgd, MultiHeadAttention, Optimizer, RMSNorm, ReLU,
-    RotaryEmbedding, Sequential, SiLU, Tanh, TransformerBlock, GELU,
+    mse_loss, mse_loss_grad, AdaptiveAvgPool2d, AvgPool2d, BatchNorm2d, Conv1d, Conv2d, Dropout,
+    Embedding, GroupedQueryAttention, LayerNorm, Linear, MaxPool2d, Module, ModuleAdam, ModuleSgd,
+    MultiHeadAttention, Optimizer, RMSNorm, ReLU, RotaryEmbedding, Sequential, SiLU, Tanh,
+    TransformerBlock, GELU,
 };
 
 #[test]
@@ -961,4 +962,286 @@ fn test_gqa_named_parameters() {
     assert!(names.contains(&"wk.weight".to_string()));
     assert!(names.contains(&"wv.weight".to_string()));
     assert!(names.contains(&"wo.weight".to_string()));
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: Conv2d padding/stride, Pooling, BatchNorm
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_conv2d_with_padding() {
+    // padding=1 on 5x5 input with 3x3 kernel should preserve spatial dims
+    let mut conv = Conv2d::<f64>::with_options(1, 1, 3, 1, 1, 1, 42);
+    let input = Tensor::new(vec![1.0; 1 * 1 * 5 * 5], Shape::from_slice(&[1, 1, 5, 5]));
+    let output = conv.forward(&input);
+    assert_eq!(output.shape().dims(), &[1, 1, 5, 5], "padding=1 should preserve 5x5");
+}
+
+#[test]
+fn test_conv2d_with_stride() {
+    // stride=2 on 6x6 with 3x3 kernel, no padding: out = (6-3)/2+1 = 2
+    let mut conv = Conv2d::<f64>::with_options(1, 1, 3, 2, 0, 1, 42);
+    let input = Tensor::new(vec![1.0; 1 * 1 * 6 * 6], Shape::from_slice(&[1, 1, 6, 6]));
+    let output = conv.forward(&input);
+    assert_eq!(output.shape().dims(), &[1, 1, 2, 2]);
+}
+
+#[test]
+fn test_conv2d_with_dilation() {
+    // dilation=2 on 7x7 with 3x3 kernel: effective_k = 2*(3-1)+1 = 5, out = 7-5+1 = 3
+    let mut conv = Conv2d::<f64>::with_options(1, 1, 3, 1, 0, 2, 42);
+    let input = Tensor::new(vec![1.0; 1 * 1 * 7 * 7], Shape::from_slice(&[1, 1, 7, 7]));
+    let output = conv.forward(&input);
+    assert_eq!(output.shape().dims(), &[1, 1, 3, 3]);
+}
+
+#[test]
+fn test_conv2d_backward_compat() {
+    // Original API should still work (stride=1, padding=0)
+    let mut conv = Conv2d::<f64>::new(1, 4, 3, 42);
+    let input = Tensor::new(vec![0.0; 1 * 1 * 5 * 5], Shape::from_slice(&[1, 1, 5, 5]));
+    let output = conv.forward(&input);
+    assert_eq!(output.shape().dims(), &[1, 4, 3, 3]);
+}
+
+#[test]
+fn test_conv2d_padded_backward_gradient_check() {
+    let mut conv = Conv2d::<f64>::with_options(1, 1, 3, 1, 1, 1, 42);
+    let input = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], Shape::from_slice(&[1, 1, 2, 2]));
+    let eps = 1e-5;
+
+    let _out = conv.forward(&input);
+    // out shape: (2+2*1-3)/1+1 = 2 -> [1,1,2,2]
+    let grad_output = Tensor::new(vec![1.0; 4], Shape::from_slice(&[1, 1, 2, 2]));
+    let grad_input = conv.backward(&grad_output);
+
+    // Check input gradient via finite differences
+    let mut input_mut = input.clone();
+    for h in 0..2 {
+        for w in 0..2 {
+            let orig = input_mut.get(&[0, 0, h, w]);
+
+            input_mut.set(&[0, 0, h, w], orig + eps);
+            let out_plus = conv.forward(&input_mut);
+            let loss_plus: f64 = out_plus.data().iter().sum();
+
+            input_mut.set(&[0, 0, h, w], orig - eps);
+            let out_minus = conv.forward(&input_mut);
+            let loss_minus: f64 = out_minus.data().iter().sum();
+
+            input_mut.set(&[0, 0, h, w], orig);
+
+            let numerical = (loss_plus - loss_minus) / (2.0 * eps);
+            let analytical = grad_input.get(&[0, 0, h, w]);
+            assert!(
+                (numerical - analytical).abs() < 1e-4,
+                "conv2d padded input grad mismatch at [0,0,{},{}]: numerical={}, analytical={}",
+                h, w, numerical, analytical
+            );
+        }
+    }
+}
+
+#[test]
+fn test_maxpool2d_forward() {
+    let mut pool = MaxPool2d::<f64>::new(2);
+    // 1x1x4x4 input
+    let input = Tensor::new(
+        vec![
+            1.0, 2.0, 3.0, 4.0,
+            5.0, 6.0, 7.0, 8.0,
+            9.0, 10.0, 11.0, 12.0,
+            13.0, 14.0, 15.0, 16.0,
+        ],
+        Shape::from_slice(&[1, 1, 4, 4]),
+    );
+    let output = pool.forward(&input);
+    assert_eq!(output.shape().dims(), &[1, 1, 2, 2]);
+    assert_eq!(output.get(&[0, 0, 0, 0]), 6.0);
+    assert_eq!(output.get(&[0, 0, 0, 1]), 8.0);
+    assert_eq!(output.get(&[0, 0, 1, 0]), 14.0);
+    assert_eq!(output.get(&[0, 0, 1, 1]), 16.0);
+}
+
+#[test]
+fn test_maxpool2d_backward() {
+    let mut pool = MaxPool2d::<f64>::new(2);
+    let input = Tensor::new(
+        vec![
+            1.0, 2.0, 3.0, 4.0,
+            5.0, 6.0, 7.0, 8.0,
+            9.0, 10.0, 11.0, 12.0,
+            13.0, 14.0, 15.0, 16.0,
+        ],
+        Shape::from_slice(&[1, 1, 4, 4]),
+    );
+    let _output = pool.forward(&input);
+    let grad = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], Shape::from_slice(&[1, 1, 2, 2]));
+    let grad_input = pool.backward(&grad);
+
+    assert_eq!(grad_input.shape().dims(), &[1, 1, 4, 4]);
+    // Gradient should only flow through max positions
+    assert_eq!(grad_input.get(&[0, 0, 1, 1]), 1.0); // max of top-left 2x2 was at (1,1)=6
+    assert_eq!(grad_input.get(&[0, 0, 0, 0]), 0.0); // non-max position
+}
+
+#[test]
+fn test_avgpool2d_forward() {
+    let mut pool = AvgPool2d::<f64>::new(2);
+    let input = Tensor::new(
+        vec![
+            1.0, 2.0, 3.0, 4.0,
+            5.0, 6.0, 7.0, 8.0,
+            9.0, 10.0, 11.0, 12.0,
+            13.0, 14.0, 15.0, 16.0,
+        ],
+        Shape::from_slice(&[1, 1, 4, 4]),
+    );
+    let output = pool.forward(&input);
+    assert_eq!(output.shape().dims(), &[1, 1, 2, 2]);
+    // Top-left 2x2: (1+2+5+6)/4 = 3.5
+    assert!((output.get(&[0, 0, 0, 0]) - 3.5).abs() < 1e-10);
+    // Bottom-right 2x2: (11+12+15+16)/4 = 13.5
+    assert!((output.get(&[0, 0, 1, 1]) - 13.5).abs() < 1e-10);
+}
+
+#[test]
+fn test_adaptive_avgpool2d() {
+    let mut pool = AdaptiveAvgPool2d::<f64>::new(1, 1);
+    let input = Tensor::new(
+        vec![1.0, 2.0, 3.0, 4.0],
+        Shape::from_slice(&[1, 1, 2, 2]),
+    );
+    let output = pool.forward(&input);
+    assert_eq!(output.shape().dims(), &[1, 1, 1, 1]);
+    assert!((output.get(&[0, 0, 0, 0]) - 2.5).abs() < 1e-10);
+}
+
+#[test]
+fn test_adaptive_avgpool2d_larger() {
+    // 7x7 -> 3x3
+    let mut pool = AdaptiveAvgPool2d::<f64>::new(3, 3);
+    let input = Tensor::new(vec![1.0; 1 * 1 * 7 * 7], Shape::from_slice(&[1, 1, 7, 7]));
+    let output = pool.forward(&input);
+    assert_eq!(output.shape().dims(), &[1, 1, 3, 3]);
+    // All ones in -> all ones out (average of 1s)
+    for h in 0..3 {
+        for w in 0..3 {
+            assert!((output.get(&[0, 0, h, w]) - 1.0).abs() < 1e-10);
+        }
+    }
+}
+
+#[test]
+fn test_adaptive_avgpool2d_backward() {
+    let mut pool = AdaptiveAvgPool2d::<f64>::new(1, 1);
+    let input = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], Shape::from_slice(&[1, 1, 2, 2]));
+    let _out = pool.forward(&input);
+    let grad = Tensor::new(vec![1.0], Shape::from_slice(&[1, 1, 1, 1]));
+    let grad_input = pool.backward(&grad);
+    assert_eq!(grad_input.shape().dims(), &[1, 1, 2, 2]);
+    // Each input gets 1/4 of the gradient
+    for h in 0..2 {
+        for w in 0..2 {
+            assert!((grad_input.get(&[0, 0, h, w]) - 0.25).abs() < 1e-10);
+        }
+    }
+}
+
+#[test]
+fn test_batchnorm2d_forward() {
+    let mut bn = BatchNorm2d::<f64>::new(2);
+    // batch=2, channels=2, 2x2 spatial
+    let input = Tensor::new(
+        vec![
+            // batch 0, channel 0
+            1.0, 2.0, 3.0, 4.0,
+            // batch 0, channel 1
+            10.0, 20.0, 30.0, 40.0,
+            // batch 1, channel 0
+            5.0, 6.0, 7.0, 8.0,
+            // batch 1, channel 1
+            50.0, 60.0, 70.0, 80.0,
+        ],
+        Shape::from_slice(&[2, 2, 2, 2]),
+    );
+    let output = bn.forward(&input);
+    assert_eq!(output.shape().dims(), &[2, 2, 2, 2]);
+
+    // With gamma=1, beta=0: channel 0 should have mean≈0 across batch*spatial
+    let mut ch0_sum = 0.0;
+    for b in 0..2 {
+        for h in 0..2 {
+            for w in 0..2 {
+                ch0_sum += output.get(&[b, 0, h, w]);
+            }
+        }
+    }
+    assert!(
+        (ch0_sum / 8.0).abs() < 1e-10,
+        "channel 0 mean should be ~0, got {}",
+        ch0_sum / 8.0
+    );
+}
+
+#[test]
+fn test_batchnorm2d_eval_mode() {
+    let mut bn = BatchNorm2d::<f64>::new(1);
+    // Train first to update running stats
+    let input = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], Shape::from_slice(&[1, 1, 2, 2]));
+    let _out_train = bn.forward(&input);
+
+    // Switch to eval
+    bn.set_training(false);
+    let out_eval1 = bn.forward(&input);
+    let out_eval2 = bn.forward(&input);
+
+    // Eval outputs should be deterministic
+    for i in 0..4 {
+        assert!(
+            (out_eval1.data()[i] - out_eval2.data()[i]).abs() < 1e-10,
+            "eval mode should be deterministic"
+        );
+    }
+}
+
+#[test]
+fn test_batchnorm2d_backward_gradient_check() {
+    let mut bn = BatchNorm2d::<f64>::new(1);
+    let input = Tensor::new(
+        vec![1.0, 3.0, 2.0, 4.0, 5.0, 7.0, 6.0, 8.0],
+        Shape::from_slice(&[2, 1, 2, 2]),
+    );
+    let eps = 1e-5;
+
+    let _out = bn.forward(&input);
+    let grad_output = Tensor::new(vec![1.0; 8], Shape::from_slice(&[2, 1, 2, 2]));
+    let grad_input = bn.backward(&grad_output);
+
+    let mut input_mut = input.clone();
+    for b in 0..2 {
+        for h in 0..2 {
+            for w in 0..2 {
+                let orig = input_mut.get(&[b, 0, h, w]);
+
+                input_mut.set(&[b, 0, h, w], orig + eps);
+                let out_plus = bn.forward(&input_mut);
+                let loss_plus: f64 = out_plus.data().iter().sum();
+
+                input_mut.set(&[b, 0, h, w], orig - eps);
+                let out_minus = bn.forward(&input_mut);
+                let loss_minus: f64 = out_minus.data().iter().sum();
+
+                input_mut.set(&[b, 0, h, w], orig);
+
+                let numerical = (loss_plus - loss_minus) / (2.0 * eps);
+                let analytical = grad_input.get(&[b, 0, h, w]);
+                assert!(
+                    (numerical - analytical).abs() < 1e-3,
+                    "batchnorm input grad mismatch at [{},0,{},{}]: numerical={}, analytical={}",
+                    b, h, w, numerical, analytical
+                );
+            }
+        }
+    }
 }

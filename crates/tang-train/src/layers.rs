@@ -488,21 +488,42 @@ impl<S: Scalar> Module<S> for Conv1d<S> {
     }
 }
 
-/// 2D convolution layer (cross-correlation, no padding, stride=1).
+/// 2D convolution layer with padding, stride, and dilation support.
 ///
 /// Input: `[batch, in_channels, height, width]`
-/// Output: `[batch, out_channels, height - kh + 1, width - kw + 1]`
+/// Output: `[batch, out_channels, out_h, out_w]`
+///
+/// where `out_h = (height + 2*padding - dilation*(kh-1) - 1) / stride + 1`
 pub struct Conv2d<S: Scalar> {
     pub weight: Parameter<S>, // [out_channels, in_channels, kh, kw]
     pub bias: Parameter<S>,   // [out_channels]
     in_channels: usize,
     out_channels: usize,
     kernel_size: usize,
+    stride: usize,
+    padding: usize,
+    dilation: usize,
     cached_input: Option<Tensor<S>>,
 }
 
 impl<S: Scalar> Conv2d<S> {
+    /// Create Conv2d with default stride=1, padding=0, dilation=1.
     pub fn new(in_channels: usize, out_channels: usize, kernel_size: usize, seed: u64) -> Self {
+        Self::with_options(in_channels, out_channels, kernel_size, 1, 0, 1, seed)
+    }
+
+    /// Create Conv2d with full options.
+    pub fn with_options(
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+        dilation: usize,
+        seed: u64,
+    ) -> Self {
+        assert!(stride > 0, "stride must be > 0");
+        assert!(dilation > 0, "dilation must be > 0");
         Self {
             weight: Parameter::randn(
                 Shape::from_slice(&[out_channels, in_channels, kernel_size, kernel_size]),
@@ -512,7 +533,25 @@ impl<S: Scalar> Conv2d<S> {
             in_channels,
             out_channels,
             kernel_size,
+            stride,
+            padding,
+            dilation,
             cached_input: None,
+        }
+    }
+
+    /// Compute output spatial dimension.
+    fn out_size(&self, input_size: usize) -> usize {
+        let effective_k = self.dilation * (self.kernel_size - 1) + 1;
+        (input_size + 2 * self.padding - effective_k) / self.stride + 1
+    }
+
+    /// Get input value with padding (returns zero for out-of-bounds).
+    fn padded_get(input: &Tensor<S>, b: usize, c: usize, i: isize, j: isize, h: usize, w: usize) -> S {
+        if i < 0 || j < 0 || (i as usize) >= h || (j as usize) >= w {
+            S::ZERO
+        } else {
+            input.get(&[b, c, i as usize, j as usize])
         }
     }
 }
@@ -521,17 +560,17 @@ impl<S: Scalar> Module<S> for Conv2d<S> {
     fn forward(&mut self, input: &Tensor<S>) -> Tensor<S> {
         assert_eq!(input.ndim(), 4, "Conv2d input must be [batch, in_channels, height, width]");
         let batch = input.shape()[0];
-        let ic = input.shape()[1];
-        assert_eq!(ic, self.in_channels);
+        assert_eq!(input.shape()[1], self.in_channels);
         let height = input.shape()[2];
         let width = input.shape()[3];
-        let kh = self.kernel_size;
-        let kw = self.kernel_size;
-        assert!(height >= kh && width >= kw, "spatial dims must be >= kernel_size");
-        let out_h = height - kh + 1;
-        let out_w = width - kw + 1;
+        let out_h = self.out_size(height);
+        let out_w = self.out_size(width);
 
         self.cached_input = Some(input.clone());
+        let pad = self.padding as isize;
+        let stride = self.stride;
+        let dilation = self.dilation;
+        let ksize = self.kernel_size;
 
         Tensor::from_fn(
             Shape::from_slice(&[batch, self.out_channels, out_h, out_w]),
@@ -539,10 +578,12 @@ impl<S: Scalar> Module<S> for Conv2d<S> {
                 let (b, oc, oh, ow) = (idx[0], idx[1], idx[2], idx[3]);
                 let mut sum = self.bias.data.get(&[oc]);
                 for c in 0..self.in_channels {
-                    for ki in 0..kh {
-                        for kj in 0..kw {
+                    for ki in 0..ksize {
+                        for kj in 0..ksize {
+                            let ih = (oh * stride) as isize - pad + (ki * dilation) as isize;
+                            let iw = (ow * stride) as isize - pad + (kj * dilation) as isize;
                             sum += self.weight.data.get(&[oc, c, ki, kj])
-                                * input.get(&[b, c, oh + ki, ow + kj]);
+                                * Self::padded_get(input, b, c, ih, iw, height, width);
                         }
                     }
                 }
@@ -559,20 +600,24 @@ impl<S: Scalar> Module<S> for Conv2d<S> {
         let batch = input.shape()[0];
         let height = input.shape()[2];
         let width = input.shape()[3];
-        let kh = self.kernel_size;
-        let kw = self.kernel_size;
-        let out_h = height - kh + 1;
-        let out_w = width - kw + 1;
+        let out_h = self.out_size(height);
+        let out_w = self.out_size(width);
+        let pad = self.padding as isize;
+        let stride = self.stride;
+        let dilation = self.dilation;
+        let ksize = self.kernel_size;
 
-        // grad_weight[oc][ic][ki][kj] = sum over b,oh,ow of grad_output[b][oc][oh][ow] * input[b][ic][oh+ki][ow+kj]
+        // grad_weight
         let grad_w = Tensor::from_fn(self.weight.data.shape().clone(), |idx| {
             let (oc, ic, ki, kj) = (idx[0], idx[1], idx[2], idx[3]);
             let mut sum = S::ZERO;
             for b in 0..batch {
                 for oh in 0..out_h {
                     for ow in 0..out_w {
+                        let ih = (oh * stride) as isize - pad + (ki * dilation) as isize;
+                        let iw = (ow * stride) as isize - pad + (kj * dilation) as isize;
                         sum += grad_output.get(&[b, oc, oh, ow])
-                            * input.get(&[b, ic, oh + ki, ow + kj]);
+                            * Self::padded_get(input, b, ic, ih, iw, height, width);
                     }
                 }
             }
@@ -580,7 +625,7 @@ impl<S: Scalar> Module<S> for Conv2d<S> {
         });
         self.weight.accumulate_grad(&grad_w);
 
-        // grad_bias[oc] = sum over b,oh,ow of grad_output[b][oc][oh][ow]
+        // grad_bias
         let grad_b = Tensor::from_fn(self.bias.data.shape().clone(), |idx| {
             let oc = idx[0];
             let mut sum = S::ZERO;
@@ -595,17 +640,28 @@ impl<S: Scalar> Module<S> for Conv2d<S> {
         });
         self.bias.accumulate_grad(&grad_b);
 
-        // grad_input[b][ic][i][j] = sum over oc,ki,kj of weight[oc][ic][ki][kj] * grad_output[b][oc][i-ki][j-kj]
-        // where 0 <= i-ki < out_h and 0 <= j-kj < out_w
+        // grad_input[b][ic][i][j] — for each input pixel, sum contributions from all output pixels
         Tensor::from_fn(input.shape().clone(), |idx| {
             let (b, ic, i, j) = (idx[0], idx[1], idx[2], idx[3]);
             let mut sum = S::ZERO;
             for oc in 0..self.out_channels {
-                for ki in 0..kh {
-                    for kj in 0..kw {
-                        if i >= ki && (i - ki) < out_h && j >= kj && (j - kj) < out_w {
-                            sum += self.weight.data.get(&[oc, ic, ki, kj])
-                                * grad_output.get(&[b, oc, i - ki, j - kj]);
+                for ki in 0..ksize {
+                    for kj in 0..ksize {
+                        // i = oh * stride - pad + ki * dilation
+                        // oh = (i + pad - ki * dilation) / stride
+                        let num_h = i as isize + pad - (ki * dilation) as isize;
+                        let num_w = j as isize + pad - (kj * dilation) as isize;
+                        if num_h >= 0
+                            && num_h % stride as isize == 0
+                            && num_w >= 0
+                            && num_w % stride as isize == 0
+                        {
+                            let oh = num_h as usize / stride;
+                            let ow = num_w as usize / stride;
+                            if oh < out_h && ow < out_w {
+                                sum += self.weight.data.get(&[oc, ic, ki, kj])
+                                    * grad_output.get(&[b, oc, oh, ow]);
+                            }
                         }
                     }
                 }
@@ -1256,6 +1312,531 @@ impl<S: Scalar> Module<S> for TransformerBlock<S> {
             params.push((alloc::format!("ff2.{}", name), p));
         }
         params
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MaxPool2d
+// ---------------------------------------------------------------------------
+
+/// 2D max pooling.
+///
+/// Input: `[batch, channels, height, width]`
+/// Output: `[batch, channels, out_h, out_w]`
+pub struct MaxPool2d<S: Scalar> {
+    kernel_size: usize,
+    stride: usize,
+    padding: usize,
+    cached_max_indices: Option<Vec<(usize, usize)>>, // (ih, iw) of max for each output
+    _marker: core::marker::PhantomData<S>,
+}
+
+impl<S: Scalar> MaxPool2d<S> {
+    pub fn new(kernel_size: usize) -> Self {
+        Self::with_options(kernel_size, kernel_size, 0)
+    }
+
+    pub fn with_options(kernel_size: usize, stride: usize, padding: usize) -> Self {
+        Self {
+            kernel_size,
+            stride,
+            padding,
+            cached_max_indices: None,
+            _marker: core::marker::PhantomData,
+        }
+    }
+
+    fn out_size(&self, input_size: usize) -> usize {
+        (input_size + 2 * self.padding - self.kernel_size) / self.stride + 1
+    }
+}
+
+impl<S: Scalar> Module<S> for MaxPool2d<S> {
+    fn forward(&mut self, input: &Tensor<S>) -> Tensor<S> {
+        assert_eq!(input.ndim(), 4);
+        let batch = input.shape()[0];
+        let channels = input.shape()[1];
+        let height = input.shape()[2];
+        let width = input.shape()[3];
+        let out_h = self.out_size(height);
+        let out_w = self.out_size(width);
+        let pad = self.padding as isize;
+
+        let total = batch * channels * out_h * out_w;
+        let mut out_data = Vec::with_capacity(total);
+        let mut indices = Vec::with_capacity(total);
+
+        for b in 0..batch {
+            for c in 0..channels {
+                for oh in 0..out_h {
+                    for ow in 0..out_w {
+                        let mut max_val = S::from_f64(f64::NEG_INFINITY);
+                        let mut max_ih = 0usize;
+                        let mut max_iw = 0usize;
+                        for ki in 0..self.kernel_size {
+                            for kj in 0..self.kernel_size {
+                                let ih = (oh * self.stride) as isize - pad + ki as isize;
+                                let iw = (ow * self.stride) as isize - pad + kj as isize;
+                                if ih >= 0 && (ih as usize) < height && iw >= 0 && (iw as usize) < width {
+                                    let v = input.get(&[b, c, ih as usize, iw as usize]);
+                                    if v > max_val {
+                                        max_val = v;
+                                        max_ih = ih as usize;
+                                        max_iw = iw as usize;
+                                    }
+                                }
+                            }
+                        }
+                        out_data.push(max_val);
+                        indices.push((max_ih, max_iw));
+                    }
+                }
+            }
+        }
+
+        self.cached_max_indices = Some(indices);
+        Tensor::new(out_data, Shape::from_slice(&[batch, channels, out_h, out_w]))
+    }
+
+    fn backward(&mut self, grad_output: &Tensor<S>) -> Tensor<S> {
+        let indices = self.cached_max_indices.as_ref().expect("must call forward before backward");
+        let batch = grad_output.shape()[0];
+        let channels = grad_output.shape()[1];
+        let out_h = grad_output.shape()[2];
+        let out_w = grad_output.shape()[3];
+
+        // Reconstruct input spatial dims from output dims
+        // input_size = (out_size - 1) * stride - 2 * padding + kernel_size
+        let height = (out_h - 1) * self.stride + self.kernel_size - 2 * self.padding;
+        let width = (out_w - 1) * self.stride + self.kernel_size - 2 * self.padding;
+
+        let mut grad_input = alloc::vec![S::ZERO; batch * channels * height * width];
+
+        let mut idx = 0;
+        for b in 0..batch {
+            for c in 0..channels {
+                for oh in 0..out_h {
+                    for ow in 0..out_w {
+                        let (ih, iw) = indices[idx];
+                        grad_input[b * channels * height * width + c * height * width + ih * width + iw]
+                            += grad_output.get(&[b, c, oh, ow]);
+                        idx += 1;
+                    }
+                }
+            }
+        }
+
+        Tensor::new(grad_input, Shape::from_slice(&[batch, channels, height, width]))
+    }
+
+    fn parameters(&self) -> Vec<&Parameter<S>> { Vec::new() }
+    fn parameters_mut(&mut self) -> Vec<&mut Parameter<S>> { Vec::new() }
+}
+
+// ---------------------------------------------------------------------------
+// AvgPool2d
+// ---------------------------------------------------------------------------
+
+/// 2D average pooling.
+///
+/// Input: `[batch, channels, height, width]`
+/// Output: `[batch, channels, out_h, out_w]`
+pub struct AvgPool2d<S: Scalar> {
+    kernel_size: usize,
+    stride: usize,
+    padding: usize,
+    _marker: core::marker::PhantomData<S>,
+}
+
+impl<S: Scalar> AvgPool2d<S> {
+    pub fn new(kernel_size: usize) -> Self {
+        Self::with_options(kernel_size, kernel_size, 0)
+    }
+
+    pub fn with_options(kernel_size: usize, stride: usize, padding: usize) -> Self {
+        Self {
+            kernel_size,
+            stride,
+            padding,
+            _marker: core::marker::PhantomData,
+        }
+    }
+
+    fn out_size(&self, input_size: usize) -> usize {
+        (input_size + 2 * self.padding - self.kernel_size) / self.stride + 1
+    }
+}
+
+impl<S: Scalar> Module<S> for AvgPool2d<S> {
+    fn forward(&mut self, input: &Tensor<S>) -> Tensor<S> {
+        assert_eq!(input.ndim(), 4);
+        let batch = input.shape()[0];
+        let channels = input.shape()[1];
+        let height = input.shape()[2];
+        let width = input.shape()[3];
+        let out_h = self.out_size(height);
+        let out_w = self.out_size(width);
+        let pad = self.padding as isize;
+        let k2 = S::from_f64((self.kernel_size * self.kernel_size) as f64);
+
+        Tensor::from_fn(
+            Shape::from_slice(&[batch, channels, out_h, out_w]),
+            |idx| {
+                let (b, c, oh, ow) = (idx[0], idx[1], idx[2], idx[3]);
+                let mut sum = S::ZERO;
+                for ki in 0..self.kernel_size {
+                    for kj in 0..self.kernel_size {
+                        let ih = (oh * self.stride) as isize - pad + ki as isize;
+                        let iw = (ow * self.stride) as isize - pad + kj as isize;
+                        if ih >= 0 && (ih as usize) < height && iw >= 0 && (iw as usize) < width {
+                            sum += input.get(&[b, c, ih as usize, iw as usize]);
+                        }
+                    }
+                }
+                sum / k2
+            },
+        )
+    }
+
+    fn backward(&mut self, grad_output: &Tensor<S>) -> Tensor<S> {
+        let batch = grad_output.shape()[0];
+        let channels = grad_output.shape()[1];
+        let out_h = grad_output.shape()[2];
+        let out_w = grad_output.shape()[3];
+        let height = (out_h - 1) * self.stride + self.kernel_size - 2 * self.padding;
+        let width = (out_w - 1) * self.stride + self.kernel_size - 2 * self.padding;
+        let k2 = S::from_f64((self.kernel_size * self.kernel_size) as f64);
+        let pad = self.padding as isize;
+
+        Tensor::from_fn(
+            Shape::from_slice(&[batch, channels, height, width]),
+            |idx| {
+                let (b, c, i, j) = (idx[0], idx[1], idx[2], idx[3]);
+                let mut sum = S::ZERO;
+                for oh in 0..out_h {
+                    for ow in 0..out_w {
+                        // Check if (i,j) falls in this pooling window
+                        let start_h = (oh * self.stride) as isize - pad;
+                        let start_w = (ow * self.stride) as isize - pad;
+                        let end_h = start_h + self.kernel_size as isize;
+                        let end_w = start_w + self.kernel_size as isize;
+                        if (i as isize) >= start_h
+                            && (i as isize) < end_h
+                            && (j as isize) >= start_w
+                            && (j as isize) < end_w
+                        {
+                            sum += grad_output.get(&[b, c, oh, ow]) / k2;
+                        }
+                    }
+                }
+                sum
+            },
+        )
+    }
+
+    fn parameters(&self) -> Vec<&Parameter<S>> { Vec::new() }
+    fn parameters_mut(&mut self) -> Vec<&mut Parameter<S>> { Vec::new() }
+}
+
+// ---------------------------------------------------------------------------
+// AdaptiveAvgPool2d
+// ---------------------------------------------------------------------------
+
+/// Adaptive average pooling — outputs a fixed spatial size regardless of input.
+///
+/// Input: `[batch, channels, H, W]`
+/// Output: `[batch, channels, out_h, out_w]`
+pub struct AdaptiveAvgPool2d<S: Scalar> {
+    output_size: (usize, usize),
+    cached_input_shape: Option<(usize, usize, usize, usize)>,
+    _marker: core::marker::PhantomData<S>,
+}
+
+impl<S: Scalar> AdaptiveAvgPool2d<S> {
+    pub fn new(output_h: usize, output_w: usize) -> Self {
+        Self {
+            output_size: (output_h, output_w),
+            cached_input_shape: None,
+            _marker: core::marker::PhantomData,
+        }
+    }
+
+    /// Compute the start index for adaptive pooling bin.
+    fn start_index(out_idx: usize, out_size: usize, in_size: usize) -> usize {
+        (out_idx * in_size) / out_size
+    }
+
+    /// Compute the end index for adaptive pooling bin.
+    fn end_index(out_idx: usize, out_size: usize, in_size: usize) -> usize {
+        ((out_idx + 1) * in_size + out_size - 1) / out_size
+    }
+}
+
+impl<S: Scalar> Module<S> for AdaptiveAvgPool2d<S> {
+    fn forward(&mut self, input: &Tensor<S>) -> Tensor<S> {
+        assert_eq!(input.ndim(), 4);
+        let batch = input.shape()[0];
+        let channels = input.shape()[1];
+        let in_h = input.shape()[2];
+        let in_w = input.shape()[3];
+        let (out_h, out_w) = self.output_size;
+
+        self.cached_input_shape = Some((batch, channels, in_h, in_w));
+
+        Tensor::from_fn(
+            Shape::from_slice(&[batch, channels, out_h, out_w]),
+            |idx| {
+                let (b, c, oh, ow) = (idx[0], idx[1], idx[2], idx[3]);
+                let h_start = Self::start_index(oh, out_h, in_h);
+                let h_end = Self::end_index(oh, out_h, in_h);
+                let w_start = Self::start_index(ow, out_w, in_w);
+                let w_end = Self::end_index(ow, out_w, in_w);
+                let count = (h_end - h_start) * (w_end - w_start);
+                let mut sum = S::ZERO;
+                for ih in h_start..h_end {
+                    for iw in w_start..w_end {
+                        sum += input.get(&[b, c, ih, iw]);
+                    }
+                }
+                sum / S::from_f64(count as f64)
+            },
+        )
+    }
+
+    fn backward(&mut self, grad_output: &Tensor<S>) -> Tensor<S> {
+        let (batch, channels, in_h, in_w) =
+            self.cached_input_shape.expect("must call forward before backward");
+        let (out_h, out_w) = self.output_size;
+
+        Tensor::from_fn(
+            Shape::from_slice(&[batch, channels, in_h, in_w]),
+            |idx| {
+                let (b, c, i, j) = (idx[0], idx[1], idx[2], idx[3]);
+                let mut sum = S::ZERO;
+                for oh in 0..out_h {
+                    let h_start = Self::start_index(oh, out_h, in_h);
+                    let h_end = Self::end_index(oh, out_h, in_h);
+                    if i < h_start || i >= h_end {
+                        continue;
+                    }
+                    for ow in 0..out_w {
+                        let w_start = Self::start_index(ow, out_w, in_w);
+                        let w_end = Self::end_index(ow, out_w, in_w);
+                        if j < w_start || j >= w_end {
+                            continue;
+                        }
+                        let count = (h_end - h_start) * (w_end - w_start);
+                        sum += grad_output.get(&[b, c, oh, ow]) / S::from_f64(count as f64);
+                    }
+                }
+                sum
+            },
+        )
+    }
+
+    fn parameters(&self) -> Vec<&Parameter<S>> { Vec::new() }
+    fn parameters_mut(&mut self) -> Vec<&mut Parameter<S>> { Vec::new() }
+}
+
+// ---------------------------------------------------------------------------
+// BatchNorm2d
+// ---------------------------------------------------------------------------
+
+/// Batch normalization for 2D inputs (CNNs).
+///
+/// Input: `[batch, channels, height, width]`
+///
+/// During training: normalizes using batch statistics, updates running stats.
+/// During eval: normalizes using running statistics.
+pub struct BatchNorm2d<S: Scalar> {
+    pub gamma: Parameter<S>,  // [channels]
+    pub beta: Parameter<S>,   // [channels]
+    running_mean: Tensor<S>,  // [channels]
+    running_var: Tensor<S>,   // [channels]
+    momentum: f64,
+    eps: f64,
+    num_channels: usize,
+    training: bool,
+    cached_input: Option<Tensor<S>>,
+    cached_mean: Option<Tensor<S>>,   // [channels]
+    cached_var: Option<Tensor<S>>,    // [channels]
+}
+
+impl<S: Scalar> BatchNorm2d<S> {
+    pub fn new(num_channels: usize) -> Self {
+        Self {
+            gamma: Parameter::new(Tensor::ones(Shape::from_slice(&[num_channels]))),
+            beta: Parameter::new(Tensor::zeros(Shape::from_slice(&[num_channels]))),
+            running_mean: Tensor::zeros(Shape::from_slice(&[num_channels])),
+            running_var: Tensor::ones(Shape::from_slice(&[num_channels])),
+            momentum: 0.1,
+            eps: 1e-5,
+            num_channels,
+            training: true,
+            cached_input: None,
+            cached_mean: None,
+            cached_var: None,
+        }
+    }
+}
+
+impl<S: Scalar> Module<S> for BatchNorm2d<S> {
+    fn forward(&mut self, input: &Tensor<S>) -> Tensor<S> {
+        assert_eq!(input.ndim(), 4, "BatchNorm2d input must be [batch, channels, H, W]");
+        let batch = input.shape()[0];
+        let channels = input.shape()[1];
+        assert_eq!(channels, self.num_channels);
+        let height = input.shape()[2];
+        let width = input.shape()[3];
+        let spatial = height * width;
+        let n = S::from_f64((batch * spatial) as f64);
+        let eps = S::from_f64(self.eps);
+
+        if self.training {
+            self.cached_input = Some(input.clone());
+
+            // Compute per-channel mean and variance
+            let mut mean_data = alloc::vec![S::ZERO; channels];
+            let mut var_data = alloc::vec![S::ZERO; channels];
+
+            for c in 0..channels {
+                let mut sum = S::ZERO;
+                for b in 0..batch {
+                    for h in 0..height {
+                        for w in 0..width {
+                            sum += input.get(&[b, c, h, w]);
+                        }
+                    }
+                }
+                mean_data[c] = sum / n;
+
+                let mut var_sum = S::ZERO;
+                for b in 0..batch {
+                    for h in 0..height {
+                        for w in 0..width {
+                            let diff = input.get(&[b, c, h, w]) - mean_data[c];
+                            var_sum += diff * diff;
+                        }
+                    }
+                }
+                var_data[c] = var_sum / n;
+            }
+
+            let mean = Tensor::new(mean_data, Shape::from_slice(&[channels]));
+            let var = Tensor::new(var_data, Shape::from_slice(&[channels]));
+
+            // Update running stats
+            let mom = S::from_f64(self.momentum);
+            let one_minus = S::from_f64(1.0 - self.momentum);
+            for c in 0..channels {
+                self.running_mean.data_mut()[c] =
+                    one_minus * self.running_mean.get(&[c]) + mom * mean.get(&[c]);
+                self.running_var.data_mut()[c] =
+                    one_minus * self.running_var.get(&[c]) + mom * var.get(&[c]);
+            }
+
+            self.cached_mean = Some(mean.clone());
+            self.cached_var = Some(var.clone());
+
+            // Normalize and scale
+            Tensor::from_fn(input.shape().clone(), |idx| {
+                let c = idx[1];
+                let x_norm = (input.get(idx) - mean.get(&[c])) / (var.get(&[c]) + eps).sqrt();
+                self.gamma.data.get(&[c]) * x_norm + self.beta.data.get(&[c])
+            })
+        } else {
+            // Eval mode: use running stats
+            Tensor::from_fn(input.shape().clone(), |idx| {
+                let c = idx[1];
+                let x_norm = (input.get(idx) - self.running_mean.get(&[c]))
+                    / (self.running_var.get(&[c]) + eps).sqrt();
+                self.gamma.data.get(&[c]) * x_norm + self.beta.data.get(&[c])
+            })
+        }
+    }
+
+    fn backward(&mut self, grad_output: &Tensor<S>) -> Tensor<S> {
+        let input = self.cached_input.as_ref().expect("must call forward before backward");
+        let mean = self.cached_mean.as_ref().expect("must call forward before backward");
+        let var = self.cached_var.as_ref().expect("must call forward before backward");
+
+        let batch = input.shape()[0];
+        let channels = input.shape()[1];
+        let height = input.shape()[2];
+        let width = input.shape()[3];
+        let spatial = height * width;
+        let n = S::from_f64((batch * spatial) as f64);
+        let eps = S::from_f64(self.eps);
+
+        // Gradient w.r.t. gamma and beta
+        let mut grad_gamma = alloc::vec![S::ZERO; channels];
+        let mut grad_beta = alloc::vec![S::ZERO; channels];
+
+        for c in 0..channels {
+            let inv_std = S::from_f64(1.0) / (var.get(&[c]) + eps).sqrt();
+            for b in 0..batch {
+                for h in 0..height {
+                    for w in 0..width {
+                        let x_norm = (input.get(&[b, c, h, w]) - mean.get(&[c])) * inv_std;
+                        grad_gamma[c] += grad_output.get(&[b, c, h, w]) * x_norm;
+                        grad_beta[c] += grad_output.get(&[b, c, h, w]);
+                    }
+                }
+            }
+        }
+
+        self.gamma.accumulate_grad(&Tensor::new(grad_gamma, Shape::from_slice(&[channels])));
+        self.beta.accumulate_grad(&Tensor::new(grad_beta, Shape::from_slice(&[channels])));
+
+        // Gradient w.r.t. input
+        Tensor::from_fn(input.shape().clone(), |idx| {
+            let c = idx[1];
+            let inv_std = S::from_f64(1.0) / (var.get(&[c]) + eps).sqrt();
+            let x_hat = (input.get(idx) - mean.get(&[c])) * inv_std;
+            let g = self.gamma.data.get(&[c]);
+
+            // Sum of grad_output * gamma and grad_output * gamma * x_hat for this channel
+            let mut sum_dy = S::ZERO;
+            let mut sum_dy_xhat = S::ZERO;
+            for b in 0..batch {
+                for h in 0..height {
+                    for w in 0..width {
+                        let dy = grad_output.get(&[b, c, h, w]);
+                        let xh = (input.get(&[b, c, h, w]) - mean.get(&[c])) * inv_std;
+                        sum_dy += dy;
+                        sum_dy_xhat += dy * xh;
+                    }
+                }
+            }
+
+            g * inv_std * (grad_output.get(idx) - sum_dy / n - x_hat * sum_dy_xhat / n)
+        })
+    }
+
+    fn parameters(&self) -> Vec<&Parameter<S>> {
+        alloc::vec![&self.gamma, &self.beta]
+    }
+
+    fn parameters_mut(&mut self) -> Vec<&mut Parameter<S>> {
+        alloc::vec![&mut self.gamma, &mut self.beta]
+    }
+
+    fn named_parameters(&self) -> Vec<(String, &Parameter<S>)> {
+        alloc::vec![
+            (String::from("weight"), &self.gamma),
+            (String::from("bias"), &self.beta),
+        ]
+    }
+
+    fn named_parameters_mut(&mut self) -> Vec<(String, &mut Parameter<S>)> {
+        alloc::vec![
+            (String::from("weight"), &mut self.gamma),
+            (String::from("bias"), &mut self.beta),
+        ]
+    }
+
+    fn set_training(&mut self, training: bool) {
+        self.training = training;
     }
 }
 
