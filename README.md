@@ -4,7 +4,7 @@
 
 # tang
 
-Math for physical reality. The shared foundation beneath geometry kernels, physics engines, and the full design→simulate→manufacture→deploy loop.
+Differentiable computing in Rust.
 
 ```rust
 use tang::*;
