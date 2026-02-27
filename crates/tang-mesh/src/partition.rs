@@ -250,6 +250,7 @@ fn wire_node_deps(node: WireNode) -> Vec<u32> {
         | WireNode::Sin(a)
         | WireNode::Exp2(a)
         | WireNode::Log2(a) => vec![a],
+        WireNode::Select(c, a, b) => vec![c, a, b],
     }
 }
 
@@ -268,6 +269,7 @@ fn remap_wire_node(node: WireNode, map: &HashMap<u32, u32>) -> WireNode {
         WireNode::Atan2(y, x) => WireNode::Atan2(remap(y), remap(x)),
         WireNode::Exp2(a) => WireNode::Exp2(remap(a)),
         WireNode::Log2(a) => WireNode::Log2(remap(a)),
+        WireNode::Select(c, a, b) => WireNode::Select(remap(c), remap(a), remap(b)),
     }
 }
 

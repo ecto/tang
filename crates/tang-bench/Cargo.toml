@@ -27,11 +27,16 @@ harness = false
 name = "expr_graph"
 harness = false
 
+[[bench]]
+name = "gpu_training"
+harness = false
+
 [dependencies]
 tang      = { workspace = true, features = ["std"] }
 tang-la   = { workspace = true, features = ["std"] }
 tang-ad   = { workspace = true }
 tang-expr = { workspace = true }
+tang-gpu  = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

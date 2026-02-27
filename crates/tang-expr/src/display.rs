@@ -37,6 +37,14 @@ impl ExprGraph {
             }
             Node::Exp2(a) => format!("exp2({})", self.fmt_expr(a)),
             Node::Log2(a) => format!("log2({})", self.fmt_expr(a)),
+            Node::Select(c, a, b) => {
+                format!(
+                    "select({}, {}, {})",
+                    self.fmt_expr(c),
+                    self.fmt_expr(a),
+                    self.fmt_expr(b)
+                )
+            }
         }
     }
 }

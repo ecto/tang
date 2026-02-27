@@ -386,6 +386,11 @@ impl Scalar for ExprId {
     fn from_i32(v: i32) -> Self {
         with_graph(|g| g.lit(v as f64))
     }
+
+    #[inline]
+    fn select(cond: Self, a: Self, b: Self) -> Self {
+        with_graph(|g| g.select(cond, a, b))
+    }
 }
 
 // --- Display for ExprId (needed by Scalar bound) ---

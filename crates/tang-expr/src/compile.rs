@@ -76,6 +76,11 @@ impl ExprGraph {
                 | Node::Log2(a) => {
                     stack.push(a.0 as usize);
                 }
+                Node::Select(c, a, b) => {
+                    stack.push(c.0 as usize);
+                    stack.push(a.0 as usize);
+                    stack.push(b.0 as usize);
+                }
             }
         }
         live
@@ -104,6 +109,13 @@ fn eval_node(node: &Node, vals: &[f64], inputs: &[f64]) -> f64 {
         Node::Atan2(y, x) => vals[y.0 as usize].atan2(vals[x.0 as usize]),
         Node::Exp2(a) => vals[a.0 as usize].exp2(),
         Node::Log2(a) => vals[a.0 as usize].log2(),
+        Node::Select(c, a, b) => {
+            if vals[c.0 as usize] > 0.0 {
+                vals[a.0 as usize]
+            } else {
+                vals[b.0 as usize]
+            }
+        }
     }
 }
 

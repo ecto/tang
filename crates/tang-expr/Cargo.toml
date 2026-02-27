@@ -7,3 +7,6 @@ description = "RISC expression graph for symbolic computation, differentiation, 
 
 [dependencies]
 tang = { workspace = true, features = ["std"] }
+
+[[example]]
+name = "symbolic_regression"

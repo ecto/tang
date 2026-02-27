@@ -340,6 +340,35 @@ impl<S: Scalar> Tensor<S> {
         Self::from_fn(out_shape, |idx| c.get(idx[0], idx[1]))
     }
 
+    // --- Stacking ---
+
+    /// Stack tensors along a new leading dimension.
+    /// All tensors must have the same shape. Result has shape [N, ...original_shape].
+    pub fn stack(tensors: &[&Tensor<S>]) -> Self {
+        assert!(!tensors.is_empty(), "stack: need at least one tensor");
+        let inner_shape = tensors[0].shape();
+        for t in &tensors[1..] {
+            assert_eq!(
+                t.shape(),
+                inner_shape,
+                "stack: all tensors must have same shape"
+            );
+        }
+
+        let n = tensors.len();
+        let mut new_dims = Vec::with_capacity(inner_shape.ndim() + 1);
+        new_dims.push(n);
+        new_dims.extend_from_slice(inner_shape.dims());
+        let new_shape = Shape::new(new_dims);
+
+        let mut data = Vec::with_capacity(new_shape.numel());
+        for t in tensors {
+            data.extend_from_slice(t.data());
+        }
+
+        Self::new(data, new_shape)
+    }
+
     // --- Conversions ---
 
     /// Convert 1-D tensor to DVec.

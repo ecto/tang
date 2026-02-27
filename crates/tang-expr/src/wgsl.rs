@@ -144,6 +144,11 @@ impl ExprGraph {
                 | Node::Log2(a) => {
                     stack.push(a.0 as usize);
                 }
+                Node::Select(c, a, b) => {
+                    stack.push(c.0 as usize);
+                    stack.push(a.0 as usize);
+                    stack.push(b.0 as usize);
+                }
             }
         }
         live
@@ -172,6 +177,15 @@ impl ExprGraph {
             }
             Node::Exp2(a) => format!("exp2({})", self.wgsl_ref(a)),
             Node::Log2(a) => format!("log2({})", self.wgsl_ref(a)),
+            Node::Select(c, a, b) => {
+                // WGSL select(false_val, true_val, cond) — false value FIRST
+                format!(
+                    "select({}, {}, {} > 0.0)",
+                    self.wgsl_ref(b),
+                    self.wgsl_ref(a),
+                    self.wgsl_ref(c)
+                )
+            }
         }
     }
 
@@ -269,6 +283,20 @@ mod tests {
         let kernel = g.to_wgsl(&[prod], 1);
         // Literal should be inlined, not assigned to a t variable
         assert!(kernel.source.contains("3.14"));
+    }
+
+    #[test]
+    fn wgsl_select() {
+        let mut g = ExprGraph::new();
+        let x = g.var(0);
+        let a = g.lit(3.0);
+        let b = g.lit(7.0);
+        let s = g.select(x, a, b);
+
+        let kernel = g.to_wgsl(&[s], 1);
+        // WGSL select(false_val, true_val, cond)
+        assert!(kernel.source.contains("select("));
+        assert!(kernel.source.contains("> 0.0)"));
     }
 
     #[test]

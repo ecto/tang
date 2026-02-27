@@ -117,6 +117,13 @@ impl ExprGraph {
                 let r = self.recip(ln2_a);
                 self.mul(da, r)
             }
+
+            Node::Select(c, a, b) => {
+                // Straight-through: condition doesn't contribute gradient
+                let da = self.diff_inner(a, var, memo);
+                let db = self.diff_inner(b, var, memo);
+                self.select(c, da, db)
+            }
         };
 
         memo.insert((expr, var), result);
@@ -240,6 +247,23 @@ mod tests {
         // d/dx (2x^2) = 4x, at x=3 → 12
         let result: f64 = g.eval(d, &[3.0]);
         assert!((result - 12.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn diff_select() {
+        // d/dx select(x, x*x, x+1) at x=2 (cond>0 → d/dx x² = 2x = 4)
+        let mut g = ExprGraph::new();
+        let x = g.var(0);
+        let xx = g.mul(x, x);
+        let xp1 = g.add(x, ExprId::ONE);
+        let s = g.select(x, xx, xp1);
+        let ds = g.diff(s, 0);
+        let result: f64 = g.eval(ds, &[2.0]);
+        assert!((result - 4.0).abs() < 1e-10);
+
+        // At x=-1 (cond<=0 → d/dx (x+1) = 1)
+        let result2: f64 = g.eval(ds, &[-1.0]);
+        assert!((result2 - 1.0).abs() < 1e-10);
     }
 
     #[test]

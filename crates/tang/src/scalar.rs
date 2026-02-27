@@ -70,6 +70,9 @@ pub trait Scalar:
     fn from_f64(v: f64) -> Self;
     fn to_f64(self) -> f64;
     fn from_i32(v: i32) -> Self;
+
+    /// Branchless select: returns `a` if `cond > 0`, else `b`.
+    fn select(cond: Self, a: Self, b: Self) -> Self;
 }
 
 // In std mode, use inherent float methods. In no_std, use libm.
@@ -503,6 +506,10 @@ macro_rules! impl_scalar_float {
             #[inline] fn from_f64(v: f64) -> Self { v as $t }
             #[inline] fn to_f64(self) -> f64 { self as f64 }
             #[inline] fn from_i32(v: i32) -> Self { v as $t }
+
+            #[inline] fn select(cond: Self, a: Self, b: Self) -> Self {
+                if cond > 0.0 as $t { a } else { b }
+            }
         }
         }
     };

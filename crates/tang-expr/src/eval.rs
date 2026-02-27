@@ -36,6 +36,9 @@ impl ExprGraph {
                     let x = vals[a.0 as usize];
                     x.ln() * S::from_f64(std::f64::consts::LOG2_E)
                 }
+                Node::Select(c, a, b) => {
+                    S::select(vals[c.0 as usize], vals[a.0 as usize], vals[b.0 as usize])
+                }
             };
             vals.push(v);
         }
@@ -70,6 +73,9 @@ impl ExprGraph {
                 Node::Log2(a) => {
                     let x = vals[a.0 as usize];
                     x.ln() * S::from_f64(std::f64::consts::LOG2_E)
+                }
+                Node::Select(c, a, b) => {
+                    S::select(vals[c.0 as usize], vals[a.0 as usize], vals[b.0 as usize])
                 }
             };
             vals.push(v);
@@ -121,6 +127,40 @@ mod tests {
         let s = g.sin(x);
         let result: f64 = g.eval(s, &[std::f64::consts::FRAC_PI_2]);
         assert!((result - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn eval_select_positive_cond() {
+        let mut g = ExprGraph::new();
+        let cond = g.lit(1.0);
+        let a = g.lit(3.0);
+        let b = g.lit(7.0);
+        let s = g.select(cond, a, b);
+        let result: f64 = g.eval(s, &[]);
+        assert!((result - 3.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn eval_select_negative_cond() {
+        let mut g = ExprGraph::new();
+        let cond = g.lit(-1.0);
+        let a = g.lit(3.0);
+        let b = g.lit(7.0);
+        let s = g.select(cond, a, b);
+        let result: f64 = g.eval(s, &[]);
+        assert!((result - 7.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn eval_select_zero_cond() {
+        // cond == 0 should select b (not > 0)
+        let mut g = ExprGraph::new();
+        let cond = g.lit(0.0);
+        let a = g.lit(3.0);
+        let b = g.lit(7.0);
+        let s = g.select(cond, a, b);
+        let result: f64 = g.eval(s, &[]);
+        assert!((result - 7.0).abs() < 1e-10);
     }
 
     #[test]

@@ -14,6 +14,18 @@ impl ExprId {
     pub const ONE: Self = Self(1);
     /// The constant 2.0 (index 2).
     pub const TWO: Self = Self(2);
+
+    /// Create an ExprId from a raw index.
+    #[inline]
+    pub fn from_index(index: u32) -> Self {
+        Self(index)
+    }
+
+    /// The raw index of this expression in the graph.
+    #[inline]
+    pub fn index(&self) -> u32 {
+        self.0
+    }
 }
 
 impl fmt::Debug for ExprId {
@@ -71,6 +83,8 @@ pub enum Node {
     Exp2(ExprId),
     /// Base-2 logarithm.
     Log2(ExprId),
+    /// Branchless select: returns `a` if `cond > 0`, else `b`.
+    Select(ExprId, ExprId, ExprId),
 }
 
 impl Node {

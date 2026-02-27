@@ -37,7 +37,7 @@ let v = q.rotate(Vec3::new(1.0, 0.0, 0.0)); // ≈ (0, 1, 0)
 | **[`tang-la`](crates/tang-la)** | Dynamic linear algebra — `DVec`, `DMat`, LU, SVD, Cholesky, QR, eigendecomposition |
 | **[`tang-ad`](crates/tang-ad)** | Reverse-mode autodiff — tape, `grad`, `jacobian`, `hessian`, VJP, JVP |
 | **[`tang-sparse`](crates/tang-sparse)** | Sparse matrices — CSR, CSC, COO, SpMV |
-| **[`tang-gpu`](crates/tang-gpu)** | GPU compute via wgpu — SpMV, batch ops, tensor kernels |
+| **[`tang-gpu`](crates/tang-gpu)** | GPU compute & training via wgpu — fused kernels, matmul, backward passes, trainer |
 | **[`tang-optim`](crates/tang-optim)** | Optimizers — SGD, Adam/AdamW, L-BFGS, Newton, Levenberg-Marquardt |
 | **[`tang-tensor`](crates/tang-tensor)** | N-d arrays — broadcasting, slicing, matmul, reductions |
 | **[`tang-train`](crates/tang-train)** | Training — `Module` trait, layers, loss functions |
@@ -210,6 +210,23 @@ tang's dense LA is pure generic Rust (works with `Dual<f64>`, any `Scalar` impl)
 | trig chain | 4.5ns | 8.2ns | 1.8x |
 | vec3 chain | 3.7ns | 15.4ns | 4.2x |
 | quat rotate | 15.0ns | 30.9ns | 2.1x |
+
+### GPU training pipeline (tang-gpu, Apple M-series Metal)
+
+| Operation | time |
+|-----------|------|
+| matmul 16x16 | 124µs |
+| matmul 32x32 | 124µs |
+| matmul 64x64 | 127µs |
+| matmul 128x128 | 127µs |
+| fused elementwise (a+b)² 4096 | 2.9ms |
+| Linear forward [4,128]→[4,64] | 6.2ms |
+| Linear backward [4,128]→[4,64] | 3.4ms |
+| Sequential(2→8→1) fwd+bwd | 28ms |
+| MSE loss (64 elements) | 8.4ms |
+| XOR training step (4 samples) | 60ms |
+
+Matmul is dispatch-bound at small sizes (constant ~124µs for 16-128). The training step includes forward, loss, backward, and Adam update for a 3-layer network.
 
 ## Examples
 

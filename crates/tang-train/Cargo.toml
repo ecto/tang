@@ -15,6 +15,9 @@ tang-optim = { workspace = true }
 [[example]]
 name = "quantum_poet"
 
+[[example]]
+name = "pinn_poisson"
+
 [dev-dependencies]
 approx = "0.5"
 tang-safetensors = { workspace = true }

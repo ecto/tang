@@ -337,6 +337,129 @@ impl<S: Scalar> SymmetricEigen<S> {
     }
 }
 
+/// Branchless Jacobi eigendecomposition for tracing through ExprId.
+///
+/// Unlike `SymmetricEigen::new()`, this variant has no data-dependent branches:
+/// - Cyclic sweep order (no max-finding)
+/// - Fixed sweep count (no convergence checks)
+/// - `S::select()` for sign-dependent terms
+/// - Sorting network for eigenvalue ordering
+///
+/// This makes it safe to trace through symbolic expression graphs.
+pub fn branchless_jacobi_eigen<S: Scalar>(
+    mat: &DMat<S>,
+    n_sweeps: usize,
+) -> (DVec<S>, DMat<S>) {
+    let n = mat.nrows();
+    assert!(mat.is_square(), "branchless_jacobi_eigen: matrix must be square");
+
+    // Working copy of the matrix (will be diagonalized in place)
+    let mut d = mat.clone();
+    // Eigenvector accumulator, starts as identity
+    let mut v = DMat::<S>::identity(n);
+
+    let eps = S::EPSILON;
+
+    for _ in 0..n_sweeps {
+        // Cyclic Jacobi: process ALL off-diagonal pairs (p,q) in fixed order
+        for p in 0..n {
+            for q in (p + 1)..n {
+                let a_pq = d.get(p, q);
+
+                // Guard: blend rotation with identity when off-diagonal is tiny
+                // active = 1.0 if |a_pq| > eps, else 0.0
+                let a_pq_abs = (a_pq * a_pq).sqrt();
+                let active = S::select(a_pq_abs - eps, S::ONE, S::ZERO);
+
+                let d_pp = d.get(p, p);
+                let d_qq = d.get(q, q);
+
+                // theta = (d[q] - d[p]) / (2 * a[p][q])
+                // When a_pq ~ 0, we need to avoid division by zero.
+                // Use a_pq + (1 - active) * ONE to make denominator safe.
+                let safe_apq = a_pq + (S::ONE - active) * S::ONE;
+                let theta = (d_qq - d_pp) / (S::TWO * safe_apq);
+
+                // Branchless t = sign(theta) / (|theta| + sqrt(1 + theta^2))
+                let sign_theta = S::select(theta, S::ONE, -S::ONE);
+                let abs_theta = (theta * theta).sqrt();
+                let t = sign_theta / (abs_theta + (S::ONE + theta * theta).sqrt());
+
+                // Blend: if not active, t = 0 (identity rotation)
+                let t = t * active;
+
+                let c = (S::ONE + t * t).sqrt().recip();
+                let s = t * c;
+
+                // Update diagonal elements
+                let new_pp = d_pp - t * a_pq * active;
+                let new_qq = d_qq + t * a_pq * active;
+                d.set(p, p, new_pp);
+                d.set(q, q, new_qq);
+                d.set(p, q, S::ZERO);
+                d.set(q, p, S::ZERO);
+
+                // Update off-diagonal rows/columns
+                for i in 0..n {
+                    if i == p || i == q {
+                        continue;
+                    }
+                    let d_ip = d.get(i, p);
+                    let d_iq = d.get(i, q);
+                    let new_ip = c * d_ip - s * d_iq;
+                    let new_iq = s * d_ip + c * d_iq;
+                    d.set(i, p, new_ip);
+                    d.set(p, i, new_ip);
+                    d.set(i, q, new_iq);
+                    d.set(q, i, new_iq);
+                }
+
+                // Update eigenvector columns
+                for i in 0..n {
+                    let v_ip = v.get(i, p);
+                    let v_iq = v.get(i, q);
+                    v.set(i, p, c * v_ip - s * v_iq);
+                    v.set(i, q, s * v_ip + c * v_iq);
+                }
+            }
+        }
+    }
+
+    // Extract eigenvalues from diagonal
+    let mut eigenvalues: Vec<S> = (0..n).map(|i| d.get(i, i)).collect();
+    // Columns of v are the eigenvectors — we need to sort by eigenvalue.
+
+    // Branchless sorting network (bubble sort variant with select)
+    // For small n this is fine; produces O(n^2) comparators.
+    for _ in 0..n {
+        for j in 0..(n - 1) {
+            // Compare eigenvalues[j] and eigenvalues[j+1]
+            let a = eigenvalues[j];
+            let b = eigenvalues[j + 1];
+            // do_swap = 1 if a > b (need to swap to ascending), else 0
+            let do_swap = S::select(a - b, S::ONE, S::ZERO);
+
+            // Branchless swap for eigenvalues
+            let new_a = S::select(do_swap - S::HALF, b, a); // min
+            let new_b = S::select(do_swap - S::HALF, a, b); // max
+            eigenvalues[j] = new_a;
+            eigenvalues[j + 1] = new_b;
+
+            // Branchless swap for eigenvector columns
+            for i in 0..n {
+                let vj = v.get(i, j);
+                let vj1 = v.get(i, j + 1);
+                let new_vj = S::select(do_swap - S::HALF, vj1, vj);
+                let new_vj1 = S::select(do_swap - S::HALF, vj, vj1);
+                v.set(i, j, new_vj);
+                v.set(i, j + 1, new_vj1);
+            }
+        }
+    }
+
+    (DVec::from_fn(n, |i| eigenvalues[i]), v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,6 +590,127 @@ mod tests {
                     j,
                     recon.get(i, j),
                     a.get(i, j)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn branchless_jacobi_4x4() {
+        let a = DMat::from_fn(4, 4, |i, j| {
+            [
+                [4.0, 1.0, 0.5, 0.0],
+                [1.0, 3.0, 1.0, 0.5],
+                [0.5, 1.0, 2.0, 1.0],
+                [0.0, 0.5, 1.0, 1.0],
+            ][i][j]
+        });
+
+        let (evals, evecs) = branchless_jacobi_eigen(&a, 30);
+        let eig_ref = SymmetricEigen::new(&a);
+
+        // Check eigenvalues match reference
+        for i in 0..4 {
+            assert!(
+                (evals[i] - eig_ref.eigenvalues[i]).abs() < 1e-10,
+                "eigenvalue {} mismatch: branchless={}, ref={}",
+                i,
+                evals[i],
+                eig_ref.eigenvalues[i]
+            );
+        }
+
+        // Check eigenvectors are orthogonal
+        let vtv = evecs.transpose().mul_mat(&evecs);
+        for i in 0..4 {
+            for j in 0..4 {
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (vtv.get(i, j) - expected).abs() < 1e-10,
+                    "V^T V mismatch at ({}, {}): {}",
+                    i,
+                    j,
+                    vtv.get(i, j)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn branchless_jacobi_8x8() {
+        let n = 8;
+        let a = DMat::from_fn(n, n, |i, j| {
+            if i == j {
+                (i + 1) as f64 * 2.0
+            } else {
+                1.0 / ((i as f64 - j as f64).abs() + 1.0)
+            }
+        });
+        let a = DMat::from_fn(n, n, |i, j| (a.get(i, j) + a.get(j, i)) * 0.5);
+
+        let (evals, evecs) = branchless_jacobi_eigen(&a, 30);
+        let eig_ref = SymmetricEigen::new(&a);
+
+        for i in 0..n {
+            assert!(
+                (evals[i] - eig_ref.eigenvalues[i]).abs() < 1e-10,
+                "eigenvalue {} mismatch: branchless={}, ref={}",
+                i,
+                evals[i],
+                eig_ref.eigenvalues[i]
+            );
+        }
+
+        let vtv = evecs.transpose().mul_mat(&evecs);
+        for i in 0..n {
+            for j in 0..n {
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (vtv.get(i, j) - expected).abs() < 1e-10,
+                    "V^T V mismatch at ({}, {}): {}",
+                    i,
+                    j,
+                    vtv.get(i, j)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn branchless_jacobi_16x16() {
+        let n = 16;
+        let a = DMat::from_fn(n, n, |i, j| {
+            if i == j {
+                (i + 1) as f64 * 3.0
+            } else {
+                1.0 / ((i as f64 - j as f64).abs() + 0.5)
+            }
+        });
+        let a = DMat::from_fn(n, n, |i, j| (a.get(i, j) + a.get(j, i)) * 0.5);
+
+        let (evals, evecs) = branchless_jacobi_eigen(&a, 30);
+        let eig_ref = SymmetricEigen::new(&a);
+
+        for i in 0..n {
+            assert!(
+                (evals[i] - eig_ref.eigenvalues[i]).abs() < 1e-8,
+                "eigenvalue {} mismatch: branchless={}, ref={}",
+                i,
+                evals[i],
+                eig_ref.eigenvalues[i]
+            );
+        }
+
+        let vtv = evecs.transpose().mul_mat(&evecs);
+        for i in 0..n {
+            for j in 0..n {
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (vtv.get(i, j) - expected).abs() < 1e-8,
+                    "V^T V mismatch at ({}, {}): {}",
+                    i,
+                    j,
+                    vtv.get(i, j)
                 );
             }
         }

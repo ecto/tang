@@ -62,6 +62,12 @@ impl ExprGraph {
                 let sa = self.simplify_inner(a, memo);
                 self.log2(sa)
             }
+            Node::Select(c, a, b) => {
+                let sc = self.simplify_inner(c, memo);
+                let sa = self.simplify_inner(a, memo);
+                let sb = self.simplify_inner(b, memo);
+                self.select(sc, sa, sb)
+            }
         };
 
         // Now apply rewrite rules on the node with simplified children
@@ -186,6 +192,15 @@ impl ExprGraph {
             Node::Log2(a) => {
                 if let Some(v) = self.node(a).as_f64() {
                     self.lit(v.log2())
+                } else {
+                    expr
+                }
+            }
+
+            // Select constant folding
+            Node::Select(c, a, b) => {
+                if let Some(vc) = self.node(c).as_f64() {
+                    if vc > 0.0 { a } else { b }
                 } else {
                     expr
                 }

@@ -1,0 +1,16 @@
+[package]
+name = "tang-safetensors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CPU safetensors load/save for tang tensors"
+
+[dependencies]
+tang = { workspace = true }
+tang-la = { workspace = true }
+tang-tensor = { workspace = true }
+safetensors = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tang-train = { workspace = true }

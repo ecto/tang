@@ -9,7 +9,7 @@ use tang_expr::node::{ExprId, Node};
 use tang_expr::ExprGraph;
 
 /// Protocol version. Incremented on breaking wire format changes.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// A node in the wire-format expression graph.
 ///
@@ -28,6 +28,7 @@ pub enum WireNode {
     Atan2(u32, u32),
     Exp2(u32),
     Log2(u32),
+    Select(u32, u32, u32),
 }
 
 impl WireNode {
@@ -45,6 +46,7 @@ impl WireNode {
             Node::Atan2(y, x) => WireNode::Atan2(y.index(), x.index()),
             Node::Exp2(a) => WireNode::Exp2(a.index()),
             Node::Log2(a) => WireNode::Log2(a.index()),
+            Node::Select(c, a, b) => WireNode::Select(c.index(), a.index(), b.index()),
         }
     }
 
@@ -62,6 +64,11 @@ impl WireNode {
             WireNode::Atan2(y, x) => Node::Atan2(ExprId::from_index(y), ExprId::from_index(x)),
             WireNode::Exp2(a) => Node::Exp2(ExprId::from_index(a)),
             WireNode::Log2(a) => Node::Log2(ExprId::from_index(a)),
+            WireNode::Select(c, a, b) => Node::Select(
+                ExprId::from_index(c),
+                ExprId::from_index(a),
+                ExprId::from_index(b),
+            ),
         }
     }
 }
@@ -123,6 +130,9 @@ impl WireGraph {
                 WireNode::Atan2(y, x) => graph.atan2(id_map[y as usize], id_map[x as usize]),
                 WireNode::Exp2(a) => graph.exp2(id_map[a as usize]),
                 WireNode::Log2(a) => graph.log2(id_map[a as usize]),
+                WireNode::Select(c, a, b) => {
+                    graph.select(id_map[c as usize], id_map[a as usize], id_map[b as usize])
+                }
             };
             id_map.push(id);
         }
@@ -243,6 +253,25 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_select() {
+        let mut g = ExprGraph::new();
+        let x = g.var(0);
+        let a = g.lit(3.0);
+        let b = g.lit(7.0);
+        let s = g.select(x, a, b);
+
+        let wire = WireGraph::from_expr_graph(&g, &[s], 1);
+        let (g2, outputs2) = wire.to_expr_graph();
+
+        // cond > 0 → a
+        let r1: f64 = g2.eval(outputs2[0], &[1.0]);
+        assert!((r1 - 3.0).abs() < 1e-10);
+        // cond <= 0 → b
+        let r2: f64 = g2.eval(outputs2[0], &[-1.0]);
+        assert!((r2 - 7.0).abs() < 1e-10);
+    }
+
+    #[test]
     fn wire_node_conversions() {
         let e = ExprId::from_index;
         let test_cases = vec![
@@ -257,6 +286,7 @@ mod tests {
             Node::Atan2(e(8), e(9)),
             Node::Exp2(e(10)),
             Node::Log2(e(11)),
+            Node::Select(e(0), e(1), e(2)),
         ];
 
         for node in test_cases {

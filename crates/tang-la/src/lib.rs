@@ -21,7 +21,7 @@ mod svd;
 pub use cholesky::Cholesky;
 pub use dmat::DMat;
 pub use dvec::DVec;
-pub use eigen::SymmetricEigen;
+pub use eigen::{branchless_jacobi_eigen, SymmetricEigen};
 pub use lu::Lu;
 pub use qr::Qr;
 pub use svd::Svd;

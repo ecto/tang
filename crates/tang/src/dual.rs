@@ -465,6 +465,16 @@ impl<S: Scalar> Scalar for Dual<S> {
     fn from_i32(v: i32) -> Self {
         Dual::constant(S::from_i32(v))
     }
+
+    // Straight-through estimator: condition doesn't contribute gradient
+    #[inline]
+    fn select(cond: Self, a: Self, b: Self) -> Self {
+        if cond.real > S::ZERO {
+            a
+        } else {
+            b
+        }
+    }
 }
 
 #[cfg(test)]

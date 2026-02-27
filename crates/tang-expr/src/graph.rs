@@ -50,6 +50,12 @@ impl ExprGraph {
         self.nodes[id.0 as usize]
     }
 
+    /// Read-only access to the node arena for serialization.
+    #[inline]
+    pub fn nodes_slice(&self) -> &[Node] {
+        &self.nodes
+    }
+
     /// Internal: insert a node, returning its interned ExprId.
     fn insert(&mut self, node: Node) -> ExprId {
         if let Some(&id) = self.intern.get(&node) {
@@ -125,6 +131,12 @@ impl ExprGraph {
     #[inline]
     pub fn log2(&mut self, a: ExprId) -> ExprId {
         self.insert(Node::Log2(a))
+    }
+
+    /// Branchless select: returns `a` if `cond > 0`, else `b`.
+    #[inline]
+    pub fn select(&mut self, cond: ExprId, a: ExprId, b: ExprId) -> ExprId {
+        self.insert(Node::Select(cond, a, b))
     }
 }
 
