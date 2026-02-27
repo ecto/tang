@@ -358,7 +358,7 @@ pub fn branchless_jacobi_eigen<S: Scalar>(
     // Eigenvector accumulator, starts as identity
     let mut v = DMat::<S>::identity(n);
 
-    let eps = S::EPSILON;
+    let eps = S::from_f64(f64::EPSILON);
 
     for _ in 0..n_sweeps {
         // Cyclic Jacobi: process ALL off-diagonal pairs (p,q) in fixed order
@@ -431,6 +431,7 @@ pub fn branchless_jacobi_eigen<S: Scalar>(
 
     // Branchless sorting network (bubble sort variant with select)
     // For small n this is fine; produces O(n^2) comparators.
+    let half = S::from_f64(0.5);
     for _ in 0..n {
         for j in 0..(n - 1) {
             // Compare eigenvalues[j] and eigenvalues[j+1]
@@ -440,8 +441,8 @@ pub fn branchless_jacobi_eigen<S: Scalar>(
             let do_swap = S::select(a - b, S::ONE, S::ZERO);
 
             // Branchless swap for eigenvalues
-            let new_a = S::select(do_swap - S::HALF, b, a); // min
-            let new_b = S::select(do_swap - S::HALF, a, b); // max
+            let new_a = S::select(do_swap - half, b, a); // min
+            let new_b = S::select(do_swap - half, a, b); // max
             eigenvalues[j] = new_a;
             eigenvalues[j + 1] = new_b;
 
@@ -449,8 +450,8 @@ pub fn branchless_jacobi_eigen<S: Scalar>(
             for i in 0..n {
                 let vj = v.get(i, j);
                 let vj1 = v.get(i, j + 1);
-                let new_vj = S::select(do_swap - S::HALF, vj1, vj);
-                let new_vj1 = S::select(do_swap - S::HALF, vj, vj1);
+                let new_vj = S::select(do_swap - half, vj1, vj);
+                let new_vj1 = S::select(do_swap - half, vj, vj1);
                 v.set(i, j, new_vj);
                 v.set(i, j + 1, new_vj1);
             }
