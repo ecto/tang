@@ -182,6 +182,18 @@ impl Worker {
     pub async fn has_coded_model(&self) -> bool {
         self.state.read().await.coded_model.is_some()
     }
+
+    /// Access the inner state lock (for testing/inspection).
+    pub fn state_ref(&self) -> &Arc<RwLock<WorkerState>> {
+        &self.state
+    }
+}
+
+impl WorkerState {
+    /// Reference to the coded model (for testing/inspection).
+    pub fn coded_model_ref(&self) -> Option<&CodedModel> {
+        self.coded_model.as_ref()
+    }
 }
 
 impl Default for Worker {
@@ -327,7 +339,7 @@ impl WorkerService for WorkerHandler {
     async fn coded_forward(
         self,
         _ctx: context::Context,
-        _layer: u32,
+        layer: u32,
         x: Vec<f32>,
         d_in: u32,
     ) -> Result<Vec<f32>, String> {
@@ -337,26 +349,32 @@ impl WorkerService for WorkerHandler {
             .as_ref()
             .ok_or_else(|| "no coded model loaded".to_string())?;
 
+        let shard = model
+            .shards
+            .get(layer as usize)
+            .ok_or_else(|| format!("no shard for layer {layer}"))?;
+
         if let Some(device) = &state.device {
             // GPU path: upload shard and x, dispatch matmul kernel
-            let shard_buf = GpuBuffer::from_slice(device, &model.shard.data);
+            let shard_buf = GpuBuffer::from_slice(device, &shard.data);
             let x_buf = GpuBuffer::from_slice(device, &x);
-            let block_size = model.shard.data.len() / d_in as usize;
+            let block_size = shard.data.len() / d_in as usize;
             let out_buf = GpuBuffer::uninit(device, block_size);
 
             // For now, use CPU path — GPU matmul kernel is a future optimization
             drop(shard_buf);
             drop(x_buf);
             drop(out_buf);
-            Ok(model.shard.forward_linear(&x, d_in as usize))
+            Ok(shard.forward_linear(&x, d_in as usize))
         } else {
-            Ok(model.shard.forward_linear(&x, d_in as usize))
+            Ok(shard.forward_linear(&x, d_in as usize))
         }
     }
 
     async fn coded_update(
         self,
         _ctx: context::Context,
+        layer: u32,
         grad: crate::coded::CompressedGrad,
         version: u64,
     ) -> Result<(), String> {
@@ -366,30 +384,41 @@ impl WorkerService for WorkerHandler {
             .as_mut()
             .ok_or_else(|| "no coded model loaded".to_string())?;
 
+        let shard = model
+            .shards
+            .get(layer as usize)
+            .ok_or_else(|| format!("no shard for layer {layer}"))?;
+
         // Version check — reject stale updates
-        if version < model.shard.version {
+        if version < shard.version {
             return Err(format!(
-                "stale update: got version {version}, current {}",
-                model.shard.version
+                "stale update for layer {layer}: got version {version}, current {}",
+                shard.version
             ));
         }
 
         let decompressed = grad.decompress();
-        if !model.apply_coded_update(&decompressed) {
+        if !model.apply_coded_update(layer as usize, &decompressed) {
             return Err("gradient rejected by clip policy".to_string());
         }
 
-        info!("applied coded update, version now {}", model.shard.version);
+        info!(
+            "applied coded update layer {layer}, version now {}",
+            model.shards[layer as usize].version
+        );
         Ok(())
     }
 
-    async fn request_shard(self, _ctx: context::Context) -> Result<crate::coded::Shard, String> {
+    async fn request_shards(
+        self,
+        _ctx: context::Context,
+    ) -> Result<Vec<crate::coded::Shard>, String> {
         let state = self.state.read().await;
         let model = state
             .coded_model
             .as_ref()
             .ok_or_else(|| "no coded model loaded".to_string())?;
-        Ok(model.shard.clone())
+        Ok(model.shards.clone())
     }
 }
 

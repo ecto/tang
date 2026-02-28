@@ -392,8 +392,8 @@ impl CompressedGrad {
 
 /// Manages a single node's participation in the coded mesh.
 pub struct CodedModel {
-    /// This node's coded shard.
-    pub shard: Shard,
+    /// This node's coded shards — one per linear layer.
+    pub shards: Vec<Shard>,
     /// The generator matrix (shared by all nodes).
     pub generator: Generator,
     /// Gradient hygiene policy.
@@ -403,44 +403,59 @@ pub struct CodedModel {
 }
 
 impl CodedModel {
-    /// Create a coded model from full (uncoded) weights.
+    /// Create a coded model from multiple linear layers' weights.
     ///
-    /// Splits weights into k equal blocks, encodes, and returns the model
-    /// holding only this node's shard.
-    pub fn from_weights(
-        weights: &[f32],
+    /// Each entry in `layer_weights` is the flat weight matrix for one linear
+    /// layer. Splits each into k blocks, encodes, and stores this node's shard
+    /// per layer.
+    pub fn from_layer_weights(
+        layer_weights: &[&[f32]],
         generator: &Generator,
         node_index: usize,
     ) -> Self {
         let k = generator.k;
-        let block_len = (weights.len() + k - 1) / k;
-        // Pad to block_len * k
-        let mut padded = weights.to_vec();
-        padded.resize(block_len * k, 0.0);
+        let mut shards = Vec::with_capacity(layer_weights.len());
+        for weights in layer_weights {
+            let block_len = (weights.len() + k - 1) / k;
+            let mut padded = weights.to_vec();
+            padded.resize(block_len * k, 0.0);
 
-        let blocks: Vec<&[f32]> = (0..k)
-            .map(|j| &padded[j * block_len..(j + 1) * block_len])
-            .collect();
+            let blocks: Vec<&[f32]> = (0..k)
+                .map(|j| &padded[j * block_len..(j + 1) * block_len])
+                .collect();
 
-        let shards = generator.encode(&blocks);
+            let encoded = generator.encode(&blocks);
+            shards.push(encoded[node_index].clone());
+        }
 
         Self {
-            shard: shards[node_index].clone(),
+            shards,
             generator: generator.clone(),
             policy: GradientPolicy::default(),
             node_index,
         }
     }
 
-    /// Apply a coded gradient update with clip + decay.
+    /// Create a coded model from full (uncoded) weights (single linear layer).
+    ///
+    /// Convenience wrapper around `from_layer_weights` for single-layer models.
+    pub fn from_weights(
+        weights: &[f32],
+        generator: &Generator,
+        node_index: usize,
+    ) -> Self {
+        Self::from_layer_weights(&[weights], generator, node_index)
+    }
+
+    /// Apply a coded gradient update to a specific layer with clip + decay.
     ///
     /// Returns false if the update was rejected (clipped).
-    pub fn apply_coded_update(&mut self, coded_grad: &[f32]) -> bool {
+    pub fn apply_coded_update(&mut self, layer: usize, coded_grad: &[f32]) -> bool {
         if !self.policy.clip_check(coded_grad) {
             return false;
         }
-        let lr = self.policy.lr_at(self.shard.version);
-        self.shard.apply_update(coded_grad, lr);
+        let lr = self.policy.lr_at(self.shards[layer].version);
+        self.shards[layer].apply_update(coded_grad, lr);
         true
     }
 
@@ -834,10 +849,10 @@ mod tests {
             .map(|i| CodedModel::from_weights(&weights, &g, i))
             .collect();
 
-        // Any 2 should reconstruct
+        // Any 2 should reconstruct (single-layer model → shards[0])
         let decoded = g.decode(&[
-            (1, &models[1].shard),
-            (3, &models[3].shard),
+            (1, &models[1].shards[0]),
+            (3, &models[3].shards[0]),
         ]);
         let mut reconstructed = decoded[0].clone();
         reconstructed.extend_from_slice(&decoded[1]);
@@ -861,9 +876,9 @@ mod tests {
 
         // Huge gradient should be rejected
         let huge_grad = vec![1000.0f32; 10];
-        let accepted = model.apply_coded_update(&huge_grad);
+        let accepted = model.apply_coded_update(0, &huge_grad);
         assert!(!accepted);
-        assert_eq!(model.shard.version, 0); // not incremented
+        assert_eq!(model.shards[0].version, 0); // not incremented
     }
 
     // --- Encode/decode outputs ---

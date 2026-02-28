@@ -278,10 +278,11 @@ impl Coordinator {
         }
     }
 
-    /// Send a coded gradient update to a specific worker.
+    /// Send a coded gradient update for a specific layer to a specific worker.
     pub async fn coded_update_on(
         &self,
         node_id: NodeId,
+        layer: u32,
         grad: crate::coded::CompressedGrad,
         version: u64,
     ) -> Result<(), MeshError> {
@@ -292,7 +293,7 @@ impl Coordinator {
             .clone();
 
         match client
-            .coded_update(context::current(), grad, version)
+            .coded_update(context::current(), layer, grad, version)
             .await
         {
             Ok(Ok(())) => Ok(()),
@@ -301,19 +302,19 @@ impl Coordinator {
         }
     }
 
-    /// Request a shard from a specific worker.
-    pub async fn request_shard_from(
+    /// Request all shards (all layers) from a specific worker.
+    pub async fn request_shards_from(
         &self,
         node_id: NodeId,
-    ) -> Result<crate::coded::Shard, MeshError> {
+    ) -> Result<Vec<crate::coded::Shard>, MeshError> {
         let workers = self.workers.read().await;
         let client = workers
             .get(&node_id)
             .ok_or(MeshError::NodeNotFound(node_id))?
             .clone();
 
-        match client.request_shard(context::current()).await {
-            Ok(Ok(shard)) => Ok(shard),
+        match client.request_shards(context::current()).await {
+            Ok(Ok(shards)) => Ok(shards),
             Ok(Err(e)) => Err(MeshError::ExecutionFailed(e)),
             Err(e) => Err(MeshError::Rpc(e.to_string())),
         }

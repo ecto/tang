@@ -187,9 +187,9 @@ pub trait WorkerService {
     /// `d_in` is the input dimension for the matrix multiply.
     async fn coded_forward(layer: u32, x: Vec<f32>, d_in: u32) -> Result<Vec<f32>, String>;
 
-    /// Apply a compressed coded gradient update.
-    async fn coded_update(grad: CompressedGrad, version: u64) -> Result<(), String>;
+    /// Apply a compressed coded gradient update to a specific layer.
+    async fn coded_update(layer: u32, grad: CompressedGrad, version: u64) -> Result<(), String>;
 
-    /// Request this node's current shard (for reconstruction / new node join).
-    async fn request_shard() -> Result<Shard, String>;
+    /// Request this node's current shards for all layers.
+    async fn request_shards() -> Result<Vec<Shard>, String>;
 }
