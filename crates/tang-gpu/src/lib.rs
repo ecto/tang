@@ -81,7 +81,7 @@ pub use backward::{forward_backward_gpu, fused_forward_backward, FusedKernel};
 pub use buffer::GpuBuffer;
 pub use device::{GpuDevice, GpuError};
 pub use kernel::KernelCache;
-pub use llm::{GpuCausalAttention, GpuEmbedding, GpuInterleavedRoPE, GpuKVCache, GpuRMSNorm, GpuRoPE, GpuSwiGLU, kv_attention_fused, swiglu_fused_pub};
+pub use llm::{GpuCausalAttention, GpuEmbedding, GpuInterleavedRoPE, GpuKVCache, GpuRMSNorm, GpuRoPE, GpuSwiGLU, GpuTrainTransformerBlock, GpuTrainTransformer, kv_attention_fused, swiglu_fused_pub, interleaved_rope_backward};
 pub use module::{GpuAdam, GpuLinear, GpuModule, GpuTrainModule};
 pub use nn::{add_tensors, bias_add, gelu, relu, relu_backward, softmax, GpuAttention, GpuLayerNorm, GpuTransformerBlock};
 pub use train::{gpu_cross_entropy_loss, gpu_mse_loss, GradScaler, GpuDataLoader, GpuReLULayer, GpuSequential, GpuTanhLayer, GpuTrainer};
