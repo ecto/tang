@@ -223,29 +223,35 @@ impl Activation {
                     .collect()
             }
             Activation::RMSNorm { eps, scale } => {
-                let n = pre_activation.len() as f32;
-                let ms = pre_activation.iter().map(|x| x * x).sum::<f32>() / n;
-                let rms = (ms + eps).sqrt();
-                let inv_rms = 1.0 / rms;
-                let x_hat: Vec<f32> = pre_activation.iter().map(|&x| x * inv_rms).collect();
-                // If scale is present, pre-multiply grad_output by scale
-                // dL/d(x_hat) = dL/dy * scale
-                let scaled_grad: Vec<f32> = if let Some(s) = scale {
-                    grad_output.iter().zip(s).map(|(&dy, &si)| dy * si).collect()
-                } else {
-                    grad_output.to_vec()
-                };
-                let dy_xhat_mean: f32 = scaled_grad
-                    .iter()
-                    .zip(&x_hat)
-                    .map(|(&dy, &xh)| dy * xh)
-                    .sum::<f32>()
-                    / n;
-                scaled_grad
-                    .iter()
-                    .zip(&x_hat)
-                    .map(|(&dy, &xh)| inv_rms * (dy - xh * dy_xhat_mean))
-                    .collect()
+                // Per-row backward when scale is present.
+                let features = scale.as_ref().map(|s| s.len()).unwrap_or(pre_activation.len());
+                let rows = pre_activation.len() / features;
+                let n = features as f32;
+                let mut result = vec![0.0f32; pre_activation.len()];
+                for row in 0..rows {
+                    let off = row * features;
+                    let pa = &pre_activation[off..off + features];
+                    let go = &grad_output[off..off + features];
+                    let ms = pa.iter().map(|x| x * x).sum::<f32>() / n;
+                    let rms = (ms + eps).sqrt();
+                    let inv_rms = 1.0 / rms;
+                    let scaled_grad: Vec<f32> = if let Some(s) = scale {
+                        go.iter().zip(s).map(|(&dy, &si)| dy * si).collect()
+                    } else {
+                        go.to_vec()
+                    };
+                    let dy_xhat_mean: f32 = scaled_grad
+                        .iter()
+                        .zip(pa)
+                        .map(|(&dy, &x)| dy * (x * inv_rms))
+                        .sum::<f32>()
+                        / n;
+                    for (i, (&dy, &x)) in scaled_grad.iter().zip(pa).enumerate() {
+                        let xh = x * inv_rms;
+                        result[off + i] = inv_rms * (dy - xh * dy_xhat_mean);
+                    }
+                }
+                result
             }
         }
     }
@@ -282,16 +288,22 @@ impl Activation {
                 }
             }
             Activation::RMSNorm { eps, scale } => {
-                let n = data.len() as f32;
-                let ms = data.iter().map(|x| x * x).sum::<f32>() / n;
-                let rms = (ms + eps).sqrt();
-                if let Some(s) = scale {
-                    for (x, &si) in data.iter_mut().zip(s) {
-                        *x = (*x / rms) * si;
-                    }
-                } else {
-                    for x in data.iter_mut() {
-                        *x /= rms;
+                // When scale is present, apply per-row (features = scale.len()).
+                let features = scale.as_ref().map(|s| s.len()).unwrap_or(data.len());
+                let rows = data.len() / features;
+                for row in 0..rows {
+                    let chunk = &mut data[row * features..(row + 1) * features];
+                    let n = features as f32;
+                    let ms = chunk.iter().map(|x| x * x).sum::<f32>() / n;
+                    let rms = (ms + eps).sqrt();
+                    if let Some(s) = scale {
+                        for (x, &si) in chunk.iter_mut().zip(s) {
+                            *x = (*x / rms) * si;
+                        }
+                    } else {
+                        for x in chunk.iter_mut() {
+                            *x /= rms;
+                        }
                     }
                 }
             }
@@ -344,6 +356,16 @@ pub enum CodedLayer {
     },
     /// Standalone bias add: x[t*dim + i] += bias[i], dim = bias.len().
     Bias(Vec<f32>),
+    /// Interleaved RoPE — sits between QkvProject and Attention.
+    /// Rotates Q and K heads, V passes through.
+    RoPE {
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        cos_table: Vec<f32>,  // [max_seq_len, head_dim/2] flat
+        sin_table: Vec<f32>,
+        max_seq_len: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -359,6 +381,131 @@ pub fn silu(x: f32) -> f32 {
 fn silu_backward(x: f32) -> f32 {
     let sig = 1.0 / (1.0 + (-x).exp());
     sig * (1.0 + x * (1.0 - sig))
+}
+
+/// Precompute interleaved RoPE cos/sin tables.
+///
+/// Returns `(cos_table, sin_table)` each of shape `[max_seq_len, head_dim/2]` flattened.
+/// θ_i = 1 / base^(2*i / head_dim) for pair index i.
+pub fn precompute_rope_tables(
+    head_dim: usize,
+    max_seq_len: usize,
+    base: f64,
+) -> (Vec<f32>, Vec<f32>) {
+    let half = head_dim / 2;
+    let mut cos_table = vec![0.0f32; max_seq_len * half];
+    let mut sin_table = vec![0.0f32; max_seq_len * half];
+    for t in 0..max_seq_len {
+        for i in 0..half {
+            let theta = (t as f64) / base.powf(2.0 * i as f64 / head_dim as f64);
+            cos_table[t * half + i] = theta.cos() as f32;
+            sin_table[t * half + i] = theta.sin() as f32;
+        }
+    }
+    (cos_table, sin_table)
+}
+
+/// Apply interleaved RoPE in-place to Q and K within a `[seq_len, d_q+d_k+d_v]` buffer.
+///
+/// For each head's interleaved pairs `(x[2i], x[2i+1])`:
+/// ```text
+/// y_even = x_even * cos(θ) - x_odd * sin(θ)
+/// y_odd  = x_even * sin(θ) + x_odd * cos(θ)
+/// ```
+pub fn apply_rope(
+    qkv: &mut [f32],
+    seq_len: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    cos_table: &[f32],
+    sin_table: &[f32],
+) {
+    let d_q = n_heads * head_dim;
+    let d_k = n_kv_heads * head_dim;
+    let d_v = n_kv_heads * head_dim;
+    let d_qkv = d_q + d_k + d_v;
+    let half = head_dim / 2;
+
+    for t in 0..seq_len {
+        let base = t * d_qkv;
+        // Rotate Q heads
+        for h in 0..n_heads {
+            let off = base + h * head_dim;
+            for i in 0..half {
+                let cos = cos_table[t * half + i];
+                let sin = sin_table[t * half + i];
+                let even = qkv[off + 2 * i];
+                let odd = qkv[off + 2 * i + 1];
+                qkv[off + 2 * i] = even * cos - odd * sin;
+                qkv[off + 2 * i + 1] = even * sin + odd * cos;
+            }
+        }
+        // Rotate K heads
+        for h in 0..n_kv_heads {
+            let off = base + d_q + h * head_dim;
+            for i in 0..half {
+                let cos = cos_table[t * half + i];
+                let sin = sin_table[t * half + i];
+                let even = qkv[off + 2 * i];
+                let odd = qkv[off + 2 * i + 1];
+                qkv[off + 2 * i] = even * cos - odd * sin;
+                qkv[off + 2 * i + 1] = even * sin + odd * cos;
+            }
+        }
+        // V passes through (no rotation)
+    }
+}
+
+/// RoPE backward: transpose rotation (orthogonal inverse).
+///
+/// ```text
+/// dx_even =  dy_even * cos + dy_odd * sin
+/// dx_odd  = -dy_even * sin + dy_odd * cos
+/// ```
+pub fn rope_backward(
+    grad: &mut [f32],
+    seq_len: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    cos_table: &[f32],
+    sin_table: &[f32],
+) {
+    let d_q = n_heads * head_dim;
+    let d_k = n_kv_heads * head_dim;
+    let d_v = n_kv_heads * head_dim;
+    let d_qkv = d_q + d_k + d_v;
+    let half = head_dim / 2;
+
+    for t in 0..seq_len {
+        let base = t * d_qkv;
+        // Q heads
+        for h in 0..n_heads {
+            let off = base + h * head_dim;
+            for i in 0..half {
+                let cos = cos_table[t * half + i];
+                let sin = sin_table[t * half + i];
+                let dy_even = grad[off + 2 * i];
+                let dy_odd = grad[off + 2 * i + 1];
+                grad[off + 2 * i] = dy_even * cos + dy_odd * sin;
+                grad[off + 2 * i + 1] = -dy_even * sin + dy_odd * cos;
+            }
+        }
+        // K heads
+        for h in 0..n_kv_heads {
+            let off = base + d_q + h * head_dim;
+            for i in 0..half {
+                let cos = cos_table[t * half + i];
+                let sin = sin_table[t * half + i];
+                let dy_even = grad[off + 2 * i];
+                let dy_odd = grad[off + 2 * i + 1];
+                grad[off + 2 * i] = dy_even * cos + dy_odd * sin;
+                grad[off + 2 * i + 1] = -dy_even * sin + dy_odd * cos;
+            }
+        }
+        // V: gradient passes through unchanged
+    }
 }
 
 /// Add bias to batched activations: x[t*dim + i] += bias[i].
@@ -717,6 +864,14 @@ impl CodedInferenceServer {
                 CodedLayer::Bias(bias) => {
                     apply_bias(&mut x, bias);
                 }
+                CodedLayer::RoPE { n_heads, n_kv_heads, head_dim, cos_table, sin_table, .. } => {
+                    let d_qkv = (n_heads + 2 * n_kv_heads) * head_dim;
+                    let seq_len = x.len() / d_qkv;
+                    apply_rope(
+                        &mut x, seq_len, *n_heads, *n_kv_heads, *head_dim,
+                        cos_table, sin_table,
+                    );
+                }
             }
         }
         Ok(x)
@@ -816,6 +971,16 @@ impl CodedInferenceServer {
                 }
                 CodedLayer::Bias(bias) => {
                     apply_bias(&mut x, bias);
+                }
+                CodedLayer::RoPE { n_heads, n_kv_heads, head_dim, cos_table, sin_table, .. } => {
+                    // No trainable params — just apply rotation (save pre-RoPE for backward)
+                    pre_activations.push(x.clone());
+                    let d_qkv = (n_heads + 2 * n_kv_heads) * head_dim;
+                    let seq_len = x.len() / d_qkv;
+                    apply_rope(
+                        &mut x, seq_len, *n_heads, *n_kv_heads, *head_dim,
+                        cos_table, sin_table,
+                    );
                 }
             }
         }
@@ -1015,6 +1180,17 @@ impl CodedInferenceServer {
                 CodedLayer::Bias(_) => {
                     // Bias is frozen — gradient passes through unchanged.
                 }
+                CodedLayer::RoPE { n_heads, n_kv_heads, head_dim, cos_table, sin_table, .. } => {
+                    // No trainable params — apply transpose rotation to gradient.
+                    // We saved pre-RoPE state in pre_activations during forward.
+                    pi -= 1;
+                    let d_qkv = (n_heads + 2 * n_kv_heads) * head_dim;
+                    let seq_len = grad.len() / d_qkv;
+                    rope_backward(
+                        &mut grad, seq_len, *n_heads, *n_kv_heads, *head_dim,
+                        cos_table, sin_table,
+                    );
+                }
             }
         }
 
@@ -1093,6 +1269,10 @@ pub struct TransformerConfig {
     pub n_layers: usize,
     pub vocab_size: usize,
     pub eps: f32,
+    /// If set, interleaved RoPE is applied after each QkvProject.
+    pub rope_base: Option<f64>,
+    /// Maximum sequence length for precomputing RoPE cos/sin tables.
+    pub max_seq_len: usize,
 }
 
 /// Weights for a coded transformer.
@@ -1137,6 +1317,11 @@ pub fn build_coded_transformer(
     let d_v = config.n_kv_heads * config.head_dim;
     let ff_dim = config.ff_dim;
 
+    // Precompute RoPE tables once (shared across all layers)
+    let rope_tables = config.rope_base.map(|base| {
+        precompute_rope_tables(config.head_dim, config.max_seq_len, base)
+    });
+
     let mut layers = Vec::new();
     let mut all_weights = Vec::new();
 
@@ -1165,6 +1350,17 @@ pub fn build_coded_transformer(
         all_weights.push(wq.clone()); // shard idx 7*i + 0
         all_weights.push(wk.clone()); // shard idx 7*i + 1
         all_weights.push(wv.clone()); // shard idx 7*i + 2
+        // Insert RoPE between QkvProject and Attention
+        if let Some((ref cos, ref sin)) = rope_tables {
+            layers.push(CodedLayer::RoPE {
+                n_heads: config.n_heads,
+                n_kv_heads: config.n_kv_heads,
+                head_dim: config.head_dim,
+                cos_table: cos.clone(),
+                sin_table: sin.clone(),
+                max_seq_len: config.max_seq_len,
+            });
+        }
         layers.push(CodedLayer::Attention {
             n_heads: config.n_heads,
             n_kv_heads: config.n_kv_heads,
@@ -2226,6 +2422,8 @@ mod tests {
             n_layers: 2,
             vocab_size: 64,
             eps: 1e-5,
+            rope_base: None,
+            max_seq_len: 0,
         };
 
         let mut rng_seed = 42u64;
@@ -2314,6 +2512,8 @@ mod tests {
             n_layers: 1,
             vocab_size,
             eps: 1e-5,
+            rope_base: None,
+            max_seq_len: 0,
         };
 
         let bq = rand_vec(d_q);
@@ -2421,5 +2621,201 @@ mod tests {
             max_diff < 0.1,
             "max diff between coded and uncoded: {max_diff}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // RoPE tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn coded_rope_matches_uncoded() {
+        // 1-layer transformer with RoPE: coded vs manual reference.
+        let d_model = 8;
+        let n_heads = 2;
+        let n_kv_heads = 1;
+        let head_dim = 4;
+        let ff_dim = 16;
+        let vocab_size = 32;
+        let rope_base = 10000.0;
+        let max_seq_len = 64;
+        let d_q = n_heads * head_dim;
+        let d_k = n_kv_heads * head_dim;
+
+        let mut rng_seed = 99u64;
+        let mut rand_vec = |len: usize| -> Vec<f32> {
+            (0..len)
+                .map(|_| {
+                    rng_seed = rng_seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    ((rng_seed >> 33) as f32 / (1u64 << 31) as f32 - 0.5) * 0.3
+                })
+                .collect()
+        };
+
+        let config = TransformerConfig {
+            d_model, n_heads, n_kv_heads, head_dim, ff_dim,
+            n_layers: 1, vocab_size, eps: 1e-5,
+            rope_base: Some(rope_base),
+            max_seq_len,
+        };
+
+        let bq = rand_vec(d_q);
+        let bk = rand_vec(d_k);
+        let bv = rand_vec(d_k);
+        let bo = rand_vec(d_model);
+        let b_gate = rand_vec(ff_dim);
+        let b_up = rand_vec(ff_dim);
+        let b_down = rand_vec(d_model);
+        let ln1 = rand_vec(d_model);
+        let ln2 = rand_vec(d_model);
+        let ln_final = rand_vec(d_model);
+        let lm_head_bias = rand_vec(vocab_size);
+
+        let wq = rand_vec(d_q * d_model);
+        let wk = rand_vec(d_k * d_model);
+        let wv = rand_vec(d_k * d_model);
+        let wo = rand_vec(d_model * d_model);
+        let w_gate = rand_vec(ff_dim * d_model);
+        let w_up = rand_vec(ff_dim * d_model);
+        let w_down = rand_vec(d_model * ff_dim);
+        let lm_head_w = rand_vec(vocab_size * d_model);
+        let embed = rand_vec(vocab_size * d_model);
+
+        let weights = TransformerWeights {
+            block_weights: vec![[wq.clone(), wk.clone(), wv.clone(), wo.clone(),
+                                 w_gate.clone(), w_up.clone(), w_down.clone()]],
+            block_biases: vec![[bq.clone(), bk.clone(), bv.clone(), bo.clone(),
+                                b_gate.clone(), b_up.clone(), b_down.clone()]],
+            block_norms: vec![(ln1.clone(), ln2.clone())],
+            ln_final_scale: ln_final.clone(),
+            lm_head_weight: lm_head_w.clone(),
+            lm_head_bias: lm_head_bias.clone(),
+            embed_table: embed.clone(),
+        };
+
+        let (layers, all_ws) = build_coded_transformer(&config, &weights);
+
+        // --- Uncoded reference (manually apply RoPE) ---
+        let tokens = vec![1u32, 5, 3];
+        let seq_len = tokens.len();
+        let mut x = embed_tokens(&tokens, &embed, d_model);
+
+        let residual1 = x.clone();
+        Activation::RMSNorm { eps: 1e-5, scale: Some(ln1.clone()) }.apply(&mut x);
+        let mut q_ref = matmul_batched(&wq, &x, d_q, d_model);
+        let mut k_ref = matmul_batched(&wk, &x, d_k, d_model);
+        let mut v_ref = matmul_batched(&wv, &x, d_k, d_model);
+        apply_bias(&mut q_ref, &bq);
+        apply_bias(&mut k_ref, &bk);
+        apply_bias(&mut v_ref, &bv);
+
+        // Concat QKV then apply RoPE
+        let d_qkv = d_q + d_k + d_k;
+        let mut qkv = vec![0.0f32; seq_len * d_qkv];
+        for t in 0..seq_len {
+            qkv[t * d_qkv..t * d_qkv + d_q].copy_from_slice(&q_ref[t * d_q..(t + 1) * d_q]);
+            qkv[t * d_qkv + d_q..t * d_qkv + d_q + d_k].copy_from_slice(&k_ref[t * d_k..(t + 1) * d_k]);
+            qkv[t * d_qkv + d_q + d_k..t * d_qkv + d_qkv].copy_from_slice(&v_ref[t * d_k..(t + 1) * d_k]);
+        }
+
+        let (cos_table, sin_table) = precompute_rope_tables(head_dim, max_seq_len, rope_base);
+        apply_rope(&mut qkv, seq_len, n_heads, n_kv_heads, head_dim, &cos_table, &sin_table);
+
+        let (attn_out, _, _, _, _) = attention_forward(&qkv, seq_len, n_heads, n_kv_heads, head_dim);
+        x = matmul_batched(&wo, &attn_out, d_model, d_model);
+        apply_bias(&mut x, &bo);
+        for (xi, ri) in x.iter_mut().zip(&residual1) { *xi += ri; }
+
+        let residual2 = x.clone();
+        Activation::RMSNorm { eps: 1e-5, scale: Some(ln2.clone()) }.apply(&mut x);
+        let mut gate_ref = matmul_batched(&w_gate, &x, ff_dim, d_model);
+        let mut up_ref = matmul_batched(&w_up, &x, ff_dim, d_model);
+        apply_bias(&mut gate_ref, &b_gate);
+        apply_bias(&mut up_ref, &b_up);
+        let swiglu_out: Vec<f32> = gate_ref.iter().zip(&up_ref)
+            .map(|(&g, &u)| silu(g) * u).collect();
+        x = matmul_batched(&w_down, &swiglu_out, d_model, ff_dim);
+        apply_bias(&mut x, &b_down);
+        for (xi, ri) in x.iter_mut().zip(&residual2) { *xi += ri; }
+
+        Activation::RMSNorm { eps: 1e-5, scale: Some(ln_final.clone()) }.apply(&mut x);
+        x = matmul_batched(&lm_head_w, &x, vocab_size, d_model);
+        apply_bias(&mut x, &lm_head_bias);
+        let expected = x;
+
+        // --- Coded inference ---
+        let weight_refs: Vec<&[f32]> = all_ws.iter().map(|w| w.as_slice()).collect();
+        let g = Generator::cauchy(4, 2);
+        let (coordinator, _workers) =
+            setup_coded_workers_multi(&weight_refs, &g, 4).await;
+
+        let server = CodedInferenceServer::new(
+            coordinator,
+            g,
+            vec![NodeId(0), NodeId(1)],
+            layers,
+        );
+
+        let input = embed_tokens(&tokens, &embed, d_model);
+        let result = server.infer(input).await.unwrap();
+
+        assert_eq!(result.len(), expected.len());
+        let max_diff: f32 = result.iter().zip(&expected)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 0.1,
+            "RoPE coded vs uncoded max diff: {max_diff}"
+        );
+    }
+
+    #[test]
+    fn rope_backward_numerical() {
+        // Finite-difference gradient check through RoPE.
+        let n_heads = 2;
+        let n_kv_heads = 1;
+        let head_dim = 4;
+        let seq_len = 3;
+        let rope_base = 10000.0;
+        let max_seq_len = 64;
+        let d_q = n_heads * head_dim;
+        let d_k = n_kv_heads * head_dim;
+        let d_v = n_kv_heads * head_dim;
+        let d_qkv = d_q + d_k + d_v;
+
+        let (cos_table, sin_table) = precompute_rope_tables(head_dim, max_seq_len, rope_base);
+
+        // Input QKV
+        let qkv: Vec<f32> = (0..seq_len * d_qkv)
+            .map(|i| ((i as f32) * 0.13 - 1.5) * 0.5)
+            .collect();
+
+        // Forward
+        let mut output = qkv.clone();
+        apply_rope(&mut output, seq_len, n_heads, n_kv_heads, head_dim, &cos_table, &sin_table);
+
+        // Backward with dy = 1.0 everywhere
+        let dy = vec![1.0f32; seq_len * d_qkv];
+        let mut grad = dy.clone();
+        rope_backward(&mut grad, seq_len, n_heads, n_kv_heads, head_dim, &cos_table, &sin_table);
+
+        // Numerical gradient check
+        let eps = 1e-4f32;
+        for i in (0..qkv.len()).step_by(3) {
+            let mut qkv_p = qkv.clone();
+            let mut qkv_m = qkv.clone();
+            qkv_p[i] += eps;
+            qkv_m[i] -= eps;
+            apply_rope(&mut qkv_p, seq_len, n_heads, n_kv_heads, head_dim, &cos_table, &sin_table);
+            apply_rope(&mut qkv_m, seq_len, n_heads, n_kv_heads, head_dim, &cos_table, &sin_table);
+            // dy = all ones → numerical grad = sum of (out_p - out_m) / (2*eps)
+            let numerical: f32 = qkv_p.iter().zip(&qkv_m)
+                .map(|(p, m)| (p - m) / (2.0 * eps))
+                .sum();
+            assert!(
+                (grad[i] - numerical).abs() < 1e-2,
+                "RoPE grad[{i}]: analytical={} numerical={}",
+                grad[i], numerical
+            );
+        }
     }
 }

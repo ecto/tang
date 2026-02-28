@@ -66,6 +66,8 @@ fn test_config() -> TransformerConfig {
         n_layers: N_LAYERS,
         vocab_size: VOCAB_SIZE,
         eps: EPS,
+        rope_base: None,
+        max_seq_len: 0,
     }
 }
 
