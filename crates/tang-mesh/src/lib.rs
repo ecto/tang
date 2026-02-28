@@ -38,6 +38,7 @@
 //! ```
 
 pub mod allreduce;
+pub mod coded;
 pub mod coordinator;
 pub mod distributed;
 pub mod error;
@@ -51,12 +52,15 @@ pub mod transport;
 pub mod worker;
 
 // Re-exports
+pub use coded::{
+    CodedModel, CompressedGrad, Generator, GradientPolicy, Shard,
+};
 pub use allreduce::{AllReduce, ReduceOp};
 pub use coordinator::Coordinator;
 pub use distributed::DistributedTrainer;
 pub use error::MeshError;
 pub use fault::{FaultHandler, HealthMonitor, HealthState};
-pub use inference::InferenceServer;
+pub use inference::{Activation, CodedInferenceServer, CodedLayer, InferenceServer};
 pub use mesh::{GpuBackend, GpuDeviceType, GpuInfo, Mesh, MeshBuilder, MeshNode, NodeId};
 pub use partition::{auto_partition, partition, GraphPartition};
 pub use placement::{Placement, ShardSpec, Strategy};

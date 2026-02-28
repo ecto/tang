@@ -14,6 +14,7 @@ use tracing::info;
 
 use tang_gpu::{GpuBuffer, GpuDevice, KernelCache};
 
+use crate::coded::CodedModel;
 use crate::protocol::WireGraph;
 use crate::transport::WorkerService;
 
@@ -42,6 +43,8 @@ pub struct WorkerState {
     cache: KernelCache,
     /// Synced parameter tensors, keyed by name.
     params: HashMap<String, Vec<f32>>,
+    /// Coded model state (if this worker participates in coded mesh).
+    coded_model: Option<CodedModel>,
 }
 
 /// A worker node that receives graphs, compiles, and executes them.
@@ -73,6 +76,7 @@ impl Worker {
                 device,
                 cache: KernelCache::new(),
                 params: HashMap::new(),
+                coded_model: None,
             })),
         }
     }
@@ -167,6 +171,16 @@ impl Worker {
     /// Whether this worker has a GPU device.
     pub async fn has_gpu(&self) -> bool {
         self.state.read().await.device.is_some()
+    }
+
+    /// Set the coded model for this worker (enables coded mesh participation).
+    pub async fn set_coded_model(&self, model: CodedModel) {
+        self.state.write().await.coded_model = Some(model);
+    }
+
+    /// Whether this worker has a coded model loaded.
+    pub async fn has_coded_model(&self) -> bool {
+        self.state.read().await.coded_model.is_some()
     }
 }
 
@@ -308,6 +322,74 @@ impl WorkerService for WorkerHandler {
         let mut state = self.state.write().await;
         state.shutting_down = true;
         Ok(())
+    }
+
+    async fn coded_forward(
+        self,
+        _ctx: context::Context,
+        _layer: u32,
+        x: Vec<f32>,
+        d_in: u32,
+    ) -> Result<Vec<f32>, String> {
+        let state = self.state.read().await;
+        let model = state
+            .coded_model
+            .as_ref()
+            .ok_or_else(|| "no coded model loaded".to_string())?;
+
+        if let Some(device) = &state.device {
+            // GPU path: upload shard and x, dispatch matmul kernel
+            let shard_buf = GpuBuffer::from_slice(device, &model.shard.data);
+            let x_buf = GpuBuffer::from_slice(device, &x);
+            let block_size = model.shard.data.len() / d_in as usize;
+            let out_buf = GpuBuffer::uninit(device, block_size);
+
+            // For now, use CPU path — GPU matmul kernel is a future optimization
+            drop(shard_buf);
+            drop(x_buf);
+            drop(out_buf);
+            Ok(model.shard.forward_linear(&x, d_in as usize))
+        } else {
+            Ok(model.shard.forward_linear(&x, d_in as usize))
+        }
+    }
+
+    async fn coded_update(
+        self,
+        _ctx: context::Context,
+        grad: crate::coded::CompressedGrad,
+        version: u64,
+    ) -> Result<(), String> {
+        let mut state = self.state.write().await;
+        let model = state
+            .coded_model
+            .as_mut()
+            .ok_or_else(|| "no coded model loaded".to_string())?;
+
+        // Version check — reject stale updates
+        if version < model.shard.version {
+            return Err(format!(
+                "stale update: got version {version}, current {}",
+                model.shard.version
+            ));
+        }
+
+        let decompressed = grad.decompress();
+        if !model.apply_coded_update(&decompressed) {
+            return Err("gradient rejected by clip policy".to_string());
+        }
+
+        info!("applied coded update, version now {}", model.shard.version);
+        Ok(())
+    }
+
+    async fn request_shard(self, _ctx: context::Context) -> Result<crate::coded::Shard, String> {
+        let state = self.state.read().await;
+        let model = state
+            .coded_model
+            .as_ref()
+            .ok_or_else(|| "no coded model loaded".to_string())?;
+        Ok(model.shard.clone())
     }
 }
 

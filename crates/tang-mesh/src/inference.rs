@@ -149,6 +149,169 @@ impl InferenceServer {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Coded inference (tensor-parallel via erasure coding)
+// ---------------------------------------------------------------------------
+
+use crate::coded::{decode_outputs, CompressedGrad, Generator, GradientPolicy};
+use crate::mesh::NodeId;
+
+/// Non-linearity type for decode/recode barriers.
+#[derive(Clone, Debug)]
+pub enum Activation {
+    Gelu,
+    LayerNorm { eps: f32 },
+    Softmax,
+}
+
+impl Activation {
+    /// Apply activation in-place.
+    fn apply(&self, data: &mut [f32]) {
+        match self {
+            Activation::Gelu => {
+                for x in data.iter_mut() {
+                    // GELU approximation: x * 0.5 * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
+                    let x3 = *x * *x * *x;
+                    let inner = 0.7978845608 * (*x + 0.044715 * x3);
+                    *x = 0.5 * *x * (1.0 + inner.tanh());
+                }
+            }
+            Activation::LayerNorm { eps } => {
+                let n = data.len() as f32;
+                let mean = data.iter().sum::<f32>() / n;
+                let var = data.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n;
+                let inv_std = 1.0 / (var + eps).sqrt();
+                for x in data.iter_mut() {
+                    *x = (*x - mean) * inv_std;
+                }
+            }
+            Activation::Softmax => {
+                let max = data.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for x in data.iter_mut() {
+                    *x = (*x - max).exp();
+                    sum += *x;
+                }
+                for x in data.iter_mut() {
+                    *x /= sum;
+                }
+            }
+        }
+    }
+}
+
+/// A layer in the coded inference pipeline.
+#[derive(Clone, Debug)]
+pub enum CodedLayer {
+    /// Linear layer — stays fully coded (no decode needed).
+    Linear { d_in: usize, d_out: usize },
+    /// Non-linearity — requires decode → apply → re-encode.
+    Nonlinear(Activation),
+}
+
+/// Coded tensor-parallel inference server.
+///
+/// Orchestrates k-node groups for coded inference:
+/// - Linear layers: broadcast x → collect k coded outputs (stays coded)
+/// - Non-linearities: decode → apply → re-encode → broadcast
+pub struct CodedInferenceServer {
+    coordinator: Coordinator,
+    generator: Generator,
+    /// The k node indices forming the active group.
+    group: Vec<NodeId>,
+    /// Layer sequence for the model.
+    layers: Vec<CodedLayer>,
+    /// Gradient policy for learning during inference.
+    policy: GradientPolicy,
+}
+
+impl CodedInferenceServer {
+    /// Create a new coded inference server with the given k-node group.
+    pub fn new(
+        coordinator: Coordinator,
+        generator: Generator,
+        group: Vec<NodeId>,
+        layers: Vec<CodedLayer>,
+    ) -> Self {
+        assert_eq!(
+            group.len(),
+            generator.k,
+            "group size must equal k"
+        );
+        Self {
+            coordinator,
+            generator,
+            group,
+            layers,
+            policy: GradientPolicy::default(),
+        }
+    }
+
+    /// Run coded inference through the layer sequence.
+    ///
+    /// At linear layers, each node computes `shard @ x` in parallel (stays coded).
+    /// At non-linearities, we decode → apply activation → re-encode.
+    pub async fn infer(&self, input: Vec<f32>) -> Result<Vec<f32>, MeshError> {
+        let k = self.generator.k;
+        let mut x = input;
+
+        for layer in &self.layers {
+            match layer {
+                CodedLayer::Linear { d_in, .. } => {
+                    // Broadcast x to all k nodes, collect coded outputs
+                    let mut coded_outputs = Vec::with_capacity(k);
+                    for (group_idx, node_id) in self.group.iter().enumerate() {
+                        let result = self
+                            .coordinator
+                            .coded_forward_on(*node_id, 0, x.clone(), *d_in as u32)
+                            .await?;
+                        coded_outputs.push((group_idx, result));
+                    }
+
+                    // Decode to get full output
+                    let refs: Vec<(usize, &[f32])> = coded_outputs
+                        .iter()
+                        .map(|(i, v)| (*i, v.as_slice()))
+                        .collect();
+                    x = decode_outputs(&self.generator, &refs);
+                }
+                CodedLayer::Nonlinear(activation) => {
+                    // Apply activation on decoded (full) hidden state
+                    activation.apply(&mut x);
+                    // After activation, x is still in decoded form.
+                    // It will be used as input to the next linear layer.
+                }
+            }
+        }
+
+        Ok(x)
+    }
+
+    /// Gossip a coded gradient update to all nodes in the group.
+    pub async fn gossip_update(
+        &self,
+        grad: &CompressedGrad,
+        version: u64,
+    ) -> Result<(), MeshError> {
+        for node_id in &self.group {
+            self.coordinator
+                .coded_update_on(*node_id, grad.clone(), version)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Access the gradient policy.
+    pub fn policy(&self) -> &GradientPolicy {
+        &self.policy
+    }
+
+    /// Mutable access to the gradient policy.
+    pub fn policy_mut(&mut self) -> &mut GradientPolicy {
+        &mut self.policy
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

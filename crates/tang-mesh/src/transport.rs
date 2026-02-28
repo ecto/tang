@@ -14,6 +14,7 @@ use iroh::Endpoint;
 use pin_project::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use crate::coded::{CompressedGrad, Shard};
 use crate::error::MeshError;
 use crate::protocol::WireGraph;
 
@@ -178,4 +179,17 @@ pub trait WorkerService {
 
     /// Graceful shutdown.
     async fn shutdown() -> Result<(), String>;
+
+    // --- Coded Mesh RPCs ---
+
+    /// Coded forward: compute `shard @ x` (partial coded matmul).
+    /// `layer` identifies which layer's shard to use, `x` is the input vector,
+    /// `d_in` is the input dimension for the matrix multiply.
+    async fn coded_forward(layer: u32, x: Vec<f32>, d_in: u32) -> Result<Vec<f32>, String>;
+
+    /// Apply a compressed coded gradient update.
+    async fn coded_update(grad: CompressedGrad, version: u64) -> Result<(), String>;
+
+    /// Request this node's current shard (for reconstruction / new node join).
+    async fn request_shard() -> Result<Shard, String>;
 }

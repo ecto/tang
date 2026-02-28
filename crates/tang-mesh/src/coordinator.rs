@@ -251,6 +251,73 @@ impl Coordinator {
     pub async fn worker_ids(&self) -> Vec<NodeId> {
         self.workers.read().await.keys().copied().collect()
     }
+
+    // --- Coded Mesh coordinator methods ---
+
+    /// Coded forward on a specific worker.
+    pub async fn coded_forward_on(
+        &self,
+        node_id: NodeId,
+        layer: u32,
+        x: Vec<f32>,
+        d_in: u32,
+    ) -> Result<Vec<f32>, MeshError> {
+        let workers = self.workers.read().await;
+        let client = workers
+            .get(&node_id)
+            .ok_or(MeshError::NodeNotFound(node_id))?
+            .clone();
+
+        match client
+            .coded_forward(context::current(), layer, x, d_in)
+            .await
+        {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(e)) => Err(MeshError::ExecutionFailed(e)),
+            Err(e) => Err(MeshError::Rpc(e.to_string())),
+        }
+    }
+
+    /// Send a coded gradient update to a specific worker.
+    pub async fn coded_update_on(
+        &self,
+        node_id: NodeId,
+        grad: crate::coded::CompressedGrad,
+        version: u64,
+    ) -> Result<(), MeshError> {
+        let workers = self.workers.read().await;
+        let client = workers
+            .get(&node_id)
+            .ok_or(MeshError::NodeNotFound(node_id))?
+            .clone();
+
+        match client
+            .coded_update(context::current(), grad, version)
+            .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(MeshError::ExecutionFailed(e)),
+            Err(e) => Err(MeshError::Rpc(e.to_string())),
+        }
+    }
+
+    /// Request a shard from a specific worker.
+    pub async fn request_shard_from(
+        &self,
+        node_id: NodeId,
+    ) -> Result<crate::coded::Shard, MeshError> {
+        let workers = self.workers.read().await;
+        let client = workers
+            .get(&node_id)
+            .ok_or(MeshError::NodeNotFound(node_id))?
+            .clone();
+
+        match client.request_shard(context::current()).await {
+            Ok(Ok(shard)) => Ok(shard),
+            Ok(Err(e)) => Err(MeshError::ExecutionFailed(e)),
+            Err(e) => Err(MeshError::Rpc(e.to_string())),
+        }
+    }
 }
 
 impl Default for Coordinator {
