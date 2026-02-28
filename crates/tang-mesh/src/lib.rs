@@ -61,7 +61,11 @@ pub use coordinator::Coordinator;
 pub use distributed::DistributedTrainer;
 pub use error::MeshError;
 pub use fault::{FaultHandler, HealthMonitor, HealthState};
-pub use inference::{Activation, CodedInferenceServer, CodedLayer, InferenceServer};
+pub use inference::{
+    Activation, CodedInferenceServer, CodedLayer, InferenceServer,
+    TransformerConfig, TransformerWeights, build_coded_transformer, embed_tokens,
+    apply_bias, attention_forward, silu,
+};
 pub use mesh::{GpuBackend, GpuDeviceType, GpuInfo, Mesh, MeshBuilder, MeshNode, NodeId};
 pub use partition::{auto_partition, partition, GraphPartition};
 pub use placement::{Placement, ShardSpec, Strategy};
