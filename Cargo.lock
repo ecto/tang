@@ -5157,10 +5157,13 @@ dependencies = [
  "approx",
  "tang",
  "tang-ad",
+ "tang-hub",
+ "tang-infer",
  "tang-la",
  "tang-optim",
  "tang-safetensors",
  "tang-tensor",
+ "tokenizers",
 ]
 
 [[package]]

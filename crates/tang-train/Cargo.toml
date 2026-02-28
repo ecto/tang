@@ -21,3 +21,9 @@ name = "pinn_poisson"
 [dev-dependencies]
 approx = "0.5"
 tang-safetensors = { workspace = true }
+tang-hub = { workspace = true, features = ["tokenizers"] }
+tang-infer = { workspace = true }
+tokenizers = { workspace = true }
+
+[[example]]
+name = "smollm"

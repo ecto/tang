@@ -51,3 +51,4 @@ wgpu = "24"
 bytemuck = { version = "1.14", features = ["derive"] }
 pollster = "0.4"
 safetensors = "0.4"
+tokenizers = "0.21"
