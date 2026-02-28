@@ -2212,6 +2212,7 @@ pub struct GroupedQueryAttention<S: Scalar> {
     num_kv_heads: usize,
     head_dim: usize,
     d_model: usize,
+    causal: bool,
     cached_q: Option<Tensor<S>>,
     cached_k: Option<Tensor<S>>,
     cached_v: Option<Tensor<S>>,
@@ -2242,12 +2243,22 @@ impl<S: Scalar> GroupedQueryAttention<S> {
             num_kv_heads,
             head_dim,
             d_model,
+            causal: false,
             cached_q: None,
             cached_k: None,
             cached_v: None,
             cached_attn: None,
             cached_input: None,
         }
+    }
+
+    /// Enable or disable causal masking.
+    ///
+    /// When enabled, position `i` can only attend to positions `j <= i`.
+    /// This is required for autoregressive (decoder) models.
+    pub fn with_causal(mut self, causal: bool) -> Self {
+        self.causal = causal;
+        self
     }
 
     /// Softmax per row of a [rows, cols] tensor.
@@ -2317,7 +2328,19 @@ impl<S: Scalar> Module<S> for GroupedQueryAttention<S> {
                 |idx| v_full.get(&[idx[0], kv_offset + idx[1]]),
             );
 
-            let scores = q_h.matmul(&k_h.transpose()).scale(scale);
+            let mut scores = q_h.matmul(&k_h.transpose()).scale(scale);
+
+            // Apply causal mask: set scores[i][j] = -inf where j > i
+            if self.causal {
+                let mut sdata = scores.data().to_vec();
+                for i in 0..seq_len {
+                    for j in (i + 1)..seq_len {
+                        sdata[i * seq_len + j] = S::NEG_INFINITY;
+                    }
+                }
+                scores = Tensor::new(sdata, scores.shape().clone());
+            }
+
             let attn_weights = Self::softmax_2d(&scores);
 
             for i in 0..seq_len {
@@ -3831,6 +3854,244 @@ impl<S: Scalar> Module<S> for SlidingWindowAttention<S> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// SwiGLU FFN
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// SwiGLU feed-forward network (LLaMA-style).
+///
+/// `output = down_proj(silu(gate_proj(x)) * up_proj(x))`
+///
+/// Uses a gated linear unit with SiLU activation. The intermediate dimension
+/// `ff_dim` is typically `(8/3) * d_model` rounded to a multiple of 256.
+pub struct SwiGLU<S: Scalar> {
+    gate_proj: Linear<S>,  // [d_model, ff_dim]
+    up_proj: Linear<S>,    // [d_model, ff_dim]
+    down_proj: Linear<S>,  // [ff_dim, d_model]
+    cached_gate_silu: Option<Tensor<S>>,
+    cached_up: Option<Tensor<S>>,
+    cached_input: Option<Tensor<S>>,
+}
+
+impl<S: Scalar> SwiGLU<S> {
+    pub fn new(d_model: usize, ff_dim: usize, seed: u64) -> Self {
+        Self {
+            gate_proj: Linear::new(d_model, ff_dim, seed),
+            up_proj: Linear::new(d_model, ff_dim, seed.wrapping_add(1)),
+            down_proj: Linear::new(ff_dim, d_model, seed.wrapping_add(2)),
+            cached_gate_silu: None,
+            cached_up: None,
+            cached_input: None,
+        }
+    }
+}
+
+impl<S: Scalar> Module<S> for SwiGLU<S> {
+    fn forward(&mut self, input: &Tensor<S>) -> Tensor<S> {
+        self.cached_input = Some(input.clone());
+
+        let gate = self.gate_proj.forward(input);  // [seq_len, ff_dim]
+        let gate_silu = gate.silu();
+        let up = self.up_proj.forward(input);       // [seq_len, ff_dim]
+
+        self.cached_gate_silu = Some(gate_silu.clone());
+        self.cached_up = Some(up.clone());
+
+        let hidden = gate_silu.mul(&up);            // elementwise
+        self.down_proj.forward(&hidden)             // [seq_len, d_model]
+    }
+
+    fn backward(&mut self, grad_output: &Tensor<S>) -> Tensor<S> {
+        let gate_silu = self.cached_gate_silu.as_ref().expect("must call forward before backward");
+        let up = self.cached_up.as_ref().expect("must call forward before backward");
+        let input = self.cached_input.as_ref().expect("must call forward before backward");
+
+        // grad through down_proj: grad_hidden = down_proj.backward(grad_output)
+        let grad_hidden = self.down_proj.backward(grad_output); // [seq_len, ff_dim]
+
+        // hidden = gate_silu * up
+        // grad_gate_silu = grad_hidden * up
+        // grad_up = grad_hidden * gate_silu
+        let grad_gate_silu = grad_hidden.mul(up);
+        let grad_up = grad_hidden.mul(gate_silu);
+
+        // grad through silu: d/dx silu(x) = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+        // We need the pre-silu gate values. Recompute from input.
+        let gate_raw = self.gate_proj.forward(input);
+        let one = S::ONE;
+        let sig = gate_raw.sigmoid();
+        let dsilu = Tensor::from_fn(gate_raw.shape().clone(), |idx| {
+            let s = sig.get(idx);
+            let x = gate_raw.get(idx);
+            s * (one + x * (one - s))
+        });
+        let grad_gate = grad_gate_silu.mul(&dsilu);
+
+        // Backprop through projections
+        let grad_input_gate = self.gate_proj.backward(&grad_gate);
+        let grad_input_up = self.up_proj.backward(&grad_up);
+
+        grad_input_gate.add(&grad_input_up)
+    }
+
+    fn parameters(&self) -> Vec<&Parameter<S>> {
+        let mut p = self.gate_proj.parameters();
+        p.extend(self.up_proj.parameters());
+        p.extend(self.down_proj.parameters());
+        p
+    }
+
+    fn parameters_mut(&mut self) -> Vec<&mut Parameter<S>> {
+        let mut p = self.gate_proj.parameters_mut();
+        p.extend(self.up_proj.parameters_mut());
+        p.extend(self.down_proj.parameters_mut());
+        p
+    }
+
+    fn named_parameters(&self) -> Vec<(String, &Parameter<S>)> {
+        let mut p = Vec::new();
+        for (n, v) in self.gate_proj.named_parameters() {
+            p.push((alloc::format!("gate_proj.{}", n), v));
+        }
+        for (n, v) in self.up_proj.named_parameters() {
+            p.push((alloc::format!("up_proj.{}", n), v));
+        }
+        for (n, v) in self.down_proj.named_parameters() {
+            p.push((alloc::format!("down_proj.{}", n), v));
+        }
+        p
+    }
+
+    fn named_parameters_mut(&mut self) -> Vec<(String, &mut Parameter<S>)> {
+        let mut p = Vec::new();
+        for (n, v) in self.gate_proj.named_parameters_mut() {
+            p.push((alloc::format!("gate_proj.{}", n), v));
+        }
+        for (n, v) in self.up_proj.named_parameters_mut() {
+            p.push((alloc::format!("up_proj.{}", n), v));
+        }
+        for (n, v) in self.down_proj.named_parameters_mut() {
+            p.push((alloc::format!("down_proj.{}", n), v));
+        }
+        p
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KV Cache
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Key-value cache for efficient autoregressive inference.
+///
+/// Stores accumulated K and V tensors per layer so that during generation
+/// only the new token's K,V need to be computed and appended.
+pub struct KVCache<S: Scalar> {
+    k_cache: Vec<Tensor<S>>,  // per-layer: [cached_len, kv_dim]
+    v_cache: Vec<Tensor<S>>,  // per-layer: [cached_len, kv_dim]
+    num_layers: usize,
+    max_seq_len: usize,
+    kv_dim: usize,
+    cached_len: usize,
+}
+
+impl<S: Scalar> KVCache<S> {
+    /// Create a new empty KV cache.
+    ///
+    /// - `num_layers`: number of transformer layers
+    /// - `max_seq_len`: maximum sequence length (for bounds checking)
+    /// - `kv_dim`: dimension of each K/V vector (`num_kv_heads * head_dim`)
+    pub fn new(num_layers: usize, max_seq_len: usize, kv_dim: usize) -> Self {
+        let mut k_cache = Vec::with_capacity(num_layers);
+        let mut v_cache = Vec::with_capacity(num_layers);
+        for _ in 0..num_layers {
+            k_cache.push(Tensor::zeros(Shape::from_slice(&[0, kv_dim])));
+            v_cache.push(Tensor::zeros(Shape::from_slice(&[0, kv_dim])));
+        }
+        Self {
+            k_cache,
+            v_cache,
+            num_layers,
+            max_seq_len,
+            kv_dim,
+            cached_len: 0,
+        }
+    }
+
+    /// Append new key and value tensors for a given layer.
+    ///
+    /// `k` and `v` should be `[new_tokens, kv_dim]`.
+    pub fn append(&mut self, layer: usize, k: &Tensor<S>, v: &Tensor<S>) {
+        assert!(layer < self.num_layers, "layer index out of bounds");
+        let new_tokens = k.shape()[0];
+        assert_eq!(k.shape()[1], self.kv_dim);
+        assert_eq!(v.shape()[0], new_tokens);
+        assert_eq!(v.shape()[1], self.kv_dim);
+        assert!(
+            self.cached_len + new_tokens <= self.max_seq_len,
+            "KV cache overflow: {} + {} > {}",
+            self.cached_len,
+            new_tokens,
+            self.max_seq_len
+        );
+
+        let old_len = self.k_cache[layer].shape()[0];
+        let total_len = old_len + new_tokens;
+
+        // Concatenate old and new along axis 0
+        let kv_dim = self.kv_dim;
+        let old_k = &self.k_cache[layer];
+        let new_k = Tensor::from_fn(Shape::from_slice(&[total_len, kv_dim]), |idx| {
+            if idx[0] < old_len {
+                old_k.get(idx)
+            } else {
+                k.get(&[idx[0] - old_len, idx[1]])
+            }
+        });
+
+        let old_v = &self.v_cache[layer];
+        let new_v = Tensor::from_fn(Shape::from_slice(&[total_len, kv_dim]), |idx| {
+            if idx[0] < old_len {
+                old_v.get(idx)
+            } else {
+                v.get(&[idx[0] - old_len, idx[1]])
+            }
+        });
+
+        self.k_cache[layer] = new_k;
+        self.v_cache[layer] = new_v;
+
+        // Update cached_len from layer 0 (all layers should stay in sync)
+        if layer == 0 {
+            self.cached_len = total_len;
+        }
+    }
+
+    /// Get the full cached K and V for a given layer.
+    pub fn get(&self, layer: usize) -> (&Tensor<S>, &Tensor<S>) {
+        assert!(layer < self.num_layers, "layer index out of bounds");
+        (&self.k_cache[layer], &self.v_cache[layer])
+    }
+
+    /// Current cached sequence length.
+    pub fn len(&self) -> usize {
+        self.cached_len
+    }
+
+    /// Whether the cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.cached_len == 0
+    }
+
+    /// Reset the cache, clearing all stored keys and values.
+    pub fn clear(&mut self) {
+        for i in 0..self.num_layers {
+            self.k_cache[i] = Tensor::zeros(Shape::from_slice(&[0, self.kv_dim]));
+            self.v_cache[i] = Tensor::zeros(Shape::from_slice(&[0, self.kv_dim]));
+        }
+        self.cached_len = 0;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // LoRA
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -4006,5 +4267,329 @@ impl<S: Scalar> Module<S> for LoRA<S> {
             (String::from("lora_a"), &mut self.lora_a),
             (String::from("lora_b"), &mut self.lora_b),
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Module;
+
+    // -----------------------------------------------------------------------
+    // Causal GQA tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn gqa_causal_mask_blocks_future() {
+        let d_model = 8;
+        let num_heads = 2;
+        let num_kv_heads = 2;
+        let seq_len = 4;
+
+        let mut gqa = GroupedQueryAttention::<f64>::new(d_model, num_heads, num_kv_heads, 42)
+            .with_causal(true);
+
+        let input = Tensor::from_fn(Shape::from_slice(&[seq_len, d_model]), |idx| {
+            ((idx[0] * d_model + idx[1]) as f64) * 0.1
+        });
+
+        let _output = gqa.forward(&input);
+
+        // Check cached attention weights: for causal, attn[h][i][j] should be ~0 for j > i
+        let attn = gqa.cached_attn.as_ref().unwrap();
+        for h in 0..num_heads {
+            for i in 0..seq_len {
+                for j in (i + 1)..seq_len {
+                    let w = attn.get(&[h, i, j]);
+                    assert!(
+                        w.abs() < 1e-10,
+                        "causal mask violated: attn[{}][{}][{}] = {} (should be ~0)",
+                        h, i, j, w
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gqa_causal_rows_sum_to_one() {
+        let d_model = 8;
+        let seq_len = 4;
+
+        let mut gqa = GroupedQueryAttention::<f64>::new(d_model, 2, 2, 99)
+            .with_causal(true);
+
+        let input = Tensor::from_fn(Shape::from_slice(&[seq_len, d_model]), |idx| {
+            ((idx[0] + idx[1]) as f64) * 0.05
+        });
+        let _output = gqa.forward(&input);
+
+        let attn = gqa.cached_attn.as_ref().unwrap();
+        for h in 0..2 {
+            for i in 0..seq_len {
+                let row_sum: f64 = (0..seq_len).map(|j| attn.get(&[h, i, j])).sum();
+                assert!(
+                    (row_sum - 1.0).abs() < 1e-10,
+                    "attention row [{},{}] sums to {} (expected 1.0)",
+                    h, i, row_sum
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gqa_non_causal_unchanged() {
+        let d_model = 8;
+        let seq_len = 3;
+
+        let mut gqa = GroupedQueryAttention::<f64>::new(d_model, 2, 2, 42);
+        // causal defaults to false
+
+        let input = Tensor::from_fn(Shape::from_slice(&[seq_len, d_model]), |idx| {
+            ((idx[0] * d_model + idx[1]) as f64) * 0.1
+        });
+        let _output = gqa.forward(&input);
+
+        // Non-causal: future positions can have non-zero attention
+        let attn = gqa.cached_attn.as_ref().unwrap();
+        let has_future = (0..2).any(|h| {
+            (0..seq_len).any(|i| {
+                ((i + 1)..seq_len).any(|j| attn.get(&[h, i, j]).abs() > 1e-10)
+            })
+        });
+        assert!(has_future, "non-causal GQA should have non-zero future attention");
+    }
+
+    #[test]
+    fn gqa_causal_backward_runs() {
+        let d_model = 8;
+        let seq_len = 3;
+
+        let mut gqa = GroupedQueryAttention::<f64>::new(d_model, 2, 2, 42)
+            .with_causal(true);
+
+        let input = Tensor::from_fn(Shape::from_slice(&[seq_len, d_model]), |idx| {
+            ((idx[0] * d_model + idx[1]) as f64) * 0.1
+        });
+        let output = gqa.forward(&input);
+        let grad_output = Tensor::from_fn(output.shape().clone(), |_| 0.01);
+        let grad_input = gqa.backward(&grad_output);
+
+        assert_eq!(grad_input.shape(), input.shape());
+        // Gradient should be finite
+        for v in grad_input.data() {
+            assert!(v.is_finite(), "grad contains non-finite value: {}", v);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // SwiGLU tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn swiglu_forward_shape() {
+        let d_model = 8;
+        let ff_dim = 16;
+        let seq_len = 4;
+
+        let mut swiglu = SwiGLU::<f64>::new(d_model, ff_dim, 42);
+        let input = Tensor::from_fn(Shape::from_slice(&[seq_len, d_model]), |idx| {
+            ((idx[0] + idx[1]) as f64) * 0.1
+        });
+        let output = swiglu.forward(&input);
+        assert_eq!(output.shape().dims(), &[seq_len, d_model]);
+    }
+
+    #[test]
+    fn swiglu_backward_shape() {
+        let d_model = 8;
+        let ff_dim = 16;
+        let seq_len = 3;
+
+        let mut swiglu = SwiGLU::<f64>::new(d_model, ff_dim, 42);
+        let input = Tensor::from_fn(Shape::from_slice(&[seq_len, d_model]), |idx| {
+            ((idx[0] + idx[1]) as f64) * 0.1
+        });
+        let output = swiglu.forward(&input);
+        let grad_out = Tensor::from_fn(output.shape().clone(), |_| 0.01);
+        let grad_input = swiglu.backward(&grad_out);
+
+        assert_eq!(grad_input.shape(), input.shape());
+        for v in grad_input.data() {
+            assert!(v.is_finite(), "grad contains non-finite value: {}", v);
+        }
+    }
+
+    #[test]
+    fn swiglu_parameters_count() {
+        let d_model = 4;
+        let ff_dim = 8;
+        let swiglu = SwiGLU::<f64>::new(d_model, ff_dim, 42);
+
+        // 3 Linear layers, each with weight + bias = 6 parameters total
+        assert_eq!(swiglu.parameters().len(), 6);
+    }
+
+    #[test]
+    fn swiglu_named_parameters() {
+        let swiglu = SwiGLU::<f64>::new(4, 8, 42);
+        let names: Vec<String> = swiglu.named_parameters().into_iter().map(|(n, _)| n).collect();
+
+        assert!(names.contains(&String::from("gate_proj.weight")));
+        assert!(names.contains(&String::from("gate_proj.bias")));
+        assert!(names.contains(&String::from("up_proj.weight")));
+        assert!(names.contains(&String::from("up_proj.bias")));
+        assert!(names.contains(&String::from("down_proj.weight")));
+        assert!(names.contains(&String::from("down_proj.bias")));
+    }
+
+    #[test]
+    fn swiglu_numerical_gradient() {
+        let d_model = 4;
+        let ff_dim = 8;
+        let eps = 1e-5;
+
+        let input = Tensor::from_fn(Shape::from_slice(&[2, d_model]), |idx| {
+            ((idx[0] * d_model + idx[1]) as f64 + 1.0) * 0.1
+        });
+
+        // Compute analytical gradient
+        let mut swiglu = SwiGLU::<f64>::new(d_model, ff_dim, 42);
+        let output = swiglu.forward(&input);
+        let grad_out = Tensor::from_fn(output.shape().clone(), |_| 1.0);
+        let analytic_grad = swiglu.backward(&grad_out);
+
+        // Compute numerical gradient via finite differences
+        for i in 0..input.numel() {
+            let mut inp_plus = input.clone();
+            let mut inp_minus = input.clone();
+
+            let idx: Vec<usize> = if input.ndim() == 2 {
+                alloc::vec![i / d_model, i % d_model]
+            } else {
+                alloc::vec![i]
+            };
+
+            inp_plus.set(&idx, inp_plus.get(&idx) + eps);
+            inp_minus.set(&idx, inp_minus.get(&idx) - eps);
+
+            let mut s1 = SwiGLU::<f64>::new(d_model, ff_dim, 42);
+            let mut s2 = SwiGLU::<f64>::new(d_model, ff_dim, 42);
+
+            let out_plus = s1.forward(&inp_plus);
+            let out_minus = s2.forward(&inp_minus);
+
+            let numerical: f64 = out_plus.sub(&out_minus).data().iter().sum::<f64>() / (2.0 * eps);
+            let analytic = analytic_grad.get(&idx);
+
+            assert!(
+                (numerical - analytic).abs() < 1e-4,
+                "swiglu grad mismatch at {:?}: numerical={}, analytic={}",
+                idx, numerical, analytic
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // KVCache tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn kv_cache_new_empty() {
+        let cache = KVCache::<f64>::new(4, 128, 32);
+        assert_eq!(cache.len(), 0);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn kv_cache_append_and_get() {
+        let mut cache = KVCache::<f64>::new(2, 128, 4);
+
+        let k = Tensor::from_fn(Shape::from_slice(&[3, 4]), |idx| {
+            (idx[0] * 4 + idx[1]) as f64
+        });
+        let v = Tensor::from_fn(Shape::from_slice(&[3, 4]), |idx| {
+            (idx[0] * 4 + idx[1]) as f64 + 100.0
+        });
+
+        cache.append(0, &k, &v);
+        assert_eq!(cache.len(), 3);
+        assert!(!cache.is_empty());
+
+        let (cached_k, cached_v) = cache.get(0);
+        assert_eq!(cached_k.shape().dims(), &[3, 4]);
+        assert_eq!(cached_v.shape().dims(), &[3, 4]);
+
+        // Values should match
+        for i in 0..3 {
+            for j in 0..4 {
+                assert_eq!(cached_k.get(&[i, j]), (i * 4 + j) as f64);
+                assert_eq!(cached_v.get(&[i, j]), (i * 4 + j) as f64 + 100.0);
+            }
+        }
+    }
+
+    #[test]
+    fn kv_cache_incremental_append() {
+        let mut cache = KVCache::<f64>::new(1, 128, 2);
+
+        // Append 2 tokens
+        let k1 = Tensor::from_fn(Shape::from_slice(&[2, 2]), |idx| idx[1] as f64);
+        let v1 = Tensor::from_fn(Shape::from_slice(&[2, 2]), |_| 1.0);
+        cache.append(0, &k1, &v1);
+        assert_eq!(cache.len(), 2);
+
+        // Append 1 more token
+        let k2 = Tensor::from_fn(Shape::from_slice(&[1, 2]), |idx| (idx[1] + 10) as f64);
+        let v2 = Tensor::from_fn(Shape::from_slice(&[1, 2]), |_| 2.0);
+        cache.append(0, &k2, &v2);
+        assert_eq!(cache.len(), 3);
+
+        let (cached_k, cached_v) = cache.get(0);
+        assert_eq!(cached_k.shape().dims(), &[3, 2]);
+        // Check the third row came from k2
+        assert_eq!(cached_k.get(&[2, 0]), 10.0);
+        assert_eq!(cached_k.get(&[2, 1]), 11.0);
+        assert_eq!(cached_v.get(&[2, 0]), 2.0);
+    }
+
+    #[test]
+    fn kv_cache_clear() {
+        let mut cache = KVCache::<f64>::new(2, 128, 4);
+        let k = Tensor::from_fn(Shape::from_slice(&[5, 4]), |_| 1.0);
+        let v = Tensor::from_fn(Shape::from_slice(&[5, 4]), |_| 2.0);
+        cache.append(0, &k, &v);
+        cache.clear();
+
+        assert_eq!(cache.len(), 0);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "KV cache overflow")]
+    fn kv_cache_overflow_panics() {
+        let mut cache = KVCache::<f64>::new(1, 4, 2);
+        let k = Tensor::from_fn(Shape::from_slice(&[5, 2]), |_| 1.0);
+        let v = Tensor::from_fn(Shape::from_slice(&[5, 2]), |_| 1.0);
+        cache.append(0, &k, &v);
+    }
+
+    #[test]
+    fn kv_cache_multi_layer() {
+        let mut cache = KVCache::<f64>::new(3, 128, 4);
+
+        for layer in 0..3 {
+            let k = Tensor::from_fn(Shape::from_slice(&[2, 4]), |idx| {
+                (layer * 100 + idx[0] * 4 + idx[1]) as f64
+            });
+            let v = k.scale(2.0);
+            cache.append(layer, &k, &v);
+        }
+
+        // Each layer should have its own data
+        let (k0, _) = cache.get(0);
+        let (k2, _) = cache.get(2);
+        assert!((k0.get(&[0, 0]) - 0.0).abs() < 1e-10);
+        assert!((k2.get(&[0, 0]) - 200.0).abs() < 1e-10);
     }
 }

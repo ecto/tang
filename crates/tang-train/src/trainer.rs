@@ -26,6 +26,7 @@ where
     loss_fn: LossFn,
     num_epochs: usize,
     scheduler: Option<Box<dyn Scheduler>>,
+    accumulation_steps: usize,
 }
 
 fn default_loss(pred: &Tensor<f64>, target: &Tensor<f64>) -> (f64, Tensor<f64>) {
@@ -47,6 +48,7 @@ where
             loss_fn: default_loss,
             num_epochs: 100,
             scheduler: None,
+            accumulation_steps: 1,
         }
     }
 
@@ -57,6 +59,17 @@ where
 
     pub fn epochs(mut self, n: usize) -> Self {
         self.num_epochs = n;
+        self
+    }
+
+    /// Set gradient accumulation steps.
+    ///
+    /// When set to `n > 1`, gradients are accumulated over `n` mini-batches
+    /// before calling `optimizer.step()`, effectively multiplying the batch
+    /// size by `n` without increasing memory usage.
+    pub fn accumulation_steps(mut self, n: usize) -> Self {
+        assert!(n >= 1, "accumulation_steps must be >= 1");
+        self.accumulation_steps = n;
         self
     }
 
@@ -82,17 +95,31 @@ where
             let mut epoch_loss = 0.0;
             let mut batch_count = 0;
 
+            let mut micro_step = 0usize;
+            self.model.zero_grad();
+
             for (inputs, targets) in loader.by_ref() {
-                self.model.zero_grad();
                 let pred = self.model.forward(&inputs);
                 let (loss, grad) = (self.loss_fn)(&pred, &targets);
                 self.model.backward(&grad);
 
-                let mut params = self.model.parameters_mut();
-                self.optimizer.step(&mut params);
-
                 epoch_loss += loss;
                 batch_count += 1;
+                micro_step += 1;
+
+                if micro_step >= self.accumulation_steps {
+                    let mut params = self.model.parameters_mut();
+                    self.optimizer.step(&mut params);
+                    self.model.zero_grad();
+                    micro_step = 0;
+                }
+            }
+
+            // Flush any remaining accumulated gradients
+            if micro_step > 0 {
+                let mut params = self.model.parameters_mut();
+                self.optimizer.step(&mut params);
+                self.model.zero_grad();
             }
 
             if batch_count > 0 {
