@@ -52,21 +52,30 @@ impl Shard {
     }
 
     /// Coded linear forward: `shard @ x` where shard is (block_size × d_in)
-    /// stored row-major, and x is (d_in,). Returns (block_size,) partial output.
+    /// stored row-major.
+    ///
+    /// Accepts either 1-D `(d_in,)` or 2-D `[seq_len, d_in]` (flattened) input.
+    /// Returns `[seq_len, block_size]` flattened (seq_len=1 when input is 1-D).
     ///
     /// The full output is reconstructed by decoding k such partial outputs.
     pub fn forward_linear(&self, x: &[f32], d_in: usize) -> Vec<f32> {
         assert!(d_in > 0);
         let block_size = self.data.len() / d_in;
         assert_eq!(self.data.len(), block_size * d_in);
-        let mut out = vec![0.0f32; block_size];
-        for row in 0..block_size {
-            let mut sum = 0.0f32;
-            let offset = row * d_in;
-            for col in 0..d_in {
-                sum += self.data[offset + col] * x[col];
+        let seq_len = x.len() / d_in;
+        assert_eq!(x.len(), seq_len * d_in, "input length must be a multiple of d_in");
+        let mut out = vec![0.0f32; seq_len * block_size];
+        for t in 0..seq_len {
+            let x_off = t * d_in;
+            let o_off = t * block_size;
+            for row in 0..block_size {
+                let mut sum = 0.0f32;
+                let w_off = row * d_in;
+                for col in 0..d_in {
+                    sum += self.data[w_off + col] * x[x_off + col];
+                }
+                out[o_off + row] = sum;
             }
-            out[row] = sum;
         }
         out
     }
@@ -505,6 +514,58 @@ pub fn decode_outputs(
     full
 }
 
+/// Reshape decoded output from block-major to token-major order.
+///
+/// `decode_outputs` returns `[block_0, block_1, ..., block_{k-1}]` where each
+/// block is `[seq_len * block_size]`. This reshapes to `[seq_len, d_out]`
+/// where `d_out = k * block_size`.
+///
+/// For `seq_len == 1` this is a no-op (returns input unchanged).
+pub fn reshape_blocks_to_seq(decoded: &[f32], k: usize, seq_len: usize) -> Vec<f32> {
+    let total = decoded.len();
+    let block_len = total / k;
+    let block_size = block_len / seq_len;
+    assert_eq!(total, k * seq_len * block_size);
+    if seq_len == 1 {
+        return decoded.to_vec();
+    }
+    let d_out = k * block_size;
+    let mut out = vec![0.0f32; seq_len * d_out];
+    for b in 0..k {
+        for t in 0..seq_len {
+            for s in 0..block_size {
+                out[t * d_out + b * block_size + s] =
+                    decoded[b * block_len + t * block_size + s];
+            }
+        }
+    }
+    out
+}
+
+/// Reshape from token-major `[seq_len, d_out]` to block-major `[k blocks, seq_len * block_size]`.
+///
+/// Inverse of `reshape_blocks_to_seq`. Used before encoding gradients.
+pub fn reshape_seq_to_blocks(seq_major: &[f32], k: usize, seq_len: usize) -> Vec<f32> {
+    let total = seq_major.len();
+    let d_out = total / seq_len;
+    let block_size = d_out / k;
+    assert_eq!(total, k * seq_len * block_size);
+    if seq_len == 1 {
+        return seq_major.to_vec();
+    }
+    let block_len = seq_len * block_size;
+    let mut out = vec![0.0f32; k * block_len];
+    for b in 0..k {
+        for t in 0..seq_len {
+            for s in 0..block_size {
+                out[b * block_len + t * block_size + s] =
+                    seq_major[t * d_out + b * block_size + s];
+            }
+        }
+    }
+    out
+}
+
 /// Re-encode a full vector back into k coded vectors.
 ///
 /// Splits `full` into k blocks and returns n coded vectors (one per node).
@@ -879,6 +940,62 @@ mod tests {
         let accepted = model.apply_coded_update(0, &huge_grad);
         assert!(!accepted);
         assert_eq!(model.shards[0].version, 0); // not incremented
+    }
+
+    // --- Batched coded forward ---
+
+    #[test]
+    fn batched_coded_forward_matches_uncoded() {
+        // W: 2×3, seq_len=3
+        let w = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0f32]; // (2 rows, 3 cols)
+        let x = [
+            1.0, 0.5, -1.0, // token 0
+            0.0, 1.0, 0.5,  // token 1
+            -0.5, 0.3, 0.8, // token 2
+        ];
+
+        // Uncoded reference per token
+        let expected: Vec<Vec<f32>> = (0..3)
+            .map(|t| {
+                let xt = &x[t * 3..(t + 1) * 3];
+                (0..2)
+                    .map(|r| (0..3).map(|c| w[r * 3 + c] * xt[c]).sum::<f32>())
+                    .collect()
+            })
+            .collect();
+
+        let g = Generator::cauchy(4, 2);
+        let b0 = &w[0..3];
+        let b1 = &w[3..6];
+        let shards = g.encode(&[b0, b1]);
+
+        // Coded forward with batched input
+        let coded_outputs: Vec<(usize, Vec<f32>)> = (0..2)
+            .map(|i| (i, shards[i].forward_linear(&x, 3)))
+            .collect();
+
+        let output_refs: Vec<(usize, &[f32])> = coded_outputs
+            .iter()
+            .map(|(i, v)| (*i, v.as_slice()))
+            .collect();
+        let full = decode_outputs(&g, &output_refs);
+
+        // decode_outputs returns k blocks concatenated (block-major):
+        // [block0(seq_len values), block1(seq_len values)]
+        // block0 = row 0 output for each token, block1 = row 1 output for each token
+        let block_size = 1; // d_out / k = 2 / 2
+        let seq_len = 3;
+        assert_eq!(full.len(), 2 * seq_len * block_size);
+        for block in 0..2 {
+            for t in 0..seq_len {
+                let got = full[block * seq_len * block_size + t * block_size];
+                let exp = expected[t][block];
+                assert!(
+                    (got - exp).abs() < 1e-3,
+                    "block {block} token {t}: {got} vs {exp}"
+                );
+            }
+        }
     }
 
     // --- Encode/decode outputs ---

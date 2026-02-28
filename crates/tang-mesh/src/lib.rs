@@ -54,6 +54,7 @@ pub mod worker;
 // Re-exports
 pub use coded::{
     CodedModel, CompressedGrad, Generator, GradientPolicy, Shard,
+    reshape_blocks_to_seq, reshape_seq_to_blocks,
 };
 pub use allreduce::{AllReduce, ReduceOp};
 pub use coordinator::Coordinator;

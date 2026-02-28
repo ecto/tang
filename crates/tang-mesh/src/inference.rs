@@ -154,7 +154,8 @@ impl InferenceServer {
 // ---------------------------------------------------------------------------
 
 use crate::coded::{
-    decode_outputs, CompressedGrad, Generator, GradientPolicy, Shard,
+    decode_outputs, reshape_blocks_to_seq, CompressedGrad, Generator,
+    GradientPolicy, Shard,
 };
 use crate::mesh::NodeId;
 
@@ -164,6 +165,8 @@ pub enum Activation {
     Gelu,
     LayerNorm { eps: f32 },
     Softmax,
+    /// RMSNorm: y = x / sqrt(mean(x^2) + eps). No learned scale/bias.
+    RMSNorm { eps: f32 },
 }
 
 impl Activation {
@@ -219,6 +222,24 @@ impl Activation {
                     .map(|(&dy, &yi)| yi * (dy - dot))
                     .collect()
             }
+            Activation::RMSNorm { eps } => {
+                let n = pre_activation.len() as f32;
+                let ms = pre_activation.iter().map(|x| x * x).sum::<f32>() / n;
+                let rms = (ms + eps).sqrt();
+                let inv_rms = 1.0 / rms;
+                let x_hat: Vec<f32> = pre_activation.iter().map(|&x| x * inv_rms).collect();
+                let dy_xhat_mean: f32 = grad_output
+                    .iter()
+                    .zip(&x_hat)
+                    .map(|(&dy, &xh)| dy * xh)
+                    .sum::<f32>()
+                    / n;
+                grad_output
+                    .iter()
+                    .zip(&x_hat)
+                    .map(|(&dy, &xh)| inv_rms * (dy - xh * dy_xhat_mean))
+                    .collect()
+            }
         }
     }
 
@@ -253,6 +274,14 @@ impl Activation {
                     *x /= sum;
                 }
             }
+            Activation::RMSNorm { eps } => {
+                let n = data.len() as f32;
+                let ms = data.iter().map(|x| x * x).sum::<f32>() / n;
+                let rms = (ms + eps).sqrt();
+                for x in data.iter_mut() {
+                    *x /= rms;
+                }
+            }
         }
     }
 }
@@ -264,6 +293,240 @@ pub enum CodedLayer {
     Linear { d_in: usize, d_out: usize },
     /// Non-linearity — requires decode → apply → re-encode.
     Nonlinear(Activation),
+
+    // -- Dataflow control --
+    /// Push x.clone() onto the residual stack.
+    SaveResidual,
+    /// x += residual_stack.pop()
+    AddResidual,
+
+    // -- Compound coded operations --
+    /// 3 coded linears from SAME input → concat [Q;K;V].
+    /// Consumes 3 consecutive shard indices.
+    QkvProject {
+        d_model: usize,
+        d_q: usize,     // n_heads * head_dim
+        d_k: usize,     // n_kv_heads * head_dim
+        d_v: usize,     // n_kv_heads * head_dim
+    },
+    /// Grouped-query attention on decoded [Q;K;V] → [seq, d_model].
+    Attention {
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    },
+    /// 2 coded linears (gate + up) from SAME input + SiLU + elementwise mul.
+    /// Consumes 2 consecutive shard indices.
+    SwiGluUp {
+        d_model: usize,
+        ff_dim: usize,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Activation helpers
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn silu(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
+#[inline]
+fn silu_backward(x: f32) -> f32 {
+    let sig = 1.0 / (1.0 + (-x).exp());
+    sig * (1.0 + x * (1.0 - sig))
+}
+
+// ---------------------------------------------------------------------------
+// Attention helpers
+// ---------------------------------------------------------------------------
+
+/// Multi-head (GQA) attention forward.
+///
+/// Input: `qkv` is `[seq_len, d_q + d_k + d_v]` flattened (token-major).
+/// Returns `[seq_len, n_heads * head_dim]` flattened.
+///
+/// Also returns `(attn_weights, q, k, v)` for backward.
+fn attention_forward(
+    qkv: &[f32],
+    seq_len: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    let d_q = n_heads * head_dim;
+    let d_k = n_kv_heads * head_dim;
+    let d_v = n_kv_heads * head_dim;
+    let d_qkv = d_q + d_k + d_v;
+    assert_eq!(qkv.len(), seq_len * d_qkv);
+
+    let heads_per_kv = n_heads / n_kv_heads;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    // Split Q, K, V: each [seq_len, d_*]
+    let mut q = vec![0.0f32; seq_len * d_q];
+    let mut k = vec![0.0f32; seq_len * d_k];
+    let mut v = vec![0.0f32; seq_len * d_v];
+    for t in 0..seq_len {
+        let off = t * d_qkv;
+        q[t * d_q..(t + 1) * d_q].copy_from_slice(&qkv[off..off + d_q]);
+        k[t * d_k..(t + 1) * d_k].copy_from_slice(&qkv[off + d_q..off + d_q + d_k]);
+        v[t * d_v..(t + 1) * d_v].copy_from_slice(&qkv[off + d_q + d_k..off + d_qkv]);
+    }
+
+    let d_model = n_heads * head_dim;
+    let mut output = vec![0.0f32; seq_len * d_model];
+    let mut all_attn_weights = vec![0.0f32; n_heads * seq_len * seq_len];
+
+    for h in 0..n_heads {
+        let kv_h = h / heads_per_kv;
+
+        // scores[i,j] = q[i] · k[j] / sqrt(hd), with causal mask
+        let mut scores = vec![0.0f32; seq_len * seq_len];
+        for i in 0..seq_len {
+            for j in 0..seq_len {
+                if j > i {
+                    scores[i * seq_len + j] = f32::NEG_INFINITY;
+                } else {
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q[i * d_q + h * head_dim + d]
+                            * k[j * d_k + kv_h * head_dim + d];
+                    }
+                    scores[i * seq_len + j] = dot * scale;
+                }
+            }
+        }
+
+        // softmax per row
+        for i in 0..seq_len {
+            let row = &mut scores[i * seq_len..(i + 1) * seq_len];
+            let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0f32;
+            for s in row.iter_mut() {
+                *s = (*s - max).exp();
+                sum += *s;
+            }
+            for s in row.iter_mut() {
+                *s /= sum;
+            }
+        }
+
+        // store attn weights for backward
+        all_attn_weights[h * seq_len * seq_len..(h + 1) * seq_len * seq_len]
+            .copy_from_slice(&scores);
+
+        // out[i] = sum_j attn[i,j] * v[j]
+        for i in 0..seq_len {
+            for j in 0..seq_len {
+                let a = scores[i * seq_len + j];
+                for d in 0..head_dim {
+                    output[i * d_model + h * head_dim + d] +=
+                        a * v[j * d_v + kv_h * head_dim + d];
+                }
+            }
+        }
+    }
+
+    (output, all_attn_weights, q, k, v)
+}
+
+/// Multi-head (GQA) attention backward.
+///
+/// `d_output`: gradient w.r.t. attention output `[seq_len, d_model]`.
+/// Returns gradient w.r.t. qkv input `[seq_len, d_q + d_k + d_v]`.
+fn attention_backward(
+    d_output: &[f32],
+    attn_weights: &[f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+) -> Vec<f32> {
+    let d_q = n_heads * head_dim;
+    let d_k = n_kv_heads * head_dim;
+    let d_v = n_kv_heads * head_dim;
+    let d_qkv = d_q + d_k + d_v;
+    let d_model = n_heads * head_dim;
+    let heads_per_kv = n_heads / n_kv_heads;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let mut dq = vec![0.0f32; seq_len * d_q];
+    let mut dk = vec![0.0f32; seq_len * d_k];
+    let mut dv = vec![0.0f32; seq_len * d_v];
+
+    for h in 0..n_heads {
+        let kv_h = h / heads_per_kv;
+        let aw = &attn_weights[h * seq_len * seq_len..(h + 1) * seq_len * seq_len];
+
+        // d_attn[i,j] from d_output and v
+        // d_v[j] += sum_i attn[i,j] * d_output[i]
+        // d_attn[i,j] = d_output[i] · v[j]
+        let mut d_attn = vec![0.0f32; seq_len * seq_len];
+        for i in 0..seq_len {
+            for j in 0..seq_len {
+                let mut dot = 0.0f32;
+                for d in 0..head_dim {
+                    dot += d_output[i * d_model + h * head_dim + d]
+                        * v[j * d_v + kv_h * head_dim + d];
+                }
+                d_attn[i * seq_len + j] = dot;
+
+                // dv
+                let a = aw[i * seq_len + j];
+                for d in 0..head_dim {
+                    dv[j * d_v + kv_h * head_dim + d] +=
+                        a * d_output[i * d_model + h * head_dim + d];
+                }
+            }
+        }
+
+        // softmax backward: d_scores = attn * (d_attn - sum_j(attn * d_attn))
+        let mut d_scores = vec![0.0f32; seq_len * seq_len];
+        for i in 0..seq_len {
+            let row_sum: f32 = (0..seq_len)
+                .map(|j| aw[i * seq_len + j] * d_attn[i * seq_len + j])
+                .sum();
+            for j in 0..seq_len {
+                d_scores[i * seq_len + j] =
+                    aw[i * seq_len + j] * (d_attn[i * seq_len + j] - row_sum);
+            }
+        }
+
+        // Scale backward
+        for s in d_scores.iter_mut() {
+            *s *= scale;
+        }
+
+        // dq[i] += sum_j d_scores[i,j] * k[j]
+        // dk[j] += sum_i d_scores[i,j] * q[i]
+        for i in 0..seq_len {
+            for j in 0..=i {
+                // causal: only j <= i
+                let ds = d_scores[i * seq_len + j];
+                for d in 0..head_dim {
+                    dq[i * d_q + h * head_dim + d] +=
+                        ds * k[j * d_k + kv_h * head_dim + d];
+                    dk[j * d_k + kv_h * head_dim + d] +=
+                        ds * q[i * d_q + h * head_dim + d];
+                }
+            }
+        }
+    }
+
+    // Reassemble dqkv
+    let mut dqkv = vec![0.0f32; seq_len * d_qkv];
+    for t in 0..seq_len {
+        let off = t * d_qkv;
+        dqkv[off..off + d_q].copy_from_slice(&dq[t * d_q..(t + 1) * d_q]);
+        dqkv[off + d_q..off + d_q + d_k].copy_from_slice(&dk[t * d_k..(t + 1) * d_k]);
+        dqkv[off + d_q + d_k..off + d_qkv].copy_from_slice(&dv[t * d_v..(t + 1) * d_v]);
+    }
+    dqkv
 }
 
 /// Coded tensor-parallel inference server.
@@ -306,7 +569,8 @@ impl CodedInferenceServer {
 
     /// Run coded forward, collecting partial outputs from k nodes and decoding.
     ///
-    /// `linear_layer_idx` is the index into each node's shard vector.
+    /// Returns raw decoded output (block-major). For 1-D input this is
+    /// already token-major. For batched input use `coded_forward_seq`.
     async fn coded_forward_layer(
         &self,
         linear_layer_idx: u32,
@@ -320,7 +584,6 @@ impl CodedInferenceServer {
                 .coordinator
                 .coded_forward_on(*node_id, linear_layer_idx, x.to_vec(), d_in as u32)
                 .await?;
-            // Use NodeId value as generator row index
             coded_outputs.push((node_id.0 as usize, result));
         }
         let refs: Vec<(usize, &[f32])> = coded_outputs
@@ -330,21 +593,83 @@ impl CodedInferenceServer {
         Ok(decode_outputs(&self.generator, &refs))
     }
 
-    /// Run coded inference through the layer sequence.
+    /// Coded forward with block→token reshape for batched input.
     ///
-    /// At linear layers, each node computes `shard @ x` in parallel (stays coded).
-    /// At non-linearities, we decode → apply activation → re-encode.
+    /// Returns `[seq_len, d_out]` flattened (token-major).
+    async fn coded_forward_seq(
+        &self,
+        linear_layer_idx: u32,
+        x: &[f32],
+        d_in: usize,
+        d_out: usize,
+    ) -> Result<Vec<f32>, MeshError> {
+        let decoded = self.coded_forward_layer(linear_layer_idx, x, d_in).await?;
+        let seq_len = x.len() / d_in;
+        if seq_len <= 1 {
+            Ok(decoded[..d_out].to_vec())
+        } else {
+            Ok(reshape_blocks_to_seq(&decoded, self.generator.k, seq_len)
+                [..seq_len * d_out]
+                .to_vec())
+        }
+    }
+
+    /// Run coded inference through the layer sequence.
     pub async fn infer(&self, input: Vec<f32>) -> Result<Vec<f32>, MeshError> {
         let mut x = input;
         let mut linear_idx = 0u32;
+        let mut residual_stack: Vec<Vec<f32>> = Vec::new();
+
         for layer in &self.layers {
             match layer {
-                CodedLayer::Linear { d_in, .. } => {
-                    x = self.coded_forward_layer(linear_idx, &x, *d_in).await?;
+                CodedLayer::Linear { d_in, d_out } => {
+                    x = self.coded_forward_seq(linear_idx, &x, *d_in, *d_out).await?;
                     linear_idx += 1;
                 }
                 CodedLayer::Nonlinear(activation) => {
                     activation.apply(&mut x);
+                }
+                CodedLayer::SaveResidual => {
+                    residual_stack.push(x.clone());
+                }
+                CodedLayer::AddResidual => {
+                    let res = residual_stack.pop().expect("residual stack underflow");
+                    for (xi, ri) in x.iter_mut().zip(&res) {
+                        *xi += ri;
+                    }
+                }
+                CodedLayer::QkvProject { d_model, d_q, d_k, d_v } => {
+                    let seq_len = x.len() / d_model;
+                    let q = self.coded_forward_seq(linear_idx, &x, *d_model, *d_q).await?;
+                    let k = self.coded_forward_seq(linear_idx + 1, &x, *d_model, *d_k).await?;
+                    let v = self.coded_forward_seq(linear_idx + 2, &x, *d_model, *d_v).await?;
+                    linear_idx += 3;
+                    // Concat [Q;K;V] per token: [seq, d_q+d_k+d_v]
+                    let d_qkv = d_q + d_k + d_v;
+                    let mut qkv = vec![0.0f32; seq_len * d_qkv];
+                    for t in 0..seq_len {
+                        qkv[t * d_qkv..t * d_qkv + d_q]
+                            .copy_from_slice(&q[t * d_q..(t + 1) * d_q]);
+                        qkv[t * d_qkv + d_q..t * d_qkv + d_q + d_k]
+                            .copy_from_slice(&k[t * d_k..(t + 1) * d_k]);
+                        qkv[t * d_qkv + d_q + d_k..t * d_qkv + d_qkv]
+                            .copy_from_slice(&v[t * d_v..(t + 1) * d_v]);
+                    }
+                    x = qkv;
+                }
+                CodedLayer::Attention { n_heads, n_kv_heads, head_dim } => {
+                    let d_qkv = (n_heads + 2 * n_kv_heads) * head_dim;
+                    let seq_len = x.len() / d_qkv;
+                    let (out, _, _, _, _) = attention_forward(
+                        &x, seq_len, *n_heads, *n_kv_heads, *head_dim,
+                    );
+                    x = out;
+                }
+                CodedLayer::SwiGluUp { d_model, ff_dim } => {
+                    let gate = self.coded_forward_seq(linear_idx, &x, *d_model, *ff_dim).await?;
+                    let up = self.coded_forward_seq(linear_idx + 1, &x, *d_model, *ff_dim).await?;
+                    linear_idx += 2;
+                    x = gate.iter().zip(&up).map(|(&g, &u)| silu(g) * u).collect();
                 }
             }
         }
@@ -352,10 +677,6 @@ impl CodedInferenceServer {
     }
 
     /// Run inference and learn: forward → MSE loss → backward → gossip updates.
-    ///
-    /// Every inference is a training step. One node (the coordinator) runs
-    /// backprop on decoded activations, producing block gradients that are
-    /// encoded and gossiped to all group members.
     ///
     /// Returns `(output, mse_loss)`.
     pub async fn infer_and_learn(
@@ -365,29 +686,78 @@ impl CodedInferenceServer {
     ) -> Result<(Vec<f32>, f32), MeshError> {
         let k = self.generator.k;
 
-        // Count linear layers for indexing
-        let num_linear = self
-            .layers
-            .iter()
-            .filter(|l| matches!(l, CodedLayer::Linear { .. }))
-            .count();
+        // Count total linear (shard) layers for decoding
+        let num_linear = self.count_linear_layers();
 
-        // --- Forward pass (save activations) ---
+        // --- Forward pass (save state for backward) ---
         let mut x = input;
+        let mut linear_idx = 0u32;
         let mut linear_inputs: Vec<Vec<f32>> = Vec::new();
         let mut pre_activations: Vec<Vec<f32>> = Vec::new();
-        let mut linear_idx = 0u32;
+        let mut residual_stack: Vec<Vec<f32>> = Vec::new();
+        // State for compound layers
+        let mut qkv_inputs: Vec<Vec<f32>> = Vec::new();
+        let mut attn_cache: Vec<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> = Vec::new();
+        let mut swiglu_cache: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> = Vec::new();
 
         for layer in &self.layers {
             match layer {
-                CodedLayer::Linear { d_in, .. } => {
+                CodedLayer::Linear { d_in, d_out } => {
                     linear_inputs.push(x.clone());
-                    x = self.coded_forward_layer(linear_idx, &x, *d_in).await?;
+                    x = self.coded_forward_seq(linear_idx, &x, *d_in, *d_out).await?;
                     linear_idx += 1;
                 }
                 CodedLayer::Nonlinear(activation) => {
                     pre_activations.push(x.clone());
                     activation.apply(&mut x);
+                }
+                CodedLayer::SaveResidual => {
+                    residual_stack.push(x.clone());
+                }
+                CodedLayer::AddResidual => {
+                    let res = residual_stack.pop().expect("residual stack underflow");
+                    for (xi, ri) in x.iter_mut().zip(&res) {
+                        *xi += ri;
+                    }
+                }
+                CodedLayer::QkvProject { d_model, d_q, d_k, d_v } => {
+                    let seq_len = x.len() / d_model;
+                    qkv_inputs.push(x.clone());
+                    let q_out = self.coded_forward_seq(linear_idx, &x, *d_model, *d_q).await?;
+                    let k_out = self.coded_forward_seq(linear_idx + 1, &x, *d_model, *d_k).await?;
+                    let v_out = self.coded_forward_seq(linear_idx + 2, &x, *d_model, *d_v).await?;
+                    linear_idx += 3;
+                    let d_qkv = d_q + d_k + d_v;
+                    let mut qkv = vec![0.0f32; seq_len * d_qkv];
+                    for t in 0..seq_len {
+                        qkv[t * d_qkv..t * d_qkv + d_q]
+                            .copy_from_slice(&q_out[t * d_q..(t + 1) * d_q]);
+                        qkv[t * d_qkv + d_q..t * d_qkv + d_q + d_k]
+                            .copy_from_slice(&k_out[t * d_k..(t + 1) * d_k]);
+                        qkv[t * d_qkv + d_q + d_k..t * d_qkv + d_qkv]
+                            .copy_from_slice(&v_out[t * d_v..(t + 1) * d_v]);
+                    }
+                    x = qkv;
+                }
+                CodedLayer::Attention { n_heads, n_kv_heads, head_dim } => {
+                    let d_qkv = (n_heads + 2 * n_kv_heads) * head_dim;
+                    let seq_len = x.len() / d_qkv;
+                    let (out, aw, q, kk, v) = attention_forward(
+                        &x, seq_len, *n_heads, *n_kv_heads, *head_dim,
+                    );
+                    attn_cache.push((aw, q, kk, v));
+                    x = out;
+                }
+                CodedLayer::SwiGluUp { d_model, ff_dim } => {
+                    swiglu_cache.push((vec![], vec![], x.clone())); // placeholder
+                    let gate = self.coded_forward_seq(linear_idx, &x, *d_model, *ff_dim).await?;
+                    let up = self.coded_forward_seq(linear_idx + 1, &x, *d_model, *ff_dim).await?;
+                    linear_idx += 2;
+                    // Save raw gate and up for backward
+                    let cache_idx = swiglu_cache.len() - 1;
+                    swiglu_cache[cache_idx].0 = gate.clone();
+                    swiglu_cache[cache_idx].1 = up.clone();
+                    x = gate.iter().zip(&up).map(|(&g, &u)| silu(g) * u).collect();
                 }
             }
         }
@@ -402,14 +772,12 @@ impl CodedInferenceServer {
             output.iter().zip(target).map(|(o, t)| 2.0 * (o - t) / n).collect();
 
         // --- Decode per-layer weights for backward ---
-        // Request all shards (all layers) from k nodes
         let mut all_shards_by_node: Vec<(usize, Vec<Shard>)> = Vec::with_capacity(k);
         for node_id in &self.group {
             let shards = self.coordinator.request_shards_from(*node_id).await?;
             all_shards_by_node.push((node_id.0 as usize, shards));
         }
 
-        // Decode weights per linear layer
         let mut full_weights_per_layer: Vec<Vec<f32>> = Vec::with_capacity(num_linear);
         let mut version_per_layer: Vec<u64> = Vec::with_capacity(num_linear);
         for layer_idx in 0..num_linear {
@@ -426,8 +794,13 @@ impl CodedInferenceServer {
         // --- Backward pass ---
         let mut li = linear_inputs.len();
         let mut pi = pre_activations.len();
-        // weight_grads stored in reverse linear-layer order (last linear first)
+        let mut qi = qkv_inputs.len();
+        let mut ai = attn_cache.len();
+        let mut si = swiglu_cache.len();
+        let mut residual_grad_stack: Vec<Vec<f32>> = Vec::new();
         let mut weight_grads: Vec<(usize, Vec<f32>)> = Vec::new();
+        // Track linear_idx in reverse
+        let mut rev_linear_idx = num_linear;
 
         for layer in self.layers.iter().rev() {
             match layer {
@@ -437,29 +810,149 @@ impl CodedInferenceServer {
                 }
                 CodedLayer::Linear { d_in, d_out } => {
                     li -= 1;
-                    let linear_layer_idx = li; // forward order index
+                    rev_linear_idx -= 1;
                     let x_in = &linear_inputs[li];
-                    let full_w = &full_weights_per_layer[linear_layer_idx];
+                    let full_w = &full_weights_per_layer[rev_linear_idx];
+                    let seq_len = x_in.len() / d_in;
 
-                    // dL/dW = outer(grad, x_in) — (d_out × d_in) row-major
+                    // dW = sum_t outer(grad[t], x[t])
                     let mut dw = vec![0.0f32; d_out * d_in];
-                    for r in 0..*d_out {
-                        for c in 0..*d_in {
-                            dw[r * d_in + c] = grad[r] * x_in[c];
-                        }
-                    }
-                    weight_grads.push((linear_layer_idx, dw));
-
-                    // dL/dx = W^T @ grad (propagate to earlier layers)
-                    if li > 0 {
-                        let mut dx = vec![0.0f32; *d_in];
-                        for c in 0..*d_in {
-                            for r in 0..*d_out {
-                                dx[c] += full_w[r * d_in + c] * grad[r];
+                    for t in 0..seq_len {
+                        let g_off = t * d_out;
+                        let x_off = t * d_in;
+                        for r in 0..*d_out {
+                            for c in 0..*d_in {
+                                dw[r * d_in + c] += grad[g_off + r] * x_in[x_off + c];
                             }
                         }
-                        grad = dx;
                     }
+                    weight_grads.push((rev_linear_idx, dw));
+
+                    // dx = W^T @ grad per token
+                    let mut dx = vec![0.0f32; seq_len * d_in];
+                    for t in 0..seq_len {
+                        for c in 0..*d_in {
+                            let mut sum = 0.0f32;
+                            for r in 0..*d_out {
+                                sum += full_w[r * d_in + c] * grad[t * d_out + r];
+                            }
+                            dx[t * d_in + c] = sum;
+                        }
+                    }
+                    grad = dx;
+                }
+                CodedLayer::SaveResidual => {
+                    let rg = residual_grad_stack.pop().expect("residual grad stack underflow");
+                    for (gi, rgi) in grad.iter_mut().zip(&rg) {
+                        *gi += rgi;
+                    }
+                }
+                CodedLayer::AddResidual => {
+                    residual_grad_stack.push(grad.clone());
+                    // grad passes through unchanged
+                }
+                CodedLayer::QkvProject { d_model, d_q, d_k, d_v } => {
+                    qi -= 1;
+                    rev_linear_idx -= 3;
+                    let x_in = &qkv_inputs[qi];
+                    let seq_len = x_in.len() / d_model;
+                    let d_qkv = d_q + d_k + d_v;
+
+                    // Split grad into dQ, dK, dV
+                    let mut dq_flat = vec![0.0f32; seq_len * d_q];
+                    let mut dk_flat = vec![0.0f32; seq_len * d_k];
+                    let mut dv_flat = vec![0.0f32; seq_len * d_v];
+                    for t in 0..seq_len {
+                        let off = t * d_qkv;
+                        dq_flat[t * d_q..(t + 1) * d_q]
+                            .copy_from_slice(&grad[off..off + d_q]);
+                        dk_flat[t * d_k..(t + 1) * d_k]
+                            .copy_from_slice(&grad[off + d_q..off + d_q + d_k]);
+                        dv_flat[t * d_v..(t + 1) * d_v]
+                            .copy_from_slice(&grad[off + d_q + d_k..off + d_qkv]);
+                    }
+
+                    // Weight grads and input grads for each of Q, K, V projections
+                    let mut dx = vec![0.0f32; seq_len * d_model];
+                    for (proj_offset, (d_proj, d_grad)) in [
+                        (*d_q, &dq_flat), (*d_k, &dk_flat), (*d_v, &dv_flat),
+                    ].iter().enumerate() {
+                        let widx = rev_linear_idx + proj_offset;
+                        let full_w = &full_weights_per_layer[widx];
+                        let mut dw = vec![0.0f32; d_proj * d_model];
+                        for t in 0..seq_len {
+                            for r in 0..*d_proj {
+                                for c in 0..*d_model {
+                                    dw[r * d_model + c] +=
+                                        d_grad[t * d_proj + r] * x_in[t * d_model + c];
+                                }
+                            }
+                        }
+                        weight_grads.push((widx, dw));
+
+                        // dx += W^T @ d_grad per token
+                        for t in 0..seq_len {
+                            for c in 0..*d_model {
+                                let mut sum = 0.0f32;
+                                for r in 0..*d_proj {
+                                    sum += full_w[r * d_model + c] * d_grad[t * d_proj + r];
+                                }
+                                dx[t * d_model + c] += sum;
+                            }
+                        }
+                    }
+                    grad = dx;
+                }
+                CodedLayer::Attention { n_heads, n_kv_heads, head_dim } => {
+                    ai -= 1;
+                    let (ref aw, ref q, ref kk, ref v) = attn_cache[ai];
+                    let d_model = n_heads * head_dim;
+                    let seq_len = grad.len() / d_model;
+                    grad = attention_backward(
+                        &grad, aw, q, kk, v, seq_len, *n_heads, *n_kv_heads, *head_dim,
+                    );
+                }
+                CodedLayer::SwiGluUp { d_model, ff_dim } => {
+                    si -= 1;
+                    rev_linear_idx -= 2;
+                    let (ref gate_raw, ref up_raw, ref x_in) = swiglu_cache[si];
+                    let seq_len = x_in.len() / d_model;
+
+                    // d_gate = grad * up * silu'(gate), d_up = grad * silu(gate)
+                    let d_gate: Vec<f32> = grad.iter().zip(up_raw).zip(gate_raw)
+                        .map(|((&dy, &u), &g)| dy * u * silu_backward(g))
+                        .collect();
+                    let d_up: Vec<f32> = grad.iter().zip(gate_raw)
+                        .map(|(&dy, &g)| dy * silu(g))
+                        .collect();
+
+                    // Weight grads for gate and up projections
+                    let mut dx = vec![0.0f32; seq_len * d_model];
+                    for (proj_offset, d_grad) in [(0, &d_gate), (1, &d_up)] {
+                        let widx = rev_linear_idx + proj_offset;
+                        let full_w = &full_weights_per_layer[widx];
+                        let mut dw = vec![0.0f32; ff_dim * d_model];
+                        for t in 0..seq_len {
+                            for r in 0..*ff_dim {
+                                for c in 0..*d_model {
+                                    dw[r * d_model + c] +=
+                                        d_grad[t * ff_dim + r] * x_in[t * d_model + c];
+                                }
+                            }
+                        }
+                        weight_grads.push((widx, dw));
+
+                        for t in 0..seq_len {
+                            for c in 0..*d_model {
+                                let mut sum = 0.0f32;
+                                for r in 0..*ff_dim {
+                                    sum += full_w[r * d_model + c] * d_grad[t * ff_dim + r];
+                                }
+                                dx[t * d_model + c] += sum;
+                            }
+                        }
+                    }
+                    grad = dx;
                 }
             }
         }
@@ -486,6 +979,16 @@ impl CodedInferenceServer {
         }
 
         Ok((output, loss))
+    }
+
+    /// Count total linear (shard) layers including those inside compound layers.
+    fn count_linear_layers(&self) -> usize {
+        self.layers.iter().map(|l| match l {
+            CodedLayer::Linear { .. } => 1,
+            CodedLayer::QkvProject { .. } => 3,
+            CodedLayer::SwiGluUp { .. } => 2,
+            _ => 0,
+        }).sum()
     }
 
     /// Gossip a coded gradient update for a specific layer to all nodes in the group.
@@ -1034,5 +1537,344 @@ mod tests {
                 numerical
             );
         }
+    }
+
+    // --- New: RMSNorm, Attention, Transformer block tests ---
+
+    #[tokio::test]
+    async fn activation_backward_rmsnorm() {
+        let x = vec![0.5, -1.0, 0.3, 0.8, -0.2f32];
+        let dy = vec![1.0; 5];
+        let dx = Activation::RMSNorm { eps: 1e-5 }.backward(&dy, &x);
+
+        // RMSNorm couples all elements, so numerical grad[i] = sum_j dy[j] * d(y_j)/d(x_i)
+        let eps = 1e-4f32;
+        for i in 0..x.len() {
+            let mut x_plus = x.clone();
+            let mut x_minus = x.clone();
+            x_plus[i] += eps;
+            x_minus[i] -= eps;
+            Activation::RMSNorm { eps: 1e-5 }.apply(&mut x_plus);
+            Activation::RMSNorm { eps: 1e-5 }.apply(&mut x_minus);
+            let numerical: f32 = x_plus.iter().zip(&x_minus)
+                .zip(&dy)
+                .map(|((&p, &m), &d)| d * (p - m) / (2.0 * eps))
+                .sum();
+            assert!(
+                (dx[i] - numerical).abs() < 1e-3,
+                "RMSNorm grad[{i}]: analytical={} numerical={}",
+                dx[i],
+                numerical
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn attention_forward_basic() {
+        // seq_len=3, n_heads=2, n_kv_heads=1, head_dim=4
+        let n_heads = 2;
+        let n_kv_heads = 1;
+        let head_dim = 4;
+        let seq_len = 3;
+        let d_q = n_heads * head_dim; // 8
+        let d_k = n_kv_heads * head_dim; // 4
+        let d_v = n_kv_heads * head_dim; // 4
+        let d_qkv = d_q + d_k + d_v; // 16
+        let d_model = n_heads * head_dim; // 8
+
+        // Deterministic input
+        let qkv: Vec<f32> = (0..seq_len * d_qkv)
+            .map(|i| ((i as f32) * 0.1 - 2.0) * 0.3)
+            .collect();
+
+        let (output, aw, _q, _k, _v) = attention_forward(
+            &qkv, seq_len, n_heads, n_kv_heads, head_dim,
+        );
+
+        // Output shape check
+        assert_eq!(output.len(), seq_len * d_model);
+
+        // Attention weights: each head has seq_len × seq_len, rows should sum to 1
+        for h in 0..n_heads {
+            for i in 0..seq_len {
+                let row_sum: f32 = (0..seq_len)
+                    .map(|j| aw[h * seq_len * seq_len + i * seq_len + j])
+                    .sum();
+                assert!(
+                    (row_sum - 1.0).abs() < 1e-5,
+                    "head {h} row {i} sum = {row_sum}"
+                );
+            }
+        }
+
+        // Causal: attn[i,j] = 0 for j > i
+        for h in 0..n_heads {
+            for i in 0..seq_len {
+                for j in (i + 1)..seq_len {
+                    let w = aw[h * seq_len * seq_len + i * seq_len + j];
+                    assert!(
+                        w < 1e-6,
+                        "causal violation: head {h} attn[{i},{j}] = {w}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn attention_backward_numerical() {
+        let n_heads = 2;
+        let n_kv_heads = 1;
+        let head_dim = 4;
+        let seq_len = 2;
+        let d_qkv = (n_heads + 2 * n_kv_heads) * head_dim;
+        let d_model = n_heads * head_dim;
+
+        let qkv: Vec<f32> = (0..seq_len * d_qkv)
+            .map(|i| ((i as f32) * 0.13 - 1.5) * 0.5)
+            .collect();
+
+        let dy = vec![1.0f32; seq_len * d_model];
+        let (_, aw, q, k, v) = attention_forward(&qkv, seq_len, n_heads, n_kv_heads, head_dim);
+        let dqkv = attention_backward(&dy, &aw, &q, &k, &v, seq_len, n_heads, n_kv_heads, head_dim);
+
+        // Numerical gradient check
+        let eps = 1e-4f32;
+        // Check a subset of indices (all would be slow)
+        for i in (0..qkv.len()).step_by(3) {
+            let mut qkv_p = qkv.clone();
+            let mut qkv_m = qkv.clone();
+            qkv_p[i] += eps;
+            qkv_m[i] -= eps;
+            let (out_p, _, _, _, _) = attention_forward(&qkv_p, seq_len, n_heads, n_kv_heads, head_dim);
+            let (out_m, _, _, _, _) = attention_forward(&qkv_m, seq_len, n_heads, n_kv_heads, head_dim);
+            // dy = all ones, so numerical grad = sum of (out_p - out_m) / (2*eps)
+            let numerical: f32 = out_p.iter().zip(&out_m)
+                .map(|(p, m)| (p - m) / (2.0 * eps))
+                .sum();
+            assert!(
+                (dqkv[i] - numerical).abs() < 1e-2,
+                "attn grad[{i}]: analytical={} numerical={}",
+                dqkv[i],
+                numerical
+            );
+        }
+    }
+
+    /// Batched matmul: W (d_out × d_in) @ x [seq_len, d_in] → [seq_len, d_out]
+    fn matmul_batched(w: &[f32], x: &[f32], d_out: usize, d_in: usize) -> Vec<f32> {
+        let seq_len = x.len() / d_in;
+        let mut out = vec![0.0f32; seq_len * d_out];
+        for t in 0..seq_len {
+            for r in 0..d_out {
+                let mut sum = 0.0f32;
+                for c in 0..d_in {
+                    sum += w[r * d_in + c] * x[t * d_in + c];
+                }
+                out[t * d_out + r] = sum;
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn transformer_block_forward_coded_matches_uncoded() {
+        // d_model=8, n_heads=2, n_kv_heads=1, head_dim=4, ff_dim=12, seq_len=3
+        let d_model = 8;
+        let n_heads = 2;
+        let n_kv_heads = 1;
+        let head_dim = 4;
+        let ff_dim = 12;
+        let seq_len = 3;
+        let d_q = n_heads * head_dim;   // 8
+        let d_k = n_kv_heads * head_dim; // 4
+        let d_v = n_kv_heads * head_dim; // 4
+
+        // Generate deterministic weights for 7 linear layers
+        let mut rng_seed = 42u64;
+        let mut rand_weight = |rows: usize, cols: usize| -> Vec<f32> {
+            (0..rows * cols)
+                .map(|_| {
+                    rng_seed = rng_seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    ((rng_seed >> 33) as f32 / (1u64 << 31) as f32 - 0.5) * 0.5
+                })
+                .collect::<Vec<f32>>()
+        };
+
+        let wq = rand_weight(d_q, d_model);     // 0
+        let wk = rand_weight(d_k, d_model);     // 1
+        let wv = rand_weight(d_v, d_model);     // 2
+        let wo = rand_weight(d_model, d_model);  // 3
+        let w_gate = rand_weight(ff_dim, d_model); // 4
+        let w_up = rand_weight(ff_dim, d_model);   // 5
+        let w_down = rand_weight(d_model, ff_dim);  // 6
+
+        // Input: [seq_len, d_model]
+        let input: Vec<f32> = (0..seq_len * d_model)
+            .map(|i| (i as f32 * 0.1 - 1.0) * 0.3)
+            .collect();
+
+        // --- Uncoded reference ---
+        let mut x = input.clone();
+
+        // SaveResidual
+        let residual1 = x.clone();
+        // RMSNorm
+        Activation::RMSNorm { eps: 1e-5 }.apply(&mut x);
+        // QKV project
+        let q_ref = matmul_batched(&wq, &x, d_q, d_model);
+        let k_ref = matmul_batched(&wk, &x, d_k, d_model);
+        let v_ref = matmul_batched(&wv, &x, d_v, d_model);
+        // Concat [Q;K;V] per token
+        let d_qkv = d_q + d_k + d_v;
+        let mut qkv_ref = vec![0.0f32; seq_len * d_qkv];
+        for t in 0..seq_len {
+            qkv_ref[t * d_qkv..t * d_qkv + d_q].copy_from_slice(&q_ref[t * d_q..(t + 1) * d_q]);
+            qkv_ref[t * d_qkv + d_q..t * d_qkv + d_q + d_k].copy_from_slice(&k_ref[t * d_k..(t + 1) * d_k]);
+            qkv_ref[t * d_qkv + d_q + d_k..t * d_qkv + d_qkv].copy_from_slice(&v_ref[t * d_v..(t + 1) * d_v]);
+        }
+        // Attention
+        let (attn_out, _, _, _, _) = attention_forward(&qkv_ref, seq_len, n_heads, n_kv_heads, head_dim);
+        // Wo
+        x = matmul_batched(&wo, &attn_out, d_model, d_model);
+        // AddResidual
+        for (xi, ri) in x.iter_mut().zip(&residual1) { *xi += ri; }
+        // SaveResidual
+        let residual2 = x.clone();
+        // RMSNorm
+        Activation::RMSNorm { eps: 1e-5 }.apply(&mut x);
+        // SwiGLU
+        let gate_ref = matmul_batched(&w_gate, &x, ff_dim, d_model);
+        let up_ref = matmul_batched(&w_up, &x, ff_dim, d_model);
+        let swiglu_out: Vec<f32> = gate_ref.iter().zip(&up_ref)
+            .map(|(&g, &u)| silu(g) * u)
+            .collect();
+        // Down proj
+        x = matmul_batched(&w_down, &swiglu_out, d_model, ff_dim);
+        // AddResidual
+        for (xi, ri) in x.iter_mut().zip(&residual2) { *xi += ri; }
+        let expected = x;
+
+        // --- Coded inference ---
+        let all_weights: Vec<&[f32]> = vec![
+            &wq, &wk, &wv, &wo, &w_gate, &w_up, &w_down,
+        ];
+        let g = Generator::cauchy(4, 2);
+        let (coordinator, _workers) =
+            setup_coded_workers_multi(&all_weights, &g, 4).await;
+
+        let layers = vec![
+            CodedLayer::SaveResidual,
+            CodedLayer::Nonlinear(Activation::RMSNorm { eps: 1e-5 }),
+            CodedLayer::QkvProject { d_model, d_q, d_k, d_v },
+            CodedLayer::Attention { n_heads, n_kv_heads, head_dim },
+            CodedLayer::Linear { d_in: d_model, d_out: d_model }, // wo
+            CodedLayer::AddResidual,
+            CodedLayer::SaveResidual,
+            CodedLayer::Nonlinear(Activation::RMSNorm { eps: 1e-5 }),
+            CodedLayer::SwiGluUp { d_model, ff_dim },
+            CodedLayer::Linear { d_in: ff_dim, d_out: d_model }, // down
+            CodedLayer::AddResidual,
+        ];
+
+        let server = CodedInferenceServer::new(
+            coordinator,
+            g,
+            vec![NodeId(0), NodeId(1)],
+            layers,
+        );
+
+        let result = server.infer(input).await.unwrap();
+        assert_eq!(result.len(), expected.len());
+        for (i, (&got, &exp)) in result.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 0.05,
+                "output[{i}]: {got} vs {exp} (diff={})",
+                (got - exp).abs()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transformer_block_learning_reduces_loss() {
+        let d_model = 8;
+        let n_heads = 2;
+        let n_kv_heads = 1;
+        let head_dim = 4;
+        let ff_dim = 12;
+        let seq_len = 2;
+        let d_q = n_heads * head_dim;
+        let d_k = n_kv_heads * head_dim;
+        let d_v = n_kv_heads * head_dim;
+
+        let mut rng_seed = 123u64;
+        let mut rand_weight = |rows: usize, cols: usize| -> Vec<f32> {
+            (0..rows * cols)
+                .map(|_| {
+                    rng_seed = rng_seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    ((rng_seed >> 33) as f32 / (1u64 << 31) as f32 - 0.5) * 0.3
+                })
+                .collect::<Vec<f32>>()
+        };
+
+        let wq = rand_weight(d_q, d_model);
+        let wk = rand_weight(d_k, d_model);
+        let wv = rand_weight(d_v, d_model);
+        let wo = rand_weight(d_model, d_model);
+        let w_gate = rand_weight(ff_dim, d_model);
+        let w_up = rand_weight(ff_dim, d_model);
+        let w_down = rand_weight(d_model, ff_dim);
+
+        let all_weights: Vec<&[f32]> = vec![
+            &wq, &wk, &wv, &wo, &w_gate, &w_up, &w_down,
+        ];
+
+        let input: Vec<f32> = (0..seq_len * d_model)
+            .map(|i| (i as f32 * 0.05 - 0.4) * 0.5)
+            .collect();
+        let target: Vec<f32> = (0..seq_len * d_model)
+            .map(|i| (i as f32 * 0.02 + 0.1) * 0.3)
+            .collect();
+
+        let g = Generator::cauchy(4, 2);
+        let (coordinator, _workers) =
+            setup_coded_workers_multi(&all_weights, &g, 4).await;
+
+        let layers = vec![
+            CodedLayer::SaveResidual,
+            CodedLayer::Nonlinear(Activation::RMSNorm { eps: 1e-5 }),
+            CodedLayer::QkvProject { d_model, d_q, d_k, d_v },
+            CodedLayer::Attention { n_heads, n_kv_heads, head_dim },
+            CodedLayer::Linear { d_in: d_model, d_out: d_model },
+            CodedLayer::AddResidual,
+            CodedLayer::SaveResidual,
+            CodedLayer::Nonlinear(Activation::RMSNorm { eps: 1e-5 }),
+            CodedLayer::SwiGluUp { d_model, ff_dim },
+            CodedLayer::Linear { d_in: ff_dim, d_out: d_model },
+            CodedLayer::AddResidual,
+        ];
+
+        let server = CodedInferenceServer::new(
+            coordinator,
+            g,
+            vec![NodeId(0), NodeId(1)],
+            layers,
+        );
+
+        let (_, loss1) = server
+            .infer_and_learn(input.clone(), &target)
+            .await
+            .unwrap();
+        assert!(loss1 > 0.0, "loss1 should be positive: {loss1}");
+
+        let (_, loss2) = server
+            .infer_and_learn(input.clone(), &target)
+            .await
+            .unwrap();
+
+        assert!(
+            loss2 < loss1,
+            "loss should decrease: loss2={loss2} vs loss1={loss1}"
+        );
     }
 }
