@@ -68,6 +68,24 @@ impl GpuTensor {
         self.shape.iter().product()
     }
 
+    /// Reshape this tensor to a new shape with the same total element count.
+    ///
+    /// Zero-copy: moves the underlying buffer into a new tensor with the new shape.
+    pub fn reshape(self, new_shape: &[usize]) -> GpuTensor {
+        let new_numel: usize = new_shape.iter().product();
+        assert_eq!(
+            self.numel(),
+            new_numel,
+            "reshape: numel mismatch {} vs {}",
+            self.numel(),
+            new_numel,
+        );
+        GpuTensor {
+            buffer: self.buffer,
+            shape: new_shape.to_vec(),
+        }
+    }
+
     /// Clone this tensor entirely on the GPU (no CPU readback).
     pub fn clone_gpu(&self, device: &GpuDevice) -> GpuTensor {
         GpuTensor {

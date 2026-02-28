@@ -27,6 +27,27 @@ impl GpuBuffer {
         }
     }
 
+    /// Create a storage buffer initialized from a u32 slice.
+    ///
+    /// Used for token ID buffers passed to [`GpuEmbedding`].
+    /// The buffer holds u32 values but `len` tracks the element count.
+    pub fn from_u32_slice(device: &GpuDevice, data: &[u32]) -> Self {
+        use wgpu::util::DeviceExt;
+        let buffer = device
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("tang-gpu storage u32"),
+                contents: bytemuck::cast_slice(data),
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+            });
+        Self {
+            buffer,
+            len: data.len(),
+        }
+    }
+
     /// Create an uninitialized storage buffer of `len` f32 elements.
     pub fn uninit(device: &GpuDevice, len: usize) -> Self {
         let buffer = device.device.create_buffer(&wgpu::BufferDescriptor {

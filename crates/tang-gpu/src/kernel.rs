@@ -801,12 +801,103 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         self.submit_or_enqueue(device, encoder.finish());
     }
 
+    /// Get or compile a pipeline with an arbitrary binding layout.
+    ///
+    /// Each `BindingSpec` describes one binding: its type and read-only flag.
+    /// The last entry should typically be Uniform for params.
+    pub(crate) fn get_or_compile_dynamic(
+        &mut self,
+        device: &GpuDevice,
+        wgsl: &str,
+        hash: u64,
+        bindings: &[BindingSpec],
+    ) -> &CachedPipeline {
+        self.pipelines.entry(hash).or_insert_with(|| {
+            Self::compile_dynamic(device, wgsl, bindings)
+        })
+    }
+
+    fn compile_dynamic(device: &GpuDevice, wgsl: &str, bindings: &[BindingSpec]) -> CachedPipeline {
+        let module = device
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("tang-gpu kernel dynamic"),
+                source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+            });
+
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = bindings
+            .iter()
+            .enumerate()
+            .map(|(i, spec)| wgpu::BindGroupLayoutEntry {
+                binding: i as u32,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: match spec {
+                    BindingSpec::Storage { read_only } => wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage {
+                            read_only: *read_only,
+                        },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    BindingSpec::Uniform => wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                },
+                count: None,
+            })
+            .collect();
+
+        let bind_group_layout =
+            device
+                .device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("tang-gpu bgl dynamic"),
+                    entries: &entries,
+                });
+
+        let pipeline_layout =
+            device
+                .device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("tang-gpu pipeline layout dynamic"),
+                    bind_group_layouts: &[&bind_group_layout],
+                    push_constant_ranges: &[],
+                });
+
+        let pipeline =
+            device
+                .device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("tang-gpu pipeline dynamic"),
+                    layout: Some(&pipeline_layout),
+                    module: &module,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+
+        CachedPipeline {
+            pipeline,
+            bind_group_layout,
+        }
+    }
+
     fn hash_wgsl(wgsl: &str) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         wgsl.hash(&mut hasher);
         hasher.finish()
     }
+}
+
+/// Binding type specification for dynamic pipeline compilation.
+pub(crate) enum BindingSpec {
+    /// Storage buffer (read-only or read-write).
+    Storage { read_only: bool },
+    /// Uniform buffer.
+    Uniform,
 }
 
 impl Default for KernelCache {
