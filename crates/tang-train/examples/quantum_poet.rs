@@ -203,8 +203,7 @@ fn main() {
 
     // train
     println!("training...");
-    let losses = Trainer::new(&mut model, ModuleAdam::new(0.005))
-        .loss_fn(|pred, target| {
+    let losses = Trainer::new(&mut model, ModuleAdam::new(0.005), |pred, target| {
             (
                 cross_entropy_loss(pred, target),
                 cross_entropy_loss_grad(pred, target),

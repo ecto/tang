@@ -3,56 +3,54 @@ use crate::scheduler::Scheduler;
 use crate::{Module, Optimizer};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use tang::Scalar;
 use tang_tensor::Tensor;
 
 /// Loss function type: takes (prediction, target) and returns (scalar loss, gradient tensor).
-pub type LossFn = fn(&Tensor<f64>, &Tensor<f64>) -> (f64, Tensor<f64>);
+pub type LossFn<S> = fn(&Tensor<S>, &Tensor<S>) -> (f64, Tensor<S>);
 
 /// Training loop abstraction.
 ///
 /// ```ignore
-/// Trainer::new(&mut model, ModuleAdam::new(0.001))
-///     .loss_fn(|pred, target| (mse_loss(pred, target), mse_loss_grad(pred, target)))
-///     .epochs(100)
-///     .fit(&mut data_loader);
+/// Trainer::new(&mut model, ModuleAdam::new(0.001), |p, t| {
+///     (mse_loss(p, t), mse_loss_grad(p, t))
+/// })
+/// .epochs(100)
+/// .fit(&mut data_loader);
 /// ```
-pub struct Trainer<'a, M, O>
+pub struct Trainer<'a, S, M, O>
 where
-    M: Module<f64>,
-    O: Optimizer,
+    S: Scalar,
+    M: Module<S>,
+    O: Optimizer<S>,
 {
     model: &'a mut M,
     optimizer: O,
-    loss_fn: LossFn,
+    loss_fn: LossFn<S>,
     num_epochs: usize,
     scheduler: Option<Box<dyn Scheduler>>,
     accumulation_steps: usize,
 }
 
-fn default_loss(pred: &Tensor<f64>, target: &Tensor<f64>) -> (f64, Tensor<f64>) {
-    (
-        crate::mse_loss(pred, target),
-        crate::mse_loss_grad(pred, target),
-    )
-}
-
-impl<'a, M, O> Trainer<'a, M, O>
+impl<'a, S, M, O> Trainer<'a, S, M, O>
 where
-    M: Module<f64>,
-    O: Optimizer,
+    S: Scalar,
+    M: Module<S>,
+    O: Optimizer<S>,
 {
-    pub fn new(model: &'a mut M, optimizer: O) -> Self {
+    /// Create a new trainer with a mandatory loss function.
+    pub fn new(model: &'a mut M, optimizer: O, loss_fn: LossFn<S>) -> Self {
         Self {
             model,
             optimizer,
-            loss_fn: default_loss,
+            loss_fn,
             num_epochs: 100,
             scheduler: None,
             accumulation_steps: 1,
         }
     }
 
-    pub fn loss_fn(mut self, f: LossFn) -> Self {
+    pub fn loss_fn(mut self, f: LossFn<S>) -> Self {
         self.loss_fn = f;
         self
     }
@@ -81,9 +79,9 @@ where
     }
 
     /// Run the training loop. Returns per-epoch average loss.
-    pub fn fit<D: Dataset<f64>>(
+    pub fn fit<D: Dataset<S>>(
         &mut self,
-        loader: &mut DataLoader<'_, f64, D>,
+        loader: &mut DataLoader<'_, S, D>,
     ) -> Vec<f64> {
         let mut losses = Vec::with_capacity(self.num_epochs);
 
@@ -155,8 +153,11 @@ mod tests {
             Box::new(Linear::new(8, 1, 456)),
         ]);
 
-        let losses = Trainer::new(&mut model, ModuleAdam::new(0.01))
-            .loss_fn(|p, t| (mse_loss(p, t), mse_loss_grad(p, t)))
+        let losses = Trainer::new(
+            &mut model,
+            ModuleAdam::new(0.01),
+            |p, t| (mse_loss(p, t), mse_loss_grad(p, t)),
+        )
             .epochs(200)
             .fit(&mut loader);
 

@@ -1,9 +1,15 @@
 use crate::Parameter;
 use alloc::vec::Vec;
+use tang::Scalar;
 
 /// Trait for optimizers that update module parameters directly.
-pub trait Optimizer {
-    fn step(&mut self, params: &mut [&mut Parameter<f64>]);
+///
+/// The optimizer accepts parameters of any scalar type `S`, but maintains
+/// internal state (momentum, variance) in f64 for numerical stability.
+/// This follows mixed-precision convention: optimizer state in high precision,
+/// model weights in whatever precision the forward pass uses.
+pub trait Optimizer<S: Scalar> {
+    fn step(&mut self, params: &mut [&mut Parameter<S>]);
     /// Update the learning rate (used by schedulers).
     fn set_lr(&mut self, lr: f64);
 }
@@ -45,12 +51,12 @@ impl ModuleAdam {
     }
 }
 
-impl Optimizer for ModuleAdam {
+impl<S: Scalar> Optimizer<S> for ModuleAdam {
     fn set_lr(&mut self, lr: f64) {
         self.lr = lr;
     }
 
-    fn step(&mut self, params: &mut [&mut Parameter<f64>]) {
+    fn step(&mut self, params: &mut [&mut Parameter<S>]) {
         self.t += 1;
 
         // Initialize state vectors if needed
@@ -71,12 +77,13 @@ impl Optimizer for ModuleAdam {
                 let grad_data = grad.data();
 
                 for j in 0..data.len() {
-                    let g = grad_data[j];
+                    let g = grad_data[j].to_f64();
                     self.m[i][j] = self.beta1 * self.m[i][j] + (1.0 - self.beta1) * g;
                     self.v[i][j] = self.beta2 * self.v[i][j] + (1.0 - self.beta2) * g * g;
                     let m_hat = self.m[i][j] / bc1;
                     let v_hat = self.v[i][j] / bc2;
-                    data[j] -= self.lr * m_hat / (v_hat.sqrt() + self.epsilon);
+                    let update = self.lr * m_hat / (v_hat.sqrt() + self.epsilon);
+                    data[j] = S::from_f64(data[j].to_f64() - update);
                 }
             }
         }
@@ -108,12 +115,12 @@ impl ModuleSgd {
     }
 }
 
-impl Optimizer for ModuleSgd {
+impl<S: Scalar> Optimizer<S> for ModuleSgd {
     fn set_lr(&mut self, lr: f64) {
         self.lr = lr;
     }
 
-    fn step(&mut self, params: &mut [&mut Parameter<f64>]) {
+    fn step(&mut self, params: &mut [&mut Parameter<S>]) {
         // Initialize velocity if using momentum
         if self.momentum > 0.0 && self.velocity.is_empty() {
             for p in params.iter() {
@@ -129,12 +136,12 @@ impl Optimizer for ModuleSgd {
                 if self.momentum > 0.0 {
                     let vel = &mut self.velocity[i];
                     for j in 0..data.len() {
-                        vel[j] = self.momentum * vel[j] + grad_data[j];
-                        data[j] -= self.lr * vel[j];
+                        vel[j] = self.momentum * vel[j] + grad_data[j].to_f64();
+                        data[j] = S::from_f64(data[j].to_f64() - self.lr * vel[j]);
                     }
                 } else {
                     for j in 0..data.len() {
-                        data[j] -= self.lr * grad_data[j];
+                        data[j] = S::from_f64(data[j].to_f64() - self.lr * grad_data[j].to_f64());
                     }
                 }
             }

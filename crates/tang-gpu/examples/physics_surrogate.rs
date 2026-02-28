@@ -154,8 +154,11 @@ fn main() {
     let n_params: usize = cpu_model.parameters().iter().map(|p| p.data.numel()).sum();
     println!("  parameters: {}", n_params);
 
-    let losses = Trainer::new(&mut cpu_model, ModuleAdam::new(0.003))
-        .loss_fn(|pred, target| (mse_loss(pred, target), mse_loss_grad(pred, target)))
+    let losses = Trainer::new(
+        &mut cpu_model,
+        ModuleAdam::new(0.003),
+        |pred, target| (mse_loss(pred, target), mse_loss_grad(pred, target)),
+    )
         .epochs(200)
         .fit(&mut loader);
 

@@ -24,10 +24,11 @@
 //! let mut loader = DataLoader::new(&ds, 32);
 //!
 //! // 3. Train
-//! let losses = Trainer::new(&mut model, ModuleAdam::new(0.001))
-//!     .loss_fn(|p, t| (cross_entropy_loss(p, t), cross_entropy_loss_grad(p, t)))
-//!     .epochs(100)
-//!     .fit(&mut loader);
+//! let losses = Trainer::new(&mut model, ModuleAdam::new(0.001), |p, t| {
+//!     (cross_entropy_loss(p, t), cross_entropy_loss_grad(p, t))
+//! })
+//! .epochs(100)
+//! .fit(&mut loader);
 //! ```
 //!
 //! # Examples
@@ -70,4 +71,6 @@ pub use optimizer::{ModuleAdam, ModuleSgd, Optimizer};
 pub use parameter::Parameter;
 pub use rng::Rng;
 pub use scheduler::{CosineAnnealingLr, ConstantLr, Scheduler, StepLr, WarmupCosine};
-pub use trainer::{LossFn, Trainer};
+pub use trainer::LossFn;
+// Trainer now takes a scalar type parameter: Trainer<'a, S, M, O>
+pub use trainer::Trainer;
