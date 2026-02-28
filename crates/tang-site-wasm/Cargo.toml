@@ -8,6 +8,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 tang = { path = "../tang" }
+tang-tensor = { workspace = true }
+tang-train = { workspace = true }
 wasm-bindgen = "0.2"
 
 [profile.release]

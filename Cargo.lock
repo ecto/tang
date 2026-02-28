@@ -5009,6 +5009,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tang-compile"
+version = "0.1.0"
+dependencies = [
+ "tang-expr",
+]
+
+[[package]]
 name = "tang-expr"
 version = "0.1.0"
 dependencies = [
@@ -5082,6 +5089,14 @@ dependencies = [
  "tokio-serde",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "tang-onnx"
+version = "0.1.0"
+dependencies = [
+ "tang-tensor",
+ "tang-train",
 ]
 
 [[package]]
