@@ -55,7 +55,7 @@ impl ExprGraph {
     }
 
     /// Find all node indices reachable from the given outputs.
-    fn live_set(&self, outputs: &[ExprId]) -> HashSet<usize> {
+    pub fn live_set(&self, outputs: &[ExprId]) -> HashSet<usize> {
         let mut live = HashSet::new();
         let mut stack: Vec<usize> = outputs.iter().map(|e| e.0 as usize).collect();
         while let Some(i) = stack.pop() {

@@ -1,0 +1,21 @@
+[package]
+name = "tang-compute"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native GPU compute backends via tang-expr multi-target codegen"
+
+[features]
+default = []
+metal = ["dep:metal", "dep:objc"]
+cuda = ["dep:cudarc"]
+
+[dependencies]
+tang = { workspace = true, features = ["std"] }
+tang-expr = { workspace = true }
+bytemuck = { workspace = true }
+metal = { version = "0.33", optional = true }
+objc = { version = "0.2", optional = true }
+cudarc = { version = "0.16", features = ["nvrtc", "cuda-version-from-build-system"], optional = true }
+
+[build-dependencies]

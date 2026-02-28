@@ -1,6 +1,5 @@
 //! WGSL compute shader code generation.
 
-use std::collections::HashSet;
 use std::fmt::Write;
 
 use crate::graph::ExprGraph;
@@ -30,8 +29,8 @@ impl ExprGraph {
         let workgroup_size = 256u32;
         let n_outputs = outputs.len();
 
-        // Find all live nodes
-        let live = self.wgsl_live_set(outputs);
+        // Find all live nodes (shared with codegen.rs and compile.rs)
+        let live = self.live_set(outputs);
         let max_id = if live.is_empty() {
             0
         } else {
@@ -120,38 +119,6 @@ impl ExprGraph {
             n_outputs,
             workgroup_size,
         }
-    }
-
-    /// Find all live node indices reachable from outputs (excluding Var/Lit atoms).
-    fn wgsl_live_set(&self, outputs: &[ExprId]) -> HashSet<usize> {
-        let mut live = HashSet::new();
-        let mut stack: Vec<usize> = outputs.iter().map(|e| e.0 as usize).collect();
-        while let Some(i) = stack.pop() {
-            if !live.insert(i) {
-                continue;
-            }
-            match self.node(ExprId(i as u32)) {
-                Node::Var(_) | Node::Lit(_) => {}
-                Node::Add(a, b) | Node::Mul(a, b) | Node::Atan2(a, b) => {
-                    stack.push(a.0 as usize);
-                    stack.push(b.0 as usize);
-                }
-                Node::Neg(a)
-                | Node::Recip(a)
-                | Node::Sqrt(a)
-                | Node::Sin(a)
-                | Node::Exp2(a)
-                | Node::Log2(a) => {
-                    stack.push(a.0 as usize);
-                }
-                Node::Select(c, a, b) => {
-                    stack.push(c.0 as usize);
-                    stack.push(a.0 as usize);
-                    stack.push(b.0 as usize);
-                }
-            }
-        }
-        live
     }
 
     /// Generate WGSL expression for a node.

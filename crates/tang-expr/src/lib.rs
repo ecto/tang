@@ -25,6 +25,7 @@
 //! let ddot_dx0 = g.simplify(ddot_dx0);
 //! ```
 
+pub mod codegen;
 pub mod compile;
 pub mod diff;
 pub mod display;

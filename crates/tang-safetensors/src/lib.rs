@@ -118,6 +118,50 @@ pub fn save(
     Ok(())
 }
 
+/// Save tensors to a safetensors file (as F32).
+pub fn save_f32(
+    tensors: &HashMap<String, Tensor<f32>>,
+    path: &Path,
+) -> Result<(), SafetensorsError> {
+    let tensor_data: Vec<(String, Vec<u8>, Vec<usize>)> = tensors
+        .iter()
+        .map(|(name, tensor)| {
+            let bytes: Vec<u8> = tensor
+                .data()
+                .iter()
+                .flat_map(|&v| v.to_le_bytes())
+                .collect();
+            let shape = tensor.shape().dims().to_vec();
+            (name.clone(), bytes, shape)
+        })
+        .collect();
+
+    let views: Vec<(String, safetensors::tensor::TensorView<'_>)> = tensor_data
+        .iter()
+        .map(|(name, bytes, shape)| {
+            let view = safetensors::tensor::TensorView::new(
+                safetensors::Dtype::F32,
+                shape.clone(),
+                bytes,
+            )
+            .unwrap();
+            (name.clone(), view)
+        })
+        .collect();
+
+    let serialized = safetensors::tensor::serialize(
+        views
+            .iter()
+            .map(|(name, view)| (name.as_str(), view.clone())),
+        &None,
+    )
+    .map_err(SafetensorsError::Serialize)?;
+
+    std::fs::write(path, serialized).map_err(SafetensorsError::Io)?;
+
+    Ok(())
+}
+
 /// Load tensors as `Tensor<f32>` (useful for GPU interop).
 pub fn load_f32(path: &Path) -> Result<HashMap<String, Tensor<f32>>, SafetensorsError> {
     let data = std::fs::read(path).map_err(SafetensorsError::Io)?;
