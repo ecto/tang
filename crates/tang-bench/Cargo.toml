@@ -31,12 +31,23 @@ harness = false
 name = "gpu_training"
 harness = false
 
+[[bench]]
+name = "cpu_training"
+harness = false
+
+[[bench]]
+name = "gpu_inference"
+harness = false
+
 [dependencies]
-tang      = { workspace = true, features = ["std"] }
-tang-la   = { workspace = true, features = ["std"] }
-tang-ad   = { workspace = true }
-tang-expr = { workspace = true }
-tang-gpu  = { workspace = true }
+tang        = { workspace = true, features = ["std"] }
+tang-la     = { workspace = true, features = ["std"] }
+tang-ad     = { workspace = true }
+tang-expr   = { workspace = true }
+tang-gpu    = { workspace = true }
+tang-train  = { workspace = true }
+tang-tensor = { workspace = true }
+tang-infer  = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

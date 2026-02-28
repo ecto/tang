@@ -5005,7 +5005,10 @@ dependencies = [
  "tang-ad",
  "tang-expr",
  "tang-gpu",
+ "tang-infer",
  "tang-la",
+ "tang-tensor",
+ "tang-train",
 ]
 
 [[package]]
