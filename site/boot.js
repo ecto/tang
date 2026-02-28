@@ -4,7 +4,7 @@
 // loon renders: all SVG visualizations
 // boot.js: animation loop + glue (no visualization logic)
 
-import tangInit, { dual_eval, curve_svg_path, tangent_svg, to_svg } from './pkg/tang/tang_site_wasm.js';
+import tangInit, { dual_eval, curve_svg_path, tangent_svg, to_svg, poet_init, poet_train_epoch, poet_generate } from './pkg/tang/tang_site_wasm.js';
 import loonInit, { init_dom_bridge, eval_ui } from './pkg/loon/loon_wasm.js';
 
 // --- DOM Bridge (minimal, just what viz.loon needs) ---
@@ -148,6 +148,107 @@ async function boot() {
   }
 
   requestAnimationFrame(animate);
+
+  // --- Quantum Poet interactive demo ---
+
+  const trainBtn = document.getElementById('poet-train-btn');
+  const terminal = document.getElementById('poet-terminal');
+  const progressWrap = document.getElementById('poet-progress-wrap');
+  const epochLabel = document.getElementById('poet-epoch-label');
+  const lossLabel = document.getElementById('poet-loss-label');
+  const progressBar = document.getElementById('poet-progress-bar');
+  const sparkline = document.getElementById('poet-sparkline-line');
+  const generateWrap = document.getElementById('poet-generate-wrap');
+  const generateBtn = document.getElementById('poet-generate-btn');
+  const seedInput = document.getElementById('poet-seed');
+  const tempSlider = document.getElementById('poet-temp');
+  const tempLabel = document.getElementById('poet-temp-label');
+  const poetOutput = document.getElementById('poet-output');
+
+  const TOTAL_EPOCHS = 200;
+  const EPOCHS_PER_FRAME = 5;
+  let poetLosses = [];
+
+  if (tempSlider) {
+    tempSlider.addEventListener('input', () => {
+      tempLabel.textContent = parseFloat(tempSlider.value).toFixed(1);
+    });
+  }
+
+  function updateSparkline() {
+    if (!sparkline || poetLosses.length < 2) return;
+    const maxLoss = poetLosses[0];
+    const w = 200;
+    const h = 48;
+    const points = poetLosses.map((loss, i) => {
+      const x = (i / (TOTAL_EPOCHS - 1)) * w;
+      const y = (loss / maxLoss) * (h - 4) + 2;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(' ');
+    sparkline.setAttribute('points', points);
+  }
+
+  if (trainBtn) {
+    trainBtn.addEventListener('click', () => {
+      trainBtn.disabled = true;
+      trainBtn.textContent = 'Initializing...';
+      trainBtn.classList.add('opacity-50', 'cursor-wait');
+
+      // Initialize on next frame so the button text updates first
+      requestAnimationFrame(() => {
+        poet_init();
+        trainBtn.textContent = 'Training...';
+        terminal.innerHTML = '';
+        progressWrap.classList.remove('hidden');
+
+        let epoch = 0;
+
+        function trainFrame() {
+          const batchEnd = Math.min(epoch + EPOCHS_PER_FRAME, TOTAL_EPOCHS);
+          let loss = 0;
+          for (; epoch < batchEnd; epoch++) {
+            loss = poet_train_epoch();
+            poetLosses.push(loss);
+          }
+
+          // Update UI
+          epochLabel.textContent = `epoch ${epoch}/${TOTAL_EPOCHS}`;
+          lossLabel.textContent = `loss = ${loss.toFixed(4)}`;
+          progressBar.style.width = `${(epoch / TOTAL_EPOCHS) * 100}%`;
+          terminal.innerHTML = `<span class="text-muted">$</span> training... epoch ${epoch}/${TOTAL_EPOCHS}  loss = ${loss.toFixed(4)}`;
+          updateSparkline();
+
+          if (epoch < TOTAL_EPOCHS) {
+            requestAnimationFrame(trainFrame);
+          } else {
+            // Training complete
+            trainBtn.textContent = 'Trained \u2713';
+            trainBtn.classList.remove('cursor-wait');
+            trainBtn.classList.add('text-green-400');
+            terminal.innerHTML = `<span class="text-muted">$</span> training complete. final loss = ${loss.toFixed(4)}`;
+            generateWrap.classList.remove('hidden');
+          }
+        }
+
+        requestAnimationFrame(trainFrame);
+      });
+    });
+  }
+
+  if (generateBtn) {
+    generateBtn.addEventListener('click', () => {
+      const seed = seedInput.value;
+      const temp = parseFloat(tempSlider.value);
+      generateBtn.disabled = true;
+      generateBtn.textContent = 'Generating...';
+      requestAnimationFrame(() => {
+        const result = poet_generate(seed, temp);
+        poetOutput.textContent = result;
+        generateBtn.disabled = false;
+        generateBtn.textContent = 'Generate';
+      });
+    });
+  }
 }
 
 boot();
