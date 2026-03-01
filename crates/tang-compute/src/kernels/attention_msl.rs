@@ -1,16 +1,20 @@
-//! MSL attention kernels: causal self-attention and KV-cached attention.
+//! MSL attention kernels using online softmax (flash attention algorithm).
+//!
+//! Streams through K/V positions using online softmax rescaling.
+//! No shared-memory score buffer — O(head_dim) threadgroup memory only.
+//! No sequence length cap (works for any seq_len).
 
-/// Causal self-attention kernel.
+/// Flash causal self-attention kernel.
 /// Q, K, V: [seq_len, n_heads * head_dim]
 /// Output: [seq_len, n_heads * head_dim]
 /// params: [seq_len, n_heads, head_dim]
 ///
 /// Each threadgroup handles one (position, head) pair.
+/// Threads parallelize over head_dim for dot-product reduction and V accumulation.
+/// K/V positions are streamed sequentially with online softmax.
 pub const CAUSAL_ATTENTION_MSL: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
-
-constant uint WG = 256;
 
 kernel void causal_attention(
     device const float* Q [[buffer(0)]],
@@ -19,88 +23,92 @@ kernel void causal_attention(
     device float* output [[buffer(3)]],
     device const uint* params [[buffer(4)]],
     uint2 tg_id [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]])
+    uint2 tid2 [[thread_position_in_threadgroup]],
+    uint2 tg_size2 [[threads_per_threadgroup]])
 {
+    uint tid = tid2.x;
+    uint tg_size = tg_size2.x;
     uint seq_len = params[0];
     uint n_heads = params[1];
     uint head_dim = params[2];
     uint total_dim = n_heads * head_dim;
 
-    uint pos = tg_id.x;        // which position
-    uint head = tg_id.y;       // which head
+    uint pos = tg_id.x;
+    uint head = tg_id.y;
     if (pos >= seq_len || head >= n_heads) return;
 
     uint h_off = head * head_dim;
     float scale = rsqrt(float(head_dim));
-
-    // Causal: attend to positions [0..pos]
     uint attend_len = pos + 1;
 
-    threadgroup float scores[WG];
-    threadgroup float shared[WG];
+    // Threadgroup memory for online softmax
+    threadgroup float out_accum[256];  // head_dim <= 256
+    threadgroup float partials[256];   // for dot-product reduction
+    threadgroup float tg_max[1];
+    threadgroup float tg_sum[1];
 
-    // Step 1: compute attention scores (dot products)
-    // Each thread handles a subset of attended positions
-    float local_max = -INFINITY;
-    for (uint j = tid; j < attend_len; j += tg_size) {
-        float dot = 0.0f;
-        for (uint d = 0; d < head_dim; d++) {
-            dot += Q[pos * total_dim + h_off + d] * K[j * total_dim + h_off + d];
-        }
-        scores[j % WG] = dot * scale;
-        local_max = max(local_max, dot * scale);
-    }
-
-    // For longer sequences, we'd need a proper reduction here.
-    // This works for attend_len <= WG.
-    shared[tid] = local_max;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tg_size / 2; s > 0; s >>= 1) {
-        if (tid < s) shared[tid] = max(shared[tid], shared[tid + s]);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float row_max = shared[0];
-
-    // Step 2: exp and sum
-    float local_sum = 0.0f;
-    for (uint j = tid; j < attend_len; j += tg_size) {
-        float val = exp(scores[j % WG] - row_max);
-        scores[j % WG] = val;
-        local_sum += val;
-    }
-    shared[tid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tg_size / 2; s > 0; s >>= 1) {
-        if (tid < s) shared[tid] += shared[tid + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float row_sum = shared[0];
-    float inv_sum = 1.0f / row_sum;
-
-    // Step 3: weighted sum of V
     for (uint d = tid; d < head_dim; d += tg_size) {
-        float val = 0.0f;
-        for (uint j = 0; j < attend_len; j++) {
-            val += scores[j % WG] * inv_sum * V[j * total_dim + h_off + d];
+        out_accum[d] = 0.0f;
+    }
+    if (tid == 0) {
+        tg_max[0] = -INFINITY;
+        tg_sum[0] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Stream through K/V positions
+    for (uint j = 0; j < attend_len; j++) {
+        // Parallel dot product: Q[pos] . K[j]
+        float local_dot = 0.0f;
+        for (uint d = tid; d < head_dim; d += tg_size) {
+            local_dot += Q[pos * total_dim + h_off + d] * K[j * total_dim + h_off + d];
         }
-        output[pos * total_dim + h_off + d] = val;
+        partials[tid] = local_dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = tg_size / 2; s > 0; s >>= 1) {
+            if (tid < s) partials[tid] += partials[tid + s];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float score = partials[0] * scale;
+
+        // Online softmax update
+        float prev_max = tg_max[0];
+        float new_max = max(prev_max, score);
+        float exp_score = exp(score - new_max);
+        float rescale = exp(prev_max - new_max);
+
+        if (tid == 0) {
+            tg_max[0] = new_max;
+            tg_sum[0] = tg_sum[0] * rescale + exp_score;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Rescale accumulator and add new V contribution
+        for (uint d = tid; d < head_dim; d += tg_size) {
+            out_accum[d] = out_accum[d] * rescale + exp_score * V[j * total_dim + h_off + d];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Normalize by sum
+    float inv_sum = 1.0f / tg_sum[0];
+    for (uint d = tid; d < head_dim; d += tg_size) {
+        output[pos * total_dim + h_off + d] = out_accum[d] * inv_sum;
     }
 }
 "#;
 
-/// KV-cached attention for autoregressive decoding (single query).
+/// Flash KV-cached attention for autoregressive decoding (single query).
 /// q: [1, n_heads * head_dim]
 /// k_cache, v_cache: [total_len, n_kv_heads * head_dim]
 /// output: [1, n_heads * head_dim]
 /// params: [total_len, n_heads, n_kv_heads, head_dim]
 ///
-/// Each threadgroup handles one head. Attends to all total_len positions.
+/// Each threadgroup handles one head. Streams through all cache positions
+/// using online softmax — no sequence length cap.
 pub const KV_ATTENTION_MSL: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
-
-constant uint WG = 256;
 
 kernel void kv_attention(
     device const float* Q [[buffer(0)]],
@@ -127,58 +135,58 @@ kernel void kv_attention(
     uint kv_off = kv_head * head_dim;
     float scale = rsqrt(float(head_dim));
 
-    threadgroup float shared[WG];
+    threadgroup float out_accum[256];
+    threadgroup float partials[256];
+    threadgroup float tg_max[1];
+    threadgroup float tg_sum[1];
 
-    // Compute scores
-    float local_max = -INFINITY;
-    for (uint j = tid; j < cache_len; j += tg_size) {
-        float dot = 0.0f;
-        for (uint d = 0; d < head_dim; d++) {
-            dot += Q[q_off + d] * K[j * kv_dim + kv_off + d];
-        }
-        float score = dot * scale;
-        shared[j % WG] = score;
-        local_max = max(local_max, score);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Find global max (simplified for cache_len <= WG)
-    threadgroup float reduce[WG];
-    reduce[tid] = local_max;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tg_size / 2; s > 0; s >>= 1) {
-        if (tid < s) reduce[tid] = max(reduce[tid], reduce[tid + s]);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float row_max = reduce[0];
-
-    // Exp + sum
-    float local_sum = 0.0f;
-    for (uint j = tid; j < cache_len; j += tg_size) {
-        float val = exp(shared[j % WG] - row_max);
-        shared[j % WG] = val;
-        local_sum += val;
-    }
-    reduce[tid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tg_size / 2; s > 0; s >>= 1) {
-        if (tid < s) reduce[tid] += reduce[tid + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float inv_sum = 1.0f / reduce[0];
-
-    // Weighted sum of V
     for (uint d = tid; d < head_dim; d += tg_size) {
-        float val = 0.0f;
-        for (uint j = 0; j < cache_len; j++) {
-            val += shared[j % WG] * inv_sum * V[j * kv_dim + kv_off + d];
+        out_accum[d] = 0.0f;
+    }
+    if (tid == 0) {
+        tg_max[0] = -INFINITY;
+        tg_sum[0] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint j = 0; j < cache_len; j++) {
+        float local_dot = 0.0f;
+        for (uint d = tid; d < head_dim; d += tg_size) {
+            local_dot += Q[q_off + d] * K[j * kv_dim + kv_off + d];
         }
-        output[q_off + d] = val;
+        partials[tid] = local_dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = tg_size / 2; s > 0; s >>= 1) {
+            if (tid < s) partials[tid] += partials[tid + s];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float score = partials[0] * scale;
+
+        float prev_max = tg_max[0];
+        float new_max = max(prev_max, score);
+        float exp_score = exp(score - new_max);
+        float rescale = exp(prev_max - new_max);
+
+        if (tid == 0) {
+            tg_max[0] = new_max;
+            tg_sum[0] = tg_sum[0] * rescale + exp_score;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint d = tid; d < head_dim; d += tg_size) {
+            out_accum[d] = out_accum[d] * rescale + exp_score * V[j * kv_dim + kv_off + d];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv_sum = 1.0f / tg_sum[0];
+    for (uint d = tid; d < head_dim; d += tg_size) {
+        output[q_off + d] = out_accum[d] * inv_sum;
     }
 }
 "#;
 
-/// KV-cached attention for batched prefill.
+/// Flash KV-cached attention for batched prefill (multi-query).
 /// q: [q_len, n_heads * head_dim]
 /// k_cache, v_cache: [cache_start + q_len, n_kv_heads * head_dim]
 /// output: [q_len, n_heads * head_dim]
@@ -186,11 +194,10 @@ kernel void kv_attention(
 ///
 /// Grid: (q_len, n_heads) threadgroups. Each handles one (qi, head) pair.
 /// Causal mask: query qi attends to positions 0..cache_start+qi+1.
+/// Uses online softmax — no sequence length cap.
 pub const KV_ATTENTION_PREFILL_MSL: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
-
-constant uint WG = 256;
 
 kernel void kv_attention_prefill(
     device const float* Q [[buffer(0)]],
@@ -198,10 +205,12 @@ kernel void kv_attention_prefill(
     device const float* V [[buffer(2)]],
     device float* output [[buffer(3)]],
     device const uint* params [[buffer(4)]],
-    uint3 tg_id [[threadgroup_position_in_grid]],
-    uint3 tid3 [[thread_position_in_threadgroup]],
-    uint3 tg_size3 [[threads_per_threadgroup]])
+    uint2 tg_id [[threadgroup_position_in_grid]],
+    uint2 tid2 [[thread_position_in_threadgroup]],
+    uint2 tg_size2 [[threads_per_threadgroup]])
 {
+    uint tid = tid2.x;
+    uint tg_size = tg_size2.x;
     uint cache_start = params[0];
     uint q_len = params[1];
     uint n_heads = params[2];
@@ -213,8 +222,6 @@ kernel void kv_attention_prefill(
 
     uint qi = tg_id.x;
     uint head = tg_id.y;
-    uint tid = tid3.x;
-    uint tg_size = tg_size3.x;
     if (qi >= q_len || head >= n_heads) return;
 
     uint kv_head = head / heads_per_kv;
@@ -223,54 +230,54 @@ kernel void kv_attention_prefill(
     float scale = rsqrt(float(head_dim));
     uint attend_len = cache_start + qi + 1;
 
-    threadgroup float scores[WG];
-    threadgroup float reduce[WG];
+    threadgroup float out_accum[256];
+    threadgroup float partials[256];
+    threadgroup float tg_max[1];
+    threadgroup float tg_sum[1];
 
-    // Compute scores
-    float local_max = -INFINITY;
-    for (uint j = tid; j < attend_len; j += tg_size) {
-        float dot = 0.0f;
-        for (uint d = 0; d < head_dim; d++) {
-            dot += Q[q_off + d] * K[j * kv_dim + kv_off + d];
+    for (uint d = tid; d < head_dim; d += tg_size) {
+        out_accum[d] = 0.0f;
+    }
+    if (tid == 0) {
+        tg_max[0] = -INFINITY;
+        tg_sum[0] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint j = 0; j < attend_len; j++) {
+        float local_dot = 0.0f;
+        for (uint d = tid; d < head_dim; d += tg_size) {
+            local_dot += Q[q_off + d] * K[j * kv_dim + kv_off + d];
         }
-        float s = dot * scale;
-        scores[j % WG] = s;
-        local_max = max(local_max, s);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+        partials[tid] = local_dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = tg_size / 2; s > 0; s >>= 1) {
+            if (tid < s) partials[tid] += partials[tid + s];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float score = partials[0] * scale;
 
-    // Global max
-    reduce[tid] = local_max;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tg_size / 2; s > 0; s >>= 1) {
-        if (tid < s) reduce[tid] = max(reduce[tid], reduce[tid + s]);
+        float prev_max = tg_max[0];
+        float new_max = max(prev_max, score);
+        float exp_score = exp(score - new_max);
+        float rescale = exp(prev_max - new_max);
+
+        if (tid == 0) {
+            tg_max[0] = new_max;
+            tg_sum[0] = tg_sum[0] * rescale + exp_score;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint d = tid; d < head_dim; d += tg_size) {
+            out_accum[d] = out_accum[d] * rescale + exp_score * V[j * kv_dim + kv_off + d];
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    float row_max = reduce[0];
 
-    // Exp + sum
-    float local_sum = 0.0f;
-    for (uint j = tid; j < attend_len; j += tg_size) {
-        float val = exp(scores[j % WG] - row_max);
-        scores[j % WG] = val;
-        local_sum += val;
-    }
-    reduce[tid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tg_size / 2; s > 0; s >>= 1) {
-        if (tid < s) reduce[tid] += reduce[tid + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float inv_sum = 1.0f / reduce[0];
-
-    // Weighted sum of V
+    float inv_sum = 1.0f / tg_sum[0];
     uint out_off = qi * total_dim + head * head_dim;
     for (uint d = tid; d < head_dim; d += tg_size) {
-        float val = 0.0f;
-        for (uint j = 0; j < attend_len; j++) {
-            val += scores[j % WG] * inv_sum * V[j * kv_dim + kv_off + d];
-        }
-        output[out_off + d] = val;
+        output[out_off + d] = out_accum[d] * inv_sum;
     }
 }
 "#;

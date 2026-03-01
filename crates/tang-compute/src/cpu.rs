@@ -215,36 +215,35 @@ impl ComputeDevice for CpuDevice {
             let h_off = h * head_dim;
 
             for i in 0..seq_len {
-                // Compute attention scores for position i
-                let mut scores = vec![0.0f32; i + 1];
+                // Online softmax: stream through K/V positions
+                // O(head_dim) memory instead of O(seq_len)
+                let mut running_max = f32::NEG_INFINITY;
+                let mut running_sum = 0.0f32;
+                let mut accum = vec![0.0f32; head_dim];
+
                 for j in 0..=i {
                     let mut dot = 0.0f32;
                     for d in 0..head_dim {
                         dot += q.data[i * total_dim + h_off + d]
                             * k.data[j * total_dim + h_off + d];
                     }
-                    scores[j] = dot * scale;
-                }
+                    let score = dot * scale;
 
-                // Softmax
-                let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let mut sum = 0.0f32;
-                for s in scores.iter_mut() {
-                    *s = (*s - max).exp();
-                    sum += *s;
-                }
-                let inv = 1.0 / sum;
-                for s in scores.iter_mut() {
-                    *s *= inv;
-                }
+                    let new_max = running_max.max(score);
+                    let exp_score = (score - new_max).exp();
+                    let rescale = (running_max - new_max).exp();
 
-                // Weighted sum of values
-                for d in 0..head_dim {
-                    let mut val = 0.0f32;
-                    for j in 0..=i {
-                        val += scores[j] * v.data[j * total_dim + h_off + d];
+                    running_sum = running_sum * rescale + exp_score;
+                    for d in 0..head_dim {
+                        accum[d] = accum[d] * rescale
+                            + exp_score * v.data[j * total_dim + h_off + d];
                     }
-                    out[i * total_dim + h_off + d] = val;
+                    running_max = new_max;
+                }
+
+                let inv = 1.0 / running_sum;
+                for d in 0..head_dim {
+                    out[i * total_dim + h_off + d] = accum[d] * inv;
                 }
             }
         }
@@ -277,36 +276,34 @@ impl ComputeDevice for CpuDevice {
                 let q_off = qi * total_dim + h * head_dim;
                 let kv_off = kv_h * head_dim;
 
-                // Compute scores against attended positions
-                let mut scores = vec![0.0f32; attend_len];
+                // Online softmax: O(head_dim) memory
+                let mut running_max = f32::NEG_INFINITY;
+                let mut running_sum = 0.0f32;
+                let mut accum = vec![0.0f32; head_dim];
+
                 for j in 0..attend_len {
                     let mut dot = 0.0f32;
                     for d in 0..head_dim {
                         dot += q.data[q_off + d] * k_cache.data[j * kv_dim + kv_off + d];
                     }
-                    scores[j] = dot * scale;
-                }
+                    let score = dot * scale;
 
-                // Softmax
-                let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let mut sum = 0.0f32;
-                for s in scores.iter_mut() {
-                    *s = (*s - max).exp();
-                    sum += *s;
-                }
-                let inv = 1.0 / sum;
-                for s in scores.iter_mut() {
-                    *s *= inv;
-                }
+                    let new_max = running_max.max(score);
+                    let exp_score = (score - new_max).exp();
+                    let rescale = (running_max - new_max).exp();
 
-                // Weighted sum
-                let out_off = qi * total_dim + h * head_dim;
-                for d in 0..head_dim {
-                    let mut val = 0.0f32;
-                    for j in 0..attend_len {
-                        val += scores[j] * v_cache.data[j * kv_dim + kv_off + d];
+                    running_sum = running_sum * rescale + exp_score;
+                    for d in 0..head_dim {
+                        accum[d] = accum[d] * rescale
+                            + exp_score * v_cache.data[j * kv_dim + kv_off + d];
                     }
-                    out[out_off + d] = val;
+                    running_max = new_max;
+                }
+
+                let out_off = qi * total_dim + h * head_dim;
+                let inv = 1.0 / running_sum;
+                for d in 0..head_dim {
+                    out[out_off + d] = accum[d] * inv;
                 }
             }
         }

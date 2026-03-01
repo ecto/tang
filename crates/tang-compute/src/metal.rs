@@ -401,6 +401,9 @@ kernel void embedding(
         let output_buf = self.make_buffer_empty(seq_len * total_dim * 4);
         let params = self.make_buffer_u32(&[seq_len as u32, n_heads as u32, head_dim as u32]);
 
+        // Flash attention: threads parallelize over head_dim
+        let tg_size = std::cmp::min(head_dim as u64, 256).next_power_of_two();
+
         autoreleasepool(|| {
             let cmd = self.queue.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
@@ -411,7 +414,6 @@ kernel void embedding(
             enc.set_buffer(3, Some(&output_buf), 0);
             enc.set_buffer(4, Some(&params), 0);
 
-            let tg_size = std::cmp::min(seq_len as u64, 256).next_power_of_two();
             enc.dispatch_thread_groups(
                 MTLSize::new(seq_len as u64, n_heads as u64, 1),
                 MTLSize::new(tg_size, 1, 1),
@@ -439,9 +441,11 @@ kernel void embedding(
         head_dim: usize,
     ) -> MetalBuffer {
         let total_dim = n_heads * head_dim;
+        // Flash attention: threads parallelize over head_dim
+        let tg_size = std::cmp::min(head_dim as u64, 256).next_power_of_two();
 
         if q_len == 1 {
-            // Single-query decode: use existing optimized kernel
+            // Single-query decode
             let pipeline = self.get_pipeline(
                 attention_msl::KV_ATTENTION_MSL,
                 "kv_attention",
@@ -465,7 +469,6 @@ kernel void embedding(
                 enc.set_buffer(3, Some(&output_buf), 0);
                 enc.set_buffer(4, Some(&params), 0);
 
-                let tg_size = std::cmp::min(total_len as u64, 256).next_power_of_two();
                 enc.dispatch_thread_groups(
                     MTLSize::new(n_heads as u64, 1, 1),
                     MTLSize::new(tg_size, 1, 1),
@@ -480,7 +483,7 @@ kernel void embedding(
                 len: total_dim,
             }
         } else {
-            // Batched prefill: use 2D grid (q_len, n_heads)
+            // Batched prefill
             let pipeline = self.get_pipeline(
                 attention_msl::KV_ATTENTION_PREFILL_MSL,
                 "kv_attention_prefill",
@@ -493,9 +496,6 @@ kernel void embedding(
                 n_kv_heads as u32,
                 head_dim as u32,
             ]);
-
-            let max_attend = cache_start + q_len;
-            let tg_size = std::cmp::min(max_attend as u64, 256).next_power_of_two();
 
             autoreleasepool(|| {
                 let cmd = self.queue.new_command_buffer();
