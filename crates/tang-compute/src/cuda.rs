@@ -313,44 +313,86 @@ impl ComputeDevice for CudaComputeDevice {
         q: &CudaBuffer,
         k_cache: &CudaBuffer,
         v_cache: &CudaBuffer,
-        cache_len: usize,
+        cache_start: usize,
+        q_len: usize,
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
     ) -> CudaBuffer {
-        let module = self.get_module(
-            attention_cuda::KV_ATTENTION_CUDA,
-            &["kv_attention"],
-        );
-        let func = self.device.get_func(&module, "kv_attention").unwrap();
         let total_dim = n_heads * head_dim;
-        let output = self.alloc(total_dim);
 
-        let tg_size = std::cmp::min(cache_len, 256).next_power_of_two();
-        let cfg = LaunchConfig {
-            block_dim: (tg_size as u32, 1, 1),
-            grid_dim: (n_heads as u32, 1, 1),
-            shared_mem_bytes: 0,
-        };
+        if q_len == 1 {
+            // Single-query decode
+            let module = self.get_module(
+                attention_cuda::KV_ATTENTION_CUDA,
+                &["kv_attention"],
+            );
+            let func = self.device.get_func(&module, "kv_attention").unwrap();
+            let total_len = cache_start + 1;
+            let output = self.alloc(total_dim);
 
-        unsafe {
-            func.launch(
-                cfg,
-                (
-                    &q.data,
-                    &k_cache.data,
-                    &v_cache.data,
-                    &output.data,
-                    cache_len as u32,
-                    n_heads as u32,
-                    n_kv_heads as u32,
-                    head_dim as u32,
-                ),
-            )
-            .unwrap();
+            let tg_size = std::cmp::min(total_len, 256).next_power_of_two();
+            let cfg = LaunchConfig {
+                block_dim: (tg_size as u32, 1, 1),
+                grid_dim: (n_heads as u32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+
+            unsafe {
+                func.launch(
+                    cfg,
+                    (
+                        &q.data,
+                        &k_cache.data,
+                        &v_cache.data,
+                        &output.data,
+                        total_len as u32,
+                        n_heads as u32,
+                        n_kv_heads as u32,
+                        head_dim as u32,
+                    ),
+                )
+                .unwrap();
+            }
+
+            output
+        } else {
+            // Batched prefill
+            let module = self.get_module(
+                attention_cuda::KV_ATTENTION_PREFILL_CUDA,
+                &["kv_attention_prefill"],
+            );
+            let func = self.device.get_func(&module, "kv_attention_prefill").unwrap();
+            let output = self.alloc(q_len * total_dim);
+
+            let max_attend = cache_start + q_len;
+            let tg_size = std::cmp::min(max_attend, 256).next_power_of_two();
+            let cfg = LaunchConfig {
+                block_dim: (tg_size as u32, 1, 1),
+                grid_dim: (q_len as u32, n_heads as u32, 1),
+                shared_mem_bytes: 0,
+            };
+
+            unsafe {
+                func.launch(
+                    cfg,
+                    (
+                        &q.data,
+                        &k_cache.data,
+                        &v_cache.data,
+                        &output.data,
+                        cache_start as u32,
+                        q_len as u32,
+                        n_heads as u32,
+                        n_kv_heads as u32,
+                        head_dim as u32,
+                    ),
+                )
+                .unwrap();
+            }
+
+            output
         }
-
-        output
     }
 
     fn sync(&self) {

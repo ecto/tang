@@ -257,7 +257,8 @@ impl ComputeDevice for CpuDevice {
         q: &CpuBuffer,
         k_cache: &CpuBuffer,
         v_cache: &CpuBuffer,
-        cache_len: usize,
+        cache_start: usize,
+        q_len: usize,
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
@@ -265,43 +266,48 @@ impl ComputeDevice for CpuDevice {
         let total_dim = n_heads * head_dim;
         let kv_dim = n_kv_heads * head_dim;
         let heads_per_kv = n_heads / n_kv_heads;
-        let mut out = vec![0.0f32; total_dim];
+        let mut out = vec![0.0f32; q_len * total_dim];
         let scale = 1.0 / (head_dim as f32).sqrt();
 
-        for h in 0..n_heads {
-            let kv_h = h / heads_per_kv;
-            let q_off = h * head_dim;
-            let kv_off = kv_h * head_dim;
+        for qi in 0..q_len {
+            let attend_len = cache_start + qi + 1;
 
-            // Compute scores against all cached positions
-            let mut scores = vec![0.0f32; cache_len];
-            for j in 0..cache_len {
-                let mut dot = 0.0f32;
+            for h in 0..n_heads {
+                let kv_h = h / heads_per_kv;
+                let q_off = qi * total_dim + h * head_dim;
+                let kv_off = kv_h * head_dim;
+
+                // Compute scores against attended positions
+                let mut scores = vec![0.0f32; attend_len];
+                for j in 0..attend_len {
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q.data[q_off + d] * k_cache.data[j * kv_dim + kv_off + d];
+                    }
+                    scores[j] = dot * scale;
+                }
+
+                // Softmax
+                let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for s in scores.iter_mut() {
+                    *s = (*s - max).exp();
+                    sum += *s;
+                }
+                let inv = 1.0 / sum;
+                for s in scores.iter_mut() {
+                    *s *= inv;
+                }
+
+                // Weighted sum
+                let out_off = qi * total_dim + h * head_dim;
                 for d in 0..head_dim {
-                    dot += q.data[q_off + d] * k_cache.data[j * kv_dim + kv_off + d];
+                    let mut val = 0.0f32;
+                    for j in 0..attend_len {
+                        val += scores[j] * v_cache.data[j * kv_dim + kv_off + d];
+                    }
+                    out[out_off + d] = val;
                 }
-                scores[j] = dot * scale;
-            }
-
-            // Softmax
-            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut sum = 0.0f32;
-            for s in scores.iter_mut() {
-                *s = (*s - max).exp();
-                sum += *s;
-            }
-            let inv = 1.0 / sum;
-            for s in scores.iter_mut() {
-                *s *= inv;
-            }
-
-            // Weighted sum
-            for d in 0..head_dim {
-                let mut val = 0.0f32;
-                for j in 0..cache_len {
-                    val += scores[j] * v_cache.data[j * kv_dim + kv_off + d];
-                }
-                out[q_off + d] = val;
             }
         }
 
@@ -561,14 +567,87 @@ mod tests {
         // q: [1, 2] (1 position, 1 head, dim=2)
         // k_cache: [[1,0],[0,1]] (2 cached positions)
         // v_cache: [[1,2],[3,4]]
+        // cache_start=1 means 1 position was already cached, this is the 2nd
+        // so attend_len = 1 + 0 + 1 = 2
         let q = dev.upload(&[1.0, 0.0]);
         let k = dev.upload(&[1.0, 0.0, 0.0, 1.0]);
         let v = dev.upload(&[1.0, 2.0, 3.0, 4.0]);
-        let result = dev.kv_attention(&q, &k, &v, 2, 1, 1, 2);
+        let result = dev.kv_attention(&q, &k, &v, 1, 1, 1, 1, 2);
         let out = dev.download(&result);
         assert_eq!(out.len(), 2);
         // q=[1,0] attends more to k[0]=[1,0] than k[1]=[0,1]
         // So output should lean toward v[0]=[1,2]
         assert!(out[0] < 2.5); // closer to 1 than 3
+    }
+
+    #[test]
+    fn cpu_kv_attention_batched_causal() {
+        let dev = CpuDevice::new();
+        // q_len=3, cache_start=0, 1 head, dim=2
+        // Q: [[1,0], [0,1], [1,1]]
+        // K (cache): [[1,0], [0,1], [1,1]]  (same as Q for simplicity)
+        // V (cache): [[1,2], [3,4], [5,6]]
+        let q = dev.upload(&[1.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
+        let k = dev.upload(&[1.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
+        let v = dev.upload(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let result = dev.kv_attention(&q, &k, &v, 0, 3, 1, 1, 2);
+        let out = dev.download(&result);
+        assert_eq!(out.len(), 6); // [3, 2]
+
+        // qi=0: attend to pos 0 only → V[0] = [1, 2]
+        assert!((out[0] - 1.0).abs() < 1e-5);
+        assert!((out[1] - 2.0).abs() < 1e-5);
+
+        // qi=1: attend to pos 0,1 → mixture of V[0] and V[1]
+        // q=[0,1], k[0]=[1,0] dot=0, k[1]=[0,1] dot=1
+        // softmax([0, 1/sqrt(2)]) → attends more to V[1]=[3,4]
+        assert!(out[2] > 1.5); // leaning toward 3
+        assert!(out[3] > 2.5); // leaning toward 4
+
+        // qi=2: attend to pos 0,1,2
+        // q=[1,1], dots with k are all computable
+        assert_eq!(out.len(), 6);
+    }
+
+    #[test]
+    fn cpu_kv_attention_batched_matches_sequential() {
+        let dev = CpuDevice::new();
+        // Compare batched q_len=4 vs 4 sequential q_len=1 calls
+        let n_heads = 2;
+        let n_kv_heads = 1;
+        let head_dim = 4;
+        let q_len = 4;
+        let total_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+
+        // Random-ish data
+        let q_data: Vec<f32> = (0..q_len * total_dim).map(|i| ((i * 7 + 3) % 13) as f32 / 13.0).collect();
+        let kv_data: Vec<f32> = (0..q_len * kv_dim).map(|i| ((i * 11 + 5) % 17) as f32 / 17.0).collect();
+        let v_data: Vec<f32> = (0..q_len * kv_dim).map(|i| ((i * 13 + 7) % 19) as f32 / 19.0).collect();
+
+        // Batched
+        let q = dev.upload(&q_data);
+        let k = dev.upload(&kv_data);
+        let v = dev.upload(&v_data);
+        let batched = dev.download(&dev.kv_attention(&q, &k, &v, 0, q_len, n_heads, n_kv_heads, head_dim));
+
+        // Sequential
+        let mut sequential = Vec::new();
+        for qi in 0..q_len {
+            let q_slice = dev.upload(&q_data[qi * total_dim..(qi + 1) * total_dim]);
+            let k_slice = dev.upload(&kv_data[..((qi + 1) * kv_dim)]);
+            let v_slice = dev.upload(&v_data[..((qi + 1) * kv_dim)]);
+            let out = dev.download(&dev.kv_attention(&q_slice, &k_slice, &v_slice, qi, 1, n_heads, n_kv_heads, head_dim));
+            sequential.extend(out);
+        }
+
+        assert_eq!(batched.len(), sequential.len());
+        for i in 0..batched.len() {
+            assert!(
+                (batched[i] - sequential[i]).abs() < 1e-5,
+                "mismatch at {i}: batched={} sequential={}",
+                batched[i], sequential[i]
+            );
+        }
     }
 }

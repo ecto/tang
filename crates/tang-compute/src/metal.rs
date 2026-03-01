@@ -432,47 +432,94 @@ kernel void embedding(
         q: &MetalBuffer,
         k_cache: &MetalBuffer,
         v_cache: &MetalBuffer,
-        cache_len: usize,
+        cache_start: usize,
+        q_len: usize,
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
     ) -> MetalBuffer {
-        let pipeline = self.get_pipeline(
-            attention_msl::KV_ATTENTION_MSL,
-            "kv_attention",
-        );
         let total_dim = n_heads * head_dim;
-        let output_buf = self.make_buffer_empty(total_dim * 4);
-        let params = self.make_buffer_u32(&[
-            cache_len as u32,
-            n_heads as u32,
-            n_kv_heads as u32,
-            head_dim as u32,
-        ]);
 
-        autoreleasepool(|| {
-            let cmd = self.queue.new_command_buffer();
-            let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&pipeline);
-            enc.set_buffer(0, Some(&q.buffer), 0);
-            enc.set_buffer(1, Some(&k_cache.buffer), 0);
-            enc.set_buffer(2, Some(&v_cache.buffer), 0);
-            enc.set_buffer(3, Some(&output_buf), 0);
-            enc.set_buffer(4, Some(&params), 0);
-
-            let tg_size = std::cmp::min(cache_len as u64, 256).next_power_of_two();
-            enc.dispatch_thread_groups(
-                MTLSize::new(n_heads as u64, 1, 1),
-                MTLSize::new(tg_size, 1, 1),
+        if q_len == 1 {
+            // Single-query decode: use existing optimized kernel
+            let pipeline = self.get_pipeline(
+                attention_msl::KV_ATTENTION_MSL,
+                "kv_attention",
             );
-            enc.end_encoding();
-            cmd.commit();
-            cmd.wait_until_completed();
-        });
+            let total_len = cache_start + 1;
+            let output_buf = self.make_buffer_empty(total_dim * 4);
+            let params = self.make_buffer_u32(&[
+                total_len as u32,
+                n_heads as u32,
+                n_kv_heads as u32,
+                head_dim as u32,
+            ]);
 
-        MetalBuffer {
-            buffer: output_buf,
-            len: total_dim,
+            autoreleasepool(|| {
+                let cmd = self.queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&pipeline);
+                enc.set_buffer(0, Some(&q.buffer), 0);
+                enc.set_buffer(1, Some(&k_cache.buffer), 0);
+                enc.set_buffer(2, Some(&v_cache.buffer), 0);
+                enc.set_buffer(3, Some(&output_buf), 0);
+                enc.set_buffer(4, Some(&params), 0);
+
+                let tg_size = std::cmp::min(total_len as u64, 256).next_power_of_two();
+                enc.dispatch_thread_groups(
+                    MTLSize::new(n_heads as u64, 1, 1),
+                    MTLSize::new(tg_size, 1, 1),
+                );
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+            });
+
+            MetalBuffer {
+                buffer: output_buf,
+                len: total_dim,
+            }
+        } else {
+            // Batched prefill: use 2D grid (q_len, n_heads)
+            let pipeline = self.get_pipeline(
+                attention_msl::KV_ATTENTION_PREFILL_MSL,
+                "kv_attention_prefill",
+            );
+            let output_buf = self.make_buffer_empty(q_len * total_dim * 4);
+            let params = self.make_buffer_u32(&[
+                cache_start as u32,
+                q_len as u32,
+                n_heads as u32,
+                n_kv_heads as u32,
+                head_dim as u32,
+            ]);
+
+            let max_attend = cache_start + q_len;
+            let tg_size = std::cmp::min(max_attend as u64, 256).next_power_of_two();
+
+            autoreleasepool(|| {
+                let cmd = self.queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&pipeline);
+                enc.set_buffer(0, Some(&q.buffer), 0);
+                enc.set_buffer(1, Some(&k_cache.buffer), 0);
+                enc.set_buffer(2, Some(&v_cache.buffer), 0);
+                enc.set_buffer(3, Some(&output_buf), 0);
+                enc.set_buffer(4, Some(&params), 0);
+
+                enc.dispatch_thread_groups(
+                    MTLSize::new(q_len as u64, n_heads as u64, 1),
+                    MTLSize::new(tg_size, 1, 1),
+                );
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+            });
+
+            MetalBuffer {
+                buffer: output_buf,
+                len: q_len * total_dim,
+            }
         }
     }
 
@@ -614,17 +661,54 @@ mod tests {
         let m_q = metal.upload(&q_data);
         let m_k = metal.upload(&k_data);
         let m_v = metal.upload(&v_data);
-        let m_out = metal.download(&metal.kv_attention(&m_q, &m_k, &m_v, 2, 1, 1, 2));
+        let m_out = metal.download(&metal.kv_attention(&m_q, &m_k, &m_v, 1, 1, 1, 1, 2));
 
         let c_q = cpu.upload(&q_data);
         let c_k = cpu.upload(&k_data);
         let c_v = cpu.upload(&v_data);
-        let c_out = cpu.download(&cpu.kv_attention(&c_q, &c_k, &c_v, 2, 1, 1, 2));
+        let c_out = cpu.download(&cpu.kv_attention(&c_q, &c_k, &c_v, 1, 1, 1, 1, 2));
 
         for i in 0..2 {
             assert!(
                 (m_out[i] - c_out[i]).abs() < 1e-3,
                 "kv_attention mismatch at {i}: metal={} cpu={}",
+                m_out[i],
+                c_out[i]
+            );
+        }
+    }
+
+    #[test]
+    fn metal_kv_attention_batched_vs_cpu() {
+        let metal = get_metal_device();
+        let cpu = CpuDevice::new();
+
+        let n_heads = 2;
+        let n_kv_heads = 1;
+        let head_dim = 4;
+        let q_len = 4;
+        let total_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+
+        let q_data: Vec<f32> = (0..q_len * total_dim).map(|i| ((i * 7 + 3) % 13) as f32 / 13.0).collect();
+        let kv_data: Vec<f32> = (0..q_len * kv_dim).map(|i| ((i * 11 + 5) % 17) as f32 / 17.0).collect();
+        let v_data: Vec<f32> = (0..q_len * kv_dim).map(|i| ((i * 13 + 7) % 19) as f32 / 19.0).collect();
+
+        let m_q = metal.upload(&q_data);
+        let m_k = metal.upload(&kv_data);
+        let m_v = metal.upload(&v_data);
+        let m_out = metal.download(&metal.kv_attention(&m_q, &m_k, &m_v, 0, q_len, n_heads, n_kv_heads, head_dim));
+
+        let c_q = cpu.upload(&q_data);
+        let c_k = cpu.upload(&kv_data);
+        let c_v = cpu.upload(&v_data);
+        let c_out = cpu.download(&cpu.kv_attention(&c_q, &c_k, &c_v, 0, q_len, n_heads, n_kv_heads, head_dim));
+
+        assert_eq!(m_out.len(), c_out.len());
+        for i in 0..m_out.len() {
+            assert!(
+                (m_out[i] - c_out[i]).abs() < 1e-3,
+                "batched kv_attention mismatch at {i}: metal={} cpu={}",
                 m_out[i],
                 c_out[i]
             );

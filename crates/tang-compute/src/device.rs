@@ -109,14 +109,22 @@ pub trait ComputeDevice: Send {
         head_dim: usize,
     ) -> Self::Buffer;
 
-    /// KV-cached attention for incremental decoding.
-    /// q: [1, n_heads * head_dim], k_cache/v_cache: [cache_len, n_kv_heads * head_dim].
+    /// KV-cached attention for incremental decoding and batched prefill.
+    ///
+    /// - `q`: `[q_len, n_heads * head_dim]`
+    /// - `k_cache`, `v_cache`: `[cache_start + q_len, n_kv_heads * head_dim]`
+    /// - `cache_start`: number of positions already in cache before this batch
+    /// - `q_len`: number of new query positions (1 for decode, N for prefill)
+    ///
+    /// Causal mask: query `i` attends to positions `0..cache_start + i + 1`.
+    /// Returns `[q_len, n_heads * head_dim]`.
     fn kv_attention(
         &self,
         q: &Self::Buffer,
         k_cache: &Self::Buffer,
         v_cache: &Self::Buffer,
-        cache_len: usize,
+        cache_start: usize,
+        q_len: usize,
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
