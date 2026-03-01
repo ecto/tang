@@ -272,6 +272,7 @@ impl ComputeDevice for CudaComputeDevice {
         v: &CudaBuffer,
         seq_len: usize,
         n_heads: usize,
+        n_kv_heads: usize,
         head_dim: usize,
     ) -> CudaBuffer {
         let module = self.get_module(
@@ -299,6 +300,7 @@ impl ComputeDevice for CudaComputeDevice {
                     &output.data,
                     seq_len as u32,
                     n_heads as u32,
+                    n_kv_heads as u32,
                     head_dim as u32,
                 ),
             )
@@ -393,6 +395,102 @@ impl ComputeDevice for CudaComputeDevice {
 
             output
         }
+    }
+
+    fn transpose_2d(&self, buf: &CudaBuffer, rows: usize, cols: usize) -> CudaBuffer {
+        // CPU fallback
+        let data = buf.to_vec();
+        let cpu = crate::CpuDevice::new();
+        let cpu_buf = cpu.upload(&data);
+        let result = cpu.transpose_2d(&cpu_buf, rows, cols);
+        self.upload(&cpu.download(&result))
+    }
+
+    fn softmax_backward(
+        &self,
+        softmax_out: &CudaBuffer,
+        grad_output: &CudaBuffer,
+        n_rows: usize,
+        row_len: usize,
+    ) -> CudaBuffer {
+        let cpu = crate::CpuDevice::new();
+        let sm = cpu.upload(&softmax_out.to_vec());
+        let grad = cpu.upload(&grad_output.to_vec());
+        let result = cpu.softmax_backward(&sm, &grad, n_rows, row_len);
+        self.upload(&cpu.download(&result))
+    }
+
+    fn rms_norm_backward(
+        &self,
+        input: &CudaBuffer,
+        weight: &CudaBuffer,
+        grad_output: &CudaBuffer,
+        n_groups: usize,
+        dim: usize,
+        eps: f32,
+    ) -> (CudaBuffer, CudaBuffer) {
+        let cpu = crate::CpuDevice::new();
+        let ci = cpu.upload(&input.to_vec());
+        let cw = cpu.upload(&weight.to_vec());
+        let cg = cpu.upload(&grad_output.to_vec());
+        let (gi, gw) = cpu.rms_norm_backward(&ci, &cw, &cg, n_groups, dim, eps);
+        (self.upload(&cpu.download(&gi)), self.upload(&cpu.download(&gw)))
+    }
+
+    fn embedding_backward(
+        &self,
+        grad_output: &CudaBuffer,
+        ids: &CudaBuffer,
+        vocab_size: usize,
+        seq_len: usize,
+        dim: usize,
+    ) -> CudaBuffer {
+        let cpu = crate::CpuDevice::new();
+        let cg = cpu.upload(&grad_output.to_vec());
+        let ci = cpu.upload(&ids.to_vec());
+        let result = cpu.embedding_backward(&cg, &ci, vocab_size, seq_len, dim);
+        self.upload(&cpu.download(&result))
+    }
+
+    fn causal_attention_backward(
+        &self,
+        grad_output: &CudaBuffer,
+        q: &CudaBuffer,
+        k: &CudaBuffer,
+        v: &CudaBuffer,
+        seq_len: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> (CudaBuffer, CudaBuffer, CudaBuffer) {
+        let cpu = crate::CpuDevice::new();
+        let cgo = cpu.upload(&grad_output.to_vec());
+        let cq = cpu.upload(&q.to_vec());
+        let ck = cpu.upload(&k.to_vec());
+        let cv = cpu.upload(&v.to_vec());
+        let (gq, gk, gv) = cpu.causal_attention_backward(
+            &cgo, &cq, &ck, &cv, seq_len, n_heads, n_kv_heads, head_dim,
+        );
+        (
+            self.upload(&cpu.download(&gq)),
+            self.upload(&cpu.download(&gk)),
+            self.upload(&cpu.download(&gv)),
+        )
+    }
+
+    fn cross_entropy_forward_backward(
+        &self,
+        logits: &CudaBuffer,
+        targets: &CudaBuffer,
+        n_positions: usize,
+        vocab_size: usize,
+        pad_id: u32,
+    ) -> (f32, CudaBuffer) {
+        let cpu = crate::CpuDevice::new();
+        let cl = cpu.upload(&logits.to_vec());
+        let ct = cpu.upload(&targets.to_vec());
+        let (loss, grad) = cpu.cross_entropy_forward_backward(&cl, &ct, n_positions, vocab_size, pad_id);
+        (loss, self.upload(&cpu.download(&grad)))
     }
 
     fn sync(&self) {

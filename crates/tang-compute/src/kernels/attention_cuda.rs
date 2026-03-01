@@ -1,6 +1,6 @@
 //! CUDA attention kernels: causal self-attention and KV-cached attention.
 
-/// Causal self-attention kernel.
+/// Causal self-attention kernel with GQA support.
 /// Grid: (seq_len, n_heads), Block: (min(seq_len, 256))
 pub const CAUSAL_ATTENTION_CUDA: &str = r#"
 extern "C" __global__ void causal_attention(
@@ -10,6 +10,7 @@ extern "C" __global__ void causal_attention(
     float* __restrict__ output,
     const unsigned int seq_len,
     const unsigned int n_heads,
+    const unsigned int n_kv_heads,
     const unsigned int head_dim)
 {
     __shared__ float scores[256];
@@ -23,7 +24,11 @@ extern "C" __global__ void causal_attention(
     if (pos >= seq_len || head >= n_heads) return;
 
     unsigned int total_dim = n_heads * head_dim;
-    unsigned int h_off = head * head_dim;
+    unsigned int kv_dim = n_kv_heads * head_dim;
+    unsigned int heads_per_kv = n_heads / n_kv_heads;
+    unsigned int kv_head = head / heads_per_kv;
+    unsigned int q_off = head * head_dim;
+    unsigned int kv_off = kv_head * head_dim;
     float scale = rsqrtf(float(head_dim));
     unsigned int attend_len = pos + 1;
 
@@ -32,7 +37,7 @@ extern "C" __global__ void causal_attention(
     for (unsigned int j = tid; j < attend_len; j += tg_size) {
         float dot = 0.0f;
         for (unsigned int d = 0; d < head_dim; d++) {
-            dot += Q[pos * total_dim + h_off + d] * K[j * total_dim + h_off + d];
+            dot += Q[pos * total_dim + q_off + d] * K[j * kv_dim + kv_off + d];
         }
         float s = dot * scale;
         scores[j % 256] = s;
@@ -65,9 +70,9 @@ extern "C" __global__ void causal_attention(
     for (unsigned int d = tid; d < head_dim; d += tg_size) {
         float val = 0.0f;
         for (unsigned int j = 0; j < attend_len; j++) {
-            val += scores[j % 256] * inv_sum * V[j * total_dim + h_off + d];
+            val += scores[j % 256] * inv_sum * V[j * kv_dim + kv_off + d];
         }
-        output[pos * total_dim + h_off + d] = val;
+        output[pos * total_dim + q_off + d] = val;
     }
 }
 "#;

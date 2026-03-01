@@ -97,8 +97,9 @@ pub trait ComputeDevice: Send {
         axis: usize,
     ) -> Self::Buffer;
 
-    /// Causal self-attention: Q,K,V → output.
-    /// Q,K,V shapes: [seq_len, n_heads * head_dim].
+    /// Causal self-attention with GQA: Q,K,V → output.
+    /// Q: [seq_len, n_heads * head_dim], K,V: [seq_len, n_kv_heads * head_dim].
+    /// Output: [seq_len, n_heads * head_dim].
     fn causal_attention(
         &self,
         q: &Self::Buffer,
@@ -106,6 +107,7 @@ pub trait ComputeDevice: Send {
         v: &Self::Buffer,
         seq_len: usize,
         n_heads: usize,
+        n_kv_heads: usize,
         head_dim: usize,
     ) -> Self::Buffer;
 
@@ -130,6 +132,103 @@ pub trait ComputeDevice: Send {
         head_dim: usize,
     ) -> Self::Buffer;
 
+    /// Transpose a 2D matrix on device: [rows, cols] → [cols, rows].
+    fn transpose_2d(
+        &self,
+        buf: &Self::Buffer,
+        rows: usize,
+        cols: usize,
+    ) -> Self::Buffer;
+
+    /// Backward pass for row-wise softmax.
+    ///
+    /// Given softmax output `sm` and upstream gradient `grad_output`,
+    /// computes `grad_input[i,j] = sm[i,j] * (grad[i,j] - dot(sm[i,:], grad[i,:]))`.
+    fn softmax_backward(
+        &self,
+        softmax_out: &Self::Buffer,
+        grad_output: &Self::Buffer,
+        n_rows: usize,
+        row_len: usize,
+    ) -> Self::Buffer;
+
+    /// Backward pass for RMS normalization.
+    ///
+    /// Returns `(grad_input, grad_weight)`.
+    fn rms_norm_backward(
+        &self,
+        input: &Self::Buffer,
+        weight: &Self::Buffer,
+        grad_output: &Self::Buffer,
+        n_groups: usize,
+        dim: usize,
+        eps: f32,
+    ) -> (Self::Buffer, Self::Buffer);
+
+    /// Backward pass for embedding lookup (scatter-add).
+    ///
+    /// `grad_weight[ids[i]] += grad_output[i]` for each position.
+    /// Returns gradient w.r.t. weight: `[vocab_size, dim]`.
+    fn embedding_backward(
+        &self,
+        grad_output: &Self::Buffer,
+        ids: &Self::Buffer,
+        vocab_size: usize,
+        seq_len: usize,
+        dim: usize,
+    ) -> Self::Buffer;
+
+    /// Backward pass for causal self-attention with GQA.
+    ///
+    /// Recomputes attention scores from Q,K,V, then computes gradients.
+    /// Q, grad_output: `[seq_len, n_heads * head_dim]`
+    /// K, V: `[seq_len, n_kv_heads * head_dim]`
+    /// Returns `(grad_Q, grad_K, grad_V)` with same shapes as inputs.
+    fn causal_attention_backward(
+        &self,
+        grad_output: &Self::Buffer,
+        q: &Self::Buffer,
+        k: &Self::Buffer,
+        v: &Self::Buffer,
+        seq_len: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> (Self::Buffer, Self::Buffer, Self::Buffer);
+
+    /// Fused cross-entropy forward + backward.
+    ///
+    /// Computes per-row log-softmax → CE loss, and gradient = (softmax - one_hot) / count.
+    /// Positions where `target == pad_id` are excluded from loss and get zero gradient.
+    /// Returns `(loss, grad_logits)`.
+    fn cross_entropy_forward_backward(
+        &self,
+        logits: &Self::Buffer,
+        targets: &Self::Buffer,
+        n_positions: usize,
+        vocab_size: usize,
+        pad_id: u32,
+    ) -> (f32, Self::Buffer);
+
     /// Wait for all pending operations to complete.
     fn sync(&self);
+
+    /// Copy a buffer on device without CPU round-trip (GPU backends use blit/copy).
+    fn copy_buffer(&self, src: &Self::Buffer) -> Self::Buffer {
+        let data = self.download(src);
+        self.upload(&data)
+    }
+
+    /// Broadcast bias addition on device: out[i] = matrix[i] + bias[i % dim].
+    ///
+    /// `numel` is total elements in matrix, `dim` is the bias length.
+    fn bias_add(&self, matrix: &Self::Buffer, bias: &Self::Buffer, numel: usize, dim: usize) -> Self::Buffer {
+        let mat_data = self.download(matrix);
+        let bias_data = self.download(bias);
+        let mut out = mat_data;
+        for i in 0..numel {
+            out[i] += bias_data[i % dim];
+        }
+        self.upload(&out)
+    }
 }

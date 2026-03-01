@@ -22,8 +22,11 @@ pub use cpu::CpuDevice;
 pub use device::{ComputeBuffer, ComputeDevice};
 pub use tang_expr::codegen::Dialect;
 
-pub use modules::{Embedding, InterleavedRoPE, KVCache, Linear, RMSNorm};
-pub use ops::{add_tensors, bias_add, swiglu_fused};
+pub use modules::{
+    Embedding, EmbeddingCache, InterleavedRoPE, KVCache, Linear, LinearCache,
+    RMSNorm, RMSNormCache,
+};
+pub use ops::{add_tensors, bias_add, causal_attention_backward, swiglu_backward, swiglu_fused};
 pub use tensor::ComputeTensor;
 
 #[cfg(feature = "metal")]

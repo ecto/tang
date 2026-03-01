@@ -61,16 +61,8 @@ impl<B: ComputeBuffer> Linear<B> {
         let batch = input.numel() / self.in_features;
         assert_eq!(input.numel(), batch * self.in_features);
 
-        // Transpose weight: [out_f, in_f] → [in_f, out_f]
-        // CPU roundtrip for transpose (simple, correct)
-        let w_data = dev.download(&self.weight.buffer);
-        let mut wt = vec![0.0f32; self.in_features * self.out_features];
-        for r in 0..self.out_features {
-            for c in 0..self.in_features {
-                wt[c * self.out_features + r] = w_data[r * self.in_features + c];
-            }
-        }
-        let wt_buf = dev.upload(&wt);
+        // Transpose weight on device: [out_f, in_f] → [in_f, out_f]
+        let wt_buf = dev.transpose_2d(&self.weight.buffer, self.out_features, self.in_features);
 
         // matmul: [batch, in_f] @ [in_f, out_f] = [batch, out_f]
         let out_buf = dev.matmul(&input.buffer, &wt_buf, batch, self.in_features, self.out_features);
@@ -78,6 +70,69 @@ impl<B: ComputeBuffer> Linear<B> {
 
         // Add bias
         bias_add(dev, &out, &self.bias)
+    }
+}
+
+/// Cached activations from Linear forward_2d_train.
+pub struct LinearCache<B: ComputeBuffer> {
+    /// Input [batch, in_features] (on device).
+    pub input: B,
+    pub batch: usize,
+}
+
+impl<B: ComputeBuffer> Linear<B> {
+    /// Forward pass for training — same as forward_2d but caches input for backward.
+    pub fn forward_2d_train<D: ComputeDevice<Buffer = B>>(
+        &self,
+        dev: &D,
+        input: &ComputeTensor<B>,
+    ) -> (ComputeTensor<B>, LinearCache<B>) {
+        let batch = input.numel() / self.in_features;
+        assert_eq!(input.numel(), batch * self.in_features);
+
+        // Transpose weight on device: [out_f, in_f] → [in_f, out_f]
+        let wt_buf = dev.transpose_2d(&self.weight.buffer, self.out_features, self.in_features);
+
+        // matmul: [batch, in_f] @ [in_f, out_f] = [batch, out_f]
+        let out_buf = dev.matmul(&input.buffer, &wt_buf, batch, self.in_features, self.out_features);
+        let out = ComputeTensor::from_buffer(out_buf, vec![batch, self.out_features]);
+
+        // Cache input for backward (copy on device, no CPU round-trip)
+        let cached_input = dev.copy_buffer(&input.buffer);
+
+        let out = bias_add(dev, &out, &self.bias);
+        let cache = LinearCache { input: cached_input, batch };
+        (out, cache)
+    }
+
+    /// Backward pass: grad_output [batch, out_f] → (grad_input, grad_weight, grad_bias).
+    ///
+    /// grad_weight and grad_bias are downloaded to CPU.
+    pub fn backward_2d<D: ComputeDevice<Buffer = B>>(
+        &self,
+        dev: &D,
+        grad_output: &ComputeTensor<B>,
+        cache: &LinearCache<B>,
+    ) -> (ComputeTensor<B>, Vec<f32>, Vec<f32>) {
+        let batch = cache.batch;
+
+        // grad_input = grad_output @ W  (W is [out_f, in_f])
+        // grad_output: [batch, out_f], W: [out_f, in_f] → [batch, in_f]
+        let gi_buf = dev.matmul(&grad_output.buffer, &self.weight.buffer, batch, self.out_features, self.in_features);
+        let grad_input = ComputeTensor::from_buffer(gi_buf, vec![batch, self.in_features]);
+
+        // grad_weight = grad_output^T @ input
+        // grad_output^T: [out_f, batch], input: [batch, in_f] → [out_f, in_f]
+        let go_t = dev.transpose_2d(&grad_output.buffer, batch, self.out_features);
+        let gw_buf = dev.matmul(&go_t, &cache.input, self.out_features, batch, self.in_features);
+        let grad_weight = dev.download(&gw_buf);
+
+        // grad_bias = sum(grad_output, axis=0) → [out_f]
+        let grad_bias = dev.download(
+            &dev.reduce_sum(&grad_output.buffer, &[batch, self.out_features], 0),
+        );
+
+        (grad_input, grad_weight, grad_bias)
     }
 }
 
@@ -112,6 +167,47 @@ impl<B: ComputeBuffer> RMSNorm<B> {
         let n_groups = input.numel() / self.dim;
         let buf = dev.rms_norm(&input.buffer, &self.weight.buffer, n_groups, self.dim, self.eps);
         ComputeTensor::from_buffer(buf, input.shape().to_vec())
+    }
+}
+
+/// Cached activations from RMSNorm forward_train.
+pub struct RMSNormCache<B: ComputeBuffer> {
+    /// Input [n_groups, dim] (on device).
+    pub input: B,
+}
+
+impl<B: ComputeBuffer> RMSNorm<B> {
+    /// Forward pass for training — caches input for backward.
+    pub fn forward_train<D: ComputeDevice<Buffer = B>>(
+        &self,
+        dev: &D,
+        input: &ComputeTensor<B>,
+    ) -> (ComputeTensor<B>, RMSNormCache<B>) {
+        let n_groups = input.numel() / self.dim;
+        let buf = dev.rms_norm(&input.buffer, &self.weight.buffer, n_groups, self.dim, self.eps);
+        let out = ComputeTensor::from_buffer(buf, input.shape().to_vec());
+
+        let cache = RMSNormCache { input: dev.copy_buffer(&input.buffer) };
+        (out, cache)
+    }
+
+    /// Backward pass: grad_output [n_groups, dim] → (grad_input, grad_weight).
+    ///
+    /// grad_weight is downloaded to CPU.
+    pub fn backward<D: ComputeDevice<Buffer = B>>(
+        &self,
+        dev: &D,
+        grad_output: &ComputeTensor<B>,
+        cache: &RMSNormCache<B>,
+    ) -> (ComputeTensor<B>, Vec<f32>) {
+        let n_groups = grad_output.numel() / self.dim;
+        let (gi_buf, gw_buf) = dev.rms_norm_backward(
+            &cache.input, &self.weight.buffer, &grad_output.buffer,
+            n_groups, self.dim, self.eps,
+        );
+        let grad_weight = dev.download(&gw_buf);
+        let grad_input = ComputeTensor::from_buffer(gi_buf, grad_output.shape().to_vec());
+        (grad_input, grad_weight)
     }
 }
 
@@ -161,6 +257,45 @@ impl<B: ComputeBuffer> Embedding<B> {
     ) -> ComputeTensor<B> {
         let buf = dev.embedding(&self.weight.buffer, ids, seq_len, self.dim);
         ComputeTensor::from_buffer(buf, vec![seq_len, self.dim])
+    }
+}
+
+/// Cached activations from Embedding forward_train.
+pub struct EmbeddingCache<B: ComputeBuffer> {
+    /// Token IDs (on device).
+    pub ids: B,
+    pub seq_len: usize,
+}
+
+impl<B: ComputeBuffer> Embedding<B> {
+    /// Forward pass for training — caches IDs for backward.
+    pub fn forward_train<D: ComputeDevice<Buffer = B>>(
+        &self,
+        dev: &D,
+        ids: &B,
+        seq_len: usize,
+    ) -> (ComputeTensor<B>, EmbeddingCache<B>) {
+        let buf = dev.embedding(&self.weight.buffer, ids, seq_len, self.dim);
+        let out = ComputeTensor::from_buffer(buf, vec![seq_len, self.dim]);
+
+        let cache = EmbeddingCache { ids: dev.copy_buffer(ids), seq_len };
+        (out, cache)
+    }
+
+    /// Backward pass: grad_output [seq_len, dim] → grad_weight [vocab_size, dim].
+    ///
+    /// grad_weight is downloaded to CPU.
+    pub fn backward<D: ComputeDevice<Buffer = B>>(
+        &self,
+        dev: &D,
+        grad_output: &ComputeTensor<B>,
+        cache: &EmbeddingCache<B>,
+    ) -> Vec<f32> {
+        let gw_buf = dev.embedding_backward(
+            &grad_output.buffer, &cache.ids,
+            self.vocab_size, cache.seq_len, self.dim,
+        );
+        dev.download(&gw_buf)
     }
 }
 
@@ -305,6 +440,48 @@ impl InterleavedRoPE {
     }
 }
 
+impl InterleavedRoPE {
+    /// Backward pass for RoPE: reverse rotation.
+    ///
+    /// RoPE forward: (x0*cos - x1*sin, x0*sin + x1*cos)
+    /// RoPE backward: (g0*cos + g1*sin, -g0*sin + g1*cos)
+    pub fn backward<D: ComputeDevice>(
+        &self,
+        dev: &D,
+        grad_output: &ComputeTensor<D::Buffer>,
+        start_pos: usize,
+    ) -> ComputeTensor<D::Buffer> {
+        let shape = grad_output.shape();
+        assert_eq!(shape.len(), 3, "InterleavedRoPE backward expects 3D");
+        let seq_len = shape[0];
+        let n_heads = shape[1];
+        let head_dim = shape[2];
+        assert_eq!(head_dim, self.head_dim);
+        let half_dim = head_dim / 2;
+
+        let data = dev.download(&grad_output.buffer);
+        let mut out = vec![0.0f32; data.len()];
+
+        for s in 0..seq_len {
+            let pos = start_pos + s;
+            for h in 0..n_heads {
+                let base_idx = (s * n_heads + h) * head_dim;
+                for i in 0..half_dim {
+                    let cos = self.cos_table[pos * half_dim + i];
+                    let sin = self.sin_table[pos * half_dim + i];
+                    let g0 = data[base_idx + 2 * i];
+                    let g1 = data[base_idx + 2 * i + 1];
+                    // Transpose of rotation matrix
+                    out[base_idx + 2 * i] = g0 * cos + g1 * sin;
+                    out[base_idx + 2 * i + 1] = -g0 * sin + g1 * cos;
+                }
+            }
+        }
+
+        ComputeTensor::from_data(dev, &out, shape)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,6 +587,63 @@ mod tests {
         assert!((v[1] - 2.0).abs() < 1e-5);
         assert!((v[2] - 3.0).abs() < 1e-5);
         assert!((v[3] - 4.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn linear_backward_grad_shape() {
+        let dev = CpuDevice::new();
+        let lin = Linear::new(&dev, &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0], &[0.1, 0.2, 0.3], 2, 3);
+        let x = ComputeTensor::from_data(&dev, &[2.0, 3.0, 1.0, 4.0], &[2, 2]);
+        let (out, cache) = lin.forward_2d_train(&dev, &x);
+        assert_eq!(out.shape(), &[2, 3]);
+
+        let grad_out = ComputeTensor::from_data(&dev, &[1.0; 6], &[2, 3]);
+        let (gi, gw, gb) = lin.backward_2d(&dev, &grad_out, &cache);
+        assert_eq!(gi.shape(), &[2, 2]);
+        assert_eq!(gw.len(), 6); // [3, 2]
+        assert_eq!(gb.len(), 3);
+    }
+
+    #[test]
+    fn rms_norm_backward_shapes() {
+        let dev = CpuDevice::new();
+        let norm = RMSNorm::new(&dev, 3, 1e-5);
+        let x = ComputeTensor::from_data(&dev, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        let (out, cache) = norm.forward_train(&dev, &x);
+        assert_eq!(out.shape(), &[2, 3]);
+
+        let grad_out = ComputeTensor::from_data(&dev, &[1.0; 6], &[2, 3]);
+        let (gi, gw) = norm.backward(&dev, &grad_out, &cache);
+        assert_eq!(gi.shape(), &[2, 3]);
+        assert_eq!(gw.len(), 3);
+    }
+
+    #[test]
+    fn embedding_backward_shapes() {
+        let dev = CpuDevice::new();
+        let emb = Embedding::new(&dev, &[0.1, 0.2, 0.3, 0.4, 0.5, 0.6], 3, 2);
+        let ids = dev.upload_u32(&[2, 0]);
+        let (out, cache) = emb.forward_train(&dev, &ids, 2);
+        assert_eq!(out.shape(), &[2, 2]);
+
+        let grad_out = ComputeTensor::from_data(&dev, &[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+        let gw = emb.backward(&dev, &grad_out, &cache);
+        assert_eq!(gw.len(), 6); // vocab=3, dim=2
+    }
+
+    #[test]
+    fn rope_backward_roundtrip() {
+        let dev = CpuDevice::new();
+        let rope = InterleavedRoPE::new(4, 32, 10000.0);
+        let input = ComputeTensor::from_data(&dev, &[1.0, 2.0, 3.0, 4.0], &[1, 1, 4]);
+        let fwd = rope.forward(&dev, &input, 3);
+        let bwd = rope.backward(&dev, &fwd, 3);
+        // backward(forward(x)) should ≈ x (RoPE is orthogonal)
+        let v = bwd.to_vec();
+        assert!((v[0] - 1.0).abs() < 1e-4);
+        assert!((v[1] - 2.0).abs() < 1e-4);
+        assert!((v[2] - 3.0).abs() < 1e-4);
+        assert!((v[3] - 4.0).abs() < 1e-4);
     }
 
     #[test]

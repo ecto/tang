@@ -13,6 +13,9 @@ pub mod reduce_msl;
 #[cfg(feature = "metal")]
 pub mod attention_msl;
 
+#[cfg(feature = "metal")]
+pub mod backward_msl;
+
 #[cfg(feature = "cuda")]
 pub mod matmul_cuda;
 

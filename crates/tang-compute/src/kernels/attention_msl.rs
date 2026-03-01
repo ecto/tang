@@ -4,10 +4,10 @@
 //! No shared-memory score buffer — O(head_dim) threadgroup memory only.
 //! No sequence length cap (works for any seq_len).
 
-/// Flash causal self-attention kernel.
-/// Q, K, V: [seq_len, n_heads * head_dim]
+/// Flash causal self-attention kernel with GQA support.
+/// Q: [seq_len, n_heads * head_dim], K,V: [seq_len, n_kv_heads * head_dim]
 /// Output: [seq_len, n_heads * head_dim]
-/// params: [seq_len, n_heads, head_dim]
+/// params: [seq_len, n_heads, n_kv_heads, head_dim]
 ///
 /// Each threadgroup handles one (position, head) pair.
 /// Threads parallelize over head_dim for dot-product reduction and V accumulation.
@@ -30,14 +30,19 @@ kernel void causal_attention(
     uint tg_size = tg_size2.x;
     uint seq_len = params[0];
     uint n_heads = params[1];
-    uint head_dim = params[2];
+    uint n_kv_heads = params[2];
+    uint head_dim = params[3];
     uint total_dim = n_heads * head_dim;
+    uint kv_dim = n_kv_heads * head_dim;
+    uint heads_per_kv = n_heads / n_kv_heads;
 
     uint pos = tg_id.x;
     uint head = tg_id.y;
     if (pos >= seq_len || head >= n_heads) return;
 
-    uint h_off = head * head_dim;
+    uint kv_head = head / heads_per_kv;
+    uint q_off = head * head_dim;
+    uint kv_off = kv_head * head_dim;
     float scale = rsqrt(float(head_dim));
     uint attend_len = pos + 1;
 
@@ -61,7 +66,7 @@ kernel void causal_attention(
         // Parallel dot product: Q[pos] . K[j]
         float local_dot = 0.0f;
         for (uint d = tid; d < head_dim; d += tg_size) {
-            local_dot += Q[pos * total_dim + h_off + d] * K[j * total_dim + h_off + d];
+            local_dot += Q[pos * total_dim + q_off + d] * K[j * kv_dim + kv_off + d];
         }
         partials[tid] = local_dot;
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -85,7 +90,7 @@ kernel void causal_attention(
 
         // Rescale accumulator and add new V contribution
         for (uint d = tid; d < head_dim; d += tg_size) {
-            out_accum[d] = out_accum[d] * rescale + exp_score * V[j * total_dim + h_off + d];
+            out_accum[d] = out_accum[d] * rescale + exp_score * V[j * kv_dim + kv_off + d];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -93,7 +98,7 @@ kernel void causal_attention(
     // Normalize by sum
     float inv_sum = 1.0f / tg_sum[0];
     for (uint d = tid; d < head_dim; d += tg_size) {
-        output[pos * total_dim + h_off + d] = out_accum[d] * inv_sum;
+        output[pos * total_dim + q_off + d] = out_accum[d] * inv_sum;
     }
 }
 "#;

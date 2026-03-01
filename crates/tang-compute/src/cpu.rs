@@ -205,18 +205,21 @@ impl ComputeDevice for CpuDevice {
         v: &CpuBuffer,
         seq_len: usize,
         n_heads: usize,
+        n_kv_heads: usize,
         head_dim: usize,
     ) -> CpuBuffer {
         let total_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let heads_per_kv = n_heads / n_kv_heads;
         let mut out = vec![0.0f32; seq_len * total_dim];
         let scale = 1.0 / (head_dim as f32).sqrt();
 
         for h in 0..n_heads {
-            let h_off = h * head_dim;
+            let kv_h = h / heads_per_kv;
+            let q_off = h * head_dim;
+            let kv_off = kv_h * head_dim;
 
             for i in 0..seq_len {
-                // Online softmax: stream through K/V positions
-                // O(head_dim) memory instead of O(seq_len)
                 let mut running_max = f32::NEG_INFINITY;
                 let mut running_sum = 0.0f32;
                 let mut accum = vec![0.0f32; head_dim];
@@ -224,8 +227,8 @@ impl ComputeDevice for CpuDevice {
                 for j in 0..=i {
                     let mut dot = 0.0f32;
                     for d in 0..head_dim {
-                        dot += q.data[i * total_dim + h_off + d]
-                            * k.data[j * total_dim + h_off + d];
+                        dot += q.data[i * total_dim + q_off + d]
+                            * k.data[j * kv_dim + kv_off + d];
                     }
                     let score = dot * scale;
 
@@ -236,14 +239,14 @@ impl ComputeDevice for CpuDevice {
                     running_sum = running_sum * rescale + exp_score;
                     for d in 0..head_dim {
                         accum[d] = accum[d] * rescale
-                            + exp_score * v.data[j * total_dim + h_off + d];
+                            + exp_score * v.data[j * kv_dim + kv_off + d];
                     }
                     running_max = new_max;
                 }
 
                 let inv = 1.0 / running_sum;
                 for d in 0..head_dim {
-                    out[i * total_dim + h_off + d] = accum[d] * inv;
+                    out[i * total_dim + q_off + d] = accum[d] * inv;
                 }
             }
         }
@@ -311,8 +314,295 @@ impl ComputeDevice for CpuDevice {
         CpuBuffer { data: out }
     }
 
+    fn transpose_2d(&self, buf: &CpuBuffer, rows: usize, cols: usize) -> CpuBuffer {
+        assert_eq!(buf.data.len(), rows * cols);
+        let mut out = vec![0.0f32; rows * cols];
+        for r in 0..rows {
+            for c in 0..cols {
+                out[c * rows + r] = buf.data[r * cols + c];
+            }
+        }
+        CpuBuffer { data: out }
+    }
+
+    fn softmax_backward(
+        &self,
+        softmax_out: &CpuBuffer,
+        grad_output: &CpuBuffer,
+        n_rows: usize,
+        row_len: usize,
+    ) -> CpuBuffer {
+        let mut grad_input = vec![0.0f32; n_rows * row_len];
+        for row in 0..n_rows {
+            let base = row * row_len;
+            // dot(sm[row], grad[row])
+            let mut dot = 0.0f32;
+            for j in 0..row_len {
+                dot += softmax_out.data[base + j] * grad_output.data[base + j];
+            }
+            for j in 0..row_len {
+                grad_input[base + j] =
+                    softmax_out.data[base + j] * (grad_output.data[base + j] - dot);
+            }
+        }
+        CpuBuffer { data: grad_input }
+    }
+
+    fn rms_norm_backward(
+        &self,
+        input: &CpuBuffer,
+        weight: &CpuBuffer,
+        grad_output: &CpuBuffer,
+        n_groups: usize,
+        dim: usize,
+        eps: f32,
+    ) -> (CpuBuffer, CpuBuffer) {
+        let mut grad_input = vec![0.0f32; n_groups * dim];
+        let mut grad_weight = vec![0.0f32; dim];
+
+        for g in 0..n_groups {
+            let base = g * dim;
+            let x = &input.data[base..base + dim];
+
+            // Forward recompute
+            let sq_sum: f32 = x.iter().map(|v| v * v).sum();
+            let rms_sq = sq_sum / dim as f32 + eps;
+            let inv_rms = 1.0 / rms_sq.sqrt();
+
+            // grad_weight accumulation
+            for d in 0..dim {
+                grad_weight[d] += grad_output.data[base + d] * x[d] * inv_rms;
+            }
+
+            // grad_input: d(loss)/d(x_i) through RMS norm
+            // norm_out = x * w * inv_rms
+            // d(loss)/d(x_i) = w_i * inv_rms * grad_out_i
+            //                 - x_i * inv_rms^3 / dim * sum_j(x_j * w_j * grad_out_j)
+            let mut sum_xwg = 0.0f32;
+            for d in 0..dim {
+                sum_xwg += x[d] * weight.data[d] * grad_output.data[base + d];
+            }
+            for d in 0..dim {
+                grad_input[base + d] = weight.data[d] * inv_rms * grad_output.data[base + d]
+                    - x[d] * inv_rms * inv_rms * inv_rms / dim as f32 * sum_xwg;
+            }
+        }
+
+        (CpuBuffer { data: grad_input }, CpuBuffer { data: grad_weight })
+    }
+
+    fn embedding_backward(
+        &self,
+        grad_output: &CpuBuffer,
+        ids: &CpuBuffer,
+        vocab_size: usize,
+        seq_len: usize,
+        dim: usize,
+    ) -> CpuBuffer {
+        let mut grad_weight = vec![0.0f32; vocab_size * dim];
+        for i in 0..seq_len {
+            let id = ids.data[i].to_bits() as usize;
+            for d in 0..dim {
+                grad_weight[id * dim + d] += grad_output.data[i * dim + d];
+            }
+        }
+        CpuBuffer { data: grad_weight }
+    }
+
+    fn causal_attention_backward(
+        &self,
+        grad_output: &CpuBuffer,
+        q: &CpuBuffer,
+        k: &CpuBuffer,
+        v: &CpuBuffer,
+        seq_len: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> (CpuBuffer, CpuBuffer, CpuBuffer) {
+        let total_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let heads_per_kv = n_heads / n_kv_heads;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let mut grad_q = vec![0.0f32; seq_len * total_dim];
+        let mut grad_k = vec![0.0f32; seq_len * kv_dim];
+        let mut grad_v = vec![0.0f32; seq_len * kv_dim];
+
+        for h in 0..n_heads {
+            let kv_h = h / heads_per_kv;
+            let q_off = h * head_dim;
+            let kv_off = kv_h * head_dim;
+
+            // 1. Recompute S = Q @ K^T / sqrt(d), apply causal mask, softmax → P
+            let mut scores = vec![0.0f32; seq_len * seq_len];
+            for i in 0..seq_len {
+                for j in 0..seq_len {
+                    if j > i {
+                        scores[i * seq_len + j] = f32::NEG_INFINITY;
+                    } else {
+                        let mut dot = 0.0f32;
+                        for d in 0..head_dim {
+                            dot += q.data[i * total_dim + q_off + d]
+                                * k.data[j * kv_dim + kv_off + d];
+                        }
+                        scores[i * seq_len + j] = dot * scale;
+                    }
+                }
+            }
+
+            // Softmax each row → P
+            let mut probs = vec![0.0f32; seq_len * seq_len];
+            for i in 0..seq_len {
+                let row = &scores[i * seq_len..(i + 1) * seq_len];
+                let max_val = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for j in 0..seq_len {
+                    let e = (row[j] - max_val).exp();
+                    probs[i * seq_len + j] = e;
+                    sum += e;
+                }
+                let inv = 1.0 / sum;
+                for j in 0..seq_len {
+                    probs[i * seq_len + j] *= inv;
+                }
+            }
+
+            // 2. grad_V = P^T @ grad_out_h
+            for j in 0..seq_len {
+                for d in 0..head_dim {
+                    let mut sum = 0.0f32;
+                    for i in 0..seq_len {
+                        sum += probs[i * seq_len + j]
+                            * grad_output.data[i * total_dim + q_off + d];
+                    }
+                    grad_v[j * kv_dim + kv_off + d] += sum;
+                }
+            }
+
+            // 3. grad_P = grad_out_h @ V^T
+            let mut grad_p = vec![0.0f32; seq_len * seq_len];
+            for i in 0..seq_len {
+                for j in 0..seq_len {
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += grad_output.data[i * total_dim + q_off + d]
+                            * v.data[j * kv_dim + kv_off + d];
+                    }
+                    grad_p[i * seq_len + j] = dot;
+                }
+            }
+
+            // 4. grad_S = softmax_backward(P, grad_P)
+            let mut grad_s = vec![0.0f32; seq_len * seq_len];
+            for i in 0..seq_len {
+                let base = i * seq_len;
+                let mut dot = 0.0f32;
+                for j in 0..seq_len {
+                    dot += probs[base + j] * grad_p[base + j];
+                }
+                for j in 0..seq_len {
+                    grad_s[base + j] = probs[base + j] * (grad_p[base + j] - dot);
+                }
+            }
+
+            // 5. grad_Q = grad_S @ K / sqrt(d)
+            for i in 0..seq_len {
+                for d in 0..head_dim {
+                    let mut sum = 0.0f32;
+                    for j in 0..seq_len {
+                        sum += grad_s[i * seq_len + j] * k.data[j * kv_dim + kv_off + d];
+                    }
+                    grad_q[i * total_dim + q_off + d] = sum * scale;
+                }
+            }
+
+            // 6. grad_K = grad_S^T @ Q / sqrt(d)
+            for j in 0..seq_len {
+                for d in 0..head_dim {
+                    let mut sum = 0.0f32;
+                    for i in 0..seq_len {
+                        sum += grad_s[i * seq_len + j]
+                            * q.data[i * total_dim + q_off + d];
+                    }
+                    grad_k[j * kv_dim + kv_off + d] += sum * scale;
+                }
+            }
+        }
+
+        (
+            CpuBuffer { data: grad_q },
+            CpuBuffer { data: grad_k },
+            CpuBuffer { data: grad_v },
+        )
+    }
+
+    fn cross_entropy_forward_backward(
+        &self,
+        logits: &CpuBuffer,
+        targets: &CpuBuffer,
+        n_positions: usize,
+        vocab_size: usize,
+        pad_id: u32,
+    ) -> (f32, CpuBuffer) {
+        let mut grad = vec![0.0f32; n_positions * vocab_size];
+        let mut total_loss = 0.0f64;
+        let mut count = 0usize;
+
+        for pos in 0..n_positions {
+            let target = targets.data[pos].to_bits();
+            if target == pad_id {
+                continue;
+            }
+            count += 1;
+            let base = pos * vocab_size;
+            let row = &logits.data[base..base + vocab_size];
+
+            // Numerically stable softmax
+            let max_val = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0f64;
+            for j in 0..vocab_size {
+                sum += ((row[j] - max_val) as f64).exp();
+            }
+            let log_sum = sum.ln();
+
+            // Loss: -log(softmax[target])
+            let log_prob = (row[target as usize] - max_val) as f64 - log_sum;
+            total_loss -= log_prob;
+
+            // Gradient: softmax - one_hot (will divide by count after)
+            for j in 0..vocab_size {
+                let sm = (((row[j] - max_val) as f64).exp() / sum) as f32;
+                grad[base + j] = sm;
+            }
+            grad[base + target as usize] -= 1.0;
+        }
+
+        if count > 0 {
+            let inv_count = 1.0 / count as f32;
+            for g in grad.iter_mut() {
+                *g *= inv_count;
+            }
+            total_loss /= count as f64;
+        }
+
+        (total_loss as f32, CpuBuffer { data: grad })
+    }
+
     fn sync(&self) {
         // No-op for CPU
+    }
+
+    fn copy_buffer(&self, src: &CpuBuffer) -> CpuBuffer {
+        CpuBuffer { data: src.data.clone() }
+    }
+
+    fn bias_add(&self, matrix: &CpuBuffer, bias: &CpuBuffer, numel: usize, dim: usize) -> CpuBuffer {
+        let mut out = matrix.data.clone();
+        for i in 0..numel {
+            out[i] += bias.data[i % dim];
+        }
+        CpuBuffer { data: out }
     }
 }
 
@@ -550,7 +840,7 @@ mod tests {
         let q = dev.upload(&[1.0, 0.0, 0.0, 1.0]);
         let k = dev.upload(&[1.0, 0.0, 0.0, 1.0]);
         let v = dev.upload(&[1.0, 2.0, 3.0, 4.0]);
-        let result = dev.causal_attention(&q, &k, &v, 2, 1, 2);
+        let result = dev.causal_attention(&q, &k, &v, 2, 1, 1, 2);
         let out = dev.download(&result);
         assert_eq!(out.len(), 4);
         // Position 0 can only attend to itself → V[0] = [1, 2]
@@ -604,6 +894,115 @@ mod tests {
         // qi=2: attend to pos 0,1,2
         // q=[1,1], dots with k are all computable
         assert_eq!(out.len(), 6);
+    }
+
+    #[test]
+    fn cpu_transpose_2d() {
+        let dev = CpuDevice::new();
+        // 2x3 → 3x2
+        let buf = dev.upload(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let result = dev.transpose_2d(&buf, 2, 3);
+        let out = dev.download(&result);
+        // [[1,2,3],[4,5,6]] → [[1,4],[2,5],[3,6]]
+        assert_eq!(out, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+    }
+
+    #[test]
+    fn cpu_softmax_backward() {
+        let dev = CpuDevice::new();
+        // softmax output and upstream gradient
+        let sm = dev.upload(&[0.2, 0.3, 0.5]);
+        let grad = dev.upload(&[1.0, 0.0, 0.0]);
+        let result = dev.softmax_backward(&sm, &grad, 1, 3);
+        let out = dev.download(&result);
+        // dot = 0.2*1 + 0.3*0 + 0.5*0 = 0.2
+        // grad_input[0] = 0.2*(1.0-0.2) = 0.16
+        // grad_input[1] = 0.3*(0.0-0.2) = -0.06
+        // grad_input[2] = 0.5*(0.0-0.2) = -0.1
+        assert!((out[0] - 0.16).abs() < 1e-6);
+        assert!((out[1] - (-0.06)).abs() < 1e-6);
+        assert!((out[2] - (-0.1)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cpu_embedding_backward() {
+        let dev = CpuDevice::new();
+        // seq_len=2, dim=3, vocab=4
+        let grad_out = dev.upload(&[1.0, 2.0, 3.0, 0.1, 0.2, 0.3]);
+        let ids = dev.upload_u32(&[1, 3]);
+        let result = dev.embedding_backward(&grad_out, &ids, 4, 2, 3);
+        let out = dev.download(&result);
+        assert_eq!(out.len(), 12); // 4*3
+        // id=1 → row 1 gets [1,2,3]
+        assert!((out[3] - 1.0).abs() < 1e-6);
+        assert!((out[4] - 2.0).abs() < 1e-6);
+        assert!((out[5] - 3.0).abs() < 1e-6);
+        // id=3 → row 3 gets [0.1,0.2,0.3]
+        assert!((out[9] - 0.1).abs() < 1e-6);
+        assert!((out[10] - 0.2).abs() < 1e-6);
+        assert!((out[11] - 0.3).abs() < 1e-6);
+        // rows 0 and 2 should be zero
+        assert!((out[0]).abs() < 1e-6);
+        assert!((out[6]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cpu_cross_entropy_forward_backward() {
+        let dev = CpuDevice::new();
+        // 2 positions, vocab=3, pad_id=99
+        // logits: [[1,2,3],[4,5,6]]
+        // targets: [2, 0]  (one-hot at indices 2 and 0)
+        let logits = dev.upload(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let targets = dev.upload_u32(&[2, 0]);
+        let (loss, grad) = dev.cross_entropy_forward_backward(&logits, &targets, 2, 3, 99);
+        let g = dev.download(&grad);
+
+        assert!(loss.is_finite());
+        assert!(loss > 0.0);
+        assert_eq!(g.len(), 6);
+
+        // Gradient should sum to ~0 per non-padded row
+        let row0_sum: f32 = g[0..3].iter().sum();
+        let row1_sum: f32 = g[3..6].iter().sum();
+        assert!(row0_sum.abs() < 1e-5);
+        assert!(row1_sum.abs() < 1e-5);
+    }
+
+    #[test]
+    fn cpu_cross_entropy_with_padding() {
+        let dev = CpuDevice::new();
+        let logits = dev.upload(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let targets = dev.upload_u32(&[2, 0]); // pad_id=0, so pos 1 is padded
+        let (loss, grad) = dev.cross_entropy_forward_backward(&logits, &targets, 2, 3, 0);
+        let g = dev.download(&grad);
+
+        // Only position 0 (target=2) should contribute
+        assert!(loss > 0.0);
+        // Padded row should have zero gradients
+        assert!((g[3]).abs() < 1e-6);
+        assert!((g[4]).abs() < 1e-6);
+        assert!((g[5]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cpu_rms_norm_backward() {
+        let dev = CpuDevice::new();
+        let input = dev.upload(&[1.0, 2.0, 3.0, 4.0]);
+        let weight = dev.upload(&[1.0, 1.0]);
+        let grad_out = dev.upload(&[1.0, 0.0, 0.0, 1.0]);
+        let (grad_input, grad_weight) =
+            dev.rms_norm_backward(&input, &weight, &grad_out, 2, 2, 1e-5);
+        let gi = dev.download(&grad_input);
+        let gw = dev.download(&grad_weight);
+        assert_eq!(gi.len(), 4);
+        assert_eq!(gw.len(), 2);
+        // Numerical check: perturb input and verify gradient direction
+        for v in &gi {
+            assert!(v.is_finite());
+        }
+        for v in &gw {
+            assert!(v.is_finite());
+        }
     }
 
     #[test]

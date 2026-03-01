@@ -52,18 +52,12 @@ impl<B: ComputeBuffer> ComputeTensor<B> {
         self.buffer.to_vec()
     }
 
-    /// Transpose a 2D tensor via CPU roundtrip.
+    /// Transpose a 2D tensor on device.
     pub fn transpose_2d<D: ComputeDevice<Buffer = B>>(self, dev: &D) -> Self {
         assert_eq!(self.shape.len(), 2, "transpose_2d requires 2D tensor");
         let rows = self.shape[0];
         let cols = self.shape[1];
-        let data = dev.download(&self.buffer);
-        let mut out = vec![0.0f32; rows * cols];
-        for r in 0..rows {
-            for c in 0..cols {
-                out[c * rows + r] = data[r * cols + c];
-            }
-        }
-        Self::from_data(dev, &out, &[cols, rows])
+        let buf = dev.transpose_2d(&self.buffer, rows, cols);
+        Self::from_buffer(buf, vec![cols, rows])
     }
 }
