@@ -10,6 +10,9 @@ extern crate std;
 
 extern crate alloc;
 
+#[cfg(all(feature = "accelerate", target_os = "macos"))]
+mod blas;
+
 mod cholesky;
 mod dmat;
 mod dvec;

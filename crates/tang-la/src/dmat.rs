@@ -1,5 +1,7 @@
 use crate::DVec;
 use alloc::vec::Vec;
+#[cfg(all(feature = "accelerate", target_os = "macos"))]
+use core::any::TypeId;
 use core::ops::{Add, Index, IndexMut, Mul, Neg, Sub};
 use tang::Scalar;
 
@@ -153,6 +155,37 @@ impl<S: Scalar> DMat<S> {
     /// Matrix-vector product: y = A * x.
     pub fn mul_vec(&self, x: &DVec<S>) -> DVec<S> {
         assert_eq!(self.ncols, x.len(), "DMat mul_vec: dimension mismatch");
+
+        #[cfg(all(feature = "accelerate", target_os = "macos"))]
+        {
+            let m = self.nrows as i32;
+            let n = self.ncols as i32;
+            if TypeId::of::<S>() == TypeId::of::<f32>() {
+                let mut y = DVec::zeros(self.nrows);
+                unsafe {
+                    crate::blas::sgemv(
+                        self.as_slice().as_ptr() as *const f32,
+                        x.as_slice().as_ptr() as *const f32,
+                        y.as_mut_slice().as_mut_ptr() as *mut f32,
+                        m, n,
+                    );
+                }
+                return y;
+            }
+            if TypeId::of::<S>() == TypeId::of::<f64>() {
+                let mut y = DVec::zeros(self.nrows);
+                unsafe {
+                    crate::blas::dgemv(
+                        self.as_slice().as_ptr() as *const f64,
+                        x.as_slice().as_ptr() as *const f64,
+                        y.as_mut_slice().as_mut_ptr() as *mut f64,
+                        m, n,
+                    );
+                }
+                return y;
+            }
+        }
+
         let mut y = DVec::zeros(self.nrows);
         for j in 0..self.ncols {
             let xj = x[j];
@@ -169,6 +202,38 @@ impl<S: Scalar> DMat<S> {
         let m = self.nrows;
         let n = rhs.ncols;
         let p = self.ncols;
+
+        #[cfg(all(feature = "accelerate", target_os = "macos"))]
+        {
+            let mi = m as i32;
+            let ni = n as i32;
+            let ki = p as i32;
+            if TypeId::of::<S>() == TypeId::of::<f32>() {
+                let mut c = DMat::zeros(m, n);
+                unsafe {
+                    crate::blas::sgemm(
+                        self.as_slice().as_ptr() as *const f32,
+                        rhs.as_slice().as_ptr() as *const f32,
+                        c.as_mut_slice().as_mut_ptr() as *mut f32,
+                        mi, ni, ki,
+                    );
+                }
+                return c;
+            }
+            if TypeId::of::<S>() == TypeId::of::<f64>() {
+                let mut c = DMat::zeros(m, n);
+                unsafe {
+                    crate::blas::dgemm(
+                        self.as_slice().as_ptr() as *const f64,
+                        rhs.as_slice().as_ptr() as *const f64,
+                        c.as_mut_slice().as_mut_ptr() as *mut f64,
+                        mi, ni, ki,
+                    );
+                }
+                return c;
+            }
+        }
+
         let mut c = DMat::zeros(m, n);
 
         let a = self.as_slice();
@@ -421,5 +486,88 @@ mod tests {
         assert_eq!(d[0], 0.0);
         assert_eq!(d[1], 4.0);
         assert_eq!(d[2], 8.0);
+    }
+
+    #[cfg(all(feature = "accelerate", target_os = "macos"))]
+    mod blas_tests {
+        use super::*;
+
+        #[test]
+        fn f32_matmul_small() {
+            let a = DMat::from_fn(2, 3, |i, j| (i * 3 + j + 1) as f32);
+            let b = DMat::from_fn(3, 2, |i, j| (i * 2 + j + 1) as f32);
+            let c = a.mul_mat(&b);
+            assert_eq!(c.get(0, 0), 22.0f32);
+            assert_eq!(c.get(0, 1), 28.0f32);
+            assert_eq!(c.get(1, 0), 49.0f32);
+            assert_eq!(c.get(1, 1), 64.0f32);
+        }
+
+        #[test]
+        fn f64_matmul_small() {
+            let a = DMat::from_fn(2, 3, |i, j| (i * 3 + j + 1) as f64);
+            let b = DMat::from_fn(3, 2, |i, j| (i * 2 + j + 1) as f64);
+            let c = a.mul_mat(&b);
+            assert_eq!(c.get(0, 0), 22.0);
+            assert_eq!(c.get(0, 1), 28.0);
+            assert_eq!(c.get(1, 0), 49.0);
+            assert_eq!(c.get(1, 1), 64.0);
+        }
+
+        #[test]
+        fn f32_matmul_large() {
+            let n = 64;
+            let a = DMat::from_fn(n, n, |i, j| ((i + j) % 7) as f32);
+            let b = DMat::from_fn(n, n, |i, j| ((i * 3 + j) % 11) as f32);
+            let c = a.mul_mat(&b);
+            // Verify a few elements against manual dot products
+            let mut expected = 0.0f32;
+            for k in 0..n {
+                expected += a.get(0, k) * b.get(k, 0);
+            }
+            assert!((c.get(0, 0) - expected).abs() < 1e-3);
+        }
+
+        #[test]
+        fn f32_matvec() {
+            let a = DMat::from_fn(2, 3, |i, j| (i * 3 + j + 1) as f32);
+            let x = DVec::from_slice(&[1.0f32, 2.0, 3.0]);
+            let y = a.mul_vec(&x);
+            // [1 2 3] * [1 2 3]^T = 14
+            // [4 5 6] * [1 2 3]^T = 32
+            assert_eq!(y[0], 14.0f32);
+            assert_eq!(y[1], 32.0f32);
+        }
+
+        #[test]
+        fn f64_matvec() {
+            let a = DMat::from_fn(2, 3, |i, j| (i * 3 + j + 1) as f64);
+            let x = DVec::from_slice(&[1.0, 2.0, 3.0]);
+            let y = a.mul_vec(&x);
+            assert_eq!(y[0], 14.0);
+            assert_eq!(y[1], 32.0);
+        }
+
+        #[test]
+        fn f32_rectangular() {
+            // Tall × Wide: (5×3) * (3×4) = (5×4)
+            let a = DMat::from_fn(5, 3, |i, j| (i + j) as f32);
+            let b = DMat::from_fn(3, 4, |i, j| (i * j + 1) as f32);
+            let c = a.mul_mat(&b);
+            assert_eq!(c.nrows(), 5);
+            assert_eq!(c.ncols(), 4);
+            // Spot check (0,0): sum_k a[0,k]*b[k,0] = 0*1 + 1*1 + 2*1 = 3
+            assert_eq!(c.get(0, 0), 3.0f32);
+        }
+
+        #[test]
+        fn f64_identity_matvec() {
+            let eye = DMat::<f64>::identity(4);
+            let x = DVec::from_slice(&[10.0, 20.0, 30.0, 40.0]);
+            let y = eye.mul_vec(&x);
+            for i in 0..4 {
+                assert_eq!(y[i], x[i]);
+            }
+        }
     }
 }

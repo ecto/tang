@@ -8,6 +8,7 @@ description = "Dynamic linear algebra — DVec, DMat, decompositions"
 [features]
 default = ["std"]
 std = ["tang/std"]
+accelerate = ["std"]
 faer = ["dep:faer"]
 
 [dependencies]

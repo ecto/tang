@@ -12,6 +12,7 @@ tang-gpu = { workspace = true, optional = true }
 
 [features]
 default = []
+accelerate = ["tang-la/accelerate"]
 gpu = ["dep:tang-gpu"]
 
 [dev-dependencies]

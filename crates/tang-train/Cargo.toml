@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Computational graph, parameter management, training loop"
 
+[features]
+accelerate = ["tang-la/accelerate", "tang-tensor/accelerate"]
+
 [dependencies]
 tang = { workspace = true }
 tang-la = { workspace = true }
