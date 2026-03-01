@@ -14,12 +14,13 @@ pub trait Optimizer<S: Scalar> {
     fn set_lr(&mut self, lr: f64);
 }
 
-/// Adam optimizer for Module parameters.
+/// Adam optimizer for Module parameters with optional decoupled weight decay (AdamW).
 pub struct ModuleAdam {
     pub lr: f64,
     pub beta1: f64,
     pub beta2: f64,
     pub epsilon: f64,
+    pub weight_decay: f64,
     m: Vec<Vec<f64>>,
     v: Vec<Vec<f64>>,
     t: usize,
@@ -32,6 +33,7 @@ impl ModuleAdam {
             beta1: 0.9,
             beta2: 0.999,
             epsilon: 1e-8,
+            weight_decay: 0.0,
             m: Vec::new(),
             v: Vec::new(),
             t: 0,
@@ -44,10 +46,42 @@ impl ModuleAdam {
             beta1,
             beta2,
             epsilon: 1e-8,
+            weight_decay: 0.0,
             m: Vec::new(),
             v: Vec::new(),
             t: 0,
         }
+    }
+
+    /// Create an Adam optimizer with decoupled weight decay (AdamW).
+    pub fn with_weight_decay(lr: f64, weight_decay: f64) -> Self {
+        Self {
+            lr,
+            beta1: 0.9,
+            beta2: 0.999,
+            epsilon: 1e-8,
+            weight_decay,
+            m: Vec::new(),
+            v: Vec::new(),
+            t: 0,
+        }
+    }
+
+    /// Return references to the internal state vectors (m, v) and step count.
+    ///
+    /// Each element of `m` and `v` is the momentum/variance buffer for one parameter.
+    pub fn state_vecs(&self) -> (&[Vec<f64>], &[Vec<f64>], usize) {
+        (&self.m, &self.v, self.t)
+    }
+
+    /// Load previously saved optimizer state.
+    ///
+    /// `m` and `v` must have the same structure as originally produced by training
+    /// (one vector per parameter, same lengths).
+    pub fn load_state_vecs(&mut self, m: Vec<Vec<f64>>, v: Vec<Vec<f64>>, t: usize) {
+        self.m = m;
+        self.v = v;
+        self.t = t;
     }
 }
 
@@ -77,6 +111,12 @@ impl<S: Scalar> Optimizer<S> for ModuleAdam {
                 let grad_data = grad.data();
 
                 for j in 0..data.len() {
+                    // Decoupled weight decay (AdamW): applied before Adam update
+                    if self.weight_decay > 0.0 {
+                        let w = data[j].to_f64();
+                        data[j] = S::from_f64(w * (1.0 - self.lr * self.weight_decay));
+                    }
+
                     let g = grad_data[j].to_f64();
                     self.m[i][j] = self.beta1 * self.m[i][j] + (1.0 - self.beta1) * g;
                     self.v[i][j] = self.beta2 * self.v[i][j] + (1.0 - self.beta2) * g * g;
