@@ -72,6 +72,19 @@
 | `quantize/q4_roundtrip_576` | 865 | 865 ns |
 | `quantize/q8_matvec_576x576` | 207,992 | 208 µs |
 
+### BLAS Acceleration (Apple Accelerate)
+
+`DMat::mul_mat` with `--features accelerate` dispatches to `cblas_sgemm`/`cblas_dgemm` via Apple's Accelerate framework (AMX/NEON). Zero-copy — `DMat` is already column-major matching CBLAS layout.
+
+**512x512 matmul** (`cargo run -p tang-la --example bench_matmul --release`):
+
+| Type | Generic | Accelerate | Speedup | GFLOP/s |
+|------|---------|------------|---------|---------|
+| f32 | 8.19 ms | 0.18 ms | **45x** | 1,478 |
+| f64 | 15.5 ms | 0.67 ms | **23x** | 402 |
+
+Enable with `cargo build --features accelerate` (macOS only). Falls through to the generic loop for non-f32/f64 types.
+
 ---
 
 ## GPU Inference (`gpu_inference`)
