@@ -145,13 +145,13 @@
   <!-- ═══════════════════════════════════════════════ -->
   <section class="px-4 sm:px-6 py-16 sm:py-24">
     <div class="max-w-3xl mx-auto">
-      <div class="border border-white/10 overflow-hidden">
+      <div class="border border-white/10 rounded-xl overflow-hidden">
         <!-- header -->
         <div class="flex items-center gap-3 px-4 py-3 border-b border-white/10">
           <span class="text-accent text-xs font-mono">tang-train</span>
           <span class="font-semibold text-sm">The Quantum Poet</span>
           <span class="text-muted text-xs ml-auto hidden sm:inline">21K params · character-level · physics haikus</span>
-          <button id="poet-train-btn" class="bg-accent hover:bg-accent/80 text-black text-xs font-mono font-semibold px-3 py-1.5 transition-colors cursor-pointer ml-2">Train &#9654;</button>
+          <button id="poet-train-btn" class="bg-accent hover:bg-accent/80 text-black text-xs font-mono font-semibold px-3 py-1.5 rounded-lg transition-colors cursor-pointer ml-2">Train &#9654;</button>
         </div>
 
         <!-- code -->
@@ -199,7 +199,7 @@
             <label class="text-muted text-xs font-mono">Temp:</label>
             <input id="poet-temp" type="range" min="0.3" max="1.5" step="0.1" value="0.8" class="w-20 accent-amber-500">
             <span id="poet-temp-label" class="text-muted text-xs font-mono w-6">0.8</span>
-            <button id="poet-generate-btn" class="bg-accent/10 hover:bg-accent/20 text-accent text-xs font-mono px-3 py-1.5 transition-colors cursor-pointer">Generate</button>
+            <button id="poet-generate-btn" class="bg-accent/10 hover:bg-accent/20 text-accent text-xs font-mono px-3 py-1.5 rounded-lg transition-colors cursor-pointer">Generate</button>
           </div>
           <pre id="poet-output" class="font-mono text-xs leading-relaxed text-green-400 min-h-[3rem]"></pre>
         </div>
@@ -223,7 +223,7 @@
 
       <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <!-- Compute -->
-        <div class="border border-white/10 overflow-hidden">
+        <div class="border border-white/10 rounded-xl overflow-hidden">
           <div class="flex items-center gap-2 px-4 py-2.5 border-b border-white/10">
             <span class="w-2 h-2 rounded-full bg-green-500"></span>
             <span class="font-mono text-sm font-semibold">Compute</span>
@@ -241,7 +241,7 @@
         </div>
 
         <!-- Differentiate -->
-        <div class="border border-white/10 overflow-hidden">
+        <div class="border border-white/10 rounded-xl overflow-hidden">
           <div class="flex items-center gap-2 px-4 py-2.5 border-b border-white/10">
             <span class="w-2 h-2 rounded-full bg-accent"></span>
             <span class="font-mono text-sm font-semibold text-accent">Differentiate</span>
@@ -269,7 +269,7 @@
       <h2 class="text-3xl sm:text-4xl font-bold mb-4">Crates<span class="text-accent">.</span></h2>
       <p class="text-muted text-lg mb-12 max-w-2xl">Use only what you need.</p>
 
-      <div class="border border-white/10 overflow-hidden">
+      <div class="border border-white/10 rounded-xl overflow-hidden">
         <a href="https://github.com/ecto/tang/tree/main/crates/tang-train" class="flex items-center justify-between px-4 py-3 border-b border-white/10 hover:bg-surface/50 transition-colors group">
           <div class="flex items-center gap-3">
             <span class="font-mono text-sm font-semibold text-accent">tang-train</span>
@@ -340,7 +340,7 @@
       <p class="mb-12"><a href="https://github.com/ecto/tang/tree/main/crates/tang-bench" class="text-accent text-sm hover:underline font-mono">view benchmark source →</a></p>
 
       <!-- Geometry primitives chart -->
-      <div class="border border-white/10 overflow-hidden">
+      <div class="border border-white/10 rounded-xl overflow-hidden">
         <div class="flex items-center gap-3 px-4 py-2.5 border-b border-white/10">
           <span class="font-mono text-sm font-semibold">Geometry &amp; physics primitives</span>
           <span class="text-muted text-xs font-mono">(f64 unless noted)</span>
@@ -379,7 +379,7 @@
       <h2 class="text-3xl sm:text-4xl font-bold mb-4">nalgebra → tang<span class="text-accent">.</span></h2>
       <p class="text-muted text-lg mb-12 max-w-2xl">Drop-in aliases. Minimal call-site changes.</p>
 
-      <div class="border border-white/10 overflow-hidden">
+      <div class="border border-white/10 rounded-xl overflow-hidden">
         <div class="overflow-x-auto">
           <table class="w-full text-sm min-w-[320px]">
             <thead>
