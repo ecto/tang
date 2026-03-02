@@ -89,14 +89,15 @@ async function boot() {
   // Load and execute loon visualization source
   const loonSource = await fetch('./viz.loon').then(r => r.text());
 
-  // Inject curve path data and call main
-  const fullSource = loonSource + `\n[main "${curvePath}"]`;
-
   try {
-    eval_ui(fullSource);
+    eval_ui(loonSource + '\n[main]');
   } catch (e) {
     console.error('Loon eval error:', e);
   }
+
+  // Inject curve path via JS (too long for loon string literals)
+  const curveEl = document.getElementById('curve-path');
+  if (curveEl) curveEl.setAttribute('d', curvePath);
 
   // --- Animation loop (tang WASM computes, updates SVG attributes) ---
   const tangentLine = document.getElementById('tangent-line');

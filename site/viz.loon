@@ -4,7 +4,7 @@
 
 ; ─── dual number visualization ───
 
-[fn render-dual-viz [curve-path-d]
+[fn render-dual-viz []
   [let root [dom.query-selector "#dual-viz"]]
   [dom.set-inner-html root [str
     "<svg viewBox='0 0 800 320' width='100%' height='100%' xmlns='http://www.w3.org/2000/svg'>"
@@ -25,7 +25,7 @@
     "</g>"
     "<line x1='400' y1='0' x2='400' y2='320' stroke='#71717a' stroke-width='0.5'/>"
     "<line x1='0' y1='183' x2='800' y2='183' stroke='#71717a' stroke-width='0.5'/>"
-    "<path d='" curve-path-d "' fill='none' stroke='#F59E0B' stroke-width='2.5' stroke-linecap='round'/>"
+    "<path id='curve-path' d='' fill='none' stroke='#F59E0B' stroke-width='2.5' stroke-linecap='round'/>"
     "<line id='tangent-line' x1='0' y1='0' x2='0' y2='0' stroke='#A6E22E' stroke-width='1.5' stroke-dasharray='6 4' stroke-linecap='round'/>"
     "<circle id='dual-point' cx='0' cy='0' r='5' fill='#fafafa' stroke='#F59E0B' stroke-width='2'/>"
     "<text id='slope-label' x='0' y='0' fill='#71717a' font-size='11' font-family='ui-monospace, monospace'>slope = 0.00</text>"
@@ -202,8 +202,8 @@
 
 ; ─── main ───
 
-[fn main [curve-path-d]
-  [render-dual-viz curve-path-d]
+[fn main []
+  [render-dual-viz]
   [render-geom-chart]
   [render-ad-chart]
   [render-la-chart]
