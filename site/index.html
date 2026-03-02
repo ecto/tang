@@ -223,11 +223,12 @@
 
       <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <!-- Compute -->
-        <div class="p-4 sm:p-5 overflow-x-auto">
-          <div class="flex items-center gap-2 mb-4">
+        <div class="border border-white/10 overflow-hidden">
+          <div class="flex items-center gap-2 px-4 py-2.5 border-b border-white/10">
             <span class="w-2 h-2 rounded-full bg-green-500"></span>
             <span class="font-mono text-sm font-semibold">Compute</span>
           </div>
+          <div class="p-4 overflow-x-auto" style="background: rgb(var(--c-code-bg))">
 <pre class="font-mono text-xs leading-relaxed"><span class="kw">fn</span> <span class="fn">spring_energy</span>&lt;<span class="ty">S</span>: <span class="ty">Scalar</span>&gt;(
     k: <span class="ty">S</span>, x: <span class="ty">S</span>
 ) -&gt; <span class="ty">S</span> {
@@ -236,14 +237,16 @@
 
 <span class="fn">spring_energy</span>(<span class="num">10.0_f64</span>, <span class="num">0.3</span>)
 <span class="cm">// → 0.45</span></pre>
+          </div>
         </div>
 
         <!-- Differentiate -->
-        <div class="p-4 sm:p-5 overflow-x-auto">
-          <div class="flex items-center gap-2 mb-4">
+        <div class="border border-white/10 overflow-hidden">
+          <div class="flex items-center gap-2 px-4 py-2.5 border-b border-white/10">
             <span class="w-2 h-2 rounded-full bg-accent"></span>
             <span class="font-mono text-sm font-semibold text-accent">Differentiate</span>
           </div>
+          <div class="p-4 overflow-x-auto" style="background: rgb(var(--c-code-bg))">
 <pre class="font-mono text-xs leading-relaxed"><span class="cm">// same function, different type</span>
 <span class="kw">let</span> x = <span class="ty">Dual</span>::<span class="fn">var</span>(<span class="num">0.3</span>);
 
@@ -252,6 +255,7 @@
 <span class="cm">//     val:  0.45,  // energy</span>
 <span class="cm">//     dual: 3.0,   // ∂E/∂x = kx</span>
 <span class="cm">// }</span></pre>
+          </div>
         </div>
       </div>
     </div>
@@ -265,57 +269,57 @@
       <h2 class="text-3xl sm:text-4xl font-bold mb-4">Crates<span class="text-accent">.</span></h2>
       <p class="text-muted text-lg mb-12 max-w-2xl">Use only what you need.</p>
 
-      <div class="space-y-1">
-        <a href="https://github.com/ecto/tang/tree/main/crates/tang-train" class="flex items-center justify-between px-4 py-3 hover:bg-surface/50 rounded transition-colors group">
+      <div class="border border-white/10 overflow-hidden">
+        <a href="https://github.com/ecto/tang/tree/main/crates/tang-train" class="flex items-center justify-between px-4 py-3 border-b border-white/10 hover:bg-surface/50 transition-colors group">
           <div class="flex items-center gap-3">
             <span class="font-mono text-sm font-semibold text-accent">tang-train</span>
             <span class="text-muted text-sm">Module trait, layers, loss functions, Trainer</span>
           </div>
           <span class="text-xs text-muted font-mono opacity-0 group-hover:opacity-100 transition-opacity">→</span>
         </a>
-        <a href="https://github.com/ecto/tang/tree/main/crates/tang-optim" class="flex items-center justify-between px-4 py-3 hover:bg-surface/50 rounded transition-colors group">
+        <a href="https://github.com/ecto/tang/tree/main/crates/tang-optim" class="flex items-center justify-between px-4 py-3 border-b border-white/10 hover:bg-surface/50 transition-colors group">
           <div class="flex items-center gap-3">
             <span class="font-mono text-sm font-semibold text-accent">tang-optim</span>
             <span class="text-muted text-sm">SGD, Adam/AdamW, L-BFGS, Newton, Levenberg-Marquardt</span>
           </div>
           <span class="text-xs text-muted font-mono opacity-0 group-hover:opacity-100 transition-opacity">→</span>
         </a>
-        <a href="https://github.com/ecto/tang/tree/main/crates/tang-tensor" class="flex items-center justify-between px-4 py-3 hover:bg-surface/50 rounded transition-colors group">
+        <a href="https://github.com/ecto/tang/tree/main/crates/tang-tensor" class="flex items-center justify-between px-4 py-3 border-b border-white/10 hover:bg-surface/50 transition-colors group">
           <div class="flex items-center gap-3">
             <span class="font-mono text-sm font-semibold text-accent">tang-tensor</span>
             <span class="text-muted text-sm">N-d arrays with broadcasting, slicing, matmul, reductions</span>
           </div>
           <span class="text-xs text-muted font-mono opacity-0 group-hover:opacity-100 transition-opacity">→</span>
         </a>
-        <a href="https://github.com/ecto/tang/tree/main/crates/tang-gpu" class="flex items-center justify-between px-4 py-3 hover:bg-surface/50 rounded transition-colors group">
+        <a href="https://github.com/ecto/tang/tree/main/crates/tang-gpu" class="flex items-center justify-between px-4 py-3 border-b border-white/10 hover:bg-surface/50 transition-colors group">
           <div class="flex items-center gap-3">
             <span class="font-mono text-sm font-semibold text-accent">tang-gpu</span>
             <span class="text-muted text-sm">GPU compute &amp; training via wgpu — fused kernels, matmul, backward</span>
           </div>
           <span class="text-xs text-muted font-mono opacity-0 group-hover:opacity-100 transition-opacity">→</span>
         </a>
-        <a href="https://github.com/ecto/tang/tree/main/crates/tang-sparse" class="flex items-center justify-between px-4 py-3 hover:bg-surface/50 rounded transition-colors group">
+        <a href="https://github.com/ecto/tang/tree/main/crates/tang-sparse" class="flex items-center justify-between px-4 py-3 border-b border-white/10 hover:bg-surface/50 transition-colors group">
           <div class="flex items-center gap-3">
             <span class="font-mono text-sm font-semibold text-accent">tang-sparse</span>
             <span class="text-muted text-sm">Sparse matrices — CSR, CSC, COO, SpMV</span>
           </div>
           <span class="text-xs text-muted font-mono opacity-0 group-hover:opacity-100 transition-opacity">→</span>
         </a>
-        <a href="https://github.com/ecto/tang/tree/main/crates/tang-ad" class="flex items-center justify-between px-4 py-3 hover:bg-surface/50 rounded transition-colors group">
+        <a href="https://github.com/ecto/tang/tree/main/crates/tang-ad" class="flex items-center justify-between px-4 py-3 border-b border-white/10 hover:bg-surface/50 transition-colors group">
           <div class="flex items-center gap-3">
             <span class="font-mono text-sm font-semibold text-accent">tang-ad</span>
             <span class="text-muted text-sm">Reverse-mode autodiff — tape, grad, jacobian, hessian</span>
           </div>
           <span class="text-xs text-muted font-mono opacity-0 group-hover:opacity-100 transition-opacity">→</span>
         </a>
-        <a href="https://github.com/ecto/tang/tree/main/crates/tang-la" class="flex items-center justify-between px-4 py-3 hover:bg-surface/50 rounded transition-colors group">
+        <a href="https://github.com/ecto/tang/tree/main/crates/tang-la" class="flex items-center justify-between px-4 py-3 border-b border-white/10 hover:bg-surface/50 transition-colors group">
           <div class="flex items-center gap-3">
             <span class="font-mono text-sm font-semibold text-accent">tang-la</span>
             <span class="text-muted text-sm">Dynamic linear algebra — DVec, DMat, LU, SVD, Cholesky, QR, Eigen</span>
           </div>
           <span class="text-xs text-muted font-mono opacity-0 group-hover:opacity-100 transition-opacity">→</span>
         </a>
-        <a href="https://github.com/ecto/tang/tree/main/crates/tang" class="flex items-center justify-between px-4 py-3 hover:bg-surface/50 rounded transition-colors group">
+        <a href="https://github.com/ecto/tang/tree/main/crates/tang" class="flex items-center justify-between px-4 py-3 hover:bg-surface/50 transition-colors group">
           <div class="flex items-center gap-3">
             <span class="font-mono text-sm font-semibold text-accent">tang</span>
             <span class="text-muted text-sm">Vec2/3/4, Mat3/4, Quat, Transform, Dual&lt;S&gt;, spatial algebra</span>
@@ -336,27 +340,31 @@
       <p class="mb-12"><a href="https://github.com/ecto/tang/tree/main/crates/tang-bench" class="text-accent text-sm hover:underline font-mono">view benchmark source →</a></p>
 
       <!-- Geometry primitives chart -->
-      <div>
-        <h3 class="font-mono text-base sm:text-lg font-semibold mb-2">Geometry &amp; physics primitives <span class="text-muted text-xs sm:text-sm font-normal">(f64 unless noted)</span></h3>
-        <p class="text-muted text-sm mb-8">Lower is better.<span class="hidden sm:inline"> glam uses f32 (SIMD).</span></p>
+      <div class="border border-white/10 overflow-hidden">
+        <div class="flex items-center gap-3 px-4 py-2.5 border-b border-white/10">
+          <span class="font-mono text-sm font-semibold">Geometry &amp; physics primitives</span>
+          <span class="text-muted text-xs font-mono">(f64 unless noted)</span>
+          <span class="text-muted text-xs ml-auto hidden sm:inline">lower is better</span>
+        </div>
         <div class="hidden sm:block p-3 sm:p-6 overflow-x-auto">
           <div id="bench-geom-container" class="min-w-[500px] w-full"></div>
         </div>
         <div class="sm:hidden p-3">
           <div id="bench-geom-compact" class="w-full"></div>
         </div>
-        <div class="hidden sm:flex flex-wrap gap-6 mt-4 text-xs font-mono">
-          <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#F59E0B"></span> tang</span>
-          <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#71717a"></span> nalgebra</span>
-          <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#3B82F6"></span> glam (f32)</span>
-        </div>
-        <div class="sm:hidden flex flex-wrap gap-4 mt-4 text-xs font-mono">
-          <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#F59E0B"></span> tang</span>
-          <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#71717a"></span> nalgebra</span>
+        <div class="flex items-center gap-4 px-4 py-2.5 border-t border-white/10" style="background: rgb(var(--c-code-bg))">
+          <div class="hidden sm:flex flex-wrap gap-6 text-xs font-mono">
+            <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#F59E0B"></span> tang</span>
+            <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#71717a"></span> nalgebra</span>
+            <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#3B82F6"></span> glam (f32)</span>
+          </div>
+          <div class="sm:hidden flex flex-wrap gap-4 text-xs font-mono">
+            <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#F59E0B"></span> tang</span>
+            <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#71717a"></span> nalgebra</span>
+          </div>
+          <a href="https://github.com/ecto/tang/tree/main/crates/tang-bench" class="text-accent hover:underline text-xs font-mono ml-auto">source &rarr;</a>
         </div>
       </div>
-
-      <p class="mt-8"><a href="https://github.com/ecto/tang/tree/main/crates/tang-bench" class="text-accent hover:underline text-sm font-mono">full benchmark suite →</a></p>
     </div>
   </section>
 
@@ -371,23 +379,22 @@
       <h2 class="text-3xl sm:text-4xl font-bold mb-4">nalgebra → tang<span class="text-accent">.</span></h2>
       <p class="text-muted text-lg mb-12 max-w-2xl">Drop-in aliases. Minimal call-site changes.</p>
 
-      <div>
-        <h3 class="font-mono text-sm text-muted mb-4">Type mapping</h3>
+      <div class="border border-white/10 overflow-hidden">
         <div class="overflow-x-auto">
           <table class="w-full text-sm min-w-[320px]">
             <thead>
-              <tr class="border-b border-white/5">
+              <tr class="border-b border-white/10">
                 <th class="p-2.5 sm:p-3 text-left font-mono text-muted font-normal">nalgebra</th>
                 <th class="p-2.5 sm:p-3 text-left font-mono text-accent font-normal">tang</th>
               </tr>
             </thead>
             <tbody class="font-mono">
-              <tr class="border-b border-white/[0.03]"><td class="p-3 text-muted">Vector3&lt;f64&gt;</td><td class="p-3">Vec3&lt;f64&gt;</td></tr>
-              <tr class="border-b border-white/[0.03]"><td class="p-3 text-muted">Point3&lt;f64&gt;</td><td class="p-3">Point3&lt;f64&gt;</td></tr>
-              <tr class="border-b border-white/[0.03]"><td class="p-3 text-muted">Unit&lt;Vector3&gt;</td><td class="p-3">Dir3&lt;f64&gt;</td></tr>
-              <tr class="border-b border-white/[0.03]"><td class="p-3 text-muted">Matrix4&lt;f64&gt;</td><td class="p-3">Mat4&lt;f64&gt;</td></tr>
-              <tr class="border-b border-white/[0.03]"><td class="p-3 text-muted">UnitQuaternion</td><td class="p-3">Quat&lt;f64&gt;</td></tr>
-              <tr class="border-b border-white/[0.03]"><td class="p-3 text-muted">DVector&lt;f64&gt;</td><td class="p-3">DVec&lt;f64&gt;</td></tr>
+              <tr class="border-b border-white/[0.05]"><td class="p-3 text-muted">Vector3&lt;f64&gt;</td><td class="p-3">Vec3&lt;f64&gt;</td></tr>
+              <tr class="border-b border-white/[0.05]"><td class="p-3 text-muted">Point3&lt;f64&gt;</td><td class="p-3">Point3&lt;f64&gt;</td></tr>
+              <tr class="border-b border-white/[0.05]"><td class="p-3 text-muted">Unit&lt;Vector3&gt;</td><td class="p-3">Dir3&lt;f64&gt;</td></tr>
+              <tr class="border-b border-white/[0.05]"><td class="p-3 text-muted">Matrix4&lt;f64&gt;</td><td class="p-3">Mat4&lt;f64&gt;</td></tr>
+              <tr class="border-b border-white/[0.05]"><td class="p-3 text-muted">UnitQuaternion</td><td class="p-3">Quat&lt;f64&gt;</td></tr>
+              <tr class="border-b border-white/[0.05]"><td class="p-3 text-muted">DVector&lt;f64&gt;</td><td class="p-3">DVec&lt;f64&gt;</td></tr>
               <tr><td class="p-3 text-muted">DMatrix&lt;f64&gt;</td><td class="p-3">DMat&lt;f64&gt;</td></tr>
             </tbody>
           </table>
