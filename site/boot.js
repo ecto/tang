@@ -256,6 +256,13 @@ async function boot() {
         poetOutput.textContent = result;
         generateBtn.disabled = false;
         generateBtn.textContent = 'Generate';
+
+        // swap mascot speech bubble
+        const mascot = document.getElementById('poet-mascot');
+        if (mascot) {
+          const bubble = mascot.querySelector('div');
+          if (bubble) bubble.textContent = 'congrats on training and running your first model from the browser!';
+        }
       });
     });
   }
