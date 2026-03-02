@@ -1,0 +1,15 @@
+{
+  "name": "tang-site-wasm",
+  "type": "module",
+  "version": "0.1.0",
+  "files": [
+    "tang_site_wasm_bg.wasm",
+    "tang_site_wasm.js",
+    "tang_site_wasm.d.ts"
+  ],
+  "main": "tang_site_wasm.js",
+  "types": "tang_site_wasm.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}
