@@ -202,6 +202,15 @@ async function boot() {
         terminal.innerHTML = '';
         progressWrap.classList.remove('hidden');
 
+        // pop the tangerine out
+        const mascot = document.getElementById('poet-mascot');
+        if (mascot) {
+          setTimeout(() => {
+            mascot.style.opacity = '1';
+            mascot.style.transform = 'translateY(0)';
+          }, 800);
+        }
+
         let epoch = 0;
 
         function trainFrame() {

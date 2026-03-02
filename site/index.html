@@ -81,6 +81,11 @@
     /* copy button */
     .copy-btn:hover { background: rgb(var(--c-surface)); }
     .copy-btn:active { transform: scale(0.95); }
+
+    @keyframes mascot-bob {
+      0%, 100% { transform: translateY(0); }
+      50% { transform: translateY(-6px); }
+    }
   </style>
 </head>
 <body class="antialiased">
@@ -145,6 +150,12 @@
   <!-- ═══════════════════════════════════════════════ -->
   <section class="px-4 sm:px-6 py-16 sm:py-24">
     <div class="max-w-3xl mx-auto">
+      <div class="relative">
+      <!-- mascot peek -->
+      <div id="poet-mascot" class="absolute -right-2 sm:right-4 -bottom-6 flex items-end gap-2 opacity-0 translate-y-8 pointer-events-none" style="transition: opacity 0.6s ease, transform 0.6s ease; z-index: 10;">
+        <div class="bg-surface border border-white/10 rounded-xl px-3 py-2 text-xs font-mono text-muted max-w-[200px] leading-relaxed shadow-lg mb-4">this is actually Rust code running in your browser!</div>
+        <img src="tang-mascot.svg" alt="" class="w-12 h-12 sm:w-16 sm:h-16 drop-shadow-lg" style="animation: mascot-bob 2s ease-in-out infinite;" />
+      </div>
       <div class="border border-white/10 rounded-xl overflow-hidden">
         <!-- header -->
         <div class="flex items-center gap-3 px-4 py-3 border-b border-white/10">
@@ -209,6 +220,7 @@
           <a href="https://github.com/ecto/tang/blob/main/crates/tang-train/examples/quantum_poet.rs" class="text-accent hover:underline text-xs font-mono">quantum_poet.rs &rarr;</a>
           <a href="https://github.com/ecto/tang/tree/main/crates/tang-train/examples" class="text-muted hover:text-accent text-xs font-mono ml-auto">more examples &rarr;</a>
         </div>
+      </div>
       </div>
     </div>
   </section>
