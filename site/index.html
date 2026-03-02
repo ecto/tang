@@ -145,16 +145,18 @@
   <!-- ═══════════════════════════════════════════════ -->
   <section class="px-4 sm:px-6 py-16 sm:py-24">
     <div class="max-w-3xl mx-auto">
-      <div class="p-4 sm:p-6 overflow-x-auto">
-        <div class="flex items-center gap-3 mb-4">
-          <span class="bg-accent/10 text-accent text-xs font-mono px-2 py-1 rounded">tang-train</span>
-          <h3 class="font-semibold text-lg">The Quantum Poet</h3>
-          <div class="ml-auto">
-            <button id="poet-train-btn" class="bg-accent/10 hover:bg-accent/20 text-accent text-xs font-mono px-3 py-1.5 rounded transition-colors cursor-pointer">Train &#9654;</button>
-          </div>
+      <div class="border border-white/10 overflow-hidden">
+        <!-- header -->
+        <div class="flex items-center gap-3 px-4 py-3 border-b border-white/10">
+          <span class="text-accent text-xs font-mono">tang-train</span>
+          <span class="font-semibold text-sm">The Quantum Poet</span>
+          <span class="text-muted text-xs ml-auto hidden sm:inline">21K params · character-level · physics haikus</span>
+          <button id="poet-train-btn" class="bg-accent hover:bg-accent/80 text-black text-xs font-mono font-semibold px-3 py-1.5 transition-colors cursor-pointer ml-2">Train &#9654;</button>
         </div>
-        <p class="text-muted text-sm mb-4">A character-level text generator trained on physics haikus. 21K parameters, trained live in your browser via WASM &mdash; no backend.</p>
-<pre class="font-mono text-xs leading-relaxed mb-4"><span class="cm">// build the model</span>
+
+        <!-- code -->
+        <div class="px-4 py-3 overflow-x-auto border-b border-white/10" style="background: rgb(var(--c-code-bg))">
+<pre class="font-mono text-xs leading-relaxed"><span class="cm">// build the model</span>
 <span class="kw">let mut</span> model = <span class="ty">Sequential</span>::&lt;<span class="ty">f64</span>&gt;::<span class="fn">new</span>(<span class="fn">vec!</span>[
     <span class="ty">Box</span>::<span class="fn">new</span>(<span class="ty">Linear</span>::<span class="fn">new</span>(<span class="num">240</span>, <span class="num">64</span>, <span class="num">42</span>)),
     <span class="ty">Box</span>::<span class="fn">new</span>(<span class="ty">Tanh</span>::<span class="fn">new</span>()),
@@ -168,45 +170,46 @@
     .<span class="fn">loss_fn</span>(|p, t| (<span class="fn">cross_entropy_loss</span>(p, t), <span class="fn">cross_entropy_loss_grad</span>(p, t)))
     .<span class="fn">epochs</span>(<span class="num">200</span>)
     .<span class="fn">fit</span>(&amp;<span class="kw">mut</span> loader);</pre>
+        </div>
 
-        <!-- Terminal: training progress -->
-        <div class="bg-[#1a1a2e] p-4 mb-4">
+        <!-- terminal -->
+        <div class="px-4 py-3" style="background: #1a1a2e">
           <div id="poet-terminal" class="font-mono text-xs leading-relaxed text-green-400">
             <span class="text-muted">click Train to start...</span>
           </div>
-          <!-- Progress bar -->
           <div id="poet-progress-wrap" class="mt-3 hidden">
             <div class="flex items-center gap-3 mb-1.5">
               <span id="poet-epoch-label" class="text-green-400 text-xs font-mono">epoch 0/200</span>
               <span id="poet-loss-label" class="text-muted text-xs font-mono">loss = --</span>
             </div>
-            <div class="w-full bg-white/5 rounded-full h-2 overflow-hidden">
-              <div id="poet-progress-bar" class="bg-accent h-full rounded-full transition-all duration-100" style="width: 0%"></div>
+            <div class="w-full bg-white/5 h-1.5 overflow-hidden">
+              <div id="poet-progress-bar" class="bg-accent h-full transition-all duration-100" style="width: 0%"></div>
             </div>
-            <!-- SVG sparkline -->
-            <svg id="poet-sparkline" class="mt-3 w-full" height="48" viewBox="0 0 200 48" preserveAspectRatio="none">
+            <svg id="poet-sparkline" class="mt-3 w-full" height="40" viewBox="0 0 200 40" preserveAspectRatio="none">
               <polyline id="poet-sparkline-line" fill="none" stroke="#F59E0B" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" points=""/>
             </svg>
           </div>
         </div>
 
-        <!-- Generate controls -->
-        <div id="poet-generate-wrap" class="bg-[#1a1a2e] p-4 mb-4 hidden">
+        <!-- generate controls -->
+        <div id="poet-generate-wrap" class="px-4 py-3 border-t border-white/10 hidden" style="background: #1a1a2e">
           <div class="flex flex-wrap items-center gap-3 mb-3">
             <label class="text-muted text-xs font-mono">Seed:</label>
-            <input id="poet-seed" type="text" value="quantum " maxlength="8" class="bg-white/5 border border-white/10 rounded px-2 py-1 text-green-400 font-mono text-xs w-24 focus:outline-none focus:border-accent/50">
+            <input id="poet-seed" type="text" value="quantum " maxlength="8" class="bg-white/5 border border-white/10 px-2 py-1 text-green-400 font-mono text-xs w-24 focus:outline-none focus:border-accent/50">
             <label class="text-muted text-xs font-mono">Temp:</label>
             <input id="poet-temp" type="range" min="0.3" max="1.5" step="0.1" value="0.8" class="w-20 accent-amber-500">
             <span id="poet-temp-label" class="text-muted text-xs font-mono w-6">0.8</span>
-            <button id="poet-generate-btn" class="bg-accent/10 hover:bg-accent/20 text-accent text-xs font-mono px-3 py-1.5 rounded transition-colors cursor-pointer">Generate</button>
+            <button id="poet-generate-btn" class="bg-accent/10 hover:bg-accent/20 text-accent text-xs font-mono px-3 py-1.5 transition-colors cursor-pointer">Generate</button>
           </div>
           <pre id="poet-output" class="font-mono text-xs leading-relaxed text-green-400 min-h-[3rem]"></pre>
         </div>
 
-        <a href="https://github.com/ecto/tang/blob/main/crates/tang-train/examples/quantum_poet.rs" class="text-accent hover:underline text-sm font-mono">quantum_poet.rs &rarr;</a>
+        <!-- footer -->
+        <div class="flex items-center gap-4 px-4 py-2.5 border-t border-white/10" style="background: rgb(var(--c-code-bg))">
+          <a href="https://github.com/ecto/tang/blob/main/crates/tang-train/examples/quantum_poet.rs" class="text-accent hover:underline text-xs font-mono">quantum_poet.rs &rarr;</a>
+          <a href="https://github.com/ecto/tang/tree/main/crates/tang-train/examples" class="text-muted hover:text-accent text-xs font-mono ml-auto">more examples &rarr;</a>
+        </div>
       </div>
-
-      <p class="mt-6"><a href="https://github.com/ecto/tang/tree/main/crates/tang-train/examples" class="text-accent hover:underline text-sm font-mono">more examples →</a></p>
     </div>
   </section>
 
