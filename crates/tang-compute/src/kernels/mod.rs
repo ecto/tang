@@ -24,3 +24,6 @@ pub mod reduce_cuda;
 
 #[cfg(feature = "cuda")]
 pub mod attention_cuda;
+
+#[cfg(feature = "cuda")]
+pub mod backward_cuda;
