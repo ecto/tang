@@ -19,6 +19,7 @@ members = [
     "crates/tang-onnx",
     "crates/tang-compile",
     "crates/tang-compute",
+    "crates/tang-3dgs",
 ]
 
 [workspace.package]
@@ -43,6 +44,7 @@ tang-infer = { path = "crates/tang-infer" }
 tang-onnx = { path = "crates/tang-onnx" }
 tang-compile = { path = "crates/tang-compile" }
 tang-compute = { path = "crates/tang-compute" }
+tang-3dgs = { path = "crates/tang-3dgs" }
 iroh = "0.96"
 tarpc = { version = "0.35", features = ["tokio1", "serde-transport"] }
 tokio = { version = "1", features = ["full"] }

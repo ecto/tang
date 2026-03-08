@@ -1,0 +1,22 @@
+[package]
+name = "tang-3dgs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Differentiable 3D Gaussian Splatting rasterizer on Metal/Vulkan/DX12 via wgpu"
+
+[dependencies]
+tang = { workspace = true }
+tang-gpu = { workspace = true }
+tang-expr = { workspace = true }
+tang-tensor = { workspace = true }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+pollster = { workspace = true }
+
+[[example]]
+name = "render_test"
+
+[dev-dependencies]
+approx = "0.5"
+image = "0.25"
