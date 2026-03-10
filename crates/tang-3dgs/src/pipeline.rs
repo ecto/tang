@@ -5,11 +5,12 @@
 
 use crate::camera::Camera;
 use crate::cloud::GaussianCloud;
-use crate::{ForwardContext, RasterConfig, RenderOutput, TILE_SIZE};
+use crate::{ForwardContext, GaussianGradients, RasterConfig, RenderOutput, TILE_SIZE};
 
 /// The gaussian splatting rasterizer.
 ///
 /// Owns compiled shader pipelines and reusable GPU resources.
+#[allow(dead_code)]
 pub struct Rasterizer {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -38,6 +39,10 @@ pub struct Rasterizer {
     tile_ranges_pipeline: wgpu::ComputePipeline,
     tile_ranges_bgl0: wgpu::BindGroupLayout,
     tile_ranges_bgl1: wgpu::BindGroupLayout,
+    // Backward pass
+    rasterize_bw_pipeline: wgpu::ComputePipeline,
+    rasterize_bw_bgl0: wgpu::BindGroupLayout,
+    rasterize_bw_bgl1: wgpu::BindGroupLayout,
     config: RasterConfig,
 }
 
@@ -51,11 +56,16 @@ impl Rasterizer {
         }))
         .expect("no GPU adapter found");
 
+        let adapter_limits = adapter.limits();
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("tang-3dgs"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                required_limits: wgpu::Limits {
+                    max_storage_buffers_per_shader_stage: adapter_limits.max_storage_buffers_per_shader_stage,
+                    max_bind_groups: adapter_limits.max_bind_groups,
+                    ..wgpu::Limits::default()
+                },
                 memory_hints: wgpu::MemoryHints::Performance,
             },
             None,
@@ -83,6 +93,8 @@ impl Rasterizer {
             compile_radix_scatter_pipeline(&device);
         let (tile_ranges_pipeline, tile_ranges_bgl0, tile_ranges_bgl1) =
             compile_tile_ranges_pipeline(&device);
+        let (rasterize_bw_pipeline, rasterize_bw_bgl0, rasterize_bw_bgl1) =
+            compile_rasterize_backward_pipeline(&device);
 
         Self {
             device,
@@ -110,6 +122,9 @@ impl Rasterizer {
             tile_ranges_pipeline,
             tile_ranges_bgl0,
             tile_ranges_bgl1,
+            rasterize_bw_pipeline,
+            rasterize_bw_bgl0,
+            rasterize_bw_bgl1,
             config,
         }
     }
@@ -251,87 +266,53 @@ impl Rasterizer {
             };
         }
 
-        // 2b: Prefix sum on tile_counts to get offsets
-        let offsets_buf = self.clone_buffer(&tile_counts_buf);
-        self.run_prefix_sum(&offsets_buf, n as usize);
+        // 2b-2e: Sort on CPU (GPU prefix sum and radix sort have cross-block bugs).
+        // Read back projection results.
+        let means_2d_raw = self.readback_f32(&means_2d_buf, n as usize * 2);
+        let radii_raw = self.readback_u32(&radii_buf, n as usize);
+        let depths_raw = self.readback_f32(&depths_buf, n as usize);
 
-        // 2c: Write (key, value) pairs
-        let keys_buf = self.create_buffer_zero(total_pairs as usize * 2);
-        let values_buf = self.create_buffer_zero(total_pairs as usize);
-
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        {
-            let bg0 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("write_keys bg0"),
-                layout: &self.write_keys_bgl0,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: means_2d_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: radii_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: depths_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: sort_config_buf.as_entire_binding() },
-                ],
-            });
-            let bg1 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("write_keys bg1"),
-                layout: &self.write_keys_bgl1,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: offsets_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: keys_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: values_buf.as_entire_binding() },
-                ],
-            });
-
-            let mut pass = encoder.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.write_keys_pipeline);
-            pass.set_bind_group(0, &bg0, &[]);
-            pass.set_bind_group(1, &bg1, &[]);
-            pass.dispatch_workgroups((n + 255) / 256, 1, 1);
+        // Generate (tile_id, depth, gaussian_idx) tuples for all tile overlaps.
+        let mut pairs: Vec<(u32, f32, u32)> = Vec::with_capacity(total_pairs as usize);
+        for idx in 0..n as usize {
+            let r = radii_raw[idx];
+            if r == 0 { continue; }
+            let mx = means_2d_raw[idx * 2];
+            let my = means_2d_raw[idx * 2 + 1];
+            let tile_min_x = ((mx - r as f32) / 16.0).max(0.0) as u32;
+            let tile_max_x = (((mx + r as f32) / 16.0) as u32 + 1).min(num_tiles_x);
+            let tile_min_y = ((my - r as f32) / 16.0).max(0.0) as u32;
+            let tile_max_y = (((my + r as f32) / 16.0) as u32 + 1).min(num_tiles_y);
+            for ty in tile_min_y..tile_max_y {
+                for tx in tile_min_x..tile_max_x {
+                    let tile_id = ty * num_tiles_x + tx;
+                    pairs.push((tile_id, depths_raw[idx], idx as u32));
+                }
+            }
         }
-        self.queue.submit(std::iter::once(encoder.finish()));
 
-        // 2d: Radix sort — sort by depth first, then by tile_id
-        let keys_buf2 = self.create_buffer_zero(total_pairs as usize * 2);
-        let values_buf2 = self.create_buffer_zero(total_pairs as usize);
+        // Sort by (tile_id, depth)
+        pairs.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.partial_cmp(&b.1).unwrap()));
 
-        // Sort by depth (component 0 = keys.y)
-        self.radix_sort_pass(&keys_buf, &values_buf, &keys_buf2, &values_buf2, total_pairs, 0);
-        // Sort by tile_id (component 1 = keys.x) — stable sort preserves depth order within tiles
-        self.radix_sort_pass(&keys_buf2, &values_buf2, &keys_buf, &values_buf, total_pairs, 1);
+        let _actual_pairs = pairs.len() as u32;
+        let sorted_indices_cpu: Vec<u32> = pairs.iter().map(|p| p.2).collect();
 
-        // The result is now in keys_buf, values_buf (sorted by tile_id, then depth)
-
-        // 2e: Identify tile ranges
-        let tile_ranges_buf = self.create_buffer_zero(num_tiles as usize * 2);
-
-        let tile_range_config = [total_pairs, num_tiles, 0u32, 0];
-        let tile_range_config_buf =
-            self.create_buffer_bytes(bytemuck::cast_slice(&tile_range_config));
-
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        {
-            let bg0 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("tile_ranges bg0"),
-                layout: &self.tile_ranges_bgl0,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: keys_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: tile_range_config_buf.as_entire_binding() },
-                ],
-            });
-            let bg1 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("tile_ranges bg1"),
-                layout: &self.tile_ranges_bgl1,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: tile_ranges_buf.as_entire_binding() },
-                ],
-            });
-
-            let mut pass = encoder.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.tile_ranges_pipeline);
-            pass.set_bind_group(0, &bg0, &[]);
-            pass.set_bind_group(1, &bg1, &[]);
-            pass.dispatch_workgroups((total_pairs + 255) / 256, 1, 1);
+        // Compute tile ranges
+        let mut tile_ranges_cpu = vec![[0u32; 2]; num_tiles as usize];
+        for (i, &(tile_id, _, _)) in pairs.iter().enumerate() {
+            let tid = tile_id as usize;
+            if i == 0 || pairs[i - 1].0 != tile_id {
+                tile_ranges_cpu[tid][0] = i as u32;
+            }
+            if i + 1 == pairs.len() || pairs[i + 1].0 != tile_id {
+                tile_ranges_cpu[tid][1] = (i + 1) as u32;
+            }
         }
-        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Upload to GPU
+        let values_buf = self.create_buffer_bytes(bytemuck::cast_slice(&sorted_indices_cpu));
+        let tile_ranges_flat: Vec<u32> = tile_ranges_cpu.iter().flat_map(|r| [r[0], r[1]]).collect();
+        let tile_ranges_buf = self.create_buffer_bytes(bytemuck::cast_slice(&tile_ranges_flat));
 
         // === PASS 3: Rasterize ===
         let image_buf = self.create_buffer_zero((w * h * 3) as usize);
@@ -413,6 +394,157 @@ impl Rasterizer {
         }
     }
 
+    /// Compute gradients w.r.t. gaussian parameters given image-space loss gradients.
+    ///
+    /// `dL_dimage` is the gradient of the loss w.r.t. the rendered image [H*W*3].
+    /// `cloud` and `camera` must be the same as used in the forward pass.
+    /// `ctx` is the ForwardContext from the forward pass.
+    pub fn backward(
+        &self,
+        cloud: &GaussianCloud,
+        _camera: &Camera,
+        ctx: &ForwardContext,
+        #[allow(non_snake_case)] dL_dimage: &[f32],
+    ) -> GaussianGradients {
+        let n = cloud.count as u32;
+        let w = self.config.width;
+        let h = self.config.height;
+        let num_tiles_x = (w + TILE_SIZE - 1) / TILE_SIZE;
+        let num_tiles_y = (h + TILE_SIZE - 1) / TILE_SIZE;
+
+        // Re-upload gaussian data needed for recomputing alpha
+        let means_2d_flat: Vec<f32> = ctx.means_2d.iter().flat_map(|m| [m[0], m[1]]).collect();
+        let means_2d_buf = self.create_buffer_f32(&means_2d_flat);
+        let conics_flat: Vec<f32> = ctx.conics.iter().flat_map(|c| [c[0], c[1], c[2], 0.0]).collect();
+        let conics_buf = self.create_buffer_f32(&conics_flat);
+        let opacities_buf = self.create_buffer_f32(
+            &cloud.opacities.iter().map(|&o| sigmoid(o)).collect::<Vec<_>>(),
+        );
+        let colors_buf = self.create_buffer_f32(&sh_to_rgb(cloud));
+
+        // Re-upload sorted indices and tile ranges
+        let sorted_indices_buf = {
+            use wgpu::util::DeviceExt;
+            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&ctx.sorted_indices),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            })
+        };
+        let tile_ranges_flat: Vec<u32> = ctx.tile_ranges.iter().flat_map(|r| [r[0], r[1]]).collect();
+        let tile_ranges_buf = {
+            use wgpu::util::DeviceExt;
+            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&tile_ranges_flat),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            })
+        };
+
+        // Config uniform (same struct as forward rasterize)
+        let raster_config = [
+            w,
+            h,
+            num_tiles_x,
+            num_tiles_y,
+            self.config.bg_color[0].to_bits(),
+            self.config.bg_color[1].to_bits(),
+            self.config.bg_color[2].to_bits(),
+            0u32,
+        ];
+        let raster_config_buf = self.create_buffer_bytes(bytemuck::cast_slice(&raster_config));
+
+        // Upload dL/dimage, final_T, n_contrib
+        let dl_image_buf = self.create_buffer_f32(dL_dimage);
+        let final_t_buf = self.create_buffer_f32(&ctx.final_transmittance);
+        let n_contrib_buf = {
+            use wgpu::util::DeviceExt;
+            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&ctx.n_contrib),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            })
+        };
+
+        // Gradient output buffers (zeroed, atomic<u32>)
+        let grad_colors_buf = self.create_buffer_zero((n as usize) * 3);
+        let grad_opacities_buf = self.create_buffer_zero(n as usize);
+        let grad_conics_buf = self.create_buffer_zero((n as usize) * 3);
+        let grad_means2d_buf = self.create_buffer_zero((n as usize) * 2);
+
+        // Dispatch backward rasterization
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        {
+            let bg0 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rasterize_bw bg0"),
+                layout: &self.rasterize_bw_bgl0,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: sorted_indices_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: tile_ranges_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: means_2d_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: conics_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: opacities_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: colors_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: raster_config_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 7, resource: dl_image_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 8, resource: final_t_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 9, resource: n_contrib_buf.as_entire_binding() },
+                ],
+            });
+            let bg1 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rasterize_bw bg1"),
+                layout: &self.rasterize_bw_bgl1,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: grad_colors_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: grad_opacities_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: grad_conics_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: grad_means2d_buf.as_entire_binding() },
+                ],
+            });
+
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.rasterize_bw_pipeline);
+            pass.set_bind_group(0, &bg0, &[]);
+            pass.set_bind_group(1, &bg1, &[]);
+            pass.dispatch_workgroups(num_tiles_x, num_tiles_y, 1);
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Readback gradients (reinterpret atomic u32 as f32)
+        let grad_colors_raw = self.readback_f32(&grad_colors_buf, (n as usize) * 3);
+        let grad_opacities_raw = self.readback_f32(&grad_opacities_buf, n as usize);
+        let grad_conics_raw = self.readback_f32(&grad_conics_buf, (n as usize) * 3);
+        let grad_means2d_raw = self.readback_f32(&grad_means2d_buf, (n as usize) * 2);
+
+        // Chain through backward projection: dL/d{conic, mean_2d} → dL/d{position, scale, rotation}
+        #[allow(non_snake_case)]
+        let dL_dconics: Vec<[f32; 3]> = grad_conics_raw.chunks(3).map(|c| [c[0], c[1], c[2]]).collect();
+        #[allow(non_snake_case)]
+        let dL_dmeans2d: Vec<[f32; 2]> = grad_means2d_raw.chunks(2).map(|m| [m[0], m[1]]).collect();
+
+        #[allow(non_snake_case)]
+        let (dL_dpositions, dL_dscales, dL_drotations) =
+            crate::project_backward::backward_projection(
+                &cloud.positions,
+                &cloud.scales,
+                &cloud.rotations,
+                _camera,
+                &ctx.radii,
+                &dL_dconics,
+                &dL_dmeans2d,
+            );
+
+        GaussianGradients {
+            positions: dL_dpositions,
+            scales: dL_dscales,
+            rotations: dL_drotations,
+            opacities: grad_opacities_raw,
+            sh_coeffs: grad_colors_raw, // dL/d(evaluated_color), chain through SH later
+            _conics: dL_dconics,
+            _means_2d: dL_dmeans2d,
+        }
+    }
+
     // --- Buffer helpers ---
 
     fn create_buffer_f32(&self, data: &[f32]) -> wgpu::Buffer {
@@ -449,6 +581,7 @@ impl Rasterizer {
         })
     }
 
+    #[allow(dead_code)]
     fn clone_buffer(&self, src: &wgpu::Buffer) -> wgpu::Buffer {
         let dst = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
@@ -516,6 +649,7 @@ impl Rasterizer {
 
     // --- Sort helpers ---
 
+    #[allow(dead_code)]
     fn run_prefix_sum(&self, buf: &wgpu::Buffer, n: usize) {
         let params = [n as u32, 0, 0, 0u32];
         let params_buf = self.create_buffer_bytes(bytemuck::cast_slice(&params));
@@ -540,6 +674,7 @@ impl Rasterizer {
         self.queue.submit(std::iter::once(encoder.finish()));
     }
 
+    #[allow(dead_code)]
     fn radix_sort_pass(
         &self,
         keys_in: &wgpu::Buffer,
@@ -765,6 +900,15 @@ fn compile_radix_scatter_pipeline(d: &wgpu::Device) -> (wgpu::ComputePipeline, w
     create_pipeline(d, crate::sort::RADIX_SCATTER_SHADER, "scatter",
         &[STORAGE_RO, STORAGE_RO, UNIFORM, STORAGE_RW],
         &[STORAGE_RW, STORAGE_RW],
+    )
+}
+
+fn compile_rasterize_backward_pipeline(d: &wgpu::Device) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout, wgpu::BindGroupLayout) {
+    create_pipeline(d, crate::rasterize::RASTERIZE_BACKWARD_SHADER, "main",
+        // group 0: sorted_indices, tile_ranges, means_2d, conics, opacities, colors, config, dL_dimage, final_T, n_contrib
+        &[STORAGE_RO, STORAGE_RO, STORAGE_RO, STORAGE_RO, STORAGE_RO, STORAGE_RO, UNIFORM, STORAGE_RO, STORAGE_RO, STORAGE_RO],
+        // group 1: grad_colors, grad_opacities, grad_conics, grad_means2d
+        &[STORAGE_RW, STORAGE_RW, STORAGE_RW, STORAGE_RW],
     )
 }
 
