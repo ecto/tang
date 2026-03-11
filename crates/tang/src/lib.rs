@@ -11,10 +11,7 @@
 //! - Block-structured spatial matrices (no 6x6 index gymnastics)
 //! - `Dir3` derefs to `Vec3` (no `.as_ref()` pain)
 
-#![no_std]
-
-#[cfg(feature = "std")]
-extern crate std;
+#![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
 
@@ -100,6 +97,41 @@ mod bytemuck_impls {
     unsafe impl bytemuck::TransparentWrapper<Vec3<f32>> for Dir3<f32> {}
     unsafe impl bytemuck::TransparentWrapper<Vec3<f64>> for Dir3<f64> {}
 }
+
+// ── Extended modules (feature-gated) ────────────────────────────────
+
+#[cfg(feature = "la")]
+pub mod la;
+
+#[cfg(feature = "ad")]
+pub mod ad;
+
+#[cfg(feature = "expr")]
+pub mod expr;
+
+#[cfg(feature = "gpu")]
+pub mod gpu;
+
+#[cfg(feature = "compute")]
+pub mod compute;
+
+#[cfg(feature = "tensor")]
+pub mod tensor;
+
+#[cfg(feature = "optim")]
+pub mod optim;
+
+#[cfg(feature = "train")]
+pub mod train;
+
+#[cfg(feature = "safetensors")]
+pub mod safetensors;
+
+#[cfg(feature = "splatting")]
+pub mod splatting;
+
+#[cfg(feature = "holo")]
+pub mod holo;
 
 #[cfg(test)]
 mod tests {

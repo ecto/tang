@@ -8,9 +8,12 @@ description = "N-dimensional arrays with CPU and GPU backends"
 [dependencies]
 tang = { workspace = true }
 tang-la = { workspace = true }
+tang-gpu = { workspace = true, optional = true }
+
 [features]
 default = []
 accelerate = ["tang-la/accelerate"]
+gpu = ["dep:tang-gpu"]
 
 [dev-dependencies]
 approx = "0.5"

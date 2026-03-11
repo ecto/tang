@@ -30,7 +30,7 @@ license = "MIT"
 repository = "https://github.com/ecto/tang"
 
 [workspace.dependencies]
-tang = { version = "0.1.0", path = "crates/tang" }
+tang = { version = "0.2.0", path = "crates/tang" }
 tang-la = { version = "0.1.0", path = "crates/tang-la" }
 tang-ad = { version = "0.1.0", path = "crates/tang-ad" }
 tang-sparse = { version = "0.1.0", path = "crates/tang-sparse" }
