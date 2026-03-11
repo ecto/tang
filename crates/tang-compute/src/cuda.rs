@@ -1098,15 +1098,16 @@ impl ComputeDevice for CudaComputeDevice {
                     .unwrap();
             }
 
-            // Step 3: Flash backward kernel
-            let tile_kv: usize = 64; // must match FA_BWD_TILE in kernel
+            // Step 3: Flash backward kernel (v2 — parallelized over heads + Q splits)
+            let tile_kv: usize = 32; // must match FA_BWD_TILE in kernel
             let n_kv_tiles = (seq_len + tile_kv - 1) / tile_kv;
-            let bwd_tg = std::cmp::min(head_dim, 256).next_power_of_two();
+            let q_split: usize = 4; // split Q loop across this many blocks
+            let bwd_tg: usize = 128;
             // smem: dK_acc[TILE*D] + dV_acc[TILE*D] + scores[TILE] + reduce[tg]
             let smem_bytes = (2 * tile_kv * head_dim + tile_kv + bwd_tg) * 4;
             let bwd_cfg = LaunchConfig {
                 block_dim: (bwd_tg as u32, 1, 1),
-                grid_dim: (n_kv_tiles as u32, n_kv_heads as u32, 1),
+                grid_dim: (n_kv_tiles as u32, n_heads as u32, q_split as u32),
                 shared_mem_bytes: smem_bytes as u32,
             };
             let (_module, bwd_func) = self.get_func(
@@ -1114,12 +1115,12 @@ impl ComputeDevice for CudaComputeDevice {
                 "causal_attention_backward_flash",
             );
 
-            // grad_Q needs zero-init (atomicAdd target)
+            // All grads need zero-init (atomicAdd targets from multiple blocks)
             let mut grad_q = self.alloc_f32(seq_len * total_dim);
-            // grad_K/V written directly (no atomics), but zero-init for partial tiles
             let mut grad_k = self.alloc_f32(seq_len * kv_dim);
             let mut grad_v = self.alloc_f32(seq_len * kv_dim);
 
+            let q_split_u32 = q_split as u32;
             unsafe {
                 self.stream.launch_builder(&bwd_func)
                     .arg(grad_output.f32_data())
@@ -1134,6 +1135,7 @@ impl ComputeDevice for CudaComputeDevice {
                     .arg(&n_heads_u32)
                     .arg(&n_kv_heads_u32)
                     .arg(&head_dim_u32)
+                    .arg(&q_split_u32)
                     .launch(bwd_cfg)
                     .unwrap();
             }
