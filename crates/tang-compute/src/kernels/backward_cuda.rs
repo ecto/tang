@@ -98,6 +98,7 @@ extern "C" __global__ void rms_norm_backward(
     }
     float rms_sq = shared[0] / float(dim) + eps;
     float inv_rms = rsqrtf(rms_sq);
+    __syncthreads();  // barrier before Phase 2 reuses shared[]
 
     // Phase 2: compute sum(x * w * grad_out)
     float local_xwg = 0.0f;
@@ -194,6 +195,7 @@ extern "C" __global__ void cross_entropy_fwd_bwd(
         __syncthreads();
     }
     float row_max = shared[0];
+    __syncthreads();  // barrier before Phase 2 reuses shared[]
 
     // Phase 2: exp sum
     float local_sum = 0.0f;
@@ -503,6 +505,7 @@ extern "C" __global__ void rms_norm_backward_bf16(
     }
     float rms_sq = shared[0] / float(dim) + eps;
     float inv_rms = rsqrtf(rms_sq);
+    __syncthreads();  // barrier before Phase 2 reuses shared[]
 
     // Phase 2: sum(x * w * grad_out)
     float local_xwg = 0.0f;
@@ -608,6 +611,7 @@ extern "C" __global__ void cross_entropy_fwd_bwd_bf16(
         __syncthreads();
     }
     float row_max = shared[0];
+    __syncthreads();  // barrier before Phase 2 reuses shared[]
 
     // Phase 2: exp sum
     float local_sum = 0.0f;
@@ -783,6 +787,7 @@ extern "C" __global__ void causal_attention_backward_flash(
             __syncthreads();
         }
         float row_max = reduce[0];
+        __syncthreads();  // barrier before reusing reduce[]
 
         // Exp and sum
         float local_sum = 0.0f;

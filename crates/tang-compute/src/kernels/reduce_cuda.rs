@@ -33,6 +33,7 @@ extern "C" __global__ void softmax(
         __syncthreads();
     }
     float row_max = shared[0];
+    __syncthreads();  // barrier before Phase 2 reuses shared[]
 
     // Phase 2: exp and sum
     float local_sum = 0.0f;
@@ -142,6 +143,7 @@ extern "C" __global__ void softmax_bf16(
         __syncthreads();
     }
     float row_max = shared[0];
+    __syncthreads();  // barrier before Phase 2 reuses shared[]
 
     // Phase 2: exp and sum
     float local_sum = 0.0f;

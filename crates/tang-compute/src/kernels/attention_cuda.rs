@@ -51,6 +51,7 @@ extern "C" __global__ void causal_attention(
         __syncthreads();
     }
     float row_max = reduce[0];
+    __syncthreads();  // barrier before reusing reduce[]
 
     // Step 2: exp + sum
     float local_sum = 0.0f;
@@ -125,6 +126,7 @@ extern "C" __global__ void kv_attention(
         __syncthreads();
     }
     float row_max = reduce[0];
+    __syncthreads();  // barrier before reusing reduce[]
 
     // Exp + sum
     float local_sum = 0.0f;
@@ -204,6 +206,7 @@ extern "C" __global__ void kv_attention_prefill(
         __syncthreads();
     }
     float row_max = reduce[0];
+    __syncthreads();  // barrier before reusing reduce[]
 
     // Exp + sum
     float local_sum = 0.0f;
@@ -338,6 +341,7 @@ extern "C" __global__ void causal_attention_flash(
             __syncthreads();
         }
         float tile_max = reduce[0];
+        __syncthreads();  // barrier before reusing reduce[]
 
         // ---- Online softmax: merge tile stats with running stats ----
         float m_new = fmaxf(row_m, tile_max);
@@ -453,6 +457,7 @@ extern "C" __global__ void causal_attention_bf16(
         __syncthreads();
     }
     float row_max = reduce[0];
+    __syncthreads();  // barrier before reusing reduce[]
 
     // Step 2: exp + sum
     float local_sum = 0.0f;
@@ -535,6 +540,7 @@ extern "C" __global__ void kv_attention_bf16(
         __syncthreads();
     }
     float row_max = reduce[0];
+    __syncthreads();  // barrier before reusing reduce[]
 
     float local_sum = 0.0f;
     for (unsigned int j = tid; j < cache_len; j += tg_size) {
@@ -620,6 +626,7 @@ extern "C" __global__ void kv_attention_prefill_bf16(
         __syncthreads();
     }
     float row_max = reduce[0];
+    __syncthreads();  // barrier before reusing reduce[]
 
     float local_sum = 0.0f;
     for (unsigned int j = tid; j < attend_len; j += tg_size) {
