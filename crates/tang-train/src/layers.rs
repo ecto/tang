@@ -4131,6 +4131,43 @@ impl<S: Scalar> LoRA<S> {
         }
     }
 
+    /// Merge LoRA adapters back into the base linear layer.
+    ///
+    /// Computes `W' = W + (alpha/rank) * B @ A` and returns a plain Linear.
+    /// Bias passes through unchanged.
+    pub fn into_merged(self) -> Linear<S> {
+        let scale = S::from_f64(self.alpha / self.rank as f64);
+        // B: [out, rank], A: [rank, in] => B @ A: [out, in]
+        let ba = self.lora_b.data.matmul(&self.lora_a.data); // [out, in]
+        let out_features = self.base.weight.data.shape()[0];
+        let in_features = self.base.weight.data.shape()[1];
+        let mut merged_data = alloc::vec![S::ZERO; out_features * in_features];
+        for i in 0..out_features {
+            for j in 0..in_features {
+                merged_data[i * in_features + j] =
+                    self.base.weight.data.get(&[i, j]) + ba.get(&[i, j]) * scale;
+            }
+        }
+        Linear {
+            weight: Parameter::new(Tensor::new(
+                merged_data,
+                Shape::from_slice(&[out_features, in_features]),
+            )),
+            bias: self.base.bias,
+            cached_input: None,
+        }
+    }
+
+    /// Low-rank dimension.
+    pub fn rank(&self) -> usize {
+        self.rank
+    }
+
+    /// Scaling factor.
+    pub fn alpha(&self) -> f64 {
+        self.alpha
+    }
+
     /// Create a LoRA-wrapped linear from scratch.
     pub fn from_dims(
         in_features: usize,

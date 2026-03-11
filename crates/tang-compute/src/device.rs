@@ -231,4 +231,28 @@ pub trait ComputeDevice: Send {
         }
         self.upload(&out)
     }
+
+    /// In-place element-wise addition: dst[i] += src[i].
+    fn add_assign(&self, dst: &mut Self::Buffer, src: &Self::Buffer);
+
+    /// Zero out all elements in a buffer.
+    fn zero_buffer(&self, buf: &mut Self::Buffer);
+
+    /// AdamW optimizer step on a single parameter tensor (in-place on device).
+    ///
+    /// Updates `param`, `m` (first moment), and `v` (second moment) in-place.
+    /// Implements decoupled weight decay: param -= lr * wd * param before the Adam update.
+    fn adamw_step(
+        &self,
+        param: &mut Self::Buffer,
+        grad: &Self::Buffer,
+        m: &mut Self::Buffer,
+        v: &mut Self::Buffer,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        weight_decay: f32,
+        step_t: usize,
+    );
 }

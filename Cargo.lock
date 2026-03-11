@@ -5532,6 +5532,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tang-holo"
+version = "0.1.0"
+dependencies = [
+ "approx",
+ "bytemuck",
+ "image",
+ "serde",
+ "tang-3dgs",
+ "tang-tensor",
+]
+
+[[package]]
 name = "tang-hub"
 version = "0.1.0"
 dependencies = [

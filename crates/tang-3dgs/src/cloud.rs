@@ -47,6 +47,48 @@ pub struct GaussianCloud {
 }
 
 impl GaussianCloud {
+    /// Save cloud to a simple binary file.
+    ///
+    /// Format: [count: u32][sh_degree: u32][positions][scales][rotations][opacities][sh_coeffs]
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path)?;
+        f.write_all(&(self.count as u32).to_le_bytes())?;
+        f.write_all(&self.sh_degree.to_le_bytes())?;
+        f.write_all(bytemuck::cast_slice::<[f32; 3], u8>(&self.positions))?;
+        f.write_all(bytemuck::cast_slice::<[f32; 3], u8>(&self.scales))?;
+        f.write_all(bytemuck::cast_slice::<[f32; 4], u8>(&self.rotations))?;
+        f.write_all(bytemuck::cast_slice::<f32, u8>(&self.opacities))?;
+        f.write_all(bytemuck::cast_slice::<f32, u8>(&self.sh_coeffs))?;
+        Ok(())
+    }
+
+    /// Load cloud from binary file.
+    pub fn load(path: &std::path::Path) -> std::io::Result<Self> {
+        use std::io::Read;
+        let mut f = std::fs::File::open(path)?;
+        let mut buf4 = [0u8; 4];
+        f.read_exact(&mut buf4)?;
+        let count = u32::from_le_bytes(buf4) as usize;
+        f.read_exact(&mut buf4)?;
+        let sh_degree = u32::from_le_bytes(buf4);
+
+        let mut positions = vec![[0.0f32; 3]; count];
+        f.read_exact(bytemuck::cast_slice_mut::<[f32; 3], u8>(&mut positions))?;
+        let mut scales = vec![[0.0f32; 3]; count];
+        f.read_exact(bytemuck::cast_slice_mut::<[f32; 3], u8>(&mut scales))?;
+        let mut rotations = vec![[0.0f32; 4]; count];
+        f.read_exact(bytemuck::cast_slice_mut::<[f32; 4], u8>(&mut rotations))?;
+        let mut opacities = vec![0.0f32; count];
+        f.read_exact(bytemuck::cast_slice_mut::<f32, u8>(&mut opacities))?;
+
+        let sh_per_g = 3 * ((sh_degree + 1) * (sh_degree + 1)) as usize;
+        let mut sh_coeffs = vec![0.0f32; count * sh_per_g];
+        f.read_exact(bytemuck::cast_slice_mut::<f32, u8>(&mut sh_coeffs))?;
+
+        Ok(Self { count, positions, scales, rotations, opacities, sh_coeffs, sh_degree })
+    }
+
     /// Number of SH coefficients per gaussian per color channel.
     pub fn sh_coeffs_per_channel(&self) -> usize {
         let d = self.sh_degree as usize + 1;

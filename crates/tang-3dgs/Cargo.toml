@@ -17,6 +17,15 @@ pollster = { workspace = true }
 [[example]]
 name = "render_test"
 
+[[example]]
+name = "grad_check"
+
+[[example]]
+name = "train_scene"
+
+[[example]]
+name = "train_image"
+
 [dev-dependencies]
 approx = "0.5"
 image = "0.25"

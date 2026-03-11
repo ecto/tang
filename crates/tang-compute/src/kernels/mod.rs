@@ -27,3 +27,6 @@ pub mod attention_cuda;
 
 #[cfg(feature = "cuda")]
 pub mod backward_cuda;
+
+#[cfg(feature = "cuda")]
+pub mod adamw_cuda;

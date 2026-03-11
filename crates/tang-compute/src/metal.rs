@@ -792,6 +792,53 @@ kernel void bias_add(
 
         MetalBuffer { buffer: output_buf, len: numel }
     }
+
+    fn add_assign(&self, dst: &mut MetalBuffer, src: &MetalBuffer) {
+        let mut data = self.download(dst);
+        let src_data = self.download(src);
+        for (d, s) in data.iter_mut().zip(src_data.iter()) {
+            *d += *s;
+        }
+        *dst = self.upload(&data);
+    }
+
+    fn zero_buffer(&self, buf: &mut MetalBuffer) {
+        *buf = self.upload(&vec![0.0f32; buf.len()]);
+    }
+
+    fn adamw_step(
+        &self,
+        param: &mut MetalBuffer,
+        grad: &MetalBuffer,
+        m: &mut MetalBuffer,
+        v: &mut MetalBuffer,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        weight_decay: f32,
+        step_t: usize,
+    ) {
+        // CPU fallback
+        let n = param.len();
+        let mut p = self.download(param);
+        let g = self.download(grad);
+        let mut m_data = self.download(m);
+        let mut v_data = self.download(v);
+        let beta1_pow = beta1.powi(step_t as i32);
+        let beta2_pow = beta2.powi(step_t as i32);
+        for i in 0..n {
+            p[i] -= lr * weight_decay * p[i];
+            m_data[i] = beta1 * m_data[i] + (1.0 - beta1) * g[i];
+            v_data[i] = beta2 * v_data[i] + (1.0 - beta2) * g[i] * g[i];
+            let m_hat = m_data[i] / (1.0 - beta1_pow);
+            let v_hat = v_data[i] / (1.0 - beta2_pow);
+            p[i] -= lr * m_hat / (v_hat.sqrt() + eps);
+        }
+        *param = self.upload(&p);
+        *m = self.upload(&m_data);
+        *v = self.upload(&v_data);
+    }
 }
 
 #[cfg(test)]

@@ -162,12 +162,22 @@ pub fn save_f32(
     Ok(())
 }
 
+/// Load tensors as `Tensor<f32>` from raw bytes (useful for `include_bytes!`).
+pub fn load_f32_from_bytes(data: &[u8]) -> Result<HashMap<String, Tensor<f32>>, SafetensorsError> {
+    let tensors =
+        safetensors::SafeTensors::deserialize(data).map_err(SafetensorsError::Parse)?;
+    deserialize_f32(&tensors)
+}
+
 /// Load tensors as `Tensor<f32>` (useful for GPU interop).
 pub fn load_f32(path: &Path) -> Result<HashMap<String, Tensor<f32>>, SafetensorsError> {
     let data = std::fs::read(path).map_err(SafetensorsError::Io)?;
     let tensors =
         safetensors::SafeTensors::deserialize(&data).map_err(SafetensorsError::Parse)?;
+    deserialize_f32(&tensors)
+}
 
+fn deserialize_f32(tensors: &safetensors::SafeTensors<'_>) -> Result<HashMap<String, Tensor<f32>>, SafetensorsError> {
     let mut result = HashMap::new();
 
     for (name, view) in tensors.tensors() {

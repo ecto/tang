@@ -35,13 +35,17 @@ pub mod camera;
 pub mod cloud;
 pub mod densify;
 pub mod pipeline;
+pub mod ply;
 pub mod project;
+pub mod train;
+pub mod project_backward;
 pub mod rasterize;
 pub mod sort;
 
 pub use camera::{Camera, Intrinsics};
 pub use cloud::GaussianCloud;
 pub use pipeline::Rasterizer;
+pub use ply::{load_ply, PlyError};
 
 /// Tile size for the tile-based rasterizer (16×16 pixels per tile).
 pub const TILE_SIZE: u32 = 16;
@@ -100,4 +104,8 @@ pub struct GaussianGradients {
     pub rotations: Vec<[f32; 4]>,
     pub opacities: Vec<f32>,
     pub sh_coeffs: Vec<f32>,
+    /// Intermediate: dL/d(conic) per gaussian, for backward projection.
+    pub _conics: Vec<[f32; 3]>,
+    /// Intermediate: dL/d(mean_2d) per gaussian, for backward projection.
+    pub _means_2d: Vec<[f32; 2]>,
 }

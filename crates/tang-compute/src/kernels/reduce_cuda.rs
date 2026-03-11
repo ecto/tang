@@ -1,4 +1,4 @@
-//! CUDA reduction kernels: softmax, rms_norm.
+//! CUDA reduction kernels: softmax, rms_norm, embedding_gather, reduce_sum.
 
 /// Row-wise softmax. Each block handles one row.
 /// Grid: (n_rows), Block: (min(row_len, 256))
@@ -214,6 +214,158 @@ extern "C" __global__ void rms_norm_bf16(
     // Normalize
     for (unsigned int i = tid; i < dim; i += tg_size) {
         output[base + i] = float_to_bf16(bf16_to_float(input[base + i]) * rms * bf16_to_float(weight[i]));
+    }
+}
+"#;
+
+/// Embedding gather: output[i, d] = weight[ids[i], d].
+/// Each thread handles one element of the [seq_len, dim] output.
+/// Grid: (ceil(seq_len*dim / 256)), Block: (256)
+///
+/// `ids` buffer stores u32 token IDs as f32 bit patterns (via upload_u32).
+/// The kernel casts the pointer to `unsigned int*` to read them directly.
+pub const EMBEDDING_GATHER_CUDA: &str = r#"
+extern "C" __global__ void embedding_gather(
+    const float* __restrict__ weight,
+    const unsigned int* __restrict__ ids,
+    float* __restrict__ output,
+    const unsigned int seq_len,
+    const unsigned int dim)
+{
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = seq_len * dim;
+    if (idx >= total) return;
+
+    unsigned int pos = idx / dim;
+    unsigned int d = idx % dim;
+    unsigned int token_id = ids[pos];
+    output[idx] = weight[token_id * dim + d];
+}
+"#;
+
+/// bf16 embedding gather: weight is bf16, ids is u32, output is bf16.
+/// Each thread copies one bf16 element (no conversion needed, just a gather).
+/// Grid: (ceil(seq_len*dim / 256)), Block: (256)
+pub const EMBEDDING_GATHER_BF16_CUDA: &str = r#"
+extern "C" __global__ void embedding_gather_bf16(
+    const unsigned short* __restrict__ weight,
+    const unsigned int* __restrict__ ids,
+    unsigned short* __restrict__ output,
+    const unsigned int seq_len,
+    const unsigned int dim)
+{
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = seq_len * dim;
+    if (idx >= total) return;
+
+    unsigned int pos = idx / dim;
+    unsigned int d = idx % dim;
+    unsigned int token_id = ids[pos];
+    output[idx] = weight[token_id * dim + d];
+}
+"#;
+
+/// Reduce-sum along an arbitrary axis.
+/// Given tensor with shape decomposed into (outer, axis_len, inner),
+/// each block handles one output element at (outer_idx, inner_idx),
+/// summing axis_len values with shared-memory parallel reduction.
+///
+/// Grid: (outer * inner), Block: (min(axis_len, 256) rounded to power-of-two)
+/// Params: input, output, outer, axis_len, inner
+pub const REDUCE_SUM_CUDA: &str = r#"
+extern "C" __global__ void reduce_sum(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    const unsigned int outer,
+    const unsigned int axis_len,
+    const unsigned int inner)
+{
+    __shared__ float shared[256];
+
+    unsigned int out_idx = blockIdx.x;
+    unsigned int tid = threadIdx.x;
+    unsigned int tg_size = blockDim.x;
+
+    unsigned int total_out = outer * inner;
+    if (out_idx >= total_out) return;
+
+    unsigned int o = out_idx / inner;
+    unsigned int i = out_idx % inner;
+
+    // Each thread accumulates a partial sum over the reduction axis
+    float local_sum = 0.0f;
+    unsigned int base = o * axis_len * inner + i;
+    for (unsigned int a = tid; a < axis_len; a += tg_size) {
+        local_sum += input[base + a * inner];
+    }
+    shared[tid] = local_sum;
+    __syncthreads();
+
+    // Tree reduction in shared memory
+    for (unsigned int s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared[tid] += shared[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        output[out_idx] = shared[0];
+    }
+}
+"#;
+
+/// bf16 reduce-sum along an arbitrary axis.
+/// Input/output are bf16 (unsigned short), reduction in f32.
+pub const REDUCE_SUM_BF16_CUDA: &str = r#"
+__device__ float bf16_to_float(unsigned short bits) {
+    return __int_as_float(((unsigned int)bits) << 16);
+}
+__device__ unsigned short float_to_bf16(float val) {
+    unsigned int bits = __float_as_int(val);
+    unsigned int lsb = (bits >> 16) & 1;
+    bits += 0x7FFF + lsb;
+    return (unsigned short)(bits >> 16);
+}
+
+extern "C" __global__ void reduce_sum_bf16(
+    const unsigned short* __restrict__ input,
+    unsigned short* __restrict__ output,
+    const unsigned int outer,
+    const unsigned int axis_len,
+    const unsigned int inner)
+{
+    __shared__ float shared[256];
+
+    unsigned int out_idx = blockIdx.x;
+    unsigned int tid = threadIdx.x;
+    unsigned int tg_size = blockDim.x;
+
+    unsigned int total_out = outer * inner;
+    if (out_idx >= total_out) return;
+
+    unsigned int o = out_idx / inner;
+    unsigned int i = out_idx % inner;
+
+    // Each thread accumulates a partial sum in f32
+    float local_sum = 0.0f;
+    unsigned int base = o * axis_len * inner + i;
+    for (unsigned int a = tid; a < axis_len; a += tg_size) {
+        local_sum += bf16_to_float(input[base + a * inner]);
+    }
+    shared[tid] = local_sum;
+    __syncthreads();
+
+    // Tree reduction in shared memory
+    for (unsigned int s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared[tid] += shared[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        output[out_idx] = float_to_bf16(shared[0]);
     }
 }
 "#;

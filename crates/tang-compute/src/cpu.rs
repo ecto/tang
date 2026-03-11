@@ -604,6 +604,50 @@ impl ComputeDevice for CpuDevice {
         }
         CpuBuffer { data: out }
     }
+
+    fn add_assign(&self, dst: &mut CpuBuffer, src: &CpuBuffer) {
+        assert_eq!(dst.data.len(), src.data.len());
+        for (d, s) in dst.data.iter_mut().zip(src.data.iter()) {
+            *d += *s;
+        }
+    }
+
+    fn zero_buffer(&self, buf: &mut CpuBuffer) {
+        for v in buf.data.iter_mut() {
+            *v = 0.0;
+        }
+    }
+
+    fn adamw_step(
+        &self,
+        param: &mut CpuBuffer,
+        grad: &CpuBuffer,
+        m: &mut CpuBuffer,
+        v: &mut CpuBuffer,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        weight_decay: f32,
+        step_t: usize,
+    ) {
+        let n = param.data.len();
+        let beta1_pow = beta1.powi(step_t as i32);
+        let beta2_pow = beta2.powi(step_t as i32);
+        for i in 0..n {
+            let g = grad.data[i];
+            // Decoupled weight decay
+            param.data[i] -= lr * weight_decay * param.data[i];
+            // Moment updates
+            m.data[i] = beta1 * m.data[i] + (1.0 - beta1) * g;
+            v.data[i] = beta2 * v.data[i] + (1.0 - beta2) * g * g;
+            // Bias-corrected moments
+            let m_hat = m.data[i] / (1.0 - beta1_pow);
+            let v_hat = v.data[i] / (1.0 - beta2_pow);
+            // Parameter update
+            param.data[i] -= lr * m_hat / (v_hat.sqrt() + eps);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1045,5 +1089,37 @@ mod tests {
                 batched[i], sequential[i]
             );
         }
+    }
+
+    #[test]
+    fn adamw_step_reduces_loss_proxy() {
+        let dev = CpuDevice::new();
+        let mut param = dev.upload(&[1.0, 2.0, 3.0]);
+        let grad = dev.upload(&[0.1, 0.2, 0.3]);
+        let mut m = dev.upload(&[0.0, 0.0, 0.0]);
+        let mut v = dev.upload(&[0.0, 0.0, 0.0]);
+        dev.adamw_step(&mut param, &grad, &mut m, &mut v, 0.001, 0.9, 0.999, 1e-8, 0.01, 1);
+        let p = param.to_vec();
+        // Params should have decreased (positive gradient -> decrease)
+        assert!(p[0] < 1.0);
+        assert!(p[1] < 2.0);
+        assert!(p[2] < 3.0);
+    }
+
+    #[test]
+    fn add_assign_works() {
+        let dev = CpuDevice::new();
+        let mut a = dev.upload(&[1.0, 2.0, 3.0]);
+        let b = dev.upload(&[0.5, 1.0, 1.5]);
+        dev.add_assign(&mut a, &b);
+        assert_eq!(a.to_vec(), vec![1.5, 3.0, 4.5]);
+    }
+
+    #[test]
+    fn zero_buffer_works() {
+        let dev = CpuDevice::new();
+        let mut a = dev.upload(&[1.0, 2.0, 3.0]);
+        dev.zero_buffer(&mut a);
+        assert_eq!(a.to_vec(), vec![0.0, 0.0, 0.0]);
     }
 }

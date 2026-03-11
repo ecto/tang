@@ -9,7 +9,7 @@ description = "HuggingFace Hub model download and loading"
 tang = { workspace = true }
 tang-la = { workspace = true }
 tang-tensor = { workspace = true }
-tang-safetensors = { path = "../tang-safetensors" }
+tang-safetensors = { workspace = true }
 hf-hub = "0.3"
 
 [features]

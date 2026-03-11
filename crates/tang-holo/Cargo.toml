@@ -1,0 +1,16 @@
+[package]
+name = "tang-holo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Talking head hologram pipeline — preprocessing, training, and runtime"
+
+[dependencies]
+tang-3dgs = { workspace = true }
+tang-tensor = { workspace = true }
+serde = { workspace = true }
+bytemuck = { workspace = true }
+image = "0.25"
+
+[dev-dependencies]
+approx = "0.5"

@@ -2,12 +2,13 @@
 name = "tang-site-wasm"
 version = "0.1.0"
 edition = "2021"
+publish = false
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-tang = { path = "../tang" }
+tang = { workspace = true }
 tang-tensor = { workspace = true }
 tang-train = { workspace = true }
 wasm-bindgen = "0.2"
