@@ -348,6 +348,25 @@ pub trait ComputeDevice: Send {
     /// Zero out all elements in a buffer.
     fn zero_buffer(&self, buf: &mut Self::Buffer);
 
+    /// Accumulate sum-of-squares of `src` into `acc` (single f32 buffer, atomicAdd).
+    /// `acc` must be a 1-element buffer, zero-initialized before the first call.
+    fn reduce_sum_sq_accumulate(&self, src: &Self::Buffer, acc: &mut Self::Buffer) {
+        let data = self.download(src);
+        let sq: f32 = data.iter().map(|&v| v * v).sum();
+        let mut a = self.download(acc);
+        a[0] += sq;
+        *acc = self.upload(&a);
+    }
+
+    /// In-place scale: buf[i] *= scale.
+    fn scale_buffer(&self, buf: &mut Self::Buffer, scale: f32) {
+        let mut data = self.download(buf);
+        for v in data.iter_mut() {
+            *v *= scale;
+        }
+        *buf = self.upload(&data);
+    }
+
     /// AdamW optimizer step on a single parameter tensor (in-place on device).
     ///
     /// Updates `param`, `m` (first moment), and `v` (second moment) in-place.

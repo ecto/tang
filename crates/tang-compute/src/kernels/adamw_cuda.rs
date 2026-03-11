@@ -132,3 +132,51 @@ extern "C" __global__ void zero_buffer(
     dst[i] = 0.0f;
 }
 "#;
+
+/// Parallel reduction: sum of squares → atomicAdd into output[0].
+/// Multiple blocks contribute via atomicAdd, so output must be zero-initialized.
+/// Grid: (ceil(n / (256*4))), Block: (256) — each thread handles 4 elements.
+pub const REDUCE_SUM_SQ_CUDA: &str = r#"
+extern "C" __global__ void reduce_sum_sq(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    const unsigned int n)
+{
+    __shared__ float shared[256];
+    unsigned int tid = threadIdx.x;
+    unsigned int idx = blockIdx.x * blockDim.x * 4 + tid;
+
+    float local_sum = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 4; k++) {
+        unsigned int i = idx + k * blockDim.x;
+        if (i < n) {
+            float v = input[i];
+            local_sum += v * v;
+        }
+    }
+    shared[tid] = local_sum;
+    __syncthreads();
+
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) shared[tid] += shared[tid + s];
+        __syncthreads();
+    }
+
+    if (tid == 0) atomicAdd(output, shared[0]);
+}
+"#;
+
+/// In-place scale: data[i] *= scale.
+/// Grid: (ceil(n / 256)), Block: (256)
+pub const SCALE_BUFFER_CUDA: &str = r#"
+extern "C" __global__ void scale_buffer(
+    float* __restrict__ data,
+    const float scale,
+    const unsigned int n)
+{
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    data[i] *= scale;
+}
+"#;

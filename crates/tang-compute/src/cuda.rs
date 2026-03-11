@@ -113,12 +113,16 @@ impl CudaComputeDevice {
         let ctx = CudaContext::new(0)?;
         let stream = ctx.default_stream();
         let cublas = CudaBlas::new(stream.clone()).expect("Failed to create cuBLAS handle");
-        // Enable TF32 tensor cores for f32 matmuls (~2× throughput on Ampere+)
-        unsafe {
-            cudarc::cublas::sys::cublasSetMathMode(
-                *cublas.handle(),
-                cudarc::cublas::sys::cublasMath_t::CUBLAS_TF32_TENSOR_OP_MATH,
-            );
+        // TF32 tensor cores: ~2× matmul throughput on Ampere+ but reduces mantissa
+        // from 23 to 10 bits. Disable by default for training stability.
+        // Enable with GAIA_TF32=1 if needed for inference speed.
+        if std::env::var("GAIA_TF32").map(|v| v == "1").unwrap_or(false) {
+            unsafe {
+                cudarc::cublas::sys::cublasSetMathMode(
+                    *cublas.handle(),
+                    cudarc::cublas::sys::cublasMath_t::CUBLAS_TF32_TENSOR_OP_MATH,
+                );
+            }
         }
         Ok(CudaComputeDevice {
             ctx,
@@ -135,12 +139,16 @@ impl CudaComputeDevice {
         let ctx = CudaContext::new(0)?;
         let stream = ctx.default_stream();
         let cublas = CudaBlas::new(stream.clone()).expect("Failed to create cuBLAS handle");
-        // Enable TF32 tensor cores for f32 matmuls (~2× throughput on Ampere+)
-        unsafe {
-            cudarc::cublas::sys::cublasSetMathMode(
-                *cublas.handle(),
-                cudarc::cublas::sys::cublasMath_t::CUBLAS_TF32_TENSOR_OP_MATH,
-            );
+        // TF32 tensor cores: ~2× matmul throughput on Ampere+ but reduces mantissa
+        // from 23 to 10 bits. Disable by default for training stability.
+        // Enable with GAIA_TF32=1 if needed for inference speed.
+        if std::env::var("GAIA_TF32").map(|v| v == "1").unwrap_or(false) {
+            unsafe {
+                cudarc::cublas::sys::cublasSetMathMode(
+                    *cublas.handle(),
+                    cudarc::cublas::sys::cublasMath_t::CUBLAS_TF32_TENSOR_OP_MATH,
+                );
+            }
         }
         Ok(CudaComputeDevice {
             ctx,
@@ -1165,78 +1173,111 @@ impl ComputeDevice for CudaComputeDevice {
             let v_f32 = if v.is_bf16() { self.upload_f32(&self.download(v)) } else { self.copy_buffer(v) };
             self.causal_attention_backward(&go_f32, &q_f32, &k_f32, &v_f32, seq_len, n_heads, n_kv_heads, head_dim)
         } else {
-            // FlashAttention-2 backward: recompute O, precompute D, then tiled backward.
+            // Check if user requested the simple (non-flash) backward kernel
+            let use_simple_bwd = std::env::var("GAIA_SIMPLE_BWD").map(|v| v == "1").unwrap_or(false);
 
-            // Step 1: Recompute forward output O (flash attention trades compute for memory)
-            let o_buf = self.causal_attention(q, k, v, seq_len, n_heads, n_kv_heads, head_dim);
+            if use_simple_bwd {
+                // Simple backward: stores all scores in shared memory, no O recompute.
+                // Slower but simpler — useful for debugging.
+                let (_module, func) = self.get_func(
+                    backward_cuda::CAUSAL_ATTENTION_BACKWARD_CUDA,
+                    "causal_attention_backward",
+                );
+                // grad_K/V need atomicAdd accumulation across Q positions
+                let mut grad_q = self.alloc_f32(seq_len * total_dim);
+                let mut grad_k = self.alloc_f32(seq_len * kv_dim);
+                let mut grad_v = self.alloc_f32(seq_len * kv_dim);
+                unsafe {
+                    self.stream.launch_builder(&func)
+                        .arg(grad_output.f32_data())
+                        .arg(q.f32_data())
+                        .arg(k.f32_data())
+                        .arg(v.f32_data())
+                        .arg(grad_q.f32_data_mut())
+                        .arg(grad_k.f32_data_mut())
+                        .arg(grad_v.f32_data_mut())
+                        .arg(&seq_len_u32)
+                        .arg(&n_heads_u32)
+                        .arg(&n_kv_heads_u32)
+                        .arg(&head_dim_u32)
+                        .launch(cfg)
+                        .unwrap();
+                }
+                (grad_q, grad_k, grad_v)
+            } else {
+                // FlashAttention-2 backward: recompute O, precompute D, then tiled backward.
 
-            // Step 2: Precompute D[i,h] = sum_d(dO[i,d] * O[i,d])
-            let d_tg = std::cmp::min(head_dim, 256).next_power_of_two();
-            let d_cfg = LaunchConfig {
-                block_dim: (d_tg as u32, 1, 1),
-                grid_dim: (seq_len as u32, n_heads as u32, 1),
-                shared_mem_bytes: (d_tg * 4) as u32,
-            };
-            let (_module, d_func) = self.get_func(
-                backward_cuda::FLASH_ATTN_BWD_PRECOMPUTE_D_CUDA,
-                "flash_attn_bwd_precompute_d",
-            );
-            let mut d_buf = self.alloc_f32(seq_len * n_heads);
-            unsafe {
-                self.stream.launch_builder(&d_func)
-                    .arg(grad_output.f32_data())
-                    .arg(o_buf.f32_data())
-                    .arg(d_buf.f32_data_mut())
-                    .arg(&seq_len_u32)
-                    .arg(&n_heads_u32)
-                    .arg(&head_dim_u32)
-                    .launch(d_cfg)
-                    .unwrap();
+                // Step 1: Recompute forward output O (flash attention trades compute for memory)
+                let o_buf = self.causal_attention(q, k, v, seq_len, n_heads, n_kv_heads, head_dim);
+
+                // Step 2: Precompute D[i,h] = sum_d(dO[i,d] * O[i,d])
+                let d_tg = std::cmp::min(head_dim, 256).next_power_of_two();
+                let d_cfg = LaunchConfig {
+                    block_dim: (d_tg as u32, 1, 1),
+                    grid_dim: (seq_len as u32, n_heads as u32, 1),
+                    shared_mem_bytes: (d_tg * 4) as u32,
+                };
+                let (_module, d_func) = self.get_func(
+                    backward_cuda::FLASH_ATTN_BWD_PRECOMPUTE_D_CUDA,
+                    "flash_attn_bwd_precompute_d",
+                );
+                let mut d_buf = self.alloc_f32(seq_len * n_heads);
+                unsafe {
+                    self.stream.launch_builder(&d_func)
+                        .arg(grad_output.f32_data())
+                        .arg(o_buf.f32_data())
+                        .arg(d_buf.f32_data_mut())
+                        .arg(&seq_len_u32)
+                        .arg(&n_heads_u32)
+                        .arg(&head_dim_u32)
+                        .launch(d_cfg)
+                        .unwrap();
+                }
+
+                // Step 3: Flash backward kernel (v2 — parallelized over heads + Q splits)
+                let tile_kv: usize = 32; // must match FA_BWD_TILE in kernel
+                let n_kv_tiles = (seq_len + tile_kv - 1) / tile_kv;
+                let q_split: usize = 4; // split Q loop across this many blocks
+                let bwd_tg: usize = 128;
+                // smem: dK_acc[TILE*D] + dV_acc[TILE*D] + scores[TILE] + reduce[tg]
+                let smem_bytes = (2 * tile_kv * head_dim + tile_kv + bwd_tg) * 4;
+                let bwd_cfg = LaunchConfig {
+                    block_dim: (bwd_tg as u32, 1, 1),
+                    grid_dim: (n_kv_tiles as u32, n_heads as u32, q_split as u32),
+                    shared_mem_bytes: smem_bytes as u32,
+                };
+                let (_module, bwd_func) = self.get_func(
+                    backward_cuda::CAUSAL_ATTENTION_BACKWARD_FLASH_CUDA,
+                    "causal_attention_backward_flash",
+                );
+
+                // All grads need zero-init (atomicAdd targets from multiple blocks)
+                let mut grad_q = self.alloc_f32(seq_len * total_dim);
+                let mut grad_k = self.alloc_f32(seq_len * kv_dim);
+                let mut grad_v = self.alloc_f32(seq_len * kv_dim);
+
+                let q_split_u32 = q_split as u32;
+                unsafe {
+                    self.stream.launch_builder(&bwd_func)
+                        .arg(grad_output.f32_data())
+                        .arg(q.f32_data())
+                        .arg(k.f32_data())
+                        .arg(v.f32_data())
+                        .arg(d_buf.f32_data())
+                        .arg(grad_q.f32_data_mut())
+                        .arg(grad_k.f32_data_mut())
+                        .arg(grad_v.f32_data_mut())
+                        .arg(&seq_len_u32)
+                        .arg(&n_heads_u32)
+                        .arg(&n_kv_heads_u32)
+                        .arg(&head_dim_u32)
+                        .arg(&q_split_u32)
+                        .launch(bwd_cfg)
+                        .unwrap();
+                }
+
+                (grad_q, grad_k, grad_v)
             }
-
-            // Step 3: Flash backward kernel (v2 — parallelized over heads + Q splits)
-            let tile_kv: usize = 32; // must match FA_BWD_TILE in kernel
-            let n_kv_tiles = (seq_len + tile_kv - 1) / tile_kv;
-            let q_split: usize = 4; // split Q loop across this many blocks
-            let bwd_tg: usize = 128;
-            // smem: dK_acc[TILE*D] + dV_acc[TILE*D] + scores[TILE] + reduce[tg]
-            let smem_bytes = (2 * tile_kv * head_dim + tile_kv + bwd_tg) * 4;
-            let bwd_cfg = LaunchConfig {
-                block_dim: (bwd_tg as u32, 1, 1),
-                grid_dim: (n_kv_tiles as u32, n_heads as u32, q_split as u32),
-                shared_mem_bytes: smem_bytes as u32,
-            };
-            let (_module, bwd_func) = self.get_func(
-                backward_cuda::CAUSAL_ATTENTION_BACKWARD_FLASH_CUDA,
-                "causal_attention_backward_flash",
-            );
-
-            // All grads need zero-init (atomicAdd targets from multiple blocks)
-            let mut grad_q = self.alloc_f32(seq_len * total_dim);
-            let mut grad_k = self.alloc_f32(seq_len * kv_dim);
-            let mut grad_v = self.alloc_f32(seq_len * kv_dim);
-
-            let q_split_u32 = q_split as u32;
-            unsafe {
-                self.stream.launch_builder(&bwd_func)
-                    .arg(grad_output.f32_data())
-                    .arg(q.f32_data())
-                    .arg(k.f32_data())
-                    .arg(v.f32_data())
-                    .arg(d_buf.f32_data())
-                    .arg(grad_q.f32_data_mut())
-                    .arg(grad_k.f32_data_mut())
-                    .arg(grad_v.f32_data_mut())
-                    .arg(&seq_len_u32)
-                    .arg(&n_heads_u32)
-                    .arg(&n_kv_heads_u32)
-                    .arg(&head_dim_u32)
-                    .arg(&q_split_u32)
-                    .launch(bwd_cfg)
-                    .unwrap();
-            }
-
-            (grad_q, grad_k, grad_v)
         }
     }
 
@@ -1717,6 +1758,50 @@ impl ComputeDevice for CudaComputeDevice {
                     .launch(cfg)
                     .unwrap();
             }
+        }
+    }
+
+    fn reduce_sum_sq_accumulate(&self, src: &CudaBuffer, acc: &mut CudaBuffer) {
+        let n = src.len as u32;
+        // 4 elements per thread, 256 threads per block
+        let blocks = (n + 1023) / 1024;
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks, 1, 1),
+            shared_mem_bytes: 256 * 4,
+        };
+        let (_module, func) = self.get_func(
+            crate::kernels::adamw_cuda::REDUCE_SUM_SQ_CUDA,
+            "reduce_sum_sq",
+        );
+        unsafe {
+            self.stream.launch_builder(&func)
+                .arg(src.f32_data())
+                .arg(acc.f32_data_mut())
+                .arg(&n)
+                .launch(cfg)
+                .unwrap();
+        }
+    }
+
+    fn scale_buffer(&self, buf: &mut CudaBuffer, scale: f32) {
+        let n = buf.len as u32;
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: ((n + 255) / 256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (_module, func) = self.get_func(
+            crate::kernels::adamw_cuda::SCALE_BUFFER_CUDA,
+            "scale_buffer",
+        );
+        unsafe {
+            self.stream.launch_builder(&func)
+                .arg(buf.f32_data_mut())
+                .arg(&scale)
+                .arg(&n)
+                .launch(cfg)
+                .unwrap();
         }
     }
 }
