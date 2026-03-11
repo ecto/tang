@@ -34,6 +34,17 @@ pub trait ComputeDevice: Send {
     /// Allocate uninitialized buffer of `len` f32 elements.
     fn alloc(&self, len: usize) -> Self::Buffer;
 
+    /// Upload data as f32 regardless of device precision mode.
+    /// Used for gradient accumulators and optimizer state that need f32 precision.
+    fn upload_f32(&self, data: &[f32]) -> Self::Buffer {
+        self.upload(data)
+    }
+
+    /// Allocate f32 zeros regardless of device precision mode.
+    fn alloc_f32(&self, len: usize) -> Self::Buffer {
+        self.alloc(len)
+    }
+
     /// Download buffer contents to CPU.
     fn download(&self, buf: &Self::Buffer) -> Vec<f32>;
 

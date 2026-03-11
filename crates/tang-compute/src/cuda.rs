@@ -212,6 +212,14 @@ impl ComputeDevice for CudaComputeDevice {
         }
     }
 
+    fn upload_f32(&self, data: &[f32]) -> CudaBuffer {
+        CudaComputeDevice::upload_f32(self, data)
+    }
+
+    fn alloc_f32(&self, len: usize) -> CudaBuffer {
+        CudaComputeDevice::alloc_f32(self, len)
+    }
+
     fn download(&self, buf: &CudaBuffer) -> Vec<f32> {
         buf.to_vec()
     }
@@ -285,6 +293,13 @@ impl ComputeDevice for CudaComputeDevice {
         let cublas_m = n as i32;
         let cublas_n = m as i32;
         let cublas_k = k as i32;
+
+        // Handle mixed types: if one is bf16 and the other f32, convert bf16 to f32
+        if a.is_bf16() != b.is_bf16() {
+            let a_f32 = if a.is_bf16() { self.upload_f32(&self.download(a)) } else { self.copy_buffer(a) };
+            let b_f32 = if b.is_bf16() { self.upload_f32(&self.download(b)) } else { self.copy_buffer(b) };
+            return self.matmul(&a_f32, &b_f32, m, k, n);
+        }
 
         if a.is_bf16() {
             let mut output = self.alloc(m * n);
@@ -1011,7 +1026,13 @@ impl ComputeDevice for CudaComputeDevice {
         let n_kv_heads_u32 = n_kv_heads as u32;
         let head_dim_u32 = head_dim as u32;
 
-        if q.is_bf16() {
+        // For mixed precision backward: grad_output may be f32 while q/k/v are bf16.
+        // Convert any bf16 inputs to f32 and use the f32 flash attention backward path
+        // for better gradient precision.
+        let any_bf16 = q.is_bf16() || k.is_bf16() || v.is_bf16() || grad_output.is_bf16();
+        let all_bf16 = q.is_bf16() && k.is_bf16() && v.is_bf16() && grad_output.is_bf16();
+
+        if all_bf16 {
             let (_module, func) = self.get_func(
                 backward_cuda::CAUSAL_ATTENTION_BACKWARD_BF16_CUDA,
                 "causal_attention_backward_bf16",
@@ -1040,6 +1061,13 @@ impl ComputeDevice for CudaComputeDevice {
             }
 
             (grad_q, grad_k, grad_v)
+        } else if any_bf16 {
+            // Mixed types: convert bf16 inputs to f32, then use f32 path
+            let go_f32 = if grad_output.is_bf16() { self.upload_f32(&self.download(grad_output)) } else { self.copy_buffer(grad_output) };
+            let q_f32 = if q.is_bf16() { self.upload_f32(&self.download(q)) } else { self.copy_buffer(q) };
+            let k_f32 = if k.is_bf16() { self.upload_f32(&self.download(k)) } else { self.copy_buffer(k) };
+            let v_f32 = if v.is_bf16() { self.upload_f32(&self.download(v)) } else { self.copy_buffer(v) };
+            self.causal_attention_backward(&go_f32, &q_f32, &k_f32, &v_f32, seq_len, n_heads, n_kv_heads, head_dim)
         } else {
             // FlashAttention-2 backward: recompute O, precompute D, then tiled backward.
 
@@ -1202,7 +1230,16 @@ impl ComputeDevice for CudaComputeDevice {
         let cublas_n = m as i32;
         let cublas_k = k as i32;
 
-        if a.is_bf16() {
+        // Mixed input types: convert to matching types first
+        if a.is_bf16() != b.is_bf16() {
+            let a_f32 = if a.is_bf16() { self.upload_f32(&self.download(a)) } else { self.copy_buffer(a) };
+            let b_f32 = if b.is_bf16() { self.upload_f32(&self.download(b)) } else { self.copy_buffer(b) };
+            self.matmul_accumulate(&a_f32, &b_f32, c, m, k, n);
+            return;
+        }
+
+        if a.is_bf16() && c.is_bf16() {
+            // All bf16: bf16 gemm_ex with beta=1 accumulate
             let alpha: f32 = 1.0;
             let beta: f32 = 1.0;
             {
@@ -1223,6 +1260,30 @@ impl ComputeDevice for CudaComputeDevice {
                         cudarc::cublas::sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
                         cudarc::cublas::sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
                     ).expect("cuBLAS bf16 gemm_ex accumulate failed");
+                }
+            }
+        } else if a.is_bf16() && !c.is_bf16() {
+            // bf16 inputs, f32 accumulator: gemm_ex with bf16 A/B, f32 C
+            let alpha: f32 = 1.0;
+            let beta: f32 = 1.0;
+            {
+                let (b_ptr, _rec_b) = b.bf16_data().device_ptr(&self.stream);
+                let (a_ptr, _rec_a) = a.bf16_data().device_ptr(&self.stream);
+                let (c_ptr, _rec_c) = c.f32_data_mut().device_ptr_mut(&self.stream);
+                unsafe {
+                    cudarc::cublas::result::gemm_ex(
+                        *self.cublas.handle(),
+                        cublasOperation_t::CUBLAS_OP_N,
+                        cublasOperation_t::CUBLAS_OP_N,
+                        cublas_m, cublas_n, cublas_k,
+                        (&alpha) as *const f32 as *const _,
+                        b_ptr as *const _, cudarc::cublas::sys::cudaDataType_t::CUDA_R_16BF, cublas_m,
+                        a_ptr as *const _, cudarc::cublas::sys::cudaDataType_t::CUDA_R_16BF, cublas_k,
+                        (&beta) as *const f32 as *const _,
+                        c_ptr as *mut _, cudarc::cublas::sys::cudaDataType_t::CUDA_R_32F, cublas_m,
+                        cudarc::cublas::sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                        cudarc::cublas::sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                    ).expect("cuBLAS mixed bf16→f32 gemm_ex accumulate failed");
                 }
             }
         } else {
@@ -1269,7 +1330,7 @@ impl ComputeDevice for CudaComputeDevice {
         let n_groups_u32 = n_groups as u32;
         let dim_u32 = dim as u32;
 
-        if input.is_bf16() {
+        if input.is_bf16() && grad_output.is_bf16() {
             let (_module, func) = self.get_func(backward_cuda::RMS_NORM_BACKWARD_BF16_CUDA, "rms_norm_backward_bf16");
             let mut grad_input = self.alloc(n_groups * dim);
             unsafe {
@@ -1286,6 +1347,12 @@ impl ComputeDevice for CudaComputeDevice {
                     .unwrap();
             }
             grad_input
+        } else if input.is_bf16() || weight.is_bf16() || grad_output.is_bf16() {
+            // Mixed types: convert bf16 inputs to f32
+            let input_f32 = if input.is_bf16() { self.upload_f32(&self.download(input)) } else { self.copy_buffer(input) };
+            let weight_f32 = if weight.is_bf16() { self.upload_f32(&self.download(weight)) } else { self.copy_buffer(weight) };
+            let grad_f32 = if grad_output.is_bf16() { self.upload_f32(&self.download(grad_output)) } else { self.copy_buffer(grad_output) };
+            self.rms_norm_backward_accumulate(&input_f32, &weight_f32, &grad_f32, n_groups, dim, eps, grad_weight_acc)
         } else {
             let (_module, func) = self.get_func(backward_cuda::RMS_NORM_BACKWARD_CUDA, "rms_norm_backward");
             let mut grad_input = self.alloc(n_groups * dim);
@@ -1390,17 +1457,42 @@ impl ComputeDevice for CudaComputeDevice {
             grid_dim: ((n + 255) / 256, 1, 1),
             shared_mem_bytes: 0,
         };
-        let (_module, func) = self.get_func(
-            crate::kernels::adamw_cuda::ADD_ASSIGN_CUDA,
-            "add_assign",
-        );
-        unsafe {
-            self.stream.launch_builder(&func)
-                .arg(dst.f32_data_mut())
-                .arg(src.f32_data())
-                .arg(&n)
-                .launch(cfg)
-                .unwrap();
+        match (&mut dst.storage, &src.storage) {
+            (CudaStorage::F32(d), CudaStorage::F32(s)) => {
+                let (_module, func) = self.get_func(
+                    crate::kernels::adamw_cuda::ADD_ASSIGN_CUDA,
+                    "add_assign",
+                );
+                unsafe {
+                    self.stream.launch_builder(&func)
+                        .arg(d)
+                        .arg(s)
+                        .arg(&n)
+                        .launch(cfg)
+                        .unwrap();
+                }
+            }
+            (CudaStorage::F32(d), CudaStorage::Bf16(s)) => {
+                let (_module, func) = self.get_func(
+                    crate::kernels::adamw_cuda::ADD_ASSIGN_BF16_TO_F32_CUDA,
+                    "add_assign_bf16_to_f32",
+                );
+                unsafe {
+                    self.stream.launch_builder(&func)
+                        .arg(d)
+                        .arg(s)
+                        .arg(&n)
+                        .launch(cfg)
+                        .unwrap();
+                }
+            }
+            _ => {
+                // bf16 += bf16 or bf16 += f32: convert via CPU for now
+                let d = self.download(dst);
+                let s = self.download(src);
+                let result: Vec<f32> = d.iter().zip(s.iter()).map(|(a, b)| a + b).collect();
+                *dst = self.upload(&result);
+            }
         }
     }
 
@@ -1437,26 +1529,50 @@ impl ComputeDevice for CudaComputeDevice {
             grid_dim: ((n + 255) / 256, 1, 1),
             shared_mem_bytes: 0,
         };
-        let (_module, func) = self.get_func(
-            crate::kernels::adamw_cuda::ADAMW_STEP_CUDA,
-            "adamw_step",
-        );
-        unsafe {
-            self.stream.launch_builder(&func)
-                .arg(param.f32_data_mut())
-                .arg(grad.f32_data())
-                .arg(m.f32_data_mut())
-                .arg(v.f32_data_mut())
-                .arg(&lr)
-                .arg(&beta1)
-                .arg(&beta2)
-                .arg(&eps)
-                .arg(&weight_decay)
-                .arg(&beta1_pow)
-                .arg(&beta2_pow)
-                .arg(&n)
-                .launch(cfg)
-                .unwrap();
+        if param.is_bf16() {
+            let (_module, func) = self.get_func(
+                crate::kernels::adamw_cuda::ADAMW_STEP_BF16_CUDA,
+                "adamw_step_bf16",
+            );
+            unsafe {
+                self.stream.launch_builder(&func)
+                    .arg(param.bf16_data_mut())
+                    .arg(grad.f32_data())
+                    .arg(m.f32_data_mut())
+                    .arg(v.f32_data_mut())
+                    .arg(&lr)
+                    .arg(&beta1)
+                    .arg(&beta2)
+                    .arg(&eps)
+                    .arg(&weight_decay)
+                    .arg(&beta1_pow)
+                    .arg(&beta2_pow)
+                    .arg(&n)
+                    .launch(cfg)
+                    .unwrap();
+            }
+        } else {
+            let (_module, func) = self.get_func(
+                crate::kernels::adamw_cuda::ADAMW_STEP_CUDA,
+                "adamw_step",
+            );
+            unsafe {
+                self.stream.launch_builder(&func)
+                    .arg(param.f32_data_mut())
+                    .arg(grad.f32_data())
+                    .arg(m.f32_data_mut())
+                    .arg(v.f32_data_mut())
+                    .arg(&lr)
+                    .arg(&beta1)
+                    .arg(&beta2)
+                    .arg(&eps)
+                    .arg(&weight_decay)
+                    .arg(&beta1_pow)
+                    .arg(&beta2_pow)
+                    .arg(&n)
+                    .launch(cfg)
+                    .unwrap();
+            }
         }
     }
 }
