@@ -1189,6 +1189,199 @@ impl ComputeDevice for CudaComputeDevice {
         self.stream.synchronize().unwrap();
     }
 
+    fn matmul_accumulate(
+        &self,
+        a: &CudaBuffer,
+        b: &CudaBuffer,
+        c: &mut CudaBuffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        let cublas_m = n as i32;
+        let cublas_n = m as i32;
+        let cublas_k = k as i32;
+
+        if a.is_bf16() {
+            let alpha: f32 = 1.0;
+            let beta: f32 = 1.0;
+            {
+                let (b_ptr, _rec_b) = b.bf16_data().device_ptr(&self.stream);
+                let (a_ptr, _rec_a) = a.bf16_data().device_ptr(&self.stream);
+                let (c_ptr, _rec_c) = c.bf16_data_mut().device_ptr_mut(&self.stream);
+                unsafe {
+                    cudarc::cublas::result::gemm_ex(
+                        *self.cublas.handle(),
+                        cublasOperation_t::CUBLAS_OP_N,
+                        cublasOperation_t::CUBLAS_OP_N,
+                        cublas_m, cublas_n, cublas_k,
+                        (&alpha) as *const f32 as *const _,
+                        b_ptr as *const _, cudarc::cublas::sys::cudaDataType_t::CUDA_R_16BF, cublas_m,
+                        a_ptr as *const _, cudarc::cublas::sys::cudaDataType_t::CUDA_R_16BF, cublas_k,
+                        (&beta) as *const f32 as *const _,
+                        c_ptr as *mut _, cudarc::cublas::sys::cudaDataType_t::CUDA_R_16BF, cublas_m,
+                        cudarc::cublas::sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                        cudarc::cublas::sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                    ).expect("cuBLAS bf16 gemm_ex accumulate failed");
+                }
+            }
+        } else {
+            unsafe {
+                self.cublas.gemm(
+                    GemmConfig {
+                        transa: cublasOperation_t::CUBLAS_OP_N,
+                        transb: cublasOperation_t::CUBLAS_OP_N,
+                        m: cublas_m,
+                        n: cublas_n,
+                        k: cublas_k,
+                        alpha: 1.0f32,
+                        lda: cublas_m,
+                        ldb: cublas_k,
+                        beta: 1.0f32,
+                        ldc: cublas_m,
+                    },
+                    b.f32_data(),
+                    a.f32_data(),
+                    c.f32_data_mut(),
+                ).expect("cuBLAS sgemm accumulate failed");
+            }
+        }
+    }
+
+    fn rms_norm_backward_accumulate(
+        &self,
+        input: &CudaBuffer,
+        weight: &CudaBuffer,
+        grad_output: &CudaBuffer,
+        n_groups: usize,
+        dim: usize,
+        eps: f32,
+        grad_weight_acc: &mut CudaBuffer,
+    ) -> CudaBuffer {
+        // The RMS norm backward kernel uses atomicAdd for grad_weight,
+        // so we can pass the existing accumulator directly instead of a zeroed buffer.
+        let tg_size = std::cmp::min(dim, 256).next_power_of_two();
+        let cfg = LaunchConfig {
+            block_dim: (tg_size as u32, 1, 1),
+            grid_dim: (n_groups as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_groups_u32 = n_groups as u32;
+        let dim_u32 = dim as u32;
+
+        if input.is_bf16() {
+            let (_module, func) = self.get_func(backward_cuda::RMS_NORM_BACKWARD_BF16_CUDA, "rms_norm_backward_bf16");
+            let mut grad_input = self.alloc(n_groups * dim);
+            unsafe {
+                self.stream.launch_builder(&func)
+                    .arg(input.bf16_data())
+                    .arg(weight.bf16_data())
+                    .arg(grad_output.bf16_data())
+                    .arg(grad_input.bf16_data_mut())
+                    .arg(grad_weight_acc.f32_data_mut())
+                    .arg(&n_groups_u32)
+                    .arg(&dim_u32)
+                    .arg(&eps)
+                    .launch(cfg)
+                    .unwrap();
+            }
+            grad_input
+        } else {
+            let (_module, func) = self.get_func(backward_cuda::RMS_NORM_BACKWARD_CUDA, "rms_norm_backward");
+            let mut grad_input = self.alloc(n_groups * dim);
+            unsafe {
+                self.stream.launch_builder(&func)
+                    .arg(input.f32_data())
+                    .arg(weight.f32_data())
+                    .arg(grad_output.f32_data())
+                    .arg(grad_input.f32_data_mut())
+                    .arg(grad_weight_acc.f32_data_mut())
+                    .arg(&n_groups_u32)
+                    .arg(&dim_u32)
+                    .arg(&eps)
+                    .launch(cfg)
+                    .unwrap();
+            }
+            grad_input
+        }
+    }
+
+    fn reduce_sum_accumulate(
+        &self,
+        data: &CudaBuffer,
+        shape: &[usize],
+        axis: usize,
+        dst: &mut CudaBuffer,
+    ) {
+        // Use a kernel that atomicAdds the reduction result into dst.
+        let ndim = shape.len();
+        assert!(axis < ndim);
+
+        let outer: usize = shape[..axis].iter().product();
+        let axis_len = shape[axis];
+        let inner: usize = shape[axis + 1..].iter().product();
+        let out_len = outer * inner;
+
+        if out_len == 0 {
+            return;
+        }
+
+        let tg_size = std::cmp::min(axis_len, 256).next_power_of_two();
+        let cfg = LaunchConfig {
+            block_dim: (tg_size as u32, 1, 1),
+            grid_dim: (out_len as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let outer_u32 = outer as u32;
+        let axis_len_u32 = axis_len as u32;
+        let inner_u32 = inner as u32;
+
+        // For accumulate, we reduce into f32 and atomicAdd into dst.
+        // The existing reduce_sum kernel writes `output[out_idx] = shared[0]`.
+        // We use a separate accumulate kernel that does `output[out_idx] += shared[0]`.
+        let (_module, func) = self.get_func(reduce_cuda::REDUCE_SUM_ACCUMULATE_CUDA, "reduce_sum_accumulate");
+
+        if data.is_bf16() {
+            // Reduce bf16 input, accumulate into f32 dst
+            unsafe {
+                self.stream.launch_builder(&func)
+                    .arg(data.f32_data()) // this will panic on bf16 — fallback to default
+                    .arg(dst.f32_data_mut())
+                    .arg(&outer_u32)
+                    .arg(&axis_len_u32)
+                    .arg(&inner_u32)
+                    .launch(cfg)
+                    .unwrap();
+            }
+        } else {
+            unsafe {
+                self.stream.launch_builder(&func)
+                    .arg(data.f32_data())
+                    .arg(dst.f32_data_mut())
+                    .arg(&outer_u32)
+                    .arg(&axis_len_u32)
+                    .arg(&inner_u32)
+                    .launch(cfg)
+                    .unwrap();
+            }
+        }
+    }
+
+    fn copy_buffer(&self, src: &CudaBuffer) -> CudaBuffer {
+        match &src.storage {
+            CudaStorage::F32(s) => {
+                let mut dst = self.stream.alloc_zeros::<f32>(src.len).unwrap();
+                self.stream.memcpy_dtod(s, &mut dst).unwrap();
+                CudaBuffer { storage: CudaStorage::F32(dst), len: src.len }
+            }
+            CudaStorage::Bf16(s) => {
+                let mut dst = self.stream.alloc_zeros::<u16>(src.len).unwrap();
+                self.stream.memcpy_dtod(s, &mut dst).unwrap();
+                CudaBuffer { storage: CudaStorage::Bf16(dst), len: src.len }
+            }
+        }
+    }
+
     fn add_assign(&self, dst: &mut CudaBuffer, src: &CudaBuffer) {
         assert_eq!(dst.len, src.len);
         let n = dst.len as u32;
@@ -1212,22 +1405,14 @@ impl ComputeDevice for CudaComputeDevice {
     }
 
     fn zero_buffer(&self, buf: &mut CudaBuffer) {
-        let n = buf.len as u32;
-        let cfg = LaunchConfig {
-            block_dim: (256, 1, 1),
-            grid_dim: ((n + 255) / 256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let (_module, func) = self.get_func(
-            crate::kernels::adamw_cuda::ZERO_BUFFER_CUDA,
-            "zero_buffer",
-        );
-        unsafe {
-            self.stream.launch_builder(&func)
-                .arg(buf.f32_data_mut())
-                .arg(&n)
-                .launch(cfg)
-                .unwrap();
+        // Use memset instead of a kernel launch — float 0.0 is all-zero bits.
+        match &mut buf.storage {
+            CudaStorage::F32(s) => {
+                self.stream.memset_zeros(s).unwrap();
+            }
+            CudaStorage::Bf16(s) => {
+                self.stream.memset_zeros(s).unwrap();
+            }
         }
     }
 

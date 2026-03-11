@@ -232,6 +232,52 @@ pub trait ComputeDevice: Send {
         self.upload(&out)
     }
 
+    /// Matrix multiply with accumulation: C[m,n] += A[m,k] * B[k,n].
+    ///
+    /// Unlike `matmul`, this adds to `c` instead of overwriting it.
+    fn matmul_accumulate(
+        &self,
+        a: &Self::Buffer,
+        b: &Self::Buffer,
+        c: &mut Self::Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        let tmp = self.matmul(a, b, m, k, n);
+        self.add_assign(c, &tmp);
+    }
+
+    /// Reduce sum along an axis, accumulating into dst: dst += reduce_sum(data, shape, axis).
+    fn reduce_sum_accumulate(
+        &self,
+        data: &Self::Buffer,
+        shape: &[usize],
+        axis: usize,
+        dst: &mut Self::Buffer,
+    ) {
+        let tmp = self.reduce_sum(data, shape, axis);
+        self.add_assign(dst, &tmp);
+    }
+
+    /// Backward pass for RMS normalization, accumulating grad_weight into an existing buffer.
+    ///
+    /// Returns grad_input. grad_weight is accumulated (+=) into `grad_weight_acc`.
+    fn rms_norm_backward_accumulate(
+        &self,
+        input: &Self::Buffer,
+        weight: &Self::Buffer,
+        grad_output: &Self::Buffer,
+        n_groups: usize,
+        dim: usize,
+        eps: f32,
+        grad_weight_acc: &mut Self::Buffer,
+    ) -> Self::Buffer {
+        let (gi, gw) = self.rms_norm_backward(input, weight, grad_output, n_groups, dim, eps);
+        self.add_assign(grad_weight_acc, &gw);
+        gi
+    }
+
     /// In-place element-wise addition: dst[i] += src[i].
     fn add_assign(&self, dst: &mut Self::Buffer, src: &Self::Buffer);
 

@@ -157,6 +157,34 @@ impl<B: ComputeBuffer> Linear<B> {
 
         (grad_input, gw_buf, gb_buf)
     }
+
+    /// Backward pass accumulating weight/bias gradients directly into existing buffers.
+    ///
+    /// Takes the cached input as a raw buffer reference (no LinearCache needed).
+    /// Uses `matmul_accumulate` (beta=1.0 gemm) and `reduce_sum_accumulate` to avoid
+    /// temporary allocations and extra add_assign kernels.
+    pub fn backward_2d_accumulate<D: ComputeDevice<Buffer = B>>(
+        &self,
+        dev: &D,
+        grad_output: &ComputeTensor<B>,
+        cached_input: &B,
+        batch: usize,
+        grad_weight_acc: &mut B,
+        grad_bias_acc: &mut B,
+    ) -> ComputeTensor<B> {
+        // grad_input = grad_output @ W
+        let gi_buf = dev.matmul(&grad_output.buffer, &self.weight.buffer, batch, self.out_features, self.in_features);
+        let grad_input = ComputeTensor::from_buffer(gi_buf, vec![batch, self.in_features]);
+
+        // grad_weight += grad_output^T @ input (accumulated via beta=1.0 gemm)
+        let go_t = dev.transpose_2d(&grad_output.buffer, batch, self.out_features);
+        dev.matmul_accumulate(&go_t, cached_input, grad_weight_acc, self.out_features, batch, self.in_features);
+
+        // grad_bias += sum(grad_output, axis=0)
+        dev.reduce_sum_accumulate(&grad_output.buffer, &[batch, self.out_features], 0, grad_bias_acc);
+
+        grad_input
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -247,6 +275,25 @@ impl<B: ComputeBuffer> RMSNorm<B> {
         );
         let grad_input = ComputeTensor::from_buffer(gi_buf, grad_output.shape().to_vec());
         (grad_input, gw_buf)
+    }
+
+    /// Backward pass accumulating grad_weight directly into an existing buffer.
+    ///
+    /// The CUDA kernel already uses atomicAdd for grad_weight, so we pass the
+    /// accumulator directly instead of allocating a zeroed buffer and add_assign'ing.
+    pub fn backward_accumulate<D: ComputeDevice<Buffer = B>>(
+        &self,
+        dev: &D,
+        grad_output: &ComputeTensor<B>,
+        cache: &RMSNormCache<B>,
+        grad_weight_acc: &mut B,
+    ) -> ComputeTensor<B> {
+        let n_groups = grad_output.numel() / self.dim;
+        let gi_buf = dev.rms_norm_backward_accumulate(
+            &cache.input, &self.weight.buffer, &grad_output.buffer,
+            n_groups, self.dim, self.eps, grad_weight_acc,
+        );
+        ComputeTensor::from_buffer(gi_buf, grad_output.shape().to_vec())
     }
 }
 
@@ -749,5 +796,68 @@ mod tests {
         let v = out.to_vec();
         // At position 5, rotation should change the values
         assert!((v[0] - 1.0).abs() > 1e-3 || (v[1]).abs() > 1e-3);
+    }
+
+    #[test]
+    fn linear_backward_accumulate_matches_device() {
+        let dev = CpuDevice::new();
+        let lin = Linear::new(&dev, &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0], &[0.1, 0.2, 0.3], 2, 3);
+        let x = ComputeTensor::from_data(&dev, &[2.0, 3.0, 1.0, 4.0], &[2, 2]);
+        let (_, cache) = lin.forward_2d_train(&dev, &x);
+        let grad_out = ComputeTensor::from_data(&dev, &[1.0; 6], &[2, 3]);
+
+        // Reference: backward_2d_device
+        let (gi_ref, gw_ref, gb_ref) = lin.backward_2d_device(&dev, &grad_out, &cache);
+
+        // Accumulate into pre-existing values (0.5 each)
+        let mut gw_acc = dev.upload(&vec![0.5; 6]);
+        let mut gb_acc = dev.upload(&vec![0.5; 3]);
+        let cached_input = dev.copy_buffer(&cache.input);
+        let gi_acc = lin.backward_2d_accumulate(
+            &dev, &grad_out, &cached_input, cache.batch,
+            &mut gw_acc, &mut gb_acc,
+        );
+
+        // grad_input should match exactly
+        assert_eq!(gi_ref.to_vec(), gi_acc.to_vec());
+
+        // grad_weight/bias should be reference + 0.5
+        let gw_ref_v = gw_ref.to_vec();
+        let gw_acc_v = gw_acc.to_vec();
+        for i in 0..6 {
+            assert!((gw_acc_v[i] - (gw_ref_v[i] + 0.5)).abs() < 1e-5,
+                "gw mismatch at {}: {} vs {}", i, gw_acc_v[i], gw_ref_v[i] + 0.5);
+        }
+        let gb_ref_v = gb_ref.to_vec();
+        let gb_acc_v = gb_acc.to_vec();
+        for i in 0..3 {
+            assert!((gb_acc_v[i] - (gb_ref_v[i] + 0.5)).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn rms_norm_backward_accumulate_matches_device() {
+        let dev = CpuDevice::new();
+        let norm = RMSNorm::new(&dev, 3, 1e-5);
+        let x = ComputeTensor::from_data(&dev, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        let (_, cache) = norm.forward_train(&dev, &x);
+        let grad_out = ComputeTensor::from_data(&dev, &[1.0; 6], &[2, 3]);
+
+        // Reference: backward_device
+        let (gi_ref, gw_ref) = norm.backward_device(&dev, &grad_out, &cache);
+
+        // Accumulate into pre-existing values (0.5 each)
+        let mut gw_acc = dev.upload(&vec![0.5; 3]);
+        let cache2 = RMSNormCache { input: dev.copy_buffer(&cache.input) };
+        let gi_acc = norm.backward_accumulate(&dev, &grad_out, &cache2, &mut gw_acc);
+
+        assert_eq!(gi_ref.to_vec(), gi_acc.to_vec());
+
+        let gw_ref_v = gw_ref.to_vec();
+        let gw_acc_v = gw_acc.to_vec();
+        for i in 0..3 {
+            assert!((gw_acc_v[i] - (gw_ref_v[i] + 0.5)).abs() < 1e-5,
+                "gw mismatch at {}: {} vs {}", i, gw_acc_v[i], gw_ref_v[i] + 0.5);
+        }
     }
 }
