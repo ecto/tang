@@ -30,3 +30,6 @@ pub mod backward_cuda;
 
 #[cfg(feature = "cuda")]
 pub mod adamw_cuda;
+
+#[cfg(feature = "cuda")]
+pub mod util_cuda;

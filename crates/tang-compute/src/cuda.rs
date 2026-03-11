@@ -12,7 +12,7 @@ use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStrea
 use cudarc::nvrtc;
 
 use crate::device::{ComputeBuffer, ComputeDevice};
-use crate::kernels::{attention_cuda, backward_cuda, reduce_cuda};
+use crate::kernels::{attention_cuda, backward_cuda, reduce_cuda, util_cuda};
 use tang_expr::codegen::Dialect;
 use tang_expr::node::ExprId;
 use tang_expr::trace;
@@ -113,6 +113,13 @@ impl CudaComputeDevice {
         let ctx = CudaContext::new(0)?;
         let stream = ctx.default_stream();
         let cublas = CudaBlas::new(stream.clone()).expect("Failed to create cuBLAS handle");
+        // Enable TF32 tensor cores for f32 matmuls (~2× throughput on Ampere+)
+        unsafe {
+            cudarc::cublas::sys::cublasSetMathMode(
+                *cublas.handle(),
+                cudarc::cublas::sys::cublasMath_t::CUBLAS_TF32_TENSOR_OP_MATH,
+            );
+        }
         Ok(CudaComputeDevice {
             ctx,
             stream,
@@ -128,6 +135,13 @@ impl CudaComputeDevice {
         let ctx = CudaContext::new(0)?;
         let stream = ctx.default_stream();
         let cublas = CudaBlas::new(stream.clone()).expect("Failed to create cuBLAS handle");
+        // Enable TF32 tensor cores for f32 matmuls (~2× throughput on Ampere+)
+        unsafe {
+            cudarc::cublas::sys::cublasSetMathMode(
+                *cublas.handle(),
+                cudarc::cublas::sys::cublasMath_t::CUBLAS_TF32_TENSOR_OP_MATH,
+            );
+        }
         Ok(CudaComputeDevice {
             ctx,
             stream,
@@ -175,6 +189,88 @@ impl CudaComputeDevice {
     fn upload_f32(&self, data: &[f32]) -> CudaBuffer {
         let slice = self.stream.memcpy_stod(data).unwrap();
         CudaBuffer { storage: CudaStorage::F32(slice), len: data.len() }
+    }
+
+    /// Extract columns [col_start, col_start + col_count) from a [batch, total_cols] matrix.
+    /// Returns a contiguous [batch, col_count] buffer.
+    pub fn extract_columns(
+        &self,
+        buf: &CudaBuffer,
+        batch: usize,
+        total_cols: usize,
+        col_start: usize,
+        col_count: usize,
+    ) -> CudaBuffer {
+        let total = batch * col_count;
+        let tg = 256;
+        let cfg = LaunchConfig {
+            block_dim: (tg as u32, 1, 1),
+            grid_dim: (((total + tg - 1) / tg) as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (_module, func) = self.get_func(
+            util_cuda::EXTRACT_COLUMNS_CUDA,
+            "extract_columns",
+        );
+        let mut out = self.alloc_f32(total);
+        let batch_u32 = batch as u32;
+        let total_cols_u32 = total_cols as u32;
+        let col_start_u32 = col_start as u32;
+        let col_count_u32 = col_count as u32;
+        unsafe {
+            self.stream.launch_builder(&func)
+                .arg(buf.f32_data())
+                .arg(out.f32_data_mut())
+                .arg(&batch_u32)
+                .arg(&total_cols_u32)
+                .arg(&col_start_u32)
+                .arg(&col_count_u32)
+                .launch(cfg)
+                .unwrap();
+        }
+        out
+    }
+
+    /// Fused residual add + RMS normalization.
+    /// Computes `rms_norm(input + residual, weight, eps)`.
+    /// Returns `(normed_output, pre_norm_sum)` — the sum is needed for backward.
+    pub fn rms_norm_residual(
+        &self,
+        input: &CudaBuffer,
+        residual: &CudaBuffer,
+        weight: &CudaBuffer,
+        n_groups: usize,
+        dim: usize,
+        eps: f32,
+    ) -> (CudaBuffer, CudaBuffer) {
+        let tg = std::cmp::min(dim, 256).next_power_of_two();
+        let cfg = LaunchConfig {
+            block_dim: (tg as u32, 1, 1),
+            grid_dim: (n_groups as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (_module, func) = self.get_func(
+            util_cuda::RMS_NORM_RESIDUAL_CUDA,
+            "rms_norm_residual",
+        );
+        let mut output = self.alloc_f32(n_groups * dim);
+        let mut sum_out = self.alloc_f32(n_groups * dim);
+        let n_groups_u32 = n_groups as u32;
+        let dim_u32 = dim as u32;
+        unsafe {
+            self.stream.launch_builder(&func)
+                .arg(input.f32_data())
+                .arg(residual.f32_data())
+                .arg(weight.f32_data())
+                .arg(output.f32_data_mut())
+                .arg(sum_out.f32_data_mut())
+                .arg(&n_groups_u32)
+                .arg(&dim_u32)
+                .arg(&eps)
+                .launch(cfg)
+                .unwrap();
+        }
+        (output, sum_out)
     }
 }
 
@@ -1449,6 +1545,52 @@ impl ComputeDevice for CudaComputeDevice {
                 CudaBuffer { storage: CudaStorage::Bf16(dst), len: src.len }
             }
         }
+    }
+
+    fn extract_columns(
+        &self,
+        buf: &CudaBuffer,
+        batch: usize,
+        total_cols: usize,
+        col_start: usize,
+        col_count: usize,
+    ) -> CudaBuffer {
+        CudaComputeDevice::extract_columns(self, buf, batch, total_cols, col_start, col_count)
+    }
+
+    fn rms_norm_residual(
+        &self,
+        input: &CudaBuffer,
+        residual: &CudaBuffer,
+        weight: &CudaBuffer,
+        n_groups: usize,
+        dim: usize,
+        eps: f32,
+    ) -> (CudaBuffer, CudaBuffer) {
+        CudaComputeDevice::rms_norm_residual(self, input, residual, weight, n_groups, dim, eps)
+    }
+
+    fn bias_add(&self, matrix: &CudaBuffer, bias: &CudaBuffer, numel: usize, dim: usize) -> CudaBuffer {
+        let numel_u32 = numel as u32;
+        let dim_u32 = dim as u32;
+        let mut output = self.alloc_f32(numel);
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: ((numel_u32 + 255) / 256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (_module, func) = self.get_func(util_cuda::BIAS_ADD_CUDA, "bias_add");
+        unsafe {
+            self.stream.launch_builder(&func)
+                .arg(matrix.f32_data())
+                .arg(bias.f32_data())
+                .arg(output.f32_data_mut())
+                .arg(&numel_u32)
+                .arg(&dim_u32)
+                .launch(cfg)
+                .unwrap();
+        }
+        output
     }
 
     fn add_assign(&self, dst: &mut CudaBuffer, src: &CudaBuffer) {

@@ -289,6 +289,59 @@ pub trait ComputeDevice: Send {
         gi
     }
 
+    /// Extract columns [col_start, col_start + col_count) from a [batch, total_cols] matrix.
+    /// Returns a contiguous [batch, col_count] buffer.
+    fn extract_columns(
+        &self,
+        buf: &Self::Buffer,
+        batch: usize,
+        total_cols: usize,
+        col_start: usize,
+        col_count: usize,
+    ) -> Self::Buffer {
+        let data = buf.to_vec();
+        let mut out = Vec::with_capacity(batch * col_count);
+        for row in 0..batch {
+            let row_start = row * total_cols + col_start;
+            out.extend_from_slice(&data[row_start..row_start + col_count]);
+        }
+        self.upload(&out)
+    }
+
+    /// Fused residual add + RMS normalization.
+    /// Computes `rms_norm(input + residual, weight, eps)`.
+    /// Returns `(normed_output, pre_norm_sum)`.
+    fn rms_norm_residual(
+        &self,
+        input: &Self::Buffer,
+        residual: &Self::Buffer,
+        weight: &Self::Buffer,
+        n_groups: usize,
+        dim: usize,
+        eps: f32,
+    ) -> (Self::Buffer, Self::Buffer) {
+        // Default: compute on CPU
+        let input_data = input.to_vec();
+        let residual_data = residual.to_vec();
+        let weight_data = weight.to_vec();
+        let mut sum_out = vec![0.0f32; n_groups * dim];
+        let mut output = vec![0.0f32; n_groups * dim];
+        for g in 0..n_groups {
+            let base = g * dim;
+            let mut sq_sum = 0.0f32;
+            for i in 0..dim {
+                let v = input_data[base + i] + residual_data[base + i];
+                sum_out[base + i] = v;
+                sq_sum += v * v;
+            }
+            let inv_rms = 1.0 / (sq_sum / dim as f32 + eps).sqrt();
+            for i in 0..dim {
+                output[base + i] = sum_out[base + i] * inv_rms * weight_data[i];
+            }
+        }
+        (self.upload(&output), self.upload(&sum_out))
+    }
+
     /// In-place element-wise addition: dst[i] += src[i].
     fn add_assign(&self, dst: &mut Self::Buffer, src: &Self::Buffer);
 
