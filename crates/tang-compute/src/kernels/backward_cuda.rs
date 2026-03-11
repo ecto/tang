@@ -637,6 +637,218 @@ extern "C" __global__ void cross_entropy_fwd_bwd_bf16(
 }
 "#;
 
+// ---------------------------------------------------------------------------
+// FlashAttention-2 backward kernels (tiled, no O(N) shared memory)
+// ---------------------------------------------------------------------------
+
+/// Precompute D[i,h] = sum_d(dO[i,h,d] * O[i,h,d]) for the flash backward.
+/// Grid: (seq_len, n_heads), Block: (min(head_dim, 256))
+pub const FLASH_ATTN_BWD_PRECOMPUTE_D_CUDA: &str = r#"
+extern "C" __global__ void flash_attn_bwd_precompute_d(
+    const float* __restrict__ dO,
+    const float* __restrict__ O,
+    float* __restrict__ D,
+    const unsigned int seq_len,
+    const unsigned int n_heads,
+    const unsigned int head_dim)
+{
+    extern __shared__ float reduce[];
+
+    const unsigned int pos  = blockIdx.x;
+    const unsigned int head = blockIdx.y;
+    const unsigned int tid  = threadIdx.x;
+    const unsigned int tg_size = blockDim.x;
+
+    if (pos >= seq_len || head >= n_heads) return;
+
+    const unsigned int total_dim = n_heads * head_dim;
+    const unsigned int base = pos * total_dim + head * head_dim;
+
+    float local_sum = 0.0f;
+    for (unsigned int d = tid; d < head_dim; d += tg_size) {
+        local_sum += dO[base + d] * O[base + d];
+    }
+    reduce[tid] = local_sum;
+    __syncthreads();
+
+    for (unsigned int s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) reduce[tid] += reduce[tid + s];
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        D[pos * n_heads + head] = reduce[0];
+    }
+}
+"#;
+
+/// FlashAttention-2 style causal attention backward with GQA support.
+///
+/// Grid: (n_kv_tiles, n_kv_heads), Block: (min(head_dim, 256))
+/// Each block owns one KV tile and accumulates grad_K/grad_V locally (no atomics).
+/// grad_Q uses atomicAdd (only n_kv_tiles blocks per position, vs seq_len in naive).
+///
+/// Dynamic shared memory layout:
+///   float dK_acc[TILE_KV * head_dim]  — local grad_K accumulator
+///   float dV_acc[TILE_KV * head_dim]  — local grad_V accumulator
+///   float scores[TILE_KV]             — one softmax row at a time
+///   float reduce[blockDim.x]          — reduction scratch
+pub const CAUSAL_ATTENTION_BACKWARD_FLASH_CUDA: &str = r#"
+#define FA_BWD_TILE 64
+
+extern "C" __global__ void causal_attention_backward_flash(
+    const float* __restrict__ dO,
+    const float* __restrict__ Q,
+    const float* __restrict__ K,
+    const float* __restrict__ V,
+    const float* __restrict__ D,
+    float* __restrict__ grad_Q,
+    float* __restrict__ grad_K,
+    float* __restrict__ grad_V,
+    const unsigned int seq_len,
+    const unsigned int n_heads,
+    const unsigned int n_kv_heads,
+    const unsigned int head_dim)
+{
+    extern __shared__ float smem[];
+
+    const unsigned int tile_idx = blockIdx.x;
+    const unsigned int kv_head  = blockIdx.y;
+    const unsigned int tid      = threadIdx.x;
+    const unsigned int tg_size  = blockDim.x;
+
+    const unsigned int tile_start = tile_idx * FA_BWD_TILE;
+    const unsigned int tile_end   = min(tile_start + (unsigned int)FA_BWD_TILE, seq_len);
+    const unsigned int tile_len   = tile_end - tile_start;
+
+    const unsigned int total_dim    = n_heads * head_dim;
+    const unsigned int kv_dim       = n_kv_heads * head_dim;
+    const unsigned int heads_per_kv = n_heads / n_kv_heads;
+    const unsigned int kv_off       = kv_head * head_dim;
+    const float scale               = rsqrtf((float)head_dim);
+
+    // Shared memory pointers
+    float* dK_acc = smem;                                          // [tile_len, head_dim]
+    float* dV_acc = smem + FA_BWD_TILE * head_dim;                 // [tile_len, head_dim]
+    float* scores = smem + 2 * FA_BWD_TILE * head_dim;             // [FA_BWD_TILE]
+    float* reduce = smem + 2 * FA_BWD_TILE * head_dim + FA_BWD_TILE; // [tg_size]
+
+    // Initialize dK_acc and dV_acc to zero
+    for (unsigned int idx = tid; idx < tile_len * head_dim; idx += tg_size) {
+        dK_acc[idx] = 0.0f;
+        dV_acc[idx] = 0.0f;
+    }
+    __syncthreads();
+
+    // Loop over all Q-heads that share this KV head
+    for (unsigned int h_off = 0; h_off < heads_per_kv; h_off++) {
+        const unsigned int head = kv_head * heads_per_kv + h_off;
+        const unsigned int q_off = head * head_dim;
+
+        // Inner loop over Q positions that can attend to this KV tile.
+        // Causal: position i attends to j <= i, so i >= tile_start.
+        for (unsigned int i = tile_start; i < seq_len; i++) {
+            // How many KV positions in this tile does position i attend to?
+            unsigned int attend_in_tile = min(i + 1 - tile_start, tile_len);
+
+            // ── Phase 1: Compute scores S[j] = Q[i] . K[tile_start+j] * scale ──
+            // Threads split over j positions in the tile
+            float local_max = -1e38f;
+            for (unsigned int j = tid; j < attend_in_tile; j += tg_size) {
+                float dot = 0.0f;
+                const unsigned int k_base = (tile_start + j) * kv_dim + kv_off;
+                const unsigned int q_base = i * total_dim + q_off;
+                for (unsigned int d = 0; d < head_dim; d++) {
+                    dot += Q[q_base + d] * K[k_base + d];
+                }
+                float s = dot * scale;
+                scores[j] = s;
+                local_max = fmaxf(local_max, s);
+            }
+            // Parallel max-reduce
+            reduce[tid] = local_max;
+            __syncthreads();
+            for (unsigned int s = tg_size / 2; s > 0; s >>= 1) {
+                if (tid < s) reduce[tid] = fmaxf(reduce[tid], reduce[tid + s]);
+                __syncthreads();
+            }
+            float row_max = reduce[0];
+
+            // Exp and sum
+            float local_sum = 0.0f;
+            for (unsigned int j = tid; j < attend_in_tile; j += tg_size) {
+                float p = expf(scores[j] - row_max);
+                scores[j] = p;
+                local_sum += p;
+            }
+            reduce[tid] = local_sum;
+            __syncthreads();
+            for (unsigned int s = tg_size / 2; s > 0; s >>= 1) {
+                if (tid < s) reduce[tid] += reduce[tid + s];
+                __syncthreads();
+            }
+            float inv_sum = (reduce[0] > 0.0f) ? (1.0f / reduce[0]) : 0.0f;
+
+            // Normalize: P[j] = exp(S[j] - max) / sum
+            for (unsigned int j = tid; j < attend_in_tile; j += tg_size) {
+                scores[j] *= inv_sum;
+            }
+            __syncthreads();
+
+            // ── Phase 2a: Accumulate dV (uses P) ──
+            // dV[tile_j, d] += P[j] * dO[i, head, d]
+            // Threads split over d
+            for (unsigned int d = tid; d < head_dim; d += tg_size) {
+                float do_val = dO[i * total_dim + q_off + d];
+                for (unsigned int j = 0; j < attend_in_tile; j++) {
+                    dV_acc[j * head_dim + d] += scores[j] * do_val;
+                }
+            }
+            __syncthreads();
+
+            // ── Phase 2b: Compute dS[j] = P[j] * (dP[j] - D[i,head]) ──
+            // dP[j] = sum_d(dO[i,d] * V[tile_start+j, d])
+            // Threads split over j
+            float d_val = D[i * n_heads + head];
+            for (unsigned int j = tid; j < attend_in_tile; j += tg_size) {
+                float dp = 0.0f;
+                const unsigned int v_base = (tile_start + j) * kv_dim + kv_off;
+                for (unsigned int d = 0; d < head_dim; d++) {
+                    dp += dO[i * total_dim + q_off + d] * V[v_base + d];
+                }
+                scores[j] = scores[j] * (dp - d_val);  // now scores holds dS[j]
+            }
+            __syncthreads();
+
+            // ── Phase 2c: Accumulate dQ and dK (uses dS) ──
+            // dQ[i, head, d] += scale * sum_j(dS[j] * K[tile_j, d])
+            // dK[tile_j, d] += scale * dS[j] * Q[i, head, d]
+            // Threads split over d
+            for (unsigned int d = tid; d < head_dim; d += tg_size) {
+                float dq_acc = 0.0f;
+                float q_val = Q[i * total_dim + q_off + d];
+                for (unsigned int j = 0; j < attend_in_tile; j++) {
+                    float ds = scores[j];
+                    dq_acc += ds * K[(tile_start + j) * kv_dim + kv_off + d];
+                    dK_acc[j * head_dim + d] += ds * q_val;
+                }
+                atomicAdd(&grad_Q[i * total_dim + q_off + d], dq_acc * scale);
+            }
+            __syncthreads();
+        }
+    }
+
+    // ── Write dK_acc and dV_acc to global memory (direct, no atomics) ──
+    // Scale dK by attention scale factor
+    for (unsigned int idx = tid; idx < tile_len * head_dim; idx += tg_size) {
+        unsigned int j = idx / head_dim;
+        unsigned int d = idx % head_dim;
+        grad_K[(tile_start + j) * kv_dim + kv_off + d] = dK_acc[j * head_dim + d] * scale;
+        grad_V[(tile_start + j) * kv_dim + kv_off + d] = dV_acc[j * head_dim + d];
+    }
+}
+"#;
+
 /// bf16 causal attention backward. grad_out/Q/K/V are bf16, grad_Q is bf16,
 /// grad_K/grad_V stay f32 (atomic accumulation for precision).
 pub const CAUSAL_ATTENTION_BACKWARD_BF16_CUDA: &str = r#"
