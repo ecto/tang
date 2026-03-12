@@ -61,11 +61,8 @@ impl<B: ComputeBuffer> Linear<B> {
         let batch = input.numel() / self.in_features;
         assert_eq!(input.numel(), batch * self.in_features);
 
-        // Transpose weight on device: [out_f, in_f] → [in_f, out_f]
-        let wt_buf = dev.transpose_2d(&self.weight.buffer, self.out_features, self.in_features);
-
-        // matmul: [batch, in_f] @ [in_f, out_f] = [batch, out_f]
-        let out_buf = dev.matmul(&input.buffer, &wt_buf, batch, self.in_features, self.out_features);
+        // matmul with transposed B: [batch, in_f] @ [out_f, in_f]^T = [batch, out_f]
+        let out_buf = dev.matmul_b_transposed(&input.buffer, &self.weight.buffer, batch, self.in_features, self.out_features);
         let out = ComputeTensor::from_buffer(out_buf, vec![batch, self.out_features]);
 
         // Add bias
@@ -90,11 +87,8 @@ impl<B: ComputeBuffer> Linear<B> {
         let batch = input.numel() / self.in_features;
         assert_eq!(input.numel(), batch * self.in_features);
 
-        // Transpose weight on device: [out_f, in_f] → [in_f, out_f]
-        let wt_buf = dev.transpose_2d(&self.weight.buffer, self.out_features, self.in_features);
-
-        // matmul: [batch, in_f] @ [in_f, out_f] = [batch, out_f]
-        let out_buf = dev.matmul(&input.buffer, &wt_buf, batch, self.in_features, self.out_features);
+        // matmul with transposed B: [batch, in_f] @ [out_f, in_f]^T = [batch, out_f]
+        let out_buf = dev.matmul_b_transposed(&input.buffer, &self.weight.buffer, batch, self.in_features, self.out_features);
         let out = ComputeTensor::from_buffer(out_buf, vec![batch, self.out_features]);
 
         // Cache input for backward (copy on device, no CPU round-trip)

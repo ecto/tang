@@ -2203,6 +2203,77 @@ impl ComputeDevice for CudaComputeDevice {
         }
     }
 
+    fn matmul_b_transposed(
+        &self,
+        a: &CudaBuffer,       // [m, k] row-major
+        b: &CudaBuffer,       // [n, k] row-major (logically transposed to [k, n])
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> CudaBuffer {
+        let cublas_m = n as i32;
+        let cublas_n = m as i32;
+        let cublas_k = k as i32;
+
+        // Mixed input types: convert
+        if a.is_bf16() != b.is_bf16() {
+            let a_conv = if a.is_bf16() { Some(self.convert_bf16_to_f32(a)) } else { None };
+            let b_conv = if b.is_bf16() { Some(self.convert_bf16_to_f32(b)) } else { None };
+            let a_ref = a_conv.as_ref().unwrap_or(a);
+            let b_ref = b_conv.as_ref().unwrap_or(b);
+            return self.matmul_b_transposed(a_ref, b_ref, m, k, n);
+        }
+
+        if a.is_bf16() {
+            let mut output = self.alloc(m * n);
+            let alpha: f32 = 1.0;
+            let beta: f32 = 0.0;
+            {
+                let (b_ptr, _rec_b) = b.bf16_data().device_ptr(&self.stream);
+                let (a_ptr, _rec_a) = a.bf16_data().device_ptr(&self.stream);
+                let (c_ptr, _rec_c) = output.bf16_data_mut().device_ptr_mut(&self.stream);
+                unsafe {
+                    cudarc::cublas::result::gemm_ex(
+                        *self.cublas.handle(),
+                        cublasOperation_t::CUBLAS_OP_T,
+                        cublasOperation_t::CUBLAS_OP_N,
+                        cublas_m, cublas_n, cublas_k,
+                        (&alpha) as *const f32 as *const _,
+                        b_ptr as *const _, cudarc::cublas::sys::cudaDataType_t::CUDA_R_16BF, cublas_k,
+                        a_ptr as *const _, cudarc::cublas::sys::cudaDataType_t::CUDA_R_16BF, cublas_k,
+                        (&beta) as *const f32 as *const _,
+                        c_ptr as *mut _, cudarc::cublas::sys::cudaDataType_t::CUDA_R_16BF, cublas_m,
+                        cudarc::cublas::sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                        cudarc::cublas::sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                    ).expect("cuBLAS bf16 gemm_ex b_transposed failed");
+                }
+            }
+            output
+        } else {
+            let mut output = self.alloc_f32(m * n);
+            unsafe {
+                self.cublas.gemm(
+                    GemmConfig {
+                        transa: cublasOperation_t::CUBLAS_OP_T,
+                        transb: cublasOperation_t::CUBLAS_OP_N,
+                        m: cublas_m,
+                        n: cublas_n,
+                        k: cublas_k,
+                        alpha: 1.0f32,
+                        lda: cublas_k,
+                        ldb: cublas_k,
+                        beta: 0.0f32,
+                        ldc: cublas_m,
+                    },
+                    b.f32_data(),
+                    a.f32_data(),
+                    output.f32_data_mut(),
+                ).expect("cuBLAS sgemm b_transposed failed");
+            }
+            output
+        }
+    }
+
     fn matmul_accumulate_a_transposed(
         &self,
         a: &CudaBuffer,   // [k, m] row-major

@@ -349,6 +349,21 @@ pub trait ComputeDevice: Send {
         self.add_assign(c, &tmp);
     }
 
+    /// Matrix multiply with transposed B: C[m,n] = A[m,k] @ B_stored[n,k]^T.
+    ///
+    /// `b` is stored as [n,k] row-major (logically transposed to [k,n]).
+    fn matmul_b_transposed(
+        &self,
+        a: &Self::Buffer,       // [m, k] row-major
+        b: &Self::Buffer,       // [n, k] row-major (transposed logically)
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Self::Buffer {
+        let b_t = self.transpose_2d(b, n, k);
+        self.matmul(a, &b_t, m, k, n)
+    }
+
     /// Matrix multiply with transposed A: C[m,n] = A[k,m]^T @ B[k,n].
     ///
     /// `a` is stored as [k,m] row-major. Avoids materializing the transpose.
