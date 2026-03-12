@@ -432,6 +432,53 @@ pub trait ComputeDevice: Send {
         (self.upload(&output), self.upload(&sum_out))
     }
 
+    /// Element-wise addition: out[i] = a[i] + b[i].
+    /// Default: delegates to elementwise(). Override for fused bf16 kernel.
+    fn add_tensors_buf(&self, a: &Self::Buffer, b: &Self::Buffer, numel: usize) -> Self::Buffer {
+        self.elementwise(&[a, b], numel, &|ids| ids[0] + ids[1])
+    }
+
+    /// SwiGLU activation: out[i] = silu(gate[i]) * up[i].
+    /// Default: delegates to elementwise(). Override for fused bf16 kernel.
+    fn swiglu_fused_buf(&self, gate: &Self::Buffer, up: &Self::Buffer, numel: usize) -> Self::Buffer {
+        use tang::Scalar;
+        self.elementwise(&[gate, up], numel, &|ids| {
+            let one = ExprId::from_f64(1.0);
+            let neg_gate = -ids[0];
+            let exp_neg = Scalar::exp(neg_gate);
+            let sigmoid = one / (one + exp_neg);
+            ids[0] * sigmoid * ids[1]
+        })
+    }
+
+    /// SwiGLU backward: returns (grad_gate, grad_up).
+    /// Default: delegates to elementwise(). Override for fused bf16 kernel.
+    fn swiglu_backward_buf(
+        &self,
+        grad: &Self::Buffer,
+        gate: &Self::Buffer,
+        up: &Self::Buffer,
+        numel: usize,
+    ) -> (Self::Buffer, Self::Buffer) {
+        use tang::Scalar;
+        let grad_up = self.elementwise(&[grad, gate], numel, &|ids| {
+            let one = ExprId::from_f64(1.0);
+            let neg_gate = -ids[1];
+            let exp_neg = Scalar::exp(neg_gate);
+            let sigmoid = one / (one + exp_neg);
+            ids[0] * ids[1] * sigmoid
+        });
+        let grad_gate = self.elementwise(&[grad, gate, up], numel, &|ids| {
+            let one = ExprId::from_f64(1.0);
+            let neg_gate = -ids[1];
+            let exp_neg = Scalar::exp(neg_gate);
+            let sigmoid = one / (one + exp_neg);
+            let dsilu = sigmoid * (one + ids[1] * (one - sigmoid));
+            ids[0] * ids[2] * dsilu
+        });
+        (grad_gate, grad_up)
+    }
+
     /// In-place element-wise addition: dst[i] += src[i].
     fn add_assign(&self, dst: &mut Self::Buffer, src: &Self::Buffer);
 

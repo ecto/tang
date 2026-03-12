@@ -2054,6 +2054,137 @@ impl ComputeDevice for CudaComputeDevice {
         }
     }
 
+    fn add_tensors_buf(&self, a: &CudaBuffer, b: &CudaBuffer, numel: usize) -> CudaBuffer {
+        if a.is_bf16() && b.is_bf16() {
+            let n = numel as u32;
+            let cfg = LaunchConfig {
+                block_dim: (256, 1, 1),
+                grid_dim: ((n + 255) / 256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let (_module, func) = self.get_func(
+                util_cuda::ADD_TENSORS_BF16_CUDA,
+                "add_tensors_bf16",
+            );
+            let mut out = CudaBuffer {
+                storage: CudaStorage::Bf16(self.stream.alloc_zeros::<u16>(numel).unwrap()),
+                len: numel,
+            };
+            unsafe {
+                self.stream.launch_builder(&func)
+                    .arg(a.bf16_data())
+                    .arg(b.bf16_data())
+                    .arg(out.bf16_data_mut())
+                    .arg(&n)
+                    .launch(cfg)
+                    .unwrap();
+            }
+            out
+        } else {
+            // Fall back to generic elementwise for f32
+            self.elementwise(&[a, b], numel, &|ids| ids[0] + ids[1])
+        }
+    }
+
+    fn swiglu_fused_buf(&self, gate: &CudaBuffer, up: &CudaBuffer, numel: usize) -> CudaBuffer {
+        if gate.is_bf16() && up.is_bf16() {
+            let n = numel as u32;
+            let cfg = LaunchConfig {
+                block_dim: (256, 1, 1),
+                grid_dim: ((n + 255) / 256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let (_module, func) = self.get_func(
+                util_cuda::SWIGLU_FUSED_BF16_CUDA,
+                "swiglu_fused_bf16",
+            );
+            let mut out = CudaBuffer {
+                storage: CudaStorage::Bf16(self.stream.alloc_zeros::<u16>(numel).unwrap()),
+                len: numel,
+            };
+            unsafe {
+                self.stream.launch_builder(&func)
+                    .arg(gate.bf16_data())
+                    .arg(up.bf16_data())
+                    .arg(out.bf16_data_mut())
+                    .arg(&n)
+                    .launch(cfg)
+                    .unwrap();
+            }
+            out
+        } else {
+            use tang::Scalar;
+            use tang_expr::node::ExprId;
+            self.elementwise(&[gate, up], numel, &|ids: &[ExprId]| {
+                let one = ExprId::from_f64(1.0);
+                let neg_gate = -ids[0];
+                let exp_neg = Scalar::exp(neg_gate);
+                let sigmoid = one / (one + exp_neg);
+                ids[0] * sigmoid * ids[1]
+            })
+        }
+    }
+
+    fn swiglu_backward_buf(
+        &self,
+        grad: &CudaBuffer,
+        gate: &CudaBuffer,
+        up: &CudaBuffer,
+        numel: usize,
+    ) -> (CudaBuffer, CudaBuffer) {
+        if grad.is_bf16() && gate.is_bf16() && up.is_bf16() {
+            let n = numel as u32;
+            let cfg = LaunchConfig {
+                block_dim: (256, 1, 1),
+                grid_dim: ((n + 255) / 256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let (_module, func) = self.get_func(
+                util_cuda::SWIGLU_BACKWARD_BF16_CUDA,
+                "swiglu_backward_bf16",
+            );
+            let mut grad_gate = CudaBuffer {
+                storage: CudaStorage::Bf16(self.stream.alloc_zeros::<u16>(numel).unwrap()),
+                len: numel,
+            };
+            let mut grad_up = CudaBuffer {
+                storage: CudaStorage::Bf16(self.stream.alloc_zeros::<u16>(numel).unwrap()),
+                len: numel,
+            };
+            unsafe {
+                self.stream.launch_builder(&func)
+                    .arg(grad.bf16_data())
+                    .arg(gate.bf16_data())
+                    .arg(up.bf16_data())
+                    .arg(grad_gate.bf16_data_mut())
+                    .arg(grad_up.bf16_data_mut())
+                    .arg(&n)
+                    .launch(cfg)
+                    .unwrap();
+            }
+            (grad_gate, grad_up)
+        } else {
+            use tang::Scalar;
+            use tang_expr::node::ExprId;
+            let grad_up = self.elementwise(&[grad, gate], numel, &|ids: &[ExprId]| {
+                let one = ExprId::from_f64(1.0);
+                let neg_gate = -ids[1];
+                let exp_neg = Scalar::exp(neg_gate);
+                let sigmoid = one / (one + exp_neg);
+                ids[0] * ids[1] * sigmoid
+            });
+            let grad_gate = self.elementwise(&[grad, gate, up], numel, &|ids: &[ExprId]| {
+                let one = ExprId::from_f64(1.0);
+                let neg_gate = -ids[1];
+                let exp_neg = Scalar::exp(neg_gate);
+                let sigmoid = one / (one + exp_neg);
+                let dsilu = sigmoid * (one + ids[1] * (one - sigmoid));
+                ids[0] * ids[2] * dsilu
+            });
+            (grad_gate, grad_up)
+        }
+    }
+
     fn add_assign(&self, dst: &mut CudaBuffer, src: &CudaBuffer) {
         assert_eq!(dst.len, src.len);
         let n = dst.len as u32;

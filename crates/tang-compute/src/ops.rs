@@ -2,8 +2,6 @@
 
 use crate::device::ComputeDevice;
 use crate::tensor::ComputeTensor;
-use tang::Scalar;
-use tang_expr::node::ExprId;
 
 /// Element-wise addition of two tensors.
 pub fn add_tensors<D: ComputeDevice>(
@@ -12,11 +10,7 @@ pub fn add_tensors<D: ComputeDevice>(
     b: &ComputeTensor<D::Buffer>,
 ) -> ComputeTensor<D::Buffer> {
     assert_eq!(a.numel(), b.numel(), "add_tensors: numel mismatch");
-    let buf = dev.elementwise(
-        &[&a.buffer, &b.buffer],
-        a.numel(),
-        &|ids: &[ExprId]| ids[0] + ids[1],
-    );
+    let buf = dev.add_tensors_buf(&a.buffer, &b.buffer, a.numel());
     ComputeTensor::from_buffer(buf, a.shape().to_vec())
 }
 
@@ -42,20 +36,7 @@ pub fn swiglu_fused<D: ComputeDevice>(
     up: &ComputeTensor<D::Buffer>,
 ) -> ComputeTensor<D::Buffer> {
     assert_eq!(gate.numel(), up.numel(), "swiglu_fused: numel mismatch");
-    let buf = dev.elementwise(
-        &[&gate.buffer, &up.buffer],
-        gate.numel(),
-        &|ids: &[ExprId]| {
-            // silu(gate) = gate * sigmoid(gate) = gate / (1 + exp(-gate))
-            let one = ExprId::from_f64(1.0);
-            let neg_gate = -ids[0];
-            let exp_neg = Scalar::exp(neg_gate);
-            let denom = one + exp_neg;
-            let sigmoid = one / denom;
-            let silu = ids[0] * sigmoid;
-            silu * ids[1]
-        },
-    );
+    let buf = dev.swiglu_fused_buf(&gate.buffer, &up.buffer, gate.numel());
     ComputeTensor::from_buffer(buf, gate.shape().to_vec())
 }
 
@@ -73,37 +54,9 @@ pub fn swiglu_backward<D: ComputeDevice>(
     up: &ComputeTensor<D::Buffer>,
 ) -> (ComputeTensor<D::Buffer>, ComputeTensor<D::Buffer>) {
     let numel = grad_output.numel();
-
-    // grad_up = grad * silu(gate)
-    let grad_up_buf = dev.elementwise(
-        &[&grad_output.buffer, &gate.buffer],
-        numel,
-        &|ids: &[ExprId]| {
-            let one = ExprId::from_f64(1.0);
-            let neg_gate = -ids[1];
-            let exp_neg = Scalar::exp(neg_gate);
-            let sigmoid = one / (one + exp_neg);
-            let silu = ids[1] * sigmoid;
-            ids[0] * silu
-        },
+    let (grad_gate_buf, grad_up_buf) = dev.swiglu_backward_buf(
+        &grad_output.buffer, &gate.buffer, &up.buffer, numel,
     );
-
-    // grad_gate = grad * up * dsilu(gate)
-    // dsilu(x) = sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x))
-    //          = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
-    let grad_gate_buf = dev.elementwise(
-        &[&grad_output.buffer, &gate.buffer, &up.buffer],
-        numel,
-        &|ids: &[ExprId]| {
-            let one = ExprId::from_f64(1.0);
-            let neg_gate = -ids[1];
-            let exp_neg = Scalar::exp(neg_gate);
-            let sigmoid = one / (one + exp_neg);
-            let dsilu = sigmoid * (one + ids[1] * (one - sigmoid));
-            ids[0] * ids[2] * dsilu
-        },
-    );
-
     (
         ComputeTensor::from_buffer(grad_gate_buf, grad_output.shape().to_vec()),
         ComputeTensor::from_buffer(grad_up_buf, grad_output.shape().to_vec()),
