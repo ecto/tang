@@ -2625,10 +2625,10 @@ impl ComputeDevice for CudaComputeDevice {
             let mut output = self.alloc(input.len);
             unsafe {
                 self.stream.launch_builder(&func)
-                    .arg(&input.bf16_data())
-                    .arg(&cos_buf.f32_data())
-                    .arg(&sin_buf.f32_data())
-                    .arg(&output.bf16_data_mut())
+                    .arg(input.bf16_data())
+                    .arg(cos_buf.f32_data())
+                    .arg(sin_buf.f32_data())
+                    .arg(output.bf16_data_mut())
                     .arg(&seq_len_u)
                     .arg(&n_heads_u)
                     .arg(&head_dim_u)
@@ -2643,10 +2643,10 @@ impl ComputeDevice for CudaComputeDevice {
             let mut output = self.alloc_f32(input.len);
             unsafe {
                 self.stream.launch_builder(&func)
-                    .arg(&input.f32_data())
-                    .arg(&cos_buf.f32_data())
-                    .arg(&sin_buf.f32_data())
-                    .arg(&output.f32_data_mut())
+                    .arg(input.f32_data())
+                    .arg(cos_buf.f32_data())
+                    .arg(sin_buf.f32_data())
+                    .arg(output.f32_data_mut())
                     .arg(&seq_len_u)
                     .arg(&n_heads_u)
                     .arg(&head_dim_u)
@@ -2690,10 +2690,10 @@ impl ComputeDevice for CudaComputeDevice {
             let mut output = self.alloc(grad_output.len);
             unsafe {
                 self.stream.launch_builder(&func)
-                    .arg(&grad_output.bf16_data())
-                    .arg(&cos_buf.f32_data())
-                    .arg(&sin_buf.f32_data())
-                    .arg(&output.bf16_data_mut())
+                    .arg(grad_output.bf16_data())
+                    .arg(cos_buf.f32_data())
+                    .arg(sin_buf.f32_data())
+                    .arg(output.bf16_data_mut())
                     .arg(&seq_len_u)
                     .arg(&n_heads_u)
                     .arg(&head_dim_u)
@@ -2708,10 +2708,10 @@ impl ComputeDevice for CudaComputeDevice {
             let mut output = self.alloc_f32(grad_output.len);
             unsafe {
                 self.stream.launch_builder(&func)
-                    .arg(&grad_output.f32_data())
-                    .arg(&cos_buf.f32_data())
-                    .arg(&sin_buf.f32_data())
-                    .arg(&output.f32_data_mut())
+                    .arg(grad_output.f32_data())
+                    .arg(cos_buf.f32_data())
+                    .arg(sin_buf.f32_data())
+                    .arg(output.f32_data_mut())
                     .arg(&seq_len_u)
                     .arg(&n_heads_u)
                     .arg(&head_dim_u)
