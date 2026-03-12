@@ -212,6 +212,158 @@ extern "C" __global__ void rms_norm_residual(
 }
 "#;
 
+// ---------- RoPE kernels ----------
+// Interleaved rotary position embedding: rotates pairs (2i, 2i+1).
+// Each thread handles one (position, head, pair) element.
+
+/// RoPE forward f32: out[base+2i] = x0*cos - x1*sin, out[base+2i+1] = x0*sin + x1*cos.
+/// Grid: (ceil(seq_len * n_heads * half_dim / 256)), Block: (256)
+pub const ROPE_FORWARD_CUDA: &str = r#"
+extern "C" __global__ void rope_forward(
+    const float* __restrict__ input,
+    const float* __restrict__ cos_table,
+    const float* __restrict__ sin_table,
+    float* __restrict__ output,
+    const unsigned int seq_len,
+    const unsigned int n_heads,
+    const unsigned int head_dim,
+    const unsigned int half_dim,
+    const unsigned int start_pos)
+{
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = seq_len * n_heads * half_dim;
+    if (idx >= total) return;
+
+    unsigned int i = idx % half_dim;
+    unsigned int remaining = idx / half_dim;
+    unsigned int h = remaining % n_heads;
+    unsigned int s = remaining / n_heads;
+    unsigned int pos = start_pos + s;
+
+    float cos_val = cos_table[pos * half_dim + i];
+    float sin_val = sin_table[pos * half_dim + i];
+
+    unsigned int base = (s * n_heads + h) * head_dim;
+    float x0 = input[base + 2*i];
+    float x1 = input[base + 2*i + 1];
+    output[base + 2*i] = x0 * cos_val - x1 * sin_val;
+    output[base + 2*i + 1] = x0 * sin_val + x1 * cos_val;
+}
+"#;
+
+/// RoPE backward f32: reverse rotation (transpose of rotation matrix).
+/// Grid: (ceil(seq_len * n_heads * half_dim / 256)), Block: (256)
+pub const ROPE_BACKWARD_CUDA: &str = r#"
+extern "C" __global__ void rope_backward(
+    const float* __restrict__ grad_output,
+    const float* __restrict__ cos_table,
+    const float* __restrict__ sin_table,
+    float* __restrict__ grad_input,
+    const unsigned int seq_len,
+    const unsigned int n_heads,
+    const unsigned int head_dim,
+    const unsigned int half_dim,
+    const unsigned int start_pos)
+{
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = seq_len * n_heads * half_dim;
+    if (idx >= total) return;
+
+    unsigned int i = idx % half_dim;
+    unsigned int remaining = idx / half_dim;
+    unsigned int h = remaining % n_heads;
+    unsigned int s = remaining / n_heads;
+    unsigned int pos = start_pos + s;
+
+    float cos_val = cos_table[pos * half_dim + i];
+    float sin_val = sin_table[pos * half_dim + i];
+
+    unsigned int base = (s * n_heads + h) * head_dim;
+    float g0 = grad_output[base + 2*i];
+    float g1 = grad_output[base + 2*i + 1];
+    grad_input[base + 2*i] = g0 * cos_val + g1 * sin_val;
+    grad_input[base + 2*i + 1] = -g0 * sin_val + g1 * cos_val;
+}
+"#;
+
+/// RoPE forward bf16: bf16 I/O, f32 compute.
+/// Grid: (ceil(seq_len * n_heads * half_dim / 256)), Block: (256)
+pub const ROPE_FORWARD_BF16_CUDA: &str = r#"
+extern "C" __global__ void rope_forward_bf16(
+    const unsigned short* __restrict__ input,
+    const float* __restrict__ cos_table,
+    const float* __restrict__ sin_table,
+    unsigned short* __restrict__ output,
+    const unsigned int seq_len,
+    const unsigned int n_heads,
+    const unsigned int head_dim,
+    const unsigned int half_dim,
+    const unsigned int start_pos)
+{
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = seq_len * n_heads * half_dim;
+    if (idx >= total) return;
+
+    unsigned int i = idx % half_dim;
+    unsigned int remaining = idx / half_dim;
+    unsigned int h = remaining % n_heads;
+    unsigned int s = remaining / n_heads;
+    unsigned int pos = start_pos + s;
+
+    float cos_val = cos_table[pos * half_dim + i];
+    float sin_val = sin_table[pos * half_dim + i];
+
+    unsigned int base = (s * n_heads + h) * head_dim;
+    float x0 = __int_as_float(((unsigned int)input[base + 2*i]) << 16);
+    float x1 = __int_as_float(((unsigned int)input[base + 2*i + 1]) << 16);
+    float r0 = x0 * cos_val - x1 * sin_val;
+    float r1 = x0 * sin_val + x1 * cos_val;
+    unsigned int b0 = __float_as_int(r0);
+    unsigned int b1 = __float_as_int(r1);
+    output[base + 2*i] = (unsigned short)((b0 + 0x7FFF + ((b0 >> 16) & 1)) >> 16);
+    output[base + 2*i + 1] = (unsigned short)((b1 + 0x7FFF + ((b1 >> 16) & 1)) >> 16);
+}
+"#;
+
+/// RoPE backward bf16: bf16 I/O, f32 compute.
+/// Grid: (ceil(seq_len * n_heads * half_dim / 256)), Block: (256)
+pub const ROPE_BACKWARD_BF16_CUDA: &str = r#"
+extern "C" __global__ void rope_backward_bf16(
+    const unsigned short* __restrict__ grad_output,
+    const float* __restrict__ cos_table,
+    const float* __restrict__ sin_table,
+    unsigned short* __restrict__ grad_input,
+    const unsigned int seq_len,
+    const unsigned int n_heads,
+    const unsigned int head_dim,
+    const unsigned int half_dim,
+    const unsigned int start_pos)
+{
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = seq_len * n_heads * half_dim;
+    if (idx >= total) return;
+
+    unsigned int i = idx % half_dim;
+    unsigned int remaining = idx / half_dim;
+    unsigned int h = remaining % n_heads;
+    unsigned int s = remaining / n_heads;
+    unsigned int pos = start_pos + s;
+
+    float cos_val = cos_table[pos * half_dim + i];
+    float sin_val = sin_table[pos * half_dim + i];
+
+    unsigned int base = (s * n_heads + h) * head_dim;
+    float g0 = __int_as_float(((unsigned int)grad_output[base + 2*i]) << 16);
+    float g1 = __int_as_float(((unsigned int)grad_output[base + 2*i + 1]) << 16);
+    float r0 = g0 * cos_val + g1 * sin_val;
+    float r1 = -g0 * sin_val + g1 * cos_val;
+    unsigned int b0 = __float_as_int(r0);
+    unsigned int b1 = __float_as_int(r1);
+    grad_input[base + 2*i] = (unsigned short)((b0 + 0x7FFF + ((b0 >> 16) & 1)) >> 16);
+    grad_input[base + 2*i + 1] = (unsigned short)((b1 + 0x7FFF + ((b1 >> 16) & 1)) >> 16);
+}
+"#;
+
 // ---------- Fused bf16 elementwise kernels ----------
 // Read bf16, compute in f32, write bf16 in a single kernel.
 // Eliminates separate bf16→f32 and f32→bf16 conversion passes.

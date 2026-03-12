@@ -2593,6 +2593,137 @@ impl ComputeDevice for CudaComputeDevice {
         }
     }
 
+    fn rope_forward(
+        &self,
+        input: &CudaBuffer,
+        cos_table: &[f32],
+        sin_table: &[f32],
+        seq_len: usize,
+        n_heads: usize,
+        head_dim: usize,
+        start_pos: usize,
+    ) -> CudaBuffer {
+        let half_dim = head_dim / 2;
+        let total = (seq_len * n_heads * half_dim) as u32;
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (total.div_ceil(256), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let seq_len_u = seq_len as u32;
+        let n_heads_u = n_heads as u32;
+        let head_dim_u = head_dim as u32;
+        let half_dim_u = half_dim as u32;
+        let start_pos_u = start_pos as u32;
+
+        // Upload cos/sin tables (f32 always — small, ~256KB for seq=2048 dim=64)
+        let cos_buf = self.upload_f32(cos_table);
+        let sin_buf = self.upload_f32(sin_table);
+
+        if input.is_bf16() {
+            let (_module, func) = self.get_func(util_cuda::ROPE_FORWARD_BF16_CUDA, "rope_forward_bf16");
+            let mut output = self.alloc(input.len);
+            unsafe {
+                self.stream.launch_builder(&func)
+                    .arg(&input.bf16_data())
+                    .arg(&cos_buf.f32_data())
+                    .arg(&sin_buf.f32_data())
+                    .arg(&output.bf16_data_mut())
+                    .arg(&seq_len_u)
+                    .arg(&n_heads_u)
+                    .arg(&head_dim_u)
+                    .arg(&half_dim_u)
+                    .arg(&start_pos_u)
+                    .launch(cfg)
+                    .expect("rope_forward_bf16 launch failed");
+            }
+            output
+        } else {
+            let (_module, func) = self.get_func(util_cuda::ROPE_FORWARD_CUDA, "rope_forward");
+            let mut output = self.alloc_f32(input.len);
+            unsafe {
+                self.stream.launch_builder(&func)
+                    .arg(&input.f32_data())
+                    .arg(&cos_buf.f32_data())
+                    .arg(&sin_buf.f32_data())
+                    .arg(&output.f32_data_mut())
+                    .arg(&seq_len_u)
+                    .arg(&n_heads_u)
+                    .arg(&head_dim_u)
+                    .arg(&half_dim_u)
+                    .arg(&start_pos_u)
+                    .launch(cfg)
+                    .expect("rope_forward launch failed");
+            }
+            output
+        }
+    }
+
+    fn rope_backward(
+        &self,
+        grad_output: &CudaBuffer,
+        cos_table: &[f32],
+        sin_table: &[f32],
+        seq_len: usize,
+        n_heads: usize,
+        head_dim: usize,
+        start_pos: usize,
+    ) -> CudaBuffer {
+        let half_dim = head_dim / 2;
+        let total = (seq_len * n_heads * half_dim) as u32;
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (total.div_ceil(256), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let seq_len_u = seq_len as u32;
+        let n_heads_u = n_heads as u32;
+        let head_dim_u = head_dim as u32;
+        let half_dim_u = half_dim as u32;
+        let start_pos_u = start_pos as u32;
+
+        let cos_buf = self.upload_f32(cos_table);
+        let sin_buf = self.upload_f32(sin_table);
+
+        if grad_output.is_bf16() {
+            let (_module, func) = self.get_func(util_cuda::ROPE_BACKWARD_BF16_CUDA, "rope_backward_bf16");
+            let mut output = self.alloc(grad_output.len);
+            unsafe {
+                self.stream.launch_builder(&func)
+                    .arg(&grad_output.bf16_data())
+                    .arg(&cos_buf.f32_data())
+                    .arg(&sin_buf.f32_data())
+                    .arg(&output.bf16_data_mut())
+                    .arg(&seq_len_u)
+                    .arg(&n_heads_u)
+                    .arg(&head_dim_u)
+                    .arg(&half_dim_u)
+                    .arg(&start_pos_u)
+                    .launch(cfg)
+                    .expect("rope_backward_bf16 launch failed");
+            }
+            output
+        } else {
+            let (_module, func) = self.get_func(util_cuda::ROPE_BACKWARD_CUDA, "rope_backward");
+            let mut output = self.alloc_f32(grad_output.len);
+            unsafe {
+                self.stream.launch_builder(&func)
+                    .arg(&grad_output.f32_data())
+                    .arg(&cos_buf.f32_data())
+                    .arg(&sin_buf.f32_data())
+                    .arg(&output.f32_data_mut())
+                    .arg(&seq_len_u)
+                    .arg(&n_heads_u)
+                    .arg(&head_dim_u)
+                    .arg(&half_dim_u)
+                    .arg(&start_pos_u)
+                    .launch(cfg)
+                    .expect("rope_backward launch failed");
+            }
+            output
+        }
+    }
+
     fn add_tensors_buf(&self, a: &CudaBuffer, b: &CudaBuffer, numel: usize) -> CudaBuffer {
         if a.is_bf16() && b.is_bf16() {
             let n = numel as u32;

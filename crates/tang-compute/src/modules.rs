@@ -504,29 +504,14 @@ impl InterleavedRoPE {
         let n_heads = shape[1];
         let head_dim = shape[2];
         assert_eq!(head_dim, self.head_dim);
-        let half_dim = head_dim / 2;
+        assert!(start_pos + seq_len <= self.max_seq_len,
+            "RoPE position {} >= max {}", start_pos + seq_len - 1, self.max_seq_len);
 
-        // Download, apply RoPE on CPU, re-upload
-        let data = dev.download(&input.buffer);
-        let mut out = vec![0.0f32; data.len()];
-
-        for s in 0..seq_len {
-            let pos = start_pos + s;
-            assert!(pos < self.max_seq_len, "RoPE position {pos} >= max {}", self.max_seq_len);
-            for h in 0..n_heads {
-                let base_idx = (s * n_heads + h) * head_dim;
-                for i in 0..half_dim {
-                    let cos = self.cos_table[pos * half_dim + i];
-                    let sin = self.sin_table[pos * half_dim + i];
-                    let x0 = data[base_idx + 2 * i];
-                    let x1 = data[base_idx + 2 * i + 1];
-                    out[base_idx + 2 * i] = x0 * cos - x1 * sin;
-                    out[base_idx + 2 * i + 1] = x0 * sin + x1 * cos;
-                }
-            }
-        }
-
-        ComputeTensor::from_data(dev, &out, shape)
+        let buf = dev.rope_forward(
+            &input.buffer, &self.cos_table, &self.sin_table,
+            seq_len, n_heads, head_dim, start_pos,
+        );
+        ComputeTensor::from_buffer(buf, shape.to_vec())
     }
 }
 
@@ -547,28 +532,12 @@ impl InterleavedRoPE {
         let n_heads = shape[1];
         let head_dim = shape[2];
         assert_eq!(head_dim, self.head_dim);
-        let half_dim = head_dim / 2;
 
-        let data = dev.download(&grad_output.buffer);
-        let mut out = vec![0.0f32; data.len()];
-
-        for s in 0..seq_len {
-            let pos = start_pos + s;
-            for h in 0..n_heads {
-                let base_idx = (s * n_heads + h) * head_dim;
-                for i in 0..half_dim {
-                    let cos = self.cos_table[pos * half_dim + i];
-                    let sin = self.sin_table[pos * half_dim + i];
-                    let g0 = data[base_idx + 2 * i];
-                    let g1 = data[base_idx + 2 * i + 1];
-                    // Transpose of rotation matrix
-                    out[base_idx + 2 * i] = g0 * cos + g1 * sin;
-                    out[base_idx + 2 * i + 1] = -g0 * sin + g1 * cos;
-                }
-            }
-        }
-
-        ComputeTensor::from_data(dev, &out, shape)
+        let buf = dev.rope_backward(
+            &grad_output.buffer, &self.cos_table, &self.sin_table,
+            seq_len, n_heads, head_dim, start_pos,
+        );
+        ComputeTensor::from_buffer(buf, shape.to_vec())
     }
 }
 

@@ -478,6 +478,72 @@ pub trait ComputeDevice: Send {
         (self.upload(&output), self.upload(&sum_out))
     }
 
+    /// Apply interleaved RoPE forward: rotates pairs (2i, 2i+1) by position-dependent angles.
+    ///
+    /// Input: `[seq_len, n_heads, head_dim]` flat buffer.
+    /// cos/sin tables: `[max_seq_len, half_dim]` precomputed on CPU.
+    /// Returns buffer of same shape.
+    fn rope_forward(
+        &self,
+        input: &Self::Buffer,
+        cos_table: &[f32],
+        sin_table: &[f32],
+        seq_len: usize,
+        n_heads: usize,
+        head_dim: usize,
+        start_pos: usize,
+    ) -> Self::Buffer {
+        let data = self.download(input);
+        let half_dim = head_dim / 2;
+        let mut out = vec![0.0f32; data.len()];
+        for s in 0..seq_len {
+            let pos = start_pos + s;
+            for h in 0..n_heads {
+                let base = (s * n_heads + h) * head_dim;
+                for i in 0..half_dim {
+                    let cos = cos_table[pos * half_dim + i];
+                    let sin = sin_table[pos * half_dim + i];
+                    let x0 = data[base + 2 * i];
+                    let x1 = data[base + 2 * i + 1];
+                    out[base + 2 * i] = x0 * cos - x1 * sin;
+                    out[base + 2 * i + 1] = x0 * sin + x1 * cos;
+                }
+            }
+        }
+        self.upload(&out)
+    }
+
+    /// Apply interleaved RoPE backward: reverse rotation (transpose of rotation matrix).
+    fn rope_backward(
+        &self,
+        grad_output: &Self::Buffer,
+        cos_table: &[f32],
+        sin_table: &[f32],
+        seq_len: usize,
+        n_heads: usize,
+        head_dim: usize,
+        start_pos: usize,
+    ) -> Self::Buffer {
+        let data = self.download(grad_output);
+        let half_dim = head_dim / 2;
+        let mut out = vec![0.0f32; data.len()];
+        for s in 0..seq_len {
+            let pos = start_pos + s;
+            for h in 0..n_heads {
+                let base = (s * n_heads + h) * head_dim;
+                for i in 0..half_dim {
+                    let cos = cos_table[pos * half_dim + i];
+                    let sin = sin_table[pos * half_dim + i];
+                    let g0 = data[base + 2 * i];
+                    let g1 = data[base + 2 * i + 1];
+                    out[base + 2 * i] = g0 * cos + g1 * sin;
+                    out[base + 2 * i + 1] = -g0 * sin + g1 * cos;
+                }
+            }
+        }
+        self.upload(&out)
+    }
+
     /// Element-wise addition: out[i] = a[i] + b[i].
     /// Default: delegates to elementwise(). Override for fused bf16 kernel.
     fn add_tensors_buf(&self, a: &Self::Buffer, b: &Self::Buffer, numel: usize) -> Self::Buffer {
