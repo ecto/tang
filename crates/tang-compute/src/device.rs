@@ -23,6 +23,9 @@ pub trait ComputeDevice: Send {
     /// Which shader dialect this device uses.
     fn dialect(&self) -> Dialect;
 
+    /// Total device memory in bytes (VRAM). Returns 0 if unknown.
+    fn total_memory_bytes(&self) -> usize { 0 }
+
     // -- Buffer lifecycle --
 
     /// Upload f32 data from CPU to device.

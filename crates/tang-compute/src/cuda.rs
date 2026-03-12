@@ -697,6 +697,10 @@ impl ComputeDevice for CudaComputeDevice {
         Dialect::Cuda
     }
 
+    fn total_memory_bytes(&self) -> usize {
+        cudarc::driver::result::mem_get_info().map(|(_, total)| total).unwrap_or(0)
+    }
+
     fn upload(&self, data: &[f32]) -> CudaBuffer {
         if self.mixed_precision {
             let bf16_data: Vec<u16> = data.iter().map(|&v| f32_to_bf16(v)).collect();
