@@ -877,6 +877,413 @@ extern "C" __global__ void causal_attention_backward_flash(
 }
 "#;
 
+/// bf16 D-precompute for flash attention backward using tensor cores.
+/// Reads bf16 dO and O, accumulates in f32, writes f32 D.
+/// Grid: (seq_len, n_heads, batch_size), Block: (min(head_dim, 256))
+pub const FLASH_ATTN_BWD_PRECOMPUTE_D_BF16_CUDA: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void flash_attn_bwd_precompute_d_bf16(
+    const __nv_bfloat16* __restrict__ dO,
+    const __nv_bfloat16* __restrict__ O,
+    float* __restrict__ D,
+    const unsigned int seq_len,
+    const unsigned int n_heads,
+    const unsigned int head_dim,
+    const unsigned int batch_size)
+{
+    extern __shared__ float reduce[];
+
+    const unsigned int pos   = blockIdx.x;
+    const unsigned int head  = blockIdx.y;
+    const unsigned int batch = blockIdx.z;
+    const unsigned int tid   = threadIdx.x;
+    const unsigned int tg_size = blockDim.x;
+
+    if (pos >= seq_len || head >= n_heads || batch >= batch_size) return;
+
+    const unsigned int total_dim = n_heads * head_dim;
+    const unsigned long long base = (unsigned long long)batch * seq_len * total_dim
+        + pos * total_dim + head * head_dim;
+
+    float local_sum = 0.0f;
+    for (unsigned int d = tid; d < head_dim; d += tg_size) {
+        local_sum += __bfloat162float(dO[base + d]) * __bfloat162float(O[base + d]);
+    }
+    reduce[tid] = local_sum;
+    __syncthreads();
+
+    for (unsigned int s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) reduce[tid] += reduce[tid + s];
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        D[batch * seq_len * n_heads + pos * n_heads + head] = reduce[0];
+    }
+}
+"#;
+
+/// Tensor-core flash attention backward (bf16 native, wmma m16n16k16).
+///
+/// Grid: (n_kv_tiles * batch_size, n_heads, q_split)
+/// Block: (128) = 4 warps
+/// TILE_Q = 16, TILE_KV = 16
+///
+/// Shared memory layout (~22KB for head_dim=64):
+///   K_smem[16×hd] bf16, V_smem[16×hd] bf16,
+///   Q_smem[16×hd] bf16, dO_smem[16×hd] bf16,
+///   S[16×16] f32, dK_acc[16×hd] f32, dV_acc[16×hd] f32,
+///   row_m[16] f32, row_l[16] f32, D_cache[16] f32,
+///   P_bf16[16×16] bf16, dS_bf16[16×16] bf16,
+///   S_warp[4][256] f32
+///
+/// All 5 matmuls use wmma m16n16k16 with bf16 A/B → f32 C accumulation.
+/// Gradient outputs (grad_Q/K/V) are f32 for precision.
+pub const CAUSAL_ATTENTION_BACKWARD_FLASH_TC_CUDA: &str = r#"
+#include <mma.h>
+using namespace nvcuda;
+
+#define TC_BWD_TILE_Q  16
+#define TC_BWD_TILE_KV 16
+#define TC_BWD_BLOCK   128
+#define TC_BWD_WARPS   4
+
+extern "C" __global__ void causal_attention_backward_flash_tc(
+    const __nv_bfloat16* __restrict__ dO,
+    const __nv_bfloat16* __restrict__ Q,
+    const __nv_bfloat16* __restrict__ K,
+    const __nv_bfloat16* __restrict__ V,
+    const float* __restrict__ D,
+    float* __restrict__ grad_Q,
+    float* __restrict__ grad_K,
+    float* __restrict__ grad_V,
+    const unsigned int seq_len,
+    const unsigned int n_heads,
+    const unsigned int n_kv_heads,
+    const unsigned int head_dim,
+    const unsigned int q_split,
+    const unsigned int batch_size,
+    const unsigned int n_kv_tiles)
+{
+    extern __shared__ char smem_raw[];
+
+    // Decode grid indices
+    const unsigned int combined = blockIdx.x;
+    const unsigned int tile_idx = combined % n_kv_tiles;
+    const unsigned int batch    = combined / n_kv_tiles;
+    const unsigned int head     = blockIdx.y;
+    const unsigned int q_chunk  = blockIdx.z;
+    const unsigned int tid      = threadIdx.x;
+    const unsigned int warp_id  = tid / 32;
+
+    if (batch >= batch_size) return;
+
+    const unsigned int hd           = head_dim;
+    const unsigned int total_dim    = n_heads * hd;
+    const unsigned int kv_dim       = n_kv_heads * hd;
+    const unsigned int heads_per_kv = n_heads / n_kv_heads;
+    const unsigned int kv_head      = head / heads_per_kv;
+    const float scale               = rsqrtf((float)hd);
+
+    const unsigned int tile_start = tile_idx * TC_BWD_TILE_KV;
+    const unsigned int tile_end   = min(tile_start + (unsigned int)TC_BWD_TILE_KV, seq_len);
+    const unsigned int tile_len   = tile_end - tile_start;
+
+    // Global memory offsets for this batch
+    const __nv_bfloat16* Q_g  = Q  + (unsigned long long)batch * seq_len * total_dim;
+    const __nv_bfloat16* K_g  = K  + (unsigned long long)batch * seq_len * kv_dim;
+    const __nv_bfloat16* V_g  = V  + (unsigned long long)batch * seq_len * kv_dim;
+    const __nv_bfloat16* dO_g = dO + (unsigned long long)batch * seq_len * total_dim;
+    const float* D_g          = D  + (unsigned long long)batch * seq_len * n_heads;
+    float* gQ_g = grad_Q + (unsigned long long)batch * seq_len * total_dim;
+    float* gK_g = grad_K + (unsigned long long)batch * seq_len * kv_dim;
+    float* gV_g = grad_V + (unsigned long long)batch * seq_len * kv_dim;
+
+    // ---- Shared memory layout ----
+    __nv_bfloat16* K_smem  = (__nv_bfloat16*)smem_raw;                                      // [16, hd]
+    __nv_bfloat16* V_smem  = K_smem + TC_BWD_TILE_KV * hd;                                  // [16, hd]
+    __nv_bfloat16* Q_smem  = V_smem + TC_BWD_TILE_KV * hd;                                  // [16, hd]
+    __nv_bfloat16* dO_smem = Q_smem + TC_BWD_TILE_Q * hd;                                   // [16, hd]
+    float* S               = (float*)(dO_smem + TC_BWD_TILE_Q * hd);                        // [16, 16]
+    float* dK_acc          = S + TC_BWD_TILE_Q * TC_BWD_TILE_KV;                             // [16, hd]
+    float* dV_acc          = dK_acc + TC_BWD_TILE_KV * hd;                                   // [16, hd]
+    float* row_m           = dV_acc + TC_BWD_TILE_KV * hd;                                   // [16]
+    float* row_l           = row_m + TC_BWD_TILE_Q;                                          // [16]
+    float* D_cache         = row_l + TC_BWD_TILE_Q;                                          // [16]
+    __nv_bfloat16* P_bf16  = (__nv_bfloat16*)(D_cache + TC_BWD_TILE_Q);                     // [16, 16]
+    __nv_bfloat16* dS_bf16 = P_bf16 + TC_BWD_TILE_Q * TC_BWD_TILE_KV;                      // [16, 16]
+    float* S_warp          = (float*)(dS_bf16 + TC_BWD_TILE_Q * TC_BWD_TILE_KV);            // [4][256]
+
+    const unsigned int n_k_steps = hd / 16;
+
+    // ---- Phase 0: Load K_smem, V_smem, zero dK_acc, dV_acc ----
+    for (unsigned int i = tid; i < TC_BWD_TILE_KV * hd; i += TC_BWD_BLOCK) {
+        unsigned int row = i / hd;
+        unsigned int col = i % hd;
+        __nv_bfloat16 kval = (row < tile_len)
+            ? K_g[(tile_start + row) * kv_dim + kv_head * hd + col]
+            : __float2bfloat16(0.0f);
+        __nv_bfloat16 vval = (row < tile_len)
+            ? V_g[(tile_start + row) * kv_dim + kv_head * hd + col]
+            : __float2bfloat16(0.0f);
+        K_smem[i] = kval;
+        V_smem[i] = vval;
+    }
+    for (unsigned int i = tid; i < TC_BWD_TILE_KV * hd; i += TC_BWD_BLOCK) {
+        dK_acc[i] = 0.0f;
+        dV_acc[i] = 0.0f;
+    }
+    __syncthreads();
+
+    // Compute Q range for this q_chunk (causal: only Q >= tile_start)
+    const unsigned int q_total = (seq_len > tile_start) ? (seq_len - tile_start) : 0;
+    const unsigned int chunk_size = (q_total + q_split - 1) / q_split;
+    const unsigned int q_start = tile_start + q_chunk * chunk_size;
+    const unsigned int q_end   = min(q_start + chunk_size, seq_len);
+
+    // ---- Phase 1: Loop over Q tiles in this chunk ----
+    // Process Q positions in tiles of TC_BWD_TILE_Q
+    for (unsigned int q_tile_start = q_start; q_tile_start < q_end; q_tile_start += TC_BWD_TILE_Q) {
+        unsigned int q_tile_end = min(q_tile_start + (unsigned int)TC_BWD_TILE_Q, q_end);
+
+        // How many KV positions in this tile can the first Q row attend?
+        // If q_tile_start < tile_start, skip (fully masked). This shouldn't happen
+        // due to q_start >= tile_start from causality.
+        if (q_tile_start + TC_BWD_TILE_Q <= tile_start && q_tile_start + TC_BWD_TILE_Q <= tile_start) {
+            continue; // Fully masked — no Q in this tile attends to any K in the KV tile
+        }
+
+        // Step 1: Load Q_smem, dO_smem, D_cache
+        for (unsigned int i = tid; i < TC_BWD_TILE_Q * hd; i += TC_BWD_BLOCK) {
+            unsigned int row = i / hd;
+            unsigned int col = i % hd;
+            unsigned int gq = q_tile_start + row;
+            Q_smem[i]  = (gq < seq_len)
+                ? Q_g[gq * total_dim + head * hd + col]
+                : __float2bfloat16(0.0f);
+            dO_smem[i] = (gq < seq_len)
+                ? dO_g[gq * total_dim + head * hd + col]
+                : __float2bfloat16(0.0f);
+        }
+        if (tid < TC_BWD_TILE_Q) {
+            unsigned int gq = q_tile_start + tid;
+            D_cache[tid] = (gq < seq_len) ? D_g[gq * n_heads + head] : 0.0f;
+        }
+        __syncthreads();
+
+        // Step 2: S = Q × K^T via wmma [16×16]
+        // Each warp handles k-steps strided by 4, accumulates partial S in a fragment
+        {
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_frag;
+            wmma::fill_fragment(acc_frag, 0.0f);
+
+            for (unsigned int ks = warp_id; ks < n_k_steps; ks += TC_BWD_WARPS) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b_frag;
+                // Q_smem[16, hd] row_major, offset by ks*16 columns
+                wmma::load_matrix_sync(a_frag, Q_smem + ks * 16, hd);
+                // K_smem[16, hd] row_major, loaded as col_major → K^T
+                wmma::load_matrix_sync(b_frag, K_smem + ks * 16, hd);
+                wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+            }
+            wmma::store_matrix_sync(S_warp + warp_id * 256, acc_frag, 16, wmma::mem_row_major);
+        }
+        __syncthreads();
+
+        // Reduce across warps into S
+        {
+            unsigned int active_warps = min((unsigned int)TC_BWD_WARPS, n_k_steps);
+            for (unsigned int i = tid; i < TC_BWD_TILE_Q * TC_BWD_TILE_KV; i += TC_BWD_BLOCK) {
+                float sum = 0.0f;
+                for (unsigned int w = 0; w < active_warps; w++)
+                    sum += S_warp[w * 256 + i];
+                S[i] = sum;
+            }
+        }
+        __syncthreads();
+
+        // Apply scale + causal mask
+        for (unsigned int i = tid; i < TC_BWD_TILE_Q * TC_BWD_TILE_KV; i += TC_BWD_BLOCK) {
+            unsigned int q_row = i / TC_BWD_TILE_KV;
+            unsigned int k_col = i % TC_BWD_TILE_KV;
+            unsigned int gq = q_tile_start + q_row;
+            unsigned int gk = tile_start + k_col;
+            if (gq >= seq_len || k_col >= tile_len || gk > gq)
+                S[i] = -1e38f;
+            else
+                S[i] *= scale;
+        }
+        __syncthreads();
+
+        // Step 3: Softmax (8 threads/row, warp shuffles) — S now holds P
+        {
+            const unsigned int tpr = TC_BWD_BLOCK / TC_BWD_TILE_Q;  // 8 threads per row
+            const unsigned int my_row  = tid / tpr;
+            const unsigned int my_lane = tid % tpr;
+
+            if (my_row < TC_BWD_TILE_Q) {
+                // Row max
+                float lmax = -1e38f;
+                for (unsigned int j = my_lane; j < TC_BWD_TILE_KV; j += tpr)
+                    lmax = fmaxf(lmax, S[my_row * TC_BWD_TILE_KV + j]);
+                for (unsigned int off = tpr / 2; off > 0; off >>= 1)
+                    lmax = fmaxf(lmax, __shfl_xor_sync(0xffffffff, lmax, off));
+
+                // Store row stats
+                if (my_lane == 0) {
+                    row_m[my_row] = lmax;
+                }
+            }
+        }
+        __syncthreads();
+
+        {
+            const unsigned int tpr = TC_BWD_BLOCK / TC_BWD_TILE_Q;
+            const unsigned int my_row  = tid / tpr;
+            const unsigned int my_lane = tid % tpr;
+
+            if (my_row < TC_BWD_TILE_Q) {
+                float lmax = row_m[my_row];
+                float lsum = 0.0f;
+                for (unsigned int j = my_lane; j < TC_BWD_TILE_KV; j += tpr) {
+                    float p = expf(S[my_row * TC_BWD_TILE_KV + j] - lmax);
+                    S[my_row * TC_BWD_TILE_KV + j] = p;
+                    lsum += p;
+                }
+                for (unsigned int off = tpr / 2; off > 0; off >>= 1)
+                    lsum += __shfl_xor_sync(0xffffffff, lsum, off);
+
+                if (my_lane == 0) {
+                    row_l[my_row] = lsum;
+                }
+            }
+        }
+        __syncthreads();
+
+        // Normalize P and convert to bf16
+        for (unsigned int i = tid; i < TC_BWD_TILE_Q * TC_BWD_TILE_KV; i += TC_BWD_BLOCK) {
+            unsigned int row = i / TC_BWD_TILE_KV;
+            float inv_l = (row_l[row] > 0.0f) ? (1.0f / row_l[row]) : 0.0f;
+            float p = S[i] * inv_l;
+            S[i] = p;
+            P_bf16[i] = __float2bfloat16(p);
+        }
+        __syncthreads();
+
+        // Step 4: dV_acc += P^T × dO via wmma
+        // P^T[16,16] col_major × dO[16,hd] row_major → [16,hd] f32
+        {
+            const unsigned int n_d_steps = hd / 16;
+            for (unsigned int ds = warp_id; ds < n_d_steps; ds += TC_BWD_WARPS) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::col_major> pt_frag;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> do_frag;
+                wmma::fragment<wmma::accumulator, 16, 16, 16, float> dv_frag;
+
+                wmma::load_matrix_sync(dv_frag, dV_acc + ds * 16, hd, wmma::mem_row_major);
+                wmma::load_matrix_sync(pt_frag, P_bf16, TC_BWD_TILE_KV);
+                wmma::load_matrix_sync(do_frag, dO_smem + ds * 16, hd);
+                wmma::mma_sync(dv_frag, pt_frag, do_frag, dv_frag);
+                wmma::store_matrix_sync(dV_acc + ds * 16, dv_frag, hd, wmma::mem_row_major);
+            }
+        }
+        __syncthreads();
+
+        // Step 5: dP = dO × V^T via wmma [16×16], then fuse dS = P * (dP - D)
+        // Same pattern as Q×K^T: 4 warps split k-steps, reduce via S_warp → S
+        {
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_frag;
+            wmma::fill_fragment(acc_frag, 0.0f);
+
+            for (unsigned int ks = warp_id; ks < n_k_steps; ks += TC_BWD_WARPS) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> do_frag;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> v_frag;
+                wmma::load_matrix_sync(do_frag, dO_smem + ks * 16, hd);
+                wmma::load_matrix_sync(v_frag, V_smem + ks * 16, hd);
+                wmma::mma_sync(acc_frag, do_frag, v_frag, acc_frag);
+            }
+            wmma::store_matrix_sync(S_warp + warp_id * 256, acc_frag, 16, wmma::mem_row_major);
+        }
+        __syncthreads();
+
+        // Reduce dP across warps, fuse dS = P * (dP - D), convert to bf16
+        {
+            unsigned int active_warps = min((unsigned int)TC_BWD_WARPS, n_k_steps);
+            for (unsigned int i = tid; i < TC_BWD_TILE_Q * TC_BWD_TILE_KV; i += TC_BWD_BLOCK) {
+                unsigned int row = i / TC_BWD_TILE_KV;
+                float dp = 0.0f;
+                for (unsigned int w = 0; w < active_warps; w++)
+                    dp += S_warp[w * 256 + i];
+                float ds = S[i] * (dp - D_cache[row]);  // S still holds P from softmax
+                S[i] = ds;                               // Reuse S for dS
+                dS_bf16[i] = __float2bfloat16(ds);
+            }
+        }
+        __syncthreads();
+
+        // Step 6: dQ += dS × K via wmma, atomicAdd to global grad_Q (f32)
+        // dS[16,16] row × K_block[16,16] row → [16,16] f32, per d-step
+        // Each warp handles d-steps strided by WARPS. After each wmma, the warp
+        // stores to its S_warp slot and immediately atomicAdds to global.
+        {
+            const unsigned int n_d_steps = hd / 16;
+            const unsigned int lane = tid % 32;
+            for (unsigned int ds = warp_id; ds < n_d_steps; ds += TC_BWD_WARPS) {
+                wmma::fragment<wmma::accumulator, 16, 16, 16, float> dq_frag;
+                wmma::fill_fragment(dq_frag, 0.0f);
+
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> ds_frag;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> k_frag;
+                wmma::load_matrix_sync(ds_frag, dS_bf16, TC_BWD_TILE_KV);
+                wmma::load_matrix_sync(k_frag, K_smem + ds * 16, hd);
+                wmma::mma_sync(dq_frag, ds_frag, k_frag, dq_frag);
+
+                // store_matrix_sync guarantees warp-level visibility
+                wmma::store_matrix_sync(S_warp + warp_id * 256, dq_frag, 16, wmma::mem_row_major);
+
+                // Each lane in the warp writes its portion to global
+                for (unsigned int i = lane; i < 256; i += 32) {
+                    unsigned int row = i / 16;
+                    unsigned int col = i % 16;
+                    unsigned int gq = q_tile_start + row;
+                    if (gq < seq_len) {
+                        atomicAdd(&gQ_g[gq * total_dim + head * hd + ds * 16 + col],
+                            S_warp[warp_id * 256 + i] * scale);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        // Step 7: dK_acc += dS^T × Q via wmma
+        // dS^T[16,16] col × Q[16,hd] row → [16,hd] f32 accumulated into dK_acc
+        {
+            const unsigned int n_d_steps = hd / 16;
+            for (unsigned int ds = warp_id; ds < n_d_steps; ds += TC_BWD_WARPS) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::col_major> dst_frag;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> q_frag;
+                wmma::fragment<wmma::accumulator, 16, 16, 16, float> dk_frag;
+
+                wmma::load_matrix_sync(dk_frag, dK_acc + ds * 16, hd, wmma::mem_row_major);
+                wmma::load_matrix_sync(dst_frag, dS_bf16, TC_BWD_TILE_KV);
+                wmma::load_matrix_sync(q_frag, Q_smem + ds * 16, hd);
+                wmma::mma_sync(dk_frag, dst_frag, q_frag, dk_frag);
+                wmma::store_matrix_sync(dK_acc + ds * 16, dk_frag, hd, wmma::mem_row_major);
+            }
+        }
+        __syncthreads();
+    }
+
+    // ---- Phase 2: atomicAdd dK_acc × scale and dV_acc to global grad_K, grad_V ----
+    for (unsigned int i = tid; i < tile_len * hd; i += TC_BWD_BLOCK) {
+        unsigned int j = i / hd;
+        unsigned int d = i % hd;
+        atomicAdd(&gK_g[(tile_start + j) * kv_dim + kv_head * hd + d], dK_acc[j * hd + d] * scale);
+        atomicAdd(&gV_g[(tile_start + j) * kv_dim + kv_head * hd + d], dV_acc[j * hd + d]);
+    }
+}
+"#;
+
 /// bf16 causal attention backward. grad_out/Q/K/V are bf16, grad_Q is bf16,
 /// grad_K/grad_V stay f32 (atomic accumulation for precision).
 pub const CAUSAL_ATTENTION_BACKWARD_BF16_CUDA: &str = r#"

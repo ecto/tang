@@ -178,9 +178,54 @@ impl CudaComputeDevice {
         module
     }
 
+    /// Compile and load a CUDA kernel with explicit GPU architecture.
+    /// Required for kernels using wmma/tensor cores (needs sm_80+).
+    fn get_module_with_arch(&self, source: &str, arch: &'static str) -> Arc<CudaModule> {
+        let mut hasher = DefaultHasher::new();
+        source.hash(&mut hasher);
+        arch.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        if let Some(module) = self.module_cache.borrow().get(&hash) {
+            return Arc::clone(module);
+        }
+
+        // Find CUDA include path for mma.h etc
+        let mut include_paths = Vec::new();
+        for candidate in &[
+            "/usr/local/cuda/include",
+            "/usr/local/cuda/targets/x86_64-linux/include",
+        ] {
+            if std::path::Path::new(candidate).exists() {
+                include_paths.push(candidate.to_string());
+            }
+        }
+
+        let opts = nvrtc::CompileOptions {
+            arch: Some(arch),
+            include_paths,
+            ..Default::default()
+        };
+        let ptx = nvrtc::compile_ptx_with_opts(source, opts)
+            .expect("Failed to compile CUDA kernel with arch");
+        let module = self.ctx.load_module(ptx).expect("Failed to load PTX");
+
+        self.module_cache
+            .borrow_mut()
+            .insert(hash, Arc::clone(&module));
+        module
+    }
+
     /// Get a function from a module by name.
     fn get_func(&self, source: &str, fn_name: &str) -> (Arc<CudaModule>, CudaFunction) {
         let module = self.get_module(source);
+        let func = module.load_function(fn_name).expect("Failed to load CUDA function");
+        (module, func)
+    }
+
+    /// Get a function from a module compiled with explicit arch.
+    fn get_func_with_arch(&self, source: &str, fn_name: &str, arch: &'static str) -> (Arc<CudaModule>, CudaFunction) {
+        let module = self.get_module_with_arch(source, arch);
         let func = module.load_function(fn_name).expect("Failed to load CUDA function");
         (module, func)
     }
@@ -429,6 +474,188 @@ impl CudaComputeDevice {
             }
             _ => panic!("write_into: mismatched storage types"),
         }
+    }
+
+    /// Tensor-core flash attention (bf16 native, wmma m16n16k16).
+    /// Used for both single and batched causal attention when inputs are bf16.
+    fn causal_attention_tc(
+        &self,
+        q: &CudaBuffer,
+        k: &CudaBuffer,
+        v: &CudaBuffer,
+        seq_len: usize,
+        batch_size: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> CudaBuffer {
+        let total_dim = n_heads * head_dim;
+        let seq_len_u32 = seq_len as u32;
+        let n_heads_u32 = n_heads as u32;
+        let n_kv_heads_u32 = n_kv_heads as u32;
+        let head_dim_u32 = head_dim as u32;
+        let batch_size_u32 = batch_size as u32;
+
+        let q_tiles = (seq_len + 15) / 16;
+
+        // Shared memory: Q_smem + KV_smem (bf16) + S + O_acc + row_m + row_l (f32) + P_bf16 + S_warp
+        let smem_bytes =
+            (16 * head_dim) * 2       // Q_smem bf16
+            + (16 * head_dim) * 2     // KV_smem bf16
+            + (16 * 16) * 4           // S f32
+            + (16 * head_dim) * 4     // O_acc f32
+            + 16 * 4                  // row_m f32
+            + 16 * 4                  // row_l f32
+            + (16 * 16) * 2           // P_bf16
+            + 4 * (16 * 16) * 4;     // S_warp[4][256] f32
+
+        let cfg = LaunchConfig {
+            block_dim: (128, 1, 1),
+            grid_dim: (q_tiles as u32, n_heads_u32, batch_size_u32),
+            shared_mem_bytes: smem_bytes as u32,
+        };
+
+        let (_module, func) = self.get_func_with_arch(
+            attention_cuda::CAUSAL_ATTENTION_FLASH_TC_CUDA,
+            "causal_attention_flash_tc",
+            "sm_86",
+        );
+
+        let mut output = self.alloc(batch_size * seq_len * total_dim);
+
+        unsafe {
+            self.stream.launch_builder(&func)
+                .arg(q.bf16_data())
+                .arg(k.bf16_data())
+                .arg(v.bf16_data())
+                .arg(output.bf16_data_mut())
+                .arg(&seq_len_u32)
+                .arg(&n_heads_u32)
+                .arg(&n_kv_heads_u32)
+                .arg(&head_dim_u32)
+                .arg(&batch_size_u32)
+                .launch(cfg)
+                .unwrap();
+        }
+
+        output
+    }
+
+    /// Tensor-core flash attention backward (bf16 native, wmma m16n16k16).
+    /// Used for both single and batched causal attention backward when inputs are bf16.
+    /// Gradient outputs are f32 for precision.
+    fn causal_attention_backward_tc(
+        &self,
+        grad_output: &CudaBuffer,
+        q: &CudaBuffer,
+        k: &CudaBuffer,
+        v: &CudaBuffer,
+        output: &CudaBuffer,
+        seq_len: usize,
+        batch_size: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> (CudaBuffer, CudaBuffer, CudaBuffer) {
+        let total_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let seq_len_u32 = seq_len as u32;
+        let n_heads_u32 = n_heads as u32;
+        let n_kv_heads_u32 = n_kv_heads as u32;
+        let head_dim_u32 = head_dim as u32;
+        let batch_size_u32 = batch_size as u32;
+
+        // Step 1: Precompute D[i,h] = sum_d(dO[i,d] * O[i,d]) — bf16 native
+        let d_tg = std::cmp::min(head_dim, 256).next_power_of_two();
+        let d_cfg = LaunchConfig {
+            block_dim: (d_tg as u32, 1, 1),
+            grid_dim: (seq_len as u32, n_heads as u32, batch_size_u32),
+            shared_mem_bytes: (d_tg * 4) as u32,
+        };
+        let (_module, d_func) = self.get_func_with_arch(
+            backward_cuda::FLASH_ATTN_BWD_PRECOMPUTE_D_BF16_CUDA,
+            "flash_attn_bwd_precompute_d_bf16",
+            "sm_86",
+        );
+        let mut d_buf = self.alloc_f32(batch_size * seq_len * n_heads);
+        unsafe {
+            self.stream.launch_builder(&d_func)
+                .arg(grad_output.bf16_data())
+                .arg(output.bf16_data())
+                .arg(d_buf.f32_data_mut())
+                .arg(&seq_len_u32)
+                .arg(&n_heads_u32)
+                .arg(&head_dim_u32)
+                .arg(&batch_size_u32)
+                .launch(d_cfg)
+                .unwrap();
+        }
+
+        // Step 2: TC flash backward kernel
+        let tile_kv: usize = 16; // must match TC_BWD_TILE_KV in kernel
+        let n_kv_tiles = (seq_len + tile_kv - 1) / tile_kv;
+        let q_split: usize = 8;
+        let bwd_tg: usize = 128;
+
+        // Shared memory: K_smem + V_smem + Q_smem + dO_smem (bf16)
+        //              + S + dK_acc + dV_acc + row_m + row_l + D_cache (f32)
+        //              + P_bf16 + dS_bf16 (bf16)
+        //              + S_warp[4][256] (f32)
+        let smem_bytes =
+            (tile_kv * head_dim) * 2         // K_smem bf16
+            + (tile_kv * head_dim) * 2       // V_smem bf16
+            + (16 * head_dim) * 2            // Q_smem bf16
+            + (16 * head_dim) * 2            // dO_smem bf16
+            + (16 * 16) * 4                  // S f32
+            + (tile_kv * head_dim) * 4       // dK_acc f32
+            + (tile_kv * head_dim) * 4       // dV_acc f32
+            + 16 * 4                         // row_m f32
+            + 16 * 4                         // row_l f32
+            + 16 * 4                         // D_cache f32
+            + (16 * 16) * 2                  // P_bf16
+            + (16 * 16) * 2                  // dS_bf16
+            + 4 * (16 * 16) * 4;            // S_warp[4][256] f32
+
+        let bwd_cfg = LaunchConfig {
+            block_dim: (bwd_tg as u32, 1, 1),
+            grid_dim: ((n_kv_tiles * batch_size) as u32, n_heads as u32, q_split as u32),
+            shared_mem_bytes: smem_bytes as u32,
+        };
+        let (_module, bwd_func) = self.get_func_with_arch(
+            backward_cuda::CAUSAL_ATTENTION_BACKWARD_FLASH_TC_CUDA,
+            "causal_attention_backward_flash_tc",
+            "sm_86",
+        );
+
+        // Gradient outputs are f32 (atomicAdd targets)
+        let mut grad_q = self.alloc_f32(batch_size * seq_len * total_dim);
+        let mut grad_k = self.alloc_f32(batch_size * seq_len * kv_dim);
+        let mut grad_v = self.alloc_f32(batch_size * seq_len * kv_dim);
+
+        let q_split_u32 = q_split as u32;
+        let n_kv_tiles_u32 = n_kv_tiles as u32;
+        unsafe {
+            self.stream.launch_builder(&bwd_func)
+                .arg(grad_output.bf16_data())
+                .arg(q.bf16_data())
+                .arg(k.bf16_data())
+                .arg(v.bf16_data())
+                .arg(d_buf.f32_data())
+                .arg(grad_q.f32_data_mut())
+                .arg(grad_k.f32_data_mut())
+                .arg(grad_v.f32_data_mut())
+                .arg(&seq_len_u32)
+                .arg(&n_heads_u32)
+                .arg(&n_kv_heads_u32)
+                .arg(&head_dim_u32)
+                .arg(&q_split_u32)
+                .arg(&batch_size_u32)
+                .arg(&n_kv_tiles_u32)
+                .launch(bwd_cfg)
+                .unwrap();
+        }
+
+        (grad_q, grad_k, grad_v)
     }
 }
 
@@ -849,7 +1076,14 @@ impl ComputeDevice for CudaComputeDevice {
         let n_kv_heads_u32 = n_kv_heads as u32;
         let head_dim_u32 = head_dim as u32;
 
-        // Convert bf16 to f32 on GPU — use flash kernel for all paths
+        // Use tensor core kernel for bf16 inputs with head_dim multiple of 16
+        if q.is_bf16() && head_dim % 16 == 0 {
+            return self.causal_attention_tc(
+                q, k, v, seq_len, 1, n_heads, n_kv_heads, head_dim,
+            );
+        }
+
+        // f32 fallback: convert bf16 if needed
         let q_conv = if q.is_bf16() { Some(self.convert_bf16_to_f32(q)) } else { None };
         let k_conv = if k.is_bf16() { Some(self.convert_bf16_to_f32(k)) } else { None };
         let v_conv = if v.is_bf16() { Some(self.convert_bf16_to_f32(v)) } else { None };
@@ -858,43 +1092,39 @@ impl ComputeDevice for CudaComputeDevice {
         let v_ref = v_conv.as_ref().unwrap_or(v);
         let return_bf16 = q.is_bf16();
 
-        {
-            // FlashAttention-style kernel: block_dim = head_dim, dynamic shared memory
-            // smem: tile_scores[FA_TILE_KV] + reduce[blockDim] + out_acc[head_dim]
-            let tile_kv: usize = 64; // must match FA_TILE_KV in the kernel
-            let smem_bytes = (tile_kv + head_dim + head_dim) * 4;
-            let batch_size: u32 = 1;
-            let cfg = LaunchConfig {
-                block_dim: (head_dim as u32, 1, 1),
-                grid_dim: (seq_len as u32, n_heads as u32, batch_size),
-                shared_mem_bytes: smem_bytes as u32,
-            };
-            let (_module, func) = self.get_func(
-                attention_cuda::CAUSAL_ATTENTION_FLASH_CUDA,
-                "causal_attention_flash",
-            );
-            let mut output = self.alloc_f32(seq_len * total_dim);
+        let tile_kv: usize = 64;
+        let smem_bytes = (tile_kv + head_dim + head_dim) * 4;
+        let batch_size: u32 = 1;
+        let cfg = LaunchConfig {
+            block_dim: (head_dim as u32, 1, 1),
+            grid_dim: (seq_len as u32, n_heads as u32, batch_size),
+            shared_mem_bytes: smem_bytes as u32,
+        };
+        let (_module, func) = self.get_func(
+            attention_cuda::CAUSAL_ATTENTION_FLASH_CUDA,
+            "causal_attention_flash",
+        );
+        let mut output = self.alloc_f32(seq_len * total_dim);
 
-            unsafe {
-                self.stream.launch_builder(&func)
-                    .arg(q_ref.f32_data())
-                    .arg(k_ref.f32_data())
-                    .arg(v_ref.f32_data())
-                    .arg(output.f32_data_mut())
-                    .arg(&seq_len_u32)
-                    .arg(&n_heads_u32)
-                    .arg(&n_kv_heads_u32)
-                    .arg(&head_dim_u32)
-                    .arg(&batch_size)
-                    .launch(cfg)
-                    .unwrap();
-            }
+        unsafe {
+            self.stream.launch_builder(&func)
+                .arg(q_ref.f32_data())
+                .arg(k_ref.f32_data())
+                .arg(v_ref.f32_data())
+                .arg(output.f32_data_mut())
+                .arg(&seq_len_u32)
+                .arg(&n_heads_u32)
+                .arg(&n_kv_heads_u32)
+                .arg(&head_dim_u32)
+                .arg(&batch_size)
+                .launch(cfg)
+                .unwrap();
+        }
 
-            if return_bf16 {
-                self.convert_f32_to_bf16(&output)
-            } else {
-                output
-            }
+        if return_bf16 {
+            self.convert_f32_to_bf16(&output)
+        } else {
+            output
         }
     }
 
@@ -1264,11 +1494,17 @@ impl ComputeDevice for CudaComputeDevice {
         let n_kv_heads_u32 = n_kv_heads as u32;
         let head_dim_u32 = head_dim as u32;
 
-        // For mixed precision: convert any bf16 inputs to f32 on GPU (no CPU round-trip)
-        // and use the f32 flash attention backward for better gradient precision.
+        // For mixed precision: use TC backward when bf16 + head_dim%16==0,
+        // otherwise convert to f32 and use scalar flash backward.
         let any_bf16 = q.is_bf16() || k.is_bf16() || v.is_bf16() || grad_output.is_bf16();
 
-        if any_bf16 {
+        if any_bf16 && q.is_bf16() && head_dim % 16 == 0 {
+            // TC path: recompute forward O (bf16), then TC precompute-D + TC backward
+            let o_buf = self.causal_attention_tc(q, k, v, seq_len, 1, n_heads, n_kv_heads, head_dim);
+            return self.causal_attention_backward_tc(
+                grad_output, q, k, v, &o_buf, seq_len, 1, n_heads, n_kv_heads, head_dim,
+            );
+        } else if any_bf16 {
             let go_conv = if grad_output.is_bf16() { Some(self.convert_bf16_to_f32(grad_output)) } else { None };
             let q_conv = if q.is_bf16() { Some(self.convert_bf16_to_f32(q)) } else { None };
             let k_conv = if k.is_bf16() { Some(self.convert_bf16_to_f32(k)) } else { None };
@@ -1411,10 +1647,14 @@ impl ComputeDevice for CudaComputeDevice {
         let n_kv_heads_u32 = n_kv_heads as u32;
         let head_dim_u32 = head_dim as u32;
 
-        // Convert bf16 inputs to f32 on GPU
+        // Convert bf16 inputs to f32 on GPU, or use TC path if eligible
         let any_bf16 = q.is_bf16() || k.is_bf16() || v.is_bf16()
             || grad_output.is_bf16() || output.is_bf16();
-        if any_bf16 {
+        if any_bf16 && q.is_bf16() && head_dim % 16 == 0 {
+            return self.causal_attention_backward_tc(
+                grad_output, q, k, v, output, seq_len, 1, n_heads, n_kv_heads, head_dim,
+            );
+        } else if any_bf16 {
             let go_conv = if grad_output.is_bf16() { Some(self.convert_bf16_to_f32(grad_output)) } else { None };
             let q_conv = if q.is_bf16() { Some(self.convert_bf16_to_f32(q)) } else { None };
             let k_conv = if k.is_bf16() { Some(self.convert_bf16_to_f32(k)) } else { None };
@@ -1513,6 +1753,13 @@ impl ComputeDevice for CudaComputeDevice {
         n_kv_heads: usize,
         head_dim: usize,
     ) -> CudaBuffer {
+        // Use tensor core kernel for bf16 inputs with head_dim multiple of 16
+        if q.is_bf16() && head_dim % 16 == 0 {
+            return self.causal_attention_tc(
+                q, k, v, seq_len, batch_size, n_heads, n_kv_heads, head_dim,
+            );
+        }
+
         if batch_size == 1 {
             return self.causal_attention(q, k, v, seq_len, n_heads, n_kv_heads, head_dim);
         }
@@ -1523,7 +1770,7 @@ impl ComputeDevice for CudaComputeDevice {
         let head_dim_u32 = head_dim as u32;
         let batch_size_u32 = batch_size as u32;
 
-        // Convert bf16 to f32 on GPU
+        // f32 path
         let q_conv = if q.is_bf16() { Some(self.convert_bf16_to_f32(q)) } else { None };
         let k_conv = if k.is_bf16() { Some(self.convert_bf16_to_f32(k)) } else { None };
         let v_conv = if v.is_bf16() { Some(self.convert_bf16_to_f32(v)) } else { None };
@@ -1580,6 +1827,13 @@ impl ComputeDevice for CudaComputeDevice {
         n_kv_heads: usize,
         head_dim: usize,
     ) -> (CudaBuffer, CudaBuffer, CudaBuffer) {
+        // Use TC backward for bf16 batched path
+        if q.is_bf16() && head_dim % 16 == 0 {
+            return self.causal_attention_backward_tc(
+                grad_output, q, k, v, output, seq_len, batch_size, n_heads, n_kv_heads, head_dim,
+            );
+        }
+
         if batch_size == 1 {
             return self.causal_attention_backward_with_output(
                 grad_output, q, k, v, output, seq_len, n_heads, n_kv_heads, head_dim,
@@ -2633,6 +2887,292 @@ mod tests {
         let elapsed = t0.elapsed().as_secs_f64();
         let per_call = elapsed / iters as f64;
         eprintln!("  flash forward  350M (seq=512): {:.3}ms/call ({} iters, {:.3}s total)",
+            per_call * 1000.0, iters, elapsed);
+        eprintln!();
+    }
+
+    #[test]
+    fn tc_forward_matches_cpu() {
+        // Verify tensor-core flash attention matches CPU reference
+        // head_dim must be multiple of 16 for wmma
+        let seq_len = 32;
+        let n_heads = 4;
+        let n_kv_heads = 2;
+        let head_dim = 16;
+        let total_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+
+        let q: Vec<f32> = (0..seq_len * total_dim).map(|i| ((i as f32) * 0.1 - 1.0).sin() * 0.5).collect();
+        let k: Vec<f32> = (0..seq_len * kv_dim).map(|i| ((i as f32) * 0.2 + 0.5).cos() * 0.5).collect();
+        let v: Vec<f32> = (0..seq_len * kv_dim).map(|i| ((i as f32) * 0.15 - 0.3).sin() * 0.5).collect();
+
+        // CPU reference
+        let cpu = CpuDevice::new();
+        let o_cpu = cpu.causal_attention(
+            &cpu.upload(&q), &cpu.upload(&k), &cpu.upload(&v),
+            seq_len, n_heads, n_kv_heads, head_dim,
+        );
+        let o_ref = cpu.download(&o_cpu);
+
+        // GPU with bf16 (triggers TC kernel)
+        let gpu = CudaComputeDevice::new_mixed_precision().expect("no CUDA GPU");
+        let o_gpu = gpu.causal_attention(
+            &gpu.upload(&q), &gpu.upload(&k), &gpu.upload(&v),
+            seq_len, n_heads, n_kv_heads, head_dim,
+        );
+        let o_cuda = gpu.download(&o_gpu);
+
+        // bf16 precision: tolerance ~1e-2 (bf16 has ~3 decimal digits)
+        approx_eq(&o_cuda, &o_ref, 5e-2, "TC forward output");
+    }
+
+    #[test]
+    fn tc_forward_matches_cpu_350m_shape() {
+        // Test at actual 350M model shape: seq=64, n_heads=16, n_kv_heads=4, head_dim=64
+        let seq_len = 64;
+        let n_heads = 16;
+        let n_kv_heads = 4;
+        let head_dim = 64;
+        let total_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+
+        let q: Vec<f32> = (0..seq_len * total_dim).map(|i| ((i as f32) * 0.01).sin() * 0.1).collect();
+        let k: Vec<f32> = (0..seq_len * kv_dim).map(|i| ((i as f32) * 0.02).cos() * 0.1).collect();
+        let v: Vec<f32> = (0..seq_len * kv_dim).map(|i| ((i as f32) * 0.015).sin() * 0.1).collect();
+
+        let cpu = CpuDevice::new();
+        let o_cpu = cpu.causal_attention(
+            &cpu.upload(&q), &cpu.upload(&k), &cpu.upload(&v),
+            seq_len, n_heads, n_kv_heads, head_dim,
+        );
+        let o_ref = cpu.download(&o_cpu);
+
+        let gpu = CudaComputeDevice::new_mixed_precision().expect("no CUDA GPU");
+        let o_gpu = gpu.causal_attention(
+            &gpu.upload(&q), &gpu.upload(&k), &gpu.upload(&v),
+            seq_len, n_heads, n_kv_heads, head_dim,
+        );
+        let o_cuda = gpu.download(&o_gpu);
+
+        approx_eq(&o_cuda, &o_ref, 5e-2, "TC forward 350m shape");
+    }
+
+    #[test]
+    fn tc_forward_batched_matches_cpu() {
+        // Test batched TC attention
+        let seq_len = 32;
+        let batch_size = 4;
+        let n_heads = 4;
+        let n_kv_heads = 2;
+        let head_dim = 16;
+        let total_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+
+        let q: Vec<f32> = (0..batch_size * seq_len * total_dim).map(|i| ((i as f32) * 0.1 - 1.0).sin() * 0.5).collect();
+        let k: Vec<f32> = (0..batch_size * seq_len * kv_dim).map(|i| ((i as f32) * 0.2 + 0.5).cos() * 0.5).collect();
+        let v: Vec<f32> = (0..batch_size * seq_len * kv_dim).map(|i| ((i as f32) * 0.15 - 0.3).sin() * 0.5).collect();
+
+        // CPU reference: run each batch separately
+        let cpu = CpuDevice::new();
+        let mut o_ref = Vec::new();
+        for b in 0..batch_size {
+            let q_b: Vec<f32> = q[b * seq_len * total_dim..(b + 1) * seq_len * total_dim].to_vec();
+            let k_b: Vec<f32> = k[b * seq_len * kv_dim..(b + 1) * seq_len * kv_dim].to_vec();
+            let v_b: Vec<f32> = v[b * seq_len * kv_dim..(b + 1) * seq_len * kv_dim].to_vec();
+            let o = cpu.causal_attention(
+                &cpu.upload(&q_b), &cpu.upload(&k_b), &cpu.upload(&v_b),
+                seq_len, n_heads, n_kv_heads, head_dim,
+            );
+            o_ref.extend(cpu.download(&o));
+        }
+
+        let gpu = CudaComputeDevice::new_mixed_precision().expect("no CUDA GPU");
+        let o_gpu = gpu.batched_causal_attention(
+            &gpu.upload(&q), &gpu.upload(&k), &gpu.upload(&v),
+            seq_len, batch_size, n_heads, n_kv_heads, head_dim,
+        );
+        let o_cuda = gpu.download(&o_gpu);
+
+        approx_eq(&o_cuda, &o_ref, 5e-2, "TC batched forward");
+    }
+
+    #[test]
+    fn tc_forward_bench_350m() {
+        // Benchmark TC attention at 350M shape
+        let seq_len = 512;
+        let n_heads = 16;
+        let n_kv_heads = 4;
+        let head_dim = 64;
+        let total_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+
+        let q: Vec<f32> = (0..seq_len * total_dim).map(|i| ((i as f32) * 0.01).sin() * 0.1).collect();
+        let k: Vec<f32> = (0..seq_len * kv_dim).map(|i| ((i as f32) * 0.02).cos() * 0.1).collect();
+        let v: Vec<f32> = (0..seq_len * kv_dim).map(|i| ((i as f32) * 0.015).sin() * 0.1).collect();
+
+        let gpu = CudaComputeDevice::new_mixed_precision().expect("no CUDA GPU");
+        let q_gpu = gpu.upload(&q);
+        let k_gpu = gpu.upload(&k);
+        let v_gpu = gpu.upload(&v);
+
+        // Warmup
+        for _ in 0..5 {
+            let _ = gpu.causal_attention(&q_gpu, &k_gpu, &v_gpu, seq_len, n_heads, n_kv_heads, head_dim);
+        }
+        gpu.stream.synchronize().unwrap();
+
+        let iters = 100;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = gpu.causal_attention(&q_gpu, &k_gpu, &v_gpu, seq_len, n_heads, n_kv_heads, head_dim);
+        }
+        gpu.stream.synchronize().unwrap();
+        let elapsed = t0.elapsed().as_secs_f64();
+        let per_call = elapsed / iters as f64;
+        eprintln!("  TC flash forward 350M (seq=512): {:.3}ms/call ({} iters, {:.3}s total)",
+            per_call * 1000.0, iters, elapsed);
+    }
+
+    #[test]
+    fn tc_backward_matches_cpu() {
+        // Small shape: seq=32, n_heads=4, n_kv_heads=2, head_dim=16
+        let seq_len = 32;
+        let n_heads = 4;
+        let n_kv_heads = 2;
+        let head_dim = 16;
+        let total_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+
+        let q: Vec<f32> = (0..seq_len * total_dim).map(|i| ((i as f32) * 0.1 - 1.0).sin() * 0.1).collect();
+        let k: Vec<f32> = (0..seq_len * kv_dim).map(|i| ((i as f32) * 0.2 + 0.5).cos() * 0.1).collect();
+        let v: Vec<f32> = (0..seq_len * kv_dim).map(|i| ((i as f32) * 0.15 - 0.3).sin() * 0.1).collect();
+        let grad_out: Vec<f32> = (0..seq_len * total_dim).map(|i| ((i as f32) * 0.25 + 0.1).cos() * 0.1).collect();
+
+        // CPU reference
+        let cpu = CpuDevice::new();
+        let (gq_cpu, gk_cpu, gv_cpu) = cpu.causal_attention_backward(
+            &cpu.upload(&grad_out), &cpu.upload(&q), &cpu.upload(&k),
+            &cpu.upload(&v), seq_len, n_heads, n_kv_heads, head_dim,
+        );
+        let gq_ref = cpu.download(&gq_cpu);
+        let gk_ref = cpu.download(&gk_cpu);
+        let gv_ref = cpu.download(&gv_cpu);
+
+        // GPU with bf16 (triggers TC backward kernel)
+        let gpu = CudaComputeDevice::new_mixed_precision().expect("no CUDA GPU");
+        let (gq_gpu, gk_gpu, gv_gpu) = gpu.causal_attention_backward(
+            &gpu.upload(&grad_out), &gpu.upload(&q), &gpu.upload(&k), &gpu.upload(&v),
+            seq_len, n_heads, n_kv_heads, head_dim,
+        );
+        let gq_cuda = gpu.download(&gq_gpu);
+        let gk_cuda = gpu.download(&gk_gpu);
+        let gv_cuda = gpu.download(&gv_gpu);
+
+        // bf16 backward: tile-local softmax + bf16 quantization → wider tolerance
+        approx_eq(&gq_cuda, &gq_ref, 3e-1, "TC grad_Q");
+        approx_eq(&gk_cuda, &gk_ref, 3e-1, "TC grad_K");
+        approx_eq(&gv_cuda, &gv_ref, 3e-1, "TC grad_V");
+    }
+
+    #[test]
+    fn tc_backward_matches_cpu_350m_shape() {
+        // 350M model shape at reduced seq_len
+        let seq_len = 64;
+        let n_heads = 16;
+        let n_kv_heads = 4;
+        let head_dim = 64;
+        let total_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+
+        let q: Vec<f32> = (0..seq_len * total_dim).map(|i| ((i as f32) * 0.01 - 2.0).sin() * 0.1).collect();
+        let k: Vec<f32> = (0..seq_len * kv_dim).map(|i| ((i as f32) * 0.02 + 1.0).cos() * 0.1).collect();
+        let v: Vec<f32> = (0..seq_len * kv_dim).map(|i| ((i as f32) * 0.015 - 0.5).sin() * 0.1).collect();
+        let grad_out: Vec<f32> = (0..seq_len * total_dim).map(|i| ((i as f32) * 0.03 + 0.2).cos() * 0.1).collect();
+
+        let cpu = CpuDevice::new();
+        let (gq_cpu, gk_cpu, gv_cpu) = cpu.causal_attention_backward(
+            &cpu.upload(&grad_out), &cpu.upload(&q), &cpu.upload(&k),
+            &cpu.upload(&v), seq_len, n_heads, n_kv_heads, head_dim,
+        );
+        let gq_ref = cpu.download(&gq_cpu);
+        let gk_ref = cpu.download(&gk_cpu);
+        let gv_ref = cpu.download(&gv_cpu);
+
+        let gpu = CudaComputeDevice::new_mixed_precision().expect("no CUDA GPU");
+        let (gq_gpu, gk_gpu, gv_gpu) = gpu.causal_attention_backward(
+            &gpu.upload(&grad_out), &gpu.upload(&q), &gpu.upload(&k), &gpu.upload(&v),
+            seq_len, n_heads, n_kv_heads, head_dim,
+        );
+        let gq_cuda = gpu.download(&gq_gpu);
+        let gk_cuda = gpu.download(&gk_gpu);
+        let gv_cuda = gpu.download(&gv_gpu);
+
+        // bf16 multi-tile backward with tile-local softmax recompute
+        approx_eq(&gq_cuda, &gq_ref, 3e-1, "TC 350m grad_Q");
+        approx_eq(&gk_cuda, &gk_ref, 3e-1, "TC 350m grad_K");
+        approx_eq(&gv_cuda, &gv_ref, 3e-1, "TC 350m grad_V");
+    }
+
+    #[test]
+    fn tc_backward_bench_350m() {
+        // Benchmark TC backward at actual 350M training shape
+        let seq_len = 512;
+        let n_heads = 16;
+        let n_kv_heads = 4;
+        let head_dim = 64;
+        let total_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+
+        let q: Vec<f32> = (0..seq_len * total_dim).map(|i| ((i as f32) * 0.01).sin() * 0.1).collect();
+        let k: Vec<f32> = (0..seq_len * kv_dim).map(|i| ((i as f32) * 0.02).cos() * 0.1).collect();
+        let v: Vec<f32> = (0..seq_len * kv_dim).map(|i| ((i as f32) * 0.015).sin() * 0.1).collect();
+        let grad_out: Vec<f32> = (0..seq_len * total_dim).map(|i| ((i as f32) * 0.03).cos() * 0.1).collect();
+
+        let gpu = CudaComputeDevice::new_mixed_precision().expect("no CUDA GPU");
+        let q_gpu = gpu.upload(&q);
+        let k_gpu = gpu.upload(&k);
+        let v_gpu = gpu.upload(&v);
+        let go_gpu = gpu.upload(&grad_out);
+
+        // Warmup
+        let _ = gpu.causal_attention_backward(
+            &go_gpu, &q_gpu, &k_gpu, &v_gpu, seq_len, n_heads, n_kv_heads, head_dim,
+        );
+        gpu.sync();
+
+        let iters = 20;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = gpu.causal_attention_backward(
+                &go_gpu, &q_gpu, &k_gpu, &v_gpu, seq_len, n_heads, n_kv_heads, head_dim,
+            );
+            gpu.sync();
+        }
+        let elapsed = t0.elapsed().as_secs_f64();
+        let per_call = elapsed / iters as f64;
+        eprintln!("  TC backward 350M (seq=512): {:.3}ms/call ({} iters, {:.3}s total)",
+            per_call * 1000.0, iters, elapsed);
+
+        // Also bench f32 flash backward for comparison
+        let gpu_f32 = CudaComputeDevice::new().expect("no CUDA GPU");
+        let q_f32 = gpu_f32.upload(&q);
+        let k_f32 = gpu_f32.upload(&k);
+        let v_f32 = gpu_f32.upload(&v);
+        let go_f32 = gpu_f32.upload(&grad_out);
+        let _ = gpu_f32.causal_attention_backward(
+            &go_f32, &q_f32, &k_f32, &v_f32, seq_len, n_heads, n_kv_heads, head_dim,
+        );
+        gpu_f32.sync();
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = gpu_f32.causal_attention_backward(
+                &go_f32, &q_f32, &k_f32, &v_f32, seq_len, n_heads, n_kv_heads, head_dim,
+            );
+            gpu_f32.sync();
+        }
+        let elapsed = t0.elapsed().as_secs_f64();
+        let per_call = elapsed / iters as f64;
+        eprintln!("  f32 flash backward 350M (seq=512): {:.3}ms/call ({} iters, {:.3}s total)",
             per_call * 1000.0, iters, elapsed);
         eprintln!();
     }
