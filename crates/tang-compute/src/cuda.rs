@@ -320,46 +320,77 @@ impl CudaComputeDevice {
         dim: usize,
         eps: f32,
     ) -> (CudaBuffer, CudaBuffer) {
-        // Handle bf16 inputs: convert to f32, run kernel, convert back
-        let any_bf16 = input.is_bf16() || residual.is_bf16() || weight.is_bf16();
-        let inp_conv = if input.is_bf16() { Some(self.convert_bf16_to_f32(input)) } else { None };
-        let res_conv = if residual.is_bf16() { Some(self.convert_bf16_to_f32(residual)) } else { None };
-        let wt_conv = if weight.is_bf16() { Some(self.convert_bf16_to_f32(weight)) } else { None };
-        let inp_ref = inp_conv.as_ref().unwrap_or(input);
-        let res_ref = res_conv.as_ref().unwrap_or(residual);
-        let wt_ref = wt_conv.as_ref().unwrap_or(weight);
-
         let tg = std::cmp::min(dim, 256).next_power_of_two();
         let cfg = LaunchConfig {
             block_dim: (tg as u32, 1, 1),
             grid_dim: (n_groups as u32, 1, 1),
             shared_mem_bytes: 0,
         };
-        let (_module, func) = self.get_func(
-            util_cuda::RMS_NORM_RESIDUAL_CUDA,
-            "rms_norm_residual",
-        );
-        let mut output = self.alloc_f32(n_groups * dim);
-        let mut sum_out = self.alloc_f32(n_groups * dim);
         let n_groups_u32 = n_groups as u32;
         let dim_u32 = dim as u32;
-        unsafe {
-            self.stream.launch_builder(&func)
-                .arg(inp_ref.f32_data())
-                .arg(res_ref.f32_data())
-                .arg(wt_ref.f32_data())
-                .arg(output.f32_data_mut())
-                .arg(sum_out.f32_data_mut())
-                .arg(&n_groups_u32)
-                .arg(&dim_u32)
-                .arg(&eps)
-                .launch(cfg)
-                .unwrap();
-        }
-        if any_bf16 {
-            (self.convert_f32_to_bf16(&output), self.convert_f32_to_bf16(&sum_out))
-        } else {
+
+        if input.is_bf16() && residual.is_bf16() && weight.is_bf16() {
+            // Native bf16 path: single kernel, no conversions
+            let (_module, func) = self.get_func(
+                util_cuda::RMS_NORM_RESIDUAL_BF16_CUDA,
+                "rms_norm_residual_bf16",
+            );
+            let mut output = CudaBuffer {
+                storage: CudaStorage::Bf16(self.stream.alloc_zeros::<u16>(n_groups * dim).unwrap()),
+                len: n_groups * dim,
+            };
+            let mut sum_out = CudaBuffer {
+                storage: CudaStorage::Bf16(self.stream.alloc_zeros::<u16>(n_groups * dim).unwrap()),
+                len: n_groups * dim,
+            };
+            unsafe {
+                self.stream.launch_builder(&func)
+                    .arg(input.bf16_data())
+                    .arg(residual.bf16_data())
+                    .arg(weight.bf16_data())
+                    .arg(output.bf16_data_mut())
+                    .arg(sum_out.bf16_data_mut())
+                    .arg(&n_groups_u32)
+                    .arg(&dim_u32)
+                    .arg(&eps)
+                    .launch(cfg)
+                    .unwrap();
+            }
             (output, sum_out)
+        } else {
+            // Fall back to f32 path for mixed or pure f32 types
+            let any_bf16 = input.is_bf16() || residual.is_bf16() || weight.is_bf16();
+            let inp_conv = if input.is_bf16() { Some(self.convert_bf16_to_f32(input)) } else { None };
+            let res_conv = if residual.is_bf16() { Some(self.convert_bf16_to_f32(residual)) } else { None };
+            let wt_conv = if weight.is_bf16() { Some(self.convert_bf16_to_f32(weight)) } else { None };
+            let inp_ref = inp_conv.as_ref().unwrap_or(input);
+            let res_ref = res_conv.as_ref().unwrap_or(residual);
+            let wt_ref = wt_conv.as_ref().unwrap_or(weight);
+
+            let (_module, func) = self.get_func(
+                util_cuda::RMS_NORM_RESIDUAL_CUDA,
+                "rms_norm_residual",
+            );
+            let mut output = self.alloc_f32(n_groups * dim);
+            let mut sum_out = self.alloc_f32(n_groups * dim);
+            unsafe {
+                self.stream.launch_builder(&func)
+                    .arg(inp_ref.f32_data())
+                    .arg(res_ref.f32_data())
+                    .arg(wt_ref.f32_data())
+                    .arg(output.f32_data_mut())
+                    .arg(sum_out.f32_data_mut())
+                    .arg(&n_groups_u32)
+                    .arg(&dim_u32)
+                    .arg(&eps)
+                    .launch(cfg)
+                    .unwrap();
+            }
+            if any_bf16 {
+                (self.convert_f32_to_bf16(&output), self.convert_f32_to_bf16(&sum_out))
+            } else {
+                (output, sum_out)
+            }
         }
     }
 
@@ -2101,6 +2132,169 @@ impl ComputeDevice for CudaComputeDevice {
         }
     }
 
+    fn matmul_a_transposed(
+        &self,
+        a: &CudaBuffer,   // [k, m] row-major
+        b: &CudaBuffer,   // [k, n] row-major
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> CudaBuffer {
+        let cublas_m = n as i32;
+        let cublas_n = m as i32;
+        let cublas_k = k as i32;
+
+        // Mixed input types: convert
+        if a.is_bf16() != b.is_bf16() {
+            let a_conv = if a.is_bf16() { Some(self.convert_bf16_to_f32(a)) } else { None };
+            let b_conv = if b.is_bf16() { Some(self.convert_bf16_to_f32(b)) } else { None };
+            let a_ref = a_conv.as_ref().unwrap_or(a);
+            let b_ref = b_conv.as_ref().unwrap_or(b);
+            return self.matmul_a_transposed(a_ref, b_ref, m, k, n);
+        }
+
+        if a.is_bf16() {
+            let mut output = self.alloc(m * n);
+            let alpha: f32 = 1.0;
+            let beta: f32 = 0.0;
+            {
+                let (b_ptr, _rec_b) = b.bf16_data().device_ptr(&self.stream);
+                let (a_ptr, _rec_a) = a.bf16_data().device_ptr(&self.stream);
+                let (c_ptr, _rec_c) = output.bf16_data_mut().device_ptr_mut(&self.stream);
+                unsafe {
+                    cudarc::cublas::result::gemm_ex(
+                        *self.cublas.handle(),
+                        cublasOperation_t::CUBLAS_OP_N,
+                        cublasOperation_t::CUBLAS_OP_T,
+                        cublas_m, cublas_n, cublas_k,
+                        (&alpha) as *const f32 as *const _,
+                        b_ptr as *const _, cudarc::cublas::sys::cudaDataType_t::CUDA_R_16BF, cublas_m,
+                        a_ptr as *const _, cudarc::cublas::sys::cudaDataType_t::CUDA_R_16BF, cublas_n,
+                        (&beta) as *const f32 as *const _,
+                        c_ptr as *mut _, cudarc::cublas::sys::cudaDataType_t::CUDA_R_16BF, cublas_m,
+                        cudarc::cublas::sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                        cudarc::cublas::sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                    ).expect("cuBLAS bf16 gemm_ex a_transposed failed");
+                }
+            }
+            output
+        } else {
+            let mut output = self.alloc_f32(m * n);
+            unsafe {
+                self.cublas.gemm(
+                    GemmConfig {
+                        transa: cublasOperation_t::CUBLAS_OP_N,
+                        transb: cublasOperation_t::CUBLAS_OP_T,
+                        m: cublas_m,
+                        n: cublas_n,
+                        k: cublas_k,
+                        alpha: 1.0f32,
+                        lda: cublas_m,
+                        ldb: cublas_n,
+                        beta: 0.0f32,
+                        ldc: cublas_m,
+                    },
+                    b.f32_data(),
+                    a.f32_data(),
+                    output.f32_data_mut(),
+                ).expect("cuBLAS sgemm a_transposed failed");
+            }
+            output
+        }
+    }
+
+    fn matmul_accumulate_a_transposed(
+        &self,
+        a: &CudaBuffer,   // [k, m] row-major
+        b: &CudaBuffer,   // [k, n] row-major
+        c: &mut CudaBuffer, // [m, n] accumulated
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        let cublas_m = n as i32;
+        let cublas_n = m as i32;
+        let cublas_k = k as i32;
+
+        // Mixed input types: convert
+        if a.is_bf16() != b.is_bf16() {
+            let a_conv = if a.is_bf16() { Some(self.convert_bf16_to_f32(a)) } else { None };
+            let b_conv = if b.is_bf16() { Some(self.convert_bf16_to_f32(b)) } else { None };
+            let a_ref = a_conv.as_ref().unwrap_or(a);
+            let b_ref = b_conv.as_ref().unwrap_or(b);
+            self.matmul_accumulate_a_transposed(a_ref, b_ref, c, m, k, n);
+            return;
+        }
+
+        if a.is_bf16() && c.is_bf16() {
+            let alpha: f32 = 1.0;
+            let beta: f32 = 1.0;
+            {
+                let (b_ptr, _rec_b) = b.bf16_data().device_ptr(&self.stream);
+                let (a_ptr, _rec_a) = a.bf16_data().device_ptr(&self.stream);
+                let (c_ptr, _rec_c) = c.bf16_data_mut().device_ptr_mut(&self.stream);
+                unsafe {
+                    cudarc::cublas::result::gemm_ex(
+                        *self.cublas.handle(),
+                        cublasOperation_t::CUBLAS_OP_N,
+                        cublasOperation_t::CUBLAS_OP_T,
+                        cublas_m, cublas_n, cublas_k,
+                        (&alpha) as *const f32 as *const _,
+                        b_ptr as *const _, cudarc::cublas::sys::cudaDataType_t::CUDA_R_16BF, cublas_m,
+                        a_ptr as *const _, cudarc::cublas::sys::cudaDataType_t::CUDA_R_16BF, cublas_n,
+                        (&beta) as *const f32 as *const _,
+                        c_ptr as *mut _, cudarc::cublas::sys::cudaDataType_t::CUDA_R_16BF, cublas_m,
+                        cudarc::cublas::sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                        cudarc::cublas::sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                    ).expect("cuBLAS bf16 gemm_ex a_transposed accumulate failed");
+                }
+            }
+        } else if a.is_bf16() && !c.is_bf16() {
+            let alpha: f32 = 1.0;
+            let beta: f32 = 1.0;
+            {
+                let (b_ptr, _rec_b) = b.bf16_data().device_ptr(&self.stream);
+                let (a_ptr, _rec_a) = a.bf16_data().device_ptr(&self.stream);
+                let (c_ptr, _rec_c) = c.f32_data_mut().device_ptr_mut(&self.stream);
+                unsafe {
+                    cudarc::cublas::result::gemm_ex(
+                        *self.cublas.handle(),
+                        cublasOperation_t::CUBLAS_OP_N,
+                        cublasOperation_t::CUBLAS_OP_T,
+                        cublas_m, cublas_n, cublas_k,
+                        (&alpha) as *const f32 as *const _,
+                        b_ptr as *const _, cudarc::cublas::sys::cudaDataType_t::CUDA_R_16BF, cublas_m,
+                        a_ptr as *const _, cudarc::cublas::sys::cudaDataType_t::CUDA_R_16BF, cublas_n,
+                        (&beta) as *const f32 as *const _,
+                        c_ptr as *mut _, cudarc::cublas::sys::cudaDataType_t::CUDA_R_32F, cublas_m,
+                        cudarc::cublas::sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                        cudarc::cublas::sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                    ).expect("cuBLAS mixed bf16→f32 gemm_ex a_transposed accumulate failed");
+                }
+            }
+        } else {
+            unsafe {
+                self.cublas.gemm(
+                    GemmConfig {
+                        transa: cublasOperation_t::CUBLAS_OP_N,
+                        transb: cublasOperation_t::CUBLAS_OP_T,
+                        m: cublas_m,
+                        n: cublas_n,
+                        k: cublas_k,
+                        alpha: 1.0f32,
+                        lda: cublas_m,
+                        ldb: cublas_n,
+                        beta: 1.0f32,
+                        ldc: cublas_m,
+                    },
+                    b.f32_data(),
+                    a.f32_data(),
+                    c.f32_data_mut(),
+                ).expect("cuBLAS sgemm a_transposed accumulate failed");
+            }
+        }
+    }
+
     fn rms_norm_backward_accumulate(
         &self,
         input: &CudaBuffer,
@@ -2276,35 +2470,55 @@ impl ComputeDevice for CudaComputeDevice {
     fn bias_add(&self, matrix: &CudaBuffer, bias: &CudaBuffer, numel: usize, dim: usize) -> CudaBuffer {
         let numel_u32 = numel as u32;
         let dim_u32 = dim as u32;
-
-        // Handle bf16 inputs: convert to f32 for the kernel
-        let any_bf16 = matrix.is_bf16() || bias.is_bf16();
-        let mat_conv = if matrix.is_bf16() { Some(self.convert_bf16_to_f32(matrix)) } else { None };
-        let bias_conv = if bias.is_bf16() { Some(self.convert_bf16_to_f32(bias)) } else { None };
-        let mat_ref = mat_conv.as_ref().unwrap_or(matrix);
-        let bias_ref = bias_conv.as_ref().unwrap_or(bias);
-
-        let mut output = self.alloc_f32(numel);
         let cfg = LaunchConfig {
             block_dim: (256, 1, 1),
             grid_dim: ((numel_u32 + 255) / 256, 1, 1),
             shared_mem_bytes: 0,
         };
-        let (_module, func) = self.get_func(util_cuda::BIAS_ADD_CUDA, "bias_add");
-        unsafe {
-            self.stream.launch_builder(&func)
-                .arg(mat_ref.f32_data())
-                .arg(bias_ref.f32_data())
-                .arg(output.f32_data_mut())
-                .arg(&numel_u32)
-                .arg(&dim_u32)
-                .launch(cfg)
-                .unwrap();
-        }
-        if any_bf16 {
-            self.convert_f32_to_bf16(&output)
-        } else {
+
+        if matrix.is_bf16() && bias.is_bf16() {
+            // Native bf16 bias_add: single kernel, no conversions
+            let (_module, func) = self.get_func(util_cuda::BIAS_ADD_BF16_CUDA, "bias_add_bf16");
+            let mut output = CudaBuffer {
+                storage: CudaStorage::Bf16(self.stream.alloc_zeros::<u16>(numel).unwrap()),
+                len: numel,
+            };
+            unsafe {
+                self.stream.launch_builder(&func)
+                    .arg(matrix.bf16_data())
+                    .arg(bias.bf16_data())
+                    .arg(output.bf16_data_mut())
+                    .arg(&numel_u32)
+                    .arg(&dim_u32)
+                    .launch(cfg)
+                    .unwrap();
+            }
             output
+        } else {
+            // Fall back to f32 path for mixed or pure f32 types
+            let any_bf16 = matrix.is_bf16() || bias.is_bf16();
+            let mat_conv = if matrix.is_bf16() { Some(self.convert_bf16_to_f32(matrix)) } else { None };
+            let bias_conv = if bias.is_bf16() { Some(self.convert_bf16_to_f32(bias)) } else { None };
+            let mat_ref = mat_conv.as_ref().unwrap_or(matrix);
+            let bias_ref = bias_conv.as_ref().unwrap_or(bias);
+
+            let mut output = self.alloc_f32(numel);
+            let (_module, func) = self.get_func(util_cuda::BIAS_ADD_CUDA, "bias_add");
+            unsafe {
+                self.stream.launch_builder(&func)
+                    .arg(mat_ref.f32_data())
+                    .arg(bias_ref.f32_data())
+                    .arg(output.f32_data_mut())
+                    .arg(&numel_u32)
+                    .arg(&dim_u32)
+                    .launch(cfg)
+                    .unwrap();
+            }
+            if any_bf16 {
+                self.convert_f32_to_bf16(&output)
+            } else {
+                output
+            }
         }
     }
 
@@ -2476,43 +2690,35 @@ impl ComputeDevice for CudaComputeDevice {
                         .unwrap();
                 }
             }
-            (CudaStorage::Bf16(_), CudaStorage::Bf16(_)) => {
-                // bf16 += bf16: convert both to f32, add, convert back
-                let d_f32 = self.convert_bf16_to_f32(dst);
-                let s_f32 = self.convert_bf16_to_f32(src);
-                let mut result = d_f32;
-                // add_assign on f32
+            (CudaStorage::Bf16(d), CudaStorage::Bf16(s)) => {
+                // Native bf16 += bf16: single kernel, no conversions
                 let (_module, func) = self.get_func(
-                    crate::kernels::adamw_cuda::ADD_ASSIGN_CUDA,
-                    "add_assign",
+                    crate::kernels::adamw_cuda::ADD_ASSIGN_BF16_CUDA,
+                    "add_assign_bf16",
                 );
                 unsafe {
                     self.stream.launch_builder(&func)
-                        .arg(result.f32_data_mut())
-                        .arg(s_f32.f32_data())
+                        .arg(d)
+                        .arg(s)
                         .arg(&n)
                         .launch(cfg)
                         .unwrap();
                 }
-                *dst = self.convert_f32_to_bf16(&result);
             }
-            (CudaStorage::Bf16(_), CudaStorage::F32(_)) => {
-                // bf16 += f32: convert dst to f32, add, convert back
-                let d_f32 = self.convert_bf16_to_f32(dst);
-                let mut result = d_f32;
+            (CudaStorage::Bf16(d), CudaStorage::F32(s)) => {
+                // Native bf16 += f32: single kernel, no conversions
                 let (_module, func) = self.get_func(
-                    crate::kernels::adamw_cuda::ADD_ASSIGN_CUDA,
-                    "add_assign",
+                    crate::kernels::adamw_cuda::ADD_ASSIGN_F32_TO_BF16_CUDA,
+                    "add_assign_f32_to_bf16",
                 );
                 unsafe {
                     self.stream.launch_builder(&func)
-                        .arg(result.f32_data_mut())
-                        .arg(src.f32_data())
+                        .arg(d)
+                        .arg(s)
                         .arg(&n)
                         .launch(cfg)
                         .unwrap();
                 }
-                *dst = self.convert_f32_to_bf16(&result);
             }
         }
     }

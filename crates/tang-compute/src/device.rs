@@ -349,6 +349,37 @@ pub trait ComputeDevice: Send {
         self.add_assign(c, &tmp);
     }
 
+    /// Matrix multiply with transposed A: C[m,n] = A[k,m]^T @ B[k,n].
+    ///
+    /// `a` is stored as [k,m] row-major. Avoids materializing the transpose.
+    fn matmul_a_transposed(
+        &self,
+        a: &Self::Buffer,  // [k, m] row-major (will be logically transposed)
+        b: &Self::Buffer,   // [k, n] row-major
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Self::Buffer {
+        let a_t = self.transpose_2d(a, k, m);
+        self.matmul(&a_t, b, m, k, n)
+    }
+
+    /// Matrix multiply with transposed A and accumulation: C[m,n] += A[k,m]^T @ B[k,n].
+    ///
+    /// `a` is stored as [k,m] row-major. Avoids materializing the transpose.
+    fn matmul_accumulate_a_transposed(
+        &self,
+        a: &Self::Buffer,  // [k, m] row-major (will be logically transposed)
+        b: &Self::Buffer,   // [k, n] row-major
+        c: &mut Self::Buffer, // [m, n] row-major, accumulated
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        let a_t = self.transpose_2d(a, k, m);
+        self.matmul_accumulate(&a_t, b, c, m, k, n);
+    }
+
     /// Reduce sum along an axis, accumulating into dst: dst += reduce_sum(data, shape, axis).
     fn reduce_sum_accumulate(
         &self,

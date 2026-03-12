@@ -89,6 +89,82 @@ extern "C" __global__ void bias_add(
 }
 "#;
 
+/// Broadcast bias addition for bf16: out[i] = matrix[i] + bias[i % dim], all bf16.
+/// Reads bf16, computes in f32, writes bf16.
+/// Grid: (ceil(numel / 256)), Block: (256)
+pub const BIAS_ADD_BF16_CUDA: &str = r#"
+extern "C" __global__ void bias_add_bf16(
+    const unsigned short* __restrict__ matrix,
+    const unsigned short* __restrict__ bias,
+    unsigned short* __restrict__ output,
+    const unsigned int numel,
+    const unsigned int dim)
+{
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= numel) return;
+    float m = __int_as_float(((unsigned int)matrix[idx]) << 16);
+    float b = __int_as_float(((unsigned int)bias[idx % dim]) << 16);
+    float result = m + b;
+    unsigned int bits = __float_as_int(result);
+    output[idx] = (unsigned short)((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16);
+}
+"#;
+
+/// Fused bf16 residual add + RMS normalization.
+/// output = rms_norm(input + residual, weight, eps), all bf16 I/O.
+/// Also writes the pre-norm sum to `sum_out` for backward.
+/// Grid: (n_groups), Block: (min(dim, 256))
+pub const RMS_NORM_RESIDUAL_BF16_CUDA: &str = r#"
+extern "C" __global__ void rms_norm_residual_bf16(
+    const unsigned short* __restrict__ input,
+    const unsigned short* __restrict__ residual,
+    const unsigned short* __restrict__ weight,
+    unsigned short* __restrict__ output,
+    unsigned short* __restrict__ sum_out,
+    const unsigned int n_groups,
+    const unsigned int dim,
+    const float eps)
+{
+    __shared__ float shared[256];
+
+    unsigned int group = blockIdx.x;
+    unsigned int tid = threadIdx.x;
+    unsigned int tg_size = blockDim.x;
+    if (group >= n_groups) return;
+
+    unsigned int base = group * dim;
+
+    // Phase 1: compute sum and sum of squares, store pre-norm sum as bf16
+    float local_sq = 0.0f;
+    for (unsigned int i = tid; i < dim; i += tg_size) {
+        float vi = __int_as_float(((unsigned int)input[base + i]) << 16);
+        float vr = __int_as_float(((unsigned int)residual[base + i]) << 16);
+        float v = vi + vr;
+        unsigned int sbits = __float_as_int(v);
+        sum_out[base + i] = (unsigned short)((sbits + 0x7FFF + ((sbits >> 16) & 1)) >> 16);
+        local_sq += v * v;
+    }
+    shared[tid] = local_sq;
+    __syncthreads();
+
+    for (unsigned int s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) shared[tid] += shared[tid + s];
+        __syncthreads();
+    }
+    float inv_rms = rsqrtf(shared[0] / float(dim) + eps);
+
+    // Phase 2: normalize — recompute sum from inputs (avoids bf16 truncation loss)
+    for (unsigned int i = tid; i < dim; i += tg_size) {
+        float vi = __int_as_float(((unsigned int)input[base + i]) << 16);
+        float vr = __int_as_float(((unsigned int)residual[base + i]) << 16);
+        float w = __int_as_float(((unsigned int)weight[i]) << 16);
+        float result = (vi + vr) * inv_rms * w;
+        unsigned int rbits = __float_as_int(result);
+        output[base + i] = (unsigned short)((rbits + 0x7FFF + ((rbits >> 16) & 1)) >> 16);
+    }
+}
+"#;
+
 /// Fused residual add + RMS normalization.
 /// output = rms_norm(input + residual, weight, eps)
 /// Also writes the pre-norm sum (input + residual) to `sum_out` for backward.

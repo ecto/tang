@@ -120,6 +120,43 @@ extern "C" __global__ void add_assign(
 }
 "#;
 
+/// Element-wise in-place addition: bf16 dst[i] += bf16 src[i].
+/// Reads bf16, computes in f32, writes bf16.
+/// Grid: (ceil(n / 256)), Block: (256)
+pub const ADD_ASSIGN_BF16_CUDA: &str = r#"
+extern "C" __global__ void add_assign_bf16(
+    unsigned short* __restrict__ dst,
+    const unsigned short* __restrict__ src,
+    const unsigned int n)
+{
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float d = __int_as_float(((unsigned int)dst[i]) << 16);
+    float s = __int_as_float(((unsigned int)src[i]) << 16);
+    float result = d + s;
+    unsigned int bits = __float_as_int(result);
+    dst[i] = (unsigned short)((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16);
+}
+"#;
+
+/// Element-wise in-place addition: bf16 dst[i] += f32 src[i].
+/// Reads bf16 dst, f32 src, computes in f32, writes bf16.
+/// Grid: (ceil(n / 256)), Block: (256)
+pub const ADD_ASSIGN_F32_TO_BF16_CUDA: &str = r#"
+extern "C" __global__ void add_assign_f32_to_bf16(
+    unsigned short* __restrict__ dst,
+    const float* __restrict__ src,
+    const unsigned int n)
+{
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float d = __int_as_float(((unsigned int)dst[i]) << 16);
+    float result = d + src[i];
+    unsigned int bits = __float_as_int(result);
+    dst[i] = (unsigned short)((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16);
+}
+"#;
+
 /// Zero buffer: dst[i] = 0.
 /// Grid: (ceil(n / 256)), Block: (256)
 pub const ZERO_BUFFER_CUDA: &str = r#"

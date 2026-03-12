@@ -121,10 +121,9 @@ impl<B: ComputeBuffer> Linear<B> {
         let gi_buf = dev.matmul(&grad_output.buffer, &self.weight.buffer, batch, self.out_features, self.in_features);
         let grad_input = ComputeTensor::from_buffer(gi_buf, vec![batch, self.in_features]);
 
-        // grad_weight = grad_output^T @ input
-        // grad_output^T: [out_f, batch], input: [batch, in_f] → [out_f, in_f]
-        let go_t = dev.transpose_2d(&grad_output.buffer, batch, self.out_features);
-        let gw_buf = dev.matmul(&go_t, &cache.input, self.out_features, batch, self.in_features);
+        // grad_weight = grad_output^T @ input (CUBLAS_OP_T avoids explicit transpose)
+        // grad_output: [batch, out_f], input: [batch, in_f] → [out_f, in_f]
+        let gw_buf = dev.matmul_a_transposed(&grad_output.buffer, &cache.input, self.out_features, batch, self.in_features);
         let grad_weight = dev.download(&gw_buf);
 
         // grad_bias = sum(grad_output, axis=0) → [out_f]
@@ -148,9 +147,8 @@ impl<B: ComputeBuffer> Linear<B> {
         let gi_buf = dev.matmul(&grad_output.buffer, &self.weight.buffer, batch, self.out_features, self.in_features);
         let grad_input = ComputeTensor::from_buffer(gi_buf, vec![batch, self.in_features]);
 
-        // grad_weight = grad_output^T @ input
-        let go_t = dev.transpose_2d(&grad_output.buffer, batch, self.out_features);
-        let gw_buf = dev.matmul(&go_t, &cache.input, self.out_features, batch, self.in_features);
+        // grad_weight = grad_output^T @ input (CUBLAS_OP_T avoids explicit transpose)
+        let gw_buf = dev.matmul_a_transposed(&grad_output.buffer, &cache.input, self.out_features, batch, self.in_features);
 
         // grad_bias = sum(grad_output, axis=0)
         let gb_buf = dev.reduce_sum(&grad_output.buffer, &[batch, self.out_features], 0);
@@ -176,9 +174,8 @@ impl<B: ComputeBuffer> Linear<B> {
         let gi_buf = dev.matmul(&grad_output.buffer, &self.weight.buffer, batch, self.out_features, self.in_features);
         let grad_input = ComputeTensor::from_buffer(gi_buf, vec![batch, self.in_features]);
 
-        // grad_weight += grad_output^T @ input (accumulated via beta=1.0 gemm)
-        let go_t = dev.transpose_2d(&grad_output.buffer, batch, self.out_features);
-        dev.matmul_accumulate(&go_t, cached_input, grad_weight_acc, self.out_features, batch, self.in_features);
+        // grad_weight += grad_output^T @ input (CUBLAS_OP_T avoids explicit transpose)
+        dev.matmul_accumulate_a_transposed(&grad_output.buffer, cached_input, grad_weight_acc, self.out_features, batch, self.in_features);
 
         // grad_bias += sum(grad_output, axis=0)
         dev.reduce_sum_accumulate(&grad_output.buffer, &[batch, self.out_features], 0, grad_bias_acc);
