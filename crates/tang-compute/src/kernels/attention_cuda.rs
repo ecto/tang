@@ -270,7 +270,8 @@ extern "C" __global__ void causal_attention_flash(
     const unsigned int seq_len,
     const unsigned int n_heads,
     const unsigned int n_kv_heads,
-    const unsigned int head_dim)
+    const unsigned int head_dim,
+    const unsigned int batch_size)
 {
     // Dynamic shared memory (allocated at launch):
     //   float tile_scores[FA_TILE_KV]
@@ -283,17 +284,18 @@ extern "C" __global__ void causal_attention_flash(
 
     const unsigned int pos     = blockIdx.x;
     const unsigned int head    = blockIdx.y;
+    const unsigned int batch   = blockIdx.z;
     const unsigned int tid     = threadIdx.x;
     const unsigned int tg_size = blockDim.x;
 
-    if (pos >= seq_len || head >= n_heads) return;
+    if (pos >= seq_len || head >= n_heads || batch >= batch_size) return;
 
     const unsigned int total_dim    = n_heads * head_dim;
     const unsigned int kv_dim       = n_kv_heads * head_dim;
     const unsigned int heads_per_kv = n_heads / n_kv_heads;
     const unsigned int kv_head      = head / heads_per_kv;
-    const unsigned int q_off        = head * head_dim;
-    const unsigned int kv_off       = kv_head * head_dim;
+    const unsigned int q_off        = batch * seq_len * total_dim + head * head_dim;
+    const unsigned int kv_off       = batch * seq_len * kv_dim + kv_head * head_dim;
     const float scale               = rsqrtf((float)head_dim);
     const unsigned int attend_len   = pos + 1;
 

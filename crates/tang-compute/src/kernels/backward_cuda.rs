@@ -654,19 +654,21 @@ extern "C" __global__ void flash_attn_bwd_precompute_d(
     float* __restrict__ D,
     const unsigned int seq_len,
     const unsigned int n_heads,
-    const unsigned int head_dim)
+    const unsigned int head_dim,
+    const unsigned int batch_size)
 {
     extern __shared__ float reduce[];
 
-    const unsigned int pos  = blockIdx.x;
-    const unsigned int head = blockIdx.y;
-    const unsigned int tid  = threadIdx.x;
+    const unsigned int pos   = blockIdx.x;
+    const unsigned int head  = blockIdx.y;
+    const unsigned int batch = blockIdx.z;
+    const unsigned int tid   = threadIdx.x;
     const unsigned int tg_size = blockDim.x;
 
-    if (pos >= seq_len || head >= n_heads) return;
+    if (pos >= seq_len || head >= n_heads || batch >= batch_size) return;
 
     const unsigned int total_dim = n_heads * head_dim;
-    const unsigned int base = pos * total_dim + head * head_dim;
+    const unsigned int base = batch * seq_len * total_dim + pos * total_dim + head * head_dim;
 
     float local_sum = 0.0f;
     for (unsigned int d = tid; d < head_dim; d += tg_size) {
@@ -681,12 +683,12 @@ extern "C" __global__ void flash_attn_bwd_precompute_d(
     }
 
     if (tid == 0) {
-        D[pos * n_heads + head] = reduce[0];
+        D[batch * seq_len * n_heads + pos * n_heads + head] = reduce[0];
     }
 }
 "#;
 
-/// FlashAttention-2 style causal attention backward with GQA support (v2).
+/// FlashAttention-2 style causal attention backward with GQA support (v3).
 ///
 /// Grid: (n_kv_tiles, n_heads, Q_SPLIT)
 ///   - blockIdx.x = KV tile index
@@ -694,15 +696,17 @@ extern "C" __global__ void flash_attn_bwd_precompute_d(
 ///   - blockIdx.z = Q-split index (each handles seq_len/Q_SPLIT Q positions)
 /// Block: (128, 1, 1)
 ///
-/// Each block processes one KV tile × one Q head × one Q-split chunk.
-/// dK and dV accumulated in shared memory, written via atomicAdd (needed for Q_SPLIT).
-/// dQ written via atomicAdd (as before).
+/// v3: Q[i] and dO[i] cached in shared memory per Q iteration.
+/// K/V read from global (L2-cached naturally for 32×64 tiles).
+/// Shared memory kept small for high occupancy.
 ///
 /// Dynamic shared memory layout:
 ///   float dK_acc[TILE_KV * head_dim]  — local grad_K accumulator
 ///   float dV_acc[TILE_KV * head_dim]  — local grad_V accumulator
 ///   float scores[TILE_KV]             — softmax probs for one Q row
 ///   float reduce[blockDim.x]          — reduction scratch
+///   float Q_cache[head_dim]           — cached Q[i] for current Q position
+///   float dO_cache[head_dim]          — cached dO[i] for current Q position
 pub const CAUSAL_ATTENTION_BACKWARD_FLASH_CUDA: &str = r#"
 #define FA_BWD_TILE 32
 
@@ -719,15 +723,22 @@ extern "C" __global__ void causal_attention_backward_flash(
     const unsigned int n_heads,
     const unsigned int n_kv_heads,
     const unsigned int head_dim,
-    const unsigned int q_split)
+    const unsigned int q_split,
+    const unsigned int batch_size,
+    const unsigned int n_kv_tiles)
 {
     extern __shared__ float smem[];
 
-    const unsigned int tile_idx = blockIdx.x;
+    // Decode batch from blockIdx.x: (tile_idx, batch) packed together
+    const unsigned int combined = blockIdx.x;
+    const unsigned int tile_idx = combined % n_kv_tiles;
+    const unsigned int batch    = combined / n_kv_tiles;
     const unsigned int head     = blockIdx.y;
     const unsigned int q_chunk  = blockIdx.z;
     const unsigned int tid      = threadIdx.x;
     const unsigned int tg_size  = blockDim.x;
+
+    if (batch >= batch_size) return;
 
     const unsigned int tile_start = tile_idx * FA_BWD_TILE;
     const unsigned int tile_end   = min(tile_start + (unsigned int)FA_BWD_TILE, seq_len);
@@ -737,15 +748,18 @@ extern "C" __global__ void causal_attention_backward_flash(
     const unsigned int kv_dim       = n_kv_heads * head_dim;
     const unsigned int heads_per_kv = n_heads / n_kv_heads;
     const unsigned int kv_head      = head / heads_per_kv;
-    const unsigned int q_off        = head * head_dim;
-    const unsigned int kv_off       = kv_head * head_dim;
+    const unsigned int q_off        = batch * seq_len * total_dim + head * head_dim;
+    const unsigned int kv_off       = batch * seq_len * kv_dim + kv_head * head_dim;
+    const unsigned int d_off        = batch * seq_len * n_heads;
     const float scale               = rsqrtf((float)head_dim);
 
-    // Shared memory pointers
-    float* dK_acc = smem;                                            // [TILE, head_dim]
-    float* dV_acc = smem + FA_BWD_TILE * head_dim;                   // [TILE, head_dim]
-    float* scores = smem + 2 * FA_BWD_TILE * head_dim;               // [FA_BWD_TILE]
-    float* reduce = smem + 2 * FA_BWD_TILE * head_dim + FA_BWD_TILE; // [tg_size]
+    // Shared memory layout (small footprint for high occupancy)
+    float* dK_acc   = smem;                                              // [TILE, head_dim]
+    float* dV_acc   = dK_acc  + FA_BWD_TILE * head_dim;                  // [TILE, head_dim]
+    float* scores   = dV_acc  + FA_BWD_TILE * head_dim;                  // [FA_BWD_TILE]
+    float* reduce   = scores  + FA_BWD_TILE;                             // [tg_size]
+    float* Q_cache  = reduce  + tg_size;                                 // [head_dim]
+    float* dO_cache = Q_cache + head_dim;                                // [head_dim]
 
     // Initialize dK_acc and dV_acc to zero
     for (unsigned int idx = tid; idx < tile_len * head_dim; idx += tg_size) {
@@ -766,14 +780,20 @@ extern "C" __global__ void causal_attention_backward_flash(
         // How many KV positions in this tile does position i attend to?
         unsigned int attend_in_tile = min(i + 1 - tile_start, tile_len);
 
+        // Cache Q[i] and dO[i] in shared memory (avoids redundant global reads across phases)
+        for (unsigned int d = tid; d < head_dim; d += tg_size) {
+            Q_cache[d]  = Q[i * total_dim + q_off + d];
+            dO_cache[d] = dO[i * total_dim + q_off + d];
+        }
+        __syncthreads();
+
         // ── Phase 1: Compute scores S[j] = Q[i] . K[tile_start+j] * scale ──
         float local_max = -1e38f;
         for (unsigned int j = tid; j < attend_in_tile; j += tg_size) {
             float dot = 0.0f;
             const unsigned int k_base = (tile_start + j) * kv_dim + kv_off;
-            const unsigned int q_base = i * total_dim + q_off;
             for (unsigned int d = 0; d < head_dim; d++) {
-                dot += Q[q_base + d] * K[k_base + d];
+                dot += Q_cache[d] * K[k_base + d];
             }
             float s = dot * scale;
             scores[j] = s;
@@ -787,7 +807,7 @@ extern "C" __global__ void causal_attention_backward_flash(
             __syncthreads();
         }
         float row_max = reduce[0];
-        __syncthreads();  // barrier before reusing reduce[]
+        __syncthreads();
 
         // Exp and sum
         float local_sum = 0.0f;
@@ -813,7 +833,7 @@ extern "C" __global__ void causal_attention_backward_flash(
         // ── Phase 2a: Accumulate dV ──
         // dV[tile_j, d] += P[j] * dO[i, head, d]
         for (unsigned int d = tid; d < head_dim; d += tg_size) {
-            float do_val = dO[i * total_dim + q_off + d];
+            float do_val = dO_cache[d];
             for (unsigned int j = 0; j < attend_in_tile; j++) {
                 dV_acc[j * head_dim + d] += scores[j] * do_val;
             }
@@ -821,12 +841,12 @@ extern "C" __global__ void causal_attention_backward_flash(
         __syncthreads();
 
         // ── Phase 2b: Compute dS[j] = P[j] * (dP[j] - D[i,head]) ──
-        float d_val = D[i * n_heads + head];
+        float d_val = D[d_off + i * n_heads + head];
         for (unsigned int j = tid; j < attend_in_tile; j += tg_size) {
             float dp = 0.0f;
             const unsigned int v_base = (tile_start + j) * kv_dim + kv_off;
             for (unsigned int d = 0; d < head_dim; d++) {
-                dp += dO[i * total_dim + q_off + d] * V[v_base + d];
+                dp += dO_cache[d] * V[v_base + d];
             }
             scores[j] = scores[j] * (dp - d_val);  // scores now holds dS[j]
         }
@@ -835,7 +855,7 @@ extern "C" __global__ void causal_attention_backward_flash(
         // ── Phase 2c: Accumulate dQ and dK ──
         for (unsigned int d = tid; d < head_dim; d += tg_size) {
             float dq_acc = 0.0f;
-            float q_val = Q[i * total_dim + q_off + d];
+            float q_val = Q_cache[d];
             for (unsigned int j = 0; j < attend_in_tile; j++) {
                 float ds = scores[j];
                 dq_acc += ds * K[(tile_start + j) * kv_dim + kv_off + d];

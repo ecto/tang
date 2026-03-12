@@ -26,7 +26,7 @@ pub use modules::{
     Embedding, EmbeddingCache, InterleavedRoPE, KVCache, Linear, LinearCache,
     RMSNorm, RMSNormCache,
 };
-pub use ops::{add_tensors, bias_add, causal_attention_backward, swiglu_backward, swiglu_fused};
+pub use ops::{add_tensors, bias_add, causal_attention_backward, causal_attention_backward_with_output, swiglu_backward, swiglu_fused};
 pub use tensor::ComputeTensor;
 
 #[cfg(feature = "metal")]

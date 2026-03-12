@@ -207,6 +207,96 @@ pub trait ComputeDevice: Send {
         head_dim: usize,
     ) -> (Self::Buffer, Self::Buffer, Self::Buffer);
 
+    /// Like `causal_attention_backward`, but uses a cached forward output O
+    /// to skip the forward recompute. Default impl ignores O and recomputes.
+    fn causal_attention_backward_with_output(
+        &self,
+        grad_output: &Self::Buffer,
+        q: &Self::Buffer,
+        k: &Self::Buffer,
+        v: &Self::Buffer,
+        _output: &Self::Buffer,
+        seq_len: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> (Self::Buffer, Self::Buffer, Self::Buffer) {
+        self.causal_attention_backward(grad_output, q, k, v, seq_len, n_heads, n_kv_heads, head_dim)
+    }
+
+    /// Batched causal attention forward. Inputs are `[batch_size * seq_len, dim]`.
+    /// Default impl loops over batch dimension.
+    fn batched_causal_attention(
+        &self,
+        q: &Self::Buffer,
+        k: &Self::Buffer,
+        v: &Self::Buffer,
+        seq_len: usize,
+        batch_size: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> Self::Buffer {
+        if batch_size == 1 {
+            return self.causal_attention(q, k, v, seq_len, n_heads, n_kv_heads, head_dim);
+        }
+        let total_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let total_rows = seq_len * batch_size;
+        let mut out = self.alloc(total_rows * total_dim);
+        for b in 0..batch_size {
+            let q_b = self.slice_buffer(q, b * seq_len * total_dim, seq_len * total_dim);
+            let k_b = self.slice_buffer(k, b * seq_len * kv_dim, seq_len * kv_dim);
+            let v_b = self.slice_buffer(v, b * seq_len * kv_dim, seq_len * kv_dim);
+            let o_b = self.causal_attention(&q_b, &k_b, &v_b, seq_len, n_heads, n_kv_heads, head_dim);
+            self.write_into(&mut out, b * seq_len * total_dim, &o_b);
+        }
+        out
+    }
+
+    /// Batched causal attention backward with cached forward output.
+    /// All inputs/outputs are `[batch_size * seq_len, dim]`.
+    /// Default impl loops over batch dimension.
+    fn batched_causal_attention_backward(
+        &self,
+        grad_output: &Self::Buffer,
+        q: &Self::Buffer,
+        k: &Self::Buffer,
+        v: &Self::Buffer,
+        output: &Self::Buffer,
+        seq_len: usize,
+        batch_size: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> (Self::Buffer, Self::Buffer, Self::Buffer) {
+        if batch_size == 1 {
+            return self.causal_attention_backward_with_output(
+                grad_output, q, k, v, output, seq_len, n_heads, n_kv_heads, head_dim,
+            );
+        }
+        let total_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let total_rows = seq_len * batch_size;
+        let mut gq = self.alloc_f32(total_rows * total_dim);
+        let mut gk = self.alloc_f32(total_rows * kv_dim);
+        let mut gv = self.alloc_f32(total_rows * kv_dim);
+        for b in 0..batch_size {
+            let go_b = self.slice_buffer(grad_output, b * seq_len * total_dim, seq_len * total_dim);
+            let q_b = self.slice_buffer(q, b * seq_len * total_dim, seq_len * total_dim);
+            let k_b = self.slice_buffer(k, b * seq_len * kv_dim, seq_len * kv_dim);
+            let v_b = self.slice_buffer(v, b * seq_len * kv_dim, seq_len * kv_dim);
+            let o_b = self.slice_buffer(output, b * seq_len * total_dim, seq_len * total_dim);
+            let (gq_b, gk_b, gv_b) = self.causal_attention_backward_with_output(
+                &go_b, &q_b, &k_b, &v_b, &o_b, seq_len, n_heads, n_kv_heads, head_dim,
+            );
+            self.write_into(&mut gq, b * seq_len * total_dim, &gq_b);
+            self.write_into(&mut gk, b * seq_len * kv_dim, &gk_b);
+            self.write_into(&mut gv, b * seq_len * kv_dim, &gv_b);
+        }
+        (gq, gk, gv)
+    }
+
     /// Fused cross-entropy forward + backward.
     ///
     /// Computes per-row log-softmax → CE loss, and gradient = (softmax - one_hot) / count.
@@ -365,6 +455,20 @@ pub trait ComputeDevice: Send {
             *v *= scale;
         }
         *buf = self.upload(&data);
+    }
+
+    /// Extract a contiguous sub-range from a buffer (offset and len in elements).
+    fn slice_buffer(&self, buf: &Self::Buffer, offset: usize, len: usize) -> Self::Buffer {
+        let data = self.download(buf);
+        self.upload(&data[offset..offset + len])
+    }
+
+    /// Write `src` into `dst` starting at element `offset`.
+    fn write_into(&self, dst: &mut Self::Buffer, offset: usize, src: &Self::Buffer) {
+        let mut d = self.download(dst);
+        let s = self.download(src);
+        d[offset..offset + s.len()].copy_from_slice(&s);
+        *dst = self.upload(&d);
     }
 
     /// AdamW optimizer step on a single parameter tensor (in-place on device).

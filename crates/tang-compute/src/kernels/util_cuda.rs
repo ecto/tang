@@ -1,4 +1,4 @@
-//! Utility CUDA kernels: column extraction, fused RMSNorm+residual.
+//! Utility CUDA kernels: column extraction, type conversion, fused RMSNorm+residual.
 
 /// Extract a contiguous column range from a row-major matrix.
 /// input: [batch, total_cols], output: [batch, col_count]
@@ -19,6 +19,57 @@ extern "C" __global__ void extract_columns(
     unsigned int row = idx / col_count;
     unsigned int col = idx % col_count;
     output[idx] = input[row * total_cols + col_start + col];
+}
+"#;
+
+/// bf16 variant of extract_columns.
+/// Grid: (ceil(batch * col_count / 256)), Block: (256)
+pub const EXTRACT_COLUMNS_BF16_CUDA: &str = r#"
+extern "C" __global__ void extract_columns_bf16(
+    const unsigned short* __restrict__ input,
+    unsigned short* __restrict__ output,
+    const unsigned int batch,
+    const unsigned int total_cols,
+    const unsigned int col_start,
+    const unsigned int col_count)
+{
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = batch * col_count;
+    if (idx >= total) return;
+    unsigned int row = idx / col_count;
+    unsigned int col = idx % col_count;
+    output[idx] = input[row * total_cols + col_start + col];
+}
+"#;
+
+/// Convert bf16 buffer to f32 on GPU (no CPU round-trip).
+/// Grid: (ceil(n / 256)), Block: (256)
+pub const BF16_TO_F32_CUDA: &str = r#"
+extern "C" __global__ void bf16_to_f32(
+    const unsigned short* __restrict__ input,
+    float* __restrict__ output,
+    const unsigned int n)
+{
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    output[idx] = __int_as_float(((unsigned int)input[idx]) << 16);
+}
+"#;
+
+/// Convert f32 buffer to bf16 on GPU (no CPU round-trip).
+/// Grid: (ceil(n / 256)), Block: (256)
+pub const F32_TO_BF16_CUDA: &str = r#"
+extern "C" __global__ void f32_to_bf16(
+    const float* __restrict__ input,
+    unsigned short* __restrict__ output,
+    const unsigned int n)
+{
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    unsigned int bits = __float_as_int(input[idx]);
+    unsigned int lsb = (bits >> 16) & 1;
+    bits += 0x7FFF + lsb;
+    output[idx] = (unsigned short)(bits >> 16);
 }
 "#;
 

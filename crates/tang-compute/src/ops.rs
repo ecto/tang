@@ -150,6 +150,41 @@ pub fn causal_attention_backward<D: ComputeDevice>(
     )
 }
 
+/// Like `causal_attention_backward` but uses a cached forward output to skip recompute.
+pub fn causal_attention_backward_with_output<D: ComputeDevice>(
+    dev: &D,
+    grad_output: &ComputeTensor<D::Buffer>,
+    q: &ComputeTensor<D::Buffer>,
+    k: &ComputeTensor<D::Buffer>,
+    v: &ComputeTensor<D::Buffer>,
+    output: &ComputeTensor<D::Buffer>,
+    seq_len: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+) -> (ComputeTensor<D::Buffer>, ComputeTensor<D::Buffer>, ComputeTensor<D::Buffer>) {
+    let total_dim = n_heads * head_dim;
+    let kv_dim = n_kv_heads * head_dim;
+
+    let (gq, gk, gv) = dev.causal_attention_backward_with_output(
+        &grad_output.buffer,
+        &q.buffer,
+        &k.buffer,
+        &v.buffer,
+        &output.buffer,
+        seq_len,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+    );
+
+    (
+        ComputeTensor::from_buffer(gq, vec![seq_len, total_dim]),
+        ComputeTensor::from_buffer(gk, vec![seq_len, kv_dim]),
+        ComputeTensor::from_buffer(gv, vec![seq_len, kv_dim]),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
