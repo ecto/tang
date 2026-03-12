@@ -527,10 +527,9 @@ impl ComputeDevice for CudaComputeDevice {
                 .unwrap();
         }
 
-        // Convert output to bf16 if mixed precision
+        // Convert output to bf16 if mixed precision (GPU-side, no CPU round-trip)
         if self.mixed_precision {
-            let f32_data = self.download(&output_buf);
-            self.upload(&f32_data)
+            self.convert_f32_to_bf16(&output_buf)
         } else {
             output_buf
         }
@@ -2092,12 +2091,43 @@ impl ComputeDevice for CudaComputeDevice {
                         .unwrap();
                 }
             }
-            _ => {
-                // bf16 += bf16 or bf16 += f32: convert via CPU for now
-                let d = self.download(dst);
-                let s = self.download(src);
-                let result: Vec<f32> = d.iter().zip(s.iter()).map(|(a, b)| a + b).collect();
-                *dst = self.upload(&result);
+            (CudaStorage::Bf16(_), CudaStorage::Bf16(_)) => {
+                // bf16 += bf16: convert both to f32, add, convert back
+                let d_f32 = self.convert_bf16_to_f32(dst);
+                let s_f32 = self.convert_bf16_to_f32(src);
+                let mut result = d_f32;
+                // add_assign on f32
+                let (_module, func) = self.get_func(
+                    crate::kernels::adamw_cuda::ADD_ASSIGN_CUDA,
+                    "add_assign",
+                );
+                unsafe {
+                    self.stream.launch_builder(&func)
+                        .arg(result.f32_data_mut())
+                        .arg(s_f32.f32_data())
+                        .arg(&n)
+                        .launch(cfg)
+                        .unwrap();
+                }
+                *dst = self.convert_f32_to_bf16(&result);
+            }
+            (CudaStorage::Bf16(_), CudaStorage::F32(_)) => {
+                // bf16 += f32: convert dst to f32, add, convert back
+                let d_f32 = self.convert_bf16_to_f32(dst);
+                let mut result = d_f32;
+                let (_module, func) = self.get_func(
+                    crate::kernels::adamw_cuda::ADD_ASSIGN_CUDA,
+                    "add_assign",
+                );
+                unsafe {
+                    self.stream.launch_builder(&func)
+                        .arg(result.f32_data_mut())
+                        .arg(src.f32_data())
+                        .arg(&n)
+                        .launch(cfg)
+                        .unwrap();
+                }
+                *dst = self.convert_f32_to_bf16(&result);
             }
         }
     }
