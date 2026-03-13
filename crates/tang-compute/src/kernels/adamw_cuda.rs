@@ -217,3 +217,74 @@ extern "C" __global__ void scale_buffer(
     data[i] *= scale;
 }
 "#;
+
+/// Fused multi-buffer sum-of-squares: processes all grad buffers in one kernel.
+/// Takes array of buffer pointers and array of cumulative offsets.
+/// Grid: (ceil(total_elems / 1024)), Block: (256), 4 elements/thread.
+pub const MULTI_BUFFER_SUM_SQ_CUDA: &str = r#"
+extern "C" __global__ void multi_buffer_sum_sq(
+    const unsigned long long* __restrict__ ptrs,
+    const unsigned int* __restrict__ offsets,
+    const unsigned int n_bufs,
+    const unsigned int total_n,
+    float* __restrict__ output)
+{
+    __shared__ float shared[256];
+    unsigned int tid = threadIdx.x;
+    unsigned int idx = blockIdx.x * blockDim.x * 4 + tid;
+
+    float local_sum = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 4; k++) {
+        unsigned int gi = idx + k * blockDim.x;
+        if (gi < total_n) {
+            // Binary search for which buffer this index falls in
+            unsigned int lo = 0, hi = n_bufs;
+            while (lo < hi) {
+                unsigned int mid = (lo + hi) / 2;
+                if (offsets[mid + 1] <= gi) lo = mid + 1;
+                else hi = mid;
+            }
+            const float* buf = (const float*)ptrs[lo];
+            unsigned int local_idx = gi - offsets[lo];
+            float v = buf[local_idx];
+            local_sum += v * v;
+        }
+    }
+    shared[tid] = local_sum;
+    __syncthreads();
+
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) shared[tid] += shared[tid + s];
+        __syncthreads();
+    }
+
+    if (tid == 0) atomicAdd(output, shared[0]);
+}
+"#;
+
+/// Fused multi-buffer scale: scales all grad buffers in one kernel.
+/// Same layout as multi_buffer_sum_sq.
+pub const MULTI_BUFFER_SCALE_CUDA: &str = r#"
+extern "C" __global__ void multi_buffer_scale(
+    const unsigned long long* __restrict__ ptrs,
+    const unsigned int* __restrict__ offsets,
+    const unsigned int n_bufs,
+    const unsigned int total_n,
+    const float scale)
+{
+    unsigned int gi = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gi >= total_n) return;
+
+    // Binary search for buffer
+    unsigned int lo = 0, hi = n_bufs;
+    while (lo < hi) {
+        unsigned int mid = (lo + hi) / 2;
+        if (offsets[mid + 1] <= gi) lo = mid + 1;
+        else hi = mid;
+    }
+    float* buf = (float*)ptrs[lo];
+    unsigned int local_idx = gi - offsets[lo];
+    buf[local_idx] *= scale;
+}
+"#;

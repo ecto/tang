@@ -550,6 +550,61 @@ pub trait ComputeDevice: Send {
         self.upload(&out)
     }
 
+    /// Batched RoPE backward: input is [batch*seq_len, n_heads, head_dim].
+    /// Positions wrap every `seq_len` elements (each batch starts at `start_pos`).
+    fn rope_backward_batched(
+        &self,
+        grad_output: &Self::Buffer,
+        cos_table: &[f32],
+        sin_table: &[f32],
+        total_rows: usize,
+        seq_len: usize,
+        n_heads: usize,
+        head_dim: usize,
+        start_pos: usize,
+    ) -> Self::Buffer {
+        let data = self.download(grad_output);
+        let half_dim = head_dim / 2;
+        let mut out = vec![0.0f32; data.len()];
+        for s in 0..total_rows {
+            let pos = start_pos + (s % seq_len);
+            for h in 0..n_heads {
+                let base = (s * n_heads + h) * head_dim;
+                for i in 0..half_dim {
+                    let cos = cos_table[pos * half_dim + i];
+                    let sin = sin_table[pos * half_dim + i];
+                    let g0 = data[base + 2 * i];
+                    let g1 = data[base + 2 * i + 1];
+                    out[base + 2 * i] = g0 * cos + g1 * sin;
+                    out[base + 2 * i + 1] = -g0 * sin + g1 * cos;
+                }
+            }
+        }
+        self.upload(&out)
+    }
+
+    /// Batched RoPE backward with pre-uploaded cos/sin buffers on device.
+    /// Avoids re-uploading tables every call.
+    fn rope_backward_batched_cached(
+        &self,
+        grad_output: &Self::Buffer,
+        cos_buf: &Self::Buffer,
+        sin_buf: &Self::Buffer,
+        total_rows: usize,
+        seq_len: usize,
+        n_heads: usize,
+        head_dim: usize,
+        start_pos: usize,
+    ) -> Self::Buffer {
+        // Default: download tables and delegate
+        let cos_table = self.download(cos_buf);
+        let sin_table = self.download(sin_buf);
+        self.rope_backward_batched(
+            grad_output, &cos_table, &sin_table,
+            total_rows, seq_len, n_heads, head_dim, start_pos,
+        )
+    }
+
     /// Element-wise addition: out[i] = a[i] + b[i].
     /// Default: delegates to elementwise(). Override for fused bf16 kernel.
     fn add_tensors_buf(&self, a: &Self::Buffer, b: &Self::Buffer, numel: usize) -> Self::Buffer {

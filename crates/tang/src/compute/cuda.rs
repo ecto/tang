@@ -1144,13 +1144,13 @@ impl ComputeDevice for CudaComputeDevice {
 
         if logits.is_bf16() {
             let (_module, func) = self.get_func(backward_cuda::CROSS_ENTROPY_BF16_CUDA, "cross_entropy_fwd_bwd_bf16");
-            let mut grad = self.alloc(n_positions * vocab_size); // bf16
+            let mut grad = self.alloc_f32(n_positions * vocab_size); // f32 for precision
 
             unsafe {
                 self.stream.launch_builder(&func)
                     .arg(logits.bf16_data())
                     .arg(targets.f32_data())
-                    .arg(grad.bf16_data_mut())
+                    .arg(grad.f32_data_mut())
                     .arg(loss_buf.f32_data_mut())
                     .arg(&n_positions_u32)
                     .arg(&vocab_size_u32)

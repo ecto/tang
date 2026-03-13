@@ -70,7 +70,7 @@ pub use module::Module;
 pub use optimizer::{ModuleAdam, ModuleSgd, Optimizer};
 pub use parameter::Parameter;
 pub use rng::Rng;
-pub use scheduler::{CosineAnnealingLr, ConstantLr, Scheduler, StepLr, WarmupCosine};
+pub use scheduler::{CosineAnnealingLr, ConstantLr, Scheduler, StepLr, WarmupCosine, WarmupStableDecay};
 pub use trainer::LossFn;
 // Trainer now takes a scalar type parameter: Trainer<'a, S, M, O>
 pub use trainer::Trainer;

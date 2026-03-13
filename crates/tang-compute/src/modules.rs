@@ -488,6 +488,12 @@ impl InterleavedRoPE {
         Self { cos_table, sin_table, head_dim, max_seq_len }
     }
 
+    /// Access the precomputed cos table.
+    pub fn cos_table(&self) -> &[f32] { &self.cos_table }
+
+    /// Access the precomputed sin table.
+    pub fn sin_table(&self) -> &[f32] { &self.sin_table }
+
     /// Apply RoPE to input tensor.
     ///
     /// input: [seq_len, n_heads, head_dim] → output: same shape.
@@ -536,6 +542,32 @@ impl InterleavedRoPE {
         let buf = dev.rope_backward(
             &grad_output.buffer, &self.cos_table, &self.sin_table,
             seq_len, n_heads, head_dim, start_pos,
+        );
+        ComputeTensor::from_buffer(buf, shape.to_vec())
+    }
+
+    /// Batched backward: input is [batch*seq_len, n_heads, head_dim].
+    ///
+    /// Positions wrap every `seq_len` rows — each batch element gets
+    /// positions `start_pos..start_pos+seq_len`. Single kernel launch
+    /// for all batch elements.
+    pub fn backward_batched<D: ComputeDevice>(
+        &self,
+        dev: &D,
+        grad_output: &ComputeTensor<D::Buffer>,
+        seq_len: usize,
+        start_pos: usize,
+    ) -> ComputeTensor<D::Buffer> {
+        let shape = grad_output.shape();
+        assert_eq!(shape.len(), 3, "InterleavedRoPE backward_batched expects 3D");
+        let total_rows = shape[0];
+        let n_heads = shape[1];
+        let head_dim = shape[2];
+        assert_eq!(head_dim, self.head_dim);
+
+        let buf = dev.rope_backward_batched(
+            &grad_output.buffer, &self.cos_table, &self.sin_table,
+            total_rows, seq_len, n_heads, head_dim, start_pos,
         );
         ComputeTensor::from_buffer(buf, shape.to_vec())
     }
@@ -703,6 +735,34 @@ mod tests {
         assert!((v[1] - 2.0).abs() < 1e-4);
         assert!((v[2] - 3.0).abs() < 1e-4);
         assert!((v[3] - 4.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn rope_backward_batched_matches_loop() {
+        let dev = CpuDevice::new();
+        let rope = InterleavedRoPE::new(4, 32, 10000.0);
+        let batch = 3;
+        let seq_len = 2;
+        // [batch*seq_len, 1 head, 4 head_dim]
+        let data: Vec<f32> = (0..batch * seq_len * 4).map(|i| i as f32 * 0.1 + 1.0).collect();
+        let grad = ComputeTensor::from_data(&dev, &data, &[batch * seq_len, 1, 4]);
+
+        // Batched: single call
+        let batched = rope.backward_batched(&dev, &grad, seq_len, 0);
+
+        // Loop: per-batch
+        let mut looped = Vec::new();
+        for b in 0..batch {
+            let start = b * seq_len * 4;
+            let chunk = ComputeTensor::from_data(&dev, &data[start..start + seq_len * 4], &[seq_len, 1, 4]);
+            let out = rope.backward(&dev, &chunk, 0);
+            looped.extend(out.to_vec());
+        }
+
+        let bv = batched.to_vec();
+        for (i, (&a, &b)) in bv.iter().zip(looped.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-5, "mismatch at {i}: {a} vs {b}");
+        }
     }
 
     #[test]

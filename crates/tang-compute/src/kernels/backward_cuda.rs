@@ -559,22 +559,17 @@ extern "C" __global__ void embedding_backward_bf16(
 }
 "#;
 
-/// bf16 fused cross-entropy. logits is bf16, targets is u32, grad is bf16, loss_out stays f32.
+/// bf16 fused cross-entropy. logits is bf16, targets is u32, grad is f32, loss_out is f32.
+/// Grad output is f32 to preserve precision for tiny gradient values (~1e-5).
 pub const CROSS_ENTROPY_BF16_CUDA: &str = r#"
 __device__ float bf16_to_float(unsigned short bits) {
     return __int_as_float(((unsigned int)bits) << 16);
-}
-__device__ unsigned short float_to_bf16(float val) {
-    unsigned int bits = __float_as_int(val);
-    unsigned int lsb = (bits >> 16) & 1;
-    bits += 0x7FFF + lsb;
-    return (unsigned short)(bits >> 16);
 }
 
 extern "C" __global__ void cross_entropy_fwd_bwd_bf16(
     const unsigned short* __restrict__ logits,
     const unsigned int* __restrict__ targets,
-    unsigned short* __restrict__ grad,
+    float* __restrict__ grad,
     float* __restrict__ loss_out,
     const unsigned int n_pos,
     const unsigned int vocab,
@@ -594,7 +589,7 @@ extern "C" __global__ void cross_entropy_fwd_bwd_bf16(
 
     if (target == pad_id) {
         for (unsigned int i = tid; i < vocab; i += tg_size) {
-            grad[base + i] = float_to_bf16(0.0f);
+            grad[base + i] = 0.0f;
         }
         return;
     }
@@ -636,7 +631,7 @@ extern "C" __global__ void cross_entropy_fwd_bwd_bf16(
     for (unsigned int i = tid; i < vocab; i += tg_size) {
         float sm = expf(bf16_to_float(logits[base + i]) - row_max) * inv_sum;
         float one_hot = (i == target) ? 1.0f : 0.0f;
-        grad[base + i] = float_to_bf16((sm - one_hot) * inv_count);
+        grad[base + i] = (sm - one_hot) * inv_count;
     }
 }
 "#;

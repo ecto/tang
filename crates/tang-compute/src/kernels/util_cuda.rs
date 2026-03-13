@@ -325,6 +325,83 @@ extern "C" __global__ void rope_forward_bf16(
 }
 "#;
 
+/// RoPE backward batched f32: positions wrap every `seq_len` elements.
+/// Input is [batch*seq_len, n_heads, head_dim], positions cycle 0..seq_len for each batch.
+/// Grid: (ceil(total_rows * n_heads * half_dim / 256)), Block: (256)
+pub const ROPE_BACKWARD_BATCHED_CUDA: &str = r#"
+extern "C" __global__ void rope_backward_batched(
+    const float* __restrict__ grad_output,
+    const float* __restrict__ cos_table,
+    const float* __restrict__ sin_table,
+    float* __restrict__ grad_input,
+    const unsigned int total_rows,
+    const unsigned int seq_len,
+    const unsigned int n_heads,
+    const unsigned int head_dim,
+    const unsigned int half_dim,
+    const unsigned int start_pos)
+{
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = total_rows * n_heads * half_dim;
+    if (idx >= total) return;
+
+    unsigned int i = idx % half_dim;
+    unsigned int remaining = idx / half_dim;
+    unsigned int h = remaining % n_heads;
+    unsigned int s = remaining / n_heads;
+    unsigned int pos = start_pos + (s % seq_len);
+
+    float cos_val = cos_table[pos * half_dim + i];
+    float sin_val = sin_table[pos * half_dim + i];
+
+    unsigned int base = (s * n_heads + h) * head_dim;
+    float g0 = grad_output[base + 2*i];
+    float g1 = grad_output[base + 2*i + 1];
+    grad_input[base + 2*i] = g0 * cos_val + g1 * sin_val;
+    grad_input[base + 2*i + 1] = -g0 * sin_val + g1 * cos_val;
+}
+"#;
+
+/// RoPE backward batched bf16: positions wrap every `seq_len` elements.
+/// Grid: (ceil(total_rows * n_heads * half_dim / 256)), Block: (256)
+pub const ROPE_BACKWARD_BATCHED_BF16_CUDA: &str = r#"
+extern "C" __global__ void rope_backward_batched_bf16(
+    const unsigned short* __restrict__ grad_output,
+    const float* __restrict__ cos_table,
+    const float* __restrict__ sin_table,
+    unsigned short* __restrict__ grad_input,
+    const unsigned int total_rows,
+    const unsigned int seq_len,
+    const unsigned int n_heads,
+    const unsigned int head_dim,
+    const unsigned int half_dim,
+    const unsigned int start_pos)
+{
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = total_rows * n_heads * half_dim;
+    if (idx >= total) return;
+
+    unsigned int i = idx % half_dim;
+    unsigned int remaining = idx / half_dim;
+    unsigned int h = remaining % n_heads;
+    unsigned int s = remaining / n_heads;
+    unsigned int pos = start_pos + (s % seq_len);
+
+    float cos_val = cos_table[pos * half_dim + i];
+    float sin_val = sin_table[pos * half_dim + i];
+
+    unsigned int base = (s * n_heads + h) * head_dim;
+    float g0 = __int_as_float(((unsigned int)grad_output[base + 2*i]) << 16);
+    float g1 = __int_as_float(((unsigned int)grad_output[base + 2*i + 1]) << 16);
+    float r0 = g0 * cos_val + g1 * sin_val;
+    float r1 = -g0 * sin_val + g1 * cos_val;
+    unsigned int b0 = __float_as_int(r0);
+    unsigned int b1 = __float_as_int(r1);
+    grad_input[base + 2*i] = (unsigned short)((b0 + 0x7FFF + ((b0 >> 16) & 1)) >> 16);
+    grad_input[base + 2*i + 1] = (unsigned short)((b1 + 0x7FFF + ((b1 >> 16) & 1)) >> 16);
+}
+"#;
+
 /// RoPE backward bf16: bf16 I/O, f32 compute.
 /// Grid: (ceil(seq_len * n_heads * half_dim / 256)), Block: (256)
 pub const ROPE_BACKWARD_BF16_CUDA: &str = r#"
