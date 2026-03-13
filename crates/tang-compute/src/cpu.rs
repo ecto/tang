@@ -605,6 +605,48 @@ impl ComputeDevice for CpuDevice {
         CpuBuffer { data: out }
     }
 
+    fn add_norm_relative_noise(
+        &self,
+        buf: &mut CpuBuffer,
+        epsilon: f32,
+        seed: u64,
+        rows: usize,
+        cols: usize,
+    ) {
+        assert_eq!(buf.data.len(), rows * cols);
+        for row in 0..rows {
+            let base = row * cols;
+            // L2 norm of row
+            let norm: f32 = buf.data[base..base + cols]
+                .iter()
+                .map(|v| v * v)
+                .sum::<f32>()
+                .sqrt();
+            let scale = epsilon * norm;
+            for col in 0..cols {
+                // splitmix64 counter-based PRNG
+                let mut key = seed ^ (row as u64 * cols as u64 + col as u64);
+                key = key.wrapping_add(0x9e3779b97f4a7c15);
+                key = (key ^ (key >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                key = (key ^ (key >> 27)).wrapping_mul(0x94d049bb133111eb);
+                key ^= key >> 31;
+
+                let mut key2 = (seed ^ (row as u64 * cols as u64 + col as u64))
+                    .wrapping_add(0x6a09e667f3bcc908);
+                key2 = key2.wrapping_add(0x9e3779b97f4a7c15);
+                key2 = (key2 ^ (key2 >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                key2 = (key2 ^ (key2 >> 27)).wrapping_mul(0x94d049bb133111eb);
+                key2 ^= key2 >> 31;
+
+                let u1 = ((key & 0x7FFFFFFF) as f32 + 1.0) / 2147483649.0;
+                let u2 = ((key2 & 0x7FFFFFFF) as f32 + 1.0) / 2147483649.0;
+                let noise = (-2.0f32 * u1.ln()).sqrt()
+                    * (core::f32::consts::TAU * u2).cos();
+                buf.data[base + col] += scale * noise;
+            }
+        }
+    }
+
     fn add_assign(&self, dst: &mut CpuBuffer, src: &CpuBuffer) {
         assert_eq!(dst.data.len(), src.data.len());
         for (d, s) in dst.data.iter_mut().zip(src.data.iter()) {

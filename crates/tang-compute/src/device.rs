@@ -26,6 +26,9 @@ pub trait ComputeDevice: Send {
     /// Total device memory in bytes (VRAM). Returns 0 if unknown.
     fn total_memory_bytes(&self) -> usize { 0 }
 
+    /// Free device memory in bytes. Returns 0 if unknown.
+    fn free_memory_bytes(&self) -> usize { 0 }
+
     // -- Buffer lifecycle --
 
     /// Upload f32 data from CPU to device.
@@ -608,6 +611,53 @@ pub trait ComputeDevice: Send {
         let mut a = self.download(acc);
         a[0] += sq;
         *acc = self.upload(&a);
+    }
+
+    /// Compute sum-of-squares across multiple buffers in a single fused operation.
+    /// Returns a 1-element buffer containing the total sum of squares (read later to avoid sync).
+    /// Default: calls reduce_sum_sq_accumulate per buffer. Override for GPU-fused version.
+    fn fused_sum_sq(&self, bufs: &[&Self::Buffer]) -> Self::Buffer {
+        let mut acc = self.upload_f32(&[0.0f32]);
+        for buf in bufs {
+            self.reduce_sum_sq_accumulate(buf, &mut acc);
+        }
+        acc
+    }
+
+    /// Compute global L2 norm across multiple buffers, clip if above max_norm.
+    /// Returns the pre-clip norm. Fused for efficiency (2 kernel launches instead of N).
+    fn clip_grad_norm(&self, bufs: &mut [&mut Self::Buffer], max_norm: f32) -> f32 {
+        let mut total_sq: f64 = 0.0;
+        for buf in bufs.iter() {
+            let data = self.download(*buf);
+            for &v in &data {
+                total_sq += (v as f64) * (v as f64);
+            }
+        }
+        let norm = total_sq.sqrt() as f32;
+        if norm > max_norm {
+            let scale = max_norm / norm;
+            for buf in bufs.iter_mut() {
+                self.scale_buffer(*buf, scale);
+            }
+        }
+        norm
+    }
+
+    /// Add norm-relative Gaussian noise in-place.
+    ///
+    /// For each row: `data[row, col] += epsilon * ||row||_2 * N(0,1)`.
+    /// Uses counter-based PRNG seeded by `seed` for reproducibility.
+    /// `rows` × `cols` must equal the buffer length.
+    fn add_norm_relative_noise(
+        &self,
+        _buf: &mut Self::Buffer,
+        _epsilon: f32,
+        _seed: u64,
+        _rows: usize,
+        _cols: usize,
+    ) {
+        panic!("add_norm_relative_noise not implemented for this device");
     }
 
     /// In-place scale: buf[i] *= scale.

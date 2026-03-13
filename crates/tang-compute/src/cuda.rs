@@ -701,6 +701,10 @@ impl ComputeDevice for CudaComputeDevice {
         cudarc::driver::result::mem_get_info().map(|(_, total)| total).unwrap_or(0)
     }
 
+    fn free_memory_bytes(&self) -> usize {
+        cudarc::driver::result::mem_get_info().map(|(free, _)| free).unwrap_or(0)
+    }
+
     fn upload(&self, data: &[f32]) -> CudaBuffer {
         if self.mixed_precision {
             let bf16_data: Vec<u16> = data.iter().map(|&v| f32_to_bf16(v)).collect();
@@ -1997,13 +2001,13 @@ impl ComputeDevice for CudaComputeDevice {
 
         if logits.is_bf16() {
             let (_module, func) = self.get_func(backward_cuda::CROSS_ENTROPY_BF16_CUDA, "cross_entropy_fwd_bwd_bf16");
-            let mut grad = self.alloc(n_positions * vocab_size); // bf16
+            let mut grad = self.alloc_f32(n_positions * vocab_size); // f32 for precision
 
             unsafe {
                 self.stream.launch_builder(&func)
                     .arg(logits.bf16_data())
                     .arg(targets.f32_data())
-                    .arg(grad.bf16_data_mut())
+                    .arg(grad.f32_data_mut())
                     .arg(loss_buf.f32_data_mut())
                     .arg(&n_positions_u32)
                     .arg(&vocab_size_u32)
@@ -2859,6 +2863,60 @@ impl ComputeDevice for CudaComputeDevice {
         }
     }
 
+    fn add_norm_relative_noise(
+        &self,
+        buf: &mut CudaBuffer,
+        epsilon: f32,
+        seed: u64,
+        rows: usize,
+        cols: usize,
+    ) {
+        assert_eq!(buf.len, rows * cols);
+        let block_dim = cols.min(256) as u32;
+        let cfg = LaunchConfig {
+            block_dim: (block_dim, 1, 1),
+            grid_dim: (rows as u32, 1, 1),
+            shared_mem_bytes: block_dim * 4,
+        };
+        let rows_u32 = rows as u32;
+        let cols_u32 = cols as u32;
+
+        match &mut buf.storage {
+            CudaStorage::F32(s) => {
+                let (_module, func) = self.get_func(
+                    crate::kernels::noise_cuda::NORM_RELATIVE_NOISE_F32_CUDA,
+                    "norm_relative_noise_f32",
+                );
+                unsafe {
+                    self.stream.launch_builder(&func)
+                        .arg(s)
+                        .arg(&epsilon)
+                        .arg(&seed)
+                        .arg(&rows_u32)
+                        .arg(&cols_u32)
+                        .launch(cfg)
+                        .unwrap();
+                }
+            }
+            CudaStorage::Bf16(s) => {
+                let (_module, func) = self.get_func(
+                    crate::kernels::noise_cuda::NORM_RELATIVE_NOISE_BF16_CUDA,
+                    "norm_relative_noise_bf16",
+                );
+                unsafe {
+                    self.stream.launch_builder(&func)
+                        .arg(s)
+                        .arg(&epsilon)
+                        .arg(&seed)
+                        .arg(&rows_u32)
+                        .arg(&cols_u32)
+                        .launch(cfg)
+                        .unwrap();
+                }
+            }
+        }
+    }
+
     fn add_assign(&self, dst: &mut CudaBuffer, src: &CudaBuffer) {
         assert_eq!(dst.len, src.len);
         let n = dst.len as u32;
@@ -3035,6 +3093,61 @@ impl ComputeDevice for CudaComputeDevice {
         }
     }
 
+    fn fused_sum_sq(&self, bufs: &[&CudaBuffer]) -> CudaBuffer {
+        if bufs.is_empty() {
+            return self.upload_f32(&[0.0f32]);
+        }
+
+        // Convert bf16 buffers to f32 if needed
+        let converted: Vec<Option<CudaBuffer>> = bufs.iter()
+            .map(|b| if b.is_bf16() { Some(self.convert_bf16_to_f32(b)) } else { None })
+            .collect();
+
+        // Collect raw device pointers and cumulative offsets
+        let mut ptrs: Vec<u64> = Vec::with_capacity(bufs.len());
+        let mut offsets: Vec<u32> = Vec::with_capacity(bufs.len() + 1);
+        let mut _records = Vec::new(); // keep SyncOnDrop alive until launch
+        offsets.push(0);
+        for (i, buf) in bufs.iter().enumerate() {
+            let src = converted[i].as_ref().unwrap_or(buf);
+            let (ptr, record) = src.f32_data().device_ptr(&self.stream);
+            ptrs.push(ptr);
+            _records.push(record);
+            offsets.push(offsets.last().unwrap() + src.len as u32);
+        }
+        let total_n = *offsets.last().unwrap();
+        let n_bufs = bufs.len() as u32;
+
+        // Upload pointer and offset arrays to GPU
+        let ptrs_gpu = self.stream.memcpy_stod(&ptrs).unwrap();
+        let offsets_gpu = self.stream.memcpy_stod(&offsets).unwrap();
+        let mut acc = self.stream.alloc_zeros::<f32>(1).unwrap();
+
+        // Single fused kernel: all buffers in one launch
+        let blocks = (total_n + 1023) / 1024; // 4 elems/thread, 256 threads/block
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks, 1, 1),
+            shared_mem_bytes: 256 * 4,
+        };
+        let (_module, func) = self.get_func(
+            crate::kernels::adamw_cuda::MULTI_BUFFER_SUM_SQ_CUDA,
+            "multi_buffer_sum_sq",
+        );
+        unsafe {
+            self.stream.launch_builder(&func)
+                .arg(&ptrs_gpu)
+                .arg(&offsets_gpu)
+                .arg(&n_bufs)
+                .arg(&total_n)
+                .arg(&mut acc)
+                .launch(cfg)
+                .unwrap();
+        }
+        drop(_records);
+        CudaBuffer { storage: CudaStorage::F32(acc), len: 1 }
+    }
+
     fn scale_buffer(&self, buf: &mut CudaBuffer, scale: f32) {
         if buf.is_bf16() {
             // Convert to f32, scale, convert back
@@ -3061,6 +3174,29 @@ impl ComputeDevice for CudaComputeDevice {
                 .launch(cfg)
                 .unwrap();
         }
+    }
+
+    fn clip_grad_norm(&self, bufs: &mut [&mut CudaBuffer], max_norm: f32) -> f32 {
+        if bufs.is_empty() {
+            return 0.0;
+        }
+
+        // Fused sum-of-squares: single kernel launch
+        let buf_refs: Vec<&CudaBuffer> = bufs.iter().map(|b| &**b).collect();
+        let acc = self.fused_sum_sq(&buf_refs);
+
+        self.stream.synchronize().unwrap();
+        let norm_sq = self.stream.memcpy_dtov(acc.f32_data()).unwrap()[0];
+        let norm = (norm_sq as f64).sqrt() as f32;
+
+        if norm > max_norm {
+            let scale = max_norm / norm;
+            for buf in bufs.iter_mut() {
+                self.scale_buffer(*buf, scale);
+            }
+        }
+
+        norm
     }
 }
 
