@@ -459,6 +459,77 @@ extern "C" __global__ void softmax_backward_bf16(
 }
 "#;
 
+/// Fused RMSNorm backward + residual accumulate.
+/// Like rms_norm_backward, but adds `residual_grad` to `grad_input` at the end.
+/// Eliminates a separate `add_tensors` kernel launch per block.
+/// Grid: (n_groups), Block: (min(dim, 256))
+pub const RMS_NORM_BACKWARD_RESIDUAL_CUDA: &str = r#"
+extern "C" __global__ void rms_norm_backward_residual(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    const float* __restrict__ grad_out,
+    const float* __restrict__ residual_grad,
+    float* __restrict__ grad_input,
+    float* __restrict__ grad_weight,
+    const unsigned int n_groups,
+    const unsigned int dim,
+    const float eps)
+{
+    __shared__ float shared[256];
+
+    unsigned int group = blockIdx.x;
+    unsigned int tid = threadIdx.x;
+    unsigned int tg_size = blockDim.x;
+    if (group >= n_groups) return;
+
+    unsigned int base = group * dim;
+
+    // Phase 1: compute sum of squares
+    float local_sq = 0.0f;
+    for (unsigned int i = tid; i < dim; i += tg_size) {
+        float v = input[base + i];
+        local_sq += v * v;
+    }
+    shared[tid] = local_sq;
+    __syncthreads();
+
+    for (unsigned int s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) shared[tid] += shared[tid + s];
+        __syncthreads();
+    }
+    float rms_sq = shared[0] / float(dim) + eps;
+    float inv_rms = rsqrtf(rms_sq);
+    __syncthreads();  // barrier before Phase 2 reuses shared[]
+
+    // Phase 2: dot product for the correction term
+    float local_xwg = 0.0f;
+    for (unsigned int i = tid; i < dim; i += tg_size) {
+        local_xwg += input[base + i] * weight[i] * grad_out[base + i];
+    }
+    shared[tid] = local_xwg;
+    __syncthreads();
+
+    for (unsigned int s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) shared[tid] += shared[tid + s];
+        __syncthreads();
+    }
+    float sum_xwg = shared[0];
+
+    // Phase 3: compute grad_input with fused residual add, and accumulate grad_weight
+    for (unsigned int i = tid; i < dim; i += tg_size) {
+        float x = input[base + i];
+        float go = grad_out[base + i];
+        float w = weight[i];
+
+        float gi = w * inv_rms * go
+            - x * inv_rms * inv_rms * inv_rms / float(dim) * sum_xwg;
+        grad_input[base + i] = gi + residual_grad[base + i];
+
+        atomicAdd(&grad_weight[i], x * inv_rms * go);
+    }
+}
+"#;
+
 /// bf16 RMS norm backward. input/weight/grad_out/grad_input are bf16, grad_weight stays f32 (atomic).
 pub const RMS_NORM_BACKWARD_BF16_CUDA: &str = r#"
 __device__ float bf16_to_float(unsigned short bits) {
@@ -1436,5 +1507,48 @@ extern "C" __global__ void causal_attention_backward_bf16(
                 p * bf16_to_float(grad_out[pos * total_dim + q_off + d]));
         }
     }
+}
+"#;
+
+/// Fused gradient clip+scale kernel.
+/// Reads a 1-element `norm_sq` buffer (output of multi_buffer_sum_sq),
+/// computes scale = max_norm / sqrt(norm_sq). If norm <= max_norm, early-exits.
+/// On NaN/Inf norm, zeros all elements. Otherwise scales all buffers in-place.
+/// Uses the same multi-buffer pointer indirection as multi_buffer_sum_sq.
+/// Grid: (ceil(total_n / 256)), Block: (256)
+pub const FUSED_CLIP_SCALE_CUDA: &str = r#"
+extern "C" __global__ void fused_clip_scale(
+    const float* __restrict__ norm_sq,
+    const unsigned long long* __restrict__ ptrs,
+    const unsigned int* __restrict__ offsets,
+    const unsigned int n_bufs,
+    const unsigned int total_n,
+    const float max_norm)
+{
+    // Every thread reads norm_sq and computes scale independently (1 global read, L1-cached)
+    float ns = norm_sq[0];
+    float norm = sqrtf(ns);
+    float s;
+    if (isnan(norm) || isinf(norm)) {
+        s = 0.0f;  // Zero out gradients on NaN/Inf
+    } else if (norm > max_norm) {
+        s = max_norm / norm;
+    } else {
+        return;  // No scaling needed, early exit for all threads
+    }
+
+    unsigned int gi = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gi >= total_n) return;
+
+    // Binary search for which buffer this element belongs to
+    unsigned int lo = 0, hi = n_bufs;
+    while (lo < hi) {
+        unsigned int mid = (lo + hi) / 2;
+        if (offsets[mid + 1] <= gi) lo = mid + 1;
+        else hi = mid;
+    }
+    float* buf = (float*)ptrs[lo];
+    unsigned int local_idx = gi - offsets[lo];
+    buf[local_idx] *= s;
 }
 "#;

@@ -16,6 +16,8 @@ pub mod tensor;
 pub mod metal;
 
 #[cfg(feature = "cuda")]
+pub mod pool;
+#[cfg(feature = "cuda")]
 pub mod cuda;
 
 pub use cpu::CpuDevice;
@@ -34,3 +36,6 @@ pub use metal::MetalDevice;
 
 #[cfg(feature = "cuda")]
 pub use cuda::CudaComputeDevice;
+
+#[cfg(feature = "cuda")]
+pub use cudarc::driver::CudaGraph;

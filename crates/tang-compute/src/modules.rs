@@ -286,6 +286,27 @@ impl<B: ComputeBuffer> RMSNorm<B> {
         );
         ComputeTensor::from_buffer(gi_buf, grad_output.shape().to_vec())
     }
+
+    /// Backward pass with fused residual addition.
+    ///
+    /// Returns `grad_input + residual_grad` in one kernel launch instead of two.
+    /// grad_weight is accumulated into `grad_weight_acc`.
+    pub fn backward_residual_accumulate<D: ComputeDevice<Buffer = B>>(
+        &self,
+        dev: &D,
+        grad_output: &ComputeTensor<B>,
+        cache: &RMSNormCache<B>,
+        grad_weight_acc: &mut B,
+        residual_grad: &ComputeTensor<B>,
+    ) -> ComputeTensor<B> {
+        let n_groups = grad_output.numel() / self.dim;
+        let buf = dev.rms_norm_backward_residual_accumulate(
+            &cache.input, &self.weight.buffer, &grad_output.buffer,
+            &residual_grad.buffer,
+            n_groups, self.dim, self.eps, grad_weight_acc,
+        );
+        ComputeTensor::from_buffer(buf, grad_output.shape().to_vec())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -515,6 +536,32 @@ impl InterleavedRoPE {
 
         let buf = dev.rope_forward(
             &input.buffer, &self.cos_table, &self.sin_table,
+            seq_len, n_heads, head_dim, start_pos,
+        );
+        ComputeTensor::from_buffer(buf, shape.to_vec())
+    }
+
+    /// Forward with pre-uploaded cos/sin buffers on device.
+    /// Avoids re-uploading tables every call.
+    pub fn forward_cached<D: ComputeDevice>(
+        &self,
+        dev: &D,
+        input: &ComputeTensor<D::Buffer>,
+        start_pos: usize,
+        cos_buf: &D::Buffer,
+        sin_buf: &D::Buffer,
+    ) -> ComputeTensor<D::Buffer> {
+        let shape = input.shape();
+        assert_eq!(shape.len(), 3, "InterleavedRoPE expects 3D [seq, heads, dim]");
+        let seq_len = shape[0];
+        let n_heads = shape[1];
+        let head_dim = shape[2];
+        assert_eq!(head_dim, self.head_dim);
+        assert!(start_pos + seq_len <= self.max_seq_len,
+            "RoPE position {} >= max {}", start_pos + seq_len - 1, self.max_seq_len);
+
+        let buf = dev.rope_forward_cached(
+            &input.buffer, cos_buf, sin_buf,
             seq_len, n_heads, head_dim, start_pos,
         );
         ComputeTensor::from_buffer(buf, shape.to_vec())

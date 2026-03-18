@@ -42,6 +42,44 @@ extern "C" __global__ void extract_columns_bf16(
 }
 "#;
 
+/// Write columns into a larger matrix (inverse of extract_columns).
+/// Writes `src[batch, col_count]` into `dst[batch, total_cols]` at columns [col_start, col_start + col_count).
+/// Grid: (ceil(batch * col_count / 256)), Block: (256)
+pub const CONCAT_COLUMNS_CUDA: &str = r#"
+extern "C" __global__ void concat_columns(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    unsigned int batch,
+    unsigned int total_cols,
+    unsigned int col_start,
+    unsigned int col_count)
+{
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch * col_count) return;
+    unsigned int row = idx / col_count;
+    unsigned int col = idx % col_count;
+    dst[row * total_cols + col_start + col] = src[idx];
+}
+"#;
+
+/// bf16 variant of concat_columns.
+pub const CONCAT_COLUMNS_BF16_CUDA: &str = r#"
+extern "C" __global__ void concat_columns_bf16(
+    const unsigned short* __restrict__ src,
+    unsigned short* __restrict__ dst,
+    unsigned int batch,
+    unsigned int total_cols,
+    unsigned int col_start,
+    unsigned int col_count)
+{
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch * col_count) return;
+    unsigned int row = idx / col_count;
+    unsigned int col = idx % col_count;
+    dst[row * total_cols + col_start + col] = src[idx];
+}
+"#;
+
 /// Convert bf16 buffer to f32 on GPU (no CPU round-trip).
 /// Grid: (ceil(n / 256)), Block: (256)
 pub const BF16_TO_F32_CUDA: &str = r#"

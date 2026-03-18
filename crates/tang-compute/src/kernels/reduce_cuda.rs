@@ -361,6 +361,56 @@ extern "C" __global__ void reduce_sum_accumulate(
 }
 "#;
 
+/// Reduce-sum along an axis, reading bf16 input, accumulating into f32 output.
+/// Fused bf16→f32 conversion + reduction — avoids separate convert-then-reduce.
+/// Grid: (outer * inner), Block: (min(axis_len, 256) rounded to power-of-two)
+pub const REDUCE_SUM_ACCUMULATE_BF16_CUDA: &str = r#"
+__device__ float bf16_to_float_rsa(unsigned short bits) {
+    unsigned int x = ((unsigned int)bits) << 16;
+    float result;
+    asm("mov.b32 %0, %1;" : "=f"(result) : "r"(x));
+    return result;
+}
+extern "C" __global__ void reduce_sum_accumulate_bf16(
+    const unsigned short* __restrict__ input,
+    float* __restrict__ output,
+    const unsigned int outer,
+    const unsigned int axis_len,
+    const unsigned int inner)
+{
+    __shared__ float shared[256];
+
+    unsigned int out_idx = blockIdx.x;
+    unsigned int tid = threadIdx.x;
+    unsigned int tg_size = blockDim.x;
+
+    unsigned int total_out = outer * inner;
+    if (out_idx >= total_out) return;
+
+    unsigned int o = out_idx / inner;
+    unsigned int i = out_idx % inner;
+
+    float local_sum = 0.0f;
+    unsigned int base = o * axis_len * inner + i;
+    for (unsigned int a = tid; a < axis_len; a += tg_size) {
+        local_sum += bf16_to_float_rsa(input[base + a * inner]);
+    }
+    shared[tid] = local_sum;
+    __syncthreads();
+
+    for (unsigned int s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared[tid] += shared[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        output[out_idx] += shared[0];
+    }
+}
+"#;
+
 /// bf16 reduce-sum along an arbitrary axis.
 /// Input/output are bf16 (unsigned short), reduction in f32.
 pub const REDUCE_SUM_BF16_CUDA: &str = r#"

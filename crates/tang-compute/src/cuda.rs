@@ -123,81 +123,17 @@ impl CudaBuffer {
     }
 }
 
-/// Power-of-2 bucketed buffer pool to avoid cudaMalloc overhead.
-/// Buffers auto-return via CudaBuffer::Drop. Per-bucket cap prevents OOM.
-const POOL_MAX_PER_BUCKET: usize = 32;
+use crate::pool::BufferPool;
 
-struct BufferPool {
-    f32_free: HashMap<usize, Vec<CudaSlice<f32>>>,
-    bf16_free: HashMap<usize, Vec<CudaSlice<u16>>>,
-    hits: u64,
-    misses: u64,
-    evictions: u64,
-}
-
-impl BufferPool {
-    fn new() -> Self {
-        Self {
-            f32_free: HashMap::new(),
-            bf16_free: HashMap::new(),
-            hits: 0,
-            misses: 0,
-            evictions: 0,
-        }
-    }
-
-    fn get_f32(&mut self, len: usize) -> Option<CudaSlice<f32>> {
-        if let Some(v) = self.f32_free.get_mut(&len) {
-            if let Some(s) = v.pop() {
-                self.hits += 1;
-                return Some(s);
-            }
-        }
-        self.misses += 1;
-        None
-    }
-
-    fn get_bf16(&mut self, len: usize) -> Option<CudaSlice<u16>> {
-        if let Some(v) = self.bf16_free.get_mut(&len) {
-            if let Some(s) = v.pop() {
-                self.hits += 1;
-                return Some(s);
-            }
-        }
-        self.misses += 1;
-        None
-    }
-
-    fn put_f32(&mut self, slice: CudaSlice<f32>, len: usize) {
-        let bucket = self.f32_free.entry(len).or_default();
-        if bucket.len() >= POOL_MAX_PER_BUCKET {
-            self.evictions += 1;
-            // drop slice — cudaFree
-        } else {
-            bucket.push(slice);
-        }
-    }
-
-    fn put_bf16(&mut self, slice: CudaSlice<u16>, len: usize) {
-        let bucket = self.bf16_free.entry(len).or_default();
-        if bucket.len() >= POOL_MAX_PER_BUCKET {
-            self.evictions += 1;
-            // drop slice — cudaFree
-        } else {
-            bucket.push(slice);
-        }
-    }
-
-    /// Drop all cached buffers, returning memory to CUDA.
-    fn clear(&mut self) {
-        self.f32_free.clear();
-        self.bf16_free.clear();
-    }
-
-    fn hit_rate(&self) -> f64 {
-        let total = self.hits + self.misses;
-        if total == 0 { 0.0 } else { self.hits as f64 / total as f64 }
-    }
+/// Extended pool diagnostics.
+pub struct PoolStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub hit_rate: f64,
+    pub evictions: u64,
+    pub pressure_clears: u64,
+    pub cached_mb: f64,
+    pub n_buckets: usize,
 }
 
 /// CUDA compute device.
@@ -291,59 +227,111 @@ impl CudaComputeDevice {
 
     /// Allocate an f32 buffer using the pool. Zeros the memory.
     fn pool_alloc_f32(&self, len: usize) -> CudaBuffer {
-        if let Some(mut slice) = self.pool.lock().unwrap().get_f32(len) {
-            self.stream.memset_zeros(&mut slice).unwrap();
-            return self.make_buf(CudaStorage::F32(slice), len);
+        {
+            let mut pool = self.pool.lock().unwrap();
+            pool.maybe_evict_under_pressure();
+            if let Some(mut slice) = pool.get_f32(len) {
+                self.stream.memset_zeros(&mut slice).unwrap();
+                return self.make_buf(CudaStorage::F32(slice), len);
+            }
         }
-        let slice = self.stream.alloc_zeros::<f32>(len).unwrap();
-        self.make_buf(CudaStorage::F32(slice), len)
+        match self.stream.alloc_zeros::<f32>(len) {
+            Ok(slice) => self.make_buf(CudaStorage::F32(slice), len),
+            Err(_) => {
+                self.pool.lock().unwrap().clear();
+                let slice = self.stream.alloc_zeros::<f32>(len).unwrap();
+                self.make_buf(CudaStorage::F32(slice), len)
+            }
+        }
     }
 
     /// Allocate an f32 buffer using the pool WITHOUT zeroing.
     /// Caller must fully overwrite before reading (e.g., matmul output).
     fn pool_alloc_uninit_f32(&self, len: usize) -> CudaBuffer {
-        if let Some(slice) = self.pool.lock().unwrap().get_f32(len) {
-            return self.make_buf(CudaStorage::F32(slice), len);
+        {
+            let mut pool = self.pool.lock().unwrap();
+            pool.maybe_evict_under_pressure();
+            if let Some(slice) = pool.get_f32(len) {
+                return self.make_buf(CudaStorage::F32(slice), len);
+            }
         }
-        // cudarc unsafe alloc skips memset
-        let slice = unsafe { self.stream.alloc::<f32>(len).unwrap() };
-        self.make_buf(CudaStorage::F32(slice), len)
+        match unsafe { self.stream.alloc::<f32>(len) } {
+            Ok(slice) => self.make_buf(CudaStorage::F32(slice), len),
+            Err(_) => {
+                // OOM — evict pool and retry
+                self.pool.lock().unwrap().clear();
+                let slice = unsafe { self.stream.alloc::<f32>(len).unwrap() };
+                self.make_buf(CudaStorage::F32(slice), len)
+            }
+        }
     }
 
     /// Allocate a bf16 buffer using the pool. Zeros the memory.
     fn pool_alloc_bf16(&self, len: usize) -> CudaBuffer {
-        if let Some(mut slice) = self.pool.lock().unwrap().get_bf16(len) {
-            self.stream.memset_zeros(&mut slice).unwrap();
-            return self.make_buf(CudaStorage::Bf16(slice), len);
+        {
+            let mut pool = self.pool.lock().unwrap();
+            pool.maybe_evict_under_pressure();
+            if let Some(mut slice) = pool.get_bf16(len) {
+                self.stream.memset_zeros(&mut slice).unwrap();
+                return self.make_buf(CudaStorage::Bf16(slice), len);
+            }
         }
-        let slice = self.stream.alloc_zeros::<u16>(len).unwrap();
-        self.make_buf(CudaStorage::Bf16(slice), len)
+        match self.stream.alloc_zeros::<u16>(len) {
+            Ok(slice) => self.make_buf(CudaStorage::Bf16(slice), len),
+            Err(_) => {
+                self.pool.lock().unwrap().clear();
+                let slice = self.stream.alloc_zeros::<u16>(len).unwrap();
+                self.make_buf(CudaStorage::Bf16(slice), len)
+            }
+        }
     }
 
     /// Allocate a bf16 buffer using the pool WITHOUT zeroing.
     fn pool_alloc_uninit_bf16(&self, len: usize) -> CudaBuffer {
-        if let Some(slice) = self.pool.lock().unwrap().get_bf16(len) {
-            return self.make_buf(CudaStorage::Bf16(slice), len);
+        {
+            let mut pool = self.pool.lock().unwrap();
+            pool.maybe_evict_under_pressure();
+            if let Some(slice) = pool.get_bf16(len) {
+                return self.make_buf(CudaStorage::Bf16(slice), len);
+            }
         }
-        let slice = unsafe { self.stream.alloc::<u16>(len).unwrap() };
-        self.make_buf(CudaStorage::Bf16(slice), len)
+        match unsafe { self.stream.alloc::<u16>(len) } {
+            Ok(slice) => self.make_buf(CudaStorage::Bf16(slice), len),
+            Err(_) => {
+                self.pool.lock().unwrap().clear();
+                let slice = unsafe { self.stream.alloc::<u16>(len).unwrap() };
+                self.make_buf(CudaStorage::Bf16(slice), len)
+            }
+        }
     }
 
-    /// Return a buffer to the pool for reuse. The buffer must not be used after this.
     /// Return a buffer to the pool for reuse.
     /// With auto-reclaim, just dropping the buffer works too.
     pub fn reclaim(&self, _buf: CudaBuffer) {
         // Drop impl handles returning storage to pool
     }
 
-    /// Get pool hit rate (for diagnostics). Returns (hits, misses, hit_rate, evictions).
+    /// Get pool diagnostics: (hits, misses, hit_rate, evictions, cached_mb, buckets, pressure_clears).
     pub fn pool_stats(&self) -> (u64, u64, f64, u64) {
         let pool = self.pool.lock().unwrap();
         (pool.hits, pool.misses, pool.hit_rate(), pool.evictions)
     }
 
+    /// Get extended pool diagnostics.
+    pub fn pool_stats_extended(&self) -> PoolStats {
+        let pool = self.pool.lock().unwrap();
+        PoolStats {
+            hits: pool.hits,
+            misses: pool.misses,
+            hit_rate: pool.hit_rate(),
+            evictions: pool.evictions,
+            pressure_clears: pool.pressure_clears,
+            cached_mb: pool.cached_bytes() as f64 / (1024.0 * 1024.0),
+            n_buckets: pool.n_buckets(),
+        }
+    }
+
     /// Drop all cached buffers in the pool, returning memory to CUDA.
-    /// Call between DiLoCo rounds to prevent fragmentation-induced OOM.
     pub fn pool_clear(&self) {
         self.pool.lock().unwrap().clear();
     }
