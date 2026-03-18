@@ -29,6 +29,11 @@ pub trait ComputeDevice: Send {
     /// Free device memory in bytes. Returns 0 if unknown.
     fn free_memory_bytes(&self) -> usize { 0 }
 
+    /// Release cached buffers in the device memory pool. No-op on devices
+    /// without pooling. Call between long-running phases to prevent
+    /// fragmentation-induced OOM.
+    fn pool_clear(&self) {}
+
     // -- Buffer lifecycle --
 
     /// Upload f32 data from CPU to device.
@@ -51,8 +56,29 @@ pub trait ComputeDevice: Send {
         self.alloc(len)
     }
 
+    /// Allocate buffer without zeroing. Callers must fully initialize before reading.
+    /// Used for output buffers (matmul results, kernel outputs) that will be immediately overwritten.
+    fn alloc_uninit(&self, len: usize) -> Self::Buffer {
+        self.alloc(len)
+    }
+
+    /// Like `alloc_uninit` but always f32.
+    fn alloc_uninit_f32(&self, len: usize) -> Self::Buffer {
+        self.alloc_f32(len)
+    }
+
     /// Download buffer contents to CPU.
     fn download(&self, buf: &Self::Buffer) -> Vec<f32>;
+
+    /// Upload f32 data into an existing buffer (graph-capturable, no new allocation).
+    fn upload_into_f32(&self, buf: &mut Self::Buffer, data: &[f32]) {
+        *buf = self.upload_f32(data);
+    }
+
+    /// Upload u32 data into an existing buffer (graph-capturable, no new allocation).
+    fn upload_into_u32(&self, buf: &mut Self::Buffer, data: &[u32]) {
+        *buf = self.upload_u32(data);
+    }
 
     // -- Auto-generated elementwise (via tang-expr) --
 
@@ -317,6 +343,22 @@ pub trait ComputeDevice: Send {
         pad_id: u32,
     ) -> (f32, Self::Buffer);
 
+    /// Like cross_entropy_forward_backward but with pre-counted non-pad positions.
+    /// Avoids GPU→CPU sync to count targets.
+    fn cross_entropy_forward_backward_counted(
+        &self,
+        logits: &Self::Buffer,
+        targets: &Self::Buffer,
+        n_positions: usize,
+        vocab_size: usize,
+        pad_id: u32,
+        non_pad_count: u32,
+    ) -> (f32, Self::Buffer) {
+        // Default: ignore count, fall back to standard impl
+        let _ = non_pad_count;
+        self.cross_entropy_forward_backward(logits, targets, n_positions, vocab_size, pad_id)
+    }
+
     /// Wait for all pending operations to complete.
     fn sync(&self);
 
@@ -431,6 +473,27 @@ pub trait ComputeDevice: Send {
         gi
     }
 
+    /// Backward pass for RMS normalization, fused with residual gradient addition.
+    /// Returns grad_input + residual_grad. grad_weight is accumulated into `grad_weight_acc`.
+    /// Eliminates a separate `add_tensors` kernel launch.
+    fn rms_norm_backward_residual_accumulate(
+        &self,
+        input: &Self::Buffer,
+        weight: &Self::Buffer,
+        grad_output: &Self::Buffer,
+        residual_grad: &Self::Buffer,
+        n_groups: usize,
+        dim: usize,
+        eps: f32,
+        grad_weight_acc: &mut Self::Buffer,
+    ) -> Self::Buffer {
+        // Default: unfused path
+        let gi = self.rms_norm_backward_accumulate(
+            input, weight, grad_output, n_groups, dim, eps, grad_weight_acc,
+        );
+        self.add_tensors_buf(&gi, residual_grad, n_groups * dim)
+    }
+
     /// Extract columns [col_start, col_start + col_count) from a [batch, total_cols] matrix.
     /// Returns a contiguous [batch, col_count] buffer.
     fn extract_columns(
@@ -448,6 +511,29 @@ pub trait ComputeDevice: Send {
             out.extend_from_slice(&data[row_start..row_start + col_count]);
         }
         self.upload(&out)
+    }
+
+    /// Write `src[batch, col_count]` into columns [col_start, col_start+col_count) of `dst[batch, total_cols]`.
+    /// Inverse of `extract_columns`.
+    fn concat_columns(
+        &self,
+        dst: &mut Self::Buffer,
+        src: &Self::Buffer,
+        batch: usize,
+        total_cols: usize,
+        col_start: usize,
+        col_count: usize,
+    ) {
+        let dst_data = dst.to_vec();
+        let src_data = src.to_vec();
+        let mut out = dst_data;
+        for row in 0..batch {
+            let dst_start = row * total_cols + col_start;
+            let src_start = row * col_count;
+            out[dst_start..dst_start + col_count]
+                .copy_from_slice(&src_data[src_start..src_start + col_count]);
+        }
+        *dst = self.upload(&out);
     }
 
     /// Fused residual add + RMS normalization.
@@ -581,6 +667,27 @@ pub trait ComputeDevice: Send {
             }
         }
         self.upload(&out)
+    }
+
+    /// RoPE forward with pre-uploaded cos/sin buffers on device.
+    /// Avoids re-uploading tables every call.
+    fn rope_forward_cached(
+        &self,
+        input: &Self::Buffer,
+        cos_buf: &Self::Buffer,
+        sin_buf: &Self::Buffer,
+        seq_len: usize,
+        n_heads: usize,
+        head_dim: usize,
+        start_pos: usize,
+    ) -> Self::Buffer {
+        // Default: download tables and delegate
+        let cos_table = self.download(cos_buf);
+        let sin_table = self.download(sin_buf);
+        self.rope_forward(
+            input, &cos_table, &sin_table,
+            seq_len, n_heads, head_dim, start_pos,
+        )
     }
 
     /// Batched RoPE backward with pre-uploaded cos/sin buffers on device.

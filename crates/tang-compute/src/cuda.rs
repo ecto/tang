@@ -4,11 +4,11 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
 use cudarc::cublas::sys::cublasOperation_t;
-use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaContext, CudaFunction, CudaGraph, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc;
 
 use crate::device::{ComputeBuffer, ComputeDevice};
@@ -38,9 +38,34 @@ enum CudaStorage {
 }
 
 /// CUDA buffer wrapping either a CudaSlice<f32> or CudaSlice<u16> (bf16).
+/// When dropped, automatically returns storage to the buffer pool (if pooled).
 pub struct CudaBuffer {
-    storage: CudaStorage,
+    storage: Option<CudaStorage>,
     len: usize,
+    pool: Option<Arc<Mutex<BufferPool>>>,
+}
+
+impl Drop for CudaBuffer {
+    fn drop(&mut self) {
+        if let (Some(storage), Some(pool)) = (self.storage.take(), self.pool.as_ref()) {
+            let mut p = pool.lock().unwrap();
+            match storage {
+                CudaStorage::F32(slice) => p.put_f32(slice, self.len),
+                CudaStorage::Bf16(slice) => p.put_bf16(slice, self.len),
+            }
+        }
+        // If no pool ref, storage is dropped normally (cudaFree)
+    }
+}
+
+impl CudaBuffer {
+    fn storage(&self) -> &CudaStorage {
+        self.storage.as_ref().expect("buffer storage already taken")
+    }
+
+    fn storage_mut(&mut self) -> &mut CudaStorage {
+        self.storage.as_mut().expect("buffer storage already taken")
+    }
 }
 
 impl ComputeBuffer for CudaBuffer {
@@ -49,7 +74,7 @@ impl ComputeBuffer for CudaBuffer {
     }
 
     fn to_vec(&self) -> Vec<f32> {
-        match &self.storage {
+        match self.storage() {
             CudaStorage::F32(s) => s.stream().memcpy_dtov(s).unwrap(),
             CudaStorage::Bf16(s) => {
                 let u16_data: Vec<u16> = s.stream().memcpy_dtov(s).unwrap();
@@ -62,12 +87,12 @@ impl ComputeBuffer for CudaBuffer {
 impl CudaBuffer {
     /// Whether this buffer stores bf16 data.
     pub fn is_bf16(&self) -> bool {
-        matches!(&self.storage, CudaStorage::Bf16(_))
+        matches!(self.storage(), CudaStorage::Bf16(_))
     }
 
     /// Get the underlying f32 slice (immutable). Panics if bf16.
     fn f32_data(&self) -> &CudaSlice<f32> {
-        match &self.storage {
+        match self.storage() {
             CudaStorage::F32(s) => s,
             CudaStorage::Bf16(_) => panic!("expected f32 buffer, got bf16"),
         }
@@ -75,7 +100,7 @@ impl CudaBuffer {
 
     /// Get the underlying f32 slice (mutable). Panics if bf16.
     fn f32_data_mut(&mut self) -> &mut CudaSlice<f32> {
-        match &mut self.storage {
+        match self.storage_mut() {
             CudaStorage::F32(s) => s,
             CudaStorage::Bf16(_) => panic!("expected f32 buffer, got bf16"),
         }
@@ -83,7 +108,7 @@ impl CudaBuffer {
 
     /// Get the underlying u16 (bf16) slice (immutable). Panics if f32.
     fn bf16_data(&self) -> &CudaSlice<u16> {
-        match &self.storage {
+        match self.storage() {
             CudaStorage::Bf16(s) => s,
             CudaStorage::F32(_) => panic!("expected bf16 buffer, got f32"),
         }
@@ -91,10 +116,87 @@ impl CudaBuffer {
 
     /// Get the underlying u16 (bf16) slice (mutable). Panics if f32.
     fn bf16_data_mut(&mut self) -> &mut CudaSlice<u16> {
-        match &mut self.storage {
+        match self.storage_mut() {
             CudaStorage::Bf16(s) => s,
             CudaStorage::F32(_) => panic!("expected bf16 buffer, got f32"),
         }
+    }
+}
+
+/// Power-of-2 bucketed buffer pool to avoid cudaMalloc overhead.
+/// Buffers auto-return via CudaBuffer::Drop. Per-bucket cap prevents OOM.
+const POOL_MAX_PER_BUCKET: usize = 32;
+
+struct BufferPool {
+    f32_free: HashMap<usize, Vec<CudaSlice<f32>>>,
+    bf16_free: HashMap<usize, Vec<CudaSlice<u16>>>,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+}
+
+impl BufferPool {
+    fn new() -> Self {
+        Self {
+            f32_free: HashMap::new(),
+            bf16_free: HashMap::new(),
+            hits: 0,
+            misses: 0,
+            evictions: 0,
+        }
+    }
+
+    fn get_f32(&mut self, len: usize) -> Option<CudaSlice<f32>> {
+        if let Some(v) = self.f32_free.get_mut(&len) {
+            if let Some(s) = v.pop() {
+                self.hits += 1;
+                return Some(s);
+            }
+        }
+        self.misses += 1;
+        None
+    }
+
+    fn get_bf16(&mut self, len: usize) -> Option<CudaSlice<u16>> {
+        if let Some(v) = self.bf16_free.get_mut(&len) {
+            if let Some(s) = v.pop() {
+                self.hits += 1;
+                return Some(s);
+            }
+        }
+        self.misses += 1;
+        None
+    }
+
+    fn put_f32(&mut self, slice: CudaSlice<f32>, len: usize) {
+        let bucket = self.f32_free.entry(len).or_default();
+        if bucket.len() >= POOL_MAX_PER_BUCKET {
+            self.evictions += 1;
+            // drop slice — cudaFree
+        } else {
+            bucket.push(slice);
+        }
+    }
+
+    fn put_bf16(&mut self, slice: CudaSlice<u16>, len: usize) {
+        let bucket = self.bf16_free.entry(len).or_default();
+        if bucket.len() >= POOL_MAX_PER_BUCKET {
+            self.evictions += 1;
+            // drop slice — cudaFree
+        } else {
+            bucket.push(slice);
+        }
+    }
+
+    /// Drop all cached buffers, returning memory to CUDA.
+    fn clear(&mut self) {
+        self.f32_free.clear();
+        self.bf16_free.clear();
+    }
+
+    fn hit_rate(&self) -> f64 {
+        let total = self.hits + self.misses;
+        if total == 0 { 0.0 } else { self.hits as f64 / total as f64 }
     }
 }
 
@@ -105,13 +207,17 @@ pub struct CudaComputeDevice {
     cublas: CudaBlas,
     module_cache: RefCell<HashMap<u64, Arc<CudaModule>>>, // hash → module
     mixed_precision: bool,
+    pool: Arc<Mutex<BufferPool>>,
 }
 
 impl CudaComputeDevice {
     /// Create a new CUDA device (ordinal 0), f32 precision.
     pub fn new() -> Result<Self, cudarc::driver::DriverError> {
         let ctx = CudaContext::new(0)?;
-        let stream = ctx.default_stream();
+        // Single-stream: disable event tracking to avoid per-op cuEventRecord overhead
+        unsafe { ctx.disable_event_tracking(); }
+        // Use non-blocking stream to support CUDA graph capture
+        let stream = ctx.new_stream()?;
         let cublas = CudaBlas::new(stream.clone()).expect("Failed to create cuBLAS handle");
         // TF32 tensor cores: ~2× matmul throughput on Ampere+ but reduces mantissa
         // from 23 to 10 bits. Disable by default for training stability.
@@ -130,6 +236,7 @@ impl CudaComputeDevice {
             cublas,
             module_cache: RefCell::new(HashMap::new()),
             mixed_precision: false,
+            pool: Arc::new(Mutex::new(BufferPool::new())),
         })
     }
 
@@ -137,7 +244,10 @@ impl CudaComputeDevice {
     /// Weights and activations stored in bf16, compute in f32 internally.
     pub fn new_mixed_precision() -> Result<Self, cudarc::driver::DriverError> {
         let ctx = CudaContext::new(0)?;
-        let stream = ctx.default_stream();
+        // Single-stream: disable event tracking to avoid per-op cuEventRecord overhead
+        unsafe { ctx.disable_event_tracking(); }
+        // Use non-blocking stream to support CUDA graph capture
+        let stream = ctx.new_stream()?;
         let cublas = CudaBlas::new(stream.clone()).expect("Failed to create cuBLAS handle");
         // TF32 tensor cores: ~2× matmul throughput on Ampere+ but reduces mantissa
         // from 23 to 10 bits. Disable by default for training stability.
@@ -156,7 +266,120 @@ impl CudaComputeDevice {
             cublas,
             module_cache: RefCell::new(HashMap::new()),
             mixed_precision: true,
+            pool: Arc::new(Mutex::new(BufferPool::new())),
         })
+    }
+
+    /// Wrap storage + len into a pooled CudaBuffer (returned to pool on drop).
+    fn make_buf(&self, storage: CudaStorage, len: usize) -> CudaBuffer {
+        CudaBuffer {
+            storage: Some(storage),
+            len,
+            pool: Some(Arc::clone(&self.pool)),
+        }
+    }
+
+    /// Wrap storage + len into an unpooled CudaBuffer (freed on drop).
+    /// Use for uploads and temporaries with unique sizes.
+    fn make_buf_unpooled(storage: CudaStorage, len: usize) -> CudaBuffer {
+        CudaBuffer {
+            storage: Some(storage),
+            len,
+            pool: None,
+        }
+    }
+
+    /// Allocate an f32 buffer using the pool. Zeros the memory.
+    fn pool_alloc_f32(&self, len: usize) -> CudaBuffer {
+        if let Some(mut slice) = self.pool.lock().unwrap().get_f32(len) {
+            self.stream.memset_zeros(&mut slice).unwrap();
+            return self.make_buf(CudaStorage::F32(slice), len);
+        }
+        let slice = self.stream.alloc_zeros::<f32>(len).unwrap();
+        self.make_buf(CudaStorage::F32(slice), len)
+    }
+
+    /// Allocate an f32 buffer using the pool WITHOUT zeroing.
+    /// Caller must fully overwrite before reading (e.g., matmul output).
+    fn pool_alloc_uninit_f32(&self, len: usize) -> CudaBuffer {
+        if let Some(slice) = self.pool.lock().unwrap().get_f32(len) {
+            return self.make_buf(CudaStorage::F32(slice), len);
+        }
+        // cudarc unsafe alloc skips memset
+        let slice = unsafe { self.stream.alloc::<f32>(len).unwrap() };
+        self.make_buf(CudaStorage::F32(slice), len)
+    }
+
+    /// Allocate a bf16 buffer using the pool. Zeros the memory.
+    fn pool_alloc_bf16(&self, len: usize) -> CudaBuffer {
+        if let Some(mut slice) = self.pool.lock().unwrap().get_bf16(len) {
+            self.stream.memset_zeros(&mut slice).unwrap();
+            return self.make_buf(CudaStorage::Bf16(slice), len);
+        }
+        let slice = self.stream.alloc_zeros::<u16>(len).unwrap();
+        self.make_buf(CudaStorage::Bf16(slice), len)
+    }
+
+    /// Allocate a bf16 buffer using the pool WITHOUT zeroing.
+    fn pool_alloc_uninit_bf16(&self, len: usize) -> CudaBuffer {
+        if let Some(slice) = self.pool.lock().unwrap().get_bf16(len) {
+            return self.make_buf(CudaStorage::Bf16(slice), len);
+        }
+        let slice = unsafe { self.stream.alloc::<u16>(len).unwrap() };
+        self.make_buf(CudaStorage::Bf16(slice), len)
+    }
+
+    /// Return a buffer to the pool for reuse. The buffer must not be used after this.
+    /// Return a buffer to the pool for reuse.
+    /// With auto-reclaim, just dropping the buffer works too.
+    pub fn reclaim(&self, _buf: CudaBuffer) {
+        // Drop impl handles returning storage to pool
+    }
+
+    /// Get pool hit rate (for diagnostics). Returns (hits, misses, hit_rate, evictions).
+    pub fn pool_stats(&self) -> (u64, u64, f64, u64) {
+        let pool = self.pool.lock().unwrap();
+        (pool.hits, pool.misses, pool.hit_rate(), pool.evictions)
+    }
+
+    /// Drop all cached buffers in the pool, returning memory to CUDA.
+    /// Call between DiLoCo rounds to prevent fragmentation-induced OOM.
+    pub fn pool_clear(&self) {
+        self.pool.lock().unwrap().clear();
+    }
+
+    // ---- CUDA Graph capture ----
+
+    /// Begin capturing GPU operations into a CUDA graph.
+    /// All subsequent GPU ops on this device's stream are recorded, not executed.
+    /// Call `end_capture()` to finalize and get a replayable graph.
+    pub fn begin_capture(&self) {
+        self.stream.begin_capture(
+            cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+        ).expect("failed to begin CUDA graph capture");
+    }
+
+    /// End graph capture and return the executable graph.
+    /// Returns None if no operations were captured.
+    pub fn end_capture(&self) -> Option<CudaGraph> {
+        self.stream.end_capture(
+            cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+        ).expect("failed to end CUDA graph capture")
+    }
+
+    /// Upload f32 data into an existing buffer (async, graph-capturable).
+    /// Buffer must be f32 and have len >= data.len().
+    pub fn upload_into_f32(&self, buf: &mut CudaBuffer, data: &[f32]) {
+        assert!(buf.len >= data.len(), "buffer too small for upload_into");
+        let dst = buf.f32_data_mut();
+        self.stream.memcpy_htod(data, dst).unwrap();
+    }
+
+    /// Upload u32 data into an existing f32 buffer (async, graph-capturable).
+    /// Reinterprets u32 as f32 bits (for token IDs stored as f32 bit patterns).
+    pub fn upload_into_u32(&self, buf: &mut CudaBuffer, data: &[u32]) {
+        let f32_data: Vec<f32> = data.iter().map(|&x| f32::from_bits(x)).collect();
+        self.upload_into_f32(buf, &f32_data);
     }
 
     /// Compile and load a CUDA kernel, returning the module.
@@ -233,15 +456,14 @@ impl CudaComputeDevice {
     /// Allocate a zero-initialized f32 buffer regardless of mixed_precision mode.
     /// Used for gradient accumulation buffers that need f32 precision (atomicAdd targets).
     fn alloc_f32(&self, len: usize) -> CudaBuffer {
-        let slice = self.stream.alloc_zeros::<f32>(len).unwrap();
-        CudaBuffer { storage: CudaStorage::F32(slice), len }
+        self.pool_alloc_f32(len)
     }
 
     /// Upload data as f32 regardless of mixed_precision mode.
     /// Used for elementwise kernels and other f32-only operations.
     fn upload_f32(&self, data: &[f32]) -> CudaBuffer {
         let slice = self.stream.memcpy_stod(data).unwrap();
-        CudaBuffer { storage: CudaStorage::F32(slice), len: data.len() }
+        Self::make_buf_unpooled(CudaStorage::F32(slice), data.len())
     }
 
     /// Extract columns [col_start, col_start + col_count) from a [batch, total_cols] matrix.
@@ -271,10 +493,7 @@ impl CudaComputeDevice {
                 util_cuda::EXTRACT_COLUMNS_BF16_CUDA,
                 "extract_columns_bf16",
             );
-            let mut out = CudaBuffer {
-                storage: CudaStorage::Bf16(self.stream.alloc_zeros::<u16>(total).unwrap()),
-                len: total,
-            };
+            let mut out = self.pool_alloc_uninit_bf16(total);
             unsafe {
                 self.stream.launch_builder(&func)
                     .arg(buf.bf16_data())
@@ -292,7 +511,7 @@ impl CudaComputeDevice {
                 util_cuda::EXTRACT_COLUMNS_CUDA,
                 "extract_columns",
             );
-            let mut out = self.alloc_f32(total);
+            let mut out = self.pool_alloc_uninit_f32(total);
             unsafe {
                 self.stream.launch_builder(&func)
                     .arg(buf.f32_data())
@@ -305,6 +524,64 @@ impl CudaComputeDevice {
                     .unwrap();
             }
             out
+        }
+    }
+
+    /// Write `src[batch, col_count]` into columns [col_start, col_start + col_count) of `dst[batch, total_cols]`.
+    /// Inverse of `extract_columns`. Supports both f32 and bf16.
+    pub fn concat_columns(
+        &self,
+        dst: &mut CudaBuffer,
+        src: &CudaBuffer,
+        batch: usize,
+        total_cols: usize,
+        col_start: usize,
+        col_count: usize,
+    ) {
+        let total = batch * col_count;
+        let tg = 256;
+        let cfg = LaunchConfig {
+            block_dim: (tg as u32, 1, 1),
+            grid_dim: (((total + tg - 1) / tg) as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let batch_u32 = batch as u32;
+        let total_cols_u32 = total_cols as u32;
+        let col_start_u32 = col_start as u32;
+        let col_count_u32 = col_count as u32;
+
+        if src.is_bf16() {
+            let (_module, func) = self.get_func(
+                util_cuda::CONCAT_COLUMNS_BF16_CUDA,
+                "concat_columns_bf16",
+            );
+            unsafe {
+                self.stream.launch_builder(&func)
+                    .arg(src.bf16_data())
+                    .arg(dst.bf16_data_mut())
+                    .arg(&batch_u32)
+                    .arg(&total_cols_u32)
+                    .arg(&col_start_u32)
+                    .arg(&col_count_u32)
+                    .launch(cfg)
+                    .unwrap();
+            }
+        } else {
+            let (_module, func) = self.get_func(
+                util_cuda::CONCAT_COLUMNS_CUDA,
+                "concat_columns",
+            );
+            unsafe {
+                self.stream.launch_builder(&func)
+                    .arg(src.f32_data())
+                    .arg(dst.f32_data_mut())
+                    .arg(&batch_u32)
+                    .arg(&total_cols_u32)
+                    .arg(&col_start_u32)
+                    .arg(&col_count_u32)
+                    .launch(cfg)
+                    .unwrap();
+            }
         }
     }
 
@@ -335,14 +612,8 @@ impl CudaComputeDevice {
                 util_cuda::RMS_NORM_RESIDUAL_BF16_CUDA,
                 "rms_norm_residual_bf16",
             );
-            let mut output = CudaBuffer {
-                storage: CudaStorage::Bf16(self.stream.alloc_zeros::<u16>(n_groups * dim).unwrap()),
-                len: n_groups * dim,
-            };
-            let mut sum_out = CudaBuffer {
-                storage: CudaStorage::Bf16(self.stream.alloc_zeros::<u16>(n_groups * dim).unwrap()),
-                len: n_groups * dim,
-            };
+            let mut output = self.pool_alloc_uninit_bf16(n_groups * dim);
+            let mut sum_out = self.pool_alloc_uninit_bf16(n_groups * dim);
             unsafe {
                 self.stream.launch_builder(&func)
                     .arg(input.bf16_data())
@@ -371,8 +642,8 @@ impl CudaComputeDevice {
                 util_cuda::RMS_NORM_RESIDUAL_CUDA,
                 "rms_norm_residual",
             );
-            let mut output = self.alloc_f32(n_groups * dim);
-            let mut sum_out = self.alloc_f32(n_groups * dim);
+            let mut output = self.pool_alloc_uninit_f32(n_groups * dim);
+            let mut sum_out = self.pool_alloc_uninit_f32(n_groups * dim);
             unsafe {
                 self.stream.launch_builder(&func)
                     .arg(inp_ref.f32_data())
@@ -410,7 +681,7 @@ impl CudaComputeDevice {
             util_cuda::BF16_TO_F32_CUDA,
             "bf16_to_f32",
         );
-        let mut out = self.alloc_f32(n);
+        let mut out = self.pool_alloc_uninit_f32(n);
         let n_u32 = n as u32;
         unsafe {
             self.stream.launch_builder(&func)
@@ -439,10 +710,7 @@ impl CudaComputeDevice {
             util_cuda::F32_TO_BF16_CUDA,
             "f32_to_bf16",
         );
-        let mut out = CudaBuffer {
-            storage: CudaStorage::Bf16(self.stream.alloc_zeros::<u16>(n).unwrap()),
-            len: n,
-        };
+        let mut out = self.pool_alloc_uninit_bf16(n);
         let n_u32 = n as u32;
         unsafe {
             self.stream.launch_builder(&func)
@@ -457,16 +725,16 @@ impl CudaComputeDevice {
 
     /// Internal copy_buffer without going through the trait.
     fn copy_buffer_impl(&self, src: &CudaBuffer) -> CudaBuffer {
-        match &src.storage {
+        match src.storage() {
             CudaStorage::F32(s) => {
-                let mut dst = self.stream.alloc_zeros::<f32>(src.len).unwrap();
-                self.stream.memcpy_dtod(s, &mut dst).unwrap();
-                CudaBuffer { storage: CudaStorage::F32(dst), len: src.len }
+                let mut out = self.pool_alloc_uninit_f32(src.len);
+                self.stream.memcpy_dtod(s, out.f32_data_mut()).unwrap();
+                out
             }
             CudaStorage::Bf16(s) => {
-                let mut dst = self.stream.alloc_zeros::<u16>(src.len).unwrap();
-                self.stream.memcpy_dtod(s, &mut dst).unwrap();
-                CudaBuffer { storage: CudaStorage::Bf16(dst), len: src.len }
+                let mut out = self.pool_alloc_uninit_bf16(src.len);
+                self.stream.memcpy_dtod(s, out.bf16_data_mut()).unwrap();
+                out
             }
         }
     }
@@ -475,18 +743,18 @@ impl CudaComputeDevice {
     /// Returns a new buffer with `len` elements starting at `offset`.
     pub fn slice_buffer(&self, buf: &CudaBuffer, offset: usize, len: usize) -> CudaBuffer {
         assert!(offset + len <= buf.len, "slice out of bounds");
-        match &buf.storage {
+        match buf.storage() {
             CudaStorage::F32(s) => {
                 let view = s.try_slice(offset..offset + len).unwrap();
-                let mut dst = self.stream.alloc_zeros::<f32>(len).unwrap();
-                self.stream.memcpy_dtod(&view, &mut dst).unwrap();
-                CudaBuffer { storage: CudaStorage::F32(dst), len }
+                let mut out = self.pool_alloc_uninit_f32(len);
+                self.stream.memcpy_dtod(&view, out.f32_data_mut()).unwrap();
+                out
             }
             CudaStorage::Bf16(s) => {
                 let view = s.try_slice(offset..offset + len).unwrap();
-                let mut dst = self.stream.alloc_zeros::<u16>(len).unwrap();
-                self.stream.memcpy_dtod(&view, &mut dst).unwrap();
-                CudaBuffer { storage: CudaStorage::Bf16(dst), len }
+                let mut out = self.pool_alloc_uninit_bf16(len);
+                self.stream.memcpy_dtod(&view, out.bf16_data_mut()).unwrap();
+                out
             }
         }
     }
@@ -494,13 +762,14 @@ impl CudaComputeDevice {
     /// Write `src` into `dst` starting at `offset` (GPU-side copy).
     pub fn write_into(&self, dst: &mut CudaBuffer, offset: usize, src: &CudaBuffer) {
         assert!(offset + src.len <= dst.len, "write_into out of bounds");
-        match (&mut dst.storage, &src.storage) {
+        let src_len = src.len;
+        match (dst.storage_mut(), src.storage()) {
             (CudaStorage::F32(d), CudaStorage::F32(s)) => {
-                let mut view = d.try_slice_mut(offset..offset + src.len).unwrap();
+                let mut view = d.try_slice_mut(offset..offset + src_len).unwrap();
                 self.stream.memcpy_dtod(s, &mut view).unwrap();
             }
             (CudaStorage::Bf16(d), CudaStorage::Bf16(s)) => {
-                let mut view = d.try_slice_mut(offset..offset + src.len).unwrap();
+                let mut view = d.try_slice_mut(offset..offset + src_len).unwrap();
                 self.stream.memcpy_dtod(s, &mut view).unwrap();
             }
             _ => panic!("write_into: mismatched storage types"),
@@ -552,7 +821,7 @@ impl CudaComputeDevice {
             "sm_86",
         );
 
-        let mut output = self.alloc(batch_size * seq_len * total_dim);
+        let mut output = self.pool_alloc_uninit_bf16(batch_size * seq_len * total_dim);
 
         unsafe {
             self.stream.launch_builder(&func)
@@ -608,7 +877,7 @@ impl CudaComputeDevice {
             "flash_attn_bwd_precompute_d_bf16",
             "sm_86",
         );
-        let mut d_buf = self.alloc_f32(batch_size * seq_len * n_heads);
+        let mut d_buf = self.pool_alloc_uninit_f32(batch_size * seq_len * n_heads);
         unsafe {
             self.stream.launch_builder(&d_func)
                 .arg(grad_output.bf16_data())
@@ -688,6 +957,67 @@ impl CudaComputeDevice {
 
         (grad_q, grad_k, grad_v)
     }
+
+    /// Graph-capturable CE loss: writes loss to pre-allocated device buffer, no CPU download.
+    /// Returns grad buffer. Caller reads loss_buf after graph completes.
+    pub fn cross_entropy_fwd_bwd_graph(
+        &self,
+        logits: &CudaBuffer,
+        targets: &CudaBuffer,
+        loss_buf: &mut CudaBuffer,
+        n_positions: usize,
+        vocab_size: usize,
+        pad_id: u32,
+        non_pad_count: u32,
+    ) -> CudaBuffer {
+        let tg_size = std::cmp::min(vocab_size, 256).next_power_of_two();
+        let cfg = LaunchConfig {
+            block_dim: (tg_size as u32, 1, 1),
+            grid_dim: (n_positions as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_positions_u32 = n_positions as u32;
+        let vocab_size_u32 = vocab_size as u32;
+
+        // Zero loss accumulator (graph-safe: async memset)
+        self.stream.memset_zeros(loss_buf.f32_data_mut()).unwrap();
+
+        if logits.is_bf16() {
+            let (_module, func) = self.get_func(backward_cuda::CROSS_ENTROPY_BF16_CUDA, "cross_entropy_fwd_bwd_bf16");
+            let mut grad = self.alloc_f32(n_positions * vocab_size);
+            unsafe {
+                self.stream.launch_builder(&func)
+                    .arg(logits.bf16_data())
+                    .arg(targets.f32_data())
+                    .arg(grad.f32_data_mut())
+                    .arg(loss_buf.f32_data_mut())
+                    .arg(&n_positions_u32)
+                    .arg(&vocab_size_u32)
+                    .arg(&pad_id)
+                    .arg(&non_pad_count)
+                    .launch(cfg)
+                    .unwrap();
+            }
+            grad
+        } else {
+            let (_module, func) = self.get_func(backward_cuda::CROSS_ENTROPY_CUDA, "cross_entropy_fwd_bwd");
+            let mut grad = self.alloc_f32(n_positions * vocab_size);
+            unsafe {
+                self.stream.launch_builder(&func)
+                    .arg(logits.f32_data())
+                    .arg(targets.f32_data())
+                    .arg(grad.f32_data_mut())
+                    .arg(loss_buf.f32_data_mut())
+                    .arg(&n_positions_u32)
+                    .arg(&vocab_size_u32)
+                    .arg(&pad_id)
+                    .arg(&non_pad_count)
+                    .launch(cfg)
+                    .unwrap();
+            }
+            grad
+        }
+    }
 }
 
 impl ComputeDevice for CudaComputeDevice {
@@ -705,14 +1035,18 @@ impl ComputeDevice for CudaComputeDevice {
         cudarc::driver::result::mem_get_info().map(|(free, _)| free).unwrap_or(0)
     }
 
+    fn pool_clear(&self) {
+        CudaComputeDevice::pool_clear(self);
+    }
+
     fn upload(&self, data: &[f32]) -> CudaBuffer {
         if self.mixed_precision {
             let bf16_data: Vec<u16> = data.iter().map(|&v| f32_to_bf16(v)).collect();
             let slice = self.stream.memcpy_stod(&bf16_data).unwrap();
-            CudaBuffer { storage: CudaStorage::Bf16(slice), len: data.len() }
+            Self::make_buf_unpooled(CudaStorage::Bf16(slice), data.len())
         } else {
             let slice = self.stream.memcpy_stod(data).unwrap();
-            CudaBuffer { storage: CudaStorage::F32(slice), len: data.len() }
+            Self::make_buf_unpooled(CudaStorage::F32(slice), data.len())
         }
     }
 
@@ -724,11 +1058,9 @@ impl ComputeDevice for CudaComputeDevice {
 
     fn alloc(&self, len: usize) -> CudaBuffer {
         if self.mixed_precision {
-            let slice = self.stream.alloc_zeros::<u16>(len).unwrap();
-            CudaBuffer { storage: CudaStorage::Bf16(slice), len }
+            self.pool_alloc_bf16(len)
         } else {
-            let slice = self.stream.alloc_zeros::<f32>(len).unwrap();
-            CudaBuffer { storage: CudaStorage::F32(slice), len }
+            self.pool_alloc_f32(len)
         }
     }
 
@@ -737,11 +1069,31 @@ impl ComputeDevice for CudaComputeDevice {
     }
 
     fn alloc_f32(&self, len: usize) -> CudaBuffer {
-        CudaComputeDevice::alloc_f32(self, len)
+        self.pool_alloc_f32(len)
+    }
+
+    fn alloc_uninit(&self, len: usize) -> CudaBuffer {
+        if self.mixed_precision {
+            self.pool_alloc_uninit_bf16(len)
+        } else {
+            self.pool_alloc_uninit_f32(len)
+        }
+    }
+
+    fn alloc_uninit_f32(&self, len: usize) -> CudaBuffer {
+        self.pool_alloc_uninit_f32(len)
     }
 
     fn download(&self, buf: &CudaBuffer) -> Vec<f32> {
         buf.to_vec()
+    }
+
+    fn upload_into_f32(&self, buf: &mut CudaBuffer, data: &[f32]) {
+        CudaComputeDevice::upload_into_f32(self, buf, data)
+    }
+
+    fn upload_into_u32(&self, buf: &mut CudaBuffer, data: &[u32]) {
+        CudaComputeDevice::upload_into_u32(self, buf, data)
     }
 
     fn elementwise(
@@ -771,7 +1123,7 @@ impl ComputeDevice for CudaComputeDevice {
             inputs.iter().map(|inp| inp.f32_data()).collect()
         };
 
-        let mut output_buf = self.alloc_f32(numel);
+        let mut output_buf = self.pool_alloc_uninit_f32(numel);
         let count = numel as u32;
 
         let cfg = LaunchConfig {
@@ -809,17 +1161,17 @@ impl ComputeDevice for CudaComputeDevice {
         let cublas_n = m as i32;
         let cublas_k = k as i32;
 
-        // Handle mixed types: if one is bf16 and the other f32, convert bf16 to f32 on GPU
+        // Handle mixed types: convert f32 operand to bf16, use tensor core gemm_ex
         if a.is_bf16() != b.is_bf16() {
-            let a_conv = if a.is_bf16() { Some(self.convert_bf16_to_f32(a)) } else { None };
-            let b_conv = if b.is_bf16() { Some(self.convert_bf16_to_f32(b)) } else { None };
+            let a_conv = if !a.is_bf16() { Some(self.convert_f32_to_bf16(a)) } else { None };
+            let b_conv = if !b.is_bf16() { Some(self.convert_f32_to_bf16(b)) } else { None };
             let a_ref = a_conv.as_ref().unwrap_or(a);
             let b_ref = b_conv.as_ref().unwrap_or(b);
             return self.matmul(a_ref, b_ref, m, k, n);
         }
 
         if a.is_bf16() {
-            let mut output = self.alloc(m * n);
+            let mut output = self.pool_alloc_uninit_bf16(m * n);
 
             // Use gemm_ex for bf16 (stored as u16) with f32 compute
             let alpha: f32 = 1.0;
@@ -858,7 +1210,7 @@ impl ComputeDevice for CudaComputeDevice {
 
             output
         } else {
-            let mut output = self.alloc_f32(m * n);
+            let mut output = self.pool_alloc_uninit_f32(m * n);
 
             unsafe {
                 self.cublas.gemm(
@@ -897,7 +1249,7 @@ impl ComputeDevice for CudaComputeDevice {
 
         if data.is_bf16() {
             let (_module, func) = self.get_func(reduce_cuda::SOFTMAX_BF16_CUDA, "softmax_bf16");
-            let mut output = self.alloc(data.len);
+            let mut output = self.pool_alloc_uninit_bf16(data.len);
 
             unsafe {
                 self.stream.launch_builder(&func)
@@ -912,7 +1264,7 @@ impl ComputeDevice for CudaComputeDevice {
             output
         } else {
             let (_module, func) = self.get_func(reduce_cuda::SOFTMAX_CUDA, "softmax");
-            let mut output = self.alloc_f32(data.len);
+            let mut output = self.pool_alloc_uninit_f32(data.len);
 
             unsafe {
                 self.stream.launch_builder(&func)
@@ -947,7 +1299,7 @@ impl ComputeDevice for CudaComputeDevice {
 
         if data.is_bf16() {
             let (_module, func) = self.get_func(reduce_cuda::RMS_NORM_BF16_CUDA, "rms_norm_bf16");
-            let mut output = self.alloc(data.len);
+            let mut output = self.pool_alloc_uninit_bf16(data.len);
 
             unsafe {
                 self.stream.launch_builder(&func)
@@ -964,7 +1316,7 @@ impl ComputeDevice for CudaComputeDevice {
             output
         } else {
             let (_module, func) = self.get_func(reduce_cuda::RMS_NORM_CUDA, "rms_norm");
-            let mut output = self.alloc_f32(data.len);
+            let mut output = self.pool_alloc_uninit_f32(data.len);
 
             unsafe {
                 self.stream.launch_builder(&func)
@@ -1003,7 +1355,7 @@ impl ComputeDevice for CudaComputeDevice {
                 reduce_cuda::EMBEDDING_GATHER_BF16_CUDA,
                 "embedding_gather_bf16",
             );
-            let mut output = self.alloc(total);
+            let mut output = self.pool_alloc_uninit_bf16(total);
 
             // ids is always f32 storage (u32 bit patterns) — cast to unsigned int* on GPU side
             unsafe {
@@ -1023,7 +1375,7 @@ impl ComputeDevice for CudaComputeDevice {
                 reduce_cuda::EMBEDDING_GATHER_CUDA,
                 "embedding_gather",
             );
-            let mut output = self.alloc_f32(total);
+            let mut output = self.pool_alloc_uninit_f32(total);
 
             // ids is always f32 storage (u32 bit patterns) — cast to unsigned int* on GPU side
             unsafe {
@@ -1066,7 +1418,7 @@ impl ComputeDevice for CudaComputeDevice {
 
         if data.is_bf16() {
             let (_module, func) = self.get_func(reduce_cuda::REDUCE_SUM_BF16_CUDA, "reduce_sum_bf16");
-            let mut output = self.alloc(out_len);
+            let mut output = self.pool_alloc_uninit_bf16(out_len);
 
             unsafe {
                 self.stream.launch_builder(&func)
@@ -1082,7 +1434,7 @@ impl ComputeDevice for CudaComputeDevice {
             output
         } else {
             let (_module, func) = self.get_func(reduce_cuda::REDUCE_SUM_CUDA, "reduce_sum");
-            let mut output = self.alloc_f32(out_len);
+            let mut output = self.pool_alloc_uninit_f32(out_len);
 
             unsafe {
                 self.stream.launch_builder(&func)
@@ -1143,7 +1495,7 @@ impl ComputeDevice for CudaComputeDevice {
             attention_cuda::CAUSAL_ATTENTION_FLASH_CUDA,
             "causal_attention_flash",
         );
-        let mut output = self.alloc_f32(seq_len * total_dim);
+        let mut output = self.pool_alloc_uninit_f32(seq_len * total_dim);
 
         unsafe {
             self.stream.launch_builder(&func)
@@ -1199,7 +1551,7 @@ impl ComputeDevice for CudaComputeDevice {
                     attention_cuda::KV_ATTENTION_BF16_CUDA,
                     "kv_attention_bf16",
                 );
-                let mut output = self.alloc(total_dim);
+                let mut output = self.pool_alloc_uninit_bf16(total_dim);
 
                 unsafe {
                     self.stream.launch_builder(&func)
@@ -1221,7 +1573,7 @@ impl ComputeDevice for CudaComputeDevice {
                     attention_cuda::KV_ATTENTION_CUDA,
                     "kv_attention",
                 );
-                let mut output = self.alloc_f32(total_dim);
+                let mut output = self.pool_alloc_uninit_f32(total_dim);
 
                 unsafe {
                     self.stream.launch_builder(&func)
@@ -1256,7 +1608,7 @@ impl ComputeDevice for CudaComputeDevice {
                     attention_cuda::KV_ATTENTION_PREFILL_BF16_CUDA,
                     "kv_attention_prefill_bf16",
                 );
-                let mut output = self.alloc(q_len * total_dim);
+                let mut output = self.pool_alloc_uninit_bf16(q_len * total_dim);
 
                 unsafe {
                     self.stream.launch_builder(&func)
@@ -1279,7 +1631,7 @@ impl ComputeDevice for CudaComputeDevice {
                     attention_cuda::KV_ATTENTION_PREFILL_CUDA,
                     "kv_attention_prefill",
                 );
-                let mut output = self.alloc_f32(q_len * total_dim);
+                let mut output = self.pool_alloc_uninit_f32(q_len * total_dim);
 
                 unsafe {
                     self.stream.launch_builder(&func)
@@ -1312,7 +1664,7 @@ impl ComputeDevice for CudaComputeDevice {
 
         if buf.is_bf16() {
             let (_module, func) = self.get_func(backward_cuda::TRANSPOSE_2D_BF16_CUDA, "transpose_2d_bf16");
-            let mut output = self.alloc(rows * cols);
+            let mut output = self.pool_alloc_uninit_bf16(rows * cols);
 
             unsafe {
                 self.stream.launch_builder(&func)
@@ -1327,7 +1679,7 @@ impl ComputeDevice for CudaComputeDevice {
             output
         } else {
             let (_module, func) = self.get_func(backward_cuda::TRANSPOSE_2D_CUDA, "transpose_2d");
-            let mut output = self.alloc_f32(rows * cols);
+            let mut output = self.pool_alloc_uninit_f32(rows * cols);
 
             unsafe {
                 self.stream.launch_builder(&func)
@@ -1361,7 +1713,7 @@ impl ComputeDevice for CudaComputeDevice {
 
         if softmax_out.is_bf16() {
             let (_module, func) = self.get_func(backward_cuda::SOFTMAX_BACKWARD_BF16_CUDA, "softmax_backward_bf16");
-            let mut output = self.alloc(n_rows * row_len);
+            let mut output = self.pool_alloc_uninit_bf16(n_rows * row_len);
 
             unsafe {
                 self.stream.launch_builder(&func)
@@ -1377,7 +1729,7 @@ impl ComputeDevice for CudaComputeDevice {
             output
         } else {
             let (_module, func) = self.get_func(backward_cuda::SOFTMAX_BACKWARD_CUDA, "softmax_backward");
-            let mut output = self.alloc_f32(n_rows * row_len);
+            let mut output = self.pool_alloc_uninit_f32(n_rows * row_len);
 
             unsafe {
                 self.stream.launch_builder(&func)
@@ -1414,8 +1766,8 @@ impl ComputeDevice for CudaComputeDevice {
 
         if input.is_bf16() {
             let (_module, func) = self.get_func(backward_cuda::RMS_NORM_BACKWARD_BF16_CUDA, "rms_norm_backward_bf16");
-            let mut grad_input = self.alloc(n_groups * dim); // bf16
-            let mut grad_weight = self.alloc_f32(dim); // f32 for atomic accumulation
+            let mut grad_input = self.pool_alloc_uninit_bf16(n_groups * dim); // bf16, fully written by kernel
+            let mut grad_weight = self.alloc_f32(dim); // f32 for atomic accumulation — MUST be zero
 
             unsafe {
                 self.stream.launch_builder(&func)
@@ -1434,8 +1786,8 @@ impl ComputeDevice for CudaComputeDevice {
             (grad_input, grad_weight)
         } else {
             let (_module, func) = self.get_func(backward_cuda::RMS_NORM_BACKWARD_CUDA, "rms_norm_backward");
-            let mut grad_input = self.alloc_f32(n_groups * dim);
-            let mut grad_weight = self.alloc_f32(dim);
+            let mut grad_input = self.pool_alloc_uninit_f32(n_groups * dim); // fully written by kernel
+            let mut grad_weight = self.alloc_f32(dim); // atomicAdd target — MUST be zero
 
             unsafe {
                 self.stream.launch_builder(&func)
@@ -1603,7 +1955,7 @@ impl ComputeDevice for CudaComputeDevice {
                     backward_cuda::FLASH_ATTN_BWD_PRECOMPUTE_D_CUDA,
                     "flash_attn_bwd_precompute_d",
                 );
-                let mut d_buf = self.alloc_f32(seq_len * n_heads);
+                let mut d_buf = self.pool_alloc_uninit_f32(seq_len * n_heads);
                 unsafe {
                     self.stream.launch_builder(&d_func)
                         .arg(grad_output.f32_data())
@@ -1721,7 +2073,7 @@ impl ComputeDevice for CudaComputeDevice {
             backward_cuda::FLASH_ATTN_BWD_PRECOMPUTE_D_CUDA,
             "flash_attn_bwd_precompute_d",
         );
-        let mut d_buf = self.alloc_f32(seq_len * n_heads);
+        let mut d_buf = self.pool_alloc_uninit_f32(seq_len * n_heads);
         unsafe {
             self.stream.launch_builder(&d_func)
                 .arg(grad_output.f32_data())
@@ -1829,7 +2181,7 @@ impl ComputeDevice for CudaComputeDevice {
             attention_cuda::CAUSAL_ATTENTION_FLASH_CUDA,
             "causal_attention_flash",
         );
-        let mut output = self.alloc_f32(batch_size * seq_len * total_dim);
+        let mut output = self.pool_alloc_uninit_f32(batch_size * seq_len * total_dim);
 
         unsafe {
             self.stream.launch_builder(&func)
@@ -1911,7 +2263,7 @@ impl ComputeDevice for CudaComputeDevice {
             backward_cuda::FLASH_ATTN_BWD_PRECOMPUTE_D_CUDA,
             "flash_attn_bwd_precompute_d",
         );
-        let mut d_buf = self.alloc_f32(batch_size * seq_len * n_heads);
+        let mut d_buf = self.pool_alloc_uninit_f32(batch_size * seq_len * n_heads);
         unsafe {
             self.stream.launch_builder(&d_func)
                 .arg(go_ref.f32_data())
@@ -2042,6 +2394,69 @@ impl ComputeDevice for CudaComputeDevice {
         }
     }
 
+    fn cross_entropy_forward_backward_counted(
+        &self,
+        logits: &CudaBuffer,
+        targets: &CudaBuffer,
+        n_positions: usize,
+        vocab_size: usize,
+        pad_id: u32,
+        non_pad_count: u32,
+    ) -> (f32, CudaBuffer) {
+        let tg_size = std::cmp::min(vocab_size, 256).next_power_of_two();
+        let cfg = LaunchConfig {
+            block_dim: (tg_size as u32, 1, 1),
+            grid_dim: (n_positions as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_positions_u32 = n_positions as u32;
+        let vocab_size_u32 = vocab_size as u32;
+
+        let mut loss_buf = self.alloc_f32(1);
+
+        if logits.is_bf16() {
+            let (_module, func) = self.get_func(backward_cuda::CROSS_ENTROPY_BF16_CUDA, "cross_entropy_fwd_bwd_bf16");
+            let mut grad = self.alloc_f32(n_positions * vocab_size);
+
+            unsafe {
+                self.stream.launch_builder(&func)
+                    .arg(logits.bf16_data())
+                    .arg(targets.f32_data())
+                    .arg(grad.f32_data_mut())
+                    .arg(loss_buf.f32_data_mut())
+                    .arg(&n_positions_u32)
+                    .arg(&vocab_size_u32)
+                    .arg(&pad_id)
+                    .arg(&non_pad_count)
+                    .launch(cfg)
+                    .unwrap();
+            }
+
+            let loss_vec = self.download(&loss_buf);
+            (loss_vec[0], grad)
+        } else {
+            let (_module, func) = self.get_func(backward_cuda::CROSS_ENTROPY_CUDA, "cross_entropy_fwd_bwd");
+            let mut grad = self.alloc_f32(n_positions * vocab_size);
+
+            unsafe {
+                self.stream.launch_builder(&func)
+                    .arg(logits.f32_data())
+                    .arg(targets.f32_data())
+                    .arg(grad.f32_data_mut())
+                    .arg(loss_buf.f32_data_mut())
+                    .arg(&n_positions_u32)
+                    .arg(&vocab_size_u32)
+                    .arg(&pad_id)
+                    .arg(&non_pad_count)
+                    .launch(cfg)
+                    .unwrap();
+            }
+
+            let loss_vec = self.download(&loss_buf);
+            (loss_vec[0], grad)
+        }
+    }
+
     fn sync(&self) {
         self.stream.synchronize().unwrap();
     }
@@ -2059,10 +2474,10 @@ impl ComputeDevice for CudaComputeDevice {
         let cublas_n = m as i32;
         let cublas_k = k as i32;
 
-        // Mixed input types: convert bf16 to f32 on GPU (no unnecessary copy)
+        // Mixed input types: convert f32→bf16 for tensor cores
         if a.is_bf16() != b.is_bf16() {
-            let a_conv = if a.is_bf16() { Some(self.convert_bf16_to_f32(a)) } else { None };
-            let b_conv = if b.is_bf16() { Some(self.convert_bf16_to_f32(b)) } else { None };
+            let a_conv = if !a.is_bf16() { Some(self.convert_f32_to_bf16(a)) } else { None };
+            let b_conv = if !b.is_bf16() { Some(self.convert_f32_to_bf16(b)) } else { None };
             let a_ref = a_conv.as_ref().unwrap_or(a);
             let b_ref = b_conv.as_ref().unwrap_or(b);
             self.matmul_accumulate(a_ref, b_ref, c, m, k, n);
@@ -2152,17 +2567,17 @@ impl ComputeDevice for CudaComputeDevice {
         let cublas_n = m as i32;
         let cublas_k = k as i32;
 
-        // Mixed input types: convert
+        // Mixed input types: convert f32→bf16 for tensor cores
         if a.is_bf16() != b.is_bf16() {
-            let a_conv = if a.is_bf16() { Some(self.convert_bf16_to_f32(a)) } else { None };
-            let b_conv = if b.is_bf16() { Some(self.convert_bf16_to_f32(b)) } else { None };
+            let a_conv = if !a.is_bf16() { Some(self.convert_f32_to_bf16(a)) } else { None };
+            let b_conv = if !b.is_bf16() { Some(self.convert_f32_to_bf16(b)) } else { None };
             let a_ref = a_conv.as_ref().unwrap_or(a);
             let b_ref = b_conv.as_ref().unwrap_or(b);
             return self.matmul_a_transposed(a_ref, b_ref, m, k, n);
         }
 
         if a.is_bf16() {
-            let mut output = self.alloc(m * n);
+            let mut output = self.pool_alloc_uninit_bf16(m * n);
             let alpha: f32 = 1.0;
             let beta: f32 = 0.0;
             {
@@ -2187,7 +2602,7 @@ impl ComputeDevice for CudaComputeDevice {
             }
             output
         } else {
-            let mut output = self.alloc_f32(m * n);
+            let mut output = self.pool_alloc_uninit_f32(m * n);
             unsafe {
                 self.cublas.gemm(
                     GemmConfig {
@@ -2223,17 +2638,17 @@ impl ComputeDevice for CudaComputeDevice {
         let cublas_n = m as i32;
         let cublas_k = k as i32;
 
-        // Mixed input types: convert
+        // Mixed input types: convert f32→bf16 for tensor cores
         if a.is_bf16() != b.is_bf16() {
-            let a_conv = if a.is_bf16() { Some(self.convert_bf16_to_f32(a)) } else { None };
-            let b_conv = if b.is_bf16() { Some(self.convert_bf16_to_f32(b)) } else { None };
+            let a_conv = if !a.is_bf16() { Some(self.convert_f32_to_bf16(a)) } else { None };
+            let b_conv = if !b.is_bf16() { Some(self.convert_f32_to_bf16(b)) } else { None };
             let a_ref = a_conv.as_ref().unwrap_or(a);
             let b_ref = b_conv.as_ref().unwrap_or(b);
             return self.matmul_b_transposed(a_ref, b_ref, m, k, n);
         }
 
         if a.is_bf16() {
-            let mut output = self.alloc(m * n);
+            let mut output = self.pool_alloc_uninit_bf16(m * n);
             let alpha: f32 = 1.0;
             let beta: f32 = 0.0;
             {
@@ -2258,7 +2673,7 @@ impl ComputeDevice for CudaComputeDevice {
             }
             output
         } else {
-            let mut output = self.alloc_f32(m * n);
+            let mut output = self.pool_alloc_uninit_f32(m * n);
             unsafe {
                 self.cublas.gemm(
                     GemmConfig {
@@ -2295,10 +2710,10 @@ impl ComputeDevice for CudaComputeDevice {
         let cublas_n = m as i32;
         let cublas_k = k as i32;
 
-        // Mixed input types: convert
+        // Mixed input types: convert f32→bf16 for tensor cores
         if a.is_bf16() != b.is_bf16() {
-            let a_conv = if a.is_bf16() { Some(self.convert_bf16_to_f32(a)) } else { None };
-            let b_conv = if b.is_bf16() { Some(self.convert_bf16_to_f32(b)) } else { None };
+            let a_conv = if !a.is_bf16() { Some(self.convert_f32_to_bf16(a)) } else { None };
+            let b_conv = if !b.is_bf16() { Some(self.convert_f32_to_bf16(b)) } else { None };
             let a_ref = a_conv.as_ref().unwrap_or(a);
             let b_ref = b_conv.as_ref().unwrap_or(b);
             self.matmul_accumulate_a_transposed(a_ref, b_ref, c, m, k, n);
@@ -2397,7 +2812,7 @@ impl ComputeDevice for CudaComputeDevice {
 
         if input.is_bf16() && grad_output.is_bf16() {
             let (_module, func) = self.get_func(backward_cuda::RMS_NORM_BACKWARD_BF16_CUDA, "rms_norm_backward_bf16");
-            let mut grad_input = self.alloc(n_groups * dim);
+            let mut grad_input = self.pool_alloc_uninit_bf16(n_groups * dim);
             unsafe {
                 self.stream.launch_builder(&func)
                     .arg(input.bf16_data())
@@ -2420,7 +2835,7 @@ impl ComputeDevice for CudaComputeDevice {
             self.rms_norm_backward_accumulate(&input_f32, &weight_f32, &grad_f32, n_groups, dim, eps, grad_weight_acc)
         } else {
             let (_module, func) = self.get_func(backward_cuda::RMS_NORM_BACKWARD_CUDA, "rms_norm_backward");
-            let mut grad_input = self.alloc_f32(n_groups * dim);
+            let mut grad_input = self.pool_alloc_uninit_f32(n_groups * dim);
             unsafe {
                 self.stream.launch_builder(&func)
                     .arg(input.f32_data())
@@ -2436,6 +2851,56 @@ impl ComputeDevice for CudaComputeDevice {
             }
             grad_input
         }
+    }
+
+    fn rms_norm_backward_residual_accumulate(
+        &self,
+        input: &CudaBuffer,
+        weight: &CudaBuffer,
+        grad_output: &CudaBuffer,
+        residual_grad: &CudaBuffer,
+        n_groups: usize,
+        dim: usize,
+        eps: f32,
+        grad_weight_acc: &mut CudaBuffer,
+    ) -> CudaBuffer {
+        // For bf16 inputs, fall back to default (convert + unfused)
+        if input.is_bf16() || weight.is_bf16() || grad_output.is_bf16() || residual_grad.is_bf16() {
+            let gi = self.rms_norm_backward_accumulate(
+                input, weight, grad_output, n_groups, dim, eps, grad_weight_acc,
+            );
+            return self.add_tensors_buf(&gi, residual_grad, n_groups * dim);
+        }
+
+        let tg_size = std::cmp::min(dim, 256).next_power_of_two();
+        let cfg = LaunchConfig {
+            block_dim: (tg_size as u32, 1, 1),
+            grid_dim: (n_groups as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_groups_u32 = n_groups as u32;
+        let dim_u32 = dim as u32;
+
+        let (_module, func) = self.get_func(
+            backward_cuda::RMS_NORM_BACKWARD_RESIDUAL_CUDA,
+            "rms_norm_backward_residual",
+        );
+        let mut grad_input = self.pool_alloc_uninit_f32(n_groups * dim);
+        unsafe {
+            self.stream.launch_builder(&func)
+                .arg(input.f32_data())
+                .arg(weight.f32_data())
+                .arg(grad_output.f32_data())
+                .arg(residual_grad.f32_data())
+                .arg(grad_input.f32_data_mut())
+                .arg(grad_weight_acc.f32_data_mut())
+                .arg(&n_groups_u32)
+                .arg(&dim_u32)
+                .arg(&eps)
+                .launch(cfg)
+                .unwrap();
+        }
+        grad_input
     }
 
     fn reduce_sum_accumulate(
@@ -2468,17 +2933,12 @@ impl ComputeDevice for CudaComputeDevice {
         let axis_len_u32 = axis_len as u32;
         let inner_u32 = inner as u32;
 
-        // For accumulate, we reduce into f32 and atomicAdd into dst.
-        // The existing reduce_sum kernel writes `output[out_idx] = shared[0]`.
-        // We use a separate accumulate kernel that does `output[out_idx] += shared[0]`.
-        let (_module, func) = self.get_func(reduce_cuda::REDUCE_SUM_ACCUMULATE_CUDA, "reduce_sum_accumulate");
-
         if data.is_bf16() {
-            // Convert bf16 input to f32, then reduce into f32 dst
-            let data_f32 = self.convert_bf16_to_f32(data);
+            // Fused bf16→f32 reduce+accumulate (no separate conversion)
+            let (_module, func) = self.get_func(reduce_cuda::REDUCE_SUM_ACCUMULATE_BF16_CUDA, "reduce_sum_accumulate_bf16");
             unsafe {
                 self.stream.launch_builder(&func)
-                    .arg(data_f32.f32_data())
+                    .arg(data.bf16_data())
                     .arg(dst.f32_data_mut())
                     .arg(&outer_u32)
                     .arg(&axis_len_u32)
@@ -2487,6 +2947,7 @@ impl ComputeDevice for CudaComputeDevice {
                     .unwrap();
             }
         } else {
+            let (_module, func) = self.get_func(reduce_cuda::REDUCE_SUM_ACCUMULATE_CUDA, "reduce_sum_accumulate");
             unsafe {
                 self.stream.launch_builder(&func)
                     .arg(data.f32_data())
@@ -2501,18 +2962,7 @@ impl ComputeDevice for CudaComputeDevice {
     }
 
     fn copy_buffer(&self, src: &CudaBuffer) -> CudaBuffer {
-        match &src.storage {
-            CudaStorage::F32(s) => {
-                let mut dst = self.stream.alloc_zeros::<f32>(src.len).unwrap();
-                self.stream.memcpy_dtod(s, &mut dst).unwrap();
-                CudaBuffer { storage: CudaStorage::F32(dst), len: src.len }
-            }
-            CudaStorage::Bf16(s) => {
-                let mut dst = self.stream.alloc_zeros::<u16>(src.len).unwrap();
-                self.stream.memcpy_dtod(s, &mut dst).unwrap();
-                CudaBuffer { storage: CudaStorage::Bf16(dst), len: src.len }
-            }
-        }
+        self.copy_buffer_impl(src)
     }
 
     fn extract_columns(
@@ -2524,6 +2974,18 @@ impl ComputeDevice for CudaComputeDevice {
         col_count: usize,
     ) -> CudaBuffer {
         CudaComputeDevice::extract_columns(self, buf, batch, total_cols, col_start, col_count)
+    }
+
+    fn concat_columns(
+        &self,
+        dst: &mut CudaBuffer,
+        src: &CudaBuffer,
+        batch: usize,
+        total_cols: usize,
+        col_start: usize,
+        col_count: usize,
+    ) {
+        CudaComputeDevice::concat_columns(self, dst, src, batch, total_cols, col_start, col_count)
     }
 
     fn rms_norm_residual(
@@ -2558,10 +3020,7 @@ impl ComputeDevice for CudaComputeDevice {
         if matrix.is_bf16() && bias.is_bf16() {
             // Native bf16 bias_add: single kernel, no conversions
             let (_module, func) = self.get_func(util_cuda::BIAS_ADD_BF16_CUDA, "bias_add_bf16");
-            let mut output = CudaBuffer {
-                storage: CudaStorage::Bf16(self.stream.alloc_zeros::<u16>(numel).unwrap()),
-                len: numel,
-            };
+            let mut output = self.pool_alloc_uninit_bf16(numel);
             unsafe {
                 self.stream.launch_builder(&func)
                     .arg(matrix.bf16_data())
@@ -2581,7 +3040,7 @@ impl ComputeDevice for CudaComputeDevice {
             let mat_ref = mat_conv.as_ref().unwrap_or(matrix);
             let bias_ref = bias_conv.as_ref().unwrap_or(bias);
 
-            let mut output = self.alloc_f32(numel);
+            let mut output = self.pool_alloc_uninit_f32(numel);
             let (_module, func) = self.get_func(util_cuda::BIAS_ADD_CUDA, "bias_add");
             unsafe {
                 self.stream.launch_builder(&func)
@@ -2630,7 +3089,7 @@ impl ComputeDevice for CudaComputeDevice {
 
         if input.is_bf16() {
             let (_module, func) = self.get_func(util_cuda::ROPE_FORWARD_BF16_CUDA, "rope_forward_bf16");
-            let mut output = self.alloc(input.len);
+            let mut output = self.pool_alloc_uninit_bf16(input.len);
             unsafe {
                 self.stream.launch_builder(&func)
                     .arg(input.bf16_data())
@@ -2648,7 +3107,7 @@ impl ComputeDevice for CudaComputeDevice {
             output
         } else {
             let (_module, func) = self.get_func(util_cuda::ROPE_FORWARD_CUDA, "rope_forward");
-            let mut output = self.alloc_f32(input.len);
+            let mut output = self.pool_alloc_uninit_f32(input.len);
             unsafe {
                 self.stream.launch_builder(&func)
                     .arg(input.f32_data())
@@ -2662,6 +3121,68 @@ impl ComputeDevice for CudaComputeDevice {
                     .arg(&start_pos_u)
                     .launch(cfg)
                     .expect("rope_forward launch failed");
+            }
+            output
+        }
+    }
+
+    fn rope_forward_cached(
+        &self,
+        input: &CudaBuffer,
+        cos_buf: &CudaBuffer,
+        sin_buf: &CudaBuffer,
+        seq_len: usize,
+        n_heads: usize,
+        head_dim: usize,
+        start_pos: usize,
+    ) -> CudaBuffer {
+        let half_dim = head_dim / 2;
+        let total = (seq_len * n_heads * half_dim) as u32;
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (total.div_ceil(256), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let seq_len_u = seq_len as u32;
+        let n_heads_u = n_heads as u32;
+        let head_dim_u = head_dim as u32;
+        let half_dim_u = half_dim as u32;
+        let start_pos_u = start_pos as u32;
+
+        if input.is_bf16() {
+            let (_module, func) = self.get_func(util_cuda::ROPE_FORWARD_BF16_CUDA, "rope_forward_bf16");
+            let mut output = self.pool_alloc_uninit_bf16(input.len);
+            unsafe {
+                self.stream.launch_builder(&func)
+                    .arg(input.bf16_data())
+                    .arg(cos_buf.f32_data())
+                    .arg(sin_buf.f32_data())
+                    .arg(output.bf16_data_mut())
+                    .arg(&seq_len_u)
+                    .arg(&n_heads_u)
+                    .arg(&head_dim_u)
+                    .arg(&half_dim_u)
+                    .arg(&start_pos_u)
+                    .launch(cfg)
+                    .expect("rope_forward_bf16 cached launch failed");
+            }
+            output
+        } else {
+            let (_module, func) = self.get_func(util_cuda::ROPE_FORWARD_CUDA, "rope_forward");
+            let mut output = self.pool_alloc_uninit_f32(input.len);
+            unsafe {
+                self.stream.launch_builder(&func)
+                    .arg(input.f32_data())
+                    .arg(cos_buf.f32_data())
+                    .arg(sin_buf.f32_data())
+                    .arg(output.f32_data_mut())
+                    .arg(&seq_len_u)
+                    .arg(&n_heads_u)
+                    .arg(&head_dim_u)
+                    .arg(&half_dim_u)
+                    .arg(&start_pos_u)
+                    .launch(cfg)
+                    .expect("rope_forward cached launch failed");
             }
             output
         }
@@ -2695,7 +3216,7 @@ impl ComputeDevice for CudaComputeDevice {
 
         if grad_output.is_bf16() {
             let (_module, func) = self.get_func(util_cuda::ROPE_BACKWARD_BF16_CUDA, "rope_backward_bf16");
-            let mut output = self.alloc(grad_output.len);
+            let mut output = self.pool_alloc_uninit_bf16(grad_output.len);
             unsafe {
                 self.stream.launch_builder(&func)
                     .arg(grad_output.bf16_data())
@@ -2713,7 +3234,7 @@ impl ComputeDevice for CudaComputeDevice {
             output
         } else {
             let (_module, func) = self.get_func(util_cuda::ROPE_BACKWARD_CUDA, "rope_backward");
-            let mut output = self.alloc_f32(grad_output.len);
+            let mut output = self.pool_alloc_uninit_f32(grad_output.len);
             unsafe {
                 self.stream.launch_builder(&func)
                     .arg(grad_output.f32_data())
@@ -2765,7 +3286,7 @@ impl ComputeDevice for CudaComputeDevice {
                 util_cuda::ROPE_BACKWARD_BATCHED_BF16_CUDA,
                 "rope_backward_batched_bf16",
             );
-            let mut output = self.alloc(grad_output.len);
+            let mut output = self.pool_alloc_uninit_bf16(grad_output.len);
             unsafe {
                 self.stream.launch_builder(&func)
                     .arg(grad_output.bf16_data())
@@ -2787,7 +3308,7 @@ impl ComputeDevice for CudaComputeDevice {
                 util_cuda::ROPE_BACKWARD_BATCHED_CUDA,
                 "rope_backward_batched",
             );
-            let mut output = self.alloc_f32(grad_output.len);
+            let mut output = self.pool_alloc_uninit_f32(grad_output.len);
             unsafe {
                 self.stream.launch_builder(&func)
                     .arg(grad_output.f32_data())
@@ -2837,7 +3358,7 @@ impl ComputeDevice for CudaComputeDevice {
                 util_cuda::ROPE_BACKWARD_BATCHED_BF16_CUDA,
                 "rope_backward_batched_bf16",
             );
-            let mut output = self.alloc(grad_output.len);
+            let mut output = self.pool_alloc_uninit_bf16(grad_output.len);
             unsafe {
                 self.stream.launch_builder(&func)
                     .arg(grad_output.bf16_data())
@@ -2859,7 +3380,7 @@ impl ComputeDevice for CudaComputeDevice {
                 util_cuda::ROPE_BACKWARD_BATCHED_CUDA,
                 "rope_backward_batched",
             );
-            let mut output = self.alloc_f32(grad_output.len);
+            let mut output = self.pool_alloc_uninit_f32(grad_output.len);
             unsafe {
                 self.stream.launch_builder(&func)
                     .arg(grad_output.f32_data())
@@ -2891,10 +3412,7 @@ impl ComputeDevice for CudaComputeDevice {
                 util_cuda::ADD_TENSORS_BF16_CUDA,
                 "add_tensors_bf16",
             );
-            let mut out = CudaBuffer {
-                storage: CudaStorage::Bf16(self.stream.alloc_zeros::<u16>(numel).unwrap()),
-                len: numel,
-            };
+            let mut out = self.pool_alloc_uninit_bf16(numel);
             unsafe {
                 self.stream.launch_builder(&func)
                     .arg(a.bf16_data())
@@ -2923,10 +3441,7 @@ impl ComputeDevice for CudaComputeDevice {
                 util_cuda::SWIGLU_FUSED_BF16_CUDA,
                 "swiglu_fused_bf16",
             );
-            let mut out = CudaBuffer {
-                storage: CudaStorage::Bf16(self.stream.alloc_zeros::<u16>(numel).unwrap()),
-                len: numel,
-            };
+            let mut out = self.pool_alloc_uninit_bf16(numel);
             unsafe {
                 self.stream.launch_builder(&func)
                     .arg(gate.bf16_data())
@@ -2968,14 +3483,8 @@ impl ComputeDevice for CudaComputeDevice {
                 util_cuda::SWIGLU_BACKWARD_BF16_CUDA,
                 "swiglu_backward_bf16",
             );
-            let mut grad_gate = CudaBuffer {
-                storage: CudaStorage::Bf16(self.stream.alloc_zeros::<u16>(numel).unwrap()),
-                len: numel,
-            };
-            let mut grad_up = CudaBuffer {
-                storage: CudaStorage::Bf16(self.stream.alloc_zeros::<u16>(numel).unwrap()),
-                len: numel,
-            };
+            let mut grad_gate = self.pool_alloc_uninit_bf16(numel);
+            let mut grad_up = self.pool_alloc_uninit_bf16(numel);
             unsafe {
                 self.stream.launch_builder(&func)
                     .arg(grad.bf16_data())
@@ -3028,7 +3537,7 @@ impl ComputeDevice for CudaComputeDevice {
         let rows_u32 = rows as u32;
         let cols_u32 = cols as u32;
 
-        match &mut buf.storage {
+        match buf.storage_mut() {
             CudaStorage::F32(s) => {
                 let (_module, func) = self.get_func(
                     crate::kernels::noise_cuda::NORM_RELATIVE_NOISE_F32_CUDA,
@@ -3072,7 +3581,7 @@ impl ComputeDevice for CudaComputeDevice {
             grid_dim: ((n + 255) / 256, 1, 1),
             shared_mem_bytes: 0,
         };
-        match (&mut dst.storage, &src.storage) {
+        match (dst.storage_mut(), src.storage()) {
             (CudaStorage::F32(d), CudaStorage::F32(s)) => {
                 let (_module, func) = self.get_func(
                     crate::kernels::adamw_cuda::ADD_ASSIGN_CUDA,
@@ -3136,7 +3645,7 @@ impl ComputeDevice for CudaComputeDevice {
 
     fn zero_buffer(&self, buf: &mut CudaBuffer) {
         // Use memset instead of a kernel launch — float 0.0 is all-zero bits.
-        match &mut buf.storage {
+        match buf.storage_mut() {
             CudaStorage::F32(s) => {
                 self.stream.memset_zeros(s).unwrap();
             }
@@ -3292,7 +3801,7 @@ impl ComputeDevice for CudaComputeDevice {
                 .unwrap();
         }
         drop(_records);
-        CudaBuffer { storage: CudaStorage::F32(acc), len: 1 }
+        self.make_buf(CudaStorage::F32(acc), 1)
     }
 
     fn scale_buffer(&self, buf: &mut CudaBuffer, scale: f32) {
@@ -3328,22 +3837,57 @@ impl ComputeDevice for CudaComputeDevice {
             return 0.0;
         }
 
-        // Fused sum-of-squares: single kernel launch
+        // Step 1: Fused sum-of-squares (single kernel, no sync)
         let buf_refs: Vec<&CudaBuffer> = bufs.iter().map(|b| &**b).collect();
-        let acc = self.fused_sum_sq(&buf_refs);
+        let norm_sq_buf = self.fused_sum_sq(&buf_refs);
 
-        self.stream.synchronize().unwrap();
-        let norm_sq = self.stream.memcpy_dtov(acc.f32_data()).unwrap()[0];
-        let norm = (norm_sq as f64).sqrt() as f32;
+        // Step 2: Fused clip+scale on GPU (reads norm_sq, conditionally scales all buffers)
+        // Precompute offsets from lengths before taking mutable device pointers
+        let n_bufs = bufs.len() as u32;
+        let mut offsets: Vec<u32> = Vec::with_capacity(bufs.len() + 1);
+        offsets.push(0);
+        for buf in bufs.iter() {
+            offsets.push(offsets.last().unwrap() + buf.len as u32);
+        }
+        let total_n = *offsets.last().unwrap();
 
-        if norm > max_norm {
-            let scale = max_norm / norm;
-            for buf in bufs.iter_mut() {
-                self.scale_buffer(*buf, scale);
-            }
+        // Now take mutable device pointers
+        let mut ptrs: Vec<u64> = Vec::with_capacity(bufs.len());
+        let mut _records = Vec::new();
+        for buf in bufs.iter_mut() {
+            let (ptr, record) = buf.f32_data_mut().device_ptr_mut(&self.stream);
+            ptrs.push(ptr);
+            _records.push(record);
         }
 
-        norm
+        let ptrs_gpu = self.stream.memcpy_stod(&ptrs).unwrap();
+        let offsets_gpu = self.stream.memcpy_stod(&offsets).unwrap();
+
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (((total_n + 255) / 256), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (_module, func) = self.get_func(
+            backward_cuda::FUSED_CLIP_SCALE_CUDA,
+            "fused_clip_scale",
+        );
+        unsafe {
+            self.stream.launch_builder(&func)
+                .arg(norm_sq_buf.f32_data())
+                .arg(&ptrs_gpu)
+                .arg(&offsets_gpu)
+                .arg(&n_bufs)
+                .arg(&total_n)
+                .arg(&max_norm)
+                .launch(cfg)
+                .unwrap();
+        }
+        drop(_records);
+
+        // Download norm for logging (memcpy_dtov syncs stream internally)
+        let norm_sq_val = self.stream.memcpy_dtov(norm_sq_buf.f32_data()).unwrap()[0];
+        (norm_sq_val as f64).sqrt() as f32
     }
 }
 
