@@ -9,7 +9,7 @@ use metal::objc::rc::autoreleasepool;
 use metal::*;
 
 use crate::device::{ComputeBuffer, ComputeDevice};
-use crate::kernels::{attention_msl, backward_msl, matmul_msl, reduce_msl};
+use crate::kernels::{adamw_msl, attention_msl, backward_msl, matmul_msl, reduce_msl};
 use tang_expr::codegen::Dialect;
 use tang_expr::node::ExprId;
 use tang_expr::trace;
@@ -37,8 +37,8 @@ pub struct MetalDevice {
     device: metal::Device,
     queue: CommandQueue,
     pipeline_cache: RefCell<HashMap<u64, ComputePipelineState>>,
-    /// Last committed command buffer — waited on in `sync()`.
-    last_cb: RefCell<Option<CommandBuffer>>,
+    /// Active command buffer — accumulates work, committed on `sync()`.
+    active_cb: RefCell<Option<CommandBuffer>>,
 }
 
 impl MetalDevice {
@@ -50,7 +50,7 @@ impl MetalDevice {
             device,
             queue,
             pipeline_cache: RefCell::new(HashMap::new()),
-            last_cb: RefCell::new(None),
+            active_cb: RefCell::new(None),
         })
     }
 
@@ -110,6 +110,29 @@ impl MetalDevice {
         )
     }
 
+    /// Get or create the active command buffer for batching dispatches.
+    fn ensure_cb(&self) {
+        let mut cb_ref = self.active_cb.borrow_mut();
+        if cb_ref.is_none() {
+            let cb = autoreleasepool(|| {
+                self.queue.new_command_buffer().to_owned()
+            });
+            *cb_ref = Some(cb);
+        }
+    }
+
+    /// Get a borrow of the active command buffer (must call ensure_cb first).
+    fn with_encoder(&self, f: impl FnOnce(&ComputeCommandEncoderRef)) {
+        self.ensure_cb();
+        autoreleasepool(|| {
+            let cb_ref = self.active_cb.borrow();
+            let cmd = cb_ref.as_ref().unwrap();
+            let enc = cmd.new_compute_command_encoder();
+            f(enc);
+            enc.end_encoding();
+        });
+    }
+
     /// Dispatch a compute pipeline with given buffers.
     fn dispatch(
         &self,
@@ -117,29 +140,21 @@ impl MetalDevice {
         buffers: &[&metal::Buffer],
         threads: u64,
     ) {
-        autoreleasepool(|| {
-            let cmd = self.queue.new_command_buffer();
-            let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(pipeline);
+        let tg_size = std::cmp::min(
+            pipeline.max_total_threads_per_threadgroup(),
+            256,
+        );
+        let tg_count = (threads + tg_size - 1) / tg_size;
 
+        self.with_encoder(|enc| {
+            enc.set_compute_pipeline_state(pipeline);
             for (i, buf) in buffers.iter().enumerate() {
                 enc.set_buffer(i as u64, Some(buf), 0);
             }
-
-            let tg_size = std::cmp::min(
-                pipeline.max_total_threads_per_threadgroup(),
-                256,
-            );
-            let tg_count = (threads + tg_size - 1) / tg_size;
-
             enc.dispatch_thread_groups(
                 MTLSize::new(tg_count, 1, 1),
                 MTLSize::new(tg_size, 1, 1),
             );
-
-            enc.end_encoding();
-            cmd.commit();
-            *self.last_cb.borrow_mut() = Some(cmd.to_owned());
         });
     }
 
@@ -151,26 +166,18 @@ impl MetalDevice {
         grid: (u64, u64),
         tg_size: (u64, u64),
     ) {
-        autoreleasepool(|| {
-            let cmd = self.queue.new_command_buffer();
-            let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(pipeline);
+        let tg_count_x = (grid.0 + tg_size.0 - 1) / tg_size.0;
+        let tg_count_y = (grid.1 + tg_size.1 - 1) / tg_size.1;
 
+        self.with_encoder(|enc| {
+            enc.set_compute_pipeline_state(pipeline);
             for (i, buf) in buffers.iter().enumerate() {
                 enc.set_buffer(i as u64, Some(buf), 0);
             }
-
-            let tg_count_x = (grid.0 + tg_size.0 - 1) / tg_size.0;
-            let tg_count_y = (grid.1 + tg_size.1 - 1) / tg_size.1;
-
             enc.dispatch_thread_groups(
                 MTLSize::new(tg_count_x, tg_count_y, 1),
                 MTLSize::new(tg_size.0, tg_size.1, 1),
             );
-
-            enc.end_encoding();
-            cmd.commit();
-            *self.last_cb.borrow_mut() = Some(cmd.to_owned());
         });
     }
 }
@@ -180,6 +187,44 @@ impl ComputeDevice for MetalDevice {
 
     fn dialect(&self) -> Dialect {
         Dialect::Msl
+    }
+
+    fn peak_flops_f32(&self) -> Option<f64> {
+        let name = self.device.name().to_lowercase();
+        // Apple Silicon GPU peak FP32 TFLOPS (from Apple specs)
+        let tflops = if name.contains("m4 max") {
+            // M4 Max: 40-core ~18.4 TFLOPS, 36-core ~14.7 TFLOPS
+            if name.contains("40") { 18.4 } else { 14.7 }
+        } else if name.contains("m4 pro") {
+            8.7
+        } else if name.contains("m4") {
+            4.6
+        } else if name.contains("m3 max") {
+            14.2
+        } else if name.contains("m3 pro") {
+            7.0
+        } else if name.contains("m3") {
+            3.6
+        } else if name.contains("m2 max") {
+            13.6
+        } else if name.contains("m2 ultra") {
+            27.2
+        } else if name.contains("m2 pro") {
+            6.8
+        } else if name.contains("m2") {
+            3.6
+        } else if name.contains("m1 max") {
+            10.4
+        } else if name.contains("m1 ultra") {
+            21.0
+        } else if name.contains("m1 pro") {
+            5.2
+        } else if name.contains("m1") {
+            2.6
+        } else {
+            return None;
+        };
+        Some(tflops * 1e12)
     }
 
     fn upload(&self, data: &[f32]) -> MetalBuffer {
@@ -252,18 +297,35 @@ impl ComputeDevice for MetalDevice {
     }
 
     fn matmul(&self, a: &MetalBuffer, b: &MetalBuffer, m: usize, k: usize, n: usize) -> MetalBuffer {
-        // Use naive kernel for now — simdgroup_matrix version requires
-        // specific alignment and dispatch patterns
-        let pipeline = self.get_pipeline(matmul_msl::MATMUL_NAIVE_MSL, "matmul_naive");
         let output_buf = self.make_buffer_empty(m * n * 4);
         let params = self.make_buffer_u32(&[m as u32, k as u32, n as u32]);
 
-        self.dispatch_2d(
-            &pipeline,
-            &[&a.buffer, &b.buffer, &output_buf, &params],
-            (n as u64, m as u64),
-            (16, 16),
-        );
+        if m % 32 == 0 && n % 32 == 0 && k % 8 == 0 && m >= 32 && n >= 32 {
+            // Simdgroup matmul for aligned dimensions (8x8 tile loads require alignment)
+            let pipeline = self.get_pipeline(matmul_msl::MATMUL_MSL, "matmul");
+            let tg_x = (n / 32) as u64;
+            let tg_y = (m / 32) as u64;
+            self.with_encoder(|enc| {
+                enc.set_compute_pipeline_state(&pipeline);
+                enc.set_buffer(0, Some(&a.buffer), 0);
+                enc.set_buffer(1, Some(&b.buffer), 0);
+                enc.set_buffer(2, Some(&output_buf), 0);
+                enc.set_buffer(3, Some(&params), 0);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(tg_x, tg_y, 1),
+                    MTLSize::new(128, 1, 1), // 4 simdgroups × 32 threads
+                );
+            });
+        } else {
+            // Naive fallback for unaligned dimensions
+            let pipeline = self.get_pipeline(matmul_msl::MATMUL_NAIVE_MSL, "matmul_naive");
+            self.dispatch_2d(
+                &pipeline,
+                &[&a.buffer, &b.buffer, &output_buf, &params],
+                (n as u64, m as u64),
+                (16, 16),
+            );
+        }
 
         MetalBuffer {
             buffer: output_buf,
@@ -271,27 +333,147 @@ impl ComputeDevice for MetalDevice {
         }
     }
 
+    fn matmul_b_transposed(
+        &self,
+        a: &MetalBuffer,   // [m, k]
+        b: &MetalBuffer,   // [n, k] row-major (logically transposed)
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> MetalBuffer {
+        if m % 32 == 0 && n % 32 == 0 && k % 8 == 0 && m >= 32 && n >= 32 {
+            let pipeline = self.get_pipeline(matmul_msl::MATMUL_BT_MSL, "matmul_bt");
+            let output_buf = self.make_buffer_empty(m * n * 4);
+            let params = self.make_buffer_u32(&[m as u32, k as u32, n as u32]);
+            let tg_x = (n / 32) as u64;
+            let tg_y = (m / 32) as u64;
+            self.with_encoder(|enc| {
+                enc.set_compute_pipeline_state(&pipeline);
+                enc.set_buffer(0, Some(&a.buffer), 0);
+                enc.set_buffer(1, Some(&b.buffer), 0);
+                enc.set_buffer(2, Some(&output_buf), 0);
+                enc.set_buffer(3, Some(&params), 0);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(tg_x, tg_y, 1),
+                    MTLSize::new(128, 1, 1),
+                );
+            });
+            MetalBuffer { buffer: output_buf, len: m * n }
+        } else {
+            let b_t = self.transpose_2d(b, n, k);
+            self.matmul(a, &b_t, m, k, n)
+        }
+    }
+
+    fn matmul_a_transposed(
+        &self,
+        a: &MetalBuffer,   // [k, m] row-major
+        b: &MetalBuffer,   // [k, n] row-major
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> MetalBuffer {
+        if m % 32 == 0 && n % 32 == 0 && k % 8 == 0 && m >= 32 && n >= 32 {
+            let pipeline = self.get_pipeline(matmul_msl::MATMUL_AT_MSL, "matmul_at");
+            let output_buf = self.make_buffer_empty(m * n * 4);
+            let params = self.make_buffer_u32(&[m as u32, k as u32, n as u32]);
+            let tg_x = (n / 32) as u64;
+            let tg_y = (m / 32) as u64;
+            self.with_encoder(|enc| {
+                enc.set_compute_pipeline_state(&pipeline);
+                enc.set_buffer(0, Some(&a.buffer), 0);
+                enc.set_buffer(1, Some(&b.buffer), 0);
+                enc.set_buffer(2, Some(&output_buf), 0);
+                enc.set_buffer(3, Some(&params), 0);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(tg_x, tg_y, 1),
+                    MTLSize::new(128, 1, 1),
+                );
+            });
+            MetalBuffer { buffer: output_buf, len: m * n }
+        } else {
+            let a_t = self.transpose_2d(a, k, m);
+            self.matmul(&a_t, b, m, k, n)
+        }
+    }
+
+    fn matmul_accumulate(
+        &self,
+        a: &MetalBuffer,
+        b: &MetalBuffer,
+        c: &mut MetalBuffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        if m % 32 == 0 && n % 32 == 0 && k % 8 == 0 && m >= 32 && n >= 32 {
+            let pipeline = self.get_pipeline(matmul_msl::MATMUL_ACC_MSL, "matmul_acc");
+            let params = self.make_buffer_u32(&[m as u32, k as u32, n as u32]);
+            let tg_x = (n / 32) as u64;
+            let tg_y = (m / 32) as u64;
+            self.with_encoder(|enc| {
+                enc.set_compute_pipeline_state(&pipeline);
+                enc.set_buffer(0, Some(&a.buffer), 0);
+                enc.set_buffer(1, Some(&b.buffer), 0);
+                enc.set_buffer(2, Some(&c.buffer), 0);
+                enc.set_buffer(3, Some(&params), 0);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(tg_x, tg_y, 1),
+                    MTLSize::new(128, 1, 1),
+                );
+            });
+        } else {
+            let tmp = self.matmul(a, b, m, k, n);
+            self.add_assign(c, &tmp);
+        }
+    }
+
+    fn matmul_accumulate_a_transposed(
+        &self,
+        a: &MetalBuffer,   // [k, m] row-major
+        b: &MetalBuffer,   // [k, n] row-major
+        c: &mut MetalBuffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        if m % 32 == 0 && n % 32 == 0 && k % 8 == 0 && m >= 32 && n >= 32 {
+            let pipeline = self.get_pipeline(matmul_msl::MATMUL_ACC_AT_MSL, "matmul_acc_at");
+            let params = self.make_buffer_u32(&[m as u32, k as u32, n as u32]);
+            let tg_x = (n / 32) as u64;
+            let tg_y = (m / 32) as u64;
+            self.with_encoder(|enc| {
+                enc.set_compute_pipeline_state(&pipeline);
+                enc.set_buffer(0, Some(&a.buffer), 0);
+                enc.set_buffer(1, Some(&b.buffer), 0);
+                enc.set_buffer(2, Some(&c.buffer), 0);
+                enc.set_buffer(3, Some(&params), 0);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(tg_x, tg_y, 1),
+                    MTLSize::new(128, 1, 1),
+                );
+            });
+        } else {
+            let a_t = self.transpose_2d(a, k, m);
+            self.matmul_accumulate(&a_t, b, c, m, k, n);
+        }
+    }
+
     fn softmax(&self, data: &MetalBuffer, n_rows: usize, row_len: usize) -> MetalBuffer {
         let pipeline = self.get_pipeline(reduce_msl::SOFTMAX_MSL, "softmax");
         let output_buf = self.make_buffer_empty(data.len * 4);
         let params = self.make_buffer_u32(&[n_rows as u32, row_len as u32]);
+        let tg_size = std::cmp::min(row_len as u64, 256).next_power_of_two();
 
-        autoreleasepool(|| {
-            let cmd = self.queue.new_command_buffer();
-            let enc = cmd.new_compute_command_encoder();
+        self.with_encoder(|enc| {
             enc.set_compute_pipeline_state(&pipeline);
             enc.set_buffer(0, Some(&data.buffer), 0);
             enc.set_buffer(1, Some(&output_buf), 0);
             enc.set_buffer(2, Some(&params), 0);
-
-            let tg_size = std::cmp::min(row_len as u64, 256).next_power_of_two();
             enc.dispatch_thread_groups(
                 MTLSize::new(n_rows as u64, 1, 1),
                 MTLSize::new(tg_size, 1, 1),
             );
-            enc.end_encoding();
-            cmd.commit();
-            *self.last_cb.borrow_mut() = Some(cmd.to_owned());
         });
 
         MetalBuffer {
@@ -311,24 +493,18 @@ impl ComputeDevice for MetalDevice {
         let pipeline = self.get_pipeline(reduce_msl::RMS_NORM_MSL, "rms_norm");
         let output_buf = self.make_buffer_empty(data.len * 4);
         let params = self.make_buffer_u32(&[n_groups as u32, dim as u32, eps.to_bits()]);
+        let tg_size = std::cmp::min(dim as u64, 256).next_power_of_two();
 
-        autoreleasepool(|| {
-            let cmd = self.queue.new_command_buffer();
-            let enc = cmd.new_compute_command_encoder();
+        self.with_encoder(|enc| {
             enc.set_compute_pipeline_state(&pipeline);
             enc.set_buffer(0, Some(&data.buffer), 0);
             enc.set_buffer(1, Some(&weight.buffer), 0);
             enc.set_buffer(2, Some(&output_buf), 0);
             enc.set_buffer(3, Some(&params), 0);
-
-            let tg_size = std::cmp::min(dim as u64, 256).next_power_of_two();
             enc.dispatch_thread_groups(
                 MTLSize::new(n_groups as u64, 1, 1),
                 MTLSize::new(tg_size, 1, 1),
             );
-            enc.end_encoding();
-            cmd.commit();
-            *self.last_cb.borrow_mut() = Some(cmd.to_owned());
         });
 
         MetalBuffer {
@@ -410,27 +586,19 @@ kernel void embedding(
         let total_dim = n_heads * head_dim;
         let output_buf = self.make_buffer_empty(seq_len * total_dim * 4);
         let params = self.make_buffer_u32(&[seq_len as u32, n_heads as u32, n_kv_heads as u32, head_dim as u32]);
-
-        // Flash attention: threads parallelize over head_dim
         let tg_size = std::cmp::min(head_dim as u64, 256).next_power_of_two();
 
-        autoreleasepool(|| {
-            let cmd = self.queue.new_command_buffer();
-            let enc = cmd.new_compute_command_encoder();
+        self.with_encoder(|enc| {
             enc.set_compute_pipeline_state(&pipeline);
             enc.set_buffer(0, Some(&q.buffer), 0);
             enc.set_buffer(1, Some(&k.buffer), 0);
             enc.set_buffer(2, Some(&v.buffer), 0);
             enc.set_buffer(3, Some(&output_buf), 0);
             enc.set_buffer(4, Some(&params), 0);
-
             enc.dispatch_thread_groups(
                 MTLSize::new(seq_len as u64, n_heads as u64, 1),
                 MTLSize::new(tg_size, 1, 1),
             );
-            enc.end_encoding();
-            cmd.commit();
-            *self.last_cb.borrow_mut() = Some(cmd.to_owned());
         });
 
         MetalBuffer {
@@ -451,11 +619,9 @@ kernel void embedding(
         head_dim: usize,
     ) -> MetalBuffer {
         let total_dim = n_heads * head_dim;
-        // Flash attention: threads parallelize over head_dim
         let tg_size = std::cmp::min(head_dim as u64, 256).next_power_of_two();
 
         if q_len == 1 {
-            // Single-query decode
             let pipeline = self.get_pipeline(
                 attention_msl::KV_ATTENTION_MSL,
                 "kv_attention",
@@ -463,73 +629,48 @@ kernel void embedding(
             let total_len = cache_start + 1;
             let output_buf = self.make_buffer_empty(total_dim * 4);
             let params = self.make_buffer_u32(&[
-                total_len as u32,
-                n_heads as u32,
-                n_kv_heads as u32,
-                head_dim as u32,
+                total_len as u32, n_heads as u32, n_kv_heads as u32, head_dim as u32,
             ]);
 
-            autoreleasepool(|| {
-                let cmd = self.queue.new_command_buffer();
-                let enc = cmd.new_compute_command_encoder();
+            self.with_encoder(|enc| {
                 enc.set_compute_pipeline_state(&pipeline);
                 enc.set_buffer(0, Some(&q.buffer), 0);
                 enc.set_buffer(1, Some(&k_cache.buffer), 0);
                 enc.set_buffer(2, Some(&v_cache.buffer), 0);
                 enc.set_buffer(3, Some(&output_buf), 0);
                 enc.set_buffer(4, Some(&params), 0);
-
                 enc.dispatch_thread_groups(
                     MTLSize::new(n_heads as u64, 1, 1),
                     MTLSize::new(tg_size, 1, 1),
                 );
-                enc.end_encoding();
-                cmd.commit();
-                *self.last_cb.borrow_mut() = Some(cmd.to_owned());
             });
 
-            MetalBuffer {
-                buffer: output_buf,
-                len: total_dim,
-            }
+            MetalBuffer { buffer: output_buf, len: total_dim }
         } else {
-            // Batched prefill
             let pipeline = self.get_pipeline(
                 attention_msl::KV_ATTENTION_PREFILL_MSL,
                 "kv_attention_prefill",
             );
             let output_buf = self.make_buffer_empty(q_len * total_dim * 4);
             let params = self.make_buffer_u32(&[
-                cache_start as u32,
-                q_len as u32,
-                n_heads as u32,
-                n_kv_heads as u32,
-                head_dim as u32,
+                cache_start as u32, q_len as u32, n_heads as u32,
+                n_kv_heads as u32, head_dim as u32,
             ]);
 
-            autoreleasepool(|| {
-                let cmd = self.queue.new_command_buffer();
-                let enc = cmd.new_compute_command_encoder();
+            self.with_encoder(|enc| {
                 enc.set_compute_pipeline_state(&pipeline);
                 enc.set_buffer(0, Some(&q.buffer), 0);
                 enc.set_buffer(1, Some(&k_cache.buffer), 0);
                 enc.set_buffer(2, Some(&v_cache.buffer), 0);
                 enc.set_buffer(3, Some(&output_buf), 0);
                 enc.set_buffer(4, Some(&params), 0);
-
                 enc.dispatch_thread_groups(
                     MTLSize::new(q_len as u64, n_heads as u64, 1),
                     MTLSize::new(tg_size, 1, 1),
                 );
-                enc.end_encoding();
-                cmd.commit();
-                *self.last_cb.borrow_mut() = Some(cmd.to_owned());
             });
 
-            MetalBuffer {
-                buffer: output_buf,
-                len: q_len * total_dim,
-            }
+            MetalBuffer { buffer: output_buf, len: q_len * total_dim }
         }
     }
 
@@ -558,11 +699,9 @@ kernel void embedding(
         let pipeline = self.get_pipeline(backward_msl::SOFTMAX_BACKWARD_MSL, "softmax_backward");
         let output_buf = self.make_buffer_empty(n_rows * row_len * 4);
         let params = self.make_buffer_u32(&[n_rows as u32, row_len as u32]);
-
         let tg_size = std::cmp::min(row_len as u64, 256).next_power_of_two();
-        autoreleasepool(|| {
-            let cmd = self.queue.new_command_buffer();
-            let enc = cmd.new_compute_command_encoder();
+
+        self.with_encoder(|enc| {
             enc.set_compute_pipeline_state(&pipeline);
             enc.set_buffer(0, Some(&softmax_out.buffer), 0);
             enc.set_buffer(1, Some(&grad_output.buffer), 0);
@@ -572,9 +711,6 @@ kernel void embedding(
                 MTLSize::new(n_rows as u64, 1, 1),
                 MTLSize::new(tg_size, 1, 1),
             );
-            enc.end_encoding();
-            cmd.commit();
-            *self.last_cb.borrow_mut() = Some(cmd.to_owned());
         });
 
         MetalBuffer { buffer: output_buf, len: n_rows * row_len }
@@ -591,14 +727,11 @@ kernel void embedding(
     ) -> (MetalBuffer, MetalBuffer) {
         let pipeline = self.get_pipeline(backward_msl::RMS_NORM_BACKWARD_MSL, "rms_norm_backward");
         let grad_input_raw = self.make_buffer_empty(n_groups * dim * 4);
-        // Zero-init grad_weight for atomic accumulation
         let grad_weight_raw = self.make_buffer(&vec![0.0f32; dim]);
         let params = self.make_buffer_u32(&[n_groups as u32, dim as u32, eps.to_bits()]);
-
         let tg_size = std::cmp::min(dim as u64, 256).next_power_of_two();
-        autoreleasepool(|| {
-            let cmd = self.queue.new_command_buffer();
-            let enc = cmd.new_compute_command_encoder();
+
+        self.with_encoder(|enc| {
             enc.set_compute_pipeline_state(&pipeline);
             enc.set_buffer(0, Some(&input.buffer), 0);
             enc.set_buffer(1, Some(&weight.buffer), 0);
@@ -610,9 +743,6 @@ kernel void embedding(
                 MTLSize::new(n_groups as u64, 1, 1),
                 MTLSize::new(tg_size, 1, 1),
             );
-            enc.end_encoding();
-            cmd.commit();
-            *self.last_cb.borrow_mut() = Some(cmd.to_owned());
         });
 
         (
@@ -663,18 +793,14 @@ kernel void embedding(
         let kv_dim = n_kv_heads * head_dim;
 
         let grad_q_raw = self.make_buffer_empty(seq_len * total_dim * 4);
-        // Zero-init for atomic accumulation
         let grad_k_raw = self.make_buffer(&vec![0.0f32; seq_len * kv_dim]);
         let grad_v_raw = self.make_buffer(&vec![0.0f32; seq_len * kv_dim]);
         let params = self.make_buffer_u32(&[
             seq_len as u32, n_heads as u32, n_kv_heads as u32, head_dim as u32,
         ]);
-
         let tg_size = std::cmp::min(head_dim as u64, 256).next_power_of_two();
 
-        autoreleasepool(|| {
-            let cmd = self.queue.new_command_buffer();
-            let enc = cmd.new_compute_command_encoder();
+        self.with_encoder(|enc| {
             enc.set_compute_pipeline_state(&pipeline);
             enc.set_buffer(0, Some(&grad_output.buffer), 0);
             enc.set_buffer(1, Some(&q.buffer), 0);
@@ -684,14 +810,10 @@ kernel void embedding(
             enc.set_buffer(5, Some(&grad_k_raw), 0);
             enc.set_buffer(6, Some(&grad_v_raw), 0);
             enc.set_buffer(7, Some(&params), 0);
-
             enc.dispatch_thread_groups(
                 MTLSize::new(seq_len as u64, n_heads as u64, 1),
                 MTLSize::new(tg_size, 1, 1),
             );
-            enc.end_encoding();
-            cmd.commit();
-            *self.last_cb.borrow_mut() = Some(cmd.to_owned());
         });
 
         (
@@ -710,6 +832,7 @@ kernel void embedding(
         pad_id: u32,
     ) -> (f32, MetalBuffer) {
         // Pre-count non-padded positions on CPU (targets are small)
+        self.sync();
         let target_data = targets.to_vec();
         let count = target_data.iter().filter(|t| t.to_bits() != pad_id).count() as u32;
 
@@ -717,11 +840,9 @@ kernel void embedding(
         let grad_buf = self.make_buffer_empty(n_positions * vocab_size * 4);
         let loss_raw = self.make_buffer(&[0.0f32]);
         let params = self.make_buffer_u32(&[n_positions as u32, vocab_size as u32, pad_id, count]);
-
         let tg_size = std::cmp::min(vocab_size as u64, 256).next_power_of_two();
-        autoreleasepool(|| {
-            let cmd = self.queue.new_command_buffer();
-            let enc = cmd.new_compute_command_encoder();
+
+        self.with_encoder(|enc| {
             enc.set_compute_pipeline_state(&pipeline);
             enc.set_buffer(0, Some(&logits.buffer), 0);
             enc.set_buffer(1, Some(&targets.buffer), 0);
@@ -732,9 +853,6 @@ kernel void embedding(
                 MTLSize::new(n_positions as u64, 1, 1),
                 MTLSize::new(tg_size, 1, 1),
             );
-            enc.end_encoding();
-            cmd.commit();
-            *self.last_cb.borrow_mut() = Some(cmd.to_owned());
         });
 
         self.sync();
@@ -744,20 +862,21 @@ kernel void embedding(
     }
 
     fn sync(&self) {
-        if let Some(cb) = self.last_cb.borrow_mut().take() {
+        if let Some(cb) = self.active_cb.borrow_mut().take() {
+            cb.commit();
             cb.wait_until_completed();
         }
     }
 
     fn copy_buffer(&self, src: &MetalBuffer) -> MetalBuffer {
         let dst = self.make_buffer_empty(src.len * 4);
+        self.ensure_cb();
         autoreleasepool(|| {
-            let cmd = self.queue.new_command_buffer();
+            let cb_ref = self.active_cb.borrow();
+            let cmd = cb_ref.as_ref().unwrap();
             let blit = cmd.new_blit_command_encoder();
             blit.copy_from_buffer(&src.buffer, 0, &dst, 0, (src.len * 4) as u64);
             blit.end_encoding();
-            cmd.commit();
-            *self.last_cb.borrow_mut() = Some(cmd.to_owned());
         });
         MetalBuffer { buffer: dst, len: src.len }
     }
@@ -794,16 +913,79 @@ kernel void bias_add(
     }
 
     fn add_assign(&self, dst: &mut MetalBuffer, src: &MetalBuffer) {
-        let mut data = self.download(dst);
-        let src_data = self.download(src);
-        for (d, s) in data.iter_mut().zip(src_data.iter()) {
-            *d += *s;
-        }
-        *dst = self.upload(&data);
+        let pipeline = self.get_pipeline(adamw_msl::ADD_ASSIGN_MSL, "add_assign");
+        let params = self.make_buffer_u32(&[dst.len as u32]);
+        self.dispatch(
+            &pipeline,
+            &[&dst.buffer, &src.buffer, &params],
+            dst.len as u64,
+        );
     }
 
     fn zero_buffer(&self, buf: &mut MetalBuffer) {
-        *buf = self.upload(&vec![0.0f32; buf.len()]);
+        self.ensure_cb();
+        autoreleasepool(|| {
+            let cb_ref = self.active_cb.borrow();
+            let cmd = cb_ref.as_ref().unwrap();
+            let blit = cmd.new_blit_command_encoder();
+            blit.fill_buffer(&buf.buffer, metal::NSRange::new(0, (buf.len * 4) as u64), 0);
+            blit.end_encoding();
+        });
+    }
+
+    fn reduce_sum_sq_accumulate(&self, src: &MetalBuffer, acc: &mut MetalBuffer) {
+        let pipeline = self.get_pipeline(adamw_msl::REDUCE_SUM_SQ_MSL, "reduce_sum_sq");
+        let params = self.make_buffer_u32(&[src.len as u32]);
+        // Each thread handles 4 elements
+        let threads = ((src.len + 3) / 4) as u64;
+        self.dispatch(
+            &pipeline,
+            &[&src.buffer, &acc.buffer, &params],
+            threads,
+        );
+    }
+
+    fn scale_buffer(&self, buf: &mut MetalBuffer, scale: f32) {
+        let pipeline = self.get_pipeline(adamw_msl::SCALE_BUFFER_MSL, "scale_buffer");
+        let scale_buf = self.make_buffer(&[scale]);
+        let params = self.make_buffer_u32(&[buf.len as u32]);
+        self.dispatch(
+            &pipeline,
+            &[&buf.buffer, &scale_buf, &params],
+            buf.len as u64,
+        );
+    }
+
+    fn slice_buffer(&self, buf: &MetalBuffer, offset: usize, len: usize) -> MetalBuffer {
+        let dst = self.make_buffer_empty(len * 4);
+        self.ensure_cb();
+        autoreleasepool(|| {
+            let cb_ref = self.active_cb.borrow();
+            let cmd = cb_ref.as_ref().unwrap();
+            let blit = cmd.new_blit_command_encoder();
+            blit.copy_from_buffer(
+                &buf.buffer, (offset * 4) as u64,
+                &dst, 0,
+                (len * 4) as u64,
+            );
+            blit.end_encoding();
+        });
+        MetalBuffer { buffer: dst, len }
+    }
+
+    fn write_into(&self, dst: &mut MetalBuffer, offset: usize, src: &MetalBuffer) {
+        self.ensure_cb();
+        autoreleasepool(|| {
+            let cb_ref = self.active_cb.borrow();
+            let cmd = cb_ref.as_ref().unwrap();
+            let blit = cmd.new_blit_command_encoder();
+            blit.copy_from_buffer(
+                &src.buffer, 0,
+                &dst.buffer, (offset * 4) as u64,
+                (src.len * 4) as u64,
+            );
+            blit.end_encoding();
+        });
     }
 
     fn adamw_step(
@@ -819,25 +1001,16 @@ kernel void bias_add(
         weight_decay: f32,
         step_t: usize,
     ) {
-        // CPU fallback
-        let n = param.len();
-        let mut p = self.download(param);
-        let g = self.download(grad);
-        let mut m_data = self.download(m);
-        let mut v_data = self.download(v);
+        let pipeline = self.get_pipeline(adamw_msl::ADAMW_STEP_MSL, "adamw_step");
         let beta1_pow = beta1.powi(step_t as i32);
         let beta2_pow = beta2.powi(step_t as i32);
-        for i in 0..n {
-            p[i] -= lr * weight_decay * p[i];
-            m_data[i] = beta1 * m_data[i] + (1.0 - beta1) * g[i];
-            v_data[i] = beta2 * v_data[i] + (1.0 - beta2) * g[i] * g[i];
-            let m_hat = m_data[i] / (1.0 - beta1_pow);
-            let v_hat = v_data[i] / (1.0 - beta2_pow);
-            p[i] -= lr * m_hat / (v_hat.sqrt() + eps);
-        }
-        *param = self.upload(&p);
-        *m = self.upload(&m_data);
-        *v = self.upload(&v_data);
+        let hparams = self.make_buffer(&[lr, beta1, beta2, eps, weight_decay, beta1_pow, beta2_pow]);
+        let count = self.make_buffer_u32(&[param.len as u32]);
+        self.dispatch(
+            &pipeline,
+            &[&param.buffer, &grad.buffer, &m.buffer, &v.buffer, &hparams, &count],
+            param.len as u64,
+        );
     }
 }
 
@@ -1264,5 +1437,241 @@ mod tests {
                 c_out[i]
             );
         }
+    }
+
+    #[test]
+    fn metal_simdgroup_matmul_aligned() {
+        // Test the simdgroup matmul path (32-aligned dimensions)
+        let metal = get_metal_device();
+        let cpu = CpuDevice::new();
+
+        let m = 64;
+        let k = 32;
+        let n = 64;
+        let a_data: Vec<f32> = (0..m * k).map(|i| ((i * 7 + 3) % 13) as f32 / 13.0 - 0.5).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| ((i * 11 + 5) % 17) as f32 / 17.0 - 0.5).collect();
+
+        let m_a = metal.upload(&a_data);
+        let m_b = metal.upload(&b_data);
+        let m_c = metal.matmul(&m_a, &m_b, m, k, n);
+        let metal_out = metal.download(&m_c);
+
+        let c_a = cpu.upload(&a_data);
+        let c_b = cpu.upload(&b_data);
+        let c_c = cpu.matmul(&c_a, &c_b, m, k, n);
+        let cpu_out = cpu.download(&c_c);
+
+        for i in 0..m * n {
+            assert!(
+                (metal_out[i] - cpu_out[i]).abs() < 1e-2,
+                "simdgroup matmul mismatch at {i}: metal={} cpu={}",
+                metal_out[i], cpu_out[i]
+            );
+        }
+    }
+
+    #[test]
+    fn metal_simdgroup_matmul_training_dims() {
+        // Test training-sized dimensions (768x768, 768x3072)
+        let metal = get_metal_device();
+        let cpu = CpuDevice::new();
+
+        for (m, k, n) in [(32, 768, 768), (32, 768, 3072), (32, 3072, 768)] {
+            let a_data: Vec<f32> = (0..m * k).map(|i| ((i * 7 + 3) % 37) as f32 / 37.0 - 0.5).collect();
+            let b_data: Vec<f32> = (0..k * n).map(|i| ((i * 11 + 5) % 41) as f32 / 41.0 - 0.5).collect();
+
+            let m_a = metal.upload(&a_data);
+            let m_b = metal.upload(&b_data);
+            let m_c = metal.matmul(&m_a, &m_b, m, k, n);
+            let metal_out = metal.download(&m_c);
+
+            let c_a = cpu.upload(&a_data);
+            let c_b = cpu.upload(&b_data);
+            let c_c = cpu.matmul(&c_a, &c_b, m, k, n);
+            let cpu_out = cpu.download(&c_c);
+
+            let max_err = metal_out.iter().zip(cpu_out.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_err < 0.1,
+                "matmul {m}x{k}x{n}: max error {max_err}"
+            );
+        }
+    }
+
+    #[test]
+    fn metal_matmul_b_transposed_vs_cpu() {
+        let metal = get_metal_device();
+        let cpu = CpuDevice::new();
+
+        let m = 64;
+        let k = 64;
+        let n = 32;
+        let a_data: Vec<f32> = (0..m * k).map(|i| ((i * 7 + 3) % 13) as f32 / 13.0 - 0.5).collect();
+        let b_data: Vec<f32> = (0..n * k).map(|i| ((i * 11 + 5) % 17) as f32 / 17.0 - 0.5).collect();
+
+        let m_a = metal.upload(&a_data);
+        let m_b = metal.upload(&b_data);
+        let m_c = metal.matmul_b_transposed(&m_a, &m_b, m, k, n);
+        let metal_out = metal.download(&m_c);
+
+        let c_a = cpu.upload(&a_data);
+        let c_b = cpu.upload(&b_data);
+        let c_c = cpu.matmul_b_transposed(&c_a, &c_b, m, k, n);
+        let cpu_out = cpu.download(&c_c);
+
+        for i in 0..m * n {
+            assert!(
+                (metal_out[i] - cpu_out[i]).abs() < 1e-2,
+                "matmul_bt mismatch at {i}: metal={} cpu={}",
+                metal_out[i], cpu_out[i]
+            );
+        }
+    }
+
+    #[test]
+    fn metal_matmul_a_transposed_vs_cpu() {
+        let metal = get_metal_device();
+        let cpu = CpuDevice::new();
+
+        let m = 32;
+        let k = 64;
+        let n = 64;
+        let a_data: Vec<f32> = (0..k * m).map(|i| ((i * 7 + 3) % 13) as f32 / 13.0 - 0.5).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| ((i * 11 + 5) % 17) as f32 / 17.0 - 0.5).collect();
+
+        let m_a = metal.upload(&a_data);
+        let m_b = metal.upload(&b_data);
+        let m_c = metal.matmul_a_transposed(&m_a, &m_b, m, k, n);
+        let metal_out = metal.download(&m_c);
+
+        let c_a = cpu.upload(&a_data);
+        let c_b = cpu.upload(&b_data);
+        let c_c = cpu.matmul_a_transposed(&c_a, &c_b, m, k, n);
+        let cpu_out = cpu.download(&c_c);
+
+        for i in 0..m * n {
+            assert!(
+                (metal_out[i] - cpu_out[i]).abs() < 1e-2,
+                "matmul_at mismatch at {i}: metal={} cpu={}",
+                metal_out[i], cpu_out[i]
+            );
+        }
+    }
+
+    #[test]
+    fn metal_matmul_accumulate_vs_cpu() {
+        let metal = get_metal_device();
+        let cpu = CpuDevice::new();
+
+        let m = 32;
+        let k = 64;
+        let n = 32;
+        let a_data: Vec<f32> = (0..m * k).map(|i| ((i * 7 + 3) % 13) as f32 / 13.0 - 0.5).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| ((i * 11 + 5) % 17) as f32 / 17.0 - 0.5).collect();
+        let c_init: Vec<f32> = (0..m * n).map(|i| ((i * 3 + 1) % 11) as f32 / 11.0).collect();
+
+        let m_a = metal.upload(&a_data);
+        let m_b = metal.upload(&b_data);
+        let mut m_c = metal.upload(&c_init);
+        metal.matmul_accumulate(&m_a, &m_b, &mut m_c, m, k, n);
+        let metal_out = metal.download(&m_c);
+
+        let c_a = cpu.upload(&a_data);
+        let c_b = cpu.upload(&b_data);
+        let mut c_c = cpu.upload(&c_init);
+        cpu.matmul_accumulate(&c_a, &c_b, &mut c_c, m, k, n);
+        let cpu_out = cpu.download(&c_c);
+
+        for i in 0..m * n {
+            assert!(
+                (metal_out[i] - cpu_out[i]).abs() < 1e-2,
+                "matmul_acc mismatch at {i}: metal={} cpu={}",
+                metal_out[i], cpu_out[i]
+            );
+        }
+    }
+
+    #[test]
+    fn metal_gpu_add_assign() {
+        let metal = get_metal_device();
+        let mut dst = metal.upload(&[1.0, 2.0, 3.0, 4.0]);
+        let src = metal.upload(&[10.0, 20.0, 30.0, 40.0]);
+        metal.add_assign(&mut dst, &src);
+        let out = metal.download(&dst);
+        assert!((out[0] - 11.0).abs() < 1e-5);
+        assert!((out[1] - 22.0).abs() < 1e-5);
+        assert!((out[2] - 33.0).abs() < 1e-5);
+        assert!((out[3] - 44.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn metal_gpu_zero_buffer() {
+        let metal = get_metal_device();
+        let mut buf = metal.upload(&[1.0, 2.0, 3.0, 4.0]);
+        metal.zero_buffer(&mut buf);
+        let out = metal.download(&buf);
+        for v in &out {
+            assert!(*v == 0.0, "zero_buffer: got {v}");
+        }
+    }
+
+    #[test]
+    fn metal_gpu_adamw_step() {
+        let metal = get_metal_device();
+        let cpu = CpuDevice::new();
+
+        let param_data = vec![1.0, 2.0, 3.0, 4.0];
+        let grad_data = vec![0.1, 0.2, 0.3, 0.4];
+        let m_data = vec![0.0; 4];
+        let v_data = vec![0.0; 4];
+        let lr = 0.001;
+        let beta1 = 0.9;
+        let beta2 = 0.999;
+        let eps = 1e-8;
+        let wd = 0.01;
+        let step_t = 1;
+
+        let mut m_param = metal.upload(&param_data);
+        let m_grad = metal.upload(&grad_data);
+        let mut m_m = metal.upload(&m_data);
+        let mut m_v = metal.upload(&v_data);
+        metal.adamw_step(&mut m_param, &m_grad, &mut m_m, &mut m_v, lr, beta1, beta2, eps, wd, step_t);
+        let metal_param = metal.download(&m_param);
+
+        let mut c_param = cpu.upload(&param_data);
+        let c_grad = cpu.upload(&grad_data);
+        let mut c_m = cpu.upload(&m_data);
+        let mut c_v = cpu.upload(&v_data);
+        cpu.adamw_step(&mut c_param, &c_grad, &mut c_m, &mut c_v, lr, beta1, beta2, eps, wd, step_t);
+        let cpu_param = cpu.download(&c_param);
+
+        for i in 0..4 {
+            assert!(
+                (metal_param[i] - cpu_param[i]).abs() < 1e-5,
+                "adamw mismatch at {i}: metal={} cpu={}",
+                metal_param[i], cpu_param[i]
+            );
+        }
+    }
+
+    #[test]
+    fn metal_gpu_slice_buffer() {
+        let metal = get_metal_device();
+        let buf = metal.upload(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+        let sliced = metal.slice_buffer(&buf, 1, 3);
+        let out = metal.download(&sliced);
+        assert_eq!(out, vec![2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn metal_gpu_write_into() {
+        let metal = get_metal_device();
+        let mut dst = metal.upload(&[0.0, 0.0, 0.0, 0.0, 0.0]);
+        let src = metal.upload(&[7.0, 8.0]);
+        metal.write_into(&mut dst, 2, &src);
+        let out = metal.download(&dst);
+        assert_eq!(out, vec![0.0, 0.0, 7.0, 8.0, 0.0]);
     }
 }

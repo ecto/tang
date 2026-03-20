@@ -65,6 +65,214 @@ kernel void matmul(
 }
 "#;
 
+/// C = A @ B^T. B stored as [N, K] row-major.
+/// Dispatch: threadgroups = ceil(M/32) × ceil(N/32), threads_per_threadgroup = 128.
+pub const MATMUL_BT_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+using namespace metal::simdgroup;
+
+constant uint TILE = 32;
+constant uint BK = 8;
+
+kernel void matmul_bt(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],    // [N, K] row-major
+    device float* C [[buffer(2)]],
+    device const uint* params [[buffer(3)]],    // [M, K, N]
+    uint2 tg_pos [[threadgroup_position_in_grid]],
+    uint sg_id [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    uint M = params[0];
+    uint K = params[1];
+    uint N = params[2];
+
+    uint row_base = tg_pos.y * TILE + sg_id * 8;
+    uint col_base = tg_pos.x * TILE;
+
+    simdgroup_float8x8 acc[4];
+    for (int i = 0; i < 4; i++) acc[i] = simdgroup_float8x8(0);
+
+    for (uint kb = 0; kb < K; kb += BK) {
+        simdgroup_float8x8 a_tile;
+        simdgroup_load(a_tile, A + row_base * K + kb, K);
+
+        for (int j = 0; j < 4; j++) {
+            // B is [N,K]: row (col_base+j*8) has stride K
+            simdgroup_float8x8 b_tile;
+            simdgroup_load(b_tile, B + (col_base + j * 8) * K + kb, K, ulong2(0), true);
+            simdgroup_multiply_accumulate(acc[j], a_tile, b_tile, acc[j]);
+        }
+    }
+
+    for (int j = 0; j < 4; j++) {
+        if (row_base < M && (col_base + j * 8) < N) {
+            simdgroup_store(acc[j], C + row_base * N + (col_base + j * 8), N);
+        }
+    }
+}
+"#;
+
+/// C = A^T @ B. A stored as [K, M] row-major.
+/// Dispatch: threadgroups = ceil(M/32) × ceil(N/32), threads_per_threadgroup = 128.
+pub const MATMUL_AT_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+using namespace metal::simdgroup;
+
+constant uint TILE = 32;
+constant uint BK = 8;
+
+kernel void matmul_at(
+    device const float* A [[buffer(0)]],    // [K, M] row-major
+    device const float* B [[buffer(1)]],    // [K, N] row-major
+    device float* C [[buffer(2)]],
+    device const uint* params [[buffer(3)]],    // [M, K, N]
+    uint2 tg_pos [[threadgroup_position_in_grid]],
+    uint sg_id [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    uint M = params[0];
+    uint K = params[1];
+    uint N = params[2];
+
+    uint row_base = tg_pos.y * TILE + sg_id * 8;
+    uint col_base = tg_pos.x * TILE;
+
+    simdgroup_float8x8 acc[4];
+    for (int i = 0; i < 4; i++) acc[i] = simdgroup_float8x8(0);
+
+    for (uint kb = 0; kb < K; kb += BK) {
+        // A is [K,M]: column row_base has stride M, need transpose
+        simdgroup_float8x8 a_tile;
+        simdgroup_load(a_tile, A + kb * M + row_base, M, ulong2(0), true);
+
+        for (int j = 0; j < 4; j++) {
+            simdgroup_float8x8 b_tile;
+            simdgroup_load(b_tile, B + kb * N + (col_base + j * 8), N);
+            simdgroup_multiply_accumulate(acc[j], a_tile, b_tile, acc[j]);
+        }
+    }
+
+    for (int j = 0; j < 4; j++) {
+        if (row_base < M && (col_base + j * 8) < N) {
+            simdgroup_store(acc[j], C + row_base * N + (col_base + j * 8), N);
+        }
+    }
+}
+"#;
+
+/// C += A @ B (accumulate into existing C).
+/// Dispatch: threadgroups = ceil(M/32) × ceil(N/32), threads_per_threadgroup = 128.
+pub const MATMUL_ACC_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+using namespace metal::simdgroup;
+
+constant uint TILE = 32;
+constant uint BK = 8;
+
+kernel void matmul_acc(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    device const uint* params [[buffer(3)]],    // [M, K, N]
+    uint2 tg_pos [[threadgroup_position_in_grid]],
+    uint sg_id [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    uint M = params[0];
+    uint K = params[1];
+    uint N = params[2];
+
+    uint row_base = tg_pos.y * TILE + sg_id * 8;
+    uint col_base = tg_pos.x * TILE;
+
+    // Initialize accumulators from existing C
+    simdgroup_float8x8 acc[4];
+    for (int j = 0; j < 4; j++) {
+        if (row_base < M && (col_base + j * 8) < N) {
+            simdgroup_load(acc[j], C + row_base * N + (col_base + j * 8), N);
+        } else {
+            acc[j] = simdgroup_float8x8(0);
+        }
+    }
+
+    for (uint kb = 0; kb < K; kb += BK) {
+        simdgroup_float8x8 a_tile;
+        simdgroup_load(a_tile, A + row_base * K + kb, K);
+
+        for (int j = 0; j < 4; j++) {
+            simdgroup_float8x8 b_tile;
+            simdgroup_load(b_tile, B + kb * N + (col_base + j * 8), N);
+            simdgroup_multiply_accumulate(acc[j], a_tile, b_tile, acc[j]);
+        }
+    }
+
+    for (int j = 0; j < 4; j++) {
+        if (row_base < M && (col_base + j * 8) < N) {
+            simdgroup_store(acc[j], C + row_base * N + (col_base + j * 8), N);
+        }
+    }
+}
+"#;
+
+/// C += A^T @ B. A stored as [K, M] row-major.
+/// Dispatch: threadgroups = ceil(M/32) × ceil(N/32), threads_per_threadgroup = 128.
+pub const MATMUL_ACC_AT_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+using namespace metal::simdgroup;
+
+constant uint TILE = 32;
+constant uint BK = 8;
+
+kernel void matmul_acc_at(
+    device const float* A [[buffer(0)]],    // [K, M] row-major
+    device const float* B [[buffer(1)]],    // [K, N] row-major
+    device float* C [[buffer(2)]],
+    device const uint* params [[buffer(3)]],    // [M, K, N]
+    uint2 tg_pos [[threadgroup_position_in_grid]],
+    uint sg_id [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    uint M = params[0];
+    uint K = params[1];
+    uint N = params[2];
+
+    uint row_base = tg_pos.y * TILE + sg_id * 8;
+    uint col_base = tg_pos.x * TILE;
+
+    // Initialize accumulators from existing C
+    simdgroup_float8x8 acc[4];
+    for (int j = 0; j < 4; j++) {
+        if (row_base < M && (col_base + j * 8) < N) {
+            simdgroup_load(acc[j], C + row_base * N + (col_base + j * 8), N);
+        } else {
+            acc[j] = simdgroup_float8x8(0);
+        }
+    }
+
+    for (uint kb = 0; kb < K; kb += BK) {
+        simdgroup_float8x8 a_tile;
+        simdgroup_load(a_tile, A + kb * M + row_base, M, ulong2(0), true);
+
+        for (int j = 0; j < 4; j++) {
+            simdgroup_float8x8 b_tile;
+            simdgroup_load(b_tile, B + kb * N + (col_base + j * 8), N);
+            simdgroup_multiply_accumulate(acc[j], a_tile, b_tile, acc[j]);
+        }
+    }
+
+    for (int j = 0; j < 4; j++) {
+        if (row_base < M && (col_base + j * 8) < N) {
+            simdgroup_store(acc[j], C + row_base * N + (col_base + j * 8), N);
+        }
+    }
+}
+"#;
+
 /// Simple matmul fallback for non-simdgroup devices or small matrices.
 /// Uses a naive per-thread approach.
 pub const MATMUL_NAIVE_MSL: &str = r#"

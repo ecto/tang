@@ -1015,6 +1015,54 @@ impl ComputeDevice for CudaComputeDevice {
         Dialect::Cuda
     }
 
+    fn peak_flops_f32(&self) -> Option<f64> {
+        // Query SM count and clock from CUDA driver
+        use cudarc::driver::sys;
+        let mut sm_count: i32 = 0;
+        let mut clock_khz: i32 = 0;
+        let mut major: i32 = 0;
+        let mut minor: i32 = 0;
+        unsafe {
+            sys::cuDeviceGetAttribute(
+                &mut sm_count,
+                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+                0,
+            );
+            sys::cuDeviceGetAttribute(
+                &mut clock_khz,
+                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_CLOCK_RATE,
+                0,
+            );
+            sys::cuDeviceGetAttribute(
+                &mut major,
+                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                0,
+            );
+            sys::cuDeviceGetAttribute(
+                &mut minor,
+                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                0,
+            );
+        }
+        if sm_count == 0 || clock_khz == 0 {
+            return None;
+        }
+        // FP32 cores per SM by compute capability
+        let fp32_per_sm = match (major, minor) {
+            (7, 0) => 64,   // V100
+            (7, 5) => 64,   // Turing (RTX 2xxx)
+            (8, 0) => 64,   // A100
+            (8, 6) => 128,  // Ampere consumer (RTX 3xxx)
+            (8, 9) => 128,  // Ada Lovelace (RTX 4xxx)
+            (9, 0) => 128,  // Hopper (H100)
+            (10, 0) => 128, // Blackwell
+            _ => 64,        // conservative default
+        };
+        // Peak FLOPS = SM_count × FP32_per_SM × 2 (FMA) × clock_Hz
+        let clock_hz = clock_khz as f64 * 1000.0;
+        Some(sm_count as f64 * fp32_per_sm as f64 * 2.0 * clock_hz)
+    }
+
     fn total_memory_bytes(&self) -> usize {
         cudarc::driver::result::mem_get_info().map(|(_, total)| total).unwrap_or(0)
     }

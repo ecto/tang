@@ -34,6 +34,10 @@ pub trait ComputeDevice: Send {
     /// fragmentation-induced OOM.
     fn pool_clear(&self) {}
 
+    /// Peak FLOPS for FP32 compute. Used for MFU calculation.
+    /// Returns None if unknown.
+    fn peak_flops_f32(&self) -> Option<f64> { None }
+
     // -- Buffer lifecycle --
 
     /// Upload f32 data from CPU to device.
