@@ -66,6 +66,7 @@ impl Scheduler for WarmupCosine {
             // Cosine decay over the remaining epochs
             let decay_epochs = self.total_epochs - self.warmup_epochs;
             let t = (epoch - self.warmup_epochs) as f64 / decay_epochs as f64;
+            let t = t.min(1.0); // clamp: hold min_lr after schedule ends
             self.min_lr + (self.initial_lr - self.min_lr) * 0.5 * (1.0 + (PI * t).cos())
         }
     }
@@ -119,6 +120,7 @@ impl Scheduler for WarmupStableDecay {
                     return self.initial_lr;
                 }
                 let t = (epoch - stable_end) as f64 / decay_steps as f64;
+                let t = t.min(1.0); // clamp: hold min_lr after schedule ends
                 self.initial_lr + (self.min_lr - self.initial_lr) * t
             }
         }
@@ -298,6 +300,36 @@ mod tests {
         // After warmup, LR stays at initial_lr
         assert!((s.lr(50) - 1.0).abs() < 1e-12);
         assert!((s.lr(100) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn wsd_clamps_at_min_lr_past_total_steps() {
+        let s = WarmupStableDecay {
+            initial_lr: 3e-4,
+            min_lr: 3e-5,
+            warmup_steps: 200,
+            stable_fraction: 0.8,
+            total_steps: 5000,
+        };
+        // At total_steps, lr should be min_lr
+        assert!((s.lr(5000) - 3e-5).abs() < 1e-10);
+        // Past total_steps, lr should clamp at min_lr, never go negative
+        assert!((s.lr(5001) - 3e-5).abs() < 1e-10);
+        assert!((s.lr(6000) - 3e-5).abs() < 1e-10);
+        assert!((s.lr(1_000_000) - 3e-5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn warmup_cosine_clamps_at_min_lr_past_total() {
+        let s = WarmupCosine {
+            initial_lr: 3e-4,
+            min_lr: 3e-5,
+            warmup_epochs: 200,
+            total_epochs: 5000,
+        };
+        assert!((s.lr(5000) - 3e-5).abs() < 1e-10);
+        assert!((s.lr(5001) - 3e-5).abs() < 1e-10);
+        assert!((s.lr(10000) - 3e-5).abs() < 1e-10);
     }
 
     #[test]
