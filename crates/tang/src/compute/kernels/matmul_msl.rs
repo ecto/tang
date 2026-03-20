@@ -10,7 +10,6 @@
 pub const MATMUL_MSL: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
-using namespace metal::simdgroup;
 
 // Each threadgroup: 32x32 tile of C
 // Each simdgroup: 8x8 accumulators tiled across the 32x32 block

@@ -10,7 +10,6 @@
 pub const MATMUL_MSL: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
-using namespace metal::simdgroup;
 
 // Each threadgroup: 32x32 tile of C
 // Each simdgroup: 8x8 accumulators tiled across the 32x32 block
@@ -70,7 +69,6 @@ kernel void matmul(
 pub const MATMUL_BT_MSL: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
-using namespace metal::simdgroup;
 
 constant uint TILE = 32;
 constant uint BK = 8;
@@ -119,7 +117,6 @@ kernel void matmul_bt(
 pub const MATMUL_AT_MSL: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
-using namespace metal::simdgroup;
 
 constant uint TILE = 32;
 constant uint BK = 8;
@@ -168,7 +165,6 @@ kernel void matmul_at(
 pub const MATMUL_ACC_MSL: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
-using namespace metal::simdgroup;
 
 constant uint TILE = 32;
 constant uint BK = 8;
@@ -223,7 +219,6 @@ kernel void matmul_acc(
 pub const MATMUL_ACC_AT_MSL: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
-using namespace metal::simdgroup;
 
 constant uint TILE = 32;
 constant uint BK = 8;
