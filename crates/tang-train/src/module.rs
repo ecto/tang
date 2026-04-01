@@ -58,24 +58,10 @@ pub trait Module<S: Scalar> {
     }
 
     /// Load parameter tensors by name. Silently skips names not in the module.
-    ///
-    /// For 2D tensors, if the checkpoint shape is the reverse of the model's
-    /// expected shape (e.g. `[in, out]` vs `[out, in]`), the tensor is
-    /// transposed automatically. This handles checkpoints saved with either
-    /// weight convention.
     fn load_state_dict(&mut self, state: &[(String, Tensor<S>)]) {
         for (name, param) in self.named_parameters_mut() {
             if let Some((_, tensor)) = state.iter().find(|(n, _)| n == &name) {
-                if tensor.ndim() == 2
-                    && param.data.ndim() == 2
-                    && tensor.shape()[0] == param.data.shape()[1]
-                    && tensor.shape()[1] == param.data.shape()[0]
-                    && tensor.shape()[0] != tensor.shape()[1]
-                {
-                    param.data = tensor.transpose();
-                } else {
-                    param.data = tensor.clone();
-                }
+                param.data = tensor.clone();
             }
         }
     }
