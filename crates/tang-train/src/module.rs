@@ -58,10 +58,20 @@ pub trait Module<S: Scalar> {
     }
 
     /// Load parameter tensors by name. Silently skips names not in the module.
+    ///
+    /// If a checkpoint tensor has the same number of elements but different
+    /// shape (e.g. `[768, 256]` vs `[256, 768]`), it is reshaped to match
+    /// the model's expected shape without rearranging the underlying data.
     fn load_state_dict(&mut self, state: &[(String, Tensor<S>)]) {
         for (name, param) in self.named_parameters_mut() {
             if let Some((_, tensor)) = state.iter().find(|(n, _)| n == &name) {
-                param.data = tensor.clone();
+                if tensor.shape() != param.data.shape()
+                    && tensor.numel() == param.data.numel()
+                {
+                    param.data = tensor.reshape(param.data.shape().clone());
+                } else {
+                    param.data = tensor.clone();
+                }
             }
         }
     }
