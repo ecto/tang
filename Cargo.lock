@@ -5941,6 +5941,7 @@ name = "tang-safetensors"
 version = "0.1.0"
 dependencies = [
  "safetensors",
+ "serde_json",
  "tang",
  "tang-la",
  "tang-tensor",

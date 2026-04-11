@@ -236,6 +236,43 @@ fn deserialize_f32(tensors: &safetensors::SafeTensors<'_>) -> Result<HashMap<Str
     Ok(result)
 }
 
+/// Load tensors as `Tensor<f32>` from a sharded model (HuggingFace index format).
+///
+/// Reads `model.safetensors.index.json` to discover shard files, then loads
+/// and merges all tensors from each shard. The index file must be in the same
+/// directory as the shard files.
+pub fn load_f32_sharded(index_path: &Path) -> Result<HashMap<String, Tensor<f32>>, SafetensorsError> {
+    let index_data = std::fs::read_to_string(index_path).map_err(SafetensorsError::Io)?;
+
+    // Parse the index JSON: { "weight_map": { "tensor_name": "shard_file", ... }, ... }
+    let index: serde_json::Value = serde_json::from_str(&index_data)
+        .map_err(|e| SafetensorsError::UnsupportedDtype(format!("invalid index JSON: {e}")))?;
+
+    let weight_map = index
+        .get("weight_map")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| SafetensorsError::UnsupportedDtype("missing weight_map in index".into()))?;
+
+    // Collect unique shard filenames
+    let parent = index_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut shard_files: Vec<String> = weight_map
+        .values()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+    shard_files.sort();
+    shard_files.dedup();
+
+    // Load each shard and merge into a single map
+    let mut result = HashMap::new();
+    for shard_name in &shard_files {
+        let shard_path = parent.join(shard_name);
+        let shard_tensors = load_f32(&shard_path)?;
+        result.extend(shard_tensors);
+    }
+
+    Ok(result)
+}
+
 /// Errors from safetensors operations.
 #[derive(Debug)]
 pub enum SafetensorsError {

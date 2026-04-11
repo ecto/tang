@@ -20,6 +20,20 @@ impl<S: Scalar> Linear<S> {
             cached_input: None,
         }
     }
+
+    /// Create a linear layer without bias (y = xW^T).
+    pub fn new_no_bias(in_features: usize, out_features: usize, seed: u64) -> Self {
+        Self {
+            weight: Parameter::randn(Shape::from_slice(&[out_features, in_features]), seed),
+            bias: Parameter::new(Tensor::zeros(Shape::from_slice(&[0]))),
+            cached_input: None,
+        }
+    }
+
+    /// Whether this layer has a bias vector.
+    pub fn has_bias(&self) -> bool {
+        self.bias.data.shape().dims().iter().all(|&d| d > 0)
+    }
 }
 
 impl<S: Scalar> Module<S> for Linear<S> {
@@ -31,12 +45,21 @@ impl<S: Scalar> Module<S> for Linear<S> {
             // Single sample: [in_features] -> [out_features]
             let input_2d = input.reshape(Shape::from_slice(&[1, input.numel()]));
             let out = input_2d.matmul(&wt); // [1, out_features]
-            let out_1d = out.reshape(Shape::from_slice(&[self.bias.data.numel()]));
-            out_1d.add(&self.bias.data)
+            let out_dim = self.weight.data.shape()[0];
+            let out_1d = out.reshape(Shape::from_slice(&[out_dim]));
+            if self.has_bias() {
+                out_1d.add(&self.bias.data)
+            } else {
+                out_1d
+            }
         } else {
             // Batch: [batch, in_features] -> [batch, out_features]
             let out = input.matmul(&wt);
-            out.add(&self.bias.data)
+            if self.has_bias() {
+                out.add(&self.bias.data)
+            } else {
+                out
+            }
         }
     }
 
@@ -60,13 +83,15 @@ impl<S: Scalar> Module<S> for Linear<S> {
         let grad_w = grad_2d.transpose().matmul(&input_2d);
         self.weight.accumulate_grad(&grad_w);
 
-        // grad_b = sum(grad_output, axis=0) — [out]
-        let grad_b = if grad_2d.shape()[0] == 1 {
-            grad_2d.reshape(Shape::from_slice(&[grad_2d.shape()[1]]))
-        } else {
-            grad_2d.sum_axis(0)
-        };
-        self.bias.accumulate_grad(&grad_b);
+        if self.has_bias() {
+            // grad_b = sum(grad_output, axis=0) — [out]
+            let grad_b = if grad_2d.shape()[0] == 1 {
+                grad_2d.reshape(Shape::from_slice(&[grad_2d.shape()[1]]))
+            } else {
+                grad_2d.sum_axis(0)
+            };
+            self.bias.accumulate_grad(&grad_b);
+        }
 
         // grad_input = grad_output @ weight — [batch, out] @ [out, in] = [batch, in]
         let grad_input = grad_2d.matmul(&self.weight.data);
@@ -79,25 +104,41 @@ impl<S: Scalar> Module<S> for Linear<S> {
     }
 
     fn parameters(&self) -> Vec<&Parameter<S>> {
-        alloc::vec![&self.weight, &self.bias]
+        if self.has_bias() {
+            alloc::vec![&self.weight, &self.bias]
+        } else {
+            alloc::vec![&self.weight]
+        }
     }
 
     fn parameters_mut(&mut self) -> Vec<&mut Parameter<S>> {
-        alloc::vec![&mut self.weight, &mut self.bias]
+        if self.has_bias() {
+            alloc::vec![&mut self.weight, &mut self.bias]
+        } else {
+            alloc::vec![&mut self.weight]
+        }
     }
 
     fn named_parameters(&self) -> Vec<(String, &Parameter<S>)> {
-        alloc::vec![
-            (String::from("weight"), &self.weight),
-            (String::from("bias"), &self.bias),
-        ]
+        if self.has_bias() {
+            alloc::vec![
+                (String::from("weight"), &self.weight),
+                (String::from("bias"), &self.bias),
+            ]
+        } else {
+            alloc::vec![(String::from("weight"), &self.weight)]
+        }
     }
 
     fn named_parameters_mut(&mut self) -> Vec<(String, &mut Parameter<S>)> {
-        alloc::vec![
-            (String::from("weight"), &mut self.weight),
-            (String::from("bias"), &mut self.bias),
-        ]
+        if self.has_bias() {
+            alloc::vec![
+                (String::from("weight"), &mut self.weight),
+                (String::from("bias"), &mut self.bias),
+            ]
+        } else {
+            alloc::vec![(String::from("weight"), &mut self.weight)]
+        }
     }
 }
 
@@ -2131,6 +2172,11 @@ impl<S: Scalar> RotaryEmbedding<S> {
         Self::with_base(dim, max_seq_len, 10000.0)
     }
 
+    /// The RoPE base frequency (theta).
+    pub fn base(&self) -> f64 {
+        self.base
+    }
+
     pub fn with_base(dim: usize, max_seq_len: usize, base: f64) -> Self {
         assert!(dim % 2 == 0, "RoPE dim must be even");
         let half = dim / 2;
@@ -2166,6 +2212,7 @@ impl<S: Scalar> RotaryEmbedding<S> {
 
     /// Apply RoPE to a tensor of shape [seq_len, dim].
     /// Rotates pairs (x[2i], x[2i+1]) by position-dependent angle.
+    /// This is the "interleaved" format used by gaia's native models.
     pub fn apply(&self, x: &Tensor<S>, offset: usize) -> Tensor<S> {
         assert_eq!(x.ndim(), 2);
         let seq_len = x.shape()[0];
@@ -2187,6 +2234,35 @@ impl<S: Scalar> RotaryEmbedding<S> {
             } else {
                 // x_even * sin + x_odd * cos
                 x.get(&[pos, d - 1]) * sin_val + x.get(&[pos, d]) * cos_val
+            }
+        })
+    }
+
+    /// Apply RoPE with "half-rotate" pairing: (x[i], x[i+dim/2]).
+    /// This is the format used by HuggingFace models (LLaMA, Qwen, Gemma).
+    pub fn apply_half(&self, x: &Tensor<S>, offset: usize) -> Tensor<S> {
+        assert_eq!(x.ndim(), 2);
+        let seq_len = x.shape()[0];
+        assert_eq!(x.shape()[1], self.dim);
+        assert!(
+            offset + seq_len <= self.max_seq_len,
+            "sequence exceeds max_seq_len"
+        );
+        let half = self.dim / 2;
+        Tensor::from_fn(x.shape().clone(), |idx| {
+            let pos = idx[0];
+            let d = idx[1];
+            if d < half {
+                // first half: x[d]*cos - x[d+half]*sin
+                let cos_val = self.cos_cache.get(&[offset + pos, d]);
+                let sin_val = self.sin_cache.get(&[offset + pos, d]);
+                x.get(&[pos, d]) * cos_val - x.get(&[pos, d + half]) * sin_val
+            } else {
+                // second half: x[d-half]*sin + x[d]*cos
+                let pair = d - half;
+                let cos_val = self.cos_cache.get(&[offset + pos, pair]);
+                let sin_val = self.sin_cache.get(&[offset + pos, pair]);
+                x.get(&[pos, d - half]) * sin_val + x.get(&[pos, d]) * cos_val
             }
         })
     }
@@ -3864,9 +3940,9 @@ impl<S: Scalar> Module<S> for SlidingWindowAttention<S> {
 /// Uses a gated linear unit with SiLU activation. The intermediate dimension
 /// `ff_dim` is typically `(8/3) * d_model` rounded to a multiple of 256.
 pub struct SwiGLU<S: Scalar> {
-    gate_proj: Linear<S>,  // [d_model, ff_dim]
-    up_proj: Linear<S>,    // [d_model, ff_dim]
-    down_proj: Linear<S>,  // [ff_dim, d_model]
+    pub gate_proj: Linear<S>,  // [d_model, ff_dim]
+    pub up_proj: Linear<S>,    // [d_model, ff_dim]
+    pub down_proj: Linear<S>,  // [ff_dim, d_model]
     cached_gate_silu: Option<Tensor<S>>,
     cached_up: Option<Tensor<S>>,
     cached_input: Option<Tensor<S>>,

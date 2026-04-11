@@ -186,7 +186,7 @@ impl<S: Scalar> Tensor<S> {
         }
 
         let out_shape = Shape::broadcast(&self.shape, &other.shape)
-            .expect("zip_with: incompatible shapes for broadcasting");
+            .unwrap_or_else(|| panic!("zip_with: incompatible shapes for broadcasting: {:?} vs {:?}", self.shape, other.shape));
 
         Self::from_fn(out_shape, |idx| {
             let a = self.broadcast_get(idx);
