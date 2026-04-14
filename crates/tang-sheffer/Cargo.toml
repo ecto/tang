@@ -1,0 +1,18 @@
+[package]
+name = "tang-sheffer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Search for universal (Sheffer) operators over elementary functions."
+
+[features]
+default = []
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+
+[dependencies]
+num-complex = "0.4"
+rayon = "1"
+wgpu = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+bytemuck = { workspace = true, optional = true }

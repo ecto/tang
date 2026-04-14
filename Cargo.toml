@@ -21,6 +21,8 @@ members = [
     "crates/tang-compute",
     "crates/tang-3dgs",
     "crates/tang-holo",
+    "crates/tang-sheffer",
+    "crates/tang-sheffer-wasm",
 ]
 
 [workspace.package]
@@ -48,6 +50,7 @@ tang-compile = { version = "0.1.0", path = "crates/tang-compile" }
 tang-compute = { version = "0.1.0", path = "crates/tang-compute" }
 tang-3dgs = { version = "0.1.0", path = "crates/tang-3dgs" }
 tang-holo = { version = "0.1.0", path = "crates/tang-holo" }
+tang-sheffer = { version = "0.1.0", path = "crates/tang-sheffer" }
 iroh = "0.96"
 tarpc = { version = "0.35", features = ["tokio1", "serde-transport"] }
 tokio = { version = "1", features = ["full"] }
