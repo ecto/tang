@@ -1,3 +1,12 @@
 /target
 .vercel
 .env*.local
+
+# training/example output artifacts
+/fitted_*.png
+/train_gt.png
+/train_step_*.png
+/trained_cloud.bin
+
+# editor/tool backups
+*.bak
