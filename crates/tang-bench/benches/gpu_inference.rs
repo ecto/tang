@@ -3,10 +3,10 @@
 //! Measures: embedding lookup, RMSNorm, RoPE, matmul at model-relevant sizes,
 //! SwiGLU fused, KV-cached attention, and full forward pass.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
-use tang_gpu::*;
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use tang_gpu::matmul::matmul;
 use tang_gpu::nn::bias_add;
+use tang_gpu::*;
 
 fn get_device() -> GpuDevice {
     GpuDevice::new_sync().expect("GPU device required for benchmarks")
@@ -14,10 +14,14 @@ fn get_device() -> GpuDevice {
 
 fn random_f32(n: usize, seed: u64) -> Vec<f32> {
     let mut state = seed;
-    (0..n).map(|_| {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        (state >> 33) as f32 / (1u32 << 31) as f32 - 0.5
-    }).collect()
+    (0..n)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as f32 / (1u32 << 31) as f32 - 0.5
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -62,15 +66,12 @@ fn bench_gpu_rmsnorm(c: &mut Criterion) {
         let data = random_f32(batch * dim, 42);
         let input = GpuTensor::from_slice(&device, &data, &[batch, dim]);
 
-        group.bench_function(
-            BenchmarkId::new("fwd", format!("{batch}x{dim}")),
-            |b| {
-                b.iter(|| {
-                    let out = norm.forward(&device, &mut cache, &input);
-                    black_box(out);
-                });
-            },
-        );
+        group.bench_function(BenchmarkId::new("fwd", format!("{batch}x{dim}")), |b| {
+            b.iter(|| {
+                let out = norm.forward(&device, &mut cache, &input);
+                black_box(out);
+            });
+        });
     }
     group.finish();
 }
@@ -192,10 +193,7 @@ fn bench_gpu_kv_attention(c: &mut Criterion) {
         group.bench_function("prefill_q128_kv128", |b| {
             b.iter(|| {
                 let out = kv_attention_fused(
-                    &device, &mut cache,
-                    &q, &k, &v,
-                    q_len, kv_len,
-                    n_heads, n_kv_heads, head_dim,
+                    &device, &mut cache, &q, &k, &v, q_len, kv_len, n_heads, n_kv_heads, head_dim,
                     0,
                 );
                 black_box(out);
@@ -217,10 +215,7 @@ fn bench_gpu_kv_attention(c: &mut Criterion) {
         group.bench_function("decode_q1_kv256", |b| {
             b.iter(|| {
                 let out = kv_attention_fused(
-                    &device, &mut cache,
-                    &q, &k, &v,
-                    q_len, kv_len,
-                    n_heads, n_kv_heads, head_dim,
+                    &device, &mut cache, &q, &k, &v, q_len, kv_len, n_heads, n_kv_heads, head_dim,
                     255,
                 );
                 black_box(out);
@@ -242,10 +237,7 @@ fn bench_gpu_kv_attention(c: &mut Criterion) {
         group.bench_function("decode_q1_kv1024", |b| {
             b.iter(|| {
                 let out = kv_attention_fused(
-                    &device, &mut cache,
-                    &q, &k, &v,
-                    q_len, kv_len,
-                    n_heads, n_kv_heads, head_dim,
+                    &device, &mut cache, &q, &k, &v, q_len, kv_len, n_heads, n_kv_heads, head_dim,
                     1023,
                 );
                 black_box(out);
@@ -328,7 +320,11 @@ fn bench_gpu_transformer_layer(c: &mut Criterion) {
     let rope = GpuInterleavedRoPE::new(&device, head_dim, max_seq, 10000.0);
 
     // Helper: batched linear on GPU
-    let linear_2d = |device: &GpuDevice, cache: &mut KernelCache, linear: &GpuLinear, input: &GpuTensor| -> GpuTensor {
+    let linear_2d = |device: &GpuDevice,
+                     cache: &mut KernelCache,
+                     linear: &GpuLinear,
+                     input: &GpuTensor|
+     -> GpuTensor {
         let wt = linear.weight.transpose_gpu(device, cache);
         let out = matmul(device, cache, input, &wt);
         bias_add(device, cache, &out, &linear.bias)
@@ -356,8 +352,17 @@ fn bench_gpu_transformer_layer(c: &mut Criterion) {
             let k_flat = kf.reshape(&[128, n_kv_heads * head_dim]);
             let v_flat = vf.reshape(&[128, n_kv_heads * head_dim]);
             let attn = kv_attention_fused(
-                &device, &mut kcache, &q_flat, &k_flat, &v_flat,
-                128, 128, n_heads, n_kv_heads, head_dim, 0,
+                &device,
+                &mut kcache,
+                &q_flat,
+                &k_flat,
+                &v_flat,
+                128,
+                128,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                0,
             );
             let proj = linear_2d(&device, &mut kcache, &wo, &attn);
             let res1 = add_tensors(&device, &mut kcache, &input, &proj);
@@ -404,8 +409,17 @@ fn bench_gpu_transformer_layer(c: &mut Criterion) {
             let k_flat = kf.reshape(&[total, n_kv_heads * head_dim]);
             let v_flat = vf.reshape(&[total, n_kv_heads * head_dim]);
             let attn = kv_attention_fused(
-                &device, &mut kcache, &q_flat, &k_flat, &v_flat,
-                1, total, n_heads, n_kv_heads, head_dim, pos - 1,
+                &device,
+                &mut kcache,
+                &q_flat,
+                &k_flat,
+                &v_flat,
+                1,
+                total,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                pos - 1,
             );
             let proj = linear_2d(&device, &mut kcache, &wo, &attn);
             let res1 = add_tensors(&device, &mut kcache, &input, &proj);

@@ -59,7 +59,7 @@ fn main() {
         cloud.positions[i] = [angle.cos() * radius, angle.sin() * radius, (t - 0.5) * 2.0];
         cloud.opacities[i] = 1.0; // sigmoid(1) ≈ 0.73
         cloud.scales[i] = [-3.5, -3.5, -3.5]; // small
-        // Random SH colors
+                                              // Random SH colors
         cloud.sh_coeffs[i * 3] = (t * 7.0).sin() * 0.5;
         cloud.sh_coeffs[i * 3 + 1] = (t * 11.0).sin() * 0.5;
         cloud.sh_coeffs[i * 3 + 2] = (t * 13.0).sin() * 0.5;
@@ -154,7 +154,10 @@ fn main() {
             densify_stats = DensifyStats::new(new_count);
 
             if new_count != old_count {
-                println!("  iter {}: densified {} -> {} gaussians", iter, old_count, new_count);
+                println!(
+                    "  iter {}: densified {} -> {} gaussians",
+                    iter, old_count, new_count
+                );
             }
         }
 

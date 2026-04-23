@@ -3,8 +3,8 @@
 //! Groups sequential element-wise operations into fused kernels that
 //! execute in a single GPU dispatch, reducing memory bandwidth.
 
-use tang_expr::{ExprGraph, ExprId, Node};
 use std::collections::HashSet;
+use tang_expr::{ExprGraph, ExprId, Node};
 
 /// A group of fused operations that can execute as a single kernel.
 #[derive(Clone, Debug)]
@@ -171,7 +171,12 @@ impl FusionPlanner {
                 f(a.index() as usize);
                 f(b.index() as usize);
             }
-            Node::Neg(a) | Node::Recip(a) | Node::Sqrt(a) | Node::Sin(a) | Node::Exp2(a) | Node::Log2(a) => {
+            Node::Neg(a)
+            | Node::Recip(a)
+            | Node::Sqrt(a)
+            | Node::Sin(a)
+            | Node::Exp2(a)
+            | Node::Log2(a) => {
                 f(a.index() as usize);
             }
             Node::Select(c, a, b) => {
@@ -229,9 +234,9 @@ mod tests {
     fn fuse_chain() {
         let mut g = ExprGraph::new();
         let x = g.var(0);
-        let a = g.neg(x);      // elementwise
-        let b = g.neg(a);      // elementwise, single-use chain
-        let c = g.neg(b);      // elementwise, single-use chain
+        let a = g.neg(x); // elementwise
+        let b = g.neg(a); // elementwise, single-use chain
+        let c = g.neg(b); // elementwise, single-use chain
 
         let groups = FusionPlanner::plan(&g, &[c]);
 
@@ -255,9 +260,9 @@ mod tests {
     fn diamond_pattern() {
         let mut g = ExprGraph::new();
         let x = g.var(0);
-        let a = g.neg(x);       // used by both b and c
+        let a = g.neg(x); // used by both b and c
         let b = g.neg(a);
-        let c = g.neg(a);       // multi-use of `a` prevents fusion with b
+        let c = g.neg(a); // multi-use of `a` prevents fusion with b
         let d = g.add(b, c);
 
         let groups = FusionPlanner::plan(&g, &[d]);

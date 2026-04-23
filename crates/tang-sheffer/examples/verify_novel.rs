@@ -62,20 +62,14 @@ fn candidates() -> Vec<(&'static str, OpExpr)> {
         //
         // RHPRep: "right-half-plane-representative"
         //   (1 - sqrt(sqr(y)) / x) — uses sqrt(sqr(y)) as branch-adjusted |y|
-        (
-            "RHPRep",
-            rc_to_owned(sub(one(), div(sqrt(sqr(y())), x()))),
-        ),
+        ("RHPRep", rc_to_owned(sub(one(), div(sqrt(sqr(y())), x())))),
         //   ((x - y) / sqrt(sqr(y))) — asymmetric version
         (
             "DiffDivRHP",
             rc_to_owned(div(sub(x(), y()), sqrt(sqr(y())))),
         ),
         // Mobius: (x - 1) / (y - 1) — simple rational map, polynomial growth
-        (
-            "Mobius",
-            rc_to_owned(div(sub(x(), one()), sub(y(), one()))),
-        ),
+        ("Mobius", rc_to_owned(div(sub(x(), one()), sub(y(), one())))),
         // Nested power: (x - y)^(y^x)
         (
             "NestedPow",
@@ -98,10 +92,7 @@ fn candidates() -> Vec<(&'static str, OpExpr)> {
         // with e baked into the body. Scored 17/{1,x}, 16/{x}.
         (
             "EDivDiff",
-            rc_to_owned(div(
-                Arc::new(OpExpr::Atom(Atom::E)),
-                sub(y(), x()),
-            )),
+            rc_to_owned(div(Arc::new(OpExpr::Atom(Atom::E)), sub(y(), x()))),
         ),
         // `tanh(exp(e))^x - y/x` — rank 2, scored 19/15. Almost certainly
         // an FP artifact because tanh(exp(e)) = 1 - 1.65e-14 in f64, so
@@ -112,10 +103,7 @@ fn candidates() -> Vec<(&'static str, OpExpr)> {
             let e = Arc::new(OpExpr::Atom(Atom::E));
             (
                 "TanhExpEPow",
-                rc_to_owned(sub(
-                    powc(tanh_u(exp_u(e)), x()),
-                    div(y(), x()),
-                )),
+                rc_to_owned(sub(powc(tanh_u(exp_u(e)), x()), div(y(), x()))),
             )
         },
         // Sibling of DivMinusOne via reciprocal: 1/(x/y - 1)
@@ -258,7 +246,11 @@ fn run_candidate(label: &str, expr: &OpExpr) {
     sorted.sort();
     println!(
         "    genuine: {}",
-        sorted.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+        sorted
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     if !artifact_hits.is_empty() {
         let names: Vec<&str> = artifact_hits.iter().map(|(n, _)| n.as_str()).collect();
@@ -328,7 +320,11 @@ fn run_candidate(label: &str, expr: &OpExpr) {
     sorted.sort();
     println!(
         "    genuine: {}",
-        sorted.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+        sorted
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     if !artifact_cf.is_empty() {
         println!("    FP-limit artifacts: {}", artifact_cf.join(", "));
@@ -337,7 +333,10 @@ fn run_candidate(label: &str, expr: &OpExpr) {
 
 fn main() {
     println!("=== Phase 6: multi-point verification of novel candidates ===");
-    println!("budget: {} ops × {} iters per run, tolerance 1e-10 at {{γ, A, G}}", BUDGET, ITERS);
+    println!(
+        "budget: {} ops × {} iters per run, tolerance 1e-10 at {{γ, A, G}}",
+        BUDGET, ITERS
+    );
 
     for (label, expr) in candidates() {
         run_candidate(label, &expr);

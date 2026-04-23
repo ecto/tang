@@ -83,11 +83,7 @@ fn main() {
         .filter(|n| !union.contains(*n))
         .collect();
     still_missing.sort();
-    println!(
-        "\n  union across all 3: {}/{}",
-        union.len(),
-        targets.len()
-    );
+    println!("\n  union across all 3: {}/{}", union.len(), targets.len());
     if !still_missing.is_empty() {
         println!("  missing from all: {}", still_missing.join(", "));
     }

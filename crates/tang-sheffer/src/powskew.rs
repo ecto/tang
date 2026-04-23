@@ -69,11 +69,7 @@ mod tests {
         let one = C::new(1.0, 0.0);
         let neg_one = C::new(-1.0, 0.0);
         approx_eq(op.eval(one, neg_one), C::new(2.0, 0.0), "pow-skew(1, -1)");
-        approx_eq(
-            op.eval(neg_one, one),
-            C::new(-2.0, 0.0),
-            "pow-skew(-1, 1)",
-        );
+        approx_eq(op.eval(neg_one, one), C::new(-2.0, 0.0), "pow-skew(-1, 1)");
     }
 
     #[test]
@@ -190,6 +186,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn powskew_identities_hold_on_positive_half_plane() {
         // The identities f(x, 0) = 1 and f(0, x) = -1 require Re(x) > 0.
         // When Re(x) < 0, `0^x` diverges via `exp(x * ln(0)) = exp(x * -inf)`
@@ -210,8 +207,16 @@ mod tests {
         ];
         for &x in &positive_re {
             approx_eq(op.eval(x, x), C::new(0.0, 0.0), &format!("f({:?}, x)", x));
-            approx_eq(op.eval(x, zero), C::new(1.0, 0.0), &format!("f({:?}, 0)", x));
-            approx_eq(op.eval(zero, x), C::new(-1.0, 0.0), &format!("f(0, {:?})", x));
+            approx_eq(
+                op.eval(x, zero),
+                C::new(1.0, 0.0),
+                &format!("f({:?}, 0)", x),
+            );
+            approx_eq(
+                op.eval(zero, x),
+                C::new(-1.0, 0.0),
+                &format!("f(0, {:?})", x),
+            );
         }
 
         // Diagonal still cancels for Re(x) < 0.

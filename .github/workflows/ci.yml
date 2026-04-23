@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config
+      - name: Clippy (workspace lib/tests/bins, excluding wasm crates)
+        run: >
+          cargo clippy --workspace --lib --tests --bins
+          --exclude tang-site-wasm
+          --exclude tang-sheffer-wasm
+          -- -D warnings
+          -A clippy::too_many_arguments
+          -A clippy::type_complexity
+          -A clippy::needless_range_loop
+          -A clippy::ptr_arg
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config
+      - name: Build (workspace, excluding wasm crates)
+        run: >
+          cargo build --workspace
+          --exclude tang-site-wasm
+          --exclude tang-sheffer-wasm
+      - name: Test (workspace lib/tests/bins, excluding wasm and gpu crates)
+        run: >
+          cargo test --workspace --lib --tests --bins
+          --exclude tang-site-wasm
+          --exclude tang-sheffer-wasm
+          --exclude tang-gpu
+
+  wasm:
+    name: wasm build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Build tang-site-wasm
+        run: cargo build -p tang-site-wasm --target wasm32-unknown-unknown
+      - name: Build tang-sheffer-wasm
+        run: cargo build -p tang-sheffer-wasm --target wasm32-unknown-unknown

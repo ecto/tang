@@ -45,7 +45,7 @@ pub struct QuantizedQ4 {
 
 /// Quantize an f32 slice to Q8 blocks.
 pub fn quantize_q8(data: &[f32]) -> Vec<Q8Block> {
-    let n_blocks = (data.len() + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    let n_blocks = data.len().div_ceil(BLOCK_SIZE);
     let mut blocks = Vec::with_capacity(n_blocks);
 
     for b in 0..n_blocks {
@@ -82,7 +82,7 @@ pub fn dequantize_q8(blocks: &[Q8Block]) -> Vec<f32> {
 
 /// Quantize an f32 slice to Q4 blocks (4-bit quantization).
 pub fn quantize_q4(data: &[f32]) -> Vec<Q4Block> {
-    let n_blocks = (data.len() + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    let n_blocks = data.len().div_ceil(BLOCK_SIZE);
     let mut blocks = Vec::with_capacity(n_blocks);
 
     for b in 0..n_blocks {
@@ -174,14 +174,20 @@ pub fn quantize_tensor_q4<S: Scalar>(tensor: &Tensor<S>) -> QuantizedQ4 {
 
 /// Dequantize Q8 back to a tensor.
 pub fn dequantize_tensor_q8(q: &QuantizedQ8) -> Tensor<f64> {
-    let data: Vec<f64> = dequantize_q8(&q.blocks).into_iter().map(|x| x as f64).collect();
+    let data: Vec<f64> = dequantize_q8(&q.blocks)
+        .into_iter()
+        .map(|x| x as f64)
+        .collect();
     let numel: usize = q.shape.iter().product();
     Tensor::new(data[..numel].to_vec(), Shape::from_slice(&q.shape))
 }
 
 /// Dequantize Q4 back to a tensor.
 pub fn dequantize_tensor_q4(q: &QuantizedQ4) -> Tensor<f64> {
-    let data: Vec<f64> = dequantize_q4(&q.blocks).into_iter().map(|x| x as f64).collect();
+    let data: Vec<f64> = dequantize_q4(&q.blocks)
+        .into_iter()
+        .map(|x| x as f64)
+        .collect();
     let numel: usize = q.shape.iter().product();
     Tensor::new(data[..numel].to_vec(), Shape::from_slice(&q.shape))
 }
@@ -230,7 +236,7 @@ pub fn q8_matvec(weight: &QuantizedQ8, x: &[f64]) -> Vec<f64> {
     let in_dim = weight.shape[1];
     assert_eq!(x.len(), in_dim);
 
-    let blocks_per_row = (in_dim + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    let blocks_per_row = in_dim.div_ceil(BLOCK_SIZE);
     let mut y = alloc::vec![0.0f64; out_dim];
 
     for row in 0..out_dim {
@@ -259,7 +265,7 @@ pub fn q4_matvec(weight: &QuantizedQ4, x: &[f64]) -> Vec<f64> {
     let in_dim = weight.shape[1];
     assert_eq!(x.len(), in_dim);
 
-    let blocks_per_row = (in_dim + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    let blocks_per_row = in_dim.div_ceil(BLOCK_SIZE);
     let mut y = alloc::vec![0.0f64; out_dim];
 
     for row in 0..out_dim {

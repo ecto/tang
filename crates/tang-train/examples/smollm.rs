@@ -12,7 +12,7 @@ use std::time::Instant;
 use tang_tensor::{Shape, Tensor};
 use tang_train::{Linear, Parameter, RotaryEmbedding};
 
-use tang_infer::{KVCache, SamplingConfig, Sampler};
+use tang_infer::{KVCache, Sampler, SamplingConfig};
 
 // ---------------------------------------------------------------------------
 // Config
@@ -71,7 +71,7 @@ impl LlamaAttention {
 
     fn forward(
         &self,
-        x: &Tensor<f64>,      // [seq_len, hidden]
+        x: &Tensor<f64>, // [seq_len, hidden]
         layer_idx: usize,
         cache: &mut KVCache<f64>,
         pos_offset: usize,
@@ -91,8 +91,8 @@ impl LlamaAttention {
         cache.append(layer_idx, &k_roped, &v_full);
 
         // Get full cached K, V
-        let cached_k = cache.get_keys(layer_idx);   // [total_seq, kv_dim]
-        let cached_v = cache.get_values(layer_idx);  // [total_seq, kv_dim]
+        let cached_k = cache.get_keys(layer_idx); // [total_seq, kv_dim]
+        let cached_v = cache.get_values(layer_idx); // [total_seq, kv_dim]
         let total_seq = cached_k.shape()[0];
 
         // Grouped-query attention per head
@@ -180,7 +180,7 @@ impl LlamaMLP {
 
     fn forward(&self, x: &Tensor<f64>) -> Tensor<f64> {
         let gate = matmul_weight(x, &self.gate_proj.weight.data); // [seq, inter]
-        let up = matmul_weight(x, &self.up_proj.weight.data);     // [seq, inter]
+        let up = matmul_weight(x, &self.up_proj.weight.data); // [seq, inter]
 
         // SwiGLU: silu(gate) * up
         let hidden = gate
@@ -236,7 +236,7 @@ impl LlamaBlock {
 // ---------------------------------------------------------------------------
 
 struct LlamaModel {
-    embed_tokens: Tensor<f64>,  // [vocab, hidden]
+    embed_tokens: Tensor<f64>, // [vocab, hidden]
     blocks: Vec<LlamaBlock>,
     final_norm_weight: Vec<f64>,
     lm_head: Linear<f64>,
@@ -265,8 +265,7 @@ impl LlamaModel {
         let embed_raw = self.embed_tokens.data();
         for (i, &tok) in token_ids.iter().enumerate() {
             let src = tok * HIDDEN;
-            embed_data[i * HIDDEN..(i + 1) * HIDDEN]
-                .copy_from_slice(&embed_raw[src..src + HIDDEN]);
+            embed_data[i * HIDDEN..(i + 1) * HIDDEN].copy_from_slice(&embed_raw[src..src + HIDDEN]);
         }
         let mut hidden = Tensor::new(embed_data, Shape::from_slice(&[seq_len, HIDDEN]));
 
@@ -491,7 +490,7 @@ fn main() {
             + HIDDEN             // ffn_norm
         )
         + HIDDEN                 // final_norm
-        + VOCAB * HIDDEN;        // lm_head
+        + VOCAB * HIDDEN; // lm_head
     println!("parameters: {:.1}M\n", n_params as f64 / 1e6);
 
     // Prompt
@@ -512,10 +511,7 @@ fn main() {
 
     // --- Generate ---
     let max_new = 20;
-    let mut sampler = Sampler::with_seed(
-        SamplingConfig::greedy(),
-        42,
-    );
+    let mut sampler = Sampler::with_seed(SamplingConfig::greedy(), 42);
 
     let mut all_tokens = prompt_tokens.clone();
     let mut next_logits = logits;

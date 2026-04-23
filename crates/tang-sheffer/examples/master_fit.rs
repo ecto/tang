@@ -139,14 +139,7 @@ fn sweep(
     let best = random_losses[0];
     println!(
         "  {:<12} d={} | tight {:>2}/{:<2} | loose {:>2}/{:<2} | best {:.2e} | median {:.2e}",
-        label,
-        master.depth,
-        tight,
-        N_SEEDS,
-        loose,
-        N_SEEDS,
-        best,
-        median,
+        label, master.depth, tight, N_SEEDS, loose, N_SEEDS, best, median,
     );
 }
 

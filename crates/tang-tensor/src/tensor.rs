@@ -185,8 +185,12 @@ impl<S: Scalar> Tensor<S> {
             return Self::new(data, self.shape.clone());
         }
 
-        let out_shape = Shape::broadcast(&self.shape, &other.shape)
-            .unwrap_or_else(|| panic!("zip_with: incompatible shapes for broadcasting: {:?} vs {:?}", self.shape, other.shape));
+        let out_shape = Shape::broadcast(&self.shape, &other.shape).unwrap_or_else(|| {
+            panic!(
+                "zip_with: incompatible shapes for broadcasting: {:?} vs {:?}",
+                self.shape, other.shape
+            )
+        });
 
         Self::from_fn(out_shape, |idx| {
             let a = self.broadcast_get(idx);
@@ -383,7 +387,7 @@ impl<S: Scalar> Tensor<S> {
             }
             for k in 0..axis_size {
                 full_idx[axis] = k;
-                sum = sum + self.get(&full_idx);
+                sum += self.get(&full_idx);
             }
             sum
         })

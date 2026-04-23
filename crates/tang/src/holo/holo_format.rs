@@ -235,10 +235,7 @@ mod tests {
         assert_eq!(loaded.config.num_anchors, 50);
 
         // Verify params match
-        assert_eq!(
-            loaded.triplane.params_flat(),
-            model.triplane.params_flat()
-        );
+        assert_eq!(loaded.triplane.params_flat(), model.triplane.params_flat());
 
         std::fs::remove_file(&tmp).ok();
     }

@@ -10,6 +10,12 @@ pub struct LevenbergMarquardt {
     pub lambda_init: f64,
 }
 
+impl Default for LevenbergMarquardt {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LevenbergMarquardt {
     pub fn new() -> Self {
         Self {

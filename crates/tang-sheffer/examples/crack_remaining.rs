@@ -114,42 +114,126 @@ fn function_targets() -> Vec<tang_sheffer::Target> {
     let two = C::new(2.0, 0.0);
     vec![
         // Already-reachable baseline
-        Target { name: "exp(x)", value: x.exp() },
-        Target { name: "ln(x)", value: x.ln() },
-        Target { name: "x^2", value: x * x },
-        Target { name: "1/x", value: C::new(1.0, 0.0) / x },
-        Target { name: "-x", value: -x },
+        Target {
+            name: "exp(x)",
+            value: x.exp(),
+        },
+        Target {
+            name: "ln(x)",
+            value: x.ln(),
+        },
+        Target {
+            name: "x^2",
+            value: x * x,
+        },
+        Target {
+            name: "1/x",
+            value: C::new(1.0, 0.0) / x,
+        },
+        Target {
+            name: "-x",
+            value: -x,
+        },
         // Stepping stones toward sqrt: sqrt(x) = exp(ln(x)/2), so we need
         // ln(x)/2 as a leaf. Getting there requires ln(ln(ln(x))) because
         // division in EML is `eml(eml(ln(ln(a)), b), 1) = a/b`, so dividing
         // ln(x) by 2 needs ln(ln(ln(x))).
-        Target { name: "ln(ln(x))", value: x.ln().ln() },
-        Target { name: "ln(ln(ln(x)))", value: x.ln().ln().ln() },
-        Target { name: "ln(x)/2", value: x.ln() / two },
+        Target {
+            name: "ln(ln(x))",
+            value: x.ln().ln(),
+        },
+        Target {
+            name: "ln(ln(ln(x)))",
+            value: x.ln().ln().ln(),
+        },
+        Target {
+            name: "ln(x)/2",
+            value: x.ln() / two,
+        },
         // Stepping stones toward Euler-form sin/cos
-        Target { name: "exp(-x)", value: (-x).exp() },
-        Target { name: "exp(i*x)", value: (i * x).exp() },
-        Target { name: "exp(-i*x)", value: (-i * x).exp() },
-        Target { name: "i*x", value: i * x },
-        Target { name: "-i*x", value: -i * x },
-        Target { name: "x/2", value: x / two },
-        Target { name: "2*sin(x)", value: two * x.sin() },
-        Target { name: "2*cos(x)", value: two * x.cos() },
-        Target { name: "exp(ix)-exp(-ix)", value: (i * x).exp() - (-i * x).exp() },
-        Target { name: "exp(ix)+exp(-ix)", value: (i * x).exp() + (-i * x).exp() },
-        Target { name: "2i*sin(x)", value: C::new(0.0, 2.0) * x.sin() },
-        Target { name: "i*sin(x)", value: i * x.sin() },
-        Target { name: "-i*sin(x)", value: -i * x.sin() },
+        Target {
+            name: "exp(-x)",
+            value: (-x).exp(),
+        },
+        Target {
+            name: "exp(i*x)",
+            value: (i * x).exp(),
+        },
+        Target {
+            name: "exp(-i*x)",
+            value: (-i * x).exp(),
+        },
+        Target {
+            name: "i*x",
+            value: i * x,
+        },
+        Target {
+            name: "-i*x",
+            value: -i * x,
+        },
+        Target {
+            name: "x/2",
+            value: x / two,
+        },
+        Target {
+            name: "2*sin(x)",
+            value: two * x.sin(),
+        },
+        Target {
+            name: "2*cos(x)",
+            value: two * x.cos(),
+        },
+        Target {
+            name: "exp(ix)-exp(-ix)",
+            value: (i * x).exp() - (-i * x).exp(),
+        },
+        Target {
+            name: "exp(ix)+exp(-ix)",
+            value: (i * x).exp() + (-i * x).exp(),
+        },
+        Target {
+            name: "2i*sin(x)",
+            value: C::new(0.0, 2.0) * x.sin(),
+        },
+        Target {
+            name: "i*sin(x)",
+            value: i * x.sin(),
+        },
+        Target {
+            name: "-i*sin(x)",
+            value: -i * x.sin(),
+        },
         // Division stepping stones: ln and ln(ln) of the pre-sin/cos values.
         // Once ln(ln(2i*sin(x))) is a leaf, sin(x) becomes a 5-node tree.
-        Target { name: "ln(2i*sin(x))", value: (C::new(0.0, 2.0) * x.sin()).ln() },
-        Target { name: "ln(ln(2i*sin(x)))", value: (C::new(0.0, 2.0) * x.sin()).ln().ln() },
-        Target { name: "ln(2*cos(x))", value: (two * x.cos()).ln() },
-        Target { name: "ln(ln(2*cos(x)))", value: (two * x.cos()).ln().ln() },
+        Target {
+            name: "ln(2i*sin(x))",
+            value: (C::new(0.0, 2.0) * x.sin()).ln(),
+        },
+        Target {
+            name: "ln(ln(2i*sin(x)))",
+            value: (C::new(0.0, 2.0) * x.sin()).ln().ln(),
+        },
+        Target {
+            name: "ln(2*cos(x))",
+            value: (two * x.cos()).ln(),
+        },
+        Target {
+            name: "ln(ln(2*cos(x)))",
+            value: (two * x.cos()).ln().ln(),
+        },
         // The three we're chasing
-        Target { name: "sqrt(x)", value: x.sqrt() },
-        Target { name: "sin(x)", value: x.sin() },
-        Target { name: "cos(x)", value: x.cos() },
+        Target {
+            name: "sqrt(x)",
+            value: x.sqrt(),
+        },
+        Target {
+            name: "sin(x)",
+            value: x.sin(),
+        },
+        Target {
+            name: "cos(x)",
+            value: x.cos(),
+        },
     ]
 }
 
@@ -246,8 +330,7 @@ fn run() {
             .map(|(n, val)| Leaf::constant(*n, *val))
             .collect(),
     );
-    v.leaves
-        .push(Leaf::variable("x", C::new(TEST_POINT, 0.0)));
+    v.leaves.push(Leaf::variable("x", C::new(TEST_POINT, 0.0)));
     println!("  fresh pool: {} leaves", v.leaves.len());
 
     let fn_targets = function_targets();
@@ -320,14 +403,19 @@ fn run() {
     // if it was found in either stage.
     println!();
     println!("--- Remaining-target scoreboard ---");
-    let const_names: std::collections::HashSet<&str> =
-        const_discoveries.iter().map(|d| d.target_name.as_str()).collect();
+    let const_names: std::collections::HashSet<&str> = const_discoveries
+        .iter()
+        .map(|d| d.target_name.as_str())
+        .collect();
     let remaining = [
         "pi", "pi/2", "2pi", "i*pi", "i", "-i", "sqrt(x)", "sin(x)", "cos(x)",
     ];
     for name in remaining {
         if const_names.contains(name) {
-            let d = const_discoveries.iter().find(|d| d.target_name == name).unwrap();
+            let d = const_discoveries
+                .iter()
+                .find(|d| d.target_name == name)
+                .unwrap();
             println!(
                 "  {:<10} ✓ CRACKED (Stage A constant, expanded size {})",
                 name, d.expanded_size

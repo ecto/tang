@@ -70,11 +70,7 @@ impl Coordinator {
 
         let stream = crate::transport::QuicStream::new(send, recv);
         let transport = crate::transport::tarpc_transport(stream);
-        let client = WorkerServiceClient::new(
-            tarpc::client::Config::default(),
-            transport,
-        )
-        .spawn();
+        let client = WorkerServiceClient::new(tarpc::client::Config::default(), transport).spawn();
 
         self.workers.write().await.insert(node_id, client);
         Ok(())
@@ -125,11 +121,7 @@ impl Coordinator {
     }
 
     /// Compile a graph on a specific worker.
-    pub async fn compile_on(
-        &self,
-        node_id: NodeId,
-        graph: &WireGraph,
-    ) -> Result<u64, MeshError> {
+    pub async fn compile_on(&self, node_id: NodeId, graph: &WireGraph) -> Result<u64, MeshError> {
         let task_id = self.next_task_id();
         let workers = self.workers.read().await;
 
@@ -193,18 +185,12 @@ impl Coordinator {
     }
 
     /// Sync parameters to all workers.
-    pub async fn sync_params_all(
-        &self,
-        params: Vec<(String, Vec<f32>)>,
-    ) -> Result<(), MeshError> {
+    pub async fn sync_params_all(&self, params: Vec<(String, Vec<f32>)>) -> Result<(), MeshError> {
         let workers = self.workers.read().await;
 
         for (node_id, client) in workers.iter() {
             let client = client.clone();
-            match client
-                .sync_params(context::current(), params.clone())
-                .await
-            {
+            match client.sync_params(context::current(), params.clone()).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => warn!("sync_params failed on {node_id}: {e}"),
                 Err(e) => warn!("rpc failed to {node_id}: {e}"),

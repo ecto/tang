@@ -39,10 +39,14 @@ impl Camera {
     ) -> Self {
         let view_matrix = look_at_rh(eye, target, up);
         let proj_matrix = perspective(
-            intrinsics.fx, intrinsics.fy,
-            intrinsics.cx, intrinsics.cy,
-            width, height,
-            near, far,
+            intrinsics.fx,
+            intrinsics.fy,
+            intrinsics.cx,
+            intrinsics.cy,
+            width,
+            height,
+            near,
+            far,
         );
 
         Self {
@@ -85,27 +89,56 @@ fn look_at_rh(eye: [f32; 3], target: [f32; 3], up: [f32; 3]) -> [f32; 16] {
     let u = cross(s, f);
 
     [
-        s[0], u[0], -f[0], 0.0,
-        s[1], u[1], -f[1], 0.0,
-        s[2], u[2], -f[2], 0.0,
-        -dot(s, eye), -dot(u, eye), dot(f, eye), 1.0,
+        s[0],
+        u[0],
+        -f[0],
+        0.0,
+        s[1],
+        u[1],
+        -f[1],
+        0.0,
+        s[2],
+        u[2],
+        -f[2],
+        0.0,
+        -dot(s, eye),
+        -dot(u, eye),
+        dot(f, eye),
+        1.0,
     ]
 }
 
 /// Perspective projection from intrinsics (column-major).
 fn perspective(
-    fx: f32, fy: f32, cx: f32, cy: f32,
-    width: u32, height: u32,
-    near: f32, far: f32,
+    fx: f32,
+    fy: f32,
+    cx: f32,
+    cy: f32,
+    width: u32,
+    height: u32,
+    near: f32,
+    far: f32,
 ) -> [f32; 16] {
     let w = width as f32;
     let h = height as f32;
 
     [
-        2.0 * fx / w, 0.0, 0.0, 0.0,
-        0.0, 2.0 * fy / h, 0.0, 0.0,
-        1.0 - 2.0 * cx / w, 2.0 * cy / h - 1.0, -(far + near) / (far - near), -1.0,
-        0.0, 0.0, -2.0 * far * near / (far - near), 0.0,
+        2.0 * fx / w,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        2.0 * fy / h,
+        0.0,
+        0.0,
+        1.0 - 2.0 * cx / w,
+        2.0 * cy / h - 1.0,
+        -(far + near) / (far - near),
+        -1.0,
+        0.0,
+        0.0,
+        -2.0 * far * near / (far - near),
+        0.0,
     ]
 }
 

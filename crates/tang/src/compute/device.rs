@@ -63,12 +63,7 @@ pub trait ComputeDevice: Send {
     ) -> Self::Buffer;
 
     /// Row-wise softmax: each of `n_rows` rows of length `row_len`.
-    fn softmax(
-        &self,
-        data: &Self::Buffer,
-        n_rows: usize,
-        row_len: usize,
-    ) -> Self::Buffer;
+    fn softmax(&self, data: &Self::Buffer, n_rows: usize, row_len: usize) -> Self::Buffer;
 
     /// RMS normalization: x * weight / sqrt(mean(x^2) + eps).
     fn rms_norm(
@@ -90,12 +85,7 @@ pub trait ComputeDevice: Send {
     ) -> Self::Buffer;
 
     /// Reduce sum along an axis.
-    fn reduce_sum(
-        &self,
-        data: &Self::Buffer,
-        shape: &[usize],
-        axis: usize,
-    ) -> Self::Buffer;
+    fn reduce_sum(&self, data: &Self::Buffer, shape: &[usize], axis: usize) -> Self::Buffer;
 
     /// Causal self-attention with GQA: Q,K,V → output.
     /// Q: [seq_len, n_heads * head_dim], K,V: [seq_len, n_kv_heads * head_dim].
@@ -133,12 +123,7 @@ pub trait ComputeDevice: Send {
     ) -> Self::Buffer;
 
     /// Transpose a 2D matrix on device: [rows, cols] → [cols, rows].
-    fn transpose_2d(
-        &self,
-        buf: &Self::Buffer,
-        rows: usize,
-        cols: usize,
-    ) -> Self::Buffer;
+    fn transpose_2d(&self, buf: &Self::Buffer, rows: usize, cols: usize) -> Self::Buffer;
 
     /// Backward pass for row-wise softmax.
     ///
@@ -222,7 +207,13 @@ pub trait ComputeDevice: Send {
     /// Broadcast bias addition on device: out[i] = matrix[i] + bias[i % dim].
     ///
     /// `numel` is total elements in matrix, `dim` is the bias length.
-    fn bias_add(&self, matrix: &Self::Buffer, bias: &Self::Buffer, numel: usize, dim: usize) -> Self::Buffer {
+    fn bias_add(
+        &self,
+        matrix: &Self::Buffer,
+        bias: &Self::Buffer,
+        numel: usize,
+        dim: usize,
+    ) -> Self::Buffer {
         let mat_data = self.download(matrix);
         let bias_data = self.download(bias);
         let mut out = mat_data;

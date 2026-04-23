@@ -81,14 +81,24 @@ pub use backward::{forward_backward_gpu, fused_forward_backward, FusedKernel};
 pub use buffer::GpuBuffer;
 pub use device::{GpuDevice, GpuError};
 pub use kernel::KernelCache;
-pub use llm::{GpuCausalAttention, GpuEmbedding, GpuInterleavedRoPE, GpuKVCache, GpuRMSNorm, GpuRoPE, GpuSwiGLU, GpuTrainTransformerBlock, GpuTrainTransformer, kv_attention_fused, swiglu_fused_pub, interleaved_rope_backward};
+pub use llm::{
+    interleaved_rope_backward, kv_attention_fused, swiglu_fused_pub, GpuCausalAttention,
+    GpuEmbedding, GpuInterleavedRoPE, GpuKVCache, GpuRMSNorm, GpuRoPE, GpuSwiGLU,
+    GpuTrainTransformer, GpuTrainTransformerBlock,
+};
 pub use module::{GpuAdam, GpuLinear, GpuModule, GpuTrainModule};
-pub use nn::{add_tensors, bias_add, gelu, relu, relu_backward, softmax, GpuAttention, GpuLayerNorm, GpuTransformerBlock};
-pub use train::{gpu_cross_entropy_loss, gpu_mse_loss, GradScaler, GpuDataLoader, GpuReLULayer, GpuSequential, GpuTanhLayer, GpuTrainer};
+pub use nn::{
+    add_tensors, bias_add, gelu, relu, relu_backward, softmax, GpuAttention, GpuLayerNorm,
+    GpuTransformerBlock,
+};
 pub use realize::{map_elementwise, map_elementwise_multi};
 pub use reduce::{reduce_max, reduce_mean, reduce_sum, reduce_sum_all};
 pub use safetensors::{load_safetensors, save_safetensors};
 pub use tensor::GpuTensor;
+pub use train::{
+    gpu_cross_entropy_loss, gpu_mse_loss, GpuDataLoader, GpuReLULayer, GpuSequential, GpuTanhLayer,
+    GpuTrainer, GradScaler,
+};
 
 #[cfg(test)]
 mod tests {
@@ -265,7 +275,11 @@ mod tests {
         assert!((row1_sum - 1.0).abs() < 1e-5, "row1 sum = {row1_sum}");
         assert!((row2_sum - 1.0).abs() < 1e-5, "row2 sum = {row2_sum}");
         // Row 2: token 0 should dominate
-        assert!(result[3] > 0.99, "row2[0] should dominate, got {}", result[3]);
+        assert!(
+            result[3] > 0.99,
+            "row2[0] should dominate, got {}",
+            result[3]
+        );
     }
 
     #[test]

@@ -65,7 +65,10 @@ fn main() {
     for shape_idx in 0..n_shapes as u32 {
         gpu.dispatch_shape(shape_idx, TARGET_THRESHOLD, CHUNK_THREADS, LIMIT_EXP);
     }
-    println!("  all dispatches submitted  [{:.2}s]", t0.elapsed().as_secs_f64());
+    println!(
+        "  all dispatches submitted  [{:.2}s]",
+        t0.elapsed().as_secs_f64()
+    );
 
     // ---- Read back hits ----
     let t0 = Instant::now();

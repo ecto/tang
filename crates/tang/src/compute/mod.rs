@@ -18,13 +18,12 @@ pub mod metal;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 
+pub use crate::expr::codegen::Dialect;
 pub use cpu::CpuDevice;
 pub use device::{ComputeBuffer, ComputeDevice};
-pub use crate::expr::codegen::Dialect;
 
 pub use modules::{
-    Embedding, EmbeddingCache, InterleavedRoPE, KVCache, Linear, LinearCache,
-    RMSNorm, RMSNormCache,
+    Embedding, EmbeddingCache, InterleavedRoPE, KVCache, Linear, LinearCache, RMSNorm, RMSNormCache,
 };
 pub use ops::{add_tensors, bias_add, causal_attention_backward, swiglu_backward, swiglu_fused};
 pub use tensor::ComputeTensor;

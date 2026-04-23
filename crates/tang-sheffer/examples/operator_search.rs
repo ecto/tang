@@ -239,7 +239,10 @@ fn main() {
     ranked.sort_by_key(ranking_key);
 
     println!();
-    println!("--- Top {} operators by (coverage + 2·const-free, size, growth) ---", TOP_K);
+    println!(
+        "--- Top {} operators by (coverage + 2·const-free, size, growth) ---",
+        TOP_K
+    );
     println!(
         "  {:<4} {:<38} {:>4} {:>6} {:>6} {:>8} {:>10}",
         "rank", "operator", "size", "{1,x}", "{x}", "ln(x)", "growth"
@@ -263,7 +266,10 @@ fn main() {
     }
 
     // ---- Unique-target honour roll ----
-    let mut uniques: Vec<&Scorecard> = ranked.iter().filter(|s| !s.unique_targets.is_empty()).collect();
+    let mut uniques: Vec<&Scorecard> = ranked
+        .iter()
+        .filter(|s| !s.unique_targets.is_empty())
+        .collect();
     uniques.sort_by_key(|s| -(s.unique_targets.len() as i64));
     println!();
     println!("--- Unique-target honour roll (reaches what EML∪EDL∪PowSkew cannot) ---");

@@ -289,7 +289,7 @@ mod tests {
             "h1_act",
             "out",
             &vec![0.0; 128 * 10],
-            Some(&vec![0.0; 10]),
+            Some(&[0.0; 10]),
             128,
             10,
         );
@@ -314,7 +314,14 @@ mod tests {
 
     #[test]
     fn op_type_roundtrip() {
-        let ops = vec!["Add", "MatMul", "Relu", "Softmax", "BatchNormalization", "LSTM"];
+        let ops = vec![
+            "Add",
+            "MatMul",
+            "Relu",
+            "Softmax",
+            "BatchNormalization",
+            "LSTM",
+        ];
         for name in ops {
             let op = OnnxOp::from_op_type(name);
             assert_eq!(op.op_type(), name);

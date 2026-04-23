@@ -72,7 +72,10 @@ pub fn preprocess(
     };
     let extracted = frames::extract_frames(video_path, &frames_dir, &frame_config)
         .map_err(|e| PreprocessError::Step("frame extraction", e.to_string()))?;
-    println!("       {} frames extracted ({}x{})", extracted.count, extracted.dimensions.0, extracted.dimensions.1);
+    println!(
+        "       {} frames extracted ({}x{})",
+        extracted.count, extracted.dimensions.0, extracted.dimensions.1
+    );
 
     // Step 2: Detect landmarks
     println!("[2/6] Detecting face landmarks...");
@@ -80,10 +83,17 @@ pub fn preprocess(
     run_python(
         &config.python,
         &scripts_dir.join("detect_landmarks.py"),
-        &[frames_dir.to_str().unwrap(), landmarks_path.to_str().unwrap()],
+        &[
+            frames_dir.to_str().unwrap(),
+            landmarks_path.to_str().unwrap(),
+        ],
     )?;
     let landmarks = LandmarkSequence::load(&landmarks_path)?;
-    println!("       {}/{} frames with faces", landmarks.detected_count(), extracted.count);
+    println!(
+        "       {}/{} frames with faces",
+        landmarks.detected_count(),
+        extracted.count
+    );
 
     // Step 3: Segment faces
     println!("[3/6] Segmenting faces...");
@@ -103,10 +113,17 @@ pub fn preprocess(
     run_python(
         &config.python,
         &scripts_dir.join("track_face.py"),
-        &[landmarks_path.to_str().unwrap(), tracking_path.to_str().unwrap()],
+        &[
+            landmarks_path.to_str().unwrap(),
+            tracking_path.to_str().unwrap(),
+        ],
     )?;
     let tracking = TrackingSequence::load(&tracking_path)?;
-    println!("       {}/{} frames tracked", tracking.valid_count(), extracted.count);
+    println!(
+        "       {}/{} frames tracked",
+        tracking.valid_count(),
+        extracted.count
+    );
 
     // Step 5: Extract audio features
     println!("[5/6] Extracting audio features...");
@@ -121,7 +138,10 @@ pub fn preprocess(
         ],
     )?;
     let audio = AudioFeatures::load(&audio_path)?;
-    println!("       {} audio frames ({}D features)", audio.num_frames, audio.feature_dim);
+    println!(
+        "       {} audio frames ({}D features)",
+        audio.num_frames, audio.feature_dim
+    );
 
     // Step 6: Background removal
     println!("[6/6] Removing backgrounds...");
@@ -134,7 +154,10 @@ pub fn preprocess(
     )?;
     println!("       {} foreground face images", count);
 
-    println!("\nPreprocessing complete! Output in {}", output_dir.display());
+    println!(
+        "\nPreprocessing complete! Output in {}",
+        output_dir.display()
+    );
 
     Ok(PreprocessedData {
         frames: extracted,

@@ -1,7 +1,7 @@
 use super::Rng;
-use alloc::vec::Vec;
-use crate::Scalar;
 use crate::tensor::{Shape, Tensor};
+use crate::Scalar;
+use alloc::vec::Vec;
 
 /// A trainable parameter — a tensor with an associated gradient buffer.
 pub struct Parameter<S: Scalar> {

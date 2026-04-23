@@ -79,10 +79,7 @@ where
     }
 
     /// Run the training loop. Returns per-epoch average loss.
-    pub fn fit<D: Dataset<S>>(
-        &mut self,
-        loader: &mut DataLoader<'_, S, D>,
-    ) -> Vec<f64> {
+    pub fn fit<D: Dataset<S>>(&mut self, loader: &mut DataLoader<'_, S, D>) -> Vec<f64> {
         let mut losses = Vec::with_capacity(self.num_epochs);
 
         for epoch in 0..self.num_epochs {
@@ -133,7 +130,7 @@ where
 mod tests {
     use super::*;
     use crate::data::TensorDataset;
-    use crate::{Linear, ModuleAdam, Sequential, Tanh, mse_loss, mse_loss_grad};
+    use crate::{mse_loss, mse_loss_grad, Linear, ModuleAdam, Sequential, Tanh};
     use alloc::{boxed::Box, vec};
     use tang_tensor::Shape;
 
@@ -153,13 +150,11 @@ mod tests {
             Box::new(Linear::new(8, 1, 456)),
         ]);
 
-        let losses = Trainer::new(
-            &mut model,
-            ModuleAdam::new(0.01),
-            |p, t| (mse_loss(p, t), mse_loss_grad(p, t)),
-        )
-            .epochs(200)
-            .fit(&mut loader);
+        let losses = Trainer::new(&mut model, ModuleAdam::new(0.01), |p, t| {
+            (mse_loss(p, t), mse_loss_grad(p, t))
+        })
+        .epochs(200)
+        .fit(&mut loader);
 
         assert_eq!(losses.len(), 200);
         assert!(

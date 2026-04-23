@@ -1,8 +1,8 @@
 use super::Parameter;
+use crate::tensor::Tensor;
+use crate::Scalar;
 use alloc::string::String;
 use alloc::vec::Vec;
-use crate::Scalar;
-use crate::tensor::Tensor;
 
 /// Trait for neural network modules.
 ///

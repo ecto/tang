@@ -1,6 +1,6 @@
-use alloc::vec::Vec;
-use crate::Scalar;
 use crate::tensor::{Shape, Tensor};
+use crate::Scalar;
+use alloc::vec::Vec;
 
 /// A dataset of input-target pairs.
 pub trait Dataset<S: Scalar> {

@@ -1,6 +1,6 @@
 use super::{DMat, DVec};
-use alloc::vec::Vec;
 use crate::Scalar;
+use alloc::vec::Vec;
 
 /// QR decomposition via Householder reflections: A = Q * R
 pub struct Qr<S> {

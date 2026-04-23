@@ -57,10 +57,10 @@ mod trainer;
 
 pub use data::{DataLoader, Dataset, TensorDataset};
 pub use layers::{
-    AdaptiveAvgPool2d, AvgPool2d, BatchNorm2d, Conv1d, Conv2d, ConvTranspose2d, Dropout,
-    Embedding, GroupNorm, GroupedQueryAttention, InstanceNorm, KVCache, LayerNorm, Linear, LoRA,
-    LSTM, MaxPool2d, MultiHeadAttention, RMSNorm, ReLU, RotaryEmbedding, Sequential, SiLU,
-    SlidingWindowAttention, SwiGLU, Tanh, TransformerBlock, Upsample, UpsampleMode, GRU, GELU,
+    AdaptiveAvgPool2d, AvgPool2d, BatchNorm2d, Conv1d, Conv2d, ConvTranspose2d, Dropout, Embedding,
+    GroupNorm, GroupedQueryAttention, InstanceNorm, KVCache, LayerNorm, Linear, LoRA, MaxPool2d,
+    MultiHeadAttention, RMSNorm, ReLU, RotaryEmbedding, Sequential, SiLU, SlidingWindowAttention,
+    SwiGLU, Tanh, TransformerBlock, Upsample, UpsampleMode, GELU, GRU, LSTM,
 };
 pub use loss::{
     cross_entropy_loss, cross_entropy_loss_grad, huber_loss, mse_loss, mse_loss_grad,
@@ -70,7 +70,7 @@ pub use module::Module;
 pub use optimizer::{ModuleAdam, ModuleSgd, Optimizer};
 pub use parameter::Parameter;
 pub use rng::Rng;
-pub use scheduler::{CosineAnnealingLr, ConstantLr, Scheduler, StepLr, WarmupCosine};
+pub use scheduler::{ConstantLr, CosineAnnealingLr, Scheduler, StepLr, WarmupCosine};
 pub use trainer::LossFn;
 // Trainer now takes a scalar type parameter: Trainer<'a, S, M, O>
 pub use trainer::Trainer;

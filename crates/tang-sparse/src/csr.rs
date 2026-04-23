@@ -27,7 +27,7 @@ impl<S: Scalar> CsrMatrix<S> {
             for k in start..end {
                 sum += self.values[k] * x[self.col_indices[k]];
             }
-            y[i] = y[i] + sum;
+            y[i] += sum;
         }
     }
 

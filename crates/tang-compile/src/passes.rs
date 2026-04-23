@@ -174,15 +174,21 @@ impl OptimizationPass for FoldConstants {
                 remap[i] = match nodes[i] {
                     Node::Lit(bits) => new_g.lit(f64::from_bits(bits)),
                     Node::Var(v) => new_g.var(v),
-                    Node::Add(a, b) => new_g.add(remap[a.index() as usize], remap[b.index() as usize]),
-                    Node::Mul(a, b) => new_g.mul(remap[a.index() as usize], remap[b.index() as usize]),
+                    Node::Add(a, b) => {
+                        new_g.add(remap[a.index() as usize], remap[b.index() as usize])
+                    }
+                    Node::Mul(a, b) => {
+                        new_g.mul(remap[a.index() as usize], remap[b.index() as usize])
+                    }
                     Node::Neg(a) => new_g.neg(remap[a.index() as usize]),
                     Node::Recip(a) => new_g.recip(remap[a.index() as usize]),
                     Node::Sqrt(a) => new_g.sqrt(remap[a.index() as usize]),
                     Node::Sin(a) => new_g.sin(remap[a.index() as usize]),
                     Node::Exp2(a) => new_g.exp2(remap[a.index() as usize]),
                     Node::Log2(a) => new_g.log2(remap[a.index() as usize]),
-                    Node::Atan2(a, b) => new_g.atan2(remap[a.index() as usize], remap[b.index() as usize]),
+                    Node::Atan2(a, b) => {
+                        new_g.atan2(remap[a.index() as usize], remap[b.index() as usize])
+                    }
                     Node::Select(c, a, b) => new_g.select(
                         remap[c.index() as usize],
                         remap[a.index() as usize],
@@ -192,10 +198,7 @@ impl OptimizationPass for FoldConstants {
             }
         }
 
-        let new_outputs: Vec<ExprId> = outputs
-            .iter()
-            .map(|o| remap[o.index() as usize])
-            .collect();
+        let new_outputs: Vec<ExprId> = outputs.iter().map(|o| remap[o.index() as usize]).collect();
 
         (new_g, new_outputs)
     }
@@ -228,7 +231,12 @@ impl OptimizationPass for EliminateDeadCode {
                     stack.push(a.index() as usize);
                     stack.push(b.index() as usize);
                 }
-                Node::Neg(a) | Node::Recip(a) | Node::Sqrt(a) | Node::Sin(a) | Node::Exp2(a) | Node::Log2(a) => {
+                Node::Neg(a)
+                | Node::Recip(a)
+                | Node::Sqrt(a)
+                | Node::Sin(a)
+                | Node::Exp2(a)
+                | Node::Log2(a) => {
                     stack.push(a.index() as usize);
                 }
                 Node::Select(c, a, b) => {
@@ -258,7 +266,9 @@ impl OptimizationPass for EliminateDeadCode {
                 Node::Sin(a) => new_g.sin(remap[a.index() as usize]),
                 Node::Exp2(a) => new_g.exp2(remap[a.index() as usize]),
                 Node::Log2(a) => new_g.log2(remap[a.index() as usize]),
-                Node::Atan2(a, b) => new_g.atan2(remap[a.index() as usize], remap[b.index() as usize]),
+                Node::Atan2(a, b) => {
+                    new_g.atan2(remap[a.index() as usize], remap[b.index() as usize])
+                }
                 Node::Select(c, a, b) => new_g.select(
                     remap[c.index() as usize],
                     remap[a.index() as usize],
@@ -267,10 +277,7 @@ impl OptimizationPass for EliminateDeadCode {
             };
         }
 
-        let new_outputs: Vec<ExprId> = outputs
-            .iter()
-            .map(|o| remap[o.index() as usize])
-            .collect();
+        let new_outputs: Vec<ExprId> = outputs.iter().map(|o| remap[o.index() as usize]).collect();
 
         (new_g, new_outputs)
     }

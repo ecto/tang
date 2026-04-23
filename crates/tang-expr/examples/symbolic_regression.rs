@@ -101,7 +101,9 @@ fn random_expr(depth: usize, rng: &mut Lcg) -> Expr {
     if depth == 0 || (depth < 3 && rng.uniform() < 0.3) {
         return match rng.range(3) {
             0 => Expr::X,
-            1 => Expr::Lit((rng.uniform() * 4.0 - 2.0) * 10.0_f64.powi(-((rng.uniform() * 2.0) as i32))),
+            1 => Expr::Lit(
+                (rng.uniform() * 4.0 - 2.0) * 10.0_f64.powi(-((rng.uniform() * 2.0) as i32)),
+            ),
             _ => Expr::X,
         };
     }
@@ -221,12 +223,14 @@ fn expr_from_graph(g: &ExprGraph, id: ExprId) -> Expr {
                 Expr::Lit(v)
             }
         }
-        tang_expr::node::Node::Add(a, b) => {
-            Expr::Add(Box::new(expr_from_graph(g, a)), Box::new(expr_from_graph(g, b)))
-        }
-        tang_expr::node::Node::Mul(a, b) => {
-            Expr::Mul(Box::new(expr_from_graph(g, a)), Box::new(expr_from_graph(g, b)))
-        }
+        tang_expr::node::Node::Add(a, b) => Expr::Add(
+            Box::new(expr_from_graph(g, a)),
+            Box::new(expr_from_graph(g, b)),
+        ),
+        tang_expr::node::Node::Mul(a, b) => Expr::Mul(
+            Box::new(expr_from_graph(g, a)),
+            Box::new(expr_from_graph(g, b)),
+        ),
         tang_expr::node::Node::Neg(a) => Expr::Neg(Box::new(expr_from_graph(g, a))),
         tang_expr::node::Node::Sin(a) => Expr::Sin(Box::new(expr_from_graph(g, a))),
         // For operations we don't represent in our AST, just evaluate as literal
@@ -382,12 +386,19 @@ fn main() {
         let exact = target(x);
         println!(
             "  f({:>5.1}) = {:>8.4}  (predicted: {:>8.4}, error: {:>8.4})",
-            x, exact, pred, (pred - exact).abs()
+            x,
+            exact,
+            pred,
+            (pred - exact).abs()
         );
     }
 
     // Symbolic derivative via ExprGraph
     let dx = g.diff(simplified, 0);
     let dx = g.simplify(dx);
-    println!("\nsymbolic derivative: d/dx [{}] = {}", expr_str, g.fmt_expr(dx));
+    println!(
+        "\nsymbolic derivative: d/dx [{}] = {}",
+        expr_str,
+        g.fmt_expr(dx)
+    );
 }

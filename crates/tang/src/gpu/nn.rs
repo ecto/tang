@@ -33,7 +33,12 @@ impl GpuLayerNorm {
     ///
     /// Uses a single WGSL kernel: one workgroup per group (row),
     /// shared memory reductions for mean and variance.
-    pub fn forward(&self, device: &GpuDevice, cache: &mut KernelCache, input: &GpuTensor) -> GpuTensor {
+    pub fn forward(
+        &self,
+        device: &GpuDevice,
+        cache: &mut KernelCache,
+        input: &GpuTensor,
+    ) -> GpuTensor {
         let n_groups = input.numel() / self.dim;
         let out = GpuTensor::uninit(device, input.shape());
 
@@ -404,7 +409,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-    cache.dispatch_rr_w(device, wgsl, &matrix.buffer, &bias.buffer, &out.buffer, &[numel, cols as u32, 0, 0]);
+    cache.dispatch_rr_w(
+        device,
+        wgsl,
+        &matrix.buffer,
+        &bias.buffer,
+        &out.buffer,
+        &[numel, cols as u32, 0, 0],
+    );
     out
 }
 
@@ -451,7 +463,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-    cache.dispatch_rr_w(device, wgsl, &input.buffer, &grad_output.buffer, &out.buffer, &[numel, 0, 0, 0]);
+    cache.dispatch_rr_w(
+        device,
+        wgsl,
+        &input.buffer,
+        &grad_output.buffer,
+        &out.buffer,
+        &[numel, 0, 0, 0],
+    );
     out
 }
 
@@ -581,7 +600,12 @@ impl GpuTransformerBlock {
 }
 
 /// Element-wise tensor addition on GPU.
-pub fn add_tensors(device: &GpuDevice, cache: &mut KernelCache, a: &GpuTensor, b: &GpuTensor) -> GpuTensor {
+pub fn add_tensors(
+    device: &GpuDevice,
+    cache: &mut KernelCache,
+    a: &GpuTensor,
+    b: &GpuTensor,
+) -> GpuTensor {
     assert_eq!(a.numel(), b.numel(), "add_tensors: shape mismatch");
     let numel = a.numel() as u32;
     let out = GpuTensor::uninit(device, a.shape());
@@ -608,6 +632,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-    cache.dispatch_rr_w(device, wgsl, &a.buffer, &b.buffer, &out.buffer, &[numel, 0, 0, 0]);
+    cache.dispatch_rr_w(
+        device,
+        wgsl,
+        &a.buffer,
+        &b.buffer,
+        &out.buffer,
+        &[numel, 0, 0, 0],
+    );
     out
 }

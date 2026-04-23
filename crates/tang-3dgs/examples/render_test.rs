@@ -55,9 +55,13 @@ fn main() {
     img.save("test_render.png").unwrap();
 
     let visible = output.ctx.radii.iter().filter(|&&r| r > 0).count();
-    println!("done! {} visible gaussians, saved to test_render.png", visible);
+    println!(
+        "done! {} visible gaussians, saved to test_render.png",
+        visible
+    );
     println!(
         "avg transmittance: {:.3}",
-        output.ctx.final_transmittance.iter().sum::<f32>() / output.ctx.final_transmittance.len() as f32
+        output.ctx.final_transmittance.iter().sum::<f32>()
+            / output.ctx.final_transmittance.len() as f32
     );
 }

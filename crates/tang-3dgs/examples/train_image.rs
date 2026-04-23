@@ -22,14 +22,22 @@ fn main() {
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
-            "--iters" => { iters = args[i + 1].parse().unwrap(); i += 2; }
-            "--num" => { num_gaussians = args[i + 1].parse().unwrap(); i += 2; }
+            "--iters" => {
+                iters = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--num" => {
+                num_gaussians = args[i + 1].parse().unwrap();
+                i += 2;
+            }
             _ => i += 1,
         }
     }
 
     // Load target image
-    let img = image::open(input_path).expect("failed to open image").to_rgb8();
+    let img = image::open(input_path)
+        .expect("failed to open image")
+        .to_rgb8();
     let (w, h) = (img.width(), img.height());
     println!("loaded {}x{} image: {}", w, h, input_path);
 
@@ -40,7 +48,10 @@ fn main() {
 
     // Estimate background color from image corners
     let bg = estimate_bg_color(&gt_image, w as usize, h as usize);
-    println!("estimated bg color: [{:.2}, {:.2}, {:.2}]", bg[0], bg[1], bg[2]);
+    println!(
+        "estimated bg color: [{:.2}, {:.2}, {:.2}]",
+        bg[0], bg[1], bg[2]
+    );
 
     let config = RasterConfig {
         width: w,
@@ -118,12 +129,23 @@ fn main() {
             pixels_with_contrib, total_contrib, max_contrib
         );
         // Check tile ranges
-        let nonempty_tiles = output.ctx.tile_ranges.iter().filter(|r| r[0] != r[1]).count();
-        let total_tile_entries: u64 = output.ctx.tile_ranges.iter()
-            .map(|r| (r[1] - r[0]) as u64).sum();
+        let nonempty_tiles = output
+            .ctx
+            .tile_ranges
+            .iter()
+            .filter(|r| r[0] != r[1])
+            .count();
+        let total_tile_entries: u64 = output
+            .ctx
+            .tile_ranges
+            .iter()
+            .map(|r| (r[1] - r[0]) as u64)
+            .sum();
         println!(
             "debug: nonempty_tiles={}/{} total_tile_entries={}",
-            nonempty_tiles, output.ctx.tile_ranges.len(), total_tile_entries
+            nonempty_tiles,
+            output.ctx.tile_ranges.len(),
+            total_tile_entries
         );
 
         // Print a few gaussian projections

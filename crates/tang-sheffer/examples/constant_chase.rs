@@ -14,9 +14,7 @@
 use std::collections::HashSet;
 use std::f64::consts::E;
 
-use tang_sheffer::{
-    stepping_stone_constants, Edl, Eml, Leaf, Operator, Verifier, C,
-};
+use tang_sheffer::{stepping_stone_constants, Edl, Eml, Leaf, Operator, Verifier, C};
 
 const BUDGET: usize = 4;
 const ITERATIONS: usize = 10;
@@ -46,12 +44,8 @@ fn main() {
     for (label, op, leaves) in runs {
         println!("-- {} --", label);
         let mut v = Verifier::new(leaves);
-        let discoveries = v.bootstrap_with_progress(
-            op.as_ref(),
-            &targets,
-            BUDGET,
-            ITERATIONS,
-            |p| {
+        let discoveries =
+            v.bootstrap_with_progress(op.as_ref(), &targets, BUDGET, ITERATIONS, |p| {
                 let new = if p.new_targets.is_empty() {
                     "—".to_string()
                 } else {
@@ -67,8 +61,7 @@ fn main() {
                     new,
                     p.iter_elapsed.as_secs_f64(),
                 );
-            },
-        );
+            });
 
         println!();
         println!("  final discoveries ({}):", discoveries.len());

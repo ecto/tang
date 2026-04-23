@@ -1,5 +1,5 @@
-use alloc::collections::VecDeque;
 use crate::la::DVec;
+use alloc::collections::VecDeque;
 
 /// Limited-memory BFGS optimizer.
 pub struct Lbfgs {

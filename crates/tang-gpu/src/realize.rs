@@ -100,13 +100,7 @@ pub fn map_elementwise_multi(
     // Output buffer holds n_outputs values per work item
     let out_buf = crate::buffer::GpuBuffer::uninit(device, numel * n_outputs);
 
-    cache.dispatch(
-        device,
-        &kernel.source,
-        &interleaved,
-        &out_buf,
-        numel as u32,
-    );
+    cache.dispatch(device, &kernel.source, &interleaved, &out_buf, numel as u32);
 
     // Read back and split
     let all_data = out_buf.to_vec_sync(device);

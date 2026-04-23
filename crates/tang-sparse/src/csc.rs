@@ -23,7 +23,7 @@ impl<S: Scalar> CscMatrix<S> {
         for j in 0..self.ncols {
             let xj = x[j];
             for k in self.col_ptrs[j]..self.col_ptrs[j + 1] {
-                y[self.row_indices[k]] = y[self.row_indices[k]] + self.values[k] * xj;
+                y[self.row_indices[k]] += self.values[k] * xj;
             }
         }
         y

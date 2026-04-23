@@ -107,7 +107,7 @@ impl GpuTensor {
         assert_eq!(self.ndim(), 2, "transpose requires 2D tensor");
         let m = self.shape[0] as u32;
         let n = self.shape[1] as u32;
-        let numel = (m * n) as u32;
+        let numel = m * n;
         let out = GpuTensor::uninit(device, &[n as usize, m as usize]);
 
         // Pack [count, M, N, 0] into params — reuse the existing params layout
@@ -159,13 +159,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let a_data = self.buffer.to_vec_sync(device);
         let b_data = other.buffer.to_vec_sync(device);
         assert_eq!(a_data.len(), b_data.len());
-        let out: Vec<f32> = a_data.iter().zip(b_data.iter()).map(|(x, y)| x + y).collect();
+        let out: Vec<f32> = a_data
+            .iter()
+            .zip(b_data.iter())
+            .map(|(x, y)| x + y)
+            .collect();
         GpuTensor::from_slice(device, &out, self.shape())
     }
 
     /// Scale all elements by a scalar factor.
     pub fn scale(&self, device: &GpuDevice, cache: &mut KernelCache, s: f32) -> GpuTensor {
         let scale_tensor = GpuTensor::from_slice(device, &vec![s; self.numel()], self.shape());
-        map_elementwise(device, cache, &[self, &scale_tensor], |args| args[0] * args[1])
+        map_elementwise(device, cache, &[self, &scale_tensor], |args| {
+            args[0] * args[1]
+        })
     }
 }

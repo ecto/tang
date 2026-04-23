@@ -49,7 +49,7 @@ impl<S: Scalar> Lu<S> {
             // Compute factors for column k
             let col_k_mut = lu.col_mut(k);
             for i in (k + 1)..n {
-                col_k_mut[i] = col_k_mut[i] * pivot_inv;
+                col_k_mut[i] *= pivot_inv;
             }
 
             // Update submatrix: for each column j > k, col_j[i] -= factor[i] * col_j[k]
@@ -58,7 +58,7 @@ impl<S: Scalar> Lu<S> {
                 let row_k_val = data[j * n + k]; // lu[k, j]
                 for i in (k + 1)..n {
                     let factor = data[k * n + i]; // lu[i, k] (the factor)
-                    data[j * n + i] = data[j * n + i] - factor * row_k_val;
+                    data[j * n + i] -= factor * row_k_val;
                 }
             }
         }
@@ -78,7 +78,7 @@ impl<S: Scalar> Lu<S> {
         for i in 1..n {
             let mut sum = x[i];
             for j in 0..i {
-                sum = sum - self.lu.get(i, j) * x[j];
+                sum -= self.lu.get(i, j) * x[j];
             }
             x[i] = sum;
         }
@@ -87,7 +87,7 @@ impl<S: Scalar> Lu<S> {
         for i in (0..n).rev() {
             let mut sum = x[i];
             for j in (i + 1)..n {
-                sum = sum - self.lu.get(i, j) * x[j];
+                sum -= self.lu.get(i, j) * x[j];
             }
             x[i] = sum * self.lu.get(i, i).recip();
         }
@@ -112,9 +112,13 @@ impl<S: Scalar> Lu<S> {
     /// Determinant.
     pub fn det(&self) -> S {
         let n = self.lu.nrows();
-        let mut d = if self.swaps % 2 == 0 { S::ONE } else { -S::ONE };
+        let mut d = if self.swaps.is_multiple_of(2) {
+            S::ONE
+        } else {
+            -S::ONE
+        };
         for i in 0..n {
-            d = d * self.lu.get(i, i);
+            d *= self.lu.get(i, i);
         }
         d
     }

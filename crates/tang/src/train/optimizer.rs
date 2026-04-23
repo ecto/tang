@@ -1,6 +1,6 @@
 use super::Parameter;
-use alloc::vec::Vec;
 use crate::Scalar;
+use alloc::vec::Vec;
 
 /// Trait for optimizers that update module parameters directly.
 ///

@@ -50,7 +50,7 @@ impl Adam {
             v[i] = self.beta2 * v[i] + (1.0 - self.beta2) * grad[i] * grad[i];
             let m_hat = m[i] / bc1;
             let v_hat = v[i] / bc2;
-            params[i] = params[i] - self.lr * m_hat / (v_hat.sqrt() + self.epsilon);
+            params[i] -= self.lr * m_hat / (v_hat.sqrt() + self.epsilon);
         }
     }
 }
@@ -73,7 +73,7 @@ impl AdamW {
         // Weight decay: params *= (1 - lr * wd)
         let factor = 1.0 - self.inner.lr * self.weight_decay;
         for i in 0..params.len() {
-            params[i] = params[i] * factor;
+            params[i] *= factor;
         }
         self.inner.step(params, grad);
     }

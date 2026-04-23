@@ -37,10 +37,10 @@ pub mod densify;
 pub mod pipeline;
 pub mod ply;
 pub mod project;
-pub mod train;
 pub mod project_backward;
 pub mod rasterize;
 pub mod sort;
+pub mod train;
 
 pub use camera::{Camera, Intrinsics};
 pub use cloud::GaussianCloud;

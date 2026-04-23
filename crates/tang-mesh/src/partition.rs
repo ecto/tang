@@ -102,10 +102,7 @@ fn partition_pipeline(
                     // Find which stage owns this dependency
                     for (other_node, other_indices) in stage_assignments {
                         if other_indices.contains(&dep) {
-                            external_inputs
-                                .entry(dep)
-                                .or_default()
-                                .insert(*other_node);
+                            external_inputs.entry(dep).or_default().insert(*other_node);
                         }
                     }
                 }
@@ -277,7 +274,10 @@ fn remap_wire_node(node: WireNode, map: &HashMap<u32, u32>) -> WireNode {
 ///
 /// Simple heuristic: divide nodes roughly equally among mesh nodes
 /// in topological order (since expression graph indices are topological).
-pub fn auto_partition(graph: &WireGraph, mesh: &Mesh) -> Result<Vec<GraphPartition>, crate::error::MeshError> {
+pub fn auto_partition(
+    graph: &WireGraph,
+    mesh: &Mesh,
+) -> Result<Vec<GraphPartition>, crate::error::MeshError> {
     let n_nodes = graph.nodes.len();
     let n_workers = mesh.len();
 
@@ -290,7 +290,7 @@ pub fn auto_partition(graph: &WireGraph, mesh: &Mesh) -> Result<Vec<GraphPartiti
         return partition_data_parallel(graph, mesh);
     }
 
-    let chunk_size = (n_nodes + n_workers - 1) / n_workers;
+    let chunk_size = n_nodes.div_ceil(n_workers);
     let stage_assignments: Vec<(NodeId, Vec<u32>)> = mesh
         .nodes()
         .iter()

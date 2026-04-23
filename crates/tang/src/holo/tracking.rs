@@ -62,18 +62,10 @@ impl TrackingSequence {
 
             let read_f32 = |o: usize| f32::from_le_bytes(data[o..o + 4].try_into().unwrap());
 
-            let rotation = [
-                read_f32(offset),
-                read_f32(offset + 4),
-                read_f32(offset + 8),
-            ];
+            let rotation = [read_f32(offset), read_f32(offset + 4), read_f32(offset + 8)];
             offset += 12;
 
-            let translation = [
-                read_f32(offset),
-                read_f32(offset + 4),
-                read_f32(offset + 8),
-            ];
+            let translation = [read_f32(offset), read_f32(offset + 4), read_f32(offset + 8)];
             offset += 12;
 
             let expression: Vec<f32> = (0..num_expr).map(|i| read_f32(offset + i * 4)).collect();

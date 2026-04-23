@@ -16,3 +16,7 @@ rayon = "1"
 wgpu = { workspace = true, optional = true }
 pollster = { workspace = true, optional = true }
 bytemuck = { workspace = true, optional = true }
+
+[[example]]
+name = "gpu_search"
+required-features = ["gpu"]

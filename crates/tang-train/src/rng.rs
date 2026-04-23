@@ -24,10 +24,7 @@ impl Rng {
 
     /// Advance the LCG and return the next raw `u64`.
     pub fn next_u64(&mut self) -> u64 {
-        self.state = self
-            .state
-            .wrapping_mul(MULTIPLIER)
-            .wrapping_add(INCREMENT);
+        self.state = self.state.wrapping_mul(MULTIPLIER).wrapping_add(INCREMENT);
         self.state
     }
 
@@ -80,10 +77,7 @@ mod tests {
         let n = 10_000;
         let sum: f64 = (0..n).map(|_| rng.normal()).sum();
         let mean = sum / n as f64;
-        assert!(
-            mean.abs() < 0.05,
-            "normal mean {mean} too far from 0.0"
-        );
+        assert!(mean.abs() < 0.05, "normal mean {mean} too far from 0.0");
     }
 
     #[test]

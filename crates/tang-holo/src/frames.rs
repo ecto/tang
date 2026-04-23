@@ -136,8 +136,10 @@ pub struct VideoInfo {
 pub fn probe_video(path: &Path) -> Result<VideoInfo, FrameError> {
     let output = Command::new("ffprobe")
         .args([
-            "-v", "quiet",
-            "-print_format", "json",
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
             "-show_streams",
             "-show_format",
         ])
@@ -169,11 +171,11 @@ fn parse_ffprobe_json(json: &str) -> Result<VideoInfo, FrameError> {
         // Skip : and whitespace, find value
         let colon = after.find(':')?;
         let rest = after[colon + 1..].trim_start();
-        if rest.starts_with('"') {
-            let end = rest[1..].find('"')?;
-            Some(rest[1..1 + end].to_string())
+        if let Some(inner) = rest.strip_prefix('"') {
+            let end = inner.find('"')?;
+            Some(inner[..end].to_string())
         } else {
-            let end = rest.find(|c: char| c == ',' || c == '}' || c == '\n')?;
+            let end = rest.find([',', '}', '\n'])?;
             Some(rest[..end].trim().to_string())
         }
     };
@@ -207,7 +209,9 @@ fn parse_ffprobe_json(json: &str) -> Result<VideoInfo, FrameError> {
         .unwrap_or((duration_secs * fps) as usize);
 
     if width == 0 || height == 0 {
-        return Err(FrameError::FfmpegFailed("could not determine video dimensions".into()));
+        return Err(FrameError::FfmpegFailed(
+            "could not determine video dimensions".into(),
+        ));
     }
 
     Ok(VideoInfo {

@@ -14,3 +14,4 @@ serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"
+tang-train = { workspace = true }

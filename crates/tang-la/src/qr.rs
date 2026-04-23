@@ -122,7 +122,7 @@ impl<S: Scalar> Qr<S> {
             }
             s = -s / self.qr.get(k, k);
             for i in k..m {
-                x[i] = x[i] + s * self.qr.get(i, k);
+                x[i] += s * self.qr.get(i, k);
             }
         }
 
@@ -131,7 +131,7 @@ impl<S: Scalar> Qr<S> {
         for i in (0..n).rev() {
             let mut sum = x[i];
             for j in (i + 1)..n {
-                sum = sum - self.qr.get(i, j) * result[j];
+                sum -= self.qr.get(i, j) * result[j];
             }
             if self.r_diag[i].abs() < S::EPSILON {
                 result[i] = S::ZERO;

@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use crate::op_enum::{Atom, BinaryOp, UnaryOp};
 use crate::operator::Operator;
-use crate::verify::{quantize, ValueKey};
+use crate::verify::quantize;
 use crate::C;
 
 /// Handle into an `OpArena`. 32 bits is enough for any enumeration we'd
@@ -129,12 +129,9 @@ impl OpArena {
             Node::Unary(UnaryOp::Neg, c) => format!("-({})", self.pretty(c)),
             Node::Unary(UnaryOp::Inv, c) => format!("1/({})", self.pretty(c)),
             Node::Unary(op, c) => format!("{}({})", op.pretty(), self.pretty(c)),
-            Node::Binary(op, l, r) => format!(
-                "({} {} {})",
-                self.pretty(l),
-                op.pretty(),
-                self.pretty(r)
-            ),
+            Node::Binary(op, l, r) => {
+                format!("({} {} {})", self.pretty(l), op.pretty(), self.pretty(r))
+            }
         }
     }
 }
@@ -205,16 +202,13 @@ pub fn build_arena(max_size: usize) -> (OpArena, Vec<Vec<NodeId>>) {
 /// level allocation is avoided: the callback gets a synthetic `Node`
 /// with child references into the arena, and unless the callback keeps
 /// the node elsewhere, it's dropped immediately.
-pub fn for_each_tree_in_arena(
-    max_size: usize,
-    mut f: impl FnMut(&OpArena, Node),
-) {
+pub fn for_each_tree_in_arena(max_size: usize, mut f: impl FnMut(&OpArena, Node)) {
     if max_size == 0 {
         return;
     }
     // Build the cache up to max_size - 1, then stream max_size.
     let cache_up_to = max_size.saturating_sub(1).max(1);
-    let (mut arena, by_size) = build_arena(cache_up_to);
+    let (arena, by_size) = build_arena(cache_up_to);
 
     // Stream sizes 1..=cache_up_to first: they're already in the arena.
     for n in 1..=cache_up_to {
@@ -265,9 +259,36 @@ pub fn for_each_tree_in_arena(
 /// Five conjecturally-algebraically-independent complex test pairs.
 /// (Same as `op_enum::DedupSet`.)
 const TEST_PAIRS: [(C, C); 5] = [
-    (C { re: 0.5772156649015329, im: 0.0 }, C { re: 1.2824271291006226, im: 0.0 }),
-    (C { re: 1.2824271291006226, im: 0.0 }, C { re: 0.9159655941772190, im: 0.0 }),
-    (C { re: 0.9159655941772190, im: 0.0 }, C { re: 0.5772156649015329, im: 0.0 }),
+    (
+        C {
+            re: 0.5772156649015329,
+            im: 0.0,
+        },
+        C {
+            re: 1.2824271291006226,
+            im: 0.0,
+        },
+    ),
+    (
+        C {
+            re: 1.2824271291006226,
+            im: 0.0,
+        },
+        C {
+            re: 0.915_965_594_177_219,
+            im: 0.0,
+        },
+    ),
+    (
+        C {
+            re: 0.915_965_594_177_219,
+            im: 0.0,
+        },
+        C {
+            re: 0.5772156649015329,
+            im: 0.0,
+        },
+    ),
     (C { re: 1.5, im: 0.3 }, C { re: 0.7, im: -0.4 }),
     (C { re: 0.4, im: 1.1 }, C { re: -0.6, im: 0.8 }),
 ];

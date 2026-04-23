@@ -47,7 +47,13 @@ impl FrameMask {
     pub fn face_only_alpha(&self) -> Vec<f32> {
         self.labels
             .iter()
-            .map(|&l| if l == SegClass::FaceSkin as u8 { 1.0 } else { 0.0 })
+            .map(|&l| {
+                if l == SegClass::FaceSkin as u8 {
+                    1.0
+                } else {
+                    0.0
+                }
+            })
             .collect()
     }
 }

@@ -227,8 +227,7 @@ impl ComputeDevice for CpuDevice {
                 for j in 0..=i {
                     let mut dot = 0.0f32;
                     for d in 0..head_dim {
-                        dot += q.data[i * total_dim + q_off + d]
-                            * k.data[j * kv_dim + kv_off + d];
+                        dot += q.data[i * total_dim + q_off + d] * k.data[j * kv_dim + kv_off + d];
                     }
                     let score = dot * scale;
 
@@ -238,8 +237,7 @@ impl ComputeDevice for CpuDevice {
 
                     running_sum = running_sum * rescale + exp_score;
                     for d in 0..head_dim {
-                        accum[d] = accum[d] * rescale
-                            + exp_score * v.data[j * kv_dim + kv_off + d];
+                        accum[d] = accum[d] * rescale + exp_score * v.data[j * kv_dim + kv_off + d];
                     }
                     running_max = new_max;
                 }
@@ -297,8 +295,8 @@ impl ComputeDevice for CpuDevice {
 
                     running_sum = running_sum * rescale + exp_score;
                     for d in 0..head_dim {
-                        accum[d] = accum[d] * rescale
-                            + exp_score * v_cache.data[j * kv_dim + kv_off + d];
+                        accum[d] =
+                            accum[d] * rescale + exp_score * v_cache.data[j * kv_dim + kv_off + d];
                     }
                     running_max = new_max;
                 }
@@ -388,7 +386,10 @@ impl ComputeDevice for CpuDevice {
             }
         }
 
-        (CpuBuffer { data: grad_input }, CpuBuffer { data: grad_weight })
+        (
+            CpuBuffer { data: grad_input },
+            CpuBuffer { data: grad_weight },
+        )
     }
 
     fn embedding_backward(
@@ -443,8 +444,8 @@ impl ComputeDevice for CpuDevice {
                     } else {
                         let mut dot = 0.0f32;
                         for d in 0..head_dim {
-                            dot += q.data[i * total_dim + q_off + d]
-                                * k.data[j * kv_dim + kv_off + d];
+                            dot +=
+                                q.data[i * total_dim + q_off + d] * k.data[j * kv_dim + kv_off + d];
                         }
                         scores[i * seq_len + j] = dot * scale;
                     }
@@ -473,8 +474,7 @@ impl ComputeDevice for CpuDevice {
                 for d in 0..head_dim {
                     let mut sum = 0.0f32;
                     for i in 0..seq_len {
-                        sum += probs[i * seq_len + j]
-                            * grad_output.data[i * total_dim + q_off + d];
+                        sum += probs[i * seq_len + j] * grad_output.data[i * total_dim + q_off + d];
                     }
                     grad_v[j * kv_dim + kv_off + d] += sum;
                 }
@@ -522,8 +522,7 @@ impl ComputeDevice for CpuDevice {
                 for d in 0..head_dim {
                     let mut sum = 0.0f32;
                     for i in 0..seq_len {
-                        sum += grad_s[i * seq_len + j]
-                            * q.data[i * total_dim + q_off + d];
+                        sum += grad_s[i * seq_len + j] * q.data[i * total_dim + q_off + d];
                     }
                     grad_k[j * kv_dim + kv_off + d] += sum * scale;
                 }
@@ -594,10 +593,18 @@ impl ComputeDevice for CpuDevice {
     }
 
     fn copy_buffer(&self, src: &CpuBuffer) -> CpuBuffer {
-        CpuBuffer { data: src.data.clone() }
+        CpuBuffer {
+            data: src.data.clone(),
+        }
     }
 
-    fn bias_add(&self, matrix: &CpuBuffer, bias: &CpuBuffer, numel: usize, dim: usize) -> CpuBuffer {
+    fn bias_add(
+        &self,
+        matrix: &CpuBuffer,
+        bias: &CpuBuffer,
+        numel: usize,
+        dim: usize,
+    ) -> CpuBuffer {
         let mut out = matrix.data.clone();
         for i in 0..numel {
             out[i] += bias.data[i % dim];
@@ -640,8 +647,7 @@ impl ComputeDevice for CpuDevice {
 
                 let u1 = ((key & 0x7FFFFFFF) as f32 + 1.0) / 2147483649.0;
                 let u2 = ((key2 & 0x7FFFFFFF) as f32 + 1.0) / 2147483649.0;
-                let noise = (-2.0f32 * u1.ln()).sqrt()
-                    * (core::f32::consts::TAU * u2).cos();
+                let noise = (-2.0f32 * u1.ln()).sqrt() * (core::f32::consts::TAU * u2).cos();
                 buf.data[base + col] += scale * noise;
             }
         }
@@ -909,9 +915,7 @@ mod tests {
         let dev = CpuDevice::new();
         let a = dev.upload(&[1.0, 4.0, 9.0]);
         // sqrt(x) + 1
-        let c = dev.elementwise(&[&a], 3, &|vars| {
-            vars[0].sqrt() + ExprId::from_f64(1.0)
-        });
+        let c = dev.elementwise(&[&a], 3, &|vars| vars[0].sqrt() + ExprId::from_f64(1.0));
         let out = dev.download(&c);
         assert!((out[0] - 2.0).abs() < 1e-4);
         assert!((out[1] - 3.0).abs() < 1e-4);
@@ -1019,7 +1023,7 @@ mod tests {
         let result = dev.embedding_backward(&grad_out, &ids, 4, 2, 3);
         let out = dev.download(&result);
         assert_eq!(out.len(), 12); // 4*3
-        // id=1 → row 1 gets [1,2,3]
+                                   // id=1 → row 1 gets [1,2,3]
         assert!((out[3] - 1.0).abs() < 1e-6);
         assert!((out[4] - 2.0).abs() < 1e-6);
         assert!((out[5] - 3.0).abs() < 1e-6);
@@ -1103,15 +1107,22 @@ mod tests {
         let kv_dim = n_kv_heads * head_dim;
 
         // Random-ish data
-        let q_data: Vec<f32> = (0..q_len * total_dim).map(|i| ((i * 7 + 3) % 13) as f32 / 13.0).collect();
-        let kv_data: Vec<f32> = (0..q_len * kv_dim).map(|i| ((i * 11 + 5) % 17) as f32 / 17.0).collect();
-        let v_data: Vec<f32> = (0..q_len * kv_dim).map(|i| ((i * 13 + 7) % 19) as f32 / 19.0).collect();
+        let q_data: Vec<f32> = (0..q_len * total_dim)
+            .map(|i| ((i * 7 + 3) % 13) as f32 / 13.0)
+            .collect();
+        let kv_data: Vec<f32> = (0..q_len * kv_dim)
+            .map(|i| ((i * 11 + 5) % 17) as f32 / 17.0)
+            .collect();
+        let v_data: Vec<f32> = (0..q_len * kv_dim)
+            .map(|i| ((i * 13 + 7) % 19) as f32 / 19.0)
+            .collect();
 
         // Batched
         let q = dev.upload(&q_data);
         let k = dev.upload(&kv_data);
         let v = dev.upload(&v_data);
-        let batched = dev.download(&dev.kv_attention(&q, &k, &v, 0, q_len, n_heads, n_kv_heads, head_dim));
+        let batched =
+            dev.download(&dev.kv_attention(&q, &k, &v, 0, q_len, n_heads, n_kv_heads, head_dim));
 
         // Sequential
         let mut sequential = Vec::new();
@@ -1119,7 +1130,9 @@ mod tests {
             let q_slice = dev.upload(&q_data[qi * total_dim..(qi + 1) * total_dim]);
             let k_slice = dev.upload(&kv_data[..((qi + 1) * kv_dim)]);
             let v_slice = dev.upload(&v_data[..((qi + 1) * kv_dim)]);
-            let out = dev.download(&dev.kv_attention(&q_slice, &k_slice, &v_slice, qi, 1, n_heads, n_kv_heads, head_dim));
+            let out = dev.download(&dev.kv_attention(
+                &q_slice, &k_slice, &v_slice, qi, 1, n_heads, n_kv_heads, head_dim,
+            ));
             sequential.extend(out);
         }
 
@@ -1128,7 +1141,8 @@ mod tests {
             assert!(
                 (batched[i] - sequential[i]).abs() < 1e-5,
                 "mismatch at {i}: batched={} sequential={}",
-                batched[i], sequential[i]
+                batched[i],
+                sequential[i]
             );
         }
     }
@@ -1140,7 +1154,9 @@ mod tests {
         let grad = dev.upload(&[0.1, 0.2, 0.3]);
         let mut m = dev.upload(&[0.0, 0.0, 0.0]);
         let mut v = dev.upload(&[0.0, 0.0, 0.0]);
-        dev.adamw_step(&mut param, &grad, &mut m, &mut v, 0.001, 0.9, 0.999, 1e-8, 0.01, 1);
+        dev.adamw_step(
+            &mut param, &grad, &mut m, &mut v, 0.001, 0.9, 0.999, 1e-8, 0.01, 1,
+        );
         let p = param.to_vec();
         // Params should have decreased (positive gradient -> decrease)
         assert!(p[0] < 1.0);

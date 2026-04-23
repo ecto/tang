@@ -61,10 +61,15 @@ impl KernelCache {
 
     /// Get or compile a pipeline with the standard 3-binding layout
     /// (read storage, read-write storage, uniform). Public for custom dispatch patterns.
-    pub(crate) fn get_or_compile_custom(&mut self, device: &GpuDevice, wgsl: &str, hash: u64) -> &CachedPipeline {
-        self.pipelines.entry(hash).or_insert_with(|| {
-            Self::compile_standard_3(device, wgsl)
-        })
+    pub(crate) fn get_or_compile_custom(
+        &mut self,
+        device: &GpuDevice,
+        wgsl: &str,
+        hash: u64,
+    ) -> &CachedPipeline {
+        self.pipelines
+            .entry(hash)
+            .or_insert_with(|| Self::compile_standard_3(device, wgsl))
     }
 
     fn compile_standard_3(device: &GpuDevice, wgsl: &str) -> CachedPipeline {
@@ -123,17 +128,16 @@ impl KernelCache {
                     push_constant_ranges: &[],
                 });
 
-        let pipeline =
-            device
-                .device
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("tang-gpu pipeline"),
-                    layout: Some(&pipeline_layout),
-                    module: &module,
-                    entry_point: Some("main"),
-                    compilation_options: Default::default(),
-                    cache: None,
-                });
+        let pipeline = device
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("tang-gpu pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
 
         CachedPipeline {
             pipeline,
@@ -144,7 +148,12 @@ impl KernelCache {
     /// Get or compile a pipeline with 5-binding layout:
     /// 0=read, 1=read, 2=read, 3=read_write, 4=uniform.
     /// Used for layer norm (input, weight, bias, output, params).
-    pub(crate) fn get_or_compile_5bind(&mut self, device: &GpuDevice, wgsl: &str, hash: u64) -> &CachedPipeline {
+    pub(crate) fn get_or_compile_5bind(
+        &mut self,
+        device: &GpuDevice,
+        wgsl: &str,
+        hash: u64,
+    ) -> &CachedPipeline {
         self.pipelines.entry(hash).or_insert_with(|| {
             let module = device
                 .device
@@ -220,9 +229,9 @@ impl KernelCache {
     /// Get or compile a pipeline for the given WGSL source.
     fn get_or_compile(&mut self, device: &GpuDevice, wgsl: &str) -> &CachedPipeline {
         let hash = Self::hash_wgsl(wgsl);
-        self.pipelines.entry(hash).or_insert_with(|| {
-            Self::compile_standard_3(device, wgsl)
-        })
+        self.pipelines
+            .entry(hash)
+            .or_insert_with(|| Self::compile_standard_3(device, wgsl))
     }
 
     /// Dispatch a compute kernel.
@@ -292,7 +301,12 @@ impl KernelCache {
 
     /// Get or compile a pipeline with 4-binding layout:
     /// 0=read, 1=read, 2=read_write, 3=uniform. Public for custom dispatch.
-    pub(crate) fn get_or_compile_rr_w(&mut self, device: &GpuDevice, wgsl: &str, hash: u64) -> &CachedPipeline {
+    pub(crate) fn get_or_compile_rr_w(
+        &mut self,
+        device: &GpuDevice,
+        wgsl: &str,
+        hash: u64,
+    ) -> &CachedPipeline {
         self.pipelines.entry(hash).or_insert_with(|| {
             let module = device
                 .device
@@ -743,7 +757,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             bc2: f32,
             _pad: u32,
         }
-        let uniform_data = AdamParams { count, lr, beta1, beta2, eps, bc1, bc2, _pad: 0 };
+        let uniform_data = AdamParams {
+            count,
+            lr,
+            beta1,
+            beta2,
+            eps,
+            bc1,
+            bc2,
+            _pad: 0,
+        };
 
         use wgpu::util::DeviceExt;
         let uniform_buf = device
@@ -812,9 +835,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         hash: u64,
         bindings: &[BindingSpec],
     ) -> &CachedPipeline {
-        self.pipelines.entry(hash).or_insert_with(|| {
-            Self::compile_dynamic(device, wgsl, bindings)
-        })
+        self.pipelines
+            .entry(hash)
+            .or_insert_with(|| Self::compile_dynamic(device, wgsl, bindings))
     }
 
     fn compile_dynamic(device: &GpuDevice, wgsl: &str, bindings: &[BindingSpec]) -> CachedPipeline {
@@ -866,17 +889,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     push_constant_ranges: &[],
                 });
 
-        let pipeline =
-            device
-                .device
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("tang-gpu pipeline dynamic"),
-                    layout: Some(&pipeline_layout),
-                    module: &module,
-                    entry_point: Some("main"),
-                    compilation_options: Default::default(),
-                    cache: None,
-                });
+        let pipeline = device
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("tang-gpu pipeline dynamic"),
+                layout: Some(&pipeline_layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
 
         CachedPipeline {
             pipeline,

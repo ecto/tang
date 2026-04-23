@@ -62,7 +62,8 @@ impl Rasterizer {
                 label: Some("tang-3dgs"),
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits {
-                    max_storage_buffers_per_shader_stage: adapter_limits.max_storage_buffers_per_shader_stage,
+                    max_storage_buffers_per_shader_stage:
+                        adapter_limits.max_storage_buffers_per_shader_stage,
                     max_bind_groups: adapter_limits.max_bind_groups,
                     ..wgpu::Limits::default()
                 },
@@ -73,8 +74,7 @@ impl Rasterizer {
         .expect("failed to create GPU device");
 
         // Compile projection shader
-        let (project_pipeline, project_bgl0, project_bgl1) =
-            compile_project_pipeline(&device);
+        let (project_pipeline, project_bgl0, project_bgl1) = compile_project_pipeline(&device);
 
         // Compile rasterization shader
         let (rasterize_pipeline, rasterize_bgl0, rasterize_bgl1) =
@@ -85,8 +85,7 @@ impl Rasterizer {
             compile_count_tiles_pipeline(&device);
         let (write_keys_pipeline, write_keys_bgl0, write_keys_bgl1) =
             compile_write_keys_pipeline(&device);
-        let (prefix_sum_pipeline, prefix_sum_bgl0) =
-            compile_prefix_sum_pipeline(&device);
+        let (prefix_sum_pipeline, prefix_sum_bgl0) = compile_prefix_sum_pipeline(&device);
         let (radix_count_pipeline, radix_count_bgl0, radix_count_bgl1) =
             compile_radix_count_pipeline(&device);
         let (radix_scatter_pipeline, radix_scatter_bgl0, radix_scatter_bgl1) =
@@ -134,8 +133,8 @@ impl Rasterizer {
         let n = cloud.count as u32;
         let w = self.config.width;
         let h = self.config.height;
-        let num_tiles_x = (w + TILE_SIZE - 1) / TILE_SIZE;
-        let num_tiles_y = (h + TILE_SIZE - 1) / TILE_SIZE;
+        let num_tiles_x = w.div_ceil(TILE_SIZE);
+        let num_tiles_y = h.div_ceil(TILE_SIZE);
         let num_tiles = num_tiles_x * num_tiles_y;
 
         // --- Upload gaussian data ---
@@ -143,7 +142,11 @@ impl Rasterizer {
         let scales_buf = self.create_buffer_f32(&flatten_vec3(&cloud.scales));
         let rotations_buf = self.create_buffer_f32(&flatten_vec4(&cloud.rotations));
         let opacities_buf = self.create_buffer_f32(
-            &cloud.opacities.iter().map(|&o| sigmoid(o)).collect::<Vec<_>>(),
+            &cloud
+                .opacities
+                .iter()
+                .map(|&o| sigmoid(o))
+                .collect::<Vec<_>>(),
         );
         let colors_buf = self.create_buffer_f32(&sh_to_rgb(cloud));
 
@@ -177,21 +180,48 @@ impl Rasterizer {
                 label: Some("project bg0"),
                 layout: &self.project_bgl0,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: positions_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: scales_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: rotations_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: camera_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 4, resource: project_config_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: positions_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: scales_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: rotations_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: camera_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: project_config_buf.as_entire_binding(),
+                    },
                 ],
             });
             let bg1 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("project bg1"),
                 layout: &self.project_bgl1,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: means_2d_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: conics_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: radii_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: depths_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: means_2d_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: conics_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: radii_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: depths_buf.as_entire_binding(),
+                    },
                 ],
             });
 
@@ -199,7 +229,7 @@ impl Rasterizer {
             pass.set_pipeline(&self.project_pipeline);
             pass.set_bind_group(0, &bg0, &[]);
             pass.set_bind_group(1, &bg1, &[]);
-            pass.dispatch_workgroups((n + 255) / 256, 1, 1);
+            pass.dispatch_workgroups(n.div_ceil(256), 1, 1);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
 
@@ -217,18 +247,36 @@ impl Rasterizer {
                 label: Some("count_tiles bg0"),
                 layout: &self.count_tiles_bgl0,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: means_2d_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: radii_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: depths_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: sort_config_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: means_2d_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: radii_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: depths_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: sort_config_buf.as_entire_binding(),
+                    },
                 ],
             });
             let bg1 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("count_tiles bg1"),
                 layout: &self.count_tiles_bgl1,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: tile_counts_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: total_pairs_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: tile_counts_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: total_pairs_buf.as_entire_binding(),
+                    },
                 ],
             });
 
@@ -236,7 +284,7 @@ impl Rasterizer {
             pass.set_pipeline(&self.count_tiles_pipeline);
             pass.set_bind_group(0, &bg0, &[]);
             pass.set_bind_group(1, &bg1, &[]);
-            pass.dispatch_workgroups((n + 255) / 256, 1, 1);
+            pass.dispatch_workgroups(n.div_ceil(256), 1, 1);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
 
@@ -276,7 +324,9 @@ impl Rasterizer {
         let mut pairs: Vec<(u32, f32, u32)> = Vec::with_capacity(total_pairs as usize);
         for idx in 0..n as usize {
             let r = radii_raw[idx];
-            if r == 0 { continue; }
+            if r == 0 {
+                continue;
+            }
             let mx = means_2d_raw[idx * 2];
             let my = means_2d_raw[idx * 2 + 1];
             let tile_min_x = ((mx - r as f32) / 16.0).max(0.0) as u32;
@@ -311,7 +361,8 @@ impl Rasterizer {
 
         // Upload to GPU
         let values_buf = self.create_buffer_bytes(bytemuck::cast_slice(&sorted_indices_cpu));
-        let tile_ranges_flat: Vec<u32> = tile_ranges_cpu.iter().flat_map(|r| [r[0], r[1]]).collect();
+        let tile_ranges_flat: Vec<u32> =
+            tile_ranges_cpu.iter().flat_map(|r| [r[0], r[1]]).collect();
         let tile_ranges_buf = self.create_buffer_bytes(bytemuck::cast_slice(&tile_ranges_flat));
 
         // === PASS 3: Rasterize ===
@@ -337,22 +388,52 @@ impl Rasterizer {
                 label: Some("rasterize bg0"),
                 layout: &self.rasterize_bgl0,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: values_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: tile_ranges_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: means_2d_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: conics_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 4, resource: opacities_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 5, resource: colors_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 6, resource: raster_config_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: values_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: tile_ranges_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: means_2d_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: conics_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: opacities_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: colors_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: raster_config_buf.as_entire_binding(),
+                    },
                 ],
             });
             let bg1 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("rasterize bg1"),
                 layout: &self.rasterize_bgl1,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: image_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: final_t_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: n_contrib_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: image_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: final_t_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: n_contrib_buf.as_entire_binding(),
+                    },
                 ],
             });
 
@@ -370,10 +451,7 @@ impl Rasterizer {
         let n_contrib = self.readback_u32(&n_contrib_buf, (w * h) as usize);
         let sorted_indices = self.readback_u32(&values_buf, total_pairs as usize);
         let tile_ranges_raw = self.readback_u32(&tile_ranges_buf, (num_tiles * 2) as usize);
-        let tile_ranges: Vec<[u32; 2]> = tile_ranges_raw
-            .chunks(2)
-            .map(|c| [c[0], c[1]])
-            .collect();
+        let tile_ranges: Vec<[u32; 2]> = tile_ranges_raw.chunks(2).map(|c| [c[0], c[1]]).collect();
         let means_2d_raw = self.readback_f32(&means_2d_buf, (n * 2) as usize);
         let means_2d: Vec<[f32; 2]> = means_2d_raw.chunks(2).map(|c| [c[0], c[1]]).collect();
         let conics_raw = self.readback_f32(&conics_buf, (n * 4) as usize);
@@ -409,36 +487,47 @@ impl Rasterizer {
         let n = cloud.count as u32;
         let w = self.config.width;
         let h = self.config.height;
-        let num_tiles_x = (w + TILE_SIZE - 1) / TILE_SIZE;
-        let num_tiles_y = (h + TILE_SIZE - 1) / TILE_SIZE;
+        let num_tiles_x = w.div_ceil(TILE_SIZE);
+        let num_tiles_y = h.div_ceil(TILE_SIZE);
 
         // Re-upload gaussian data needed for recomputing alpha
         let means_2d_flat: Vec<f32> = ctx.means_2d.iter().flat_map(|m| [m[0], m[1]]).collect();
         let means_2d_buf = self.create_buffer_f32(&means_2d_flat);
-        let conics_flat: Vec<f32> = ctx.conics.iter().flat_map(|c| [c[0], c[1], c[2], 0.0]).collect();
+        let conics_flat: Vec<f32> = ctx
+            .conics
+            .iter()
+            .flat_map(|c| [c[0], c[1], c[2], 0.0])
+            .collect();
         let conics_buf = self.create_buffer_f32(&conics_flat);
         let opacities_buf = self.create_buffer_f32(
-            &cloud.opacities.iter().map(|&o| sigmoid(o)).collect::<Vec<_>>(),
+            &cloud
+                .opacities
+                .iter()
+                .map(|&o| sigmoid(o))
+                .collect::<Vec<_>>(),
         );
         let colors_buf = self.create_buffer_f32(&sh_to_rgb(cloud));
 
         // Re-upload sorted indices and tile ranges
         let sorted_indices_buf = {
             use wgpu::util::DeviceExt;
-            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None,
-                contents: bytemuck::cast_slice(&ctx.sorted_indices),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            })
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytemuck::cast_slice(&ctx.sorted_indices),
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                })
         };
-        let tile_ranges_flat: Vec<u32> = ctx.tile_ranges.iter().flat_map(|r| [r[0], r[1]]).collect();
+        let tile_ranges_flat: Vec<u32> =
+            ctx.tile_ranges.iter().flat_map(|r| [r[0], r[1]]).collect();
         let tile_ranges_buf = {
             use wgpu::util::DeviceExt;
-            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None,
-                contents: bytemuck::cast_slice(&tile_ranges_flat),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            })
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytemuck::cast_slice(&tile_ranges_flat),
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                })
         };
 
         // Config uniform (same struct as forward rasterize)
@@ -459,11 +548,12 @@ impl Rasterizer {
         let final_t_buf = self.create_buffer_f32(&ctx.final_transmittance);
         let n_contrib_buf = {
             use wgpu::util::DeviceExt;
-            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None,
-                contents: bytemuck::cast_slice(&ctx.n_contrib),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            })
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytemuck::cast_slice(&ctx.n_contrib),
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                })
         };
 
         // Gradient output buffers (zeroed, atomic<u32>)
@@ -479,26 +569,68 @@ impl Rasterizer {
                 label: Some("rasterize_bw bg0"),
                 layout: &self.rasterize_bw_bgl0,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: sorted_indices_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: tile_ranges_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: means_2d_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: conics_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 4, resource: opacities_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 5, resource: colors_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 6, resource: raster_config_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 7, resource: dl_image_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 8, resource: final_t_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 9, resource: n_contrib_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: sorted_indices_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: tile_ranges_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: means_2d_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: conics_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: opacities_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: colors_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: raster_config_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: dl_image_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: final_t_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 9,
+                        resource: n_contrib_buf.as_entire_binding(),
+                    },
                 ],
             });
             let bg1 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("rasterize_bw bg1"),
                 layout: &self.rasterize_bw_bgl1,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: grad_colors_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: grad_opacities_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: grad_conics_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: grad_means2d_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: grad_colors_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: grad_opacities_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: grad_conics_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: grad_means2d_buf.as_entire_binding(),
+                    },
                 ],
             });
 
@@ -518,7 +650,10 @@ impl Rasterizer {
 
         // Chain through backward projection: dL/d{conic, mean_2d} → dL/d{position, scale, rotation}
         #[allow(non_snake_case)]
-        let dL_dconics: Vec<[f32; 3]> = grad_conics_raw.chunks(3).map(|c| [c[0], c[1], c[2]]).collect();
+        let dL_dconics: Vec<[f32; 3]> = grad_conics_raw
+            .chunks(3)
+            .map(|c| [c[0], c[1], c[2]])
+            .collect();
         #[allow(non_snake_case)]
         let dL_dmeans2d: Vec<[f32; 2]> = grad_means2d_raw.chunks(2).map(|m| [m[0], m[1]]).collect();
 
@@ -549,25 +684,27 @@ impl Rasterizer {
 
     fn create_buffer_f32(&self, data: &[f32]) -> wgpu::Buffer {
         use wgpu::util::DeviceExt;
-        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: bytemuck::cast_slice(data),
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
-        })
+        self.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(data),
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+            })
     }
 
     fn create_buffer_bytes(&self, data: &[u8]) -> wgpu::Buffer {
         use wgpu::util::DeviceExt;
-        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: data,
-            usage: wgpu::BufferUsages::UNIFORM
-                | wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
-        })
+        self.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: data,
+                usage: wgpu::BufferUsages::UNIFORM
+                    | wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+            })
     }
 
     fn create_buffer_zero(&self, len: usize) -> wgpu::Buffer {
@@ -611,7 +748,9 @@ impl Rasterizer {
 
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            tx.send(r).ok();
+        });
         self.device.poll(wgpu::Maintain::Wait);
         rx.recv().unwrap().unwrap();
 
@@ -636,7 +775,9 @@ impl Rasterizer {
 
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            tx.send(r).ok();
+        });
         self.device.poll(wgpu::Maintain::Wait);
         rx.recv().unwrap().unwrap();
 
@@ -654,15 +795,21 @@ impl Rasterizer {
         let params = [n as u32, 0, 0, 0u32];
         let params_buf = self.create_buffer_bytes(bytemuck::cast_slice(&params));
 
-        let num_blocks = (n + 511) / 512;
+        let num_blocks = n.div_ceil(512);
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
             let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("prefix_sum bg"),
                 layout: &self.prefix_sum_bgl0,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: params_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: params_buf.as_entire_binding(),
+                    },
                 ],
             });
 
@@ -697,24 +844,34 @@ impl Rasterizer {
                     label: None,
                     layout: &self.radix_count_bgl0,
                     entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: keys_in.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: values_in.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 2, resource: sort_params_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: keys_in.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: values_in.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: sort_params_buf.as_entire_binding(),
+                        },
                     ],
                 });
                 let bg1 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
                     layout: &self.radix_count_bgl1,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: histogram_buf.as_entire_binding() },
-                    ],
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: histogram_buf.as_entire_binding(),
+                    }],
                 });
 
                 let mut pass = encoder.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&self.radix_count_pipeline);
                 pass.set_bind_group(0, &bg0, &[]);
                 pass.set_bind_group(1, &bg1, &[]);
-                pass.dispatch_workgroups((num_pairs + 255) / 256, 1, 1);
+                pass.dispatch_workgroups(num_pairs.div_ceil(256), 1, 1);
             }
             self.queue.submit(std::iter::once(encoder.finish()));
 
@@ -728,18 +885,36 @@ impl Rasterizer {
                     label: None,
                     layout: &self.radix_scatter_bgl0,
                     entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: keys_in.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: values_in.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 2, resource: sort_params_buf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 3, resource: histogram_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: keys_in.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: values_in.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: sort_params_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: histogram_buf.as_entire_binding(),
+                        },
                     ],
                 });
                 let bg1 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
                     layout: &self.radix_scatter_bgl1,
                     entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: keys_out.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: values_out.as_entire_binding() },
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: keys_out.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: values_out.as_entire_binding(),
+                        },
                     ],
                 });
 
@@ -747,7 +922,7 @@ impl Rasterizer {
                 pass.set_pipeline(&self.radix_scatter_pipeline);
                 pass.set_bind_group(0, &bg0, &[]);
                 pass.set_bind_group(1, &bg1, &[]);
-                pass.dispatch_workgroups((num_pairs + 255) / 256, 1, 1);
+                pass.dispatch_workgroups(num_pairs.div_ceil(256), 1, 1);
             }
             self.queue.submit(std::iter::once(encoder.finish()));
         }
@@ -756,7 +931,9 @@ impl Rasterizer {
 
 // --- Shader compilation (one function per pipeline to keep it organized) ---
 
-fn make_bgl_entries(entries: &[(wgpu::BufferBindingType, bool)]) -> Vec<wgpu::BindGroupLayoutEntry> {
+fn make_bgl_entries(
+    entries: &[(wgpu::BufferBindingType, bool)],
+) -> Vec<wgpu::BindGroupLayoutEntry> {
     entries
         .iter()
         .enumerate()
@@ -789,7 +966,11 @@ fn create_pipeline(
     entry: &str,
     bgl0_entries: &[(wgpu::BufferBindingType, bool)],
     bgl1_entries: &[(wgpu::BufferBindingType, bool)],
-) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout, wgpu::BindGroupLayout) {
+) -> (
+    wgpu::ComputePipeline,
+    wgpu::BindGroupLayout,
+    wgpu::BindGroupLayout,
+) {
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: None,
         source: wgpu::ShaderSource::Wgsl(wgsl.into()),
@@ -835,29 +1016,67 @@ const STORAGE_RO: (BBT, bool) = (BBT::Storage { read_only: true }, RO);
 const STORAGE_RW: (BBT, bool) = (BBT::Storage { read_only: false }, RW);
 const UNIFORM: (BBT, bool) = (BBT::Uniform, true);
 
-fn compile_project_pipeline(d: &wgpu::Device) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout, wgpu::BindGroupLayout) {
-    create_pipeline(d, crate::project::PROJECT_SHADER, "main",
+fn compile_project_pipeline(
+    d: &wgpu::Device,
+) -> (
+    wgpu::ComputePipeline,
+    wgpu::BindGroupLayout,
+    wgpu::BindGroupLayout,
+) {
+    create_pipeline(
+        d,
+        crate::project::PROJECT_SHADER,
+        "main",
         &[STORAGE_RO, STORAGE_RO, STORAGE_RO, UNIFORM, UNIFORM],
         &[STORAGE_RW, STORAGE_RW, STORAGE_RW, STORAGE_RW],
     )
 }
 
-fn compile_rasterize_pipeline(d: &wgpu::Device) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout, wgpu::BindGroupLayout) {
-    create_pipeline(d, crate::rasterize::RASTERIZE_FORWARD_SHADER, "main",
-        &[STORAGE_RO, STORAGE_RO, STORAGE_RO, STORAGE_RO, STORAGE_RO, STORAGE_RO, UNIFORM],
+fn compile_rasterize_pipeline(
+    d: &wgpu::Device,
+) -> (
+    wgpu::ComputePipeline,
+    wgpu::BindGroupLayout,
+    wgpu::BindGroupLayout,
+) {
+    create_pipeline(
+        d,
+        crate::rasterize::RASTERIZE_FORWARD_SHADER,
+        "main",
+        &[
+            STORAGE_RO, STORAGE_RO, STORAGE_RO, STORAGE_RO, STORAGE_RO, STORAGE_RO, UNIFORM,
+        ],
         &[STORAGE_RW, STORAGE_RW, STORAGE_RW],
     )
 }
 
-fn compile_count_tiles_pipeline(d: &wgpu::Device) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout, wgpu::BindGroupLayout) {
-    create_pipeline(d, crate::sort::GENERATE_KEYS_SHADER, "count_tiles",
+fn compile_count_tiles_pipeline(
+    d: &wgpu::Device,
+) -> (
+    wgpu::ComputePipeline,
+    wgpu::BindGroupLayout,
+    wgpu::BindGroupLayout,
+) {
+    create_pipeline(
+        d,
+        crate::sort::GENERATE_KEYS_SHADER,
+        "count_tiles",
         &[STORAGE_RO, STORAGE_RO, STORAGE_RO, UNIFORM],
         &[STORAGE_RW, STORAGE_RW],
     )
 }
 
-fn compile_write_keys_pipeline(d: &wgpu::Device) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout, wgpu::BindGroupLayout) {
-    create_pipeline(d, crate::sort::WRITE_KEYS_SHADER, "write_pairs",
+fn compile_write_keys_pipeline(
+    d: &wgpu::Device,
+) -> (
+    wgpu::ComputePipeline,
+    wgpu::BindGroupLayout,
+    wgpu::BindGroupLayout,
+) {
+    create_pipeline(
+        d,
+        crate::sort::WRITE_KEYS_SHADER,
+        "write_pairs",
         &[STORAGE_RO, STORAGE_RO, STORAGE_RO, UNIFORM],
         &[STORAGE_RO, STORAGE_RW, STORAGE_RW],
     )
@@ -889,31 +1108,70 @@ fn compile_prefix_sum_pipeline(d: &wgpu::Device) -> (wgpu::ComputePipeline, wgpu
     (pipeline, bgl)
 }
 
-fn compile_radix_count_pipeline(d: &wgpu::Device) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout, wgpu::BindGroupLayout) {
-    create_pipeline(d, crate::sort::RADIX_SORT_SHADER, "count",
+fn compile_radix_count_pipeline(
+    d: &wgpu::Device,
+) -> (
+    wgpu::ComputePipeline,
+    wgpu::BindGroupLayout,
+    wgpu::BindGroupLayout,
+) {
+    create_pipeline(
+        d,
+        crate::sort::RADIX_SORT_SHADER,
+        "count",
         &[STORAGE_RO, STORAGE_RO, UNIFORM],
         &[STORAGE_RW],
     )
 }
 
-fn compile_radix_scatter_pipeline(d: &wgpu::Device) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout, wgpu::BindGroupLayout) {
-    create_pipeline(d, crate::sort::RADIX_SCATTER_SHADER, "scatter",
+fn compile_radix_scatter_pipeline(
+    d: &wgpu::Device,
+) -> (
+    wgpu::ComputePipeline,
+    wgpu::BindGroupLayout,
+    wgpu::BindGroupLayout,
+) {
+    create_pipeline(
+        d,
+        crate::sort::RADIX_SCATTER_SHADER,
+        "scatter",
         &[STORAGE_RO, STORAGE_RO, UNIFORM, STORAGE_RW],
         &[STORAGE_RW, STORAGE_RW],
     )
 }
 
-fn compile_rasterize_backward_pipeline(d: &wgpu::Device) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout, wgpu::BindGroupLayout) {
-    create_pipeline(d, crate::rasterize::RASTERIZE_BACKWARD_SHADER, "main",
+fn compile_rasterize_backward_pipeline(
+    d: &wgpu::Device,
+) -> (
+    wgpu::ComputePipeline,
+    wgpu::BindGroupLayout,
+    wgpu::BindGroupLayout,
+) {
+    create_pipeline(
+        d,
+        crate::rasterize::RASTERIZE_BACKWARD_SHADER,
+        "main",
         // group 0: sorted_indices, tile_ranges, means_2d, conics, opacities, colors, config, dL_dimage, final_T, n_contrib
-        &[STORAGE_RO, STORAGE_RO, STORAGE_RO, STORAGE_RO, STORAGE_RO, STORAGE_RO, UNIFORM, STORAGE_RO, STORAGE_RO, STORAGE_RO],
+        &[
+            STORAGE_RO, STORAGE_RO, STORAGE_RO, STORAGE_RO, STORAGE_RO, STORAGE_RO, UNIFORM,
+            STORAGE_RO, STORAGE_RO, STORAGE_RO,
+        ],
         // group 1: grad_colors, grad_opacities, grad_conics, grad_means2d
         &[STORAGE_RW, STORAGE_RW, STORAGE_RW, STORAGE_RW],
     )
 }
 
-fn compile_tile_ranges_pipeline(d: &wgpu::Device) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout, wgpu::BindGroupLayout) {
-    create_pipeline(d, crate::sort::IDENTIFY_TILE_RANGES_SHADER, "main",
+fn compile_tile_ranges_pipeline(
+    d: &wgpu::Device,
+) -> (
+    wgpu::ComputePipeline,
+    wgpu::BindGroupLayout,
+    wgpu::BindGroupLayout,
+) {
+    create_pipeline(
+        d,
+        crate::sort::IDENTIFY_TILE_RANGES_SHADER,
+        "main",
         &[STORAGE_RO, UNIFORM],
         &[STORAGE_RW],
     )

@@ -68,10 +68,7 @@ impl DistributedTrainer {
 
     /// Compile a forward graph on all workers.
     pub async fn compile_forward(&self, graph: &WireGraph) -> Result<u64, MeshError> {
-        let coordinator = self
-            .coordinator
-            .as_ref()
-            .ok_or(MeshError::NoWorkers)?;
+        let coordinator = self.coordinator.as_ref().ok_or(MeshError::NoWorkers)?;
         coordinator.compile_all(graph).await
     }
 
@@ -85,10 +82,7 @@ impl DistributedTrainer {
         data: &[Vec<f32>],
         _targets: &[Vec<f32>],
     ) -> Result<Vec<f32>, MeshError> {
-        let coordinator = self
-            .coordinator
-            .as_ref()
-            .ok_or(MeshError::NoWorkers)?;
+        let coordinator = self.coordinator.as_ref().ok_or(MeshError::NoWorkers)?;
 
         let n_workers = coordinator.num_workers().await;
         let task_id = coordinator.compile_all(forward_graph).await?;
@@ -97,7 +91,7 @@ impl DistributedTrainer {
 
         for _epoch in 0..self.num_epochs {
             // Shard data across workers
-            let chunk_size = (data.len() + n_workers - 1) / n_workers;
+            let chunk_size = data.len().div_ceil(n_workers);
             let worker_ids = coordinator.worker_ids().await;
 
             let mut worker_grads = Vec::new();
@@ -111,10 +105,7 @@ impl DistributedTrainer {
 
                 let shard: Vec<f32> = data[start..end].iter().flatten().copied().collect();
 
-                match coordinator
-                    .forward_on(node_id, task_id, 0, shard)
-                    .await
-                {
+                match coordinator.forward_on(node_id, task_id, 0, shard).await {
                     Ok(grads) => worker_grads.push(grads),
                     Err(e) => {
                         tracing::warn!("worker {node_id} failed: {e}");
@@ -190,12 +181,8 @@ mod tests {
         let coordinator = Coordinator::new();
         let w1 = Worker::new();
         let w2 = Worker::new();
-        coordinator
-            .add_worker(NodeId(0), w1.spawn_channel())
-            .await;
-        coordinator
-            .add_worker(NodeId(1), w2.spawn_channel())
-            .await;
+        coordinator.add_worker(NodeId(0), w1.spawn_channel()).await;
+        coordinator.add_worker(NodeId(1), w2.spawn_channel()).await;
 
         let mut trainer = DistributedTrainer::from_coordinator(coordinator, 0.01, 3);
         let graph = simple_add_graph();
@@ -219,12 +206,8 @@ mod tests {
         let coordinator = Coordinator::new();
         let w1 = Worker::new();
         let w2 = Worker::new();
-        coordinator
-            .add_worker(NodeId(0), w1.spawn_channel())
-            .await;
-        coordinator
-            .add_worker(NodeId(1), w2.spawn_channel())
-            .await;
+        coordinator.add_worker(NodeId(0), w1.spawn_channel()).await;
+        coordinator.add_worker(NodeId(1), w2.spawn_channel()).await;
 
         let mut trainer = DistributedTrainer::from_coordinator(coordinator, 0.01, 1);
         let graph = simple_add_graph();
@@ -250,12 +233,8 @@ mod tests {
         let coordinator = Coordinator::new();
         let w1 = Worker::new();
         let w2 = Worker::new();
-        coordinator
-            .add_worker(NodeId(0), w1.spawn_channel())
-            .await;
-        coordinator
-            .add_worker(NodeId(1), w2.spawn_channel())
-            .await;
+        coordinator.add_worker(NodeId(0), w1.spawn_channel()).await;
+        coordinator.add_worker(NodeId(1), w2.spawn_channel()).await;
 
         let mut trainer = DistributedTrainer::from_coordinator(coordinator, 0.01, 1);
         let graph = simple_add_graph();

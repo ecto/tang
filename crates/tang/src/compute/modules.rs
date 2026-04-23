@@ -65,7 +65,13 @@ impl<B: ComputeBuffer> Linear<B> {
         let wt_buf = dev.transpose_2d(&self.weight.buffer, self.out_features, self.in_features);
 
         // matmul: [batch, in_f] @ [in_f, out_f] = [batch, out_f]
-        let out_buf = dev.matmul(&input.buffer, &wt_buf, batch, self.in_features, self.out_features);
+        let out_buf = dev.matmul(
+            &input.buffer,
+            &wt_buf,
+            batch,
+            self.in_features,
+            self.out_features,
+        );
         let out = ComputeTensor::from_buffer(out_buf, vec![batch, self.out_features]);
 
         // Add bias
@@ -94,14 +100,23 @@ impl<B: ComputeBuffer> Linear<B> {
         let wt_buf = dev.transpose_2d(&self.weight.buffer, self.out_features, self.in_features);
 
         // matmul: [batch, in_f] @ [in_f, out_f] = [batch, out_f]
-        let out_buf = dev.matmul(&input.buffer, &wt_buf, batch, self.in_features, self.out_features);
+        let out_buf = dev.matmul(
+            &input.buffer,
+            &wt_buf,
+            batch,
+            self.in_features,
+            self.out_features,
+        );
         let out = ComputeTensor::from_buffer(out_buf, vec![batch, self.out_features]);
 
         // Cache input for backward (copy on device, no CPU round-trip)
         let cached_input = dev.copy_buffer(&input.buffer);
 
         let out = bias_add(dev, &out, &self.bias);
-        let cache = LinearCache { input: cached_input, batch };
+        let cache = LinearCache {
+            input: cached_input,
+            batch,
+        };
         (out, cache)
     }
 
@@ -118,19 +133,30 @@ impl<B: ComputeBuffer> Linear<B> {
 
         // grad_input = grad_output @ W  (W is [out_f, in_f])
         // grad_output: [batch, out_f], W: [out_f, in_f] → [batch, in_f]
-        let gi_buf = dev.matmul(&grad_output.buffer, &self.weight.buffer, batch, self.out_features, self.in_features);
+        let gi_buf = dev.matmul(
+            &grad_output.buffer,
+            &self.weight.buffer,
+            batch,
+            self.out_features,
+            self.in_features,
+        );
         let grad_input = ComputeTensor::from_buffer(gi_buf, vec![batch, self.in_features]);
 
         // grad_weight = grad_output^T @ input
         // grad_output^T: [out_f, batch], input: [batch, in_f] → [out_f, in_f]
         let go_t = dev.transpose_2d(&grad_output.buffer, batch, self.out_features);
-        let gw_buf = dev.matmul(&go_t, &cache.input, self.out_features, batch, self.in_features);
+        let gw_buf = dev.matmul(
+            &go_t,
+            &cache.input,
+            self.out_features,
+            batch,
+            self.in_features,
+        );
         let grad_weight = dev.download(&gw_buf);
 
         // grad_bias = sum(grad_output, axis=0) → [out_f]
-        let grad_bias = dev.download(
-            &dev.reduce_sum(&grad_output.buffer, &[batch, self.out_features], 0),
-        );
+        let grad_bias =
+            dev.download(&dev.reduce_sum(&grad_output.buffer, &[batch, self.out_features], 0));
 
         (grad_input, grad_weight, grad_bias)
     }
@@ -145,12 +171,24 @@ impl<B: ComputeBuffer> Linear<B> {
         let batch = cache.batch;
 
         // grad_input = grad_output @ W
-        let gi_buf = dev.matmul(&grad_output.buffer, &self.weight.buffer, batch, self.out_features, self.in_features);
+        let gi_buf = dev.matmul(
+            &grad_output.buffer,
+            &self.weight.buffer,
+            batch,
+            self.out_features,
+            self.in_features,
+        );
         let grad_input = ComputeTensor::from_buffer(gi_buf, vec![batch, self.in_features]);
 
         // grad_weight = grad_output^T @ input
         let go_t = dev.transpose_2d(&grad_output.buffer, batch, self.out_features);
-        let gw_buf = dev.matmul(&go_t, &cache.input, self.out_features, batch, self.in_features);
+        let gw_buf = dev.matmul(
+            &go_t,
+            &cache.input,
+            self.out_features,
+            batch,
+            self.in_features,
+        );
 
         // grad_bias = sum(grad_output, axis=0)
         let gb_buf = dev.reduce_sum(&grad_output.buffer, &[batch, self.out_features], 0);
@@ -188,7 +226,13 @@ impl<B: ComputeBuffer> RMSNorm<B> {
         input: &ComputeTensor<B>,
     ) -> ComputeTensor<B> {
         let n_groups = input.numel() / self.dim;
-        let buf = dev.rms_norm(&input.buffer, &self.weight.buffer, n_groups, self.dim, self.eps);
+        let buf = dev.rms_norm(
+            &input.buffer,
+            &self.weight.buffer,
+            n_groups,
+            self.dim,
+            self.eps,
+        );
         ComputeTensor::from_buffer(buf, input.shape().to_vec())
     }
 }
@@ -207,10 +251,18 @@ impl<B: ComputeBuffer> RMSNorm<B> {
         input: &ComputeTensor<B>,
     ) -> (ComputeTensor<B>, RMSNormCache<B>) {
         let n_groups = input.numel() / self.dim;
-        let buf = dev.rms_norm(&input.buffer, &self.weight.buffer, n_groups, self.dim, self.eps);
+        let buf = dev.rms_norm(
+            &input.buffer,
+            &self.weight.buffer,
+            n_groups,
+            self.dim,
+            self.eps,
+        );
         let out = ComputeTensor::from_buffer(buf, input.shape().to_vec());
 
-        let cache = RMSNormCache { input: dev.copy_buffer(&input.buffer) };
+        let cache = RMSNormCache {
+            input: dev.copy_buffer(&input.buffer),
+        };
         (out, cache)
     }
 
@@ -225,8 +277,12 @@ impl<B: ComputeBuffer> RMSNorm<B> {
     ) -> (ComputeTensor<B>, Vec<f32>) {
         let n_groups = grad_output.numel() / self.dim;
         let (gi_buf, gw_buf) = dev.rms_norm_backward(
-            &cache.input, &self.weight.buffer, &grad_output.buffer,
-            n_groups, self.dim, self.eps,
+            &cache.input,
+            &self.weight.buffer,
+            &grad_output.buffer,
+            n_groups,
+            self.dim,
+            self.eps,
         );
         let grad_weight = dev.download(&gw_buf);
         let grad_input = ComputeTensor::from_buffer(gi_buf, grad_output.shape().to_vec());
@@ -242,8 +298,12 @@ impl<B: ComputeBuffer> RMSNorm<B> {
     ) -> (ComputeTensor<B>, B) {
         let n_groups = grad_output.numel() / self.dim;
         let (gi_buf, gw_buf) = dev.rms_norm_backward(
-            &cache.input, &self.weight.buffer, &grad_output.buffer,
-            n_groups, self.dim, self.eps,
+            &cache.input,
+            &self.weight.buffer,
+            &grad_output.buffer,
+            n_groups,
+            self.dim,
+            self.eps,
         );
         let grad_input = ComputeTensor::from_buffer(gi_buf, grad_output.shape().to_vec());
         (grad_input, gw_buf)
@@ -317,7 +377,10 @@ impl<B: ComputeBuffer> Embedding<B> {
         let buf = dev.embedding(&self.weight.buffer, ids, seq_len, self.dim);
         let out = ComputeTensor::from_buffer(buf, vec![seq_len, self.dim]);
 
-        let cache = EmbeddingCache { ids: dev.copy_buffer(ids), seq_len };
+        let cache = EmbeddingCache {
+            ids: dev.copy_buffer(ids),
+            seq_len,
+        };
         (out, cache)
     }
 
@@ -331,8 +394,11 @@ impl<B: ComputeBuffer> Embedding<B> {
         cache: &EmbeddingCache<B>,
     ) -> Vec<f32> {
         let gw_buf = dev.embedding_backward(
-            &grad_output.buffer, &cache.ids,
-            self.vocab_size, cache.seq_len, self.dim,
+            &grad_output.buffer,
+            &cache.ids,
+            self.vocab_size,
+            cache.seq_len,
+            self.dim,
         );
         dev.download(&gw_buf)
     }
@@ -345,8 +411,11 @@ impl<B: ComputeBuffer> Embedding<B> {
         cache: &EmbeddingCache<B>,
     ) -> B {
         dev.embedding_backward(
-            &grad_output.buffer, &cache.ids,
-            self.vocab_size, cache.seq_len, self.dim,
+            &grad_output.buffer,
+            &cache.ids,
+            self.vocab_size,
+            cache.seq_len,
+            self.dim,
         )
     }
 }
@@ -447,7 +516,12 @@ impl InterleavedRoPE {
             }
         }
 
-        Self { cos_table, sin_table, head_dim, max_seq_len }
+        Self {
+            cos_table,
+            sin_table,
+            head_dim,
+            max_seq_len,
+        }
     }
 
     /// Apply RoPE to input tensor.
@@ -461,7 +535,11 @@ impl InterleavedRoPE {
         start_pos: usize,
     ) -> ComputeTensor<D::Buffer> {
         let shape = input.shape();
-        assert_eq!(shape.len(), 3, "InterleavedRoPE expects 3D [seq, heads, dim]");
+        assert_eq!(
+            shape.len(),
+            3,
+            "InterleavedRoPE expects 3D [seq, heads, dim]"
+        );
         let seq_len = shape[0];
         let n_heads = shape[1];
         let head_dim = shape[2];
@@ -474,7 +552,11 @@ impl InterleavedRoPE {
 
         for s in 0..seq_len {
             let pos = start_pos + s;
-            assert!(pos < self.max_seq_len, "RoPE position {pos} >= max {}", self.max_seq_len);
+            assert!(
+                pos < self.max_seq_len,
+                "RoPE position {pos} >= max {}",
+                self.max_seq_len
+            );
             for h in 0..n_heads {
                 let base_idx = (s * n_heads + h) * head_dim;
                 for i in 0..half_dim {
@@ -536,15 +618,21 @@ impl InterleavedRoPE {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::CpuDevice;
+    use super::*;
 
     #[test]
     fn linear_forward() {
         let dev = CpuDevice::new();
         // W = [[1,0],[0,1],[1,1]], b = [0.1, 0.2, 0.3]
         // in=2, out=3
-        let lin = Linear::new(&dev, &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0], &[0.1, 0.2, 0.3], 2, 3);
+        let lin = Linear::new(
+            &dev,
+            &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            &[0.1, 0.2, 0.3],
+            2,
+            3,
+        );
         let x = ComputeTensor::from_data(&dev, &[2.0, 3.0], &[1, 2]);
         let y = lin.forward_2d(&dev, &x);
         let v = y.to_vec();
@@ -644,7 +732,13 @@ mod tests {
     #[test]
     fn linear_backward_grad_shape() {
         let dev = CpuDevice::new();
-        let lin = Linear::new(&dev, &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0], &[0.1, 0.2, 0.3], 2, 3);
+        let lin = Linear::new(
+            &dev,
+            &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            &[0.1, 0.2, 0.3],
+            2,
+            3,
+        );
         let x = ComputeTensor::from_data(&dev, &[2.0, 3.0, 1.0, 4.0], &[2, 2]);
         let (out, cache) = lin.forward_2d_train(&dev, &x);
         assert_eq!(out.shape(), &[2, 3]);
@@ -701,7 +795,13 @@ mod tests {
     #[test]
     fn linear_backward_device_matches_cpu() {
         let dev = CpuDevice::new();
-        let lin = Linear::new(&dev, &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0], &[0.1, 0.2, 0.3], 2, 3);
+        let lin = Linear::new(
+            &dev,
+            &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            &[0.1, 0.2, 0.3],
+            2,
+            3,
+        );
         let x = ComputeTensor::from_data(&dev, &[2.0, 3.0, 1.0, 4.0], &[2, 2]);
         let (_, cache1) = lin.forward_2d_train(&dev, &x);
         let (_, cache2) = lin.forward_2d_train(&dev, &x);

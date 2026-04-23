@@ -169,7 +169,7 @@ fn json_to_config(json: &str) -> Option<HoloConfig> {
         let pattern = format!("\"{}\":", key);
         let pos = json.find(&pattern)?;
         let rest = &json[pos + pattern.len()..];
-        let end = rest.find(|c: char| c == ',' || c == '}')?;
+        let end = rest.find([',', '}'])?;
         rest[..end].trim().parse().ok()
     };
 
@@ -235,10 +235,7 @@ mod tests {
         assert_eq!(loaded.config.num_anchors, 50);
 
         // Verify params match
-        assert_eq!(
-            loaded.triplane.params_flat(),
-            model.triplane.params_flat()
-        );
+        assert_eq!(loaded.triplane.params_flat(), model.triplane.params_flat());
 
         std::fs::remove_file(&tmp).ok();
     }

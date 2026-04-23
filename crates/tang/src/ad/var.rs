@@ -1,8 +1,8 @@
 use super::Tape;
+use crate::la::DVec;
 use alloc::sync::Arc;
 use alloc::vec;
 use core::ops::{Add, Div, Mul, Neg, Sub};
-use crate::la::DVec;
 
 /// A variable tracked on the AD tape.
 ///

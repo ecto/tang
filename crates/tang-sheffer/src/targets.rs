@@ -34,18 +34,54 @@ pub const TEST_POINT_2: f64 = 1.2824271291006226;
 pub fn stepping_stone_constants() -> Vec<Target> {
     let mut v = standard_constants();
     v.extend([
-        Target { name: "+inf", value: C::new(f64::INFINITY, 0.0) },
-        Target { name: "-inf", value: C::new(f64::NEG_INFINITY, 0.0) },
-        Target { name: "exp(e)", value: C::new(E.exp(), 0.0) },
-        Target { name: "e-1", value: C::new(E - 1.0, 0.0) },
-        Target { name: "e+1", value: C::new(E + 1.0, 0.0) },
-        Target { name: "2e", value: C::new(2.0 * E, 0.0) },
-        Target { name: "e/2", value: C::new(E / 2.0, 0.0) },
-        Target { name: "ln(pi)", value: C::new(PI.ln(), 0.0) },
-        Target { name: "i*pi/2", value: C::new(0.0, PI / 2.0) },
-        Target { name: "-i*pi", value: C::new(0.0, -PI) },
-        Target { name: "2i", value: C::new(0.0, 2.0) },
-        Target { name: "i/2", value: C::new(0.0, 0.5) },
+        Target {
+            name: "+inf",
+            value: C::new(f64::INFINITY, 0.0),
+        },
+        Target {
+            name: "-inf",
+            value: C::new(f64::NEG_INFINITY, 0.0),
+        },
+        Target {
+            name: "exp(e)",
+            value: C::new(E.exp(), 0.0),
+        },
+        Target {
+            name: "e-1",
+            value: C::new(E - 1.0, 0.0),
+        },
+        Target {
+            name: "e+1",
+            value: C::new(E + 1.0, 0.0),
+        },
+        Target {
+            name: "2e",
+            value: C::new(2.0 * E, 0.0),
+        },
+        Target {
+            name: "e/2",
+            value: C::new(E / 2.0, 0.0),
+        },
+        Target {
+            name: "ln(pi)",
+            value: C::new(PI.ln(), 0.0),
+        },
+        Target {
+            name: "i*pi/2",
+            value: C::new(0.0, PI / 2.0),
+        },
+        Target {
+            name: "-i*pi",
+            value: C::new(0.0, -PI),
+        },
+        Target {
+            name: "2i",
+            value: C::new(0.0, 2.0),
+        },
+        Target {
+            name: "i/2",
+            value: C::new(0.0, 0.5),
+        },
     ]);
     v
 }

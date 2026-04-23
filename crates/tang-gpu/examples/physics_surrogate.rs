@@ -17,7 +17,7 @@ use tang_expr::{ExprGraph, ExprId};
 use tang_gpu::*;
 use tang_tensor::{Shape, Tensor};
 use tang_train::{
-    mse_loss, mse_loss_grad, DataLoader, Linear, ModuleAdam, Module, Sequential, Tanh,
+    mse_loss, mse_loss_grad, DataLoader, Linear, Module, ModuleAdam, Sequential, Tanh,
     TensorDataset, Trainer,
 };
 
@@ -32,16 +32,56 @@ struct Mass {
 fn point_masses() -> Vec<Mass> {
     // 10 fixed point masses in [-2, 2]²
     vec![
-        Mass { x: 0.5, y: 0.3, m: 1.0 },
-        Mass { x: -1.2, y: 0.8, m: 2.0 },
-        Mass { x: 1.0, y: -1.0, m: 0.5 },
-        Mass { x: -0.3, y: -0.7, m: 1.5 },
-        Mass { x: 1.5, y: 1.5, m: 0.8 },
-        Mass { x: -1.8, y: -1.2, m: 1.2 },
-        Mass { x: 0.0, y: 1.8, m: 0.6 },
-        Mass { x: -0.5, y: 0.0, m: 2.5 },
-        Mass { x: 1.2, y: -1.5, m: 1.0 },
-        Mass { x: -1.0, y: 1.2, m: 0.7 },
+        Mass {
+            x: 0.5,
+            y: 0.3,
+            m: 1.0,
+        },
+        Mass {
+            x: -1.2,
+            y: 0.8,
+            m: 2.0,
+        },
+        Mass {
+            x: 1.0,
+            y: -1.0,
+            m: 0.5,
+        },
+        Mass {
+            x: -0.3,
+            y: -0.7,
+            m: 1.5,
+        },
+        Mass {
+            x: 1.5,
+            y: 1.5,
+            m: 0.8,
+        },
+        Mass {
+            x: -1.8,
+            y: -1.2,
+            m: 1.2,
+        },
+        Mass {
+            x: 0.0,
+            y: 1.8,
+            m: 0.6,
+        },
+        Mass {
+            x: -0.5,
+            y: 0.0,
+            m: 2.5,
+        },
+        Mass {
+            x: 1.2,
+            y: -1.5,
+            m: 1.0,
+        },
+        Mass {
+            x: -1.0,
+            y: 1.2,
+            m: 0.7,
+        },
     ]
 }
 
@@ -154,13 +194,11 @@ fn main() {
     let n_params: usize = cpu_model.parameters().iter().map(|p| p.data.numel()).sum();
     println!("  parameters: {}", n_params);
 
-    let losses = Trainer::new(
-        &mut cpu_model,
-        ModuleAdam::new(0.003),
-        |pred, target| (mse_loss(pred, target), mse_loss_grad(pred, target)),
-    )
-        .epochs(200)
-        .fit(&mut loader);
+    let losses = Trainer::new(&mut cpu_model, ModuleAdam::new(0.003), |pred, target| {
+        (mse_loss(pred, target), mse_loss_grad(pred, target))
+    })
+    .epochs(200)
+    .fit(&mut loader);
 
     println!("  epoch   1: loss = {:.6}", losses[0]);
     println!("  epoch 100: loss = {:.6}", losses[99]);
@@ -204,8 +242,13 @@ fn main() {
     let gpu_targets: Vec<f32> = target_data.iter().map(|&v| v as f32).collect();
     let mut gpu_loader = GpuDataLoader::new(gpu_inputs.clone(), gpu_targets, 2, 3, 256);
 
-    let gpu_losses = GpuTrainer::new(0.001, 20).fit(&device, &mut cache, &mut gpu_model, &mut gpu_loader);
-    println!("  GPU fine-tune: loss {:.6} -> {:.6}", gpu_losses[0], gpu_losses.last().unwrap());
+    let gpu_losses =
+        GpuTrainer::new(0.001, 20).fit(&device, &mut cache, &mut gpu_model, &mut gpu_loader);
+    println!(
+        "  GPU fine-tune: loss {:.6} -> {:.6}",
+        gpu_losses[0],
+        gpu_losses.last().unwrap()
+    );
 
     // 5. Benchmark
     println!("\n--- Benchmark: 10,000 point evaluations ---\n");
@@ -251,6 +294,12 @@ fn main() {
     let gpu_time = start.elapsed();
     println!("GPU network:      {:>8.2?}", gpu_time);
 
-    println!("\nspeedup (expr→GPU): {:.1}x", expr_time.as_secs_f64() / gpu_time.as_secs_f64());
-    println!("speedup (CPU→GPU):  {:.1}x", cpu_time.as_secs_f64() / gpu_time.as_secs_f64());
+    println!(
+        "\nspeedup (expr→GPU): {:.1}x",
+        expr_time.as_secs_f64() / gpu_time.as_secs_f64()
+    );
+    println!(
+        "speedup (CPU→GPU):  {:.1}x",
+        cpu_time.as_secs_f64() / gpu_time.as_secs_f64()
+    );
 }

@@ -1,5 +1,5 @@
-use crate::Scalar;
 use crate::tensor::Tensor;
+use crate::Scalar;
 
 #[cfg(test)]
 use crate::tensor::Shape;
@@ -309,9 +309,9 @@ mod tests {
         // 3 positions, vocab_size=4, no padding
         let logits = Tensor::new(
             alloc::vec![
-                10.0, 0.0, 0.0, 0.0,   // pos 0: confident in class 0
-                0.0, 10.0, 0.0, 0.0,   // pos 1: confident in class 1
-                0.0, 0.0, 10.0, 0.0,   // pos 2: confident in class 2
+                10.0, 0.0, 0.0, 0.0, // pos 0: confident in class 0
+                0.0, 10.0, 0.0, 0.0, // pos 1: confident in class 1
+                0.0, 0.0, 10.0, 0.0, // pos 2: confident in class 2
             ],
             Shape::from_slice(&[3, 4]),
         );
@@ -324,8 +324,8 @@ mod tests {
     fn seq_ce_skips_padding() {
         let logits = Tensor::new(
             alloc::vec![
-                1.0, 2.0, 3.0,   // pos 0
-                1.0, 2.0, 3.0,   // pos 1 (will be padding)
+                1.0, 2.0, 3.0, // pos 0
+                1.0, 2.0, 3.0, // pos 1 (will be padding)
             ],
             Shape::from_slice(&[2, 3]),
         );
@@ -334,10 +334,7 @@ mod tests {
         let loss_with_pad = sequence_cross_entropy(&logits, &targets, 99);
 
         // Should equal single-position CE for pos 0 targeting class 2
-        let single_logits = Tensor::new(
-            alloc::vec![1.0, 2.0, 3.0],
-            Shape::from_slice(&[1, 3]),
-        );
+        let single_logits = Tensor::new(alloc::vec![1.0, 2.0, 3.0], Shape::from_slice(&[1, 3]));
         let single_targets = Tensor::from_slice(&[2.0]);
         let loss_single = cross_entropy_loss(&single_logits, &single_targets);
 
@@ -351,10 +348,7 @@ mod tests {
 
     #[test]
     fn seq_ce_all_padding_returns_zero() {
-        let logits = Tensor::new(
-            alloc::vec![1.0, 2.0, 1.0, 2.0],
-            Shape::from_slice(&[2, 2]),
-        );
+        let logits = Tensor::new(alloc::vec![1.0, 2.0, 1.0, 2.0], Shape::from_slice(&[2, 2]));
         let targets = Tensor::from_slice(&[0.0, 0.0]);
         let loss = sequence_cross_entropy(&logits, &targets, 0);
         assert!((loss - 0.0).abs() < 1e-15);
@@ -414,7 +408,10 @@ mod tests {
                 assert!(
                     (numerical - analytic.get(&[t, c])).abs() < 1e-5,
                     "grad mismatch at [{},{}]: numerical={}, analytic={}",
-                    t, c, numerical, analytic.get(&[t, c])
+                    t,
+                    c,
+                    numerical,
+                    analytic.get(&[t, c])
                 );
             }
         }

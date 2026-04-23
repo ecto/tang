@@ -11,10 +11,7 @@
 //! ```
 
 use tang_expr::ExprGraph;
-use tang_mesh::{
-    AllReduce, Coordinator, NodeId, Worker,
-    protocol::WireGraph,
-};
+use tang_mesh::{protocol::WireGraph, AllReduce, Coordinator, NodeId, Worker};
 
 // --- Build the model as a WireGraph ------------------------------------------
 
@@ -24,17 +21,17 @@ use tang_mesh::{
 /// Output: w1 * sin(w2 * x + w3) + w4
 fn build_model_graph() -> WireGraph {
     let mut g = ExprGraph::new();
-    let x = g.var(0);   // input
-    let w1 = g.var(1);  // amplitude
-    let w2 = g.var(2);  // frequency
-    let w3 = g.var(3);  // phase
-    let w4 = g.var(4);  // offset
+    let x = g.var(0); // input
+    let w1 = g.var(1); // amplitude
+    let w2 = g.var(2); // frequency
+    let w3 = g.var(3); // phase
+    let w4 = g.var(4); // offset
 
     let w2x = g.mul(w2, x);
-    let inner = g.add(w2x, w3);           // w2*x + w3
-    let s = g.sin(inner);                  // sin(w2*x + w3)
+    let inner = g.add(w2x, w3); // w2*x + w3
+    let s = g.sin(inner); // sin(w2*x + w3)
     let w1s = g.mul(w1, s);
-    let out = g.add(w1s, w4);              // w1*sin(...) + w4
+    let out = g.add(w1s, w4); // w1*sin(...) + w4
 
     WireGraph::from_expr_graph(&g, &[out], 5)
 }
@@ -100,8 +97,12 @@ async fn main() {
 
     // Build model graph
     let graph = build_model_graph();
-    println!("graph: {} nodes, {} outputs, {} inputs",
-        graph.nodes.len(), graph.outputs.len(), graph.n_inputs);
+    println!(
+        "graph: {} nodes, {} outputs, {} inputs",
+        graph.nodes.len(),
+        graph.outputs.len(),
+        graph.n_inputs
+    );
 
     // Spawn 2 in-process workers
     let coordinator = Coordinator::new();
@@ -127,8 +128,17 @@ async fn main() {
     let allreduce = AllReduce::mean();
     let num_epochs = 200;
 
-    println!("training: {} epochs, lr={}, data split={}/{}", num_epochs, lr, shard0.len(), shard1.len());
-    println!("initial params: w1={:.3}, w2={:.3}, w3={:.3}, w4={:.3}\n", params[0], params[1], params[2], params[3]);
+    println!(
+        "training: {} epochs, lr={}, data split={}/{}",
+        num_epochs,
+        lr,
+        shard0.len(),
+        shard1.len()
+    );
+    println!(
+        "initial params: w1={:.3}, w2={:.3}, w3={:.3}, w4={:.3}\n",
+        params[0], params[1], params[2], params[3]
+    );
 
     for epoch in 0..num_epochs {
         // Each worker computes loss and gradients on its shard
@@ -138,9 +148,19 @@ async fn main() {
         // Forward on workers (verify they can execute the compiled graph)
         if epoch == 0 {
             let test_input = vec![1.0f32, params[0], params[1], params[2], params[3]];
-            let result = coordinator.execute_on(NodeId(0), task_id, test_input.clone()).await.unwrap();
-            println!("worker 0 verify: f(1.0) = {:.4} (expected: {:.4})", result[0], 1.0f32.sin());
-            let result = coordinator.execute_on(NodeId(1), task_id, test_input).await.unwrap();
+            let result = coordinator
+                .execute_on(NodeId(0), task_id, test_input.clone())
+                .await
+                .unwrap();
+            println!(
+                "worker 0 verify: f(1.0) = {:.4} (expected: {:.4})",
+                result[0],
+                1.0f32.sin()
+            );
+            let result = coordinator
+                .execute_on(NodeId(1), task_id, test_input)
+                .await
+                .unwrap();
             println!("worker 1 verify: f(1.0) = {:.4}\n", result[0]);
         }
 
@@ -162,7 +182,12 @@ async fn main() {
         if (epoch + 1) % 20 == 0 || epoch == 0 {
             println!(
                 "epoch {:>3}: loss = {:.6}  w1={:.3} w2={:.3} w3={:.3} w4={:.3}",
-                epoch + 1, avg_loss, params[0], params[1], params[2], params[3]
+                epoch + 1,
+                avg_loss,
+                params[0],
+                params[1],
+                params[2],
+                params[3]
             );
         }
     }

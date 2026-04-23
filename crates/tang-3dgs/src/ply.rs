@@ -212,8 +212,8 @@ fn parse_binary_data<R: Read>(
         0
     } else {
         let coeffs_per_channel = sh_rest_count / 3 + 1;
-        let deg = (coeffs_per_channel as f64).sqrt() as u32 - 1;
-        deg
+
+        (coeffs_per_channel as f64).sqrt() as u32 - 1
     };
 
     let sh_per_gaussian = 3 * ((sh_degree + 1) * (sh_degree + 1)) as usize;
@@ -238,7 +238,9 @@ fn parse_binary_data<R: Read>(
     let mut buf = vec![0u8; header.vertex_bytes];
 
     for _ in 0..n {
-        reader.read_exact(&mut buf).map_err(|_| PlyError::UnexpectedEof)?;
+        reader
+            .read_exact(&mut buf)
+            .map_err(|_| PlyError::UnexpectedEof)?;
 
         let read_f32 = |offset: usize| -> f32 {
             f32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap())
@@ -339,12 +341,23 @@ mod tests {
         for i in 0..n {
             let t = i as f32;
             let floats: [f32; 17] = [
-                t, t + 1.0, t + 2.0, // x, y, z
-                0.0, 0.0, 1.0, // nx, ny, nz
-                0.5, 0.6, 0.7, // f_dc RGB
-                2.0,  // opacity (logit)
-                -3.0, -3.0, -3.0, // scale (log)
-                1.0, 0.0, 0.0, 0.0, // rot (w,x,y,z)
+                t,
+                t + 1.0,
+                t + 2.0, // x, y, z
+                0.0,
+                0.0,
+                1.0, // nx, ny, nz
+                0.5,
+                0.6,
+                0.7, // f_dc RGB
+                2.0, // opacity (logit)
+                -3.0,
+                -3.0,
+                -3.0, // scale (log)
+                1.0,
+                0.0,
+                0.0,
+                0.0, // rot (w,x,y,z)
             ];
             for f in floats {
                 data.extend_from_slice(&f.to_le_bytes());

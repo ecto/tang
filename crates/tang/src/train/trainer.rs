@@ -1,10 +1,10 @@
 use super::data::{DataLoader, Dataset};
 use super::scheduler::Scheduler;
 use super::{Module, Optimizer};
+use crate::tensor::Tensor;
+use crate::Scalar;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use crate::Scalar;
-use crate::tensor::Tensor;
 
 /// Loss function type: takes (prediction, target) and returns (scalar loss, gradient tensor).
 pub type LossFn<S> = fn(&Tensor<S>, &Tensor<S>) -> (f64, Tensor<S>);
@@ -79,10 +79,7 @@ where
     }
 
     /// Run the training loop. Returns per-epoch average loss.
-    pub fn fit<D: Dataset<S>>(
-        &mut self,
-        loader: &mut DataLoader<'_, S, D>,
-    ) -> Vec<f64> {
+    pub fn fit<D: Dataset<S>>(&mut self, loader: &mut DataLoader<'_, S, D>) -> Vec<f64> {
         let mut losses = Vec::with_capacity(self.num_epochs);
 
         for epoch in 0..self.num_epochs {
@@ -131,11 +128,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::data::TensorDataset;
-    use super::{Linear, ModuleAdam, Sequential, Tanh, mse_loss, mse_loss_grad};
-    use alloc::{boxed::Box, vec};
+    use super::*;
+    use super::{mse_loss, mse_loss_grad, Linear, ModuleAdam, Sequential, Tanh};
     use crate::tensor::Shape;
+    use alloc::{boxed::Box, vec};
 
     #[test]
     fn trainer_basic() {
@@ -153,13 +150,11 @@ mod tests {
             Box::new(Linear::new(8, 1, 456)),
         ]);
 
-        let losses = Trainer::new(
-            &mut model,
-            ModuleAdam::new(0.01),
-            |p, t| (mse_loss(p, t), mse_loss_grad(p, t)),
-        )
-            .epochs(200)
-            .fit(&mut loader);
+        let losses = Trainer::new(&mut model, ModuleAdam::new(0.01), |p, t| {
+            (mse_loss(p, t), mse_loss_grad(p, t))
+        })
+        .epochs(200)
+        .fit(&mut loader);
 
         assert_eq!(losses.len(), 200);
         assert!(

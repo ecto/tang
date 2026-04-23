@@ -104,7 +104,7 @@ impl<S: Scalar> DVec<S> {
         if n > S::EPSILON {
             let inv = n.recip();
             for x in &mut self.data {
-                *x = *x * inv;
+                *x *= inv;
             }
         }
         n
@@ -120,7 +120,7 @@ impl<S: Scalar> DVec<S> {
     /// Scale all elements.
     pub fn scale(&mut self, s: S) {
         for x in &mut self.data {
-            *x = *x * s;
+            *x *= s;
         }
     }
 

@@ -6,6 +6,12 @@ pub struct Newton {
     pub tol: f64,
 }
 
+impl Default for Newton {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Newton {
     pub fn new() -> Self {
         Self {
@@ -32,12 +38,12 @@ impl Newton {
                 let dir = lu.solve(&g);
                 // x -= dir (Newton step)
                 for i in 0..x.len() {
-                    x[i] = x[i] - dir[i];
+                    x[i] -= dir[i];
                 }
             } else {
                 // Fallback to gradient descent if Hessian is singular
                 for i in 0..x.len() {
-                    x[i] = x[i] - 0.01 * g[i];
+                    x[i] -= 0.01 * g[i];
                 }
             }
         }

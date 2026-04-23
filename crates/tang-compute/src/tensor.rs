@@ -12,29 +12,56 @@ impl<B: ComputeBuffer> ComputeTensor<B> {
     /// Upload f32 data to device with the given shape.
     pub fn from_data<D: ComputeDevice<Buffer = B>>(dev: &D, data: &[f32], shape: &[usize]) -> Self {
         let numel: usize = shape.iter().product();
-        assert_eq!(data.len(), numel, "data length {} != shape product {}", data.len(), numel);
-        Self { buffer: dev.upload(data), shape: shape.to_vec() }
+        assert_eq!(
+            data.len(),
+            numel,
+            "data length {} != shape product {}",
+            data.len(),
+            numel
+        );
+        Self {
+            buffer: dev.upload(data),
+            shape: shape.to_vec(),
+        }
     }
 
     /// Create a zero-filled tensor on device.
     pub fn zeros<D: ComputeDevice<Buffer = B>>(dev: &D, shape: &[usize]) -> Self {
         let numel: usize = shape.iter().product();
         let data = vec![0.0f32; numel];
-        Self { buffer: dev.upload(&data), shape: shape.to_vec() }
+        Self {
+            buffer: dev.upload(&data),
+            shape: shape.to_vec(),
+        }
     }
 
     /// Wrap an existing buffer with shape metadata.
     pub fn from_buffer(buffer: B, shape: Vec<usize>) -> Self {
         let numel: usize = shape.iter().product();
-        assert_eq!(buffer.len(), numel, "buffer len {} != shape product {}", buffer.len(), numel);
+        assert_eq!(
+            buffer.len(),
+            numel,
+            "buffer len {} != shape product {}",
+            buffer.len(),
+            numel
+        );
         Self { buffer, shape }
     }
 
     /// Zero-copy reshape. Panics if numel doesn't match.
     pub fn reshape(self, new_shape: &[usize]) -> Self {
         let new_numel: usize = new_shape.iter().product();
-        assert_eq!(self.numel(), new_numel, "reshape: {} != {}", self.numel(), new_numel);
-        Self { buffer: self.buffer, shape: new_shape.to_vec() }
+        assert_eq!(
+            self.numel(),
+            new_numel,
+            "reshape: {} != {}",
+            self.numel(),
+            new_numel
+        );
+        Self {
+            buffer: self.buffer,
+            shape: new_shape.to_vec(),
+        }
     }
 
     /// Shape of this tensor.

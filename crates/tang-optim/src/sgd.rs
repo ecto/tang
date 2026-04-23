@@ -31,11 +31,11 @@ impl Sgd {
             let v = self.velocity.get_or_insert_with(|| DVec::zeros(n));
             for i in 0..n {
                 v[i] = self.momentum * v[i] + grad[i];
-                params[i] = params[i] - self.lr * v[i];
+                params[i] -= self.lr * v[i];
             }
         } else {
             for i in 0..n {
-                params[i] = params[i] - self.lr * grad[i];
+                params[i] -= self.lr * grad[i];
             }
         }
     }

@@ -52,8 +52,11 @@ impl Mlp {
     /// Forward pass for a single input.
     pub fn forward(&self, input: &[f32]) -> Vec<f32> {
         let mut x = input.to_vec();
-        for (i, ((in_dim, out_dim), (w, b))) in
-            self.dims.iter().zip(self.weights.iter().zip(self.biases.iter())).enumerate()
+        for (i, ((in_dim, out_dim), (w, b))) in self
+            .dims
+            .iter()
+            .zip(self.weights.iter().zip(self.biases.iter()))
+            .enumerate()
         {
             let mut y = vec![0.0f32; *out_dim];
             for j in 0..*out_dim {
@@ -105,11 +108,11 @@ impl Mlp {
 /// Canonical gaussian predictor: triplane features → gaussian parameters.
 ///
 /// Output layout per gaussian (14 values):
-/// - [0..3]: position offset (dx, dy, dz)
-/// - [3..6]: log-scale (sx, sy, sz)
-/// - [6..10]: rotation quaternion (w, x, y, z)
-/// - [10]: opacity logit
-/// - [11..14]: SH DC color (r, g, b)
+/// - `[0..3]`: position offset (dx, dy, dz)
+/// - `[3..6]`: log-scale (sx, sy, sz)
+/// - `[6..10]`: rotation quaternion (w, x, y, z)
+/// - `[10]`: opacity logit
+/// - `[11..14]`: SH DC color (r, g, b)
 pub struct CanonicalPredictor {
     pub mlp: Mlp,
 }

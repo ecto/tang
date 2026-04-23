@@ -277,6 +277,9 @@ fn main() {
     if max_error < 0.05 {
         println!("\nSUCCESS: max error < 0.05");
     } else {
-        println!("\nNOTE: max error = {:.4} (target < 0.05, may need more epochs)", max_error);
+        println!(
+            "\nNOTE: max error = {:.4} (target < 0.05, may need more epochs)",
+            max_error
+        );
     }
 }
