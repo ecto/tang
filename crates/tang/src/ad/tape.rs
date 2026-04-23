@@ -21,6 +21,7 @@ pub struct Tape {
 
 impl Tape {
     /// Create a new empty tape.
+    #[allow(clippy::arc_with_non_send_sync)]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             ops: RefCell::new(Vec::new()),
