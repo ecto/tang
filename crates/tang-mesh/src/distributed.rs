@@ -91,7 +91,7 @@ impl DistributedTrainer {
 
         for _epoch in 0..self.num_epochs {
             // Shard data across workers
-            let chunk_size = (data.len() + n_workers - 1) / n_workers;
+            let chunk_size = data.len().div_ceil(n_workers);
             let worker_ids = coordinator.worker_ids().await;
 
             let mut worker_grads = Vec::new();

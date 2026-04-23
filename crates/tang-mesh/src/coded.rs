@@ -423,7 +423,7 @@ impl CodedModel {
         let k = generator.k;
         let mut shards = Vec::with_capacity(layer_weights.len());
         for weights in layer_weights {
-            let block_len = (weights.len() + k - 1) / k;
+            let block_len = weights.len().div_ceil(k);
             let mut padded = weights.to_vec();
             padded.resize(block_len * k, 0.0);
 
@@ -560,7 +560,7 @@ pub fn reshape_seq_to_blocks(seq_major: &[f32], k: usize, seq_len: usize) -> Vec
 /// Splits `full` into k blocks and returns n coded vectors (one per node).
 pub fn encode_outputs(generator: &Generator, full: &[f32]) -> Vec<Vec<f32>> {
     let k = generator.k;
-    let block_len = (full.len() + k - 1) / k;
+    let block_len = full.len().div_ceil(k);
     let mut padded = full.to_vec();
     padded.resize(block_len * k, 0.0);
 

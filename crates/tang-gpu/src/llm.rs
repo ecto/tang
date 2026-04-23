@@ -1265,7 +1265,7 @@ fn causal_attention_fused(
 
     // Use a workgroup per (query_pos, head) pair.
     // Each workgroup computes attention for one query position and one head.
-    let wg_size = (seq_len as u32).next_power_of_two().min(256).max(1);
+    let wg_size = (seq_len as u32).next_power_of_two().clamp(1, 256);
 
     let wgsl = format!(
         r#"// Fused causal GQA attention
@@ -1522,7 +1522,7 @@ pub fn kv_attention_fused(
     let heads_per_group = n_heads / n_kv_heads;
     let out = GpuTensor::uninit(device, &[q_len, n_heads * head_dim]);
 
-    let wg_size = (kv_len as u32).next_power_of_two().min(256).max(1);
+    let wg_size = (kv_len as u32).next_power_of_two().clamp(1, 256);
 
     let wgsl = format!(
         r#"// Fused causal GQA attention with separate Q/KV lengths
@@ -2955,9 +2955,9 @@ mod tests {
         let result = out.to_vec_sync(&device);
 
         // SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
-        let expected: Vec<f32> = [0.0, 1.0, -1.0, 2.0]
+        let expected: Vec<f32> = [0.0_f32, 1.0, -1.0, 2.0]
             .iter()
-            .map(|&x| x / (1.0 + (-x as f32).exp()))
+            .map(|&x| x / (1.0 + (-x).exp()))
             .collect();
 
         for (i, (&got, &exp)) in result.iter().zip(expected.iter()).enumerate() {
@@ -3349,7 +3349,7 @@ mod tests {
         let input = GpuTensor::from_slice(&device, &input_data, &[2, 4]);
 
         let _output = rms.forward_train(&device, &mut cache, &input);
-        let grad_out = GpuTensor::from_slice(&device, &vec![1.0f32; 8], &[2, 4]);
+        let grad_out = GpuTensor::from_slice(&device, &[1.0f32; 8], &[2, 4]);
         let grad_input = rms.backward(&device, &mut cache, &grad_out);
 
         cache.flush(&device);
@@ -3738,7 +3738,7 @@ mod tests {
         assert_eq!(output.shape(), &[2, 4]);
 
         // Backward
-        let grad_out = GpuTensor::from_slice(&device, &vec![1.0f32; 8], &[2, 4]);
+        let grad_out = GpuTensor::from_slice(&device, &[1.0f32; 8], &[2, 4]);
         let grad_input = block.backward(&device, &mut cache, &grad_out);
         assert_eq!(grad_input.shape(), &[2, 4]);
 

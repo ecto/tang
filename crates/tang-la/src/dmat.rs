@@ -252,7 +252,7 @@ impl<S: Scalar> DMat<S> {
                 let b_kj = b[j * rhs.nrows + k];
                 let a_col = k * m;
                 for i in 0..m {
-                    c_data[c_col + i] = c_data[c_col + i] + a[a_col + i] * b_kj;
+                    c_data[c_col + i] += a[a_col + i] * b_kj;
                 }
             }
         }

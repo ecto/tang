@@ -94,7 +94,7 @@ where
         let grads = out.backward();
         let vk = v[k];
         for i in 0..n {
-            result[i] = result[i] + vk * grads[indices[i]];
+            result[i] += vk * grads[indices[i]];
         }
     }
     result

@@ -815,7 +815,7 @@ impl<S: Scalar> Module<S> for LayerNorm<S> {
             for f in 0..features {
                 mean += input.get(&[b, f]);
             }
-            mean = mean / n;
+            mean /= n;
 
             // variance
             let mut var = S::ZERO;
@@ -823,7 +823,7 @@ impl<S: Scalar> Module<S> for LayerNorm<S> {
                 let diff = input.get(&[b, f]) - mean;
                 var += diff * diff;
             }
-            var = var / n;
+            var /= n;
 
             let inv_std = (var + eps).sqrt();
 
@@ -890,14 +890,14 @@ impl<S: Scalar> Module<S> for LayerNorm<S> {
             for j in 0..features {
                 mean += input.get(&[b, j]);
             }
-            mean = mean / n;
+            mean /= n;
 
             let mut var = S::ZERO;
             for j in 0..features {
                 let diff = input.get(&[b, j]) - mean;
                 var += diff * diff;
             }
-            var = var / n;
+            var /= n;
             let inv_std = S::from_f64(1.0) / (var + eps).sqrt();
 
             // dy_hat = grad_output * gamma (scaled gradient)
@@ -909,8 +909,8 @@ impl<S: Scalar> Module<S> for LayerNorm<S> {
                 mean_dy += dy_hat;
                 mean_dy_xn += dy_hat * cached_norm.get(&[b, j]);
             }
-            mean_dy = mean_dy / n;
-            mean_dy_xn = mean_dy_xn / n;
+            mean_dy /= n;
+            mean_dy_xn /= n;
 
             let dy_hat = grad_output.get(&[b, f]) * self.gamma.data.get(&[f]);
             (dy_hat - mean_dy - cached_norm.get(&[b, f]) * mean_dy_xn) * inv_std
@@ -965,7 +965,7 @@ pub struct MultiHeadAttention<S: Scalar> {
 impl<S: Scalar> MultiHeadAttention<S> {
     pub fn new(d_model: usize, num_heads: usize, seed: u64) -> Self {
         assert!(
-            d_model % num_heads == 0,
+            d_model.is_multiple_of(num_heads),
             "d_model must be divisible by num_heads"
         );
         let head_dim = d_model / num_heads;
@@ -1006,7 +1006,7 @@ impl<S: Scalar> MultiHeadAttention<S> {
                 sum += e;
             }
             for c in 0..cols {
-                data[r * cols + c] = data[r * cols + c] / sum;
+                data[r * cols + c] /= sum;
             }
         }
         Tensor::new(data, input.shape().clone())
@@ -1664,7 +1664,7 @@ impl<S: Scalar> AdaptiveAvgPool2d<S> {
 
     /// Compute the end index for adaptive pooling bin.
     fn end_index(out_idx: usize, out_size: usize, in_size: usize) -> usize {
-        ((out_idx + 1) * in_size + out_size - 1) / out_size
+        ((out_idx + 1) * in_size).div_ceil(out_size)
     }
 }
 
@@ -2247,7 +2247,7 @@ impl<S: Scalar> RotaryEmbedding<S> {
     }
 
     pub fn with_base(dim: usize, max_seq_len: usize, base: f64) -> Self {
-        assert!(dim % 2 == 0, "RoPE dim must be even");
+        assert!(dim.is_multiple_of(2), "RoPE dim must be even");
         let half = dim / 2;
 
         // Precompute cos/sin tables: theta_i = 1 / base^(2i/dim)
@@ -2362,7 +2362,7 @@ pub struct GroupedQueryAttention<S: Scalar> {
 impl<S: Scalar> GroupedQueryAttention<S> {
     pub fn new(d_model: usize, num_heads: usize, num_kv_heads: usize, seed: u64) -> Self {
         assert!(
-            num_heads % num_kv_heads == 0,
+            num_heads.is_multiple_of(num_kv_heads),
             "num_heads must be divisible by num_kv_heads"
         );
         let head_dim = d_model / num_heads;
@@ -2415,7 +2415,7 @@ impl<S: Scalar> GroupedQueryAttention<S> {
                 sum += e;
             }
             for c in 0..cols {
-                data[r * cols + c] = data[r * cols + c] / sum;
+                data[r * cols + c] /= sum;
             }
         }
         Tensor::new(data, input.shape().clone())
@@ -3106,7 +3106,7 @@ pub struct GroupNorm<S: Scalar> {
 impl<S: Scalar> GroupNorm<S> {
     pub fn new(num_groups: usize, num_channels: usize) -> Self {
         assert!(
-            num_channels % num_groups == 0,
+            num_channels.is_multiple_of(num_groups),
             "num_channels must be divisible by num_groups"
         );
         Self {
@@ -3954,11 +3954,7 @@ impl<S: Scalar> Module<S> for SlidingWindowAttention<S> {
 
             for qi in 0..seq_len {
                 // Window: attend to positions max(0, qi - window_size + 1)..=qi
-                let start = if qi + 1 >= self.window_size {
-                    qi + 1 - self.window_size
-                } else {
-                    0
-                };
+                let start = (qi + 1).saturating_sub(self.window_size);
                 let end = qi + 1;
 
                 // Compute scores within window
@@ -3985,7 +3981,7 @@ impl<S: Scalar> Module<S> for SlidingWindowAttention<S> {
                     exp_sum += *s;
                 }
                 for s in scores.iter_mut() {
-                    *s = *s / exp_sum;
+                    *s /= exp_sum;
                 }
 
                 // Weighted sum of values

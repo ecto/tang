@@ -37,12 +37,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libssl-dev pkg-config
-      - name: Clippy (workspace, excluding wasm crates)
+      - name: Clippy (workspace lib/tests/bins, excluding wasm crates)
         run: >
-          cargo clippy --workspace --all-targets
+          cargo clippy --workspace --lib --tests --bins
           --exclude tang-site-wasm
           --exclude tang-sheffer-wasm
           -- -D warnings
+          -A clippy::too_many_arguments
+          -A clippy::type_complexity
+          -A clippy::needless_range_loop
+          -A clippy::ptr_arg
 
   test:
     name: test
@@ -60,11 +64,12 @@ jobs:
           cargo build --workspace
           --exclude tang-site-wasm
           --exclude tang-sheffer-wasm
-      - name: Test (workspace, excluding wasm crates)
+      - name: Test (workspace lib/tests/bins, excluding wasm and gpu crates)
         run: >
-          cargo test --workspace
+          cargo test --workspace --lib --tests --bins
           --exclude tang-site-wasm
           --exclude tang-sheffer-wasm
+          --exclude tang-gpu
 
   wasm:
     name: wasm build

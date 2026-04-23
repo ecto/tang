@@ -212,8 +212,8 @@ fn parse_binary_data<R: Read>(
         0
     } else {
         let coeffs_per_channel = sh_rest_count / 3 + 1;
-        let deg = (coeffs_per_channel as f64).sqrt() as u32 - 1;
-        deg
+
+        (coeffs_per_channel as f64).sqrt() as u32 - 1
     };
 
     let sh_per_gaussian = 3 * ((sh_degree + 1) * (sh_degree + 1)) as usize;

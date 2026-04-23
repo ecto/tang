@@ -4,7 +4,7 @@ use tang_train::{
     ConvTranspose2d, Dropout, Embedding, GroupNorm, GroupedQueryAttention, InstanceNorm, LayerNorm,
     Linear, LoRA, MaxPool2d, Module, ModuleAdam, ModuleSgd, MultiHeadAttention, Optimizer, RMSNorm,
     ReLU, RotaryEmbedding, Sequential, SiLU, SlidingWindowAttention, Tanh, TransformerBlock,
-    Upsample, UpsampleMode, GELU, GRU, LSTM,
+    Upsample, GELU, GRU, LSTM,
 };
 
 #[test]
@@ -488,7 +488,7 @@ fn test_conv1d_forward_shape() {
 #[test]
 fn test_conv2d_forward_shape() {
     let mut conv = Conv2d::<f64>::new(1, 4, 3, 42); // in=1, out=4, 3x3 kernel
-    let input = Tensor::new(vec![0.0; 1 * 1 * 5 * 5], Shape::from_slice(&[1, 1, 5, 5]));
+    let input = Tensor::new(vec![0.0; 5 * 5], Shape::from_slice(&[1, 1, 5, 5]));
     let output = conv.forward(&input);
     assert_eq!(output.shape().dims(), &[1, 4, 3, 3]); // 5-3+1 = 3
 }
@@ -1072,7 +1072,7 @@ fn test_gqa_named_parameters() {
 fn test_conv2d_with_padding() {
     // padding=1 on 5x5 input with 3x3 kernel should preserve spatial dims
     let mut conv = Conv2d::<f64>::with_options(1, 1, 3, 1, 1, 1, 42);
-    let input = Tensor::new(vec![1.0; 1 * 1 * 5 * 5], Shape::from_slice(&[1, 1, 5, 5]));
+    let input = Tensor::new(vec![1.0; 5 * 5], Shape::from_slice(&[1, 1, 5, 5]));
     let output = conv.forward(&input);
     assert_eq!(
         output.shape().dims(),
@@ -1085,7 +1085,7 @@ fn test_conv2d_with_padding() {
 fn test_conv2d_with_stride() {
     // stride=2 on 6x6 with 3x3 kernel, no padding: out = (6-3)/2+1 = 2
     let mut conv = Conv2d::<f64>::with_options(1, 1, 3, 2, 0, 1, 42);
-    let input = Tensor::new(vec![1.0; 1 * 1 * 6 * 6], Shape::from_slice(&[1, 1, 6, 6]));
+    let input = Tensor::new(vec![1.0; 6 * 6], Shape::from_slice(&[1, 1, 6, 6]));
     let output = conv.forward(&input);
     assert_eq!(output.shape().dims(), &[1, 1, 2, 2]);
 }
@@ -1094,7 +1094,7 @@ fn test_conv2d_with_stride() {
 fn test_conv2d_with_dilation() {
     // dilation=2 on 7x7 with 3x3 kernel: effective_k = 2*(3-1)+1 = 5, out = 7-5+1 = 3
     let mut conv = Conv2d::<f64>::with_options(1, 1, 3, 1, 0, 2, 42);
-    let input = Tensor::new(vec![1.0; 1 * 1 * 7 * 7], Shape::from_slice(&[1, 1, 7, 7]));
+    let input = Tensor::new(vec![1.0; 7 * 7], Shape::from_slice(&[1, 1, 7, 7]));
     let output = conv.forward(&input);
     assert_eq!(output.shape().dims(), &[1, 1, 3, 3]);
 }
@@ -1103,7 +1103,7 @@ fn test_conv2d_with_dilation() {
 fn test_conv2d_backward_compat() {
     // Original API should still work (stride=1, padding=0)
     let mut conv = Conv2d::<f64>::new(1, 4, 3, 42);
-    let input = Tensor::new(vec![0.0; 1 * 1 * 5 * 5], Shape::from_slice(&[1, 1, 5, 5]));
+    let input = Tensor::new(vec![0.0; 5 * 5], Shape::from_slice(&[1, 1, 5, 5]));
     let output = conv.forward(&input);
     assert_eq!(output.shape().dims(), &[1, 4, 3, 3]);
 }
@@ -1216,7 +1216,7 @@ fn test_adaptive_avgpool2d() {
 fn test_adaptive_avgpool2d_larger() {
     // 7x7 -> 3x3
     let mut pool = AdaptiveAvgPool2d::<f64>::new(3, 3);
-    let input = Tensor::new(vec![1.0; 1 * 1 * 7 * 7], Shape::from_slice(&[1, 1, 7, 7]));
+    let input = Tensor::new(vec![1.0; 7 * 7], Shape::from_slice(&[1, 1, 7, 7]));
     let output = pool.forward(&input);
     assert_eq!(output.shape().dims(), &[1, 1, 3, 3]);
     // All ones in -> all ones out (average of 1s)
@@ -1401,7 +1401,7 @@ fn test_upsample_bilinear() {
         for j in 0..4 {
             let v = output.get(&[0, 0, i, j]);
             assert!(
-                v >= -0.01 && v <= 1.01,
+                (-0.01..=1.01).contains(&v),
                 "bilinear out of range: {v} at [{i},{j}]"
             );
         }

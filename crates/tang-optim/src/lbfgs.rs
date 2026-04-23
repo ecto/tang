@@ -61,7 +61,7 @@ impl Lbfgs {
         // Update history
         if let (Some(prev_x), Some(prev_g)) = (&self.prev_x, &self.prev_g) {
             let s = &*params - prev_x;
-            let y = &*grad - prev_g;
+            let y = grad - prev_g;
             let sy = s.dot(&y);
             if sy > 1e-10 {
                 if self.s_hist.len() >= self.m {
@@ -78,7 +78,7 @@ impl Lbfgs {
 
         let dir = self.direction(grad);
         for i in 0..params.len() {
-            params[i] = params[i] + self.lr * dir[i];
+            params[i] += self.lr * dir[i];
         }
     }
 }

@@ -245,6 +245,7 @@ pub fn check_discovery(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::op_enum::Atom;
     use std::f64::consts::E;
     use std::sync::Arc;
 

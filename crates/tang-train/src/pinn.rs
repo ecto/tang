@@ -287,7 +287,7 @@ mod tests {
         let points = collocation_random(100, 3, -1.0, 1.0, 42);
         assert_eq!(points.shape().dims(), &[100, 3]);
         for &v in points.data() {
-            assert!(v >= -1.0 && v <= 1.0);
+            assert!((-1.0..=1.0).contains(&v));
         }
     }
 

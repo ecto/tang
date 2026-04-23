@@ -173,6 +173,7 @@ impl Verifier {
                 let diff = (f.value - t.value).norm();
                 // NaN compares false both ways, so an explicit `< tol` rejects
                 // non-finite diffs without a separate is_nan check.
+                #[allow(clippy::neg_cmp_op_on_partial_ord)]
                 if !(diff < self.tol) {
                     continue;
                 }

@@ -186,6 +186,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn powskew_identities_hold_on_positive_half_plane() {
         // The identities f(x, 0) = 1 and f(0, x) = -1 require Re(x) > 0.
         // When Re(x) < 0, `0^x` diverges via `exp(x * ln(0)) = exp(x * -inf)`

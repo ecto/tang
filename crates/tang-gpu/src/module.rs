@@ -187,8 +187,8 @@ impl GpuTrainModule for GpuLinear {
             self.bias_grad = Some(gb);
 
             // grad_input = grad_output @ weight -> [batch, in_f]
-            let grad_input = matmul(device, cache, grad_output, &self.weight);
-            grad_input
+
+            matmul(device, cache, grad_output, &self.weight)
         } else {
             // Single vector: grad_output [out_f], input [in_f]
             // grad_weight[i,j] = grad_output[i] * input[j]

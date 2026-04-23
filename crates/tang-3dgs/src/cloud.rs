@@ -134,9 +134,7 @@ impl GaussianCloud {
             sh_coeffs.push(r);
             sh_coeffs.push(g);
             sh_coeffs.push(b);
-            for _ in 3..sh_per_g {
-                sh_coeffs.push(0.0);
-            }
+            sh_coeffs.resize(sh_coeffs.len() + sh_per_g.saturating_sub(3), 0.0);
         }
 
         Self {

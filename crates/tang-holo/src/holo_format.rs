@@ -169,7 +169,7 @@ fn json_to_config(json: &str) -> Option<HoloConfig> {
         let pattern = format!("\"{}\":", key);
         let pos = json.find(&pattern)?;
         let rest = &json[pos + pattern.len()..];
-        let end = rest.find(|c: char| c == ',' || c == '}')?;
+        let end = rest.find([',', '}'])?;
         rest[..end].trim().parse().ok()
     };
 

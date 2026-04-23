@@ -290,7 +290,7 @@ pub fn auto_partition(
         return partition_data_parallel(graph, mesh);
     }
 
-    let chunk_size = (n_nodes + n_workers - 1) / n_workers;
+    let chunk_size = n_nodes.div_ceil(n_workers);
     let stage_assignments: Vec<(NodeId, Vec<u32>)> = mesh
         .nodes()
         .iter()

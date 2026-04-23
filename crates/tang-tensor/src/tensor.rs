@@ -387,7 +387,7 @@ impl<S: Scalar> Tensor<S> {
             }
             for k in 0..axis_size {
                 full_idx[axis] = k;
-                sum = sum + self.get(&full_idx);
+                sum += self.get(&full_idx);
             }
             sum
         })

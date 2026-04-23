@@ -17,6 +17,12 @@ pub struct GpuTanhLayer {
     cached_output: Option<GpuTensor>,
 }
 
+impl Default for GpuTanhLayer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GpuTanhLayer {
     pub fn new() -> Self {
         Self {
@@ -84,6 +90,12 @@ impl GpuTrainModule for GpuTanhLayer {
 /// ReLU activation layer with cached input for backward.
 pub struct GpuReLULayer {
     cached_input: Option<GpuTensor>,
+}
+
+impl Default for GpuReLULayer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl GpuReLULayer {
@@ -277,9 +289,7 @@ pub fn gpu_cross_entropy_loss(
         total_loss += -probs[target_idx].max(1e-12).ln();
 
         // Grad = softmax - one_hot(target)
-        for c in 0..num_classes {
-            grad[offset + c] = probs[c];
-        }
+        grad[offset..offset + num_classes].copy_from_slice(&probs[..num_classes]);
         grad[offset + target_idx] -= 1.0;
     }
 
@@ -384,7 +394,7 @@ impl GpuDataLoader {
 
     /// Number of batches per epoch.
     pub fn n_batches(&self) -> usize {
-        (self.n_samples + self.batch_size - 1) / self.batch_size
+        self.n_samples.div_ceil(self.batch_size)
     }
 }
 

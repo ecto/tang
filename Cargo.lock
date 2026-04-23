@@ -5945,6 +5945,7 @@ dependencies = [
  "tang",
  "tang-la",
  "tang-tensor",
+ "tang-train",
  "tempfile",
 ]
 

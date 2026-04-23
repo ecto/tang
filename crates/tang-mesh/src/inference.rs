@@ -178,10 +178,10 @@ impl Activation {
                 .zip(pre_activation)
                 .map(|(&dy, &x)| {
                     let x3 = x * x * x;
-                    let inner = 0.7978845608 * (x + 0.044715 * x3);
+                    let inner = 0.797_884_6 * (x + 0.044715 * x3);
                     let tanh_inner = inner.tanh();
                     let sech2 = 1.0 - tanh_inner * tanh_inner;
-                    let d_inner = 0.7978845608 * (1.0 + 3.0 * 0.044715 * x * x);
+                    let d_inner = 0.797_884_6 * (1.0 + 3.0 * 0.044715 * x * x);
                     let gelu_prime = 0.5 * (1.0 + tanh_inner) + 0.5 * x * sech2 * d_inner;
                     dy * gelu_prime
                 })
@@ -270,7 +270,7 @@ impl Activation {
                 for x in data.iter_mut() {
                     // GELU approximation: x * 0.5 * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
                     let x3 = *x * *x * *x;
-                    let inner = 0.7978845608 * (*x + 0.044715 * x3);
+                    let inner = 0.797_884_6 * (*x + 0.044715 * x3);
                     *x = 0.5 * *x * (1.0 + inner.tanh());
                 }
             }
@@ -523,7 +523,7 @@ pub fn rope_backward(
 /// dim = bias.len(), seq_len = x.len() / dim.
 pub fn apply_bias(x: &mut [f32], bias: &[f32]) {
     let dim = bias.len();
-    assert!(dim > 0 && x.len() % dim == 0);
+    assert!(dim > 0 && x.len().is_multiple_of(dim));
     for chunk in x.chunks_mut(dim) {
         for (xi, &bi) in chunk.iter_mut().zip(bias) {
             *xi += bi;
@@ -1347,7 +1347,7 @@ impl CodedInferenceServer {
         // --- Encode and gossip weight gradients (per layer) ---
         for (layer_idx, dw) in &weight_grads {
             let version = version_per_layer[*layer_idx];
-            let block_len = (dw.len() + k - 1) / k;
+            let block_len = dw.len().div_ceil(k);
             let mut padded = dw.clone();
             padded.resize(block_len * k, 0.0);
 

@@ -1051,8 +1051,8 @@ mod tests {
         let (gi_ref, gw_ref, gb_ref) = lin.backward_2d_device(&dev, &grad_out, &cache);
 
         // Accumulate into pre-existing values (0.5 each)
-        let mut gw_acc = dev.upload(&vec![0.5; 6]);
-        let mut gb_acc = dev.upload(&vec![0.5; 3]);
+        let mut gw_acc = dev.upload(&[0.5; 6]);
+        let mut gb_acc = dev.upload(&[0.5; 3]);
         let cached_input = dev.copy_buffer(&cache.input);
         let gi_acc = lin.backward_2d_accumulate(
             &dev,
@@ -1097,7 +1097,7 @@ mod tests {
         let (gi_ref, gw_ref) = norm.backward_device(&dev, &grad_out, &cache);
 
         // Accumulate into pre-existing values (0.5 each)
-        let mut gw_acc = dev.upload(&vec![0.5; 3]);
+        let mut gw_acc = dev.upload(&[0.5; 3]);
         let cache2 = RMSNormCache {
             input: dev.copy_buffer(&cache.input),
         };

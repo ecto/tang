@@ -555,6 +555,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn msl_literal_suffix() {
         let mut g = ExprGraph::new();
         let x = g.var(0);

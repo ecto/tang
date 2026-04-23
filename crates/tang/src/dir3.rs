@@ -73,6 +73,7 @@ impl<S: Scalar> Dir3<S> {
 
     /// Negate the direction
     #[inline]
+    #[allow(clippy::should_implement_trait)]
     pub fn neg(self) -> Self {
         Self { inner: -self.inner }
     }

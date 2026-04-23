@@ -133,8 +133,8 @@ impl Rasterizer {
         let n = cloud.count as u32;
         let w = self.config.width;
         let h = self.config.height;
-        let num_tiles_x = (w + TILE_SIZE - 1) / TILE_SIZE;
-        let num_tiles_y = (h + TILE_SIZE - 1) / TILE_SIZE;
+        let num_tiles_x = w.div_ceil(TILE_SIZE);
+        let num_tiles_y = h.div_ceil(TILE_SIZE);
         let num_tiles = num_tiles_x * num_tiles_y;
 
         // --- Upload gaussian data ---
@@ -229,7 +229,7 @@ impl Rasterizer {
             pass.set_pipeline(&self.project_pipeline);
             pass.set_bind_group(0, &bg0, &[]);
             pass.set_bind_group(1, &bg1, &[]);
-            pass.dispatch_workgroups((n + 255) / 256, 1, 1);
+            pass.dispatch_workgroups(n.div_ceil(256), 1, 1);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
 
@@ -284,7 +284,7 @@ impl Rasterizer {
             pass.set_pipeline(&self.count_tiles_pipeline);
             pass.set_bind_group(0, &bg0, &[]);
             pass.set_bind_group(1, &bg1, &[]);
-            pass.dispatch_workgroups((n + 255) / 256, 1, 1);
+            pass.dispatch_workgroups(n.div_ceil(256), 1, 1);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
 
@@ -487,8 +487,8 @@ impl Rasterizer {
         let n = cloud.count as u32;
         let w = self.config.width;
         let h = self.config.height;
-        let num_tiles_x = (w + TILE_SIZE - 1) / TILE_SIZE;
-        let num_tiles_y = (h + TILE_SIZE - 1) / TILE_SIZE;
+        let num_tiles_x = w.div_ceil(TILE_SIZE);
+        let num_tiles_y = h.div_ceil(TILE_SIZE);
 
         // Re-upload gaussian data needed for recomputing alpha
         let means_2d_flat: Vec<f32> = ctx.means_2d.iter().flat_map(|m| [m[0], m[1]]).collect();
@@ -795,7 +795,7 @@ impl Rasterizer {
         let params = [n as u32, 0, 0, 0u32];
         let params_buf = self.create_buffer_bytes(bytemuck::cast_slice(&params));
 
-        let num_blocks = (n + 511) / 512;
+        let num_blocks = n.div_ceil(512);
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
             let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -871,7 +871,7 @@ impl Rasterizer {
                 pass.set_pipeline(&self.radix_count_pipeline);
                 pass.set_bind_group(0, &bg0, &[]);
                 pass.set_bind_group(1, &bg1, &[]);
-                pass.dispatch_workgroups((num_pairs + 255) / 256, 1, 1);
+                pass.dispatch_workgroups(num_pairs.div_ceil(256), 1, 1);
             }
             self.queue.submit(std::iter::once(encoder.finish()));
 
@@ -922,7 +922,7 @@ impl Rasterizer {
                 pass.set_pipeline(&self.radix_scatter_pipeline);
                 pass.set_bind_group(0, &bg0, &[]);
                 pass.set_bind_group(1, &bg1, &[]);
-                pass.dispatch_workgroups((num_pairs + 255) / 256, 1, 1);
+                pass.dispatch_workgroups(num_pairs.div_ceil(256), 1, 1);
             }
             self.queue.submit(std::iter::once(encoder.finish()));
         }

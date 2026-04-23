@@ -64,10 +64,10 @@ pub fn extract_foreground_frames(
         }
 
         let frame_img = image::open(frame_path)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+            .map_err(|e| std::io::Error::other(e.to_string()))?
             .to_rgb8();
         let mask_img = image::open(&mask_path)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+            .map_err(|e| std::io::Error::other(e.to_string()))?
             .to_luma8();
 
         let (w, h) = (frame_img.width(), frame_img.height());
@@ -94,11 +94,11 @@ pub fn extract_foreground_frames(
         }
 
         let out_img = image::RgbaImage::from_raw(w, h, out_data)
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "bad image dims"))?;
+            .ok_or_else(|| std::io::Error::other("bad image dims"))?;
         let out_path = output_dir.join(format!("face_{}.png", idx_str));
         out_img
             .save(&out_path)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         count += 1;
     }
 

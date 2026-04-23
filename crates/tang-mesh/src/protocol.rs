@@ -269,6 +269,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn wire_node_conversions() {
         let e = ExprId::from_index;
         let test_cases = vec![

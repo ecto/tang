@@ -241,6 +241,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn wgsl_lit_inline() {
         let mut g = ExprGraph::new();
         let x = g.var(0);

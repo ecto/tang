@@ -108,11 +108,11 @@ impl Mlp {
 /// Canonical gaussian predictor: triplane features → gaussian parameters.
 ///
 /// Output layout per gaussian (14 values):
-/// - [0..3]: position offset (dx, dy, dz)
-/// - [3..6]: log-scale (sx, sy, sz)
-/// - [6..10]: rotation quaternion (w, x, y, z)
-/// - [10]: opacity logit
-/// - [11..14]: SH DC color (r, g, b)
+/// - `[0..3]`: position offset (dx, dy, dz)
+/// - `[3..6]`: log-scale (sx, sy, sz)
+/// - `[6..10]`: rotation quaternion (w, x, y, z)
+/// - `[10]`: opacity logit
+/// - `[11..14]`: SH DC color (r, g, b)
 pub struct CanonicalPredictor {
     pub mlp: Mlp,
 }

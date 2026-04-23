@@ -107,7 +107,7 @@ impl GpuTensor {
         assert_eq!(self.ndim(), 2, "transpose requires 2D tensor");
         let m = self.shape[0] as u32;
         let n = self.shape[1] as u32;
-        let numel = (m * n) as u32;
+        let numel = m * n;
         let out = GpuTensor::uninit(device, &[n as usize, m as usize]);
 
         // Pack [count, M, N, 0] into params — reuse the existing params layout

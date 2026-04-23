@@ -23,9 +23,9 @@ use crate::C;
 /// triple numerical match at all of them implies a true identity modulo the
 /// conjecture.
 pub const TEST_POINTS: [f64; 3] = [
-    0.5772156649015329, // Euler-Mascheroni γ
-    1.2824271291006226, // Glaisher-Kinkelin A
-    0.9159655941772190, // Catalan's constant G
+    0.5772156649015329,    // Euler-Mascheroni γ
+    1.2824271291006226,    // Glaisher-Kinkelin A
+    0.915_965_594_177_219, // Catalan's constant G
 ];
 
 /// Swap the numeric value of each Variable leaf in `leaves` to the new x
@@ -100,6 +100,9 @@ where
                 }
             };
             let residual = (computed - expected).norm();
+            // NaN compares false both ways, so `!(residual < tol)` also
+            // rejects non-finite residuals without a separate is_nan check.
+            #[allow(clippy::neg_cmp_op_on_partial_ord)]
             if !(residual < tol) {
                 report.passed = false;
             }

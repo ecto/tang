@@ -244,7 +244,7 @@ mod tests {
         // With logits strongly preferring atom index 1, every leaf ≈ x.
         // Then eml(x, x) = exp(x) - ln(x), etc. Just sanity-check no-panic.
         let m = Master::new(2, 2);
-        let params: Vec<f64> = (0..m.n_params)
+        let _params: Vec<f64> = (0..m.n_params)
             .flat_map(|i| if i % 2 == 0 { vec![-10.0] } else { vec![10.0] })
             .collect();
         // Wait — the above uses flat_map wrong; fix.
