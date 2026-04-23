@@ -200,7 +200,11 @@ impl ExprGraph {
             // Select constant folding
             Node::Select(c, a, b) => {
                 if let Some(vc) = self.node(c).as_f64() {
-                    if vc > 0.0 { a } else { b }
+                    if vc > 0.0 {
+                        a
+                    } else {
+                        b
+                    }
                 } else {
                     expr
                 }

@@ -65,9 +65,7 @@ pub trait Module<S: Scalar> {
     fn load_state_dict(&mut self, state: &[(String, Tensor<S>)]) {
         for (name, param) in self.named_parameters_mut() {
             if let Some((_, tensor)) = state.iter().find(|(n, _)| n == &name) {
-                if tensor.shape() != param.data.shape()
-                    && tensor.numel() == param.data.numel()
-                {
+                if tensor.shape() != param.data.shape() && tensor.numel() == param.data.numel() {
                     param.data = tensor.reshape(param.data.shape().clone());
                 } else {
                     param.data = tensor.clone();

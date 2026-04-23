@@ -86,7 +86,15 @@ impl GaussianCloud {
         let mut sh_coeffs = vec![0.0f32; count * sh_per_g];
         f.read_exact(bytemuck::cast_slice_mut::<f32, u8>(&mut sh_coeffs))?;
 
-        Ok(Self { count, positions, scales, rotations, opacities, sh_coeffs, sh_degree })
+        Ok(Self {
+            count,
+            positions,
+            scales,
+            rotations,
+            opacities,
+            sh_coeffs,
+            sh_degree,
+        })
     }
 
     /// Number of SH coefficients per gaussian per color channel.

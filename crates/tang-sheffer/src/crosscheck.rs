@@ -23,9 +23,9 @@ use crate::C;
 /// triple numerical match at all of them implies a true identity modulo the
 /// conjecture.
 pub const TEST_POINTS: [f64; 3] = [
-    0.5772156649015329,  // Euler-Mascheroni γ
-    1.2824271291006226,  // Glaisher-Kinkelin A
-    0.9159655941772190,  // Catalan's constant G
+    0.5772156649015329, // Euler-Mascheroni γ
+    1.2824271291006226, // Glaisher-Kinkelin A
+    0.9159655941772190, // Catalan's constant G
 ];
 
 /// Swap the numeric value of each Variable leaf in `leaves` to the new x
@@ -93,7 +93,9 @@ where
                 Some(v) => v,
                 None => {
                     report.passed = false;
-                    report.points.push((computed, C::new(f64::NAN, 0.0), f64::NAN));
+                    report
+                        .points
+                        .push((computed, C::new(f64::NAN, 0.0), f64::NAN));
                     continue;
                 }
             };

@@ -72,14 +72,18 @@ pub fn download(repo_id: &str) -> Result<ModelFiles, HubError> {
     if weight_files.is_empty() {
         // Try index file for sharded models
         if let Ok(index_path) = repo.get("model.safetensors.index.json") {
-            let index_content = std::fs::read_to_string(&index_path)
-                .map_err(|e| HubError::Io(e.to_string()))?;
+            let index_content =
+                std::fs::read_to_string(&index_path).map_err(|e| HubError::Io(e.to_string()))?;
             // Parse weight_map to find shard filenames
             if let Some(filenames) = parse_shard_filenames(&index_content) {
                 for filename in filenames {
                     match repo.get(&filename) {
                         Ok(path) => weight_files.push(path),
-                        Err(e) => return Err(HubError::Api(format!("failed to download {filename}: {e}"))),
+                        Err(e) => {
+                            return Err(HubError::Api(format!(
+                                "failed to download {filename}: {e}"
+                            )))
+                        }
                     }
                 }
             }
@@ -148,7 +152,9 @@ pub fn load_tokenizer(repo_id: &str) -> Result<tokenizers::Tokenizer, HubError> 
 /// Encode text to a 1-D `Tensor<f64>` of token IDs.
 #[cfg(feature = "tokenizers")]
 pub fn encode(tokenizer: &tokenizers::Tokenizer, text: &str) -> Tensor<f64> {
-    let encoding = tokenizer.encode(text, false).expect("tokenizer encode failed");
+    let encoding = tokenizer
+        .encode(text, false)
+        .expect("tokenizer encode failed");
     let ids: Vec<f64> = encoding.get_ids().iter().map(|&id| id as f64).collect();
     Tensor::from_slice(&ids)
 }
@@ -178,7 +184,9 @@ pub fn batch_encode(
     let mut data = vec![pad_id; batch * max_len];
 
     for (i, text) in texts.iter().enumerate() {
-        let encoding = tokenizer.encode(*text, false).expect("tokenizer encode failed");
+        let encoding = tokenizer
+            .encode(*text, false)
+            .expect("tokenizer encode failed");
         let ids = encoding.get_ids();
         let len = ids.len().min(max_len);
         for j in 0..len {
@@ -283,14 +291,8 @@ mod tests {
         // load_state_dict requires network, but we can test the sort behavior
         // by verifying the function signature compiles and the conversion logic
         let mut map = HashMap::new();
-        map.insert(
-            "b.weight".to_string(),
-            Tensor::from_slice(&[1.0, 2.0]),
-        );
-        map.insert(
-            "a.weight".to_string(),
-            Tensor::from_slice(&[3.0, 4.0]),
-        );
+        map.insert("b.weight".to_string(), Tensor::from_slice(&[1.0, 2.0]));
+        map.insert("a.weight".to_string(), Tensor::from_slice(&[3.0, 4.0]));
 
         let mut pairs: Vec<(String, Tensor<f64>)> = map.into_iter().collect();
         pairs.sort_by(|a, b| a.0.cmp(&b.0));
@@ -304,10 +306,7 @@ mod tests {
     fn test_hub_download() {
         // Download a tiny public model
         let files = download("hf-internal-testing/tiny-random-bert").unwrap();
-        assert!(
-            !files.weight_files.is_empty(),
-            "should have weight files"
-        );
+        assert!(!files.weight_files.is_empty(), "should have weight files");
     }
 
     #[test]
@@ -317,7 +316,10 @@ mod tests {
         assert!(!state.is_empty(), "should have weight tensors");
         // Verify sorted order
         for window in state.windows(2) {
-            assert!(window[0].0 <= window[1].0, "state dict should be sorted by name");
+            assert!(
+                window[0].0 <= window[1].0,
+                "state dict should be sorted by name"
+            );
         }
     }
 }

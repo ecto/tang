@@ -10,8 +10,7 @@ use tang_tensor::{Shape, Tensor};
 /// Load tensors from a safetensors file as `Tensor<f64>`.
 pub fn load(path: &Path) -> Result<HashMap<String, Tensor<f64>>, SafetensorsError> {
     let data = std::fs::read(path).map_err(SafetensorsError::Io)?;
-    let tensors =
-        safetensors::SafeTensors::deserialize(&data).map_err(SafetensorsError::Parse)?;
+    let tensors = safetensors::SafeTensors::deserialize(&data).map_err(SafetensorsError::Parse)?;
 
     let mut result = HashMap::new();
 
@@ -74,10 +73,7 @@ pub fn load(path: &Path) -> Result<HashMap<String, Tensor<f64>>, SafetensorsErro
 }
 
 /// Save tensors to a safetensors file (as F64).
-pub fn save(
-    tensors: &HashMap<String, Tensor<f64>>,
-    path: &Path,
-) -> Result<(), SafetensorsError> {
+pub fn save(tensors: &HashMap<String, Tensor<f64>>, path: &Path) -> Result<(), SafetensorsError> {
     // Collect owned data so we can borrow it for TensorView
     let tensor_data: Vec<(String, Vec<u8>, Vec<usize>)> = tensors
         .iter()
@@ -95,12 +91,9 @@ pub fn save(
     let views: Vec<(String, safetensors::tensor::TensorView<'_>)> = tensor_data
         .iter()
         .map(|(name, bytes, shape)| {
-            let view = safetensors::tensor::TensorView::new(
-                safetensors::Dtype::F64,
-                shape.clone(),
-                bytes,
-            )
-            .unwrap();
+            let view =
+                safetensors::tensor::TensorView::new(safetensors::Dtype::F64, shape.clone(), bytes)
+                    .unwrap();
             (name.clone(), view)
         })
         .collect();
@@ -139,12 +132,9 @@ pub fn save_f32(
     let views: Vec<(String, safetensors::tensor::TensorView<'_>)> = tensor_data
         .iter()
         .map(|(name, bytes, shape)| {
-            let view = safetensors::tensor::TensorView::new(
-                safetensors::Dtype::F32,
-                shape.clone(),
-                bytes,
-            )
-            .unwrap();
+            let view =
+                safetensors::tensor::TensorView::new(safetensors::Dtype::F32, shape.clone(), bytes)
+                    .unwrap();
             (name.clone(), view)
         })
         .collect();
@@ -164,20 +154,20 @@ pub fn save_f32(
 
 /// Load tensors as `Tensor<f32>` from raw bytes (useful for `include_bytes!`).
 pub fn load_f32_from_bytes(data: &[u8]) -> Result<HashMap<String, Tensor<f32>>, SafetensorsError> {
-    let tensors =
-        safetensors::SafeTensors::deserialize(data).map_err(SafetensorsError::Parse)?;
+    let tensors = safetensors::SafeTensors::deserialize(data).map_err(SafetensorsError::Parse)?;
     deserialize_f32(&tensors)
 }
 
 /// Load tensors as `Tensor<f32>` (useful for GPU interop).
 pub fn load_f32(path: &Path) -> Result<HashMap<String, Tensor<f32>>, SafetensorsError> {
     let data = std::fs::read(path).map_err(SafetensorsError::Io)?;
-    let tensors =
-        safetensors::SafeTensors::deserialize(&data).map_err(SafetensorsError::Parse)?;
+    let tensors = safetensors::SafeTensors::deserialize(&data).map_err(SafetensorsError::Parse)?;
     deserialize_f32(&tensors)
 }
 
-fn deserialize_f32(tensors: &safetensors::SafeTensors<'_>) -> Result<HashMap<String, Tensor<f32>>, SafetensorsError> {
+fn deserialize_f32(
+    tensors: &safetensors::SafeTensors<'_>,
+) -> Result<HashMap<String, Tensor<f32>>, SafetensorsError> {
     let mut result = HashMap::new();
 
     for (name, view) in tensors.tensors() {
@@ -241,7 +231,9 @@ fn deserialize_f32(tensors: &safetensors::SafeTensors<'_>) -> Result<HashMap<Str
 /// Reads `model.safetensors.index.json` to discover shard files, then loads
 /// and merges all tensors from each shard. The index file must be in the same
 /// directory as the shard files.
-pub fn load_f32_sharded(index_path: &Path) -> Result<HashMap<String, Tensor<f32>>, SafetensorsError> {
+pub fn load_f32_sharded(
+    index_path: &Path,
+) -> Result<HashMap<String, Tensor<f32>>, SafetensorsError> {
     let index_data = std::fs::read_to_string(index_path).map_err(SafetensorsError::Io)?;
 
     // Parse the index JSON: { "weight_map": { "tensor_name": "shard_file", ... }, ... }
@@ -345,12 +337,12 @@ mod tests {
         let mut tensors = HashMap::new();
         tensors.insert(
             "weight".to_string(),
-            Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], Shape::from_slice(&[2, 3])),
+            Tensor::new(
+                vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                Shape::from_slice(&[2, 3]),
+            ),
         );
-        tensors.insert(
-            "bias".to_string(),
-            Tensor::from_slice(&[0.1, 0.2, 0.3]),
-        );
+        tensors.insert("bias".to_string(), Tensor::from_slice(&[0.1, 0.2, 0.3]));
 
         save(&tensors, &path).unwrap();
         let loaded = load(&path).unwrap();
@@ -410,7 +402,11 @@ mod tests {
         ]);
 
         // Verify naming convention
-        let names: Vec<String> = model.named_parameters().iter().map(|(n, _)| n.clone()).collect();
+        let names: Vec<String> = model
+            .named_parameters()
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
         assert_eq!(names, vec!["0.weight", "0.bias", "2.weight", "2.bias"]);
 
         // Save

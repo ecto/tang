@@ -75,24 +75,23 @@ fn main() {
     let mut targets = standard_constants();
     targets.extend(standard_functions());
 
-    let discoveries =
-        v.bootstrap_with_progress(&op, &targets, BUDGET, ITERS, |p| {
-            let new = if p.new_targets.is_empty() {
-                "—".to_string()
-            } else {
-                p.new_targets.join(", ")
-            };
-            println!(
-                "  iter {} | leaves={:>3} | cat={:>8} | found={:>2}/{} | +{}  ({:.2}s)",
-                p.iteration,
-                p.leaf_count,
-                p.catalogue_size,
-                p.total_found,
-                targets.len(),
-                new,
-                p.iter_elapsed.as_secs_f64(),
-            );
-        });
+    let discoveries = v.bootstrap_with_progress(&op, &targets, BUDGET, ITERS, |p| {
+        let new = if p.new_targets.is_empty() {
+            "—".to_string()
+        } else {
+            p.new_targets.join(", ")
+        };
+        println!(
+            "  iter {} | leaves={:>3} | cat={:>8} | found={:>2}/{} | +{}  ({:.2}s)",
+            p.iteration,
+            p.leaf_count,
+            p.catalogue_size,
+            p.total_found,
+            targets.len(),
+            new,
+            p.iter_elapsed.as_secs_f64(),
+        );
+    });
 
     println!();
     println!("--- Full discovery list (in bootstrap order) ---");
@@ -118,18 +117,27 @@ fn main() {
     let two = C::new(2.0, 0.0);
 
     let c1 = op.eval(one, two);
-    println!("  C1 = f(1, 2)   = -((1-2)^(1^2))                    = {:?}", c1);
-    let c2 = op.eval(one, c1);
-    println!("  C2 = f(1, C1)  = -((1-C1)^(1^C1))                  = {:?}", c2);
-    let c3 = op.eval(c2, neg_one_c);
-    println!("  C3 = f(C2, -1) = -((C2-(-1))^(C2^(-1)))            = {:?}", c3);
-    let cfinal = op.eval(c3, zero_c);
-    println!("  e  = f(C3, 0)  = -((C3-0)^(C3^0))                  = {:?}", cfinal);
-    println!("  target e = {:?}", C::new(E, 0.0));
     println!(
-        "  residual = {:.2e}",
-        (cfinal - C::new(E, 0.0)).norm()
+        "  C1 = f(1, 2)   = -((1-2)^(1^2))                    = {:?}",
+        c1
     );
+    let c2 = op.eval(one, c1);
+    println!(
+        "  C2 = f(1, C1)  = -((1-C1)^(1^C1))                  = {:?}",
+        c2
+    );
+    let c3 = op.eval(c2, neg_one_c);
+    println!(
+        "  C3 = f(C2, -1) = -((C2-(-1))^(C2^(-1)))            = {:?}",
+        c3
+    );
+    let cfinal = op.eval(c3, zero_c);
+    println!(
+        "  e  = f(C3, 0)  = -((C3-0)^(C3^0))                  = {:?}",
+        cfinal
+    );
+    println!("  target e = {:?}", C::new(E, 0.0));
+    println!("  residual = {:.2e}", (cfinal - C::new(E, 0.0)).norm());
 
     // --- Step 3: deep-dive the e, -e, ±i, -x chain ---
     //
@@ -147,10 +155,7 @@ fn main() {
         let expanded = d.expression.format_expanded("neg-nested-pow", &v.leaves);
         let short = truncate(&expanded, 140);
         println!();
-        println!(
-            "  {:<4} (expanded size {}):",
-            name, d.expanded_size
-        );
+        println!("  {:<4} (expanded size {}):", name, d.expanded_size);
         println!("    {}", short);
 
         // Evaluate at {γ, A, G} by rebinding the variable leaf. Because

@@ -31,7 +31,12 @@ impl<S: Scalar> KVCache<S> {
     /// - `max_seq_len`: maximum sequence length (for capacity pre-allocation)
     /// - `num_kv_heads`: number of key/value heads
     /// - `head_dim`: dimension per head
-    pub fn new(num_layers: usize, max_seq_len: usize, num_kv_heads: usize, head_dim: usize) -> Self {
+    pub fn new(
+        num_layers: usize,
+        max_seq_len: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Self {
         let kv_dim = num_kv_heads * head_dim;
         let cap = max_seq_len * kv_dim;
         let mut keys = Vec::with_capacity(num_layers);

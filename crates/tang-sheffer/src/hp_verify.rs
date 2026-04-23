@@ -68,12 +68,7 @@ fn combine_flags(a: &LimitAwareResult, b: &LimitAwareResult) -> (bool, Option<C>
 /// Evaluate an `OpExpr` at `(x, y)` while watching for `(1+ε)^(1/ε)`
 /// limit-regime pow calls. Returns the final value plus the worst-seen
 /// (base, exponent) product.
-pub fn eval_opexpr_limit_aware(
-    expr: &OpExpr,
-    x: C,
-    y: C,
-    threshold: f64,
-) -> LimitAwareResult {
+pub fn eval_opexpr_limit_aware(expr: &OpExpr, x: C, y: C, threshold: f64) -> LimitAwareResult {
     match expr {
         OpExpr::Atom(a) => LimitAwareResult::new(a.eval(x, y)),
         OpExpr::Unary(op, inner) => {
@@ -305,8 +300,7 @@ mod tests {
             c3.limit_artifact,
             "C3 step should have triggered the limit detector. \
              worst_base = {:?}, worst_exp = {:?}",
-            c3.worst_base,
-            c3.worst_exp
+            c3.worst_base, c3.worst_exp
         );
     }
 
@@ -338,12 +332,7 @@ mod tests {
         ));
         let body = (*body).clone();
 
-        let r = eval_opexpr_limit_aware(
-            &body,
-            C::new(1.5, 0.0),
-            C::new(2.0, 0.0),
-            LIMIT_THRESHOLD,
-        );
+        let r = eval_opexpr_limit_aware(&body, C::new(1.5, 0.0), C::new(2.0, 0.0), LIMIT_THRESHOLD);
         assert!(!r.limit_artifact);
     }
 }

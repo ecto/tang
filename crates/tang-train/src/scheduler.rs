@@ -258,9 +258,9 @@ mod tests {
         // 2% warmup, 78% stable, 20% decay (typical WSD split)
         let total = 100_000;
         let warmup = 2000; // 2%
-        // stable_fraction chosen so stable = 78% of total:
-        // stable_steps = stable_fraction * (total - warmup) = 0.7959... * 98000 = 78000
-        // Use 0.7959 to get ~78000 stable steps
+                           // stable_fraction chosen so stable = 78% of total:
+                           // stable_steps = stable_fraction * (total - warmup) = 0.7959... * 98000 = 78000
+                           // Use 0.7959 to get ~78000 stable steps
         let s = WarmupStableDecay {
             initial_lr: 3e-4,
             min_lr: 3e-5,
@@ -283,7 +283,12 @@ mod tests {
 
         // After warmup, never goes below min
         for step in (warmup..=total).step_by(1000) {
-            assert!(s.lr(step) >= 3e-5 - 1e-15, "lr at step {} was {}", step, s.lr(step));
+            assert!(
+                s.lr(step) >= 3e-5 - 1e-15,
+                "lr at step {} was {}",
+                step,
+                s.lr(step)
+            );
         }
     }
 

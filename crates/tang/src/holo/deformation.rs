@@ -82,7 +82,10 @@ pub struct Deformations {
 
 impl Deformations {
     /// Apply deformations to canonical gaussians, producing deformed cloud.
-    pub fn apply(&self, canonical: &crate::splatting::GaussianCloud) -> crate::splatting::GaussianCloud {
+    pub fn apply(
+        &self,
+        canonical: &crate::splatting::GaussianCloud,
+    ) -> crate::splatting::GaussianCloud {
         let n = canonical.count;
         let mut positions = Vec::with_capacity(n);
         let mut scales = Vec::with_capacity(n);

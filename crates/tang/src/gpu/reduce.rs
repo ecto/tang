@@ -35,11 +35,7 @@ pub fn reduce_mean(
 }
 
 /// Sum all elements to a single scalar [1] tensor, entirely on GPU.
-pub fn reduce_sum_all(
-    device: &GpuDevice,
-    cache: &mut KernelCache,
-    input: &GpuTensor,
-) -> GpuTensor {
+pub fn reduce_sum_all(device: &GpuDevice, cache: &mut KernelCache, input: &GpuTensor) -> GpuTensor {
     let mut t = reduce_sum(device, cache, input, 0);
     while t.numel() > 1 {
         t = reduce_sum(device, cache, &t, 0);
@@ -136,7 +132,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         wgsl,
         &input.buffer,
         &out.buffer,
-        &[out_numel as u32, axis_size as u32, inner_size as u32, op_code],
+        &[
+            out_numel as u32,
+            axis_size as u32,
+            inner_size as u32,
+            op_code,
+        ],
     );
 
     out

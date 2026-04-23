@@ -1,9 +1,9 @@
 use super::DVec;
+use crate::Scalar;
 use alloc::vec::Vec;
 #[cfg(all(feature = "accelerate", target_os = "macos"))]
 use core::any::TypeId;
 use core::ops::{Add, Index, IndexMut, Mul, Neg, Sub};
-use crate::Scalar;
 
 /// Heap-allocated column-major matrix.
 ///
@@ -167,7 +167,8 @@ impl<S: Scalar> DMat<S> {
                         self.as_slice().as_ptr() as *const f32,
                         x.as_slice().as_ptr() as *const f32,
                         y.as_mut_slice().as_mut_ptr() as *mut f32,
-                        m, n,
+                        m,
+                        n,
                     );
                 }
                 return y;
@@ -179,7 +180,8 @@ impl<S: Scalar> DMat<S> {
                         self.as_slice().as_ptr() as *const f64,
                         x.as_slice().as_ptr() as *const f64,
                         y.as_mut_slice().as_mut_ptr() as *mut f64,
-                        m, n,
+                        m,
+                        n,
                     );
                 }
                 return y;
@@ -215,7 +217,9 @@ impl<S: Scalar> DMat<S> {
                         self.as_slice().as_ptr() as *const f32,
                         rhs.as_slice().as_ptr() as *const f32,
                         c.as_mut_slice().as_mut_ptr() as *mut f32,
-                        mi, ni, ki,
+                        mi,
+                        ni,
+                        ki,
                     );
                 }
                 return c;
@@ -227,7 +231,9 @@ impl<S: Scalar> DMat<S> {
                         self.as_slice().as_ptr() as *const f64,
                         rhs.as_slice().as_ptr() as *const f64,
                         c.as_mut_slice().as_mut_ptr() as *mut f64,
-                        mi, ni, ki,
+                        mi,
+                        ni,
+                        ki,
                     );
                 }
                 return c;

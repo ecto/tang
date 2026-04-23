@@ -442,7 +442,9 @@ fn read_op(r: &mut Reader) -> Result<OnnxOp, SerializeError> {
             let name = r.read_str()?;
             Ok(OnnxOp::Custom(name))
         }
-        _ => Err(SerializeError::InvalidData(format!("unknown op tag: {tag}"))),
+        _ => Err(SerializeError::InvalidData(format!(
+            "unknown op tag: {tag}"
+        ))),
     }
 }
 
@@ -516,8 +518,9 @@ impl OnnxGraph {
             let name = r.read_str()?;
             let shape = r.read_usize_vec()?;
             let elem_code = r.read_u32()? as i32;
-            let elem_type = ElemType::from_onnx_code(elem_code)
-                .ok_or_else(|| SerializeError::InvalidData(format!("unknown elem type: {elem_code}")))?;
+            let elem_type = ElemType::from_onnx_code(elem_code).ok_or_else(|| {
+                SerializeError::InvalidData(format!("unknown elem type: {elem_code}"))
+            })?;
             inputs.push(OnnxValueInfo {
                 name,
                 shape,
@@ -532,8 +535,9 @@ impl OnnxGraph {
             let name = r.read_str()?;
             let shape = r.read_usize_vec()?;
             let elem_code = r.read_u32()? as i32;
-            let elem_type = ElemType::from_onnx_code(elem_code)
-                .ok_or_else(|| SerializeError::InvalidData(format!("unknown elem type: {elem_code}")))?;
+            let elem_type = ElemType::from_onnx_code(elem_code).ok_or_else(|| {
+                SerializeError::InvalidData(format!("unknown elem type: {elem_code}"))
+            })?;
             outputs.push(OnnxValueInfo {
                 name,
                 shape,
@@ -589,7 +593,11 @@ mod tests {
         g.add_input("x", vec![1, 3, 224, 224]);
         g.add_output("y", vec![1, 1000]);
 
-        g.add_initializer(OnnxTensor::new("w", vec![64, 3, 7, 7], vec![0.1; 64 * 3 * 7 * 7]));
+        g.add_initializer(OnnxTensor::new(
+            "w",
+            vec![64, 3, 7, 7],
+            vec![0.1; 64 * 3 * 7 * 7],
+        ));
 
         g.add_node(OnnxNode::new(
             "conv1",
@@ -603,7 +611,12 @@ mod tests {
             vec!["x", "w"],
             vec!["h1"],
         ));
-        g.add_node(OnnxNode::new("relu1", OnnxOp::Relu, vec!["h1"], vec!["h1_act"]));
+        g.add_node(OnnxNode::new(
+            "relu1",
+            OnnxOp::Relu,
+            vec!["h1"],
+            vec!["h1_act"],
+        ));
         g.add_node(OnnxNode::new(
             "pool1",
             OnnxOp::GlobalAveragePool,

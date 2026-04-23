@@ -73,8 +73,14 @@ pub fn extract_foreground_frames(
         let (w, h) = (frame_img.width(), frame_img.height());
 
         // Convert to float
-        let rgb: Vec<f32> = frame_img.pixels().flat_map(|p| p.0.map(|v| v as f32 / 255.0)).collect();
-        let mask: Vec<f32> = mask_img.pixels().map(|p| if p.0[0] > 0 { 1.0 } else { 0.0 }).collect();
+        let rgb: Vec<f32> = frame_img
+            .pixels()
+            .flat_map(|p| p.0.map(|v| v as f32 / 255.0))
+            .collect();
+        let mask: Vec<f32> = mask_img
+            .pixels()
+            .map(|p| if p.0[0] > 0 { 1.0 } else { 0.0 })
+            .collect();
 
         let rgba = apply_mask(&rgb, &mask, bg_color);
 

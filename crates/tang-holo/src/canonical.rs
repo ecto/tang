@@ -52,8 +52,11 @@ impl Mlp {
     /// Forward pass for a single input.
     pub fn forward(&self, input: &[f32]) -> Vec<f32> {
         let mut x = input.to_vec();
-        for (i, ((in_dim, out_dim), (w, b))) in
-            self.dims.iter().zip(self.weights.iter().zip(self.biases.iter())).enumerate()
+        for (i, ((in_dim, out_dim), (w, b))) in self
+            .dims
+            .iter()
+            .zip(self.weights.iter().zip(self.biases.iter()))
+            .enumerate()
         {
             let mut y = vec![0.0f32; *out_dim];
             for j in 0..*out_dim {

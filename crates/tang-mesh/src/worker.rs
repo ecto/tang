@@ -84,11 +84,8 @@ impl Worker {
     /// Spawn a worker serving a tarpc channel transport.
     ///
     /// Returns a client that can call this worker's RPC methods.
-    pub fn spawn_channel(
-        &self,
-    ) -> crate::transport::WorkerServiceClient {
-        let (client_transport, server_transport) =
-            tarpc::transport::channel::unbounded();
+    pub fn spawn_channel(&self) -> crate::transport::WorkerServiceClient {
+        let (client_transport, server_transport) = tarpc::transport::channel::unbounded();
 
         let server = BaseChannel::with_defaults(server_transport);
         let handler = WorkerHandler {
@@ -240,9 +237,7 @@ impl WorkerService for WorkerHandler {
         let mut state = self.state.write().await;
         state.compiled.insert(task_id, compiled);
 
-        info!(
-            "compiled graph for task {task_id}: {n_inputs} inputs, {n_outputs} outputs"
-        );
+        info!("compiled graph for task {task_id}: {n_inputs} inputs, {n_outputs} outputs");
 
         Ok(())
     }
@@ -266,7 +261,9 @@ impl WorkerService for WorkerHandler {
             let n_outputs = compiled.n_outputs;
             let input_buf = GpuBuffer::from_slice(&device, &inputs);
             let output_buf = GpuBuffer::uninit(&device, n_outputs);
-            state.cache.dispatch(&device, &wgsl, &input_buf, &output_buf, 1);
+            state
+                .cache
+                .dispatch(&device, &wgsl, &input_buf, &output_buf, 1);
             state.cache.flush(&device);
             let results = output_buf.to_vec_sync(&device);
             Ok(results)
@@ -299,7 +296,9 @@ impl WorkerService for WorkerHandler {
             let n_outputs = compiled.n_outputs;
             let input_buf = GpuBuffer::from_slice(&device, &data);
             let output_buf = GpuBuffer::uninit(&device, n_outputs);
-            state.cache.dispatch(&device, &wgsl, &input_buf, &output_buf, 1);
+            state
+                .cache
+                .dispatch(&device, &wgsl, &input_buf, &output_buf, 1);
             state.cache.flush(&device);
             let results = output_buf.to_vec_sync(&device);
             Ok(results)

@@ -10,8 +10,8 @@ use wasm_bindgen::prelude::*;
 // ── Quantum Poet ─────────────────────────────────────────────────────────────
 
 const VOCAB: [char; 30] = [
-    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r',
-    's', 't', 'u', 'v', 'w', 'x', 'y', 'z', ' ', '\n', ',', '.',
+    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's',
+    't', 'u', 'v', 'w', 'x', 'y', 'z', ' ', '\n', ',', '.',
 ];
 const VOCAB_SIZE: usize = 30;
 const WINDOW: usize = 8;
@@ -187,7 +187,10 @@ pub fn poet_train_epoch() -> f64 {
         for (inputs, targets) in loader.by_ref() {
             s.model.zero_grad();
             let pred = s.model.forward(&inputs);
-            let (loss, grad) = (cross_entropy_loss(&pred, &targets), cross_entropy_loss_grad(&pred, &targets));
+            let (loss, grad) = (
+                cross_entropy_loss(&pred, &targets),
+                cross_entropy_loss_grad(&pred, &targets),
+            );
             s.model.backward(&grad);
 
             let mut params = s.model.parameters_mut();
@@ -212,10 +215,7 @@ pub fn poet_generate(seed: &str, temperature: f64) -> String {
         let mut state = p.borrow_mut();
         let s = state.as_mut().expect("call poet_init first");
 
-        let mut window: Vec<usize> = seed
-            .chars()
-            .filter_map(char_to_idx)
-            .collect();
+        let mut window: Vec<usize> = seed.chars().filter_map(char_to_idx).collect();
 
         // Pad or truncate to WINDOW size
         while window.len() < WINDOW {

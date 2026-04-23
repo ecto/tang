@@ -2,8 +2,8 @@
 
 use super::device::ComputeDevice;
 use super::tensor::ComputeTensor;
-use crate::Scalar;
 use crate::expr::node::ExprId;
+use crate::Scalar;
 
 /// Element-wise addition of two tensors.
 pub fn add_tensors<D: ComputeDevice>(
@@ -12,11 +12,9 @@ pub fn add_tensors<D: ComputeDevice>(
     b: &ComputeTensor<D::Buffer>,
 ) -> ComputeTensor<D::Buffer> {
     assert_eq!(a.numel(), b.numel(), "add_tensors: numel mismatch");
-    let buf = dev.elementwise(
-        &[&a.buffer, &b.buffer],
-        a.numel(),
-        &|ids: &[ExprId]| ids[0] + ids[1],
-    );
+    let buf = dev.elementwise(&[&a.buffer, &b.buffer], a.numel(), &|ids: &[ExprId]| {
+        ids[0] + ids[1]
+    });
     ComputeTensor::from_buffer(buf, a.shape().to_vec())
 }
 
@@ -30,7 +28,11 @@ pub fn bias_add<D: ComputeDevice>(
 ) -> ComputeTensor<D::Buffer> {
     let numel = matrix.numel();
     let dim = bias.numel();
-    assert_eq!(numel % dim, 0, "bias_add: matrix numel not divisible by bias dim");
+    assert_eq!(
+        numel % dim,
+        0,
+        "bias_add: matrix numel not divisible by bias dim"
+    );
     let buf = dev.bias_add(&matrix.buffer, &bias.buffer, numel, dim);
     ComputeTensor::from_buffer(buf, matrix.shape().to_vec())
 }
@@ -128,7 +130,11 @@ pub fn causal_attention_backward<D: ComputeDevice>(
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
-) -> (ComputeTensor<D::Buffer>, ComputeTensor<D::Buffer>, ComputeTensor<D::Buffer>) {
+) -> (
+    ComputeTensor<D::Buffer>,
+    ComputeTensor<D::Buffer>,
+    ComputeTensor<D::Buffer>,
+) {
     let total_dim = n_heads * head_dim;
     let kv_dim = n_kv_heads * head_dim;
 
@@ -152,8 +158,8 @@ pub fn causal_attention_backward<D: ComputeDevice>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::CpuDevice;
+    use super::*;
 
     #[test]
     fn test_add_tensors() {
@@ -212,14 +218,17 @@ mod tests {
         let v = ComputeTensor::from_data(&dev, &[1.0, 2.0, 3.0, 4.0], &[2, 2]);
         let grad_out = ComputeTensor::from_data(&dev, &[1.0, 0.0, 0.0, 1.0], &[2, 2]);
 
-        let (gq, gk, gv) = causal_attention_backward(
-            &dev, &grad_out, &q, &k, &v, 2, 1, 1, 2,
-        );
+        let (gq, gk, gv) = causal_attention_backward(&dev, &grad_out, &q, &k, &v, 2, 1, 1, 2);
         assert_eq!(gq.shape(), &[2, 2]);
         assert_eq!(gk.shape(), &[2, 2]);
         assert_eq!(gv.shape(), &[2, 2]);
         // All gradients should be finite
-        for v in gq.to_vec().iter().chain(gk.to_vec().iter()).chain(gv.to_vec().iter()) {
+        for v in gq
+            .to_vec()
+            .iter()
+            .chain(gk.to_vec().iter())
+            .chain(gv.to_vec().iter())
+        {
             assert!(v.is_finite(), "gradient should be finite");
         }
     }

@@ -1,8 +1,8 @@
 //! Metal compute backend for Apple Silicon.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use metal::objc::rc::autoreleasepool;
@@ -78,7 +78,9 @@ impl MetalDevice {
             .new_compute_pipeline_state_with_function(&func)
             .expect("Failed to create pipeline");
 
-        self.pipeline_cache.borrow_mut().insert(hash, pipeline.clone());
+        self.pipeline_cache
+            .borrow_mut()
+            .insert(hash, pipeline.clone());
         pipeline
     }
 
@@ -104,19 +106,12 @@ impl MetalDevice {
 
     /// Allocate an empty Metal buffer.
     fn make_buffer_empty(&self, byte_len: usize) -> metal::Buffer {
-        self.device.new_buffer(
-            byte_len as u64,
-            MTLResourceOptions::StorageModeShared,
-        )
+        self.device
+            .new_buffer(byte_len as u64, MTLResourceOptions::StorageModeShared)
     }
 
     /// Dispatch a compute pipeline with given buffers.
-    fn dispatch(
-        &self,
-        pipeline: &ComputePipelineState,
-        buffers: &[&metal::Buffer],
-        threads: u64,
-    ) {
+    fn dispatch(&self, pipeline: &ComputePipelineState, buffers: &[&metal::Buffer], threads: u64) {
         autoreleasepool(|| {
             let cmd = self.queue.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
@@ -126,16 +121,10 @@ impl MetalDevice {
                 enc.set_buffer(i as u64, Some(buf), 0);
             }
 
-            let tg_size = std::cmp::min(
-                pipeline.max_total_threads_per_threadgroup(),
-                256,
-            );
+            let tg_size = std::cmp::min(pipeline.max_total_threads_per_threadgroup(), 256);
             let tg_count = (threads + tg_size - 1) / tg_size;
 
-            enc.dispatch_thread_groups(
-                MTLSize::new(tg_count, 1, 1),
-                MTLSize::new(tg_size, 1, 1),
-            );
+            enc.dispatch_thread_groups(MTLSize::new(tg_count, 1, 1), MTLSize::new(tg_size, 1, 1));
 
             enc.end_encoding();
             cmd.commit();
@@ -251,7 +240,14 @@ impl ComputeDevice for MetalDevice {
         }
     }
 
-    fn matmul(&self, a: &MetalBuffer, b: &MetalBuffer, m: usize, k: usize, n: usize) -> MetalBuffer {
+    fn matmul(
+        &self,
+        a: &MetalBuffer,
+        b: &MetalBuffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> MetalBuffer {
         // Use naive kernel for now — simdgroup_matrix version requires
         // specific alignment and dispatch patterns
         let pipeline = self.get_pipeline(matmul_msl::MATMUL_NAIVE_MSL, "matmul_naive");
@@ -403,13 +399,15 @@ kernel void embedding(
         n_kv_heads: usize,
         head_dim: usize,
     ) -> MetalBuffer {
-        let pipeline = self.get_pipeline(
-            attention_msl::CAUSAL_ATTENTION_MSL,
-            "causal_attention",
-        );
+        let pipeline = self.get_pipeline(attention_msl::CAUSAL_ATTENTION_MSL, "causal_attention");
         let total_dim = n_heads * head_dim;
         let output_buf = self.make_buffer_empty(seq_len * total_dim * 4);
-        let params = self.make_buffer_u32(&[seq_len as u32, n_heads as u32, n_kv_heads as u32, head_dim as u32]);
+        let params = self.make_buffer_u32(&[
+            seq_len as u32,
+            n_heads as u32,
+            n_kv_heads as u32,
+            head_dim as u32,
+        ]);
 
         // Flash attention: threads parallelize over head_dim
         let tg_size = std::cmp::min(head_dim as u64, 256).next_power_of_two();
@@ -456,10 +454,7 @@ kernel void embedding(
 
         if q_len == 1 {
             // Single-query decode
-            let pipeline = self.get_pipeline(
-                attention_msl::KV_ATTENTION_MSL,
-                "kv_attention",
-            );
+            let pipeline = self.get_pipeline(attention_msl::KV_ATTENTION_MSL, "kv_attention");
             let total_len = cache_start + 1;
             let output_buf = self.make_buffer_empty(total_dim * 4);
             let params = self.make_buffer_u32(&[
@@ -545,7 +540,10 @@ kernel void embedding(
             (16, 16),
         );
 
-        MetalBuffer { buffer: output_buf, len: rows * cols }
+        MetalBuffer {
+            buffer: output_buf,
+            len: rows * cols,
+        }
     }
 
     fn softmax_backward(
@@ -577,7 +575,10 @@ kernel void embedding(
             *self.last_cb.borrow_mut() = Some(cmd.to_owned());
         });
 
-        MetalBuffer { buffer: output_buf, len: n_rows * row_len }
+        MetalBuffer {
+            buffer: output_buf,
+            len: n_rows * row_len,
+        }
     }
 
     fn rms_norm_backward(
@@ -616,8 +617,14 @@ kernel void embedding(
         });
 
         (
-            MetalBuffer { buffer: grad_input_raw, len: n_groups * dim },
-            MetalBuffer { buffer: grad_weight_raw, len: dim },
+            MetalBuffer {
+                buffer: grad_input_raw,
+                len: n_groups * dim,
+            },
+            MetalBuffer {
+                buffer: grad_weight_raw,
+                len: dim,
+            },
         )
     }
 
@@ -629,7 +636,8 @@ kernel void embedding(
         seq_len: usize,
         dim: usize,
     ) -> MetalBuffer {
-        let pipeline = self.get_pipeline(backward_msl::EMBEDDING_BACKWARD_MSL, "embedding_backward");
+        let pipeline =
+            self.get_pipeline(backward_msl::EMBEDDING_BACKWARD_MSL, "embedding_backward");
         // Zero-init for atomic accumulation
         let grad_weight_raw = self.make_buffer(&vec![0.0f32; vocab_size * dim]);
         let params = self.make_buffer_u32(&[vocab_size as u32, seq_len as u32, dim as u32]);
@@ -640,7 +648,10 @@ kernel void embedding(
             seq_len as u64,
         );
 
-        MetalBuffer { buffer: grad_weight_raw, len: vocab_size * dim }
+        MetalBuffer {
+            buffer: grad_weight_raw,
+            len: vocab_size * dim,
+        }
     }
 
     fn causal_attention_backward(
@@ -654,7 +665,11 @@ kernel void embedding(
         n_kv_heads: usize,
         head_dim: usize,
     ) -> (MetalBuffer, MetalBuffer, MetalBuffer) {
-        assert!(seq_len <= 2048, "causal_attention_backward: seq_len {} exceeds MAX_SEQ 2048", seq_len);
+        assert!(
+            seq_len <= 2048,
+            "causal_attention_backward: seq_len {} exceeds MAX_SEQ 2048",
+            seq_len
+        );
         let pipeline = self.get_pipeline(
             backward_msl::CAUSAL_ATTENTION_BACKWARD_MSL,
             "causal_attention_backward",
@@ -667,7 +682,10 @@ kernel void embedding(
         let grad_k_raw = self.make_buffer(&vec![0.0f32; seq_len * kv_dim]);
         let grad_v_raw = self.make_buffer(&vec![0.0f32; seq_len * kv_dim]);
         let params = self.make_buffer_u32(&[
-            seq_len as u32, n_heads as u32, n_kv_heads as u32, head_dim as u32,
+            seq_len as u32,
+            n_heads as u32,
+            n_kv_heads as u32,
+            head_dim as u32,
         ]);
 
         let tg_size = std::cmp::min(head_dim as u64, 256).next_power_of_two();
@@ -695,9 +713,18 @@ kernel void embedding(
         });
 
         (
-            MetalBuffer { buffer: grad_q_raw, len: seq_len * total_dim },
-            MetalBuffer { buffer: grad_k_raw, len: seq_len * kv_dim },
-            MetalBuffer { buffer: grad_v_raw, len: seq_len * kv_dim },
+            MetalBuffer {
+                buffer: grad_q_raw,
+                len: seq_len * total_dim,
+            },
+            MetalBuffer {
+                buffer: grad_k_raw,
+                len: seq_len * kv_dim,
+            },
+            MetalBuffer {
+                buffer: grad_v_raw,
+                len: seq_len * kv_dim,
+            },
         )
     }
 
@@ -740,7 +767,13 @@ kernel void embedding(
         self.sync();
         let loss_ptr = loss_raw.contents() as *const f32;
         let loss = unsafe { *loss_ptr };
-        (loss, MetalBuffer { buffer: grad_buf, len: n_positions * vocab_size })
+        (
+            loss,
+            MetalBuffer {
+                buffer: grad_buf,
+                len: n_positions * vocab_size,
+            },
+        )
     }
 
     fn sync(&self) {
@@ -759,10 +792,19 @@ kernel void embedding(
             cmd.commit();
             *self.last_cb.borrow_mut() = Some(cmd.to_owned());
         });
-        MetalBuffer { buffer: dst, len: src.len }
+        MetalBuffer {
+            buffer: dst,
+            len: src.len,
+        }
     }
 
-    fn bias_add(&self, matrix: &MetalBuffer, bias: &MetalBuffer, numel: usize, dim: usize) -> MetalBuffer {
+    fn bias_add(
+        &self,
+        matrix: &MetalBuffer,
+        bias: &MetalBuffer,
+        numel: usize,
+        dim: usize,
+    ) -> MetalBuffer {
         let src = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -790,7 +832,10 @@ kernel void bias_add(
             numel as u64,
         );
 
-        MetalBuffer { buffer: output_buf, len: numel }
+        MetalBuffer {
+            buffer: output_buf,
+            len: numel,
+        }
     }
 
     fn add_assign(&self, dst: &mut MetalBuffer, src: &MetalBuffer) {
@@ -843,9 +888,9 @@ kernel void bias_add(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::cpu::CpuDevice;
     use super::device::ComputeDevice;
+    use super::*;
 
     fn get_metal_device() -> MetalDevice {
         MetalDevice::new().expect("Metal device not available")
@@ -1004,8 +1049,12 @@ mod tests {
 
         assert_eq!(m_out.len(), c_out.len());
         for i in 0..m_out.len() {
-            assert!((m_out[i] - c_out[i]).abs() < 1e-5,
-                "transpose mismatch at {i}: metal={} cpu={}", m_out[i], c_out[i]);
+            assert!(
+                (m_out[i] - c_out[i]).abs() < 1e-5,
+                "transpose mismatch at {i}: metal={} cpu={}",
+                m_out[i],
+                c_out[i]
+            );
         }
     }
 
@@ -1026,8 +1075,12 @@ mod tests {
         let c_out = cpu.download(&cpu.softmax_backward(&c_sm, &c_grad, 2, 3));
 
         for i in 0..m_out.len() {
-            assert!((m_out[i] - c_out[i]).abs() < 1e-4,
-                "softmax_backward mismatch at {i}: metal={} cpu={}", m_out[i], c_out[i]);
+            assert!(
+                (m_out[i] - c_out[i]).abs() < 1e-4,
+                "softmax_backward mismatch at {i}: metal={} cpu={}",
+                m_out[i],
+                c_out[i]
+            );
         }
     }
 
@@ -1048,8 +1101,12 @@ mod tests {
         let c_out = cpu.download(&cpu.embedding_backward(&c_grad, &c_ids, 4, 2, 3));
 
         for i in 0..m_out.len() {
-            assert!((m_out[i] - c_out[i]).abs() < 1e-4,
-                "embedding_backward mismatch at {i}: metal={} cpu={}", m_out[i], c_out[i]);
+            assert!(
+                (m_out[i] - c_out[i]).abs() < 1e-4,
+                "embedding_backward mismatch at {i}: metal={} cpu={}",
+                m_out[i],
+                c_out[i]
+            );
         }
     }
 
@@ -1063,19 +1120,29 @@ mod tests {
 
         let m_logits = metal.upload(&logits);
         let m_targets = metal.upload_u32(&targets);
-        let (m_loss, m_grad_buf) = metal.cross_entropy_forward_backward(&m_logits, &m_targets, 2, 3, 99);
+        let (m_loss, m_grad_buf) =
+            metal.cross_entropy_forward_backward(&m_logits, &m_targets, 2, 3, 99);
         let m_grad = metal.download(&m_grad_buf);
 
         let c_logits = cpu.upload(&logits);
         let c_targets = cpu.upload_u32(&targets);
-        let (c_loss, c_grad_buf) = cpu.cross_entropy_forward_backward(&c_logits, &c_targets, 2, 3, 99);
+        let (c_loss, c_grad_buf) =
+            cpu.cross_entropy_forward_backward(&c_logits, &c_targets, 2, 3, 99);
         let c_grad = cpu.download(&c_grad_buf);
 
-        assert!((m_loss - c_loss).abs() < 1e-3,
-            "cross_entropy loss mismatch: metal={} cpu={}", m_loss, c_loss);
+        assert!(
+            (m_loss - c_loss).abs() < 1e-3,
+            "cross_entropy loss mismatch: metal={} cpu={}",
+            m_loss,
+            c_loss
+        );
         for i in 0..m_grad.len() {
-            assert!((m_grad[i] - c_grad[i]).abs() < 1e-3,
-                "cross_entropy grad mismatch at {i}: metal={} cpu={}", m_grad[i], c_grad[i]);
+            assert!(
+                (m_grad[i] - c_grad[i]).abs() < 1e-3,
+                "cross_entropy grad mismatch at {i}: metal={} cpu={}",
+                m_grad[i],
+                c_grad[i]
+            );
         }
     }
 
@@ -1103,12 +1170,20 @@ mod tests {
         let c_gw_v = cpu.download(&c_gw);
 
         for i in 0..m_gi_v.len() {
-            assert!((m_gi_v[i] - c_gi_v[i]).abs() < 1e-3,
-                "rms_norm_backward grad_input mismatch at {i}: metal={} cpu={}", m_gi_v[i], c_gi_v[i]);
+            assert!(
+                (m_gi_v[i] - c_gi_v[i]).abs() < 1e-3,
+                "rms_norm_backward grad_input mismatch at {i}: metal={} cpu={}",
+                m_gi_v[i],
+                c_gi_v[i]
+            );
         }
         for i in 0..m_gw_v.len() {
-            assert!((m_gw_v[i] - c_gw_v[i]).abs() < 1e-3,
-                "rms_norm_backward grad_weight mismatch at {i}: metal={} cpu={}", m_gw_v[i], c_gw_v[i]);
+            assert!(
+                (m_gw_v[i] - c_gw_v[i]).abs() < 1e-3,
+                "rms_norm_backward grad_weight mismatch at {i}: metal={} cpu={}",
+                m_gw_v[i],
+                c_gw_v[i]
+            );
         }
     }
 
@@ -1126,13 +1201,17 @@ mod tests {
 
         // Deterministic pseudo-random data
         let q_data: Vec<f32> = (0..seq_len * total_dim)
-            .map(|i| ((i * 7 + 3) % 13) as f32 / 13.0 - 0.5).collect();
+            .map(|i| ((i * 7 + 3) % 13) as f32 / 13.0 - 0.5)
+            .collect();
         let k_data: Vec<f32> = (0..seq_len * kv_dim)
-            .map(|i| ((i * 11 + 5) % 17) as f32 / 17.0 - 0.5).collect();
+            .map(|i| ((i * 11 + 5) % 17) as f32 / 17.0 - 0.5)
+            .collect();
         let v_data: Vec<f32> = (0..seq_len * kv_dim)
-            .map(|i| ((i * 13 + 7) % 19) as f32 / 19.0 - 0.5).collect();
+            .map(|i| ((i * 13 + 7) % 19) as f32 / 19.0 - 0.5)
+            .collect();
         let go_data: Vec<f32> = (0..seq_len * total_dim)
-            .map(|i| ((i * 3 + 11) % 23) as f32 / 23.0 - 0.5).collect();
+            .map(|i| ((i * 3 + 11) % 23) as f32 / 23.0 - 0.5)
+            .collect();
 
         // Metal
         let m_go = metal.upload(&go_data);
@@ -1159,16 +1238,28 @@ mod tests {
         let c_gv_v = cpu.download(&c_gv);
 
         for i in 0..m_gq_v.len() {
-            assert!((m_gq_v[i] - c_gq_v[i]).abs() < 1e-3,
-                "grad_Q mismatch at {i}: metal={} cpu={}", m_gq_v[i], c_gq_v[i]);
+            assert!(
+                (m_gq_v[i] - c_gq_v[i]).abs() < 1e-3,
+                "grad_Q mismatch at {i}: metal={} cpu={}",
+                m_gq_v[i],
+                c_gq_v[i]
+            );
         }
         for i in 0..m_gk_v.len() {
-            assert!((m_gk_v[i] - c_gk_v[i]).abs() < 1e-3,
-                "grad_K mismatch at {i}: metal={} cpu={}", m_gk_v[i], c_gk_v[i]);
+            assert!(
+                (m_gk_v[i] - c_gk_v[i]).abs() < 1e-3,
+                "grad_K mismatch at {i}: metal={} cpu={}",
+                m_gk_v[i],
+                c_gk_v[i]
+            );
         }
         for i in 0..m_gv_v.len() {
-            assert!((m_gv_v[i] - c_gv_v[i]).abs() < 1e-3,
-                "grad_V mismatch at {i}: metal={} cpu={}", m_gv_v[i], c_gv_v[i]);
+            assert!(
+                (m_gv_v[i] - c_gv_v[i]).abs() < 1e-3,
+                "grad_V mismatch at {i}: metal={} cpu={}",
+                m_gv_v[i],
+                c_gv_v[i]
+            );
         }
     }
 
@@ -1185,13 +1276,17 @@ mod tests {
         let total_dim = n_heads * head_dim;
 
         let q_data: Vec<f32> = (0..seq_len * total_dim)
-            .map(|i| ((i * 7 + 3) % 13) as f32 / 13.0 - 0.5).collect();
+            .map(|i| ((i * 7 + 3) % 13) as f32 / 13.0 - 0.5)
+            .collect();
         let k_data: Vec<f32> = (0..seq_len * total_dim)
-            .map(|i| ((i * 11 + 5) % 17) as f32 / 17.0 - 0.5).collect();
+            .map(|i| ((i * 11 + 5) % 17) as f32 / 17.0 - 0.5)
+            .collect();
         let v_data: Vec<f32> = (0..seq_len * total_dim)
-            .map(|i| ((i * 13 + 7) % 19) as f32 / 19.0 - 0.5).collect();
+            .map(|i| ((i * 13 + 7) % 19) as f32 / 19.0 - 0.5)
+            .collect();
         let go_data: Vec<f32> = (0..seq_len * total_dim)
-            .map(|i| ((i * 3 + 11) % 23) as f32 / 23.0 - 0.5).collect();
+            .map(|i| ((i * 3 + 11) % 23) as f32 / 23.0 - 0.5)
+            .collect();
 
         let m_go = metal.upload(&go_data);
         let m_q = metal.upload(&q_data);
@@ -1216,16 +1311,28 @@ mod tests {
         let c_gv_v = cpu.download(&c_gv);
 
         for i in 0..m_gq_v.len() {
-            assert!((m_gq_v[i] - c_gq_v[i]).abs() < 1e-3,
-                "MHA grad_Q mismatch at {i}: metal={} cpu={}", m_gq_v[i], c_gq_v[i]);
+            assert!(
+                (m_gq_v[i] - c_gq_v[i]).abs() < 1e-3,
+                "MHA grad_Q mismatch at {i}: metal={} cpu={}",
+                m_gq_v[i],
+                c_gq_v[i]
+            );
         }
         for i in 0..m_gk_v.len() {
-            assert!((m_gk_v[i] - c_gk_v[i]).abs() < 1e-3,
-                "MHA grad_K mismatch at {i}: metal={} cpu={}", m_gk_v[i], c_gk_v[i]);
+            assert!(
+                (m_gk_v[i] - c_gk_v[i]).abs() < 1e-3,
+                "MHA grad_K mismatch at {i}: metal={} cpu={}",
+                m_gk_v[i],
+                c_gk_v[i]
+            );
         }
         for i in 0..m_gv_v.len() {
-            assert!((m_gv_v[i] - c_gv_v[i]).abs() < 1e-3,
-                "MHA grad_V mismatch at {i}: metal={} cpu={}", m_gv_v[i], c_gv_v[i]);
+            assert!(
+                (m_gv_v[i] - c_gv_v[i]).abs() < 1e-3,
+                "MHA grad_V mismatch at {i}: metal={} cpu={}",
+                m_gv_v[i],
+                c_gv_v[i]
+            );
         }
     }
 
@@ -1241,19 +1348,28 @@ mod tests {
         let total_dim = n_heads * head_dim;
         let kv_dim = n_kv_heads * head_dim;
 
-        let q_data: Vec<f32> = (0..q_len * total_dim).map(|i| ((i * 7 + 3) % 13) as f32 / 13.0).collect();
-        let kv_data: Vec<f32> = (0..q_len * kv_dim).map(|i| ((i * 11 + 5) % 17) as f32 / 17.0).collect();
-        let v_data: Vec<f32> = (0..q_len * kv_dim).map(|i| ((i * 13 + 7) % 19) as f32 / 19.0).collect();
+        let q_data: Vec<f32> = (0..q_len * total_dim)
+            .map(|i| ((i * 7 + 3) % 13) as f32 / 13.0)
+            .collect();
+        let kv_data: Vec<f32> = (0..q_len * kv_dim)
+            .map(|i| ((i * 11 + 5) % 17) as f32 / 17.0)
+            .collect();
+        let v_data: Vec<f32> = (0..q_len * kv_dim)
+            .map(|i| ((i * 13 + 7) % 19) as f32 / 19.0)
+            .collect();
 
         let m_q = metal.upload(&q_data);
         let m_k = metal.upload(&kv_data);
         let m_v = metal.upload(&v_data);
-        let m_out = metal.download(&metal.kv_attention(&m_q, &m_k, &m_v, 0, q_len, n_heads, n_kv_heads, head_dim));
+        let m_out = metal.download(
+            &metal.kv_attention(&m_q, &m_k, &m_v, 0, q_len, n_heads, n_kv_heads, head_dim),
+        );
 
         let c_q = cpu.upload(&q_data);
         let c_k = cpu.upload(&kv_data);
         let c_v = cpu.upload(&v_data);
-        let c_out = cpu.download(&cpu.kv_attention(&c_q, &c_k, &c_v, 0, q_len, n_heads, n_kv_heads, head_dim));
+        let c_out = cpu
+            .download(&cpu.kv_attention(&c_q, &c_k, &c_v, 0, q_len, n_heads, n_kv_heads, head_dim));
 
         assert_eq!(m_out.len(), c_out.len());
         for i in 0..m_out.len() {

@@ -13,8 +13,8 @@ mod var;
 pub use tape::Tape;
 pub use var::Var;
 
-use alloc::vec::Vec;
 use crate::la::{DMat, DVec};
+use alloc::vec::Vec;
 /// Compute gradient of scalar-valued function via reverse-mode AD.
 ///
 /// Returns gradient vector where `grad[i]` = ∂f/∂x_i.

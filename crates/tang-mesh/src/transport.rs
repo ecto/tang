@@ -51,10 +51,7 @@ impl MeshTransport {
     ///
     /// iroh handles NAT traversal, relay fallback, and encryption.
     pub async fn connect(&self, peer: iroh::EndpointId) -> Result<Connection, MeshError> {
-        let conn = self
-            .endpoint
-            .connect(peer, ALPN)
-            .await?;
+        let conn = self.endpoint.connect(peer, ALPN).await?;
         Ok(conn)
     }
 

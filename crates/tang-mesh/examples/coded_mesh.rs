@@ -17,8 +17,8 @@
 use tang_mesh::coded::{CodedModel, Generator};
 use tang_mesh::coordinator::Coordinator;
 use tang_mesh::inference::{
-    apply_bias, attention_forward, build_coded_transformer, embed_tokens, silu,
-    Activation, CodedInferenceServer, TransformerConfig, TransformerWeights,
+    apply_bias, attention_forward, build_coded_transformer, embed_tokens, silu, Activation,
+    CodedInferenceServer, TransformerConfig, TransformerWeights,
 };
 use tang_mesh::mesh::NodeId;
 use tang_mesh::transport::MeshTransport;
@@ -176,10 +176,8 @@ fn uncoded_forward(
         let d_qkv = d_q + d_k + d_k;
         let mut qkv = vec![0.0f32; seq_len * d_qkv];
         for t in 0..seq_len {
-            qkv[t * d_qkv..t * d_qkv + d_q]
-                .copy_from_slice(&q[t * d_q..(t + 1) * d_q]);
-            qkv[t * d_qkv + d_q..t * d_qkv + d_q + d_k]
-                .copy_from_slice(&k[t * d_k..(t + 1) * d_k]);
+            qkv[t * d_qkv..t * d_qkv + d_q].copy_from_slice(&q[t * d_q..(t + 1) * d_q]);
+            qkv[t * d_qkv + d_q..t * d_qkv + d_q + d_k].copy_from_slice(&k[t * d_k..(t + 1) * d_k]);
             qkv[t * d_qkv + d_q + d_k..t * d_qkv + d_qkv]
                 .copy_from_slice(&v[t * d_k..(t + 1) * d_k]);
         }
@@ -260,12 +258,7 @@ async fn run_local() {
         workers.push(worker);
     }
 
-    let server = CodedInferenceServer::new(
-        coordinator,
-        g,
-        vec![NodeId(0), NodeId(1)],
-        layers,
-    );
+    let server = CodedInferenceServer::new(coordinator, g, vec![NodeId(0), NodeId(1)], layers);
 
     let tokens = vec![1u32, 42, 7, 100];
     let input = embed_tokens(&tokens, &weights.embed_table, config.d_model);
@@ -301,11 +294,7 @@ async fn run_local() {
         .sum::<f32>()
         / coded_logits.len() as f32;
 
-    println!(
-        "output shape: [{}, {}]",
-        tokens.len(),
-        config.vocab_size
-    );
+    println!("output shape: [{}, {}]", tokens.len(), config.vocab_size);
     println!("max |coded - uncoded|: {:.6e}", max_diff);
     println!("mean |coded - uncoded|: {:.6e}", mean_diff);
 
@@ -337,10 +326,7 @@ async fn run_local() {
     }
 
     let pass = max_diff < 0.1;
-    println!(
-        "\n{}",
-        if pass { "PASS" } else { "FAIL" }
-    );
+    println!("\n{}", if pass { "PASS" } else { "FAIL" });
 }
 
 async fn run_worker(node_id: usize) {
@@ -406,9 +392,7 @@ async fn run_coordinator(node_id: usize, peer: &str) {
 
     // Remote worker gets node_id 1 (assume coordinator is 0, worker is 1)
     let remote_node_id = if node_id == 0 { 1u32 } else { 0u32 };
-    coordinator
-        .add_worker(NodeId(remote_node_id), client)
-        .await;
+    coordinator.add_worker(NodeId(remote_node_id), client).await;
     println!("connected to remote worker as node {}", remote_node_id);
 
     let server = CodedInferenceServer::new(
@@ -432,10 +416,7 @@ async fn run_coordinator(node_id: usize, peer: &str) {
         .fold(0.0f32, f32::max);
 
     println!("max |coded - uncoded|: {:.6e}", max_diff);
-    println!(
-        "{}",
-        if max_diff < 0.1 { "PASS" } else { "FAIL" }
-    );
+    println!("{}", if max_diff < 0.1 { "PASS" } else { "FAIL" });
 
     transport.close().await;
 }

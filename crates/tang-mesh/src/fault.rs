@@ -115,13 +115,19 @@ impl HealthMonitor {
             if health.missed_beats >= self.dead_threshold {
                 health.state = HealthState::Dead;
                 if prev_state != HealthState::Dead {
-                    warn!("{node_id} declared dead ({} missed heartbeats)", health.missed_beats);
+                    warn!(
+                        "{node_id} declared dead ({} missed heartbeats)",
+                        health.missed_beats
+                    );
                     newly_dead.push(node_id);
                 }
             } else if health.missed_beats >= self.suspect_threshold {
                 health.state = HealthState::Suspect;
                 if prev_state == HealthState::Healthy {
-                    warn!("{node_id} suspected ({} missed heartbeats)", health.missed_beats);
+                    warn!(
+                        "{node_id} suspected ({} missed heartbeats)",
+                        health.missed_beats
+                    );
                 }
             }
         }
@@ -172,7 +178,10 @@ impl FaultHandler {
         mesh: &crate::mesh::Mesh,
         strategy: &crate::placement::Strategy,
     ) -> Result<Vec<crate::partition::GraphPartition>, crate::error::MeshError> {
-        info!("handling failure of {} node(s), re-partitioning", dead_nodes.len());
+        info!(
+            "handling failure of {} node(s), re-partitioning",
+            dead_nodes.len()
+        );
 
         let alive_mesh = mesh.without_nodes(dead_nodes);
         if alive_mesh.is_empty() {
@@ -243,13 +252,9 @@ mod tests {
         };
 
         // Kill node 1, re-partition across survivors
-        let partitions = FaultHandler::handle_failure(
-            &[NodeId(1)],
-            &graph,
-            &mesh,
-            &Strategy::DataParallel,
-        )
-        .unwrap();
+        let partitions =
+            FaultHandler::handle_failure(&[NodeId(1)], &graph, &mesh, &Strategy::DataParallel)
+                .unwrap();
 
         // Should only have partitions for nodes 0 and 2
         assert_eq!(partitions.len(), 2);

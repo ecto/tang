@@ -19,7 +19,9 @@ pub struct GpuTanhLayer {
 
 impl GpuTanhLayer {
     pub fn new() -> Self {
-        Self { cached_output: None }
+        Self {
+            cached_output: None,
+        }
     }
 }
 
@@ -45,10 +47,13 @@ impl GpuTrainModule for GpuTanhLayer {
         grad_output: &GpuTensor,
     ) -> GpuTensor {
         // d/dx tanh(x) = 1 - tanh(x)^2
-        let output = self.cached_output.as_ref().expect("must call forward_train before backward");
+        let output = self
+            .cached_output
+            .as_ref()
+            .expect("must call forward_train before backward");
         map_elementwise(device, cache, &[grad_output, output], |args| {
-            use crate::Scalar;
             use crate::expr::ExprId;
+            use crate::Scalar;
             let grad = args[0];
             let out = args[1];
             grad * (ExprId::from_f64(1.0) - out * out)
@@ -104,7 +109,10 @@ impl GpuTrainModule for GpuReLULayer {
         cache: &mut KernelCache,
         grad_output: &GpuTensor,
     ) -> GpuTensor {
-        let input = self.cached_input.as_ref().expect("must call forward_train before backward");
+        let input = self
+            .cached_input
+            .as_ref()
+            .expect("must call forward_train before backward");
         relu_backward(device, cache, input, grad_output)
     }
 
@@ -173,7 +181,10 @@ impl GpuTrainModule for GpuSequential {
     }
 
     fn parameters_mut(&mut self) -> Vec<&mut GpuTensor> {
-        self.layers.iter_mut().flat_map(|l| l.parameters_mut()).collect()
+        self.layers
+            .iter_mut()
+            .flat_map(|l| l.parameters_mut())
+            .collect()
     }
 
     fn gradients(&self) -> Vec<Option<&GpuTensor>> {
@@ -455,10 +466,7 @@ impl GpuTrainer {
             // Flush once per epoch, then read back all loss scalars
             cache.flush(device);
             let n_batches = batch_losses.len().max(1);
-            let total_loss: f32 = batch_losses
-                .iter()
-                .map(|t| t.to_vec_sync(device)[0])
-                .sum();
+            let total_loss: f32 = batch_losses.iter().map(|t| t.to_vec_sync(device)[0]).sum();
             epoch_losses.push(total_loss / n_batches as f32);
 
             // Re-enable batching for next epoch
@@ -614,8 +622,8 @@ impl Default for GradScaler {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::module::{GpuLinear, GpuModule};
+    use super::*;
 
     fn get_device() -> GpuDevice {
         GpuDevice::new_sync().expect("GPU device required for tests")
@@ -674,8 +682,11 @@ mod tests {
             let p_data = out_p.to_vec_sync(&device);
             let m_data = out_m.to_vec_sync(&device);
             // sum of outputs (since grad_out = [1,1,1])
-            let numerical_grad: f32 =
-                p_data.iter().zip(m_data.iter()).map(|(p, m)| (p - m) / (2.0 * eps)).sum();
+            let numerical_grad: f32 = p_data
+                .iter()
+                .zip(m_data.iter())
+                .map(|(p, m)| (p - m) / (2.0 * eps))
+                .sum();
             assert!(
                 (gi_data[dim] - numerical_grad).abs() < 0.05,
                 "input grad[{dim}]: analytical={}, numerical={}",

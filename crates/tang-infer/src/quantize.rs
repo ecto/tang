@@ -174,14 +174,20 @@ pub fn quantize_tensor_q4<S: Scalar>(tensor: &Tensor<S>) -> QuantizedQ4 {
 
 /// Dequantize Q8 back to a tensor.
 pub fn dequantize_tensor_q8(q: &QuantizedQ8) -> Tensor<f64> {
-    let data: Vec<f64> = dequantize_q8(&q.blocks).into_iter().map(|x| x as f64).collect();
+    let data: Vec<f64> = dequantize_q8(&q.blocks)
+        .into_iter()
+        .map(|x| x as f64)
+        .collect();
     let numel: usize = q.shape.iter().product();
     Tensor::new(data[..numel].to_vec(), Shape::from_slice(&q.shape))
 }
 
 /// Dequantize Q4 back to a tensor.
 pub fn dequantize_tensor_q4(q: &QuantizedQ4) -> Tensor<f64> {
-    let data: Vec<f64> = dequantize_q4(&q.blocks).into_iter().map(|x| x as f64).collect();
+    let data: Vec<f64> = dequantize_q4(&q.blocks)
+        .into_iter()
+        .map(|x| x as f64)
+        .collect();
     let numel: usize = q.shape.iter().product();
     Tensor::new(data[..numel].to_vec(), Shape::from_slice(&q.shape))
 }

@@ -68,7 +68,12 @@ fn target_at(name: &str, x: f64) -> Option<C> {
 
 fn report_crosscheck(label: &str, reports: &[CrossCheckReport]) {
     let passed = reports.iter().filter(|r| r.passed).count();
-    println!("  {:<12} {:>3}/{:<3} pass 3-point check", label, passed, reports.len());
+    println!(
+        "  {:<12} {:>3}/{:<3} pass 3-point check",
+        label,
+        passed,
+        reports.len()
+    );
 
     // Show any failures — they're the most interesting rows.
     let fails: Vec<&CrossCheckReport> = reports.iter().filter(|r| !r.passed).collect();
@@ -124,9 +129,7 @@ fn main() {
     ];
 
     // -- Part A: multi-point cross-check --
-    println!(
-        "Part A — cross-check at 3 independent transcendentals {{γ, A, G}}"
-    );
+    println!("Part A — cross-check at 3 independent transcendentals {{γ, A, G}}");
     println!(
         "  test points: γ={:.4}, A={:.4}, G={:.4}",
         TEST_POINTS[0], TEST_POINTS[1], TEST_POINTS[2]

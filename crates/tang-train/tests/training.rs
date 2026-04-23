@@ -1,10 +1,10 @@
 use tang_tensor::{Shape, Tensor};
 use tang_train::{
     mse_loss, mse_loss_grad, AdaptiveAvgPool2d, AvgPool2d, BatchNorm2d, Conv1d, Conv2d,
-    ConvTranspose2d, Dropout, Embedding, GroupNorm, GroupedQueryAttention, InstanceNorm,
-    LayerNorm, Linear, LoRA, LSTM, MaxPool2d, Module, ModuleAdam, ModuleSgd,
-    MultiHeadAttention, Optimizer, RMSNorm, ReLU, RotaryEmbedding, Sequential, SiLU,
-    SlidingWindowAttention, Tanh, TransformerBlock, Upsample, UpsampleMode, GRU, GELU,
+    ConvTranspose2d, Dropout, Embedding, GroupNorm, GroupedQueryAttention, InstanceNorm, LayerNorm,
+    Linear, LoRA, MaxPool2d, Module, ModuleAdam, ModuleSgd, MultiHeadAttention, Optimizer, RMSNorm,
+    ReLU, RotaryEmbedding, Sequential, SiLU, SlidingWindowAttention, Tanh, TransformerBlock,
+    Upsample, UpsampleMode, GELU, GRU, LSTM,
 };
 
 #[test]
@@ -139,7 +139,10 @@ fn test_sequential_forward_backward() {
 
     // Verify all parameters have gradients
     for p in model.parameters() {
-        assert!(p.grad.is_some(), "parameter should have gradient after backward");
+        assert!(
+            p.grad.is_some(),
+            "parameter should have gradient after backward"
+        );
     }
 }
 
@@ -197,10 +200,7 @@ fn test_training_converges_xor() {
 #[test]
 fn test_module_sgd_converges() {
     // Simple regression: y = 2x + 1
-    let inputs = Tensor::new(
-        vec![0.0, 1.0, 2.0, 3.0],
-        Shape::from_slice(&[4, 1]),
-    );
+    let inputs = Tensor::new(vec![0.0, 1.0, 2.0, 3.0], Shape::from_slice(&[4, 1]));
     let targets = Tensor::new(vec![1.0, 3.0, 5.0, 7.0], Shape::from_slice(&[4, 1]));
 
     let mut model = Linear::<f64>::new(1, 1, 99);
@@ -231,10 +231,7 @@ fn test_module_generic_dual() {
 
     // Verify Linear<Dual<f64>> compiles and works for forward pass
     let mut layer = Linear::<Dual<f64>>::new(2, 3, 42);
-    let input = Tensor::from_slice(&[
-        Dual::var(1.0_f64),
-        Dual::constant(2.0_f64),
-    ]);
+    let input = Tensor::from_slice(&[Dual::var(1.0_f64), Dual::constant(2.0_f64)]);
     let output = layer.forward(&input);
     assert_eq!(output.numel(), 3);
 
@@ -333,8 +330,16 @@ fn test_dropout_training() {
 
     // Some elements should be zero, others scaled by 2.0
     let zeros = output.data().iter().filter(|&&v| v == 0.0).count();
-    let scaled = output.data().iter().filter(|&&v| (v - 2.0).abs() < 1e-10).count();
-    assert!(zeros > 300 && zeros < 700, "~50% should be zeroed, got {}", zeros);
+    let scaled = output
+        .data()
+        .iter()
+        .filter(|&&v| (v - 2.0).abs() < 1e-10)
+        .count();
+    assert!(
+        zeros > 300 && zeros < 700,
+        "~50% should be zeroed, got {}",
+        zeros
+    );
     assert_eq!(zeros + scaled, 1000, "all elements should be 0 or 2.0");
 }
 
@@ -354,7 +359,11 @@ fn test_dropout_eval() {
 #[test]
 fn test_named_parameters_linear() {
     let layer = Linear::<f64>::new(3, 2, 42);
-    let names: Vec<String> = layer.named_parameters().iter().map(|(n, _)| n.clone()).collect();
+    let names: Vec<String> = layer
+        .named_parameters()
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect();
     assert_eq!(names, vec!["weight", "bias"]);
 }
 
@@ -365,7 +374,11 @@ fn test_named_parameters_sequential() {
         Box::new(Tanh::new()),
         Box::new(Linear::new(8, 2, 137)),
     ]);
-    let names: Vec<String> = model.named_parameters().iter().map(|(n, _)| n.clone()).collect();
+    let names: Vec<String> = model
+        .named_parameters()
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect();
     assert_eq!(names, vec!["0.weight", "0.bias", "2.weight", "2.bias"]);
 }
 
@@ -455,7 +468,12 @@ fn test_state_dict_roundtrip() {
     let out1 = model.forward(&input);
     let out2 = model2.forward(&input);
     for (&a, &b) in out1.data().iter().zip(out2.data().iter()) {
-        assert!((a - b).abs() < 1e-10, "state_dict roundtrip mismatch: {} vs {}", a, b);
+        assert!(
+            (a - b).abs() < 1e-10,
+            "state_dict roundtrip mismatch: {} vs {}",
+            a,
+            b
+        );
     }
 }
 
@@ -511,7 +529,11 @@ fn test_conv1d_backward_gradient_check() {
                 assert!(
                     (numerical - analytical).abs() < 1e-4,
                     "conv1d weight grad mismatch at [{},{},{}]: numerical={}, analytical={}",
-                    oc, ic, k, numerical, analytical
+                    oc,
+                    ic,
+                    k,
+                    numerical,
+                    analytical
                 );
             }
         }
@@ -537,7 +559,9 @@ fn test_conv1d_backward_gradient_check() {
         assert!(
             (numerical - analytical).abs() < 1e-4,
             "conv1d bias grad mismatch at [{}]: numerical={}, analytical={}",
-            oc, numerical, analytical
+            oc,
+            numerical,
+            analytical
         );
     }
 
@@ -566,7 +590,10 @@ fn test_conv1d_backward_gradient_check() {
             assert!(
                 (numerical - analytical).abs() < 1e-4,
                 "conv1d input grad mismatch at [0,{},{}]: numerical={}, analytical={}",
-                ic, i, numerical, analytical
+                ic,
+                i,
+                numerical,
+                analytical
             );
         }
     }
@@ -575,21 +602,32 @@ fn test_conv1d_backward_gradient_check() {
 #[test]
 fn test_conv1d_named_parameters() {
     let conv = Conv1d::<f64>::new(2, 3, 3, 42);
-    let names: Vec<String> = conv.named_parameters().iter().map(|(n, _)| n.clone()).collect();
+    let names: Vec<String> = conv
+        .named_parameters()
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect();
     assert_eq!(names, vec!["weight", "bias"]);
 }
 
 #[test]
 fn test_conv2d_named_parameters() {
     let conv = Conv2d::<f64>::new(1, 4, 3, 42);
-    let names: Vec<String> = conv.named_parameters().iter().map(|(n, _)| n.clone()).collect();
+    let names: Vec<String> = conv
+        .named_parameters()
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect();
     assert_eq!(names, vec!["weight", "bias"]);
 }
 
 #[test]
 fn test_layer_norm_forward() {
     let mut ln = LayerNorm::<f64>::new(4);
-    let input = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], Shape::from_slice(&[2, 4]));
+    let input = Tensor::new(
+        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        Shape::from_slice(&[2, 4]),
+    );
     let output = ln.forward(&input);
 
     // Each row should be approximately normalized (mean≈0, std≈1 before gamma/beta)
@@ -597,14 +635,22 @@ fn test_layer_norm_forward() {
     // With gamma=1, beta=0, output should have mean≈0 per row
     for b in 0..2 {
         let row_mean: f64 = (0..4).map(|j| output.get(&[b, j])).sum::<f64>() / 4.0;
-        assert!(row_mean.abs() < 1e-10, "row {} mean should be ~0, got {}", b, row_mean);
+        assert!(
+            row_mean.abs() < 1e-10,
+            "row {} mean should be ~0, got {}",
+            b,
+            row_mean
+        );
     }
 }
 
 #[test]
 fn test_layer_norm_backward_gradient_check() {
     let mut ln = LayerNorm::<f64>::new(3);
-    let input = Tensor::new(vec![1.0, 3.0, 2.0, 4.0, 1.0, 5.0], Shape::from_slice(&[2, 3]));
+    let input = Tensor::new(
+        vec![1.0, 3.0, 2.0, 4.0, 1.0, 5.0],
+        Shape::from_slice(&[2, 3]),
+    );
     let eps = 1e-5;
 
     let _out = ln.forward(&input);
@@ -632,7 +678,10 @@ fn test_layer_norm_backward_gradient_check() {
             assert!(
                 (numerical - analytical).abs() < 1e-4,
                 "layernorm input grad mismatch at [{},{}]: numerical={}, analytical={}",
-                b, j, numerical, analytical
+                b,
+                j,
+                numerical,
+                analytical
             );
         }
     }
@@ -641,7 +690,11 @@ fn test_layer_norm_backward_gradient_check() {
 #[test]
 fn test_layer_norm_named_parameters() {
     let ln = LayerNorm::<f64>::new(8);
-    let names: Vec<String> = ln.named_parameters().iter().map(|(n, _)| n.clone()).collect();
+    let names: Vec<String> = ln
+        .named_parameters()
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect();
     assert_eq!(names, vec!["gamma", "beta"]);
 }
 
@@ -656,7 +709,11 @@ fn test_multi_head_attention_forward_shape() {
 #[test]
 fn test_multi_head_attention_named_parameters() {
     let mha = MultiHeadAttention::<f64>::new(16, 4, 42);
-    let names: Vec<String> = mha.named_parameters().iter().map(|(n, _)| n.clone()).collect();
+    let names: Vec<String> = mha
+        .named_parameters()
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect();
     assert!(names.contains(&"wq.weight".to_string()));
     assert!(names.contains(&"wq.bias".to_string()));
     assert!(names.contains(&"wk.weight".to_string()));
@@ -703,13 +760,32 @@ fn test_transformer_block_backward_runs() {
 #[test]
 fn test_transformer_block_named_parameters() {
     let block = TransformerBlock::<f64>::new(8, 2, 16, 42);
-    let names: Vec<String> = block.named_parameters().iter().map(|(n, _)| n.clone()).collect();
+    let names: Vec<String> = block
+        .named_parameters()
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect();
     // Should have prefixed names
-    assert!(names.iter().any(|n| n.starts_with("attn.")), "should have attn params");
-    assert!(names.iter().any(|n| n.starts_with("ln1.")), "should have ln1 params");
-    assert!(names.iter().any(|n| n.starts_with("ln2.")), "should have ln2 params");
-    assert!(names.iter().any(|n| n.starts_with("ff1.")), "should have ff1 params");
-    assert!(names.iter().any(|n| n.starts_with("ff2.")), "should have ff2 params");
+    assert!(
+        names.iter().any(|n| n.starts_with("attn.")),
+        "should have attn params"
+    );
+    assert!(
+        names.iter().any(|n| n.starts_with("ln1.")),
+        "should have ln1 params"
+    );
+    assert!(
+        names.iter().any(|n| n.starts_with("ln2.")),
+        "should have ln2 params"
+    );
+    assert!(
+        names.iter().any(|n| n.starts_with("ff1.")),
+        "should have ff1 params"
+    );
+    assert!(
+        names.iter().any(|n| n.starts_with("ff2.")),
+        "should have ff2 params"
+    );
 }
 
 #[test]
@@ -717,7 +793,10 @@ fn test_transformer_block_residual_connection() {
     // With zero-initialized weights, the output should approximately equal the input
     // (due to residual connections and layer norm)
     let mut block = TransformerBlock::<f64>::new(4, 1, 8, 42);
-    let input = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], Shape::from_slice(&[2, 4]));
+    let input = Tensor::new(
+        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        Shape::from_slice(&[2, 4]),
+    );
     let output = block.forward(&input);
     // Output should be finite and same shape
     assert_eq!(output.shape().dims(), &[2, 4]);
@@ -760,7 +839,9 @@ fn test_silu_forward_backward() {
         assert!(
             (grad_in.get(&[i]) - numerical).abs() < 1e-4,
             "silu grad mismatch at {}: analytical={}, numerical={}",
-            i, grad_in.get(&[i]), numerical
+            i,
+            grad_in.get(&[i]),
+            numerical
         );
     }
 }
@@ -791,7 +872,9 @@ fn test_gelu_forward_backward() {
         assert!(
             (grad_in.get(&[i]) - numerical).abs() < 1e-4,
             "gelu grad mismatch at {}: analytical={}, numerical={}",
-            i, grad_in.get(&[i]), numerical
+            i,
+            grad_in.get(&[i]),
+            numerical
         );
     }
 }
@@ -856,7 +939,10 @@ fn test_rms_norm_backward_gradient_check() {
             assert!(
                 (numerical - analytical).abs() < 1e-3,
                 "rmsnorm input grad mismatch at [{},{}]: numerical={}, analytical={}",
-                b, j, numerical, analytical
+                b,
+                j,
+                numerical,
+                analytical
             );
         }
     }
@@ -865,7 +951,11 @@ fn test_rms_norm_backward_gradient_check() {
 #[test]
 fn test_rms_norm_named_parameters() {
     let rms = RMSNorm::<f64>::new(8);
-    let names: Vec<String> = rms.named_parameters().iter().map(|(n, _)| n.clone()).collect();
+    let names: Vec<String> = rms
+        .named_parameters()
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect();
     assert_eq!(names, vec!["weight"]);
 }
 
@@ -906,12 +996,17 @@ fn test_rope_relative_position() {
     let k_rot_5 = rope.apply(&k, 5);
 
     // Same relative position (0,0) vs (5,5) should give same dot product
-    let dot_same_0: f64 = (0..4).map(|d| q_rot_0.get(&[0, d]) * k_rot_0.get(&[0, d])).sum();
-    let dot_same_5: f64 = (0..4).map(|d| q_rot_5.get(&[0, d]) * k_rot_5.get(&[0, d])).sum();
+    let dot_same_0: f64 = (0..4)
+        .map(|d| q_rot_0.get(&[0, d]) * k_rot_0.get(&[0, d]))
+        .sum();
+    let dot_same_5: f64 = (0..4)
+        .map(|d| q_rot_5.get(&[0, d]) * k_rot_5.get(&[0, d]))
+        .sum();
     assert!(
         (dot_same_0 - dot_same_5).abs() < 1e-10,
         "same relative position should give same dot product: {} vs {}",
-        dot_same_0, dot_same_5
+        dot_same_0,
+        dot_same_5
     );
 }
 
@@ -958,7 +1053,11 @@ fn test_gqa_backward_runs() {
 #[test]
 fn test_gqa_named_parameters() {
     let gqa = GroupedQueryAttention::<f64>::new(8, 4, 2, 42);
-    let names: Vec<String> = gqa.named_parameters().iter().map(|(n, _)| n.clone()).collect();
+    let names: Vec<String> = gqa
+        .named_parameters()
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect();
     assert!(names.contains(&"wq.weight".to_string()));
     assert!(names.contains(&"wk.weight".to_string()));
     assert!(names.contains(&"wv.weight".to_string()));
@@ -975,7 +1074,11 @@ fn test_conv2d_with_padding() {
     let mut conv = Conv2d::<f64>::with_options(1, 1, 3, 1, 1, 1, 42);
     let input = Tensor::new(vec![1.0; 1 * 1 * 5 * 5], Shape::from_slice(&[1, 1, 5, 5]));
     let output = conv.forward(&input);
-    assert_eq!(output.shape().dims(), &[1, 1, 5, 5], "padding=1 should preserve 5x5");
+    assert_eq!(
+        output.shape().dims(),
+        &[1, 1, 5, 5],
+        "padding=1 should preserve 5x5"
+    );
 }
 
 #[test]
@@ -1037,7 +1140,10 @@ fn test_conv2d_padded_backward_gradient_check() {
             assert!(
                 (numerical - analytical).abs() < 1e-4,
                 "conv2d padded input grad mismatch at [0,0,{},{}]: numerical={}, analytical={}",
-                h, w, numerical, analytical
+                h,
+                w,
+                numerical,
+                analytical
             );
         }
     }
@@ -1049,10 +1155,7 @@ fn test_maxpool2d_forward() {
     // 1x1x4x4 input
     let input = Tensor::new(
         vec![
-            1.0, 2.0, 3.0, 4.0,
-            5.0, 6.0, 7.0, 8.0,
-            9.0, 10.0, 11.0, 12.0,
-            13.0, 14.0, 15.0, 16.0,
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
         ],
         Shape::from_slice(&[1, 1, 4, 4]),
     );
@@ -1069,10 +1172,7 @@ fn test_maxpool2d_backward() {
     let mut pool = MaxPool2d::<f64>::new(2);
     let input = Tensor::new(
         vec![
-            1.0, 2.0, 3.0, 4.0,
-            5.0, 6.0, 7.0, 8.0,
-            9.0, 10.0, 11.0, 12.0,
-            13.0, 14.0, 15.0, 16.0,
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
         ],
         Shape::from_slice(&[1, 1, 4, 4]),
     );
@@ -1091,10 +1191,7 @@ fn test_avgpool2d_forward() {
     let mut pool = AvgPool2d::<f64>::new(2);
     let input = Tensor::new(
         vec![
-            1.0, 2.0, 3.0, 4.0,
-            5.0, 6.0, 7.0, 8.0,
-            9.0, 10.0, 11.0, 12.0,
-            13.0, 14.0, 15.0, 16.0,
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
         ],
         Shape::from_slice(&[1, 1, 4, 4]),
     );
@@ -1109,10 +1206,7 @@ fn test_avgpool2d_forward() {
 #[test]
 fn test_adaptive_avgpool2d() {
     let mut pool = AdaptiveAvgPool2d::<f64>::new(1, 1);
-    let input = Tensor::new(
-        vec![1.0, 2.0, 3.0, 4.0],
-        Shape::from_slice(&[1, 1, 2, 2]),
-    );
+    let input = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], Shape::from_slice(&[1, 1, 2, 2]));
     let output = pool.forward(&input);
     assert_eq!(output.shape().dims(), &[1, 1, 1, 1]);
     assert!((output.get(&[0, 0, 0, 0]) - 2.5).abs() < 1e-10);
@@ -1156,12 +1250,9 @@ fn test_batchnorm2d_forward() {
     let input = Tensor::new(
         vec![
             // batch 0, channel 0
-            1.0, 2.0, 3.0, 4.0,
-            // batch 0, channel 1
-            10.0, 20.0, 30.0, 40.0,
-            // batch 1, channel 0
-            5.0, 6.0, 7.0, 8.0,
-            // batch 1, channel 1
+            1.0, 2.0, 3.0, 4.0, // batch 0, channel 1
+            10.0, 20.0, 30.0, 40.0, // batch 1, channel 0
+            5.0, 6.0, 7.0, 8.0, // batch 1, channel 1
             50.0, 60.0, 70.0, 80.0,
         ],
         Shape::from_slice(&[2, 2, 2, 2]),
@@ -1240,7 +1331,11 @@ fn test_batchnorm2d_backward_gradient_check() {
                 assert!(
                     (numerical - analytical).abs() < 1e-3,
                     "batchnorm input grad mismatch at [{},0,{},{}]: numerical={}, analytical={}",
-                    b, h, w, numerical, analytical
+                    b,
+                    h,
+                    w,
+                    numerical,
+                    analytical
                 );
             }
         }
@@ -1277,7 +1372,10 @@ fn test_conv_transpose2d_backward_runs() {
 fn test_upsample_nearest() {
     let mut up = Upsample::nearest(2);
     // [1, 1, 2, 2] -> [1, 1, 4, 4]
-    let input = Tensor::new(vec![1.0, 2.0, 3.0, 4.0_f64], Shape::from_slice(&[1, 1, 2, 2]));
+    let input = Tensor::new(
+        vec![1.0, 2.0, 3.0, 4.0_f64],
+        Shape::from_slice(&[1, 1, 2, 2]),
+    );
     let output = up.forward(&input);
     assert_eq!(output.shape().dims(), &[1, 1, 4, 4]);
     // Each 2x2 block should be the same value
@@ -1291,7 +1389,10 @@ fn test_upsample_nearest() {
 #[test]
 fn test_upsample_bilinear() {
     let mut up = Upsample::bilinear(2);
-    let input = Tensor::new(vec![0.0, 1.0, 0.0, 1.0_f64], Shape::from_slice(&[1, 1, 2, 2]));
+    let input = Tensor::new(
+        vec![0.0, 1.0, 0.0, 1.0_f64],
+        Shape::from_slice(&[1, 1, 2, 2]),
+    );
     let output = up.forward(&input);
     assert_eq!(output.shape().dims(), &[1, 1, 4, 4]);
     // Bilinear should produce smooth interpolation
@@ -1299,7 +1400,10 @@ fn test_upsample_bilinear() {
     for i in 0..4 {
         for j in 0..4 {
             let v = output.get(&[0, 0, i, j]);
-            assert!(v >= -0.01 && v <= 1.01, "bilinear out of range: {v} at [{i},{j}]");
+            assert!(
+                v >= -0.01 && v <= 1.01,
+                "bilinear out of range: {v} at [{i},{j}]"
+            );
         }
     }
 }
@@ -1307,7 +1411,10 @@ fn test_upsample_bilinear() {
 #[test]
 fn test_upsample_nearest_backward() {
     let mut up = Upsample::nearest(2);
-    let input = Tensor::new(vec![1.0, 2.0, 3.0, 4.0_f64], Shape::from_slice(&[1, 1, 2, 2]));
+    let input = Tensor::new(
+        vec![1.0, 2.0, 3.0, 4.0_f64],
+        Shape::from_slice(&[1, 1, 2, 2]),
+    );
     let _output = up.forward(&input);
     let grad_out = Tensor::<f64>::ones(Shape::from_slice(&[1, 1, 4, 4]));
     let grad_in = up.backward(&grad_out);
@@ -1338,7 +1445,11 @@ fn test_group_norm_forward() {
             }
         }
     }
-    assert!((group0_sum / 8.0).abs() < 0.01, "group0 mean should be ~0, got {}", group0_sum / 8.0);
+    assert!(
+        (group0_sum / 8.0).abs() < 0.01,
+        "group0 mean should be ~0, got {}",
+        group0_sum / 8.0
+    );
 }
 
 #[test]

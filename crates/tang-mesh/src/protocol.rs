@@ -212,10 +212,7 @@ mod tests {
         let reconst: Vec<f64> = g2.eval_many(&outputs2, &inputs);
 
         for (a, b) in orig.iter().zip(reconst.iter()) {
-            assert!(
-                (a - b).abs() < 1e-10,
-                "mismatch: orig={a}, reconst={b}"
-            );
+            assert!((a - b).abs() < 1e-10, "mismatch: orig={a}, reconst={b}");
         }
     }
 

@@ -52,19 +52,18 @@ pub mod transport;
 pub mod worker;
 
 // Re-exports
-pub use coded::{
-    CodedModel, CompressedGrad, Generator, GradientPolicy, Shard,
-    reshape_blocks_to_seq, reshape_seq_to_blocks,
-};
 pub use allreduce::{AllReduce, ReduceOp};
+pub use coded::{
+    reshape_blocks_to_seq, reshape_seq_to_blocks, CodedModel, CompressedGrad, Generator,
+    GradientPolicy, Shard,
+};
 pub use coordinator::Coordinator;
 pub use distributed::DistributedTrainer;
 pub use error::MeshError;
 pub use fault::{FaultHandler, HealthMonitor, HealthState};
 pub use inference::{
-    Activation, CodedInferenceServer, CodedLayer, InferenceServer,
-    TransformerConfig, TransformerWeights, build_coded_transformer, embed_tokens,
-    apply_bias, attention_forward, silu,
+    apply_bias, attention_forward, build_coded_transformer, embed_tokens, silu, Activation,
+    CodedInferenceServer, CodedLayer, InferenceServer, TransformerConfig, TransformerWeights,
 };
 pub use mesh::{GpuBackend, GpuDeviceType, GpuInfo, Mesh, MeshBuilder, MeshNode, NodeId};
 pub use partition::{auto_partition, partition, GraphPartition};

@@ -129,12 +129,9 @@ impl OpArena {
             Node::Unary(UnaryOp::Neg, c) => format!("-({})", self.pretty(c)),
             Node::Unary(UnaryOp::Inv, c) => format!("1/({})", self.pretty(c)),
             Node::Unary(op, c) => format!("{}({})", op.pretty(), self.pretty(c)),
-            Node::Binary(op, l, r) => format!(
-                "({} {} {})",
-                self.pretty(l),
-                op.pretty(),
-                self.pretty(r)
-            ),
+            Node::Binary(op, l, r) => {
+                format!("({} {} {})", self.pretty(l), op.pretty(), self.pretty(r))
+            }
         }
     }
 }
@@ -205,10 +202,7 @@ pub fn build_arena(max_size: usize) -> (OpArena, Vec<Vec<NodeId>>) {
 /// level allocation is avoided: the callback gets a synthetic `Node`
 /// with child references into the arena, and unless the callback keeps
 /// the node elsewhere, it's dropped immediately.
-pub fn for_each_tree_in_arena(
-    max_size: usize,
-    mut f: impl FnMut(&OpArena, Node),
-) {
+pub fn for_each_tree_in_arena(max_size: usize, mut f: impl FnMut(&OpArena, Node)) {
     if max_size == 0 {
         return;
     }
@@ -265,9 +259,36 @@ pub fn for_each_tree_in_arena(
 /// Five conjecturally-algebraically-independent complex test pairs.
 /// (Same as `op_enum::DedupSet`.)
 const TEST_PAIRS: [(C, C); 5] = [
-    (C { re: 0.5772156649015329, im: 0.0 }, C { re: 1.2824271291006226, im: 0.0 }),
-    (C { re: 1.2824271291006226, im: 0.0 }, C { re: 0.9159655941772190, im: 0.0 }),
-    (C { re: 0.9159655941772190, im: 0.0 }, C { re: 0.5772156649015329, im: 0.0 }),
+    (
+        C {
+            re: 0.5772156649015329,
+            im: 0.0,
+        },
+        C {
+            re: 1.2824271291006226,
+            im: 0.0,
+        },
+    ),
+    (
+        C {
+            re: 1.2824271291006226,
+            im: 0.0,
+        },
+        C {
+            re: 0.9159655941772190,
+            im: 0.0,
+        },
+    ),
+    (
+        C {
+            re: 0.9159655941772190,
+            im: 0.0,
+        },
+        C {
+            re: 0.5772156649015329,
+            im: 0.0,
+        },
+    ),
     (C { re: 1.5, im: 0.3 }, C { re: 0.7, im: -0.4 }),
     (C { re: 0.4, im: 1.1 }, C { re: -0.6, im: 0.8 }),
 ];

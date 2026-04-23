@@ -12,7 +12,8 @@ pub fn load_safetensors(
     path: &Path,
 ) -> Result<HashMap<String, GpuTensor>, SafetensorsError> {
     let data = std::fs::read(path).map_err(SafetensorsError::Io)?;
-    let tensors = safetensors_crate::SafeTensors::deserialize(&data).map_err(SafetensorsError::Parse)?;
+    let tensors =
+        safetensors_crate::SafeTensors::deserialize(&data).map_err(SafetensorsError::Parse)?;
 
     let mut result = HashMap::new();
 
@@ -79,9 +80,12 @@ pub fn save_safetensors(
         .iter()
         .map(|(name, data, shape)| {
             let bytes: &[u8] = bytemuck::cast_slice(data);
-            let view =
-                safetensors_crate::tensor::TensorView::new(safetensors_crate::Dtype::F32, shape.clone(), bytes)
-                    .unwrap();
+            let view = safetensors_crate::tensor::TensorView::new(
+                safetensors_crate::Dtype::F32,
+                shape.clone(),
+                bytes,
+            )
+            .unwrap();
             (name.clone(), view)
         })
         .collect();

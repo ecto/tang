@@ -9,15 +9,15 @@
 
 use tang_tensor::{Shape, Tensor};
 use tang_train::{
-    cross_entropy_loss, cross_entropy_loss_grad, softmax, DataLoader, Linear, ModuleAdam, Module,
+    cross_entropy_loss, cross_entropy_loss_grad, softmax, DataLoader, Linear, Module, ModuleAdam,
     Sequential, Tanh, TensorDataset, Trainer,
 };
 
 // --- Vocabulary ---------------------------------------------------------------
 
 const VOCAB: [char; 30] = [
-    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r',
-    's', 't', 'u', 'v', 'w', 'x', 'y', 'z', ' ', '\n', ',', '.',
+    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's',
+    't', 'u', 'v', 'w', 'x', 'y', 'z', ' ', '\n', ',', '.',
 ];
 
 fn char_to_idx(c: char) -> Option<usize> {
@@ -204,13 +204,13 @@ fn main() {
     // train
     println!("training...");
     let losses = Trainer::new(&mut model, ModuleAdam::new(0.005), |pred, target| {
-            (
-                cross_entropy_loss(pred, target),
-                cross_entropy_loss_grad(pred, target),
-            )
-        })
-        .epochs(200)
-        .fit(&mut loader);
+        (
+            cross_entropy_loss(pred, target),
+            cross_entropy_loss_grad(pred, target),
+        )
+    })
+    .epochs(200)
+    .fit(&mut loader);
 
     for (i, loss) in losses.iter().enumerate() {
         if (i + 1) % 20 == 0 || i == 0 {

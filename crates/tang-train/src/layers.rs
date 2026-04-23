@@ -241,7 +241,7 @@ pub struct Embedding<S: Scalar> {
     pub weight: Parameter<S>, // [num_embeddings, embed_dim]
     embed_dim: usize,
     cached_input_shape: Option<(usize, usize)>, // (batch, seq_len)
-    cached_indices: Option<Vec<usize>>,          // flat indices for backward
+    cached_indices: Option<Vec<usize>>,         // flat indices for backward
 }
 
 impl<S: Scalar> Embedding<S> {
@@ -278,12 +278,20 @@ impl<S: Scalar> Module<S> for Embedding<S> {
         self.cached_input_shape = Some((batch, seq_len));
         self.cached_indices = Some(indices);
 
-        Tensor::new(out_data, Shape::from_slice(&[batch, seq_len * self.embed_dim]))
+        Tensor::new(
+            out_data,
+            Shape::from_slice(&[batch, seq_len * self.embed_dim]),
+        )
     }
 
     fn backward(&mut self, grad_output: &Tensor<S>) -> Tensor<S> {
-        let (batch, seq_len) = self.cached_input_shape.expect("must call forward before backward");
-        let indices = self.cached_indices.as_ref().expect("must call forward before backward");
+        let (batch, seq_len) = self
+            .cached_input_shape
+            .expect("must call forward before backward");
+        let indices = self
+            .cached_indices
+            .as_ref()
+            .expect("must call forward before backward");
 
         // Scatter-add gradients back to weight matrix
         // grad_output: [batch, seq_len * embed_dim]
@@ -342,7 +350,10 @@ pub struct Dropout<S: Scalar> {
 
 impl<S: Scalar> Dropout<S> {
     pub fn new(p: f64, seed: u64) -> Self {
-        assert!((0.0..1.0).contains(&p), "dropout probability must be in [0, 1)");
+        assert!(
+            (0.0..1.0).contains(&p),
+            "dropout probability must be in [0, 1)"
+        );
         Self {
             p,
             training: true,
@@ -429,12 +440,19 @@ impl<S: Scalar> Conv1d<S> {
 
 impl<S: Scalar> Module<S> for Conv1d<S> {
     fn forward(&mut self, input: &Tensor<S>) -> Tensor<S> {
-        assert_eq!(input.ndim(), 3, "Conv1d input must be [batch, in_channels, length]");
+        assert_eq!(
+            input.ndim(),
+            3,
+            "Conv1d input must be [batch, in_channels, length]"
+        );
         let batch = input.shape()[0];
         let ic = input.shape()[1];
         assert_eq!(ic, self.in_channels);
         let length = input.shape()[2];
-        assert!(length >= self.kernel_size, "input length must be >= kernel_size");
+        assert!(
+            length >= self.kernel_size,
+            "input length must be >= kernel_size"
+        );
         let out_len = length - self.kernel_size + 1;
 
         self.cached_input = Some(input.clone());
@@ -497,8 +515,8 @@ impl<S: Scalar> Module<S> for Conv1d<S> {
             for oc in 0..self.out_channels {
                 for k in 0..self.kernel_size {
                     if i >= k && (i - k) < out_len {
-                        sum += self.weight.data.get(&[oc, ic, k])
-                            * grad_output.get(&[b, oc, i - k]);
+                        sum +=
+                            self.weight.data.get(&[oc, ic, k]) * grad_output.get(&[b, oc, i - k]);
                     }
                 }
             }
@@ -588,7 +606,15 @@ impl<S: Scalar> Conv2d<S> {
     }
 
     /// Get input value with padding (returns zero for out-of-bounds).
-    fn padded_get(input: &Tensor<S>, b: usize, c: usize, i: isize, j: isize, h: usize, w: usize) -> S {
+    fn padded_get(
+        input: &Tensor<S>,
+        b: usize,
+        c: usize,
+        i: isize,
+        j: isize,
+        h: usize,
+        w: usize,
+    ) -> S {
         if i < 0 || j < 0 || (i as usize) >= h || (j as usize) >= w {
             S::ZERO
         } else {
@@ -599,7 +625,11 @@ impl<S: Scalar> Conv2d<S> {
 
 impl<S: Scalar> Module<S> for Conv2d<S> {
     fn forward(&mut self, input: &Tensor<S>) -> Tensor<S> {
-        assert_eq!(input.ndim(), 4, "Conv2d input must be [batch, in_channels, height, width]");
+        assert_eq!(
+            input.ndim(),
+            4,
+            "Conv2d input must be [batch, in_channels, height, width]"
+        );
         let batch = input.shape()[0];
         assert_eq!(input.shape()[1], self.in_channels);
         let height = input.shape()[2];
@@ -985,7 +1015,11 @@ impl<S: Scalar> MultiHeadAttention<S> {
 
 impl<S: Scalar> Module<S> for MultiHeadAttention<S> {
     fn forward(&mut self, input: &Tensor<S>) -> Tensor<S> {
-        assert_eq!(input.ndim(), 2, "MultiHeadAttention input must be [seq_len, d_model]");
+        assert_eq!(
+            input.ndim(),
+            2,
+            "MultiHeadAttention input must be [seq_len, d_model]"
+        );
         let seq_len = input.shape()[0];
         assert_eq!(input.shape()[1], self.d_model);
 
@@ -1012,18 +1046,15 @@ impl<S: Scalar> Module<S> for MultiHeadAttention<S> {
             let offset = h * self.head_dim;
 
             // Extract Q_h, K_h: [seq_len, head_dim]
-            let q_h = Tensor::from_fn(
-                Shape::from_slice(&[seq_len, self.head_dim]),
-                |idx| q_full.get(&[idx[0], offset + idx[1]]),
-            );
-            let k_h = Tensor::from_fn(
-                Shape::from_slice(&[seq_len, self.head_dim]),
-                |idx| k_full.get(&[idx[0], offset + idx[1]]),
-            );
-            let v_h = Tensor::from_fn(
-                Shape::from_slice(&[seq_len, self.head_dim]),
-                |idx| v_full.get(&[idx[0], offset + idx[1]]),
-            );
+            let q_h = Tensor::from_fn(Shape::from_slice(&[seq_len, self.head_dim]), |idx| {
+                q_full.get(&[idx[0], offset + idx[1]])
+            });
+            let k_h = Tensor::from_fn(Shape::from_slice(&[seq_len, self.head_dim]), |idx| {
+                k_full.get(&[idx[0], offset + idx[1]])
+            });
+            let v_h = Tensor::from_fn(Shape::from_slice(&[seq_len, self.head_dim]), |idx| {
+                v_full.get(&[idx[0], offset + idx[1]])
+            });
 
             // scores = Q_h @ K_h^T / sqrt(head_dim) -> [seq_len, seq_len]
             let scores = q_h.matmul(&k_h.transpose()).scale(scale);
@@ -1034,8 +1065,7 @@ impl<S: Scalar> Module<S> for MultiHeadAttention<S> {
             // Store attention weights for backward
             for i in 0..seq_len {
                 for j in 0..seq_len {
-                    attn_data[h * seq_len * seq_len + i * seq_len + j] =
-                        attn_weights.get(&[i, j]);
+                    attn_data[h * seq_len * seq_len + i * seq_len + j] = attn_weights.get(&[i, j]);
                 }
             }
 
@@ -1061,10 +1091,22 @@ impl<S: Scalar> Module<S> for MultiHeadAttention<S> {
     }
 
     fn backward(&mut self, grad_output: &Tensor<S>) -> Tensor<S> {
-        let q_full = self.cached_q.as_ref().expect("must call forward before backward");
-        let k_full = self.cached_k.as_ref().expect("must call forward before backward");
-        let v_full = self.cached_v.as_ref().expect("must call forward before backward");
-        let attn = self.cached_attn.as_ref().expect("must call forward before backward");
+        let q_full = self
+            .cached_q
+            .as_ref()
+            .expect("must call forward before backward");
+        let k_full = self
+            .cached_k
+            .as_ref()
+            .expect("must call forward before backward");
+        let v_full = self
+            .cached_v
+            .as_ref()
+            .expect("must call forward before backward");
+        let attn = self
+            .cached_attn
+            .as_ref()
+            .expect("must call forward before backward");
 
         let seq_len = q_full.shape()[0];
         let scale = S::from_f64(1.0 / (self.head_dim as f64).sqrt());
@@ -1081,30 +1123,26 @@ impl<S: Scalar> Module<S> for MultiHeadAttention<S> {
             let offset = h * self.head_dim;
 
             // Extract cached head tensors
-            let v_h = Tensor::from_fn(
-                Shape::from_slice(&[seq_len, self.head_dim]),
-                |idx| v_full.get(&[idx[0], offset + idx[1]]),
-            );
-            let q_h = Tensor::from_fn(
-                Shape::from_slice(&[seq_len, self.head_dim]),
-                |idx| q_full.get(&[idx[0], offset + idx[1]]),
-            );
-            let k_h = Tensor::from_fn(
-                Shape::from_slice(&[seq_len, self.head_dim]),
-                |idx| k_full.get(&[idx[0], offset + idx[1]]),
-            );
+            let v_h = Tensor::from_fn(Shape::from_slice(&[seq_len, self.head_dim]), |idx| {
+                v_full.get(&[idx[0], offset + idx[1]])
+            });
+            let q_h = Tensor::from_fn(Shape::from_slice(&[seq_len, self.head_dim]), |idx| {
+                q_full.get(&[idx[0], offset + idx[1]])
+            });
+            let k_h = Tensor::from_fn(Shape::from_slice(&[seq_len, self.head_dim]), |idx| {
+                k_full.get(&[idx[0], offset + idx[1]])
+            });
 
             // Extract attention weights for this head: [seq_len, seq_len]
-            let attn_h = Tensor::from_fn(
-                Shape::from_slice(&[seq_len, seq_len]),
-                |idx| attn.get(&[h, idx[0], idx[1]]),
-            );
+            let attn_h = Tensor::from_fn(Shape::from_slice(&[seq_len, seq_len]), |idx| {
+                attn.get(&[h, idx[0], idx[1]])
+            });
 
             // grad_concat_h: [seq_len, head_dim]
-            let grad_concat_h = Tensor::from_fn(
-                Shape::from_slice(&[seq_len, self.head_dim]),
-                |idx| grad_concat.get(&[idx[0], offset + idx[1]]),
-            );
+            let grad_concat_h =
+                Tensor::from_fn(Shape::from_slice(&[seq_len, self.head_dim]), |idx| {
+                    grad_concat.get(&[idx[0], offset + idx[1]])
+                });
 
             // Backward through attn_out = attn_h @ V_h
             // grad_attn_h = grad_concat_h @ V_h^T  -> [seq_len, seq_len]
@@ -1115,19 +1153,16 @@ impl<S: Scalar> Module<S> for MultiHeadAttention<S> {
             // Backward through softmax: grad_scores
             // For softmax: dL/ds_i = sum_j (dL/da_j * a_j * (delta_ij - a_i))
             //            = a_i * (dL/da_i - sum_j(dL/da_j * a_j))
-            let grad_scores = Tensor::from_fn(
-                Shape::from_slice(&[seq_len, seq_len]),
-                |idx| {
-                    let (i, j) = (idx[0], idx[1]);
-                    let a_ij = attn_h.get(&[i, j]);
-                    // dot = sum_k (grad_attn_h[i,k] * attn_h[i,k])
-                    let mut dot = S::ZERO;
-                    for k in 0..seq_len {
-                        dot += grad_attn_h.get(&[i, k]) * attn_h.get(&[i, k]);
-                    }
-                    a_ij * (grad_attn_h.get(&[i, j]) - dot)
-                },
-            );
+            let grad_scores = Tensor::from_fn(Shape::from_slice(&[seq_len, seq_len]), |idx| {
+                let (i, j) = (idx[0], idx[1]);
+                let a_ij = attn_h.get(&[i, j]);
+                // dot = sum_k (grad_attn_h[i,k] * attn_h[i,k])
+                let mut dot = S::ZERO;
+                for k in 0..seq_len {
+                    dot += grad_attn_h.get(&[i, k]) * attn_h.get(&[i, k]);
+                }
+                a_ij * (grad_attn_h.get(&[i, j]) - dot)
+            });
 
             // Backward through scores = Q_h @ K_h^T * scale
             let grad_scores_scaled = grad_scores.scale(scale);
@@ -1418,7 +1453,11 @@ impl<S: Scalar> Module<S> for MaxPool2d<S> {
                             for kj in 0..self.kernel_size {
                                 let ih = (oh * self.stride) as isize - pad + ki as isize;
                                 let iw = (ow * self.stride) as isize - pad + kj as isize;
-                                if ih >= 0 && (ih as usize) < height && iw >= 0 && (iw as usize) < width {
+                                if ih >= 0
+                                    && (ih as usize) < height
+                                    && iw >= 0
+                                    && (iw as usize) < width
+                                {
                                     let v = input.get(&[b, c, ih as usize, iw as usize]);
                                     if v > max_val {
                                         max_val = v;
@@ -1436,11 +1475,17 @@ impl<S: Scalar> Module<S> for MaxPool2d<S> {
         }
 
         self.cached_max_indices = Some(indices);
-        Tensor::new(out_data, Shape::from_slice(&[batch, channels, out_h, out_w]))
+        Tensor::new(
+            out_data,
+            Shape::from_slice(&[batch, channels, out_h, out_w]),
+        )
     }
 
     fn backward(&mut self, grad_output: &Tensor<S>) -> Tensor<S> {
-        let indices = self.cached_max_indices.as_ref().expect("must call forward before backward");
+        let indices = self
+            .cached_max_indices
+            .as_ref()
+            .expect("must call forward before backward");
         let batch = grad_output.shape()[0];
         let channels = grad_output.shape()[1];
         let out_h = grad_output.shape()[2];
@@ -1459,19 +1504,28 @@ impl<S: Scalar> Module<S> for MaxPool2d<S> {
                 for oh in 0..out_h {
                     for ow in 0..out_w {
                         let (ih, iw) = indices[idx];
-                        grad_input[b * channels * height * width + c * height * width + ih * width + iw]
-                            += grad_output.get(&[b, c, oh, ow]);
+                        grad_input[b * channels * height * width
+                            + c * height * width
+                            + ih * width
+                            + iw] += grad_output.get(&[b, c, oh, ow]);
                         idx += 1;
                     }
                 }
             }
         }
 
-        Tensor::new(grad_input, Shape::from_slice(&[batch, channels, height, width]))
+        Tensor::new(
+            grad_input,
+            Shape::from_slice(&[batch, channels, height, width]),
+        )
     }
 
-    fn parameters(&self) -> Vec<&Parameter<S>> { Vec::new() }
-    fn parameters_mut(&mut self) -> Vec<&mut Parameter<S>> { Vec::new() }
+    fn parameters(&self) -> Vec<&Parameter<S>> {
+        Vec::new()
+    }
+    fn parameters_mut(&mut self) -> Vec<&mut Parameter<S>> {
+        Vec::new()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1520,23 +1574,20 @@ impl<S: Scalar> Module<S> for AvgPool2d<S> {
         let pad = self.padding as isize;
         let k2 = S::from_f64((self.kernel_size * self.kernel_size) as f64);
 
-        Tensor::from_fn(
-            Shape::from_slice(&[batch, channels, out_h, out_w]),
-            |idx| {
-                let (b, c, oh, ow) = (idx[0], idx[1], idx[2], idx[3]);
-                let mut sum = S::ZERO;
-                for ki in 0..self.kernel_size {
-                    for kj in 0..self.kernel_size {
-                        let ih = (oh * self.stride) as isize - pad + ki as isize;
-                        let iw = (ow * self.stride) as isize - pad + kj as isize;
-                        if ih >= 0 && (ih as usize) < height && iw >= 0 && (iw as usize) < width {
-                            sum += input.get(&[b, c, ih as usize, iw as usize]);
-                        }
+        Tensor::from_fn(Shape::from_slice(&[batch, channels, out_h, out_w]), |idx| {
+            let (b, c, oh, ow) = (idx[0], idx[1], idx[2], idx[3]);
+            let mut sum = S::ZERO;
+            for ki in 0..self.kernel_size {
+                for kj in 0..self.kernel_size {
+                    let ih = (oh * self.stride) as isize - pad + ki as isize;
+                    let iw = (ow * self.stride) as isize - pad + kj as isize;
+                    if ih >= 0 && (ih as usize) < height && iw >= 0 && (iw as usize) < width {
+                        sum += input.get(&[b, c, ih as usize, iw as usize]);
                     }
                 }
-                sum / k2
-            },
-        )
+            }
+            sum / k2
+        })
     }
 
     fn backward(&mut self, grad_output: &Tensor<S>) -> Tensor<S> {
@@ -1575,8 +1626,12 @@ impl<S: Scalar> Module<S> for AvgPool2d<S> {
         )
     }
 
-    fn parameters(&self) -> Vec<&Parameter<S>> { Vec::new() }
-    fn parameters_mut(&mut self) -> Vec<&mut Parameter<S>> { Vec::new() }
+    fn parameters(&self) -> Vec<&Parameter<S>> {
+        Vec::new()
+    }
+    fn parameters_mut(&mut self) -> Vec<&mut Parameter<S>> {
+        Vec::new()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1624,59 +1679,58 @@ impl<S: Scalar> Module<S> for AdaptiveAvgPool2d<S> {
 
         self.cached_input_shape = Some((batch, channels, in_h, in_w));
 
-        Tensor::from_fn(
-            Shape::from_slice(&[batch, channels, out_h, out_w]),
-            |idx| {
-                let (b, c, oh, ow) = (idx[0], idx[1], idx[2], idx[3]);
-                let h_start = Self::start_index(oh, out_h, in_h);
-                let h_end = Self::end_index(oh, out_h, in_h);
-                let w_start = Self::start_index(ow, out_w, in_w);
-                let w_end = Self::end_index(ow, out_w, in_w);
-                let count = (h_end - h_start) * (w_end - w_start);
-                let mut sum = S::ZERO;
-                for ih in h_start..h_end {
-                    for iw in w_start..w_end {
-                        sum += input.get(&[b, c, ih, iw]);
-                    }
+        Tensor::from_fn(Shape::from_slice(&[batch, channels, out_h, out_w]), |idx| {
+            let (b, c, oh, ow) = (idx[0], idx[1], idx[2], idx[3]);
+            let h_start = Self::start_index(oh, out_h, in_h);
+            let h_end = Self::end_index(oh, out_h, in_h);
+            let w_start = Self::start_index(ow, out_w, in_w);
+            let w_end = Self::end_index(ow, out_w, in_w);
+            let count = (h_end - h_start) * (w_end - w_start);
+            let mut sum = S::ZERO;
+            for ih in h_start..h_end {
+                for iw in w_start..w_end {
+                    sum += input.get(&[b, c, ih, iw]);
                 }
-                sum / S::from_f64(count as f64)
-            },
-        )
+            }
+            sum / S::from_f64(count as f64)
+        })
     }
 
     fn backward(&mut self, grad_output: &Tensor<S>) -> Tensor<S> {
-        let (batch, channels, in_h, in_w) =
-            self.cached_input_shape.expect("must call forward before backward");
+        let (batch, channels, in_h, in_w) = self
+            .cached_input_shape
+            .expect("must call forward before backward");
         let (out_h, out_w) = self.output_size;
 
-        Tensor::from_fn(
-            Shape::from_slice(&[batch, channels, in_h, in_w]),
-            |idx| {
-                let (b, c, i, j) = (idx[0], idx[1], idx[2], idx[3]);
-                let mut sum = S::ZERO;
-                for oh in 0..out_h {
-                    let h_start = Self::start_index(oh, out_h, in_h);
-                    let h_end = Self::end_index(oh, out_h, in_h);
-                    if i < h_start || i >= h_end {
+        Tensor::from_fn(Shape::from_slice(&[batch, channels, in_h, in_w]), |idx| {
+            let (b, c, i, j) = (idx[0], idx[1], idx[2], idx[3]);
+            let mut sum = S::ZERO;
+            for oh in 0..out_h {
+                let h_start = Self::start_index(oh, out_h, in_h);
+                let h_end = Self::end_index(oh, out_h, in_h);
+                if i < h_start || i >= h_end {
+                    continue;
+                }
+                for ow in 0..out_w {
+                    let w_start = Self::start_index(ow, out_w, in_w);
+                    let w_end = Self::end_index(ow, out_w, in_w);
+                    if j < w_start || j >= w_end {
                         continue;
                     }
-                    for ow in 0..out_w {
-                        let w_start = Self::start_index(ow, out_w, in_w);
-                        let w_end = Self::end_index(ow, out_w, in_w);
-                        if j < w_start || j >= w_end {
-                            continue;
-                        }
-                        let count = (h_end - h_start) * (w_end - w_start);
-                        sum += grad_output.get(&[b, c, oh, ow]) / S::from_f64(count as f64);
-                    }
+                    let count = (h_end - h_start) * (w_end - w_start);
+                    sum += grad_output.get(&[b, c, oh, ow]) / S::from_f64(count as f64);
                 }
-                sum
-            },
-        )
+            }
+            sum
+        })
     }
 
-    fn parameters(&self) -> Vec<&Parameter<S>> { Vec::new() }
-    fn parameters_mut(&mut self) -> Vec<&mut Parameter<S>> { Vec::new() }
+    fn parameters(&self) -> Vec<&Parameter<S>> {
+        Vec::new()
+    }
+    fn parameters_mut(&mut self) -> Vec<&mut Parameter<S>> {
+        Vec::new()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1690,17 +1744,17 @@ impl<S: Scalar> Module<S> for AdaptiveAvgPool2d<S> {
 /// During training: normalizes using batch statistics, updates running stats.
 /// During eval: normalizes using running statistics.
 pub struct BatchNorm2d<S: Scalar> {
-    pub gamma: Parameter<S>,  // [channels]
-    pub beta: Parameter<S>,   // [channels]
-    running_mean: Tensor<S>,  // [channels]
-    running_var: Tensor<S>,   // [channels]
+    pub gamma: Parameter<S>, // [channels]
+    pub beta: Parameter<S>,  // [channels]
+    running_mean: Tensor<S>, // [channels]
+    running_var: Tensor<S>,  // [channels]
     momentum: f64,
     eps: f64,
     num_channels: usize,
     training: bool,
     cached_input: Option<Tensor<S>>,
-    cached_mean: Option<Tensor<S>>,   // [channels]
-    cached_var: Option<Tensor<S>>,    // [channels]
+    cached_mean: Option<Tensor<S>>, // [channels]
+    cached_var: Option<Tensor<S>>,  // [channels]
 }
 
 impl<S: Scalar> BatchNorm2d<S> {
@@ -1723,7 +1777,11 @@ impl<S: Scalar> BatchNorm2d<S> {
 
 impl<S: Scalar> Module<S> for BatchNorm2d<S> {
     fn forward(&mut self, input: &Tensor<S>) -> Tensor<S> {
-        assert_eq!(input.ndim(), 4, "BatchNorm2d input must be [batch, channels, H, W]");
+        assert_eq!(
+            input.ndim(),
+            4,
+            "BatchNorm2d input must be [batch, channels, H, W]"
+        );
         let batch = input.shape()[0];
         let channels = input.shape()[1];
         assert_eq!(channels, self.num_channels);
@@ -1797,9 +1855,18 @@ impl<S: Scalar> Module<S> for BatchNorm2d<S> {
     }
 
     fn backward(&mut self, grad_output: &Tensor<S>) -> Tensor<S> {
-        let input = self.cached_input.as_ref().expect("must call forward before backward");
-        let mean = self.cached_mean.as_ref().expect("must call forward before backward");
-        let var = self.cached_var.as_ref().expect("must call forward before backward");
+        let input = self
+            .cached_input
+            .as_ref()
+            .expect("must call forward before backward");
+        let mean = self
+            .cached_mean
+            .as_ref()
+            .expect("must call forward before backward");
+        let var = self
+            .cached_var
+            .as_ref()
+            .expect("must call forward before backward");
 
         let batch = input.shape()[0];
         let channels = input.shape()[1];
@@ -1826,8 +1893,10 @@ impl<S: Scalar> Module<S> for BatchNorm2d<S> {
             }
         }
 
-        self.gamma.accumulate_grad(&Tensor::new(grad_gamma, Shape::from_slice(&[channels])));
-        self.beta.accumulate_grad(&Tensor::new(grad_beta, Shape::from_slice(&[channels])));
+        self.gamma
+            .accumulate_grad(&Tensor::new(grad_gamma, Shape::from_slice(&[channels])));
+        self.beta
+            .accumulate_grad(&Tensor::new(grad_beta, Shape::from_slice(&[channels])));
 
         // Gradient w.r.t. input
         Tensor::from_fn(input.shape().clone(), |idx| {
@@ -2182,24 +2251,18 @@ impl<S: Scalar> RotaryEmbedding<S> {
         let half = dim / 2;
 
         // Precompute cos/sin tables: theta_i = 1 / base^(2i/dim)
-        let cos_cache = Tensor::from_fn(
-            Shape::from_slice(&[max_seq_len, half]),
-            |idx| {
-                let pos = idx[0] as f64;
-                let i = idx[1] as f64;
-                let theta = pos / base.powf(2.0 * i / dim as f64);
-                S::from_f64(theta.cos())
-            },
-        );
-        let sin_cache = Tensor::from_fn(
-            Shape::from_slice(&[max_seq_len, half]),
-            |idx| {
-                let pos = idx[0] as f64;
-                let i = idx[1] as f64;
-                let theta = pos / base.powf(2.0 * i / dim as f64);
-                S::from_f64(theta.sin())
-            },
-        );
+        let cos_cache = Tensor::from_fn(Shape::from_slice(&[max_seq_len, half]), |idx| {
+            let pos = idx[0] as f64;
+            let i = idx[1] as f64;
+            let theta = pos / base.powf(2.0 * i / dim as f64);
+            S::from_f64(theta.cos())
+        });
+        let sin_cache = Tensor::from_fn(Shape::from_slice(&[max_seq_len, half]), |idx| {
+            let pos = idx[0] as f64;
+            let i = idx[1] as f64;
+            let theta = pos / base.powf(2.0 * i / dim as f64);
+            S::from_f64(theta.sin())
+        });
 
         Self {
             dim,
@@ -2297,12 +2360,7 @@ pub struct GroupedQueryAttention<S: Scalar> {
 }
 
 impl<S: Scalar> GroupedQueryAttention<S> {
-    pub fn new(
-        d_model: usize,
-        num_heads: usize,
-        num_kv_heads: usize,
-        seed: u64,
-    ) -> Self {
+    pub fn new(d_model: usize, num_heads: usize, num_kv_heads: usize, seed: u64) -> Self {
         assert!(
             num_heads % num_kv_heads == 0,
             "num_heads must be divisible by num_kv_heads"
@@ -2372,9 +2430,9 @@ impl<S: Scalar> Module<S> for GroupedQueryAttention<S> {
 
         self.cached_input = Some(input.clone());
 
-        let q_full = self.wq.forward(input);  // [seq_len, d_model]
-        let k_full = self.wk.forward(input);  // [seq_len, kv_dim]
-        let v_full = self.wv.forward(input);  // [seq_len, kv_dim]
+        let q_full = self.wq.forward(input); // [seq_len, d_model]
+        let k_full = self.wk.forward(input); // [seq_len, kv_dim]
+        let v_full = self.wv.forward(input); // [seq_len, kv_dim]
 
         self.cached_q = Some(q_full.clone());
         self.cached_k = Some(k_full.clone());
@@ -2391,18 +2449,15 @@ impl<S: Scalar> Module<S> for GroupedQueryAttention<S> {
             let kv_group = h / heads_per_kv;
             let kv_offset = kv_group * self.head_dim;
 
-            let q_h = Tensor::from_fn(
-                Shape::from_slice(&[seq_len, self.head_dim]),
-                |idx| q_full.get(&[idx[0], q_offset + idx[1]]),
-            );
-            let k_h = Tensor::from_fn(
-                Shape::from_slice(&[seq_len, self.head_dim]),
-                |idx| k_full.get(&[idx[0], kv_offset + idx[1]]),
-            );
-            let v_h = Tensor::from_fn(
-                Shape::from_slice(&[seq_len, self.head_dim]),
-                |idx| v_full.get(&[idx[0], kv_offset + idx[1]]),
-            );
+            let q_h = Tensor::from_fn(Shape::from_slice(&[seq_len, self.head_dim]), |idx| {
+                q_full.get(&[idx[0], q_offset + idx[1]])
+            });
+            let k_h = Tensor::from_fn(Shape::from_slice(&[seq_len, self.head_dim]), |idx| {
+                k_full.get(&[idx[0], kv_offset + idx[1]])
+            });
+            let v_h = Tensor::from_fn(Shape::from_slice(&[seq_len, self.head_dim]), |idx| {
+                v_full.get(&[idx[0], kv_offset + idx[1]])
+            });
 
             let mut scores = q_h.matmul(&k_h.transpose()).scale(scale);
 
@@ -2421,8 +2476,7 @@ impl<S: Scalar> Module<S> for GroupedQueryAttention<S> {
 
             for i in 0..seq_len {
                 for j in 0..seq_len {
-                    attn_data[h * seq_len * seq_len + i * seq_len + j] =
-                        attn_weights.get(&[i, j]);
+                    attn_data[h * seq_len * seq_len + i * seq_len + j] = attn_weights.get(&[i, j]);
                 }
             }
 
@@ -2444,10 +2498,22 @@ impl<S: Scalar> Module<S> for GroupedQueryAttention<S> {
     }
 
     fn backward(&mut self, grad_output: &Tensor<S>) -> Tensor<S> {
-        let q_full = self.cached_q.as_ref().expect("must call forward before backward");
-        let k_full = self.cached_k.as_ref().expect("must call forward before backward");
-        let v_full = self.cached_v.as_ref().expect("must call forward before backward");
-        let attn = self.cached_attn.as_ref().expect("must call forward before backward");
+        let q_full = self
+            .cached_q
+            .as_ref()
+            .expect("must call forward before backward");
+        let k_full = self
+            .cached_k
+            .as_ref()
+            .expect("must call forward before backward");
+        let v_full = self
+            .cached_v
+            .as_ref()
+            .expect("must call forward before backward");
+        let attn = self
+            .cached_attn
+            .as_ref()
+            .expect("must call forward before backward");
 
         let seq_len = q_full.shape()[0];
         let kv_dim = self.num_kv_heads * self.head_dim;
@@ -2465,44 +2531,37 @@ impl<S: Scalar> Module<S> for GroupedQueryAttention<S> {
             let kv_group = h / heads_per_kv;
             let kv_offset = kv_group * self.head_dim;
 
-            let v_h = Tensor::from_fn(
-                Shape::from_slice(&[seq_len, self.head_dim]),
-                |idx| v_full.get(&[idx[0], kv_offset + idx[1]]),
-            );
-            let q_h = Tensor::from_fn(
-                Shape::from_slice(&[seq_len, self.head_dim]),
-                |idx| q_full.get(&[idx[0], q_offset + idx[1]]),
-            );
-            let k_h = Tensor::from_fn(
-                Shape::from_slice(&[seq_len, self.head_dim]),
-                |idx| k_full.get(&[idx[0], kv_offset + idx[1]]),
-            );
+            let v_h = Tensor::from_fn(Shape::from_slice(&[seq_len, self.head_dim]), |idx| {
+                v_full.get(&[idx[0], kv_offset + idx[1]])
+            });
+            let q_h = Tensor::from_fn(Shape::from_slice(&[seq_len, self.head_dim]), |idx| {
+                q_full.get(&[idx[0], q_offset + idx[1]])
+            });
+            let k_h = Tensor::from_fn(Shape::from_slice(&[seq_len, self.head_dim]), |idx| {
+                k_full.get(&[idx[0], kv_offset + idx[1]])
+            });
 
-            let attn_h = Tensor::from_fn(
-                Shape::from_slice(&[seq_len, seq_len]),
-                |idx| attn.get(&[h, idx[0], idx[1]]),
-            );
+            let attn_h = Tensor::from_fn(Shape::from_slice(&[seq_len, seq_len]), |idx| {
+                attn.get(&[h, idx[0], idx[1]])
+            });
 
-            let grad_concat_h = Tensor::from_fn(
-                Shape::from_slice(&[seq_len, self.head_dim]),
-                |idx| grad_concat.get(&[idx[0], q_offset + idx[1]]),
-            );
+            let grad_concat_h =
+                Tensor::from_fn(Shape::from_slice(&[seq_len, self.head_dim]), |idx| {
+                    grad_concat.get(&[idx[0], q_offset + idx[1]])
+                });
 
             let grad_attn_h = grad_concat_h.matmul(&v_h.transpose());
             let grad_v_h = attn_h.transpose().matmul(&grad_concat_h);
 
-            let grad_scores = Tensor::from_fn(
-                Shape::from_slice(&[seq_len, seq_len]),
-                |idx| {
-                    let (i, j) = (idx[0], idx[1]);
-                    let a_ij = attn_h.get(&[i, j]);
-                    let mut dot = S::ZERO;
-                    for k in 0..seq_len {
-                        dot += grad_attn_h.get(&[i, k]) * attn_h.get(&[i, k]);
-                    }
-                    a_ij * (grad_attn_h.get(&[i, j]) - dot)
-                },
-            );
+            let grad_scores = Tensor::from_fn(Shape::from_slice(&[seq_len, seq_len]), |idx| {
+                let (i, j) = (idx[0], idx[1]);
+                let a_ij = attn_h.get(&[i, j]);
+                let mut dot = S::ZERO;
+                for k in 0..seq_len {
+                    dot += grad_attn_h.get(&[i, k]) * attn_h.get(&[i, k]);
+                }
+                a_ij * (grad_attn_h.get(&[i, j]) - dot)
+            });
 
             let grad_scores_scaled = grad_scores.scale(scale);
             let grad_q_h = grad_scores_scaled.matmul(&k_h);
@@ -2713,7 +2772,11 @@ impl<S: Scalar> ConvTranspose2d<S> {
 
 impl<S: Scalar> Module<S> for ConvTranspose2d<S> {
     fn forward(&mut self, input: &Tensor<S>) -> Tensor<S> {
-        assert_eq!(input.ndim(), 4, "ConvTranspose2d input must be [batch, in_channels, H, W]");
+        assert_eq!(
+            input.ndim(),
+            4,
+            "ConvTranspose2d input must be [batch, in_channels, H, W]"
+        );
         let batch = input.shape()[0];
         assert_eq!(input.shape()[1], self.in_channels);
         let h_in = input.shape()[2];
@@ -2761,7 +2824,10 @@ impl<S: Scalar> Module<S> for ConvTranspose2d<S> {
     }
 
     fn backward(&mut self, grad_output: &Tensor<S>) -> Tensor<S> {
-        let input = self.cached_input.as_ref().expect("must call forward before backward");
+        let input = self
+            .cached_input
+            .as_ref()
+            .expect("must call forward before backward");
         let batch = input.shape()[0];
         let h_in = input.shape()[2];
         let w_in = input.shape()[3];
@@ -2788,8 +2854,8 @@ impl<S: Scalar> Module<S> for ConvTranspose2d<S> {
                             let ih = ih_num as usize / stride;
                             let iw = iw_num as usize / stride;
                             if ih < h_in && iw < w_in {
-                                sum += grad_output.get(&[b, oc, oh, ow])
-                                    * input.get(&[b, ic, ih, iw]);
+                                sum +=
+                                    grad_output.get(&[b, oc, oh, ow]) * input.get(&[b, ic, ih, iw]);
                             }
                         }
                     }
@@ -2898,7 +2964,11 @@ impl Upsample {
 
 impl<S: Scalar> Module<S> for Upsample {
     fn forward(&mut self, input: &Tensor<S>) -> Tensor<S> {
-        assert_eq!(input.ndim(), 4, "Upsample input must be [batch, channels, H, W]");
+        assert_eq!(
+            input.ndim(),
+            4,
+            "Upsample input must be [batch, channels, H, W]"
+        );
         let batch = input.shape()[0];
         let channels = input.shape()[1];
         let h = input.shape()[2];
@@ -2934,8 +3004,7 @@ impl<S: Scalar> Module<S> for Upsample {
                     let v01 = input.get(&[b, c, h0, w1]);
                     let v10 = input.get(&[b, c, h1, w0]);
                     let v11 = input.get(&[b, c, h1, w1]);
-                    (one - fh) * ((one - fw) * v00 + fw * v01)
-                        + fh * ((one - fw) * v10 + fw * v11)
+                    (one - fh) * ((one - fw) * v00 + fw * v01) + fh * ((one - fw) * v10 + fw * v11)
                 })
             }
         }
@@ -2985,7 +3054,8 @@ impl<S: Scalar> Module<S> for Upsample {
                                 let fw = src_w - w0 as f64;
                                 let g = grad_output.get(&[b, c, oh, ow]);
                                 let base = (b * channels + c) * h * w;
-                                grad_data[base + h0 * w + w0] += g * S::from_f64((1.0 - fh) * (1.0 - fw));
+                                grad_data[base + h0 * w + w0] +=
+                                    g * S::from_f64((1.0 - fh) * (1.0 - fw));
                                 grad_data[base + h0 * w + w1] += g * S::from_f64((1.0 - fh) * fw);
                                 grad_data[base + h1 * w + w0] += g * S::from_f64(fh * (1.0 - fw));
                                 grad_data[base + h1 * w + w1] += g * S::from_f64(fh * fw);
@@ -3023,8 +3093,8 @@ impl<S: Scalar> Module<S> for Upsample {
 /// Each group of `channels / num_groups` channels is normalized independently.
 /// More stable than BatchNorm for small batch sizes.
 pub struct GroupNorm<S: Scalar> {
-    pub gamma: Parameter<S>,  // [channels]
-    pub beta: Parameter<S>,   // [channels]
+    pub gamma: Parameter<S>, // [channels]
+    pub beta: Parameter<S>,  // [channels]
     num_groups: usize,
     num_channels: usize,
     eps: f64,
@@ -3054,7 +3124,10 @@ impl<S: Scalar> GroupNorm<S> {
 
 impl<S: Scalar> Module<S> for GroupNorm<S> {
     fn forward(&mut self, input: &Tensor<S>) -> Tensor<S> {
-        assert!(input.ndim() >= 2, "GroupNorm input must have at least 2 dims");
+        assert!(
+            input.ndim() >= 2,
+            "GroupNorm input must have at least 2 dims"
+        );
         let batch = input.shape()[0];
         let channels = input.shape()[1];
         assert_eq!(channels, self.num_channels);
@@ -3112,7 +3185,8 @@ impl<S: Scalar> Module<S> for GroupNorm<S> {
                     let gamma = self.gamma.data.get(&[c]);
                     let beta = self.beta.data.get(&[c]);
                     for s in 0..spatial {
-                        out_data[base + s] = gamma * (in_data[base + s] - means[gi]) * inv_std + beta;
+                        out_data[base + s] =
+                            gamma * (in_data[base + s] - means[gi]) * inv_std + beta;
                     }
                 }
             }
@@ -3155,8 +3229,10 @@ impl<S: Scalar> Module<S> for GroupNorm<S> {
                 }
             }
         }
-        self.gamma.accumulate_grad(&Tensor::new(grad_gamma, Shape::from_slice(&[channels])));
-        self.beta.accumulate_grad(&Tensor::new(grad_beta, Shape::from_slice(&[channels])));
+        self.gamma
+            .accumulate_grad(&Tensor::new(grad_gamma, Shape::from_slice(&[channels])));
+        self.beta
+            .accumulate_grad(&Tensor::new(grad_beta, Shape::from_slice(&[channels])));
 
         // grad_input
         let mut grad_in = alloc::vec![S::ZERO; in_data.len()];
@@ -3278,7 +3354,7 @@ pub struct LSTM<S: Scalar> {
     hidden_size: usize,
     // Cached states for backward
     cached_input: Option<Tensor<S>>,
-    cached_gates: Option<Vec<[Tensor<S>; 4]>>,  // [i, f, g, o] per timestep
+    cached_gates: Option<Vec<[Tensor<S>; 4]>>, // [i, f, g, o] per timestep
     cached_cells: Option<Vec<Tensor<S>>>,
     cached_hiddens: Option<Vec<Tensor<S>>>,
 }
@@ -3288,7 +3364,10 @@ impl<S: Scalar> LSTM<S> {
         let hs4 = 4 * hidden_size;
         Self {
             weight_ih: Parameter::randn(Shape::from_slice(&[hs4, input_size]), seed),
-            weight_hh: Parameter::randn(Shape::from_slice(&[hs4, hidden_size]), seed.wrapping_add(1)),
+            weight_hh: Parameter::randn(
+                Shape::from_slice(&[hs4, hidden_size]),
+                seed.wrapping_add(1),
+            ),
             bias_ih: Parameter::new(Tensor::zeros(Shape::from_slice(&[hs4]))),
             bias_hh: Parameter::new(Tensor::zeros(Shape::from_slice(&[hs4]))),
             input_size,
@@ -3487,21 +3566,34 @@ impl<S: Scalar> Module<S> for LSTM<S> {
             grad_wih,
             Shape::from_slice(&[4 * hs, self.input_size]),
         ));
-        self.weight_hh.accumulate_grad(&Tensor::new(
-            grad_whh,
-            Shape::from_slice(&[4 * hs, hs]),
-        ));
-        self.bias_ih.accumulate_grad(&Tensor::new(grad_bih, Shape::from_slice(&[4 * hs])));
-        self.bias_hh.accumulate_grad(&Tensor::new(grad_bhh, Shape::from_slice(&[4 * hs])));
+        self.weight_hh
+            .accumulate_grad(&Tensor::new(grad_whh, Shape::from_slice(&[4 * hs, hs])));
+        self.bias_ih
+            .accumulate_grad(&Tensor::new(grad_bih, Shape::from_slice(&[4 * hs])));
+        self.bias_hh
+            .accumulate_grad(&Tensor::new(grad_bhh, Shape::from_slice(&[4 * hs])));
 
-        Tensor::new(grad_input_data, Shape::from_slice(&[seq_len, self.input_size]))
+        Tensor::new(
+            grad_input_data,
+            Shape::from_slice(&[seq_len, self.input_size]),
+        )
     }
 
     fn parameters(&self) -> Vec<&Parameter<S>> {
-        alloc::vec![&self.weight_ih, &self.weight_hh, &self.bias_ih, &self.bias_hh]
+        alloc::vec![
+            &self.weight_ih,
+            &self.weight_hh,
+            &self.bias_ih,
+            &self.bias_hh
+        ]
     }
     fn parameters_mut(&mut self) -> Vec<&mut Parameter<S>> {
-        alloc::vec![&mut self.weight_ih, &mut self.weight_hh, &mut self.bias_ih, &mut self.bias_hh]
+        alloc::vec![
+            &mut self.weight_ih,
+            &mut self.weight_hh,
+            &mut self.bias_ih,
+            &mut self.bias_hh
+        ]
     }
     fn named_parameters(&self) -> Vec<(String, &Parameter<S>)> {
         alloc::vec![
@@ -3542,7 +3634,7 @@ pub struct GRU<S: Scalar> {
     input_size: usize,
     hidden_size: usize,
     cached_input: Option<Tensor<S>>,
-    cached_gates: Option<Vec<[Tensor<S>; 3]>>,  // [r, z, n] per timestep
+    cached_gates: Option<Vec<[Tensor<S>; 3]>>, // [r, z, n] per timestep
     cached_hiddens: Option<Vec<Tensor<S>>>,
 }
 
@@ -3551,7 +3643,10 @@ impl<S: Scalar> GRU<S> {
         let hs3 = 3 * hidden_size;
         Self {
             weight_ih: Parameter::randn(Shape::from_slice(&[hs3, input_size]), seed),
-            weight_hh: Parameter::randn(Shape::from_slice(&[hs3, hidden_size]), seed.wrapping_add(1)),
+            weight_hh: Parameter::randn(
+                Shape::from_slice(&[hs3, hidden_size]),
+                seed.wrapping_add(1),
+            ),
             bias_ih: Parameter::new(Tensor::zeros(Shape::from_slice(&[hs3]))),
             bias_hh: Parameter::new(Tensor::zeros(Shape::from_slice(&[hs3]))),
             input_size,
@@ -3755,21 +3850,34 @@ impl<S: Scalar> Module<S> for GRU<S> {
             grad_wih,
             Shape::from_slice(&[3 * hs, self.input_size]),
         ));
-        self.weight_hh.accumulate_grad(&Tensor::new(
-            grad_whh,
-            Shape::from_slice(&[3 * hs, hs]),
-        ));
-        self.bias_ih.accumulate_grad(&Tensor::new(grad_bih, Shape::from_slice(&[3 * hs])));
-        self.bias_hh.accumulate_grad(&Tensor::new(grad_bhh, Shape::from_slice(&[3 * hs])));
+        self.weight_hh
+            .accumulate_grad(&Tensor::new(grad_whh, Shape::from_slice(&[3 * hs, hs])));
+        self.bias_ih
+            .accumulate_grad(&Tensor::new(grad_bih, Shape::from_slice(&[3 * hs])));
+        self.bias_hh
+            .accumulate_grad(&Tensor::new(grad_bhh, Shape::from_slice(&[3 * hs])));
 
-        Tensor::new(grad_input_data, Shape::from_slice(&[seq_len, self.input_size]))
+        Tensor::new(
+            grad_input_data,
+            Shape::from_slice(&[seq_len, self.input_size]),
+        )
     }
 
     fn parameters(&self) -> Vec<&Parameter<S>> {
-        alloc::vec![&self.weight_ih, &self.weight_hh, &self.bias_ih, &self.bias_hh]
+        alloc::vec![
+            &self.weight_ih,
+            &self.weight_hh,
+            &self.bias_ih,
+            &self.bias_hh
+        ]
     }
     fn parameters_mut(&mut self) -> Vec<&mut Parameter<S>> {
-        alloc::vec![&mut self.weight_ih, &mut self.weight_hh, &mut self.bias_ih, &mut self.bias_hh]
+        alloc::vec![
+            &mut self.weight_ih,
+            &mut self.weight_hh,
+            &mut self.bias_ih,
+            &mut self.bias_hh
+        ]
     }
     fn named_parameters(&self) -> Vec<(String, &Parameter<S>)> {
         alloc::vec![
@@ -3846,7 +3954,11 @@ impl<S: Scalar> Module<S> for SlidingWindowAttention<S> {
 
             for qi in 0..seq_len {
                 // Window: attend to positions max(0, qi - window_size + 1)..=qi
-                let start = if qi + 1 >= self.window_size { qi + 1 - self.window_size } else { 0 };
+                let start = if qi + 1 >= self.window_size {
+                    qi + 1 - self.window_size
+                } else {
+                    0
+                };
                 let end = qi + 1;
 
                 // Compute scores within window
@@ -3863,7 +3975,9 @@ impl<S: Scalar> Module<S> for SlidingWindowAttention<S> {
                 // Softmax over window
                 let mut max_s = scores[0];
                 for &s in &scores[1..] {
-                    if s > max_s { max_s = s; }
+                    if s > max_s {
+                        max_s = s;
+                    }
                 }
                 let mut exp_sum = S::ZERO;
                 for s in scores.iter_mut() {
@@ -3912,19 +4026,35 @@ impl<S: Scalar> Module<S> for SlidingWindowAttention<S> {
 
     fn named_parameters(&self) -> Vec<(String, &Parameter<S>)> {
         let mut p = Vec::new();
-        for (n, v) in self.wq.named_parameters() { p.push((alloc::format!("wq.{}", n), v)); }
-        for (n, v) in self.wk.named_parameters() { p.push((alloc::format!("wk.{}", n), v)); }
-        for (n, v) in self.wv.named_parameters() { p.push((alloc::format!("wv.{}", n), v)); }
-        for (n, v) in self.wo.named_parameters() { p.push((alloc::format!("wo.{}", n), v)); }
+        for (n, v) in self.wq.named_parameters() {
+            p.push((alloc::format!("wq.{}", n), v));
+        }
+        for (n, v) in self.wk.named_parameters() {
+            p.push((alloc::format!("wk.{}", n), v));
+        }
+        for (n, v) in self.wv.named_parameters() {
+            p.push((alloc::format!("wv.{}", n), v));
+        }
+        for (n, v) in self.wo.named_parameters() {
+            p.push((alloc::format!("wo.{}", n), v));
+        }
         p
     }
 
     fn named_parameters_mut(&mut self) -> Vec<(String, &mut Parameter<S>)> {
         let mut p = Vec::new();
-        for (n, v) in self.wq.named_parameters_mut() { p.push((alloc::format!("wq.{}", n), v)); }
-        for (n, v) in self.wk.named_parameters_mut() { p.push((alloc::format!("wk.{}", n), v)); }
-        for (n, v) in self.wv.named_parameters_mut() { p.push((alloc::format!("wv.{}", n), v)); }
-        for (n, v) in self.wo.named_parameters_mut() { p.push((alloc::format!("wo.{}", n), v)); }
+        for (n, v) in self.wq.named_parameters_mut() {
+            p.push((alloc::format!("wq.{}", n), v));
+        }
+        for (n, v) in self.wk.named_parameters_mut() {
+            p.push((alloc::format!("wk.{}", n), v));
+        }
+        for (n, v) in self.wv.named_parameters_mut() {
+            p.push((alloc::format!("wv.{}", n), v));
+        }
+        for (n, v) in self.wo.named_parameters_mut() {
+            p.push((alloc::format!("wo.{}", n), v));
+        }
         p
     }
 }
@@ -3940,9 +4070,9 @@ impl<S: Scalar> Module<S> for SlidingWindowAttention<S> {
 /// Uses a gated linear unit with SiLU activation. The intermediate dimension
 /// `ff_dim` is typically `(8/3) * d_model` rounded to a multiple of 256.
 pub struct SwiGLU<S: Scalar> {
-    pub gate_proj: Linear<S>,  // [d_model, ff_dim]
-    pub up_proj: Linear<S>,    // [d_model, ff_dim]
-    pub down_proj: Linear<S>,  // [ff_dim, d_model]
+    pub gate_proj: Linear<S>, // [d_model, ff_dim]
+    pub up_proj: Linear<S>,   // [d_model, ff_dim]
+    pub down_proj: Linear<S>, // [ff_dim, d_model]
     cached_gate_silu: Option<Tensor<S>>,
     cached_up: Option<Tensor<S>>,
     cached_input: Option<Tensor<S>>,
@@ -3965,21 +4095,30 @@ impl<S: Scalar> Module<S> for SwiGLU<S> {
     fn forward(&mut self, input: &Tensor<S>) -> Tensor<S> {
         self.cached_input = Some(input.clone());
 
-        let gate = self.gate_proj.forward(input);  // [seq_len, ff_dim]
+        let gate = self.gate_proj.forward(input); // [seq_len, ff_dim]
         let gate_silu = gate.silu();
-        let up = self.up_proj.forward(input);       // [seq_len, ff_dim]
+        let up = self.up_proj.forward(input); // [seq_len, ff_dim]
 
         self.cached_gate_silu = Some(gate_silu.clone());
         self.cached_up = Some(up.clone());
 
-        let hidden = gate_silu.mul(&up);            // elementwise
-        self.down_proj.forward(&hidden)             // [seq_len, d_model]
+        let hidden = gate_silu.mul(&up); // elementwise
+        self.down_proj.forward(&hidden) // [seq_len, d_model]
     }
 
     fn backward(&mut self, grad_output: &Tensor<S>) -> Tensor<S> {
-        let gate_silu = self.cached_gate_silu.as_ref().expect("must call forward before backward");
-        let up = self.cached_up.as_ref().expect("must call forward before backward");
-        let input = self.cached_input.as_ref().expect("must call forward before backward");
+        let gate_silu = self
+            .cached_gate_silu
+            .as_ref()
+            .expect("must call forward before backward");
+        let up = self
+            .cached_up
+            .as_ref()
+            .expect("must call forward before backward");
+        let input = self
+            .cached_input
+            .as_ref()
+            .expect("must call forward before backward");
 
         // grad through down_proj: grad_hidden = down_proj.backward(grad_output)
         let grad_hidden = self.down_proj.backward(grad_output); // [seq_len, ff_dim]
@@ -4061,8 +4200,8 @@ impl<S: Scalar> Module<S> for SwiGLU<S> {
 /// Stores accumulated K and V tensors per layer so that during generation
 /// only the new token's K,V need to be computed and appended.
 pub struct KVCache<S: Scalar> {
-    k_cache: Vec<Tensor<S>>,  // per-layer: [cached_len, kv_dim]
-    v_cache: Vec<Tensor<S>>,  // per-layer: [cached_len, kv_dim]
+    k_cache: Vec<Tensor<S>>, // per-layer: [cached_len, kv_dim]
+    v_cache: Vec<Tensor<S>>, // per-layer: [cached_len, kv_dim]
     num_layers: usize,
     max_seq_len: usize,
     kv_dim: usize,
@@ -4282,7 +4421,7 @@ impl<S: Scalar> Module<S> for LoRA<S> {
         } else {
             let ax = input.matmul(&a_t); // [batch, rank]
             let bax = ax.matmul(&self.lora_b.data.transpose()); // [batch, out]
-            // scale and add
+                                                                // scale and add
             let batch = input.shape()[0];
             let out_features = base_out.shape()[1];
             let mut out_data = alloc::vec![S::ZERO; batch * out_features];
@@ -4324,9 +4463,7 @@ impl<S: Scalar> Module<S> for LoRA<S> {
 
         // grad_B: [out, batch] @ [batch, rank] * scale
         let grad_b = go_t.matmul(&ax); // [out, rank]
-        let grad_b_scaled = Tensor::from_fn(grad_b.shape().clone(), |idx| {
-            grad_b.get(idx) * scale
-        });
+        let grad_b_scaled = Tensor::from_fn(grad_b.shape().clone(), |idx| grad_b.get(idx) * scale);
         self.lora_b.accumulate_grad(&grad_b_scaled);
 
         // grad_A: [rank, out] @ [out, batch] @ [batch, in] * scale = [rank, batch] @ [batch, in]
@@ -4334,17 +4471,13 @@ impl<S: Scalar> Module<S> for LoRA<S> {
         let bt_t = bt.transpose(); // [rank, out]
         let bt_go = bt_t.matmul(&go_t); // [rank, batch]
         let grad_a = bt_go.matmul(&input_2d); // [rank, in]
-        let grad_a_scaled = Tensor::from_fn(grad_a.shape().clone(), |idx| {
-            grad_a.get(idx) * scale
-        });
+        let grad_a_scaled = Tensor::from_fn(grad_a.shape().clone(), |idx| grad_a.get(idx) * scale);
         self.lora_a.accumulate_grad(&grad_a_scaled);
 
         // grad_input from LoRA: grad_output @ B @ A * scale
         let go_b = grad_2d.matmul(&self.lora_b.data.clone()); // [batch, rank]
         let go_b_a = go_b.matmul(&self.lora_a.data.clone()); // [batch, in]
-        let gi_lora = Tensor::from_fn(go_b_a.shape().clone(), |idx| {
-            go_b_a.get(idx) * scale
-        });
+        let gi_lora = Tensor::from_fn(go_b_a.shape().clone(), |idx| go_b_a.get(idx) * scale);
 
         // Total grad_input
         if input.ndim() == 1 {
@@ -4417,7 +4550,10 @@ mod tests {
                     assert!(
                         w.abs() < 1e-10,
                         "causal mask violated: attn[{}][{}][{}] = {} (should be ~0)",
-                        h, i, j, w
+                        h,
+                        i,
+                        j,
+                        w
                     );
                 }
             }
@@ -4429,8 +4565,7 @@ mod tests {
         let d_model = 8;
         let seq_len = 4;
 
-        let mut gqa = GroupedQueryAttention::<f64>::new(d_model, 2, 2, 99)
-            .with_causal(true);
+        let mut gqa = GroupedQueryAttention::<f64>::new(d_model, 2, 2, 99).with_causal(true);
 
         let input = Tensor::from_fn(Shape::from_slice(&[seq_len, d_model]), |idx| {
             ((idx[0] + idx[1]) as f64) * 0.05
@@ -4444,7 +4579,9 @@ mod tests {
                 assert!(
                     (row_sum - 1.0).abs() < 1e-10,
                     "attention row [{},{}] sums to {} (expected 1.0)",
-                    h, i, row_sum
+                    h,
+                    i,
+                    row_sum
                 );
             }
         }
@@ -4466,11 +4603,12 @@ mod tests {
         // Non-causal: future positions can have non-zero attention
         let attn = gqa.cached_attn.as_ref().unwrap();
         let has_future = (0..2).any(|h| {
-            (0..seq_len).any(|i| {
-                ((i + 1)..seq_len).any(|j| attn.get(&[h, i, j]).abs() > 1e-10)
-            })
+            (0..seq_len).any(|i| ((i + 1)..seq_len).any(|j| attn.get(&[h, i, j]).abs() > 1e-10))
         });
-        assert!(has_future, "non-causal GQA should have non-zero future attention");
+        assert!(
+            has_future,
+            "non-causal GQA should have non-zero future attention"
+        );
     }
 
     #[test]
@@ -4478,8 +4616,7 @@ mod tests {
         let d_model = 8;
         let seq_len = 3;
 
-        let mut gqa = GroupedQueryAttention::<f64>::new(d_model, 2, 2, 42)
-            .with_causal(true);
+        let mut gqa = GroupedQueryAttention::<f64>::new(d_model, 2, 2, 42).with_causal(true);
 
         let input = Tensor::from_fn(Shape::from_slice(&[seq_len, d_model]), |idx| {
             ((idx[0] * d_model + idx[1]) as f64) * 0.1
@@ -4546,7 +4683,11 @@ mod tests {
     #[test]
     fn swiglu_named_parameters() {
         let swiglu = SwiGLU::<f64>::new(4, 8, 42);
-        let names: Vec<String> = swiglu.named_parameters().into_iter().map(|(n, _)| n).collect();
+        let names: Vec<String> = swiglu
+            .named_parameters()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
 
         assert!(names.contains(&String::from("gate_proj.weight")));
         assert!(names.contains(&String::from("gate_proj.bias")));
@@ -4598,7 +4739,9 @@ mod tests {
             assert!(
                 (numerical - analytic).abs() < 1e-4,
                 "swiglu grad mismatch at {:?}: numerical={}, analytic={}",
-                idx, numerical, analytic
+                idx,
+                numerical,
+                analytic
             );
         }
     }

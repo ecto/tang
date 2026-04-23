@@ -110,8 +110,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let bindings = [
             BindingSpec::Storage { read_only: true },  // token_ids
             BindingSpec::Storage { read_only: true },  // weight
-            BindingSpec::Storage { read_only: false },  // output
-            BindingSpec::Uniform,                       // params
+            BindingSpec::Storage { read_only: false }, // output
+            BindingSpec::Uniform,                      // params
         ];
         let cached = cache.get_or_compile_dynamic(device, wgsl, hash, &bindings);
 
@@ -288,10 +288,10 @@ fn main(
 
         let hash = hash_wgsl(&wgsl);
         let bindings = [
-            BindingSpec::Storage { read_only: true },   // input
-            BindingSpec::Storage { read_only: true },   // weight
-            BindingSpec::Storage { read_only: false },   // output
-            BindingSpec::Uniform,                        // params
+            BindingSpec::Storage { read_only: true },  // input
+            BindingSpec::Storage { read_only: true },  // weight
+            BindingSpec::Storage { read_only: false }, // output
+            BindingSpec::Uniform,                      // params
         ];
         let cached = cache.get_or_compile_dynamic(device, &wgsl, hash, &bindings);
 
@@ -505,7 +505,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-    cache.dispatch_rr_w(device, wgsl, &gate.buffer, &up.buffer, &out.buffer, &[numel, 0, 0, 0]);
+    cache.dispatch_rr_w(
+        device,
+        wgsl,
+        &gate.buffer,
+        &up.buffer,
+        &out.buffer,
+        &[numel, 0, 0, 0],
+    );
     out
 }
 
@@ -567,7 +574,11 @@ impl GpuRoPE {
         input: &GpuTensor,
         start_pos: usize,
     ) -> GpuTensor {
-        assert_eq!(input.ndim(), 3, "RoPE input must be [seq_len, n_heads, head_dim]");
+        assert_eq!(
+            input.ndim(),
+            3,
+            "RoPE input must be [seq_len, n_heads, head_dim]"
+        );
         let seq_len = input.shape()[0];
         let n_heads = input.shape()[1];
         let head_dim = input.shape()[2];
@@ -661,11 +672,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         let hash = hash_wgsl(wgsl);
         let bindings = [
-            BindingSpec::Storage { read_only: true },   // input
-            BindingSpec::Storage { read_only: true },   // cos_table
-            BindingSpec::Storage { read_only: true },   // sin_table
-            BindingSpec::Storage { read_only: false },   // output
-            BindingSpec::Uniform,                        // params
+            BindingSpec::Storage { read_only: true },  // input
+            BindingSpec::Storage { read_only: true },  // cos_table
+            BindingSpec::Storage { read_only: true },  // sin_table
+            BindingSpec::Storage { read_only: false }, // output
+            BindingSpec::Uniform,                      // params
         ];
         let cached = cache.get_or_compile_dynamic(device, wgsl, hash, &bindings);
 
@@ -790,7 +801,11 @@ impl GpuInterleavedRoPE {
         input: &GpuTensor,
         start_pos: usize,
     ) -> GpuTensor {
-        assert_eq!(input.ndim(), 3, "RoPE input must be [seq_len, n_heads, head_dim]");
+        assert_eq!(
+            input.ndim(),
+            3,
+            "RoPE input must be [seq_len, n_heads, head_dim]"
+        );
         let seq_len = input.shape()[0];
         let n_heads = input.shape()[1];
         let head_dim = input.shape()[2];
@@ -798,7 +813,9 @@ impl GpuInterleavedRoPE {
         assert!(
             start_pos + seq_len <= self.max_seq_len,
             "RoPE: position {} + seq_len {} exceeds max {}",
-            start_pos, seq_len, self.max_seq_len
+            start_pos,
+            seq_len,
+            self.max_seq_len
         );
 
         let half = head_dim / 2;
@@ -1029,7 +1046,11 @@ impl GpuKVCache {
         let row_size = self.n_kv_heads * self.head_dim;
         let total = self.len * row_size;
         let data = self.keys.to_vec_sync(device);
-        GpuTensor::from_slice(device, &data[..total], &[self.len, self.n_kv_heads, self.head_dim])
+        GpuTensor::from_slice(
+            device,
+            &data[..total],
+            &[self.len, self.n_kv_heads, self.head_dim],
+        )
     }
 
     /// Get cached values as a tensor of shape `[current_len, n_kv_heads, head_dim]`.
@@ -1037,17 +1058,17 @@ impl GpuKVCache {
         let row_size = self.n_kv_heads * self.head_dim;
         let total = self.len * row_size;
         let data = self.values.to_vec_sync(device);
-        GpuTensor::from_slice(device, &data[..total], &[self.len, self.n_kv_heads, self.head_dim])
+        GpuTensor::from_slice(
+            device,
+            &data[..total],
+            &[self.len, self.n_kv_heads, self.head_dim],
+        )
     }
 
     /// Get cached keys as a tensor, staying on GPU (no CPU roundtrip).
     ///
     /// Returns `[current_len, n_kv_heads, head_dim]`.
-    pub fn get_keys_gpu(
-        &self,
-        device: &GpuDevice,
-        cache: &mut KernelCache,
-    ) -> GpuTensor {
+    pub fn get_keys_gpu(&self, device: &GpuDevice, cache: &mut KernelCache) -> GpuTensor {
         let row_size = self.n_kv_heads * self.head_dim;
         let total = self.len * row_size;
         let dst = GpuBuffer::uninit(device, total);
@@ -1070,11 +1091,7 @@ impl GpuKVCache {
     /// Get cached values as a tensor, staying on GPU (no CPU roundtrip).
     ///
     /// Returns `[current_len, n_kv_heads, head_dim]`.
-    pub fn get_values_gpu(
-        &self,
-        device: &GpuDevice,
-        cache: &mut KernelCache,
-    ) -> GpuTensor {
+    pub fn get_values_gpu(&self, device: &GpuDevice, cache: &mut KernelCache) -> GpuTensor {
         let row_size = self.n_kv_heads * self.head_dim;
         let total = self.len * row_size;
         let dst = GpuBuffer::uninit(device, total);
@@ -1143,14 +1160,26 @@ impl GpuCausalAttention {
         n_kv_heads: usize,
         head_dim: usize,
     ) -> Self {
-        assert_eq!(n_heads % n_kv_heads, 0, "n_heads must be divisible by n_kv_heads");
+        assert_eq!(
+            n_heads % n_kv_heads,
+            0,
+            "n_heads must be divisible by n_kv_heads"
+        );
         let q_size = n_heads * head_dim * dim;
         let kv_size = n_kv_heads * head_dim * dim;
         let o_size = dim * n_heads * head_dim;
         Self {
             wq: GpuTensor::from_slice(device, &vec![0.0f32; q_size], &[n_heads * head_dim, dim]),
-            wk: GpuTensor::from_slice(device, &vec![0.0f32; kv_size], &[n_kv_heads * head_dim, dim]),
-            wv: GpuTensor::from_slice(device, &vec![0.0f32; kv_size], &[n_kv_heads * head_dim, dim]),
+            wk: GpuTensor::from_slice(
+                device,
+                &vec![0.0f32; kv_size],
+                &[n_kv_heads * head_dim, dim],
+            ),
+            wv: GpuTensor::from_slice(
+                device,
+                &vec![0.0f32; kv_size],
+                &[n_kv_heads * head_dim, dim],
+            ),
             wo: GpuTensor::from_slice(device, &vec![0.0f32; o_size], &[dim, n_heads * head_dim]),
             n_heads,
             n_kv_heads,
@@ -1400,11 +1429,11 @@ fn main(
 
     let hash = hash_wgsl(&wgsl);
     let bindings = [
-        BindingSpec::Storage { read_only: true },   // Q
-        BindingSpec::Storage { read_only: true },   // K
-        BindingSpec::Storage { read_only: true },   // V
-        BindingSpec::Storage { read_only: false },   // output
-        BindingSpec::Uniform,                        // params
+        BindingSpec::Storage { read_only: true },  // Q
+        BindingSpec::Storage { read_only: true },  // K
+        BindingSpec::Storage { read_only: true },  // V
+        BindingSpec::Storage { read_only: false }, // output
+        BindingSpec::Uniform,                      // params
     ];
     let cached = cache.get_or_compile_dynamic(device, &wgsl, hash, &bindings);
 
@@ -1737,11 +1766,13 @@ impl GpuTrainModule for GpuEmbedding {
         // Create u32 buffer for embedding lookup
         use wgpu::util::DeviceExt;
         let id_buf = GpuBuffer {
-            buffer: device.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("embedding train token ids"),
-                contents: bytemuck::cast_slice(&token_ids),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            }),
+            buffer: device
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("embedding train token ids"),
+                    contents: bytemuck::cast_slice(&token_ids),
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                }),
             len: seq_len,
         };
 
@@ -1754,7 +1785,10 @@ impl GpuTrainModule for GpuEmbedding {
         cache: &mut KernelCache,
         grad_output: &GpuTensor,
     ) -> GpuTensor {
-        let indices = self.cached_indices.as_ref().expect("must call forward_train before backward");
+        let indices = self
+            .cached_indices
+            .as_ref()
+            .expect("must call forward_train before backward");
         let seq_len = self.cached_seq_len.unwrap();
 
         // Download grad_output [seq_len, dim]
@@ -1770,7 +1804,11 @@ impl GpuTrainModule for GpuEmbedding {
             }
         }
 
-        self.weight_grad = Some(GpuTensor::from_slice(device, &grad_w, &[self.vocab_size, self.dim]));
+        self.weight_grad = Some(GpuTensor::from_slice(
+            device,
+            &grad_w,
+            &[self.vocab_size, self.dim],
+        ));
 
         // No meaningful gradient for integer indices — return zeros
         GpuTensor::from_slice(device, &vec![0.0f32; seq_len], &[seq_len])
@@ -1836,8 +1874,14 @@ impl GpuTrainModule for GpuRMSNorm {
         cache: &mut KernelCache,
         grad_output: &GpuTensor,
     ) -> GpuTensor {
-        let input_data = self.cached_input.as_ref().expect("must call forward_train before backward");
-        let rms_vals = self.cached_rms.as_ref().expect("must call forward_train before backward");
+        let input_data = self
+            .cached_input
+            .as_ref()
+            .expect("must call forward_train before backward");
+        let rms_vals = self
+            .cached_rms
+            .as_ref()
+            .expect("must call forward_train before backward");
 
         cache.flush(device);
         let grad_out_data = grad_output.buffer.to_vec_sync(device);
@@ -1909,7 +1953,11 @@ pub fn interleaved_rope_backward(
     grad_output: &GpuTensor,
     start_pos: usize,
 ) -> GpuTensor {
-    assert_eq!(grad_output.ndim(), 3, "RoPE grad must be [seq_len, n_heads, head_dim]");
+    assert_eq!(
+        grad_output.ndim(),
+        3,
+        "RoPE grad must be [seq_len, n_heads, head_dim]"
+    );
     let seq_len = grad_output.shape()[0];
     let n_heads = grad_output.shape()[1];
     let head_dim = grad_output.shape()[2];
@@ -2000,27 +2048,46 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let cached = cache.get_or_compile_dynamic(device, wgsl, hash, &bindings);
 
     use wgpu::util::DeviceExt;
-    let params_buf = device.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("rope backward params"),
-        contents: bytemuck::bytes_of(&uniform),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
+    let params_buf = device
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("rope backward params"),
+            contents: bytemuck::bytes_of(&uniform),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
 
     let bind_group = device.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("rope backward bind group"),
         layout: &cached.bind_group_layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: grad_output.buffer.buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: rope.cos_table.buffer.buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: rope.sin_table.buffer.buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: out.buffer.buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: params_buf.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: grad_output.buffer.buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: rope.cos_table.buffer.buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: rope.sin_table.buffer.buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: out.buffer.buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: params_buf.as_entire_binding(),
+            },
         ],
     });
 
-    let mut encoder = device.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("rope backward dispatch"),
-    });
+    let mut encoder = device
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("rope backward dispatch"),
+        });
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("rope backward compute"),
@@ -2090,7 +2157,10 @@ impl GpuTrainModule for GpuSwiGLU {
         let result = matmul(device, cache, &activated, &down_t);
 
         if was_1d {
-            GpuTensor { buffer: result.buffer, shape: vec![self.dim] }
+            GpuTensor {
+                buffer: result.buffer,
+                shape: vec![self.dim],
+            }
         } else {
             result
         }
@@ -2102,11 +2172,23 @@ impl GpuTrainModule for GpuSwiGLU {
         cache: &mut KernelCache,
         grad_output: &GpuTensor,
     ) -> GpuTensor {
-        let cached_input = self.cached_input.as_ref().expect("must call forward_train before backward");
-        let gate_raw = self.cached_gate_raw.as_ref().expect("cached_gate_raw missing");
+        let cached_input = self
+            .cached_input
+            .as_ref()
+            .expect("must call forward_train before backward");
+        let gate_raw = self
+            .cached_gate_raw
+            .as_ref()
+            .expect("cached_gate_raw missing");
         let up_raw = self.cached_up_raw.as_ref().expect("cached_up_raw missing");
-        let gate_silu = self.cached_gate_silu.as_ref().expect("cached_gate_silu missing");
-        let activated = self.cached_activated.as_ref().expect("cached_activated missing");
+        let gate_silu = self
+            .cached_gate_silu
+            .as_ref()
+            .expect("cached_gate_silu missing");
+        let activated = self
+            .cached_activated
+            .as_ref()
+            .expect("cached_activated missing");
 
         // Ensure 2D grad_output
         let was_1d = grad_output.ndim() == 1;
@@ -2162,7 +2244,10 @@ impl GpuTrainModule for GpuSwiGLU {
         let grad_input = add_tensors(device, cache, &gi_gate, &gi_up);
 
         if was_1d {
-            GpuTensor { buffer: grad_input.buffer, shape: vec![self.dim] }
+            GpuTensor {
+                buffer: grad_input.buffer,
+                shape: vec![self.dim],
+            }
         } else {
             grad_input
         }
@@ -2220,8 +2305,15 @@ impl GpuTrainModule for GpuCausalAttention {
 
         // Fused attention on GPU
         let attn_out = causal_attention_fused(
-            device, cache, &q_flat, &k_flat, &v_flat,
-            seq_len, self.n_heads, self.n_kv_heads, self.head_dim,
+            device,
+            cache,
+            &q_flat,
+            &k_flat,
+            &v_flat,
+            seq_len,
+            self.n_heads,
+            self.n_kv_heads,
+            self.head_dim,
         );
 
         // Output projection on GPU
@@ -2249,7 +2341,10 @@ impl GpuTrainModule for GpuCausalAttention {
         let q_data = self.cached_q.as_ref().expect("cached_q missing");
         let k_data = self.cached_k.as_ref().expect("cached_k missing");
         let v_data = self.cached_v.as_ref().expect("cached_v missing");
-        let attn_out_data = self.cached_attn_out.as_ref().expect("cached_attn_out missing");
+        let attn_out_data = self
+            .cached_attn_out
+            .as_ref()
+            .expect("cached_attn_out missing");
 
         cache.flush(device);
         let grad_out_data = grad_output.buffer.to_vec_sync(device);
@@ -2288,7 +2383,11 @@ impl GpuTrainModule for GpuCausalAttention {
                 wo_grad_data[k * q_dim + j] = sum;
             }
         }
-        self.wo_grad = Some(GpuTensor::from_slice(device, &wo_grad_data, &[self.dim, q_dim]));
+        self.wo_grad = Some(GpuTensor::from_slice(
+            device,
+            &wo_grad_data,
+            &[self.dim, q_dim],
+        ));
 
         // Per-head attention backward
         let mut grad_q_full = vec![0.0f32; seq_len * q_dim];
@@ -2308,8 +2407,8 @@ impl GpuTrainModule for GpuCausalAttention {
                 for kp in 0..=qi {
                     let mut dot = 0.0f32;
                     for d in 0..self.head_dim {
-                        dot += q_data[qi * q_dim + q_offset + d]
-                            * k_data[kp * kv_dim + kv_offset + d];
+                        dot +=
+                            q_data[qi * q_dim + q_offset + d] * k_data[kp * kv_dim + kv_offset + d];
                     }
                     let s = dot * scale;
                     attn_weights[qi * seq_len + kp] = s;
@@ -2376,8 +2475,7 @@ impl GpuTrainModule for GpuCausalAttention {
                 for d in 0..self.head_dim {
                     let mut sum = 0.0f32;
                     for kp in 0..seq_len {
-                        sum += grad_scores[qi * seq_len + kp]
-                            * k_data[kp * kv_dim + kv_offset + d];
+                        sum += grad_scores[qi * seq_len + kp] * k_data[kp * kv_dim + kv_offset + d];
                     }
                     grad_q_full[qi * q_dim + q_offset + d] += sum;
                 }
@@ -2388,8 +2486,7 @@ impl GpuTrainModule for GpuCausalAttention {
                 for d in 0..self.head_dim {
                     let mut sum = 0.0f32;
                     for qi in 0..seq_len {
-                        sum += grad_scores[qi * seq_len + kp]
-                            * q_data[qi * q_dim + q_offset + d];
+                        sum += grad_scores[qi * seq_len + kp] * q_data[qi * q_dim + q_offset + d];
                     }
                     grad_k_full[kp * kv_dim + kv_offset + d] += sum;
                 }
@@ -2465,9 +2562,21 @@ impl GpuTrainModule for GpuCausalAttention {
             }
         }
 
-        self.wq_grad = Some(GpuTensor::from_slice(device, &wq_grad_data, &[q_dim, self.dim]));
-        self.wk_grad = Some(GpuTensor::from_slice(device, &wk_grad_data, &[kv_dim, self.dim]));
-        self.wv_grad = Some(GpuTensor::from_slice(device, &wv_grad_data, &[kv_dim, self.dim]));
+        self.wq_grad = Some(GpuTensor::from_slice(
+            device,
+            &wq_grad_data,
+            &[q_dim, self.dim],
+        ));
+        self.wk_grad = Some(GpuTensor::from_slice(
+            device,
+            &wk_grad_data,
+            &[kv_dim, self.dim],
+        ));
+        self.wv_grad = Some(GpuTensor::from_slice(
+            device,
+            &wv_grad_data,
+            &[kv_dim, self.dim],
+        ));
 
         GpuTensor::from_slice(device, &grad_input, &[seq_len, self.dim])
     }
@@ -2519,14 +2628,12 @@ pub struct GpuTrainTransformerBlock {
 }
 
 impl GpuTrainTransformerBlock {
-    pub fn new(
-        ln1: GpuRMSNorm,
-        attn: GpuCausalAttention,
-        ln2: GpuRMSNorm,
-        ffn: GpuSwiGLU,
-    ) -> Self {
+    pub fn new(ln1: GpuRMSNorm, attn: GpuCausalAttention, ln2: GpuRMSNorm, ffn: GpuSwiGLU) -> Self {
         Self {
-            ln1, attn, ln2, ffn,
+            ln1,
+            attn,
+            ln2,
+            ffn,
             cached_residual1: None,
             cached_ln1_out: None,
             cached_ln2_input: None,
@@ -2578,7 +2685,12 @@ impl GpuTrainModule for GpuTrainTransformerBlock {
         let grad_residual1_from_ln2 = self.ln2.backward(device, cache, &grad_ln2_out);
 
         // Sum gradients at residual1
-        let grad_residual1 = add_tensors(device, cache, grad_residual1_from_add, &grad_residual1_from_ln2);
+        let grad_residual1 = add_tensors(
+            device,
+            cache,
+            grad_residual1_from_add,
+            &grad_residual1_from_ln2,
+        );
 
         // Backward through first residual
         let grad_attn_out = &grad_residual1;
@@ -2906,11 +3018,7 @@ mod tests {
         let rope = GpuRoPE::new(&device, head_dim, 32, base);
 
         // Input: [1, 0, 0, 0] at position 5
-        let input = GpuTensor::from_slice(
-            &device,
-            &[1.0, 0.0, 0.0, 0.0],
-            &[1, 1, 4],
-        );
+        let input = GpuTensor::from_slice(&device, &[1.0, 0.0, 0.0, 0.0], &[1, 1, 4]);
         let output = rope.forward(&device, &mut cache, &input, 5);
         let result = output.to_vec_sync(&device);
 
@@ -2971,10 +3079,7 @@ mod tests {
         let v1 = GpuTensor::from_slice(
             &device,
             &[
-                1.0, 1.0, 1.0, 1.0,
-                2.0, 2.0, 2.0, 2.0,
-                3.0, 3.0, 3.0, 3.0,
-                4.0, 4.0, 4.0, 4.0,
+                1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0, 4.0, 4.0, 4.0, 4.0,
             ],
             &[2, 2, 4],
         );
@@ -3035,8 +3140,9 @@ mod tests {
         let attn = GpuCausalAttention::zeros(&device, 8, 2, 2, 4);
         let input = GpuTensor::from_slice(
             &device,
-            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
-              8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0],
+            &[
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0,
+            ],
             &[2, 8],
         );
         let output = attn.forward(&device, &mut cache, &input);
@@ -3064,10 +3170,7 @@ mod tests {
 
         // Set Wq, Wk, Wv to identity, Wo to identity
         let eye4 = vec![
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.0, 0.0, 0.0, 1.0,
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
         ];
 
         let attn = GpuCausalAttention {
@@ -3116,10 +3219,7 @@ mod tests {
         let head_dim = 4;
 
         let eye4 = vec![
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.0, 0.0, 0.0, 1.0,
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
         ];
 
         let attn = GpuCausalAttention {
@@ -3185,11 +3285,8 @@ mod tests {
         let head_dim = 2;
 
         let attn = GpuCausalAttention::zeros(&device, dim, n_heads, n_kv_heads, head_dim);
-        let input = GpuTensor::from_slice(
-            &device,
-            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-            &[1, 8],
-        );
+        let input =
+            GpuTensor::from_slice(&device, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[1, 8]);
 
         // Should not panic -- just verifying GQA dispatch works
         let output = attn.forward(&device, &mut cache, &input);
@@ -3219,11 +3316,7 @@ mod tests {
     }
 
     /// CPU-only finite-difference gradient (pure CPU, no GPU state).
-    fn finite_diff_cpu(
-        input: &[f32],
-        eps: f32,
-        f: &dyn Fn(&[f32]) -> f32,
-    ) -> Vec<f32> {
+    fn finite_diff_cpu(input: &[f32], eps: f32, f: &dyn Fn(&[f32]) -> f32) -> Vec<f32> {
         let mut grad = vec![0.0f32; input.len()];
         for i in 0..input.len() {
             let mut plus = input.to_vec();
@@ -3271,7 +3364,8 @@ mod tests {
             assert!(
                 (analytical[i] - numerical[i]).abs() < 0.01,
                 "rmsnorm grad[{i}]: analytical={}, numerical={}",
-                analytical[i], numerical[i]
+                analytical[i],
+                numerical[i]
             );
         }
     }
@@ -3303,10 +3397,18 @@ mod tests {
             let mut minus = input_data.clone();
             minus[dim_i] -= h;
 
-            let out_p = rope.forward(&device, &mut cache,
-                &GpuTensor::from_slice(&device, &plus, &[1, 1, 4]), 3);
-            let out_m = rope.forward(&device, &mut cache,
-                &GpuTensor::from_slice(&device, &minus, &[1, 1, 4]), 3);
+            let out_p = rope.forward(
+                &device,
+                &mut cache,
+                &GpuTensor::from_slice(&device, &plus, &[1, 1, 4]),
+                3,
+            );
+            let out_m = rope.forward(
+                &device,
+                &mut cache,
+                &GpuTensor::from_slice(&device, &minus, &[1, 1, 4]),
+                3,
+            );
             let p = out_p.to_vec_sync(&device);
             let m = out_m.to_vec_sync(&device);
             let numerical = (p[0] - m[0]) / (2.0 * h);
@@ -3314,7 +3416,8 @@ mod tests {
             assert!(
                 (gi[dim_i] - numerical).abs() < 1e-3,
                 "rope grad[{dim_i}]: analytical={}, numerical={}",
-                gi[dim_i], numerical
+                gi[dim_i],
+                numerical
             );
         }
     }
@@ -3363,8 +3466,13 @@ mod tests {
 
     /// CPU-only SwiGLU forward sum for gradient checking.
     fn cpu_swiglu_sum(
-        inp: &[f32], gate_w: &[f32], up_w: &[f32], down_w: &[f32],
-        seq_len: usize, dim: usize, hidden_dim: usize,
+        inp: &[f32],
+        gate_w: &[f32],
+        up_w: &[f32],
+        down_w: &[f32],
+        seq_len: usize,
+        dim: usize,
+        hidden_dim: usize,
     ) -> f32 {
         // gate = inp @ gate_w^T -> [seq, hidden]
         let mut gate = vec![0.0f32; seq_len * hidden_dim];
@@ -3424,7 +3532,9 @@ mod tests {
         cache.flush(&device);
         let analytical = grad_input.to_vec_sync(&device);
 
-        let gw = gate_w.clone(); let uw = up_w.clone(); let dw = down_w.clone();
+        let gw = gate_w.clone();
+        let uw = up_w.clone();
+        let dw = down_w.clone();
         let numerical = finite_diff_cpu(&input_data, 1e-3, &|inp| {
             cpu_swiglu_sum(inp, &gw, &uw, &dw, 2, dim, hidden_dim)
         });
@@ -3433,15 +3543,24 @@ mod tests {
             assert!(
                 (analytical[i] - numerical[i]).abs() < 0.05,
                 "swiglu grad[{i}]: analytical={}, numerical={}",
-                analytical[i], numerical[i]
+                analytical[i],
+                numerical[i]
             );
         }
     }
 
     /// CPU-only causal attention forward sum for gradient checking.
     fn cpu_causal_attn_sum(
-        inp: &[f32], wq: &[f32], wk: &[f32], wv: &[f32], wo: &[f32],
-        seq_len: usize, dim: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize,
+        inp: &[f32],
+        wq: &[f32],
+        wk: &[f32],
+        wv: &[f32],
+        wo: &[f32],
+        seq_len: usize,
+        dim: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
     ) -> f32 {
         let q_dim = n_heads * head_dim;
         let kv_dim = n_kv_heads * head_dim;
@@ -3455,7 +3574,9 @@ mod tests {
         for s in 0..seq_len {
             for j in 0..q_dim {
                 let mut sum = 0.0f32;
-                for d in 0..dim { sum += inp[s * dim + d] * wq[j * dim + d]; }
+                for d in 0..dim {
+                    sum += inp[s * dim + d] * wq[j * dim + d];
+                }
                 q[s * q_dim + j] = sum;
             }
             for j in 0..kv_dim {
@@ -3493,7 +3614,9 @@ mod tests {
                     scores[kp] = (scores[kp] - row_max).exp();
                     exp_sum += scores[kp];
                 }
-                for kp in 0..=qi { scores[kp] /= exp_sum; }
+                for kp in 0..=qi {
+                    scores[kp] /= exp_sum;
+                }
                 // Weighted sum of V
                 for d in 0..head_dim {
                     let mut acc = 0.0f32;
@@ -3510,7 +3633,9 @@ mod tests {
         for s in 0..seq_len {
             for d in 0..dim {
                 let mut val = 0.0f32;
-                for j in 0..q_dim { val += attn_out[s * q_dim + j] * wo[d * q_dim + j]; }
+                for j in 0..q_dim {
+                    val += attn_out[s * q_dim + j] * wo[d * q_dim + j];
+                }
                 out_sum += val;
             }
         }
@@ -3568,17 +3693,22 @@ mod tests {
         cache.flush(&device);
         let analytical = grad_input.to_vec_sync(&device);
 
-        let wq = wq_data.clone(); let wk = wk_data.clone();
-        let wv = wv_data.clone(); let wo = wo_data.clone();
+        let wq = wq_data.clone();
+        let wk = wk_data.clone();
+        let wv = wv_data.clone();
+        let wo = wo_data.clone();
         let numerical = finite_diff_cpu(&input_data, 1e-3, &|inp| {
-            cpu_causal_attn_sum(inp, &wq, &wk, &wv, &wo, 2, dim, n_heads, n_kv_heads, head_dim)
+            cpu_causal_attn_sum(
+                inp, &wq, &wk, &wv, &wo, 2, dim, n_heads, n_kv_heads, head_dim,
+            )
         });
 
         for i in 0..8 {
             assert!(
                 (analytical[i] - numerical[i]).abs() < 0.05,
                 "attn grad[{i}]: analytical={}, numerical={}",
-                analytical[i], numerical[i]
+                analytical[i],
+                numerical[i]
             );
         }
     }
@@ -3602,11 +3732,8 @@ mod tests {
         let mut block = GpuTrainTransformerBlock::new(ln1, attn, ln2, ffn);
 
         // Forward
-        let input = GpuTensor::from_slice(
-            &device,
-            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-            &[2, 4],
-        );
+        let input =
+            GpuTensor::from_slice(&device, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 4]);
         let output = block.forward_train(&device, &mut cache, &input);
         assert_eq!(output.shape(), &[2, 4]);
 

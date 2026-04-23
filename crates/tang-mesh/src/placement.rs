@@ -13,10 +13,7 @@ pub enum ShardSpec {
     /// Full copy on every node (data parallelism).
     Replicated,
     /// Split along an axis across specific nodes (tensor parallelism).
-    Split {
-        axis: usize,
-        nodes: Vec<NodeId>,
-    },
+    Split { axis: usize, nodes: Vec<NodeId> },
 }
 
 /// Top-level parallelism strategy.
@@ -27,7 +24,9 @@ pub enum Strategy {
     /// Split tensors along an axis across nodes.
     TensorParallel { split_axis: usize },
     /// Different layers on different nodes, activations pipeline through.
-    Pipeline { stage_assignments: Vec<(NodeId, Vec<u32>)> },
+    Pipeline {
+        stage_assignments: Vec<(NodeId, Vec<u32>)>,
+    },
 }
 
 /// Complete placement plan for a model across a mesh.
@@ -93,10 +92,7 @@ mod tests {
 
     #[test]
     fn pipeline_placement() {
-        let p = Placement::pipeline(vec![
-            (NodeId(0), vec![0, 1, 2]),
-            (NodeId(1), vec![3, 4, 5]),
-        ]);
+        let p = Placement::pipeline(vec![(NodeId(0), vec![0, 1, 2]), (NodeId(1), vec![3, 4, 5])]);
         assert!(p.is_pipeline());
         assert!(!p.is_data_parallel());
     }

@@ -18,9 +18,15 @@ use tang_sheffer::op_enum::{Atom, BinaryOp, OpExpr, UnaryOp};
 
 type C = Complex64;
 
-fn x() -> Arc<OpExpr> { Arc::new(OpExpr::Atom(Atom::X)) }
-fn y() -> Arc<OpExpr> { Arc::new(OpExpr::Atom(Atom::Y)) }
-fn one() -> Arc<OpExpr> { Arc::new(OpExpr::Atom(Atom::One)) }
+fn x() -> Arc<OpExpr> {
+    Arc::new(OpExpr::Atom(Atom::X))
+}
+fn y() -> Arc<OpExpr> {
+    Arc::new(OpExpr::Atom(Atom::Y))
+}
+fn one() -> Arc<OpExpr> {
+    Arc::new(OpExpr::Atom(Atom::One))
+}
 
 fn unary(op: UnaryOp, e: Arc<OpExpr>) -> Arc<OpExpr> {
     Arc::new(OpExpr::Unary(op, e))
@@ -52,17 +58,9 @@ fn build(name: &str) -> Option<Arc<OpExpr>> {
             binary(BinaryOp::Pow, y(), x()),
         ),
         // SubPow = (x - y)^y
-        "subpow" => binary(
-            BinaryOp::Pow,
-            binary(BinaryOp::Sub, x(), y()),
-            y(),
-        ),
+        "subpow" => binary(BinaryOp::Pow, binary(BinaryOp::Sub, x(), y()), y()),
         // OneMinusDiv = 1 - x/y
-        "oneminusdiv" => binary(
-            BinaryOp::Sub,
-            one(),
-            binary(BinaryOp::Div, x(), y()),
-        ),
+        "oneminusdiv" => binary(BinaryOp::Sub, one(), binary(BinaryOp::Div, x(), y())),
         _ => return None,
     })
 }
@@ -96,8 +94,16 @@ fn quantize(v: C) -> (i64, i64) {
     // 1e-9 grid is plenty for the demo and matches the visual
     // tolerance the user can read.
     let scale = 1e9;
-    let qr = if v.re.is_finite() { (v.re * scale).round() as i64 } else { i64::MAX };
-    let qi = if v.im.is_finite() { (v.im * scale).round() as i64 } else { i64::MAX };
+    let qr = if v.re.is_finite() {
+        (v.re * scale).round() as i64
+    } else {
+        i64::MAX
+    };
+    let qi = if v.im.is_finite() {
+        (v.im * scale).round() as i64
+    } else {
+        i64::MAX
+    };
     (qr, qi)
 }
 
@@ -115,12 +121,21 @@ struct Found {
 /// Returns a JSON string: `[{re, im, iter, label?}, ...]` ordered by
 /// iteration first found. The first entry is always the seed itself.
 #[wasm_bindgen]
-pub fn bootstrap(op_name: &str, seed_re: f64, seed_im: f64, max_iters: u32, max_per_iter: u32) -> String {
+pub fn bootstrap(
+    op_name: &str,
+    seed_re: f64,
+    seed_im: f64,
+    max_iters: u32,
+    max_per_iter: u32,
+) -> String {
     let Some(expr) = build(op_name) else {
         return "[]".to_string();
     };
 
-    let mut found: Vec<Found> = vec![Found { value: C::new(seed_re, seed_im), iter: 0 }];
+    let mut found: Vec<Found> = vec![Found {
+        value: C::new(seed_re, seed_im),
+        iter: 0,
+    }];
     let mut seen: HashSet<(i64, i64)> = HashSet::new();
     seen.insert(quantize(found[0].value));
 
@@ -130,25 +145,35 @@ pub fn bootstrap(op_name: &str, seed_re: f64, seed_im: f64, max_iters: u32, max_
         'pairs: for a in &snapshot {
             for b in &snapshot {
                 let v = expr.eval(a.value, b.value);
-                if !v.re.is_finite() || !v.im.is_finite() { continue; }
+                if !v.re.is_finite() || !v.im.is_finite() {
+                    continue;
+                }
                 // Filter wildly-large intermediates so the visualization
                 // doesn't get steamrolled by overflow chains.
-                if v.norm() > 1e6 { continue; }
+                if v.norm() > 1e6 {
+                    continue;
+                }
                 let key = quantize(v);
                 if seen.insert(key) {
                     found.push(Found { value: v, iter: it });
                     added += 1;
-                    if added >= max_per_iter { break 'pairs; }
+                    if added >= max_per_iter {
+                        break 'pairs;
+                    }
                 }
             }
         }
-        if added == 0 { break; }
+        if added == 0 {
+            break;
+        }
     }
 
     // Hand-roll JSON (no serde dep just for this).
     let mut out = String::from("[");
     for (i, f) in found.iter().enumerate() {
-        if i > 0 { out.push(','); }
+        if i > 0 {
+            out.push(',');
+        }
         out.push_str(&format!(
             "{{\"re\":{:.6},\"im\":{:.6},\"iter\":{}}}",
             f.value.re, f.value.im, f.iter

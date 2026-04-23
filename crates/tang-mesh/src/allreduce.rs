@@ -104,10 +104,7 @@ mod tests {
     #[test]
     fn mean_reduce() {
         let ar = AllReduce::mean();
-        let grads = vec![
-            vec![1.0, 2.0, 3.0],
-            vec![3.0, 4.0, 5.0],
-        ];
+        let grads = vec![vec![1.0, 2.0, 3.0], vec![3.0, 4.0, 5.0]];
         let result = ar.reduce(&grads);
         assert_eq!(result, vec![2.0, 3.0, 4.0]);
     }
@@ -115,10 +112,7 @@ mod tests {
     #[test]
     fn sum_reduce() {
         let ar = AllReduce::sum();
-        let grads = vec![
-            vec![1.0, 2.0, 3.0],
-            vec![3.0, 4.0, 5.0],
-        ];
+        let grads = vec![vec![1.0, 2.0, 3.0], vec![3.0, 4.0, 5.0]];
         let result = ar.reduce(&grads);
         assert_eq!(result, vec![4.0, 6.0, 8.0]);
     }

@@ -2,12 +2,12 @@
 //!
 //! Tests the full path: QUIC transport → compile → partition → pipeline inference.
 
-use tang_mesh::transport::{MeshTransport, ALPN};
-use tang_mesh::worker::Worker;
 use tang_mesh::coordinator::Coordinator;
 use tang_mesh::inference::InferenceServer;
 use tang_mesh::mesh::NodeId;
 use tang_mesh::protocol::{WireGraph, WireNode, PROTOCOL_VERSION};
+use tang_mesh::transport::{MeshTransport, ALPN};
+use tang_mesh::worker::Worker;
 
 use iroh::endpoint::RelayMode;
 use iroh::Endpoint;
@@ -76,11 +76,9 @@ async fn quic_compile_and_execute() {
     let (send, recv) = conn.open_bi().await.unwrap();
     let stream = tang_mesh::transport::QuicStream::new(send, recv);
     let transport = tang_mesh::transport::tarpc_transport(stream);
-    let client = tang_mesh::transport::WorkerServiceClient::new(
-        tarpc::client::Config::default(),
-        transport,
-    )
-    .spawn();
+    let client =
+        tang_mesh::transport::WorkerServiceClient::new(tarpc::client::Config::default(), transport)
+            .spawn();
 
     // Compile and execute
     let graph = simple_add_graph();
@@ -131,9 +129,13 @@ async fn quic_two_workers_same_result() {
     let t2 = MeshTransport::from_endpoint(ep_w2);
 
     let w1c = w1.clone();
-    tokio::spawn(async move { w1c.serve(&t1).await.ok(); });
+    tokio::spawn(async move {
+        w1c.serve(&t1).await.ok();
+    });
     let w2c = w2.clone();
-    tokio::spawn(async move { w2c.serve(&t2).await.ok(); });
+    tokio::spawn(async move {
+        w2c.serve(&t2).await.ok();
+    });
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -213,9 +215,13 @@ async fn quic_pipeline_inference() {
     let t2 = MeshTransport::from_endpoint(ep_w2);
 
     let w1c = w1.clone();
-    tokio::spawn(async move { w1c.serve(&t1).await.ok(); });
+    tokio::spawn(async move {
+        w1c.serve(&t1).await.ok();
+    });
     let w2c = w2.clone();
-    tokio::spawn(async move { w2c.serve(&t2).await.ok(); });
+    tokio::spawn(async move {
+        w2c.serve(&t2).await.ok();
+    });
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -226,9 +232,7 @@ async fn quic_pipeline_inference() {
     let (s1, r1) = conn1.open_bi().await.unwrap();
     let client1 = tang_mesh::transport::WorkerServiceClient::new(
         tarpc::client::Config::default(),
-        tang_mesh::transport::tarpc_transport(
-            tang_mesh::transport::QuicStream::new(s1, r1),
-        ),
+        tang_mesh::transport::tarpc_transport(tang_mesh::transport::QuicStream::new(s1, r1)),
     )
     .spawn();
     coordinator.add_worker(NodeId(0), client1).await;
@@ -237,9 +241,7 @@ async fn quic_pipeline_inference() {
     let (s2, r2) = conn2.open_bi().await.unwrap();
     let client2 = tang_mesh::transport::WorkerServiceClient::new(
         tarpc::client::Config::default(),
-        tang_mesh::transport::tarpc_transport(
-            tang_mesh::transport::QuicStream::new(s2, r2),
-        ),
+        tang_mesh::transport::tarpc_transport(tang_mesh::transport::QuicStream::new(s2, r2)),
     )
     .spawn();
     coordinator.add_worker(NodeId(1), client2).await;

@@ -141,13 +141,7 @@ pub fn collocation_grid(dim: usize, n_per_dim: usize, lo: f64, hi: f64) -> Tenso
 /// * `lo` - Lower bound
 /// * `hi` - Upper bound
 /// * `seed` - PRNG seed
-pub fn collocation_random(
-    n_points: usize,
-    dim: usize,
-    lo: f64,
-    hi: f64,
-    seed: u64,
-) -> Tensor<f64> {
+pub fn collocation_random(n_points: usize, dim: usize, lo: f64, hi: f64, seed: u64) -> Tensor<f64> {
     let total = n_points * dim;
     let mut data = Vec::with_capacity(total);
     let mut state = seed;
@@ -315,11 +309,7 @@ mod tests {
         let residual = pde_residual(&net, &pde_op, &points);
 
         for &r in residual.data() {
-            assert!(
-                r.abs() < 1e-10,
-                "Laplace residual should be ~0, got {}",
-                r
-            );
+            assert!(r.abs() < 1e-10, "Laplace residual should be ~0, got {}", r);
         }
     }
 }

@@ -1,7 +1,7 @@
 use super::Shape;
-use alloc::vec::Vec;
-use crate::Scalar;
 use crate::la::{DMat, DVec};
+use crate::Scalar;
+use alloc::vec::Vec;
 
 /// N-dimensional tensor with CPU storage.
 #[derive(Debug, Clone)]

@@ -44,7 +44,12 @@ impl ExprGraph {
     ///
     /// Each work item reads `n_inputs` f32 values and writes `outputs.len()` f32 values.
     /// Shared subexpressions are computed once per thread.
-    pub fn to_kernel(&self, outputs: &[ExprId], n_inputs: usize, dialect: Dialect) -> ComputeKernel {
+    pub fn to_kernel(
+        &self,
+        outputs: &[ExprId],
+        n_inputs: usize,
+        dialect: Dialect,
+    ) -> ComputeKernel {
         let workgroup_size = 256u32;
         let n_outputs = outputs.len();
         let live = self.live_set(outputs);
@@ -57,7 +62,16 @@ impl ExprGraph {
         let mut src = String::with_capacity(2048);
 
         match dialect {
-            Dialect::Wgsl => emit_wgsl(&mut src, self, outputs, n_inputs, n_outputs, &live, max_id, workgroup_size),
+            Dialect::Wgsl => emit_wgsl(
+                &mut src,
+                self,
+                outputs,
+                n_inputs,
+                n_outputs,
+                &live,
+                max_id,
+                workgroup_size,
+            ),
             Dialect::Msl => emit_msl(&mut src, self, outputs, n_inputs, n_outputs, &live, max_id),
             Dialect::Cuda => emit_cuda(&mut src, self, outputs, n_inputs, n_outputs, &live, max_id),
             Dialect::C => emit_c(&mut src, self, outputs, n_inputs, n_outputs, &live, max_id),
@@ -164,13 +178,25 @@ fn expr_str(graph: &ExprGraph, node: Node, suffix: &str, dialect: Dialect) -> St
     match node {
         Node::Var(n) => format!("x{n}"),
         Node::Lit(bits) => format_literal(f64::from_bits(bits), suffix),
-        Node::Add(a, b) => format!("({} + {})", ref_str(graph, a, suffix), ref_str(graph, b, suffix)),
-        Node::Mul(a, b) => format!("({} * {})", ref_str(graph, a, suffix), ref_str(graph, b, suffix)),
+        Node::Add(a, b) => format!(
+            "({} + {})",
+            ref_str(graph, a, suffix),
+            ref_str(graph, b, suffix)
+        ),
+        Node::Mul(a, b) => format!(
+            "({} * {})",
+            ref_str(graph, a, suffix),
+            ref_str(graph, b, suffix)
+        ),
         Node::Neg(a) => format!("(-{})", ref_str(graph, a, suffix)),
         Node::Recip(a) => format!("(1.0{suffix} / {})", ref_str(graph, a, suffix)),
         Node::Sqrt(a) => format!("sqrt({})", ref_str(graph, a, suffix)),
         Node::Sin(a) => format!("sin({})", ref_str(graph, a, suffix)),
-        Node::Atan2(y, x) => format!("atan2({}, {})", ref_str(graph, y, suffix), ref_str(graph, x, suffix)),
+        Node::Atan2(y, x) => format!(
+            "atan2({}, {})",
+            ref_str(graph, y, suffix),
+            ref_str(graph, x, suffix)
+        ),
         Node::Exp2(a) => format!("exp2({})", ref_str(graph, a, suffix)),
         Node::Log2(a) => format!("log2({})", ref_str(graph, a, suffix)),
         Node::Select(c, a, b) => {
@@ -255,19 +281,44 @@ fn emit_wgsl(
     writeln!(src).unwrap();
 
     // Bindings
-    writeln!(src, "@group(0) @binding(0) var<storage, read> inputs: array<f32>;").unwrap();
-    writeln!(src, "@group(0) @binding(1) var<storage, read_write> outputs: array<f32>;").unwrap();
+    writeln!(
+        src,
+        "@group(0) @binding(0) var<storage, read> inputs: array<f32>;"
+    )
+    .unwrap();
+    writeln!(
+        src,
+        "@group(0) @binding(1) var<storage, read_write> outputs: array<f32>;"
+    )
+    .unwrap();
     writeln!(src, "@group(0) @binding(2) var<uniform> params: Params;").unwrap();
     writeln!(src).unwrap();
 
     // Entry point
     writeln!(src, "@compute @workgroup_size({workgroup_size})").unwrap();
-    writeln!(src, "fn k0(@builtin(global_invocation_id) gid: vec3<u32>) {{").unwrap();
+    writeln!(
+        src,
+        "fn k0(@builtin(global_invocation_id) gid: vec3<u32>) {{"
+    )
+    .unwrap();
     writeln!(src, "    let idx = gid.x;").unwrap();
     writeln!(src, "    if (idx >= params.count) {{ return; }}").unwrap();
     writeln!(src).unwrap();
 
-    emit_body(src, graph, outputs, n_inputs, n_outputs, live, max_id, "    ", "let", "", "idx", Dialect::Wgsl);
+    emit_body(
+        src,
+        graph,
+        outputs,
+        n_inputs,
+        n_outputs,
+        live,
+        max_id,
+        "    ",
+        "let",
+        "",
+        "idx",
+        Dialect::Wgsl,
+    );
 
     writeln!(src, "}}").unwrap();
 }
@@ -298,7 +349,20 @@ fn emit_msl(
     writeln!(src, "    if (gid >= count) {{ return; }}").unwrap();
     writeln!(src).unwrap();
 
-    emit_body(src, graph, outputs, n_inputs, n_outputs, live, max_id, "    ", "float", "f", "gid", Dialect::Msl);
+    emit_body(
+        src,
+        graph,
+        outputs,
+        n_inputs,
+        n_outputs,
+        live,
+        max_id,
+        "    ",
+        "float",
+        "f",
+        "gid",
+        Dialect::Msl,
+    );
 
     writeln!(src, "}}").unwrap();
 }
@@ -328,11 +392,28 @@ fn emit_cuda(
     }
     writeln!(src, "float* __restrict__ outputs,").unwrap();
     writeln!(src, "    const unsigned int count) {{").unwrap();
-    writeln!(src, "    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;").unwrap();
+    writeln!(
+        src,
+        "    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;"
+    )
+    .unwrap();
     writeln!(src, "    if (gid >= count) {{ return; }}").unwrap();
     writeln!(src).unwrap();
 
-    emit_body(src, graph, outputs, n_inputs, n_outputs, live, max_id, "    ", "float", "f", "gid", Dialect::Cuda);
+    emit_body(
+        src,
+        graph,
+        outputs,
+        n_inputs,
+        n_outputs,
+        live,
+        max_id,
+        "    ",
+        "float",
+        "f",
+        "gid",
+        Dialect::Cuda,
+    );
 
     writeln!(src, "}}").unwrap();
 }
@@ -360,7 +441,20 @@ fn emit_c(
     writeln!(src, "    int count) {{").unwrap();
     writeln!(src, "    for (int i = 0; i < count; i++) {{").unwrap();
 
-    emit_body(src, graph, outputs, n_inputs, n_outputs, live, max_id, "        ", "float", "f", "i", Dialect::C);
+    emit_body(
+        src,
+        graph,
+        outputs,
+        n_inputs,
+        n_outputs,
+        live,
+        max_id,
+        "        ",
+        "float",
+        "f",
+        "i",
+        Dialect::C,
+    );
 
     writeln!(src, "    }}").unwrap();
     writeln!(src, "}}").unwrap();
@@ -414,7 +508,9 @@ mod tests {
         let prod = g.mul(x, y);
         let kernel = g.to_kernel(&[prod], 2, Dialect::Cuda);
         assert!(kernel.source.contains("extern \"C\" __global__ void k0("));
-        assert!(kernel.source.contains("blockIdx.x * blockDim.x + threadIdx.x"));
+        assert!(kernel
+            .source
+            .contains("blockIdx.x * blockDim.x + threadIdx.x"));
         // Separate input pointers instead of interleaved buffer
         assert!(kernel.source.contains("const float* __restrict__ in0,"));
         assert!(kernel.source.contains("const float* __restrict__ in1,"));

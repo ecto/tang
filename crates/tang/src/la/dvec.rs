@@ -1,6 +1,6 @@
+use crate::Scalar;
 use alloc::vec::Vec;
 use core::ops::{Add, AddAssign, Index, IndexMut, Mul, MulAssign, Neg, Sub, SubAssign};
-use crate::Scalar;
 
 /// Heap-allocated vector of scalars.
 #[derive(Clone, Debug, PartialEq)]

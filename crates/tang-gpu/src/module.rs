@@ -111,12 +111,7 @@ impl GpuLinear {
 }
 
 impl GpuModule for GpuLinear {
-    fn forward(
-        &self,
-        device: &GpuDevice,
-        cache: &mut KernelCache,
-        input: &GpuTensor,
-    ) -> GpuTensor {
+    fn forward(&self, device: &GpuDevice, cache: &mut KernelCache, input: &GpuTensor) -> GpuTensor {
         // Simple matmul + bias for single vectors
         // input: [in_features], weight: [out_features, in_features]
         // output: [out_features] = weight @ input + bias
@@ -174,7 +169,10 @@ impl GpuTrainModule for GpuLinear {
         cache: &mut KernelCache,
         grad_output: &GpuTensor,
     ) -> GpuTensor {
-        let input = self.cached_input.as_ref().expect("must call forward_train before backward");
+        let input = self
+            .cached_input
+            .as_ref()
+            .expect("must call forward_train before backward");
         let is_batched = input.ndim() == 2;
 
         if is_batched {
@@ -204,10 +202,14 @@ impl GpuTrainModule for GpuLinear {
                 }
             }
             self.weight_grad = Some(GpuTensor::from_slice(
-                device, &gw, &[self.out_features, self.in_features],
+                device,
+                &gw,
+                &[self.out_features, self.in_features],
             ));
             self.bias_grad = Some(GpuTensor::from_slice(
-                device, &go_data, &[self.out_features],
+                device,
+                &go_data,
+                &[self.out_features],
             ));
             // grad_input = W^T @ grad_output
             let w_data = self.weight.buffer.to_vec_sync(device);
@@ -285,8 +287,10 @@ impl GpuAdam {
         if self.m.is_empty() {
             for p in params.iter() {
                 let zeros = vec![0.0f32; p.numel()];
-                self.m.push(GpuTensor::from_slice(device, &zeros, p.shape()));
-                self.v.push(GpuTensor::from_slice(device, &zeros, p.shape()));
+                self.m
+                    .push(GpuTensor::from_slice(device, &zeros, p.shape()));
+                self.v
+                    .push(GpuTensor::from_slice(device, &zeros, p.shape()));
             }
         }
 

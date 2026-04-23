@@ -49,9 +49,15 @@ fn main() {
     let base_image = &output.image;
 
     println!("=== Numerical Gradient Check (Full Pipeline) ===\n");
-    println!("  Gaussian 0: pos=({:.3}, {:.3}, {:.3}) mean2d=({:.3}, {:.3}) radius={}",
-        cloud.positions[0][0], cloud.positions[0][1], cloud.positions[0][2],
-        output.ctx.means_2d[0][0], output.ctx.means_2d[0][1], output.ctx.radii[0]);
+    println!(
+        "  Gaussian 0: pos=({:.3}, {:.3}, {:.3}) mean2d=({:.3}, {:.3}) radius={}",
+        cloud.positions[0][0],
+        cloud.positions[0][1],
+        cloud.positions[0][2],
+        output.ctx.means_2d[0][0],
+        output.ctx.means_2d[0][1],
+        output.ctx.radii[0]
+    );
     println!();
 
     let mut total_checks = 0;
@@ -63,9 +69,14 @@ fn main() {
         let rel_err = abs_diff / denom;
         let ok = rel_err < TOL || abs_diff < ABS_TOL;
         let status = if ok { "OK" } else { "FAIL" };
-        println!("  [{}] fd={:.6} ana={:.6} rel_err={:.4} {}", name, fd, ana, rel_err, status);
+        println!(
+            "  [{}] fd={:.6} ana={:.6} rel_err={:.4} {}",
+            name, fd, ana, rel_err, status
+        );
         total_checks += 1;
-        if ok { passed += 1; }
+        if ok {
+            passed += 1;
+        }
         ok
     };
 
@@ -84,31 +95,90 @@ fn main() {
 
     // Opacity (through sigmoid)
     let sig = 1.0 / (1.0 + (-cloud.opacities[0]).exp());
-    check("opacity", fd(&|c, e| c.opacities[0] += e), grads.opacities[0] * sig * (1.0 - sig));
+    check(
+        "opacity",
+        fd(&|c, e| c.opacities[0] += e),
+        grads.opacities[0] * sig * (1.0 - sig),
+    );
 
     // SH color (DC R channel)
     let _sh_per = cloud.sh_coeffs_per_gaussian();
-    check("sh_r", fd(&|c, e| c.sh_coeffs[0] += e), grads.sh_coeffs[0] * 0.28209479);
-    check("sh_g", fd(&|c, e| c.sh_coeffs[1] += e), grads.sh_coeffs[1] * 0.28209479);
-    check("sh_b", fd(&|c, e| c.sh_coeffs[2] += e), grads.sh_coeffs[2] * 0.28209479);
+    check(
+        "sh_r",
+        fd(&|c, e| c.sh_coeffs[0] += e),
+        grads.sh_coeffs[0] * 0.28209479,
+    );
+    check(
+        "sh_g",
+        fd(&|c, e| c.sh_coeffs[1] += e),
+        grads.sh_coeffs[1] * 0.28209479,
+    );
+    check(
+        "sh_b",
+        fd(&|c, e| c.sh_coeffs[2] += e),
+        grads.sh_coeffs[2] * 0.28209479,
+    );
 
     // Position
-    check("pos_x", fd(&|c, e| c.positions[0][0] += e), grads.positions[0][0]);
-    check("pos_y", fd(&|c, e| c.positions[0][1] += e), grads.positions[0][1]);
-    check("pos_z", fd(&|c, e| c.positions[0][2] += e), grads.positions[0][2]);
+    check(
+        "pos_x",
+        fd(&|c, e| c.positions[0][0] += e),
+        grads.positions[0][0],
+    );
+    check(
+        "pos_y",
+        fd(&|c, e| c.positions[0][1] += e),
+        grads.positions[0][1],
+    );
+    check(
+        "pos_z",
+        fd(&|c, e| c.positions[0][2] += e),
+        grads.positions[0][2],
+    );
 
     // Scale (log-scale)
-    check("scale_x", fd(&|c, e| c.scales[0][0] += e), grads.scales[0][0]);
-    check("scale_y", fd(&|c, e| c.scales[0][1] += e), grads.scales[0][1]);
-    check("scale_z", fd(&|c, e| c.scales[0][2] += e), grads.scales[0][2]);
+    check(
+        "scale_x",
+        fd(&|c, e| c.scales[0][0] += e),
+        grads.scales[0][0],
+    );
+    check(
+        "scale_y",
+        fd(&|c, e| c.scales[0][1] += e),
+        grads.scales[0][1],
+    );
+    check(
+        "scale_z",
+        fd(&|c, e| c.scales[0][2] += e),
+        grads.scales[0][2],
+    );
 
     // Rotation (quaternion)
-    check("rot_w", fd(&|c, e| c.rotations[0][0] += e), grads.rotations[0][0]);
-    check("rot_x", fd(&|c, e| c.rotations[0][1] += e), grads.rotations[0][1]);
-    check("rot_y", fd(&|c, e| c.rotations[0][2] += e), grads.rotations[0][2]);
-    check("rot_z", fd(&|c, e| c.rotations[0][3] += e), grads.rotations[0][3]);
+    check(
+        "rot_w",
+        fd(&|c, e| c.rotations[0][0] += e),
+        grads.rotations[0][0],
+    );
+    check(
+        "rot_x",
+        fd(&|c, e| c.rotations[0][1] += e),
+        grads.rotations[0][1],
+    );
+    check(
+        "rot_y",
+        fd(&|c, e| c.rotations[0][2] += e),
+        grads.rotations[0][2],
+    );
+    check(
+        "rot_z",
+        fd(&|c, e| c.rotations[0][3] += e),
+        grads.rotations[0][3],
+    );
 
-    println!("\n=== Result: {}/{} checks passed ===", passed, total_checks);
+    println!(
+        "\n=== Result: {}/{} checks passed ===",
+        passed, total_checks
+    );
     if passed == total_checks {
         println!("ALL PASSED!");
     } else {

@@ -1,7 +1,7 @@
 use super::{DMat, DVec};
+use crate::Scalar;
 use alloc::vec;
 use alloc::vec::Vec;
-use crate::Scalar;
 
 /// Eigendecomposition of a symmetric matrix: A = V * diag(λ) * V^T
 ///
@@ -346,12 +346,12 @@ impl<S: Scalar> SymmetricEigen<S> {
 /// - Sorting network for eigenvalue ordering
 ///
 /// This makes it safe to trace through symbolic expression graphs.
-pub fn branchless_jacobi_eigen<S: Scalar>(
-    mat: &DMat<S>,
-    n_sweeps: usize,
-) -> (DVec<S>, DMat<S>) {
+pub fn branchless_jacobi_eigen<S: Scalar>(mat: &DMat<S>, n_sweeps: usize) -> (DVec<S>, DMat<S>) {
     let n = mat.nrows();
-    assert!(mat.is_square(), "branchless_jacobi_eigen: matrix must be square");
+    assert!(
+        mat.is_square(),
+        "branchless_jacobi_eigen: matrix must be square"
+    );
 
     // Working copy of the matrix (will be diagonalized in place)
     let mut d = mat.clone();

@@ -74,10 +74,7 @@ pub fn load(path: &Path) -> Result<HashMap<String, Tensor<f64>>, SafetensorsErro
 }
 
 /// Save tensors to a safetensors file (as F64).
-pub fn save(
-    tensors: &HashMap<String, Tensor<f64>>,
-    path: &Path,
-) -> Result<(), SafetensorsError> {
+pub fn save(tensors: &HashMap<String, Tensor<f64>>, path: &Path) -> Result<(), SafetensorsError> {
     // Collect owned data so we can borrow it for TensorView
     let tensor_data: Vec<(String, Vec<u8>, Vec<usize>)> = tensors
         .iter()
@@ -177,7 +174,9 @@ pub fn load_f32(path: &Path) -> Result<HashMap<String, Tensor<f32>>, Safetensors
     deserialize_f32(&tensors)
 }
 
-fn deserialize_f32(tensors: &safetensors_crate::SafeTensors<'_>) -> Result<HashMap<String, Tensor<f32>>, SafetensorsError> {
+fn deserialize_f32(
+    tensors: &safetensors_crate::SafeTensors<'_>,
+) -> Result<HashMap<String, Tensor<f32>>, SafetensorsError> {
     let mut result = HashMap::new();
 
     for (name, view) in tensors.tensors() {
@@ -308,12 +307,12 @@ mod tests {
         let mut tensors = HashMap::new();
         tensors.insert(
             "weight".to_string(),
-            Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], Shape::from_slice(&[2, 3])),
+            Tensor::new(
+                vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                Shape::from_slice(&[2, 3]),
+            ),
         );
-        tensors.insert(
-            "bias".to_string(),
-            Tensor::from_slice(&[0.1, 0.2, 0.3]),
-        );
+        tensors.insert("bias".to_string(), Tensor::from_slice(&[0.1, 0.2, 0.3]));
 
         save(&tensors, &path).unwrap();
         let loaded = load(&path).unwrap();
@@ -373,7 +372,11 @@ mod tests {
         ]);
 
         // Verify naming convention
-        let names: Vec<String> = model.named_parameters().iter().map(|(n, _)| n.clone()).collect();
+        let names: Vec<String> = model
+            .named_parameters()
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
         assert_eq!(names, vec!["0.weight", "0.bias", "2.weight", "2.bias"]);
 
         // Save

@@ -1,6 +1,6 @@
 use super::{DMat, DVec};
-use alloc::vec::Vec;
 use crate::Scalar;
+use alloc::vec::Vec;
 
 /// Singular Value Decomposition: A = U * Σ * V^T
 ///

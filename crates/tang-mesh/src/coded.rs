@@ -63,7 +63,11 @@ impl Shard {
         let block_size = self.data.len() / d_in;
         assert_eq!(self.data.len(), block_size * d_in);
         let seq_len = x.len() / d_in;
-        assert_eq!(x.len(), seq_len * d_in, "input length must be a multiple of d_in");
+        assert_eq!(
+            x.len(),
+            seq_len * d_in,
+            "input length must be a multiple of d_in"
+        );
         let mut out = vec![0.0f32; seq_len * block_size];
         for t in 0..seq_len {
             let x_off = t * d_in;
@@ -357,16 +361,10 @@ impl CompressedGrad {
         indexed.sort_unstable_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap());
         indexed.truncate(k);
 
-        let scale = indexed
-            .iter()
-            .map(|(_, v)| v.abs())
-            .fold(0.0f32, f32::max);
+        let scale = indexed.iter().map(|(_, v)| v.abs()).fold(0.0f32, f32::max);
 
         let (indices, values): (Vec<u32>, Vec<i8>) = if scale < 1e-30 {
-            indexed
-                .iter()
-                .map(|&(i, _)| (i as u32, 0i8))
-                .unzip()
+            indexed.iter().map(|&(i, _)| (i as u32, 0i8)).unzip()
         } else {
             indexed
                 .iter()
@@ -448,11 +446,7 @@ impl CodedModel {
     /// Create a coded model from full (uncoded) weights (single linear layer).
     ///
     /// Convenience wrapper around `from_layer_weights` for single-layer models.
-    pub fn from_weights(
-        weights: &[f32],
-        generator: &Generator,
-        node_index: usize,
-    ) -> Self {
+    pub fn from_weights(weights: &[f32], generator: &Generator, node_index: usize) -> Self {
         Self::from_layer_weights(&[weights], generator, node_index)
     }
 
@@ -484,10 +478,7 @@ impl CodedModel {
 /// `generator` — the shared generator matrix.
 ///
 /// Returns the reconstructed full output (all k blocks concatenated).
-pub fn decode_outputs(
-    generator: &Generator,
-    coded_outputs: &[(usize, &[f32])],
-) -> Vec<f32> {
+pub fn decode_outputs(generator: &Generator, coded_outputs: &[(usize, &[f32])]) -> Vec<f32> {
     let k = generator.k;
     assert_eq!(coded_outputs.len(), k);
     let block_len = coded_outputs[0].1.len();
@@ -534,8 +525,7 @@ pub fn reshape_blocks_to_seq(decoded: &[f32], k: usize, seq_len: usize) -> Vec<f
     for b in 0..k {
         for t in 0..seq_len {
             for s in 0..block_size {
-                out[t * d_out + b * block_size + s] =
-                    decoded[b * block_len + t * block_size + s];
+                out[t * d_out + b * block_size + s] = decoded[b * block_len + t * block_size + s];
             }
         }
     }
@@ -558,8 +548,7 @@ pub fn reshape_seq_to_blocks(seq_major: &[f32], k: usize, seq_len: usize) -> Vec
     for b in 0..k {
         for t in 0..seq_len {
             for s in 0..block_size {
-                out[b * block_len + t * block_size + s] =
-                    seq_major[t * d_out + b * block_size + s];
+                out[b * block_len + t * block_size + s] = seq_major[t * d_out + b * block_size + s];
             }
         }
     }
@@ -668,11 +657,7 @@ mod tests {
         assert_eq!(shards.len(), 5);
 
         // Decode from nodes 0,2,4
-        let decoded = g.decode(&[
-            (0, &shards[0]),
-            (2, &shards[2]),
-            (4, &shards[4]),
-        ]);
+        let decoded = g.decode(&[(0, &shards[0]), (2, &shards[2]), (4, &shards[4])]);
         assert_eq!(decoded.len(), 3);
         for (got, expected) in decoded[0].iter().zip(b0.iter()) {
             assert!((got - expected).abs() < 1e-3, "b0: {got} vs {expected}");
@@ -698,14 +683,9 @@ mod tests {
         for i in 0..5 {
             for j in (i + 1)..5 {
                 for l in (j + 1)..5 {
-                    let decoded = g.decode(&[
-                        (i, &shards[i]),
-                        (j, &shards[j]),
-                        (l, &shards[l]),
-                    ]);
+                    let decoded = g.decode(&[(i, &shards[i]), (j, &shards[j]), (l, &shards[l])]);
                     for (bi, block) in blocks.iter().enumerate() {
-                        for (idx, (&got, &exp)) in
-                            decoded[bi].iter().zip(block.iter()).enumerate()
+                        for (idx, (&got, &exp)) in decoded[bi].iter().zip(block.iter()).enumerate()
                         {
                             assert!(
                                 (got - exp).abs() < 1e-3,
@@ -744,10 +724,7 @@ mod tests {
         }
 
         // Decode and verify
-        let decoded = g.decode(&[
-            (0, &shards[0]),
-            (1, &shards[1]),
-        ]);
+        let decoded = g.decode(&[(0, &shards[0]), (1, &shards[1])]);
         for (got, exp) in decoded[0].iter().zip(expected_b0.iter()) {
             assert!((got - exp).abs() < 1e-4, "b0: {got} vs {exp}");
         }
@@ -866,9 +843,15 @@ mod tests {
 
     #[test]
     fn compress_decompress_roundtrip() {
-        let grad: Vec<f32> = (0..1000).map(|i| {
-            if i < 5 { (i + 1) as f32 * 10.0 } else { i as f32 * 0.001 }
-        }).collect();
+        let grad: Vec<f32> = (0..1000)
+            .map(|i| {
+                if i < 5 {
+                    (i + 1) as f32 * 10.0
+                } else {
+                    i as f32 * 0.001
+                }
+            })
+            .collect();
 
         let compressed = CompressedGrad::compress(&grad, 0.01); // top 1%
         assert_eq!(compressed.indices.len(), 10); // 1000 * 0.01 = 10
@@ -911,10 +894,7 @@ mod tests {
             .collect();
 
         // Any 2 should reconstruct (single-layer model → shards[0])
-        let decoded = g.decode(&[
-            (1, &models[1].shards[0]),
-            (3, &models[3].shards[0]),
-        ]);
+        let decoded = g.decode(&[(1, &models[1].shards[0]), (3, &models[3].shards[0])]);
         let mut reconstructed = decoded[0].clone();
         reconstructed.extend_from_slice(&decoded[1]);
         reconstructed.truncate(weights.len());
@@ -950,7 +930,7 @@ mod tests {
         let w = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0f32]; // (2 rows, 3 cols)
         let x = [
             1.0, 0.5, -1.0, // token 0
-            0.0, 1.0, 0.5,  // token 1
+            0.0, 1.0, 0.5, // token 1
             -0.5, 0.3, 0.8, // token 2
         ];
 

@@ -1,6 +1,6 @@
 use super::{DMat, DVec};
-use alloc::vec::Vec;
 use crate::Scalar;
+use alloc::vec::Vec;
 
 /// LU decomposition with partial pivoting: PA = LU
 pub struct Lu<S> {

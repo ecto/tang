@@ -15,18 +15,18 @@
 
 pub mod crosscheck;
 pub mod expr;
-pub mod growth;
 #[cfg(feature = "gpu")]
 pub mod gpu_search;
+pub mod growth;
 pub mod hp_verify;
 pub mod master;
 pub mod op_arena;
 pub mod op_enum;
 pub mod op_score;
 pub mod operator;
-pub mod shape_bytecode;
 #[cfg(test)]
 mod powskew;
+pub mod shape_bytecode;
 pub mod targets;
 pub mod verify;
 
@@ -38,8 +38,8 @@ pub use expr::{Expr, Leaf, LeafSource};
 pub use growth::{profile, GrowthClass, GrowthProfile};
 pub use operator::{
     CoshAcosh, Edl, Eml, ExpDiff, ExpMinusSqrt, LnDiff, Operator, PowExpSkew, PowLnSkew, PowMinus,
-    PowRatio, PowSkew, SinAsin, SinhAsinh, SinhDiff, SinhLn, SqrDivSqrt, SqrSqrt, TanAtan,
-    TanDiff, TanhAtanh,
+    PowRatio, PowSkew, SinAsin, SinhAsinh, SinhDiff, SinhLn, SqrDivSqrt, SqrSqrt, TanAtan, TanDiff,
+    TanhAtanh,
 };
 pub use targets::{
     standard_constants, standard_functions, stepping_stone_constants, Target, TEST_POINT,

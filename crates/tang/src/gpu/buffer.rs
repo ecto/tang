@@ -129,7 +129,11 @@ impl GpuBuffer {
     }
 
     /// Clone this buffer on GPU, using the kernel cache's batching mode.
-    pub fn clone_gpu_batched(&self, device: &GpuDevice, cache: &mut super::kernel::KernelCache) -> GpuBuffer {
+    pub fn clone_gpu_batched(
+        &self,
+        device: &GpuDevice,
+        cache: &mut super::kernel::KernelCache,
+    ) -> GpuBuffer {
         let dst = Self::uninit(device, self.len);
         let mut encoder = device
             .device

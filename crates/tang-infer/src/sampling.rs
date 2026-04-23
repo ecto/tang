@@ -75,7 +75,10 @@ impl Sampler {
 
     /// Simple LCG random number generator returning [0, 1).
     fn rand_f64(&mut self) -> f64 {
-        self.rng_state = self.rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.rng_state = self
+            .rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (self.rng_state >> 11) as f64 / (1u64 << 53) as f64
     }
 
@@ -197,7 +200,11 @@ fn argmax(values: &[f64]) -> usize {
 fn top_p_filter(probs: &mut [f64], p: f64) {
     // Get sorted indices by probability (descending)
     let mut indices: Vec<usize> = (0..probs.len()).collect();
-    indices.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap_or(core::cmp::Ordering::Equal));
+    indices.sort_by(|&a, &b| {
+        probs[b]
+            .partial_cmp(&probs[a])
+            .unwrap_or(core::cmp::Ordering::Equal)
+    });
 
     let mut cumsum = 0.0;
     let mut cutoff = probs.len();
@@ -341,7 +348,7 @@ mod tests {
     #[test]
     fn repetition_penalty() {
         let config = SamplingConfig {
-            temperature: 0.0, // greedy
+            temperature: 0.0,          // greedy
             repetition_penalty: 100.0, // extreme penalty
             ..Default::default()
         };
@@ -396,9 +403,7 @@ mod tests {
 
         let generated = generate::<f64, _>(
             &[0],
-            &mut |_tokens: &[usize]| -> Tensor<f64> {
-                Tensor::from_slice(&[0.0, 10.0, 0.0])
-            },
+            &mut |_tokens: &[usize]| -> Tensor<f64> { Tensor::from_slice(&[0.0, 10.0, 0.0]) },
             &config,
             42,
         );
@@ -426,6 +431,10 @@ mod tests {
             seen[tok] = true;
         }
         let num_seen = seen.iter().filter(|&&s| s).count();
-        assert!(num_seen >= 3, "high temperature should produce variety, saw {} of 4", num_seen);
+        assert!(
+            num_seen >= 3,
+            "high temperature should produce variety, saw {} of 4",
+            num_seen
+        );
     }
 }

@@ -101,10 +101,7 @@ fn classify(m: &[f64]) -> GrowthClass {
     let prev2 = finite[n - 3];
 
     // Bounded: no meaningful change over the window.
-    if (last / prev).abs() < 1.5
-        && (prev / prev2).abs() < 1.5
-        && last.max(prev).max(prev2) < 10.0
-    {
+    if (last / prev).abs() < 1.5 && (prev / prev2).abs() < 1.5 && last.max(prev).max(prev2) < 10.0 {
         return GrowthClass::Bounded;
     }
 

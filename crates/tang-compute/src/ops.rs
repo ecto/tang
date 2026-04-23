@@ -24,7 +24,11 @@ pub fn bias_add<D: ComputeDevice>(
 ) -> ComputeTensor<D::Buffer> {
     let numel = matrix.numel();
     let dim = bias.numel();
-    assert_eq!(numel % dim, 0, "bias_add: matrix numel not divisible by bias dim");
+    assert_eq!(
+        numel % dim,
+        0,
+        "bias_add: matrix numel not divisible by bias dim"
+    );
     let buf = dev.bias_add(&matrix.buffer, &bias.buffer, numel, dim);
     ComputeTensor::from_buffer(buf, matrix.shape().to_vec())
 }
@@ -54,9 +58,8 @@ pub fn swiglu_backward<D: ComputeDevice>(
     up: &ComputeTensor<D::Buffer>,
 ) -> (ComputeTensor<D::Buffer>, ComputeTensor<D::Buffer>) {
     let numel = grad_output.numel();
-    let (grad_gate_buf, grad_up_buf) = dev.swiglu_backward_buf(
-        &grad_output.buffer, &gate.buffer, &up.buffer, numel,
-    );
+    let (grad_gate_buf, grad_up_buf) =
+        dev.swiglu_backward_buf(&grad_output.buffer, &gate.buffer, &up.buffer, numel);
     (
         ComputeTensor::from_buffer(grad_gate_buf, grad_output.shape().to_vec()),
         ComputeTensor::from_buffer(grad_up_buf, grad_output.shape().to_vec()),
@@ -81,7 +84,11 @@ pub fn causal_attention_backward<D: ComputeDevice>(
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
-) -> (ComputeTensor<D::Buffer>, ComputeTensor<D::Buffer>, ComputeTensor<D::Buffer>) {
+) -> (
+    ComputeTensor<D::Buffer>,
+    ComputeTensor<D::Buffer>,
+    ComputeTensor<D::Buffer>,
+) {
     let total_dim = n_heads * head_dim;
     let kv_dim = n_kv_heads * head_dim;
 
@@ -115,7 +122,11 @@ pub fn causal_attention_backward_with_output<D: ComputeDevice>(
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
-) -> (ComputeTensor<D::Buffer>, ComputeTensor<D::Buffer>, ComputeTensor<D::Buffer>) {
+) -> (
+    ComputeTensor<D::Buffer>,
+    ComputeTensor<D::Buffer>,
+    ComputeTensor<D::Buffer>,
+) {
     let total_dim = n_heads * head_dim;
     let kv_dim = n_kv_heads * head_dim;
 
@@ -200,14 +211,17 @@ mod tests {
         let v = ComputeTensor::from_data(&dev, &[1.0, 2.0, 3.0, 4.0], &[2, 2]);
         let grad_out = ComputeTensor::from_data(&dev, &[1.0, 0.0, 0.0, 1.0], &[2, 2]);
 
-        let (gq, gk, gv) = causal_attention_backward(
-            &dev, &grad_out, &q, &k, &v, 2, 1, 1, 2,
-        );
+        let (gq, gk, gv) = causal_attention_backward(&dev, &grad_out, &q, &k, &v, 2, 1, 1, 2);
         assert_eq!(gq.shape(), &[2, 2]);
         assert_eq!(gk.shape(), &[2, 2]);
         assert_eq!(gv.shape(), &[2, 2]);
         // All gradients should be finite
-        for v in gq.to_vec().iter().chain(gk.to_vec().iter()).chain(gv.to_vec().iter()) {
+        for v in gq
+            .to_vec()
+            .iter()
+            .chain(gk.to_vec().iter())
+            .chain(gv.to_vec().iter())
+        {
             assert!(v.is_finite(), "gradient should be finite");
         }
     }

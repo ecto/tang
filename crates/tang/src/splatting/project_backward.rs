@@ -104,8 +104,8 @@ pub fn backward_projection(
         let v1 = mat3_vec(cov3d, t1); // cov3d * T[1]
 
         let a = dot3(t0, v0) + 0.3; // cov2d[0][0] + low-pass
-        let b = dot3(t0, v1);        // cov2d[0][1]
-        let c = dot3(t1, v1) + 0.3;  // cov2d[1][1] + low-pass
+        let b = dot3(t0, v1); // cov2d[0][1]
+        let c = dot3(t1, v1) + 0.3; // cov2d[1][1] + low-pass
 
         let det = a * c - b * b;
         if det <= 0.0 {
@@ -119,12 +119,10 @@ pub fn backward_projection(
         let dL_cy = dL_dconics[i][1]; // dL/d(conic.y)
         let dL_cz = dL_dconics[i][2]; // dL/d(conic.z)
 
-        let dL_da = det2_inv
-            * (-c * c * dL_cx + b * c * dL_cy - b * b * dL_cz);
-        let dL_db = det2_inv
-            * (2.0 * b * c * dL_cx - (a * c + b * b) * dL_cy + 2.0 * a * b * dL_cz);
-        let dL_dc_val = det2_inv
-            * (-b * b * dL_cx + a * b * dL_cy - a * a * dL_cz);
+        let dL_da = det2_inv * (-c * c * dL_cx + b * c * dL_cy - b * b * dL_cz);
+        let dL_db =
+            det2_inv * (2.0 * b * c * dL_cx - (a * c + b * b) * dL_cy + 2.0 * a * b * dL_cz);
+        let dL_dc_val = det2_inv * (-b * b * dL_cx + a * b * dL_cy - a * a * dL_cz);
 
         // === 2. dL/d{a,b,c} → dL/d(cov3d) ===
         // cov2d_00 = t0 · cov3d · t0^T, cov2d_01 = t0 · cov3d · t1^T, cov2d_11 = t1 · cov3d · t1^T
@@ -132,9 +130,8 @@ pub fn backward_projection(
         let mut dL_dcov3d = [[0.0f32; 3]; 3];
         for p in 0..3 {
             for qq in 0..3 {
-                dL_dcov3d[p][qq] = dL_da * t0[p] * t0[qq]
-                    + dL_db * t0[p] * t1[qq]
-                    + dL_dc_val * t1[p] * t1[qq];
+                dL_dcov3d[p][qq] =
+                    dL_da * t0[p] * t0[qq] + dL_db * t0[p] * t1[qq] + dL_dc_val * t1[p] * t1[qq];
             }
         }
 
@@ -144,8 +141,7 @@ pub fn backward_projection(
         for row in 0..3 {
             for col in 0..3 {
                 for k in 0..3 {
-                    dL_drs[row][col] +=
-                        (dL_dcov3d[row][k] + dL_dcov3d[k][row]) * rs[k][col];
+                    dL_drs[row][col] += (dL_dcov3d[row][k] + dL_dcov3d[k][row]) * rs[k][col];
                 }
             }
         }
@@ -208,8 +204,7 @@ pub fn backward_projection(
         let dL_dm = dL_dmeans2d[i];
         dL_dpos_cam[0] += dL_dm[0] * (fx / depth);
         dL_dpos_cam[1] += dL_dm[1] * (-fy / depth);
-        dL_dpos_cam[2] += dL_dm[0] * (fx * pos_cam[0] / z2)
-            + dL_dm[1] * (-fy * pos_cam[1] / z2);
+        dL_dpos_cam[2] += dL_dm[0] * (fx * pos_cam[0] / z2) + dL_dm[1] * (-fy * pos_cam[1] / z2);
 
         // === 6. dL/d(pos_cam) → dL/d(position) via W^T ===
         for j_idx in 0..3 {
@@ -274,23 +269,38 @@ fn dR_dquat(q: [f32; 4], dL_dR: [[f32; 3]; 3]) -> [f32; 4] {
     // dL/dq_i = sum_{j,k} dL/dR_{jk} * dR_{jk}/dq_i
     // Derivatives of R elements w.r.t. quaternion components:
     let dL_dw = 2.0
-        * (m[0][1] * z + m[0][2] * (-y) + m[1][0] * (-z) + m[1][2] * x + m[2][0] * y
+        * (m[0][1] * z
+            + m[0][2] * (-y)
+            + m[1][0] * (-z)
+            + m[1][2] * x
+            + m[2][0] * y
             + m[2][1] * (-x));
 
     let dL_dx = 2.0
-        * (m[0][1] * y + m[0][2] * z + m[1][0] * y + m[1][1] * (-2.0 * x) + m[1][2] * w
+        * (m[0][1] * y
+            + m[0][2] * z
+            + m[1][0] * y
+            + m[1][1] * (-2.0 * x)
+            + m[1][2] * w
             + m[2][0] * z
             + m[2][1] * (-w)
             + m[2][2] * (-2.0 * x));
 
     let dL_dy = 2.0
-        * (m[0][0] * (-2.0 * y) + m[0][1] * x + m[0][2] * (-w) + m[1][0] * x + m[1][2] * z
+        * (m[0][0] * (-2.0 * y)
+            + m[0][1] * x
+            + m[0][2] * (-w)
+            + m[1][0] * x
+            + m[1][2] * z
             + m[2][0] * w
             + m[2][1] * z
             + m[2][2] * (-2.0 * y));
 
     let dL_dz = 2.0
-        * (m[0][0] * (-2.0 * z) + m[0][1] * w + m[0][2] * x + m[1][0] * (-w)
+        * (m[0][0] * (-2.0 * z)
+            + m[0][1] * w
+            + m[0][2] * x
+            + m[1][0] * (-w)
             + m[1][1] * (-2.0 * z)
             + m[1][2] * y
             + m[2][0] * x

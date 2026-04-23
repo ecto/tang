@@ -64,8 +64,11 @@ impl HoloModel {
         let canonical = CanonicalPredictor::new(config.feature_dim);
         let audio_encoder =
             AudioEncoder::new(config.mel_dim, config.audio_window, config.audio_latent_dim);
-        let cross_attention =
-            CrossAttention::new(config.feature_dim, config.audio_latent_dim, config.attn_head_dim);
+        let cross_attention = CrossAttention::new(
+            config.feature_dim,
+            config.audio_latent_dim,
+            config.attn_head_dim,
+        );
         let deformation = DeformationPredictor::new(config.feature_dim);
 
         // Initialize anchors on a uniform grid in [-1, 1]
@@ -107,11 +110,9 @@ impl HoloModel {
         let features = self.triplane.query_batch(&self.anchors);
 
         // Predict canonical gaussians
-        let canonical = self.canonical.predict(
-            &features,
-            self.config.feature_dim,
-            &self.anchors,
-        );
+        let canonical = self
+            .canonical
+            .predict(&features, self.config.feature_dim, &self.anchors);
 
         if let Some(audio) = audio_window {
             // Encode audio
@@ -121,7 +122,9 @@ impl HoloModel {
             let conditioned = self.cross_attention.forward(&features, &audio_latent);
 
             // Predict deformations
-            let deformations = self.deformation.predict(&conditioned, self.config.feature_dim);
+            let deformations = self
+                .deformation
+                .predict(&conditioned, self.config.feature_dim);
 
             // Apply deformations to canonical cloud
             let canonical_cloud = canonical.to_cloud();

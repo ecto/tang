@@ -34,7 +34,10 @@ impl fmt::Display for MeshError {
             Self::Rpc(msg) => write!(f, "rpc error: {msg}"),
             Self::Serde(msg) => write!(f, "serialization error: {msg}"),
             Self::VersionMismatch { expected, got } => {
-                write!(f, "protocol version mismatch: expected {expected}, got {got}")
+                write!(
+                    f,
+                    "protocol version mismatch: expected {expected}, got {got}"
+                )
             }
             Self::NodeNotFound(id) => write!(f, "node {id} not found in mesh"),
             Self::CompileFailed(msg) => write!(f, "graph compilation failed: {msg}"),

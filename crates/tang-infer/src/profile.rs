@@ -104,12 +104,7 @@ impl Profiler {
     }
 
     /// Record an activation or element-wise layer (no parameters).
-    pub fn record_elementwise(
-        &mut self,
-        name: &str,
-        shape: &[usize],
-        forward_us: u64,
-    ) {
+    pub fn record_elementwise(&mut self, name: &str, shape: &[usize], forward_us: u64) {
         let numel: usize = shape.iter().product();
         self.record(LayerProfile {
             name: String::from(name),
@@ -136,7 +131,8 @@ impl Profiler {
         // QKV projection + output projection
         let num_params = 4 * d_model * d_model;
         // QK^T: B*H * S*S*D, softmax: B*H*S*S, AV: B*H*S*S*D
-        let flops = (batch * num_heads * (2 * seq_len * seq_len * head_dim + seq_len * seq_len)) as u64;
+        let flops =
+            (batch * num_heads * (2 * seq_len * seq_len * head_dim + seq_len * seq_len)) as u64;
         self.record(LayerProfile {
             name: String::from(name),
             forward_us,
@@ -190,22 +186,36 @@ impl Profiler {
         use alloc::fmt::Write;
         let mut s = String::new();
 
-        let _ = writeln!(s, "{:<30} {:>12} {:>10} {:>12} {:>10}",
-            "Layer", "Output Shape", "Params", "FLOPs", "Time (μs)");
+        let _ = writeln!(
+            s,
+            "{:<30} {:>12} {:>10} {:>12} {:>10}",
+            "Layer", "Output Shape", "Params", "FLOPs", "Time (μs)"
+        );
         let _ = writeln!(s, "{}", "-".repeat(78));
 
         for l in &self.layers {
             let shape_str = format!("{:?}", l.output_shape);
-            let _ = writeln!(s, "{:<30} {:>12} {:>10} {:>12} {:>10}",
-                l.name, shape_str, l.num_params, l.flops, l.forward_us);
+            let _ = writeln!(
+                s,
+                "{:<30} {:>12} {:>10} {:>12} {:>10}",
+                l.name, shape_str, l.num_params, l.flops, l.forward_us
+            );
         }
 
         let _ = writeln!(s, "{}", "-".repeat(78));
         let _ = writeln!(s, "Total params: {}", self.total_params());
         let _ = writeln!(s, "Total FLOPs: {}", self.total_flops());
         let _ = writeln!(s, "Total time: {} μs", self.total_time_us());
-        let _ = writeln!(s, "Param memory: {:.2} MB", self.param_memory_bytes() as f64 / 1_048_576.0);
-        let _ = writeln!(s, "Peak activation memory: {:.2} MB", self.peak_memory_bytes() as f64 / 1_048_576.0);
+        let _ = writeln!(
+            s,
+            "Param memory: {:.2} MB",
+            self.param_memory_bytes() as f64 / 1_048_576.0
+        );
+        let _ = writeln!(
+            s,
+            "Peak activation memory: {:.2} MB",
+            self.peak_memory_bytes() as f64 / 1_048_576.0
+        );
 
         s
     }

@@ -418,9 +418,36 @@ pub fn for_each_tree(max_size: usize, mut f: impl FnMut(&Arc<OpExpr>)) {
 /// certainly semantically equivalent to another with the same profile,
 /// modulo Schanuel. More test points = fewer false dedup collapses.
 const TEST_PAIRS: [(C, C); 5] = [
-    (C { re: 0.5772156649015329, im: 0.0 }, C { re: 1.2824271291006226, im: 0.0 }),
-    (C { re: 1.2824271291006226, im: 0.0 }, C { re: 0.9159655941772190, im: 0.0 }),
-    (C { re: 0.9159655941772190, im: 0.0 }, C { re: 0.5772156649015329, im: 0.0 }),
+    (
+        C {
+            re: 0.5772156649015329,
+            im: 0.0,
+        },
+        C {
+            re: 1.2824271291006226,
+            im: 0.0,
+        },
+    ),
+    (
+        C {
+            re: 1.2824271291006226,
+            im: 0.0,
+        },
+        C {
+            re: 0.9159655941772190,
+            im: 0.0,
+        },
+    ),
+    (
+        C {
+            re: 0.9159655941772190,
+            im: 0.0,
+        },
+        C {
+            re: 0.5772156649015329,
+            im: 0.0,
+        },
+    ),
     (C { re: 1.5, im: 0.3 }, C { re: 0.7, im: -0.4 }),
     (C { re: 0.4, im: 1.1 }, C { re: -0.6, im: 0.8 }),
 ];

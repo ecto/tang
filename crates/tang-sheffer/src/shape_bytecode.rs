@@ -201,10 +201,7 @@ pub fn build_shape_table(max_size: usize) -> ShapeTable {
 
 /// Reconstruct an `OpExpr` from a shape and assignment index, using
 /// the same base-6/10/5 decoding order as the GPU kernel.
-pub fn reconstruct_opexpr(
-    shape: &Shape,
-    assignment_idx: u64,
-) -> crate::op_enum::OpExpr {
+pub fn reconstruct_opexpr(shape: &Shape, assignment_idx: u64) -> crate::op_enum::OpExpr {
     let (a, u, b) = shape.slots();
     let mut remaining = assignment_idx;
 

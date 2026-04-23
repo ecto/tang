@@ -12,8 +12,8 @@ use tang_gpu::*;
 // --- Vocabulary ---------------------------------------------------------------
 
 const VOCAB: [char; 30] = [
-    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r',
-    's', 't', 'u', 'v', 'w', 'x', 'y', 'z', ' ', '\n', ',', '.',
+    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's',
+    't', 'u', 'v', 'w', 'x', 'y', 'z', ' ', '\n', ',', '.',
 ];
 
 fn char_to_idx(c: char) -> Option<usize> {
@@ -145,7 +145,10 @@ fn build_dataset() -> (Vec<f32>, Vec<f32>, usize) {
 
 fn sample_with_temperature(probs: &[f32], temperature: f32, hash_seed: u64) -> usize {
     // Apply temperature to log-probs, then re-normalize
-    let log_probs: Vec<f32> = probs.iter().map(|&p| p.max(1e-12).ln() / temperature).collect();
+    let log_probs: Vec<f32> = probs
+        .iter()
+        .map(|&p| p.max(1e-12).ln() / temperature)
+        .collect();
     let max_lp = log_probs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let exp: Vec<f32> = log_probs.iter().map(|&lp| (lp - max_lp).exp()).collect();
     let sum: f32 = exp.iter().sum();
@@ -196,8 +199,7 @@ fn main() {
 
     // Train
     println!("training...");
-    let mut trainer = GpuTrainer::new(0.005, 200)
-        .with_loss_fn(gpu_cross_entropy_loss);
+    let mut trainer = GpuTrainer::new(0.005, 200).with_loss_fn(gpu_cross_entropy_loss);
     let losses = trainer.fit(&device, &mut cache, &mut model, &mut loader);
 
     for (i, &loss) in losses.iter().enumerate() {
@@ -235,7 +237,10 @@ fn main() {
             let logits_data = logits.to_vec_sync(&device);
 
             // Softmax on CPU for sampling
-            let max_val = logits_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let max_val = logits_data
+                .iter()
+                .cloned()
+                .fold(f32::NEG_INFINITY, f32::max);
             let exp: Vec<f32> = logits_data.iter().map(|&x| (x - max_val).exp()).collect();
             let sum: f32 = exp.iter().sum();
             let probs: Vec<f32> = exp.iter().map(|&e| e / sum).collect();

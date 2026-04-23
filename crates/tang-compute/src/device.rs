@@ -24,10 +24,14 @@ pub trait ComputeDevice: Send {
     fn dialect(&self) -> Dialect;
 
     /// Total device memory in bytes (VRAM). Returns 0 if unknown.
-    fn total_memory_bytes(&self) -> usize { 0 }
+    fn total_memory_bytes(&self) -> usize {
+        0
+    }
 
     /// Free device memory in bytes. Returns 0 if unknown.
-    fn free_memory_bytes(&self) -> usize { 0 }
+    fn free_memory_bytes(&self) -> usize {
+        0
+    }
 
     /// Release cached buffers in the device memory pool. No-op on devices
     /// without pooling. Call between long-running phases to prevent
@@ -36,7 +40,9 @@ pub trait ComputeDevice: Send {
 
     /// Peak FLOPS for FP32 compute. Used for MFU calculation.
     /// Returns None if unknown.
-    fn peak_flops_f32(&self) -> Option<f64> { None }
+    fn peak_flops_f32(&self) -> Option<f64> {
+        None
+    }
 
     // -- Buffer lifecycle --
 
@@ -110,12 +116,7 @@ pub trait ComputeDevice: Send {
     ) -> Self::Buffer;
 
     /// Row-wise softmax: each of `n_rows` rows of length `row_len`.
-    fn softmax(
-        &self,
-        data: &Self::Buffer,
-        n_rows: usize,
-        row_len: usize,
-    ) -> Self::Buffer;
+    fn softmax(&self, data: &Self::Buffer, n_rows: usize, row_len: usize) -> Self::Buffer;
 
     /// RMS normalization: x * weight / sqrt(mean(x^2) + eps).
     fn rms_norm(
@@ -137,12 +138,7 @@ pub trait ComputeDevice: Send {
     ) -> Self::Buffer;
 
     /// Reduce sum along an axis.
-    fn reduce_sum(
-        &self,
-        data: &Self::Buffer,
-        shape: &[usize],
-        axis: usize,
-    ) -> Self::Buffer;
+    fn reduce_sum(&self, data: &Self::Buffer, shape: &[usize], axis: usize) -> Self::Buffer;
 
     /// Causal self-attention with GQA: Q,K,V → output.
     /// Q: [seq_len, n_heads * head_dim], K,V: [seq_len, n_kv_heads * head_dim].
@@ -180,12 +176,7 @@ pub trait ComputeDevice: Send {
     ) -> Self::Buffer;
 
     /// Transpose a 2D matrix on device: [rows, cols] → [cols, rows].
-    fn transpose_2d(
-        &self,
-        buf: &Self::Buffer,
-        rows: usize,
-        cols: usize,
-    ) -> Self::Buffer;
+    fn transpose_2d(&self, buf: &Self::Buffer, rows: usize, cols: usize) -> Self::Buffer;
 
     /// Backward pass for row-wise softmax.
     ///
@@ -284,7 +275,8 @@ pub trait ComputeDevice: Send {
             let q_b = self.slice_buffer(q, b * seq_len * total_dim, seq_len * total_dim);
             let k_b = self.slice_buffer(k, b * seq_len * kv_dim, seq_len * kv_dim);
             let v_b = self.slice_buffer(v, b * seq_len * kv_dim, seq_len * kv_dim);
-            let o_b = self.causal_attention(&q_b, &k_b, &v_b, seq_len, n_heads, n_kv_heads, head_dim);
+            let o_b =
+                self.causal_attention(&q_b, &k_b, &v_b, seq_len, n_heads, n_kv_heads, head_dim);
             self.write_into(&mut out, b * seq_len * total_dim, &o_b);
         }
         out
@@ -308,7 +300,15 @@ pub trait ComputeDevice: Send {
     ) -> (Self::Buffer, Self::Buffer, Self::Buffer) {
         if batch_size == 1 {
             return self.causal_attention_backward_with_output(
-                grad_output, q, k, v, output, seq_len, n_heads, n_kv_heads, head_dim,
+                grad_output,
+                q,
+                k,
+                v,
+                output,
+                seq_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
             );
         }
         let total_dim = n_heads * head_dim;
@@ -375,7 +375,13 @@ pub trait ComputeDevice: Send {
     /// Broadcast bias addition on device: out[i] = matrix[i] + bias[i % dim].
     ///
     /// `numel` is total elements in matrix, `dim` is the bias length.
-    fn bias_add(&self, matrix: &Self::Buffer, bias: &Self::Buffer, numel: usize, dim: usize) -> Self::Buffer {
+    fn bias_add(
+        &self,
+        matrix: &Self::Buffer,
+        bias: &Self::Buffer,
+        numel: usize,
+        dim: usize,
+    ) -> Self::Buffer {
         let mat_data = self.download(matrix);
         let bias_data = self.download(bias);
         let mut out = mat_data;
@@ -406,8 +412,8 @@ pub trait ComputeDevice: Send {
     /// `b` is stored as [n,k] row-major (logically transposed to [k,n]).
     fn matmul_b_transposed(
         &self,
-        a: &Self::Buffer,       // [m, k] row-major
-        b: &Self::Buffer,       // [n, k] row-major (transposed logically)
+        a: &Self::Buffer, // [m, k] row-major
+        b: &Self::Buffer, // [n, k] row-major (transposed logically)
         m: usize,
         k: usize,
         n: usize,
@@ -421,8 +427,8 @@ pub trait ComputeDevice: Send {
     /// `a` is stored as [k,m] row-major. Avoids materializing the transpose.
     fn matmul_a_transposed(
         &self,
-        a: &Self::Buffer,  // [k, m] row-major (will be logically transposed)
-        b: &Self::Buffer,   // [k, n] row-major
+        a: &Self::Buffer, // [k, m] row-major (will be logically transposed)
+        b: &Self::Buffer, // [k, n] row-major
         m: usize,
         k: usize,
         n: usize,
@@ -436,8 +442,8 @@ pub trait ComputeDevice: Send {
     /// `a` is stored as [k,m] row-major. Avoids materializing the transpose.
     fn matmul_accumulate_a_transposed(
         &self,
-        a: &Self::Buffer,  // [k, m] row-major (will be logically transposed)
-        b: &Self::Buffer,   // [k, n] row-major
+        a: &Self::Buffer,     // [k, m] row-major (will be logically transposed)
+        b: &Self::Buffer,     // [k, n] row-major
         c: &mut Self::Buffer, // [m, n] row-major, accumulated
         m: usize,
         k: usize,
@@ -493,7 +499,13 @@ pub trait ComputeDevice: Send {
     ) -> Self::Buffer {
         // Default: unfused path
         let gi = self.rms_norm_backward_accumulate(
-            input, weight, grad_output, n_groups, dim, eps, grad_weight_acc,
+            input,
+            weight,
+            grad_output,
+            n_groups,
+            dim,
+            eps,
+            grad_weight_acc,
         );
         self.add_tensors_buf(&gi, residual_grad, n_groups * dim)
     }
@@ -689,8 +701,7 @@ pub trait ComputeDevice: Send {
         let cos_table = self.download(cos_buf);
         let sin_table = self.download(sin_buf);
         self.rope_forward(
-            input, &cos_table, &sin_table,
-            seq_len, n_heads, head_dim, start_pos,
+            input, &cos_table, &sin_table, seq_len, n_heads, head_dim, start_pos,
         )
     }
 
@@ -711,8 +722,14 @@ pub trait ComputeDevice: Send {
         let cos_table = self.download(cos_buf);
         let sin_table = self.download(sin_buf);
         self.rope_backward_batched(
-            grad_output, &cos_table, &sin_table,
-            total_rows, seq_len, n_heads, head_dim, start_pos,
+            grad_output,
+            &cos_table,
+            &sin_table,
+            total_rows,
+            seq_len,
+            n_heads,
+            head_dim,
+            start_pos,
         )
     }
 
@@ -724,7 +741,12 @@ pub trait ComputeDevice: Send {
 
     /// SwiGLU activation: out[i] = silu(gate[i]) * up[i].
     /// Default: delegates to elementwise(). Override for fused bf16 kernel.
-    fn swiglu_fused_buf(&self, gate: &Self::Buffer, up: &Self::Buffer, numel: usize) -> Self::Buffer {
+    fn swiglu_fused_buf(
+        &self,
+        gate: &Self::Buffer,
+        up: &Self::Buffer,
+        numel: usize,
+    ) -> Self::Buffer {
         use tang::Scalar;
         self.elementwise(&[gate, up], numel, &|ids| {
             let one = ExprId::from_f64(1.0);

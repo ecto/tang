@@ -60,11 +60,7 @@ fn bench_linear_forward(c: &mut Criterion) {
 
     c.bench_function("gpu_linear_forward_128x64", |bench| {
         let mut linear = GpuLinear::kaiming(&device, 128, 64, 42);
-        let input = GpuTensor::from_slice(
-            &device,
-            &vec![0.1f32; 4 * 128],
-            &[4, 128],
-        );
+        let input = GpuTensor::from_slice(&device, &vec![0.1f32; 4 * 128], &[4, 128]);
         bench.iter(|| {
             let out = linear.forward_train(&device, &mut cache, &input);
             black_box(out);
@@ -78,18 +74,10 @@ fn bench_linear_backward(c: &mut Criterion) {
 
     c.bench_function("gpu_linear_backward_128x64", |bench| {
         let mut linear = GpuLinear::kaiming(&device, 128, 64, 42);
-        let input = GpuTensor::from_slice(
-            &device,
-            &vec![0.1f32; 4 * 128],
-            &[4, 128],
-        );
+        let input = GpuTensor::from_slice(&device, &vec![0.1f32; 4 * 128], &[4, 128]);
         // Forward first to cache input
         let _ = linear.forward_train(&device, &mut cache, &input);
-        let grad_out = GpuTensor::from_slice(
-            &device,
-            &vec![0.01f32; 4 * 64],
-            &[4, 64],
-        );
+        let grad_out = GpuTensor::from_slice(&device, &vec![0.01f32; 4 * 64], &[4, 64]);
         bench.iter(|| {
             let gi = linear.backward(&device, &mut cache, &grad_out);
             black_box(gi);
@@ -132,7 +120,9 @@ fn bench_training_step(c: &mut Criterion) {
         let mut loader = GpuDataLoader::new(
             vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0],
             vec![0.0, 1.0, 1.0, 0.0],
-            2, 1, 4,
+            2,
+            1,
+            4,
         );
         let mut trainer = GpuTrainer::new(0.01, 1);
 
