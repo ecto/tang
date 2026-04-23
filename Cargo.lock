@@ -5949,6 +5949,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "tang-sheffer"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "num-complex",
+ "pollster",
+ "rayon",
+ "wgpu",
+]
+
+[[package]]
+name = "tang-sheffer-wasm"
+version = "0.1.0"
+dependencies = [
+ "num-complex",
+ "tang-sheffer",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "tang-site-wasm"
 version = "0.1.0"
 dependencies = [

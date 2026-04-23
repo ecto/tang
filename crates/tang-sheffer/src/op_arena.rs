@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use crate::op_enum::{Atom, BinaryOp, UnaryOp};
 use crate::operator::Operator;
-use crate::verify::{quantize, ValueKey};
+use crate::verify::quantize;
 use crate::C;
 
 /// Handle into an `OpArena`. 32 bits is enough for any enumeration we'd
@@ -214,7 +214,7 @@ pub fn for_each_tree_in_arena(
     }
     // Build the cache up to max_size - 1, then stream max_size.
     let cache_up_to = max_size.saturating_sub(1).max(1);
-    let (mut arena, by_size) = build_arena(cache_up_to);
+    let (arena, by_size) = build_arena(cache_up_to);
 
     // Stream sizes 1..=cache_up_to first: they're already in the arena.
     for n in 1..=cache_up_to {

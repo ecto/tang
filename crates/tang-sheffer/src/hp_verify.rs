@@ -22,7 +22,7 @@
 //! blatant artifacts). We use 1e-8 by default.
 
 use crate::expr::{Expr, Leaf, LeafSource};
-use crate::op_enum::{Atom, BinaryOp, OpExpr, UnaryOp};
+use crate::op_enum::{BinaryOp, OpExpr, UnaryOp};
 use crate::C;
 
 /// Threshold for the `(1+ε)^(1/ε)` limit detector. Any pow call with
