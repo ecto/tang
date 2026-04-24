@@ -10,8 +10,8 @@
 //! on pathological inputs but ~2x the throughput and trivially
 //! vectorizable.
 
-use core::any::TypeId;
 use crate::Scalar;
+use core::any::TypeId;
 
 /// All four moments computed together in two passes.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -186,8 +186,7 @@ fn sum_generic<S: Scalar>(x: &[S]) -> S {
 fn dispatch_f32<S: Scalar>(x: &[S], f: fn(&[f32]) -> f32) -> Option<S> {
     if TypeId::of::<S>() == TypeId::of::<f32>() {
         // SAFETY: S == f32 verified by TypeId.
-        let xs: &[f32] =
-            unsafe { core::slice::from_raw_parts(x.as_ptr() as *const f32, x.len()) };
+        let xs: &[f32] = unsafe { core::slice::from_raw_parts(x.as_ptr() as *const f32, x.len()) };
         let r = f(xs);
         Some(unsafe { core::mem::transmute_copy::<f32, S>(&r) })
     } else {
@@ -198,8 +197,7 @@ fn dispatch_f32<S: Scalar>(x: &[S], f: fn(&[f32]) -> f32) -> Option<S> {
 #[inline]
 fn dispatch_f64<S: Scalar>(x: &[S], f: fn(&[f64]) -> f64) -> Option<S> {
     if TypeId::of::<S>() == TypeId::of::<f64>() {
-        let xs: &[f64] =
-            unsafe { core::slice::from_raw_parts(x.as_ptr() as *const f64, x.len()) };
+        let xs: &[f64] = unsafe { core::slice::from_raw_parts(x.as_ptr() as *const f64, x.len()) };
         let r = f(xs);
         Some(unsafe { core::mem::transmute_copy::<f64, S>(&r) })
     } else {
@@ -214,8 +212,7 @@ fn dispatch_f32_moments<S: Scalar>(
     f: fn(&[f32], f32) -> (f32, f32, f32),
 ) -> Option<(S, S, S, S)> {
     if TypeId::of::<S>() == TypeId::of::<f32>() {
-        let xs: &[f32] =
-            unsafe { core::slice::from_raw_parts(x.as_ptr() as *const f32, x.len()) };
+        let xs: &[f32] = unsafe { core::slice::from_raw_parts(x.as_ptr() as *const f32, x.len()) };
         let m: f32 = unsafe { core::mem::transmute_copy::<S, f32>(&mean) };
         let (m2, m3, m4) = f(xs, m);
         let cvt = |v: f32| -> S { unsafe { core::mem::transmute_copy::<f32, S>(&v) } };
@@ -232,8 +229,7 @@ fn dispatch_f64_moments<S: Scalar>(
     f: fn(&[f64], f64) -> (f64, f64, f64),
 ) -> Option<(S, S, S, S)> {
     if TypeId::of::<S>() == TypeId::of::<f64>() {
-        let xs: &[f64] =
-            unsafe { core::slice::from_raw_parts(x.as_ptr() as *const f64, x.len()) };
+        let xs: &[f64] = unsafe { core::slice::from_raw_parts(x.as_ptr() as *const f64, x.len()) };
         let m: f64 = unsafe { core::mem::transmute_copy::<S, f64>(&mean) };
         let (m2, m3, m4) = f(xs, m);
         let cvt = |v: f64| -> S { unsafe { core::mem::transmute_copy::<f64, S>(&v) } };
@@ -822,8 +818,16 @@ mod tests {
                 n,
                 mean: x.iter().sum::<f64>() / nn,
                 variance: m2r,
-                skewness: if m2r > 0.0 { m3r / (m2r.sqrt() * m2r) } else { 0.0 },
-                kurtosis: if m2r > 0.0 { m4r / (m2r * m2r) - 3.0 } else { 0.0 },
+                skewness: if m2r > 0.0 {
+                    m3r / (m2r.sqrt() * m2r)
+                } else {
+                    0.0
+                },
+                kurtosis: if m2r > 0.0 {
+                    m4r / (m2r * m2r) - 3.0
+                } else {
+                    0.0
+                },
             };
             let got = moments(&x);
             assert_relative_eq!(got.mean, want.mean, max_relative = 1e-12);
