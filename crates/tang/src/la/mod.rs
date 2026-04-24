@@ -19,6 +19,7 @@ mod dvec;
 mod eigen;
 mod lu;
 mod qr;
+pub mod stats;
 mod svd;
 
 pub use cholesky::Cholesky;
@@ -27,4 +28,8 @@ pub use dvec::DVec;
 pub use eigen::{branchless_jacobi_eigen, SymmetricEigen};
 pub use lu::Lu;
 pub use qr::Qr;
+pub use stats::{
+    central_moment, kurtosis, kurtosis_raw, mean, moments, skewness, stddev, stddev_sample,
+    variance, variance_sample, Moments,
+};
 pub use svd::Svd;

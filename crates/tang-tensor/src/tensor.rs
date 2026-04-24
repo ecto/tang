@@ -352,6 +352,31 @@ impl<S: Scalar> Tensor<S> {
         self.sum() / S::from_f64(self.numel() as f64)
     }
 
+    /// Population variance of all elements (SIMD-accelerated for f32/f64).
+    pub fn variance(&self) -> S {
+        tang_la::variance(&self.data)
+    }
+
+    /// Population standard deviation of all elements.
+    pub fn stddev(&self) -> S {
+        tang_la::stddev(&self.data)
+    }
+
+    /// Method-of-moments skewness of all elements.
+    pub fn skewness(&self) -> S {
+        tang_la::skewness(&self.data)
+    }
+
+    /// Excess kurtosis of all elements (normal distribution = 0).
+    pub fn kurtosis(&self) -> S {
+        tang_la::kurtosis(&self.data)
+    }
+
+    /// Mean and all four central moments in two passes.
+    pub fn moments(&self) -> tang_la::Moments<S> {
+        tang_la::moments(&self.data)
+    }
+
     /// Max element.
     pub fn max(&self) -> S {
         let mut m = self.data[0];
