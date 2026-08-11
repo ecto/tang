@@ -10,6 +10,7 @@ default = ["std"]
 std = ["tang/std"]
 accelerate = ["std"]
 faer = ["dep:faer"]
+algebraic = ["tang/algebraic"]
 
 [dependencies]
 tang = { workspace = true }

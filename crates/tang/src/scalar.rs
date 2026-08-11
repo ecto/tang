@@ -73,6 +73,27 @@ pub trait Scalar:
 
     /// Branchless select: returns `a` if `cond > 0`, else `b`.
     fn select(cond: Self, a: Self, b: Self) -> Self;
+
+    /// Reassociable add: with the `algebraic` feature on f32/f64 the compiler
+    /// may reorder/vectorize chains of these (result varies by ~1 ulp per
+    /// element vs strict order). Defaults to strict `+` so Dual, Interval,
+    /// and non-feature builds are bit-identical to today.
+    #[inline]
+    fn alg_add(self, other: Self) -> Self {
+        self + other
+    }
+
+    /// Reassociable sub — see [`Scalar::alg_add`].
+    #[inline]
+    fn alg_sub(self, other: Self) -> Self {
+        self - other
+    }
+
+    /// Reassociable mul — see [`Scalar::alg_add`].
+    #[inline]
+    fn alg_mul(self, other: Self) -> Self {
+        self * other
+    }
 }
 
 // In std mode, use inherent float methods. In no_std, use libm.
@@ -510,6 +531,13 @@ macro_rules! impl_scalar_float {
             #[inline] fn select(cond: Self, a: Self, b: Self) -> Self {
                 if cond > 0.0 as $t { a } else { b }
             }
+
+            #[cfg(feature = "algebraic")]
+            #[inline] fn alg_add(self, other: Self) -> Self { <$t>::algebraic_add(self, other) }
+            #[cfg(feature = "algebraic")]
+            #[inline] fn alg_sub(self, other: Self) -> Self { <$t>::algebraic_sub(self, other) }
+            #[cfg(feature = "algebraic")]
+            #[inline] fn alg_mul(self, other: Self) -> Self { <$t>::algebraic_mul(self, other) }
         }
         }
     };
