@@ -81,9 +81,11 @@ impl<S: Scalar> DVec<S> {
     /// Dot product.
     pub fn dot(&self, other: &DVec<S>) -> S {
         assert_eq!(self.len(), other.len(), "DVec dot: length mismatch");
+        // alg_add/alg_mul are strict + and * unless the `algebraic` feature is
+        // enabled, which lets the compiler vectorize the reduction.
         let mut sum = S::ZERO;
         for i in 0..self.len() {
-            sum += self.data[i] * other.data[i];
+            sum = sum.alg_add(self.data[i].alg_mul(other.data[i]));
         }
         sum
     }

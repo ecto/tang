@@ -13,6 +13,8 @@ bytemuck = ["dep:bytemuck"]
 serde = ["dep:serde"]
 exact = ["dep:robust", "std"]
 libm = ["dep:libm"]
+# Reassociable float ops (algebraic_add/mul) in hot reductions. Requires Rust 1.98+.
+algebraic = []
 
 # Extended modules
 la = ["std"]
