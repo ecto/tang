@@ -99,6 +99,8 @@ Arrows point from dependee → dependent. Two independent trees (`tang-la` for a
 
 **No heavyweight dependencies.** Core types are hand-rolled `#[repr(C)]` with optional `bytemuck` and `serde` support. Dense LA is native Rust, generic over `Scalar`. An optional `faer` feature enables world-class f64 performance.
 
+**Opt-in float reassociation.** The `algebraic` feature compiles reduction inner loops (`Scalar::alg_add`/`alg_sub`/`alg_mul`) to Rust's `algebraic_*` ops, letting the compiler reorder and vectorize float chains — ~4x on dot products. Two caveats. First, results drift ~1 ulp per element versus a strict build, so skip it if you have a pinned numeric baseline. Second, **cargo features are additive and global**: if any crate in your dependency graph enables `tang/algebraic`, it is on for every tang consumer in that build, and you cannot opt out locally. Code whose evaluation order is load-bearing — the exact predicates in `crates/tang/src/predicates.rs`, the SVD Jacobi sweeps, any compensated summation — never uses the `alg_*` ops and is unaffected; `crates/tang/tests/algebraic_forbidden.rs` enforces that. `algebraic` and `exact` are compatible on purpose, since boolean geometry wants exact predicates and fast solvers at once.
+
 **Physics-native ML.** The same types that run your constraint solver and physics engine also train your neural nets. `tang-tensor` → `tang-ad` → `tang-optim` → `tang-train` is a complete differentiable programming stack.
 
 **Distributed by default.** `tang-mesh` ships expression graphs — not tensors — over QUIC. Each worker compiles locally to its own GPU backend. Data-parallel, pipeline-parallel, and tensor-parallel strategies with fault tolerance.

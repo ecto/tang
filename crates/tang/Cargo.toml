@@ -14,6 +14,17 @@ serde = ["dep:serde"]
 exact = ["dep:robust", "std"]
 libm = ["dep:libm"]
 # Reassociable float ops (algebraic_add/mul) in hot reductions. Requires Rust 1.98+.
+#
+# WARNING: cargo features are additive and global. If ANY crate in the build
+# graph enables `tang/algebraic`, it is on for every tang consumer in that
+# build — you cannot opt out locally. Results then differ from a strict build by
+# ~1 ulp per element in reductions (dot, norm, sum). Don't enable it in a build
+# that has a pinned numeric baseline.
+#
+# It is deliberately NOT mutually exclusive with `exact`: consumers such as vcad
+# legitimately want exact predicates for boolean geometry *and* fast solvers in
+# the same build. Order-sensitive code is kept safe by never calling the alg_*
+# ops, enforced by crates/tang/tests/algebraic_forbidden.rs.
 algebraic = []
 
 # Extended modules
