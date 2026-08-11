@@ -188,11 +188,11 @@ impl<S: Scalar> DMat<S> {
             }
         }
 
-        let mut y = DVec::zeros(self.nrows);
+        let mut y: DVec<S> = DVec::zeros(self.nrows);
         for j in 0..self.ncols {
             let xj = x[j];
             for i in 0..self.nrows {
-                y[i] += self.get(i, j) * xj;
+                y[i] = y[i].alg_add(self.get(i, j).alg_mul(xj));
             }
         }
         y
@@ -244,7 +244,7 @@ impl<S: Scalar> DMat<S> {
 
         let a = self.as_slice();
         let b = rhs.as_slice();
-        let c_data = c.as_mut_slice();
+        let c_data: &mut [S] = c.as_mut_slice();
 
         for j in 0..n {
             let c_col = j * m;
@@ -252,7 +252,7 @@ impl<S: Scalar> DMat<S> {
                 let b_kj = b[j * rhs.nrows + k];
                 let a_col = k * m;
                 for i in 0..m {
-                    c_data[c_col + i] = c_data[c_col + i] + a[a_col + i] * b_kj;
+                    c_data[c_col + i] = c_data[c_col + i].alg_add(a[a_col + i].alg_mul(b_kj));
                 }
             }
         }
@@ -264,7 +264,7 @@ impl<S: Scalar> DMat<S> {
     pub fn norm_sq(&self) -> S {
         let mut s = S::ZERO;
         for &x in &self.data {
-            s += x * x;
+            s = s.alg_add(x.alg_mul(x));
         }
         s
     }
@@ -279,7 +279,7 @@ impl<S: Scalar> DMat<S> {
         let n = self.nrows.min(self.ncols);
         let mut s = S::ZERO;
         for i in 0..n {
-            s += self.get(i, i);
+            s = s.alg_add(self.get(i, i));
         }
         s
     }

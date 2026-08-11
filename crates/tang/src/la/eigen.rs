@@ -138,7 +138,7 @@ impl<S: Scalar> SymmetricEigen<S> {
             // Compute the Householder vector for column k, rows k+1..n
             let mut x_norm_sq = S::ZERO;
             for i in (k + 1)..n {
-                x_norm_sq += a.get(i, k) * a.get(i, k);
+                x_norm_sq = x_norm_sq.alg_add(a.get(i, k).alg_mul(a.get(i, k)));
             }
 
             if x_norm_sq < S::EPSILON * S::EPSILON {
@@ -186,7 +186,7 @@ impl<S: Scalar> SymmetricEigen<S> {
             // Step 2: beta = (tau/2) * v^T * p
             let mut beta = S::ZERO;
             for i in (k + 1)..n {
-                beta += v[i] * p[i];
+                beta = beta.alg_add(v[i].alg_mul(p[i]));
             }
             beta = beta * tau * S::HALF;
 
@@ -199,7 +199,10 @@ impl<S: Scalar> SymmetricEigen<S> {
             // Step 4: A <- A - v * w^T - w * v^T
             for i in 0..n {
                 for j in 0..n {
-                    let val = a.get(i, j) - v[i] * w[j] - w[i] * v[j];
+                    let val = a
+                        .get(i, j)
+                        .alg_sub(v[i].alg_mul(w[j]))
+                        .alg_sub(w[i].alg_mul(v[j]));
                     a.set(i, j, val);
                 }
             }
@@ -215,7 +218,7 @@ impl<S: Scalar> SymmetricEigen<S> {
             }
             for i in 0..n {
                 for j in (k + 1)..n {
-                    let val = q.get(i, j) - tau * qv[i] * v[j];
+                    let val = q.get(i, j).alg_sub(tau.alg_mul(qv[i]).alg_mul(v[j]));
                     q.set(i, j, val);
                 }
             }
@@ -378,7 +381,12 @@ impl<S: Scalar> SymmetricEigen<S> {
             for j in 0..n {
                 let mut sum = S::ZERO;
                 for k in 0..n {
-                    sum += self.eigenvectors.get(i, k) * self.eigenvalues[k] * vt.get(k, j);
+                    sum = sum.alg_add(
+                        self.eigenvectors
+                            .get(i, k)
+                            .alg_mul(self.eigenvalues[k])
+                            .alg_mul(vt.get(k, j)),
+                    );
                 }
                 result.set(i, j, sum);
             }

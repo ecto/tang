@@ -53,7 +53,7 @@ impl<S: Scalar> Cholesky<S> {
         for i in 0..n {
             let mut sum = b[i];
             for j in 0..i {
-                sum -= self.l.get(i, j) * y[j];
+                sum = sum.alg_sub(self.l.get(i, j).alg_mul(y[j]));
             }
             y[i] = sum * self.l.get(i, i).recip();
         }
@@ -63,7 +63,7 @@ impl<S: Scalar> Cholesky<S> {
         for i in (0..n).rev() {
             let mut sum = y[i];
             for j in (i + 1)..n {
-                sum -= self.l.get(j, i) * x[j];
+                sum = sum.alg_sub(self.l.get(j, i).alg_mul(x[j]));
             }
             x[i] = sum * self.l.get(i, i).recip();
         }

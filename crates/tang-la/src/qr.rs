@@ -22,7 +22,7 @@ impl<S: Scalar> Qr<S> {
             // Compute norm of column k below diagonal
             let mut norm_sq = S::ZERO;
             for i in k..m {
-                norm_sq += qr.get(i, k) * qr.get(i, k);
+                norm_sq = norm_sq.alg_add(qr.get(i, k).alg_mul(qr.get(i, k)));
             }
             let mut norm = norm_sq.sqrt();
 
@@ -44,11 +44,11 @@ impl<S: Scalar> Qr<S> {
                 for j in (k + 1)..n {
                     let mut s = S::ZERO;
                     for i in k..m {
-                        s += qr.get(i, k) * qr.get(i, j);
+                        s = s.alg_add(qr.get(i, k).alg_mul(qr.get(i, j)));
                     }
                     s = -s / qr.get(k, k);
                     for i in k..m {
-                        let v = qr.get(i, j) + s * qr.get(i, k);
+                        let v = qr.get(i, j).alg_add(s.alg_mul(qr.get(i, k)));
                         qr.set(i, j, v);
                     }
                 }
@@ -90,11 +90,11 @@ impl<S: Scalar> Qr<S> {
             for col in j..m {
                 let mut s = S::ZERO;
                 for i in j..m {
-                    s += self.qr.get(i, j) * q.get(i, col);
+                    s = s.alg_add(self.qr.get(i, j).alg_mul(q.get(i, col)));
                 }
                 s = -s / self.qr.get(j, j);
                 for i in j..m {
-                    let v = q.get(i, col) + s * self.qr.get(i, j);
+                    let v = q.get(i, col).alg_add(s.alg_mul(self.qr.get(i, j)));
                     q.set(i, col, v);
                 }
             }
@@ -118,11 +118,11 @@ impl<S: Scalar> Qr<S> {
             }
             let mut s = S::ZERO;
             for i in k..m {
-                s += self.qr.get(i, k) * x[i];
+                s = s.alg_add(self.qr.get(i, k).alg_mul(x[i]));
             }
             s = -s / self.qr.get(k, k);
             for i in k..m {
-                x[i] += s * self.qr.get(i, k);
+                x[i] = x[i].alg_add(s.alg_mul(self.qr.get(i, k)));
             }
         }
 
