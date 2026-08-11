@@ -3,6 +3,16 @@
 //! These predicates give exact results for topological decisions
 //! (point orientation, incircle/insphere) regardless of floating-point error.
 //! Uses the `robust` crate (Shewchuk's algorithm).
+//!
+//! **Evaluation order is load-bearing here.** Shewchuk's adaptive predicates
+//! depend on computing exact error terms and summing them in a strictly defined
+//! order. Never use [`Scalar::alg_add`]/`alg_sub`/`alg_mul` (the reassociable
+//! ops behind the `algebraic` feature) in this file or anything it calls:
+//! reassociation discards the error terms and the predicates return the wrong
+//! *sign* near degeneracy, silently. Plain `+`/`-`/`*` only.
+//! Enforced by `crates/tang/tests/algebraic_forbidden.rs`.
+//!
+//! [`Scalar::alg_add`]: crate::Scalar::alg_add
 
 use crate::Point2;
 use crate::Point3;

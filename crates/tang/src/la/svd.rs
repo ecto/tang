@@ -1,3 +1,14 @@
+//! Singular value decomposition (one-sided Jacobi).
+//!
+//! **Evaluation order is load-bearing in this file.** The Gram accumulations in
+//! the Jacobi sweep feed a near-tolerance convergence comparison, and any
+//! compensated (Kahan) summation added here depends on the compensation term
+//! surviving. Do not use `Scalar::alg_add`/`alg_sub`/`alg_mul` — the
+//! reassociable ops behind the `algebraic` feature — anywhere in this file:
+//! reassociation cancels the compensation term, making the result strictly
+//! worse than a plain strict sum while looking like an optimization. Use plain
+//! `+`/`-`/`*`. Enforced by `crates/tang/tests/algebraic_forbidden.rs`.
+
 use super::{DMat, DVec};
 use crate::Scalar;
 use alloc::vec::Vec;
