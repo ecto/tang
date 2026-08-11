@@ -61,9 +61,27 @@ fn no_algebraic_ops_in_order_sensitive_files() {
         let src = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("forbidden-list entry {rel} is unreadable ({e}) — the file moved or was deleted; update FORBIDDEN"));
 
+        // Comment lines are skipped so the "don't use alg_*" notices in these
+        // files don't trip their own guard — except inside a doc-test fence,
+        // where the "comment" is real compiled-and-run code. `/* */` blocks are
+        // not skipped: nothing in them executes, so scanning them only risks a
+        // false positive, which is the safe direction for a lint like this.
+        let mut in_doctest = false;
+
         for (i, line) in src.lines().enumerate() {
-            // Skip this guard's own prose in doc/line comments.
-            if line.trim_start().starts_with("//") {
+            let trimmed = line.trim_start();
+            let is_doc = trimmed.starts_with("///") || trimmed.starts_with("//!");
+
+            if is_doc
+                && trimmed
+                    .trim_start_matches(['/', '!'])
+                    .trim_start()
+                    .starts_with("```")
+            {
+                in_doctest = !in_doctest;
+                continue;
+            }
+            if trimmed.starts_with("//") && !in_doctest {
                 continue;
             }
             for needle in NEEDLES {
