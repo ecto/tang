@@ -130,7 +130,7 @@ impl<S: Scalar> DVec<S> {
     pub fn axpy(&mut self, a: S, x: &DVec<S>) {
         assert_eq!(self.len(), x.len());
         for i in 0..self.len() {
-            self.data[i] += a * x.data[i];
+            self.data[i] = self.data[i].alg_add(a.alg_mul(x.data[i]));
         }
     }
 
@@ -138,7 +138,7 @@ impl<S: Scalar> DVec<S> {
     pub fn sum(&self) -> S {
         let mut s = S::ZERO;
         for &x in &self.data {
-            s += x;
+            s = s.alg_add(x);
         }
         s
     }

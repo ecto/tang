@@ -58,7 +58,7 @@ impl<S: Scalar> Lu<S> {
                 let row_k_val = data[j * n + k]; // lu[k, j]
                 for i in (k + 1)..n {
                     let factor = data[k * n + i]; // lu[i, k] (the factor)
-                    data[j * n + i] -= factor * row_k_val;
+                    data[j * n + i] = data[j * n + i].alg_sub(factor.alg_mul(row_k_val));
                 }
             }
         }

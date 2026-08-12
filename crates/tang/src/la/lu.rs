@@ -58,7 +58,7 @@ impl<S: Scalar> Lu<S> {
                 let row_k_val = data[j * n + k]; // lu[k, j]
                 for i in (k + 1)..n {
                     let factor = data[k * n + i]; // lu[i, k] (the factor)
-                    data[j * n + i] = data[j * n + i] - factor * row_k_val;
+                    data[j * n + i] = data[j * n + i].alg_sub(factor.alg_mul(row_k_val));
                 }
             }
         }
@@ -78,7 +78,7 @@ impl<S: Scalar> Lu<S> {
         for i in 1..n {
             let mut sum = x[i];
             for j in 0..i {
-                sum = sum - self.lu.get(i, j) * x[j];
+                sum -= self.lu.get(i, j) * x[j];
             }
             x[i] = sum;
         }
@@ -87,7 +87,7 @@ impl<S: Scalar> Lu<S> {
         for i in (0..n).rev() {
             let mut sum = x[i];
             for j in (i + 1)..n {
-                sum = sum - self.lu.get(i, j) * x[j];
+                sum -= self.lu.get(i, j) * x[j];
             }
             x[i] = sum * self.lu.get(i, i).recip();
         }
