@@ -97,7 +97,9 @@ Arrows point from dependee → dependent. Two independent trees (`tang-la` for a
 
 **`no_std` throughout.** Every crate is `#![no_std]` with `alloc`. Use tang on embedded, in WASM, wherever.
 
-**No heavyweight dependencies.** Core types are hand-rolled `#[repr(C)]` with optional `bytemuck` and `serde` support. Dense LA is native Rust, generic over `Scalar`. An optional `faer` feature enables world-class f64 performance.
+**No heavyweight dependencies.** Core types are hand-rolled `#[repr(C)]` with optional `bytemuck` and `serde` support. Dense LA is native Rust, generic over `Scalar`.
+
+**Fast on the CPU, by default.** `DMat::mul_mat` and `Tensor::matmul` route through `tang-la::gemm` — cache-blocked, register-tiled, and NEON-vectorized for `f32`/`f64`, with the generic `Scalar` path (`Dual`, and anything else you impl) kept intact behind the same API. `--features threads` splits the work across a rayon pool; `--features accelerate` dispatches to Apple's AMX on macOS. See [BENCHMARKS.md](BENCHMARKS.md) for numbers and for what is still on the table (x86 SIMD is not written yet).
 
 **Opt-in float reassociation.** The `algebraic` feature compiles reduction inner loops (`Scalar::alg_add`/`alg_sub`/`alg_mul`) to Rust's `algebraic_*` ops, letting the compiler reorder and vectorize float chains — ~4x on dot products. Two caveats. First, results drift ~1 ulp per element versus a strict build, so skip it if you have a pinned numeric baseline. Second, **cargo features are additive and global**: if any crate in your dependency graph enables `tang/algebraic`, it is on for every tang consumer in that build, and you cannot opt out locally. Code whose evaluation order is load-bearing — the exact predicates in `crates/tang/src/predicates.rs`, the SVD Jacobi sweeps, any compensated summation — never uses the `alg_*` ops and is unaffected; `crates/tang/tests/algebraic_forbidden.rs` enforces that. `algebraic` and `exact` are compatible on purpose, since boolean geometry wants exact predicates and fast solvers at once.
 
@@ -224,7 +226,7 @@ The LU solve benchmark highlights a capability nalgebra cannot match: because ta
 | **Sym. Eigen** | 32 | 66µs | 28µs | 2.4x |
 | | 128 | **4.8ms** | 942µs | 5.1x |
 
-tang's dense LA is pure generic Rust (works with `Dual<f64>`, any `Scalar` impl). nalgebra dispatches to optimized BLAS/LAPACK-style routines for `f64`. The gap is expected and acceptable for tang's use case — when you need peak f64 throughput, enable the `faer` feature.
+tang's dense LA is pure generic Rust (works with `Dual<f64>`, any `Scalar` impl). nalgebra dispatches to optimized BLAS/LAPACK-style routines for `f64`. For matrix products the gap is largely closed by `tang-la::gemm`; for decompositions it remains. On macOS, `--features accelerate` hands `f32`/`f64` GEMM to Apple's AMX.
 
 ### Autodiff overhead
 
