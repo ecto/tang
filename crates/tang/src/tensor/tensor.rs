@@ -341,7 +341,7 @@ impl<S: Scalar> Tensor<S> {
                     sum = sum.alg_add(e);
                 }
                 for v in row.iter_mut() {
-                    *v = *v / sum;
+                    *v /= sum;
                 }
             }
             return Self::new(out, self.shape.clone());

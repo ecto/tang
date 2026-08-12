@@ -765,7 +765,7 @@ fn layernorm_row_mean_var<S: Scalar>(input: &Tensor<S>, b: usize, features: usiz
         for &x in row {
             mean = mean.alg_add(x);
         }
-        mean = mean / n;
+        mean /= n;
         for &x in row {
             let diff = x.alg_sub(mean);
             var = var.alg_add(diff.alg_mul(diff));
@@ -774,7 +774,7 @@ fn layernorm_row_mean_var<S: Scalar>(input: &Tensor<S>, b: usize, features: usiz
         for f in 0..features {
             mean = mean.alg_add(input.get(&[b, f]));
         }
-        mean = mean / n;
+        mean /= n;
         for f in 0..features {
             let diff = input.get(&[b, f]).alg_sub(mean);
             var = var.alg_add(diff.alg_mul(diff));
