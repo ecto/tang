@@ -6,6 +6,19 @@ use crate::tensor::Shape;
 
 /// Mean Squared Error loss: (1/n) * sum((pred - target)^2)
 pub fn mse_loss<S: Scalar>(pred: &Tensor<S>, target: &Tensor<S>) -> S {
+    // Fused fast path for the common same-shape contiguous case: one pass with
+    // no temporaries. Element order and arithmetic match the general path
+    // below, so the default build is bit-identical; with the `algebraic`
+    // feature alg_sub/alg_mul/alg_add let LLVM vectorize the whole reduction.
+    if pred.shape() == target.shape() && pred.is_contiguous() && target.is_contiguous() {
+        let (a, b) = (pred.data(), target.data());
+        let mut acc = S::ZERO;
+        for i in 0..a.len() {
+            let d = a[i].alg_sub(b[i]);
+            acc = acc.alg_add(d.alg_mul(d));
+        }
+        return acc / S::from_f64(a.len() as f64);
+    }
     let diff = pred.sub(target);
     let sq = diff.mul(&diff);
     sq.mean()
@@ -27,12 +40,46 @@ pub fn huber_loss<S: Scalar>(pred: &Tensor<S>, target: &Tensor<S>, delta: S) -> 
     for &d in diff.data() {
         let a = d.abs();
         if a <= delta {
-            total += half * d * d;
+            total = total.alg_add(half * d * d);
         } else {
-            total += delta * (a - half * delta);
+            total = total.alg_add(delta * (a - half * delta));
         }
     }
     total / n
+}
+
+/// Row max and `sum(exp(x - max))` for row `r` of a `[rows, n]` logits tensor.
+///
+/// Prefers a flat row slice when the tensor is contiguous, falling back to
+/// multi-index `get`. Both branches visit elements in the same order and do the
+/// same arithmetic, so results are bit-identical without the `algebraic`
+/// feature; with it, alg_add lets the denominator reduction vectorize.
+fn row_max_and_sum_exp<S: Scalar>(logits: &Tensor<S>, r: usize, n: usize) -> (S, S) {
+    if let Some(row) = logits.row(r) {
+        let mut max_val = row[0];
+        for &v in &row[1..] {
+            if v > max_val {
+                max_val = v;
+            }
+        }
+        let mut sum = S::ZERO;
+        for &v in row {
+            sum = sum.alg_add((v - max_val).exp());
+        }
+        return (max_val, sum);
+    }
+    let mut max_val = logits.get(&[r, 0]);
+    for c in 1..n {
+        let v = logits.get(&[r, c]);
+        if v > max_val {
+            max_val = v;
+        }
+    }
+    let mut sum = S::ZERO;
+    for c in 0..n {
+        sum = sum.alg_add((logits.get(&[r, c]) - max_val).exp());
+    }
+    (max_val, sum)
 }
 
 /// Softmax: exp(x_i) / sum(exp(x_j)) for a 1-D tensor.
@@ -55,17 +102,7 @@ pub fn cross_entropy_loss<S: Scalar>(logits: &Tensor<S>, targets: &Tensor<S>) ->
 
     for b in 0..batch {
         // Compute log-softmax for numerical stability
-        let mut max_val = logits.get(&[b, 0]);
-        for c in 1..num_classes {
-            let v = logits.get(&[b, c]);
-            if v > max_val {
-                max_val = v;
-            }
-        }
-        let mut log_sum_exp = S::from_f64(0.0);
-        for c in 0..num_classes {
-            log_sum_exp += (logits.get(&[b, c]) - max_val).exp();
-        }
+        let (max_val, log_sum_exp) = row_max_and_sum_exp(logits, b, num_classes);
         let log_sum_exp = max_val + log_sum_exp.ln();
 
         let target_class = targets.get(&[b]).to_f64() as usize;
@@ -88,17 +125,7 @@ pub fn cross_entropy_loss_grad<S: Scalar>(logits: &Tensor<S>, targets: &Tensor<S
         let b = idx[0];
         let c = idx[1];
         // Compute softmax for row b
-        let mut max_val = logits.get(&[b, 0]);
-        for k in 1..num_classes {
-            let v = logits.get(&[b, k]);
-            if v > max_val {
-                max_val = v;
-            }
-        }
-        let mut sum_exp = S::from_f64(0.0);
-        for k in 0..num_classes {
-            sum_exp += (logits.get(&[b, k]) - max_val).exp();
-        }
+        let (max_val, sum_exp) = row_max_and_sum_exp(logits, b, num_classes);
         let softmax_c = (logits.get(&[b, c]) - max_val).exp() / sum_exp;
         let target_class = targets.get(&[b]).to_f64() as usize;
         let one_hot = if c == target_class {
@@ -139,17 +166,7 @@ pub fn sequence_cross_entropy<S: Scalar>(
         }
 
         // log-softmax for numerical stability
-        let mut max_val = logits.get(&[t, 0]);
-        for c in 1..vocab_size {
-            let v = logits.get(&[t, c]);
-            if v > max_val {
-                max_val = v;
-            }
-        }
-        let mut log_sum_exp = S::ZERO;
-        for c in 0..vocab_size {
-            log_sum_exp += (logits.get(&[t, c]) - max_val).exp();
-        }
+        let (max_val, log_sum_exp) = row_max_and_sum_exp(logits, t, vocab_size);
         let log_sum_exp = max_val + log_sum_exp.ln();
 
         let target_class = target_id as usize;
@@ -203,17 +220,7 @@ pub fn sequence_cross_entropy_grad<S: Scalar>(
         }
 
         // softmax for this position
-        let mut max_val = logits.get(&[t, 0]);
-        for k in 1..vocab_size {
-            let v = logits.get(&[t, k]);
-            if v > max_val {
-                max_val = v;
-            }
-        }
-        let mut sum_exp = S::ZERO;
-        for k in 0..vocab_size {
-            sum_exp += (logits.get(&[t, k]) - max_val).exp();
-        }
+        let (max_val, sum_exp) = row_max_and_sum_exp(logits, t, vocab_size);
         let softmax_c = (logits.get(&[t, c]) - max_val).exp() / sum_exp;
 
         let target_class = target_id as usize;

@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 description = "Optimization algorithms — Adam, L-BFGS, Newton, Levenberg-Marquardt"
 
+[features]
+default = []
+# Reassociable float ops in hot reductions. Requires Rust 1.98+.
+algebraic = ["tang/algebraic", "tang-la/algebraic"]
+
 [dependencies]
 tang = { workspace = true }
 tang-la = { workspace = true }

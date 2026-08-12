@@ -128,10 +128,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::data::TensorDataset;
     use super::*;
-    use super::{mse_loss, mse_loss_grad, Linear, ModuleAdam, Sequential, Tanh};
+    // `super` here is `train::trainer`, so these must come from `train` itself.
     use crate::tensor::Shape;
+    use crate::train::data::TensorDataset;
+    use crate::train::{mse_loss, mse_loss_grad, Linear, ModuleAdam, Sequential, Tanh};
     use alloc::{boxed::Box, vec};
 
     #[test]
