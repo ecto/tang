@@ -5765,6 +5765,7 @@ dependencies = [
  "objc",
  "paste",
  "pollster",
+ "rayon",
  "robust",
  "safetensors",
  "serde",
@@ -5892,6 +5893,7 @@ version = "0.1.0"
 dependencies = [
  "approx",
  "faer 0.24.0",
+ "rayon",
  "tang",
 ]
 

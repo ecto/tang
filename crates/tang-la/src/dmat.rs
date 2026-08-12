@@ -242,20 +242,12 @@ impl<S: Scalar> DMat<S> {
 
         let mut c = DMat::zeros(m, n);
 
+        // A column-major buffer read as row-major is the transpose, so
+        // col-major `C = A·B` is row-major `Cᵀ = Bᵀ·Aᵀ` over the very same
+        // bytes — no packing, no copy, just swapped operands and extents.
         let a = self.as_slice();
         let b = rhs.as_slice();
-        let c_data: &mut [S] = c.as_mut_slice();
-
-        for j in 0..n {
-            let c_col = j * m;
-            for k in 0..p {
-                let b_kj = b[j * rhs.nrows + k];
-                let a_col = k * m;
-                for i in 0..m {
-                    c_data[c_col + i] = c_data[c_col + i].alg_add(a[a_col + i].alg_mul(b_kj));
-                }
-            }
-        }
+        crate::gemm::gemm_nn(n, m, p, b, p, a, m, c.as_mut_slice(), m);
 
         c
     }

@@ -17,6 +17,7 @@ mod cholesky;
 mod dmat;
 mod dvec;
 mod eigen;
+pub mod gemm;
 mod lu;
 mod qr;
 pub mod stats;
@@ -26,6 +27,7 @@ pub use cholesky::Cholesky;
 pub use dmat::DMat;
 pub use dvec::DVec;
 pub use eigen::{branchless_jacobi_eigen, SymmetricEigen};
+pub use gemm::{gemm_nn, gemm_nt, gemm_tn};
 pub use lu::Lu;
 pub use qr::Qr;
 pub use stats::{

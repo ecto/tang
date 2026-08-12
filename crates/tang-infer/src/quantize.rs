@@ -230,6 +230,35 @@ pub fn quantize_matrix_q4(data: &[f32], rows: usize, cols: usize) -> QuantizedQ4
 /// Weight must be quantized row-by-row (use `quantize_matrix_q8`).
 /// Shape is [out, in], x is [in]. Returns [out].
 /// Dequantizes on-the-fly per block for cache efficiency.
+/// Dot product of one full block of `i8` weights against `f64` activations.
+///
+/// Four independent accumulators so the reduction is not one serial
+/// dependency chain; LLVM folds these into NEON FMAs.
+#[inline]
+fn dot_block_i8(v: &[i8; BLOCK_SIZE], x: &[f64]) -> f64 {
+    let (mut a0, mut a1, mut a2, mut a3) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    for i in (0..BLOCK_SIZE).step_by(4) {
+        a0 += v[i] as f64 * x[i];
+        a1 += v[i + 1] as f64 * x[i + 1];
+        a2 += v[i + 2] as f64 * x[i + 2];
+        a3 += v[i + 3] as f64 * x[i + 3];
+    }
+    (a0 + a1) + (a2 + a3)
+}
+
+/// Dot product of one full block of packed 4-bit weights against `f64`
+/// activations. Nibbles unpack to `-8..7`; see [`Q4Block`].
+#[inline]
+fn dot_block_q4(v: &[u8; BLOCK_SIZE / 2], x: &[f64]) -> f64 {
+    let (mut a0, mut a1) = (0.0f64, 0.0f64);
+    for i in 0..BLOCK_SIZE / 2 {
+        let byte = v[i];
+        a0 += (((byte & 0x0F) as i8) - 8) as f64 * x[i * 2];
+        a1 += ((((byte >> 4) & 0x0F) as i8) - 8) as f64 * x[i * 2 + 1];
+    }
+    a0 + a1
+}
+
 pub fn q8_matvec(weight: &QuantizedQ8, x: &[f64]) -> Vec<f64> {
     assert_eq!(weight.shape.len(), 2);
     let out_dim = weight.shape[0];
@@ -237,21 +266,32 @@ pub fn q8_matvec(weight: &QuantizedQ8, x: &[f64]) -> Vec<f64> {
     assert_eq!(x.len(), in_dim);
 
     let blocks_per_row = in_dim.div_ceil(BLOCK_SIZE);
+    let full_blocks = in_dim / BLOCK_SIZE;
     let mut y = alloc::vec![0.0f64; out_dim];
 
     for row in 0..out_dim {
+        let row_blocks = &weight.blocks[row * blocks_per_row..(row + 1) * blocks_per_row];
         let mut sum = 0.0f64;
-        for b in 0..blocks_per_row {
-            let block = &weight.blocks[row * blocks_per_row + b];
-            let x_start = b * BLOCK_SIZE;
-            let scale = block.scale as f64;
-            for i in 0..BLOCK_SIZE {
-                let xi = x_start + i;
-                if xi < in_dim {
-                    sum += (block.values[i] as f64) * scale * x[xi];
-                }
-            }
+
+        // Whole blocks. The scale is constant across a block, so it applies
+        // once to the block's dot product rather than to every element, and
+        // the bounds test that used to sit in the inner loop is gone.
+        for (b, block) in row_blocks.iter().take(full_blocks).enumerate() {
+            let xs = &x[b * BLOCK_SIZE..(b + 1) * BLOCK_SIZE];
+            sum += block.scale as f64 * dot_block_i8(&block.values, xs);
         }
+
+        // Trailing partial block when in_dim is not a multiple of BLOCK_SIZE.
+        if full_blocks < blocks_per_row {
+            let block = &row_blocks[full_blocks];
+            let start = full_blocks * BLOCK_SIZE;
+            let mut acc = 0.0f64;
+            for (i, &xi) in x[start..].iter().enumerate() {
+                acc += block.values[i] as f64 * xi;
+            }
+            sum += block.scale as f64 * acc;
+        }
+
         y[row] = sum;
     }
 
@@ -266,28 +306,35 @@ pub fn q4_matvec(weight: &QuantizedQ4, x: &[f64]) -> Vec<f64> {
     assert_eq!(x.len(), in_dim);
 
     let blocks_per_row = in_dim.div_ceil(BLOCK_SIZE);
+    let full_blocks = in_dim / BLOCK_SIZE;
     let mut y = alloc::vec![0.0f64; out_dim];
 
     for row in 0..out_dim {
+        let row_blocks = &weight.blocks[row * blocks_per_row..(row + 1) * blocks_per_row];
         let mut sum = 0.0f64;
-        for b in 0..blocks_per_row {
-            let block = &weight.blocks[row * blocks_per_row + b];
-            let x_start = b * BLOCK_SIZE;
-            let scale = block.scale as f64;
+
+        for (b, block) in row_blocks.iter().take(full_blocks).enumerate() {
+            let xs = &x[b * BLOCK_SIZE..(b + 1) * BLOCK_SIZE];
+            sum += block.scale as f64 * dot_block_q4(&block.values, xs);
+        }
+
+        if full_blocks < blocks_per_row {
+            let block = &row_blocks[full_blocks];
+            let start = full_blocks * BLOCK_SIZE;
+            let mut acc = 0.0f64;
             for i in 0..BLOCK_SIZE / 2 {
                 let byte = block.values[i];
-                let v0 = ((byte & 0x0F) as i8 - 8) as f64;
-                let v1 = (((byte >> 4) & 0x0F) as i8 - 8) as f64;
-                let xi0 = x_start + i * 2;
-                let xi1 = xi0 + 1;
+                let (xi0, xi1) = (start + i * 2, start + i * 2 + 1);
                 if xi0 < in_dim {
-                    sum += v0 * scale * x[xi0];
+                    acc += (((byte & 0x0F) as i8) - 8) as f64 * x[xi0];
                 }
                 if xi1 < in_dim {
-                    sum += v1 * scale * x[xi1];
+                    acc += ((((byte >> 4) & 0x0F) as i8) - 8) as f64 * x[xi1];
                 }
             }
+            sum += block.scale as f64 * acc;
         }
+
         y[row] = sum;
     }
 
@@ -342,6 +389,55 @@ mod tests {
         assert_eq!(y.len(), 2);
         assert!((y[0] - (-1.0)).abs() < 0.15, "y[0]={}", y[0]);
         assert!((y[1] - 0.5).abs() < 0.15, "y[1]={}", y[1]);
+    }
+
+    /// The blocked kernels must agree with the elementwise definition,
+    /// including when `in_dim` leaves a partial trailing block.
+    ///
+    /// Tolerance is f32-level because the reference dequantizes to f32 first,
+    /// whereas the kernels keep `value * scale` in f64 — the reference is the
+    /// less accurate of the two.
+    #[test]
+    fn matvec_matches_elementwise_reference() {
+        for in_dim in [3usize, 31, 32, 33, 64, 100, 576] {
+            let out_dim = 5;
+            let w: Vec<f32> = (0..out_dim * in_dim)
+                .map(|i| ((i as f32) * 0.017).sin() * 3.0)
+                .collect();
+            let x: Vec<f64> = (0..in_dim).map(|i| ((i as f64) * 0.11).cos()).collect();
+
+            let q8 = quantize_matrix_q8(&w, out_dim, in_dim);
+            let deq8 = dequantize_q8(&q8.blocks);
+            let got8 = q8_matvec(&q8, &x);
+            let bpr = in_dim.div_ceil(32);
+            for row in 0..out_dim {
+                // Reference: dequantize, then plain dot product.
+                let mut want = 0.0f64;
+                for c in 0..in_dim {
+                    want += deq8[row * bpr * 32 + c] as f64 * x[c];
+                }
+                assert!(
+                    (got8[row] - want).abs() < 1e-6 * want.abs().max(1.0),
+                    "q8 in_dim={in_dim} row={row}: {} vs {want}",
+                    got8[row]
+                );
+            }
+
+            let q4 = quantize_matrix_q4(&w, out_dim, in_dim);
+            let deq4 = dequantize_q4(&q4.blocks);
+            let got4 = q4_matvec(&q4, &x);
+            for row in 0..out_dim {
+                let mut want = 0.0f64;
+                for c in 0..in_dim {
+                    want += deq4[row * bpr * 32 + c] as f64 * x[c];
+                }
+                assert!(
+                    (got4[row] - want).abs() < 1e-6 * want.abs().max(1.0),
+                    "q4 in_dim={in_dim} row={row}: {} vs {want}",
+                    got4[row]
+                );
+            }
+        }
     }
 
     #[test]
