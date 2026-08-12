@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 description = "Inference runtime: KV-cache, sampling strategies, autoregressive generation"
 
+[features]
+default = []
+# Reassociable float ops in hot reductions. Requires Rust 1.98+.
+algebraic = ["tang/algebraic", "tang-tensor/algebraic", "tang-train/algebraic"]
+
 [dependencies]
 tang = { workspace = true }
 tang-tensor = { workspace = true }

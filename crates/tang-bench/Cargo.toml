@@ -39,6 +39,20 @@ harness = false
 name = "gpu_inference"
 harness = false
 
+[features]
+default = []
+# Reassociable float ops in hot reductions. Requires Rust 1.98+.
+algebraic = [
+    "tang/algebraic",
+    "tang-la/algebraic",
+    "tang-tensor/algebraic",
+    "tang-train/algebraic",
+    "tang-infer/algebraic",
+]
+
+[[example]]
+name = "algebraic_reductions"
+
 [dependencies]
 tang        = { workspace = true, features = ["std"] }
 tang-la     = { workspace = true, features = ["std"] }
@@ -54,3 +68,9 @@ criterion = { version = "0.5", features = ["html_reports"] }
 nalgebra  = "0.33"
 glam      = "0.29"
 rand      = "0.8"
+
+[[example]]
+name = "algebraic_bits"
+
+[[example]]
+name = "algebraic_e2e"

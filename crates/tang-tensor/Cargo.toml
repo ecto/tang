@@ -11,6 +11,8 @@ tang-la = { workspace = true }
 [features]
 default = []
 accelerate = ["tang-la/accelerate"]
+# Reassociable float ops in hot reductions. Requires Rust 1.98+.
+algebraic = ["tang/algebraic", "tang-la/algebraic"]
 
 [dev-dependencies]
 approx = "0.5"

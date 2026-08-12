@@ -2,6 +2,19 @@ use alloc::vec::Vec;
 use tang::Scalar;
 use tang_tensor::Tensor;
 
+/// Sum over a probability slice.
+///
+/// Same left-to-right order as `iter().sum()`, so this is bit-identical without
+/// the `algebraic` feature; with it, LLVM can split the chain into SIMD lanes.
+#[inline]
+fn alg_sum(xs: &[f64]) -> f64 {
+    let mut acc = 0.0f64;
+    for &x in xs {
+        acc = Scalar::alg_add(acc, x);
+    }
+    acc
+}
+
 /// Configuration for token sampling.
 #[derive(Clone, Debug)]
 pub struct SamplingConfig {
@@ -136,7 +149,7 @@ impl Sampler {
         }
 
         // Normalize
-        let sum: f64 = probs.iter().sum();
+        let sum: f64 = alg_sum(&probs);
         if sum <= 0.0 {
             return argmax(&probs);
         }
@@ -148,7 +161,7 @@ impl Sampler {
         if self.config.top_p < 1.0 {
             top_p_filter(&mut probs, self.config.top_p);
             // Re-normalize
-            let sum: f64 = probs.iter().sum();
+            let sum: f64 = alg_sum(&probs);
             if sum > 0.0 {
                 for p in probs.iter_mut() {
                     *p /= sum;

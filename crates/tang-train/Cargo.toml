@@ -7,6 +7,13 @@ description = "Computational graph, parameter management, training loop"
 
 [features]
 accelerate = ["tang-la/accelerate", "tang-tensor/accelerate"]
+# Reassociable float ops in hot reductions. Requires Rust 1.98+.
+algebraic = [
+    "tang/algebraic",
+    "tang-la/algebraic",
+    "tang-tensor/algebraic",
+    "tang-optim/algebraic",
+]
 
 [dependencies]
 tang = { workspace = true }

@@ -104,6 +104,21 @@ impl<S: Scalar> Tensor<S> {
             .sum()
     }
 
+    /// Contiguous slice for row `r` of a 2-D contiguous tensor.
+    ///
+    /// Returns `None` for non-2-D or strided tensors, so callers must keep a
+    /// `get`-based fallback. Hot loops use this to reduce over a flat slice
+    /// instead of paying multi-index arithmetic per element.
+    #[inline]
+    pub fn row(&self, r: usize) -> Option<&[S]> {
+        if self.ndim() == 2 && self.is_contiguous() {
+            let n = self.shape[1];
+            Some(&self.data[r * n..(r + 1) * n])
+        } else {
+            None
+        }
+    }
+
     /// Get element by multi-index.
     pub fn get(&self, idx: &[usize]) -> S {
         self.data[self.flat_index(idx)]
@@ -306,6 +321,32 @@ impl<S: Scalar> Tensor<S> {
         assert!(axis < self.ndim());
         let axis_size = self.shape[axis];
 
+        // Fast path: reducing the innermost axis of a contiguous tensor means
+        // each softmax "row" is a flat slice. Same arithmetic in the same order
+        // as the general path below, so the default build is bit-identical;
+        // alg_add lets the `algebraic` feature vectorize the denominator.
+        if axis_size > 0 && axis == self.ndim() - 1 && self.is_contiguous() {
+            let mut out = self.data.clone();
+            for row in out.chunks_mut(axis_size) {
+                let mut max_val = row[0];
+                for &v in &row[1..] {
+                    if v > max_val {
+                        max_val = v;
+                    }
+                }
+                let mut sum = S::ZERO;
+                for v in row.iter_mut() {
+                    let e = (*v - max_val).exp();
+                    *v = e;
+                    sum = sum.alg_add(e);
+                }
+                for v in row.iter_mut() {
+                    *v = *v / sum;
+                }
+            }
+            return Self::new(out, self.shape.clone());
+        }
+
         // For each "row" along the axis, subtract max then exponentiate
         Self::from_fn(self.shape.clone(), |idx| {
             // Find max along axis
@@ -337,10 +378,13 @@ impl<S: Scalar> Tensor<S> {
 
     /// Sum all elements.
     pub fn sum(&self) -> S {
-        self.data
-            .iter()
-            .copied()
-            .fold(S::from_f64(0.0), |a, b| a + b)
+        // alg_add is a strict `+` unless the `algebraic` feature is enabled,
+        // which lets the compiler split this dependent chain into SIMD lanes.
+        let mut acc = S::from_f64(0.0);
+        for &v in &self.data {
+            acc = acc.alg_add(v);
+        }
+        acc
     }
 
     /// Mean of all elements.
@@ -393,6 +437,20 @@ impl<S: Scalar> Tensor<S> {
             return Self::scalar(self.sum());
         }
         let new_shape = Shape::new(new_dims);
+
+        // Fast path: innermost axis of a contiguous tensor — each reduction
+        // group is a flat slice, summed in the same order as the general path.
+        if axis_size > 0 && axis == self.ndim() - 1 && self.is_contiguous() {
+            let mut out = Vec::with_capacity(new_shape.numel());
+            for chunk in self.data.chunks(axis_size) {
+                let mut acc = S::from_f64(0.0);
+                for &v in chunk {
+                    acc = acc.alg_add(v);
+                }
+                out.push(acc);
+            }
+            return Self::new(out, new_shape);
+        }
 
         Self::from_fn(new_shape, |idx| {
             let mut sum = S::from_f64(0.0);

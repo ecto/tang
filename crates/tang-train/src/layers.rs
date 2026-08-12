@@ -793,6 +793,37 @@ impl<S: Scalar> LayerNorm<S> {
     }
 }
 
+/// Mean and population variance of row `b` of a `[batch, features]` tensor.
+///
+/// alg_add/alg_sub/alg_mul are strict ops unless the `algebraic` feature is on,
+/// which lets these two reductions vectorize. Element order is unchanged either
+/// way, so feature-off results are bit-identical to the original loops.
+#[inline]
+fn layernorm_row_mean_var<S: Scalar>(input: &Tensor<S>, b: usize, features: usize, n: S) -> (S, S) {
+    let mut mean = S::ZERO;
+    let mut var = S::ZERO;
+    if let Some(row) = input.row(b) {
+        for &x in row {
+            mean = mean.alg_add(x);
+        }
+        mean = mean / n;
+        for &x in row {
+            let diff = x.alg_sub(mean);
+            var = var.alg_add(diff.alg_mul(diff));
+        }
+    } else {
+        for f in 0..features {
+            mean = mean.alg_add(input.get(&[b, f]));
+        }
+        mean = mean / n;
+        for f in 0..features {
+            let diff = input.get(&[b, f]).alg_sub(mean);
+            var = var.alg_add(diff.alg_mul(diff));
+        }
+    }
+    (mean, var / n)
+}
+
 impl<S: Scalar> Module<S> for LayerNorm<S> {
     fn forward(&mut self, input: &Tensor<S>) -> Tensor<S> {
         assert_eq!(input.ndim(), 2, "LayerNorm input must be [batch, features]");
@@ -810,21 +841,7 @@ impl<S: Scalar> Module<S> for LayerNorm<S> {
         let mut out_data = alloc::vec![S::ZERO; batch * features];
 
         for b in 0..batch {
-            // mean
-            let mut mean = S::ZERO;
-            for f in 0..features {
-                mean += input.get(&[b, f]);
-            }
-            mean /= n;
-
-            // variance
-            let mut var = S::ZERO;
-            for f in 0..features {
-                let diff = input.get(&[b, f]) - mean;
-                var += diff * diff;
-            }
-            var /= n;
-
+            let (mean, var) = layernorm_row_mean_var(input, b, features, n);
             let inv_std = (var + eps).sqrt();
 
             for f in 0..features {
@@ -886,28 +903,36 @@ impl<S: Scalar> Module<S> for LayerNorm<S> {
             let f = idx[1];
 
             // Recompute std for this row
-            let mut mean = S::ZERO;
-            for j in 0..features {
-                mean += input.get(&[b, j]);
-            }
-            mean /= n;
-
-            let mut var = S::ZERO;
-            for j in 0..features {
-                let diff = input.get(&[b, j]) - mean;
-                var += diff * diff;
-            }
-            var /= n;
+            let (_mean, var) = layernorm_row_mean_var(input, b, features, n);
             let inv_std = S::from_f64(1.0) / (var + eps).sqrt();
 
             // dy_hat = grad_output * gamma (scaled gradient)
             // Compute mean(dy_hat) and mean(dy_hat * x_norm) over features
             let mut mean_dy = S::ZERO;
             let mut mean_dy_xn = S::ZERO;
-            for j in 0..features {
-                let dy_hat = grad_output.get(&[b, j]) * self.gamma.data.get(&[j]);
-                mean_dy += dy_hat;
-                mean_dy_xn += dy_hat * cached_norm.get(&[b, j]);
+            match (
+                grad_output.row(b),
+                cached_norm.row(b),
+                self.gamma.data.data(),
+            ) {
+                (Some(g_row), Some(xn_row), gamma)
+                    if gamma.len() == features && self.gamma.data.is_contiguous() =>
+                {
+                    for j in 0..features {
+                        let dy_hat = g_row[j].alg_mul(gamma[j]);
+                        mean_dy = mean_dy.alg_add(dy_hat);
+                        mean_dy_xn = mean_dy_xn.alg_add(dy_hat.alg_mul(xn_row[j]));
+                    }
+                }
+                _ => {
+                    for j in 0..features {
+                        let dy_hat = grad_output
+                            .get(&[b, j])
+                            .alg_mul(self.gamma.data.get(&[j]));
+                        mean_dy = mean_dy.alg_add(dy_hat);
+                        mean_dy_xn = mean_dy_xn.alg_add(dy_hat.alg_mul(cached_norm.get(&[b, j])));
+                    }
+                }
             }
             mean_dy /= n;
             mean_dy_xn /= n;
@@ -2132,11 +2157,18 @@ impl<S: Scalar> Module<S> for RMSNorm<S> {
         let mut out_data = alloc::vec![S::ZERO; batch * features];
 
         for b in 0..batch {
-            // mean(x^2)
+            // mean(x^2) — alg_add/alg_mul are strict +/* unless the `algebraic`
+            // feature is on, which lets this reduction vectorize.
             let mut sq_sum = S::ZERO;
-            for f in 0..features {
-                let x = input.get(&[b, f]);
-                sq_sum += x * x;
+            if let Some(row) = input.row(b) {
+                for &x in row {
+                    sq_sum = sq_sum.alg_add(x.alg_mul(x));
+                }
+            } else {
+                for f in 0..features {
+                    let x = input.get(&[b, f]);
+                    sq_sum = sq_sum.alg_add(x.alg_mul(x));
+                }
             }
             let rms = (sq_sum / n + eps).sqrt();
             rms_data[b] = rms;
@@ -2184,8 +2216,25 @@ impl<S: Scalar> Module<S> for RMSNorm<S> {
             // = w_i / rms - w_i * x_i * (x_i / (n * rms^3))... simplified:
             // = (w * grad_out) / rms - x * dot(w * grad_out, x) / (n * rms^3)
             let mut dot = S::ZERO;
-            for f in 0..features {
-                dot += self.weight.data.get(&[f]) * grad_output.get(&[b, f]) * input.get(&[b, f]);
+            match (self.weight.data.data(), input.row(b), grad_output.row(b)) {
+                (w, Some(x_row), Some(g_row))
+                    if w.len() == features && self.weight.data.is_contiguous() =>
+                {
+                    for f in 0..features {
+                        dot = dot.alg_add(w[f].alg_mul(g_row[f]).alg_mul(x_row[f]));
+                    }
+                }
+                _ => {
+                    for f in 0..features {
+                        dot = dot.alg_add(
+                            self.weight
+                                .data
+                                .get(&[f])
+                                .alg_mul(grad_output.get(&[b, f]))
+                                .alg_mul(input.get(&[b, f])),
+                        );
+                    }
+                }
             }
 
             for f in 0..features {
