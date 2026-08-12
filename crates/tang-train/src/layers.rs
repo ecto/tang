@@ -926,9 +926,7 @@ impl<S: Scalar> Module<S> for LayerNorm<S> {
                 }
                 _ => {
                     for j in 0..features {
-                        let dy_hat = grad_output
-                            .get(&[b, j])
-                            .alg_mul(self.gamma.data.get(&[j]));
+                        let dy_hat = grad_output.get(&[b, j]).alg_mul(self.gamma.data.get(&[j]));
                         mean_dy = mean_dy.alg_add(dy_hat);
                         mean_dy_xn = mean_dy_xn.alg_add(dy_hat.alg_mul(cached_norm.get(&[b, j])));
                     }

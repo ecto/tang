@@ -52,7 +52,9 @@ fn fill<S: tang::Scalar>(n: usize, seed: u64) -> Vec<S> {
     let mut s = seed | 1;
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let u = (s >> 11) as f64 / (1u64 << 53) as f64;
             S::from_f64(u * 2.0 - 1.0)
         })

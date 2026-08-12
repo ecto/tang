@@ -1,5 +1,5 @@
-use crate::Scalar;
 use crate::tensor::Tensor;
+use crate::Scalar;
 
 #[cfg(test)]
 use crate::tensor::Shape;
