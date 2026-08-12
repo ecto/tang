@@ -25,17 +25,19 @@ impl<S: Scalar> Linear<S> {
 impl<S: Scalar> Module<S> for Linear<S> {
     fn forward(&mut self, input: &Tensor<S>) -> Tensor<S> {
         self.cached_input = Some(input.clone());
-        let wt = self.weight.data.transpose(); // [in_features, out_features]
 
+        // Weights are [out, in] and the product contracts over `in`, so
+        // `matmul_nt` consumes them in place. Transposing first would copy the
+        // whole weight matrix on every forward pass.
         if input.ndim() == 1 {
             // Single sample: [in_features] -> [out_features]
             let input_2d = input.reshape(Shape::from_slice(&[1, input.numel()]));
-            let out = input_2d.matmul(&wt); // [1, out_features]
+            let out = input_2d.matmul_nt(&self.weight.data); // [1, out_features]
             let out_1d = out.reshape(Shape::from_slice(&[self.bias.data.numel()]));
             out_1d.add(&self.bias.data)
         } else {
             // Batch: [batch, in_features] -> [batch, out_features]
-            let out = input.matmul(&wt);
+            let out = input.matmul_nt(&self.weight.data);
             out.add(&self.bias.data)
         }
     }
@@ -57,7 +59,7 @@ impl<S: Scalar> Module<S> for Linear<S> {
         };
 
         // grad_w = grad_output^T @ input — [out, batch] @ [batch, in] = [out, in]
-        let grad_w = grad_2d.transpose().matmul(&input_2d);
+        let grad_w = grad_2d.matmul_tn(&input_2d);
         self.weight.accumulate_grad(&grad_w);
 
         // grad_b = sum(grad_output, axis=0) — [out]

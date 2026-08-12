@@ -42,10 +42,14 @@ safetensors = ["la", "tensor", "dep:safetensors-crate"]
 splatting = ["gpu", "expr", "tensor", "dep:wgpu", "bytemuck", "dep:pollster"]
 holo = ["splatting", "tensor", "dep:image"]
 accelerate = ["la", "dep:faer"]
+# Multi-core GEMM via rayon. Off by default: tang is no_std-first.
+threads = ["la", "std", "dep:rayon"]
 
 [dependencies]
 # Core (always)
 paste = "1"
+
+rayon = { version = "1", optional = true }
 
 # Optional core
 bytemuck = { version = "1.14", features = ["derive"], optional = true }

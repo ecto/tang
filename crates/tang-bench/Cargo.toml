@@ -42,6 +42,7 @@ harness = false
 [features]
 default = []
 # Reassociable float ops in hot reductions. Requires Rust 1.98+.
+threads = ["tang-la/threads", "tang-tensor/threads", "tang-train/threads", "tang-infer/threads"]
 algebraic = [
     "tang/algebraic",
     "tang-la/algebraic",

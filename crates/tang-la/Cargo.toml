@@ -10,11 +10,15 @@ default = ["std"]
 std = ["tang/std"]
 accelerate = ["std"]
 faer = ["dep:faer"]
+# Multi-core GEMM via rayon. Off by default: the crate is no_std-first and
+# threading pulls in std.
+threads = ["std", "dep:rayon"]
 algebraic = ["tang/algebraic"]
 
 [dependencies]
 tang = { workspace = true }
 faer = { version = "0.24", optional = true }
+rayon = { version = "1", optional = true }
 
 [dev-dependencies]
 approx = "0.5"

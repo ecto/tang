@@ -91,8 +91,19 @@ impl<S: Scalar> Tensor<S> {
     }
 
     /// Whether strides match contiguous layout.
+    ///
+    /// Checked against a running product rather than against
+    /// `Shape::contiguous_strides`, which allocates — this is called per row
+    /// by [`Tensor::row`] and on every reshape.
     pub fn is_contiguous(&self) -> bool {
-        self.strides == self.shape.contiguous_strides()
+        let mut expected = 1usize;
+        for d in (0..self.ndim()).rev() {
+            if self.strides[d] != expected {
+                return false;
+            }
+            expected *= self.shape[d];
+        }
+        true
     }
 
     /// Flat index from multi-index.
@@ -153,11 +164,54 @@ impl<S: Scalar> Tensor<S> {
         new_dims.swap(nd - 2, nd - 1);
         let new_shape = Shape::new(new_dims);
 
-        Self::from_fn(new_shape, |idx| {
-            let mut src_idx: Vec<usize> = idx.to_vec();
+        // Fast path: only the trailing two axes move, so a contiguous tensor
+        // of any rank is a stack of independent 2-D planes. Walk each in
+        // square blocks to keep both the strided reads and the strided writes
+        // inside cache.
+        if self.is_contiguous() {
+            let rows = self.shape[nd - 2];
+            let cols = self.shape[nd - 1];
+            let plane = rows * cols;
+            if plane > 0 {
+                const BLK: usize = 32;
+                let mut data = alloc::vec![S::ZERO; self.data.len()];
+                for base in (0..self.data.len()).step_by(plane) {
+                    for r0 in (0..rows).step_by(BLK) {
+                        let r1 = (r0 + BLK).min(rows);
+                        for c0 in (0..cols).step_by(BLK) {
+                            let c1 = (c0 + BLK).min(cols);
+                            for r in r0..r1 {
+                                let src = base + r * cols;
+                                for c in c0..c1 {
+                                    data[base + c * rows + r] = self.data[src + c];
+                                }
+                            }
+                        }
+                    }
+                }
+                return Self::new(data, new_shape);
+            }
+        }
+
+        // Strided source: fall back to the multi-index walk, hoisting the
+        // index buffer out of the loop.
+        let n = new_shape.numel();
+        let mut data = Vec::with_capacity(n);
+        let mut idx = alloc::vec![0usize; nd];
+        let mut src_idx = alloc::vec![0usize; nd];
+        for _ in 0..n {
+            src_idx.copy_from_slice(&idx);
             src_idx.swap(nd - 2, nd - 1);
-            self.get(&src_idx)
-        })
+            data.push(self.get(&src_idx));
+            for d in (0..nd).rev() {
+                idx[d] += 1;
+                if idx[d] < new_shape[d] {
+                    break;
+                }
+                idx[d] = 0;
+            }
+        }
+        Self::new(data, new_shape)
     }
 
     /// Collect data in contiguous order.
@@ -489,12 +543,59 @@ impl<S: Scalar> Tensor<S> {
         let n = other.shape[1];
         assert_eq!(other.shape[0], k);
 
-        let a = DMat::from_fn(m, k, |i, j| self.get(&[i, j]));
-        let b = DMat::from_fn(k, n, |i, j| other.get(&[i, j]));
-        let c = a.mul_mat(&b);
+        let a = self.contiguous();
+        let b = other.contiguous();
+        let mut c = alloc::vec![S::ZERO; m * n];
+        crate::la::gemm_nn(m, n, k, a.data(), k, b.data(), n, &mut c, n);
+        Self::new(c, Shape::from_slice(&[m, n]))
+    }
 
-        let out_shape = Shape::from_slice(&[m, n]);
-        Self::from_fn(out_shape, |idx| c.get(idx[0], idx[1]))
+    /// `self · otherᵀ` — the product against a `[n, k]` operand.
+    ///
+    /// This is the linear-layer forward: weights are stored `[out, in]`, so
+    /// the contraction runs along contiguous rows of *both* operands and no
+    /// transposed copy is needed.
+    pub fn matmul_nt(&self, other: &Self) -> Self {
+        assert_eq!(self.ndim(), 2);
+        assert_eq!(other.ndim(), 2);
+        let m = self.shape[0];
+        let k = self.shape[1];
+        let n = other.shape[0];
+        assert_eq!(other.shape[1], k, "matmul_nt: inner dimension mismatch");
+
+        let a = self.contiguous();
+        let b = other.contiguous();
+        let mut c = alloc::vec![S::ZERO; m * n];
+        crate::la::gemm_nt(m, n, k, a.data(), k, b.data(), k, &mut c, n);
+        Self::new(c, Shape::from_slice(&[m, n]))
+    }
+
+    /// `selfᵀ · other` — the product of a `[k, m]` operand with a `[k, n]` one.
+    ///
+    /// This is the weight gradient, which would otherwise transpose the
+    /// upstream gradient first.
+    pub fn matmul_tn(&self, other: &Self) -> Self {
+        assert_eq!(self.ndim(), 2);
+        assert_eq!(other.ndim(), 2);
+        let k = self.shape[0];
+        let m = self.shape[1];
+        let n = other.shape[1];
+        assert_eq!(other.shape[0], k, "matmul_tn: inner dimension mismatch");
+
+        let a = self.contiguous();
+        let b = other.contiguous();
+        let mut c = alloc::vec![S::ZERO; m * n];
+        crate::la::gemm_tn(m, n, k, a.data(), m, b.data(), n, &mut c, n);
+        Self::new(c, Shape::from_slice(&[m, n]))
+    }
+
+    /// Borrow `self` if already contiguous, else materialize a contiguous copy.
+    fn contiguous(&self) -> alloc::borrow::Cow<'_, Self> {
+        if self.is_contiguous() {
+            alloc::borrow::Cow::Borrowed(self)
+        } else {
+            alloc::borrow::Cow::Owned(Self::new(self.to_contiguous_data(), self.shape.clone()))
+        }
     }
 
     // --- Stacking ---
