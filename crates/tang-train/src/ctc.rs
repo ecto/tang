@@ -576,7 +576,7 @@ mod tests {
         let mut worst_ours = 0.0f64;
         let mut worst_naive = 0.0f64;
         // Sweep down to where `1 + x` stops being representable as distinct.
-        let xs: Vec<f64> = (0..320).map(|i| 0.5f64.powi(i as i32)).collect();
+        let xs: Vec<f64> = (0..320).map(|i| 0.5f64.powi(i)).collect();
         for &x in &xs {
             let want = x.ln_1p();
             if want == 0.0 {
