@@ -80,16 +80,30 @@ fn log_add<S: Scalar>(a: S, b: S) -> S {
     hi + (lo - hi).exp().ln_1p_compat()
 }
 
-/// `ln(1 + x)` via the [`Scalar`] surface.
+/// `ln(1 + x)` via the [`Scalar`] surface, without losing the small-`x` bits.
 ///
-/// [`Scalar`] has no `ln_1p`, and `(1 + x).ln()` loses precision for small `x`.
-/// Since `x = exp(lo - hi)` is in `(0, 1]` here, the loss is bounded and the
-/// direct form is accurate enough; the trait method exists so the workaround is
-/// named rather than scattered.
+/// [`Scalar`] has no `ln_1p`, and the direct `(1 + x).ln()` is exactly the form
+/// that fails for small `x`: forming `1 + x` rounds away the low bits of `x`,
+/// and for `x` below the epsilon it rounds to `1` and returns zero instead of
+/// `x`. In `log_add` this is the common case, not a corner — `x` is
+/// `exp(lo - hi)`, which is tiny whenever one alignment dominates another,
+/// which is most of the time once a model has learned anything.
+///
+/// This is Kahan's correction, and it needs nothing beyond the arithmetic
+/// [`Scalar`] already has. Let `u` be the rounded `1 + x`. Then `u - 1` is the
+/// perturbation that was *actually* representable, so `ln(u) / (u - 1)` is the
+/// slope over the interval the hardware really used; scaling it by the true `x`
+/// recovers the bits that forming `u` discarded. When `u` rounds to exactly
+/// `1`, `ln(1 + x)` equals `x` to within representable precision, so return `x`.
 trait Ln1p: Scalar {
     #[inline]
     fn ln_1p_compat(self) -> Self {
-        (Self::ONE + self).ln()
+        let u = Self::ONE + self;
+        if u == Self::ONE {
+            self
+        } else {
+            self * u.ln() / (u - Self::ONE)
+        }
     }
 }
 impl<S: Scalar> Ln1p for S {}
@@ -546,4 +560,76 @@ pub fn beam_decode<S: Scalar>(logits: &Tensor<S>, blank: usize, width: usize) ->
         .next()
         .map(|b| b.prefix)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::{log_add, Ln1p};
+    use std::vec::Vec;
+
+    /// The generic path must match the accuracy of a native `ln_1p`, not the
+    /// naive `(1 + x).ln()` it replaced.
+    #[test]
+    fn ln_1p_matches_the_native_implementation() {
+        let mut worst_ours = 0.0f64;
+        let mut worst_naive = 0.0f64;
+        // Sweep down to where `1 + x` stops being representable as distinct.
+        let xs: Vec<f64> = (0..320).map(|i| 0.5f64.powi(i as i32)).collect();
+        for &x in &xs {
+            let want = x.ln_1p();
+            if want == 0.0 {
+                continue;
+            }
+            let ours = (x.ln_1p_compat() - want).abs() / want.abs();
+            let naive = ((1.0f64 + x).ln() - want).abs() / want.abs();
+            worst_ours = worst_ours.max(ours);
+            worst_naive = worst_naive.max(naive);
+        }
+        assert!(
+            worst_ours < 1e-15,
+            "Kahan correction drifted by {worst_ours} relative"
+        );
+        // The naive form loses everything once `1 + x` rounds to `1`.
+        assert!(
+            worst_naive > 0.5,
+            "expected the naive form to fail badly, worst was {worst_naive}"
+        );
+    }
+
+    /// `log_add` is the only consumer, and it must stay exact when one term
+    /// dwarfs the other — the case CTC hits constantly.
+    #[test]
+    fn log_add_survives_lopsided_terms() {
+        for exponent in [1i32, 10, 30, 60, 200, 700] {
+            let hi = -1.0f64;
+            let lo = hi - exponent as f64;
+            let got = log_add(hi, lo);
+            let want = hi + (lo - hi).exp().ln_1p();
+            assert!(
+                (got - want).abs() <= 1e-15 * want.abs().max(1.0),
+                "log_add({hi}, {lo}) = {got}, want {want}"
+            );
+            // Adding a vastly smaller term must never lose the larger one.
+            assert!(got >= hi, "log_add fell below its own maximum");
+        }
+    }
+
+    #[test]
+    fn log_add_handles_impossible_paths() {
+        assert_eq!(log_add(f64::NEG_INFINITY, -3.0), -3.0);
+        assert_eq!(log_add(-3.0, f64::NEG_INFINITY), -3.0);
+        assert_eq!(
+            log_add(f64::NEG_INFINITY, f64::NEG_INFINITY),
+            f64::NEG_INFINITY
+        );
+    }
+
+    #[test]
+    fn log_add_is_commutative() {
+        for (a, b) in [(-1.0f64, -2.0), (-0.5, -40.0), (-100.0, -0.25)] {
+            assert_eq!(log_add(a, b), log_add(b, a));
+        }
+    }
 }
