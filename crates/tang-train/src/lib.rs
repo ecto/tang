@@ -44,6 +44,7 @@
 
 extern crate alloc;
 
+mod ctc;
 pub mod data;
 mod layers;
 mod loss;
@@ -55,6 +56,10 @@ mod rng;
 mod scheduler;
 mod trainer;
 
+pub use ctc::{
+    beam_decode, collapse, ctc_loss, ctc_loss_batch, ctc_loss_batch_grad, ctc_loss_grad,
+    greedy_decode, min_input_len, CtcError,
+};
 pub use data::{DataLoader, Dataset, TensorDataset};
 pub use layers::{
     AdaptiveAvgPool2d, AvgPool2d, BatchNorm2d, Conv1d, Conv2d, ConvTranspose2d, Dropout, Embedding,
