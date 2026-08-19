@@ -58,7 +58,7 @@ let v = q.rotate(Vec3::new(1.0, 0.0, 0.0)); // ≈ (0, 1, 0)
 | Crate | What it does |
 |-------|--------------|
 | **[`tang-optim`](crates/tang-optim)** | SGD, Adam/AdamW, L-BFGS, Newton, Levenberg-Marquardt |
-| **[`tang-train`](crates/tang-train)** | `Module` trait, layers (Linear → Transformer), loss functions, schedulers, PINN support |
+| **[`tang-train`](crates/tang-train)** | `Module` trait, layers (Linear → Transformer), loss functions (incl. CTC), schedulers, PINN support |
 
 ### Ecosystem
 
