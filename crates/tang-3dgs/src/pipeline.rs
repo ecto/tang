@@ -664,6 +664,7 @@ impl Rasterizer {
                 &cloud.scales,
                 &cloud.rotations,
                 _camera,
+                (self.config.width, self.config.height),
                 &ctx.radii,
                 &dL_dconics,
                 &dL_dmeans2d,
