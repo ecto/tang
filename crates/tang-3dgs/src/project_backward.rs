@@ -25,6 +25,8 @@ pub fn backward_projection(
     log_scales: &[[f32; 3]],
     rotations: &[[f32; 4]],
     camera: &Camera,
+    // image width and height, for the frustum clamp the forward pass applies
+    image_size: (u32, u32),
     radii: &[u32],
     dL_dconics: &[[f32; 3]],
     dL_dmeans2d: &[[f32; 2]],
@@ -80,10 +82,22 @@ pub fn backward_projection(
         //      [0,     fy/z,   -fy*py/z²],
         //      [0,     0,       0        ]]
         // where px=pos_cam[0], py=pos_cam[1], z=depth=-pos_cam[2]
+        // The same Jacobian the forward shader uses (project.rs): the y row
+        // carries the image-y-down sign, and the off-diagonal terms are taken
+        // at a point clamped to 1.3x the frustum. Where the clamp is active
+        // the term no longer depends on px/py and its depth derivative halves.
+        let limx = 1.3 * (0.5 * image_size.0 as f32) / fx;
+        let limy = 1.3 * (0.5 * image_size.1 as f32) / fy;
+        let ux = pos_cam[0] / depth;
+        let uy = pos_cam[1] / depth;
+        let clamped_x = ux.abs() > limx;
+        let clamped_y = uy.abs() > limy;
+        let tx = ux.clamp(-limx, limx) * depth;
+        let ty = uy.clamp(-limy, limy) * depth;
         let j00 = fx / depth;
-        let j11 = fy / depth;
-        let j02 = -fx * pos_cam[0] / z2;
-        let j12 = -fy * pos_cam[1] / z2;
+        let j11 = -fy / depth;
+        let j02 = -fx * tx / z2;
+        let j12 = fy * ty / z2;
 
         // T = J * W (only rows 0 and 1 matter)
         // T_row0 = J[0][0]*W_row0 + J[0][2]*W_row2
@@ -188,15 +202,31 @@ pub fn backward_projection(
         // J[1][2] = -fy*py/z²      → dJ12/d(pos_cam.y) = -fy/z², dJ12/d(pos_cam.z) = -2*fy*py/z³ = 2*j12/depth
         let mut dL_dpos_cam = [0.0f32; 3];
 
-        // dL/d(pos_cam.x) from J[0][2]
-        dL_dpos_cam[0] += dL_dj02 * (-fx / z2);
-        // dL/d(pos_cam.y) from J[1][2]
-        dL_dpos_cam[1] += dL_dj12 * (-fy / z2);
-        // dL/d(pos_cam.z) from J[0][0], J[1][1], J[0][2], J[1][2]
+        // dL/d(pos_cam.x) from J[0][2]: -fx/z² unclamped, nothing when clamped
+        if !clamped_x {
+            dL_dpos_cam[0] += dL_dj02 * (-fx / z2);
+        }
+        // dL/d(pos_cam.y) from J[1][2]: +fy/z² unclamped (the y row's sign)
+        if !clamped_y {
+            dL_dpos_cam[1] += dL_dj12 * (fy / z2);
+        }
+        // dL/d(pos_cam.z): J00 = fx/depth → fx/z²; J11 = -fy/depth → -fy/z²;
+        // the off-diagonals scale as 1/z² unclamped (2 j/depth) and as 1/depth
+        // when clamped (j/depth)
         dL_dpos_cam[2] += dL_dj00 * (fx / z2)
-            + dL_dj11 * (fy / z2)
-            + dL_dj02 * (2.0 * j02 / depth)
-            + dL_dj12 * (2.0 * j12 / depth);
+            + dL_dj11 * (-fy / z2)
+            + dL_dj02
+                * (if clamped_x {
+                    j02 / depth
+                } else {
+                    2.0 * j02 / depth
+                })
+            + dL_dj12
+                * (if clamped_y {
+                    j12 / depth
+                } else {
+                    2.0 * j12 / depth
+                });
 
         // === 5. dL/d(mean_2d) → dL/d(pos_cam) ===
         // mean_2d_x = fx * pos_cam.x / depth + cx

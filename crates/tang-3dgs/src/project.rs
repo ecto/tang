@@ -114,12 +114,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let mean_2d_x = fx * pos_cam.x / depth + cx;
     let mean_2d_y = fy * (-pos_cam.y) / depth + cy;
 
-    // Jacobian of perspective projection
+    // Jacobian of perspective projection, at a point clamped to 1.3× the
+    // frustum (the reference rasterizer's limx/limy). Without the clamp a
+    // gaussian just outside the image gets a Jacobian from a wildly oblique
+    // ray and a covariance the size of the screen; a camera standing inside a
+    // scene then sees one flat colour. Found rendering Mip-NeRF 360 bonsai
+    // from its own camera poses.
+    //
+    // The y row carries the same sign flip as mean_2d_y (image y is down),
+    // or every anisotropic gaussian's ellipse is mirrored about x.
+    let limx = 1.3 * (0.5 * f32(config.image_width)) / fx;
+    let limy = 1.3 * (0.5 * f32(config.image_height)) / fy;
+    let tx = clamp(pos_cam.x / depth, -limx, limx) * depth;
+    let ty = clamp(pos_cam.y / depth, -limy, limy) * depth;
     let z2 = depth * depth;
     let J = mat3x3<f32>(
         vec3<f32>(fx / depth, 0.0, 0.0),
-        vec3<f32>(0.0, fy / depth, 0.0),
-        vec3<f32>(-fx * pos_cam.x / z2, -fy * pos_cam.y / z2, 0.0),
+        vec3<f32>(0.0, -fy / depth, 0.0),
+        vec3<f32>(-fx * tx / z2, fy * ty / z2, 0.0),
     );
 
     // View rotation (upper-left 3×3 of view matrix)
