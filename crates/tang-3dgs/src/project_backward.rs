@@ -215,8 +215,18 @@ pub fn backward_projection(
         // when clamped (j/depth)
         dL_dpos_cam[2] += dL_dj00 * (fx / z2)
             + dL_dj11 * (-fy / z2)
-            + dL_dj02 * (if clamped_x { j02 / depth } else { 2.0 * j02 / depth })
-            + dL_dj12 * (if clamped_y { j12 / depth } else { 2.0 * j12 / depth });
+            + dL_dj02
+                * (if clamped_x {
+                    j02 / depth
+                } else {
+                    2.0 * j02 / depth
+                })
+            + dL_dj12
+                * (if clamped_y {
+                    j12 / depth
+                } else {
+                    2.0 * j12 / depth
+                });
 
         // === 5. dL/d(mean_2d) → dL/d(pos_cam) ===
         // mean_2d_x = fx * pos_cam.x / depth + cx
