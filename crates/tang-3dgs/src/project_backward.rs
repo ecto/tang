@@ -25,7 +25,7 @@ pub fn backward_projection(
     log_scales: &[[f32; 3]],
     rotations: &[[f32; 4]],
     camera: &Camera,
-    /// Image width and height, for the frustum clamp the forward pass applies.
+    // image width and height, for the frustum clamp the forward pass applies
     image_size: (u32, u32),
     radii: &[u32],
     dL_dconics: &[[f32; 3]],
