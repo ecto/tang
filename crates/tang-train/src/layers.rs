@@ -1,3 +1,4 @@
+use crate::conv::{self, ConvSpec};
 use crate::{Module, Parameter, Rng};
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -555,6 +556,30 @@ impl<S: Scalar> Module<S> for Conv1d<S> {
 /// Output: `[batch, out_channels, out_h, out_w]`
 ///
 /// where `out_h = (height + 2*padding - dilation*(kh-1) - 1) / stride + 1`
+///
+/// # Algorithm
+///
+/// The forward pass gathers each batch element's receptive fields into a patch
+/// matrix `cols[K, out_h·out_w]` (`K = in_channels·kh·kw`) and computes the
+/// output as one matrix product `W[out_channels, K] · cols`, delegating to the
+/// blocked, NEON-accelerated GEMM kernels in `tang-la`. The backward pass is
+/// the same reduction read two other ways: `∂W = ∂Y · colsᵀ`, `∂cols = Wᵀ · ∂Y`
+/// followed by a `col2im` scatter for `∂input`, and a plain sum over the
+/// spatial axes for `∂bias`. See `crate::conv` for the derivation and the
+/// patch-matrix layout.
+///
+/// This is two orders of magnitude faster than the naive `Tensor::from_fn`
+/// formulation on a realistic layer, which matters because convolution is
+/// essentially the whole cost of a convolutional training step.
+///
+/// # Fallback
+///
+/// The fast path requires the input, the weights and the incoming gradient to
+/// be contiguous — which every tensor built by `Tensor::new`, `zeros`,
+/// `from_fn` or `reshape` is. Should a strided tensor reach the layer, both
+/// passes fall back to [`Conv2d::forward_reference`] and
+/// [`Conv2d::backward_reference`], the direct `get`-per-tap implementation.
+/// Those two are also the parity oracle the tests check the fast path against.
 pub struct Conv2d<S: Scalar> {
     pub weight: Parameter<S>, // [out_channels, in_channels, kh, kw]
     pub bias: Parameter<S>,   // [out_channels]
@@ -623,10 +648,32 @@ impl<S: Scalar> Conv2d<S> {
             input.get(&[b, c, i as usize, j as usize])
         }
     }
-}
 
-impl<S: Scalar> Module<S> for Conv2d<S> {
-    fn forward(&mut self, input: &Tensor<S>) -> Tensor<S> {
+    /// Resolve the layer's configuration against a concrete input shape.
+    fn spec(&self, input: &Tensor<S>) -> ConvSpec {
+        let height = input.shape()[2];
+        let width = input.shape()[3];
+        ConvSpec {
+            batch: input.shape()[0],
+            c_in: self.in_channels,
+            h: height,
+            w: width,
+            c_out: self.out_channels,
+            kh: self.kernel_size,
+            kw: self.kernel_size,
+            stride: self.stride,
+            padding: self.padding,
+            dilation: self.dilation,
+            out_h: self.out_size(height),
+            out_w: self.out_size(width),
+        }
+    }
+
+    /// The direct, tap-at-a-time forward: the reference the fast im2col +
+    /// GEMM path is checked against, and the fallback for strided inputs.
+    ///
+    /// Like `Module::forward` it caches the input for the backward pass.
+    pub fn forward_reference(&mut self, input: &Tensor<S>) -> Tensor<S> {
         assert_eq!(
             input.ndim(),
             4,
@@ -665,7 +712,9 @@ impl<S: Scalar> Module<S> for Conv2d<S> {
         )
     }
 
-    fn backward(&mut self, grad_output: &Tensor<S>) -> Tensor<S> {
+    /// The direct backward matching [`Conv2d::forward_reference`]. Accumulates
+    /// into the weight and bias gradients and returns the input gradient.
+    pub fn backward_reference(&mut self, grad_output: &Tensor<S>) -> Tensor<S> {
         let input = self
             .cached_input
             .as_ref()
@@ -741,6 +790,46 @@ impl<S: Scalar> Module<S> for Conv2d<S> {
             }
             sum
         })
+    }
+}
+
+impl<S: Scalar> Module<S> for Conv2d<S> {
+    fn forward(&mut self, input: &Tensor<S>) -> Tensor<S> {
+        assert_eq!(
+            input.ndim(),
+            4,
+            "Conv2d input must be [batch, in_channels, height, width]"
+        );
+        assert_eq!(input.shape()[1], self.in_channels);
+
+        if !input.is_contiguous() || !self.weight.data.is_contiguous() {
+            return self.forward_reference(input);
+        }
+
+        let spec = self.spec(input);
+        self.cached_input = Some(input.clone());
+        conv::forward(input, &self.weight.data, &self.bias.data, &spec)
+    }
+
+    fn backward(&mut self, grad_output: &Tensor<S>) -> Tensor<S> {
+        let input = self
+            .cached_input
+            .as_ref()
+            .expect("must call forward before backward");
+
+        if !input.is_contiguous()
+            || !self.weight.data.is_contiguous()
+            || !grad_output.is_contiguous()
+        {
+            return self.backward_reference(grad_output);
+        }
+
+        let spec = self.spec(input);
+        let (grad_input, grad_w, grad_b) =
+            conv::backward(input, &self.weight.data, grad_output, &spec);
+        self.weight.accumulate_grad(&grad_w);
+        self.bias.accumulate_grad(&grad_b);
+        grad_input
     }
 
     fn parameters(&self) -> Vec<&Parameter<S>> {

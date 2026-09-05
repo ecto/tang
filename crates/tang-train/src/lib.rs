@@ -44,6 +44,7 @@
 
 extern crate alloc;
 
+mod conv;
 mod ctc;
 pub mod data;
 mod layers;
