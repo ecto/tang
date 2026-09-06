@@ -44,7 +44,7 @@ for epoch in 0..100 {
 | `Dropout` | — | Inverted; identity in eval mode |
 | `Embedding` | lookup table | Integer indices → dense vectors |
 | `Conv1d` | kernel, bias | stride=1, no padding |
-| `Conv2d` | kernel, bias | stride=1, no padding |
+| `Conv2d` | kernel, bias | stride, padding, dilation; im2col + GEMM |
 | `LayerNorm` | γ, β | Learnable affine |
 | `MultiHeadAttention` | Q, K, V, Out | Scaled dot-product |
 | `TransformerBlock` | attention + FFN | Pre-norm with residuals |
@@ -96,6 +96,12 @@ let residual = pinn::pde_residual(
 - `Module` trait: `forward`, `backward`, `parameters`, `state_dict`, `set_training`
 - Hand-written backward passes (no runtime tape overhead)
 - Activation caching during forward for backward reuse
+- `Conv2d` runs as im2col + `tang-la` GEMM, ~100x the naive `Tensor::from_fn`
+  formulation and ~6x hand-written flat convolution loops on a 3x3 10-32-32-25
+  network over 64x64 tiles at batch 16 (`cargo run --release --example
+  conv2d_bench`); the direct per-tap path remains as `forward_reference` /
+  `backward_reference`, used as the fallback for strided tensors and as the
+  parity oracle in the tests
 - LCG-based deterministic PRNG for reproducible shuffling and dropout
 
 ## License
