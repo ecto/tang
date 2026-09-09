@@ -34,43 +34,40 @@ repository = "https://github.com/ecto/tang"
 rust-version = "1.94"
 authors = ["Cam Pedersen <cam@campedersen.com>"]
 
-# Release plan (docs/publishing.md). crates.io today: tang 0.2.0, tang-la 0.1.0,
-# tang-ad 0.1.0, tang-expr 0.1.0. Everything else is unpublished.
-#   tang        0.2.0 -> 0.2.1   (additive since the 0.2.0 commit f82c629:
-#                                 the `algebraic` feature, SIMD stats moments,
-#                                 row-major GEMM. No breaking change found.)
-#   tang-la     0.1.0 -> 0.1.1   (algebraic reductions, eigensolver fix)
-#   tang-ad     0.1.0 -> 0.1.1
-#   tang-expr   0.1.0 -> 0.1.1
-#   tang-tensor 0.1.0 first publish
-#   tang-optim  0.1.0 first publish
-#   tang-gpu    0.1.0 first publish
-#   tang-train  0.1.0 first publish
-#   tang-3dgs   0.1.0 first publish
-# Versions are NOT bumped here: tang has no release-commit convention and no
-# tags — 0.2.0 was bumped inline inside a feature commit. Bump on the release
-# commit, then publish in the order in docs/publishing.md.
+# Released (docs/publishing.md). crates.io before this commit: tang 0.2.0,
+# tang-la 0.1.0, tang-ad 0.1.0, tang-expr 0.1.0. Everything else unpublished.
+#   tang        0.2.1   (additive since the 0.2.0 commit f82c629: the
+#                        `algebraic` feature, SIMD stats moments, row-major
+#                        GEMM. No breaking change found.)
+#   tang-la     0.1.1   (algebraic reductions, eigensolver fix)
+#   tang-ad     0.1.1
+#   tang-expr   0.1.1
+#   tang-tensor / tang-optim / tang-gpu / tang-train / tang-3dgs
+#               0.1.0, first publish — they take [workspace.package] version.
+# tang-la, tang-ad and tang-expr carry their own `version` because they moved
+# off the workspace number. Publish in the order in docs/publishing.md
+# (scripts/publish.sh).
 
 [workspace.dependencies]
-tang = { version = "0.2.0", path = "crates/tang" }
-tang-la = { version = "0.1.0", path = "crates/tang-la" }
-tang-ad = { version = "0.1.0", path = "crates/tang-ad" }
-tang-sparse = { version = "0.1.0", path = "crates/tang-sparse" }
-tang-gpu = { version = "0.1.0", path = "crates/tang-gpu" }
-tang-tensor = { version = "0.1.0", path = "crates/tang-tensor" }
-tang-optim = { version = "0.1.0", path = "crates/tang-optim" }
-tang-train = { version = "0.1.0", path = "crates/tang-train" }
-tang-safetensors = { version = "0.1.0", path = "crates/tang-safetensors" }
-tang-hub = { version = "0.1.0", path = "crates/tang-hub" }
-tang-expr = { version = "0.1.0", path = "crates/tang-expr" }
-tang-mesh = { version = "0.1.0", path = "crates/tang-mesh" }
-tang-infer = { version = "0.1.0", path = "crates/tang-infer" }
-tang-onnx = { version = "0.1.0", path = "crates/tang-onnx" }
-tang-compile = { version = "0.1.0", path = "crates/tang-compile" }
-tang-compute = { version = "0.1.0", path = "crates/tang-compute" }
-tang-3dgs = { version = "0.1.0", path = "crates/tang-3dgs" }
-tang-holo = { version = "0.1.0", path = "crates/tang-holo" }
-tang-sheffer = { version = "0.1.0", path = "crates/tang-sheffer" }
+tang = { version = "0.2", path = "crates/tang" }
+tang-la = { version = "0.1", path = "crates/tang-la" }
+tang-ad = { version = "0.1", path = "crates/tang-ad" }
+tang-sparse = { version = "0.1", path = "crates/tang-sparse" }
+tang-gpu = { version = "0.1", path = "crates/tang-gpu" }
+tang-tensor = { version = "0.1", path = "crates/tang-tensor" }
+tang-optim = { version = "0.1", path = "crates/tang-optim" }
+tang-train = { version = "0.1", path = "crates/tang-train" }
+tang-safetensors = { version = "0.1", path = "crates/tang-safetensors" }
+tang-hub = { version = "0.1", path = "crates/tang-hub" }
+tang-expr = { version = "0.1", path = "crates/tang-expr" }
+tang-mesh = { version = "0.1", path = "crates/tang-mesh" }
+tang-infer = { version = "0.1", path = "crates/tang-infer" }
+tang-onnx = { version = "0.1", path = "crates/tang-onnx" }
+tang-compile = { version = "0.1", path = "crates/tang-compile" }
+tang-compute = { version = "0.1", path = "crates/tang-compute" }
+tang-3dgs = { version = "0.1", path = "crates/tang-3dgs" }
+tang-holo = { version = "0.1", path = "crates/tang-holo" }
+tang-sheffer = { version = "0.1", path = "crates/tang-sheffer" }
 iroh = "0.96"
 tarpc = { version = "0.35", features = ["tokio1", "serde-transport"] }
 tokio = { version = "1", features = ["full"] }

@@ -5753,7 +5753,7 @@ checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
 
 [[package]]
 name = "tang"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "approx",
  "bytemuck",
@@ -5789,7 +5789,7 @@ dependencies = [
 
 [[package]]
 name = "tang-ad"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "approx",
  "tang",
@@ -5835,7 +5835,7 @@ dependencies = [
 
 [[package]]
 name = "tang-expr"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "tang",
 ]
@@ -5889,7 +5889,7 @@ dependencies = [
 
 [[package]]
 name = "tang-la"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "approx",
  "faer 0.24.0",
