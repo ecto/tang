@@ -2,8 +2,14 @@
 name = "tang-train"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Computational graph, parameter management, training loop"
+repository.workspace = true
+readme = "README.md"
+keywords = ["machine-learning", "training", "neural-network", "autodiff"]
+categories = ["science", "mathematics"]
+include = ["src/**/*", "README.md", "examples/**/*", "tests/**/*"]
 
 [features]
 accelerate = ["tang-la/accelerate", "tang-tensor/accelerate"]

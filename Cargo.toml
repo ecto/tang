@@ -30,6 +30,26 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/ecto/tang"
+# CI builds on 1.94.1 (.github/workflows); that is the MSRV we promise.
+rust-version = "1.94"
+authors = ["Cam Pedersen <cam@campedersen.com>"]
+
+# Release plan (docs/publishing.md). crates.io today: tang 0.2.0, tang-la 0.1.0,
+# tang-ad 0.1.0, tang-expr 0.1.0. Everything else is unpublished.
+#   tang        0.2.0 -> 0.2.1   (additive since the 0.2.0 commit f82c629:
+#                                 the `algebraic` feature, SIMD stats moments,
+#                                 row-major GEMM. No breaking change found.)
+#   tang-la     0.1.0 -> 0.1.1   (algebraic reductions, eigensolver fix)
+#   tang-ad     0.1.0 -> 0.1.1
+#   tang-expr   0.1.0 -> 0.1.1
+#   tang-tensor 0.1.0 first publish
+#   tang-optim  0.1.0 first publish
+#   tang-gpu    0.1.0 first publish
+#   tang-train  0.1.0 first publish
+#   tang-3dgs   0.1.0 first publish
+# Versions are NOT bumped here: tang has no release-commit convention and no
+# tags — 0.2.0 was bumped inline inside a feature commit. Bump on the release
+# commit, then publish in the order in docs/publishing.md.
 
 [workspace.dependencies]
 tang = { version = "0.2.0", path = "crates/tang" }

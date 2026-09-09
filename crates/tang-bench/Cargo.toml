@@ -2,6 +2,7 @@
 name = "tang-bench"
 version.workspace = true
 edition.workspace = true
+# benchmarks and their fixtures, not an API anyone depends on
 publish = false
 
 [lib]

@@ -2,8 +2,14 @@
 name = "tang-onnx"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "ONNX model import/export for tang"
+repository.workspace = true
+readme = "README.md"
+keywords = ["onnx", "import", "export", "model"]
+categories = ["encoding", "science"]
+include = ["src/**/*", "README.md"]
 
 [dependencies]
 tang-tensor = { workspace = true }

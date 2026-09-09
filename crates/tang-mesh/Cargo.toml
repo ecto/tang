@@ -2,8 +2,14 @@
 name = "tang-mesh"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Distributed expression graph execution for tang"
+repository.workspace = true
+readme = "README.md"
+keywords = ["distributed", "mesh", "rpc", "compute"]
+categories = ["network-programming", "science"]
+include = ["src/**/*", "README.md", "examples/**/*", "tests/**/*"]
 
 [features]
 default = []

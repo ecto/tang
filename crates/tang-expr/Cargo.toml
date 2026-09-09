@@ -2,8 +2,14 @@
 name = "tang-expr"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "RISC expression graph for symbolic computation, differentiation, and compilation"
+repository.workspace = true
+readme = "README.md"
+keywords = ["expression", "symbolic", "graph", "codegen", "autodiff"]
+categories = ["mathematics", "science", "compilers"]
+include = ["src/**/*", "README.md", "examples/**/*"]
 
 [dependencies]
 tang = { workspace = true, features = ["std"] }

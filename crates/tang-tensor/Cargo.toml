@@ -2,8 +2,14 @@
 name = "tang-tensor"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "N-dimensional arrays with CPU and GPU backends"
+repository.workspace = true
+readme = "README.md"
+keywords = ["tensor", "ndarray", "machine-learning", "gpu"]
+categories = ["mathematics", "science"]
+include = ["src/**/*", "README.md"]
 
 [dependencies]
 tang = { workspace = true }

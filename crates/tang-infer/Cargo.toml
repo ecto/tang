@@ -2,8 +2,14 @@
 name = "tang-infer"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Inference runtime: KV-cache, sampling strategies, autoregressive generation"
+repository.workspace = true
+readme = "README.md"
+keywords = ["inference", "llm", "kv-cache", "sampling"]
+categories = ["science", "algorithms"]
+include = ["src/**/*", "README.md"]
 
 [features]
 default = []

@@ -2,8 +2,14 @@
 name = "tang-compile"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Graph optimization and compilation passes for tang"
+repository.workspace = true
+readme = "README.md"
+keywords = ["compiler", "graph", "optimization", "codegen"]
+categories = ["compilers", "mathematics"]
+include = ["src/**/*", "README.md"]
 
 [dependencies]
 tang-expr = { workspace = true }

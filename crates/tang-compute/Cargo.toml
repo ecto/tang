@@ -2,8 +2,14 @@
 name = "tang-compute"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Native GPU compute backends via tang-expr multi-target codegen"
+repository.workspace = true
+readme = "README.md"
+keywords = ["gpu", "metal", "cuda", "compute", "codegen"]
+categories = ["hardware-support", "science"]
+include = ["src/**/*", "README.md", "build.rs"]
 
 [features]
 default = []

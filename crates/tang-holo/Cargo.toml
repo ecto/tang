@@ -2,8 +2,14 @@
 name = "tang-holo"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Talking head hologram pipeline — preprocessing, training, and runtime"
+repository.workspace = true
+readme = "README.md"
+keywords = ["hologram", "gaussian-splatting", "avatar", "rendering"]
+categories = ["graphics", "rendering"]
+include = ["src/**/*", "README.md"]
 
 [dependencies]
 tang-3dgs = { workspace = true }

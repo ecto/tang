@@ -2,8 +2,14 @@
 name = "tang-3dgs"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Differentiable 3D Gaussian Splatting rasterizer on Metal/Vulkan/DX12 via wgpu"
+repository.workspace = true
+readme = "README.md"
+keywords = ["gaussian-splatting", "rendering", "gpu", "wgpu", "differentiable"]
+categories = ["graphics", "rendering", "science"]
+include = ["src/**/*", "README.md", "examples/**/*"]
 
 [dependencies]
 tang = { workspace = true }
