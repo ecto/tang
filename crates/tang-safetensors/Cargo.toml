@@ -2,8 +2,14 @@
 name = "tang-safetensors"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "CPU safetensors load/save for tang tensors"
+repository.workspace = true
+readme = "README.md"
+keywords = ["safetensors", "tensor", "serialization", "io"]
+categories = ["encoding", "science"]
+include = ["src/**/*", "README.md"]
 
 [dependencies]
 tang = { workspace = true }

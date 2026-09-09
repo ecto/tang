@@ -2,8 +2,14 @@
 name = "tang-hub"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "HuggingFace Hub model download and loading"
+repository.workspace = true
+readme = "README.md"
+keywords = ["huggingface", "models", "download", "tensor"]
+categories = ["api-bindings", "science"]
+include = ["src/**/*", "README.md"]
 
 [dependencies]
 tang = { workspace = true }

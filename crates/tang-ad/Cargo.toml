@@ -2,8 +2,14 @@
 name = "tang-ad"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Reverse-mode automatic differentiation"
+repository.workspace = true
+readme = "README.md"
+keywords = ["autodiff", "gradient", "backprop", "math"]
+categories = ["mathematics", "science"]
+include = ["src/**/*", "README.md"]
 
 [dependencies]
 tang = { workspace = true }

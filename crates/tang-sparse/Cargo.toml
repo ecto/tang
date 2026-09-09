@@ -2,8 +2,14 @@
 name = "tang-sparse"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "CSR/CSC sparse matrices and sparse solvers"
+repository.workspace = true
+readme = "README.md"
+keywords = ["sparse", "matrix", "csr", "solver", "math"]
+categories = ["mathematics", "science"]
+include = ["src/**/*", "README.md"]
 
 [dependencies]
 tang = { workspace = true }

@@ -2,9 +2,14 @@
 name = "tang-sheffer"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Search for universal (Sheffer) operators over elementary functions."
+readme = "README.md"
+keywords = ["sheffer", "logic", "search", "functions"]
+categories = ["mathematics", "science"]
+include = ["src/**/*", "README.md", "examples/**/*"]
 
 [features]
 default = []

@@ -2,8 +2,14 @@
 name = "tang-optim"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Optimization algorithms — Adam, L-BFGS, Newton, Levenberg-Marquardt"
+repository.workspace = true
+readme = "README.md"
+keywords = ["optimization", "adam", "lbfgs", "newton", "math"]
+categories = ["mathematics", "science", "algorithms"]
+include = ["src/**/*", "README.md"]
 
 [features]
 default = []
