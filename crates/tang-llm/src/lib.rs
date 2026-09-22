@@ -9,4 +9,4 @@ pub mod model;
 pub mod weights;
 
 pub use config::Config;
-pub use model::{Cache, Model};
+pub use model::{Cache, Dtype, Model};

@@ -6,6 +6,13 @@ use anyhow::Result;
 use std::path::Path;
 use tang_compute::ComputeDevice;
 
+/// How matrices are stored on device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dtype {
+    F32,
+    Bf16,
+}
+
 struct Layer<B> {
     attn_norm: B,
     wq: B,
@@ -42,38 +49,70 @@ pub struct Cache<B> {
 }
 
 impl<D: ComputeDevice> Model<D> {
-    pub fn load(dev: D, dir: &Path, max_ctx: usize) -> Result<Self> {
+    /// Load a checkpoint directory. Matrices are kept in `dtype` on device; norms stay f32.
+    pub fn load(dev: D, dir: &Path, max_ctx: usize, dtype: Dtype) -> Result<Self> {
         let cfg: Config = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
         let w = Weights::open(dir)?;
-        let up = |name: &str| -> Result<D::Buffer> { Ok(dev.upload(&w.f32(name)?.0)) };
+        let vec = |name: &str| -> Result<D::Buffer> { Ok(dev.upload(&w.f32(name)?.0)) };
+        let up = |name: &str| -> Result<D::Buffer> {
+            match dtype {
+                Dtype::F32 => vec(name),
+                Dtype::Bf16 => Ok(dev.upload_bf16(&w.bf16(name)?)),
+            }
+        };
         let opt = |name: &str| -> Result<Option<D::Buffer>> {
-            if w.has(name) { up(name).map(Some) } else { Ok(None) }
+            if w.has(name) {
+                up(name).map(Some)
+            } else {
+                Ok(None)
+            }
+        };
+        let opt_vec = |name: &str| -> Result<Option<D::Buffer>> {
+            if w.has(name) {
+                vec(name).map(Some)
+            } else {
+                Ok(None)
+            }
         };
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for l in 0..cfg.num_hidden_layers {
             let p = format!("model.layers.{l}");
             layers.push(Layer {
-                attn_norm: up(&format!("{p}.input_layernorm.weight"))?,
+                attn_norm: vec(&format!("{p}.input_layernorm.weight"))?,
                 wq: up(&format!("{p}.self_attn.q_proj.weight"))?,
                 wk: up(&format!("{p}.self_attn.k_proj.weight"))?,
                 wv: up(&format!("{p}.self_attn.v_proj.weight"))?,
                 wo: up(&format!("{p}.self_attn.o_proj.weight"))?,
-                q_norm: opt(&format!("{p}.self_attn.q_norm.weight"))?,
-                k_norm: opt(&format!("{p}.self_attn.k_norm.weight"))?,
-                mlp_norm: up(&format!("{p}.post_attention_layernorm.weight"))?,
+                q_norm: opt_vec(&format!("{p}.self_attn.q_norm.weight"))?,
+                k_norm: opt_vec(&format!("{p}.self_attn.k_norm.weight"))?,
+                mlp_norm: vec(&format!("{p}.post_attention_layernorm.weight"))?,
                 w_gate: up(&format!("{p}.mlp.gate_proj.weight"))?,
                 w_up: up(&format!("{p}.mlp.up_proj.weight"))?,
                 w_down: up(&format!("{p}.mlp.down_proj.weight"))?,
             });
         }
         let embed = up("model.embed_tokens.weight")?;
-        let lm_head = if cfg.tie_word_embeddings { None } else { opt("lm_head.weight")? };
-        let norm = up("model.norm.weight")?;
+        let lm_head = if cfg.tie_word_embeddings {
+            None
+        } else {
+            opt("lm_head.weight")?
+        };
+        let norm = vec("model.norm.weight")?;
 
         let max_ctx = max_ctx.min(cfg.max_position_embeddings);
         let (cos, sin) = rope_tables(cfg.head_dim(), max_ctx, cfg.rope_theta);
         let (cos, sin) = (dev.upload(&cos), dev.upload(&sin));
-        Ok(Self { cfg, dev, embed, layers, norm, lm_head, cos, sin, max_ctx })
+        Ok(Self {
+            cfg,
+            dev,
+            embed,
+            layers,
+            norm,
+            lm_head,
+            cos,
+            sin,
+            max_ctx,
+        })
     }
 
     pub fn max_ctx(&self) -> usize {
@@ -92,13 +131,27 @@ impl<D: ComputeDevice> Model<D> {
 
     /// Run `tokens` through the model after what's already in `cache`, append them to it, and
     /// return logits: for the last token only, or for every token if `all` is set.
-    pub fn forward(&self, tokens: &[u32], cache: &mut Cache<D::Buffer>, all: bool) -> Result<Vec<f32>> {
+    pub fn forward(
+        &self,
+        tokens: &[u32],
+        cache: &mut Cache<D::Buffer>,
+        all: bool,
+    ) -> Result<Vec<f32>> {
         let c = &self.cfg;
         let dev = &self.dev;
         let (s, pos) = (tokens.len(), cache.len);
         anyhow::ensure!(s > 0, "no tokens");
-        anyhow::ensure!(pos + s <= self.max_ctx, "context full ({} tokens)", self.max_ctx);
-        let (h, hd, nh, nkv) = (c.hidden_size, c.head_dim(), c.num_attention_heads, c.kv_heads());
+        anyhow::ensure!(
+            pos + s <= self.max_ctx,
+            "context full ({} tokens)",
+            self.max_ctx
+        );
+        let (h, hd, nh, nkv) = (
+            c.hidden_size,
+            c.head_dim(),
+            c.num_attention_heads,
+            c.kv_heads(),
+        );
         let (qd, kvd, ff) = (c.q_dim(), c.kv_dim(), c.intermediate_size);
         let eps = c.rms_norm_eps;
 
@@ -130,7 +183,11 @@ impl<D: ComputeDevice> Model<D> {
             let d = dev.linear(&act, &w.w_down, s, ff, h);
             x = dev.add_tensors_buf(&x, &d, s * h);
         }
-        let (rows, x) = if all { (s, x) } else { (1, dev.slice_buffer(&x, (s - 1) * h, h)) };
+        let (rows, x) = if all {
+            (s, x)
+        } else {
+            (1, dev.slice_buffer(&x, (s - 1) * h, h))
+        };
         let x = dev.rms_norm(&x, &self.norm, rows, h, eps);
         let head = self.lm_head.as_ref().unwrap_or(&self.embed);
         let logits = dev.linear(&x, head, rows, h, c.vocab_size);

@@ -2,23 +2,26 @@
 //! checking against a reference implementation).
 //! `tang-llm generate <model-dir> <token ids...> [-n N]` — greedy decode, print ids and speed.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 use std::time::Instant;
 use tang_compute::MetalDevice;
-use tang_llm::Model;
+use tang_llm::{Dtype, Model};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (cmd, dir) = match args.as_slice() {
         [c, d, ..] => (c.as_str(), PathBuf::from(d)),
-        _ => bail!("usage: tang-llm <logits|generate> <model-dir> <ids...> [-n N]"),
+        _ => bail!("usage: tang-llm <logits|generate> <model-dir> <ids...> [-n N] [--f32]"),
     };
     let mut n = 32;
+    let mut dtype = Dtype::Bf16;
     let mut ids = Vec::new();
     let mut rest = args[2..].iter();
     while let Some(a) = rest.next() {
-        if a == "-n" {
+        if a == "--f32" {
+            dtype = Dtype::F32;
+        } else if a == "-n" {
             n = rest.next().context("-n N")?.parse()?;
         } else {
             ids.push(a.parse::<u32>()?);
@@ -26,7 +29,7 @@ fn main() -> Result<()> {
     }
     let dev = MetalDevice::new().context("no Metal device")?;
     let t = Instant::now();
-    let model = Model::load(dev, &dir, 4096)?;
+    let model = Model::load(dev, &dir, 4096, dtype)?;
     eprintln!("loaded in {:.2}s", t.elapsed().as_secs_f32());
     let mut cache = model.new_cache();
     match cmd {

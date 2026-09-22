@@ -1,6 +1,6 @@
 //! Memory-mapped safetensors checkpoints, single-file or sharded.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use memmap2::Mmap;
 use safetensors::{Dtype, SafeTensors};
 use std::collections::HashMap;
@@ -42,6 +42,24 @@ impl Weights {
         self.index.contains_key(name)
     }
 
+    /// A tensor as raw bfloat16 bits (f32/f16 are rounded), for weights kept in bf16 on device.
+    pub fn bf16(&self, name: &str) -> Result<Vec<u16>> {
+        let i = *self
+            .index
+            .get(name)
+            .with_context(|| format!("missing tensor {name}"))?;
+        let st = SafeTensors::deserialize(&self.maps[i])?;
+        let t = st.tensor(name)?;
+        if t.dtype() == Dtype::BF16 {
+            return Ok(t
+                .data()
+                .chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .collect());
+        }
+        Ok(self.f32(name)?.0.into_iter().map(to_bf16).collect())
+    }
+
     /// A tensor as f32 (bf16/f16 are widened), with its shape.
     pub fn f32(&self, name: &str) -> Result<(Vec<f32>, Vec<usize>)> {
         let i = *self
@@ -65,6 +83,15 @@ impl Weights {
         };
         Ok((out, t.shape().to_vec()))
     }
+}
+
+/// Round-to-nearest-even f32 -> bf16.
+fn to_bf16(x: f32) -> u16 {
+    let b = x.to_bits();
+    if x.is_nan() {
+        return ((b >> 16) | 0x40) as u16;
+    }
+    ((b + 0x7fff + ((b >> 16) & 1)) >> 16) as u16
 }
 
 fn bytemuck_f32(data: &[u8]) -> Vec<f32> {

@@ -871,9 +871,27 @@ pub trait ComputeDevice: Send {
         *dst = self.upload(&d);
     }
 
+    /// Upload read-only weights given as raw bfloat16 bits. Backends that support it keep them
+    /// in bf16 (half the memory and bandwidth) for [`linear`](Self::linear) and
+    /// [`embedding`](Self::embedding); the default widens to f32.
+    fn upload_bf16(&self, bits: &[u16]) -> Self::Buffer {
+        let wide: Vec<f32> = bits
+            .iter()
+            .map(|&b| f32::from_bits((b as u32) << 16))
+            .collect();
+        self.upload(&wide)
+    }
+
     /// Linear layer: `y[m, n] = x[m, k] @ w[n, k]^T`, with `w` stored the way checkpoints store
     /// it (`[out, in]` row-major). Backends specialize small `m` (decode) as a GEMV.
-    fn linear(&self, x: &Self::Buffer, w: &Self::Buffer, m: usize, k: usize, n: usize) -> Self::Buffer {
+    fn linear(
+        &self,
+        x: &Self::Buffer,
+        w: &Self::Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Self::Buffer {
         self.matmul_b_transposed(x, w, m, k, n)
     }
 
