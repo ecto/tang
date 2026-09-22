@@ -1,0 +1,24 @@
+[package]
+name = "tang-llm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "LLM inference on tang-compute: Qwen3-family models, KV cache, sampling, chat templates"
+repository.workspace = true
+keywords = ["llm", "inference", "metal", "qwen"]
+categories = ["science"]
+publish = false
+
+[features]
+default = ["metal"]
+metal = ["tang-compute/metal"]
+
+[dependencies]
+tang-compute = { workspace = true }
+safetensors = { workspace = true }
+tokenizers = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"
+memmap2 = "0.9"
+anyhow = "1"

@@ -871,6 +871,44 @@ pub trait ComputeDevice: Send {
         *dst = self.upload(&d);
     }
 
+    /// Linear layer: `y[m, n] = x[m, k] @ w[n, k]^T`, with `w` stored the way checkpoints store
+    /// it (`[out, in]` row-major). Backends specialize small `m` (decode) as a GEMV.
+    fn linear(&self, x: &Self::Buffer, w: &Self::Buffer, m: usize, k: usize, n: usize) -> Self::Buffer {
+        self.matmul_b_transposed(x, w, m, k, n)
+    }
+
+    /// Half-split ("NeoX") RoPE, as used by Llama/Qwen checkpoints: rotates pairs
+    /// `(i, i + head_dim/2)`. Input `[seq_len, n_heads, head_dim]`; tables `[max_pos, head_dim/2]`
+    /// on device. Returns a new buffer.
+    fn rope_half_cached(
+        &self,
+        input: &Self::Buffer,
+        cos_buf: &Self::Buffer,
+        sin_buf: &Self::Buffer,
+        seq_len: usize,
+        n_heads: usize,
+        head_dim: usize,
+        start_pos: usize,
+    ) -> Self::Buffer {
+        let data = self.download(input);
+        let (cos, sin) = (self.download(cos_buf), self.download(sin_buf));
+        let half = head_dim / 2;
+        let mut out = data.clone();
+        for s in 0..seq_len {
+            let pos = start_pos + s;
+            for h in 0..n_heads {
+                let base = (s * n_heads + h) * head_dim;
+                for i in 0..half {
+                    let (c, sn) = (cos[pos * half + i], sin[pos * half + i]);
+                    let (x0, x1) = (data[base + i], data[base + i + half]);
+                    out[base + i] = x0 * c - x1 * sn;
+                    out[base + i + half] = x1 * c + x0 * sn;
+                }
+            }
+        }
+        self.upload(&out)
+    }
+
     /// AdamW optimizer step on a single parameter tensor (in-place on device).
     ///
     /// Updates `param`, `m` (first moment), and `v` (second moment) in-place.

@@ -81,6 +81,8 @@ kernel void causal_attention(
         float new_max = max(prev_max, score);
         float exp_score = exp(score - new_max);
         float rescale = exp(prev_max - new_max);
+        // Everyone reads tg_max before thread 0 overwrites it.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (tid == 0) {
             tg_max[0] = new_max;
@@ -171,6 +173,8 @@ kernel void kv_attention(
         float new_max = max(prev_max, score);
         float exp_score = exp(score - new_max);
         float rescale = exp(prev_max - new_max);
+        // Everyone reads tg_max before thread 0 overwrites it.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (tid == 0) {
             tg_max[0] = new_max;
@@ -266,6 +270,8 @@ kernel void kv_attention_prefill(
         float new_max = max(prev_max, score);
         float exp_score = exp(score - new_max);
         float rescale = exp(prev_max - new_max);
+        // Everyone reads tg_max before thread 0 overwrites it.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (tid == 0) {
             tg_max[0] = new_max;

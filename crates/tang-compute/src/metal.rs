@@ -9,7 +9,7 @@ use metal::objc::rc::autoreleasepool;
 use metal::*;
 
 use crate::device::{ComputeBuffer, ComputeDevice};
-use crate::kernels::{adamw_msl, attention_msl, backward_msl, matmul_msl, reduce_msl};
+use crate::kernels::{adamw_msl, attention_msl, backward_msl, llm_msl, matmul_msl, reduce_msl};
 use tang_expr::codegen::Dialect;
 use tang_expr::node::ExprId;
 use tang_expr::trace;
@@ -1005,6 +1005,64 @@ kernel void bias_add(
         );
     }
 
+    fn linear(&self, x: &MetalBuffer, w: &MetalBuffer, m: usize, k: usize, n: usize) -> MetalBuffer {
+        if m <= 8 {
+            let pipeline = self.get_pipeline(llm_msl::GEMV_BT_MSL, "gemv_bt");
+            let out = self.make_buffer_empty(m * n * 4);
+            let params = self.make_buffer_u32(&[m as u32, k as u32, n as u32]);
+            self.with_encoder(|enc| {
+                enc.set_compute_pipeline_state(&pipeline);
+                enc.set_buffer(0, Some(&x.buffer), 0);
+                enc.set_buffer(1, Some(&w.buffer), 0);
+                enc.set_buffer(2, Some(&out), 0);
+                enc.set_buffer(3, Some(&params), 0);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(n.div_ceil(8) as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+            });
+            return MetalBuffer { buffer: out, len: m * n };
+        }
+        if n % 32 != 0 || k % 8 != 0 {
+            return self.matmul_b_transposed(x, w, m, k, n);
+        }
+        // The simdgroup kernel works in 32-row tiles: pad the rows, then drop the padding.
+        let mp = m.next_multiple_of(32);
+        if mp == m {
+            return self.matmul_b_transposed(x, w, m, k, n);
+        }
+        let mut padded = self.alloc(mp * k);
+        self.write_into(&mut padded, 0, x);
+        let y = self.matmul_b_transposed(&padded, w, mp, k, n);
+        self.slice_buffer(&y, 0, m * n)
+    }
+
+    fn rope_half_cached(
+        &self,
+        input: &MetalBuffer,
+        cos_buf: &MetalBuffer,
+        sin_buf: &MetalBuffer,
+        seq_len: usize,
+        n_heads: usize,
+        head_dim: usize,
+        start_pos: usize,
+    ) -> MetalBuffer {
+        let pipeline = self.get_pipeline(llm_msl::ROPE_HALF_MSL, "rope_half");
+        let out = self.make_buffer_empty(input.len * 4);
+        let params = self.make_buffer_u32(&[
+            seq_len as u32,
+            n_heads as u32,
+            head_dim as u32,
+            start_pos as u32,
+        ]);
+        self.dispatch(
+            &pipeline,
+            &[&input.buffer, &cos_buf.buffer, &sin_buf.buffer, &out, &params],
+            (seq_len * n_heads * head_dim / 2) as u64,
+        );
+        MetalBuffer { buffer: out, len: input.len }
+    }
+
     fn slice_buffer(&self, buf: &MetalBuffer, offset: usize, len: usize) -> MetalBuffer {
         let dst = self.make_buffer_empty(len * 4);
         self.ensure_cb();
@@ -1847,5 +1905,41 @@ mod tests {
         metal.write_into(&mut dst, 2, &src);
         let out = metal.download(&dst);
         assert_eq!(out, vec![0.0, 0.0, 7.0, 8.0, 0.0]);
+    }
+
+    #[test]
+    fn metal_linear_vs_cpu_decode_and_prefill() {
+        let metal = get_metal_device();
+        let cpu = CpuDevice::new();
+        // Decode (GEMV), unaligned prefill (padded), aligned prefill, and K not a multiple of 4.
+        for &(m, k, n) in &[(1, 64, 96), (5, 64, 96), (37, 64, 96), (64, 64, 32), (3, 30, 40)] {
+            let x: Vec<f32> = (0..m * k).map(|i| ((i * 7 + 3) % 13) as f32 / 13.0 - 0.5).collect();
+            let w: Vec<f32> = (0..n * k).map(|i| ((i * 11 + 5) % 17) as f32 / 17.0 - 0.5).collect();
+            let got = metal.download(&metal.linear(&metal.upload(&x), &metal.upload(&w), m, k, n));
+            let want = cpu.download(&cpu.matmul_b_transposed(&cpu.upload(&x), &cpu.upload(&w), m, k, n));
+            assert_eq!(got.len(), m * n);
+            for i in 0..m * n {
+                assert!((got[i] - want[i]).abs() < 1e-3, "({m},{k},{n}) at {i}: {} vs {}", got[i], want[i]);
+            }
+        }
+    }
+
+    #[test]
+    fn metal_rope_half_vs_cpu() {
+        let metal = get_metal_device();
+        let cpu = CpuDevice::new();
+        let (seq, heads, hd, start, max_pos) = (3, 2, 8, 4, 16);
+        let x: Vec<f32> = (0..seq * heads * hd).map(|i| (i as f32 * 0.37).sin()).collect();
+        let cos: Vec<f32> = (0..max_pos * hd / 2).map(|i| (i as f32 * 0.1).cos()).collect();
+        let sin: Vec<f32> = (0..max_pos * hd / 2).map(|i| (i as f32 * 0.1).sin()).collect();
+        let got = metal.download(&metal.rope_half_cached(
+            &metal.upload(&x), &metal.upload(&cos), &metal.upload(&sin), seq, heads, hd, start,
+        ));
+        let want = cpu.download(&cpu.rope_half_cached(
+            &cpu.upload(&x), &cpu.upload(&cos), &cpu.upload(&sin), seq, heads, hd, start,
+        ));
+        for i in 0..x.len() {
+            assert!((got[i] - want[i]).abs() < 1e-5, "at {i}: {} vs {}", got[i], want[i]);
+        }
     }
 }
