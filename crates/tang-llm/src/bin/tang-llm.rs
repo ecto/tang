@@ -25,6 +25,8 @@ fn main() -> Result<()> {
     while let Some(a) = rest.next() {
         if a == "--f32" {
             dtype = Dtype::F32;
+        } else if a == "--q4" {
+            dtype = Dtype::Q4;
         } else if a == "-n" {
             n = rest.next().context("-n N")?.parse()?;
         } else {
@@ -85,7 +87,7 @@ fn main() -> Result<()> {
 fn serve(args: &[String]) -> Result<()> {
     let spec = args
         .first()
-        .context("usage: tang-llm serve <model> [--port P] [--ctx N] [--f32]")?
+        .context("usage: tang-llm serve <model> [--port P] [--ctx N] [--f32 | --q4]")?
         .clone();
     let (mut port, mut ctx, mut dtype) = (8911u16, 32_768usize, Dtype::Bf16);
     let mut it = args[1..].iter();
@@ -94,6 +96,7 @@ fn serve(args: &[String]) -> Result<()> {
             "--port" => port = it.next().context("--port P")?.parse()?,
             "--ctx" => ctx = it.next().context("--ctx N")?.parse()?,
             "--f32" => dtype = Dtype::F32,
+            "--q4" => dtype = Dtype::Q4,
             other => bail!("unknown option {other}"),
         }
     }

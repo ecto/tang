@@ -25,6 +25,15 @@ pub struct Config {
     pub max_position_embeddings: usize,
     #[serde(default)]
     pub eos_token_id: Option<EosIds>,
+    /// MLX-quantized checkpoints: `{"group_size": 64, "bits": 4}`.
+    #[serde(default)]
+    pub quantization: Option<Quantization>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Quantization {
+    pub group_size: usize,
+    pub bits: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]

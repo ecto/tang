@@ -32,6 +32,31 @@ fn main() {
             dev.linear(&x, &wf, 1, k, n);
         });
     }
+    for &(k, n) in &[
+        (2560, 4096),
+        (2560, 1024),
+        (2560, 9728),
+        (9728, 2560),
+        (2560, 151936),
+    ] {
+        let x = dev.upload(&vec![0.1f32; k]);
+        let packed = vec![0x12345678u32; k * n / 8];
+        let sb = vec![0x3c00u16; k * n / 64];
+        let wq = dev.upload_q4(&packed, &sb, &sb, 64);
+        let wb = dev.upload_bf16(&vec![0x3f80u16; k * n]);
+        time(
+            &dev,
+            &format!("gemv q4   {k}x{n}"),
+            k * n / 2 + k * n / 16,
+            reps,
+            || {
+                dev.linear(&x, &wq, 1, k, n);
+            },
+        );
+        time(&dev, &format!("gemv bf16 {k}x{n}"), k * n * 2, reps, || {
+            dev.linear(&x, &wb, 1, k, n);
+        });
+    }
     let h = dev.upload(&vec![0.1f32; 1024]);
     let w = dev.upload(&vec![1.0f32; 1024]);
     time(&dev, "rms_norm 1024", 8192, reps, || {

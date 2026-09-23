@@ -11,19 +11,20 @@ use tang_compute::ComputeDevice;
 pub enum Dtype {
     F32,
     Bf16,
+    /// 4-bit affine groups of 64 (quantized at load unless the checkpoint already is).
+    Q4,
 }
 
 struct Layer<B> {
     attn_norm: B,
-    wq: B,
-    wk: B,
-    wv: B,
+    /// Q, K and V projections stacked: `[(nh + 2*nkv) * hd, hidden]`.
+    wqkv: B,
     wo: B,
     q_norm: Option<B>,
     k_norm: Option<B>,
     mlp_norm: B,
-    w_gate: B,
-    w_up: B,
+    /// Gate and up projections stacked: `[2 * ff, hidden]`.
+    w_gate_up: B,
     w_down: B,
 }
 
@@ -63,12 +64,53 @@ impl<D: ComputeDevice> Model<D> {
         let cfg: Config = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
         let w = Weights::open(dir)?;
         let vec = |name: &str| -> Result<D::Buffer> { Ok(dev.upload(&w.f32(name)?.0)) };
-        let up = |name: &str| -> Result<D::Buffer> {
+        let quant = cfg.quantization.clone();
+        if let Some(q) = &quant {
+            anyhow::ensure!(
+                q.bits == 4,
+                "{}-bit checkpoints aren't supported yet (4-bit only)",
+                q.bits
+            );
+        }
+        // Matrices stacked along the output dimension (rows share K, so row-major data just
+        // concatenates), for fused projections like Q/K/V.
+        let up_cat = |names: &[String]| -> Result<D::Buffer> {
+            let base = |n: &String| n.strip_suffix(".weight").unwrap_or(n).to_string();
+            // Pre-quantized (MLX): `X.weight` (packed u32) with `X.scales` and `X.biases`.
+            if let Some(q) = quant
+                .as_ref()
+                .filter(|_| w.has(&format!("{}.scales", base(&names[0]))))
+            {
+                let (mut p, mut sc, mut bi) = (Vec::new(), Vec::new(), Vec::new());
+                for n in names {
+                    p.extend(w.u32(n)?);
+                    sc.extend(w.bf16(&format!("{}.scales", base(n)))?);
+                    bi.extend(w.bf16(&format!("{}.biases", base(n)))?);
+                }
+                return Ok(dev.upload_q4(&p, &sc, &bi, q.group_size));
+            }
             match dtype {
-                Dtype::F32 => vec(name),
-                Dtype::Bf16 => Ok(dev.upload_bf16(&w.bf16(name)?)),
+                Dtype::Bf16 => {
+                    let mut all = Vec::new();
+                    for n in names {
+                        all.extend(w.bf16(n)?);
+                    }
+                    Ok(dev.upload_bf16(&all))
+                }
+                Dtype::F32 | Dtype::Q4 => {
+                    let mut all = Vec::new();
+                    for n in names {
+                        all.extend(w.f32(n)?.0);
+                    }
+                    if dtype == Dtype::F32 {
+                        return Ok(dev.upload(&all));
+                    }
+                    let (p, s, b) = crate::weights::quantize_q4(&all, 64);
+                    Ok(dev.upload_q4(&p, &s, &b, 64))
+                }
             }
         };
+        let up = |name: &str| up_cat(&[name.to_string()]);
         let opt = |name: &str| -> Result<Option<D::Buffer>> {
             if w.has(name) {
                 up(name).map(Some)
@@ -88,15 +130,12 @@ impl<D: ComputeDevice> Model<D> {
             let p = format!("model.layers.{l}");
             layers.push(Layer {
                 attn_norm: vec(&format!("{p}.input_layernorm.weight"))?,
-                wq: up(&format!("{p}.self_attn.q_proj.weight"))?,
-                wk: up(&format!("{p}.self_attn.k_proj.weight"))?,
-                wv: up(&format!("{p}.self_attn.v_proj.weight"))?,
+                wqkv: up_cat(&["q", "k", "v"].map(|x| format!("{p}.self_attn.{x}_proj.weight")))?,
                 wo: up(&format!("{p}.self_attn.o_proj.weight"))?,
                 q_norm: opt_vec(&format!("{p}.self_attn.q_norm.weight"))?,
                 k_norm: opt_vec(&format!("{p}.self_attn.k_norm.weight"))?,
                 mlp_norm: vec(&format!("{p}.post_attention_layernorm.weight"))?,
-                w_gate: up(&format!("{p}.mlp.gate_proj.weight"))?,
-                w_up: up(&format!("{p}.mlp.up_proj.weight"))?,
+                w_gate_up: up_cat(&["gate", "up"].map(|x| format!("{p}.mlp.{x}_proj.weight")))?,
                 w_down: up(&format!("{p}.mlp.down_proj.weight"))?,
             });
         }
@@ -168,29 +207,33 @@ impl<D: ComputeDevice> Model<D> {
         let mut x = dev.embedding(&self.embed, &ids, s, h);
         for (l, w) in self.layers.iter().enumerate() {
             let a = dev.rms_norm(&x, &w.attn_norm, s, h, eps);
-            let mut q = dev.linear(&a, &w.wq, s, h, qd);
-            let mut k = dev.linear(&a, &w.wk, s, h, kvd);
-            let v = dev.linear(&a, &w.wv, s, h, kvd);
-            if let Some(n) = &w.q_norm {
-                q = dev.rms_norm(&q, n, s * nh, hd, eps);
-            }
-            if let Some(n) = &w.k_norm {
-                k = dev.rms_norm(&k, n, s * nkv, hd, eps);
-            }
-            let q = dev.rope_half_cached(&q, &self.cos, &self.sin, s, nh, hd, pos);
-            let k = dev.rope_half_cached(&k, &self.cos, &self.sin, s, nkv, hd, pos);
-            dev.write_into(&mut cache.k[l], pos * kvd, &k);
-            dev.write_into(&mut cache.v[l], pos * kvd, &v);
+            let qkv = dev.linear(&a, &w.wqkv, s, h, qd + 2 * kvd);
+            let q = dev.attention_prep(
+                &qkv,
+                w.q_norm.as_ref(),
+                w.k_norm.as_ref(),
+                &self.cos,
+                &self.sin,
+                &mut cache.k[l],
+                &mut cache.v[l],
+                s,
+                (nh, nkv, hd),
+                pos,
+                eps,
+            );
             let att = dev.kv_attention(&q, &cache.k[l], &cache.v[l], pos, s, nh, nkv, hd);
             let o = dev.linear(&att, &w.wo, s, qd, h);
             x = dev.add_tensors_buf(&x, &o, s * h);
 
             let m = dev.rms_norm(&x, &w.mlp_norm, s, h, eps);
-            let g = dev.linear(&m, &w.w_gate, s, h, ff);
-            let u = dev.linear(&m, &w.w_up, s, h, ff);
-            let act = dev.swiglu_fused_buf(&g, &u, s * ff);
+            let gu = dev.linear(&m, &w.w_gate_up, s, h, 2 * ff);
+            let act = dev.swiglu_split(&gu, s, ff);
             let d = dev.linear(&act, &w.w_down, s, ff, h);
             x = dev.add_tensors_buf(&x, &d, s * h);
+            // Let the GPU start on what's encoded so far.
+            if l % 4 == 3 {
+                dev.flush();
+            }
         }
         let (rows, x) = if all {
             (s, x)

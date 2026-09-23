@@ -42,6 +42,23 @@ impl Weights {
         self.index.contains_key(name)
     }
 
+    /// A packed integer tensor (MLX quantized weights).
+    pub fn u32(&self, name: &str) -> Result<Vec<u32>> {
+        let i = *self
+            .index
+            .get(name)
+            .with_context(|| format!("missing tensor {name}"))?;
+        let st = SafeTensors::deserialize(&self.maps[i])?;
+        let t = st.tensor(name)?;
+        if t.dtype() != Dtype::U32 {
+            bail!("{name}: expected U32, got {:?}", t.dtype());
+        }
+        Ok(t.data()
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect())
+    }
+
     /// A tensor as raw bfloat16 bits (f32/f16 are rounded), for weights kept in bf16 on device.
     pub fn bf16(&self, name: &str) -> Result<Vec<u16>> {
         let i = *self
@@ -85,6 +102,34 @@ impl Weights {
     }
 }
 
+/// Round-to-nearest 4-bit affine quantization of a row-major matrix with rows of `k`, in
+/// MLX's layout: `(packed, scales, biases)` with `w ≈ scale * q + bias` per `group` weights.
+pub fn quantize_q4(w: &[f32], group: usize) -> (Vec<u32>, Vec<u16>, Vec<u16>) {
+    let groups = w.len() / group;
+    let mut packed = vec![0u32; w.len() / 8];
+    let (mut scales, mut biases) = (Vec::with_capacity(groups), Vec::with_capacity(groups));
+    for g in 0..groups {
+        let vals = &w[g * group..(g + 1) * group];
+        let lo = vals.iter().copied().fold(f32::INFINITY, f32::min);
+        let hi = vals.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        // Store in bf16 first, then quantize against the stored values.
+        let s = from_bf16(to_bf16(((hi - lo) / 15.0).max(1e-8)));
+        let b = from_bf16(to_bf16(lo));
+        scales.push(to_bf16(s));
+        biases.push(to_bf16(b));
+        for (j, &v) in vals.iter().enumerate() {
+            let q = ((v - b) / s).round().clamp(0.0, 15.0) as u32;
+            let i = g * group + j;
+            packed[i / 8] |= q << (4 * (i % 8));
+        }
+    }
+    (packed, scales, biases)
+}
+
+fn from_bf16(b: u16) -> f32 {
+    f32::from_bits((b as u32) << 16)
+}
+
 /// Round-to-nearest-even f32 -> bf16.
 fn to_bf16(x: f32) -> u16 {
     let b = x.to_bits();
@@ -124,6 +169,19 @@ fn f16_to_f32(h: u16) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn q4_round_trip_error_is_within_half_a_step() {
+        let w: Vec<f32> = (0..256)
+            .map(|i| ((i * 37 % 101) as f32 / 50.0) - 1.0)
+            .collect();
+        let (p, s, b) = super::quantize_q4(&w, 64);
+        for (i, &v) in w.iter().enumerate() {
+            let q = (p[i / 8] >> (4 * (i % 8))) & 0xf;
+            let (s, b) = (super::from_bf16(s[i / 64]), super::from_bf16(b[i / 64]));
+            assert!((s * q as f32 + b - v).abs() <= s * 0.51 + 1e-3, "at {i}");
+        }
+    }
+
     #[test]
     fn f16_widening() {
         assert_eq!(super::f16_to_f32(0x3c00), 1.0);

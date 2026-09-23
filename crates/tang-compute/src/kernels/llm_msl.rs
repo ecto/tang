@@ -354,3 +354,214 @@ kernel void attn_combine(
     }
 }
 "#;
+
+/// 4-bit affine weights (MLX layout, see `Kind::Q4`): decode GEMV, tiled prefill matmul, and
+/// embedding lookup. `group` must be a multiple of 32 and K a multiple of `group`.
+pub const Q4_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+inline float bf(ushort b) { return as_type<float>(uint(b) << 16); }
+
+// Eight nibbles of `w` (low first) against eight activations.
+inline float dot8(uint w, float4 a, float4 b) {
+    return float(w & 0xf) * a.x + float((w >> 4) & 0xf) * a.y
+         + float((w >> 8) & 0xf) * a.z + float((w >> 12) & 0xf) * a.w
+         + float((w >> 16) & 0xf) * b.x + float((w >> 20) & 0xf) * b.y
+         + float((w >> 24) & 0xf) * b.z + float(w >> 28) * b.w;
+}
+
+// Each simdgroup computes 4 output columns; each lane holds 16 activations in registers and
+// applies them to all 4, so activation traffic is amortized. Needs K % 16 == 0.
+// Dispatch: threadgroups = ceil(N / 8), 64 threads (2 simdgroups).
+kernel void gemv_q4(
+    device const float* X [[buffer(0)]],
+    device const uint* W [[buffer(1)]],
+    device const ushort* S [[buffer(2)]],
+    device const ushort* B [[buffer(3)]],
+    device float* Y [[buffer(4)]],
+    device const uint* params [[buffer(5)]],  // [M, K, N, group]
+    uint tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    uint M = params[0], K = params[1], N = params[2], group = params[3];
+    uint n0 = tg * 8 + sg * 4;
+    if (n0 >= N) return;
+    uint rows = min(4u, N - n0);
+    uint G = K / group;
+    uint words = K / 8;
+
+    for (uint r = 0; r < M; r++) {
+        float acc[4] = {0, 0, 0, 0};
+        for (uint k = lane * 16; k < K; k += 512) {
+            device const float4* xp = (device const float4*)(X + r * K + k);
+            float4 x0 = xp[0], x1 = xp[1], x2 = xp[2], x3 = xp[3];
+            float4 xs4 = x0 + x1 + x2 + x3;
+            float xs = xs4.x + xs4.y + xs4.z + xs4.w;
+            for (uint j = 0; j < rows; j++) {
+                uint n = n0 + j;
+                uint2 w = *(device const uint2*)(W + (ulong)n * words + k / 8);
+                uint g = n * G + k / group;
+                float d = dot8(w.x, x0, x1) + dot8(w.y, x2, x3);
+                acc[j] += bf(S[g]) * d + bf(B[g]) * xs;
+            }
+        }
+        for (uint j = 0; j < rows; j++) {
+            float v = simd_sum(acc[j]);
+            if (lane == 0) Y[r * N + n0 + j] = v;
+        }
+    }
+}
+
+inline float q4_at(device const uint* W, device const ushort* S, device const ushort* B,
+                   uint row, uint k, uint K, uint group) {
+    uint q = (W[(ulong)row * (K / 8) + k / 8] >> (4 * (k % 8))) & 0xf;
+    uint g = row * (K / group) + k / group;
+    return bf(S[g]) * float(q) + bf(B[g]);
+}
+
+// Same tiling as matmul_bt_bf16, dequantizing B into threadgroup memory.
+constant uint T = 32;
+
+kernel void matmul_bt_q4(
+    device const float* A [[buffer(0)]],
+    device const uint* W [[buffer(1)]],
+    device const ushort* S [[buffer(2)]],
+    device const ushort* Bz [[buffer(3)]],
+    device float* C [[buffer(4)]],
+    device const uint* params [[buffer(5)]],  // [M, K, N, group]
+    uint2 tg_pos [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]])
+{
+    uint M = params[0], K = params[1], N = params[2], group = params[3];
+    uint row0 = tg_pos.y * T;
+    uint col0 = tg_pos.x * T;
+
+    threadgroup float As[T * T];
+    threadgroup float Bs[T * T];
+    simdgroup_float8x8 acc[4];
+    for (int j = 0; j < 4; j++) acc[j] = simdgroup_float8x8(0);
+
+    for (uint kb = 0; kb < K; kb += T) {
+        for (uint e = 0; e < 8; e++) {
+            uint idx = tid * 8 + e;
+            uint r = idx / T, kk = idx % T;
+            uint k = kb + kk;
+            uint row = row0 + r, col = col0 + r;
+            As[idx] = (row < M && k < K) ? A[(ulong)row * K + k] : 0.0f;
+            Bs[idx] = (col < N && k < K) ? q4_at(W, S, Bz, col, k, K, group) : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ks = 0; ks < T; ks += 8) {
+            simdgroup_float8x8 a;
+            simdgroup_load(a, As + sg * 8 * T + ks, T);
+            for (int j = 0; j < 4; j++) {
+                simdgroup_float8x8 b;
+                simdgroup_load(b, Bs + j * 8 * T + ks, T, ulong2(0), true);
+                simdgroup_multiply_accumulate(acc[j], a, b, acc[j]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (int j = 0; j < 4; j++) simdgroup_store(acc[j], As + sg * 8 * T + j * 8, T);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = 0; e < 8; e++) {
+        uint idx = tid * 8 + e;
+        uint r = idx / T, c = idx % T;
+        if (row0 + r < M && col0 + c < N) C[(ulong)(row0 + r) * N + col0 + c] = As[idx];
+    }
+}
+
+kernel void embedding_q4(
+    device const uint* W [[buffer(0)]],
+    device const ushort* S [[buffer(1)]],
+    device const ushort* B [[buffer(2)]],
+    device const uint* ids [[buffer(3)]],
+    device float* Y [[buffer(4)]],
+    device const uint* params [[buffer(5)]],  // [seq_len, dim, group]
+    uint gid [[thread_position_in_grid]])
+{
+    uint dim = params[1];
+    if (gid >= params[0] * dim) return;
+    uint s = gid / dim, d = gid % dim;
+    Y[gid] = q4_at(W, S, B, ids[s], d, dim, params[2]);
+}
+"#;
+
+/// Fused decoder-layer glue: attention prologue and split SwiGLU.
+///
+/// `attention_prep`: one simdgroup per (token, head) over q, k and v heads of a fused QKV row.
+/// q/k heads get the optional RMS norm and half-split RoPE; q goes to `Qo`, k and v straight
+/// into the caches. Each lane holds `hd/32` elements; element `lane + 32v` pairs with
+/// `lane + 32(v + hd/64)` for RoPE, so `hd` must be a multiple of 64 (at most 256).
+pub const FUSED_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void attention_prep(
+    device const float* QKV [[buffer(0)]],
+    device const float* QN [[buffer(1)]],
+    device const float* KN [[buffer(2)]],
+    device const float* COS [[buffer(3)]],
+    device const float* SIN [[buffer(4)]],
+    device float* Qo [[buffer(5)]],
+    device float* KC [[buffer(6)]],
+    device float* VC [[buffer(7)]],
+    device const uint* params [[buffer(8)]],  // [seq, nh, nkv, hd, pos, eps bits, has_qn, has_kn]
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    uint nh = params[1], nkv = params[2], hd = params[3], pos = params[4];
+    float eps = as_type<float>(params[5]);
+    uint s = tg.y, h = tg.x;
+    uint qd = nh * hd, kvd = nkv * hd, row = qd + 2 * kvd;
+    uint per = hd / 32, half_v = per / 2, half_dim = hd / 2;
+    device const float* src = QKV + (ulong)s * row + h * hd;  // heads are contiguous: q.., k.., v..
+
+    float x[8];
+    for (uint v = 0; v < per; v++) x[v] = src[v * 32 + lane];
+
+    if (h >= nh + nkv) {  // v head: straight into the cache
+        uint kh = h - nh - nkv;
+        device float* dst = VC + (ulong)(pos + s) * kvd + kh * hd;
+        for (uint v = 0; v < per; v++) dst[v * 32 + lane] = x[v];
+        return;
+    }
+    bool is_q = h < nh;
+    bool has_norm = is_q ? params[6] != 0 : params[7] != 0;
+    if (has_norm) {
+        device const float* w = is_q ? QN : KN;
+        float ss = 0;
+        for (uint v = 0; v < per; v++) ss += x[v] * x[v];
+        float r = rsqrt(simd_sum(ss) / float(hd) + eps);
+        for (uint v = 0; v < per; v++) x[v] *= r * w[v * 32 + lane];
+    }
+    float y[8];
+    uint t = (pos + s) * half_dim;
+    for (uint v = 0; v < half_v; v++) {
+        uint i = v * 32 + lane;
+        float c = COS[t + i], sn = SIN[t + i];
+        float x0 = x[v], x1 = x[v + half_v];
+        y[v] = x0 * c - x1 * sn;
+        y[v + half_v] = x1 * c + x0 * sn;
+    }
+    device float* dst = is_q ? Qo + (ulong)s * qd + h * hd
+                             : KC + (ulong)(pos + s) * kvd + (h - nh) * hd;
+    for (uint v = 0; v < per; v++) dst[v * 32 + lane] = y[v];
+}
+
+kernel void swiglu_split(
+    device const float* GU [[buffer(0)]],
+    device float* Y [[buffer(1)]],
+    device const uint* params [[buffer(2)]],  // [rows, ff]
+    uint gid [[thread_position_in_grid]])
+{
+    uint ff = params[1];
+    if (gid >= params[0] * ff) return;
+    uint r = gid / ff, i = gid % ff;
+    float g = GU[(ulong)r * 2 * ff + i];
+    Y[gid] = g / (1.0f + exp(-g)) * GU[(ulong)r * 2 * ff + ff + i];
+}
+"#;
