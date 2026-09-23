@@ -15,8 +15,16 @@ model, tok = load(model_dir)
 model.update(tree_map(lambda p: p.astype(mx.float32) if mx.issubdtype(p.dtype, mx.floating) else p, model.parameters()))
 ids = tok.encode(prompt)
 ref = np.array(model(mx.array([ids]))[0].astype(mx.float32))
+# Long prompts: compare the last few positions only (set LAST).
+import os
+last = int(os.environ.get("LAST", "0"))
+extra = ["--last", str(last)] if last else []
+if last:
+    ref = ref[-last:]
 
-out = subprocess.run([binary, "logits", model_dir, *map(str, ids)], capture_output=True, text=True, check=True)
+# STEP=1 feeds tokens one at a time (the decode kernels) instead of one prefill.
+cmd = "logits-step" if os.environ.get("STEP") else "logits"
+out = subprocess.run([binary, cmd, model_dir, *map(str, ids), *extra], capture_output=True, text=True, check=True)
 got = np.array(json.loads(out.stdout), dtype=np.float32)
 assert got.shape == ref.shape, (got.shape, ref.shape)
 

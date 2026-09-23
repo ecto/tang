@@ -250,7 +250,9 @@ kernel void copy_f32(
 /// Pass 2 (`attn_combine`): per (qi, head), rescale and sum the splits.
 ///
 /// Layouts: q/out `[q_len, n_heads*D]`, K/V `[pos, n_kv_heads*D]`; query qi attends to keys
-/// `0 ..= cache_start + qi`. D must be a multiple of 32, at most 256.
+/// `0 ..= cache_start + qi`, or with a sliding window (`params[7] > 0`) only the last `window`
+/// of them. Splits start at key `params[8]` (decode skips keys no window can see).
+/// D must be a multiple of 32, at most 256.
 pub const FLASH_DECODE_MSL: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -262,7 +264,7 @@ kernel void attn_partial(
     device const float* K [[buffer(1)]],
     device const float* V [[buffer(2)]],
     device float* P [[buffer(3)]],            // [q_len, n_heads, n_splits, D + 2]
-    device const uint* params [[buffer(4)]],  // [cache_start, q_len, n_heads, n_kv_heads, D, n_splits, split_len]
+    device const uint* params [[buffer(4)]],  // [cache_start, q_len, n_heads, n_kv_heads, D, n_splits, split_len, window, base]
     uint3 tg [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
@@ -273,14 +275,17 @@ kernel void attn_partial(
     uint D = params[4];
     uint n_splits = params[5];
     uint split_len = params[6];
+    uint window = params[7], base = params[8];
     uint head = tg.x, split = tg.y, qi = tg.z;
     uint kv_head = head / (n_heads / n_kv);
     uint kv_dim = n_kv * D;
     uint per = D / 32;
 
     uint attend = cache_start + qi + 1;
-    uint j0 = split * split_len;
-    uint j1 = min(j0 + split_len, attend);
+    uint lo = (window > 0 && attend > window) ? attend - window : 0;
+    uint s0 = base + split * split_len;
+    uint j0 = max(s0, lo);
+    uint j1 = min(s0 + split_len, attend);
 
     float q[MAXV], acc[MAXV];
     float scale = rsqrt(float(D));
@@ -342,13 +347,16 @@ kernel void attn_decode(
     uint cache_start = params[0];
     uint n_heads = params[2], n_kv = params[3], D = params[4];
     uint n_splits = params[5], split_len = params[6];
+    uint window = params[7], base = params[8];
     uint head = tg.x, split = tg.y;
     uint kv_head = head / (n_heads / n_kv);
     uint kv_dim = n_kv * D;
     uint per = (D + 31) / 32;
     uint attend = cache_start + 1;
-    uint j0 = split * split_len;
-    uint j1 = min(j0 + split_len, attend);
+    uint lo = (window > 0 && attend > window) ? attend - window : 0;
+    uint s0 = base + split * split_len;
+    uint j0 = max(s0, lo);
+    uint j1 = min(s0 + split_len, attend);
 
     threadgroup float4 qs[64];
     float scale = rsqrt(float(D));
@@ -646,6 +654,22 @@ kernel void attention_prep(
     device float* dst = is_q ? Qo + (ulong)s * qd + h * hd
                              : KC + (ulong)(pos + s) * kvd + (h - nh) * hd;
     for (uint v = 0; v < per; v++) dst[v * 32 + lane] = y[v];
+}
+
+// GeGLU (Gemma): gelu_tanh(gate) * up over a fused gate/up projection.
+kernel void geglu_split(
+    device const float* GU [[buffer(0)]],
+    device float* Y [[buffer(1)]],
+    device const uint* params [[buffer(2)]],  // [rows, ff]
+    uint gid [[thread_position_in_grid]])
+{
+    uint ff = params[1];
+    if (gid >= params[0] * ff) return;
+    uint r = gid / ff, i = gid % ff;
+    float g = GU[(ulong)r * 2 * ff + i];
+    // Fast-math tanh overflows (inf/inf) for large inputs; it's ±1 well before ±10.
+    float t = tanh(clamp(0.7978845608f * (g + 0.044715f * g * g * g), -10.0f, 10.0f));
+    Y[gid] = 0.5f * g * (1.0f + t) * GU[(ulong)r * 2 * ff + ff + i];
 }
 
 kernel void swiglu_split(

@@ -1,4 +1,6 @@
-//! Qwen3-family decoder (also Llama-shaped models: q/k norm is used only when present).
+//! Qwen3-family decoder (also Llama-shaped models: q/k norm is used only when present), and
+//! Gemma 3: GeGLU, `(1 + w)` RMSNorms around both attention and MLP, a scaled embedding, and
+//! local sliding-window layers (own RoPE base) between global ones (scaled RoPE).
 
 use crate::config::Config;
 use crate::weights::Weights;
@@ -26,6 +28,12 @@ struct Layer<B> {
     /// Gate and up projections stacked: `[2 * ff, hidden]`.
     w_gate_up: B,
     w_down: B,
+    /// Gemma: norms on the attention and MLP outputs, before the residual adds.
+    post_attn_norm: Option<B>,
+    post_mlp_norm: Option<B>,
+    /// Sliding window (0: global attention), and which RoPE tables (0 global, 1 local).
+    window: usize,
+    rope: usize,
 }
 
 pub struct Model<D: ComputeDevice> {
@@ -35,8 +43,10 @@ pub struct Model<D: ComputeDevice> {
     layers: Vec<Layer<D::Buffer>>,
     norm: D::Buffer,
     lm_head: Option<D::Buffer>,
-    cos: D::Buffer,
-    sin: D::Buffer,
+    /// RoPE tables: global, and (Gemma) local.
+    ropes: Vec<(D::Buffer, D::Buffer)>,
+    /// Gemma scales embeddings by sqrt(hidden), rounded to bf16 as the reference does.
+    embed_scale: Option<f32>,
     max_ctx: usize,
 }
 
@@ -61,9 +71,25 @@ impl<B> Cache<B> {
 impl<D: ComputeDevice> Model<D> {
     /// Load a checkpoint directory. Matrices are kept in `dtype` on device; norms stay f32.
     pub fn load(dev: D, dir: &Path, max_ctx: usize, dtype: Dtype) -> Result<Self> {
-        let cfg: Config = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
+        let cfg = Config::from_json(&std::fs::read(dir.join("config.json"))?)?;
         let w = Weights::open(dir)?;
-        let vec = |name: &str| -> Result<D::Buffer> { Ok(dev.upload(&w.f32(name)?.0)) };
+        let gemma = cfg.is_gemma();
+        // Multimodal checkpoints keep the language model under `language_model.`.
+        let lm = if w.has("language_model.model.embed_tokens.weight")
+            || w.has("language_model.model.embed_tokens.scales")
+        {
+            "language_model."
+        } else {
+            ""
+        };
+        // Gemma's RMSNorm scales by (1 + w): fold the 1 in at load.
+        let vec = |name: &str| -> Result<D::Buffer> {
+            let mut v = w.f32(name)?.0;
+            if gemma {
+                v.iter_mut().for_each(|x| *x += 1.0);
+            }
+            Ok(dev.upload(&v))
+        };
         let quant = cfg.quantization.clone();
         if let Some(q) = &quant {
             anyhow::ensure!(
@@ -127,29 +153,58 @@ impl<D: ComputeDevice> Model<D> {
         };
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for l in 0..cfg.num_hidden_layers {
-            let p = format!("model.layers.{l}");
+            let p = format!("{lm}model.layers.{l}");
+            let norm = |n: &str| vec(&format!("{p}.{n}.weight"));
+            let window = cfg.window(l);
             layers.push(Layer {
-                attn_norm: vec(&format!("{p}.input_layernorm.weight"))?,
+                attn_norm: norm("input_layernorm")?,
                 wqkv: up_cat(&["q", "k", "v"].map(|x| format!("{p}.self_attn.{x}_proj.weight")))?,
                 wo: up(&format!("{p}.self_attn.o_proj.weight"))?,
                 q_norm: opt_vec(&format!("{p}.self_attn.q_norm.weight"))?,
                 k_norm: opt_vec(&format!("{p}.self_attn.k_norm.weight"))?,
-                mlp_norm: vec(&format!("{p}.post_attention_layernorm.weight"))?,
+                // Gemma norms the MLP input with its own weight; Qwen reuses the post-attention one.
+                mlp_norm: norm(if gemma {
+                    "pre_feedforward_layernorm"
+                } else {
+                    "post_attention_layernorm"
+                })?,
                 w_gate_up: up_cat(&["gate", "up"].map(|x| format!("{p}.mlp.{x}_proj.weight")))?,
                 w_down: up(&format!("{p}.mlp.down_proj.weight"))?,
+                post_attn_norm: if gemma {
+                    Some(norm("post_attention_layernorm")?)
+                } else {
+                    None
+                },
+                post_mlp_norm: if gemma {
+                    Some(norm("post_feedforward_layernorm")?)
+                } else {
+                    None
+                },
+                window,
+                rope: usize::from(gemma && window > 0),
             });
         }
-        let embed = up("model.embed_tokens.weight")?;
-        let lm_head = if cfg.tie_word_embeddings {
+        let embed = up(&format!("{lm}model.embed_tokens.weight"))?;
+        let head_name = format!("{lm}lm_head.weight");
+        let lm_head = if cfg.tie_word_embeddings || !w.has(&head_name) {
             None
         } else {
-            opt("lm_head.weight")?
+            opt(&head_name)?
         };
-        let norm = vec("model.norm.weight")?;
+        let norm = vec(&format!("{lm}model.norm.weight"))?;
 
         let max_ctx = max_ctx.min(cfg.max_position_embeddings);
-        let (cos, sin) = rope_tables(cfg.head_dim(), max_ctx, cfg.rope_theta);
-        let (cos, sin) = (dev.upload(&cos), dev.upload(&sin));
+        let hd = cfg.head_dim();
+        let scale = cfg.rope_scaling.as_ref().map_or(1.0, |s| s.factor);
+        let mut ropes = Vec::new();
+        let (cos, sin) = rope_tables(hd, max_ctx, cfg.rope_theta, scale);
+        ropes.push((dev.upload(&cos), dev.upload(&sin)));
+        if gemma {
+            let base = cfg.rope_local_base_freq.unwrap_or(10_000.0);
+            let (cos, sin) = rope_tables(hd, max_ctx, base, 1.0);
+            ropes.push((dev.upload(&cos), dev.upload(&sin)));
+        }
+        let embed_scale = gemma.then(|| bf16_round((cfg.hidden_size as f32).sqrt()));
         Ok(Self {
             cfg,
             dev,
@@ -157,8 +212,8 @@ impl<D: ComputeDevice> Model<D> {
             layers,
             norm,
             lm_head,
-            cos,
-            sin,
+            ropes,
+            embed_scale,
             max_ctx,
         })
     }
@@ -186,6 +241,32 @@ impl<D: ComputeDevice> Model<D> {
         cache: &mut Cache<D::Buffer>,
         all: bool,
     ) -> Result<Vec<f32>> {
+        let x = self.embed(tokens)?;
+        self.forward_hidden(x, tokens, cache, all)
+    }
+
+    /// Token embeddings (scaled, for Gemma), `[tokens, hidden]` on device.
+    pub fn embed(&self, tokens: &[u32]) -> Result<D::Buffer> {
+        anyhow::ensure!(!tokens.is_empty(), "no tokens");
+        let ids = self.dev.upload_u32(tokens);
+        let mut x = self
+            .dev
+            .embedding(&self.embed, &ids, tokens.len(), self.cfg.hidden_size);
+        if let Some(scale) = self.embed_scale {
+            self.dev.scale_buffer(&mut x, scale);
+        }
+        Ok(x)
+    }
+
+    /// Like `forward`, from hidden states instead of token ids (so image features can stand
+    /// in for placeholder tokens). `tokens` are what the cache records for these positions.
+    pub fn forward_hidden(
+        &self,
+        mut x: D::Buffer,
+        tokens: &[u32],
+        cache: &mut Cache<D::Buffer>,
+        all: bool,
+    ) -> Result<Vec<f32>> {
         let c = &self.cfg;
         let dev = &self.dev;
         let (s, pos) = (tokens.len(), cache.len);
@@ -195,47 +276,8 @@ impl<D: ComputeDevice> Model<D> {
             "context full ({} tokens)",
             self.max_ctx
         );
-        let (h, hd, nh, nkv) = (
-            c.hidden_size,
-            c.head_dim(),
-            c.num_attention_heads,
-            c.kv_heads(),
-        );
-        let (qd, kvd, ff) = (c.q_dim(), c.kv_dim(), c.intermediate_size);
-        let eps = c.rms_norm_eps;
-
-        let ids = dev.upload_u32(tokens);
-        let mut x = dev.embedding(&self.embed, &ids, s, h);
-        for (l, w) in self.layers.iter().enumerate() {
-            let a = dev.rms_norm(&x, &w.attn_norm, s, h, eps);
-            let qkv = dev.linear(&a, &w.wqkv, s, h, qd + 2 * kvd);
-            let q = dev.attention_prep(
-                &qkv,
-                w.q_norm.as_ref(),
-                w.k_norm.as_ref(),
-                &self.cos,
-                &self.sin,
-                &mut cache.k[l],
-                &mut cache.v[l],
-                s,
-                (nh, nkv, hd),
-                pos,
-                eps,
-            );
-            let att = dev.kv_attention(&q, &cache.k[l], &cache.v[l], pos, s, nh, nkv, hd);
-            let o = dev.linear(&att, &w.wo, s, qd, h);
-            x = dev.add_tensors_buf(&x, &o, s * h);
-
-            let m = dev.rms_norm(&x, &w.mlp_norm, s, h, eps);
-            let gu = dev.linear(&m, &w.w_gate_up, s, h, 2 * ff);
-            let act = dev.swiglu_split(&gu, s, ff);
-            let d = dev.linear(&act, &w.w_down, s, ff, h);
-            x = dev.add_tensors_buf(&x, &d, s * h);
-            // Let the GPU start on what's encoded so far.
-            if l % 4 == 3 {
-                dev.flush();
-            }
-        }
+        let (h, eps) = (c.hidden_size, c.rms_norm_eps);
+        self.decode_layers(&mut x, cache, s, pos)?;
         let (rows, x) = if all {
             (s, x)
         } else {
@@ -251,15 +293,94 @@ impl<D: ComputeDevice> Model<D> {
     }
 }
 
-/// cos/sin for half-split RoPE, `[max_pos, head_dim / 2]`.
-fn rope_tables(head_dim: usize, max_pos: usize, theta: f32) -> (Vec<f32>, Vec<f32>) {
+impl<D: ComputeDevice> Model<D> {
+    /// The decoder layers over hidden states `x` (`[s, hidden]`) at positions `pos..`.
+    fn decode_layers(
+        &self,
+        x: &mut D::Buffer,
+        cache: &mut Cache<D::Buffer>,
+        s: usize,
+        pos: usize,
+    ) -> Result<()> {
+        let c = &self.cfg;
+        let dev = &self.dev;
+        let (h, hd, nh, nkv) = (
+            c.hidden_size,
+            c.head_dim(),
+            c.num_attention_heads,
+            c.kv_heads(),
+        );
+        let (qd, kvd, ff) = (c.q_dim(), c.kv_dim(), c.intermediate_size);
+        let eps = c.rms_norm_eps;
+        for (l, w) in self.layers.iter().enumerate() {
+            let a = dev.rms_norm(x, &w.attn_norm, s, h, eps);
+            let qkv = dev.linear(&a, &w.wqkv, s, h, qd + 2 * kvd);
+            let (cos, sin) = &self.ropes[w.rope];
+            let q = dev.attention_prep(
+                &qkv,
+                w.q_norm.as_ref(),
+                w.k_norm.as_ref(),
+                cos,
+                sin,
+                &mut cache.k[l],
+                &mut cache.v[l],
+                s,
+                (nh, nkv, hd),
+                pos,
+                eps,
+            );
+            let att = dev.kv_attention_window(
+                &q,
+                &cache.k[l],
+                &cache.v[l],
+                pos,
+                s,
+                (nh, nkv, hd),
+                w.window,
+            );
+            let mut o = dev.linear(&att, &w.wo, s, qd, h);
+            if let Some(n) = &w.post_attn_norm {
+                o = dev.rms_norm(&o, n, s, h, eps);
+            }
+            *x = dev.add_tensors_buf(x, &o, s * h);
+
+            let m = dev.rms_norm(x, &w.mlp_norm, s, h, eps);
+            let gu = dev.linear(&m, &w.w_gate_up, s, h, 2 * ff);
+            let act = if c.is_gemma() {
+                dev.geglu_split(&gu, s, ff)
+            } else {
+                dev.swiglu_split(&gu, s, ff)
+            };
+            let mut d = dev.linear(&act, &w.w_down, s, ff, h);
+            if let Some(n) = &w.post_mlp_norm {
+                d = dev.rms_norm(&d, n, s, h, eps);
+            }
+            *x = dev.add_tensors_buf(x, &d, s * h);
+            // Let the GPU start on what's encoded so far.
+            if l % 4 == 3 {
+                dev.flush();
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Round to the nearest bfloat16, as Gemma's reference does for its embedding scale.
+fn bf16_round(x: f32) -> f32 {
+    let b = x.to_bits();
+    f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff_0000)
+}
+
+/// cos/sin for half-split RoPE, `[max_pos, head_dim / 2]`, positions divided by `scale`
+/// (linear RoPE scaling).
+fn rope_tables(head_dim: usize, max_pos: usize, theta: f32, scale: f32) -> (Vec<f32>, Vec<f32>) {
     let half = head_dim / 2;
     let mut cos = Vec::with_capacity(max_pos * half);
     let mut sin = Vec::with_capacity(max_pos * half);
     for p in 0..max_pos {
         for i in 0..half {
             let inv = (theta as f64).powf(-(2.0 * i as f64) / head_dim as f64);
-            let a = p as f64 * inv;
+            let a = p as f64 / scale as f64 * inv;
             cos.push(a.cos() as f32);
             sin.push(a.sin() as f32);
         }

@@ -943,6 +943,71 @@ pub trait ComputeDevice: Send {
         )
     }
 
+    /// `kv_attention` where each query sees only the last `window` keys (0: all of them), as in
+    /// Gemma's local layers. The portable fallback runs on the host.
+    #[allow(clippy::too_many_arguments)]
+    fn kv_attention_window(
+        &self,
+        q: &Self::Buffer,
+        k_cache: &Self::Buffer,
+        v_cache: &Self::Buffer,
+        cache_start: usize,
+        q_len: usize,
+        (nh, nkv, hd): (usize, usize, usize),
+        window: usize,
+    ) -> Self::Buffer {
+        if window == 0 || cache_start + q_len <= window {
+            return self.kv_attention(q, k_cache, v_cache, cache_start, q_len, nh, nkv, hd);
+        }
+        let (q, k, v) = (
+            self.download(q),
+            self.download(k_cache),
+            self.download(v_cache),
+        );
+        let (kvd, scale) = (nkv * hd, 1.0 / (hd as f32).sqrt());
+        let mut out = vec![0.0f32; q_len * nh * hd];
+        for qi in 0..q_len {
+            let attend = cache_start + qi + 1;
+            let lo = attend.saturating_sub(window);
+            for h in 0..nh {
+                let kh = h / (nh / nkv);
+                let qv = &q[(qi * nh + h) * hd..][..hd];
+                let scores: Vec<f32> = (lo..attend)
+                    .map(|j| {
+                        (0..hd)
+                            .map(|d| qv[d] * k[j * kvd + kh * hd + d])
+                            .sum::<f32>()
+                            * scale
+                    })
+                    .collect();
+                let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let e: Vec<f32> = scores.iter().map(|s| (s - m).exp()).collect();
+                let z: f32 = e.iter().sum();
+                let o = &mut out[(qi * nh + h) * hd..][..hd];
+                for (t, j) in (lo..attend).enumerate() {
+                    for d in 0..hd {
+                        o[d] += e[t] / z * v[j * kvd + kh * hd + d];
+                    }
+                }
+            }
+        }
+        self.upload(&out)
+    }
+
+    /// GeGLU over a fused gate/up projection (Gemma): `gelu_tanh(gate) * up`, `[rows, ff]`.
+    fn geglu_split(&self, gu: &Self::Buffer, rows: usize, ff: usize) -> Self::Buffer {
+        let d = self.download(gu);
+        let mut y = Vec::with_capacity(rows * ff);
+        for r in 0..rows {
+            for i in 0..ff {
+                let g = d[r * 2 * ff + i];
+                let t = (0.797_884_6 * (g + 0.044715 * g * g * g)).tanh();
+                y.push(0.5 * g * (1.0 + t) * d[r * 2 * ff + ff + i]);
+            }
+        }
+        self.upload(&y)
+    }
+
     /// SwiGLU over a fused gate/up projection: `gu` is `[rows, 2*ff]` (gate then up per row);
     /// returns `silu(gate) * up`, `[rows, ff]`.
     fn swiglu_split(&self, gu: &Self::Buffer, rows: usize, ff: usize) -> Self::Buffer {

@@ -19,6 +19,8 @@ fn main() -> Result<()> {
         return serve(&args[1..]);
     }
     let mut n = 32;
+    // `logits --last N`: only the last N positions (long prompts).
+    let mut last: Option<usize> = None;
     let mut dtype = Dtype::Bf16;
     let mut ids = Vec::new();
     let mut rest = args[2..].iter();
@@ -27,6 +29,8 @@ fn main() -> Result<()> {
             dtype = Dtype::F32;
         } else if a == "--q4" {
             dtype = Dtype::Q4;
+        } else if a == "--last" {
+            last = Some(rest.next().context("--last N")?.parse()?);
         } else if a == "-n" {
             n = rest.next().context("-n N")?.parse()?;
         } else {
@@ -50,7 +54,10 @@ fn main() -> Result<()> {
                 all
             };
             let v = model.cfg.vocab_size;
-            let rows: Vec<&[f32]> = logits.chunks(v).collect();
+            let mut rows: Vec<&[f32]> = logits.chunks(v).collect();
+            if let Some(n) = last {
+                rows = rows.split_off(rows.len().saturating_sub(n));
+            }
             println!("{}", serde_json::to_string(&rows)?);
         }
         "generate" => {

@@ -338,16 +338,28 @@ impl MetalDevice {
         n_heads: usize,
         n_kv: usize,
         d: usize,
+        window: usize,
     ) -> MetalBuffer {
         let longest = cache_start + q_len;
+        // Decode with a sliding window only needs the last `window` keys.
+        let base = if q_len == 1 && window > 0 {
+            longest.saturating_sub(window)
+        } else {
+            0
+        };
+        let span = longest - base;
         // Short contexts: per-key simdgroup loop (lower fixed cost). Longer: lane-per-key.
-        let lane_keys = q_len == 1 && longest >= 512;
+        let lane_keys = q_len == 1 && span >= 512;
         let n_splits = match q_len {
-            1 if lane_keys => longest.div_ceil(256).clamp(1, 64),
-            1 => longest.div_ceil(256).clamp(1, 32),
+            1 if lane_keys => span.div_ceil(256).clamp(1, 64),
+            1 => span.div_ceil(256).clamp(1, 32),
             _ => 1,
         };
-        let split_len = longest.div_ceil(n_splits);
+        let split_len = if q_len == 1 {
+            span.div_ceil(n_splits)
+        } else {
+            longest
+        };
         let params = self.make_buffer_u32(&[
             cache_start as u32,
             q_len as u32,
@@ -356,6 +368,8 @@ impl MetalDevice {
             d as u32,
             n_splits as u32,
             split_len as u32,
+            window as u32,
+            base as u32,
         ]);
         let partial = self.make_buffer_empty(q_len * n_heads * n_splits * (d + 2) * 4);
         let out = self.make_buffer_empty(q_len * n_heads * d * 4);
@@ -974,6 +988,7 @@ kernel void embedding(
                 n_heads,
                 n_kv_heads,
                 head_dim,
+                0,
             );
         }
         let total_dim = n_heads * head_dim;
@@ -1355,6 +1370,57 @@ kernel void embedding(
         MetalBuffer {
             buffer: q,
             len: seq * nh * hd,
+            kind: Kind::F32,
+        }
+    }
+
+    fn kv_attention_window(
+        &self,
+        q: &MetalBuffer,
+        k_cache: &MetalBuffer,
+        v_cache: &MetalBuffer,
+        cache_start: usize,
+        q_len: usize,
+        (n_heads, n_kv_heads, head_dim): (usize, usize, usize),
+        window: usize,
+    ) -> MetalBuffer {
+        if window == 0 || cache_start + q_len <= window {
+            return self.kv_attention(
+                q,
+                k_cache,
+                v_cache,
+                cache_start,
+                q_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+            );
+        }
+        assert!(
+            head_dim % 32 == 0 && head_dim <= 256 && n_heads % n_kv_heads == 0,
+            "sliding-window attention needs head_dim a multiple of 32, at most 256"
+        );
+        self.flash_attention(
+            q,
+            k_cache,
+            v_cache,
+            cache_start,
+            q_len,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            window,
+        )
+    }
+
+    fn geglu_split(&self, gu: &MetalBuffer, rows: usize, ff: usize) -> MetalBuffer {
+        let pipeline = self.get_pipeline(llm_msl::FUSED_MSL, "geglu_split");
+        let out = self.make_buffer_empty(rows * ff * 4);
+        let params = self.make_buffer_u32(&[rows as u32, ff as u32]);
+        self.dispatch(&pipeline, &[&gu.buffer, &out, &params], (rows * ff) as u64);
+        MetalBuffer {
+            buffer: out,
+            len: rows * ff,
             kind: Kind::F32,
         }
     }
