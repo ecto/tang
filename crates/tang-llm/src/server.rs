@@ -106,16 +106,36 @@ fn error(status: StatusCode, msg: impl Into<String>) -> Response {
         .into_response()
 }
 
-/// Flatten OpenAI content arrays (`[{type: text, text}]`) to strings, which templates expect.
+/// Make content a string, which templates assume: flatten OpenAI content arrays
+/// (`[{type: text, text}]`), and turn a null/missing content (tool-call-only assistant turns)
+/// into "" (templates do things like `'</think>' in message.content`).
 fn normalize_messages(messages: &Value) -> Value {
     let mut out = messages.clone();
     for m in out.as_array_mut().into_iter().flatten() {
         if let Some(parts) = m["content"].as_array() {
             let text: Vec<&str> = parts.iter().filter_map(|p| p["text"].as_str()).collect();
             m["content"] = json!(text.join("\n"));
+        } else if !m["content"].is_string() && m.is_object() {
+            m["content"] = json!("");
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn content_is_always_a_string() {
+        let m = serde_json::json!([
+            {"role": "assistant", "content": null, "tool_calls": []},
+            {"role": "user", "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]},
+            {"role": "assistant"},
+        ]);
+        let n = super::normalize_messages(&m);
+        assert_eq!(n[0]["content"], "");
+        assert_eq!(n[1]["content"], "a\nb");
+        assert_eq!(n[2]["content"], "");
+    }
 }
 
 fn parse(body: &Value) -> Result<Request, String> {
