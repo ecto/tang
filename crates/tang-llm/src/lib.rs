@@ -11,6 +11,7 @@ pub mod engine;
 pub mod model;
 pub mod sample;
 pub mod server;
+pub mod vision;
 pub mod weights;
 
 pub use config::Config;

@@ -251,8 +251,9 @@ kernel void copy_f32(
 ///
 /// Layouts: q/out `[q_len, n_heads*D]`, K/V `[pos, n_kv_heads*D]`; query qi attends to keys
 /// `0 ..= cache_start + qi`, or with a sliding window (`params[7] > 0`) only the last `window`
-/// of them. Splits start at key `params[8]` (decode skips keys no window can see).
-/// D must be a multiple of 32, at most 256.
+/// of them. Splits start at key `params[8]` (decode skips keys no window can see). With
+/// `params[9]` set, attention is bidirectional within the batch: every query sees keys up to
+/// `cache_start + q_len` (image tokens, vision encoders). D at most 256.
 pub const FLASH_DECODE_MSL: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -275,14 +276,15 @@ kernel void attn_partial(
     uint D = params[4];
     uint n_splits = params[5];
     uint split_len = params[6];
-    uint window = params[7], base = params[8];
+    uint window = params[7], base = params[8], bidir = params[9];
     uint head = tg.x, split = tg.y, qi = tg.z;
     uint kv_head = head / (n_heads / n_kv);
     uint kv_dim = n_kv * D;
-    uint per = D / 32;
+    uint per = (D + 31) / 32;
 
-    uint attend = cache_start + qi + 1;
-    uint lo = (window > 0 && attend > window) ? attend - window : 0;
+    uint qpos = cache_start + qi + 1;
+    uint attend = bidir ? cache_start + params[1] : qpos;
+    uint lo = (window > 0 && qpos > window) ? qpos - window : 0;
     uint s0 = base + split * split_len;
     uint j0 = max(s0, lo);
     uint j1 = min(s0 + split_len, attend);
@@ -290,19 +292,23 @@ kernel void attn_partial(
     float q[MAXV], acc[MAXV];
     float scale = rsqrt(float(D));
     device const float* qp = Q + (ulong)qi * n_heads * D + head * D;
-    for (uint v = 0; v < per; v++) { q[v] = qp[v * 32 + lane] * scale; acc[v] = 0; }
+    for (uint v = 0; v < per; v++) {
+        uint d = v * 32 + lane;
+        q[v] = d < D ? qp[d] * scale : 0.0f;
+        acc[v] = 0;
+    }
     float m = -INFINITY, l = 0;
 
     for (uint j = j0 + sg; j < j1; j += 8) {
         device const float* kp = K + (ulong)j * kv_dim + kv_head * D;
         float s = 0;
-        for (uint v = 0; v < per; v++) s += q[v] * kp[v * 32 + lane];
+        for (uint v = 0; v < per; v++) { uint d = v * 32 + lane; if (d < D) s += q[v] * kp[d]; }
         s = simd_sum(s);
         float m2 = max(m, s);
         float c = exp(m - m2), p = exp(s - m2);
         l = l * c + p;
         device const float* vp = V + (ulong)j * kv_dim + kv_head * D;
-        for (uint v = 0; v < per; v++) acc[v] = acc[v] * c + p * vp[v * 32 + lane];
+        for (uint v = 0; v < per; v++) { uint d = v * 32 + lane; if (d < D) acc[v] = acc[v] * c + p * vp[d]; }
         m = m2;
     }
 
@@ -310,7 +316,7 @@ kernel void attn_partial(
     threadgroup float sm[8], sl[8];
     threadgroup float sacc[8 * 256];
     if (lane == 0) { sm[sg] = m; sl[sg] = l; }
-    for (uint v = 0; v < per; v++) sacc[sg * D + v * 32 + lane] = acc[v];
+    for (uint v = 0; v < per; v++) { uint d = v * 32 + lane; if (d < D) sacc[sg * D + d] = acc[v]; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (sg != 0) return;
 
@@ -322,10 +328,10 @@ kernel void attn_partial(
     for (uint g = 0; g < 8; g++) {
         float c = (sm[g] == -INFINITY) ? 0.0f : exp(sm[g] - M);
         L += sl[g] * c;
-        for (uint v = 0; v < per; v++) out[v] += sacc[g * D + v * 32 + lane] * c;
+        for (uint v = 0; v < per; v++) { uint d = v * 32 + lane; if (d < D) out[v] += sacc[g * D + d] * c; }
     }
     device float* pp = P + (((ulong)qi * n_heads + head) * n_splits + split) * (D + 2);
-    for (uint v = 0; v < per; v++) pp[2 + v * 32 + lane] = out[v];
+    for (uint v = 0; v < per; v++) { uint d = v * 32 + lane; if (d < D) pp[2 + d] = out[v]; }
     if (lane == 0) { pp[0] = M; pp[1] = L; }
 }
 
@@ -656,6 +662,55 @@ kernel void attention_prep(
     for (uint v = 0; v < per; v++) dst[v * 32 + lane] = y[v];
 }
 
+// GELU (tanh approximation), elementwise.
+kernel void gelu_tanh(
+    device const float* X [[buffer(0)]],
+    device float* Y [[buffer(1)]],
+    device const uint* params [[buffer(2)]],  // [n]
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= params[0]) return;
+    float g = X[gid];
+    float t = tanh(clamp(0.7978845608f * (g + 0.044715f * g * g * g), -10.0f, 10.0f));
+    Y[gid] = 0.5f * g * (1.0f + t);
+}
+
+// LayerNorm with weight and bias: one threadgroup (256 threads) per row.
+kernel void layer_norm(
+    device const float* X [[buffer(0)]],
+    device const float* W [[buffer(1)]],
+    device const float* B [[buffer(2)]],
+    device float* Y [[buffer(3)]],
+    device const float* eps [[buffer(4)]],
+    device const uint* params [[buffer(5)]],  // [rows, dim]
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    uint dim = params[1];
+    device const float* x = X + (ulong)row * dim;
+    threadgroup float red[8];
+    float s = 0;
+    for (uint i = tid; i < dim; i += 256) s += x[i];
+    s = simd_sum(s);
+    if (lane == 0) red[sg] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float mean = 0;
+    for (uint g = 0; g < 8; g++) mean += red[g];
+    mean /= float(dim);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float v = 0;
+    for (uint i = tid; i < dim; i += 256) { float d = x[i] - mean; v += d * d; }
+    v = simd_sum(v);
+    if (lane == 0) red[sg] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float var = 0;
+    for (uint g = 0; g < 8; g++) var += red[g];
+    float inv = rsqrt(var / float(dim) + eps[0]);
+    for (uint i = tid; i < dim; i += 256) Y[(ulong)row * dim + i] = (x[i] - mean) * inv * W[i] + B[i];
+}
+
 // GeGLU (Gemma): gelu_tanh(gate) * up over a fused gate/up projection.
 kernel void geglu_split(
     device const float* GU [[buffer(0)]],
@@ -707,12 +762,13 @@ kernel void attn_prefill(
     device const float* K [[buffer(1)]],     // [.., nkv*D]
     device const float* V [[buffer(2)]],
     device float* O [[buffer(3)]],           // [q_pad, nh*D]
-    device const uint* params [[buffer(4)]], // [cache_start, q_len, nh, nkv, D]
+    device const uint* params [[buffer(4)]], // [cache_start, q_len, nh, nkv, D, bidirectional]
     uint2 tg [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
 {
     uint cache_start = params[0], q_len = params[1], nh = params[2], nkv = params[3], D = params[4];
+    bool bidir = params[5] != 0;
     uint qb = tg.x, head = tg.y;
     uint kvh = head / (nh / nkv);
     uint qs = nh * D, ks = nkv * D;
@@ -731,8 +787,10 @@ kernel void attn_prefill(
     // Row bookkeeping: lane handles row lane/4, columns (lane%4)*8 .. +8.
     uint row = lane / 4, part = lane % 4;
     float m = -INFINITY, l = 0;
-    uint abs_row = cache_start + r0 + row;       // absolute position of this query
-    uint last = min(cache_start + r0 + 7, cache_start + q_len - 1);  // last position any row here needs
+    uint end = cache_start + q_len - 1;          // last key in the cache
+    // The last key this row may see: itself (causal) or the batch's end (bidirectional).
+    uint abs_row = bidir ? end : cache_start + r0 + row;
+    uint last = bidir ? end : min(cache_start + r0 + 7, end);  // last position any row here needs
 
     device const float* qp = Q + (ulong)r0 * qs + head * D;
     for (uint j0 = 0; j0 <= last; j0 += BK) {

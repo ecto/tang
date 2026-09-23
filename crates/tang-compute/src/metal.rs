@@ -279,6 +279,7 @@ impl MetalDevice {
         n_heads: usize,
         n_kv: usize,
         d: usize,
+        bidir: bool,
     ) -> MetalBuffer {
         let q_pad = q_len.next_multiple_of(32);
         let width = n_heads * d;
@@ -298,6 +299,7 @@ impl MetalDevice {
             n_heads as u32,
             n_kv as u32,
             d as u32,
+            bidir as u32,
         ]);
         let pipeline = self.get_pipeline(llm_msl::FLASH_PREFILL_MSL, "attn_prefill");
         self.with_encoder(|enc| {
@@ -339,6 +341,7 @@ impl MetalDevice {
         n_kv: usize,
         d: usize,
         window: usize,
+        bidir: bool,
     ) -> MetalBuffer {
         let longest = cache_start + q_len;
         // Decode with a sliding window only needs the last `window` keys.
@@ -370,6 +373,7 @@ impl MetalDevice {
             split_len as u32,
             window as u32,
             base as u32,
+            bidir as u32,
         ]);
         let partial = self.make_buffer_empty(q_len * n_heads * n_splits * (d + 2) * 4);
         let out = self.make_buffer_empty(q_len * n_heads * d * 4);
@@ -976,6 +980,7 @@ kernel void embedding(
                 n_heads,
                 n_kv_heads,
                 head_dim,
+                false,
             );
         }
         if head_dim % 32 == 0 && head_dim <= 256 && n_heads % n_kv_heads == 0 {
@@ -989,6 +994,7 @@ kernel void embedding(
                 n_kv_heads,
                 head_dim,
                 0,
+                false,
             );
         }
         let total_dim = n_heads * head_dim;
@@ -1383,8 +1389,9 @@ kernel void embedding(
         q_len: usize,
         (n_heads, n_kv_heads, head_dim): (usize, usize, usize),
         window: usize,
+        causal: bool,
     ) -> MetalBuffer {
-        if window == 0 || cache_start + q_len <= window {
+        if causal && (window == 0 || cache_start + q_len <= window) {
             return self.kv_attention(
                 q,
                 k_cache,
@@ -1397,8 +1404,8 @@ kernel void embedding(
             );
         }
         assert!(
-            head_dim % 32 == 0 && head_dim <= 256 && n_heads % n_kv_heads == 0,
-            "sliding-window attention needs head_dim a multiple of 32, at most 256"
+            head_dim <= 256 && n_heads % n_kv_heads == 0,
+            "windowed or bidirectional attention needs head_dim at most 256"
         );
         self.flash_attention(
             q,
@@ -1410,7 +1417,63 @@ kernel void embedding(
             n_kv_heads,
             head_dim,
             window,
+            !causal,
         )
+    }
+
+    fn attention_full(
+        &self,
+        q: &MetalBuffer,
+        k: &MetalBuffer,
+        v: &MetalBuffer,
+        n: usize,
+        nh: usize,
+        hd: usize,
+    ) -> MetalBuffer {
+        // The tiled simdgroup-matrix kernel when the shape allows (vision towers: D 64-128).
+        let rows = n.next_multiple_of(32) * nh * hd;
+        if hd % 8 == 0 && hd <= 128 && k.len >= rows && v.len >= rows {
+            return self.flash_prefill(q, k, v, 0, n, nh, nh, hd, true);
+        }
+        self.flash_attention(q, k, v, 0, n, nh, nh, hd, 0, true)
+    }
+
+    fn layer_norm(
+        &self,
+        x: &MetalBuffer,
+        w: &MetalBuffer,
+        b: &MetalBuffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) -> MetalBuffer {
+        let pipeline = self.get_pipeline(llm_msl::FUSED_MSL, "layer_norm");
+        let out = self.make_buffer_empty(rows * dim * 4);
+        let eps = self.make_buffer(&[eps]);
+        let params = self.make_buffer_u32(&[rows as u32, dim as u32]);
+        self.dispatch_groups(
+            &pipeline,
+            &[&x.buffer, &w.buffer, &b.buffer, &out, &eps, &params],
+            (rows, 1),
+            256,
+        );
+        MetalBuffer {
+            buffer: out,
+            len: rows * dim,
+            kind: Kind::F32,
+        }
+    }
+
+    fn gelu_tanh(&self, x: &MetalBuffer, n: usize) -> MetalBuffer {
+        let pipeline = self.get_pipeline(llm_msl::FUSED_MSL, "gelu_tanh");
+        let out = self.make_buffer_empty(n * 4);
+        let params = self.make_buffer_u32(&[n as u32]);
+        self.dispatch(&pipeline, &[&x.buffer, &out, &params], n as u64);
+        MetalBuffer {
+            buffer: out,
+            len: n,
+            kind: Kind::F32,
+        }
     }
 
     fn geglu_split(&self, gu: &MetalBuffer, rows: usize, ff: usize) -> MetalBuffer {

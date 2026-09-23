@@ -955,8 +955,9 @@ pub trait ComputeDevice: Send {
         q_len: usize,
         (nh, nkv, hd): (usize, usize, usize),
         window: usize,
+        causal: bool,
     ) -> Self::Buffer {
-        if window == 0 || cache_start + q_len <= window {
+        if causal && (window == 0 || cache_start + q_len <= window) {
             return self.kv_attention(q, k_cache, v_cache, cache_start, q_len, nh, nkv, hd);
         }
         let (q, k, v) = (
@@ -967,8 +968,13 @@ pub trait ComputeDevice: Send {
         let (kvd, scale) = (nkv * hd, 1.0 / (hd as f32).sqrt());
         let mut out = vec![0.0f32; q_len * nh * hd];
         for qi in 0..q_len {
-            let attend = cache_start + qi + 1;
-            let lo = attend.saturating_sub(window);
+            let qpos = cache_start + qi + 1;
+            let attend = if causal { qpos } else { cache_start + q_len };
+            let lo = if window > 0 {
+                qpos.saturating_sub(window)
+            } else {
+                0
+            };
             for h in 0..nh {
                 let kh = h / (nh / nkv);
                 let qv = &q[(qi * nh + h) * hd..][..hd];
@@ -992,6 +998,55 @@ pub trait ComputeDevice: Send {
             }
         }
         self.upload(&out)
+    }
+
+    /// Bidirectional multi-head attention over `n` positions (vision encoders): q, k, v and the
+    /// result are `[n, nh * hd]`.
+    fn attention_full(
+        &self,
+        q: &Self::Buffer,
+        k: &Self::Buffer,
+        v: &Self::Buffer,
+        n: usize,
+        nh: usize,
+        hd: usize,
+    ) -> Self::Buffer {
+        self.kv_attention_window(q, k, v, 0, n, (nh, nh, hd), 0, false)
+    }
+
+    /// LayerNorm over rows of `dim`, with weight and bias.
+    fn layer_norm(
+        &self,
+        x: &Self::Buffer,
+        w: &Self::Buffer,
+        b: &Self::Buffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Self::Buffer {
+        let (x, w, b) = (self.download(x), self.download(w), self.download(b));
+        let mut y = Vec::with_capacity(rows * dim);
+        for r in x.chunks(dim).take(rows) {
+            let mean = r.iter().sum::<f32>() / dim as f32;
+            let var = r.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / dim as f32;
+            let inv = 1.0 / (var + eps).sqrt();
+            y.extend(
+                r.iter()
+                    .enumerate()
+                    .map(|(i, v)| (v - mean) * inv * w[i] + b[i]),
+            );
+        }
+        self.upload(&y)
+    }
+
+    /// GELU, tanh approximation, elementwise over `n` values.
+    fn gelu_tanh(&self, x: &Self::Buffer, n: usize) -> Self::Buffer {
+        let x = self.download(x);
+        let y: Vec<f32> = x[..n]
+            .iter()
+            .map(|&g| 0.5 * g * (1.0 + (0.797_884_6 * (g + 0.044715 * g * g * g)).tanh()))
+            .collect();
+        self.upload(&y)
     }
 
     /// GeGLU over a fused gate/up projection (Gemma): `gelu_tanh(gate) * up`, `[rows, ff]`.

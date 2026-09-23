@@ -47,6 +47,8 @@ pub struct Model<D: ComputeDevice> {
     ropes: Vec<(D::Buffer, D::Buffer)>,
     /// Gemma scales embeddings by sqrt(hidden), rounded to bf16 as the reference does.
     embed_scale: Option<f32>,
+    /// The vision tower, for multimodal checkpoints.
+    pub vision: Option<crate::vision::Vision<D::Buffer>>,
     max_ctx: usize,
 }
 
@@ -205,6 +207,12 @@ impl<D: ComputeDevice> Model<D> {
             ropes.push((dev.upload(&cos), dev.upload(&sin)));
         }
         let embed_scale = gemma.then(|| bf16_round((cfg.hidden_size as f32).sqrt()));
+        let vision = match &cfg.vision {
+            Some(v) if w.has("vision_tower.vision_model.post_layernorm.weight") => Some(
+                crate::vision::Vision::load(&dev, &w, v.clone(), cfg.hidden_size, cfg.mm_tokens_per_image)?,
+            ),
+            _ => None,
+        };
         Ok(Self {
             cfg,
             dev,
@@ -214,6 +222,7 @@ impl<D: ComputeDevice> Model<D> {
             lm_head,
             ropes,
             embed_scale,
+            vision,
             max_ctx,
         })
     }
@@ -242,7 +251,62 @@ impl<D: ComputeDevice> Model<D> {
         all: bool,
     ) -> Result<Vec<f32>> {
         let x = self.embed(tokens)?;
-        self.forward_hidden(x, tokens, cache, all)
+        self.forward_hidden(x, tokens, cache, all, true)
+    }
+
+    /// An image's embeddings, ready to stand in for its placeholder tokens.
+    pub fn encode_image(&self, pixels: &[f32]) -> Result<D::Buffer> {
+        let v = self.vision.as_ref().ok_or_else(|| anyhow::anyhow!("this model has no vision tower"))?;
+        Ok(v.encode(&self.dev, pixels, self.embed_scale.unwrap_or(1.0)))
+    }
+
+    /// `forward` with images: each run of image placeholder tokens takes the next image's
+    /// embeddings, and attends bidirectionally within itself (text stays causal).
+    pub fn forward_images(
+        &self,
+        tokens: &[u32],
+        images: &[D::Buffer],
+        cache: &mut Cache<D::Buffer>,
+        all: bool,
+    ) -> Result<Vec<f32>> {
+        let Some(img_tok) = self.cfg.image_token.filter(|_| !images.is_empty()) else {
+            return self.forward(tokens, cache, all);
+        };
+        let h = self.cfg.hidden_size;
+        let mut x = self.embed(tokens)?;
+        // Runs of (start, len, is_image).
+        let mut runs: Vec<(usize, usize, bool)> = Vec::new();
+        for (i, &t) in tokens.iter().enumerate() {
+            let img = t == img_tok;
+            match runs.last_mut() {
+                Some((_, len, kind)) if *kind == img => *len += 1,
+                _ => runs.push((i, 1, img)),
+            }
+        }
+        let mut next = images.iter();
+        for &(start, len, img) in &runs {
+            if img {
+                let feat = next.next().ok_or_else(|| anyhow::anyhow!("more image placeholders than images"))?;
+                anyhow::ensure!(len == self.vision.as_ref().map_or(0, |v| v.tokens), "an image takes {} placeholders, got {len}", self.vision.as_ref().map_or(0, |v| v.tokens));
+                self.dev.write_into(&mut x, start * h, feat);
+            }
+        }
+        let mut out = Vec::new();
+        for (r, &(start, len, img)) in runs.iter().enumerate() {
+            let seg = self.dev.slice_buffer(&x, start * h, len * h);
+            let last = r + 1 == runs.len();
+            let logits = self.forward_hidden(seg, &tokens[start..start + len], cache, all || last, !img)?;
+            if all {
+                out.extend(logits);
+            } else if last {
+                out = logits;
+            }
+        }
+        if !all {
+            let v = self.cfg.vocab_size;
+            out = out.split_off(out.len() - v);
+        }
+        Ok(out)
     }
 
     /// Token embeddings (scaled, for Gemma), `[tokens, hidden]` on device.
@@ -266,6 +330,7 @@ impl<D: ComputeDevice> Model<D> {
         tokens: &[u32],
         cache: &mut Cache<D::Buffer>,
         all: bool,
+        causal: bool,
     ) -> Result<Vec<f32>> {
         let c = &self.cfg;
         let dev = &self.dev;
@@ -277,7 +342,7 @@ impl<D: ComputeDevice> Model<D> {
             self.max_ctx
         );
         let (h, eps) = (c.hidden_size, c.rms_norm_eps);
-        self.decode_layers(&mut x, cache, s, pos)?;
+        self.decode_layers(&mut x, cache, s, pos, causal)?;
         let (rows, x) = if all {
             (s, x)
         } else {
@@ -301,6 +366,7 @@ impl<D: ComputeDevice> Model<D> {
         cache: &mut Cache<D::Buffer>,
         s: usize,
         pos: usize,
+        causal: bool,
     ) -> Result<()> {
         let c = &self.cfg;
         let dev = &self.dev;
@@ -337,6 +403,7 @@ impl<D: ComputeDevice> Model<D> {
                 s,
                 (nh, nkv, hd),
                 w.window,
+                causal,
             );
             let mut o = dev.linear(&att, &w.wo, s, qd, h);
             if let Some(n) = &w.post_attn_norm {
