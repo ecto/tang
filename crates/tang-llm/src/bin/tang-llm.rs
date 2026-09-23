@@ -33,7 +33,12 @@ fn main() -> Result<()> {
     if matches!(cmd, "image-features" | "logits-image") {
         let path = rest.next().context("a pixels file")?;
         let bytes = std::fs::read(path)?;
-        pixels = Some(bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect());
+        pixels = Some(
+            bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect(),
+        );
     }
     while let Some(a) = rest.next() {
         if a == "--f32" {

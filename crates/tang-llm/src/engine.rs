@@ -14,8 +14,13 @@ use tokenizers::Tokenizer;
 /// Prefill in chunks to bound scratch memory.
 const PREFILL_CHUNK: usize = 512;
 
+/// Where an image goes in a flattened message; expanded to the model's image tokens.
+pub const IMAGE_MARKER: &str = "<start_of_image>";
+
 pub struct Request {
     pub messages: Value,
+    /// Encoded images (PNG, JPEG, ...), in the order their markers appear.
+    pub images: Vec<Vec<u8>>,
     pub tools: Option<Value>,
     pub think: Option<bool>,
     pub sampling: Sampling,
@@ -45,6 +50,9 @@ pub struct Engine<D: ComputeDevice> {
     tok: Tokenizer,
     template: Template,
     cache: Cache<D::Buffer>,
+    /// Images in the cache: where each image's tokens start, and a hash of the image, so a
+    /// shared prefix is only reused when the images in it are the same.
+    cache_images: Vec<(usize, u64)>,
     eos: Vec<u32>,
 }
 
@@ -79,6 +87,7 @@ impl<D: ComputeDevice> Engine<D> {
             tok,
             template,
             cache,
+            cache_images: Vec::new(),
             eos,
         })
     }
@@ -106,10 +115,37 @@ impl<D: ComputeDevice> Engine<D> {
         req: &Request,
         mut on: impl FnMut(Piece) -> bool,
     ) -> Result<(Finish, Usage)> {
-        let prompt = self
+        let mut prompt = self
             .template
             .render(&req.messages, req.tools.as_ref(), req.think)?;
+        if !req.images.is_empty() {
+            let per = self
+                .model
+                .vision
+                .as_ref()
+                .map(|v| v.tokens)
+                .ok_or_else(|| anyhow!("this model can't see images"))?;
+            anyhow::ensure!(
+                prompt.matches(IMAGE_MARKER).count() == req.images.len(),
+                "the chat template dropped some images"
+            );
+            // As the processor does: each marker becomes a block of image tokens.
+            let block = format!(
+                "\n\n<start_of_image>{}<end_of_image>\n\n",
+                "<image_soft_token>".repeat(per)
+            );
+            prompt = prompt.replace(IMAGE_MARKER, &block);
+        }
         let ids = self.encode(&prompt)?;
+        // Where each image's tokens start, with a hash of the image.
+        let img_tok = self.model.cfg.image_token;
+        let mut runs: Vec<(usize, u64)> = Vec::new();
+        for (i, &t) in ids.iter().enumerate() {
+            if !req.images.is_empty() && Some(t) == img_tok && (i == 0 || ids[i - 1] != t) {
+                let bytes = &req.images[runs.len().min(req.images.len().saturating_sub(1))];
+                runs.push((i, hash(bytes)));
+            }
+        }
         let ctx = self.model.max_ctx();
         anyhow::ensure!(
             ids.len() < ctx,
@@ -126,14 +162,42 @@ impl<D: ComputeDevice> Engine<D> {
             .zip(&ids)
             .take_while(|(a, b)| a == b)
             .count();
-        let reuse = shared.min(ids.len() - 1);
+        // Only as far as the images match, and never into the middle of an image's tokens.
+        let differ = self
+            .cache_images
+            .iter()
+            .zip(&runs)
+            .find(|(a, b)| a != b)
+            .map(|(a, b)| a.0.min(b.0))
+            .or_else(|| runs.get(self.cache_images.len()).map(|r| r.0))
+            .unwrap_or(usize::MAX);
+        let mut reuse = shared.min(ids.len() - 1).min(differ);
+        let per = self.model.vision.as_ref().map_or(0, |v| v.tokens);
+        if let Some(&(start, _)) = runs.iter().find(|(s, _)| *s < reuse && reuse < s + per) {
+            reuse = start;
+        }
         self.cache.truncate(reuse);
 
         let t = Instant::now();
         let mut logits = Vec::new();
-        for chunk in ids[reuse..].chunks(PREFILL_CHUNK) {
-            logits = self.model.forward(chunk, &mut self.cache, false)?;
+        if runs.is_empty() {
+            for chunk in ids[reuse..].chunks(PREFILL_CHUNK) {
+                logits = self.model.forward(chunk, &mut self.cache, false)?;
+            }
+        } else {
+            let size = self.model.vision.as_ref().map_or(896, |v| v.cfg.image_size);
+            let mut feats = Vec::new();
+            for (i, &(start, _)) in runs.iter().enumerate() {
+                if start >= reuse {
+                    let px = crate::vision::preprocess(&req.images[i], size)?;
+                    feats.push(self.model.encode_image(&px)?);
+                }
+            }
+            logits = self
+                .model
+                .forward_images(&ids[reuse..], &feats, &mut self.cache, false)?;
         }
+        self.cache_images = runs;
         let prefill_s = t.elapsed().as_secs_f64();
 
         let mut sampler = Sampler::new(req.sampling.clone());
@@ -217,4 +281,11 @@ impl<D: ComputeDevice> Engine<D> {
             .map_err(|e| anyhow!("detokenize: {e}"))
             .context("decode")
     }
+}
+
+fn hash(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
 }

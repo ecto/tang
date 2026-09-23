@@ -45,8 +45,12 @@ impl<B> Vision<B> {
         let p = "vision_tower.vision_model";
         let f32v = |n: &str| -> Result<B> { Ok(dev.upload(&w.f32(n)?.0)) };
         let mat = |n: &str| -> Result<B> { Ok(dev.upload_bf16(&w.bf16(n)?)) };
-        let lin = |n: &str| -> Result<(B, B)> { Ok((mat(&format!("{n}.weight"))?, f32v(&format!("{n}.bias"))?)) };
-        let norm = |n: &str| -> Result<(B, B)> { Ok((f32v(&format!("{n}.weight"))?, f32v(&format!("{n}.bias"))?)) };
+        let lin = |n: &str| -> Result<(B, B)> {
+            Ok((mat(&format!("{n}.weight"))?, f32v(&format!("{n}.bias"))?))
+        };
+        let norm = |n: &str| -> Result<(B, B)> {
+            Ok((f32v(&format!("{n}.weight"))?, f32v(&format!("{n}.bias"))?))
+        };
         let layers = (0..cfg.num_hidden_layers)
             .map(|l| {
                 let q = format!("{p}.encoder.layers.{l}");
@@ -96,7 +100,12 @@ impl<B> Vision<B> {
     /// the language model's space, `[tokens, text_hidden]`, scaled so that the decoder's input
     /// embedding scale leaves them as the projector produced them divided by sqrt(hidden)
     /// (as the reference merges them).
-    pub fn encode<D: ComputeDevice<Buffer = B>>(&self, dev: &D, pixels: &[f32], embed_scale: f32) -> B {
+    pub fn encode<D: ComputeDevice<Buffer = B>>(
+        &self,
+        dev: &D,
+        pixels: &[f32],
+        embed_scale: f32,
+    ) -> B {
         let mut out = self.project(dev, pixels);
         // The reference divides by sqrt(hidden) before the decoder multiplies every input
         // embedding by its (bf16-rounded) scale; embeddings here are already scaled.
@@ -123,7 +132,11 @@ impl<B> Vision<B> {
         };
         for l in &self.layers {
             let a = dev.layer_norm(&x, &l.ln1.0, &l.ln1.1, n, h, eps);
-            let (q, k, v) = (lin(&a, &l.q, h, h), lin(&a, &l.k, h, h), lin(&a, &l.v, h, h));
+            let (q, k, v) = (
+                lin(&a, &l.q, h, h),
+                lin(&a, &l.k, h, h),
+                lin(&a, &l.v, h, h),
+            );
             let att = dev.attention_full(&q, &k, &v, n, nh, hd);
             x = dev.add_tensors_buf(&x, &lin(&att, &l.o, h, h), n * h);
             let m = dev.layer_norm(&x, &l.ln2.0, &l.ln2.1, n, h, eps);
@@ -155,6 +168,25 @@ impl<B> Vision<B> {
         let normed = dev.rms_norm(&pooled, &self.mm_norm, m, h, eps);
         dev.linear(&normed, &self.mm_proj, m, h, self.text_hidden)
     }
+}
+
+/// Decode an image (PNG, JPEG, WebP, GIF) and prepare it for the tower: RGB, resized to
+/// `size`×`size` (bilinear), scaled to [-1, 1], `[size, size, 3]` row-major.
+pub fn preprocess(bytes: &[u8], size: usize) -> Result<Vec<f32>> {
+    let img = image::load_from_memory(bytes)
+        .map_err(|e| anyhow::anyhow!("couldn't read the image: {e}"))?
+        .to_rgb8();
+    let img = image::imageops::resize(
+        &img,
+        size as u32,
+        size as u32,
+        image::imageops::FilterType::Triangle,
+    );
+    Ok(img
+        .into_raw()
+        .into_iter()
+        .map(|b| (b as f32 / 255.0 - 0.5) / 0.5)
+        .collect())
 }
 
 /// Non-overlapping `ps`×`ps` patches of an `[size, size, 3]` image, row-major over the patch

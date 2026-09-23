@@ -36,6 +36,8 @@ struct App {
     jobs: std_mpsc::Sender<Job>,
     model: String,
     ctx: usize,
+    /// The model takes images.
+    vision: bool,
 }
 
 /// Serve `engine` on `addr` until the process exits. `load` runs on the worker thread (so the
@@ -50,7 +52,7 @@ where
     std::thread::spawn(move || {
         let mut engine = match load() {
             Ok(e) => {
-                let _ = ready_tx.send(Ok(e.context_window()));
+                let _ = ready_tx.send(Ok((e.context_window(), e.model.vision.is_some())));
                 e
             }
             Err(e) => {
@@ -67,9 +69,14 @@ where
             };
         }
     });
-    let ctx = ready_rx.recv()??;
+    let (ctx, vision) = ready_rx.recv()??;
 
-    let app = App { jobs, model, ctx };
+    let app = App {
+        jobs,
+        model,
+        ctx,
+        vision,
+    };
     let router = Router::new()
         .route("/v1/chat/completions", post(chat))
         .route("/v1/models", get(models))
@@ -88,9 +95,14 @@ where
 }
 
 async fn models(State(app): State<App>) -> Json<Value> {
+    let caps: Vec<&str> = if app.vision {
+        vec!["completion", "vision"]
+    } else {
+        vec!["completion"]
+    };
     Json(json!({
         "object": "list",
-        "data": [{ "id": app.model, "object": "model", "owned_by": "tang", "max_model_len": app.ctx }],
+        "data": [{ "id": app.model, "object": "model", "owned_by": "tang", "max_model_len": app.ctx, "capabilities": caps }],
     }))
 }
 
@@ -108,18 +120,37 @@ fn error(status: StatusCode, msg: impl Into<String>) -> Response {
 
 /// Make content a string, which templates assume: flatten OpenAI content arrays
 /// (`[{type: text, text}]`), and turn a null/missing content (tool-call-only assistant turns)
-/// into "" (templates do things like `'</think>' in message.content`).
-fn normalize_messages(messages: &Value) -> Value {
+/// into "" (templates do things like `'</think>' in message.content`). Images (`image_url`
+/// parts with data URLs) are returned in order, each leaving an image marker in the text.
+fn normalize_messages(messages: &Value) -> Result<(Value, Vec<Vec<u8>>), String> {
+    use base64::Engine as _;
     let mut out = messages.clone();
+    let mut images = Vec::new();
     for m in out.as_array_mut().into_iter().flatten() {
         if let Some(parts) = m["content"].as_array() {
-            let text: Vec<&str> = parts.iter().filter_map(|p| p["text"].as_str()).collect();
+            let mut text: Vec<String> = Vec::new();
+            for p in parts {
+                if let Some(t) = p["text"].as_str() {
+                    text.push(t.to_string());
+                } else if let Some(url) = p["image_url"]["url"].as_str().or(p["image_url"].as_str())
+                {
+                    let data = url
+                        .split_once(";base64,")
+                        .map(|(_, d)| d)
+                        .ok_or("images must be data URLs (data:image/...;base64,...)")?;
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(data.trim())
+                        .map_err(|e| format!("image data: {e}"))?;
+                    images.push(bytes);
+                    text.push(crate::engine::IMAGE_MARKER.to_string());
+                }
+            }
             m["content"] = json!(text.join("\n"));
         } else if !m["content"].is_string() && m.is_object() {
             m["content"] = json!("");
         }
     }
-    out
+    Ok((out, images))
 }
 
 #[cfg(test)]
@@ -131,7 +162,7 @@ mod tests {
             {"role": "user", "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]},
             {"role": "assistant"},
         ]);
-        let n = super::normalize_messages(&m);
+        let (n, _) = super::normalize_messages(&m).unwrap();
         assert_eq!(n[0]["content"], "");
         assert_eq!(n[1]["content"], "a\nb");
         assert_eq!(n[2]["content"], "");
@@ -145,8 +176,10 @@ fn parse(body: &Value) -> Result<Request, String> {
         .ok_or("messages must be an array")?;
     let d = Sampling::default();
     let f = |k: &str| body[k].as_f64();
+    let (messages, images) = normalize_messages(messages)?;
     Ok(Request {
-        messages: normalize_messages(messages),
+        messages,
+        images,
         tools: body.get("tools").cloned().filter(|t| !t.is_null()),
         think: body["chat_template_kwargs"]["enable_thinking"]
             .as_bool()

@@ -208,9 +208,15 @@ impl<D: ComputeDevice> Model<D> {
         }
         let embed_scale = gemma.then(|| bf16_round((cfg.hidden_size as f32).sqrt()));
         let vision = match &cfg.vision {
-            Some(v) if w.has("vision_tower.vision_model.post_layernorm.weight") => Some(
-                crate::vision::Vision::load(&dev, &w, v.clone(), cfg.hidden_size, cfg.mm_tokens_per_image)?,
-            ),
+            Some(v) if w.has("vision_tower.vision_model.post_layernorm.weight") => {
+                Some(crate::vision::Vision::load(
+                    &dev,
+                    &w,
+                    v.clone(),
+                    cfg.hidden_size,
+                    cfg.mm_tokens_per_image,
+                )?)
+            }
             _ => None,
         };
         Ok(Self {
@@ -256,7 +262,10 @@ impl<D: ComputeDevice> Model<D> {
 
     /// An image's embeddings, ready to stand in for its placeholder tokens.
     pub fn encode_image(&self, pixels: &[f32]) -> Result<D::Buffer> {
-        let v = self.vision.as_ref().ok_or_else(|| anyhow::anyhow!("this model has no vision tower"))?;
+        let v = self
+            .vision
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("this model has no vision tower"))?;
         Ok(v.encode(&self.dev, pixels, self.embed_scale.unwrap_or(1.0)))
     }
 
@@ -286,16 +295,37 @@ impl<D: ComputeDevice> Model<D> {
         let mut next = images.iter();
         for &(start, len, img) in &runs {
             if img {
-                let feat = next.next().ok_or_else(|| anyhow::anyhow!("more image placeholders than images"))?;
-                anyhow::ensure!(len == self.vision.as_ref().map_or(0, |v| v.tokens), "an image takes {} placeholders, got {len}", self.vision.as_ref().map_or(0, |v| v.tokens));
+                let feat = next
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("more image placeholders than images"))?;
+                anyhow::ensure!(
+                    len == self.vision.as_ref().map_or(0, |v| v.tokens),
+                    "an image takes {} placeholders, got {len}",
+                    self.vision.as_ref().map_or(0, |v| v.tokens)
+                );
                 self.dev.write_into(&mut x, start * h, feat);
             }
         }
+        // Text runs go in chunks (bounded scratch memory); an image block never splits.
+        let mut pieces: Vec<(usize, usize, bool)> = Vec::new();
+        for &(start, len, img) in &runs {
+            if img {
+                pieces.push((start, len, true));
+            } else {
+                let mut s = start;
+                while s < start + len {
+                    let n = (start + len - s).min(512);
+                    pieces.push((s, n, false));
+                    s += n;
+                }
+            }
+        }
         let mut out = Vec::new();
-        for (r, &(start, len, img)) in runs.iter().enumerate() {
+        for (r, &(start, len, img)) in pieces.iter().enumerate() {
             let seg = self.dev.slice_buffer(&x, start * h, len * h);
-            let last = r + 1 == runs.len();
-            let logits = self.forward_hidden(seg, &tokens[start..start + len], cache, all || last, !img)?;
+            let last = r + 1 == pieces.len();
+            let logits =
+                self.forward_hidden(seg, &tokens[start..start + len], cache, all || last, !img)?;
             if all {
                 out.extend(logits);
             } else if last {
