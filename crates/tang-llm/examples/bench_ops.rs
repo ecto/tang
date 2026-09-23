@@ -78,6 +78,19 @@ fn main() {
             },
         );
     }
+    let q4b = dev.upload(&vec![0.1f32; 4096]);
+    for &len in &[512usize, 2048, 8192] {
+        let kc = dev.upload(&vec![0.1f32; len * 1024]);
+        time(
+            &dev,
+            &format!("kv_attention 4B len {len}"),
+            len * 1024 * 8,
+            reps,
+            || {
+                dev.kv_attention(&q4b, &kc, &kc, len - 1, 1, 32, 8, 128);
+            },
+        );
+    }
     let t = dev.upload(&vec![0.0f32; 4096 * 64]);
     time(&dev, "rope q", 0, reps, || {
         dev.rope_half_cached(&q, &t, &t, 1, 16, 128, 5);

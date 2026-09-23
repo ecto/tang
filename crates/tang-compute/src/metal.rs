@@ -266,6 +266,65 @@ impl MetalDevice {
         self.dispatch(&pipeline, &[src, dst, &params], n as u64);
     }
 
+    /// Tiled causal attention for prefill (`llm_msl::FLASH_PREFILL_MSL`). Query rows are
+    /// padded to a multiple of 32 and the padding is dropped from the output.
+    #[allow(clippy::too_many_arguments)]
+    fn flash_prefill(
+        &self,
+        q: &MetalBuffer,
+        k: &MetalBuffer,
+        v: &MetalBuffer,
+        cache_start: usize,
+        q_len: usize,
+        n_heads: usize,
+        n_kv: usize,
+        d: usize,
+    ) -> MetalBuffer {
+        let q_pad = q_len.next_multiple_of(32);
+        let width = n_heads * d;
+        let padded;
+        let qb = if q_pad == q_len {
+            q
+        } else {
+            let mut p = self.alloc(q_pad * width);
+            self.write_into(&mut p, 0, q);
+            padded = p;
+            &padded
+        };
+        let out = self.make_buffer_empty(q_pad * width * 4);
+        let params = self.make_buffer_u32(&[
+            cache_start as u32,
+            q_len as u32,
+            n_heads as u32,
+            n_kv as u32,
+            d as u32,
+        ]);
+        let pipeline = self.get_pipeline(llm_msl::FLASH_PREFILL_MSL, "attn_prefill");
+        self.with_encoder(|enc| {
+            enc.set_compute_pipeline_state(&pipeline);
+            for (i, b) in [&qb.buffer, &k.buffer, &v.buffer, &out, &params]
+                .iter()
+                .enumerate()
+            {
+                enc.set_buffer(i as u64, Some(b), 0);
+            }
+            enc.dispatch_thread_groups(
+                MTLSize::new((q_pad / 32) as u64, n_heads as u64, 1),
+                MTLSize::new(128, 1, 1),
+            );
+        });
+        let full = MetalBuffer {
+            buffer: out,
+            len: q_pad * width,
+            kind: Kind::F32,
+        };
+        if q_pad == q_len {
+            full
+        } else {
+            self.slice_buffer(&full, 0, q_len * width)
+        }
+    }
+
     /// Split-KV attention (`llm_msl::FLASH_DECODE_MSL`). Decode splits the keys across up to 32
     /// threadgroups per head; prefill already has a threadgroup per (query, head).
     #[allow(clippy::too_many_arguments)]
@@ -281,10 +340,12 @@ impl MetalDevice {
         d: usize,
     ) -> MetalBuffer {
         let longest = cache_start + q_len;
-        let n_splits = if q_len == 1 {
-            longest.div_ceil(256).clamp(1, 32)
-        } else {
-            1
+        // Short contexts: per-key simdgroup loop (lower fixed cost). Longer: lane-per-key.
+        let lane_keys = q_len == 1 && longest >= 512;
+        let n_splits = match q_len {
+            1 if lane_keys => longest.div_ceil(256).clamp(1, 64),
+            1 => longest.div_ceil(256).clamp(1, 32),
+            _ => 1,
         };
         let split_len = longest.div_ceil(n_splits);
         let params = self.make_buffer_u32(&[
@@ -298,7 +359,15 @@ impl MetalDevice {
         ]);
         let partial = self.make_buffer_empty(q_len * n_heads * n_splits * (d + 2) * 4);
         let out = self.make_buffer_empty(q_len * n_heads * d * 4);
-        let p1 = self.get_pipeline(llm_msl::FLASH_DECODE_MSL, "attn_partial");
+        let p1 = self.get_pipeline(
+            llm_msl::FLASH_DECODE_MSL,
+            if lane_keys {
+                "attn_decode"
+            } else {
+                "attn_partial"
+            },
+        );
+        let grid1 = MTLSize::new(n_heads as u64, n_splits as u64, q_len as u64);
         let p2 = self.get_pipeline(llm_msl::FLASH_DECODE_MSL, "attn_combine");
         self.with_encoder(|enc| {
             enc.set_compute_pipeline_state(&p1);
@@ -308,10 +377,7 @@ impl MetalDevice {
             {
                 enc.set_buffer(i as u64, Some(b), 0);
             }
-            enc.dispatch_thread_groups(
-                MTLSize::new(n_heads as u64, n_splits as u64, q_len as u64),
-                MTLSize::new(256, 1, 1),
-            );
+            enc.dispatch_thread_groups(grid1, MTLSize::new(256, 1, 1));
             enc.set_compute_pipeline_state(&p2);
             for (i, b) in [&partial, &out, &params].iter().enumerate() {
                 enc.set_buffer(i as u64, Some(b), 0);
@@ -878,6 +944,26 @@ kernel void embedding(
         n_kv_heads: usize,
         head_dim: usize,
     ) -> MetalBuffer {
+        // Tiled prefill needs K/V readable to a 32-row boundary past the end.
+        let kv_rows_needed = (cache_start + q_len).next_multiple_of(32);
+        if q_len > 1
+            && head_dim % 8 == 0
+            && head_dim <= 128
+            && n_heads % n_kv_heads == 0
+            && k_cache.len >= kv_rows_needed * n_kv_heads * head_dim
+            && v_cache.len >= kv_rows_needed * n_kv_heads * head_dim
+        {
+            return self.flash_prefill(
+                q,
+                k_cache,
+                v_cache,
+                cache_start,
+                q_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+            );
+        }
         if head_dim % 32 == 0 && head_dim <= 256 && n_heads % n_kv_heads == 0 {
             return self.flash_attention(
                 q,
@@ -2483,8 +2569,8 @@ mod tests {
         let cpu = CpuDevice::new();
         let (nh, nkv, d) = (4, 2, 64);
         // Decode with several splits, and a prefill chunk after cached tokens.
-        for &(cache_start, q_len) in &[(700usize, 1usize), (5, 9)] {
-            let total = cache_start + q_len;
+        for &(cache_start, q_len) in &[(700usize, 1usize), (5, 9), (0, 70), (40, 33)] {
+            let total = (cache_start + q_len).next_multiple_of(32);
             let q: Vec<f32> = (0..q_len * nh * d)
                 .map(|i| ((i * 13 + 1) % 23) as f32 / 23.0 - 0.5)
                 .collect();

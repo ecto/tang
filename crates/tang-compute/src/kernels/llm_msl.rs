@@ -324,6 +324,89 @@ kernel void attn_partial(
     if (lane == 0) { pp[0] = M; pp[1] = L; }
 }
 
+// Decode (q_len == 1): lanes score different keys. Threadgroup (head, split), 8 simdgroups;
+// each takes 32-key blocks: lane t scores key j0+t against q (from threadgroup memory), the
+// block's max/sum is one simd reduction, and V is accumulated with lanes owning output dims
+// and p broadcast by shuffles. Same partial layout as attn_partial. D % 4 == 0, D <= 256.
+kernel void attn_decode(
+    device const float* Q [[buffer(0)]],
+    device const float* K [[buffer(1)]],
+    device const float* V [[buffer(2)]],
+    device float* P [[buffer(3)]],
+    device const uint* params [[buffer(4)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    uint cache_start = params[0];
+    uint n_heads = params[2], n_kv = params[3], D = params[4];
+    uint n_splits = params[5], split_len = params[6];
+    uint head = tg.x, split = tg.y;
+    uint kv_head = head / (n_heads / n_kv);
+    uint kv_dim = n_kv * D;
+    uint per = (D + 31) / 32;
+    uint attend = cache_start + 1;
+    uint j0 = split * split_len;
+    uint j1 = min(j0 + split_len, attend);
+
+    threadgroup float4 qs[64];
+    float scale = rsqrt(float(D));
+    for (uint i = tid; i < D / 4; i += 256) qs[i] = ((device const float4*)(Q + head * D))[i] * scale;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float m = -INFINITY, l = 0;
+    float acc[8];
+    for (uint v = 0; v < per; v++) acc[v] = 0;
+    for (uint b = j0 + sg * 32; b < j1; b += 256) {
+        uint j = b + lane;
+        bool valid = j < j1;
+        float s = -INFINITY;
+        if (valid) {
+            device const float4* kp = (device const float4*)(K + (ulong)j * kv_dim + kv_head * D);
+            float4 d4 = 0;
+            for (uint i = 0; i < D / 4; i++) d4 += qs[i] * kp[i];
+            s = d4.x + d4.y + d4.z + d4.w;
+        }
+        float bm = simd_max(s);
+        float mn = max(m, bm);
+        float c = (m == -INFINITY) ? 0.0f : exp(m - mn);
+        float p = valid ? exp(s - mn) : 0.0f;
+        l = l * c + simd_sum(p);
+        m = mn;
+        for (uint v = 0; v < per; v++) acc[v] *= c;
+        uint n = min(32u, j1 - b);
+        for (uint t = 0; t < n; t++) {
+            float pt = simd_shuffle(p, t);
+            device const float* vp = V + (ulong)(b + t) * kv_dim + kv_head * D;
+            for (uint v = 0; v < per; v++) {
+                uint d = v * 32 + lane;
+                if (d < D) acc[v] += pt * vp[d];
+            }
+        }
+    }
+
+    threadgroup float sm[8], sl[8];
+    threadgroup float sacc[8 * 256];
+    if (lane == 0) { sm[sg] = m; sl[sg] = l; }
+    for (uint v = 0; v < per; v++) { uint d = v * 32 + lane; if (d < D) sacc[sg * D + d] = acc[v]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg != 0) return;
+    float M = -INFINITY;
+    for (uint g = 0; g < 8; g++) M = max(M, sm[g]);
+    float L = 0;
+    float out[8];
+    for (uint v = 0; v < per; v++) out[v] = 0;
+    for (uint g = 0; g < 8; g++) {
+        float c = (sm[g] == -INFINITY) ? 0.0f : exp(sm[g] - M);
+        L += sl[g] * c;
+        for (uint v = 0; v < per; v++) { uint d = v * 32 + lane; if (d < D) out[v] += sacc[g * D + d] * c; }
+    }
+    device float* pp = P + ((ulong)head * n_splits + split) * (D + 2);
+    for (uint v = 0; v < per; v++) { uint d = v * 32 + lane; if (d < D) pp[2 + d] = out[v]; }
+    if (lane == 0) { pp[0] = M; pp[1] = L; }
+}
+
 kernel void attn_combine(
     device const float* P [[buffer(0)]],
     device float* O [[buffer(1)]],
@@ -449,9 +532,22 @@ kernel void matmul_bt_q4(
             uint idx = tid * 8 + e;
             uint r = idx / T, kk = idx % T;
             uint k = kb + kk;
-            uint row = row0 + r, col = col0 + r;
+            uint row = row0 + r;
             As[idx] = (row < M && k < K) ? A[(ulong)row * K + k] : 0.0f;
-            Bs[idx] = (col < N && k < K) ? q4_at(W, S, Bz, col, k, K, group) : 0.0f;
+        }
+        {
+            // One packed word (8 weights) per thread: column tid/4, weights (tid%4)*8 .. +8.
+            uint c = tid / 4, k = kb + (tid % 4) * 8;
+            uint col = col0 + c;
+            threadgroup float* dst = Bs + c * T + (tid % 4) * 8;
+            if (col < N && k < K) {
+                uint w = W[(ulong)col * (K / 8) + k / 8];
+                uint g = col * (K / group) + k / group;
+                float sc = bf(S[g]), bi = bf(Bz[g]);
+                for (uint e = 0; e < 8; e++) dst[e] = sc * float((w >> (4 * e)) & 0xf) + bi;
+            } else {
+                for (uint e = 0; e < 8; e++) dst[e] = 0.0f;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint ks = 0; ks < T; ks += 8) {
@@ -563,5 +659,131 @@ kernel void swiglu_split(
     uint r = gid / ff, i = gid % ff;
     float g = GU[(ulong)r * 2 * ff + i];
     Y[gid] = g / (1.0f + exp(-g)) * GU[(ulong)r * 2 * ff + ff + i];
+}
+"#;
+
+/// Tiled causal flash attention for prefill, on simdgroup matrices.
+///
+/// Threadgroup = (32-query block, head), 4 simdgroups × 8 query rows. Per 32-key block, each
+/// simdgroup computes S = Q·Kᵀ (8×32), runs the online softmax on it in threadgroup scratch,
+/// rescales its O accumulator (8×D, as D/8 8×8 tiles) by diag(α) and adds P·V. K/V tiles are
+/// read straight from the cache with `simdgroup_load`. Blocks past the diagonal are skipped.
+/// Requires: q rows padded to a multiple of 32; K/V caches readable to a multiple of 32 rows
+/// past the end; D a multiple of 8, at most 128.
+pub const FLASH_PREFILL_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+#define BQ 32
+#define BK 32
+#define MAXT 16   // D / 8
+
+kernel void attn_prefill(
+    device const float* Q [[buffer(0)]],     // [q_pad, nh*D]
+    device const float* K [[buffer(1)]],     // [.., nkv*D]
+    device const float* V [[buffer(2)]],
+    device float* O [[buffer(3)]],           // [q_pad, nh*D]
+    device const uint* params [[buffer(4)]], // [cache_start, q_len, nh, nkv, D]
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    uint cache_start = params[0], q_len = params[1], nh = params[2], nkv = params[3], D = params[4];
+    uint qb = tg.x, head = tg.y;
+    uint kvh = head / (nh / nkv);
+    uint qs = nh * D, ks = nkv * D;
+    uint r0 = qb * BQ + sg * 8;                  // first query row of this simdgroup
+    uint T = D / 8;
+    float scale = rsqrt(float(D));
+
+    threadgroup float scratch[4][8 * BK];
+    threadgroup float diag[4][64];
+    threadgroup float* S = scratch[sg];
+    threadgroup float* Dg = diag[sg];
+
+    simdgroup_float8x8 o[MAXT];
+    for (uint t = 0; t < T; t++) o[t] = simdgroup_float8x8(0);
+
+    // Row bookkeeping: lane handles row lane/4, columns (lane%4)*8 .. +8.
+    uint row = lane / 4, part = lane % 4;
+    float m = -INFINITY, l = 0;
+    uint abs_row = cache_start + r0 + row;       // absolute position of this query
+    uint last = min(cache_start + r0 + 7, cache_start + q_len - 1);  // last position any row here needs
+
+    device const float* qp = Q + (ulong)r0 * qs + head * D;
+    for (uint j0 = 0; j0 <= last; j0 += BK) {
+        // S = Q Kᵀ for 8 rows × 32 keys.
+        simdgroup_float8x8 s[4];
+        for (uint c = 0; c < 4; c++) s[c] = simdgroup_float8x8(0);
+        for (uint d = 0; d < D; d += 8) {
+            simdgroup_float8x8 a;
+            simdgroup_load(a, qp + d, qs);
+            for (uint c = 0; c < 4; c++) {
+                simdgroup_float8x8 b;
+                simdgroup_load(b, K + (ulong)(j0 + c * 8) * ks + kvh * D + d, ks, ulong2(0), true);
+                simdgroup_multiply_accumulate(s[c], a, b, s[c]);
+            }
+        }
+        for (uint c = 0; c < 4; c++) simdgroup_store(s[c], S + c * 8, BK);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Online softmax on this lane's 8 columns of its row.
+        float v[8];
+        float bm = -INFINITY;
+        for (uint i = 0; i < 8; i++) {
+            uint j = j0 + part * 8 + i;
+            v[i] = (j <= abs_row) ? S[row * BK + part * 8 + i] * scale : -INFINITY;
+            bm = max(bm, v[i]);
+        }
+        bm = max(bm, simd_shuffle_xor(bm, 1));
+        bm = max(bm, simd_shuffle_xor(bm, 2));
+        float mn = max(m, bm);
+        float alpha = (m == -INFINITY) ? 0.0f : exp(m - mn);
+        float ps = 0;
+        for (uint i = 0; i < 8; i++) {
+            float p = (v[i] == -INFINITY) ? 0.0f : exp(v[i] - mn);
+            S[row * BK + part * 8 + i] = p;
+            ps += p;
+        }
+        ps += simd_shuffle_xor(ps, 1);
+        ps += simd_shuffle_xor(ps, 2);
+        l = l * alpha + ps;
+        m = mn;
+        // diag(alpha)
+        for (uint i = lane; i < 64; i += 32) Dg[i] = 0;
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (part == 0) Dg[row * 8 + row] = alpha;
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 da;
+        simdgroup_load(da, Dg, 8);
+        simdgroup_float8x8 p[4];
+        for (uint c = 0; c < 4; c++) simdgroup_load(p[c], S + c * 8, BK);
+        for (uint t = 0; t < T; t++) {
+            simdgroup_float8x8 acc;
+            simdgroup_multiply(acc, da, o[t]);
+            for (uint c = 0; c < 4; c++) {
+                simdgroup_float8x8 vt;
+                simdgroup_load(vt, V + (ulong)(j0 + c * 8) * ks + kvh * D + t * 8, ks);
+                simdgroup_multiply_accumulate(acc, p[c], vt, acc);
+            }
+            o[t] = acc;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // O /= l
+    for (uint i = lane; i < 64; i += 32) Dg[i] = 0;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (part == 0) Dg[row * 8 + row] = (l > 0) ? 1.0f / l : 0.0f;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 dl;
+    simdgroup_load(dl, Dg, 8);
+    device float* op = O + (ulong)r0 * qs + head * D;
+    for (uint t = 0; t < T; t++) {
+        simdgroup_float8x8 r;
+        simdgroup_multiply(r, dl, o[t]);
+        simdgroup_store(r, op + t * 8, qs);
+    }
 }
 "#;

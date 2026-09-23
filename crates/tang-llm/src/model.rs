@@ -168,7 +168,8 @@ impl<D: ComputeDevice> Model<D> {
     }
 
     pub fn new_cache(&self) -> Cache<D::Buffer> {
-        let n = self.max_ctx * self.cfg.kv_dim();
+        // Rounded up so tiled attention can read whole 32-row blocks.
+        let n = self.max_ctx.next_multiple_of(32) * self.cfg.kv_dim();
         Cache {
             k: (0..self.layers.len()).map(|_| self.dev.alloc(n)).collect(),
             v: (0..self.layers.len()).map(|_| self.dev.alloc(n)).collect(),
