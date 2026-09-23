@@ -40,12 +40,21 @@ pub struct Model<D: ComputeDevice> {
 }
 
 /// Per-sequence attention state: K and V for every layer, `[max_ctx, kv_dim]`, on device.
+/// Truncating keeps a prefix (later positions are simply overwritten), which is how a new
+/// request reuses the part of the conversation it shares with the last one.
 pub struct Cache<B> {
     k: Vec<B>,
     v: Vec<B>,
     /// Tokens already in the cache.
     pub len: usize,
     pub tokens: Vec<u32>,
+}
+
+impl<B> Cache<B> {
+    pub fn truncate(&mut self, len: usize) {
+        self.len = self.len.min(len);
+        self.tokens.truncate(self.len);
+    }
 }
 
 impl<D: ComputeDevice> Model<D> {

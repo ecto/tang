@@ -1,12 +1,13 @@
 //! `tang-llm logits <model-dir> <token ids...>` — dump logits for every position as JSON (for
 //! checking against a reference implementation).
 //! `tang-llm generate <model-dir> <token ids...> [-n N]` — greedy decode, print ids and speed.
+//! `tang-llm serve <model-dir | hf-repo-id> [--port P] [--ctx N]` — OpenAI-compatible server.
 
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 use std::time::Instant;
 use tang_compute::MetalDevice;
-use tang_llm::{Dtype, Model};
+use tang_llm::{Dtype, Engine, Model};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -14,6 +15,9 @@ fn main() -> Result<()> {
         [c, d, ..] => (c.as_str(), PathBuf::from(d)),
         _ => bail!("usage: tang-llm <logits|generate> <model-dir> <ids...> [-n N] [--f32]"),
     };
+    if args.first().map(String::as_str) == Some("serve") {
+        return serve(&args[1..]);
+    }
     let mut n = 32;
     let mut dtype = Dtype::Bf16;
     let mut ids = Vec::new();
@@ -76,6 +80,37 @@ fn main() -> Result<()> {
         c => bail!("unknown command {c}"),
     }
     Ok(())
+}
+
+fn serve(args: &[String]) -> Result<()> {
+    let spec = args
+        .first()
+        .context("usage: tang-llm serve <model> [--port P] [--ctx N] [--f32]")?
+        .clone();
+    let (mut port, mut ctx, mut dtype) = (8911u16, 32_768usize, Dtype::Bf16);
+    let mut it = args[1..].iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--port" => port = it.next().context("--port P")?.parse()?,
+            "--ctx" => ctx = it.next().context("--ctx N")?.parse()?,
+            "--f32" => dtype = Dtype::F32,
+            other => bail!("unknown option {other}"),
+        }
+    }
+    let dir = tang_llm::resolve_model(&spec)?;
+    let name = spec.clone();
+    tang_llm::server::serve(&format!("127.0.0.1:{port}"), name, move || {
+        let t = Instant::now();
+        let dev = MetalDevice::new().context("no Metal device")?;
+        let e = Engine::load(dev, &dir, ctx, dtype)?;
+        eprintln!(
+            "tang-llm: loaded {} in {:.1}s ({} ctx)",
+            dir.display(),
+            t.elapsed().as_secs_f32(),
+            e.context_window()
+        );
+        Ok(e)
+    })
 }
 
 fn argmax(v: &[f32]) -> u32 {
