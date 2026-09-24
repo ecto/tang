@@ -112,6 +112,120 @@ extern "C" __global__ void gemv_q4(
     }
 }
 
+// A few rows (2..32: speculative-decoding verify, short incremental prefills), one output
+// column per thread: each thread streams its column's weights (64 K per step, prefetched a
+// step ahead with the step's activations: 128 K, 64 or 256 bytes per column), widens each weight once, and applies it to every row,
+// whose activations come from shared memory as broadcasts (Xs[k][row]). Rows are padded to
+// MR (8, 16 or 32). A K split (gridDim.y > 1) writes its own [M, N] slice of Y for
+// `sum_splits`. Needs K % 128 == 0 (and group % 64 == 0 for 4-bit).
+// Launch: grid (ceil(N / 256), splits), block 256.
+template <int MR, bool IS_Q4, int KC>
+__device__ __forceinline__ void gemm_cols_body(
+    const float* __restrict__ X, const unsigned int* __restrict__ Wq,
+    const unsigned short* __restrict__ S, const unsigned short* __restrict__ B,
+    const unsigned short* __restrict__ Wb, float* __restrict__ Y,
+    unsigned int M, unsigned int K, unsigned int N, unsigned int group, unsigned int k_split)
+{
+    __shared__ __align__(16) float Xs[KC * MR];
+    constexpr int NW = IS_Q4 ? KC / 32 : KC / 8;   // uint4 per column per step
+    unsigned int tid = threadIdx.x, n = blockIdx.x * 256 + tid;
+    unsigned int kb = blockIdx.y * k_split, ke = min(kb + k_split, K);
+    Y += (u64)blockIdx.y * M * N;
+    unsigned int nc = min(n, N - 1);
+    unsigned int G = K / group;
+
+    uint4 wr[NW];
+    float sc[NW / 2 + 1], bi[NW / 2 + 1];
+    auto fetch = [&](unsigned int k0) {
+        #pragma unroll
+        for (int u = 0; u < NW; u++)
+            wr[u] = IS_Q4 ? *(const uint4*)(Wq + (u64)nc * (K / 8) + k0 / 8 + u * 4)
+                          : *(const uint4*)(Wb + (u64)nc * K + k0 + u * 8);
+        if (IS_Q4) {
+            #pragma unroll
+            for (int u = 0; u < NW / 2; u++) {
+                u64 g = (u64)nc * G + (k0 + 64 * u) / group;
+                sc[u] = bf(S[g]); bi[u] = bf(B[g]);
+            }
+        }
+    };
+    float acc[MR];
+    #pragma unroll
+    for (int r = 0; r < MR; r++) acc[r] = 0.0f;
+
+    // X loader: element tid + 256 * i of the [MR, KC] chunk.
+    constexpr int NX = KC * MR / 256;
+    float xr[NX];
+    auto fetch_x = [&](unsigned int k0) {
+        #pragma unroll
+        for (int i = 0; i < NX; i++) {
+            unsigned int e = tid + 256 * i, r = e / KC, kk = e % KC;
+            xr[i] = (r < M) ? X[(u64)r * K + k0 + kk] : 0.0f;
+        }
+    };
+    if (kb < ke) { fetch(kb); fetch_x(kb); }
+    for (unsigned int k0 = kb; k0 < ke; k0 += KC) {
+        #pragma unroll
+        for (int i = 0; i < NX; i++) {
+            unsigned int e = tid + 256 * i, r = e / KC, kk = e % KC;
+            Xs[kk * MR + r] = xr[i];
+        }
+        uint4 w4[NW];
+        #pragma unroll
+        for (int u = 0; u < NW; u++) w4[u] = wr[u];
+        float s4[NW / 2 + 1], b4[NW / 2 + 1];
+        #pragma unroll
+        for (int u = 0; u < NW / 2 + 1; u++) { s4[u] = sc[u]; b4[u] = bi[u]; }
+        __syncthreads();
+        if (k0 + KC < ke) { fetch(k0 + KC); fetch_x(k0 + KC); }
+        #pragma unroll
+        for (int u = 0; u < NW; u++) {
+            unsigned int wv[4] = {w4[u].x, w4[u].y, w4[u].z, w4[u].w};
+            #pragma unroll
+            for (int e = 0; e < (IS_Q4 ? 32 : 8); e++) {
+                float w;
+                if (IS_Q4) w = fmaf((float)((wv[e / 8] >> (4 * (e % 8))) & 0xf), s4[u / 2], b4[u / 2]);
+                else w = bf((unsigned short)(wv[e / 2] >> (16 * (e % 2))));
+                const float4* xr = (const float4*)(Xs + (u * (IS_Q4 ? 32 : 8) + e) * MR);
+                #pragma unroll
+                for (int r4 = 0; r4 < MR / 4; r4++) {
+                    float4 x = xr[r4];
+                    acc[4 * r4] += w * x.x;
+                    acc[4 * r4 + 1] += w * x.y;
+                    acc[4 * r4 + 2] += w * x.z;
+                    acc[4 * r4 + 3] += w * x.w;
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (n < N) {
+        #pragma unroll
+        for (int r = 0; r < MR; r++)
+            if (r < M) Y[(u64)r * N + n] = acc[r];
+    }
+}
+
+#define GEMM_COLS(NAME, MR)                                                                   \
+extern "C" __global__ void __launch_bounds__(256) NAME##_q4(                                  \
+    const float* __restrict__ X, const unsigned int* __restrict__ Wq,                         \
+    const unsigned short* __restrict__ S, const unsigned short* __restrict__ B,               \
+    float* __restrict__ Y, unsigned int M, unsigned int K, unsigned int N, unsigned int group, \
+    unsigned int k_split)                                                                     \
+{                                                                                             \
+    gemm_cols_body<MR, true, 128>(X, Wq, S, B, nullptr, Y, M, K, N, group, k_split);               \
+}                                                                                             \
+extern "C" __global__ void __launch_bounds__(256) NAME##_bf16(                                \
+    const float* __restrict__ X, const unsigned short* __restrict__ W, float* __restrict__ Y, \
+    unsigned int M, unsigned int K, unsigned int N, unsigned int k_split)                     \
+{                                                                                             \
+    gemm_cols_body<MR, false, 128>(X, nullptr, nullptr, nullptr, W, Y, M, K, N, 64, k_split);      \
+}
+
+GEMM_COLS(gemm_cols8, 8)
+GEMM_COLS(gemm_cols16, 16)
+GEMM_COLS(gemm_cols32, 32)
+
 // Small-batch GEMM (9..32 rows: verify steps, short incremental prefills) straight off packed
 // weights: block (128 output columns, K split), 256 threads, 64-deep K chunks. The weight tile
 // is widened into shared memory once per chunk and shared by every row, X is staged transposed;

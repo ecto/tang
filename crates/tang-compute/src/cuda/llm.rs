@@ -179,6 +179,16 @@ impl CudaComputeDevice {
         let x = self.as_f32(x, &mut tmp);
         let mut out = self.pool_alloc_uninit_f32(m * n);
         let (mu, ku, nu) = (m as u32, k as u32, n as u32);
+        // Column-per-thread GEMM from 4 rows (4-bit) or 9 rows (bf16, whose GEMV stays
+        // memory-bound up to 8); the GEMV below is faster for fewer.
+        let cols_ok = match w.storage() {
+            CudaStorage::Q4(q) => m >= 4 && q.group % 64 == 0 && k % 128 == 0,
+            _ => m >= 9 && k % 128 == 0,
+        };
+        if m <= SMALL_GEMM_ROWS && cols_ok {
+            self.gemm_cols(x, w, &mut out, m, k, n);
+            return Some(self.finish(out));
+        }
         if m <= 8 && k % 8 == 0 {
             let cfg = blocks((n.div_ceil(8), 1, 1), 256);
             match w.storage() {
@@ -257,6 +267,101 @@ impl CudaComputeDevice {
             row0 += rows;
         }
         Some(self.finish(out))
+    }
+
+    /// `out = x · wᵀ` for 2..=32 rows with `gemm_cols{8,16,32}_*`: a thread per output
+    /// column, K split (partials summed by `sum_splits`) when the columns can't fill the GPU.
+    fn gemm_cols(
+        &self,
+        x: &CudaBuffer,
+        w: &CudaBuffer,
+        out: &mut CudaBuffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        let col_blocks = n.div_ceil(256);
+        let kc = 128;
+        let chunks = k / kc;
+        // Aim for three blocks per SM; each split keeps at least 2 chunks of K.
+        let want = (3 * sm_count()).div_ceil(col_blocks);
+        let per = chunks.div_ceil(want.clamp(1, chunks.div_ceil(2).max(1)));
+        let splits = chunks.div_ceil(per);
+        let k_split = (per * kc) as u32;
+        let (mu, ku, nu) = (m as u32, k as u32, n as u32);
+        let cfg = blocks((col_blocks, splits, 1), 256);
+        let mr = match m {
+            ..=8 => "gemm_cols8",
+            ..=16 => "gemm_cols16",
+            _ => "gemm_cols32",
+        };
+        let mut partial = (splits > 1).then(|| self.pool_alloc_uninit_f32(splits * m * n));
+        let dst = match partial.as_mut() {
+            Some(p) => p.f32_data_mut(),
+            None => out.f32_data_mut(),
+        };
+        match w.storage() {
+            CudaStorage::Q4(q) => {
+                let name = match mr {
+                    "gemm_cols8" => "gemm_cols8_q4",
+                    "gemm_cols16" => "gemm_cols16_q4",
+                    _ => "gemm_cols32_q4",
+                };
+                let f = self.llm_func(llm_cuda::GEMV_CUDA, name);
+                let group = q.group as u32;
+                unsafe {
+                    self.stream
+                        .launch_builder(&f)
+                        .arg(x.f32_data())
+                        .arg(&q.packed)
+                        .arg(&q.scales)
+                        .arg(&q.biases)
+                        .arg(dst)
+                        .arg(&mu)
+                        .arg(&ku)
+                        .arg(&nu)
+                        .arg(&group)
+                        .arg(&k_split)
+                        .launch(cfg)
+                        .unwrap();
+                }
+            }
+            _ => {
+                let name = match mr {
+                    "gemm_cols8" => "gemm_cols8_bf16",
+                    "gemm_cols16" => "gemm_cols16_bf16",
+                    _ => "gemm_cols32_bf16",
+                };
+                let f = self.llm_func(llm_cuda::GEMV_CUDA, name);
+                unsafe {
+                    self.stream
+                        .launch_builder(&f)
+                        .arg(x.f32_data())
+                        .arg(w.bf16_data())
+                        .arg(dst)
+                        .arg(&mu)
+                        .arg(&ku)
+                        .arg(&nu)
+                        .arg(&k_split)
+                        .launch(cfg)
+                        .unwrap();
+                }
+            }
+        }
+        if let Some(p) = partial {
+            let f = self.llm_func(llm_cuda::GEMV_CUDA, "sum_splits");
+            let (total, s) = ((m * n) as u32, splits as u32);
+            unsafe {
+                self.stream
+                    .launch_builder(&f)
+                    .arg(p.f32_data())
+                    .arg(out.f32_data_mut())
+                    .arg(&total)
+                    .arg(&s)
+                    .launch(per_elem(m * n))
+                    .unwrap();
+            }
+        }
     }
 
     /// `out = x · wᵀ` for `m <= 32` rows with `gemm_small_*`: 128 output columns per block,
@@ -556,7 +661,7 @@ impl CudaComputeDevice {
                 .arg(&nh_u)
                 .arg(&d_u)
                 .arg(&ns)
-                .launch(blocks((nh, 1, 1), 32))
+                .launch(blocks((nh, 1, 1), d.next_multiple_of(32).min(256) as u32))
                 .unwrap();
         }
         self.finish(out)
@@ -639,7 +744,10 @@ impl CudaComputeDevice {
                 .arg(&nh_u)
                 .arg(&d_u)
                 .arg(&ns)
-                .launch(blocks((nh, q_len, 1), 32))
+                .launch(blocks(
+                    (nh, q_len, 1),
+                    d.next_multiple_of(32).min(256) as u32,
+                ))
                 .unwrap();
         }
     }
@@ -862,6 +970,8 @@ mod tests {
         // Small batches (the split-K GEMM): row counts around the GEMV / GEMM boundaries,
         // column counts off the 128-column tile, one and several K splits.
         for &(m, k, n, group) in &[
+            (2, 512, 100, 64),
+            (5, 512, 300, 64),
             (9, 256, 200, 64),
             (16, 1024, 130, 32),
             (32, 4096, 384, 64),
