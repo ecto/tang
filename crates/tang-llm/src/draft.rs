@@ -546,6 +546,62 @@ impl Calibration {
     }
 }
 
+/// Verify costs: the configured curve until this server has timed enough forwards of a width
+/// (and of one token) to use its own measurements, which track the backend, the context
+/// length and whatever else shares the GPU.
+#[derive(Debug, Clone)]
+pub struct CostModel {
+    /// Mean seconds per forward, by width (tokens fed), as a moving average.
+    secs: Vec<f32>,
+    n: Vec<u32>,
+}
+
+/// Forwards of a width (and of width 1) before its measured cost is trusted.
+const COST_MIN_N: u32 = 8;
+const COST_EMA: f32 = 0.05;
+
+impl CostModel {
+    pub fn new(max_width: usize) -> Self {
+        Self {
+            secs: vec![0.0; max_width + 1],
+            n: vec![0; max_width + 1],
+        }
+    }
+
+    pub fn observe(&mut self, width: usize, secs: f64) {
+        let Some(n) = self.n.get_mut(width) else {
+            return;
+        };
+        *n += 1;
+        let a = COST_EMA.max(1.0 / *n as f32);
+        self.secs[width] += a * (secs as f32 - self.secs[width]);
+    }
+
+    /// Relative cost by width (index 0 unused), measured where there's enough data, the
+    /// configured curve elsewhere; made non-decreasing.
+    pub fn table(&self, cfg: &DraftConfig, max_width: usize) -> Vec<f32> {
+        let mut t = vec![1.0f32; max_width + 1];
+        let base = (self.n.get(1).copied().unwrap_or(0) >= COST_MIN_N).then(|| self.secs[1]);
+        for (w, c) in t.iter_mut().enumerate().skip(2) {
+            *c = match base {
+                Some(b) if b > 0.0 && self.n.get(w).copied().unwrap_or(0) >= COST_MIN_N => {
+                    self.secs[w] / b
+                }
+                _ => cfg.cost(w),
+            };
+        }
+        for w in 2..t.len() {
+            t[w] = t[w].max(t[w - 1]);
+        }
+        t
+    }
+
+    /// Mean measured seconds for a width, and how many forwards that's from.
+    pub fn measured(&self, width: usize) -> (f32, u32) {
+        (self.secs[width], self.n[width])
+    }
+}
+
 /// A proposed draft.
 #[derive(Debug, Clone, Default)]
 pub struct Draft {
@@ -562,6 +618,8 @@ pub struct Session<'a> {
     global: &'a Global,
     /// The hit rates, updated as drafts are verified (the caller keeps them afterwards).
     pub calib: Calibration,
+    /// Relative verify cost by forward width.
+    cost: Vec<f32>,
     local: Sam,
     gm: Matcher,
 }
@@ -571,6 +629,7 @@ impl<'a> Session<'a> {
         cfg: &'a DraftConfig,
         global: &'a Global,
         calib: Calibration,
+        cost: Vec<f32>,
         prompt: &[u32],
     ) -> Self {
         let mut local = Sam::with_capacity(prompt.len() + 1024);
@@ -583,6 +642,7 @@ impl<'a> Session<'a> {
             cfg,
             global,
             calib,
+            cost,
             local,
             gm,
         }
@@ -597,7 +657,7 @@ impl<'a> Session<'a> {
     /// The draft to verify next, at most `room` tokens: the best source's continuation, cut
     /// where expected tokens per verify cost peaks.
     pub fn propose(&self, room: usize) -> Draft {
-        let room = room.min(self.cfg.max_draft);
+        let room = room.min(self.cfg.max_draft).min(self.cost.len().saturating_sub(2));
         if room == 0 {
             return Draft::default();
         }
@@ -622,7 +682,7 @@ impl<'a> Session<'a> {
                     break;
                 }
                 sum += p;
-                let sc = (1.0 + sum) / self.cfg.cost(i + 2);
+                let sc = (1.0 + sum) / self.cost[i + 2];
                 if sc > score {
                     (len, score) = (i + 1, sc);
                 }
@@ -707,7 +767,7 @@ mod tests {
         let code: Vec<u32> = (100..140).collect();
         let mut prompt = code.clone();
         prompt.extend([1, 2, 3]);
-        let mut s = Session::new(&cfg, &g, cal.clone(), &prompt);
+        let mut s = Session::new(&cfg, &g, cal.clone(), CostModel::new(17).table(&cfg, 17), &prompt);
         for &t in &code[..12] {
             s.push(t);
         }
@@ -723,7 +783,7 @@ mod tests {
         let old: Vec<u32> = (500..540).collect();
         g.push(&old);
         let cal = Calibration::default();
-        let mut s = Session::new(&cfg, &g, cal.clone(), &[1, 2, 3]);
+        let mut s = Session::new(&cfg, &g, cal.clone(), CostModel::new(17).table(&cfg, 17), &[1, 2, 3]);
         for &t in &old[..10] {
             s.push(t);
         }
@@ -754,7 +814,7 @@ mod tests {
         let cfg = cfg();
         let g = Global::new(0, None);
         let cal = Calibration::default();
-        let s = Session::new(&cfg, &g, cal.clone(), &[1, 2, 3, 4]);
+        let s = Session::new(&cfg, &g, cal.clone(), CostModel::new(17).table(&cfg, 17), &[1, 2, 3, 4]);
         assert!(s.propose(16).tokens.is_empty());
         assert!((cfg.cost(3) - (1.17 + 1.74) / 2.0).abs() < 1e-5);
         assert!(cfg.cost(64) > cfg.cost(32));

@@ -311,7 +311,8 @@ mod tests {
     }
 }
 
-fn parse(body: &Value) -> Result<Request, String> {
+/// A chat completion body as an engine request.
+pub fn parse(body: &Value) -> Result<Request, String> {
     let messages = body
         .get("messages")
         .filter(|m| m.is_array())

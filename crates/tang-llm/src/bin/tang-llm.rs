@@ -16,6 +16,15 @@
 //! logits for all k rows: ms (median and min over interleaved rounds) and cost relative to the
 //! first k.
 //!
+//! `tang-llm bench-spec <model> <requests.jsonl> [--ctx N] [--passes off,on] [--greedy]` — run
+//! chat completion bodies (one JSON per line) with speculative decoding off, then on: decode
+//! tok/s, draft acceptance, and whether outputs matched. Drafting settings come from
+//! `TANG_DRAFT_*`; the global store starts empty (no file).
+//!
+//! `tang-llm sim-spec <dump.jsonl>...` — replay `bench-spec --dump` token logs through the
+//! drafter without a model: tokens per verify forward and the speedup the cost curve predicts
+//! (`TANG_DRAFT_*` settings; `TANG_DRAFT_COST` defaults to the CUDA curve).
+//!
 //! Every command takes `--device auto|metal|cuda|cpu` (auto: Metal, then CUDA, then the CPU,
 //! whichever is built in and present).
 
@@ -132,6 +141,12 @@ fn main() -> Result<()> {
     };
     if args.first().map(String::as_str) == Some("serve") {
         return serve(backend, &args[1..]);
+    }
+    if cmd == "sim-spec" {
+        return sim_spec(&args[1..]);
+    }
+    if cmd == "bench-spec" {
+        return bench_spec(backend, &args[1..]);
     }
     if matches!(cmd, "bench-prefill" | "bench-verify") {
         let cmd = cmd.to_string();
@@ -509,4 +524,214 @@ fn argmax(v: &[f32]) -> u32 {
         }
     }
     best as u32
+}
+
+fn bench_spec(backend: Backend, args: &[String]) -> Result<()> {
+    let spec = args.first().context("bench-spec <model> <requests.jsonl>")?;
+    let file = args.get(1).context("bench-spec <model> <requests.jsonl>")?;
+    let (mut ctx, mut passes, mut greedy) = (16_384usize, vec!["off".to_string(), "on".to_string()], false);
+    let mut dump: Option<String> = None;
+    let mut it = args[2..].iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--ctx" => ctx = it.next().context("--ctx N")?.parse()?,
+            "--passes" => {
+                passes = it
+                    .next()
+                    .context("--passes off,on")?
+                    .split(',')
+                    .map(str::to_string)
+                    .collect()
+            }
+            "--greedy" => greedy = true,
+            "--dump" => dump = Some(it.next().context("--dump FILE")?.clone()),
+            other => bail!("unknown option {other}"),
+        }
+    }
+    let mut reqs = Vec::new();
+    for line in std::fs::read_to_string(file)?.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let body: serde_json::Value = serde_json::from_str(line)?;
+        let mut r = tang_llm::server::parse(&body).map_err(|e| anyhow::anyhow!(e))?;
+        if greedy {
+            r.sampling.temperature = 0.0;
+        }
+        reqs.push(r);
+    }
+    let dir = tang_llm::resolve_model(spec)?;
+    eprintln!("bench-spec {} on {backend:?}: {} requests", dir.display(), reqs.len());
+    let mut draft = draft_config(backend, spec);
+    draft.store = None;
+    on_backend!(backend, bench_spec_on(&dir, ctx, reqs, passes, draft, dump))
+}
+
+fn bench_spec_on<D: ComputeDevice>(
+    make: fn() -> Result<D>,
+    dir: &std::path::Path,
+    ctx: usize,
+    reqs: Vec<tang_llm::Request>,
+    passes: Vec<String>,
+    draft: tang_llm::draft::DraftConfig,
+    dump: Option<String>,
+) -> Result<()> {
+    let mut dump = match dump {
+        Some(f) => Some(std::io::BufWriter::new(std::fs::File::create(f)?)),
+        None => None,
+    };
+    let mut fwd: Vec<Vec<(usize, f64)>> = vec![vec![(0, 0.0); 65]; passes.len()];
+    let mut e = Engine::load(make()?, dir, ctx, Dtype::Bf16)?;
+    // Warm up kernels.
+    e.set_speculation(None);
+    let warm = tang_llm::server::parse(&serde_json::json!({
+        "messages": [{"role": "user", "content": "hi"}], "max_tokens": 8
+    }))
+    .map_err(|e| anyhow::anyhow!(e))?;
+    e.complete(&warm, |_| true)?;
+    // Passes interleave per request (off, on, off, on, ...) so that load from elsewhere on a
+    // shared GPU hits both alike. Each pass keeps its own drafting state across requests.
+    e.set_speculation(Some(draft.clone()));
+    let mut states: Vec<Option<tang_llm::engine::Speculation>> = passes
+        .iter()
+        .map(|p| {
+            (p == "on").then(|| {
+                e.set_speculation(Some(draft.clone()));
+                e.take_speculation().unwrap()
+            })
+        })
+        .collect();
+    let mut texts: Vec<Vec<String>> = vec![Vec::new(); passes.len()];
+    let mut totals: Vec<(String, usize, f64, usize, usize)> =
+        passes.iter().map(|p| (p.clone(), 0, 0.0, 0, 0)).collect();
+    for (i, r) in reqs.iter().enumerate() {
+        for (j, pass) in passes.iter().enumerate() {
+            e.put_speculation(states[j].take());
+            let before = e.forwards.clone();
+            let mut text = String::new();
+            let (finish, u) = e.complete(r, |p| {
+                match p {
+                    tang_llm::chat::Piece::Reasoning(t) | tang_llm::chat::Piece::Text(t) => {
+                        text.push_str(&t)
+                    }
+                    tang_llm::chat::Piece::ToolCall { name, arguments } => {
+                        text.push_str(&format!("[{name} {arguments}]"))
+                    }
+                }
+                true
+            })?;
+            states[j] = e.take_speculation();
+            for (w, (a, b)) in e.forwards.iter().zip(&before).enumerate() {
+                fwd[j][w].0 += a.0 - b.0;
+                fwd[j][w].1 += a.1 - b.1;
+            }
+            if j == 0 {
+                if let Some(d) = dump.as_mut() {
+                    use std::io::Write;
+                    let (p, o) = e.last_tokens();
+                    writeln!(d, "{}", serde_json::json!({ "prompt": p, "out": o }))?;
+                }
+            }
+            let s = u.completion_tokens as f64 / u.decode_tok_s.max(1e-9);
+            eprintln!(
+                "{pass} #{i}: prompt {} (cached {}) → {} tok {finish:?}, {:.1} tok/s, drafts {}/{}",
+                u.prompt_tokens,
+                u.cached_tokens,
+                u.completion_tokens,
+                u.decode_tok_s,
+                u.accepted_tokens,
+                u.draft_tokens
+            );
+            let t = &mut totals[j];
+            t.1 += u.completion_tokens;
+            t.2 += s;
+            t.3 += u.draft_tokens;
+            t.4 += u.accepted_tokens;
+            texts[j].push(text);
+        }
+    }
+    println!("| pass | tokens | decode s | tok/s | vs first | drafted | accepted | accept % | tok/forward |");
+    println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|");
+    let base = totals[0].1 as f64 / totals[0].2;
+    for (pass, toks, secs, drafted, accepted) in &totals {
+        let rate = *toks as f64 / secs;
+        println!(
+            "| {pass} | {toks} | {secs:.1} | {rate:.1} | {:.2}x | {drafted} | {accepted} | {:.0}% | {:.2} |",
+            rate / base,
+            100.0 * *accepted as f64 / (*drafted).max(1) as f64,
+            *toks as f64 / (toks - accepted).max(1) as f64,
+        );
+    }
+    println!("\n| pass | forward width | forwards | mean ms | vs width 1 |");
+    println!("|---|---:|---:|---:|---:|");
+    for (pass, f) in passes.iter().zip(&fwd) {
+        let one = f[1].1 / f[1].0.max(1) as f64;
+        for (w, &(n, secs)) in f.iter().enumerate() {
+            if n > 0 {
+                let ms = secs / n as f64;
+                println!("| {pass} | {w} | {n} | {:.2} | {:.2} |", ms * 1e3, ms / one);
+            }
+        }
+    }
+    if texts.len() >= 2 {
+        let same = texts[0].iter().zip(&texts[1]).filter(|(a, b)| a == b).count();
+        println!("\noutputs identical: {same}/{}", texts[0].len());
+        for (i, (a, b)) in texts[0].iter().zip(&texts[1]).enumerate() {
+            if a != b {
+                let at = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
+                println!("  #{i} differs at byte {at} of {}/{}", a.len(), b.len());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sim_spec(files: &[String]) -> Result<()> {
+    use tang_llm::draft::{Calibration, CostModel, DraftConfig, Global, Session, COST_CUDA};
+    let cfg = DraftConfig::new(COST_CUDA).from_env();
+    let mut global = Global::new(cfg.global_tokens, None);
+    let mut calib = Calibration::default();
+    let cost = CostModel::new(cfg.max_draft + 1).table(&cfg, cfg.max_draft + 1);
+    let (mut toks, mut fwds, mut units, mut drafted, mut accepted) = (0usize, 0usize, 0f64, 0usize, 0usize);
+    for f in files {
+        for line in std::fs::read_to_string(f)?.lines() {
+            let v: serde_json::Value = serde_json::from_str(line)?;
+            let ids = |k: &str| -> Vec<u32> {
+                v[k].as_array().into_iter().flatten().filter_map(|x| x.as_u64().map(|x| x as u32)).collect()
+            };
+            let (prompt, out) = (ids("prompt"), ids("out"));
+            let mut s = Session::new(&cfg, &global, calib.clone(), cost.clone(), &prompt);
+            let mut j = 0;
+            while j < out.len() {
+                let d = s.propose(out.len() - j);
+                let mut a = 0;
+                while a < d.tokens.len() && d.tokens[a] == out[j + a] {
+                    s.calib.observe(d.match_len, d.shares[a], true);
+                    a += 1;
+                }
+                if a < d.tokens.len() {
+                    s.calib.observe(d.match_len, d.shares[a], false);
+                }
+                let take = (a + 1).min(out.len() - j);
+                for &t in &out[j..j + take] {
+                    s.push(t);
+                }
+                fwds += 1;
+                units += cost[1 + d.tokens.len()] as f64;
+                drafted += d.tokens.len();
+                accepted += a.min(take);
+                j += take;
+            }
+            toks += out.len();
+            calib = s.calib;
+            global.push(&out);
+        }
+    }
+    println!(
+        "tokens {toks} forwards {fwds} tok/forward {:.2} accept {:.0}% ({accepted}/{drafted}) predicted speedup {:.2}x",
+        toks as f64 / fwds.max(1) as f64,
+        100.0 * accepted as f64 / drafted.max(1) as f64,
+        toks as f64 / units.max(1e-9)
+    );
+    Ok(())
 }
