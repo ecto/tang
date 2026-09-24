@@ -1,26 +1,124 @@
 //! `tang-llm logits <model-dir> <token ids...>` — dump logits for every position as JSON (for
 //! checking against a reference implementation).
 //! `tang-llm generate <model-dir> <token ids...> [-n N]` — greedy decode, print ids and speed.
-//! `tang-llm serve <model-dir | hf-repo-id> [--port P] [--ctx N]` — OpenAI-compatible server.
+//! `tang-llm serve <model-dir | hf-repo-id> [--host H] [--port P] [--ctx N]` — OpenAI-compatible
+//! server (on 127.0.0.1 unless `--host` says otherwise).
 //! `tang-llm image-features <model-dir> <pixels.f32>` — the projector's output for an image
 //! (`[896, 896, 3]` f32, normalized), as JSON.
 //! `tang-llm logits-image <model-dir> <pixels.f32> <token ids...> [--last N]` — logits with the
 //! image standing in for its placeholder tokens.
+//!
+//! Every command takes `--device auto|metal|cuda|cpu` (auto: Metal, then CUDA, then the CPU,
+//! whichever is built in and present).
 
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 use std::time::Instant;
-use tang_compute::{ComputeDevice, MetalDevice};
+use tang_compute::{ComputeDevice, CpuDevice};
 use tang_llm::{Dtype, Engine, Model};
 
+/// Where the model runs.
+#[derive(Clone, Copy, Debug)]
+enum Backend {
+    #[cfg(feature = "metal")]
+    Metal,
+    #[cfg(feature = "cuda")]
+    Cuda,
+    Cpu,
+}
+
+impl Backend {
+    fn parse(s: &str) -> Result<Self> {
+        Ok(match s {
+            "auto" => Self::detect(),
+            #[cfg(feature = "metal")]
+            "metal" => Self::Metal,
+            #[cfg(feature = "cuda")]
+            "cuda" => Self::Cuda,
+            "cpu" => Self::Cpu,
+            other if ["metal", "cuda"].contains(&other) => {
+                bail!("this build has no {other} support (rebuild with --features {other})")
+            }
+            other => bail!("unknown device {other} (auto, metal, cuda or cpu)"),
+        })
+    }
+
+    /// The first backend that's built in and has a device.
+    fn detect() -> Self {
+        #[cfg(feature = "metal")]
+        if tang_compute::MetalDevice::new().is_some() {
+            return Self::Metal;
+        }
+        #[cfg(feature = "cuda")]
+        if new_cuda().is_ok() {
+            return Self::Cuda;
+        }
+        eprintln!("tang-llm: no GPU found, running on the CPU (slow)");
+        Self::Cpu
+    }
+}
+
+#[cfg(feature = "metal")]
+fn new_metal() -> Result<tang_compute::MetalDevice> {
+    tang_compute::MetalDevice::new().context("no Metal device")
+}
+
+/// A CUDA device, or an error when there's no driver (cudarc panics when it can't load
+/// libcuda) or no GPU.
+#[cfg(feature = "cuda")]
+fn new_cuda() -> Result<tang_compute::CudaComputeDevice> {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let dev = std::panic::catch_unwind(tang_compute::CudaComputeDevice::new);
+    std::panic::set_hook(hook);
+    match dev {
+        Ok(Ok(dev)) => Ok(dev),
+        Ok(Err(e)) => bail!("no CUDA device: {e}"),
+        Err(_) => bail!("no CUDA device (couldn't load the driver or cuBLAS)"),
+    }
+}
+
+fn new_cpu() -> Result<CpuDevice> {
+    Ok(CpuDevice::new())
+}
+
+/// Call `$f(make_device, args...)` with the constructor for `$backend`'s device type.
+macro_rules! on_backend {
+    ($backend:expr, $f:ident($($arg:expr),*)) => {
+        match $backend {
+            #[cfg(feature = "metal")]
+            Backend::Metal => $f(new_metal, $($arg),*),
+            #[cfg(feature = "cuda")]
+            Backend::Cuda => $f(new_cuda, $($arg),*),
+            Backend::Cpu => $f(new_cpu, $($arg),*),
+        }
+    };
+}
+
+/// Pull `--device X` out of the arguments.
+fn take_device(args: &mut Vec<String>) -> Result<Backend> {
+    match args.iter().position(|a| a == "--device") {
+        Some(i) => {
+            let spec = args
+                .get(i + 1)
+                .context("--device auto|metal|cuda|cpu")?
+                .clone();
+            args.drain(i..i + 2);
+            Backend::parse(&spec)
+        }
+        None => Ok(Backend::detect()),
+    }
+}
+
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let backend = take_device(&mut args)?;
     let (cmd, dir) = match args.as_slice() {
         [c, d, ..] => (c.as_str(), PathBuf::from(d)),
         _ => bail!("usage: tang-llm <logits|generate> <model-dir> <ids...> [-n N] [--f32]"),
     };
     if args.first().map(String::as_str) == Some("serve") {
-        return serve(&args[1..]);
+        return serve(backend, &args[1..]);
     }
     // Multimodal checks take a raw f32 pixel file before the token ids.
     let mut pixels: Option<Vec<f32>> = None;
@@ -53,9 +151,22 @@ fn main() -> Result<()> {
             ids.push(a.parse::<u32>()?);
         }
     }
-    let dev = MetalDevice::new().context("no Metal device")?;
+    on_backend!(backend, run(cmd, &dir, pixels, n, last, dtype, ids))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run<D: ComputeDevice>(
+    make: fn() -> Result<D>,
+    cmd: &str,
+    dir: &std::path::Path,
+    pixels: Option<Vec<f32>>,
+    n: usize,
+    last: Option<usize>,
+    dtype: Dtype,
+    ids: Vec<u32>,
+) -> Result<()> {
     let t = Instant::now();
-    let model = Model::load(dev, &dir, 4096, dtype)?;
+    let model = Model::load(make()?, dir, 4096, dtype)?;
     eprintln!("loaded in {:.2}s", t.elapsed().as_secs_f32());
     let mut cache = model.new_cache();
     match cmd {
@@ -126,15 +237,17 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn serve(args: &[String]) -> Result<()> {
+fn serve(backend: Backend, args: &[String]) -> Result<()> {
     let spec = args
         .first()
-        .context("usage: tang-llm serve <model> [--port P] [--ctx N] [--f32 | --q4]")?
+        .context("usage: tang-llm serve <model> [--host H] [--port P] [--ctx N] [--f32 | --q4]")?
         .clone();
     let (mut port, mut ctx, mut dtype) = (8911u16, 32_768usize, Dtype::Bf16);
+    let mut host = "127.0.0.1".to_string();
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
         match a.as_str() {
+            "--host" => host = it.next().context("--host H")?.clone(),
             "--port" => port = it.next().context("--port P")?.parse()?,
             "--ctx" => ctx = it.next().context("--ctx N")?.parse()?,
             "--f32" => dtype = Dtype::F32,
@@ -143,11 +256,21 @@ fn serve(args: &[String]) -> Result<()> {
         }
     }
     let dir = tang_llm::resolve_model(&spec)?;
-    let name = spec.clone();
-    tang_llm::server::serve(&format!("127.0.0.1:{port}"), name, move || {
+    let addr = format!("{host}:{port}");
+    on_backend!(backend, serve_on(&addr, spec, dir, ctx, dtype))
+}
+
+fn serve_on<D: ComputeDevice + 'static>(
+    make: fn() -> Result<D>,
+    addr: &str,
+    name: String,
+    dir: PathBuf,
+    ctx: usize,
+    dtype: Dtype,
+) -> Result<()> {
+    tang_llm::server::serve(addr, name, move || {
         let t = Instant::now();
-        let dev = MetalDevice::new().context("no Metal device")?;
-        let e = Engine::load(dev, &dir, ctx, dtype)?;
+        let e = Engine::load(make()?, &dir, ctx, dtype)?;
         eprintln!(
             "tang-llm: loaded {} in {:.1}s ({} ctx)",
             dir.display(),

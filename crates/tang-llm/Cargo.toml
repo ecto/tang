@@ -13,6 +13,8 @@ publish = false
 [features]
 default = ["metal"]
 metal = ["tang-compute/metal"]
+# NVIDIA GPUs. On Linux, build with `--no-default-features --features cuda` (Metal is macOS-only).
+cuda = ["tang-compute/cuda"]
 
 [dependencies]
 tang-compute = { workspace = true }
@@ -29,3 +31,11 @@ tokio = { workspace = true }
 tokio-stream = "0.1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 base64 = "0.22"
+
+[[example]]
+name = "bench_ops"
+required-features = ["metal"]
+
+[[example]]
+name = "bench_prefill"
+required-features = ["metal"]
