@@ -9,7 +9,9 @@
 //! is exact only where a k-token forward's rows are bit-identical to one-token forwards: on
 //! Metal with bf16 weights that holds for k <= 4, so `bitwise_*` caps drafts at 3 there and
 //! demands identical bytes. With longer drafts (and on other kernels), rows differ by ~1e-5 in
-//! the logits, which can flip a near-tie; `default_drafts_*` reports how far outputs agree.
+//! the logits, which can flip a near-tie; `default_drafts_match` checks the full-length
+//! drafts anyway (they matched on Metal and CUDA when written).
+#![cfg(any(feature = "metal", feature = "cuda"))]
 
 use serde_json::json;
 use tang_compute::ComputeDevice;
