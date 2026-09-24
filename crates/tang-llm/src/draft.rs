@@ -28,13 +28,17 @@ const SEP: u32 = u32::MAX;
 /// like a long stretch of one repeated token; counts near the root just saturate).
 const COUNT_WALK: usize = 1024;
 
-/// Multiplicative hasher for the (state, token) transition table.
+/// A fast hasher for the (state, token) transition table (splitmix64's finalizer, so both
+/// halves of the key reach the low bits the table indexes by).
 #[derive(Default, Clone, Copy)]
 struct Fx(u64);
 
 impl Hasher for Fx {
     fn finish(&self) -> u64 {
-        self.0
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
     }
     fn write(&mut self, bytes: &[u8]) {
         for &b in bytes {
@@ -42,7 +46,7 @@ impl Hasher for Fx {
         }
     }
     fn write_u64(&mut self, n: u64) {
-        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+        self.0 = self.0.rotate_left(5) ^ n;
     }
 }
 
@@ -409,7 +413,10 @@ pub struct DraftConfig {
     pub min_prob: f32,
     /// Longest suffix match considered.
     pub max_depth: usize,
-    /// Tokens kept in the global store of earlier completions (0: none).
+    /// Shortest suffix match drafted from.
+    pub min_match: usize,
+    /// Tokens kept in the global store of earlier completions (0: none); about 110 bytes of
+    /// automaton each.
     pub global_tokens: usize,
     /// Where the global store lives across restarts.
     pub store: Option<PathBuf>,
@@ -440,10 +447,11 @@ impl DraftConfig {
     pub fn new(cost: &[(usize, f32)]) -> Self {
         Self {
             max_draft: 16,
-            alpha: 1.0,
+            alpha: 2.0,
             min_prob: 0.1,
             max_depth: 64,
-            global_tokens: 1 << 20,
+            min_match: 1,
+            global_tokens: 1 << 19,
             store: None,
             cost: cost.to_vec(),
         }
@@ -460,6 +468,9 @@ impl DraftConfig {
         }
         if let Some(v) = get("MIN_PROB").and_then(|v| v.parse().ok()) {
             self.min_prob = v;
+        }
+        if let Some(v) = get("MIN_MATCH").and_then(|v| v.parse().ok()) {
+            self.min_match = v;
         }
         if let Some(v) = get("GLOBAL").and_then(|v| v.parse().ok()) {
             self.global_tokens = v;
@@ -667,7 +678,7 @@ impl<'a> Session<'a> {
             (&self.local, ls, ln),
             (&self.global.sam, self.gm.s, self.gm.n),
         ] {
-            if n == 0 {
+            if n == 0 || n < self.cfg.min_match {
                 continue;
             }
             let limit = room.min(((self.cfg.alpha * n as f32) as usize).max(1));
@@ -818,5 +829,44 @@ mod tests {
         assert!(s.propose(16).tokens.is_empty());
         assert!((cfg.cost(3) - (1.17 + 1.74) / 2.0).abs() < 1e-5);
         assert!(cfg.cost(64) > cfg.cost(32));
+    }
+}
+
+#[cfg(test)]
+mod scale {
+    /// `cargo test --release -p tang-llm --lib scale -- --ignored --nocapture`: build time and
+    /// memory for a full global store.
+    #[test]
+    #[ignore]
+    fn million_token_store() {
+        let mut x = 0x2545_f491u64;
+        // Text-like: a Zipfian-ish token stream with repeated phrases.
+        let mut toks = Vec::with_capacity(1 << 20);
+        while toks.len() < 1 << 20 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let r = (x % 1000) as usize;
+            if r < 300 && toks.len() > 64 {
+                let start = (x as usize / 1000) % (toks.len() - 32);
+                let len = 4 + r % 28;
+                let copy: Vec<u32> = toks[start..start + len].to_vec();
+                toks.extend(copy);
+            } else {
+                toks.push((1.0 / ((x >> 20) as f64 / (1u64 << 44) as f64 + 1e-5)) as u32 % 150_000);
+            }
+        }
+        let t = std::time::Instant::now();
+        let mut s = super::Sam::with_capacity(toks.len());
+        s.extend(&toks);
+        let bytes = s.len.capacity() * 16 + s.edges.capacity() * 12 + s.index.capacity() * 13;
+        eprintln!(
+            "{} tokens: {} states, {} edges, built in {:.2}s, ~{} MB",
+            toks.len(),
+            s.len.len(),
+            s.edges.len(),
+            t.elapsed().as_secs_f64(),
+            bytes >> 20
+        );
     }
 }
