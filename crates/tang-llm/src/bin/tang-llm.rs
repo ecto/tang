@@ -4,6 +4,11 @@
 //! `tang-llm serve <model-dir | hf-repo-id> [--host H] [--port P] [--ctx N] [--api-key-file F]`
 //! — OpenAI-compatible server (on 127.0.0.1 unless `--host` says otherwise). With a key (from
 //! the file, or `TANG_API_KEY`), requests need `Authorization: Bearer <key>`.
+//! Speculative decoding (suffix drafts from the prompt and earlier completions, verified in one
+//! forward; outputs unchanged) is on for GPUs: `--no-speculate` or `TANG_SPECULATE=0` turns it
+//! off, `--speculate` forces it on. Earlier completions are kept in
+//! `~/.cache/tang/drafts/<model>.tok` (`TANG_DRAFT_STORE=<file>`, or `0` for memory only);
+//! `TANG_DRAFT_MAX`, `_ALPHA`, `_MIN_PROB`, `_MIN_MATCH`, `_GLOBAL`, `_COST` tune drafting.
 //! `tang-llm image-features <model-dir> <pixels.f32>` — the projector's output for an image
 //! (`[896, 896, 3]` f32, normalized), as JSON.
 //! `tang-llm logits-image <model-dir> <pixels.f32> <token ids...> [--last N]` — logits with the
@@ -272,7 +277,7 @@ fn run<D: ComputeDevice>(
 fn serve(backend: Backend, args: &[String]) -> Result<()> {
     let spec = args
         .first()
-        .context("usage: tang-llm serve <model> [--host H] [--port P] [--ctx N] [--api-key-file F] [--f32 | --q4]")?
+        .context("usage: tang-llm serve <model> [--host H] [--port P] [--ctx N] [--api-key-file F] [--f32 | --q4] [--no-speculate]")?
         .clone();
     let (mut port, mut ctx, mut dtype) = (8911u16, 32_768usize, Dtype::Bf16);
     let mut host = "127.0.0.1".to_string();
