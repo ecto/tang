@@ -3,7 +3,7 @@
 
     spec_workloads.py edit  <out.jsonl> [--root DIR]      # rewrite code from a file in context
     spec_workloads.py chat  <out.jsonl>                   # plain chat, few copies to draft
-    spec_workloads.py kiln  <out.jsonl> SESSIONS_DIR... [--max N]  # kiln calls replayed from logs
+    spec_workloads.py kiln  <out.jsonl> SESSIONS_DIR... [--max N | --all-calls LAST_N_SESSIONS]
 
 `kiln` rebuilds each model call's conversation from kiln session logs (user text, assistant
 thinking/text/tool calls, tool results). The logs lack kiln's system prompt and tool schemas, so
@@ -71,7 +71,7 @@ SYSTEM = ("You are kiln, a coding agent working in the user's project directory.
           "to read, search and edit files and run commands, then answer briefly.")
 
 
-def kiln(dirs, per_session=4, max_tokens=400, budget=256):
+def kiln(dirs, per_session=4, max_tokens=400, budget=256, last_sessions=0):
     out, schemas = [], {}
     files = sorted(f for d in dirs for f in glob.glob(os.path.join(d, "*.jsonl")))
     sessions = []
@@ -117,11 +117,13 @@ def kiln(dirs, per_session=4, max_tokens=400, budget=256):
                         msgs.append({"role": "user", "content": b["text"]})
         if calls:
             sessions.append(calls)
+    if last_sessions:
+        sessions = sessions[-last_sessions:]
     tools = [{"type": "function", "function": {"name": n, "description": f"The {n} tool.",
               "parameters": {"type": "object", "properties": p}}} for n, p in sorted(schemas.items())]
     for calls in sessions:
         # Spread the picks over the session: early calls and later ones with more history.
-        step = max(1, len(calls) // per_session)
+        step = max(1, len(calls) // min(per_session, len(calls)))
         for msgs in calls[::step][:per_session]:
             out.append(body(msgs, max_tokens, True, budget, tools))
     return out
@@ -135,9 +137,11 @@ def main():
     elif kind == "chat":
         reqs = chat()
     elif kind == "kiln":
-        cap = int(rest[rest.index("--max") + 1]) if "--max" in rest else 0
-        dirs = [d for i, d in enumerate(rest) if d != "--max" and (i == 0 or rest[i - 1] != "--max")]
-        reqs = kiln(dirs, per_session=2)
+        opt = lambda k: int(rest[rest.index(k) + 1]) if k in rest else 0
+        cap, every = opt("--max"), opt("--all-calls")
+        dirs = [d for i, d in enumerate(rest) if not d.startswith("--") and (i == 0 or not rest[i - 1].startswith("--"))]
+        # --all-calls N: every call of the last N sessions (consecutive calls, as served).
+        reqs = kiln(dirs, per_session=10**9 if every else 2, last_sessions=every)
         if cap and len(reqs) > cap:
             # Evenly spaced, keeping chronological order.
             reqs = [reqs[i * len(reqs) // cap] for i in range(cap)]

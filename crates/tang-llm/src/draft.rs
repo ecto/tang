@@ -446,7 +446,8 @@ pub const COST_METAL: &[(usize, f32)] = &[
 impl DraftConfig {
     pub fn new(cost: &[(usize, f32)]) -> Self {
         Self {
-            max_draft: 16,
+            // Forwards of up to 16 tokens stay on the small-batch kernels; 17 costs far more.
+            max_draft: 15,
             alpha: 2.0,
             min_prob: 0.1,
             max_depth: 64,
