@@ -13,7 +13,8 @@
 //! cache, 512-token chunks like the server) of N synthetic tokens: ms and tok/s.
 //! `tang-llm bench-verify <model> [--ctx 4096,16384] [--k 1,2,4,8,16,32] [--reps R]` — one
 //! forward of k tokens on top of a ctx-token cache (a speculative-decoding verify step), with
-//! logits for all k rows: median ms and cost relative to k=1.
+//! logits for all k rows: ms (median and min over interleaved rounds) and cost relative to the
+//! first k.
 //!
 //! Every command takes `--device auto|metal|cuda|cpu` (auto: Metal, then CUDA, then the CPU,
 //! whichever is built in and present).
@@ -403,31 +404,41 @@ fn bench_on<D: ComputeDevice>(
         }
         return Ok(());
     }
-    println!("| ctx | k | ms/forward | vs k=1 | ms/token |");
-    println!("|---:|---:|---:|---:|---:|");
+    // Rounds interleave the k values so that load from elsewhere on the machine (a shared
+    // GPU) hits every k alike; the median and the minimum are both reported.
+    println!("| ctx | k | ms/forward (median) | ms (min) | vs k=1 (median) | vs k=1 (min) |");
+    println!("|---:|---:|---:|---:|---:|---:|");
     for &ctx in &o.ns {
         let ids = synthetic_ids(ctx + max_k, vocab);
         fill(&mut cache, &ids[..ctx])?;
-        let mut base = None;
-        for &k in &o.ks {
-            let draft = &ids[ctx..ctx + k];
-            let mut times = Vec::new();
-            for r in 0..o.reps.max(1) + 2 {
+        let mut times = vec![Vec::new(); o.ks.len()];
+        for r in 0..o.reps.max(1) + 2 {
+            for (i, &k) in o.ks.iter().enumerate() {
                 cache.truncate(ctx);
                 let t = Instant::now();
-                let logits = model.forward(draft, &mut cache, true)?;
-                let dt = t.elapsed().as_secs_f64();
+                let logits = model.forward(&ids[ctx..ctx + k], &mut cache, true)?;
+                let dt = t.elapsed().as_secs_f64() * 1e3;
                 anyhow::ensure!(logits.len() == k * vocab);
                 if r >= 2 {
-                    times.push(dt);
+                    times[i].push(dt);
                 }
             }
-            let ms = median(times) * 1e3;
-            let b = *base.get_or_insert(ms);
+        }
+        let stats: Vec<(f64, f64)> = times
+            .into_iter()
+            .map(|t| {
+                (
+                    median(t.clone()),
+                    t.into_iter().fold(f64::INFINITY, f64::min),
+                )
+            })
+            .collect();
+        let (b_med, b_min) = stats[0];
+        for (&k, &(med, min)) in o.ks.iter().zip(&stats) {
             println!(
-                "| {ctx} | {k} | {ms:.2} | {:.2} | {:.2} |",
-                ms / b,
-                ms / k as f64
+                "| {ctx} | {k} | {med:.2} | {min:.2} | {:.2} | {:.2} |",
+                med / b_med,
+                min / b_min
             );
         }
     }
