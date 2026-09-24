@@ -121,7 +121,8 @@ async fn require_key(
     if same(given.as_bytes(), key.as_bytes()) {
         return next.run(req).await;
     }
-    let body = json!({"error": {"message": "missing or wrong API key", "type": "invalid_request_error"}});
+    let body =
+        json!({"error": {"message": "missing or wrong API key", "type": "invalid_request_error"}});
     (StatusCode::UNAUTHORIZED, Json(body)).into_response()
 }
 
@@ -201,6 +202,81 @@ mod tests {
         assert_eq!(n[0]["content"], "");
         assert_eq!(n[1]["content"], "a\nb");
         assert_eq!(n[2]["content"], "");
+    }
+
+    use super::{collect_response, stream_response, Out};
+    use crate::chat::Piece;
+    use crate::engine::{Finish, Usage};
+    use axum::response::IntoResponse;
+    use serde_json::{json, Value};
+    use tokio::sync::mpsc;
+
+    fn two_calls() -> mpsc::UnboundedReceiver<Out> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        for name in ["a", "b"] {
+            let call = Piece::ToolCall {
+                name: name.into(),
+                arguments: json!({}),
+            };
+            tx.send(Out::Piece(call)).unwrap();
+        }
+        let usage = Usage {
+            prompt_tokens: 1,
+            cached_tokens: 0,
+            completion_tokens: 1,
+            prefill_tok_s: 0.0,
+            decode_tok_s: 0.0,
+        };
+        tx.send(Out::Done(Finish::ToolCalls, usage)).unwrap();
+        rx
+    }
+
+    async fn body(r: axum::response::Response) -> String {
+        let b = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(b.to_vec()).unwrap()
+    }
+
+    async fn ids_non_streaming() -> Vec<String> {
+        let r = collect_response("m".into(), "id".into(), 0, two_calls()).await;
+        let v: Value = serde_json::from_str(&body(r).await).unwrap();
+        v["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    async fn ids_streaming() -> Vec<String> {
+        let r = stream_response("m".into(), "id".into(), 0, false, two_calls()).into_response();
+        body(r)
+            .await
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+            .filter_map(|v| {
+                v["choices"][0]["delta"]["tool_calls"][0]["id"]
+                    .as_str()
+                    .map(String::from)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn tool_call_ids_are_unique_within_and_across_responses() {
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            ids.extend(ids_non_streaming().await);
+            ids.extend(ids_streaming().await);
+        }
+        assert_eq!(ids.len(), 8);
+        for id in &ids {
+            assert!(id.starts_with("call_") && id.len() == 29, "{id}");
+        }
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "{ids:?}");
     }
 }
 
@@ -332,7 +408,7 @@ fn stream_response(
                 Out::Piece(Piece::ToolCall { name, arguments }) => {
                     evs.push(chunk(
                         json!({ "role": role, "tool_calls": [{
-                            "index": calls, "id": format!("call_{calls}"), "type": "function",
+                            "index": calls, "id": tool_call_id(), "type": "function",
                             "function": { "name": name, "arguments": arguments.to_string() },
                         }]}),
                         None,
@@ -373,6 +449,31 @@ fn stream_response(
     Sse::new(UnboundedReceiverStream::new(sse_rx))
 }
 
+/// A tool-call id unique within the response, across requests and across restarts: clients
+/// (kiln among them) key tool results by id, so `call_0` on every call collides. A per-process
+/// random prefix plus a process-wide counter, as `call_<24 hex>`.
+fn tool_call_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    static PREFIX: OnceLock<u64> = OnceLock::new();
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let prefix = *PREFIX.get_or_init(|| {
+        // RandomState is seeded from the OS RNG; mix in time and pid for good measure.
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|t| t.as_nanos())
+                .unwrap_or(0),
+        );
+        h.write_u32(std::process::id());
+        h.finish()
+    });
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!("call_{prefix:016x}{n:08x}")
+}
+
 fn last_id(evs: &[Value]) -> Value {
     evs.last().map(|e| e["id"].clone()).unwrap_or(Value::Null)
 }
@@ -389,7 +490,7 @@ async fn collect_response(
             Out::Piece(Piece::Text(t)) => text.push_str(&t),
             Out::Piece(Piece::Reasoning(t)) => reasoning.push_str(&t),
             Out::Piece(Piece::ToolCall { name, arguments }) => calls.push(json!({
-                "id": format!("call_{}", calls.len()), "type": "function",
+                "id": tool_call_id(), "type": "function",
                 "function": { "name": name, "arguments": arguments.to_string() },
             })),
             Out::Error(e) => return error(StatusCode::BAD_REQUEST, e),

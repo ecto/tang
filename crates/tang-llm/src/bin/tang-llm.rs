@@ -255,7 +255,8 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
             "--ctx" => ctx = it.next().context("--ctx N")?.parse()?,
             "--api-key-file" => {
                 let path = it.next().context("--api-key-file F")?;
-                key = Some(std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?);
+                key =
+                    Some(std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?);
             }
             "--f32" => dtype = Dtype::F32,
             "--q4" => dtype = Dtype::Q4,
