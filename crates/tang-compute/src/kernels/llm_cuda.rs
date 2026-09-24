@@ -111,6 +111,146 @@ extern "C" __global__ void gemv_q4(
         }
     }
 }
+
+// Small-batch GEMM (9..32 rows: verify steps, short incremental prefills) straight off packed
+// weights: block (128 output columns, K split), 256 threads, 64-deep K chunks. The weight tile
+// is widened into shared memory once per chunk and shared by every row, X is staged transposed;
+// each thread owns 4 rows x 4 columns (rows (tid / 32) * 4 .., columns tid % 32 + 32 * i).
+// The next chunk's global loads are issued before the current chunk's math. With a K split
+// (gridDim.y > 1) each split writes its own `[M, N]` slice of Y for `sum_splits`.
+// Needs M <= 32 and K % 64 == 0 (and group % 8 == 0 for 4-bit).
+#define GS_BN 128
+#define GS_BK 64
+#define GS_XS 36
+template <bool IS_Q4>
+__device__ __forceinline__ void gemm_small_body(
+    const float* __restrict__ X, const unsigned int* __restrict__ Wq,
+    const unsigned short* __restrict__ S, const unsigned short* __restrict__ B,
+    const unsigned short* __restrict__ Wb, float* __restrict__ Y,
+    unsigned int M, unsigned int K, unsigned int N, unsigned int group, unsigned int k_split)
+{
+    __shared__ __align__(16) float Ws[GS_BK * GS_BN];
+    __shared__ __align__(16) float Xs[GS_BK * GS_XS];
+    unsigned int tid = threadIdx.x;
+    unsigned int n0 = blockIdx.x * GS_BN;
+    unsigned int kb = blockIdx.y * k_split, ke = min(kb + k_split, K);
+    Y += (u64)blockIdx.y * M * N;
+
+    // Loader roles: weight column wc (two threads per column, 32 k each), X column xk.
+    unsigned int wc = tid >> 1, part = tid & 1, wn = n0 + wc;
+    unsigned int xk = tid & 63, xr = (tid >> 6) * 8;
+    uint4 wreg[IS_Q4 ? 1 : 4];
+    float xreg[8];
+
+    auto fetch = [&](unsigned int k0) {
+        if (IS_Q4) {
+            wreg[0] = (wn < N) ? *(const uint4*)(Wq + (u64)wn * (K / 8) + k0 / 8 + part * 4)
+                               : make_uint4(0, 0, 0, 0);
+        } else {
+            #pragma unroll
+            for (int u = 0; u < (IS_Q4 ? 1 : 4); u++)
+                wreg[u] = (wn < N) ? *(const uint4*)(Wb + (u64)wn * K + k0 + part * 32 + u * 8)
+                                   : make_uint4(0, 0, 0, 0);
+        }
+        #pragma unroll
+        for (int i = 0; i < 8; i++)
+            xreg[i] = (xr + i < M) ? X[(u64)(xr + i) * K + k0 + xk] : 0.0f;
+    };
+    auto stage = [&](unsigned int k0) {
+        if (IS_Q4) {
+            unsigned int w4[4] = {wreg[0].x, wreg[0].y, wreg[0].z, wreg[0].w};
+            #pragma unroll
+            for (int u = 0; u < 4; u++) {
+                unsigned int kk = part * 32 + u * 8;
+                float sc = 0.0f, bi = 0.0f;
+                if (wn < N) {
+                    u64 g = (u64)wn * (K / group) + (k0 + kk) / group;
+                    sc = bf(S[g]); bi = bf(B[g]);
+                }
+                #pragma unroll
+                for (int e = 0; e < 8; e++)
+                    Ws[(kk + e) * GS_BN + wc] = sc * (float)((w4[u] >> (4 * e)) & 0xf) + bi;
+            }
+        } else {
+            #pragma unroll
+            for (int u = 0; u < (IS_Q4 ? 1 : 4); u++) {
+                unsigned int w4[4] = {wreg[u].x, wreg[u].y, wreg[u].z, wreg[u].w};
+                unsigned int kk = part * 32 + u * 8;
+                #pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    Ws[(kk + 2 * e) * GS_BN + wc] = bf(w4[e] & 0xffff);
+                    Ws[(kk + 2 * e + 1) * GS_BN + wc] = bf(w4[e] >> 16);
+                }
+            }
+        }
+        #pragma unroll
+        for (int i = 0; i < 8; i++) Xs[xk * GS_XS + xr + i] = xreg[i];
+    };
+
+    unsigned int tc = tid & 31, tr = (tid >> 5) * 4;
+    float acc[4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
+
+    if (kb < ke) fetch(kb);
+    for (unsigned int k0 = kb; k0 < ke; k0 += GS_BK) {
+        stage(k0);
+        __syncthreads();
+        if (k0 + GS_BK < ke) fetch(k0 + GS_BK);
+        #pragma unroll 8
+        for (int kk = 0; kk < GS_BK; kk++) {
+            float4 x = *(const float4*)(Xs + kk * GS_XS + tr);
+            const float* w = Ws + kk * GS_BN + tc;
+            float wv[4] = {w[0], w[32], w[64], w[96]};
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                acc[0][j] += x.x * wv[j];
+                acc[1][j] += x.y * wv[j];
+                acc[2][j] += x.z * wv[j];
+                acc[3][j] += x.w * wv[j];
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        if (tr + i >= M) break;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            unsigned int n = n0 + tc + 32 * j;
+            if (n < N) Y[(u64)(tr + i) * N + n] = acc[i][j];
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) gemm_small_q4(
+    const float* __restrict__ X, const unsigned int* __restrict__ Wq,
+    const unsigned short* __restrict__ S, const unsigned short* __restrict__ B,
+    float* __restrict__ Y, unsigned int M, unsigned int K, unsigned int N, unsigned int group,
+    unsigned int k_split)
+{
+    gemm_small_body<true>(X, Wq, S, B, nullptr, Y, M, K, N, group, k_split);
+}
+
+extern "C" __global__ void __launch_bounds__(256) gemm_small_bf16(
+    const float* __restrict__ X, const unsigned short* __restrict__ W, float* __restrict__ Y,
+    unsigned int M, unsigned int K, unsigned int N, unsigned int k_split)
+{
+    gemm_small_body<false>(X, nullptr, nullptr, nullptr, W, Y, M, K, N, 8, k_split);
+}
+
+// Y[i] = sum over splits of P[s * n + i].
+extern "C" __global__ void sum_splits(
+    const float* __restrict__ P, float* __restrict__ Y, unsigned int n, unsigned int splits)
+{
+    u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float s = 0.0f;
+    for (unsigned int k = 0; k < splits; k++) s += P[(u64)k * n + i];
+    Y[i] = s;
+}
 "#
 );
 
@@ -557,5 +697,200 @@ extern "C" __global__ void attn_prefill(
         if (d < D) op[d] = acc[i] * inv;
     }
 }
+
+#undef BK
+
+// Split-KV attention for a few queries (speculative-decoding verify, short incremental
+// prefills): block (kv head, split, row group). A block's rows are (query, head) pairs that
+// share one KV head (row f -> query f / gqa, head kvh * gqa + f % gqa), so each K/V row of the
+// split is read once for every query and every head of the GQA group. Keys come in tiles of
+// BK, row-major in shared memory (stride D + 4 keeps float4 accesses conflict-free), with the
+// next tile's K and V prefetched into registers while the current one is used: scores with
+// one key per lane, an online softmax per row in registers (warp w owns rows w*RW ..), then
+// P·V with lanes over head dims. Writes unnormalized partials in `attn_partial`'s layout for
+// `attn_combine`. Needs D % 4 == 0.
+template <int R, int BK, int DMAX>
+__device__ __forceinline__ void attn_multi_body(
+    const float* __restrict__ Q, const float* __restrict__ K, const float* __restrict__ V,
+    float* __restrict__ P, unsigned int cache_start, unsigned int q_len, unsigned int nh,
+    unsigned int nkv, unsigned int D, unsigned int n_splits, unsigned int split_len,
+    unsigned int window, unsigned int base, unsigned int bidir,
+    float* Qs, float* KVs, float* Ps)
+{
+    constexpr int RW = R / 8;              // rows per warp
+    constexpr int SEGS = 32 / BK;          // key segments per warp
+    constexpr int RPT = RW / SEGS;         // rows per lane in the score phase
+    constexpr int NV = DMAX / 32;          // head dims per lane in the PV phase
+    constexpr int PS = R + 4;              // Ps row stride
+    constexpr int NL = BK * DMAX / 4 / 256;  // float4 loads per thread per tile
+
+    unsigned int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    unsigned int kvh = blockIdx.x, split = blockIdx.y, f0 = blockIdx.z * R;
+    unsigned int gqa = nh / nkv, rows = q_len * gqa;
+    unsigned int LD = D + 4, D4 = D / 4;
+    u64 kvd = (u64)nkv * D;
+    unsigned int total = cache_start + q_len;
+    float scale = rsqrtf((float)D);
+
+    for (unsigned int i = tid; i < R * D4; i += 256) {
+        unsigned int r = i / D4, d = (i % D4) * 4, f = f0 + r;
+        float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (f < rows) {
+            unsigned int qi = f / gqa, head = kvh * gqa + f % gqa;
+            v = *(const float4*)(Q + ((u64)qi * nh + head) * D + d);
+            v.x *= scale; v.y *= scale; v.z *= scale; v.w *= scale;
+        }
+        *(float4*)(Qs + r * LD + d) = v;
+    }
+
+    // Keys any row of the block can see, clipped to this split.
+    unsigned int f_last = min(f0 + R, rows) - 1;
+    unsigned int first = cache_start + f0 / gqa + 1;
+    unsigned int lo_blk = (window > 0 && first > window) ? first - window : 0;
+    unsigned int hi_blk = bidir ? total : cache_start + f_last / gqa + 1;
+    unsigned int s0 = base + split * split_len;
+    unsigned int jb = max(s0, lo_blk), je = min(s0 + split_len, hi_blk);
+
+    unsigned int c = lane % BK, seg = lane / BK;
+    unsigned int r0 = warp * RW + seg * RPT;
+    unsigned int lo[RPT], hi[RPT];
+    float m[RPT], l[RPT];
+    #pragma unroll
+    for (int i = 0; i < RPT; i++) {
+        unsigned int f = f0 + r0 + i;
+        lo[i] = 0; hi[i] = 0;
+        if (f < rows) {
+            unsigned int qpos = cache_start + f / gqa + 1;
+            hi[i] = bidir ? total : qpos;
+            lo[i] = (window > 0 && qpos > window) ? qpos - window : 0;
+        }
+        m[i] = NEG_INF; l[i] = 0.0f;
+    }
+    float acc[RW][NV];
+    #pragma unroll
+    for (int i = 0; i < RW; i++)
+        #pragma unroll
+        for (int v = 0; v < NV; v++) acc[i][v] = 0.0f;
+
+    float4 kreg[NL], vreg[NL];
+    auto fetch = [&](float4* reg, const float* src, unsigned int j0) {
+        #pragma unroll
+        for (int t = 0; t < NL; t++) {
+            unsigned int i = tid + 256 * t, cc = i / D4, d = (i % D4) * 4, j = j0 + cc;
+            reg[t] = (cc < BK && j < je) ? *(const float4*)(src + (u64)j * kvd + (u64)kvh * D + d)
+                                         : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+    };
+    auto stage = [&](const float4* reg) {
+        #pragma unroll
+        for (int t = 0; t < NL; t++) {
+            unsigned int i = tid + 256 * t, cc = i / D4, d = (i % D4) * 4;
+            if (cc < BK) *(float4*)(KVs + cc * LD + d) = reg[t];
+        }
+    };
+    if (jb < je) { fetch(kreg, K, jb); fetch(vreg, V, jb); }
+    __syncthreads();
+
+    for (unsigned int j0 = jb; j0 < je; j0 += BK) {
+        bool more = j0 + BK < je;
+        stage(kreg);
+        __syncthreads();
+        if (more) fetch(kreg, K, j0 + BK);
+
+        float s[RPT];
+        #pragma unroll
+        for (int i = 0; i < RPT; i++) s[i] = 0.0f;
+        const float* kr = KVs + c * LD;
+        for (unsigned int d = 0; d < D; d += 4) {
+            float4 k4 = *(const float4*)(kr + d);
+            #pragma unroll
+            for (int i = 0; i < RPT; i++) {
+                float4 q4 = *(const float4*)(Qs + (r0 + i) * LD + d);
+                s[i] += q4.x * k4.x + q4.y * k4.y + q4.z * k4.z + q4.w * k4.w;
+            }
+        }
+        unsigned int j = j0 + c;
+        float alpha[RPT];
+        #pragma unroll
+        for (int i = 0; i < RPT; i++) {
+            if (!(j < je && j >= lo[i] && j < hi[i])) s[i] = NEG_INF;
+            float mx = s[i];
+            #pragma unroll
+            for (int o = BK / 2; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            float mn = fmaxf(m[i], mx);
+            float p = (s[i] == NEG_INF) ? 0.0f : __expf(s[i] - mn);
+            alpha[i] = (m[i] == NEG_INF) ? 0.0f : __expf(m[i] - mn);
+            float ps = p;
+            #pragma unroll
+            for (int o = BK / 2; o > 0; o >>= 1) ps += __shfl_xor_sync(0xffffffffu, ps, o);
+            l[i] = l[i] * alpha[i] + ps;
+            m[i] = mn;
+            Ps[c * PS + r0 + i] = p;
+        }
+        __syncthreads();   // every warp is done with K
+        stage(vreg);
+        __syncthreads();
+        if (more) fetch(vreg, V, j0 + BK);
+
+        #pragma unroll
+        for (int i = 0; i < RW; i++) {
+            float a = __shfl_sync(0xffffffffu, alpha[i % RPT], (i / RPT) * BK);
+            #pragma unroll
+            for (int v = 0; v < NV; v++) acc[i][v] *= a;
+        }
+        const float* pw = Ps + warp * RW;
+        #pragma unroll 4
+        for (int cc = 0; cc < BK; cc++) {
+            float p[RW];
+            #pragma unroll
+            for (int i = 0; i < RW; i++) p[i] = pw[cc * PS + i];
+            const float* vr = KVs + cc * LD;
+            #pragma unroll
+            for (int v = 0; v < NV; v++) {
+                unsigned int d = v * 32 + lane;
+                float x = (d < D) ? vr[d] : 0.0f;
+                #pragma unroll
+                for (int i = 0; i < RW; i++) acc[i][v] += p[i] * x;
+            }
+        }
+        __syncthreads();   // before the next tile overwrites V and Ps
+    }
+
+    #pragma unroll
+    for (int i = 0; i < RW; i++) {
+        unsigned int src = (i / RPT) * BK;
+        float mi = __shfl_sync(0xffffffffu, m[i % RPT], src);
+        float li = __shfl_sync(0xffffffffu, l[i % RPT], src);
+        unsigned int f = f0 + warp * RW + i;
+        if (f >= rows) continue;
+        unsigned int qi = f / gqa, head = kvh * gqa + f % gqa;
+        float* pp = P + (((u64)qi * nh + head) * n_splits + split) * (D + 2);
+        #pragma unroll
+        for (int v = 0; v < NV; v++) {
+            unsigned int d = v * 32 + lane;
+            if (d < D) pp[2 + d] = acc[i][v];
+        }
+        if (lane == 0) { pp[0] = mi; pp[1] = li; }
+    }
+}
+
+#define ATTN_MULTI(NAME, R, BK, DMAX)                                                         \
+extern "C" __global__ void __launch_bounds__(256) NAME(                                      \
+    const float* __restrict__ Q, const float* __restrict__ K, const float* __restrict__ V,    \
+    float* __restrict__ P, unsigned int cache_start, unsigned int q_len, unsigned int nh,     \
+    unsigned int nkv, unsigned int D, unsigned int n_splits, unsigned int split_len,          \
+    unsigned int window, unsigned int base, unsigned int bidir)                               \
+{                                                                                             \
+    __shared__ __align__(16) float Qs[R * (DMAX + 4)];                                        \
+    __shared__ __align__(16) float KVs[BK * (DMAX + 4)];                                      \
+    __shared__ __align__(16) float Ps[BK * (R + 4)];                                          \
+    attn_multi_body<R, BK, DMAX>(Q, K, V, P, cache_start, q_len, nh, nkv, D, n_splits,        \
+                                 split_len, window, base, bidir, Qs, KVs, Ps);                \
+}
+
+ATTN_MULTI(attn_multi_r8, 8, 32, 128)
+ATTN_MULTI(attn_multi_r16, 16, 32, 128)
+ATTN_MULTI(attn_multi_r32, 32, 32, 128)
+ATTN_MULTI(attn_multi_d256, 16, 16, 256)
 "#
 );

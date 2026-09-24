@@ -30,6 +30,35 @@ fn blocks(grid: (usize, usize, usize), threads: u32) -> LaunchConfig {
 /// Dequantized weight rows staged per prefill GEMM (floats): bounds scratch memory.
 const DEQUANT_CHUNK: usize = 32 << 20;
 
+/// Batches up to this many rows run the small-batch GEMM straight off the packed weights
+/// (`gemm_small_*`) instead of dequantizing for cuBLAS; up to 8 rows use the GEMV.
+const SMALL_GEMM_ROWS: usize = 32;
+
+/// Forwards of up to this many queries use split-KV attention (`attn_multi_*`) instead of the
+/// tiled prefill kernel, which launches too few blocks to stream a long cache quickly.
+const SMALL_ATTN_ROWS: usize = 32;
+
+/// Streaming multiprocessors on the current device (for sizing split-KV / split-K grids).
+fn sm_count() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        use cudarc::driver::sys;
+        let mut n: i32 = 0;
+        unsafe {
+            sys::cuDeviceGetAttribute(
+                &mut n,
+                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+                0,
+            );
+        }
+        if n > 0 {
+            n as usize
+        } else {
+            80
+        }
+    })
+}
+
 impl CudaComputeDevice {
     /// Kernel `name` from `source` (one of `llm_cuda`'s), compiled once.
     fn llm_func(&self, source: &str, name: &'static str) -> CudaFunction {
@@ -191,6 +220,11 @@ impl CudaComputeDevice {
             return Some(self.finish(out));
         }
 
+        if m <= SMALL_GEMM_ROWS && k % 64 == 0 {
+            self.gemm_small(x, w, &mut out, m, k, n);
+            return Some(self.finish(out));
+        }
+
         let chunk = (DEQUANT_CHUNK / k).clamp(1, n);
         let mut scratch = self.pool_alloc_uninit_f32(chunk * k);
         let mut row0 = 0;
@@ -223,6 +257,85 @@ impl CudaComputeDevice {
             row0 += rows;
         }
         Some(self.finish(out))
+    }
+
+    /// `out = x · wᵀ` for `m <= 32` rows with `gemm_small_*`: 128 output columns per block,
+    /// and a K split (partials summed by `sum_splits`) when that alone can't fill the GPU.
+    fn gemm_small(
+        &self,
+        x: &CudaBuffer,
+        w: &CudaBuffer,
+        out: &mut CudaBuffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        let col_blocks = n.div_ceil(128);
+        let chunks = k / 64;
+        // Aim for two blocks per SM; each split keeps at least 4 chunks of K.
+        let want = (2 * sm_count()).div_ceil(col_blocks);
+        let per = chunks.div_ceil(want.clamp(1, chunks.div_ceil(4).max(1)));
+        let splits = chunks.div_ceil(per);
+        let k_split = (per * 64) as u32;
+        let (mu, ku, nu) = (m as u32, k as u32, n as u32);
+        let cfg = blocks((col_blocks, splits, 1), 256);
+        let mut partial = (splits > 1).then(|| self.pool_alloc_uninit_f32(splits * m * n));
+        let dst = match partial.as_mut() {
+            Some(p) => p.f32_data_mut(),
+            None => out.f32_data_mut(),
+        };
+        match w.storage() {
+            CudaStorage::Q4(q) => {
+                let f = self.llm_func(llm_cuda::GEMV_CUDA, "gemm_small_q4");
+                let group = q.group as u32;
+                unsafe {
+                    self.stream
+                        .launch_builder(&f)
+                        .arg(x.f32_data())
+                        .arg(&q.packed)
+                        .arg(&q.scales)
+                        .arg(&q.biases)
+                        .arg(dst)
+                        .arg(&mu)
+                        .arg(&ku)
+                        .arg(&nu)
+                        .arg(&group)
+                        .arg(&k_split)
+                        .launch(cfg)
+                        .unwrap();
+                }
+            }
+            _ => {
+                let f = self.llm_func(llm_cuda::GEMV_CUDA, "gemm_small_bf16");
+                unsafe {
+                    self.stream
+                        .launch_builder(&f)
+                        .arg(x.f32_data())
+                        .arg(w.bf16_data())
+                        .arg(dst)
+                        .arg(&mu)
+                        .arg(&ku)
+                        .arg(&nu)
+                        .arg(&k_split)
+                        .launch(cfg)
+                        .unwrap();
+                }
+            }
+        }
+        if let Some(p) = partial {
+            let f = self.llm_func(llm_cuda::GEMV_CUDA, "sum_splits");
+            let (total, s) = ((m * n) as u32, splits as u32);
+            unsafe {
+                self.stream
+                    .launch_builder(&f)
+                    .arg(p.f32_data())
+                    .arg(out.f32_data_mut())
+                    .arg(&total)
+                    .arg(&s)
+                    .launch(per_elem(m * n))
+                    .unwrap();
+            }
+        }
     }
 
     /// Widen weight rows `row0 .. row0 + rows` (bf16 or 4-bit) into `dst` as `[rows, k]` f32.
@@ -364,6 +477,20 @@ impl CudaComputeDevice {
             bidir as u32,
         );
 
+        if q_len > 1 && q_len <= SMALL_ATTN_ROWS && d % 4 == 0 {
+            self.attention_multi(
+                q,
+                k,
+                v,
+                &mut out,
+                cache_start,
+                q_len,
+                (nh, nkv, d),
+                window,
+                bidir,
+            );
+            return self.finish(out);
+        }
         if q_len > 1 {
             let bq: u32 = if d <= 128 { 32 } else { 16 };
             let f = self.llm_func(llm_cuda::ATTENTION_CUDA, "attn_prefill");
@@ -433,6 +560,88 @@ impl CudaComputeDevice {
                 .unwrap();
         }
         self.finish(out)
+    }
+
+    /// Split-KV attention for a few queries (`attn_multi_*` then `attn_combine`): blocks over
+    /// (KV head, key split, group of (query, head) rows), each reading its split's keys once
+    /// for all the rows.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_multi(
+        &self,
+        q: &CudaBuffer,
+        k: &CudaBuffer,
+        v: &CudaBuffer,
+        out: &mut CudaBuffer,
+        cache_start: usize,
+        q_len: usize,
+        (nh, nkv, d): (usize, usize, usize),
+        window: usize,
+        bidir: bool,
+    ) {
+        let gqa_rows = q_len * (nh / nkv);
+        let (name, rows, tile) = match (d <= 128, gqa_rows) {
+            (false, _) => ("attn_multi_d256", 16, 16),
+            (true, ..=8) => ("attn_multi_r8", 8, 32),
+            (true, ..=16) => ("attn_multi_r16", 16, 32),
+            _ => ("attn_multi_r32", 32, 32),
+        };
+        let longest = cache_start + q_len;
+        // The earliest key any query can see.
+        let base = if window > 0 && !bidir {
+            (cache_start + 1).saturating_sub(window)
+        } else {
+            0
+        };
+        let span = longest - base;
+        let groups = gqa_rows.div_ceil(rows);
+        // Enough blocks for a few per SM, splits a whole number of key tiles.
+        let want = (4 * sm_count()).div_ceil(nkv * groups).max(1);
+        let split_len = span.div_ceil(want).max(2 * tile).next_multiple_of(tile);
+        let n_splits = span.div_ceil(split_len);
+        let mut partial = self.pool_alloc_uninit_f32(q_len * nh * n_splits * (d + 2));
+        let (cs, ql, nh_u, nkv_u, d_u, win, bi) = (
+            cache_start as u32,
+            q_len as u32,
+            nh as u32,
+            nkv as u32,
+            d as u32,
+            window as u32,
+            bidir as u32,
+        );
+        let (ns, sl, base_u) = (n_splits as u32, split_len as u32, base as u32);
+        let f = self.llm_func(llm_cuda::ATTENTION_CUDA, name);
+        unsafe {
+            self.stream
+                .launch_builder(&f)
+                .arg(q.f32_data())
+                .arg(k.f32_data())
+                .arg(v.f32_data())
+                .arg(partial.f32_data_mut())
+                .arg(&cs)
+                .arg(&ql)
+                .arg(&nh_u)
+                .arg(&nkv_u)
+                .arg(&d_u)
+                .arg(&ns)
+                .arg(&sl)
+                .arg(&win)
+                .arg(&base_u)
+                .arg(&bi)
+                .launch(blocks((nkv, n_splits, groups), 256))
+                .unwrap();
+        }
+        let f = self.llm_func(llm_cuda::ATTENTION_CUDA, "attn_combine");
+        unsafe {
+            self.stream
+                .launch_builder(&f)
+                .arg(partial.f32_data())
+                .arg(out.f32_data_mut())
+                .arg(&nh_u)
+                .arg(&d_u)
+                .arg(&ns)
+                .launch(blocks((nh, q_len, 1), 32))
+                .unwrap();
+        }
     }
 
     /// Elementwise kernels from `FUSED_CUDA` taking `(in, out, a[, b])` with f32 buffers.
@@ -650,6 +859,26 @@ mod tests {
                 close(&got, &want, 0.0, "embedding");
             }
         }
+        // Small batches (the split-K GEMM): row counts around the GEMV / GEMM boundaries,
+        // column counts off the 128-column tile, one and several K splits.
+        for &(m, k, n, group) in &[
+            (9, 256, 200, 64),
+            (16, 1024, 130, 32),
+            (32, 4096, 384, 64),
+            (21, 2048, 1000, 128),
+        ] {
+            let x = vals(m * k, 30, 2.0);
+            let (p, s, b) = q4(n, k, group);
+            let got =
+                g.download(&g.linear(&g.upload(&x), &g.upload_q4(&p, &s, &b, group), m, k, n));
+            let want =
+                c.download(&c.linear(&c.upload(&x), &c.upload_q4(&p, &s, &b, group), m, k, n));
+            close(&got, &want, 1e-4, &format!("q4 small gemm {m}x{k}x{n}"));
+            let wb = bf16_bits(&vals(n * k, 31, 1.0));
+            let got = g.download(&g.linear(&g.upload(&x), &g.upload_bf16(&wb), m, k, n));
+            let want = c.download(&c.linear(&c.upload(&x), &c.upload_bf16(&wb), m, k, n));
+            close(&got, &want, 1e-4, &format!("bf16 small gemm {m}x{k}x{n}"));
+        }
         // K not a multiple of 8 (bf16 goes through the dequantized GEMM).
         let (m, k, n) = (2, 30, 17);
         let x = vals(m * k, 5, 1.0);
@@ -739,6 +968,15 @@ mod tests {
             (4, 2, 256, 20, 50, 16, true),  // windowed prefill, D = 256
             (4, 4, 72, 3, 33, 0, false),    // image block: bidirectional within the batch
             (2, 2, 72, 0, 1, 0, false),
+            // A few queries on a cache (split-KV multi-query path).
+            (4, 2, 128, 999, 5, 0, true),
+            (32, 8, 128, 1500, 8, 0, true), // 8B-shaped verify step
+            (4, 1, 64, 30, 32, 0, true),    // 4 row groups
+            (8, 4, 256, 700, 3, 512, true), // D = 256, past the window
+            (4, 2, 256, 40, 20, 16, true),  // window shorter than the batch
+            (4, 2, 80, 100, 2, 0, true),    // D not a multiple of 32
+            (4, 4, 72, 3, 7, 0, false),     // bidirectional
+            (2, 1, 128, 0, 6, 0, true),     // empty cache
         ];
         for &(nh, nkv, hd, cs, ql, window, causal) in &cases {
             let total = cs + ql;
@@ -864,6 +1102,69 @@ mod tests {
             )),
             1e-5,
             "rope_half",
+        );
+    }
+
+    /// Timings of the small-k kernels (not a check) for a model shape
+    /// `(heads, kv heads, head dim, hidden, ff)`.
+    fn bench_small_k_on<D: ComputeDevice>(
+        g: &D,
+        (nh, nkv, hd, h, ff): (usize, usize, usize, usize, usize),
+    ) {
+        let time = |f: &mut dyn FnMut()| {
+            f();
+            g.sync();
+            let t = std::time::Instant::now();
+            for _ in 0..20 {
+                f();
+            }
+            g.sync();
+            t.elapsed().as_secs_f64() * 1e6 / 20.0
+        };
+        let ks = [1, 2, 4, 8, 16, 32];
+        for ctx in [4096, 16384] {
+            let k = g.upload(&vals((ctx + 32) * nkv * hd, 1, 2.0));
+            let v = g.upload(&vals((ctx + 32) * nkv * hd, 2, 2.0));
+            let mut line = format!("attention ctx {ctx:>5} (us):");
+            for ql in ks {
+                let q = g.upload(&vals(ql * nh * hd, 3, 2.0));
+                let us = time(&mut || {
+                    g.kv_attention_window(&q, &k, &v, ctx, ql, (nh, nkv, hd), 0, true);
+                });
+                line += &format!(" k{ql} {us:.0}");
+            }
+            eprintln!("{line}");
+        }
+        for (kk, n) in [(nh * hd, h), (h, (nh + 2 * nkv) * hd), (h, 2 * ff), (ff, h)] {
+            let (p, s, b) = q4(n, kk, 64);
+            let w = g.upload_q4(&p, &s, &b, 64);
+            let mut line = format!("q4 linear {kk:>5}x{n:>5} (us):");
+            for m in [1, 2, 4, 8, 9, 16, 32] {
+                let x = g.upload(&vals(m * kk, 4, 1.0));
+                let us = time(&mut || {
+                    g.linear(&x, &w, m, kk, n);
+                });
+                line += &format!(" m{m} {us:.0}");
+            }
+            eprintln!("{line}");
+        }
+    }
+
+    /// `cargo test --release -p tang-compute --features cuda --lib bench_small_k -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_small_k_cuda() {
+        on_gpu(|g| bench_small_k_on(g, (32, 8, 128, 4096, 12288)));
+    }
+
+    /// Qwen3-4B shapes on Metal.
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore]
+    fn bench_small_k_metal() {
+        bench_small_k_on(
+            &crate::MetalDevice::new().expect("no Metal device"),
+            (32, 8, 128, 2560, 9728),
         );
     }
 
