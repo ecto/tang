@@ -80,7 +80,12 @@ fn new_cuda() -> Result<tang_compute::CudaComputeDevice> {
     let dev = std::panic::catch_unwind(tang_compute::CudaComputeDevice::new);
     std::panic::set_hook(hook);
     match dev {
-        Ok(Ok(dev)) => Ok(dev),
+        Ok(Ok(dev)) => {
+            // TF32 tensor cores for the prefill GEMMs: ~1.1-1.3x prefill on an RTX 3090 at
+            // KL ~1e-5 against FP32 (decode's GEMVs don't use cuBLAS). `GAIA_TF32=0` opts out.
+            dev.set_tf32(std::env::var("GAIA_TF32").as_deref() != Ok("0"));
+            Ok(dev)
+        }
         Ok(Err(e)) => bail!("no CUDA device: {e}"),
         Err(_) => bail!("no CUDA device (couldn't load the driver or cuBLAS)"),
     }

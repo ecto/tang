@@ -214,6 +214,20 @@ impl CudaComputeDevice {
         })
     }
 
+    /// Switch cuBLAS f32 GEMMs between TF32 tensor cores (`on`) and full FP32 (the default,
+    /// unless `GAIA_TF32=1`). TF32 keeps 10 mantissa bits in the products (f32 accumulate):
+    /// fine for inference prefill, riskier for training.
+    pub fn set_tf32(&self, on: bool) {
+        let mode = if on {
+            cudarc::cublas::sys::cublasMath_t::CUBLAS_TF32_TENSOR_OP_MATH
+        } else {
+            cudarc::cublas::sys::cublasMath_t::CUBLAS_DEFAULT_MATH
+        };
+        unsafe {
+            cudarc::cublas::sys::cublasSetMathMode(*self.cublas.handle(), mode);
+        }
+    }
+
     /// Create a new CUDA device with bf16 mixed precision.
     /// Weights and activations stored in bf16, compute in f32 internally.
     pub fn new_mixed_precision() -> Result<Self, cudarc::driver::DriverError> {

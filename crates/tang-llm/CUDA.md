@@ -123,9 +123,17 @@ scratch (a dequantized weight chunk is up to 128 MB) and the CUDA context.
 ## Known limits
 
 - f32 activations and KV cache, like Metal: exact, but twice the cache memory of bf16.
-- Prefill GEMMs run in FP32 on CUDA cores. `GAIA_TF32=1` switches cuBLAS to TF32 tensor cores
-  (roughly 2x faster prefill, 10-bit mantissas in the products).
-- Attention is plain CUDA-core code (no tensor cores): fine for chat-length prompts, slower than
-  FlashAttention for very long prefills.
+- The `tang-llm` binary runs prefill GEMMs on TF32 tensor cores (10-bit mantissas in the
+  products, f32 accumulate); `GAIA_TF32=0` switches back to FP32. On an RTX 3090 with
+  Qwen3-8B-4bit, cold prefill goes 928 → 1217 tok/s at 1k tokens, 644 → 758 at 4k and
+  416 → 461 at 9k; against the CPU reference (Qwen3-0.6B-4bit) max KL goes from ~1e-9 to ~3e-5,
+  same top-1. Decode is unaffected (its GEMVs don't use cuBLAS). The library default
+  (`CudaComputeDevice::new`, so the tests) stays FP32 unless `GAIA_TF32=1`.
+- Attention is plain CUDA-core code (no tensor cores). With more than one query (prefill, and a
+  speculative-decoding verify of k tokens) it runs one block per 32 queries per head, each
+  walking every cached key, so few queries against a long cache use a fraction of the GPU: at
+  9k tokens attention dominates prefill, and verifying 2 tokens on a 16k cache takes ~280 ms
+  against ~18 ms for one (`tang-llm bench-verify`). Single-token decode splits the keys across
+  blocks and is fine.
 - Kernels are compiled with NVRTC the first time each is used, so the first request is a little
   slower.
