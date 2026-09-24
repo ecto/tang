@@ -5,7 +5,7 @@
 
 use cudarc::cublas::sys::cublasOperation_t;
 use cudarc::cublas::{Gemm, GemmConfig};
-use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaFunction, CudaSlice, LaunchConfig, PushKernelArg};
 
 use super::{CudaBuffer, CudaComputeDevice, CudaStorage, Q4Weight};
 use crate::kernels::llm_cuda;
@@ -31,6 +31,16 @@ fn blocks(grid: (usize, usize, usize), threads: u32) -> LaunchConfig {
 const DEQUANT_CHUNK: usize = 32 << 20;
 
 impl CudaComputeDevice {
+    /// Kernel `name` from `source` (one of `llm_cuda`'s), compiled once.
+    fn llm_func(&self, source: &str, name: &'static str) -> CudaFunction {
+        if let Some(f) = self.llm_funcs.borrow().get(name) {
+            return f.clone();
+        }
+        let (_module, f) = self.get_func(source, name);
+        self.llm_funcs.borrow_mut().insert(name, f.clone());
+        f
+    }
+
     /// `buf` as f32 on device: itself, or a widened copy of bf16 activations.
     fn as_f32<'a>(&self, buf: &'a CudaBuffer, tmp: &'a mut Option<CudaBuffer>) -> &'a CudaBuffer {
         if buf.is_bf16() {
@@ -84,7 +94,7 @@ impl CudaComputeDevice {
         let mut out = self.pool_alloc_uninit_f32(total);
         match weight.storage() {
             CudaStorage::Q4(q) => {
-                let (_m, f) = self.get_func(llm_cuda::EMBED_CUDA, "embedding_q4");
+                let f = self.llm_func(llm_cuda::EMBED_CUDA, "embedding_q4");
                 let group = q.group as u32;
                 unsafe {
                     self.stream
@@ -103,7 +113,7 @@ impl CudaComputeDevice {
             }
             // bf16 activations (mixed precision) keep the training path.
             CudaStorage::Bf16(w) if !self.mixed_precision => {
-                let (_m, f) = self.get_func(llm_cuda::EMBED_CUDA, "embedding_bf16");
+                let f = self.llm_func(llm_cuda::EMBED_CUDA, "embedding_bf16");
                 unsafe {
                     self.stream
                         .launch_builder(&f)
@@ -144,7 +154,7 @@ impl CudaComputeDevice {
             let cfg = blocks((n.div_ceil(8), 1, 1), 256);
             match w.storage() {
                 CudaStorage::Q4(q) => {
-                    let (_m, f) = self.get_func(llm_cuda::GEMV_CUDA, "gemv_q4");
+                    let f = self.llm_func(llm_cuda::GEMV_CUDA, "gemv_q4");
                     let group = q.group as u32;
                     unsafe {
                         self.stream
@@ -163,7 +173,7 @@ impl CudaComputeDevice {
                     }
                 }
                 _ => {
-                    let (_m, f) = self.get_func(llm_cuda::GEMV_CUDA, "gemv_bf16");
+                    let f = self.llm_func(llm_cuda::GEMV_CUDA, "gemv_bf16");
                     unsafe {
                         self.stream
                             .launch_builder(&f)
@@ -227,7 +237,7 @@ impl CudaComputeDevice {
         let (r0, r, ku) = (row0 as u32, rows as u32, k as u32);
         match w.storage() {
             CudaStorage::Q4(q) => {
-                let (_m, f) = self.get_func(llm_cuda::DEQUANT_CUDA, "dequant_q4");
+                let f = self.llm_func(llm_cuda::DEQUANT_CUDA, "dequant_q4");
                 let group = q.group as u32;
                 unsafe {
                     self.stream
@@ -245,7 +255,7 @@ impl CudaComputeDevice {
                 }
             }
             CudaStorage::Bf16(s) => {
-                let (_m, f) = self.get_func(llm_cuda::DEQUANT_CUDA, "dequant_bf16");
+                let f = self.llm_func(llm_cuda::DEQUANT_CUDA, "dequant_bf16");
                 unsafe {
                     self.stream
                         .launch_builder(&f)
@@ -288,7 +298,7 @@ impl CudaComputeDevice {
             "KV cache too small"
         );
         let mut q = self.pool_alloc_uninit_f32(seq * nh * hd);
-        let (_m, f) = self.get_func(llm_cuda::FUSED_CUDA, "attention_prep");
+        let f = self.llm_func(llm_cuda::FUSED_CUDA, "attention_prep");
         let qn = q_norm.unwrap_or(qkv);
         let kn = k_norm.unwrap_or(qkv);
         let (nh_u, nkv_u, hd_u, pos_u) = (nh as u32, nkv as u32, hd as u32, pos as u32);
@@ -356,7 +366,7 @@ impl CudaComputeDevice {
 
         if q_len > 1 {
             let bq: u32 = if d <= 128 { 32 } else { 16 };
-            let (_m, f) = self.get_func(llm_cuda::ATTENTION_CUDA, "attn_prefill");
+            let f = self.llm_func(llm_cuda::ATTENTION_CUDA, "attn_prefill");
             unsafe {
                 self.stream
                     .launch_builder(&f)
@@ -389,7 +399,7 @@ impl CudaComputeDevice {
         let split_len = span.div_ceil(n_splits);
         let mut partial = self.pool_alloc_uninit_f32(nh * n_splits * (d + 2));
         let (ns, sl, base_u) = (n_splits as u32, split_len as u32, base as u32);
-        let (_m, f) = self.get_func(llm_cuda::ATTENTION_CUDA, "attn_partial");
+        let f = self.llm_func(llm_cuda::ATTENTION_CUDA, "attn_partial");
         unsafe {
             self.stream
                 .launch_builder(&f)
@@ -410,7 +420,7 @@ impl CudaComputeDevice {
                 .launch(blocks((nh, n_splits, 1), 256))
                 .unwrap();
         }
-        let (_m, f) = self.get_func(llm_cuda::ATTENTION_CUDA, "attn_combine");
+        let f = self.llm_func(llm_cuda::ATTENTION_CUDA, "attn_combine");
         unsafe {
             self.stream
                 .launch_builder(&f)
@@ -428,7 +438,7 @@ impl CudaComputeDevice {
     /// Elementwise kernels from `FUSED_CUDA` taking `(in, out, a[, b])` with f32 buffers.
     fn fused_unary(
         &self,
-        name: &str,
+        name: &'static str,
         x: &CudaBuffer,
         n_out: usize,
         a: u32,
@@ -437,7 +447,7 @@ impl CudaComputeDevice {
         let mut tmp = None;
         let x = self.as_f32(x, &mut tmp);
         let mut out = self.pool_alloc_uninit_f32(n_out);
-        let (_m, f) = self.get_func(llm_cuda::FUSED_CUDA, name);
+        let f = self.llm_func(llm_cuda::FUSED_CUDA, name);
         unsafe {
             let mut l = self.stream.launch_builder(&f);
             l.arg(x.f32_data()).arg(out.f32_data_mut()).arg(&a);
@@ -455,7 +465,7 @@ impl CudaComputeDevice {
 
     pub(super) fn gated_split_llm(
         &self,
-        name: &str,
+        name: &'static str,
         gu: &CudaBuffer,
         rows: usize,
         ff: usize,
@@ -469,7 +479,7 @@ impl CudaComputeDevice {
             return None;
         }
         let mut out = self.pool_alloc_uninit_f32(n);
-        let (_m, f) = self.get_func(llm_cuda::FUSED_CUDA, "add_f32");
+        let f = self.llm_func(llm_cuda::FUSED_CUDA, "add_f32");
         let n_u = n as u32;
         unsafe {
             self.stream
@@ -500,7 +510,7 @@ impl CudaComputeDevice {
             self.as_f32(b, &mut tb),
         );
         let mut out = self.pool_alloc_uninit_f32(rows * dim);
-        let (_m, f) = self.get_func(llm_cuda::FUSED_CUDA, "layer_norm");
+        let f = self.llm_func(llm_cuda::FUSED_CUDA, "layer_norm");
         let dim_u = dim as u32;
         unsafe {
             self.stream
@@ -537,7 +547,7 @@ impl CudaComputeDevice {
                 .memcpy_dtod(x.f32_data(), out.f32_data_mut())
                 .unwrap();
         }
-        let (_m, f) = self.get_func(llm_cuda::FUSED_CUDA, "rope_half");
+        let f = self.llm_func(llm_cuda::FUSED_CUDA, "rope_half");
         let (s, h, d, p) = (
             seq_len as u32,
             n_heads as u32,

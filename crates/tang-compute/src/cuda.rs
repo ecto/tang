@@ -174,6 +174,8 @@ pub struct CudaComputeDevice {
     module_cache: RefCell<HashMap<u64, Arc<CudaModule>>>, // hash → module
     mixed_precision: bool,
     pool: Arc<Mutex<BufferPool>>,
+    /// LLM kernels by name, so decode doesn't hash kernel sources on every launch.
+    llm_funcs: RefCell<HashMap<&'static str, CudaFunction>>,
 }
 
 impl CudaComputeDevice {
@@ -208,6 +210,7 @@ impl CudaComputeDevice {
             module_cache: RefCell::new(HashMap::new()),
             mixed_precision: false,
             pool: Arc::new(Mutex::new(BufferPool::new())),
+            llm_funcs: RefCell::new(HashMap::new()),
         })
     }
 
@@ -243,6 +246,7 @@ impl CudaComputeDevice {
             module_cache: RefCell::new(HashMap::new()),
             mixed_precision: true,
             pool: Arc::new(Mutex::new(BufferPool::new())),
+            llm_funcs: RefCell::new(HashMap::new()),
         })
     }
 
