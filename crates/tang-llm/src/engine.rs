@@ -23,6 +23,9 @@ pub struct Request {
     pub images: Vec<Vec<u8>>,
     pub tools: Option<Value>,
     pub think: Option<bool>,
+    /// Most tokens to spend inside `<think>` before the reasoning is wrapped up (see
+    /// [`ThinkBudget`]); `None` is unlimited.
+    pub thinking_budget: Option<usize>,
     pub sampling: Sampling,
     pub max_tokens: Option<usize>,
     pub stop: Vec<String>,
@@ -41,6 +44,8 @@ pub struct Usage {
     pub prompt_tokens: usize,
     pub cached_tokens: usize,
     pub completion_tokens: usize,
+    /// Of the completion, tokens inside `<think>` (including any wrap-up the budget injected).
+    pub reasoning_tokens: usize,
     pub prefill_tok_s: f64,
     pub decode_tok_s: f64,
 }
@@ -54,6 +59,72 @@ pub struct Engine<D: ComputeDevice> {
     /// shared prefix is only reused when the images in it are the same.
     cache_images: Vec<(usize, u64)>,
     eos: Vec<u32>,
+    /// `<think>` and `</think>`, when the model has them.
+    think_tags: Option<(u32, u32)>,
+    /// What a spent thinking budget appends: a wrap-up sentence, `</think>`, a blank line.
+    wrap_up: Vec<u32>,
+}
+
+/// Qwen3's suggested way to end reasoning early: say so, then close the block.
+const WRAP_UP: &str =
+    "\n\nConsidering the limited time, I have to give the solution based on the thinking directly now.\n";
+
+/// Caps reasoning at a token budget. Fed each generated token, it tracks whether decoding is
+/// inside `<think>` and how much it has spent there, and says when the budget runs out so the
+/// engine can append the wrap-up (through `</think>`) as if the model had written it.
+#[derive(Debug)]
+pub struct ThinkBudget {
+    tags: Option<(u32, u32)>,
+    budget: Option<usize>,
+    inside: bool,
+    spent: usize,
+    /// Tokens inside `<think>` so far, the tags and any wrap-up included.
+    pub reasoning: usize,
+    /// The budget ran out and the reasoning was closed.
+    pub hit: bool,
+}
+
+impl ThinkBudget {
+    /// `inside`: the prompt already opened `<think>`. Without tags nothing is ever cut.
+    pub fn new(tags: Option<(u32, u32)>, budget: Option<usize>, inside: bool) -> Self {
+        Self {
+            tags,
+            budget,
+            inside: inside && tags.is_some(),
+            spent: 0,
+            reasoning: 0,
+            hit: false,
+        }
+    }
+
+    /// Note a generated token. True when the reasoning must be closed now.
+    pub fn step(&mut self, tok: u32) -> bool {
+        let Some((open, close)) = self.tags else {
+            return false;
+        };
+        if tok == close {
+            self.reasoning += self.inside as usize;
+            self.inside = false;
+            return false;
+        }
+        if tok == open {
+            self.inside = true;
+        } else if self.inside {
+            self.spent += 1;
+        }
+        if !self.inside {
+            return false;
+        }
+        self.reasoning += 1;
+        self.budget.is_some_and(|b| !self.hit && self.spent >= b)
+    }
+
+    /// The engine appended `n` tokens of wrap-up, ending with `</think>`.
+    pub fn closed(&mut self, n: usize) {
+        self.reasoning += n;
+        self.inside = false;
+        self.hit = true;
+    }
 }
 
 impl<D: ComputeDevice> Engine<D> {
@@ -82,6 +153,20 @@ impl<D: ComputeDevice> Engine<D> {
         eos.sort_unstable();
         eos.dedup();
         let cache = model.new_cache();
+        let think_tags = tok.token_to_id("<think>").zip(tok.token_to_id("</think>"));
+        let mut wrap_up = Vec::new();
+        if let Some((_, close)) = think_tags {
+            let enc = |s: &str| -> Result<Vec<u32>> {
+                Ok(tok
+                    .encode(s, false)
+                    .map_err(|e| anyhow!("tokenize: {e}"))?
+                    .get_ids()
+                    .to_vec())
+            };
+            wrap_up = enc(WRAP_UP)?;
+            wrap_up.push(close);
+            wrap_up.extend(enc("\n\n")?);
+        }
         Ok(Self {
             model,
             tok,
@@ -89,6 +174,8 @@ impl<D: ComputeDevice> Engine<D> {
             cache,
             cache_images: Vec::new(),
             eos,
+            think_tags,
+            wrap_up,
         })
     }
 
@@ -152,7 +239,7 @@ impl<D: ComputeDevice> Engine<D> {
             "prompt is {} tokens; the context window is {ctx}",
             ids.len()
         );
-        let budget = req.max_tokens.unwrap_or(usize::MAX).min(ctx - ids.len());
+        let limit = req.max_tokens.unwrap_or(usize::MAX).min(ctx - ids.len());
 
         // Reuse the shared prefix (at least one token must be fed to get logits).
         let shared = self
@@ -201,7 +288,9 @@ impl<D: ComputeDevice> Engine<D> {
         let prefill_s = t.elapsed().as_secs_f64();
 
         let mut sampler = Sampler::new(req.sampling.clone());
-        let mut parser = Parser::new(prompt.trim_end().ends_with("<think>"));
+        let opened = prompt.trim_end().ends_with("<think>");
+        let mut parser = Parser::new(opened);
+        let mut think = ThinkBudget::new(self.think_tags, req.thinking_budget, opened);
         let mut out: Vec<u32> = Vec::new();
         let (mut prefix, mut read) = (0usize, 0usize);
         let mut text = String::new();
@@ -221,13 +310,21 @@ impl<D: ComputeDevice> Engine<D> {
             true
         };
 
-        while out.len() < budget {
+        while out.len() < limit {
             let next = sampler.sample(&logits);
             if self.eos.contains(&next) {
                 finish = Finish::Stop;
                 break;
             }
             out.push(next);
+            // Out of thinking budget: write the wrap-up and `</think>` for the model (into the
+            // KV cache like its own tokens, and streamed as reasoning), then let it answer.
+            let mut fed = vec![next];
+            if think.step(next) && out.len() + self.wrap_up.len() < limit {
+                out.extend(&self.wrap_up);
+                fed.extend(&self.wrap_up);
+                think.closed(self.wrap_up.len());
+            }
             // Incremental detokenization: decode a small window and emit what's new, holding
             // back incomplete UTF-8.
             let before = self.decode(&out[prefix..read])?;
@@ -254,7 +351,7 @@ impl<D: ComputeDevice> Engine<D> {
                     break;
                 }
             }
-            logits = self.model.forward(&[next], &mut self.cache, false)?;
+            logits = self.model.forward(&fed, &mut self.cache, false)?;
         }
         if finish != Finish::Cancelled {
             deliver(parser.finish(), &mut tool_calls);
@@ -269,6 +366,7 @@ impl<D: ComputeDevice> Engine<D> {
                 prompt_tokens: ids.len(),
                 cached_tokens: reuse,
                 completion_tokens: out.len(),
+                reasoning_tokens: think.reasoning,
                 prefill_tok_s: (ids.len() - reuse) as f64 / prefill_s.max(1e-9),
                 decode_tok_s: out.len() as f64 / decode_s.max(1e-9),
             },
@@ -288,4 +386,64 @@ fn hash(bytes: &[u8]) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut h);
     h.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ThinkBudget;
+
+    const OPEN: u32 = 1;
+    const CLOSE: u32 = 2;
+
+    /// Feed tokens; the index of the token after which the budget cut in, if it did.
+    fn run(b: &mut ThinkBudget, toks: &[u32]) -> Option<usize> {
+        for (i, &t) in toks.iter().enumerate() {
+            if b.step(t) {
+                b.closed(3);
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn cuts_after_budget_tokens_of_reasoning() {
+        let mut b = ThinkBudget::new(Some((OPEN, CLOSE)), Some(3), false);
+        // `<think>`, then three reasoning tokens: the third spends the budget.
+        assert_eq!(run(&mut b, &[OPEN, 10, 11, 12, 13]), Some(3));
+        assert!(b.hit);
+        assert_eq!(b.reasoning, 4 + 3);
+        // Answer tokens after the close don't count, and a second block isn't cut.
+        assert_eq!(run(&mut b, &[20, 21, OPEN, 30, 31, 32, 33]), None);
+    }
+
+    #[test]
+    fn reasoning_that_ends_in_time_is_left_alone() {
+        let mut b = ThinkBudget::new(Some((OPEN, CLOSE)), Some(3), false);
+        assert_eq!(run(&mut b, &[OPEN, 10, 11, CLOSE, 20, 21, 22, 23]), None);
+        assert!(!b.hit);
+        assert_eq!(b.reasoning, 4);
+    }
+
+    #[test]
+    fn a_prompt_that_opened_think_counts_from_the_first_token() {
+        let mut b = ThinkBudget::new(Some((OPEN, CLOSE)), Some(2), true);
+        assert_eq!(run(&mut b, &[10, 11, 12]), Some(1));
+    }
+
+    #[test]
+    fn zero_budget_closes_right_after_the_open_tag() {
+        let mut b = ThinkBudget::new(Some((OPEN, CLOSE)), Some(0), false);
+        assert_eq!(run(&mut b, &[5, OPEN, 10]), Some(1));
+    }
+
+    #[test]
+    fn no_budget_or_no_tags_never_cuts() {
+        let mut b = ThinkBudget::new(Some((OPEN, CLOSE)), None, false);
+        assert_eq!(run(&mut b, &[OPEN, 10, 11, 12, CLOSE]), None);
+        assert_eq!(b.reasoning, 5);
+        let mut b = ThinkBudget::new(None, Some(0), true);
+        assert_eq!(run(&mut b, &[OPEN, 10, 11]), None);
+        assert_eq!(b.reasoning, 0);
+    }
 }
