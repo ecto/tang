@@ -263,6 +263,12 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
     let mut host = "127.0.0.1".to_string();
     // Never on the command line itself, where `ps` would show it.
     let mut key = std::env::var("TANG_API_KEY").ok();
+    // Speculative decoding (suffix drafts): on for GPUs unless TANG_SPECULATE=0 or --no-speculate.
+    let mut speculate = match std::env::var("TANG_SPECULATE").as_deref() {
+        Ok("0") | Ok("off") | Ok("false") => false,
+        Ok(_) => true,
+        Err(_) => !matches!(backend, Backend::Cpu),
+    };
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -276,16 +282,49 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
             }
             "--f32" => dtype = Dtype::F32,
             "--q4" => dtype = Dtype::Q4,
+            "--speculate" => speculate = true,
+            "--no-speculate" => speculate = false,
             other => bail!("unknown option {other}"),
         }
     }
+    let draft = speculate.then(|| draft_config(backend, &spec));
     let key = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
     let dir = tang_llm::resolve_model(&spec)?;
     let addr = format!("{host}:{port}");
     if key.is_none() && !host.starts_with("127.") && host != "localhost" {
         eprintln!("tang-llm: warning: listening on {host} without an API key; anyone who can reach it can use it");
     }
-    on_backend!(backend, serve_on(&addr, spec, dir, ctx, dtype, key))
+    on_backend!(backend, serve_on(&addr, spec, dir, ctx, dtype, key, draft))
+}
+
+/// Drafting settings for `backend`: its verify cost curve, a store of earlier completions under
+/// `~/.cache/tang/drafts/` (`TANG_DRAFT_STORE`: another file, or 0 for none), `TANG_DRAFT_*`.
+fn draft_config(backend: Backend, model: &str) -> tang_llm::draft::DraftConfig {
+    use tang_llm::draft::{DraftConfig, COST_CUDA, COST_METAL};
+    let cost = match backend {
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => COST_CUDA,
+        #[cfg(feature = "metal")]
+        Backend::Metal => COST_METAL,
+        // A CPU forward costs about k times one token: drafts only pay when nearly certain.
+        _ => &[(1, 1.0), (2, 1.9), (32, 30.0)],
+    };
+    let _ = (COST_CUDA, COST_METAL);
+    let mut cfg = DraftConfig::new(cost).from_env();
+    let name: String = model
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || "-_.".contains(c) { c } else { '_' })
+        .collect();
+    cfg.store = match std::env::var("TANG_DRAFT_STORE").as_deref() {
+        Ok("0") | Ok("") => None,
+        Ok(p) => Some(PathBuf::from(p)),
+        Err(_) => std::env::var_os("HOME").map(|h| {
+            PathBuf::from(h)
+                .join(".cache/tang/drafts")
+                .join(format!("{name}.tok"))
+        }),
+    };
+    cfg
 }
 
 fn serve_on<D: ComputeDevice + 'static>(
@@ -296,10 +335,22 @@ fn serve_on<D: ComputeDevice + 'static>(
     ctx: usize,
     dtype: Dtype,
     key: Option<String>,
+    draft: Option<tang_llm::draft::DraftConfig>,
 ) -> Result<()> {
     tang_llm::server::serve(addr, name, key, move || {
         let t = Instant::now();
-        let e = Engine::load(make()?, &dir, ctx, dtype)?;
+        let mut e = Engine::load(make()?, &dir, ctx, dtype)?;
+        if let Some(d) = &draft {
+            eprintln!(
+                "tang-llm: speculative decoding on (suffix drafts, up to {}; store {})",
+                d.max_draft,
+                d.store.as_ref().map_or("off".into(), |p| p.display().to_string())
+            );
+        }
+        e.set_speculation(draft);
+        if let Some(s) = e.speculation() {
+            eprintln!("tang-llm: draft store has {} tokens", s.global.tokens());
+        }
         eprintln!(
             "tang-llm: loaded {} in {:.1}s ({} ctx)",
             dir.display(),
