@@ -9,6 +9,12 @@
 //! `tang-llm logits-image <model-dir> <pixels.f32> <token ids...> [--last N]` — logits with the
 //! image standing in for its placeholder tokens.
 //!
+//! `tang-llm bench-prefill <model> [--n 1024,4096,9216] [--reps R]` — cold prefill (empty
+//! cache, 512-token chunks like the server) of N synthetic tokens: ms and tok/s.
+//! `tang-llm bench-verify <model> [--ctx 4096,16384] [--k 1,2,4,8,16,32] [--reps R]` — one
+//! forward of k tokens on top of a ctx-token cache (a speculative-decoding verify step), with
+//! logits for all k rows: median ms and cost relative to k=1.
+//!
 //! Every command takes `--device auto|metal|cuda|cpu` (auto: Metal, then CUDA, then the CPU,
 //! whichever is built in and present).
 
@@ -120,6 +126,10 @@ fn main() -> Result<()> {
     };
     if args.first().map(String::as_str) == Some("serve") {
         return serve(backend, &args[1..]);
+    }
+    if matches!(cmd, "bench-prefill" | "bench-verify") {
+        let cmd = cmd.to_string();
+        return bench(backend, &cmd, &args[1..]);
     }
     // Multimodal checks take a raw f32 pixel file before the token ids.
     let mut pixels: Option<Vec<f32>> = None;
@@ -292,6 +302,136 @@ fn serve_on<D: ComputeDevice + 'static>(
         );
         Ok(e)
     })
+}
+
+/// Options for the bench commands.
+struct BenchOpts {
+    ns: Vec<usize>,
+    ks: Vec<usize>,
+    reps: usize,
+}
+
+fn bench(backend: Backend, cmd: &str, args: &[String]) -> Result<()> {
+    let list = |s: &String| -> Result<Vec<usize>> {
+        s.split(',').map(|v| Ok(v.trim().parse()?)).collect()
+    };
+    let spec = args
+        .first()
+        .context("a model directory or Hugging Face repo id")?;
+    let prefill = cmd == "bench-prefill";
+    let mut o = BenchOpts {
+        ns: if prefill {
+            vec![1024, 4096, 9216]
+        } else {
+            vec![4096, 16384]
+        },
+        ks: vec![1, 2, 4, 8, 16, 32],
+        reps: if prefill { 2 } else { 10 },
+    };
+    let mut it = args[1..].iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--n" | "--ctx" => o.ns = list(it.next().context("--ctx N,N,...")?)?,
+            "--k" => o.ks = list(it.next().context("--k K,K,...")?)?,
+            "--reps" => o.reps = it.next().context("--reps R")?.parse()?,
+            other => bail!("unknown option {other}"),
+        }
+    }
+    let dir = tang_llm::resolve_model(spec)?;
+    eprintln!("{cmd} {} on {backend:?}", dir.display());
+    on_backend!(backend, bench_on(&dir, prefill, o))
+}
+
+/// Deterministic, tokenizer-free token ids (timing doesn't depend on the text).
+fn synthetic_ids(n: usize, vocab: usize) -> Vec<u32> {
+    let mut x = 0x9e37_79b9_7f4a_7c15u64;
+    (0..n)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (1000 + x % (vocab.min(150_000) as u64 - 1000)) as u32
+        })
+        .collect()
+}
+
+fn median(mut v: Vec<f64>) -> f64 {
+    v.sort_by(f64::total_cmp);
+    v[v.len() / 2]
+}
+
+fn bench_on<D: ComputeDevice>(
+    make: fn() -> Result<D>,
+    dir: &std::path::Path,
+    prefill: bool,
+    o: BenchOpts,
+) -> Result<()> {
+    let max_n = *o.ns.iter().max().context("no sizes")?;
+    let max_k = if prefill {
+        0
+    } else {
+        *o.ks.iter().max().context("no k")?
+    };
+    let model = Model::load(make()?, dir, max_n + max_k + 1, Dtype::Bf16)?;
+    let vocab = model.cfg.vocab_size;
+    let mut cache = model.new_cache();
+    // Warm up: kernel compilation, pools, cuBLAS/Metal pipeline setup.
+    for m in [1, 4, 16, 512] {
+        cache.truncate(0);
+        model.forward(&synthetic_ids(m, vocab), &mut cache, false)?;
+    }
+    let fill = |cache: &mut tang_llm::Cache<D::Buffer>, ids: &[u32]| -> Result<()> {
+        cache.truncate(0);
+        for chunk in ids.chunks(512) {
+            model.forward(chunk, cache, false)?;
+        }
+        Ok(())
+    };
+    if prefill {
+        println!("| prompt tokens | ms | tok/s |");
+        println!("|---:|---:|---:|");
+        for &n in &o.ns {
+            let ids = synthetic_ids(n, vocab);
+            let mut times = Vec::new();
+            for _ in 0..o.reps.max(1) {
+                let t = Instant::now();
+                fill(&mut cache, &ids)?;
+                times.push(t.elapsed().as_secs_f64());
+            }
+            let t = median(times);
+            println!("| {n} | {:.0} | {:.0} |", t * 1e3, n as f64 / t);
+        }
+        return Ok(());
+    }
+    println!("| ctx | k | ms/forward | vs k=1 | ms/token |");
+    println!("|---:|---:|---:|---:|---:|");
+    for &ctx in &o.ns {
+        let ids = synthetic_ids(ctx + max_k, vocab);
+        fill(&mut cache, &ids[..ctx])?;
+        let mut base = None;
+        for &k in &o.ks {
+            let draft = &ids[ctx..ctx + k];
+            let mut times = Vec::new();
+            for r in 0..o.reps.max(1) + 2 {
+                cache.truncate(ctx);
+                let t = Instant::now();
+                let logits = model.forward(draft, &mut cache, true)?;
+                let dt = t.elapsed().as_secs_f64();
+                anyhow::ensure!(logits.len() == k * vocab);
+                if r >= 2 {
+                    times.push(dt);
+                }
+            }
+            let ms = median(times) * 1e3;
+            let b = *base.get_or_insert(ms);
+            println!(
+                "| {ctx} | {k} | {ms:.2} | {:.2} | {:.2} |",
+                ms / b,
+                ms / k as f64
+            );
+        }
+    }
+    Ok(())
 }
 
 fn argmax(v: &[f32]) -> u32 {
