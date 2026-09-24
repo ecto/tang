@@ -14,7 +14,10 @@ model = AutoModelForCausalLM.from_pretrained(model_dir, torch_dtype=torch.float3
 with torch.no_grad():
     ref = model(torch.tensor([ids])).logits[0]
 
-out = subprocess.run([binary, "logits", model_dir, *map(str, ids)], capture_output=True, text=True, check=True)
+# STEP=1 feeds tokens one at a time (the decode kernels) instead of one prefill.
+import os
+cmd = "logits-step" if os.environ.get("STEP") else "logits"
+out = subprocess.run([binary, cmd, model_dir, *map(str, ids)], capture_output=True, text=True, check=True)
 got = torch.tensor(json.loads(out.stdout))
 assert got.shape == ref.shape, (got.shape, ref.shape)
 
