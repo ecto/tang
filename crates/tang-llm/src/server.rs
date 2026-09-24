@@ -66,6 +66,14 @@ where
         for job in rx {
             let tx = job.tx.clone();
             let result = engine.complete(&job.req, |p| tx.send(Out::Piece(p)).is_ok());
+            if let Ok((_, u)) = &result {
+                if engine.speculation().is_some() {
+                    eprintln!(
+                        "tang-llm: {} tokens at {:.1} tok/s, drafts {}/{} accepted",
+                        u.completion_tokens, u.decode_tok_s, u.accepted_tokens, u.draft_tokens
+                    );
+                }
+            }
             let _ = match result {
                 Ok((finish, usage)) => job.tx.send(Out::Done(finish, usage)),
                 Err(e) => job.tx.send(Out::Error(format!("{e:#}"))),
@@ -247,6 +255,8 @@ mod tests {
             reasoning_tokens: 0,
             prefill_tok_s: 0.0,
             decode_tok_s: 0.0,
+            draft_tokens: 0,
+            accepted_tokens: 0,
         };
         tx.send(Out::Done(Finish::ToolCalls, usage)).unwrap();
         rx
@@ -301,7 +311,8 @@ mod tests {
     }
 }
 
-fn parse(body: &Value) -> Result<Request, String> {
+/// A chat completion body as an engine request.
+pub fn parse(body: &Value) -> Result<Request, String> {
     let messages = body
         .get("messages")
         .filter(|m| m.is_array())
@@ -377,7 +388,13 @@ fn usage_json(u: &Usage) -> Value {
         "total_tokens": u.prompt_tokens + u.completion_tokens,
         "prompt_tokens_details": { "cached_tokens": u.cached_tokens },
         "completion_tokens_details": { "reasoning_tokens": u.reasoning_tokens },
-        "timings": { "prompt_per_second": u.prefill_tok_s, "predicted_per_second": u.decode_tok_s },
+        // llama.cpp's names for speculative decoding stats.
+        "timings": {
+            "prompt_per_second": u.prefill_tok_s,
+            "predicted_per_second": u.decode_tok_s,
+            "draft_n": u.draft_tokens,
+            "draft_n_accepted": u.accepted_tokens,
+        },
     })
 }
 

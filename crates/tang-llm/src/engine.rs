@@ -2,6 +2,7 @@
 //! reusing the KV cache for whatever prefix the new prompt shares with the previous one.
 
 use crate::chat::{Parser, Piece, Template};
+use crate::draft::{Calibration, CostModel, DraftConfig, Global, Session};
 use crate::model::{Cache, Dtype, Model};
 use crate::sample::{Sampler, Sampling};
 use anyhow::{anyhow, Context, Result};
@@ -48,6 +49,17 @@ pub struct Usage {
     pub reasoning_tokens: usize,
     pub prefill_tok_s: f64,
     pub decode_tok_s: f64,
+    /// Speculative decoding: draft tokens verified, and how many of them were kept.
+    pub draft_tokens: usize,
+    pub accepted_tokens: usize,
+}
+
+/// Speculative decoding state that outlives a request.
+pub struct Speculation {
+    pub cfg: DraftConfig,
+    pub global: Global,
+    pub calib: Calibration,
+    pub cost: CostModel,
 }
 
 pub struct Engine<D: ComputeDevice> {
@@ -63,6 +75,12 @@ pub struct Engine<D: ComputeDevice> {
     think_tags: Option<(u32, u32)>,
     /// What a spent thinking budget appends: a wrap-up sentence, `</think>`, a blank line.
     wrap_up: Vec<u32>,
+    /// Suffix drafting with verification, when on.
+    spec: Option<Speculation>,
+    /// The last request's prompt and completion tokens (for offline drafting studies).
+    last: (Vec<u32>, Vec<u32>),
+    /// Decode forwards so far by width: (count, seconds).
+    pub forwards: Vec<(usize, f64)>,
 }
 
 /// Qwen3's suggested way to end reasoning early: say so, then close the block.
@@ -176,7 +194,50 @@ impl<D: ComputeDevice> Engine<D> {
             eos,
             think_tags,
             wrap_up,
+            spec: None,
+            last: (Vec::new(), Vec::new()),
+            forwards: vec![(0, 0.0); 65],
         })
+    }
+
+    /// Turn speculative decoding on (with these settings) or off. Outputs don't change.
+    pub fn set_speculation(&mut self, cfg: Option<DraftConfig>) {
+        self.spec = cfg.map(|cfg| Speculation {
+            global: Global::new(cfg.global_tokens, cfg.store.clone()),
+            calib: Calibration::default(),
+            cost: CostModel::new(cfg.max_draft + 1),
+            cfg,
+        });
+    }
+
+    pub fn speculation(&self) -> Option<&Speculation> {
+        self.spec.as_ref()
+    }
+
+    /// Take the speculation state out (decoding plainly until it's put back), keeping what it
+    /// has learned.
+    pub fn take_speculation(&mut self) -> Option<Speculation> {
+        self.spec.take()
+    }
+
+    pub fn put_speculation(&mut self, spec: Option<Speculation>) {
+        self.spec = spec;
+    }
+
+    /// The last request's prompt and completion tokens.
+    pub fn last_tokens(&self) -> (&[u32], &[u32]) {
+        (&self.last.0, &self.last.1)
+    }
+
+    /// Forget the KV cache (the next request prefills from scratch).
+    pub fn reset(&mut self) {
+        self.cache.truncate(0);
+        self.cache_images.clear();
+    }
+
+    /// Tokens whose keys and values are in the cache.
+    pub fn cached_tokens(&self) -> &[u32] {
+        &self.cache.tokens
     }
 
     pub fn context_window(&self) -> usize {
@@ -310,20 +371,61 @@ impl<D: ComputeDevice> Engine<D> {
             true
         };
 
+        // Speculation: each forward feeds the new token(s) plus a draft, and returns logits for
+        // every draft position. Every token is still sampled from the target's logits in order,
+        // with the same sampler state, so the output is what plain decoding would produce; a
+        // draft token only saves a forward when it equals the sampled token.
+        let mut sess = self
+            .spec
+            .as_ref()
+            .map(|s| {
+                let cost = s.cost.table(&s.cfg, s.cfg.max_draft + 1);
+                Session::new(&s.cfg, &s.global, s.calib.clone(), cost, &ids)
+            });
+        // Decode forwards timed by width, for the cost model and stats.
+        let mut timed: Vec<(usize, f64)> = Vec::new();
+        let vocab = self.model.cfg.vocab_size;
+        let max_ctx = self.model.max_ctx();
+        // Logits rows from the last forward: row r follows the fed tokens and draft[..r].
+        let mut rows = logits;
+        let mut draft = crate::draft::Draft::default();
+        let mut row = 0usize;
+        // Draft tokens in the cache that aren't accepted yet.
+        let mut pending = 0usize;
+        let (mut drafted, mut accepted) = (0usize, 0usize);
+
         while out.len() < limit {
-            let next = sampler.sample(&logits);
+            let next = sampler.sample(&rows[row * vocab..(row + 1) * vocab]);
+            let hit = draft.tokens.get(row) == Some(&next);
+            if row < draft.tokens.len() {
+                if let Some(s) = sess.as_mut() {
+                    s.calib.observe(draft.match_len, draft.shares[row], hit);
+                }
+            }
+            if hit {
+                accepted += 1;
+                pending -= 1;
+            }
             if self.eos.contains(&next) {
                 finish = Finish::Stop;
                 break;
             }
             out.push(next);
+            // What the next forward must feed (a hit is already in the cache).
+            let mut fed = if hit { vec![] } else { vec![next] };
             // Out of thinking budget: write the wrap-up and `</think>` for the model (into the
             // KV cache like its own tokens, and streamed as reasoning), then let it answer.
-            let mut fed = vec![next];
-            if think.step(next) && out.len() + self.wrap_up.len() < limit {
+            let wrap = think.step(next) && out.len() + self.wrap_up.len() < limit;
+            if wrap {
                 out.extend(&self.wrap_up);
                 fed.extend(&self.wrap_up);
                 think.closed(self.wrap_up.len());
+            }
+            if let Some(s) = sess.as_mut() {
+                let n = out.len() - if wrap { self.wrap_up.len() } else { 0 };
+                for &tok in &out[n - 1..] {
+                    s.push(tok);
+                }
             }
             // Incremental detokenization: decode a small window and emit what's new, holding
             // back incomplete UTF-8.
@@ -351,24 +453,76 @@ impl<D: ComputeDevice> Engine<D> {
                     break;
                 }
             }
-            logits = self.model.forward(&fed, &mut self.cache, false)?;
+            if fed.is_empty() {
+                // The draft was right: the next position's logits are already here.
+                row += 1;
+                continue;
+            }
+            if out.len() >= limit {
+                break;
+            }
+            // Drop the rejected rest of the draft from the cache.
+            self.cache.truncate(self.cache.len - pending);
+            // A new draft, unless the wrap-up was just forced in (don't draft across it).
+            draft = match sess.as_ref() {
+                Some(s) if !wrap => {
+                    let room = (limit - out.len())
+                        .min(max_ctx.saturating_sub(self.cache.len + fed.len()));
+                    s.propose(room)
+                }
+                _ => crate::draft::Draft::default(),
+            };
+            let k = draft.tokens.len();
+            let m = fed.len();
+            fed.extend(&draft.tokens);
+            let tf = Instant::now();
+            rows = self.model.forward(&fed, &mut self.cache, k > 0)?;
+            if m == 1 {
+                timed.push((1 + k, tf.elapsed().as_secs_f64()));
+            }
+            if k > 0 {
+                rows.drain(..(m - 1) * vocab);
+            }
+            row = 0;
+            pending = k;
+            drafted += k;
         }
+        // Leave only accepted tokens in the cache.
+        self.cache.truncate(self.cache.len - pending);
         if finish != Finish::Cancelled {
             deliver(parser.finish(), &mut tool_calls);
             if tool_calls > 0 && finish == Finish::Stop {
                 finish = Finish::ToolCalls;
             }
         }
+        let calib = sess.map(|s| s.calib);
+        for &(w, secs) in &timed {
+            if let Some(slot) = self.forwards.get_mut(w) {
+                slot.0 += 1;
+                slot.1 += secs;
+            }
+        }
+        if let (Some(calib), Some(spec)) = (calib, self.spec.as_mut()) {
+            spec.calib = calib;
+            for &(w, secs) in &timed {
+                spec.cost.observe(w, secs);
+            }
+            spec.global.push(&out);
+        }
         let decode_s = t.elapsed().as_secs_f64();
+        let prompt_tokens = ids.len();
+        self.last = (ids, out.clone());
         Ok((
             finish,
             Usage {
-                prompt_tokens: ids.len(),
+                prompt_tokens,
                 cached_tokens: reuse,
                 completion_tokens: out.len(),
                 reasoning_tokens: think.reasoning,
-                prefill_tok_s: (ids.len() - reuse) as f64 / prefill_s.max(1e-9),
+                prefill_tok_s: (prompt_tokens - reuse) as f64 / prefill_s.max(1e-9),
                 decode_tok_s: out.len() as f64 / decode_s.max(1e-9),
+                draft_tokens: drafted,
+                accepted_tokens: accepted,
             },
         ))
     }
