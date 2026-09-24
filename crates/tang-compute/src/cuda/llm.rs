@@ -1147,6 +1147,16 @@ mod tests {
                 line += &format!(" m{m} {us:.0}");
             }
             eprintln!("{line}");
+            let wb = g.upload_bf16(&bf16_bits(&vals(n * kk, 5, 1.0)));
+            let mut line = format!("bf16 linear {kk:>5}x{n:>5} (us):");
+            for m in [1, 2, 4, 8, 9, 16, 32] {
+                let x = g.upload(&vals(m * kk, 4, 1.0));
+                let us = time(&mut || {
+                    g.linear(&x, &wb, m, kk, n);
+                });
+                line += &format!(" m{m} {us:.0}");
+            }
+            eprintln!("{line}");
         }
     }
 

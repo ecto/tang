@@ -634,6 +634,7 @@ kernel void NAME(                                                               
     attn_multi_body<R, BK, DMAX, NW>(Q, K, V, P, params, Qs, KVs, Ps, tg, tid, warp, lane); \
 }
 
+ATTN_MULTI(attn_multi_r4, 4, 32, 128, 4)
 ATTN_MULTI(attn_multi_r8, 8, 32, 128, 8)
 ATTN_MULTI(attn_multi_r16, 16, 32, 128, 8)
 ATTN_MULTI(attn_multi_r32, 32, 16, 128, 8)
@@ -764,14 +765,14 @@ kernel void gemv_q4_rows(
 // and shared by all rows, X is staged beside it, and each thread's global loads for the steps
 // ahead (QP of them) are already in flight while the current step multiplies.
 // With a K split (grid y > 1) each split writes its own [M, N] slice for `sum_splits`.
-// Needs K % 32 == 0, group % 32 == 0. params: [M, K, N, group, steps per split].
+// Needs K % 32 == 0 (and group % 32 == 0 for 4-bit). params: [M, K, N, group, steps per split].
 // Dispatch: threadgroups (ceil(N / 128), splits), 256 threads.
 #define QS_BN 128
 #define QS_BK 32
 #define QS_LD 36
 #define QP 2
 
-template <int RB>
+template <int RB, bool Q4>
 inline void qmm_small_body(
     device const float* X, device const uint* W, device const ushort* S, device const ushort* B,
     device float* Y, uint M, uint K, uint N, uint group, uint k_steps, uint2 tg, uint tid, uint sg,
@@ -787,15 +788,23 @@ inline void qmm_small_body(
     // X loader: rows tid / 32 + 8 i, column tid % 32.
     uint xk = tid & 31, xr = tid >> 5;
 
-    uint2 wq[QP];
+    // Q4: 16 nibbles in wq[.][0].xy with their group's scale and bias; bf16: 16 values in
+    // wq[.][0..2] (low half first).
+    uint4 wq[QP][2];
     float xv[QP][RB], wsc[QP], wbi[QP];
     auto fetch = [&](uint slot, uint st) {
         uint k0 = (st0 + st) * QS_BK;
         bool ok = wn < N && st < steps;
-        wq[slot] = ok ? *(device const uint2*)(W + (ulong)wn * words + k0 / 8 + part * 2) : uint2(0);
-        uint g = wn * G + (k0 + part * 16) / group;
-        wsc[slot] = ok ? bf(S[g]) : 0.0f;
-        wbi[slot] = ok ? bf(B[g]) : 0.0f;
+        if (Q4) {
+            wq[slot][0].xy = ok ? *(device const uint2*)(W + (ulong)wn * words + k0 / 8 + part * 2) : uint2(0);
+            uint g = wn * G + (k0 + part * 16) / group;
+            wsc[slot] = ok ? bf(S[g]) : 0.0f;
+            wbi[slot] = ok ? bf(B[g]) : 0.0f;
+        } else {
+            device const uint4* p = (device const uint4*)(W + ((ulong)wn * K + k0 + part * 16) / 2);
+            wq[slot][0] = ok ? p[0] : uint4(0);
+            wq[slot][1] = ok ? p[1] : uint4(0);
+        }
         for (int i = 0; i < RB; i++) {
             uint r = xr + 8 * i;
             xv[slot][i] = (r < M && st < steps) ? X[(ulong)r * K + k0 + xk] : 0.0f;
@@ -808,13 +817,21 @@ inline void qmm_small_body(
     for (uint st = 0; st < steps; st++) {
         uint slot = st % QP;
         {
-            float sc = wsc[slot], bi = wbi[slot];
-            uint2 q = wq[slot];
             threadgroup float4* dst = (threadgroup float4*)(Ws + wc * QS_LD + part * 16);
-            dst[0] = float4(float(q.x & 0xf), float((q.x >> 4) & 0xf), float((q.x >> 8) & 0xf), float((q.x >> 12) & 0xf)) * sc + bi;
-            dst[1] = float4(float((q.x >> 16) & 0xf), float((q.x >> 20) & 0xf), float((q.x >> 24) & 0xf), float(q.x >> 28)) * sc + bi;
-            dst[2] = float4(float(q.y & 0xf), float((q.y >> 4) & 0xf), float((q.y >> 8) & 0xf), float((q.y >> 12) & 0xf)) * sc + bi;
-            dst[3] = float4(float((q.y >> 16) & 0xf), float((q.y >> 20) & 0xf), float((q.y >> 24) & 0xf), float(q.y >> 28)) * sc + bi;
+            if (Q4) {
+                float sc = wsc[slot], bi = wbi[slot];
+                uint2 q = wq[slot][0].xy;
+                dst[0] = float4(float(q.x & 0xf), float((q.x >> 4) & 0xf), float((q.x >> 8) & 0xf), float((q.x >> 12) & 0xf)) * sc + bi;
+                dst[1] = float4(float((q.x >> 16) & 0xf), float((q.x >> 20) & 0xf), float((q.x >> 24) & 0xf), float(q.x >> 28)) * sc + bi;
+                dst[2] = float4(float(q.y & 0xf), float((q.y >> 4) & 0xf), float((q.y >> 8) & 0xf), float((q.y >> 12) & 0xf)) * sc + bi;
+                dst[3] = float4(float((q.y >> 16) & 0xf), float((q.y >> 20) & 0xf), float((q.y >> 24) & 0xf), float(q.y >> 28)) * sc + bi;
+            } else {
+                for (int h = 0; h < 2; h++) {
+                    uint4 u = wq[slot][h];
+                    dst[2 * h] = float4(bf(u.x & 0xffff), bf(u.x >> 16), bf(u.y & 0xffff), bf(u.y >> 16));
+                    dst[2 * h + 1] = float4(bf(u.z & 0xffff), bf(u.z >> 16), bf(u.w & 0xffff), bf(u.w >> 16));
+                }
+            }
             for (int i = 0; i < RB; i++) Xs[(xr + 8 * i) * QS_LD + xk] = xv[slot][i];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -844,7 +861,7 @@ inline void qmm_small_body(
     }
 }
 
-#define QMM_SMALL(NAME, RB)                                                                   \
+#define QMM_SMALL(NAME, RB, Q4)                                                               \
 kernel void NAME(                                                                             \
     device const float* X [[buffer(0)]], device const uint* W [[buffer(1)]],                  \
     device const ushort* S [[buffer(2)]], device const ushort* B [[buffer(3)]],               \
@@ -854,13 +871,17 @@ kernel void NAME(                                                               
 {                                                                                             \
     threadgroup float Ws[QS_BN * QS_LD];                                                      \
     threadgroup float Xs[RB * 8 * QS_LD];                                                     \
-    qmm_small_body<RB>(X, W, S, B, Y, params[0], params[1], params[2], params[3], params[4],  \
+    qmm_small_body<RB, Q4>(X, W, S, B, Y, params[0], params[1], params[2], params[3], params[4],  \
                        tg, tid, sg, Ws, Xs);                                                  \
 }
 
-QMM_SMALL(qmm_small_8, 1)
-QMM_SMALL(qmm_small_16, 2)
-QMM_SMALL(qmm_small_32, 4)
+QMM_SMALL(qmm_small_8, 1, true)
+QMM_SMALL(qmm_small_16, 2, true)
+QMM_SMALL(qmm_small_32, 4, true)
+// bf16 weights (`W` is the bf16 matrix; S and B are unused).
+QMM_SMALL(gemm_small_bf16_8, 1, false)
+QMM_SMALL(gemm_small_bf16_16, 2, false)
+QMM_SMALL(gemm_small_bf16_32, 4, false)
 
 // Y[i] = sum over splits of P[s * n + i]. params: [n, splits].
 kernel void sum_splits(

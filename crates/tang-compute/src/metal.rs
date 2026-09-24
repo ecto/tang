@@ -327,6 +327,63 @@ impl MetalDevice {
         }
     }
 
+    /// `x · wᵀ` for 2..=32 rows over 4-bit or bf16 weights with `qmm_small_*` /
+    /// `gemm_small_bf16_*`: the weights are read once for all the rows, and K is split when the
+    /// columns alone give too few threadgroups.
+    fn gemm_small(
+        &self,
+        x: &MetalBuffer,
+        w: &MetalBuffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> MetalBuffer {
+        let out = self.make_buffer_empty(m * n * 4);
+        let (group, (so, bo)) = match w.kind {
+            Kind::Q4 { group } => (group, w.q4_offsets(group as usize)),
+            _ => (32, (0, 0)),
+        };
+        let name = match (w.kind == Kind::Bf16, m) {
+            (false, ..=8) => "qmm_small_8",
+            (false, ..=16) => "qmm_small_16",
+            (false, _) => "qmm_small_32",
+            (true, ..=8) => "gemm_small_bf16_8",
+            (true, ..=16) => "gemm_small_bf16_16",
+            (true, _) => "gemm_small_bf16_32",
+        };
+        let pipeline = self.get_pipeline(llm_msl::Q4_MSL, name);
+        // Each split keeps at least 8 steps of 32.
+        let (col_groups, steps) = (n.div_ceil(128), k / 32);
+        let want = SMALL_GEMM_GROUPS.div_ceil(col_groups);
+        let per = steps.div_ceil(want.clamp(1, (steps / 8).max(1)));
+        let splits = steps.div_ceil(per);
+        let params = self.make_buffer_u32(&[m as u32, k as u32, n as u32, group, per as u32]);
+        let partial = (splits > 1).then(|| self.make_buffer_empty(splits * m * n * 4));
+        self.with_encoder(|enc| {
+            enc.set_compute_pipeline_state(&pipeline);
+            enc.set_buffer(0, Some(&x.buffer), 0);
+            enc.set_buffer(1, Some(&w.buffer), 0);
+            enc.set_buffer(2, Some(&w.buffer), so);
+            enc.set_buffer(3, Some(&w.buffer), bo);
+            enc.set_buffer(4, Some(partial.as_ref().unwrap_or(&out)), 0);
+            enc.set_buffer(5, Some(&params), 0);
+            enc.dispatch_thread_groups(
+                MTLSize::new(col_groups as u64, splits as u64, 1),
+                MTLSize::new(256, 1, 1),
+            );
+        });
+        if let Some(p) = partial {
+            let sum = self.get_pipeline(llm_msl::Q4_MSL, "sum_splits");
+            let sp = self.make_buffer_u32(&[(m * n) as u32, splits as u32]);
+            self.dispatch(&sum, &[&p, &out, &sp], (m * n) as u64);
+        }
+        MetalBuffer {
+            buffer: out,
+            len: m * n,
+            kind: Kind::F32,
+        }
+    }
+
     /// Split-KV attention for a few queries (`llm_msl::FLASH_MULTI_MSL`, then
     /// `attn_combine`): threadgroups over (KV head, key split, group of (query, head) rows),
     /// each reading its split's keys once for all the rows.
@@ -347,6 +404,7 @@ impl MetalDevice {
         let gqa_rows = q_len * (n_heads / n_kv);
         let (name, rows, tile, threads) = match (d <= 128, gqa_rows) {
             (false, _) => ("attn_multi_d256", 8, 16, 128),
+            (true, ..=4) => ("attn_multi_r4", 4, 32, 128),
             (true, ..=8) => ("attn_multi_r8", 8, 32, 256),
             (true, ..=16) => ("attn_multi_r16", 16, 32, 256),
             _ => ("attn_multi_r32", 32, 16, 256),
@@ -1771,45 +1829,7 @@ kernel void bias_add(
                 };
             }
             if (2..=SMALL_GEMM_ROWS).contains(&m) && k % 32 == 0 {
-                let name = match m {
-                    ..=8 => "qmm_small_8",
-                    ..=16 => "qmm_small_16",
-                    _ => "qmm_small_32",
-                };
-                let pipeline = self.get_pipeline(llm_msl::Q4_MSL, name);
-                let (so, bo) = w.q4_offsets(group as usize);
-                // Split K when the columns alone give too few threadgroups; each split keeps
-                // at least 8 steps.
-                let (col_groups, steps) = (n.div_ceil(128), k / 32);
-                let want = SMALL_GEMM_GROUPS.div_ceil(col_groups);
-                let per = steps.div_ceil(want.clamp(1, (steps / 8).max(1)));
-                let splits = steps.div_ceil(per);
-                let params =
-                    self.make_buffer_u32(&[m as u32, k as u32, n as u32, group, per as u32]);
-                let partial = (splits > 1).then(|| self.make_buffer_empty(splits * m * n * 4));
-                self.with_encoder(|enc| {
-                    enc.set_compute_pipeline_state(&pipeline);
-                    enc.set_buffer(0, Some(&x.buffer), 0);
-                    enc.set_buffer(1, Some(&w.buffer), 0);
-                    enc.set_buffer(2, Some(&w.buffer), so);
-                    enc.set_buffer(3, Some(&w.buffer), bo);
-                    enc.set_buffer(4, Some(partial.as_ref().unwrap_or(&out)), 0);
-                    enc.set_buffer(5, Some(&params), 0);
-                    enc.dispatch_thread_groups(
-                        MTLSize::new(col_groups as u64, splits as u64, 1),
-                        MTLSize::new(256, 1, 1),
-                    );
-                });
-                if let Some(p) = partial {
-                    let sum = self.get_pipeline(llm_msl::Q4_MSL, "sum_splits");
-                    let sp = self.make_buffer_u32(&[(m * n) as u32, splits as u32]);
-                    self.dispatch(&sum, &[&p, &out, &sp], (m * n) as u64);
-                }
-                return MetalBuffer {
-                    buffer: out,
-                    len: m * n,
-                    kind: Kind::F32,
-                };
+                return self.gemm_small(x, w, m, k, n);
             }
             let params = self.make_buffer_u32(&[m as u32, k as u32, n as u32, group]);
             let (so, bo) = w.q4_offsets(group as usize);
@@ -1837,6 +1857,9 @@ kernel void bias_add(
                 len: m * n,
                 kind: Kind::F32,
             };
+        }
+        if w.kind == Kind::Bf16 && (5..=SMALL_GEMM_ROWS).contains(&m) && k % 32 == 0 {
+            return self.gemm_small(x, w, m, k, n);
         }
         if w.kind == Kind::Bf16 {
             let out = self.make_buffer_empty(m * n * 4);
