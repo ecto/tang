@@ -1,8 +1,9 @@
 //! `tang-llm logits <model-dir> <token ids...>` — dump logits for every position as JSON (for
 //! checking against a reference implementation).
 //! `tang-llm generate <model-dir> <token ids...> [-n N]` — greedy decode, print ids and speed.
-//! `tang-llm serve <model-dir | hf-repo-id> [--host H] [--port P] [--ctx N]` — OpenAI-compatible
-//! server (on 127.0.0.1 unless `--host` says otherwise).
+//! `tang-llm serve <model-dir | hf-repo-id> [--host H] [--port P] [--ctx N] [--api-key-file F]`
+//! — OpenAI-compatible server (on 127.0.0.1 unless `--host` says otherwise). With a key (from
+//! the file, or `TANG_API_KEY`), requests need `Authorization: Bearer <key>`.
 //! `tang-llm image-features <model-dir> <pixels.f32>` — the projector's output for an image
 //! (`[896, 896, 3]` f32, normalized), as JSON.
 //! `tang-llm logits-image <model-dir> <pixels.f32> <token ids...> [--last N]` — logits with the
@@ -240,24 +241,34 @@ fn run<D: ComputeDevice>(
 fn serve(backend: Backend, args: &[String]) -> Result<()> {
     let spec = args
         .first()
-        .context("usage: tang-llm serve <model> [--host H] [--port P] [--ctx N] [--f32 | --q4]")?
+        .context("usage: tang-llm serve <model> [--host H] [--port P] [--ctx N] [--api-key-file F] [--f32 | --q4]")?
         .clone();
     let (mut port, mut ctx, mut dtype) = (8911u16, 32_768usize, Dtype::Bf16);
     let mut host = "127.0.0.1".to_string();
+    // Never on the command line itself, where `ps` would show it.
+    let mut key = std::env::var("TANG_API_KEY").ok();
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--host" => host = it.next().context("--host H")?.clone(),
             "--port" => port = it.next().context("--port P")?.parse()?,
             "--ctx" => ctx = it.next().context("--ctx N")?.parse()?,
+            "--api-key-file" => {
+                let path = it.next().context("--api-key-file F")?;
+                key = Some(std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?);
+            }
             "--f32" => dtype = Dtype::F32,
             "--q4" => dtype = Dtype::Q4,
             other => bail!("unknown option {other}"),
         }
     }
+    let key = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
     let dir = tang_llm::resolve_model(&spec)?;
     let addr = format!("{host}:{port}");
-    on_backend!(backend, serve_on(&addr, spec, dir, ctx, dtype))
+    if key.is_none() && !host.starts_with("127.") && host != "localhost" {
+        eprintln!("tang-llm: warning: listening on {host} without an API key; anyone who can reach it can use it");
+    }
+    on_backend!(backend, serve_on(&addr, spec, dir, ctx, dtype, key))
 }
 
 fn serve_on<D: ComputeDevice + 'static>(
@@ -267,8 +278,9 @@ fn serve_on<D: ComputeDevice + 'static>(
     dir: PathBuf,
     ctx: usize,
     dtype: Dtype,
+    key: Option<String>,
 ) -> Result<()> {
-    tang_llm::server::serve(addr, name, move || {
+    tang_llm::server::serve(addr, name, key, move || {
         let t = Instant::now();
         let e = Engine::load(make()?, &dir, ctx, dtype)?;
         eprintln!(

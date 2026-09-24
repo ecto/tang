@@ -2,12 +2,15 @@
 //! and llama.cpp-style `/props` so clients can discover the context window.
 //!
 //! The model lives on one worker thread (GPU state isn't shareable); requests queue for it.
+//!
+//! With an API key, every route but `/health` wants `Authorization: Bearer <key>`.
 
 use crate::chat::Piece;
 use crate::engine::{Engine, Finish, Request, Usage};
 use crate::sample::Sampling;
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{Request as HttpRequest, State};
+use axum::http::{header, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -41,8 +44,8 @@ struct App {
 }
 
 /// Serve `engine` on `addr` until the process exits. `load` runs on the worker thread (so the
-/// GPU device is created where it's used).
-pub fn serve<D, F>(addr: &str, model: String, load: F) -> anyhow::Result<()>
+/// GPU device is created where it's used). With `key`, requests must present it.
+pub fn serve<D, F>(addr: &str, model: String, key: Option<String>, load: F) -> anyhow::Result<()>
 where
     D: ComputeDevice + 'static,
     F: FnOnce() -> anyhow::Result<Engine<D>> + Send + 'static,
@@ -77,12 +80,21 @@ where
         ctx,
         vision,
     };
-    let router = Router::new()
+    let api = Router::new()
         .route("/v1/chat/completions", post(chat))
         .route("/v1/models", get(models))
         .route("/props", get(props))
-        .route("/health", get(|| async { "ok" }))
         .with_state(app);
+    let api = match key {
+        Some(key) => api.layer(middleware::from_fn_with_state(
+            std::sync::Arc::new(key),
+            require_key,
+        )),
+        None => api,
+    };
+    let router = Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .merge(api);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -92,6 +104,29 @@ where
         axum::serve(listener, router).await?;
         anyhow::Ok(())
     })
+}
+
+/// Turn away requests without the key (compared in constant time).
+async fn require_key(
+    State(key): State<std::sync::Arc<String>>,
+    req: HttpRequest,
+    next: Next,
+) -> Response {
+    let given = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if same(given.as_bytes(), key.as_bytes()) {
+        return next.run(req).await;
+    }
+    let body = json!({"error": {"message": "missing or wrong API key", "type": "invalid_request_error"}});
+    (StatusCode::UNAUTHORIZED, Json(body)).into_response()
+}
+
+fn same(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 async fn models(State(app): State<App>) -> Json<Value> {
