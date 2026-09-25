@@ -19,6 +19,9 @@ pub mod backward_msl;
 #[cfg(feature = "metal")]
 pub mod adamw_msl;
 
+#[cfg(feature = "metal")]
+pub mod llm_msl;
+
 #[cfg(feature = "cuda")]
 pub mod matmul_cuda;
 
@@ -39,3 +42,6 @@ pub mod util_cuda;
 
 #[cfg(feature = "cuda")]
 pub mod noise_cuda;
+
+#[cfg(feature = "cuda")]
+pub mod llm_cuda;

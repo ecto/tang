@@ -9,7 +9,7 @@ use metal::objc::rc::autoreleasepool;
 use metal::*;
 
 use crate::device::{ComputeBuffer, ComputeDevice};
-use crate::kernels::{adamw_msl, attention_msl, backward_msl, matmul_msl, reduce_msl};
+use crate::kernels::{adamw_msl, attention_msl, backward_msl, llm_msl, matmul_msl, reduce_msl};
 use tang_expr::codegen::Dialect;
 use tang_expr::node::ExprId;
 use tang_expr::trace;
@@ -17,7 +17,31 @@ use tang_expr::trace;
 /// Metal buffer wrapping a `metal::Buffer`.
 pub struct MetalBuffer {
     buffer: metal::Buffer,
+    /// Element count.
     len: usize,
+    /// Element format. Anything but `F32` is a read-only weight for `linear`/`embedding`.
+    kind: Kind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    F32,
+    Bf16,
+    /// 4-bit affine groups in MLX's layout: `w = scale * q + bias` per `group` consecutive
+    /// weights of a row. The buffer holds the packed nibbles (`[n, k/8]` u32, low nibble first),
+    /// then bf16 scales, then bf16 biases (each `[n, k/group]`). `len` is `n * k`.
+    Q4 {
+        group: u32,
+    },
+}
+
+impl MetalBuffer {
+    /// Byte offsets of the scales and biases in a `Q4` buffer.
+    fn q4_offsets(&self, group: usize) -> (u64, u64) {
+        let packed = self.len / 2;
+        let scales = self.len / group * 2;
+        (packed as u64, (packed + scales) as u64)
+    }
 }
 
 impl ComputeBuffer for MetalBuffer {
@@ -26,6 +50,29 @@ impl ComputeBuffer for MetalBuffer {
     }
 
     fn to_vec(&self) -> Vec<f32> {
+        if let Kind::Q4 { group } = self.kind {
+            let group = group as usize;
+            let base = self.buffer.contents() as *const u8;
+            let (so, bo) = self.q4_offsets(group);
+            let words = unsafe { std::slice::from_raw_parts(base as *const u32, self.len / 8) };
+            let bf = |off: u64, i: usize| unsafe {
+                f32::from_bits((*(base.add(off as usize) as *const u16).add(i) as u32) << 16)
+            };
+            return (0..self.len)
+                .map(|i| {
+                    let q = (words[i / 8] >> (4 * (i % 8))) & 0xf;
+                    bf(so, i / group) * q as f32 + bf(bo, i / group)
+                })
+                .collect();
+        }
+        if self.kind == Kind::Bf16 {
+            let ptr = self.buffer.contents() as *const u16;
+            let bits = unsafe { std::slice::from_raw_parts(ptr, self.len) };
+            return bits
+                .iter()
+                .map(|&b| f32::from_bits((b as u32) << 16))
+                .collect();
+        }
         let ptr = self.buffer.contents() as *const f32;
         let slice = unsafe { std::slice::from_raw_parts(ptr, self.len) };
         slice.to_vec()
@@ -39,6 +86,11 @@ pub struct MetalDevice {
     pipeline_cache: RefCell<HashMap<u64, ComputePipelineState>>,
     /// Active command buffer — accumulates work, committed on `sync()`.
     active_cb: RefCell<Option<CommandBuffer>>,
+    /// Open compute encoder on `active_cb`, reused across dispatches (dispatches in a serial
+    /// encoder run in order); closed before blits and on `sync()`.
+    active_enc: RefCell<Option<ComputeCommandEncoder>>,
+    /// Command buffers committed by `flush()` and not yet waited on.
+    in_flight: RefCell<Vec<CommandBuffer>>,
 }
 
 impl MetalDevice {
@@ -51,6 +103,8 @@ impl MetalDevice {
             queue,
             pipeline_cache: RefCell::new(HashMap::new()),
             active_cb: RefCell::new(None),
+            active_enc: RefCell::new(None),
+            in_flight: RefCell::new(Vec::new()),
         })
     }
 
@@ -119,16 +173,25 @@ impl MetalDevice {
         }
     }
 
-    /// Get a borrow of the active command buffer (must call ensure_cb first).
+    /// Encode into the open compute encoder, opening one if needed.
     fn with_encoder(&self, f: impl FnOnce(&ComputeCommandEncoderRef)) {
         self.ensure_cb();
         autoreleasepool(|| {
-            let cb_ref = self.active_cb.borrow();
-            let cmd = cb_ref.as_ref().unwrap();
-            let enc = cmd.new_compute_command_encoder();
-            f(enc);
-            enc.end_encoding();
+            let mut enc_ref = self.active_enc.borrow_mut();
+            if enc_ref.is_none() {
+                let cb_ref = self.active_cb.borrow();
+                let cmd = cb_ref.as_ref().unwrap();
+                *enc_ref = Some(cmd.new_compute_command_encoder().to_owned());
+            }
+            f(enc_ref.as_ref().unwrap());
         });
+    }
+
+    /// Close the open compute encoder (before a blit, or before committing).
+    fn end_compute(&self) {
+        if let Some(enc) = self.active_enc.borrow_mut().take() {
+            enc.end_encoding();
+        }
     }
 
     /// Dispatch a compute pipeline with given buffers.
@@ -166,6 +229,204 @@ impl MetalDevice {
                 MTLSize::new(tg_size.0, tg_size.1, 1),
             );
         });
+    }
+}
+
+impl MetalDevice {
+    /// Dispatch `groups` threadgroups of `threads` threads each.
+    fn dispatch_groups(
+        &self,
+        pipeline: &ComputePipelineState,
+        buffers: &[&metal::Buffer],
+        groups: (usize, usize),
+        threads: usize,
+    ) {
+        self.with_encoder(|enc| {
+            enc.set_compute_pipeline_state(pipeline);
+            for (i, buf) in buffers.iter().enumerate() {
+                enc.set_buffer(i as u64, Some(buf), 0);
+            }
+            enc.dispatch_thread_groups(
+                MTLSize::new(groups.0 as u64, groups.1 as u64, 1),
+                MTLSize::new(threads as u64, 1, 1),
+            );
+        });
+    }
+
+    fn copy_f32(
+        &self,
+        src: &metal::Buffer,
+        src_off: usize,
+        dst: &metal::Buffer,
+        dst_off: usize,
+        n: usize,
+    ) {
+        let pipeline = self.get_pipeline(llm_msl::COPY_MSL, "copy_f32");
+        let params = self.make_buffer_u32(&[src_off as u32, dst_off as u32, n as u32]);
+        self.dispatch(&pipeline, &[src, dst, &params], n as u64);
+    }
+
+    /// Tiled causal attention for prefill (`llm_msl::FLASH_PREFILL_MSL`). Query rows are
+    /// padded to a multiple of 32 and the padding is dropped from the output.
+    #[allow(clippy::too_many_arguments)]
+    fn flash_prefill(
+        &self,
+        q: &MetalBuffer,
+        k: &MetalBuffer,
+        v: &MetalBuffer,
+        cache_start: usize,
+        q_len: usize,
+        n_heads: usize,
+        n_kv: usize,
+        d: usize,
+        bidir: bool,
+    ) -> MetalBuffer {
+        let q_pad = q_len.next_multiple_of(32);
+        let width = n_heads * d;
+        let padded;
+        let qb = if q_pad == q_len {
+            q
+        } else {
+            let mut p = self.alloc(q_pad * width);
+            self.write_into(&mut p, 0, q);
+            padded = p;
+            &padded
+        };
+        let out = self.make_buffer_empty(q_pad * width * 4);
+        let params = self.make_buffer_u32(&[
+            cache_start as u32,
+            q_len as u32,
+            n_heads as u32,
+            n_kv as u32,
+            d as u32,
+            bidir as u32,
+        ]);
+        let pipeline = self.get_pipeline(llm_msl::FLASH_PREFILL_MSL, "attn_prefill");
+        self.with_encoder(|enc| {
+            enc.set_compute_pipeline_state(&pipeline);
+            for (i, b) in [&qb.buffer, &k.buffer, &v.buffer, &out, &params]
+                .iter()
+                .enumerate()
+            {
+                enc.set_buffer(i as u64, Some(b), 0);
+            }
+            enc.dispatch_thread_groups(
+                MTLSize::new((q_pad / 32) as u64, n_heads as u64, 1),
+                MTLSize::new(128, 1, 1),
+            );
+        });
+        let full = MetalBuffer {
+            buffer: out,
+            len: q_pad * width,
+            kind: Kind::F32,
+        };
+        if q_pad == q_len {
+            full
+        } else {
+            self.slice_buffer(&full, 0, q_len * width)
+        }
+    }
+
+    /// Split-KV attention (`llm_msl::FLASH_DECODE_MSL`). Decode splits the keys across up to 32
+    /// threadgroups per head; prefill already has a threadgroup per (query, head).
+    #[allow(clippy::too_many_arguments)]
+    fn flash_attention(
+        &self,
+        q: &MetalBuffer,
+        k: &MetalBuffer,
+        v: &MetalBuffer,
+        cache_start: usize,
+        q_len: usize,
+        n_heads: usize,
+        n_kv: usize,
+        d: usize,
+        window: usize,
+        bidir: bool,
+    ) -> MetalBuffer {
+        let longest = cache_start + q_len;
+        // Decode with a sliding window only needs the last `window` keys.
+        let base = if q_len == 1 && window > 0 {
+            longest.saturating_sub(window)
+        } else {
+            0
+        };
+        let span = longest - base;
+        // Short contexts: per-key simdgroup loop (lower fixed cost). Longer: lane-per-key.
+        let lane_keys = q_len == 1 && span >= 512;
+        let n_splits = match q_len {
+            1 if lane_keys => span.div_ceil(256).clamp(1, 64),
+            1 => span.div_ceil(256).clamp(1, 32),
+            _ => 1,
+        };
+        let split_len = if q_len == 1 {
+            span.div_ceil(n_splits)
+        } else {
+            longest
+        };
+        let params = self.make_buffer_u32(&[
+            cache_start as u32,
+            q_len as u32,
+            n_heads as u32,
+            n_kv as u32,
+            d as u32,
+            n_splits as u32,
+            split_len as u32,
+            window as u32,
+            base as u32,
+            bidir as u32,
+        ]);
+        let partial = self.make_buffer_empty(q_len * n_heads * n_splits * (d + 2) * 4);
+        let out = self.make_buffer_empty(q_len * n_heads * d * 4);
+        let p1 = self.get_pipeline(
+            llm_msl::FLASH_DECODE_MSL,
+            if lane_keys {
+                "attn_decode"
+            } else {
+                "attn_partial"
+            },
+        );
+        let grid1 = MTLSize::new(n_heads as u64, n_splits as u64, q_len as u64);
+        let p2 = self.get_pipeline(llm_msl::FLASH_DECODE_MSL, "attn_combine");
+        self.with_encoder(|enc| {
+            enc.set_compute_pipeline_state(&p1);
+            for (i, b) in [&q.buffer, &k.buffer, &v.buffer, &partial, &params]
+                .iter()
+                .enumerate()
+            {
+                enc.set_buffer(i as u64, Some(b), 0);
+            }
+            enc.dispatch_thread_groups(grid1, MTLSize::new(256, 1, 1));
+            enc.set_compute_pipeline_state(&p2);
+            for (i, b) in [&partial, &out, &params].iter().enumerate() {
+                enc.set_buffer(i as u64, Some(b), 0);
+            }
+            enc.dispatch_thread_groups(
+                MTLSize::new(n_heads as u64, q_len as u64, 1),
+                MTLSize::new(32, 1, 1),
+            );
+        });
+        MetalBuffer {
+            buffer: out,
+            len: q_len * n_heads * d,
+            kind: Kind::F32,
+        }
+    }
+
+    /// Elementwise `f(a[i], b[i])` with a native kernel from `llm_msl::ELEMENTWISE_MSL`.
+    fn binary(&self, a: &MetalBuffer, b: &MetalBuffer, numel: usize, kernel: &str) -> MetalBuffer {
+        let pipeline = self.get_pipeline(llm_msl::ELEMENTWISE_MSL, kernel);
+        let out = self.make_buffer_empty(numel * 4);
+        let params = self.make_buffer_u32(&[numel as u32]);
+        self.dispatch(
+            &pipeline,
+            &[&a.buffer, &b.buffer, &out, &params],
+            numel as u64,
+        );
+        MetalBuffer {
+            buffer: out,
+            len: numel,
+            kind: Kind::F32,
+        }
     }
 }
 
@@ -222,6 +483,45 @@ impl ComputeDevice for MetalDevice {
         MetalBuffer {
             buffer: self.make_buffer(data),
             len: data.len(),
+            kind: Kind::F32,
+        }
+    }
+
+    fn upload_bf16(&self, bits: &[u16]) -> MetalBuffer {
+        let buffer = self.device.new_buffer_with_data(
+            bits.as_ptr() as *const _,
+            (bits.len() * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        MetalBuffer {
+            buffer,
+            len: bits.len(),
+            kind: Kind::Bf16,
+        }
+    }
+
+    fn upload_q4(
+        &self,
+        packed: &[u32],
+        scales: &[u16],
+        biases: &[u16],
+        group: usize,
+    ) -> MetalBuffer {
+        let mut bytes: Vec<u8> = Vec::with_capacity(packed.len() * 4 + scales.len() * 4);
+        bytes.extend(packed.iter().flat_map(|w| w.to_le_bytes()));
+        bytes.extend(scales.iter().flat_map(|w| w.to_le_bytes()));
+        bytes.extend(biases.iter().flat_map(|w| w.to_le_bytes()));
+        let buffer = self.device.new_buffer_with_data(
+            bytes.as_ptr() as *const _,
+            bytes.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        MetalBuffer {
+            buffer,
+            len: packed.len() * 8,
+            kind: Kind::Q4 {
+                group: group as u32,
+            },
         }
     }
 
@@ -229,6 +529,7 @@ impl ComputeDevice for MetalDevice {
         MetalBuffer {
             buffer: self.make_buffer_u32(data),
             len: data.len(),
+            kind: Kind::F32,
         }
     }
 
@@ -236,6 +537,7 @@ impl ComputeDevice for MetalDevice {
         MetalBuffer {
             buffer: self.make_buffer_empty(len * 4),
             len,
+            kind: Kind::F32,
         }
     }
 
@@ -284,6 +586,7 @@ impl ComputeDevice for MetalDevice {
         MetalBuffer {
             buffer: output_buf,
             len: numel,
+            kind: Kind::F32,
         }
     }
 
@@ -328,6 +631,7 @@ impl ComputeDevice for MetalDevice {
         MetalBuffer {
             buffer: output_buf,
             len: m * n,
+            kind: Kind::F32,
         }
     }
 
@@ -356,6 +660,7 @@ impl ComputeDevice for MetalDevice {
             MetalBuffer {
                 buffer: output_buf,
                 len: m * n,
+                kind: Kind::F32,
             }
         } else {
             let b_t = self.transpose_2d(b, n, k);
@@ -388,6 +693,7 @@ impl ComputeDevice for MetalDevice {
             MetalBuffer {
                 buffer: output_buf,
                 len: m * n,
+                kind: Kind::F32,
             }
         } else {
             let a_t = self.transpose_2d(a, k, m);
@@ -471,6 +777,7 @@ impl ComputeDevice for MetalDevice {
         MetalBuffer {
             buffer: output_buf,
             len: data.len,
+            kind: Kind::F32,
         }
     }
 
@@ -502,6 +809,7 @@ impl ComputeDevice for MetalDevice {
         MetalBuffer {
             buffer: output_buf,
             len: data.len,
+            kind: Kind::F32,
         }
     }
 
@@ -512,6 +820,46 @@ impl ComputeDevice for MetalDevice {
         seq_len: usize,
         dim: usize,
     ) -> MetalBuffer {
+        if let Kind::Q4 { group } = weight.kind {
+            let pipeline = self.get_pipeline(llm_msl::Q4_MSL, "embedding_q4");
+            let out = self.make_buffer_empty(seq_len * dim * 4);
+            let params = self.make_buffer_u32(&[seq_len as u32, dim as u32, group]);
+            let (so, bo) = weight.q4_offsets(group as usize);
+            let total = (seq_len * dim) as u64;
+            self.with_encoder(|enc| {
+                enc.set_compute_pipeline_state(&pipeline);
+                enc.set_buffer(0, Some(&weight.buffer), 0);
+                enc.set_buffer(1, Some(&weight.buffer), so);
+                enc.set_buffer(2, Some(&weight.buffer), bo);
+                enc.set_buffer(3, Some(&ids.buffer), 0);
+                enc.set_buffer(4, Some(&out), 0);
+                enc.set_buffer(5, Some(&params), 0);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(total.div_ceil(256), 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+            });
+            return MetalBuffer {
+                buffer: out,
+                len: seq_len * dim,
+                kind: Kind::F32,
+            };
+        }
+        if weight.kind == Kind::Bf16 {
+            let pipeline = self.get_pipeline(llm_msl::BF16_MSL, "embedding_bf16");
+            let out = self.make_buffer_empty(seq_len * dim * 4);
+            let params = self.make_buffer_u32(&[seq_len as u32, dim as u32]);
+            self.dispatch(
+                &pipeline,
+                &[&weight.buffer, &ids.buffer, &out, &params],
+                (seq_len * dim) as u64,
+            );
+            return MetalBuffer {
+                buffer: out,
+                len: seq_len * dim,
+                kind: Kind::F32,
+            };
+        }
         // Simple MSL embedding kernel inline
         let src = r#"
 #include <metal_stdlib>
@@ -547,6 +895,7 @@ kernel void embedding(
         MetalBuffer {
             buffer: output_buf,
             len: seq_len * dim,
+            kind: Kind::F32,
         }
     }
 
@@ -598,6 +947,7 @@ kernel void embedding(
         MetalBuffer {
             buffer: output_buf,
             len: seq_len * total_dim,
+            kind: Kind::F32,
         }
     }
 
@@ -612,6 +962,41 @@ kernel void embedding(
         n_kv_heads: usize,
         head_dim: usize,
     ) -> MetalBuffer {
+        // Tiled prefill needs K/V readable to a 32-row boundary past the end.
+        let kv_rows_needed = (cache_start + q_len).next_multiple_of(32);
+        if q_len > 1
+            && head_dim % 8 == 0
+            && head_dim <= 128
+            && n_heads % n_kv_heads == 0
+            && k_cache.len >= kv_rows_needed * n_kv_heads * head_dim
+            && v_cache.len >= kv_rows_needed * n_kv_heads * head_dim
+        {
+            return self.flash_prefill(
+                q,
+                k_cache,
+                v_cache,
+                cache_start,
+                q_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                false,
+            );
+        }
+        if head_dim % 32 == 0 && head_dim <= 256 && n_heads % n_kv_heads == 0 {
+            return self.flash_attention(
+                q,
+                k_cache,
+                v_cache,
+                cache_start,
+                q_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                0,
+                false,
+            );
+        }
         let total_dim = n_heads * head_dim;
         let tg_size = std::cmp::min(head_dim as u64, 256).next_power_of_two();
 
@@ -642,6 +1027,7 @@ kernel void embedding(
             MetalBuffer {
                 buffer: output_buf,
                 len: total_dim,
+                kind: Kind::F32,
             }
         } else {
             let pipeline = self.get_pipeline(
@@ -673,6 +1059,7 @@ kernel void embedding(
             MetalBuffer {
                 buffer: output_buf,
                 len: q_len * total_dim,
+                kind: Kind::F32,
             }
         }
     }
@@ -692,6 +1079,7 @@ kernel void embedding(
         MetalBuffer {
             buffer: output_buf,
             len: rows * cols,
+            kind: Kind::F32,
         }
     }
 
@@ -722,6 +1110,7 @@ kernel void embedding(
         MetalBuffer {
             buffer: output_buf,
             len: n_rows * row_len,
+            kind: Kind::F32,
         }
     }
 
@@ -758,10 +1147,12 @@ kernel void embedding(
             MetalBuffer {
                 buffer: grad_input_raw,
                 len: n_groups * dim,
+                kind: Kind::F32,
             },
             MetalBuffer {
                 buffer: grad_weight_raw,
                 len: dim,
+                kind: Kind::F32,
             },
         )
     }
@@ -789,6 +1180,7 @@ kernel void embedding(
         MetalBuffer {
             buffer: grad_weight_raw,
             len: vocab_size * dim,
+            kind: Kind::F32,
         }
     }
 
@@ -846,14 +1238,17 @@ kernel void embedding(
             MetalBuffer {
                 buffer: grad_q_raw,
                 len: seq_len * total_dim,
+                kind: Kind::F32,
             },
             MetalBuffer {
                 buffer: grad_k_raw,
                 len: seq_len * kv_dim,
+                kind: Kind::F32,
             },
             MetalBuffer {
                 buffer: grad_v_raw,
                 len: seq_len * kv_dim,
+                kind: Kind::F32,
             },
         )
     }
@@ -898,19 +1293,227 @@ kernel void embedding(
             MetalBuffer {
                 buffer: grad_buf,
                 len: n_positions * vocab_size,
+                kind: Kind::F32,
             },
         )
     }
 
-    fn sync(&self) {
+    fn flush(&self) {
+        self.end_compute();
         if let Some(cb) = self.active_cb.borrow_mut().take() {
             cb.commit();
+            // Keep it alive until it's done; sync() waits on the newest buffer, and command
+            // buffers on one queue run in order.
+            self.in_flight.borrow_mut().push(cb);
+        }
+    }
+
+    fn attention_prep(
+        &self,
+        qkv: &MetalBuffer,
+        q_norm: Option<&MetalBuffer>,
+        k_norm: Option<&MetalBuffer>,
+        cos: &MetalBuffer,
+        sin: &MetalBuffer,
+        k_cache: &mut MetalBuffer,
+        v_cache: &mut MetalBuffer,
+        seq: usize,
+        (nh, nkv, hd): (usize, usize, usize),
+        pos: usize,
+        eps: f32,
+    ) -> MetalBuffer {
+        if hd % 64 != 0 || hd > 256 {
+            return crate::device::attention_prep_default(
+                self,
+                qkv,
+                q_norm,
+                k_norm,
+                cos,
+                sin,
+                k_cache,
+                v_cache,
+                seq,
+                (nh, nkv, hd),
+                pos,
+                eps,
+            );
+        }
+        let pipeline = self.get_pipeline(llm_msl::FUSED_MSL, "attention_prep");
+        let q = self.make_buffer_empty(seq * nh * hd * 4);
+        let params = self.make_buffer_u32(&[
+            seq as u32,
+            nh as u32,
+            nkv as u32,
+            hd as u32,
+            pos as u32,
+            eps.to_bits(),
+            q_norm.is_some() as u32,
+            k_norm.is_some() as u32,
+        ]);
+        let qn = q_norm.unwrap_or(qkv);
+        let kn = k_norm.unwrap_or(qkv);
+        self.with_encoder(|enc| {
+            enc.set_compute_pipeline_state(&pipeline);
+            let bufs = [
+                &qkv.buffer,
+                &qn.buffer,
+                &kn.buffer,
+                &cos.buffer,
+                &sin.buffer,
+                &q,
+                &k_cache.buffer,
+                &v_cache.buffer,
+                &params,
+            ];
+            for (i, b) in bufs.iter().enumerate() {
+                enc.set_buffer(i as u64, Some(b), 0);
+            }
+            enc.dispatch_thread_groups(
+                MTLSize::new((nh + 2 * nkv) as u64, seq as u64, 1),
+                MTLSize::new(32, 1, 1),
+            );
+        });
+        MetalBuffer {
+            buffer: q,
+            len: seq * nh * hd,
+            kind: Kind::F32,
+        }
+    }
+
+    fn kv_attention_window(
+        &self,
+        q: &MetalBuffer,
+        k_cache: &MetalBuffer,
+        v_cache: &MetalBuffer,
+        cache_start: usize,
+        q_len: usize,
+        (n_heads, n_kv_heads, head_dim): (usize, usize, usize),
+        window: usize,
+        causal: bool,
+    ) -> MetalBuffer {
+        if causal && (window == 0 || cache_start + q_len <= window) {
+            return self.kv_attention(
+                q,
+                k_cache,
+                v_cache,
+                cache_start,
+                q_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+            );
+        }
+        assert!(
+            head_dim <= 256 && n_heads % n_kv_heads == 0,
+            "windowed or bidirectional attention needs head_dim at most 256"
+        );
+        self.flash_attention(
+            q,
+            k_cache,
+            v_cache,
+            cache_start,
+            q_len,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            window,
+            !causal,
+        )
+    }
+
+    fn attention_full(
+        &self,
+        q: &MetalBuffer,
+        k: &MetalBuffer,
+        v: &MetalBuffer,
+        n: usize,
+        nh: usize,
+        hd: usize,
+    ) -> MetalBuffer {
+        // The tiled simdgroup-matrix kernel when the shape allows (vision towers: D 64-128).
+        let rows = n.next_multiple_of(32) * nh * hd;
+        if hd % 8 == 0 && hd <= 128 && k.len >= rows && v.len >= rows {
+            return self.flash_prefill(q, k, v, 0, n, nh, nh, hd, true);
+        }
+        self.flash_attention(q, k, v, 0, n, nh, nh, hd, 0, true)
+    }
+
+    fn layer_norm(
+        &self,
+        x: &MetalBuffer,
+        w: &MetalBuffer,
+        b: &MetalBuffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) -> MetalBuffer {
+        let pipeline = self.get_pipeline(llm_msl::FUSED_MSL, "layer_norm");
+        let out = self.make_buffer_empty(rows * dim * 4);
+        let eps = self.make_buffer(&[eps]);
+        let params = self.make_buffer_u32(&[rows as u32, dim as u32]);
+        self.dispatch_groups(
+            &pipeline,
+            &[&x.buffer, &w.buffer, &b.buffer, &out, &eps, &params],
+            (rows, 1),
+            256,
+        );
+        MetalBuffer {
+            buffer: out,
+            len: rows * dim,
+            kind: Kind::F32,
+        }
+    }
+
+    fn gelu_tanh(&self, x: &MetalBuffer, n: usize) -> MetalBuffer {
+        let pipeline = self.get_pipeline(llm_msl::FUSED_MSL, "gelu_tanh");
+        let out = self.make_buffer_empty(n * 4);
+        let params = self.make_buffer_u32(&[n as u32]);
+        self.dispatch(&pipeline, &[&x.buffer, &out, &params], n as u64);
+        MetalBuffer {
+            buffer: out,
+            len: n,
+            kind: Kind::F32,
+        }
+    }
+
+    fn geglu_split(&self, gu: &MetalBuffer, rows: usize, ff: usize) -> MetalBuffer {
+        let pipeline = self.get_pipeline(llm_msl::FUSED_MSL, "geglu_split");
+        let out = self.make_buffer_empty(rows * ff * 4);
+        let params = self.make_buffer_u32(&[rows as u32, ff as u32]);
+        self.dispatch(&pipeline, &[&gu.buffer, &out, &params], (rows * ff) as u64);
+        MetalBuffer {
+            buffer: out,
+            len: rows * ff,
+            kind: Kind::F32,
+        }
+    }
+
+    fn swiglu_split(&self, gu: &MetalBuffer, rows: usize, ff: usize) -> MetalBuffer {
+        let pipeline = self.get_pipeline(llm_msl::FUSED_MSL, "swiglu_split");
+        let out = self.make_buffer_empty(rows * ff * 4);
+        let params = self.make_buffer_u32(&[rows as u32, ff as u32]);
+        self.dispatch(&pipeline, &[&gu.buffer, &out, &params], (rows * ff) as u64);
+        MetalBuffer {
+            buffer: out,
+            len: rows * ff,
+            kind: Kind::F32,
+        }
+    }
+
+    fn sync(&self) {
+        self.end_compute();
+        if let Some(cb) = self.active_cb.borrow_mut().take() {
+            cb.commit();
+            cb.wait_until_completed();
+        }
+        for cb in self.in_flight.borrow_mut().drain(..) {
             cb.wait_until_completed();
         }
     }
 
     fn copy_buffer(&self, src: &MetalBuffer) -> MetalBuffer {
         let dst = self.make_buffer_empty(src.len * 4);
+        self.end_compute();
         self.ensure_cb();
         autoreleasepool(|| {
             let cb_ref = self.active_cb.borrow();
@@ -922,6 +1525,7 @@ kernel void embedding(
         MetalBuffer {
             buffer: dst,
             len: src.len,
+            kind: Kind::F32,
         }
     }
 
@@ -962,6 +1566,7 @@ kernel void bias_add(
         MetalBuffer {
             buffer: output_buf,
             len: numel,
+            kind: Kind::F32,
         }
     }
 
@@ -976,6 +1581,7 @@ kernel void bias_add(
     }
 
     fn zero_buffer(&self, buf: &mut MetalBuffer) {
+        self.end_compute();
         self.ensure_cb();
         autoreleasepool(|| {
             let cb_ref = self.active_cb.borrow();
@@ -1005,34 +1611,151 @@ kernel void bias_add(
         );
     }
 
+    fn linear(
+        &self,
+        x: &MetalBuffer,
+        w: &MetalBuffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> MetalBuffer {
+        if let Kind::Q4 { group } = w.kind {
+            let out = self.make_buffer_empty(m * n * 4);
+            let params = self.make_buffer_u32(&[m as u32, k as u32, n as u32, group]);
+            let (so, bo) = w.q4_offsets(group as usize);
+            let (name, groups, threads) = if m <= 8 {
+                ("gemv_q4", (n.div_ceil(8), 1), 64)
+            } else {
+                ("matmul_bt_q4", (n.div_ceil(32), m.div_ceil(32)), 128)
+            };
+            let pipeline = self.get_pipeline(llm_msl::Q4_MSL, name);
+            self.with_encoder(|enc| {
+                enc.set_compute_pipeline_state(&pipeline);
+                enc.set_buffer(0, Some(&x.buffer), 0);
+                enc.set_buffer(1, Some(&w.buffer), 0);
+                enc.set_buffer(2, Some(&w.buffer), so);
+                enc.set_buffer(3, Some(&w.buffer), bo);
+                enc.set_buffer(4, Some(&out), 0);
+                enc.set_buffer(5, Some(&params), 0);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(groups.0 as u64, groups.1 as u64, 1),
+                    MTLSize::new(threads, 1, 1),
+                );
+            });
+            return MetalBuffer {
+                buffer: out,
+                len: m * n,
+                kind: Kind::F32,
+            };
+        }
+        if w.kind == Kind::Bf16 {
+            let out = self.make_buffer_empty(m * n * 4);
+            let params = self.make_buffer_u32(&[m as u32, k as u32, n as u32]);
+            let bufs = [&x.buffer, &w.buffer, &out, &params];
+            if m <= 8 {
+                let pipeline = self.get_pipeline(llm_msl::BF16_MSL, "gemv_bt_bf16");
+                self.dispatch_groups(&pipeline, &bufs, (n.div_ceil(8), 1), 256);
+            } else {
+                let pipeline = self.get_pipeline(llm_msl::BF16_MSL, "matmul_bt_bf16");
+                self.dispatch_groups(&pipeline, &bufs, (n.div_ceil(32), m.div_ceil(32)), 128);
+            }
+            return MetalBuffer {
+                buffer: out,
+                len: m * n,
+                kind: Kind::F32,
+            };
+        }
+        if m <= 8 {
+            let pipeline = self.get_pipeline(llm_msl::GEMV_BT_MSL, "gemv_bt");
+            let out = self.make_buffer_empty(m * n * 4);
+            let params = self.make_buffer_u32(&[m as u32, k as u32, n as u32]);
+            self.with_encoder(|enc| {
+                enc.set_compute_pipeline_state(&pipeline);
+                enc.set_buffer(0, Some(&x.buffer), 0);
+                enc.set_buffer(1, Some(&w.buffer), 0);
+                enc.set_buffer(2, Some(&out), 0);
+                enc.set_buffer(3, Some(&params), 0);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(n.div_ceil(8) as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+            });
+            return MetalBuffer {
+                buffer: out,
+                len: m * n,
+                kind: Kind::F32,
+            };
+        }
+        if n % 32 != 0 || k % 8 != 0 {
+            return self.matmul_b_transposed(x, w, m, k, n);
+        }
+        // The simdgroup kernel works in 32-row tiles: pad the rows, then drop the padding.
+        let mp = m.next_multiple_of(32);
+        if mp == m {
+            return self.matmul_b_transposed(x, w, m, k, n);
+        }
+        let mut padded = self.alloc(mp * k);
+        self.write_into(&mut padded, 0, x);
+        let y = self.matmul_b_transposed(&padded, w, mp, k, n);
+        self.slice_buffer(&y, 0, m * n)
+    }
+
+    fn add_tensors_buf(&self, a: &MetalBuffer, b: &MetalBuffer, numel: usize) -> MetalBuffer {
+        self.binary(a, b, numel, "add_f32")
+    }
+
+    fn swiglu_fused_buf(&self, gate: &MetalBuffer, up: &MetalBuffer, numel: usize) -> MetalBuffer {
+        self.binary(gate, up, numel, "swiglu_f32")
+    }
+
+    fn rope_half_cached(
+        &self,
+        input: &MetalBuffer,
+        cos_buf: &MetalBuffer,
+        sin_buf: &MetalBuffer,
+        seq_len: usize,
+        n_heads: usize,
+        head_dim: usize,
+        start_pos: usize,
+    ) -> MetalBuffer {
+        let pipeline = self.get_pipeline(llm_msl::ROPE_HALF_MSL, "rope_half");
+        let out = self.make_buffer_empty(input.len * 4);
+        let params = self.make_buffer_u32(&[
+            seq_len as u32,
+            n_heads as u32,
+            head_dim as u32,
+            start_pos as u32,
+        ]);
+        self.dispatch(
+            &pipeline,
+            &[
+                &input.buffer,
+                &cos_buf.buffer,
+                &sin_buf.buffer,
+                &out,
+                &params,
+            ],
+            (seq_len * n_heads * head_dim / 2) as u64,
+        );
+        MetalBuffer {
+            buffer: out,
+            len: input.len,
+            kind: Kind::F32,
+        }
+    }
+
     fn slice_buffer(&self, buf: &MetalBuffer, offset: usize, len: usize) -> MetalBuffer {
         let dst = self.make_buffer_empty(len * 4);
-        self.ensure_cb();
-        autoreleasepool(|| {
-            let cb_ref = self.active_cb.borrow();
-            let cmd = cb_ref.as_ref().unwrap();
-            let blit = cmd.new_blit_command_encoder();
-            blit.copy_from_buffer(&buf.buffer, (offset * 4) as u64, &dst, 0, (len * 4) as u64);
-            blit.end_encoding();
-        });
-        MetalBuffer { buffer: dst, len }
+        self.copy_f32(&buf.buffer, offset, &dst, 0, len);
+        MetalBuffer {
+            buffer: dst,
+            len,
+            kind: Kind::F32,
+        }
     }
 
     fn write_into(&self, dst: &mut MetalBuffer, offset: usize, src: &MetalBuffer) {
-        self.ensure_cb();
-        autoreleasepool(|| {
-            let cb_ref = self.active_cb.borrow();
-            let cmd = cb_ref.as_ref().unwrap();
-            let blit = cmd.new_blit_command_encoder();
-            blit.copy_from_buffer(
-                &src.buffer,
-                0,
-                &dst.buffer,
-                (offset * 4) as u64,
-                (src.len * 4) as u64,
-            );
-            blit.end_encoding();
-        });
+        self.copy_f32(&src.buffer, 0, &dst.buffer, offset, src.len);
     }
 
     fn adamw_step(
@@ -1847,5 +2570,283 @@ mod tests {
         metal.write_into(&mut dst, 2, &src);
         let out = metal.download(&dst);
         assert_eq!(out, vec![0.0, 0.0, 7.0, 8.0, 0.0]);
+    }
+
+    #[test]
+    fn metal_linear_vs_cpu_decode_and_prefill() {
+        let metal = get_metal_device();
+        let cpu = CpuDevice::new();
+        // Decode (GEMV), unaligned prefill (padded), aligned prefill, and K not a multiple of 4.
+        for &(m, k, n) in &[
+            (1, 64, 96),
+            (5, 64, 96),
+            (37, 64, 96),
+            (64, 64, 32),
+            (3, 30, 40),
+        ] {
+            let x: Vec<f32> = (0..m * k)
+                .map(|i| ((i * 7 + 3) % 13) as f32 / 13.0 - 0.5)
+                .collect();
+            let w: Vec<f32> = (0..n * k)
+                .map(|i| ((i * 11 + 5) % 17) as f32 / 17.0 - 0.5)
+                .collect();
+            let got = metal.download(&metal.linear(&metal.upload(&x), &metal.upload(&w), m, k, n));
+            let want =
+                cpu.download(&cpu.matmul_b_transposed(&cpu.upload(&x), &cpu.upload(&w), m, k, n));
+            assert_eq!(got.len(), m * n);
+            for i in 0..m * n {
+                assert!(
+                    (got[i] - want[i]).abs() < 1e-3,
+                    "({m},{k},{n}) at {i}: {} vs {}",
+                    got[i],
+                    want[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn metal_rope_half_vs_cpu() {
+        let metal = get_metal_device();
+        let cpu = CpuDevice::new();
+        let (seq, heads, hd, start, max_pos) = (3, 2, 8, 4, 16);
+        let x: Vec<f32> = (0..seq * heads * hd)
+            .map(|i| (i as f32 * 0.37).sin())
+            .collect();
+        let cos: Vec<f32> = (0..max_pos * hd / 2)
+            .map(|i| (i as f32 * 0.1).cos())
+            .collect();
+        let sin: Vec<f32> = (0..max_pos * hd / 2)
+            .map(|i| (i as f32 * 0.1).sin())
+            .collect();
+        let got = metal.download(&metal.rope_half_cached(
+            &metal.upload(&x),
+            &metal.upload(&cos),
+            &metal.upload(&sin),
+            seq,
+            heads,
+            hd,
+            start,
+        ));
+        let want = cpu.download(&cpu.rope_half_cached(
+            &cpu.upload(&x),
+            &cpu.upload(&cos),
+            &cpu.upload(&sin),
+            seq,
+            heads,
+            hd,
+            start,
+        ));
+        for i in 0..x.len() {
+            assert!(
+                (got[i] - want[i]).abs() < 1e-5,
+                "at {i}: {} vs {}",
+                got[i],
+                want[i]
+            );
+        }
+    }
+
+    #[test]
+    fn metal_bf16_linear_and_embedding_vs_f32() {
+        let metal = get_metal_device();
+        let cpu = CpuDevice::new();
+        let bf = |v: f32| (v.to_bits() >> 16) as u16;
+        for &(m, k, n) in &[(1, 64, 40), (6, 36, 40), (45, 70, 33), (64, 64, 64)] {
+            let x: Vec<f32> = (0..m * k)
+                .map(|i| ((i * 7 + 3) % 13) as f32 / 13.0 - 0.5)
+                .collect();
+            let bits: Vec<u16> = (0..n * k)
+                .map(|i| bf(((i * 11 + 5) % 17) as f32 / 17.0 - 0.5))
+                .collect();
+            let w: Vec<f32> = bits
+                .iter()
+                .map(|&b| f32::from_bits((b as u32) << 16))
+                .collect();
+            let got = metal.download(&metal.linear(
+                &metal.upload(&x),
+                &metal.upload_bf16(&bits),
+                m,
+                k,
+                n,
+            ));
+            let want =
+                cpu.download(&cpu.matmul_b_transposed(&cpu.upload(&x), &cpu.upload(&w), m, k, n));
+            for i in 0..m * n {
+                assert!(
+                    (got[i] - want[i]).abs() < 1e-3,
+                    "({m},{k},{n}) at {i}: {} vs {}",
+                    got[i],
+                    want[i]
+                );
+            }
+        }
+        let (vocab, dim) = (10, 6);
+        let bits: Vec<u16> = (0..vocab * dim).map(|i| bf(i as f32 * 0.25)).collect();
+        let ids = metal.upload_u32(&[3, 0, 9]);
+        let got = metal.download(&metal.embedding(&metal.upload_bf16(&bits), &ids, 3, dim));
+        let want: Vec<f32> = [3, 0, 9]
+            .iter()
+            .flat_map(|&t| (0..dim).map(move |d| (t * dim + d) as f32 * 0.25))
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn metal_flash_attention_vs_cpu() {
+        let metal = get_metal_device();
+        let cpu = CpuDevice::new();
+        let (nh, nkv, d) = (4, 2, 64);
+        // Decode with several splits, and a prefill chunk after cached tokens.
+        for &(cache_start, q_len) in &[(700usize, 1usize), (5, 9), (0, 70), (40, 33)] {
+            let total = (cache_start + q_len).next_multiple_of(32);
+            let q: Vec<f32> = (0..q_len * nh * d)
+                .map(|i| ((i * 13 + 1) % 23) as f32 / 23.0 - 0.5)
+                .collect();
+            let k: Vec<f32> = (0..total * nkv * d)
+                .map(|i| ((i * 7 + 3) % 19) as f32 / 19.0 - 0.5)
+                .collect();
+            let v: Vec<f32> = (0..total * nkv * d)
+                .map(|i| ((i * 5 + 2) % 17) as f32 / 17.0 - 0.5)
+                .collect();
+            let got = metal.download(&metal.kv_attention(
+                &metal.upload(&q),
+                &metal.upload(&k),
+                &metal.upload(&v),
+                cache_start,
+                q_len,
+                nh,
+                nkv,
+                d,
+            ));
+            let want = cpu.download(&cpu.kv_attention(
+                &cpu.upload(&q),
+                &cpu.upload(&k),
+                &cpu.upload(&v),
+                cache_start,
+                q_len,
+                nh,
+                nkv,
+                d,
+            ));
+            for i in 0..want.len() {
+                assert!(
+                    (got[i] - want[i]).abs() < 1e-4,
+                    "({cache_start},{q_len}) at {i}: {} vs {}",
+                    got[i],
+                    want[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn metal_q4_linear_and_embedding_vs_dequantized() {
+        let metal = get_metal_device();
+        let cpu = CpuDevice::new();
+        let bf = |v: f32| (v.to_bits() >> 16) as u16;
+        let group = 64;
+        for &(m, k, n) in &[(1, 128, 40), (3, 256, 24), (41, 192, 33)] {
+            let packed: Vec<u32> = (0..n * k / 8)
+                .map(|i| (i as u32).wrapping_mul(2654435761))
+                .collect();
+            let scales: Vec<u16> = (0..n * k / group)
+                .map(|i| bf(0.01 + (i % 7) as f32 * 0.003))
+                .collect();
+            let biases: Vec<u16> = (0..n * k / group)
+                .map(|i| bf(-0.05 + (i % 5) as f32 * 0.01))
+                .collect();
+            let x: Vec<f32> = (0..m * k)
+                .map(|i| ((i * 7 + 3) % 13) as f32 / 13.0 - 0.5)
+                .collect();
+            let wq = metal.upload_q4(&packed, &scales, &biases, group);
+            let w = cpu.upload_q4(&packed, &scales, &biases, group);
+            assert_eq!(wq.to_vec(), cpu.download(&w), "dequantization");
+            let got = metal.download(&metal.linear(&metal.upload(&x), &wq, m, k, n));
+            let want = cpu.download(&cpu.matmul_b_transposed(&cpu.upload(&x), &w, m, k, n));
+            for i in 0..m * n {
+                assert!(
+                    (got[i] - want[i]).abs() < 1e-3,
+                    "({m},{k},{n}) at {i}: {} vs {}",
+                    got[i],
+                    want[i]
+                );
+            }
+            if m == 1 {
+                let ids = [5u32, 0, 39];
+                let got = metal.download(&metal.embedding(&wq, &metal.upload_u32(&ids), 3, k));
+                let all = cpu.download(&w);
+                let want: Vec<f32> = ids
+                    .iter()
+                    .flat_map(|&t| all[t as usize * k..(t as usize + 1) * k].to_vec())
+                    .collect();
+                assert_eq!(got, want);
+            }
+        }
+    }
+
+    #[test]
+    fn metal_fused_attention_prep_and_swiglu_vs_default() {
+        let metal = get_metal_device();
+        let (seq, nh, nkv, hd, pos, max) = (3, 4, 2, 64, 2, 8);
+        let row = (nh + 2 * nkv) * hd;
+        let qkv: Vec<f32> = (0..seq * row)
+            .map(|i| ((i * 13 + 1) % 23) as f32 / 23.0 - 0.5)
+            .collect();
+        let qn: Vec<f32> = (0..hd).map(|i| 1.0 + i as f32 * 0.01).collect();
+        let kn: Vec<f32> = (0..hd).map(|i| 0.5 + i as f32 * 0.02).collect();
+        let cos: Vec<f32> = (0..max * hd / 2).map(|i| (i as f32 * 0.1).cos()).collect();
+        let sin: Vec<f32> = (0..max * hd / 2).map(|i| (i as f32 * 0.1).sin()).collect();
+        let up = |v: &[f32]| metal.upload(v);
+        let run = |fused: bool| {
+            let (mut kc, mut vc) = (metal.alloc(max * nkv * hd), metal.alloc(max * nkv * hd));
+            let (a, b, c, d, e) = (up(&qkv), up(&qn), up(&kn), up(&cos), up(&sin));
+            let q = if fused {
+                metal.attention_prep(
+                    &a,
+                    Some(&b),
+                    Some(&c),
+                    &d,
+                    &e,
+                    &mut kc,
+                    &mut vc,
+                    seq,
+                    (nh, nkv, hd),
+                    pos,
+                    1e-6,
+                )
+            } else {
+                crate::device::attention_prep_default(
+                    &metal,
+                    &a,
+                    Some(&b),
+                    Some(&c),
+                    &d,
+                    &e,
+                    &mut kc,
+                    &mut vc,
+                    seq,
+                    (nh, nkv, hd),
+                    pos,
+                    1e-6,
+                )
+            };
+            (metal.download(&q), metal.download(&kc), metal.download(&vc))
+        };
+        let (got, want) = (run(true), run(false));
+        for (g, w) in [(&got.0, &want.0), (&got.1, &want.1), (&got.2, &want.2)] {
+            for i in 0..w.len() {
+                assert!((g[i] - w[i]).abs() < 1e-5, "at {i}: {} vs {}", g[i], w[i]);
+            }
+        }
+        let gu: Vec<f32> = (0..2 * 2 * 5).map(|i| i as f32 * 0.3 - 2.0).collect();
+        let got = metal.download(&metal.swiglu_split(&up(&gu), 2, 5));
+        let silu = |g: f32| g / (1.0 + (-g).exp());
+        for r in 0..2 {
+            for i in 0..5 {
+                let want = silu(gu[r * 10 + i]) * gu[r * 10 + 5 + i];
+                assert!((got[r * 5 + i] - want).abs() < 1e-5);
+            }
+        }
     }
 }

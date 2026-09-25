@@ -366,6 +366,10 @@ pub trait ComputeDevice: Send {
     /// Wait for all pending operations to complete.
     fn sync(&self);
 
+    /// Submit queued work without waiting, so the device can start on it while the caller
+    /// keeps encoding. Default: no-op.
+    fn flush(&self) {}
+
     /// Copy a buffer on device without CPU round-trip (GPU backends use blit/copy).
     fn copy_buffer(&self, src: &Self::Buffer) -> Self::Buffer {
         let data = self.download(src);
@@ -871,6 +875,251 @@ pub trait ComputeDevice: Send {
         *dst = self.upload(&d);
     }
 
+    /// Upload read-only weights given as raw bfloat16 bits. Backends that support it keep them
+    /// in bf16 (half the memory and bandwidth) for [`linear`](Self::linear) and
+    /// [`embedding`](Self::embedding); the default widens to f32.
+    fn upload_bf16(&self, bits: &[u16]) -> Self::Buffer {
+        let wide: Vec<f32> = bits
+            .iter()
+            .map(|&b| f32::from_bits((b as u32) << 16))
+            .collect();
+        self.upload(&wide)
+    }
+
+    /// Upload 4-bit affine-quantized weights in MLX's layout: `packed` holds 8 weights per
+    /// u32 (low nibble first) for a row-major `[n, k]` matrix; `scales` and `biases` are bf16
+    /// bits, one per `group` consecutive weights of a row (`w = scale * q + bias`). Backends
+    /// that support it keep this format for [`linear`](Self::linear) and
+    /// [`embedding`](Self::embedding); the default dequantizes to f32.
+    fn upload_q4(
+        &self,
+        packed: &[u32],
+        scales: &[u16],
+        biases: &[u16],
+        group: usize,
+    ) -> Self::Buffer {
+        let bf = |b: u16| f32::from_bits((b as u32) << 16);
+        let n = packed.len() * 8;
+        let w: Vec<f32> = (0..n)
+            .map(|i| {
+                let q = (packed[i / 8] >> (4 * (i % 8))) & 0xf;
+                bf(scales[i / group]) * q as f32 + bf(biases[i / group])
+            })
+            .collect();
+        self.upload(&w)
+    }
+
+    /// Decoder attention prologue, fused. `qkv` is `[seq, (nh + 2*nkv) * hd]` (a fused Q/K/V
+    /// projection). Applies the optional per-head RMS norms to q and k, half-split RoPE at
+    /// positions `pos..`, writes k and v into the caches at `pos`, and returns q `[seq, nh*hd]`.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_prep(
+        &self,
+        qkv: &Self::Buffer,
+        q_norm: Option<&Self::Buffer>,
+        k_norm: Option<&Self::Buffer>,
+        cos: &Self::Buffer,
+        sin: &Self::Buffer,
+        k_cache: &mut Self::Buffer,
+        v_cache: &mut Self::Buffer,
+        seq: usize,
+        (nh, nkv, hd): (usize, usize, usize),
+        pos: usize,
+        eps: f32,
+    ) -> Self::Buffer {
+        attention_prep_default(
+            self,
+            qkv,
+            q_norm,
+            k_norm,
+            cos,
+            sin,
+            k_cache,
+            v_cache,
+            seq,
+            (nh, nkv, hd),
+            pos,
+            eps,
+        )
+    }
+
+    /// `kv_attention` where each query sees only the last `window` keys (0: all of them), as in
+    /// Gemma's local layers. The portable fallback runs on the host.
+    #[allow(clippy::too_many_arguments)]
+    fn kv_attention_window(
+        &self,
+        q: &Self::Buffer,
+        k_cache: &Self::Buffer,
+        v_cache: &Self::Buffer,
+        cache_start: usize,
+        q_len: usize,
+        (nh, nkv, hd): (usize, usize, usize),
+        window: usize,
+        causal: bool,
+    ) -> Self::Buffer {
+        if causal && (window == 0 || cache_start + q_len <= window) {
+            return self.kv_attention(q, k_cache, v_cache, cache_start, q_len, nh, nkv, hd);
+        }
+        let (q, k, v) = (
+            self.download(q),
+            self.download(k_cache),
+            self.download(v_cache),
+        );
+        let (kvd, scale) = (nkv * hd, 1.0 / (hd as f32).sqrt());
+        let mut out = vec![0.0f32; q_len * nh * hd];
+        for qi in 0..q_len {
+            let qpos = cache_start + qi + 1;
+            let attend = if causal { qpos } else { cache_start + q_len };
+            let lo = if window > 0 {
+                qpos.saturating_sub(window)
+            } else {
+                0
+            };
+            for h in 0..nh {
+                let kh = h / (nh / nkv);
+                let qv = &q[(qi * nh + h) * hd..][..hd];
+                let scores: Vec<f32> = (lo..attend)
+                    .map(|j| {
+                        (0..hd)
+                            .map(|d| qv[d] * k[j * kvd + kh * hd + d])
+                            .sum::<f32>()
+                            * scale
+                    })
+                    .collect();
+                let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let e: Vec<f32> = scores.iter().map(|s| (s - m).exp()).collect();
+                let z: f32 = e.iter().sum();
+                let o = &mut out[(qi * nh + h) * hd..][..hd];
+                for (t, j) in (lo..attend).enumerate() {
+                    for d in 0..hd {
+                        o[d] += e[t] / z * v[j * kvd + kh * hd + d];
+                    }
+                }
+            }
+        }
+        self.upload(&out)
+    }
+
+    /// Bidirectional multi-head attention over `n` positions (vision encoders): q, k, v and the
+    /// result are `[n, nh * hd]`.
+    fn attention_full(
+        &self,
+        q: &Self::Buffer,
+        k: &Self::Buffer,
+        v: &Self::Buffer,
+        n: usize,
+        nh: usize,
+        hd: usize,
+    ) -> Self::Buffer {
+        self.kv_attention_window(q, k, v, 0, n, (nh, nh, hd), 0, false)
+    }
+
+    /// LayerNorm over rows of `dim`, with weight and bias.
+    fn layer_norm(
+        &self,
+        x: &Self::Buffer,
+        w: &Self::Buffer,
+        b: &Self::Buffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Self::Buffer {
+        let (x, w, b) = (self.download(x), self.download(w), self.download(b));
+        let mut y = Vec::with_capacity(rows * dim);
+        for r in x.chunks(dim).take(rows) {
+            let mean = r.iter().sum::<f32>() / dim as f32;
+            let var = r.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / dim as f32;
+            let inv = 1.0 / (var + eps).sqrt();
+            y.extend(
+                r.iter()
+                    .enumerate()
+                    .map(|(i, v)| (v - mean) * inv * w[i] + b[i]),
+            );
+        }
+        self.upload(&y)
+    }
+
+    /// GELU, tanh approximation, elementwise over `n` values.
+    fn gelu_tanh(&self, x: &Self::Buffer, n: usize) -> Self::Buffer {
+        let x = self.download(x);
+        let y: Vec<f32> = x[..n]
+            .iter()
+            .map(|&g| 0.5 * g * (1.0 + (0.797_884_6 * (g + 0.044715 * g * g * g)).tanh()))
+            .collect();
+        self.upload(&y)
+    }
+
+    /// GeGLU over a fused gate/up projection (Gemma): `gelu_tanh(gate) * up`, `[rows, ff]`.
+    fn geglu_split(&self, gu: &Self::Buffer, rows: usize, ff: usize) -> Self::Buffer {
+        let d = self.download(gu);
+        let mut y = Vec::with_capacity(rows * ff);
+        for r in 0..rows {
+            for i in 0..ff {
+                let g = d[r * 2 * ff + i];
+                let t = (0.797_884_6 * (g + 0.044715 * g * g * g)).tanh();
+                y.push(0.5 * g * (1.0 + t) * d[r * 2 * ff + ff + i]);
+            }
+        }
+        self.upload(&y)
+    }
+
+    /// SwiGLU over a fused gate/up projection: `gu` is `[rows, 2*ff]` (gate then up per row);
+    /// returns `silu(gate) * up`, `[rows, ff]`.
+    fn swiglu_split(&self, gu: &Self::Buffer, rows: usize, ff: usize) -> Self::Buffer {
+        let d = self.download(gu);
+        let (mut g, mut u) = (Vec::with_capacity(rows * ff), Vec::with_capacity(rows * ff));
+        for r in 0..rows {
+            g.extend_from_slice(&d[r * 2 * ff..r * 2 * ff + ff]);
+            u.extend_from_slice(&d[r * 2 * ff + ff..(r + 1) * 2 * ff]);
+        }
+        self.swiglu_fused_buf(&self.upload(&g), &self.upload(&u), rows * ff)
+    }
+
+    /// Linear layer: `y[m, n] = x[m, k] @ w[n, k]^T`, with `w` stored the way checkpoints store
+    /// it (`[out, in]` row-major). Backends specialize small `m` (decode) as a GEMV.
+    fn linear(
+        &self,
+        x: &Self::Buffer,
+        w: &Self::Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Self::Buffer {
+        self.matmul_b_transposed(x, w, m, k, n)
+    }
+
+    /// Half-split ("NeoX") RoPE, as used by Llama/Qwen checkpoints: rotates pairs
+    /// `(i, i + head_dim/2)`. Input `[seq_len, n_heads, head_dim]`; tables `[max_pos, head_dim/2]`
+    /// on device. Returns a new buffer.
+    fn rope_half_cached(
+        &self,
+        input: &Self::Buffer,
+        cos_buf: &Self::Buffer,
+        sin_buf: &Self::Buffer,
+        seq_len: usize,
+        n_heads: usize,
+        head_dim: usize,
+        start_pos: usize,
+    ) -> Self::Buffer {
+        let data = self.download(input);
+        let (cos, sin) = (self.download(cos_buf), self.download(sin_buf));
+        let half = head_dim / 2;
+        let mut out = data.clone();
+        for s in 0..seq_len {
+            let pos = start_pos + s;
+            for h in 0..n_heads {
+                let base = (s * n_heads + h) * head_dim;
+                for i in 0..half {
+                    let (c, sn) = (cos[pos * half + i], sin[pos * half + i]);
+                    let (x0, x1) = (data[base + i], data[base + i + half]);
+                    out[base + i] = x0 * c - x1 * sn;
+                    out[base + i + half] = x1 * c + x0 * sn;
+                }
+            }
+        }
+        self.upload(&out)
+    }
+
     /// AdamW optimizer step on a single parameter tensor (in-place on device).
     ///
     /// Updates `param`, `m` (first moment), and `v` (second moment) in-place.
@@ -888,4 +1137,44 @@ pub trait ComputeDevice: Send {
         weight_decay: f32,
         step_t: usize,
     );
+}
+
+/// Composition of primitives behind [`ComputeDevice::attention_prep`] (backends that fuse it
+/// fall back to this for shapes their kernel doesn't cover).
+#[allow(clippy::too_many_arguments)]
+pub fn attention_prep_default<D: ComputeDevice + ?Sized>(
+    dev: &D,
+    qkv: &D::Buffer,
+    q_norm: Option<&D::Buffer>,
+    k_norm: Option<&D::Buffer>,
+    cos: &D::Buffer,
+    sin: &D::Buffer,
+    k_cache: &mut D::Buffer,
+    v_cache: &mut D::Buffer,
+    seq: usize,
+    (nh, nkv, hd): (usize, usize, usize),
+    pos: usize,
+    eps: f32,
+) -> D::Buffer {
+    let (qd, kvd) = (nh * hd, nkv * hd);
+    let row = qd + 2 * kvd;
+    let all = dev.download(qkv);
+    let part = |off: usize, w: usize| -> Vec<f32> {
+        (0..seq)
+            .flat_map(|s| all[s * row + off..s * row + off + w].to_vec())
+            .collect()
+    };
+    let (mut q, mut k) = (dev.upload(&part(0, qd)), dev.upload(&part(qd, kvd)));
+    let v = dev.upload(&part(qd + kvd, kvd));
+    if let Some(n) = q_norm {
+        q = dev.rms_norm(&q, n, seq * nh, hd, eps);
+    }
+    if let Some(n) = k_norm {
+        k = dev.rms_norm(&k, n, seq * nkv, hd, eps);
+    }
+    let q = dev.rope_half_cached(&q, cos, sin, seq, nh, hd, pos);
+    let k = dev.rope_half_cached(&k, cos, sin, seq, nkv, hd, pos);
+    dev.write_into(k_cache, pos * kvd, &k);
+    dev.write_into(v_cache, pos * kvd, &v);
+    q
 }

@@ -38,6 +38,17 @@ fn bf16_to_f32(bits: u16) -> f32 {
 enum CudaStorage {
     F32(CudaSlice<f32>),
     Bf16(CudaSlice<u16>),
+    /// Read-only 4-bit weights for `linear`/`embedding` (see `ComputeDevice::upload_q4`).
+    Q4(Box<Q4Weight>),
+}
+
+/// 4-bit affine weights in MLX's layout: `packed` holds 8 weights per u32 (low nibble first)
+/// for a row-major `[n, k]` matrix; `scales` and `biases` are bf16, one per `group` weights.
+struct Q4Weight {
+    packed: CudaSlice<u32>,
+    scales: CudaSlice<u16>,
+    biases: CudaSlice<u16>,
+    group: usize,
 }
 
 /// CUDA buffer wrapping either a CudaSlice<f32> or CudaSlice<u16> (bf16).
@@ -55,6 +66,7 @@ impl Drop for CudaBuffer {
             match storage {
                 CudaStorage::F32(slice) => p.put_f32(slice, self.len),
                 CudaStorage::Bf16(slice) => p.put_bf16(slice, self.len),
+                CudaStorage::Q4(_) => {}
             }
         }
         // If no pool ref, storage is dropped normally (cudaFree)
@@ -83,6 +95,19 @@ impl ComputeBuffer for CudaBuffer {
                 let u16_data: Vec<u16> = s.stream().memcpy_dtov(s).unwrap();
                 u16_data.iter().map(|&b| bf16_to_f32(b)).collect()
             }
+            CudaStorage::Q4(q) => {
+                let stream = q.packed.stream();
+                let packed: Vec<u32> = stream.memcpy_dtov(&q.packed).unwrap();
+                let scales: Vec<u16> = stream.memcpy_dtov(&q.scales).unwrap();
+                let biases: Vec<u16> = stream.memcpy_dtov(&q.biases).unwrap();
+                (0..self.len)
+                    .map(|i| {
+                        let v = (packed[i / 8] >> (4 * (i % 8))) & 0xf;
+                        let g = i / q.group;
+                        bf16_to_f32(scales[g]) * v as f32 + bf16_to_f32(biases[g])
+                    })
+                    .collect()
+            }
         }
     }
 }
@@ -97,7 +122,7 @@ impl CudaBuffer {
     fn f32_data(&self) -> &CudaSlice<f32> {
         match self.storage() {
             CudaStorage::F32(s) => s,
-            CudaStorage::Bf16(_) => panic!("expected f32 buffer, got bf16"),
+            _ => panic!("expected f32 buffer"),
         }
     }
 
@@ -105,7 +130,7 @@ impl CudaBuffer {
     fn f32_data_mut(&mut self) -> &mut CudaSlice<f32> {
         match self.storage_mut() {
             CudaStorage::F32(s) => s,
-            CudaStorage::Bf16(_) => panic!("expected f32 buffer, got bf16"),
+            _ => panic!("expected f32 buffer"),
         }
     }
 
@@ -113,7 +138,7 @@ impl CudaBuffer {
     fn bf16_data(&self) -> &CudaSlice<u16> {
         match self.storage() {
             CudaStorage::Bf16(s) => s,
-            CudaStorage::F32(_) => panic!("expected bf16 buffer, got f32"),
+            _ => panic!("expected bf16 buffer"),
         }
     }
 
@@ -121,12 +146,14 @@ impl CudaBuffer {
     fn bf16_data_mut(&mut self) -> &mut CudaSlice<u16> {
         match self.storage_mut() {
             CudaStorage::Bf16(s) => s,
-            CudaStorage::F32(_) => panic!("expected bf16 buffer, got f32"),
+            _ => panic!("expected bf16 buffer"),
         }
     }
 }
 
 use crate::pool::BufferPool;
+
+mod llm;
 
 /// Extended pool diagnostics.
 pub struct PoolStats {
@@ -147,6 +174,8 @@ pub struct CudaComputeDevice {
     module_cache: RefCell<HashMap<u64, Arc<CudaModule>>>, // hash → module
     mixed_precision: bool,
     pool: Arc<Mutex<BufferPool>>,
+    /// LLM kernels by name, so decode doesn't hash kernel sources on every launch.
+    llm_funcs: RefCell<HashMap<&'static str, CudaFunction>>,
 }
 
 impl CudaComputeDevice {
@@ -181,7 +210,22 @@ impl CudaComputeDevice {
             module_cache: RefCell::new(HashMap::new()),
             mixed_precision: false,
             pool: Arc::new(Mutex::new(BufferPool::new())),
+            llm_funcs: RefCell::new(HashMap::new()),
         })
+    }
+
+    /// Switch cuBLAS f32 GEMMs between TF32 tensor cores (`on`) and full FP32 (the default,
+    /// unless `GAIA_TF32=1`). TF32 keeps 10 mantissa bits in the products (f32 accumulate):
+    /// fine for inference prefill, riskier for training.
+    pub fn set_tf32(&self, on: bool) {
+        let mode = if on {
+            cudarc::cublas::sys::cublasMath_t::CUBLAS_TF32_TENSOR_OP_MATH
+        } else {
+            cudarc::cublas::sys::cublasMath_t::CUBLAS_DEFAULT_MATH
+        };
+        unsafe {
+            cudarc::cublas::sys::cublasSetMathMode(*self.cublas.handle(), mode);
+        }
     }
 
     /// Create a new CUDA device with bf16 mixed precision.
@@ -216,6 +260,7 @@ impl CudaComputeDevice {
             module_cache: RefCell::new(HashMap::new()),
             mixed_precision: true,
             pool: Arc::new(Mutex::new(BufferPool::new())),
+            llm_funcs: RefCell::new(HashMap::new()),
         })
     }
 
@@ -753,6 +798,7 @@ impl CudaComputeDevice {
                 self.stream.memcpy_dtod(s, out.bf16_data_mut()).unwrap();
                 out
             }
+            CudaStorage::Q4(_) => panic!("4-bit weights can't be copied"),
         }
     }
 
@@ -773,6 +819,7 @@ impl CudaComputeDevice {
                 self.stream.memcpy_dtod(&view, out.bf16_data_mut()).unwrap();
                 out
             }
+            CudaStorage::Q4(_) => panic!("4-bit weights can't be sliced"),
         }
     }
 
@@ -1434,6 +1481,9 @@ impl ComputeDevice for CudaComputeDevice {
         seq_len: usize,
         dim: usize,
     ) -> CudaBuffer {
+        if let Some(out) = self.embedding_llm(weight, ids, seq_len, dim) {
+            return out;
+        }
         let total = seq_len * dim;
         let cfg = LaunchConfig {
             block_dim: (256, 1, 1),
@@ -3832,6 +3882,9 @@ impl ComputeDevice for CudaComputeDevice {
     }
 
     fn add_tensors_buf(&self, a: &CudaBuffer, b: &CudaBuffer, numel: usize) -> CudaBuffer {
+        if let Some(out) = self.add_llm(a, b, numel) {
+            return out;
+        }
         if a.is_bf16() && b.is_bf16() {
             let n = numel as u32;
             let cfg = LaunchConfig {
@@ -4000,7 +4053,125 @@ impl ComputeDevice for CudaComputeDevice {
                         .unwrap();
                 }
             }
+            CudaStorage::Q4(_) => panic!("4-bit weights are read-only"),
         }
+    }
+
+    fn upload_bf16(&self, bits: &[u16]) -> CudaBuffer {
+        self.upload_bf16_impl(bits)
+    }
+
+    fn upload_q4(
+        &self,
+        packed: &[u32],
+        scales: &[u16],
+        biases: &[u16],
+        group: usize,
+    ) -> CudaBuffer {
+        self.upload_q4_impl(packed, scales, biases, group)
+    }
+
+    fn linear(&self, x: &CudaBuffer, w: &CudaBuffer, m: usize, k: usize, n: usize) -> CudaBuffer {
+        self.linear_llm(x, w, m, k, n)
+            .unwrap_or_else(|| self.matmul_b_transposed(x, w, m, k, n))
+    }
+
+    fn attention_prep(
+        &self,
+        qkv: &CudaBuffer,
+        q_norm: Option<&CudaBuffer>,
+        k_norm: Option<&CudaBuffer>,
+        cos: &CudaBuffer,
+        sin: &CudaBuffer,
+        k_cache: &mut CudaBuffer,
+        v_cache: &mut CudaBuffer,
+        seq: usize,
+        shape: (usize, usize, usize),
+        pos: usize,
+        eps: f32,
+    ) -> CudaBuffer {
+        if let Some(q) = self.attention_prep_llm(
+            qkv, q_norm, k_norm, cos, sin, k_cache, v_cache, seq, shape, pos, eps,
+        ) {
+            return q;
+        }
+        crate::device::attention_prep_default(
+            self, qkv, q_norm, k_norm, cos, sin, k_cache, v_cache, seq, shape, pos, eps,
+        )
+    }
+
+    fn kv_attention_window(
+        &self,
+        q: &CudaBuffer,
+        k_cache: &CudaBuffer,
+        v_cache: &CudaBuffer,
+        cache_start: usize,
+        q_len: usize,
+        shape: (usize, usize, usize),
+        window: usize,
+        causal: bool,
+    ) -> CudaBuffer {
+        self.attention_llm(
+            q,
+            k_cache,
+            v_cache,
+            cache_start,
+            q_len,
+            shape,
+            window,
+            !causal,
+        )
+    }
+
+    fn attention_full(
+        &self,
+        q: &CudaBuffer,
+        k: &CudaBuffer,
+        v: &CudaBuffer,
+        n: usize,
+        nh: usize,
+        hd: usize,
+    ) -> CudaBuffer {
+        self.attention_llm(q, k, v, 0, n, (nh, nh, hd), 0, true)
+    }
+
+    fn layer_norm(
+        &self,
+        x: &CudaBuffer,
+        w: &CudaBuffer,
+        b: &CudaBuffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) -> CudaBuffer {
+        self.layer_norm_llm(x, w, b, rows, dim, eps)
+    }
+
+    fn gelu_tanh(&self, x: &CudaBuffer, n: usize) -> CudaBuffer {
+        self.gelu_tanh_llm(x, n)
+    }
+
+    fn geglu_split(&self, gu: &CudaBuffer, rows: usize, ff: usize) -> CudaBuffer {
+        self.gated_split_llm("geglu_split", gu, rows, ff)
+    }
+
+    fn swiglu_split(&self, gu: &CudaBuffer, rows: usize, ff: usize) -> CudaBuffer {
+        self.gated_split_llm("swiglu_split", gu, rows, ff)
+    }
+
+    fn rope_half_cached(
+        &self,
+        input: &CudaBuffer,
+        cos_buf: &CudaBuffer,
+        sin_buf: &CudaBuffer,
+        seq_len: usize,
+        n_heads: usize,
+        head_dim: usize,
+        start_pos: usize,
+    ) -> CudaBuffer {
+        self.rope_half_llm(
+            input, cos_buf, sin_buf, seq_len, n_heads, head_dim, start_pos,
+        )
     }
 
     fn add_assign(&self, dst: &mut CudaBuffer, src: &CudaBuffer) {
@@ -4072,6 +4243,7 @@ impl ComputeDevice for CudaComputeDevice {
                         .unwrap();
                 }
             }
+            _ => panic!("add_assign: unsupported storage"),
         }
     }
 
@@ -4084,6 +4256,7 @@ impl ComputeDevice for CudaComputeDevice {
             CudaStorage::Bf16(s) => {
                 self.stream.memset_zeros(s).unwrap();
             }
+            CudaStorage::Q4(_) => panic!("4-bit weights are read-only"),
         }
     }
 
