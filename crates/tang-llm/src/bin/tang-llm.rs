@@ -333,7 +333,13 @@ fn draft_config(backend: Backend, model: &str) -> tang_llm::draft::DraftConfig {
     let mut cfg = DraftConfig::new(cost).from_env();
     let name: String = model
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || "-_.".contains(c) { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "-_.".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     cfg.store = match std::env::var("TANG_DRAFT_STORE").as_deref() {
         Ok("0") | Ok("") => None,
@@ -364,7 +370,9 @@ fn serve_on<D: ComputeDevice + 'static>(
             eprintln!(
                 "tang-llm: speculative decoding on (suffix drafts, up to {}; store {})",
                 d.max_draft,
-                d.store.as_ref().map_or("off".into(), |p| p.display().to_string())
+                d.store
+                    .as_ref()
+                    .map_or("off".into(), |p| p.display().to_string())
             );
         }
         e.set_speculation(draft);
@@ -532,9 +540,15 @@ fn argmax(v: &[f32]) -> u32 {
 }
 
 fn bench_spec(backend: Backend, args: &[String]) -> Result<()> {
-    let spec = args.first().context("bench-spec <model> <requests.jsonl>")?;
+    let spec = args
+        .first()
+        .context("bench-spec <model> <requests.jsonl>")?;
     let file = args.get(1).context("bench-spec <model> <requests.jsonl>")?;
-    let (mut ctx, mut passes, mut greedy) = (16_384usize, vec!["off".to_string(), "on".to_string()], false);
+    let (mut ctx, mut passes, mut greedy) = (
+        16_384usize,
+        vec!["off".to_string(), "on".to_string()],
+        false,
+    );
     let mut dump: Option<String> = None;
     let mut it = args[2..].iter();
     while let Some(a) = it.next() {
@@ -566,7 +580,11 @@ fn bench_spec(backend: Backend, args: &[String]) -> Result<()> {
         reqs.push(r);
     }
     let dir = tang_llm::resolve_model(spec)?;
-    eprintln!("bench-spec {} on {backend:?}: {} requests", dir.display(), reqs.len());
+    eprintln!(
+        "bench-spec {} on {backend:?}: {} requests",
+        dir.display(),
+        reqs.len()
+    );
     let mut draft = draft_config(backend, spec);
     draft.store = None;
     on_backend!(backend, bench_spec_on(&dir, ctx, reqs, passes, draft, dump))
@@ -679,7 +697,11 @@ fn bench_spec_on<D: ComputeDevice>(
         }
     }
     if texts.len() >= 2 {
-        let same = texts[0].iter().zip(&texts[1]).filter(|(a, b)| a == b).count();
+        let same = texts[0]
+            .iter()
+            .zip(&texts[1])
+            .filter(|(a, b)| a == b)
+            .count();
         println!("\noutputs identical: {same}/{}", texts[0].len());
         for (i, (a, b)) in texts[0].iter().zip(&texts[1]).enumerate() {
             if a != b {
@@ -697,12 +719,17 @@ fn sim_spec(files: &[String]) -> Result<()> {
     let mut global = Global::new(cfg.global_tokens, None);
     let mut calib = Calibration::default();
     let cost = CostModel::new(cfg.max_draft + 1).table(&cfg, cfg.max_draft + 1);
-    let (mut toks, mut fwds, mut units, mut drafted, mut accepted) = (0usize, 0usize, 0f64, 0usize, 0usize);
+    let (mut toks, mut fwds, mut units, mut drafted, mut accepted) =
+        (0usize, 0usize, 0f64, 0usize, 0usize);
     for f in files {
         for line in std::fs::read_to_string(f)?.lines() {
             let v: serde_json::Value = serde_json::from_str(line)?;
             let ids = |k: &str| -> Vec<u32> {
-                v[k].as_array().into_iter().flatten().filter_map(|x| x.as_u64().map(|x| x as u32)).collect()
+                v[k].as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|x| x.as_u64().map(|x| x as u32))
+                    .collect()
             };
             let (prompt, out) = (ids("prompt"), ids("out"));
             let mut s = Session::new(&cfg, &global, calib.clone(), cost.clone(), &prompt);
