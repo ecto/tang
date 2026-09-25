@@ -87,6 +87,63 @@ fn compare<D: ComputeDevice>(dev: D, dir: &Path, name: &str) {
     check(&format!("{name} decode, last {STEPS}"), &got, tail, vocab);
 }
 
+/// A k-token forward on a cached prefix (a speculative-decoding verify step, or a short
+/// incremental prefill) against the same tokens decoded one at a time, for k up to 32 so every
+/// small-batch path (split-KV attention, the few-row GEMVs and GEMMs) is covered. The prefix is
+/// long enough that attention spans several key splits.
+fn verify_matches_decode<D: ComputeDevice>(dev: D, dir: &Path, name: &str) {
+    let tok = Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer.json");
+    let text = "fn main() { let xs: Vec<u32> = (0..10).map(|i| i * i).collect(); \
+                println!(\"{:?}\", xs); } // The quick brown fox jumps over the lazy dog.\n";
+    let mut ids = Vec::new();
+    while ids.len() < 700 {
+        ids.extend(tok.encode(text, false).expect("encode").get_ids());
+    }
+    let ks = [2usize, 3, 5, 8, 13, 32];
+    let max_k = *ks.iter().max().unwrap();
+    let prefix = 600;
+    ids.truncate(prefix + max_k);
+    let model = Model::load(dev, dir, prefix + max_k + 8, Dtype::Bf16).expect("load");
+    let vocab = model.cfg.vocab_size;
+    let mut cache = model.new_cache();
+    for chunk in ids[..prefix].chunks(256) {
+        model.forward(chunk, &mut cache, false).unwrap();
+    }
+    // Reference: one token at a time.
+    let mut want = Vec::new();
+    for &id in &ids[prefix..] {
+        want.extend(model.forward(&[id], &mut cache, false).unwrap());
+    }
+    for k in ks {
+        cache.truncate(prefix);
+        let got = model
+            .forward(&ids[prefix..prefix + k], &mut cache, true)
+            .unwrap();
+        check(
+            &format!("{name} {k}-token forward vs {k} decodes"),
+            &got,
+            &want[..k * vocab],
+            vocab,
+        );
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_verify_matches_decode() {
+    let Some(dir) = model_dir() else { return };
+    let dev = tang_compute::CudaComputeDevice::new().expect("no CUDA device");
+    verify_matches_decode(dev, &dir, "cuda");
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_verify_matches_decode() {
+    let Some(dir) = model_dir() else { return };
+    let dev = tang_compute::MetalDevice::new().expect("no Metal device");
+    verify_matches_decode(dev, &dir, "metal");
+}
+
 #[cfg(feature = "cuda")]
 #[test]
 fn cuda_logits_match_cpu() {

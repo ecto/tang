@@ -327,6 +327,143 @@ impl MetalDevice {
         }
     }
 
+    /// `x · wᵀ` for 2..=32 rows over 4-bit or bf16 weights with `qmm_small_*` /
+    /// `gemm_small_bf16_*`: the weights are read once for all the rows, and K is split when the
+    /// columns alone give too few threadgroups.
+    fn gemm_small(
+        &self,
+        x: &MetalBuffer,
+        w: &MetalBuffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> MetalBuffer {
+        let out = self.make_buffer_empty(m * n * 4);
+        let (group, (so, bo)) = match w.kind {
+            Kind::Q4 { group } => (group, w.q4_offsets(group as usize)),
+            _ => (32, (0, 0)),
+        };
+        let name = match (w.kind == Kind::Bf16, m) {
+            (false, ..=8) => "qmm_small_8",
+            (false, ..=16) => "qmm_small_16",
+            (false, _) => "qmm_small_32",
+            (true, ..=8) => "gemm_small_bf16_8",
+            (true, ..=16) => "gemm_small_bf16_16",
+            (true, _) => "gemm_small_bf16_32",
+        };
+        let pipeline = self.get_pipeline(llm_msl::Q4_MSL, name);
+        // Each split keeps at least 8 steps of 32.
+        let (col_groups, steps) = (n.div_ceil(128), k / 32);
+        let want = SMALL_GEMM_GROUPS.div_ceil(col_groups);
+        let per = steps.div_ceil(want.clamp(1, (steps / 8).max(1)));
+        let splits = steps.div_ceil(per);
+        let params = self.make_buffer_u32(&[m as u32, k as u32, n as u32, group, per as u32]);
+        let partial = (splits > 1).then(|| self.make_buffer_empty(splits * m * n * 4));
+        self.with_encoder(|enc| {
+            enc.set_compute_pipeline_state(&pipeline);
+            enc.set_buffer(0, Some(&x.buffer), 0);
+            enc.set_buffer(1, Some(&w.buffer), 0);
+            enc.set_buffer(2, Some(&w.buffer), so);
+            enc.set_buffer(3, Some(&w.buffer), bo);
+            enc.set_buffer(4, Some(partial.as_ref().unwrap_or(&out)), 0);
+            enc.set_buffer(5, Some(&params), 0);
+            enc.dispatch_thread_groups(
+                MTLSize::new(col_groups as u64, splits as u64, 1),
+                MTLSize::new(256, 1, 1),
+            );
+        });
+        if let Some(p) = partial {
+            let sum = self.get_pipeline(llm_msl::Q4_MSL, "sum_splits");
+            let sp = self.make_buffer_u32(&[(m * n) as u32, splits as u32]);
+            self.dispatch(&sum, &[&p, &out, &sp], (m * n) as u64);
+        }
+        MetalBuffer {
+            buffer: out,
+            len: m * n,
+            kind: Kind::F32,
+        }
+    }
+
+    /// Split-KV attention for a few queries (`llm_msl::FLASH_MULTI_MSL`, then
+    /// `attn_combine`): threadgroups over (KV head, key split, group of (query, head) rows),
+    /// each reading its split's keys once for all the rows.
+    #[allow(clippy::too_many_arguments)]
+    fn flash_multi(
+        &self,
+        q: &MetalBuffer,
+        k: &MetalBuffer,
+        v: &MetalBuffer,
+        cache_start: usize,
+        q_len: usize,
+        n_heads: usize,
+        n_kv: usize,
+        d: usize,
+        window: usize,
+        bidir: bool,
+    ) -> MetalBuffer {
+        let gqa_rows = q_len * (n_heads / n_kv);
+        let (name, rows, tile, threads) = match (d <= 128, gqa_rows) {
+            (false, _) => ("attn_multi_d256", 8, 16, 128),
+            (true, ..=4) => ("attn_multi_r4", 4, 32, 128),
+            (true, ..=8) => ("attn_multi_r8", 8, 32, 256),
+            (true, ..=16) => ("attn_multi_r16", 16, 32, 256),
+            _ => ("attn_multi_r32", 32, 16, 256),
+        };
+        let longest = cache_start + q_len;
+        let base = if window > 0 && !bidir {
+            (cache_start + 1).saturating_sub(window)
+        } else {
+            0
+        };
+        let span = longest - base;
+        let groups = gqa_rows.div_ceil(rows);
+        let want = MULTI_ATTN_GROUPS.div_ceil(n_kv * groups).max(1);
+        let split_len = span.div_ceil(want).max(2 * tile).next_multiple_of(tile);
+        let n_splits = span.div_ceil(split_len);
+        let params = self.make_buffer_u32(&[
+            cache_start as u32,
+            q_len as u32,
+            n_heads as u32,
+            n_kv as u32,
+            d as u32,
+            n_splits as u32,
+            split_len as u32,
+            window as u32,
+            base as u32,
+            bidir as u32,
+        ]);
+        let partial = self.make_buffer_empty(q_len * n_heads * n_splits * (d + 2) * 4);
+        let out = self.make_buffer_empty(q_len * n_heads * d * 4);
+        let p1 = self.get_pipeline(llm_msl::FLASH_MULTI_MSL, name);
+        let p2 = self.get_pipeline(llm_msl::FLASH_DECODE_MSL, "attn_combine");
+        self.with_encoder(|enc| {
+            enc.set_compute_pipeline_state(&p1);
+            for (i, b) in [&q.buffer, &k.buffer, &v.buffer, &partial, &params]
+                .iter()
+                .enumerate()
+            {
+                enc.set_buffer(i as u64, Some(b), 0);
+            }
+            enc.dispatch_thread_groups(
+                MTLSize::new(n_kv as u64, n_splits as u64, groups as u64),
+                MTLSize::new(threads, 1, 1),
+            );
+            enc.set_compute_pipeline_state(&p2);
+            for (i, b) in [&partial, &out, &params].iter().enumerate() {
+                enc.set_buffer(i as u64, Some(b), 0);
+            }
+            enc.dispatch_thread_groups(
+                MTLSize::new(n_heads as u64, q_len as u64, 1),
+                MTLSize::new(32, 1, 1),
+            );
+        });
+        MetalBuffer {
+            buffer: out,
+            len: q_len * n_heads * d,
+            kind: Kind::F32,
+        }
+    }
+
     /// Split-KV attention (`llm_msl::FLASH_DECODE_MSL`). Decode splits the keys across up to 32
     /// threadgroups per head; prefill already has a threadgroup per (query, head).
     #[allow(clippy::too_many_arguments)]
@@ -428,6 +565,24 @@ impl MetalDevice {
             kind: Kind::F32,
         }
     }
+}
+
+/// Forwards of up to this many queries use split-KV attention (`flash_multi`) instead of the
+/// tiled prefill kernel, which has too few threadgroups to stream a long cache quickly.
+const MULTI_ATTN_ROWS: usize = 32;
+
+/// Batches of 2 up to this many rows run `qmm_small_*` (weights read once for all the rows)
+/// instead of the tiled matmul.
+const SMALL_GEMM_ROWS: usize = 32;
+
+/// Threadgroups `qmm_small_*` aims for (K is split until there are about this many).
+const SMALL_GEMM_GROUPS: usize = 160;
+
+/// Threadgroups `flash_multi` aims for (keys are split until there are about this many).
+const MULTI_ATTN_GROUPS: usize = 256;
+
+fn multi_attn(q_len: usize, n_heads: usize, n_kv: usize, d: usize) -> bool {
+    q_len >= 1 && q_len <= MULTI_ATTN_ROWS && d % 4 == 0 && d <= 256 && n_heads % n_kv == 0
 }
 
 impl ComputeDevice for MetalDevice {
@@ -962,6 +1117,20 @@ kernel void embedding(
         n_kv_heads: usize,
         head_dim: usize,
     ) -> MetalBuffer {
+        if multi_attn(q_len, n_heads, n_kv_heads, head_dim) {
+            return self.flash_multi(
+                q,
+                k_cache,
+                v_cache,
+                cache_start,
+                q_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                0,
+                false,
+            );
+        }
         // Tiled prefill needs K/V readable to a 32-row boundary past the end.
         let kv_rows_needed = (cache_start + q_len).next_multiple_of(32);
         if q_len > 1
@@ -1407,6 +1576,20 @@ kernel void embedding(
             head_dim <= 256 && n_heads % n_kv_heads == 0,
             "windowed or bidirectional attention needs head_dim at most 256"
         );
+        if multi_attn(q_len, n_heads, n_kv_heads, head_dim) {
+            return self.flash_multi(
+                q,
+                k_cache,
+                v_cache,
+                cache_start,
+                q_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                window,
+                !causal,
+            );
+        }
         self.flash_attention(
             q,
             k_cache,
@@ -1621,6 +1804,33 @@ kernel void bias_add(
     ) -> MetalBuffer {
         if let Kind::Q4 { group } = w.kind {
             let out = self.make_buffer_empty(m * n * 4);
+            if (2..=4).contains(&m) && k % 16 == 0 {
+                // A few rows: the GEMV that unpacks each weight once for all of them.
+                let pipeline = self.get_pipeline(llm_msl::Q4_MSL, "gemv_q4_rows");
+                let (so, bo) = w.q4_offsets(group as usize);
+                let params = self.make_buffer_u32(&[m as u32, k as u32, n as u32, group]);
+                self.with_encoder(|enc| {
+                    enc.set_compute_pipeline_state(&pipeline);
+                    enc.set_buffer(0, Some(&x.buffer), 0);
+                    enc.set_buffer(1, Some(&w.buffer), 0);
+                    enc.set_buffer(2, Some(&w.buffer), so);
+                    enc.set_buffer(3, Some(&w.buffer), bo);
+                    enc.set_buffer(4, Some(&out), 0);
+                    enc.set_buffer(5, Some(&params), 0);
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(n.div_ceil(8) as u64, 1, 1),
+                        MTLSize::new(64, 1, 1),
+                    );
+                });
+                return MetalBuffer {
+                    buffer: out,
+                    len: m * n,
+                    kind: Kind::F32,
+                };
+            }
+            if (2..=SMALL_GEMM_ROWS).contains(&m) && k % 32 == 0 {
+                return self.gemm_small(x, w, m, k, n);
+            }
             let params = self.make_buffer_u32(&[m as u32, k as u32, n as u32, group]);
             let (so, bo) = w.q4_offsets(group as usize);
             let (name, groups, threads) = if m <= 8 {
@@ -1647,6 +1857,9 @@ kernel void bias_add(
                 len: m * n,
                 kind: Kind::F32,
             };
+        }
+        if w.kind == Kind::Bf16 && (5..=SMALL_GEMM_ROWS).contains(&m) && k % 32 == 0 {
+            return self.gemm_small(x, w, m, k, n);
         }
         if w.kind == Kind::Bf16 {
             let out = self.make_buffer_empty(m * n * 4);
