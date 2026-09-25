@@ -131,11 +131,11 @@ fn same(a: &[u8], b: &[u8]) -> bool {
 }
 
 async fn models(State(app): State<App>) -> Json<Value> {
-    let caps: Vec<&str> = if app.vision {
-        vec!["completion", "vision"]
-    } else {
-        vec!["completion"]
-    };
+    // `thinking_budget`: requests may cap reasoning tokens (see `engine::ThinkBudget`).
+    let mut caps = vec!["completion", "thinking_budget"];
+    if app.vision {
+        caps.push("vision");
+    }
     Json(json!({
         "object": "list",
         "data": [{ "id": app.model, "object": "model", "owned_by": "tang", "max_model_len": app.ctx, "capabilities": caps }],
@@ -205,6 +205,26 @@ mod tests {
         assert_eq!(n[2]["content"], "");
     }
 
+    #[test]
+    fn thinking_budget_from_the_field_the_kwargs_or_the_effort() {
+        use super::thinking_budget as tb;
+        assert_eq!(tb(&serde_json::json!({})), None);
+        assert_eq!(
+            tb(&serde_json::json!({ "thinking_budget": 512 })),
+            Some(512)
+        );
+        assert_eq!(tb(&serde_json::json!({ "thinking_budget": -1 })), None);
+        let kw = serde_json::json!({ "chat_template_kwargs": { "thinking_budget": 256 } });
+        assert_eq!(tb(&kw), Some(256));
+        assert_eq!(
+            tb(&serde_json::json!({ "reasoning_effort": "low" })),
+            Some(1024)
+        );
+        assert_eq!(tb(&serde_json::json!({ "reasoning_effort": "high" })), None);
+        let both = serde_json::json!({ "thinking_budget": 100, "reasoning_effort": "low" });
+        assert_eq!(tb(&both), Some(100));
+    }
+
     use super::{collect_response, stream_response, Out};
     use crate::chat::Piece;
     use crate::engine::{Finish, Usage};
@@ -225,6 +245,7 @@ mod tests {
             prompt_tokens: 1,
             cached_tokens: 0,
             completion_tokens: 1,
+            reasoning_tokens: 0,
             prefill_tok_s: 0.0,
             decode_tok_s: 0.0,
         };
@@ -295,7 +316,9 @@ fn parse(body: &Value) -> Result<Request, String> {
         tools: body.get("tools").cloned().filter(|t| !t.is_null()),
         think: body["chat_template_kwargs"]["enable_thinking"]
             .as_bool()
-            .or(body["think"].as_bool()),
+            .or(body["think"].as_bool())
+            .or((body["reasoning_effort"] == "none").then_some(false)),
+        thinking_budget: thinking_budget(body),
         sampling: Sampling {
             temperature: f("temperature").map(|v| v as f32).unwrap_or(d.temperature),
             top_p: f("top_p").map(|v| v as f32).unwrap_or(d.top_p),
@@ -325,6 +348,21 @@ fn parse(body: &Value) -> Result<Request, String> {
     })
 }
 
+/// Reasoning token caps for OpenAI's `reasoning_effort` (`high` is unlimited).
+const EFFORT: [(&str, usize); 3] = [("minimal", 0), ("low", 1024), ("medium", 4096)];
+
+/// The cap on reasoning tokens: `thinking_budget` (top level, or in `chat_template_kwargs` as
+/// some servers take it), else from `reasoning_effort`. Negative or absent is unlimited.
+fn thinking_budget(body: &Value) -> Option<usize> {
+    let n = |v: &Value| v.as_u64().map(|n| n as usize);
+    n(&body["thinking_budget"])
+        .or_else(|| n(&body["chat_template_kwargs"]["thinking_budget"]))
+        .or_else(|| {
+            let effort = body["reasoning_effort"].as_str()?;
+            EFFORT.iter().find(|(e, _)| *e == effort).map(|(_, n)| *n)
+        })
+}
+
 fn finish_reason(f: Finish) -> &'static str {
     match f {
         Finish::Stop | Finish::Cancelled => "stop",
@@ -339,6 +377,7 @@ fn usage_json(u: &Usage) -> Value {
         "completion_tokens": u.completion_tokens,
         "total_tokens": u.prompt_tokens + u.completion_tokens,
         "prompt_tokens_details": { "cached_tokens": u.cached_tokens },
+        "completion_tokens_details": { "reasoning_tokens": u.reasoning_tokens },
         "timings": { "prompt_per_second": u.prefill_tok_s, "predicted_per_second": u.decode_tok_s },
     })
 }
