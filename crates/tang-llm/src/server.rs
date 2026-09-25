@@ -198,6 +198,7 @@ fn normalize_messages(messages: &Value) -> Result<(Value, Vec<Vec<u8>>), String>
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     #[test]
     fn content_is_always_a_string() {

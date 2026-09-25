@@ -157,7 +157,7 @@ impl Config {
     /// Sliding window for layer `l` (0 = global attention).
     pub fn window(&self, l: usize) -> usize {
         match (self.sliding_window, self.sliding_window_pattern) {
-            (Some(w), Some(p)) if p > 1 && (l + 1) % p != 0 => w,
+            (Some(w), Some(p)) if p > 1 && !(l + 1).is_multiple_of(p) => w,
             _ => 0,
         }
     }

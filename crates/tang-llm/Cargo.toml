@@ -11,7 +11,7 @@ categories = ["science"]
 publish = false
 
 [features]
-default = ["metal"]
+default = []
 metal = ["tang-compute/metal"]
 # NVIDIA GPUs. On Linux, build with `--no-default-features --features cuda` (Metal is macOS-only).
 cuda = ["tang-compute/cuda"]
