@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
@@ -70,6 +69,25 @@ jobs:
           --exclude tang-site-wasm
           --exclude tang-sheffer-wasm
           --exclude tang-gpu
+
+  metal:
+    name: metal (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build and test tang-compute with Metal
+        run: |
+          cargo build -p tang-compute --features metal
+          cargo test -p tang-compute --features metal
+      # tang-llm is not on main yet; build and test it wherever the crate exists.
+      # Its model-backed tests skip themselves when TANG_LLM_TEST_MODEL is unset.
+      - name: Build and test tang-llm with Metal
+        if: ${{ hashFiles('crates/tang-llm/Cargo.toml') != '' }}
+        run: |
+          cargo build -p tang-llm --features metal
+          cargo test -p tang-llm --features metal --lib --tests --bins
 
   wasm:
     name: wasm build
