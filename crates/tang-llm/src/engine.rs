@@ -375,13 +375,10 @@ impl<D: ComputeDevice> Engine<D> {
         // every draft position. Every token is still sampled from the target's logits in order,
         // with the same sampler state, so the output is what plain decoding would produce; a
         // draft token only saves a forward when it equals the sampled token.
-        let mut sess = self
-            .spec
-            .as_ref()
-            .map(|s| {
-                let cost = s.cost.table(&s.cfg, s.cfg.max_draft + 1);
-                Session::new(&s.cfg, &s.global, s.calib.clone(), cost, &ids)
-            });
+        let mut sess = self.spec.as_ref().map(|s| {
+            let cost = s.cost.table(&s.cfg, s.cfg.max_draft + 1);
+            Session::new(&s.cfg, &s.global, s.calib.clone(), cost, &ids)
+        });
         // Decode forwards timed by width, for the cost model and stats.
         let mut timed: Vec<(usize, f64)> = Vec::new();
         let vocab = self.model.cfg.vocab_size;
@@ -466,8 +463,8 @@ impl<D: ComputeDevice> Engine<D> {
             // A new draft, unless the wrap-up was just forced in (don't draft across it).
             draft = match sess.as_ref() {
                 Some(s) if !wrap => {
-                    let room = (limit - out.len())
-                        .min(max_ctx.saturating_sub(self.cache.len + fed.len()));
+                    let room =
+                        (limit - out.len()).min(max_ctx.saturating_sub(self.cache.len + fed.len()));
                     s.propose(room)
                 }
                 _ => crate::draft::Draft::default(),

@@ -68,7 +68,12 @@ fn requests() -> Vec<(&'static str, Request)> {
         top_p: 0.95,
         seed: 42,
     };
-    let req = |msg: String, think: bool, budget: Option<usize>, s: &Sampling, max: usize, stop: &[&str]| Request {
+    let req = |msg: String,
+               think: bool,
+               budget: Option<usize>,
+               s: &Sampling,
+               max: usize,
+               stop: &[&str]| Request {
         messages: json!([{ "role": "user", "content": msg }]),
         images: vec![],
         tools: None,
@@ -82,14 +87,59 @@ fn requests() -> Vec<(&'static str, Request)> {
         "Here is src/words.rs:\n\n```rust\n{CODE}```\n\nRename `word_counts` to `count_words` everywhere and output the whole updated file in a rust code block, nothing else."
     );
     vec![
-        ("edit/greedy", req(edit.clone(), false, None, &greedy, 400, &[])),
-        ("edit/seeded", req(edit.clone(), false, None, &seeded, 400, &[])),
-        ("chat/greedy", req("Write a short poem about a lighthouse keeper.".into(), false, None, &greedy, 120, &[])),
-        ("chat/seeded", req("Explain what a suffix automaton is in three sentences.".into(), false, None, &seeded, 120, &[])),
-        ("think+budget/greedy", req(edit.clone(), true, Some(40), &greedy, 200, &[])),
-        ("think+budget/seeded", req("What is 17 * 23? Answer briefly.".into(), true, Some(24), &seeded, 120, &[])),
-        ("stop/greedy", req(edit.clone(), false, None, &greedy, 300, &["top_words"])),
-        ("short-limit/greedy", req(edit, false, None, &greedy, 37, &[])),
+        (
+            "edit/greedy",
+            req(edit.clone(), false, None, &greedy, 400, &[]),
+        ),
+        (
+            "edit/seeded",
+            req(edit.clone(), false, None, &seeded, 400, &[]),
+        ),
+        (
+            "chat/greedy",
+            req(
+                "Write a short poem about a lighthouse keeper.".into(),
+                false,
+                None,
+                &greedy,
+                120,
+                &[],
+            ),
+        ),
+        (
+            "chat/seeded",
+            req(
+                "Explain what a suffix automaton is in three sentences.".into(),
+                false,
+                None,
+                &seeded,
+                120,
+                &[],
+            ),
+        ),
+        (
+            "think+budget/greedy",
+            req(edit.clone(), true, Some(40), &greedy, 200, &[]),
+        ),
+        (
+            "think+budget/seeded",
+            req(
+                "What is 17 * 23? Answer briefly.".into(),
+                true,
+                Some(24),
+                &seeded,
+                120,
+                &[],
+            ),
+        ),
+        (
+            "stop/greedy",
+            req(edit.clone(), false, None, &greedy, 300, &["top_words"]),
+        ),
+        (
+            "short-limit/greedy",
+            req(edit, false, None, &greedy, 37, &[]),
+        ),
     ]
 }
 
@@ -101,7 +151,9 @@ fn run<D: ComputeDevice>(e: &mut Engine<D>, r: &Request) -> (String, Usage, Vec<
             match p {
                 Piece::Reasoning(t) => out.push_str(&format!("[r]{t}")),
                 Piece::Text(t) => out.push_str(&t),
-                Piece::ToolCall { name, arguments } => out.push_str(&format!("[call {name} {arguments}]")),
+                Piece::ToolCall { name, arguments } => {
+                    out.push_str(&format!("[call {name} {arguments}]"))
+                }
             }
             true
         })
@@ -165,7 +217,10 @@ fn bitwise_exact_with_short_drafts() {
         assert!(cache_same, "{name}: the KV cache holds different tokens");
     }
     let edit = &rows[0].4;
-    assert!(edit.accepted_tokens > 50, "the edit task should accept many drafts: {edit:?}");
+    assert!(
+        edit.accepted_tokens > 50,
+        "the edit task should accept many drafts: {edit:?}"
+    );
 }
 
 #[test]
@@ -178,7 +233,12 @@ fn default_drafts_match() {
     for (name, same, off, on, _, cache_same) in &rows {
         if !same || !cache_same {
             let i = first_diff(off, on);
-            eprintln!("{name}: differs at byte {i} of {}: off {:?} / on {:?}", off.len(), &off[i.saturating_sub(40)..(i + 40).min(off.len())], &on[i.saturating_sub(40)..(i + 40).min(on.len())]);
+            eprintln!(
+                "{name}: differs at byte {i} of {}: off {:?} / on {:?}",
+                off.len(),
+                &off[i.saturating_sub(40)..(i + 40).min(off.len())],
+                &on[i.saturating_sub(40)..(i + 40).min(on.len())]
+            );
             bad.push(name.clone());
         }
     }

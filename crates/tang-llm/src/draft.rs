@@ -507,7 +507,11 @@ impl DraftConfig {
         let n = pts.len();
         let (k0, c0) = pts[n.saturating_sub(2)];
         let (k1, c1) = pts[n - 1];
-        let slope = if k1 > k0 { (c1 - c0) / (k1 - k0) as f32 } else { 0.0 };
+        let slope = if k1 > k0 {
+            (c1 - c0) / (k1 - k0) as f32
+        } else {
+            0.0
+        };
         c1 + slope * (k - k1) as f32
     }
 }
@@ -516,7 +520,10 @@ impl DraftConfig {
 const BUCKETS: [usize; 8] = [1, 2, 3, 5, 8, 16, 32, usize::MAX];
 
 fn bucket(n: usize) -> usize {
-    BUCKETS.iter().position(|&b| n <= b).unwrap_or(BUCKETS.len() - 1)
+    BUCKETS
+        .iter()
+        .position(|&b| n <= b)
+        .unwrap_or(BUCKETS.len() - 1)
 }
 
 /// Per-token hit rates by match length: how often a drafted token (whose predecessors were all
@@ -669,7 +676,9 @@ impl<'a> Session<'a> {
     /// The draft to verify next, at most `room` tokens: the best source's continuation, cut
     /// where expected tokens per verify cost peaks.
     pub fn propose(&self, room: usize) -> Draft {
-        let room = room.min(self.cfg.max_draft).min(self.cost.len().saturating_sub(2));
+        let room = room
+            .min(self.cfg.max_draft)
+            .min(self.cost.len().saturating_sub(2));
         if room == 0 {
             return Draft::default();
         }
@@ -779,7 +788,13 @@ mod tests {
         let code: Vec<u32> = (100..140).collect();
         let mut prompt = code.clone();
         prompt.extend([1, 2, 3]);
-        let mut s = Session::new(&cfg, &g, cal.clone(), CostModel::new(17).table(&cfg, 17), &prompt);
+        let mut s = Session::new(
+            &cfg,
+            &g,
+            cal.clone(),
+            CostModel::new(17).table(&cfg, 17),
+            &prompt,
+        );
         for &t in &code[..12] {
             s.push(t);
         }
@@ -795,7 +810,13 @@ mod tests {
         let old: Vec<u32> = (500..540).collect();
         g.push(&old);
         let cal = Calibration::default();
-        let mut s = Session::new(&cfg, &g, cal.clone(), CostModel::new(17).table(&cfg, 17), &[1, 2, 3]);
+        let mut s = Session::new(
+            &cfg,
+            &g,
+            cal.clone(),
+            CostModel::new(17).table(&cfg, 17),
+            &[1, 2, 3],
+        );
         for &t in &old[..10] {
             s.push(t);
         }
@@ -826,7 +847,13 @@ mod tests {
         let cfg = cfg();
         let g = Global::new(0, None);
         let cal = Calibration::default();
-        let s = Session::new(&cfg, &g, cal.clone(), CostModel::new(17).table(&cfg, 17), &[1, 2, 3, 4]);
+        let s = Session::new(
+            &cfg,
+            &g,
+            cal.clone(),
+            CostModel::new(17).table(&cfg, 17),
+            &[1, 2, 3, 4],
+        );
         assert!(s.propose(16).tokens.is_empty());
         assert!((cfg.cost(3) - (1.17 + 1.74) / 2.0).abs() < 1e-5);
         assert!(cfg.cost(64) > cfg.cost(32));
