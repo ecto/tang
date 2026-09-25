@@ -6,6 +6,8 @@
 //! Skipped without it. `TANG_LLM_TEST_TOKENS` sets the prompt length (default 48). Run with
 //! `--release`: the CPU reference is slow.
 
+#![cfg(any(feature = "metal", feature = "cuda"))]
+
 use std::path::{Path, PathBuf};
 use tang_compute::{ComputeDevice, CpuDevice};
 use tang_llm::{Dtype, Model};
