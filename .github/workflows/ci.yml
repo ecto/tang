@@ -88,6 +88,13 @@ jobs:
         run: |
           cargo build -p tang-llm --features metal
           cargo test -p tang-llm --features metal --lib --tests --bins
+      - name: Build tang-llm-ios (Mac, and the iOS staticlib)
+        if: ${{ hashFiles('crates/tang-llm-ios/Cargo.toml') != '' }}
+        run: |
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+          cargo build -p tang-llm-ios --lib --examples
+          cargo build -p tang-llm-ios --lib --target aarch64-apple-ios
+          cargo build -p tang-llm-ios --lib --target aarch64-apple-ios-sim
 
   wasm:
     name: wasm build

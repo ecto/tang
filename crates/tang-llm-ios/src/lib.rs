@@ -1,6 +1,7 @@
 //! A C ABI over tang-llm for iOS, where the model has to run in-process instead of behind the
 //! `tang-llm serve` sidecar. Strings cross as UTF-8; every string tang returns is freed with
 //! [`tang_string_free`]. Results and errors come back as JSON.
+#![cfg(target_vendor = "apple")]
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
@@ -51,13 +52,18 @@ pub unsafe extern "C" fn tang_load(
         let t = Instant::now();
         let dtype = if q4 { Dtype::Q4 } else { Dtype::Bf16 };
         let engine = Engine::load(dev, Path::new(dir), max_ctx as usize, dtype)?;
-        Ok(Handle { engine, load_s: t.elapsed().as_secs_f64() })
+        Ok(Handle {
+            engine,
+            load_s: t.elapsed().as_secs_f64(),
+        })
     };
     match load() {
         Ok(h) => Box::into_raw(Box::new(h)),
         Err(e) => {
             if !error.is_null() {
-                *error = CString::new(format!("{e:#}")).unwrap_or_default().into_raw();
+                *error = CString::new(format!("{e:#}"))
+                    .unwrap_or_default()
+                    .into_raw();
             }
             std::ptr::null_mut()
         }
@@ -81,7 +87,9 @@ pub unsafe extern "C" fn tang_string_free(s: *mut c_char) {
 /// What the model is and how long it took to load.
 #[no_mangle]
 pub unsafe extern "C" fn tang_info(h: *mut Handle) -> *mut c_char {
-    let Some(h) = h.as_ref() else { return err(anyhow!("null handle")) };
+    let Some(h) = h.as_ref() else {
+        return err(anyhow!("null handle"));
+    };
     let c = &h.engine.model.cfg;
     out(json!({
         "model_type": c.model_type,
@@ -110,7 +118,10 @@ fn run(e: &mut Engine<MetalDevice>, messages: Value, max_tokens: usize) -> Resul
         tools: None,
         think: Some(false),
         thinking_budget: None,
-        sampling: Sampling { temperature: 0.0, ..Sampling::default() },
+        sampling: Sampling {
+            temperature: 0.0,
+            ..Sampling::default()
+        },
         max_tokens: Some(max_tokens),
         stop: Vec::new(),
     };
@@ -136,8 +147,14 @@ fn prompt_of(e: &Engine<MetalDevice>, tokens: usize) -> Result<String> {
 /// Cold prefill of about `prompt_tokens`, then `gen_tokens` of decode; then a warm follow-up
 /// turn that reuses the KV cache, as an agent's next step would.
 #[no_mangle]
-pub unsafe extern "C" fn tang_bench(h: *mut Handle, prompt_tokens: u32, gen_tokens: u32) -> *mut c_char {
-    let Some(h) = h.as_mut() else { return err(anyhow!("null handle")) };
+pub unsafe extern "C" fn tang_bench(
+    h: *mut Handle,
+    prompt_tokens: u32,
+    gen_tokens: u32,
+) -> *mut c_char {
+    let Some(h) = h.as_mut() else {
+        return err(anyhow!("null handle"));
+    };
     let mut bench = || -> Result<Value> {
         let e = &mut h.engine;
         e.reset();
@@ -163,7 +180,9 @@ pub unsafe extern "C" fn tang_chat(
     on_text: extern "C" fn(*const c_char, *mut c_void) -> bool,
     ctx: *mut c_void,
 ) -> *mut c_char {
-    let Some(h) = h.as_mut() else { return err(anyhow!("null handle")) };
+    let Some(h) = h.as_mut() else {
+        return err(anyhow!("null handle"));
+    };
     let mut chat = || -> Result<Value> {
         let messages: Value = serde_json::from_str(str_arg(messages)?)?;
         let req = Request {

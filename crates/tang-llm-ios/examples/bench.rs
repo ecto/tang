@@ -1,7 +1,14 @@
 //! The phone bench, on this Mac: `cargo run --release -p tang-llm-ios --example bench -- <model dir> [prompt] [gen]`.
+#![cfg_attr(not(target_vendor = "apple"), allow(unused))]
+#[cfg(target_vendor = "apple")]
 use std::ffi::{CStr, CString};
+#[cfg(target_vendor = "apple")]
 use tang_llm_ios::*;
 
+#[cfg(not(target_vendor = "apple"))]
+fn main() {}
+
+#[cfg(target_vendor = "apple")]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dir = tang_llm::resolve_model(&args[1]).unwrap();
