@@ -1,0 +1,18 @@
+[package]
+name = "tang-llm-ios"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "A C ABI over tang-llm, for linking into an iOS app (no sidecar processes there)"
+repository.workspace = true
+publish = false
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+tang-llm = { path = "../tang-llm" }
+tang-compute = { workspace = true, features = ["metal"] }
+serde_json = "1"
+anyhow = "1"
