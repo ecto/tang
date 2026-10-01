@@ -24,6 +24,7 @@ members = [
     "crates/tang-sheffer",
     "crates/tang-sheffer-wasm",
     "crates/tang-llm",
+    "crates/tang-llm-ios",
 ]
 
 [workspace.package]

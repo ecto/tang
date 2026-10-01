@@ -6029,6 +6029,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tang-llm-ios"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "tang-compute",
+ "tang-llm",
+]
+
+[[package]]
 name = "tang-mesh"
 version = "0.1.0"
 dependencies = [
