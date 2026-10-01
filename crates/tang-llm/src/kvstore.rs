@@ -6,6 +6,8 @@
 //! those positions hold. Saving after a turn appends only the new positions; a conversation
 //! that was rewound is cut back to what it still shares first. Exact: rows are stored as
 //! computed. The oldest files go when the directory passes its budget.
+//!
+//! [`Writer`] does the writing on its own thread, so a turn never waits on the disk.
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -138,6 +140,94 @@ impl Store {
     }
 }
 
+/// A save waiting for the writer thread.
+enum Job {
+    Write {
+        key: String,
+        tokens: Vec<u32>,
+        from: usize,
+        rows: Vec<f32>,
+    },
+    /// Answer once every earlier write is done.
+    Flush(std::sync::mpsc::SyncSender<()>),
+}
+
+/// A [`Store`] whose writes happen on a thread of their own, in order.
+pub struct Writer {
+    store: std::sync::Arc<Store>,
+    jobs: std::sync::mpsc::Sender<Job>,
+    /// Writes sent and not yet done.
+    pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Writer {
+    pub fn new(store: Store) -> Self {
+        use std::sync::atomic::Ordering;
+        let store = std::sync::Arc::new(store);
+        let pending = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (jobs, rx) = std::sync::mpsc::channel::<Job>();
+        let (s, p) = (store.clone(), pending.clone());
+        std::thread::spawn(move || {
+            for job in rx {
+                match job {
+                    Job::Write {
+                        key,
+                        tokens,
+                        from,
+                        rows,
+                    } => {
+                        if let Err(e) = s.write(&key, &tokens, from, &rows) {
+                            eprintln!("tang-llm: saving the KV cache: {e:#}");
+                        }
+                        p.fetch_sub(1, Ordering::Release);
+                    }
+                    Job::Flush(done) => {
+                        let _ = done.send(());
+                    }
+                }
+            }
+        });
+        Self {
+            store,
+            jobs,
+            pending,
+        }
+    }
+
+    /// The store, for reads. A read right after [`write`](Self::write) may not see it yet:
+    /// [`flush`](Self::flush) first where that matters.
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+
+    /// [`Store::write`], in the background.
+    pub fn write(&self, key: &str, tokens: Vec<u32>, from: usize, rows: Vec<f32>) {
+        self.pending
+            .fetch_add(1, std::sync::atomic::Ordering::Acquire);
+        let job = Job::Write {
+            key: key.to_string(),
+            tokens,
+            from,
+            rows,
+        };
+        if self.jobs.send(job).is_err() {
+            self.pending
+                .fetch_sub(1, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Wait for writes already sent (returns at once when there are none).
+    pub fn flush(&self) {
+        if self.pending.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        if self.jobs.send(Job::Flush(tx)).is_ok() {
+            let _ = rx.recv();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Store;
@@ -162,6 +252,18 @@ mod tests {
         assert_eq!(s.tokens("a"), vec![1, 9]);
         assert_eq!(s.read("a", 0, 2).unwrap(), vec![1.0, 2.0, 7.0, 8.0]);
         assert!(s.tokens("b").is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_writer_writes_in_order_and_flush_waits() {
+        let (s, dir) = store(1 << 21);
+        let w = super::Writer::new(s);
+        w.write("a", vec![1, 2], 0, vec![1.0, 2.0, 3.0, 4.0]);
+        w.write("a", vec![1, 3], 1, vec![5.0, 6.0]);
+        w.flush();
+        assert_eq!(w.store().tokens("a"), vec![1, 3]);
+        assert_eq!(w.store().read("a", 0, 2).unwrap(), vec![1.0, 2.0, 5.0, 6.0]);
         let _ = std::fs::remove_dir_all(dir);
     }
 
