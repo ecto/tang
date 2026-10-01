@@ -86,7 +86,7 @@ pub struct Engine<D: ComputeDevice> {
     /// are dropped to stay under it.
     kv_budget: Option<usize>,
     /// Conversations' caches on disk, by `prompt_cache_key`.
-    store: Option<crate::kvstore::Store>,
+    store: Option<crate::kvstore::Writer>,
     clock: u64,
     eos: Vec<u32>,
     /// `<think>` and `</think>`, when the model has them.
@@ -292,11 +292,11 @@ impl<D: ComputeDevice> Engine<D> {
     /// Keep conversations' caches on disk in `dir` (up to `budget` bytes), so one that lost its
     /// slot, or outlived the server, is read back instead of prefilled.
     pub fn set_kv_store(&mut self, dir: std::path::PathBuf, budget: u64) -> Result<()> {
-        self.store = Some(crate::kvstore::Store::new(
+        self.store = Some(crate::kvstore::Writer::new(crate::kvstore::Store::new(
             dir,
             budget,
             self.model.row_floats(),
-        )?);
+        )?));
         Ok(())
     }
 
@@ -309,16 +309,17 @@ impl<D: ComputeDevice> Engine<D> {
         if self.cache_key.as_deref() != Some(key) || !self.cache_images.is_empty() {
             return;
         }
-        let disk = store.tokens(key);
+        // An earlier save may still be on its way, so this can rewrite more than it must
+        // (never less): each write cuts the file back to where it starts.
+        let disk = store.store().tokens(key);
         let tokens = &self.cache.tokens;
         let common = disk.iter().zip(tokens).take_while(|(a, b)| a == b).count();
         if common == tokens.len() && common == disk.len() {
             return;
         }
+        // Read back from the device here; the disk write happens on the writer's thread.
         let rows = self.model.read_rows(&self.cache, common, tokens.len());
-        if let Err(e) = store.write(key, tokens, common, &rows) {
-            eprintln!("tang-llm: saving the KV cache: {e:#}");
-        }
+        store.write(key, tokens.clone(), common, rows);
     }
 
     /// Read back from disk what it has of this prompt beyond what the cache holds.
@@ -328,8 +329,16 @@ impl<D: ComputeDevice> Engine<D> {
         };
         let shared = |t: &[u32]| t.iter().zip(ids).take_while(|(a, b)| a == b).count();
         let have = shared(&self.cache.tokens);
-        // At least one prompt token is still fed, for the logits.
-        let want = shared(&store.tokens(key)).min(ids.len() - 1);
+        // At least one prompt token is still fed, for the logits. The token list is written
+        // last, so it's safe to look at while a write is under way; reading rows isn't, so wait
+        // for writes then (only when the disk is needed: usually the slot has it all).
+        let want = |store: &crate::kvstore::Store| shared(&store.tokens(key)).min(ids.len() - 1);
+        if want(store.store()) <= have {
+            return;
+        }
+        store.flush();
+        let store = store.store();
+        let want = want(store);
         if want <= have {
             return;
         }
