@@ -124,6 +124,7 @@ fn run(e: &mut Engine<MetalDevice>, messages: Value, max_tokens: usize) -> Resul
         },
         max_tokens: Some(max_tokens),
         stop: Vec::new(),
+        cache_key: None,
     };
     let mut text = String::new();
     let t = Instant::now();
@@ -194,6 +195,7 @@ pub unsafe extern "C" fn tang_chat(
             sampling: Sampling::default(),
             max_tokens: Some(max_tokens as usize),
             stop: Vec::new(),
+            cache_key: None,
         };
         let t = Instant::now();
         let (_, u) = h.engine.complete(&req, |p| match p {

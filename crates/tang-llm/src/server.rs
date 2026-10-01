@@ -140,7 +140,8 @@ fn same(a: &[u8], b: &[u8]) -> bool {
 
 async fn models(State(app): State<App>) -> Json<Value> {
     // `thinking_budget`: requests may cap reasoning tokens (see `engine::ThinkBudget`).
-    let mut caps = vec!["completion", "thinking_budget"];
+    // `prompt_cache_key`: requests may name their conversation's KV slot (see `crate::slots`).
+    let mut caps = vec!["completion", "thinking_budget", "prompt_cache_key"];
     if app.vision {
         caps.push("vision");
     }
@@ -356,6 +357,7 @@ pub fn parse(body: &Value) -> Result<Request, String> {
                 .collect(),
             _ => Vec::new(),
         },
+        cache_key: body["prompt_cache_key"].as_str().map(String::from),
     })
 }
 

@@ -30,6 +30,9 @@ pub struct Request {
     pub sampling: Sampling,
     pub max_tokens: Option<usize>,
     pub stop: Vec<String>,
+    /// The conversation this continues (`prompt_cache_key`), so it runs in that
+    /// conversation's KV slot.
+    pub cache_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -70,6 +73,14 @@ pub struct Engine<D: ComputeDevice> {
     /// Images in the cache: where each image's tokens start, and a hash of the image, so a
     /// shared prefix is only reused when the images in it are the same.
     cache_images: Vec<(usize, u64)>,
+    /// The active slot's conversation, and when it last ran (see [`crate::slots`]).
+    cache_key: Option<String>,
+    cache_used: u64,
+    /// Other conversations' caches, swapped in when a request names them.
+    parked: Vec<Slot<D::Buffer>>,
+    /// Most caches to keep, the active one included. Each is allocated on first use.
+    slots: usize,
+    clock: u64,
     eos: Vec<u32>,
     /// `<think>` and `</think>`, when the model has them.
     think_tags: Option<(u32, u32)>,
@@ -81,6 +92,14 @@ pub struct Engine<D: ComputeDevice> {
     last: (Vec<u32>, Vec<u32>),
     /// Decode forwards so far by width: (count, seconds).
     pub forwards: Vec<(usize, f64)>,
+}
+
+/// A KV cache parked while another conversation runs.
+struct Slot<B> {
+    cache: Cache<B>,
+    images: Vec<(usize, u64)>,
+    key: Option<String>,
+    used: u64,
 }
 
 /// Qwen3's suggested way to end reasoning early: say so, then close the block.
@@ -191,6 +210,11 @@ impl<D: ComputeDevice> Engine<D> {
             template,
             cache,
             cache_images: Vec::new(),
+            cache_key: None,
+            cache_used: 0,
+            parked: Vec::new(),
+            slots: 1,
+            clock: 0,
             eos,
             think_tags,
             wrap_up,
@@ -229,10 +253,69 @@ impl<D: ComputeDevice> Engine<D> {
         (&self.last.0, &self.last.1)
     }
 
-    /// Forget the KV cache (the next request prefills from scratch).
+    /// Forget every KV cache (the next request prefills from scratch).
     pub fn reset(&mut self) {
         self.cache.truncate(0);
         self.cache_images.clear();
+        for s in &mut self.parked {
+            s.cache.truncate(0);
+            s.images.clear();
+        }
+    }
+
+    /// Keep up to `n` conversations' KV caches (at least 1). Each costs a full context's
+    /// worth of device memory once used.
+    pub fn set_slots(&mut self, n: usize) {
+        self.slots = n.max(1);
+        self.parked.truncate(self.slots - 1);
+    }
+
+    pub fn slots(&self) -> usize {
+        self.slots
+    }
+
+    /// Make the slot for this request the active one.
+    fn select(&mut self, key: Option<&str>, ids: &[u32]) {
+        use crate::slots::{pick, Pick, View};
+        fn view<'a, B>(key: &'a Option<String>, c: &'a Cache<B>, used: u64) -> View<'a> {
+            View {
+                key: key.as_deref(),
+                tokens: &c.tokens,
+                used,
+            }
+        }
+        let parked: Vec<View> = self
+            .parked
+            .iter()
+            .map(|s| view(&s.key, &s.cache, s.used))
+            .collect();
+        let active = view(&self.cache_key, &self.cache, self.cache_used);
+        let room = self.parked.len() + 1 < self.slots;
+        let i = match pick(active, &parked, key, ids, room) {
+            Pick::Active => None,
+            Pick::Parked(i) => Some(i),
+            Pick::Fresh => {
+                self.parked.push(Slot {
+                    cache: self.model.new_cache(),
+                    images: Vec::new(),
+                    key: None,
+                    used: 0,
+                });
+                Some(self.parked.len() - 1)
+            }
+        };
+        if let Some(i) = i {
+            let s = &mut self.parked[i];
+            std::mem::swap(&mut self.cache, &mut s.cache);
+            std::mem::swap(&mut self.cache_images, &mut s.images);
+            std::mem::swap(&mut self.cache_key, &mut s.key);
+            std::mem::swap(&mut self.cache_used, &mut s.used);
+        }
+        if let Some(k) = key {
+            self.cache_key = Some(k.to_string());
+        }
+        self.clock += 1;
+        self.cache_used = self.clock;
     }
 
     /// Tokens whose keys and values are in the cache.
@@ -302,6 +385,7 @@ impl<D: ComputeDevice> Engine<D> {
         );
         let limit = req.max_tokens.unwrap_or(usize::MAX).min(ctx - ids.len());
 
+        self.select(req.cache_key.as_deref(), &ids);
         // Reuse the shared prefix (at least one token must be fed to get logits).
         let shared = self
             .cache

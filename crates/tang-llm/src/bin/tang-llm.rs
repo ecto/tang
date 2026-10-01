@@ -4,6 +4,10 @@
 //! `tang-llm serve <model-dir | hf-repo-id> [--host H] [--port P] [--ctx N] [--api-key-file F]`
 //! — OpenAI-compatible server (on 127.0.0.1 unless `--host` says otherwise). With a key (from
 //! the file, or `TANG_API_KEY`), requests need `Authorization: Bearer <key>`.
+//! `--kv-slots N` keeps N conversations' KV caches (default 1), each a full context's worth of
+//! memory once used; a request's `prompt_cache_key` picks its conversation's cache.
+//! `--kv-slots auto` fits up to 4 in half of RAM where the GPU shares it (Metal, CPU), and
+//! keeps 1 on CUDA. `TANG_KV_SLOTS` sets the default.
 //! Speculative decoding (suffix drafts from the prompt and earlier completions, verified in one
 //! forward; outputs unchanged) is on for GPUs: `--no-speculate` or `TANG_SPECULATE=0` turns it
 //! off, `--speculate` forces it on. Earlier completions are kept in
@@ -277,10 +281,11 @@ fn run<D: ComputeDevice>(
 fn serve(backend: Backend, args: &[String]) -> Result<()> {
     let spec = args
         .first()
-        .context("usage: tang-llm serve <model> [--host H] [--port P] [--ctx N] [--api-key-file F] [--f32 | --q4] [--no-speculate]")?
+        .context("usage: tang-llm serve <model> [--host H] [--port P] [--ctx N] [--api-key-file F] [--f32 | --q4] [--no-speculate] [--kv-slots N|auto]")?
         .clone();
     let (mut port, mut ctx, mut dtype) = (8911u16, 32_768usize, Dtype::Bf16);
     let mut host = "127.0.0.1".to_string();
+    let mut slots = kv_slots(&std::env::var("TANG_KV_SLOTS").unwrap_or_else(|_| "1".into()))?;
     // Never on the command line itself, where `ps` would show it.
     let mut key = std::env::var("TANG_API_KEY").ok();
     // Speculative decoding (suffix drafts): on for GPUs unless TANG_SPECULATE=0 or --no-speculate.
@@ -295,6 +300,7 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
             "--host" => host = it.next().context("--host H")?.clone(),
             "--port" => port = it.next().context("--port P")?.parse()?,
             "--ctx" => ctx = it.next().context("--ctx N")?.parse()?,
+            "--kv-slots" => slots = kv_slots(it.next().context("--kv-slots N|auto")?)?,
             "--api-key-file" => {
                 let path = it.next().context("--api-key-file F")?;
                 key =
@@ -308,13 +314,22 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
         }
     }
     let draft = speculate.then(|| draft_config(backend, &spec));
+    // The GPU's memory is the system's (so RAM bounds the KV slots).
+    let unified = match backend {
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => false,
+        _ => true,
+    };
     let key = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
     let dir = tang_llm::resolve_model(&spec)?;
     let addr = format!("{host}:{port}");
     if key.is_none() && !host.starts_with("127.") && host != "localhost" {
         eprintln!("tang-llm: warning: listening on {host} without an API key; anyone who can reach it can use it");
     }
-    on_backend!(backend, serve_on(&addr, spec, dir, ctx, dtype, key, draft))
+    on_backend!(
+        backend,
+        serve_on(&addr, spec, dir, ctx, dtype, key, draft, slots, unified)
+    )
 }
 
 /// Drafting settings for `backend`: its verify cost curve, a store of earlier completions under
@@ -353,6 +368,41 @@ fn draft_config(backend: Backend, model: &str) -> tang_llm::draft::DraftConfig {
     cfg
 }
 
+/// `--kv-slots N|auto`; None is auto.
+fn kv_slots(v: &str) -> Result<Option<usize>> {
+    match v {
+        "auto" => Ok(None),
+        n => Ok(Some(n.parse().context("--kv-slots N|auto")?)),
+    }
+}
+
+/// KV slots for `--kv-slots auto`: as many caches as fit in half of RAM, 1 to 4, where
+/// the GPU shares RAM; 1 elsewhere (nothing here measures VRAM).
+fn auto_slots(cache_bytes: usize, unified: bool) -> usize {
+    let ram = unified.then(physical_ram).flatten().unwrap_or(0);
+    (ram / 2 / cache_bytes.max(1)).clamp(1, 4)
+}
+
+fn physical_ram() -> Option<usize> {
+    if cfg!(target_os = "macos") {
+        let out = std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()?;
+        return String::from_utf8(out.stdout).ok()?.trim().parse().ok();
+    }
+    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kb: usize = info
+        .lines()
+        .find_map(|l| l.strip_prefix("MemTotal:"))?
+        .trim()
+        .trim_end_matches("kB")
+        .trim()
+        .parse()
+        .ok()?;
+    Some(kb * 1024)
+}
+
 fn serve_on<D: ComputeDevice + 'static>(
     make: fn() -> Result<D>,
     addr: &str,
@@ -362,6 +412,8 @@ fn serve_on<D: ComputeDevice + 'static>(
     dtype: Dtype,
     key: Option<String>,
     draft: Option<tang_llm::draft::DraftConfig>,
+    slots: Option<usize>,
+    unified: bool,
 ) -> Result<()> {
     tang_llm::server::serve(addr, name, key, move || {
         let t = Instant::now();
@@ -376,14 +428,16 @@ fn serve_on<D: ComputeDevice + 'static>(
             );
         }
         e.set_speculation(draft);
+        e.set_slots(slots.unwrap_or_else(|| auto_slots(e.model.cache_bytes(), unified)));
         if let Some(s) = e.speculation() {
             eprintln!("tang-llm: draft store has {} tokens", s.global.tokens());
         }
         eprintln!(
-            "tang-llm: loaded {} in {:.1}s ({} ctx)",
+            "tang-llm: loaded {} in {:.1}s ({} ctx, {} KV slots)",
             dir.display(),
             t.elapsed().as_secs_f32(),
-            e.context_window()
+            e.context_window(),
+            e.slots()
         );
         Ok(e)
     })

@@ -82,6 +82,7 @@ fn requests() -> Vec<(&'static str, Request)> {
         sampling: s.clone(),
         max_tokens: Some(max),
         stop: stop.iter().map(|s| s.to_string()).collect(),
+        cache_key: None,
     };
     let edit = format!(
         "Here is src/words.rs:\n\n```rust\n{CODE}```\n\nRename `word_counts` to `count_words` everywhere and output the whole updated file in a rust code block, nothing else."
