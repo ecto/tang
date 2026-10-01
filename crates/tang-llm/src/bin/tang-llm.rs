@@ -8,7 +8,9 @@
 //! picks its conversation's cache. Caches grow with their conversations. `--kv-slots auto`
 //! keeps up to 8 within half of RAM where the GPU shares it (Metal, CPU), dropping the least
 //! recently used to make room, and keeps 1 on CUDA. `TANG_KV_SLOTS` sets the default;
-//! `TANG_KV_BUDGET=<GB>` sets the memory cap (with any slot count).
+//! `TANG_KV_BUDGET=<GB>` sets the memory cap (with any slot count). Keyed conversations' caches
+//! are also saved to `~/.cache/tang/kv/` after each turn and read back instead of prefilled;
+//! `TANG_KV_DISK=<GB>` caps that (default 8, 0 turns it off).
 //! Speculative decoding (suffix drafts from the prompt and earlier completions, verified in one
 //! forward; outputs unchanged) is on for GPUs: `--no-speculate` or `TANG_SPECULATE=0` turns it
 //! off, `--speculate` forces it on. Earlier completions are kept in
@@ -347,16 +349,7 @@ fn draft_config(backend: Backend, model: &str) -> tang_llm::draft::DraftConfig {
     };
     let _ = (COST_CUDA, COST_METAL);
     let mut cfg = DraftConfig::new(cost).from_env();
-    let name: String = model
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || "-_.".contains(c) {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
+    let name = file_name(model);
     cfg.store = match std::env::var("TANG_DRAFT_STORE").as_deref() {
         Ok("0") | Ok("") => None,
         Ok(p) => Some(PathBuf::from(p)),
@@ -367,6 +360,37 @@ fn draft_config(backend: Backend, model: &str) -> tang_llm::draft::DraftConfig {
         }),
     };
     cfg
+}
+
+/// `model` as a file name.
+fn file_name(model: &str) -> String {
+    model
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "-_.".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Where conversations' KV caches go on disk, and how many bytes: `~/.cache/tang/kv/`, 8 GB
+/// unless `TANG_KV_DISK=<GB>` (0 turns it off).
+fn kv_disk(model: &str, dtype: Dtype) -> Option<(PathBuf, u64)> {
+    let gb = match std::env::var("TANG_KV_DISK") {
+        Ok(v) => v.parse::<f64>().ok()?,
+        Err(_) => 8.0,
+    };
+    if gb <= 0.0 {
+        return None;
+    }
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    let dir = home
+        .join(".cache/tang/kv")
+        .join(format!("{}-{dtype:?}", file_name(model)));
+    Some((dir, (gb * 1e9) as u64))
 }
 
 /// `--kv-slots N|auto`; None is auto.
@@ -418,6 +442,7 @@ fn serve_on<D: ComputeDevice + 'static>(
     slots: Option<usize>,
     unified: bool,
 ) -> Result<()> {
+    let disk = kv_disk(&name, dtype);
     tang_llm::server::serve(addr, name, key, move || {
         let t = Instant::now();
         let mut e = Engine::load(make()?, &dir, ctx, dtype)?;
@@ -439,6 +464,14 @@ fn serve_on<D: ComputeDevice + 'static>(
             .or(budget);
         e.set_slots(n);
         e.set_kv_budget(budget);
+        if let Some((dir, bytes)) = disk {
+            e.set_kv_store(dir.clone(), bytes)?;
+            eprintln!(
+                "tang-llm: KV caches saved in {} (up to {:.0} GB)",
+                dir.display(),
+                bytes as f64 / 1e9
+            );
+        }
         if let Some(s) = e.speculation() {
             eprintln!("tang-llm: draft store has {} tokens", s.global.tokens());
         }

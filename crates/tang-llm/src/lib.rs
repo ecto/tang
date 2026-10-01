@@ -9,6 +9,7 @@ pub mod chat;
 pub mod config;
 pub mod draft;
 pub mod engine;
+pub mod kvstore;
 pub mod model;
 pub mod sample;
 pub mod server;
