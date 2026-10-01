@@ -52,18 +52,31 @@ pub struct Model<D: ComputeDevice> {
     max_ctx: usize,
 }
 
-/// Per-sequence attention state: K and V for every layer, `[max_ctx, kv_dim]`, on device.
+/// Per-sequence attention state: K and V for every layer, `[cap, kv_dim]`, on device. It
+/// starts small and doubles as the sequence grows, up to the context window.
 /// Truncating keeps a prefix (later positions are simply overwritten), which is how a new
 /// request reuses the part of the conversation it shares with the last one.
 pub struct Cache<B> {
     k: Vec<B>,
     v: Vec<B>,
+    /// Positions allocated (a multiple of 32).
+    cap: usize,
+    /// Device memory per position, all layers' K and V.
+    row_bytes: usize,
     /// Tokens already in the cache.
     pub len: usize,
     pub tokens: Vec<u32>,
 }
 
+/// Positions a new cache starts with.
+const FIRST_ROWS: usize = 4096;
+
 impl<B> Cache<B> {
+    /// Device memory it holds now.
+    pub fn bytes(&self) -> usize {
+        self.cap * self.row_bytes
+    }
+
     pub fn truncate(&mut self, len: usize) {
         self.len = self.len.min(len);
         self.tokens.truncate(self.len);
@@ -237,20 +250,51 @@ impl<D: ComputeDevice> Model<D> {
         self.max_ctx
     }
 
-    /// Device memory one [`Cache`] takes (f32 keys and values for every layer).
-    pub fn cache_bytes(&self) -> usize {
-        2 * self.layers.len() * self.max_ctx.next_multiple_of(32) * self.cfg.kv_dim() * 4
+    /// Device memory a [`Cache`] of `rows` positions takes (f32 K and V for every layer).
+    pub fn cache_bytes(&self, rows: usize) -> usize {
+        rows.min(self.max_ctx).next_multiple_of(32) * self.row_bytes()
+    }
+
+    fn row_bytes(&self) -> usize {
+        2 * self.layers.len() * self.cfg.kv_dim() * 4
     }
 
     pub fn new_cache(&self) -> Cache<D::Buffer> {
         // Rounded up so tiled attention can read whole 32-row blocks.
-        let n = self.max_ctx.next_multiple_of(32) * self.cfg.kv_dim();
+        let cap = FIRST_ROWS.min(self.max_ctx).next_multiple_of(32);
+        let n = cap * self.cfg.kv_dim();
         Cache {
             k: (0..self.layers.len()).map(|_| self.dev.alloc(n)).collect(),
             v: (0..self.layers.len()).map(|_| self.dev.alloc(n)).collect(),
+            cap,
+            row_bytes: self.row_bytes(),
             len: 0,
             tokens: Vec::new(),
         }
+    }
+
+    /// Make room in `cache` for `rows` positions: double it (at least to `rows`, at most to
+    /// the context window) and copy what's there.
+    fn reserve(&self, cache: &mut Cache<D::Buffer>, rows: usize) {
+        if rows <= cache.cap {
+            return;
+        }
+        let cap = rows
+            .max(cache.cap * 2)
+            .min(self.max_ctx)
+            .max(rows)
+            .next_multiple_of(32);
+        let kvd = self.cfg.kv_dim();
+        let used = cache.len * kvd;
+        for buf in cache.k.iter_mut().chain(cache.v.iter_mut()) {
+            let mut grown = self.dev.alloc(cap * kvd);
+            if used > 0 {
+                let old = self.dev.slice_buffer(buf, 0, used);
+                self.dev.write_into(&mut grown, 0, &old);
+            }
+            *buf = grown;
+        }
+        cache.cap = cap;
     }
 
     /// Run `tokens` through the model after what's already in `cache`, append them to it, and
@@ -413,6 +457,7 @@ impl<D: ComputeDevice> Model<D> {
         );
         let (qd, kvd, ff) = (c.q_dim(), c.kv_dim(), c.intermediate_size);
         let eps = c.rms_norm_eps;
+        self.reserve(cache, pos + s);
         for (l, w) in self.layers.iter().enumerate() {
             let a = dev.rms_norm(x, &w.attn_norm, s, h, eps);
             let qkv = dev.linear(&a, &w.wqkv, s, h, qd + 2 * kvd);
