@@ -33,6 +33,8 @@ pub struct Request {
     /// The conversation this continues (`prompt_cache_key`), so it runs in that
     /// conversation's KV slot.
     pub cache_key: Option<String>,
+    /// Only prefill (warm the cache for a request that will follow); nothing is generated.
+    pub prefill_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -83,6 +85,8 @@ pub struct Engine<D: ComputeDevice> {
     /// Most device memory all caches together may hold; least recently used parked caches
     /// are dropped to stay under it.
     kv_budget: Option<usize>,
+    /// Conversations' caches on disk, by `prompt_cache_key`.
+    store: Option<crate::kvstore::Store>,
     clock: u64,
     eos: Vec<u32>,
     /// `<think>` and `</think>`, when the model has them.
@@ -218,6 +222,7 @@ impl<D: ComputeDevice> Engine<D> {
             parked: Vec::new(),
             slots: 1,
             kv_budget: None,
+            store: None,
             clock: 0,
             eos,
             think_tags,
@@ -282,6 +287,67 @@ impl<D: ComputeDevice> Engine<D> {
     /// conversations, so this, not the slot count, is usually what limits them).
     pub fn set_kv_budget(&mut self, bytes: Option<usize>) {
         self.kv_budget = bytes;
+    }
+
+    /// Keep conversations' caches on disk in `dir` (up to `budget` bytes), so one that lost its
+    /// slot, or outlived the server, is read back instead of prefilled.
+    pub fn set_kv_store(&mut self, dir: std::path::PathBuf, budget: u64) -> Result<()> {
+        self.store = Some(crate::kvstore::Store::new(
+            dir,
+            budget,
+            self.model.row_floats(),
+        )?);
+        Ok(())
+    }
+
+    /// Save the new part of `key`'s cache to disk (after a request; the reply has gone out).
+    pub fn save(&mut self, key: Option<&str>) {
+        let (Some(key), Some(store)) = (key, &self.store) else {
+            return;
+        };
+        // Only the conversation that just ran, and not with images (they aren't in tokens).
+        if self.cache_key.as_deref() != Some(key) || !self.cache_images.is_empty() {
+            return;
+        }
+        let disk = store.tokens(key);
+        let tokens = &self.cache.tokens;
+        let common = disk.iter().zip(tokens).take_while(|(a, b)| a == b).count();
+        if common == tokens.len() && common == disk.len() {
+            return;
+        }
+        let rows = self.model.read_rows(&self.cache, common, tokens.len());
+        if let Err(e) = store.write(key, tokens, common, &rows) {
+            eprintln!("tang-llm: saving the KV cache: {e:#}");
+        }
+    }
+
+    /// Read back from disk what it has of this prompt beyond what the cache holds.
+    fn restore(&mut self, key: Option<&str>, ids: &[u32]) {
+        let (Some(key), Some(store)) = (key, &self.store) else {
+            return;
+        };
+        let shared = |t: &[u32]| t.iter().zip(ids).take_while(|(a, b)| a == b).count();
+        let have = shared(&self.cache.tokens);
+        // At least one prompt token is still fed, for the logits.
+        let want = shared(&store.tokens(key)).min(ids.len() - 1);
+        if want <= have {
+            return;
+        }
+        let t = Instant::now();
+        match store.read(key, have, want) {
+            Ok(rows) => {
+                self.cache.truncate(have);
+                self.cache_images.retain(|&(s, _)| s < have);
+                self.model
+                    .write_rows(&mut self.cache, &ids[have..want], &rows);
+                eprintln!(
+                    "tang-llm: read {} positions from disk in {:.0} ms",
+                    want - have,
+                    t.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            Err(e) => eprintln!("tang-llm: reading the KV cache: {e:#}"),
+        }
     }
 
     /// Device memory the KV caches hold now.
@@ -422,6 +488,9 @@ impl<D: ComputeDevice> Engine<D> {
         self.select(req.cache_key.as_deref(), &ids);
         // Room for the prompt and a typical reply; a longer one grows past the budget a little.
         self.make_room(ids.len() + limit.min(4096));
+        if req.images.is_empty() {
+            self.restore(req.cache_key.as_deref(), &ids);
+        }
         // Reuse the shared prefix (at least one token must be fed to get logits).
         let shared = self
             .cache
@@ -467,6 +536,21 @@ impl<D: ComputeDevice> Engine<D> {
         }
         self.cache_images = runs;
         let prefill_s = t.elapsed().as_secs_f64();
+        if req.prefill_only {
+            return Ok((
+                Finish::Stop,
+                Usage {
+                    prompt_tokens: ids.len(),
+                    cached_tokens: reuse,
+                    completion_tokens: 0,
+                    reasoning_tokens: 0,
+                    prefill_tok_s: (ids.len() - reuse) as f64 / prefill_s.max(1e-9),
+                    decode_tok_s: 0.0,
+                    draft_tokens: 0,
+                    accepted_tokens: 0,
+                },
+            ));
+        }
 
         let mut sampler = Sampler::new(req.sampling.clone());
         let opened = prompt.trim_end().ends_with("<think>");

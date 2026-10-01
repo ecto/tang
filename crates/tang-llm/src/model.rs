@@ -273,6 +273,62 @@ impl<D: ComputeDevice> Model<D> {
         }
     }
 
+    /// Floats per position in [`read_rows`](Self::read_rows): every layer's K and V.
+    pub fn row_floats(&self) -> usize {
+        2 * self.layers.len() * self.cfg.kv_dim()
+    }
+
+    /// Positions `from..to` of `cache`, position-major: for each, every layer's K row then V
+    /// row.
+    pub fn read_rows(&self, cache: &Cache<D::Buffer>, from: usize, to: usize) -> Vec<f32> {
+        let kvd = self.cfg.kv_dim();
+        let n = to - from;
+        let mut out = vec![0f32; n * self.row_floats()];
+        if n == 0 {
+            return out;
+        }
+        let bufs = cache.k.iter().zip(&cache.v).flat_map(|(k, v)| [k, v]);
+        for (j, buf) in bufs.enumerate() {
+            let part = self
+                .dev
+                .download(&self.dev.slice_buffer(buf, from * kvd, n * kvd));
+            for p in 0..n {
+                let at = (p * self.layers.len() * 2 + j) * kvd;
+                out[at..at + kvd].copy_from_slice(&part[p * kvd..(p + 1) * kvd]);
+            }
+        }
+        out
+    }
+
+    /// Append positions to `cache`: `tokens`, with their rows as [`read_rows`](Self::read_rows)
+    /// gives them.
+    pub fn write_rows(&self, cache: &mut Cache<D::Buffer>, tokens: &[u32], rows: &[f32]) {
+        let kvd = self.cfg.kv_dim();
+        let n = tokens.len();
+        if n == 0 {
+            return;
+        }
+        self.reserve(cache, cache.len + n);
+        let at = cache.len * kvd;
+        let layers = self.layers.len();
+        let bufs = cache
+            .k
+            .iter_mut()
+            .zip(cache.v.iter_mut())
+            .flat_map(|(k, v)| [k, v]);
+        for (j, buf) in bufs.enumerate() {
+            let mut part = Vec::with_capacity(n * kvd);
+            for p in 0..n {
+                let from = (p * layers * 2 + j) * kvd;
+                part.extend_from_slice(&rows[from..from + kvd]);
+            }
+            // In the cache's own precision (bf16 on CUDA in mixed precision).
+            self.dev.write_into(buf, at, &self.dev.upload(&part));
+        }
+        cache.len += n;
+        cache.tokens.extend_from_slice(tokens);
+    }
+
     /// Make room in `cache` for `rows` positions: double it (at least to `rows`, at most to
     /// the context window) and copy what's there.
     fn reserve(&self, cache: &mut Cache<D::Buffer>, rows: usize) {

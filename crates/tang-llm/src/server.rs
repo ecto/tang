@@ -1,5 +1,7 @@
 //! OpenAI-compatible HTTP server: `/v1/chat/completions` (streaming and not), `/v1/models`,
-//! and llama.cpp-style `/props` so clients can discover the context window.
+//! and llama.cpp-style `/props` so clients can discover the context window. `/v1/prefill`
+//! takes a chat completion body and only prefills it, so the request that follows (the same
+//! conversation plus a new message) starts from a warm cache.
 //!
 //! The model lives on one worker thread (GPU state isn't shareable); requests queue for it.
 //!
@@ -74,10 +76,15 @@ where
                     );
                 }
             }
+            let ok = result.is_ok();
             let _ = match result {
                 Ok((finish, usage)) => job.tx.send(Out::Done(finish, usage)),
                 Err(e) => job.tx.send(Out::Error(format!("{e:#}"))),
             };
+            // After the reply, so saving never delays it.
+            if ok {
+                engine.save(job.req.cache_key.as_deref());
+            }
         }
     });
     let (ctx, vision) = ready_rx.recv()??;
@@ -90,6 +97,7 @@ where
     };
     let api = Router::new()
         .route("/v1/chat/completions", post(chat))
+        .route("/v1/prefill", post(prefill))
         .route("/v1/models", get(models))
         .route("/props", get(props))
         .with_state(app);
@@ -141,7 +149,13 @@ fn same(a: &[u8], b: &[u8]) -> bool {
 async fn models(State(app): State<App>) -> Json<Value> {
     // `thinking_budget`: requests may cap reasoning tokens (see `engine::ThinkBudget`).
     // `prompt_cache_key`: requests may name their conversation's KV slot (see `crate::slots`).
-    let mut caps = vec!["completion", "thinking_budget", "prompt_cache_key"];
+    // `prefill`: `/v1/prefill` warms a conversation's cache.
+    let mut caps = vec![
+        "completion",
+        "thinking_budget",
+        "prompt_cache_key",
+        "prefill",
+    ];
     if app.vision {
         caps.push("vision");
     }
@@ -358,6 +372,7 @@ pub fn parse(body: &Value) -> Result<Request, String> {
             _ => Vec::new(),
         },
         cache_key: body["prompt_cache_key"].as_str().map(String::from),
+        prefill_only: false,
     })
 }
 
@@ -399,6 +414,30 @@ fn usage_json(u: &Usage) -> Value {
             "draft_n_accepted": u.accepted_tokens,
         },
     })
+}
+
+/// Prefill a chat completion body without generating: `{usage}` once the cache holds it.
+async fn prefill(State(app): State<App>, Json(body): Json<Value>) -> Response {
+    let mut req = match parse(&body) {
+        Ok(r) => r,
+        Err(e) => return error(StatusCode::BAD_REQUEST, e),
+    };
+    req.prefill_only = true;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    if app.jobs.send(Job { req, tx }).is_err() {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "model worker stopped");
+    }
+    while let Some(out) = rx.recv().await {
+        match out {
+            Out::Piece(_) => {}
+            Out::Done(_, u) => {
+                return Json(json!({ "object": "prefill", "usage": usage_json(&u) }))
+                    .into_response()
+            }
+            Out::Error(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e),
+        }
+    }
+    error(StatusCode::SERVICE_UNAVAILABLE, "model worker stopped")
 }
 
 async fn chat(State(app): State<App>, Json(body): Json<Value>) -> Response {
