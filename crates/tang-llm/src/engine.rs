@@ -80,6 +80,9 @@ pub struct Engine<D: ComputeDevice> {
     parked: Vec<Slot<D::Buffer>>,
     /// Most caches to keep, the active one included. Each is allocated on first use.
     slots: usize,
+    /// Most device memory all caches together may hold; least recently used parked caches
+    /// are dropped to stay under it.
+    kv_budget: Option<usize>,
     clock: u64,
     eos: Vec<u32>,
     /// `<think>` and `</think>`, when the model has them.
@@ -214,6 +217,7 @@ impl<D: ComputeDevice> Engine<D> {
             cache_used: 0,
             parked: Vec::new(),
             slots: 1,
+            kv_budget: None,
             clock: 0,
             eos,
             think_tags,
@@ -272,6 +276,36 @@ impl<D: ComputeDevice> Engine<D> {
 
     pub fn slots(&self) -> usize {
         self.slots
+    }
+
+    /// Cap the device memory all KV caches may hold together (caches grow with their
+    /// conversations, so this, not the slot count, is usually what limits them).
+    pub fn set_kv_budget(&mut self, bytes: Option<usize>) {
+        self.kv_budget = bytes;
+    }
+
+    /// Device memory the KV caches hold now.
+    pub fn kv_bytes(&self) -> usize {
+        self.cache.bytes() + self.parked.iter().map(|s| s.cache.bytes()).sum::<usize>()
+    }
+
+    /// Drop least recently used parked caches until the active one can grow to `rows`
+    /// positions within the budget.
+    fn make_room(&mut self, rows: usize) {
+        let Some(budget) = self.kv_budget else {
+            return;
+        };
+        let need = self.model.cache_bytes(rows).max(self.cache.bytes());
+        loop {
+            let parked: usize = self.parked.iter().map(|s| s.cache.bytes()).sum();
+            if need + parked <= budget {
+                return;
+            }
+            let Some(lru) = (0..self.parked.len()).min_by_key(|&i| self.parked[i].used) else {
+                return;
+            };
+            self.parked.swap_remove(lru);
+        }
     }
 
     /// Make the slot for this request the active one.
@@ -386,6 +420,8 @@ impl<D: ComputeDevice> Engine<D> {
         let limit = req.max_tokens.unwrap_or(usize::MAX).min(ctx - ids.len());
 
         self.select(req.cache_key.as_deref(), &ids);
+        // Room for the prompt and a typical reply; a longer one grows past the budget a little.
+        self.make_room(ids.len() + limit.min(4096));
         // Reuse the shared prefix (at least one token must be fed to get logits).
         let shared = self
             .cache

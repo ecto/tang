@@ -4,10 +4,11 @@
 //! `tang-llm serve <model-dir | hf-repo-id> [--host H] [--port P] [--ctx N] [--api-key-file F]`
 //! — OpenAI-compatible server (on 127.0.0.1 unless `--host` says otherwise). With a key (from
 //! the file, or `TANG_API_KEY`), requests need `Authorization: Bearer <key>`.
-//! `--kv-slots N` keeps N conversations' KV caches (default 1), each a full context's worth of
-//! memory once used; a request's `prompt_cache_key` picks its conversation's cache.
-//! `--kv-slots auto` fits up to 4 in half of RAM where the GPU shares it (Metal, CPU), and
-//! keeps 1 on CUDA. `TANG_KV_SLOTS` sets the default.
+//! `--kv-slots N` keeps N conversations' KV caches (default 1); a request's `prompt_cache_key`
+//! picks its conversation's cache. Caches grow with their conversations. `--kv-slots auto`
+//! keeps up to 8 within half of RAM where the GPU shares it (Metal, CPU), dropping the least
+//! recently used to make room, and keeps 1 on CUDA. `TANG_KV_SLOTS` sets the default;
+//! `TANG_KV_BUDGET=<GB>` sets the memory cap (with any slot count).
 //! Speculative decoding (suffix drafts from the prompt and earlier completions, verified in one
 //! forward; outputs unchanged) is on for GPUs: `--no-speculate` or `TANG_SPECULATE=0` turns it
 //! off, `--speculate` forces it on. Earlier completions are kept in
@@ -376,11 +377,13 @@ fn kv_slots(v: &str) -> Result<Option<usize>> {
     }
 }
 
-/// KV slots for `--kv-slots auto`: as many caches as fit in half of RAM, 1 to 4, where
-/// the GPU shares RAM; 1 elsewhere (nothing here measures VRAM).
-fn auto_slots(cache_bytes: usize, unified: bool) -> usize {
-    let ram = unified.then(physical_ram).flatten().unwrap_or(0);
-    (ram / 2 / cache_bytes.max(1)).clamp(1, 4)
+/// `--kv-slots auto`: up to 8 caches within half of RAM where the GPU shares RAM; 1 elsewhere
+/// (nothing here measures VRAM). Slots and a memory budget.
+fn auto_slots(unified: bool) -> (usize, Option<usize>) {
+    match unified.then(physical_ram).flatten() {
+        Some(ram) => (8, Some(ram / 2)),
+        None => (1, None),
+    }
 }
 
 fn physical_ram() -> Option<usize> {
@@ -428,16 +431,27 @@ fn serve_on<D: ComputeDevice + 'static>(
             );
         }
         e.set_speculation(draft);
-        e.set_slots(slots.unwrap_or_else(|| auto_slots(e.model.cache_bytes(), unified)));
+        let (n, budget) = slots.map_or_else(|| auto_slots(unified), |n| (n, None));
+        let budget = std::env::var("TANG_KV_BUDGET")
+            .ok()
+            .and_then(|gb| gb.parse::<f64>().ok())
+            .map(|gb| (gb * 1e9) as usize)
+            .or(budget);
+        e.set_slots(n);
+        e.set_kv_budget(budget);
         if let Some(s) = e.speculation() {
             eprintln!("tang-llm: draft store has {} tokens", s.global.tokens());
         }
         eprintln!(
-            "tang-llm: loaded {} in {:.1}s ({} ctx, {} KV slots)",
+            "tang-llm: loaded {} in {:.1}s ({} ctx, {} KV slots{})",
             dir.display(),
             t.elapsed().as_secs_f32(),
             e.context_window(),
-            e.slots()
+            e.slots(),
+            budget.map_or(String::new(), |b| format!(
+                " within {:.1} GB",
+                b as f64 / 1e9
+            ))
         );
         Ok(e)
     })
