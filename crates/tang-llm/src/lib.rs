@@ -12,6 +12,7 @@ pub mod engine;
 pub mod model;
 pub mod sample;
 pub mod server;
+pub mod slots;
 pub mod vision;
 pub mod weights;
 

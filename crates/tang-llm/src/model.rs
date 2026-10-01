@@ -237,6 +237,11 @@ impl<D: ComputeDevice> Model<D> {
         self.max_ctx
     }
 
+    /// Device memory one [`Cache`] takes (f32 keys and values for every layer).
+    pub fn cache_bytes(&self) -> usize {
+        2 * self.layers.len() * self.max_ctx.next_multiple_of(32) * self.cfg.kv_dim() * 4
+    }
+
     pub fn new_cache(&self) -> Cache<D::Buffer> {
         // Rounded up so tiled attention can read whole 32-row blocks.
         let n = self.max_ctx.next_multiple_of(32) * self.cfg.kv_dim();
