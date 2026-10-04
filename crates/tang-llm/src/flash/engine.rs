@@ -951,7 +951,7 @@ impl Engine {
             last_mtp_gpu_ms: 0.0,
             defer_boundary: false,
             pending_boundary: false,
-            pcie_frac: std::env::var("TANG_FLASH_PCIE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.25),
+            pcie_frac: std::env::var("TANG_FLASH_PCIE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0),
             side: Stream::new().map_err(|e| anyhow!("{e}"))?,
             use_mtp: false,
             mtp_last: Vec::new(),
