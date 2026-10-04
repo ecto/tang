@@ -1069,58 +1069,121 @@ __device__ __forceinline__ int half_dot(unsigned int w, uint4 x) {
 // The tree: slot m + slot m + 4 is a shuffle with lane b ^ 2, then (l0 + l2) + (l1 + l3) with
 // lane b ^ 1. On return, lanes with b = 0 hold rows r (o0) and r + 8 (o1). Entry e reads row
 // row[e] of the [QAct] at X (m_rows rows, kb words wide).
-template <int G, int NE>
+// One load step of a tile: B groups' code words and scales for this lane's two rows.
+#define TILE_B(G) ((G) % 2 == 0 ? 2 : 5)
+template <int G> struct TStep {
+    uint2 w[TILE_B(G)][2];
+    unsigned short ds[TILE_B(G)][2];
+};
+template <int G>
+__device__ __forceinline__ void tile_load(const unsigned char* __restrict__ codes, const unsigned char* __restrict__ scales,
+                                          int g0, unsigned int lane, TStep<G>& st) {
+    unsigned int r = lane >> 2, b = lane & 3;
+    #pragma unroll
+    for (int q = 0; q < TILE_B(G); q++)
+        #pragma unroll
+        for (int rr = 0; rr < 2; rr++) {
+            st.w[q][rr] = __ldg((const uint2*)(codes + (g0 + q) * 512 + (r + 8 * rr) * 32 + b * 8));
+            st.ds[q][rr] = __ldg((const unsigned short*)(scales + (g0 + q) * 64 + (r + 8 * rr) * 4 + (b >> 1) * 2));
+        }
+}
+
+// One 16-row expert tile against up to NE entries, in the pinned order of ExpertBlob::ORDER:
+// lane = (r = lane / 4, quarter b = lane % 4) owns slots 2b, 2b + 1 (one chunk, both halves) of
+// rows r and r + 8, and runs their chains over the rows' 128-weight groups: one 8-byte load per
+// row and group (the warp reads two 256-byte lines), each activation load serving both rows.
+// The tree: slot m + slot m + 4 is a shuffle with lane b ^ 2, then (l0 + l2) + (l1 + l3) with
+// lane b ^ 1. On return, lanes with b = 0 hold rows r (o0) and r + 8 (o1). Entry e reads row
+// row[e] of the [QAct] at X (m_rows rows, kb words wide). Step 0 comes from `pre` when given
+// (the caller prefetched it, e.g. during its previous tile).
+template <int G, int NE, bool CG = false>
 __device__ __forceinline__ void tile_dot(const unsigned char* __restrict__ codes, const unsigned char* __restrict__ scales,
                                          const unsigned int* __restrict__ X, unsigned int kb, unsigned int m_rows,
                                          const unsigned int row[NE], unsigned int ne, unsigned int lane,
-                                         float o0[NE], float o1[NE]) {
+                                         float o0[NE], float o1[NE], const TStep<G>* pre = nullptr) {
+    constexpr int B = TILE_B(G);
     const unsigned int nch = kb / 8;
-    unsigned int r = lane >> 2, b = lane & 3;
-    const unsigned int* xp[NE];
-    const unsigned int* sp[NE];
-    #pragma unroll
-    for (int e = 0; e < NE; e++) {
-        xp[e] = X + (u64)row[e] * kb + b * 8;
-        sp[e] = X + (u64)m_rows * kb + (u64)row[e] * nch + b;
-    }
+    unsigned int b = lane & 3;
+    // Entry e's activation words and (d, Σq) at word offsets from X (no per-entry pointers:
+    // registers decide the occupancy here).
+    const unsigned int* xs = X + (u64)m_rows * kb + b;
     const unsigned int hoff = m_rows * nch;
+    if (G == B) {
+        // One load step (the down tiles): entries outermost, so only one entry's chains are live
+        // (registers set the occupancy); each entry's order is the same as below.
+        TStep<G> cur;
+        if (pre) cur = *pre; else tile_load<G>(codes, scales, 0, lane, cur);
+        #pragma unroll
+        for (int e = 0; e < NE; e++) {
+            if (e >= ne) continue;
+            float a2[2][2] = {{0.0f, 0.0f}, {0.0f, 0.0f}};
+            #pragma unroll
+            for (int q = 0; q < B; q++) {
+                unsigned int c4 = 4 * q;
+                const uint4* xq = (const uint4*)(X + row[e] * kb + b * 8 + c4 * 8);
+                uint4 x0 = CG ? __ldcg(xq) : xq[0], x1 = CG ? __ldcg(xq + 1) : xq[1];
+                float dx = __uint_as_float(CG ? __ldcg(xs + row[e] * nch + c4) : xs[row[e] * nch + c4]);
+                int nh = -(int)(CG ? __ldcg(xs + hoff + row[e] * nch + c4) : xs[hoff + row[e] * nch + c4]);
+                #pragma unroll
+                for (int rr = 0; rr < 2; rr++) {
+                    uint2 w = cur.w[q][rr];
+                    int s0 = __dp4a((int)(w.x & 0x03030303u), (int)x0.x, nh);
+                    s0 = __dp4a((int)((w.x >> 2) & 0x03030303u), (int)x0.y, s0);
+                    s0 = __dp4a((int)((w.x >> 4) & 0x03030303u), (int)x0.z, s0);
+                    s0 = __dp4a((int)((w.x >> 6) & 0x03030303u), (int)x0.w, s0);
+                    int s1 = __dp4a((int)(w.y & 0x03030303u), (int)x1.x, 0);
+                    s1 = __dp4a((int)((w.y >> 2) & 0x03030303u), (int)x1.y, s1);
+                    s1 = __dp4a((int)((w.y >> 4) & 0x03030303u), (int)x1.z, s1);
+                    s1 = __dp4a((int)((w.y >> 6) & 0x03030303u), (int)x1.w, s1);
+                    float dd = h2f(cur.ds[q][rr]) * dx;
+                    a2[rr][0] = __fmaf_rn((float)s0, dd, a2[rr][0]);
+                    a2[rr][1] = __fmaf_rn((float)s1, dd, a2[rr][1]);
+                }
+            }
+            #pragma unroll
+            for (int rr = 0; rr < 2; rr++) {
+                float l0 = a2[rr][0] + __shfl_xor_sync(0xffffffffu, a2[rr][0], 2);
+                float l1 = a2[rr][1] + __shfl_xor_sync(0xffffffffu, a2[rr][1], 2);
+                float x = l0 + __shfl_xor_sync(0xffffffffu, l0, 1);
+                float y = l1 + __shfl_xor_sync(0xffffffffu, l1, 1);
+                if (rr == 0) o0[e] = x + y; else o1[e] = x + y;
+            }
+        }
+        return;
+    }
     float a[NE][2][2];
     #pragma unroll
     for (int e = 0; e < NE; e++)
         #pragma unroll
         for (int q = 0; q < 2; q++) { a[e][q][0] = 0.0f; a[e][q][1] = 0.0f; }
-    constexpr int B = G % 2 == 0 ? 2 : 5;
     for (int g0 = 0; g0 < G; g0 += B) {
-        uint2 w[B][2];
-        unsigned short ds[B][2];
+        TStep<G> cur;
+        if (pre && g0 == 0) cur = *pre; else tile_load<G>(codes, scales, g0, lane, cur);
+#ifdef MOE_LOADONLY
         #pragma unroll
-        for (int q = 0; q < B; q++)
-            #pragma unroll
-            for (int rr = 0; rr < 2; rr++) {
-                w[q][rr] = *(const uint2*)(codes + (g0 + q) * 512 + (r + 8 * rr) * 32 + b * 8);
-                ds[q][rr] = *(const unsigned short*)(scales + (g0 + q) * 64 + (r + 8 * rr) * 4 + (b >> 1) * 2);
-            }
+        for (int q = 0; q < B; q++) a[0][0][0] += __uint_as_float((cur.w[q][0].x ^ cur.w[q][1].y ^ cur.ds[q][0] ^ cur.ds[q][1]) & 0x3fffffffu);
+#else
         #pragma unroll
         for (int q = 0; q < B; q++) {
             int op[2][2][4];
             float d[2];
             #pragma unroll
             for (int rr = 0; rr < 2; rr++) {
-                d[rr] = h2f(ds[q][rr]);
+                d[rr] = h2f(cur.ds[q][rr]);
                 #pragma unroll
                 for (int f = 0; f < 4; f++) {
-                    op[rr][0][f] = (int)((w[q][rr].x >> (2 * f)) & 0x03030303u);
-                    op[rr][1][f] = (int)((w[q][rr].y >> (2 * f)) & 0x03030303u);
+                    op[rr][0][f] = (int)((cur.w[q][rr].x >> (2 * f)) & 0x03030303u);
+                    op[rr][1][f] = (int)((cur.w[q][rr].y >> (2 * f)) & 0x03030303u);
                 }
             }
             unsigned int c4 = 4 * (g0 + q);
             #pragma unroll
             for (int e = 0; e < NE; e++) {
                 if (e < ne) {
-                    const uint4* xq = (const uint4*)(xp[e] + c4 * 8);
+                    const uint4* xq = (const uint4*)(X + row[e] * kb + b * 8 + c4 * 8);
                     uint4 x0 = xq[0], x1 = xq[1];
-                    float dx = __uint_as_float(sp[e][c4]);
-                    int nh = -(int)sp[e][hoff + c4];
+                    float dx = __uint_as_float(xs[row[e] * nch + c4]);
+                    int nh = -(int)xs[hoff + row[e] * nch + c4];
                     #pragma unroll
                     for (int rr = 0; rr < 2; rr++) {
                         int s0 = __dp4a(op[rr][0][0], (int)x0.x, nh);
@@ -1138,6 +1201,7 @@ __device__ __forceinline__ void tile_dot(const unsigned char* __restrict__ codes
                 }
             }
         }
+#endif
     }
     #pragma unroll
     for (int e = 0; e < NE; e++) {
@@ -1155,83 +1219,100 @@ __device__ __forceinline__ void tile_dot(const unsigned char* __restrict__ codes
 }
 
 // Gate and up rows of every planned expert for its tokens, h = psilu(gate)·up quantized per
-// [QAct] into HQ (m = PLAN_CAP rows of FF, row = entry). Work items are (32-row h chunk, group),
-// 20 per group, one per 128-thread block in turn: each warp takes one 16-row gu tile (8 h rows),
-// the block gathers the chunk's h in shared memory and quantizes it.
+// [QAct] into HQ (m = PLAN_CAP rows of FF, row = entry). A gu item is (32-row h chunk q, group g),
+// 20 per group, for a 128-thread block: each warp takes one 16-row gu tile (8 h rows), the block
+// gathers the chunk's h in shared memory and quantizes it.
 template <int NE>
-__device__ __forceinline__ void moe_gu_body(const unsigned int* __restrict__ XQ, unsigned int T,
-                                            const unsigned int* __restrict__ PLAN, unsigned int* __restrict__ HQ) {
-    __shared__ float hs[NE][32];
-    unsigned int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+__device__ __forceinline__ void moe_gu_item(const unsigned int* __restrict__ XQ, unsigned int T,
+                                            const unsigned int* __restrict__ PLAN, unsigned int* __restrict__ HQ,
+                                            unsigned int q, unsigned int g, float (*hs)[32]) {
+    unsigned int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tile = 4 * q + warp;
     const unsigned int kb = HIDDEN / 4;
-    unsigned int items = (FF / 32) * PLAN[0];
-    for (unsigned int item = blockIdx.x; item < items; item += gridDim.x) {
-        unsigned int q = item % (FF / 32), g = item / (FF / 32), tile = 4 * q + warp;
-        const unsigned char* blob = plan_blob(PLAN, g);
-        unsigned int e0 = PLAN[PLAN_GS + g], ne = PLAN[PLAN_GS + g + 1] - e0;
-        unsigned int tok[NE];
+    const unsigned char* blob = plan_blob(PLAN, g);
+    unsigned int e0 = PLAN[PLAN_GS + g], ne = PLAN[PLAN_GS + g + 1] - e0;
+    // Entries in passes of EC (the tile is re-read per pass, from L2): the chains of at most EC
+    // entries are live, so a wide instantiation costs what a T=4 one does on narrow groups.
+    constexpr int EC = NE > 4 ? 4 : NE;
+    __syncthreads();
+    for (unsigned int p0 = 0; p0 < ne; p0 += EC) {
+        unsigned int np = min(ne - p0, (unsigned int)EC);
+        unsigned int tok[EC];
         #pragma unroll
-        for (int e = 0; e < NE; e++) tok[e] = e < ne ? PLAN[PLAN_ET + e0 + e] : 0;
-        float a0[NE], a1[NE];
-        tile_dot<HIDDEN / 128, NE>(blob + GU_CODES + (u64)tile * (HIDDEN / 128) * 512,
-                                   blob + GU_SCALES + (u64)tile * (HIDDEN / 128) * 64, XQ, kb, T, tok, ne, lane, a0, a1);
-        __syncthreads();
+        for (int e = 0; e < EC; e++) tok[e] = e < np ? PLAN[PLAN_ET + e0 + p0 + e] : 0;
+        float a0[EC], a1[EC];
+        tile_dot<HIDDEN / 128, EC>(blob + GU_CODES + (u64)tile * (HIDDEN / 128) * 512,
+                                   blob + GU_SCALES + (u64)tile * (HIDDEN / 128) * 64, XQ, kb, T, tok, np, lane, a0, a1);
         #pragma unroll
-        for (int e = 0; e < NE; e++) {
-            if (e < ne) {
+        for (int e = 0; e < EC; e++) {
+            if (e < np) {
                 // Lane 4s holds gu rows s (a0) and s + 8 (a1): gate (s even) or up (s odd) of h
                 // rows 8·tile + s / 2 and 8·tile + 4 + s / 2.
                 float u0 = __shfl_down_sync(0xffffffffu, a0[e], 4);
                 float u1 = __shfl_down_sync(0xffffffffu, a1[e], 4);
                 if ((lane & 7) == 0) {
-                    hs[e][8 * warp + (lane >> 3)] = psilu(a0[e]) * u0;
-                    hs[e][8 * warp + 4 + (lane >> 3)] = psilu(a1[e]) * u1;
+                    hs[p0 + e][8 * warp + (lane >> 3)] = psilu(a0[e]) * u0;
+                    hs[p0 + e][8 * warp + 4 + (lane >> 3)] = psilu(a1[e]) * u1;
                 }
             }
         }
-        __syncthreads();
-        for (unsigned int e = warp; e < ne; e += 4) quant_chunk(hs[e][lane], HQ, PLAN_CAP, FF, e0 + e, q, lane);
     }
+    __syncthreads();
+    for (unsigned int e = warp; e < ne; e += 4) quant_chunk(hs[e][lane], HQ, PLAN_CAP, FF, e0 + e, q, lane);
+}
+
+template <int NE>
+__device__ __forceinline__ void moe_gu_body(const unsigned int* __restrict__ XQ, unsigned int T,
+                                            const unsigned int* __restrict__ PLAN, unsigned int* __restrict__ HQ) {
+    __shared__ float hs[NE][32];
+    unsigned int items = (FF / 32) * PLAN[0];
+    for (unsigned int item = blockIdx.x; item < items; item += gridDim.x)
+        moe_gu_item<NE>(XQ, T, PLAN, HQ, item % (FF / 32), item / (FF / 32), hs);
 }
 
 #define MOE_GU(T) \
-extern "C" __global__ void __launch_bounds__(128) fl_moe_gu_t##T( \
+extern "C" __global__ void __launch_bounds__(128, 8) fl_moe_gu_t##T( \
     const unsigned int* __restrict__ XQ, unsigned int Tm, const unsigned int* __restrict__ PLAN, \
     unsigned int* __restrict__ HQ) { \
     moe_gu_body<T>(XQ, Tm, PLAN, HQ); \
 }
 MOE_GU(1) MOE_GU(2) MOE_GU(3) MOE_GU(4) MOE_GU(5) MOE_GU(6) MOE_GU(7) MOE_GU(8)
 
-// Down rows of every planned expert against its entries' quantized h (HQ), into PARTS[dst].
-// Work items are (16-row down tile, group), 160 per group, one per warp in turn.
+// Down rows of every planned expert against its entries' quantized h (HQ), into PARTS[dst]:
+// one 16-row down tile of group g for a warp (160 per group). CG: read HQ through L2 only (it
+// was written in the same launch).
+template <int NE, bool CG>
+__device__ __forceinline__ void moe_down_tile(const unsigned int* __restrict__ HQ, const unsigned int* __restrict__ PLAN,
+                                              float* __restrict__ PARTS, unsigned int tile, unsigned int g) {
+    unsigned int lane = threadIdx.x & 31;
+    const unsigned int kb = FF / 4;
+    const unsigned char* blob = plan_blob(PLAN, g);
+    unsigned int e0 = PLAN[PLAN_GS + g], ne = PLAN[PLAN_GS + g + 1] - e0;
+    unsigned int ents[NE];
+    #pragma unroll
+    for (int e = 0; e < NE; e++) ents[e] = e0 + e;
+    float a0[NE], a1[NE];
+    tile_dot<FF / 128, NE, CG>(blob + DOWN_CODES + (u64)tile * (FF / 128) * 512,
+                               blob + DOWN_SCALES + (u64)tile * (FF / 128) * 64, HQ, kb, PLAN_CAP, ents, ne, lane,
+                               a0, a1);
+    unsigned int my_dst = lane < ne ? PLAN[PLAN_ED + e0 + lane] : 0;
+    #pragma unroll
+    for (int e = 0; e < NE; e++) {
+        unsigned int dst = __shfl_sync(0xffffffffu, my_dst, e);
+        if (e < ne && (lane & 3) == 0) {
+            float* out = PARTS + (u64)dst * HIDDEN + 16 * tile + (lane >> 2);
+            out[0] = a0[e];
+            out[8] = a1[e];
+        }
+    }
+}
+
 template <int NE>
 __device__ __forceinline__ void moe_down_body(const unsigned int* __restrict__ HQ, const unsigned int* __restrict__ PLAN,
                                               float* __restrict__ PARTS) {
-    unsigned int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const unsigned int kb = FF / 4;
+    unsigned int warp = threadIdx.x >> 5;
     unsigned int items = (HIDDEN / 16) * PLAN[0];
-    for (unsigned int item = blockIdx.x * 8 + warp; item < items; item += gridDim.x * 8) {
-        unsigned int tile = item % (HIDDEN / 16), g = item / (HIDDEN / 16);
-        const unsigned char* blob = plan_blob(PLAN, g);
-        unsigned int e0 = PLAN[PLAN_GS + g], ne = PLAN[PLAN_GS + g + 1] - e0;
-        unsigned int ents[NE];
-        #pragma unroll
-        for (int e = 0; e < NE; e++) ents[e] = e0 + e;
-        float a0[NE], a1[NE];
-        tile_dot<FF / 128, NE>(blob + DOWN_CODES + (u64)tile * (FF / 128) * 512,
-                               blob + DOWN_SCALES + (u64)tile * (FF / 128) * 64, HQ, kb, PLAN_CAP, ents, ne, lane,
-                               a0, a1);
-        unsigned int my_dst = lane < ne ? PLAN[PLAN_ED + e0 + lane] : 0;
-        #pragma unroll
-        for (int e = 0; e < NE; e++) {
-            unsigned int dst = __shfl_sync(0xffffffffu, my_dst, e);
-            if (e < ne && (lane & 3) == 0) {
-                float* out = PARTS + (u64)dst * HIDDEN + 16 * tile + (lane >> 2);
-                out[0] = a0[e];
-                out[8] = a1[e];
-            }
-        }
-    }
+    for (unsigned int item = blockIdx.x * 8 + warp; item < items; item += gridDim.x * 8)
+        moe_down_tile<NE, false>(HQ, PLAN, PARTS, item % (HIDDEN / 16), item / (HIDDEN / 16));
 }
 
 #define MOE_DOWN(T) \
@@ -1240,6 +1321,51 @@ extern "C" __global__ void __launch_bounds__(256, 3) fl_moe_down_t##T( \
     moe_down_body<T>(HQ, PLAN, PARTS); \
 }
 MOE_DOWN(1) MOE_DOWN(2) MOE_DOWN(3) MOE_DOWN(4) MOE_DOWN(5) MOE_DOWN(6) MOE_DOWN(7) MOE_DOWN(8)
+
+// gu and down in one launch on a co-resident grid of 128-thread blocks: items are every group's
+// 20 gu items, then every group's 40 down items (4 tiles, a warp each), taken in index order
+// (block b: b, b + grid, ...). A down item of group g waits for g's 20 gu items (CNT[g], counted
+// after each item's HQ is written), so the down weights stream while the last gu items finish
+// instead of after a launch boundary. Each block first runs all its gu items, so a waiting block
+// never holds back a gu item: no deadlock. The last block out resets CNT. Same per-tile
+// arithmetic as the two kernels (bitwise).
+template <int NE>
+__device__ __forceinline__ void moe_fused_body(const unsigned int* __restrict__ XQ, unsigned int T,
+                                               const unsigned int* __restrict__ PLAN, unsigned int* __restrict__ HQ,
+                                               float* __restrict__ PARTS, unsigned int* __restrict__ CNT) {
+    __shared__ float hs[NE][32];
+    const unsigned int ng = PLAN[0], ngu = (FF / 32) * ng, items = ngu + (HIDDEN / 64) * ng;
+    for (unsigned int item = blockIdx.x; item < items; item += gridDim.x) {
+        if (item < ngu) {
+            unsigned int g = item / (FF / 32);
+            moe_gu_item<NE>(XQ, T, PLAN, HQ, item % (FF / 32), g, hs);
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                __threadfence();
+                atomicAdd(CNT + g, 1u);
+            }
+        } else {
+            unsigned int d = item - ngu, g = d / (HIDDEN / 64), tile = 4 * (d % (HIDDEN / 64)) + (threadIdx.x >> 5);
+            if (threadIdx.x == 0) {
+                volatile unsigned int* c = CNT + g;
+                while (*c < FF / 32) __nanosleep(32);
+                __threadfence();
+            }
+            __syncthreads();
+            moe_down_tile<NE, true>(HQ, PLAN, PARTS, tile, g);
+        }
+    }
+    if (last_block(CNT + PLAN_CAP, gridDim.x))
+        for (unsigned int i = threadIdx.x; i < ng; i += blockDim.x) CNT[i] = 0;
+}
+
+#define MOE_FUSED(T) \
+extern "C" __global__ void __launch_bounds__(128, 8) fl_moe_fused_t##T( \
+    const unsigned int* __restrict__ XQ, unsigned int Tm, const unsigned int* __restrict__ PLAN, \
+    unsigned int* __restrict__ HQ, float* __restrict__ PARTS, unsigned int* __restrict__ CNT) { \
+    moe_fused_body<T>(XQ, Tm, PLAN, HQ, PARTS, CNT); \
+}
+MOE_FUSED(1) MOE_FUSED(2) MOE_FUSED(3) MOE_FUSED(4) MOE_FUSED(5) MOE_FUSED(6) MOE_FUSED(7) MOE_FUSED(8)
 
 // y[t] = Σ_i w[t][i] parts[t·10 + i] (+ σ(logit[t][sg]) parts[SHARED_ROW + t]). Grid
 // (HIDDEN / 256, T).
