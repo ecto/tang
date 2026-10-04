@@ -829,7 +829,18 @@ impl Engine {
                     }
                 };
                 let params = if opts.adapt {
-                    AdaptParams::default()
+                    // TANG_FLASH_ADAPT=every,max_swaps (default 4,96).
+                    let mut p = AdaptParams::default();
+                    if let Ok(v) = std::env::var("TANG_FLASH_ADAPT") {
+                        let f: Vec<&str> = v.split(',').collect();
+                        if let Some(e) = f.first().and_then(|x| x.parse().ok()) {
+                            p.every = e;
+                        }
+                        if let Some(m) = f.get(1).and_then(|x| x.parse().ok()) {
+                            p.max_swaps = m;
+                        }
+                    }
+                    p
                 } else {
                     AdaptParams {
                         every: 0,
