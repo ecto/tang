@@ -95,7 +95,12 @@ impl CudaComputeDevice {
         if let Some(f) = self.llm_funcs.borrow().get(name) {
             return f.clone();
         }
-        let (_module, f) = self.get_func_with_arch(FLASH_CUDA, name, "sm_86");
+        // TANG_FL_DEFS="#define X;#define Y": experiment defines prepended to the flash source.
+        let src: &'static str = match std::env::var("TANG_FL_DEFS") {
+            Ok(d) => Box::leak(format!("{}\n{FLASH_CUDA}", d.replace(';', "\n")).into_boxed_str()),
+            Err(_) => FLASH_CUDA,
+        };
+        let (_module, f) = self.get_func_with_arch(src, name, "sm_86");
         self.llm_funcs.borrow_mut().insert(name, f.clone());
         f
     }
