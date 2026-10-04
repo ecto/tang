@@ -131,8 +131,7 @@ __device__ __forceinline__ int chunk_dot(const int* m, const unsigned int* __res
 // applying it to every column, so each activation load serves four rows. KS warps split K for
 // one row group (KS = 1, 2, 4, 8; 8 / KS row groups per 256-thread block) and reduce through
 // shared memory, which keeps short-N / long-K shapes (10240 -> 320) on many SMs.
-#define GR 4
-template <int FMT, int T>
+template <int FMT, int T, int GR>
 __device__ __forceinline__ void gemv_body(const float* __restrict__ X, const unsigned int* __restrict__ XQ,
                                           const unsigned char* __restrict__ W, float* __restrict__ Y,
                                           unsigned int K, unsigned int N, unsigned int KS) {
@@ -265,7 +264,7 @@ extern "C" __global__ void __launch_bounds__(256) fl_##NAME##_t##T( \
     const float* __restrict__ X, const unsigned int* __restrict__ XQ, \
     const unsigned char* __restrict__ W, float* __restrict__ Y, unsigned int K, unsigned int N, \
     unsigned int KS) { \
-    gemv_body<FMT, T>(X, XQ, W, Y, K, N, KS); \
+    gemv_body<FMT, T, (T == 1 ? 2 : 4)>(X, XQ, W, Y, K, N, KS); \
 }
 #define GEMV_ALL(FMT, NAME) GEMV(FMT, NAME, 1) GEMV(FMT, NAME, 2) GEMV(FMT, NAME, 3) GEMV(FMT, NAME, 4) \
     GEMV(FMT, NAME, 5) GEMV(FMT, NAME, 6) GEMV(FMT, NAME, 7) GEMV(FMT, NAME, 8)

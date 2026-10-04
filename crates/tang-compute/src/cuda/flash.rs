@@ -205,9 +205,11 @@ impl CudaComputeDevice {
             "q8x_gemv" => 16,
             _ => 32,
         };
+        // Rows per warp, as the kernel picks it: 2 for one column, 4 for more.
+        let gr = if m == 1 { 2 } else { 4 };
         let mut ks = 1;
         while ks < 8
-            && n.div_ceil(4 * 8 / ks) < 2 * super::llm::sm_count()
+            && n.div_ceil(gr * 8 / ks) < 2 * super::llm::sm_count()
             && k / epv / (2 * ks) >= 32
         {
             ks *= 2;
@@ -225,7 +227,7 @@ impl CudaComputeDevice {
                 .arg(&ku)
                 .arg(&nu)
                 .arg(&ksu)
-                .launch(grid((n.div_ceil(4 * 8 / ks), 1, 1), 256))
+                .launch(grid((n.div_ceil(gr * 8 / ks), 1, 1), 256))
                 .unwrap();
         }
     }
