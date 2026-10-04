@@ -2,6 +2,8 @@
 //! `crate::flash`). Every launch here writes into caller buffers and takes per-window values
 //! from the `win` record, so a window of them can be captured into one CUDA graph.
 
+use std::collections::HashMap;
+
 use cudarc::driver::{CudaFunction, DevicePtr, LaunchConfig, PushKernelArg};
 
 use super::{CudaBuffer, CudaComputeDevice, CudaStorage, Q2Weight};
@@ -32,6 +34,16 @@ fn grid(g: (usize, usize, usize), threads: u32) -> LaunchConfig {
     }
 }
 
+const NAT_NAMES: [&str; 8] = [
+    "fl_nat_t1",
+    "fl_nat_t2",
+    "fl_nat_t3",
+    "fl_nat_t4",
+    "fl_nat_t5",
+    "fl_nat_t6",
+    "fl_nat_t7",
+    "fl_nat_t8",
+];
 const GEMV_FMTS: [&str; 4] = ["bf16_gemv", "q2_gemv", "q4x_gemv", "q8x_gemv"];
 const GEMV_NAMES: [[&str; 8]; 4] = [
     [
@@ -246,6 +258,72 @@ impl CudaComputeDevice {
         };
         assert!(q.n == n && q.k == k);
         self.gemv_rows("q2_gemv", None, Some(xq), &q.data, out, m, k, n);
+    }
+
+    /// `fl_nat_t{m}` of the NatX module for `ty`, compiled on first use.
+    fn nat_func(&self, ty: crate::flash_native::NatType, m: usize) -> CudaFunction {
+        static KEYS: std::sync::OnceLock<std::sync::Mutex<HashMap<(u32, usize), &'static str>>> =
+            std::sync::OnceLock::new();
+        let key = *KEYS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .entry((ty.ggml(), m))
+            .or_insert_with(|| Box::leak(format!("nat{}_t{m}", ty.ggml()).into_boxed_str()));
+        if let Some(f) = self.llm_funcs.borrow().get(key) {
+            return f.clone();
+        }
+        let src: &'static str = Box::leak(
+            format!(
+                "#define TY {}\n{}",
+                ty.ggml(),
+                crate::kernels::native_cuda::NATIVE_CUDA
+            )
+            .into_boxed_str(),
+        );
+        let (_module, f) = self.get_func_with_arch(src, NAT_NAMES[m - 1], "sm_86");
+        self.llm_funcs.borrow_mut().insert(key, f.clone());
+        f
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn native_linear_impl(
+        &self,
+        ty: crate::flash_native::NatType,
+        xq: &CudaBuffer,
+        w: &CudaBuffer,
+        out: &mut CudaBuffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        assert!((1..=MAX_T).contains(&m) && out.len >= m * n && k.is_multiple_of(32));
+        let (_, hoff, soff, total) = crate::flash_native::nat_layout(ty, n, k);
+        assert!(w.len * 4 >= total, "native_linear_into: weight size");
+        let gr = if m == 1 { 2 } else { 4 };
+        let mut ks = 1;
+        while ks < 8
+            && n.div_ceil(gr * 8 / ks) < 2 * super::llm::sm_count()
+            && k / 32 / (2 * ks) >= 32
+        {
+            ks *= 2;
+        }
+        let f = self.nat_func(ty, m);
+        let (ku, nu, ksu, ho, so) = (k as u32, n as u32, ks as u32, hoff as u64, soff as u64);
+        unsafe {
+            self.stream
+                .launch_builder(&f)
+                .arg(xq.f32_data())
+                .arg(w.f32_data())
+                .arg(out.f32_data_mut())
+                .arg(&ku)
+                .arg(&nu)
+                .arg(&ksu)
+                .arg(&ho)
+                .arg(&so)
+                .launch(grid((n.div_ceil(gr * 8 / ks), 1, 1), 256))
+                .unwrap();
+        }
     }
 
     pub(super) fn q4x_linear_impl(
@@ -1326,6 +1404,60 @@ mod tests {
         }
     }
 
+    /// Native GGUF types: GPU against the CPU reference (same pinned per-chunk arithmetic), and
+    /// both within f32 rounding of dequant(W) · dequant(q8(x)) in f64 (the engine's gate).
+    fn native_linear_vs_cpu<D: ComputeDevice>(g: &D) {
+        use crate::flash_native::{
+            nat_decode,
+            tests::{random_gguf, ALL},
+        };
+        let c = CpuDevice::new();
+        let mut rng = Rng(0x7a7);
+        for ty in ALL {
+            for &(k, n) in &[(2560, 300), (6144, 129)] {
+                let raw = random_gguf(ty, n, k, rng.u());
+                let (gw, cw) = (
+                    g.upload_native(ty, &raw, n, k),
+                    c.upload_native(ty, &raw, n, k),
+                );
+                let ir = nat_decode(ty, &raw, n, k);
+                for t in TS {
+                    let x = rng.vec(t * k, 2.0);
+                    let qa = QAct { m: t, k };
+                    let (mut gq, mut cq) = (g.alloc_f32(qa.words()), c.alloc_f32(qa.words()));
+                    g.quantize_act_into(&g.upload_f32(&x), &mut gq, t, k);
+                    c.quantize_act_into(&c.upload_f32(&x), &mut cq, t, k);
+                    let (mut gy, mut cy) = (g.alloc_f32(t * n), c.alloc_f32(t * n));
+                    g.native_linear_into(ty, &gq, &gw, &mut gy, t, k, n);
+                    c.native_linear_into(ty, &cq, &cw, &mut cy, t, k, n);
+                    let (got, want) = (g.download(&gy), c.download(&cy));
+                    close(&got, &want, 1e-5, &format!("native {ty:?} t={t} {k}->{n}"));
+                    // The gate: against the dequantized product in f64.
+                    let qw = u32s(&c.download(&cq));
+                    for r in 0..t {
+                        let xr = crate::cpu::flash::QRow::decode(&qw, qa, r);
+                        for o in (0..n).step_by(17) {
+                            let (mut dot, mut mag) = (0f64, 0f64);
+                            for e in 0..k {
+                                let w = ir.scale[(o * k + e) / 16] as f64
+                                    * ir.code[o * k + e] as f64
+                                    - ir.min[(o * k + e) / 32] as f64;
+                                let xv = xr.q[e] as f64 * xr.d[e / 32] as f64;
+                                dot += w * xv;
+                                mag += (w * xv).abs();
+                            }
+                            let gv = got[r * n + o] as f64;
+                            assert!(
+                                (gv - dot).abs() <= 2e-6 * mag + 1e-30,
+                                "native {ty:?} gate t={t} row {o}: {gv} vs {dot} (mag {mag})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn linear_into_vs_cpu<D: ComputeDevice>(g: &D) {
         let c = CpuDevice::new();
         let mut rng = Rng(7);
@@ -2235,6 +2367,11 @@ mod tests {
     #[test]
     fn cuda_q8x_linear_vs_cpu() {
         on_gpu(q8x_linear_vs_cpu::<CudaComputeDevice>);
+    }
+
+    #[test]
+    fn cuda_native_linear_vs_cpu() {
+        on_gpu(native_linear_vs_cpu::<CudaComputeDevice>);
     }
 
     #[test]

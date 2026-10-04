@@ -1240,6 +1240,38 @@ pub trait ComputeDevice: Send {
         *out = self.upload_f32(&y);
     }
 
+    /// Upload a GGUF matrix `[n, k]` of a native type, repacked as NatX
+    /// ([`crate::flash_native::nat_repack`]) for [`native_linear_into`](Self::native_linear_into).
+    fn upload_native(
+        &self,
+        ty: crate::flash_native::NatType,
+        raw: &[u8],
+        n: usize,
+        k: usize,
+    ) -> Self::Buffer {
+        self.upload_bytes(&crate::flash_native::nat_repack(ty, raw, n, k))
+    }
+
+    /// `out[m, n] = W · x̂` for a NatX weight of type `ty` (`m <= 8` columns of int8
+    /// activations, [`crate::flash::QAct`]); the per-chunk arithmetic is pinned in
+    /// [`crate::flash_native`], the order chunks are summed in is the backend's.
+    #[allow(clippy::too_many_arguments)]
+    fn native_linear_into(
+        &self,
+        ty: crate::flash_native::NatType,
+        xq: &Self::Buffer,
+        w: &Self::Buffer,
+        out: &mut Self::Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        let (xq, w) = (self.download(xq), self.download(w));
+        let wb: Vec<u8> = w.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+        let y = crate::cpu::flash::native_linear(ty, &crate::flash::u32s(&xq), &wb, m, k, n);
+        *out = self.upload_f32(&y);
+    }
+
     /// Hyper-connection read for a window of `t` tokens: `r` is `[t][HC][HIDDEN]`; writes
     /// `x [t][HIDDEN]`, `xq` (when given) the same as int8 activations
     /// (`QAct { m: t, k: HIDDEN }`), and, when `w.inject` is set, `inj [t][HC]`. A `pending`

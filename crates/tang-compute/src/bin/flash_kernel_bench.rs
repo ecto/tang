@@ -854,6 +854,68 @@ fn window_launches(c: Class) -> usize {
     }
 }
 
+/// Native GGUF types (NatX): GB/s of the GGUF's bytes (and of the repacked ones) at the
+/// Flash-Next dense shapes, T = 1 and 4, in graphs over weight copies larger than L2.
+fn native(g: &CudaComputeDevice) {
+    use tang_compute::flash_native::{
+        nat_layout,
+        tests::{random_gguf, ALL},
+        NatType,
+    };
+    let mut rng = Rng(0xa11ce);
+    println!("native GEMV, GB/s of GGUF bytes T=1 / T=4 (repacked bytes in parentheses)");
+    let shapes = [
+        (2560, 10240),
+        (2560, 6144),
+        (6144, 2560),
+        (2560, 12288),
+        (2560, 640),
+        (2560, 512),
+    ];
+    for ty in ALL {
+        let mut line = format!("{ty:<6?}");
+        let mut sh: Vec<(usize, usize)> = shapes.to_vec();
+        if ty == NatType::Q5K {
+            sh.push((2560, 248_320));
+        }
+        for (k, n) in sh {
+            if ty.block().0 == 256 && k % 256 != 0 {
+                continue;
+            }
+            let raw = random_gguf(ty, n, k, rng.u());
+            let bytes = ty.gguf_bytes(n, k);
+            let rep = nat_layout(ty, n, k).3;
+            let copies = (96usize << 20).div_ceil(rep).clamp(1, 16);
+            let ws: Vec<B> = (0..copies)
+                .map(|_| g.upload_native(ty, &raw, n, k))
+                .collect();
+            let mut cell = format!(" | {k}->{n}");
+            for t in [1usize, 4] {
+                let mut xq = g.alloc_f32(QAct { m: t, k }.words());
+                g.quantize_act_into(&g.upload_f32(&rng.vec(t * k, 1.0)), &mut xq, t, k);
+                let mut y = g.alloc_f32(t * n);
+                let reps = (copies * 4).max(8);
+                let graph = g.capture(&mut || {
+                    for i in 0..reps {
+                        g.native_linear_into(ty, &xq, &ws[i % copies], &mut y, t, k, n);
+                    }
+                });
+                graph.launch().unwrap();
+                let ms = (0..3)
+                    .map(|_| g.event_ms(&mut || graph.launch().unwrap()))
+                    .fold(f32::INFINITY, f32::min);
+                let us = ms as f64 * 1e3 / reps as f64;
+                cell += &format!(" {:.0}", bytes as f64 / (us * 1e3));
+                if t == 4 {
+                    cell += &format!(" ({:.0}, {:.1}us@T1)", rep as f64 / (us * 1e3), 0.0);
+                }
+            }
+            line += &cell;
+        }
+        println!("{line}");
+    }
+}
+
 /// Routed experts alone: `moe_grouped_into` for 48 layers of synthetic routing (all experts
 /// resident, plus the shared expert), in one graph, for T = 1, 2, 4, 8.
 fn moe(g: &CudaComputeDevice) {
@@ -936,6 +998,7 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("gemv") => gemv(&g),
         Some("moe") => moe(&g),
+        Some("native") => native(&g),
         Some("window") => {
             let ts: Vec<usize> = args[1..].iter().map(|a| a.parse().expect("T")).collect();
             run_window(&g, if ts.is_empty() { &[1, 2, 4] } else { &ts });

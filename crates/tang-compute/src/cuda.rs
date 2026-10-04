@@ -4138,6 +4138,19 @@ impl ComputeDevice for CudaComputeDevice {
         self.q8x_linear_impl(xq, w, out, m, k, n)
     }
 
+    fn native_linear_into(
+        &self,
+        ty: crate::flash_native::NatType,
+        xq: &CudaBuffer,
+        w: &CudaBuffer,
+        out: &mut CudaBuffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        self.native_linear_impl(ty, xq, w, out, m, k, n)
+    }
+
     fn q4x_linear_into(
         &self,
         xq: &CudaBuffer,
