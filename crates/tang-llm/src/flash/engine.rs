@@ -2392,12 +2392,12 @@ impl Mtp {
         };
         let q8 = std::env::var("TANG_FLASH_MTP_Q8").is_ok_and(|v| v == "1");
         // The drafter's vocabulary: token ids [0, n) and the specials from 248044 on
-        // (`TANG_FLASH_MTP_VOCAB`, default 65536; 0 = all).
+        // (`TANG_FLASH_MTP_VOCAB`, default 106000: same acceptance as the full head on chat and code, 65536 costs code d1 96 -> 92%; 0 = all).
         let vocab_lo: Option<usize> = match std::env::var("TANG_FLASH_MTP_VOCAB").ok().and_then(|v| v.parse::<usize>().ok()) {
             Some(0) => None,
             Some(n) if n < 248_044 => Some(n),
             Some(_) => None,
-            None => Some(65536),
+            None => Some(106_000),
         };
         let mut ex: Vec<B> = Vec::new();
         let mut ex_rb = [0usize; 3];
