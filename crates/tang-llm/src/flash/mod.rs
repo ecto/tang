@@ -11,9 +11,11 @@ pub mod cli;
 pub mod engine;
 #[cfg(feature = "cuda")]
 pub mod kernels;
+pub mod mtp;
 pub mod ngram;
 pub mod pack;
 pub mod reference;
+pub mod requant;
 pub mod tokenize;
 
 use crate::gguf::{Gguf, TensorInfo};

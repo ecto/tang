@@ -25,6 +25,7 @@
 //! Routed experts are dequantised lazily, one (layer, expert) at a time, only for the experts some
 //! token picked. N-gram table rows are read with `pread` at their offsets (16 per token).
 
+use super::requant::{self, DensePolicy, Format};
 use crate::gguf::{f16_to_f32, f32_to_f16, GgmlType, Gguf, TensorInfo};
 use anyhow::{bail, ensure, Context, Result};
 use rayon::prelude::*;
@@ -278,6 +279,9 @@ pub enum Act {
     Q8_0,
     Q8K,
     Bf16,
+    /// The fast kernels' contract (`tang_compute::flash::QAct`): per 32-element chunk
+    /// `d = amax / 127` in f32, `q = clamp(round_half_away(x / d), ±127)`.
+    Int8,
 }
 
 impl Act {
@@ -297,6 +301,19 @@ impl Act {
         match self {
             Act::F32 => {}
             Act::Bf16 => x.iter_mut().for_each(|v| *v = round_bf16(*v)),
+            Act::Int8 => {
+                for b in x.chunks_mut(32) {
+                    let amax = b.iter().fold(0f32, |m, v| m.max(v.abs()));
+                    let d = amax / 127.0;
+                    for v in b.iter_mut() {
+                        *v = if d == 0.0 {
+                            0.0
+                        } else {
+                            (*v / d).round().clamp(-127.0, 127.0) * d
+                        };
+                    }
+                }
+            }
             Act::Q8_0 => {
                 for b in x.chunks_mut(32) {
                     let amax = b.iter().fold(0f32, |m, v| m.max(v.abs()));
@@ -357,7 +374,8 @@ pub struct Mat {
 }
 
 impl Mat {
-    fn from_info(g: &Gguf, t: &TensorInfo, emulate: bool) -> Result<Self> {
+    /// Dequantize `t`, then round-trip it through `fmt` (the dense requant study).
+    fn from_info(g: &Gguf, t: &TensorInfo, fmt: Format, act: Act) -> Result<Self> {
         ensure!(t.dims.len() <= 2, "{}: not a matrix ({:?})", t.name, t.dims);
         let cols = t.dims[0] as usize;
         let rows = if t.dims.len() == 2 {
@@ -365,20 +383,14 @@ impl Mat {
         } else {
             1
         };
+        let mut data = g.dequantize(t)?;
+        requant::apply(fmt, &mut data, cols);
         Ok(Self {
             rows,
             cols,
-            data: g.dequantize(t)?,
-            act: if emulate {
-                Act::for_weight(t.ty)
-            } else {
-                Act::F32
-            },
+            data,
+            act,
         })
-    }
-
-    fn load(g: &Gguf, name: &str, emulate: bool) -> Result<Self> {
-        Self::from_info(g, g.info(name)?, emulate)
     }
 
     fn row(&self, r: usize) -> &[f32] {
@@ -461,7 +473,7 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 }
 
 #[inline]
-fn sigmoid(x: f32) -> f32 {
+pub(crate) fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
@@ -487,7 +499,7 @@ fn inv_rms(x: &[f32], eps: f32) -> f32 {
 }
 
 /// In place: `x = x / rms(x) * w`.
-fn rms_norm_mul(x: &mut [f32], w: &[f32], eps: f32) {
+pub(crate) fn rms_norm_mul(x: &mut [f32], w: &[f32], eps: f32) {
     let s = inv_rms(x, eps);
     for (v, g) in x.iter_mut().zip(w) {
         *v = *v * s * g;
@@ -506,7 +518,7 @@ fn l2_norm(x: &mut [f32], eps: f32) {
 /// NeoX rope on the first `n_rot` dims of one head (pairs `i`, `i + n_rot/2`), at `pos`.
 /// The model's rope is interleaved M-RoPE with sections [11, 11, 10, 0]; for text every section
 /// gets the same position, so it is exactly this.
-fn rope_neox(x: &mut [f32], pos: usize, n_rot: usize, base: f32) {
+pub(crate) fn rope_neox(x: &mut [f32], pos: usize, n_rot: usize, base: f32) {
     let half = n_rot / 2;
     for i in 0..half {
         let theta = pos as f32 * base.powf(-2.0 * i as f32 / n_rot as f32);
@@ -536,7 +548,7 @@ impl Dump {
         })
     }
 
-    fn f32(&mut self, name: &str, shape: &[usize], v: &[f32]) -> Result<()> {
+    pub(crate) fn f32(&mut self, name: &str, shape: &[usize], v: &[f32]) -> Result<()> {
         ensure!(
             shape.iter().product::<usize>() == v.len(),
             "{name}: shape {shape:?} vs {} values",
@@ -550,7 +562,7 @@ impl Dump {
         Ok(())
     }
 
-    fn u32(&mut self, name: &str, v: &[u32]) -> Result<()> {
+    pub(crate) fn u32(&mut self, name: &str, v: &[u32]) -> Result<()> {
         let file = format!("{name}.u32");
         let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
         std::fs::write(self.dir.join(&file), bytes)?;
@@ -560,7 +572,7 @@ impl Dump {
         Ok(())
     }
 
-    fn finish(&self, tokens: &[u32], position: usize) -> Result<()> {
+    pub(crate) fn finish(&self, tokens: &[u32], position: usize) -> Result<()> {
         let idx = serde_json::json!({
             "model": "qwen4exp",
             "position": position,
@@ -589,6 +601,11 @@ pub struct FlashRef {
     pub emulate_llama: bool,
     /// Ablation: QSA attends to every earlier cell, skipping the indexer's selection.
     pub qsa_dense: bool,
+    /// What the dense weights are requantized to first ([`DensePolicy::F32`]: nothing).
+    pub dense: DensePolicy,
+    /// The fast kernels' activation contract ([`Act::Int8`]) on every matmul whose weight isn't
+    /// kept as bf16/f32.
+    pub act_int8: bool,
 }
 
 /// One position's top-k next-token log-probabilities.
@@ -607,6 +624,8 @@ impl FlashRef {
             verbose: false,
             emulate_llama: false,
             qsa_dense: false,
+            dense: DensePolicy::F32,
+            act_int8: false,
         })
     }
 
@@ -618,19 +637,34 @@ impl FlashRef {
         self.load(&self.t(l, name))
     }
 
-    fn load(&self, name: &str) -> Result<Mat> {
-        Mat::load(&self.g, name, self.emulate_llama)
+    pub(crate) fn load(&self, name: &str) -> Result<Mat> {
+        let t = self.g.info(name)?;
+        let fmt = if t.dims.len() == 2 {
+            self.dense.format(name, t.ty)
+        } else {
+            Format::Keep
+        };
+        Mat::from_info(&self.g, t, fmt, self.act_for(t, fmt))
     }
 
-    fn act_for(&self, t: &TensorInfo) -> Act {
-        if self.emulate_llama {
+    /// The input rounding a matmul against `t` (stored as `fmt`) gets.
+    fn act_for(&self, t: &TensorInfo, fmt: Format) -> Act {
+        let float =
+            fmt == Format::Keep && matches!(t.ty, GgmlType::Bf16 | GgmlType::F32 | GgmlType::F16);
+        if self.act_int8 {
+            if float {
+                Act::F32
+            } else {
+                Act::Int8
+            }
+        } else if self.emulate_llama {
             Act::for_weight(t.ty)
         } else {
             Act::F32
         }
     }
 
-    fn vec(&self, name: &str) -> Result<Vec<f32>> {
+    pub(crate) fn vec(&self, name: &str) -> Result<Vec<f32>> {
         self.g.tensor_f32(name)
     }
 
@@ -641,8 +675,20 @@ impl FlashRef {
         tokens: &[u32],
         out_from: usize,
         k: usize,
-        mut dump: Option<&mut Dump>,
+        dump: Option<&mut Dump>,
     ) -> Result<Vec<TopK>> {
+        Ok(self.forward_res(tokens, out_from, k, dump)?.0)
+    }
+
+    /// [`forward`](Self::forward), also returning the final 4-stream residual of every position
+    /// (`[T][hc][n_embd]`, before the output hyper-connection read): what the MTP layer reads.
+    pub fn forward_res(
+        &self,
+        tokens: &[u32],
+        out_from: usize,
+        k: usize,
+        mut dump: Option<&mut Dump>,
+    ) -> Result<(Vec<TopK>, Vec<f32>)> {
         let hp = &self.hp;
         let (n, hc, t_len) = (hp.n_embd, hp.hc, tokens.len());
         ensure!(t_len > 0, "no tokens");
@@ -749,7 +795,7 @@ impl FlashRef {
                 start.elapsed().as_secs_f64()
             );
         }
-        Ok(tops)
+        Ok((tops, r))
     }
 
     /// `build_hc_mix`: collapse the 4 streams to the one vector a block reads, and (when `inject`)
@@ -757,7 +803,7 @@ impl FlashRef {
     ///
     /// `xn[c] = rmsnorm(R[c]) * w_norm[c]` (w stored as 1 + w); `gate = sigmoid(up @ silu(down @ xn / hc))`;
     /// `x = mean_c(xn[c] * gate[c])`; `inj = inject @ xn`.
-    fn hc_read(
+    pub(crate) fn hc_read(
         &self,
         r: &[f32],
         t_len: usize,
@@ -1098,7 +1144,13 @@ impl FlashRef {
 
     /// MoE: softmax over all experts, top-k, renormalised with the 2^-14 clamp; plus the
     /// sigmoid-gated shared expert.
-    fn moe(&self, l: usize, x: &[f32], t_len: usize, dump: Option<&mut Dump>) -> Result<Vec<f32>> {
+    pub(crate) fn moe(
+        &self,
+        l: usize,
+        x: &[f32],
+        t_len: usize,
+        dump: Option<&mut Dump>,
+    ) -> Result<Vec<f32>> {
         let hp = &self.hp;
         let (n, ne, k) = (hp.n_embd, hp.n_expert, hp.n_expert_used);
         let router = self.mat(l, "ffn_gate_inp.weight")?;
@@ -1162,19 +1214,19 @@ impl FlashRef {
                     rows: ff,
                     cols: n,
                     data: self.g.expert(gate_t, e)?,
-                    act: self.act_for(gate_t),
+                    act: self.act_for(gate_t, Format::Keep),
                 };
                 let up = Mat {
                     rows: ff,
                     cols: n,
                     data: self.g.expert(up_t, e)?,
-                    act: self.act_for(up_t),
+                    act: self.act_for(up_t, Format::Keep),
                 };
                 let down = Mat {
                     rows: n,
                     cols: ff,
                     data: self.g.expert(down_t, e)?,
-                    act: self.act_for(down_t),
+                    act: self.act_for(down_t, Format::Keep),
                 };
                 let gv = gate.apply(&xe, m, true);
                 let uv = up.apply(&xe, m, true);
@@ -1217,7 +1269,7 @@ impl FlashRef {
                 }
             }
             let mut xt = x[t * n..(t + 1) * n].to_vec();
-            self.act_for(sg_t).round(&mut xt);
+            self.act_for(sg_t, Format::Keep).round(&mut xt);
             let gsh = sigmoid(dot(&sg, &xt));
             for (o, v) in yt.iter_mut().zip(&sh[t * n..(t + 1) * n]) {
                 *o += gsh * v;
@@ -1350,7 +1402,7 @@ impl FlashRef {
 }
 
 /// `build_hc_combine`: every stream adds the block output, scaled by `2 * sigmoid(inj[c] / hc)`.
-fn hc_write(r: &mut [f32], y: &[f32], inj: &[f32], t_len: usize, hc: usize, n: usize) {
+pub(crate) fn hc_write(r: &mut [f32], y: &[f32], inj: &[f32], t_len: usize, hc: usize, n: usize) {
     for t in 0..t_len {
         for c in 0..hc {
             let w = 2.0 * sigmoid(inj[t * hc + c] / hc as f32);
@@ -1387,7 +1439,9 @@ pub fn top_logprobs(logits: &[f32], k: usize) -> Vec<(u32, f64)> {
 /// position, `{"pos": i, "top": [[id, logprob], ...]}` (the distribution of the token *after*
 /// position i). `--llama-numerics` rounds activations and the QSA caches the way llama.cpp's CPU
 /// backend does (see [`Act`]); without it everything is f32. `--qsa-dense` is an ablation: QSA
-/// attends to every cell, as if the indexer selected everything.
+/// attends to every cell, as if the indexer selected everything. `--dense-as` requantizes dense
+/// weights first (see [`requant`]); `--act-int8` applies the fast kernels' int8 activation
+/// contract to every matmul whose weight isn't bf16/f32.
 pub fn cli(args: &[String]) -> Result<()> {
     let usage =
         "usage: flash-ref <gguf> <ids...> [--ids-file F] [--last N] [--top K] [--dump DIR] [-v]";
@@ -1400,6 +1454,8 @@ pub fn cli(args: &[String]) -> Result<()> {
     let mut verbose = false;
     let mut llama_numerics = false;
     let mut qsa_dense = false;
+    let mut act_int8 = false;
+    let mut dense = DensePolicy::F32;
     while let Some(a) = it.next() {
         match a.as_str() {
             "--last" => last = Some(it.next().context("--last N")?.parse().context("--last N")?),
@@ -1420,6 +1476,8 @@ pub fn cli(args: &[String]) -> Result<()> {
             "-v" | "--verbose" => verbose = true,
             "--llama-numerics" => llama_numerics = true,
             "--qsa-dense" => qsa_dense = true,
+            "--act-int8" => act_int8 = true,
+            "--dense-as" => dense = DensePolicy::parse(it.next().context("--dense-as POLICY")?)?,
             s => ids.push(
                 s.parse()
                     .with_context(|| format!("bad token id {s:?}; {usage}"))?,
@@ -1433,6 +1491,8 @@ pub fn cli(args: &[String]) -> Result<()> {
     m.verbose = verbose;
     m.emulate_llama = llama_numerics;
     m.qsa_dense = qsa_dense;
+    m.act_int8 = act_int8;
+    m.dense = dense;
     let from = ids.len() - last.unwrap_or(ids.len()).clamp(1, ids.len());
     let mut dump = dump_dir.as_deref().map(Dump::new).transpose()?;
     let tops = m.forward(&ids, from, top, dump.as_mut())?;
