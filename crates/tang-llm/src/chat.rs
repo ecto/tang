@@ -47,6 +47,16 @@ impl Template {
         })
     }
 
+    /// A template from its Jinja source and bos/eos strings (e.g. a GGUF's metadata).
+    pub fn from_source(source: String, bos: String, eos: String) -> Result<Self> {
+        let mut env = minijinja::Environment::new();
+        minijinja_contrib::add_to_environment(&mut env);
+        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        env.add_filter("tojson", tojson);
+        env.add_template_owned("chat", source)?;
+        Ok(Self { env, bos, eos })
+    }
+
     pub fn render(
         &self,
         messages: &Value,

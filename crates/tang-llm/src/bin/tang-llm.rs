@@ -190,6 +190,9 @@ fn main() -> Result<()> {
         print!("{}", tang_llm::flash::requant::report(&g)?);
         return Ok(());
     }
+    if cmd == "flash-tokenize" {
+        return tang_llm::flash::tokenize::cli(&args[1..]);
+    }
     if cmd == "flash-ref" {
         return tang_llm::flash::reference::cli(&args[1..]);
     }

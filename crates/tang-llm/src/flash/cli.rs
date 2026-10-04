@@ -388,7 +388,11 @@ pub fn generate(args: &[String]) -> Result<()> {
     println!("prompt: {} tokens, prefill {:.2} s ({:.0} tok/s)", ids.len(), prefill_s, ids.len() as f64 / prefill_s);
     println!("ids: {}", out.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" "));
     if !a.quiet {
-        println!("text: {}", detok(&vocab, &out));
+        let g = crate::gguf::Gguf::open(&a.path)?;
+        match super::tokenize::FlashTokenizer::from_gguf(&g).and_then(|t| t.decode(&out)) {
+            Ok(text) => println!("text: {text}"),
+            Err(_) => println!("text: {}", detok(&vocab, &out)),
+        }
     }
     println!(
         "decode: {} tokens in {:.3} s = {:.1} tok/s (drafts {}, temp {}, graphs {})",
