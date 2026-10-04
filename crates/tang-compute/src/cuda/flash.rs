@@ -747,7 +747,7 @@ impl CudaComputeDevice {
                 .arg(&tu)
                 .arg(plan.f32_data())
                 .arg(scratch.f32_data_mut())
-                .launch(grid((8 * super::llm::sm_count(), 1, 1), 256))
+                .launch(grid((16 * super::llm::sm_count(), 1, 1), 128))
                 .unwrap();
         }
         let f = self.fl(DOWN[t - 1]);

@@ -418,9 +418,10 @@ impl MoePlan {
     pub const SHARED_ROW: usize = MAX_T * TOPK;
     /// Rows of `parts` ([`HIDDEN`] floats each).
     pub const PARTS_ROWS: usize = Self::CAP;
-    /// Words of `moe_grouped_into` scratch: the SwiGLU activations of every entry, f32.
+    /// Words of `moe_grouped_into` scratch: every entry's SwiGLU activations as int8
+    /// (`QAct { m: CAP, k: FF }`, row = entry).
     pub fn scratch_words() -> usize {
-        Self::CAP * FF
+        QAct { m: Self::CAP, k: FF }.words()
     }
 }
 
