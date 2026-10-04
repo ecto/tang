@@ -315,6 +315,8 @@ struct Kern {
     m_cat: Fun,
     m_prep: Fun,
     m_attn: Fun,
+    m_attn_part: Fun,
+    m_attn_merge: Fun,
     m_moe: Fun,
     m_amax1: Fun,
     m_amax2: Fun,
@@ -452,6 +454,8 @@ pub struct Engine {
     pub load_report: String,
     mtp: Option<Box<Mtp>>,
     pub last_mtp_ms: f64,
+    pub last_commit_ms: f64,
+    pub last_mtp_gpu_ms: f64,
     /// Run the MTP after every window (keeps its K/V cache complete) and keep its drafts.
     pub use_mtp: bool,
     /// The last MTP pass's chain: (draft, probability) × 3.
@@ -747,6 +751,8 @@ impl Engine {
             m_cat: f(&gm, "fe_mtp_cat")?,
             m_prep: f(&gm, "fe_mtp_prep")?,
             m_attn: f(&gm, "fe_mtp_attn")?,
+            m_attn_part: f(&gm, "fe_mtp_attn_part")?,
+            m_attn_merge: f(&gm, "fe_mtp_attn_merge")?,
             m_moe: f(&gm, "fe_moe_rows")?,
             m_amax1: f(&gm, "fe_amaxp1")?,
             m_amax2: f(&gm, "fe_amaxp2")?,
@@ -907,6 +913,8 @@ impl Engine {
             load_report,
             mtp: None,
             last_mtp_ms: 0.0,
+            last_commit_ms: 0.0,
+            last_mtp_gpu_ms: 0.0,
             use_mtp: false,
             mtp_last: Vec::new(),
         };
@@ -2179,8 +2187,15 @@ struct Mtp {
     /// The main model's token embedding (Q3_K) for the chain's draft tokens.
     embed: B,
     embed_rb: usize,
+    /// The draft head: the main head's rows for tokens [0, n_lo) and [hi_base, vocab)
+    /// (`TANG_FLASH_MTP_VOCAB`, e.g. 32768; default 0 = the whole head: on code, 32768 costs d1 97% -> 91%). A drafter's vocabulary
+    /// changes acceptance only.
+    dhead: Option<(Dw, usize, usize)>,
     kc: B,
     vc: B,
+    /// Split-K attention partials: [8 cells][2 groups][nchunk][12 heads][258].
+    part: B,
+    nchunk: usize,
     h: B,
     toks: B,
     /// One control record per step: [pos0, cells].
@@ -2291,9 +2306,39 @@ impl Mtp {
             ex: [ex.remove(0), ex.remove(0), ex.remove(0)],
             ex_rb,
             embed: m::upload_padded(dev, main.bytes(emb_t)),
+            dhead: {
+                let n_lo: usize = std::env::var("TANG_FLASH_MTP_VOCAB").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+                if n_lo == 0 || n_lo >= vocab {
+                    None
+                } else {
+                    let ht = main.info("output.weight")?;
+                    let rb = ht.row_bytes()?;
+                    let hi_base = 248_044.min(vocab);
+                    let all = main.bytes(ht);
+                    let mut b = all[..n_lo * rb].to_vec();
+                    b.extend_from_slice(&all[hi_base * rb..vocab * rb]);
+                    let w = m::upload_padded(dev, &b);
+                    let p = dev.buffer_addr(&w);
+                    let rows = n_lo + vocab - hi_base;
+                    let ty = m::ggml_id(ht.ty)?;
+                    Some((
+                        Dw::Native {
+                            segs: dev.upload_u32(&[p as u32, (p >> 32) as u32, ty as u32, rows as u32, rb as u32, 0]),
+                            _w: w,
+                            nseg: 1,
+                            rows,
+                            row16: row16(&[[ty, rows as u64, rb as u64, 0, 0]]),
+                        },
+                        n_lo,
+                        hi_base,
+                    ))
+                }
+            },
             embed_rb: emb_t.row_bytes()?,
             kc: z(max_ctx * QSA_KV * QSA_D),
             vc: z(max_ctx * QSA_KV * QSA_D),
+            part: z(MAX_T * QSA_KV * max_ctx.div_ceil(128) * 12 * 258),
+            nchunk: max_ctx.div_ceil(128),
             h: z(MAX_T * HC * HIDDEN),
             toks: z(MAX_T),
             ctl: (0..super::mtp_gpu::STEPS).map(|_| z(4)).collect(),
@@ -2348,8 +2393,9 @@ impl Engine {
             let (pr, stride, qn, kn, cs, sn, q, kc, vc, eps) =
                 (a(&mt.proj), mp as i32, a(&mt.qn), a(&mt.kn), a(&self.rope.0), a(&self.rope.1), a(&mt.q), a(&mt.kc), a(&mt.vc), EPS);
             launch(self.k.m_prep, (c as u32, 26, 1), 256, tang_moe::args![pr, stride, qn, kn, cs, sn, ctl, q, kc, vc, eps]);
-            let out = a(&mt.attn);
-            launch(self.k.m_attn, (c as u32, QSA_HEADS as u32, 1), 256, tang_moe::args![q, kc, vc, pr, stride, ctl, out]);
+            let (out, part, nch) = (a(&mt.attn), a(&mt.part), mt.nchunk as i32);
+            launch(self.k.m_attn_part, (c as u32, QSA_KV as u32, mt.nchunk as u32), 128, tang_moe::args![q, kc, vc, ctl, part, nch]);
+            launch(self.k.m_attn_merge, (c as u32, QSA_HEADS as u32, 1), 256, tang_moe::args![part, nch, pr, stride, out]);
         }
         mt.w_out.native_ptr(dev, &nk, a(&mt.attn), a(&s.mix), c, QSA_OUT, HIDDEN);
         dev.hc_read_into(
@@ -2406,12 +2452,24 @@ impl Engine {
             c,
             EPS,
         );
-        let v = self.hp.n_vocab;
-        self.head.native_ptr(dev, &nk, a(&s.x), a(&mt.logits), c, HIDDEN, v);
+        // Only the last cell's draft is used: the head for that row alone.
+        let xl = a(&s.x) + ((c - 1) * HIDDEN * 4) as u64;
+        let (v, n_lo, hi_base) = match &mt.dhead {
+            Some((h, n_lo, hi)) => {
+                let rows = n_lo + self.hp.n_vocab - hi;
+                h.native_ptr(dev, &nk, xl, a(&mt.logits), 1, HIDDEN, rows);
+                (rows, *n_lo as i32, *hi as i32)
+            }
+            None => {
+                let v = self.hp.n_vocab;
+                self.head.native_ptr(dev, &nk, xl, a(&mt.logits), 1, HIDDEN, v);
+                (v, v as i32, 0)
+            }
+        };
         {
             let (lg, n, part, np, ids, pr) = (a(&mt.logits), v as i32, a(&mt.amax), 64i32, a(&mt.drafts[step]), a(&mt.probs[step]));
-            launch(self.k.m_amax1, (64, c as u32, 1), 1024, tang_moe::args![lg, n, part]);
-            launch(self.k.m_amax2, (c as u32, 1, 1), 32, tang_moe::args![part, np, ids, pr]);
+            launch(self.k.m_amax1, (64, 1, 1), 1024, tang_moe::args![lg, n, part]);
+            launch(self.k.m_amax2, (1, 1, 1), 32, tang_moe::args![part, np, ids, pr, n_lo, hi_base]);
         }
     }
 
@@ -2476,6 +2534,30 @@ impl Engine {
         }
     }
 
+    /// Capture every graph decoding can use (windows and commits of T = 1..8, the MTP pass for
+    /// 1..8 cells) on a throwaway sequence, so no capture lands inside a timed run.
+    pub fn warm(&mut self) -> Result<()> {
+        let use_mtp = self.use_mtp;
+        self.use_mtp = self.mtp.is_some();
+        self.reset();
+        let ids: Vec<u32> = (0..16).map(|i| 1000 + i).collect();
+        let mut cur = self.prefill(&ids, MAX_T, None)?;
+        for t in 1..=MAX_T {
+            let d: Vec<u32> = (0..t - 1).map(|i| 7 + i as u32).collect();
+            cur = *self.verify(cur, &d)?.last().unwrap();
+        }
+        if self.mtp.is_some() {
+            let pos = self.tokens.len() - 1;
+            for c in 1..=MAX_T {
+                self.mtp_draft(pos.saturating_sub(c), &vec![cur; c])?;
+                self.mtp_draft(pos.saturating_sub(c), &vec![cur; c])?;
+            }
+        }
+        self.use_mtp = use_mtp;
+        self.reset();
+        Ok(())
+    }
+
     pub fn has_mtp(&self) -> bool {
         self.mtp.is_some()
     }
@@ -2493,7 +2575,15 @@ impl Engine {
         ctl[0] = pos0 as u32;
         ctl[1] = c as u32;
         let ready = self.mtp.as_ref().unwrap().graphs[c].is_some();
-        if self.use_graphs && ready {
+        if std::env::var("TANG_FLASH_MTP_TIMING").is_ok() {
+            self.dev.sync();
+            self.last_commit_ms = t0.elapsed().as_secs_f64() * 1e3;
+        }
+        if self.use_graphs && ready && std::env::var("TANG_FLASH_MTP_TIMING").is_ok() {
+            let g = self.mtp.as_ref().unwrap().graphs[c].as_ref().unwrap() as *const Graph;
+            let stream = ManuallyDrop::new(Stream(self.dev.cu_stream()));
+            self.last_mtp_gpu_ms = self.dev.event_ms(&mut || unsafe { &*g }.launch(&stream).expect("mtp graph")) as f64;
+        } else if self.use_graphs && ready {
             self.mtp.as_ref().unwrap().graphs[c].as_ref().unwrap().launch(&self.stream).map_err(|e| anyhow!("{e}"))?;
         } else {
             self.enqueue_mtp(c);
@@ -2501,7 +2591,7 @@ impl Engine {
         self.dev.sync();
         let mut out = Vec::with_capacity(super::mtp_gpu::STEPS);
         for step in 0..super::mtp_gpu::STEPS {
-            let idx = if step == 0 { c - 1 } else { 0 };
+            let idx = 0;
             let d = self.io.u32s(Io::MTP_OUT + 64 * step, MAX_T)[idx];
             let p = f32::from_bits(self.io.u32s(Io::MTP_OUT + 64 * step + 32, MAX_T)[idx]);
             out.push((d, p));

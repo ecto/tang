@@ -834,7 +834,7 @@ extern "C" __global__ void fe_amaxp1(const float* logits, int n, float* part) {
         p[0] = v; p[1] = __int_as_float(idx); p[2] = s;
     }
 }
-extern "C" __global__ void fe_amaxp2(const float* part, int nparts, unsigned* ids, float* probs) {
+extern "C" __global__ void fe_amaxp2(const float* part, int nparts, unsigned* ids, float* probs, int n_lo, int hi_base) {
     const float* p = part + (size_t)blockIdx.x * nparts * 3;
     float v = __int_as_float(0xff800000), s = 0.f;
     int idx = 0x7fffffff;
@@ -854,7 +854,11 @@ extern "C" __global__ void fe_amaxp2(const float* part, int nparts, unsigned* id
         if (ov > v || (ov == v && oi < idx)) idx = oi;
         v = M; s = ns;
     }
-    if (threadIdx.x == 0) { ids[blockIdx.x] = (unsigned)idx; probs[blockIdx.x] = 1.0f / s; }
+    // A pruned draft head holds rows [0, n_lo) and then [hi_base, ...): map back to token ids.
+    if (threadIdx.x == 0) {
+        ids[blockIdx.x] = (unsigned)(idx < n_lo ? idx : hi_base + (idx - n_lo));
+        probs[blockIdx.x] = 1.0f / s;
+    }
 }
 
 // Chain step setup: h ← the last cell's output residual, token ← its draft, ctl ← next position.
@@ -864,9 +868,96 @@ extern "C" __global__ void fe_mtp_next(const float* r, float* h, const unsigned*
     const float* src = r + (size_t)(n - 1) * MTP_HC * MTP_HID;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < MTP_HC * MTP_HID; i += gridDim.x * blockDim.x) h[i] = src[i];
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-        toks[0] = drafts[n - 1];
+        toks[0] = drafts[0];
         ctl[0] = ctl_prev[0] + n;
         ctl[1] = 1;
     }
+}
+
+// Split-K MTP attention: block (cell c, kv group g, chunk j of 128 positions) runs the 12 query
+// heads of group g over its chunk (4 warps × 32 positions; lane owns 8 dims), merges its warps,
+// and writes per head (m, l, acc[256]) to part[c][g][j][12][258]. Chunks past the cell's
+// position write l = 0.
+#define MTP_CHUNK 128
+extern "C" __global__ void __launch_bounds__(128) fe_mtp_attn_part(const float* q, const float* kc, const float* vc,
+                                                                   const unsigned* ctl, float* part, int nchunk) {
+    __shared__ float wm[4][12], wl[4][12];
+    __shared__ float wacc[4][256];
+    const int c = blockIdx.x, g = blockIdx.y, j = blockIdx.z;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int pos = (int)ctl[0] + c;
+    float* out = part + (((size_t)c * 2 + g) * nchunk + j) * 12 * 258;
+    const int lo = j * MTP_CHUNK;
+    if (lo > pos) {
+        if (threadIdx.x < 12) out[threadIdx.x * 258 + 1] = 0.f;
+        return;
+    }
+    float qv[12][8];
+    for (int h = 0; h < 12; h++)
+        for (int i = 0; i < 8; i++) qv[h][i] = q[((size_t)c * 24 + g * 12 + h) * 256 + lane * 8 + i] * 0.0625f;
+    float m[12], l[12], acc[12][8];
+    for (int h = 0; h < 12; h++) {
+        m[h] = __int_as_float(0xff800000);
+        l[h] = 0.f;
+        for (int i = 0; i < 8; i++) acc[h][i] = 0.f;
+    }
+    const int hi = min(pos + 1, lo + MTP_CHUNK);
+    for (int p = lo + warp; p < hi; p += 4) {
+        const float4* kr = (const float4*)(kc + ((size_t)p * 2 + g) * 256 + lane * 8);
+        const float4 k0 = kr[0], k1 = kr[1];
+        const float4* vr = (const float4*)(vc + ((size_t)p * 2 + g) * 256 + lane * 8);
+        const float4 v0 = vr[0], v1 = vr[1];
+        const float kv[8] = {k0.x, k0.y, k0.z, k0.w, k1.x, k1.y, k1.z, k1.w};
+        const float vv[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+        #pragma unroll
+        for (int h = 0; h < 12; h++) {
+            float sc = 0.f;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) sc = fmaf(qv[h][i], kv[i], sc);
+            for (int o = 16; o > 0; o >>= 1) sc += __shfl_xor_sync(0xffffffffu, sc, o);
+            const float mn = fmaxf(m[h], sc), corr = expf(m[h] - mn), pr = expf(sc - mn);
+            #pragma unroll
+            for (int i = 0; i < 8; i++) acc[h][i] = fmaf(pr, vv[i], acc[h][i] * corr);
+            l[h] = l[h] * corr + pr;
+            m[h] = mn;
+        }
+    }
+    for (int h = 0; h < 12; h++)
+        if (lane == 0) { wm[warp][h] = m[h]; wl[warp][h] = l[h]; }
+    #pragma unroll
+    for (int h = 0; h < 12; h++) {
+        __syncthreads();
+        for (int i = 0; i < 8; i++) wacc[warp][lane * 8 + i] = acc[h][i];
+        __syncthreads();
+        float M = __int_as_float(0xff800000);
+        for (int w = 0; w < 4; w++) if (wl[w][h] > 0.f) M = fmaxf(M, wm[w][h]);
+        float L = 0.f;
+        for (int w = 0; w < 4; w++) if (wl[w][h] > 0.f) L += wl[w][h] * expf(wm[w][h] - M);
+        for (int d = threadIdx.x; d < 256; d += 128) {
+            float o = 0.f;
+            for (int w = 0; w < 4; w++) if (wl[w][h] > 0.f) o += wacc[w][d] * expf(wm[w][h] - M);
+            out[h * 258 + 2 + d] = o;
+        }
+        if (threadIdx.x == 0) { out[h * 258] = M; out[h * 258 + 1] = L; }
+    }
+}
+
+// Merge the chunks of each (cell, head) and apply the sigmoid gate. Grid (C, 24), 256 threads.
+extern "C" __global__ void fe_mtp_attn_merge(const float* part, int nchunk, const float* proj, int stride, float* out) {
+    const int c = blockIdx.x, h = blockIdx.y, g = h / 12, hh = h % 12, d = threadIdx.x;
+    const float* pp = part + ((size_t)c * 2 + g) * nchunk * 12 * 258 + hh * 258;
+    float M = __int_as_float(0xff800000);
+    for (int j = 0; j < nchunk; j++) if (pp[(size_t)j * 12 * 258 + 1] > 0.f) M = fmaxf(M, pp[(size_t)j * 12 * 258]);
+    float L = 0.f, o = 0.f;
+    for (int j = 0; j < nchunk; j++) {
+        const float* q = pp + (size_t)j * 12 * 258;
+        if (q[1] > 0.f) {
+            const float f = expf(q[0] - M);
+            L += q[1] * f;
+            o += q[2 + d] * f;
+        }
+    }
+    const float gt = proj[(size_t)c * stride + h * 512 + 256 + d];
+    out[((size_t)c * 24 + h) * 256 + d] = (o / L) * (1.0f / (1.0f + expf(-gt)));
 }
 "#;

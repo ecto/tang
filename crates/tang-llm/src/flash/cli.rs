@@ -205,6 +205,8 @@ pub struct SpecStats {
     pub widths: Vec<usize>,
     /// MTP time per window (ms, summed).
     pub mtp_ms: f64,
+    pub commit_ms: f64,
+    pub mtp_gpu_ms: f64,
 }
 
 /// Decode `n` tokens after `ids` with verify windows and drafts from `kind` (`none`, `suffix`,
@@ -313,6 +315,8 @@ fn decode_spec(
         }
         sp.windows += 1;
         sp.mtp_ms += e.last_mtp_ms;
+        sp.commit_ms += e.last_commit_ms;
+        sp.mtp_gpu_ms += e.last_mtp_gpu_ms;
         sp.widths[drafts.len() + 1] += 1;
         sp.tokens += kept.len();
         stats.push(e.last);
@@ -328,7 +332,12 @@ fn decode_spec(
 }
 
 fn spec_report(sp: &SpecStats) -> String {
-    let mut s = format!("mtp {:.2} ms/window; ", sp.mtp_ms / sp.windows.max(1) as f64);
+    let mut s = format!(
+        "mtp {:.2} ms/window (waiting for the commit {:.2}, MTP graph on the GPU {:.2}); ",
+        sp.mtp_ms / sp.windows.max(1) as f64,
+        sp.commit_ms / sp.windows.max(1) as f64,
+        sp.mtp_gpu_ms / sp.windows.max(1) as f64
+    );
     s += &format!(
         "{} windows, {:.2} tokens/window; widths {:?}; accepted by draft position:",
         sp.windows,
@@ -372,11 +381,8 @@ pub fn generate(args: &[String]) -> Result<()> {
     let a = parse(args)?;
     let ids = prompt_ids(&a)?;
     let mut e = load(&a)?;
-    // Warm-up: capture every graph this mode uses (window sizes, commits) on a short run.
-    {
-        let warm = &ids[..ids.len().min(64)];
-        let _ = decode_spec(&mut e, warm, 40.min(a.n), a.chunk, &a.draft)?;
-    }
+    // Warm-up: capture every graph (window sizes, commits, MTP cell counts) before timing.
+    e.warm()?;
     let (out, stats, prefill_s, secs, sp) = decode_spec(&mut e, &ids, a.n, a.chunk, &a.draft)?;
     let vocab = e.vocab()?;
     println!("prompt: {} tokens, prefill {:.2} s ({:.0} tok/s)", ids.len(), prefill_s, ids.len() as f64 / prefill_s);
@@ -593,11 +599,8 @@ pub fn bench(args: &[String]) -> Result<()> {
         a.opts.max_ctx = (ids.len() + a.n + 8).next_multiple_of(1024);
     }
     let mut e = load(&a)?;
-    // Warm-up: capture every graph this mode uses (window sizes, commits) on a short run.
-    {
-        let warm = &ids[..ids.len().min(64)];
-        let _ = decode_spec(&mut e, warm, 40.min(a.n), a.chunk, &a.draft)?;
-    }
+    // Warm-up: capture every graph (window sizes, commits, MTP cell counts) before timing.
+    e.warm()?;
     let (out, stats, prefill_s, secs, sp) = decode_spec(&mut e, &ids, a.n, a.chunk, &a.draft)?;
     let timed = &stats[..];
     let m = mean(timed);
