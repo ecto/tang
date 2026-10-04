@@ -1272,6 +1272,31 @@ pub trait ComputeDevice: Send {
         *out = self.upload_f32(&y);
     }
 
+    /// [`native_linear_into`](Self::native_linear_into) into a slice of a wider output: row `o`
+    /// of column `t` goes to `out[off + t · ostride + o]` (a segment of a stacked projection);
+    /// the rest of `out` is untouched.
+    #[allow(clippy::too_many_arguments)]
+    fn native_linear_out_into(
+        &self,
+        ty: crate::flash_native::NatType,
+        xq: &Self::Buffer,
+        w: &Self::Buffer,
+        out: &mut Self::Buffer,
+        off: usize,
+        ostride: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        let mut y = self.alloc_f32(m * n);
+        self.native_linear_into(ty, xq, w, &mut y, m, k, n);
+        let (y, mut o) = (self.download(&y), self.download(out));
+        for t in 0..m {
+            o[off + t * ostride..off + t * ostride + n].copy_from_slice(&y[t * n..(t + 1) * n]);
+        }
+        *out = self.upload_f32(&o);
+    }
+
     /// Hyper-connection read for a window of `t` tokens: `r` is `[t][HC][HIDDEN]`; writes
     /// `x [t][HIDDEN]`, `xq` (when given) the same as int8 activations
     /// (`QAct { m: t, k: HIDDEN }`), and, when `w.inject` is set, `inj [t][HC]`. A `pending`
