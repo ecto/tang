@@ -1230,23 +1230,29 @@ __device__ __forceinline__ void moe_gu_item(const unsigned int* __restrict__ XQ,
     const unsigned int kb = HIDDEN / 4;
     const unsigned char* blob = plan_blob(PLAN, g);
     unsigned int e0 = PLAN[PLAN_GS + g], ne = PLAN[PLAN_GS + g + 1] - e0;
-    unsigned int tok[NE];
-    #pragma unroll
-    for (int e = 0; e < NE; e++) tok[e] = e < ne ? PLAN[PLAN_ET + e0 + e] : 0;
-    float a0[NE], a1[NE];
-    tile_dot<HIDDEN / 128, NE>(blob + GU_CODES + (u64)tile * (HIDDEN / 128) * 512,
-                               blob + GU_SCALES + (u64)tile * (HIDDEN / 128) * 64, XQ, kb, T, tok, ne, lane, a0, a1);
+    // Entries in passes of EC (the tile is re-read per pass, from L2): the chains of at most EC
+    // entries are live, so a wide instantiation costs what a T=4 one does on narrow groups.
+    constexpr int EC = NE > 4 ? 4 : NE;
     __syncthreads();
-    #pragma unroll
-    for (int e = 0; e < NE; e++) {
-        if (e < ne) {
-            // Lane 4s holds gu rows s (a0) and s + 8 (a1): gate (s even) or up (s odd) of h
-            // rows 8·tile + s / 2 and 8·tile + 4 + s / 2.
-            float u0 = __shfl_down_sync(0xffffffffu, a0[e], 4);
-            float u1 = __shfl_down_sync(0xffffffffu, a1[e], 4);
-            if ((lane & 7) == 0) {
-                hs[e][8 * warp + (lane >> 3)] = psilu(a0[e]) * u0;
-                hs[e][8 * warp + 4 + (lane >> 3)] = psilu(a1[e]) * u1;
+    for (unsigned int p0 = 0; p0 < ne; p0 += EC) {
+        unsigned int np = min(ne - p0, (unsigned int)EC);
+        unsigned int tok[EC];
+        #pragma unroll
+        for (int e = 0; e < EC; e++) tok[e] = e < np ? PLAN[PLAN_ET + e0 + p0 + e] : 0;
+        float a0[EC], a1[EC];
+        tile_dot<HIDDEN / 128, EC>(blob + GU_CODES + (u64)tile * (HIDDEN / 128) * 512,
+                                   blob + GU_SCALES + (u64)tile * (HIDDEN / 128) * 64, XQ, kb, T, tok, np, lane, a0, a1);
+        #pragma unroll
+        for (int e = 0; e < EC; e++) {
+            if (e < np) {
+                // Lane 4s holds gu rows s (a0) and s + 8 (a1): gate (s even) or up (s odd) of h
+                // rows 8·tile + s / 2 and 8·tile + 4 + s / 2.
+                float u0 = __shfl_down_sync(0xffffffffu, a0[e], 4);
+                float u1 = __shfl_down_sync(0xffffffffu, a1[e], 4);
+                if ((lane & 7) == 0) {
+                    hs[p0 + e][8 * warp + (lane >> 3)] = psilu(a0[e]) * u0;
+                    hs[p0 + e][8 * warp + 4 + (lane >> 3)] = psilu(a1[e]) * u1;
+                }
             }
         }
     }

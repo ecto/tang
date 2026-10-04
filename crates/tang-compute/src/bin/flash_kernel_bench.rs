@@ -994,8 +994,11 @@ fn moe(g: &CudaComputeDevice) {
             );
             plans.push(plan);
         }
-        let mut xq = g.alloc_f32(QAct { m: t, k: HIDDEN }.words());
-        g.quantize_act_into(&g.upload_f32(&rng.vec(t * HIDDEN, 1.0)), &mut xq, t, HIDDEN);
+        // FKB_MOE_W=8: launch at window width 8 on t tokens' plans (a graph captured wider
+        // than the window, as the engine's).
+        let tw: usize = std::env::var("FKB_MOE_W").ok().and_then(|v| v.parse().ok()).unwrap_or(t).max(t);
+        let mut xq = g.alloc_f32(QAct { m: tw, k: HIDDEN }.words());
+        g.quantize_act_into(&g.upload_f32(&rng.vec(tw * HIDDEN, 1.0)), &mut xq, tw, HIDDEN);
         let (mut sc, mut parts) = (
             g.alloc_f32(MoePlan::scratch_words()),
             g.alloc_f32(MoePlan::PARTS_ROWS * HIDDEN),
@@ -1003,7 +1006,7 @@ fn moe(g: &CudaComputeDevice) {
         let graph = g.capture(&mut || {
             for p in &plans {
                 // SAFETY: plans hold live pool addresses.
-                unsafe { g.moe_grouped_into(&xq, p, &mut sc, &mut parts, t) };
+                unsafe { g.moe_grouped_into(&xq, p, &mut sc, &mut parts, tw) };
             }
         });
         graph.launch().unwrap();
