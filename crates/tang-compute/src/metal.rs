@@ -702,8 +702,13 @@ const SMALL_GEMM_GROUPS: usize = 160;
 /// Threadgroups `flash_multi` aims for (keys are split until there are about this many).
 const MULTI_ATTN_GROUPS: usize = 256;
 
-fn multi_attn(q_len: usize, n_heads: usize, n_kv: usize, d: usize) -> bool {
-    q_len >= 1 && q_len <= MULTI_ATTN_ROWS && d % 4 == 0 && d <= 256 && n_heads % n_kv == 0
+fn multi_attn(k: &MetalBuffer, q_len: usize, n_heads: usize, n_kv: usize, d: usize) -> bool {
+    q_len >= 1
+        && q_len <= MULTI_ATTN_ROWS
+        && d % 4 == 0
+        && d <= 256
+        && n_heads % n_kv == 0
+        && (k.kind != Kind::Bf16 || d % 8 == 0)
 }
 
 impl ComputeDevice for MetalDevice {
@@ -1259,7 +1264,7 @@ kernel void embedding(
         n_kv_heads: usize,
         head_dim: usize,
     ) -> MetalBuffer {
-        if multi_attn(q_len, n_heads, n_kv_heads, head_dim) {
+        if multi_attn(k_cache, q_len, n_heads, n_kv_heads, head_dim) {
             return self.flash_multi(
                 q,
                 k_cache,
@@ -1736,7 +1741,10 @@ kernel void embedding(
         let (k, v) = (k_pool, v_pool);
         let plain = causal && (window == 0 || cache_start + q_len <= window);
         let window = if plain { 0 } else { window };
-        if hd > 256 || nh % nkv != 0 || (plain && hd % 32 != 0 && !multi_attn(q_len, nh, nkv, hd)) {
+        if hd > 256
+            || nh % nkv != 0
+            || (plain && hd % 32 != 0 && !multi_attn(k, q_len, nh, nkv, hd))
+        {
             return crate::device::kv_attention_paged_default(
                 self,
                 q,
@@ -1750,7 +1758,7 @@ kernel void embedding(
                 causal,
             );
         }
-        if multi_attn(q_len, nh, nkv, hd) {
+        if multi_attn(k, q_len, nh, nkv, hd) {
             return self.flash_multi(
                 q,
                 k,
@@ -1810,7 +1818,7 @@ kernel void embedding(
             head_dim <= 256 && n_heads % n_kv_heads == 0,
             "windowed or bidirectional attention needs head_dim at most 256"
         );
-        if multi_attn(q_len, n_heads, n_kv_heads, head_dim) {
+        if multi_attn(k_cache, q_len, n_heads, n_kv_heads, head_dim) {
             return self.flash_multi(
                 q,
                 k_cache,

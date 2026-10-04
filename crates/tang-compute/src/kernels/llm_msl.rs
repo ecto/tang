@@ -491,7 +491,8 @@ kernel void attn_combine(
 /// row-major in threadgroup memory (stride D + 4), with the next tile's K and V prefetched into
 /// registers: scores with one key per lane, an online softmax per row in registers
 /// (simdgroup w owns rows w*RW ..), then P·V with lanes over head dims. Writes unnormalized
-/// partials for `FLASH_DECODE_MSL`'s `attn_combine` (same params). D % 4 == 0, D <= 256.
+/// partials for `FLASH_DECODE_MSL`'s `attn_combine` (same params). D % 4 == 0 (% 8 for bf16
+/// caches), D <= 256.
 pub const FLASH_MULTI_MSL: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -508,14 +509,14 @@ inline void attn_multi_body(
     constexpr int NV = DMAX / 32;          // head dims per lane in the PV phase
     constexpr int PS = R + 4;              // Ps row stride
     constexpr int NT = 32 * NW;            // threads
-    constexpr int NL = BK * DMAX / 4 / NT; // float4 loads per thread per tile
+    constexpr int NL = BK * DMAX / KV_VW / NT; // wide loads per thread per tile
 
     uint cache_start = params[0], q_len = params[1], nh = params[2], nkv = params[3];
     uint D = params[4], n_splits = params[5], split_len = params[6];
     uint window = params[7], base = params[8], bidir = params[9], sh = params[10];
     uint kvh = tg.x, split = tg.y, f0 = tg.z * R;
     uint gqa = nh / nkv, rows = q_len * gqa;
-    uint LD = D + 4, D4 = D / 4;
+    uint LD = D + 4, D4 = D / 4, DV = D / KV_VW;
     ulong kvd = (ulong)nkv * D;
     uint total = cache_start + q_len;
     float scale = rsqrt(float(D));
@@ -555,14 +556,14 @@ inline void attn_multi_body(
     for (int i = 0; i < RW; i++)
         for (int v = 0; v < NV; v++) acc[i][v] = 0.0f;
 
-    float4 kreg[NL], vreg[NL];
+    kvv kreg[NL], vreg[NL];
     if (jb < je) {
         for (int t = 0; t < NL; t++) {
-            uint i = tid + NT * t, cc = i / D4, d = (i % D4) * 4, j = jb + cc;
+            uint i = tid + NT * t, cc = i / DV, d = (i % DV) * KV_VW, j = jb + cc;
             bool ok = cc < (uint)BK && j < je;
             ulong o = kv_row(T, sh, j) * kvd + (ulong)kvh * D + d;
-            kreg[t] = ok ? kv4(K + o) : float4(0.0f);
-            vreg[t] = ok ? kv4(V + o) : float4(0.0f);
+            kreg[t] = ok ? kv_ldv(K + o) : kv_zero();
+            vreg[t] = ok ? kv_ldv(V + o) : kv_zero();
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -570,15 +571,15 @@ inline void attn_multi_body(
     for (uint j0 = jb; j0 < je; j0 += BK) {
         bool more = j0 + BK < je;
         for (int t = 0; t < NL; t++) {
-            uint i = tid + NT * t, cc = i / D4, d = (i % D4) * 4;
-            if (cc < (uint)BK) *(threadgroup float4*)(KVs + cc * LD + d) = kreg[t];
+            uint i = tid + NT * t, cc = i / DV, d = (i % DV) * KV_VW;
+            if (cc < (uint)BK) kv_stv(KVs + cc * LD + d, kreg[t]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (more) {
             for (int t = 0; t < NL; t++) {
-                uint i = tid + NT * t, cc = i / D4, d = (i % D4) * 4, j = j0 + BK + cc;
+                uint i = tid + NT * t, cc = i / DV, d = (i % DV) * KV_VW, j = j0 + BK + cc;
                 kreg[t] = (cc < (uint)BK && j < je)
-                    ? kv4(K + kv_row(T, sh, j) * kvd + (ulong)kvh * D + d) : float4(0.0f);
+                    ? kv_ldv(K + kv_row(T, sh, j) * kvd + (ulong)kvh * D + d) : kv_zero();
             }
         }
 
@@ -606,15 +607,15 @@ inline void attn_multi_body(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int t = 0; t < NL; t++) {
-            uint i = tid + NT * t, cc = i / D4, d = (i % D4) * 4;
-            if (cc < (uint)BK) *(threadgroup float4*)(KVs + cc * LD + d) = vreg[t];
+            uint i = tid + NT * t, cc = i / DV, d = (i % DV) * KV_VW;
+            if (cc < (uint)BK) kv_stv(KVs + cc * LD + d, vreg[t]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (more) {
             for (int t = 0; t < NL; t++) {
-                uint i = tid + NT * t, cc = i / D4, d = (i % D4) * 4, j = j0 + BK + cc;
+                uint i = tid + NT * t, cc = i / DV, d = (i % DV) * KV_VW, j = j0 + BK + cc;
                 vreg[t] = (cc < (uint)BK && j < je)
-                    ? kv4(V + kv_row(T, sh, j) * kvd + (ulong)kvh * D + d) : float4(0.0f);
+                    ? kv_ldv(V + kv_row(T, sh, j) * kvd + (ulong)kvh * D + d) : kv_zero();
             }
         }
 
@@ -1028,6 +1029,12 @@ typedef float kv_t;
 inline float kv1(device const float* p) { return *p; }
 inline float4 kv4(device const float* p) { return *(device const float4*)p; }
 inline void kv_st(device float* p, float x) { *p = x; }
+// Wide loads for staging tiles: KV_VW elements at a time.
+#define KV_VW 4
+typedef float4 kvv;
+inline kvv kv_ldv(device const float* p) { return *(device const float4*)p; }
+inline kvv kv_zero() { return float4(0.0f); }
+inline void kv_stv(threadgroup float* p, kvv x) { *(threadgroup float4*)p = x; }
 "#;
 
 /// [`KV_F32_MSL`] for bfloat16 caches (raw bits in `ushort`).
@@ -1045,6 +1052,25 @@ inline float4 kv4(device const ushort* p) {
 inline void kv_st(device ushort* p, float x) {
     uint b = as_type<uint>(x);
     *p = ushort((b + 0x7fffu + ((b >> 16) & 1u)) >> 16);
+}
+// Wide loads for staging tiles: 8 elements (16 bytes) at a time, as many bytes per load as f32.
+#define KV_VW 8
+struct kvv { float4 a; float4 b; };
+inline float4 kv_pair2(uint2 u) {
+    return float4(as_type<float>(u.x << 16), as_type<float>(u.x & 0xffff0000u),
+                  as_type<float>(u.y << 16), as_type<float>(u.y & 0xffff0000u));
+}
+inline kvv kv_ldv(device const ushort* p) {
+    uint4 u = *(device const uint4*)p;
+    kvv r;
+    r.a = kv_pair2(u.xy);
+    r.b = kv_pair2(u.zw);
+    return r;
+}
+inline kvv kv_zero() { kvv r; r.a = float4(0.0f); r.b = float4(0.0f); return r; }
+inline void kv_stv(threadgroup float* p, kvv x) {
+    *(threadgroup float4*)p = x.a;
+    *(threadgroup float4*)(p + 4) = x.b;
 }
 "#;
 
@@ -1291,8 +1317,7 @@ kernel void attn_prefill(
             simdgroup_load(a, qp + d, qs);
 #if KV_BF16
             device const kv_t* kr = K + (r0k + lane) * ks + kvh * D + d;
-            *(threadgroup float4*)(St + lane * 8) = kv4(kr);
-            *(threadgroup float4*)(St + lane * 8 + 4) = kv4(kr + 4);
+            kv_stv(St + lane * 8, kv_ldv(kr));
             simdgroup_barrier(mem_flags::mem_threadgroup);
 #endif
             for (uint c = 0; c < 4; c++) {
@@ -1348,8 +1373,7 @@ kernel void attn_prefill(
             simdgroup_multiply(acc, da, o[t]);
 #if KV_BF16
             device const kv_t* vr = V + (r0k + lane) * ks + kvh * D + t * 8;
-            *(threadgroup float4*)(St + lane * 8) = kv4(vr);
-            *(threadgroup float4*)(St + lane * 8 + 4) = kv4(vr + 4);
+            kv_stv(St + lane * 8, kv_ldv(vr));
             simdgroup_barrier(mem_flags::mem_threadgroup);
 #endif
             for (uint c = 0; c < 4; c++) {
