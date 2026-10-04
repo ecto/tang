@@ -502,6 +502,16 @@ impl ResidentCache {
         }
     }
 
+    /// The device-mapped address of a host-resident key's blob (the arena is registered
+    /// `DEVICEMAP`), for letting a kernel stream it over PCIe instead of the CPU computing it.
+    pub fn host_device_addr(&self, key: u32) -> Option<u64> {
+        use crate::resident::Loc;
+        match self.policy.loc(key) {
+            Loc::Host(h) => self.host.device_ptr(h as usize * self.blob),
+            _ => None,
+        }
+    }
+
     pub fn record(&mut self, keys: &[u32]) {
         self.policy.record(keys);
     }

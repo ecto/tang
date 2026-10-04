@@ -373,6 +373,7 @@ fn mean(stats: &[WinStats]) -> WinStats {
         m.routed += s.routed;
         m.distinct += s.distinct;
         m.missed += s.missed;
+        m.pcie += s.pcie;
         m.swaps += s.swaps;
     }
     m
@@ -628,10 +629,11 @@ pub fn bench(args: &[String]) -> Result<()> {
     println!("  host plan          {:8.3} ms", m.plan_ms);
     println!("  host CPU experts   {:8.3} ms", m.cpu_ms);
     println!(
-        "  experts            {:.1} distinct/window, {:.2} missed/window, hit rate {:.3}, swaps {}",
+        "  experts            {:.1} distinct/window, {:.2} on the CPU/window, {:.2} over PCIe/window, VRAM hit rate {:.3}, swaps {}",
         m.distinct as f64 / timed.len() as f64,
         m.missed as f64 / timed.len() as f64,
-        1.0 - m.missed as f64 / m.distinct.max(1) as f64,
+        m.pcie as f64 / timed.len() as f64,
+        1.0 - (m.missed + m.pcie) as f64 / m.distinct.max(1) as f64,
         m.swaps
     );
     let (h, r) = e.ngram_stats();

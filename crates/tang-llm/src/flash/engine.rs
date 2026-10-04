@@ -389,6 +389,8 @@ pub struct WinStats {
     pub post_ms: f64,
     pub routed: usize,
     pub distinct: usize,
+    /// Distinct experts the GPU streamed from mapped host memory (PCIe share).
+    pub pcie: usize,
     pub missed: usize,
     pub swaps: usize,
 }
@@ -458,6 +460,8 @@ pub struct Engine {
     pub last_mtp_gpu_ms: f64,
     defer_boundary: bool,
     pending_boundary: bool,
+    /// Fraction of host-resident experts the GPU streams over PCIe (`TANG_FLASH_PCIE`).
+    pub pcie_frac: f32,
     /// A second stream: the MTP draft overlaps the commit.
     side: Stream,
     /// Run the MTP after every window (keeps its K/V cache complete) and keep its drafts.
@@ -932,6 +936,7 @@ impl Engine {
             last_mtp_gpu_ms: 0.0,
             defer_boundary: false,
             pending_boundary: false,
+            pcie_frac: std::env::var("TANG_FLASH_PCIE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.25),
             side: Stream::new().map_err(|e| anyhow!("{e}"))?,
             use_mtp: false,
             mtp_last: Vec::new(),
@@ -1543,9 +1548,10 @@ impl Engine {
         let ids: Vec<u32> = ids.to_vec();
         let base = (l * EXPERTS) as u32;
         let experts = &self.experts;
+        let tab = &self.table_addrs;
         let addr = |e: u32| -> u64 {
             match experts {
-                Experts::Resident(rc) => rc.addr(base + e),
+                Experts::Resident(_) => tab[(base + e) as usize],
                 Experts::Cpu(_) => 0,
             }
         };
@@ -1581,6 +1587,12 @@ impl Engine {
         st.routed += t * TOPK;
         st.distinct += distinct.len();
         st.missed += missed.len();
+        if let Experts::Resident(rc) = &self.experts {
+            st.pcie += distinct
+                .iter()
+                .filter(|&&e| self.table_addrs[(base + e) as usize] != 0 && rc.addr(base + e) == 0)
+                .count();
+        }
         for &e in &distinct {
             self.routing[(base + e) as usize] += 1;
             self.keys.push(base + e);
@@ -1724,7 +1736,16 @@ impl Engine {
             let base = l * EXPERTS;
             let mut dirty = false;
             for e in 0..EXPERTS {
-                let a = rc.addr((base + e) as u32);
+                let key = (base + e) as u32;
+                let mut a = rc.addr(key);
+                // PCIe share: a fixed fraction of the host-resident keys is streamed by the
+                // expert kernel from the mapped arena instead of computed on the CPU.
+                if a == 0 && self.pcie_frac > 0.0 {
+                    let h = (key.wrapping_mul(2_654_435_761) >> 8) as f32 / (1u32 << 24) as f32;
+                    if h < self.pcie_frac {
+                        a = rc.host_device_addr(key).unwrap_or(0);
+                    }
+                }
                 if self.table_addrs[base + e] != a {
                     self.table_addrs[base + e] = a;
                     dirty = true;
@@ -1733,9 +1754,9 @@ impl Engine {
             if dirty {
                 unsafe {
                     gpu::check(
-                        cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                        cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
                             self.dev.buffer_addr(&self.tables[l]),
-                            rc.device_addrs() + (base * 8) as u64,
+                            self.table_addrs[base..].as_ptr() as *const std::ffi::c_void,
                             EXPERTS * 8,
                             self.stream.0,
                         ),
