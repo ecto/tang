@@ -1161,6 +1161,29 @@ pub trait ComputeDevice: Send {
         *out = self.linear(x, w, m, k, n);
     }
 
+    /// `out[off + t · ostride + o] = W[o] · x[t]` for a bf16 weight `[n, k]` and f32 activations
+    /// (`m <= 8` rows), the rest of `out` untouched: one pinned fma chain per 8 weights, the K
+    /// split chosen from (n, k) only, so a token's result doesn't depend on `m`.
+    #[allow(clippy::too_many_arguments)]
+    fn bf16_linear_out_into(
+        &self,
+        x: &Self::Buffer,
+        w: &Self::Buffer,
+        out: &mut Self::Buffer,
+        off: usize,
+        ostride: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        let y = self.download(&self.linear(x, w, m, k, n));
+        let mut o = self.download(out);
+        for t in 0..m {
+            o[off + t * ostride..off + t * ostride + n].copy_from_slice(&y[t * n..(t + 1) * n]);
+        }
+        *out = self.upload_f32(&o);
+    }
+
     /// Quantize `m` rows of `k` f32 activations to int8 ([`crate::flash::QAct`]).
     fn quantize_act_into(&self, x: &Self::Buffer, xq: &mut Self::Buffer, m: usize, k: usize) {
         let w = crate::cpu::flash::quantize_act(&self.download(x)[..m * k], m, k);
@@ -1338,13 +1361,23 @@ pub trait ComputeDevice: Send {
                 (y, self.download(inj))
             }
         });
+        use crate::flash::shape::{HC, HC_LR, HIDDEN};
+        // q8 buffers are bytes in f32 words: back to the f32 weights the reference reads.
+        let mat = |b: &Self::Buffer, n: usize, k: usize, up: bool| -> Vec<f32> {
+            let v = self.download(b);
+            if !w.q8 {
+                return v;
+            }
+            let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_bits().to_le_bytes()).collect();
+            crate::flash::hc_q8_dequant(&bytes, n, k, up)
+        };
         let (xv, iv) = crate::cpu::flash::hc_read(
             &mut rv,
             pend.as_ref().map(|(y, i)| (&y[..], &i[..])),
             &self.download(w.norm),
-            &self.download(w.down),
-            &self.download(w.up),
-            w.inject.map(|b| self.download(b)).as_deref(),
+            &mat(w.down, HC_LR, HC * HIDDEN, false),
+            &mat(w.up, HC * HIDDEN, HC_LR, true),
+            w.inject.map(|b| mat(b, HC, HC * HIDDEN, false)).as_deref(),
             t,
             eps,
         );

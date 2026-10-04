@@ -145,7 +145,7 @@ __device__ __forceinline__ float dot8_rn(uint4 p, float4 a, float4 b, float acc)
 template <int FMT, int T, int GR>
 __device__ __forceinline__ void gemv_body(const float* __restrict__ X, const unsigned int* __restrict__ XQ,
                                           const unsigned char* __restrict__ W, float* __restrict__ Y,
-                                          unsigned int K, unsigned int N, unsigned int KS) {
+                                          unsigned int K, unsigned int N, unsigned int KS, unsigned int OS) {
     __shared__ float red[8][GR * T];
     const unsigned int EPV = FMT == 0 ? 8 : (FMT == 1 ? 64 : (FMT == 2 ? 32 : 16));
     unsigned int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -248,7 +248,7 @@ __device__ __forceinline__ void gemv_body(const float* __restrict__ X, const uns
         for (int t = 0; t < T; t++) {
             float v = warp_sum(acc[r][t]);
             if (KS == 1) {
-                if (lane == 0 && row0 + r < N) Y[(u64)t * N + row0 + r] = v;
+                if (lane == 0 && row0 + r < N) Y[(u64)t * OS + row0 + r] = v;
             } else if (lane == 0) {
                 red[warp][r * T + t] = v;
             }
@@ -261,7 +261,7 @@ __device__ __forceinline__ void gemv_body(const float* __restrict__ X, const uns
         unsigned int o = (blockIdx.x * groups + g) * GR + r;
         float v = 0.0f;
         for (unsigned int k = 0; k < KS; k++) v += red[g * KS + k][rt];
-        if (o < N) Y[(u64)t * N + o] = v;
+        if (o < N) Y[(u64)t * OS + o] = v;
     }
 }
 
@@ -269,8 +269,8 @@ __device__ __forceinline__ void gemv_body(const float* __restrict__ X, const uns
 extern "C" __global__ void __launch_bounds__(256) fl_##NAME##_t##T( \
     const float* __restrict__ X, const unsigned int* __restrict__ XQ, \
     const unsigned char* __restrict__ W, float* __restrict__ Y, unsigned int K, unsigned int N, \
-    unsigned int KS) { \
-    gemv_body<FMT, T, (T == 1 ? 2 : 4)>(X, XQ, W, Y, K, N, KS); \
+    unsigned int KS, unsigned int OS) { \
+    gemv_body<FMT, T, (T == 1 ? 2 : 4)>(X, XQ, W, Y, K, N, KS, OS); \
 }
 #define GEMV_ALL(FMT, NAME) GEMV(FMT, NAME, 1) GEMV(FMT, NAME, 2) GEMV(FMT, NAME, 3) GEMV(FMT, NAME, 4) \
     GEMV(FMT, NAME, 5) GEMV(FMT, NAME, 6) GEMV(FMT, NAME, 7) GEMV(FMT, NAME, 8)
@@ -511,7 +511,30 @@ __device__ bool last_block(unsigned int* cnt, unsigned int nb) {
 // quantization chunk). XN and LO are the hc scratch.
 // acc + (w · (a, b)) for 8 bf16 weights in p, as one pinned fma chain.
 
-template <int T>
+// Eight int8 codes (one uint2) to floats: the byte goes into the low byte of 2^23 (biased by
+// 128), so q = bits − (2^23 + 128), exact; full-rate ops only (prmt, fadd).
+__device__ __forceinline__ void q8x8(uint2 w, float q[8]) {
+    unsigned int lo = w.x ^ 0x80808080u, hi = w.y ^ 0x80808080u;
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        q[j] = __fsub_rn(__int_as_float(__byte_perm(lo, 0x4B000000u, 0x7540u | j)), 8388736.0f);
+        q[4 + j] = __fsub_rn(__int_as_float(__byte_perm(hi, 0x4B000000u, 0x7540u | j)), 8388736.0f);
+    }
+}
+// acc + d · (q · (a, b)) for eight int8 codes, as one pinned chain.
+__device__ __forceinline__ float dot8q_rn(uint2 w, float d, float4 a, float4 b, float acc) {
+    float q[8];
+    q8x8(w, q);
+    float s = __fmul_rn(q[0], a.x);
+    s = __fmaf_rn(q[1], a.y, s); s = __fmaf_rn(q[2], a.z, s); s = __fmaf_rn(q[3], a.w, s);
+    s = __fmaf_rn(q[4], b.x, s); s = __fmaf_rn(q[5], b.y, s); s = __fmaf_rn(q[6], b.z, s);
+    s = __fmaf_rn(q[7], b.w, s);
+    return __fmaf_rn(d, s, acc);
+}
+
+// Q8: the matrices are flash::hc_q8 buffers (codes, then f16 scales per 32 at the next 16-byte
+// boundary, by GGUF row); dot products take dot8q_rn instead of dot8_rn.
+template <int T, bool Q8>
 __device__ __forceinline__ void hc_fused_body(
     float* __restrict__ R, const float* __restrict__ Yp, const float* __restrict__ Ip, unsigned int mode,
     const float* __restrict__ Wn, float eps, const float* __restrict__ PARTS, const float* __restrict__ Wr,
@@ -519,9 +542,10 @@ __device__ __forceinline__ void hc_fused_body(
     const unsigned short* __restrict__ Wi, unsigned int rows, const unsigned short* __restrict__ Wu,
     float* __restrict__ X, unsigned int* __restrict__ XQ, unsigned int quant, float* __restrict__ INJ,
     float* __restrict__ XN, float* __restrict__ LO, unsigned int* __restrict__ bar) {
+    float* PART = LO;  // [4][rows][T] phase-1 partials (flash::hc_scratch_words)
     __shared__ float red[16][2 * T];
-    __shared__ __align__(16) float lo[T * HC_LR];
     __shared__ float xs[T][32];
+    __shared__ __align__(16) float lo[T * HC_LR];
     unsigned int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, nb = gridDim.x;
     // Phase 0: per (stream, token) row.
     for (unsigned int item = blockIdx.x; item < HC * T; item += nb) {
@@ -565,54 +589,112 @@ __device__ __forceinline__ void hc_fused_body(
         __syncthreads();
     }
     grid_bar(bar, nb);
-    // Phase 1: rows (r, r + 1) per step; warp w takes K slice [640 w, 640 w + 640).
-    for (unsigned int r0 = 2 * blockIdx.x; r0 < rows; r0 += 2 * nb) {
+#ifdef HC_STOP1
+    return;
+#endif
+    // Phase 1: items (8-row group rg, K quarter kq), 4 per group: warp w takes rows
+    // 8 rg + 2 (w % 4) + {0, 1} over K slice kq · 2560 + (w / 4) · 640, so a block reads a quarter
+    // of XN (four warps share each slice in L1) instead of all of it per row pair. Partial sums
+    // per (kq, row, t) go to PART; phase 2 adds the quarters in order.
+    const unsigned int KW = HC * HIDDEN;
+    const unsigned int ngroups = (rows + 7) / 8;
+    for (unsigned int item = blockIdx.x; item < 4 * ngroups; item += nb) {
+        const unsigned int rg = item / 4, kq = item % 4, rp = warp % 4, ks = warp / 4;
+        const unsigned int r0 = 8 * rg + 2 * rp, koff = kq * 2560 + ks * 640;
         const unsigned short* w[2];
+        const unsigned char* wq[2];
+        const unsigned short* ws[2];
         #pragma unroll
         for (int r = 0; r < 2; r++) {
             unsigned int row = min(r0 + r, rows - 1);
-            w[r] = (row < HC_LR ? Wd + (u64)row * HC * HIDDEN : Wi + (u64)(row - HC_LR) * HC * HIDDEN) + warp * 640;
+            w[r] = (row < HC_LR ? Wd + (u64)row * KW : Wi + (u64)(row - HC_LR) * KW) + koff;
+            if (Q8) {
+                const unsigned char* base = (const unsigned char*)(row < HC_LR ? Wd : Wi);
+                unsigned int rr = row < HC_LR ? row : row - HC_LR, nr = row < HC_LR ? HC_LR : HC;
+                wq[r] = base + (u64)rr * KW + koff;
+                ws[r] = (const unsigned short*)(base + (((u64)nr * KW + 15) & ~15ull)) + (u64)rr * (KW / 32) + koff / 32;
+            }
         }
         float acc[2][T];
         #pragma unroll
         for (int r = 0; r < 2; r++)
             #pragma unroll
             for (int t = 0; t < T; t++) acc[r][t] = 0.0f;
-        for (unsigned int i = lane; i < 80; i += 32) {
-            uint4 p0 = ((const uint4*)w[0])[i], p1 = ((const uint4*)w[1])[i];
+        if (r0 < rows) {
+            // All of the warp's weight loads (three steps) are issued before any math.
+            uint4 p0[3], p1[3];
+            uint2 c0[3], c1[3];
+            float d0[3], d1[3];
             #pragma unroll
-            for (int t = 0; t < T; t++) {
-                const float4* x4 = (const float4*)(XN + (u64)t * HC * HIDDEN + warp * 640 + i * 8);
-                float4 a = x4[0], b = x4[1];
-                // Explicit fma chains: contraction must not depend on T (the instantiation),
-                // or a token's output would depend on the window it is computed in.
-                acc[0][t] = dot8_rn(p0, a, b, acc[0][t]);
-                acc[1][t] = dot8_rn(p1, a, b, acc[1][t]);
+            for (int j = 0; j < 3; j++) {
+                unsigned int i = min(lane + 32 * j, 79u);
+                if (Q8) {
+                    c0[j] = __ldg((const uint2*)wq[0] + i); c1[j] = __ldg((const uint2*)wq[1] + i);
+                    d0[j] = h2f(__ldg(ws[0] + i / 4)); d1[j] = h2f(__ldg(ws[1] + i / 4));
+                } else {
+                    p0[j] = __ldg((const uint4*)w[0] + i); p1[j] = __ldg((const uint4*)w[1] + i);
+                }
+            }
+            #pragma unroll
+            for (int j = 0; j < 3; j++) {
+                unsigned int i = lane + 32 * j;
+                if (i >= 80) break;
+                #pragma unroll
+                for (int t = 0; t < T; t++) {
+                    const float4* x4 = (const float4*)(XN + (u64)t * HC * HIDDEN + koff + i * 8);
+                    float4 a = x4[0], b = x4[1];
+                    // Explicit fma chains: contraction must not depend on T (the instantiation),
+                    // or a token's output would depend on the window it is computed in.
+                    if (Q8) {
+                        acc[0][t] = dot8q_rn(c0[j], d0[j], a, b, acc[0][t]);
+                        acc[1][t] = dot8q_rn(c1[j], d1[j], a, b, acc[1][t]);
+                    } else {
+                        acc[0][t] = dot8_rn(p0[j], a, b, acc[0][t]);
+                        acc[1][t] = dot8_rn(p1[j], a, b, acc[1][t]);
+                    }
+                }
             }
         }
         #pragma unroll
         for (int r = 0; r < 2; r++)
             #pragma unroll
             for (int t = 0; t < T; t++) {
-                float s = warp_sum(acc[r][t]);
-                if (lane == 0) red[warp][r * T + t] = s;
+                float sm = warp_sum(acc[r][t]);
+                if (lane == 0) red[warp][r * T + t] = sm;
             }
         __syncthreads();
-        if (tid < 2 * T) {
-            unsigned int r = tid / T, t = tid % T, row = r0 + r;
+        if (tid < 8 * T) {
+            unsigned int rl = tid / T, t = tid % T, row = 8 * rg + rl;
             if (row < rows) {
-                float v = 0.0f;
-                for (int k = 0; k < 16; k++) v += red[k][r * T + t];
-                if (row < HC_LR) LO[t * HC_LR + row] = silu(v * 0.25f);
-                else INJ[t * HC + row - HC_LR] = v;
+                // Row rl is (rp = rl / 2, r = rl % 2): the four K slices are warps rp + 4 ks.
+                unsigned int rpp = rl / 2, r = rl % 2;
+                float v = red[rpp][r * T + t];
+                for (int k = 1; k < 4; k++) v += red[rpp + 4 * k][r * T + t];
+                PART[((u64)kq * rows + row) * T + t] = v;
             }
         }
         __syncthreads();
     }
     grid_bar(bar, nb);
+#ifdef HC_STOP2
+    return;
+#endif
+    // The bottleneck from the quarters (added in order), and the injection (block 0).
+    if (blockIdx.x == 0)
+        for (unsigned int i = tid; i < (rows - HC_LR) * T; i += 512) {
+            unsigned int row = HC_LR + i / T, t = i % T;
+            float v = PART[(u64)row * T + t];
+            for (int k = 1; k < 4; k++) v += PART[((u64)k * rows + row) * T + t];
+            INJ[t * HC + row - HC_LR] = v;
+        }
     // Phase 2: 32 outputs per block step, two per warp.
     if (blockIdx.x >= HIDDEN / 32) return;
-    for (unsigned int i = tid; i < T * HC_LR; i += 512) lo[i] = LO[i];
+    for (unsigned int i = tid; i < T * HC_LR; i += 512) {
+        unsigned int t = i / HC_LR, row = i % HC_LR;
+        float v = PART[(u64)row * T + t];
+        for (int k = 1; k < 4; k++) v += PART[((u64)k * rows + row) * T + t];
+        lo[i] = silu(v * 0.25f);
+    }
     __syncthreads();
     for (unsigned int q = blockIdx.x; q < HIDDEN / 32; q += nb) {
         #pragma unroll
@@ -620,14 +702,36 @@ __device__ __forceinline__ void hc_fused_body(
             unsigned int dl = warp + 16 * half, d = q * 32 + dl;
             const uint4* w = (const uint4*)(Wu + (u64)d * HC * HC_LR);
             uint4 qv[5];
-            #pragma unroll
-            for (int j = 0; j < 5; j++) qv[j] = w[lane + 32 * j];
+            uint2 cv[5];
+            float dv[5];
+            if (Q8) {
+                const unsigned char* base = (const unsigned char*)Wu;
+                const unsigned short* sc = (const unsigned short*)(base + (((u64)HC * HIDDEN * HC_LR + 15) & ~15ull));
+                // Vector v = lane + 32 j holds GGUF row (c = lane % 4) · HIDDEN + d, k 8p .. 8p + 8.
+                #pragma unroll
+                for (int j = 0; j < 5; j++) {
+                    unsigned int p = (lane >> 2) + 8 * j;
+                    cv[j] = __ldg((const uint2*)(base + (u64)d * HC * HC_LR) + lane + 32 * j);
+                    dv[j] = h2f(__ldg(sc + (u64)((lane & 3) * HIDDEN + d) * (HC_LR / 32) + p / 4));
+                }
+            } else {
+                #pragma unroll
+                for (int j = 0; j < 5; j++) qv[j] = w[lane + 32 * j];
+            }
             float acc[T];
             #pragma unroll
             for (int t = 0; t < T; t++) acc[t] = 0.0f;
             #pragma unroll
             for (int j = 0; j < 5; j++) {
                 unsigned int p = (lane >> 2) + 8 * j;
+                if (Q8) {
+                    #pragma unroll
+                    for (int t = 0; t < T; t++) {
+                        const float4* l4 = (const float4*)(lo + t * HC_LR + p * 8);
+                        acc[t] = dot8q_rn(cv[j], dv[j], l4[0], l4[1], acc[t]);
+                    }
+                    continue;
+                }
                 float wv[8] = {bf(qv[j].x & 0xffff), bf(qv[j].x >> 16), bf(qv[j].y & 0xffff), bf(qv[j].y >> 16),
                                bf(qv[j].z & 0xffff), bf(qv[j].z >> 16), bf(qv[j].w & 0xffff), bf(qv[j].w >> 16)};
                 #pragma unroll
@@ -672,8 +776,16 @@ extern "C" __global__ void __launch_bounds__(512, 2) fl_hc_fused_t##T( \
     const float* PARTS, const float* Wr, const float* L, unsigned int stride, int sg, \
     const unsigned short* Wd, const unsigned short* Wi, unsigned int rows, const unsigned short* Wu, \
     float* X, unsigned int* XQ, unsigned int quant, float* INJ, float* XN, float* LO, unsigned int* bar) { \
-    hc_fused_body<T>(R, Yp, Ip, mode, Wn, eps, PARTS, Wr, L, stride, sg, Wd, Wi, rows, Wu, X, XQ, quant, \
-                     INJ, XN, LO, bar); \
+    hc_fused_body<T, false>(R, Yp, Ip, mode, Wn, eps, PARTS, Wr, L, stride, sg, Wd, Wi, rows, Wu, X, XQ, quant, \
+                            INJ, XN, LO, bar); \
+} \
+extern "C" __global__ void __launch_bounds__(512, 2) fl_hc_fused_q8_t##T( \
+    float* R, const float* Yp, const float* Ip, unsigned int mode, const float* Wn, float eps, \
+    const float* PARTS, const float* Wr, const float* L, unsigned int stride, int sg, \
+    const unsigned short* Wd, const unsigned short* Wi, unsigned int rows, const unsigned short* Wu, \
+    float* X, unsigned int* XQ, unsigned int quant, float* INJ, float* XN, float* LO, unsigned int* bar) { \
+    hc_fused_body<T, true>(R, Yp, Ip, mode, Wn, eps, PARTS, Wr, L, stride, sg, Wd, Wi, rows, Wu, X, XQ, quant, \
+                           INJ, XN, LO, bar); \
 }
 HC_FUSED(1) HC_FUSED(2) HC_FUSED(3) HC_FUSED(4) HC_FUSED(5) HC_FUSED(6) HC_FUSED(7) HC_FUSED(8)
 

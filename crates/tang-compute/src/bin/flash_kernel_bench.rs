@@ -196,15 +196,39 @@ struct Hc {
     down: B,
     up: B,
     inject: B,
+    q8: bool,
+}
+
+/// `FKB_HC_Q8=1`: hyper-connection weights at 8 bits (`flash::hc_q8`).
+fn hc_q8() -> bool {
+    std::env::var("FKB_HC_Q8").is_ok_and(|v| v == "1")
 }
 
 impl Hc {
     fn new(g: &CudaComputeDevice, src: &Src) -> Self {
+        let w = HC * HIDDEN;
+        if hc_q8() {
+            return Hc {
+                norm: g.upload_f32(&vec![1.0; w]),
+                down: g.upload_bytes(&flash::hc_q8(&src.bf[..HC_LR * w], HC_LR, w, false)),
+                up: g.upload_bytes(&flash::hc_q8(&src.bf[..w * HC_LR], w, HC_LR, true)),
+                inject: g.upload_bytes(&flash::hc_q8(&src.bf[..HC * w], HC, w, false)),
+                q8: true,
+            };
+        }
         Hc {
-            norm: g.upload_f32(&vec![1.0; HC * HIDDEN]),
-            down: src.bf16(g, HC_LR * HC * HIDDEN),
-            up: src.bf16(g, HC * HIDDEN * HC_LR),
-            inject: src.bf16(g, HC * HC * HIDDEN),
+            norm: g.upload_f32(&vec![1.0; w]),
+            down: src.bf16(g, HC_LR * w),
+            up: src.bf16(g, w * HC_LR),
+            inject: src.bf16(g, HC * w),
+            q8: false,
+        }
+    }
+    fn bytes(&self) -> usize {
+        if self.q8 {
+            Self::BYTES / 2 + Self::BYTES / 32
+        } else {
+            Self::BYTES
         }
     }
     fn w(&self, inject: bool) -> HcWeights<'_, B> {
@@ -213,6 +237,7 @@ impl Hc {
             down: &self.down,
             up: &self.up,
             inject: inject.then_some(&self.inject),
+            q8: self.q8,
         }
     }
     const BYTES: usize = 2 * (HC_LR * HC * HIDDEN * 2) + HC * HC * HIDDEN * 2;
@@ -945,7 +970,13 @@ fn moe(g: &CudaComputeDevice) {
         b.extend(src.q2_raw(HIDDEN, FF));
         b
     };
-    let pool: Vec<B> = (0..EXPERTS).map(|_| g.upload_bytes(&blob)).collect();
+    // FKB_MOE_POOL=n: n resident blobs (the engine's cache spans ~13k slots, 18 GB), each
+    // (layer, expert) on its own slot.
+    let npool: usize = std::env::var("FKB_MOE_POOL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(EXPERTS);
+    let pool: Vec<B> = (0..npool).map(|_| g.upload_bytes(&blob)).collect();
     let mut addrs: Vec<u64> = pool.iter().map(|b| g.buffer_addr(b)).collect();
     // FKB_HOST=n: the first n experts of the pool live in mapped pinned host memory (the
     // engine's miss path), read by the kernels straight over PCIe.
@@ -980,7 +1011,7 @@ fn moe(g: &CudaComputeDevice) {
             groups += u + 1;
             let table: Vec<u32> = (0..EXPERTS)
                 .flat_map(|e| {
-                    let p = addrs[(e + 37 * l) % EXPERTS];
+                    let p = addrs[(e * 48 + l) * 7919 % npool];
                     [p as u32, (p >> 32) as u32]
                 })
                 .collect();
@@ -996,9 +1027,18 @@ fn moe(g: &CudaComputeDevice) {
         }
         // FKB_MOE_W=8: launch at window width 8 on t tokens' plans (a graph captured wider
         // than the window, as the engine's).
-        let tw: usize = std::env::var("FKB_MOE_W").ok().and_then(|v| v.parse().ok()).unwrap_or(t).max(t);
+        let tw: usize = std::env::var("FKB_MOE_W")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(t)
+            .max(t);
         let mut xq = g.alloc_f32(QAct { m: tw, k: HIDDEN }.words());
-        g.quantize_act_into(&g.upload_f32(&rng.vec(tw * HIDDEN, 1.0)), &mut xq, tw, HIDDEN);
+        g.quantize_act_into(
+            &g.upload_f32(&rng.vec(tw * HIDDEN, 1.0)),
+            &mut xq,
+            tw,
+            HIDDEN,
+        );
         let (mut sc, mut parts) = (
             g.alloc_f32(MoePlan::scratch_words()),
             g.alloc_f32(MoePlan::PARTS_ROWS * HIDDEN),
@@ -1061,8 +1101,13 @@ fn hc(g: &CudaComputeDevice) {
             .fold(f32::INFINITY, f32::min);
         let us = ms as f64 * 1e3 / 96.0;
         println!(
-            "  T={t}: {us:6.1} us/read, {:4.0} GB/s",
-            Hc::BYTES as f64 / (us * 1e3)
+            "  T={t}: {us:6.1} us/read, {:4.0} GB/s{}",
+            hcs[0].bytes() as f64 / (us * 1e3),
+            if hcs[0].q8 {
+                " (q8: GB/s of int8 + scale bytes)"
+            } else {
+                ""
+            }
         );
     }
 }

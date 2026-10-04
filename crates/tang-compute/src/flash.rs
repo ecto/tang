@@ -494,6 +494,8 @@ pub struct HcWeights<'a, B> {
     pub up: &'a B,
     /// Injection rows.
     pub inject: Option<&'a B>,
+    /// The matrices are [`hc_q8`] buffers (int8, f16 scale per 32) instead of bf16.
+    pub q8: bool,
 }
 
 /// A write still owed to the residual, applied by `hc_read_into` before it reads (the fused
@@ -548,10 +550,59 @@ pub fn hc_up_index(row: usize, k: usize) -> usize {
     ((d * (HC_LR / 8) + k / 8) * HC + c) * 8 + k % 8
 }
 
+/// Hyper-connection weights at 8 bits (the truth track's measured alternative to bf16: within
+/// the int8 parity band, half the bytes): Q8_0-style blocks of 32 along each GGUF row,
+/// `d = amax / 127` stored f16, `q = round(w / d)` with `1 / d` as llama.cpp's
+/// `quantize_row_q8_0_ref` (so `flash-ref --hc-as q8_0` emulates it exactly). Buffer:
+/// int8 codes in the bf16 layout's element order (`up`: the [`hc_up_repack`] order), then at the
+/// next 16-byte boundary the scales `[row][k / 32]` f16 by GGUF row. `bf16`: the GGUF-order
+/// matrix `[n][k]` (`up`: `[HC · HIDDEN][HC_LR]`, before any repack).
+pub fn hc_q8(bf16: &[u16], n: usize, k: usize, up: bool) -> Vec<u8> {
+    assert!(bf16.len() == n * k && k.is_multiple_of(32));
+    let off = (n * k).next_multiple_of(16);
+    let mut out = vec![0u8; off + n * k / 32 * 2];
+    for row in 0..n {
+        for blk in 0..k / 32 {
+            let w: Vec<f32> = (0..32)
+                .map(|i| f32::from_bits((bf16[row * k + blk * 32 + i] as u32) << 16))
+                .collect();
+            let amax = w.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let d = amax / 127.0;
+            let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+            for (i, v) in w.iter().enumerate() {
+                let q = (v * id).round().clamp(-127.0, 127.0) as i8;
+                let e = blk * 32 + i;
+                let at = if up { hc_up_index(row, e) } else { row * k + e };
+                out[at] = q as u8;
+            }
+            let sc = f32_to_f16(d).to_le_bytes();
+            let at = off + (row * (k / 32) + blk) * 2;
+            out[at..at + 2].copy_from_slice(&sc);
+        }
+    }
+    out
+}
+
+/// A [`hc_q8`] buffer as f32 weights `d · q`, in the codes' order (what the bf16 path would
+/// read: GGUF order, or the repacked order for `up`).
+pub fn hc_q8_dequant(bytes: &[u8], n: usize, k: usize, up: bool) -> Vec<f32> {
+    let off = (n * k).next_multiple_of(16);
+    let mut w = vec![0f32; n * k];
+    for row in 0..n {
+        for e in 0..k {
+            let at = if up { hc_up_index(row, e) } else { row * k + e };
+            let s = off + (row * (k / 32) + e / 32) * 2;
+            let d = f16_to_f32(u16::from_le_bytes([bytes[s], bytes[s + 1]]));
+            w[at] = d * (bytes[at] as i8) as f32;
+        }
+    }
+    w
+}
+
 /// Words of `hc_read_into` scratch for a window of `t`: normalized streams `[t][HC·HIDDEN]`
-/// and the bottleneck `[t][HC_LR]`.
+/// and the bottleneck: `[t][HC_LR]` (separate kernels) or the fused read's K-quarter partials `[4][HC_LR + HC][t]`.
 pub fn hc_scratch_words(t: usize) -> usize {
-    t * (HC * HIDDEN + HC_LR)
+    t * (HC * HIDDEN + 4 * (HC_LR + HC))
 }
 
 // ---- QSA ----
