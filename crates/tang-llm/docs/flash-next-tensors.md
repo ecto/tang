@@ -308,7 +308,8 @@ Q8_0 MTP file with its own embedding and head (the main model's head gives the s
 | code continuation (128 greedy tokens after `sample.rs`) | 126 | 0.897 | 0.882 | 0.851 | 0.897 / 0.791 / 0.673 |
 | code, whole sequence (prompt + continuation) | 444 | 0.919 | 0.901 | 0.869 | 0.919 / 0.828 / 0.719 |
 | chat2 reasoning (320 greedy tokens, a `<think>` answer) | 318 | 0.761 | 0.671 | 0.662 | 0.761 / 0.511 / 0.338 |
-MTP_EXTRA
+| chat (94 tokens: one-word answer, 30 greedy tokens) | 28 | 0.857 | 0.913 | 0.900 | 0.857 / 0.783 / 0.704 |
+| long (`engine.rs` 2300 tokens, teacher-forced prompt) | 2298 | 0.828 | 0.831 | 0.868 | 0.828 / 0.688 / 0.597 |
 
 That's the published band for this family (≈ 0.9 / 0.72–0.78 / 0.48–0.62 cumulative) on code
 and below it on free-form reasoning text. With two drafts always proposed, chat2's numbers give
