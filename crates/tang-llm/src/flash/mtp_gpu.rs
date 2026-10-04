@@ -22,8 +22,13 @@ use tang_compute::{ComputeDevice, CudaComputeDevice};
 
 /// Rows of the MTP attention projection: `[q|gate × 24 | k 512 | v 512]`.
 pub const MTP_PROJ: usize = QSA_HEADS * 2 * QSA_D + 2 * QSA_KV * QSA_D;
-/// Draft steps per window (the teacher pass's last cell, then two chain cells).
-pub const STEPS: usize = 3;
+/// Most draft steps per window (the teacher pass's last cell, then chain cells).
+pub const MAX_STEPS: usize = 6;
+
+/// Draft steps per window: `TANG_FLASH_MTP_STEPS` (default 3).
+pub fn steps() -> usize {
+    std::env::var("TANG_FLASH_MTP_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(3).clamp(1, MAX_STEPS)
+}
 
 /// Raw GGUF bytes of a 2-D tensor, its ggml id and row bytes.
 pub struct Raw {

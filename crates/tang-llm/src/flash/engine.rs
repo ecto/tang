@@ -354,7 +354,7 @@ impl Io {
     const MTP_IN: usize = Self::STAMPS + 48 * 8 * 8 + 64;
     /// MTP outputs per step: drafts (8 u32), then at +32 probabilities (8 f32).
     const MTP_OUT: usize = Self::MTP_IN + 128;
-    const BYTES: usize = Self::MTP_OUT + 64 * 4;
+    const BYTES: usize = Self::MTP_OUT + 64 * 8;
 
     fn ptr(&self, off: usize) -> *mut u8 {
         unsafe { self.arena.as_ptr().add(off) }
@@ -2289,6 +2289,7 @@ struct Mtp {
     drafts: Vec<B>,
     probs: Vec<B>,
     graphs: Vec<Option<Graph>>,
+    steps: usize,
 }
 
 impl Mtp {
@@ -2416,7 +2417,8 @@ impl Mtp {
             nchunk: max_ctx.div_ceil(128),
             h: z(MAX_T * HC * HIDDEN),
             toks: z(MAX_T),
-            ctl: (0..super::mtp_gpu::STEPS).map(|_| z(4)).collect(),
+            ctl: (0..super::mtp_gpu::MAX_STEPS).map(|_| z(4)).collect(),
+            steps: super::mtp_gpu::steps(),
             e: z(MAX_T * HIDDEN),
             cat: z(MAX_T * HC * 2 * HIDDEN),
             r: z(MAX_T * HC * HIDDEN),
@@ -2428,8 +2430,8 @@ impl Mtp {
             hf: z(pairs * FF),
             logits: z(MAX_T * vocab),
             amax: z(MAX_T * 64 * 3),
-            drafts: (0..super::mtp_gpu::STEPS).map(|_| z(MAX_T)).collect(),
-            probs: (0..super::mtp_gpu::STEPS).map(|_| z(MAX_T)).collect(),
+            drafts: (0..super::mtp_gpu::MAX_STEPS).map(|_| z(MAX_T)).collect(),
+            probs: (0..super::mtp_gpu::MAX_STEPS).map(|_| z(MAX_T)).collect(),
             graphs: (0..=MAX_T).map(|_| None).collect(),
         })
     }
@@ -2571,7 +2573,8 @@ impl Engine {
             .expect("copy");
         }
         self.enqueue_mtp_cells(0, c);
-        for step in 1..super::mtp_gpu::STEPS {
+        let steps = self.mtp.as_ref().unwrap().steps;
+        for step in 1..steps {
             {
                 let mt = self.mtp.as_ref().unwrap();
                 let a = |b: &B| self.dev.buffer_addr(b);
@@ -2583,7 +2586,7 @@ impl Engine {
             self.enqueue_mtp_cells(step, 1);
         }
         let mt = self.mtp.as_ref().unwrap();
-        for step in 0..super::mtp_gpu::STEPS {
+        for step in 0..steps {
             unsafe {
                 gpu::check(
                     cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
@@ -2643,7 +2646,7 @@ impl Engine {
     }
 
     fn mtp_read(&self, _c: usize) -> Vec<(u32, f32)> {
-        (0..super::mtp_gpu::STEPS)
+        (0..self.mtp.as_ref().map_or(0, |m| m.steps))
             .map(|step| {
                 let d = self.io.u32s(Io::MTP_OUT + 64 * step, MAX_T)[0];
                 let p = f32::from_bits(self.io.u32s(Io::MTP_OUT + 64 * step + 32, MAX_T)[0]);

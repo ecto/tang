@@ -247,6 +247,19 @@ fn decode_spec(
         ..Default::default()
     };
     let mut started = None;
+    // Window cost by width (ms, EMA; priors from flash-bench on mew) and the drafting cost.
+    let mut wcost: Vec<f64> = vec![12.0, 12.0, 15.0, 17.0, 19.5, 22.0, 24.5, 27.0, 29.5];
+    let mut mtp_cost = 3.5f64;
+    // Acceptance calibration by draft-probability bucket: (accepted, tried) with a prior.
+    let mut calib: Vec<(f64, f64)> = (0..10)
+        .map(|b| {
+            let p = (b as f64 + 0.5) / 10.0;
+            let a = if p >= 0.9 { 0.985 } else if p >= 0.5 { 0.6 + (p - 0.5) * 0.8 } else { 0.3 + p * 0.6 };
+            (4.0 * a, 4.0)
+        })
+        .collect();
+    let mut mtp_probs: Vec<f32> = Vec::new();
+    let fixed_gate = std::env::var("TANG_FLASH_GATE").ok().and_then(|v| v.parse::<f32>().ok());
     while out.len() < n {
         if out.len() >= 2 && started.is_none() {
             started = Some(Instant::now());
@@ -264,13 +277,23 @@ fn decode_spec(
                 (d.tokens.clone(), Some(d))
             }
             "mtp" => {
-                let mut d = Vec::new();
-                for &(tok, p) in &e.mtp_last {
-                    if p < 0.5 || d.len() >= room {
-                        break;
+                // Price each draft length: expected tokens (1 + Σ cumulative acceptance) per
+                // ms of window (measured EMA per width) plus drafting, keep the best. The
+                // acceptance of a draft is estimated from its probability by an online
+                // calibration (10 buckets, prior from the truth track's measurements).
+                let mut best = (0usize, 1.0 / (wcost[1] + mtp_cost));
+                let (mut cum, mut exp) = (1.0f64, 1.0f64);
+                for (k, &(_, p)) in e.mtp_last.iter().enumerate().take(room) {
+                    let b = ((p * 10.0) as usize).min(9);
+                    cum *= calib[b].0 / calib[b].1;
+                    exp += cum;
+                    let rate = exp / (wcost[k + 2] + mtp_cost);
+                    if rate > best.1 {
+                        best = (k + 1, rate);
                     }
-                    d.push(tok);
                 }
+                let d: Vec<u32> = e.mtp_last.iter().take(best.0).map(|x| x.0).collect();
+                mtp_probs = e.mtp_last.iter().take(best.0).map(|x| x.1).collect();
                 (d, None)
             }
             "wrong" => {
@@ -301,8 +324,29 @@ fn decode_spec(
             }
             _ => (Vec::new(), None),
         };
+        let drafts = match (kind, fixed_gate) {
+            ("mtp", Some(g)) => {
+                // Fixed gate (TANG_FLASH_GATE=0.5): keep drafts while p >= g.
+                let d: Vec<u32> = e.mtp_last.iter().take_while(|x| x.1 >= g).take(room).map(|x| x.0).collect();
+                mtp_probs = e.mtp_last.iter().take(d.len()).map(|x| x.1).collect();
+                d
+            }
+            _ => drafts,
+        };
         let kept = e.verify(cur, &drafts)?;
         let acc = kept.len() - 1;
+        if kind == "mtp" {
+            for (j, &p) in mtp_probs.iter().enumerate().take(acc + 1) {
+                let b = ((p * 10.0) as usize).min(9);
+                calib[b].1 += 1.0;
+                if j < acc {
+                    calib[b].0 += 1.0;
+                }
+            }
+            let w = drafts.len() + 1;
+            wcost[w] = 0.9 * wcost[w] + 0.1 * e.last.wall_ms;
+            mtp_cost = 0.9 * mtp_cost + 0.1 * e.last_mtp_ms;
+        }
         for (j, slot) in sp.by_pos.iter_mut().enumerate().take(drafts.len()) {
             slot.0 += 1;
             if j < acc {
