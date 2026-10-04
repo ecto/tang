@@ -100,6 +100,12 @@ impl Default for Opts {
     }
 }
 
+/// One segment of a [`Dw::Kn`] stack.
+enum KSeg {
+    Nat(B, tang_compute::flash_native::NatType),
+    Own(Dw),
+}
+
 /// Launch handles for the native GEMV (`kernels::GEMV_SRC`), one per window size.
 #[derive(Clone, Copy)]
 struct NativeK {
@@ -119,8 +125,9 @@ const XQ8_BYTES: usize = MAX_T * 6144 + MAX_T * 6144 / 32 * 4;
 /// A dense GEMV weight: Q4X (int8 activations), bf16 (f32 activations), or native GGUF
 /// segments (`fe_gemv`, f32 activations).
 enum Dw {
-    /// The kernel track's native GEMV (`native_linear_into`, NatX repack), one tensor.
-    Kn(B, tang_compute::flash_native::NatType),
+    /// The kernel track's native GEMV (`native_linear_out_into`, NatX repack) per segment of a
+    /// stacked projection (rows, output column), and the stack's width.
+    Kn(Vec<(KSeg, usize, usize)>, usize),
     Q4x(B),
     Bf16(B),
     Native {
@@ -154,7 +161,15 @@ impl Dw {
         match self {
             Dw::Bf16(b) => dev.linear_into(x, b, out, t, k, n),
             Dw::Q4x(b) => dev.q4x_linear_into(xq, b, out, t, k, n),
-            Dw::Kn(b, ty) => dev.native_linear_into(*ty, xq, b, out, t, k, n),
+            Dw::Kn(segs, width) => {
+                assert_eq!(*width, n, "native GEMV rows");
+                for (seg, rows, off) in segs {
+                    match seg {
+                        KSeg::Nat(b, ty) => dev.native_linear_out_into(*ty, xq, b, out, *off, n, t, k, *rows),
+                        KSeg::Own(d) => d.native_ptr(dev, nk, dev.buffer_addr(x), dev.buffer_addr(out) + (*off * 4) as u64, t, k, n),
+                    }
+                }
+            }
             Dw::Native { rows, .. } => {
                 assert_eq!(*rows, n, "native GEMV rows");
                 self.native_ptr(dev, nk, dev.buffer_addr(x), dev.buffer_addr(out), t, k, n);
@@ -187,7 +202,7 @@ impl Dw {
     }
 
     fn native(&self) -> bool {
-        matches!(self, Dw::Native { .. })
+        matches!(self, Dw::Native { .. } | Dw::Kn(..))
     }
 }
 
@@ -544,17 +559,32 @@ impl Engine {
             Ok(match e.fmt {
                 Fmt::Bf16 => Dw::Bf16(w),
                 Fmt::Q4x => Dw::Q4x(w),
-                Fmt::Native
-                    if e.segs.len() == 1
-                        && std::env::var("TANG_FLASH_KNATIVE").is_ok_and(|v| v == "1")
-                        && tang_compute::flash_native::NatType::from_ggml(e.segs[0][0] as u32).is_some() =>
-                {
-                    let ty = tang_compute::flash_native::NatType::from_ggml(e.segs[0][0] as u32).unwrap();
+                Fmt::Native if std::env::var("TANG_FLASH_KNATIVE").map_or(true, |v| v != "0") => {
+                    // The kernel track's native GEMV per segment (NatX repack); bf16 segments
+                    // through fe_gemv.
                     let raw = pack::read_entry(&df, e)?;
-                    let rows = e.segs[0][1] as usize;
-                    let rb = e.segs[0][2] as usize;
                     drop(w);
-                    Dw::Kn(dev.upload_native(ty, &raw[..rows * rb], e.n, e.k), ty)
+                    let mut segs = Vec::new();
+                    for &[ty, rows, rb, off, out] in &e.segs {
+                        let (rows, rb, off, out) = (rows as usize, rb as usize, off as usize, out as usize);
+                        let bytes = &raw[off..off + rows * rb];
+                        let seg = match tang_compute::flash_native::NatType::from_ggml(ty as u32) {
+                            Some(nt) => KSeg::Nat(dev.upload_native(nt, bytes, rows, e.k), nt),
+                            None => {
+                                let wb = super::mtp_gpu::upload_padded(&dev, bytes);
+                                let p = dev.buffer_addr(&wb);
+                                KSeg::Own(Dw::Native {
+                                    segs: dev.upload_u32(&[p as u32, (p >> 32) as u32, ty as u32, rows as u32, rb as u32, 0]),
+                                    _w: wb,
+                                    nseg: 1,
+                                    rows,
+                                    row16: row16(&[[ty, rows as u64, rb as u64, 0, 0]]),
+                                })
+                            }
+                        };
+                        segs.push((seg, rows, out));
+                    }
+                    Dw::Kn(segs, e.n)
                 }
                 Fmt::Native => {
                     let base = dev.buffer_addr(&w);

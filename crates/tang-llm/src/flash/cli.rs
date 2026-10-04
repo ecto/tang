@@ -739,6 +739,7 @@ pub fn spec_test(args: &[String]) -> Result<()> {
         let mut kinds = vec!["suffix".to_string(), "wrong".to_string(), format!("oracle:{}", f.display())];
         if e.has_mtp() {
             kinds.insert(0, "mtp".into());
+            kinds.insert(1, "hybrid".into());
         }
         for kind in kinds {
             let (out, stats, _, secs, sp) = decode_spec(&mut e, &ids, a.n, a.chunk, &kind)?;
