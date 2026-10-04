@@ -25,7 +25,7 @@
 //! Routed experts are dequantised lazily, one (layer, expert) at a time, only for the experts some
 //! token picked. N-gram table rows are read with `pread` at their offsets (16 per token).
 
-use crate::gguf::{Gguf, TensorInfo};
+use crate::gguf::{f16_to_f32, f32_to_f16, GgmlType, Gguf, TensorInfo};
 use anyhow::{bail, ensure, Context, Result};
 use rayon::prelude::*;
 use std::fmt::Write as _;
@@ -265,15 +265,99 @@ impl Hparams {
 // Small numeric pieces
 // ---------------------------------------------------------------------------------------------
 
+/// How a matmul's input is rounded before the dot products.
+///
+/// The truth is [`Act::F32`]. The others reproduce what ggml-cpu does to the *activation* for a
+/// weight of a given type (its `vec_dot_type`), so `--llama-numerics` can show how much of the
+/// distance to llama.cpp is llama.cpp's own rounding: Q8_0 (blocks of 32, `d = amax/127` stored as
+/// f16, round half to even) for Q2_0/Q4_0/Q5_0/Q8_0/IQ4_NL; Q8_K (blocks of 256, `d = max/-127` in
+/// f32, round half to even) for the K-quants and the other i-quants; BF16 for BF16 weights.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Act {
+    F32,
+    Q8_0,
+    Q8K,
+    Bf16,
+}
+
+impl Act {
+    pub fn for_weight(ty: GgmlType) -> Act {
+        use GgmlType::*;
+        match ty {
+            Q2_0 | Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | Iq4Nl => Act::Q8_0,
+            Q2K | Q3K | Q4K | Q5K | Q6K | Iq2Xxs | Iq2Xs | Iq2S | Iq3Xxs | Iq3S | Iq1S | Iq1M
+            | Iq4Xs => Act::Q8K,
+            Bf16 => Act::Bf16,
+            _ => Act::F32,
+        }
+    }
+
+    /// Round `x` (one or more whole rows) in place to what the dot product would see.
+    pub fn round(self, x: &mut [f32]) {
+        match self {
+            Act::F32 => {}
+            Act::Bf16 => x.iter_mut().for_each(|v| *v = round_bf16(*v)),
+            Act::Q8_0 => {
+                for b in x.chunks_mut(32) {
+                    let amax = b.iter().fold(0f32, |m, v| m.max(v.abs()));
+                    let d = amax / 127.0;
+                    let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+                    let dh = f16_to_f32(f32_to_f16(d));
+                    for v in b.iter_mut() {
+                        *v = (*v * id).round_ties_even() * dh;
+                    }
+                }
+            }
+            Act::Q8K => {
+                for b in x.chunks_mut(256) {
+                    let (mut amax, mut max) = (0f32, 0f32);
+                    for &v in b.iter() {
+                        if v.abs() > amax {
+                            amax = v.abs();
+                            max = v;
+                        }
+                    }
+                    if amax == 0.0 {
+                        b.iter_mut().for_each(|v| *v = 0.0);
+                        continue;
+                    }
+                    let iscale = -127.0 / max;
+                    let d = 1.0 / iscale;
+                    for v in b.iter_mut() {
+                        *v = (*v * iscale).round_ties_even().min(127.0) * d;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// f32 -> bf16 -> f32, round to nearest even (ggml's `ggml_fp32_to_bf16`).
+fn round_bf16(x: f32) -> f32 {
+    if x.is_nan() {
+        return x;
+    }
+    let u = x.to_bits();
+    let r = (u + (0x7fff + ((u >> 16) & 1))) & 0xffff_0000;
+    f32::from_bits(r)
+}
+
+/// f32 -> f16 -> f32.
+fn round_f16(x: f32) -> f32 {
+    f16_to_f32(f32_to_f16(x))
+}
+
 /// A dequantised `y = W x` matrix: `rows` outputs, each `cols` contiguous inputs.
 pub struct Mat {
     pub rows: usize,
     pub cols: usize,
     pub data: Vec<f32>,
+    /// Rounding applied to each input row first ([`Act::F32`]: none).
+    pub act: Act,
 }
 
 impl Mat {
-    fn from_info(g: &Gguf, t: &TensorInfo) -> Result<Self> {
+    fn from_info(g: &Gguf, t: &TensorInfo, emulate: bool) -> Result<Self> {
         ensure!(t.dims.len() <= 2, "{}: not a matrix ({:?})", t.name, t.dims);
         let cols = t.dims[0] as usize;
         let rows = if t.dims.len() == 2 {
@@ -285,11 +369,16 @@ impl Mat {
             rows,
             cols,
             data: g.dequantize(t)?,
+            act: if emulate {
+                Act::for_weight(t.ty)
+            } else {
+                Act::F32
+            },
         })
     }
 
-    fn load(g: &Gguf, name: &str) -> Result<Self> {
-        Self::from_info(g, g.info(name)?)
+    fn load(g: &Gguf, name: &str, emulate: bool) -> Result<Self> {
+        Self::from_info(g, g.info(name)?, emulate)
     }
 
     fn row(&self, r: usize) -> &[f32] {
@@ -300,6 +389,17 @@ impl Mat {
     /// Parallel over blocks of output rows unless `serial`; the result doesn't depend on which.
     pub fn apply(&self, x: &[f32], n: usize, serial: bool) -> Vec<f32> {
         assert_eq!(x.len(), n * self.cols, "matmul input");
+        let rounded;
+        let x = if self.act == Act::F32 {
+            x
+        } else {
+            let mut r = x.to_vec();
+            for row in r.chunks_mut(self.cols) {
+                self.act.round(row);
+            }
+            rounded = r;
+            &rounded[..]
+        };
         // Tile: a block of output rows against a block of inputs, so both stay in cache.
         const RB: usize = 16;
         const TB: usize = 32;
@@ -483,6 +583,12 @@ pub struct FlashRef {
     pub hp: Hparams,
     /// Print per-layer timings to stderr.
     pub verbose: bool,
+    /// Round activations the way ggml-cpu does (see [`Act`]) and keep QSA K/V, Q and the
+    /// indexer cache in f16, as llama.cpp's default f16 cache and flash attention do. Not the
+    /// truth: a way to measure how much of the distance to llama.cpp is llama.cpp's rounding.
+    pub emulate_llama: bool,
+    /// Ablation: QSA attends to every earlier cell, skipping the indexer's selection.
+    pub qsa_dense: bool,
 }
 
 /// One position's top-k next-token log-probabilities.
@@ -499,6 +605,8 @@ impl FlashRef {
             g,
             hp,
             verbose: false,
+            emulate_llama: false,
+            qsa_dense: false,
         })
     }
 
@@ -507,7 +615,19 @@ impl FlashRef {
     }
 
     fn mat(&self, l: usize, name: &str) -> Result<Mat> {
-        Mat::load(&self.g, &self.t(l, name))
+        self.load(&self.t(l, name))
+    }
+
+    fn load(&self, name: &str) -> Result<Mat> {
+        Mat::load(&self.g, name, self.emulate_llama)
+    }
+
+    fn act_for(&self, t: &TensorInfo) -> Act {
+        if self.emulate_llama {
+            Act::for_weight(t.ty)
+        } else {
+            Act::F32
+        }
     }
 
     fn vec(&self, name: &str) -> Result<Vec<f32>> {
@@ -599,7 +719,7 @@ impl FlashRef {
         let rows: Vec<f32> = r[out_from * hc * n..].to_vec();
         let n_out = t_len - out_from;
         let (x, _) = self.hc_read(&rows, n_out, "output_hc_", false)?;
-        let head = Mat::load(&self.g, "output.weight")?;
+        let head = self.load("output.weight")?;
         ensure!(head.cols == n, "output.weight is {} wide", head.cols);
         let mut tops = Vec::with_capacity(n_out);
         // a few positions at a time, so T × 248k logits never live at once
@@ -646,8 +766,8 @@ impl FlashRef {
     ) -> Result<(Vec<f32>, Vec<f32>)> {
         let (n, hc, eps) = (self.hp.n_embd, self.hp.hc, self.hp.eps);
         let w_norm = self.vec(&format!("{prefix}norm.weight"))?;
-        let down = Mat::load(&self.g, &format!("{prefix}down.weight"))?;
-        let up = Mat::load(&self.g, &format!("{prefix}up.weight"))?;
+        let down = self.load(&format!("{prefix}down.weight"))?;
+        let up = self.load(&format!("{prefix}up.weight"))?;
         ensure!(
             w_norm.len() == hc * n && down.cols == hc * n && up.rows == hc * n,
             "{prefix}: hc shapes"
@@ -675,7 +795,7 @@ impl FlashRef {
             }
         }
         let inj = if inject {
-            let w = Mat::load(&self.g, &format!("{prefix}inject.weight"))?;
+            let w = self.load(&format!("{prefix}inject.weight"))?;
             ensure!(
                 w.rows == hc && w.cols == hc * n,
                 "{prefix}inject: {}×{}",
@@ -825,7 +945,7 @@ impl FlashRef {
         let q_full = self.mat(l, "attn_q.weight")?.apply(x, t_len, false); // [T][nh][q hd | gate hd]
         let mut kc = self.mat(l, "attn_k.weight")?.apply(x, t_len, false); // [T][nkv][hd]
         let vc = self.mat(l, "attn_v.weight")?.apply(x, t_len, false);
-        let k_raw = self.mat(l, "indexer.k_proj.weight")?.apply(x, t_len, false); // [T][idd]
+        let mut k_raw = self.mat(l, "indexer.k_proj.weight")?.apply(x, t_len, false); // [T][idd]
         let mut qi = self.mat(l, "indexer.q_proj.weight")?.apply(x, t_len, false); // [T][ih][idd]
         let qn = self.vec(&self.t(l, "attn_q_norm.weight"))?;
         let kn = self.vec(&self.t(l, "attn_k_norm.weight"))?;
@@ -863,6 +983,14 @@ impl FlashRef {
                 rope_neox(d, t, n_rot, base);
             }
         }
+        let mut vc = vc;
+        if self.emulate_llama {
+            // llama.cpp's default caches are f16 (QSA K/V and the indexer's raw|pooled rows), and
+            // CPU flash attention converts Q to the K type
+            for buf in [&mut q, &mut kc, &mut vc, &mut k_raw] {
+                buf.iter_mut().for_each(|v| *v = round_f16(*v));
+            }
+        }
         // pooled indexer keys: mean of the block's raw keys, *then* norm, then rope at its first cell
         let n_blocks = t_len / kp;
         let mut pooled = vec![0f32; n_blocks * idd];
@@ -881,6 +1009,9 @@ impl FlashRef {
             }
             rms_norm_mul(p, &ikn, eps);
             rope_neox(p, b * kp, n_rot, base);
+            if self.emulate_llama {
+                p.iter_mut().for_each(|v| *v = round_f16(*v));
+            }
         }
 
         let max_blocks = hp.idx_top_k / kp;
@@ -894,7 +1025,7 @@ impl FlashRef {
                 // the blocks complete at this token, then the tail cells after them (itself included)
                 let nv = (t + 1) / kp;
                 let mut blocks: Vec<usize> = (0..nv).collect();
-                if nv > max_blocks {
+                if nv > max_blocks && !self.qsa_dense {
                     // score = Σ_heads relu(q_h · pooled_b) / sqrt(idx_dim)
                     let qt = &qi[t * ih * idd..(t + 1) * ih * idd];
                     let scores: Vec<f32> = (0..nv)
@@ -1031,16 +1162,19 @@ impl FlashRef {
                     rows: ff,
                     cols: n,
                     data: self.g.expert(gate_t, e)?,
+                    act: self.act_for(gate_t),
                 };
                 let up = Mat {
                     rows: ff,
                     cols: n,
                     data: self.g.expert(up_t, e)?,
+                    act: self.act_for(up_t),
                 };
                 let down = Mat {
                     rows: n,
                     cols: ff,
                     data: self.g.expert(down_t, e)?,
+                    act: self.act_for(down_t),
                 };
                 let gv = gate.apply(&xe, m, true);
                 let uv = up.apply(&xe, m, true);
@@ -1060,7 +1194,8 @@ impl FlashRef {
             }
         }
         // shared expert, gated per token by sigmoid(w · x)
-        let sg = self.vec(&self.t(l, "ffn_gate_inp_shexp.weight"))?;
+        let sg_t = self.g.info(&self.t(l, "ffn_gate_inp_shexp.weight"))?;
+        let sg = self.g.dequantize(sg_t)?;
         let sh_gate = self.mat(l, "ffn_gate_shexp.weight")?.apply(x, t_len, false);
         let sh_up = self.mat(l, "ffn_up_shexp.weight")?.apply(x, t_len, false);
         let sh_h: Vec<f32> = sh_gate
@@ -1081,7 +1216,9 @@ impl FlashRef {
                     *o += w * v;
                 }
             }
-            let gsh = sigmoid(dot(&sg, &x[t * n..(t + 1) * n]));
+            let mut xt = x[t * n..(t + 1) * n].to_vec();
+            self.act_for(sg_t).round(&mut xt);
+            let gsh = sigmoid(dot(&sg, &xt));
             for (o, v) in yt.iter_mut().zip(&sh[t * n..(t + 1) * n]) {
                 *o += gsh * v;
             }
@@ -1246,8 +1383,11 @@ pub fn top_logprobs(logits: &[f32], k: usize) -> Vec<(u32, f64)> {
 }
 
 /// `tang-llm flash-ref <gguf-first-shard> <token ids...> [--ids-file F] [--last N] [--top K]
-/// [--dump DIR] [-v]`: run the reference and print one JSON object per output position,
-/// `{"pos": i, "top": [[id, logprob], ...]}` (the distribution of the token *after* position i).
+/// [--dump DIR] [--llama-numerics] [-v]`: run the reference and print one JSON object per output
+/// position, `{"pos": i, "top": [[id, logprob], ...]}` (the distribution of the token *after*
+/// position i). `--llama-numerics` rounds activations and the QSA caches the way llama.cpp's CPU
+/// backend does (see [`Act`]); without it everything is f32. `--qsa-dense` is an ablation: QSA
+/// attends to every cell, as if the indexer selected everything.
 pub fn cli(args: &[String]) -> Result<()> {
     let usage =
         "usage: flash-ref <gguf> <ids...> [--ids-file F] [--last N] [--top K] [--dump DIR] [-v]";
@@ -1258,6 +1398,8 @@ pub fn cli(args: &[String]) -> Result<()> {
     let mut top = 10;
     let mut dump_dir: Option<PathBuf> = None;
     let mut verbose = false;
+    let mut llama_numerics = false;
+    let mut qsa_dense = false;
     while let Some(a) = it.next() {
         match a.as_str() {
             "--last" => last = Some(it.next().context("--last N")?.parse().context("--last N")?),
@@ -1276,6 +1418,8 @@ pub fn cli(args: &[String]) -> Result<()> {
                 }
             }
             "-v" | "--verbose" => verbose = true,
+            "--llama-numerics" => llama_numerics = true,
+            "--qsa-dense" => qsa_dense = true,
             s => ids.push(
                 s.parse()
                     .with_context(|| format!("bad token id {s:?}; {usage}"))?,
@@ -1287,6 +1431,8 @@ pub fn cli(args: &[String]) -> Result<()> {
     }
     let mut m = FlashRef::open(&path)?;
     m.verbose = verbose;
+    m.emulate_llama = llama_numerics;
+    m.qsa_dense = qsa_dense;
     let from = ids.len() - last.unwrap_or(ids.len()).clamp(1, ids.len());
     let mut dump = dump_dir.as_deref().map(Dump::new).transpose()?;
     let tops = m.forward(&ids, from, top, dump.as_mut())?;
@@ -1381,6 +1527,7 @@ mod tests {
             data: (0..rows * cols)
                 .map(|i| ((i * 7919) % 101) as f32 / 50.0 - 1.0)
                 .collect(),
+            act: Act::F32,
         };
         let x: Vec<f32> = (0..n * cols)
             .map(|i| ((i * 104729) % 89) as f32 / 44.0 - 1.0)
@@ -1396,6 +1543,34 @@ mod tests {
                 assert_eq!(y[t * rows + r], ys[t * rows + r]);
             }
         }
+    }
+
+    #[test]
+    fn activation_rounding() {
+        // Q8_0: the block's largest magnitude lands on ±127 steps of an f16 scale
+        let mut x: Vec<f32> = (0..64).map(|i| (i as f32 - 20.0) * 0.013).collect();
+        let orig = x.clone();
+        Act::Q8_0.round(&mut x);
+        for (b, ob) in x.chunks(32).zip(orig.chunks(32)) {
+            let amax = ob.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let d = f16_to_f32(f32_to_f16(amax / 127.0));
+            for (v, o) in b.iter().zip(ob) {
+                let q = v / d;
+                assert!((q - q.round()).abs() < 1e-3 && q.abs() <= 127.5, "{v} {o}");
+                assert!((v - o).abs() <= d * 0.5 + amax * 1e-3);
+            }
+        }
+        // Q8_K: scale from the signed max, so it maps to exactly -127
+        let mut y: Vec<f32> = (0..256)
+            .map(|i| ((i * 37) % 101) as f32 / 50.0 - 1.0)
+            .collect();
+        y[7] = -3.0;
+        Act::Q8K.round(&mut y);
+        assert_eq!(y[7], -3.0);
+        // BF16: round to nearest even on the 16 dropped bits
+        assert_eq!(round_bf16(1.0 + 1.0 / 256.0), 1.0); // tie -> even
+        assert_eq!(round_bf16(1.0 + 3.0 / 256.0), 1.0 + 4.0 / 256.0);
+        assert_eq!(round_bf16(1.0 + 1.0 / 128.0), 1.0 + 1.0 / 128.0);
     }
 
     #[test]

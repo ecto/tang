@@ -37,6 +37,13 @@
 //! drafter without a model: tokens per verify forward and the speedup the cost curve predicts
 //! (`TANG_DRAFT_*` settings; `TANG_DRAFT_COST` defaults to the CUDA curve).
 //!
+//! `tang-llm gguf-info <file.gguf>` — metadata and a tensor inventory of a GGUF (all shards).
+//! `tang-llm gguf-rows <file.gguf> <tensor> <first> <n> <out.f32>` — rows dequantized to raw f32.
+//! `tang-llm flash-ref <first shard.gguf> <token ids...> [--ids-file F] [--top K] [--last N]
+//! [--dump DIR] [-v]` — Qwen3.8-Flash-Next's slow f32 reference forward on the CPU: top-K
+//! next-token logprobs per position as JSON lines, and with `--dump` the last position's
+//! per-layer intermediates (see `flash::reference`).
+//!
 //! Every command takes `--device auto|metal|cuda|cpu` (auto: Metal, then CUDA, then the CPU,
 //! whichever is built in and present).
 
@@ -157,6 +164,18 @@ fn main() -> Result<()> {
     if cmd == "gguf-info" {
         let g = tang_llm::gguf::Gguf::open(&dir)?;
         print!("{}", tang_llm::flash::inventory(&g)?);
+        return Ok(());
+    }
+    if cmd == "gguf-rows" {
+        // gguf-rows <gguf> <tensor> <first row> <n rows> <out.f32>: dequantized rows, raw f32
+        let usage = "gguf-rows <gguf> <tensor> <first row> <n rows> <out.f32>";
+        let g = tang_llm::gguf::Gguf::open(&dir)?;
+        let t = g.info(args.get(2).context(usage)?)?;
+        let first: usize = args.get(3).context(usage)?.parse().context(usage)?;
+        let n: usize = args.get(4).context(usage)?.parse().context(usage)?;
+        let v = g.rows(t, first, n)?;
+        let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        std::fs::write(args.get(5).context(usage)?, bytes)?;
         return Ok(());
     }
     if cmd == "flash-ref" {

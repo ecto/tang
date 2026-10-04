@@ -88,7 +88,7 @@ def load_jsonl(path):
 def cmd_compare(a):
     ref = load_jsonl(a.llama)
     got = load_jsonl(a.tang)
-    pos = sorted(set(ref) & set(got))
+    pos = sorted(p for p in set(ref) & set(got) if a.from_ <= p < a.to)
     if not pos:
         sys.exit("no common positions")
     agree = 0
@@ -151,6 +151,8 @@ def main():
     c.add_argument("llama")
     c.add_argument("tang")
     c.add_argument("-k", type=int, default=10)
+    c.add_argument("--from", dest="from_", type=int, default=0, help="only positions >= this")
+    c.add_argument("--to", type=int, default=1 << 62, help="only positions < this")
     a = ap.parse_args()
     {"tokenize": cmd_tokenize, "probs": cmd_probs, "compare": cmd_compare}[a.cmd](a)
 
