@@ -99,3 +99,133 @@ on this box.
    `/etc/sysctl.d/90-hugepages.conf`. `HostArena` tries `MAP_HUGETLB` first.
 3. **Memlock: not needed** for `cuMemHostRegister`, verified to 20 GiB with an 8 GiB limit.
    Only an `mlock` fallback would need `LimitMEMLOCK=infinity` in the service unit.
+
+# The CPU miss path, as built
+
+Measured in [BENCH.md](BENCH.md), "CPU miss path".
+
+## Per-window cost at the realistic load
+
+At 93 % hits there are ~110 misses per 3–4-token window, ≈ 2.3 distinct missed experts per
+layer, mostly one token each.
+
+| | measured |
+|---|---|
+| CPU time for one layer's misses (8 P-cores, AVX-VNNI) | 31 / 55 / 79 µs for 1 / 2 / 3 misses (45–53 GB/s) |
+| CPU time per window (synthetic window, M = 2–3) | 2.75–4.0 ms |
+| ...of which exposed (not hidden under the GPU's hits) | 0.9–2.2 ms |
+| Doorbell handoff (publish, two waits, row copy) | 0.82 ms per window, 17 µs per layer |
+| **Added to the GPU's window** | **≈ 1.7–3.0 ms** |
+
+Only the GPU work that runs after routing (hits and shared expert, ~35–50 µs per layer) can
+hide CPU time, so the exposed share climbs fast above 2 misses per layer. Ways to shrink it
+(none built):
+
+- Let the GPU build the plan itself from `ResidentCache::device_addrs()`, using the kernel
+  track's `moe_plan_into`, and publish only `MISSING`. That drops the `FLAG_A` round trip
+  (~6–8 µs per layer, ~0.35 ms per window).
+- Raise the hit rate.
+- Start phase A on the first missed expert before the plan is published.
+
+## The engine interface
+
+One `doorbell::Mailbox`: 233,472 u32 words (912 KiB) of registered, device-mapped host
+memory, reused for every layer of every window. Word offsets are `doorbell::Mb`; byte offset
+= 4 × word.
+
+| words | name | written by | contents |
+|---|---|---|---|
+| 0 | `SEQ` | GPU, last | `win · 64 + layer + 1` |
+| 64 | `FLAG_A` | host | `SEQ` value once `PLAN` is written |
+| 128 | `FLAG_B` | host | `SEQ` value once `ROWS` and `CPU_ROWS` are written |
+| 192 | `HDR_T` | GPU | tokens in this window, `t` (1..8) |
+| 193 | `HDR_LAYER` | GPU | layer (informational) |
+| 256.. | `IDS` | GPU | router ids `[t][TOPK]`, u32, token major, rank minor |
+| 512.. | `XQ` | GPU | the layer's int8 activations, `QAct { m: t, k: 2560 }` words, the exact buffer `moe_grouped_into` reads (contract below) |
+| 6912.. | `PLAN` | host | a `MoePlan` (`MoePlan::WORDS` = 533 words) |
+| 7456.. | `CPU_ROWS` | host | `[n, dst_0 .. dst_{n-1}]`: the `parts` rows the host filled |
+| 8192.. | `ROWS` | host | `[88][2560]` f32; row `dst` is `parts` row `dst` |
+
+The flag regions are 256 bytes apart from everything the GPU writes.
+
+Per layer, inside the window's graph:
+
+1. After `router_topk_into`, the GPU writes `HDR_T`, `IDS` and `XQ`, then
+   `__threadfence_system()`, then `SEQ` (`db_publish` does this; the real router or quantize
+   kernel can write the mailbox directly). The window counter `win` is a device word written
+   stream-ordered before each replay. Proposal: a third word in the kernel track's `Win`
+   record.
+2. `db_wait(mb, FLAG_A, win, layer, PLAN, 533, plan_vram)`: one thread spins
+   (`ld.acquire.sys`), then the block copies the plan into the VRAM buffer `moe_grouped_into`
+   reads.
+   - **Never have many warps read mapped control words:** each warp-read is a serialised
+     PCIe round trip, measured ~1 µs.
+   - The plan is `contract::MoePlan`, word for word the kernel track's layout. Groups are the
+     *resident* distinct experts (address = VRAM slot or scratch) plus the shared expert.
+     Missed experts get no group and are listed in `MISSING`.
+3. `moe_grouped_into(xq, plan_vram, parts)` runs hits and the shared expert while the host
+   computes the misses.
+4. `db_wait(mb, FLAG_B, win, layer, CPU_ROWS, 89, list_vram)`, then
+   `db_copy_rows(mb, list_vram, parts)`: one block per listed row copies `ROWS[dst]` →
+   `parts[dst]`.
+5. `moe_combine_into` as usual. **Router weights are applied only on the GPU.** CPU rows are
+   raw expert outputs, like VRAM-computed `parts` rows.
+
+What the host computes for each missed expert e and each routed occurrence `j = t·TOPK + rank`
+with `ids[j] = e`: `ROWS[j] = down · q(silu(gate · x̂_t) ⊙ (up · x̂_t))`, where:
+
+- `x̂_t` is token t's row of `XQ`;
+- `q()` is the same int8 contract applied to the 640-wide intermediate;
+- weights are the expert's repacked Q2_0 blob `gate | up | down` (`contract::ExpertBlob`,
+  1,382,400 B), read from the resident-mode host arena.
+
+**Activation contract** (the kernel track's, followed here unchanged): per 32-element chunk,
+`d = amax/127` as f32, `q = clamp(round_half_away(x/d), −127, 127)` with IEEE division, `Σq`
+stored alongside. A chunk's dot is `d_w · d_x · (Σ code·q − Σq)`.
+
+**The coordinator's sketch matches the kernel track.** Its "dot = d·s·(Σcode·x̂ − Σx̂)" is
+`d_w · d_x · (Σ code·q − Σq)`, with an fp16 weight scale per 64-weight block and an f32
+activation scale per 32-element chunk.
+
+**Not yet verified against the kernel track's own code:**
+- **The contract is copied, not imported** into `contract.rs`, because their
+  `flash.rs`/`cpu/flash.rs` is uncommitted on `claude/flash-kernels`. When it lands,
+  `contract.rs` should re-export it, and a test should run `expert_ref` against their
+  `moe_grouped`.
+- **The GPU may compute `silu` differently.** The reference uses `x / (1 + exp(−x))` in fp32
+  with libm `exp`; the GPU may use `__expf`.
+
+**Host side:** `doorbell::serve_layer(mb, seq, stream, exec, addr, host_blob, shared)` once
+per layer, in order, on the thread that launched the graph:
+
+- `addr(e)` is `ResidentCache::addr(layer·512 + e)`;
+- `host_blob(e)` is `ResidentCache::host_blob(...)`;
+- `exec` is a `MissExec` over a `Pool` of the P-cores.
+
+Between windows, call `ResidentCache::record(routed keys)` and `ResidentCache::boundary(main)`.
+
+**Watchdog.** `Mailbox::wait_seq` polls `cuStreamQuery` every 2 ms (`TANG_MOE_WATCHDOG_MS`).
+If the stream has finished or failed without publishing, it calls `Mailbox::abort()`, which
+raises both flags to `u32::MAX` so no device wait spins forever, and returns an error. No host
+callbacks are used anywhere.
+
+## Resident mode
+
+The host arena holds only experts not in VRAM: 12,235 blobs, 16.9 GB. A swap is an exchange
+through a VRAM scratch slot, one copy per window boundary (`resident.rs` has the stage table):
+
+1. save `S → X`;
+2. fill `H → S`, after which the incoming expert is admitted;
+3. write back `X → H`, after which the victim is served from the host.
+
+The victim leaves its slot as soon as its bytes are safe in scratch, and stays GPU-served from
+scratch until its host copy exists. This is the one place this differs from "victim
+non-resident immediately": in resident mode a victim has no host copy to serve from yet.
+
+**Tests:**
+- CPU tests simulate memory with random copy delays. They check that every window reads the
+  right bytes and no in-flight copy writes a served location.
+- A GPU test does the same with real copies and checksums through the device table.
+
+**Budget:** 96 swaps in flight need 96 scratch slots (133 MB of VRAM, taken from the slot
+budget). With fewer, adaptation is throttled to the free scratch count.

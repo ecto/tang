@@ -371,3 +371,301 @@ mod tests {
         cache.policy.check();
     }
 }
+
+/// Resident mode on the GPU: VRAM slots + scratch, a host arena holding only the experts not
+/// in VRAM, exchanges driven by [`ResidentPolicy`]. The device table holds, per key, the
+/// address of its blob if it is on the GPU and 0 if it is on the host (the "0 = not resident"
+/// convention of the MoE plan builder, so `addr` can feed [`crate::miss::build_plan`]).
+pub struct ResidentCache {
+    pub policy: crate::resident::ResidentPolicy,
+    blob: usize,
+    vram: DevBuf,
+    scratch: DevBuf,
+    host: HostArena,
+    d_resid: DevBuf,
+    d_addr: DevBuf,
+    d_upd: DevBuf,
+    side: Stream,
+    inflight: VecDeque<(Event, Vec<u32>)>,
+    apply: sys::CUfunction,
+    _module: Module,
+}
+
+impl ResidentCache {
+    /// Allocate `n_slots` + `n_scratch` VRAM blobs and a registered host arena for the rest,
+    /// and place every key: `ranking` (hottest first) into slots, the others into host slots.
+    /// `src(key)` gives each key's bytes for the initial load.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new<'a>(
+        gpu: &Gpu,
+        geo: Geometry,
+        params: AdaptParams,
+        n_slots: usize,
+        n_scratch: usize,
+        ranking: impl IntoIterator<Item = u32>,
+        src: impl Fn(u32) -> &'a [u8],
+    ) -> Result<Self> {
+        use crate::arena::ArenaOptions;
+        use crate::resident::{Loc, ResidentPolicy};
+        gpu.bind()?;
+        let blob = geo.blob_bytes;
+        let policy = ResidentPolicy::new(geo, n_slots, n_scratch, params, ranking);
+        let mut host = HostArena::new(policy.host_slots().max(1) * blob, ArenaOptions::default())
+            .map_err(|e| crate::gpu::Error(format!("mmap: {e}")))?;
+        host.register(&gpu.ctx, &[1 << 30, 256 << 20])?;
+        let vram = DevBuf::alloc(n_slots.max(1) * blob)?;
+        let scratch = DevBuf::alloc(n_scratch.max(1) * blob)?;
+        for k in 0..geo.keys() as u32 {
+            let bytes = src(k);
+            assert_eq!(bytes.len(), blob);
+            match policy.loc(k) {
+                Loc::Slot(s) => vram.write(s as usize * blob, bytes)?,
+                Loc::Host(h) => {
+                    let hb = unsafe { host.bytes_mut() };
+                    hb[h as usize * blob..(h as usize + 1) * blob].copy_from_slice(bytes);
+                }
+                Loc::Scratch(_) => unreachable!(),
+            }
+        }
+        let module = gpu.module(kernels::CACHE)?;
+        let apply = module.func("apply_updates")?;
+        let keys = geo.keys();
+        let mut c = ResidentCache {
+            policy,
+            blob,
+            vram,
+            scratch,
+            host,
+            d_resid: DevBuf::from_slice(&vec![-1i32; keys])?,
+            d_addr: DevBuf::zeroed(keys * 8)?,
+            d_upd: DevBuf::alloc(keys * std::mem::size_of::<Upd>())?,
+            side: Stream::new()?,
+            inflight: VecDeque::new(),
+            apply,
+            _module: module,
+        };
+        let all: Vec<u32> = (0..keys as u32).collect();
+        let s = Stream::new()?;
+        c.publish(&all, &s)?;
+        s.sync()?;
+        Ok(c)
+    }
+
+    /// Device address of `u64[keys]`: blob address if on the GPU, 0 if on the host.
+    pub fn device_addrs(&self) -> u64 {
+        self.d_addr.ptr
+    }
+
+    /// Host-side view of the same table.
+    pub fn addr(&self, key: u32) -> u64 {
+        use crate::resident::Loc;
+        match self.policy.loc(key) {
+            Loc::Slot(s) => self.vram.ptr + s as u64 * self.blob as u64,
+            Loc::Scratch(x) => self.scratch.ptr + x as u64 * self.blob as u64,
+            Loc::Host(_) => 0,
+        }
+    }
+
+    /// The host copy of a key that lives on the host.
+    pub fn host_blob(&self, key: u32) -> Option<&[u8]> {
+        use crate::resident::Loc;
+        match self.policy.loc(key) {
+            Loc::Host(h) => Some(unsafe {
+                std::slice::from_raw_parts(
+                    self.host.as_ptr().add(h as usize * self.blob),
+                    self.blob,
+                )
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn record(&mut self, keys: &[u32]) {
+        self.policy.record(keys);
+    }
+
+    /// Between windows, on the main stream: advance landed exchanges, publish table changes,
+    /// then start this boundary's copies on the side stream. Returns copies started.
+    pub fn boundary(&mut self, main: &Stream) -> Result<usize> {
+        let mut landed = Vec::new();
+        while self.inflight.front().is_some_and(|(e, _)| e.done()) {
+            landed.extend(self.inflight.pop_front().unwrap().1);
+        }
+        let steps = self.policy.boundary(&landed);
+        let dirty = self.policy.drain_dirty();
+        self.publish(&dirty, main)?;
+        if steps.is_empty() {
+            return Ok(0);
+        }
+        let published = Event::new(false)?;
+        published.record(main)?;
+        self.side.wait(&published)?;
+        let b = self.blob as u64;
+        for st in &steps {
+            use crate::resident::CopyOp::*;
+            match st.op {
+                SlotToScratch { slot, scratch } => ck!(sys::cuMemcpyDtoDAsync_v2(
+                    self.scratch.ptr + scratch as u64 * b,
+                    self.vram.ptr + slot as u64 * b,
+                    self.blob,
+                    self.side.0
+                ))?,
+                HostToSlot { host, slot } => ck!(sys::cuMemcpyHtoDAsync_v2(
+                    self.vram.ptr + slot as u64 * b,
+                    self.host.as_ptr().add(host as usize * self.blob) as *const c_void,
+                    self.blob,
+                    self.side.0
+                ))?,
+                ScratchToHost { scratch, host } => ck!(sys::cuMemcpyDtoHAsync_v2(
+                    self.host.as_ptr().add(host as usize * self.blob) as *mut c_void,
+                    self.scratch.ptr + scratch as u64 * b,
+                    self.blob,
+                    self.side.0
+                ))?,
+            }
+        }
+        let ev = Event::new(false)?;
+        ev.record(&self.side)?;
+        self.inflight
+            .push_back((ev, steps.iter().map(|s| s.ex).collect()));
+        Ok(steps.len())
+    }
+
+    /// Wait for in-flight copies (they are reported landed at the next boundary).
+    pub fn sync_side(&self) -> Result<()> {
+        self.side.sync()
+    }
+
+    fn publish(&mut self, keys: &[u32], main: &Stream) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let upd: Vec<Upd> = keys
+            .iter()
+            .map(|&k| {
+                let a = self.addr(k);
+                Upd {
+                    key: k,
+                    slot: if a == 0 { -1 } else { 0 },
+                    ptr: a,
+                }
+            })
+            .collect();
+        self.d_upd.write_async(0, &upd, main)?;
+        let n = upd.len() as i32;
+        unsafe {
+            launch(
+                self.apply,
+                ((n as u32).div_ceil(256), 1, 1),
+                (256, 1, 1),
+                0,
+                main,
+                args![self.d_upd.ptr, n, self.d_resid.ptr, self.d_addr.ptr],
+            )
+        }
+    }
+
+    /// The device address table read back (tests).
+    pub fn read_addrs(&self) -> Result<Vec<u64>> {
+        self.d_addr.read(0, self.policy.locs().len())
+    }
+}
+
+#[cfg(test)]
+mod resident_tests {
+    use super::*;
+
+    #[test]
+    fn resident_exchanges_keep_every_blob_readable() {
+        let Some(gpu) = Gpu::for_test() else { return };
+        gpu.bind().unwrap();
+        let geo = Geometry {
+            layers: 2,
+            experts: 32,
+            blob_bytes: 64 << 10,
+        };
+        let words = geo.blob_bytes / 4;
+        let content = |k: u32| -> Vec<u8> {
+            (0..words)
+                .flat_map(|i| (k.wrapping_mul(2_654_435_761) ^ (i as u32 * 7)).to_le_bytes())
+                .collect()
+        };
+        let blobs: Vec<Vec<u8>> = (0..geo.keys() as u32).map(content).collect();
+        let want: Vec<u32> = blobs
+            .iter()
+            .map(|b| {
+                b.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .fold(0u32, |a, w| a.wrapping_add(u32::from_le_bytes(*w)))
+            })
+            .collect();
+        let params = AdaptParams {
+            every: 2,
+            max_swaps: 6,
+            ..AdaptParams::default()
+        };
+        let mut c =
+            ResidentCache::new(&gpu, geo, params, 12, 4, 0..64, |k| &blobs[k as usize]).unwrap();
+        let module = gpu.module(kernels::CACHE).unwrap();
+        let sums = module.func("blob_sums").unwrap();
+        let out = DevBuf::zeroed(geo.keys() * 4).unwrap();
+        let main = Stream::new().unwrap();
+        let mut rng = crate::q2cpu::tests::Rng(42);
+        let mut started = 0;
+        for w in 0..300 {
+            // A "window": read every GPU-resident blob through the device table (keys on the
+            // host point at a zero address and are skipped) and every host blob on the CPU.
+            let addrs = c.read_addrs().unwrap();
+            let gpu_keys: Vec<u32> = (0..geo.keys() as u32)
+                .filter(|&k| addrs[k as usize] != 0)
+                .collect();
+            let table: Vec<u64> = gpu_keys.iter().map(|&k| addrs[k as usize]).collect();
+            let d_table = DevBuf::from_slice(&table).unwrap();
+            unsafe {
+                launch(
+                    sums,
+                    (table.len() as u32, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    &main,
+                    args![d_table.ptr, words as i32, out.ptr],
+                )
+                .unwrap();
+            }
+            main.sync().unwrap();
+            let got: Vec<u32> = out.read(0, table.len()).unwrap();
+            for (i, &k) in gpu_keys.iter().enumerate() {
+                assert_eq!(got[i], want[k as usize], "window {w}: GPU key {k}");
+            }
+            for k in 0..geo.keys() as u32 {
+                if let Some(b) = c.host_blob(k) {
+                    assert!(b == &blobs[k as usize][..], "window {w}: host key {k}");
+                }
+            }
+            let base = (w / 60) * 9;
+            let keys: Vec<u32> = (0..30)
+                .map(|_| ((base + (rng.next() % 10) as usize) % geo.keys()) as u32)
+                .collect();
+            c.record(&keys);
+            if rng.next().is_multiple_of(3) {
+                c.sync_side().unwrap(); // sometimes let copies land before the boundary
+            }
+            started += c.boundary(&main).unwrap();
+        }
+        assert!(started > 30, "only {started} copies");
+        assert_eq!(
+            gpu_keys_count(&c),
+            12 + c
+                .policy
+                .locs()
+                .iter()
+                .filter(|l| matches!(l, crate::resident::Loc::Scratch(_)))
+                .count()
+        );
+    }
+
+    fn gpu_keys_count(c: &ResidentCache) -> usize {
+        c.policy.locs().iter().filter(|l| l.on_gpu()).count()
+    }
+}

@@ -238,3 +238,139 @@ one adaptation: 96 swaps; plan + publish 0.19 ms on the host; copies landed afte
 
 From a real 17 GB scattered arena, expect the 3.3 GB/s of (b): ~5 s to seed, ~40 ms per
 96-swap adaptation (on the copy engine, overlapping decode at ~14 % cost to concurrent kernels).
+
+# CPU miss path (second round, 2026-10-04)
+
+Built after DESIGN.md chose CPU experts for misses. Code: `src/q2cpu.rs` (kernels),
+`src/miss.rs` (plan builder and two-phase executor), `src/pool.rs`, `src/doorbell.rs`,
+`src/resident.rs` and `ResidentCache` in `src/cache.rs`.
+
+```sh
+B=./target/release/tang-moe-bench
+$B cpu --iters 30                        # (a) kernel throughput, parity, per-layer latency
+$B missw --iters 30                      # (b) synthetic window through the doorbell
+TANG_MOE_STAMPS=1 $B missw --iters 10    # (b) plus a per-step GPU timeline (globaltimer)
+TANG_REQUIRE_CUDA=1 cargo test --release -p tang-moe --features cuda   # 25 tests
+```
+
+Both build a resident-mode arena: 12,235 blobs (the experts not in the 12,341 VRAM slots),
+16.9 GB, pinned, filled with valid repacked Q2_0 (random codes, fp16 scales 0.01–0.03).
+
+Box state for the tables below (15:42 UTC): load average 9.6–13.5, with a robot-sim process
+holding one core at 100 % the whole time; 43 GB available; 1.67 GB VRAM held by other
+clients. An earlier run at load average 16–18 (other agents compiling) gave 54 GB/s for the
+8-P-core T=1 row and 2.5 ms exposed at M=2. The CPU path is sensitive to a busy host.
+
+## (a) CPU expert kernels
+
+Parity against the scalar spec (`contract::expert_ref`, the kernel track's `moe_grouped` math,
+fp32 single fma chain), 4 experts × 2 tokens × 2,560 outputs: **max |Δ| / max |y| = 5.4e-7**
+for every ISA. Unit tests also check that:
+
+- the integer chunk sums are exact;
+- AVX2 and AVX-VNNI are bitwise equal to the portable lane path;
+- the lane path is within 2e-5·Σ|terms| of the spec per row;
+- the direct quantizer is bitwise equal to the contract's `quantize_act`.
+
+The only difference from the spec is fp32 reassociation: two half-chunk lanes and an 8-lane
+tree.
+
+Throughput = expert weight bytes / wall time of `MissExec::run` (both phases plus the
+quantize), with 16 fresh random blobs per call. Median [p10–p90] of 30. DRAM read ceiling
+measured earlier: 27.9 GB/s on one core, 66–70 GB/s on 8–16 threads.
+
+| threads | ISA | experts × tokens | µs | GB/s |
+|---|---|---|---|---|
+| 1 P-core | AVX2 | 16 × 1 | 1546 | 14.3 [14.2–14.5] |
+| 1 P-core | AVX2 | 16 × 2 | 2107 | 10.5 |
+| 1 P-core | AVX2 | 16 × 4 | 3387 | 6.5 |
+| 1 P-core | AVX-VNNI | 16 × 1 | 1426 | 15.5 [15.1–15.7] |
+| 1 P-core | AVX-VNNI | 16 × 2 | 1916 | 11.5 |
+| 1 P-core | AVX-VNNI | 16 × 4 | 2916 | 7.6 |
+| 8 P-cores | AVX-VNNI | 16 × 1 | 382 | **57.8** [57.0–58.7] |
+| 8 P-cores | AVX-VNNI | 16 × 2 | 542 | 40.8 |
+| 8 P-cores | AVX-VNNI | 16 × 4 | 603 | 36.7 |
+| 8 P + 8 E | AVX-VNNI | 16 × 1 | 364 | 60.8 [57.7–62.2] |
+| 8 P + 8 E | AVX-VNNI | 16 × 2 | 442 | 50.1 |
+| 8 P + 8 E | AVX-VNNI | 16 × 4 | 665 | 33.2 |
+
+- **Rates are per weight byte, not per token.** At T = 4 one core does 4 × 7.6 = 30 GB/s of
+  token-weight products.
+- **One token per expert runs at 85 % of the DRAM ceiling on 8 P-cores.** Several tokens per
+  expert are compute-bound: decoding is shared, but each token costs ~12 µops per 128 weights.
+  Misses are cold experts and mostly serve one token per window (~1.25 at T = 3), so T = 1 is
+  the case that matters.
+- **AVX-VNNI vs AVX2:** +8 % at T = 1, +17 % at T = 4.
+- Earlier versions of the kernel, kept as measurements:
+  - with one `vpdpbusd` chain per group and one row at a time, VNNI was *slower* than AVX2
+    (10.1 vs 13.1 GB/s single-core): the 4-deep dependent chain was the limit;
+  - two chains, two rows per pass, and `−Σq` folded into the accumulator init fixed it.
+- **The "VNNI4 interleave" (arXiv 2508.06753) is not needed.** The GPU's chunk-permuted
+  activation layout already lines up with `(codes >> 2f) & 3` per byte, so there is no unpack
+  shuffle at all.
+- **E-cores** add 5 % at T = 1 and help at T = 2, but they are noisy on a shared box (p10 fell
+  to 4.5 GB/s in the loaded run). They stay opt-in (`TANG_MOE_ECORES=1`).
+
+Per-layer latency at the sizes that occur: 8 P-cores, M distinct missed experts each serving
+one token, fresh blobs. Median [p10–p90] of 30, after a 100-call warm-up. Without the warm-up,
+the first calls after creating a pool ran 3× slower: 120 vs 33 µs.
+
+| M | µs | phase A µs | quantize µs | phase B µs | GB/s |
+|---|---|---|---|---|---|
+| 1 | 31 [30–32] | 17 | 4.1 | 9 | 45.2 |
+| 2 | 55 [54–58] | 33 | 4.1 | 17 | 50.0 |
+| 3 | 79 [77–81] | 48 | 4.5 | 24 | 52.8 |
+| 4 | 102 [100–104] | 64 | 4.1 | 32 | 54.4 |
+| 8 | 196 [192–202] | 126 | 5.4 | 64 | 56.3 |
+
+## (b) A synthetic decode window through the doorbell
+
+48 layers in one captured graph, T = 3 tokens, 24 distinct experts per layer, of which M are
+missed. The missed experts are drawn at random from the 16.9 GB arena. Per layer:
+
+- **GPU:** a dense stand-in (stream 128 MiB of VRAM, 153 µs), `db_publish` (ids + int8
+  activations into the mailbox, bump `SEQ`), `db_wait(FLAG_A)` staging the plan into VRAM,
+  a hits stand-in (read each planned group's blob from VRAM, ~35 µs),
+  `db_wait(FLAG_B)` staging the row list, `db_copy_rows`.
+- **Host** (`doorbell::serve_layer`, pinned to P-core 0, 7 more P-core workers): spin on
+  `SEQ`, build the `MoePlan`, raise `FLAG_A`, run the missed experts, raise `FLAG_B`.
+
+Window = host wall time from graph launch to stream sync. Median [p10–p90] of 30 windows.
+CPU = Σ over layers of FLAG_A → FLAG_B. Exposed = window − window at M = 0. Hidden =
+1 − exposed / CPU.
+
+| variant | M/layer | misses/window | window ms | CPU ms | exposed ms | hidden | plan µs/layer |
+|---|---|---|---|---|---|---|---|
+| GPU work only, no doorbell | 0 | 0 | 9.23 [9.22–9.72] | — | — | — | — |
+| doorbell | 0 | 0 | 10.06 [10.04–10.52] | 0.00 | — | — | 0.9 |
+| doorbell | 1 | 48 | 10.25 [10.22–10.78] | 1.54 | 0.19 | 87 % | 0.9 |
+| doorbell | 2 | 96 | 10.94 [10.87–11.61] | 2.75 | 0.88 | 68 % | 0.9 |
+| doorbell | 3 | 144 | 12.29 [12.21–12.87] | 4.04 | 2.23 | 45 % | 1.0 |
+| doorbell | 4 | 192 | 13.62 [13.49–14.10] | 5.23 | 3.57 | 32 % | 1.1 |
+| doorbell | 8 | 384 | 19.19 [18.84–19.79] | 10.31 | 9.13 | 11 % | 1.5 |
+
+- **Handoff:** 0.82 ms per window (17 µs per layer) with no misses. The GPU timeline at layer
+  24 (`TANG_MOE_STAMPS=1`, M = 0) is publish 8 µs, wait A 6 µs, wait B 4 µs, copy 2 µs, plus
+  kernel boundaries.
+- **What hides the CPU.** Only the work the GPU still has after routing: the hits and the
+  shared expert, ~35 µs here. Everything else in the next layer depends on the combined
+  output. So:
+  - M = 1 is almost free;
+  - from M = 3 most CPU time is exposed. Wait B grows from 4 µs (M = 0) to 52 µs (M = 3) and
+    172 µs (M = 8).
+- **Parity end to end:** rows the GPU received for layer 47 against the scalar spec are within
+  max |Δ| / max |y| = 3–5e-7 at every M.
+- **Realistic load** (93 % hits, ~110 misses per 3–4-token window ≈ 2.3 per layer): between
+  the M = 2 and M = 3 rows. The CPU half costs **~2.8–3.3 ms of CPU time, of which ~1–2 ms is
+  exposed, plus 0.8 ms of handoff**: about 1.7–3.0 ms added to the GPU's window. This replaces
+  the "~3 ms" estimate.
+
+Bugs these numbers caught (fixed, kept as measurements):
+
+1. **Mapped control words read by every warp are serialised.** `plan_hits` read three plan
+   words from mapped memory in each of its 2,816 blocks: 29 ms per layer. 88 one-word reads
+   in `db_copy_rows`: 0.69 ms (~1 µs per warp-read). Now `db_wait` stages the plan and the row
+   list into VRAM once, coalesced.
+2. **Host flags 64 bytes from GPU-written words** were the first suspect. Moving them didn't
+   change the 29 ms, so it was not the cause. They now sit 256 bytes apart anyway, and the wait
+   uses `ld.acquire.sys`.

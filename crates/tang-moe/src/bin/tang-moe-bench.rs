@@ -7,6 +7,9 @@
 //! tang-moe-bench spin
 //! ```
 
+#[path = "../bench/missbench.rs"]
+mod missbench;
+
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
@@ -87,6 +90,8 @@ fn run(cmd: &str, o: &Opts) -> Result<()> {
             "spin" => spin(&gpu)?,
             "pcie" => pcie(&gpu)?,
             "size" => size(&gpu)?,
+            "cpu" => missbench::cpu(Some(&gpu), o.iters)?,
+            "missw" => missbench::missw(&gpu, o.iters)?,
             "mapped" => bench.as_ref().unwrap().mapped(o)?,
             "window" => bench.as_ref().unwrap().window(o)?,
             "copy" => bench.as_ref().unwrap().copy(o)?,

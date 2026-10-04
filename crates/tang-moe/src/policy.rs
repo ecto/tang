@@ -112,6 +112,8 @@ pub struct CachePolicy {
     slots: Vec<Slot>,
     /// key is the target of an in-flight fill.
     filling: Vec<bool>,
+    /// key may not be picked as a candidate (e.g. a resident-mode victim still moving out).
+    busy: Vec<bool>,
     usage: Vec<f32>,
     windows: u32,
     dirty: Vec<u32>,
@@ -126,6 +128,7 @@ impl CachePolicy {
             resident: vec![-1; geo.keys()],
             slots: vec![Slot::Free; n_slots],
             filling: vec![false; geo.keys()],
+            busy: vec![false; geo.keys()],
             usage: vec![0.0; geo.keys()],
             windows: 0,
             dirty: Vec::new(),
@@ -221,11 +224,17 @@ impl CachePolicy {
     /// free slots first, then the least-used resident keys' slots, while the candidate's count
     /// is ≥ margin × the victim's. Victims become non-resident now. Then decay all counts.
     pub fn plan_adapt(&mut self) -> Vec<Swap> {
+        self.plan_adapt_n(self.params.max_swaps)
+    }
+
+    /// [`plan_adapt`](Self::plan_adapt) with at most `max` swaps (≤ `max_swaps`).
+    pub fn plan_adapt_n(&mut self, max: usize) -> Vec<Swap> {
         let p = self.params;
         let mut cands: Vec<u32> = (0..self.geo.keys() as u32)
             .filter(|&k| {
                 self.resident[k as usize] < 0
                     && !self.filling[k as usize]
+                    && !self.busy[k as usize]
                     && self.usage[k as usize] >= p.threshold
             })
             .collect();
@@ -234,7 +243,7 @@ impl CachePolicy {
                 .total_cmp(&self.usage[*a as usize])
                 .then(a.cmp(b))
         });
-        cands.truncate(p.max_swaps);
+        cands.truncate(p.max_swaps.min(max));
 
         let mut free: Vec<u32> = (0..self.slots.len() as u32)
             .filter(|&s| self.slots[s as usize] == Slot::Free)
@@ -296,6 +305,11 @@ impl CachePolicy {
         self.stats.swaps += out.len() as u64;
         self.stats.adaptations += 1;
         out
+    }
+
+    /// Exclude (or re-admit) `key` as a swap candidate.
+    pub fn set_busy(&mut self, key: u32, busy: bool) {
+        self.busy[key as usize] = busy;
     }
 
     /// Keys whose residency changed since the last drain (deduplicated, ascending).

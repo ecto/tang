@@ -8,16 +8,28 @@
 //!   or the mapped host copy, so an expert kernel does one indirection and doesn't care where
 //!   the blob lives.
 //! - `ExpertCache` (feature `cuda`): the VRAM slot arena, the device-side residency and pointer
-//!   tables, and swaps on a side stream.
+//!   tables, and swaps on a side stream. `ResidentCache`: the same in resident mode (host arena
+//!   holds only non-VRAM experts; swaps are exchanges, see [`resident`]).
+//! - The CPU miss path: [`contract`] (the data contract shared with the GPU kernels and the
+//!   scalar spec), [`q2cpu`] (AVX-VNNI / AVX2 Q2_0 rows), [`pool`] (pinned spinning workers),
+//!   [`miss`] (plan builder and two-phase executor), and `doorbell` (feature `cuda`: the
+//!   per-layer GPU↔CPU protocol on mapped memory).
 //!
 //! See `DESIGN.md` for the measurements behind the design and `BENCH.md` for how to reproduce
 //! them with `tang-moe-bench`.
 
 pub mod arena;
+pub mod contract;
+pub mod miss;
 pub mod policy;
+pub mod pool;
+pub mod q2cpu;
+pub mod resident;
 
 #[cfg(feature = "cuda")]
 pub mod cache;
+#[cfg(feature = "cuda")]
+pub mod doorbell;
 #[cfg(feature = "cuda")]
 pub mod gpu;
 #[cfg(feature = "cuda")]
