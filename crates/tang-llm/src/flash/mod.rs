@@ -5,7 +5,9 @@
 //! The block math, with its traps, is written up in `docs/strata.md`; what the GGUF actually holds
 //! is in `docs/flash-next-tensors.md`.
 
+pub mod mtp;
 pub mod reference;
+pub mod requant;
 
 use crate::gguf::{Gguf, TensorInfo};
 use anyhow::Result;
