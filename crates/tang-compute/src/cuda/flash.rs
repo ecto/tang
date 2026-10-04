@@ -217,11 +217,13 @@ impl CudaComputeDevice {
             "q8x_gemv" => 16,
             _ => 32,
         };
-        // Rows per warp, as the kernel picks it: 2 for one column, 4 for more.
+        // Rows per warp, as the kernel picks it: 2 for one column, 4 for more. The K split is
+        // chosen from (n, k) alone (at 2 rows a warp), so a row's summation order doesn't depend
+        // on the window width m.
         let gr = if m == 1 { 2 } else { 4 };
         let mut ks = 1;
         while ks < 8
-            && n.div_ceil(gr * 8 / ks) < 2 * super::llm::sm_count()
+            && n.div_ceil(2 * 8 / ks) < 2 * super::llm::sm_count()
             && k / epv / (2 * ks) >= 32
         {
             ks *= 2;
@@ -2395,6 +2397,649 @@ mod tests {
             left[..max_blocks].iter().all(|v| v.to_bits() == 0),
             "union masks not cleared"
         );
+    }
+
+    // ---- window-width invariance ----
+    //
+    // A token's result must not depend on the window it is computed in (speculative verify
+    // windows must reproduce T=1 decoding bit for bit): every op, run on a T=8 window, gives
+    // each column (token) exactly what it gives that column alone at T=1 -- or, for the stateful
+    // ops (GDN, QSA prep), what eight successive T=1 windows give.
+
+    const TW: usize = 8;
+
+    /// Column `j` of a `[m][w]` buffer.
+    fn col(v: &[f32], j: usize, w: usize) -> &[f32] {
+        &v[j * w..(j + 1) * w]
+    }
+
+    /// Column `j` of a QAct (codes, scales, sums) as one vector.
+    fn qact_col(v: &[f32], m: usize, k: usize, j: usize) -> Vec<f32> {
+        let (kb, nch) = (k / 4, k / 32);
+        let mut o = v[j * kb..(j + 1) * kb].to_vec();
+        o.extend_from_slice(&v[m * kb + j * nch..m * kb + (j + 1) * nch]);
+        o.extend_from_slice(&v[m * kb + m * nch + j * nch..m * kb + m * nch + (j + 1) * nch]);
+        o
+    }
+
+    struct Inv(Vec<String>);
+    impl Inv {
+        fn eq(&mut self, a: &[f32], b: &[f32], what: &str) {
+            assert_eq!(a.len(), b.len(), "{what}: lengths");
+            if let Some(i) = a
+                .iter()
+                .zip(b)
+                .position(|(x, y)| x.to_bits() != y.to_bits())
+            {
+                self.0.push(format!(
+                    "{what}: first difference at {i}: {} vs {}",
+                    a[i], b[i]
+                ));
+            }
+        }
+    }
+
+    fn t_invariance(g: &CudaComputeDevice) {
+        let mut inv = Inv(vec![]);
+        let mut rng = Rng(0x7177);
+        let quant = |x: &[f32], m: usize, k: usize| {
+            let mut q = g.alloc_f32(QAct { m, k }.words());
+            g.quantize_act_into(&g.upload_f32(x), &mut q, m, k);
+            q
+        };
+        // quantize_act
+        for k in [HIDDEN, GDN_V, FF] {
+            let x = rng.vec(TW * k, 2.0);
+            let q8 = g.download(&quant(&x, TW, k));
+            for j in 0..TW {
+                let q1 = g.download(&quant(col(&x, j, k), 1, k));
+                inv.eq(
+                    &qact_col(&q8, TW, k, j),
+                    &q1,
+                    &format!("quantize k={k} col {j}"),
+                );
+            }
+        }
+        // Dense GEMVs: (name, k, n, run(xq or x, m) -> y).
+        type Gemv<'a> = Box<dyn Fn(&D, &B, &B, usize) -> B + 'a>;
+        type D = CudaComputeDevice;
+        type B = CudaBuffer;
+        let mut gemvs: Vec<(String, usize, usize, B, Gemv)> = vec![];
+        // Shapes either side of the K-split heuristics (router, ple, mixer, head-sized).
+        for (k, n) in [
+            (2560, 300),
+            (6144, 129),
+            (2560, 512),
+            (2560, 2560),
+            (6144, 2560),
+            (2560, 10240),
+        ] {
+            let wb = rng.bf16(n * k, 0.5);
+            gemvs.push((
+                format!("bf16 linear {k}->{n}"),
+                k,
+                n,
+                g.upload_bf16(&wb),
+                Box::new(move |d: &D, x: &B, w: &B, m| {
+                    let mut y = d.alloc_f32(m * n);
+                    d.linear_into(x, w, &mut y, m, k, n);
+                    y
+                }),
+            ));
+            let raw = rng.q2(n, k);
+            gemvs.push((
+                format!("q2 {k}->{n}"),
+                k,
+                n,
+                g.upload_q2(&raw, n, k),
+                Box::new(move |d: &D, xq: &B, w: &B, m| {
+                    let mut y = d.alloc_f32(m * n);
+                    d.q2_linear_into(xq, w, &mut y, m, k, n);
+                    y
+                }),
+            ));
+            let packed: Vec<u32> = (0..n * k / 8).map(|_| rng.u() as u32).collect();
+            let (sc, bi) = (rng.bf16(n * k / 64, 0.02), rng.bf16(n * k / 64, 0.1));
+            gemvs.push((
+                format!("q4x {k}->{n}"),
+                k,
+                n,
+                g.upload_q4x(&packed, &sc, &bi, n, k),
+                Box::new(move |d: &D, xq: &B, w: &B, m| {
+                    let mut y = d.alloc_f32(m * n);
+                    d.q4x_linear_into(xq, w, &mut y, m, k, n);
+                    y
+                }),
+            ));
+            let q8raw: Vec<u8> = (0..n * k / 32)
+                .flat_map(|_| {
+                    let mut b = vec![0u8; fl::Q8_BLOCK_BYTES];
+                    b[..2]
+                        .copy_from_slice(&fl::f32_to_f16(0.01 + rng.f(0.005).abs()).to_le_bytes());
+                    for v in b.iter_mut().skip(2) {
+                        *v = rng.u() as u8;
+                    }
+                    b
+                })
+                .collect();
+            gemvs.push((
+                format!("q8x {k}->{n}"),
+                k,
+                n,
+                g.upload_q8x(&q8raw, n, k),
+                Box::new(move |d: &D, xq: &B, w: &B, m| {
+                    let mut y = d.alloc_f32(m * n);
+                    d.q8x_linear_into(xq, w, &mut y, m, k, n);
+                    y
+                }),
+            ));
+            for ty in crate::flash_native::tests::ALL {
+                if k % ty.block().0 != 0 {
+                    continue;
+                }
+                let raw = crate::flash_native::tests::random_gguf(ty, n, k, rng.u());
+                gemvs.push((
+                    format!("native {ty:?} {k}->{n}"),
+                    k,
+                    n,
+                    g.upload_native(ty, &raw, n, k),
+                    Box::new(move |d: &D, xq: &B, w: &B, m| {
+                        let mut y = d.alloc_f32(m * n);
+                        d.native_linear_into(ty, xq, w, &mut y, m, k, n);
+                        y
+                    }),
+                ));
+            }
+        }
+        for (name, k, n, w, run) in &gemvs {
+            let (k, n) = (*k, *n);
+            let x = rng.vec(TW * k, 1.5);
+            let f32_in = name.starts_with("bf16");
+            let in8 = if f32_in {
+                g.upload_f32(&x)
+            } else {
+                quant(&x, TW, k)
+            };
+            let y8 = g.download(&run(g, &in8, w, TW));
+            for j in 0..TW {
+                let in1 = if f32_in {
+                    g.upload_f32(col(&x, j, k))
+                } else {
+                    quant(col(&x, j, k), 1, k)
+                };
+                let y1 = g.download(&run(g, &in1, w, 1));
+                inv.eq(col(&y8, j, n), &y1, &format!("{name} col {j}"));
+            }
+        }
+        // Hyper-connection reads (no pending, pending write, pending MoE write).
+        {
+            let w = HC * HIDDEN;
+            let norm: Vec<f32> = rng.vec(w, 1.0).iter().map(|v| 1.0 + 0.2 * v).collect();
+            let (n, dn, u, i) = (
+                g.upload_f32(&norm),
+                g.upload_bf16(&rng.bf16(HC_LR * w, 0.05)),
+                g.upload_bf16(&fl::hc_up_repack(&rng.bf16(w * HC_LR, 0.2))),
+                g.upload_bf16(&rng.bf16(HC * w, 0.05)),
+            );
+            let hw = HcWeights {
+                norm: &n,
+                down: &dn,
+                up: &u,
+                inject: Some(&i),
+            };
+            let ls = EXPERTS + 1;
+            let r0 = rng.vec(TW * w, 2.0);
+            let (y, injp) = (rng.vec(TW * HIDDEN, 1.0), rng.vec(TW * HC, 3.0));
+            let parts = rng.vec(MoePlan::PARTS_ROWS * HIDDEN, 1.0);
+            let (rw, logits) = (rng.vec(TW * TOPK, 0.3), rng.vec(TW * ls, 2.0));
+            // One read over columns `cols` (parts rows remapped to the window's own rows).
+            let read = |cols: &[usize], mode: u32| -> [Vec<f32>; 4] {
+                let m = cols.len();
+                let pick = |v: &[f32], wd: usize| -> Vec<f32> {
+                    cols.iter().flat_map(|&j| col(v, j, wd).to_vec()).collect()
+                };
+                let mut pr = vec![0f32; MoePlan::PARTS_ROWS * HIDDEN];
+                for (t, &j) in cols.iter().enumerate() {
+                    for kk in 0..TOPK {
+                        pr[(t * TOPK + kk) * HIDDEN..][..HIDDEN].copy_from_slice(col(
+                            &parts,
+                            j * TOPK + kk,
+                            HIDDEN,
+                        ));
+                    }
+                    pr[(MoePlan::SHARED_ROW + t) * HIDDEN..][..HIDDEN].copy_from_slice(col(
+                        &parts,
+                        MoePlan::SHARED_ROW + j,
+                        HIDDEN,
+                    ));
+                }
+                let mut r = g.upload_f32(&pick(&r0, w));
+                let (yb, ib) = (
+                    g.upload_f32(&pick(&y, HIDDEN)),
+                    g.upload_f32(&pick(&injp, HC)),
+                );
+                let (pb, wb, lb) = (
+                    g.upload_f32(&pr),
+                    g.upload_f32(&pick(&rw, TOPK)),
+                    g.upload_f32(&pick(&logits, ls)),
+                );
+                let pending = match mode {
+                    0 => None,
+                    1 => Some(HcPending::Write { y: &yb, inj: &ib }),
+                    _ => Some(HcPending::Moe {
+                        parts: &pb,
+                        w: &wb,
+                        logits: &lb,
+                        stride: ls,
+                        sg: Some(EXPERTS),
+                        inj: &ib,
+                    }),
+                };
+                let (mut x, mut inj, mut sc, mut xq) = (
+                    g.alloc_f32(m * HIDDEN),
+                    g.alloc_f32(m * HC),
+                    g.alloc_f32(fl::hc_scratch_words(m)),
+                    g.alloc_f32(QAct { m, k: HIDDEN }.words()),
+                );
+                g.hc_read_into(
+                    &mut r,
+                    pending,
+                    &hw,
+                    &mut x,
+                    Some(&mut xq),
+                    Some(&mut inj),
+                    &mut sc,
+                    m,
+                    1e-6,
+                );
+                [
+                    g.download(&x),
+                    g.download(&inj),
+                    g.download(&r),
+                    g.download(&xq),
+                ]
+            };
+            let all: Vec<usize> = (0..TW).collect();
+            for mode in 0..3 {
+                let o8 = read(&all, mode);
+                for j in 0..TW {
+                    let o1 = read(&[j], mode);
+                    let what = format!("hc_read pending={mode} col {j}");
+                    inv.eq(col(&o8[0], j, HIDDEN), &o1[0], &format!("{what} x"));
+                    inv.eq(col(&o8[1], j, HC), &o1[1], &format!("{what} inj"));
+                    inv.eq(col(&o8[2], j, w), &o1[2], &format!("{what} r"));
+                    inv.eq(
+                        &qact_col(&o8[3], TW, HIDDEN, j),
+                        &o1[3],
+                        &format!("{what} xq"),
+                    );
+                }
+            }
+        }
+        // Router top-k.
+        {
+            let stride = EXPERTS + 1;
+            let l = rng.vec(TW * stride, 4.0);
+            let topk = |v: &[f32], m: usize| {
+                let (mut i, mut w) = (g.alloc_f32(m * TOPK), g.alloc_f32(m * TOPK));
+                g.router_topk_into(&g.upload_f32(v), stride, EXPERTS, &mut i, &mut w, m);
+                (g.download(&i), g.download(&w))
+            };
+            let (i8, w8) = topk(&l, TW);
+            for j in 0..TW {
+                let (i1, w1) = topk(col(&l, j, stride), 1);
+                inv.eq(col(&i8, j, TOPK), &i1, &format!("router ids col {j}"));
+                inv.eq(col(&w8, j, TOPK), &w1, &format!("router w col {j}"));
+            }
+        }
+        // Grouped experts (parts rows per token) and combine.
+        {
+            let blobs: Vec<B> = (0..6)
+                .map(|_| {
+                    g.upload_bytes(&ExpertBlob::from_gguf(
+                        &rng.q2(FF, HIDDEN),
+                        &rng.q2(FF, HIDDEN),
+                        &rng.q2(HIDDEN, FF),
+                    ))
+                })
+                .collect();
+            let shared = g.upload_bytes(&ExpertBlob::from_gguf(
+                &rng.q2(FF, HIDDEN),
+                &rng.q2(FF, HIDDEN),
+                &rng.q2(HIDDEN, FF),
+            ));
+            let table: Vec<u32> = (0..EXPERTS)
+                .flat_map(|e| {
+                    let p = g.buffer_addr(&blobs[e % 6]);
+                    [p as u32, (p >> 32) as u32]
+                })
+                .collect();
+            let gtab = g.upload_u32(&table);
+            // Overlapping experts across tokens, so the T=8 groups hold several entries.
+            let mut ids = vec![];
+            for tt in 0..TW {
+                let mut row: Vec<u32> = vec![];
+                while row.len() < TOPK {
+                    let e = (rng.u() % 16) as u32 * 3 + (tt as u32 % 2);
+                    if !row.contains(&e) {
+                        row.push(e);
+                    }
+                }
+                ids.extend(row);
+            }
+            let x = rng.vec(TW * HIDDEN, 1.0);
+            let w = rng.vec(TW * TOPK, 0.3);
+            let logits = rng.vec(TW * (EXPERTS + 1), 2.0);
+            let run = |cols: &[usize]| -> (Vec<f32>, Vec<f32>) {
+                let m = cols.len();
+                let pid: Vec<u32> = cols
+                    .iter()
+                    .flat_map(|&j| ids[j * TOPK..(j + 1) * TOPK].to_vec())
+                    .collect();
+                let px: Vec<f32> = cols
+                    .iter()
+                    .flat_map(|&j| col(&x, j, HIDDEN).to_vec())
+                    .collect();
+                let pw: Vec<f32> = cols
+                    .iter()
+                    .flat_map(|&j| col(&w, j, TOPK).to_vec())
+                    .collect();
+                let pl: Vec<f32> = cols
+                    .iter()
+                    .flat_map(|&j| col(&logits, j, EXPERTS + 1).to_vec())
+                    .collect();
+                let mut plan = g.alloc_f32(MoePlan::WORDS);
+                g.moe_plan_into(
+                    &g.upload_u32(&pid),
+                    &gtab,
+                    g.buffer_addr(&shared),
+                    &mut plan,
+                    m,
+                );
+                let xq = quant(&px, m, HIDDEN);
+                let (mut sc, mut parts) = (
+                    g.alloc_f32(MoePlan::scratch_words()),
+                    g.alloc_f32(MoePlan::PARTS_ROWS * HIDDEN),
+                );
+                // SAFETY: the plan's addresses are the live blobs above.
+                unsafe { g.moe_grouped_into(&xq, &plan, &mut sc, &mut parts, m) };
+                let mut y = g.alloc_f32(m * HIDDEN);
+                g.moe_combine_into(
+                    &parts,
+                    &g.upload_f32(&pw),
+                    &g.upload_f32(&pl),
+                    EXPERTS + 1,
+                    Some(EXPERTS),
+                    &mut y,
+                    m,
+                );
+                (g.download(&parts), g.download(&y))
+            };
+            let (p8, y8) = run(&(0..TW).collect::<Vec<_>>());
+            for j in 0..TW {
+                let (p1, y1) = run(&[j]);
+                for kk in 0..TOPK {
+                    inv.eq(
+                        col(&p8, j * TOPK + kk, HIDDEN),
+                        col(&p1, kk, HIDDEN),
+                        &format!("moe parts col {j} slot {kk}"),
+                    );
+                }
+                inv.eq(
+                    col(&p8, MoePlan::SHARED_ROW + j, HIDDEN),
+                    col(&p1, MoePlan::SHARED_ROW, HIDDEN),
+                    &format!("moe shared col {j}"),
+                );
+                inv.eq(col(&y8, j, HIDDEN), &y1, &format!("moe combine col {j}"));
+            }
+        }
+        // GDN: one T=8 commit window vs eight T=1 commit windows (both launch shapes).
+        {
+            let cs = gdn_case(&mut rng, TW);
+            let (dt, a, norm, conv) = (
+                g.upload_f32(&cs.dt),
+                g.upload_f32(&cs.a),
+                g.upload_f32(&cs.norm),
+                g.upload_f32(&cs.conv),
+            );
+            let p = GdnParams {
+                conv: &conv,
+                dt_bias: &dt,
+                ssm_a: &a,
+                norm: &norm,
+            };
+            for fused in [false, true] {
+                let run = |m: usize, steps: usize| -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+                    let mut state = g.upload_f32(&cs.state);
+                    let mut hist = g.upload_f32(&cs.hist);
+                    let (mut ys, mut yqs) = (vec![], vec![]);
+                    for s in 0..steps {
+                        let proj = g.upload_f32(&cs.proj[s * m * GDN_PROJ..(s + 1) * m * GDN_PROJ]);
+                        let w = win(g, s * m, m);
+                        let (mut y, mut yq) = (
+                            g.alloc_f32(m * GDN_V),
+                            g.alloc_f32(QAct { m, k: GDN_V }.words()),
+                        );
+                        if fused {
+                            g.gdn_conv_step(
+                                &mut state,
+                                &proj,
+                                GDN_PROJ,
+                                &hist,
+                                &p,
+                                &mut y,
+                                Some(&mut yq),
+                                m,
+                                GdnMode::Commit { win: &w },
+                                1e-6,
+                            );
+                        } else {
+                            let mut h = g.alloc_f32(m * GDN_CONV);
+                            g.gdn_conv_into(&proj, GDN_PROJ, &hist, &conv, &mut h, m, 1e-6);
+                            g.gdn_step(
+                                &mut state,
+                                &h,
+                                &proj,
+                                GDN_PROJ,
+                                &p,
+                                &mut y,
+                                Some(&mut yq),
+                                m,
+                                GdnMode::Commit { win: &w },
+                                1e-6,
+                            );
+                        }
+                        g.gdn_conv_commit(&mut hist, &proj, GDN_PROJ, &w, m);
+                        ys.extend(g.download(&y));
+                        let q = g.download(&yq);
+                        for j in 0..m {
+                            yqs.extend(qact_col(&q, m, GDN_V, j));
+                        }
+                    }
+                    (ys, yqs, g.download(&state), g.download(&hist))
+                };
+                let a8 = run(TW, 1);
+                let a1 = run(1, TW);
+                let what = format!("gdn fused={fused}");
+                inv.eq(&a8.0, &a1.0, &format!("{what} y"));
+                inv.eq(&a8.1, &a1.1, &format!("{what} yq"));
+                inv.eq(&a8.2, &a1.2, &format!("{what} state"));
+                inv.eq(&a8.3, &a1.3, &format!("{what} hist"));
+            }
+        }
+        // QSA: prep over successive windows (T=8 vs T=1 from position 0), then select and
+        // attend per column at its own position.
+        {
+            let max_ctx = 4096;
+            let (cos, sin) = fl::rope_table(max_ctx, 1e7);
+            let (cb, sb) = (g.upload_f32(&cos), g.upload_f32(&sin));
+            let nb: Vec<B> = [QSA_D, QSA_D, IDX_D, IDX_D]
+                .iter()
+                .map(|&n| {
+                    g.upload_f32(
+                        &rng.vec(n, 1.0)
+                            .iter()
+                            .map(|v| 1.0 + 0.3 * v)
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect();
+            let qn = QsaNorms {
+                q: &nb[0],
+                k: &nb[1],
+                iq: &nb[2],
+                ik: &nb[3],
+            };
+            let n_tok = 24;
+            let proj = rng.vec(n_tok * QSA_PROJ, 1.0);
+            let prep = |m: usize| -> [Vec<f32>; 5] {
+                let (mut kc, mut vc) = (
+                    g.alloc_bf16(max_ctx * QSA_KV * QSA_D),
+                    g.alloc_bf16(max_ctx * QSA_KV * QSA_D),
+                );
+                let (mut ring, mut pooled) =
+                    (g.alloc_f32(16 * IDX_D), g.alloc_f32(max_ctx / 4 * IDX_D));
+                let mut qs = vec![];
+                for s in 0..n_tok / m {
+                    let mut q = g.alloc_f32(fl::qsa_q_words(m));
+                    let cache = QsaCache {
+                        k: &mut kc,
+                        v: &mut vc,
+                        ring: &mut ring,
+                        pooled: &mut pooled,
+                    };
+                    g.qsa_prep(
+                        &g.upload_f32(&proj[s * m * QSA_PROJ..(s + 1) * m * QSA_PROJ]),
+                        QSA_PROJ,
+                        &win(g, s * m, 0),
+                        &qn,
+                        (&cb, &sb),
+                        &mut q,
+                        cache,
+                        m,
+                        1e-6,
+                    );
+                    let q = g.download(&q);
+                    let (a, b) = (QSA_HEADS * QSA_D, IDX_HEADS * IDX_D);
+                    for j in 0..m {
+                        qs.extend_from_slice(&q[j * a..(j + 1) * a]);
+                        qs.extend_from_slice(&q[m * a + j * b..m * a + (j + 1) * b]);
+                    }
+                }
+                let n = n_tok * QSA_KV * QSA_D;
+                [
+                    qs,
+                    g.download(&kc)[..n].to_vec(),
+                    g.download(&vc)[..n].to_vec(),
+                    g.download(&ring),
+                    g.download(&pooled)[..n_tok / 4 * IDX_D].to_vec(),
+                ]
+            };
+            let (p8, p1) = (prep(TW), prep(1));
+            for (i, nm) in ["q", "k cache", "v cache", "ring", "pooled"]
+                .iter()
+                .enumerate()
+            {
+                inv.eq(&p8[i], &p1[i], &format!("qsa prep {nm}"));
+            }
+            // Select and attend at a long position (selection active), per column.
+            let max_blocks = 1024;
+            let pooled = rng.vec(max_blocks * IDX_D, 1.0);
+            let to_bits = |v: &[f32]| -> Vec<u16> {
+                v.iter()
+                    .map(|x| (fl::bf16_round(*x).to_bits() >> 16) as u16)
+                    .collect()
+            };
+            let (gk, gv, gp) = (
+                g.upload_bf16(&to_bits(&rng.vec(max_ctx * QSA_KV * QSA_D, 1.0))),
+                g.upload_bf16(&to_bits(&rng.vec(max_ctx * QSA_KV * QSA_D, 1.0))),
+                g.upload_f32(&pooled),
+            );
+            let q8 = rng.vec(fl::qsa_q_words(TW), 1.0);
+            let pr8 = rng.vec(TW * QSA_PROJ, 2.0);
+            let (a, b) = (QSA_HEADS * QSA_D, IDX_HEADS * IDX_D);
+            let qcol = |j: usize| -> Vec<f32> {
+                let mut v = q8[j * a..(j + 1) * a].to_vec();
+                v.extend_from_slice(&q8[TW * a + j * b..TW * a + (j + 1) * b]);
+                v
+            };
+            for pos0 in [100usize, 3000] {
+                let sel_att = |q: &[f32],
+                               pr: &[f32],
+                               m: usize,
+                               pos: usize|
+                 -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+                    let (gq, w) = (g.upload_f32(q), win(g, pos, 0));
+                    let (mut sc, mut ids) =
+                        (g.alloc_f32(m * max_blocks), g.alloc_f32(m * QSA_WIDTH));
+                    g.qsa_select_into(&gp, &gq, &w, &mut sc, &mut ids, max_blocks, m);
+                    let mut s = g.alloc_f32(fl::qsa_attend_scratch_words(m));
+                    let (mut out, mut oq) = (
+                        g.alloc_f32(m * QSA_OUT),
+                        g.alloc_f32(QAct { m, k: QSA_OUT }.words()),
+                    );
+                    g.qsa_attend_into(
+                        &gq,
+                        &gk,
+                        &gv,
+                        &ids,
+                        &g.upload_f32(pr),
+                        QSA_PROJ,
+                        &w,
+                        &mut s,
+                        &mut out,
+                        Some(&mut oq),
+                        m,
+                    );
+                    (
+                        g.download(&sc),
+                        g.download(&ids),
+                        g.download(&out),
+                        g.download(&oq),
+                    )
+                };
+                let o8 = sel_att(&q8, &pr8, TW, pos0);
+                for j in 0..TW {
+                    let o1 = sel_att(&qcol(j), col(&pr8, j, QSA_PROJ), 1, pos0 + j);
+                    let nbk = (pos0 + j + 1) / 4;
+                    let what = format!("qsa pos0={pos0} col {j}");
+                    inv.eq(
+                        &col(&o8.0, j, max_blocks)[..nbk],
+                        &o1.0[..nbk],
+                        &format!("{what} scores"),
+                    );
+                    inv.eq(col(&o8.1, j, QSA_WIDTH), &o1.1, &format!("{what} ids"));
+                    inv.eq(col(&o8.2, j, QSA_OUT), &o1.2, &format!("{what} out"));
+                    inv.eq(
+                        &qact_col(&o8.3, TW, QSA_OUT, j),
+                        &o1.3,
+                        &format!("{what} outq"),
+                    );
+                }
+            }
+        }
+        if !inv.0.is_empty() {
+            // One line per (op, field): the first column that differs.
+            let mut seen = std::collections::BTreeSet::new();
+            let lines: Vec<&String> = inv
+                .0
+                .iter()
+                .filter(|l| seen.insert(l.split(" col ").next().unwrap().to_string()))
+                .collect();
+            panic!(
+                "window-width dependence:\n{}",
+                lines
+                    .iter()
+                    .map(|l| l.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
+    }
+
+    #[test]
+    fn cuda_window_width_invariance() {
+        on_gpu(t_invariance);
     }
 
     #[test]
