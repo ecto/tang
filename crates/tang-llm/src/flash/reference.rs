@@ -611,6 +611,8 @@ pub struct FlashRef {
     /// whether their GEMVs then take int8 activations (the bf16 contract is f32).
     pub hc_fmt: Format,
     pub hc_parts: Vec<String>,
+    /// Per-part formats (`--hc-as down=q5,up=fp8,...`), checked before `hc_fmt`.
+    pub hc_mix: Vec<(String, Format)>,
     pub hc_act_int8: bool,
     /// Write the one-layer-ahead expert prediction study here (see [`lookahead`]).
     pub lookahead: Option<PathBuf>,
@@ -665,6 +667,7 @@ impl FlashRef {
             dense: DensePolicy::f32(),
             act_int8: false,
             hc_fmt: Format::Keep,
+            hc_mix: Vec::new(),
             hc_parts: ["down", "up", "inject", "out"]
                 .iter()
                 .map(|s| s.to_string())
@@ -685,6 +688,14 @@ impl FlashRef {
     pub(crate) fn load(&self, name: &str) -> Result<Mat> {
         let t = self.g.info(name)?;
         if let Some(part) = hc_part(name) {
+            let act = if self.hc_act_int8 {
+                Act::Int8
+            } else {
+                Act::F32
+            };
+            if let Some((_, f)) = self.hc_mix.iter().find(|(p, _)| p == part) {
+                return Mat::from_info(&self.g, t, *f, act);
+            }
             if self.hc_fmt != Format::Keep && self.hc_parts.iter().any(|p| p == part) {
                 let act = if self.hc_act_int8 {
                     Act::Int8
@@ -1618,6 +1629,7 @@ pub fn cli(args: &[String]) -> Result<()> {
     let mut qsa_dense = false;
     let mut act_int8 = false;
     let mut hc_fmt = Format::Keep;
+    let mut hc_mix = Vec::new();
     let mut hc_parts: Vec<String> = ["down", "up", "inject", "out"]
         .iter()
         .map(|s| s.to_string())
@@ -1646,7 +1658,17 @@ pub fn cli(args: &[String]) -> Result<()> {
             "--llama-numerics" => llama_numerics = true,
             "--qsa-dense" => qsa_dense = true,
             "--act-int8" => act_int8 = true,
-            "--hc-as" => hc_fmt = Format::parse_hc(it.next().context("--hc-as FORMAT")?)?,
+            "--hc-as" => {
+                let v = it.next().context("--hc-as FORMAT | part=format,...")?;
+                if v.contains('=') {
+                    for kv in v.split(',') {
+                        let (p, f) = kv.split_once('=').context("--hc-as part=format")?;
+                        hc_mix.push((p.to_string(), Format::parse_hc(f)?));
+                    }
+                } else {
+                    hc_fmt = Format::parse_hc(v)?;
+                }
+            }
             "--hc-parts" => {
                 hc_parts = it
                     .next()
@@ -1675,6 +1697,7 @@ pub fn cli(args: &[String]) -> Result<()> {
     m.qsa_dense = qsa_dense;
     m.act_int8 = act_int8;
     m.hc_fmt = hc_fmt;
+    m.hc_mix = hc_mix;
     m.hc_parts = hc_parts;
     m.hc_act_int8 = hc_act_int8;
     m.lookahead = lookahead;
