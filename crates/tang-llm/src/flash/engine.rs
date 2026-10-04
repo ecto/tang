@@ -456,6 +456,10 @@ pub struct Engine {
     pub last_mtp_ms: f64,
     pub last_commit_ms: f64,
     pub last_mtp_gpu_ms: f64,
+    defer_boundary: bool,
+    pending_boundary: bool,
+    /// A second stream: the MTP draft overlaps the commit.
+    side: Stream,
     /// Run the MTP after every window (keeps its K/V cache complete) and keep its drafts.
     pub use_mtp: bool,
     /// The last MTP pass's chain: (draft, probability) × 3.
@@ -915,6 +919,9 @@ impl Engine {
             last_mtp_ms: 0.0,
             last_commit_ms: 0.0,
             last_mtp_gpu_ms: 0.0,
+            defer_boundary: false,
+            pending_boundary: false,
+            side: Stream::new().map_err(|e| anyhow!("{e}"))?,
             use_mtp: false,
             mtp_last: Vec::new(),
         };
@@ -1637,12 +1644,13 @@ impl Engine {
                 st.gpu_wait_b_ms += (stamps[b + 3] - stamps[b + 2]) as f64 / 1e6;
             }
         }
-        // Cache bookkeeping between windows.
-        if let Experts::Resident(rc) = &mut self.experts {
-            rc.record(&self.keys);
-            st.swaps = rc.boundary(&self.stream).map_err(|e| anyhow!("{e}"))?;
+        // Cache bookkeeping between windows (deferred by `verify` until the MTP and the
+        // commit are launched).
+        if self.defer_boundary {
+            self.pending_boundary = true;
+        } else {
+            st.swaps = self.boundary()?;
         }
-        self.sync_tables()?;
         self.counter = self.counter.wrapping_add(1);
         st.wall_ms = w0.elapsed().as_secs_f64() * 1e3;
         st.post_ms = td.elapsed().as_secs_f64() * 1e3;
@@ -1681,6 +1689,18 @@ impl Engine {
             self.enqueue_commit(t);
         }
         Ok(())
+    }
+
+    /// The cache's between-windows step: record usage, publish table changes, start swaps.
+    fn boundary(&mut self) -> Result<usize> {
+        self.pending_boundary = false;
+        let mut swaps = 0;
+        if let Experts::Resident(rc) = &mut self.experts {
+            rc.record(&self.keys);
+            swaps = rc.boundary(&self.stream).map_err(|e| anyhow!("{e}"))?;
+        }
+        self.sync_tables()?;
+        Ok(swaps)
     }
 
     /// Copy the cache's residency table into the per-layer plan tables where it changed
@@ -1839,6 +1859,9 @@ impl Engine {
         ensure!(t <= MAX_T, "{} drafts", drafts.len());
         self.tokens.push(cur);
         self.tokens.extend_from_slice(drafts);
+        // With a captured MTP graph, the draft runs on a second stream while the commit and the
+        // cache's bookkeeping run on the main one.
+        self.defer_boundary = true;
         let kept = if t == 1 {
             vec![self.window(pos, 1, None)?[0]]
         } else {
@@ -1847,12 +1870,32 @@ impl Engine {
             while n < t && drafts[n - 1] == targets[n - 1] {
                 n += 1;
             }
-            self.commit(t, n)?;
-            self.tokens.truncate(pos + n);
             targets[..n].to_vec()
         };
+        self.defer_boundary = false;
+        let n = kept.len();
         self.last_mtp_ms = 0.0;
-        if self.use_mtp && self.mtp.is_some() {
+        let t0 = Instant::now();
+        let overlap = self.use_mtp && self.use_graphs && self.mtp.as_ref().is_some_and(|m| m.graphs[n].is_some());
+        if overlap {
+            self.mtp_stage(pos, &kept);
+            let ev = gpu::Event::new(false).map_err(|e| anyhow!("{e}"))?;
+            ev.record(&self.stream).map_err(|e| anyhow!("{e}"))?;
+            self.side.wait(&ev).map_err(|e| anyhow!("{e}"))?;
+            self.mtp.as_ref().unwrap().graphs[n].as_ref().unwrap().launch(&self.side).map_err(|e| anyhow!("{e}"))?;
+        }
+        if t > 1 {
+            self.commit(t, n)?;
+            self.tokens.truncate(pos + n);
+        }
+        if self.pending_boundary {
+            self.last.swaps = self.boundary()?;
+        }
+        if overlap {
+            self.side.sync().map_err(|e| anyhow!("{e}"))?;
+            self.mtp_last = self.mtp_read(n);
+            self.last_mtp_ms = t0.elapsed().as_secs_f64() * 1e3;
+        } else if self.use_mtp && self.mtp.is_some() {
             self.mtp_last = self.mtp_draft(pos, &kept)?;
         }
         Ok(kept)
@@ -2558,6 +2601,25 @@ impl Engine {
         Ok(())
     }
 
+    fn mtp_stage(&mut self, pos0: usize, next: &[u32]) {
+        let c = next.len();
+        let tk = self.io.u32s(Io::MTP_IN, MAX_T);
+        tk[..c].copy_from_slice(next);
+        let ctl = self.io.u32s(Io::MTP_IN + 64, 2);
+        ctl[0] = pos0 as u32;
+        ctl[1] = c as u32;
+    }
+
+    fn mtp_read(&self, _c: usize) -> Vec<(u32, f32)> {
+        (0..super::mtp_gpu::STEPS)
+            .map(|step| {
+                let d = self.io.u32s(Io::MTP_OUT + 64 * step, MAX_T)[0];
+                let p = f32::from_bits(self.io.u32s(Io::MTP_OUT + 64 * step + 32, MAX_T)[0]);
+                (d, p)
+            })
+            .collect()
+    }
+
     pub fn has_mtp(&self) -> bool {
         self.mtp.is_some()
     }
@@ -2569,11 +2631,7 @@ impl Engine {
         let c = next.len();
         ensure!((1..=MAX_T).contains(&c) && self.mtp.is_some());
         let t0 = Instant::now();
-        let tk = self.io.u32s(Io::MTP_IN, MAX_T);
-        tk[..c].copy_from_slice(next);
-        let ctl = self.io.u32s(Io::MTP_IN + 64, 2);
-        ctl[0] = pos0 as u32;
-        ctl[1] = c as u32;
+        self.mtp_stage(pos0, next);
         let ready = self.mtp.as_ref().unwrap().graphs[c].is_some();
         if std::env::var("TANG_FLASH_MTP_TIMING").is_ok() {
             self.dev.sync();
@@ -2589,13 +2647,7 @@ impl Engine {
             self.enqueue_mtp(c);
         }
         self.dev.sync();
-        let mut out = Vec::with_capacity(super::mtp_gpu::STEPS);
-        for step in 0..super::mtp_gpu::STEPS {
-            let idx = 0;
-            let d = self.io.u32s(Io::MTP_OUT + 64 * step, MAX_T)[idx];
-            let p = f32::from_bits(self.io.u32s(Io::MTP_OUT + 64 * step + 32, MAX_T)[idx]);
-            out.push((d, p));
-        }
+        let out = self.mtp_read(c);
         self.last_mtp_ms = t0.elapsed().as_secs_f64() * 1e3;
         if self.use_graphs && !ready {
             let stream = ManuallyDrop::new(Stream(self.dev.cu_stream()));

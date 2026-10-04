@@ -72,6 +72,7 @@ fn parse(args: &[String]) -> Result<Args> {
             }
             "--ids-file" => a.ids = read_ids(val()?)?,
             "--prompt" => a.prompt = Some(val()?.clone()),
+            "--prompt-file" => a.prompt = Some(std::fs::read_to_string(val()?)?),
             "-n" => a.n = val()?.parse()?,
             "--max-ctx" => a.opts.max_ctx = val()?.parse()?,
             "--ctx" => a.ctx = Some(val()?.parse()?),
@@ -636,6 +637,12 @@ pub fn bench(args: &[String]) -> Result<()> {
     let (h, r) = e.ngram_stats();
     println!("  n-gram rows        {r} reads, {h} cache hits");
     println!("  first tokens: {}", out.iter().take(16).map(|v| v.to_string()).collect::<Vec<_>>().join(" "));
+    if a.prompt.is_some() && !a.quiet {
+        let g = crate::gguf::Gguf::open(&a.path)?;
+        let t = super::tokenize::FlashTokenizer::from_gguf(&g)?;
+        let text = t.decode(&out)?;
+        println!("  text: {}", text.chars().take(600).collect::<String>().replace('\n', "\\n"));
+    }
     if let Some(p) = &a.out {
         std::fs::write(p, out.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" "))?;
     }
