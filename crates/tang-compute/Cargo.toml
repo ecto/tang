@@ -16,6 +16,11 @@ default = []
 metal = ["dep:metal", "dep:objc"]
 cuda = ["dep:cudarc"]
 
+[[bin]]
+name = "flash-kernel-bench"
+path = "src/bin/flash_kernel_bench.rs"
+required-features = ["cuda"]
+
 [dependencies]
 tang = { workspace = true, features = ["std"] }
 tang-expr = { workspace = true }
