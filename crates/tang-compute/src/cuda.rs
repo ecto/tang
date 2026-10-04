@@ -178,6 +178,14 @@ pub struct CudaComputeDevice {
     llm_funcs: RefCell<HashMap<&'static str, CudaFunction>>,
 }
 
+/// GPU 0's name, free and total memory, without making a device (no stream or cuBLAS handle):
+/// it holds the primary context only while asking. Free memory counts every process's use.
+pub fn cuda_memory_info() -> Result<(String, usize, usize), cudarc::driver::DriverError> {
+    let ctx = CudaContext::new(0)?;
+    let (free, total) = cudarc::driver::result::mem_get_info()?;
+    Ok((ctx.name()?, free, total))
+}
+
 impl CudaComputeDevice {
     /// Create a new CUDA device (ordinal 0), f32 precision.
     pub fn new() -> Result<Self, cudarc::driver::DriverError> {
@@ -1169,6 +1177,10 @@ impl ComputeDevice for CudaComputeDevice {
         cudarc::driver::result::mem_get_info()
             .map(|(free, _)| free)
             .unwrap_or(0)
+    }
+
+    fn device_name(&self) -> String {
+        self.ctx.name().unwrap_or_default()
     }
 
     fn pool_clear(&self) {

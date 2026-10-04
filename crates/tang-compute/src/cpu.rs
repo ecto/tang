@@ -42,6 +42,10 @@ impl ComputeDevice for CpuDevice {
         Dialect::C
     }
 
+    fn device_name(&self) -> String {
+        "cpu".into()
+    }
+
     fn upload(&self, data: &[f32]) -> CpuBuffer {
         CpuBuffer {
             data: data.to_vec(),

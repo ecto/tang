@@ -49,6 +49,11 @@ curl http://<box>:8911/v1/chat/completions -H 'content-type: application/json' \
   -d '{"messages": [{"role": "user", "content": "Hello!"}], "max_tokens": 64}'
 ```
 
+For frog's scheduler the server also has `GET /node` (the GPU, free VRAM, the model and its
+measured rates, the queue, KV blocks), `POST /models/load` / `/models/unload`, which only ever
+load into free VRAM, and an `x-frog-priority: interactive | background` header: see
+[docs/node.md](docs/node.md).
+
 `--device auto` (the default) picks Metal, then CUDA, then the CPU, so `--device cuda` is only
 there to fail loudly if the GPU isn't found.
 

@@ -33,6 +33,11 @@ pub trait ComputeDevice: Send {
         0
     }
 
+    /// The device's name (e.g. "Apple M4 Max", "NVIDIA GeForce RTX 3090"); empty if unknown.
+    fn device_name(&self) -> String {
+        String::new()
+    }
+
     /// Release cached buffers in the device memory pool. No-op on devices
     /// without pooling. Call between long-running phases to prevent
     /// fragmentation-induced OOM.

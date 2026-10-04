@@ -230,6 +230,11 @@ impl<B> Pool<B> {
             .retain(|_, b| self.meta[*b as usize].hash.is_some());
     }
 
+    /// The ids of every sealed block held, in no particular order.
+    pub fn hashes(&self) -> Vec<u64> {
+        self.by_hash.keys().copied().collect()
+    }
+
     /// The id of sealed block `b`.
     pub fn hash(&self, b: u32) -> Option<u64> {
         self.meta[b as usize].hash
