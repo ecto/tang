@@ -865,6 +865,8 @@ fn native(g: &CudaComputeDevice) {
     let mut rng = Rng(0xa11ce);
     println!("native GEMV, GB/s of GGUF bytes T=1 / T=4 (repacked bytes in parentheses)");
     let shapes = [
+        (2560, 16480),
+        (2560, 13952),
         (2560, 10240),
         (2560, 6144),
         (6144, 2560),
@@ -872,10 +874,23 @@ fn native(g: &CudaComputeDevice) {
         (2560, 640),
         (2560, 512),
     ];
+    // FKB_SHAPES="2560x10240,6144x2560" and FKB_TYPES="Q4K,Q3K" narrow the sweep.
+    let env_shapes: Option<Vec<(usize, usize)>> = std::env::var("FKB_SHAPES").ok().map(|v| {
+        v.split(',')
+            .map(|p| {
+                let (k, n) = p.split_once('x').expect("KxN");
+                (k.parse().unwrap(), n.parse().unwrap())
+            })
+            .collect()
+    });
+    let types = std::env::var("FKB_TYPES").unwrap_or_default();
     for ty in ALL {
+        if !types.is_empty() && !types.split(',').any(|t| t == format!("{ty:?}")) {
+            continue;
+        }
         let mut line = format!("{ty:<6?}");
-        let mut sh: Vec<(usize, usize)> = shapes.to_vec();
-        if ty == NatType::Q5K {
+        let mut sh: Vec<(usize, usize)> = env_shapes.clone().unwrap_or_else(|| shapes.to_vec());
+        if ty == NatType::Q5K && env_shapes.is_none() {
             sh.push((2560, 248_320));
         }
         for (k, n) in sh {
@@ -906,8 +921,11 @@ fn native(g: &CudaComputeDevice) {
                     .fold(f32::INFINITY, f32::min);
                 let us = ms as f64 * 1e3 / reps as f64;
                 cell += &format!(" {:.0}", bytes as f64 / (us * 1e3));
+                if env_shapes.is_some() {
+                    cell += &format!("/{us:.1}us");
+                }
                 if t == 4 {
-                    cell += &format!(" ({:.0}, {:.1}us@T1)", rep as f64 / (us * 1e3), 0.0);
+                    cell += &format!(" ({:.0})", rep as f64 / (us * 1e3));
                 }
             }
             line += &cell;

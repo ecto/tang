@@ -7,8 +7,9 @@ pub const NATIVE_CUDA: &str = r#"
 typedef unsigned long long u64;
 
 __device__ __forceinline__ float h2f(unsigned short h) {
-    float f = __uint_as_float(((unsigned int)(h & 0x7fffu)) << 13) * 5.192296858534828e+33f;
-    return (h & 0x8000u) ? -f : f;
+    float f;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h));
+    return f;
 }
 __device__ __forceinline__ float warp_sum(float v) {
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
@@ -27,28 +28,28 @@ __device__ __forceinline__ unsigned int iq4w(unsigned int n) {
 #define HB ((TY == 6 || TY == 13 || TY == 11) ? 4 : (TY == 14 ? 8 : 0))
 #define HAS_MIN (TY == 12 || TY == 13)
 #define PER16 (TY == 11 || TY == 14)
+#ifndef NAT_PF
+#define NAT_PF(T) (T == 1)
+#endif
+#define SPC (TY == 23 ? 1 : ((TY == 11 || TY == 12 || TY == 13 || TY == 14) ? 2 : 0))
 
-// The eight dp4a operands (int8 lanes in activation order) of one chunk.
-__device__ __forceinline__ void operands(const unsigned char* L, const unsigned char* H, int op[8]) {
+
+// The eight dp4a operands (int8 lanes in activation order) of one chunk from its loaded words:
+// low plane l[0..LB/4), extra-bit words h0, h1.
+__device__ __forceinline__ void operands(const unsigned int* l, unsigned int h0, unsigned int h1, int op[8]) {
     if (LB == 16) {
-        uint4 q = *(const uint4*)L;
-        unsigned int w[4] = {q.x, q.y, q.z, q.w};
         #pragma unroll
         for (int i = 0; i < 4; i++) {
-            op[2 * i] = (int)(w[i] & 0x0f0f0f0fu);
-            op[2 * i + 1] = (int)((w[i] >> 4) & 0x0f0f0f0fu);
+            op[2 * i] = (int)(l[i] & 0x0f0f0f0fu);
+            op[2 * i + 1] = (int)((l[i] >> 4) & 0x0f0f0f0fu);
         }
     } else {
-        uint2 q = *(const uint2*)L;
         #pragma unroll
         for (int f = 0; f < 4; f++) {
-            op[f] = (int)((q.x >> (2 * f)) & 0x03030303u);
-            op[4 + f] = (int)((q.y >> (2 * f)) & 0x03030303u);
+            op[f] = (int)((l[0] >> (2 * f)) & 0x03030303u);
+            op[4 + f] = (int)((l[1] >> (2 * f)) & 0x03030303u);
         }
     }
-    unsigned int h0 = 0, h1 = 0;
-    if (HB == 4) h0 = *(const unsigned int*)H;
-    if (HB == 8) { uint2 hh = *(const uint2*)H; h0 = hh.x; h1 = hh.y; }
     #pragma unroll
     for (int j = 0; j < 8; j++) {
         unsigned int v = (unsigned int)op[j];
@@ -67,58 +68,119 @@ __device__ __forceinline__ void operands(const unsigned char* L, const unsigned 
     }
 }
 
-// Scales of chunk c of a row: sc0, sc1 (per half) and the min.
-__device__ __forceinline__ void chunk_scales(const unsigned char* S, unsigned int c, float& sc0, float& sc1, float& mn) {
+// One chunk of one row as loaded: low plane, extra-bit words, scale words. All of a step's loads
+// are issued before any of them is used (and the next step's before this one's math), so a warp
+// keeps two steps of weights in flight instead of waiting on the scale loads after the codes.
+struct Raw { uint4 l; unsigned int h0, h1, s0, s1; };
+
+// A row's planes: low codes, extra bits, scales.
+struct RowP { const unsigned char* l; const unsigned char* h; const unsigned char* s; const unsigned char* d; };
+
+__device__ __forceinline__ Raw load_raw(const RowP& p, unsigned int c) {
+    Raw r;
+    if (LB == 16) r.l = __ldg((const uint4*)p.l + c);
+    else { uint2 l2 = __ldg((const uint2*)p.l + c); r.l = make_uint4(l2.x, l2.y, 0, 0); }
+    r.h0 = r.h1 = 0;
+    if (HB == 4) r.h0 = __ldg((const unsigned int*)p.h + c);
+    if (HB == 8) { uint2 h = __ldg((const uint2*)p.h + c); r.h0 = h.x; r.h1 = h.y; }
+    r.s1 = 0;
+    const unsigned char* S = p.s;
+    if (TY == 2 || TY == 6 || TY == 20) r.s0 = __ldg((const unsigned short*)S + c);
+    else if (TY == 42) r.s0 = __ldg((const unsigned short*)S + c / 2);
+    else {
+        // Super-block types: the chunk's SC entry, then its 256-block's SD word.
+        if (TY == 23) r.s1 = __ldg(S + c);
+        else r.s1 = __ldg((const unsigned short*)S + c);
+        r.s0 = __ldg((const unsigned int*)p.d + c / 8);
+    }
+    return r;
+}
+
+// Scales of chunk c from its scale words: sc0, sc1 (per half) and the min.
+__device__ __forceinline__ void chunk_scales(const Raw& r, unsigned int c, float& sc0, float& sc1, float& mn) {
     mn = 0.0f;
-    if (TY == 2 || TY == 6 || TY == 20) {
-        sc0 = sc1 = h2f(*(const unsigned short*)(S + 2 * c));
-    } else if (TY == 42) {
-        sc0 = sc1 = h2f(*(const unsigned short*)(S + 2 * (c / 2)));
+    if (TY == 2 || TY == 6 || TY == 20 || TY == 42) {
+        sc0 = sc1 = h2f((unsigned short)r.s0);
     } else if (TY == 23) {
-        const unsigned char* hd = S + (c / 8) * 12;
-        sc0 = sc1 = h2f(*(const unsigned short*)hd) * (float)(signed char)hd[4 + c % 8];
+        sc0 = sc1 = h2f((unsigned short)r.s0) * (float)(signed char)r.s1;
     } else if (TY == 11 || TY == 14) {
-        const unsigned char* hd = S + (c / 8) * 20;
-        float d = h2f(*(const unsigned short*)hd);
-        sc0 = d * (float)(signed char)hd[4 + 2 * (c % 8)];
-        sc1 = d * (float)(signed char)hd[5 + 2 * (c % 8)];
+        float d = h2f((unsigned short)r.s0);
+        sc0 = d * (float)(signed char)r.s1;
+        sc1 = d * (float)(signed char)(r.s1 >> 8);
     } else {
-        const unsigned char* hd = S + (c / 8) * 20;
-        sc0 = sc1 = h2f(*(const unsigned short*)hd) * (float)hd[4 + c % 8];
-        mn = h2f(*(const unsigned short*)(hd + 2)) * (float)hd[12 + c % 8];
+        sc0 = sc1 = h2f((unsigned short)r.s0) * (float)(r.s1 & 0xffu);
+        mn = h2f((unsigned short)(r.s0 >> 16)) * (float)(r.s1 >> 8);
     }
 }
 
 // Y[t, o] = W[o] · x̂[t]: GR rows a warp, one 32-weight chunk a lane per step, KS warps
-// splitting K (8 / KS row groups a 256-thread block), as the other multi-column GEMVs.
+// splitting K (8 / KS row groups a 256-thread block), as the other multi-column GEMVs. Blocks
+// stride over the NB row tiles, the grid capped at what is co-resident (no partial last wave).
 template <int T, int GR>
-__device__ __forceinline__ void nat_body(const unsigned int* __restrict__ XQ, const unsigned char* __restrict__ W,
+__device__ __forceinline__ void nat_tile(unsigned int bx, const unsigned int* __restrict__ XQ, const unsigned char* __restrict__ W,
                                          float* __restrict__ Y, unsigned int K, unsigned int N, unsigned int KS,
-                                         u64 hoff, u64 soff) {
-    __shared__ float red[8][GR * T];
-    unsigned int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+                                         u64 hoff, u64 soff, unsigned int LPR, float (*red)[2][GR * T]) {
+    // Each LPR-lane group (a half-warp or the whole warp) takes GR rows; its lanes stride the
+    // chunks. Half-warps when a warp's chunk range is not a whole number of 32-lane steps (K = 2560
+    // is 80 chunks, five 16-lane steps).
+    unsigned int lane = threadIdx.x % LPR, half = (threadIdx.x & 31) / LPR, warp = threadIdx.x >> 5, nh = 32 / LPR;
     unsigned int kw = warp % KS, rg = warp / KS, groups = 8 / KS;
-    unsigned int row0 = (blockIdx.x * groups + rg) * GR;
+    unsigned int row0 = (bx * groups + rg) * nh * GR + half * GR;
     unsigned int nch = K / 32, c0 = kw * nch / KS, c1 = (kw + 1) * nch / KS;
     const unsigned int kb = K / 4;
     const unsigned int* xs = XQ + (u64)T * kb;
     const unsigned int* xh = xs + (u64)T * nch;
-    u64 sbytes = TY == 42 ? K / 64 * 2 : ((TY == 2 || TY == 6 || TY == 20) ? K / 32 * 2 : (TY == 23 ? K / 256 * 12 : K / 256 * 20));
+    u64 sbytes = TY == 42 ? K / 64 * 2 : K / 32 * 2;
     float acc[GR][T];
     #pragma unroll
     for (int r = 0; r < GR; r++)
         #pragma unroll
         for (int t = 0; t < T; t++) acc[r][t] = 0.0f;
     if (row0 < N) {
-        for (unsigned int c = c0 + lane; c < c1; c += 32) {
+        RowP rp[GR];
+        #pragma unroll
+        for (int r = 0; r < GR; r++) {
+            u64 o = min(row0 + r, N - 1);
+            rp[r].l = W + o * nch * LB;
+            rp[r].h = W + hoff + o * nch * HB;
+            if (SPC == 0) {
+                rp[r].s = W + soff + o * sbytes;
+                rp[r].d = rp[r].s;
+            } else {
+                rp[r].s = W + soff + o * nch * SPC;
+                rp[r].d = W + soff + (u64)N * nch * SPC + o * (K / 256) * 4;
+            }
+        }
+        unsigned int cc = c0 + lane;
+        constexpr bool PF = NAT_PF(T);
+        Raw cur[GR];
+        if (PF && cc < c1) {
+            #pragma unroll
+            for (int r = 0; r < GR; r++) cur[r] = load_raw(rp[r], cc);
+        }
+        for (; cc < c1; cc += LPR) {
+            unsigned int cn = cc + LPR;
+            Raw nxt[GR];
+            if (!PF) {
+                #pragma unroll
+                for (int r = 0; r < GR; r++) cur[r] = load_raw(rp[r], cc);
+            } else if (cn < c1) {
+                #pragma unroll
+                for (int r = 0; r < GR; r++) nxt[r] = load_raw(rp[r], cn);
+            }
+            const unsigned int c = cc;
+#ifdef NAT_LOADONLY
+            #pragma unroll
+            for (int r = 0; r < GR; r++)
+                acc[r][0] += __uint_as_float((cur[r].l.x ^ cur[r].l.y ^ cur[r].l.z ^ cur[r].l.w ^ cur[r].h0 ^ cur[r].h1 ^ cur[r].s0 ^ cur[r].s1) & 0x3fffffffu);
+#else
             int op[GR][8];
             float sc0[GR], sc1[GR], mn[GR];
             #pragma unroll
             for (int r = 0; r < GR; r++) {
-                unsigned int o = min(row0 + r, N - 1);
-                u64 ch = (u64)o * nch + c;
-                operands(W + ch * LB, W + hoff + ch * (HB ? HB : 1), op[r]);
-                chunk_scales(W + soff + (u64)o * sbytes, c, sc0[r], sc1[r], mn[r]);
+                unsigned int lw[4] = {cur[r].l.x, cur[r].l.y, cur[r].l.z, cur[r].l.w};
+                operands(lw, cur[r].h0, cur[r].h1, op[r]);
+                chunk_scales(cur[r], c, sc0[r], sc1[r], mn[r]);
             }
             #pragma unroll
             for (int t = 0; t < T; t++) {
@@ -143,36 +205,49 @@ __device__ __forceinline__ void nat_body(const unsigned int* __restrict__ XQ, co
                     acc[r][t] = __fmaf_rn(dx, v, acc[r][t]);
                 }
             }
+#endif
+            #pragma unroll
+            for (int r = 0; r < GR; r++) if (PF) cur[r] = nxt[r];
         }
     }
     #pragma unroll
     for (int r = 0; r < GR; r++)
         #pragma unroll
         for (int t = 0; t < T; t++) {
-            float v = warp_sum(acc[r][t]);
+            float v = acc[r][t];
+            for (unsigned int o = LPR / 2; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
             if (KS == 1) {
                 if (lane == 0 && row0 + r < N) Y[(u64)t * N + row0 + r] = v;
             } else if (lane == 0) {
-                red[warp][r * T + t] = v;
+                red[warp][half][r * T + t] = v;
             }
         }
     if (KS == 1) return;
     __syncthreads();
     unsigned int i = threadIdx.x;
-    if (i < groups * GR * T) {
-        unsigned int g = i / (GR * T), rt = i % (GR * T), r = rt / T, t = rt % T;
-        unsigned int o = (blockIdx.x * groups + g) * GR + r;
+    if (i < groups * nh * GR * T) {
+        unsigned int g = i / (nh * GR * T), hrt = i % (nh * GR * T), hf = hrt / (GR * T), rt = hrt % (GR * T);
+        unsigned int r = rt / T, t = rt % T;
+        unsigned int o = (bx * groups + g) * nh * GR + hf * GR + r;
         float v = 0.0f;
-        for (unsigned int k = 0; k < KS; k++) v += red[g * KS + k][rt];
+        for (unsigned int k = 0; k < KS; k++) v += red[g * KS + k][hf][rt];
         if (o < N) Y[(u64)t * N + o] = v;
     }
 }
 
+#ifndef NAT_GR
+#define NAT_GR(T) (T == 1 ? 2 : 4)
+#endif
 #define NAT(T) \
 extern "C" __global__ void __launch_bounds__(256) fl_nat_t##T( \
     const unsigned int* __restrict__ XQ, const unsigned char* __restrict__ W, float* __restrict__ Y, \
-    unsigned int K, unsigned int N, unsigned int KS, u64 hoff, u64 soff) { \
-    nat_body<T, (T == 1 ? 2 : 4)>(XQ, W, Y, K, N, KS, hoff, soff); \
+    unsigned int K, unsigned int N, unsigned int KS, u64 hoff, u64 soff, unsigned int LPR, unsigned int NB) { \
+    constexpr int GR = NAT_GR(T); \
+    __shared__ float red[8][2][GR * T]; \
+    for (unsigned int bx = blockIdx.x; bx < NB; bx += gridDim.x) { \
+        if (bx != blockIdx.x) __syncthreads(); \
+        nat_tile<T, GR>(bx, XQ, W, Y, K, N, KS, hoff, soff, LPR, red); \
+    } \
 }
 NAT(1) NAT(2) NAT(3) NAT(4) NAT(5) NAT(6) NAT(7) NAT(8)
 "#;
