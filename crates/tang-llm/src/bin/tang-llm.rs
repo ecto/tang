@@ -154,6 +154,14 @@ fn main() -> Result<()> {
     if args.first().map(String::as_str) == Some("serve") {
         return serve(backend, &args[1..]);
     }
+    if cmd == "gguf-info" {
+        let g = tang_llm::gguf::Gguf::open(&dir)?;
+        print!("{}", tang_llm::flash::inventory(&g)?);
+        return Ok(());
+    }
+    if cmd == "flash-ref" {
+        return tang_llm::flash::reference::cli(&args[1..]);
+    }
     if cmd == "sim-spec" {
         return sim_spec(&args[1..]);
     }

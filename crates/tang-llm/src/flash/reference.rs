@@ -1,0 +1,1409 @@
+//! The truth track: a slow, plain f32 CPU forward of Qwen3.8-Flash-Next straight from its GGUF.
+//!
+//! Every fast kernel is checked against this, so it is written for reading, not speed: each block is
+//! the formula in `docs/strata.md` (as corrected in `docs/flash-next-tensors.md`), every weight is
+//! dequantised to f32, every activation stays f32, and reductions that decide discrete things
+//! (router softmax, logprobs) run in f64. The one concession to time is that a whole sequence goes
+//! through a layer at once, so each dense weight is dequantised once per layer, and the matmuls and
+//! independent heads run on rayon.
+//!
+//! What it computes for a token sequence `t[0..T]` starting at position 0:
+//!
+//! ```text
+//! R[c] = embed(t) for the 4 hyper-connection streams
+//! for l in 0..48:
+//!   if l is the PLE layer (1):  R = ple(R)
+//!   x, inj = hc_read(R, hc_attn_*);  R = hc_write(R, gdn(x) or qsa(x), inj)
+//!   x, inj = hc_read(R, hc_ffn_*);   R = hc_write(R, moe(x), inj)
+//! logits = output @ hc_read(R, output_hc_*)
+//! ```
+//!
+//! State is what a decode would carry: GDN conv history (3 × 10240) and recurrent state
+//! (48 × 128 × 128) start at zero; the PLE conv history (9 × 10240) starts at zero; QSA attends over
+//! every earlier cell of the sequence, through the indexer's block selection.
+//!
+//! Routed experts are dequantised lazily, one (layer, expert) at a time, only for the experts some
+//! token picked. N-gram table rows are read with `pread` at their offsets (16 per token).
+
+use crate::gguf::{Gguf, TensorInfo};
+use anyhow::{bail, ensure, Context, Result};
+use rayon::prelude::*;
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+/// `LLAMA_TOKEN_NULL`: a predecessor before the start of the sequence.
+const TOKEN_NULL: i64 = -1;
+
+/// The model geometry, from GGUF metadata (`qwen4exp.*`).
+#[derive(Clone, Debug)]
+pub struct Hparams {
+    pub n_embd: usize,
+    pub n_layer: usize,
+    pub n_vocab: usize,
+    pub eps: f32,
+    /// Hyper-connection streams and bottleneck rank.
+    pub hc: usize,
+    pub hc_lr: usize,
+    // QSA
+    pub n_head: usize,
+    pub n_head_kv: usize,
+    pub head_dim: usize,
+    pub n_rot: usize,
+    pub rope_base: f32,
+    pub rope_sections: [usize; 4],
+    pub idx_heads: usize,
+    pub idx_dim: usize,
+    pub idx_top_k: usize,
+    /// Cells per indexer block (`attention.compress_ratios` of the QSA layers).
+    pub kpool: usize,
+    // GDN
+    pub ssm_d_conv: usize,
+    pub ssm_d_state: usize,
+    pub ssm_k_heads: usize,
+    pub ssm_v_heads: usize,
+    // MoE
+    pub n_expert: usize,
+    pub n_expert_used: usize,
+    pub n_ff_exp: usize,
+    pub expert_weights_scale: f32,
+    /// Per layer: true for recurrent (GDN) mixers, false for QSA.
+    pub is_recurrent: Vec<bool>,
+    pub ple: Option<PleParams>,
+}
+
+/// The n-gram ("PLE") block's constants.
+#[derive(Clone, Debug)]
+pub struct PleParams {
+    pub layer: usize,
+    pub ngram: usize,
+    pub heads_per_ngram: usize,
+    pub conv_kernel: usize,
+    pub eos: i64,
+    pub head_dim: usize,
+    pub multipliers: Vec<u64>,
+    pub head_offsets: Vec<u64>,
+    pub head_vocab: Vec<u64>,
+}
+
+impl PleParams {
+    pub fn n_heads(&self) -> usize {
+        (self.ngram - 1) * self.heads_per_ngram
+    }
+
+    /// The table rows for the token at `i` of `tokens`, exactly as llama.cpp's
+    /// `llm_graph_input_qwen4exp_ple::set_input`: the window is the token and its predecessors
+    /// (newest first); a missing predecessor or an EOS anywhere in it replaces that slot *and every
+    /// older one* with EOS, but the token's own EOS doesn't cut. Head `h` of n-gram `n` takes
+    /// `XOR_j(ctx[j] * mult[j]) % vocab[h] + offset[h]` over the first `n` slots.
+    pub fn rows(&self, tokens: &[u32], i: usize) -> Vec<u64> {
+        let mut ctx = vec![tokens[i] as i64; self.ngram];
+        let mut cut = false;
+        for s in 1..self.ngram {
+            let t = if cut || i < s {
+                TOKEN_NULL
+            } else {
+                tokens[i - s] as i64
+            };
+            cut = cut || t < 0 || t == self.eos;
+            ctx[s] = if cut { self.eos } else { t };
+        }
+        let mut out = Vec::with_capacity(self.n_heads());
+        for n in 2..=self.ngram {
+            let mixed = ctx[..n]
+                .iter()
+                .zip(&self.multipliers)
+                .map(|(&c, &m)| (c as u64).wrapping_mul(m))
+                .fold(0u64, |acc, v| acc ^ v);
+            for g in 0..self.heads_per_ngram {
+                let h = (n - 2) * self.heads_per_ngram + g;
+                out.push(mixed % self.head_vocab[h] + self.head_offsets[h]);
+            }
+        }
+        out
+    }
+}
+
+impl Hparams {
+    pub fn from_gguf(g: &Gguf) -> Result<Self> {
+        let arch = g.meta_str("general.architecture")?;
+        ensure!(arch == "qwen4exp", "architecture {arch}, want qwen4exp");
+        let k = |s: &str| format!("qwen4exp.{s}");
+        let u = |s: &str| g.meta_u64(&k(s)).map(|v| v as usize);
+        let n_layer = u("block_count")?;
+        let n_embd = u("embedding_length")?;
+        let n_vocab = g.info("token_embd.weight")?.dims[1] as usize;
+        let eps = g.meta_f64(&k("attention.layer_norm_rms_epsilon"))? as f32;
+
+        let ratios = g.meta_u64s(&k("attention.compress_ratios"))?;
+        let ratios: Vec<u64> = if ratios.len() == 1 {
+            vec![ratios[0]; n_layer]
+        } else {
+            ratios
+        };
+        ensure!(
+            ratios.len() >= n_layer,
+            "compress_ratios has {} entries",
+            ratios.len()
+        );
+        let mut kpool = 0;
+        for &r in &ratios[..n_layer] {
+            if r != 0 {
+                ensure!(
+                    kpool == 0 || kpool == r as usize,
+                    "QSA layers with different compress ratios"
+                );
+                kpool = r as usize;
+            }
+        }
+        let is_recurrent: Vec<bool> = match g.meta.get(&k("attention.recurrent_layers")) {
+            Some(v) => {
+                let a = v
+                    .as_array()
+                    .context("attention.recurrent_layers is not an array")?;
+                a.iter()
+                    .take(n_layer)
+                    .map(|x| x.as_u64().unwrap_or(0) != 0)
+                    .collect()
+            }
+            None => {
+                let every = g
+                    .meta
+                    .get(&k("full_attention_interval"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(4) as usize;
+                ensure!(every > 0, "full_attention_interval is 0");
+                (0..n_layer).map(|i| (i + 1) % every != 0).collect()
+            }
+        };
+        for (i, &r) in is_recurrent.iter().enumerate() {
+            ensure!(r || ratios[i] > 0, "layer {i} is full attention without a compress ratio (dense attention isn't implemented)");
+        }
+        let secs = g.meta_u64s(&k("rope.dimension_sections"))?;
+        let mut rope_sections = [0usize; 4];
+        for (i, s) in secs.iter().take(4).enumerate() {
+            rope_sections[i] = *s as usize;
+        }
+
+        let ple = match g.meta.get(&k("ple.layers")) {
+            Some(v) => {
+                let layers = v.as_array().context("ple.layers")?;
+                ensure!(
+                    layers.len() == 1,
+                    "{} PLE layers (one is supported)",
+                    layers.len()
+                );
+                let layer = layers[0].as_u64().context("ple.layers")? as usize;
+                ensure!(
+                    layer < n_layer && is_recurrent[layer],
+                    "PLE layer {layer} must be a GDN layer"
+                );
+                let p = PleParams {
+                    layer,
+                    ngram: u("ple.ngram_size")?,
+                    heads_per_ngram: u("ple.heads_per_ngram")?,
+                    conv_kernel: u("ple.conv_kernel")?,
+                    eos: g.meta_u64(&k("ple.eos_token_id"))? as i64,
+                    head_dim: u("embedding_length_per_layer_input")?,
+                    multipliers: g.meta_u64s(&k("ple.layer_multipliers"))?,
+                    head_offsets: g.meta_u64s(&k("ple.head_offsets"))?,
+                    head_vocab: g.meta_u64s(&k("ple.head_vocab_sizes"))?,
+                };
+                ensure!(
+                    p.ngram >= 2 && p.multipliers.len() >= p.ngram,
+                    "PLE n-gram constants"
+                );
+                ensure!(
+                    p.head_offsets.len() >= p.n_heads() && p.head_vocab.len() >= p.n_heads(),
+                    "PLE head constants"
+                );
+                ensure!(
+                    p.n_heads() * p.head_dim == n_embd,
+                    "PLE heads × head_dim != n_embd"
+                );
+                Some(p)
+            }
+            None => None,
+        };
+
+        Ok(Self {
+            n_embd,
+            n_layer,
+            n_vocab,
+            eps,
+            hc: u("hyper_connection.count")?,
+            hc_lr: u("hyper_connection.low_rank")?,
+            n_head: u("attention.head_count")?,
+            n_head_kv: u("attention.head_count_kv")?,
+            head_dim: u("attention.key_length")?,
+            n_rot: u("rope.dimension_count")?,
+            rope_base: g.meta_f64(&k("rope.freq_base"))? as f32,
+            rope_sections,
+            idx_heads: u("attention.indexer.head_count")?,
+            idx_dim: u("attention.indexer.key_length")?,
+            idx_top_k: u("attention.indexer.top_k")?,
+            kpool,
+            ssm_d_conv: u("ssm.conv_kernel")?,
+            ssm_d_state: u("ssm.state_size")?,
+            ssm_k_heads: u("ssm.group_count")?,
+            ssm_v_heads: u("ssm.time_step_rank")?,
+            n_expert: u("expert_count")?,
+            n_expert_used: u("expert_used_count")?,
+            n_ff_exp: u("expert_feed_forward_length")?,
+            expert_weights_scale: g
+                .meta
+                .get(&k("expert_weights_scale"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0) as f32,
+            is_recurrent,
+            ple,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Small numeric pieces
+// ---------------------------------------------------------------------------------------------
+
+/// A dequantised `y = W x` matrix: `rows` outputs, each `cols` contiguous inputs.
+pub struct Mat {
+    pub rows: usize,
+    pub cols: usize,
+    pub data: Vec<f32>,
+}
+
+impl Mat {
+    fn from_info(g: &Gguf, t: &TensorInfo) -> Result<Self> {
+        ensure!(t.dims.len() <= 2, "{}: not a matrix ({:?})", t.name, t.dims);
+        let cols = t.dims[0] as usize;
+        let rows = if t.dims.len() == 2 {
+            t.dims[1] as usize
+        } else {
+            1
+        };
+        Ok(Self {
+            rows,
+            cols,
+            data: g.dequantize(t)?,
+        })
+    }
+
+    fn load(g: &Gguf, name: &str) -> Result<Self> {
+        Self::from_info(g, g.info(name)?)
+    }
+
+    fn row(&self, r: usize) -> &[f32] {
+        &self.data[r * self.cols..(r + 1) * self.cols]
+    }
+
+    /// `Y[t] = W X[t]` for `n` inputs packed `X[t * cols ..]`; output `Y[t * rows ..]`.
+    /// Parallel over blocks of output rows unless `serial`; the result doesn't depend on which.
+    pub fn apply(&self, x: &[f32], n: usize, serial: bool) -> Vec<f32> {
+        assert_eq!(x.len(), n * self.cols, "matmul input");
+        // Tile: a block of output rows against a block of inputs, so both stay in cache.
+        const RB: usize = 16;
+        const TB: usize = 32;
+        let work = |r0: usize, out: &mut [f32]| {
+            // `out` holds rows r0..r0+RB of every input, stored [input][RB]
+            let r1 = (r0 + RB).min(self.rows);
+            for t0 in (0..n).step_by(TB) {
+                let t1 = (t0 + TB).min(n);
+                for r in r0..r1 {
+                    let w = self.row(r);
+                    for t in t0..t1 {
+                        out[t * RB + (r - r0)] = dot(w, &x[t * self.cols..(t + 1) * self.cols]);
+                    }
+                }
+            }
+        };
+        let blocks = self.rows.div_ceil(RB);
+        let mut tmp = vec![0f32; blocks * n * RB];
+        if serial {
+            for (b, out) in tmp.chunks_mut(n * RB).enumerate() {
+                work(b * RB, out);
+            }
+        } else {
+            tmp.par_chunks_mut(n * RB)
+                .enumerate()
+                .for_each(|(b, out)| work(b * RB, out));
+        }
+        let mut y = vec![0f32; n * self.rows];
+        for (b, out) in tmp.chunks(n * RB).enumerate() {
+            let r0 = b * RB;
+            let r1 = (r0 + RB).min(self.rows);
+            for t in 0..n {
+                y[t * self.rows + r0..t * self.rows + r1]
+                    .copy_from_slice(&out[t * RB..t * RB + (r1 - r0)]);
+            }
+        }
+        y
+    }
+}
+
+/// f32 dot product with eight independent accumulators (the order is fixed, so it's
+/// deterministic run to run).
+#[inline]
+pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut acc = [0f32; 8];
+    let (ca, ra) = a.as_chunks::<8>();
+    let (cb, rb) = b.as_chunks::<8>();
+    for (x, y) in ca.iter().zip(cb) {
+        for i in 0..8 {
+            acc[i] += x[i] * y[i];
+        }
+    }
+    let mut s = ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7]));
+    for (x, y) in ra.iter().zip(rb) {
+        s += x * y;
+    }
+    s
+}
+
+#[inline]
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+#[inline]
+fn silu(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
+/// ggml's softplus: `log(1 + e^x)`, passed through above 20.
+#[inline]
+fn softplus(x: f32) -> f32 {
+    if x > 20.0 {
+        x
+    } else {
+        (1.0 + x.exp()).ln()
+    }
+}
+
+/// `1 / sqrt(mean(x²) + eps)`, the sum in f64 as ggml does.
+fn inv_rms(x: &[f32], eps: f32) -> f32 {
+    let s: f64 = x.iter().map(|&v| (v as f64) * (v as f64)).sum();
+    1.0 / ((s / x.len() as f64) as f32 + eps).sqrt()
+}
+
+/// In place: `x = x / rms(x) * w`.
+fn rms_norm_mul(x: &mut [f32], w: &[f32], eps: f32) {
+    let s = inv_rms(x, eps);
+    for (v, g) in x.iter_mut().zip(w) {
+        *v = *v * s * g;
+    }
+}
+
+/// In place: `x / sqrt(Σx² + eps)` — the GDN q/k norm, eps on the *squared* norm.
+fn l2_norm(x: &mut [f32], eps: f32) {
+    let s: f64 = x.iter().map(|&v| (v as f64) * (v as f64)).sum();
+    let r = 1.0 / ((s as f32) + eps).sqrt();
+    for v in x {
+        *v *= r;
+    }
+}
+
+/// NeoX rope on the first `n_rot` dims of one head (pairs `i`, `i + n_rot/2`), at `pos`.
+/// The model's rope is interleaved M-RoPE with sections [11, 11, 10, 0]; for text every section
+/// gets the same position, so it is exactly this.
+fn rope_neox(x: &mut [f32], pos: usize, n_rot: usize, base: f32) {
+    let half = n_rot / 2;
+    for i in 0..half {
+        let theta = pos as f32 * base.powf(-2.0 * i as f32 / n_rot as f32);
+        let (s, c) = theta.sin_cos();
+        let (a, b) = (x[i], x[i + half]);
+        x[i] = a * c - b * s;
+        x[i + half] = a * s + b * c;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The model
+// ---------------------------------------------------------------------------------------------
+
+/// Intermediate tensors of the last position, as raw little-endian files plus `index.json`.
+pub struct Dump {
+    dir: PathBuf,
+    entries: Vec<serde_json::Value>,
+}
+
+impl Dump {
+    pub fn new(dir: &Path) -> Result<Self> {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            entries: Vec::new(),
+        })
+    }
+
+    fn f32(&mut self, name: &str, shape: &[usize], v: &[f32]) -> Result<()> {
+        ensure!(
+            shape.iter().product::<usize>() == v.len(),
+            "{name}: shape {shape:?} vs {} values",
+            v.len()
+        );
+        let file = format!("{name}.f32");
+        let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        std::fs::write(self.dir.join(&file), bytes)?;
+        self.entries
+            .push(serde_json::json!({"name": name, "file": file, "dtype": "f32", "shape": shape}));
+        Ok(())
+    }
+
+    fn u32(&mut self, name: &str, v: &[u32]) -> Result<()> {
+        let file = format!("{name}.u32");
+        let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        std::fs::write(self.dir.join(&file), bytes)?;
+        self.entries.push(
+            serde_json::json!({"name": name, "file": file, "dtype": "u32", "shape": [v.len()]}),
+        );
+        Ok(())
+    }
+
+    fn finish(&self, tokens: &[u32], position: usize) -> Result<()> {
+        let idx = serde_json::json!({
+            "model": "qwen4exp",
+            "position": position,
+            "tokens": tokens,
+            "layout": "little-endian raw arrays; residual streams are [hc=4][n_embd=2560], stream-major",
+            "tensors": self.entries,
+        });
+        std::fs::write(
+            self.dir.join("index.json"),
+            serde_json::to_string_pretty(&idx)?,
+        )?;
+        Ok(())
+    }
+}
+
+/// The reference model: an open GGUF and its geometry. Weights are dequantised as each layer
+/// runs and dropped after.
+pub struct FlashRef {
+    pub g: Gguf,
+    pub hp: Hparams,
+    /// Print per-layer timings to stderr.
+    pub verbose: bool,
+}
+
+/// One position's top-k next-token log-probabilities.
+pub struct TopK {
+    pub pos: usize,
+    pub top: Vec<(u32, f64)>,
+}
+
+impl FlashRef {
+    pub fn open(path: &Path) -> Result<Self> {
+        let g = Gguf::open(path)?;
+        let hp = Hparams::from_gguf(&g)?;
+        Ok(Self {
+            g,
+            hp,
+            verbose: false,
+        })
+    }
+
+    fn t(&self, l: usize, name: &str) -> String {
+        format!("blk.{l}.{name}")
+    }
+
+    fn mat(&self, l: usize, name: &str) -> Result<Mat> {
+        Mat::load(&self.g, &self.t(l, name))
+    }
+
+    fn vec(&self, name: &str) -> Result<Vec<f32>> {
+        self.g.tensor_f32(name)
+    }
+
+    /// Run `tokens` (positions 0..T) and return the top-`k` next-token logprobs for each position
+    /// in `out_from..T`. With `dump`, intermediate tensors of the last position are written.
+    pub fn forward(
+        &self,
+        tokens: &[u32],
+        out_from: usize,
+        k: usize,
+        mut dump: Option<&mut Dump>,
+    ) -> Result<Vec<TopK>> {
+        let hp = &self.hp;
+        let (n, hc, t_len) = (hp.n_embd, hp.hc, tokens.len());
+        ensure!(t_len > 0, "no tokens");
+        ensure!(out_from < t_len, "no output positions");
+        let last = t_len - 1;
+        let start = Instant::now();
+
+        // ---- embedding, copied into every stream
+        let embd = self.g.info("token_embd.weight")?;
+        let mut r = vec![0f32; t_len * hc * n];
+        for (t, &tok) in tokens.iter().enumerate() {
+            ensure!((tok as usize) < hp.n_vocab, "token {tok} out of range");
+            let e = self.g.rows(embd, tok as usize, 1)?;
+            for c in 0..hc {
+                r[(t * hc + c) * n..(t * hc + c + 1) * n].copy_from_slice(&e);
+            }
+            if t == last {
+                if let Some(d) = dump.as_deref_mut() {
+                    d.f32("embd", &[n], &e)?;
+                }
+            }
+        }
+
+        for l in 0..hp.n_layer {
+            let lt = Instant::now();
+            if hp.ple.as_ref().is_some_and(|p| p.layer == l) {
+                self.ple_block(l, tokens, &mut r, dump.as_deref_mut())?;
+            }
+            let (x, inj) = self.hc_read(&r, t_len, &self.t(l, "hc_attn_"), true)?;
+            let y = if hp.is_recurrent[l] {
+                self.gdn(l, &x, t_len, dump.as_deref_mut())?
+            } else {
+                self.qsa(l, &x, t_len, dump.as_deref_mut())?
+            };
+            hc_write(&mut r, &y, &inj, t_len, hc, n);
+            if let Some(d) = dump.as_deref_mut() {
+                d.f32(
+                    &format!("L{l:02}.mixer_out"),
+                    &[n],
+                    &y[last * n..(last + 1) * n],
+                )?;
+                d.f32(
+                    &format!("L{l:02}.post_mixer"),
+                    &[hc, n],
+                    &r[last * hc * n..(last + 1) * hc * n],
+                )?;
+            }
+            let (x, inj) = self.hc_read(&r, t_len, &self.t(l, "hc_ffn_"), true)?;
+            let y = self.moe(l, &x, t_len, dump.as_deref_mut())?;
+            hc_write(&mut r, &y, &inj, t_len, hc, n);
+            if let Some(d) = dump.as_deref_mut() {
+                d.f32(
+                    &format!("L{l:02}.moe_out"),
+                    &[n],
+                    &y[last * n..(last + 1) * n],
+                )?;
+                d.f32(
+                    &format!("L{l:02}.post_moe"),
+                    &[hc, n],
+                    &r[last * hc * n..(last + 1) * hc * n],
+                )?;
+            }
+            if self.verbose {
+                eprintln!(
+                    "layer {l:2} {} {:6.1}s (total {:6.1}s)",
+                    if hp.is_recurrent[l] { "gdn" } else { "qsa" },
+                    lt.elapsed().as_secs_f64(),
+                    start.elapsed().as_secs_f64()
+                );
+            }
+        }
+
+        // ---- head: the final hyper-connection read is the output norm
+        let rows: Vec<f32> = r[out_from * hc * n..].to_vec();
+        let n_out = t_len - out_from;
+        let (x, _) = self.hc_read(&rows, n_out, "output_hc_", false)?;
+        let head = Mat::load(&self.g, "output.weight")?;
+        ensure!(head.cols == n, "output.weight is {} wide", head.cols);
+        let mut tops = Vec::with_capacity(n_out);
+        // a few positions at a time, so T × 248k logits never live at once
+        for c0 in (0..n_out).step_by(64) {
+            let c1 = (c0 + 64).min(n_out);
+            let logits = head.apply(&x[c0 * n..c1 * n], c1 - c0, false);
+            for (j, lg) in logits.chunks(head.rows).enumerate() {
+                let pos = out_from + c0 + j;
+                tops.push(TopK {
+                    pos,
+                    top: top_logprobs(lg, k),
+                });
+                if pos == last {
+                    if let Some(d) = dump.as_deref_mut() {
+                        d.f32("final_x", &[n], &x[(c0 + j) * n..(c0 + j + 1) * n])?;
+                        d.f32("logits", &[lg.len()], lg)?;
+                    }
+                }
+            }
+        }
+        if let Some(d) = dump {
+            d.finish(tokens, last)?;
+        }
+        if self.verbose {
+            eprintln!(
+                "forward of {t_len} tokens: {:.1}s",
+                start.elapsed().as_secs_f64()
+            );
+        }
+        Ok(tops)
+    }
+
+    /// `build_hc_mix`: collapse the 4 streams to the one vector a block reads, and (when `inject`)
+    /// the per-stream write-back logits.
+    ///
+    /// `xn[c] = rmsnorm(R[c]) * w_norm[c]` (w stored as 1 + w); `gate = sigmoid(up @ silu(down @ xn / hc))`;
+    /// `x = mean_c(xn[c] * gate[c])`; `inj = inject @ xn`.
+    fn hc_read(
+        &self,
+        r: &[f32],
+        t_len: usize,
+        prefix: &str,
+        inject: bool,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let (n, hc, eps) = (self.hp.n_embd, self.hp.hc, self.hp.eps);
+        let w_norm = self.vec(&format!("{prefix}norm.weight"))?;
+        let down = Mat::load(&self.g, &format!("{prefix}down.weight"))?;
+        let up = Mat::load(&self.g, &format!("{prefix}up.weight"))?;
+        ensure!(
+            w_norm.len() == hc * n && down.cols == hc * n && up.rows == hc * n,
+            "{prefix}: hc shapes"
+        );
+        let mut xn = r.to_vec();
+        xn.par_chunks_mut(n).enumerate().for_each(|(i, s)| {
+            let c = i % hc;
+            rms_norm_mul(s, &w_norm[c * n..(c + 1) * n], eps);
+        });
+        let mut lo = down.apply(&xn, t_len, false);
+        for v in &mut lo {
+            *v = silu(*v / hc as f32);
+        }
+        let gate = up.apply(&lo, t_len, false);
+        let mut x = vec![0f32; t_len * n];
+        for t in 0..t_len {
+            for c in 0..hc {
+                let base = (t * hc + c) * n;
+                for i in 0..n {
+                    x[t * n + i] += xn[base + i] * sigmoid(gate[base + i]);
+                }
+            }
+            for v in &mut x[t * n..(t + 1) * n] {
+                *v /= hc as f32;
+            }
+        }
+        let inj = if inject {
+            let w = Mat::load(&self.g, &format!("{prefix}inject.weight"))?;
+            ensure!(
+                w.rows == hc && w.cols == hc * n,
+                "{prefix}inject: {}×{}",
+                w.rows,
+                w.cols
+            );
+            w.apply(&xn, t_len, false)
+        } else {
+            Vec::new()
+        };
+        Ok((x, inj))
+    }
+
+    /// Gated DeltaNet over the whole sequence from zero state.
+    fn gdn(&self, l: usize, x: &[f32], t_len: usize, dump: Option<&mut Dump>) -> Result<Vec<f32>> {
+        let hp = &self.hp;
+        let (s, hk, hv, eps) = (hp.ssm_d_state, hp.ssm_k_heads, hp.ssm_v_heads, hp.eps);
+        let kd = s * hk;
+        let ch = 2 * kd + s * hv;
+        let d_conv = hp.ssm_d_conv;
+        let w_qkv = self.mat(l, "attn_qkv.weight")?;
+        let w_z = self.mat(l, "attn_gate.weight")?;
+        let w_a = self.mat(l, "ssm_alpha.weight")?;
+        let w_b = self.mat(l, "ssm_beta.weight")?;
+        let conv = self.vec(&self.t(l, "ssm_conv1d.weight"))?; // [d_conv, ch]: tap i of channel c at c*d_conv + i
+        let dt = self.vec(&self.t(l, "ssm_dt.bias"))?;
+        let a = self.vec(&self.t(l, "ssm_a"))?; // already -exp(A_log)
+        let norm = self.vec(&self.t(l, "ssm_norm.weight"))?;
+        ensure!(
+            w_qkv.rows == ch && conv.len() == ch * d_conv && norm.len() == s,
+            "blk.{l} GDN shapes"
+        );
+
+        let qkv = w_qkv.apply(x, t_len, false);
+        let z = w_z.apply(x, t_len, false);
+        let alpha = w_a.apply(x, t_len, false);
+        let beta = w_b.apply(x, t_len, false);
+
+        // causal conv over [3 zero columns | qkv] (tap 0 is the oldest), SiLU on all channels
+        let cols: Vec<Vec<f32>> = (0..ch)
+            .into_par_iter()
+            .map(|c| {
+                let w = &conv[c * d_conv..(c + 1) * d_conv];
+                (0..t_len)
+                    .map(|t| {
+                        let mut acc = 0f32;
+                        for (i, wi) in w.iter().enumerate() {
+                            let back = d_conv - 1 - i;
+                            if t >= back {
+                                acc += qkv[(t - back) * ch + c] * wi;
+                            }
+                        }
+                        silu(acc)
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut h = vec![0f32; t_len * ch];
+        for (c, col) in cols.into_iter().enumerate() {
+            for (t, v) in col.into_iter().enumerate() {
+                h[t * ch + c] = v;
+            }
+        }
+        // q, k L2-normed per head; q also / sqrt(S)
+        let qscale = 1.0 / (s as f32).sqrt();
+        h.par_chunks_mut(ch).for_each(|row| {
+            for head in 0..2 * hk {
+                l2_norm(&mut row[head * s..(head + 1) * s], eps);
+            }
+            for v in &mut row[..kd] {
+                *v *= qscale;
+            }
+        });
+
+        // the recurrence, one value head at a time (heads are independent)
+        let results: Vec<(Vec<f32>, f32)> = (0..hv)
+            .into_par_iter()
+            .map(|vh| {
+                let kh = vh % hk; // GGUF order: v head h reads k head h % 16
+                let mut st = vec![0f32; s * s]; // st[a * s + b]: a = key dim, b = value dim
+                let mut o = vec![0f32; t_len * s];
+                let mut sk = vec![0f32; s];
+                for t in 0..t_len {
+                    let row = &h[t * ch..(t + 1) * ch];
+                    let q = &row[kh * s..(kh + 1) * s];
+                    let k = &row[kd + kh * s..kd + (kh + 1) * s];
+                    let v = &row[2 * kd + vh * s..2 * kd + (vh + 1) * s];
+                    let g = softplus(alpha[t * hv + vh] + dt[vh]) * a[vh];
+                    let decay = g.exp();
+                    let b = sigmoid(beta[t * hv + vh]);
+                    // decay first, then the delta update, then read the updated state
+                    for e in st.iter_mut() {
+                        *e *= decay;
+                    }
+                    sk.iter_mut().for_each(|e| *e = 0.0);
+                    for (ai, &ka) in k.iter().enumerate() {
+                        for (acc, &sv) in sk.iter_mut().zip(&st[ai * s..(ai + 1) * s]) {
+                            *acc += sv * ka;
+                        }
+                    }
+                    let d: Vec<f32> = v.iter().zip(&sk).map(|(&vv, &kk)| (vv - kk) * b).collect();
+                    for (ai, &ka) in k.iter().enumerate() {
+                        for (sv, &dv) in st[ai * s..(ai + 1) * s].iter_mut().zip(&d) {
+                            *sv += ka * dv;
+                        }
+                    }
+                    let ot = &mut o[t * s..(t + 1) * s];
+                    for (ai, &qa) in q.iter().enumerate() {
+                        for (acc, &sv) in ot.iter_mut().zip(&st[ai * s..(ai + 1) * s]) {
+                            *acc += sv * qa;
+                        }
+                    }
+                }
+                let norm2: f64 = st.iter().map(|&e| (e as f64) * (e as f64)).sum();
+                (o, norm2.sqrt() as f32)
+            })
+            .collect();
+
+        // y = rmsnorm(o) * ssm_norm * sigmoid(z), per head
+        let vd = s * hv;
+        let mut y = vec![0f32; t_len * vd];
+        for (vh, (o, _)) in results.iter().enumerate() {
+            for t in 0..t_len {
+                let dst = &mut y[t * vd + vh * s..t * vd + (vh + 1) * s];
+                dst.copy_from_slice(&o[t * s..(t + 1) * s]);
+                rms_norm_mul(dst, &norm, eps);
+                for (j, v) in dst.iter_mut().enumerate() {
+                    *v *= sigmoid(z[t * vd + vh * s + j]);
+                }
+            }
+        }
+        if let Some(d) = dump {
+            let norms: Vec<f32> = results.iter().map(|(_, nn)| *nn).collect();
+            d.f32(&format!("L{l:02}.gdn_state_norm"), &[hv], &norms)?;
+        }
+        let w_o = self.mat(l, "ssm_out.weight")?;
+        Ok(w_o.apply(&y, t_len, false))
+    }
+
+    /// QSA: gated GQA over the cells the indexer selects (all of them until a token sees more
+    /// than `top_k / kpool` complete blocks), causal, positions 0..T.
+    fn qsa(&self, l: usize, x: &[f32], t_len: usize, dump: Option<&mut Dump>) -> Result<Vec<f32>> {
+        let hp = &self.hp;
+        let (nh, nkv, hd, eps) = (hp.n_head, hp.n_head_kv, hp.head_dim, hp.eps);
+        let (ih, idd, kp) = (hp.idx_heads, hp.idx_dim, hp.kpool);
+        let (n_rot, base) = (hp.n_rot, hp.rope_base);
+        let q_full = self.mat(l, "attn_q.weight")?.apply(x, t_len, false); // [T][nh][q hd | gate hd]
+        let mut kc = self.mat(l, "attn_k.weight")?.apply(x, t_len, false); // [T][nkv][hd]
+        let vc = self.mat(l, "attn_v.weight")?.apply(x, t_len, false);
+        let k_raw = self.mat(l, "indexer.k_proj.weight")?.apply(x, t_len, false); // [T][idd]
+        let mut qi = self.mat(l, "indexer.q_proj.weight")?.apply(x, t_len, false); // [T][ih][idd]
+        let qn = self.vec(&self.t(l, "attn_q_norm.weight"))?;
+        let kn = self.vec(&self.t(l, "attn_k_norm.weight"))?;
+        let iqn = self.vec(&self.t(l, "indexer.q_norm.weight"))?;
+        let ikn = self.vec(&self.t(l, "indexer.k_norm.weight"))?;
+        ensure!(
+            q_full.len() == t_len * nh * 2 * hd && kc.len() == t_len * nkv * hd,
+            "blk.{l} QSA shapes"
+        );
+        ensure!(
+            qi.len() == t_len * ih * idd && k_raw.len() == t_len * idd,
+            "blk.{l} indexer shapes"
+        );
+
+        // q is the first half of each head's [q | gate]; q, k: rmsnorm * w then rope
+        let mut q = vec![0f32; t_len * nh * hd];
+        let mut gate = vec![0f32; t_len * nh * hd];
+        for t in 0..t_len {
+            for h in 0..nh {
+                let src = &q_full[(t * nh + h) * 2 * hd..(t * nh + h + 1) * 2 * hd];
+                let dq = &mut q[(t * nh + h) * hd..(t * nh + h + 1) * hd];
+                dq.copy_from_slice(&src[..hd]);
+                rms_norm_mul(dq, &qn, eps);
+                rope_neox(dq, t, n_rot, base);
+                gate[(t * nh + h) * hd..(t * nh + h + 1) * hd].copy_from_slice(&src[hd..]);
+            }
+            for g in 0..nkv {
+                let dk = &mut kc[(t * nkv + g) * hd..(t * nkv + g + 1) * hd];
+                rms_norm_mul(dk, &kn, eps);
+                rope_neox(dk, t, n_rot, base);
+            }
+            for h in 0..ih {
+                let d = &mut qi[(t * ih + h) * idd..(t * ih + h + 1) * idd];
+                rms_norm_mul(d, &iqn, eps);
+                rope_neox(d, t, n_rot, base);
+            }
+        }
+        // pooled indexer keys: mean of the block's raw keys, *then* norm, then rope at its first cell
+        let n_blocks = t_len / kp;
+        let mut pooled = vec![0f32; n_blocks * idd];
+        for b in 0..n_blocks {
+            let p = &mut pooled[b * idd..(b + 1) * idd];
+            for j in 0..kp {
+                for (o, v) in p
+                    .iter_mut()
+                    .zip(&k_raw[(b * kp + j) * idd..(b * kp + j + 1) * idd])
+                {
+                    *o += v;
+                }
+            }
+            for o in p.iter_mut() {
+                *o /= kp as f32;
+            }
+            rms_norm_mul(p, &ikn, eps);
+            rope_neox(p, b * kp, n_rot, base);
+        }
+
+        let max_blocks = hp.idx_top_k / kp;
+        let iscale = 1.0 / (idd as f32).sqrt();
+        let kq_scale = 1.0 / (hd as f32).sqrt();
+        let group = nh / nkv;
+        let last = t_len - 1;
+        let per_token: Vec<(Vec<f32>, Option<Vec<u32>>)> = (0..t_len)
+            .into_par_iter()
+            .map(|t| {
+                // the blocks complete at this token, then the tail cells after them (itself included)
+                let nv = (t + 1) / kp;
+                let mut blocks: Vec<usize> = (0..nv).collect();
+                if nv > max_blocks {
+                    // score = Σ_heads relu(q_h · pooled_b) / sqrt(idx_dim)
+                    let qt = &qi[t * ih * idd..(t + 1) * ih * idd];
+                    let scores: Vec<f32> = (0..nv)
+                        .map(|b| {
+                            let kb = &pooled[b * idd..(b + 1) * idd];
+                            (0..ih)
+                                .map(|h| dot(&qt[h * idd..(h + 1) * idd], kb).max(0.0) * iscale)
+                                .sum()
+                        })
+                        .collect();
+                    // highest first; ties to the lower block (ggml's top_k leaves ties unspecified)
+                    blocks.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
+                    blocks.truncate(max_blocks);
+                    blocks.sort_unstable();
+                }
+                let mut cells: Vec<usize> =
+                    blocks.iter().flat_map(|&b| b * kp..(b + 1) * kp).collect();
+                cells.extend(nv * kp..=t);
+                let mut out = vec![0f32; nh * hd];
+                let mut w = vec![0f32; cells.len()];
+                for h in 0..nh {
+                    let g = h / group; // kv head = q head / 12
+                    let qh = &q[(t * nh + h) * hd..(t * nh + h + 1) * hd];
+                    let mut mx = f32::NEG_INFINITY;
+                    for (j, &c) in cells.iter().enumerate() {
+                        w[j] = dot(qh, &kc[(c * nkv + g) * hd..(c * nkv + g + 1) * hd]) * kq_scale;
+                        mx = mx.max(w[j]);
+                    }
+                    let mut sum = 0f64;
+                    for v in w.iter_mut() {
+                        *v = (*v - mx).exp();
+                        sum += *v as f64;
+                    }
+                    let oh = &mut out[h * hd..(h + 1) * hd];
+                    for (j, &c) in cells.iter().enumerate() {
+                        let p = (w[j] as f64 / sum) as f32;
+                        for (o, v) in oh
+                            .iter_mut()
+                            .zip(&vc[(c * nkv + g) * hd..(c * nkv + g + 1) * hd])
+                        {
+                            *o += p * v;
+                        }
+                    }
+                    let gh = &gate[(t * nh + h) * hd..(t * nh + h + 1) * hd];
+                    for (o, gv) in oh.iter_mut().zip(gh) {
+                        *o *= sigmoid(*gv);
+                    }
+                }
+                let sel = (t == last).then(|| cells.iter().map(|&c| c as u32).collect());
+                (out, sel)
+            })
+            .collect();
+        let mut attn = vec![0f32; t_len * nh * hd];
+        let mut sel_last = None;
+        for (t, (o, sel)) in per_token.into_iter().enumerate() {
+            attn[t * nh * hd..(t + 1) * nh * hd].copy_from_slice(&o);
+            if sel.is_some() {
+                sel_last = sel;
+            }
+        }
+        if let Some(d) = dump {
+            d.u32(
+                &format!("L{l:02}.qsa_selected"),
+                &sel_last.unwrap_or_default(),
+            )?;
+        }
+        let w_o = self.mat(l, "attn_output.weight")?;
+        Ok(w_o.apply(&attn, t_len, false))
+    }
+
+    /// MoE: softmax over all experts, top-k, renormalised with the 2^-14 clamp; plus the
+    /// sigmoid-gated shared expert.
+    fn moe(&self, l: usize, x: &[f32], t_len: usize, dump: Option<&mut Dump>) -> Result<Vec<f32>> {
+        let hp = &self.hp;
+        let (n, ne, k) = (hp.n_embd, hp.n_expert, hp.n_expert_used);
+        let router = self.mat(l, "ffn_gate_inp.weight")?;
+        ensure!(
+            router.rows == ne && router.cols == n,
+            "blk.{l} router shape"
+        );
+        let logits = router.apply(x, t_len, false);
+
+        // routing: per token, (expert, weight) in rank order
+        let mut routes: Vec<Vec<(usize, f32)>> = Vec::with_capacity(t_len);
+        for t in 0..t_len {
+            let lg = &logits[t * ne..(t + 1) * ne];
+            let mx = lg.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
+            let ex: Vec<f64> = lg.iter().map(|&v| (v as f64 - mx).exp()).collect();
+            let sum: f64 = ex.iter().sum();
+            let p: Vec<f64> = ex.iter().map(|v| v / sum).collect();
+            let mut idx: Vec<usize> = (0..ne).collect();
+            idx.sort_by(|&a, &b| p[b].total_cmp(&p[a]).then(a.cmp(&b)));
+            idx.truncate(k);
+            let wsum: f64 = idx.iter().map(|&e| p[e]).sum::<f64>().max(6.103515625e-5);
+            let mut r: Vec<(usize, f32)> = idx.iter().map(|&e| (e, (p[e] / wsum) as f32)).collect();
+            if hp.expert_weights_scale != 0.0 && hp.expert_weights_scale != 1.0 {
+                for e in &mut r {
+                    e.1 *= hp.expert_weights_scale;
+                }
+            }
+            routes.push(r);
+        }
+
+        // group tokens by expert: expert -> [(token, rank)]
+        let mut by_expert: Vec<Vec<(usize, usize)>> = vec![Vec::new(); ne];
+        for (t, r) in routes.iter().enumerate() {
+            for (rank, &(e, _)) in r.iter().enumerate() {
+                by_expert[e].push((t, rank));
+            }
+        }
+        let gate_t = self.g.info(&self.t(l, "ffn_gate_exps.weight"))?;
+        let up_t = self.g.info(&self.t(l, "ffn_up_exps.weight"))?;
+        let down_t = self.g.info(&self.t(l, "ffn_down_exps.weight"))?;
+        let ff = hp.n_ff_exp;
+        ensure!(
+            gate_t.dims == [n as u64, ff as u64, ne as u64]
+                && down_t.dims == [ff as u64, n as u64, ne as u64],
+            "blk.{l} expert shapes"
+        );
+
+        // each used expert: dequantise it, run its tokens, hand back (token, rank, y)
+        type ExpertOut = Vec<(usize, usize, Vec<f32>)>;
+        let used: Vec<usize> = (0..ne).filter(|&e| !by_expert[e].is_empty()).collect();
+        let outs: Vec<Result<ExpertOut>> = used
+            .par_iter()
+            .map(|&e| {
+                let toks = &by_expert[e];
+                let xe: Vec<f32> = toks
+                    .iter()
+                    .flat_map(|&(t, _)| x[t * n..(t + 1) * n].iter().copied())
+                    .collect();
+                let m = toks.len();
+                let gate = Mat {
+                    rows: ff,
+                    cols: n,
+                    data: self.g.expert(gate_t, e)?,
+                };
+                let up = Mat {
+                    rows: ff,
+                    cols: n,
+                    data: self.g.expert(up_t, e)?,
+                };
+                let down = Mat {
+                    rows: n,
+                    cols: ff,
+                    data: self.g.expert(down_t, e)?,
+                };
+                let gv = gate.apply(&xe, m, true);
+                let uv = up.apply(&xe, m, true);
+                let hv: Vec<f32> = gv.iter().zip(&uv).map(|(&g, &u)| silu(g) * u).collect();
+                let y = down.apply(&hv, m, true);
+                Ok(toks
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(t, rank))| (t, rank, y[i * n..(i + 1) * n].to_vec()))
+                    .collect())
+            })
+            .collect();
+        let mut slots: Vec<Vec<Vec<f32>>> = vec![vec![Vec::new(); k]; t_len];
+        for o in outs {
+            for (t, rank, y) in o? {
+                slots[t][rank] = y;
+            }
+        }
+        // shared expert, gated per token by sigmoid(w · x)
+        let sg = self.vec(&self.t(l, "ffn_gate_inp_shexp.weight"))?;
+        let sh_gate = self.mat(l, "ffn_gate_shexp.weight")?.apply(x, t_len, false);
+        let sh_up = self.mat(l, "ffn_up_shexp.weight")?.apply(x, t_len, false);
+        let sh_h: Vec<f32> = sh_gate
+            .iter()
+            .zip(&sh_up)
+            .map(|(&g, &u)| silu(g) * u)
+            .collect();
+        let sh = self
+            .mat(l, "ffn_down_shexp.weight")?
+            .apply(&sh_h, t_len, false);
+
+        // combine in rank order, so the sum is the same however the experts were scheduled
+        let mut y = vec![0f32; t_len * n];
+        for t in 0..t_len {
+            let yt = &mut y[t * n..(t + 1) * n];
+            for (rank, &(_, w)) in routes[t].iter().enumerate() {
+                for (o, v) in yt.iter_mut().zip(&slots[t][rank]) {
+                    *o += w * v;
+                }
+            }
+            let gsh = sigmoid(dot(&sg, &x[t * n..(t + 1) * n]));
+            for (o, v) in yt.iter_mut().zip(&sh[t * n..(t + 1) * n]) {
+                *o += gsh * v;
+            }
+        }
+        if let Some(d) = dump {
+            let last = &routes[t_len - 1];
+            d.u32(
+                &format!("L{l:02}.router_ids"),
+                &last.iter().map(|&(e, _)| e as u32).collect::<Vec<_>>(),
+            )?;
+            d.f32(
+                &format!("L{l:02}.router_w"),
+                &[k],
+                &last.iter().map(|&(_, w)| w).collect::<Vec<_>>(),
+            )?;
+        }
+        Ok(y)
+    }
+
+    /// The n-gram embedding block (`build_ple`), applied to the residual stack before layer `l`'s
+    /// mixer read.
+    ///
+    /// `key = gnorm(ple_key @ e)`, `q = gnorm(R)` (per stream), `s[c] = <key[c], q[c]> / sqrt(n)`,
+    /// `gate[c] = sigmoid(sign(s) sqrt(max(|s|, 1e-6)))`, `gated[c] = (ple_value @ e) * gate[c]`;
+    /// `R += gated + silu(conv(gnorm(gated)))`, the conv depthwise, 4 taps, dilation 3, causal.
+    fn ple_block(
+        &self,
+        l: usize,
+        tokens: &[u32],
+        r: &mut [f32],
+        dump: Option<&mut Dump>,
+    ) -> Result<()> {
+        let hp = &self.hp;
+        let p = hp.ple.as_ref().context("no PLE constants")?;
+        let (n, hc, eps, t_len) = (hp.n_embd, hp.hc, hp.eps, tokens.len());
+        let hcd = n * hc;
+        let table = self.g.info("per_layer_token_embd.weight")?;
+        ensure!(
+            table.row_len() == p.head_dim,
+            "PLE table rows are {} wide",
+            table.row_len()
+        );
+
+        // gather 16 rows per token, flattened head-slowest
+        let mut emb = vec![0f32; t_len * n];
+        let mut all_rows = Vec::with_capacity(t_len);
+        for t in 0..t_len {
+            let rows = p.rows(tokens, t);
+            for (h, &row) in rows.iter().enumerate() {
+                self.g.read_row(
+                    table,
+                    row as usize,
+                    &mut emb[t * n + h * p.head_dim..t * n + (h + 1) * p.head_dim],
+                )?;
+            }
+            all_rows.push(rows);
+        }
+        let key = self.mat(l, "ple_key.weight")?.apply(&emb, t_len, false); // [T][hc*n]
+        let value = self.mat(l, "ple_value.weight")?.apply(&emb, t_len, false); // [T][n]
+        let nk = self.vec(&self.t(l, "ple_norm_key.weight"))?;
+        let nq = self.vec(&self.t(l, "ple_norm_query.weight"))?;
+        let nc = self.vec(&self.t(l, "ple_norm_conv.weight"))?;
+        let conv = self.vec(&self.t(l, "ple_conv1d.weight"))?; // [kern, hc*n]: tap k of channel c at k + kern*c
+        let kern = p.conv_kernel;
+        let dil = p.ngram;
+        ensure!(
+            key.len() == t_len * hcd && value.len() == t_len * n && conv.len() == kern * hcd,
+            "PLE shapes"
+        );
+
+        let grouped = |v: &mut [f32], w: &[f32]| {
+            for c in 0..hc {
+                rms_norm_mul(&mut v[c * n..(c + 1) * n], &w[c * n..(c + 1) * n], eps);
+            }
+        };
+        let mut gated = vec![0f32; t_len * hcd];
+        let mut normalized = vec![0f32; t_len * hcd];
+        let mut gates = vec![0f32; t_len * hc];
+        for t in 0..t_len {
+            let mut k = key[t * hcd..(t + 1) * hcd].to_vec();
+            grouped(&mut k, &nk);
+            let mut q = r[t * hcd..(t + 1) * hcd].to_vec();
+            grouped(&mut q, &nq);
+            for c in 0..hc {
+                let s = dot(&k[c * n..(c + 1) * n], &q[c * n..(c + 1) * n]) / (n as f32).sqrt();
+                // ggml_sgn(0) is 0, so a zero score gates at exactly one half
+                let sgn = if s > 0.0 {
+                    1.0
+                } else if s < 0.0 {
+                    -1.0
+                } else {
+                    0.0
+                };
+                let gte = sigmoid(sgn * s.abs().max(1e-6).sqrt());
+                gates[t * hc + c] = gte;
+                for i in 0..n {
+                    gated[t * hcd + c * n + i] = value[t * n + i] * gte;
+                }
+            }
+            let nm = &mut normalized[t * hcd..(t + 1) * hcd];
+            nm.copy_from_slice(&gated[t * hcd..(t + 1) * hcd]);
+            grouped(nm, &nc);
+        }
+        // causal depthwise conv over the normalized rows, tap k reaching (kern-1-k)*dil back, zero history
+        for t in 0..t_len {
+            for ch in 0..hcd {
+                let mut acc = 0f32;
+                for kk in 0..kern {
+                    let back = (kern - 1 - kk) * dil;
+                    if t >= back {
+                        acc += conv[kk + kern * ch] * normalized[(t - back) * hcd + ch];
+                    }
+                }
+                r[t * hcd + ch] += gated[t * hcd + ch] + silu(acc);
+            }
+        }
+        if let Some(d) = dump {
+            let last = t_len - 1;
+            d.u32(
+                "ple.rows",
+                &all_rows[last].iter().map(|&x| x as u32).collect::<Vec<_>>(),
+            )?;
+            d.f32("ple.emb", &[n], &emb[last * n..(last + 1) * n])?;
+            d.f32("ple.gate", &[hc], &gates[last * hc..(last + 1) * hc])?;
+            d.f32("ple.out", &[hc, n], &r[last * hcd..(last + 1) * hcd])?;
+        }
+        Ok(())
+    }
+}
+
+/// `build_hc_combine`: every stream adds the block output, scaled by `2 * sigmoid(inj[c] / hc)`.
+fn hc_write(r: &mut [f32], y: &[f32], inj: &[f32], t_len: usize, hc: usize, n: usize) {
+    for t in 0..t_len {
+        for c in 0..hc {
+            let w = 2.0 * sigmoid(inj[t * hc + c] / hc as f32);
+            let dst = &mut r[(t * hc + c) * n..(t * hc + c + 1) * n];
+            for (o, v) in dst.iter_mut().zip(&y[t * n..(t + 1) * n]) {
+                *o += v * w;
+            }
+        }
+    }
+}
+
+/// The `k` largest log-softmax entries, f64, descending (ties to the lower id).
+pub fn top_logprobs(logits: &[f32], k: usize) -> Vec<(u32, f64)> {
+    let mx = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
+    let lse = mx
+        + logits
+            .iter()
+            .map(|&v| (v as f64 - mx).exp())
+            .sum::<f64>()
+            .ln();
+    let k = k.clamp(1, logits.len());
+    let mut idx: Vec<usize> = (0..logits.len()).collect();
+    let cmp = |a: &usize, b: &usize| logits[*b].total_cmp(&logits[*a]).then(a.cmp(b));
+    idx.select_nth_unstable_by(k - 1, cmp);
+    idx.truncate(k);
+    idx.sort_by(cmp);
+    idx.into_iter()
+        .map(|i| (i as u32, logits[i] as f64 - lse))
+        .collect()
+}
+
+/// `tang-llm flash-ref <gguf-first-shard> <token ids...> [--ids-file F] [--last N] [--top K]
+/// [--dump DIR] [-v]`: run the reference and print one JSON object per output position,
+/// `{"pos": i, "top": [[id, logprob], ...]}` (the distribution of the token *after* position i).
+pub fn cli(args: &[String]) -> Result<()> {
+    let usage =
+        "usage: flash-ref <gguf> <ids...> [--ids-file F] [--last N] [--top K] [--dump DIR] [-v]";
+    let mut it = args.iter();
+    let path = PathBuf::from(it.next().context(usage)?);
+    let mut ids: Vec<u32> = Vec::new();
+    let mut last: Option<usize> = None;
+    let mut top = 10;
+    let mut dump_dir: Option<PathBuf> = None;
+    let mut verbose = false;
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--last" => last = Some(it.next().context("--last N")?.parse().context("--last N")?),
+            "--top" => top = it.next().context("--top K")?.parse().context("--top K")?,
+            "--dump" => dump_dir = Some(PathBuf::from(it.next().context("--dump DIR")?)),
+            "--ids-file" => {
+                let f = it.next().context("--ids-file F")?;
+                let s = std::fs::read_to_string(f).with_context(|| format!("reading {f}"))?;
+                for w in s.split(|c: char| c.is_whitespace() || c == ',' || c == '[' || c == ']') {
+                    if !w.is_empty() {
+                        ids.push(
+                            w.parse()
+                                .with_context(|| format!("{f}: bad token id {w:?}"))?,
+                        );
+                    }
+                }
+            }
+            "-v" | "--verbose" => verbose = true,
+            s => ids.push(
+                s.parse()
+                    .with_context(|| format!("bad token id {s:?}; {usage}"))?,
+            ),
+        }
+    }
+    if ids.is_empty() {
+        bail!("no token ids; {usage}");
+    }
+    let mut m = FlashRef::open(&path)?;
+    m.verbose = verbose;
+    let from = ids.len() - last.unwrap_or(ids.len()).clamp(1, ids.len());
+    let mut dump = dump_dir.as_deref().map(Dump::new).transpose()?;
+    let tops = m.forward(&ids, from, top, dump.as_mut())?;
+    let mut out = String::new();
+    for t in tops {
+        let top: Vec<String> = t
+            .top
+            .iter()
+            .map(|(i, lp)| format!("[{i},{lp:.6}]"))
+            .collect();
+        writeln!(out, "{{\"pos\":{},\"top\":[{}]}}", t.pos, top.join(","))?;
+    }
+    print!("{out}");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ple_params() -> PleParams {
+        PleParams {
+            layer: 1,
+            ngram: 3,
+            heads_per_ngram: 8,
+            conv_kernel: 4,
+            eos: 248044,
+            head_dim: 160,
+            multipliers: vec![23703573157769, 20109073645365, 8052911324071],
+            head_offsets: (0..16).map(|h| h * 20_000_100).collect(),
+            head_vocab: (0..16).map(|h| 20_000_003 + 10 * h).collect(),
+        }
+    }
+
+    #[test]
+    fn ple_hash_window() {
+        let p = ple_params();
+        // first token: both predecessors missing -> EOS
+        let r0 = p.rows(&[5], 0);
+        let mixed2 = 5u64.wrapping_mul(p.multipliers[0]) ^ 248044u64.wrapping_mul(p.multipliers[1]);
+        assert_eq!(r0[0], mixed2 % p.head_vocab[0]);
+        // an EOS predecessor cuts everything older; the token's own EOS doesn't
+        let a = p.rows(&[9, 248044, 7], 2);
+        let b = p.rows(&[1, 248044, 7], 2);
+        assert_eq!(a, b, "older context is cut at the EOS");
+        let c = p.rows(&[3, 4, 248044], 2);
+        let d = p.rows(&[3, 5, 248044], 2);
+        assert_ne!(c, d, "own EOS keeps its context");
+        // token id 0 is a real token, not a missing one
+        assert_ne!(p.rows(&[0, 7], 1), p.rows(&[7], 0));
+        // XOR, not sum: equal products cancel
+        let mut q = p.clone();
+        q.multipliers = vec![3, 3, 3];
+        let r = q.rows(&[11, 11], 1);
+        assert_eq!(r[0], q.head_offsets[0]);
+    }
+
+    #[test]
+    fn rope_is_a_rotation() {
+        let mut x: Vec<f32> = (0..256).map(|i| (i as f32 * 0.37).sin()).collect();
+        let n0: f32 = x[..64].iter().map(|v| v * v).sum();
+        let tail = x[64..].to_vec();
+        rope_neox(&mut x, 1234, 64, 1e7);
+        let n1: f32 = x[..64].iter().map(|v| v * v).sum();
+        assert!((n0 - n1).abs() < 1e-4);
+        assert_eq!(&x[64..], &tail[..]);
+        let mut y = vec![1.0f32; 64];
+        rope_neox(&mut y, 0, 64, 1e7);
+        assert_eq!(y, vec![1.0f32; 64]);
+    }
+
+    #[test]
+    fn l2_norm_eps_on_squared_norm() {
+        let mut x = vec![3.0f32, 4.0];
+        l2_norm(&mut x, 0.0);
+        assert!((x[0] - 0.6).abs() < 1e-6 && (x[1] - 0.8).abs() < 1e-6);
+        let mut y = vec![0.0f32; 4];
+        y[0] = 1e-4;
+        l2_norm(&mut y, 1e-6);
+        // sqrt(1e-8 + 1e-6), not sqrt(mean + eps)
+        assert!((y[0] - 1e-4 / (1e-8f32 + 1e-6).sqrt()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn matmul_tiles_match_naive() {
+        let rows = 37;
+        let cols = 29;
+        let n = 70;
+        let w = Mat {
+            rows,
+            cols,
+            data: (0..rows * cols)
+                .map(|i| ((i * 7919) % 101) as f32 / 50.0 - 1.0)
+                .collect(),
+        };
+        let x: Vec<f32> = (0..n * cols)
+            .map(|i| ((i * 104729) % 89) as f32 / 44.0 - 1.0)
+            .collect();
+        let y = w.apply(&x, n, false);
+        let ys = w.apply(&x, n, true);
+        for t in 0..n {
+            for r in 0..rows {
+                let want: f32 = (0..cols)
+                    .map(|c| w.data[r * cols + c] * x[t * cols + c])
+                    .sum();
+                assert!((y[t * rows + r] - want).abs() < 1e-4);
+                assert_eq!(y[t * rows + r], ys[t * rows + r]);
+            }
+        }
+    }
+
+    #[test]
+    fn top_logprobs_sorted_and_normalised() {
+        let lg = vec![0.0f32, 2.0, 1.0, 2.0, -1.0];
+        let t = top_logprobs(&lg, 3);
+        assert_eq!(t.iter().map(|x| x.0).collect::<Vec<_>>(), vec![1, 3, 2]);
+        let z: f64 = lg.iter().map(|&v| (v as f64).exp()).sum();
+        assert!((t[0].1 - (2.0f64 - z.ln())).abs() < 1e-9);
+    }
+}

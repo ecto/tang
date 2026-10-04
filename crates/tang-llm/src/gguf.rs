@@ -194,7 +194,11 @@ impl GgmlType {
         let (el, by) = self
             .geometry()
             .with_context(|| format!("no block geometry for {}", self.name()))?;
-        ensure!(n % el == 0, "{n} elements is not a whole number of {} blocks of {el}", self.name());
+        ensure!(
+            n.is_multiple_of(el),
+            "{n} elements is not a whole number of {} blocks of {el}",
+            self.name()
+        );
         Ok(n / el * by)
     }
 }
@@ -259,24 +263,41 @@ impl Value {
     /// A short rendering for inventories: arrays longer than 8 show their length and head.
     pub fn summary(&self) -> String {
         match self {
-            Value::Str(s) if s.len() > 120 => format!("{:?}… ({} bytes)", s.chars().take(80).collect::<String>(), s.len()),
+            Value::Str(s) if s.len() > 120 => format!(
+                "{:?}… ({} bytes)",
+                s.chars().take(80).collect::<String>(),
+                s.len()
+            ),
             Value::Str(s) => format!("{s:?}"),
             Value::Array(a) if a.len() > 8 => format!(
                 "[{} items: {}, …]",
                 a.len(),
-                a[..4].iter().map(Value::summary).collect::<Vec<_>>().join(", ")
+                a[..4]
+                    .iter()
+                    .map(Value::summary)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
-            Value::Array(a) => format!("[{}]", a.iter().map(Value::summary).collect::<Vec<_>>().join(", ")),
+            Value::Array(a) => format!(
+                "[{}]",
+                a.iter().map(Value::summary).collect::<Vec<_>>().join(", ")
+            ),
             Value::F32(v) => format!("{v}"),
             Value::F64(v) => format!("{v}"),
             Value::Bool(v) => format!("{v}"),
-            other => format!("{}", other.as_u64().map(|v| v as i128).unwrap_or_else(|| match other {
-                Value::I8(v) => *v as i128,
-                Value::I16(v) => *v as i128,
-                Value::I32(v) => *v as i128,
-                Value::I64(v) => *v as i128,
-                _ => 0,
-            })),
+            other => format!(
+                "{}",
+                other
+                    .as_u64()
+                    .map(|v| v as i128)
+                    .unwrap_or_else(|| match other {
+                        Value::I8(v) => *v as i128,
+                        Value::I16(v) => *v as i128,
+                        Value::I32(v) => *v as i128,
+                        Value::I64(v) => *v as i128,
+                        _ => 0,
+                    })
+            ),
         }
     }
 }
@@ -351,7 +372,12 @@ pub fn discover_shards(path: &Path) -> Result<Vec<PathBuf>> {
                 .map(|i| dir.join(format!("{base}-{i:05}-of-{total:05}.gguf")))
                 .collect();
             for p in &out {
-                ensure!(p.exists(), "{}: shard {} is missing", path.display(), p.display());
+                ensure!(
+                    p.exists(),
+                    "{}: shard {} is missing",
+                    path.display(),
+                    p.display()
+                );
             }
             return Ok(out);
         }
@@ -368,7 +394,11 @@ struct Cursor<'a> {
 impl<'a> Cursor<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         let end = self.pos.checked_add(n).context("header length overflow")?;
-        ensure!(end <= self.buf.len(), "truncated header at byte {}", self.pos);
+        ensure!(
+            end <= self.buf.len(),
+            "truncated header at byte {}",
+            self.pos
+        );
         let s = &self.buf[self.pos..end];
         self.pos = end;
         Ok(s)
@@ -405,7 +435,10 @@ impl<'a> Cursor<'a> {
             9 => {
                 let ety = self.u32()?;
                 let n = self.u64()? as usize;
-                ensure!(n <= self.buf.len(), "array of {n} items is longer than the file");
+                ensure!(
+                    n <= self.buf.len(),
+                    "array of {n} items is longer than the file"
+                );
                 let mut v = Vec::with_capacity(n);
                 for _ in 0..n {
                     v.push(self.value(ety, depth + 1)?);
@@ -432,7 +465,8 @@ impl Gguf {
             let file = File::open(p).with_context(|| format!("opening {}", p.display()))?;
             // Safety: model files aren't modified while we run.
             let map = unsafe { Mmap::map(&file)? };
-            let (kv, infos) = parse_header(&map, si).with_context(|| format!("reading {}", p.display()))?;
+            let (kv, infos) =
+                parse_header(&map, si).with_context(|| format!("reading {}", p.display()))?;
             if si == 0 {
                 meta = kv;
             }
@@ -448,9 +482,18 @@ impl Gguf {
                 }
                 tensors.push(t);
             }
-            shards.push(Shard { path: p.clone(), file, map });
+            shards.push(Shard {
+                path: p.clone(),
+                file,
+                map,
+            });
         }
-        Ok(Self { shards, meta, tensors, index })
+        Ok(Self {
+            shards,
+            meta,
+            tensors,
+            index,
+        })
     }
 
     pub fn shard_paths(&self) -> Vec<&Path> {
@@ -462,11 +505,14 @@ impl Gguf {
     }
 
     pub fn info(&self, name: &str) -> Result<&TensorInfo> {
-        self.get(name).with_context(|| format!("missing tensor {name}"))
+        self.get(name)
+            .with_context(|| format!("missing tensor {name}"))
     }
 
     pub fn meta(&self, key: &str) -> Result<&Value> {
-        self.meta.get(key).with_context(|| format!("missing metadata key {key}"))
+        self.meta
+            .get(key)
+            .with_context(|| format!("missing metadata key {key}"))
     }
 
     pub fn meta_u64(&self, key: &str) -> Result<u64> {
@@ -476,11 +522,15 @@ impl Gguf {
     }
 
     pub fn meta_f64(&self, key: &str) -> Result<f64> {
-        self.meta(key)?.as_f64().with_context(|| format!("metadata {key} is not a number"))
+        self.meta(key)?
+            .as_f64()
+            .with_context(|| format!("metadata {key} is not a number"))
     }
 
     pub fn meta_str(&self, key: &str) -> Result<&str> {
-        self.meta(key)?.as_str().with_context(|| format!("metadata {key} is not a string"))
+        self.meta(key)?
+            .as_str()
+            .with_context(|| format!("metadata {key} is not a string"))
     }
 
     /// An integer array (or a scalar, broadcast to `n` when `n` is given).
@@ -489,7 +539,10 @@ impl Gguf {
         match v {
             Value::Array(a) => a
                 .iter()
-                .map(|x| x.as_u64().with_context(|| format!("metadata {key}: not an unsigned integer")))
+                .map(|x| {
+                    x.as_u64()
+                        .with_context(|| format!("metadata {key}: not an unsigned integer"))
+                })
                 .collect(),
             other => Ok(vec![other
                 .as_u64()
@@ -506,7 +559,8 @@ impl Gguf {
     /// The whole tensor as f32, `dims[0]` fastest.
     pub fn dequantize(&self, t: &TensorInfo) -> Result<Vec<f32>> {
         let mut out = vec![0f32; t.n_elements() as usize];
-        dequantize(t.ty, self.bytes(t), &mut out).with_context(|| format!("dequantizing {}", t.name))?;
+        dequantize(t.ty, self.bytes(t), &mut out)
+            .with_context(|| format!("dequantizing {}", t.name))?;
         Ok(out)
     }
 
@@ -516,7 +570,13 @@ impl Gguf {
 
     /// Rows `start..start + n` of a tensor (a row is `dims[0]` elements), from the mapping.
     pub fn rows(&self, t: &TensorInfo, start: usize, n: usize) -> Result<Vec<f32>> {
-        ensure!(start + n <= t.n_rows(), "{}: rows {start}..{} of {}", t.name, start + n, t.n_rows());
+        ensure!(
+            start + n <= t.n_rows(),
+            "{}: rows {start}..{} of {}",
+            t.name,
+            start + n,
+            t.n_rows()
+        );
         let rb = t.row_bytes()?;
         let all = self.bytes(t);
         let mut out = vec![0f32; n * t.row_len()];
@@ -528,8 +588,19 @@ impl Gguf {
     /// faulted in as a whole: the n-gram table is read this way, 16 rows a token.
     pub fn read_row(&self, t: &TensorInfo, row: usize, out: &mut [f32]) -> Result<()> {
         use std::os::unix::fs::FileExt;
-        ensure!(row < t.n_rows(), "{}: row {row} out of range ({})", t.name, t.n_rows());
-        ensure!(out.len() == t.row_len(), "{}: row is {} wide, buffer {}", t.name, t.row_len(), out.len());
+        ensure!(
+            row < t.n_rows(),
+            "{}: row {row} out of range ({})",
+            t.name,
+            t.n_rows()
+        );
+        ensure!(
+            out.len() == t.row_len(),
+            "{}: row is {} wide, buffer {}",
+            t.name,
+            t.row_len(),
+            out.len()
+        );
         let rb = t.row_bytes()?;
         let mut buf = vec![0u8; rb];
         self.shards[t.shard]
@@ -541,14 +612,22 @@ impl Gguf {
 
     /// Expert `e` of a fused `[in, out, n_expert]` tensor, as `out` rows of `in`.
     pub fn expert(&self, t: &TensorInfo, e: usize) -> Result<Vec<f32>> {
-        ensure!(t.dims.len() == 3, "{}: not a fused expert tensor ({:?})", t.name, t.dims);
+        ensure!(
+            t.dims.len() == 3,
+            "{}: not a fused expert tensor ({:?})",
+            t.name,
+            t.dims
+        );
         let per = (t.dims[0] * t.dims[1]) as usize;
-        ensure!(e < t.dims[2] as usize, "{}: expert {e} out of range", t.name);
+        ensure!(
+            e < t.dims[2] as usize,
+            "{}: expert {e} out of range",
+            t.name
+        );
         let rows = t.dims[1] as usize;
-        self.rows(t, e * rows, rows).map(|v| {
-            debug_assert_eq!(v.len(), per);
-            v
-        })
+        let v = self.rows(t, e * rows, rows)?;
+        debug_assert_eq!(v.len(), per);
+        Ok(v)
     }
 }
 
@@ -556,7 +635,10 @@ fn parse_header(map: &[u8], shard: usize) -> Result<(BTreeMap<String, Value>, Ve
     let mut c = Cursor { buf: map, pos: 0 };
     ensure!(c.take(4)? == MAGIC, "not a GGUF file");
     let version = c.u32()?;
-    ensure!(version == 3 || version == 2, "GGUF version {version} (want 2 or 3)");
+    ensure!(
+        version == 3 || version == 2,
+        "GGUF version {version} (want 2 or 3)"
+    );
     let n_tensors = c.u64()? as usize;
     let n_kv = c.u64()? as usize;
     let mut kv = BTreeMap::new();
@@ -576,10 +658,17 @@ fn parse_header(map: &[u8], shard: usize) -> Result<(BTreeMap<String, Value>, Ve
         let offset = c.u64()?;
         let n: u64 = dims.iter().product();
         let nbytes = match ty.geometry() {
-            Some(_) => ty.bytes_for(n as usize).with_context(|| format!("{name}"))? as u64,
+            Some(_) => ty.bytes_for(n as usize).with_context(|| name.clone())? as u64,
             None => 0,
         };
-        infos.push(TensorInfo { name, dims, ty, shard, offset, nbytes });
+        infos.push(TensorInfo {
+            name,
+            dims,
+            ty,
+            shard,
+            offset,
+            nbytes,
+        });
     }
     let align = kv
         .get("general.alignment")
@@ -674,31 +763,44 @@ fn half(b: &[u8], at: usize) -> f32 {
 }
 
 /// `kvalues_iq4nl` from ggml-common.h.
-pub const IQ4NL_VALUES: [i8; 16] = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
+pub const IQ4NL_VALUES: [i8; 16] = [
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+];
 
 /// Dequantise `src` (whole blocks of `ty`) into `out`, which must be exactly the element count.
 pub fn dequantize(ty: GgmlType, src: &[u8], out: &mut [f32]) -> Result<()> {
     let need = ty.bytes_for(out.len())?;
-    ensure!(src.len() == need, "{}: {} bytes for {} elements (want {need})", ty.name(), src.len(), out.len());
+    ensure!(
+        src.len() == need,
+        "{}: {} bytes for {} elements (want {need})",
+        ty.name(),
+        src.len(),
+        out.len()
+    );
     use GgmlType::*;
     match ty {
         F32 => {
-            for (o, b) in out.iter_mut().zip(src.chunks_exact(4)) {
+            for (o, b) in out.iter_mut().zip(src.as_chunks::<4>().0) {
                 *o = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
             }
         }
         F16 => {
-            for (o, b) in out.iter_mut().zip(src.chunks_exact(2)) {
+            for (o, b) in out.iter_mut().zip(src.as_chunks::<2>().0) {
                 *o = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
             }
         }
         Bf16 => {
-            for (o, b) in out.iter_mut().zip(src.chunks_exact(2)) {
+            for (o, b) in out.iter_mut().zip(src.as_chunks::<2>().0) {
                 *o = bf16_to_f32(u16::from_le_bytes([b[0], b[1]]));
             }
         }
         Q8_0 => {
-            for (y, b) in out.chunks_exact_mut(32).zip(src.chunks_exact(34)) {
+            for (y, b) in out
+                .as_chunks_mut::<32>()
+                .0
+                .iter_mut()
+                .zip(src.as_chunks::<34>().0)
+            {
                 let d = half(b, 0);
                 for j in 0..32 {
                     y[j] = d * (b[2 + j] as i8) as f32;
@@ -706,7 +808,12 @@ pub fn dequantize(ty: GgmlType, src: &[u8], out: &mut [f32]) -> Result<()> {
             }
         }
         Q4_0 => {
-            for (y, b) in out.chunks_exact_mut(32).zip(src.chunks_exact(18)) {
+            for (y, b) in out
+                .as_chunks_mut::<32>()
+                .0
+                .iter_mut()
+                .zip(src.as_chunks::<18>().0)
+            {
                 let d = half(b, 0);
                 for j in 0..16 {
                     y[j] = ((b[2 + j] & 0xf) as i32 - 8) as f32 * d;
@@ -715,7 +822,12 @@ pub fn dequantize(ty: GgmlType, src: &[u8], out: &mut [f32]) -> Result<()> {
             }
         }
         Q4_1 => {
-            for (y, b) in out.chunks_exact_mut(32).zip(src.chunks_exact(20)) {
+            for (y, b) in out
+                .as_chunks_mut::<32>()
+                .0
+                .iter_mut()
+                .zip(src.as_chunks::<20>().0)
+            {
                 let (d, m) = (half(b, 0), half(b, 2));
                 for j in 0..16 {
                     y[j] = (b[4 + j] & 0xf) as f32 * d + m;
@@ -724,7 +836,12 @@ pub fn dequantize(ty: GgmlType, src: &[u8], out: &mut [f32]) -> Result<()> {
             }
         }
         Q5_0 => {
-            for (y, b) in out.chunks_exact_mut(32).zip(src.chunks_exact(22)) {
+            for (y, b) in out
+                .as_chunks_mut::<32>()
+                .0
+                .iter_mut()
+                .zip(src.as_chunks::<22>().0)
+            {
                 let d = half(b, 0);
                 let qh = u32::from_le_bytes([b[2], b[3], b[4], b[5]]);
                 for j in 0..16 {
@@ -736,7 +853,12 @@ pub fn dequantize(ty: GgmlType, src: &[u8], out: &mut [f32]) -> Result<()> {
             }
         }
         Q5_1 => {
-            for (y, b) in out.chunks_exact_mut(32).zip(src.chunks_exact(24)) {
+            for (y, b) in out
+                .as_chunks_mut::<32>()
+                .0
+                .iter_mut()
+                .zip(src.as_chunks::<24>().0)
+            {
                 let (d, m) = (half(b, 0), half(b, 2));
                 let qh = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
                 for j in 0..16 {
@@ -748,7 +870,12 @@ pub fn dequantize(ty: GgmlType, src: &[u8], out: &mut [f32]) -> Result<()> {
             }
         }
         Q2_0 => {
-            for (y, b) in out.chunks_exact_mut(64).zip(src.chunks_exact(18)) {
+            for (y, b) in out
+                .as_chunks_mut::<64>()
+                .0
+                .iter_mut()
+                .zip(src.as_chunks::<18>().0)
+            {
                 let d = half(b, 0);
                 for j in 0..64 {
                     let q = (b[2 + j / 4] >> ((j % 4) * 2)) & 3;
@@ -757,7 +884,12 @@ pub fn dequantize(ty: GgmlType, src: &[u8], out: &mut [f32]) -> Result<()> {
             }
         }
         Iq4Nl => {
-            for (y, b) in out.chunks_exact_mut(32).zip(src.chunks_exact(18)) {
+            for (y, b) in out
+                .as_chunks_mut::<32>()
+                .0
+                .iter_mut()
+                .zip(src.as_chunks::<18>().0)
+            {
                 let d = half(b, 0);
                 for j in 0..16 {
                     y[j] = d * IQ4NL_VALUES[(b[2 + j] & 0xf) as usize] as f32;
@@ -767,13 +899,19 @@ pub fn dequantize(ty: GgmlType, src: &[u8], out: &mut [f32]) -> Result<()> {
         }
         Iq4Xs => {
             // d f16 | scales_h u16 | scales_l[4] | qs[128]
-            for (y, b) in out.chunks_exact_mut(256).zip(src.chunks_exact(136)) {
+            for (y, b) in out
+                .as_chunks_mut::<256>()
+                .0
+                .iter_mut()
+                .zip(src.as_chunks::<136>().0)
+            {
                 let d = half(b, 0);
                 let sh = rd16(b, 2) as u32;
                 let sl = &b[4..8];
                 let qs = &b[8..136];
                 for ib in 0..8 {
-                    let ls = ((sl[ib / 2] >> (4 * (ib % 2))) & 0xf) as i32 | ((((sh >> (2 * ib)) & 3) << 4) as i32);
+                    let ls = ((sl[ib / 2] >> (4 * (ib % 2))) & 0xf) as i32
+                        | ((((sh >> (2 * ib)) & 3) << 4) as i32);
                     let dl = d * (ls - 32) as f32;
                     let q = &qs[ib * 16..ib * 16 + 16];
                     let yy = &mut y[ib * 32..ib * 32 + 32];
@@ -786,7 +924,12 @@ pub fn dequantize(ty: GgmlType, src: &[u8], out: &mut [f32]) -> Result<()> {
         }
         Q2K => {
             // scales[16] | qs[64] | d | dmin
-            for (y, b) in out.chunks_exact_mut(256).zip(src.chunks_exact(84)) {
+            for (y, b) in out
+                .as_chunks_mut::<256>()
+                .0
+                .iter_mut()
+                .zip(src.as_chunks::<84>().0)
+            {
                 let sc = &b[0..16];
                 let d = half(b, 80);
                 let min = half(b, 82);
@@ -811,7 +954,12 @@ pub fn dequantize(ty: GgmlType, src: &[u8], out: &mut [f32]) -> Result<()> {
         }
         Q3K => {
             // hmask[32] | qs[64] | scales[12] | d
-            for (y, b) in out.chunks_exact_mut(256).zip(src.chunks_exact(110)) {
+            for (y, b) in out
+                .as_chunks_mut::<256>()
+                .0
+                .iter_mut()
+                .zip(src.as_chunks::<110>().0)
+            {
                 let hm = &b[0..32];
                 let d_all = half(b, 108);
                 let scales = q3k_scales(&b[96..108]);
@@ -826,7 +974,8 @@ pub fn dequantize(ty: GgmlType, src: &[u8], out: &mut [f32]) -> Result<()> {
                             is += 1;
                             for l in 0..16 {
                                 let li = l + 16 * half_;
-                                let v = ((q[li] >> shift) & 3) as i32 - if hm[li] & m != 0 { 0 } else { 4 };
+                                let v = ((q[li] >> shift) & 3) as i32
+                                    - if hm[li] & m != 0 { 0 } else { 4 };
                                 y[yi] = dl * v as f32;
                                 yi += 1;
                             }
@@ -838,7 +987,12 @@ pub fn dequantize(ty: GgmlType, src: &[u8], out: &mut [f32]) -> Result<()> {
         }
         Q4K => {
             // d | dmin | scales[12] | qs[128]
-            for (y, b) in out.chunks_exact_mut(256).zip(src.chunks_exact(144)) {
+            for (y, b) in out
+                .as_chunks_mut::<256>()
+                .0
+                .iter_mut()
+                .zip(src.as_chunks::<144>().0)
+            {
                 let d = half(b, 0);
                 let min = half(b, 2);
                 let sc = &b[4..16];
@@ -859,7 +1013,12 @@ pub fn dequantize(ty: GgmlType, src: &[u8], out: &mut [f32]) -> Result<()> {
         }
         Q5K => {
             // d | dmin | scales[12] | qh[32] | qs[128]
-            for (y, b) in out.chunks_exact_mut(256).zip(src.chunks_exact(176)) {
+            for (y, b) in out
+                .as_chunks_mut::<256>()
+                .0
+                .iter_mut()
+                .zip(src.as_chunks::<176>().0)
+            {
                 let d = half(b, 0);
                 let min = half(b, 2);
                 let sc = &b[4..16];
@@ -886,7 +1045,12 @@ pub fn dequantize(ty: GgmlType, src: &[u8], out: &mut [f32]) -> Result<()> {
         }
         Q6K => {
             // ql[128] | qh[64] | scales[16] (i8) | d
-            for (y, b) in out.chunks_exact_mut(256).zip(src.chunks_exact(210)) {
+            for (y, b) in out
+                .as_chunks_mut::<256>()
+                .0
+                .iter_mut()
+                .zip(src.as_chunks::<210>().0)
+            {
                 let d = half(b, 208);
                 for n in 0..2 {
                     let ql = &b[n * 64..n * 64 + 64];
@@ -909,11 +1073,19 @@ pub fn dequantize(ty: GgmlType, src: &[u8], out: &mut [f32]) -> Result<()> {
         }
         Iq2Xs => {
             // d | qs u16[32] | scales[8]: each u16 is a 9-bit grid index and a 7-bit sign index
-            for (y, b) in out.chunks_exact_mut(256).zip(src.chunks_exact(74)) {
+            for (y, b) in out
+                .as_chunks_mut::<256>()
+                .0
+                .iter_mut()
+                .zip(src.as_chunks::<74>().0)
+            {
                 let d = half(b, 0);
                 for ib in 0..8 {
                     let s = b[66 + ib];
-                    let db = [d * (0.5 + (s & 0xf) as f32) * 0.25, d * (0.5 + (s >> 4) as f32) * 0.25];
+                    let db = [
+                        d * (0.5 + (s & 0xf) as f32) * 0.25,
+                        d * (0.5 + (s >> 4) as f32) * 0.25,
+                    ];
                     for l in 0..4 {
                         let q = rd16(b, 2 + 2 * (4 * ib + l));
                         let grid = grids::IQ2XS_GRID[(q & 511) as usize].to_le_bytes();
@@ -929,7 +1101,12 @@ pub fn dequantize(ty: GgmlType, src: &[u8], out: &mut [f32]) -> Result<()> {
         }
         Iq3Xxs => {
             // d | qs[64] grid indices | 8 × u32 (7-bit sign indices ×4, 4-bit scale)
-            for (y, b) in out.chunks_exact_mut(256).zip(src.chunks_exact(98)) {
+            for (y, b) in out
+                .as_chunks_mut::<256>()
+                .0
+                .iter_mut()
+                .zip(src.as_chunks::<98>().0)
+            {
                 let d = half(b, 0);
                 let qs = &b[2..66];
                 for ib in 0..8 {
@@ -943,7 +1120,11 @@ pub fn dequantize(ty: GgmlType, src: &[u8], out: &mut [f32]) -> Result<()> {
                         let yy = &mut y[ib * 32 + l * 8..ib * 32 + l * 8 + 8];
                         for j in 0..4 {
                             let s1 = if signs & (1 << j) != 0 { -1.0 } else { 1.0 };
-                            let s2 = if signs & (1 << (j + 4)) != 0 { -1.0 } else { 1.0 };
+                            let s2 = if signs & (1 << (j + 4)) != 0 {
+                                -1.0
+                            } else {
+                                1.0
+                            };
                             yy[j] = db * g1[j] as f32 * s1;
                             yy[j + 4] = db * g2[j] as f32 * s2;
                         }
@@ -961,7 +1142,10 @@ fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
     if j < 4 {
         (q[j] & 63, q[j + 4] & 63)
     } else {
-        ((q[j + 4] & 0xf) | ((q[j - 4] >> 6) << 4), (q[j + 4] >> 4) | ((q[j] >> 6) << 4))
+        (
+            (q[j + 4] & 0xf) | ((q[j - 4] >> 6) << 4),
+            (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
+        )
     }
 }
 
@@ -992,7 +1176,10 @@ mod tests {
     struct Lcg(u64);
     impl Lcg {
         fn next(&mut self) -> u32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (self.0 >> 33) as u32
         }
         fn byte(&mut self) -> u8 {
@@ -1009,7 +1196,16 @@ mod tests {
 
     #[test]
     fn half_round_trips() {
-        for &x in &[0.0f32, -0.0, 1.0, -2.5, 65504.0, 6.1035156e-5, 5.9604645e-8, 0.333251953125] {
+        for &x in &[
+            0.0f32,
+            -0.0,
+            1.0,
+            -2.5,
+            65504.0,
+            6.103_515_6e-5,
+            5.960_464_5e-8,
+            0.333_251_95,
+        ] {
             assert_eq!(f16_to_f32(f32_to_f16(x)), x, "{x}");
         }
         // every half value survives f16 -> f32 -> f16
@@ -1076,7 +1272,11 @@ mod tests {
         let (sc, m) = scale_min_k4(sub, &b[4..16]);
         let chunk = sub / 2; // 64-element chunk shares 32 bytes
         let byte = b[16 + chunk * 32 + i % 32];
-        let q = if sub % 2 == 0 { byte & 0xf } else { byte >> 4 };
+        let q = if sub.is_multiple_of(2) {
+            byte & 0xf
+        } else {
+            byte >> 4
+        };
         d * sc as f32 * q as f32 - min * m as f32
     }
 
@@ -1116,7 +1316,11 @@ mod tests {
         let d = half(b, 108);
         // scales: 6-bit, low 4 bits from bytes 0..8 (nibbles), high 2 bits from bytes 8..12
         let sidx = i / 16;
-        let low = if sidx < 8 { b[96 + sidx] & 0xf } else { b[96 + sidx - 8] >> 4 };
+        let low = if sidx < 8 {
+            b[96 + sidx] & 0xf
+        } else {
+            b[96 + sidx - 8] >> 4
+        };
         let high = (b[96 + 8 + sidx % 4] >> (2 * (sidx / 4))) & 3;
         let s = (low | (high << 4)) as i32 - 32;
         let n = i / 128;
@@ -1135,7 +1339,11 @@ mod tests {
         let (sc, m) = scale_min_k4(sub, &b[4..16]);
         let l = i % 32;
         let byte = b[48 + (sub / 2) * 32 + l];
-        let lo = if sub % 2 == 0 { byte & 0xf } else { byte >> 4 };
+        let lo = if sub.is_multiple_of(2) {
+            byte & 0xf
+        } else {
+            byte >> 4
+        };
         let hi = (b[16 + l] >> sub) & 1;
         d * sc as f32 * (lo + 16 * hi) as f32 - min * m as f32
     }
@@ -1144,7 +1352,8 @@ mod tests {
         let d = half(b, 0);
         let ib = i / 32;
         let sh = rd16(b, 2);
-        let ls = ((b[4 + ib / 2] >> (4 * (ib % 2))) & 0xf) as i32 | ((((sh >> (2 * ib)) & 3) << 4) as i32);
+        let ls = ((b[4 + ib / 2] >> (4 * (ib % 2))) & 0xf) as i32
+            | ((((sh >> (2 * ib)) & 3) << 4) as i32);
         let j = i % 32;
         let byte = b[8 + ib * 16 + j % 16];
         let q = if j < 16 { byte & 0xf } else { byte >> 4 };
@@ -1160,9 +1369,13 @@ mod tests {
             }
             let mut y = vec![0f32; 256];
             dequantize(ty, &b, &mut y).unwrap();
-            for i in 0..256 {
+            for (i, &got) in y.iter().enumerate() {
                 let want = elem(&b, i);
-                assert!((y[i] - want).abs() <= 1e-6 * want.abs().max(1.0), "{} elem {i}: {} vs {want}", ty.name(), y[i]);
+                assert!(
+                    (got - want).abs() <= 1e-6 * want.abs().max(1.0),
+                    "{} elem {i}: {got} vs {want}",
+                    ty.name()
+                );
             }
         }
     }
