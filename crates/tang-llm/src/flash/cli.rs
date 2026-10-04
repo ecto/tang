@@ -254,8 +254,8 @@ fn decode_spec(
     };
     let mut started = None;
     // Window cost by width (ms, EMA; priors from flash-bench on mew) and the drafting cost.
-    let mut wcost: Vec<f64> = vec![12.0, 12.0, 15.0, 17.0, 19.5, 22.0, 24.5, 27.0, 29.5];
-    let mut mtp_cost = 3.5f64;
+    let mut wcost: Vec<f64> = vec![10.6, 10.6, 12.9, 15.0, 17.1, 19.2, 21.3, 23.4, 25.5];
+    let mut mtp_cost = 2.5f64;
     // Acceptance calibration by draft-probability bucket: (accepted, tried) with a prior.
     let mut calib: Vec<(f64, f64)> = (0..10)
         .map(|b| {
@@ -431,6 +431,8 @@ fn mean(stats: &[WinStats]) -> WinStats {
         m.gpu_wait_b_ms += s.gpu_wait_b_ms / n;
         m.gpu_ms += s.gpu_ms / n;
         m.serve_ms += s.serve_ms / n;
+        m.commit_host_ms += s.commit_host_ms / n;
+        m.boundary_ms += s.boundary_ms / n;
         m.drain_ms += s.drain_ms / n;
         m.post_ms += s.post_ms / n;
         m.routed += s.routed;
@@ -690,6 +692,7 @@ pub fn bench(args: &[String]) -> Result<()> {
     println!("  host prep          {:8.3} ms  (embedding; n-gram rows are read during layer 0)", m.host_prep_ms);
     println!("  host: launch..served {:6.3} ms, ..drained {:.3} ms, boundary+tables {:.3} ms", m.serve_ms, m.drain_ms, m.post_ms);
     println!("  host plan          {:8.3} ms", m.plan_ms);
+    println!("  after window: commit launch {:.3} ms, cache boundary + tables {:.3} ms", m.commit_host_ms, m.boundary_ms);
     println!("  host CPU experts   {:8.3} ms", m.cpu_ms);
     println!(
         "  experts            {:.1} distinct/window, {:.2} on the CPU/window, {:.2} over PCIe/window, VRAM hit rate {:.3}, swaps {}",

@@ -406,6 +406,9 @@ pub struct WinStats {
     /// Host: launch to the window's last layer served; served to stream drained; drained to
     /// return (cache boundary, tables).
     pub serve_ms: f64,
+    /// Host time to launch the commit / to run the cache boundary after a verify window.
+    pub commit_host_ms: f64,
+    pub boundary_ms: f64,
     pub drain_ms: f64,
     pub post_ms: f64,
     pub routed: usize,
@@ -470,7 +473,8 @@ pub struct Engine {
     tables: Vec<B>,
     /// Per layer, the mapped host address of every host-resident expert (PCIe share).
     host_tables: Vec<B>,
-    host_addrs: Vec<u64>,
+    /// Pinned (so the copies stay asynchronous) mirror of `host_tables`.
+    host_addrs: HostArena,
     /// The addresses `tables` holds now (host copy, to find layers that changed).
     table_addrs: Vec<u64>,
     host_plan: Vec<u32>,
@@ -922,6 +926,12 @@ impl Engine {
         let (free2, _) = gpu.mem_info().map_err(|e| anyhow!("{e}"))?;
         let tables: Vec<B> = (0..hp.n_layer).map(|_| dev.alloc_f32(2 * EXPERTS)).collect();
         let host_tables: Vec<B> = (0..hp.n_layer).map(|_| dev.alloc_f32(2 * EXPERTS)).collect();
+        let host_addrs = {
+            let mut a = HostArena::new(48 * EXPERTS * 8, ArenaOptions { try_hugetlb: false, thp: false })?;
+            a.register(&gpu.ctx, &[]).map_err(|e| anyhow!("{e}"))?;
+            unsafe { std::slice::from_raw_parts_mut(a.as_ptr() as *mut u64, 48 * EXPERTS) }.fill(u64::MAX);
+            a
+        };
         let mut exec = MissExec::new(Pool::new(&Pool::default_cpus(), std::time::Duration::from_millis(20)), Isa::detect());
         exec.tiled = true;
         let ngram = std::sync::Arc::new(NgramTable::open(&g, &plep)?);
@@ -978,7 +988,7 @@ impl Engine {
             routing: vec![0; 48 * EXPERTS],
             keys: Vec::new(),
             host_tables,
-            host_addrs: vec![u64::MAX; 48 * EXPERTS],
+            host_addrs,
             tables,
             table_addrs: vec![u64::MAX; 48 * EXPERTS],
             host_plan: vec![0; MoePlan::WORDS],
@@ -1793,6 +1803,11 @@ impl Engine {
         Ok(swaps)
     }
 
+    #[allow(clippy::mut_from_ref)]
+    fn host_addrs_pinned(&self) -> &mut [u64] {
+        unsafe { std::slice::from_raw_parts_mut(self.host_addrs.as_ptr() as *mut u64, 48 * EXPERTS) }
+    }
+
     /// Copy the cache's residency table into the per-layer plan tables where it changed
     /// (stream-ordered after the cache's own publish).
     fn sync_tables(&mut self) -> Result<()> {
@@ -1806,8 +1821,9 @@ impl Engine {
                 let key = (base + e) as u32;
                 let a = rc.addr(key);
                 let hd = if a == 0 { rc.host_device_addr(key).unwrap_or(0) } else { 0 };
-                if self.host_addrs[base + e] != hd {
-                    self.host_addrs[base + e] = hd;
+                let ha = self.host_addrs_pinned();
+                if ha[base + e] != hd {
+                    ha[base + e] = hd;
                     dirty = true;
                 }
                 if self.table_addrs[base + e] != a {
@@ -1818,9 +1834,9 @@ impl Engine {
             if dirty {
                 unsafe {
                     gpu::check(
-                        cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                        cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
                             self.dev.buffer_addr(&self.tables[l]),
-                            self.table_addrs[base..].as_ptr() as *const std::ffi::c_void,
+                            rc.device_addrs() + (base * 8) as u64,
                             EXPERTS * 8,
                             self.stream.0,
                         ),
@@ -1830,7 +1846,7 @@ impl Engine {
                     gpu::check(
                         cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
                             self.dev.buffer_addr(&self.host_tables[l]),
-                            self.host_addrs[base..].as_ptr() as *const std::ffi::c_void,
+                            self.host_addrs_pinned()[base..].as_ptr() as *const std::ffi::c_void,
                             EXPERTS * 8,
                             self.stream.0,
                         ),
@@ -1990,13 +2006,17 @@ impl Engine {
             self.side.wait(&ev).map_err(|e| anyhow!("{e}"))?;
             self.mtp.as_ref().unwrap().graphs[n].as_ref().unwrap().launch(&self.side).map_err(|e| anyhow!("{e}"))?;
         }
+        let tc = Instant::now();
         if t > 1 {
             self.commit(t, n)?;
             self.tokens.truncate(pos + n);
         }
+        let tb = Instant::now();
         if self.pending_boundary {
             self.last.swaps = self.boundary()?;
         }
+        self.last.commit_host_ms = (tb - tc).as_secs_f64() * 1e3;
+        self.last.boundary_ms = tb.elapsed().as_secs_f64() * 1e3;
         if overlap {
             self.side.sync().map_err(|e| anyhow!("{e}"))?;
             self.mtp_last = self.mtp_read(n);
