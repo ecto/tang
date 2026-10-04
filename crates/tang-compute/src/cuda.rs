@@ -192,6 +192,9 @@ pub struct CudaComputeDevice {
     pool: Arc<Mutex<BufferPool>>,
     /// LLM kernels by name, so decode doesn't hash kernel sources on every launch.
     llm_funcs: RefCell<HashMap<&'static str, CudaFunction>>,
+    /// Self-resetting grid-barrier and completion counters for the fused Flash-Next kernels
+    /// (`cuda/flash.rs`), allocated on first use.
+    flash_sync: RefCell<Option<CudaSlice<u32>>>,
 }
 
 impl CudaComputeDevice {
@@ -227,6 +230,7 @@ impl CudaComputeDevice {
             mixed_precision: false,
             pool: Arc::new(Mutex::new(BufferPool::new())),
             llm_funcs: RefCell::new(HashMap::new()),
+            flash_sync: RefCell::new(None),
         })
     }
 
@@ -277,6 +281,7 @@ impl CudaComputeDevice {
             mixed_precision: true,
             pool: Arc::new(Mutex::new(BufferPool::new())),
             llm_funcs: RefCell::new(HashMap::new()),
+            flash_sync: RefCell::new(None),
         })
     }
 

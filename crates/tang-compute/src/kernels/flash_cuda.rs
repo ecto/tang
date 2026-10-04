@@ -446,6 +446,214 @@ extern "C" __global__ void __launch_bounds__(1024) fl_hc_up_t##T( \
 }
 HC_UP(1) HC_UP(2) HC_UP(3) HC_UP(4) HC_UP(5) HC_UP(6) HC_UP(7) HC_UP(8)
 
+// ---- grid barrier and completion counters ----
+
+// All blocks of a co-resident grid meet here. `bar` = [count, generation], self-resetting, so a
+// captured graph can replay it.
+__device__ void grid_bar(unsigned int* bar, unsigned int nb) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        volatile unsigned int* gen = bar + 1;
+        unsigned int g = *gen;
+        __threadfence();
+        if (atomicAdd(bar, 1u) == nb - 1) {
+            atomicExch(bar, 0u);
+            __threadfence();
+            atomicAdd(bar + 1, 1u);
+        } else {
+            while (*gen == g) {}
+        }
+        __threadfence();
+    }
+    __syncthreads();
+}
+
+// True in exactly one block: the last of `nb` to arrive at `cnt` (which it resets). Everything
+// the other blocks wrote before arriving is visible to it.
+__device__ bool last_block(unsigned int* cnt, unsigned int nb) {
+    __shared__ unsigned int is_last;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence();
+        unsigned int prev = atomicAdd(cnt, 1u);
+        is_last = prev == nb - 1;
+        if (is_last) atomicExch(cnt, 0u);
+    }
+    __syncthreads();
+    if (is_last) __threadfence();
+    return is_last;
+}
+
+// The whole hyper-connection read in one launch on a co-resident grid (512 threads a block):
+// phase 0 the pending write and per-stream norm (fl_hc_norm's arithmetic), barrier, phase 1 the
+// down / inject rows (two rows per block step, 16 warps splitting K), barrier, phase 2 the up
+// projection and mean (fl_hc_up's arithmetic: a warp per output, a block per 32-wide
+// quantization chunk). XN and LO are the hc scratch.
+template <int T>
+__device__ __forceinline__ void hc_fused_body(
+    float* __restrict__ R, const float* __restrict__ Yp, const float* __restrict__ Ip, unsigned int mode,
+    const float* __restrict__ Wn, float eps, const float* __restrict__ PARTS, const float* __restrict__ Wr,
+    const float* __restrict__ L, unsigned int stride, int sg, const unsigned short* __restrict__ Wd,
+    const unsigned short* __restrict__ Wi, unsigned int rows, const unsigned short* __restrict__ Wu,
+    float* __restrict__ X, unsigned int* __restrict__ XQ, unsigned int quant, float* __restrict__ INJ,
+    float* __restrict__ XN, float* __restrict__ LO, unsigned int* __restrict__ bar) {
+    __shared__ float red[16][2 * T];
+    __shared__ __align__(16) float lo[T * HC_LR];
+    __shared__ float xs[T][32];
+    unsigned int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, nb = gridDim.x;
+    // Phase 0: per (stream, token) row.
+    for (unsigned int item = blockIdx.x; item < HC * T; item += nb) {
+        unsigned int c = item % HC, t = item / HC;
+        float* row = R + ((u64)t * HC + c) * HIDDEN;
+        float g = mode ? 2.0f / (1.0f + expf(-(Ip[t * HC + c] * 0.25f))) : 0.0f;
+        float gs = (mode == 2 && sg >= 0) ? sigm(L[(u64)t * stride + sg]) : 0.0f;
+        float v[5], ss = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 5; i++) {
+            unsigned int d = tid + 512 * i;
+            float x = row[d];
+            if (mode) {
+                float y;
+                if (mode == 1) {
+                    y = Yp[(u64)t * HIDDEN + d];
+                } else {
+                    y = 0.0f;
+                    #pragma unroll
+                    for (int k = 0; k < TOPK; k++)
+                        y = __fmaf_rn(Wr[t * TOPK + k], PARTS[(u64)(t * TOPK + k) * HIDDEN + d], y);
+                    if (sg >= 0) y = __fmaf_rn(gs, PARTS[(u64)(SHARED_ROW + t) * HIDDEN + d], y);
+                }
+                x = __fmaf_rn(y, g, x);
+                row[d] = x;
+            }
+            v[i] = x;
+            ss += x * x;
+        }
+        ss = warp_sum(ss);
+        if (lane == 0) red[warp][0] = ss;
+        __syncthreads();
+        ss = 0.0f;
+        for (int w = 0; w < 16; w++) ss += red[w][0];
+        float rs = 1.0f / sqrtf(ss / (float)HIDDEN + eps);
+        #pragma unroll
+        for (int i = 0; i < 5; i++) {
+            unsigned int d = tid + 512 * i;
+            XN[(u64)t * HC * HIDDEN + c * HIDDEN + d] = v[i] * rs * Wn[c * HIDDEN + d];
+        }
+        __syncthreads();
+    }
+    grid_bar(bar, nb);
+    // Phase 1: rows (r, r + 1) per step; warp w takes K slice [640 w, 640 w + 640).
+    for (unsigned int r0 = 2 * blockIdx.x; r0 < rows; r0 += 2 * nb) {
+        const unsigned short* w[2];
+        #pragma unroll
+        for (int r = 0; r < 2; r++) {
+            unsigned int row = min(r0 + r, rows - 1);
+            w[r] = (row < HC_LR ? Wd + (u64)row * HC * HIDDEN : Wi + (u64)(row - HC_LR) * HC * HIDDEN) + warp * 640;
+        }
+        float acc[2][T];
+        #pragma unroll
+        for (int r = 0; r < 2; r++)
+            #pragma unroll
+            for (int t = 0; t < T; t++) acc[r][t] = 0.0f;
+        for (unsigned int i = lane; i < 80; i += 32) {
+            uint4 p0 = ((const uint4*)w[0])[i], p1 = ((const uint4*)w[1])[i];
+            #pragma unroll
+            for (int t = 0; t < T; t++) {
+                const float4* x4 = (const float4*)(XN + (u64)t * HC * HIDDEN + warp * 640 + i * 8);
+                float4 a = x4[0], b = x4[1];
+                acc[0][t] += bf(p0.x & 0xffff) * a.x + bf(p0.x >> 16) * a.y + bf(p0.y & 0xffff) * a.z
+                           + bf(p0.y >> 16) * a.w + bf(p0.z & 0xffff) * b.x + bf(p0.z >> 16) * b.y
+                           + bf(p0.w & 0xffff) * b.z + bf(p0.w >> 16) * b.w;
+                acc[1][t] += bf(p1.x & 0xffff) * a.x + bf(p1.x >> 16) * a.y + bf(p1.y & 0xffff) * a.z
+                           + bf(p1.y >> 16) * a.w + bf(p1.z & 0xffff) * b.x + bf(p1.z >> 16) * b.y
+                           + bf(p1.w & 0xffff) * b.z + bf(p1.w >> 16) * b.w;
+            }
+        }
+        #pragma unroll
+        for (int r = 0; r < 2; r++)
+            #pragma unroll
+            for (int t = 0; t < T; t++) {
+                float s = warp_sum(acc[r][t]);
+                if (lane == 0) red[warp][r * T + t] = s;
+            }
+        __syncthreads();
+        if (tid < 2 * T) {
+            unsigned int r = tid / T, t = tid % T, row = r0 + r;
+            if (row < rows) {
+                float v = 0.0f;
+                for (int k = 0; k < 16; k++) v += red[k][r * T + t];
+                if (row < HC_LR) LO[t * HC_LR + row] = silu(v * 0.25f);
+                else INJ[t * HC + row - HC_LR] = v;
+            }
+        }
+        __syncthreads();
+    }
+    grid_bar(bar, nb);
+    // Phase 2: 32 outputs per block step, two per warp.
+    if (blockIdx.x >= HIDDEN / 32) return;
+    for (unsigned int i = tid; i < T * HC_LR; i += 512) lo[i] = LO[i];
+    __syncthreads();
+    for (unsigned int q = blockIdx.x; q < HIDDEN / 32; q += nb) {
+        #pragma unroll
+        for (int half = 0; half < 2; half++) {
+            unsigned int dl = warp + 16 * half, d = q * 32 + dl;
+            const uint4* w = (const uint4*)(Wu + (u64)d * HC * HC_LR);
+            uint4 qv[5];
+            #pragma unroll
+            for (int j = 0; j < 5; j++) qv[j] = w[lane + 32 * j];
+            float acc[T];
+            #pragma unroll
+            for (int t = 0; t < T; t++) acc[t] = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < 5; j++) {
+                unsigned int p = (lane >> 2) + 8 * j;
+                float wv[8] = {bf(qv[j].x & 0xffff), bf(qv[j].x >> 16), bf(qv[j].y & 0xffff), bf(qv[j].y >> 16),
+                               bf(qv[j].z & 0xffff), bf(qv[j].z >> 16), bf(qv[j].w & 0xffff), bf(qv[j].w >> 16)};
+                #pragma unroll
+                for (int t = 0; t < T; t++) {
+                    const float4* l4 = (const float4*)(lo + t * HC_LR + p * 8);
+                    float4 a = l4[0], b = l4[1];
+                    acc[t] += wv[0] * a.x + wv[1] * a.y + wv[2] * a.z + wv[3] * a.w
+                            + wv[4] * b.x + wv[5] * b.y + wv[6] * b.z + wv[7] * b.w;
+                }
+            }
+            #pragma unroll
+            for (int t = 0; t < T; t++) {
+                float v = acc[t];
+                v += __shfl_xor_sync(0xffffffffu, v, 4);
+                v += __shfl_xor_sync(0xffffffffu, v, 8);
+                v += __shfl_xor_sync(0xffffffffu, v, 16);
+                float g = sigm(v);
+                float g1 = __shfl_sync(0xffffffffu, g, 1), g2 = __shfl_sync(0xffffffffu, g, 2), g3 = __shfl_sync(0xffffffffu, g, 3);
+                if (lane == 0) {
+                    const float* xn = XN + (u64)t * HC * HIDDEN + d;
+                    float x = __fmaf_rn(xn[0], g, 0.0f);
+                    x = __fmaf_rn(xn[HIDDEN], g1, x);
+                    x = __fmaf_rn(xn[2 * HIDDEN], g2, x);
+                    x = __fmaf_rn(xn[3 * HIDDEN], g3, x);
+                    x *= 0.25f;
+                    X[(u64)t * HIDDEN + d] = x;
+                    xs[t][dl] = x;
+                }
+            }
+        }
+        __syncthreads();
+        if (quant && warp < T) quant_chunk(xs[warp][lane], XQ, T, HIDDEN, warp, q, lane);
+        __syncthreads();
+    }
+}
+#define HC_FUSED(T) \
+extern "C" __global__ void __launch_bounds__(512, 2) fl_hc_fused_t##T( \
+    float* R, const float* Yp, const float* Ip, unsigned int mode, const float* Wn, float eps, \
+    const float* PARTS, const float* Wr, const float* L, unsigned int stride, int sg, \
+    const unsigned short* Wd, const unsigned short* Wi, unsigned int rows, const unsigned short* Wu, \
+    float* X, unsigned int* XQ, unsigned int quant, float* INJ, float* XN, float* LO, unsigned int* bar) { \
+    hc_fused_body<T>(R, Yp, Ip, mode, Wn, eps, PARTS, Wr, L, stride, sg, Wd, Wi, rows, Wu, X, XQ, quant, \
+                     INJ, XN, LO, bar); \
+}
+HC_FUSED(1) HC_FUSED(2) HC_FUSED(3) HC_FUSED(4) HC_FUSED(5) HC_FUSED(6) HC_FUSED(7) HC_FUSED(8)
+
 // ---- Gated DeltaNet ----
 
 // Grid GDN_CONV / 128 (one block per 128-channel head), block 128.
