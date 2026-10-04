@@ -66,9 +66,9 @@ pub(crate) fn quantize_act_rows(x: &[f32], l: QAct, r0: usize, rows: usize, w: &
 
 /// One row of int8 activations, decoded from [`QAct`] words into element order.
 pub(crate) struct QRow {
-    q: Vec<i32>,
-    d: Vec<f32>,
-    hx: Vec<i32>,
+    pub(crate) q: Vec<i32>,
+    pub(crate) d: Vec<f32>,
+    pub(crate) hx: Vec<i32>,
 }
 
 impl QRow {
@@ -185,6 +185,47 @@ pub(crate) fn q8x_linear(xq: &[u32], wb: &[u8], m: usize, k: usize, n: usize) ->
                     }
                     acc = (d * x.d[c]).mul_add(s as f32, acc);
                 }
+            }
+            out[r * n + o] = acc;
+        }
+    }
+    out
+}
+
+/// `out[m, n] = W · x̂` for a NatX weight ([`crate::flash_native`]): per chunk the exact
+/// integer half sums, the type's scale combination, `fma(d_x, v, acc)`, chunks ascending.
+pub(crate) fn native_linear(
+    ty: crate::flash_native::NatType,
+    xq: &[u32],
+    wb: &[u8],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Vec<f32> {
+    let ir = crate::flash_native::nat_unpack(ty, wb, n, k);
+    let l = QAct { m, k };
+    let mut out = vec![0f32; m * n];
+    for r in 0..m {
+        let x = QRow::decode(xq, l, r);
+        for o in 0..n {
+            let mut acc = 0f32;
+            for c in 0..k / 32 {
+                let e0 = o * k + c * 32;
+                let mut s = [0i32; 2];
+                for (hh, sh) in s.iter_mut().enumerate() {
+                    for i in 0..16 {
+                        *sh += ir.code[e0 + 16 * hh + i] as i32 * x.q[c * 32 + 16 * hh + i];
+                    }
+                }
+                let (sc0, sc1) = (ir.scale[e0 / 16], ir.scale[e0 / 16 + 1]);
+                let v = if ty.per16() {
+                    sc1.mul_add(s[1] as f32, sc0 * s[0] as f32)
+                } else if ty.has_min() {
+                    sc0.mul_add((s[0] + s[1]) as f32, -(ir.min[e0 / 32] * x.hx[c] as f32))
+                } else {
+                    sc0 * (s[0] + s[1]) as f32
+                };
+                acc = x.d[c].mul_add(v, acc);
             }
             out[r * n + o] = acc;
         }

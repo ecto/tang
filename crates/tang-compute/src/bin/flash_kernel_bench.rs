@@ -495,7 +495,7 @@ fn window(
                 t,
                 eps,
             );
-            launches += 3;
+            launches += if unfused() { 3 } else { 1 };
         }
         if on(Class::Dense) {
             g.q4x_linear_into(&s.xq, &layer.w_in, &mut s.proj, t, HIDDEN, layer.in_rows);
@@ -644,7 +644,7 @@ fn window(
                 t,
                 eps,
             );
-            launches += 3;
+            launches += if unfused() { 3 } else { 1 };
         }
         if on(Class::Dense) {
             g.linear_into(&s.x2, &layer.router, &mut s.logits, t, HIDDEN, ROUTER_ROWS);
@@ -692,7 +692,7 @@ fn window(
             t,
             eps,
         );
-        launches += 3;
+        launches += if unfused() { 3 } else { 1 };
     }
     if on(Class::Dense) {
         g.q4x_linear_into(&s.xq, &m.head, &mut s.head, t, HIDDEN, VOCAB);
@@ -840,11 +840,97 @@ fn run_window(g: &CudaComputeDevice, ts: &[usize]) {
 
 fn window_launches(c: Class) -> usize {
     match c {
-        Class::Hc => 96 * 3 + 3,
+        Class::Hc => {
+            if unfused() {
+                97 * 3
+            } else {
+                97
+            }
+        }
         Class::Dense => 48 * 3 + 1,
         Class::Gdn => 36,
         Class::Qsa => 12 * 5,
         Class::Moe => 48 * 3,
+    }
+}
+
+/// Native GGUF types (NatX): GB/s of the GGUF's bytes (and of the repacked ones) at the
+/// Flash-Next dense shapes, T = 1 and 4, in graphs over weight copies larger than L2.
+fn native(g: &CudaComputeDevice) {
+    use tang_compute::flash_native::{
+        nat_layout,
+        tests::{random_gguf, ALL},
+        NatType,
+    };
+    let mut rng = Rng(0xa11ce);
+    println!("native GEMV, GB/s of GGUF bytes T=1 / T=4 (repacked bytes in parentheses)");
+    let shapes = [
+        (2560, 16480),
+        (2560, 13952),
+        (2560, 10240),
+        (2560, 6144),
+        (6144, 2560),
+        (2560, 12288),
+        (2560, 640),
+        (2560, 512),
+    ];
+    // FKB_SHAPES="2560x10240,6144x2560" and FKB_TYPES="Q4K,Q3K" narrow the sweep.
+    let env_shapes: Option<Vec<(usize, usize)>> = std::env::var("FKB_SHAPES").ok().map(|v| {
+        v.split(',')
+            .map(|p| {
+                let (k, n) = p.split_once('x').expect("KxN");
+                (k.parse().unwrap(), n.parse().unwrap())
+            })
+            .collect()
+    });
+    let types = std::env::var("FKB_TYPES").unwrap_or_default();
+    for ty in ALL {
+        if !types.is_empty() && !types.split(',').any(|t| t == format!("{ty:?}")) {
+            continue;
+        }
+        let mut line = format!("{ty:<6?}");
+        let mut sh: Vec<(usize, usize)> = env_shapes.clone().unwrap_or_else(|| shapes.to_vec());
+        if ty == NatType::Q5K && env_shapes.is_none() {
+            sh.push((2560, 248_320));
+        }
+        for (k, n) in sh {
+            if ty.block().0 == 256 && k % 256 != 0 {
+                continue;
+            }
+            let raw = random_gguf(ty, n, k, rng.u());
+            let bytes = ty.gguf_bytes(n, k);
+            let rep = nat_layout(ty, n, k).3;
+            let copies = (96usize << 20).div_ceil(rep).clamp(1, 16);
+            let ws: Vec<B> = (0..copies)
+                .map(|_| g.upload_native(ty, &raw, n, k))
+                .collect();
+            let mut cell = format!(" | {k}->{n}");
+            for t in [1usize, 4] {
+                let mut xq = g.alloc_f32(QAct { m: t, k }.words());
+                g.quantize_act_into(&g.upload_f32(&rng.vec(t * k, 1.0)), &mut xq, t, k);
+                let mut y = g.alloc_f32(t * n);
+                let reps = (copies * 4).max(8);
+                let graph = g.capture(&mut || {
+                    for i in 0..reps {
+                        g.native_linear_into(ty, &xq, &ws[i % copies], &mut y, t, k, n);
+                    }
+                });
+                graph.launch().unwrap();
+                let ms = (0..3)
+                    .map(|_| g.event_ms(&mut || graph.launch().unwrap()))
+                    .fold(f32::INFINITY, f32::min);
+                let us = ms as f64 * 1e3 / reps as f64;
+                cell += &format!(" {:.0}", bytes as f64 / (us * 1e3));
+                if env_shapes.is_some() {
+                    cell += &format!("/{us:.1}us");
+                }
+                if t == 4 {
+                    cell += &format!(" ({:.0})", rep as f64 / (us * 1e3));
+                }
+            }
+            line += &cell;
+        }
+        println!("{line}");
     }
 }
 
@@ -860,7 +946,30 @@ fn moe(g: &CudaComputeDevice) {
         b
     };
     let pool: Vec<B> = (0..EXPERTS).map(|_| g.upload_bytes(&blob)).collect();
-    let addrs: Vec<u64> = pool.iter().map(|b| g.buffer_addr(b)).collect();
+    let mut addrs: Vec<u64> = pool.iter().map(|b| g.buffer_addr(b)).collect();
+    // FKB_HOST=n: the first n experts of the pool live in mapped pinned host memory (the
+    // engine's miss path), read by the kernels straight over PCIe.
+    let host: usize = std::env::var("FKB_HOST")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    for a in addrs.iter_mut().take(host) {
+        use cudarc::driver::{result, sys};
+        // SAFETY: a fresh pinned allocation, written once here, never freed (bench lifetime).
+        unsafe {
+            let p = result::malloc_host(
+                blob.len(),
+                sys::CU_MEMHOSTALLOC_DEVICEMAP | sys::CU_MEMHOSTALLOC_PORTABLE,
+            )
+            .unwrap() as *mut u8;
+            std::ptr::copy_nonoverlapping(blob.as_ptr(), p, blob.len());
+            let mut d: sys::CUdeviceptr = 0;
+            sys::cuMemHostGetDevicePointer_v2(&mut d, p as *mut _, 0)
+                .result()
+                .unwrap();
+            *a = d;
+        }
+    }
     let shared = g.upload_bytes(&blob);
     println!("moe_grouped_into, 48 layers in one graph (GB/s of expert bytes read)");
     for t in [1usize, 2, 4, 8] {
@@ -913,6 +1022,48 @@ fn moe(g: &CudaComputeDevice) {
     }
 }
 
+/// Hyper-connection reads alone: 96 reads (48 layers x 2) in one graph over 8 weight copies (>L2),
+/// each with a pending block-output write and the injection, T = 1, 2, 4, 8.
+fn hc(g: &CudaComputeDevice) {
+    let mut rng = Rng(0x4c);
+    let src = Src::new(&mut rng, 16 << 20);
+    let hcs: Vec<Hc> = (0..8).map(|_| Hc::new(g, &src)).collect();
+    println!("hc_read_into x96 in one graph (GB/s of bf16 weight bytes)");
+    for t in [1usize, 2, 4, 8] {
+        let mut r = g.upload_f32(&rng.vec(t * HC * HIDDEN, 1.0));
+        let y = g.upload_f32(&rng.vec(t * HIDDEN, 0.1));
+        let inj = g.upload_f32(&rng.vec(t * HC, 1.0));
+        let mut x = g.alloc_f32(t * HIDDEN);
+        let mut xq = g.alloc_f32(QAct { m: t, k: HIDDEN }.words());
+        let mut inj_o = g.alloc_f32(t * HC);
+        let mut sc = g.alloc_f32(flash::hc_scratch_words(t));
+        let graph = g.capture(&mut || {
+            for i in 0..96 {
+                g.hc_read_into(
+                    &mut r,
+                    Some(HcPending::Write { y: &y, inj: &inj }),
+                    &hcs[i % 8].w(true),
+                    &mut x,
+                    Some(&mut xq),
+                    Some(&mut inj_o),
+                    &mut sc,
+                    t,
+                    1e-6,
+                );
+            }
+        });
+        graph.launch().unwrap();
+        let ms = (0..5)
+            .map(|_| g.event_ms(&mut || graph.launch().unwrap()))
+            .fold(f32::INFINITY, f32::min);
+        let us = ms as f64 * 1e3 / 96.0;
+        println!(
+            "  T={t}: {us:6.1} us/read, {:4.0} GB/s",
+            Hc::BYTES as f64 / (us * 1e3)
+        );
+    }
+}
+
 /// `TANG_FLASH_UNION=1`: QSA attention over the window's union of selections (measured slower
 /// than per-token attention on mew; kept for A/B).
 fn union_attend() -> bool {
@@ -930,6 +1081,8 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("gemv") => gemv(&g),
         Some("moe") => moe(&g),
+        Some("hc") => hc(&g),
+        Some("native") => native(&g),
         Some("window") => {
             let ts: Vec<usize> = args[1..].iter().map(|a| a.parse().expect("T")).collect();
             run_window(&g, if ts.is_empty() { &[1, 2, 4] } else { &ts });
