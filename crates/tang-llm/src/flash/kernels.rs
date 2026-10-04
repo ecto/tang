@@ -119,6 +119,30 @@ extern "C" __global__ void fe_silu_q(const float* gu, unsigned* xq, float* hf, i
     }
 }
 
+// PCIe share with a per-layer cap: the first `cap` missing experts of the plan (first-appearance
+// order, as the host's own plan lists them) become groups read from the mapped host arena
+// (`hosttab`: EXPERTS addresses, word pairs). One thread.
+extern "C" __global__ void fe_pcie_patch(unsigned* plan, const unsigned* ids, const unsigned* hosttab,
+                                         int t, int cap, int gp, int gs, int et, int ed, int miss) {
+    if (threadIdx.x != 0) return;
+    unsigned ng = plan[0], ne = plan[1];
+    const unsigned nm = plan[2];
+    for (unsigned i = 0; i < nm && (int)i < cap; i++) {
+        const unsigned e = plan[miss + i];
+        const unsigned lo = hosttab[2 * e], hi = hosttab[2 * e + 1];
+        if (lo == 0 && hi == 0) continue;
+        plan[gp + 2 * ng] = lo;
+        plan[gp + 2 * ng + 1] = hi;
+        plan[gs + ng] = ne;
+        for (int j = 0; j < t * 10; j++)
+            if (ids[j] == e) { plan[et + ne] = j / 10; plan[ed + ne] = j; ne++; }
+        ng++;
+    }
+    plan[gs + ng] = ne;
+    plan[0] = ng;
+    plan[1] = ne;
+}
+
 // dst[i] = src[i] for n floats.
 extern "C" __global__ void fe_copy(float* dst, const float* src, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -682,8 +706,21 @@ __device__ void embed_rows(const unsigned char* table, int row_bytes, const unsi
         for (int i = 0; i < 8; i++) out[(size_t)blockIdx.x * k + e0 + i] = v[i];
     }
 }
-extern "C" __global__ void fe_embed_q3k(const unsigned char* table, int row_bytes, const unsigned* toks, float* out, int k) {
-    embed_rows<11>(table, row_bytes, toks, out, k);
+// A pruned table holds token rows [0, n_lo) then [hi_base, ...): map ids to rows.
+extern "C" __global__ void fe_embed_q3k(const unsigned char* table, int row_bytes, const unsigned* toks, float* out, int k,
+                                        int n_lo, int hi_base) {
+    __shared__ unsigned row[8];
+    if (threadIdx.x == 0) {
+        const unsigned t = toks[blockIdx.x];
+        row[0] = (int)t < n_lo ? t : n_lo + (t - hi_base);
+    }
+    __syncthreads();
+    const unsigned char* r = table + (size_t)row[0] * row_bytes;
+    for (int e0 = threadIdx.x * 8; e0 < k; e0 += blockDim.x * 8) {
+        float v[8];
+        decode8<11>(r, e0, v);
+        for (int i = 0; i < 8; i++) out[(size_t)blockIdx.x * k + e0 + i] = v[i];
+    }
 }
 
 // cat[c][s] = [rmsnorm(e[c]) * enorm ; rmsnorm(h[c][s]) * hnorm[s]] (one block per (cell, stream)).

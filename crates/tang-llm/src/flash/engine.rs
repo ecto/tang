@@ -314,6 +314,7 @@ struct Kern {
     scatter: Fun,
     argmax: Fun,
     argmax2: Fun,
+    pcie: Fun,
     m_embed: Fun,
     m_cat: Fun,
     m_prep: Fun,
@@ -357,7 +358,9 @@ impl Io {
     const MTP_IN: usize = Self::STAMPS + 48 * 8 * 8 + 64;
     /// MTP outputs per step: drafts (8 u32), then at +32 probabilities (8 f32).
     const MTP_OUT: usize = Self::MTP_IN + 128;
-    const BYTES: usize = Self::MTP_OUT + 64 * 8;
+    /// Teacher-forced MTP cells' token embeddings (8 × 2560 f32).
+    const MTP_EMB: usize = Self::MTP_OUT + 64 * 8;
+    const BYTES: usize = Self::MTP_EMB + MAX_T * HIDDEN * 4;
 
     fn ptr(&self, off: usize) -> *mut u8 {
         unsafe { self.arena.as_ptr().add(off) }
@@ -450,6 +453,9 @@ pub struct Engine {
     /// Per layer, the device residency table `moe_route_into` plans from (`EXPERTS` addresses,
     /// 0 = on the host), mirrored from the cache's table after each boundary.
     tables: Vec<B>,
+    /// Per layer, the mapped host address of every host-resident expert (PCIe share).
+    host_tables: Vec<B>,
+    host_addrs: Vec<u64>,
     /// The addresses `tables` holds now (host copy, to find layers that changed).
     table_addrs: Vec<u64>,
     host_plan: Vec<u32>,
@@ -463,8 +469,9 @@ pub struct Engine {
     pub last_mtp_gpu_ms: f64,
     defer_boundary: bool,
     pending_boundary: bool,
-    /// Fraction of host-resident experts the GPU streams over PCIe (`TANG_FLASH_PCIE`).
-    pub pcie_frac: f32,
+    /// At most this many missed experts per layer the GPU streams from the mapped host arena
+    /// instead of the CPU computing them (`TANG_FLASH_PCIE_CAP`).
+    pub pcie_cap: usize,
     /// A second stream: the MTP draft overlaps the commit.
     side: Stream,
     /// Run the MTP after every window (keeps its K/V cache complete) and keep its drafts.
@@ -787,6 +794,7 @@ impl Engine {
             scatter: f(&m, "fe_scatter_cols")?,
             argmax: f(&m, "fe_argmax1")?,
             argmax2: f(&m, "fe_argmax2")?,
+            pcie: f(&m, "fe_pcie_patch")?,
             publish: f(&db, "db_publish")?,
             wait: f(&db, "db_wait")?,
             copy_rows: f(&db, "db_copy_rows")?,
@@ -883,6 +891,7 @@ impl Engine {
         let t_experts = t2.elapsed().as_secs_f64();
         let (free2, _) = gpu.mem_info().map_err(|e| anyhow!("{e}"))?;
         let tables: Vec<B> = (0..hp.n_layer).map(|_| dev.alloc_f32(2 * EXPERTS)).collect();
+        let host_tables: Vec<B> = (0..hp.n_layer).map(|_| dev.alloc_f32(2 * EXPERTS)).collect();
         let mut exec = MissExec::new(Pool::new(&Pool::default_cpus(), std::time::Duration::from_millis(20)), Isa::detect());
         exec.tiled = true;
         let ngram = std::sync::Arc::new(NgramTable::open(&g, &plep)?);
@@ -938,6 +947,8 @@ impl Engine {
             tokens: Vec::new(),
             routing: vec![0; 48 * EXPERTS],
             keys: Vec::new(),
+            host_tables,
+            host_addrs: vec![u64::MAX; 48 * EXPERTS],
             tables,
             table_addrs: vec![u64::MAX; 48 * EXPERTS],
             host_plan: vec![0; MoePlan::WORDS],
@@ -951,7 +962,7 @@ impl Engine {
             last_mtp_gpu_ms: 0.0,
             defer_boundary: false,
             pending_boundary: false,
-            pcie_frac: std::env::var("TANG_FLASH_PCIE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0),
+            pcie_cap: std::env::var("TANG_FLASH_PCIE_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             side: Stream::new().map_err(|e| anyhow!("{e}"))?,
             use_mtp: false,
             mtp_last: Vec::new(),
@@ -1306,6 +1317,20 @@ impl Engine {
             &mut s.plan,
             t,
         );
+        if self.pcie_cap > 0 {
+            let (plan, ids, ht, ti, cap) = (a(&s.plan), a(&s.ids), a(&self.host_tables[l]), t as i32, self.pcie_cap as i32);
+            let (gp, gs, et, ed, mi) = (
+                MoePlan::GROUP_PTR as i32,
+                MoePlan::GROUP_START as i32,
+                MoePlan::ENT_TOK as i32,
+                MoePlan::ENT_DST as i32,
+                MoePlan::MISSING as i32,
+            );
+            unsafe {
+                gpu::launch(self.k.pcie, (1, 1, 1), (32, 1, 1), 0, &self.stream, tang_moe::args![plan, ids, ht, ti, cap, gp, gs, et, ed, mi])
+                    .expect("launch")
+            };
+        }
         // Publish ids and activations; the host computes the misses while the GPU runs the
         // hits and the shared expert.
         let mbp = self.mb.device();
@@ -1570,7 +1595,9 @@ impl Engine {
                 Experts::Cpu(_) => 0,
             }
         };
-        let missed = build_plan(&ids, t, addr, 0, &mut self.host_plan);
+        let mut missed = build_plan(&ids, t, addr, 0, &mut self.host_plan);
+        let streamed = if matches!(experts, Experts::Resident(_)) { self.pcie_cap.min(missed.len()) } else { 0 };
+        missed.drain(..streamed);
         let t1 = Instant::now();
         let blob = ExpertBlob::BYTES;
         let jobs: Vec<MissJob> = missed
@@ -1602,12 +1629,7 @@ impl Engine {
         st.routed += t * TOPK;
         st.distinct += distinct.len();
         st.missed += missed.len();
-        if let Experts::Resident(rc) = &self.experts {
-            st.pcie += distinct
-                .iter()
-                .filter(|&&e| self.table_addrs[(base + e) as usize] != 0 && rc.addr(base + e) == 0)
-                .count();
-        }
+        st.pcie += streamed;
         for &e in &distinct {
             self.routing[(base + e) as usize] += 1;
             self.keys.push(base + e);
@@ -1752,14 +1774,11 @@ impl Engine {
             let mut dirty = false;
             for e in 0..EXPERTS {
                 let key = (base + e) as u32;
-                let mut a = rc.addr(key);
-                // PCIe share: a fixed fraction of the host-resident keys is streamed by the
-                // expert kernel from the mapped arena instead of computed on the CPU.
-                if a == 0 && self.pcie_frac > 0.0 {
-                    let h = (key.wrapping_mul(2_654_435_761) >> 8) as f32 / (1u32 << 24) as f32;
-                    if h < self.pcie_frac {
-                        a = rc.host_device_addr(key).unwrap_or(0);
-                    }
+                let a = rc.addr(key);
+                let hd = if a == 0 { rc.host_device_addr(key).unwrap_or(0) } else { 0 };
+                if self.host_addrs[base + e] != hd {
+                    self.host_addrs[base + e] = hd;
+                    dirty = true;
                 }
                 if self.table_addrs[base + e] != a {
                     self.table_addrs[base + e] = a;
@@ -1776,6 +1795,16 @@ impl Engine {
                             self.stream.0,
                         ),
                         "table copy",
+                    )
+                    .map_err(|e| anyhow!("{e}"))?;
+                    gpu::check(
+                        cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                            self.dev.buffer_addr(&self.host_tables[l]),
+                            self.host_addrs[base..].as_ptr() as *const std::ffi::c_void,
+                            EXPERTS * 8,
+                            self.stream.0,
+                        ),
+                        "host table copy",
                     )
                     .map_err(|e| anyhow!("{e}"))?;
                 }
@@ -2275,8 +2304,12 @@ struct Mtp {
     ex: [B; 3],
     ex_rb: [usize; 3],
     /// The main model's token embedding (Q3_K) for the chain's draft tokens.
+    /// The main embedding's rows for the drafter's vocabulary (chain cells' draft tokens);
+    /// teacher-forced cells' rows come from the host.
     embed: B,
     embed_rb: usize,
+    emb_lo: i32,
+    emb_hi: i32,
     /// The draft head: the main head's rows for tokens [0, n_lo) and [hi_base, vocab)
     /// (`TANG_FLASH_MTP_VOCAB`, e.g. 32768; default 0 = the whole head: on code, 32768 costs d1 97% -> 91%). A drafter's vocabulary
     /// changes acceptance only.
@@ -2358,6 +2391,14 @@ impl Mtp {
             })
         };
         let q8 = std::env::var("TANG_FLASH_MTP_Q8").is_ok_and(|v| v == "1");
+        // The drafter's vocabulary: token ids [0, n) and the specials from 248044 on
+        // (`TANG_FLASH_MTP_VOCAB`, default 65536; 0 = all).
+        let vocab_lo: Option<usize> = match std::env::var("TANG_FLASH_MTP_VOCAB").ok().and_then(|v| v.parse::<usize>().ok()) {
+            Some(0) => None,
+            Some(n) if n < 248_044 => Some(n),
+            Some(_) => None,
+            None => Some(65536),
+        };
         let mut ex: Vec<B> = Vec::new();
         let mut ex_rb = [0usize; 3];
         for (i, n) in ["ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"].iter().enumerate() {
@@ -2396,12 +2437,22 @@ impl Mtp {
             ex_ty: if q8 { 8 } else { 2 },
             ex: [ex.remove(0), ex.remove(0), ex.remove(0)],
             ex_rb,
-            embed: m::upload_padded(dev, main.bytes(emb_t)),
+            embed: {
+                let all = main.bytes(emb_t);
+                let rb = emb_t.row_bytes()?;
+                match vocab_lo {
+                    Some(n) => {
+                        let mut b = all[..n * rb].to_vec();
+                        b.extend_from_slice(&all[248_044.min(vocab) * rb..vocab * rb]);
+                        m::upload_padded(dev, &b)
+                    }
+                    None => m::upload_padded(dev, all),
+                }
+            },
+            emb_lo: vocab_lo.map_or(vocab as i32, |n| n as i32),
+            emb_hi: 248_044.min(vocab) as i32,
             dhead: {
-                let n_lo: usize = std::env::var("TANG_FLASH_MTP_VOCAB").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-                if n_lo == 0 || n_lo >= vocab {
-                    None
-                } else {
+                if let Some(n_lo) = vocab_lo {
                     let ht = main.info("output.weight")?;
                     let rb = ht.row_bytes()?;
                     let hi_base = 248_044.min(vocab);
@@ -2423,6 +2474,8 @@ impl Mtp {
                         n_lo,
                         hi_base,
                     ))
+                } else {
+                    None
                 }
             },
             embed_rb: emb_t.row_bytes()?,
@@ -2465,10 +2518,12 @@ impl Engine {
             gpu::launch(f, grid, (block, 1, 1), 0, &st, args).expect("mtp launch")
         };
         let ctl = a(&mt.ctl[step]);
-        // embedding of the cells' tokens, then [e ; hn] per stream
+        // embedding of the cells' tokens (step 0: staged by the host), then [e ; hn] per stream
         {
-            let (tb, rb, tk, e, k) = (a(&mt.embed), mt.embed_rb as i32, a(&mt.toks), a(&mt.e), HIDDEN as i32);
-            launch(self.k.m_embed, (c as u32, 1, 1), 256, tang_moe::args![tb, rb, tk, e, k]);
+            let (tb, rb, tk, e, k, lo, hi) = (a(&mt.embed), mt.embed_rb as i32, a(&mt.toks), a(&mt.e), HIDDEN as i32, mt.emb_lo, mt.emb_hi);
+            if step > 0 {
+                launch(self.k.m_embed, (c as u32, 1, 1), 256, tang_moe::args![tb, rb, tk, e, k, lo, hi]);
+            }
             let (en, h, hn, cat, eps) = (a(&mt.enorm), a(&mt.h), a(&mt.hnorm), a(&mt.cat), EPS);
             launch(self.k.m_cat, ((c * HC) as u32, 1, 1), 256, tang_moe::args![e, en, h, hn, cat, eps]);
         }
@@ -2586,6 +2641,11 @@ impl Engine {
                 "mtp h",
             )
             .expect("copy");
+            gpu::check(
+                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(self.dev.buffer_addr(&mt.e), self.io.ptr(Io::MTP_EMB) as *const _, c * HIDDEN * 4, st),
+                "mtp emb",
+            )
+            .expect("copy");
         }
         self.enqueue_mtp_cells(0, c);
         let steps = self.mtp.as_ref().unwrap().steps;
@@ -2653,6 +2713,14 @@ impl Engine {
 
     fn mtp_stage(&mut self, pos0: usize, next: &[u32]) {
         let c = next.len();
+        if let Ok(emb_t) = self.g.info("token_embd.weight").cloned() {
+            let e = self.io.f32s(Io::MTP_EMB, c * HIDDEN);
+            for (i, &tok) in next.iter().enumerate() {
+                if let Ok(row) = self.g.rows(&emb_t, tok as usize, 1) {
+                    e[i * HIDDEN..(i + 1) * HIDDEN].copy_from_slice(&row);
+                }
+            }
+        }
         let tk = self.io.u32s(Io::MTP_IN, MAX_T);
         tk[..c].copy_from_slice(next);
         let ctl = self.io.u32s(Io::MTP_IN + 64, 2);

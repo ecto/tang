@@ -28,6 +28,7 @@ struct Args {
     temp: f32,
     seed: u32,
     out: Option<PathBuf>,
+    think: Option<bool>,
 }
 
 fn read_ids(f: &str) -> Result<Vec<u32>> {
@@ -59,6 +60,7 @@ fn parse(args: &[String]) -> Result<Args> {
         temp: 0.0,
         seed: 0,
         out: None,
+        think: None,
     };
     while let Some(x) = it.next() {
         let mut val = || it.next().with_context(|| format!("{x} needs a value"));
@@ -91,6 +93,7 @@ fn parse(args: &[String]) -> Result<Args> {
             "-q" => a.quiet = true,
             "--save" => a.save = Some(PathBuf::from(val()?)),
             "--draft" => a.draft = val()?.clone(),
+            "--no-think" => a.think = Some(false),
             "--mtp" => a.opts.mtp = Some(PathBuf::from(val()?)),
             "--temp" => a.temp = val()?.parse()?,
             "--seed" => a.seed = val()?.parse()?,
@@ -147,7 +150,7 @@ pub fn detok(vocab: &[String], ids: &[u32]) -> String {
 
 fn prompt_ids(a: &Args) -> Result<Vec<u32>> {
     if let Some(p) = &a.prompt {
-        return super::tokenize::encode_chat(&a.path, p);
+        return super::tokenize::encode_chat(&a.path, p, a.think);
     }
     ensure!(!a.ids.is_empty(), "no prompt (--prompt-ids, --ids-file or --prompt)");
     Ok(a.ids.clone())
@@ -208,6 +211,8 @@ pub struct SpecStats {
     pub mtp_ms: f64,
     pub commit_ms: f64,
     pub mtp_gpu_ms: f64,
+    /// Windows that used the suffix drafter's proposal (hybrid).
+    pub suffix_windows: usize,
 }
 
 /// Decode `n` tokens after `ids` with verify windows and drafts from `kind` (`none`, `suffix`,
@@ -221,8 +226,9 @@ fn decode_spec(
 ) -> Result<(Vec<u32>, Vec<WinStats>, f64, f64, SpecStats)> {
     use crate::draft::{Calibration, DraftConfig, Global, Session};
     e.reset();
-    e.use_mtp = kind == "mtp";
+    e.use_mtp = kind == "mtp" || kind == "hybrid";
     ensure!(!e.use_mtp || e.has_mtp(), "--draft mtp needs --mtp FILE");
+    let is_mtp = e.use_mtp;
     let t0 = Instant::now();
     let mut cur = e.prefill(ids, chunk, None)?;
     let prefill_s = t0.elapsed().as_secs_f64();
@@ -276,7 +282,7 @@ fn decode_spec(
                 let d = sess.propose(room);
                 (d.tokens.clone(), Some(d))
             }
-            "mtp" => {
+            "mtp" | "hybrid" => {
                 // Price each draft length: expected tokens (1 + Σ cumulative acceptance) per
                 // ms of window (measured EMA per width) plus drafting, keep the best. The
                 // acceptance of a draft is estimated from its probability by an online
@@ -294,7 +300,19 @@ fn decode_spec(
                 }
                 let d: Vec<u32> = e.mtp_last.iter().take(best.0).map(|x| x.0).collect();
                 mtp_probs = e.mtp_last.iter().take(best.0).map(|x| x.1).collect();
-                (d, None)
+                // Hybrid: take the suffix drafter's longer proposal when it agrees with the
+                // MTP's first draft (a long earlier match: quoted text, code being repeated).
+                let sd = if kind == "hybrid" { sess.propose(room) } else { Default::default() };
+                if !sd.tokens.is_empty()
+                    && e.mtp_last.first().is_some_and(|x| x.0 == sd.tokens[0])
+                    && sd.tokens.len() > d.len()
+                {
+                    mtp_probs.clear();
+                    sp.suffix_windows += 1;
+                    (sd.tokens.clone(), Some(sd))
+                } else {
+                    (d, None)
+                }
             }
             "wrong" => {
                 // Forced-wrong: random tokens (and sometimes a true prefix from an oracle).
@@ -325,7 +343,7 @@ fn decode_spec(
             _ => (Vec::new(), None),
         };
         let drafts = match (kind, fixed_gate) {
-            ("mtp", Some(g)) => {
+            ("mtp" | "hybrid", Some(g)) => {
                 // Fixed gate (TANG_FLASH_GATE=0.5): keep drafts while p >= g.
                 let d: Vec<u32> = e.mtp_last.iter().take_while(|x| x.1 >= g).take(room).map(|x| x.0).collect();
                 mtp_probs = e.mtp_last.iter().take(d.len()).map(|x| x.1).collect();
@@ -335,7 +353,7 @@ fn decode_spec(
         };
         let kept = e.verify(cur, &drafts)?;
         let acc = kept.len() - 1;
-        if kind == "mtp" {
+        if is_mtp {
             for (j, &p) in mtp_probs.iter().enumerate().take(acc + 1) {
                 let b = ((p * 10.0) as usize).min(9);
                 calib[b].1 += 1.0;
@@ -377,7 +395,8 @@ fn decode_spec(
 }
 
 fn spec_report(sp: &SpecStats) -> String {
-    let mut s = format!(
+    let mut s = format!("suffix drafts in {} windows; ", sp.suffix_windows);
+    s += &format!(
         "mtp {:.2} ms/window (waiting for the commit {:.2}, MTP graph on the GPU {:.2}); ",
         sp.mtp_ms / sp.windows.max(1) as f64,
         sp.commit_ms / sp.windows.max(1) as f64,

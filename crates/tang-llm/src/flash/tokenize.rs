@@ -113,10 +113,10 @@ impl FlashTokenizer {
 }
 
 /// The chat template applied to one user message, tokenized.
-pub fn encode_chat(gguf: &Path, text: &str) -> Result<Vec<u32>> {
+pub fn encode_chat(gguf: &Path, text: &str, think: Option<bool>) -> Result<Vec<u32>> {
     let g = Gguf::open(gguf)?;
     let t = FlashTokenizer::from_gguf(&g)?;
-    t.encode(&t.chat(text, None)?)
+    t.encode(&t.chat(text, think)?)
 }
 
 /// `tang-llm flash-tokenize <gguf> (--text T | --chat T | --check IDS_FILE...)`: print ids, or
