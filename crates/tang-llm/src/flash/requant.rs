@@ -38,6 +38,43 @@ pub enum Format {
     Q4xSearch,
     /// Q8_0: int8 codes, f16 scale per 32.
     Q8,
+    /// int8 codes, one f32 scale per row (`amax / 127`).
+    Q8Row,
+    /// FP8 E4M3 (finite, max 448, round to nearest even), one f32 scale per row (`amax / 448`).
+    Fp8Row,
+    /// Symmetric 6-bit codes in [-31, 31], f16 scale per 32 (`amax / 31`): 6.5 bits a weight.
+    Q6,
+    /// Symmetric 5-bit codes in [-15, 15], f16 scale per 32: 5.5 bits a weight.
+    Q5,
+}
+
+impl Format {
+    /// The HC study's format names (`--hc-as`).
+    pub fn parse_hc(s: &str) -> Result<Self> {
+        Ok(match s {
+            "bf16" | "native" => Self::Keep,
+            "q8" => Self::Q8,
+            "q8row" => Self::Q8Row,
+            "fp8" => Self::Fp8Row,
+            "q6" => Self::Q6,
+            "q5" => Self::Q5,
+            "q4x" => Self::Q4x,
+            _ => bail!("--hc-as {s}: want bf16, q8, q8row, fp8, q6, q5 or q4x"),
+        })
+    }
+}
+
+/// FP8 E4M3 ("fn": no infinities, max 448, subnormal step 2^-9): `x` rounded to the nearest
+/// representable value, ties to even.
+pub fn round_e4m3(x: f32) -> f32 {
+    if x == 0.0 || !x.is_finite() {
+        return if x.is_finite() { x } else { 448f32.copysign(x) };
+    }
+    let a = x.abs().min(448.0);
+    let e = a.log2().floor().max(-6.0) as i32;
+    let step = 2f32.powi(e - 3);
+    let q = ((a / step).round_ties_even() * step).min(448.0);
+    q.copysign(x)
 }
 
 /// Which dense tensors go to which [`Format`]: an ordered rule list, first match wins, for the
@@ -171,6 +208,37 @@ pub fn apply(f: Format, w: &mut [f32], k: usize) {
                 }
             });
         }
+        Format::Q8Row | Format::Fp8Row => {
+            let fp8 = f == Format::Fp8Row;
+            w.par_chunks_mut(k).for_each(|row| {
+                let amax = row.iter().fold(0f32, |m, v| m.max(v.abs()));
+                if amax == 0.0 {
+                    return;
+                }
+                let d = amax / if fp8 { 448.0 } else { 127.0 };
+                for v in row.iter_mut() {
+                    *v = if fp8 {
+                        round_e4m3(*v / d) * d
+                    } else {
+                        (*v / d).round() * d
+                    };
+                }
+            });
+        }
+        Format::Q6 | Format::Q5 => {
+            let m = if f == Format::Q6 { 31.0 } else { 15.0 };
+            w.par_chunks_mut(32).for_each(|b| {
+                let amax = b.iter().fold(0f32, |a, v| a.max(v.abs()));
+                let d = f16_to_f32(f32_to_f16(amax / m));
+                if d == 0.0 {
+                    b.iter_mut().for_each(|v| *v = 0.0);
+                    return;
+                }
+                for v in b.iter_mut() {
+                    *v = (*v / d).round().clamp(-m, m) * d;
+                }
+            });
+        }
     }
 }
 
@@ -258,6 +326,9 @@ pub fn bytes(f: Format, ty: GgmlType, n: usize) -> u64 {
         Format::Keep => ty.bytes_for(n).unwrap_or(0) as u64,
         Format::Q4x | Format::Q4xSearch => (n / 2 + 4 * n / 64) as u64,
         Format::Q8 => (n / 32 * 34) as u64,
+        Format::Q8Row | Format::Fp8Row => n as u64, // + 4 B a row
+        Format::Q6 => (n / 32 * 26) as u64,
+        Format::Q5 => (n / 32 * 22) as u64,
     }
 }
 
@@ -391,6 +462,26 @@ mod tests {
             lv.dedup();
             assert!(lv.len() <= 16);
         }
+    }
+
+    #[test]
+    fn e4m3_grid() {
+        for (x, want) in [
+            (1.0f32, 1.0),
+            (1.06, 1.0),
+            (1.07, 1.125),
+            (448.0, 448.0),
+            (1000.0, 448.0),
+            (0.0, 0.0),
+        ] {
+            assert_eq!(round_e4m3(x), want, "{x}");
+            assert_eq!(round_e4m3(-x), -want);
+        }
+        // subnormals: step 2^-9
+        assert_eq!(round_e4m3(3.0 * 2f32.powi(-9)), 3.0 * 2f32.powi(-9));
+        assert_eq!(round_e4m3(2f32.powi(-11)), 0.0); // tie between 0 and 2^-9 -> even (0)
+                                                     // 1.0625 is a tie between 1.0 and 1.125 -> even mantissa (1.0)
+        assert_eq!(round_e4m3(1.0625), 1.0);
     }
 
     #[test]
