@@ -330,6 +330,7 @@ struct Kern {
     argmax: Fun,
     argmax2: Fun,
     pcie: Fun,
+    wait_if: Fun,
     m_embed: Fun,
     m_cat: Fun,
     m_prep: Fun,
@@ -369,8 +370,10 @@ impl Io {
     const PLE: usize = Self::EMB + MAX_T * HIDDEN * 4;
     const IDS: usize = Self::PLE + MAX_T * HIDDEN * 4;
     const STAMPS: usize = Self::IDS + 64;
+    /// Every layer's routed ids `[48][MAX_T × TOPK]` u32, written by the graph.
+    const LIDS: usize = Self::STAMPS + 48 * 8 * 8 + 64;
     /// MTP inputs: cell tokens (8 u32), then at +64 the control record [pos0, cells].
-    const MTP_IN: usize = Self::STAMPS + 48 * 8 * 8 + 64;
+    const MTP_IN: usize = Self::LIDS + 48 * MAX_T * TOPK * 4;
     /// MTP outputs per step: drafts (8 u32), then at +32 probabilities (8 f32).
     const MTP_OUT: usize = Self::MTP_IN + 128;
     /// Teacher-forced MTP cells' token embeddings (8 × 2560 f32).
@@ -413,6 +416,8 @@ pub struct WinStats {
     pub post_ms: f64,
     pub routed: usize,
     pub distinct: usize,
+    /// Layers the GPU passed without waiting for the host (no CPU misses).
+    pub skipped: usize,
     /// Distinct experts the GPU streamed from mapped host memory (PCIe share).
     pub pcie: usize,
     pub missed: usize,
@@ -829,6 +834,7 @@ impl Engine {
             argmax: f(&m, "fe_argmax1")?,
             argmax2: f(&m, "fe_argmax2")?,
             pcie: f(&m, "fe_pcie_patch")?,
+            wait_if: f(&m, "fe_db_wait_if")?,
             publish: f(&db, "db_publish")?,
             wait: f(&db, "db_wait")?,
             copy_rows: f(&db, "db_copy_rows")?,
@@ -1336,6 +1342,16 @@ impl Engine {
             &mut s.plan,
             t,
         );
+        {
+            let (dst, src, n) = (
+                self.io.arena.device_ptr(Io::LIDS + l * 4 * MAX_T * TOPK).expect("mapped"),
+                a(&s.ids),
+                (t * TOPK) as i32,
+            );
+            unsafe {
+                gpu::launch(self.k.copy, (1, 1, 1), (256, 1, 1), 0, &self.stream, tang_moe::args![dst, src, n]).expect("launch")
+            };
+        }
         if self.pcie_cap > 0 {
             let (plan, ids, ht, ti, cap) = (a(&s.plan), a(&s.ids), a(&self.host_tables[l]), t as i32, self.pcie_cap as i32);
             let (gp, gs, et, ed, mi) = (
@@ -1423,14 +1439,15 @@ impl Engine {
                 (1 + MoePlan::CAP) as i32,
                 a(&s.list),
             );
+            let (plan, streamed) = (a(&s.plan), self.pcie_cap as i32);
             unsafe {
                 gpu::launch(
-                    self.k.wait,
+                    self.k.wait_if,
                     (1, 1, 1),
                     (256, 1, 1),
                     0,
                     &self.stream,
-                    tang_moe::args![mbp, flag, ctlw, li, src, n, dst],
+                    tang_moe::args![mbp, flag, ctlw, li, src, n, dst, plan, streamed],
                 )
                 .expect("launch")
             };
@@ -1591,6 +1608,12 @@ impl Engine {
     fn serve(&mut self, l: usize, st: &mut WinStats) -> Result<()> {
         let seq = doorbell::seq(self.counter, l);
         self.mb.wait_seq(seq, &self.stream).map_err(|e| anyhow!("layer {l}: {e}"))?;
+        // The GPU only waits on layers with CPU misses; if it has already published a later
+        // layer, this one had none.
+        if self.mb.words(Mb::SEQ, 1)[0] != seq {
+            st.skipped += 1;
+            return Ok(());
+        }
         let t0 = Instant::now();
         let (t, ids, xq) = self.mb.request();
         let ids: Vec<u32> = ids.to_vec();
@@ -1631,17 +1654,8 @@ impl Engine {
         let t2 = Instant::now();
         st.plan_ms += (t1 - t0).as_secs_f64() * 1e3;
         st.cpu_ms += (t2 - t1).as_secs_f64() * 1e3;
-        let mut distinct: Vec<u32> = ids[..t * TOPK].to_vec();
-        distinct.sort_unstable();
-        distinct.dedup();
-        st.routed += t * TOPK;
-        st.distinct += distinct.len();
         st.missed += missed.len();
         st.pcie += streamed;
-        for &e in &distinct {
-            self.routing[(base + e) as usize] += 1;
-            self.keys.push(base + e);
-        }
         Ok(())
     }
 
@@ -1692,6 +1706,19 @@ impl Engine {
         let ts = Instant::now();
         st.serve_ms = (ts - w0).as_secs_f64() * 1e3 - st.host_prep_ms;
         self.dev.sync();
+        // Routing of every layer (copied out by the graph): cache usage and statistics.
+        for l in 0..self.layers.len() {
+            let mut d: Vec<u32> = self.io.u32s(Io::LIDS + l * 4 * MAX_T * TOPK, t * TOPK).to_vec();
+            d.sort_unstable();
+            d.dedup();
+            st.routed += t * TOPK;
+            st.distinct += d.len();
+            let base = (l * EXPERTS) as u32;
+            for &e in &d {
+                self.routing[(base + e) as usize] += 1;
+                self.keys.push(base + e);
+            }
+        }
         let td = Instant::now();
         st.drain_ms = (td - ts).as_secs_f64() * 1e3;
         if let Some(e) = self.gather_err.lock().unwrap().take() {

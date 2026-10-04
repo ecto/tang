@@ -143,6 +143,29 @@ extern "C" __global__ void fe_pcie_patch(unsigned* plan, const unsigned* ids, co
     plan[1] = ne;
 }
 
+// The doorbell's wait for CPU rows, skipped when this layer has no CPU misses: if the plan's
+// missing count is at most `streamed` (the PCIe share), write an empty row list and return;
+// otherwise as tang-moe's db_wait (one thread spins on the mapped flag, the block copies).
+__device__ __forceinline__ unsigned ld_acq_sys(const unsigned* p) {
+    unsigned v;
+    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
+extern "C" __global__ void fe_db_wait_if(const unsigned* mb, int flag, const unsigned* win, int layer,
+                                         int src, int n, unsigned* dst, const unsigned* plan, int streamed) {
+    if (plan[2] <= (unsigned)streamed) {
+        if (threadIdx.x == 0) dst[0] = 0;
+        return;
+    }
+    if (threadIdx.x == 0) {
+        const unsigned target = win[0] * 64u + (unsigned)layer + 1u;
+        while ((int)(ld_acq_sys(mb + flag) - target) < 0) { }
+    }
+    __syncthreads();
+    volatile const unsigned* m = mb + src;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = m[i];
+}
+
 // dst[i] = src[i] for n floats.
 extern "C" __global__ void fe_copy(float* dst, const float* src, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;

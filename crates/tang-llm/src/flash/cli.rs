@@ -439,6 +439,7 @@ fn mean(stats: &[WinStats]) -> WinStats {
         m.distinct += s.distinct;
         m.missed += s.missed;
         m.pcie += s.pcie;
+        m.skipped += s.skipped;
         m.swaps += s.swaps;
     }
     m
@@ -693,7 +694,7 @@ pub fn bench(args: &[String]) -> Result<()> {
     println!("  host: launch..served {:6.3} ms, ..drained {:.3} ms, boundary+tables {:.3} ms", m.serve_ms, m.drain_ms, m.post_ms);
     println!("  host plan          {:8.3} ms", m.plan_ms);
     println!("  after window: commit launch {:.3} ms, cache boundary + tables {:.3} ms", m.commit_host_ms, m.boundary_ms);
-    println!("  host CPU experts   {:8.3} ms", m.cpu_ms);
+    println!("  host CPU experts   {:8.3} ms ({:.1} of 48 layers/window without a doorbell wait)", m.cpu_ms, m.skipped as f64 / timed.len().max(1) as f64);
     println!(
         "  experts            {:.1} distinct/window, {:.2} on the CPU/window, {:.2} over PCIe/window, VRAM hit rate {:.3}, swaps {}",
         m.distinct as f64 / timed.len() as f64,
