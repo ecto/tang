@@ -6062,6 +6062,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tang-moe"
+version = "0.1.0"
+dependencies = [
+ "cudarc 0.16.6",
+ "libc",
+]
+
+[[package]]
 name = "tang-onnx"
 version = "0.1.0"
 dependencies = [
