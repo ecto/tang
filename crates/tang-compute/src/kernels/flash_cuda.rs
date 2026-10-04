@@ -502,6 +502,16 @@ __device__ bool last_block(unsigned int* cnt, unsigned int nb) {
 // down / inject rows (two rows per block step, 16 warps splitting K), barrier, phase 2 the up
 // projection and mean (fl_hc_up's arithmetic: a warp per output, a block per 32-wide
 // quantization chunk). XN and LO are the hc scratch.
+// acc + (w · (a, b)) for 8 bf16 weights in p, as one pinned fma chain.
+__device__ __forceinline__ float dot8_rn(uint4 p, float4 a, float4 b, float acc) {
+    float s = __fmul_rn(bf(p.x & 0xffff), a.x);
+    s = __fmaf_rn(bf(p.x >> 16), a.y, s); s = __fmaf_rn(bf(p.y & 0xffff), a.z, s);
+    s = __fmaf_rn(bf(p.y >> 16), a.w, s); s = __fmaf_rn(bf(p.z & 0xffff), b.x, s);
+    s = __fmaf_rn(bf(p.z >> 16), b.y, s); s = __fmaf_rn(bf(p.w & 0xffff), b.z, s);
+    s = __fmaf_rn(bf(p.w >> 16), b.w, s);
+    return __fadd_rn(acc, s);
+}
+
 template <int T>
 __device__ __forceinline__ void hc_fused_body(
     float* __restrict__ R, const float* __restrict__ Yp, const float* __restrict__ Ip, unsigned int mode,
@@ -540,7 +550,7 @@ __device__ __forceinline__ void hc_fused_body(
                 row[d] = x;
             }
             v[i] = x;
-            ss += x * x;
+            ss = __fmaf_rn(x, x, ss);
         }
         ss = warp_sum(ss);
         if (lane == 0) red[warp][0] = ss;
@@ -575,12 +585,10 @@ __device__ __forceinline__ void hc_fused_body(
             for (int t = 0; t < T; t++) {
                 const float4* x4 = (const float4*)(XN + (u64)t * HC * HIDDEN + warp * 640 + i * 8);
                 float4 a = x4[0], b = x4[1];
-                acc[0][t] += bf(p0.x & 0xffff) * a.x + bf(p0.x >> 16) * a.y + bf(p0.y & 0xffff) * a.z
-                           + bf(p0.y >> 16) * a.w + bf(p0.z & 0xffff) * b.x + bf(p0.z >> 16) * b.y
-                           + bf(p0.w & 0xffff) * b.z + bf(p0.w >> 16) * b.w;
-                acc[1][t] += bf(p1.x & 0xffff) * a.x + bf(p1.x >> 16) * a.y + bf(p1.y & 0xffff) * a.z
-                           + bf(p1.y >> 16) * a.w + bf(p1.z & 0xffff) * b.x + bf(p1.z >> 16) * b.y
-                           + bf(p1.w & 0xffff) * b.z + bf(p1.w >> 16) * b.w;
+                // Explicit fma chains: contraction must not depend on T (the instantiation),
+                // or a token's output would depend on the window it is computed in.
+                acc[0][t] = dot8_rn(p0, a, b, acc[0][t]);
+                acc[1][t] = dot8_rn(p1, a, b, acc[1][t]);
             }
         }
         #pragma unroll
@@ -627,8 +635,11 @@ __device__ __forceinline__ void hc_fused_body(
                 for (int t = 0; t < T; t++) {
                     const float4* l4 = (const float4*)(lo + t * HC_LR + p * 8);
                     float4 a = l4[0], b = l4[1];
-                    acc[t] += wv[0] * a.x + wv[1] * a.y + wv[2] * a.z + wv[3] * a.w
-                            + wv[4] * b.x + wv[5] * b.y + wv[6] * b.z + wv[7] * b.w;
+                    float s8 = __fmul_rn(wv[0], a.x);
+                    s8 = __fmaf_rn(wv[1], a.y, s8); s8 = __fmaf_rn(wv[2], a.z, s8); s8 = __fmaf_rn(wv[3], a.w, s8);
+                    s8 = __fmaf_rn(wv[4], b.x, s8); s8 = __fmaf_rn(wv[5], b.y, s8); s8 = __fmaf_rn(wv[6], b.z, s8);
+                    s8 = __fmaf_rn(wv[7], b.w, s8);
+                    acc[t] = __fadd_rn(acc[t], s8);
                 }
             }
             #pragma unroll

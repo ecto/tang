@@ -198,6 +198,8 @@ fn main() -> Result<()> {
         "flash-generate" => return tang_llm::flash::cli::generate(&args[1..]),
         "flash-parity" => return tang_llm::flash::cli::parity(&args[1..]),
         "flash-bench" => return tang_llm::flash::cli::bench(&args[1..]),
+        "flash-spec-test" => return tang_llm::flash::cli::spec_test(&args[1..]),
+        "flash-tcheck" => return tang_llm::flash::cli::tcheck(&args[1..]),
         "flash-gemv-check" => return tang_llm::flash::engine::gemv_check(&dir),
         _ => {}
     }

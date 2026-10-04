@@ -237,7 +237,7 @@ struct Layer {
     side: B,
     side_rows: usize,
     w_out: Dw,
-    router: B,
+    router: Dw,
     sh_gu: Dw,
     sh_down: Dw,
     gdn: Option<Gdn>,
@@ -246,9 +246,10 @@ struct Layer {
 
 struct Ple {
     layer: usize,
-    key: B,
-    key_q2: bool,
-    value: B,
+    /// `ple_key` as a native Q2_0 segment (`fe_gemv8`), so a token's PLE output doesn't depend
+    /// on the window width.
+    key: Dw,
+    value: Dw,
     nk: B,
     nq: B,
     nc: B,
@@ -327,8 +328,14 @@ struct Io {
 }
 
 impl Io {
+    /// The window's control words (`Scratch::ctl`): pos0, n_keep, counter, seed, temperature.
     const CTL: usize = 0;
-    const EMB: usize = 64;
+    /// The same for the commit graph (its own copy: the next window restages CTL before the
+    /// commit's copy has run).
+    const CCTL: usize = 64;
+    /// Raised by the n-gram reader when the window's PLE rows are staged (own cache line).
+    const PLE_FLAG: usize = 128;
+    const EMB: usize = 256;
     const PLE: usize = Self::EMB + MAX_T * HIDDEN * 4;
     const IDS: usize = Self::PLE + MAX_T * HIDDEN * 4;
     const STAMPS: usize = Self::IDS + 64;
@@ -384,7 +391,7 @@ pub struct Engine {
     pub hp: Hparams,
     pub opts: Opts,
     g: Gguf,
-    ngram: NgramTable,
+    ngram: std::sync::Arc<NgramTable>,
     layers: Vec<Layer>,
     out_hc: Hc,
     head: Dw,
@@ -402,7 +409,13 @@ pub struct Engine {
     exec: MissExec,
     stream: ManuallyDrop<Stream>,
     graphs: Vec<Option<Graph>>,
+    commit_graphs: Vec<Option<Graph>>,
     counter: u32,
+    /// Sampling: Gumbel-max with `Philox(seed, position)` noise at `temperature` (0: greedy).
+    pub seed: u32,
+    pub temperature: f32,
+    gather_err: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    ngram_pending: bool,
     /// The sequence so far (PLE needs its predecessors).
     pub tokens: Vec<u32>,
     /// Routing counts per key, for `--dump-routing`.
@@ -506,6 +519,24 @@ impl Engine {
                 f => bail!("{name}: unexpected format {f:?}"),
             })
         };
+        // A bf16 matrix through fe_gemv's pinned fma chains (the kernel track's bf16 GEMV
+        // contracts differently per window width).
+        let bf16_native = |name: &str| -> Result<Dw> {
+            let e = by.get(name).with_context(|| format!("pack has no {name}"))?;
+            ensure!(e.fmt == Fmt::Bf16, "{name} isn't bf16");
+            let mut raw = pack::read_entry(&df, e)?;
+            raw.extend_from_slice(&[0u8; 16]);
+            let w = dev.upload_bytes(&raw);
+            let p = dev.buffer_addr(&w);
+            let rb = (e.k * 2) as u64;
+            Ok(Dw::Native {
+                segs: dev.upload_u32(&[p as u32, (p >> 32) as u32, 30, e.n as u32, rb as u32, 0]),
+                _w: w,
+                nseg: 1,
+                rows: e.n,
+                row16: row16(&[[30, e.n as u64, rb, 0, 0]]),
+            })
+        };
         let hc = |key: &str, inject: bool| -> Result<Hc> {
             Ok(Hc {
                 norm: get(&format!("{key}.norm"))?,
@@ -565,7 +596,7 @@ impl Engine {
                 side: get(&format!("{k}.side"))?,
                 side_rows,
                 w_out: dw(&format!("{k}.w_out"))?,
-                router: get(&format!("{k}.router"))?,
+                router: bf16_native(&format!("{k}.router"))?,
                 sh_gu: dw(&format!("{k}.sh_gu"))?,
                 sh_down: dw(&format!("{k}.sh_down"))?,
                 gdn,
@@ -574,9 +605,24 @@ impl Engine {
         }
         let ple = Ple {
             layer: plep.layer,
-            key_q2: by.get("ple.key").is_some_and(|e| e.fmt == Fmt::Q2Raw),
-            key: get("ple.key")?,
-            value: get("ple.value")?,
+            key: {
+                let e = by.get("ple.key").context("pack has no ple.key")?;
+                ensure!(e.fmt == Fmt::Q2Raw, "ple.key must be Q2_0");
+                let mut raw = pack::read_entry(&std::fs::File::open(&dense_path)?, e)?;
+                raw.extend_from_slice(&[0u8; 16]);
+                let w = dev.upload_bytes(&raw);
+                let p = dev.buffer_addr(&w);
+                let rb = (e.k / 64 * 18) as u64;
+                let seg = [42u64, e.n as u64, rb, 0, 0];
+                Dw::Native {
+                    segs: dev.upload_u32(&[p as u32, (p >> 32) as u32, 42, e.n as u32, rb as u32, 0]),
+                    _w: w,
+                    nseg: 1,
+                    rows: e.n,
+                    row16: row16(&[seg]),
+                }
+            },
+            value: bf16_native("ple.value")?,
             nk: get("ple.nk")?,
             nq: get("ple.nq")?,
             nc: get("ple.nc")?,
@@ -592,7 +638,7 @@ impl Engine {
         };
         let z = |n: usize| dev.alloc_f32(n);
         let s = Scratch {
-            ctl: z(4),
+            ctl: z(8),
             emb: z(MAX_T * HIDDEN),
             ple_e: z(MAX_T * HIDDEN),
             ple_eq: z(QAct { m: MAX_T, k: HIDDEN }.words()),
@@ -734,7 +780,7 @@ impl Engine {
         let tables: Vec<B> = (0..hp.n_layer).map(|_| dev.alloc_f32(2 * EXPERTS)).collect();
         let mut exec = MissExec::new(Pool::new(&Pool::default_cpus(), std::time::Duration::from_millis(20)), Isa::detect());
         exec.tiled = true;
-        let ngram = NgramTable::open(&g, &plep)?;
+        let ngram = std::sync::Arc::new(NgramTable::open(&g, &plep)?);
         let load_report = format!(
             "load: {} ({}) pack {:.1}s, dense upload {:.1}s ({:.2} GB VRAM), experts {:.1}s: {} VRAM slots ({:.2} GB) + {} scratch, host arena {:.2} GB; VRAM free {:.2} -> {:.2} GB; total {:.1}s",
             if warm { "warm" } else { "cold" },
@@ -777,8 +823,13 @@ impl Engine {
             experts,
             exec,
             stream,
-            graphs: (0..=MAX_T).map(|_| None).collect(),
+            graphs: (0..2 * (MAX_T + 1)).map(|_| None).collect(),
+            commit_graphs: (0..=MAX_T).map(|_| None).collect(),
             counter: 1,
+            seed: 0,
+            temperature: 0.0,
+            gather_err: Default::default(),
+            ngram_pending: false,
             tokens: Vec::new(),
             routing: vec![0; 48 * EXPERTS],
             keys: Vec::new(),
@@ -869,9 +920,8 @@ impl Engine {
             )
             .expect("input copy")
         };
-        cp(&self.s.ctl, Io::CTL, 16);
+        cp(&self.s.ctl, Io::CTL, 32);
         cp(&self.s.emb, Io::EMB, t * HIDDEN * 4);
-        cp(&self.s.ple_e, Io::PLE, t * HIDDEN * 4);
     }
 
     fn enqueue_outputs(&self, t: usize) {
@@ -931,15 +981,37 @@ impl Engine {
     }
 
     fn enqueue_ple(&mut self, t: usize) {
+        // The n-gram rows are read on the host while layer 0 runs: wait for them, then copy.
+        {
+            let (mb, flag, ctlw, layer, src, n, dst) = (
+                self.io.arena.device_ptr(0).expect("io arena is mapped"),
+                (Io::PLE_FLAG / 4) as i32,
+                self.dev.buffer_addr(&self.s.ctl) + 8,
+                63i32,
+                0i32,
+                0i32,
+                self.dev.buffer_addr(&self.s.out_ids),
+            );
+            unsafe {
+                gpu::launch(self.k.wait, (1, 1, 1), (32, 1, 1), 0, &self.stream, tang_moe::args![mb, flag, ctlw, layer, src, n, dst])
+                    .expect("launch");
+                gpu::check(
+                    cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                        self.dev.buffer_addr(&self.s.ple_e),
+                        self.io.ptr(Io::PLE) as *const std::ffi::c_void,
+                        t * HIDDEN * 4,
+                        self.stream.0,
+                    ),
+                    "cuMemcpyHtoDAsync",
+                )
+                .expect("ple copy");
+            }
+        }
         let dev = &self.dev;
         let s = &mut self.s;
         dev.quantize_act_into(&s.ple_e, &mut s.ple_eq, t, HIDDEN);
-        if self.ple.key_q2 {
-            dev.q2_linear_into(&s.ple_eq, &self.ple.key, &mut s.ple_key, t, HIDDEN, HC * HIDDEN);
-        } else {
-            dev.q4x_linear_into(&s.ple_eq, &self.ple.key, &mut s.ple_key, t, HIDDEN, HC * HIDDEN);
-        }
-        dev.linear_into(&s.ple_e, &self.ple.value, &mut s.ple_val, t, HIDDEN, HIDDEN);
+        self.ple.key.apply(dev, &self.nk, &s.ple_e, &s.ple_eq, &mut s.ple_key, t, HIDDEN, HC * HIDDEN);
+        self.ple.value.apply(dev, &self.nk, &s.ple_e, &s.ple_eq, &mut s.ple_val, t, HIDDEN, HIDDEN);
         let a = |b: &B| dev.buffer_addr(b);
         let (r, key, val, nk, nq, nc, conv, ring, ctl) = (
             a(&s.r),
@@ -965,7 +1037,7 @@ impl Engine {
 
     /// Layer `l` of a window of `t` (every token kept). `fused`: the previous layer's MoE write
     /// is applied inside this layer's first hyper-connection read.
-    fn enqueue_layer(&mut self, l: usize, t: usize, fused: bool) {
+    fn enqueue_layer(&mut self, l: usize, t: usize, fused: bool, verify: bool) {
         let dev = &self.dev;
         let s = &mut self.s;
         let layer = &mut self.layers[l];
@@ -1033,10 +1105,16 @@ impl Engine {
                 &mut s.y,
                 Some(&mut s.yq),
                 t,
-                GdnMode::Commit { win: &s.ctl },
+                if verify {
+                    GdnMode::ReadOnly
+                } else {
+                    GdnMode::Commit { win: &s.ctl }
+                },
                 EPS,
             );
-            dev.gdn_conv_commit(&mut g.hist, &g.proj, GDN_PROJ, &s.ctl, t);
+            if !verify {
+                dev.gdn_conv_commit(&mut g.hist, &g.proj, GDN_PROJ, &s.ctl, t);
+            }
             layer.w_out.apply(dev, &self.nk, &s.y, &s.yq, &mut s.mix, t, GDN_V, HIDDEN);
         }
         if let Some(q) = layer.qsa.as_mut() {
@@ -1094,7 +1172,7 @@ impl Engine {
             t,
             EPS,
         );
-        dev.linear_into(&s.x2, &layer.router, &mut s.logits, t, HIDDEN, ROUTER_ROWS);
+        layer.router.apply(dev, &self.nk, &s.x2, &s.xq, &mut s.logits, t, HIDDEN, ROUTER_ROWS);
         // Top-10 and the plan over VRAM-resident experts, on the GPU from its residency table;
         // the host computes the same misses from its own view of the table (both change only
         // between windows).
@@ -1240,15 +1318,16 @@ impl Engine {
         );
         let v = self.hp.n_vocab;
         self.head.apply(dev, &self.nk, &s.x, &s.xq, &mut s.head, t, HIDDEN, v);
-        let (lg, ids, n, part, np) = (
+        let (lg, ids, n, part, np, ctl) = (
             dev.buffer_addr(&s.head),
             dev.buffer_addr(&s.out_ids),
             v as i32,
             dev.buffer_addr(&s.amax),
             64i32,
+            dev.buffer_addr(&s.ctl),
         );
         unsafe {
-            gpu::launch(self.k.argmax, (64, t as u32, 1), (1024, 1, 1), 0, &self.stream, tang_moe::args![lg, n, part])
+            gpu::launch(self.k.argmax, (64, t as u32, 1), (1024, 1, 1), 0, &self.stream, tang_moe::args![lg, n, part, ctl])
                 .expect("launch");
             gpu::launch(self.k.argmax2, (t as u32, 1, 1), (32, 1, 1), 0, &self.stream, tang_moe::args![part, np, ids])
                 .expect("launch");
@@ -1258,7 +1337,7 @@ impl Engine {
 
     /// Everything a window enqueues, layer by layer; `between(l)` runs on the host after layer
     /// `l` is enqueued (eager mode serves it there).
-    fn enqueue_window(&mut self, t: usize, unfused: bool, between: &mut dyn FnMut(&mut Self, usize) -> Result<()>) -> Result<()> {
+    fn enqueue_window(&mut self, t: usize, unfused: bool, verify: bool, between: &mut dyn FnMut(&mut Self, usize) -> Result<()>) -> Result<()> {
         self.enqueue_inputs(t);
         self.enqueue_embed(t);
         let pl = self.ple.layer;
@@ -1273,7 +1352,7 @@ impl Engine {
             if !fused && l > 0 && l != pl {
                 self.apply_moe(t);
             }
-            self.enqueue_layer(l, t, fused);
+            self.enqueue_layer(l, t, fused, verify);
             between(self, l)?;
         }
         if unfused {
@@ -1284,23 +1363,77 @@ impl Engine {
         Ok(())
     }
 
+    /// The commit after a verify window: replay the first `n_keep` (from `Io::CCTL`) tokens'
+    /// recurrence into every GDN layer's state and conv history.
+    fn enqueue_commit(&mut self, t: usize) {
+        unsafe {
+            gpu::check(
+                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                    self.dev.buffer_addr(&self.s.ctl),
+                    self.io.ptr(Io::CCTL) as *const std::ffi::c_void,
+                    32,
+                    self.stream.0,
+                ),
+                "cuMemcpyHtoDAsync",
+            )
+            .expect("commit ctl copy");
+        }
+        let dev = &self.dev;
+        let s = &mut self.s;
+        for layer in &mut self.layers {
+            if let Some(g) = layer.gdn.as_mut() {
+                let p = GdnParams {
+                    conv: &g.conv,
+                    dt_bias: &g.dt,
+                    ssm_a: &g.a,
+                    norm: &g.norm,
+                };
+                dev.gdn_step(&mut g.state, &g.h, &g.proj, GDN_PROJ, &p, &mut s.y, None, t, GdnMode::Commit { win: &s.ctl }, EPS);
+                dev.gdn_conv_commit(&mut g.hist, &g.proj, GDN_PROJ, &s.ctl, t);
+            }
+        }
+    }
+
     // ---- host side
 
-    /// Fill the pinned staging for tokens `self.tokens[pos0..pos0 + t]`.
+    /// Fill the pinned staging for tokens `self.tokens[pos0..pos0 + t]` (control words and
+    /// embeddings; the n-gram rows come from [`start_gather`](Self::start_gather)).
     fn stage(&mut self, pos0: usize, t: usize) -> Result<()> {
-        let ctl = self.io.u32s(Io::CTL, 3);
+        let ctl = self.io.u32s(Io::CTL, 5);
         ctl[0] = pos0 as u32;
         ctl[1] = t as u32;
         ctl[2] = self.counter;
+        ctl[3] = self.seed;
+        ctl[4] = self.temperature.to_bits();
         let emb_t = self.g.info("token_embd.weight")?.clone();
         let emb = self.io.f32s(Io::EMB, t * HIDDEN);
         for i in 0..t {
             let row = self.g.rows(&emb_t, self.tokens[pos0 + i] as usize, 1)?;
             emb[i * HIDDEN..(i + 1) * HIDDEN].copy_from_slice(&row);
         }
-        let ple = self.io.f32s(Io::PLE, t * HIDDEN);
-        self.ngram.gather(&self.tokens, pos0, pos0 + t, ple)?;
         Ok(())
+    }
+
+    /// Read the window's n-gram rows on the E-core pool into `Io::PLE`, then raise
+    /// `Io::PLE_FLAG` (the graph waits for it before the PLE block, after layer 0).
+    fn start_gather(&mut self, pos0: usize, t: usize) {
+        struct P(*mut u8);
+        unsafe impl Send for P {}
+        let (ple, flag) = (P(self.io.ptr(Io::PLE)), P(self.io.ptr(Io::PLE_FLAG)));
+        let toks: Vec<u32> = self.tokens[..pos0 + t].to_vec();
+        let ng = self.ngram.clone();
+        let err = self.gather_err.clone();
+        let target = self.counter.wrapping_mul(64).wrapping_add(64);
+        self.ngram_pending = true;
+        ng.clone().spawn(move || {
+            let (ple, flag) = (ple, flag);
+            let out = unsafe { std::slice::from_raw_parts_mut(ple.0 as *mut f32, t * HIDDEN) };
+            if let Err(e) = ng.gather(&toks, pos0, pos0 + t, out) {
+                *err.lock().unwrap() = Some(format!("{e:#}"));
+            }
+            let f = unsafe { &*(flag.0 as *const std::sync::atomic::AtomicU32) };
+            f.store(target, std::sync::atomic::Ordering::Release);
+        });
     }
 
     /// Serve layer `l` of the current window: plan, raise A, compute misses, raise B.
@@ -1361,6 +1494,12 @@ impl Engine {
     /// position's logits. With `probe`, runs eagerly and unfused and records the last token's
     /// intermediates.
     pub fn window(&mut self, pos0: usize, t: usize, mut probe: Option<&mut Probe>) -> Result<Vec<u32>> {
+        self.window_mode(pos0, t, false, probe.take())
+    }
+
+    /// [`window`](Self::window) as a verify window (`verify`): the GDN state is only read; call
+    /// [`commit`](Self::commit) with the number of tokens kept before the next window.
+    pub fn window_mode(&mut self, pos0: usize, t: usize, verify: bool, mut probe: Option<&mut Probe>) -> Result<Vec<u32>> {
         ensure!((1..=MAX_T).contains(&t) && pos0 + t <= self.tokens.len());
         ensure!(pos0 + t <= self.opts.max_ctx, "context {} > max {}", pos0 + t, self.opts.max_ctx);
         let w0 = Instant::now();
@@ -1371,18 +1510,21 @@ impl Engine {
         self.stage(pos0, t)?;
         st.host_prep_ms = w0.elapsed().as_secs_f64() * 1e3;
         self.keys.clear();
-        let graph_ready = self.graphs[t].is_some();
+        let gi = t + if verify { MAX_T + 1 } else { 0 };
+        let graph_ready = self.graphs[gi].is_some();
         if probe.is_none() && self.use_graphs && graph_ready {
-            self.graphs[t]
+            self.graphs[gi]
                 .as_ref()
                 .unwrap()
                 .launch(&self.stream)
                 .map_err(|e| anyhow!("{e}"))?;
+            self.start_gather(pos0, t);
             for l in 0..self.layers.len() {
                 self.serve(l, &mut st)?;
             }
         } else {
             let unfused = probe.is_some();
+            self.start_gather(pos0, t);
             let mut f = |me: &mut Self, l: usize| -> Result<()> {
                 me.serve(l, &mut st)?;
                 if let Some(p) = probe.as_deref_mut() {
@@ -1390,9 +1532,12 @@ impl Engine {
                 }
                 Ok(())
             };
-            self.enqueue_window(t, unfused, &mut f)?;
+            self.enqueue_window(t, unfused, verify, &mut f)?;
         }
         self.dev.sync();
+        if let Some(e) = self.gather_err.lock().unwrap().take() {
+            bail!("n-gram rows: {e}");
+        }
         let ids = self.io.u32s(Io::IDS, t).to_vec();
         if let Some(p) = probe {
             p.final_x = self.dev.download(&self.s.x)[(t - 1) * HIDDEN..t * HIDDEN].to_vec();
@@ -1419,9 +1564,38 @@ impl Engine {
         self.last = st;
         // Capture this size's graph now that every kernel is loaded.
         if self.use_graphs && !graph_ready {
-            self.capture(t)?;
+            self.capture(t, verify)?;
         }
         Ok(ids)
+    }
+
+    /// After a verify window of `t`: keep the first `n_keep` tokens' recurrent state. Async on
+    /// the stream (the next window is ordered after it).
+    pub fn commit(&mut self, t: usize, n_keep: usize) -> Result<()> {
+        ensure!((1..=t).contains(&n_keep));
+        let c = self.io.u32s(Io::CCTL, 2);
+        c[0] = 0;
+        c[1] = n_keep as u32;
+        if self.use_graphs {
+            if self.commit_graphs[t].is_none() {
+                self.enqueue_commit(t);
+                self.dev.sync();
+                let stream = ManuallyDrop::new(Stream(self.dev.cu_stream()));
+                let me = self as *mut Self;
+                let g = Graph::capture(&stream, |_| {
+                    // SAFETY: `self` is not otherwise touched during capture.
+                    unsafe { &mut *me }.enqueue_commit(t);
+                    Ok(())
+                })
+                .map_err(|e| anyhow!("capture commit T={t}: {e}"))?;
+                self.commit_graphs[t] = Some(g);
+                return Ok(());
+            }
+            self.commit_graphs[t].as_ref().unwrap().launch(&self.stream).map_err(|e| anyhow!("{e}"))?;
+        } else {
+            self.enqueue_commit(t);
+        }
+        Ok(())
     }
 
     /// Copy the cache's residency table into the per-layer plan tables where it changed
@@ -1458,17 +1632,17 @@ impl Engine {
         Ok(())
     }
 
-    fn capture(&mut self, t: usize) -> Result<()> {
+    fn capture(&mut self, t: usize, verify: bool) -> Result<()> {
         let stream = ManuallyDrop::new(Stream(self.dev.cu_stream()));
         let me = self as *mut Self;
         let g = Graph::capture(&stream, |_| {
             // SAFETY: `self` is not otherwise touched during capture.
             let me = unsafe { &mut *me };
-            me.enqueue_window(t, false, &mut |_, _| Ok(()))
+            me.enqueue_window(t, false, verify, &mut |_, _| Ok(()))
                 .map_err(|e| tang_moe::gpu::Error(format!("{e}")))
         })
         .map_err(|e| anyhow!("capture T={t}: {e}"))?;
-        self.graphs[t] = Some(g);
+        self.graphs[t + if verify { MAX_T + 1 } else { 0 }] = Some(g);
         Ok(())
     }
 
@@ -1562,6 +1736,29 @@ impl Engine {
             pos += t;
         }
         Ok(next)
+    }
+
+    /// One speculative step: feed `cur` (the last sampled token) and `drafts` as a window, keep
+    /// the drafts the model itself samples (exact match), commit the kept tokens' recurrent
+    /// state, and return the sampled tokens of the kept positions (1 + accepted drafts; the
+    /// last is the next `cur`). Without drafts this is a plain T=1 window.
+    pub fn verify(&mut self, cur: u32, drafts: &[u32]) -> Result<Vec<u32>> {
+        let pos = self.tokens.len();
+        let t = 1 + drafts.len();
+        ensure!(t <= MAX_T, "{} drafts", drafts.len());
+        self.tokens.push(cur);
+        self.tokens.extend_from_slice(drafts);
+        if t == 1 {
+            return Ok(vec![self.window(pos, 1, None)?[0]]);
+        }
+        let targets = self.window_mode(pos, t, true, None)?;
+        let mut n = 1;
+        while n < t && drafts[n - 1] == targets[n - 1] {
+            n += 1;
+        }
+        self.commit(t, n)?;
+        self.tokens.truncate(pos + n);
+        Ok(targets[..n].to_vec())
     }
 
     /// Append `tok` and run it as a T=1 window; returns the greedy next token.
@@ -1743,4 +1940,129 @@ pub fn gemv_check(path: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+impl Engine {
+    /// Per-op window-width check on layer `l`'s real weights and random inputs: for each op,
+    /// does token 7 of a T=8 call equal a T=1 call on the same token (GDN: eight committed
+    /// T=1 steps vs one read-only T=8 walk)? Prints mismatching element counts.
+    pub fn op_tcheck(&mut self, l: usize) -> Result<()> {
+        let mut rng = 0x1234_5678_9abc_def1u64;
+        let mut rnd = |n: usize, sc: f32| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    (((rng >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0) * sc
+                })
+                .collect()
+        };
+        let dev = &self.dev;
+        let diff = |a: &[f32], b: &[f32]| a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+        let t = 8;
+        // hc read
+        let r8 = rnd(t * HC * HIDDEN, 1.0);
+        let r1 = r8[7 * HC * HIDDEN..].to_vec();
+        let (mut x8, mut x1) = (dev.alloc_f32(t * HIDDEN), dev.alloc_f32(HIDDEN));
+        let (mut q8, mut q1) = (dev.alloc_f32(QAct { m: t, k: HIDDEN }.words()), dev.alloc_f32(QAct { m: 1, k: HIDDEN }.words()));
+        let (mut i8b, mut i1b) = (dev.alloc_f32(t * HC), dev.alloc_f32(HC));
+        let mut hc = dev.alloc_f32(fl::hc_scratch_words(t));
+        let (mut rb8, mut rb1) = (dev.upload_f32(&r8), dev.upload_f32(&r1));
+        let w = self.layers[l].hc_a.w();
+        dev.hc_read_into(&mut rb8, None, &w, &mut x8, Some(&mut q8), Some(&mut i8b), &mut hc, t, EPS);
+        dev.hc_read_into(&mut rb1, None, &w, &mut x1, Some(&mut q1), Some(&mut i1b), &mut hc, 1, EPS);
+        let (xa, xb) = (dev.download(&x8), dev.download(&x1));
+        println!("hc_read x: {} of {} differ", diff(&xa[7 * HIDDEN..], &xb), HIDDEN);
+        // GEMVs on identical inputs
+        let xv = rnd(t * HIDDEN, 1.0);
+        let x8 = dev.upload_f32(&xv);
+        let x1 = dev.upload_f32(&xv[7 * HIDDEN..]);
+        let mut xq8 = dev.alloc_f32(QAct { m: t, k: HIDDEN }.words());
+        let mut xq1 = dev.alloc_f32(QAct { m: 1, k: HIDDEN }.words());
+        dev.quantize_act_into(&x8, &mut xq8, t, HIDDEN);
+        dev.quantize_act_into(&x1, &mut xq1, 1, HIDDEN);
+        let n = self.layers[l].in_rows;
+        let (mut o8, mut o1) = (dev.alloc_f32(t * n), dev.alloc_f32(n));
+        self.layers[l].w_in.apply(dev, &self.nk, &x8, &xq8, &mut o8, t, HIDDEN, n);
+        self.layers[l].w_in.apply(dev, &self.nk, &x1, &xq1, &mut o1, 1, HIDDEN, n);
+        let (a, b) = (dev.download(&o8), dev.download(&o1));
+        println!("w_in GEMV: {} of {n} differ", diff(&a[7 * n..8 * n], &b));
+        let (mut l8, mut l1) = (dev.alloc_f32(t * ROUTER_ROWS), dev.alloc_f32(ROUTER_ROWS));
+        self.layers[l].router.apply(dev, &self.nk, &x8, &xq8, &mut l8, t, HIDDEN, ROUTER_ROWS);
+        self.layers[l].router.apply(dev, &self.nk, &x1, &xq1, &mut l1, 1, HIDDEN, ROUTER_ROWS);
+        let (a, b) = (dev.download(&l8), dev.download(&l1));
+        println!("router bf16 GEMV: {} of {ROUTER_ROWS} differ", diff(&a[7 * ROUTER_ROWS..], &b));
+        // PLE value GEMV (bf16, 2560 x 2560)
+        let (mut v8, mut v1) = (dev.alloc_f32(t * HIDDEN), dev.alloc_f32(HIDDEN));
+        self.ple.value.apply(dev, &self.nk, &x8, &xq8, &mut v8, t, HIDDEN, HIDDEN);
+        self.ple.value.apply(dev, &self.nk, &x1, &xq1, &mut v1, 1, HIDDEN, HIDDEN);
+        let (a, b) = (dev.download(&v8), dev.download(&v1));
+        println!("ple value bf16 GEMV: {} of {HIDDEN} differ", diff(&a[7 * HIDDEN..], &b));
+        // MoE combine + hc write
+        {
+            let parts_v = rnd(MoePlan::PARTS_ROWS * HIDDEN, 1.0);
+            let wv = rnd(t * TOPK, 1.0);
+            let lv = rnd(t * ROUTER_ROWS, 1.0);
+            let injv = rnd(t * HC, 1.0);
+            let mut p1 = parts_v.clone();
+            for k in 0..TOPK {
+                let (src, dst) = ((7 * TOPK + k) * HIDDEN, k * HIDDEN);
+                let row = parts_v[src..src + HIDDEN].to_vec();
+                p1[dst..dst + HIDDEN].copy_from_slice(&row);
+            }
+            let row = parts_v[(MoePlan::SHARED_ROW + 7) * HIDDEN..(MoePlan::SHARED_ROW + 8) * HIDDEN].to_vec();
+            p1[MoePlan::SHARED_ROW * HIDDEN..(MoePlan::SHARED_ROW + 1) * HIDDEN].copy_from_slice(&row);
+            let (pb8, pb1) = (dev.upload_f32(&parts_v), dev.upload_f32(&p1));
+            let (w8, w1) = (dev.upload_f32(&wv), dev.upload_f32(&wv[7 * TOPK..]));
+            let (lg8, lg1) = (dev.upload_f32(&lv), dev.upload_f32(&lv[7 * ROUTER_ROWS..]));
+            let (in8, in1) = (dev.upload_f32(&injv), dev.upload_f32(&injv[7 * HC..]));
+            let (mut y8, mut y1) = (dev.alloc_f32(t * HIDDEN), dev.alloc_f32(HIDDEN));
+            dev.moe_combine_into(&pb8, &w8, &lg8, ROUTER_ROWS, Some(EXPERTS), &mut y8, t);
+            dev.moe_combine_into(&pb1, &w1, &lg1, ROUTER_ROWS, Some(EXPERTS), &mut y1, 1);
+            let (a, b) = (dev.download(&y8), dev.download(&y1));
+            println!("moe combine: {} of {HIDDEN} differ", diff(&a[7 * HIDDEN..], &b));
+            let (mut ra, mut rb) = (dev.upload_f32(&r8), dev.upload_f32(&r1));
+            dev.hc_write(&mut ra, &y8, &in8, t);
+            dev.hc_write(&mut rb, &y1, &in1, 1);
+            let (a, b) = (dev.download(&ra), dev.download(&rb));
+            println!("hc write: {} of {} differ", diff(&a[7 * HC * HIDDEN..], &b), HC * HIDDEN);
+        }
+        // GDN: eight committed T=1 steps vs one read-only T=8 walk from the same state.
+        if self.layers[l].gdn.is_some() {
+            let pv = rnd(t * GDN_PROJ, 1.0);
+            let st0 = rnd(fl::GDN_STATE, 0.05);
+            let h0 = rnd(fl::GDN_HIST, 0.5);
+            let g = self.layers[l].gdn.as_mut().unwrap();
+            let p = GdnParams { conv: &g.conv, dt_bias: &g.dt, ssm_a: &g.a, norm: &g.norm };
+            let mut st = dev.upload_f32(&st0);
+            let hist = dev.upload_f32(&h0);
+            let proj8 = dev.upload_f32(&pv);
+            let mut h8 = dev.alloc_f32(t * GDN_CONV);
+            let mut y8 = dev.alloc_f32(t * GDN_V);
+            let mut yq8 = dev.alloc_f32(QAct { m: t, k: GDN_V }.words());
+            dev.gdn_conv_into(&proj8, GDN_PROJ, &hist, p.conv, &mut h8, t, EPS);
+            dev.gdn_step(&mut st, &h8, &proj8, GDN_PROJ, &p, &mut y8, Some(&mut yq8), t, GdnMode::ReadOnly, EPS);
+            let ya = dev.download(&y8);
+            let ha = dev.download(&h8);
+            let mut st1 = dev.upload_f32(&st0);
+            let mut hist1 = dev.upload_f32(&h0);
+            let ctl = dev.upload_u32(&[0, 1, 0, 0]);
+            let (mut yb, mut hb) = (vec![], vec![]);
+            for i in 0..t {
+                let proj1 = dev.upload_f32(&pv[i * GDN_PROJ..(i + 1) * GDN_PROJ]);
+                let mut h1 = dev.alloc_f32(GDN_CONV);
+                let mut y1 = dev.alloc_f32(GDN_V);
+                let mut yq1 = dev.alloc_f32(QAct { m: 1, k: GDN_V }.words());
+                dev.gdn_conv_into(&proj1, GDN_PROJ, &hist1, p.conv, &mut h1, 1, EPS);
+                dev.gdn_step(&mut st1, &h1, &proj1, GDN_PROJ, &p, &mut y1, Some(&mut yq1), 1, GdnMode::Commit { win: &ctl }, EPS);
+                dev.gdn_conv_commit(&mut hist1, &proj1, GDN_PROJ, &ctl, 1);
+                yb = dev.download(&y1);
+                hb = dev.download(&h1);
+            }
+            println!("gdn conv h (token 7): {} of {GDN_CONV} differ", diff(&ha[7 * GDN_CONV..], &hb));
+            println!("gdn step y (token 7): {} of {GDN_V} differ", diff(&ya[7 * GDN_V..], &yb));
+        }
+        Ok(())
+    }
 }

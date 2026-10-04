@@ -136,14 +136,41 @@ extern "C" __global__ void fe_scatter_cols(float* dst, int stride, int off, cons
 __device__ __forceinline__ void amax_merge(float& v, int& i, float ov, int oi) {
     if (ov > v || (ov == v && oi < i)) { v = ov; i = oi; }
 }
-extern "C" __global__ void fe_argmax1(const float* logits, int n, float* part) {
+// Philox4x32-10, first output word, for counter (c0, c1, 0, 0) and key (k0, 0).
+__device__ __forceinline__ unsigned philox(unsigned c0, unsigned c1, unsigned k0) {
+    unsigned x0 = c0, x1 = c1, x2 = 0, x3 = 0, k1 = 0;
+    #pragma unroll
+    for (int r = 0; r < 10; r++) {
+        const unsigned lo0 = 0xD2511F53u * x0, hi0 = __umulhi(0xD2511F53u, x0);
+        const unsigned lo1 = 0xCD9E8D57u * x2, hi1 = __umulhi(0xCD9E8D57u, x2);
+        const unsigned y0 = hi1 ^ x1 ^ k0, y2 = hi0 ^ x3 ^ k1;
+        x0 = y0; x1 = lo1; x2 = y2; x3 = lo0;
+        k0 += 0x9E3779B9u; k1 += 0xBB67AE85u;
+    }
+    return x0;
+}
+
+// Sampling is the Gumbel-max trick on the window's logits: token = argmax_i (logit_i / T + g_i),
+// g_i = -log(-log(u_i)), u_i from Philox(seed, position, i). A function of (seed, position) and
+// the logits only, so drafts never change what is sampled. T = 0: plain argmax.
+extern "C" __global__ void fe_argmax1(const float* logits, int n, float* part, const unsigned* ctl) {
     __shared__ float bv[32];
     __shared__ int bi[32];
     const float* l = logits + (size_t)blockIdx.y * n;
     const int per = (n + gridDim.x - 1) / gridDim.x, lo = blockIdx.x * per, hi = min(n, lo + per);
     float v = __int_as_float(0xff800000);
     int idx = 0x7fffffff;
-    for (int i = lo + threadIdx.x; i < hi; i += blockDim.x) amax_merge(v, idx, l[i], i);
+    const float temp = __uint_as_float(ctl[4]);
+    const unsigned pos = ctl[0] + blockIdx.y, seed = ctl[3];
+    if (temp > 0.f) {
+        const float it = 1.0f / temp;
+        for (int i = lo + threadIdx.x; i < hi; i += blockDim.x) {
+            const float u = ((float)(philox((unsigned)i, pos, seed) >> 8) + 0.5f) * 5.9604644775390625e-8f;
+            amax_merge(v, idx, l[i] * it - logf(-logf(u)), i);
+        }
+    } else {
+        for (int i = lo + threadIdx.x; i < hi; i += blockDim.x) amax_merge(v, idx, l[i], i);
+    }
     for (int o = 16; o > 0; o >>= 1) amax_merge(v, idx, __shfl_xor_sync(0xffffffffu, v, o), __shfl_xor_sync(0xffffffffu, idx, o));
     const int w = threadIdx.x >> 5;
     if ((threadIdx.x & 31) == 0) { bv[w] = v; bi[w] = idx; }

@@ -2,6 +2,7 @@
 //! command line.
 
 use super::engine::{Engine, ExpertMode, Opts, Probe, WinStats};
+use tang_compute::flash::MAX_T;
 use super::reference::top_logprobs;
 use anyhow::{bail, ensure, Context, Result};
 use std::path::{Path, PathBuf};
@@ -22,6 +23,11 @@ struct Args {
     ctx: Option<usize>,
     quiet: bool,
     save: Option<PathBuf>,
+    /// Drafts: none, suffix, wrong (forced-wrong tokens), oracle:FILE (a previous run's ids).
+    draft: String,
+    temp: f32,
+    seed: u32,
+    out: Option<PathBuf>,
 }
 
 fn read_ids(f: &str) -> Result<Vec<u32>> {
@@ -49,6 +55,10 @@ fn parse(args: &[String]) -> Result<Args> {
         ctx: None,
         quiet: false,
         save: None,
+        draft: "none".into(),
+        temp: 0.0,
+        seed: 0,
+        out: None,
     };
     while let Some(x) = it.next() {
         let mut val = || it.next().with_context(|| format!("{x} needs a value"));
@@ -79,6 +89,10 @@ fn parse(args: &[String]) -> Result<Args> {
             "--dump" => a.dump = Some(PathBuf::from(val()?)),
             "-q" => a.quiet = true,
             "--save" => a.save = Some(PathBuf::from(val()?)),
+            "--draft" => a.draft = val()?.clone(),
+            "--temp" => a.temp = val()?.parse()?,
+            "--seed" => a.seed = val()?.parse()?,
+            "--out" => a.out = Some(PathBuf::from(val()?)),
             s => bail!("unknown argument {s}"),
         }
     }
@@ -88,6 +102,8 @@ fn parse(args: &[String]) -> Result<Args> {
 fn load(a: &Args) -> Result<Engine> {
     let mut e = Engine::load(&a.path, a.opts.clone())?;
     e.use_graphs = !a.eager;
+    e.temperature = a.temp;
+    e.seed = a.seed;
     eprintln!("{}", e.load_report);
     Ok(e)
 }
@@ -177,6 +193,131 @@ fn decode(e: &mut Engine, ids: &[u32], n: usize, chunk: usize) -> Result<(Vec<u3
     Ok((out, stats, prefill_s, secs))
 }
 
+/// Per-run speculation counters.
+#[derive(Default, Debug, Clone)]
+pub struct SpecStats {
+    pub windows: usize,
+    pub tokens: usize,
+    /// Per draft position j: (proposed, accepted).
+    pub by_pos: Vec<(usize, usize)>,
+    /// Windows per width.
+    pub widths: Vec<usize>,
+}
+
+/// Decode `n` tokens after `ids` with verify windows and drafts from `kind` (`none`, `suffix`,
+/// `wrong`, `oracle:FILE`). Returns (tokens, per-window stats, prefill s, decode s, spec stats).
+fn decode_spec(
+    e: &mut Engine,
+    ids: &[u32],
+    n: usize,
+    chunk: usize,
+    kind: &str,
+) -> Result<(Vec<u32>, Vec<WinStats>, f64, f64, SpecStats)> {
+    use crate::draft::{Calibration, DraftConfig, Global, Session};
+    e.reset();
+    let t0 = Instant::now();
+    let mut cur = e.prefill(ids, chunk, None)?;
+    let prefill_s = t0.elapsed().as_secs_f64();
+    let cfg = DraftConfig::new(&[(1, 1.0), (2, 1.12), (4, 1.35), (8, 1.9)]);
+    let global = Global::new(0, None);
+    let cost: Vec<f32> = (0..=MAX_T).map(|k| cfg.cost(k.max(1))).collect();
+    let mut sess = Session::new(&cfg, &global, Calibration::default(), cost, ids);
+    let oracle: Vec<u32> = match kind.strip_prefix("oracle:") {
+        Some(f) => read_ids(f)?,
+        None => Vec::new(),
+    };
+    let mut rng = 0x2545_F491_4F6C_DD1Du64;
+    let mut out = vec![cur];
+    sess.push(cur);
+    let mut stats = Vec::new();
+    let mut sp = SpecStats {
+        by_pos: vec![(0, 0); MAX_T],
+        widths: vec![0; MAX_T + 1],
+        ..Default::default()
+    };
+    let mut started = None;
+    while out.len() < n {
+        if out.len() >= 2 && started.is_none() {
+            started = Some(Instant::now());
+            stats.clear();
+            sp = SpecStats {
+                by_pos: vec![(0, 0); MAX_T],
+                widths: vec![0; MAX_T + 1],
+                ..Default::default()
+            };
+        }
+        let room = (MAX_T - 1).min(n - out.len());
+        let (drafts, draft) = match kind {
+            "suffix" => {
+                let d = sess.propose(room);
+                (d.tokens.clone(), Some(d))
+            }
+            "wrong" => {
+                // Forced-wrong: random tokens (and sometimes a true prefix from an oracle).
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                let k = 1 + (rng % room.max(1) as u64) as usize;
+                ((0..k.min(room)).map(|i| ((rng >> (8 * i)) % 248_000) as u32).collect(), None)
+            }
+            _ if !oracle.is_empty() => {
+                // Oracle: the true continuation, with one token corrupted now and then.
+                let at = out.len();
+                let mut d: Vec<u32> = oracle.iter().skip(at).take(room).copied().collect();
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                if !d.is_empty() && rng % 3 == 0 {
+                    let j = (rng >> 8) as usize % d.len();
+                    d[j] = d[j].wrapping_add(1);
+                }
+                (d, None)
+            }
+            _ => (Vec::new(), None),
+        };
+        let kept = e.verify(cur, &drafts)?;
+        let acc = kept.len() - 1;
+        for (j, slot) in sp.by_pos.iter_mut().enumerate().take(drafts.len()) {
+            slot.0 += 1;
+            if j < acc {
+                slot.1 += 1;
+            }
+        }
+        if let Some(d) = &draft {
+            for j in 0..d.tokens.len().min(acc + 1) {
+                sess.calib.observe(d.match_len, d.shares[j], j < acc);
+            }
+        }
+        sp.windows += 1;
+        sp.widths[drafts.len() + 1] += 1;
+        sp.tokens += kept.len();
+        stats.push(e.last);
+        for &k in &kept {
+            sess.push(k);
+        }
+        out.extend_from_slice(&kept);
+        cur = *kept.last().unwrap();
+    }
+    let secs = started.map_or(0.0, |s| s.elapsed().as_secs_f64());
+    out.truncate(n);
+    Ok((out, stats, prefill_s, secs, sp))
+}
+
+fn spec_report(sp: &SpecStats) -> String {
+    let mut s = format!(
+        "{} windows, {:.2} tokens/window; widths {:?}; accepted by draft position:",
+        sp.windows,
+        sp.tokens as f64 / sp.windows.max(1) as f64,
+        sp.widths.iter().enumerate().filter(|(_, &c)| c > 0).map(|(w, c)| format!("T{w}:{c}")).collect::<Vec<_>>()
+    );
+    for (j, &(p, a)) in sp.by_pos.iter().enumerate() {
+        if p > 0 {
+            s += &format!(" d{}={}/{} ({:.0}%)", j + 1, a, p, 100.0 * a as f64 / p as f64);
+        }
+    }
+    s
+}
+
 fn mean(stats: &[WinStats]) -> WinStats {
     let n = stats.len().max(1) as f64;
     let mut m = WinStats {
@@ -203,25 +344,32 @@ pub fn generate(args: &[String]) -> Result<()> {
     let a = parse(args)?;
     let ids = prompt_ids(&a)?;
     let mut e = load(&a)?;
-    let (out, stats, prefill_s, secs) = decode(&mut e, &ids, a.n, a.chunk)?;
+    let (out, stats, prefill_s, secs, sp) = decode_spec(&mut e, &ids, a.n, a.chunk, &a.draft)?;
     let vocab = e.vocab()?;
     println!("prompt: {} tokens, prefill {:.2} s ({:.0} tok/s)", ids.len(), prefill_s, ids.len() as f64 / prefill_s);
     println!("ids: {}", out.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" "));
-    println!("text: {}", detok(&vocab, &out));
-    let timed = stats.len().saturating_sub(1);
+    if !a.quiet {
+        println!("text: {}", detok(&vocab, &out));
+    }
     println!(
-        "decode: {} tokens in {:.3} s = {:.1} tok/s (T=1, graphs {})",
-        timed,
+        "decode: {} tokens in {:.3} s = {:.1} tok/s (drafts {}, temp {}, graphs {})",
+        sp.tokens,
         secs,
-        timed as f64 / secs,
+        sp.tokens as f64 / secs,
+        a.draft,
+        a.temp,
         e.use_graphs
     );
-    println!("mean window: {}", split_line(&mean(&stats[1.min(stats.len())..])));
+    println!("speculation: {}", spec_report(&sp));
+    println!("mean window: {}", split_line(&mean(&stats)));
     if let Some(cs) = e.cache_stats() {
         println!("cache: hit rate {:.3} over the run ({} hits, {} misses, {} swaps)", cs.hit_rate(), cs.hits, cs.misses, cs.swaps);
     }
     let (h, r) = e.ngram_stats();
     println!("n-gram rows: {r} reads, {h} cache hits");
+    if let Some(p) = &a.out {
+        std::fs::write(p, out.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" "))?;
+    }
     if let Some(p) = &a.dump_routing {
         e.save_routing(p)?;
         println!("routing counts -> {}", p.display());
@@ -445,5 +593,107 @@ pub fn bench(args: &[String]) -> Result<()> {
         e.save_routing(p)?;
     }
     let _ = HIDDEN;
+    Ok(())
+}
+
+/// `flash-spec-test`: with one load, decode `-n` tokens without drafts, then with suffix drafts,
+/// forced-wrong drafts and an oracle (the no-draft output, corrupted now and then), greedy and
+/// at `--temp` (default 0.8), and check every output equals the no-draft one.
+pub fn spec_test(args: &[String]) -> Result<()> {
+    let mut a = parse(args)?;
+    let ids = prompt_ids(&a)?;
+    if a.temp == 0.0 {
+        a.temp = 0.8;
+    }
+    let mut e = load(&a)?;
+    let mut ok = true;
+    for temp in [0.0, a.temp] {
+        e.temperature = temp;
+        e.seed = a.seed;
+        let (base, _, _, s0, sp0) = decode_spec(&mut e, &ids, a.n, a.chunk, "none")?;
+        let f = std::env::temp_dir().join(format!("flash-oracle-{}.ids", std::process::id()));
+        std::fs::write(&f, base.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" "))?;
+        println!("temp {temp}: none   {:.1} tok/s  first {:?}", sp0.tokens as f64 / s0, &base[..base.len().min(12)]);
+        for kind in ["suffix".to_string(), "wrong".to_string(), format!("oracle:{}", f.display())] {
+            let (out, stats, _, secs, sp) = decode_spec(&mut e, &ids, a.n, a.chunk, &kind)?;
+            let same = out == base;
+            ok &= same;
+            let first_diff = out.iter().zip(&base).position(|(x, y)| x != y);
+            println!(
+                "temp {temp}: {:<7} {} {:.1} tok/s, {} | mean window {:.2} ms{}",
+                kind.split(':').next().unwrap(),
+                if same { "SAME" } else { "DIFFERS" },
+                sp.tokens as f64 / secs,
+                spec_report(&sp),
+                mean(&stats).wall_ms,
+                first_diff.map_or(String::new(), |i| format!(" (first difference at {i})"))
+            );
+        }
+        let _ = std::fs::remove_file(&f);
+    }
+    println!("{}", if ok { "spec test: PASS" } else { "spec test: FAIL" });
+    Ok(())
+}
+
+/// `flash-tcheck`: is a token's output independent of the window it is computed in? After a
+/// shared prefix, runs the next 8 tokens as eight T=1 windows, as one T=8 window, and as one
+/// T=8 verify window, each with per-layer probes of the last token, and reports where they
+/// first differ bitwise.
+pub fn tcheck(args: &[String]) -> Result<()> {
+    let a = parse(args)?;
+    let ids = prompt_ids(&a)?;
+    ensure!(ids.len() > 16, "need a longer prompt");
+    let mut e = load(&a)?;
+    for l in [0usize, 3] {
+        println!("layer {l} ops:");
+        e.op_tcheck(l)?;
+    }
+    let p = ids.len() - 8;
+    let v = e.hp.n_vocab;
+    let mut runs: Vec<(String, Vec<f32>, Probe)> = Vec::new();
+    for mode in ["t1", "t8", "t8-verify"] {
+        e.reset();
+        e.prefill(&ids[..p], 8, None)?;
+        e.tokens.extend_from_slice(&ids[p..]);
+        let mut probe = Probe::default();
+        let logits = match mode {
+            "t1" => {
+                for i in 0..7 {
+                    e.window(p + i, 1, None)?;
+                }
+                e.window(p + 7, 1, Some(&mut probe))?;
+                e.logits(1)
+            }
+            "t8" => {
+                e.window(p, 8, Some(&mut probe))?;
+                e.logits(8)[7 * v..].to_vec()
+            }
+            _ => {
+                e.window_mode(p, 8, true, Some(&mut probe))?;
+                e.logits(8)[7 * v..].to_vec()
+            }
+        };
+        runs.push((mode.to_string(), logits, probe));
+    }
+    let bits = |x: &[f32], y: &[f32]| x.iter().zip(y).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+    for i in 1..runs.len() {
+        let (a0, b0) = (&runs[0], &runs[i]);
+        println!("{} vs {}: logits differ in {} of {} entries", a0.0, b0.0, bits(&a0.1, &b0.1), v);
+        let mut first = None;
+        for l in 0..e.hp.n_layer {
+            let d = [
+                ("mixer_out", bits(&a0.2.mixer_out[l], &b0.2.mixer_out[l])),
+                ("post_mixer", bits(&a0.2.post_mixer[l], &b0.2.post_mixer[l])),
+                ("moe_out", bits(&a0.2.moe_out[l], &b0.2.moe_out[l])),
+            ];
+            if d.iter().any(|x| x.1 > 0) && first.is_none() {
+                first = Some(l);
+                println!("  first difference at layer {l}: {d:?}, router ids {:?} vs {:?}", a0.2.router_ids[l], b0.2.router_ids[l]);
+            }
+        }
+        if first.is_none() {
+            println!("  every probed layer bitwise equal");
+        }
+    }
     Ok(())
 }

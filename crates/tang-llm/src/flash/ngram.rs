@@ -153,6 +153,11 @@ impl NgramTable {
         Ok(raw)
     }
 
+    /// Run `f` on the reader pool.
+    pub fn spawn(self: std::sync::Arc<Self>, f: impl FnOnce() + Send + 'static) {
+        self.io.spawn(f);
+    }
+
     /// The gathered PLE inputs (`n_heads × head_dim` = 2560 floats each) for tokens `i0..i1`
     /// of `tokens` (the sequence so far), into `out[(i - i0) * 2560 ..]`. All rows of the window
     /// are read in parallel.
