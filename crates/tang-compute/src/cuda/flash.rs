@@ -14,6 +14,16 @@ use crate::kernels::flash_cuda::FLASH_CUDA;
 /// A null device pointer for kernel arguments a mode never reads.
 const NULL: u64 = 0;
 
+/// Words of the per-device sync counters, and each fused kernel's slot in them.
+const SYNC_WORDS: usize = 256;
+const SYNC_HC: usize = 0;
+
+/// `TANG_FLASH_UNFUSED=1`: the multi-launch kernels instead of the barrier-merged ones (A/B).
+fn unfused() -> bool {
+    static U: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *U.get_or_init(|| std::env::var("TANG_FLASH_UNFUSED").is_ok_and(|v| v == "1"))
+}
+
 fn grid(g: (usize, usize, usize), threads: u32) -> LaunchConfig {
     LaunchConfig {
         block_dim: (threads, 1, 1),
@@ -260,6 +270,25 @@ impl CudaComputeDevice {
         }
     }
 
+    /// The self-resetting counters the fused kernels synchronize through (zeroed once).
+    fn sync_words(&self) -> std::cell::RefMut<'_, cudarc::driver::CudaSlice<u32>> {
+        let mut s = self.flash_sync.borrow_mut();
+        if s.is_none() {
+            *s = Some(self.stream.alloc_zeros::<u32>(SYNC_WORDS).unwrap());
+        }
+        std::cell::RefMut::map(s, |s| s.as_mut().unwrap())
+    }
+
+    /// Blocks for a grid that must be co-resident (it meets at `grid_bar`): up to `per_sm`
+    /// per SM, as the occupancy calculator allows.
+    fn coresident(&self, f: &CudaFunction, threads: u32, per_sm: u32) -> usize {
+        let occ = f
+            .occupancy_max_active_blocks_per_multiprocessor(threads, 0, None)
+            .unwrap();
+        assert!(occ >= 1, "fused kernel does not fit on an SM");
+        occ.min(per_sm) as usize * super::llm::sm_count()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn hc_read_impl(
         &self,
@@ -274,6 +303,9 @@ impl CudaComputeDevice {
         eps: f32,
     ) {
         assert!((1..=MAX_T).contains(&t) && scratch.len >= crate::flash::hc_scratch_words(t));
+        if !unfused() {
+            return self.hc_fused_impl(r, pending, w, x, xq, inj, scratch, t, eps);
+        }
         let xn_len = t * HC * HIDDEN;
         let (mut xn, mut lo) = scratch.f32_data_mut().split_at_mut(xn_len);
         // Unused pointer arguments get `w.norm`; the kernel never reads them in that mode.
@@ -364,6 +396,98 @@ impl CudaComputeDevice {
             };
             l.arg(&quant)
                 .launch(grid((HIDDEN / 32, 1, 1), 1024))
+                .unwrap();
+        }
+    }
+
+    /// `hc_read_impl` as one launch of `fl_hc_fused_t{t}` on a co-resident grid.
+    #[allow(clippy::too_many_arguments)]
+    fn hc_fused_impl(
+        &self,
+        r: &mut CudaBuffer,
+        pending: Option<HcPending<'_, CudaBuffer>>,
+        w: &HcWeights<'_, CudaBuffer>,
+        x: &mut CudaBuffer,
+        xq: Option<&mut CudaBuffer>,
+        inj: Option<&mut CudaBuffer>,
+        scratch: &mut CudaBuffer,
+        t: usize,
+        eps: f32,
+    ) {
+        const NAMES: [&str; 8] = [
+            "fl_hc_fused_t1",
+            "fl_hc_fused_t2",
+            "fl_hc_fused_t3",
+            "fl_hc_fused_t4",
+            "fl_hc_fused_t5",
+            "fl_hc_fused_t6",
+            "fl_hc_fused_t7",
+            "fl_hc_fused_t8",
+        ];
+        let f = self.fl(NAMES[t - 1]);
+        let blocks = self.coresident(&f, 512, 2);
+        let (mut xn, mut lo) = scratch.f32_data_mut().split_at_mut(t * HC * HIDDEN);
+        let any = w.norm;
+        let (mode, yp, ip, parts, wr, lg, stride, sg) = match pending {
+            None => (0u32, any, any, any, any, any, 0usize, -1i32),
+            Some(HcPending::Write { y, inj }) => (1, y, inj, any, any, any, 0, -1),
+            Some(HcPending::Moe {
+                parts,
+                w: wr,
+                logits,
+                stride,
+                sg,
+                inj,
+            }) => (
+                2,
+                any,
+                inj,
+                parts,
+                wr,
+                logits,
+                stride,
+                sg.map_or(-1, |c| c as i32),
+            ),
+        };
+        let rows = (HC_LR + if w.inject.is_some() { HC } else { 0 }) as u32;
+        let wi = w.inject.unwrap_or(w.down);
+        let (su, quant) = (stride as u32, xq.is_some() as u32);
+        let mut bar = self.sync_words();
+        let mut bar = bar.slice_mut(SYNC_HC..SYNC_HC + 2);
+        unsafe {
+            let mut l = self.stream.launch_builder(&f);
+            l.arg(r.f32_data_mut())
+                .arg(yp.f32_data())
+                .arg(ip.f32_data())
+                .arg(&mode)
+                .arg(w.norm.f32_data())
+                .arg(&eps)
+                .arg(parts.f32_data())
+                .arg(wr.f32_data())
+                .arg(lg.f32_data())
+                .arg(&su)
+                .arg(&sg)
+                .arg(w.down.bf16_data())
+                .arg(wi.bf16_data())
+                .arg(&rows)
+                .arg(w.up.bf16_data())
+                .arg(x.f32_data_mut());
+            match xq {
+                Some(q) => {
+                    assert!(q.len >= QAct { m: t, k: HIDDEN }.words());
+                    l.arg(q.f32_data_mut())
+                }
+                None => l.arg(&NULL),
+            };
+            l.arg(&quant);
+            match inj {
+                Some(i) => l.arg(i.f32_data_mut()),
+                None => l.arg(&NULL),
+            };
+            l.arg(&mut xn)
+                .arg(&mut lo)
+                .arg(&mut bar)
+                .launch(grid((blocks, 1, 1), 512))
                 .unwrap();
         }
     }
