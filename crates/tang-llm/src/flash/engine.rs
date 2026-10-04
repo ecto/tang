@@ -367,6 +367,11 @@ pub struct WinStats {
     pub gpu_wait_b_ms: f64,
     /// GPU: window start to end (with `split`).
     pub gpu_ms: f64,
+    /// Host: launch to the window's last layer served; served to stream drained; drained to
+    /// return (cache boundary, tables).
+    pub serve_ms: f64,
+    pub drain_ms: f64,
+    pub post_ms: f64,
     pub routed: usize,
     pub distinct: usize,
     pub missed: usize,
@@ -1534,7 +1539,11 @@ impl Engine {
             };
             self.enqueue_window(t, unfused, verify, &mut f)?;
         }
+        let ts = Instant::now();
+        st.serve_ms = (ts - w0).as_secs_f64() * 1e3 - st.host_prep_ms;
         self.dev.sync();
+        let td = Instant::now();
+        st.drain_ms = (td - ts).as_secs_f64() * 1e3;
         if let Some(e) = self.gather_err.lock().unwrap().take() {
             bail!("n-gram rows: {e}");
         }
@@ -1561,6 +1570,7 @@ impl Engine {
         self.sync_tables()?;
         self.counter = self.counter.wrapping_add(1);
         st.wall_ms = w0.elapsed().as_secs_f64() * 1e3;
+        st.post_ms = td.elapsed().as_secs_f64() * 1e3;
         self.last = st;
         // Capture this size's graph now that every kernel is loaded.
         if self.use_graphs && !graph_ready {

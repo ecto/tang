@@ -224,7 +224,10 @@ fn decode_spec(
     let mut sess = Session::new(&cfg, &global, Calibration::default(), cost, ids);
     let oracle: Vec<u32> = match kind.strip_prefix("oracle:") {
         Some(f) => read_ids(f)?,
-        None => Vec::new(),
+        None => match kind.strip_prefix("fixed:") {
+            Some(r) => read_ids(r.split_once(':').context("fixed:K:FILE")?.1)?,
+            None => Vec::new(),
+        },
     };
     let mut rng = 0x2545_F491_4F6C_DD1Du64;
     let mut out = vec![cur];
@@ -259,6 +262,11 @@ fn decode_spec(
                 rng ^= rng << 17;
                 let k = 1 + (rng % room.max(1) as u64) as usize;
                 ((0..k.min(room)).map(|i| ((rng >> (8 * i)) % 248_000) as u32).collect(), None)
+            }
+            _ if !oracle.is_empty() && kind.starts_with("fixed") => {
+                // Fixed width: the true continuation, never corrupted (every window T = k + 1).
+                let k = kind.split(':').nth(1).and_then(|v| v.parse().ok()).unwrap_or(3usize);
+                (oracle.iter().skip(out.len()).take(room.min(k)).copied().collect(), None)
             }
             _ if !oracle.is_empty() => {
                 // Oracle: the true continuation, with one token corrupted now and then.
@@ -332,6 +340,9 @@ fn mean(stats: &[WinStats]) -> WinStats {
         m.gpu_wait_a_ms += s.gpu_wait_a_ms / n;
         m.gpu_wait_b_ms += s.gpu_wait_b_ms / n;
         m.gpu_ms += s.gpu_ms / n;
+        m.serve_ms += s.serve_ms / n;
+        m.drain_ms += s.drain_ms / n;
+        m.post_ms += s.post_ms / n;
         m.routed += s.routed;
         m.distinct += s.distinct;
         m.missed += s.missed;
@@ -344,6 +355,11 @@ pub fn generate(args: &[String]) -> Result<()> {
     let a = parse(args)?;
     let ids = prompt_ids(&a)?;
     let mut e = load(&a)?;
+    // Warm-up: capture every graph this mode uses (window sizes, commits) on a short run.
+    {
+        let warm = &ids[..ids.len().min(64)];
+        let _ = decode_spec(&mut e, warm, 40.min(a.n), a.chunk, &a.draft)?;
+    }
     let (out, stats, prefill_s, secs, sp) = decode_spec(&mut e, &ids, a.n, a.chunk, &a.draft)?;
     let vocab = e.vocab()?;
     println!("prompt: {} tokens, prefill {:.2} s ({:.0} tok/s)", ids.len(), prefill_s, ids.len() as f64 / prefill_s);
@@ -560,27 +576,34 @@ pub fn bench(args: &[String]) -> Result<()> {
         a.opts.max_ctx = (ids.len() + a.n + 8).next_multiple_of(1024);
     }
     let mut e = load(&a)?;
-    let (out, stats, prefill_s, secs) = decode(&mut e, &ids, a.n, a.chunk)?;
-    let timed = &stats[1.min(stats.len())..];
+    // Warm-up: capture every graph this mode uses (window sizes, commits) on a short run.
+    {
+        let warm = &ids[..ids.len().min(64)];
+        let _ = decode_spec(&mut e, warm, 40.min(a.n), a.chunk, &a.draft)?;
+    }
+    let (out, stats, prefill_s, secs, sp) = decode_spec(&mut e, &ids, a.n, a.chunk, &a.draft)?;
+    let timed = &stats[..];
     let m = mean(timed);
-    let tps = timed.len() as f64 / secs;
+    let tps = sp.tokens as f64 / secs;
     let walls: Vec<f64> = {
         let mut w: Vec<f64> = timed.iter().map(|s| s.wall_ms).collect();
         w.sort_by(|a, b| a.total_cmp(b));
         w
     };
-    println!("flash-bench: context {} + {} new tokens, greedy, T=1, graphs {}", ids.len(), a.n, e.use_graphs);
+    println!("flash-bench: context {} + {} new tokens, temp {}, drafts {}, graphs {}", ids.len(), a.n, a.temp, a.draft, e.use_graphs);
     println!("  prefill            {:8.2} s ({:.0} tok/s, chunk {})", prefill_s, ids.len() as f64 / prefill_s, a.chunk);
-    println!("  decode             {:8.1} tok/s ({} tokens in {:.3} s)", tps, timed.len(), secs);
+    println!("  decode             {:8.1} tok/s ({} tokens in {:.3} s)", tps, sp.tokens, secs);
+    println!("  speculation        {}", spec_report(&sp));
     println!("  window wall        {:8.3} ms mean, {:.3} median, {:.3} p90", m.wall_ms, walls[walls.len() / 2], walls[walls.len() * 9 / 10]);
     println!("  GPU (graph)        {:8.3} ms", m.gpu_ms);
     println!("    waiting for plan {:8.3} ms  (handoff A)", m.gpu_wait_a_ms);
     println!("    waiting for CPU  {:8.3} ms  (CPU-miss time exposed)", m.gpu_wait_b_ms);
-    println!("  host prep          {:8.3} ms  (embedding + n-gram rows)", m.host_prep_ms);
+    println!("  host prep          {:8.3} ms  (embedding; n-gram rows are read during layer 0)", m.host_prep_ms);
+    println!("  host: launch..served {:6.3} ms, ..drained {:.3} ms, boundary+tables {:.3} ms", m.serve_ms, m.drain_ms, m.post_ms);
     println!("  host plan          {:8.3} ms", m.plan_ms);
     println!("  host CPU experts   {:8.3} ms", m.cpu_ms);
     println!(
-        "  experts            {:.1} distinct/token, {:.2} missed/token, hit rate {:.3}, swaps {}",
+        "  experts            {:.1} distinct/window, {:.2} missed/window, hit rate {:.3}, swaps {}",
         m.distinct as f64 / timed.len() as f64,
         m.missed as f64 / timed.len() as f64,
         1.0 - m.missed as f64 / m.distinct.max(1) as f64,
@@ -589,6 +612,9 @@ pub fn bench(args: &[String]) -> Result<()> {
     let (h, r) = e.ngram_stats();
     println!("  n-gram rows        {r} reads, {h} cache hits");
     println!("  first tokens: {}", out.iter().take(16).map(|v| v.to_string()).collect::<Vec<_>>().join(" "));
+    if let Some(p) = &a.out {
+        std::fs::write(p, out.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" "))?;
+    }
     if let Some(p) = &a.dump_routing {
         e.save_routing(p)?;
     }
