@@ -248,6 +248,154 @@ tang-llm flash-ref <first shard> --ids-file chat.ids --top 40 --dump dump_chat >
 python3 $S compare llama_chat.jsonl tang_chat.jsonl [--from I --to J]
 ```
 
+## Dense requantization for the fast kernels
+
+The GPU kernels take a dense weight as bf16, native Q2_0, or Q4X (tang-Q4: affine 4-bit, group 64,
+bf16 scale and bias, 0.5625 B/weight) against int8 activations. ISTA's other dense tensors (3.31 G
+weights in nine types) must be requantized or get their own kernels. Measured with
+`flash-ref --dense-as <policy> --act-int8` (`src/flash/requant.rs`) against the f32 reference (and
+llama.cpp), and `flash-requant` for bytes. "Bytes" is what a decode step reads in full: dense +
+HC + router + head, not experts or table rows.
+
+**The int8 activation contract alone** (per 32, `d = amax/127` in f32, round half away from zero,
+on every GEMV whose weight isn't kept bf16/f32, experts included; `--act-int8`, weights exact) is
+the parity band for the fast engine: KL vs the f32 reference 0.0027 / 0.0016 / 0.0056, top-1
+98.4% / 99.1% / 97.6% (chat / code / long), and 0.0016 / 99.0% on the 387-token chat2 sequence.
+
+| Policy (all with int8 activations) | Bytes/step | KL vs f32: chat / code / long | top-1 vs f32: long | KL vs llama.cpp: long |
+|---|---|---|---|---|
+| native kernels for every type (= the band above) | 3.366 GB | 0.0027 / 0.0016 / 0.0056 | 97.6% | 0.0080 |
+| **native Q3_K, IQ4_XS, Q4_K; Q8_0 for the rest (head included)** | **3.698 GB** | **0.0033 / 0.0026 / 0.0064** | **97.4%** | 0.0085 |
+| native for all five K-quants; Q8_0 for the 4 small types | 3.389 GB | not run: native is exact, Q8_0 adds ≈ 0 | | |
+| Q8_0 for everything | 5.077 GB | — / 0.0020 / — (chat2 0.0015) | | |
+| Q4X min/max for everything (the engine today) | 3.422 GB | 0.095 / 0.059 / 0.106 | 88.9% | 0.107 |
+| Q4X searched (scale, bias) for everything | 3.422 GB | 0.035 / 0.035 / 0.087 | 90.6% | 0.088 |
+| searched Q4X, but Q8_0 for ≥ 5-bit types | 3.859 GB | 0.019 / 0.013 / 0.038 | 93.9% | 0.038 |
+
+Q4X costs real quality: KL 0.06–0.11 and 89–95% top-1, 10–20× the int8 band. Per source type,
+searched Q4X on that type alone (rest native, int8 activations; KL vs f32 on code / chat2, band
+0.0016 / 0.0016):
+
+| GGUF type | Weights | Native bytes | Q8_0 bytes | Q4X bytes | Q4X cost (KL code / chat2) | Recommendation |
+|---|---|---|---|---|---|---|
+| `output.weight` (Q5_K) | 636 M | 437.0 MB | 675.4 MB | 357.6 MB | **0.024 / 0.042** | never Q4X; Q8_0 now, native Q5_K later |
+| Q6_K (12 tensors) | 103 M | 84.4 MB | 109.3 MB | 57.9 MB | **0.016 / 0.018** | Q8_0 (or native) |
+| IQ4_XS (56) | 824 M | 437.8 MB | 875.6 MB | 463.6 MB | 0.008 / 0.009 | native (Q4X is *more* bytes) |
+| Q4_K (38) | 413 M | 232.2 MB | 438.7 MB | 232.2 MB | 0.007 / 0.009 | native (same bytes as Q4X) |
+| Q3_K (90) | 1,162 M | 499.3 MB | 1,234.6 MB | 653.6 MB | 0.007 / 0.006 | native (Q4X is 31% *more* bytes) |
+| Q5_K except the head (15) | 122 M | 83.6 MB | 129.2 MB | 68.4 MB | 0.0044 / 0.0038 | Q8_0 (or native) |
+| IQ4_NL, Q4_0, Q5_0, Q8_0 (32 shared-expert downs) | 52 M | 32.6 MB | 55.7 MB | 29.5 MB | 0.0034 / 0.0041 | Q8_0 |
+
+So the cheapest fix is not better Q4X rounding (searched scales halve the cost and it's still
+0.035–0.09): it's three native GEMVs (Q3_K, IQ4_XS, Q4_K: ggml's `vec_dot_*_q8_1` MMVQ paths, with
+the same int8 activations) plus an int8 Q8_0 GEMV for everything else, at 3.70 GB/step (+10% over
+the file's 3.37 GB, +8% over Q4X's 3.42 GB) and parity at the int8 band. Native Q5_K and Q6_K
+kernels too would bring it to 3.39 GB. Weight-space error, for reference (relative ‖W−Q(W)‖²,
+`flash-requant`): Q4X 0.85–1.17%, searched Q4X 0.54–0.97%, Q8_0 ≤ 0.004%, for every source type.
+
+## MTP acceptance
+
+`tang-llm flash-mtp <main> <mtp> --ids-file F --from I --depth 3` (`src/flash/mtp.rs`):
+teacher-forced chains of depth 1..3 from every start, compared with the main model's own greedy
+token at each step (a depth-`k` draft is counted only when the drafts before it were accepted and
+the main model's greedy tokens are the sequence's, which holds on its own greedy text: the
+`*_gen.ids` sequences are a prompt plus llama.cpp's greedy continuation). ISTA main model, the
+Q8_0 MTP file with its own embedding and head (the main model's head gives the same: 0.761 /
+0.675 / 0.689 on chat2), f32, dense MTP attention:
+
+| Sequence (scored region) | Starts | Depth 1 | Depth 2 (conditional) | Depth 3 (conditional) | Cumulative 1 / 2 / 3 |
+|---|---|---|---|---|---|
+| code continuation (128 greedy tokens after `sample.rs`) | 126 | 0.897 | 0.882 | 0.851 | 0.897 / 0.791 / 0.673 |
+| code, whole sequence (prompt + continuation) | 444 | 0.919 | 0.901 | 0.869 | 0.919 / 0.828 / 0.719 |
+| chat2 reasoning (320 greedy tokens, a `<think>` answer) | 318 | 0.761 | 0.671 | 0.662 | 0.761 / 0.511 / 0.338 |
+MTP_EXTRA
+
+That's the published band for this family (≈ 0.9 / 0.72–0.78 / 0.48–0.62 cumulative) on code
+and below it on free-form reasoning text. With two drafts always proposed, chat2's numbers give
+(0.761 + 0.511) / 2 = 0.64 accepted per drafted token, against unsloth's "draft acceptance
+0.661" for llama.cpp `--spec-draft-n-max 2` on its own runs.
+
+Calibration (all depths; acceptance by the draft's own softmax probability): on code
+0.98 at p ≥ 0.9, 0.60–0.92 in [0.5, 0.9), 0.33–0.57 below 0.5; on chat2 0.995 at p ≥ 0.9, 0.71–0.86
+in [0.5, 0.9), 0.29–0.62 below. Gating at p ≥ 0.5 keeps 93.5% (code) / 88.3% (chat2) acceptance on
+the drafts it lets through and rejects drafts that would have been accepted 45% / 44% of the
+time.
+
+Checked by ablation on chat2 depth 1: per-stream `hnorm` 0.761 vs Strata's RMS over all 10240,
+0.711; adding 1 to `enorm`/`hnorm` (as if stored raw): 0.610; `[h ; e]` instead of `[e ; h]`: 0;
+rope offset by one position: unchanged (only relative positions matter). llama.cpp b11382's own
+`--spec-type draft-mtp` crashes on the CPU backend (`llama_kv_cache::set_input_k_idxs` abort in
+`common_context_can_seq_rm`), so there is no llama.cpp number to compare.
+
+`flash-mtp --dump DIR` adds `mtp.x_attn.<pos>`, `mtp.r_out.<pos>`, `mtp.final_x.<pos>` (the last
+teacher-forced cell's attention input, output residual and head input) and `mtp.tf_top`,
+`mtp.tf_top_p`, `mtp.tf_tokens_in` to the main model's dump. On mew: `~/flash-truth/dump_mtp_code`.
+
+## QSA selection, checked directly
+
+`scripts/flash_qsa_topk.cpp` (a replacement for llama.cpp's `eval-callback`, built CPU-only from
+llama.cpp `46847e6` on mew) dumps `indexer_top_k` and `indexer_score` for the last token of the
+8151-token prompt; `scripts/flash_qsa_compare.py` diffs them with `LNN.qsa_selected` and
+`LNN.qsa_scores`.
+
+| Layer | 3 | 7 | 11 | 15 | 19 | 23 | 27 | 31 | 35 | 39 | 43 | 47 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| same blocks (of 512) | 509 | 506 | 508 | 507 | 506 | 506 | 504 | 495 | 487 | 480 | 477 | 482 |
+| score corr. (tang vs llama.cpp) | 0.9998 | 0.9999 | 0.9999 | 0.9998 | 0.9996 | 0.9989 | 0.9987 | 0.9957 | 0.9922 | 0.9887 | 0.9878 | 0.9917 |
+
+Selection logic agrees: in layers 3–15 every disagreeing block sits within ~50 places of the cut
+in llama.cpp's own ranking (ranks 491–566 around 512), i.e. near-ties at the 512th place. Deeper, the scores themselves drift, a few
+blocks a lot (block 359: 6.58 vs 3.17 at layer 39). That drift is numeric, not a bug: our own f32
+run against our own `--llama-numerics` run moves the same blocks (673, 1033, 468, 78, 359, 1096,
+1814) by similar amounts and its overlap falls the same way (509 at layer 3, 495 at layer 27). The
+indexer's ranking near the cut is simply that sensitive; it costs nothing visible at the output
+(KL 0.0015 vs llama.cpp over the last 51 positions).
+
+## The MTP file
+
+`~/models/qwen3.8-flash-next/MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf` (unsloth, 4,137,429,120 bytes,
+one shard, "self-contained": it carries its own embedding and head). Architecture `qwen4exp` with
+`block_count = 49` and `nextn_predict_layers = 1`: the MTP block is `blk.48`, and the file has no
+trunk. `attention.compress_ratios` has 49 entries and is **0 at index 48**, so the MTP attention is
+dense; the block still ships indexer tensors, which llama.cpp loads and doesn't use. Its other
+metadata matches the main files (no `ple.*` keys).
+
+| Pattern | ne | Type | Bytes | Role |
+|---|---|---|---|---|
+| `token_embd.weight` | `[2560, 248320]` | Q8_0 | 675,430,400 | embedding (same model as the main file's) |
+| `output.weight` | `[2560, 248320]` | Q8_0 | 675,430,400 | LM head (same) |
+| `blk.48.nextn.enorm.weight` | `[2560]` | F32 | 10,240 | RMSNorm gamma on the token embedding, already 1+w |
+| `blk.48.nextn.hnorm.weight` | `[10240]` | F32 | 40,960 | per-stream RMSNorm gamma on the main residual, read `[2560, 4]`, already 1+w |
+| `blk.48.nextn.eh_proj.weight` | `[5120, 2560]` | Q8_0 | 13,926,400 | `[e ; hn[c]] → R[c]`, per stream (embedding half first) |
+| `blk.48.hc_attn_{norm,down,up,inject}.weight` | as main | F32 / Q8_0 | 7,047,680 | HC before attention |
+| `blk.48.attn_{q,k,v,output}.weight` | as main QSA | Q8_0 | 52,920,320 | attention (q is `[q 256 \| gate 256]` × 24) |
+| `blk.48.attn_{q,k}_norm.weight` | `[256]` | F32 | 2,048 | q/k RMSNorm |
+| `blk.48.indexer.{q_proj,k_proj}.weight`, `indexer.{q,k}_norm.weight` | as main | BF16 / F32 | 3,277,824 | unused (compress ratio 0) |
+| `blk.48.hc_ffn_{norm,down,up,inject}.weight` | as main | F32 / Q8_0 | 7,047,680 | HC before the MoE |
+| `blk.48.ffn_gate_inp.weight`, `ffn_gate_inp_shexp.weight` | `[2560, 512]`, `[2560]` | F32 | 5,253,120 | router, shared gate |
+| `blk.48.ffn_{gate,up,down}_exps.weight` | `[2560, 640, 512]` / `[640, 2560, 512]` | Q8_0 | 2,673,868,800 | 512 routed experts (5,222,400 B each) |
+| `blk.48.ffn_{gate,up,down}_shexp.weight` | `[2560, 640]` / `[640, 2560]` | Q8_0 | 5,222,400 | shared expert |
+| `blk.48.nextn.hc_head_{norm,down,up}.weight` | `[10240]`, `[10240, 320]`, `[320, 10240]` | F32 / Q8_0 | 7,004,160 | the MTP's own final HC read before the head |
+
+Totals: experts 2.674 GB, embedding 0.675 GB, head 0.675 GB, the rest 0.102 GB; 4.126 GB.
+
+The math (`src/flash/mtp.rs`; llama.cpp `graph_mtp` in `qwen4exp.cpp`): cell `i` takes the main
+model's final residual `h_i` (all 4 streams, before `output_hc_*`) and the token at `i + 1`, at
+rope position `i`, and predicts the token at `i + 2`:
+
+```
+e     = rmsnorm(embed(tok)) * enorm
+hn[c] = rmsnorm(h[c]) * hnorm[c]                 per 2560 stream
+R[c]  = eh_proj @ [e ; hn[c]]
+x, inj = hc_read(R, hc_attn_*);  R = hc_write(R, attn(x), inj)   dense causal, own K/V cache
+x, inj = hc_read(R, hc_ffn_*);   R = hc_write(R, moe(x), inj)
+logits = output @ hc_read(R, nextn.hc_head_*)
+```
+
+`R` is the next chained draft's `h`: depth `d` from start `i` is a cell at position `i + d − 1`
+whose token is the previous draft, attending to the teacher-forced cells `0..=i` and the chain's
+own earlier cells.
+
 ## Corrections
 
 What the GGUF and llama.cpp (`46847e6`, 2026-10-04; the docker image is build 11382 `11fe02151`,
@@ -281,9 +429,12 @@ same day) show, where [strata.md](strata.md) (written from Strata, which pins ll
 7. **The PLE predecessor window** comes from the sequence's own earlier tokens; before the start,
    a missing predecessor reads as EOS (248044), and an EOS predecessor cuts everything older.
    strata.md's "hash(tok, prev1, prev2)" is right but silent on this.
-8. **No MTP layer in either GGUF.** strata.md's byte table lists "MTP layer 0.8 GB"; that's from
+8. **MTP `hnorm` is per stream.** llama.cpp's `graph_mtp` normalizes each 2560 stream of the
+   main residual; Strata's `mtp.cpp` takes one RMS over all 10240. Per stream accepts more
+   (0.761 vs 0.711 at depth 1 on chat2). The MTP attention is dense (`compress_ratios[48] = 0`).
+9. **No MTP layer in either GGUF.** strata.md's byte table lists "MTP layer 0.8 GB"; that's from
    Strata's separate pack, not these files.
-9. **Byte totals, measured (ISTA):** routed experts 33.97 GB (31.64 GiB), matching "34 GB";
+10. **Byte totals, measured (ISTA):** routed experts 33.97 GB (31.64 GiB), matching "34 GB";
    n-gram table 28.80 GB ✓; head 0.437 GB plus 13 MB of `output_hc_*` ✓; HC 1.27 GB ✓ "1.3 GB".
    "Mixers, routers, shared experts 1.8 GB" is 1.65 GB here (PLE block included, embedding not);
    with the 0.27 GB embedding it's 1.92 GB.
