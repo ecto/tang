@@ -29,6 +29,7 @@ struct Args {
     seed: u32,
     out: Option<PathBuf>,
     think: Option<bool>,
+    dump_mtp_train: Option<PathBuf>,
 }
 
 fn read_ids(f: &str) -> Result<Vec<u32>> {
@@ -61,6 +62,7 @@ fn parse(args: &[String]) -> Result<Args> {
         seed: 0,
         out: None,
         think: None,
+        dump_mtp_train: None,
     };
     while let Some(x) = it.next() {
         let mut val = || it.next().with_context(|| format!("{x} needs a value"));
@@ -94,6 +96,7 @@ fn parse(args: &[String]) -> Result<Args> {
             "--save" => a.save = Some(PathBuf::from(val()?)),
             "--draft" => a.draft = val()?.clone(),
             "--no-think" => a.think = Some(false),
+            "--dump-mtp-train" => a.dump_mtp_train = Some(PathBuf::from(val()?)),
             "--mtp" => a.opts.mtp = Some(PathBuf::from(val()?)),
             "--temp" => a.temp = val()?.parse()?,
             "--seed" => a.seed = val()?.parse()?,
@@ -213,6 +216,12 @@ pub struct SpecStats {
     pub mtp_gpu_ms: f64,
     /// Windows that used the suffix drafter's proposal (hybrid).
     pub suffix_windows: usize,
+    /// Per draft position, (proposed, accepted) inside `<think>` and after it.
+    pub by_pos_think: Vec<(usize, usize)>,
+    pub by_pos_answer: Vec<(usize, usize)>,
+    /// Windows per width inside / after thinking.
+    pub widths_think: Vec<usize>,
+    pub widths_answer: Vec<usize>,
 }
 
 /// Decode `n` tokens after `ids` with verify windows and drafts from `kind` (`none`, `suffix`,
@@ -266,6 +275,10 @@ fn decode_spec(
         .collect();
     let mut mtp_probs: Vec<f32> = Vec::new();
     let fixed_gate = std::env::var("TANG_FLASH_GATE").ok().and_then(|v| v.parse::<f32>().ok());
+    // Thinking spans: the prompt ends inside `<think>` (248068) until `</think>` (248069).
+    let think_end = 248_069u32;
+    let mut in_think = ids.iter().rev().take(4).any(|&x| x == 248_068);
+    let think_room: usize = std::env::var("TANG_FLASH_THINK_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(MAX_T);
     while out.len() < n {
         if out.len() >= 2 && started.is_none() {
             started = Some(Instant::now());
@@ -276,7 +289,10 @@ fn decode_spec(
                 ..Default::default()
             };
         }
-        let room = (MAX_T - 1).min(n - out.len());
+        let mut room = (MAX_T - 1).min(n - out.len());
+        if in_think {
+            room = room.min(think_room);
+        }
         let (drafts, draft) = match kind {
             "suffix" => {
                 let d = sess.propose(room);
@@ -371,6 +387,22 @@ fn decode_spec(
                 slot.1 += 1;
             }
         }
+        {
+            let (bp, wd) = if in_think {
+                (&mut sp.by_pos_think, &mut sp.widths_think)
+            } else {
+                (&mut sp.by_pos_answer, &mut sp.widths_answer)
+            };
+            bp.resize(MAX_T, (0, 0));
+            wd.resize(MAX_T + 1, 0);
+            wd[drafts.len() + 1] += 1;
+            for (j, slot) in bp.iter_mut().enumerate().take(drafts.len()) {
+                slot.0 += 1;
+                if j < acc {
+                    slot.1 += 1;
+                }
+            }
+        }
         if let Some(d) = &draft {
             for j in 0..d.tokens.len().min(acc + 1) {
                 sess.calib.observe(d.match_len, d.shares[j], j < acc);
@@ -385,6 +417,9 @@ fn decode_spec(
         stats.push(e.last);
         for &k in &kept {
             sess.push(k);
+            if k == think_end {
+                in_think = false;
+            }
         }
         out.extend_from_slice(&kept);
         cur = *kept.last().unwrap();
@@ -411,6 +446,20 @@ fn spec_report(sp: &SpecStats) -> String {
     for (j, &(p, a)) in sp.by_pos.iter().enumerate() {
         if p > 0 {
             s += &format!(" d{}={}/{} ({:.0}%)", j + 1, a, p, 100.0 * a as f64 / p as f64);
+        }
+    }
+    for (name, bp, wd) in [("thinking", &sp.by_pos_think, &sp.widths_think), ("answer", &sp.by_pos_answer, &sp.widths_answer)] {
+        let w: usize = wd.iter().sum();
+        if w == 0 {
+            continue;
+        }
+        let acc: usize = bp.iter().map(|x| x.1).sum();
+        s += &format!("\n                     {name}: {w} windows, {:.2} tokens/window, widths {:?}, accepted", (w + acc) as f64 / w as f64,
+            wd.iter().enumerate().filter(|(_, &c)| c > 0).map(|(t, c)| format!("T{t}:{c}")).collect::<Vec<_>>());
+        for (j, &(p, a)) in bp.iter().enumerate() {
+            if p > 0 {
+                s += &format!(" d{}={:.0}%", j + 1, 100.0 * a as f64 / p as f64);
+            }
         }
     }
     s
@@ -449,6 +498,9 @@ pub fn generate(args: &[String]) -> Result<()> {
     let a = parse(args)?;
     let ids = prompt_ids(&a)?;
     let mut e = load(&a)?;
+    if let Some(d) = &a.dump_mtp_train {
+        e.dump_mtp_train(d)?;
+    }
     // Warm-up: capture every graph (window sizes, commits, MTP cell counts) before timing.
     e.warm()?;
     let (out, stats, prefill_s, secs, sp) = decode_spec(&mut e, &ids, a.n, a.chunk, &a.draft)?;

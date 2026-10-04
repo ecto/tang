@@ -495,6 +495,8 @@ pub struct Engine {
     pub load_report: String,
     mtp: Option<Box<Mtp>>,
     pub last_mtp_ms: f64,
+    probe_buf: Option<B>,
+    train_dump: Option<(std::io::BufWriter<std::fs::File>, std::io::BufWriter<std::fs::File>)>,
     pub last_commit_ms: f64,
     pub last_mtp_gpu_ms: f64,
     defer_boundary: bool,
@@ -894,7 +896,7 @@ impl Engine {
                     "flash: MTP layer loaded in {:.1} s, {:.2} GB VRAM (experts {})",
                     t.elapsed().as_secs_f64(),
                     (free_a - free_b) as f64 / 1e9,
-                    if m.ex_ty == 8 { "Q8_0" } else { "Q4_0" }
+                    match m.ex_ty { 8 => "Q8_0", 42 => "Q2_0", _ => "Q4_0" }
                 );
                 Some(m)
             }
@@ -1036,6 +1038,8 @@ impl Engine {
             load_report,
             mtp: None,
             last_mtp_ms: 0.0,
+            train_dump: None,
+            probe_buf: None,
             last_commit_ms: 0.0,
             last_mtp_gpu_ms: 0.0,
             defer_boundary: false,
@@ -1720,6 +1724,7 @@ impl Engine {
                 .launch(&self.stream)
                 .map_err(|e| anyhow!("{e}"))?;
             self.start_gather(pos0, t);
+            self.probe_traffic()?;
             for l in 0..self.layers.len() {
                 self.serve(l, &mut st)?;
             }
@@ -1970,16 +1975,80 @@ impl Engine {
             if let Some(cb) = logits_cb.as_deref_mut() {
                 cb(pos, t, &self.logits(t));
             }
+            let nexts: Vec<u32> = (0..t)
+                .map(|i| self.tokens.get(pos + i + 1).copied().unwrap_or(out[t - 1]))
+                .collect();
+            self.dump_train(pos, &nexts)?;
             if self.use_mtp && self.mtp.is_some() {
-                let next: Vec<u32> = (0..t)
-                    .map(|i| self.tokens.get(pos + i + 1).copied().unwrap_or(out[t - 1]))
-                    .collect();
-                self.mtp_last = self.mtp_draft(pos, &next)?;
+                self.mtp_last = self.mtp_draft(pos, &nexts)?;
             }
             next = out[t - 1];
             pos += t;
         }
         Ok(next)
+    }
+
+    /// `TANG_FLASH_PROBE_MB=N`: a contention probe for lookahead prefetch. Alongside each graph
+    /// window, a kernel on the side stream copies N MB of host-resident expert blobs from the
+    /// mapped arena into a VRAM scratch buffer (the traffic a prefetch of predicted misses would
+    /// make), so the window's slowdown can be measured.
+    fn probe_traffic(&mut self) -> Result<()> {
+        let mb: usize = std::env::var("TANG_FLASH_PROBE_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        if mb == 0 {
+            return Ok(());
+        }
+        let Experts::Resident(rc) = &self.experts else { return Ok(()) };
+        let blob = ExpertBlob::BYTES;
+        let n = (mb << 20) / blob;
+        if self.probe_buf.is_none() {
+            self.probe_buf = Some(self.dev.alloc_f32(n.max(1) * blob / 4));
+        }
+        let dst0 = self.dev.buffer_addr(self.probe_buf.as_ref().unwrap());
+        let mut srcs = Vec::new();
+        let mut key = (self.counter as usize * 97) % (48 * EXPERTS);
+        while srcs.len() < n {
+            if let Some(a) = rc.host_device_addr(key as u32) {
+                srcs.push(a);
+            }
+            key = (key + 1) % (48 * EXPERTS);
+        }
+        for (i, &src) in srcs.iter().enumerate() {
+            self.kcopy_on(self.side.0, dst0 + (i * blob) as u64, src, blob);
+        }
+        Ok(())
+    }
+
+    /// `--dump-mtp-train`: for each kept position `pos0 + i`, the final 4-stream residual (the
+    /// MTP's `h`, fp16 `[4][2560]`) to `h.f16`, and `(position, token, next token)` as three u32
+    /// to `ids.u32`: what a distillation job needs to fine-tune the MTP layer on this text.
+    fn dump_train(&mut self, pos0: usize, next: &[u32]) -> Result<()> {
+        use std::io::Write;
+        if self.train_dump.is_none() {
+            return Ok(());
+        }
+        let n = next.len();
+        let r = self.dev.download(&self.s.r);
+        let (hw, iw) = self.train_dump.as_mut().unwrap();
+        for (i, &nx) in next.iter().enumerate().take(n) {
+            let row = &r[i * HC * HIDDEN..(i + 1) * HC * HIDDEN];
+            let b: Vec<u8> = row.iter().flat_map(|&x| fl::f32_to_f16(x).to_le_bytes()).collect();
+            hw.write_all(&b)?;
+            let p = pos0 + i;
+            for v in [p as u32, self.tokens[p], nx] {
+                iw.write_all(&v.to_le_bytes())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Start writing MTP training pairs to `dir` (`h.f16`, `ids.u32`).
+    pub fn dump_mtp_train(&mut self, dir: &Path) -> Result<()> {
+        std::fs::create_dir_all(dir)?;
+        let f = |n: &str| -> Result<std::io::BufWriter<std::fs::File>> {
+            Ok(std::io::BufWriter::new(std::fs::OpenOptions::new().create(true).append(true).open(dir.join(n))?))
+        };
+        self.train_dump = Some((f("h.f16")?, f("ids.u32")?));
+        Ok(())
     }
 
     /// One speculative step: feed `cur` (the last sampled token) and `drafts` as a window, keep
@@ -2007,6 +2076,7 @@ impl Engine {
         };
         self.defer_boundary = false;
         let n = kept.len();
+        self.dump_train(pos, &kept)?;
         self.last_mtp_ms = 0.0;
         let t0 = Instant::now();
         let overlap = self.use_mtp && self.use_graphs && self.mtp.as_ref().is_some_and(|m| m.graphs[n].is_some());
@@ -2453,6 +2523,8 @@ impl Mtp {
             })
         };
         let q8 = std::env::var("TANG_FLASH_MTP_Q8").is_ok_and(|v| v == "1");
+        // TANG_FLASH_MTP_Q2=1: experts requantized to Q2_0 (0.67 GB instead of 1.42).
+        let q2 = !q8 && std::env::var("TANG_FLASH_MTP_Q2").is_ok_and(|v| v == "1");
         // The drafter's vocabulary: token ids [0, n) and the specials from 248044 on
         // (`TANG_FLASH_MTP_VOCAB`, default 106000: same acceptance as the full head on chat and code, 65536 costs code d1 96 -> 92%; 0 = all).
         let vocab_lo: Option<usize> = match std::env::var("TANG_FLASH_MTP_VOCAB").ok().and_then(|v| v.parse::<usize>().ok()) {
@@ -2467,8 +2539,14 @@ impl Mtp {
             let ti = t(n)?;
             ensure!(ti.ty == GgmlType::Q8_0, "{n}: {:?} MTP experts (Q8_0 expected)", ti.ty);
             let k = ti.row_len();
-            let b = if q8 { g.bytes(ti).to_vec() } else { m::q8_to_q4_0(g.bytes(ti))? };
-            ex_rb[i] = if q8 { k / 32 * 34 } else { k / 32 * 18 };
+            let b = if q8 {
+                g.bytes(ti).to_vec()
+            } else if q2 {
+                m::q8_to_q2_0(g.bytes(ti))?
+            } else {
+                m::q8_to_q4_0(g.bytes(ti))?
+            };
+            ex_rb[i] = if q8 { k / 32 * 34 } else if q2 { k / 64 * 18 } else { k / 32 * 18 };
             ex.push(m::upload_padded(dev, &b));
         }
         let emb_t = main.info("token_embd.weight")?;
@@ -2496,7 +2574,7 @@ impl Mtp {
             router: native(&[("ffn_gate_inp.weight", 0), ("ffn_gate_inp_shexp.weight", EXPERTS)], ROUTER_ROWS)?,
             sh_gu: native(&[("ffn_gate_shexp.weight", 0), ("ffn_up_shexp.weight", FF)], 2 * FF)?,
             sh_down: native(&[("ffn_down_shexp.weight", 0)], HIDDEN)?,
-            ex_ty: if q8 { 8 } else { 2 },
+            ex_ty: if q8 { 8 } else if q2 { 42 } else { 2 },
             ex: [ex.remove(0), ex.remove(0), ex.remove(0)],
             ex_rb,
             embed: {

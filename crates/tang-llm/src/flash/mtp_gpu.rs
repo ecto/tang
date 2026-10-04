@@ -103,6 +103,51 @@ pub fn q8_to_q4_0(src: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Q8_0 → Q2_0 (64 weights in 18 B, `(code − 1) · d`, codes 0..3): per block, the `d` from a
+/// small search that minimizes the squared error. A drafter's precision changes acceptance only.
+pub fn q8_to_q2_0(src: &[u8]) -> Result<Vec<u8>> {
+    ensure!(src.len() % 68 == 0, "Q8_0 size (pairs of 32-blocks)");
+    let nb = src.len() / 68;
+    let mut out = vec![0u8; nb * 18];
+    out.par_chunks_mut(18 * 2048).enumerate().try_for_each(|(c, o)| -> Result<()> {
+        let mut f = [0f32; 64];
+        for (i, dst) in o.chunks_mut(18).enumerate() {
+            let b = c * 2048 + i;
+            dequantize(GgmlType::Q8_0, &src[b * 68..b * 68 + 68], &mut f)?;
+            let amax = f.iter().fold(0f32, |a, v| a.max(v.abs()));
+            let (mut best, mut bd) = (f64::INFINITY, 0f32);
+            if amax > 0.0 {
+                for step in 1..=24 {
+                    // levels {-d, 0, d, 2d}
+                    let d = amax * step as f32 / 24.0;
+                    let mut e = 0f64;
+                    for &x in &f {
+                        let q = ((x / d).round()).clamp(-1.0, 2.0);
+                        let r = (x - q * d) as f64;
+                        e += r * r;
+                    }
+                    if e < best {
+                        best = e;
+                        bd = d;
+                    }
+                }
+            }
+            let dh = tang_compute::flash::f32_to_f16(bd);
+            let d = tang_compute::flash::f16_to_f32(dh);
+            dst[..2].copy_from_slice(&dh.to_le_bytes());
+            for v in dst[2..].iter_mut() {
+                *v = 0;
+            }
+            for (j, &x) in f.iter().enumerate() {
+                let q = if d > 0.0 { ((x / d).round()).clamp(-1.0, 2.0) as i32 + 1 } else { 1 };
+                dst[2 + j / 4] |= (q as u8) << (2 * (j % 4));
+            }
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
 pub fn upload_padded(dev: &CudaComputeDevice, b: &[u8]) -> B {
     let mut v = b.to_vec();
     v.extend_from_slice(&[0u8; 16]);

@@ -856,6 +856,7 @@ __device__ void moe_rows(const unsigned char* base, unsigned long long estride, 
 extern "C" __global__ void fe_moe_rows(int ty, const unsigned char* base, unsigned long long estride, int row_bytes, int rows,
                                        const unsigned* ids, const float* x, int xdiv, int k, float* out, int ostride, int ooff) {
     if (ty == 2) moe_rows<2>(base, estride, row_bytes, rows, ids, x, xdiv, k, out, ostride, ooff);
+    else if (ty == 42) moe_rows<42>(base, estride, row_bytes, rows, ids, x, xdiv, k, out, ostride, ooff);
     else if (ty == 8) moe_rows<8>(base, estride, row_bytes, rows, ids, x, xdiv, k, out, ostride, ooff);
 }
 
