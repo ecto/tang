@@ -15,11 +15,12 @@
 //! H  [n][k/32][hb]  extra bits, u32 planes with element (word j, byte b) at bit 8b + j:
 //!                   Q5_* 1 plane (bit 4), Q3_K 1 plane (bit 2), Q6_K 2 planes (bits 4, 5)
 //! S  scales:        Q4_0 / Q5_0 / IQ4_NL: [n][k/32] f16 d;  Q2_0: [n][k/64] f16 d;
-//!                   super-block types: a per-chunk plane SC [n][k/32][spc] then a per-256
-//!                   plane SD [n][k/256] u32 (d f16 | dmin f16 << 16, dmin 0 where absent):
-//!                   IQ4_XS spc 1 (i8 ls − 32); Q3_K / Q6_K spc 2 (the chunk's two i8 per-16
-//!                   scales); Q4_K / Q5_K spc 2 (u8 s, u8 m). A lane's scale loads are then one
-//!                   coalesced per-chunk load plus one per-256 word (same bytes as the headers).
+//!                   IQ4_XS: [n][k/256] × 12 B (d f16, 2 B pad, 8 × i8 ls − 32);
+//!                   Q3_K / Q6_K: [n][k/256] × 20 B (d f16, 2 B pad, 16 × i8 per-16 scale);
+//!                   Q4_K / Q5_K: a per-chunk plane SC [n][k/32] × (u8 s, u8 m), then a per-256
+//!                   plane SD [n][k/256] u32 (d f16 | dmin f16 << 16) -- the header bytes,
+//!                   split so a lane's scale loads are one coalesced u16 and one u32 (measured
+//!                   faster than headers for these two, slower for the per-16 types).
 //! ```
 //!
 //! # The dot (spec: `cpu::flash::native_linear`)
@@ -133,11 +134,10 @@ impl NatType {
         }
     }
 
-    /// Per-chunk scale bytes of a super-block type's SC plane (0 for the per-block types).
+    /// Per-chunk scale bytes of the SC plane (Q4_K / Q5_K; 0 for the others).
     pub fn spc(self) -> usize {
         match self {
-            Self::Iq4Xs => 1,
-            Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K => 2,
+            Self::Q4K | Self::Q5K => 2,
             _ => 0,
         }
     }
@@ -436,19 +436,26 @@ pub fn nat_repack(ty: NatType, raw: &[u8], n: usize, k: usize) -> Vec<u8> {
                     srow[2 * blk..2 * blk + 2].copy_from_slice(&src[..2]);
                 }
             }
-            _ => {
+            NatType::Iq4Xs | NatType::Q3K | NatType::Q6K => {
+                let hsz = if ty == NatType::Iq4Xs { 12 } else { 20 };
+                let srow = &mut out[so + row * ty.scale_bytes(k)..];
+                for sb in 0..k / 256 {
+                    let (d, dmin, sub) = hdr[row * (k / 256) + sb];
+                    let o = &mut srow[sb * hsz..(sb + 1) * hsz];
+                    o[0..2].copy_from_slice(&d.to_le_bytes());
+                    o[2..4].copy_from_slice(&dmin.to_le_bytes());
+                    o[4..hsz].copy_from_slice(&sub[..hsz - 4]);
+                }
+            }
+            NatType::Q4K | NatType::Q5K => {
                 let (spc, nch) = (ty.spc(), k / 32);
                 let sd = so + n * nch * spc;
                 for sb in 0..k / 256 {
                     let (d, dmin, sub) = hdr[row * (k / 256) + sb];
                     let w = so + (row * nch + 8 * sb) * spc;
                     for j in 0..8 {
-                        let pair = match ty {
-                            NatType::Iq4Xs => [sub[j], 0],
-                            NatType::Q4K | NatType::Q5K => [sub[j], sub[8 + j]],
-                            _ => [sub[2 * j], sub[2 * j + 1]],
-                        };
-                        out[w + j * spc..w + (j + 1) * spc].copy_from_slice(&pair[..spc]);
+                        out[w + 2 * j] = sub[j];
+                        out[w + 2 * j + 1] = sub[8 + j];
                     }
                     let at = sd + (row * (k / 256) + sb) * 4;
                     out[at..at + 2].copy_from_slice(&d.to_le_bytes());
@@ -520,14 +527,20 @@ pub fn nat_unpack(ty: NatType, wb: &[u8], n: usize, k: usize) -> NatIr {
                     (f16_to_f32(rd16(srow + 2 * (e / 32))), 0.0)
                 }
                 NatType::Q2_0 => (f16_to_f32(rd16(srow + 2 * (e / 64))), 0.0),
-                NatType::Iq4Xs => (
-                    f16_to_f32(rd16(sd_at(e))) * (wb[sc_at(e)] as i8) as f32,
-                    0.0,
-                ),
-                NatType::Q3K | NatType::Q6K => (
-                    f16_to_f32(rd16(sd_at(e))) * (wb[sc_at(e) + (e % 32) / 16] as i8) as f32,
-                    0.0,
-                ),
+                NatType::Iq4Xs => {
+                    let hd = srow + (e / 256) * 12;
+                    (
+                        f16_to_f32(rd16(hd)) * (wb[hd + 4 + (e % 256) / 32] as i8) as f32,
+                        0.0,
+                    )
+                }
+                NatType::Q3K | NatType::Q6K => {
+                    let hd = srow + (e / 256) * 20;
+                    (
+                        f16_to_f32(rd16(hd)) * (wb[hd + 4 + (e % 256) / 16] as i8) as f32,
+                        0.0,
+                    )
+                }
                 NatType::Q4K | NatType::Q5K => (
                     f16_to_f32(rd16(sd_at(e))) * wb[sc_at(e)] as f32,
                     f16_to_f32(rd16(sd_at(e) + 2)) * wb[sc_at(e) + 1] as f32,

@@ -275,11 +275,8 @@ impl CudaComputeDevice {
         }
         let src: &'static str = Box::leak(
             format!(
-                "#define TY {}\n{}\n{}",
+                "#define TY {}\n{}",
                 ty.ggml(),
-                std::env::var("TANG_NAT_DEFS")
-                    .unwrap_or_default()
-                    .replace(';', "\n"),
                 crate::kernels::native_cuda::NATIVE_CUDA
             )
             .into_boxed_str(),
@@ -303,44 +300,17 @@ impl CudaComputeDevice {
         assert!((1..=MAX_T).contains(&m) && out.len >= m * n && k.is_multiple_of(32));
         let (_, hoff, soff, total) = crate::flash_native::nat_layout(ty, n, k);
         assert!(w.len * 4 >= total, "native_linear_into: weight size");
-        // GR = 2 (one column) or 4 rows per lane group; a group is a half-warp when a K split's
-        // chunk count is not a whole number of 32-lane steps, else the whole warp.
-        let rows: usize = std::env::var("TANG_NAT_GR")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(4);
-        let rows = if m == 1 { 2 } else { rows };
-        let pick = |ks: usize| {
-            let lpr = if (k / 32 / ks).is_multiple_of(32) {
-                32
-            } else {
-                16
-            };
-            let lpr = std::env::var("TANG_NAT_LPR")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(lpr);
-            (lpr, rows * 32 / lpr)
-        };
-        let f = self.nat_func(ty, m);
-        let res = self.coresident(&f, 256, 8);
+        // Rows a warp: 2 for one column, 4 for more (as the kernel's GR); split K over 1..8
+        // warps until there are ~2 blocks per SM, keeping 32+ chunks per warp.
+        let gr = if m == 1 { 2 } else { 4 };
         let mut ks = 1;
-        let fill = std::env::var("TANG_NAT_FILL")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2 * super::llm::sm_count());
-        let _ = res;
-        while ks < 8 && n.div_ceil(pick(ks).1 * 8 / ks) < fill && k / 32 / (2 * ks) >= 16 {
+        while ks < 8
+            && n.div_ceil(gr * 8 / ks) < 2 * super::llm::sm_count()
+            && k / 32 / (2 * ks) >= 32
+        {
             ks *= 2;
         }
-        if let Some(f) = std::env::var("TANG_NAT_KS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
-            ks = f;
-        }
-        let (lpr, gr) = pick(ks);
-        let nb = n.div_ceil(gr * 8 / ks);
+        let f = self.nat_func(ty, m);
         let (ku, nu, ksu, ho, so) = (k as u32, n as u32, ks as u32, hoff as u64, soff as u64);
         unsafe {
             self.stream
@@ -353,20 +323,7 @@ impl CudaComputeDevice {
                 .arg(&ksu)
                 .arg(&ho)
                 .arg(&so)
-                .arg(&(lpr as u32))
-                .arg(&(nb as u32))
-                .launch(grid(
-                    (
-                        if std::env::var_os("TANG_NAT_NOCAP").is_some() {
-                            nb
-                        } else {
-                            nb.min(res)
-                        },
-                        1,
-                        1,
-                    ),
-                    256,
-                ))
+                .launch(grid((n.div_ceil(gr * 8 / ks), 1, 1), 256))
                 .unwrap();
         }
     }

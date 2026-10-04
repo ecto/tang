@@ -946,7 +946,30 @@ fn moe(g: &CudaComputeDevice) {
         b
     };
     let pool: Vec<B> = (0..EXPERTS).map(|_| g.upload_bytes(&blob)).collect();
-    let addrs: Vec<u64> = pool.iter().map(|b| g.buffer_addr(b)).collect();
+    let mut addrs: Vec<u64> = pool.iter().map(|b| g.buffer_addr(b)).collect();
+    // FKB_HOST=n: the first n experts of the pool live in mapped pinned host memory (the
+    // engine's miss path), read by the kernels straight over PCIe.
+    let host: usize = std::env::var("FKB_HOST")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    for a in addrs.iter_mut().take(host) {
+        use cudarc::driver::{result, sys};
+        // SAFETY: a fresh pinned allocation, written once here, never freed (bench lifetime).
+        unsafe {
+            let p = result::malloc_host(
+                blob.len(),
+                sys::CU_MEMHOSTALLOC_DEVICEMAP | sys::CU_MEMHOSTALLOC_PORTABLE,
+            )
+            .unwrap() as *mut u8;
+            std::ptr::copy_nonoverlapping(blob.as_ptr(), p, blob.len());
+            let mut d: sys::CUdeviceptr = 0;
+            sys::cuMemHostGetDevicePointer_v2(&mut d, p as *mut _, 0)
+                .result()
+                .unwrap();
+            *a = d;
+        }
+    }
     let shared = g.upload_bytes(&blob);
     println!("moe_grouped_into, 48 layers in one graph (GB/s of expert bytes read)");
     for t in [1usize, 2, 4, 8] {
