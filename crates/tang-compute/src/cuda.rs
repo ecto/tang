@@ -4209,6 +4209,22 @@ impl ComputeDevice for CudaComputeDevice {
         self.gdn_step_impl(state, h, proj, stride, p, y, yq, t, mode, eps)
     }
 
+    fn gdn_conv_step(
+        &self,
+        state: &mut CudaBuffer,
+        proj: &CudaBuffer,
+        stride: usize,
+        hist: &CudaBuffer,
+        p: &crate::flash::GdnParams<'_, CudaBuffer>,
+        y: &mut CudaBuffer,
+        yq: Option<&mut CudaBuffer>,
+        t: usize,
+        mode: crate::flash::GdnMode<'_, CudaBuffer>,
+        eps: f32,
+    ) {
+        self.gdn_conv_step_impl(state, proj, stride, hist, p, y, yq, t, mode, eps)
+    }
+
     fn router_topk_into(
         &self,
         logits: &CudaBuffer,

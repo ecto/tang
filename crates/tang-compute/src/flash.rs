@@ -421,7 +421,11 @@ impl MoePlan {
     /// Words of `moe_grouped_into` scratch: every entry's SwiGLU activations as int8
     /// (`QAct { m: CAP, k: FF }`, row = entry).
     pub fn scratch_words() -> usize {
-        QAct { m: Self::CAP, k: FF }.words()
+        QAct {
+            m: Self::CAP,
+            k: FF,
+        }
+        .words()
     }
 }
 

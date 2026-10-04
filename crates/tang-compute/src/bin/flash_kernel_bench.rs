@@ -499,26 +499,45 @@ fn window(
         }
         if let Some(gd) = layer.gdn.as_mut() {
             if on(Class::Gdn) {
-                g.gdn_conv_into(&s.proj, GDN_PROJ, &gd.hist, &gd.conv, &mut s.h, t, eps);
                 let p = GdnParams {
                     conv: &gd.conv,
                     dt_bias: &gd.dt,
                     ssm_a: &gd.a,
                     norm: &gd.norm,
                 };
-                g.gdn_step(
-                    &mut gd.state,
-                    &s.h,
-                    &s.proj,
-                    GDN_PROJ,
-                    &p,
-                    &mut s.y,
-                    Some(&mut s.yq),
-                    t,
-                    GdnMode::ReadOnly,
-                    eps,
-                );
-                launches += 2;
+                if unfused() {
+                    g.gdn_conv_into(&s.proj, GDN_PROJ, &gd.hist, &gd.conv, &mut s.h, t, eps);
+                    let yq = Some(&mut s.yq);
+                    g.gdn_step(
+                        &mut gd.state,
+                        &s.h,
+                        &s.proj,
+                        GDN_PROJ,
+                        &p,
+                        &mut s.y,
+                        yq,
+                        t,
+                        GdnMode::ReadOnly,
+                        eps,
+                    );
+                    launches += 2;
+                } else {
+                    let yq = Some(&mut s.yq);
+                    let ro = GdnMode::ReadOnly;
+                    g.gdn_conv_step(
+                        &mut gd.state,
+                        &s.proj,
+                        GDN_PROJ,
+                        &gd.hist,
+                        &p,
+                        &mut s.y,
+                        yq,
+                        t,
+                        ro,
+                        eps,
+                    );
+                    launches += 1;
+                }
             }
             if on(Class::Dense) {
                 g.q4x_linear_into(&s.yq, &layer.w_out, &mut s.mix, t, GDN_V, HIDDEN);
@@ -663,16 +682,17 @@ fn commit(g: &CudaComputeDevice, m: &mut Model, s: &mut Scratch, t: usize) {
                 ssm_a: &gd.a,
                 norm: &gd.norm,
             };
-            g.gdn_step(
+            let commit = GdnMode::Commit { win: &s.win };
+            g.gdn_conv_step(
                 &mut gd.state,
-                &s.h,
                 &s.proj,
                 GDN_PROJ,
+                &gd.hist,
                 &p,
                 &mut s.y,
                 None,
                 t,
-                GdnMode::Commit { win: &s.win },
+                commit,
                 1e-6,
             );
             g.gdn_conv_commit(&mut gd.hist, &s.proj, GDN_PROJ, &s.win, t);
@@ -793,7 +813,7 @@ fn window_launches(c: Class) -> usize {
     match c {
         Class::Hc => 96 * 3 + 3,
         Class::Dense => 48 * 3 + 1,
-        Class::Gdn => 36 * 2,
+        Class::Gdn => 36,
         Class::Qsa => 12 * 5,
         Class::Moe => 48 * 3,
     }
@@ -862,6 +882,11 @@ fn moe(g: &CudaComputeDevice) {
             bytes as f64 / (ms as f64 * 1e6)
         );
     }
+}
+
+/// `TANG_FLASH_UNFUSED=1`: the bench's own A/B switch, matching the library's.
+fn unfused() -> bool {
+    std::env::var("TANG_FLASH_UNFUSED").is_ok_and(|v| v == "1")
 }
 
 fn main() {

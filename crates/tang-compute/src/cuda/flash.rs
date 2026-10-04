@@ -615,6 +615,53 @@ impl CudaComputeDevice {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn gdn_conv_step_impl(
+        &self,
+        state: &mut CudaBuffer,
+        proj: &CudaBuffer,
+        stride: usize,
+        hist: &CudaBuffer,
+        p: &GdnParams<'_, CudaBuffer>,
+        y: &mut CudaBuffer,
+        yq: Option<&mut CudaBuffer>,
+        t: usize,
+        mode: GdnMode<'_, CudaBuffer>,
+        eps: f32,
+    ) {
+        assert!((1..=MAX_T).contains(&t));
+        let quant = yq.is_some() as u32;
+        let (win, commit) = match mode {
+            GdnMode::ReadOnly => (proj, 0u32),
+            GdnMode::Commit { win } => (win, 1u32),
+        };
+        let f = self.fl("fl_gdn_conv_step");
+        let (s, tu) = (stride as u32, t as u32);
+        unsafe {
+            let mut l = self.stream.launch_builder(&f);
+            l.arg(state.f32_data_mut())
+                .arg(proj.f32_data())
+                .arg(&s)
+                .arg(p.dt_bias.f32_data())
+                .arg(p.ssm_a.f32_data())
+                .arg(p.norm.f32_data())
+                .arg(y.f32_data_mut())
+                .arg(&tu)
+                .arg(win.f32_data())
+                .arg(&commit)
+                .arg(&eps);
+            match yq {
+                Some(q) => l.arg(q.f32_data_mut()),
+                None => l.arg(&NULL),
+            };
+            l.arg(&quant)
+                .arg(hist.f32_data())
+                .arg(p.conv.f32_data())
+                .launch(grid((GDN_HV, 1, 1), 512))
+                .unwrap();
+        }
+    }
+
     pub(super) fn router_topk_impl(
         &self,
         logits: &CudaBuffer,
@@ -1379,6 +1426,21 @@ mod tests {
         let mut q = d.alloc_f32(QAct { m: t, k: GDN_V }.words());
         d.quantize_act_into(&y, &mut q, t, GDN_V);
         same_bits(&d.download(&yq), &d.download(&q), "gdn fused int8 output");
+        // Conv and step in one launch: bitwise the two.
+        let mut yf = d.alloc_f32(t * GDN_V);
+        d.gdn_conv_step(
+            &mut state,
+            &proj,
+            GDN_PROJ,
+            &hist,
+            &p,
+            &mut yf,
+            None,
+            t,
+            GdnMode::ReadOnly,
+            1e-6,
+        );
+        same_bits(&d.download(&yf), &d.download(&y), "gdn conv+step fused");
         let unchanged = d.download(&state);
         same_bits(&unchanged, &cs.state, "readonly leaves the state");
         let w = win(d, 0, n_keep);

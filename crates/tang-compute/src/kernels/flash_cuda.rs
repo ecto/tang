@@ -723,25 +723,62 @@ extern "C" __global__ void fl_gdn_conv_commit(float* __restrict__ H0, const floa
 // state rows × 128 columns; each thread holds its 32 state values in registers for the window.
 // `commit`: run min(win[1], T) tokens and write the state; else run T, state untouched. Same
 // code path either way, so commit's outputs are bitwise verify's.
-extern "C" __global__ void __launch_bounds__(512) fl_gdn_step(
+template <bool FUSED>
+__device__ __forceinline__ void gdn_step_body(
     float* __restrict__ S, const float* __restrict__ Hc, const float* __restrict__ P,
     unsigned int stride, const float* __restrict__ DT, const float* __restrict__ SA,
     const float* __restrict__ NW, float* __restrict__ Y, unsigned int T,
     const unsigned int* __restrict__ win, unsigned int commit, float eps,
-    unsigned int* __restrict__ YQ, unsigned int quant) {
+    unsigned int* __restrict__ YQ, unsigned int quant, const float* __restrict__ H0,
+    const float* __restrict__ Wc) {
     __shared__ float sq[8][128], sk[8][128], sv[8][128], sz[8][128];
     __shared__ float sg[8], sb[8];
     __shared__ float red[4][128];
     __shared__ float red2[4];
     unsigned int hv = blockIdx.x, hk = hv % GDN_HK, tid = threadIdx.x, j = tid & 127, rg = tid >> 7;
     unsigned int n = commit ? min(win[1], T) : T;
-    for (unsigned int i = tid; i < n * 128; i += 512) {
-        unsigned int t = i >> 7, jj = i & 127;
-        const float* hh = Hc + (u64)t * GDN_CONV;
-        sq[t][jj] = hh[hk * 128 + jj];
-        sk[t][jj] = hh[GDN_HK * 128 + hk * 128 + jj];
-        sv[t][jj] = hh[2 * GDN_HK * 128 + hv * 128 + jj];
-        sz[t][jj] = P[(u64)t * stride + GDN_Z + hv * 128 + jj];
+    if (FUSED) {
+        // The conv for this head's q, k and v channels (thread groups 0, 1, 2), fl_gdn_conv's
+        // arithmetic, including its L2-norm reduction order.
+        __shared__ float cred[2][4];
+        unsigned int ch = rg == 0 ? hk * 128 + j : (rg == 1 ? GDN_HK * 128 + hk * 128 + j : 2 * GDN_HK * 128 + hv * 128 + j);
+        float4 w = rg < 3 ? ((const float4*)Wc)[ch] : make_float4(0, 0, 0, 0);
+        float e[11];
+        e[0] = rg < 3 ? H0[ch] : 0.0f;
+        e[1] = rg < 3 ? H0[GDN_CONV + ch] : 0.0f;
+        e[2] = rg < 3 ? H0[2 * GDN_CONV + ch] : 0.0f;
+        #pragma unroll
+        for (unsigned int t = 0; t < 8; t++) e[3 + t] = (t < n && rg < 3) ? P[(u64)t * stride + ch] : 0.0f;
+        #pragma unroll
+        for (unsigned int t = 0; t < 8; t++) {
+            if (t >= n) break;
+            float acc = e[t] * w.x;
+            acc = __fmaf_rn(e[t + 1], w.y, acc);
+            acc = __fmaf_rn(e[t + 2], w.z, acc);
+            acc = __fmaf_rn(e[t + 3], w.w, acc);
+            float v = silu(acc);
+            float ss = warp_sum(v * v);
+            if (rg < 2 && (j & 31) == 0) cred[rg][j >> 5] = ss;
+            __syncthreads();
+            if (rg < 2) {
+                ss = ((cred[rg][0] + cred[rg][1]) + cred[rg][2]) + cred[rg][3];
+                v *= 1.0f / sqrtf(ss + eps);
+            }
+            __syncthreads();
+            if (rg == 0) sq[t][j] = v;
+            else if (rg == 1) sk[t][j] = v;
+            else if (rg == 2) sv[t][j] = v;
+            else sz[t][j] = P[(u64)t * stride + GDN_Z + hv * 128 + j];
+        }
+    } else {
+        for (unsigned int i = tid; i < n * 128; i += 512) {
+            unsigned int t = i >> 7, jj = i & 127;
+            const float* hh = Hc + (u64)t * GDN_CONV;
+            sq[t][jj] = hh[hk * 128 + jj];
+            sk[t][jj] = hh[GDN_HK * 128 + hk * 128 + jj];
+            sv[t][jj] = hh[2 * GDN_HK * 128 + hv * 128 + jj];
+            sz[t][jj] = P[(u64)t * stride + GDN_Z + hv * 128 + jj];
+        }
     }
     if (tid < n) {
         float a = P[(u64)tid * stride + GDN_A + hv] + DT[hv];
@@ -793,6 +830,27 @@ extern "C" __global__ void __launch_bounds__(512) fl_gdn_step(
         #pragma unroll
         for (int r = 0; r < 32; r++) S[((u64)(rg * 32 + r) * GDN_HV + hv) * 128 + j] = st[r];
     }
+}
+
+extern "C" __global__ void __launch_bounds__(512) fl_gdn_step(
+    float* __restrict__ S, const float* __restrict__ Hc, const float* __restrict__ P,
+    unsigned int stride, const float* __restrict__ DT, const float* __restrict__ SA,
+    const float* __restrict__ NW, float* __restrict__ Y, unsigned int T,
+    const unsigned int* __restrict__ win, unsigned int commit, float eps,
+    unsigned int* __restrict__ YQ, unsigned int quant) {
+    gdn_step_body<false>(S, Hc, P, stride, DT, SA, NW, Y, T, win, commit, eps, YQ, quant, nullptr, nullptr);
+}
+
+// The conv (history read-only) and the recurrence in one launch: Hc unused, conv inputs from
+// P's qkv columns, the history H0 and the conv weights Wc.
+extern "C" __global__ void __launch_bounds__(512) fl_gdn_conv_step(
+    float* __restrict__ S, const float* __restrict__ P,
+    unsigned int stride, const float* __restrict__ DT, const float* __restrict__ SA,
+    const float* __restrict__ NW, float* __restrict__ Y, unsigned int T,
+    const unsigned int* __restrict__ win, unsigned int commit, float eps,
+    unsigned int* __restrict__ YQ, unsigned int quant, const float* __restrict__ H0,
+    const float* __restrict__ Wc) {
+    gdn_step_body<true>(S, nullptr, P, stride, DT, SA, NW, Y, T, win, commit, eps, YQ, quant, H0, Wc);
 }
 
 // ---- MoE ----

@@ -1412,6 +1412,29 @@ pub trait ComputeDevice: Send {
         *y = self.upload_f32(&yv);
     }
 
+    /// [`gdn_conv_into`](Self::gdn_conv_into) and [`gdn_step`](Self::gdn_step) in one step,
+    /// bitwise the two: the conv runs from `proj`'s qkv columns, the history `hist` (not
+    /// written) and `p.conv`. Run before [`gdn_conv_commit`](Self::gdn_conv_commit) in a commit,
+    /// as the conv needs the history the window started from.
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_conv_step(
+        &self,
+        state: &mut Self::Buffer,
+        proj: &Self::Buffer,
+        stride: usize,
+        hist: &Self::Buffer,
+        p: &crate::flash::GdnParams<'_, Self::Buffer>,
+        y: &mut Self::Buffer,
+        yq: Option<&mut Self::Buffer>,
+        t: usize,
+        mode: crate::flash::GdnMode<'_, Self::Buffer>,
+        eps: f32,
+    ) {
+        let mut h = self.alloc_f32(t * crate::flash::shape::GDN_CONV);
+        self.gdn_conv_into(proj, stride, hist, p.conv, &mut h, t, eps);
+        self.gdn_step(state, &h, proj, stride, p, y, yq, t, mode, eps);
+    }
+
     /// MoE router for a window: `logits [t][stride]` (experts in columns `0..n_expert`); writes
     /// `ids [t][TOPK]` (u32): the top `TOPK` by (logit desc, index asc); and `w [t][TOPK]`:
     /// `e_k / Σ_top e_j`, `e_k = exp(l_k − l_max)` in f64 summed in rank order, which is the
