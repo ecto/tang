@@ -163,6 +163,35 @@ pub(crate) fn q4x_linear(xq: &[u32], wb: &[u8], m: usize, k: usize, n: usize) ->
     out
 }
 
+/// `out[m, n] = W · x̂` for a Q8X weight `[n, k]` ([`crate::flash::q8x_repack`]): per half
+/// chunk `fma(d_w · d_x, Σ w·q, acc)`, ascending.
+pub(crate) fn q8x_linear(xq: &[u32], wb: &[u8], m: usize, k: usize, n: usize) -> Vec<f32> {
+    let l = QAct { m, k };
+    let mut out = vec![0f32; m * n];
+    for r in 0..m {
+        let x = QRow::decode(xq, l, r);
+        for o in 0..n {
+            let mut acc = 0f32;
+            for c in 0..k / 32 {
+                let so = n * k + 2 * (o * k / 32 + c);
+                let d = f16_to_f32(u16::from_le_bytes([wb[so], wb[so + 1]]));
+                for h in 0..2 {
+                    let mut s = 0i32;
+                    for b in 0..4 {
+                        for f in 0..4 {
+                            let w = wb[o * k + c * 32 + 16 * h + 4 * f + b] as i8 as i32;
+                            s += w * x.q[c * 32 + 16 * h + 4 * b + f];
+                        }
+                    }
+                    acc = (d * x.d[c]).mul_add(s as f32, acc);
+                }
+            }
+            out[r * n + o] = acc;
+        }
+    }
+    out
+}
+
 // ---- hyper-connections ----
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {

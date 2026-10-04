@@ -236,6 +236,27 @@ pub fn q4x_repack(packed: &[u32], scales: &[u16], biases: &[u16], n: usize, k: u
     out
 }
 
+/// Bytes of one GGUF Q8_0 block: fp16 `d`, then 32 int8 weights.
+pub const Q8_BLOCK_BYTES: usize = 34;
+
+/// Repack GGUF Q8_0 (`[n, k]`, blocks of fp16 `d` + 32 int8, `w = d · q`) into Q8X for the
+/// int8-activation GEMV: `[n][k]` int8 weights with each 32-wide chunk in the [`QAct`] word
+/// order (so weight word `j` pairs with activation word `j`), then `[n][k/32]` fp16 scales.
+/// 8.5 bits per weight, as Q8_0.
+pub fn q8x_repack(raw: &[u8], n: usize, k: usize) -> Vec<u8> {
+    assert!(k.is_multiple_of(32) && raw.len() == n * k / 32 * Q8_BLOCK_BYTES);
+    let mut out = vec![0u8; n * k + 2 * n * k / 32];
+    for b in 0..n * k / 32 {
+        let blk = &raw[b * Q8_BLOCK_BYTES..(b + 1) * Q8_BLOCK_BYTES];
+        out[n * k + 2 * b..n * k + 2 * b + 2].copy_from_slice(&blk[..2]);
+        for i in 0..32 {
+            let (w, by) = QAct::slot(i);
+            out[b * 32 + 4 * w + by] = blk[2 + i];
+        }
+    }
+    out
+}
+
 /// One routed expert's blob, 1,382,400 bytes: the three GGUF Q2_0 matrices' bytes, rearranged
 /// into tiles of 16 rows so that a GPU warp (lane = row `r`, half `b` of the row's 32-byte group)
 /// reads one 512-byte line per group with 16-byte loads, and a CPU core reads each row's

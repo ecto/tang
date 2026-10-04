@@ -4126,6 +4126,18 @@ impl ComputeDevice for CudaComputeDevice {
         self.q2_linear_impl(xq, w, out, m, k, n)
     }
 
+    fn q8x_linear_into(
+        &self,
+        xq: &CudaBuffer,
+        w: &CudaBuffer,
+        out: &mut CudaBuffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        self.q8x_linear_impl(xq, w, out, m, k, n)
+    }
+
     fn q4x_linear_into(
         &self,
         xq: &CudaBuffer,

@@ -74,6 +74,18 @@ impl Src {
         let biases = vec![bf16(-0.015); gs];
         g.upload_q4x(&self.words[..n * k / 8], &scales, &biases, n, k)
     }
+    fn q8_raw(&self, n: usize, k: usize) -> Vec<u8> {
+        let mut raw = Vec::with_capacity(n * k / 32 * 34);
+        let mut i = 0;
+        for _ in 0..n * k / 32 {
+            raw.extend(flash::f32_to_f16(0.002).to_le_bytes());
+            for _ in 0..8 {
+                raw.extend(self.words[i % self.words.len()].to_le_bytes());
+                i += 1;
+            }
+        }
+        raw
+    }
     fn q2_raw(&self, n: usize, k: usize) -> Vec<u8> {
         let mut raw = Vec::with_capacity(flash::q2_bytes(n, k));
         let mut i = 0;
@@ -113,13 +125,14 @@ fn gemv(g: &CudaComputeDevice) {
         (6144, 2560),
         (2560, 513),
     ] {
-        for fmt in ["bf16", "q4", "q4x", "q2"] {
+        for fmt in ["bf16", "q4", "q4x", "q8x", "q2"] {
             let bytes = match fmt {
                 "bf16" => n * k * 2,
                 "q4" | "q4x" => q4_bytes(n, k),
+                "q8x" => n * k / 32 * 34,
                 _ => flash::q2_bytes(n, k),
             };
-            if fmt == "bf16" && n * k > 200_000_000 {
+            if (fmt == "bf16" || fmt == "q8x" || fmt == "q4") && n * k > 200_000_000 {
                 // 1.3 GB of bf16 head: skip, the 2560-wide shapes show the kernel's rate.
                 continue;
             }
@@ -129,6 +142,7 @@ fn gemv(g: &CudaComputeDevice) {
                     "bf16" => src.bf16(g, n * k),
                     "q4" => src.q4(g, n, k),
                     "q4x" => src.q4x(g, n, k),
+                    "q8x" => g.upload_q8x(&src.q8_raw(n, k), n, k),
                     _ => g.upload_q2(&src.q2_raw(n, k), n, k),
                 })
                 .collect();
@@ -151,6 +165,8 @@ fn gemv(g: &CudaComputeDevice) {
                             g.q2_linear_into(&xq, w, &mut y, t, k, n);
                         } else if fmt == "q4x" {
                             g.q4x_linear_into(&xq, w, &mut y, t, k, n);
+                        } else if fmt == "q8x" {
+                            g.q8x_linear_into(&xq, w, &mut y, t, k, n);
                         } else {
                             g.linear_into(&x, w, &mut y, t, k, n);
                         }

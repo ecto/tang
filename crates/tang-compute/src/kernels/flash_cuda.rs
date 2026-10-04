@@ -137,12 +137,12 @@ __device__ __forceinline__ void gemv_body(const float* __restrict__ X, const uns
                                           const unsigned char* __restrict__ W, float* __restrict__ Y,
                                           unsigned int K, unsigned int N, unsigned int KS) {
     __shared__ float red[8][GR * T];
-    const unsigned int EPV = FMT == 0 ? 8 : (FMT == 1 ? 64 : 32);
+    const unsigned int EPV = FMT == 0 ? 8 : (FMT == 1 ? 64 : (FMT == 2 ? 32 : 16));
     unsigned int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     unsigned int kw = warp % KS, rg = warp / KS, groups = 8 / KS;
     unsigned int row0 = (blockIdx.x * groups + rg) * GR;
     unsigned int nv = K / EPV, v0 = kw * nv / KS, v1 = (kw + 1) * nv / KS;
-    u64 rowbytes = FMT == 0 ? (u64)K * 2 : (FMT == 1 ? K / 4 : K / 2);
+    u64 rowbytes = FMT == 0 ? (u64)K * 2 : (FMT == 1 ? K / 4 : (FMT == 2 ? K / 2 : K));
     const unsigned short* sc = (const unsigned short*)(W + (u64)N * rowbytes);
     const unsigned short* bi = sc + (u64)N * (K / 64);
     unsigned int kb = K / 4, nch = K / 32;
@@ -162,6 +162,7 @@ __device__ __forceinline__ void gemv_body(const float* __restrict__ X, const uns
                 unsigned int o = min(row0 + r, N - 1);
                 wv[r] = ((const uint4*)(W + (u64)o * rowbytes))[v];
                 if (FMT == 1) ws[r] = h2f(sc[(u64)o * (K / 64) + v]);
+                if (FMT == 3) ws[r] = h2f(sc[(u64)o * (K / 32) + v / 2]);
                 if (FMT == 2) {
                     ws[r] = bf(sc[(u64)o * (K / 64) + v / 2]);
                     wb[r] = bf(bi[(u64)o * (K / 64) + v / 2]);
@@ -209,6 +210,18 @@ __device__ __forceinline__ void gemv_body(const float* __restrict__ X, const uns
                         int s1 = chunk_dot(&m[r][8], xw + 8);
                         acc[r][t] = __fmaf_rn(ws[r] * dx0, (float)(s0 - hx0), acc[r][t]);
                         acc[r][t] = __fmaf_rn(ws[r] * dx1, (float)(s1 - hx1), acc[r][t]);
+                    }
+                } else if (FMT == 3) {
+                    // Half a chunk: 16 int8 weights (activation order) against 4 activation words.
+                    uint4 xw = *(const uint4*)(XQ + (u64)t * kb + v * 4);
+                    float dx = __uint_as_float(xs[(u64)t * nch + v / 2]);
+                    #pragma unroll
+                    for (int r = 0; r < GR; r++) {
+                        int S = __dp4a((int)wv[r].x, (int)xw.x, 0);
+                        S = __dp4a((int)wv[r].y, (int)xw.y, S);
+                        S = __dp4a((int)wv[r].z, (int)xw.z, S);
+                        S = __dp4a((int)wv[r].w, (int)xw.w, S);
+                        acc[r][t] = __fmaf_rn(ws[r] * dx, (float)S, acc[r][t]);
                     }
                 } else {
                     const unsigned int* xw = XQ + (u64)t * kb + v * 8;
@@ -259,6 +272,7 @@ extern "C" __global__ void __launch_bounds__(256) fl_##NAME##_t##T( \
 GEMV_ALL(0, bf16_gemv)
 GEMV_ALL(1, q2_gemv)
 GEMV_ALL(2, q4x_gemv)
+GEMV_ALL(3, q8x_gemv)
 
 // ---- hyper-connections ----
 

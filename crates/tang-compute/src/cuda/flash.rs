@@ -32,8 +32,8 @@ fn grid(g: (usize, usize, usize), threads: u32) -> LaunchConfig {
     }
 }
 
-const GEMV_FMTS: [&str; 3] = ["bf16_gemv", "q2_gemv", "q4x_gemv"];
-const GEMV_NAMES: [[&str; 8]; 3] = [
+const GEMV_FMTS: [&str; 4] = ["bf16_gemv", "q2_gemv", "q4x_gemv", "q8x_gemv"];
+const GEMV_NAMES: [[&str; 8]; 4] = [
     [
         "fl_bf16_gemv_t1",
         "fl_bf16_gemv_t2",
@@ -63,6 +63,16 @@ const GEMV_NAMES: [[&str; 8]; 3] = [
         "fl_q4x_gemv_t6",
         "fl_q4x_gemv_t7",
         "fl_q4x_gemv_t8",
+    ],
+    [
+        "fl_q8x_gemv_t1",
+        "fl_q8x_gemv_t2",
+        "fl_q8x_gemv_t3",
+        "fl_q8x_gemv_t4",
+        "fl_q8x_gemv_t5",
+        "fl_q8x_gemv_t6",
+        "fl_q8x_gemv_t7",
+        "fl_q8x_gemv_t8",
     ],
 ];
 
@@ -192,6 +202,7 @@ impl CudaComputeDevice {
         let epv = match name {
             "bf16_gemv" => 8,
             "q2_gemv" => 64,
+            "q8x_gemv" => 16,
             _ => 32,
         };
         let mut ks = 1;
@@ -249,6 +260,22 @@ impl CudaComputeDevice {
             "q4x_linear_into: weight size"
         );
         self.gemv_rows("q4x_gemv", None, Some(xq), w.f32_data(), out, m, k, n);
+    }
+
+    pub(super) fn q8x_linear_impl(
+        &self,
+        xq: &CudaBuffer,
+        w: &CudaBuffer,
+        out: &mut CudaBuffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        assert!(
+            w.len * 4 >= n * k + 2 * n * k / 32,
+            "q8x_linear_into: weight size"
+        );
+        self.gemv_rows("q8x_gemv", None, Some(xq), w.f32_data(), out, m, k, n);
     }
 
     pub(super) fn hc_write_impl(
@@ -1080,6 +1107,47 @@ mod tests {
         }
     }
 
+    fn q8x_linear_vs_cpu<D: ComputeDevice>(g: &D) {
+        let c = CpuDevice::new();
+        let mut rng = Rng(0x88);
+        for &(k, n) in &[(2560, 300), (6144, 129), (10240, 40)] {
+            let mut raw = Vec::with_capacity(n * k / 32 * fl::Q8_BLOCK_BYTES);
+            for _ in 0..n * k / 32 {
+                raw.extend(fl::f32_to_f16(0.001 + 0.002 * (rng.f(1.0) + 1.0)).to_le_bytes());
+                raw.extend((0..32).map(|_| rng.u() as u8));
+            }
+            let (gw, cw) = (g.upload_q8x(&raw, n, k), c.upload_q8x(&raw, n, k));
+            for t in TS {
+                let x = rng.vec(t * k, 2.0);
+                let qa = QAct { m: t, k };
+                let (mut gq, mut cq) = (g.alloc_f32(qa.words()), c.alloc_f32(qa.words()));
+                g.quantize_act_into(&g.upload_f32(&x), &mut gq, t, k);
+                c.quantize_act_into(&c.upload_f32(&x), &mut cq, t, k);
+                let (mut gy, mut cy) = (g.alloc_f32(t * n), c.alloc_f32(t * n));
+                g.q8x_linear_into(&gq, &gw, &mut gy, t, k, n);
+                c.q8x_linear_into(&cq, &cw, &mut cy, t, k, n);
+                let want = c.download(&cy);
+                close(
+                    &g.download(&gy),
+                    &want,
+                    1e-5,
+                    &format!("q8x linear t={t} {k}->{n}"),
+                );
+                // Against the dequantized weights and the f32 activations: int8 rounding only.
+                let mut deq = vec![0f32; n * k];
+                for (b, blk) in raw.chunks(fl::Q8_BLOCK_BYTES).enumerate() {
+                    let d = fl::f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+                    for i in 0..32 {
+                        deq[b * 32 + i] = d * blk[2 + i] as i8 as f32;
+                    }
+                }
+                let f32_path =
+                    c.download(&c.linear(&c.upload_f32(&x), &c.upload_f32(&deq), t, k, n));
+                close(&want, &f32_path, 2e-2, &format!("q8x vs f32 t={t}"));
+            }
+        }
+    }
+
     fn linear_into_vs_cpu<D: ComputeDevice>(g: &D) {
         let c = CpuDevice::new();
         let mut rng = Rng(7);
@@ -1880,6 +1948,11 @@ mod tests {
     #[test]
     fn cuda_q4x_linear_vs_cpu() {
         on_gpu(q4x_linear_vs_cpu::<CudaComputeDevice>);
+    }
+
+    #[test]
+    fn cuda_q8x_linear_vs_cpu() {
+        on_gpu(q8x_linear_vs_cpu::<CudaComputeDevice>);
     }
 
     #[test]

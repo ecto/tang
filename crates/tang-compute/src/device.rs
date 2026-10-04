@@ -1217,6 +1217,29 @@ pub trait ComputeDevice: Send {
         *out = self.upload_f32(&y);
     }
 
+    /// Upload a GGUF Q8_0 matrix `[n, k]` (blocks of fp16 `d` + 32 int8) repacked as Q8X
+    /// ([`crate::flash::q8x_repack`]) for [`q8x_linear_into`](Self::q8x_linear_into).
+    fn upload_q8x(&self, raw: &[u8], n: usize, k: usize) -> Self::Buffer {
+        self.upload_bytes(&crate::flash::q8x_repack(raw, n, k))
+    }
+
+    /// `out[m, n] = W · x̂` for a Q8X weight `[n, k]` and int8 activations (`m <= 8`): per half
+    /// chunk `fma(d_w · d_x, Σ w·q, acc)`; the order the halves are summed in is the backend's.
+    fn q8x_linear_into(
+        &self,
+        xq: &Self::Buffer,
+        w: &Self::Buffer,
+        out: &mut Self::Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        let (xq, w) = (self.download(xq), self.download(w));
+        let wb: Vec<u8> = w.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+        let y = crate::cpu::flash::q8x_linear(&crate::flash::u32s(&xq), &wb, m, k, n);
+        *out = self.upload_f32(&y);
+    }
+
     /// Hyper-connection read for a window of `t` tokens: `r` is `[t][HC][HIDDEN]`; writes
     /// `x [t][HIDDEN]`, `xq` (when given) the same as int8 activations
     /// (`QAct { m: t, k: HIDDEN }`), and, when `w.inject` is set, `inj [t][HC]`. A `pending`
