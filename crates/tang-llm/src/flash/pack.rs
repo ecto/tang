@@ -480,6 +480,7 @@ fn run_job(g: &Gguf, job: &Job) -> Result<Built> {
                 while out.len() % 16 != 0 {
                     out.push(0);
                 }
+                ensure!(t.row_bytes()? + 15 <= 322 * 16, "{name}: {} B rows don't fit fe_gemv's stage", t.row_bytes()?);
                 meta.push([ggml_id(t.ty)?, tn as u64, t.row_bytes()? as u64, out.len() as u64, *off as u64]);
                 out.extend_from_slice(g.bytes(t));
             }

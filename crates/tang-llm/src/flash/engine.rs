@@ -101,8 +101,16 @@ impl Default for Opts {
 #[derive(Clone, Copy)]
 struct NativeK {
     f: [Fun; MAX_T],
+    /// `fe_gemv8_t*` (int8 activations) and `fe_q8`.
+    f8: [Fun; MAX_T],
+    q8: Fun,
+    /// Scratch for the int8 activations (`XQ8_T × 6144` codes + scales).
+    xq8: u64,
     stream: cudarc::driver::sys::CUstream,
 }
+
+/// Bytes of the `fe_q8` scratch for widths up to `k`.
+const XQ8_BYTES: usize = MAX_T * 6144 + MAX_T * 6144 / 32 * 4;
 
 /// A dense GEMV weight: Q4X (int8 activations), bf16 (f32 activations), or native GGUF
 /// segments (`fe_gemv`, f32 activations).
@@ -114,7 +122,24 @@ enum Dw {
         segs: B,
         nseg: i32,
         rows: usize,
+        /// 16-byte units of shared memory per warp (the largest staged row + slack).
+        row16: i32,
     },
+}
+
+/// Grid (persistent: as many 4-warp blocks as fit at once, at most one row per warp) and
+/// dynamic shared memory (two staged rows per warp) of a native GEMV launch.
+fn gemv_grid(n: usize, row16: i32) -> (u32, u32) {
+    let smem = 4 * 2 * 16 * row16 as usize;
+    let per_sm = (100 * 1024 / smem.max(1)).clamp(1, 12);
+    let grid = (82 * per_sm).min(n.div_ceil(4));
+    (grid as u32, smem as u32)
+}
+
+/// Shared memory per warp for a native GEMV's staged rows (bf16 rows aren't staged).
+fn row16(segs: &[[u64; 5]]) -> i32 {
+    let rb = segs.iter().filter(|s| s[0] != 30).map(|s| s[2]).max().unwrap_or(0);
+    ((rb + 15).div_ceil(16) + 1) as i32
 }
 
 impl Dw {
@@ -123,7 +148,7 @@ impl Dw {
         match self {
             Dw::Bf16(b) => dev.linear_into(x, b, out, t, k, n),
             Dw::Q4x(b) => dev.q4x_linear_into(xq, b, out, t, k, n),
-            Dw::Native { segs, nseg, rows, .. } => {
+            Dw::Native { segs, nseg, rows, row16, .. } => {
                 assert_eq!(*rows, n, "native GEMV rows");
                 let (sp, ns, xp, ki, op, os) = (
                     dev.buffer_addr(segs),
@@ -134,14 +159,20 @@ impl Dw {
                     n as i32,
                 );
                 let s = ManuallyDrop::new(Stream(nk.stream));
+                let r16 = *row16;
+                let xq = nk.xq8;
                 unsafe {
+                    let (ki, ti) = (k as i32, t as i32);
+                    let _ = ti;
+                    gpu::launch(nk.q8, ((k / 32) as u32, t as u32, 1), (32, 1, 1), 0, &s, tang_moe::args![xp, xq, ki])
+                        .expect("fe_q8 launch");
                     gpu::launch(
-                        nk.f[t - 1],
+                        nk.f8[t - 1],
                         (n.div_ceil(8) as u32, 1, 1),
-                        (256, 1, 1),
-                        0,
+                        (128, 1, 1),
+                        (8 * 16 * r16) as u32,
                         &s,
-                        tang_moe::args![sp, ns, xp, ki, op, os],
+                        tang_moe::args![sp, ns, xp, xq, ki, op, os, r16],
                     )
                     .expect("fe_gemv launch")
                 };
@@ -361,6 +392,7 @@ pub struct Engine {
     gpu: Gpu,
     k: Kern,
     nk: NativeK,
+    _xq8: B,
     _gemv: Module,
     experts: Experts,
     exec: MissExec,
@@ -373,6 +405,12 @@ pub struct Engine {
     pub routing: Vec<u32>,
     /// Last window's per-layer distinct routed experts (keys), for the cache.
     keys: Vec<u32>,
+    /// Per layer, the device residency table `moe_route_into` plans from (`EXPERTS` addresses,
+    /// 0 = on the host), mirrored from the cache's table after each boundary.
+    tables: Vec<B>,
+    /// The addresses `tables` holds now (host copy, to find layers that changed).
+    table_addrs: Vec<u64>,
+    host_plan: Vec<u32>,
     pub use_graphs: bool,
     pub last: WinStats,
     pub n_slots: usize,
@@ -391,7 +429,13 @@ fn upload_entry(dev: &CudaComputeDevice, e: &Entry, b: &[u8]) -> B {
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect::<Vec<_>>(),
         ),
-        Fmt::Q4x | Fmt::Native => dev.upload_bytes(b),
+        Fmt::Q4x => dev.upload_bytes(b),
+        // 16 bytes of slack: fe_gemv stages rows with aligned 16-byte loads.
+        Fmt::Native => {
+            let mut v = b.to_vec();
+            v.extend_from_slice(&[0u8; 16]);
+            dev.upload_bytes(&v)
+        }
         Fmt::Q2Raw => dev.upload_q2(b, e.n, e.k),
     }
 }
@@ -452,6 +496,7 @@ impl Engine {
                         segs: dev.upload_u32(&words),
                         nseg: e.segs.len() as i32,
                         rows: e.n,
+                        row16: row16(&e.segs),
                     }
                 }
                 f => bail!("{name}: unexpected format {f:?}"),
@@ -610,8 +655,16 @@ impl Engine {
         for (i, n) in names.iter().enumerate() {
             fs[i] = f(&gm, n)?;
         }
+        let mut f8s = [std::ptr::null_mut(); MAX_T];
+        for (i, slot) in f8s.iter_mut().enumerate() {
+            *slot = f(&gm, ["fe_gemv8_t1", "fe_gemv8_t2", "fe_gemv8_t3", "fe_gemv8_t4", "fe_gemv8_t5", "fe_gemv8_t6", "fe_gemv8_t7", "fe_gemv8_t8"][i])?;
+        }
+        let xq8_buf = dev.alloc_f32(XQ8_BYTES / 4);
         let nk = NativeK {
             f: fs,
+            f8: f8s,
+            q8: f(&gm, "fe_q8")?,
+            xq8: dev.buffer_addr(&xq8_buf),
             stream: dev.cu_stream(),
         };
         let mb = Mailbox::new(&gpu).map_err(|e| anyhow!("{e}"))?;
@@ -672,6 +725,7 @@ impl Engine {
         };
         let t_experts = t2.elapsed().as_secs_f64();
         let (free2, _) = gpu.mem_info().map_err(|e| anyhow!("{e}"))?;
+        let tables: Vec<B> = (0..hp.n_layer).map(|_| dev.alloc_f32(2 * EXPERTS)).collect();
         let mut exec = MissExec::new(Pool::new(&Pool::default_cpus(), std::time::Duration::from_millis(20)), Isa::detect());
         exec.tiled = true;
         let ngram = NgramTable::open(&g, &plep)?;
@@ -695,7 +749,7 @@ impl Engine {
             free2 as f64 / 1e9,
             t0.elapsed().as_secs_f64()
         );
-        Ok(Engine {
+        let mut eng = Engine {
             dev,
             hp,
             opts,
@@ -712,6 +766,7 @@ impl Engine {
             gpu,
             k,
             nk,
+            _xq8: xq8_buf,
             _gemv: gm,
             experts,
             exec,
@@ -721,11 +776,17 @@ impl Engine {
             tokens: Vec::new(),
             routing: vec![0; 48 * EXPERTS],
             keys: Vec::new(),
+            tables,
+            table_addrs: vec![u64::MAX; 48 * EXPERTS],
+            host_plan: vec![0; MoePlan::WORDS],
             use_graphs: true,
             last: WinStats::default(),
             n_slots,
             load_report,
-        })
+        };
+        eng.sync_tables()?;
+        eng.dev.sync();
+        Ok(eng)
     }
 
     /// Hottest first: a saved profile's order, then (and without one) layer-uniform order so
@@ -1028,13 +1089,28 @@ impl Engine {
             EPS,
         );
         dev.linear_into(&s.x2, &layer.router, &mut s.logits, t, HIDDEN, ROUTER_ROWS);
-        dev.router_topk_into(&s.logits, ROUTER_ROWS, EXPERTS, &mut s.ids, &mut s.w, t);
-        // Publish ids and activations; the host plans while the shared expert runs.
+        // Top-10 and the plan over VRAM-resident experts, on the GPU from its residency table;
+        // the host computes the same misses from its own view of the table (both change only
+        // between windows).
+        dev.moe_route_into(
+            &s.logits,
+            ROUTER_ROWS,
+            EXPERTS,
+            None,
+            &self.tables[l],
+            0,
+            &mut s.ids,
+            &mut s.w,
+            &mut s.plan,
+            t,
+        );
+        // Publish ids and activations; the host computes the misses while the GPU runs the
+        // hits and the shared expert.
         let mbp = self.mb.device();
         let ctlw = a(&s.ctl) + 8; // window counter word
-        let (li, ti) = (l as i32, t as i32);
+        let li = l as i32;
         {
-            let (ids, xq, xw) = (a(&s.ids), a(&s.xq), QAct { m: t, k: HIDDEN }.words() as i32);
+            let (ids, xq, xw, ti) = (a(&s.ids), a(&s.xq), QAct { m: t, k: HIDDEN }.words() as i32, t as i32);
             unsafe {
                 gpu::launch(
                     self.k.publish,
@@ -1047,6 +1123,8 @@ impl Engine {
                 .expect("launch")
             };
         }
+        // SAFETY: every group address in the plan is a live VRAM slot or scratch blob.
+        unsafe { dev.moe_grouped_into(&s.xq, &s.plan, &mut s.moe, &mut s.parts, t) };
         layer.sh_gu.apply(dev, &self.nk, &s.x2, &s.xq, &mut s.gu, t, HIDDEN, 2 * FF);
         {
             let (gu, hq, hf, ff, ti) = (a(&s.gu), a(&s.hq), a(&s.hf), FF as i32, t as i32);
@@ -1082,40 +1160,14 @@ impl Engine {
             };
         }
         let st = 1 + 4 * l;
-        if self.opts.split {
-            let p = a(&s.stamps);
-            let i = st as i32;
-            unsafe { gpu::launch(self.k.stamp, (1, 1, 1), (1, 1, 1), 0, &self.stream, tang_moe::args![p, i]).expect("launch") };
-        }
-        {
-            let (flag, src, n, dst) = (
-                Mb::FLAG_A as i32,
-                Mb::PLAN as i32,
-                MoePlan::WORDS as i32,
-                a(&s.plan),
-            );
-            unsafe {
-                gpu::launch(
-                    self.k.wait,
-                    (1, 1, 1),
-                    (256, 1, 1),
-                    0,
-                    &self.stream,
-                    tang_moe::args![mbp, flag, ctlw, li, src, n, dst],
-                )
-                .expect("launch")
-            };
+        for i in [st, st + 1] {
+            if self.opts.split {
+                let (p, i) = (a(&s.stamps), i as i32);
+                unsafe { gpu::launch(self.k.stamp, (1, 1, 1), (1, 1, 1), 0, &self.stream, tang_moe::args![p, i]).expect("launch") };
+            }
         }
         if self.opts.split {
-            let p = a(&s.stamps);
-            let i = st as i32 + 1;
-            unsafe { gpu::launch(self.k.stamp, (1, 1, 1), (1, 1, 1), 0, &self.stream, tang_moe::args![p, i]).expect("launch") };
-        }
-        // SAFETY: every group address in the host's plan is a live VRAM slot or scratch blob.
-        unsafe { dev.moe_grouped_into(&s.xq, &s.plan, &mut s.moe, &mut s.parts, t) };
-        if self.opts.split {
-            let p = a(&s.stamps);
-            let i = st as i32 + 2;
+            let (p, i) = (a(&s.stamps), st as i32 + 2);
             unsafe { gpu::launch(self.k.stamp, (1, 1, 1), (1, 1, 1), 0, &self.stream, tang_moe::args![p, i]).expect("launch") };
         }
         {
@@ -1138,8 +1190,7 @@ impl Engine {
             };
         }
         if self.opts.split {
-            let p = a(&s.stamps);
-            let i = st as i32 + 3;
+            let (p, i) = (a(&s.stamps), st as i32 + 3);
             unsafe { gpu::launch(self.k.stamp, (1, 1, 1), (1, 1, 1), 0, &self.stream, tang_moe::args![p, i]).expect("launch") };
         }
         {
@@ -1260,8 +1311,7 @@ impl Engine {
                 Experts::Cpu(_) => 0,
             }
         };
-        let missed = build_plan(&ids, t, addr, 0, self.mb.plan_mut());
-        self.mb.raise_a(seq);
+        let missed = build_plan(&ids, t, addr, 0, &mut self.host_plan);
         let t1 = Instant::now();
         let blob = ExpertBlob::BYTES;
         let jobs: Vec<MissJob> = missed
@@ -1356,6 +1406,7 @@ impl Engine {
             rc.record(&self.keys);
             st.swaps = rc.boundary(&self.stream).map_err(|e| anyhow!("{e}"))?;
         }
+        self.sync_tables()?;
         self.counter = self.counter.wrapping_add(1);
         st.wall_ms = w0.elapsed().as_secs_f64() * 1e3;
         self.last = st;
@@ -1364,6 +1415,40 @@ impl Engine {
             self.capture(t)?;
         }
         Ok(ids)
+    }
+
+    /// Copy the cache's residency table into the per-layer plan tables where it changed
+    /// (stream-ordered after the cache's own publish).
+    fn sync_tables(&mut self) -> Result<()> {
+        let Experts::Resident(rc) = &self.experts else {
+            return Ok(());
+        };
+        for l in 0..self.layers.len() {
+            let base = l * EXPERTS;
+            let mut dirty = false;
+            for e in 0..EXPERTS {
+                let a = rc.addr((base + e) as u32);
+                if self.table_addrs[base + e] != a {
+                    self.table_addrs[base + e] = a;
+                    dirty = true;
+                }
+            }
+            if dirty {
+                unsafe {
+                    gpu::check(
+                        cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                            self.dev.buffer_addr(&self.tables[l]),
+                            rc.device_addrs() + (base * 8) as u64,
+                            EXPERTS * 8,
+                            self.stream.0,
+                        ),
+                        "table copy",
+                    )
+                    .map_err(|e| anyhow!("{e}"))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn capture(&mut self, t: usize) -> Result<()> {
@@ -1525,7 +1610,7 @@ pub fn gemv_check(path: &Path) -> Result<()> {
         ((rng >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
     };
     for t in &g.tensors {
-        if t.dims.len() != 2 || t.name.contains("_exps") || t.name.starts_with("per_layer") || t.name == "token_embd.weight" || t.name == "output.weight" {
+        if t.dims.len() != 2 || t.name.contains("_exps") || t.name.starts_with("per_layer") || t.name == "token_embd.weight" || t.name.contains("hc_") {
             continue;
         }
         let id = match t.ty {
@@ -1548,10 +1633,14 @@ pub fn gemv_check(path: &Path) -> Result<()> {
         }
         let n = t.n_rows().min(512);
         let rb = t.row_bytes()?;
-        let raw = &g.bytes(t)[..n * rb];
-        let w = dev.upload_bytes(raw);
+        let mut rawp = g.bytes(t)[..n * rb].to_vec();
+        rawp.extend_from_slice(&[0u8; 16]);
+        let raw = &rawp[..n * rb];
+        let w = dev.upload_bytes(&rawp);
         let p = dev.buffer_addr(&w);
         let segs = dev.upload_u32(&[p as u32, (p >> 32) as u32, id, n as u32, rb as u32, 0]);
+        let r16 = row16(&[[id as u64, n as u64, rb as u64, 0, 0]]);
+        let (grid, smem) = gemv_grid(n, r16);
         let mut wf = vec![0f32; n * k];
         crate::gguf::dequantize(t.ty, raw, &mut wf)?;
         let mut worst = 0f64;
@@ -1562,7 +1651,7 @@ pub fn gemv_check(path: &Path) -> Result<()> {
             let f = gm.func(&format!("fe_gemv_t{tt}")).map_err(|e| anyhow!("{e}"))?;
             let (sp, ns, xp, ki, op, os) = (dev.buffer_addr(&segs), 1i32, dev.buffer_addr(&x), k as i32, dev.buffer_addr(&out), n as i32);
             unsafe {
-                gpu::launch(f, (n.div_ceil(8) as u32, 1, 1), (256, 1, 1), 0, &stream, tang_moe::args![sp, ns, xp, ki, op, os])
+                { let total = n as i32; gpu::launch(f, (grid, 1, 1), (128, 1, 1), smem, &stream, tang_moe::args![sp, ns, xp, ki, op, os, r16, total]) }
                     .map_err(|e| anyhow!("{e}"))?
             };
             dev.sync();
@@ -1576,11 +1665,74 @@ pub fn gemv_check(path: &Path) -> Result<()> {
                 }
             }
         }
+        // The int8-activation kernel against dequant(W) · dequant(q8(x)).
+        let q8 = gm.func("fe_q8").map_err(|e| anyhow!("{e}"))?;
+        let xqb = dev.alloc_f32(XQ8_BYTES / 4);
+        let mut worst8 = 0f64;
+        for tt in [1usize, 3, 8] {
+            let xv: Vec<f32> = (0..tt * k).map(|_| rnd()).collect();
+            let x = dev.upload_f32(&xv);
+            let out = dev.alloc_f32(tt * n);
+            let f = gm.func(&format!("fe_gemv8_t{tt}")).map_err(|e| anyhow!("{e}"))?;
+            let (sp, ns, xp, xq, ki, op, os) = (dev.buffer_addr(&segs), 1i32, dev.buffer_addr(&x), dev.buffer_addr(&xqb), k as i32, dev.buffer_addr(&out), n as i32);
+            unsafe {
+                gpu::launch(q8, ((k / 32) as u32, tt as u32, 1), (32, 1, 1), 0, &stream, tang_moe::args![xp, xq, ki]).map_err(|e| anyhow!("{e}"))?;
+                gpu::launch(f, (n.div_ceil(8) as u32, 1, 1), (128, 1, 1), 8 * 16 * r16 as u32, &stream, tang_moe::args![sp, ns, xp, xq, ki, op, os, r16])
+                    .map_err(|e| anyhow!("{e}"))?
+            };
+            dev.sync();
+            let got = dev.download(&out);
+            let qw: Vec<u8> = dev.download(&xqb).iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+            let xd = |ti: usize, i: usize| -> f64 {
+                let q = qw[ti * k + i] as i8 as f64;
+                let o = MAX_T * k + 4 * (ti * (k / 32) + i / 32);
+                q * f32::from_le_bytes([qw[o], qw[o + 1], qw[o + 2], qw[o + 3]]) as f64
+            };
+            for ti in 0..tt {
+                for r in 0..n {
+                    let (mut want, mut mag) = (0f64, 0f64);
+                    for i in 0..k {
+                        let v = wf[r * k + i] as f64 * if id == 30 { xv[ti * k + i] as f64 } else { xd(ti, i) };
+                        want += v;
+                        mag += v.abs();
+                    }
+                    worst8 = worst8.max((got[ti * n + r] as f64 - want).abs() / mag.max(1e-30));
+                }
+            }
+        }
+        // Bandwidth over the whole tensor at T = 1 and 4.
+        let nf = t.n_rows();
+        let mut full = g.bytes(t).to_vec();
+        full.extend_from_slice(&[0u8; 16]);
+        let wfull = dev.upload_bytes(&full);
+        let pf = dev.buffer_addr(&wfull);
+        let segf = dev.upload_u32(&[pf as u32, (pf >> 32) as u32, id, nf as u32, rb as u32, 0]);
+        let mut gbs = vec![];
+        for tt in [1usize, 4] {
+            let x = dev.upload_f32(&vec![0.5f32; tt * k]);
+            let out = dev.alloc_f32(tt * nf);
+            let f = gm.func(&format!("fe_gemv8_t{tt}")).map_err(|e| anyhow!("{e}"))?;
+            let (sp, ns, xp, xq, ki, op, os) = (dev.buffer_addr(&segf), 1i32, dev.buffer_addr(&x), dev.buffer_addr(&xqb), k as i32, dev.buffer_addr(&out), nf as i32);
+            let mut run = || unsafe {
+                gpu::launch(q8, ((k / 32) as u32, tt as u32, 1), (32, 1, 1), 0, &stream, tang_moe::args![xp, xq, ki]).unwrap();
+                gpu::launch(f, (nf.div_ceil(8) as u32, 1, 1), (128, 1, 1), 8 * 16 * r16 as u32, &stream, tang_moe::args![sp, ns, xp, xq, ki, op, os, r16]).unwrap()
+            };
+            run();
+            let ms = dev.event_ms(&mut || {
+                for _ in 0..20 {
+                    run()
+                }
+            }) / 20.0;
+            gbs.push(t.nbytes as f64 / (ms as f64 * 1e6));
+        }
         println!(
-            "{:<8} k={k:<5} {:<34} rows {n}: worst |err| / Σ|terms| = {worst:.2e} {}",
+            "{:<8} k={k:<5} {:<34} rows {n}: f32 path {worst:.1e}, int8 path {worst8:.1e} {}  int8 {:.0} / {:.0} GB/s at T=1/4 ({:.1} MB)",
             t.ty.name(),
             t.name,
-            if worst < 1e-5 { "ok" } else { "FAIL" }
+            if worst < 1e-5 && worst8 < 1e-5 { "ok" } else { "FAIL" },
+            gbs[0],
+            gbs[1],
+            t.nbytes as f64 / 1e6
         );
     }
     Ok(())

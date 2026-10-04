@@ -51,6 +51,36 @@ pub struct NgramTable {
     pub cache_rows: usize,
     pub hits: std::sync::atomic::AtomicU64,
     pub reads: std::sync::atomic::AtomicU64,
+    /// Readers, on the E-cores when the CPU has them (the P-cores spin for expert misses).
+    io: rayon::ThreadPool,
+}
+
+/// E-core CPUs of a hybrid Intel part (empty elsewhere).
+fn ecores() -> Vec<usize> {
+    let Ok(s) = std::fs::read_to_string("/sys/devices/cpu_atom/cpus") else {
+        return Vec::new();
+    };
+    let mut v = Vec::new();
+    for part in s.trim().split(',') {
+        if let Some((a, b)) = part.split_once('-') {
+            if let (Ok(a), Ok(b)) = (a.parse::<usize>(), b.parse::<usize>()) {
+                v.extend(a..=b);
+            }
+        } else if let Ok(a) = part.parse() {
+            v.push(a);
+        }
+    }
+    v
+}
+
+fn pin(cpu: usize) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(cpu, &mut set);
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+    }
+    let _ = cpu;
 }
 
 impl NgramTable {
@@ -80,6 +110,17 @@ impl NgramTable {
             cache_rows: 1 << 18,
             hits: 0.into(),
             reads: 0.into(),
+            io: {
+                let e = ecores();
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(16)
+                    .start_handler(move |i| {
+                        if !e.is_empty() {
+                            pin(e[i % e.len()]);
+                        }
+                    })
+                    .build()?
+            },
         })
     }
 
@@ -119,7 +160,8 @@ impl NgramTable {
         let per = self.p.n_heads();
         let rows: Vec<u64> = (i0..i1).flat_map(|i| self.p.rows(tokens, i)).collect();
         ensure!(out.len() >= rows.len() * self.width && rows.len() == (i1 - i0) * per, "PLE gather");
-        let raws: Vec<Result<Box<[u8]>>> = rows.par_iter().map(|&r| self.read_raw(r)).collect();
+        let raws: Vec<Result<Box<[u8]>>> =
+            self.io.install(|| rows.par_iter().map(|&r| self.read_raw(r)).collect());
         for (h, raw) in raws.into_iter().enumerate() {
             dequantize(self.ty, &raw?, &mut out[h * self.width..(h + 1) * self.width])?;
         }

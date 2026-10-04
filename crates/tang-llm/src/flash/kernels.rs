@@ -167,7 +167,16 @@ extern "C" __global__ void fe_argmax(const float* logits, int n, unsigned* ids) 
 pub const GEMV_SRC: &str = r#"
 struct Seg { unsigned long long w; int type; int rows; int row_bytes; int out_off; };
 
-__constant__ signed char IQ4NL[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+// Small int -> float without I2F (quarter rate on sm_86): magic-number add.
+__device__ __forceinline__ float i2f(int q) { return __int_as_float(0x4B400000 + q) - 12582912.0f; }
+
+// IQ4_NL grid value for a nibble, from registers (a __constant__ table serializes when lanes
+// index it differently).
+__device__ __forceinline__ float iq4(int q) {
+    const unsigned t0 = 0xBFAD9881u, t1 = 0xF6EADDCFu, t2 = 0x26190D01u, t3 = 0x71594535u;
+    const unsigned w = (q & 8) ? ((q & 4) ? t3 : t2) : ((q & 4) ? t1 : t0);
+    return i2f((int)(signed char)(w >> (8 * (q & 3))));
+}
 
 __device__ __forceinline__ float h2f(unsigned short h) {
     float f;
@@ -177,12 +186,23 @@ __device__ __forceinline__ float h2f(unsigned short h) {
 __device__ __forceinline__ unsigned short rd16(const unsigned char* p) {
     return (unsigned short)p[0] | ((unsigned short)p[1] << 8);
 }
+// 8 consecutive bytes at any alignment (shared memory: three aligned 32-bit loads, two funnel
+// shifts).
+__device__ __forceinline__ unsigned long long rd64(const unsigned char* p) {
+    const unsigned long long a = (unsigned long long)p;
+    const unsigned* q = (const unsigned*)(a & ~3ull);
+    const unsigned sh = (unsigned)(a & 3) * 8;
+    const unsigned w0 = q[0], w1 = q[1], w2 = q[2];
+    const unsigned lo = __funnelshift_r(w0, w1, sh), hi = __funnelshift_r(w1, w2, sh);
+    return (unsigned long long)lo | ((unsigned long long)hi << 32);
+}
 __device__ __forceinline__ void scale_min_k4(int j, const unsigned char* q, int& s, int& m) {
     if (j < 4) { s = q[j] & 63; m = q[j + 4] & 63; }
     else { s = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4); m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4); }
 }
 
-// The 8 weights e0..e0 + 8 of a row (e0 % 8 == 0).
+// The 8 weights e0..e0 + 8 of a row (e0 % 8 == 0). Shift-based selects, no lane-dependent
+// branches (lanes of a warp sit in different quarters of a block).
 template <int TY>
 __device__ __forceinline__ void decode8(const unsigned char* row, int e0, float* v) {
     if (TY == 30) {  // BF16
@@ -193,93 +213,92 @@ __device__ __forceinline__ void decode8(const unsigned char* row, int e0, float*
     } else if (TY == 8) {  // Q8_0
         const unsigned char* b = row + (e0 / 32) * 34;
         const float d = h2f(rd16(b));
-        const int j = e0 % 32;
+        const unsigned long long q = rd64(b + 2 + e0 % 32);
         #pragma unroll
-        for (int i = 0; i < 8; i++) v[i] = d * (float)(signed char)b[2 + j + i];
+        for (int i = 0; i < 8; i++) v[i] = d * i2f((int)(signed char)(q >> (8 * i)));
     } else if (TY == 2 || TY == 20) {  // Q4_0, IQ4_NL
         const unsigned char* b = row + (e0 / 32) * 18;
         const float d = h2f(rd16(b));
-        const int j = e0 % 32;
+        const int j = e0 % 32, sh = (j >> 4) * 4;
+        const unsigned long long q = rd64(b + 2 + (j & 15));
         #pragma unroll
         for (int i = 0; i < 8; i++) {
-            const int q = j < 16 ? (b[2 + j + i] & 0xf) : (b[2 + j - 16 + i] >> 4);
-            v[i] = TY == 2 ? d * (float)(q - 8) : d * (float)IQ4NL[q];
+            const int n = (int)(q >> (8 * i + sh)) & 0xf;
+            v[i] = TY == 2 ? d * i2f(n - 8) : d * iq4(n);
         }
     } else if (TY == 6) {  // Q5_0
         const unsigned char* b = row + (e0 / 32) * 22;
         const float d = h2f(rd16(b));
         const unsigned qh = (unsigned)b[2] | ((unsigned)b[3] << 8) | ((unsigned)b[4] << 16) | ((unsigned)b[5] << 24);
-        const int j0 = e0 % 32;
+        const int j0 = e0 % 32, hi = j0 >> 4, jl = j0 & 15;
+        const unsigned long long q = rd64(b + 6 + jl);
         #pragma unroll
         for (int i = 0; i < 8; i++) {
-            int q;
-            if (j0 < 16) { const int j = j0 + i; q = (b[6 + j] & 0xf) | (((qh >> j) << 4) & 0x10); }
-            else { const int j = j0 - 16 + i; q = (b[6 + j] >> 4) | ((qh >> (j + 12)) & 0x10); }
-            v[i] = d * (float)(q - 16);
+            const int n = ((int)(q >> (8 * i + 4 * hi)) & 0xf) | (((qh >> (j0 + i)) & 1) << 4);
+            v[i] = d * i2f(n - 16);
         }
     } else if (TY == 42) {  // Q2_0: 64 in 18 B, (code - 1) * d
         const unsigned char* b = row + (e0 / 64) * 18;
         const float d = h2f(rd16(b));
         const int j = e0 % 64;
+        const unsigned q = (unsigned)b[2 + j / 4] | ((unsigned)b[3 + j / 4] << 8);
         #pragma unroll
-        for (int i = 0; i < 8; i++) v[i] = d * (float)((int)((b[2 + (j + i) / 4] >> (2 * ((j + i) % 4))) & 3) - 1);
+        for (int i = 0; i < 8; i++) v[i] = d * i2f((int)((q >> (2 * i)) & 3) - 1);
     } else if (TY == 23) {  // IQ4_XS
         const unsigned char* b = row + (e0 / 256) * 136;
-        const int e = e0 % 256, ib = e / 32, j = e % 32;
+        const int e = e0 % 256, ib = e / 32, j = e % 32, sh = (j >> 4) * 4;
         const float d = h2f(rd16(b));
-        const unsigned sh = rd16(b + 2);
-        const int ls = ((b[4 + ib / 2] >> (4 * (ib % 2))) & 0xf) | (((sh >> (2 * ib)) & 3) << 4);
-        const float dl = d * (float)(ls - 32);
-        const unsigned char* q = b + 8 + ib * 16;
+        const unsigned shh = rd16(b + 2);
+        const int ls = ((b[4 + ib / 2] >> (4 * (ib % 2))) & 0xf) | (((shh >> (2 * ib)) & 3) << 4);
+        const float dl = d * i2f(ls - 32);
+        const unsigned long long q = rd64(b + 8 + ib * 16 + (j & 15));
         #pragma unroll
-        for (int i = 0; i < 8; i++) v[i] = dl * (float)IQ4NL[j < 16 ? (q[j + i] & 0xf) : (q[j - 16 + i] >> 4)];
+        for (int i = 0; i < 8; i++) v[i] = dl * iq4((int)(q >> (8 * i + sh)) & 0xf);
     } else if (TY == 11) {  // Q3_K: hmask[32] qs[64] scales[12] d
         const unsigned char* b = row + (e0 / 256) * 110;
         const int e = e0 % 256, n = e / 128, jj = (e % 128) / 32, l = e % 32;
         const int is = n * 8 + jj * 2 + l / 16;
         const unsigned char* sc = b + 96;
-        const int lo = is < 8 ? (sc[is] & 0xF) : (sc[is - 8] >> 4);
+        const int lo = (sc[is & 7] >> (4 * (is >> 3))) & 0xF;
         const int hi = (sc[8 + is % 4] >> (2 * (is / 4))) & 3;
-        const float dl = h2f(rd16(b + 108)) * (float)((lo | (hi << 4)) - 32);
-        const unsigned char m = (unsigned char)(1 << (n * 4 + jj));
+        const float dl = h2f(rd16(b + 108)) * i2f((lo | (hi << 4)) - 32);
+        const int m = n * 4 + jj;
+        const unsigned long long q = rd64(b + 32 + n * 32 + l);
+        const unsigned long long hm = rd64(b + l);
         #pragma unroll
         for (int i = 0; i < 8; i++) {
-            const int li = l + i;
-            const int q = (int)((b[32 + n * 32 + li] >> (2 * jj)) & 3) - ((b[li] & m) ? 0 : 4);
-            v[i] = dl * (float)q;
+            const int qv = (int)((q >> (8 * i + 2 * jj)) & 3) - (((hm >> (8 * i + m)) & 1) ? 0 : 4);
+            v[i] = dl * i2f(qv);
         }
     } else if (TY == 12 || TY == 13) {  // Q4_K, Q5_K
         const int bb = TY == 12 ? 144 : 176;
         const unsigned char* b = row + (e0 / 256) * bb;
         const float d = h2f(rd16(b)), dmin = h2f(rd16(b + 2));
-        const int e = e0 % 256, j = e / 64, w = e % 64, l = w % 32;
+        const int e = e0 % 256, j = e / 64, w = e % 64, l = w % 32, up = w >> 5;
         int s, m;
-        scale_min_k4(2 * j + (w >= 32), b + 4, s, m);
-        const float d1 = d * (float)s, m1 = dmin * (float)m;
-        const unsigned char* q = b + (TY == 12 ? 16 : 48) + j * 32;
-        const unsigned char u = (unsigned char)((w < 32 ? 1 : 2) << (2 * j));
+        scale_min_k4(2 * j + up, b + 4, s, m);
+        const float d1 = d * i2f(s), m1 = dmin * i2f(m);
+        const unsigned long long q = rd64(b + (TY == 12 ? 16 : 48) + j * 32 + l);
+        const unsigned long long qh = TY == 13 ? rd64(b + 16 + l) : 0ull;
+        const int hb = 2 * j + up;
         #pragma unroll
         for (int i = 0; i < 8; i++) {
-            int qv = w < 32 ? (q[l + i] & 0xf) : (q[l + i] >> 4);
-            if (TY == 13 && (b[16 + l + i] & u)) qv += 16;
-            v[i] = d1 * (float)qv - m1;
+            int qv = (int)(q >> (8 * i + 4 * up)) & 0xf;
+            if (TY == 13) qv |= (int)((qh >> (8 * i + hb)) & 1) << 4;
+            v[i] = fmaf(d1, i2f(qv), -m1);
         }
     } else if (TY == 14) {  // Q6_K: ql[128] qh[64] scales[16] d
         const unsigned char* b = row + (e0 / 256) * 210;
         const float d = h2f(rd16(b + 208));
         const int e = e0 % 256, n = e / 128, r = e % 128, qt = r / 32, l = r % 32;
-        const unsigned char* ql = b + n * 64;
-        const unsigned char* qh = b + 128 + n * 32;
-        const float dl = d * (float)(signed char)b[192 + n * 8 + l / 16 + 2 * qt];
+        const float dl = d * i2f((int)(signed char)b[192 + n * 8 + l / 16 + 2 * qt]);
+        const unsigned long long ql = rd64(b + n * 64 + l + 32 * (qt & 1));
+        const unsigned long long qh = rd64(b + 128 + n * 32 + l);
+        const int ls = 4 * (qt >> 1), hs = 2 * qt;
         #pragma unroll
         for (int i = 0; i < 8; i++) {
-            const int li = l + i;
-            int q;
-            if (qt == 0) q = (ql[li] & 0xf) | ((qh[li] & 3) << 4);
-            else if (qt == 1) q = (ql[li + 32] & 0xf) | (((qh[li] >> 2) & 3) << 4);
-            else if (qt == 2) q = (ql[li] >> 4) | (((qh[li] >> 4) & 3) << 4);
-            else q = (ql[li + 32] >> 4) | (((qh[li] >> 6) & 3) << 4);
-            v[i] = dl * (float)(q - 32);
+            const int qv = ((int)(ql >> (8 * i + ls)) & 0xf) | (((int)(qh >> (8 * i + hs)) & 3) << 4);
+            v[i] = dl * i2f(qv - 32);
         }
     }
 }
@@ -302,41 +321,299 @@ __device__ __forceinline__ void rows_dot(const unsigned char* w, const float* x,
     }
 }
 
-template <int T>
-__device__ void gemv_body(const Seg* segs, int nseg, const float* x, int k, float* out, int ostride) {
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    int row = blockIdx.x * 8 + warp, s = 0;
-    while (s < nseg && row >= segs[s].rows) { row -= segs[s].rows; s++; }
-    if (s >= nseg) return;
-    const Seg sg = segs[s];
-    const unsigned char* w = (const unsigned char*)sg.w + (size_t)row * sg.row_bytes;
-    float acc[T];
-    #pragma unroll
-    for (int t = 0; t < T; t++) acc[t] = 0.f;
-    switch (sg.type) {
-        case 30: rows_dot<T, 30>(w, x, k, acc); break;
-        case 8: rows_dot<T, 8>(w, x, k, acc); break;
-        case 2: rows_dot<T, 2>(w, x, k, acc); break;
-        case 20: rows_dot<T, 20>(w, x, k, acc); break;
-        case 6: rows_dot<T, 6>(w, x, k, acc); break;
-        case 42: rows_dot<T, 42>(w, x, k, acc); break;
-        case 23: rows_dot<T, 23>(w, x, k, acc); break;
-        case 11: rows_dot<T, 11>(w, x, k, acc); break;
-        case 12: rows_dot<T, 12>(w, x, k, acc); break;
-        case 13: rows_dot<T, 13>(w, x, k, acc); break;
-        case 14: rows_dot<T, 14>(w, x, k, acc); break;
-        default: break;
-    }
-    #pragma unroll
-    for (int t = 0; t < T; t++) {
-        float a = acc[t];
-        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
-        if (lane == 0) out[(size_t)t * ostride + sg.out_off + row] = a;
+// ---- int8-activation path (dp4a) ----
+
+#define XQ8_T 8
+
+// IQ4_NL grid for four nibbles (bytes 0..15) at once.
+__device__ __forceinline__ int iq4w(unsigned n) {
+    const unsigned sel = (n & 0x7u) | ((n >> 4) & 0x70u) | ((n >> 8) & 0x700u) | ((n >> 12) & 0x7000u);
+    const unsigned lo = __byte_perm(0xBFAD9881u, 0xF6EADDCFu, sel);
+    const unsigned hi = __byte_perm(0x26190D01u, 0x71594535u, sel);
+    const unsigned m = ((n >> 3) & 0x01010101u) * 0xFFu;
+    return (int)((lo & ~m) | (hi & m));
+}
+// Four 1-bit fields (bits 0..3 of b) into bit 0 of four bytes.
+__device__ __forceinline__ unsigned spread1(unsigned b) {
+    return (b & 1u) | ((b & 2u) << 7) | ((b & 4u) << 14) | ((b & 8u) << 21);
+}
+// Four 2-bit fields (bits 0..7 of c) into four bytes.
+__device__ __forceinline__ unsigned spread2(unsigned c) {
+    return (c & 3u) | ((c & 0xCu) << 6) | ((c & 0x30u) << 12) | ((c & 0xC0u) << 18);
+}
+
+// The 8 weights e0..e0 + 8 as signed int8 lanes of (w0, w1), with weight = dw · code − mw.
+template <int TY>
+__device__ __forceinline__ void decode8i(const unsigned char* row, int e0, int& w0, int& w1, float& dw, float& mw) {
+    mw = 0.f;
+    if (TY == 8) {
+        const unsigned char* b = row + (e0 / 32) * 34;
+        dw = h2f(rd16(b));
+        const unsigned long long q = rd64(b + 2 + e0 % 32);
+        w0 = (int)(unsigned)q; w1 = (int)(unsigned)(q >> 32);
+    } else if (TY == 2 || TY == 20) {
+        const unsigned char* b = row + (e0 / 32) * 18;
+        dw = h2f(rd16(b));
+        const int j = e0 % 32, sh = (j >> 4) * 4;
+        const unsigned long long q = rd64(b + 2 + (j & 15));
+        const unsigned n0 = ((unsigned)q >> sh) & 0x0F0F0F0Fu, n1 = ((unsigned)(q >> 32) >> sh) & 0x0F0F0F0Fu;
+        if (TY == 2) { w0 = (int)__vsub4(n0, 0x08080808u); w1 = (int)__vsub4(n1, 0x08080808u); }
+        else { w0 = iq4w(n0); w1 = iq4w(n1); }
+    } else if (TY == 6) {
+        const unsigned char* b = row + (e0 / 32) * 22;
+        dw = h2f(rd16(b));
+        const unsigned qh = (unsigned)b[2] | ((unsigned)b[3] << 8) | ((unsigned)b[4] << 16) | ((unsigned)b[5] << 24);
+        const int j0 = e0 % 32, sh = (j0 >> 4) * 4;
+        const unsigned long long q = rd64(b + 6 + (j0 & 15));
+        const unsigned h = qh >> j0;
+        const unsigned n0 = (((unsigned)q >> sh) & 0x0F0F0F0Fu) | (spread1(h & 0xF) << 4);
+        const unsigned n1 = (((unsigned)(q >> 32) >> sh) & 0x0F0F0F0Fu) | (spread1((h >> 4) & 0xF) << 4);
+        w0 = (int)__vsub4(n0, 0x10101010u); w1 = (int)__vsub4(n1, 0x10101010u);
+    } else if (TY == 42) {
+        const unsigned char* b = row + (e0 / 64) * 18;
+        dw = h2f(rd16(b));
+        const int j = e0 % 64;
+        const unsigned q = (unsigned)b[2 + j / 4] | ((unsigned)b[3 + j / 4] << 8);
+        w0 = (int)__vsub4(spread2(q & 0xFF), 0x01010101u);
+        w1 = (int)__vsub4(spread2(q >> 8), 0x01010101u);
+    } else if (TY == 23) {
+        const unsigned char* b = row + (e0 / 256) * 136;
+        const int e = e0 % 256, ib = e / 32, j = e % 32, sh = (j >> 4) * 4;
+        const unsigned shh = rd16(b + 2);
+        const int ls = ((b[4 + ib / 2] >> (4 * (ib % 2))) & 0xf) | (((shh >> (2 * ib)) & 3) << 4);
+        dw = h2f(rd16(b)) * i2f(ls - 32);
+        const unsigned long long q = rd64(b + 8 + ib * 16 + (j & 15));
+        w0 = iq4w(((unsigned)q >> sh) & 0x0F0F0F0Fu);
+        w1 = iq4w(((unsigned)(q >> 32) >> sh) & 0x0F0F0F0Fu);
+    } else if (TY == 11) {
+        const unsigned char* b = row + (e0 / 256) * 110;
+        const int e = e0 % 256, n = e / 128, jj = (e % 128) / 32, l = e % 32;
+        const int is = n * 8 + jj * 2 + l / 16;
+        const unsigned char* sc = b + 96;
+        const int lo = (sc[is & 7] >> (4 * (is >> 3))) & 0xF;
+        const int hi = (sc[8 + is % 4] >> (2 * (is / 4))) & 3;
+        dw = h2f(rd16(b + 108)) * i2f((lo | (hi << 4)) - 32);
+        const int m = n * 4 + jj;
+        const unsigned long long q = rd64(b + 32 + n * 32 + l);
+        const unsigned long long hm = rd64(b + l);
+        const unsigned c0 = ((unsigned)q >> (2 * jj)) & 0x03030303u, c1 = ((unsigned)(q >> 32) >> (2 * jj)) & 0x03030303u;
+        const unsigned h0 = ((unsigned)hm >> m) & 0x01010101u, h1 = ((unsigned)(hm >> 32) >> m) & 0x01010101u;
+        w0 = (int)__vsub4(c0, (h0 ^ 0x01010101u) << 2);
+        w1 = (int)__vsub4(c1, (h1 ^ 0x01010101u) << 2);
+    } else if (TY == 12 || TY == 13) {
+        const int bb = TY == 12 ? 144 : 176;
+        const unsigned char* b = row + (e0 / 256) * bb;
+        const int e = e0 % 256, j = e / 64, w = e % 64, l = w % 32, up = w >> 5;
+        int s, m;
+        scale_min_k4(2 * j + up, b + 4, s, m);
+        dw = h2f(rd16(b)) * i2f(s);
+        mw = h2f(rd16(b + 2)) * i2f(m);
+        const unsigned long long q = rd64(b + (TY == 12 ? 16 : 48) + j * 32 + l);
+        unsigned n0 = ((unsigned)q >> (4 * up)) & 0x0F0F0F0Fu, n1 = ((unsigned)(q >> 32) >> (4 * up)) & 0x0F0F0F0Fu;
+        if (TY == 13) {
+            const unsigned long long qh = rd64(b + 16 + l);
+            const int hb = 2 * j + up;
+            n0 |= (((unsigned)qh >> hb) & 0x01010101u) << 4;
+            n1 |= (((unsigned)(qh >> 32) >> hb) & 0x01010101u) << 4;
+        }
+        w0 = (int)n0; w1 = (int)n1;
+    } else if (TY == 14) {
+        const unsigned char* b = row + (e0 / 256) * 210;
+        const int e = e0 % 256, n = e / 128, r = e % 128, qt = r / 32, l = r % 32;
+        dw = h2f(rd16(b + 208)) * i2f((int)(signed char)b[192 + n * 8 + l / 16 + 2 * qt]);
+        const unsigned long long ql = rd64(b + n * 64 + l + 32 * (qt & 1));
+        const unsigned long long qh = rd64(b + 128 + n * 32 + l);
+        const int ls = 4 * (qt >> 1), hs = 2 * qt;
+        const unsigned n0 = (((unsigned)ql >> ls) & 0x0F0F0F0Fu) | ((((unsigned)qh >> hs) & 0x03030303u) << 4);
+        const unsigned n1 = (((unsigned)(ql >> 32) >> ls) & 0x0F0F0F0Fu) | ((((unsigned)(qh >> 32) >> hs) & 0x03030303u) << 4);
+        w0 = (int)__vsub4(n0, 0x20202020u); w1 = (int)__vsub4(n1, 0x20202020u);
     }
 }
 
-#define GEMV_T(T) extern "C" __global__ void __launch_bounds__(256) fe_gemv_t##T( \
-    const Seg* segs, int nseg, const float* x, int k, float* out, int ostride) { \
-    gemv_body<T>(segs, nseg, x, k, out, ostride); }
+// xq: int8 codes [XQ8_T][k] (plain order), then f32 scales [XQ8_T][k / 32].
+template <int T, int TY>
+__device__ __forceinline__ void rows_dot8(const unsigned char* w, const unsigned char* xq, int k, float* acc) {
+    const int lane = threadIdx.x & 31;
+    const float* xd = (const float*)(xq + (size_t)XQ8_T * k);
+    for (int e0 = lane * 8; e0 < k; e0 += 256) {
+        int w0, w1;
+        float dw, mw;
+        decode8i<TY>(w, e0, w0, w1, dw, mw);
+        #pragma unroll
+        for (int t = 0; t < T; t++) {
+            const uint2 xv = *(const uint2*)(xq + (size_t)t * k + e0);
+            const float dx = xd[t * (k / 32) + e0 / 32];
+            const int s = __dp4a(w0, (int)xv.x, __dp4a(w1, (int)xv.y, 0));
+            if (TY == 12 || TY == 13) {
+                const int sx = __dp4a(0x01010101, (int)xv.x, __dp4a(0x01010101, (int)xv.y, 0));
+                acc[t] = fmaf(dx, fmaf(dw, i2f(s), -mw * i2f(sx)), acc[t]);
+            } else {
+                acc[t] = fmaf(dx * dw, i2f(s), acc[t]);
+            }
+        }
+    }
+}
+
+// x [t][k] f32 -> xq (int8 plain codes + per-32 scales; d = amax/127, round half away, as QAct).
+extern "C" __global__ void fe_q8(const float* x, unsigned char* xq, int k) {
+    const int c = blockIdx.x, t = blockIdx.y, lane = threadIdx.x;
+    const float v = x[(size_t)t * k + c * 32 + lane];
+    float amax = fabsf(v);
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    const float d = amax / 127.0f;
+    const int q = d == 0.f ? 0 : (int)fminf(fmaxf(roundf(v / d), -127.f), 127.f);
+    xq[(size_t)t * k + c * 32 + lane] = (unsigned char)(signed char)q;
+    if (lane == 0) ((float*)(xq + (size_t)XQ8_T * k))[t * (k / 32) + c] = d;
+}
+
+// Two rows per warp (both staged in shared memory before either is decoded, so twice the bytes
+// are in flight), four warps per block; int8 activations for quantized segments, f32 for BF16.
+template <int T>
+__device__ void gemv8_body(const Seg* segs, int nseg, const float* x, const unsigned char* xq, int k, float* out, int ostride, int row16) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    extern __shared__ uint4 dsm[];
+    const unsigned char* w[2];
+    Seg sg[2];
+    int rr[2];
+    bool ok[2];
+    #pragma unroll
+    for (int j = 0; j < 2; j++) {
+        int row = (blockIdx.x * 4 + warp) * 2 + j, s = 0;
+        while (s < nseg && row >= segs[s].rows) { row -= segs[s].rows; s++; }
+        ok[j] = s < nseg;
+        rr[j] = row;
+        w[j] = 0;
+        if (!ok[j]) continue;
+        sg[j] = segs[s];
+        const unsigned char* src = (const unsigned char*)sg[j].w + (size_t)row * sg[j].row_bytes;
+        w[j] = src;
+        if (sg[j].type != 30) {
+            uint4* sm = dsm + (warp * 2 + j) * row16;
+            const unsigned long long a = (unsigned long long)src & ~15ull;
+            const int delta = (int)((unsigned long long)src - a);
+            const int n16 = (delta + sg[j].row_bytes + 15) >> 4;
+            for (int i = lane; i < n16; i += 32) sm[i] = __ldg((const uint4*)a + i);
+            w[j] = (const unsigned char*)sm + delta;
+        }
+    }
+    __syncwarp();
+    #pragma unroll
+    for (int j = 0; j < 2; j++) {
+        if (!ok[j]) continue;
+        float acc[T];
+        #pragma unroll
+        for (int t = 0; t < T; t++) acc[t] = 0.f;
+        switch (sg[j].type) {
+            case 30: rows_dot<T, 30>(w[j], x, k, acc); break;
+            case 8: rows_dot8<T, 8>(w[j], xq, k, acc); break;
+            case 2: rows_dot8<T, 2>(w[j], xq, k, acc); break;
+            case 20: rows_dot8<T, 20>(w[j], xq, k, acc); break;
+            case 6: rows_dot8<T, 6>(w[j], xq, k, acc); break;
+            case 42: rows_dot8<T, 42>(w[j], xq, k, acc); break;
+            case 23: rows_dot8<T, 23>(w[j], xq, k, acc); break;
+            case 11: rows_dot8<T, 11>(w[j], xq, k, acc); break;
+            case 12: rows_dot8<T, 12>(w[j], xq, k, acc); break;
+            case 13: rows_dot8<T, 13>(w[j], xq, k, acc); break;
+            case 14: rows_dot8<T, 14>(w[j], xq, k, acc); break;
+            default: break;
+        }
+        #pragma unroll
+        for (int t = 0; t < T; t++) {
+            float a = acc[t];
+            for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+            if (lane == 0) out[(size_t)t * ostride + sg[j].out_off + rr[j]] = a;
+        }
+    }
+}
+
+#define GEMV8_T(T) extern "C" __global__ void __launch_bounds__(128) fe_gemv8_t##T( \
+    const Seg* segs, int nseg, const float* x, const unsigned char* xq, int k, float* out, int ostride, int row16) { \
+    gemv8_body<T>(segs, nseg, x, xq, k, out, ostride, row16); }
+GEMV8_T(1) GEMV8_T(2) GEMV8_T(3) GEMV8_T(4) GEMV8_T(5) GEMV8_T(6) GEMV8_T(7) GEMV8_T(8)
+
+__device__ __forceinline__ void cp16(void* dst, const void* src) {
+    const unsigned d = (unsigned)__cvta_generic_to_shared(dst);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(d), "l"(src) : "memory");
+}
+__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;" ::: "memory"); }
+__device__ __forceinline__ void cp_wait1() { asm volatile("cp.async.wait_group 1;" ::: "memory"); }
+
+// Row `row` of the stacked weight: its segment and byte address.
+__device__ __forceinline__ const Seg* find_seg(const Seg* segs, int nseg, int& row) {
+    int s = 0;
+    while (s < nseg && row >= segs[s].rows) { row -= segs[s].rows; s++; }
+    return s < nseg ? segs + s : 0;
+}
+
+// Async-stage one row (aligned 16-byte cp.async) into `sm`; returns the offset of its first
+// byte there. BF16 rows aren't staged (read straight from global).
+__device__ __forceinline__ int stage_row(const Seg* sg, int row, uint4* sm, int lane) {
+    if (!sg || sg->type == 30) return 0;
+    const unsigned char* src = (const unsigned char*)sg->w + (size_t)row * sg->row_bytes;
+    const unsigned long long a = (unsigned long long)src & ~15ull;
+    const int delta = (int)((unsigned long long)src - a);
+    const int n16 = (delta + sg->row_bytes + 15) >> 4;
+    for (int i = lane; i < n16; i += 32) cp16(sm + i, (const uint4*)a + i);
+    return delta;
+}
+
+// Each warp walks rows warp_id, warp_id + n_warps, ...; the next row's bytes stream into the
+// other half of its double buffer (cp.async) while it decodes the current one.
+template <int T>
+__device__ void gemv_body(const Seg* segs, int nseg, const float* x, int k, float* out, int ostride, int row16, int total) {
+    extern __shared__ uint4 dsm[];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int nw = gridDim.x * (blockDim.x >> 5);
+    uint4* buf[2] = {dsm + (2 * warp) * row16, dsm + (2 * warp + 1) * row16};
+    int row = blockIdx.x * (blockDim.x >> 5) + warp;
+    int r0 = row;
+    const Seg* sg = row < total ? find_seg(segs, nseg, r0) : 0;
+    int delta = stage_row(sg, r0, buf[0], lane);
+    cp_commit();
+    for (int it = 0; row < total; it++, row += nw) {
+        const int nrow = row + nw;
+        int r1 = nrow;
+        const Seg* ns = nrow < total ? find_seg(segs, nseg, r1) : 0;
+        const int ndelta = stage_row(ns, r1, buf[(it + 1) & 1], lane);
+        cp_commit();
+        cp_wait1();
+        __syncwarp();
+        const Seg cur = *sg;
+        const unsigned char* w = cur.type == 30
+            ? (const unsigned char*)cur.w + (size_t)r0 * cur.row_bytes
+            : (const unsigned char*)buf[it & 1] + delta;
+        float acc[T];
+        #pragma unroll
+        for (int t = 0; t < T; t++) acc[t] = 0.f;
+        switch (cur.type) {
+            case 30: rows_dot<T, 30>(w, x, k, acc); break;
+            case 8: rows_dot<T, 8>(w, x, k, acc); break;
+            case 2: rows_dot<T, 2>(w, x, k, acc); break;
+            case 20: rows_dot<T, 20>(w, x, k, acc); break;
+            case 6: rows_dot<T, 6>(w, x, k, acc); break;
+            case 42: rows_dot<T, 42>(w, x, k, acc); break;
+            case 23: rows_dot<T, 23>(w, x, k, acc); break;
+            case 11: rows_dot<T, 11>(w, x, k, acc); break;
+            case 12: rows_dot<T, 12>(w, x, k, acc); break;
+            case 13: rows_dot<T, 13>(w, x, k, acc); break;
+            case 14: rows_dot<T, 14>(w, x, k, acc); break;
+            default: break;
+        }
+        #pragma unroll
+        for (int t = 0; t < T; t++) {
+            float v = acc[t];
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+            if (lane == 0) out[(size_t)t * ostride + cur.out_off + r0] = v;
+        }
+        __syncwarp();  // everyone is done with buf[it & 1] before it is refilled
+        sg = ns;
+        r0 = r1;
+        delta = ndelta;
+    }
+}
+
+#define GEMV_T(T) extern "C" __global__ void __launch_bounds__(128) fe_gemv_t##T( \
+    const Seg* segs, int nseg, const float* x, int k, float* out, int ostride, int row16, int total) { \
+    gemv_body<T>(segs, nseg, x, k, out, ostride, row16, total); }
 GEMV_T(1) GEMV_T(2) GEMV_T(3) GEMV_T(4) GEMV_T(5) GEMV_T(6) GEMV_T(7) GEMV_T(8)
 "#;
