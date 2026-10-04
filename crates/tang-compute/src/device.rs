@@ -886,6 +886,27 @@ pub trait ComputeDevice: Send {
         self.upload(&wide)
     }
 
+    /// Whether [`alloc_bf16`](Self::alloc_bf16) stores bfloat16 (otherwise it's f32).
+    fn bf16_storage(&self) -> bool {
+        false
+    }
+
+    /// A zeroed buffer of `len` elements kept in bfloat16, for data the kernels write as well
+    /// as read: a KV cache, which [`attention_prep`](Self::attention_prep) fills and the
+    /// attention methods read (math in f32 either way). [`write_into`](Self::write_into) and
+    /// [`slice_buffer`](Self::slice_buffer) work on it, converting f32 sources, and
+    /// [`upload_bf16`](Self::upload_bf16) makes a source of the same kind. Backends without
+    /// bf16 storage return f32 ([`alloc`](Self::alloc)).
+    fn alloc_bf16(&self, len: usize) -> Self::Buffer {
+        self.alloc(len)
+    }
+
+    /// The contents as bfloat16 bits: exact for bf16 storage, rounded to nearest even
+    /// otherwise.
+    fn download_bf16(&self, buf: &Self::Buffer) -> Vec<u16> {
+        self.download(buf).into_iter().map(f32_to_bf16).collect()
+    }
+
     /// Upload 4-bit affine-quantized weights in MLX's layout: `packed` holds 8 weights per
     /// u32 (low nibble first) for a row-major `[n, k]` matrix; `scales` and `biases` are bf16
     /// bits, one per `group` consecutive weights of a row (`w = scale * q + bias`). Backends
@@ -1177,4 +1198,10 @@ pub fn attention_prep_default<D: ComputeDevice + ?Sized>(
     dev.write_into(k_cache, pos * kvd, &k);
     dev.write_into(v_cache, pos * kvd, &v);
     q
+}
+
+/// bfloat16 bits of `x`, rounded to nearest even.
+pub fn f32_to_bf16(x: f32) -> u16 {
+    let b = x.to_bits();
+    (b.wrapping_add(0x7fff + ((b >> 16) & 1)) >> 16) as u16
 }

@@ -2,10 +2,11 @@
 //! read instead of a prefill.
 //!
 //! Each conversation (`prompt_cache_key`) is two files: `<hash>.kv`, its positions' keys and
-//! values (f32, position-major: every layer's K row then V row), and `<hash>.json`, the tokens
-//! those positions hold. Saving after a turn appends only the new positions; a conversation
-//! that was rewound is cut back to what it still shares first. Exact: rows are stored as
-//! computed. The oldest files go when the directory passes its budget.
+//! values (bf16, position-major: every layer's K row then V row), and `<hash>.json`, the tokens
+//! those positions hold (and the row format: files from before bf16, which held f32, are
+//! ignored and rewritten). Saving after a turn appends only the new positions; a conversation
+//! that was rewound is cut back to what it still shares first. Exact for bf16 caches: rows are
+//! stored as the cache holds them. The oldest files go when the directory passes its budget.
 //!
 //! [`Writer`] does the writing on its own thread, so a turn never waits on the disk.
 
@@ -19,12 +20,16 @@ pub struct Store {
     dir: PathBuf,
     /// Most bytes of `.kv` files to keep.
     budget: u64,
-    /// Floats per position.
+    /// Elements per position.
     row: usize,
 }
 
+/// What `.json` files record about their `.kv` file's rows; anything else is ignored.
+const FORMAT: &str = "bf16";
+
 impl Store {
-    /// A store in `dir` (one per model and weight format) holding positions of `row` floats.
+    /// A store in `dir` (one per model and weight format) holding positions of `row` bf16
+    /// elements.
     pub fn new(dir: PathBuf, budget: u64, row: usize) -> Result<Self> {
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         Ok(Self { dir, budget, row })
@@ -40,7 +45,7 @@ impl Store {
     }
 
     fn row_bytes(&self) -> u64 {
-        self.row as u64 * 4
+        self.row as u64 * 2
     }
 
     /// The tokens whose positions are on disk for `key` (empty if none).
@@ -52,7 +57,7 @@ impl Store {
         else {
             return Vec::new();
         };
-        if v["key"] != key || v["row"].as_u64() != Some(self.row as u64) {
+        if v["key"] != key || v["row"].as_u64() != Some(self.row as u64) || v["format"] != FORMAT {
             return Vec::new();
         }
         let rows = fs::metadata(&data).map_or(0, |m| m.len() / self.row_bytes()) as usize;
@@ -67,23 +72,23 @@ impl Store {
     }
 
     /// Positions `from..to` for `key`.
-    pub fn read(&self, key: &str, from: usize, to: usize) -> Result<Vec<f32>> {
+    pub fn read(&self, key: &str, from: usize, to: usize) -> Result<Vec<u16>> {
         let (_, data) = self.paths(key);
         let mut f = fs::File::open(&data)?;
         f.seek(SeekFrom::Start(from as u64 * self.row_bytes()))?;
-        let mut bytes = vec![0u8; (to - from) * self.row * 4];
+        let mut bytes = vec![0u8; (to - from) * self.row * 2];
         f.read_exact(&mut bytes)?;
         // Touch it: the budget drops the least recently used first.
         let _ = f.set_modified(std::time::SystemTime::now());
         Ok(bytes
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
             .collect())
     }
 
     /// Record that `key`'s cache holds `tokens`, whose positions from `from` on are `rows`
     /// (positions before `from` are already on disk).
-    pub fn write(&self, key: &str, tokens: &[u32], from: usize, rows: &[f32]) -> Result<()> {
+    pub fn write(&self, key: &str, tokens: &[u32], from: usize, rows: &[u16]) -> Result<()> {
         debug_assert_eq!(rows.len(), (tokens.len() - from) * self.row);
         let (meta, data) = self.paths(key);
         let mut f = OpenOptions::new()
@@ -95,7 +100,7 @@ impl Store {
         // tokens, which never claim more rows than the file has.
         f.set_len(from as u64 * self.row_bytes())?;
         f.seek(SeekFrom::End(0))?;
-        let mut bytes = Vec::with_capacity(rows.len() * 4);
+        let mut bytes = Vec::with_capacity(rows.len() * 2);
         for x in rows {
             bytes.extend_from_slice(&x.to_le_bytes());
         }
@@ -103,7 +108,9 @@ impl Store {
         let tmp = meta.with_extension("json.tmp");
         fs::write(
             &tmp,
-            serde_json::to_vec(&json!({ "key": key, "row": self.row, "tokens": tokens }))?,
+            serde_json::to_vec(
+                &json!({ "key": key, "row": self.row, "format": FORMAT, "tokens": tokens }),
+            )?,
         )?;
         fs::rename(&tmp, &meta)?;
         self.trim(&data);
@@ -146,7 +153,7 @@ enum Job {
         key: String,
         tokens: Vec<u32>,
         from: usize,
-        rows: Vec<f32>,
+        rows: Vec<u16>,
     },
     /// Answer once every earlier write is done.
     Flush(std::sync::mpsc::SyncSender<()>),
@@ -201,7 +208,7 @@ impl Writer {
     }
 
     /// [`Store::write`], in the background.
-    pub fn write(&self, key: &str, tokens: Vec<u32>, from: usize, rows: Vec<f32>) {
+    pub fn write(&self, key: &str, tokens: Vec<u32>, from: usize, rows: Vec<u16>) {
         self.pending
             .fetch_add(1, std::sync::atomic::Ordering::Acquire);
         let job = Job::Write {
@@ -243,15 +250,31 @@ mod tests {
     fn appends_reads_and_rewinds() {
         let (s, dir) = store(1 << 20);
         assert!(s.tokens("a").is_empty());
-        s.write("a", &[1, 2], 0, &[1.0, 2.0, 3.0, 4.0]).unwrap();
-        s.write("a", &[1, 2, 3], 2, &[5.0, 6.0]).unwrap();
+        s.write("a", &[1, 2], 0, &[1, 2, 3, 4]).unwrap();
+        s.write("a", &[1, 2, 3], 2, &[5, 6]).unwrap();
         assert_eq!(s.tokens("a"), vec![1, 2, 3]);
-        assert_eq!(s.read("a", 1, 3).unwrap(), vec![3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(s.read("a", 1, 3).unwrap(), vec![3, 4, 5, 6]);
         // Rewound to one shared token, then a different continuation.
-        s.write("a", &[1, 9], 1, &[7.0, 8.0]).unwrap();
+        s.write("a", &[1, 9], 1, &[7, 8]).unwrap();
         assert_eq!(s.tokens("a"), vec![1, 9]);
-        assert_eq!(s.read("a", 0, 2).unwrap(), vec![1.0, 2.0, 7.0, 8.0]);
+        assert_eq!(s.read("a", 0, 2).unwrap(), vec![1, 2, 7, 8]);
         assert!(s.tokens("b").is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ignores_files_from_before_bf16() {
+        let (s, dir) = store(1 << 22);
+        // What the f32 format left: no "format", 4 bytes an element.
+        let (meta, data) = s.paths("a");
+        std::fs::write(&data, [0u8; 16]).unwrap();
+        let old = serde_json::json!({ "key": "a", "row": 2, "tokens": [1, 2] });
+        std::fs::write(&meta, serde_json::to_vec(&old).unwrap()).unwrap();
+        assert!(s.tokens("a").is_empty());
+        // Saving starts the file over.
+        s.write("a", &[1], 0, &[7, 8]).unwrap();
+        assert_eq!(s.tokens("a"), vec![1]);
+        assert_eq!(std::fs::metadata(&data).unwrap().len(), 4);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -259,21 +282,21 @@ mod tests {
     fn the_writer_writes_in_order_and_flush_waits() {
         let (s, dir) = store(1 << 21);
         let w = super::Writer::new(s);
-        w.write("a", vec![1, 2], 0, vec![1.0, 2.0, 3.0, 4.0]);
-        w.write("a", vec![1, 3], 1, vec![5.0, 6.0]);
+        w.write("a", vec![1, 2], 0, vec![1, 2, 3, 4]);
+        w.write("a", vec![1, 3], 1, vec![5, 6]);
         w.flush();
         assert_eq!(w.store().tokens("a"), vec![1, 3]);
-        assert_eq!(w.store().read("a", 0, 2).unwrap(), vec![1.0, 2.0, 5.0, 6.0]);
+        assert_eq!(w.store().read("a", 0, 2).unwrap(), vec![1, 2, 5, 6]);
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn trims_the_least_recently_used() {
-        // Two positions of two floats: 16 bytes a conversation; room for one.
-        let (s, dir) = store(20);
-        s.write("a", &[1, 2], 0, &[0.0; 4]).unwrap();
+        // Two positions of two elements: 8 bytes a conversation; room for one.
+        let (s, dir) = store(10);
+        s.write("a", &[1, 2], 0, &[0; 4]).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        s.write("b", &[1, 2], 0, &[0.0; 4]).unwrap();
+        s.write("b", &[1, 2], 0, &[0; 4]).unwrap();
         assert!(s.tokens("a").is_empty());
         assert_eq!(s.tokens("b"), vec![1, 2]);
         let _ = std::fs::remove_dir_all(dir);

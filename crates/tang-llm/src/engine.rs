@@ -272,6 +272,15 @@ impl<D: ComputeDevice> Engine<D> {
         }
     }
 
+    /// Keep KV caches in f32 instead of bf16 (or back). Drops every cache.
+    pub fn set_kv_f32(&mut self, f32: bool) {
+        self.model.set_kv_f32(f32);
+        self.cache = self.model.new_cache();
+        self.cache_images.clear();
+        self.cache_key = None;
+        self.parked.clear();
+    }
+
     /// Keep up to `n` conversations' KV caches (at least 1). Each costs a full context's
     /// worth of device memory once used.
     pub fn set_slots(&mut self, n: usize) {
@@ -295,7 +304,7 @@ impl<D: ComputeDevice> Engine<D> {
         self.store = Some(crate::kvstore::Writer::new(crate::kvstore::Store::new(
             dir,
             budget,
-            self.model.row_floats(),
+            self.model.row_elems(),
         )?));
         Ok(())
     }

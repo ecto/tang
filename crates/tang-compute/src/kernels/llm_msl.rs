@@ -226,7 +226,7 @@ kernel void embedding_bf16(
 "#;
 
 /// `dst[dst_off + i] = src[src_off + i]` — a compute-encoder copy, so small copies (KV cache
-/// appends, row slices) don't force an encoder switch.
+/// appends, row slices) don't force an encoder switch. f32, bf16, or converting between them.
 pub const COPY_MSL: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -238,6 +238,36 @@ kernel void copy_f32(
     uint gid [[thread_position_in_grid]])
 {
     if (gid < params[2]) dst[params[1] + gid] = src[params[0] + gid];
+}
+
+// The same between bfloat16 buffers, and across formats (to bf16 rounds to nearest even).
+kernel void copy_u16(
+    device const ushort* src [[buffer(0)]],
+    device ushort* dst [[buffer(1)]],
+    device const uint* params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < params[2]) dst[params[1] + gid] = src[params[0] + gid];
+}
+
+kernel void f32_to_bf16(
+    device const float* src [[buffer(0)]],
+    device ushort* dst [[buffer(1)]],
+    device const uint* params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= params[2]) return;
+    uint b = as_type<uint>(src[params[0] + gid]);
+    dst[params[1] + gid] = ushort((b + 0x7fffu + ((b >> 16) & 1u)) >> 16);
+}
+
+kernel void bf16_to_f32(
+    device const ushort* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    device const uint* params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < params[2]) dst[params[1] + gid] = as_type<float>(uint(src[params[0] + gid]) << 16);
 }
 "#;
 
@@ -262,8 +292,8 @@ using namespace metal;
 
 kernel void attn_partial(
     device const float* Q [[buffer(0)]],
-    device const float* K [[buffer(1)]],
-    device const float* V [[buffer(2)]],
+    device const kv_t* K [[buffer(1)]],
+    device const kv_t* V [[buffer(2)]],
     device float* P [[buffer(3)]],            // [q_len, n_heads, n_splits, D + 2]
     device const uint* params [[buffer(4)]],  // [cache_start, q_len, n_heads, n_kv_heads, D, n_splits, split_len, window, base]
     uint3 tg [[threadgroup_position_in_grid]],
@@ -300,15 +330,15 @@ kernel void attn_partial(
     float m = -INFINITY, l = 0;
 
     for (uint j = j0 + sg; j < j1; j += 8) {
-        device const float* kp = K + (ulong)j * kv_dim + kv_head * D;
+        device const kv_t* kp = K + (ulong)j * kv_dim + kv_head * D;
         float s = 0;
-        for (uint v = 0; v < per; v++) { uint d = v * 32 + lane; if (d < D) s += q[v] * kp[d]; }
+        for (uint v = 0; v < per; v++) { uint d = v * 32 + lane; if (d < D) s += q[v] * kv1(kp + d); }
         s = simd_sum(s);
         float m2 = max(m, s);
         float c = exp(m - m2), p = exp(s - m2);
         l = l * c + p;
-        device const float* vp = V + (ulong)j * kv_dim + kv_head * D;
-        for (uint v = 0; v < per; v++) { uint d = v * 32 + lane; if (d < D) acc[v] = acc[v] * c + p * vp[d]; }
+        device const kv_t* vp = V + (ulong)j * kv_dim + kv_head * D;
+        for (uint v = 0; v < per; v++) { uint d = v * 32 + lane; if (d < D) acc[v] = acc[v] * c + p * kv1(vp + d); }
         m = m2;
     }
 
@@ -341,8 +371,8 @@ kernel void attn_partial(
 // and p broadcast by shuffles. Same partial layout as attn_partial. D % 4 == 0, D <= 256.
 kernel void attn_decode(
     device const float* Q [[buffer(0)]],
-    device const float* K [[buffer(1)]],
-    device const float* V [[buffer(2)]],
+    device const kv_t* K [[buffer(1)]],
+    device const kv_t* V [[buffer(2)]],
     device float* P [[buffer(3)]],
     device const uint* params [[buffer(4)]],
     uint2 tg [[threadgroup_position_in_grid]],
@@ -377,9 +407,9 @@ kernel void attn_decode(
         bool valid = j < j1;
         float s = -INFINITY;
         if (valid) {
-            device const float4* kp = (device const float4*)(K + (ulong)j * kv_dim + kv_head * D);
+            device const kv_t* kp = K + (ulong)j * kv_dim + kv_head * D;
             float4 d4 = 0;
-            for (uint i = 0; i < D / 4; i++) d4 += qs[i] * kp[i];
+            for (uint i = 0; i < D / 4; i++) d4 += qs[i] * kv4(kp + 4 * i);
             s = d4.x + d4.y + d4.z + d4.w;
         }
         float bm = simd_max(s);
@@ -392,10 +422,10 @@ kernel void attn_decode(
         uint n = min(32u, j1 - b);
         for (uint t = 0; t < n; t++) {
             float pt = simd_shuffle(p, t);
-            device const float* vp = V + (ulong)(b + t) * kv_dim + kv_head * D;
+            device const kv_t* vp = V + (ulong)(b + t) * kv_dim + kv_head * D;
             for (uint v = 0; v < per; v++) {
                 uint d = v * 32 + lane;
-                if (d < D) acc[v] += pt * vp[d];
+                if (d < D) acc[v] += pt * kv1(vp + d);
             }
         }
     }
@@ -466,7 +496,7 @@ using namespace metal;
 
 template <int R, int BK, int DMAX, int NW>
 inline void attn_multi_body(
-    device const float* Q, device const float* K, device const float* V, device float* P,
+    device const float* Q, device const kv_t* K, device const kv_t* V, device float* P,
     device const uint* params, threadgroup float* Qs, threadgroup float* KVs,
     threadgroup float* Ps, uint3 tg, uint tid, uint warp, uint lane)
 {
@@ -529,8 +559,8 @@ inline void attn_multi_body(
             uint i = tid + NT * t, cc = i / D4, d = (i % D4) * 4, j = jb + cc;
             bool ok = cc < (uint)BK && j < je;
             ulong o = (ulong)j * kvd + (ulong)kvh * D + d;
-            kreg[t] = ok ? *(device const float4*)(K + o) : float4(0.0f);
-            vreg[t] = ok ? *(device const float4*)(V + o) : float4(0.0f);
+            kreg[t] = ok ? kv4(K + o) : float4(0.0f);
+            vreg[t] = ok ? kv4(V + o) : float4(0.0f);
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -546,7 +576,7 @@ inline void attn_multi_body(
             for (int t = 0; t < NL; t++) {
                 uint i = tid + NT * t, cc = i / D4, d = (i % D4) * 4, j = j0 + BK + cc;
                 kreg[t] = (cc < (uint)BK && j < je)
-                    ? *(device const float4*)(K + (ulong)j * kvd + (ulong)kvh * D + d) : float4(0.0f);
+                    ? kv4(K + (ulong)j * kvd + (ulong)kvh * D + d) : float4(0.0f);
             }
         }
 
@@ -582,7 +612,7 @@ inline void attn_multi_body(
             for (int t = 0; t < NL; t++) {
                 uint i = tid + NT * t, cc = i / D4, d = (i % D4) * 4, j = j0 + BK + cc;
                 vreg[t] = (cc < (uint)BK && j < je)
-                    ? *(device const float4*)(V + (ulong)j * kvd + (ulong)kvh * D + d) : float4(0.0f);
+                    ? kv4(V + (ulong)j * kvd + (ulong)kvh * D + d) : float4(0.0f);
             }
         }
 
@@ -622,8 +652,8 @@ inline void attn_multi_body(
 
 #define ATTN_MULTI(NAME, R, BK, DMAX, NW)                                                    \
 kernel void NAME(                                                                            \
-    device const float* Q [[buffer(0)]], device const float* K [[buffer(1)]],                \
-    device const float* V [[buffer(2)]], device float* P [[buffer(3)]],                      \
+    device const float* Q [[buffer(0)]], device const kv_t* K [[buffer(1)]],                 \
+    device const kv_t* V [[buffer(2)]], device float* P [[buffer(3)]],                       \
     device const uint* params [[buffer(4)]], uint3 tg [[threadgroup_position_in_grid]],      \
     uint tid [[thread_index_in_threadgroup]], uint warp [[simdgroup_index_in_threadgroup]],  \
     uint lane [[thread_index_in_simdgroup]])                                                 \
@@ -984,16 +1014,59 @@ kernel void embedding_q4(
 }
 "#;
 
-/// Fused decoder-layer glue: attention prologue and split SwiGLU.
-///
-/// `attention_prep`: one simdgroup per (token, head) over q, k and v heads of a fused QKV row.
-/// q/k heads get the optional RMS norm and half-split RoPE; q goes to `Qo`, k and v straight
-/// into the caches. Each lane holds `hd/32` elements; element `lane + 32v` pairs with
-/// `lane + 32(v + hd/64)` for RoPE, so `hd` must be a multiple of 64 (at most 256).
-pub const FUSED_MSL: &str = r#"
+/// How kernels that read or write a KV cache see its elements, prepended to their source (see
+/// [`kv_source`]): `kv_t` is the stored type, `kv1`/`kv4` load one or four as float, `kv_st`
+/// stores one (rounding to nearest even for bf16). Attention math stays f32 either way.
+pub const KV_F32_MSL: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
+#define KV_BF16 0
+typedef float kv_t;
+inline float kv1(device const float* p) { return *p; }
+inline float4 kv4(device const float* p) { return *(device const float4*)p; }
+inline void kv_st(device float* p, float x) { *p = x; }
+"#;
 
+/// [`KV_F32_MSL`] for bfloat16 caches (raw bits in `ushort`).
+pub const KV_BF16_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+#define KV_BF16 1
+typedef ushort kv_t;
+inline float kv_bf(ushort b) { return as_type<float>(uint(b) << 16); }
+inline float kv1(device const ushort* p) { return kv_bf(*p); }
+inline float4 kv4(device const ushort* p) {
+    ushort4 b = *(device const ushort4*)p;
+    return float4(kv_bf(b.x), kv_bf(b.y), kv_bf(b.z), kv_bf(b.w));
+}
+inline void kv_st(device ushort* p, float x) {
+    uint b = as_type<uint>(x);
+    *p = ushort((b + 0x7fffu + ((b >> 16) & 1u)) >> 16);
+}
+"#;
+
+/// `src` (one of the KV-reading sources: [`ATTN_PREP_MSL`], [`FLASH_DECODE_MSL`],
+/// [`FLASH_MULTI_MSL`], [`FLASH_PREFILL_MSL`]) for f32 or bf16 caches. Built once per variant.
+pub fn kv_source(src: &'static str, bf16: bool) -> &'static str {
+    use std::sync::Mutex;
+    static BUILT: Mutex<Vec<(usize, bool, &'static str)>> = Mutex::new(Vec::new());
+    let mut built = BUILT.lock().unwrap();
+    let id = src.as_ptr() as usize;
+    if let Some(&(_, _, s)) = built.iter().find(|(p, b, _)| *p == id && *b == bf16) {
+        return s;
+    }
+    let head = if bf16 { KV_BF16_MSL } else { KV_F32_MSL };
+    let s: &'static str = Box::leak(format!("{head}{src}").into_boxed_str());
+    built.push((id, bf16, s));
+    s
+}
+
+/// Attention prologue: one simdgroup per (token, head) over q, k and v heads of a fused QKV
+/// row. q/k heads get the optional RMS norm and half-split RoPE; q goes to `Qo`, k and v
+/// straight into the caches (`kv_t`, see [`kv_source`]). Each lane holds `hd/32` elements;
+/// element `lane + 32v` pairs with `lane + 32(v + hd/64)` for RoPE, so `hd` must be a multiple
+/// of 64 (at most 256).
+pub const ATTN_PREP_MSL: &str = r#"
 kernel void attention_prep(
     device const float* QKV [[buffer(0)]],
     device const float* QN [[buffer(1)]],
@@ -1001,8 +1074,8 @@ kernel void attention_prep(
     device const float* COS [[buffer(3)]],
     device const float* SIN [[buffer(4)]],
     device float* Qo [[buffer(5)]],
-    device float* KC [[buffer(6)]],
-    device float* VC [[buffer(7)]],
+    device kv_t* KC [[buffer(6)]],
+    device kv_t* VC [[buffer(7)]],
     device const uint* params [[buffer(8)]],  // [seq, nh, nkv, hd, pos, eps bits, has_qn, has_kn]
     uint2 tg [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]])
@@ -1019,8 +1092,8 @@ kernel void attention_prep(
 
     if (h >= nh + nkv) {  // v head: straight into the cache
         uint kh = h - nh - nkv;
-        device float* dst = VC + (ulong)(pos + s) * kvd + kh * hd;
-        for (uint v = 0; v < per; v++) dst[v * 32 + lane] = x[v];
+        device kv_t* dst = VC + (ulong)(pos + s) * kvd + kh * hd;
+        for (uint v = 0; v < per; v++) kv_st(dst + v * 32 + lane, x[v]);
         return;
     }
     bool is_q = h < nh;
@@ -1041,10 +1114,20 @@ kernel void attention_prep(
         y[v] = x0 * c - x1 * sn;
         y[v + half_v] = x1 * c + x0 * sn;
     }
-    device float* dst = is_q ? Qo + (ulong)s * qd + h * hd
-                             : KC + (ulong)(pos + s) * kvd + (h - nh) * hd;
-    for (uint v = 0; v < per; v++) dst[v * 32 + lane] = y[v];
+    if (is_q) {
+        device float* dst = Qo + (ulong)s * qd + h * hd;
+        for (uint v = 0; v < per; v++) dst[v * 32 + lane] = y[v];
+    } else {
+        device kv_t* dst = KC + (ulong)(pos + s) * kvd + (h - nh) * hd;
+        for (uint v = 0; v < per; v++) kv_st(dst + v * 32 + lane, y[v]);
+    }
 }
+"#;
+
+/// Fused decoder-layer glue: GELU, LayerNorm, and split GeGLU / SwiGLU.
+pub const FUSED_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
 
 // GELU (tanh approximation), elementwise.
 kernel void gelu_tanh(
@@ -1130,7 +1213,8 @@ kernel void swiglu_split(
 /// Threadgroup = (32-query block, head), 4 simdgroups × 8 query rows. Per 32-key block, each
 /// simdgroup computes S = Q·Kᵀ (8×32), runs the online softmax on it in threadgroup scratch,
 /// rescales its O accumulator (8×D, as D/8 8×8 tiles) by diag(α) and adds P·V. K/V tiles are
-/// read straight from the cache with `simdgroup_load`. Blocks past the diagonal are skipped.
+/// read straight from an f32 cache with `simdgroup_load` (a bf16 cache's are widened through
+/// threadgroup memory first). Blocks past the diagonal are skipped.
 /// Requires: q rows padded to a multiple of 32; K/V caches readable to a multiple of 32 rows
 /// past the end; D a multiple of 8, at most 128.
 pub const FLASH_PREFILL_MSL: &str = r#"
@@ -1143,8 +1227,8 @@ using namespace metal;
 
 kernel void attn_prefill(
     device const float* Q [[buffer(0)]],     // [q_pad, nh*D]
-    device const float* K [[buffer(1)]],     // [.., nkv*D]
-    device const float* V [[buffer(2)]],
+    device const kv_t* K [[buffer(1)]],      // [.., nkv*D]
+    device const kv_t* V [[buffer(2)]],
     device float* O [[buffer(3)]],           // [q_pad, nh*D]
     device const uint* params [[buffer(4)]], // [cache_start, q_len, nh, nkv, D, bidirectional]
     uint2 tg [[threadgroup_position_in_grid]],
@@ -1164,6 +1248,12 @@ kernel void attn_prefill(
     threadgroup float diag[4][64];
     threadgroup float* S = scratch[sg];
     threadgroup float* Dg = diag[sg];
+#if KV_BF16
+    // bf16 caches: each 32-key × 8-dim K or V tile is widened into here, key-major, then
+    // loaded as 8x8 matrices (simdgroup_load can't convert).
+    threadgroup float stage[4][BK * 8];
+    threadgroup float* St = stage[sg];
+#endif
 
     simdgroup_float8x8 o[MAXT];
     for (uint t = 0; t < T; t++) o[t] = simdgroup_float8x8(0);
@@ -1184,11 +1274,24 @@ kernel void attn_prefill(
         for (uint d = 0; d < D; d += 8) {
             simdgroup_float8x8 a;
             simdgroup_load(a, qp + d, qs);
+#if KV_BF16
+            device const kv_t* kr = K + (ulong)(j0 + lane) * ks + kvh * D + d;
+            *(threadgroup float4*)(St + lane * 8) = kv4(kr);
+            *(threadgroup float4*)(St + lane * 8 + 4) = kv4(kr + 4);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+#endif
             for (uint c = 0; c < 4; c++) {
                 simdgroup_float8x8 b;
+#if KV_BF16
+                simdgroup_load(b, St + c * 64, 8, ulong2(0), true);
+#else
                 simdgroup_load(b, K + (ulong)(j0 + c * 8) * ks + kvh * D + d, ks, ulong2(0), true);
+#endif
                 simdgroup_multiply_accumulate(s[c], a, b, s[c]);
             }
+#if KV_BF16
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+#endif
         }
         for (uint c = 0; c < 4; c++) simdgroup_store(s[c], S + c * 8, BK);
         simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -1228,11 +1331,24 @@ kernel void attn_prefill(
         for (uint t = 0; t < T; t++) {
             simdgroup_float8x8 acc;
             simdgroup_multiply(acc, da, o[t]);
+#if KV_BF16
+            device const kv_t* vr = V + (ulong)(j0 + lane) * ks + kvh * D + t * 8;
+            *(threadgroup float4*)(St + lane * 8) = kv4(vr);
+            *(threadgroup float4*)(St + lane * 8 + 4) = kv4(vr + 4);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+#endif
             for (uint c = 0; c < 4; c++) {
                 simdgroup_float8x8 vt;
+#if KV_BF16
+                simdgroup_load(vt, St + c * 64, 8);
+#else
                 simdgroup_load(vt, V + (ulong)(j0 + c * 8) * ks + kvh * D + t * 8, ks);
+#endif
                 simdgroup_multiply_accumulate(acc, p[c], vt, acc);
             }
+#if KV_BF16
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+#endif
             o[t] = acc;
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);

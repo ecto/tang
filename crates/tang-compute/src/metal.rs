@@ -19,7 +19,8 @@ pub struct MetalBuffer {
     buffer: metal::Buffer,
     /// Element count.
     len: usize,
-    /// Element format. Anything but `F32` is a read-only weight for `linear`/`embedding`.
+    /// Element format. `Q4`, and `Bf16` from `upload_bf16`, are read-only weights for
+    /// `linear`/`embedding`; `Bf16` from `alloc_bf16` is a KV cache.
     kind: Kind,
 }
 
@@ -261,9 +262,42 @@ impl MetalDevice {
         dst_off: usize,
         n: usize,
     ) {
-        let pipeline = self.get_pipeline(llm_msl::COPY_MSL, "copy_f32");
+        self.copy_with("copy_f32", src, src_off, dst, dst_off, n);
+    }
+
+    /// `n` elements with one of `COPY_MSL`'s kernels (same format, or converting).
+    fn copy_with(
+        &self,
+        kernel: &str,
+        src: &metal::Buffer,
+        src_off: usize,
+        dst: &metal::Buffer,
+        dst_off: usize,
+        n: usize,
+    ) {
+        if n == 0 {
+            return;
+        }
+        let pipeline = self.get_pipeline(llm_msl::COPY_MSL, kernel);
         let params = self.make_buffer_u32(&[src_off as u32, dst_off as u32, n as u32]);
         self.dispatch(&pipeline, &[src, dst, &params], n as u64);
+    }
+
+    /// A bf16 KV cache widened to f32 (for the fallback kernels that only read f32).
+    fn widen(&self, buf: &MetalBuffer) -> MetalBuffer {
+        let mut out = self.alloc(buf.len);
+        self.write_into(&mut out, 0, buf);
+        out
+    }
+
+    /// The KV-reading kernel source `src` for caches `k` and `v` (see `llm_msl::kv_source`).
+    fn kv_src(src: &'static str, k: &MetalBuffer, v: &MetalBuffer) -> &'static str {
+        assert_eq!(k.kind, v.kind, "K and V caches differ in format");
+        assert!(
+            matches!(k.kind, Kind::F32 | Kind::Bf16),
+            "a KV cache is f32 or bf16"
+        );
+        llm_msl::kv_source(src, k.kind == Kind::Bf16)
     }
 
     /// Tiled causal attention for prefill (`llm_msl::FLASH_PREFILL_MSL`). Query rows are
@@ -301,7 +335,10 @@ impl MetalDevice {
             d as u32,
             bidir as u32,
         ]);
-        let pipeline = self.get_pipeline(llm_msl::FLASH_PREFILL_MSL, "attn_prefill");
+        let pipeline = self.get_pipeline(
+            Self::kv_src(llm_msl::FLASH_PREFILL_MSL, k, v),
+            "attn_prefill",
+        );
         self.with_encoder(|enc| {
             enc.set_compute_pipeline_state(&pipeline);
             for (i, b) in [&qb.buffer, &k.buffer, &v.buffer, &out, &params]
@@ -434,8 +471,11 @@ impl MetalDevice {
         ]);
         let partial = self.make_buffer_empty(q_len * n_heads * n_splits * (d + 2) * 4);
         let out = self.make_buffer_empty(q_len * n_heads * d * 4);
-        let p1 = self.get_pipeline(llm_msl::FLASH_MULTI_MSL, name);
-        let p2 = self.get_pipeline(llm_msl::FLASH_DECODE_MSL, "attn_combine");
+        let p1 = self.get_pipeline(Self::kv_src(llm_msl::FLASH_MULTI_MSL, k, v), name);
+        let p2 = self.get_pipeline(
+            llm_msl::kv_source(llm_msl::FLASH_DECODE_MSL, false),
+            "attn_combine",
+        );
         self.with_encoder(|enc| {
             enc.set_compute_pipeline_state(&p1);
             for (i, b) in [&q.buffer, &k.buffer, &v.buffer, &partial, &params]
@@ -515,7 +555,7 @@ impl MetalDevice {
         let partial = self.make_buffer_empty(q_len * n_heads * n_splits * (d + 2) * 4);
         let out = self.make_buffer_empty(q_len * n_heads * d * 4);
         let p1 = self.get_pipeline(
-            llm_msl::FLASH_DECODE_MSL,
+            Self::kv_src(llm_msl::FLASH_DECODE_MSL, k, v),
             if lane_keys {
                 "attn_decode"
             } else {
@@ -523,7 +563,10 @@ impl MetalDevice {
             },
         );
         let grid1 = MTLSize::new(n_heads as u64, n_splits as u64, q_len as u64);
-        let p2 = self.get_pipeline(llm_msl::FLASH_DECODE_MSL, "attn_combine");
+        let p2 = self.get_pipeline(
+            llm_msl::kv_source(llm_msl::FLASH_DECODE_MSL, false),
+            "attn_combine",
+        );
         self.with_encoder(|enc| {
             enc.set_compute_pipeline_state(&p1);
             for (i, b) in [&q.buffer, &k.buffer, &v.buffer, &partial, &params]
@@ -694,6 +737,27 @@ impl ComputeDevice for MetalDevice {
             len,
             kind: Kind::F32,
         }
+    }
+
+    fn bf16_storage(&self) -> bool {
+        true
+    }
+
+    fn alloc_bf16(&self, len: usize) -> MetalBuffer {
+        MetalBuffer {
+            buffer: self.make_buffer_empty(len * 2),
+            len,
+            kind: Kind::Bf16,
+        }
+    }
+
+    fn download_bf16(&self, buf: &MetalBuffer) -> Vec<u16> {
+        self.sync();
+        if buf.kind != Kind::Bf16 {
+            return buf.to_vec().into_iter().map(crate::f32_to_bf16).collect();
+        }
+        let ptr = buf.buffer.contents() as *const u16;
+        unsafe { std::slice::from_raw_parts(ptr, buf.len) }.to_vec()
     }
 
     fn download(&self, buf: &MetalBuffer) -> Vec<f32> {
@@ -1166,6 +1230,10 @@ kernel void embedding(
                 false,
             );
         }
+        if k_cache.kind == Kind::Bf16 {
+            let (k, v) = (self.widen(k_cache), self.widen(v_cache));
+            return self.kv_attention(q, &k, &v, cache_start, q_len, n_heads, n_kv_heads, head_dim);
+        }
         let total_dim = n_heads * head_dim;
         let tg_size = std::cmp::min(head_dim as u64, 256).next_power_of_two();
 
@@ -1507,7 +1575,10 @@ kernel void embedding(
                 eps,
             );
         }
-        let pipeline = self.get_pipeline(llm_msl::FUSED_MSL, "attention_prep");
+        let pipeline = self.get_pipeline(
+            Self::kv_src(llm_msl::ATTN_PREP_MSL, k_cache, v_cache),
+            "attention_prep",
+        );
         let q = self.make_buffer_empty(seq * nh * hd * 4);
         let params = self.make_buffer_u32(&[
             seq as u32,
@@ -1958,6 +2029,15 @@ kernel void bias_add(
     }
 
     fn slice_buffer(&self, buf: &MetalBuffer, offset: usize, len: usize) -> MetalBuffer {
+        if buf.kind == Kind::Bf16 {
+            let dst = self.make_buffer_empty(len * 2);
+            self.copy_with("copy_u16", &buf.buffer, offset, &dst, 0, len);
+            return MetalBuffer {
+                buffer: dst,
+                len,
+                kind: Kind::Bf16,
+            };
+        }
         let dst = self.make_buffer_empty(len * 4);
         self.copy_f32(&buf.buffer, offset, &dst, 0, len);
         MetalBuffer {
@@ -1968,7 +2048,15 @@ kernel void bias_add(
     }
 
     fn write_into(&self, dst: &mut MetalBuffer, offset: usize, src: &MetalBuffer) {
-        self.copy_f32(&src.buffer, 0, &dst.buffer, offset, src.len);
+        assert!(offset + src.len <= dst.len, "write_into out of bounds");
+        let kernel = match (dst.kind, src.kind) {
+            (Kind::F32, Kind::F32) => "copy_f32",
+            (Kind::Bf16, Kind::Bf16) => "copy_u16",
+            (Kind::Bf16, Kind::F32) => "f32_to_bf16",
+            (Kind::F32, Kind::Bf16) => "bf16_to_f32",
+            (d, s) => panic!("write_into: can't copy {s:?} into {d:?}"),
+        };
+        self.copy_with(kernel, &src.buffer, 0, &dst.buffer, offset, src.len);
     }
 
     fn adamw_step(

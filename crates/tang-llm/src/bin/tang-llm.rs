@@ -10,7 +10,8 @@
 //! recently used to make room, and keeps 1 on CUDA. `TANG_KV_SLOTS` sets the default;
 //! `TANG_KV_BUDGET=<GB>` sets the memory cap (with any slot count). Keyed conversations' caches
 //! are also saved to `~/.cache/tang/kv/` after each turn and read back instead of prefilled;
-//! `TANG_KV_DISK=<GB>` caps that (default 8, 0 turns it off).
+//! `TANG_KV_DISK=<GB>` caps that (default 8, 0 turns it off). KV caches hold bf16 on the GPU
+//! (half of f32's memory; attention accumulates in f32); `TANG_KV_F32=1` keeps them f32.
 //! Speculative decoding (suffix drafts from the prompt and earlier completions, verified in one
 //! forward; outputs unchanged) is on for GPUs: `--no-speculate` or `TANG_SPECULATE=0` turns it
 //! off, `--speculate` forces it on. Earlier completions are kept in
@@ -476,7 +477,7 @@ fn serve_on<D: ComputeDevice + 'static>(
             eprintln!("tang-llm: draft store has {} tokens", s.global.tokens());
         }
         eprintln!(
-            "tang-llm: loaded {} in {:.1}s ({} ctx, {} KV slots{})",
+            "tang-llm: loaded {} in {:.1}s ({} ctx, {} KV slots{}; KV {} KiB a token, {})",
             dir.display(),
             t.elapsed().as_secs_f32(),
             e.context_window(),
@@ -484,7 +485,9 @@ fn serve_on<D: ComputeDevice + 'static>(
             budget.map_or(String::new(), |b| format!(
                 " within {:.1} GB",
                 b as f64 / 1e9
-            ))
+            )),
+            e.model.row_bytes() / 1024,
+            if e.model.kv_bf16() { "bf16" } else { "f32" },
         );
         Ok(e)
     })

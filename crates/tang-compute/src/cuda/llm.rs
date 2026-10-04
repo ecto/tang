@@ -5,10 +5,28 @@
 
 use cudarc::cublas::sys::cublasOperation_t;
 use cudarc::cublas::{Gemm, GemmConfig};
-use cudarc::driver::{CudaFunction, CudaSlice, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaFunction, CudaSlice, LaunchArgs, LaunchConfig, PushKernelArg};
 
 use super::{CudaBuffer, CudaComputeDevice, CudaStorage, Q4Weight};
 use crate::kernels::llm_cuda;
+
+/// Push a KV cache (f32 or bf16) as a kernel argument.
+fn kv_arg<'a>(lb: &mut LaunchArgs<'a>, b: &'a CudaBuffer) {
+    match b.storage() {
+        CudaStorage::F32(s) => lb.arg(s),
+        CudaStorage::Bf16(s) => lb.arg(s),
+        CudaStorage::Q4(_) => panic!("a KV cache is f32 or bf16"),
+    };
+}
+
+/// [`kv_arg`] for a cache the kernel writes.
+fn kv_arg_mut<'a>(lb: &mut LaunchArgs<'a>, b: &'a mut CudaBuffer) {
+    match b.storage_mut() {
+        CudaStorage::F32(s) => lb.arg(s),
+        CudaStorage::Bf16(s) => lb.arg(s),
+        CudaStorage::Q4(_) => panic!("a KV cache is f32 or bf16"),
+    };
+}
 
 /// One thread per element, 256 per block.
 fn per_elem(n: usize) -> LaunchConfig {
@@ -68,6 +86,39 @@ impl CudaComputeDevice {
         let (_module, f) = self.get_func(source, name);
         self.llm_funcs.borrow_mut().insert(name, f.clone());
         f
+    }
+
+    /// Kernel `name` from a KV-reading source (`llm_cuda::kv_source`), for f32 or bf16 caches.
+    fn kv_func(&self, source: &'static str, name: &'static str, bf16: bool) -> CudaFunction {
+        if !bf16 {
+            return self.llm_func(llm_cuda::kv_source(source, false), name);
+        }
+        let key: &'static str = {
+            use std::sync::Mutex;
+            static KEYS: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+            let want = format!("{name}/bf16");
+            let mut keys = KEYS.lock().unwrap();
+            match keys.iter().find(|k| **k == want) {
+                Some(k) => k,
+                None => {
+                    let k: &'static str = Box::leak(want.into_boxed_str());
+                    keys.push(k);
+                    k
+                }
+            }
+        };
+        if let Some(f) = self.llm_funcs.borrow().get(key) {
+            return f.clone();
+        }
+        let (_module, f) = self.get_func(llm_cuda::kv_source(source, true), name);
+        self.llm_funcs.borrow_mut().insert(key, f.clone());
+        f
+    }
+
+    /// Whether K and V caches are bf16 (they must agree).
+    fn kv_bf16(k: &CudaBuffer, v: &CudaBuffer) -> bool {
+        assert_eq!(k.is_bf16(), v.is_bf16(), "K and V caches differ in format");
+        k.is_bf16()
     }
 
     /// `buf` as f32 on device: itself, or a widened copy of bf16 activations.
@@ -507,32 +558,32 @@ impl CudaComputeDevice {
         pos: usize,
         eps: f32,
     ) -> Option<CudaBuffer> {
-        if qkv.is_bf16() || k_cache.is_bf16() || v_cache.is_bf16() || hd % 2 != 0 || hd > 256 {
+        if qkv.is_bf16() || hd % 2 != 0 || hd > 256 {
             return None;
         }
+        let bf16 = Self::kv_bf16(k_cache, v_cache);
         let kvd = nkv * hd;
         assert!(
             k_cache.len >= (pos + seq) * kvd && v_cache.len >= (pos + seq) * kvd,
             "KV cache too small"
         );
         let mut q = self.pool_alloc_uninit_f32(seq * nh * hd);
-        let f = self.llm_func(llm_cuda::FUSED_CUDA, "attention_prep");
+        let f = self.kv_func(llm_cuda::ATTN_PREP_CUDA, "attention_prep", bf16);
         let qn = q_norm.unwrap_or(qkv);
         let kn = k_norm.unwrap_or(qkv);
         let (nh_u, nkv_u, hd_u, pos_u) = (nh as u32, nkv as u32, hd as u32, pos as u32);
         let (has_qn, has_kn) = (q_norm.is_some() as u32, k_norm.is_some() as u32);
+        let mut lb = self.stream.launch_builder(&f);
+        lb.arg(qkv.f32_data())
+            .arg(qn.f32_data())
+            .arg(kn.f32_data())
+            .arg(cos.f32_data())
+            .arg(sin.f32_data())
+            .arg(q.f32_data_mut());
+        kv_arg_mut(&mut lb, k_cache);
+        kv_arg_mut(&mut lb, v_cache);
         unsafe {
-            self.stream
-                .launch_builder(&f)
-                .arg(qkv.f32_data())
-                .arg(qn.f32_data())
-                .arg(kn.f32_data())
-                .arg(cos.f32_data())
-                .arg(sin.f32_data())
-                .arg(q.f32_data_mut())
-                .arg(k_cache.f32_data_mut())
-                .arg(v_cache.f32_data_mut())
-                .arg(&nh_u)
+            lb.arg(&nh_u)
                 .arg(&nkv_u)
                 .arg(&hd_u)
                 .arg(&pos_u)
@@ -563,12 +614,10 @@ impl CudaComputeDevice {
             d <= 256 && nh % nkv == 0,
             "attention needs head_dim at most 256 and n_heads a multiple of n_kv_heads"
         );
-        let (mut tq, mut tk, mut tv) = (None, None, None);
-        let (q, k, v) = (
-            self.as_f32(q, &mut tq),
-            self.as_f32(k, &mut tk),
-            self.as_f32(v, &mut tv),
-        );
+        // K and V are read as stored (f32 or bf16); q is widened if it's bf16.
+        let mut tq = None;
+        let q = self.as_f32(q, &mut tq);
+        let bf16 = Self::kv_bf16(k, v);
         let longest = cache_start + q_len;
         assert!(k.len >= longest * nkv * d && v.len >= longest * nkv * d);
         let mut out = self.pool_alloc_uninit_f32(q_len * nh * d);
@@ -593,19 +642,19 @@ impl CudaComputeDevice {
                 (nh, nkv, d),
                 window,
                 bidir,
+                bf16,
             );
             return self.finish(out);
         }
         if q_len > 1 {
             let bq: u32 = if d <= 128 { 32 } else { 16 };
-            let f = self.llm_func(llm_cuda::ATTENTION_CUDA, "attn_prefill");
+            let f = self.kv_func(llm_cuda::ATTENTION_CUDA, "attn_prefill", bf16);
+            let mut lb = self.stream.launch_builder(&f);
+            lb.arg(q.f32_data());
+            kv_arg(&mut lb, k);
+            kv_arg(&mut lb, v);
             unsafe {
-                self.stream
-                    .launch_builder(&f)
-                    .arg(q.f32_data())
-                    .arg(k.f32_data())
-                    .arg(v.f32_data())
-                    .arg(out.f32_data_mut())
+                lb.arg(out.f32_data_mut())
                     .arg(&cs)
                     .arg(&ql)
                     .arg(&nh_u)
@@ -631,14 +680,13 @@ impl CudaComputeDevice {
         let split_len = span.div_ceil(n_splits);
         let mut partial = self.pool_alloc_uninit_f32(nh * n_splits * (d + 2));
         let (ns, sl, base_u) = (n_splits as u32, split_len as u32, base as u32);
-        let f = self.llm_func(llm_cuda::ATTENTION_CUDA, "attn_partial");
+        let f = self.kv_func(llm_cuda::ATTENTION_CUDA, "attn_partial", bf16);
+        let mut lb = self.stream.launch_builder(&f);
+        lb.arg(q.f32_data());
+        kv_arg(&mut lb, k);
+        kv_arg(&mut lb, v);
         unsafe {
-            self.stream
-                .launch_builder(&f)
-                .arg(q.f32_data())
-                .arg(k.f32_data())
-                .arg(v.f32_data())
-                .arg(partial.f32_data_mut())
+            lb.arg(partial.f32_data_mut())
                 .arg(&cs)
                 .arg(&ql)
                 .arg(&nh_u)
@@ -652,7 +700,7 @@ impl CudaComputeDevice {
                 .launch(blocks((nh, n_splits, 1), 256))
                 .unwrap();
         }
-        let f = self.llm_func(llm_cuda::ATTENTION_CUDA, "attn_combine");
+        let f = self.kv_func(llm_cuda::ATTENTION_CUDA, "attn_combine", false);
         unsafe {
             self.stream
                 .launch_builder(&f)
@@ -682,6 +730,7 @@ impl CudaComputeDevice {
         (nh, nkv, d): (usize, usize, usize),
         window: usize,
         bidir: bool,
+        bf16: bool,
     ) {
         let gqa_rows = q_len * (nh / nkv);
         let (name, rows, tile) = match (d <= 128, gqa_rows) {
@@ -714,14 +763,13 @@ impl CudaComputeDevice {
             bidir as u32,
         );
         let (ns, sl, base_u) = (n_splits as u32, split_len as u32, base as u32);
-        let f = self.llm_func(llm_cuda::ATTENTION_CUDA, name);
+        let f = self.kv_func(llm_cuda::ATTENTION_CUDA, name, bf16);
+        let mut lb = self.stream.launch_builder(&f);
+        lb.arg(q.f32_data());
+        kv_arg(&mut lb, k);
+        kv_arg(&mut lb, v);
         unsafe {
-            self.stream
-                .launch_builder(&f)
-                .arg(q.f32_data())
-                .arg(k.f32_data())
-                .arg(v.f32_data())
-                .arg(partial.f32_data_mut())
+            lb.arg(partial.f32_data_mut())
                 .arg(&cs)
                 .arg(&ql)
                 .arg(&nh_u)
@@ -735,7 +783,7 @@ impl CudaComputeDevice {
                 .launch(blocks((nkv, n_splits, groups), 256))
                 .unwrap();
         }
-        let f = self.llm_func(llm_cuda::ATTENTION_CUDA, "attn_combine");
+        let f = self.kv_func(llm_cuda::ATTENTION_CUDA, "attn_combine", false);
         unsafe {
             self.stream
                 .launch_builder(&f)
@@ -1009,7 +1057,26 @@ mod tests {
         close(&got, &want, 1e-3, "chunked q4 linear");
     }
 
-    fn attention_prep_vs_cpu<D: ComputeDevice>(g: &D) {
+    /// `x` rounded to bf16 (as f32).
+    fn bf16_round(x: &[f32]) -> Vec<f32> {
+        bf16_bits(x)
+            .iter()
+            .map(|&b| super::super::bf16_to_f32(b))
+            .collect()
+    }
+
+    /// A KV cache holding `x` (and room for `rows` elements): bf16 or f32.
+    fn kv_cache<D: ComputeDevice>(g: &D, x: &[f32], rows: usize, bf16: bool) -> D::Buffer {
+        if !bf16 {
+            return g.upload(x);
+        }
+        let mut b = g.alloc_bf16(rows.max(x.len()));
+        g.write_into(&mut b, 0, &g.upload(x));
+        b
+    }
+
+    /// With `bf16`, the GPU's caches are bf16 and the CPU's results are rounded to compare.
+    fn attention_prep_vs_cpu<D: ComputeDevice>(g: &D, bf16: bool) {
         let c = CpuDevice::new();
         for &(nh, nkv, hd, seq, pos, norms) in &[
             (4, 2, 128, 3, 5, true),
@@ -1024,7 +1091,11 @@ mod tests {
             let cache = max * nkv * hd;
             let run = |d: &dyn Fn() -> (Vec<f32>, Vec<f32>, Vec<f32>)| d();
             let got = run(&|| {
-                let (mut kc, mut vc) = (g.alloc(cache), g.alloc(cache));
+                let (mut kc, mut vc) = if bf16 {
+                    (g.alloc_bf16(cache), g.alloc_bf16(cache))
+                } else {
+                    (g.alloc(cache), g.alloc(cache))
+                };
                 let (qn, kn) = (g.upload(&qn), g.upload(&kn));
                 let q = g.attention_prep(
                     &g.upload(&qkv),
@@ -1057,16 +1128,25 @@ mod tests {
                     pos,
                     1e-6,
                 );
-                (c.download(&q), c.download(&kc), c.download(&vc))
+                let (k, v) = (c.download(&kc), c.download(&vc));
+                if bf16 {
+                    (c.download(&q), bf16_round(&k), bf16_round(&v))
+                } else {
+                    (c.download(&q), k, v)
+                }
             });
-            let what = format!("attention_prep nh={nh} nkv={nkv} hd={hd}");
+            let what = format!("attention_prep nh={nh} nkv={nkv} hd={hd} bf16={bf16}");
             close(&got.0, &want.0, 1e-4, &format!("{what} q"));
-            close(&got.1, &want.1, 1e-4, &format!("{what} k cache"));
+            // A k within 1e-4 can still round to the neighbouring bf16.
+            let k_tol = if bf16 { 8e-3 } else { 1e-4 };
+            close(&got.1, &want.1, k_tol, &format!("{what} k cache"));
             close(&got.2, &want.2, 0.0, &format!("{what} v cache"));
         }
     }
 
-    fn attention_vs_cpu<D: ComputeDevice>(g: &D) {
+    /// With `bf16`, K and V are bf16 caches on the GPU (rows rounded up to 32, as the model
+    /// allocates them) and bf16-rounded values on the CPU.
+    fn attention_vs_cpu<D: ComputeDevice>(g: &D, bf16: bool) {
         let c = CpuDevice::new();
         // (nh, nkv, hd, cache_start, q_len, window, causal)
         let cases = [
@@ -1091,12 +1171,16 @@ mod tests {
         for &(nh, nkv, hd, cs, ql, window, causal) in &cases {
             let total = cs + ql;
             let q = vals(ql * nh * hd, 13, 2.0);
-            let k = vals(total * nkv * hd, 14, 2.0);
-            let v = vals(total * nkv * hd, 15, 2.0);
+            let mut k = vals(total * nkv * hd, 14, 2.0);
+            let mut v = vals(total * nkv * hd, 15, 2.0);
+            if bf16 {
+                (k, v) = (bf16_round(&k), bf16_round(&v));
+            }
+            let rows = total.next_multiple_of(32) * nkv * hd;
             let got = g.download(&g.kv_attention_window(
                 &g.upload(&q),
-                &g.upload(&k),
-                &g.upload(&v),
+                &kv_cache(g, &k, rows, bf16),
+                &kv_cache(g, &v, rows, bf16),
                 cs,
                 ql,
                 (nh, nkv, hd),
@@ -1113,7 +1197,7 @@ mod tests {
                 window,
                 causal,
             ));
-            let what = format!("attention nh={nh} nkv={nkv} hd={hd} start={cs} len={ql} window={window} causal={causal}");
+            let what = format!("attention nh={nh} nkv={nkv} hd={hd} start={cs} len={ql} window={window} causal={causal} bf16={bf16}");
             close(&got, &want, 1e-4, &what);
         }
         // Vision tower shape (SigLIP: 16 heads of 72), smaller grid.
@@ -1300,12 +1384,14 @@ mod tests {
 
     #[test]
     fn cuda_attention_prep_vs_cpu() {
-        on_gpu(attention_prep_vs_cpu::<CudaComputeDevice>);
+        on_gpu(|g| attention_prep_vs_cpu(g, false));
+        on_gpu(|g| attention_prep_vs_cpu(g, true));
     }
 
     #[test]
     fn cuda_attention_vs_cpu() {
-        on_gpu(attention_vs_cpu::<CudaComputeDevice>);
+        on_gpu(|g| attention_vs_cpu(g, false));
+        on_gpu(|g| attention_vs_cpu(g, true));
     }
 
     #[test]
@@ -1333,14 +1419,18 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_attention_prep_vs_cpu() {
-        attention_prep_vs_cpu(&crate::MetalDevice::new().expect("no Metal device"));
+        let g = crate::MetalDevice::new().expect("no Metal device");
+        attention_prep_vs_cpu(&g, false);
+        attention_prep_vs_cpu(&g, true);
     }
 
     /// The same checks on Metal, so the harness itself is exercised on a Mac.
     #[cfg(feature = "metal")]
     #[test]
     fn metal_attention_vs_cpu() {
-        attention_vs_cpu(&crate::MetalDevice::new().expect("no Metal device"));
+        let g = crate::MetalDevice::new().expect("no Metal device");
+        attention_vs_cpu(&g, false);
+        attention_vs_cpu(&g, true);
     }
 
     /// The same checks on Metal, so the harness itself is exercised on a Mac.

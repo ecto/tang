@@ -50,10 +50,14 @@ pub struct Model<D: ComputeDevice> {
     /// The vision tower, for multimodal checkpoints.
     pub vision: Option<crate::vision::Vision<D::Buffer>>,
     max_ctx: usize,
+    /// New caches keep K and V in bf16 (half the memory of f32; attention still accumulates in
+    /// f32). Off where the device has no bf16 storage, or with `TANG_KV_F32=1`.
+    kv_bf16: bool,
 }
 
-/// Per-sequence attention state: K and V for every layer, `[cap, kv_dim]`, on device. It
-/// starts small and doubles as the sequence grows, up to the context window.
+/// Per-sequence attention state: K and V for every layer, `[cap, kv_dim]`, on device (bf16, or
+/// f32; see [`Model::set_kv_f32`]). It starts small and doubles as the sequence grows, up to
+/// the context window.
 /// Truncating keeps a prefix (later positions are simply overwritten), which is how a new
 /// request reuses the part of the conversation it shares with the last one.
 pub struct Cache<B> {
@@ -63,6 +67,8 @@ pub struct Cache<B> {
     cap: usize,
     /// Device memory per position, all layers' K and V.
     row_bytes: usize,
+    /// K and V are bf16 (else f32).
+    bf16: bool,
     /// Tokens already in the cache.
     pub len: usize,
     pub tokens: Vec<u32>,
@@ -220,6 +226,7 @@ impl<D: ComputeDevice> Model<D> {
             ropes.push((dev.upload(&cos), dev.upload(&sin)));
         }
         let embed_scale = gemma.then(|| bf16_round((cfg.hidden_size as f32).sqrt()));
+        let dev_bf16 = dev.bf16_storage();
         let vision = match &cfg.vision {
             Some(v) if w.has("vision_tower.vision_model.post_layernorm.weight") => {
                 Some(crate::vision::Vision::load(
@@ -243,20 +250,41 @@ impl<D: ComputeDevice> Model<D> {
             embed_scale,
             vision,
             max_ctx,
+            kv_bf16: dev_bf16 && !std::env::var("TANG_KV_F32").is_ok_and(|v| v == "1"),
         })
+    }
+
+    /// Keep caches made from now on in f32 instead of bf16 (for comparing the two).
+    pub fn set_kv_f32(&mut self, f32: bool) {
+        self.kv_bf16 = !f32 && self.dev.bf16_storage();
+    }
+
+    /// Whether new caches hold bf16 (else f32).
+    pub fn kv_bf16(&self) -> bool {
+        self.kv_bf16
     }
 
     pub fn max_ctx(&self) -> usize {
         self.max_ctx
     }
 
-    /// Device memory a [`Cache`] of `rows` positions takes (f32 K and V for every layer).
+    /// Device memory a [`Cache`] of `rows` positions takes (K and V for every layer).
     pub fn cache_bytes(&self, rows: usize) -> usize {
         rows.min(self.max_ctx).next_multiple_of(32) * self.row_bytes()
     }
 
-    fn row_bytes(&self) -> usize {
-        2 * self.layers.len() * self.cfg.kv_dim() * 4
+    /// Device memory per position: every layer's K and V, 2 bytes an element in bf16, else 4.
+    pub fn row_bytes(&self) -> usize {
+        self.row_elems() * if self.kv_bf16 { 2 } else { 4 }
+    }
+
+    /// One layer's K or V buffer of `n` elements, bf16 or f32.
+    fn kv_alloc(&self, bf16: bool, n: usize) -> D::Buffer {
+        if bf16 {
+            self.dev.alloc_bf16(n)
+        } else {
+            self.dev.alloc(n)
+        }
     }
 
     pub fn new_cache(&self) -> Cache<D::Buffer> {
@@ -264,8 +292,13 @@ impl<D: ComputeDevice> Model<D> {
         let cap = FIRST_ROWS.min(self.max_ctx).next_multiple_of(32);
         let n = cap * self.cfg.kv_dim();
         Cache {
-            k: (0..self.layers.len()).map(|_| self.dev.alloc(n)).collect(),
-            v: (0..self.layers.len()).map(|_| self.dev.alloc(n)).collect(),
+            k: (0..self.layers.len())
+                .map(|_| self.kv_alloc(self.kv_bf16, n))
+                .collect(),
+            v: (0..self.layers.len())
+                .map(|_| self.kv_alloc(self.kv_bf16, n))
+                .collect(),
+            bf16: self.kv_bf16,
             cap,
             row_bytes: self.row_bytes(),
             len: 0,
@@ -273,17 +306,17 @@ impl<D: ComputeDevice> Model<D> {
         }
     }
 
-    /// Floats per position in [`read_rows`](Self::read_rows): every layer's K and V.
-    pub fn row_floats(&self) -> usize {
+    /// Elements per position in [`read_rows`](Self::read_rows): every layer's K and V.
+    pub fn row_elems(&self) -> usize {
         2 * self.layers.len() * self.cfg.kv_dim()
     }
 
-    /// Positions `from..to` of `cache`, position-major: for each, every layer's K row then V
-    /// row.
-    pub fn read_rows(&self, cache: &Cache<D::Buffer>, from: usize, to: usize) -> Vec<f32> {
+    /// Positions `from..to` of `cache` as bf16 bits (exact for a bf16 cache, rounded from an f32
+    /// one), position-major: for each, every layer's K row then V row.
+    pub fn read_rows(&self, cache: &Cache<D::Buffer>, from: usize, to: usize) -> Vec<u16> {
         let kvd = self.cfg.kv_dim();
         let n = to - from;
-        let mut out = vec![0f32; n * self.row_floats()];
+        let mut out = vec![0u16; n * self.row_elems()];
         if n == 0 {
             return out;
         }
@@ -291,7 +324,7 @@ impl<D: ComputeDevice> Model<D> {
         for (j, buf) in bufs.enumerate() {
             let part = self
                 .dev
-                .download(&self.dev.slice_buffer(buf, from * kvd, n * kvd));
+                .download_bf16(&self.dev.slice_buffer(buf, from * kvd, n * kvd));
             for p in 0..n {
                 let at = (p * self.layers.len() * 2 + j) * kvd;
                 out[at..at + kvd].copy_from_slice(&part[p * kvd..(p + 1) * kvd]);
@@ -302,7 +335,7 @@ impl<D: ComputeDevice> Model<D> {
 
     /// Append positions to `cache`: `tokens`, with their rows as [`read_rows`](Self::read_rows)
     /// gives them.
-    pub fn write_rows(&self, cache: &mut Cache<D::Buffer>, tokens: &[u32], rows: &[f32]) {
+    pub fn write_rows(&self, cache: &mut Cache<D::Buffer>, tokens: &[u32], rows: &[u16]) {
         let kvd = self.cfg.kv_dim();
         let n = tokens.len();
         if n == 0 {
@@ -322,8 +355,8 @@ impl<D: ComputeDevice> Model<D> {
                 let from = (p * layers * 2 + j) * kvd;
                 part.extend_from_slice(&rows[from..from + kvd]);
             }
-            // In the cache's own precision (bf16 on CUDA in mixed precision).
-            self.dev.write_into(buf, at, &self.dev.upload(&part));
+            // Widened on the way in if the cache is f32.
+            self.dev.write_into(buf, at, &self.dev.upload_bf16(&part));
         }
         cache.len += n;
         cache.tokens.extend_from_slice(tokens);
@@ -343,7 +376,7 @@ impl<D: ComputeDevice> Model<D> {
         let kvd = self.cfg.kv_dim();
         let used = cache.len * kvd;
         for buf in cache.k.iter_mut().chain(cache.v.iter_mut()) {
-            let mut grown = self.dev.alloc(cap * kvd);
+            let mut grown = self.kv_alloc(cache.bf16, cap * kvd);
             if used > 0 {
                 let old = self.dev.slice_buffer(buf, 0, used);
                 self.dev.write_into(&mut grown, 0, &old);

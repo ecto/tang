@@ -836,6 +836,15 @@ impl CudaComputeDevice {
                 let mut view = d.try_slice_mut(offset..offset + src_len).unwrap();
                 self.stream.memcpy_dtod(s, &mut view).unwrap();
             }
+            // Across formats (a bf16 KV cache written from f32 rows, or read back): convert.
+            (CudaStorage::Bf16(_), CudaStorage::F32(_)) => {
+                let conv = self.convert_f32_to_bf16(src);
+                self.write_into(dst, offset, &conv);
+            }
+            (CudaStorage::F32(_), CudaStorage::Bf16(_)) => {
+                let conv = self.convert_bf16_to_f32(src);
+                self.write_into(dst, offset, &conv);
+            }
             _ => panic!("write_into: mismatched storage types"),
         }
     }
@@ -4059,6 +4068,21 @@ impl ComputeDevice for CudaComputeDevice {
 
     fn upload_bf16(&self, bits: &[u16]) -> CudaBuffer {
         self.upload_bf16_impl(bits)
+    }
+
+    fn bf16_storage(&self) -> bool {
+        true
+    }
+
+    fn alloc_bf16(&self, len: usize) -> CudaBuffer {
+        self.pool_alloc_bf16(len)
+    }
+
+    fn download_bf16(&self, buf: &CudaBuffer) -> Vec<u16> {
+        match buf.storage() {
+            CudaStorage::Bf16(s) => self.stream.memcpy_dtov(s).unwrap(),
+            _ => buf.to_vec().into_iter().map(f32_to_bf16).collect(),
+        }
     }
 
     fn upload_q4(
