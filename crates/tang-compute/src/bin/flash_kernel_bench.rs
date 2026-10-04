@@ -495,7 +495,7 @@ fn window(
                 t,
                 eps,
             );
-            launches += 3;
+            launches += if unfused() { 3 } else { 1 };
         }
         if on(Class::Dense) {
             g.q4x_linear_into(&s.xq, &layer.w_in, &mut s.proj, t, HIDDEN, layer.in_rows);
@@ -644,7 +644,7 @@ fn window(
                 t,
                 eps,
             );
-            launches += 3;
+            launches += if unfused() { 3 } else { 1 };
         }
         if on(Class::Dense) {
             g.linear_into(&s.x2, &layer.router, &mut s.logits, t, HIDDEN, ROUTER_ROWS);
@@ -692,7 +692,7 @@ fn window(
             t,
             eps,
         );
-        launches += 3;
+        launches += if unfused() { 3 } else { 1 };
     }
     if on(Class::Dense) {
         g.q4x_linear_into(&s.xq, &m.head, &mut s.head, t, HIDDEN, VOCAB);
@@ -840,7 +840,13 @@ fn run_window(g: &CudaComputeDevice, ts: &[usize]) {
 
 fn window_launches(c: Class) -> usize {
     match c {
-        Class::Hc => 96 * 3 + 3,
+        Class::Hc => {
+            if unfused() {
+                97 * 3
+            } else {
+                97
+            }
+        }
         Class::Dense => 48 * 3 + 1,
         Class::Gdn => 36,
         Class::Qsa => 12 * 5,
