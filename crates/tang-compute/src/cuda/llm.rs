@@ -39,7 +39,7 @@ const SMALL_GEMM_ROWS: usize = 32;
 const SMALL_ATTN_ROWS: usize = 32;
 
 /// Streaming multiprocessors on the current device (for sizing split-KV / split-K grids).
-fn sm_count() -> usize {
+pub(super) fn sm_count() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
         use cudarc::driver::sys;

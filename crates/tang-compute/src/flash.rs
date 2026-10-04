@@ -193,26 +193,107 @@ pub fn q2_repack(raw: &[u8], n: usize, k: usize) -> Vec<u8> {
     out
 }
 
-/// One routed expert's blob: three repacked ([`q2_repack`]) Q2_0 matrices back to back,
-/// `gate [FF, HIDDEN] | up [FF, HIDDEN] | down [HIDDEN, FF]`, 1,382,400 bytes. A blob may live
+/// Position of chunk element `i` (< 32) in a repacked Q4X chunk (16 bytes): (byte, shift).
+/// Code word `w` (< 4) of the chunk holds, at nibble `2b + s`, the element whose int8
+/// activation sits in byte `b` of [`QAct`] word `2w + s`, so `(w >> 4s) & 0x0f0f0f0f` pairs
+/// with the activation words in order, as Q2_0's fields do.
+pub fn q4x_slot(i: usize) -> (usize, u32) {
+    let (h, b, f) = (i / 16, (i % 16) / 4, i % 4);
+    let j = 4 * h + f;
+    let nib = 2 * b + j % 2;
+    ((j / 2) * 4 + nib / 2, 4 * (nib % 2) as u32)
+}
+
+/// Repack tang-Q4 (MLX affine, group 64: `packed [n][k/8]` u32 low nibble first, `scales`,
+/// `biases` `[n][k/64]` bf16; `w = scale · q + bias`) into Q4X for the int8-activation GEMV:
+/// `[n][k/2]` code bytes in [`q4x_slot`] order, then the scales plane, then the biases plane
+/// (bf16 bits, little-endian). 4.5 bits per weight, as tang-Q4.
+pub fn q4x_repack(packed: &[u32], scales: &[u16], biases: &[u16], n: usize, k: usize) -> Vec<u8> {
+    assert!(k.is_multiple_of(64) && packed.len() == n * k / 8);
+    assert!(scales.len() == n * k / 64 && biases.len() == n * k / 64);
+    let mut out = vec![0u8; n * k / 2 + 4 * n * k / 64];
+    for r in 0..n {
+        for e in 0..k {
+            let q = ((packed[(r * k + e) / 8] >> (4 * (e % 8))) & 0xf) as u8;
+            let (byte, sh) = q4x_slot(e % 32);
+            out[r * k / 2 + (e / 32) * 16 + byte] |= q << sh;
+        }
+    }
+    let sp = n * k / 2;
+    for (i, (&s, &b)) in scales.iter().zip(biases).enumerate() {
+        out[sp + 2 * i..sp + 2 * i + 2].copy_from_slice(&s.to_le_bytes());
+        let bp = sp + 2 * (n * k / 64) + 2 * i;
+        out[bp..bp + 2].copy_from_slice(&b.to_le_bytes());
+    }
+    out
+}
+
+/// One routed expert's blob, 1,382,400 bytes (the three GGUF Q2_0 matrices' bytes,
+/// rearranged), laid out so a warp's 16-byte-per-lane loads are coalesced and every lane stays
+/// on one row:
+///
+/// ```text
+/// GU_CODES    320 tiles × [40 cols][4 rows] × 16 B   gate/up rows interleaved: gu row 2r = gate r,
+/// GU_SCALES   320 tiles × [40 cols][4 rows] × fp16   2r + 1 = up r; tile i = gu rows 4i .. 4i + 4
+/// DOWN_CODES  160 tiles × [10 cols][16 rows] × 16 B  down rows, tile i = rows 16i .. 16i + 16
+/// DOWN_SCALES 160 tiles × [10 cols][16 rows] × fp16
+/// ```
+///
+/// A "col" is one GGUF Q2_0 block (64 weights: its 16 code bytes, its fp16 `d`). A blob may live
 /// in VRAM or in device-mapped host memory; the kernels only see its address.
 pub struct ExpertBlob;
 
 impl ExpertBlob {
-    /// Byte offset of the gate matrix.
-    pub const GATE: usize = 0;
-    /// Byte offset of the up matrix.
-    pub const UP: usize = FF * HIDDEN / 64 * Q2_BLOCK_BYTES;
-    /// Byte offset of the down matrix.
-    pub const DOWN: usize = 2 * Self::UP;
+    /// Gate/up code tiles.
+    pub const GU_CODES: usize = 0;
+    /// Gate/up scale tiles.
+    pub const GU_SCALES: usize = 2 * FF * HIDDEN / 4;
+    /// Down code tiles.
+    pub const DOWN_CODES: usize = Self::GU_SCALES + 2 * FF * HIDDEN / 64 * 2;
+    /// Down scale tiles.
+    pub const DOWN_SCALES: usize = Self::DOWN_CODES + HIDDEN * FF / 4;
     /// Blob size.
-    pub const BYTES: usize = 3 * Self::UP;
+    pub const BYTES: usize = Self::DOWN_SCALES + HIDDEN * FF / 64 * 2;
 
-    /// Build a blob from the three GGUF Q2_0 tensors of one expert.
+    /// Byte offsets of (codes, scale) of gu row `row` (2r gate r, 2r + 1 up r), block `c`.
+    pub fn gu_block(row: usize, c: usize) -> (usize, usize) {
+        let (tile, r) = (row / 4, row % 4);
+        let i = tile * 160 + c * 4 + r;
+        (Self::GU_CODES + 16 * i, Self::GU_SCALES + 2 * i)
+    }
+
+    /// Byte offsets of (codes, scale) of down row `row`, block `c`.
+    pub fn down_block(row: usize, c: usize) -> (usize, usize) {
+        let (tile, r) = (row / 16, row % 16);
+        let i = tile * 160 + c * 16 + r;
+        (Self::DOWN_CODES + 16 * i, Self::DOWN_SCALES + 2 * i)
+    }
+
+    /// Build a blob from the three GGUF Q2_0 tensors of one expert (`gate`, `up` `[FF, HIDDEN]`,
+    /// `down` `[HIDDEN, FF]`).
     pub fn from_gguf(gate: &[u8], up: &[u8], down: &[u8]) -> Vec<u8> {
-        let mut b = q2_repack(gate, FF, HIDDEN);
-        b.extend(q2_repack(up, FF, HIDDEN));
-        b.extend(q2_repack(down, HIDDEN, FF));
+        assert!(gate.len() == q2_bytes(FF, HIDDEN) && up.len() == gate.len());
+        assert_eq!(down.len(), q2_bytes(HIDDEN, FF));
+        let mut b = vec![0u8; Self::BYTES];
+        let mut put = |(co, so): (usize, usize), blk: &[u8]| {
+            b[so..so + 2].copy_from_slice(&blk[..2]);
+            b[co..co + 16].copy_from_slice(&blk[2..18]);
+        };
+        let nb = HIDDEN / 64;
+        for r in 0..FF {
+            for c in 0..nb {
+                let o = (r * nb + c) * Q2_BLOCK_BYTES;
+                put(Self::gu_block(2 * r, c), &gate[o..o + 18]);
+                put(Self::gu_block(2 * r + 1, c), &up[o..o + 18]);
+            }
+        }
+        let nb = FF / 64;
+        for r in 0..HIDDEN {
+            for c in 0..nb {
+                let o = (r * nb + c) * Q2_BLOCK_BYTES;
+                put(Self::down_block(r, c), &down[o..o + 18]);
+            }
+        }
         b
     }
 }
@@ -256,13 +337,9 @@ impl MoePlan {
     pub const SHARED_ROW: usize = MAX_T * TOPK;
     /// Rows of `parts` ([`HIDDEN`] floats each).
     pub const PARTS_ROWS: usize = Self::CAP;
-    /// Words of `moe_grouped_into` scratch: the int8 SwiGLU activations of every entry.
+    /// Words of `moe_grouped_into` scratch: the SwiGLU activations of every entry, f32.
     pub fn scratch_words() -> usize {
-        QAct {
-            m: Self::CAP,
-            k: FF,
-        }
-        .words()
+        Self::CAP * FF
     }
 }
 
@@ -318,7 +395,9 @@ pub const GDN_HIST: usize = (GDN_TAPS - 1) * GDN_CONV;
 /// One hyper-connection read's weights (bf16 except `norm`).
 ///
 /// - `norm` `[HC · HIDDEN]` f32 (`hc_*_norm`, stored as `1 + w`)
-/// - `down` `[HC_LR][HC · HIDDEN]`, `up` `[HC · HIDDEN][HC_LR]`
+/// - `down` `[HC_LR][HC · HIDDEN]` (GGUF order)
+/// - `up`: GGUF `[HC · HIDDEN][HC_LR]` repacked by [`hc_up_repack`], so the four rows that gate
+///   one output column interleave at 8-value granularity
 /// - `inject` `[HC][HC · HIDDEN]`, or `None` for the final read before the head.
 pub struct HcWeights<'a, B> {
     /// Per-stream RMSNorm weight.
@@ -329,6 +408,58 @@ pub struct HcWeights<'a, B> {
     pub up: &'a B,
     /// Injection rows.
     pub inject: Option<&'a B>,
+}
+
+/// A write still owed to the residual, applied by `hc_read_into` before it reads (the fused
+/// write-then-read). Both forms are bitwise the separate ops: `Write` is `hc_write(r, y, inj)`,
+/// `Moe` is `moe_combine_into(parts, w, logits, stride, sg)` then that write.
+pub enum HcPending<'a, B> {
+    /// `r[t][c] += y[t] · 2σ(inj[t][c] / HC)`.
+    Write {
+        /// The block output `[t][HIDDEN]`.
+        y: &'a B,
+        /// Its injection `[t][HC]`.
+        inj: &'a B,
+    },
+    /// The same with `y` the MoE combine of `parts`.
+    Moe {
+        /// Expert outputs ([`MoePlan::PARTS_ROWS`] rows).
+        parts: &'a B,
+        /// Router weights `[t][TOPK]`.
+        w: &'a B,
+        /// Router logits `[t][stride]` (for the shared-expert gate).
+        logits: &'a B,
+        /// Row stride of `logits`.
+        stride: usize,
+        /// Shared-gate column, or `None` without a shared expert.
+        sg: Option<usize>,
+        /// Injection `[t][HC]`.
+        inj: &'a B,
+    },
+}
+
+/// Repack a hyper-connection up projection (bf16 bits, GGUF `[HC · HIDDEN][HC_LR]`, row
+/// `c · HIDDEN + d`) for `hc_read_into`: for each output column `d`, its four rows' 8-value
+/// groups interleaved, `out[((d · 40 + p) · 4 + c) · 8 + e] = up[(c · HIDDEN + d) · 320 + 8p + e]`.
+pub fn hc_up_repack(up: &[u16]) -> Vec<u16> {
+    assert_eq!(up.len(), HC * HIDDEN * HC_LR);
+    let mut out = vec![0u16; up.len()];
+    for d in 0..HIDDEN {
+        for p in 0..HC_LR / 8 {
+            for c in 0..HC {
+                let src = (c * HIDDEN + d) * HC_LR + 8 * p;
+                let dst = ((d * (HC_LR / 8) + p) * HC + c) * 8;
+                out[dst..dst + 8].copy_from_slice(&up[src..src + 8]);
+            }
+        }
+    }
+    out
+}
+
+/// Index of GGUF up element (`row` = `c · HIDDEN + d`, `k`) in the [`hc_up_repack`] layout.
+pub fn hc_up_index(row: usize, k: usize) -> usize {
+    let (c, d) = (row / HIDDEN, row % HIDDEN);
+    ((d * (HC_LR / 8) + k / 8) * HC + c) * 8 + k % 8
 }
 
 /// Words of `hc_read_into` scratch for a window of `t`: normalized streams `[t][HC·HIDDEN]`

@@ -1185,24 +1185,79 @@ pub trait ComputeDevice: Send {
         *out = self.upload_f32(&y);
     }
 
+    /// Upload tang-Q4 weights (`upload_q4`'s arrays, group 64) repacked as Q4X
+    /// ([`crate::flash::q4x_repack`]) for [`q4x_linear_into`](Self::q4x_linear_into), the
+    /// int8-activation path. Only that op reads it.
+    fn upload_q4x(
+        &self,
+        packed: &[u32],
+        scales: &[u16],
+        biases: &[u16],
+        n: usize,
+        k: usize,
+    ) -> Self::Buffer {
+        self.upload_bytes(&crate::flash::q4x_repack(packed, scales, biases, n, k))
+    }
+
+    /// `out[m, n] = W · x̂` for a Q4X weight `[n, k]` and int8 activations (`m <= 8`): per
+    /// chunk `fma(d_x, fma(scale, Σ q·x̂, bias · Σ x̂), acc)`; chunk summation order is the
+    /// backend's. Same weights as tang-Q4 `linear`, but int8 activations (as llama.cpp's MMVQ).
+    fn q4x_linear_into(
+        &self,
+        xq: &Self::Buffer,
+        w: &Self::Buffer,
+        out: &mut Self::Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        let (xq, w) = (self.download(xq), self.download(w));
+        let wb: Vec<u8> = w.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+        let y = crate::cpu::flash::q4x_linear(&crate::flash::u32s(&xq), &wb, m, k, n);
+        *out = self.upload_f32(&y);
+    }
+
     /// Hyper-connection read for a window of `t` tokens: `r` is `[t][HC][HIDDEN]`; writes
-    /// `x [t][HIDDEN]` and, when `w.inject` is set, `inj [t][HC]`. With `pending = (y, inj_prev)`
-    /// it first applies that write to `r` in place (the fused write-then-read, bitwise
-    /// [`hc_write`](Self::hc_write) then this). `scratch`: [`crate::flash::hc_scratch_words`].
+    /// `x [t][HIDDEN]`, `xq` (when given) the same as int8 activations
+    /// (`QAct { m: t, k: HIDDEN }`), and, when `w.inject` is set, `inj [t][HC]`. A `pending`
+    /// write is applied to `r` first ([`crate::flash::HcPending`]: bitwise the separate ops).
+    /// `scratch`: [`crate::flash::hc_scratch_words`].
     #[allow(clippy::too_many_arguments)]
     fn hc_read_into(
         &self,
         r: &mut Self::Buffer,
-        pending: Option<(&Self::Buffer, &Self::Buffer)>,
+        pending: Option<crate::flash::HcPending<'_, Self::Buffer>>,
         w: &crate::flash::HcWeights<'_, Self::Buffer>,
         x: &mut Self::Buffer,
+        xq: Option<&mut Self::Buffer>,
         inj: Option<&mut Self::Buffer>,
         _scratch: &mut Self::Buffer,
         t: usize,
         eps: f32,
     ) {
+        use crate::flash::HcPending;
         let mut rv = self.download(r);
-        let pend = pending.map(|(y, i)| (self.download(y), self.download(i)));
+        let pend = pending.map(|p| match p {
+            HcPending::Write { y, inj } => (self.download(y), self.download(inj)),
+            HcPending::Moe {
+                parts,
+                w,
+                logits,
+                stride,
+                sg,
+                inj,
+            } => {
+                let y = crate::cpu::flash::moe_combine(
+                    &self.download(parts),
+                    &self.download(w),
+                    &self.download(logits),
+                    stride,
+                    sg,
+                    t,
+                );
+                (y, self.download(inj))
+            }
+        });
         let (xv, iv) = crate::cpu::flash::hc_read(
             &mut rv,
             pend.as_ref().map(|(y, i)| (&y[..], &i[..])),
@@ -1214,6 +1269,13 @@ pub trait ComputeDevice: Send {
             eps,
         );
         *r = self.upload_f32(&rv);
+        if let Some(xq) = xq {
+            *xq = self.upload_u32(&crate::cpu::flash::quantize_act(
+                &xv,
+                t,
+                crate::flash::shape::HIDDEN,
+            ));
+        }
         *x = self.upload_f32(&xv);
         if let Some(inj) = inj {
             *inj = self.upload_f32(&iv);
@@ -1269,7 +1331,8 @@ pub trait ComputeDevice: Send {
 
     /// The GDN recurrence and gated output norm for a window ([`crate::flash::GDN_STATE`] for
     /// the math): `h` from [`gdn_conv_into`](Self::gdn_conv_into), `z`, `a`, `b` from the
-    /// stacked projection `proj`; writes `y [t][GDN_V]` for the tokens it runs.
+    /// stacked projection `proj`; writes `y [t][GDN_V]` for the tokens it runs, and `yq` (when
+    /// given) the same rows as int8 activations (`QAct { m: t, k: GDN_V }`).
     #[allow(clippy::too_many_arguments)]
     fn gdn_step(
         &self,
@@ -1279,6 +1342,7 @@ pub trait ComputeDevice: Send {
         stride: usize,
         p: &crate::flash::GdnParams<'_, Self::Buffer>,
         y: &mut Self::Buffer,
+        yq: Option<&mut Self::Buffer>,
         t: usize,
         mode: crate::flash::GdnMode<'_, Self::Buffer>,
         eps: f32,
@@ -1312,11 +1376,23 @@ pub trait ComputeDevice: Send {
         let mut yv = self.download(y);
         let n = n_run * crate::flash::shape::GDN_V;
         yv[..n].copy_from_slice(&out[..n]);
+        if let Some(yq) = yq {
+            let mut q = crate::flash::u32s(&self.download(yq));
+            let l = crate::flash::QAct {
+                m: t,
+                k: crate::flash::shape::GDN_V,
+            };
+            q.resize(l.words(), 0);
+            crate::cpu::flash::quantize_act_rows(&out, l, 0, n_run, &mut q);
+            *yq = self.upload_u32(&q);
+        }
         *y = self.upload_f32(&yv);
     }
 
     /// MoE router for a window: `logits [t][stride]` (experts in columns `0..n_expert`); writes
-    /// `ids [t][TOPK]` (u32) and `w [t][TOPK]` per `cpu::flash::router_topk`'s contract.
+    /// `ids [t][TOPK]` (u32): the top `TOPK` by (logit desc, index asc); and `w [t][TOPK]`:
+    /// `e_k / Σ_top e_j`, `e_k = exp(l_k − l_max)` in f64 summed in rank order, which is the
+    /// full softmax renormalised over the top k with the 2^-14 clamp (unreachable for 10 of 512).
     fn router_topk_into(
         &self,
         logits: &Self::Buffer,
@@ -1354,6 +1430,27 @@ pub trait ComputeDevice: Send {
             t,
         );
         *plan = self.upload_u32(&p);
+    }
+
+    /// Router and plan in one step: [`router_topk_into`](Self::router_topk_into) into `ids` and
+    /// `w`, then [`moe_plan_into`](Self::moe_plan_into) from those ids, or from `forced` (a
+    /// recorded routing `[t][TOPK]`, for replays and benchmarks) when given.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_route_into(
+        &self,
+        logits: &Self::Buffer,
+        stride: usize,
+        n_expert: usize,
+        forced: Option<&Self::Buffer>,
+        table: &Self::Buffer,
+        shared: u64,
+        ids: &mut Self::Buffer,
+        w: &mut Self::Buffer,
+        plan: &mut Self::Buffer,
+        t: usize,
+    ) {
+        self.router_topk_into(logits, stride, n_expert, ids, w, t);
+        self.moe_plan_into(forced.unwrap_or(ids), table, shared, plan, t);
     }
 
     /// Evaluate the planned experts into `parts` ([`crate::flash::MoePlan::PARTS_ROWS`] rows of
@@ -1487,7 +1584,7 @@ pub trait ComputeDevice: Send {
     }
 
     /// QSA attention over the selected cells with the sigmoid output gate (read from `proj`):
-    /// writes `out [t][QSA_OUT]`. `scratch`: [`crate::flash::qsa_attend_scratch_words`].
+    /// writes `out [t][QSA_OUT]` and `outq` (when given) as int8 activations. `scratch`: [`crate::flash::qsa_attend_scratch_words`].
     #[allow(clippy::too_many_arguments)]
     fn qsa_attend_into(
         &self,
@@ -1500,6 +1597,7 @@ pub trait ComputeDevice: Send {
         win: &Self::Buffer,
         _scratch: &mut Self::Buffer,
         out: &mut Self::Buffer,
+        outq: Option<&mut Self::Buffer>,
         t: usize,
     ) {
         let pos0 = self.download(win)[crate::flash::Win::POS0].to_bits() as usize;
@@ -1513,6 +1611,13 @@ pub trait ComputeDevice: Send {
             pos0,
             t,
         );
+        if let Some(q) = outq {
+            *q = self.upload_u32(&crate::cpu::flash::quantize_act(
+                &o,
+                t,
+                crate::flash::shape::QSA_OUT,
+            ));
+        }
         *out = self.upload_f32(&o);
     }
 

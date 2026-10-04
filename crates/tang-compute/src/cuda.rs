@@ -4121,18 +4121,31 @@ impl ComputeDevice for CudaComputeDevice {
         self.q2_linear_impl(xq, w, out, m, k, n)
     }
 
+    fn q4x_linear_into(
+        &self,
+        xq: &CudaBuffer,
+        w: &CudaBuffer,
+        out: &mut CudaBuffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        self.q4x_linear_impl(xq, w, out, m, k, n)
+    }
+
     fn hc_read_into(
         &self,
         r: &mut CudaBuffer,
-        pending: Option<(&CudaBuffer, &CudaBuffer)>,
+        pending: Option<crate::flash::HcPending<'_, CudaBuffer>>,
         w: &crate::flash::HcWeights<'_, CudaBuffer>,
         x: &mut CudaBuffer,
+        xq: Option<&mut CudaBuffer>,
         inj: Option<&mut CudaBuffer>,
         scratch: &mut CudaBuffer,
         t: usize,
         eps: f32,
     ) {
-        self.hc_read_impl(r, pending, w, x, inj, scratch, t, eps)
+        self.hc_read_impl(r, pending, w, x, xq, inj, scratch, t, eps)
     }
 
     fn hc_write(&self, r: &mut CudaBuffer, y: &CudaBuffer, inj: &CudaBuffer, t: usize) {
@@ -4171,11 +4184,12 @@ impl ComputeDevice for CudaComputeDevice {
         stride: usize,
         p: &crate::flash::GdnParams<'_, CudaBuffer>,
         y: &mut CudaBuffer,
+        yq: Option<&mut CudaBuffer>,
         t: usize,
         mode: crate::flash::GdnMode<'_, CudaBuffer>,
         eps: f32,
     ) {
-        self.gdn_step_impl(state, h, proj, stride, p, y, t, mode, eps)
+        self.gdn_step_impl(state, h, proj, stride, p, y, yq, t, mode, eps)
     }
 
     fn router_topk_into(
@@ -4199,6 +4213,24 @@ impl ComputeDevice for CudaComputeDevice {
         t: usize,
     ) {
         self.moe_plan_impl(ids, table, shared, plan, t)
+    }
+
+    fn moe_route_into(
+        &self,
+        logits: &CudaBuffer,
+        stride: usize,
+        n_expert: usize,
+        forced: Option<&CudaBuffer>,
+        table: &CudaBuffer,
+        shared: u64,
+        ids: &mut CudaBuffer,
+        w: &mut CudaBuffer,
+        plan: &mut CudaBuffer,
+        t: usize,
+    ) {
+        self.moe_route_impl(
+            logits, stride, n_expert, forced, table, shared, ids, w, plan, t,
+        )
     }
 
     unsafe fn moe_grouped_into(
@@ -4264,9 +4296,12 @@ impl ComputeDevice for CudaComputeDevice {
         win: &CudaBuffer,
         scratch: &mut CudaBuffer,
         out: &mut CudaBuffer,
+        outq: Option<&mut CudaBuffer>,
         t: usize,
     ) {
-        self.qsa_attend_impl(q, k_cache, v_cache, ids, proj, stride, win, scratch, out, t)
+        self.qsa_attend_impl(
+            q, k_cache, v_cache, ids, proj, stride, win, scratch, out, outq, t,
+        )
     }
 
     fn upload_q4(

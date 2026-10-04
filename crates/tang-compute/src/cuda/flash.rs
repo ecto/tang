@@ -6,8 +6,13 @@ use cudarc::driver::{CudaFunction, DevicePtr, LaunchConfig, PushKernelArg};
 
 use super::{CudaBuffer, CudaComputeDevice, CudaStorage, Q2Weight};
 use crate::flash::shape::*;
-use crate::flash::{GdnMode, GdnParams, HcWeights, MoePlan, QAct, QsaCache, QsaNorms, MAX_T};
+use crate::flash::{
+    GdnMode, GdnParams, HcPending, HcWeights, MoePlan, QAct, QsaCache, QsaNorms, MAX_T,
+};
 use crate::kernels::flash_cuda::FLASH_CUDA;
+
+/// A null device pointer for kernel arguments a mode never reads.
+const NULL: u64 = 0;
 
 fn grid(g: (usize, usize, usize), threads: u32) -> LaunchConfig {
     LaunchConfig {
@@ -17,8 +22,39 @@ fn grid(g: (usize, usize, usize), threads: u32) -> LaunchConfig {
     }
 }
 
-/// Q2 GEMV rows per warp × warps per block.
-const Q2_ROWS_PER_BLOCK: usize = 16;
+const GEMV_FMTS: [&str; 3] = ["bf16_gemv", "q2_gemv", "q4x_gemv"];
+const GEMV_NAMES: [[&str; 8]; 3] = [
+    [
+        "fl_bf16_gemv_t1",
+        "fl_bf16_gemv_t2",
+        "fl_bf16_gemv_t3",
+        "fl_bf16_gemv_t4",
+        "fl_bf16_gemv_t5",
+        "fl_bf16_gemv_t6",
+        "fl_bf16_gemv_t7",
+        "fl_bf16_gemv_t8",
+    ],
+    [
+        "fl_q2_gemv_t1",
+        "fl_q2_gemv_t2",
+        "fl_q2_gemv_t3",
+        "fl_q2_gemv_t4",
+        "fl_q2_gemv_t5",
+        "fl_q2_gemv_t6",
+        "fl_q2_gemv_t7",
+        "fl_q2_gemv_t8",
+    ],
+    [
+        "fl_q4x_gemv_t1",
+        "fl_q4x_gemv_t2",
+        "fl_q4x_gemv_t3",
+        "fl_q4x_gemv_t4",
+        "fl_q4x_gemv_t5",
+        "fl_q4x_gemv_t6",
+        "fl_q4x_gemv_t7",
+        "fl_q4x_gemv_t8",
+    ],
+];
 
 impl CudaComputeDevice {
     /// Kernel `name` of `FLASH_CUDA` (compiled once for sm_86, as the tensor-core kernels are:
@@ -95,20 +131,8 @@ impl CudaComputeDevice {
                         .unwrap();
                 }
             }
-            CudaStorage::Bf16(s) if direct => {
-                let f = self.llm_func(crate::kernels::llm_cuda::GEMV_CUDA, "gemv_bf16");
-                unsafe {
-                    self.stream
-                        .launch_builder(&f)
-                        .arg(x.f32_data())
-                        .arg(s)
-                        .arg(out.f32_data_mut())
-                        .arg(&mu)
-                        .arg(&ku)
-                        .arg(&nu)
-                        .launch(cfg)
-                        .unwrap();
-                }
+            CudaStorage::Bf16(s) if direct && k.is_multiple_of(8) && m >= 1 => {
+                self.gemv_rows("bf16_gemv", Some(x), None, s, out, m, k, n);
             }
             _ => {
                 let y = self.linear(x, w, m, k, n);
@@ -139,6 +163,52 @@ impl CudaComputeDevice {
         }
     }
 
+    /// Launch `fl_{name}_t{m}` (the multi-column GEMV) for `[n, k]` weights at `w`.
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_rows(
+        &self,
+        name: &str,
+        x: Option<&CudaBuffer>,
+        xq: Option<&CudaBuffer>,
+        w: &cudarc::driver::CudaSlice<impl cudarc::driver::DeviceRepr>,
+        out: &mut CudaBuffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        assert!((1..=MAX_T).contains(&m) && out.len >= m * n);
+        // Split K over 1..8 warps until there are ~2 blocks per SM, keeping 32+ weight vectors
+        // per warp (4 rows a warp, 8 / ks row groups a 256-thread block).
+        let epv = match name {
+            "bf16_gemv" => 8,
+            "q2_gemv" => 64,
+            _ => 32,
+        };
+        let mut ks = 1;
+        while ks < 8
+            && n.div_ceil(4 * 8 / ks) < 2 * super::llm::sm_count()
+            && k / epv / (2 * ks) >= 32
+        {
+            ks *= 2;
+        }
+        let f = self.fl(GEMV_NAMES[GEMV_FMTS.iter().position(|&f| f == name).unwrap()][m - 1]);
+        let (ku, nu, ksu) = (k as u32, n as u32, ks as u32);
+        let any = xq.or(x).unwrap();
+        unsafe {
+            self.stream
+                .launch_builder(&f)
+                .arg(x.unwrap_or(any).f32_data())
+                .arg(xq.unwrap_or(any).f32_data())
+                .arg(w)
+                .arg(out.f32_data_mut())
+                .arg(&ku)
+                .arg(&nu)
+                .arg(&ksu)
+                .launch(grid((n.div_ceil(4 * 8 / ks), 1, 1), 256))
+                .unwrap();
+        }
+    }
+
     pub(super) fn q2_linear_impl(
         &self,
         xq: &CudaBuffer,
@@ -151,30 +221,24 @@ impl CudaComputeDevice {
         let CudaStorage::Q2(q) = w.storage() else {
             panic!("q2_linear_into needs a Q2 weight (upload_q2)")
         };
-        assert!(q.n == n && q.k == k && (1..=MAX_T).contains(&m) && out.len >= m * n);
-        const NAMES: [&str; 8] = [
-            "fl_q2_gemv_t1",
-            "fl_q2_gemv_t2",
-            "fl_q2_gemv_t3",
-            "fl_q2_gemv_t4",
-            "fl_q2_gemv_t5",
-            "fl_q2_gemv_t6",
-            "fl_q2_gemv_t7",
-            "fl_q2_gemv_t8",
-        ];
-        let f = self.fl(NAMES[m - 1]);
-        let (ku, nu) = (k as u32, n as u32);
-        unsafe {
-            self.stream
-                .launch_builder(&f)
-                .arg(xq.f32_data())
-                .arg(&q.data)
-                .arg(out.f32_data_mut())
-                .arg(&ku)
-                .arg(&nu)
-                .launch(grid((n.div_ceil(Q2_ROWS_PER_BLOCK), 1, 1), 256))
-                .unwrap();
-        }
+        assert!(q.n == n && q.k == k);
+        self.gemv_rows("q2_gemv", None, Some(xq), &q.data, out, m, k, n);
+    }
+
+    pub(super) fn q4x_linear_impl(
+        &self,
+        xq: &CudaBuffer,
+        w: &CudaBuffer,
+        out: &mut CudaBuffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        assert!(
+            w.len * 4 >= n * k / 2 + 4 * n * k / 64,
+            "q4x_linear_into: weight size"
+        );
+        self.gemv_rows("q4x_gemv", None, Some(xq), w.f32_data(), out, m, k, n);
     }
 
     pub(super) fn hc_write_impl(
@@ -200,9 +264,10 @@ impl CudaComputeDevice {
     pub(super) fn hc_read_impl(
         &self,
         r: &mut CudaBuffer,
-        pending: Option<(&CudaBuffer, &CudaBuffer)>,
+        pending: Option<HcPending<'_, CudaBuffer>>,
         w: &HcWeights<'_, CudaBuffer>,
         x: &mut CudaBuffer,
+        xq: Option<&mut CudaBuffer>,
         inj: Option<&mut CudaBuffer>,
         scratch: &mut CudaBuffer,
         t: usize,
@@ -211,8 +276,30 @@ impl CudaComputeDevice {
         assert!((1..=MAX_T).contains(&t) && scratch.len >= crate::flash::hc_scratch_words(t));
         let xn_len = t * HC * HIDDEN;
         let (mut xn, mut lo) = scratch.f32_data_mut().split_at_mut(xn_len);
-        let apply = pending.is_some() as u32;
-        let (yp, ip) = pending.unwrap_or((&*x, &*x));
+        // Unused pointer arguments get `w.norm`; the kernel never reads them in that mode.
+        let any = w.norm;
+        let (mode, yp, ip, parts, wr, lg, stride, sg) = match pending {
+            None => (0u32, any, any, any, any, any, 0usize, -1i32),
+            Some(HcPending::Write { y, inj }) => (1, y, inj, any, any, any, 0, -1),
+            Some(HcPending::Moe {
+                parts,
+                w: wr,
+                logits,
+                stride,
+                sg,
+                inj,
+            }) => (
+                2,
+                any,
+                inj,
+                parts,
+                wr,
+                logits,
+                stride,
+                sg.map_or(-1, |c| c as i32),
+            ),
+        };
+        let su = stride as u32;
         let f = self.fl("fl_hc_norm");
         unsafe {
             self.stream
@@ -220,10 +307,15 @@ impl CudaComputeDevice {
                 .arg(r.f32_data_mut())
                 .arg(yp.f32_data())
                 .arg(ip.f32_data())
-                .arg(&apply)
+                .arg(&mode)
                 .arg(w.norm.f32_data())
                 .arg(&mut xn)
                 .arg(&eps)
+                .arg(parts.f32_data())
+                .arg(wr.f32_data())
+                .arg(lg.f32_data())
+                .arg(&su)
+                .arg(&sg)
                 .launch(grid((HC, t, 1), 256))
                 .unwrap();
         }
@@ -242,18 +334,36 @@ impl CudaComputeDevice {
                 Some(i) => l.arg(i.f32_data_mut()),
                 None => l.arg(r.f32_data_mut()),
             };
-            l.arg(&tu).launch(grid((rows, 1, 1), 256)).unwrap();
+            let ru = rows as u32;
+            l.arg(&tu)
+                .arg(&ru)
+                .launch(grid((rows.div_ceil(4), 1, 1), 256))
+                .unwrap();
         }
-        let f = self.fl("fl_hc_up");
+        const UP: [&str; 8] = [
+            "fl_hc_up_t1",
+            "fl_hc_up_t2",
+            "fl_hc_up_t3",
+            "fl_hc_up_t4",
+            "fl_hc_up_t5",
+            "fl_hc_up_t6",
+            "fl_hc_up_t7",
+            "fl_hc_up_t8",
+        ];
+        let f = self.fl(UP[t - 1]);
+        let quant = xq.is_some() as u32;
         unsafe {
-            self.stream
-                .launch_builder(&f)
-                .arg(&mut xn)
-                .arg(&mut lo)
-                .arg(w.up.bf16_data())
-                .arg(x.f32_data_mut())
-                .arg(&tu)
-                .launch(grid((HIDDEN / 8, 1, 1), 256))
+            let mut l = self.stream.launch_builder(&f);
+            l.arg(&mut xn).arg(&mut lo).arg(w.up.bf16_data());
+            match xq {
+                Some(q) => {
+                    assert!(q.len >= QAct { m: t, k: HIDDEN }.words());
+                    l.arg(x.f32_data_mut()).arg(q.f32_data_mut())
+                }
+                None => l.arg(x.f32_data_mut()).arg(&NULL),
+            };
+            l.arg(&quant)
+                .launch(grid((HIDDEN / 32, 1, 1), 1024))
                 .unwrap();
         }
     }
@@ -319,11 +429,13 @@ impl CudaComputeDevice {
         stride: usize,
         p: &GdnParams<'_, CudaBuffer>,
         y: &mut CudaBuffer,
+        yq: Option<&mut CudaBuffer>,
         t: usize,
         mode: GdnMode<'_, CudaBuffer>,
         eps: f32,
     ) {
         assert!((1..=MAX_T).contains(&t));
+        let quant = yq.is_some() as u32;
         let (win, commit) = match mode {
             GdnMode::ReadOnly => (h, 0u32),
             GdnMode::Commit { win } => (win, 1u32),
@@ -331,9 +443,8 @@ impl CudaComputeDevice {
         let f = self.fl("fl_gdn_step");
         let (s, tu) = (stride as u32, t as u32);
         unsafe {
-            self.stream
-                .launch_builder(&f)
-                .arg(state.f32_data_mut())
+            let mut l = self.stream.launch_builder(&f);
+            l.arg(state.f32_data_mut())
                 .arg(h.f32_data())
                 .arg(proj.f32_data())
                 .arg(&s)
@@ -344,9 +455,12 @@ impl CudaComputeDevice {
                 .arg(&tu)
                 .arg(win.f32_data())
                 .arg(&commit)
-                .arg(&eps)
-                .launch(grid((GDN_HV, 1, 1), 512))
-                .unwrap();
+                .arg(&eps);
+            match yq {
+                Some(q) => l.arg(q.f32_data_mut()),
+                None => l.arg(&NULL),
+            };
+            l.arg(&quant).launch(grid((GDN_HV, 1, 1), 512)).unwrap();
         }
     }
 
@@ -399,6 +513,48 @@ impl CudaComputeDevice {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn moe_route_impl(
+        &self,
+        logits: &CudaBuffer,
+        stride: usize,
+        n_expert: usize,
+        forced: Option<&CudaBuffer>,
+        table: &CudaBuffer,
+        shared: u64,
+        ids: &mut CudaBuffer,
+        w: &mut CudaBuffer,
+        plan: &mut CudaBuffer,
+        t: usize,
+    ) {
+        assert!((1..=MAX_T).contains(&t) && (TOPK..=512).contains(&n_expert));
+        assert!(plan.len >= MoePlan::WORDS && table.len >= 2 * EXPERTS);
+        let f = self.fl("fl_moe_route");
+        let (s, ne, tu, fo) = (
+            stride as u32,
+            n_expert as u32,
+            t as u32,
+            forced.is_some() as u32,
+        );
+        unsafe {
+            let mut l = self.stream.launch_builder(&f);
+            l.arg(logits.f32_data()).arg(&s).arg(&ne);
+            match forced {
+                Some(b) => l.arg(b.f32_data()),
+                None => l.arg(&NULL),
+            };
+            l.arg(&fo)
+                .arg(table.f32_data())
+                .arg(&shared)
+                .arg(ids.f32_data_mut())
+                .arg(w.f32_data_mut())
+                .arg(plan.f32_data_mut())
+                .arg(&tu)
+                .launch(grid((1, 1, 1), 256))
+                .unwrap();
+        }
+    }
+
     pub(super) fn moe_grouped_impl(
         &self,
         xq: &CudaBuffer,
@@ -419,7 +575,7 @@ impl CudaComputeDevice {
                 .arg(&tu)
                 .arg(plan.f32_data())
                 .arg(scratch.f32_data_mut())
-                .launch(grid((FF / 32, MoePlan::CAP, 1), 256))
+                .launch(grid((8 * super::llm::sm_count(), 1, 1), 256))
                 .unwrap();
         }
         let f = self.fl("fl_moe_down");
@@ -429,7 +585,7 @@ impl CudaComputeDevice {
                 .arg(scratch.f32_data())
                 .arg(plan.f32_data())
                 .arg(parts.f32_data_mut())
-                .launch(grid((HIDDEN / 64, MoePlan::CAP, 1), 256))
+                .launch(grid((8 * super::llm::sm_count(), 1, 1), 256))
                 .unwrap();
         }
     }
@@ -553,6 +709,7 @@ impl CudaComputeDevice {
         win: &CudaBuffer,
         scratch: &mut CudaBuffer,
         out: &mut CudaBuffer,
+        outq: Option<&mut CudaBuffer>,
         t: usize,
     ) {
         assert!(scratch.len >= crate::flash::qsa_attend_scratch_words(t));
@@ -572,17 +729,55 @@ impl CudaComputeDevice {
         }
         let f = self.fl("fl_qsa_merge");
         let s = stride as u32;
+        let quant = outq.is_some() as u32;
+        let tu = t as u32;
         unsafe {
-            self.stream
-                .launch_builder(&f)
-                .arg(scratch.f32_data())
+            let mut l = self.stream.launch_builder(&f);
+            l.arg(scratch.f32_data())
                 .arg(proj.f32_data())
                 .arg(&s)
                 .arg(win.f32_data())
-                .arg(out.f32_data_mut())
+                .arg(out.f32_data_mut());
+            match outq {
+                Some(q) => l.arg(q.f32_data_mut()),
+                None => l.arg(&NULL),
+            };
+            l.arg(&quant)
+                .arg(&tu)
                 .launch(grid((QSA_HEADS, t, 1), 256))
                 .unwrap();
         }
+    }
+}
+
+/// GPU timing for benchmarks (`flash-kernel-bench`).
+impl CudaComputeDevice {
+    /// GPU milliseconds between CUDA events recorded before and after `f` (whatever `f`
+    /// enqueues on this device's stream, including any idle time between its launches).
+    pub fn event_ms(&self, f: &mut dyn FnMut()) -> f32 {
+        use cudarc::driver::sys::CUevent_flags;
+        let a = self
+            .ctx
+            .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+            .unwrap();
+        let b = self
+            .ctx
+            .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+            .unwrap();
+        a.record(&self.stream).unwrap();
+        f();
+        b.record(&self.stream).unwrap();
+        a.elapsed_ms(&b).unwrap()
+    }
+
+    /// Capture `f` into a CUDA graph (run it eagerly once first, so modules are loaded and
+    /// pools warm), then return the graph.
+    pub fn capture(&self, f: &mut dyn FnMut()) -> cudarc::driver::CudaGraph {
+        f();
+        self.stream.synchronize().unwrap();
+        self.begin_capture();
+        f();
+        self.end_capture().expect("empty graph")
     }
 }
 
@@ -592,7 +787,7 @@ impl CudaComputeDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::flash::{self as fl, u32s, ExpertBlob};
+    use crate::flash::{self as fl, u32s, ExpertBlob, HcPending};
     use crate::{ComputeBuffer, ComputeDevice, CpuDevice};
 
     fn on_gpu(check: fn(&CudaComputeDevice)) {
@@ -653,6 +848,22 @@ mod tests {
         }
     }
 
+    /// Everything within `tol`, and at least `frac` of the values within `tight`.
+    fn close_mostly(got: &[f32], want: &[f32], tol: f32, tight: f32, frac: f32, what: &str) {
+        close(got, want, tol, what);
+        let scale = want.iter().map(|v| v.abs()).sum::<f32>() / want.len().max(1) as f32;
+        let ok = got
+            .iter()
+            .zip(want)
+            .filter(|(g, w)| (*g - *w).abs() <= tight * (scale + w.abs()))
+            .count();
+        let n = want.len();
+        assert!(
+            ok as f32 >= frac * n as f32,
+            "{what}: only {ok} of {n} within {tight}"
+        );
+    }
+
     fn same_bits(got: &[f32], want: &[f32], what: &str) {
         assert_eq!(got.len(), want.len(), "{what}: length");
         for (i, (g, w)) in got.iter().zip(want).enumerate() {
@@ -701,6 +912,45 @@ mod tests {
         }
     }
 
+    fn q4x_linear_vs_cpu<D: ComputeDevice>(g: &D) {
+        let c = CpuDevice::new();
+        let mut rng = Rng(0x51);
+        for &(k, n) in &[(2560, 300), (6144, 129), (10240, 40)] {
+            let packed: Vec<u32> = (0..n * k / 8).map(|_| rng.u() as u32).collect();
+            let sc: Vec<u16> = (0..n * k / 64)
+                .map(|_| (rng.f(0.02).to_bits() >> 16) as u16)
+                .collect();
+            let bi: Vec<u16> = (0..n * k / 64)
+                .map(|_| (rng.f(0.1).to_bits() >> 16) as u16)
+                .collect();
+            let (gw, cw) = (
+                g.upload_q4x(&packed, &sc, &bi, n, k),
+                c.upload_q4x(&packed, &sc, &bi, n, k),
+            );
+            // The same weights through tang-Q4 `linear` (f32 activations) agree to int8 rounding.
+            let cq4 = c.upload_q4(&packed, &sc, &bi, 64);
+            for t in TS {
+                let x = rng.vec(t * k, 2.0);
+                let qa = QAct { m: t, k };
+                let (mut gq, mut cq) = (g.alloc_f32(qa.words()), c.alloc_f32(qa.words()));
+                g.quantize_act_into(&g.upload_f32(&x), &mut gq, t, k);
+                c.quantize_act_into(&c.upload_f32(&x), &mut cq, t, k);
+                let (mut gy, mut cy) = (g.alloc_f32(t * n), c.alloc_f32(t * n));
+                g.q4x_linear_into(&gq, &gw, &mut gy, t, k, n);
+                c.q4x_linear_into(&cq, &cw, &mut cy, t, k, n);
+                let want = c.download(&cy);
+                close(
+                    &g.download(&gy),
+                    &want,
+                    1e-5,
+                    &format!("q4x linear t={t} {k}->{n}"),
+                );
+                let f32_path = c.download(&c.linear(&c.upload_f32(&x), &cq4, t, k, n));
+                close(&want, &f32_path, 2e-2, &format!("q4x vs f32 q4 t={t}"));
+            }
+        }
+    }
+
     fn linear_into_vs_cpu<D: ComputeDevice>(g: &D) {
         let c = CpuDevice::new();
         let mut rng = Rng(7);
@@ -732,76 +982,47 @@ mod tests {
 
     // ---- hyper-connections ----
 
+    /// (norm, down, up, inject, r0) on the host.
+    type HcWeightsHost<'a> = (&'a [f32], &'a [u16], &'a [u16], &'a [u16], &'a [f32]);
+    /// (y, inj, parts, router weights, logits) on the host.
+    type HcInputsHost<'a> = (&'a [f32], &'a [f32], &'a [f32], &'a [f32], &'a [f32]);
+
     fn hc_vs_cpu<D: ComputeDevice>(g: &D) {
         let c = CpuDevice::new();
         let mut rng = Rng(11);
         let w = HC * HIDDEN;
-        let norm = rng
-            .vec(w, 1.0)
-            .iter()
-            .map(|v| 1.0 + 0.2 * v)
-            .collect::<Vec<_>>();
+        let norm: Vec<f32> = rng.vec(w, 1.0).iter().map(|v| 1.0 + 0.2 * v).collect();
         let (down, up, inject) = (
             rng.bf16(HC_LR * w, 0.05),
-            rng.bf16(w * HC_LR, 0.2),
+            fl::hc_up_repack(&rng.bf16(w * HC_LR, 0.2)),
             rng.bf16(HC * w, 0.05),
         );
+        let ls = EXPERTS + 1;
+        // (inject rows, pending: 0 none, 1 write, 2 MoE write)
         for t in TS {
-            for (with_inject, pending) in [(true, false), (true, true), (false, true)] {
+            for (with_inject, mode) in [(true, 0), (true, 1), (false, 1), (true, 2)] {
                 let r0 = rng.vec(t * w, 2.0);
                 let (y, injp) = (rng.vec(t * HIDDEN, 1.0), rng.vec(t * HC, 3.0));
-                let run = |d: &dyn Fn() -> (Vec<f32>, Vec<f32>, Vec<f32>)| d();
-                macro_rules! go {
-                    ($d:expr) => {{
-                        let d = $d;
-                        let (n, dn, u, i) = (
-                            d.upload_f32(&norm),
-                            d.upload_bf16(&down),
-                            d.upload_bf16(&up),
-                            d.upload_bf16(&inject),
-                        );
-                        let hw = HcWeights {
-                            norm: &n,
-                            down: &dn,
-                            up: &u,
-                            inject: with_inject.then_some(&i),
-                        };
-                        let mut r = d.upload_f32(&r0);
-                        let (yb, ib) = (d.upload_f32(&y), d.upload_f32(&injp));
-                        let (mut x, mut inj, mut sc) = (
-                            d.alloc_f32(t * HIDDEN),
-                            d.alloc_f32(t * HC),
-                            d.alloc_f32(fl::hc_scratch_words(t)),
-                        );
-                        d.hc_read_into(
-                            &mut r,
-                            pending.then_some((&yb, &ib)),
-                            &hw,
-                            &mut x,
-                            with_inject.then_some(&mut inj),
-                            &mut sc,
-                            t,
-                            1e-6,
-                        );
-                        (d.download(&x), d.download(&inj), d.download(&r))
-                    }};
-                }
-                let got = run(&|| go!(g));
-                let want = run(&|| go!(&c));
-                let what = format!("hc t={t} inject={with_inject} pending={pending}");
-                close(&got.2, &want.2, 1e-6, &format!("{what} R"));
-                close(&got.0, &want.0, 2e-4, &format!("{what} x"));
-                if with_inject {
-                    close(&got.1, &want.1, 2e-4, &format!("{what} inj"));
-                }
-                if pending {
-                    // Fused write-then-read is bitwise the write, then the read.
-                    let d = g;
+                let parts = rng.vec(MoePlan::PARTS_ROWS * HIDDEN, 1.0);
+                let (rw, logits) = (rng.vec(t * TOPK, 0.3), rng.vec(t * ls, 2.0));
+                // (x, inj, r, xq) after one read on `d`; `split` does the write as its own op.
+                fn go<D: ComputeDevice>(
+                    d: &D,
+                    split: bool,
+                    a: HcWeightsHost,
+                    b: HcInputsHost,
+                    with_inject: bool,
+                    mode: u32,
+                    t: usize,
+                ) -> [Vec<f32>; 4] {
+                    let (norm, down, up, inject, r0) = a;
+                    let (y, injp, parts, rw, logits) = b;
+                    let ls = EXPERTS + 1;
                     let (n, dn, u, i) = (
-                        d.upload_f32(&norm),
-                        d.upload_bf16(&down),
-                        d.upload_bf16(&up),
-                        d.upload_bf16(&inject),
+                        d.upload_f32(norm),
+                        d.upload_bf16(down),
+                        d.upload_bf16(up),
+                        d.upload_bf16(inject),
                     );
                     let hw = HcWeights {
                         norm: &n,
@@ -809,25 +1030,78 @@ mod tests {
                         up: &u,
                         inject: with_inject.then_some(&i),
                     };
-                    let mut r = d.upload_f32(&r0);
-                    d.hc_write(&mut r, &d.upload_f32(&y), &d.upload_f32(&injp), t);
-                    let (mut x, mut inj, mut sc) = (
+                    let mut r = d.upload_f32(r0);
+                    let (yb, ib) = (d.upload_f32(y), d.upload_f32(injp));
+                    let (pb, wb, lb) =
+                        (d.upload_f32(parts), d.upload_f32(rw), d.upload_f32(logits));
+                    let pending = match mode {
+                        0 => None,
+                        1 => Some(HcPending::Write { y: &yb, inj: &ib }),
+                        _ => Some(HcPending::Moe {
+                            parts: &pb,
+                            w: &wb,
+                            logits: &lb,
+                            stride: ls,
+                            sg: Some(EXPERTS),
+                            inj: &ib,
+                        }),
+                    };
+                    let pending = if split && mode > 0 {
+                        let mut yc = d.alloc_f32(t * HIDDEN);
+                        let yref = if mode == 2 {
+                            d.moe_combine_into(&pb, &wb, &lb, ls, Some(EXPERTS), &mut yc, t);
+                            &yc
+                        } else {
+                            &yb
+                        };
+                        d.hc_write(&mut r, yref, &ib, t);
+                        None
+                    } else {
+                        pending
+                    };
+                    let (mut x, mut inj, mut sc, mut xq) = (
                         d.alloc_f32(t * HIDDEN),
                         d.alloc_f32(t * HC),
                         d.alloc_f32(fl::hc_scratch_words(t)),
+                        d.alloc_f32(QAct { m: t, k: HIDDEN }.words()),
                     );
                     d.hc_read_into(
                         &mut r,
-                        None,
+                        pending,
                         &hw,
                         &mut x,
+                        Some(&mut xq),
                         with_inject.then_some(&mut inj),
                         &mut sc,
                         t,
                         1e-6,
                     );
-                    same_bits(&d.download(&r), &got.2, &format!("{what} unfused R"));
-                    same_bits(&d.download(&x), &got.0, &format!("{what} unfused x"));
+                    [
+                        d.download(&x),
+                        d.download(&inj),
+                        d.download(&r),
+                        d.download(&xq),
+                    ]
+                }
+                let a = (&norm[..], &down[..], &up[..], &inject[..], &r0[..]);
+                let b = (&y[..], &injp[..], &parts[..], &rw[..], &logits[..]);
+                let got = go(g, false, a, b, with_inject, mode, t);
+                let want = go(&c, false, a, b, with_inject, mode, t);
+                let what = format!("hc t={t} inject={with_inject} pending={mode}");
+                close(&got[2], &want[2], 1e-6, &format!("{what} R"));
+                close(&got[0], &want[0], 2e-4, &format!("{what} x"));
+                if with_inject {
+                    close(&got[1], &want[1], 2e-4, &format!("{what} inj"));
+                }
+                // The fused int8 output is the quantization of x.
+                let mut q = g.alloc_f32(QAct { m: t, k: HIDDEN }.words());
+                g.quantize_act_into(&g.upload_f32(&got[0]), &mut q, t, HIDDEN);
+                same_bits(&got[3], &g.download(&q), &format!("{what} xq"));
+                if mode > 0 {
+                    // Fused write-then-read is bitwise the separate ops.
+                    let split = go(g, true, a, b, with_inject, mode, t);
+                    same_bits(&split[2], &got[2], &format!("{what} unfused R"));
+                    same_bits(&split[0], &got[0], &format!("{what} unfused x"));
                 }
             }
         }
@@ -892,6 +1166,7 @@ mod tests {
         let mut h = d.alloc_f32(t * GDN_CONV);
         d.gdn_conv_into(&proj, GDN_PROJ, &hist, &conv, &mut h, t, 1e-6);
         let mut y = d.alloc_f32(t * GDN_V);
+        let mut yq = d.alloc_f32(QAct { m: t, k: GDN_V }.words());
         d.gdn_step(
             &mut state,
             &h,
@@ -899,10 +1174,14 @@ mod tests {
             GDN_PROJ,
             &p,
             &mut y,
+            Some(&mut yq),
             t,
             GdnMode::ReadOnly,
             1e-6,
         );
+        let mut q = d.alloc_f32(QAct { m: t, k: GDN_V }.words());
+        d.quantize_act_into(&y, &mut q, t, GDN_V);
+        same_bits(&d.download(&yq), &d.download(&q), "gdn fused int8 output");
         let unchanged = d.download(&state);
         same_bits(&unchanged, &cs.state, "readonly leaves the state");
         let w = win(d, 0, n_keep);
@@ -914,6 +1193,7 @@ mod tests {
             GDN_PROJ,
             &p,
             &mut yc,
+            None,
             t,
             GdnMode::Commit { win: &w },
             1e-6,
@@ -982,6 +1262,7 @@ mod tests {
                         GDN_PROJ,
                         &p,
                         &mut y,
+                        None,
                         t - k,
                         GdnMode::ReadOnly,
                         1e-6,
@@ -1127,6 +1408,61 @@ mod tests {
                 );
                 assert!(nm > 0 && ng > 0);
 
+                // The fused route: router ids/weights as router_topk, plan as moe_plan on them,
+                // and with forced ids, the plan above.
+                let gl = g.upload_f32(&logits);
+                let (mut ri, mut rw, mut rp) = (
+                    g.alloc_f32(t * TOPK),
+                    g.alloc_f32(t * TOPK),
+                    g.alloc_f32(MoePlan::WORDS),
+                );
+                let gtab = g.upload_u32(&tw(&gt));
+                g.moe_route_into(
+                    &gl,
+                    EXPERTS + 1,
+                    EXPERTS,
+                    None,
+                    &gtab,
+                    gsh,
+                    &mut ri,
+                    &mut rw,
+                    &mut rp,
+                    t,
+                );
+                let (mut ti, mut tw2) = (g.alloc_f32(t * TOPK), g.alloc_f32(t * TOPK));
+                g.router_topk_into(&gl, EXPERTS + 1, EXPERTS, &mut ti, &mut tw2, t);
+                same_bits(&g.download(&ri), &g.download(&ti), "route ids");
+                same_bits(&g.download(&rw), &g.download(&tw2), "route w");
+                let want_r = crate::cpu::flash::moe_plan(&u32s(&g.download(&ti)), &gt, gsh, t);
+                let got_r = u32s(&g.download(&rp));
+                let ner = want_r[1] as usize;
+                assert_eq!(&got_r[..3], &want_r[..3], "route plan header");
+                assert_eq!(
+                    got_r[MoePlan::ENT_DST..][..ner],
+                    want_r[MoePlan::ENT_DST..][..ner],
+                    "route plan dst"
+                );
+                let gids = g.upload_u32(&ids);
+                g.moe_route_into(
+                    &gl,
+                    EXPERTS + 1,
+                    EXPERTS,
+                    Some(&gids),
+                    &gtab,
+                    gsh,
+                    &mut ri,
+                    &mut rw,
+                    &mut rp,
+                    t,
+                );
+                let got_f = u32s(&g.download(&rp));
+                assert_eq!(&got_f[..3], &want[..3], "forced plan header");
+                assert_eq!(
+                    got_f[MoePlan::ENT_TOK..][..ne],
+                    want[MoePlan::ENT_TOK..][..ne],
+                    "forced plan tok"
+                );
+
                 // Grouped experts and combine, each device with its own addresses.
                 let run = |d: &dyn Fn() -> (Vec<f32>, Vec<f32>)| d();
                 macro_rules! go {
@@ -1163,18 +1499,23 @@ mod tests {
                 }
                 let gotp = run(&|| go!(g, &gt, g.buffer_addr(&gs)));
                 let wantp = run(&|| go!(&c, &ct, c.buffer_addr(&cs)));
-                close(
-                    &gotp.0,
-                    &wantp.0,
-                    1e-4,
-                    &format!("moe parts t={t} shared={shared}"),
+                // h is requantized to int8 between gate/up and down, so a summation-order
+                // difference can move one code by 1 at a rounding tie: a few outputs may move by
+                // d_h · w; nearly all agree to fp32 noise.
+                let what = format!("moe parts t={t} shared={shared}");
+                close_mostly(&gotp.0, &wantp.0, 1e-2, 1e-5, 0.98, &what);
+                // Combine on the same parts.
+                let mut cy = c.alloc_f32(t * HIDDEN);
+                let ls = EXPERTS + 1;
+                let sg = shared.then_some(EXPERTS);
+                let (cp, cw, cl) = (
+                    c.upload_f32(&gotp.0),
+                    c.upload_f32(&w),
+                    c.upload_f32(&logits),
                 );
-                close(
-                    &gotp.1,
-                    &wantp.1,
-                    1e-4,
-                    &format!("moe combine t={t} shared={shared}"),
-                );
+                c.moe_combine_into(&cp, &cw, &cl, ls, sg, &mut cy, t);
+                let what = format!("moe combine t={t} shared={shared}");
+                close(&gotp.1, &c.download(&cy), 1e-5, &what);
             }
         }
     }
@@ -1358,6 +1699,7 @@ mod tests {
                 let gv = g.upload_bf16(&to_bits(&vv));
                 let mut gs = g.alloc_f32(fl::qsa_attend_scratch_words(t));
                 let mut go = g.alloc_f32(t * QSA_OUT);
+                let mut gq = g.alloc_f32(QAct { m: t, k: QSA_OUT }.words());
                 g.qsa_attend_into(
                     &g.upload_f32(&q),
                     &gk,
@@ -1368,8 +1710,12 @@ mod tests {
                     &win(g, pos0, 0),
                     &mut gs,
                     &mut go,
+                    Some(&mut gq),
                     t,
                 );
+                let mut qq = g.alloc_f32(QAct { m: t, k: QSA_OUT }.words());
+                g.quantize_act_into(&go, &mut qq, t, QSA_OUT);
+                same_bits(&g.download(&gq), &g.download(&qq), "qsa fused int8 output");
                 let mut co = c.alloc_f32(t * QSA_OUT);
                 let mut cs = c.alloc_f32(1);
                 c.qsa_attend_into(
@@ -1382,6 +1728,7 @@ mod tests {
                     &win(&c, pos0, 0),
                     &mut cs,
                     &mut co,
+                    None,
                     t,
                 );
                 close(
@@ -1397,6 +1744,11 @@ mod tests {
     #[test]
     fn cuda_q2_linear_vs_cpu() {
         on_gpu(q2_linear_vs_cpu::<CudaComputeDevice>);
+    }
+
+    #[test]
+    fn cuda_q4x_linear_vs_cpu() {
+        on_gpu(q4x_linear_vs_cpu::<CudaComputeDevice>);
     }
 
     #[test]

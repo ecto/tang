@@ -87,22 +87,31 @@ impl QRow {
     }
 }
 
-/// Row `o` of a repacked `[n, k]` Q2_0 matrix `wb` against a row of int8 activations:
-/// `Σ_chunks fma(d_block · d_x, (Σ code·q − Σ q), acc)`, chunks ascending.
+/// One Q2_0 block (16 code bytes, scale `d`) at 64-wide column `c` against a row of int8
+/// activations: its two chunks, `fma(d · d_x, Σ code·q − Σ q, acc)` each, ascending.
+pub(crate) fn q2_block_dot(codes: &[u8], d: f32, c: usize, x: &QRow, mut acc: f32) -> f32 {
+    for h in 0..2 {
+        let ch = 2 * c + h;
+        let mut s = 0i32;
+        for (j, &byte) in codes[8 * h..8 * h + 8].iter().enumerate() {
+            for f in 0..4 {
+                s += ((byte >> (2 * f)) & 3) as i32 * x.q[ch * 32 + 4 * j + f];
+            }
+        }
+        acc = (d * x.d[ch]).mul_add((s - x.hx[ch]) as f32, acc);
+    }
+    acc
+}
+
+/// Row `o` of a repacked `[n, k]` Q2_0 matrix `wb` against a row of int8 activations: the
+/// row's blocks through [`q2_block_dot`], ascending.
 pub(crate) fn q2_row_dot(wb: &[u8], n: usize, k: usize, o: usize, x: &QRow) -> f32 {
     let codes = &wb[o * k / 4..(o + 1) * k / 4];
     let sc = n * k / 4 + o * (k / 64) * 2;
     let mut acc = 0f32;
-    for c in 0..k / 32 {
-        let b = sc + 2 * (c / 2);
-        let d = f16_to_f32(u16::from_le_bytes([wb[b], wb[b + 1]]));
-        let mut s = 0i32;
-        for (j, &byte) in codes[c * 8..c * 8 + 8].iter().enumerate() {
-            for f in 0..4 {
-                s += ((byte >> (2 * f)) & 3) as i32 * x.q[c * 32 + 4 * j + f];
-            }
-        }
-        acc = (d * x.d[c]).mul_add((s - x.hx[c]) as f32, acc);
+    for c in 0..k / 64 {
+        let d = f16_to_f32(u16::from_le_bytes([wb[sc + 2 * c], wb[sc + 2 * c + 1]]));
+        acc = q2_block_dot(&codes[16 * c..16 * c + 16], d, c, x, acc);
     }
     acc
 }
@@ -115,6 +124,40 @@ pub(crate) fn q2_linear(xq: &[u32], wb: &[u8], m: usize, k: usize, n: usize) -> 
         let x = QRow::decode(xq, l, r);
         for o in 0..n {
             out[r * n + o] = q2_row_dot(wb, n, k, o, &x);
+        }
+    }
+    out
+}
+
+/// Row `o` of a Q4X matrix ([`crate::flash::q4x_repack`]) against a row of int8 activations:
+/// per chunk `S = Σ q·x̂`, `acc = fma(d_x, fma(scale, S, bias · Σ x̂), acc)`, chunks ascending.
+pub(crate) fn q4x_row_dot(wb: &[u8], n: usize, k: usize, o: usize, x: &QRow) -> f32 {
+    let codes = &wb[o * k / 2..(o + 1) * k / 2];
+    let bf = |off: usize| f32::from_bits((u16::from_le_bytes([wb[off], wb[off + 1]]) as u32) << 16);
+    let (sp, bp) = (n * k / 2, n * k / 2 + 2 * (n * k / 64));
+    let mut acc = 0f32;
+    for c in 0..k / 32 {
+        let g = o * (k / 64) + c / 2;
+        let (s, b) = (bf(sp + 2 * g), bf(bp + 2 * g));
+        let mut sum = 0i32;
+        for i in 0..32 {
+            let (byte, sh) = crate::flash::q4x_slot(i);
+            sum += ((codes[c * 16 + byte] >> sh) & 0xf) as i32 * x.q[c * 32 + i];
+        }
+        let v = s.mul_add(sum as f32, b * x.hx[c] as f32);
+        acc = x.d[c].mul_add(v, acc);
+    }
+    acc
+}
+
+/// `out[m, n] = W · x̂` for a Q4X weight `[n, k]`.
+pub(crate) fn q4x_linear(xq: &[u32], wb: &[u8], m: usize, k: usize, n: usize) -> Vec<f32> {
+    let l = QAct { m, k };
+    let mut out = vec![0f32; m * n];
+    for r in 0..m {
+        let x = QRow::decode(xq, l, r);
+        for o in 0..n {
+            out[r * n + o] = q4x_row_dot(wb, n, k, o, &x);
         }
     }
     out
@@ -180,7 +223,10 @@ pub(crate) fn hc_read(
             let mut acc = 0f32;
             for c in 0..HC {
                 let i = c * HIDDEN + d;
-                let g = sigmoid(dot(&up[i * HC_LR..(i + 1) * HC_LR], &lo));
+                let row: f32 = (0..HC_LR)
+                    .map(|k| up[crate::flash::hc_up_index(i, k)] * lo[k])
+                    .sum();
+                let g = sigmoid(row);
                 acc = xn[i].mul_add(g, acc);
             }
             x[tt * HIDDEN + d] = acc * 0.25;
@@ -325,39 +371,33 @@ pub(crate) fn gdn_step(
 
 // ---- MoE ----
 
-/// Router: per token, the top `TOPK` experts by (logit desc, index asc) and their weights
-/// `p_i / max(Σ_top p, 2^-14)`, `p = softmax` in f64 (`Z` summed as 32 lanes over strided
-/// experts, ascending, then the xor butterfly). Returns `(ids [t][TOPK], w [t][TOPK])`.
+/// Router: per token, the top `TOPK` experts by (logit desc, index asc), weighted
+/// `e_k / Σ_top e_j` with `e_k = exp(l_k − l_max)` in f64 (the sum in rank order), as f32.
+///
+/// That is the softmax-over-all-experts weight renormalised over the top k,
+/// `p_k / max(Σ_top p, 2^-14)`: `Z` cancels, and the clamp cannot bind because the top k of
+/// `n` probabilities sum to at least `k / n` (10 / 512 here). Returns `(ids, w)`, `[t][TOPK]`.
 pub(crate) fn router_topk(
     logits: &[f32],
     stride: usize,
     t: usize,
     n_expert: usize,
 ) -> (Vec<u32>, Vec<f32>) {
+    assert!(TOPK as f64 / n_expert as f64 >= 1.0 / 16384.0);
     let (mut ids, mut ws) = (Vec::with_capacity(t * TOPK), Vec::with_capacity(t * TOPK));
     for tt in 0..t {
         let l = &logits[tt * stride..tt * stride + n_expert];
         let mut idx: Vec<usize> = (0..n_expert).collect();
         idx.sort_by(|&a, &b| l[b].partial_cmp(&l[a]).unwrap().then(a.cmp(&b)));
         let m = l[idx[0]] as f64;
-        let mut lanes = [0f64; 32];
-        for (lane, acc) in lanes.iter_mut().enumerate() {
-            let mut i = lane;
-            while i < n_expert {
-                *acc += (l[i] as f64 - m).exp();
-                i += 32;
-            }
-        }
-        let z = butterfly(lanes);
-        let p: Vec<f64> = idx[..TOPK]
+        let e: Vec<f64> = idx[..TOPK]
             .iter()
-            .map(|&i| (l[i] as f64 - m).exp() / z)
+            .map(|&i| (l[i] as f64 - m).exp())
             .collect();
-        let sum = p.iter().fold(0f64, |a, v| a + v);
-        let den = sum.max(1.0 / 16384.0);
+        let sum = e.iter().fold(0f64, |a, v| a + v);
         for (k, &i) in idx[..TOPK].iter().enumerate() {
             ids.push(i as u32);
-            ws.push((p[k] / den) as f32);
+            ws.push((e[k] / sum) as f32);
         }
     }
     (ids, ws)
@@ -434,11 +474,10 @@ pub(crate) unsafe fn moe_grouped(xq: &[u32], plan: &[u32], parts: &mut [f32], t:
             | (plan[MoePlan::GROUP_PTR + 2 * g + 1] as u64) << 32;
         // SAFETY: the caller guarantees the address is a live blob.
         let blob = unsafe { std::slice::from_raw_parts(ptr as *const u8, ExpertBlob::BYTES) };
-        let (gate, up, down) = (
-            &blob[ExpertBlob::GATE..ExpertBlob::UP],
-            &blob[ExpertBlob::UP..ExpertBlob::DOWN],
-            &blob[ExpertBlob::DOWN..],
-        );
+        let row_dot = |(co, so): (usize, usize), c: usize, x: &QRow, acc: f32| {
+            let d = f16_to_f32(u16::from_le_bytes([blob[so], blob[so + 1]]));
+            q2_block_dot(&blob[co..co + 16], d, c, x, acc)
+        };
         for e in
             plan[MoePlan::GROUP_START + g] as usize..plan[MoePlan::GROUP_START + g + 1] as usize
         {
@@ -449,14 +488,21 @@ pub(crate) unsafe fn moe_grouped(xq: &[u32], plan: &[u32], parts: &mut [f32], t:
             let x = QRow::decode(xq, lx, tok);
             let hrow: Vec<f32> = (0..FF)
                 .map(|r| {
-                    let gv = q2_row_dot(gate, FF, HIDDEN, r, &x);
-                    let uv = q2_row_dot(up, FF, HIDDEN, r, &x);
+                    let (mut gv, mut uv) = (0f32, 0f32);
+                    for c in 0..HIDDEN / 64 {
+                        gv = row_dot(ExpertBlob::gu_block(2 * r, c), c, &x, gv);
+                        uv = row_dot(ExpertBlob::gu_block(2 * r + 1, c), c, &x, uv);
+                    }
                     silu(gv) * uv
                 })
                 .collect();
             let hq = QRow::decode(&quantize_act(&hrow, 1, FF), lh, 0);
             for r in 0..HIDDEN {
-                parts[dst * HIDDEN + r] = q2_row_dot(down, HIDDEN, FF, r, &hq);
+                let mut acc = 0f32;
+                for c in 0..FF / 64 {
+                    acc = row_dot(ExpertBlob::down_block(r, c), c, &hq, acc);
+                }
+                parts[dst * HIDDEN + r] = acc;
             }
         }
     }
