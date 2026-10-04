@@ -1074,49 +1074,37 @@ impl Engine {
         unsafe { self.launch(self.k.stamp, (1, 1, 1), 1, tang_moe::args![p, i]) };
     }
 
+    /// Device address of byte `off` of the pinned staging (registered device-mapped).
+    fn io_dev(&self, off: usize) -> u64 {
+        self.io.arena.device_ptr(off).expect("io arena is mapped")
+    }
+
+    /// `bytes` (a multiple of 4) from `src` to `dst` with a kernel on `stream`: device or
+    /// mapped host addresses alike. Used instead of copy-engine memcpys on the decode path, so
+    /// a window never queues behind the expert cache's swap copies on the copy engines.
+    fn kcopy_on(&self, stream: cudarc::driver::sys::CUstream, dst: u64, src: u64, bytes: usize) {
+        let n = (bytes / 4) as i32;
+        let s = ManuallyDrop::new(Stream(stream));
+        unsafe {
+            gpu::launch(self.k.copy, ((n as u32).div_ceil(256).max(1), 1, 1), (256, 1, 1), 0, &s, tang_moe::args![dst, src, n])
+                .expect("kcopy")
+        };
+    }
+
+    fn kcopy(&self, dst: u64, src: u64, bytes: usize) {
+        self.kcopy_on(self.stream.0, dst, src, bytes);
+    }
+
     /// Copy the window's inputs from pinned staging (graph nodes).
     fn enqueue_inputs(&self, t: usize) {
-        let st = self.stream.0;
-        let cp = |dst: &B, off: usize, bytes: usize| unsafe {
-            gpu::check(
-                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
-                    Self::addr(dst, &self.dev),
-                    self.io.ptr(off) as *const std::ffi::c_void,
-                    bytes,
-                    st,
-                ),
-                "cuMemcpyHtoDAsync",
-            )
-            .expect("input copy")
-        };
-        cp(&self.s.ctl, Io::CTL, 32);
-        cp(&self.s.emb, Io::EMB, t * HIDDEN * 4);
+        self.kcopy(self.dev.buffer_addr(&self.s.ctl), self.io_dev(Io::CTL), 32);
+        self.kcopy(self.dev.buffer_addr(&self.s.emb), self.io_dev(Io::EMB), t * HIDDEN * 4);
     }
 
     fn enqueue_outputs(&self, t: usize) {
-        unsafe {
-            gpu::check(
-                cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
-                    self.io.ptr(Io::IDS) as *mut std::ffi::c_void,
-                    Self::addr(&self.s.out_ids, &self.dev),
-                    t * 4,
-                    self.stream.0,
-                ),
-                "cuMemcpyDtoHAsync",
-            )
-            .expect("output copy");
-            if self.opts.split {
-                gpu::check(
-                    cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
-                        self.io.ptr(Io::STAMPS) as *mut std::ffi::c_void,
-                        Self::addr(&self.s.stamps, &self.dev),
-                        48 * 8 * 8,
-                        self.stream.0,
-                    ),
-                    "cuMemcpyDtoHAsync",
-                )
-                .expect("stamp copy");
-            }
+        self.kcopy(self.io_dev(Io::IDS), self.dev.buffer_addr(&self.s.out_ids), t * 4);
+        if self.opts.split {
+            self.kcopy(self.io_dev(Io::STAMPS), self.dev.buffer_addr(&self.s.stamps), 48 * 8 * 8);
         }
     }
 
@@ -1164,17 +1152,8 @@ impl Engine {
             unsafe {
                 gpu::launch(self.k.wait, (1, 1, 1), (32, 1, 1), 0, &self.stream, tang_moe::args![mb, flag, ctlw, layer, src, n, dst])
                     .expect("launch");
-                gpu::check(
-                    cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
-                        self.dev.buffer_addr(&self.s.ple_e),
-                        self.io.ptr(Io::PLE) as *const std::ffi::c_void,
-                        t * HIDDEN * 4,
-                        self.stream.0,
-                    ),
-                    "cuMemcpyHtoDAsync",
-                )
-                .expect("ple copy");
             }
+            self.kcopy(self.dev.buffer_addr(&self.s.ple_e), self.io_dev(Io::PLE), t * HIDDEN * 4);
         }
         let dev = &self.dev;
         let s = &mut self.s;
@@ -1549,18 +1528,7 @@ impl Engine {
     /// The commit after a verify window: replay the first `n_keep` (from `Io::CCTL`) tokens'
     /// recurrence into every GDN layer's state and conv history.
     fn enqueue_commit(&mut self, t: usize) {
-        unsafe {
-            gpu::check(
-                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
-                    self.dev.buffer_addr(&self.s.ctl),
-                    self.io.ptr(Io::CCTL) as *const std::ffi::c_void,
-                    32,
-                    self.stream.0,
-                ),
-                "cuMemcpyHtoDAsync",
-            )
-            .expect("commit ctl copy");
-        }
+        self.kcopy(self.dev.buffer_addr(&self.s.ctl), self.io_dev(Io::CCTL), 32);
         let dev = &self.dev;
         let s = &mut self.s;
         for layer in &mut self.layers {
@@ -1832,28 +1800,12 @@ impl Engine {
                 }
             }
             if dirty {
-                unsafe {
-                    gpu::check(
-                        cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
-                            self.dev.buffer_addr(&self.tables[l]),
-                            rc.device_addrs() + (base * 8) as u64,
-                            EXPERTS * 8,
-                            self.stream.0,
-                        ),
-                        "table copy",
-                    )
-                    .map_err(|e| anyhow!("{e}"))?;
-                    gpu::check(
-                        cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
-                            self.dev.buffer_addr(&self.host_tables[l]),
-                            self.host_addrs_pinned()[base..].as_ptr() as *const std::ffi::c_void,
-                            EXPERTS * 8,
-                            self.stream.0,
-                        ),
-                        "host table copy",
-                    )
-                    .map_err(|e| anyhow!("{e}"))?;
-                }
+                self.kcopy(self.dev.buffer_addr(&self.tables[l]), rc.device_addrs() + (base * 8) as u64, EXPERTS * 8);
+                self.kcopy(
+                    self.dev.buffer_addr(&self.host_tables[l]),
+                    self.host_addrs.device_ptr(base * 8).expect("mapped"),
+                    EXPERTS * 8,
+                );
             }
         }
         Ok(())
@@ -2673,30 +2625,12 @@ impl Engine {
     /// The whole MTP pass for `c` teacher-forced cells (inputs staged in `Io::MTP_IN`): cells,
     /// then two chain steps, then the drafts and probabilities to `Io::MTP_OUT`.
     fn enqueue_mtp(&mut self, c: usize) {
-        let st = self.stream.0;
         let mt = self.mtp.as_ref().expect("MTP loaded");
-        unsafe {
-            gpu::check(
-                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(self.dev.buffer_addr(&mt.toks), self.io.ptr(Io::MTP_IN) as *const _, 4 * MAX_T, st),
-                "mtp in",
-            )
-            .expect("copy");
-            gpu::check(
-                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(self.dev.buffer_addr(&mt.ctl[0]), self.io.ptr(Io::MTP_IN + 64) as *const _, 16, st),
-                "mtp ctl",
-            )
-            .expect("copy");
-            gpu::check(
-                cudarc::driver::sys::cuMemcpyDtoDAsync_v2(self.dev.buffer_addr(&mt.h), self.dev.buffer_addr(&self.s.r), c * HC * HIDDEN * 4, st),
-                "mtp h",
-            )
-            .expect("copy");
-            gpu::check(
-                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(self.dev.buffer_addr(&mt.e), self.io.ptr(Io::MTP_EMB) as *const _, c * HIDDEN * 4, st),
-                "mtp emb",
-            )
-            .expect("copy");
-        }
+        let a = |b: &B| self.dev.buffer_addr(b);
+        self.kcopy(a(&mt.toks), self.io_dev(Io::MTP_IN), 4 * MAX_T);
+        self.kcopy(a(&mt.ctl[0]), self.io_dev(Io::MTP_IN + 64), 16);
+        self.kcopy(a(&mt.h), a(&self.s.r), c * HC * HIDDEN * 4);
+        self.kcopy(a(&mt.e), self.io_dev(Io::MTP_EMB), c * HIDDEN * 4);
         self.enqueue_mtp_cells(0, c);
         let steps = self.mtp.as_ref().unwrap().steps;
         for step in 1..steps {
@@ -2712,28 +2646,8 @@ impl Engine {
         }
         let mt = self.mtp.as_ref().unwrap();
         for step in 0..steps {
-            unsafe {
-                gpu::check(
-                    cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
-                        self.io.ptr(Io::MTP_OUT + 64 * step) as *mut _,
-                        self.dev.buffer_addr(&mt.drafts[step]),
-                        4 * MAX_T,
-                        st,
-                    ),
-                    "mtp out",
-                )
-                .expect("copy");
-                gpu::check(
-                    cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
-                        self.io.ptr(Io::MTP_OUT + 64 * step + 32) as *mut _,
-                        self.dev.buffer_addr(&mt.probs[step]),
-                        4 * MAX_T,
-                        st,
-                    ),
-                    "mtp out",
-                )
-                .expect("copy");
-            }
+            self.kcopy(self.io_dev(Io::MTP_OUT + 64 * step), self.dev.buffer_addr(&mt.drafts[step]), 4 * MAX_T);
+            self.kcopy(self.io_dev(Io::MTP_OUT + 64 * step + 32), self.dev.buffer_addr(&mt.probs[step]), 4 * MAX_T);
         }
     }
 
