@@ -12,6 +12,8 @@ pub mod draft;
 pub mod engine;
 pub mod kvstore;
 pub mod model;
+pub mod node;
+pub mod queue;
 pub mod sample;
 pub mod server;
 pub mod slots;
@@ -30,14 +32,7 @@ pub fn resolve_model(spec: &str) -> anyhow::Result<PathBuf> {
     if p.join("config.json").exists() {
         return Ok(p);
     }
-    let hub = std::env::var_os("HF_HUB_CACHE")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HF_HOME").map(|h| PathBuf::from(h).join("hub")))
-        .or_else(|| {
-            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache/huggingface/hub"))
-        })
-        .unwrap_or_default();
-    let snaps = hub
+    let snaps = hf_hub_dir()
         .join(format!("models--{}", spec.replace('/', "--")))
         .join("snapshots");
     let mut dirs: Vec<_> = std::fs::read_dir(&snaps)
@@ -51,4 +46,15 @@ pub fn resolve_model(spec: &str) -> anyhow::Result<PathBuf> {
             snaps.display()
         )
     })
+}
+
+/// The Hugging Face hub cache: `HF_HUB_CACHE`, `$HF_HOME/hub`, or `~/.cache/huggingface/hub`.
+pub fn hf_hub_dir() -> PathBuf {
+    std::env::var_os("HF_HUB_CACHE")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HF_HOME").map(|h| PathBuf::from(h).join("hub")))
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache/huggingface/hub"))
+        })
+        .unwrap_or_default()
 }
