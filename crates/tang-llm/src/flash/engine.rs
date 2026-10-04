@@ -211,6 +211,8 @@ struct Hc {
     down: B,
     up: B,
     inject: Option<B>,
+    /// `TANG_FLASH_HC_Q8=1`: the matrices are `fl::hc_q8` buffers.
+    q8: bool,
 }
 
 impl Hc {
@@ -220,6 +222,7 @@ impl Hc {
             down: &self.down,
             up: &self.up,
             inject: self.inject.as_ref(),
+            q8: self.q8,
         }
     }
 }
@@ -634,7 +637,36 @@ impl Engine {
                 row16: row16(&[[30, e.n as u64, rb, 0, 0]]),
             })
         };
+        // TANG_FLASH_HC_Q8=1: hyper-connection weights at 8 bits (fl::hc_q8), quantized here from
+        // the packed bf16 (the packed up is hc_up_repack'ed: back to GGUF order first).
+        let hc_q8 = std::env::var("TANG_FLASH_HC_Q8").is_ok_and(|v| v == "1");
         let hc = |key: &str, inject: bool| -> Result<Hc> {
+            if hc_q8 {
+                let bits = |name: &str| -> Result<Vec<u16>> {
+                    let e = by.get(name).with_context(|| format!("pack has no {name}"))?;
+                    let b = pack::read_entry(&df, e)?;
+                    Ok(b.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect())
+                };
+                let w = HC * HIDDEN;
+                let rep = bits(&format!("{key}.up"))?;
+                let mut up = vec![0u16; rep.len()];
+                for row in 0..w {
+                    for k in 0..HC_LR {
+                        up[row * HC_LR + k] = rep[fl::hc_up_index(row, k)];
+                    }
+                }
+                return Ok(Hc {
+                    norm: get(&format!("{key}.norm"))?,
+                    down: dev.upload_bytes(&fl::hc_q8(&bits(&format!("{key}.down"))?, HC_LR, w, false)),
+                    up: dev.upload_bytes(&fl::hc_q8(&up, w, HC_LR, true)),
+                    inject: if inject {
+                        Some(dev.upload_bytes(&fl::hc_q8(&bits(&format!("{key}.inject"))?, HC, w, false)))
+                    } else {
+                        None
+                    },
+                    q8: true,
+                });
+            }
             Ok(Hc {
                 norm: get(&format!("{key}.norm"))?,
                 down: get(&format!("{key}.down"))?,
@@ -644,6 +676,7 @@ impl Engine {
                 } else {
                     None
                 },
+                q8: false,
             })
         };
         let max_ctx = opts.max_ctx.next_multiple_of(16);
@@ -2417,6 +2450,7 @@ impl Mtp {
                 } else {
                     None
                 },
+                q8: false,
             })
         };
         let q8 = std::env::var("TANG_FLASH_MTP_Q8").is_ok_and(|v| v == "1");
