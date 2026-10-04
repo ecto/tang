@@ -70,7 +70,11 @@ fn compare<D: ComputeDevice>(dev: D, dir: &Path, name: &str) {
     let n = ids.len();
 
     let cpu = Model::load(CpuDevice::new(), dir, n + 8, Dtype::Bf16).expect("load (cpu)");
-    let gpu = Model::load(dev, dir, n + 8, Dtype::Bf16).expect("load");
+    let mut gpu = Model::load(dev, dir, n + 8, Dtype::Bf16).expect("load");
+    // The kernels against the CPU, exactly: on the f32 cache like the CPU's. A bf16 cache moves
+    // logits by up to ~0.2 on small models, enough to flip a near-tied top-1 (Qwen3-0.6B, row 6,
+    // margin 0.03); `bf16_kv_matches_f32` holds that to its own bar.
+    gpu.set_kv_f32(true);
     let vocab = cpu.cfg.vocab_size;
     let want = cpu.forward(&ids, &mut cpu.new_cache(), true).unwrap();
 
