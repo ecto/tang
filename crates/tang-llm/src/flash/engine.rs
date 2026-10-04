@@ -103,6 +103,8 @@ impl Default for Opts {
 /// One segment of a [`Dw::Kn`] stack.
 enum KSeg {
     Nat(B, tang_compute::flash_native::NatType),
+    /// bf16 rows through the kernel track's strided bf16 GEMV (f32 activations).
+    Bf(B),
     Own(Dw),
 }
 
@@ -166,6 +168,7 @@ impl Dw {
                 for (seg, rows, off) in segs {
                     match seg {
                         KSeg::Nat(b, ty) => dev.native_linear_out_into(*ty, xq, b, out, *off, n, t, k, *rows),
+                        KSeg::Bf(b) => dev.bf16_linear_out_into(x, b, out, *off, n, t, k, *rows),
                         KSeg::Own(d) => d.native_ptr(dev, nk, dev.buffer_addr(x), dev.buffer_addr(out) + (*off * 4) as u64, t, k, n),
                     }
                 }
@@ -582,6 +585,9 @@ impl Engine {
                         let bytes = &raw[off..off + rows * rb];
                         let seg = match tang_compute::flash_native::NatType::from_ggml(ty as u32) {
                             Some(nt) => KSeg::Nat(dev.upload_native(nt, bytes, rows, e.k), nt),
+                            None if ty == 30 && std::env::var("TANG_FLASH_BF16_OWN").is_err() => KSeg::Bf(
+                                dev.upload_bf16(&bytes.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect::<Vec<_>>()),
+                            ),
                             None => {
                                 let wb = super::mtp_gpu::upload_padded(&dev, bytes);
                                 let p = dev.buffer_addr(&wb);
@@ -624,9 +630,12 @@ impl Engine {
         let bf16_native = |name: &str| -> Result<Dw> {
             let e = by.get(name).with_context(|| format!("pack has no {name}"))?;
             ensure!(e.fmt == Fmt::Bf16, "{name} isn't bf16");
-            let mut raw = pack::read_entry(&df, e)?;
-            raw.extend_from_slice(&[0u8; 16]);
-            let w = dev.upload_bytes(&raw);
+            let raw = pack::read_entry(&df, e)?;
+            if std::env::var("TANG_FLASH_BF16_OWN").is_err() {
+                let w = dev.upload_bf16(&raw.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect::<Vec<_>>());
+                return Ok(Dw::Kn(vec![(KSeg::Bf(w), e.n, 0)], e.n));
+            }
+            let w = super::mtp_gpu::upload_padded(&dev, &raw);
             let p = dev.buffer_addr(&w);
             let rb = (e.k * 2) as u64;
             Ok(Dw::Native {
@@ -738,19 +747,9 @@ impl Engine {
             key: {
                 let e = by.get("ple.key").context("pack has no ple.key")?;
                 ensure!(e.fmt == Fmt::Q2Raw, "ple.key must be Q2_0");
-                let mut raw = pack::read_entry(&std::fs::File::open(&dense_path)?, e)?;
-                raw.extend_from_slice(&[0u8; 16]);
-                let w = dev.upload_bytes(&raw);
-                let p = dev.buffer_addr(&w);
-                let rb = (e.k / 64 * 18) as u64;
-                let seg = [42u64, e.n as u64, rb, 0, 0];
-                Dw::Native {
-                    segs: dev.upload_u32(&[p as u32, (p >> 32) as u32, 42, e.n as u32, rb as u32, 0]),
-                    _w: w,
-                    nseg: 1,
-                    rows: e.n,
-                    row16: row16(&[seg]),
-                }
+                let raw = pack::read_entry(&std::fs::File::open(&dense_path)?, e)?;
+                let nt = tang_compute::flash_native::NatType::Q2_0;
+                Dw::Kn(vec![(KSeg::Nat(dev.upload_native(nt, &raw, e.n, e.k), nt), e.n, 0)], e.n)
             },
             value: bf16_native("ple.value")?,
             nk: get("ple.nk")?,
