@@ -6019,6 +6019,7 @@ dependencies = [
  "memmap2",
  "minijinja",
  "minijinja-contrib",
+ "rayon",
  "safetensors",
  "serde",
  "serde_json",
