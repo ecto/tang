@@ -19,6 +19,9 @@ const NULL: u64 = 0;
 /// Words of the per-device sync counters, and each fused kernel's slot in them.
 const SYNC_WORDS: usize = 256;
 const SYNC_HC: usize = 0;
+/// `fl_moe_fused`: PLAN_CAP group counters, then its last-block counter.
+const SYNC_MOE: usize = 64;
+const _: () = assert!(SYNC_MOE + MoePlan::CAP + 1 <= SYNC_WORDS);
 
 /// `TANG_FLASH_UNFUSED=1`: the multi-launch kernels instead of the barrier-merged ones (A/B).
 fn unfused() -> bool {
@@ -892,6 +895,35 @@ impl CudaComputeDevice {
         ];
         // A group has at most t entries (an expert appears once per token; the shared group has t).
         let tu = t as u32;
+        if !unfused() {
+            const FUSED: [&str; 8] = [
+                "fl_moe_fused_t1",
+                "fl_moe_fused_t2",
+                "fl_moe_fused_t3",
+                "fl_moe_fused_t4",
+                "fl_moe_fused_t5",
+                "fl_moe_fused_t6",
+                "fl_moe_fused_t7",
+                "fl_moe_fused_t8",
+            ];
+            let f = self.fl(FUSED[t - 1]);
+            let blocks = self.coresident(&f, 128, 8);
+            let mut sync = self.sync_words();
+            let mut cnt = sync.slice_mut(SYNC_MOE..SYNC_MOE + MoePlan::CAP + 1);
+            unsafe {
+                self.stream
+                    .launch_builder(&f)
+                    .arg(xq.f32_data())
+                    .arg(&tu)
+                    .arg(plan.f32_data())
+                    .arg(scratch.f32_data_mut())
+                    .arg(parts.f32_data_mut())
+                    .arg(&mut cnt)
+                    .launch(grid((blocks, 1, 1), 128))
+                    .unwrap();
+            }
+            return;
+        }
         let f = self.fl(GU[t - 1]);
         unsafe {
             self.stream
