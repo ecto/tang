@@ -5,7 +5,16 @@
 //! The block math, with its traps, is written up in `docs/strata.md`; what the GGUF actually holds
 //! is in `docs/flash-next-tensors.md`.
 
+#[cfg(feature = "cuda")]
+pub mod cli;
+#[cfg(feature = "cuda")]
+pub mod engine;
+#[cfg(feature = "cuda")]
+pub mod kernels;
+pub mod ngram;
+pub mod pack;
 pub mod reference;
+pub mod tokenize;
 
 use crate::gguf::{Gguf, TensorInfo};
 use anyhow::Result;

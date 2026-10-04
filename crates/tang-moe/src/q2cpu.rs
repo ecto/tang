@@ -146,6 +146,108 @@ impl XPrep {
     }
 }
 
+/// Where a matrix's 64-weight blocks live in its bytes. A row is `k / 64` blocks; block `c` of
+/// row `r` has its 16 code bytes at `cb + c·cs` and its fp16 scale at `sb + c·ss`, where
+/// `(cb, cs, sb, ss) = layout.row(n, k, r)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Layout {
+    /// [`crate::contract::q2_repack`]: `[n][k/4]` codes, then `[n][k/64]` fp16 scales. `wb` is
+    /// the matrix.
+    Plain,
+    /// tang-compute's `flash::ExpertBlob` gate/up tiles (`wb` is the whole blob): gu row
+    /// `2r + up` is gate (`up = false`) or up row `r`; tile `i` holds gu rows `4i..4i + 4` as
+    /// `[40 cols][4 rows]` × 16 B, scales in the same order in their own plane.
+    GuTiled { up: bool },
+    /// tang-compute's `flash::ExpertBlob` down tiles (`wb` is the whole blob): tile `i` holds rows
+    /// `16i..16i + 16` as `[10 cols][16 rows]` × 16 B, scales likewise.
+    DownTiled,
+}
+
+impl Layout {
+    /// Gate/up codes, gate/up scales, down codes, down scales: tang-compute `ExpertBlob` offsets.
+    const GU_SCALES: usize = 2 * crate::contract::FF * crate::contract::HIDDEN / 4;
+    const DOWN_CODES: usize = Self::GU_SCALES + 2 * crate::contract::FF * crate::contract::HIDDEN / 32;
+    const DOWN_SCALES: usize = Self::DOWN_CODES + crate::contract::HIDDEN * crate::contract::FF / 4;
+
+    /// `(cb, cs, sb, ss)` of row `r` of an `[n, k]` matrix.
+    #[inline]
+    pub fn row(self, n: usize, k: usize, r: usize) -> (usize, usize, usize, usize) {
+        match self {
+            Layout::Plain => (r * k / 4, 16, n * k / 4 + r * (k / 64) * 2, 2),
+            Layout::GuTiled { up } => {
+                let g = 2 * r + up as usize;
+                let i = (g / 4) * 160 + g % 4;
+                (16 * i, 64, Self::GU_SCALES + 2 * i, 8)
+            }
+            Layout::DownTiled => {
+                let i = (r / 16) * 160 + r % 16;
+                (Self::DOWN_CODES + 16 * i, 256, Self::DOWN_SCALES + 2 * i, 32)
+            }
+        }
+    }
+
+    /// The 32 code bytes of blocks `2g, 2g + 1` of a row (the unit the kernels decode).
+    #[inline]
+    fn pair<'a>(self, wb: &'a [u8], (cb, cs, _, _): (usize, usize, usize, usize), g: usize, buf: &'a mut [u8; 32]) -> &'a [u8] {
+        if cs == 16 {
+            &wb[cb + g * 32..cb + g * 32 + 32]
+        } else {
+            let (a, b) = (cb + 2 * g * cs, cb + (2 * g + 1) * cs);
+            buf[..16].copy_from_slice(&wb[a..a + 16]);
+            buf[16..].copy_from_slice(&wb[b..b + 16]);
+            &buf[..]
+        }
+    }
+}
+
+/// [`rows`] for a matrix stored in `layout` (`wb` as that layout says).
+#[allow(clippy::too_many_arguments)]
+pub fn rows_in(
+    isa: Isa,
+    layout: Layout,
+    wb: &[u8],
+    n: usize,
+    k: usize,
+    r0: usize,
+    r1: usize,
+    xs: &[&XPrep],
+    out: &mut [f32],
+) {
+    let t = xs.len();
+    assert!((1..=8).contains(&t) && r1 <= n && r0 <= r1);
+    assert!(k.is_multiple_of(128) && out.len() >= (r1 - r0) * t);
+    if r1 > r0 {
+        let (cb, cs, sb, ss) = layout.row(n, k, r1 - 1);
+        assert!(cb + (k / 64 - 1) * cs + 16 <= wb.len() && sb + (k / 64 - 1) * ss + 2 <= wb.len());
+    }
+    for x in xs {
+        assert_eq!(x.k, k);
+    }
+    macro_rules! go {
+        ($f:ident) => {
+            match t {
+                1 => $f::<1>(layout, wb, n, k, r0, r1, xs, out),
+                2 => $f::<2>(layout, wb, n, k, r0, r1, xs, out),
+                3 => $f::<3>(layout, wb, n, k, r0, r1, xs, out),
+                4 => $f::<4>(layout, wb, n, k, r0, r1, xs, out),
+                5 => $f::<5>(layout, wb, n, k, r0, r1, xs, out),
+                6 => $f::<6>(layout, wb, n, k, r0, r1, xs, out),
+                7 => $f::<7>(layout, wb, n, k, r0, r1, xs, out),
+                _ => $f::<8>(layout, wb, n, k, r0, r1, xs, out),
+            }
+        };
+    }
+    match isa {
+        Isa::Lane => go!(rows_lane),
+        #[cfg(target_arch = "x86_64")]
+        Isa::Avx2 => unsafe { go!(rows_avx2) },
+        #[cfg(target_arch = "x86_64")]
+        Isa::AvxVnni => unsafe { go!(rows_vnni) },
+        #[allow(unreachable_patterns)]
+        _ => panic!("{isa:?} not available on this target"),
+    }
+}
+
 /// Rows `r0..r1` of repacked Q2_0 `[n, k]` matrix `wb` against tokens `xs` (1..=8, all width
 /// `k`). Writes `out[(r - r0) · T + t]`. Each 32-byte code load is decoded once and dotted
 /// against every token.
@@ -164,36 +266,8 @@ pub fn rows(
     xs: &[&XPrep],
     out: &mut [f32],
 ) {
-    let t = xs.len();
-    assert!((1..=8).contains(&t) && r1 <= n && r0 <= r1);
-    assert!(k.is_multiple_of(128) && wb.len() >= n * k / 4 + n * k / 32);
-    assert!(out.len() >= (r1 - r0) * t);
-    for x in xs {
-        assert_eq!(x.k, k);
-    }
-    macro_rules! go {
-        ($f:ident) => {
-            match t {
-                1 => $f::<1>(wb, n, k, r0, r1, xs, out),
-                2 => $f::<2>(wb, n, k, r0, r1, xs, out),
-                3 => $f::<3>(wb, n, k, r0, r1, xs, out),
-                4 => $f::<4>(wb, n, k, r0, r1, xs, out),
-                5 => $f::<5>(wb, n, k, r0, r1, xs, out),
-                6 => $f::<6>(wb, n, k, r0, r1, xs, out),
-                7 => $f::<7>(wb, n, k, r0, r1, xs, out),
-                _ => $f::<8>(wb, n, k, r0, r1, xs, out),
-            }
-        };
-    }
-    match isa {
-        Isa::Lane => go!(rows_lane),
-        #[cfg(target_arch = "x86_64")]
-        Isa::Avx2 => unsafe { go!(rows_avx2) },
-        #[cfg(target_arch = "x86_64")]
-        Isa::AvxVnni => unsafe { go!(rows_vnni) },
-        #[allow(unreachable_patterns)]
-        _ => panic!("{isa:?} not available on this target"),
-    }
+    assert!(wb.len() >= n * k / 4 + n * k / 32);
+    rows_in(isa, Layout::Plain, wb, n, k, r0, r1, xs, out)
 }
 
 /// The fixed tree the SIMD paths use to sum 8 lanes.
@@ -202,15 +276,17 @@ fn hsum8(a: [f32; 8]) -> f32 {
     (l[0] + l[2]) + (l[1] + l[3])
 }
 
-fn scale_pair(wb: &[u8], n: usize, k: usize, r: usize, g: usize) -> (f32, f32) {
-    let b = n * k / 4 + r * (k / 64) * 2 + 4 * g;
+fn scale_pair(wb: &[u8], (_, _, sb, ss): (usize, usize, usize, usize), g: usize) -> (f32, f32) {
+    let (a, b) = (sb + 2 * g * ss, sb + (2 * g + 1) * ss);
     (
+        crate::contract::f16_to_f32(u16::from_le_bytes([wb[a], wb[a + 1]])),
         crate::contract::f16_to_f32(u16::from_le_bytes([wb[b], wb[b + 1]])),
-        crate::contract::f16_to_f32(u16::from_le_bytes([wb[b + 2], wb[b + 3]])),
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rows_lane<const T: usize>(
+    layout: Layout,
     wb: &[u8],
     n: usize,
     k: usize,
@@ -221,10 +297,11 @@ fn rows_lane<const T: usize>(
 ) {
     for r in r0..r1 {
         let mut acc = [[0f32; 8]; T];
-        let crow = &wb[r * k / 4..(r + 1) * k / 4];
+        let ra = layout.row(n, k, r);
+        let mut buf = [0u8; 32];
         for g in 0..k / 128 {
-            let v = &crow[g * 32..g * 32 + 32];
-            let (d0, d1) = scale_pair(wb, n, k, r, g);
+            let v = layout.pair(wb, ra, g, &mut buf);
+            let (d0, d1) = scale_pair(wb, ra, g);
             for (t, acc) in acc.iter_mut().enumerate() {
                 let x = xs[t];
                 for i in 0..8 {
@@ -254,7 +331,9 @@ macro_rules! simd_rows {
         /// Two rows at a time when there are ≤ 4 tokens (independent chains for the
         /// out-of-order core), one row otherwise (register pressure).
         #[target_feature(enable = $feat)]
+        #[allow(clippy::too_many_arguments)]
         unsafe fn $name<const T: usize>(
+            layout: Layout,
             wb: &[u8],
             n: usize,
             k: usize,
@@ -266,22 +345,24 @@ macro_rules! simd_rows {
             if T <= 4 {
                 let mut r = r0;
                 while r + 2 <= r1 {
-                    $inner::<T, 2>(wb, n, k, r, r0, xs, out);
+                    $inner::<T, 2>(layout, wb, n, k, r, r0, xs, out);
                     r += 2;
                 }
                 if r < r1 {
-                    $inner::<T, 1>(wb, n, k, r, r0, xs, out);
+                    $inner::<T, 1>(layout, wb, n, k, r, r0, xs, out);
                 }
             } else {
                 for r in r0..r1 {
-                    $inner::<T, 1>(wb, n, k, r, r0, xs, out);
+                    $inner::<T, 1>(layout, wb, n, k, r, r0, xs, out);
                 }
             }
         }
 
         #[target_feature(enable = $feat)]
         #[inline]
+        #[allow(clippy::too_many_arguments)]
         unsafe fn $inner<const T: usize, const R: usize>(
+            layout: Layout,
             wb: &[u8],
             n: usize,
             k: usize,
@@ -293,21 +374,36 @@ macro_rules! simd_rows {
             use std::arch::x86_64::*;
             let mask = _mm256_set1_epi8(3);
             let perm = _mm256_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1);
-            let codes = wb.as_ptr();
-            let scales = wb.as_ptr().add(n * k / 4);
+            let base = wb.as_ptr();
+            let mut ra = [(0usize, 0usize, 0usize, 0usize); R];
+            for (ri, a) in ra.iter_mut().enumerate() {
+                *a = layout.row(n, k, r + ri);
+            }
             let mut acc = [[_mm256_setzero_ps(); T]; R];
             for g in 0..k / 128 {
                 let mut v = [[_mm256_setzero_si256(); 4]; R];
                 let mut dw = [_mm256_setzero_ps(); R];
                 for (ri, (vr, dwr)) in v.iter_mut().zip(dw.iter_mut()).enumerate() {
-                    let raw =
-                        _mm256_loadu_si256(codes.add((r + ri) * k / 4 + g * 32) as *const __m256i);
+                    let (cb, cs, sb, ss) = ra[ri];
+                    let raw = if cs == 16 {
+                        _mm256_loadu_si256(base.add(cb + g * 32) as *const __m256i)
+                    } else {
+                        _mm256_loadu2_m128i(
+                            base.add(cb + (2 * g + 1) * cs) as *const __m128i,
+                            base.add(cb + 2 * g * cs) as *const __m128i,
+                        )
+                    };
                     vr[0] = _mm256_and_si256(raw, mask);
                     vr[1] = _mm256_and_si256(_mm256_srli_epi32(raw, 2), mask);
                     vr[2] = _mm256_and_si256(_mm256_srli_epi32(raw, 4), mask);
                     vr[3] = _mm256_and_si256(_mm256_srli_epi32(raw, 6), mask);
-                    let dpair = (scales.add((r + ri) * (k / 64) * 2 + g * 4) as *const i32)
-                        .read_unaligned();
+                    let dpair = if ss == 2 {
+                        (base.add(sb + g * 4) as *const i32).read_unaligned()
+                    } else {
+                        let lo = (base.add(sb + 2 * g * ss) as *const u16).read_unaligned();
+                        let hi = (base.add(sb + (2 * g + 1) * ss) as *const u16).read_unaligned();
+                        (lo as u32 | (hi as u32) << 16) as i32
+                    };
                     *dwr = _mm256_permutevar8x32_ps(_mm256_cvtph_ps(_mm_set1_epi32(dpair)), perm);
                 }
                 for t in 0..T {
@@ -480,6 +576,59 @@ pub(crate) mod tests {
                 .flatten()
                 .zip(b.dx.iter().flatten())
                 .all(|(p, q)| p.to_bits() == q.to_bits()));
+        }
+    }
+
+    /// A `contract::ExpertBlob` rearranged into tang-compute's tiled `flash::ExpertBlob`.
+    fn tile(plain: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8; ExpertBlob::BYTES];
+        let mut put = |src: &[u8], n: usize, k: usize, lay: Layout| {
+            for r in 0..n {
+                let (cb, cs, sb, ss) = lay.row(n, k, r);
+                let (pcb, _, psb, _) = Layout::Plain.row(n, k, r);
+                for c in 0..k / 64 {
+                    out[cb + c * cs..cb + c * cs + 16]
+                        .copy_from_slice(&src[pcb + 16 * c..pcb + 16 * c + 16]);
+                    out[sb + c * ss..sb + c * ss + 2]
+                        .copy_from_slice(&src[psb + 2 * c..psb + 2 * c + 2]);
+                }
+            }
+        };
+        put(&plain[ExpertBlob::GATE..ExpertBlob::UP], FF, HIDDEN, Layout::GuTiled { up: false });
+        put(&plain[ExpertBlob::UP..ExpertBlob::DOWN], FF, HIDDEN, Layout::GuTiled { up: true });
+        put(&plain[ExpertBlob::DOWN..], HIDDEN, FF, Layout::DownTiled);
+        out
+    }
+
+    #[test]
+    fn tiled_layout_matches_plain_bitwise() {
+        let mut rng = Rng(13);
+        let plain = blob(&mut rng);
+        let tiled = tile(&plain);
+        let xq = acts(&mut rng, 3, HIDDEN);
+        let hq = acts(&mut rng, 3, FF);
+        for t in [1, 3] {
+            let xs: Vec<XPrep> = (0..t).map(|r| XPrep::from_qact(&xq, QAct { m: 3, k: HIDDEN }, r)).collect();
+            let hs: Vec<XPrep> = (0..t).map(|r| XPrep::from_qact(&hq, QAct { m: 3, k: FF }, r)).collect();
+            let xr: Vec<&XPrep> = xs.iter().collect();
+            let hr: Vec<&XPrep> = hs.iter().collect();
+            for isa in Isa::available() {
+                for (lay, pw, n, k, x) in [
+                    (Layout::GuTiled { up: false }, &plain[ExpertBlob::GATE..ExpertBlob::UP], FF, HIDDEN, &xr),
+                    (Layout::GuTiled { up: true }, &plain[ExpertBlob::UP..ExpertBlob::DOWN], FF, HIDDEN, &xr),
+                    (Layout::DownTiled, &plain[ExpertBlob::DOWN..], HIDDEN, FF, &hr),
+                ] {
+                    let (r0, r1) = (5, n - 3);
+                    let mut a = vec![0f32; (r1 - r0) * t];
+                    let mut b = vec![1f32; (r1 - r0) * t];
+                    rows(isa, pw, n, k, r0, r1, x, &mut a);
+                    rows_in(isa, lay, &tiled, n, k, r0, r1, x, &mut b);
+                    assert!(
+                        a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()),
+                        "{isa:?} {lay:?} t={t}"
+                    );
+                }
+            }
         }
     }
 

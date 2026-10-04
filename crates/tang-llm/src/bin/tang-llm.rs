@@ -181,6 +181,14 @@ fn main() -> Result<()> {
     if cmd == "flash-ref" {
         return tang_llm::flash::reference::cli(&args[1..]);
     }
+    #[cfg(feature = "cuda")]
+    match cmd {
+        "flash-generate" => return tang_llm::flash::cli::generate(&args[1..]),
+        "flash-parity" => return tang_llm::flash::cli::parity(&args[1..]),
+        "flash-bench" => return tang_llm::flash::cli::bench(&args[1..]),
+        "flash-gemv-check" => return tang_llm::flash::engine::gemv_check(&dir),
+        _ => {}
+    }
     if cmd == "sim-spec" {
         return sim_spec(&args[1..]);
     }

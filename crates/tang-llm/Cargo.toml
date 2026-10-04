@@ -14,7 +14,7 @@ publish = false
 default = []
 metal = ["tang-compute/metal"]
 # NVIDIA GPUs. On Linux, build with `--no-default-features --features cuda` (Metal is macOS-only).
-cuda = ["tang-compute/cuda"]
+cuda = ["tang-compute/cuda", "dep:tang-moe", "tang-moe/cuda", "dep:cudarc"]
 
 [dependencies]
 tang-compute = { workspace = true }
@@ -32,6 +32,9 @@ tokio = { workspace = true }
 tokio-stream = "0.1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 base64 = "0.22"
+libc = "0.2"
+tang-moe = { path = "../tang-moe", optional = true }
+cudarc = { version = "0.16", features = ["nvrtc", "cuda-version-from-build-system"], optional = true }
 
 [[example]]
 name = "bench_ops"

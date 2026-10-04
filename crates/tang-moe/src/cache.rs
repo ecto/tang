@@ -405,6 +405,26 @@ impl ResidentCache {
         ranking: impl IntoIterator<Item = u32>,
         src: impl Fn(u32) -> &'a [u8],
     ) -> Result<Self> {
+        Self::new_fill(gpu, geo, params, n_slots, n_scratch, ranking, |k, dst| {
+            let bytes = src(k);
+            assert_eq!(bytes.len(), dst.len());
+            dst.copy_from_slice(bytes)
+        })
+    }
+
+    /// [`new`](Self::new) with `fill(key, dst)` writing each key's bytes into `dst` (straight
+    /// into the host arena for host keys, a staging buffer for slot keys), in key order, so a
+    /// loader can stream from a file without holding or mapping the whole set.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_fill(
+        gpu: &Gpu,
+        geo: Geometry,
+        params: AdaptParams,
+        n_slots: usize,
+        n_scratch: usize,
+        ranking: impl IntoIterator<Item = u32>,
+        mut fill: impl FnMut(u32, &mut [u8]),
+    ) -> Result<Self> {
         use crate::arena::ArenaOptions;
         use crate::resident::{Loc, ResidentPolicy};
         gpu.bind()?;
@@ -415,14 +435,16 @@ impl ResidentCache {
         host.register(&gpu.ctx, &[1 << 30, 256 << 20])?;
         let vram = DevBuf::alloc(n_slots.max(1) * blob)?;
         let scratch = DevBuf::alloc(n_scratch.max(1) * blob)?;
+        let mut stage = vec![0u8; blob];
         for k in 0..geo.keys() as u32 {
-            let bytes = src(k);
-            assert_eq!(bytes.len(), blob);
             match policy.loc(k) {
-                Loc::Slot(s) => vram.write(s as usize * blob, bytes)?,
+                Loc::Slot(s) => {
+                    fill(k, &mut stage);
+                    vram.write(s as usize * blob, &stage)?
+                }
                 Loc::Host(h) => {
                     let hb = unsafe { host.bytes_mut() };
-                    hb[h as usize * blob..(h as usize + 1) * blob].copy_from_slice(bytes);
+                    fill(k, &mut hb[h as usize * blob..(h as usize + 1) * blob]);
                 }
                 Loc::Scratch(_) => unreachable!(),
             }

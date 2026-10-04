@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use crate::contract::{silu, ExpertBlob, MoePlan, QAct, FF, HIDDEN, MAX_T, TOPK};
 use crate::pool::Pool;
-use crate::q2cpu::{rows, Isa, XPrep};
+use crate::q2cpu::{rows_in, Isa, Layout, XPrep};
 
 /// A missed expert and the routed occurrences it must serve.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,6 +137,9 @@ pub struct MissExec {
     pub isa: Isa,
     /// Ranges per thread per phase.
     pub split: usize,
+    /// Blobs are tang-compute's tiled `flash::ExpertBlob` (the GPU kernels' layout, so one
+    /// copy serves VRAM slots and the host arena) instead of `contract::ExpertBlob`.
+    pub tiled: bool,
     x: Vec<XPrep>,
     h: Vec<f32>,
     hprep: Vec<XPrep>,
@@ -148,6 +151,7 @@ impl MissExec {
             pool,
             isa,
             split: 3,
+            tiled: false,
             x: (0..MAX_T).map(|_| XPrep::new(HIDDEN)).collect(),
             h: vec![0.0; MAX_MISSED * MAX_T * FF],
             hprep: (0..MAX_MISSED * MAX_T).map(|_| XPrep::new(FF)).collect(),
@@ -192,6 +196,7 @@ impl MissExec {
 
         let threads = self.pool.threads();
         let isa = self.isa;
+        let tiled = self.tiled;
         let nj = jobs.len();
         let ranges = |total: usize| (self.split * threads).min(total.div_ceil(8)).max(1);
 
@@ -215,26 +220,23 @@ impl MissExec {
                 }
                 let toks = &tk[..nt];
                 let (mut g, mut u) = ([0f32; 32 * MAX_T], [0f32; 32 * MAX_T]);
-                rows(
-                    isa,
-                    &j.blob[ExpertBlob::GATE..ExpertBlob::UP],
-                    FF,
-                    HIDDEN,
-                    r0,
-                    r1,
-                    toks,
-                    &mut g,
-                );
-                rows(
-                    isa,
-                    &j.blob[ExpertBlob::UP..ExpertBlob::DOWN],
-                    FF,
-                    HIDDEN,
-                    r0,
-                    r1,
-                    toks,
-                    &mut u,
-                );
+                let (gl, gw, ul, uw) = if tiled {
+                    (
+                        Layout::GuTiled { up: false },
+                        &j.blob[..],
+                        Layout::GuTiled { up: true },
+                        &j.blob[..],
+                    )
+                } else {
+                    (
+                        Layout::Plain,
+                        &j.blob[ExpertBlob::GATE..ExpertBlob::UP],
+                        Layout::Plain,
+                        &j.blob[ExpertBlob::UP..ExpertBlob::DOWN],
+                    )
+                };
+                rows_in(isa, gl, gw, FF, HIDDEN, r0, r1, toks, &mut g);
+                rows_in(isa, ul, uw, FF, HIDDEN, r0, r1, toks, &mut u);
                 for rr in r0..r1 {
                     for ti in 0..nt {
                         let v = silu(g[(rr - r0) * nt + ti]) * u[(rr - r0) * nt + ti];
@@ -284,16 +286,12 @@ impl MissExec {
                 }
                 let hs = &hk[..nt];
                 let mut y = [0f32; 64 * MAX_T];
-                rows(
-                    isa,
-                    &j.blob[ExpertBlob::DOWN..ExpertBlob::BYTES],
-                    HIDDEN,
-                    FF,
-                    r0,
-                    r1,
-                    hs,
-                    &mut y,
-                );
+                let (dl, dw) = if tiled {
+                    (Layout::DownTiled, &j.blob[..])
+                } else {
+                    (Layout::Plain, &j.blob[ExpertBlob::DOWN..ExpertBlob::BYTES])
+                };
+                rows_in(isa, dl, dw, HIDDEN, FF, r0, r1, hs, &mut y);
                 for (ti, &(_, dst)) in j.toks.iter().enumerate() {
                     for rr in r0..r1 {
                         // SAFETY: caller guarantees the rows; (dst, rr) has one writer.
