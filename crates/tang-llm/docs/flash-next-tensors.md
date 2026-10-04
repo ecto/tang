@@ -248,6 +248,78 @@ tang-llm flash-ref <first shard> --ids-file chat.ids --top 40 --dump dump_chat >
 python3 $S compare llama_chat.jsonl tang_chat.jsonl [--from I --to J]
 ```
 
+## Hyper-connection weight precision
+
+The HC matrices (`blk.N.hc_{attn,ffn}_{down,up,inject}`, `output_hc_{down,up}`: 639.6 M weights)
+are 1.279 GB of BF16 read every step. `flash-ref --act-int8 --hc-as <fmt>` round-trips them
+(`--hc-as down=q5,up=fp8,...` per matrix) with the kernels' contract for HC GEMVs, **f32
+activations** (`tang_compute::flash`: bf16 weights always multiply fp32 activations);
+`--hc-act-int8` tries int8 instead. KL / top-1 vs the f32 reference; the band (int8 activations
+elsewhere, HC bf16) is 0.0027 / 0.0016 / 0.0016 / 0.0056.
+
+| HC format | Bytes/step | chat | code | chat2 | long |
+|---|---|---|---|---|---|
+| bf16 (band) | 1,279 MB | 0.0027 / 98.4% | 0.0016 / 99.1% | 0.0016 / 99.0% | 0.0056 / 97.6% |
+| **FP8 E4M3, f32 scale per row** | **644 MB** | 0.0025 / 96.9% | 0.0019 / 99.7% | 0.0016 / 99.0% | 0.0078 / 96.8% |
+| Q8_0 (int8, f16 scale per 32) | 680 MB | 0.0042 / 95.3% | 0.0018 / 100% | 0.0018 / 98.4% | 0.0077 / 96.7% |
+| int8, f32 scale per row | 644 MB | | 0.0032 / 98.7% | 0.0024 / 98.4% | |
+| 6-bit symmetric per 32 | 520 MB | 0.0094 / 96.9% | 0.0057 / 98.7% | 0.0044 / 96.4% | 0.0145 / 95.7% |
+| 5-bit symmetric per 32 | 440 MB | | 0.0155 / 96.9% | 0.0132 / 96.4% | |
+| Q8_0 with int8 activations | 680 MB | | 0.0050 / 98.7% | 0.0047 / 97.4% | |
+| down q5, inject q5, up fp8, out fp8 | 544 MB | | 0.0036 / 98.1% | 0.0028 / 97.9% | 0.0104 / 96.6% |
+| down Q4X, inject q5, up fp8, out fp8 | 505 MB | | 0.0032 / 98.4% | 0.0035 / 97.4% | 0.0143 / 96.3% |
+| down q5, inject q5, up q8, out q8 | 563 MB | | 0.0052 / 97.5% | 0.0033 / 97.7% | |
+| down q5, inject q5, up q6, out q6 | 482 MB | | 0.0067 / 98.4% | 0.0055 / 96.6% | |
+
+Which matrix is sensitive (one matrix at 5 bits, rest bf16; code / chat2): `down` 0.0030 /
+0.0019, `inject` 0.0026 / 0.0014, `out` 0.0019 / 0.0018, **`up` 0.0118 / 0.0128**. `up` makes the
+per-stream gate `sigmoid(up · lo)` that scales every stream, so its error reaches the residual
+directly. Int8 activations hurt through the same matrix: on `down` alone 0.0018 / 0.0017
+(band), on `up` alone 0.0042 / 0.0048 (its input `lo = silu(down·xn / 4)` is only 320 wide).
+
+**Recommendation:** FP8 E4M3 with one f32 scale per row (or Q8_0, equally good and an easier
+int8 decode) for all HC matrices, f32 activations: 644 MB instead of 1,279 MB, saving 636 MB a
+step (≈ half the HC time, ~1.2 ms of the 2.4 ms). It's at the band on chat, code and chat2 and
++0.002 over it on long, inside the run-to-run sensitivity there (our own f32 vs llama-numerics
+on long is 0.0083). Going below 8 bits is not worth it: 5-bit or Q4X `down`/`inject` saves another ~100–140 MB and
+costs +0.001–0.002 KL on code and chat2, but long gets worse (0.0104 / 0.0143 against 0.0078).
+`up` must stay ≥ 8 bits and keep f32 activations.
+
+## One-layer-ahead expert prediction
+
+`flash-ref --lookahead FILE` records, for every layer `l ≥ 1` and token, the true top-10 and the
+top-32 that layer `l`'s router gives on stand-ins from layer `l − 1`, always passed through layer
+`l`'s real `hc_ffn` read: (`x_l`) layer `l−1`'s MoE input straight into router `l` (no hc read);
+(`r_mid`) the residual after layer `l−1`'s mixer, before its MoE — available when layer `l−1`
+routes; (`r_mid+mean_moe`) that plus the sequence-mean MoE write of layer `l−1` (the
+"quasi-hidden state" of arXiv 2603.19289); (`r_post`) the residual after layer `l−1`'s MoE —
+available only once its experts finish. `scripts/flash_lookahead.py` scores them. Resident set:
+the hottest 50% of all 24,576 (layer, expert) pairs counted on *other* sequences (code + chat2
+scored against a profile from long, and long against code + chat2); recall on misses counts the
+true experts outside it; false prefetches are predicted non-resident experts the token didn't use.
+
+| Method | m | recall (long) | recall (code+chat2) | miss recall: code+chat2 (hit 0.81) | miss recall: long (hit 0.86) | false prefetches / token-layer (code+chat2 / long) |
+|---|---|---|---|---|---|---|
+| `x_l` | 16 | 0.773 | 0.780 | 0.785 | 0.682 | 2.83 / 2.59 |
+| `r_mid` | 10 | 0.761 | 0.777 | 0.747 | 0.647 | 0.66 / 0.61 |
+| **`r_mid`** | **16** | **0.886** | **0.900** | **0.892** | **0.813** | **2.23 / 1.99** |
+| `r_mid` | 24 | 0.936 | 0.946 | 0.945 | 0.893 | 5.11 / 4.59 |
+| `r_mid` | 32 | 0.956 | 0.963 | 0.964 | 0.928 | 8.43 / 7.72 |
+| `r_mid+mean_moe` | 16 | 0.875 | 0.891 | 0.887 | 0.819 | 2.38 / 2.22 |
+| `r_post` | 16 | 0.910 | 0.923 | 0.927 | 0.874 | 2.29 / 2.14 |
+
+True misses per token-layer at that resident set: 1.95 (code+chat2), 1.40 (long); at 75% resident
+(hit 0.964 on long) 0.36, with `r_mid` m=16 still covering 0.787 of them for 0.69 false prefetches.
+Per layer, `r_mid` recall@16 is 0.80–0.97 everywhere except layer 1 (0.47, the PLE block sits
+between the two routers) and the last three layers (0.80–0.83). The quasi-hidden mean-MoE
+correction doesn't help here (it's worse at layer 1, where PLE dominates, and level elsewhere).
+
+Read: worth building. Routing layer `l+1` from layer `l`'s post-mixer residual — one extra
+hc_read plus a router GEMV, both on weights already resident — names 89% of the next
+layer's experts and 81–89% of its *misses* with a 16-wide guess, so CPU expert work and PCIe
+copies for the next layer can start a full MoE ahead, at 1.1–1.4 false prefetches per true miss.
+Speculative work is wasted only on the ~2 false prefetches per token-layer, never wrong output.
+
 ## Dense requantization for the fast kernels
 
 The GPU kernels take a dense weight as bf16, native Q2_0, or Q4X (tang-Q4: affine 4-bit, group 64,
