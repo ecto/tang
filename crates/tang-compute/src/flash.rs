@@ -630,6 +630,24 @@ pub fn qsa_score_blocks(max_ctx: usize) -> usize {
 /// Complete indexer blocks a token keeps (top_k / 4).
 pub const QSA_BLOCKS: usize = 512;
 
+/// Capacity in blocks of a window's union of selections (`qsa_select_union_into`).
+pub fn qsa_union_cap(t: usize) -> usize {
+    t * (QSA_BLOCKS + 1) + 2
+}
+
+/// Words of the union buffer: `[max_blocks]` per-block token masks (all zero between uses; the
+/// union step clears them), then the union's blocks `[cap]`, their masks `[cap]`, and the count.
+/// Zero it once at allocation.
+pub fn qsa_union_words(max_blocks: usize, t: usize) -> usize {
+    max_blocks + 2 * qsa_union_cap(t) + 1
+}
+
+/// Words of `qsa_attend_union_into` scratch: per token, head and 64-cell union chunk,
+/// `[m, l, acc[QSA_D]]`.
+pub fn qsa_union_scratch_words(t: usize) -> usize {
+    t * QSA_HEADS * qsa_union_cap(t).div_ceil(16) * (QSA_D + 2)
+}
+
 /// Selected cells per attention chunk (the split-K unit of `qsa_attend_into`).
 pub const QSA_CHUNK: usize = 64;
 

@@ -1629,6 +1629,54 @@ pub trait ComputeDevice: Send {
         *ids = self.upload_u32(&iv);
     }
 
+    /// [`qsa_select_into`](Self::qsa_select_into), and also the window's union of selected
+    /// blocks into `union` ([`crate::flash::qsa_union_words`]; zero it once at allocation) for
+    /// [`qsa_attend_union_into`](Self::qsa_attend_union_into). The default leaves `union`
+    /// alone (the default attention reads `ids`).
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_select_union_into(
+        &self,
+        pooled: &Self::Buffer,
+        q: &Self::Buffer,
+        win: &Self::Buffer,
+        scores: &mut Self::Buffer,
+        ids: &mut Self::Buffer,
+        _union: &mut Self::Buffer,
+        max_blocks: usize,
+        t: usize,
+    ) {
+        self.qsa_select_into(pooled, q, win, scores, ids, max_blocks, t);
+    }
+
+    /// [`qsa_attend_into`](Self::qsa_attend_into) computed over the window's union of
+    /// selections: every token still attends to exactly its own selected cells (cells it did
+    /// not select score −∞), but each key and value row is read once per window instead of
+    /// once per token. Same result up to fp32 summation order. The default runs
+    /// `qsa_attend_into` on `ids`. On mew (3090, 4K context) the CUDA version is slower than
+    /// per-token `qsa_attend_into` (T = 4: 2.15 vs 0.78 ms for 12 layers): concurrent per-token
+    /// blocks already share the rows through L2, and the union kernel walks the tokens serially.
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_attend_union_into(
+        &self,
+        q: &Self::Buffer,
+        k_cache: &Self::Buffer,
+        v_cache: &Self::Buffer,
+        ids: &Self::Buffer,
+        _union: &Self::Buffer,
+        _max_blocks: usize,
+        proj: &Self::Buffer,
+        stride: usize,
+        win: &Self::Buffer,
+        scratch: &mut Self::Buffer,
+        out: &mut Self::Buffer,
+        outq: Option<&mut Self::Buffer>,
+        t: usize,
+    ) {
+        self.qsa_attend_into(
+            q, k_cache, v_cache, ids, proj, stride, win, scratch, out, outq, t,
+        );
+    }
+
     /// QSA attention over the selected cells with the sigmoid output gate (read from `proj`):
     /// writes `out [t][QSA_OUT]` and `outq` (when given) as int8 activations. `scratch`: [`crate::flash::qsa_attend_scratch_words`].
     #[allow(clippy::too_many_arguments)]

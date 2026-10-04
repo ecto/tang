@@ -1380,7 +1380,7 @@ __device__ __forceinline__ unsigned int qsa_n_sel(unsigned int n_kv) {
 // Top cells per token. Grid T, block 1024.
 extern "C" __global__ void __launch_bounds__(1024) fl_qsa_select(
     const float* __restrict__ SC, const unsigned int* __restrict__ win, unsigned int* __restrict__ IDS,
-    unsigned int MAXB) {
+    unsigned int MAXB, unsigned int* __restrict__ BM, unsigned int mask) {
     __shared__ unsigned int keys[SEL_MAXB];
     __shared__ unsigned int hist[256];
     __shared__ unsigned int scan[1024];
@@ -1391,6 +1391,8 @@ extern "C" __global__ void __launch_bounds__(1024) fl_qsa_select(
     unsigned int n_bid = n_kv / 4, tail = n_kv % 4;
     if (n_bid <= SEL_BLOCKS) {
         for (unsigned int i = tid; i < n_kv; i += 1024) out[i] = i;
+        if (mask)
+            for (unsigned int b = tid; b < n_bid; b += 1024) atomicOr(&BM[b], 1u << t);
         return;
     }
     // The top 512 complete blocks by (score desc, block asc), then the tail's cells.
@@ -1457,6 +1459,7 @@ extern "C" __global__ void __launch_bounds__(1024) fl_qsa_select(
             r++;
         }
         for (unsigned int i = 0; i < c; i++) out[off++] = b * 4 + i;
+        if (mask && c) atomicOr(&BM[b], 1u << t);
     }
     if (tid == 0)
         for (unsigned int i = 0; i < tail; i++) out[4 * SEL_BLOCKS + i] = n_bid * 4 + i;
@@ -1549,6 +1552,173 @@ extern "C" __global__ void __launch_bounds__(256) fl_qsa_attend(
             part[2 * j + 1] = acc1[h] + half[h][2 * j + 1];
         }
     }
+}
+
+// ---- QSA attention over the union of a window's selections ----
+
+// The window's union of selected blocks: block b is in it when some token selected it (BM, one
+// bit per token, from fl_qsa_select) or when it holds some token's incomplete tail. Writes the
+// union's blocks ascending (UB) with their masks (UM) and the count (UC[0]), and clears BM for
+// the next window. Grid 1, block 1024.
+extern "C" __global__ void __launch_bounds__(1024) fl_qsa_union(
+    unsigned int* __restrict__ BM, const unsigned int* __restrict__ win, unsigned int T,
+    unsigned int* __restrict__ UB, unsigned int* __restrict__ UM, unsigned int* __restrict__ UC) {
+    __shared__ unsigned int scan[1024];
+    unsigned int tid = threadIdx.x, pos0 = win[0];
+    unsigned int nb_hi = (pos0 + T + 3) / 4, tail_lo = (pos0 + 1) / 4;
+    unsigned int per = (nb_hi + 1023) / 1024, b0 = min(tid * per, nb_hi), b1 = min(b0 + per, nb_hi);
+    unsigned int cnt = 0;
+    for (unsigned int b = b0; b < b1; b++) cnt += (BM[b] != 0 || b >= tail_lo);
+    unsigned int off = block_scan(cnt, scan) - cnt;
+    for (unsigned int b = b0; b < b1; b++) {
+        unsigned int m = BM[b];
+        if (m != 0 || b >= tail_lo) {
+            UB[off] = b;
+            UM[off] = m;
+            off++;
+        }
+        BM[b] = 0;
+    }
+    if (tid == 1023) UC[0] = off;
+}
+
+// Token t sees cell c of a union block with selection mask m.
+__device__ __forceinline__ bool qsa_member(unsigned int c, unsigned int m, unsigned int t, unsigned int pos0) {
+    unsigned int n_kv = pos0 + t + 1;
+    return c < n_kv && (((m >> t) & 1u) || c >= (n_kv / 4) * 4);
+}
+
+// Attention over the union: grid (QSA_UCH chunks of 16 union blocks, QSA_KV), block 256. Each
+// chunk's keys and values are read once, in two 32-cell tiles, for every token's 12 heads that
+// share the kv head; a token's cells outside its own selection score -inf, so each token's
+// softmax is over exactly its selected cells. Online softmax across the tiles; partials per
+// (token, head, chunk) [m, l, acc[256]] for fl_qsa_union_merge.
+#define UTILE 32
+extern "C" __global__ void __launch_bounds__(256) fl_qsa_attend_union(
+    const float* __restrict__ Q, const unsigned short* __restrict__ KC, const unsigned short* __restrict__ VC,
+    const unsigned int* __restrict__ UB, const unsigned int* __restrict__ UM, const unsigned int* __restrict__ UC,
+    const unsigned int* __restrict__ win, float* __restrict__ PART, unsigned int T, unsigned int NCHU) {
+    __shared__ __align__(16) unsigned short ks[UTILE][256];
+    __shared__ __align__(16) unsigned short vs[UTILE][256];
+    __shared__ __align__(16) float qs[12][256];
+    __shared__ float s[12][UTILE];
+    __shared__ float mrow[12], lrow[12], scl[12];
+    __shared__ unsigned int cells[UTILE], masks[UTILE];
+    unsigned int ch = blockIdx.x, g = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    unsigned int nub = UC[0], pos0 = win[0];
+    if (ch * 16 >= nub) return;
+    for (unsigned int t = 0; t < T; t++) {
+        // Online softmax state for this token's heads lives in registers (acc) and smem (m, l).
+        float acc[12];
+        #pragma unroll
+        for (int h = 0; h < 12; h++) acc[h] = 0.0f;
+        if (tid < 12) { mrow[tid] = NEG_INF; lrow[tid] = 0.0f; }
+        for (unsigned int i = tid; i < 12 * 256 / 4; i += 256)
+            ((float4*)&qs[0][0])[i] = ((const float4*)(Q + ((u64)t * QSA_HEADS + g * 12) * QSA_D))[i];
+        for (unsigned int st = 0; st < 2; st++) {
+            unsigned int ub0 = ch * 16 + st * 8;
+            __syncthreads();
+            if (tid < UTILE) {
+                unsigned int k = ub0 + tid / 4;
+                cells[tid] = k < nub ? UB[k] * 4 + tid % 4 : 0xffffffffu;
+                masks[tid] = k < nub ? UM[k] : 0;
+            }
+            __syncthreads();
+            // K and V tiles: 32 rows of 512 B each, 16 bytes a thread per step.
+            for (unsigned int i = tid; i < UTILE * 32; i += 256) {
+                unsigned int c = i / 32, p = i % 32, cell = cells[c];
+                uint4 kz = make_uint4(0, 0, 0, 0), vz = kz;
+                if (cell != 0xffffffffu) {
+                    kz = ((const uint4*)(KC + ((u64)cell * QSA_KV + g) * QSA_D))[p];
+                    vz = ((const uint4*)(VC + ((u64)cell * QSA_KV + g) * QSA_D))[p];
+                }
+                ((uint4*)&ks[c][0])[p] = kz;
+                ((uint4*)&vs[c][0])[p] = vz;
+            }
+            __syncthreads();
+            // Scores: thread (cell, head group of 1.5 heads): heads hg and hg + 8 (hg < 4).
+            {
+                unsigned int c = tid % UTILE, hg = tid / UTILE;
+                bool mem = cells[c] != 0xffffffffu && qsa_member(cells[c], masks[c], t, pos0);
+                for (unsigned int h = hg; h < 12; h += 8) {
+                    float a = 0.0f;
+                    for (int v = 0; v < 32; v++) {
+                        uint4 kq = ((const uint4*)&ks[c][0])[v];
+                        float kv[8] = {bf(kq.x & 0xffff), bf(kq.x >> 16), bf(kq.y & 0xffff), bf(kq.y >> 16),
+                                       bf(kq.z & 0xffff), bf(kq.z >> 16), bf(kq.w & 0xffff), bf(kq.w >> 16)};
+                        #pragma unroll
+                        for (int e = 0; e < 8; e++) a = __fmaf_rn(kv[e], qs[h][8 * v + e], a);
+                    }
+                    s[h][c] = mem ? a * 0.0625f : NEG_INF;
+                }
+            }
+            __syncthreads();
+            // Per head (a warp each): new max, rescale, probabilities.
+            for (unsigned int h = warp; h < 12; h += 8) {
+                float x = s[h][lane];
+                float mt = warp_max(x);
+                float mo = mrow[h], mn = fmaxf(mo, mt);
+                float p = mn == NEG_INF ? 0.0f : expf(x - mn);
+                s[h][lane] = p;
+                float lt = warp_sum(p);
+                if (lane == 0) {
+                    float sc = mn == NEG_INF ? 1.0f : expf(mo - mn);
+                    scl[h] = sc;
+                    mrow[h] = mn;
+                    lrow[h] = lrow[h] * sc + lt;
+                }
+            }
+            __syncthreads();
+            #pragma unroll
+            for (int h = 0; h < 12; h++) {
+                float a = acc[h] * scl[h];
+                for (int c = 0; c < UTILE; c++) a = __fmaf_rn(s[h][c], bf(vs[c][tid]), a);
+                acc[h] = a;
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int h = 0; h < 12; h++) {
+            float* part = PART + (((u64)t * QSA_HEADS + g * 12 + h) * NCHU + ch) * (QSA_D + 2);
+            if (tid == 0) { part[0] = mrow[h]; part[1] = lrow[h]; }
+            part[2 + tid] = acc[h];
+        }
+        __syncthreads();
+    }
+}
+
+// Merge the union chunks per (head, token) and gate, as fl_qsa_merge. Grid (QSA_HEADS, T).
+extern "C" __global__ void fl_qsa_union_merge(const float* __restrict__ PART, const float* __restrict__ P,
+                                              unsigned int stride, const unsigned int* __restrict__ UC,
+                                              float* __restrict__ OUT, unsigned int* __restrict__ OQ,
+                                              unsigned int quant, unsigned int T, unsigned int NCHU) {
+    __shared__ float f[1024];
+    __shared__ float sL;
+    unsigned int h = blockIdx.x, t = blockIdx.y, j = threadIdx.x;
+    unsigned int nch = (UC[0] + 15) / 16;
+    const float* part = PART + ((u64)t * QSA_HEADS + h) * NCHU * (QSA_D + 2);
+    if (j < 32) {
+        float M = NEG_INF;
+        for (unsigned int c = j; c < nch; c += 32) M = fmaxf(M, part[c * (QSA_D + 2)]);
+        M = warp_max(M);
+        float L = 0.0f;
+        for (unsigned int c = j; c < nch; c += 32) {
+            float m = part[c * (QSA_D + 2)];
+            float w = m == NEG_INF ? 0.0f : expf(m - M);
+            f[c] = w;
+            L += part[c * (QSA_D + 2) + 1] * w;
+        }
+        L = warp_sum(L);
+        if (j == 0) sL = L;
+    }
+    __syncthreads();
+    float o = 0.0f;
+    for (unsigned int c = 0; c < nch; c++)
+        if (f[c] != 0.0f) o = __fmaf_rn(part[c * (QSA_D + 2) + 2 + j], f[c], o);
+    float gate = P[(u64)t * stride + h * 512 + 256 + j];
+    float y = o / sL * sigm(gate);
+    OUT[(u64)t * QSA_HEADS * QSA_D + h * QSA_D + j] = y;
+    if (quant) quant_chunk(y, OQ, T, QSA_HEADS * QSA_D, t, h * 8 + (j >> 5), j & 31);
 }
 
 // Merge the chunks and apply the sigmoid gate; with `OQ`, also the gated output as int8

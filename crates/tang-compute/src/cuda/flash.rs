@@ -904,6 +904,7 @@ impl CudaComputeDevice {
                 .unwrap();
         }
         let f = self.fl("fl_qsa_select");
+        let mask = 0u32;
         unsafe {
             self.stream
                 .launch_builder(&f)
@@ -911,7 +912,135 @@ impl CudaComputeDevice {
                 .arg(win.f32_data())
                 .arg(ids.f32_data_mut())
                 .arg(&mb)
+                .arg(&NULL)
+                .arg(&mask)
                 .launch(grid((t, 1, 1), 1024))
+                .unwrap();
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn qsa_select_union_impl(
+        &self,
+        pooled: &CudaBuffer,
+        q: &CudaBuffer,
+        win: &CudaBuffer,
+        scores: &mut CudaBuffer,
+        ids: &mut CudaBuffer,
+        union: &mut CudaBuffer,
+        max_blocks: usize,
+        t: usize,
+    ) {
+        assert!(max_blocks <= 8192 && union.len >= crate::flash::qsa_union_words(max_blocks, t));
+        assert!(scores.len >= t * max_blocks && ids.len >= t * QSA_WIDTH);
+        let iq = q.f32_data().slice(t * QSA_HEADS * QSA_D..);
+        let mb = max_blocks as u32;
+        let f = self.fl("fl_qsa_scores");
+        unsafe {
+            self.stream
+                .launch_builder(&f)
+                .arg(pooled.f32_data())
+                .arg(&iq)
+                .arg(win.f32_data())
+                .arg(scores.f32_data_mut())
+                .arg(&mb)
+                .launch(grid((max_blocks.div_ceil(8), t, 1), 256))
+                .unwrap();
+        }
+        let cap = crate::flash::qsa_union_cap(t);
+        let (mut bm, mut rest) = union.f32_data_mut().split_at_mut(max_blocks);
+        let (mut ub, mut rest) = rest.split_at_mut(cap);
+        let (mut um, mut uc) = rest.split_at_mut(cap);
+        let f = self.fl("fl_qsa_select");
+        let mask = 1u32;
+        unsafe {
+            self.stream
+                .launch_builder(&f)
+                .arg(scores.f32_data())
+                .arg(win.f32_data())
+                .arg(ids.f32_data_mut())
+                .arg(&mb)
+                .arg(&mut bm)
+                .arg(&mask)
+                .launch(grid((t, 1, 1), 1024))
+                .unwrap();
+        }
+        let f = self.fl("fl_qsa_union");
+        let tu = t as u32;
+        unsafe {
+            self.stream
+                .launch_builder(&f)
+                .arg(&mut bm)
+                .arg(win.f32_data())
+                .arg(&tu)
+                .arg(&mut ub)
+                .arg(&mut um)
+                .arg(&mut uc)
+                .launch(grid((1, 1, 1), 1024))
+                .unwrap();
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn qsa_attend_union_impl(
+        &self,
+        q: &CudaBuffer,
+        k_cache: &CudaBuffer,
+        v_cache: &CudaBuffer,
+        union: &CudaBuffer,
+        max_blocks: usize,
+        proj: &CudaBuffer,
+        stride: usize,
+        win: &CudaBuffer,
+        scratch: &mut CudaBuffer,
+        out: &mut CudaBuffer,
+        outq: Option<&mut CudaBuffer>,
+        t: usize,
+    ) {
+        assert!(scratch.len >= crate::flash::qsa_union_scratch_words(t));
+        let cap = crate::flash::qsa_union_cap(t);
+        let nchu = cap.div_ceil(16);
+        let u = union.f32_data();
+        let (ub, um, uc) = (
+            u.slice(max_blocks..max_blocks + cap),
+            u.slice(max_blocks + cap..max_blocks + 2 * cap),
+            u.slice(max_blocks + 2 * cap..max_blocks + 2 * cap + 1),
+        );
+        let (tu, nu) = (t as u32, nchu as u32);
+        let f = self.fl("fl_qsa_attend_union");
+        unsafe {
+            self.stream
+                .launch_builder(&f)
+                .arg(q.f32_data())
+                .arg(k_cache.bf16_data())
+                .arg(v_cache.bf16_data())
+                .arg(&ub)
+                .arg(&um)
+                .arg(&uc)
+                .arg(win.f32_data())
+                .arg(scratch.f32_data_mut())
+                .arg(&tu)
+                .arg(&nu)
+                .launch(grid((nchu, QSA_KV, 1), 256))
+                .unwrap();
+        }
+        let f = self.fl("fl_qsa_union_merge");
+        let (s, quant) = (stride as u32, outq.is_some() as u32);
+        unsafe {
+            let mut l = self.stream.launch_builder(&f);
+            l.arg(scratch.f32_data())
+                .arg(proj.f32_data())
+                .arg(&s)
+                .arg(&uc)
+                .arg(out.f32_data_mut());
+            match outq {
+                Some(q) => l.arg(q.f32_data_mut()),
+                None => l.arg(&NULL),
+            };
+            l.arg(&quant)
+                .arg(&tu)
+                .arg(&nu)
+                .launch(grid((QSA_HEADS, t, 1), 256))
                 .unwrap();
         }
     }
@@ -2000,6 +2129,95 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn qsa_union_vs_cpu<D: ComputeDevice>(g: &D) {
+        let c = CpuDevice::new();
+        let mut rng = Rng(67);
+        let (max_ctx, max_blocks) = (4096, 1024);
+        let to_bits =
+            |v: &[f32]| -> Vec<u16> { v.iter().map(|x| (x.to_bits() >> 16) as u16).collect() };
+        let kv: Vec<f32> = rng
+            .vec(max_ctx * QSA_KV * QSA_D, 1.0)
+            .iter()
+            .map(|&v| fl::bf16_round(v))
+            .collect();
+        let vv: Vec<f32> = rng
+            .vec(max_ctx * QSA_KV * QSA_D, 1.0)
+            .iter()
+            .map(|&v| fl::bf16_round(v))
+            .collect();
+        let pooled = rng.vec(max_blocks * IDX_D, 1.0);
+        let (gk, gv, gp) = (
+            g.upload_bf16(&to_bits(&kv)),
+            g.upload_bf16(&to_bits(&vv)),
+            g.upload_f32(&pooled),
+        );
+        let mut un = g.alloc_f32(fl::qsa_union_words(max_blocks, 8));
+        for t in TS {
+            let q = rng.vec(fl::qsa_q_words(t), 1.0);
+            let proj = rng.vec(t * QSA_PROJ, 2.0);
+            for &pos0 in &[0usize, 61, 2047, 2049, 3001, 4095 - t] {
+                let w = win(g, pos0, 0);
+                let gq = g.upload_f32(&q);
+                let (mut sc, mut ids) = (g.alloc_f32(t * max_blocks), g.alloc_f32(t * QSA_WIDTH));
+                g.qsa_select_union_into(&gp, &gq, &w, &mut sc, &mut ids, &mut un, max_blocks, t);
+                let mut s = g.alloc_f32(fl::qsa_union_scratch_words(t));
+                let (mut out, mut oq) = (
+                    g.alloc_f32(t * QSA_OUT),
+                    g.alloc_f32(QAct { m: t, k: QSA_OUT }.words()),
+                );
+                let gpr = g.upload_f32(&proj);
+                g.qsa_attend_union_into(
+                    &gq,
+                    &gk,
+                    &gv,
+                    &ids,
+                    &un,
+                    max_blocks,
+                    &gpr,
+                    QSA_PROJ,
+                    &w,
+                    &mut s,
+                    &mut out,
+                    Some(&mut oq),
+                    t,
+                );
+                let mut co = c.alloc_f32(t * QSA_OUT);
+                let mut cs = c.alloc_f32(1);
+                let cw = win(&c, pos0, 0);
+                let (cq, ck, cv, ci, cp) = (
+                    c.upload_f32(&q),
+                    c.upload_f32(&kv),
+                    c.upload_f32(&vv),
+                    c.upload_f32(&g.download(&ids)),
+                    c.upload_f32(&proj),
+                );
+                c.qsa_attend_into(
+                    &cq, &ck, &cv, &ci, &cp, QSA_PROJ, &cw, &mut cs, &mut co, None, t,
+                );
+                close(
+                    &g.download(&out),
+                    &c.download(&co),
+                    1e-4,
+                    &format!("qsa union attend t={t} pos0={pos0}"),
+                );
+                let mut qq = g.alloc_f32(QAct { m: t, k: QSA_OUT }.words());
+                g.quantize_act_into(&out, &mut qq, t, QSA_OUT);
+                same_bits(&g.download(&oq), &g.download(&qq), "qsa union int8 output");
+            }
+        }
+        // The mask region is left clear for the next use.
+        let left = g.download(&un);
+        assert!(
+            left[..max_blocks].iter().all(|v| v.to_bits() == 0),
+            "union masks not cleared"
+        );
+    }
+
+    #[test]
+    fn cuda_qsa_union_vs_cpu() {
+        on_gpu(qsa_union_vs_cpu::<CudaComputeDevice>);
     }
 
     #[test]

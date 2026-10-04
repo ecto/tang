@@ -294,6 +294,8 @@ struct Scratch {
     scores: B,
     sel: B,
     attn_s: B,
+    attn_u: B,
+    union: B,
     attn: B,
     head: B,
 }
@@ -450,6 +452,8 @@ fn scratch(g: &CudaComputeDevice, t: usize) -> Scratch {
         scores: z(t * MAX_CTX / 4),
         sel: z(t * QSA_WIDTH),
         attn_s: z(flash::qsa_attend_scratch_words(t)),
+        attn_u: z(flash::qsa_union_scratch_words(t)),
+        union: z(flash::qsa_union_words(MAX_CTX / 4, t)),
         attn: z(t * QSA_OUT),
         head: z(t * VOCAB),
     }
@@ -569,29 +573,54 @@ fn window(
                     t,
                     eps,
                 );
-                g.qsa_select_into(
-                    &qs.pooled,
-                    &s.q,
-                    &s.win,
-                    &mut s.scores,
-                    &mut s.sel,
-                    MAX_CTX / 4,
-                    t,
-                );
-                g.qsa_attend_into(
-                    &s.q,
-                    &qs.k,
-                    &qs.v,
-                    &s.sel,
-                    &s.proj,
-                    QSA_PROJ,
-                    &s.win,
-                    &mut s.attn_s,
-                    &mut s.attn,
-                    Some(&mut s.yq),
-                    t,
-                );
-                launches += 5;
+                let mb = MAX_CTX / 4;
+                if !union_attend() {
+                    g.qsa_select_into(&qs.pooled, &s.q, &s.win, &mut s.scores, &mut s.sel, mb, t);
+                    let yq = Some(&mut s.yq);
+                    g.qsa_attend_into(
+                        &s.q,
+                        &qs.k,
+                        &qs.v,
+                        &s.sel,
+                        &s.proj,
+                        QSA_PROJ,
+                        &s.win,
+                        &mut s.attn_s,
+                        &mut s.attn,
+                        yq,
+                        t,
+                    );
+                    launches += 5;
+                } else {
+                    g.qsa_select_union_into(
+                        &qs.pooled,
+                        &s.q,
+                        &s.win,
+                        &mut s.scores,
+                        &mut s.sel,
+                        &mut s.union,
+                        mb,
+                        t,
+                    );
+                    let yq = Some(&mut s.yq);
+                    let (q, sel, un, pr, w) = (&s.q, &s.sel, &s.union, &s.proj, &s.win);
+                    g.qsa_attend_union_into(
+                        q,
+                        &qs.k,
+                        &qs.v,
+                        sel,
+                        un,
+                        mb,
+                        pr,
+                        QSA_PROJ,
+                        w,
+                        &mut s.attn_u,
+                        &mut s.attn,
+                        yq,
+                        t,
+                    );
+                    launches += 6;
+                }
             }
             if on(Class::Dense) {
                 g.q4x_linear_into(&s.yq, &layer.w_out, &mut s.mix, t, QSA_OUT, HIDDEN);
@@ -882,6 +911,12 @@ fn moe(g: &CudaComputeDevice) {
             bytes as f64 / (ms as f64 * 1e6)
         );
     }
+}
+
+/// `TANG_FLASH_UNION=1`: QSA attention over the window's union of selections (measured slower
+/// than per-token attention on mew; kept for A/B).
+fn union_attend() -> bool {
+    std::env::var("TANG_FLASH_UNION").is_ok_and(|v| v == "1")
 }
 
 /// `TANG_FLASH_UNFUSED=1`: the bench's own A/B switch, matching the library's.

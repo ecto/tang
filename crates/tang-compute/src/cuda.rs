@@ -4318,6 +4318,41 @@ impl ComputeDevice for CudaComputeDevice {
         self.qsa_select_impl(pooled, q, win, scores, ids, max_blocks, t)
     }
 
+    fn qsa_select_union_into(
+        &self,
+        pooled: &CudaBuffer,
+        q: &CudaBuffer,
+        win: &CudaBuffer,
+        scores: &mut CudaBuffer,
+        ids: &mut CudaBuffer,
+        union: &mut CudaBuffer,
+        max_blocks: usize,
+        t: usize,
+    ) {
+        self.qsa_select_union_impl(pooled, q, win, scores, ids, union, max_blocks, t)
+    }
+
+    fn qsa_attend_union_into(
+        &self,
+        q: &CudaBuffer,
+        k_cache: &CudaBuffer,
+        v_cache: &CudaBuffer,
+        _ids: &CudaBuffer,
+        union: &CudaBuffer,
+        max_blocks: usize,
+        proj: &CudaBuffer,
+        stride: usize,
+        win: &CudaBuffer,
+        scratch: &mut CudaBuffer,
+        out: &mut CudaBuffer,
+        outq: Option<&mut CudaBuffer>,
+        t: usize,
+    ) {
+        self.qsa_attend_union_impl(
+            q, k_cache, v_cache, union, max_blocks, proj, stride, win, scratch, out, outq, t,
+        )
+    }
+
     fn qsa_attend_into(
         &self,
         q: &CudaBuffer,
