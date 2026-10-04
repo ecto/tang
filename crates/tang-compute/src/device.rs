@@ -1120,6 +1120,402 @@ pub trait ComputeDevice: Send {
         self.upload(&out)
     }
 
+    // -- Flash-Next decode ops (contracts in `crate::flash`; reference math in `cpu::flash`).
+    // The defaults run the reference on the host through download/upload: right on any device,
+    // fast on none. Outputs are caller-allocated so a backend can capture the window in a graph.
+
+    /// Upload raw bytes, packed little-endian 4 per element ([`crate::flash`], "Words").
+    fn upload_bytes(&self, bytes: &[u8]) -> Self::Buffer {
+        self.upload_u32(&crate::flash::bytes_to_words(bytes))
+    }
+
+    /// A zeroed buffer of `len` values stored as bf16 where the backend can (the QSA K/V cache).
+    /// The default stores f32 (values written to it are rounded to bf16 by the ops anyway).
+    fn alloc_bf16(&self, len: usize) -> Self::Buffer {
+        self.alloc_f32(len)
+    }
+
+    /// The address of `buf`'s first byte as this device's kernels see it (a host address on the
+    /// CPU). For expert residency tables and plans.
+    fn buffer_addr(&self, _buf: &Self::Buffer) -> u64 {
+        panic!("buffer_addr not implemented for this device")
+    }
+
+    /// Upload a GGUF Q2_0 matrix `[n, k]` (raw blocks), repacked by [`crate::flash::q2_repack`].
+    /// Only the Q2 ops read it.
+    fn upload_q2(&self, raw: &[u8], n: usize, k: usize) -> Self::Buffer {
+        self.upload_bytes(&crate::flash::q2_repack(raw, n, k))
+    }
+
+    /// `out = linear(x, w)` into an existing `[m, n]` buffer (no allocation on backends that
+    /// override it, for `m <= 8`).
+    fn linear_into(
+        &self,
+        x: &Self::Buffer,
+        w: &Self::Buffer,
+        out: &mut Self::Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        *out = self.linear(x, w, m, k, n);
+    }
+
+    /// Quantize `m` rows of `k` f32 activations to int8 ([`crate::flash::QAct`]).
+    fn quantize_act_into(&self, x: &Self::Buffer, xq: &mut Self::Buffer, m: usize, k: usize) {
+        let w = crate::cpu::flash::quantize_act(&self.download(x)[..m * k], m, k);
+        *xq = self.upload_u32(&w);
+    }
+
+    /// `out[m, n] = W · x̂` for a Q2_0 weight `[n, k]` ([`upload_q2`](Self::upload_q2)) and
+    /// quantized activations (`m <= 8` rows). Per chunk `fma(d_w · d_x, Σ code·q − Σ q, acc)`;
+    /// the order chunks are summed in is the backend's.
+    fn q2_linear_into(
+        &self,
+        xq: &Self::Buffer,
+        w: &Self::Buffer,
+        out: &mut Self::Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        let (xq, w) = (self.download(xq), self.download(w));
+        let wb: Vec<u8> = w.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+        let y = crate::cpu::flash::q2_linear(&crate::flash::u32s(&xq), &wb, m, k, n);
+        *out = self.upload_f32(&y);
+    }
+
+    /// Hyper-connection read for a window of `t` tokens: `r` is `[t][HC][HIDDEN]`; writes
+    /// `x [t][HIDDEN]` and, when `w.inject` is set, `inj [t][HC]`. With `pending = (y, inj_prev)`
+    /// it first applies that write to `r` in place (the fused write-then-read, bitwise
+    /// [`hc_write`](Self::hc_write) then this). `scratch`: [`crate::flash::hc_scratch_words`].
+    #[allow(clippy::too_many_arguments)]
+    fn hc_read_into(
+        &self,
+        r: &mut Self::Buffer,
+        pending: Option<(&Self::Buffer, &Self::Buffer)>,
+        w: &crate::flash::HcWeights<'_, Self::Buffer>,
+        x: &mut Self::Buffer,
+        inj: Option<&mut Self::Buffer>,
+        _scratch: &mut Self::Buffer,
+        t: usize,
+        eps: f32,
+    ) {
+        let mut rv = self.download(r);
+        let pend = pending.map(|(y, i)| (self.download(y), self.download(i)));
+        let (xv, iv) = crate::cpu::flash::hc_read(
+            &mut rv,
+            pend.as_ref().map(|(y, i)| (&y[..], &i[..])),
+            &self.download(w.norm),
+            &self.download(w.down),
+            &self.download(w.up),
+            w.inject.map(|b| self.download(b)).as_deref(),
+            t,
+            eps,
+        );
+        *r = self.upload_f32(&rv);
+        *x = self.upload_f32(&xv);
+        if let Some(inj) = inj {
+            *inj = self.upload_f32(&iv);
+        }
+    }
+
+    /// Hyper-connection write: `r[t][c] += y[t] · 2σ(inj[t][c] / HC)`.
+    fn hc_write(&self, r: &mut Self::Buffer, y: &Self::Buffer, inj: &Self::Buffer, t: usize) {
+        let mut rv = self.download(r);
+        crate::cpu::flash::hc_write(&mut rv, &self.download(y), &self.download(inj), t);
+        *r = self.upload_f32(&rv);
+    }
+
+    /// GDN conv for a window: reads the `qkv` columns of `proj` (`[t][stride]`) and the history
+    /// `hist` ([`crate::flash::GDN_HIST`], not written), writes `h [t][GDN_CONV]`.
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_conv_into(
+        &self,
+        proj: &Self::Buffer,
+        stride: usize,
+        hist: &Self::Buffer,
+        conv: &Self::Buffer,
+        h: &mut Self::Buffer,
+        t: usize,
+        eps: f32,
+    ) {
+        let y = crate::cpu::flash::gdn_conv(
+            &self.download(proj),
+            stride,
+            &self.download(hist),
+            &self.download(conv),
+            t,
+            eps,
+        );
+        *h = self.upload_f32(&y);
+    }
+
+    /// Commit the conv history: the last 3 rows of `[hist | qkv_0 .. qkv_{n−1}]`,
+    /// `n = min(win[N_KEEP], t)`.
+    fn gdn_conv_commit(
+        &self,
+        hist: &mut Self::Buffer,
+        proj: &Self::Buffer,
+        stride: usize,
+        win: &Self::Buffer,
+        t: usize,
+    ) {
+        let n = (self.download(win)[crate::flash::Win::N_KEEP].to_bits() as usize).min(t);
+        let mut hv = self.download(hist);
+        crate::cpu::flash::gdn_conv_commit(&mut hv, &self.download(proj), stride, n);
+        *hist = self.upload_f32(&hv);
+    }
+
+    /// The GDN recurrence and gated output norm for a window ([`crate::flash::GDN_STATE`] for
+    /// the math): `h` from [`gdn_conv_into`](Self::gdn_conv_into), `z`, `a`, `b` from the
+    /// stacked projection `proj`; writes `y [t][GDN_V]` for the tokens it runs.
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_step(
+        &self,
+        state: &mut Self::Buffer,
+        h: &Self::Buffer,
+        proj: &Self::Buffer,
+        stride: usize,
+        p: &crate::flash::GdnParams<'_, Self::Buffer>,
+        y: &mut Self::Buffer,
+        t: usize,
+        mode: crate::flash::GdnMode<'_, Self::Buffer>,
+        eps: f32,
+    ) {
+        let mut sv = self.download(state);
+        let (n_run, write) = match mode {
+            crate::flash::GdnMode::ReadOnly => (t, false),
+            crate::flash::GdnMode::Commit { win } => (
+                (self.download(win)[crate::flash::Win::N_KEEP].to_bits() as usize).min(t),
+                true,
+            ),
+        };
+        let out = crate::cpu::flash::gdn_step(
+            &mut sv,
+            &self.download(h),
+            &self.download(proj),
+            stride,
+            (
+                &self.download(p.dt_bias),
+                &self.download(p.ssm_a),
+                &self.download(p.norm),
+            ),
+            t,
+            n_run,
+            write,
+            eps,
+        );
+        if write {
+            *state = self.upload_f32(&sv);
+        }
+        let mut yv = self.download(y);
+        let n = n_run * crate::flash::shape::GDN_V;
+        yv[..n].copy_from_slice(&out[..n]);
+        *y = self.upload_f32(&yv);
+    }
+
+    /// MoE router for a window: `logits [t][stride]` (experts in columns `0..n_expert`); writes
+    /// `ids [t][TOPK]` (u32) and `w [t][TOPK]` per `cpu::flash::router_topk`'s contract.
+    fn router_topk_into(
+        &self,
+        logits: &Self::Buffer,
+        stride: usize,
+        n_expert: usize,
+        ids: &mut Self::Buffer,
+        w: &mut Self::Buffer,
+        t: usize,
+    ) {
+        let (i, wv) = crate::cpu::flash::router_topk(&self.download(logits), stride, t, n_expert);
+        *ids = self.upload_u32(&i);
+        *w = self.upload_f32(&wv);
+    }
+
+    /// Build a [`crate::flash::MoePlan`] on the device from router ids and a residency table
+    /// (`EXPERTS` addresses as word pairs, 0 = not resident); `shared` is the shared expert's
+    /// blob address, or 0 for none.
+    fn moe_plan_into(
+        &self,
+        ids: &Self::Buffer,
+        table: &Self::Buffer,
+        shared: u64,
+        plan: &mut Self::Buffer,
+        t: usize,
+    ) {
+        let tw = crate::flash::u32s(&self.download(table));
+        let table: Vec<u64> = tw
+            .chunks(2)
+            .map(|c| c[0] as u64 | (c[1] as u64) << 32)
+            .collect();
+        let p = crate::cpu::flash::moe_plan(
+            &crate::flash::u32s(&self.download(ids)),
+            &table,
+            shared,
+            t,
+        );
+        *plan = self.upload_u32(&p);
+    }
+
+    /// Evaluate the planned experts into `parts` ([`crate::flash::MoePlan::PARTS_ROWS`] rows of
+    /// `HIDDEN`); `xq` holds the window's activations quantized as `QAct { m: t, k: HIDDEN }`.
+    /// Each weight row of a group is read once for all of its entries. Rows the plan does not
+    /// name are not written.
+    ///
+    /// # Safety
+    /// Every group address in the plan must point at a live [`crate::flash::ExpertBlob`] that
+    /// this device can read (VRAM, or device-mapped host memory; a host address on the CPU).
+    unsafe fn moe_grouped_into(
+        &self,
+        xq: &Self::Buffer,
+        plan: &Self::Buffer,
+        _scratch: &mut Self::Buffer,
+        parts: &mut Self::Buffer,
+        t: usize,
+    ) {
+        let mut pv = self.download(parts);
+        // SAFETY: forwarded from the caller.
+        unsafe {
+            crate::cpu::flash::moe_grouped(
+                &crate::flash::u32s(&self.download(xq)),
+                &crate::flash::u32s(&self.download(plan)),
+                &mut pv,
+                t,
+            );
+        }
+        *parts = self.upload_f32(&pv);
+    }
+
+    /// MoE combine: `y[t] = Σ_i w[t][i] · parts[t·TOPK + i] + σ(logits[t][sg]) · shared row`.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_combine_into(
+        &self,
+        parts: &Self::Buffer,
+        w: &Self::Buffer,
+        logits: &Self::Buffer,
+        stride: usize,
+        sg: Option<usize>,
+        y: &mut Self::Buffer,
+        t: usize,
+    ) {
+        let v = crate::cpu::flash::moe_combine(
+            &self.download(parts),
+            &self.download(w),
+            &self.download(logits),
+            stride,
+            sg,
+            t,
+        );
+        *y = self.upload_f32(&v);
+    }
+
+    /// QSA prologue for a window: from the stacked projection `proj [t][stride]`, writes the
+    /// normed, rotated queries `q` ([`crate::flash::qsa_q_words`]), appends K/V to the cache,
+    /// raw indexer keys to the ring, and pools every block the window completes.
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_prep(
+        &self,
+        proj: &Self::Buffer,
+        stride: usize,
+        win: &Self::Buffer,
+        norms: &crate::flash::QsaNorms<'_, Self::Buffer>,
+        rope: (&Self::Buffer, &Self::Buffer),
+        q: &mut Self::Buffer,
+        cache: crate::flash::QsaCache<'_, Self::Buffer>,
+        t: usize,
+        eps: f32,
+    ) {
+        let pos0 = self.download(win)[crate::flash::Win::POS0].to_bits() as usize;
+        let (mut qv, mut kc, mut vc, mut ring, mut pooled) = (
+            self.download(q),
+            self.download(cache.k),
+            self.download(cache.v),
+            self.download(cache.ring),
+            self.download(cache.pooled),
+        );
+        crate::cpu::flash::qsa_prep(
+            &self.download(proj),
+            stride,
+            pos0,
+            (
+                &self.download(norms.q),
+                &self.download(norms.k),
+                &self.download(norms.iq),
+                &self.download(norms.ik),
+            ),
+            (&self.download(rope.0), &self.download(rope.1)),
+            t,
+            eps,
+            &mut qv,
+            (&mut kc, &mut vc, &mut ring, &mut pooled),
+        );
+        *q = self.upload_f32(&qv);
+        *cache.k = self.upload_f32(&kc);
+        *cache.v = self.upload_f32(&vc);
+        *cache.ring = self.upload_f32(&ring);
+        *cache.pooled = self.upload_f32(&pooled);
+    }
+
+    /// QSA selection for a window: scores `pooled` blocks against the indexer queries in `q`
+    /// into `scores [t][max_blocks]`, then writes `ids [t][QSA_WIDTH]`
+    /// ([`crate::flash::qsa_score_blocks`] for the contract). `max_blocks` = max context / 4.
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_select_into(
+        &self,
+        pooled: &Self::Buffer,
+        q: &Self::Buffer,
+        win: &Self::Buffer,
+        scores: &mut Self::Buffer,
+        ids: &mut Self::Buffer,
+        max_blocks: usize,
+        t: usize,
+    ) {
+        use crate::flash::shape::*;
+        let pos0 = self.download(win)[crate::flash::Win::POS0].to_bits() as usize;
+        let qv = self.download(q);
+        let mut sv = self.download(scores);
+        crate::cpu::flash::qsa_scores(
+            &self.download(pooled),
+            &qv[t * QSA_HEADS * QSA_D..],
+            pos0,
+            t,
+            max_blocks,
+            &mut sv,
+        );
+        let iv = crate::cpu::flash::qsa_select(&sv, pos0, t, max_blocks);
+        *scores = self.upload_f32(&sv);
+        *ids = self.upload_u32(&iv);
+    }
+
+    /// QSA attention over the selected cells with the sigmoid output gate (read from `proj`):
+    /// writes `out [t][QSA_OUT]`. `scratch`: [`crate::flash::qsa_attend_scratch_words`].
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_attend_into(
+        &self,
+        q: &Self::Buffer,
+        k_cache: &Self::Buffer,
+        v_cache: &Self::Buffer,
+        ids: &Self::Buffer,
+        proj: &Self::Buffer,
+        stride: usize,
+        win: &Self::Buffer,
+        _scratch: &mut Self::Buffer,
+        out: &mut Self::Buffer,
+        t: usize,
+    ) {
+        let pos0 = self.download(win)[crate::flash::Win::POS0].to_bits() as usize;
+        let o = crate::cpu::flash::qsa_attend(
+            &self.download(q),
+            &self.download(k_cache),
+            &self.download(v_cache),
+            &crate::flash::u32s(&self.download(ids)),
+            &self.download(proj),
+            stride,
+            pos0,
+            t,
+        );
+        *out = self.upload_f32(&o);
+    }
+
     /// AdamW optimizer step on a single parameter tensor (in-place on device).
     ///
     /// Updates `param`, `m` (first moment), and `v` (second moment) in-place.

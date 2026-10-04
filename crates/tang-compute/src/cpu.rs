@@ -5,6 +5,8 @@ use tang_expr::codegen::Dialect;
 use tang_expr::node::ExprId;
 use tang_expr::trace;
 
+pub(crate) mod flash;
+
 /// CPU buffer: just a Vec<f32>.
 pub struct CpuBuffer {
     data: Vec<f32>,
@@ -63,6 +65,10 @@ impl ComputeDevice for CpuDevice {
 
     fn download(&self, buf: &CpuBuffer) -> Vec<f32> {
         buf.data.clone()
+    }
+
+    fn buffer_addr(&self, buf: &CpuBuffer) -> u64 {
+        buf.data.as_ptr() as u64
     }
 
     fn elementwise(

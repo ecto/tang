@@ -61,7 +61,7 @@ fn sm_count() -> usize {
 
 impl CudaComputeDevice {
     /// Kernel `name` from `source` (one of `llm_cuda`'s), compiled once.
-    fn llm_func(&self, source: &str, name: &'static str) -> CudaFunction {
+    pub(super) fn llm_func(&self, source: &str, name: &'static str) -> CudaFunction {
         if let Some(f) = self.llm_funcs.borrow().get(name) {
             return f.clone();
         }
@@ -486,7 +486,7 @@ impl CudaComputeDevice {
                         .unwrap();
                 }
             }
-            CudaStorage::F32(_) => unreachable!(),
+            CudaStorage::F32(_) | CudaStorage::Q2(_) => unreachable!(),
         }
     }
 
