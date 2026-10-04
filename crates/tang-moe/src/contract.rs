@@ -166,8 +166,34 @@ pub fn f32_to_f16(x: f32) -> u16 {
     s | h as u16
 }
 
+/// SiLU with tang-compute's pinned exponential (`flash::pexp`), so a CPU-computed expert row is
+/// bitwise the GPU's.
 pub fn silu(x: f32) -> f32 {
-    x / (1.0 + (-x).exp())
+    x / (1.0 + pexp(-x))
+}
+
+/// `exp` as a pinned sequence of IEEE f32 operations (tang-compute `flash::pexp`, copied).
+pub fn pexp(x: f32) -> f32 {
+    const LN2_HI: f32 = f32::from_bits(0x3f31_7200);
+    const LN2_LO: f32 = f32::from_bits(0x35bf_be8e);
+    const C: [f32; 8] = [
+        f32::from_bits(0x3950_0d01),
+        f32::from_bits(0x3ab6_0b61),
+        f32::from_bits(0x3c08_8889),
+        f32::from_bits(0x3d2a_aaab),
+        f32::from_bits(0x3e2a_aaab),
+        0.5,
+        1.0,
+        1.0,
+    ];
+    let x = x.clamp(-87.0, 88.0);
+    let n = (x * std::f32::consts::LOG2_E).round_ties_even();
+    let r = (-n).mul_add(LN2_LO, (-n).mul_add(LN2_HI, x));
+    let mut p = C[0];
+    for &c in &C[1..] {
+        p = p.mul_add(r, c);
+    }
+    p * f32::from_bits(((n as i32 + 127) as u32) << 23)
 }
 
 /// Quantize rows `r0..r0 + rows` of `x` into `w` per the [`QAct`] contract.

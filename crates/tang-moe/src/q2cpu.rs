@@ -146,25 +146,26 @@ impl XPrep {
     }
 }
 
-/// Where a matrix's 64-weight blocks live in its bytes. A row is `k / 64` blocks; block `c` of
-/// row `r` has its 16 code bytes at `cb + c·cs` and its fp16 scale at `sb + c·ss`, where
-/// `(cb, cs, sb, ss) = layout.row(n, k, r)`.
+/// Where a matrix's 128-weight groups live in its bytes. Group `g` (64-weight blocks `2g`,
+/// `2g + 1`) of row `r` has its 32 code bytes at `cb + g·cs` and its two fp16 scales at
+/// `sb + g·ss`, where `(cb, cs, sb, ss) = layout.row(n, k, r)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Layout {
     /// [`crate::contract::q2_repack`]: `[n][k/4]` codes, then `[n][k/64]` fp16 scales. `wb` is
     /// the matrix.
     Plain,
     /// tang-compute's `flash::ExpertBlob` gate/up tiles (`wb` is the whole blob): gu row
-    /// `2r + up` is gate (`up = false`) or up row `r`; tile `i` holds gu rows `4i..4i + 4` as
-    /// `[40 cols][4 rows]` × 16 B, scales in the same order in their own plane.
+    /// `2r + up` is gate (`up = false`) or up row `r`; tile `i` holds gu rows `16i..16i + 16` as
+    /// `[20 groups][16 rows]` × 32 B, scales (2 fp16 per group) in the same order in their own
+    /// plane.
     GuTiled { up: bool },
     /// tang-compute's `flash::ExpertBlob` down tiles (`wb` is the whole blob): tile `i` holds rows
-    /// `16i..16i + 16` as `[10 cols][16 rows]` × 16 B, scales likewise.
+    /// `16i..16i + 16` as `[5 groups][16 rows]` × 32 B, scales likewise.
     DownTiled,
 }
 
 impl Layout {
-    /// Gate/up codes, gate/up scales, down codes, down scales: tang-compute `ExpertBlob` offsets.
+    /// tang-compute `ExpertBlob` plane offsets.
     const GU_SCALES: usize = 2 * crate::contract::FF * crate::contract::HIDDEN / 4;
     const DOWN_CODES: usize = Self::GU_SCALES + 2 * crate::contract::FF * crate::contract::HIDDEN / 32;
     const DOWN_SCALES: usize = Self::DOWN_CODES + crate::contract::HIDDEN * crate::contract::FF / 4;
@@ -173,30 +174,23 @@ impl Layout {
     #[inline]
     pub fn row(self, n: usize, k: usize, r: usize) -> (usize, usize, usize, usize) {
         match self {
-            Layout::Plain => (r * k / 4, 16, n * k / 4 + r * (k / 64) * 2, 2),
+            Layout::Plain => (r * k / 4, 32, n * k / 4 + r * (k / 64) * 2, 4),
             Layout::GuTiled { up } => {
                 let g = 2 * r + up as usize;
-                let i = (g / 4) * 160 + g % 4;
-                (16 * i, 64, Self::GU_SCALES + 2 * i, 8)
+                let i = (g / 16) * (16 * crate::contract::HIDDEN / 128) + g % 16;
+                (32 * i, 512, Self::GU_SCALES + 4 * i, 64)
             }
             Layout::DownTiled => {
-                let i = (r / 16) * 160 + r % 16;
-                (Self::DOWN_CODES + 16 * i, 256, Self::DOWN_SCALES + 2 * i, 32)
+                let i = (r / 16) * (16 * crate::contract::FF / 128) + r % 16;
+                (Self::DOWN_CODES + 32 * i, 512, Self::DOWN_SCALES + 4 * i, 64)
             }
         }
     }
 
-    /// The 32 code bytes of blocks `2g, 2g + 1` of a row (the unit the kernels decode).
+    /// The 32 code bytes of group `g` of a row.
     #[inline]
-    fn pair<'a>(self, wb: &'a [u8], (cb, cs, _, _): (usize, usize, usize, usize), g: usize, buf: &'a mut [u8; 32]) -> &'a [u8] {
-        if cs == 16 {
-            &wb[cb + g * 32..cb + g * 32 + 32]
-        } else {
-            let (a, b) = (cb + 2 * g * cs, cb + (2 * g + 1) * cs);
-            buf[..16].copy_from_slice(&wb[a..a + 16]);
-            buf[16..].copy_from_slice(&wb[b..b + 16]);
-            &buf[..]
-        }
+    fn pair<'a>(self, wb: &'a [u8], (cb, cs, _, _): (usize, usize, usize, usize), g: usize) -> &'a [u8] {
+        &wb[cb + g * cs..cb + g * cs + 32]
     }
 }
 
@@ -218,7 +212,7 @@ pub fn rows_in(
     assert!(k.is_multiple_of(128) && out.len() >= (r1 - r0) * t);
     if r1 > r0 {
         let (cb, cs, sb, ss) = layout.row(n, k, r1 - 1);
-        assert!(cb + (k / 64 - 1) * cs + 16 <= wb.len() && sb + (k / 64 - 1) * ss + 2 <= wb.len());
+        assert!(cb + (k / 128 - 1) * cs + 32 <= wb.len() && sb + (k / 128 - 1) * ss + 4 <= wb.len());
     }
     for x in xs {
         assert_eq!(x.k, k);
@@ -277,7 +271,7 @@ fn hsum8(a: [f32; 8]) -> f32 {
 }
 
 fn scale_pair(wb: &[u8], (_, _, sb, ss): (usize, usize, usize, usize), g: usize) -> (f32, f32) {
-    let (a, b) = (sb + 2 * g * ss, sb + (2 * g + 1) * ss);
+    let (a, b) = (sb + g * ss, sb + g * ss + 2);
     (
         crate::contract::f16_to_f32(u16::from_le_bytes([wb[a], wb[a + 1]])),
         crate::contract::f16_to_f32(u16::from_le_bytes([wb[b], wb[b + 1]])),
@@ -298,9 +292,8 @@ fn rows_lane<const T: usize>(
     for r in r0..r1 {
         let mut acc = [[0f32; 8]; T];
         let ra = layout.row(n, k, r);
-        let mut buf = [0u8; 32];
         for g in 0..k / 128 {
-            let v = layout.pair(wb, ra, g, &mut buf);
+            let v = layout.pair(wb, ra, g);
             let (d0, d1) = scale_pair(wb, ra, g);
             for (t, acc) in acc.iter_mut().enumerate() {
                 let x = xs[t];
@@ -385,25 +378,12 @@ macro_rules! simd_rows {
                 let mut dw = [_mm256_setzero_ps(); R];
                 for (ri, (vr, dwr)) in v.iter_mut().zip(dw.iter_mut()).enumerate() {
                     let (cb, cs, sb, ss) = ra[ri];
-                    let raw = if cs == 16 {
-                        _mm256_loadu_si256(base.add(cb + g * 32) as *const __m256i)
-                    } else {
-                        _mm256_loadu2_m128i(
-                            base.add(cb + (2 * g + 1) * cs) as *const __m128i,
-                            base.add(cb + 2 * g * cs) as *const __m128i,
-                        )
-                    };
+                    let raw = _mm256_loadu_si256(base.add(cb + g * cs) as *const __m256i);
                     vr[0] = _mm256_and_si256(raw, mask);
                     vr[1] = _mm256_and_si256(_mm256_srli_epi32(raw, 2), mask);
                     vr[2] = _mm256_and_si256(_mm256_srli_epi32(raw, 4), mask);
                     vr[3] = _mm256_and_si256(_mm256_srli_epi32(raw, 6), mask);
-                    let dpair = if ss == 2 {
-                        (base.add(sb + g * 4) as *const i32).read_unaligned()
-                    } else {
-                        let lo = (base.add(sb + 2 * g * ss) as *const u16).read_unaligned();
-                        let hi = (base.add(sb + (2 * g + 1) * ss) as *const u16).read_unaligned();
-                        (lo as u32 | (hi as u32) << 16) as i32
-                    };
+                    let dpair = (base.add(sb + g * ss) as *const i32).read_unaligned();
                     *dwr = _mm256_permutevar8x32_ps(_mm256_cvtph_ps(_mm_set1_epi32(dpair)), perm);
                 }
                 for t in 0..T {
@@ -585,12 +565,12 @@ pub(crate) mod tests {
         let mut put = |src: &[u8], n: usize, k: usize, lay: Layout| {
             for r in 0..n {
                 let (cb, cs, sb, ss) = lay.row(n, k, r);
-                let (pcb, _, psb, _) = Layout::Plain.row(n, k, r);
-                for c in 0..k / 64 {
-                    out[cb + c * cs..cb + c * cs + 16]
-                        .copy_from_slice(&src[pcb + 16 * c..pcb + 16 * c + 16]);
-                    out[sb + c * ss..sb + c * ss + 2]
-                        .copy_from_slice(&src[psb + 2 * c..psb + 2 * c + 2]);
+                let (pcb, pcs, psb, pss) = Layout::Plain.row(n, k, r);
+                for g in 0..k / 128 {
+                    out[cb + g * cs..cb + g * cs + 32]
+                        .copy_from_slice(&src[pcb + g * pcs..pcb + g * pcs + 32]);
+                    out[sb + g * ss..sb + g * ss + 4]
+                        .copy_from_slice(&src[psb + g * pss..psb + g * pss + 4]);
                 }
             }
         };

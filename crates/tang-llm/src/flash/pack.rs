@@ -29,6 +29,10 @@ use tang_compute::flash::{self as fl, ExpertBlob};
 /// Bump when any packed format changes.
 pub const FORMAT: &str = "flash-pack-v1";
 
+/// The expert blobs' file; the name carries tang-compute's `ExpertBlob` layout version
+/// (v2: 32-byte groups of 16-row tiles).
+pub const EXPERTS_FILE: &str = "experts.v2.bin";
+
 /// A packed tensor's device format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Fmt {
@@ -622,14 +626,14 @@ pub fn pread(f: &std::fs::File, off: u64, buf: &mut [u8]) -> Result<()> {
 /// Build `experts.bin` (all `n_layer × 512` blobs in key order) if it isn't there. Reads each
 /// layer's three fused tensors with `pread` and drops them from the page cache after.
 pub fn experts(g: &Gguf, dir: &Path, n_layer: usize) -> Result<PathBuf> {
-    let path = dir.join("experts.bin");
+    let path = dir.join(EXPERTS_FILE);
     let want = (n_layer * EXPERTS * ExpertBlob::BYTES) as u64;
     if path.exists() && std::fs::metadata(&path)?.len() == want {
         return Ok(path);
     }
     std::fs::create_dir_all(dir)?;
     let t0 = std::time::Instant::now();
-    let tmp = dir.join("experts.bin.tmp");
+    let tmp = dir.join(format!("{EXPERTS_FILE}.tmp"));
     let mut out = std::fs::File::create(&tmp)?;
     let shards: Vec<std::fs::File> = g
         .shard_paths()

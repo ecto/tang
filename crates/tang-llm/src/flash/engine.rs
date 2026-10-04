@@ -457,7 +457,7 @@ impl Engine {
         let plep = hp.ple.clone().context("no PLE block")?;
         let dir = pack::cache_dir(path)?;
         let warm = dir.join(format!("dense.{}.json", pack::dense_tag())).exists()
-            && dir.join("experts.bin").exists();
+            && dir.join(pack::EXPERTS_FILE).exists();
         let (entries, dense_path) =
             pack::dense(&g, &dir, hp.n_layer, &hp.is_recurrent, Some(plep.layer))?;
         let experts_path = pack::experts(&g, &dir, hp.n_layer)?;
