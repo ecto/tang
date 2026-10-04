@@ -4,6 +4,9 @@
 //! `tang-llm serve <model-dir | hf-repo-id> [--host H] [--port P] [--ctx N] [--api-key-file F]`
 //! — OpenAI-compatible server (on 127.0.0.1 unless `--host` says otherwise). With a key (from
 //! the file, or `TANG_API_KEY`), requests need `Authorization: Bearer <key>`.
+//! For frog's scheduler it also serves `GET /node` (hardware, free memory, model, measured
+//! rates, queue, KV blocks), `POST /models/load` / `/models/unload` (swap the model, only into
+//! free memory) and takes `x-frog-priority: interactive | background` (see `docs/node.md`).
 //! `--kv-slots N` keeps N conversations' KV caches (default 1); a request's `prompt_cache_key`
 //! picks its conversation's cache. Caches grow with their conversations. `--kv-slots auto`
 //! keeps up to 8 within half of RAM where the GPU shares it (Metal, CPU), dropping the least

@@ -272,8 +272,9 @@ impl Need {
 
 /// KV positions a fresh load must have room for (on top of its weights): a typical turn.
 pub const HEADROOM_POSITIONS: u64 = 8192;
-/// Scratch for activations and the like.
-pub const HEADROOM_SCRATCH: u64 = 512 << 20;
+/// Scratch for activations, staged weight chunks and the like (CUDA's prefill stages up to
+/// 128 MB of dequantized weights; cuBLAS wants a workspace).
+pub const HEADROOM_SCRATCH: u64 = 1 << 30;
 
 /// What loading the checkpoint in `dir` as `dtype` takes. Pre-quantized (MLX 4-bit)
 /// checkpoints load as they are; others are converted from their stored precision.
