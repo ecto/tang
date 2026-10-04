@@ -718,6 +718,23 @@ impl ComputeDevice for MetalDevice {
         Dialect::Msl
     }
 
+    /// The most memory the GPU should use (Metal's recommended working set: unified memory,
+    /// so a share of RAM).
+    fn total_memory_bytes(&self) -> usize {
+        self.device.recommended_max_working_set_size() as usize
+    }
+
+    /// The working set left: [`total_memory_bytes`](Self::total_memory_bytes) less what this
+    /// process has allocated on the device. Other processes' use of RAM isn't counted.
+    fn free_memory_bytes(&self) -> usize {
+        self.total_memory_bytes()
+            .saturating_sub(self.device.current_allocated_size() as usize)
+    }
+
+    fn device_name(&self) -> String {
+        self.device.name().to_string()
+    }
+
     fn peak_flops_f32(&self) -> Option<f64> {
         let name = self.device.name().to_lowercase();
         // Apple Silicon GPU peak FP32 TFLOPS (from Apple specs)
