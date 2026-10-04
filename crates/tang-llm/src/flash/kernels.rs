@@ -131,30 +131,37 @@ extern "C" __global__ void fe_scatter_cols(float* dst, int stride, int off, cons
     if (j < w) dst[(size_t)tt * stride + off + j] = src[(size_t)tt * w + j];
 }
 
-// Greedy: ids[t] = argmax_j logits[t][j] (ties to the lower id). One block per token.
-extern "C" __global__ void fe_argmax(const float* logits, int n, unsigned* ids) {
+// Greedy argmax in two passes: fe_argmax1 grid (64, t) writes each slice's (value, index) to
+// `part [t][64][2]`; fe_argmax2 (one block of 64 per token) reduces them. Ties go to the lower id.
+__device__ __forceinline__ void amax_merge(float& v, int& i, float ov, int oi) {
+    if (ov > v || (ov == v && oi < i)) { v = ov; i = oi; }
+}
+extern "C" __global__ void fe_argmax1(const float* logits, int n, float* part) {
     __shared__ float bv[32];
     __shared__ int bi[32];
-    const float* l = logits + (size_t)blockIdx.x * n;
+    const float* l = logits + (size_t)blockIdx.y * n;
+    const int per = (n + gridDim.x - 1) / gridDim.x, lo = blockIdx.x * per, hi = min(n, lo + per);
     float v = __int_as_float(0xff800000);
     int idx = 0x7fffffff;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        const float x = l[i];
-        if (x > v) { v = x; idx = i; }
-    }
-    for (int o = 16; o > 0; o >>= 1) {
-        const float ov = __shfl_xor_sync(0xffffffffu, v, o);
-        const int oi = __shfl_xor_sync(0xffffffffu, idx, o);
-        if (ov > v || (ov == v && oi < idx)) { v = ov; idx = oi; }
-    }
+    for (int i = lo + threadIdx.x; i < hi; i += blockDim.x) amax_merge(v, idx, l[i], i);
+    for (int o = 16; o > 0; o >>= 1) amax_merge(v, idx, __shfl_xor_sync(0xffffffffu, v, o), __shfl_xor_sync(0xffffffffu, idx, o));
     const int w = threadIdx.x >> 5;
     if ((threadIdx.x & 31) == 0) { bv[w] = v; bi[w] = idx; }
     __syncthreads();
     if (threadIdx.x == 0) {
-        for (int i = 1; i < (int)(blockDim.x >> 5); i++)
-            if (bv[i] > v || (bv[i] == v && bi[i] < idx)) { v = bv[i]; idx = bi[i]; }
-        ids[blockIdx.x] = (unsigned)idx;
+        for (int i = 1; i < (int)(blockDim.x >> 5); i++) amax_merge(v, idx, bv[i], bi[i]);
+        float* p = part + ((size_t)blockIdx.y * gridDim.x + blockIdx.x) * 2;
+        p[0] = v;
+        p[1] = __int_as_float(idx);
     }
+}
+extern "C" __global__ void fe_argmax2(const float* part, int nparts, unsigned* ids) {
+    const float* p = part + (size_t)blockIdx.x * nparts * 2;
+    float v = __int_as_float(0xff800000);
+    int idx = 0x7fffffff;
+    for (int i = threadIdx.x; i < nparts; i += 32) amax_merge(v, idx, p[2 * i], __float_as_int(p[2 * i + 1]));
+    for (int o = 16; o > 0; o >>= 1) amax_merge(v, idx, __shfl_xor_sync(0xffffffffu, v, o), __shfl_xor_sync(0xffffffffu, idx, o));
+    if (threadIdx.x == 0) ids[blockIdx.x] = (unsigned)idx;
 }
 "#;
 
@@ -525,6 +532,7 @@ __device__ void gemv8_body(const Seg* segs, int nseg, const float* x, const unsi
         }
     }
 }
+
 
 #define GEMV8_T(T) extern "C" __global__ void __launch_bounds__(128) fe_gemv8_t##T( \
     const Seg* segs, int nseg, const float* x, const unsigned char* xq, int k, float* out, int ostride, int row16) { \

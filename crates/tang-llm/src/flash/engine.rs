@@ -103,6 +103,7 @@ struct NativeK {
     f: [Fun; MAX_T],
     /// `fe_gemv8_t*` (int8 activations) and `fe_q8`.
     f8: [Fun; MAX_T],
+
     q8: Fun,
     /// Scratch for the int8 activations (`XQ8_T × 6144` codes + scales).
     xq8: u64,
@@ -150,7 +151,7 @@ impl Dw {
             Dw::Q4x(b) => dev.q4x_linear_into(xq, b, out, t, k, n),
             Dw::Native { segs, nseg, rows, row16, .. } => {
                 assert_eq!(*rows, n, "native GEMV rows");
-                let (sp, ns, xp, ki, op, os) = (
+                let (sp, ns, xp, _ki, op, os) = (
                     dev.buffer_addr(segs),
                     *nseg,
                     dev.buffer_addr(x),
@@ -166,9 +167,10 @@ impl Dw {
                     let _ = ti;
                     gpu::launch(nk.q8, ((k / 32) as u32, t as u32, 1), (32, 1, 1), 0, &s, tang_moe::args![xp, xq, ki])
                         .expect("fe_q8 launch");
+                    let (f, grid) = (nk.f8[t - 1], n.div_ceil(8) as u32);
                     gpu::launch(
-                        nk.f8[t - 1],
-                        (n.div_ceil(8) as u32, 1, 1),
+                        f,
+                        (grid, 1, 1),
                         (128, 1, 1),
                         (8 * 16 * r16) as u32,
                         &s,
@@ -292,6 +294,7 @@ struct Scratch {
     shy: B,
     head: B,
     out_ids: B,
+    amax: B,
     stamps: B,
 }
 
@@ -305,6 +308,7 @@ struct Kern {
     copy: Fun,
     scatter: Fun,
     argmax: Fun,
+    argmax2: Fun,
     publish: Fun,
     wait: Fun,
     copy_rows: Fun,
@@ -623,6 +627,7 @@ impl Engine {
             shy: z(MAX_T * HIDDEN),
             head: z(MAX_T * hp.n_vocab),
             out_ids: z(MAX_T),
+            amax: z(MAX_T * 64 * 2),
             stamps: z(48 * 8 * 2),
         };
         dev.sync();
@@ -641,7 +646,8 @@ impl Engine {
             silu_q: f(&m, "fe_silu_q")?,
             copy: f(&m, "fe_copy")?,
             scatter: f(&m, "fe_scatter_cols")?,
-            argmax: f(&m, "fe_argmax")?,
+            argmax: f(&m, "fe_argmax1")?,
+            argmax2: f(&m, "fe_argmax2")?,
             publish: f(&db, "db_publish")?,
             wait: f(&db, "db_wait")?,
             copy_rows: f(&db, "db_copy_rows")?,
@@ -1234,18 +1240,19 @@ impl Engine {
         );
         let v = self.hp.n_vocab;
         self.head.apply(dev, &self.nk, &s.x, &s.xq, &mut s.head, t, HIDDEN, v);
-        let (lg, ids, n) = (dev.buffer_addr(&s.head), dev.buffer_addr(&s.out_ids), v as i32);
+        let (lg, ids, n, part, np) = (
+            dev.buffer_addr(&s.head),
+            dev.buffer_addr(&s.out_ids),
+            v as i32,
+            dev.buffer_addr(&s.amax),
+            64i32,
+        );
         unsafe {
-            gpu::launch(
-                self.k.argmax,
-                (t as u32, 1, 1),
-                (1024, 1, 1),
-                0,
-                &self.stream,
-                tang_moe::args![lg, n, ids],
-            )
-            .expect("launch")
-        };
+            gpu::launch(self.k.argmax, (64, t as u32, 1), (1024, 1, 1), 0, &self.stream, tang_moe::args![lg, n, part])
+                .expect("launch");
+            gpu::launch(self.k.argmax2, (t as u32, 1, 1), (32, 1, 1), 0, &self.stream, tang_moe::args![part, np, ids])
+                .expect("launch");
+        }
         self.stamp(1 + 4 * 48);
     }
 
@@ -1673,11 +1680,11 @@ pub fn gemv_check(path: &Path) -> Result<()> {
             let xv: Vec<f32> = (0..tt * k).map(|_| rnd()).collect();
             let x = dev.upload_f32(&xv);
             let out = dev.alloc_f32(tt * n);
-            let f = gm.func(&format!("fe_gemv8_t{tt}")).map_err(|e| anyhow!("{e}"))?;
+            let (f, grid) = (gm.func(&format!("fe_gemv8_t{tt}")).map_err(|e| anyhow!("{e}"))?, n.div_ceil(8) as u32);
             let (sp, ns, xp, xq, ki, op, os) = (dev.buffer_addr(&segs), 1i32, dev.buffer_addr(&x), dev.buffer_addr(&xqb), k as i32, dev.buffer_addr(&out), n as i32);
             unsafe {
                 gpu::launch(q8, ((k / 32) as u32, tt as u32, 1), (32, 1, 1), 0, &stream, tang_moe::args![xp, xq, ki]).map_err(|e| anyhow!("{e}"))?;
-                gpu::launch(f, (n.div_ceil(8) as u32, 1, 1), (128, 1, 1), 8 * 16 * r16 as u32, &stream, tang_moe::args![sp, ns, xp, xq, ki, op, os, r16])
+                gpu::launch(f, (grid, 1, 1), (128, 1, 1), 8 * 16 * r16 as u32, &stream, tang_moe::args![sp, ns, xp, xq, ki, op, os, r16])
                     .map_err(|e| anyhow!("{e}"))?
             };
             dev.sync();
@@ -1711,11 +1718,11 @@ pub fn gemv_check(path: &Path) -> Result<()> {
         for tt in [1usize, 4] {
             let x = dev.upload_f32(&vec![0.5f32; tt * k]);
             let out = dev.alloc_f32(tt * nf);
-            let f = gm.func(&format!("fe_gemv8_t{tt}")).map_err(|e| anyhow!("{e}"))?;
+            let (f, gridf) = (gm.func(&format!("fe_gemv8_t{tt}")).map_err(|e| anyhow!("{e}"))?, nf.div_ceil(8) as u32);
             let (sp, ns, xp, xq, ki, op, os) = (dev.buffer_addr(&segf), 1i32, dev.buffer_addr(&x), dev.buffer_addr(&xqb), k as i32, dev.buffer_addr(&out), nf as i32);
             let mut run = || unsafe {
                 gpu::launch(q8, ((k / 32) as u32, tt as u32, 1), (32, 1, 1), 0, &stream, tang_moe::args![xp, xq, ki]).unwrap();
-                gpu::launch(f, (nf.div_ceil(8) as u32, 1, 1), (128, 1, 1), 8 * 16 * r16 as u32, &stream, tang_moe::args![sp, ns, xp, xq, ki, op, os, r16]).unwrap()
+                gpu::launch(f, (gridf, 1, 1), (128, 1, 1), 8 * 16 * r16 as u32, &stream, tang_moe::args![sp, ns, xp, xq, ki, op, os, r16]).unwrap()
             };
             run();
             let ms = dev.event_ms(&mut || {
