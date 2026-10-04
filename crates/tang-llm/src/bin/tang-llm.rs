@@ -8,8 +8,10 @@
 //! picks its conversation's cache. Caches grow with their conversations. `--kv-slots auto`
 //! keeps up to 8 within half of RAM where the GPU shares it (Metal, CPU), dropping the least
 //! recently used to make room, and keeps 1 on CUDA. `TANG_KV_SLOTS` sets the default;
-//! `TANG_KV_BUDGET=<GB>` sets the memory cap (with any slot count). Keyed conversations' caches
-//! are also saved to `~/.cache/tang/kv/` after each turn and read back instead of prefilled;
+//! `TANG_KV_BUDGET=<GB>` sets the memory cap (with any slot count). KV is kept in 256-position
+//! blocks shared by content: a conversation whose prompt starts like another's reuses that one's
+//! blocks instead of prefilling them. Keyed conversations' blocks are also saved to
+//! `~/.cache/tang/kv/` after each turn (each block once) and read back instead of prefilled;
 //! `TANG_KV_DISK=<GB>` caps that (default 8, 0 turns it off). KV caches hold bf16 on the GPU
 //! (half of f32's memory; attention accumulates in f32); `TANG_KV_F32=1` keeps them f32.
 //! Speculative decoding (suffix drafts from the prompt and earlier completions, verified in one

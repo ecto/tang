@@ -1,7 +1,8 @@
 //! KV blocks shared between conversations: a second conversation (another
 //! `prompt_cache_key`) whose prompt starts like the first's reuses the first's blocks instead of
-//! prefilling them, and generates exactly what it would have alone; and the block pool stays
-//! within its memory budget.
+//! prefilling them, and generates exactly what it would have alone; the block pool stays within
+//! its memory budget; and blocks saved to disk come back after a restart, for any conversation
+//! that shares them.
 //!
 //! Needs `TANG_LLM_TEST_MODEL` (e.g. `mlx-community/Qwen3-4B-4bit`); skipped without it. Run
 //! with `--release`.
@@ -206,4 +207,47 @@ fn the_pool_stays_within_its_budget() {
         u.cached_tokens, 0,
         "the oldest blocks should have been evicted"
     );
+}
+
+#[test]
+fn blocks_on_disk_survive_a_restart() {
+    let Some(dir) = model() else { return };
+    let disk = std::env::temp_dir().join(format!("tang-shared-prefix-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&disk);
+    let load = || {
+        let mut e = Engine::load(device(), &dir, 8192, Dtype::Bf16).unwrap();
+        e.set_slots(4);
+        e.set_kv_store(disk.clone(), 1 << 32).unwrap();
+        e
+    };
+    let mut e = load();
+    let system = system_prompt(&e);
+    let a = req(&system, "Name three colours.", "conv-a", 24);
+    run(&mut e, &a);
+    e.save(Some("conv-a"));
+    // The same turn again, warm in memory: what a restored conversation must reproduce.
+    let (warm, warm_out) = run(&mut e, &a);
+    assert_eq!(warm.cached_tokens, warm.prompt_tokens - 1);
+    e.flush_kv_store();
+    drop(e);
+
+    // A new engine: conv-a's blocks and tail come back from disk.
+    let mut e = load();
+    let (u, out) = run(&mut e, &a);
+    assert_eq!(u.cached_tokens, u.prompt_tokens - 1, "conv-a from disk");
+    assert_eq!(out, warm_out, "restored conversation output differs");
+    drop(e);
+
+    // Another conversation sharing the prefix finds conv-a's blocks on disk.
+    let mut e = load();
+    let (u, _) = run(
+        &mut e,
+        &req(&system, "Name three animals, briefly.", "conv-b", 24),
+    );
+    assert_eq!(
+        u.cached_tokens,
+        8 * BLOCK,
+        "conv-b from conv-a's blocks on disk"
+    );
+    let _ = std::fs::remove_dir_all(&disk);
 }

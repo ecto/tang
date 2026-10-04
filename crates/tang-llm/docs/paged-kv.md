@@ -1,6 +1,6 @@
 # Paged, content-addressed KV blocks
 
-Status: design (implementation follows in steps; see "Steps" at the end for what landed).
+Status: implemented (see "Steps" at the end).
 
 ## Why
 
@@ -124,8 +124,19 @@ conversations.
 ## Steps
 
 1. Paged kernels behind `kv_attention_paged` / `attention_prep_paged` (Metal, CUDA, CPU
-   default); tests against the contiguous kernels.
-2. `Pool` and the block-table `Cache` in the model; logits identical to the contiguous cache.
+   default); tests against the contiguous kernels. Done; CUDA syntax-checked only.
+2. `Pool` and the block-table `Cache` in the model (`src/blocks.rs`); logits bit-identical to
+   the contiguous cache. Done.
 3. Engine: attach / seal / eviction within the budget; tests for shared-prefix reuse,
-   bit-identical greedy output, and the budget.
-4. Disk tier by block hash.
+   bit-identical greedy output, and the budget (`tests/shared_prefix.rs`). Done. A partial
+   block is shared only from 32 positions on (a chat template's first tokens are the same
+   everywhere, and copying them saves nothing).
+4. Disk tier by block hash. Done.
+
+Not done:
+
+- The pool only grows (to the budget); it never hands memory back. Caches did the same within
+  a slot before; across slots, dropping a parked conversation used to free its memory.
+- Blocks are sealed at the end of a request, not as they fill, so two requests running at
+  once (the engine runs one at a time today) wouldn't share each other's new blocks.
+- Images: blocks from the first image on are never sealed, so they're never shared or saved.

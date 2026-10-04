@@ -327,8 +327,17 @@ impl<D: ComputeDevice> Engine<D> {
         Ok(())
     }
 
-    /// Save the new part of `key`'s cache to disk (after a request; the reply has gone out).
+    /// Wait until saves already made are on disk.
+    pub fn flush_kv_store(&self) {
+        if let Some(s) = &self.store {
+            s.flush();
+        }
+    }
+
+    /// Save `key`'s cache to disk (after a request; the reply has gone out): its sealed blocks
+    /// that aren't there yet, and its tail.
     pub fn save(&mut self, key: Option<&str>) {
+        use crate::blocks::{lock, BLOCK};
         let (Some(key), Some(store)) = (key, &self.store) else {
             return;
         };
@@ -336,53 +345,100 @@ impl<D: ComputeDevice> Engine<D> {
         if self.cache_key.as_deref() != Some(key) || !self.cache_images.is_empty() {
             return;
         }
-        // An earlier save may still be on its way, so this can rewrite more than it must
-        // (never less): each write cuts the file back to where it starts.
-        let disk = store.store().tokens(key);
+        let full = self.cache.len / BLOCK;
         let tokens = &self.cache.tokens;
-        let common = disk.iter().zip(tokens).take_while(|(a, b)| a == b).count();
-        if common == tokens.len() && common == disk.len() {
+        // Read back from the device here; the disk writes happen on the writer's thread.
+        let shared = self.model.pool().clone();
+        let mut pool = lock(&shared);
+        for (i, &b) in self.cache.blocks()[..full].iter().enumerate() {
+            let Some(h) = pool.hash(b).filter(|_| !pool.on_disk(b)) else {
+                continue;
+            };
+            let rows = pool.read_block(&self.model.dev, b, 0, BLOCK);
+            store.write_block(h, tokens[i * BLOCK..(i + 1) * BLOCK].to_vec(), rows);
+            pool.set_on_disk(b);
+        }
+        drop(pool);
+        let start = full * BLOCK;
+        if store
+            .store()
+            .tail(key)
+            .is_some_and(|(t, s)| s == start && t == *tokens)
+        {
             return;
         }
-        // Read back from the device here; the disk write happens on the writer's thread.
-        let rows = self.model.read_rows(&self.cache, common, tokens.len());
-        store.write(key, tokens.clone(), common, rows);
+        let rows = self.model.read_rows(&self.cache, start, tokens.len());
+        store.write_tail(key, tokens.clone(), start, rows);
     }
 
-    /// Read back from disk what it has of this prompt beyond what the cache holds.
+    /// Read back from disk what it has of this prompt beyond what the cache holds: whole blocks
+    /// by hash (whichever conversation wrote them), then `key`'s tail.
     fn restore(&mut self, key: Option<&str>, ids: &[u32]) {
-        let (Some(key), Some(store)) = (key, &self.store) else {
+        use crate::blocks::{chain_all, lock, BLOCK, SEED};
+        let Some(store) = &self.store else {
             return;
         };
-        let shared = |t: &[u32]| t.iter().zip(ids).take_while(|(a, b)| a == b).count();
-        let have = shared(&self.cache.tokens);
-        // At least one prompt token is still fed, for the logits. The token list is written
-        // last, so it's safe to look at while a write is under way; reading rows isn't, so wait
-        // for writes then (only when the disk is needed: usually the slot has it all).
-        let want = |store: &crate::kvstore::Store| shared(&store.tokens(key)).min(ids.len() - 1);
-        if want(store.store()) <= have {
-            return;
-        }
-        store.flush();
         let store = store.store();
-        let want = want(store);
-        if want <= have {
-            return;
-        }
+        // At least one prompt token is still fed, for the logits.
+        let limit = ids.len() - 1;
+        let have = shared_len(&self.cache.tokens, ids);
         let t = Instant::now();
-        match store.read(key, have, want) {
-            Ok(rows) => {
-                self.cache.truncate(have);
-                self.cache_images.retain(|&(s, _)| s < have);
-                self.model
-                    .write_rows(&mut self.cache, &ids[have..want], &rows);
-                eprintln!(
-                    "tang-llm: read {} positions from disk in {:.0} ms",
-                    want - have,
-                    t.elapsed().as_secs_f64() * 1e3
-                );
+        let hashes = chain_all(&ids[..limit / BLOCK * BLOCK]);
+        let mut found = Vec::new();
+        for (j, &h) in hashes.iter().enumerate().skip(have / BLOCK) {
+            match store.read_block(h, &ids[j * BLOCK..(j + 1) * BLOCK]) {
+                Ok(Some(rows)) => found.push(rows),
+                Ok(None) => break,
+                Err(e) => {
+                    eprintln!("tang-llm: reading a KV block: {e:#}");
+                    break;
+                }
             }
-            Err(e) => eprintln!("tang-llm: reading the KV cache: {e:#}"),
+        }
+        let from = have / BLOCK * BLOCK;
+        if !found.is_empty() {
+            // Whole blocks from `from` (a partial one held is replaced by the full one).
+            self.cache.truncate(from);
+            let shared = self.model.pool().clone();
+            let mut pool = lock(&shared);
+            for (j, rows) in (from / BLOCK..).zip(found) {
+                let toks = &ids[j * BLOCK..(j + 1) * BLOCK];
+                let parent = if j == 0 { SEED } else { hashes[j - 1] };
+                let b = pool.alloc(&self.model.dev);
+                pool.write_block(&self.model.dev, b, 0, &rows);
+                let b = pool.seal(b, hashes[j], parent, toks);
+                pool.set_on_disk(b);
+                drop(pool);
+                self.cache.push_block(b, toks);
+                pool = lock(&shared);
+            }
+        }
+        // Then the conversation's tail, if it continues past what's held: it starts on a block
+        // boundary the cache has reached.
+        if let Some((toks, start)) = key.and_then(|k| store.tail(k)) {
+            let end = if start <= self.cache.len && toks.get(..start) == ids.get(..start) {
+                start + shared_len(&toks[start..], &ids[start..limit.max(start)])
+            } else {
+                0
+            };
+            if end > self.cache.len {
+                match store.read_tail(key.unwrap(), end - start) {
+                    Ok(rows) => {
+                        self.cache.truncate(start);
+                        self.model
+                            .write_rows(&mut self.cache, &ids[start..end], &rows);
+                    }
+                    Err(e) => eprintln!("tang-llm: reading a KV tail: {e:#}"),
+                }
+            }
+        }
+        if self.cache.len > have {
+            let read = self.cache.len - have;
+            self.cache_images.retain(|&(s, _)| s < from);
+            eprintln!(
+                "tang-llm: read {read} positions from disk in {:.0} ms",
+                t.elapsed().as_secs_f64() * 1e3
+            );
         }
     }
 
