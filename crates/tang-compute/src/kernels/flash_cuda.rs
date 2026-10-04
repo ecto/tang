@@ -145,7 +145,7 @@ __device__ __forceinline__ float dot8_rn(uint4 p, float4 a, float4 b, float acc)
 template <int FMT, int T, int GR>
 __device__ __forceinline__ void gemv_body(const float* __restrict__ X, const unsigned int* __restrict__ XQ,
                                           const unsigned char* __restrict__ W, float* __restrict__ Y,
-                                          unsigned int K, unsigned int N, unsigned int KS) {
+                                          unsigned int K, unsigned int N, unsigned int KS, unsigned int OS) {
     __shared__ float red[8][GR * T];
     const unsigned int EPV = FMT == 0 ? 8 : (FMT == 1 ? 64 : (FMT == 2 ? 32 : 16));
     unsigned int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -248,7 +248,7 @@ __device__ __forceinline__ void gemv_body(const float* __restrict__ X, const uns
         for (int t = 0; t < T; t++) {
             float v = warp_sum(acc[r][t]);
             if (KS == 1) {
-                if (lane == 0 && row0 + r < N) Y[(u64)t * N + row0 + r] = v;
+                if (lane == 0 && row0 + r < N) Y[(u64)t * OS + row0 + r] = v;
             } else if (lane == 0) {
                 red[warp][r * T + t] = v;
             }
@@ -261,7 +261,7 @@ __device__ __forceinline__ void gemv_body(const float* __restrict__ X, const uns
         unsigned int o = (blockIdx.x * groups + g) * GR + r;
         float v = 0.0f;
         for (unsigned int k = 0; k < KS; k++) v += red[g * KS + k][rt];
-        if (o < N) Y[(u64)t * N + o] = v;
+        if (o < N) Y[(u64)t * OS + o] = v;
     }
 }
 
@@ -269,8 +269,8 @@ __device__ __forceinline__ void gemv_body(const float* __restrict__ X, const uns
 extern "C" __global__ void __launch_bounds__(256) fl_##NAME##_t##T( \
     const float* __restrict__ X, const unsigned int* __restrict__ XQ, \
     const unsigned char* __restrict__ W, float* __restrict__ Y, unsigned int K, unsigned int N, \
-    unsigned int KS) { \
-    gemv_body<FMT, T, (T == 1 ? 2 : 4)>(X, XQ, W, Y, K, N, KS); \
+    unsigned int KS, unsigned int OS) { \
+    gemv_body<FMT, T, (T == 1 ? 2 : 4)>(X, XQ, W, Y, K, N, KS, OS); \
 }
 #define GEMV_ALL(FMT, NAME) GEMV(FMT, NAME, 1) GEMV(FMT, NAME, 2) GEMV(FMT, NAME, 3) GEMV(FMT, NAME, 4) \
     GEMV(FMT, NAME, 5) GEMV(FMT, NAME, 6) GEMV(FMT, NAME, 7) GEMV(FMT, NAME, 8)

@@ -172,13 +172,43 @@ impl CudaComputeDevice {
                 }
             }
             CudaStorage::Bf16(s) if direct && k.is_multiple_of(8) && m >= 1 => {
-                self.gemv_rows("bf16_gemv", Some(x), None, s, out, m, k, n);
+                self.gemv_rows("bf16_gemv", Some(x), None, s, out, (0, n), m, k, n);
             }
             _ => {
                 let y = self.linear(x, w, m, k, n);
                 self.write_into(out, 0, &y);
             }
         }
+    }
+
+    /// bf16 GEMV into a slice of a wider output (`out[off + t · ostride + o]`).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn bf16_linear_out_impl(
+        &self,
+        x: &CudaBuffer,
+        w: &CudaBuffer,
+        out: &mut CudaBuffer,
+        off: usize,
+        ostride: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        assert!(
+            k.is_multiple_of(8) && w.len >= n * k,
+            "bf16_linear_out_into: weight"
+        );
+        self.gemv_rows(
+            "bf16_gemv",
+            Some(x),
+            None,
+            w.bf16_data(),
+            out,
+            (off, ostride),
+            m,
+            k,
+            n,
+        );
     }
 
     pub(super) fn quantize_act_impl(
@@ -212,11 +242,12 @@ impl CudaComputeDevice {
         xq: Option<&CudaBuffer>,
         w: &cudarc::driver::CudaSlice<impl cudarc::driver::DeviceRepr>,
         out: &mut CudaBuffer,
+        (off, ostride): (usize, usize),
         m: usize,
         k: usize,
         n: usize,
     ) {
-        assert!((1..=MAX_T).contains(&m) && out.len >= m * n);
+        assert!((1..=MAX_T).contains(&m) && ostride >= n && out.len >= off + (m - 1) * ostride + n);
         // Split K over 1..8 warps until there are ~2 blocks per SM, keeping 32+ weight vectors
         // per warp (4 rows a warp, 8 / ks row groups a 256-thread block).
         let epv = match name {
@@ -237,18 +268,20 @@ impl CudaComputeDevice {
             ks *= 2;
         }
         let f = self.fl(GEMV_NAMES[GEMV_FMTS.iter().position(|&f| f == name).unwrap()][m - 1]);
-        let (ku, nu, ksu) = (k as u32, n as u32, ks as u32);
+        let (ku, nu, ksu, osu) = (k as u32, n as u32, ks as u32, ostride as u32);
         let any = xq.or(x).unwrap();
+        let mut y = out.f32_data_mut().slice_mut(off..);
         unsafe {
             self.stream
                 .launch_builder(&f)
                 .arg(x.unwrap_or(any).f32_data())
                 .arg(xq.unwrap_or(any).f32_data())
                 .arg(w)
-                .arg(out.f32_data_mut())
+                .arg(&mut y)
                 .arg(&ku)
                 .arg(&nu)
                 .arg(&ksu)
+                .arg(&osu)
                 .launch(grid((n.div_ceil(gr * 8 / ks), 1, 1), 256))
                 .unwrap();
         }
@@ -267,7 +300,7 @@ impl CudaComputeDevice {
             panic!("q2_linear_into needs a Q2 weight (upload_q2)")
         };
         assert!(q.n == n && q.k == k);
-        self.gemv_rows("q2_gemv", None, Some(xq), &q.data, out, m, k, n);
+        self.gemv_rows("q2_gemv", None, Some(xq), &q.data, out, (0, n), m, k, n);
     }
 
     /// `fl_nat_t{m}` of the NatX module for `ty`, compiled on first use.
@@ -368,7 +401,17 @@ impl CudaComputeDevice {
             w.len * 4 >= n * k / 2 + 4 * n * k / 64,
             "q4x_linear_into: weight size"
         );
-        self.gemv_rows("q4x_gemv", None, Some(xq), w.f32_data(), out, m, k, n);
+        self.gemv_rows(
+            "q4x_gemv",
+            None,
+            Some(xq),
+            w.f32_data(),
+            out,
+            (0, n),
+            m,
+            k,
+            n,
+        );
     }
 
     pub(super) fn q8x_linear_impl(
@@ -384,7 +427,17 @@ impl CudaComputeDevice {
             w.len * 4 >= n * k + 2 * n * k / 32,
             "q8x_linear_into: weight size"
         );
-        self.gemv_rows("q8x_gemv", None, Some(xq), w.f32_data(), out, m, k, n);
+        self.gemv_rows(
+            "q8x_gemv",
+            None,
+            Some(xq),
+            w.f32_data(),
+            out,
+            (0, n),
+            m,
+            k,
+            n,
+        );
     }
 
     pub(super) fn hc_write_impl(
@@ -1588,6 +1641,35 @@ mod tests {
                     1e-4,
                     &format!("linear_into t={t}"),
                 );
+            }
+        }
+    }
+
+    /// The bf16 GEMV into a slice of a wider output: the plain GEMV's bits, the rest untouched.
+    fn bf16_linear_out<D: ComputeDevice>(g: &D) {
+        let mut rng = Rng(77);
+        for &(k, n) in &[(2560, 513), (2560, 48), (6144, 2560)] {
+            let wb = g.upload_bf16(&rng.bf16(n * k, 0.5));
+            for t in TS {
+                let x = g.upload_f32(&rng.vec(t * k, 1.0));
+                let mut y = g.alloc_f32(t * n);
+                g.linear_into(&x, &wb, &mut y, t, k, n);
+                let y = g.download(&y);
+                let (off, os) = (3, n + 29);
+                let mut o = g.upload_f32(&vec![5.0; off + t * os]);
+                g.bf16_linear_out_into(&x, &wb, &mut o, off, os, t, k, n);
+                let o = g.download(&o);
+                for r in 0..t {
+                    same_bits(
+                        &o[off + r * os..off + r * os + n],
+                        &y[r * n..(r + 1) * n],
+                        "bf16 out rows",
+                    );
+                    assert!(o[off + r * os + n..off + (r + 1) * os]
+                        .iter()
+                        .all(|&v| v == 5.0));
+                }
+                assert!(o[..off].iter().all(|&v| v == 5.0));
             }
         }
     }
@@ -3190,6 +3272,11 @@ mod tests {
                     .join("\n")
             );
         }
+    }
+
+    #[test]
+    fn cuda_bf16_linear_out() {
+        on_gpu(bf16_linear_out);
     }
 
     #[test]
