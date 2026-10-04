@@ -293,36 +293,53 @@ impl CudaComputeDevice {
         xq: &CudaBuffer,
         w: &CudaBuffer,
         out: &mut CudaBuffer,
+        off: usize,
+        ostride: usize,
         m: usize,
         k: usize,
         n: usize,
     ) {
-        assert!((1..=MAX_T).contains(&m) && out.len >= m * n && k.is_multiple_of(32));
+        assert!((1..=MAX_T).contains(&m) && k.is_multiple_of(32) && ostride >= n);
+        assert!(
+            out.len >= off + (m - 1) * ostride + n,
+            "native_linear: output size"
+        );
         let (_, hoff, soff, total) = crate::flash_native::nat_layout(ty, n, k);
         assert!(w.len * 4 >= total, "native_linear_into: weight size");
-        // Rows a warp: 2 for one column, 4 for more (as the kernel's GR); split K over 1..8
-        // warps until there are ~2 blocks per SM, keeping 32+ chunks per warp.
+        // Rows a warp: 2 for one column, 4 for more (as the kernel's GR). K is split over 1..8
+        // warps until there are ~2 blocks per SM at 2 rows a warp, keeping 32+ chunks per warp:
+        // chosen from (n, k) alone, so a row's summation order (and its bits) doesn't depend on
+        // the window width m.
         let gr = if m == 1 { 2 } else { 4 };
         let mut ks = 1;
         while ks < 8
-            && n.div_ceil(gr * 8 / ks) < 2 * super::llm::sm_count()
+            && n.div_ceil(2 * 8 / ks) < 2 * super::llm::sm_count()
             && k / 32 / (2 * ks) >= 32
         {
             ks *= 2;
         }
         let f = self.nat_func(ty, m);
-        let (ku, nu, ksu, ho, so) = (k as u32, n as u32, ks as u32, hoff as u64, soff as u64);
+        let (ku, nu, ksu, ho, so, os) = (
+            k as u32,
+            n as u32,
+            ks as u32,
+            hoff as u64,
+            soff as u64,
+            ostride as u32,
+        );
+        let mut y = out.f32_data_mut().slice_mut(off..);
         unsafe {
             self.stream
                 .launch_builder(&f)
                 .arg(xq.f32_data())
                 .arg(w.f32_data())
-                .arg(out.f32_data_mut())
+                .arg(&mut y)
                 .arg(&ku)
                 .arg(&nu)
                 .arg(&ksu)
                 .arg(&ho)
                 .arg(&so)
+                .arg(&os)
                 .launch(grid((n.div_ceil(gr * 8 / ks), 1, 1), 256))
                 .unwrap();
         }
@@ -1434,6 +1451,35 @@ mod tests {
                     c.native_linear_into(ty, &cq, &cw, &mut cy, t, k, n);
                     let (got, want) = (g.download(&gy), c.download(&cy));
                     close(&got, &want, 1e-5, &format!("native {ty:?} t={t} {k}->{n}"));
+                    // Into a slice of a wider output: the same bits, the rest untouched.
+                    let (off, os) = (5, n + 11);
+                    let mut gs = g.upload_f32(&vec![7.0; off + t * os]);
+                    g.native_linear_out_into(ty, &gq, &gw, &mut gs, off, os, t, k, n);
+                    let s = g.download(&gs);
+                    for r in 0..t {
+                        assert!(s[off + r * os..off + r * os + n]
+                            .iter()
+                            .zip(&got[r * n..(r + 1) * n])
+                            .all(|(a, b)| a.to_bits() == b.to_bits()));
+                        assert!(s[off + r * os + n..off + (r + 1) * os]
+                            .iter()
+                            .all(|&v| v == 7.0));
+                    }
+                    assert!(s[..off].iter().all(|&v| v == 7.0));
+                    // Window-width invariance: column 0 alone gives the same bits.
+                    if t > 1 {
+                        let mut g1 = g.alloc_f32(QAct { m: 1, k }.words());
+                        g.quantize_act_into(&g.upload_f32(&x[..k]), &mut g1, 1, k);
+                        let mut y1 = g.alloc_f32(n);
+                        g.native_linear_into(ty, &g1, &gw, &mut y1, 1, k, n);
+                        let y1 = g.download(&y1);
+                        assert!(
+                            y1.iter()
+                                .zip(&got[..n])
+                                .all(|(a, b)| a.to_bits() == b.to_bits()),
+                            "native {ty:?} t={t}: column 0 differs from the T=1 result"
+                        );
+                    }
                     // The gate: against the dequantized product in f64.
                     let qw = u32s(&c.download(&cq));
                     for r in 0..t {
