@@ -4115,7 +4115,7 @@ impl ComputeDevice for CudaComputeDevice {
         eps: f32,
     ) -> CudaBuffer {
         if let Some(q) = self.attention_prep_llm(
-            qkv, q_norm, k_norm, cos, sin, k_cache, v_cache, seq, shape, pos, eps,
+            qkv, q_norm, k_norm, cos, sin, k_cache, v_cache, seq, shape, pos, eps, None,
         ) {
             return q;
         }
@@ -4144,6 +4144,73 @@ impl ComputeDevice for CudaComputeDevice {
             shape,
             window,
             !causal,
+            None,
+        )
+    }
+
+    fn attention_prep_paged(
+        &self,
+        qkv: &CudaBuffer,
+        q_norm: Option<&CudaBuffer>,
+        k_norm: Option<&CudaBuffer>,
+        cos: &CudaBuffer,
+        sin: &CudaBuffer,
+        k_pool: &mut CudaBuffer,
+        v_pool: &mut CudaBuffer,
+        pages: &crate::Pages<CudaBuffer>,
+        seq: usize,
+        shape: (usize, usize, usize),
+        pos: usize,
+        eps: f32,
+    ) -> CudaBuffer {
+        let pg = Some((pages.table, pages.shift()));
+        if let Some(q) = self.attention_prep_llm(
+            qkv, q_norm, k_norm, cos, sin, k_pool, v_pool, seq, shape, pos, eps, pg,
+        ) {
+            return q;
+        }
+        crate::device::attention_prep_paged_default(
+            self, qkv, q_norm, k_norm, cos, sin, k_pool, v_pool, pages, seq, shape, pos, eps,
+        )
+    }
+
+    fn kv_attention_paged(
+        &self,
+        q: &CudaBuffer,
+        k_pool: &CudaBuffer,
+        v_pool: &CudaBuffer,
+        pages: &crate::Pages<CudaBuffer>,
+        cache_start: usize,
+        q_len: usize,
+        shape: (usize, usize, usize),
+        window: usize,
+        causal: bool,
+    ) -> CudaBuffer {
+        let (nh, nkv, d) = shape;
+        if d > 256 || nh % nkv != 0 {
+            return crate::device::kv_attention_paged_default(
+                self,
+                q,
+                k_pool,
+                v_pool,
+                pages,
+                cache_start,
+                q_len,
+                shape,
+                window,
+                causal,
+            );
+        }
+        self.attention_llm(
+            q,
+            k_pool,
+            v_pool,
+            cache_start,
+            q_len,
+            shape,
+            window,
+            !causal,
+            Some((pages.table, pages.shift())),
         )
     }
 
@@ -4156,7 +4223,7 @@ impl ComputeDevice for CudaComputeDevice {
         nh: usize,
         hd: usize,
     ) -> CudaBuffer {
-        self.attention_llm(q, k, v, 0, n, (nh, nh, hd), 0, true)
+        self.attention_llm(q, k, v, 0, n, (nh, nh, hd), 0, true, None)
     }
 
     fn layer_norm(

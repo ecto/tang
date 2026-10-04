@@ -295,7 +295,8 @@ kernel void attn_partial(
     device const kv_t* K [[buffer(1)]],
     device const kv_t* V [[buffer(2)]],
     device float* P [[buffer(3)]],            // [q_len, n_heads, n_splits, D + 2]
-    device const uint* params [[buffer(4)]],  // [cache_start, q_len, n_heads, n_kv_heads, D, n_splits, split_len, window, base]
+    device const uint* params [[buffer(4)]],  // [cache_start, q_len, n_heads, n_kv_heads, D, n_splits, split_len, window, base, bidir, page shift]
+    device const uint* T [[buffer(5)]],       // block table (paged caches)
     uint3 tg [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
@@ -330,14 +331,14 @@ kernel void attn_partial(
     float m = -INFINITY, l = 0;
 
     for (uint j = j0 + sg; j < j1; j += 8) {
-        device const kv_t* kp = K + (ulong)j * kv_dim + kv_head * D;
+        device const kv_t* kp = K + kv_row(T, params[10], j) * kv_dim + kv_head * D;
         float s = 0;
         for (uint v = 0; v < per; v++) { uint d = v * 32 + lane; if (d < D) s += q[v] * kv1(kp + d); }
         s = simd_sum(s);
         float m2 = max(m, s);
         float c = exp(m - m2), p = exp(s - m2);
         l = l * c + p;
-        device const kv_t* vp = V + (ulong)j * kv_dim + kv_head * D;
+        device const kv_t* vp = V + kv_row(T, params[10], j) * kv_dim + kv_head * D;
         for (uint v = 0; v < per; v++) { uint d = v * 32 + lane; if (d < D) acc[v] = acc[v] * c + p * kv1(vp + d); }
         m = m2;
     }
@@ -375,6 +376,7 @@ kernel void attn_decode(
     device const kv_t* V [[buffer(2)]],
     device float* P [[buffer(3)]],
     device const uint* params [[buffer(4)]],
+    device const uint* T [[buffer(5)]],
     uint2 tg [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
@@ -407,7 +409,7 @@ kernel void attn_decode(
         bool valid = j < j1;
         float s = -INFINITY;
         if (valid) {
-            device const kv_t* kp = K + (ulong)j * kv_dim + kv_head * D;
+            device const kv_t* kp = K + kv_row(T, params[10], j) * kv_dim + kv_head * D;
             float4 d4 = 0;
             for (uint i = 0; i < D / 4; i++) d4 += qs[i] * kv4(kp + 4 * i);
             s = d4.x + d4.y + d4.z + d4.w;
@@ -422,7 +424,7 @@ kernel void attn_decode(
         uint n = min(32u, j1 - b);
         for (uint t = 0; t < n; t++) {
             float pt = simd_shuffle(p, t);
-            device const kv_t* vp = V + (ulong)(b + t) * kv_dim + kv_head * D;
+            device const kv_t* vp = V + kv_row(T, params[10], b + t) * kv_dim + kv_head * D;
             for (uint v = 0; v < per; v++) {
                 uint d = v * 32 + lane;
                 if (d < D) acc[v] += pt * kv1(vp + d);
@@ -497,7 +499,7 @@ using namespace metal;
 template <int R, int BK, int DMAX, int NW>
 inline void attn_multi_body(
     device const float* Q, device const kv_t* K, device const kv_t* V, device float* P,
-    device const uint* params, threadgroup float* Qs, threadgroup float* KVs,
+    device const uint* params, device const uint* T, threadgroup float* Qs, threadgroup float* KVs,
     threadgroup float* Ps, uint3 tg, uint tid, uint warp, uint lane)
 {
     constexpr int RW = R / NW;             // rows per simdgroup
@@ -510,7 +512,7 @@ inline void attn_multi_body(
 
     uint cache_start = params[0], q_len = params[1], nh = params[2], nkv = params[3];
     uint D = params[4], n_splits = params[5], split_len = params[6];
-    uint window = params[7], base = params[8], bidir = params[9];
+    uint window = params[7], base = params[8], bidir = params[9], sh = params[10];
     uint kvh = tg.x, split = tg.y, f0 = tg.z * R;
     uint gqa = nh / nkv, rows = q_len * gqa;
     uint LD = D + 4, D4 = D / 4;
@@ -558,7 +560,7 @@ inline void attn_multi_body(
         for (int t = 0; t < NL; t++) {
             uint i = tid + NT * t, cc = i / D4, d = (i % D4) * 4, j = jb + cc;
             bool ok = cc < (uint)BK && j < je;
-            ulong o = (ulong)j * kvd + (ulong)kvh * D + d;
+            ulong o = kv_row(T, sh, j) * kvd + (ulong)kvh * D + d;
             kreg[t] = ok ? kv4(K + o) : float4(0.0f);
             vreg[t] = ok ? kv4(V + o) : float4(0.0f);
         }
@@ -576,7 +578,7 @@ inline void attn_multi_body(
             for (int t = 0; t < NL; t++) {
                 uint i = tid + NT * t, cc = i / D4, d = (i % D4) * 4, j = j0 + BK + cc;
                 kreg[t] = (cc < (uint)BK && j < je)
-                    ? kv4(K + (ulong)j * kvd + (ulong)kvh * D + d) : float4(0.0f);
+                    ? kv4(K + kv_row(T, sh, j) * kvd + (ulong)kvh * D + d) : float4(0.0f);
             }
         }
 
@@ -612,7 +614,7 @@ inline void attn_multi_body(
             for (int t = 0; t < NL; t++) {
                 uint i = tid + NT * t, cc = i / D4, d = (i % D4) * 4, j = j0 + BK + cc;
                 vreg[t] = (cc < (uint)BK && j < je)
-                    ? kv4(V + (ulong)j * kvd + (ulong)kvh * D + d) : float4(0.0f);
+                    ? kv4(V + kv_row(T, sh, j) * kvd + (ulong)kvh * D + d) : float4(0.0f);
             }
         }
 
@@ -654,14 +656,15 @@ inline void attn_multi_body(
 kernel void NAME(                                                                            \
     device const float* Q [[buffer(0)]], device const kv_t* K [[buffer(1)]],                 \
     device const kv_t* V [[buffer(2)]], device float* P [[buffer(3)]],                       \
-    device const uint* params [[buffer(4)]], uint3 tg [[threadgroup_position_in_grid]],      \
+    device const uint* params [[buffer(4)]], device const uint* T [[buffer(5)]],             \
+    uint3 tg [[threadgroup_position_in_grid]],                                               \
     uint tid [[thread_index_in_threadgroup]], uint warp [[simdgroup_index_in_threadgroup]],  \
     uint lane [[thread_index_in_simdgroup]])                                                 \
 {                                                                                            \
     threadgroup float Qs[R * (DMAX + 4)];                                                    \
     threadgroup float KVs[BK * (DMAX + 4)];                                                  \
     threadgroup float Ps[BK * (R + 4)];                                                      \
-    attn_multi_body<R, BK, DMAX, NW>(Q, K, V, P, params, Qs, KVs, Ps, tg, tid, warp, lane); \
+    attn_multi_body<R, BK, DMAX, NW>(Q, K, V, P, params, T, Qs, KVs, Ps, tg, tid, warp, lane); \
 }
 
 ATTN_MULTI(attn_multi_r4, 4, 32, 128, 4)
@@ -1045,6 +1048,14 @@ inline void kv_st(device ushort* p, float x) {
 }
 "#;
 
+/// The row of a cache buffer that position `j` lives in: `j` itself (`sh == 0`), or through
+/// the block table `T` of a paged cache (blocks of `1 << sh` positions).
+pub const KV_ROW_MSL: &str = r#"
+inline ulong kv_row(device const uint* T, uint sh, uint j) {
+    return sh == 0 ? ulong(j) : (ulong(T[j >> sh]) << sh) | ulong(j & ((1u << sh) - 1u));
+}
+"#;
+
 /// `src` (one of the KV-reading sources: [`ATTN_PREP_MSL`], [`FLASH_DECODE_MSL`],
 /// [`FLASH_MULTI_MSL`], [`FLASH_PREFILL_MSL`]) for f32 or bf16 caches. Built once per variant.
 pub fn kv_source(src: &'static str, bf16: bool) -> &'static str {
@@ -1056,7 +1067,7 @@ pub fn kv_source(src: &'static str, bf16: bool) -> &'static str {
         return s;
     }
     let head = if bf16 { KV_BF16_MSL } else { KV_F32_MSL };
-    let s: &'static str = Box::leak(format!("{head}{src}").into_boxed_str());
+    let s: &'static str = Box::leak(format!("{head}{KV_ROW_MSL}{src}").into_boxed_str());
     built.push((id, bf16, s));
     s
 }
@@ -1076,7 +1087,8 @@ kernel void attention_prep(
     device float* Qo [[buffer(5)]],
     device kv_t* KC [[buffer(6)]],
     device kv_t* VC [[buffer(7)]],
-    device const uint* params [[buffer(8)]],  // [seq, nh, nkv, hd, pos, eps bits, has_qn, has_kn]
+    device const uint* params [[buffer(8)]],  // [seq, nh, nkv, hd, pos, eps bits, has_qn, has_kn, page shift]
+    device const uint* T [[buffer(9)]],       // block table (paged caches)
     uint2 tg [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]])
 {
@@ -1092,7 +1104,7 @@ kernel void attention_prep(
 
     if (h >= nh + nkv) {  // v head: straight into the cache
         uint kh = h - nh - nkv;
-        device kv_t* dst = VC + (ulong)(pos + s) * kvd + kh * hd;
+        device kv_t* dst = VC + kv_row(T, params[8], pos + s) * kvd + kh * hd;
         for (uint v = 0; v < per; v++) kv_st(dst + v * 32 + lane, x[v]);
         return;
     }
@@ -1118,7 +1130,7 @@ kernel void attention_prep(
         device float* dst = Qo + (ulong)s * qd + h * hd;
         for (uint v = 0; v < per; v++) dst[v * 32 + lane] = y[v];
     } else {
-        device kv_t* dst = KC + (ulong)(pos + s) * kvd + (h - nh) * hd;
+        device kv_t* dst = KC + kv_row(T, params[8], pos + s) * kvd + (h - nh) * hd;
         for (uint v = 0; v < per; v++) kv_st(dst + v * 32 + lane, y[v]);
     }
 }
@@ -1230,7 +1242,8 @@ kernel void attn_prefill(
     device const kv_t* K [[buffer(1)]],      // [.., nkv*D]
     device const kv_t* V [[buffer(2)]],
     device float* O [[buffer(3)]],           // [q_pad, nh*D]
-    device const uint* params [[buffer(4)]], // [cache_start, q_len, nh, nkv, D, bidirectional]
+    device const uint* params [[buffer(4)]], // [cache_start, q_len, nh, nkv, D, bidirectional, page shift]
+    device const uint* PT [[buffer(5)]],     // block table (paged caches)
     uint2 tg [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
@@ -1268,6 +1281,8 @@ kernel void attn_prefill(
 
     device const float* qp = Q + (ulong)r0 * qs + head * D;
     for (uint j0 = 0; j0 <= last; j0 += BK) {
+        // The 32 keys from j0 are contiguous rows (blocks are multiples of 32 positions).
+        ulong r0k = kv_row(PT, params[6], j0);
         // S = Q Kᵀ for 8 rows × 32 keys.
         simdgroup_float8x8 s[4];
         for (uint c = 0; c < 4; c++) s[c] = simdgroup_float8x8(0);
@@ -1275,7 +1290,7 @@ kernel void attn_prefill(
             simdgroup_float8x8 a;
             simdgroup_load(a, qp + d, qs);
 #if KV_BF16
-            device const kv_t* kr = K + (ulong)(j0 + lane) * ks + kvh * D + d;
+            device const kv_t* kr = K + (r0k + lane) * ks + kvh * D + d;
             *(threadgroup float4*)(St + lane * 8) = kv4(kr);
             *(threadgroup float4*)(St + lane * 8 + 4) = kv4(kr + 4);
             simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -1285,7 +1300,7 @@ kernel void attn_prefill(
 #if KV_BF16
                 simdgroup_load(b, St + c * 64, 8, ulong2(0), true);
 #else
-                simdgroup_load(b, K + (ulong)(j0 + c * 8) * ks + kvh * D + d, ks, ulong2(0), true);
+                simdgroup_load(b, K + (r0k + c * 8) * ks + kvh * D + d, ks, ulong2(0), true);
 #endif
                 simdgroup_multiply_accumulate(s[c], a, b, s[c]);
             }
@@ -1332,7 +1347,7 @@ kernel void attn_prefill(
             simdgroup_float8x8 acc;
             simdgroup_multiply(acc, da, o[t]);
 #if KV_BF16
-            device const kv_t* vr = V + (ulong)(j0 + lane) * ks + kvh * D + t * 8;
+            device const kv_t* vr = V + (r0k + lane) * ks + kvh * D + t * 8;
             *(threadgroup float4*)(St + lane * 8) = kv4(vr);
             *(threadgroup float4*)(St + lane * 8 + 4) = kv4(vr + 4);
             simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -1342,7 +1357,7 @@ kernel void attn_prefill(
 #if KV_BF16
                 simdgroup_load(vt, St + c * 64, 8);
 #else
-                simdgroup_load(vt, V + (ulong)(j0 + c * 8) * ks + kvh * D + t * 8, ks);
+                simdgroup_load(vt, V + (r0k + c * 8) * ks + kvh * D + t * 8, ks);
 #endif
                 simdgroup_multiply_accumulate(acc, p[c], vt, acc);
             }

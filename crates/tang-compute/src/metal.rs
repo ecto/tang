@@ -314,6 +314,7 @@ impl MetalDevice {
         n_kv: usize,
         d: usize,
         bidir: bool,
+        pages: Option<Paging>,
     ) -> MetalBuffer {
         let q_pad = q_len.next_multiple_of(32);
         let width = n_heads * d;
@@ -334,14 +335,16 @@ impl MetalDevice {
             n_kv as u32,
             d as u32,
             bidir as u32,
+            pages.map_or(0, |p| p.1),
         ]);
         let pipeline = self.get_pipeline(
             Self::kv_src(llm_msl::FLASH_PREFILL_MSL, k, v),
             "attn_prefill",
         );
+        let table = pages.map_or(&params, |p| p.0);
         self.with_encoder(|enc| {
             enc.set_compute_pipeline_state(&pipeline);
-            for (i, b) in [&qb.buffer, &k.buffer, &v.buffer, &out, &params]
+            for (i, b) in [&qb.buffer, &k.buffer, &v.buffer, &out, &params, table]
                 .iter()
                 .enumerate()
             {
@@ -437,6 +440,7 @@ impl MetalDevice {
         d: usize,
         window: usize,
         bidir: bool,
+        pages: Option<Paging>,
     ) -> MetalBuffer {
         let gqa_rows = q_len * (n_heads / n_kv);
         let (name, rows, tile, threads) = match (d <= 128, gqa_rows) {
@@ -468,7 +472,9 @@ impl MetalDevice {
             window as u32,
             base as u32,
             bidir as u32,
+            pages.map_or(0, |p| p.1),
         ]);
+        let table = pages.map_or(&params, |p| p.0);
         let partial = self.make_buffer_empty(q_len * n_heads * n_splits * (d + 2) * 4);
         let out = self.make_buffer_empty(q_len * n_heads * d * 4);
         let p1 = self.get_pipeline(Self::kv_src(llm_msl::FLASH_MULTI_MSL, k, v), name);
@@ -478,7 +484,7 @@ impl MetalDevice {
         );
         self.with_encoder(|enc| {
             enc.set_compute_pipeline_state(&p1);
-            for (i, b) in [&q.buffer, &k.buffer, &v.buffer, &partial, &params]
+            for (i, b) in [&q.buffer, &k.buffer, &v.buffer, &partial, &params, table]
                 .iter()
                 .enumerate()
             {
@@ -519,6 +525,7 @@ impl MetalDevice {
         d: usize,
         window: usize,
         bidir: bool,
+        pages: Option<Paging>,
     ) -> MetalBuffer {
         let longest = cache_start + q_len;
         // Decode with a sliding window only needs the last `window` keys.
@@ -551,7 +558,9 @@ impl MetalDevice {
             window as u32,
             base as u32,
             bidir as u32,
+            pages.map_or(0, |p| p.1),
         ]);
+        let table = pages.map_or(&params, |p| p.0);
         let partial = self.make_buffer_empty(q_len * n_heads * n_splits * (d + 2) * 4);
         let out = self.make_buffer_empty(q_len * n_heads * d * 4);
         let p1 = self.get_pipeline(
@@ -569,7 +578,7 @@ impl MetalDevice {
         );
         self.with_encoder(|enc| {
             enc.set_compute_pipeline_state(&p1);
-            for (i, b) in [&q.buffer, &k.buffer, &v.buffer, &partial, &params]
+            for (i, b) in [&q.buffer, &k.buffer, &v.buffer, &partial, &params, table]
                 .iter()
                 .enumerate()
             {
@@ -592,6 +601,71 @@ impl MetalDevice {
         }
     }
 
+    /// The fused attention prologue (`ATTN_PREP_MSL`), into contiguous or paged caches.
+    #[allow(clippy::too_many_arguments)]
+    fn prep(
+        &self,
+        qkv: &MetalBuffer,
+        q_norm: Option<&MetalBuffer>,
+        k_norm: Option<&MetalBuffer>,
+        cos: &MetalBuffer,
+        sin: &MetalBuffer,
+        k_cache: &MetalBuffer,
+        v_cache: &MetalBuffer,
+        seq: usize,
+        (nh, nkv, hd): (usize, usize, usize),
+        pos: usize,
+        eps: f32,
+        pages: Option<Paging>,
+    ) -> MetalBuffer {
+        let pipeline = self.get_pipeline(
+            Self::kv_src(llm_msl::ATTN_PREP_MSL, k_cache, v_cache),
+            "attention_prep",
+        );
+        let q = self.make_buffer_empty(seq * nh * hd * 4);
+        let params = self.make_buffer_u32(&[
+            seq as u32,
+            nh as u32,
+            nkv as u32,
+            hd as u32,
+            pos as u32,
+            eps.to_bits(),
+            q_norm.is_some() as u32,
+            k_norm.is_some() as u32,
+            pages.map_or(0, |p| p.1),
+        ]);
+        let table = pages.map_or(&params, |p| p.0);
+        let qn = q_norm.unwrap_or(qkv);
+        let kn = k_norm.unwrap_or(qkv);
+        self.with_encoder(|enc| {
+            enc.set_compute_pipeline_state(&pipeline);
+            let bufs = [
+                &qkv.buffer,
+                &qn.buffer,
+                &kn.buffer,
+                &cos.buffer,
+                &sin.buffer,
+                &q,
+                &k_cache.buffer,
+                &v_cache.buffer,
+                &params,
+                table,
+            ];
+            for (i, b) in bufs.iter().enumerate() {
+                enc.set_buffer(i as u64, Some(b), 0);
+            }
+            enc.dispatch_thread_groups(
+                MTLSize::new((nh + 2 * nkv) as u64, seq as u64, 1),
+                MTLSize::new(32, 1, 1),
+            );
+        });
+        MetalBuffer {
+            buffer: q,
+            len: seq * nh * hd,
+            kind: Kind::F32,
+        }
+    }
+
     /// Elementwise `f(a[i], b[i])` with a native kernel from `llm_msl::ELEMENTWISE_MSL`.
     fn binary(&self, a: &MetalBuffer, b: &MetalBuffer, numel: usize, kernel: &str) -> MetalBuffer {
         let pipeline = self.get_pipeline(llm_msl::ELEMENTWISE_MSL, kernel);
@@ -609,6 +683,10 @@ impl MetalDevice {
         }
     }
 }
+
+/// A paged cache's block table (u32 on device) and `log2` of its block size, for the attention
+/// kernels (`None`: contiguous).
+type Paging<'a> = (&'a metal::Buffer, u32);
 
 /// Forwards of up to this many queries use split-KV attention (`flash_multi`) instead of the
 /// tiled prefill kernel, which has too few threadgroups to stream a long cache quickly.
@@ -1193,6 +1271,7 @@ kernel void embedding(
                 head_dim,
                 0,
                 false,
+                None,
             );
         }
         // Tiled prefill needs K/V readable to a 32-row boundary past the end.
@@ -1214,6 +1293,7 @@ kernel void embedding(
                 n_kv_heads,
                 head_dim,
                 false,
+                None,
             );
         }
         if head_dim % 32 == 0 && head_dim <= 256 && n_heads % n_kv_heads == 0 {
@@ -1228,6 +1308,7 @@ kernel void embedding(
                 head_dim,
                 0,
                 false,
+                None,
             );
         }
         if k_cache.kind == Kind::Bf16 {
@@ -1575,49 +1656,131 @@ kernel void embedding(
                 eps,
             );
         }
-        let pipeline = self.get_pipeline(
-            Self::kv_src(llm_msl::ATTN_PREP_MSL, k_cache, v_cache),
-            "attention_prep",
-        );
-        let q = self.make_buffer_empty(seq * nh * hd * 4);
-        let params = self.make_buffer_u32(&[
-            seq as u32,
-            nh as u32,
-            nkv as u32,
-            hd as u32,
-            pos as u32,
-            eps.to_bits(),
-            q_norm.is_some() as u32,
-            k_norm.is_some() as u32,
-        ]);
-        let qn = q_norm.unwrap_or(qkv);
-        let kn = k_norm.unwrap_or(qkv);
-        self.with_encoder(|enc| {
-            enc.set_compute_pipeline_state(&pipeline);
-            let bufs = [
-                &qkv.buffer,
-                &qn.buffer,
-                &kn.buffer,
-                &cos.buffer,
-                &sin.buffer,
-                &q,
-                &k_cache.buffer,
-                &v_cache.buffer,
-                &params,
-            ];
-            for (i, b) in bufs.iter().enumerate() {
-                enc.set_buffer(i as u64, Some(b), 0);
-            }
-            enc.dispatch_thread_groups(
-                MTLSize::new((nh + 2 * nkv) as u64, seq as u64, 1),
-                MTLSize::new(32, 1, 1),
+        self.prep(
+            qkv,
+            q_norm,
+            k_norm,
+            cos,
+            sin,
+            k_cache,
+            v_cache,
+            seq,
+            (nh, nkv, hd),
+            pos,
+            eps,
+            None,
+        )
+    }
+
+    fn attention_prep_paged(
+        &self,
+        qkv: &MetalBuffer,
+        q_norm: Option<&MetalBuffer>,
+        k_norm: Option<&MetalBuffer>,
+        cos: &MetalBuffer,
+        sin: &MetalBuffer,
+        k_pool: &mut MetalBuffer,
+        v_pool: &mut MetalBuffer,
+        pages: &crate::Pages<MetalBuffer>,
+        seq: usize,
+        (nh, nkv, hd): (usize, usize, usize),
+        pos: usize,
+        eps: f32,
+    ) -> MetalBuffer {
+        if hd % 64 != 0 || hd > 256 {
+            return crate::device::attention_prep_paged_default(
+                self,
+                qkv,
+                q_norm,
+                k_norm,
+                cos,
+                sin,
+                k_pool,
+                v_pool,
+                pages,
+                seq,
+                (nh, nkv, hd),
+                pos,
+                eps,
             );
-        });
-        MetalBuffer {
-            buffer: q,
-            len: seq * nh * hd,
-            kind: Kind::F32,
         }
+        self.prep(
+            qkv,
+            q_norm,
+            k_norm,
+            cos,
+            sin,
+            k_pool,
+            v_pool,
+            seq,
+            (nh, nkv, hd),
+            pos,
+            eps,
+            Some((&pages.table.buffer, pages.shift())),
+        )
+    }
+
+    fn kv_attention_paged(
+        &self,
+        q: &MetalBuffer,
+        k_pool: &MetalBuffer,
+        v_pool: &MetalBuffer,
+        pages: &crate::Pages<MetalBuffer>,
+        cache_start: usize,
+        q_len: usize,
+        (nh, nkv, hd): (usize, usize, usize),
+        window: usize,
+        causal: bool,
+    ) -> MetalBuffer {
+        let pg = Some((&pages.table.buffer, pages.shift()));
+        let (k, v) = (k_pool, v_pool);
+        let plain = causal && (window == 0 || cache_start + q_len <= window);
+        let window = if plain { 0 } else { window };
+        if hd > 256 || nh % nkv != 0 || (plain && hd % 32 != 0 && !multi_attn(q_len, nh, nkv, hd)) {
+            return crate::device::kv_attention_paged_default(
+                self,
+                q,
+                k,
+                v,
+                pages,
+                cache_start,
+                q_len,
+                (nh, nkv, hd),
+                window,
+                causal,
+            );
+        }
+        if multi_attn(q_len, nh, nkv, hd) {
+            return self.flash_multi(
+                q,
+                k,
+                v,
+                cache_start,
+                q_len,
+                nh,
+                nkv,
+                hd,
+                window,
+                !causal,
+                pg,
+            );
+        }
+        if plain && q_len > 1 && hd % 8 == 0 && hd <= 128 {
+            return self.flash_prefill(q, k, v, cache_start, q_len, nh, nkv, hd, false, pg);
+        }
+        self.flash_attention(
+            q,
+            k,
+            v,
+            cache_start,
+            q_len,
+            nh,
+            nkv,
+            hd,
+            window,
+            !causal,
+            pg,
+        )
     }
 
     fn kv_attention_window(
@@ -1659,6 +1822,7 @@ kernel void embedding(
                 head_dim,
                 window,
                 !causal,
+                None,
             );
         }
         self.flash_attention(
@@ -1672,6 +1836,7 @@ kernel void embedding(
             head_dim,
             window,
             !causal,
+            None,
         )
     }
 
@@ -1687,9 +1852,9 @@ kernel void embedding(
         // The tiled simdgroup-matrix kernel when the shape allows (vision towers: D 64-128).
         let rows = n.next_multiple_of(32) * nh * hd;
         if hd % 8 == 0 && hd <= 128 && k.len >= rows && v.len >= rows {
-            return self.flash_prefill(q, k, v, 0, n, nh, nh, hd, true);
+            return self.flash_prefill(q, k, v, 0, n, nh, nh, hd, true, None);
         }
-        self.flash_attention(q, k, v, 0, n, nh, nh, hd, 0, true)
+        self.flash_attention(q, k, v, 0, n, nh, nh, hd, 0, true, None)
     }
 
     fn layer_norm(

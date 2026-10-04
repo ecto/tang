@@ -462,6 +462,16 @@ __device__ __forceinline__ void kv_st(kv_t* p, float x) {
 }
 "#;
 
+/// The row of a cache buffer that position `j` lives in: `j` itself (`sh == 0`), or through
+/// the block table `T` of a paged cache (blocks of `1 << sh` positions).
+pub const KV_ROW_CUDA: &str = r#"
+__device__ __forceinline__ unsigned long long kv_row(const unsigned int* T, unsigned int sh,
+                                                     unsigned int j) {
+    return sh == 0 ? (unsigned long long)j
+                   : ((unsigned long long)T[j >> sh] << sh) | (j & ((1u << sh) - 1u));
+}
+"#;
+
 /// `src` (one of the KV-reading sources: [`ATTN_PREP_CUDA`], [`ATTENTION_CUDA`]) for f32 or
 /// bf16 caches. Built once per variant.
 pub fn kv_source(src: &'static str, bf16: bool) -> &'static str {
@@ -473,7 +483,7 @@ pub fn kv_source(src: &'static str, bf16: bool) -> &'static str {
         return s;
     }
     let head = if bf16 { KV_BF16_CUDA } else { KV_F32_CUDA };
-    let s: &'static str = Box::leak(format!("{head}{src}").into_boxed_str());
+    let s: &'static str = Box::leak(format!("{head}{KV_ROW_CUDA}{src}").into_boxed_str());
     built.push((id, bf16, s));
     s
 }
@@ -489,7 +499,8 @@ extern "C" __global__ void attention_prep(
     const float* __restrict__ COS, const float* __restrict__ SIN,
     float* __restrict__ Qo, kv_t* __restrict__ KC, kv_t* __restrict__ VC,
     unsigned int nh, unsigned int nkv, unsigned int hd, unsigned int pos, float eps,
-    unsigned int has_qn, unsigned int has_kn)
+    unsigned int has_qn, unsigned int has_kn, const unsigned int* __restrict__ T,
+    unsigned int sh)
 {
     __shared__ float xs[256];
     unsigned int h = blockIdx.x, s = blockIdx.y, lane = threadIdx.x;
@@ -497,7 +508,7 @@ extern "C" __global__ void attention_prep(
     const float* src = QKV + (u64)s * row + (u64)h * hd;  // heads are contiguous: q.., k.., v..
 
     if (h >= nh + nkv) {  // v head: straight into the cache
-        kv_t* dst = VC + (u64)(pos + s) * kvd + (u64)(h - nh - nkv) * hd;
+        kv_t* dst = VC + kv_row(T, sh, pos + s) * kvd + (u64)(h - nh - nkv) * hd;
         for (unsigned int d = lane; d < hd; d += 32) kv_st(dst + d, src[d]);
         return;
     }
@@ -522,7 +533,7 @@ extern "C" __global__ void attention_prep(
         }
         return;
     }
-    kv_t* dst = KC + (u64)(pos + s) * kvd + (u64)(h - nh) * hd;
+    kv_t* dst = KC + kv_row(T, sh, pos + s) * kvd + (u64)(h - nh) * hd;
     for (unsigned int i = lane; i < half; i += 32) {
         float c = COS[t + i], sn = SIN[t + i];
         float x0 = xs[i], x1 = xs[i + half];
@@ -652,7 +663,7 @@ extern "C" __global__ void attn_partial(
     float* __restrict__ P,   // [q_len, nh, n_splits, D + 2]
     unsigned int cache_start, unsigned int q_len, unsigned int nh, unsigned int nkv,
     unsigned int D, unsigned int n_splits, unsigned int split_len, unsigned int window,
-    unsigned int base, unsigned int bidir)
+    unsigned int base, unsigned int bidir, const unsigned int* __restrict__ T, unsigned int sh)
 {
     unsigned int head = blockIdx.x, split = blockIdx.y, qi = blockIdx.z;
     unsigned int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -679,7 +690,7 @@ extern "C" __global__ void attn_partial(
     float m = NEG_INF, l = 0.0f;
 
     for (unsigned int j = j0 + warp; j < j1; j += 8) {
-        const kv_t* kp = K + (u64)j * kvd + (u64)kvh * D;
+        const kv_t* kp = K + kv_row(T, sh, j) * kvd + (u64)kvh * D;
         float s = 0.0f;
         #pragma unroll
         for (unsigned int v = 0; v < MAXV; v++) {
@@ -690,7 +701,7 @@ extern "C" __global__ void attn_partial(
         float m2 = fmaxf(m, s);
         float c = expf(m - m2), p = expf(s - m2);
         l = l * c + p;
-        const kv_t* vp = V + (u64)j * kvd + (u64)kvh * D;
+        const kv_t* vp = V + kv_row(T, sh, j) * kvd + (u64)kvh * D;
         #pragma unroll
         for (unsigned int v = 0; v < MAXV; v++) {
             unsigned int d = v * 32 + lane;
@@ -763,7 +774,8 @@ extern "C" __global__ void attn_combine(
 extern "C" __global__ void attn_prefill(
     const float* __restrict__ Q, const kv_t* __restrict__ K, const kv_t* __restrict__ V,
     float* __restrict__ O, unsigned int cache_start, unsigned int q_len, unsigned int nh,
-    unsigned int nkv, unsigned int D, unsigned int window, unsigned int bidir, unsigned int BQ)
+    unsigned int nkv, unsigned int D, unsigned int window, unsigned int bidir, unsigned int BQ,
+    const unsigned int* __restrict__ T, unsigned int sh)
 {
     __shared__ float Qs[32 * 129];        // [BQ][D + 1]; BQ * (D + 1) <= 4128
     __shared__ float KVs[BK * 257];       // [BK][D + 1], K then V
@@ -802,7 +814,7 @@ extern "C" __global__ void attn_prefill(
     for (unsigned int j0 = k_begin; j0 < k_end; j0 += BK) {
         for (unsigned int i = tid; i < BK * D; i += 256) {
             unsigned int c = i / D, d = i % D, j = j0 + c;
-            KVs[c * ld + d] = (j < total) ? kv1(K + (u64)j * kvd + (u64)kvh * D + d) : 0.0f;
+            KVs[c * ld + d] = (j < total) ? kv1(K + kv_row(T, sh, j) * kvd + (u64)kvh * D + d) : 0.0f;
         }
         __syncthreads();
         for (unsigned int t = 0; t < per_score; t++) {
@@ -841,7 +853,7 @@ extern "C" __global__ void attn_prefill(
         for (unsigned int i = tid; i < BK * D; i += 256) {
             unsigned int c = i / D, d = i % D, j = j0 + c;
             // Overwrites K: every score read of K finished before the barrier above.
-            KVs[c * ld + d] = (j < total) ? kv1(V + (u64)j * kvd + (u64)kvh * D + d) : 0.0f;
+            KVs[c * ld + d] = (j < total) ? kv1(V + kv_row(T, sh, j) * kvd + (u64)kvh * D + d) : 0.0f;
         }
         __syncthreads();
         float alpha = a_s[ar];
@@ -887,7 +899,7 @@ __device__ __forceinline__ void attn_multi_body(
     float* __restrict__ P, unsigned int cache_start, unsigned int q_len, unsigned int nh,
     unsigned int nkv, unsigned int D, unsigned int n_splits, unsigned int split_len,
     unsigned int window, unsigned int base, unsigned int bidir,
-    float* Qs, float* KVs, float* Ps)
+    const unsigned int* __restrict__ T, unsigned int sh, float* Qs, float* KVs, float* Ps)
 {
     constexpr int RW = R / 8;              // rows per warp
     constexpr int SEGS = 32 / BK;          // key segments per warp
@@ -949,7 +961,7 @@ __device__ __forceinline__ void attn_multi_body(
         #pragma unroll
         for (int t = 0; t < NL; t++) {
             unsigned int i = tid + 256 * t, cc = i / D4, d = (i % D4) * 4, j = j0 + cc;
-            reg[t] = (cc < BK && j < je) ? kv4(src + (u64)j * kvd + (u64)kvh * D + d)
+            reg[t] = (cc < BK && j < je) ? kv4(src + kv_row(T, sh, j) * kvd + (u64)kvh * D + d)
                                          : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         }
     };
@@ -1051,13 +1063,14 @@ extern "C" __global__ void __launch_bounds__(256) NAME(                         
     const float* __restrict__ Q, const kv_t* __restrict__ K, const kv_t* __restrict__ V,      \
     float* __restrict__ P, unsigned int cache_start, unsigned int q_len, unsigned int nh,     \
     unsigned int nkv, unsigned int D, unsigned int n_splits, unsigned int split_len,          \
-    unsigned int window, unsigned int base, unsigned int bidir)                               \
+    unsigned int window, unsigned int base, unsigned int bidir,                               \
+    const unsigned int* __restrict__ T, unsigned int sh)                                      \
 {                                                                                             \
     __shared__ __align__(16) float Qs[R * (DMAX + 4)];                                        \
     __shared__ __align__(16) float KVs[BK * (DMAX + 4)];                                      \
     __shared__ __align__(16) float Ps[BK * (R + 4)];                                          \
     attn_multi_body<R, BK, DMAX>(Q, K, V, P, cache_start, q_len, nh, nkv, D, n_splits,        \
-                                 split_len, window, base, bidir, Qs, KVs, Ps);                \
+                                 split_len, window, base, bidir, T, sh, Qs, KVs, Ps);         \
 }
 
 ATTN_MULTI(attn_multi_r8, 8, 32, 128)

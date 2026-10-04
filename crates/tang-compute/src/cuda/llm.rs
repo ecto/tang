@@ -28,6 +28,19 @@ fn kv_arg_mut<'a>(lb: &mut LaunchArgs<'a>, b: &'a mut CudaBuffer) {
     };
 }
 
+/// A paged cache's block table (u32 bits, as `upload_u32` stores them) and `log2` of its block
+/// size, for the attention kernels (`None`: contiguous).
+pub(super) type Paging<'a> = Option<(&'a CudaBuffer, u32)>;
+
+/// The table argument for a kernel: the block table, or any device pointer when contiguous
+/// (the kernel never reads it then).
+fn table_of<'a>(pages: Paging<'a>, fallback: &'a CudaBuffer) -> (&'a CudaSlice<f32>, u32) {
+    match pages {
+        Some((t, sh)) => (t.f32_data(), sh),
+        None => (fallback.f32_data(), 0),
+    }
+}
+
 /// One thread per element, 256 per block.
 fn per_elem(n: usize) -> LaunchConfig {
     LaunchConfig {
@@ -557,6 +570,7 @@ impl CudaComputeDevice {
         (nh, nkv, hd): (usize, usize, usize),
         pos: usize,
         eps: f32,
+        pages: Paging,
     ) -> Option<CudaBuffer> {
         if qkv.is_bf16() || hd % 2 != 0 || hd > 256 {
             return None;
@@ -564,9 +578,11 @@ impl CudaComputeDevice {
         let bf16 = Self::kv_bf16(k_cache, v_cache);
         let kvd = nkv * hd;
         assert!(
-            k_cache.len >= (pos + seq) * kvd && v_cache.len >= (pos + seq) * kvd,
+            pages.is_some()
+                || (k_cache.len >= (pos + seq) * kvd && v_cache.len >= (pos + seq) * kvd),
             "KV cache too small"
         );
+        let (table, sh) = table_of(pages, qkv);
         let mut q = self.pool_alloc_uninit_f32(seq * nh * hd);
         let f = self.kv_func(llm_cuda::ATTN_PREP_CUDA, "attention_prep", bf16);
         let qn = q_norm.unwrap_or(qkv);
@@ -590,6 +606,8 @@ impl CudaComputeDevice {
                 .arg(&eps)
                 .arg(&has_qn)
                 .arg(&has_kn)
+                .arg(table)
+                .arg(&sh)
                 .launch(blocks((nh + 2 * nkv, seq, 1), 32))
                 .unwrap();
         }
@@ -609,6 +627,7 @@ impl CudaComputeDevice {
         (nh, nkv, d): (usize, usize, usize),
         window: usize,
         bidir: bool,
+        pages: Paging,
     ) -> CudaBuffer {
         assert!(
             d <= 256 && nh % nkv == 0,
@@ -619,8 +638,9 @@ impl CudaComputeDevice {
         let q = self.as_f32(q, &mut tq);
         let bf16 = Self::kv_bf16(k, v);
         let longest = cache_start + q_len;
-        assert!(k.len >= longest * nkv * d && v.len >= longest * nkv * d);
+        assert!(pages.is_some() || (k.len >= longest * nkv * d && v.len >= longest * nkv * d));
         let mut out = self.pool_alloc_uninit_f32(q_len * nh * d);
+        let (table, sh) = table_of(pages, q);
         let (cs, ql, nh_u, nkv_u, d_u, win, bi) = (
             cache_start as u32,
             q_len as u32,
@@ -643,6 +663,7 @@ impl CudaComputeDevice {
                 window,
                 bidir,
                 bf16,
+                pages,
             );
             return self.finish(out);
         }
@@ -663,6 +684,8 @@ impl CudaComputeDevice {
                     .arg(&win)
                     .arg(&bi)
                     .arg(&bq)
+                    .arg(table)
+                    .arg(&sh)
                     .launch(blocks((q_len.div_ceil(bq as usize), nh, 1), 256))
                     .unwrap();
             }
@@ -697,6 +720,8 @@ impl CudaComputeDevice {
                 .arg(&win)
                 .arg(&base_u)
                 .arg(&bi)
+                .arg(table)
+                .arg(&sh)
                 .launch(blocks((nh, n_splits, 1), 256))
                 .unwrap();
         }
@@ -731,6 +756,7 @@ impl CudaComputeDevice {
         window: usize,
         bidir: bool,
         bf16: bool,
+        pages: Paging,
     ) {
         let gqa_rows = q_len * (nh / nkv);
         let (name, rows, tile) = match (d <= 128, gqa_rows) {
@@ -764,6 +790,7 @@ impl CudaComputeDevice {
         );
         let (ns, sl, base_u) = (n_splits as u32, split_len as u32, base as u32);
         let f = self.kv_func(llm_cuda::ATTENTION_CUDA, name, bf16);
+        let (table, sh) = table_of(pages, q);
         let mut lb = self.stream.launch_builder(&f);
         lb.arg(q.f32_data());
         kv_arg(&mut lb, k);
@@ -780,6 +807,8 @@ impl CudaComputeDevice {
                 .arg(&win)
                 .arg(&base_u)
                 .arg(&bi)
+                .arg(table)
+                .arg(&sh)
                 .launch(blocks((nkv, n_splits, groups), 256))
                 .unwrap();
         }
@@ -1214,6 +1243,188 @@ mod tests {
         close(&got, &want, 1e-4, "attention_full");
     }
 
+    /// A paged copy of contiguous K or V rows `x` (`kvd` wide): blocks of `block` rows, placed
+    /// in a pool of `ids.len() + 3` blocks in the scrambled order `ids`.
+    fn paged<D: ComputeDevice>(
+        g: &D,
+        x: &[f32],
+        kvd: usize,
+        ids: &[u32],
+        block: usize,
+        bf16: bool,
+    ) -> D::Buffer {
+        let mut pool = vec![0.0f32; (ids.len() + 3) * block * kvd];
+        for p in 0..x.len() / kvd {
+            let row = ids[p / block] as usize * block + p % block;
+            pool[row * kvd..(row + 1) * kvd].copy_from_slice(&x[p * kvd..(p + 1) * kvd]);
+        }
+        kv_cache(g, &pool, pool.len(), bf16)
+    }
+
+    /// Block ids for `n` blocks, out of order, within a pool of `n + 3`: odd blocks from the
+    /// top down, even ones from the bottom up past a gap.
+    fn scrambled(n: usize) -> Vec<u32> {
+        (0..n)
+            .map(|i| if i % 2 == 1 { n + 2 - i / 2 } else { 1 + i / 2 } as u32)
+            .collect()
+    }
+
+    /// Paged attention and prologue against the contiguous ones on the same device, and the
+    /// paged attention against the CPU's paged fallback.
+    fn paged_vs_contiguous<D: ComputeDevice>(g: &D, bf16: bool) {
+        let c = CpuDevice::new();
+        // (nh, nkv, hd, cache_start, q_len, window, causal, block)
+        let cases = [
+            (4, 2, 128, 999, 1, 0, true, 32),    // decode, several splits
+            (4, 2, 128, 2100, 1, 0, true, 256),  // lane-per-key decode
+            (8, 4, 256, 700, 1, 512, true, 64),  // windowed decode, D = 256
+            (4, 1, 64, 0, 45, 0, true, 32),      // prefill
+            (4, 2, 128, 300, 100, 0, true, 64),  // prefill after a prefix
+            (4, 2, 256, 20, 50, 16, true, 32),   // windowed prefill, D = 256
+            (4, 4, 72, 3, 33, 0, false, 32),     // bidirectional, D not a multiple of 64
+            (4, 2, 128, 999, 5, 0, true, 128),   // multi-query
+            (32, 8, 128, 1500, 8, 0, true, 256), // verify step
+            (8, 4, 256, 700, 3, 512, true, 32),  // multi-query, D = 256, windowed
+            (4, 2, 80, 100, 2, 0, true, 32),     // D not a multiple of 32
+        ];
+        for &(nh, nkv, hd, cs, ql, window, causal, block) in &cases {
+            let (total, kvd) = (cs + ql, nkv * hd);
+            let q = vals(ql * nh * hd, 21, 2.0);
+            let mut k = vals(total * kvd, 22, 2.0);
+            let mut v = vals(total * kvd, 23, 2.0);
+            if bf16 {
+                (k, v) = (bf16_round(&k), bf16_round(&v));
+            }
+            let ids = scrambled(total.div_ceil(block));
+            let what = format!("paged attention nh={nh} nkv={nkv} hd={hd} start={cs} len={ql} window={window} causal={causal} block={block} bf16={bf16}");
+            let run = |d: &D, cpu: bool| -> Vec<f32> {
+                let _ = cpu;
+                let table = d.upload_u32(&ids);
+                let pages = crate::Pages {
+                    ids: &ids,
+                    table: &table,
+                    block,
+                };
+                d.download(&d.kv_attention_paged(
+                    &d.upload(&q),
+                    &paged(d, &k, kvd, &ids, block, bf16),
+                    &paged(d, &v, kvd, &ids, block, bf16),
+                    &pages,
+                    cs,
+                    ql,
+                    (nh, nkv, hd),
+                    window,
+                    causal,
+                ))
+            };
+            let got = run(g, false);
+            let rows = total.next_multiple_of(32) * kvd;
+            let flat = g.download(&g.kv_attention_window(
+                &g.upload(&q),
+                &kv_cache(g, &k, rows, bf16),
+                &kv_cache(g, &v, rows, bf16),
+                cs,
+                ql,
+                (nh, nkv, hd),
+                window,
+                causal,
+            ));
+            close(&got, &flat, 1e-5, &format!("{what} vs contiguous"));
+            let table = c.upload_u32(&ids);
+            let pages = crate::Pages {
+                ids: &ids,
+                table: &table,
+                block,
+            };
+            let want = c.download(&c.kv_attention_paged(
+                &c.upload(&q),
+                &paged(&c, &k, kvd, &ids, block, false),
+                &paged(&c, &v, kvd, &ids, block, false),
+                &pages,
+                cs,
+                ql,
+                (nh, nkv, hd),
+                window,
+                causal,
+            ));
+            close(&got, &want, 1e-4, &format!("{what} vs cpu"));
+        }
+        // The prologue writes each position's k and v where the table puts it.
+        for &(nh, nkv, hd, seq, pos, block) in &[
+            (4, 2, 128, 40, 50, 32),
+            (8, 4, 256, 1, 300, 256),
+            (2, 2, 72, 5, 30, 32),
+        ] {
+            let kvd = nkv * hd;
+            let qkv = vals(seq * (nh + 2 * nkv) * hd, 24, 2.0);
+            let (qn, kn) = (vals(hd, 25, 1.0), vals(hd, 26, 1.0));
+            let max = 512;
+            let (cos, sin) = (vals(max * hd / 2, 27, 2.0), vals(max * hd / 2, 28, 2.0));
+            let ids = scrambled((pos + seq).div_ceil(block));
+            let table = g.upload_u32(&ids);
+            let pages = crate::Pages {
+                ids: &ids,
+                table: &table,
+                block,
+            };
+            let pool = (ids.len() + 3) * block * kvd;
+            let (mut kp, mut vp) = if bf16 {
+                (g.alloc_bf16(pool), g.alloc_bf16(pool))
+            } else {
+                (g.alloc(pool), g.alloc(pool))
+            };
+            let (qn, kn) = (g.upload(&qn), g.upload(&kn));
+            let (qkv, cos, sin) = (g.upload(&qkv), g.upload(&cos), g.upload(&sin));
+            let q1 = g.download(&g.attention_prep_paged(
+                &qkv,
+                Some(&qn),
+                Some(&kn),
+                &cos,
+                &sin,
+                &mut kp,
+                &mut vp,
+                &pages,
+                seq,
+                (nh, nkv, hd),
+                pos,
+                1e-6,
+            ));
+            let rows = (pos + seq) * kvd;
+            let (mut kc, mut vc) = if bf16 {
+                (g.alloc_bf16(rows), g.alloc_bf16(rows))
+            } else {
+                (g.alloc(rows), g.alloc(rows))
+            };
+            let q2 = g.download(&g.attention_prep(
+                &qkv,
+                Some(&qn),
+                Some(&kn),
+                &cos,
+                &sin,
+                &mut kc,
+                &mut vc,
+                seq,
+                (nh, nkv, hd),
+                pos,
+                1e-6,
+            ));
+            let what = format!("paged prologue nh={nh} hd={hd} seq={seq} pos={pos} bf16={bf16}");
+            close(&q1, &q2, 0.0, &format!("{what} q"));
+            let (kp, vp, kc, vc) = (
+                g.download(&kp),
+                g.download(&vp),
+                g.download(&kc),
+                g.download(&vc),
+            );
+            for p in pos..pos + seq {
+                let row = pages.row(p);
+                let at = |x: &[f32], r: usize| x[r * kvd..(r + 1) * kvd].to_vec();
+                close(&at(&kp, row), &at(&kc, p), 0.0, &format!("{what} k at {p}"));
+                close(&at(&vp, row), &at(&vc, p), 0.0, &format!("{what} v at {p}"));
+            }
+        }
+    }
+
     fn elementwise_and_norms_vs_cpu<D: ComputeDevice>(g: &D) {
         let c = CpuDevice::new();
         let (rows, ff, dim) = (3, 300, 1152);
@@ -1395,6 +1606,12 @@ mod tests {
     }
 
     #[test]
+    fn cuda_paged_vs_contiguous() {
+        on_gpu(|g| paged_vs_contiguous(g, false));
+        on_gpu(|g| paged_vs_contiguous(g, true));
+    }
+
+    #[test]
     fn cuda_elementwise_and_norms_vs_cpu() {
         on_gpu(elementwise_and_norms_vs_cpu::<CudaComputeDevice>);
     }
@@ -1431,6 +1648,14 @@ mod tests {
         let g = crate::MetalDevice::new().expect("no Metal device");
         attention_vs_cpu(&g, false);
         attention_vs_cpu(&g, true);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_paged_vs_contiguous() {
+        let g = crate::MetalDevice::new().expect("no Metal device");
+        paged_vs_contiguous(&g, false);
+        paged_vs_contiguous(&g, true);
     }
 
     /// The same checks on Metal, so the harness itself is exercised on a Mac.

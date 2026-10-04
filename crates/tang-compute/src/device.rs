@@ -964,6 +964,60 @@ pub trait ComputeDevice: Send {
         )
     }
 
+    /// [`attention_prep`](Self::attention_prep) into a paged cache: k and v of position `p`
+    /// go to the row `pages` maps it to. The default ([`attention_prep_paged_default`]) runs
+    /// `attention_prep` on scratch caches and copies the rows over.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_prep_paged(
+        &self,
+        qkv: &Self::Buffer,
+        q_norm: Option<&Self::Buffer>,
+        k_norm: Option<&Self::Buffer>,
+        cos: &Self::Buffer,
+        sin: &Self::Buffer,
+        k_pool: &mut Self::Buffer,
+        v_pool: &mut Self::Buffer,
+        pages: &Pages<Self::Buffer>,
+        seq: usize,
+        shape: (usize, usize, usize),
+        pos: usize,
+        eps: f32,
+    ) -> Self::Buffer {
+        attention_prep_paged_default(
+            self, qkv, q_norm, k_norm, cos, sin, k_pool, v_pool, pages, seq, shape, pos, eps,
+        )
+    }
+
+    /// [`kv_attention_window`](Self::kv_attention_window) over a paged cache: key `j` is the
+    /// row `pages` maps it to. The default ([`kv_attention_paged_default`]) gathers the keys
+    /// into contiguous buffers.
+    #[allow(clippy::too_many_arguments)]
+    fn kv_attention_paged(
+        &self,
+        q: &Self::Buffer,
+        k_pool: &Self::Buffer,
+        v_pool: &Self::Buffer,
+        pages: &Pages<Self::Buffer>,
+        cache_start: usize,
+        q_len: usize,
+        shape: (usize, usize, usize),
+        window: usize,
+        causal: bool,
+    ) -> Self::Buffer {
+        kv_attention_paged_default(
+            self,
+            q,
+            k_pool,
+            v_pool,
+            pages,
+            cache_start,
+            q_len,
+            shape,
+            window,
+            causal,
+        )
+    }
+
     /// `kv_attention` where each query sees only the last `window` keys (0: all of them), as in
     /// Gemma's local layers. The portable fallback runs on the host.
     #[allow(clippy::too_many_arguments)]
@@ -1158,6 +1212,115 @@ pub trait ComputeDevice: Send {
         weight_decay: f32,
         step_t: usize,
     );
+}
+
+/// Where a sequence's positions live in a paged KV cache: position `p` is row
+/// `ids[p / block] * block + p % block` of the cache buffers (each layer's K and V alike).
+pub struct Pages<'a, B> {
+    /// The sequence's blocks, in order.
+    pub ids: &'a [u32],
+    /// `ids` on the device (from [`ComputeDevice::upload_u32`]).
+    pub table: &'a B,
+    /// Positions a block holds: a power of two, at least 32.
+    pub block: usize,
+}
+
+impl<B> Pages<'_, B> {
+    /// `log2(block)`, as kernels take it.
+    pub fn shift(&self) -> u32 {
+        debug_assert!(self.block.is_power_of_two() && self.block >= 32);
+        self.block.trailing_zeros()
+    }
+
+    /// The row position `p` maps to.
+    pub fn row(&self, p: usize) -> usize {
+        self.ids[p / self.block] as usize * self.block + p % self.block
+    }
+
+    /// Positions `from..to` as contiguous runs: (first position, its row, length).
+    pub fn runs(&self, from: usize, to: usize) -> Vec<(usize, usize, usize)> {
+        let mut out = Vec::new();
+        let mut p = from;
+        while p < to {
+            let n = (self.block - p % self.block).min(to - p);
+            out.push((p, self.row(p), n));
+            p += n;
+        }
+        out
+    }
+}
+
+/// The portable [`ComputeDevice::attention_prep_paged`]: `attention_prep` on scratch caches,
+/// then the new rows copied to where `pages` puts them.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_prep_paged_default<D: ComputeDevice + ?Sized>(
+    dev: &D,
+    qkv: &D::Buffer,
+    q_norm: Option<&D::Buffer>,
+    k_norm: Option<&D::Buffer>,
+    cos: &D::Buffer,
+    sin: &D::Buffer,
+    k_pool: &mut D::Buffer,
+    v_pool: &mut D::Buffer,
+    pages: &Pages<D::Buffer>,
+    seq: usize,
+    (nh, nkv, hd): (usize, usize, usize),
+    pos: usize,
+    eps: f32,
+) -> D::Buffer {
+    let kvd = nkv * hd;
+    let (mut k, mut v) = (dev.alloc((pos + seq) * kvd), dev.alloc((pos + seq) * kvd));
+    let q = dev.attention_prep(
+        qkv,
+        q_norm,
+        k_norm,
+        cos,
+        sin,
+        &mut k,
+        &mut v,
+        seq,
+        (nh, nkv, hd),
+        pos,
+        eps,
+    );
+    for (from, row, n) in pages.runs(pos, pos + seq) {
+        let (ks, vs) = (
+            dev.slice_buffer(&k, from * kvd, n * kvd),
+            dev.slice_buffer(&v, from * kvd, n * kvd),
+        );
+        dev.write_into(k_pool, row * kvd, &ks);
+        dev.write_into(v_pool, row * kvd, &vs);
+    }
+    q
+}
+
+/// The portable [`ComputeDevice::kv_attention_paged`]: the keys gathered into contiguous f32
+/// buffers, then [`ComputeDevice::kv_attention_window`].
+#[allow(clippy::too_many_arguments)]
+pub fn kv_attention_paged_default<D: ComputeDevice + ?Sized>(
+    dev: &D,
+    q: &D::Buffer,
+    k_pool: &D::Buffer,
+    v_pool: &D::Buffer,
+    pages: &Pages<D::Buffer>,
+    cache_start: usize,
+    q_len: usize,
+    (nh, nkv, hd): (usize, usize, usize),
+    window: usize,
+    causal: bool,
+) -> D::Buffer {
+    let kvd = nkv * hd;
+    let total = cache_start + q_len;
+    let (mut k, mut v) = (dev.alloc(total * kvd), dev.alloc(total * kvd));
+    for (from, row, n) in pages.runs(0, total) {
+        let (ks, vs) = (
+            dev.slice_buffer(k_pool, row * kvd, n * kvd),
+            dev.slice_buffer(v_pool, row * kvd, n * kvd),
+        );
+        dev.write_into(&mut k, from * kvd, &ks);
+        dev.write_into(&mut v, from * kvd, &vs);
+    }
+    dev.kv_attention_window(q, &k, &v, cache_start, q_len, (nh, nkv, hd), window, causal)
 }
 
 /// Composition of primitives behind [`ComputeDevice::attention_prep`] (backends that fuse it
