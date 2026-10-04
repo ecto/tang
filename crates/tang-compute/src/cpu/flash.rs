@@ -459,9 +459,51 @@ pub(crate) fn moe_plan(ids: &[u32], table: &[u64], shared: u64, t: usize) -> Vec
     plan
 }
 
+/// One expert row against a row of int8 activations, in the pinned order of
+/// [`ExpertBlob::ORDER`]: eight lane accumulators over the row's 128-weight groups, then the
+/// fixed tree. `group(g)` gives the byte offsets of the row's group `g` in `blob`.
+pub(crate) fn expert_row_dot(
+    blob: &[u8],
+    groups: usize,
+    group: impl Fn(usize) -> (usize, usize),
+    x: &QRow,
+) -> f32 {
+    let mut acc = [0f32; 8];
+    for g in 0..groups {
+        let (co, so) = group(g);
+        let v = &blob[co..co + 32];
+        let dw = [
+            f16_to_f32(u16::from_le_bytes([blob[so], blob[so + 1]])),
+            f16_to_f32(u16::from_le_bytes([blob[so + 2], blob[so + 3]])),
+        ];
+        for (i, a) in acc.iter_mut().enumerate() {
+            let (c, h) = (4 * g + i / 2, i % 2);
+            let mut s = 0i32;
+            for b in 0..4 {
+                let byte = v[4 * i + b];
+                for f in 0..4 {
+                    s += ((byte >> (2 * f)) & 3) as i32 * x.q[c * 32 + 16 * h + 4 * b + f];
+                }
+            }
+            if h == 0 {
+                s -= x.hx[c];
+            }
+            *a = (s as f32).mul_add(dw[i / 4] * x.d[c], *a);
+        }
+    }
+    ((acc[0] + acc[4]) + (acc[2] + acc[6])) + ((acc[1] + acc[5]) + (acc[3] + acc[7]))
+}
+
+/// SiLU with the pinned exponential: `x / (1 + pexp(−x))`.
+pub(crate) fn psilu(x: f32) -> f32 {
+    x / (1.0 + crate::flash::pexp(-x))
+}
+
 /// Evaluate every planned (expert, token) pair into `parts` rows: gate/up rows against the
-/// token's int8 activations (`xq`, `QAct { m: t, k: HIDDEN }`), `h = silu(g) · u`, `h`
-/// quantized per the [`QAct`] contract, then down rows against it.
+/// token's int8 activations (`xq`, `QAct { m: t, k: HIDDEN }`), `h = psilu(g) · u`, `h`
+/// quantized per the [`QAct`] contract, then down rows against it, every row in the pinned
+/// order of [`ExpertBlob::ORDER`]. This is the spec both the GPU kernels and the CPU expert
+/// kernels match bit for bit.
 ///
 /// # Safety
 /// Every group address in `plan` must point at a live [`ExpertBlob`] readable from the host.
@@ -474,10 +516,6 @@ pub(crate) unsafe fn moe_grouped(xq: &[u32], plan: &[u32], parts: &mut [f32], t:
             | (plan[MoePlan::GROUP_PTR + 2 * g + 1] as u64) << 32;
         // SAFETY: the caller guarantees the address is a live blob.
         let blob = unsafe { std::slice::from_raw_parts(ptr as *const u8, ExpertBlob::BYTES) };
-        let row_dot = |(co, so): (usize, usize), c: usize, x: &QRow, acc: f32| {
-            let d = f16_to_f32(u16::from_le_bytes([blob[so], blob[so + 1]]));
-            q2_block_dot(&blob[co..co + 16], d, c, x, acc)
-        };
         for e in
             plan[MoePlan::GROUP_START + g] as usize..plan[MoePlan::GROUP_START + g + 1] as usize
         {
@@ -486,26 +524,30 @@ pub(crate) unsafe fn moe_grouped(xq: &[u32], plan: &[u32], parts: &mut [f32], t:
                 plan[MoePlan::ENT_DST + e] as usize,
             );
             let x = QRow::decode(xq, lx, tok);
-            let hrow: Vec<f32> = (0..FF)
-                .map(|r| {
-                    let (mut gv, mut uv) = (0f32, 0f32);
-                    for c in 0..HIDDEN / 64 {
-                        gv = row_dot(ExpertBlob::gu_block(2 * r, c), c, &x, gv);
-                        uv = row_dot(ExpertBlob::gu_block(2 * r + 1, c), c, &x, uv);
-                    }
-                    silu(gv) * uv
-                })
-                .collect();
+            let hrow = expert_h(blob, &x);
             let hq = QRow::decode(&quantize_act(&hrow, 1, FF), lh, 0);
             for r in 0..HIDDEN {
-                let mut acc = 0f32;
-                for c in 0..FF / 64 {
-                    acc = row_dot(ExpertBlob::down_block(r, c), c, &hq, acc);
-                }
-                parts[dst * HIDDEN + r] = acc;
+                parts[dst * HIDDEN + r] =
+                    expert_row_dot(blob, FF / 128, |g| ExpertBlob::down_group(r, g), &hq);
             }
         }
     }
+}
+
+/// An expert's SwiGLU activations `h [FF]` for one token, in the pinned order.
+pub(crate) fn expert_h(blob: &[u8], x: &QRow) -> Vec<f32> {
+    (0..FF)
+        .map(|r| {
+            let gv = expert_row_dot(blob, HIDDEN / 128, |g| ExpertBlob::gu_group(2 * r, g), x);
+            let uv = expert_row_dot(
+                blob,
+                HIDDEN / 128,
+                |g| ExpertBlob::gu_group(2 * r + 1, g),
+                x,
+            );
+            psilu(gv) * uv
+        })
+        .collect()
 }
 
 /// `y[t] = Σ_i w[t][i] · parts[t·TOPK + i]` (fma chain, i ascending), then
@@ -958,6 +1000,66 @@ mod tests {
         for j in 0..GDN_D {
             let want = o[j] / rms;
             assert!((y[hv * GDN_D + j] - want).abs() < 1e-4 * (1.0 + want.abs()));
+        }
+    }
+
+    #[test]
+    fn pexp_is_within_two_ulp_of_exp() {
+        let mut x = -87.0f32;
+        while x < 88.0 {
+            let (got, want) = (crate::flash::pexp(x), (x as f64).exp());
+            let ulp = (want as f32).to_bits().abs_diff(got.to_bits());
+            assert!(ulp <= 2, "pexp({x}) = {got}, exp = {want}");
+            x += 0.0137;
+        }
+    }
+
+    #[test]
+    fn expert_row_dot_is_the_dequantized_dot() {
+        use crate::flash::{ExpertBlob, Q2_BLOCK_BYTES};
+        let mut s = 7u64;
+        let mut byte = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s as u8
+        };
+        let mat = |n: usize, k: usize, byte: &mut dyn FnMut() -> u8| -> Vec<u8> {
+            let mut m = vec![];
+            for b in 0..n * k / 64 {
+                m.extend(f32_to_f16(0.01 + 0.001 * (b % 7) as f32).to_le_bytes());
+                m.extend((0..16).map(|_| byte()));
+            }
+            m
+        };
+        let (gate, up, down) = (
+            mat(FF, HIDDEN, &mut byte),
+            mat(FF, HIDDEN, &mut byte),
+            mat(HIDDEN, FF, &mut byte),
+        );
+        let blob = ExpertBlob::from_gguf(&gate, &up, &down);
+        let x = vals(HIDDEN, 9, 1.0);
+        let xq = quantize_act(&x, 1, HIDDEN);
+        let row = QRow::decode(&xq, QAct { m: 1, k: HIDDEN }, 0);
+        for r in [0, 17, 639] {
+            let got = expert_row_dot(
+                &blob,
+                HIDDEN / 128,
+                |g| ExpertBlob::gu_group(2 * r + 1, g),
+                &row,
+            );
+            let mut want = 0f64;
+            for e in 0..HIDDEN {
+                let blk = &up[(r * HIDDEN + e) / 64 * Q2_BLOCK_BYTES..];
+                let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]])) as f64;
+                let i = e % 64;
+                let code = ((blk[2 + i / 4] >> (2 * (i % 4))) & 3) as f64;
+                want += (code - 1.0) * d * row.q[e] as f64 * row.d[e / 32] as f64;
+            }
+            assert!(
+                (got as f64 - want).abs() < 1e-4 * (1.0 + want.abs()),
+                "{got} vs {want}"
+            );
         }
     }
 

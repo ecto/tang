@@ -99,7 +99,11 @@ pub mod shape {
 use shape::*;
 
 /// The per-window record in device memory (u32 words), written by the host before each window
-/// (one 8-byte H2D copy, which a graph replays from its source).
+/// (one 12-byte H2D copy on the graph's stream, which a graph replays from its source).
+///
+/// Mapped host memory: kernels here never read device-mapped host memory with many warps (each
+/// warp-read is a serialized PCIe round trip). Plans and rows that arrive through mapped memory
+/// are staged into VRAM by one block (`tang-moe`'s doorbell does this) before these kernels run.
 pub struct Win;
 
 impl Win {
@@ -107,8 +111,12 @@ impl Win {
     pub const POS0: usize = 0;
     /// Tokens to keep (commit): `min(n_keep, t)` are replayed into the running state.
     pub const N_KEEP: usize = 1;
+    /// Window counter, incremented by the host each window and written with the record (on the
+    /// graph's stream, before each replay): the doorbell's `SEQ` for the CPU miss path
+    /// (`tang-moe`). No kernel here reads it.
+    pub const SEQ: usize = 2;
     /// Words in the record.
-    pub const WORDS: usize = 2;
+    pub const WORDS: usize = 3;
 }
 
 // ---- int8 activations ----
@@ -228,22 +236,41 @@ pub fn q4x_repack(packed: &[u32], scales: &[u16], biases: &[u16], n: usize, k: u
     out
 }
 
-/// One routed expert's blob, 1,382,400 bytes (the three GGUF Q2_0 matrices' bytes,
-/// rearranged), laid out so a warp's 16-byte-per-lane loads are coalesced and every lane stays
-/// on one row:
+/// One routed expert's blob, 1,382,400 bytes: the three GGUF Q2_0 matrices' bytes, rearranged
+/// into tiles of 16 rows so that a GPU warp (lane = row `r`, half `b` of the row's 32-byte group)
+/// reads one 512-byte line per group with 16-byte loads, and a CPU core reads each row's
+/// 128-weight groups as 32 contiguous bytes, exactly as in a row-major repack:
 ///
 /// ```text
-/// GU_CODES    320 tiles × [40 cols][4 rows] × 16 B   gate/up rows interleaved: gu row 2r = gate r,
-/// GU_SCALES   320 tiles × [40 cols][4 rows] × fp16   2r + 1 = up r; tile i = gu rows 4i .. 4i + 4
-/// DOWN_CODES  160 tiles × [10 cols][16 rows] × 16 B  down rows, tile i = rows 16i .. 16i + 16
-/// DOWN_SCALES 160 tiles × [10 cols][16 rows] × fp16
+/// GU_CODES     80 tiles × [20 g][16 rows] × 32 B   gu rows interleaved: gu row 2r = gate r,
+/// GU_SCALES    80 tiles × [20 g][16 rows] × 2 fp16 2r + 1 = up r; tile i = gu rows 16i ..
+/// DOWN_CODES  160 tiles × [5 g][16 rows] × 32 B    down rows, tile i = rows 16i .. 16i + 16
+/// DOWN_SCALES 160 tiles × [5 g][16 rows] × 2 fp16
 /// ```
 ///
-/// A "col" is one GGUF Q2_0 block (64 weights: its 16 code bytes, its fp16 `d`). A blob may live
-/// in VRAM or in device-mapped host memory; the kernels only see its address.
+/// A group `g` of a row is 128 weights = GGUF Q2_0 blocks `2g` and `2g + 1`: their 2 × 16 code
+/// bytes, and their two fp16 `d`. A blob may live in VRAM or in device-mapped host memory; the
+/// kernels only see its address. [`expert_row_dot`](crate::flash::ExpertBlob) order: see
+/// [`ExpertBlob::ORDER`].
 pub struct ExpertBlob;
 
 impl ExpertBlob {
+    /// The pinned summation order of an expert row (GPU kernels and CPU expert kernels alike;
+    /// `cpu::flash::expert_row_dot` is the spec, and a CPU-computed row is bitwise a GPU one):
+    ///
+    /// ```text
+    /// for lane i in 0..8:                       (chunk c = 4g + i/2, half h = i % 2)
+    ///   acc_i = 0
+    ///   for g ascending:
+    ///     s = Σ_{f<4} Σ_{b<4} code(c, 16h + 4b + f) · q(c, 16h + 4b + f)   (exact int)
+    ///         − (h == 0 ? Σq_c : 0)
+    ///     acc_i = fma(float(s), d_w(block 2g + i/4) · d_x(c), acc_i)
+    /// row = ((acc0 + acc4) + (acc2 + acc6)) + ((acc1 + acc5) + (acc3 + acc7))
+    /// h_j = silu(gate_j) · up_j,  silu(x) = x / (1 + pexp(−x))   ([`pexp`])
+    /// ```
+    ///
+    /// then `h` is quantized per the [`QAct`] contract and the down rows use the same order.
+    pub const ORDER: () = ();
     /// Gate/up code tiles.
     pub const GU_CODES: usize = 0;
     /// Gate/up scale tiles.
@@ -255,18 +282,17 @@ impl ExpertBlob {
     /// Blob size.
     pub const BYTES: usize = Self::DOWN_SCALES + HIDDEN * FF / 64 * 2;
 
-    /// Byte offsets of (codes, scale) of gu row `row` (2r gate r, 2r + 1 up r), block `c`.
-    pub fn gu_block(row: usize, c: usize) -> (usize, usize) {
-        let (tile, r) = (row / 4, row % 4);
-        let i = tile * 160 + c * 4 + r;
-        (Self::GU_CODES + 16 * i, Self::GU_SCALES + 2 * i)
+    /// Byte offsets of (32 code bytes, 2 fp16 scales) of gu row `row` (2r gate r, 2r + 1 up r),
+    /// group `g` (weights `128 g ..`).
+    pub fn gu_group(row: usize, g: usize) -> (usize, usize) {
+        let i = (row / 16) * (16 * HIDDEN / 128) + g * 16 + row % 16;
+        (Self::GU_CODES + 32 * i, Self::GU_SCALES + 4 * i)
     }
 
-    /// Byte offsets of (codes, scale) of down row `row`, block `c`.
-    pub fn down_block(row: usize, c: usize) -> (usize, usize) {
-        let (tile, r) = (row / 16, row % 16);
-        let i = tile * 160 + c * 16 + r;
-        (Self::DOWN_CODES + 16 * i, Self::DOWN_SCALES + 2 * i)
+    /// Byte offsets of (32 code bytes, 2 fp16 scales) of down row `row`, group `g`.
+    pub fn down_group(row: usize, g: usize) -> (usize, usize) {
+        let i = (row / 16) * (16 * FF / 128) + g * 16 + row % 16;
+        (Self::DOWN_CODES + 32 * i, Self::DOWN_SCALES + 4 * i)
     }
 
     /// Build a blob from the three GGUF Q2_0 tensors of one expert (`gate`, `up` `[FF, HIDDEN]`,
@@ -275,28 +301,62 @@ impl ExpertBlob {
         assert!(gate.len() == q2_bytes(FF, HIDDEN) && up.len() == gate.len());
         assert_eq!(down.len(), q2_bytes(HIDDEN, FF));
         let mut b = vec![0u8; Self::BYTES];
-        let mut put = |(co, so): (usize, usize), blk: &[u8]| {
-            b[so..so + 2].copy_from_slice(&blk[..2]);
-            b[co..co + 16].copy_from_slice(&blk[2..18]);
+        let mut put = |(co, so): (usize, usize), mat: &[u8], first_block: usize| {
+            for h in 0..2 {
+                let blk = &mat[(first_block + h) * Q2_BLOCK_BYTES..][..Q2_BLOCK_BYTES];
+                b[so + 2 * h..so + 2 * h + 2].copy_from_slice(&blk[..2]);
+                b[co + 16 * h..co + 16 * h + 16].copy_from_slice(&blk[2..]);
+            }
         };
         let nb = HIDDEN / 64;
         for r in 0..FF {
-            for c in 0..nb {
-                let o = (r * nb + c) * Q2_BLOCK_BYTES;
-                put(Self::gu_block(2 * r, c), &gate[o..o + 18]);
-                put(Self::gu_block(2 * r + 1, c), &up[o..o + 18]);
+            for g in 0..HIDDEN / 128 {
+                put(Self::gu_group(2 * r, g), gate, r * nb + 2 * g);
+                put(Self::gu_group(2 * r + 1, g), up, r * nb + 2 * g);
             }
         }
         let nb = FF / 64;
         for r in 0..HIDDEN {
-            for c in 0..nb {
-                let o = (r * nb + c) * Q2_BLOCK_BYTES;
-                put(Self::down_block(r, c), &down[o..o + 18]);
+            for g in 0..FF / 128 {
+                put(Self::down_group(r, g), down, r * nb + 2 * g);
             }
         }
         b
     }
 }
+
+/// `exp(x)` in f32 with a pinned sequence of IEEE operations, so the CPU and the GPU agree bit
+/// for bit (CUDA's `expf` and libm `exp` differ in the last bits): `n = round_ties_even(x ·
+/// log2 e)`, `r = fma(−n, ln2_lo, fma(−n, ln2_hi, x))`, a degree-7 Taylor polynomial in Horner
+/// form with fma, times `2^n` built from bits. `x` is clamped to `[−87, 88]`. Within 2 ulp of
+/// `exp` over that range.
+pub fn pexp(x: f32) -> f32 {
+    let x = x.clamp(-87.0, 88.0);
+    let n = (x * std::f32::consts::LOG2_E).round_ties_even();
+    let r = (-n).mul_add(PEXP_LN2_LO, (-n).mul_add(PEXP_LN2_HI, x));
+    let mut p = PEXP_C[0];
+    for &c in &PEXP_C[1..] {
+        p = p.mul_add(r, c);
+    }
+    p * f32::from_bits(((n as i32 + 127) as u32) << 23)
+}
+
+/// High part of ln 2 for [`pexp`] (8 trailing zero bits, so `n · hi` is exact).
+pub const PEXP_LN2_HI: f32 = f32::from_bits(0x3f31_7200);
+/// Low part of ln 2 for [`pexp`].
+pub const PEXP_LN2_LO: f32 = f32::from_bits(0x35bf_be8e);
+/// [`pexp`] polynomial, highest degree first: 1/5040, 1/720, 1/120, 1/24, 1/6 (f32 bits), 1/2,
+/// 1, 1.
+pub const PEXP_C: [f32; 8] = [
+    f32::from_bits(0x3950_0d01),
+    f32::from_bits(0x3ab6_0b61),
+    f32::from_bits(0x3c08_8889),
+    f32::from_bits(0x3d2a_aaab),
+    f32::from_bits(0x3e2a_aaab),
+    0.5,
+    1.0,
+    1.0,
+];
 
 // ---- MoE plan ----
 

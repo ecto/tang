@@ -409,7 +409,7 @@ fn build(g: &CudaComputeDevice, ts: &[usize]) -> (Model, Vec<usize>) {
 
 fn scratch(g: &CudaComputeDevice, t: usize) -> Scratch {
     let z = |n: usize| g.alloc_f32(n);
-    let win = g.upload_u32(&[(CTX - t) as u32, t as u32]);
+    let win = g.upload_u32(&[(CTX - t) as u32, t as u32, 0]);
     Scratch {
         win,
         r: g.upload_f32(&Rng(5).vec(t * HC * HIDDEN, 1.0)),
@@ -678,9 +678,15 @@ fn dense_bytes() -> (usize, [usize; 4]) {
     )
 }
 
+/// The fastest of the repeats: other processes on a shared GPU only ever add time, in bursts,
+/// so the minimum is the uncontended figure (the median is reported where it matters).
 fn median(mut v: Vec<f32>) -> f32 {
     v.sort_by(|a, b| a.total_cmp(b));
-    v[v.len() / 2]
+    if std::env::var("FKB_MEDIAN").is_ok_and(|x| x == "1") {
+        v[v.len() / 2]
+    } else {
+        v[0]
+    }
 }
 
 fn run_window(g: &CudaComputeDevice, ts: &[usize]) {
@@ -777,11 +783,77 @@ fn window_launches(c: Class) -> usize {
     }
 }
 
+/// Routed experts alone: `moe_grouped_into` for 48 layers of synthetic routing (all experts
+/// resident, plus the shared expert), in one graph, for T = 1, 2, 4, 8.
+fn moe(g: &CudaComputeDevice) {
+    let mut rng = Rng(0x5eed);
+    let src = Src::new(&mut rng, 4 << 20);
+    let blob: Vec<u8> = {
+        let mut b = src.q2_raw(FF, HIDDEN);
+        b.extend(src.q2_raw(FF, HIDDEN));
+        b.extend(src.q2_raw(HIDDEN, FF));
+        b
+    };
+    let pool: Vec<B> = (0..EXPERTS).map(|_| g.upload_bytes(&blob)).collect();
+    let addrs: Vec<u64> = pool.iter().map(|b| g.buffer_addr(b)).collect();
+    let shared = g.upload_bytes(&blob);
+    println!("moe_grouped_into, 48 layers in one graph (GB/s of expert bytes read)");
+    for t in [1usize, 2, 4, 8] {
+        let mut plans = vec![];
+        let mut groups = 0;
+        for l in 0..48 {
+            let (ids, u) = synthetic_ids(&mut rng, t);
+            groups += u + 1;
+            let table: Vec<u32> = (0..EXPERTS)
+                .flat_map(|e| {
+                    let p = addrs[(e + 37 * l) % EXPERTS];
+                    [p as u32, (p >> 32) as u32]
+                })
+                .collect();
+            let mut plan = g.alloc_f32(MoePlan::WORDS);
+            g.moe_plan_into(
+                &g.upload_u32(&ids),
+                &g.upload_u32(&table),
+                g.buffer_addr(&shared),
+                &mut plan,
+                t,
+            );
+            plans.push(plan);
+        }
+        let mut xq = g.alloc_f32(QAct { m: t, k: HIDDEN }.words());
+        g.quantize_act_into(&g.upload_f32(&rng.vec(t * HIDDEN, 1.0)), &mut xq, t, HIDDEN);
+        let (mut sc, mut parts) = (
+            g.alloc_f32(MoePlan::scratch_words()),
+            g.alloc_f32(MoePlan::PARTS_ROWS * HIDDEN),
+        );
+        let graph = g.capture(&mut || {
+            for p in &plans {
+                // SAFETY: plans hold live pool addresses.
+                unsafe { g.moe_grouped_into(&xq, p, &mut sc, &mut parts, t) };
+            }
+        });
+        graph.launch().unwrap();
+        let ms = median(
+            (0..10)
+                .map(|_| g.event_ms(&mut || graph.launch().unwrap()))
+                .collect(),
+        );
+        let bytes = groups * ExpertBlob::BYTES;
+        println!(
+            "  T={t}: {:.1} groups/layer, {:6.1} us/layer, {:4.0} GB/s",
+            groups as f64 / 48.0,
+            ms as f64 * 1e3 / 48.0,
+            bytes as f64 / (ms as f64 * 1e6)
+        );
+    }
+}
+
 fn main() {
     let g = CudaComputeDevice::new().expect("CUDA device");
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("gemv") => gemv(&g),
+        Some("moe") => moe(&g),
         Some("window") => {
             let ts: Vec<usize> = args[1..].iter().map(|a| a.parse().expect("T")).collect();
             run_window(&g, if ts.is_empty() { &[1, 2, 4] } else { &ts });

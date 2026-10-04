@@ -690,8 +690,29 @@ impl CudaComputeDevice {
         assert!(
             scratch.len >= MoePlan::scratch_words() && parts.len >= MoePlan::PARTS_ROWS * HIDDEN
         );
+        const GU: [&str; 8] = [
+            "fl_moe_gu_t1",
+            "fl_moe_gu_t2",
+            "fl_moe_gu_t3",
+            "fl_moe_gu_t4",
+            "fl_moe_gu_t5",
+            "fl_moe_gu_t6",
+            "fl_moe_gu_t7",
+            "fl_moe_gu_t8",
+        ];
+        const DOWN: [&str; 8] = [
+            "fl_moe_down_t1",
+            "fl_moe_down_t2",
+            "fl_moe_down_t3",
+            "fl_moe_down_t4",
+            "fl_moe_down_t5",
+            "fl_moe_down_t6",
+            "fl_moe_down_t7",
+            "fl_moe_down_t8",
+        ];
+        // A group has at most t entries (an expert appears once per token; the shared group has t).
         let tu = t as u32;
-        let f = self.fl("fl_moe_gu");
+        let f = self.fl(GU[t - 1]);
         unsafe {
             self.stream
                 .launch_builder(&f)
@@ -702,7 +723,7 @@ impl CudaComputeDevice {
                 .launch(grid((8 * super::llm::sm_count(), 1, 1), 256))
                 .unwrap();
         }
-        let f = self.fl("fl_moe_down");
+        let f = self.fl(DOWN[t - 1]);
         unsafe {
             self.stream
                 .launch_builder(&f)
@@ -972,22 +993,6 @@ mod tests {
         }
     }
 
-    /// Everything within `tol`, and at least `frac` of the values within `tight`.
-    fn close_mostly(got: &[f32], want: &[f32], tol: f32, tight: f32, frac: f32, what: &str) {
-        close(got, want, tol, what);
-        let scale = want.iter().map(|v| v.abs()).sum::<f32>() / want.len().max(1) as f32;
-        let ok = got
-            .iter()
-            .zip(want)
-            .filter(|(g, w)| (*g - *w).abs() <= tight * (scale + w.abs()))
-            .count();
-        let n = want.len();
-        assert!(
-            ok as f32 >= frac * n as f32,
-            "{what}: only {ok} of {n} within {tight}"
-        );
-    }
-
     fn same_bits(got: &[f32], want: &[f32], what: &str) {
         assert_eq!(got.len(), want.len(), "{what}: length");
         for (i, (g, w)) in got.iter().zip(want).enumerate() {
@@ -996,7 +1001,7 @@ mod tests {
     }
 
     fn win<D: ComputeDevice>(d: &D, pos0: usize, n_keep: usize) -> D::Buffer {
-        d.upload_u32(&[pos0 as u32, n_keep as u32])
+        d.upload_u32(&[pos0 as u32, n_keep as u32, 0])
     }
 
     // ---- Q2 / int8 / dense GEMVs ----
@@ -1626,8 +1631,10 @@ mod tests {
                 // h is requantized to int8 between gate/up and down, so a summation-order
                 // difference can move one code by 1 at a rounding tie: a few outputs may move by
                 // d_h · w; nearly all agree to fp32 noise.
+                // The expert order is pinned (ExpertBlob::ORDER): GPU rows are the reference's
+                // bit for bit, so a CPU-served miss and a VRAM hit agree exactly.
                 let what = format!("moe parts t={t} shared={shared}");
-                close_mostly(&gotp.0, &wantp.0, 1e-2, 1e-5, 0.98, &what);
+                same_bits(&gotp.0, &wantp.0, &what);
                 // Combine on the same parts.
                 let mut cy = c.alloc_f32(t * HIDDEN);
                 let ls = EXPERTS + 1;
