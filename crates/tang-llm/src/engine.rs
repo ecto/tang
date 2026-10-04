@@ -8,6 +8,7 @@ use crate::sample::{Sampler, Sampling};
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 use tang_compute::ComputeDevice;
 use tokenizers::Tokenizer;
@@ -63,6 +64,91 @@ pub struct Usage {
     pub accepted_tokens: usize,
 }
 
+/// How a run went: finished, or stopped part way through its prefill because its
+/// [`Control`] asked it to yield. A yielded run's prefilled blocks are sealed and its cache
+/// kept, so running the same request again picks up where it stopped (as any prompt that
+/// shares a cached prefix does).
+#[derive(Debug, Clone)]
+pub enum Outcome {
+    Done(Finish, Usage),
+    Yielded {
+        prompt_tokens: usize,
+        /// Positions reused from caches before this run's prefill.
+        cached_tokens: usize,
+        /// Positions this run prefilled before yielding.
+        prefilled: usize,
+        /// Seconds those took.
+        secs: f64,
+    },
+}
+
+/// Where a running request is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Progress {
+    pub prompt_tokens: usize,
+    pub cached_tokens: usize,
+    /// Positions prefilled so far (past the cached ones).
+    pub prefilled: usize,
+    /// Tokens generated so far.
+    pub generated: usize,
+}
+
+/// What the caller of [`Engine::complete_with`] gets to say while a request runs.
+pub trait Control {
+    /// Asked between prefill chunks (never before the first): false stops the prefill there,
+    /// and the run returns [`Outcome::Yielded`].
+    fn keep_prefilling(&mut self) -> bool {
+        true
+    }
+
+    /// After each prefill chunk and each generated token.
+    fn progress(&mut self, _p: Progress) {}
+}
+
+/// Never yields; ignores progress.
+impl Control for () {}
+
+/// The chat template and tokenizer, shareable across threads: turns a request into its
+/// prompt's token ids, as the engine will see them (to count a waiting request's prompt).
+#[derive(Clone)]
+pub struct Prompter {
+    tok: Arc<Tokenizer>,
+    template: Arc<Template>,
+    /// Tokens an image takes, if the model sees images.
+    image_tokens: Option<usize>,
+}
+
+impl Prompter {
+    /// The rendered prompt and its token ids.
+    pub fn prompt(&self, req: &Request) -> Result<(String, Vec<u32>)> {
+        let mut prompt = self
+            .template
+            .render(&req.messages, req.tools.as_ref(), req.think)?;
+        if !req.images.is_empty() {
+            let per = self
+                .image_tokens
+                .ok_or_else(|| anyhow!("this model can't see images"))?;
+            anyhow::ensure!(
+                prompt.matches(IMAGE_MARKER).count() == req.images.len(),
+                "the chat template dropped some images"
+            );
+            // As the processor does: each marker becomes a block of image tokens.
+            let block = format!(
+                "\n\n<start_of_image>{}<end_of_image>\n\n",
+                "<image_soft_token>".repeat(per)
+            );
+            prompt = prompt.replace(IMAGE_MARKER, &block);
+        }
+        let ids = self
+            .tok
+            .encode(prompt.as_str(), false)
+            .map_err(|e| anyhow!("tokenize: {e}"))?
+            .get_ids()
+            .to_vec();
+        Ok((prompt, ids))
+    }
+}
+
 /// Speculative decoding state that outlives a request.
 pub struct Speculation {
     pub cfg: DraftConfig,
@@ -73,8 +159,8 @@ pub struct Speculation {
 
 pub struct Engine<D: ComputeDevice> {
     pub model: Model<D>,
-    tok: Tokenizer,
-    template: Template,
+    tok: Arc<Tokenizer>,
+    template: Arc<Template>,
     cache: Cache<D::Buffer>,
     /// Images in the cache: where each image's tokens start, and a hash of the image, so a
     /// shared prefix is only reused when the images in it are the same.
@@ -217,8 +303,8 @@ impl<D: ComputeDevice> Engine<D> {
         }
         Ok(Self {
             model,
-            tok,
-            template,
+            tok: Arc::new(tok),
+            template: Arc::new(template),
             cache,
             cache_images: Vec::new(),
             cache_key: None,
@@ -567,6 +653,35 @@ impl<D: ComputeDevice> Engine<D> {
         self.cache_used = self.clock;
     }
 
+    /// The template and tokenizer, to count prompts elsewhere.
+    pub fn prompter(&self) -> Prompter {
+        Prompter {
+            tok: self.tok.clone(),
+            template: self.template.clone(),
+            image_tokens: self.model.vision.as_ref().map(|v| v.tokens),
+        }
+    }
+
+    /// The sealed KV blocks in memory, by id (see [`crate::blocks::chain`]).
+    pub fn block_hashes(&self) -> Vec<u64> {
+        crate::blocks::lock(self.model.pool()).hashes()
+    }
+
+    /// Each conversation's `prompt_cache_key` and how many positions its cache holds (the
+    /// active one first; keyless caches are left out).
+    pub fn cached_keys(&self) -> Vec<(String, usize)> {
+        let active = std::iter::once((&self.cache_key, &self.cache));
+        active
+            .chain(self.parked.iter().map(|s| (&s.key, &s.cache)))
+            .filter_map(|(k, c)| Some((k.clone()?, c.len)))
+            .collect()
+    }
+
+    /// Where KV blocks are kept on disk (`<dir>/blocks/<hash>.kvb`), if they are.
+    pub fn kv_store_dir(&self) -> Option<&Path> {
+        self.store.as_ref().map(|s| s.store().dir())
+    }
+
     /// Tokens whose keys and values are in the cache.
     pub fn cached_tokens(&self) -> &[u32] {
         &self.cache.tokens
@@ -593,30 +708,29 @@ impl<D: ComputeDevice> Engine<D> {
     pub fn complete(
         &mut self,
         req: &Request,
-        mut on: impl FnMut(Piece) -> bool,
+        on: impl FnMut(Piece) -> bool,
     ) -> Result<(Finish, Usage)> {
-        let mut prompt = self
-            .template
-            .render(&req.messages, req.tools.as_ref(), req.think)?;
-        if !req.images.is_empty() {
-            let per = self
-                .model
-                .vision
-                .as_ref()
-                .map(|v| v.tokens)
-                .ok_or_else(|| anyhow!("this model can't see images"))?;
-            anyhow::ensure!(
-                prompt.matches(IMAGE_MARKER).count() == req.images.len(),
-                "the chat template dropped some images"
-            );
-            // As the processor does: each marker becomes a block of image tokens.
-            let block = format!(
-                "\n\n<start_of_image>{}<end_of_image>\n\n",
-                "<image_soft_token>".repeat(per)
-            );
-            prompt = prompt.replace(IMAGE_MARKER, &block);
+        match self.complete_with(req, None, on, &mut ())? {
+            Outcome::Done(finish, usage) => Ok((finish, usage)),
+            Outcome::Yielded { .. } => unreachable!("() never yields"),
         }
-        let ids = self.encode(&prompt)?;
+    }
+
+    /// [`complete`](Self::complete), with `ctl` told the request's progress and asked between
+    /// prefill chunks whether to go on (a prompt with images is prefilled in one go).
+    /// `prompt`: the request's prompt and token ids if already made (by this model's
+    /// [`Prompter`]).
+    pub fn complete_with(
+        &mut self,
+        req: &Request,
+        prompt: Option<(String, Vec<u32>)>,
+        mut on: impl FnMut(Piece) -> bool,
+        ctl: &mut dyn Control,
+    ) -> Result<Outcome> {
+        let (prompt, ids) = match prompt {
+            Some(p) => p,
+            None => self.prompter().prompt(req)?,
+        };
         // Where each image's tokens start, with a hash of the image.
         let img_tok = self.model.cfg.image_token;
         let mut runs: Vec<(usize, u64)> = Vec::new();
@@ -676,9 +790,29 @@ impl<D: ComputeDevice> Engine<D> {
 
         let t = Instant::now();
         let mut logits = Vec::new();
+        let mut progress = Progress {
+            prompt_tokens: ids.len(),
+            cached_tokens: reuse,
+            prefilled: 0,
+            generated: 0,
+        };
         if runs.is_empty() {
-            for chunk in ids[reuse..].chunks(PREFILL_CHUNK) {
+            for (i, chunk) in ids[reuse..].chunks(PREFILL_CHUNK).enumerate() {
+                if i > 0 && !ctl.keep_prefilling() {
+                    // Seal what's done so another conversation can't lose it for us, even if
+                    // this cache is dropped before the request comes back.
+                    self.cache_images.clear();
+                    self.seal();
+                    return Ok(Outcome::Yielded {
+                        prompt_tokens: ids.len(),
+                        cached_tokens: reuse,
+                        prefilled: progress.prefilled,
+                        secs: t.elapsed().as_secs_f64(),
+                    });
+                }
                 logits = self.model.forward(chunk, &mut self.cache, false)?;
+                progress.prefilled += chunk.len();
+                ctl.progress(progress);
             }
         } else {
             let size = self.model.vision.as_ref().map_or(896, |v| v.cfg.image_size);
@@ -692,12 +826,14 @@ impl<D: ComputeDevice> Engine<D> {
             logits = self
                 .model
                 .forward_images(&ids[reuse..], &feats, &mut self.cache, false)?;
+            progress.prefilled = ids.len() - reuse;
+            ctl.progress(progress);
         }
         self.cache_images = runs;
         let prefill_s = t.elapsed().as_secs_f64();
         if req.prefill_only {
             self.seal();
-            return Ok((
+            return Ok(Outcome::Done(
                 Finish::Stop,
                 Usage {
                     prompt_tokens: ids.len(),
@@ -772,6 +908,8 @@ impl<D: ComputeDevice> Engine<D> {
                 break;
             }
             out.push(next);
+            progress.generated = out.len();
+            ctl.progress(progress);
             // What the next forward must feed (a hit is already in the cache).
             let mut fed = if hit { vec![] } else { vec![next] };
             // Out of thinking budget: write the wrap-up and `</think>` for the model (into the
@@ -874,7 +1012,7 @@ impl<D: ComputeDevice> Engine<D> {
         let decode_s = t.elapsed().as_secs_f64();
         let prompt_tokens = ids.len();
         self.last = (ids, out.clone());
-        Ok((
+        Ok(Outcome::Done(
             finish,
             Usage {
                 prompt_tokens,

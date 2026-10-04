@@ -100,6 +100,23 @@ impl Store {
         Ok(Self { dir, budget, row })
     }
 
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The ids of the blocks on disk (from their file names).
+    pub fn block_hashes(dir: &Path) -> Vec<u64> {
+        let Ok(rd) = fs::read_dir(dir.join("blocks")) else {
+            return Vec::new();
+        };
+        rd.filter_map(|e| {
+            let name = e.ok()?.file_name();
+            let hex = name.to_str()?.strip_suffix(".kvb")?;
+            u64::from_str_radix(hex, 16).ok()
+        })
+        .collect()
+    }
+
     fn block_path(&self, hash: u64) -> PathBuf {
         self.dir.join("blocks").join(format!("{hash:016x}.kvb"))
     }
