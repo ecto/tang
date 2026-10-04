@@ -14,6 +14,8 @@
 //!   refits ([`quantize_q4_search`]); same format and bytes, better values.
 //! - `q4x-q8hi`, `q4x-search-q8hi` — as above, but tensors whose GGUF type has ≥ 5 bits (Q5_K,
 //!   Q6_K, Q5_0, Q8_0) go to Q8_0 (int8 codes, f16 scale per 32: 8.5 bits) instead.
+//! - `q8` — everything to Q8_0; or a rule list (see [`DensePolicy`]), where `native` means a
+//!   kernel for the GGUF's own type.
 //!
 //! The token embedding (a row lookup), F32/F16 vectors and the n-gram table are never touched.
 //!
@@ -38,64 +40,96 @@ pub enum Format {
     Q8,
 }
 
-/// Which dense tensors go to which [`Format`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DensePolicy {
-    F32,
-    Q4x,
-    Q4xSearch,
-    Q4xQ8Hi,
-    Q4xSearchQ8Hi,
+/// Which dense tensors go to which [`Format`]: an ordered rule list, first match wins, for the
+/// tensors [`requantizable`] admits (everything else is always [`Format::Keep`]).
+///
+/// `--dense-as` takes a preset (`f32`, `q4x`, `q4x-search`, `q4x-q8hi`, `q4x-search-q8hi`,
+/// `q8`) or rules `match=format,...` where `match` is a GGUF type name (`Q3_K`), `*`, or a
+/// tensor-name substring (`output.weight`, `attn_qkv`), and `format` is `native` (keep the GGUF's
+/// own type: a native kernel), `q4x`, `q4xs` (searched Q4X) or `q8`. E.g.
+/// `output.weight=q8,Q3_K=native,*=q4xs`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DensePolicy {
+    pub name: String,
+    pub rules: Vec<(String, Format)>,
 }
 
 impl DensePolicy {
+    pub fn f32() -> Self {
+        Self {
+            name: "f32".into(),
+            rules: vec![],
+        }
+    }
+
     pub fn parse(s: &str) -> Result<Self> {
-        Ok(match s {
-            "f32" => Self::F32,
-            "q4x" => Self::Q4x,
-            "q4x-search" => Self::Q4xSearch,
-            "q4x-q8hi" => Self::Q4xQ8Hi,
-            "q4x-search-q8hi" => Self::Q4xSearchQ8Hi,
-            _ => bail!("--dense-as {s}: want f32, q4x, q4x-search, q4x-q8hi or q4x-search-q8hi"),
+        let hi = |f: Format, lo: Format| -> Vec<(String, Format)> {
+            let mut v: Vec<(String, Format)> = ["Q5_K", "Q6_K", "Q5_0", "Q5_1", "Q8_0"]
+                .iter()
+                .map(|t| (t.to_string(), f))
+                .collect();
+            v.push(("*".into(), lo));
+            v
+        };
+        let rules = match s {
+            "f32" => vec![],
+            "q4x" => vec![("*".into(), Format::Q4x)],
+            "q4x-search" => vec![("*".into(), Format::Q4xSearch)],
+            "q8" => vec![("*".into(), Format::Q8)],
+            "q4x-q8hi" => hi(Format::Q8, Format::Q4x),
+            "q4x-search-q8hi" => hi(Format::Q8, Format::Q4xSearch),
+            _ => {
+                let mut v = Vec::new();
+                for part in s.split(',') {
+                    let Some((m, f)) = part.split_once('=') else {
+                        bail!("--dense-as {s}: {part:?} is not match=format");
+                    };
+                    let f = match f {
+                        "native" | "keep" => Format::Keep,
+                        "q4x" => Format::Q4x,
+                        "q4xs" => Format::Q4xSearch,
+                        "q8" => Format::Q8,
+                        _ => bail!("--dense-as: unknown format {f:?} (native, q4x, q4xs, q8)"),
+                    };
+                    v.push((m.to_string(), f));
+                }
+                v
+            }
+        };
+        Ok(Self {
+            name: s.into(),
+            rules,
         })
     }
 
-    pub const ALL: [DensePolicy; 5] = [
-        Self::F32,
-        Self::Q4x,
-        Self::Q4xSearch,
-        Self::Q4xQ8Hi,
-        Self::Q4xSearchQ8Hi,
-    ];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::F32 => "f32",
-            Self::Q4x => "q4x",
-            Self::Q4xSearch => "q4x-search",
-            Self::Q4xQ8Hi => "q4x-q8hi",
-            Self::Q4xSearchQ8Hi => "q4x-search-q8hi",
-        }
+    pub fn presets() -> Vec<DensePolicy> {
+        [
+            "f32",
+            "q4x",
+            "q4x-search",
+            "q4x-q8hi",
+            "q4x-search-q8hi",
+            "q8",
+        ]
+        .iter()
+        .map(|p| Self::parse(p).expect("preset"))
+        .collect()
     }
 
-    /// The format a dense matrix of GGUF type `ty` ends up in.
-    pub fn format(self, name: &str, ty: GgmlType) -> Format {
-        if !requantizable(name, ty) || self == Self::F32 {
+    /// The format a dense matrix `name` of GGUF type `ty` ends up in.
+    pub fn format(&self, name: &str, ty: GgmlType) -> Format {
+        if !requantizable(name, ty) {
             return Format::Keep;
         }
-        let hi = matches!(
-            ty,
-            GgmlType::Q5K | GgmlType::Q6K | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q8_0
-        );
-        match self {
-            Self::F32 => Format::Keep,
-            Self::Q4x => Format::Q4x,
-            Self::Q4xSearch => Format::Q4xSearch,
-            Self::Q4xQ8Hi if hi => Format::Q8,
-            Self::Q4xQ8Hi => Format::Q4x,
-            Self::Q4xSearchQ8Hi if hi => Format::Q8,
-            Self::Q4xSearchQ8Hi => Format::Q4xSearch,
+        for (m, f) in &self.rules {
+            if m == "*"
+                || *m == ty.name()
+                || (m.contains(|c: char| c.is_ascii_lowercase()) && name.contains(m.as_str()))
+            {
+                return *f;
+            }
         }
+        Format::Keep
     }
 }
 
@@ -235,10 +269,10 @@ fn read_per_token(t: &TensorInfo) -> bool {
         && !t.name.starts_with("per_layer_token_embd")
 }
 
-/// `tang-llm flash-requant <gguf> [--policy P]`: for each source type, the relative squared
-/// error ‖W − Q(W)‖² / ‖W‖² of each format, and the dense bytes a decode step reads under each
-/// policy.
-pub fn report(g: &Gguf) -> Result<String> {
+/// `tang-llm flash-requant <gguf> [--no-errors] [policy...]`: for each source type, the relative
+/// squared error ‖W − Q(W)‖² / ‖W‖² of each format, and the dense bytes a decode step reads under
+/// the presets and any extra policies.
+pub fn report(g: &Gguf, extra: &[DensePolicy], errors: bool) -> Result<String> {
     let mut s = String::new();
     // per source type: (tensors, elements, ||w||^2, err per format)
     #[derive(Default)]
@@ -251,7 +285,7 @@ pub fn report(g: &Gguf) -> Result<String> {
     }
     let mut by_type: BTreeMap<String, Acc> = BTreeMap::new();
     for t in &g.tensors {
-        if t.dims.len() != 2 || !requantizable(&t.name, t.ty) {
+        if !errors || t.dims.len() != 2 || !requantizable(&t.name, t.ty) {
             continue;
         }
         let w = g.dequantize(t)?;
@@ -272,32 +306,34 @@ pub fn report(g: &Gguf) -> Result<String> {
             *a.err.entry(f).or_default() += e;
         }
     }
-    writeln!(
-        s,
-        "## requant error by source type (relative squared error, sum over tensors)"
-    )?;
-    writeln!(
-        s,
-        "type | tensors | params | GGUF bytes | q4x | q4x-search | q8_0"
-    )?;
-    for (ty, a) in &by_type {
+    if errors {
         writeln!(
             s,
-            "{ty} | {} | {} | {} | {:.3e} | {:.3e} | {:.3e}",
-            a.tensors,
-            a.elems,
-            a.bytes,
-            a.err[&Format::Q4x] / a.norm,
-            a.err[&Format::Q4xSearch] / a.norm,
-            a.err[&Format::Q8] / a.norm
+            "## requant error by source type (relative squared error, sum over tensors)"
         )?;
+        writeln!(
+            s,
+            "type | tensors | params | GGUF bytes | q4x | q4x-search | q8_0"
+        )?;
+        for (ty, a) in &by_type {
+            writeln!(
+                s,
+                "{ty} | {} | {} | {} | {:.3e} | {:.3e} | {:.3e}",
+                a.tensors,
+                a.elems,
+                a.bytes,
+                a.err[&Format::Q4x] / a.norm,
+                a.err[&Format::Q4xSearch] / a.norm,
+                a.err[&Format::Q8] / a.norm
+            )?;
+        }
     }
     writeln!(
         s,
         "\n## bytes a decode step reads in full (experts, embedding row, table rows excluded)"
     )?;
-    writeln!(s, "policy | requantized | kept | total")?;
-    for p in DensePolicy::ALL {
+    writeln!(s, "policy | requantized | kept as in the GGUF | total")?;
+    for p in DensePolicy::presets().iter().chain(extra) {
         let (mut rq, mut kept) = (0u64, 0u64);
         for t in g.tensors.iter().filter(|t| read_per_token(t)) {
             let f = if t.dims.len() == 2 {
@@ -312,7 +348,7 @@ pub fn report(g: &Gguf) -> Result<String> {
                 rq += b;
             }
         }
-        writeln!(s, "{} | {rq} | {kept} | {}", p.name(), rq + kept)?;
+        writeln!(s, "{} | {rq} | {kept} | {}", p.name, rq + kept)?;
     }
     Ok(s)
 }
@@ -368,7 +404,7 @@ mod tests {
 
     #[test]
     fn policy_formats() {
-        let p = DensePolicy::Q4xQ8Hi;
+        let p = DensePolicy::parse("q4x-q8hi").unwrap();
         assert_eq!(p.format("blk.0.attn_qkv.weight", GgmlType::Q6K), Format::Q8);
         assert_eq!(
             p.format("blk.0.attn_qkv.weight", GgmlType::Iq4Xs),
@@ -384,8 +420,15 @@ mod tests {
         );
         assert_eq!(p.format("token_embd.weight", GgmlType::Q3K), Format::Keep);
         assert_eq!(
-            DensePolicy::F32.format("output.weight", GgmlType::Q5K),
+            DensePolicy::f32().format("output.weight", GgmlType::Q5K),
             Format::Keep
+        );
+        let r = DensePolicy::parse("output.weight=q8,Q3_K=native,*=q4xs").unwrap();
+        assert_eq!(r.format("output.weight", GgmlType::Q5K), Format::Q8);
+        assert_eq!(r.format("blk.3.attn_q.weight", GgmlType::Q3K), Format::Keep);
+        assert_eq!(
+            r.format("blk.3.attn_q.weight", GgmlType::Iq4Xs),
+            Format::Q4xSearch
         );
     }
 }

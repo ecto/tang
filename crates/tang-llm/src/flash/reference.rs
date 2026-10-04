@@ -624,7 +624,7 @@ impl FlashRef {
             verbose: false,
             emulate_llama: false,
             qsa_dense: false,
-            dense: DensePolicy::F32,
+            dense: DensePolicy::f32(),
             act_int8: false,
         })
     }
@@ -1137,6 +1137,26 @@ impl FlashRef {
                 &format!("L{l:02}.qsa_selected"),
                 &sel_last.unwrap_or_default(),
             )?;
+            // the last token's indexer score of every complete block, selected or not
+            let nv = t_len / kp;
+            let qt = &qi[last * ih * idd..(last + 1) * ih * idd];
+            let scores: Vec<f32> = (0..nv)
+                .map(|b| {
+                    let kb = &pooled[b * idd..(b + 1) * idd];
+                    (0..ih)
+                        .map(|h| dot(&qt[h * idd..(h + 1) * idd], kb).max(0.0) * iscale)
+                        .sum()
+                })
+                .collect();
+            d.f32(&format!("L{l:02}.qsa_scores"), &[nv], &scores)?;
+            d.f32(&format!("L{l:02}.qsa_q_idx"), &[ih, idd], qt)?;
+            if nv > 0 {
+                d.f32(
+                    &format!("L{l:02}.qsa_pooled"),
+                    &[nv, idd],
+                    &pooled[..nv * idd],
+                )?;
+            }
         }
         let w_o = self.mat(l, "attn_output.weight")?;
         Ok(w_o.apply(&attn, t_len, false))
@@ -1455,7 +1475,7 @@ pub fn cli(args: &[String]) -> Result<()> {
     let mut llama_numerics = false;
     let mut qsa_dense = false;
     let mut act_int8 = false;
-    let mut dense = DensePolicy::F32;
+    let mut dense = DensePolicy::f32();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--last" => last = Some(it.next().context("--last N")?.parse().context("--last N")?),

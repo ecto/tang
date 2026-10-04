@@ -41,8 +41,9 @@
 //! `tang-llm gguf-rows <file.gguf> <tensor> <first> <n> <out.f32>` — rows dequantized to raw f32.
 //! `tang-llm flash-mtp <main.gguf> <mtp.gguf> --ids-file F [--from I] [--depth D] [--joint-hnorm]
 //! [--main-head] [--dump DIR]` — teacher-forced acceptance of chained MTP drafts (`flash::mtp`).
-//! `tang-llm flash-requant <file.gguf>` — per source type, the error of requantizing dense weights
-//! to Q4X / searched Q4X / Q8_0, and the dense bytes a decode step reads under each policy.
+//! `tang-llm flash-requant <file.gguf> [--no-errors] [policy...]` — per source type, the error of
+//! requantizing dense weights to Q4X / searched Q4X / Q8_0, and the dense bytes a decode step reads
+//! under each policy (`flash::requant::DensePolicy`).
 //! `tang-llm flash-ref <first shard.gguf> <token ids...> [--ids-file F] [--top K] [--last N]
 //! [--dump DIR] [-v]` — Qwen3.8-Flash-Next's slow f32 reference forward on the CPU: top-K
 //! next-token logprobs per position as JSON lines, and with `--dump` the last position's
@@ -186,8 +187,15 @@ fn main() -> Result<()> {
         return tang_llm::flash::mtp::cli(&args[1..]);
     }
     if cmd == "flash-requant" {
+        use tang_llm::flash::requant::{report, DensePolicy};
         let g = tang_llm::gguf::Gguf::open(&dir)?;
-        print!("{}", tang_llm::flash::requant::report(&g)?);
+        let errors = !args[2..].iter().any(|a| a == "--no-errors");
+        let extra = args[2..]
+            .iter()
+            .filter(|a| *a != "--no-errors")
+            .map(|a| DensePolicy::parse(a))
+            .collect::<Result<Vec<_>>>()?;
+        print!("{}", report(&g, &extra, errors)?);
         return Ok(());
     }
     if cmd == "flash-ref" {
