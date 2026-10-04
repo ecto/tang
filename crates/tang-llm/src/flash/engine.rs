@@ -119,6 +119,8 @@ const XQ8_BYTES: usize = MAX_T * 6144 + MAX_T * 6144 / 32 * 4;
 /// A dense GEMV weight: Q4X (int8 activations), bf16 (f32 activations), or native GGUF
 /// segments (`fe_gemv`, f32 activations).
 enum Dw {
+    /// The kernel track's native GEMV (`native_linear_into`, NatX repack), one tensor.
+    Kn(B, tang_compute::flash_native::NatType),
     Q4x(B),
     Bf16(B),
     Native {
@@ -152,6 +154,7 @@ impl Dw {
         match self {
             Dw::Bf16(b) => dev.linear_into(x, b, out, t, k, n),
             Dw::Q4x(b) => dev.q4x_linear_into(xq, b, out, t, k, n),
+            Dw::Kn(b, ty) => dev.native_linear_into(*ty, xq, b, out, t, k, n),
             Dw::Native { rows, .. } => {
                 assert_eq!(*rows, n, "native GEMV rows");
                 self.native_ptr(dev, nk, dev.buffer_addr(x), dev.buffer_addr(out), t, k, n);
@@ -534,6 +537,18 @@ impl Engine {
             Ok(match e.fmt {
                 Fmt::Bf16 => Dw::Bf16(w),
                 Fmt::Q4x => Dw::Q4x(w),
+                Fmt::Native
+                    if e.segs.len() == 1
+                        && std::env::var("TANG_FLASH_KNATIVE").is_ok_and(|v| v == "1")
+                        && tang_compute::flash_native::NatType::from_ggml(e.segs[0][0] as u32).is_some() =>
+                {
+                    let ty = tang_compute::flash_native::NatType::from_ggml(e.segs[0][0] as u32).unwrap();
+                    let raw = pack::read_entry(&df, e)?;
+                    let rows = e.segs[0][1] as usize;
+                    let rb = e.segs[0][2] as usize;
+                    drop(w);
+                    Dw::Kn(dev.upload_native(ty, &raw[..rows * rb], e.n, e.k), ty)
+                }
                 Fmt::Native => {
                     let base = dev.buffer_addr(&w);
                     let words: Vec<u32> = e
