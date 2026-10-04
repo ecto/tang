@@ -216,6 +216,20 @@ impl<B> Pool<B> {
         b
     }
 
+    /// Drop every cached block (sealed, held by no cache): nothing is shared afterwards with
+    /// what was computed before.
+    pub fn forget(&mut self) {
+        for b in 0..self.meta.len() {
+            let m = &mut self.meta[b];
+            if m.refs == 0 && m.hash.is_some() {
+                *m = Meta::default();
+                self.free.push(b as u32);
+            }
+        }
+        self.by_hash
+            .retain(|_, b| self.meta[*b as usize].hash.is_some());
+    }
+
     /// The id of sealed block `b`.
     pub fn hash(&self, b: u32) -> Option<u64> {
         self.meta[b as usize].hash
@@ -440,6 +454,16 @@ impl<B> Cache<B> {
         self.table = blocks.to_vec();
         self.len = blocks.len() * BLOCK;
         self.tokens = tokens[..self.len].to_vec();
+    }
+
+    /// Append block `b` (held for it already) holding `tokens` at its first positions: the
+    /// cache must end on a block boundary.
+    pub fn push_block(&mut self, b: u32, tokens: &[u32]) {
+        assert_eq!(self.len % BLOCK, 0, "push_block mid-block");
+        assert_eq!(self.table.len(), self.len / BLOCK);
+        self.table.push(b);
+        self.len += tokens.len();
+        self.tokens.extend_from_slice(tokens);
     }
 
     /// Seal its full blocks among the first `upto` positions, deduplicating against blocks

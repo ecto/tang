@@ -15,6 +15,10 @@ use tokenizers::Tokenizer;
 /// Prefill in chunks to bound scratch memory.
 const PREFILL_CHUNK: usize = 512;
 
+/// Fewest leading positions of another conversation's block worth copying (fewer are just
+/// prefilled: a chat template's first few tokens are the same everywhere).
+const MIN_PARTIAL: usize = 32;
+
 /// Where an image goes in a flattened message; expanded to the model's image tokens.
 pub const IMAGE_MARKER: &str = "<start_of_image>";
 
@@ -262,7 +266,8 @@ impl<D: ComputeDevice> Engine<D> {
         (&self.last.0, &self.last.1)
     }
 
-    /// Forget every KV cache (the next request prefills from scratch).
+    /// Forget every KV cache, shared blocks included (the next request prefills from
+    /// scratch).
     pub fn reset(&mut self) {
         self.cache.truncate(0);
         self.cache_images.clear();
@@ -270,6 +275,7 @@ impl<D: ComputeDevice> Engine<D> {
             s.cache.truncate(0);
             s.images.clear();
         }
+        crate::blocks::lock(self.model.pool()).forget();
     }
 
     /// Keep KV caches in f32 instead of bf16 (or back). Drops every cache.
@@ -279,13 +285,15 @@ impl<D: ComputeDevice> Engine<D> {
         self.cache_images.clear();
         self.cache_key = None;
         self.parked.clear();
+        self.apply_budget();
     }
 
-    /// Keep up to `n` conversations' KV caches (at least 1). Each costs a full context's
-    /// worth of device memory once used.
+    /// Keep up to `n` conversations' KV caches (at least 1). Without a memory budget, the
+    /// caches may hold up to `n` full contexts between them.
     pub fn set_slots(&mut self, n: usize) {
         self.slots = n.max(1);
         self.parked.truncate(self.slots - 1);
+        self.apply_budget();
     }
 
     pub fn slots(&self) -> usize {
@@ -296,6 +304,16 @@ impl<D: ComputeDevice> Engine<D> {
     /// conversations, so this, not the slot count, is usually what limits them).
     pub fn set_kv_budget(&mut self, bytes: Option<usize>) {
         self.kv_budget = bytes;
+        self.apply_budget();
+    }
+
+    /// The pool's block budget: the memory budget, or else the slots' full contexts.
+    fn apply_budget(&mut self) {
+        let max_ctx = self.model.max_ctx();
+        let bytes = self
+            .kv_budget
+            .unwrap_or_else(|| self.slots * self.model.cache_bytes(max_ctx));
+        self.model.set_kv_budget(Some(bytes));
     }
 
     /// Keep conversations' caches on disk in `dir` (up to `budget` bytes), so one that lost its
@@ -368,28 +386,85 @@ impl<D: ComputeDevice> Engine<D> {
         }
     }
 
-    /// Device memory the KV caches hold now.
+    /// Device memory the KV block pool holds now.
     pub fn kv_bytes(&self) -> usize {
-        self.cache.bytes() + self.parked.iter().map(|s| s.cache.bytes()).sum::<usize>()
+        let pool = crate::blocks::lock(self.model.pool());
+        pool.stats().capacity * pool.block_bytes()
     }
 
-    /// Drop least recently used parked caches until the active one can grow to `rows`
-    /// positions within the budget.
+    /// What the KV block pool holds, in blocks.
+    pub fn kv_stats(&self) -> crate::blocks::Stats {
+        crate::blocks::lock(self.model.pool()).stats()
+    }
+
+    /// Drop least recently used parked conversations until the active one can grow to `rows`
+    /// positions within the budget (their sealed blocks stay cached while there's room).
     fn make_room(&mut self, rows: usize) {
-        let Some(budget) = self.kv_budget else {
-            return;
-        };
-        let need = self.model.cache_bytes(rows).max(self.cache.bytes());
-        loop {
-            let parked: usize = self.parked.iter().map(|s| s.cache.bytes()).sum();
-            if need + parked <= budget {
-                return;
-            }
+        use crate::blocks::BLOCK;
+        // Blocks past what it holds now, plus a copy of its last one if that's shared.
+        let need = (rows.min(self.model.max_ctx()).div_ceil(BLOCK) + 1)
+            .saturating_sub(self.cache.len / BLOCK);
+        while crate::blocks::lock(self.model.pool()).available() < need {
             let Some(lru) = (0..self.parked.len()).min_by_key(|&i| self.parked[i].used) else {
                 return;
             };
             self.parked.swap_remove(lru);
         }
+    }
+
+    /// Take the longest prefix of `ids` (up to `limit` positions) that sealed blocks in the
+    /// pool hold, when that beats what the active cache already shares with `ids`: its full
+    /// blocks are attached as they are, and a block sharing only some leading positions is
+    /// copied that far. Returns the positions attached (0 if the cache was kept).
+    fn attach(&mut self, ids: &[u32], limit: usize) -> usize {
+        use crate::blocks::{chain, lock, BLOCK, SEED};
+        let own = shared_len(&self.cache.tokens, ids);
+        let shared = self.model.pool().clone();
+        let mut pool = lock(&shared);
+        let (mut found, mut parent) = (Vec::new(), SEED);
+        while (found.len() + 1) * BLOCK <= limit {
+            let t = &ids[found.len() * BLOCK..(found.len() + 1) * BLOCK];
+            let h = chain(parent, t);
+            let Some(b) = pool.find(h, t) else { break };
+            found.push(b);
+            parent = h;
+        }
+        let at = found.len() * BLOCK;
+        // A block after the last match that shares some leading positions.
+        let rest = &ids[at..limit.min(at + BLOCK)];
+        let partial = pool
+            .children(parent)
+            .into_iter()
+            .map(|(b, t)| (b, shared_len(t, rest)))
+            .max_by_key(|&(_, n)| n)
+            .filter(|&(_, n)| n >= MIN_PARTIAL);
+        let total = at + partial.map_or(0, |p| p.1);
+        if total <= own {
+            return 0;
+        }
+        // Held before anything is allocated, so eviction can't take them.
+        if let Some((b, _)) = partial {
+            pool.retain(b);
+        }
+        drop(pool);
+        self.cache.attach(&found, ids);
+        self.cache_images.clear();
+        if let Some((b, n)) = partial {
+            let mut pool = lock(&shared);
+            let fresh = pool.alloc(&self.model.dev);
+            pool.copy_rows(&self.model.dev, b, fresh, n);
+            pool.release(b);
+            drop(pool);
+            self.cache.push_block(fresh, &ids[at..at + n]);
+        }
+        total
+    }
+
+    /// Seal the active cache's full blocks (those before any image), so other conversations
+    /// can share them.
+    fn seal(&mut self) {
+        let upto = self.cache_images.first().map_or(usize::MAX, |&(s, _)| s);
+        self.cache.seal(upto);
     }
 
     /// Make the slot for this request the active one.
@@ -504,6 +579,16 @@ impl<D: ComputeDevice> Engine<D> {
         let limit = req.max_tokens.unwrap_or(usize::MAX).min(ctx - ids.len());
 
         self.select(req.cache_key.as_deref(), &ids);
+        // Another conversation's blocks, if they hold more of this prompt (at least one token
+        // is still fed, for the logits; nothing from an image on).
+        let first_image = runs.first().map_or(ids.len(), |r| r.0);
+        let attached = self.attach(&ids, (ids.len() - 1).min(first_image));
+        if attached > 0 {
+            eprintln!("tang-llm: {attached} positions from shared blocks");
+        }
+        // What's past the shared prefix won't be reused.
+        let keep = shared_len(&self.cache.tokens, &ids);
+        self.cache.truncate(keep);
         // Room for the prompt and a typical reply; a longer one grows past the budget a little.
         self.make_room(ids.len() + limit.min(4096));
         if req.images.is_empty() {
@@ -555,6 +640,7 @@ impl<D: ComputeDevice> Engine<D> {
         self.cache_images = runs;
         let prefill_s = t.elapsed().as_secs_f64();
         if req.prefill_only {
+            self.seal();
             return Ok((
                 Finish::Stop,
                 Usage {
@@ -728,6 +814,7 @@ impl<D: ComputeDevice> Engine<D> {
             }
             spec.global.push(&out);
         }
+        self.seal();
         let decode_s = t.elapsed().as_secs_f64();
         let prompt_tokens = ids.len();
         self.last = (ids, out.clone());
@@ -752,6 +839,11 @@ impl<D: ComputeDevice> Engine<D> {
             .map_err(|e| anyhow!("detokenize: {e}"))
             .context("decode")
     }
+}
+
+/// How many leading tokens `a` and `b` share.
+fn shared_len(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
 fn hash(bytes: &[u8]) -> u64 {
