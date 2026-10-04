@@ -1022,6 +1022,48 @@ fn moe(g: &CudaComputeDevice) {
     }
 }
 
+/// Hyper-connection reads alone: 96 reads (48 layers x 2) in one graph over 8 weight copies (>L2),
+/// each with a pending block-output write and the injection, T = 1, 2, 4, 8.
+fn hc(g: &CudaComputeDevice) {
+    let mut rng = Rng(0x4c);
+    let src = Src::new(&mut rng, 16 << 20);
+    let hcs: Vec<Hc> = (0..8).map(|_| Hc::new(g, &src)).collect();
+    println!("hc_read_into x96 in one graph (GB/s of bf16 weight bytes)");
+    for t in [1usize, 2, 4, 8] {
+        let mut r = g.upload_f32(&rng.vec(t * HC * HIDDEN, 1.0));
+        let y = g.upload_f32(&rng.vec(t * HIDDEN, 0.1));
+        let inj = g.upload_f32(&rng.vec(t * HC, 1.0));
+        let mut x = g.alloc_f32(t * HIDDEN);
+        let mut xq = g.alloc_f32(QAct { m: t, k: HIDDEN }.words());
+        let mut inj_o = g.alloc_f32(t * HC);
+        let mut sc = g.alloc_f32(flash::hc_scratch_words(t));
+        let graph = g.capture(&mut || {
+            for i in 0..96 {
+                g.hc_read_into(
+                    &mut r,
+                    Some(HcPending::Write { y: &y, inj: &inj }),
+                    &hcs[i % 8].w(true),
+                    &mut x,
+                    Some(&mut xq),
+                    Some(&mut inj_o),
+                    &mut sc,
+                    t,
+                    1e-6,
+                );
+            }
+        });
+        graph.launch().unwrap();
+        let ms = (0..5)
+            .map(|_| g.event_ms(&mut || graph.launch().unwrap()))
+            .fold(f32::INFINITY, f32::min);
+        let us = ms as f64 * 1e3 / 96.0;
+        println!(
+            "  T={t}: {us:6.1} us/read, {:4.0} GB/s",
+            Hc::BYTES as f64 / (us * 1e3)
+        );
+    }
+}
+
 /// `TANG_FLASH_UNION=1`: QSA attention over the window's union of selections (measured slower
 /// than per-token attention on mew; kept for A/B).
 fn union_attend() -> bool {
@@ -1039,6 +1081,7 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("gemv") => gemv(&g),
         Some("moe") => moe(&g),
+        Some("hc") => hc(&g),
         Some("native") => native(&g),
         Some("window") => {
             let ts: Vec<usize> = args[1..].iter().map(|a| a.parse().expect("T")).collect();
