@@ -128,6 +128,64 @@ fn verify_matches_decode<D: ComputeDevice>(dev: D, dir: &Path, name: &str) {
     }
 }
 
+/// bf16 KV caches against f32 ones: a long prefill (`TANG_LLM_TEST_KV_TOKENS`, default 1024)
+/// in 512-token chunks, then decode steps fed the same tokens, logits for each.
+fn bf16_kv_matches_f32<D: ComputeDevice>(make: impl Fn() -> D, dir: &Path, name: &str) {
+    let n: usize = std::env::var("TANG_LLM_TEST_KV_TOKENS")
+        .ok()
+        .map_or(1024, |v| v.parse().expect("TANG_LLM_TEST_KV_TOKENS"));
+    let steps = 16;
+    let tok = Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer.json");
+    let text = "fn main() { let xs: Vec<u32> = (0..10).map(|i| i * i).collect(); \
+                println!(\"{:?}\", xs); } // The quick brown fox jumps over the lazy dog. \
+                Attention is a weighted average of values, keyed by similarity.\n";
+    let mut ids = Vec::new();
+    while ids.len() < n + steps {
+        ids.extend(tok.encode(text, false).expect("encode").get_ids());
+    }
+    ids.truncate(n + steps);
+    let run = |f32: bool| -> Vec<f32> {
+        let mut model = Model::load(make(), dir, n + steps + 8, Dtype::Bf16).expect("load");
+        model.set_kv_f32(f32);
+        assert_eq!(model.kv_bf16(), !f32, "{name}: no bf16 KV storage");
+        let mut cache = model.new_cache();
+        let mut out = Vec::new();
+        for chunk in ids[..n].chunks(512) {
+            out = model.forward(chunk, &mut cache, false).unwrap();
+        }
+        for &id in &ids[n..n + steps - 1] {
+            out.extend(model.forward(&[id], &mut cache, false).unwrap());
+        }
+        out
+    };
+    let vocab = Model::load(make(), dir, 64, Dtype::Bf16)
+        .expect("load")
+        .cfg
+        .vocab_size;
+    check(
+        &format!("{name} bf16 KV vs f32 KV, {n} tokens + {steps} decodes"),
+        &run(false),
+        &run(true),
+        vocab,
+    );
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_bf16_kv_matches_f32() {
+    let Some(dir) = model_dir() else { return };
+    let make = || tang_compute::MetalDevice::new().expect("no Metal device");
+    bf16_kv_matches_f32(make, &dir, "metal");
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_bf16_kv_matches_f32() {
+    let Some(dir) = model_dir() else { return };
+    let make = || tang_compute::CudaComputeDevice::new().expect("no CUDA device");
+    bf16_kv_matches_f32(make, &dir, "cuda");
+}
+
 #[cfg(feature = "cuda")]
 #[test]
 fn cuda_verify_matches_decode() {

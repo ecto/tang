@@ -2,6 +2,7 @@
 //! Gemma 3: GeGLU, `(1 + w)` RMSNorms around both attention and MLP, a scaled embedding, and
 //! local sliding-window layers (own RoPE base) between global ones (scaled RoPE).
 
+use crate::blocks::{self, Shared, BLOCK};
 use crate::config::Config;
 use crate::weights::Weights;
 use anyhow::Result;
@@ -50,38 +51,13 @@ pub struct Model<D: ComputeDevice> {
     /// The vision tower, for multimodal checkpoints.
     pub vision: Option<crate::vision::Vision<D::Buffer>>,
     max_ctx: usize,
+    /// Every cache's K and V blocks (see [`crate::blocks`]): bf16 (half the memory of f32;
+    /// attention still accumulates in f32) unless the device has no bf16 storage, or with
+    /// `TANG_KV_F32=1`.
+    pool: Shared<D::Buffer>,
 }
 
-/// Per-sequence attention state: K and V for every layer, `[cap, kv_dim]`, on device. It
-/// starts small and doubles as the sequence grows, up to the context window.
-/// Truncating keeps a prefix (later positions are simply overwritten), which is how a new
-/// request reuses the part of the conversation it shares with the last one.
-pub struct Cache<B> {
-    k: Vec<B>,
-    v: Vec<B>,
-    /// Positions allocated (a multiple of 32).
-    cap: usize,
-    /// Device memory per position, all layers' K and V.
-    row_bytes: usize,
-    /// Tokens already in the cache.
-    pub len: usize,
-    pub tokens: Vec<u32>,
-}
-
-/// Positions a new cache starts with.
-const FIRST_ROWS: usize = 4096;
-
-impl<B> Cache<B> {
-    /// Device memory it holds now.
-    pub fn bytes(&self) -> usize {
-        self.cap * self.row_bytes
-    }
-
-    pub fn truncate(&mut self, len: usize) {
-        self.len = self.len.min(len);
-        self.tokens.truncate(self.len);
-    }
-}
+pub use crate::blocks::Cache;
 
 impl<D: ComputeDevice> Model<D> {
     /// Load a checkpoint directory. Matrices are kept in `dtype` on device; norms stay f32.
@@ -220,6 +196,8 @@ impl<D: ComputeDevice> Model<D> {
             ropes.push((dev.upload(&cos), dev.upload(&sin)));
         }
         let embed_scale = gemma.then(|| bf16_round((cfg.hidden_size as f32).sqrt()));
+        let dev_bf16 = dev.bf16_storage();
+        let (n_layers, kv_dim) = (layers.len(), cfg.kv_dim());
         let vision = match &cfg.vision {
             Some(v) if w.has("vision_tower.vision_model.post_layernorm.weight") => {
                 Some(crate::vision::Vision::load(
@@ -243,114 +221,103 @@ impl<D: ComputeDevice> Model<D> {
             embed_scale,
             vision,
             max_ctx,
+            pool: new_pool(
+                n_layers,
+                kv_dim,
+                dev_bf16 && !std::env::var("TANG_KV_F32").is_ok_and(|v| v == "1"),
+                usize::MAX,
+            ),
         })
+    }
+
+    /// Keep KV in f32 instead of bf16 (for comparing the two), in a new pool: caches made
+    /// before keep the old one.
+    pub fn set_kv_f32(&mut self, f32: bool) {
+        let max = blocks::lock(&self.pool).stats().max;
+        self.pool = new_pool(
+            self.layers.len(),
+            self.cfg.kv_dim(),
+            !f32 && self.dev.bf16_storage(),
+            max,
+        );
+    }
+
+    /// Whether caches hold bf16 (else f32).
+    pub fn kv_bf16(&self) -> bool {
+        blocks::lock(&self.pool).bf16()
+    }
+
+    /// The pool every cache's blocks come from.
+    pub fn pool(&self) -> &Shared<D::Buffer> {
+        &self.pool
+    }
+
+    /// Cap the device memory KV blocks may take (`None`: no cap).
+    pub fn set_kv_budget(&self, bytes: Option<usize>) {
+        let mut pool = blocks::lock(&self.pool);
+        let max = bytes.map_or(usize::MAX, |b| (b / pool.block_bytes()).max(1));
+        pool.set_max_blocks(max);
     }
 
     pub fn max_ctx(&self) -> usize {
         self.max_ctx
     }
 
-    /// Device memory a [`Cache`] of `rows` positions takes (f32 K and V for every layer).
+    /// Device memory a [`Cache`] of `rows` positions takes (K and V for every layer, in
+    /// whole blocks).
     pub fn cache_bytes(&self, rows: usize) -> usize {
-        rows.min(self.max_ctx).next_multiple_of(32) * self.row_bytes()
+        rows.min(self.max_ctx).div_ceil(BLOCK) * blocks::lock(&self.pool).block_bytes()
     }
 
-    fn row_bytes(&self) -> usize {
-        2 * self.layers.len() * self.cfg.kv_dim() * 4
+    /// Device memory per position: every layer's K and V, 2 bytes an element in bf16, else 4.
+    pub fn row_bytes(&self) -> usize {
+        self.row_elems() * if self.kv_bf16() { 2 } else { 4 }
     }
 
     pub fn new_cache(&self) -> Cache<D::Buffer> {
-        // Rounded up so tiled attention can read whole 32-row blocks.
-        let cap = FIRST_ROWS.min(self.max_ctx).next_multiple_of(32);
-        let n = cap * self.cfg.kv_dim();
-        Cache {
-            k: (0..self.layers.len()).map(|_| self.dev.alloc(n)).collect(),
-            v: (0..self.layers.len()).map(|_| self.dev.alloc(n)).collect(),
-            cap,
-            row_bytes: self.row_bytes(),
-            len: 0,
-            tokens: Vec::new(),
-        }
+        Cache::new(self.pool.clone())
     }
 
-    /// Floats per position in [`read_rows`](Self::read_rows): every layer's K and V.
-    pub fn row_floats(&self) -> usize {
+    /// Elements per position in [`read_rows`](Self::read_rows): every layer's K and V.
+    pub fn row_elems(&self) -> usize {
         2 * self.layers.len() * self.cfg.kv_dim()
     }
 
-    /// Positions `from..to` of `cache`, position-major: for each, every layer's K row then V
-    /// row.
-    pub fn read_rows(&self, cache: &Cache<D::Buffer>, from: usize, to: usize) -> Vec<f32> {
-        let kvd = self.cfg.kv_dim();
-        let n = to - from;
-        let mut out = vec![0f32; n * self.row_floats()];
-        if n == 0 {
-            return out;
-        }
-        let bufs = cache.k.iter().zip(&cache.v).flat_map(|(k, v)| [k, v]);
-        for (j, buf) in bufs.enumerate() {
-            let part = self
-                .dev
-                .download(&self.dev.slice_buffer(buf, from * kvd, n * kvd));
-            for p in 0..n {
-                let at = (p * self.layers.len() * 2 + j) * kvd;
-                out[at..at + kvd].copy_from_slice(&part[p * kvd..(p + 1) * kvd]);
-            }
+    /// Positions `from..to` of `cache` as bf16 bits (exact for a bf16 cache, rounded from an f32
+    /// one), position-major: for each, every layer's K row then V row.
+    pub fn read_rows(&self, cache: &Cache<D::Buffer>, from: usize, to: usize) -> Vec<u16> {
+        let pool = blocks::lock(cache.pool());
+        let mut out = Vec::with_capacity((to - from) * self.row_elems());
+        let mut p = from;
+        while p < to {
+            let n = (BLOCK - p % BLOCK).min(to - p);
+            out.extend(pool.read_block(&self.dev, cache.table[p / BLOCK], p % BLOCK, n));
+            p += n;
         }
         out
     }
 
     /// Append positions to `cache`: `tokens`, with their rows as [`read_rows`](Self::read_rows)
     /// gives them.
-    pub fn write_rows(&self, cache: &mut Cache<D::Buffer>, tokens: &[u32], rows: &[f32]) {
-        let kvd = self.cfg.kv_dim();
+    pub fn write_rows(&self, cache: &mut Cache<D::Buffer>, tokens: &[u32], rows: &[u16]) {
         let n = tokens.len();
         if n == 0 {
             return;
         }
-        self.reserve(cache, cache.len + n);
-        let at = cache.len * kvd;
-        let layers = self.layers.len();
-        let bufs = cache
-            .k
-            .iter_mut()
-            .zip(cache.v.iter_mut())
-            .flat_map(|(k, v)| [k, v]);
-        for (j, buf) in bufs.enumerate() {
-            let mut part = Vec::with_capacity(n * kvd);
-            for p in 0..n {
-                let from = (p * layers * 2 + j) * kvd;
-                part.extend_from_slice(&rows[from..from + kvd]);
-            }
-            // In the cache's own precision (bf16 on CUDA in mixed precision).
-            self.dev.write_into(buf, at, &self.dev.upload(&part));
+        let pool = cache.pool().clone();
+        let mut pool = blocks::lock(&pool);
+        let (from, to) = (cache.len, cache.len + n);
+        blocks::prepare(&self.dev, &mut pool, cache, from, to);
+        let row = self.row_elems();
+        let mut p = from;
+        while p < to {
+            let k = (BLOCK - p % BLOCK).min(to - p);
+            let part = &rows[(p - from) * row..(p - from + k) * row];
+            pool.write_block(&self.dev, cache.table[p / BLOCK], p % BLOCK, part);
+            p += k;
         }
-        cache.len += n;
+        cache.len = to;
         cache.tokens.extend_from_slice(tokens);
-    }
-
-    /// Make room in `cache` for `rows` positions: double it (at least to `rows`, at most to
-    /// the context window) and copy what's there.
-    fn reserve(&self, cache: &mut Cache<D::Buffer>, rows: usize) {
-        if rows <= cache.cap {
-            return;
-        }
-        let cap = rows
-            .max(cache.cap * 2)
-            .min(self.max_ctx)
-            .max(rows)
-            .next_multiple_of(32);
-        let kvd = self.cfg.kv_dim();
-        let used = cache.len * kvd;
-        for buf in cache.k.iter_mut().chain(cache.v.iter_mut()) {
-            let mut grown = self.dev.alloc(cap * kvd);
-            if used > 0 {
-                let old = self.dev.slice_buffer(buf, 0, used);
-                self.dev.write_into(&mut grown, 0, &old);
-            }
-            *buf = grown;
-        }
-        cache.cap = cap;
     }
 
     /// Run `tokens` through the model after what's already in `cache`, append them to it, and
@@ -513,34 +480,36 @@ impl<D: ComputeDevice> Model<D> {
         );
         let (qd, kvd, ff) = (c.q_dim(), c.kv_dim(), c.intermediate_size);
         let eps = c.rms_norm_eps;
-        self.reserve(cache, pos + s);
+        let shared = cache.pool().clone();
+        let mut pool = blocks::lock(&shared);
+        let ids = blocks::prepare(dev, &mut pool, cache, pos, pos + s);
+        let table = dev.upload_u32(&ids);
+        let pages = tang_compute::Pages {
+            ids: &ids,
+            table: &table,
+            block: BLOCK,
+        };
         for (l, w) in self.layers.iter().enumerate() {
+            let (kp, vp) = pool.layer(l);
             let a = dev.rms_norm(x, &w.attn_norm, s, h, eps);
             let qkv = dev.linear(&a, &w.wqkv, s, h, qd + 2 * kvd);
             let (cos, sin) = &self.ropes[w.rope];
-            let q = dev.attention_prep(
+            let q = dev.attention_prep_paged(
                 &qkv,
                 w.q_norm.as_ref(),
                 w.k_norm.as_ref(),
                 cos,
                 sin,
-                &mut cache.k[l],
-                &mut cache.v[l],
+                kp,
+                vp,
+                &pages,
                 s,
                 (nh, nkv, hd),
                 pos,
                 eps,
             );
-            let att = dev.kv_attention_window(
-                &q,
-                &cache.k[l],
-                &cache.v[l],
-                pos,
-                s,
-                (nh, nkv, hd),
-                w.window,
-                causal,
-            );
+            let att =
+                dev.kv_attention_paged(&q, kp, vp, &pages, pos, s, (nh, nkv, hd), w.window, causal);
             let mut o = dev.linear(&att, &w.wo, s, qd, h);
             if let Some(n) = &w.post_attn_norm {
                 o = dev.rms_norm(&o, n, s, h, eps);
@@ -566,6 +535,12 @@ impl<D: ComputeDevice> Model<D> {
         }
         Ok(())
     }
+}
+
+fn new_pool<B>(layers: usize, kv_dim: usize, bf16: bool, max_blocks: usize) -> Shared<B> {
+    std::sync::Arc::new(std::sync::Mutex::new(blocks::Pool::new(
+        layers, kv_dim, bf16, max_blocks,
+    )))
 }
 
 /// Round to the nearest bfloat16, as Gemma's reference does for its embedding scale.
