@@ -90,6 +90,7 @@ fn parse(args: &[String]) -> Result<Args> {
             "-q" => a.quiet = true,
             "--save" => a.save = Some(PathBuf::from(val()?)),
             "--draft" => a.draft = val()?.clone(),
+            "--mtp" => a.opts.mtp = Some(PathBuf::from(val()?)),
             "--temp" => a.temp = val()?.parse()?,
             "--seed" => a.seed = val()?.parse()?,
             "--out" => a.out = Some(PathBuf::from(val()?)),
@@ -202,6 +203,8 @@ pub struct SpecStats {
     pub by_pos: Vec<(usize, usize)>,
     /// Windows per width.
     pub widths: Vec<usize>,
+    /// MTP time per window (ms, summed).
+    pub mtp_ms: f64,
 }
 
 /// Decode `n` tokens after `ids` with verify windows and drafts from `kind` (`none`, `suffix`,
@@ -215,6 +218,8 @@ fn decode_spec(
 ) -> Result<(Vec<u32>, Vec<WinStats>, f64, f64, SpecStats)> {
     use crate::draft::{Calibration, DraftConfig, Global, Session};
     e.reset();
+    e.use_mtp = kind == "mtp";
+    ensure!(!e.use_mtp || e.has_mtp(), "--draft mtp needs --mtp FILE");
     let t0 = Instant::now();
     let mut cur = e.prefill(ids, chunk, None)?;
     let prefill_s = t0.elapsed().as_secs_f64();
@@ -254,6 +259,16 @@ fn decode_spec(
             "suffix" => {
                 let d = sess.propose(room);
                 (d.tokens.clone(), Some(d))
+            }
+            "mtp" => {
+                let mut d = Vec::new();
+                for &(tok, p) in &e.mtp_last {
+                    if p < 0.5 || d.len() >= room {
+                        break;
+                    }
+                    d.push(tok);
+                }
+                (d, None)
             }
             "wrong" => {
                 // Forced-wrong: random tokens (and sometimes a true prefix from an oracle).
@@ -297,6 +312,7 @@ fn decode_spec(
             }
         }
         sp.windows += 1;
+        sp.mtp_ms += e.last_mtp_ms;
         sp.widths[drafts.len() + 1] += 1;
         sp.tokens += kept.len();
         stats.push(e.last);
@@ -312,7 +328,8 @@ fn decode_spec(
 }
 
 fn spec_report(sp: &SpecStats) -> String {
-    let mut s = format!(
+    let mut s = format!("mtp {:.2} ms/window; ", sp.mtp_ms / sp.windows.max(1) as f64);
+    s += &format!(
         "{} windows, {:.2} tokens/window; widths {:?}; accepted by draft position:",
         sp.windows,
         sp.tokens as f64 / sp.windows.max(1) as f64,
@@ -640,7 +657,11 @@ pub fn spec_test(args: &[String]) -> Result<()> {
         let f = std::env::temp_dir().join(format!("flash-oracle-{}.ids", std::process::id()));
         std::fs::write(&f, base.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" "))?;
         println!("temp {temp}: none   {:.1} tok/s  first {:?}", sp0.tokens as f64 / s0, &base[..base.len().min(12)]);
-        for kind in ["suffix".to_string(), "wrong".to_string(), format!("oracle:{}", f.display())] {
+        let mut kinds = vec!["suffix".to_string(), "wrong".to_string(), format!("oracle:{}", f.display())];
+        if e.has_mtp() {
+            kinds.insert(0, "mtp".into());
+        }
+        for kind in kinds {
             let (out, stats, _, secs, sp) = decode_spec(&mut e, &ids, a.n, a.chunk, &kind)?;
             let same = out == base;
             ok &= same;

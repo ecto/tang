@@ -12,6 +12,8 @@ pub mod engine;
 #[cfg(feature = "cuda")]
 pub mod kernels;
 pub mod mtp;
+#[cfg(feature = "cuda")]
+pub mod mtp_gpu;
 pub mod ngram;
 pub mod pack;
 pub mod reference;

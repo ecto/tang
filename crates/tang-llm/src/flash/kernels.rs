@@ -239,7 +239,10 @@ __device__ __forceinline__ void scale_min_k4(int j, const unsigned char* q, int&
 // branches (lanes of a warp sit in different quarters of a block).
 template <int TY>
 __device__ __forceinline__ void decode8(const unsigned char* row, int e0, float* v) {
-    if (TY == 30) {  // BF16
+    if (TY == 0) {  // F32
+        const float4 a = *(const float4*)(row + 4 * e0), b = *(const float4*)(row + 4 * e0 + 16);
+        v[0] = a.x; v[1] = a.y; v[2] = a.z; v[3] = a.w; v[4] = b.x; v[5] = b.y; v[6] = b.z; v[7] = b.w;
+    } else if (TY == 30) {  // BF16
         const uint4 u = *(const uint4*)(row + 2 * e0);
         const unsigned w[4] = {u.x, u.y, u.z, u.w};
         #pragma unroll
@@ -521,7 +524,7 @@ __device__ void gemv8_body(const Seg* segs, int nseg, const float* x, const unsi
         sg[j] = segs[s];
         const unsigned char* src = (const unsigned char*)sg[j].w + (size_t)row * sg[j].row_bytes;
         w[j] = src;
-        if (sg[j].type != 30) {
+        if (sg[j].type != 30 && sg[j].type != 0) {
             uint4* sm = dsm + (warp * 2 + j) * row16;
             const unsigned long long a = (unsigned long long)src & ~15ull;
             const int delta = (int)((unsigned long long)src - a);
@@ -539,6 +542,7 @@ __device__ void gemv8_body(const Seg* segs, int nseg, const float* x, const unsi
         for (int t = 0; t < T; t++) acc[t] = 0.f;
         switch (sg[j].type) {
             case 30: rows_dot<T, 30>(w[j], x, k, acc); break;
+            case 0: rows_dot<T, 0>(w[j], x, k, acc); break;
             case 8: rows_dot8<T, 8>(w[j], xq, k, acc); break;
             case 2: rows_dot8<T, 2>(w[j], xq, k, acc); break;
             case 20: rows_dot8<T, 20>(w[j], xq, k, acc); break;
@@ -651,4 +655,218 @@ __device__ void gemv_body(const Seg* segs, int nseg, const float* x, int k, floa
     const Seg* segs, int nseg, const float* x, int k, float* out, int ostride, int row16, int total) { \
     gemv_body<T>(segs, nseg, x, k, out, ostride, row16, total); }
 GEMV_T(1) GEMV_T(2) GEMV_T(3) GEMV_T(4) GEMV_T(5) GEMV_T(6) GEMV_T(7) GEMV_T(8)
+
+// ---- MTP layer ----
+
+#define MTP_HID 2560
+#define MTP_HC 4
+
+__device__ float bsum(float v, float* sh) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    const int w = threadIdx.x >> 5, l = threadIdx.x & 31;
+    __syncthreads();
+    if (l == 0) sh[w] = v;
+    __syncthreads();
+    float s = 0.f;
+    for (int i = 0; i < (int)(blockDim.x >> 5); i++) s += sh[i];
+    return s;
+}
+
+// out[c] = dequant(table row toks[c]) (one block per cell), for a GGUF-typed embedding in VRAM.
+template <int TY>
+__device__ void embed_rows(const unsigned char* table, int row_bytes, const unsigned* toks, float* out, int k) {
+    const unsigned char* row = table + (size_t)toks[blockIdx.x] * row_bytes;
+    for (int e0 = threadIdx.x * 8; e0 < k; e0 += blockDim.x * 8) {
+        float v[8];
+        decode8<TY>(row, e0, v);
+        for (int i = 0; i < 8; i++) out[(size_t)blockIdx.x * k + e0 + i] = v[i];
+    }
+}
+extern "C" __global__ void fe_embed_q3k(const unsigned char* table, int row_bytes, const unsigned* toks, float* out, int k) {
+    embed_rows<11>(table, row_bytes, toks, out, k);
+}
+
+// cat[c][s] = [rmsnorm(e[c]) * enorm ; rmsnorm(h[c][s]) * hnorm[s]] (one block per (cell, stream)).
+extern "C" __global__ void fe_mtp_cat(const float* e, const float* enorm, const float* h, const float* hnorm, float* cat, float eps) {
+    __shared__ float sh[32];
+    const int c = blockIdx.x / MTP_HC, st = blockIdx.x % MTP_HC;
+    const float* ec = e + (size_t)c * MTP_HID;
+    const float* hc = h + ((size_t)c * MTP_HC + st) * MTP_HID;
+    float se = 0.f, shh = 0.f;
+    for (int i = threadIdx.x; i < MTP_HID; i += blockDim.x) { se = fmaf(ec[i], ec[i], se); shh = fmaf(hc[i], hc[i], shh); }
+    se = bsum(se, sh);
+    shh = bsum(shh, sh);
+    const float ie = rsqrtf(se / MTP_HID + eps), ih = rsqrtf(shh / MTP_HID + eps);
+    float* o = cat + (size_t)blockIdx.x * 2 * MTP_HID;
+    for (int i = threadIdx.x; i < MTP_HID; i += blockDim.x) {
+        o[i] = ec[i] * ie * enorm[i];
+        o[MTP_HID + i] = hc[i] * ih * hnorm[st * MTP_HID + i];
+    }
+}
+
+// q / k / v of each cell (proj: [q|gate × 24 | k 512 | v 512] rows): q rmsnorm·qn and rope →
+// q [C][24][256]; k rmsnorm·kn and rope, v → f32 caches at the cell's position. Grid (C, 26).
+extern "C" __global__ void fe_mtp_prep(const float* proj, int stride, const float* qn, const float* kn,
+                                       const float* cosv, const float* sinv, const unsigned* ctl,
+                                       float* q, float* kc, float* vc, float eps) {
+    __shared__ float sh[32];
+    __shared__ float buf[256];
+    const int c = blockIdx.x, hh = blockIdx.y, d = threadIdx.x;
+    const unsigned pos = ctl[0] + c;
+    const float* row = proj + (size_t)c * stride;
+    float x;
+    const float* w;
+    if (hh < 24) { x = row[hh * 512 + d]; w = qn; }
+    else { x = row[12288 + (hh - 24) * 256 + d]; w = kn; }
+    const float ss = bsum(x * x, sh);
+    x = x * rsqrtf(ss / 256.f + eps) * w[d];
+    buf[d] = x;
+    __syncthreads();
+    if (d < 64) {
+        const int i = d & 31;
+        const float cs = cosv[pos * 32 + i], sn = sinv[pos * 32 + i];
+        const float a = buf[i], b = buf[i + 32];
+        x = d < 32 ? a * cs - b * sn : b * cs + a * sn;
+    }
+    if (hh < 24) q[((size_t)c * 24 + hh) * 256 + d] = x;
+    else {
+        const int g = hh - 24;
+        kc[((size_t)pos * 2 + g) * 256 + d] = x;
+        vc[((size_t)pos * 2 + g) * 256 + d] = row[12800 + g * 256 + d];
+    }
+}
+
+// Dense causal attention of cell c (position ctl[0] + c) over cache rows 0..=pos, gated:
+// out[c][h] = softmax(q·k / 16) v ⊙ sigmoid(gate). Grid (C, 24), 256 threads: warp w takes
+// rows w, w + 8, ...; lane owns 8 dims; warps merged through shared memory.
+extern "C" __global__ void fe_mtp_attn(const float* q, const float* kc, const float* vc, const float* proj,
+                                       int stride, const unsigned* ctl, float* out) {
+    __shared__ float sm[8], sl[8];
+    __shared__ float sacc[8][256];
+    const int c = blockIdx.x, h = blockIdx.y, g = h / 12;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int pos = (int)ctl[0] + c;
+    float qv[8];
+    for (int i = 0; i < 8; i++) qv[i] = q[((size_t)c * 24 + h) * 256 + lane * 8 + i] * 0.0625f;
+    float m = __int_as_float(0xff800000), l = 0.f, acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (int j = warp; j <= pos; j += 8) {
+        const float* kr = kc + ((size_t)j * 2 + g) * 256 + lane * 8;
+        float s = 0.f;
+        for (int i = 0; i < 8; i++) s = fmaf(qv[i], kr[i], s);
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+        const float mn = fmaxf(m, s), corr = expf(m - mn), p = expf(s - mn);
+        const float* vr = vc + ((size_t)j * 2 + g) * 256 + lane * 8;
+        for (int i = 0; i < 8; i++) acc[i] = fmaf(p, vr[i], acc[i] * corr);
+        l = l * corr + p;
+        m = mn;
+    }
+    if (lane == 0) { sm[warp] = m; sl[warp] = l; }
+    for (int i = 0; i < 8; i++) sacc[warp][lane * 8 + i] = acc[i];
+    __syncthreads();
+    const int d = threadIdx.x;
+    float M = __int_as_float(0xff800000);
+    for (int w = 0; w < 8; w++) M = fmaxf(M, sm[w]);
+    float L = 0.f, o = 0.f;
+    for (int w = 0; w < 8; w++) {
+        if (sl[w] == 0.f) continue;
+        const float f = expf(sm[w] - M);
+        L += sl[w] * f;
+        o += sacc[w][d] * f;
+    }
+    const float gt = proj[(size_t)c * stride + h * 512 + 256 + d];
+    out[((size_t)c * 24 + h) * 256 + d] = (o / L) * (1.0f / (1.0f + expf(-gt)));
+}
+
+// Routed experts of a GGUF-typed expert set in VRAM, f32 activations: for pair p = token·10 +
+// rank (expert ids[p]), row r of the expert's [rows][k] matrix at base + e·estride:
+// out[p · ostride + ooff + r] = W_e[r] · x[p / xdiv]. Grid (rows / 8, pairs), 8 warps.
+template <int TY>
+__device__ void moe_rows(const unsigned char* base, unsigned long long estride, int row_bytes, int rows,
+                         const unsigned* ids, const float* x, int xdiv, int k, float* out, int ostride, int ooff) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, p = blockIdx.y;
+    const int r = blockIdx.x * 8 + warp;
+    if (r >= rows) return;
+    const unsigned char* w = base + ids[p] * estride + (size_t)r * row_bytes;
+    float acc[1] = {0.f};
+    rows_dot<1, TY>(w, x + (size_t)(p / xdiv) * k, k, acc);
+    float a = acc[0];
+    for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+    if (lane == 0) out[(size_t)p * ostride + ooff + r] = a;
+}
+extern "C" __global__ void fe_moe_rows(int ty, const unsigned char* base, unsigned long long estride, int row_bytes, int rows,
+                                       const unsigned* ids, const float* x, int xdiv, int k, float* out, int ostride, int ooff) {
+    if (ty == 2) moe_rows<2>(base, estride, row_bytes, rows, ids, x, xdiv, k, out, ostride, ooff);
+    else if (ty == 8) moe_rows<8>(base, estride, row_bytes, rows, ids, x, xdiv, k, out, ostride, ooff);
+}
+
+// Argmax and its softmax probability, two passes (64 slices per row, then one warp per row).
+extern "C" __global__ void fe_amaxp1(const float* logits, int n, float* part) {
+    __shared__ float bv[32], bs[32];
+    __shared__ int bi[32];
+    const float* l = logits + (size_t)blockIdx.y * n;
+    const int per = (n + gridDim.x - 1) / gridDim.x, lo = blockIdx.x * per, hi = min(n, lo + per);
+    float v = __int_as_float(0xff800000), s = 0.f;
+    int idx = 0x7fffffff;
+    for (int i = lo + threadIdx.x; i < hi; i += blockDim.x) {
+        const float x = l[i];
+        if (x > v) { s = s * expf(v - x) + 1.f; v = x; idx = i; }
+        else s += expf(x - v);
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, v, o), os = __shfl_xor_sync(0xffffffffu, s, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, idx, o);
+        const float M = fmaxf(v, ov);
+        const float ns = (s == 0.f ? 0.f : s * expf(v - M)) + (os == 0.f ? 0.f : os * expf(ov - M));
+        if (ov > v || (ov == v && oi < idx)) idx = oi;
+        v = M; s = ns;
+    }
+    const int w = threadIdx.x >> 5;
+    if ((threadIdx.x & 31) == 0) { bv[w] = v; bi[w] = idx; bs[w] = s; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int i = 1; i < (int)(blockDim.x >> 5); i++) {
+            const float M = fmaxf(v, bv[i]);
+            const float ns = (s == 0.f ? 0.f : s * expf(v - M)) + (bs[i] == 0.f ? 0.f : bs[i] * expf(bv[i] - M));
+            if (bv[i] > v || (bv[i] == v && bi[i] < idx)) idx = bi[i];
+            v = M; s = ns;
+        }
+        float* p = part + ((size_t)blockIdx.y * gridDim.x + blockIdx.x) * 3;
+        p[0] = v; p[1] = __int_as_float(idx); p[2] = s;
+    }
+}
+extern "C" __global__ void fe_amaxp2(const float* part, int nparts, unsigned* ids, float* probs) {
+    const float* p = part + (size_t)blockIdx.x * nparts * 3;
+    float v = __int_as_float(0xff800000), s = 0.f;
+    int idx = 0x7fffffff;
+    for (int i = threadIdx.x; i < nparts; i += 32) {
+        const float ov = p[3 * i], os = p[3 * i + 2];
+        const int oi = __float_as_int(p[3 * i + 1]);
+        const float M = fmaxf(v, ov);
+        const float ns = (s == 0.f ? 0.f : s * expf(v - M)) + (os == 0.f ? 0.f : os * expf(ov - M));
+        if (ov > v || (ov == v && oi < idx)) idx = oi;
+        v = M; s = ns;
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, v, o), os = __shfl_xor_sync(0xffffffffu, s, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, idx, o);
+        const float M = fmaxf(v, ov);
+        const float ns = (s == 0.f ? 0.f : s * expf(v - M)) + (os == 0.f ? 0.f : os * expf(ov - M));
+        if (ov > v || (ov == v && oi < idx)) idx = oi;
+        v = M; s = ns;
+    }
+    if (threadIdx.x == 0) { ids[blockIdx.x] = (unsigned)idx; probs[blockIdx.x] = 1.0f / s; }
+}
+
+// Chain step setup: h ← the last cell's output residual, token ← its draft, ctl ← next position.
+extern "C" __global__ void fe_mtp_next(const float* r, float* h, const unsigned* drafts, unsigned* toks,
+                                       const unsigned* ctl_prev, unsigned* ctl) {
+    const unsigned n = ctl_prev[1];
+    const float* src = r + (size_t)(n - 1) * MTP_HC * MTP_HID;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < MTP_HC * MTP_HID; i += gridDim.x * blockDim.x) h[i] = src[i];
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        toks[0] = drafts[n - 1];
+        ctl[0] = ctl_prev[0] + n;
+        ctl[1] = 1;
+    }
+}
 "#;

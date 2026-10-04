@@ -80,7 +80,7 @@ pub fn cache_dir(first_shard: &Path) -> Result<PathBuf> {
 
 // ---- Q4 with a least-squares fit ----
 
-fn bf16_bits(x: f32) -> u16 {
+pub fn bf16_bits(x: f32) -> u16 {
     let b = x.to_bits();
     if x.is_nan() {
         return ((b >> 16) | 0x40) as u16;

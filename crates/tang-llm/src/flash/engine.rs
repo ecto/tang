@@ -24,7 +24,7 @@ use super::kernels;
 use super::ngram::NgramTable;
 use super::pack::{self, Entry, Fmt};
 use super::reference::Hparams;
-use crate::gguf::Gguf;
+use crate::gguf::{GgmlType, Gguf};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
@@ -79,6 +79,8 @@ pub struct Opts {
     pub adapt: bool,
     /// Record GPU timestamps around the doorbell waits (the split).
     pub split: bool,
+    /// The MTP GGUF (drafting); loaded before the expert slots are sized.
+    pub mtp: Option<PathBuf>,
 }
 
 impl Default for Opts {
@@ -93,6 +95,7 @@ impl Default for Opts {
             experts: ExpertMode::Cache,
             adapt: true,
             split: false,
+            mtp: None,
         }
     }
 }
@@ -139,7 +142,7 @@ fn gemv_grid(n: usize, row16: i32) -> (u32, u32) {
 
 /// Shared memory per warp for a native GEMV's staged rows (bf16 rows aren't staged).
 fn row16(segs: &[[u64; 5]]) -> i32 {
-    let rb = segs.iter().filter(|s| s[0] != 30).map(|s| s[2]).max().unwrap_or(0);
+    let rb = segs.iter().filter(|s| s[0] != 30 && s[0] != 0).map(|s| s[2]).max().unwrap_or(0);
     ((rb + 15).div_ceil(16) + 1) as i32
 }
 
@@ -149,37 +152,35 @@ impl Dw {
         match self {
             Dw::Bf16(b) => dev.linear_into(x, b, out, t, k, n),
             Dw::Q4x(b) => dev.q4x_linear_into(xq, b, out, t, k, n),
-            Dw::Native { segs, nseg, rows, row16, .. } => {
+            Dw::Native { rows, .. } => {
                 assert_eq!(*rows, n, "native GEMV rows");
-                let (sp, ns, xp, _ki, op, os) = (
-                    dev.buffer_addr(segs),
-                    *nseg,
-                    dev.buffer_addr(x),
-                    k as i32,
-                    dev.buffer_addr(out),
-                    n as i32,
-                );
-                let s = ManuallyDrop::new(Stream(nk.stream));
-                let r16 = *row16;
-                let xq = nk.xq8;
-                unsafe {
-                    let (ki, ti) = (k as i32, t as i32);
-                    let _ = ti;
-                    gpu::launch(nk.q8, ((k / 32) as u32, t as u32, 1), (32, 1, 1), 0, &s, tang_moe::args![xp, xq, ki])
-                        .expect("fe_q8 launch");
-                    let (f, grid) = (nk.f8[t - 1], n.div_ceil(8) as u32);
-                    gpu::launch(
-                        f,
-                        (grid, 1, 1),
-                        (128, 1, 1),
-                        (8 * 16 * r16) as u32,
-                        &s,
-                        tang_moe::args![sp, ns, xp, xq, ki, op, os, r16],
-                    )
-                    .expect("fe_gemv launch")
-                };
+                self.native_ptr(dev, nk, dev.buffer_addr(x), dev.buffer_addr(out), t, k, n);
             }
         }
+    }
+
+    /// Native GEMV on raw addresses: `t` rows of f32 `x` (`k` wide) at `xp`, outputs
+    /// `out[t · ostride + seg offset + row]` at `op`.
+    #[allow(clippy::too_many_arguments)]
+    fn native_ptr(&self, dev: &CudaComputeDevice, nk: &NativeK, xp: u64, op: u64, t: usize, k: usize, ostride: usize) {
+        let Dw::Native { segs, nseg, rows, row16, .. } = self else {
+            panic!("native_ptr on a non-native weight")
+        };
+        let (sp, ns, os, r16, xq, ki) = (dev.buffer_addr(segs), *nseg, ostride as i32, *row16, nk.xq8, k as i32);
+        let s = ManuallyDrop::new(Stream(nk.stream));
+        unsafe {
+            gpu::launch(nk.q8, ((k / 32) as u32, t as u32, 1), (32, 1, 1), 0, &s, tang_moe::args![xp, xq, ki])
+                .expect("fe_q8 launch");
+            gpu::launch(
+                nk.f8[t - 1],
+                (rows.div_ceil(8) as u32, 1, 1),
+                (128, 1, 1),
+                (8 * 16 * r16) as u32,
+                &s,
+                tang_moe::args![sp, ns, xp, xq, ki, op, os, r16],
+            )
+            .expect("fe_gemv launch")
+        };
     }
 
     fn native(&self) -> bool {
@@ -310,6 +311,14 @@ struct Kern {
     scatter: Fun,
     argmax: Fun,
     argmax2: Fun,
+    m_embed: Fun,
+    m_cat: Fun,
+    m_prep: Fun,
+    m_attn: Fun,
+    m_moe: Fun,
+    m_amax1: Fun,
+    m_amax2: Fun,
+    m_next: Fun,
     publish: Fun,
     wait: Fun,
     copy_rows: Fun,
@@ -339,7 +348,11 @@ impl Io {
     const PLE: usize = Self::EMB + MAX_T * HIDDEN * 4;
     const IDS: usize = Self::PLE + MAX_T * HIDDEN * 4;
     const STAMPS: usize = Self::IDS + 64;
-    const BYTES: usize = Self::STAMPS + 48 * 8 * 8;
+    /// MTP inputs: cell tokens (8 u32), then at +64 the control record [pos0, cells].
+    const MTP_IN: usize = Self::STAMPS + 48 * 8 * 8 + 64;
+    /// MTP outputs per step: drafts (8 u32), then at +32 probabilities (8 f32).
+    const MTP_OUT: usize = Self::MTP_IN + 128;
+    const BYTES: usize = Self::MTP_OUT + 64 * 4;
 
     fn ptr(&self, off: usize) -> *mut u8 {
         unsafe { self.arena.as_ptr().add(off) }
@@ -437,6 +450,12 @@ pub struct Engine {
     pub last: WinStats,
     pub n_slots: usize,
     pub load_report: String,
+    mtp: Option<Box<Mtp>>,
+    pub last_mtp_ms: f64,
+    /// Run the MTP after every window (keeps its K/V cache complete) and keep its drafts.
+    pub use_mtp: bool,
+    /// The last MTP pass's chain: (draft, probability) × 3.
+    pub mtp_last: Vec<(u32, f32)>,
 }
 
 fn upload_entry(dev: &CudaComputeDevice, e: &Entry, b: &[u8]) -> B {
@@ -691,7 +710,47 @@ impl Engine {
             .module(&doorbell::kernels_src())
             .map_err(|e| anyhow!("{e}"))?;
         let f = |m: &Module, n: &str| m.func(n).map_err(|e| anyhow!("{e}"));
+        let gm = gpu.module(kernels::GEMV_SRC).map_err(|e| anyhow!("{e}"))?;
+        let names = ["fe_gemv_t1", "fe_gemv_t2", "fe_gemv_t3", "fe_gemv_t4", "fe_gemv_t5", "fe_gemv_t6", "fe_gemv_t7", "fe_gemv_t8"];
+        let mut fs = [std::ptr::null_mut(); MAX_T];
+        for (i, n) in names.iter().enumerate() {
+            fs[i] = f(&gm, n)?;
+        }
+        let mut f8s = [std::ptr::null_mut(); MAX_T];
+        for (i, slot) in f8s.iter_mut().enumerate() {
+            *slot = f(&gm, ["fe_gemv8_t1", "fe_gemv8_t2", "fe_gemv8_t3", "fe_gemv8_t4", "fe_gemv8_t5", "fe_gemv8_t6", "fe_gemv8_t7", "fe_gemv8_t8"][i])?;
+        }
+        for &f8 in &f8s {
+            // Rows of up to ~12 KB staged per warp (Q8_0 at k = 6144 is 6.5 KB; 8 warps).
+            unsafe {
+                gpu::check(
+                    cudarc::driver::sys::cuFuncSetAttribute(
+                        f8,
+                        cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        99 * 1024,
+                    ),
+                    "cuFuncSetAttribute",
+                )
+                .map_err(|e| anyhow!("{e}"))?;
+            }
+        }
+        let xq8_buf = dev.alloc_f32(XQ8_BYTES / 4);
+        let nk = NativeK {
+            f: fs,
+            f8: f8s,
+            q8: f(&gm, "fe_q8")?,
+            xq8: dev.buffer_addr(&xq8_buf),
+            stream: dev.cu_stream(),
+        };
         let k = Kern {
+            m_embed: f(&gm, "fe_embed_q3k")?,
+            m_cat: f(&gm, "fe_mtp_cat")?,
+            m_prep: f(&gm, "fe_mtp_prep")?,
+            m_attn: f(&gm, "fe_mtp_attn")?,
+            m_moe: f(&gm, "fe_moe_rows")?,
+            m_amax1: f(&gm, "fe_amaxp1")?,
+            m_amax2: f(&gm, "fe_amaxp2")?,
+            m_next: f(&gm, "fe_mtp_next")?,
             embed: f(&m, "fe_embed")?,
             ple: f(&m, "fe_ple")?,
             silu_q: f(&m, "fe_silu_q")?,
@@ -706,24 +765,6 @@ impl Engine {
             _m: m,
             _db: db,
         };
-        let gm = gpu.module(kernels::GEMV_SRC).map_err(|e| anyhow!("{e}"))?;
-        let names = ["fe_gemv_t1", "fe_gemv_t2", "fe_gemv_t3", "fe_gemv_t4", "fe_gemv_t5", "fe_gemv_t6", "fe_gemv_t7", "fe_gemv_t8"];
-        let mut fs = [std::ptr::null_mut(); MAX_T];
-        for (i, n) in names.iter().enumerate() {
-            fs[i] = f(&gm, n)?;
-        }
-        let mut f8s = [std::ptr::null_mut(); MAX_T];
-        for (i, slot) in f8s.iter_mut().enumerate() {
-            *slot = f(&gm, ["fe_gemv8_t1", "fe_gemv8_t2", "fe_gemv8_t3", "fe_gemv8_t4", "fe_gemv8_t5", "fe_gemv8_t6", "fe_gemv8_t7", "fe_gemv8_t8"][i])?;
-        }
-        let xq8_buf = dev.alloc_f32(XQ8_BYTES / 4);
-        let nk = NativeK {
-            f: fs,
-            f8: f8s,
-            q8: f(&gm, "fe_q8")?,
-            xq8: dev.buffer_addr(&xq8_buf),
-            stream: dev.cu_stream(),
-        };
         let mb = Mailbox::new(&gpu).map_err(|e| anyhow!("{e}"))?;
         let mut io = Io {
             arena: HostArena::new(Io::BYTES, ArenaOptions { try_hugetlb: false, thp: false })?,
@@ -732,6 +773,25 @@ impl Engine {
             .register(&gpu.ctx, &[])
             .map_err(|e| anyhow!("{e}"))?;
         let stream = ManuallyDrop::new(Stream(dev.cu_stream()));
+
+        // ---- MTP (before sizing the expert slots, so its VRAM is accounted for)
+        let mtp_loaded = match &opts.mtp {
+            Some(p) => {
+                let t = Instant::now();
+                let (free_a, _) = gpu.mem_info().map_err(|e| anyhow!("{e}"))?;
+                let m = Mtp::load(&dev, &g, p, max_ctx, hp.n_vocab)?;
+                let (free_b, _) = gpu.mem_info().map_err(|e| anyhow!("{e}"))?;
+                eprintln!(
+                    "flash: MTP layer loaded in {:.1} s, {:.2} GB VRAM (experts {})",
+                    t.elapsed().as_secs_f64(),
+                    (free_a - free_b) as f64 / 1e9,
+                    if m.ex_ty == 8 { "Q8_0" } else { "Q4_0" }
+                );
+                Some(m)
+            }
+            None => None,
+        };
+        let mtp_reserve = if mtp_loaded.is_some() { 0 } else { opts.mtp_mb };
 
         // ---- experts
         let t2 = Instant::now();
@@ -744,7 +804,7 @@ impl Engine {
             }
             ExpertMode::Cache => {
                 let (free, _) = gpu.mem_info().map_err(|e| anyhow!("{e}"))?;
-                let budget = free.saturating_sub((opts.reserve_mb + opts.mtp_mb) << 20);
+                let budget = free.saturating_sub((opts.reserve_mb + mtp_reserve) << 20);
                 let fit = (budget / blob).saturating_sub(opts.scratch_slots);
                 let n_slots = opts.slots.unwrap_or(fit).min(fit).min(geo.keys());
                 let ranking = Self::ranking(opts.profile.as_deref(), hp.n_layer)?;
@@ -845,7 +905,14 @@ impl Engine {
             last: WinStats::default(),
             n_slots,
             load_report,
+            mtp: None,
+            last_mtp_ms: 0.0,
+            use_mtp: false,
+            mtp_last: Vec::new(),
         };
+        if let Some(m) = mtp_loaded {
+            eng.mtp = Some(Box::new(m));
+        }
         eng.sync_tables()?;
         eng.dev.sync();
         Ok(eng)
@@ -1742,6 +1809,12 @@ impl Engine {
             if let Some(cb) = logits_cb.as_deref_mut() {
                 cb(pos, t, &self.logits(t));
             }
+            if self.use_mtp && self.mtp.is_some() {
+                let next: Vec<u32> = (0..t)
+                    .map(|i| self.tokens.get(pos + i + 1).copied().unwrap_or(out[t - 1]))
+                    .collect();
+                self.mtp_last = self.mtp_draft(pos, &next)?;
+            }
             next = out[t - 1];
             pos += t;
         }
@@ -1758,17 +1831,23 @@ impl Engine {
         ensure!(t <= MAX_T, "{} drafts", drafts.len());
         self.tokens.push(cur);
         self.tokens.extend_from_slice(drafts);
-        if t == 1 {
-            return Ok(vec![self.window(pos, 1, None)?[0]]);
+        let kept = if t == 1 {
+            vec![self.window(pos, 1, None)?[0]]
+        } else {
+            let targets = self.window_mode(pos, t, true, None)?;
+            let mut n = 1;
+            while n < t && drafts[n - 1] == targets[n - 1] {
+                n += 1;
+            }
+            self.commit(t, n)?;
+            self.tokens.truncate(pos + n);
+            targets[..n].to_vec()
+        };
+        self.last_mtp_ms = 0.0;
+        if self.use_mtp && self.mtp.is_some() {
+            self.mtp_last = self.mtp_draft(pos, &kept)?;
         }
-        let targets = self.window_mode(pos, t, true, None)?;
-        let mut n = 1;
-        while n < t && drafts[n - 1] == targets[n - 1] {
-            n += 1;
-        }
-        self.commit(t, n)?;
-        self.tokens.truncate(pos + n);
-        Ok(targets[..n].to_vec())
+        Ok(kept)
     }
 
     /// Append `tok` and run it as a T=1 window; returns the greedy next token.
@@ -2074,5 +2153,371 @@ impl Engine {
             println!("gdn step y (token 7): {} of {GDN_V} differ", diff(&ya[7 * GDN_V..], &yb));
         }
         Ok(())
+    }
+}
+
+
+/// The MTP layer's weights and buffers ([`super::mtp_gpu`] for what it computes).
+struct Mtp {
+    eh: Dw,
+    enorm: B,
+    hnorm: B,
+    hc_a: Hc,
+    hc_f: Hc,
+    hc_head: Hc,
+    w_in: Dw,
+    qn: B,
+    kn: B,
+    w_out: Dw,
+    router: Dw,
+    sh_gu: Dw,
+    sh_down: Dw,
+    /// Routed experts: ggml type, the three [512 × rows × k] tensors, their row bytes.
+    ex_ty: i32,
+    ex: [B; 3],
+    ex_rb: [usize; 3],
+    /// The main model's token embedding (Q3_K) for the chain's draft tokens.
+    embed: B,
+    embed_rb: usize,
+    kc: B,
+    vc: B,
+    h: B,
+    toks: B,
+    /// One control record per step: [pos0, cells].
+    ctl: Vec<B>,
+    e: B,
+    cat: B,
+    r: B,
+    proj: B,
+    q: B,
+    attn: B,
+    gu: B,
+    hq: B,
+    hf: B,
+    logits: B,
+    amax: B,
+    drafts: Vec<B>,
+    probs: Vec<B>,
+    graphs: Vec<Option<Graph>>,
+}
+
+impl Mtp {
+    fn load(dev: &CudaComputeDevice, main: &Gguf, path: &Path, max_ctx: usize, vocab: usize) -> Result<Self> {
+        use super::mtp_gpu::{self as m, raw};
+        let (g, l) = m::open(path)?;
+        let t = |n: &str| g.info(&format!("blk.{l}.{n}"));
+        let native = |parts: &[(&str, usize)], rows_total: usize| -> Result<Dw> {
+            let mut bytes = Vec::new();
+            let mut words = Vec::new();
+            let mut meta = Vec::new();
+            for &(n, off) in parts {
+                let r = raw(&g, t(n)?)?;
+                while bytes.len() % 16 != 0 {
+                    bytes.push(0);
+                }
+                meta.push((bytes.len() as u64, r.ty, r.rows, r.rb, off));
+                bytes.extend_from_slice(&r.bytes);
+            }
+            let w = m::upload_padded(dev, &bytes);
+            let base = dev.buffer_addr(&w);
+            let mut seg_meta = Vec::new();
+            let mut rows = 0;
+            for (o, ty, r, rb, off) in meta {
+                let p = base + o;
+                words.extend_from_slice(&[p as u32, (p >> 32) as u32, ty as u32, r as u32, rb as u32, off as u32]);
+                seg_meta.push([ty, r as u64, rb as u64, 0, off as u64]);
+                rows += r;
+            }
+            ensure!(rows <= rows_total, "{parts:?}: {rows} rows > {rows_total}");
+            Ok(Dw::Native {
+                segs: dev.upload_u32(&words),
+                _w: w,
+                nseg: parts.len() as i32,
+                rows: rows_total,
+                row16: row16(&seg_meta),
+            })
+        };
+        let f32v = |n: &str| -> Result<B> { Ok(dev.upload_f32(&g.dequantize(t(n)?)?)) };
+        let hc = |pre: &str, inject: bool| -> Result<Hc> {
+            let up = m::bf16(&g, t(&format!("{pre}up.weight"))?)?;
+            Ok(Hc {
+                norm: f32v(&format!("{pre}norm.weight"))?,
+                down: dev.upload_bf16(&m::bf16(&g, t(&format!("{pre}down.weight"))?)?),
+                up: dev.upload_bf16(&fl::hc_up_repack(&up)),
+                inject: if inject {
+                    Some(dev.upload_bf16(&m::bf16(&g, t(&format!("{pre}inject.weight"))?)?))
+                } else {
+                    None
+                },
+            })
+        };
+        let q8 = std::env::var("TANG_FLASH_MTP_Q8").is_ok_and(|v| v == "1");
+        let mut ex: Vec<B> = Vec::new();
+        let mut ex_rb = [0usize; 3];
+        for (i, n) in ["ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"].iter().enumerate() {
+            let ti = t(n)?;
+            ensure!(ti.ty == GgmlType::Q8_0, "{n}: {:?} MTP experts (Q8_0 expected)", ti.ty);
+            let k = ti.row_len();
+            let b = if q8 { g.bytes(ti).to_vec() } else { m::q8_to_q4_0(g.bytes(ti))? };
+            ex_rb[i] = if q8 { k / 32 * 34 } else { k / 32 * 18 };
+            ex.push(m::upload_padded(dev, &b));
+        }
+        let emb_t = main.info("token_embd.weight")?;
+        ensure!(emb_t.ty == GgmlType::Q3K, "main embedding is {:?} (Q3_K expected)", emb_t.ty);
+        let z = |n: usize| dev.alloc_f32(n);
+        let pairs = MAX_T * TOPK;
+        Ok(Mtp {
+            eh: native(&[("nextn.eh_proj.weight", 0)], HIDDEN)?,
+            enorm: f32v("nextn.enorm.weight")?,
+            hnorm: f32v("nextn.hnorm.weight")?,
+            hc_a: hc("hc_attn_", true)?,
+            hc_f: hc("hc_ffn_", true)?,
+            hc_head: hc("nextn.hc_head_", false)?,
+            w_in: native(
+                &[
+                    ("attn_q.weight", 0),
+                    ("attn_k.weight", QSA_HEADS * 2 * QSA_D),
+                    ("attn_v.weight", QSA_HEADS * 2 * QSA_D + QSA_KV * QSA_D),
+                ],
+                super::mtp_gpu::MTP_PROJ,
+            )?,
+            qn: f32v("attn_q_norm.weight")?,
+            kn: f32v("attn_k_norm.weight")?,
+            w_out: native(&[("attn_output.weight", 0)], HIDDEN)?,
+            router: native(&[("ffn_gate_inp.weight", 0), ("ffn_gate_inp_shexp.weight", EXPERTS)], ROUTER_ROWS)?,
+            sh_gu: native(&[("ffn_gate_shexp.weight", 0), ("ffn_up_shexp.weight", FF)], 2 * FF)?,
+            sh_down: native(&[("ffn_down_shexp.weight", 0)], HIDDEN)?,
+            ex_ty: if q8 { 8 } else { 2 },
+            ex: [ex.remove(0), ex.remove(0), ex.remove(0)],
+            ex_rb,
+            embed: m::upload_padded(dev, main.bytes(emb_t)),
+            embed_rb: emb_t.row_bytes()?,
+            kc: z(max_ctx * QSA_KV * QSA_D),
+            vc: z(max_ctx * QSA_KV * QSA_D),
+            h: z(MAX_T * HC * HIDDEN),
+            toks: z(MAX_T),
+            ctl: (0..super::mtp_gpu::STEPS).map(|_| z(4)).collect(),
+            e: z(MAX_T * HIDDEN),
+            cat: z(MAX_T * HC * 2 * HIDDEN),
+            r: z(MAX_T * HC * HIDDEN),
+            proj: z(MAX_T * super::mtp_gpu::MTP_PROJ),
+            q: z(MAX_T * QSA_HEADS * QSA_D),
+            attn: z(MAX_T * QSA_OUT),
+            gu: z(pairs * 2 * FF),
+            hq: z(QAct { m: pairs, k: FF }.words()),
+            hf: z(pairs * FF),
+            logits: z(MAX_T * vocab),
+            amax: z(MAX_T * 64 * 3),
+            drafts: (0..super::mtp_gpu::STEPS).map(|_| z(MAX_T)).collect(),
+            probs: (0..super::mtp_gpu::STEPS).map(|_| z(MAX_T)).collect(),
+            graphs: (0..=MAX_T).map(|_| None).collect(),
+        })
+    }
+}
+
+impl Engine {
+    /// MTP cells for `c` = 1..=8 positions starting at the control record of step `step`.
+    fn enqueue_mtp_cells(&mut self, step: usize, c: usize) {
+        let dev = &self.dev;
+        let nk = self.nk;
+        let st = ManuallyDrop::new(Stream(nk.stream));
+        let mt = self.mtp.as_mut().expect("MTP loaded");
+        let s = &mut self.s;
+        let a = |b: &B| dev.buffer_addr(b);
+        let launch = |f: Fun, grid: (u32, u32, u32), block: u32, args: &mut [*mut std::ffi::c_void]| unsafe {
+            gpu::launch(f, grid, (block, 1, 1), 0, &st, args).expect("mtp launch")
+        };
+        let ctl = a(&mt.ctl[step]);
+        // embedding of the cells' tokens, then [e ; hn] per stream
+        {
+            let (tb, rb, tk, e, k) = (a(&mt.embed), mt.embed_rb as i32, a(&mt.toks), a(&mt.e), HIDDEN as i32);
+            launch(self.k.m_embed, (c as u32, 1, 1), 256, tang_moe::args![tb, rb, tk, e, k]);
+            let (en, h, hn, cat, eps) = (a(&mt.enorm), a(&mt.h), a(&mt.hnorm), a(&mt.cat), EPS);
+            launch(self.k.m_cat, ((c * HC) as u32, 1, 1), 256, tang_moe::args![e, en, h, hn, cat, eps]);
+        }
+        // R = eh_proj [e ; hn[c]], 4c rows of 5120, eight at a time
+        let rows = c * HC;
+        for r0 in (0..rows).step_by(MAX_T) {
+            let n = (rows - r0).min(MAX_T);
+            mt.eh.native_ptr(dev, &nk, a(&mt.cat) + (r0 * 2 * HIDDEN * 4) as u64, a(&mt.r) + (r0 * HIDDEN * 4) as u64, n, 2 * HIDDEN, HIDDEN);
+        }
+        dev.hc_read_into(&mut mt.r, None, &mt.hc_a.w(), &mut s.x, Some(&mut s.xq), Some(&mut s.inj_a), &mut s.hc, c, EPS);
+        let mp = super::mtp_gpu::MTP_PROJ;
+        mt.w_in.native_ptr(dev, &nk, a(&s.x), a(&mt.proj), c, HIDDEN, mp);
+        {
+            let (pr, stride, qn, kn, cs, sn, q, kc, vc, eps) =
+                (a(&mt.proj), mp as i32, a(&mt.qn), a(&mt.kn), a(&self.rope.0), a(&self.rope.1), a(&mt.q), a(&mt.kc), a(&mt.vc), EPS);
+            launch(self.k.m_prep, (c as u32, 26, 1), 256, tang_moe::args![pr, stride, qn, kn, cs, sn, ctl, q, kc, vc, eps]);
+            let out = a(&mt.attn);
+            launch(self.k.m_attn, (c as u32, QSA_HEADS as u32, 1), 256, tang_moe::args![q, kc, vc, pr, stride, ctl, out]);
+        }
+        mt.w_out.native_ptr(dev, &nk, a(&mt.attn), a(&s.mix), c, QSA_OUT, HIDDEN);
+        dev.hc_read_into(
+            &mut mt.r,
+            Some(HcPending::Write { y: &s.mix, inj: &s.inj_a }),
+            &mt.hc_f.w(),
+            &mut s.x2,
+            Some(&mut s.xq),
+            Some(&mut s.inj_f),
+            &mut s.hc,
+            c,
+            EPS,
+        );
+        mt.router.native_ptr(dev, &nk, a(&s.x2), a(&s.logits), c, HIDDEN, ROUTER_ROWS);
+        dev.router_topk_into(&s.logits, ROUTER_ROWS, EXPERTS, &mut s.ids, &mut s.w, c);
+        // routed experts: gate | up rows per (token, rank), SwiGLU, down rows into parts
+        {
+            let pairs = (c * TOPK) as u32;
+            let (ids, x2, gu, hf, hq, parts) = (a(&s.ids), a(&s.x2), a(&mt.gu), a(&mt.hf), a(&mt.hq), a(&s.parts));
+            let ty = mt.ex_ty;
+            for (i, ooff) in [(0usize, 0i32), (1, FF as i32)] {
+                let (base, es, rb, rows, xd, k, os) =
+                    (a(&mt.ex[i]), (FF * mt.ex_rb[i]) as u64, mt.ex_rb[i] as i32, FF as i32, TOPK as i32, HIDDEN as i32, (2 * FF) as i32);
+                launch(self.k.m_moe, ((FF / 8) as u32, pairs, 1), 256, tang_moe::args![ty, base, es, rb, rows, ids, x2, xd, k, gu, os, ooff]);
+            }
+            let (ff, np) = (FF as i32, pairs as i32);
+            launch(self.k.silu_q, ((FF / 32) as u32, pairs, 1), 32, tang_moe::args![gu, hq, hf, ff, np]);
+            let (base, es, rb, rows, xd, k, os, ooff) =
+                (a(&mt.ex[2]), (HIDDEN * mt.ex_rb[2]) as u64, mt.ex_rb[2] as i32, HIDDEN as i32, 1i32, FF as i32, HIDDEN as i32, 0i32);
+            launch(self.k.m_moe, ((HIDDEN / 8) as u32, pairs, 1), 256, tang_moe::args![ty, base, es, rb, rows, ids, hf, xd, k, parts, os, ooff]);
+        }
+        // shared expert into parts' shared rows
+        mt.sh_gu.native_ptr(dev, &nk, a(&s.x2), a(&s.gu), c, HIDDEN, 2 * FF);
+        {
+            let (gu, hq, hf, ff, ti) = (a(&s.gu), a(&s.hq), a(&s.hf), FF as i32, c as i32);
+            launch(self.k.silu_q, ((FF / 32) as u32, c as u32, 1), 32, tang_moe::args![gu, hq, hf, ff, ti]);
+        }
+        mt.sh_down.native_ptr(dev, &nk, a(&s.hf), a(&s.parts) + (MoePlan::SHARED_ROW * HIDDEN * 4) as u64, c, FF, HIDDEN);
+        dev.hc_read_into(
+            &mut mt.r,
+            Some(HcPending::Moe {
+                parts: &s.parts,
+                w: &s.w,
+                logits: &s.logits,
+                stride: ROUTER_ROWS,
+                sg: Some(EXPERTS),
+                inj: &s.inj_f,
+            }),
+            &mt.hc_head.w(),
+            &mut s.x,
+            Some(&mut s.xq),
+            None,
+            &mut s.hc,
+            c,
+            EPS,
+        );
+        let v = self.hp.n_vocab;
+        self.head.native_ptr(dev, &nk, a(&s.x), a(&mt.logits), c, HIDDEN, v);
+        {
+            let (lg, n, part, np, ids, pr) = (a(&mt.logits), v as i32, a(&mt.amax), 64i32, a(&mt.drafts[step]), a(&mt.probs[step]));
+            launch(self.k.m_amax1, (64, c as u32, 1), 1024, tang_moe::args![lg, n, part]);
+            launch(self.k.m_amax2, (c as u32, 1, 1), 32, tang_moe::args![part, np, ids, pr]);
+        }
+    }
+
+    /// The whole MTP pass for `c` teacher-forced cells (inputs staged in `Io::MTP_IN`): cells,
+    /// then two chain steps, then the drafts and probabilities to `Io::MTP_OUT`.
+    fn enqueue_mtp(&mut self, c: usize) {
+        let st = self.stream.0;
+        let mt = self.mtp.as_ref().expect("MTP loaded");
+        unsafe {
+            gpu::check(
+                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(self.dev.buffer_addr(&mt.toks), self.io.ptr(Io::MTP_IN) as *const _, 4 * MAX_T, st),
+                "mtp in",
+            )
+            .expect("copy");
+            gpu::check(
+                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(self.dev.buffer_addr(&mt.ctl[0]), self.io.ptr(Io::MTP_IN + 64) as *const _, 16, st),
+                "mtp ctl",
+            )
+            .expect("copy");
+            gpu::check(
+                cudarc::driver::sys::cuMemcpyDtoDAsync_v2(self.dev.buffer_addr(&mt.h), self.dev.buffer_addr(&self.s.r), c * HC * HIDDEN * 4, st),
+                "mtp h",
+            )
+            .expect("copy");
+        }
+        self.enqueue_mtp_cells(0, c);
+        for step in 1..super::mtp_gpu::STEPS {
+            {
+                let mt = self.mtp.as_ref().unwrap();
+                let a = |b: &B| self.dev.buffer_addr(b);
+                let (r, h, d, tk, cp, cn) = (a(&mt.r), a(&mt.h), a(&mt.drafts[step - 1]), a(&mt.toks), a(&mt.ctl[step - 1]), a(&mt.ctl[step]));
+                unsafe {
+                    gpu::launch(self.k.m_next, (20, 1, 1), (512, 1, 1), 0, &self.stream, tang_moe::args![r, h, d, tk, cp, cn]).expect("launch")
+                };
+            }
+            self.enqueue_mtp_cells(step, 1);
+        }
+        let mt = self.mtp.as_ref().unwrap();
+        for step in 0..super::mtp_gpu::STEPS {
+            unsafe {
+                gpu::check(
+                    cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
+                        self.io.ptr(Io::MTP_OUT + 64 * step) as *mut _,
+                        self.dev.buffer_addr(&mt.drafts[step]),
+                        4 * MAX_T,
+                        st,
+                    ),
+                    "mtp out",
+                )
+                .expect("copy");
+                gpu::check(
+                    cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
+                        self.io.ptr(Io::MTP_OUT + 64 * step + 32) as *mut _,
+                        self.dev.buffer_addr(&mt.probs[step]),
+                        4 * MAX_T,
+                        st,
+                    ),
+                    "mtp out",
+                )
+                .expect("copy");
+            }
+        }
+    }
+
+    pub fn has_mtp(&self) -> bool {
+        self.mtp.is_some()
+    }
+
+    /// Run the MTP over the `c` positions `pos0..pos0 + c` the last window kept (their final
+    /// residuals are still in the window's `r`), with `next[i]` the token after position
+    /// `pos0 + i`. Returns the chain's drafts and probabilities (3 each).
+    pub fn mtp_draft(&mut self, pos0: usize, next: &[u32]) -> Result<Vec<(u32, f32)>> {
+        let c = next.len();
+        ensure!((1..=MAX_T).contains(&c) && self.mtp.is_some());
+        let t0 = Instant::now();
+        let tk = self.io.u32s(Io::MTP_IN, MAX_T);
+        tk[..c].copy_from_slice(next);
+        let ctl = self.io.u32s(Io::MTP_IN + 64, 2);
+        ctl[0] = pos0 as u32;
+        ctl[1] = c as u32;
+        let ready = self.mtp.as_ref().unwrap().graphs[c].is_some();
+        if self.use_graphs && ready {
+            self.mtp.as_ref().unwrap().graphs[c].as_ref().unwrap().launch(&self.stream).map_err(|e| anyhow!("{e}"))?;
+        } else {
+            self.enqueue_mtp(c);
+        }
+        self.dev.sync();
+        let mut out = Vec::with_capacity(super::mtp_gpu::STEPS);
+        for step in 0..super::mtp_gpu::STEPS {
+            let idx = if step == 0 { c - 1 } else { 0 };
+            let d = self.io.u32s(Io::MTP_OUT + 64 * step, MAX_T)[idx];
+            let p = f32::from_bits(self.io.u32s(Io::MTP_OUT + 64 * step + 32, MAX_T)[idx]);
+            out.push((d, p));
+        }
+        self.last_mtp_ms = t0.elapsed().as_secs_f64() * 1e3;
+        if self.use_graphs && !ready {
+            let stream = ManuallyDrop::new(Stream(self.dev.cu_stream()));
+            let me = self as *mut Self;
+            let g = Graph::capture(&stream, |_| {
+                // SAFETY: `self` is not otherwise touched during capture.
+                unsafe { &mut *me }.enqueue_mtp(c);
+                Ok(())
+            })
+            .map_err(|e| anyhow!("capture MTP c={c}: {e}"))?;
+            self.mtp.as_mut().unwrap().graphs[c] = Some(g);
+        }
+        Ok(out)
     }
 }
