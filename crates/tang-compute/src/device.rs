@@ -1217,6 +1217,29 @@ pub trait ComputeDevice: Send {
         *out = self.upload_f32(&y);
     }
 
+    /// Upload a GGUF Q8_0 matrix `[n, k]` (blocks of fp16 `d` + 32 int8) repacked as Q8X
+    /// ([`crate::flash::q8x_repack`]) for [`q8x_linear_into`](Self::q8x_linear_into).
+    fn upload_q8x(&self, raw: &[u8], n: usize, k: usize) -> Self::Buffer {
+        self.upload_bytes(&crate::flash::q8x_repack(raw, n, k))
+    }
+
+    /// `out[m, n] = W · x̂` for a Q8X weight `[n, k]` and int8 activations (`m <= 8`): per half
+    /// chunk `fma(d_w · d_x, Σ w·q, acc)`; the order the halves are summed in is the backend's.
+    fn q8x_linear_into(
+        &self,
+        xq: &Self::Buffer,
+        w: &Self::Buffer,
+        out: &mut Self::Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        let (xq, w) = (self.download(xq), self.download(w));
+        let wb: Vec<u8> = w.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+        let y = crate::cpu::flash::q8x_linear(&crate::flash::u32s(&xq), &wb, m, k, n);
+        *out = self.upload_f32(&y);
+    }
+
     /// Hyper-connection read for a window of `t` tokens: `r` is `[t][HC][HIDDEN]`; writes
     /// `x [t][HIDDEN]`, `xq` (when given) the same as int8 activations
     /// (`QAct { m: t, k: HIDDEN }`), and, when `w.inject` is set, `inj [t][HC]`. A `pending`
@@ -1387,6 +1410,29 @@ pub trait ComputeDevice: Send {
             *yq = self.upload_u32(&q);
         }
         *y = self.upload_f32(&yv);
+    }
+
+    /// [`gdn_conv_into`](Self::gdn_conv_into) and [`gdn_step`](Self::gdn_step) in one step,
+    /// bitwise the two: the conv runs from `proj`'s qkv columns, the history `hist` (not
+    /// written) and `p.conv`. Run before [`gdn_conv_commit`](Self::gdn_conv_commit) in a commit,
+    /// as the conv needs the history the window started from.
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_conv_step(
+        &self,
+        state: &mut Self::Buffer,
+        proj: &Self::Buffer,
+        stride: usize,
+        hist: &Self::Buffer,
+        p: &crate::flash::GdnParams<'_, Self::Buffer>,
+        y: &mut Self::Buffer,
+        yq: Option<&mut Self::Buffer>,
+        t: usize,
+        mode: crate::flash::GdnMode<'_, Self::Buffer>,
+        eps: f32,
+    ) {
+        let mut h = self.alloc_f32(t * crate::flash::shape::GDN_CONV);
+        self.gdn_conv_into(proj, stride, hist, p.conv, &mut h, t, eps);
+        self.gdn_step(state, &h, proj, stride, p, y, yq, t, mode, eps);
     }
 
     /// MoE router for a window: `logits [t][stride]` (experts in columns `0..n_expert`); writes
@@ -1581,6 +1627,54 @@ pub trait ComputeDevice: Send {
         let iv = crate::cpu::flash::qsa_select(&sv, pos0, t, max_blocks);
         *scores = self.upload_f32(&sv);
         *ids = self.upload_u32(&iv);
+    }
+
+    /// [`qsa_select_into`](Self::qsa_select_into), and also the window's union of selected
+    /// blocks into `union` ([`crate::flash::qsa_union_words`]; zero it once at allocation) for
+    /// [`qsa_attend_union_into`](Self::qsa_attend_union_into). The default leaves `union`
+    /// alone (the default attention reads `ids`).
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_select_union_into(
+        &self,
+        pooled: &Self::Buffer,
+        q: &Self::Buffer,
+        win: &Self::Buffer,
+        scores: &mut Self::Buffer,
+        ids: &mut Self::Buffer,
+        _union: &mut Self::Buffer,
+        max_blocks: usize,
+        t: usize,
+    ) {
+        self.qsa_select_into(pooled, q, win, scores, ids, max_blocks, t);
+    }
+
+    /// [`qsa_attend_into`](Self::qsa_attend_into) computed over the window's union of
+    /// selections: every token still attends to exactly its own selected cells (cells it did
+    /// not select score −∞), but each key and value row is read once per window instead of
+    /// once per token. Same result up to fp32 summation order. The default runs
+    /// `qsa_attend_into` on `ids`. On mew (3090, 4K context) the CUDA version is slower than
+    /// per-token `qsa_attend_into` (T = 4: 2.15 vs 0.78 ms for 12 layers): concurrent per-token
+    /// blocks already share the rows through L2, and the union kernel walks the tokens serially.
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_attend_union_into(
+        &self,
+        q: &Self::Buffer,
+        k_cache: &Self::Buffer,
+        v_cache: &Self::Buffer,
+        ids: &Self::Buffer,
+        _union: &Self::Buffer,
+        _max_blocks: usize,
+        proj: &Self::Buffer,
+        stride: usize,
+        win: &Self::Buffer,
+        scratch: &mut Self::Buffer,
+        out: &mut Self::Buffer,
+        outq: Option<&mut Self::Buffer>,
+        t: usize,
+    ) {
+        self.qsa_attend_into(
+            q, k_cache, v_cache, ids, proj, stride, win, scratch, out, outq, t,
+        );
     }
 
     /// QSA attention over the selected cells with the sigmoid output gate (read from `proj`):

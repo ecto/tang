@@ -32,8 +32,8 @@ fn grid(g: (usize, usize, usize), threads: u32) -> LaunchConfig {
     }
 }
 
-const GEMV_FMTS: [&str; 3] = ["bf16_gemv", "q2_gemv", "q4x_gemv"];
-const GEMV_NAMES: [[&str; 8]; 3] = [
+const GEMV_FMTS: [&str; 4] = ["bf16_gemv", "q2_gemv", "q4x_gemv", "q8x_gemv"];
+const GEMV_NAMES: [[&str; 8]; 4] = [
     [
         "fl_bf16_gemv_t1",
         "fl_bf16_gemv_t2",
@@ -63,6 +63,16 @@ const GEMV_NAMES: [[&str; 8]; 3] = [
         "fl_q4x_gemv_t6",
         "fl_q4x_gemv_t7",
         "fl_q4x_gemv_t8",
+    ],
+    [
+        "fl_q8x_gemv_t1",
+        "fl_q8x_gemv_t2",
+        "fl_q8x_gemv_t3",
+        "fl_q8x_gemv_t4",
+        "fl_q8x_gemv_t5",
+        "fl_q8x_gemv_t6",
+        "fl_q8x_gemv_t7",
+        "fl_q8x_gemv_t8",
     ],
 ];
 
@@ -192,11 +202,14 @@ impl CudaComputeDevice {
         let epv = match name {
             "bf16_gemv" => 8,
             "q2_gemv" => 64,
+            "q8x_gemv" => 16,
             _ => 32,
         };
+        // Rows per warp, as the kernel picks it: 2 for one column, 4 for more.
+        let gr = if m == 1 { 2 } else { 4 };
         let mut ks = 1;
         while ks < 8
-            && n.div_ceil(4 * 8 / ks) < 2 * super::llm::sm_count()
+            && n.div_ceil(gr * 8 / ks) < 2 * super::llm::sm_count()
             && k / epv / (2 * ks) >= 32
         {
             ks *= 2;
@@ -214,7 +227,7 @@ impl CudaComputeDevice {
                 .arg(&ku)
                 .arg(&nu)
                 .arg(&ksu)
-                .launch(grid((n.div_ceil(4 * 8 / ks), 1, 1), 256))
+                .launch(grid((n.div_ceil(gr * 8 / ks), 1, 1), 256))
                 .unwrap();
         }
     }
@@ -249,6 +262,22 @@ impl CudaComputeDevice {
             "q4x_linear_into: weight size"
         );
         self.gemv_rows("q4x_gemv", None, Some(xq), w.f32_data(), out, m, k, n);
+    }
+
+    pub(super) fn q8x_linear_impl(
+        &self,
+        xq: &CudaBuffer,
+        w: &CudaBuffer,
+        out: &mut CudaBuffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        assert!(
+            w.len * 4 >= n * k + 2 * n * k / 32,
+            "q8x_linear_into: weight size"
+        );
+        self.gemv_rows("q8x_gemv", None, Some(xq), w.f32_data(), out, m, k, n);
     }
 
     pub(super) fn hc_write_impl(
@@ -588,6 +617,53 @@ impl CudaComputeDevice {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn gdn_conv_step_impl(
+        &self,
+        state: &mut CudaBuffer,
+        proj: &CudaBuffer,
+        stride: usize,
+        hist: &CudaBuffer,
+        p: &GdnParams<'_, CudaBuffer>,
+        y: &mut CudaBuffer,
+        yq: Option<&mut CudaBuffer>,
+        t: usize,
+        mode: GdnMode<'_, CudaBuffer>,
+        eps: f32,
+    ) {
+        assert!((1..=MAX_T).contains(&t));
+        let quant = yq.is_some() as u32;
+        let (win, commit) = match mode {
+            GdnMode::ReadOnly => (proj, 0u32),
+            GdnMode::Commit { win } => (win, 1u32),
+        };
+        let f = self.fl("fl_gdn_conv_step");
+        let (s, tu) = (stride as u32, t as u32);
+        unsafe {
+            let mut l = self.stream.launch_builder(&f);
+            l.arg(state.f32_data_mut())
+                .arg(proj.f32_data())
+                .arg(&s)
+                .arg(p.dt_bias.f32_data())
+                .arg(p.ssm_a.f32_data())
+                .arg(p.norm.f32_data())
+                .arg(y.f32_data_mut())
+                .arg(&tu)
+                .arg(win.f32_data())
+                .arg(&commit)
+                .arg(&eps);
+            match yq {
+                Some(q) => l.arg(q.f32_data_mut()),
+                None => l.arg(&NULL),
+            };
+            l.arg(&quant)
+                .arg(hist.f32_data())
+                .arg(p.conv.f32_data())
+                .launch(grid((GDN_HV, 1, 1), 512))
+                .unwrap();
+        }
+    }
+
     pub(super) fn router_topk_impl(
         &self,
         logits: &CudaBuffer,
@@ -690,8 +766,29 @@ impl CudaComputeDevice {
         assert!(
             scratch.len >= MoePlan::scratch_words() && parts.len >= MoePlan::PARTS_ROWS * HIDDEN
         );
+        const GU: [&str; 8] = [
+            "fl_moe_gu_t1",
+            "fl_moe_gu_t2",
+            "fl_moe_gu_t3",
+            "fl_moe_gu_t4",
+            "fl_moe_gu_t5",
+            "fl_moe_gu_t6",
+            "fl_moe_gu_t7",
+            "fl_moe_gu_t8",
+        ];
+        const DOWN: [&str; 8] = [
+            "fl_moe_down_t1",
+            "fl_moe_down_t2",
+            "fl_moe_down_t3",
+            "fl_moe_down_t4",
+            "fl_moe_down_t5",
+            "fl_moe_down_t6",
+            "fl_moe_down_t7",
+            "fl_moe_down_t8",
+        ];
+        // A group has at most t entries (an expert appears once per token; the shared group has t).
         let tu = t as u32;
-        let f = self.fl("fl_moe_gu");
+        let f = self.fl(GU[t - 1]);
         unsafe {
             self.stream
                 .launch_builder(&f)
@@ -699,10 +796,10 @@ impl CudaComputeDevice {
                 .arg(&tu)
                 .arg(plan.f32_data())
                 .arg(scratch.f32_data_mut())
-                .launch(grid((8 * super::llm::sm_count(), 1, 1), 256))
+                .launch(grid((16 * super::llm::sm_count(), 1, 1), 128))
                 .unwrap();
         }
-        let f = self.fl("fl_moe_down");
+        let f = self.fl(DOWN[t - 1]);
         unsafe {
             self.stream
                 .launch_builder(&f)
@@ -809,6 +906,7 @@ impl CudaComputeDevice {
                 .unwrap();
         }
         let f = self.fl("fl_qsa_select");
+        let mask = 0u32;
         unsafe {
             self.stream
                 .launch_builder(&f)
@@ -816,7 +914,135 @@ impl CudaComputeDevice {
                 .arg(win.f32_data())
                 .arg(ids.f32_data_mut())
                 .arg(&mb)
+                .arg(&NULL)
+                .arg(&mask)
                 .launch(grid((t, 1, 1), 1024))
+                .unwrap();
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn qsa_select_union_impl(
+        &self,
+        pooled: &CudaBuffer,
+        q: &CudaBuffer,
+        win: &CudaBuffer,
+        scores: &mut CudaBuffer,
+        ids: &mut CudaBuffer,
+        union: &mut CudaBuffer,
+        max_blocks: usize,
+        t: usize,
+    ) {
+        assert!(max_blocks <= 8192 && union.len >= crate::flash::qsa_union_words(max_blocks, t));
+        assert!(scores.len >= t * max_blocks && ids.len >= t * QSA_WIDTH);
+        let iq = q.f32_data().slice(t * QSA_HEADS * QSA_D..);
+        let mb = max_blocks as u32;
+        let f = self.fl("fl_qsa_scores");
+        unsafe {
+            self.stream
+                .launch_builder(&f)
+                .arg(pooled.f32_data())
+                .arg(&iq)
+                .arg(win.f32_data())
+                .arg(scores.f32_data_mut())
+                .arg(&mb)
+                .launch(grid((max_blocks.div_ceil(8), t, 1), 256))
+                .unwrap();
+        }
+        let cap = crate::flash::qsa_union_cap(t);
+        let (mut bm, mut rest) = union.f32_data_mut().split_at_mut(max_blocks);
+        let (mut ub, mut rest) = rest.split_at_mut(cap);
+        let (mut um, mut uc) = rest.split_at_mut(cap);
+        let f = self.fl("fl_qsa_select");
+        let mask = 1u32;
+        unsafe {
+            self.stream
+                .launch_builder(&f)
+                .arg(scores.f32_data())
+                .arg(win.f32_data())
+                .arg(ids.f32_data_mut())
+                .arg(&mb)
+                .arg(&mut bm)
+                .arg(&mask)
+                .launch(grid((t, 1, 1), 1024))
+                .unwrap();
+        }
+        let f = self.fl("fl_qsa_union");
+        let tu = t as u32;
+        unsafe {
+            self.stream
+                .launch_builder(&f)
+                .arg(&mut bm)
+                .arg(win.f32_data())
+                .arg(&tu)
+                .arg(&mut ub)
+                .arg(&mut um)
+                .arg(&mut uc)
+                .launch(grid((1, 1, 1), 1024))
+                .unwrap();
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn qsa_attend_union_impl(
+        &self,
+        q: &CudaBuffer,
+        k_cache: &CudaBuffer,
+        v_cache: &CudaBuffer,
+        union: &CudaBuffer,
+        max_blocks: usize,
+        proj: &CudaBuffer,
+        stride: usize,
+        win: &CudaBuffer,
+        scratch: &mut CudaBuffer,
+        out: &mut CudaBuffer,
+        outq: Option<&mut CudaBuffer>,
+        t: usize,
+    ) {
+        assert!(scratch.len >= crate::flash::qsa_union_scratch_words(t));
+        let cap = crate::flash::qsa_union_cap(t);
+        let nchu = cap.div_ceil(16);
+        let u = union.f32_data();
+        let (ub, um, uc) = (
+            u.slice(max_blocks..max_blocks + cap),
+            u.slice(max_blocks + cap..max_blocks + 2 * cap),
+            u.slice(max_blocks + 2 * cap..max_blocks + 2 * cap + 1),
+        );
+        let (tu, nu) = (t as u32, nchu as u32);
+        let f = self.fl("fl_qsa_attend_union");
+        unsafe {
+            self.stream
+                .launch_builder(&f)
+                .arg(q.f32_data())
+                .arg(k_cache.bf16_data())
+                .arg(v_cache.bf16_data())
+                .arg(&ub)
+                .arg(&um)
+                .arg(&uc)
+                .arg(win.f32_data())
+                .arg(scratch.f32_data_mut())
+                .arg(&tu)
+                .arg(&nu)
+                .launch(grid((nchu, QSA_KV, 1), 256))
+                .unwrap();
+        }
+        let f = self.fl("fl_qsa_union_merge");
+        let (s, quant) = (stride as u32, outq.is_some() as u32);
+        unsafe {
+            let mut l = self.stream.launch_builder(&f);
+            l.arg(scratch.f32_data())
+                .arg(proj.f32_data())
+                .arg(&s)
+                .arg(&uc)
+                .arg(out.f32_data_mut());
+            match outq {
+                Some(q) => l.arg(q.f32_data_mut()),
+                None => l.arg(&NULL),
+            };
+            l.arg(&quant)
+                .arg(&tu)
+                .arg(&nu)
+                .launch(grid((QSA_HEADS, t, 1), 256))
                 .unwrap();
         }
     }
@@ -1001,22 +1227,6 @@ mod tests {
         }
     }
 
-    /// Everything within `tol`, and at least `frac` of the values within `tight`.
-    fn close_mostly(got: &[f32], want: &[f32], tol: f32, tight: f32, frac: f32, what: &str) {
-        close(got, want, tol, what);
-        let scale = want.iter().map(|v| v.abs()).sum::<f32>() / want.len().max(1) as f32;
-        let ok = got
-            .iter()
-            .zip(want)
-            .filter(|(g, w)| (*g - *w).abs() <= tight * (scale + w.abs()))
-            .count();
-        let n = want.len();
-        assert!(
-            ok as f32 >= frac * n as f32,
-            "{what}: only {ok} of {n} within {tight}"
-        );
-    }
-
     fn same_bits(got: &[f32], want: &[f32], what: &str) {
         assert_eq!(got.len(), want.len(), "{what}: length");
         for (i, (g, w)) in got.iter().zip(want).enumerate() {
@@ -1025,7 +1235,7 @@ mod tests {
     }
 
     fn win<D: ComputeDevice>(d: &D, pos0: usize, n_keep: usize) -> D::Buffer {
-        d.upload_u32(&[pos0 as u32, n_keep as u32])
+        d.upload_u32(&[pos0 as u32, n_keep as u32, 0])
     }
 
     // ---- Q2 / int8 / dense GEMVs ----
@@ -1100,6 +1310,47 @@ mod tests {
                 );
                 let f32_path = c.download(&c.linear(&c.upload_f32(&x), &cq4, t, k, n));
                 close(&want, &f32_path, 2e-2, &format!("q4x vs f32 q4 t={t}"));
+            }
+        }
+    }
+
+    fn q8x_linear_vs_cpu<D: ComputeDevice>(g: &D) {
+        let c = CpuDevice::new();
+        let mut rng = Rng(0x88);
+        for &(k, n) in &[(2560, 300), (6144, 129), (10240, 40)] {
+            let mut raw = Vec::with_capacity(n * k / 32 * fl::Q8_BLOCK_BYTES);
+            for _ in 0..n * k / 32 {
+                raw.extend(fl::f32_to_f16(0.001 + 0.002 * (rng.f(1.0) + 1.0)).to_le_bytes());
+                raw.extend((0..32).map(|_| rng.u() as u8));
+            }
+            let (gw, cw) = (g.upload_q8x(&raw, n, k), c.upload_q8x(&raw, n, k));
+            for t in TS {
+                let x = rng.vec(t * k, 2.0);
+                let qa = QAct { m: t, k };
+                let (mut gq, mut cq) = (g.alloc_f32(qa.words()), c.alloc_f32(qa.words()));
+                g.quantize_act_into(&g.upload_f32(&x), &mut gq, t, k);
+                c.quantize_act_into(&c.upload_f32(&x), &mut cq, t, k);
+                let (mut gy, mut cy) = (g.alloc_f32(t * n), c.alloc_f32(t * n));
+                g.q8x_linear_into(&gq, &gw, &mut gy, t, k, n);
+                c.q8x_linear_into(&cq, &cw, &mut cy, t, k, n);
+                let want = c.download(&cy);
+                close(
+                    &g.download(&gy),
+                    &want,
+                    1e-5,
+                    &format!("q8x linear t={t} {k}->{n}"),
+                );
+                // Against the dequantized weights and the f32 activations: int8 rounding only.
+                let mut deq = vec![0f32; n * k];
+                for (b, blk) in raw.chunks(fl::Q8_BLOCK_BYTES).enumerate() {
+                    let d = fl::f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+                    for i in 0..32 {
+                        deq[b * 32 + i] = d * blk[2 + i] as i8 as f32;
+                    }
+                }
+                let f32_path =
+                    c.download(&c.linear(&c.upload_f32(&x), &c.upload_f32(&deq), t, k, n));
+                close(&want, &f32_path, 2e-2, &format!("q8x vs f32 t={t}"));
             }
         }
     }
@@ -1335,6 +1586,21 @@ mod tests {
         let mut q = d.alloc_f32(QAct { m: t, k: GDN_V }.words());
         d.quantize_act_into(&y, &mut q, t, GDN_V);
         same_bits(&d.download(&yq), &d.download(&q), "gdn fused int8 output");
+        // Conv and step in one launch: bitwise the two.
+        let mut yf = d.alloc_f32(t * GDN_V);
+        d.gdn_conv_step(
+            &mut state,
+            &proj,
+            GDN_PROJ,
+            &hist,
+            &p,
+            &mut yf,
+            None,
+            t,
+            GdnMode::ReadOnly,
+            1e-6,
+        );
+        same_bits(&d.download(&yf), &d.download(&y), "gdn conv+step fused");
         let unchanged = d.download(&state);
         same_bits(&unchanged, &cs.state, "readonly leaves the state");
         let w = win(d, 0, n_keep);
@@ -1655,8 +1921,10 @@ mod tests {
                 // h is requantized to int8 between gate/up and down, so a summation-order
                 // difference can move one code by 1 at a rounding tie: a few outputs may move by
                 // d_h · w; nearly all agree to fp32 noise.
+                // The expert order is pinned (ExpertBlob::ORDER): GPU rows are the reference's
+                // bit for bit, so a CPU-served miss and a VRAM hit agree exactly.
                 let what = format!("moe parts t={t} shared={shared}");
-                close_mostly(&gotp.0, &wantp.0, 1e-2, 1e-5, 0.98, &what);
+                same_bits(&gotp.0, &wantp.0, &what);
                 // Combine on the same parts.
                 let mut cy = c.alloc_f32(t * HIDDEN);
                 let ls = EXPERTS + 1;
@@ -1805,7 +2073,7 @@ mod tests {
                         &want.0[tt * max_blocks..tt * max_blocks + nb],
                         &format!("qsa scores t={t} pos0={pos0} row {tt}"),
                     );
-                    let w = n_kv.min(QSA_WIDTH);
+                    let w = crate::cpu::flash::qsa_n_sel(n_kv);
                     assert_eq!(
                         u32s(&got.1[tt * QSA_WIDTH..tt * QSA_WIDTH + w]),
                         u32s(&want.1[tt * QSA_WIDTH..tt * QSA_WIDTH + w]),
@@ -1840,7 +2108,7 @@ mod tests {
                 let mut ids = vec![0u32; t * QSA_WIDTH];
                 for tt in 0..t {
                     let n_kv = pos0 + tt + 1;
-                    let w = n_kv.min(QSA_WIDTH);
+                    let w = crate::cpu::flash::qsa_n_sel(n_kv);
                     let mut cells: Vec<u32> = (0..n_kv as u32).collect();
                     while cells.len() > w {
                         let i = (rng.u() as usize) % cells.len();
@@ -1894,6 +2162,95 @@ mod tests {
         }
     }
 
+    fn qsa_union_vs_cpu<D: ComputeDevice>(g: &D) {
+        let c = CpuDevice::new();
+        let mut rng = Rng(67);
+        let (max_ctx, max_blocks) = (4096, 1024);
+        let to_bits =
+            |v: &[f32]| -> Vec<u16> { v.iter().map(|x| (x.to_bits() >> 16) as u16).collect() };
+        let kv: Vec<f32> = rng
+            .vec(max_ctx * QSA_KV * QSA_D, 1.0)
+            .iter()
+            .map(|&v| fl::bf16_round(v))
+            .collect();
+        let vv: Vec<f32> = rng
+            .vec(max_ctx * QSA_KV * QSA_D, 1.0)
+            .iter()
+            .map(|&v| fl::bf16_round(v))
+            .collect();
+        let pooled = rng.vec(max_blocks * IDX_D, 1.0);
+        let (gk, gv, gp) = (
+            g.upload_bf16(&to_bits(&kv)),
+            g.upload_bf16(&to_bits(&vv)),
+            g.upload_f32(&pooled),
+        );
+        let mut un = g.alloc_f32(fl::qsa_union_words(max_blocks, 8));
+        for t in TS {
+            let q = rng.vec(fl::qsa_q_words(t), 1.0);
+            let proj = rng.vec(t * QSA_PROJ, 2.0);
+            for &pos0 in &[0usize, 61, 2047, 2049, 3001, 4095 - t] {
+                let w = win(g, pos0, 0);
+                let gq = g.upload_f32(&q);
+                let (mut sc, mut ids) = (g.alloc_f32(t * max_blocks), g.alloc_f32(t * QSA_WIDTH));
+                g.qsa_select_union_into(&gp, &gq, &w, &mut sc, &mut ids, &mut un, max_blocks, t);
+                let mut s = g.alloc_f32(fl::qsa_union_scratch_words(t));
+                let (mut out, mut oq) = (
+                    g.alloc_f32(t * QSA_OUT),
+                    g.alloc_f32(QAct { m: t, k: QSA_OUT }.words()),
+                );
+                let gpr = g.upload_f32(&proj);
+                g.qsa_attend_union_into(
+                    &gq,
+                    &gk,
+                    &gv,
+                    &ids,
+                    &un,
+                    max_blocks,
+                    &gpr,
+                    QSA_PROJ,
+                    &w,
+                    &mut s,
+                    &mut out,
+                    Some(&mut oq),
+                    t,
+                );
+                let mut co = c.alloc_f32(t * QSA_OUT);
+                let mut cs = c.alloc_f32(1);
+                let cw = win(&c, pos0, 0);
+                let (cq, ck, cv, ci, cp) = (
+                    c.upload_f32(&q),
+                    c.upload_f32(&kv),
+                    c.upload_f32(&vv),
+                    c.upload_f32(&g.download(&ids)),
+                    c.upload_f32(&proj),
+                );
+                c.qsa_attend_into(
+                    &cq, &ck, &cv, &ci, &cp, QSA_PROJ, &cw, &mut cs, &mut co, None, t,
+                );
+                close(
+                    &g.download(&out),
+                    &c.download(&co),
+                    1e-4,
+                    &format!("qsa union attend t={t} pos0={pos0}"),
+                );
+                let mut qq = g.alloc_f32(QAct { m: t, k: QSA_OUT }.words());
+                g.quantize_act_into(&out, &mut qq, t, QSA_OUT);
+                same_bits(&g.download(&oq), &g.download(&qq), "qsa union int8 output");
+            }
+        }
+        // The mask region is left clear for the next use.
+        let left = g.download(&un);
+        assert!(
+            left[..max_blocks].iter().all(|v| v.to_bits() == 0),
+            "union masks not cleared"
+        );
+    }
+
+    #[test]
+    fn cuda_qsa_union_vs_cpu() {
+        on_gpu(qsa_union_vs_cpu::<CudaComputeDevice>);
+    }
+
     #[test]
     fn cuda_q2_linear_vs_cpu() {
         on_gpu(q2_linear_vs_cpu::<CudaComputeDevice>);
@@ -1902,6 +2259,11 @@ mod tests {
     #[test]
     fn cuda_q4x_linear_vs_cpu() {
         on_gpu(q4x_linear_vs_cpu::<CudaComputeDevice>);
+    }
+
+    #[test]
+    fn cuda_q8x_linear_vs_cpu() {
+        on_gpu(q8x_linear_vs_cpu::<CudaComputeDevice>);
     }
 
     #[test]

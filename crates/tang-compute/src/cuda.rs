@@ -4126,6 +4126,18 @@ impl ComputeDevice for CudaComputeDevice {
         self.q2_linear_impl(xq, w, out, m, k, n)
     }
 
+    fn q8x_linear_into(
+        &self,
+        xq: &CudaBuffer,
+        w: &CudaBuffer,
+        out: &mut CudaBuffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        self.q8x_linear_impl(xq, w, out, m, k, n)
+    }
+
     fn q4x_linear_into(
         &self,
         xq: &CudaBuffer,
@@ -4195,6 +4207,22 @@ impl ComputeDevice for CudaComputeDevice {
         eps: f32,
     ) {
         self.gdn_step_impl(state, h, proj, stride, p, y, yq, t, mode, eps)
+    }
+
+    fn gdn_conv_step(
+        &self,
+        state: &mut CudaBuffer,
+        proj: &CudaBuffer,
+        stride: usize,
+        hist: &CudaBuffer,
+        p: &crate::flash::GdnParams<'_, CudaBuffer>,
+        y: &mut CudaBuffer,
+        yq: Option<&mut CudaBuffer>,
+        t: usize,
+        mode: crate::flash::GdnMode<'_, CudaBuffer>,
+        eps: f32,
+    ) {
+        self.gdn_conv_step_impl(state, proj, stride, hist, p, y, yq, t, mode, eps)
     }
 
     fn router_topk_into(
@@ -4288,6 +4316,41 @@ impl ComputeDevice for CudaComputeDevice {
         t: usize,
     ) {
         self.qsa_select_impl(pooled, q, win, scores, ids, max_blocks, t)
+    }
+
+    fn qsa_select_union_into(
+        &self,
+        pooled: &CudaBuffer,
+        q: &CudaBuffer,
+        win: &CudaBuffer,
+        scores: &mut CudaBuffer,
+        ids: &mut CudaBuffer,
+        union: &mut CudaBuffer,
+        max_blocks: usize,
+        t: usize,
+    ) {
+        self.qsa_select_union_impl(pooled, q, win, scores, ids, union, max_blocks, t)
+    }
+
+    fn qsa_attend_union_into(
+        &self,
+        q: &CudaBuffer,
+        k_cache: &CudaBuffer,
+        v_cache: &CudaBuffer,
+        _ids: &CudaBuffer,
+        union: &CudaBuffer,
+        max_blocks: usize,
+        proj: &CudaBuffer,
+        stride: usize,
+        win: &CudaBuffer,
+        scratch: &mut CudaBuffer,
+        out: &mut CudaBuffer,
+        outq: Option<&mut CudaBuffer>,
+        t: usize,
+    ) {
+        self.qsa_attend_union_impl(
+            q, k_cache, v_cache, union, max_blocks, proj, stride, win, scratch, out, outq, t,
+        )
     }
 
     fn qsa_attend_into(
