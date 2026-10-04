@@ -72,7 +72,7 @@ pub mod shape {
     pub const IDX_D: usize = 128;
     /// Cells pooled per indexer block.
     pub const IDX_BLOCK: usize = 4;
-    /// Cells selected per query: 2048 + the incomplete tail's 3.
+    /// Capacity of a token's selection: 512 blocks + the incomplete tail's up to 3 cells.
     pub const QSA_WIDTH: usize = 2051;
     /// Offsets in a QSA layer's stacked input projection row ([`QSA_PROJ`] wide):
     /// `[q|gate per head (24 × 512, q first) | k 512 | v 512 | idx q 512 | idx k 128]`.
@@ -589,17 +589,20 @@ pub fn qsa_q_words(t: usize) -> usize {
     t * (QSA_HEADS * QSA_D + IDX_HEADS * IDX_D)
 }
 
-/// Selection: ids `[t][QSA_WIDTH]` (u32 cells, ascending); token `i` selects
-/// `min(n_kv, QSA_WIDTH)` of them, `n_kv = pos0 + i + 1`.
+/// Selection (llama.cpp's, verified on the real file by the truth track): ids `[t][QSA_WIDTH]`
+/// (u32 cells, ascending); token `i` (`n_kv = pos0 + i + 1`) selects `qsa_n_sel(n_kv)` cells.
 ///
-/// When `n_kv <= QSA_WIDTH` it is every cell. Otherwise: block `b < n_kv / 4` scores
-/// `Σ_h relu(iq_h · pooled_b)` (heads summed in order; each dot is 32 lanes of 4-dim fma chains
-/// reduced by an xor butterfly, which the reference reproduces), each cell takes its block's
-/// score, the incomplete tail's cells score +∞, and the top `QSA_WIDTH` cells by (score desc,
-/// cell asc) are returned ascending.
+/// Block `b < n_kv / 4` (complete blocks only) scores `(Σ_h relu(iq_h · pooled_b)) / √128`
+/// (heads summed in order; each dot is 32 lanes of 4-dim fma chains reduced by an xor
+/// butterfly, which the reference reproduces). While there are at most [`QSA_BLOCKS`] complete
+/// blocks every cell is selected; from `n_kv = 2052` on, the top 512 blocks by (score desc,
+/// block asc) are kept, plus the incomplete tail's 0–3 cells, all returned ascending.
 pub fn qsa_score_blocks(max_ctx: usize) -> usize {
     max_ctx / IDX_BLOCK
 }
+
+/// Complete indexer blocks a token keeps (top_k / 4).
+pub const QSA_BLOCKS: usize = 512;
 
 /// Selected cells per attention chunk (the split-K unit of `qsa_attend_into`).
 pub const QSA_CHUNK: usize = 64;

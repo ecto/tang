@@ -291,7 +291,7 @@ pub(crate) fn gdn_conv_commit(hist: &mut [f32], proj: &[f32], stride: usize, n: 
 }
 
 /// 1 / sqrt(128) as f32.
-pub(crate) const INV_SQRT_D: f32 = 0.088_388_35;
+pub(crate) const INV_SQRT_D: f32 = f32::from_bits(0x3db5_04f3);
 
 /// The GDN recurrence (see [`crate::flash::GDN_STATE`]) for the first `n_run` tokens; writes the
 /// state back when `write`. Returns `y [t][GDN_V]` (rows past `n_run` are zero).
@@ -712,7 +712,7 @@ pub(crate) fn qsa_scores(
                 let s = butterfly(lanes);
                 total += if s > 0.0 { s } else { 0.0 };
             }
-            scores[tt * max_blocks + b] = total;
+            scores[tt * max_blocks + b] = total * INV_SQRT_D;
         }
     }
 }
@@ -727,35 +727,37 @@ pub(crate) fn ordered(x: f32) -> u32 {
     }
 }
 
+/// Cells a token selects: every cell while it sees at most 512 complete blocks, else the 512
+/// selected blocks' 2048 cells plus the incomplete tail's.
+pub(crate) fn qsa_n_sel(n_kv: usize) -> usize {
+    if n_kv / IDX_BLOCK <= crate::flash::QSA_BLOCKS {
+        n_kv
+    } else {
+        IDX_BLOCK * crate::flash::QSA_BLOCKS + n_kv % IDX_BLOCK
+    }
+}
+
 /// Selected cells per the contract on [`crate::flash::qsa_score_blocks`]: ids `[t][QSA_WIDTH]`.
 pub(crate) fn qsa_select(scores: &[f32], pos0: usize, t: usize, max_blocks: usize) -> Vec<u32> {
     let mut ids = vec![0u32; t * QSA_WIDTH];
     for tt in 0..t {
         let n_kv = pos0 + tt + 1;
         let out = &mut ids[tt * QSA_WIDTH..(tt + 1) * QSA_WIDTH];
-        if n_kv <= QSA_WIDTH {
+        let n_bid = n_kv / IDX_BLOCK;
+        if n_bid <= crate::flash::QSA_BLOCKS {
             for (i, o) in out.iter_mut().take(n_kv).enumerate() {
                 *o = i as u32;
             }
             continue;
         }
-        let (n_bid, tail) = (n_kv / IDX_BLOCK, n_kv % IDX_BLOCK);
         let s = &scores[tt * max_blocks..tt * max_blocks + n_bid];
         let mut order: Vec<usize> = (0..n_bid).collect();
         order.sort_by(|&a, &b| ordered(s[b]).cmp(&ordered(s[a])).then(a.cmp(&b)));
-        let mut cnt = vec![0usize; n_bid];
-        let mut left = QSA_WIDTH - tail;
-        for &b in &order {
-            if left == 0 {
-                break;
-            }
-            let take = left.min(IDX_BLOCK);
-            cnt[b] = take;
-            left -= take;
-        }
+        let mut keep: Vec<usize> = order[..crate::flash::QSA_BLOCKS].to_vec();
+        keep.sort_unstable();
         let mut i = 0;
-        for (b, &c) in cnt.iter().enumerate() {
-            for j in 0..c {
+        for b in keep {
+            for j in 0..IDX_BLOCK {
                 out[i] = (b * IDX_BLOCK + j) as u32;
                 i += 1;
             }
@@ -764,7 +766,7 @@ pub(crate) fn qsa_select(scores: &[f32], pos0: usize, t: usize, max_blocks: usiz
             out[i] = c as u32;
             i += 1;
         }
-        debug_assert_eq!(i, QSA_WIDTH);
+        debug_assert_eq!(i, qsa_n_sel(n_kv));
     }
     ids
 }
@@ -784,7 +786,7 @@ pub(crate) fn qsa_attend(
 ) -> Vec<f32> {
     let mut out = vec![0f32; t * QSA_OUT];
     for tt in 0..t {
-        let n_sel = (pos0 + tt + 1).min(QSA_WIDTH);
+        let n_sel = qsa_n_sel(pos0 + tt + 1);
         let cells = &ids[tt * QSA_WIDTH..tt * QSA_WIDTH + n_sel];
         for h in 0..QSA_HEADS {
             let g = h / (QSA_HEADS / QSA_KV);
@@ -953,8 +955,16 @@ mod tests {
         assert!(ids[..100].iter().enumerate().all(|(i, &c)| c == i as u32));
         let pos0 = 3001; // n_kv 3002: tail of 2 cells
         let ids = qsa_select(&scores, pos0, 1, max_blocks);
+        let ids = &ids[..qsa_n_sel(3002)];
+        assert_eq!(ids.len(), 2050);
         assert!(ids.windows(2).all(|w| w[0] < w[1]));
-        assert_eq!(&ids[QSA_WIDTH - 2..], &[3000, 3001]);
+        assert_eq!(&ids[2048..], &[3000, 3001]);
+        // n_kv = 2052: 513 complete blocks, no tail: 512 whole blocks, no partial one.
+        let ids2 = qsa_select(&scores, 2051, 1, max_blocks);
+        assert_eq!(qsa_n_sel(2052), 2048);
+        assert!(ids2[..2048]
+            .chunks(4)
+            .all(|c| c[0] % 4 == 0 && c[3] == c[0] + 3));
         // The best block is in, the worst is out.
         let n_bid = 3002 / 4;
         let best = (0..n_bid)

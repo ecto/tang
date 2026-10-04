@@ -1783,7 +1783,7 @@ mod tests {
                         &want.0[tt * max_blocks..tt * max_blocks + nb],
                         &format!("qsa scores t={t} pos0={pos0} row {tt}"),
                     );
-                    let w = n_kv.min(QSA_WIDTH);
+                    let w = crate::cpu::flash::qsa_n_sel(n_kv);
                     assert_eq!(
                         u32s(&got.1[tt * QSA_WIDTH..tt * QSA_WIDTH + w]),
                         u32s(&want.1[tt * QSA_WIDTH..tt * QSA_WIDTH + w]),
@@ -1818,7 +1818,7 @@ mod tests {
                 let mut ids = vec![0u32; t * QSA_WIDTH];
                 for tt in 0..t {
                     let n_kv = pos0 + tt + 1;
-                    let w = n_kv.min(QSA_WIDTH);
+                    let w = crate::cpu::flash::qsa_n_sel(n_kv);
                     let mut cells: Vec<u32> = (0..n_kv as u32).collect();
                     while cells.len() > w {
                         let i = (rng.u() as usize) % cells.len();

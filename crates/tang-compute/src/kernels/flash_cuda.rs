@@ -44,7 +44,7 @@ typedef unsigned long long u64;
 #define GU_SCALES 819200
 #define DOWN_CODES 921600
 #define DOWN_SCALES 1331200
-#define INV_SQRT_D 0.088388346f
+#define INV_SQRT_D __int_as_float(0x3db504f3)
 
 __device__ __forceinline__ float bf(unsigned short b) { return __uint_as_float(((unsigned int)b) << 16); }
 __device__ __forceinline__ unsigned short to_bf16(float x) {
@@ -1268,7 +1268,7 @@ extern "C" __global__ void fl_qsa_scores(const float* __restrict__ POOLED, const
         a = warp_sum(a);
         total += a > 0.0f ? a : 0.0f;
     }
-    if (lane == 0) SC[(u64)t * MAXB + b] = total;
+    if (lane == 0) SC[(u64)t * MAXB + b] = total * INV_SQRT_D;
 }
 
 __device__ __forceinline__ unsigned int ordered(float x) {
@@ -1301,6 +1301,11 @@ __device__ unsigned int block_scan(unsigned int v, unsigned int* sc) {
 }
 
 #define SEL_MAXB 8192
+#define SEL_BLOCKS 512
+// Cells token t selects: every cell up to 512 complete blocks, else 512 blocks plus the tail.
+__device__ __forceinline__ unsigned int qsa_n_sel(unsigned int n_kv) {
+    return n_kv / 4 <= SEL_BLOCKS ? n_kv : 4 * SEL_BLOCKS + n_kv % 4;
+}
 // Top cells per token. Grid T, block 1024.
 extern "C" __global__ void __launch_bounds__(1024) fl_qsa_select(
     const float* __restrict__ SC, const unsigned int* __restrict__ win, unsigned int* __restrict__ IDS,
@@ -1312,12 +1317,13 @@ extern "C" __global__ void __launch_bounds__(1024) fl_qsa_select(
     unsigned int t = blockIdx.x, tid = threadIdx.x;
     unsigned int n_kv = win[0] + t + 1;
     unsigned int* out = IDS + (u64)t * QSA_WIDTH;
-    if (n_kv <= QSA_WIDTH) {
+    unsigned int n_bid = n_kv / 4, tail = n_kv % 4;
+    if (n_bid <= SEL_BLOCKS) {
         for (unsigned int i = tid; i < n_kv; i += 1024) out[i] = i;
         return;
     }
-    unsigned int n_bid = n_kv / 4, tail = n_kv % 4;
-    unsigned int R = QSA_WIDTH - tail, full = R / 4, rem = R % 4, need = full + (rem > 0);
+    // The top 512 complete blocks by (score desc, block asc), then the tail's cells.
+    const unsigned int need = SEL_BLOCKS, rem = 0;
     for (unsigned int b = tid; b < n_bid; b += 1024) keys[b] = ordered(SC[(u64)t * MAXB + b]);
     __syncthreads();
     unsigned int prefix = 0, pmask = 0, k = need;
@@ -1382,7 +1388,7 @@ extern "C" __global__ void __launch_bounds__(1024) fl_qsa_select(
         for (unsigned int i = 0; i < c; i++) out[off++] = b * 4 + i;
     }
     if (tid == 0)
-        for (unsigned int i = 0; i < tail; i++) out[QSA_WIDTH - tail + i] = n_bid * 4 + i;
+        for (unsigned int i = 0; i < tail; i++) out[4 * SEL_BLOCKS + i] = n_bid * 4 + i;
 }
 
 // Split-K attention: grid (QSA_NCH, QSA_KV, T), block 256. A block reads its chunk of
@@ -1398,7 +1404,7 @@ extern "C" __global__ void __launch_bounds__(256) fl_qsa_attend(
     __shared__ __align__(8) float half[12][256];
     unsigned int ch = blockIdx.x, g = blockIdx.y, t = blockIdx.z, tid = threadIdx.x;
     unsigned int lane = tid & 31, warp = tid >> 5;
-    unsigned int n_sel = min(win[0] + t + 1, (unsigned int)QSA_WIDTH);
+    unsigned int n_sel = qsa_n_sel(win[0] + t + 1);
     unsigned int i0 = ch * QSA_CHUNK;
     if (i0 >= n_sel) return;
     unsigned int n = min((unsigned int)QSA_CHUNK, n_sel - i0);
@@ -1483,7 +1489,7 @@ extern "C" __global__ void fl_qsa_merge(const float* __restrict__ PART, const fl
     __shared__ float f[QSA_NCH];
     __shared__ float sL;
     unsigned int h = blockIdx.x, t = blockIdx.y, j = threadIdx.x;
-    unsigned int n_sel = min(win[0] + t + 1, (unsigned int)QSA_WIDTH);
+    unsigned int n_sel = qsa_n_sel(win[0] + t + 1);
     unsigned int nch = (n_sel + QSA_CHUNK - 1) / QSA_CHUNK;
     const float* part = PART + ((u64)t * QSA_HEADS + h) * QSA_NCH * (QSA_D + 2);
     if (j < 32) {
