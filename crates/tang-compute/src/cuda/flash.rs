@@ -439,7 +439,8 @@ impl CudaComputeDevice {
         eps: f32,
     ) {
         assert!((1..=MAX_T).contains(&t) && scratch.len >= crate::flash::hc_scratch_words(t));
-        if !unfused() {
+        // The q8 weights have only the fused kernel.
+        if !unfused() || w.q8 {
             return self.hc_fused_impl(r, pending, w, x, xq, inj, scratch, t, eps);
         }
         let xn_len = t * HC * HIDDEN;
@@ -560,7 +561,17 @@ impl CudaComputeDevice {
             "fl_hc_fused_t7",
             "fl_hc_fused_t8",
         ];
-        let f = self.fl(NAMES[t - 1]);
+        const Q8: [&str; 8] = [
+            "fl_hc_fused_q8_t1",
+            "fl_hc_fused_q8_t2",
+            "fl_hc_fused_q8_t3",
+            "fl_hc_fused_q8_t4",
+            "fl_hc_fused_q8_t5",
+            "fl_hc_fused_q8_t6",
+            "fl_hc_fused_q8_t7",
+            "fl_hc_fused_q8_t8",
+        ];
+        let f = self.fl(if w.q8 { Q8[t - 1] } else { NAMES[t - 1] });
         let blocks = self.coresident(&f, 512, 2);
         let (mut xn, mut lo) = scratch.f32_data_mut().split_at_mut(t * HC * HIDDEN);
         let any = w.norm;
@@ -602,12 +613,19 @@ impl CudaComputeDevice {
                 .arg(wr.f32_data())
                 .arg(lg.f32_data())
                 .arg(&su)
-                .arg(&sg)
-                .arg(w.down.bf16_data())
-                .arg(wi.bf16_data())
-                .arg(&rows)
-                .arg(w.up.bf16_data())
-                .arg(x.f32_data_mut());
+                .arg(&sg);
+            if w.q8 {
+                l.arg(w.down.f32_data())
+                    .arg(wi.f32_data())
+                    .arg(&rows)
+                    .arg(w.up.f32_data());
+            } else {
+                l.arg(w.down.bf16_data())
+                    .arg(wi.bf16_data())
+                    .arg(&rows)
+                    .arg(w.up.bf16_data());
+            }
+            l.arg(x.f32_data_mut());
             match xq {
                 Some(q) => {
                     assert!(q.len >= QAct { m: t, k: HIDDEN }.words());
@@ -1623,6 +1641,7 @@ mod tests {
                         down: &dn,
                         up: &u,
                         inject: with_inject.then_some(&i),
+                        q8: false,
                     };
                     let mut r = d.upload_f32(r0);
                     let (yb, ib) = (d.upload_f32(y), d.upload_f32(injp));
@@ -1696,6 +1715,90 @@ mod tests {
                     let split = go(g, true, a, b, with_inject, mode, t);
                     same_bits(&split[2], &got[2], &format!("{what} unfused R"));
                     same_bits(&split[0], &got[0], &format!("{what} unfused x"));
+                }
+            }
+        }
+    }
+
+    /// The 8-bit hc weights: GPU against the CPU reference on the dequantized weights.
+    fn hc_q8_vs_cpu<D: ComputeDevice>(g: &D) {
+        let c = CpuDevice::new();
+        let mut rng = Rng(13);
+        let w = HC * HIDDEN;
+        let norm: Vec<f32> = rng.vec(w, 1.0).iter().map(|v| 1.0 + 0.2 * v).collect();
+        let (db, ub, ib) = (
+            rng.bf16(HC_LR * w, 0.05),
+            rng.bf16(w * HC_LR, 0.2),
+            rng.bf16(HC * w, 0.05),
+        );
+        let (qd, qu, qi) = (
+            fl::hc_q8(&db, HC_LR, w, false),
+            fl::hc_q8(&ub, w, HC_LR, true),
+            fl::hc_q8(&ib, HC, w, false),
+        );
+        // The dequantized weights are within half a step of bf16 ones.
+        let back = fl::hc_q8_dequant(&qd, HC_LR, w, false);
+        for (blk, chunk) in db.chunks(32).enumerate() {
+            let f: Vec<f32> = chunk
+                .iter()
+                .map(|&b| f32::from_bits((b as u32) << 16))
+                .collect();
+            let d = f.iter().fold(0f32, |m, v| m.max(v.abs())) / 127.0;
+            for (i, v) in f.iter().enumerate() {
+                // Half a step, plus the f16 rounding of d times up to 127.
+                assert!((back[blk * 32 + i] - v).abs() <= 0.5 * d + 127.0 * d / 1024.0 + 1e-9);
+            }
+        }
+        for t in TS {
+            for (with_inject, mode) in [(true, 0), (true, 1), (false, 1)] {
+                let r0 = rng.vec(t * w, 2.0);
+                let (y, injp) = (rng.vec(t * HIDDEN, 1.0), rng.vec(t * HC, 3.0));
+                macro_rules! go {
+                    ($d:expr) => {{
+                        let d = $d;
+                        let (n, dn, u, i) = (
+                            d.upload_f32(&norm),
+                            d.upload_bytes(&qd),
+                            d.upload_bytes(&qu),
+                            d.upload_bytes(&qi),
+                        );
+                        let hw = HcWeights {
+                            norm: &n,
+                            down: &dn,
+                            up: &u,
+                            inject: with_inject.then_some(&i),
+                            q8: true,
+                        };
+                        let mut r = d.upload_f32(&r0);
+                        let (yb, ib) = (d.upload_f32(&y), d.upload_f32(&injp));
+                        let pending = (mode == 1).then_some(HcPending::Write { y: &yb, inj: &ib });
+                        let (mut x, mut inj, mut sc, mut xq) = (
+                            d.alloc_f32(t * HIDDEN),
+                            d.alloc_f32(t * HC),
+                            d.alloc_f32(fl::hc_scratch_words(t)),
+                            d.alloc_f32(QAct { m: t, k: HIDDEN }.words()),
+                        );
+                        d.hc_read_into(
+                            &mut r,
+                            pending,
+                            &hw,
+                            &mut x,
+                            Some(&mut xq),
+                            with_inject.then_some(&mut inj),
+                            &mut sc,
+                            t,
+                            1e-6,
+                        );
+                        (d.download(&x), d.download(&inj), d.download(&r))
+                    }};
+                }
+                let got = go!(g);
+                let want = go!(&c);
+                let what = format!("hc q8 t={t} inject={with_inject} pending={mode}");
+                close(&got.2, &want.2, 1e-6, &format!("{what} R"));
+                close(&got.0, &want.0, 2e-4, &format!("{what} x"));
+                if with_inject {
+                    close(&got.1, &want.1, 2e-4, &format!("{what} inj"));
                 }
             }
         }
@@ -2609,20 +2712,35 @@ mod tests {
             }
         }
         // Hyper-connection reads (no pending, pending write, pending MoE write).
-        {
+        for q8 in [false, true] {
             let w = HC * HIDDEN;
             let norm: Vec<f32> = rng.vec(w, 1.0).iter().map(|v| 1.0 + 0.2 * v).collect();
-            let (n, dn, u, i) = (
-                g.upload_f32(&norm),
-                g.upload_bf16(&rng.bf16(HC_LR * w, 0.05)),
-                g.upload_bf16(&fl::hc_up_repack(&rng.bf16(w * HC_LR, 0.2))),
-                g.upload_bf16(&rng.bf16(HC * w, 0.05)),
+            let (db, ub, ib) = (
+                rng.bf16(HC_LR * w, 0.05),
+                rng.bf16(w * HC_LR, 0.2),
+                rng.bf16(HC * w, 0.05),
             );
+            let (n, dn, u, i) = if q8 {
+                (
+                    g.upload_f32(&norm),
+                    g.upload_bytes(&fl::hc_q8(&db, HC_LR, w, false)),
+                    g.upload_bytes(&fl::hc_q8(&ub, w, HC_LR, true)),
+                    g.upload_bytes(&fl::hc_q8(&ib, HC, w, false)),
+                )
+            } else {
+                (
+                    g.upload_f32(&norm),
+                    g.upload_bf16(&db),
+                    g.upload_bf16(&fl::hc_up_repack(&ub)),
+                    g.upload_bf16(&ib),
+                )
+            };
             let hw = HcWeights {
                 norm: &n,
                 down: &dn,
                 up: &u,
                 inject: Some(&i),
+                q8,
             };
             let ls = EXPERTS + 1;
             let r0 = rng.vec(TW * w, 2.0);
@@ -2701,7 +2819,7 @@ mod tests {
                 let o8 = read(&all, mode);
                 for j in 0..TW {
                     let o1 = read(&[j], mode);
-                    let what = format!("hc_read pending={mode} col {j}");
+                    let what = format!("hc_read q8={q8} pending={mode} col {j}");
                     inv.eq(col(&o8[0], j, HIDDEN), &o1[0], &format!("{what} x"));
                     inv.eq(col(&o8[1], j, HC), &o1[1], &format!("{what} inj"));
                     inv.eq(col(&o8[2], j, w), &o1[2], &format!("{what} r"));
@@ -3072,6 +3190,11 @@ mod tests {
                     .join("\n")
             );
         }
+    }
+
+    #[test]
+    fn cuda_hc_q8_vs_cpu() {
+        on_gpu(hc_q8_vs_cpu);
     }
 
     #[test]

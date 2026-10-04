@@ -1338,13 +1338,23 @@ pub trait ComputeDevice: Send {
                 (y, self.download(inj))
             }
         });
+        use crate::flash::shape::{HC, HC_LR, HIDDEN};
+        // q8 buffers are bytes in f32 words: back to the f32 weights the reference reads.
+        let mat = |b: &Self::Buffer, n: usize, k: usize, up: bool| -> Vec<f32> {
+            let v = self.download(b);
+            if !w.q8 {
+                return v;
+            }
+            let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_bits().to_le_bytes()).collect();
+            crate::flash::hc_q8_dequant(&bytes, n, k, up)
+        };
         let (xv, iv) = crate::cpu::flash::hc_read(
             &mut rv,
             pend.as_ref().map(|(y, i)| (&y[..], &i[..])),
             &self.download(w.norm),
-            &self.download(w.down),
-            &self.download(w.up),
-            w.inject.map(|b| self.download(b)).as_deref(),
+            &mat(w.down, HC_LR, HC * HIDDEN, false),
+            &mat(w.up, HC * HIDDEN, HC_LR, true),
+            w.inject.map(|b| mat(b, HC, HC * HIDDEN, false)).as_deref(),
             t,
             eps,
         );
