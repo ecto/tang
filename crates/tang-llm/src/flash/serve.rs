@@ -198,7 +198,7 @@ pub struct FlashServe {
     clock: u64,
     temp: f32,
     sampling: SamplingMode,
-    /// Widest prefill window (`TANG_FLASH_WIDE`, default 0 = decode-width windows; 64 measured faster before merging 27b1611, slower and unstable after).
+    /// Widest prefill window (`TANG_FLASH_WIDE`, default 64; 0: decode-width windows only).
     wide: usize,
     disk: Option<PathBuf>,
     dump: Option<PathBuf>,
@@ -303,7 +303,7 @@ impl FlashServe {
             clock: 0,
             temp: s.temp,
             sampling: s.sampling,
-            wide: std::env::var("TANG_FLASH_WIDE").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            wide: std::env::var("TANG_FLASH_WIDE").ok().and_then(|v| v.parse().ok()).unwrap_or(64),
             disk: s.disk.clone(),
             dump: s.dump.clone(),
             shape,
@@ -311,6 +311,17 @@ impl FlashServe {
             requests: 0,
             line: Line::default(),
         };
+        // Capture the wide prefill graphs (64, 32, 16) now, not in the first request.
+        if me.wide > 0 {
+            let t = Instant::now();
+            let ids: Vec<u32> = (0..64 + 32 + 16 + 1).map(|i| 1000 + i as u32).collect();
+            for _ in 0..2 {
+                me.e.reset();
+                prefill_span(&mut me.e, &ids, MAX_T, usize::MAX, me.wide, true)?;
+            }
+            me.e.reset();
+            eprintln!("tang-llm: wide prefill graphs (up to T={}) captured in {:.1} s", me.wide, t.elapsed().as_secs_f64());
+        }
         for f in &s.warm {
             let t = Instant::now();
             let body: Value = serde_json::from_str(&std::fs::read_to_string(f)?).with_context(|| format!("reading {}", f.display()))?;
