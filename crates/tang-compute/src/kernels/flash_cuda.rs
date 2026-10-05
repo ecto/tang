@@ -32,6 +32,7 @@ typedef unsigned long long u64;
 #define QSA_CHUNK 64
 #define QSA_NCH 33
 #define TOPK 10
+#define QSA_RING 128
 #define FF 640
 #ifndef PLAN_CAP
 #define PLAN_CAP 88
@@ -2010,7 +2011,7 @@ extern "C" __global__ void fl_qsa_prep(
         float y = norm_rope(p + QSA_IQ + h * 128, IQN, 128, COS, SIN, pos, eps, buf, red);
         if (j < 128) Q[(u64)T * QSA_HEADS * QSA_D + ((u64)t * IDX_HEADS + h) * IDX_D + j] = y;
     } else if (job == 32) {
-        if (j < 128) RING[(pos % 16) * IDX_D + j] = p[QSA_IK + j];
+        if (j < 128) RING[(pos % QSA_RING) * IDX_D + j] = p[QSA_IK + j];
     } else {
         if (pos % 4 != 3) return;
         unsigned int b = pos / 4, c0 = 4 * b;
@@ -2018,7 +2019,7 @@ extern "C" __global__ void fl_qsa_prep(
             float r[4];
             for (int i = 0; i < 4; i++) {
                 unsigned int c = c0 + i;
-                r[i] = c >= pos0 ? P[(u64)(c - pos0) * stride + QSA_IK + j] : RING[(c % 16) * IDX_D + j];
+                r[i] = c >= pos0 ? P[(u64)(c - pos0) * stride + QSA_IK + j] : RING[(c % QSA_RING) * IDX_D + j];
             }
             mean[j] = (((r[0] + r[1]) + r[2]) + r[3]) * 0.25f;
         }

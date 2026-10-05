@@ -423,7 +423,7 @@ fn build(g: &CudaComputeDevice, ts: &[usize]) -> (Model, Vec<usize>) {
             norms: [QSA_D, QSA_D, IDX_D, IDX_D].map(|n| g.upload_f32(&vec![1.0; n])),
             k: g.upload_bf16(&src.bf[..MAX_CTX * QSA_KV * QSA_D]),
             v: g.upload_bf16(&src.bf[..MAX_CTX * QSA_KV * QSA_D]),
-            ring: g.upload_f32(&rng.vec(16 * IDX_D, 1.0)),
+            ring: g.upload_f32(&rng.vec(QSA_RING * IDX_D, 1.0)),
             pooled: g.upload_f32(&rng.vec(MAX_CTX / 4 * IDX_D, 1.0)),
         });
         layers.push(Layer {

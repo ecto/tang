@@ -737,7 +737,7 @@ pub(crate) fn qsa_prep(
             if c >= pos0 {
                 &proj[(c - pos0) * stride + QSA_IK..(c - pos0) * stride + QSA_IK + IDX_D]
             } else {
-                &ring[(c % 16) * IDX_D..(c % 16 + 1) * IDX_D]
+                &ring[(c % QSA_RING) * IDX_D..(c % QSA_RING + 1) * IDX_D]
             }
         };
         let c0 = b * IDX_BLOCK;
@@ -749,7 +749,7 @@ pub(crate) fn qsa_prep(
     }
     for tt in 0..t {
         let pos = pos0 + tt;
-        ring[(pos % 16) * IDX_D..(pos % 16 + 1) * IDX_D]
+        ring[(pos % QSA_RING) * IDX_D..(pos % QSA_RING + 1) * IDX_D]
             .copy_from_slice(&proj[tt * stride + QSA_IK..tt * stride + QSA_IK + IDX_D]);
     }
 }
