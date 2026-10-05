@@ -40,7 +40,7 @@ for entry in files:
     original=hashlib.sha256();converted=hashlib.sha256()
     print(f'Downloading {name}',flush=True)
     with requests.get(base+name+'?download=true',stream=True,timeout=(30,120)) as response:
-        response.raise_for_status();stream=response.raw
+        response.raise_for_status();stream=response.raw;stream.decode_content=True
         with tmp.open('xb') as out:
             def write(data):
                 if shutil.disk_usage(root).free < len(data)+reserve:raise RuntimeError('disk headroom exhausted')
