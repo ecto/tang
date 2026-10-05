@@ -183,6 +183,10 @@ fn main() -> Result<()> {
         std::fs::write(args.get(5).context(usage)?, bytes)?;
         return Ok(());
     }
+    #[cfg(feature = "mtp-train")]
+    if cmd == "flash-mtp-train" {
+        return tang_llm::flash::mtp_train::cli(&args[1..]);
+    }
     if cmd == "flash-mtp" {
         return tang_llm::flash::mtp::cli(&args[1..]);
     }

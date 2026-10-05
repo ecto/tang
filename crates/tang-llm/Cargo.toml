@@ -16,8 +16,13 @@ metal = ["tang-compute/metal"]
 # NVIDIA GPUs. On Linux, build with `--no-default-features --features cuda` (Metal is macOS-only).
 cuda = ["tang-compute/cuda", "dep:tang-moe", "tang-moe/cuda", "dep:cudarc"]
 
+mtp-train = ["dep:tang-ad", "dep:tang-train", "dep:tang-tensor"]
+
 [dependencies]
 tang-compute = { workspace = true }
+tang-ad = { workspace = true, optional = true }
+tang-train = { workspace = true, optional = true }
+tang-tensor = { workspace = true, optional = true }
 safetensors = { workspace = true }
 tokenizers = { workspace = true }
 serde = { workspace = true }

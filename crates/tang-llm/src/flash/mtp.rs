@@ -551,3 +551,48 @@ pub fn cli(args: &[String]) -> Result<()> {
     print!("{}", acc.report());
     Ok(())
 }
+
+/// CPU oracle for the offline trainer's recursive mask (full-precision Q8 experts).
+#[cfg(feature = "mtp-train")]
+pub(crate) fn training_oracle(
+    main: &FlashRef,
+    mtp: &Mtp,
+    h: &[f32],
+    tokens: &[u32],
+    pos: &[usize],
+) -> Result<Vec<(Vec<f32>, Vec<(u32, f32)>)>> {
+    let width = mtp.m.hp.hc * mtp.m.hp.n_embd;
+    let len = pos.len();
+    let mut residual = h.to_vec();
+    let mut kv = Kv::default();
+    let mut counts = Vec::new();
+    let mut result = Vec::new();
+    for depth in 1..=3 {
+        let rows = len - depth;
+        let cells: Vec<_> = (0..rows)
+            .map(|i| {
+                let mut visible: Vec<_> = (0..=i).collect();
+                if depth == 1 {
+                    visible.pop();
+                } else {
+                    let mut offset = counts[0];
+                    for &count in &counts[1..] {
+                        visible.push(offset + i);
+                        offset += count;
+                    }
+                }
+                Cell {
+                    h: &residual[i * width..(i + 1) * width],
+                    tok: tokens[i + depth],
+                    pos: pos[i] + depth - 1,
+                    visible,
+                }
+            })
+            .collect();
+        let out = mtp.run(main, &cells, &mut kv, None)?;
+        result.push((out.r.clone(), out.top));
+        residual = out.r;
+        counts.push(rows);
+    }
+    Ok(result)
+}
