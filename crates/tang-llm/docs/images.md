@@ -32,8 +32,11 @@ step boundary. Latent previews and cancellation inside VAE decode remain unfinis
 The DiT follows the basic single-image path: RMSNorm/SwiGLU blocks, scale/tanh-gate
 modulation, interleaved axis RoPE, image/caption padding and refiners, and joint
 attention. Weights are BF16 on GPU; norms remain F32. The VAE upcasts to F32 and uses
-bounded tiled im2col/GEMM convolutions. Packing, affine broadcasts and upsampling
-are intentionally unfused. Broad quality and performance evaluation remains unfinished.
+bounded tiled im2col/GEMM convolutions. Metal fuses DiT RMS normalization with channel
+scale or gated residual, keeping modulation on device. Bounded command batches limit
+temporary retention. `TANG_IMAGE_UNFUSED=1` preserves the earlier path for comparisons.
+Packing, final-layer modulation and VAE upsampling/convolution remain unfused.
+Broad quality and performance evaluation remains unfinished.
 
 ## Trained-weight smoke test
 
@@ -53,6 +56,13 @@ Additional 128×128 validation exposed a Metal softmax shared-scratch race in VA
 The barrier fix passes real Frog generation with diagnostics disabled and all 80 Metal
 compute regressions. `TANG_IMAGE_TRACE=1` optionally logs synchronized VAE finite-value
 counts for diagnostics; it is off by default. Nonfinite sampler latents fail at their step.
+
+Three resident 320×192 runs with fused modulation took 8.679, 8.739 and 8.746 seconds;
+the earlier path took 13.786, 12.913 and 13.242 seconds in the same session. Fused
+repeats produced byte-identical PNGs. Relative to the earlier implementation, changed
+pixels differed by at most one channel value, mean absolute channel error below 0.0011.
+One resident 512×512 request took 37.8 seconds. Reproducibility is scoped to a backend
+implementation; checkpoint hashes do not identify floating-point kernel changes.
 
 ## Reference validation
 
@@ -90,6 +100,14 @@ passes all 20 Metal boundaries under the existing 1e-3 absolute bound, final max
 2.8e-6. CPU final output is similarly close, but five hidden boundaries exceed its
 stricter 1e-4 bound. At 32×32 trained latents, twelve Metal boundaries still exceed the
 same strict bound; final output max error is 1.10e-4 (relative L2 5.93e-6).
+
+An independent fp32 audit of PyTorch MATH versus CPU flash attention on the same trained
+8×8 case also exceeds the old pointwise bound at ten late boundaries, worst max error
+0.0078125 and final-output max error 3.16e-5 (relative L2 5.90e-6). This establishes that
+the strict pointwise failure alone does not isolate a porting error. Fused Metal retains
+nine late failures under that bound, final-output max error 5.45e-5 (relative L2 6.02e-6);
+the deterministic random-head128 cases still pass all boundaries below 8.3e-6. The old
+strict checks remain visible; they have not been silently relaxed.
 
 `scripts/download_gemma_judge.py <new-directory>` explicitly downloads a pinned public
 Gemma 3 4B MLX checkpoint, verifies hashes and preserves the same disk reserve. Language

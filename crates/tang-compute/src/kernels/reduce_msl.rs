@@ -1,5 +1,46 @@
 //! MSL reduction kernels: softmax, rms_norm.
 
+/// DiT channel modulation and optional gated residual, without host downloads or
+/// expanded per-token scales. Same reduction layout as the standalone RMS kernel.
+pub const MODULATED_RMS_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void rms_norm_modulation(
+    device const float* input [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device const float* modulation [[buffer(2)]],
+    device const float* residual [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    device const uint* params [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint size [[threads_per_threadgroup]])
+{
+    uint dim = params[1], offset = params[2];
+    uint base = row * dim;
+    threadgroup float shared[256];
+    float sum = 0;
+    for (uint i = tid; i < dim; i += size) sum += input[base+i] * input[base+i];
+    shared[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = size/2; s > 0; s >>= 1) {
+        if (tid < s) shared[tid] += shared[tid+s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = rsqrt(shared[0]/float(dim) + as_type<float>(params[4]));
+    for (uint i = tid; i < dim; i += size) {
+        float normalized = input[base+i] * inv * weight[i];
+        if (params[3]) {
+            float gate = tanh(clamp(modulation[offset+i], -10.0f, 10.0f));
+            float update = normalized * gate;
+            output[base+i] = residual[base+i] + update;
+        } else {
+            output[base+i] = normalized * (1.0f + modulation[offset+i]);
+        }
+    }
+}
+"#;
+
 /// Row-wise softmax: each threadgroup handles one row.
 /// params: [n_rows, row_len]
 pub const SOFTMAX_MSL: &str = r#"

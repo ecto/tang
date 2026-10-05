@@ -138,6 +138,51 @@ pub trait ComputeDevice: Send {
         eps: f32,
     ) -> Self::Buffer;
 
+    /// RMS norm followed by channel modulation `1 + scale[offset..]`.
+    /// Backends may fuse these operations without expanding the channel vector.
+    fn rms_norm_scale(
+        &self,
+        data: &Self::Buffer,
+        weight: &Self::Buffer,
+        scale: &Self::Buffer,
+        offset: usize,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Self::Buffer {
+        let normalized = self.rms_norm(data, weight, rows, dim, eps);
+        let values = self.download(scale);
+        let scale: Vec<f32> = values[offset..offset + dim]
+            .iter()
+            .map(|x| 1. + x)
+            .collect();
+        let scale = self.upload(&scale.repeat(rows));
+        self.elementwise(&[&normalized, &scale], rows * dim, &|x| x[0] * x[1])
+    }
+
+    /// Residual plus RMS-normalized update gated by `tanh(gate[offset..])`.
+    fn rms_norm_gate_residual(
+        &self,
+        data: &Self::Buffer,
+        weight: &Self::Buffer,
+        gate: &Self::Buffer,
+        residual: &Self::Buffer,
+        offset: usize,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Self::Buffer {
+        let normalized = self.rms_norm(data, weight, rows, dim, eps);
+        let values = self.download(gate);
+        let gate: Vec<f32> = values[offset..offset + dim]
+            .iter()
+            .map(|x| x.tanh())
+            .collect();
+        let gate = self.upload(&gate.repeat(rows));
+        let update = self.elementwise(&[&normalized, &gate], rows * dim, &|x| x[0] * x[1]);
+        self.add_tensors_buf(residual, &update, rows * dim)
+    }
+
     /// Embedding lookup: weight[ids[i]] for each token.
     fn embedding(
         &self,

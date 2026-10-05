@@ -107,6 +107,7 @@ pub struct DiT<B> {
     final_out: Linear<B>,
     norm_ones: B,
     norm_zeros: B,
+    fused_modulation: bool,
 }
 fn silu<D: ComputeDevice>(dev: &D, x: &D::Buffer) -> D::Buffer {
     dev.swiglu_fused_buf(x, &dev.upload(&vec![1.; x.len()]), x.len())
@@ -209,6 +210,7 @@ impl<B: ComputeBuffer> DiT<B> {
             final_mod: linear("all_final_layer.2-1.adaLN_modulation.1", ad, dim, true)?,
             final_out: linear("all_final_layer.2-1.linear", dim, cfg.in_channels * 4, true)?,
             norm_ones: dev.upload(&vec![1.; dim]),
+            fused_modulation: std::env::var("TANG_IMAGE_UNFUSED").as_deref() != Ok("1"),
             norm_zeros: dev.upload(&vec![0.; dim]),
             cfg,
         })
@@ -226,19 +228,52 @@ impl<B: ComputeBuffer> DiT<B> {
         let c = &self.cfg;
         let d = c.dim;
         let hd = d / c.n_heads;
-        let modulation = b
-            .modulation
-            .as_ref()
-            .map(|m| dev.download(&m.run(dev, time, 1)));
-        let mut a = dev.rms_norm(&x, &b.an1, rows, d, c.norm_eps);
-        if let Some(m) = &modulation {
-            a = multiply_rows(
-                dev,
-                &a,
-                &m[..d].iter().map(|v| 1. + v).collect::<Vec<_>>(),
-                rows,
-            );
-        }
+        let modulation = b.modulation.as_ref().map(|m| m.run(dev, time, 1));
+        let legacy = if self.fused_modulation {
+            None
+        } else {
+            modulation.as_ref().map(|m| dev.download(m))
+        };
+        let norm_scale = |data: &B, weight: &B, offset: usize| {
+            if let Some(m) = modulation.as_ref().filter(|_| self.fused_modulation) {
+                dev.rms_norm_scale(data, weight, m, offset, rows, d, c.norm_eps)
+            } else {
+                let normalized = dev.rms_norm(data, weight, rows, d, c.norm_eps);
+                if let Some(m) = &legacy {
+                    multiply_rows(
+                        dev,
+                        &normalized,
+                        &m[offset..offset + d]
+                            .iter()
+                            .map(|v| 1. + v)
+                            .collect::<Vec<_>>(),
+                        rows,
+                    )
+                } else {
+                    normalized
+                }
+            }
+        };
+        let norm_gate = |data: &B, weight: &B, residual: &B, offset: usize| {
+            if let Some(m) = modulation.as_ref().filter(|_| self.fused_modulation) {
+                dev.rms_norm_gate_residual(data, weight, m, residual, offset, rows, d, c.norm_eps)
+            } else {
+                let mut normalized = dev.rms_norm(data, weight, rows, d, c.norm_eps);
+                if let Some(m) = &legacy {
+                    normalized = multiply_rows(
+                        dev,
+                        &normalized,
+                        &m[offset..offset + d]
+                            .iter()
+                            .map(|v| v.tanh())
+                            .collect::<Vec<_>>(),
+                        rows,
+                    );
+                }
+                dev.add_tensors_buf(residual, &normalized, rows * d)
+            }
+        };
+        let a = norm_scale(&x, &b.an1, 0);
         let mut q = b.q.run(dev, &a, rows);
         let mut k = b.k.run(dev, &a, rows);
         let v = b.v.run(dev, &a, rows);
@@ -251,50 +286,12 @@ impl<B: ComputeBuffer> DiT<B> {
         q = dev.rope_forward_cached(&q, cos, sin, rows, c.n_heads, hd, 0);
         k = dev.rope_forward_cached(&k, cos, sin, rows, c.n_heads, hd, 0);
         let attention = dev.attention_full(&q, &k, &v, rows, c.n_heads, hd);
-        let mut a = dev.rms_norm(
-            &b.out.run(dev, &attention, rows),
-            &b.an2,
-            rows,
-            d,
-            c.norm_eps,
-        );
-        if let Some(m) = &modulation {
-            a = multiply_rows(
-                dev,
-                &a,
-                &m[d..2 * d].iter().map(|v| v.tanh()).collect::<Vec<_>>(),
-                rows,
-            );
-        }
-        x = dev.add_tensors_buf(&x, &a, rows * d);
-        let mut a = dev.rms_norm(&x, &b.fn1, rows, d, c.norm_eps);
-        if let Some(m) = &modulation {
-            a = multiply_rows(
-                dev,
-                &a,
-                &m[2 * d..3 * d].iter().map(|v| 1. + v).collect::<Vec<_>>(),
-                rows,
-            );
-        }
+        x = norm_gate(&b.out.run(dev, &attention, rows), &b.an2, &x, d);
+        let a = norm_scale(&x, &b.fn1, 2 * d);
         let gate = b.w1.run(dev, &a, rows);
         let up = b.w3.run(dev, &a, rows);
         let activated = dev.swiglu_fused_buf(&gate, &up, rows * b.w1.output);
-        let mut a = dev.rms_norm(
-            &b.w2.run(dev, &activated, rows),
-            &b.fn2,
-            rows,
-            d,
-            c.norm_eps,
-        );
-        if let Some(m) = &modulation {
-            a = multiply_rows(
-                dev,
-                &a,
-                &m[3 * d..].iter().map(|v| v.tanh()).collect::<Vec<_>>(),
-                rows,
-            );
-        }
-        dev.add_tensors_buf(&x, &a, rows * d)
+        norm_gate(&b.w2.run(dev, &activated, rows), &b.fn2, &x, 3 * d)
     }
     fn rope<D: ComputeDevice<Buffer = B>>(
         &self,
@@ -438,6 +435,12 @@ impl<B: ComputeBuffer> DiT<B> {
         for (i, b) in self.layers.iter().enumerate() {
             x = self.block(dev, b, x, rows, &cos, &sin, &time);
             trace(&format!("layers.{i}"), &x);
+            // Bound command-buffer retention of temporary activations while avoiding
+            // the old per-block modulation downloads. Large images use smaller batches.
+            let batch = if rows > 2048 { 2 } else { 4 };
+            if self.fused_modulation && (i + 1) % batch == 0 {
+                dev.sync();
+            }
         }
         let x = dev.layer_norm(&x, &self.norm_ones, &self.norm_zeros, rows, c.dim, 1e-6);
         let scale = dev

@@ -121,6 +121,9 @@ impl MetalDevice {
         }
 
         let options = CompileOptions::new();
+        if fn_name == "rms_norm_modulation" {
+            options.set_fast_math_enabled(false);
+        }
         let library = self
             .device
             .new_library_with_source(source, &options)
@@ -186,6 +189,52 @@ impl MetalDevice {
             }
             f(enc_ref.as_ref().unwrap());
         });
+    }
+
+    fn modulated_rms(
+        &self,
+        data: &MetalBuffer,
+        weight: &MetalBuffer,
+        modulation: &MetalBuffer,
+        residual: Option<&MetalBuffer>,
+        offset: usize,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) -> MetalBuffer {
+        assert!(dim > 0 && data.len() == rows * dim && weight.len() == dim);
+        assert!(modulation.len() >= offset + dim);
+        assert!(residual.is_none_or(|r| r.len() == data.len()));
+        for buffer in [data, weight, modulation, residual.unwrap_or(data)] {
+            assert_eq!(buffer.kind, Kind::F32);
+        }
+        let pipeline = self.get_pipeline(reduce_msl::MODULATED_RMS_MSL, "rms_norm_modulation");
+        let output = self.make_buffer_empty(rows * dim * 4);
+        let params = self.make_buffer_u32(&[
+            rows as u32,
+            dim as u32,
+            offset as u32,
+            residual.is_some() as u32,
+            eps.to_bits(),
+        ]);
+        self.dispatch_groups(
+            &pipeline,
+            &[
+                &data.buffer,
+                &weight.buffer,
+                &modulation.buffer,
+                &residual.unwrap_or(data).buffer,
+                &output,
+                &params,
+            ],
+            (rows, 1),
+            dim.min(256).next_power_of_two(),
+        );
+        MetalBuffer {
+            buffer: output,
+            len: rows * dim,
+            kind: Kind::F32,
+        }
     }
 
     /// Close the open compute encoder (before a blit, or before committing).
@@ -1885,6 +1934,33 @@ kernel void embedding(
         self.flash_attention(q, k, v, 0, n, nh, nh, hd, 0, true, None)
     }
 
+    fn rms_norm_scale(
+        &self,
+        data: &MetalBuffer,
+        weight: &MetalBuffer,
+        scale: &MetalBuffer,
+        offset: usize,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) -> MetalBuffer {
+        self.modulated_rms(data, weight, scale, None, offset, rows, dim, eps)
+    }
+
+    fn rms_norm_gate_residual(
+        &self,
+        data: &MetalBuffer,
+        weight: &MetalBuffer,
+        gate: &MetalBuffer,
+        residual: &MetalBuffer,
+        offset: usize,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) -> MetalBuffer {
+        self.modulated_rms(data, weight, gate, Some(residual), offset, rows, dim, eps)
+    }
+
     fn layer_norm(
         &self,
         x: &MetalBuffer,
@@ -3275,6 +3351,52 @@ mod tests {
                     .flat_map(|&t| all[t as usize * k..(t as usize + 1) * k].to_vec())
                     .collect();
                 assert_eq!(got, want);
+            }
+        }
+    }
+
+    #[test]
+    fn metal_modulated_rms_matches_cpu_at_dit_widths_and_large_gates() {
+        let metal = get_metal_device();
+        let cpu = CpuDevice::new();
+        for (dim, rows) in [(24, 3), (128, 5), (3840, 2)] {
+            let data: Vec<f32> = (0..rows * dim)
+                .map(|i| ((i * 17) % 97) as f32 / 13. - 3.)
+                .collect();
+            let weight: Vec<f32> = (0..dim).map(|i| 0.5 + (i % 13) as f32 / 13.).collect();
+            let residual: Vec<f32> = (0..rows * dim)
+                .map(|i| ((i * 11) % 31) as f32 / 7. - 2.)
+                .collect();
+            let mut modulation: Vec<f32> = (0..4 * dim)
+                .map(|i| ((i * 13) % 27) as f32 / 9. - 1.5)
+                .collect();
+            modulation[dim] = -1000.;
+            modulation[dim + 1] = 1000.;
+            let (x, w, m, r) = (
+                metal.upload(&data),
+                metal.upload(&weight),
+                metal.upload(&modulation),
+                metal.upload(&residual),
+            );
+            let (cx, cw, cm, cr) = (
+                cpu.upload(&data),
+                cpu.upload(&weight),
+                cpu.upload(&modulation),
+                cpu.upload(&residual),
+            );
+            let actual = [
+                metal.download(&metal.rms_norm_scale(&x, &w, &m, 0, rows, dim, 1e-6)),
+                metal.download(&metal.rms_norm_gate_residual(&x, &w, &m, &r, dim, rows, dim, 1e-6)),
+            ];
+            let expected = [
+                cpu.download(&cpu.rms_norm_scale(&cx, &cw, &cm, 0, rows, dim, 1e-6)),
+                cpu.download(&cpu.rms_norm_gate_residual(&cx, &cw, &cm, &cr, dim, rows, dim, 1e-6)),
+            ];
+            for (a, b) in actual.iter().flatten().zip(expected.iter().flatten()) {
+                assert!(
+                    a.is_finite() && (a - b).abs() <= 2e-5 * b.abs().max(1.),
+                    "dim {dim}: {a} vs {b}"
+                );
             }
         }
     }
