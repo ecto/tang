@@ -279,7 +279,18 @@ fn decode_spec(
     let think_end = 248_069u32;
     let mut in_think = ids.iter().rev().take(8).find(|&&x| x == 248_068 || x == think_end) == Some(&248_068);
     let think_room: usize = std::env::var("TANG_FLASH_THINK_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(MAX_T);
+    // TANG_FLASH_STOP_IDS=a,b: stop once any of these tokens is generated (data generation).
+    let stop: Vec<u32> = std::env::var("TANG_FLASH_STOP_IDS")
+        .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect())
+        .unwrap_or_default();
+    let mut stop_seen = 0;
     while out.len() < n {
+        if !stop.is_empty() {
+            if out[stop_seen..].iter().any(|x| stop.contains(x)) {
+                break;
+            }
+            stop_seen = out.len();
+        }
         if out.len() >= 2 && started.is_none() {
             started = Some(Instant::now());
             stats.clear();
@@ -498,11 +509,12 @@ pub fn generate(args: &[String]) -> Result<()> {
     let a = parse(args)?;
     let ids = prompt_ids(&a)?;
     let mut e = load(&a)?;
+    // Warm-up: capture every graph (window sizes, commits, MTP cell counts) before timing.
+    e.warm()?;
+    // After the warm-up, whose throwaway sequence must not land in the training dump.
     if let Some(d) = &a.dump_mtp_train {
         e.dump_mtp_train(d)?;
     }
-    // Warm-up: capture every graph (window sizes, commits, MTP cell counts) before timing.
-    e.warm()?;
     let (out, stats, prefill_s, secs, sp) = decode_spec(&mut e, &ids, a.n, a.chunk, &a.draft)?;
     let vocab = e.vocab()?;
     println!("prompt: {} tokens, prefill {:.2} s ({:.0} tok/s)", ids.len(), prefill_s, ids.len() as f64 / prefill_s);

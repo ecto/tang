@@ -942,7 +942,7 @@ extern "C" __global__ void fe_mtp_next(const float* r, float* h, const unsigned*
 // heads of group g over its chunk (4 warps × 32 positions; lane owns 8 dims), merges its warps,
 // and writes per head (m, l, acc[256]) to part[c][g][j][12][258]. Chunks past the cell's
 // position write l = 0.
-#define MTP_CHUNK 128
+#define MTP_CHUNK 32
 extern "C" __global__ void __launch_bounds__(128) fe_mtp_attn_part(const float* q, const float* kc, const float* vc,
                                                                    const unsigned* ctl, float* part, int nchunk) {
     __shared__ float wm[4][12], wl[4][12];
@@ -1078,47 +1078,67 @@ extern "C" __global__ void fe_short1(const float* lg, int n, float* part) {
         out[0] = M; out[1] = S;
     }
 }
-extern "C" __global__ void fe_short2(const float* part, int nparts, const unsigned char* head, int rb, const float* x,
-                                     unsigned* ids, float* probs, int n_lo, int hi_base) {
-    __shared__ float ev[256], eq[256], red[256];
-    __shared__ int ei[256];
-    const int t = threadIdx.x;
+// Stage 2a: one warp per shortlisted row (grid 32 × 256 threads = 256 warps), the exact Q5_K dot.
+extern "C" __global__ void fe_short2a(const float* part, int nparts, const unsigned char* head, int rb, const float* x,
+                                      float* exact) {
+    const int t = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     const int b = t / 4, r = t % 4;
-    const float* p = part + (size_t)b * 10;
-    const float q2v = p[2 + 2 * r];
-    const int row = __float_as_int(p[2 + 2 * r + 1]);
-    float exact = __int_as_float(0xff800000);
-    if (b < nparts && row >= 0) {
-        float acc = 0.f;
-        const unsigned char* w = head + (size_t)row * rb;
-        for (int e0 = 0; e0 < 2560; e0 += 8) {
-            float v[8];
-            decode8<13>(w, e0, v);
-            for (int i = 0; i < 8; i++) acc = fmaf(v[i], x[e0 + i], acc);
-        }
-        exact = acc;
+    const int row = b < nparts ? __float_as_int(part[(size_t)b * 10 + 2 + 2 * r + 1]) : -1;
+    if (row < 0) { if (lane == 0) exact[t] = __int_as_float(0xff800000); return; }
+    const unsigned char* w = head + (size_t)row * rb;
+    float acc = 0.f;
+    for (int e0 = lane * 8; e0 < 2560; e0 += 256) {
+        float v[8];
+        decode8<13>(w, e0, v);
+        #pragma unroll
+        for (int i = 0; i < 8; i++) acc = fmaf(v[i], x[e0 + i], acc);
     }
-    ev[t] = exact; eq[t] = (b < nparts && row >= 0) ? q2v : __int_as_float(0xff800000); ei[t] = row;
-    __syncthreads();
-    if (t == 0) {
-        // global Q2 softmax pieces
-        float M = __int_as_float(0xff800000), S = 0.f;
-        for (int i = 0; i < nparts; i++) {
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if (lane == 0) exact[t] = acc;
+}
+// Stage 2b: one block of 256: argmax of the exact scores, and its probability (as before).
+extern "C" __global__ void fe_short2b(const float* part, int nparts, const float* exact,
+                                      unsigned* ids, float* probs, int n_lo, int hi_base) {
+    __shared__ float bv[256], rs[256];
+    __shared__ int bt[256];
+    __shared__ float gM, gS;
+    const int t = threadIdx.x, b = t / 4, r = t % 4;
+    const bool ok = b < nparts && __float_as_int(part[(size_t)b * 10 + 2 + 2 * r + 1]) >= 0;
+    const float ev = exact[t];
+    const float eq = ok ? part[(size_t)b * 10 + 2 + 2 * r] : 0.f;
+    const int row = ok ? __float_as_int(part[(size_t)b * 10 + 2 + 2 * r + 1]) : 0x7fffffff;
+    bv[t] = ok ? ev : __int_as_float(0xff800000); bt[t] = row;
+    if (t < 32) {
+        float m = __int_as_float(0xff800000), s = 0.f;
+        for (int i = t; i < nparts; i += 32) {
             const float pm = part[i * 10], ps = part[i * 10 + 1];
-            const float nm = fmaxf(M, pm);
-            S = (S == 0.f ? 0.f : S * expf(M - nm)) + (ps == 0.f ? 0.f : ps * expf(pm - nm));
-            M = nm;
+            const float nm = fmaxf(m, pm);
+            s = (s == 0.f ? 0.f : s * expf(m - nm)) + (ps == 0.f ? 0.f : ps * expf(pm - nm));
+            m = nm;
         }
-        int best = 0;
-        for (int i = 1; i < 256; i++) if (ev[i] > ev[best] || (ev[i] == ev[best] && ei[i] < ei[best])) best = i;
-        const float top = ev[best];
-        const float MM = fmaxf(M, top);
-        float tot = S * expf(M - MM);
-        for (int i = 0; i < 256; i++) {
-            if (ei[i] < 0) continue;
-            tot += expf(ev[i] - MM) - expf(eq[i] - MM);
+        for (int o = 16; o > 0; o >>= 1) {
+            const float om = __shfl_xor_sync(0xffffffffu, m, o), os = __shfl_xor_sync(0xffffffffu, s, o);
+            const float M = fmaxf(m, om);
+            s = (s == 0.f ? 0.f : s * expf(m - M)) + (os == 0.f ? 0.f : os * expf(om - M));
+            m = M;
         }
-        const int idx = ei[best];
+        if (t == 0) { gM = m; gS = s; }
+    }
+    __syncthreads();
+    for (int w = 128; w > 0; w >>= 1) {
+        if (t < w && (bv[t + w] > bv[t] || (bv[t + w] == bv[t] && bt[t + w] < bt[t]))) { bv[t] = bv[t + w]; bt[t] = bt[t + w]; }
+        __syncthreads();
+    }
+    const float top = bv[0], MM = fmaxf(gM, top);
+    rs[t] = ok ? expf(ev - MM) - expf(eq - MM) : 0.f;
+    __syncthreads();
+    for (int w = 128; w > 0; w >>= 1) {
+        if (t < w) rs[t] += rs[t + w];
+        __syncthreads();
+    }
+    if (t == 0) {
+        const float tot = gS * expf(gM - MM) + rs[0];
+        const int idx = bt[0];
         ids[0] = (unsigned)(idx < n_lo ? idx : hi_base + (idx - n_lo));
         probs[0] = expf(top - MM) / tot;
     }

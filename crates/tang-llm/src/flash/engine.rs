@@ -366,7 +366,8 @@ struct Kern {
     m_amax2: Fun,
     m_next: Fun,
     m_short1: Fun,
-    m_short2: Fun,
+    m_short2a: Fun,
+    m_short2b: Fun,
     publish: Fun,
     wait: Fun,
     copy_rows: Fun,
@@ -550,7 +551,7 @@ fn upload_entry(dev: &CudaComputeDevice, e: &Entry, b: &[u8]) -> B {
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect::<Vec<_>>(),
         ),
-        Fmt::Q4x => dev.upload_bytes(b),
+        Fmt::Q4x | Fmt::HcQ8 => dev.upload_bytes(b),
         // 16 bytes of slack: fe_gemv stages rows with aligned 16-byte loads.
         Fmt::Native => {
             let mut v = b.to_vec();
@@ -694,28 +695,18 @@ impl Engine {
         let hc_q8 = !std::env::var("TANG_FLASH_HC_Q8").is_ok_and(|v| v == "0");
         let hc = |key: &str, inject: bool| -> Result<Hc> {
             if hc_q8 {
-                let bits = |name: &str| -> Result<Vec<u16>> {
-                    let e = by.get(name).with_context(|| format!("pack has no {name}"))?;
-                    let b = pack::read_entry(&df, e)?;
-                    Ok(b.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect())
+                let q8 = |part: &str, n: usize, k: usize| -> Result<B> {
+                    let name = format!("{key}.{part}.q8");
+                    let e = by.get(name.as_str()).with_context(|| format!("pack has no {name}"))?;
+                    ensure!((e.n, e.k) == (n, k), "{name}: {}x{} vs {n}x{k}", e.n, e.k);
+                    Ok(dev.upload_bytes(&pack::read_entry(&df, e)?))
                 };
                 let w = HC * HIDDEN;
-                let rep = bits(&format!("{key}.up"))?;
-                let mut up = vec![0u16; rep.len()];
-                for row in 0..w {
-                    for k in 0..HC_LR {
-                        up[row * HC_LR + k] = rep[fl::hc_up_index(row, k)];
-                    }
-                }
                 return Ok(Hc {
                     norm: get(&format!("{key}.norm"))?,
-                    down: dev.upload_bytes(&fl::hc_q8(&bits(&format!("{key}.down"))?, HC_LR, w, false)),
-                    up: dev.upload_bytes(&fl::hc_q8(&up, w, HC_LR, true)),
-                    inject: if inject {
-                        Some(dev.upload_bytes(&fl::hc_q8(&bits(&format!("{key}.inject"))?, HC, w, false)))
-                    } else {
-                        None
-                    },
+                    down: q8("down", HC_LR, w)?,
+                    up: q8("up", w, HC_LR)?,
+                    inject: if inject { Some(q8("inject", HC, w)?) } else { None },
                     q8: true,
                 });
             }
@@ -902,7 +893,8 @@ impl Engine {
             m_amax2: f(&gm, "fe_amaxp2")?,
             m_next: f(&gm, "fe_mtp_next")?,
             m_short1: f(&gm, "fe_short1")?,
-            m_short2: f(&gm, "fe_short2")?,
+            m_short2a: f(&gm, "fe_short2a")?,
+            m_short2b: f(&gm, "fe_short2b")?,
             embed: f(&m, "fe_embed")?,
             ple: f(&m, "fe_ple")?,
             silu_q: f(&m, "fe_silu_q")?,
@@ -2087,7 +2079,11 @@ impl Engine {
             let nexts: Vec<u32> = (0..t)
                 .map(|i| self.tokens.get(pos + i + 1).copied().unwrap_or(out[t - 1]))
                 .collect();
-            self.dump_train(pos, &nexts)?;
+            // Training pairs from generated text only: of the prompt, just its last position
+            // (whose next token is the first generated one).
+            if pos + t == self.tokens.len() {
+                self.dump_train(pos, &nexts, t - 1)?;
+            }
             if self.use_mtp && self.mtp.is_some() {
                 self.mtp_last = self.mtp_draft(pos, &nexts)?;
             }
@@ -2130,7 +2126,8 @@ impl Engine {
     /// `--dump-mtp-train`: for each kept position `pos0 + i`, the final 4-stream residual (the
     /// MTP's `h`, fp16 `[4][2560]`) to `h.f16`, and `(position, token, next token)` as three u32
     /// to `ids.u32`: what a distillation job needs to fine-tune the MTP layer on this text.
-    fn dump_train(&mut self, pos0: usize, next: &[u32]) -> Result<()> {
+    /// Rows before `from` (prompt positions) are skipped.
+    fn dump_train(&mut self, pos0: usize, next: &[u32], from: usize) -> Result<()> {
         use std::io::Write;
         if self.train_dump.is_none() {
             return Ok(());
@@ -2138,7 +2135,7 @@ impl Engine {
         let n = next.len();
         let r = self.dev.download(&self.s.r);
         let (hw, iw) = self.train_dump.as_mut().unwrap();
-        for (i, &nx) in next.iter().enumerate().take(n) {
+        for (i, &nx) in next.iter().enumerate().take(n).skip(from) {
             let row = &r[i * HC * HIDDEN..(i + 1) * HC * HIDDEN];
             let b: Vec<u8> = row.iter().flat_map(|&x| fl::f32_to_f16(x).to_le_bytes()).collect();
             hw.write_all(&b)?;
@@ -2185,7 +2182,7 @@ impl Engine {
         };
         self.defer_boundary = false;
         let n = kept.len();
-        self.dump_train(pos, &kept)?;
+        self.dump_train(pos, &kept, 0)?;
         self.last_mtp_ms = 0.0;
         let t0 = Instant::now();
         let overlap = self.use_mtp && self.use_graphs && self.mtp.as_ref().is_some_and(|m| m.graphs[n].is_some());
@@ -2554,7 +2551,7 @@ struct Mtp {
     /// (`TANG_FLASH_MTP_VOCAB`, e.g. 32768; default 0 = the whole head: on code, 32768 costs d1 97% -> 91%). A drafter's vocabulary
     /// changes acceptance only.
     dhead: Option<(Dw, usize, usize)>,
-    /// `TANG_FLASH_MTP_HEAD2=1`: a Q2_0 copy of the draft head that shortlists 256 rows, rescored
+    /// Default (`TANG_FLASH_MTP_HEAD2=0` disables): a Q2_0 copy of the draft head that shortlists 256 rows, rescored
     /// exactly from the draft head's own (Q5_K) rows: (Q2 head, exact rows buffer, row bytes).
     head2: Option<(Dw, B, usize)>,
     short: B,
@@ -2731,7 +2728,7 @@ impl Mtp {
                     None
                 }
             },
-            head2: if std::env::var("TANG_FLASH_MTP_HEAD2").is_ok_and(|v| v == "1") {
+            head2: if vocab_lo.is_some() && !std::env::var("TANG_FLASH_MTP_HEAD2").is_ok_and(|v| v == "0") {
                 let n_lo = vocab_lo.context("TANG_FLASH_MTP_HEAD2 needs a pruned draft vocabulary")?;
                 let ht = main.info("output.weight")?;
                 ensure!(ht.ty == GgmlType::Q5K, "head2 assumes a Q5_K head");
@@ -2768,12 +2765,12 @@ impl Mtp {
             } else {
                 None
             },
-            short: z(64 * 10),
+            short: z(64 * 10 + 256),
             embed_rb: emb_t.row_bytes()?,
             kc: z(max_ctx * QSA_KV * QSA_D),
             vc: z(max_ctx * QSA_KV * QSA_D),
-            part: z(MAX_T * QSA_KV * max_ctx.div_ceil(128) * 12 * 258),
-            nchunk: max_ctx.div_ceil(128),
+            part: z(MAX_T * QSA_KV * max_ctx.div_ceil(32) * 12 * 258),
+            nchunk: max_ctx.div_ceil(32),
             h: z(MAX_T * HC * HIDDEN),
             toks: z(MAX_T),
             ctl: (0..super::mtp_gpu::MAX_STEPS).map(|_| z(4)).collect(),
@@ -2898,7 +2895,9 @@ impl Engine {
             let (lg, n, part) = (a(&mt.logits), rows as i32, a(&mt.short));
             launch(self.k.m_short1, (64, 1, 1), 1024, tang_moe::args![lg, n, part]);
             let (np, hd, rbi, ids, pr, nl, hb) = (64i32, a(exact), *rb as i32, a(&mt.drafts[step]), a(&mt.probs[step]), *n_lo as i32, *hi as i32);
-            launch(self.k.m_short2, (1, 1, 1), 256, tang_moe::args![part, np, hd, rbi, xl, ids, pr, nl, hb]);
+            let ex = part + (64 * 10 * 4) as u64;
+            launch(self.k.m_short2a, (32, 1, 1), 256, tang_moe::args![part, np, hd, rbi, xl, ex]);
+            launch(self.k.m_short2b, (1, 1, 1), 256, tang_moe::args![part, np, ex, ids, pr, nl, hb]);
             return;
         }
         let (v, n_lo, hi_base) = match &mt.dhead {
