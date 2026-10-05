@@ -33,13 +33,19 @@ typedef unsigned long long u64;
 #define QSA_NCH 33
 #define TOPK 10
 #define FF 640
+#ifndef PLAN_CAP
 #define PLAN_CAP 88
+#endif
 #define PLAN_GP 4
 #define PLAN_GS (PLAN_GP + 2 * PLAN_CAP)
 #define PLAN_ET (PLAN_GS + PLAN_CAP + 1)
 #define PLAN_ED (PLAN_ET + PLAN_CAP)
 #define PLAN_MISS (PLAN_ED + PLAN_CAP)
+#ifndef SHARED_ROW
 #define SHARED_ROW 80
+#endif
+// The shared expert's first parts row in a wide (prefill, T > 8) window: 64 · TOPK.
+#define WIDE_SHARED_ROW 640
 #define GU_CODES 0
 #define GU_SCALES 819200
 #define DOWN_CODES 921600
@@ -839,7 +845,7 @@ __device__ __forceinline__ void hc_wide_body(
                     #pragma unroll
                     for (int k = 0; k < TOPK; k++)
                         y = __fmaf_rn(Wr[t * TOPK + k], PARTS[(u64)(t * TOPK + k) * HIDDEN + d], y);
-                    if (sg >= 0) y = __fmaf_rn(gs, PARTS[(u64)((M > 8 ? M * TOPK : SHARED_ROW) + t) * HIDDEN + d], y);
+                    if (sg >= 0) y = __fmaf_rn(gs, PARTS[(u64)((M > 8 ? WIDE_SHARED_ROW : SHARED_ROW) + t) * HIDDEN + d], y);
                 }
                 x = __fmaf_rn(y, g, x);
                 row[d] = x;
@@ -1312,10 +1318,10 @@ __device__ unsigned int scan128(unsigned int v, unsigned int* sc) {
         unsigned int n = __shfl_up_sync(0xffffffffu, v, o);
         if (lane >= o) v += n;
     }
-    if (lane == 31 && warp < 4) sc[warp] = v;
+    if (lane == 31) sc[warp] = v;
     __syncthreads();
     unsigned int off = 0;
-    for (unsigned int w = 0; w < warp && w < 4; w++) off += sc[w];
+    for (unsigned int w = 0; w < warp; w++) off += sc[w];
     __syncthreads();
     return v + off;
 }
@@ -1326,7 +1332,7 @@ __device__ unsigned int scan128(unsigned int v, unsigned int* sc) {
 __device__ void plan_core(const unsigned int* ids, const unsigned int* __restrict__ TABLE, u64 shared,
                           unsigned int* __restrict__ PLAN, unsigned int T) {
     __shared__ unsigned int first[PLAN_CAP], gid[PLAN_CAP], start[PLAN_CAP + 1];
-    __shared__ unsigned int sc[4];
+    __shared__ unsigned int sc[32];
     __shared__ unsigned int tot_g, tot_e, tot_m;
     unsigned int n = T * TOPK, tid = threadIdx.x;
     u64 p = 0;
@@ -1345,7 +1351,7 @@ __device__ void plan_core(const unsigned int* ids, const unsigned int* __restric
     unsigned int g_incl = scan128(res ? 1u : 0u, sc);
     unsigned int s_incl = scan128(cnt, sc);
     unsigned int m_incl = scan128(miss ? 1u : 0u, sc);
-    if (tid == 127) { tot_g = g_incl; tot_e = s_incl; tot_m = m_incl; }
+    if (tid == blockDim.x - 1) { tot_g = g_incl; tot_e = s_incl; tot_m = m_incl; }
     if (res) {
         unsigned int g = g_incl - 1, st = s_incl - cnt;
         gid[tid] = g;
@@ -1392,7 +1398,7 @@ __device__ void plan_core(const unsigned int* ids, const unsigned int* __restric
 extern "C" __global__ void fl_moe_plan(const unsigned int* __restrict__ IDS, const unsigned int* __restrict__ TABLE,
                                        u64 shared, unsigned int* __restrict__ PLAN, unsigned int T) {
     __shared__ unsigned int ids[PLAN_CAP];
-    if (threadIdx.x < T * TOPK) ids[threadIdx.x] = IDS[threadIdx.x];
+    for (unsigned int i = threadIdx.x; i < T * TOPK; i += blockDim.x) ids[i] = IDS[i];
     __syncthreads();
     plan_core(ids, TABLE, shared, PLAN, T);
 }
@@ -1406,8 +1412,8 @@ extern "C" __global__ void fl_moe_route(const float* __restrict__ L, unsigned in
                                         unsigned int* __restrict__ IDS, float* __restrict__ W,
                                         unsigned int* __restrict__ PLAN, unsigned int T) {
     __shared__ unsigned int ids[PLAN_CAP];
-    unsigned int lane = threadIdx.x & 31, t = threadIdx.x >> 5;
-    if (t < T) {
+    unsigned int lane = threadIdx.x & 31;
+    for (unsigned int t = threadIdx.x >> 5; t < T; t += blockDim.x >> 5) {
         unsigned int id;
         float w;
         router_warp(L + (u64)t * stride, NE, lane, &id, &w);
@@ -1417,7 +1423,8 @@ extern "C" __global__ void fl_moe_route(const float* __restrict__ L, unsigned in
             if (!forced) ids[t * TOPK + lane] = id;
         }
     }
-    if (forced && threadIdx.x < T * TOPK) ids[threadIdx.x] = FORCED[threadIdx.x];
+    if (forced)
+        for (unsigned int i = threadIdx.x; i < T * TOPK; i += blockDim.x) ids[i] = FORCED[i];
     __syncthreads();
     plan_core(ids, TABLE, shared, PLAN, T);
 }
@@ -1667,6 +1674,9 @@ extern "C" __global__ void __launch_bounds__(128, 8) fl_moe_gu_t##T( \
     moe_gu_body<T>(XQ, Tm, PLAN, HQ); \
 }
 MOE_GU(1) MOE_GU(2) MOE_GU(3) MOE_GU(4) MOE_GU(5) MOE_GU(6) MOE_GU(7) MOE_GU(8)
+#ifdef FLASH_WIDE
+MOE_GU(64)
+#endif
 
 // Down rows of every planned expert against its entries' quantized h (HQ), into PARTS[dst]:
 // one 16-row down tile of group g for a warp (160 per group). CG: read HQ through L2 only (it
@@ -1677,23 +1687,28 @@ __device__ __forceinline__ void moe_down_tile(const unsigned int* __restrict__ H
     unsigned int lane = threadIdx.x & 31;
     const unsigned int kb = FF / 4;
     const unsigned char* blob = plan_blob(PLAN, g);
-    unsigned int e0 = PLAN[PLAN_GS + g], ne = PLAN[PLAN_GS + g + 1] - e0;
-    unsigned int ents[NE];
+    unsigned int e0 = PLAN[PLAN_GS + g], ne_all = PLAN[PLAN_GS + g + 1] - e0;
+    // Entries in passes of DC (one pass up to T = 8; wide groups re-read the tile from L2).
+    constexpr int DC = NE > 8 ? 8 : NE;
+    for (unsigned int p0 = 0; p0 < ne_all; p0 += DC) {
+    unsigned int ne = min(ne_all - p0, (unsigned int)DC);
+    unsigned int ents[DC];
     #pragma unroll
-    for (int e = 0; e < NE; e++) ents[e] = e0 + e;
-    float a0[NE], a1[NE];
-    tile_dot<FF / 128, NE, CG>(blob + DOWN_CODES + (u64)tile * (FF / 128) * 512,
+    for (int e = 0; e < DC; e++) ents[e] = e0 + p0 + e;
+    float a0[DC], a1[DC];
+    tile_dot<FF / 128, DC, CG>(blob + DOWN_CODES + (u64)tile * (FF / 128) * 512,
                                blob + DOWN_SCALES + (u64)tile * (FF / 128) * 64, HQ, kb, PLAN_CAP, ents, ne, lane,
                                a0, a1);
-    unsigned int my_dst = lane < ne ? PLAN[PLAN_ED + e0 + lane] : 0;
+    unsigned int my_dst = lane < ne ? PLAN[PLAN_ED + e0 + p0 + lane] : 0;
     #pragma unroll
-    for (int e = 0; e < NE; e++) {
+    for (int e = 0; e < DC; e++) {
         unsigned int dst = __shfl_sync(0xffffffffu, my_dst, e);
         if (e < ne && (lane & 3) == 0) {
             float* out = PARTS + (u64)dst * HIDDEN + 16 * tile + (lane >> 2);
             out[0] = a0[e];
             out[8] = a1[e];
         }
+    }
     }
 }
 
@@ -1712,6 +1727,9 @@ extern "C" __global__ void __launch_bounds__(256, 3) fl_moe_down_t##T( \
     moe_down_body<T>(HQ, PLAN, PARTS); \
 }
 MOE_DOWN(1) MOE_DOWN(2) MOE_DOWN(3) MOE_DOWN(4) MOE_DOWN(5) MOE_DOWN(6) MOE_DOWN(7) MOE_DOWN(8)
+#ifdef FLASH_WIDE
+MOE_DOWN(64)
+#endif
 
 // gu and down in one launch on a co-resident grid of 128-thread blocks: items are every group's
 // 20 gu items, then every group's 40 down items (4 tiles, a warp each), taken in index order
@@ -1757,6 +1775,9 @@ extern "C" __global__ void __launch_bounds__(128, 8) fl_moe_fused_t##T( \
     moe_fused_body<T>(XQ, Tm, PLAN, HQ, PARTS, CNT); \
 }
 MOE_FUSED(1) MOE_FUSED(2) MOE_FUSED(3) MOE_FUSED(4) MOE_FUSED(5) MOE_FUSED(6) MOE_FUSED(7) MOE_FUSED(8)
+#ifdef FLASH_WIDE
+MOE_FUSED(64)
+#endif
 
 // y[t] = Σ_i w[t][i] parts[t·10 + i] (+ σ(logit[t][sg]) parts[SHARED_ROW + t]). Grid
 // (HIDDEN / 256, T).

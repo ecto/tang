@@ -17,11 +17,11 @@ use crate::kernels::flash_cuda::FLASH_CUDA;
 const NULL: u64 = 0;
 
 /// Words of the per-device sync counters, and each fused kernel's slot in them.
-const SYNC_WORDS: usize = 256;
+const SYNC_WORDS: usize = 1024;
 const SYNC_HC: usize = 0;
 /// `fl_moe_fused`: PLAN_CAP group counters, then its last-block counter.
 const SYNC_MOE: usize = 64;
-const _: () = assert!(SYNC_MOE + MoePlan::CAP + 1 <= SYNC_WORDS);
+const _: () = assert!(SYNC_MOE + MoePlan::WIDE_CAP + 1 <= SYNC_WORDS);
 
 /// `TANG_FLASH_UNFUSED=1`: the multi-launch kernels instead of the barrier-merged ones (A/B).
 fn unfused() -> bool {
@@ -162,6 +162,30 @@ impl CudaComputeDevice {
         let (_module, f) = self.get_func_with_arch(src, name, "sm_86");
         self.llm_funcs.borrow_mut().insert(name, f.clone());
         f
+    }
+
+    /// A kernel of the wide (prefill) MoE module: the flash source with the wide plan capacity.
+    fn fl_wide(&self, name: &'static str) -> CudaFunction {
+        let key: &'static str = Box::leak(format!("wide:{name}").into_boxed_str());
+        if let Some(f) = self.llm_funcs.borrow().get(key) {
+            return f.clone();
+        }
+        let src: &'static str = Box::leak(
+            format!(
+                "#define FLASH_WIDE 1\n#define PLAN_CAP {}\n#define SHARED_ROW {}\n{FLASH_CUDA}",
+                MoePlan::WIDE_CAP,
+                MoePlan::shared_row(MAX_T + 1)
+            )
+            .into_boxed_str(),
+        );
+        let (_module, f) = self.get_func_with_arch(src, name, "sm_86");
+        self.llm_funcs.borrow_mut().insert(key, f.clone());
+        f
+    }
+
+    /// `fl` for the MoE kernels: the wide module above `MAX_T`.
+    fn fl_moe(&self, name: &'static str, t: usize) -> CudaFunction {
+        if t > MAX_T { self.fl_wide(name) } else { self.fl(name) }
     }
 
     pub(super) fn upload_bytes_impl(&self, bytes: &[u8]) -> CudaBuffer {
@@ -1092,8 +1116,9 @@ impl CudaComputeDevice {
         plan: &mut CudaBuffer,
         t: usize,
     ) {
-        assert!((1..=MAX_T).contains(&t) && plan.len >= MoePlan::WORDS && table.len >= 2 * EXPERTS);
-        let f = self.fl("fl_moe_plan");
+        assert!(width_ok(t) && t <= MoePlan::WIDE_MAX && plan.len >= MoePlan::words(t) && table.len >= 2 * EXPERTS);
+        let f = self.fl_moe("fl_moe_plan", t);
+        let threads = if t > MAX_T { 1024 } else { 128 };
         let tu = t as u32;
         unsafe {
             self.stream
@@ -1103,7 +1128,7 @@ impl CudaComputeDevice {
                 .arg(&shared)
                 .arg(plan.f32_data_mut())
                 .arg(&tu)
-                .launch(grid((1, 1, 1), 128))
+                .launch(grid((1, 1, 1), threads))
                 .unwrap();
         }
     }
@@ -1122,9 +1147,10 @@ impl CudaComputeDevice {
         plan: &mut CudaBuffer,
         t: usize,
     ) {
-        assert!((1..=MAX_T).contains(&t) && (TOPK..=512).contains(&n_expert));
-        assert!(plan.len >= MoePlan::WORDS && table.len >= 2 * EXPERTS);
-        let f = self.fl("fl_moe_route");
+        assert!(width_ok(t) && t <= MoePlan::WIDE_MAX && (TOPK..=512).contains(&n_expert));
+        assert!(plan.len >= MoePlan::words(t) && table.len >= 2 * EXPERTS);
+        let f = self.fl_moe("fl_moe_route", t);
+        let threads = if t > MAX_T { 1024 } else { 256 };
         let (s, ne, tu, fo) = (
             stride as u32,
             n_expert as u32,
@@ -1145,7 +1171,7 @@ impl CudaComputeDevice {
                 .arg(w.f32_data_mut())
                 .arg(plan.f32_data_mut())
                 .arg(&tu)
-                .launch(grid((1, 1, 1), 256))
+                .launch(grid((1, 1, 1), threads))
                 .unwrap();
         }
     }
@@ -1159,7 +1185,7 @@ impl CudaComputeDevice {
         t: usize,
     ) {
         assert!(
-            scratch.len >= MoePlan::scratch_words() && parts.len >= MoePlan::PARTS_ROWS * HIDDEN
+            scratch.len >= MoePlan::scratch_words_for(t) && parts.len >= MoePlan::parts_rows(t) * HIDDEN
         );
         const GU: [&str; 8] = [
             "fl_moe_gu_t1",
@@ -1194,10 +1220,10 @@ impl CudaComputeDevice {
                 "fl_moe_fused_t7",
                 "fl_moe_fused_t8",
             ];
-            let f = self.fl(FUSED[t - 1]);
+            let f = if t > MAX_T { self.fl_wide("fl_moe_fused_t64") } else { self.fl(FUSED[t - 1]) };
             let blocks = self.coresident(&f, 128, 8);
             let mut sync = self.sync_words();
-            let mut cnt = sync.slice_mut(SYNC_MOE..SYNC_MOE + MoePlan::CAP + 1);
+            let mut cnt = sync.slice_mut(SYNC_MOE..SYNC_MOE + MoePlan::cap(t) + 1);
             unsafe {
                 self.stream
                     .launch_builder(&f)
@@ -1212,7 +1238,7 @@ impl CudaComputeDevice {
             }
             return;
         }
-        let f = self.fl(GU[t - 1]);
+        let f = if t > MAX_T { self.fl_wide("fl_moe_gu_t64") } else { self.fl(GU[t - 1]) };
         unsafe {
             self.stream
                 .launch_builder(&f)
@@ -1223,7 +1249,7 @@ impl CudaComputeDevice {
                 .launch(grid((16 * super::llm::sm_count(), 1, 1), 128))
                 .unwrap();
         }
-        let f = self.fl(DOWN[t - 1]);
+        let f = if t > MAX_T { self.fl_wide("fl_moe_down_t64") } else { self.fl(DOWN[t - 1]) };
         unsafe {
             self.stream
                 .launch_builder(&f)
@@ -1246,7 +1272,7 @@ impl CudaComputeDevice {
         y: &mut CudaBuffer,
         t: usize,
     ) {
-        let f = self.fl("fl_moe_combine");
+        let f = self.fl_moe("fl_moe_combine", t);
         let (s, sgi) = (stride as u32, sg.map_or(-1i32, |c| c as i32));
         unsafe {
             self.stream
@@ -3210,8 +3236,8 @@ mod tests {
                 inv.eq(col(&w8, j, TOPK), &w1, &format!("router w col {j}"));
             }
         }
-        // Grouped experts (parts rows per token) and combine (wide: TODO, the plan is MAX_T-sized).
-        if tw <= MAX_T {
+        // Grouped experts (parts rows per token) and combine.
+        {
             let blobs: Vec<B> = (0..6)
                 .map(|_| {
                     g.upload_bytes(&ExpertBlob::from_gguf(
@@ -3266,7 +3292,7 @@ mod tests {
                     .iter()
                     .flat_map(|&j| col(&logits, j, EXPERTS + 1).to_vec())
                     .collect();
-                let mut plan = g.alloc_f32(MoePlan::WORDS);
+                let mut plan = g.alloc_f32(MoePlan::words(m));
                 g.moe_plan_into(
                     &g.upload_u32(&pid),
                     &gtab,
@@ -3276,8 +3302,8 @@ mod tests {
                 );
                 let xq = quant(&px, m, HIDDEN);
                 let (mut sc, mut parts) = (
-                    g.alloc_f32(MoePlan::scratch_words()),
-                    g.alloc_f32(MoePlan::PARTS_ROWS * HIDDEN),
+                    g.alloc_f32(MoePlan::scratch_words_for(m)),
+                    g.alloc_f32(MoePlan::parts_rows(m) * HIDDEN),
                 );
                 // SAFETY: the plan's addresses are the live blobs above.
                 unsafe { g.moe_grouped_into(&xq, &plan, &mut sc, &mut parts, m) };
@@ -3304,8 +3330,8 @@ mod tests {
                     );
                 }
                 inv.eq(
-                    col(&p8, MoePlan::SHARED_ROW + j, HIDDEN),
-                    col(&p1, MoePlan::SHARED_ROW, HIDDEN),
+                    col(&p8, MoePlan::shared_row(tw) + j, HIDDEN),
+                    col(&p1, MoePlan::shared_row(1), HIDDEN),
                     &format!("moe shared col {j}"),
                 );
                 inv.eq(col(&y8, j, HIDDEN), &y1, &format!("moe combine col {j}"));
