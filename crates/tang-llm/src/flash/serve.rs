@@ -53,6 +53,9 @@ pub struct Settings {
     pub disk: Option<PathBuf>,
     /// Write each request's prompt and output ids here (`req-N.ids`, `req-N.out`).
     pub dump: Option<PathBuf>,
+    /// Chat completion bodies (JSON files) to prefill at start, so their tools block and
+    /// system prompt states are saved before the first real request.
+    pub warm: Vec<PathBuf>,
 }
 
 /// A saved running state and the tokens it follows.
@@ -281,7 +284,7 @@ impl FlashServe {
             s.snapshots,
             s.disk.as_ref().map_or(String::new(), |d| format!(", system prompts saved in {}", d.display()))
         );
-        Ok(FlashServe {
+        let mut me = FlashServe {
             drafts_mode: if e.use_mtp { "mtp" } else { "none" },
             e,
             im_start: id("<|im_start|>")?,
@@ -304,7 +307,16 @@ impl FlashServe {
             gdn_layers,
             requests: 0,
             line: Line::default(),
-        })
+        };
+        for f in &s.warm {
+            let t = Instant::now();
+            let body: Value = serde_json::from_str(&std::fs::read_to_string(f)?).with_context(|| format!("reading {}", f.display()))?;
+            let mut req = crate::server::parse(&body).map_err(|e| anyhow::anyhow!(e))?;
+            req.prefill_only = true;
+            me.generate(&req, &mut |_| true)?;
+            eprintln!("tang-llm: warmed {} ({} tokens, {} reused) in {:.1} s", f.display(), me.line.prompt, me.line.reused, t.elapsed().as_secs_f64());
+        }
+        Ok(me)
     }
 
     /// The template's messages: tool-call arguments as objects (the template wants mappings),
