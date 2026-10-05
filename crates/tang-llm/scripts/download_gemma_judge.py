@@ -2,19 +2,23 @@
 Verifies completed files and LFS hashes, decodes HTTP compression and reserves 4 GiB disk.
 """
 import hashlib
+import argparse
 import json
 import os
 import shutil
-import sys
 from pathlib import Path
 import requests
 from huggingface_hub import model_info
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-repo='mlx-community/gemma-3-4b-it-4bit'
-revision='93724907d4ed1745d2fe50baadf3b0b01a65abf2'
-root=Path(sys.argv[1]);root.mkdir(parents=True,exist_ok=True)
+parser=argparse.ArgumentParser(description=__doc__)
+parser.add_argument('output',type=Path)
+parser.add_argument('--model',choices=('4b','12b'),default='4b')
+args=parser.parse_args()
+repo=f'mlx-community/gemma-3-{args.model}-it-4bit'
+revision={'4b':'93724907d4ed1745d2fe50baadf3b0b01a65abf2','12b':'86cc6a8dedbc456dd0e4af01a9d09f396f77e558'}[args.model]
+root=args.output;root.mkdir(parents=True,exist_ok=True)
 record=root/'download.json'
 manifest=json.loads(record.read_text()) if record.exists() else {'repo':repo,'revision':revision,'files':{}}
 assert manifest['repo']==repo and manifest['revision']==revision
@@ -34,6 +38,8 @@ for entry in files:
         with dest.open('rb') as f:
             while data:=f.read(16*1024**2):digest.update(data)
         assert digest.hexdigest()==previous['sha256'] and dest.stat().st_size==previous['bytes']
+        assert dest.stat().st_size==entry.size,'upstream size mismatch'
+        if entry.lfs:assert digest.hexdigest()==entry.lfs.sha256,'upstream SHA256 mismatch'
         print('Verified completed',entry.rfilename,flush=True)
         continue
     assert entry.rfilename not in manifest['files'],'completed file missing'

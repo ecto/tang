@@ -142,6 +142,12 @@ python crates/tang-llm/scripts/z_image_attention_audit.py \
 `scripts/download_gemma_judge.py <new-directory>` explicitly downloads a pinned public
 Gemma 3 4B MLX checkpoint, verifies hashes and preserves the same disk reserve. Language
 weights are Q4 and vision weights BF16. No judge weights download during inference.
+Add `--model 12b` for the pinned public Gemma 3 12B checkpoint (about 8.03 GB).
+The downloader requires space for every remaining file plus a 4 GiB reserve and
+verifies LFS hashes before publishing each file. Check free device memory separately:
+the larger model also needs more KV memory, especially when used as the coding model.
+Replacing a test model is an explicit caller action; this utility never removes or
+evicts existing weights or inference workloads.
 
 For constrained disk, `scripts/download_z_image.py <new-directory>` pins a public
 Hugging Face revision, streams F32 matrices into BF16, preserves vectors, verifies
