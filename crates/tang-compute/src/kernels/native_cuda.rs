@@ -17,14 +17,6 @@ __device__ __forceinline__ float warp_sum(float v) {
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
     return v;
 }
-// IQ4_NL grid for four nibbles (bytes 0..15) at once.
-__device__ __forceinline__ unsigned int iq4w(unsigned int n) {
-    const unsigned int sel = (n & 0x7u) | ((n >> 4) & 0x70u) | ((n >> 8) & 0x700u) | ((n >> 12) & 0x7000u);
-    const unsigned int lo = __byte_perm(0xBFAD9881u, 0xF6EADDCFu, sel);
-    const unsigned int hi = __byte_perm(0x26190D01u, 0x71594535u, sel);
-    const unsigned int m = ((n >> 3) & 0x01010101u) * 0xFFu;
-    return (lo & ~m) | (hi & m);
-}
 
 #define LB ((TY == 42 || TY == 11) ? 8 : 16)
 #define HB ((TY == 6 || TY == 13 || TY == 11) ? 4 : (TY == 14 ? 8 : 0))
@@ -36,6 +28,28 @@ __device__ __forceinline__ unsigned int iq4w(unsigned int n) {
 // The eight dp4a operands (int8 lanes in activation order) of one chunk.
 template <int TY>
 __device__ __forceinline__ void operands(const unsigned char* L, const unsigned char* H, int op[8]) {
+    if (TY == 20 || TY == 23) {
+        // IQ4: both nibble words of a code word through the 16-entry grid with byte permutes
+        // (llama.cpp's get_int_from_table_16): the low 3 bits pick among 8 entries, bit 3
+        // between the two halves of the table.
+        uint4 q = *(const uint4*)L;
+        unsigned int w[4] = {q.x, q.y, q.z, q.w};
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const unsigned int hl = 0x32103210u | ((w[i] & 0x88888888u) >> 1);
+            unsigned int tmp[2];
+            #pragma unroll
+            for (int k = 0; k < 2; k++) {
+                const unsigned int sh = 16 * k;
+                const unsigned int lo = __byte_perm(0xBFAD9881u, 0xF6EADDCFu, w[i] >> sh);
+                const unsigned int hi = __byte_perm(0x26190D01u, 0x71594535u, w[i] >> sh);
+                tmp[k] = __byte_perm(lo, hi, hl >> sh);
+            }
+            op[2 * i] = (int)__byte_perm(tmp[0], tmp[1], 0x6420);
+            op[2 * i + 1] = (int)__byte_perm(tmp[0], tmp[1], 0x7531);
+        }
+        return;
+    }
     if (LB == 16) {
         uint4 q = *(const uint4*)L;
         unsigned int w[4] = {q.x, q.y, q.z, q.w};
@@ -63,12 +77,13 @@ __device__ __forceinline__ void operands(const unsigned char* L, const unsigned 
             v |= b0 << (TY == 11 ? 2 : 4);
             if (HB == 8) v |= ((h1 >> j) & 0x01010101u) << 5;
         }
-        if (TY == 2) v = __vsub4(v, 0x08080808u);
-        else if (TY == 6) v = __vsub4(v, 0x10101010u);
-        else if (TY == 42) v = __vsub4(v, 0x01010101u);
-        else if (TY == 11) v = __vsub4(v, 0x04040404u);
-        else if (TY == 14) v = __vsub4(v, 0x20202020u);
-        else if (TY == 20 || TY == 23) v = iq4w(v);
+        // Stored value v (unsigned, below 0x80) minus the type's offset as signed bytes:
+        // (v + 0x80 - off) ^ 0x80, no carries between bytes.
+        if (TY == 2) v = (v + 0x78787878u) ^ 0x80808080u;
+        else if (TY == 6) v = (v + 0x70707070u) ^ 0x80808080u;
+        else if (TY == 42) v = (v + 0x7F7F7F7Fu) ^ 0x80808080u;
+        else if (TY == 11) v = (v + 0x7C7C7C7Cu) ^ 0x80808080u;
+        else if (TY == 14) v = (v + 0x60606060u) ^ 0x80808080u;
         op[j] = (int)v;
     }
 }
