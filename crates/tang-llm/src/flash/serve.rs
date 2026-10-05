@@ -198,6 +198,8 @@ pub struct FlashServe {
     clock: u64,
     temp: f32,
     sampling: SamplingMode,
+    /// Widest prefill window (`TANG_FLASH_WIDE`, default 32; 0: decode-width windows only).
+    wide: usize,
     disk: Option<PathBuf>,
     dump: Option<PathBuf>,
     /// Lengths of a running state's parts, to check states read from disk.
@@ -301,6 +303,7 @@ impl FlashServe {
             clock: 0,
             temp: s.temp,
             sampling: s.sampling,
+            wide: std::env::var("TANG_FLASH_WIDE").ok().and_then(|v| v.parse().ok()).unwrap_or(32),
             disk: s.disk.clone(),
             dump: s.dump.clone(),
             shape,
@@ -659,12 +662,12 @@ impl FlashServe {
         let mut a = start;
         for (p, pinned) in marks {
             if p > a {
-                prefill_windows(&mut self.e, &ids[a..p], MAX_T, mtp_from)?;
+                prefill_span(&mut self.e, &ids[a..p], MAX_T, mtp_from, self.wide, false)?;
                 a = p;
             }
             self.snapshot(pinned)?;
         }
-        let next = prefill_windows(&mut self.e, &ids[a..], MAX_T, mtp_from)?.0;
+        let next = prefill_span(&mut self.e, &ids[a..], MAX_T, mtp_from, self.wide, true)?.0;
         Ok((start, next))
     }
 
@@ -1033,13 +1036,27 @@ pub fn default_disk(gguf: &Path) -> Option<PathBuf> {
 /// only changes its drafts' acceptance, never the output (measured: no change in tokens/window
 /// at 2K and 10K with the last 512 positions).
 pub fn prefill_windows(e: &mut Engine, ids: &[u32], chunk: usize, mtp_from: usize) -> Result<(u32, Vec<super::engine::WinStats>, f64)> {
+    prefill_span(e, ids, chunk, mtp_from, 0, true)
+}
+
+/// [`prefill_windows`] with wide prefill windows (`Engine::prefill_wide`, widths 16/32/64 up
+/// to `wide`; 0: none) for everything but the last `MAX_T` tokens when `last` (that window
+/// runs the head), or for all of it otherwise (the result's next token is then meaningless).
+pub fn prefill_span(e: &mut Engine, ids: &[u32], chunk: usize, mtp_from: usize, wide: usize, last: bool) -> Result<(u32, Vec<super::engine::WinStats>, f64)> {
     ensure!(!ids.is_empty(), "empty prompt");
     let pos_start = e.tokens.len();
     e.tokens.extend_from_slice(ids);
     let end = e.tokens.len();
     let (mut pos, mut next, mut stats, mut mtp_ms) = (pos_start, 0, Vec::new(), 0.0);
     while pos < end {
-        let t = chunk.min(end - pos).clamp(1, MAX_T);
+        let left = end - pos;
+        let room = if last { left.saturating_sub(1) } else { left };
+        if let Some(&w) = [64usize, 32, 16].iter().find(|&&w| w <= wide && w <= room) {
+            stats.push(e.prefill_wide(pos, w)?);
+            pos += w;
+            continue;
+        }
+        let t = chunk.min(left).clamp(1, MAX_T);
         let out = e.window(pos, t, None)?;
         stats.push(e.last);
         if e.use_mtp && e.has_mtp() && pos + t > mtp_from {
@@ -1066,6 +1083,7 @@ pub fn prefill_bench(args: &[String]) -> Result<()> {
     let (mut caps, mut tails) = (vec![16usize, 88], vec![0usize, 512]);
     let mut quick = false;
     let mut chunks: Vec<usize> = Vec::new();
+    let mut wides: Vec<usize> = Vec::new();
     let list = |s: &str| -> Result<Vec<usize>> { s.split(',').map(|x| Ok(x.parse::<usize>()?)).collect() };
     while let Some(a) = it.next() {
         let mut val = || it.next().with_context(|| format!("{a} needs a value"));
@@ -1081,6 +1099,7 @@ pub fn prefill_bench(args: &[String]) -> Result<()> {
             "--mtp" => mtp = Some(PathBuf::from(val()?)),
             "--quick" => quick = true,
             "--chunks" => chunks = list(val()?)?,
+            "--wide" => wides = list(val()?)?,
             s => bail!("unknown argument {s}"),
         }
     }
@@ -1105,6 +1124,9 @@ pub fn prefill_bench(args: &[String]) -> Result<()> {
     for &n in &ns {
         let p = &ids[..n];
         let mut configs: Vec<(String, usize, usize, usize)> = vec![("served (mtp all, cap default)".into(), usize::MAX, default_cap, MAX_T)];
+        for &w in &wides {
+            configs.push((format!("wide {w}, mtp last 512"), 512, default_cap, 1000 + w));
+        }
         for &c in &chunks {
             configs.push((format!("chunk {c}, mtp last 512"), 512, default_cap, c));
         }
@@ -1130,7 +1152,11 @@ pub fn prefill_bench(args: &[String]) -> Result<()> {
                 }
             }
             let t0 = Instant::now();
-            let (next, st, mtp_ms) = prefill_windows(&mut e, p, chunk, n.saturating_sub(tail))?;
+            let (next, st, mtp_ms) = if chunk > 1000 {
+                prefill_span(&mut e, p, MAX_T, n.saturating_sub(tail), chunk - 1000, true)?
+            } else {
+                prefill_windows(&mut e, p, chunk, n.saturating_sub(tail))?
+            };
             let secs = t0.elapsed().as_secs_f64();
             let last_t = st.last().map_or(1, |s| s.t);
             let lg = e.logits(last_t)[(last_t - 1) * v..].to_vec();

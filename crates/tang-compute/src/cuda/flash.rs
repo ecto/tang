@@ -1555,6 +1555,35 @@ impl CudaComputeDevice {
     }
 }
 
+/// Raw handles for an engine that launches its own kernels and mapped-memory protocol on this
+/// device's stream (tang-llm's Flash-Next engine and tang-moe's doorbell).
+impl CudaComputeDevice {
+    /// The driver handle of this device's (only) stream.
+    pub fn cu_stream(&self) -> cudarc::driver::sys::CUstream {
+        self.stream.cu_stream()
+    }
+
+    /// This device's stream, for `launch_builder` on [`custom_func`](Self::custom_func)s.
+    pub fn cuda_stream(&self) -> &std::sync::Arc<cudarc::driver::CudaStream> {
+        &self.stream
+    }
+
+    /// This device's context.
+    pub fn cuda_context(&self) -> &std::sync::Arc<cudarc::driver::CudaContext> {
+        &self.ctx
+    }
+
+    /// Kernel `name` of CUDA C `src`, compiled once for sm_86 and cached by name.
+    pub fn custom_func(&self, src: &str, name: &'static str) -> CudaFunction {
+        if let Some(f) = self.llm_funcs.borrow().get(name) {
+            return f.clone();
+        }
+        let (_module, f) = self.get_func_with_arch(src, name, "sm_86");
+        self.llm_funcs.borrow_mut().insert(name, f.clone());
+        f
+    }
+}
+
 /// GPU timing for benchmarks (`flash-kernel-bench`).
 impl CudaComputeDevice {
     /// GPU milliseconds between CUDA events recorded before and after `f` (whatever `f`

@@ -3,10 +3,13 @@
 //! per-window values from the `win` record, so they capture into the window's graph.
 
 /// CUDA C, compiled by NVRTC at load (`CudaComputeDevice::custom_func`).
+/// PLE ring rows (positions mod this): more than the widest window plus its 3 conv taps.
+pub const PLE_RING: usize = 128;
+
 pub const SRC: &str = r#"
 #define HIDDEN 2560
 #define HC 4
-#define PLE_RING 16
+#define PLE_RING 128
 
 __device__ __forceinline__ float silu_f(float x) { return x / (1.0f + expf(-x)); }
 __device__ __forceinline__ float sigmoid_f(float x) { return 1.0f / (1.0f + expf(-x)); }

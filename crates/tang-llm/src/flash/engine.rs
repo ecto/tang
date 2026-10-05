@@ -48,6 +48,9 @@ use tang_moe::resident::Loc;
 type B = CudaBuffer;
 type Fun = cudarc::driver::sys::CUfunction;
 
+/// Widest prefill window (`prefill_wide`): scratch, staging and plans are sized for it.
+pub const WIDE: usize = MoePlan::WIDE_MAX;
+
 /// Router rows: 512 experts and the shared expert's gate.
 const ROUTER_ROWS: usize = EXPERTS + 1;
 const EPS: f32 = 1e-6;
@@ -381,13 +384,13 @@ impl Io {
     /// Raised by the n-gram reader when the window's PLE rows are staged (own cache line).
     const PLE_FLAG: usize = 128;
     const EMB: usize = 256;
-    const PLE: usize = Self::EMB + MAX_T * HIDDEN * 4;
-    const IDS: usize = Self::PLE + MAX_T * HIDDEN * 4;
+    const PLE: usize = Self::EMB + WIDE * HIDDEN * 4;
+    const IDS: usize = Self::PLE + WIDE * HIDDEN * 4;
     const STAMPS: usize = Self::IDS + 64;
     /// Every layer's routed ids `[48][MAX_T × TOPK]` u32, written by the graph.
     const LIDS: usize = Self::STAMPS + 48 * 8 * 8 + 64;
     /// MTP inputs: cell tokens (8 u32), then at +64 the control record [pos0, cells].
-    const MTP_IN: usize = Self::LIDS + 48 * MAX_T * TOPK * 4;
+    const MTP_IN: usize = Self::LIDS + 48 * WIDE * TOPK * 4;
     /// MTP outputs per step: drafts (8 u32), then at +32 probabilities (8 f32).
     const MTP_OUT: usize = Self::MTP_IN + 128;
     /// Teacher-forced MTP cells' token embeddings (8 × 2560 f32).
@@ -520,6 +523,10 @@ pub struct Engine {
     pub mtp_last: Vec<(u32, f32)>,
     /// Top-k / top-p / presence-penalty sampling in the head (`enable_sampler`); `None`: argmax.
     sampler: Option<Box<super::sampler::Sampler>>,
+    /// Enqueueing a wide prefill window (`prefill_wide`): no doorbell, misses over PCIe, no head.
+    wide: bool,
+    /// Captured wide prefill windows by width.
+    wide_graphs: std::collections::HashMap<usize, Graph>,
 }
 
 fn upload_entry(dev: &CudaComputeDevice, e: &Entry, b: &[u8]) -> B {
@@ -733,8 +740,8 @@ impl Engine {
                     norm: get(&format!("{k}.norm"))?,
                     state: dev.alloc_f32(fl::GDN_STATE),
                     hist: dev.alloc_f32(fl::GDN_HIST),
-                    proj: dev.alloc_f32(MAX_T * GDN_PROJ),
-                    h: dev.alloc_f32(MAX_T * GDN_CONV),
+                    proj: dev.alloc_f32(WIDE * GDN_PROJ),
+                    h: dev.alloc_f32(WIDE * GDN_CONV),
                 })
             } else {
                 None
@@ -749,7 +756,7 @@ impl Engine {
                     v: dev.alloc_bf16(max_ctx * QSA_KV * QSA_D),
                     ring: dev.alloc_f32(16 * IDX_D),
                     pooled: dev.alloc_f32(max_ctx / IDX_BLOCK * IDX_D),
-                    proj: dev.alloc_f32(MAX_T * QSA_PROJ),
+                    proj: dev.alloc_f32(WIDE * QSA_PROJ),
                 })
             } else {
                 None
@@ -783,7 +790,7 @@ impl Engine {
             nq: get("ple.nq")?,
             nc: get("ple.nc")?,
             conv: get("ple.conv")?,
-            ring: dev.alloc_f32(16 * HC * HIDDEN),
+            ring: dev.alloc_f32(kernels::PLE_RING * HC * HIDDEN),
         };
         let out_hc = hc("out_hc", false)?;
         let head = dw("head")?;
@@ -795,38 +802,38 @@ impl Engine {
         let z = |n: usize| dev.alloc_f32(n);
         let s = Scratch {
             ctl: z(8),
-            emb: z(MAX_T * HIDDEN),
-            ple_e: z(MAX_T * HIDDEN),
-            ple_eq: z(QAct { m: MAX_T, k: HIDDEN }.words()),
-            ple_key: z(MAX_T * HC * HIDDEN),
-            ple_val: z(MAX_T * HIDDEN),
-            r: z(MAX_T * HC * HIDDEN),
-            x: z(MAX_T * HIDDEN),
-            x2: z(MAX_T * HIDDEN),
-            xq: z(QAct { m: MAX_T, k: HIDDEN }.words()),
-            inj_a: z(MAX_T * HC),
-            inj_f: z(MAX_T * HC),
-            hc: z(fl::hc_scratch_words(MAX_T)),
-            side: z(MAX_T * (IDX_HEADS * IDX_D + IDX_D)),
-            y: z(MAX_T * GDN_V),
-            yq: z(QAct { m: MAX_T, k: GDN_V }.words()),
-            mix: z(MAX_T * HIDDEN),
-            q: z(fl::qsa_q_words(MAX_T)),
-            scores: z(MAX_T * max_ctx / IDX_BLOCK),
-            sel: z(MAX_T * QSA_WIDTH),
-            attn_s: z(fl::qsa_attend_scratch_words(MAX_T)),
-            attn: z(MAX_T * QSA_OUT),
-            logits: z(MAX_T * ROUTER_ROWS),
-            ids: z(MAX_T * TOPK),
-            w: z(MAX_T * TOPK),
-            plan: z(MoePlan::WORDS),
+            emb: z(WIDE * HIDDEN),
+            ple_e: z(WIDE * HIDDEN),
+            ple_eq: z(QAct { m: WIDE, k: HIDDEN }.words()),
+            ple_key: z(WIDE * HC * HIDDEN),
+            ple_val: z(WIDE * HIDDEN),
+            r: z(WIDE * HC * HIDDEN),
+            x: z(WIDE * HIDDEN),
+            x2: z(WIDE * HIDDEN),
+            xq: z(QAct { m: WIDE, k: HIDDEN }.words()),
+            inj_a: z(WIDE * HC),
+            inj_f: z(WIDE * HC),
+            hc: z(fl::hc_scratch_words(WIDE)),
+            side: z(WIDE * (IDX_HEADS * IDX_D + IDX_D)),
+            y: z(WIDE * GDN_V),
+            yq: z(QAct { m: WIDE, k: GDN_V }.words()),
+            mix: z(WIDE * HIDDEN),
+            q: z(fl::qsa_q_words(WIDE)),
+            scores: z(WIDE * max_ctx / IDX_BLOCK),
+            sel: z(WIDE * QSA_WIDTH),
+            attn_s: z(fl::qsa_attend_scratch_words(WIDE)),
+            attn: z(WIDE * QSA_OUT),
+            logits: z(WIDE * ROUTER_ROWS),
+            ids: z(WIDE * TOPK),
+            w: z(WIDE * TOPK),
+            plan: z(MoePlan::words(WIDE)),
             list: z(1 + MoePlan::CAP),
-            moe: z(MoePlan::scratch_words()),
-            parts: z(MoePlan::PARTS_ROWS * HIDDEN),
-            gu: z(MAX_T * 2 * FF),
-            hf: z(MAX_T * FF),
-            hq: z(QAct { m: MAX_T, k: FF }.words()),
-            shy: z(MAX_T * HIDDEN),
+            moe: z(MoePlan::scratch_words_for(WIDE)),
+            parts: z(MoePlan::parts_rows(WIDE) * HIDDEN),
+            gu: z(WIDE * 2 * FF),
+            hf: z(WIDE * FF),
+            hq: z(QAct { m: WIDE, k: FF }.words()),
+            shy: z(WIDE * HIDDEN),
             head: z(MAX_T * hp.n_vocab),
             out_ids: z(MAX_T),
             amax: z(MAX_T * 64 * 2),
@@ -1076,6 +1083,8 @@ impl Engine {
             use_mtp: false,
             mtp_last: Vec::new(),
             sampler: None,
+            wide: false,
+            wide_graphs: Default::default(),
         };
         if let Some(m) = mtp_loaded {
             eng.mtp = Some(Box::new(m));
@@ -1408,7 +1417,7 @@ impl Engine {
         );
         {
             let (dst, src, n) = (
-                self.io.arena.device_ptr(Io::LIDS + l * 4 * MAX_T * TOPK).expect("mapped"),
+                self.io.arena.device_ptr(Io::LIDS + l * 4 * WIDE * TOPK).expect("mapped"),
                 a(&s.ids),
                 (t * TOPK) as i32,
             );
@@ -1416,25 +1425,25 @@ impl Engine {
                 gpu::launch(self.k.copy, (1, 1, 1), (256, 1, 1), 0, &self.stream, tang_moe::args![dst, src, n]).expect("launch")
             };
         }
-        if self.pcie_cap > 0 {
-            let (plan, ids, ht, ti, cap) = (a(&s.plan), a(&s.ids), a(&self.host_tables[l]), t as i32, self.pcie_cap as i32);
-            let (gp, gs, et, ed, mi) = (
-                MoePlan::GROUP_PTR as i32,
-                MoePlan::GROUP_START as i32,
-                MoePlan::ENT_TOK as i32,
-                MoePlan::ENT_DST as i32,
-                MoePlan::MISSING as i32,
-            );
+        if self.pcie_cap > 0 || self.wide {
+            let cap = if self.wide { i32::MAX } else { self.pcie_cap as i32 };
+            let (plan, ids, ht, ti) = (a(&s.plan), a(&s.ids), a(&self.host_tables[l]), t as i32);
+            // The plan's layout at this width (MoePlan's offsets with cap(t)).
+            let c = MoePlan::cap(t) as i32;
+            let gp = MoePlan::GROUP_PTR as i32;
+            let (gs, et) = (gp + 2 * c, gp + 3 * c + 1);
+            let (ed, mi) = (et + c, et + 2 * c);
             unsafe {
                 gpu::launch(self.k.pcie, (1, 1, 1), (32, 1, 1), 0, &self.stream, tang_moe::args![plan, ids, ht, ti, cap, gp, gs, et, ed, mi])
                     .expect("launch")
             };
         }
         // Publish ids and activations; the host computes the misses while the GPU runs the
-        // hits and the shared expert.
+        // hits and the shared expert (not in a wide prefill window: misses go over PCIe).
         let mbp = self.mb.device();
         let ctlw = a(&s.ctl) + 8; // window counter word
         let li = l as i32;
+        if !self.wide {
         {
             let (ids, xq, xw, ti) = (a(&s.ids), a(&s.xq), QAct { m: t, k: HIDDEN }.words() as i32, t as i32);
             unsafe {
@@ -1448,6 +1457,7 @@ impl Engine {
                 )
                 .expect("launch")
             };
+        }
         }
         // SAFETY: every group address in the plan is a live VRAM slot or scratch blob.
         unsafe { dev.moe_grouped_into(&s.xq, &s.plan, &mut s.moe, &mut s.parts, t) };
@@ -1469,7 +1479,7 @@ impl Engine {
         layer.sh_down.apply(dev, &self.nk, &s.hf, &s.hq, &mut s.shy, t, FF, HIDDEN);
         {
             let (dst, src, n) = (
-                a(&s.parts) + (MoePlan::SHARED_ROW * HIDDEN * 4) as u64,
+                a(&s.parts) + (MoePlan::shared_row(t) * HIDDEN * 4) as u64,
                 a(&s.shy),
                 (t * HIDDEN) as i32,
             );
@@ -1484,6 +1494,9 @@ impl Engine {
                 )
                 .expect("launch")
             };
+        }
+        if self.wide {
+            return;
         }
         let st = 1 + 4 * l;
         for i in [st, st + 1] {
@@ -1605,6 +1618,11 @@ impl Engine {
         if unfused {
             self.apply_moe(t);
         }
+        if self.wide {
+            // Prefill: no logits (the prompt's last window runs the head); the last layer's MoE
+            // write is left pending (nothing reads the residual after it).
+            return Ok(());
+        }
         self.enqueue_head(t, !unfused);
         self.enqueue_outputs(t);
         Ok(())
@@ -1641,7 +1659,7 @@ impl Engine {
         ctl[2] = self.counter;
         ctl[3] = self.seed;
         ctl[4] = self.temperature.to_bits();
-        if let Some(sp) = self.sampler.as_mut() {
+        if let Some(sp) = self.sampler.as_mut().filter(|_| t <= MAX_T) {
             sp.stage(&self.dev, &self.tokens, pos0, t)?;
         }
         let emb_t = self.g.info("token_embd.weight")?.clone();
@@ -1780,7 +1798,7 @@ impl Engine {
         self.dev.sync();
         // Routing of every layer (copied out by the graph): cache usage and statistics.
         for l in 0..self.layers.len() {
-            let mut d: Vec<u32> = self.io.u32s(Io::LIDS + l * 4 * MAX_T * TOPK, t * TOPK).to_vec();
+            let mut d: Vec<u32> = self.io.u32s(Io::LIDS + l * 4 * WIDE * TOPK, t * TOPK).to_vec();
             d.sort_unstable();
             d.dedup();
             st.routed += t * TOPK;
@@ -3181,5 +3199,44 @@ impl Engine {
             Some(s) => s.begin(&self.dev, pos),
             None => Ok(()),
         }
+    }
+}
+
+impl Engine {
+    /// A prefill window of `t` (`MAX_T` < t <= `WIDE`) tokens `tokens[pos0..pos0 + t]`, every
+    /// token kept, with its own graph per width (decode's graphs untouched). Routed experts
+    /// missing from VRAM are read by the GPU from the mapped host arena (no doorbell, no CPU
+    /// rows), and there is no head: for every prompt window but the last.
+    pub fn prefill_wide(&mut self, pos0: usize, t: usize) -> Result<WinStats> {
+        ensure!(t > MAX_T && t <= WIDE && pos0 + t <= self.tokens.len());
+        ensure!(pos0 + t <= self.opts.max_ctx, "context {} > max {}", pos0 + t, self.opts.max_ctx);
+        let w0 = Instant::now();
+        self.stage(pos0, t)?;
+        self.start_gather(pos0, t);
+        self.wide = true;
+        let r = match self.wide_graphs.get(&t) {
+            Some(g) => g.launch(&self.stream).map_err(|e| anyhow!("{e}")),
+            None => self.enqueue_window(t, false, false, &mut |_, _| Ok(())),
+        };
+        self.wide = false;
+        r?;
+        self.dev.sync();
+        if let Some(e) = self.gather_err.lock().unwrap().take() {
+            bail!("n-gram rows: {e}");
+        }
+        self.counter = self.counter.wrapping_add(1);
+        if self.use_graphs && !self.wide_graphs.contains_key(&t) {
+            let stream = ManuallyDrop::new(Stream(self.dev.cu_stream()));
+            let me = self as *mut Self;
+            self.wide = true;
+            let g = Graph::capture(&stream, |_| {
+                // SAFETY: `self` is not otherwise touched during capture.
+                let me = unsafe { &mut *me };
+                me.enqueue_window(t, false, false, &mut |_, _| Ok(())).map_err(|e| tang_moe::gpu::Error(format!("{e}")))
+            });
+            self.wide = false;
+            self.wide_graphs.insert(t, g.map_err(|e| anyhow!("capture wide T={t}: {e}"))?);
+        }
+        Ok(WinStats { t, wall_ms: w0.elapsed().as_secs_f64() * 1e3, ..Default::default() })
     }
 }
