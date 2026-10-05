@@ -253,14 +253,17 @@ __device__ __forceinline__ void mma_k16(int c[4], unsigned int a0, unsigned int 
                  : "r"(a0), "r"(a1), "r"(b0), "r"(0), "r"(0), "r"(0), "r"(0));
 }
 #define NM_NT 4
+// A block owns 16 rows; its 8 warps split the KS K slices' 32 slots each into contiguous runs
+// of bit-reversed slot order (subtrees of warp_sum's tree), then the block merges the subtrees
+// in tree order and adds the KS slices in order.
 extern "C" __global__ void __launch_bounds__(256) fl_natmma(
     const unsigned int* __restrict__ XQ, const unsigned char* __restrict__ W, float* __restrict__ Y,
     unsigned int K, unsigned int N, unsigned int KS, u64 hoff, u64 soff, unsigned int OS, unsigned int M) {
     constexpr int TY = NAT_TY;
-    __shared__ float red[8][16][8 * NM_NT];
+    __shared__ float sm[8][16][8 * NM_NT];
     const unsigned int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, gid = lane >> 2, tig = lane & 3;
-    const unsigned int kw = warp % KS, rg = warp / KS, groups = 8 / KS;
-    const unsigned int row0 = (blockIdx.x * groups + rg) * 16;
+    const unsigned int wpk = 8 / KS, kw = warp / wpk, sub = warp % wpk, L = 32 / wpk;
+    const unsigned int row0 = blockIdx.x * 16;
     const unsigned int nch = K / 32, c0 = kw * nch / KS, c1 = (kw + 1) * nch / KS;
     const unsigned int kb = K / 4;
     const unsigned int* xs = XQ + (u64)M * kb;
@@ -270,7 +273,6 @@ extern "C" __global__ void __launch_bounds__(256) fl_natmma(
     const u64 sbytes = TY == 23 ? K / 256 * 12 : K / 256 * 20;
     const unsigned int o[2] = {min(row0 + gid, N - 1), min(row0 + gid + 8, N - 1)};
     for (unsigned int t0 = 0; t0 < M; t0 += 8 * NM_NT) {
-        // Tokens of this thread: B column gid of n tile nt; C columns 2 tig, 2 tig + 1.
         unsigned int tb[NM_NT], te[NM_NT][2];
         #pragma unroll
         for (int nt = 0; nt < NM_NT; nt++) {
@@ -281,62 +283,59 @@ extern "C" __global__ void __launch_bounds__(256) fl_natmma(
         float st[5][NM_NT][4];
         float v[NM_NT][4];
         #pragma unroll 1
-        for (unsigned int i = 0; i < 32; i++) {
-            const unsigned int l = __brev(i) >> 27;
+        for (unsigned int j = 0; j < L; j++) {
+            const unsigned int i = sub * L + j, l = __brev(i) >> 27;
             float cur[NM_NT][4];
             #pragma unroll
             for (int nt = 0; nt < NM_NT; nt++)
                 #pragma unroll
                 for (int k = 0; k < 4; k++) cur[nt][k] = 0.0f;
-            if (row0 < N) {
-                #pragma unroll 1
-                for (unsigned int c = c0 + l; c < c1; c += 32) {
-                    int op[2][8];
-                    float sc0[2], sc1[2], mn[2];
-                    #pragma unroll
-                    for (int r = 0; r < 2; r++) {
-                        u64 ch = (u64)o[r] * nch + c;
-                        operands<TY>(W + ch * LB, W + hoff + ch * (HB ? HB : 1), op[r]);
-                        chunk_scales<TY>(S, D, sbytes, o[r], c, ch, sc0[r], sc1[r], mn[r]);
+            #pragma unroll 1
+            for (unsigned int c = c0 + l; c < c1; c += 32) {
+                int op[2][8];
+                float sc0[2], sc1[2], mn[2];
+                #pragma unroll
+                for (int r = 0; r < 2; r++) {
+                    u64 ch = (u64)o[r] * nch + c;
+                    operands<TY>(W + ch * LB, W + hoff + ch * (HB ? HB : 1), op[r]);
+                    chunk_scales<TY>(S, D, sbytes, o[r], c, ch, sc0[r], sc1[r], mn[r]);
+                }
+                #pragma unroll
+                for (int nt = 0; nt < NM_NT; nt++) {
+                    const unsigned int* xb = XQ + (u64)tb[nt] * kb + c * 8;
+                    unsigned int b[2] = {__ldg(xb + tig), __ldg(xb + 4 + tig)};
+                    int C0[4], C1[4];
+                    if (PER16) {
+                        mma_k16(C0, (unsigned int)op[0][tig], (unsigned int)op[1][tig], b[0]);
+                        mma_k16(C1, (unsigned int)op[0][4 + tig], (unsigned int)op[1][4 + tig], b[1]);
+                    } else {
+                        unsigned int a[4] = {(unsigned int)op[0][tig], (unsigned int)op[1][tig],
+                                             (unsigned int)op[0][4 + tig], (unsigned int)op[1][4 + tig]};
+                        mma_k32(C0, a, b);
                     }
                     #pragma unroll
-                    for (int nt = 0; nt < NM_NT; nt++) {
-                        const unsigned int* xb = XQ + (u64)tb[nt] * kb + c * 8;
-                        unsigned int b[2] = {__ldg(xb + tig), __ldg(xb + 4 + tig)};
-                        int C0[4], C1[4];
-                        if (PER16) {
-                            mma_k16(C0, (unsigned int)op[0][tig], (unsigned int)op[1][tig], b[0]);
-                            mma_k16(C1, (unsigned int)op[0][4 + tig], (unsigned int)op[1][4 + tig], b[1]);
-                        } else {
-                            unsigned int a[4] = {(unsigned int)op[0][tig], (unsigned int)op[1][tig],
-                                                 (unsigned int)op[0][4 + tig], (unsigned int)op[1][4 + tig]};
-                            mma_k32(C0, a, b);
-                        }
+                    for (int ec = 0; ec < 2; ec++) {
+                        const unsigned int t = te[nt][ec];
+                        float dx = __uint_as_float(__ldg(xs + (u64)t * nch + c));
+                        float hx = HAS_MIN ? (float)(int)__ldg(xh + (u64)t * nch + c) : 0.0f;
                         #pragma unroll
-                        for (int ec = 0; ec < 2; ec++) {
-                            const unsigned int t = te[nt][ec];
-                            float dx = __uint_as_float(__ldg(xs + (u64)t * nch + c));
-                            float hx = HAS_MIN ? (float)(int)__ldg(xh + (u64)t * nch + c) : 0.0f;
-                            #pragma unroll
-                            for (int r = 0; r < 2; r++) {
-                                float vv;
-                                if (PER16) vv = __fmaf_rn(sc1[r], (float)C1[2 * r + ec], sc0[r] * (float)C0[2 * r + ec]);
-                                else if (HAS_MIN) vv = __fmaf_rn(sc0[r], (float)C0[2 * r + ec], -(mn[r] * hx));
-                                else vv = sc0[r] * (float)C0[2 * r + ec];
-                                cur[nt][2 * r + ec] = __fmaf_rn(dx, vv, cur[nt][2 * r + ec]);
-                            }
+                        for (int r = 0; r < 2; r++) {
+                            float vv;
+                            if (PER16) vv = __fmaf_rn(sc1[r], (float)C1[2 * r + ec], sc0[r] * (float)C0[2 * r + ec]);
+                            else if (HAS_MIN) vv = __fmaf_rn(sc0[r], (float)C0[2 * r + ec], -(mn[r] * hx));
+                            else vv = sc0[r] * (float)C0[2 * r + ec];
+                            cur[nt][2 * r + ec] = __fmaf_rn(dx, vv, cur[nt][2 * r + ec]);
                         }
                     }
                 }
             }
-            // Binary-counter merge: slot partials pair up as warp_sum's xor tree.
             #pragma unroll
             for (int nt = 0; nt < NM_NT; nt++)
                 #pragma unroll
                 for (int k = 0; k < 4; k++) v[nt][k] = cur[nt][k];
             #pragma unroll
             for (int lv = 0; lv < 5; lv++) {
-                if ((i >> lv) & 1) {
+                if ((j >> lv) & 1) {
                     #pragma unroll
                     for (int nt = 0; nt < NM_NT; nt++)
                         #pragma unroll
@@ -350,27 +349,24 @@ extern "C" __global__ void __launch_bounds__(256) fl_natmma(
                 }
             }
         }
-        // v now holds the full warp sums (after i = 31).
-        if (KS > 1) __syncthreads();
+        // v: this warp's subtree (L leaves). Merge subtrees, then the K slices.
+        __syncthreads();
         #pragma unroll
         for (int nt = 0; nt < NM_NT; nt++)
             #pragma unroll
-            for (int k = 0; k < 4; k++) {
-                const unsigned int r = gid + 8 * (k >> 1), tl = 8 * nt + 2 * tig + (k & 1);
-                if (KS == 1) {
-                    if (row0 + r < N && t0 + tl < M) Y[(u64)(t0 + tl) * OS + row0 + r] = v[nt][k];
-                } else {
-                    red[warp][r][tl] = v[nt][k];
-                }
-            }
-        if (KS == 1) continue;
+            for (int k = 0; k < 4; k++) sm[warp][gid + 8 * (k >> 1)][8 * nt + 2 * tig + (k & 1)] = v[nt][k];
         __syncthreads();
-        for (unsigned int idx = threadIdx.x; idx < groups * 16 * 8 * NM_NT; idx += 256) {
-            unsigned int g = idx / (16 * 8 * NM_NT), r = (idx / (8 * NM_NT)) % 16, tl = idx % (8 * NM_NT);
-            unsigned int oo = (blockIdx.x * groups + g) * 16 + r;
+        for (unsigned int idx = threadIdx.x; idx < 16 * 8 * NM_NT; idx += 256) {
+            const unsigned int r = idx / (8 * NM_NT), tl = idx % (8 * NM_NT);
             float sum = 0.0f;
-            for (unsigned int k = 0; k < KS; k++) sum += red[g * KS + k][r][tl];
-            if (oo < N && t0 + tl < M) Y[(u64)(t0 + tl) * OS + oo] = sum;
+            for (unsigned int k = 0; k < KS; k++) {
+                float p[8];
+                for (unsigned int w = 0; w < wpk; w++) p[w] = sm[k * wpk + w][r][tl];
+                for (unsigned int len = 1; len < wpk; len *= 2)
+                    for (unsigned int w = 0; w < wpk; w += 2 * len) p[w] = p[w] + p[w + len];
+                if (KS == 1) sum = p[0]; else sum += p[0];
+            }
+            if (row0 + r < N && t0 + tl < M) Y[(u64)(t0 + tl) * OS + row0 + r] = sum;
         }
     }
 }
