@@ -37,6 +37,17 @@ fn grid(g: (usize, usize, usize), threads: u32) -> LaunchConfig {
     }
 }
 
+const NATST_NAMES: [&str; 8] = [
+    "fl_natst_t1",
+    "fl_natst_t2",
+    "fl_natst_t3",
+    "fl_natst_t4",
+    "fl_natst_t5",
+    "fl_natst_t6",
+    "fl_natst_t7",
+    "fl_natst_t8",
+];
+
 const NAT_NAMES: [&str; 8] = [
     "fl_nat_t1",
     "fl_nat_t2",
@@ -318,7 +329,7 @@ impl CudaComputeDevice {
         }
         let src: &'static str = Box::leak(
             format!(
-                "#define TY {}\n{}",
+                "#define NAT_TY {}\n{}",
                 ty.ggml(),
                 crate::kernels::native_cuda::NATIVE_CUDA
             )
@@ -327,6 +338,99 @@ impl CudaComputeDevice {
         let (_module, f) = self.get_func_with_arch(src, NAT_NAMES[m - 1], "sm_86");
         self.llm_funcs.borrow_mut().insert(key, f.clone());
         f
+    }
+
+    /// K split of a stacked segment: the single-segment GEMVs' rule, from (rows, k) alone.
+    fn stack_ks(ty: Option<crate::flash_native::NatType>, n: usize, k: usize) -> usize {
+        let epv = if ty.is_some() { 32 } else { 8 };
+        let mut ks = 1;
+        while ks < 8
+            && n.div_ceil(2 * 8 / ks) < 2 * super::llm::sm_count()
+            && k / epv / (2 * ks) >= 32
+        {
+            ks *= 2;
+        }
+        ks
+    }
+
+    pub(super) fn native_stack_impl(
+        &self,
+        segs: Vec<crate::flash_native::NatSeg<CudaBuffer>>,
+        n: usize,
+        k: usize,
+    ) -> crate::flash_native::NatStack<CudaBuffer> {
+        let mut words = vec![];
+        for g in &segs {
+            assert!(g.off + g.rows <= n, "native_stack: segment out of range");
+            let p = self.buffer_addr_impl(&g.w);
+            let (ty, ho, so) = match g.ty {
+                Some(ty) => {
+                    assert!(k.is_multiple_of(ty.block().0));
+                    let (_, h, s, total) = crate::flash_native::nat_layout(ty, g.rows, k);
+                    assert!(g.w.len * 4 >= total, "native_stack: weight size");
+                    (ty.ggml(), h as u64, s as u64)
+                }
+                None => {
+                    assert!(k.is_multiple_of(8) && g.w.len >= g.rows * k);
+                    (0, 0, 0)
+                }
+            };
+            let ks = Self::stack_ks(g.ty, g.rows, k) as u32;
+            for v in [p, ho, so] {
+                words.extend([v as u32, (v >> 32) as u32]);
+            }
+            words.extend([ty, g.rows as u32, ks, g.off as u32]);
+        }
+        let table = Some(crate::ComputeDevice::upload_u32(self, &words));
+        crate::flash_native::NatStack { segs, table, n, k }
+    }
+
+    pub(super) fn native_stack_into_impl(
+        &self,
+        s: &crate::flash_native::NatStack<CudaBuffer>,
+        x: &CudaBuffer,
+        xq: &CudaBuffer,
+        out: &mut CudaBuffer,
+        m: usize,
+    ) {
+        assert!((1..=MAX_T).contains(&m) && out.len >= m * s.n);
+        let gr = if m == 1 { 2 } else { 4 };
+        let blocks: usize = s
+            .segs
+            .iter()
+            .map(|g| g.rows.div_ceil(gr * 8 / Self::stack_ks(g.ty, g.rows, s.k)))
+            .sum();
+        let key = NATST_NAMES[m - 1];
+        let f = match self.llm_funcs.borrow().get(key) {
+            Some(f) => Some(f.clone()),
+            None => None,
+        };
+        let f = f.unwrap_or_else(|| {
+            let src: &'static str = Box::leak(
+                format!(
+                    "#define NAT_STACK\n{}",
+                    crate::kernels::native_cuda::NATIVE_CUDA
+                )
+                .into_boxed_str(),
+            );
+            let (_module, f) = self.get_func_with_arch(src, key, "sm_86");
+            self.llm_funcs.borrow_mut().insert(key, f.clone());
+            f
+        });
+        let (nseg, ku, os) = (s.segs.len() as u32, s.k as u32, s.n as u32);
+        unsafe {
+            self.stream
+                .launch_builder(&f)
+                .arg(xq.f32_data())
+                .arg(x.f32_data())
+                .arg(s.table.as_ref().expect("native_stack table").f32_data())
+                .arg(&nseg)
+                .arg(out.f32_data_mut())
+                .arg(&ku)
+                .arg(&os)
+                .launch(grid((blocks, 1, 1), 256))
+                .unwrap();
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1670,6 +1774,70 @@ mod tests {
                     1e-4,
                     &format!("linear_into t={t}"),
                 );
+            }
+        }
+    }
+
+    /// A stacked projection (mixed native types and bf16, one launch) against the per-segment
+    /// calls: bitwise, and each column of a T=8 window bitwise its T=1 result.
+    fn native_stack_vs_segments(g: &CudaComputeDevice) {
+        use crate::flash_native::{tests::random_gguf, NatSeg, NatType};
+        let mut rng = Rng(0x57ac);
+        for k in [2560usize, 6144] {
+            // Segment layout of a GDN w_in (shrunk): two native types, then two bf16 strips.
+            let parts: Vec<(Option<NatType>, usize)> = vec![
+                (Some(NatType::Iq4Xs), 1000),
+                (Some(NatType::Q4K), 600),
+                (None, 48),
+                (None, 48),
+                (Some(NatType::Q3K), 130),
+                (Some(NatType::Q2_0), 64),
+            ];
+            let n: usize = parts.iter().map(|p| p.1).sum();
+            let (mut segs, mut off) = (vec![], 0);
+            for &(ty, rows) in &parts {
+                let w = match ty {
+                    Some(ty) => g.upload_native(ty, &random_gguf(ty, rows, k, rng.u()), rows, k),
+                    None => g.upload_bf16(&rng.bf16(rows * k, 0.5)),
+                };
+                segs.push(NatSeg { ty, w, rows, off });
+                off += rows;
+            }
+            let st = g.native_stack(segs, n, k);
+            let x = rng.vec(TW * k, 1.0);
+            let run = |m: usize, xs: &[f32], stacked: bool| -> Vec<f32> {
+                let xb = g.upload_f32(xs);
+                let mut xq = g.alloc_f32(QAct { m, k }.words());
+                g.quantize_act_into(&xb, &mut xq, m, k);
+                let mut y = g.upload_f32(&vec![0.0; m * n]);
+                if stacked {
+                    g.native_stack_into(&st, &xb, &xq, &mut y, m);
+                } else {
+                    for sg in &st.segs {
+                        match sg.ty {
+                            Some(ty) => g.native_linear_out_into(
+                                ty, &xq, &sg.w, &mut y, sg.off, n, m, k, sg.rows,
+                            ),
+                            None => {
+                                g.bf16_linear_out_into(&xb, &sg.w, &mut y, sg.off, n, m, k, sg.rows)
+                            }
+                        }
+                    }
+                }
+                g.download(&y)
+            };
+            for m in TS {
+                let a = run(m, &x[..m * k], true);
+                let b = run(m, &x[..m * k], false);
+                same_bits(&a, &b, &format!("stack k={k} m={m}"));
+                for j in 0..m {
+                    let c = run(1, &x[j * k..(j + 1) * k], true);
+                    same_bits(
+                        &a[j * n..(j + 1) * n],
+                        &c,
+                        &format!("stack k={k} m={m} col {j} vs T=1"),
+                    );
+                }
             }
         }
     }
@@ -3301,6 +3469,11 @@ mod tests {
                     .join("\n")
             );
         }
+    }
+
+    #[test]
+    fn cuda_native_stack() {
+        on_gpu(native_stack_vs_segments);
     }
 
     #[test]

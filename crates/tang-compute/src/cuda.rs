@@ -4165,6 +4165,26 @@ impl ComputeDevice for CudaComputeDevice {
         self.bf16_linear_out_impl(x, w, out, off, ostride, m, k, n)
     }
 
+    fn native_stack(
+        &self,
+        segs: Vec<crate::flash_native::NatSeg<CudaBuffer>>,
+        n: usize,
+        k: usize,
+    ) -> crate::flash_native::NatStack<CudaBuffer> {
+        self.native_stack_impl(segs, n, k)
+    }
+
+    fn native_stack_into(
+        &self,
+        s: &crate::flash_native::NatStack<CudaBuffer>,
+        x: &CudaBuffer,
+        xq: &CudaBuffer,
+        out: &mut CudaBuffer,
+        m: usize,
+    ) {
+        self.native_stack_into_impl(s, x, xq, out, m)
+    }
+
     fn native_linear_out_into(
         &self,
         ty: crate::flash_native::NatType,
