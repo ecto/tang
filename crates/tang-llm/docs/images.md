@@ -26,7 +26,18 @@ The DiT follows the basic single-image path: RMSNorm/SwiGLU blocks, scale/tanh-g
 modulation, interleaved axis RoPE, image/caption padding and refiners, and joint
 attention. Weights are BF16 on GPU; norms remain F32. The VAE upcasts to F32 and uses
 bounded tiled im2col/GEMM convolutions. Packing, affine broadcasts and upsampling
-are intentionally unfused. No speed or production-quality claim is established yet.
+are intentionally unfused. Broad quality and performance evaluation remains unfinished.
+
+## Trained-weight smoke test
+
+The pinned converted checkpoint passed real Frog tool approval, all eight streamed steps,
+PNG delivery, workspace asset saving and actual generation metadata on a 48 GiB Apple
+Silicon Mac. A frog photograph at seed 42 produced a recognizable subject at 320×192
+and 512×512; the native Frog transcript and lightbox were inspected. Repeating 320×192
+with the resident pipeline produced a byte-identical PNG. First request: 52.3 seconds
+including model loading; resident repeat: 11.1 seconds; 512×512: 52.2 seconds. These are
+individual eight-step end-to-end measurements, not general benchmark or quality claims.
+The chat/vision delivery assertions used a local fixture, not a production vision judge.
 
 ## Reference validation
 
@@ -46,12 +57,13 @@ cargo run -p tang-llm --features metal --example z_image_parity -- /tmp/vae-ref 
 ```
 
 Validated with torch 2.14.1 / diffusers 0.40.0: DiT boundary errors below 1.1e-5;
-VAE boundary errors below 2e-5 on CPU and Metal. Full trained-weight inference is
-still being validated.
+VAE boundary errors below 2e-5 on CPU and Metal. Trained-weight inference also passed
+the smoke test above; full trained reference parity remains a separate validation task.
 
 For constrained disk, `scripts/download_z_image.py <new-directory>` pins a public
 Hugging Face revision, streams F32 matrices into BF16, preserves vectors, verifies
 original LFS hashes, records converted hashes and retains 4 GiB disk headroom. It
 writes about 20.5 GB instead of storing the roughly 32.8 GB original checkpoint.
-The converted files are a distinct artifact; do not insert them into the official
+Completed files can be resumed after size and SHA256 verification against the conversion
+manifest; interrupted partial files are refused. The converted files are a distinct artifact; do not insert them into the official
 repository's cache as if their hashes matched the originals.
