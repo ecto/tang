@@ -33,5 +33,9 @@ Screenshot, Compare and subsequent Edit revisions without malformed JSON. Its vi
 quality remains poor and repeated ineffective edits trigger Frog's loop detector;
 format correctness does not establish task completion.
 
+Inter-token indentation is limited to eight whitespace characters. This prevents
+a model from repeatedly generating whitespace before a required value until its
+token budget expires. String contents retain ordinary JSON whitespace and escapes.
+
 The [llguidance Rust example](https://github.com/guidance-ai/llguidance/blob/main/sample_parser/src/minimal.rs)
 shows the underlying mask/sample/consume API.

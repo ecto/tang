@@ -19,8 +19,8 @@ req=urllib.request.Request(url,json.dumps(body).encode(),{'Content-Type':'applic
 with urllib.request.urlopen(req,timeout=120) as response: result=json.load(response)
 (args.output/'result.json').write_text(json.dumps(result,indent=2))
 choice=result['choices'][0]
-assert json.loads(choice['message']['content']) == {'answer':'ok','count':7},result
 assert choice['finish_reason']=='stop',result
+assert json.loads(choice['message']['content']) == {'answer':'ok','count':7},result
 assert result['usage'].get('draft_tokens',0)==0 and result['usage'].get('accepted_tokens',0)==0,result
 print('PASS live schema overrides conflicting prompt, numeric bounds and extra keys',flush=True)
 for response_format in [{'type':'bad'},{'type':'json_schema','json_schema':{'schema':{'type':'bogus'}}},{'type':'json_schema','json_schema':{'schema':{'description':'x'*65537}}}]:

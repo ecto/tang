@@ -3,7 +3,7 @@ use anyhow::{bail, ensure, Result};
 use llguidance::{
     api::TopLevelGrammar,
     toktrie::{ApproximateTokEnv, TokRxInfo, TokTrie},
-    Matcher, ParserFactory,
+    JsonCompileOptions, Matcher, ParserFactory,
 };
 use serde_json::{json, Value};
 use std::{
@@ -18,6 +18,21 @@ static VALIDATOR: LazyLock<ParserFactory> = LazyLock::new(|| {
     factory.quiet();
     factory
 });
+
+fn grammar(mut schema: Value) -> TopLevelGrammar {
+    if schema.is_boolean() {
+        schema = json!({"allOf":[schema]});
+    }
+    // A skip lexeme is allowed once between grammar terminals. Bound it so a
+    // model cannot spend its entire response repeating indentation before a value.
+    // Whitespace inside JSON strings remains part of their content, unrestricted.
+    JsonCompileOptions {
+        whitespace_pattern: Some(r"[ \t\r\n]{1,8}".into()),
+        ..Default::default()
+    }
+    .apply_to(&mut schema);
+    TopLevelGrammar::from_json_schema(schema)
+}
 
 pub fn response_schema(body: &Value) -> Result<Option<Value>> {
     let format = &body["response_format"];
@@ -47,7 +62,7 @@ pub fn response_schema(body: &Value) -> Result<Option<Value>> {
     );
     // Validate without a model or network access, before this request enters the queue.
     catch_unwind(AssertUnwindSafe(|| {
-        VALIDATOR.create_parser(TopLevelGrammar::from_json_schema(schema.clone()))
+        VALIDATOR.create_parser(grammar(schema.clone()))
     }))
     .map_err(|_| anyhow::anyhow!("invalid structured output schema"))??;
     Ok(Some(schema))
@@ -86,7 +101,7 @@ pub fn matcher(factory: &ParserFactory, schema: Value) -> Result<Matcher> {
         serde_json::to_vec(&schema)?.len() <= MAX_SCHEMA_BYTES,
         "schema exceeds 64 KiB"
     );
-    let parser = factory.create_parser(TopLevelGrammar::from_json_schema(schema))?;
+    let parser = factory.create_parser(grammar(schema))?;
     Ok(Matcher::new(Ok(parser)))
 }
 
@@ -182,5 +197,37 @@ mod tests {
         logits.fill(0.);
         mask(&mut object, &mut logits, &[255, 256]).unwrap();
         assert!(!logits[255].is_finite() && !logits[256].is_finite());
+    }
+
+    #[test]
+    fn indentation_cannot_loop_but_string_whitespace_is_preserved() {
+        let factory = ParserFactory::new_simple(&ApproximateTokEnv::single_byte_env()).unwrap();
+        let mut object = matcher(&factory, json!({"type":"object","properties":{"count":{"const":7}},"required":["count"],"additionalProperties":false})).unwrap();
+        for &byte in b"{\"count\":" {
+            object.consume_token(byte as u32).unwrap();
+        }
+        for _ in 0..8 {
+            let allowed = object.compute_mask().unwrap();
+            assert!(allowed.is_allowed(b' ' as u32));
+            object.consume_token(b' ' as u32).unwrap();
+        }
+        let allowed = object.compute_mask().unwrap();
+        assert!(!allowed.is_allowed(b' ' as u32));
+        assert!(allowed.is_allowed(b'7' as u32));
+        let mut string = matcher(&factory, json!({"type":"string"})).unwrap();
+        for &byte in serde_json::to_vec(&format!("{}\n", " ".repeat(30)))
+            .unwrap()
+            .iter()
+        {
+            let allowed = string.compute_mask().unwrap();
+            assert!(allowed.is_allowed(byte as u32));
+            string.consume_token(byte as u32).unwrap();
+        }
+        assert!(string.is_accepting().unwrap());
+        assert!(response_schema(
+            &json!({"response_format":{"type":"json_schema","json_schema":{"schema":true}}})
+        )
+        .unwrap()
+        .is_some());
     }
 }
