@@ -60,7 +60,7 @@ pub struct Vae<B> {
     output: Conv<B>,
 }
 fn silu<D: ComputeDevice>(dev: &D, x: &D::Buffer) -> D::Buffer {
-    dev.swiglu_fused_buf(x, &dev.upload(&vec![1.; x.len()]), x.len())
+    dev.silu_buf(x, x.len())
 }
 fn norm<D: ComputeDevice>(
     dev: &D,

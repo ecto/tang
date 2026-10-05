@@ -96,6 +96,17 @@ kernel void add_f32(
     if (gid < params[0]) Y[gid] = A[gid] + B[gid];
 }
 
+kernel void silu_f32(
+    device const float* X [[buffer(0)]],
+    device float* Y [[buffer(1)]],
+    device const uint* params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= params[0]) return;
+    float x = X[gid];
+    Y[gid] = x / (1.0f + exp(-x));
+}
+
 kernel void swiglu_f32(
     device const float* G [[buffer(0)]],
     device const float* U [[buffer(1)]],

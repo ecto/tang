@@ -2387,6 +2387,18 @@ kernel void bias_add(
         self.binary(a, b, numel, "add_f32")
     }
 
+    fn silu_buf(&self, input: &MetalBuffer, numel: usize) -> MetalBuffer {
+        let pipeline = self.get_pipeline(llm_msl::ELEMENTWISE_MSL, "silu_f32");
+        let out = self.make_buffer_empty(numel * 4);
+        let params = self.make_buffer_u32(&[numel as u32]);
+        self.dispatch(&pipeline, &[&input.buffer, &out, &params], numel as u64);
+        MetalBuffer {
+            buffer: out,
+            len: numel,
+            kind: Kind::F32,
+        }
+    }
+
     fn swiglu_fused_buf(&self, gate: &MetalBuffer, up: &MetalBuffer, numel: usize) -> MetalBuffer {
         self.binary(gate, up, numel, "swiglu_f32")
     }
@@ -3673,6 +3685,27 @@ mod tests {
                     "softmax index {index}: {a} vs {b}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn metal_unary_silu_matches_cpu_and_previous_swiglu_path() {
+        let Some(metal) = MetalDevice::new() else {
+            return;
+        };
+        let cpu = crate::CpuDevice::new();
+        let data = [-1000., -100., -20., -5., -1., 0., 1., 5., 20., 100., 1000.];
+        let x = metal.upload(&data);
+        let actual = metal.download(&metal.silu_buf(&x, data.len()));
+        let previous = metal.download(&metal.swiglu_fused_buf(
+            &x,
+            &metal.upload(&vec![1.; data.len()]),
+            data.len(),
+        ));
+        let expected = cpu.download(&cpu.silu_buf(&cpu.upload(&data), data.len()));
+        assert_eq!(actual, previous);
+        for (a, b) in actual.iter().zip(expected) {
+            assert!(a.is_finite() && (a - b).abs() < 1e-5);
         }
     }
 

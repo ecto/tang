@@ -818,6 +818,14 @@ pub trait ComputeDevice: Send {
         self.elementwise(&[a, b], numel, &|ids| ids[0] + ids[1])
     }
 
+    /// Unary SiLU, without constructing a tensor of ones for SwiGLU.
+    fn silu_buf(&self, input: &Self::Buffer, numel: usize) -> Self::Buffer {
+        use tang::Scalar;
+        self.elementwise(&[input], numel, &|ids| {
+            ids[0] / (ExprId::from_f64(1.0) + Scalar::exp(-ids[0]))
+        })
+    }
+
     /// SwiGLU activation: out[i] = silu(gate[i]) * up[i].
     /// Default: delegates to elementwise(). Override for fused bf16 kernel.
     fn swiglu_fused_buf(
