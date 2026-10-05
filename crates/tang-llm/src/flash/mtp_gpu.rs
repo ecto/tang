@@ -148,6 +148,32 @@ pub fn q8_to_q2_0(src: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// f32 rows → Q2_0 (the search of [`q8_to_q2_0`]).
+pub fn f32_to_q2_0(f: &[f32]) -> Vec<u8> {
+    let nb = f.len() / 64;
+    let mut out = vec![0u8; nb * 18];
+    out.par_chunks_mut(18).enumerate().for_each(|(b, dst)| {
+        let x = &f[b * 64..b * 64 + 64];
+        let amax = x.iter().fold(0f32, |a, v| a.max(v.abs()));
+        let (mut best, mut bd) = (f64::INFINITY, 0f32);
+        if amax > 0.0 {
+            for step in 1..=24 {
+                let d = amax * step as f32 / 24.0;
+                let e: f64 = x.iter().map(|&v| { let q = (v / d).round().clamp(-1.0, 2.0); ((v - q * d) as f64).powi(2) }).sum();
+                if e < best { best = e; bd = d; }
+            }
+        }
+        let dh = tang_compute::flash::f32_to_f16(bd);
+        let d = tang_compute::flash::f16_to_f32(dh);
+        dst[..2].copy_from_slice(&dh.to_le_bytes());
+        for (j, &v) in x.iter().enumerate() {
+            let q = if d > 0.0 { (v / d).round().clamp(-1.0, 2.0) as i32 + 1 } else { 1 };
+            dst[2 + j / 4] |= (q as u8) << (2 * (j % 4));
+        }
+    });
+    out
+}
+
 pub fn upload_padded(dev: &CudaComputeDevice, b: &[u8]) -> B {
     let mut v = b.to_vec();
     v.extend_from_slice(&[0u8; 16]);

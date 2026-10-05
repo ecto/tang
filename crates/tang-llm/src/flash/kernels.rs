@@ -1021,4 +1021,103 @@ extern "C" __global__ void fe_mtp_attn_merge(const float* part, int nchunk, cons
     const float gt = proj[(size_t)c * stride + h * 512 + 256 + d];
     out[((size_t)c * 24 + h) * 256 + d] = (o / L) * (1.0f / (1.0f + expf(-gt)));
 }
+
+// Two-stage draft head. Stage 1 (fe_short1, grid 64 × 1024 threads): over the Q2 head's logits,
+// each block keeps its slice's top 4 (value, row) and its (max, Σ exp) for the softmax; stage 2
+// (fe_short2, one block of 256): rescore the 256 shortlisted rows exactly (the Q5_K head rows,
+// one thread each), take the argmax, and its probability against Σ exp over the vocabulary
+// with the shortlisted terms exact and the rest from the Q2 logits.
+extern "C" __global__ void fe_short1(const float* lg, int n, float* part) {
+    __shared__ float bv[1024];
+    __shared__ int bi[1024];
+    __shared__ float sm[32], ss[32];
+    const int per = (n + gridDim.x - 1) / gridDim.x, lo = blockIdx.x * per, hi = min(n, lo + per);
+    // local max / sum exp
+    float m = __int_as_float(0xff800000), s = 0.f;
+    for (int i = lo + threadIdx.x; i < hi; i += blockDim.x) {
+        const float x = lg[i];
+        if (x > m) { s = s * expf(m - x) + 1.f; m = x; } else s += expf(x - m);
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        const float om = __shfl_xor_sync(0xffffffffu, m, o), os = __shfl_xor_sync(0xffffffffu, s, o);
+        const float M = fmaxf(m, om);
+        s = (s == 0.f ? 0.f : s * expf(m - M)) + (os == 0.f ? 0.f : os * expf(om - M));
+        m = M;
+    }
+    if ((threadIdx.x & 31) == 0) { sm[threadIdx.x >> 5] = m; ss[threadIdx.x >> 5] = s; }
+    float* out = part + (size_t)blockIdx.x * 10;
+    // top 4 by repeated argmax
+    for (int r = 0; r < 4; r++) {
+        float v = __int_as_float(0xff800000);
+        int idx = -1;
+        for (int i = lo + threadIdx.x; i < hi; i += blockDim.x) {
+            const float x = lg[i];
+            bool taken = false;
+            for (int q = 0; q < r; q++) taken |= __float_as_int(out[2 + 2 * q + 1]) == i;
+            if (!taken && x > v) { v = x; idx = i; }
+        }
+        bv[threadIdx.x] = v; bi[threadIdx.x] = idx;
+        __syncthreads();
+        for (int w = blockDim.x / 2; w > 0; w >>= 1) {
+            if (threadIdx.x < w && bv[threadIdx.x + w] > bv[threadIdx.x]) { bv[threadIdx.x] = bv[threadIdx.x + w]; bi[threadIdx.x] = bi[threadIdx.x + w]; }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) { out[2 + 2 * r] = bv[0]; out[2 + 2 * r + 1] = __int_as_float(bi[0]); }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        float M = __int_as_float(0xff800000), S = 0.f;
+        for (int w = 0; w < (int)(blockDim.x >> 5); w++) {
+            const float nm = fmaxf(M, sm[w]);
+            S = (S == 0.f ? 0.f : S * expf(M - nm)) + (ss[w] == 0.f ? 0.f : ss[w] * expf(sm[w] - nm));
+            M = nm;
+        }
+        out[0] = M; out[1] = S;
+    }
+}
+extern "C" __global__ void fe_short2(const float* part, int nparts, const unsigned char* head, int rb, const float* x,
+                                     unsigned* ids, float* probs, int n_lo, int hi_base) {
+    __shared__ float ev[256], eq[256], red[256];
+    __shared__ int ei[256];
+    const int t = threadIdx.x;
+    const int b = t / 4, r = t % 4;
+    const float* p = part + (size_t)b * 10;
+    const float q2v = p[2 + 2 * r];
+    const int row = __float_as_int(p[2 + 2 * r + 1]);
+    float exact = __int_as_float(0xff800000);
+    if (b < nparts && row >= 0) {
+        float acc = 0.f;
+        const unsigned char* w = head + (size_t)row * rb;
+        for (int e0 = 0; e0 < 2560; e0 += 8) {
+            float v[8];
+            decode8<13>(w, e0, v);
+            for (int i = 0; i < 8; i++) acc = fmaf(v[i], x[e0 + i], acc);
+        }
+        exact = acc;
+    }
+    ev[t] = exact; eq[t] = (b < nparts && row >= 0) ? q2v : __int_as_float(0xff800000); ei[t] = row;
+    __syncthreads();
+    if (t == 0) {
+        // global Q2 softmax pieces
+        float M = __int_as_float(0xff800000), S = 0.f;
+        for (int i = 0; i < nparts; i++) {
+            const float pm = part[i * 10], ps = part[i * 10 + 1];
+            const float nm = fmaxf(M, pm);
+            S = (S == 0.f ? 0.f : S * expf(M - nm)) + (ps == 0.f ? 0.f : ps * expf(pm - nm));
+            M = nm;
+        }
+        int best = 0;
+        for (int i = 1; i < 256; i++) if (ev[i] > ev[best] || (ev[i] == ev[best] && ei[i] < ei[best])) best = i;
+        const float top = ev[best];
+        const float MM = fmaxf(M, top);
+        float tot = S * expf(M - MM);
+        for (int i = 0; i < 256; i++) {
+            if (ei[i] < 0) continue;
+            tot += expf(ev[i] - MM) - expf(eq[i] - MM);
+        }
+        const int idx = ei[best];
+        ids[0] = (unsigned)(idx < n_lo ? idx : hi_base + (idx - n_lo));
+        probs[0] = expf(top - MM) / tot;
+    }
+}
 "#;
