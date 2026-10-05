@@ -836,7 +836,7 @@ impl Engine {
             ids: z(WIDE * TOPK),
             w: z(WIDE * TOPK),
             plan: z(MoePlan::words(WIDE)),
-            list: z(1 + MoePlan::CAP),
+            list: z(1 + MoePlan::cap(WIDE)),
             moe: z(MoePlan::scratch_words_for(WIDE)),
             parts: z(MoePlan::parts_rows(WIDE) * HIDDEN),
             gu: z(WIDE * 2 * FF),
@@ -1434,8 +1434,9 @@ impl Engine {
                 gpu::launch(self.k.copy, (1, 1, 1), (256, 1, 1), 0, &self.stream, tang_moe::args![dst, src, n]).expect("launch")
             };
         }
-        if self.pcie_cap > 0 || self.wide {
-            let cap = if self.wide { i32::MAX } else { self.pcie_cap as i32 };
+        let wide_pcie = self.wide && std::env::var("TANG_FLASH_WIDE_PCIE").is_ok_and(|v| v == "1");
+        if self.pcie_cap > 0 || wide_pcie {
+            let cap = if wide_pcie { i32::MAX } else { self.pcie_cap as i32 };
             let (plan, ids, ht, ti) = (a(&s.plan), a(&s.ids), a(&self.host_tables[l]), t as i32);
             // The plan's layout at this width (MoePlan's offsets with cap(t)).
             let c = MoePlan::cap(t) as i32;
@@ -1452,7 +1453,7 @@ impl Engine {
         let mbp = self.mb.device();
         let ctlw = a(&s.ctl) + 8; // window counter word
         let li = l as i32;
-        if !self.wide {
+        if !wide_pcie {
         {
             let (ids, xq, xw, ti) = (a(&s.ids), a(&s.xq), QAct { m: t, k: HIDDEN }.words() as i32, t as i32);
             unsafe {
@@ -1504,7 +1505,7 @@ impl Engine {
                 .expect("launch")
             };
         }
-        if self.wide {
+        if wide_pcie {
             return;
         }
         let st = 1 + 4 * l;
@@ -1522,7 +1523,7 @@ impl Engine {
             let (flag, src, n, dst) = (
                 Mb::FLAG_B as i32,
                 Mb::CPU_ROWS as i32,
-                (1 + MoePlan::CAP) as i32,
+                (1 + MoePlan::cap(t)) as i32,
                 a(&s.list),
             );
             let (plan, streamed) = (a(&s.plan), self.pcie_cap as i32);
@@ -1547,7 +1548,7 @@ impl Engine {
             unsafe {
                 gpu::launch(
                     self.k.copy_rows,
-                    (MoePlan::CAP as u32, 1, 1),
+                    (MoePlan::cap(t) as u32, 1, 1),
                     (256, 1, 1),
                     0,
                     &self.stream,
@@ -1724,7 +1725,25 @@ impl Engine {
                 Experts::Cpu(_) => 0,
             }
         };
-        let mut missed = build_plan(&ids, t, addr, 0, &mut self.host_plan);
+        let mut missed = if t <= MAX_T {
+            build_plan(&ids, t, addr, 0, &mut self.host_plan)
+        } else {
+            // Wide prefill window: the missed experts in order of first appearance.
+            let n = t * TOPK;
+            let mut seen: Vec<u32> = Vec::new();
+            let mut m = Vec::new();
+            for &e in &ids[..n] {
+                if seen.contains(&e) {
+                    continue;
+                }
+                seen.push(e);
+                if addr(e) == 0 {
+                    let toks = (0..n).filter(|&j| ids[j] == e).map(|j| (j / TOPK, j)).collect();
+                    m.push(tang_moe::miss::Missed { expert: e, toks });
+                }
+            }
+            m
+        };
         let streamed = if matches!(experts, Experts::Resident(_)) { self.pcie_cap.min(missed.len()) } else { 0 };
         missed.drain(..streamed);
         let t1 = Instant::now();
@@ -1742,8 +1761,36 @@ impl Engine {
                 toks: &m.toks,
             })
             .collect();
-        // SAFETY: ROWS holds PARTS_ROWS rows; the GPU reads them only after FLAG_B.
-        unsafe { self.exec.run(xq, t, &jobs, self.mb.rows_ptr()) };
+        if t <= MAX_T {
+            // SAFETY: ROWS holds PARTS_ROWS rows; the GPU reads them only after FLAG_B.
+            unsafe { self.exec.run(xq, t, &jobs, self.mb.rows_ptr()) };
+        } else {
+            // Wide: in slices of MAX_T tokens (the executor's width), each with its own
+            // activations repacked and the jobs' tokens that fall in it; rows land at their
+            // window-wide dst. Each row's arithmetic is the T <= 8 path's.
+            let qa = tang_moe::contract::QAct { m: t, k: HIDDEN };
+            for s0 in (0..t).step_by(MAX_T) {
+                let n = MAX_T.min(t - s0);
+                let qs = tang_moe::contract::QAct { m: n, k: HIDDEN };
+                let mut sub = vec![0u32; qs.words()];
+                let (cw, sw) = (HIDDEN / 4, HIDDEN / 32);
+                sub[..n * cw].copy_from_slice(&xq[qa.codes(s0)..qa.codes(s0) + n * cw]);
+                sub[qs.scales(0)..qs.scales(0) + n * sw].copy_from_slice(&xq[qa.scales(s0)..qa.scales(s0) + n * sw]);
+                sub[qs.sums(0)..qs.sums(0) + n * sw].copy_from_slice(&xq[qa.sums(s0)..qa.sums(s0) + n * sw]);
+                let toks: Vec<Vec<(usize, usize)>> = jobs
+                    .iter()
+                    .map(|j| j.toks.iter().filter(|&&(tk, _)| tk >= s0 && tk < s0 + n).map(|&(tk, d)| (tk - s0, d)).collect())
+                    .collect();
+                let sj: Vec<MissJob> = jobs
+                    .iter()
+                    .zip(&toks)
+                    .filter(|(_, tk)| !tk.is_empty())
+                    .map(|(j, tk)| MissJob { blob: j.blob, toks: tk })
+                    .collect();
+                // SAFETY: as above; ROWS holds the wide plan's rows (tang-moe `WIDE_CAP`).
+                unsafe { self.exec.run(&sub, n, &sj, self.mb.rows_ptr()) };
+            }
+        }
         let dsts: Vec<u32> = missed
             .iter()
             .flat_map(|m| m.toks.iter().map(|&(_, d)| d as u32))
@@ -3220,19 +3267,44 @@ impl Engine {
         ensure!(t > MAX_T && t <= WIDE && pos0 + t <= self.tokens.len());
         ensure!(pos0 + t <= self.opts.max_ctx, "context {} > max {}", pos0 + t, self.opts.max_ctx);
         let w0 = Instant::now();
+        let mut st = WinStats { t, ..Default::default() };
         self.stage(pos0, t)?;
-        self.start_gather(pos0, t);
+        self.keys.clear();
         self.wide = true;
-        let r = match self.wide_graphs.get(&t) {
-            Some(g) => g.launch(&self.stream).map_err(|e| anyhow!("{e}")),
-            None => self.enqueue_window(t, false, false, &mut |_, _| Ok(())),
-        };
+        let r = (|| -> Result<()> {
+            if let Some(g) = self.wide_graphs.get(&t) {
+                g.launch(&self.stream).map_err(|e| anyhow!("{e}"))?;
+                self.start_gather(pos0, t);
+                for l in 0..self.layers.len() {
+                    self.serve(l, &mut st)?;
+                }
+                Ok(())
+            } else {
+                self.start_gather(pos0, t);
+                let mut f = |me: &mut Self, l: usize| me.serve(l, &mut st);
+                self.enqueue_window(t, false, false, &mut f)
+            }
+        })();
         self.wide = false;
         r?;
         self.dev.sync();
         if let Some(e) = self.gather_err.lock().unwrap().take() {
             bail!("n-gram rows: {e}");
         }
+        // Routing from the ids copied out per layer: statistics and the cache's adaptation.
+        for l in 0..self.layers.len() {
+            let mut d: Vec<u32> = self.io.u32s(Io::LIDS + l * 4 * WIDE * TOPK, t * TOPK).to_vec();
+            d.sort_unstable();
+            d.dedup();
+            st.routed += t * TOPK;
+            st.distinct += d.len();
+            let base = (l * EXPERTS) as u32;
+            for &e in &d {
+                self.routing[(base + e) as usize] += 1;
+                self.keys.push(base + e);
+            }
+        }
+        st.swaps = self.boundary()?;
         self.counter = self.counter.wrapping_add(1);
         if self.use_graphs && !self.wide_graphs.contains_key(&t) {
             let stream = ManuallyDrop::new(Stream(self.dev.cu_stream()));
@@ -3246,6 +3318,7 @@ impl Engine {
             self.wide = false;
             self.wide_graphs.insert(t, g.map_err(|e| anyhow!("capture wide T={t}: {e}"))?);
         }
-        Ok(WinStats { t, wall_ms: w0.elapsed().as_secs_f64() * 1e3, ..Default::default() })
+        st.wall_ms = w0.elapsed().as_secs_f64() * 1e3;
+        Ok(st)
     }
 }

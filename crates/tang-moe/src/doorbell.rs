@@ -38,6 +38,11 @@ use crate::miss::{build_plan, MissExec, MissJob, MissTimes};
 /// also use `ld.acquire.sys`).
 pub struct Mb;
 
+/// Widest window the mailbox carries (wide prefill windows; decode stays at `MAX_T`).
+pub const WIDE_T: usize = 64;
+/// Row capacity at `WIDE_T`: every routed slot plus the shared expert's rows.
+pub const WIDE_CAP: usize = WIDE_T * TOPK + WIDE_T;
+
 impl Mb {
     pub const SEQ: usize = 0;
     pub const FLAG_A: usize = 64;
@@ -45,16 +50,16 @@ impl Mb {
     pub const HDR_T: usize = 192;
     pub const HDR_LAYER: usize = 193;
     pub const IDS: usize = 256;
-    pub const XQ: usize = 512;
+    pub const XQ: usize = (Self::IDS + WIDE_T * TOPK).next_multiple_of(64);
     pub const XQ_WORDS: usize = QAct {
-        m: MAX_T,
+        m: WIDE_T,
         k: HIDDEN,
     }
     .words();
     pub const PLAN: usize = (Self::XQ + Self::XQ_WORDS).next_multiple_of(16);
     pub const CPU_ROWS: usize = (Self::PLAN + MoePlan::WORDS).next_multiple_of(16);
-    pub const ROWS: usize = (Self::CPU_ROWS + 1 + MoePlan::CAP).next_multiple_of(1024);
-    pub const WORDS: usize = Self::ROWS + MoePlan::PARTS_ROWS * HIDDEN;
+    pub const ROWS: usize = (Self::CPU_ROWS + 1 + WIDE_CAP).next_multiple_of(1024);
+    pub const WORDS: usize = Self::ROWS + WIDE_CAP * HIDDEN;
 }
 
 /// Sequence number of layer `l` of window `w`.
@@ -150,7 +155,7 @@ impl Mailbox {
 
     /// The published request: `(t, ids [t·TOPK], xq words of QAct { m: t, k: HIDDEN })`.
     pub fn request(&self) -> (usize, &[u32], &[u32]) {
-        let t = (self.words(Mb::HDR_T, 1)[0] as usize).min(MAX_T);
+        let t = (self.words(Mb::HDR_T, 1)[0] as usize).min(WIDE_T);
         (
             t,
             self.words(Mb::IDS, t * TOPK),
@@ -175,7 +180,7 @@ impl Mailbox {
 
     /// List the rows written and raise `FLAG_B`.
     pub fn raise_b(&self, seq: u32, dsts: &[u32]) {
-        let w = self.words_mut(Mb::CPU_ROWS, 1 + MoePlan::CAP);
+        let w = self.words_mut(Mb::CPU_ROWS, 1 + WIDE_CAP);
         w[0] = dsts.len() as u32;
         w[1..1 + dsts.len()].copy_from_slice(dsts);
         self.atom(Mb::FLAG_B).store(seq, Ordering::Release);
@@ -382,7 +387,7 @@ mod tests {
 
     #[test]
     fn layout_is_aligned_and_disjoint() {
-        const { assert!(Mb::IDS + MAX_T * TOPK <= Mb::XQ) };
+        const { assert!(Mb::IDS + WIDE_T * TOPK <= Mb::XQ) };
         // Host-written flags 256 bytes clear of everything else.
         for f in [Mb::FLAG_A, Mb::FLAG_B] {
             for other in [Mb::SEQ, Mb::FLAG_A, Mb::FLAG_B, Mb::HDR_T, Mb::IDS] {

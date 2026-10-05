@@ -1181,6 +1181,19 @@ pub fn prefill_bench(args: &[String]) -> Result<()> {
                 cur = *kept.last().unwrap();
             }
             let dsecs = t1.elapsed().as_secs_f64();
+            let wide: Vec<&super::engine::WinStats> = st.iter().filter(|s| s.t > MAX_T).collect();
+            if !wide.is_empty() {
+                let n = wide.len() as f64;
+                let ms = wide.iter().map(|s| s.wall_ms).sum::<f64>() / n;
+                let pcie = wide.iter().map(|s| s.pcie).sum::<usize>() as f64 / n;
+                println!(
+                    "    wide windows: {} of T={}, {ms:.1} ms each, {:.0} distinct experts, {pcie:.0} over PCIe ({:.2} GB) per window",
+                    wide.len(),
+                    wide[0].t,
+                    wide.iter().map(|s| s.distinct).sum::<usize>() as f64 / n,
+                    pcie * tang_compute::flash::ExpertBlob::BYTES as f64 / 1e9
+                );
+            }
             let w = st.len().max(1) as f64;
             let m = |f: fn(&super::engine::WinStats) -> f64| st.iter().map(f).sum::<f64>() / w;
             let c = |f: fn(&super::engine::WinStats) -> usize| st.iter().map(f).sum::<usize>() as f64 / w;
