@@ -11,6 +11,11 @@
 //! demands identical bytes. With longer drafts (and on other kernels), rows differ by ~1e-5 in
 //! the logits, which can flip a near-tie; `default_drafts_match` checks the full-length
 //! drafts anyway (they matched on Metal and CUDA when written).
+//!
+//! Both run with f32 KV caches. With bf16 caches (the default) the rows drift further apart:
+//! a key the wider batch computes ~1e-6 differently can round to the neighbouring bf16 value,
+//! which moves later logits by ~1e-3 (Qwen3-4B, k <= 4), enough to flip a near-tie now and
+//! then (2 of these 8 requests). Both outputs are the model's; they just aren't the same bytes.
 #![cfg(any(feature = "metal", feature = "cuda"))]
 
 use serde_json::json;
@@ -179,6 +184,8 @@ fn device() -> impl ComputeDevice {
 fn compare(cfg: DraftConfig) -> Vec<(String, bool, String, String, Usage, bool)> {
     let dir = model().unwrap();
     let mut e = Engine::load(device(), &dir, 4096, Dtype::Bf16).unwrap();
+    // f32 KV caches (see the module docs).
+    e.set_kv_f32(true);
     let mut rows = Vec::new();
     for (name, r) in requests() {
         e.set_speculation(None);

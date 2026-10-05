@@ -208,11 +208,6 @@ impl CudaComputeDevice {
         )))
     }
 
-    pub(super) fn alloc_bf16_impl(&self, len: usize) -> CudaBuffer {
-        let slice = self.stream.alloc_zeros::<u16>(len).unwrap();
-        Self::make_buf_unpooled(CudaStorage::Bf16(slice), len)
-    }
-
     pub(super) fn buffer_addr_impl(&self, buf: &CudaBuffer) -> u64 {
         let (p, _sync) = match buf.storage() {
             CudaStorage::F32(s) => s.device_ptr(&self.stream),

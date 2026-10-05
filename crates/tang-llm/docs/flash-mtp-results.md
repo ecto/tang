@@ -125,4 +125,9 @@ dense kernels, host expert reads) remain open.
 Raw logs: `mew:~/flash-codex/eval25/` and `eval50/`; each contains `spec.log`, four benchmark
 logs, `exit-code`, and `done`. Reload diagnostics: `reload25/` and `reload50/`. All GPU runs
 used `~/tang-gpu.lock`; the original collection script, model files, and server settings remain
-untouched. The PR still has pre-existing merge conflicts with main in `cuda.rs` and `server.rs`.
+untouched. The conflicts with main in `cuda.rs` and `server.rs` were subsequently resolved by integrating
+main's node API/priority worker with the Flash backend and retaining the shared BF16 pool.
+The integrated head passes 78 library tests (one pre-existing ignored) and both CPU node API
+tests; CUDA model-dependent integration tests compile but skip without `TANG_LLM_TEST_MODEL`.
+Flash keeps worker-local prompt rendering and a fixed model bundle: model load/unload is
+rejected, its background prefill does not yield, and dense KV block reporting is unavailable.

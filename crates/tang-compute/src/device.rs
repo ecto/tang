@@ -33,6 +33,11 @@ pub trait ComputeDevice: Send {
         0
     }
 
+    /// The device's name (e.g. "Apple M4 Max", "NVIDIA GeForce RTX 3090"); empty if unknown.
+    fn device_name(&self) -> String {
+        String::new()
+    }
+
     /// Release cached buffers in the device memory pool. No-op on devices
     /// without pooling. Call between long-running phases to prevent
     /// fragmentation-induced OOM.
@@ -886,6 +891,27 @@ pub trait ComputeDevice: Send {
         self.upload(&wide)
     }
 
+    /// Whether [`alloc_bf16`](Self::alloc_bf16) stores bfloat16 (otherwise it's f32).
+    fn bf16_storage(&self) -> bool {
+        false
+    }
+
+    /// A zeroed buffer of `len` elements kept in bfloat16, for data the kernels write as well
+    /// as read: a KV cache, which [`attention_prep`](Self::attention_prep) fills and the
+    /// attention methods read (math in f32 either way). [`write_into`](Self::write_into) and
+    /// [`slice_buffer`](Self::slice_buffer) work on it, converting f32 sources, and
+    /// [`upload_bf16`](Self::upload_bf16) makes a source of the same kind. Backends without
+    /// bf16 storage return f32 ([`alloc`](Self::alloc)).
+    fn alloc_bf16(&self, len: usize) -> Self::Buffer {
+        self.alloc(len)
+    }
+
+    /// The contents as bfloat16 bits: exact for bf16 storage, rounded to nearest even
+    /// otherwise.
+    fn download_bf16(&self, buf: &Self::Buffer) -> Vec<u16> {
+        self.download(buf).into_iter().map(f32_to_bf16).collect()
+    }
+
     /// Upload 4-bit affine-quantized weights in MLX's layout: `packed` holds 8 weights per
     /// u32 (low nibble first) for a row-major `[n, k]` matrix; `scales` and `biases` are bf16
     /// bits, one per `group` consecutive weights of a row (`w = scale * q + bias`). Backends
@@ -940,6 +966,60 @@ pub trait ComputeDevice: Send {
             (nh, nkv, hd),
             pos,
             eps,
+        )
+    }
+
+    /// [`attention_prep`](Self::attention_prep) into a paged cache: k and v of position `p`
+    /// go to the row `pages` maps it to. The default ([`attention_prep_paged_default`]) runs
+    /// `attention_prep` on scratch caches and copies the rows over.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_prep_paged(
+        &self,
+        qkv: &Self::Buffer,
+        q_norm: Option<&Self::Buffer>,
+        k_norm: Option<&Self::Buffer>,
+        cos: &Self::Buffer,
+        sin: &Self::Buffer,
+        k_pool: &mut Self::Buffer,
+        v_pool: &mut Self::Buffer,
+        pages: &Pages<Self::Buffer>,
+        seq: usize,
+        shape: (usize, usize, usize),
+        pos: usize,
+        eps: f32,
+    ) -> Self::Buffer {
+        attention_prep_paged_default(
+            self, qkv, q_norm, k_norm, cos, sin, k_pool, v_pool, pages, seq, shape, pos, eps,
+        )
+    }
+
+    /// [`kv_attention_window`](Self::kv_attention_window) over a paged cache: key `j` is the
+    /// row `pages` maps it to. The default ([`kv_attention_paged_default`]) gathers the keys
+    /// into contiguous buffers.
+    #[allow(clippy::too_many_arguments)]
+    fn kv_attention_paged(
+        &self,
+        q: &Self::Buffer,
+        k_pool: &Self::Buffer,
+        v_pool: &Self::Buffer,
+        pages: &Pages<Self::Buffer>,
+        cache_start: usize,
+        q_len: usize,
+        shape: (usize, usize, usize),
+        window: usize,
+        causal: bool,
+    ) -> Self::Buffer {
+        kv_attention_paged_default(
+            self,
+            q,
+            k_pool,
+            v_pool,
+            pages,
+            cache_start,
+            q_len,
+            shape,
+            window,
+            causal,
         )
     }
 
@@ -1127,12 +1207,6 @@ pub trait ComputeDevice: Send {
     /// Upload raw bytes, packed little-endian 4 per element ([`crate::flash`], "Words").
     fn upload_bytes(&self, bytes: &[u8]) -> Self::Buffer {
         self.upload_u32(&crate::flash::bytes_to_words(bytes))
-    }
-
-    /// A zeroed buffer of `len` values stored as bf16 where the backend can (the QSA K/V cache).
-    /// The default stores f32 (values written to it are rounded to bf16 by the ops anyway).
-    fn alloc_bf16(&self, len: usize) -> Self::Buffer {
-        self.alloc_f32(len)
     }
 
     /// The address of `buf`'s first byte as this device's kernels see it (a host address on the
@@ -1861,6 +1935,115 @@ pub trait ComputeDevice: Send {
     );
 }
 
+/// Where a sequence's positions live in a paged KV cache: position `p` is row
+/// `ids[p / block] * block + p % block` of the cache buffers (each layer's K and V alike).
+pub struct Pages<'a, B> {
+    /// The sequence's blocks, in order.
+    pub ids: &'a [u32],
+    /// `ids` on the device (from [`ComputeDevice::upload_u32`]).
+    pub table: &'a B,
+    /// Positions a block holds: a power of two, at least 32.
+    pub block: usize,
+}
+
+impl<B> Pages<'_, B> {
+    /// `log2(block)`, as kernels take it.
+    pub fn shift(&self) -> u32 {
+        debug_assert!(self.block.is_power_of_two() && self.block >= 32);
+        self.block.trailing_zeros()
+    }
+
+    /// The row position `p` maps to.
+    pub fn row(&self, p: usize) -> usize {
+        self.ids[p / self.block] as usize * self.block + p % self.block
+    }
+
+    /// Positions `from..to` as contiguous runs: (first position, its row, length).
+    pub fn runs(&self, from: usize, to: usize) -> Vec<(usize, usize, usize)> {
+        let mut out = Vec::new();
+        let mut p = from;
+        while p < to {
+            let n = (self.block - p % self.block).min(to - p);
+            out.push((p, self.row(p), n));
+            p += n;
+        }
+        out
+    }
+}
+
+/// The portable [`ComputeDevice::attention_prep_paged`]: `attention_prep` on scratch caches,
+/// then the new rows copied to where `pages` puts them.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_prep_paged_default<D: ComputeDevice + ?Sized>(
+    dev: &D,
+    qkv: &D::Buffer,
+    q_norm: Option<&D::Buffer>,
+    k_norm: Option<&D::Buffer>,
+    cos: &D::Buffer,
+    sin: &D::Buffer,
+    k_pool: &mut D::Buffer,
+    v_pool: &mut D::Buffer,
+    pages: &Pages<D::Buffer>,
+    seq: usize,
+    (nh, nkv, hd): (usize, usize, usize),
+    pos: usize,
+    eps: f32,
+) -> D::Buffer {
+    let kvd = nkv * hd;
+    let (mut k, mut v) = (dev.alloc((pos + seq) * kvd), dev.alloc((pos + seq) * kvd));
+    let q = dev.attention_prep(
+        qkv,
+        q_norm,
+        k_norm,
+        cos,
+        sin,
+        &mut k,
+        &mut v,
+        seq,
+        (nh, nkv, hd),
+        pos,
+        eps,
+    );
+    for (from, row, n) in pages.runs(pos, pos + seq) {
+        let (ks, vs) = (
+            dev.slice_buffer(&k, from * kvd, n * kvd),
+            dev.slice_buffer(&v, from * kvd, n * kvd),
+        );
+        dev.write_into(k_pool, row * kvd, &ks);
+        dev.write_into(v_pool, row * kvd, &vs);
+    }
+    q
+}
+
+/// The portable [`ComputeDevice::kv_attention_paged`]: the keys gathered into contiguous f32
+/// buffers, then [`ComputeDevice::kv_attention_window`].
+#[allow(clippy::too_many_arguments)]
+pub fn kv_attention_paged_default<D: ComputeDevice + ?Sized>(
+    dev: &D,
+    q: &D::Buffer,
+    k_pool: &D::Buffer,
+    v_pool: &D::Buffer,
+    pages: &Pages<D::Buffer>,
+    cache_start: usize,
+    q_len: usize,
+    (nh, nkv, hd): (usize, usize, usize),
+    window: usize,
+    causal: bool,
+) -> D::Buffer {
+    let kvd = nkv * hd;
+    let total = cache_start + q_len;
+    let (mut k, mut v) = (dev.alloc(total * kvd), dev.alloc(total * kvd));
+    for (from, row, n) in pages.runs(0, total) {
+        let (ks, vs) = (
+            dev.slice_buffer(k_pool, row * kvd, n * kvd),
+            dev.slice_buffer(v_pool, row * kvd, n * kvd),
+        );
+        dev.write_into(&mut k, from * kvd, &ks);
+        dev.write_into(&mut v, from * kvd, &vs);
+    }
+    dev.kv_attention_window(q, &k, &v, cache_start, q_len, (nh, nkv, hd), window, causal)
+}
+
 /// Composition of primitives behind [`ComputeDevice::attention_prep`] (backends that fuse it
 /// fall back to this for shapes their kernel doesn't cover).
 #[allow(clippy::too_many_arguments)]
@@ -1899,4 +2082,10 @@ pub fn attention_prep_default<D: ComputeDevice + ?Sized>(
     dev.write_into(k_cache, pos * kvd, &k);
     dev.write_into(v_cache, pos * kvd, &v);
     q
+}
+
+/// bfloat16 bits of `x`, rounded to nearest even.
+pub fn f32_to_bf16(x: f32) -> u16 {
+    let b = x.to_bits();
+    (b.wrapping_add(0x7fff + ((b >> 16) & 1)) >> 16) as u16
 }

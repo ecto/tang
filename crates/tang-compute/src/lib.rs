@@ -23,7 +23,7 @@ pub mod cuda;
 pub mod pool;
 
 pub use cpu::CpuDevice;
-pub use device::{ComputeBuffer, ComputeDevice};
+pub use device::{f32_to_bf16, ComputeBuffer, ComputeDevice, Pages};
 pub use tang_expr::codegen::Dialect;
 
 pub use modules::{
@@ -39,7 +39,7 @@ pub use tensor::ComputeTensor;
 pub use metal::MetalDevice;
 
 #[cfg(feature = "cuda")]
-pub use cuda::CudaComputeDevice;
+pub use cuda::{cuda_memory_info, CudaComputeDevice};
 
 #[cfg(feature = "cuda")]
 pub use cudarc::driver::CudaGraph;

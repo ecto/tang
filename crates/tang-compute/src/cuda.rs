@@ -197,6 +197,14 @@ pub struct CudaComputeDevice {
     flash_sync: RefCell<Option<CudaSlice<u32>>>,
 }
 
+/// GPU 0's name, free and total memory, without making a device (no stream or cuBLAS handle):
+/// it holds the primary context only while asking. Free memory counts every process's use.
+pub fn cuda_memory_info() -> Result<(String, usize, usize), cudarc::driver::DriverError> {
+    let ctx = CudaContext::new(0)?;
+    let (free, total) = cudarc::driver::result::mem_get_info()?;
+    Ok((ctx.name()?, free, total))
+}
+
 impl CudaComputeDevice {
     /// Create a new CUDA device (ordinal 0), f32 precision.
     pub fn new() -> Result<Self, cudarc::driver::DriverError> {
@@ -857,6 +865,15 @@ impl CudaComputeDevice {
                 let mut view = d.try_slice_mut(offset..offset + src_len).unwrap();
                 self.stream.memcpy_dtod(s, &mut view).unwrap();
             }
+            // Across formats (a bf16 KV cache written from f32 rows, or read back): convert.
+            (CudaStorage::Bf16(_), CudaStorage::F32(_)) => {
+                let conv = self.convert_f32_to_bf16(src);
+                self.write_into(dst, offset, &conv);
+            }
+            (CudaStorage::F32(_), CudaStorage::Bf16(_)) => {
+                let conv = self.convert_bf16_to_f32(src);
+                self.write_into(dst, offset, &conv);
+            }
             _ => panic!("write_into: mismatched storage types"),
         }
     }
@@ -1181,6 +1198,10 @@ impl ComputeDevice for CudaComputeDevice {
         cudarc::driver::result::mem_get_info()
             .map(|(free, _)| free)
             .unwrap_or(0)
+    }
+
+    fn device_name(&self) -> String {
+        self.ctx.name().unwrap_or_default()
     }
 
     fn pool_clear(&self) {
@@ -4087,7 +4108,7 @@ impl ComputeDevice for CudaComputeDevice {
     }
 
     fn alloc_bf16(&self, len: usize) -> CudaBuffer {
-        self.alloc_bf16_impl(len)
+        self.pool_alloc_bf16(len)
     }
 
     fn buffer_addr(&self, buf: &CudaBuffer) -> u64 {
@@ -4434,6 +4455,17 @@ impl ComputeDevice for CudaComputeDevice {
         )
     }
 
+    fn bf16_storage(&self) -> bool {
+        true
+    }
+
+    fn download_bf16(&self, buf: &CudaBuffer) -> Vec<u16> {
+        match buf.storage() {
+            CudaStorage::Bf16(s) => self.stream.memcpy_dtov(s).unwrap(),
+            _ => buf.to_vec().into_iter().map(f32_to_bf16).collect(),
+        }
+    }
+
     fn upload_q4(
         &self,
         packed: &[u32],
@@ -4464,7 +4496,7 @@ impl ComputeDevice for CudaComputeDevice {
         eps: f32,
     ) -> CudaBuffer {
         if let Some(q) = self.attention_prep_llm(
-            qkv, q_norm, k_norm, cos, sin, k_cache, v_cache, seq, shape, pos, eps,
+            qkv, q_norm, k_norm, cos, sin, k_cache, v_cache, seq, shape, pos, eps, None,
         ) {
             return q;
         }
@@ -4493,6 +4525,73 @@ impl ComputeDevice for CudaComputeDevice {
             shape,
             window,
             !causal,
+            None,
+        )
+    }
+
+    fn attention_prep_paged(
+        &self,
+        qkv: &CudaBuffer,
+        q_norm: Option<&CudaBuffer>,
+        k_norm: Option<&CudaBuffer>,
+        cos: &CudaBuffer,
+        sin: &CudaBuffer,
+        k_pool: &mut CudaBuffer,
+        v_pool: &mut CudaBuffer,
+        pages: &crate::Pages<CudaBuffer>,
+        seq: usize,
+        shape: (usize, usize, usize),
+        pos: usize,
+        eps: f32,
+    ) -> CudaBuffer {
+        let pg = Some((pages.table, pages.shift()));
+        if let Some(q) = self.attention_prep_llm(
+            qkv, q_norm, k_norm, cos, sin, k_pool, v_pool, seq, shape, pos, eps, pg,
+        ) {
+            return q;
+        }
+        crate::device::attention_prep_paged_default(
+            self, qkv, q_norm, k_norm, cos, sin, k_pool, v_pool, pages, seq, shape, pos, eps,
+        )
+    }
+
+    fn kv_attention_paged(
+        &self,
+        q: &CudaBuffer,
+        k_pool: &CudaBuffer,
+        v_pool: &CudaBuffer,
+        pages: &crate::Pages<CudaBuffer>,
+        cache_start: usize,
+        q_len: usize,
+        shape: (usize, usize, usize),
+        window: usize,
+        causal: bool,
+    ) -> CudaBuffer {
+        let (nh, nkv, d) = shape;
+        if d > 256 || nh % nkv != 0 {
+            return crate::device::kv_attention_paged_default(
+                self,
+                q,
+                k_pool,
+                v_pool,
+                pages,
+                cache_start,
+                q_len,
+                shape,
+                window,
+                causal,
+            );
+        }
+        self.attention_llm(
+            q,
+            k_pool,
+            v_pool,
+            cache_start,
+            q_len,
+            shape,
+            window,
+            !causal,
+            Some((pages.table, pages.shift())),
         )
     }
 
@@ -4505,7 +4604,7 @@ impl ComputeDevice for CudaComputeDevice {
         nh: usize,
         hd: usize,
     ) -> CudaBuffer {
-        self.attention_llm(q, k, v, 0, n, (nh, nh, hd), 0, true)
+        self.attention_llm(q, k, v, 0, n, (nh, nh, hd), 0, true, None)
     }
 
     fn layer_norm(

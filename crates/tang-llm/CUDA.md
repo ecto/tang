@@ -7,8 +7,8 @@ Written for an RTX 3090 (24 GB, Ampere, sm_86) on Linux. Anything from Turing up
 Everything in the forward pass, with the same semantics as Metal: MLX 4-bit and bf16 weights
 stay packed on the GPU (decode GEMVs read them directly; prefill widens a chunk of rows at a
 time into cuBLAS SGEMM), and attention (split-KV decode, tiled prefill) handles GQA, Gemma's
-sliding windows, bidirectional image blocks and head dims up to 256. Activations and the KV
-cache are f32, as on Metal. Qwen3 and Gemma 3 (text and vision) are covered.
+sliding windows, bidirectional image blocks and head dims up to 256. Activations are f32 and
+the KV cache bf16 (attention accumulates in f32), as on Metal; `TANG_KV_F32=1` keeps it f32. Qwen3 and Gemma 3 (text and vision) are covered.
 
 ## Requirements
 
@@ -49,20 +49,26 @@ curl http://<box>:8911/v1/chat/completions -H 'content-type: application/json' \
   -d '{"messages": [{"role": "user", "content": "Hello!"}], "max_tokens": 64}'
 ```
 
+For frog's scheduler the server also has `GET /node` (the GPU, free VRAM, the model and its
+measured rates, the queue, KV blocks), `POST /models/load` / `/models/unload`, which only ever
+load into free VRAM, and an `x-frog-priority: interactive | background` header: see
+[docs/node.md](docs/node.md).
+
 `--device auto` (the default) picks Metal, then CUDA, then the CPU, so `--device cuda` is only
 there to fail loudly if the GPU isn't found.
 
 ### What fits in 24 GB
 
-Memory is the weights plus an f32 KV cache sized for `--ctx` (default 32768) up front:
+Memory is the weights plus a bf16 KV cache that grows with the conversation, up to `--ctx`
+(default 32768):
 
 | model | weights | KV cache per token | at `--ctx 32768` |
 |---|---|---|---|
-| mlx-community/Qwen3-4B-4bit | 2.1 GB | 288 KiB | 9.0 GiB |
-| mlx-community/Qwen3-8B-4bit | ~4.6 GB | 288 KiB | 9.0 GiB |
-| mlx-community/Qwen3-14B-4bit | ~8.3 GB | 320 KiB | 10 GiB (tight: use `--ctx 16384`) |
-| mlx-community/gemma-3-4b-it-4bit (with vision) | 3.2 GB | 272 KiB | 8.5 GiB |
-| mlx-community/gemma-3-12b-it-4bit | ~8 GB | 768 KiB | too big: use `--ctx 8192` (6 GiB) |
+| mlx-community/Qwen3-4B-4bit | 2.1 GB | 144 KiB | 4.5 GiB |
+| mlx-community/Qwen3-8B-4bit | ~4.6 GB | 144 KiB | 4.5 GiB |
+| mlx-community/Qwen3-14B-4bit | ~8.3 GB | 160 KiB | 5 GiB |
+| mlx-community/gemma-3-4b-it-4bit (with vision) | 3.2 GB | 136 KiB | 4.25 GiB |
+| mlx-community/gemma-3-12b-it-4bit | ~8 GB | 384 KiB | 12 GiB (tight: use `--ctx 16384`) |
 
 Qwen3-8B-4bit at the default context is the comfortable choice. Leave ~2 GB for prefill
 scratch (a dequantized weight chunk is up to 128 MB) and the CUDA context.

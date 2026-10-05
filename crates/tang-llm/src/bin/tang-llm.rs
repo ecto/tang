@@ -4,13 +4,19 @@
 //! `tang-llm serve <model-dir | hf-repo-id> [--host H] [--port P] [--ctx N] [--api-key-file F]`
 //! — OpenAI-compatible server (on 127.0.0.1 unless `--host` says otherwise). With a key (from
 //! the file, or `TANG_API_KEY`), requests need `Authorization: Bearer <key>`.
+//! For frog's scheduler it also serves `GET /node` (hardware, free memory, model, measured
+//! rates, queue, KV blocks), `POST /models/load` / `/models/unload` (swap the model, only into
+//! free memory) and takes `x-frog-priority: interactive | background` (see `docs/node.md`).
 //! `--kv-slots N` keeps N conversations' KV caches (default 1); a request's `prompt_cache_key`
 //! picks its conversation's cache. Caches grow with their conversations. `--kv-slots auto`
 //! keeps up to 8 within half of RAM where the GPU shares it (Metal, CPU), dropping the least
 //! recently used to make room, and keeps 1 on CUDA. `TANG_KV_SLOTS` sets the default;
-//! `TANG_KV_BUDGET=<GB>` sets the memory cap (with any slot count). Keyed conversations' caches
-//! are also saved to `~/.cache/tang/kv/` after each turn and read back instead of prefilled;
-//! `TANG_KV_DISK=<GB>` caps that (default 8, 0 turns it off).
+//! `TANG_KV_BUDGET=<GB>` sets the memory cap (with any slot count). KV is kept in 256-position
+//! blocks shared by content: a conversation whose prompt starts like another's reuses that one's
+//! blocks instead of prefilling them. Keyed conversations' blocks are also saved to
+//! `~/.cache/tang/kv/` after each turn (each block once) and read back instead of prefilled;
+//! `TANG_KV_DISK=<GB>` caps that (default 8, 0 turns it off). KV caches hold bf16 on the GPU
+//! (half of f32's memory; attention accumulates in f32); `TANG_KV_F32=1` keeps them f32.
 //! Speculative decoding (suffix drafts from the prompt and earlier completions, verified in one
 //! forward; outputs unchanged) is on for GPUs: `--no-speculate` or `TANG_SPECULATE=0` turns it
 //! off, `--speculate` forces it on. Earlier completions are kept in
@@ -403,7 +409,14 @@ fn serve_flash(args: &[String]) -> Result<()> {
         .file_name()
         .map(|n| n.to_string_lossy().split("-0000").next().unwrap_or_default().to_string())
         .unwrap_or_default();
-    tang_llm::server::serve(&format!("{host}:{port}"), name, key, move || FlashServe::load(&s))
+    let opts = tang_llm::server::Options {
+        addr: format!("{host}:{port}"),
+        model: Some(name),
+        key,
+        dtype: Dtype::Q4,
+        hardware: probe(Backend::Cuda),
+    };
+    tang_llm::server::serve(opts, move |_name: &str| FlashServe::load(&s))
 }
 
 fn serve(backend: Backend, args: &[String]) -> Result<()> {
@@ -445,7 +458,6 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
             other => bail!("unknown option {other}"),
         }
     }
-    let draft = speculate.then(|| draft_config(backend, &spec));
     // The GPU's memory is the system's (so RAM bounds the KV slots).
     let unified = match backend {
         #[cfg(feature = "cuda")]
@@ -453,15 +465,72 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
         _ => true,
     };
     let key = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
-    let dir = tang_llm::resolve_model(&spec)?;
+    tang_llm::resolve_model(&spec)?;
     let addr = format!("{host}:{port}");
     if key.is_none() && !host.starts_with("127.") && host != "localhost" {
         eprintln!("tang-llm: warning: listening on {host} without an API key; anyone who can reach it can use it");
     }
+    let opts = tang_llm::server::Options {
+        addr,
+        key,
+        model: Some(spec),
+        dtype,
+        hardware: probe(backend),
+    };
     on_backend!(
         backend,
-        serve_on(&addr, spec, dir, ctx, dtype, key, draft, slots, unified)
+        serve_on(opts, backend, ctx, speculate, slots, unified)
     )
+}
+
+/// Reads the device and its free memory, for `/node` and the fit check before a load.
+fn probe(backend: Backend) -> tang_llm::node::Probe {
+    use std::sync::Arc;
+    use tang_llm::node::{host_memory, Hardware};
+    let host = || host_memory().unwrap_or((0, 0));
+    match backend {
+        #[cfg(feature = "metal")]
+        Backend::Metal => {
+            // The same GPU the model's device uses: its working set counts this process's
+            // buffers.
+            let dev = std::sync::Mutex::new(new_metal().ok());
+            Arc::new(move || {
+                let (total, available) = host();
+                let dev = dev.lock().unwrap_or_else(|e| e.into_inner());
+                let (name, gpu_free) = dev.as_ref().map_or((String::new(), available), |d| {
+                    (d.device_name(), d.free_memory_bytes() as u64)
+                });
+                Hardware {
+                    kind: "metal",
+                    name,
+                    unified: true,
+                    total_bytes: total,
+                    free_bytes: available.min(gpu_free),
+                }
+            })
+        }
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => Arc::new(|| {
+            let (name, free, total) = tang_compute::cuda_memory_info().unwrap_or_default();
+            Hardware {
+                kind: "cuda",
+                name,
+                unified: false,
+                total_bytes: total as u64,
+                free_bytes: free as u64,
+            }
+        }),
+        Backend::Cpu => Arc::new(move || {
+            let (total, available) = host();
+            Hardware {
+                kind: "cpu",
+                name: "cpu".into(),
+                unified: true,
+                total_bytes: total,
+                free_bytes: available,
+            }
+        }),
+    }
 }
 
 /// Drafting settings for `backend`: its verify cost curve, a store of earlier completions under
@@ -559,21 +628,23 @@ fn physical_ram() -> Option<usize> {
     Some(kb * 1024)
 }
 
+/// Serve with `opts`, loading each model (the first, and any `/models/load` asks for) with the
+/// command line's settings.
 fn serve_on<D: ComputeDevice + 'static>(
     make: fn() -> Result<D>,
-    addr: &str,
-    name: String,
-    dir: PathBuf,
+    opts: tang_llm::server::Options,
+    backend: Backend,
     ctx: usize,
-    dtype: Dtype,
-    key: Option<String>,
-    draft: Option<tang_llm::draft::DraftConfig>,
+    speculate: bool,
     slots: Option<usize>,
     unified: bool,
 ) -> Result<()> {
-    let disk = kv_disk(&name, dtype);
-    tang_llm::server::serve(addr, name, key, move || {
+    let dtype = opts.dtype;
+    tang_llm::server::serve(opts, move |name: &str| {
         let t = Instant::now();
+        let dir = tang_llm::resolve_model(name)?;
+        let disk = kv_disk(name, dtype);
+        let draft = speculate.then(|| draft_config(backend, name));
         let mut e = Engine::load(make()?, &dir, ctx, dtype)?;
         if let Some(d) = &draft {
             eprintln!(
@@ -605,7 +676,7 @@ fn serve_on<D: ComputeDevice + 'static>(
             eprintln!("tang-llm: draft store has {} tokens", s.global.tokens());
         }
         eprintln!(
-            "tang-llm: loaded {} in {:.1}s ({} ctx, {} KV slots{})",
+            "tang-llm: loaded {} in {:.1}s ({} ctx, {} KV slots{}; KV {} KiB a token, {})",
             dir.display(),
             t.elapsed().as_secs_f32(),
             e.context_window(),
@@ -613,7 +684,9 @@ fn serve_on<D: ComputeDevice + 'static>(
             budget.map_or(String::new(), |b| format!(
                 " within {:.1} GB",
                 b as f64 / 1e9
-            ))
+            )),
+            e.model.row_bytes() / 1024,
+            if e.model.kv_bf16() { "bf16" } else { "f32" },
         );
         Ok(e)
     })

@@ -1,5 +1,7 @@
 //! `tang-llm serve <first shard.gguf> --mtp <mtp.gguf>`: the Flash-Next engine behind the
-//! OpenAI-compatible server (`crate::server`), for agents like frog.
+//! OpenAI-compatible server (`crate::server`), for agents like frog. The shared server keeps
+//! priority queue ordering and `/node` rates; this fixed GGUF backend does not swap models,
+//! yield a background prefill, or report dense-engine KV blocks.
 //!
 //! - **Prompt.** The GGUF's own chat template. An assistant message this server generated is
 //!   spliced back in as the exact tokens it generated (reasoning included, as the template's
@@ -183,6 +185,7 @@ struct Line {
 }
 
 pub struct FlashServe {
+    gguf: PathBuf,
     e: Engine,
     tok: FlashTokenizer,
     ctx: usize,
@@ -287,6 +290,7 @@ impl FlashServe {
             s.disk.as_ref().map_or(String::new(), |d| format!(", system prompts saved in {}", d.display()))
         );
         let mut me = FlashServe {
+            gguf: s.gguf.clone(),
             drafts_mode: if e.use_mtp { "mtp" } else { "none" },
             e,
             im_start: id("<|im_start|>")?,
@@ -885,6 +889,8 @@ impl FlashServe {
 }
 
 impl Backend for FlashServe {
+    fn model_path(&self, _spec: &str) -> Result<PathBuf> { Ok(self.gguf.clone()) }
+
     fn complete(&mut self, req: &Request, on: &mut dyn FnMut(Piece) -> bool) -> Result<(Finish, Usage)> {
         let r = self.generate(req, on);
         if r.is_err() {
