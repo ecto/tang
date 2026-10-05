@@ -196,6 +196,15 @@ impl Dw {
         let Dw::Native { segs, nseg, rows, row16, .. } = self else {
             panic!("native_ptr on a non-native weight")
         };
+        // Wider than MAX_T (wide prefill): slices of MAX_T tokens (each row's arithmetic doesn't
+        // depend on the width).
+        if t > MAX_T {
+            for i in (0..t).step_by(MAX_T) {
+                let n = MAX_T.min(t - i);
+                self.native_ptr(dev, nk, xp + (i * k * 4) as u64, op + (i * ostride * 4) as u64, n, k, ostride);
+            }
+            return;
+        }
         let (sp, ns, os, r16, xq, ki) = (dev.buffer_addr(segs), *nseg, ostride as i32, *row16, nk.xq8, k as i32);
         let s = ManuallyDrop::new(Stream(nk.stream));
         unsafe {

@@ -198,7 +198,7 @@ pub struct FlashServe {
     clock: u64,
     temp: f32,
     sampling: SamplingMode,
-    /// Widest prefill window (`TANG_FLASH_WIDE`, default 32; 0: decode-width windows only).
+    /// Widest prefill window (`TANG_FLASH_WIDE`, default 0 = decode-width windows: wide windows read every VRAM-missing expert over PCIe, which is slower until the CPU-miss path is widened).
     wide: usize,
     disk: Option<PathBuf>,
     dump: Option<PathBuf>,
@@ -303,7 +303,7 @@ impl FlashServe {
             clock: 0,
             temp: s.temp,
             sampling: s.sampling,
-            wide: std::env::var("TANG_FLASH_WIDE").ok().and_then(|v| v.parse().ok()).unwrap_or(32),
+            wide: std::env::var("TANG_FLASH_WIDE").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             disk: s.disk.clone(),
             dump: s.dump.clone(),
             shape,
