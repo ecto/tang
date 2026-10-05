@@ -642,15 +642,17 @@ impl FlashServe {
         marks.sort_by_key(|m| m.0);
         marks.retain(|&(p, _)| p > start && p < ids.len());
         marks.dedup_by_key(|m| m.0);
+        // The MTP only over the prompt's last positions (`TANG_FLASH_MTP_PREFILL`, default 512).
+        let mtp_from = ids.len().saturating_sub(std::env::var("TANG_FLASH_MTP_PREFILL").ok().and_then(|v| v.parse().ok()).unwrap_or(512));
         let mut a = start;
         for (p, pinned) in marks {
             if p > a {
-                self.e.prefill(&ids[a..p], MAX_T, None)?;
+                prefill_windows(&mut self.e, &ids[a..p], MAX_T, mtp_from)?;
                 a = p;
             }
             self.snapshot(pinned)?;
         }
-        let next = self.e.prefill(&ids[a..], MAX_T, None)?;
+        let next = prefill_windows(&mut self.e, &ids[a..], MAX_T, mtp_from)?.0;
         Ok((start, next))
     }
 
@@ -1013,10 +1015,12 @@ pub fn default_disk(gguf: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Prefill `ids` after the engine's sequence in windows of `chunk`, the MTP run only over the
-/// last `mtp_tail` positions (all of them: `usize::MAX`). Returns the sampled next token, each
-/// window's stats and the MTP time.
-pub fn prefill_windows(e: &mut Engine, ids: &[u32], chunk: usize, mtp_tail: usize) -> Result<(u32, Vec<super::engine::WinStats>, f64)> {
+/// Prefill `ids` after the engine's sequence in windows of `chunk`, the MTP run only over
+/// windows that reach position `mtp_from` (0: all). Returns the sampled next token, each
+/// window's stats and the MTP time. The MTP's K/V for earlier positions stays unwritten: that
+/// only changes its drafts' acceptance, never the output (measured: no change in tokens/window
+/// at 2K and 10K with the last 512 positions).
+pub fn prefill_windows(e: &mut Engine, ids: &[u32], chunk: usize, mtp_from: usize) -> Result<(u32, Vec<super::engine::WinStats>, f64)> {
     ensure!(!ids.is_empty(), "empty prompt");
     let pos_start = e.tokens.len();
     e.tokens.extend_from_slice(ids);
@@ -1026,7 +1030,7 @@ pub fn prefill_windows(e: &mut Engine, ids: &[u32], chunk: usize, mtp_tail: usiz
         let t = chunk.min(end - pos).clamp(1, MAX_T);
         let out = e.window(pos, t, None)?;
         stats.push(e.last);
-        if e.use_mtp && e.has_mtp() && end - pos <= mtp_tail.saturating_add(t) {
+        if e.use_mtp && e.has_mtp() && pos + t > mtp_from {
             let nexts: Vec<u32> = (0..t).map(|i| e.tokens.get(pos + i + 1).copied().unwrap_or(out[t - 1])).collect();
             let t0 = Instant::now();
             e.mtp_last = e.mtp_draft(pos, &nexts)?;
@@ -1048,6 +1052,8 @@ pub fn prefill_bench(args: &[String]) -> Result<()> {
     let path = PathBuf::from(it.next().context("first argument: the first GGUF shard")?);
     let (mut ids, mut ns, mut mtp) = (Vec::<u32>::new(), vec![2048usize, 10240], None);
     let (mut caps, mut tails) = (vec![16usize, 88], vec![0usize, 512]);
+    let mut quick = false;
+    let mut chunks: Vec<usize> = Vec::new();
     let list = |s: &str| -> Result<Vec<usize>> { s.split(',').map(|x| Ok(x.parse::<usize>()?)).collect() };
     while let Some(a) = it.next() {
         let mut val = || it.next().with_context(|| format!("{a} needs a value"));
@@ -1061,8 +1067,14 @@ pub fn prefill_bench(args: &[String]) -> Result<()> {
             "--caps" => caps = list(val()?)?,
             "--tails" => tails = list(val()?)?,
             "--mtp" => mtp = Some(PathBuf::from(val()?)),
+            "--quick" => quick = true,
+            "--chunks" => chunks = list(val()?)?,
             s => bail!("unknown argument {s}"),
         }
+    }
+    if quick {
+        caps.clear();
+        tails = vec![512];
     }
     ensure!(!ids.is_empty(), "--ids-file");
     let max_n = *ns.iter().max().unwrap();
@@ -1080,17 +1092,22 @@ pub fn prefill_bench(args: &[String]) -> Result<()> {
     let default_cap = e.pcie_cap;
     for &n in &ns {
         let p = &ids[..n];
-        let mut configs: Vec<(String, usize, usize)> = vec![("served (mtp all, cap default)".into(), usize::MAX, default_cap)];
+        let mut configs: Vec<(String, usize, usize, usize)> = vec![("served (mtp all, cap default)".into(), usize::MAX, default_cap, MAX_T)];
+        for &c in &chunks {
+            configs.push((format!("chunk {c}, mtp last 512"), 512, default_cap, c));
+        }
         for &t in &tails {
-            configs.push((format!("mtp last {t}"), t, default_cap));
+            configs.push((format!("mtp last {t}"), t, default_cap, MAX_T));
         }
         for &c in &caps {
-            configs.push((format!("mtp last 512, pcie_cap {c}"), 512, c));
+            configs.push((format!("mtp last 512, pcie_cap {c}"), 512, c, MAX_T));
         }
-        configs.push(("served again".into(), usize::MAX, default_cap));
+        if !quick {
+            configs.push(("served again".into(), usize::MAX, default_cap, MAX_T));
+        }
         let mut want: Option<(u32, Vec<f32>)> = None;
         println!("prefill {n} tokens:");
-        for (name, tail, cap) in configs {
+        for (name, tail, cap, chunk) in configs {
             e.reset();
             e.use_mtp = has_mtp;
             if e.pcie_cap != cap {
@@ -1101,7 +1118,7 @@ pub fn prefill_bench(args: &[String]) -> Result<()> {
                 }
             }
             let t0 = Instant::now();
-            let (next, st, mtp_ms) = prefill_windows(&mut e, p, MAX_T, tail)?;
+            let (next, st, mtp_ms) = prefill_windows(&mut e, p, chunk, n.saturating_sub(tail))?;
             let secs = t0.elapsed().as_secs_f64();
             let last_t = st.last().map_or(1, |s| s.t);
             let lg = e.logits(last_t)[(last_t - 1) * v..].to_vec();
