@@ -5523,6 +5523,7 @@ dependencies = [
  "cfg-if",
  "cpufeatures",
  "digest 0.10.7",
+ "sha2-asm",
 ]
 
 [[package]]
@@ -5534,6 +5535,15 @@ dependencies = [
  "cfg-if",
  "cpufeatures",
  "digest 0.11.0-rc.10",
+]
+
+[[package]]
+name = "sha2-asm"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b845214d6175804686b2bd482bcffe96651bb2d1200742b712003504a2dac1ab"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -6022,6 +6032,7 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tang-compute",
  "tokenizers",
  "tokio",

@@ -18,7 +18,10 @@ cross-queue priority scheduling and explicit image unloading are later work.
 
 Requests: `{model:"z-image-turbo",prompt,size?,n?,seed?,steps?,response_format?}`.
 Sizes are multiples of 16 from 64 to 1024 per axis, count 1–4, steps 1–100 (default 8),
-and output is `data[].b64_json` PNG plus actual seed, steps and dimensions. Seeds use
+and output is `data[].b64_json` PNG plus actual seed, steps and dimensions. The top-level
+`model_hash` fingerprints actual checkpoint weights, architecture, tokenizer and scheduler
+bytes once per resident load; it is independent of the requested model name or download
+revision. Apple Silicon uses hardware-assisted SHA256. Seeds use
 SplitMix64/Box-Muller noise, not PyTorch's RNG sequence. The same seed identifies tang's
 stream only; cross-backend reproducibility requires matching noise and arithmetic.
 
@@ -46,6 +49,10 @@ test used WebKit and a resident local Gemma 3 4B vision judge in the combined se
 the matched stop persisted across Frog restart. The judge returned structured differences
 but also invented missing letters, so this establishes integration rather than judge quality.
 The generator and judge remained resident together without evicting existing workloads.
+Additional 128×128 validation exposed a Metal softmax shared-scratch race in VAE attention.
+The barrier fix passes real Frog generation with diagnostics disabled and all 80 Metal
+compute regressions. `TANG_IMAGE_TRACE=1` optionally logs synchronized VAE finite-value
+counts for diagnostics; it is off by default. Nonfinite sampler latents fail at their step.
 
 ## Reference validation
 

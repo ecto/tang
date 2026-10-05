@@ -59,7 +59,8 @@ pub(crate) struct Service {
     app: App,
 }
 fn images_value(images: Vec<Generated>) -> Value {
-    json!({"model":"z-image-turbo","data":images.into_iter().map(|image|json!({"b64_json":STANDARD.encode(image.png),"seed":image.seed,"steps":image.steps,"width":image.width,"height":image.height})).collect::<Vec<_>>()})
+    let model_hash = images.first().map(|image| image.model_hash.clone());
+    json!({"model":"z-image-turbo","model_hash":model_hash,"data":images.into_iter().map(|image|json!({"b64_json":STANDARD.encode(image.png),"seed":image.seed,"steps":image.steps,"width":image.width,"height":image.height})).collect::<Vec<_>>()})
 }
 async fn models(State(app): State<App>) -> Json<Value> {
     Json(

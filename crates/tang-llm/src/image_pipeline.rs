@@ -9,6 +9,7 @@ use crate::{
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::{
     io::{Cursor, Read},
     path::Path,
@@ -80,6 +81,7 @@ pub struct Generated {
     pub steps: usize,
     pub width: usize,
     pub height: usize,
+    pub model_hash: String,
 }
 pub struct Pipeline<D: ComputeDevice> {
     pub encoder: Model<D>,
@@ -88,6 +90,7 @@ pub struct Pipeline<D: ComputeDevice> {
     tokenizer: Tokenizer,
     template: Template,
     shift: f32,
+    model_hash: String,
 }
 impl<D: ComputeDevice> Pipeline<D> {
     pub fn load(dev: D, root: &Path) -> Result<Self> {
@@ -115,6 +118,7 @@ impl<D: ComputeDevice> Pipeline<D> {
             "only static Euler shifting supported"
         );
         let shift = cfg["shift"].as_f64().context("scheduler shift missing")? as f32;
+        let model_hash = fingerprint(root)?;
         Ok(Self {
             encoder,
             dit,
@@ -122,6 +126,7 @@ impl<D: ComputeDevice> Pipeline<D> {
             tokenizer,
             template,
             shift,
+            model_hash,
         })
     }
     pub fn generate(
@@ -174,6 +179,11 @@ impl<D: ComputeDevice> Pipeline<D> {
                     schedule.normalized_time(step)?,
                 )?;
                 schedule.step(step, &prediction, &mut latent)?;
+                ensure!(
+                    latent.iter().all(|x| x.is_finite()),
+                    "nonfinite latent at step {}",
+                    step + 1
+                );
             }
             ensure!(
                 on((index + 1) * request.steps, request.n * request.steps),
@@ -183,7 +193,23 @@ impl<D: ComputeDevice> Pipeline<D> {
                 .iter()
                 .map(|x| x / self.vae.cfg.scaling_factor + self.vae.cfg.shift_factor)
                 .collect();
-            let decoded = self.vae.decode(dev, &scaled, h, w)?;
+            let decoded = if std::env::var("TANG_IMAGE_TRACE").as_deref() == Ok("1") {
+                eprintln!(
+                    "image latent: max abs {}",
+                    scaled.iter().map(|x| x.abs()).fold(0f32, f32::max)
+                );
+                self.vae
+                    .decode_trace(dev, &scaled, h, w, &mut |name, buffer| {
+                        let values = dev.download(buffer);
+                        eprintln!(
+                            "image VAE {name}: {} nonfinite, max abs {}",
+                            values.iter().filter(|x| !x.is_finite()).count(),
+                            values.iter().map(|x| x.abs()).fold(0f32, f32::max)
+                        );
+                    })?
+            } else {
+                self.vae.decode(dev, &scaled, h, w)?
+            };
             ensure!(
                 self.vae.cfg.out_channels == 3 && decoded.len() == width * height * 3,
                 "unexpected decoded image dimensions"
@@ -212,10 +238,57 @@ impl<D: ComputeDevice> Pipeline<D> {
                 steps: request.steps,
                 width,
                 height,
+                model_hash: self.model_hash.clone(),
             });
         }
         Ok(images)
     }
+}
+/// Hash actual checkpoint bytes once per resident load, not a claimed download revision.
+/// Paths and per-file digests include weights, architecture, tokenizer and scheduler.
+fn fingerprint(root: &Path) -> Result<String> {
+    let mut paths = Vec::new();
+    for sub in [
+        "transformer",
+        "text_encoder",
+        "vae",
+        "tokenizer",
+        "scheduler",
+    ] {
+        for entry in std::fs::read_dir(root.join(sub))? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|ext| {
+                ["safetensors", "json", "txt", "model", "jinja"]
+                    .iter()
+                    .any(|s| ext == *s)
+            }) {
+                paths.push(path);
+            }
+        }
+    }
+    paths.sort();
+    let mut digest = Sha256::new();
+    digest.update(b"tang-z-image-checkpoint-v1\0");
+    let mut buffer = vec![0u8; 1024 * 1024];
+    for path in paths {
+        let name = path
+            .strip_prefix(root)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let mut file = std::fs::File::open(&path)?;
+        let mut file_digest = Sha256::new();
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            file_digest.update(&buffer[..count]);
+        }
+        digest.update((name.len() as u64).to_le_bytes());
+        digest.update(name.as_bytes());
+        digest.update(file_digest.finalize());
+    }
+    Ok(format!("sha256:{:x}", digest.finalize()))
 }
 fn check_memory<D: ComputeDevice>(root: &Path, dev: &D) -> Result<()> {
     // Matrices are resident in BF16; VAE is explicitly upcast. Retain scratch/headroom.
@@ -279,6 +352,36 @@ impl Normal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn checkpoint_hash_tracks_weight_and_configuration_bytes() {
+        let root = std::env::temp_dir().join(format!(
+            "tang-image-hash-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for sub in [
+            "transformer",
+            "text_encoder",
+            "vae",
+            "tokenizer",
+            "scheduler",
+        ] {
+            std::fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        let weight = root.join("transformer/model.safetensors");
+        std::fs::write(&weight, b"first weights").unwrap();
+        let first = fingerprint(&root).unwrap();
+        assert_eq!(first, fingerprint(&root).unwrap());
+        std::fs::write(&weight, b"other weights").unwrap();
+        let second = fingerprint(&root).unwrap();
+        assert_ne!(first, second);
+        std::fs::write(root.join("scheduler/config.json"), b"{\"shift\":3}").unwrap();
+        assert_ne!(second, fingerprint(&root).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn gaussian_is_seeded_and_normalized() {
         let mut a = Normal::new(42);
