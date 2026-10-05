@@ -930,7 +930,7 @@ fn native(g: &CudaComputeDevice) {
                 .map(|_| g.upload_native(ty, &raw, n, k))
                 .collect();
             let mut cell = format!(" | {k}->{n}");
-            for t in [1usize, 4] {
+            for t in widths(&[1, 4]) {
                 let mut xq = g.alloc_f32(QAct { m: t, k }.words());
                 g.quantize_act_into(&g.upload_f32(&rng.vec(t * k, 1.0)), &mut xq, t, k);
                 let mut y = g.alloc_f32(t * n);
@@ -1132,7 +1132,7 @@ fn hc(g: &CudaComputeDevice) {
     let src = Src::new(&mut rng, 16 << 20);
     let hcs: Vec<Hc> = (0..8).map(|_| Hc::new(g, &src)).collect();
     println!("hc_read_into x96 in one graph (GB/s of bf16 weight bytes)");
-    for t in [1usize, 2, 4, 8] {
+    for t in widths(&[1, 2, 4, 8]) {
         let mut r = g.upload_f32(&rng.vec(t * HC * HIDDEN, 1.0));
         let y = g.upload_f32(&rng.vec(t * HIDDEN, 0.1));
         let inj = g.upload_f32(&rng.vec(t * HC, 1.0));
@@ -1181,6 +1181,11 @@ fn union_attend() -> bool {
 /// `TANG_FLASH_UNFUSED=1`: the bench's own A/B switch, matching the library's.
 fn unfused() -> bool {
     std::env::var("TANG_FLASH_UNFUSED").is_ok_and(|v| v == "1")
+}
+
+/// `FKB_T=1,4,16`: window widths for the native and hc sweeps.
+fn widths(default: &[usize]) -> Vec<usize> {
+    std::env::var("FKB_T").ok().map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_else(|| default.to_vec())
 }
 
 fn main() {

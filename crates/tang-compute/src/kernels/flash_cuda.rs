@@ -788,6 +788,8 @@ extern "C" __global__ void __launch_bounds__(512, 2) fl_hc_fused_q8_t##T( \
                            INJ, XN, LO, bar); \
 }
 HC_FUSED(1) HC_FUSED(2) HC_FUSED(3) HC_FUSED(4) HC_FUSED(5) HC_FUSED(6) HC_FUSED(7) HC_FUSED(8)
+// Prefill-only widths (flash-serve).
+HC_FUSED(16) HC_FUSED(32)
 
 // ---- Gated DeltaNet ----
 

@@ -37,6 +37,26 @@ fn grid(g: (usize, usize, usize), threads: u32) -> LaunchConfig {
     }
 }
 
+/// Prefill-only window widths beyond `MAX_T` (instantiated for some kernels only).
+pub const WIDE_T: [usize; 3] = [16, 32, 64]; // hc_fused: 16, 32 only (t64 exceeds 48 KB static smem)
+
+fn width_ok(t: usize) -> bool {
+    (1..=MAX_T).contains(&t) || WIDE_T.contains(&t)
+}
+
+/// `{prefix}{t}` as a static name (cached).
+fn wide_name(prefix: &'static str, t: usize) -> &'static str {
+    use std::sync::Mutex;
+    static NAMES: Mutex<Vec<(&'static str, usize, &'static str)>> = Mutex::new(Vec::new());
+    let mut v = NAMES.lock().unwrap();
+    if let Some(n) = v.iter().find(|x| x.0 == prefix && x.1 == t) {
+        return n.2;
+    }
+    let n: &'static str = Box::leak(format!("{prefix}{t}").into_boxed_str());
+    v.push((prefix, t, n));
+    n
+}
+
 const NATST_NAMES: [&str; 8] = [
     "fl_natst_t1",
     "fl_natst_t2",
@@ -335,7 +355,7 @@ impl CudaComputeDevice {
             )
             .into_boxed_str(),
         );
-        let (_module, f) = self.get_func_with_arch(src, NAT_NAMES[m - 1], "sm_86");
+        let (_module, f) = self.get_func_with_arch(src, if m <= MAX_T { NAT_NAMES[m - 1] } else { wide_name("fl_nat_t", m) }, "sm_86");
         self.llm_funcs.borrow_mut().insert(key, f.clone());
         f
     }
@@ -446,7 +466,7 @@ impl CudaComputeDevice {
         k: usize,
         n: usize,
     ) {
-        assert!((1..=MAX_T).contains(&m) && k.is_multiple_of(32) && ostride >= n);
+        assert!(width_ok(m) && k.is_multiple_of(32) && ostride >= n);
         assert!(
             out.len >= off + (m - 1) * ostride + n,
             "native_linear: output size"
@@ -595,7 +615,7 @@ impl CudaComputeDevice {
         t: usize,
         eps: f32,
     ) {
-        assert!((1..=MAX_T).contains(&t) && scratch.len >= crate::flash::hc_scratch_words(t));
+        assert!(width_ok(t) && scratch.len >= crate::flash::hc_scratch_words(t));
         // The q8 weights have only the fused kernel.
         if !unfused() || w.q8 {
             return self.hc_fused_impl(r, pending, w, x, xq, inj, scratch, t, eps);
@@ -728,7 +748,7 @@ impl CudaComputeDevice {
             "fl_hc_fused_q8_t7",
             "fl_hc_fused_q8_t8",
         ];
-        let f = self.fl(if w.q8 { Q8[t - 1] } else { NAMES[t - 1] });
+        let f = self.fl(match (w.q8, t <= MAX_T) { (true, true) => Q8[t - 1], (false, true) => NAMES[t - 1], (true, false) => wide_name("fl_hc_fused_q8_t", t), (false, false) => wide_name("fl_hc_fused_t", t) });
         let blocks = self.coresident(&f, 512, 2);
         let (mut xn, mut lo) = scratch.f32_data_mut().split_at_mut(t * HC * HIDDEN);
         let any = w.norm;
