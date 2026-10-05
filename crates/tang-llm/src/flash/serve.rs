@@ -326,10 +326,27 @@ impl FlashServe {
         (msgs, spliced)
     }
 
+    /// The template, with the system block always rendered as with thinking on: this template
+    /// puts its reasoning instructions at the very top of the system prompt, so a client that
+    /// switches thinking per turn (frog does) would otherwise invalidate every cached token.
+    /// Thinking off then only closes the generation prompt's `<think>` block, as the template
+    /// does (`TANG_FLASH_STABLE_SYSTEM=0`: the template exactly).
+    fn render(&self, msgs: &Value, req: &Request) -> Result<String> {
+        let stable = std::env::var("TANG_FLASH_STABLE_SYSTEM").map_or(true, |v| v != "0");
+        if !stable || req.think != Some(false) {
+            return self.tok.render(msgs, req.tools.as_ref(), req.think);
+        }
+        let text = self.tok.render(msgs, req.tools.as_ref(), Some(true))?;
+        match text.strip_suffix("<think>\n") {
+            Some(head) => Ok(format!("{head}<think>\n\n</think>\n\n")),
+            None => self.tok.render(msgs, req.tools.as_ref(), req.think),
+        }
+    }
+
     /// The prompt's ids, the rendered text, and how many assistant turns were spliced.
     fn prompt(&self, req: &Request) -> Result<(Vec<u32>, String, usize)> {
         let (msgs, spliced) = self.messages(req);
-        let text = self.tok.render(&msgs, req.tools.as_ref(), req.think)?;
+        let text = self.render(&msgs, req)?;
         let mut ids = Vec::new();
         let mut at = 0;
         let mut n = 0;
@@ -359,7 +376,7 @@ impl FlashServe {
             // The template didn't render the markers where expected: no splicing.
             let mut msgs = req.messages.clone();
             args_as_objects(&mut msgs);
-            let text = self.tok.render(&msgs, req.tools.as_ref(), req.think)?;
+            let text = self.render(&msgs, req)?;
             eprintln!("tang-llm: splicing skipped (template rendered generated turns unexpectedly)");
             return Ok((self.tok.encode(&text)?, text, 0));
         }
@@ -396,7 +413,7 @@ impl FlashServe {
             self.snaps.swap_remove(lru);
         }
         // Least recently used first; pinned ones have their own (small) quota.
-        for (want_pinned, cap) in [(false, self.max_snaps), (true, 3)] {
+        for (want_pinned, cap) in [(false, self.max_snaps), (true, 4)] {
             while self.snaps.iter().filter(|s| s.pinned == want_pinned).count() > cap {
                 let lru = (0..self.snaps.len())
                     .filter(|&i| self.snaps[i].pinned == want_pinned)
@@ -510,7 +527,7 @@ impl FlashServe {
     /// Bring the engine to a prefix of `ids` (live sequence, a saved state, or empty), prefill
     /// the rest (saving states at the system prompt's end and the last turn boundary), and
     /// return (tokens reused, the sampled next token).
-    fn prefill(&mut self, ids: &[u32]) -> Result<(usize, u32)> {
+    fn prefill(&mut self, ids: &[u32], text: &str) -> Result<(usize, u32)> {
         let limit = ids.len() - 1;
         let live = self.e.tokens.len();
         let live_ok = live <= limit && lcp(&self.e.tokens, ids) == live;
@@ -547,12 +564,23 @@ impl FlashServe {
         // the last turn boundary (the last one, which opens the generation prompt).
         let starts: Vec<usize> = ids.iter().enumerate().filter(|(_, &t)| t == self.im_start).map(|(i, _)| i).collect();
         let mut marks: Vec<(usize, bool)> = Vec::new();
+        // The end of the tools block, which the template puts before the system text (that
+        // has the working directory in it): the same for every session of a client.
+        if let Some(i) = text.find("</IMPORTANT>").filter(|&i| i < 200_000) {
+            if let Ok(head) = self.tok.encode(&text[..i + "</IMPORTANT>".len()]) {
+                if head.len() > 1 && ids.starts_with(&head[..head.len() - 1]) {
+                    // The last token may merge with what follows; stop one short.
+                    marks.push((head.len() - 1, true));
+                }
+            }
+        }
         if let Some(&p) = starts.get(1) {
             marks.push((p, true));
         }
         if let Some(&p) = starts.last() {
             marks.push((p, false));
         }
+        marks.sort_by_key(|m| m.0);
         marks.retain(|&(p, _)| p > start && p < ids.len());
         marks.dedup_by_key(|m| m.0);
         let mut a = start;
@@ -581,7 +609,7 @@ impl FlashServe {
         if let Some(d) = &self.dump {
             std::fs::write(d.join(format!("req-{tag}.ids")), ids.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" "))?;
         }
-        let (reused, cur) = self.prefill(&ids)?;
+        let (reused, cur) = self.prefill(&ids, &text)?;
         let prefill_s = t0.elapsed().as_secs_f64();
         self.line.prompt = ids.len();
         self.line.reused = reused;
