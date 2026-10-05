@@ -70,6 +70,8 @@ pub mod shape {
     pub const IDX_HEADS: usize = 4;
     /// Indexer key/query width.
     pub const IDX_D: usize = 128;
+    /// Slots of the raw indexer-key ring (see `QsaCache`).
+    pub const QSA_RING: usize = 128;
     /// Cells pooled per indexer block.
     pub const IDX_BLOCK: usize = 4;
     /// Capacity of a token's selection: 512 blocks + the incomplete tail's up to 3 cells.
@@ -667,9 +669,10 @@ pub struct QsaNorms<'a, B> {
 ///
 /// - `k_cache`, `v_cache`: bf16 (`alloc_bf16`), `[max_ctx][QSA_KV][QSA_D]`, cell-major. Values
 ///   are the fp32 K (normed, rotated) and V rounded to bf16, nearest-even.
-/// - `ring`: `[16][IDX_D]` f32, raw indexer keys by `pos % 16`. Sixteen slots is what makes
-///   verify windows safe without a snapshot: a window writes positions `pos0..pos0+8`, and a
-///   block still pooling needs at most the 3 cells before `pos0`.
+/// - `ring`: `[QSA_RING][IDX_D]` f32, raw indexer keys by `pos % QSA_RING`. 128 slots is what
+///   makes any window up to 64 cells safe without a snapshot: a window writes `pos0..pos0+T`
+///   (distinct slots), and a block still pooling needs at most the 3 cells before `pos0`, which
+///   no write of the window reaches (T + 3 <= 128).
 /// - `pooled`: `[max_ctx / 4][IDX_D]` f32: block `b` = rope(rmsnorm(mean of its 4 raw keys) ·
 ///   ik_norm, position 4b), written when the block's last cell is appended. The mean is
 ///   `((r0 + r1) + r2) + r3) · 0.25`.

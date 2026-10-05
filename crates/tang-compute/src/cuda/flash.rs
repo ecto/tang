@@ -177,7 +177,8 @@ impl CudaComputeDevice {
         }
         let src: &'static str = Box::leak(
             format!(
-                "#define FLASH_WIDE 1\n#define PLAN_CAP {}\n#define SHARED_ROW {}\n{FLASH_CUDA}",
+                "{}\n#define FLASH_WIDE 1\n#define PLAN_CAP {}\n#define SHARED_ROW {}\n{FLASH_CUDA}",
+                std::env::var("TANG_FL_DEFS").unwrap_or_default().replace(';', "\n"),
                 MoePlan::WIDE_CAP,
                 MoePlan::shared_row(MAX_T + 1)
             )
@@ -2690,7 +2691,7 @@ mod tests {
                         d.alloc_bf16(max_ctx * QSA_KV * QSA_D),
                     );
                     let (mut ring, mut pooled) =
-                        (d.alloc_f32(16 * IDX_D), d.alloc_f32(max_ctx / 4 * IDX_D));
+                        (d.alloc_f32(QSA_RING * IDX_D), d.alloc_f32(max_ctx / 4 * IDX_D));
                     let mut q = d.alloc_f32(fl::qsa_q_words(t));
                     for (pos0, proj) in &windows {
                         let cache = QsaCache {
@@ -3468,7 +3469,9 @@ mod tests {
                 iq: &nb[2],
                 ik: &nb[3],
             };
-            let n_tok = if tw <= MAX_T { 24 } else { 2 * tw };
+            // Three single cells first, so the windows straddle pooled blocks (pos0 % 4 == 3) and
+            // read pre-window ring cells while writing their own.
+            let n_tok = 3 + 2 * tw;
             let proj = rng.vec(n_tok * QSA_PROJ, 1.0);
             let prep = |m: usize| -> [Vec<f32>; 5] {
                 let (mut kc, mut vc) = (
@@ -3476,9 +3479,11 @@ mod tests {
                     g.alloc_bf16(max_ctx * QSA_KV * QSA_D),
                 );
                 let (mut ring, mut pooled) =
-                    (g.alloc_f32(16 * IDX_D), g.alloc_f32(max_ctx / 4 * IDX_D));
+                    (g.alloc_f32(QSA_RING * IDX_D), g.alloc_f32(max_ctx / 4 * IDX_D));
                 let mut qs = vec![];
-                for s in 0..n_tok / m {
+                let starts: Vec<(usize, usize)> =
+                    [(0, 1), (1, 1), (2, 1)].into_iter().chain((3..n_tok).step_by(m).map(|p| (p, m))).collect();
+                for (p0, m) in starts {
                     let mut q = g.alloc_f32(fl::qsa_q_words(m));
                     let cache = QsaCache {
                         k: &mut kc,
@@ -3487,9 +3492,9 @@ mod tests {
                         pooled: &mut pooled,
                     };
                     g.qsa_prep(
-                        &g.upload_f32(&proj[s * m * QSA_PROJ..(s + 1) * m * QSA_PROJ]),
+                        &g.upload_f32(&proj[p0 * QSA_PROJ..(p0 + m) * QSA_PROJ]),
                         QSA_PROJ,
-                        &win(g, s * m, 0),
+                        &win(g, p0, 0),
                         &qn,
                         (&cb, &sb),
                         &mut q,
