@@ -15,7 +15,7 @@
 //!   the drafts. Temperature only (no top-k/top-p); greedy unless the request names one.
 //! - **Tool calls.** Qwen XML (`chat::parse_xml_call`), typed by the request's schemas.
 
-use super::engine::{Engine, Opts, RunningState};
+use super::engine::{Engine, Opts, Positional, RunningState};
 use super::tokenize::FlashTokenizer;
 use crate::chat::{Parser, Piece};
 use crate::engine::{Finish, Request, ThinkBudget, Usage, WRAP_UP};
@@ -34,8 +34,9 @@ pub struct Settings {
     pub ctx: usize,
     /// Temperature for requests that don't name one (default 0: greedy).
     pub temp: f32,
-    /// Saved running states kept in RAM (besides the pinned system-prompt ones).
+    /// Saved states kept in RAM (besides the pinned system-prompt ones), and their total size.
     pub snapshots: usize,
+    pub snapshot_bytes: usize,
     /// Where pinned (system prompt) states are saved; `None` keeps them in RAM only.
     pub disk: Option<PathBuf>,
     /// Write each request's prompt and output ids here (`req-N.ids`, `req-N.out`).
@@ -46,6 +47,9 @@ pub struct Settings {
 struct Snap {
     tokens: Vec<u32>,
     state: RunningState,
+    /// Positions `0..tokens.len()` of the positional state (another sequence may have
+    /// overwritten them on the device since).
+    pos: Positional,
     pinned: bool,
     used: u64,
 }
@@ -172,6 +176,7 @@ pub struct FlashServe {
     wrap_up: Vec<u32>,
     snaps: Vec<Snap>,
     max_snaps: usize,
+    max_snap_bytes: usize,
     memo: VecDeque<Memo>,
     policy: Policy,
     clock: u64,
@@ -272,6 +277,7 @@ impl FlashServe {
             wrap_up,
             snaps: Vec::new(),
             max_snaps: s.snapshots,
+            max_snap_bytes: s.snapshot_bytes,
             memo: VecDeque::new(),
             policy: Policy::new(),
             clock: 0,
@@ -376,12 +382,19 @@ impl FlashServe {
         }
         let t = Instant::now();
         let state = self.e.save_running()?;
+        let n = self.e.tokens.len();
+        let pos = self.e.save_positional(0, n)?;
         self.line.snap_ms += t.elapsed().as_secs_f64() * 1e3;
         let tokens = self.e.tokens.clone();
         if pinned {
-            self.save_disk(&tokens, &state);
+            self.save_disk(&tokens, &state, &pos);
         }
-        self.snaps.push(Snap { tokens, state, pinned, used: clock });
+        self.snaps.push(Snap { tokens, state, pos, pinned, used: clock });
+        let size = |s: &Snap| s.state.bytes() + s.pos.bytes();
+        while self.snaps.len() > 1 && self.snaps.iter().map(size).sum::<usize>() > self.max_snap_bytes {
+            let lru = (0..self.snaps.len()).min_by_key(|&i| (self.snaps[i].pinned, self.snaps[i].used)).unwrap();
+            self.snaps.swap_remove(lru);
+        }
         // Least recently used first; pinned ones have their own (small) quota.
         for (want_pinned, cap) in [(false, self.max_snaps), (true, 3)] {
             while self.snaps.iter().filter(|s| s.pinned == want_pinned).count() > cap {
@@ -400,13 +413,13 @@ impl FlashServe {
     }
 
     /// Write a pinned state to disk (on a thread; the file appears complete or not at all).
-    fn save_disk(&self, ids: &[u32], s: &RunningState) {
+    fn save_disk(&self, ids: &[u32], s: &RunningState, pos: &Positional) {
         let Some(path) = self.disk_path(ids) else { return };
         if path.exists() {
             return;
         }
         let mut bytes: Vec<u8> = Vec::with_capacity(s.bytes() + 4 * ids.len() + 64);
-        bytes.extend_from_slice(b"TANGRS01");
+        bytes.extend_from_slice(b"TANGRS02");
         bytes.extend_from_slice(&(ids.len() as u64).to_le_bytes());
         for &i in ids {
             bytes.extend_from_slice(&i.to_le_bytes());
@@ -418,6 +431,11 @@ impl FlashServe {
             for &x in p {
                 bytes.extend_from_slice(&x.to_le_bytes());
             }
+        }
+        bytes.extend_from_slice(&(pos.parts().len() as u64).to_le_bytes());
+        for p in pos.parts() {
+            bytes.extend_from_slice(&(p.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(p);
         }
         std::thread::spawn(move || {
             let tmp = path.with_extension("tmp");
@@ -454,7 +472,7 @@ impl FlashServe {
                 Ok(s)
             }
             let word = |b: &[u8], at: &mut usize| -> Result<usize> { Ok(u64::from_le_bytes(take(b, at, 8)?.try_into()?) as usize) };
-            ensure!(b.get(..8) == Some(&b"TANGRS01"[..]), "not a state file");
+            ensure!(b.get(..8) == Some(&b"TANGRS02"[..]), "not a state file");
             let len = word(&b, &mut at)?;
             ensure!(len == n, "length");
             let tokens: Vec<u32> = take(&b, &mut at, 4 * len)?.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
@@ -466,7 +484,19 @@ impl FlashServe {
                 ensure!(k == want, "part size");
                 parts.push(take(&b, &mut at, 4 * k)?.chunks(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect());
             }
-            Ok(Snap { tokens, state: RunningState::from_parts(n, self.gdn_layers, parts)?, pinned: true, used: 0 })
+            let np = word(&b, &mut at)?;
+            let mut pos = Vec::with_capacity(np);
+            for _ in 0..np {
+                let k = word(&b, &mut at)?;
+                pos.push(take(&b, &mut at, k)?.to_vec());
+            }
+            Ok(Snap {
+                tokens,
+                state: RunningState::from_parts(n, self.gdn_layers, parts)?,
+                pos: Positional::from_parts(0, n, pos),
+                pinned: true,
+                used: 0,
+            })
         };
         match read() {
             Ok(s) => Some(s),
@@ -494,12 +524,16 @@ impl FlashServe {
             let i = best.unwrap();
             self.clock += 1;
             self.snaps[i].used = self.clock;
+            let valid = lcp(&self.e.tokens, &self.snaps[i].tokens);
+            self.e.restore_positional(&self.snaps[i].pos, valid)?;
             let (tokens, state) = (&self.snaps[i].tokens, &self.snaps[i].state);
             self.e.restore_running(state, tokens)?;
             start = snap_len;
         } else if !live_ok {
             match self.load_disk(ids, limit).filter(|s| s.tokens.len() > 0) {
                 Some(s) => {
+                    let valid = lcp(&self.e.tokens, &s.tokens);
+                    self.e.restore_positional(&s.pos, valid)?;
                     self.e.restore_running(&s.state, &s.tokens)?;
                     start = s.tokens.len();
                     eprintln!("tang-llm: read the running state at {start} from disk");
@@ -832,6 +866,7 @@ pub fn resume_test(args: &[String]) -> Result<()> {
     e.prefill(&ids[..p], MAX_T, None)?;
     let t = Instant::now();
     let st = e.save_running()?;
+    let pos = e.save_positional(0, p)?;
     let save_ms = t.elapsed().as_secs_f64() * 1e3;
     let junk: Vec<u32> = (0..53).map(|i| 1000 + 37 * i).collect();
     e.prefill(&junk, MAX_T, None)?;
@@ -842,12 +877,15 @@ pub fn resume_test(args: &[String]) -> Result<()> {
     // And from a fresh engine state (reset, then restore), as after another conversation.
     e.reset();
     e.prefill(&junk, MAX_T, None)?;
+    let valid = lcp(&e.tokens, &ids[..p]);
+    e.restore_positional(&pos, valid)?;
     e.restore_running(&st, &ids[..p])?;
     let (resumed2, _) = run(&mut e, &[&ids[p..]], p)?;
     println!(
-        "resume test: {} ids, state saved at {p} ({:.0} MB, save {save_ms:.0} ms, restore {restore_ms:.0} ms)",
+        "resume test: {} ids, state saved at {p} ({:.0} MB + {:.0} MB positional, save {save_ms:.0} ms, restore {restore_ms:.0} ms)",
         ids.len(),
-        st.bytes() as f64 / 1e6
+        st.bytes() as f64 / 1e6,
+        pos.bytes() as f64 / 1e6
     );
     println!("  resumed vs straight (same windows): {} of {} logits differ; next token {} vs {}", bits(&resumed, &split), split.len(), n_resumed, n_split);
     println!("  resumed after other prefills vs straight: {} of {} differ", bits(&resumed2, &split), split.len());

@@ -2979,3 +2979,85 @@ impl Engine {
         Ok(())
     }
 }
+
+/// Positional state (QSA K/V and pooled indexer keys, MTP K/V) for positions `from..to`, as
+/// raw bytes per buffer: what a [`RunningState`] needs besides itself when another sequence has
+/// since overwritten those positions.
+pub struct Positional {
+    pub from: usize,
+    pub to: usize,
+    bufs: Vec<Vec<u8>>,
+}
+
+impl Positional {
+    pub fn bytes(&self) -> usize {
+        self.bufs.iter().map(Vec::len).sum()
+    }
+
+    pub fn parts(&self) -> &[Vec<u8>] {
+        &self.bufs
+    }
+
+    pub fn from_parts(from: usize, to: usize, bufs: Vec<Vec<u8>>) -> Self {
+        Positional { from, to, bufs }
+    }
+}
+
+impl Engine {
+    /// Every positional buffer: (device address, positions per row, row bytes).
+    fn positional_bufs(&self) -> Vec<(u64, usize, usize)> {
+        let a = |b: &B| self.dev.buffer_addr(b);
+        let mut v = Vec::new();
+        for q in self.layers.iter().filter_map(|l| l.qsa.as_ref()) {
+            v.push((a(&q.k), 1, QSA_KV * QSA_D * 2));
+            v.push((a(&q.v), 1, QSA_KV * QSA_D * 2));
+            v.push((a(&q.pooled), IDX_BLOCK, IDX_D * 4));
+        }
+        if let Some(m) = self.mtp.as_ref() {
+            v.push((a(&m.kc), 1, QSA_KV * QSA_D * 4));
+            v.push((a(&m.vc), 1, QSA_KV * QSA_D * 4));
+        }
+        v
+    }
+
+    /// Copy positions `from..to` of the positional state out.
+    pub fn save_positional(&mut self, from: usize, to: usize) -> Result<Positional> {
+        ensure!(from <= to && to <= self.opts.max_ctx);
+        self.side.sync().map_err(|e| anyhow!("{e}"))?;
+        self.dev.sync();
+        let mut bufs = Vec::new();
+        for (addr, per, row) in self.positional_bufs() {
+            let (r0, r1) = (from / per, to / per);
+            let mut host = vec![0u8; (r1 - r0) * row];
+            if !host.is_empty() {
+                let r = unsafe {
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(host.as_mut_ptr() as *mut _, addr + (r0 * row) as u64, host.len())
+                };
+                ensure!(r == cudarc::driver::sys::CUresult::CUDA_SUCCESS, "cuMemcpyDtoH: {r:?}");
+            }
+            bufs.push(host);
+        }
+        Ok(Positional { from, to, bufs })
+    }
+
+    /// Write positions `from.max(p.from)..p.to` of `p` back.
+    pub fn restore_positional(&mut self, p: &Positional, from: usize) -> Result<()> {
+        let bufs = self.positional_bufs();
+        ensure!(bufs.len() == p.bufs.len(), "positional state is for another model");
+        self.side.sync().map_err(|e| anyhow!("{e}"))?;
+        self.dev.sync();
+        let from = from.max(p.from);
+        for ((addr, per, row), host) in bufs.into_iter().zip(&p.bufs) {
+            let (r0, r1, base) = (from / per, p.to / per, p.from / per);
+            ensure!(host.len() == (r1 - base) * row, "positional state size differs");
+            if r1 > r0 {
+                let src = &host[(r0 - base) * row..];
+                let r = unsafe {
+                    cudarc::driver::sys::cuMemcpyHtoD_v2(addr + (r0 * row) as u64, src.as_ptr() as *const _, (r1 - r0) * row)
+                };
+                ensure!(r == cudarc::driver::sys::CUresult::CUDA_SUCCESS, "cuMemcpyHtoD: {r:?}");
+            }
+        }
+        Ok(())
+    }
+}

@@ -347,6 +347,7 @@ fn serve_flash(args: &[String]) -> Result<()> {
         ctx: 32_768,
         temp: 0.0,
         snapshots: 6,
+        snapshot_bytes: std::env::var("TANG_FLASH_SNAP_GB").ok().and_then(|v| v.parse::<f64>().ok()).map_or(12e9, |g| g * 1e9) as usize,
         dump: None,
     };
     let (mut host, mut port) = ("127.0.0.1".to_string(), 8911u16);
