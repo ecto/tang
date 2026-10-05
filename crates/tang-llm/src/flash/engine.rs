@@ -763,7 +763,7 @@ impl Engine {
                     ikn: get(&format!("{k}.ikn"))?,
                     k: dev.alloc_bf16(max_ctx * QSA_KV * QSA_D),
                     v: dev.alloc_bf16(max_ctx * QSA_KV * QSA_D),
-                    ring: dev.alloc_f32(16 * IDX_D),
+                    ring: dev.alloc_f32(QSA_RING * IDX_D),
                     pooled: dev.alloc_f32(max_ctx / IDX_BLOCK * IDX_D),
                     proj: dev.alloc_f32(WIDE * QSA_PROJ),
                 })
