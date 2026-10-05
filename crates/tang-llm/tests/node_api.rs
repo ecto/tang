@@ -16,6 +16,10 @@ const KEY: &str = "test-key";
 
 /// Start a server with no model on a free port; its address.
 fn start() -> String {
+    start_with_images(false)
+}
+
+fn start_with_images(images: bool) -> String {
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -37,9 +41,21 @@ fn start() -> String {
         }),
     };
     std::thread::spawn(move || {
-        serve(opts, |spec: &str| -> anyhow::Result<Engine<CpuDevice>> {
+        let loader = |spec: &str| -> anyhow::Result<Engine<CpuDevice>> {
             anyhow::bail!("no loads in this test ({spec})")
-        })
+        };
+        if images {
+            tang_llm::server::serve_with_images(
+                opts,
+                loader,
+                Some((
+                    std::env::temp_dir().join(format!("tang-image-missing-{port}")),
+                    || Ok(CpuDevice::new()),
+                )),
+            )
+        } else {
+            serve(opts, loader)
+        }
     });
     for _ in 0..200 {
         if TcpStream::connect(&addr).is_ok() {
@@ -111,6 +127,38 @@ fn node_reports_its_shape() {
     // The id is the machine's, not the process's.
     let (_, again) = call(&addr, "GET", "/node", Some(KEY), "");
     assert_eq!(again["node_id"], v["node_id"]);
+}
+
+#[test]
+fn image_worker_shares_authentication_and_reports_failed_loads_without_poisoning() {
+    let addr = start_with_images(true);
+    let request = r#"{"model":"z-image-turbo","prompt":"frog","size":"64x64","steps":8}"#;
+    assert_eq!(call(&addr, "GET", "/health", None, "").0, 200);
+    assert_eq!(
+        call(&addr, "POST", "/v1/images/generations", None, request).0,
+        401
+    );
+    for _ in 0..2 {
+        let (status, value) = call(&addr, "POST", "/v1/images/generations", Some(KEY), request);
+        assert_eq!(status, 503, "{value}");
+        assert!(value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("loading image model"));
+    }
+    let (status, value) = call(&addr, "GET", "/v1/models", Some(KEY), "");
+    assert_eq!(status, 200);
+    assert_eq!(value["data"][0]["type"], "image");
+    assert_eq!(value["data"][0]["resident"], false);
+    let (status, value) = call(&addr, "GET", "/node", Some(KEY), "");
+    assert_eq!(status, 200);
+    assert_eq!(value["image_model"]["id"], "z-image-turbo");
+    assert_eq!(value["image_model"]["resident"], false);
+    let invalid = request.replace("64x64", "65x64");
+    assert_eq!(
+        call(&addr, "POST", "/v1/images/generations", Some(KEY), &invalid).0,
+        400
+    );
 }
 
 #[test]

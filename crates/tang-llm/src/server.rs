@@ -79,6 +79,9 @@ struct Node {
     state: Mutex<NodeState>,
     hardware: Probe,
     dtype: Dtype,
+    /// Serialize model loads and heavy inference across the judge and image workers.
+    resources: Arc<Mutex<()>>,
+    image: Option<crate::image_server::ImageModel>,
 }
 
 #[derive(Default)]
@@ -161,12 +164,30 @@ where
     D: ComputeDevice + 'static,
     F: Fn(&str) -> anyhow::Result<Engine<D>> + Send + 'static,
 {
+    serve_with_images(opts, load, None)
+}
+
+/// Serve chat/vision and a lazy resident image pipeline in one process. Heavy inference
+/// is serialized so both workers share scratch headroom; neither evicts the other's weights.
+pub fn serve_with_images<D, F>(
+    opts: Options,
+    load: F,
+    image: Option<(PathBuf, fn() -> anyhow::Result<D>)>,
+) -> anyhow::Result<()>
+where
+    D: ComputeDevice + 'static,
+    F: Fn(&str) -> anyhow::Result<Engine<D>> + Send + 'static,
+{
+    let resources = Arc::new(Mutex::new(()));
+    let image = image.map(|(root, make)| crate::image_server::mount(root, make, resources.clone()));
     let node = Arc::new(Node {
         id: crate::node::node_id(),
         queue: Queue::new(),
         state: Mutex::new(NodeState::default()),
         hardware: opts.hardware,
         dtype: opts.dtype,
+        resources,
+        image: image.as_ref().map(|service| service.model.clone()),
     });
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let worker = node.clone();
@@ -178,6 +199,8 @@ where
             load,
         };
         if let Some(spec) = first {
+            let gate = w.node.resources.clone();
+            let _guard = gate.lock().unwrap_or_else(|e| e.into_inner());
             if let Err(e) = w.load(&spec) {
                 let _ = ready_tx.send(Err(e));
                 return;
@@ -189,7 +212,7 @@ where
     ready_rx.recv()??;
 
     let app = App { node };
-    let api = Router::new()
+    let mut api = Router::new()
         .route("/v1/chat/completions", post(chat))
         .route("/v1/prefill", post(prefill))
         .route("/v1/models", get(models))
@@ -198,6 +221,9 @@ where
         .route("/models/load", post(load_model))
         .route("/models/unload", post(unload_model))
         .with_state(app);
+    if let Some(image) = image {
+        api = api.merge(image.router);
+    }
     let api = match opts.key {
         Some(key) => api.layer(middleware::from_fn_with_state(
             std::sync::Arc::new(key),
@@ -253,6 +279,8 @@ where
     fn run(&mut self) {
         loop {
             let (ticket, job) = self.node.queue.pop();
+            let gate = self.node.resources.clone();
+            let _guard = gate.lock().unwrap_or_else(|e| e.into_inner());
             match job {
                 Job::Complete {
                     req,
@@ -534,7 +562,7 @@ where
 }
 
 /// Turn away requests without the key (compared in constant time).
-async fn require_key(
+pub(crate) async fn require_key(
     State(key): State<std::sync::Arc<String>>,
     req: HttpRequest,
     next: Next,
@@ -559,7 +587,7 @@ fn same(a: &[u8], b: &[u8]) -> bool {
 
 async fn models(State(app): State<App>) -> Json<Value> {
     let st = app.node.state();
-    let data: Vec<Value> = st
+    let mut data: Vec<Value> = st
         .model
         .iter()
         .map(|m| {
@@ -580,6 +608,9 @@ async fn models(State(app): State<App>) -> Json<Value> {
             json!({ "id": m.name, "object": "model", "owned_by": "tang", "max_model_len": m.ctx, "capabilities": caps })
         })
         .collect();
+    if let Some(image) = &app.node.image {
+        data.push(image.json());
+    }
     Json(json!({ "object": "list", "data": data }))
 }
 
@@ -697,6 +728,9 @@ fn describe(node: &Node) -> Value {
         "hardware": hw.json(),
         "models": { "loaded": loaded, "loading": loading, "on_disk": on_disk },
         "queue": { "running": running, "waiting": waiting },
+        "image_model": node.image.as_ref().map(|image|json!({
+            "id":"z-image-turbo", "path":image.path, "resident":image.resident.load(std::sync::atomic::Ordering::Relaxed),
+        })),
     })
 }
 

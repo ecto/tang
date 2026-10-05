@@ -3,9 +3,9 @@
 use crate::image_pipeline::{Generated, Pipeline, Request};
 use anyhow::Result;
 use axum::{
-    extract::{Request as HttpRequest, State},
-    http::{header, StatusCode},
-    middleware::{self, Next},
+    extract::State,
+    http::StatusCode,
+    middleware,
     response::{
         sse::{Event, Sse},
         IntoResponse, Response,
@@ -20,7 +20,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc as std_mpsc, Arc,
+        mpsc as std_mpsc, Arc, Mutex,
     },
 };
 use tang_compute::ComputeDevice;
@@ -37,9 +37,26 @@ struct Job {
 }
 #[derive(Clone)]
 struct App {
-    jobs: std_mpsc::Sender<Job>,
+    jobs: std_mpsc::SyncSender<Job>,
     resident: Arc<AtomicBool>,
-    key: Option<String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ImageModel {
+    pub path: PathBuf,
+    pub resident: Arc<AtomicBool>,
+}
+impl ImageModel {
+    pub fn json(&self) -> Value {
+        json!({"id":"z-image-turbo","object":"model","type":"image",
+            "capabilities":["image_generation","seed","steps","stream_progress"],
+            "resident":self.resident.load(Ordering::Relaxed)})
+    }
+}
+pub(crate) struct Service {
+    pub router: Router,
+    pub model: ImageModel,
+    app: App,
 }
 fn images_value(images: Vec<Generated>) -> Value {
     json!({"model":"z-image-turbo","data":images.into_iter().map(|image|json!({"b64_json":STANDARD.encode(image.png),"seed":image.seed,"steps":image.steps,"width":image.width,"height":image.height})).collect::<Vec<_>>()})
@@ -48,25 +65,6 @@ async fn models(State(app): State<App>) -> Json<Value> {
     Json(
         json!({"data":[{"id":"z-image-turbo","object":"model","type":"image","resident":app.resident.load(Ordering::Relaxed)}]}),
     )
-}
-async fn authenticate(State(app): State<App>, req: HttpRequest, next: Next) -> Response {
-    if req.uri().path() != "/health" {
-        if let Some(key) = &app.key {
-            let provided = req
-                .headers()
-                .get(header::AUTHORIZATION)
-                .and_then(|s| s.to_str().ok())
-                .and_then(|s| s.strip_prefix("Bearer "));
-            if provided != Some(key) {
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    Json(json!({"error":{"message":"invalid API key"}})),
-                )
-                    .into_response();
-            }
-        }
-    }
-    next.run(req).await
 }
 async fn generate(
     State(app): State<App>,
@@ -82,12 +80,14 @@ async fn generate(
     }
     let stream = request.stream || headers.get("x-frog-progress").is_some_and(|v| v == "sse");
     let (tx, mut rx) = mpsc::unbounded_channel();
-    if app.jobs.send(Job { request, tx }).is_err() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error":{"message":"image worker unavailable"}})),
-        )
-            .into_response();
+    if let Err(error) = app.jobs.try_send(Job { request, tx }) {
+        let (status, message) = match error {
+            std_mpsc::TrySendError::Full(_) => (StatusCode::TOO_MANY_REQUESTS, "image queue full"),
+            std_mpsc::TrySendError::Disconnected(_) => {
+                (StatusCode::SERVICE_UNAVAILABLE, "image worker unavailable")
+            }
+        };
+        return (status, Json(json!({"error":{"message":message}}))).into_response();
     }
     if stream {
         let events = UnboundedReceiverStream::new(rx);
@@ -126,17 +126,25 @@ async fn generate(
     )
         .into_response()
 }
-pub fn serve<D, F>(addr: &str, root: PathBuf, key: Option<String>, make_device: F) -> Result<()>
+pub(crate) fn mount<D, F>(root: PathBuf, make_device: F, load_gate: Arc<Mutex<()>>) -> Service
 where
     D: ComputeDevice + 'static,
     F: Fn() -> Result<D> + Send + 'static,
 {
-    let (jobs, rx) = std_mpsc::channel::<Job>();
+    let (jobs, rx) = std_mpsc::sync_channel::<Job>(8);
     let resident = Arc::new(AtomicBool::new(false));
     let worker_resident = resident.clone();
+    let model = ImageModel {
+        path: root.clone(),
+        resident: resident.clone(),
+    };
     std::thread::spawn(move || {
         let mut pipeline = None;
         for job in rx {
+            if job.tx.is_closed() {
+                continue;
+            }
+            let _guard = load_gate.lock().unwrap_or_else(|e| e.into_inner());
             if job.tx.is_closed() {
                 continue;
             }
@@ -169,17 +177,34 @@ where
             let _ = job.tx.send(out);
         }
     });
-    let app = App {
-        jobs,
-        resident,
-        key,
+    let app = App { jobs, resident };
+    let router = Router::new()
+        .route("/v1/images/generations", post(generate))
+        .with_state(app.clone());
+    Service { router, model, app }
+}
+
+pub fn serve<D, F>(addr: &str, root: PathBuf, key: Option<String>, make_device: F) -> Result<()>
+where
+    D: ComputeDevice + 'static,
+    F: Fn() -> Result<D> + Send + 'static,
+{
+    let service = mount(root, make_device, Arc::new(Mutex::new(())));
+    let api = service.router.merge(
+        Router::new()
+            .route("/v1/models", get(models))
+            .with_state(service.app),
+    );
+    let api = match key {
+        Some(key) => api.layer(middleware::from_fn_with_state(
+            Arc::new(key),
+            crate::server::require_key,
+        )),
+        None => api,
     };
     let router = Router::new()
         .route("/health", get(|| async { "ok" }))
-        .route("/v1/models", get(models))
-        .route("/v1/images/generations", post(generate))
-        .layer(middleware::from_fn_with_state(app.clone(), authenticate))
-        .with_state(app);
+        .merge(api);
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
         let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -187,4 +212,46 @@ where
         axum::serve(listener, router).await
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_image_queue_returns_429_instead_of_growing_without_bound() {
+        let (jobs, _receiver) = std_mpsc::sync_channel(8);
+        let app = App {
+            jobs,
+            resident: Arc::new(AtomicBool::new(false)),
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let request = || Request {
+                model: "z-image-turbo".into(),
+                prompt: "frog".into(),
+                size: "64x64".into(),
+                n: 1,
+                seed: Some(42),
+                steps: 8,
+                stream: true,
+                response_format: None,
+            };
+            let mut accepted = Vec::new();
+            for _ in 0..8 {
+                let response = generate(
+                    State(app.clone()),
+                    axum::http::HeaderMap::new(),
+                    Json(request()),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                accepted.push(response);
+            }
+            let rejected =
+                generate(State(app), axum::http::HeaderMap::new(), Json(request())).await;
+            assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+            drop(accepted);
+        });
+    }
 }

@@ -297,6 +297,7 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
         .clone();
     let (mut port, mut ctx, mut dtype) = (8911u16, 32_768usize, Dtype::Bf16);
     let mut host = "127.0.0.1".to_string();
+    let mut image_pipeline = None;
     let mut slots = kv_slots(&std::env::var("TANG_KV_SLOTS").unwrap_or_else(|_| "1".into()))?;
     // Never on the command line itself, where `ps` would show it.
     let mut key = std::env::var("TANG_API_KEY").ok();
@@ -312,6 +313,9 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
             "--host" => host = it.next().context("--host H")?.clone(),
             "--port" => port = it.next().context("--port P")?.parse()?,
             "--ctx" => ctx = it.next().context("--ctx N")?.parse()?,
+            "--image-pipeline" => {
+                image_pipeline = Some(PathBuf::from(it.next().context("--image-pipeline DIR")?))
+            }
             "--kv-slots" => slots = kv_slots(it.next().context("--kv-slots N|auto")?)?,
             "--api-key-file" => {
                 let path = it.next().context("--api-key-file F")?;
@@ -346,7 +350,15 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
     };
     on_backend!(
         backend,
-        serve_on(opts, backend, ctx, speculate, slots, unified)
+        serve_on(
+            opts,
+            backend,
+            ctx,
+            speculate,
+            slots,
+            unified,
+            image_pipeline
+        )
     )
 }
 
@@ -505,9 +517,10 @@ fn serve_on<D: ComputeDevice + 'static>(
     speculate: bool,
     slots: Option<usize>,
     unified: bool,
+    image_pipeline: Option<PathBuf>,
 ) -> Result<()> {
     let dtype = opts.dtype;
-    tang_llm::server::serve(opts, move |name: &str| {
+    let loader = move |name: &str| {
         let t = Instant::now();
         let dir = tang_llm::resolve_model(name)?;
         let disk = kv_disk(name, dtype);
@@ -556,7 +569,8 @@ fn serve_on<D: ComputeDevice + 'static>(
             if e.model.kv_bf16() { "bf16" } else { "f32" },
         );
         Ok(e)
-    })
+    };
+    tang_llm::server::serve_with_images(opts, loader, image_pipeline.map(|root| (root, make)))
 }
 
 /// Options for the bench commands.

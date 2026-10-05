@@ -9,8 +9,12 @@ Z-Image-Turbo. Nothing downloads implicitly. The default listener is loopback;
 The worker loads Qwen3 conditioning, the DiT and VAE on the first generation and keeps
 them resident. It refuses a load that would exceed free memory plus scratch, using
 tang's node memory probe, without evicting other models. `GET /v1/models` reports the
-image model and residency. This dedicated image worker does not yet share a coding
-model or a resident vision judge; node integration is a subsequent milestone.
+image model and residency. `serve <chat-model> --image-pipeline <pipeline-directory>`
+mounts the same image worker alongside chat/vision, under the same API key. Both models
+remain resident, while a shared resource lock serializes heavy inference and model loads.
+The image queue accepts eight waiting jobs and returns HTTP 429 when full. `/node`
+reports image residency alongside the chat model. Image and chat queues remain separate;
+cross-queue priority scheduling and explicit image unloading are later work.
 
 Requests: `{model:"z-image-turbo",prompt,size?,n?,seed?,steps?,response_format?}`.
 Sizes are multiples of 16 from 64 to 1024 per axis, count 1–4, steps 1–100 (default 8),
@@ -37,7 +41,11 @@ and 512×512; the native Frog transcript and lightbox were inspected. Repeating 
 with the resident pipeline produced a byte-identical PNG. First request: 52.3 seconds
 including model loading; resident repeat: 11.1 seconds; 512×512: 52.2 seconds. These are
 individual eight-step end-to-end measurements, not general benchmark or quality claims.
-The chat/vision delivery assertions used a local fixture, not a production vision judge.
+These image tests use fixture chat decisions. An additional real Frog Screenshot/Compare
+test used WebKit and a resident local Gemma 3 4B vision judge in the combined service;
+the matched stop persisted across Frog restart. The judge returned structured differences
+but also invented missing letters, so this establishes integration rather than judge quality.
+The generator and judge remained resident together without evicting existing workloads.
 
 ## Reference validation
 
@@ -73,7 +81,12 @@ Accurate CPU RMS statistics reduced the worst CPU boundary error from 0.0427 to 
 forward/backward consistency and 97 affected regressions pass. Trained VAE at 4×4 latents
 passes all 20 Metal boundaries under the existing 1e-3 absolute bound, final max error
 2.8e-6. CPU final output is similarly close, but five hidden boundaries exceed its
-stricter 1e-4 bound. Larger trained DiT reference cases are being investigated separately.
+stricter 1e-4 bound. At 32×32 trained latents, twelve Metal boundaries still exceed the
+same strict bound; final output max error is 1.10e-4 (relative L2 5.93e-6).
+
+`scripts/download_gemma_judge.py <new-directory>` explicitly downloads a pinned public
+Gemma 3 4B MLX checkpoint, verifies hashes and preserves the same disk reserve. Language
+weights are Q4 and vision weights BF16. No judge weights download during inference.
 
 For constrained disk, `scripts/download_z_image.py <new-directory>` pins a public
 Hugging Face revision, streams F32 matrices into BF16, preserves vectors, verifies
