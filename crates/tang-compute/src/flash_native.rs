@@ -162,8 +162,10 @@ impl NatType {
     pub fn rows_per_warp(self, m: usize) -> usize {
         if m == 1 {
             2
-        } else {
+        } else if m <= crate::flash::MAX_T {
             WIDE_GR(self)
+        } else {
+            1
         }
     }
 

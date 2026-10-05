@@ -270,7 +270,7 @@ extern "C" __global__ void __launch_bounds__(256) fl_##NAME##_t##T( \
     const float* __restrict__ X, const unsigned int* __restrict__ XQ, \
     const unsigned char* __restrict__ W, float* __restrict__ Y, unsigned int K, unsigned int N, \
     unsigned int KS, unsigned int OS) { \
-    gemv_body<FMT, T, (T == 1 ? 2 : 4)>(X, XQ, W, Y, K, N, KS, OS); \
+    gemv_body<FMT, T, (T == 1 ? 2 : (T <= 8 ? 4 : 1))>(X, XQ, W, Y, K, N, KS, OS); \
 }
 #define GEMV_ALL(FMT, NAME) GEMV(FMT, NAME, 1) GEMV(FMT, NAME, 2) GEMV(FMT, NAME, 3) GEMV(FMT, NAME, 4) \
     GEMV(FMT, NAME, 5) GEMV(FMT, NAME, 6) GEMV(FMT, NAME, 7) GEMV(FMT, NAME, 8)
@@ -278,6 +278,11 @@ GEMV_ALL(0, bf16_gemv)
 GEMV_ALL(1, q2_gemv)
 GEMV_ALL(2, q4x_gemv)
 GEMV_ALL(3, q8x_gemv)
+// Prefill-only widths (one row a warp: the per-row arithmetic is the same at any width).
+GEMV(0, bf16_gemv, 16) GEMV(0, bf16_gemv, 32) GEMV(0, bf16_gemv, 64)
+GEMV(1, q2_gemv, 16) GEMV(1, q2_gemv, 32) GEMV(1, q2_gemv, 64)
+GEMV(2, q4x_gemv, 16) GEMV(2, q4x_gemv, 32) GEMV(2, q4x_gemv, 64)
+GEMV(3, q8x_gemv, 16) GEMV(3, q8x_gemv, 32) GEMV(3, q8x_gemv, 64)
 
 // ---- hyper-connections ----
 

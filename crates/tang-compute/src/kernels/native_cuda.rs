@@ -30,7 +30,7 @@ __device__ __forceinline__ float warp_sum(float v) {
 // Measured at T=4 (flash-kernel-bench native): 2 rows for the IQ4 types and Q2_0 (+30..80 GB/s),
 // 4 for the rest (+40..150).
 #define NAT_GR_WIDE(ty) (((ty) == 20 || (ty) == 23 || (ty) == 42) ? 2 : 4)
-__host__ __device__ constexpr int nat_gr(int ty, int t) { return t == 1 ? 2 : NAT_GR_WIDE(ty); }
+__host__ __device__ constexpr int nat_gr(int ty, int t) { return t == 1 ? 2 : (t <= 8 ? NAT_GR_WIDE(ty) : 1); }
 
 // The eight dp4a operands (int8 lanes in activation order) of one chunk.
 template <int TY>
@@ -128,15 +128,17 @@ __device__ __forceinline__ void chunk_scales(const unsigned char* S, const unsig
 template <int TY, int T, int GR>
 __device__ __forceinline__ void nat_body(unsigned int bx, const unsigned int* __restrict__ XQ, const unsigned char* __restrict__ W,
                                          float* __restrict__ Y, unsigned int K, unsigned int N, unsigned int KS,
-                                         u64 hoff, u64 soff, unsigned int OS) {
+                                         u64 hoff, u64 soff, unsigned int OS, unsigned int M = T, unsigned int t0 = 0) {
+    // Columns t0 .. t0 + T of an M-column window (a token tile); a column past M is computed on
+    // column M - 1 and not written.
     __shared__ float red[8][GR * T];
     unsigned int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     unsigned int kw = warp % KS, rg = warp / KS, groups = 8 / KS;
     unsigned int row0 = (bx * groups + rg) * GR;
     unsigned int nch = K / 32, c0 = kw * nch / KS, c1 = (kw + 1) * nch / KS;
     const unsigned int kb = K / 4;
-    const unsigned int* xs = XQ + (u64)T * kb;
-    const unsigned int* xh = xs + (u64)T * nch;
+    const unsigned int* xs = XQ + (u64)M * kb;
+    const unsigned int* xh = xs + (u64)M * nch;
     const unsigned char* S = W + soff;
     const unsigned char* D = S + (u64)N * nch * SPC;
     const u64 sbytes = TY == 23 ? K / 256 * 12 : K / 256 * 20;
@@ -158,10 +160,11 @@ __device__ __forceinline__ void nat_body(unsigned int bx, const unsigned int* __
             }
             #pragma unroll
             for (int t = 0; t < T; t++) {
-                const uint4* xw = (const uint4*)(XQ + (u64)t * kb + c * 8);
+                const unsigned int tc = min(t0 + t, M - 1);
+                const uint4* xw = (const uint4*)(XQ + (u64)tc * kb + c * 8);
                 uint4 xa = xw[0], xb = xw[1];
-                float dx = __uint_as_float(xs[(u64)t * nch + c]);
-                float hx = HAS_MIN ? (float)(int)xh[(u64)t * nch + c] : 0.0f;
+                float dx = __uint_as_float(xs[(u64)tc * nch + c]);
+                float hx = HAS_MIN ? (float)(int)xh[(u64)tc * nch + c] : 0.0f;
                 #pragma unroll
                 for (int r = 0; r < GR; r++) {
                     int s0 = __dp4a(op[r][0], (int)xa.x, 0);
@@ -187,7 +190,7 @@ __device__ __forceinline__ void nat_body(unsigned int bx, const unsigned int* __
         for (int t = 0; t < T; t++) {
             float v = warp_sum(acc[r][t]);
             if (KS == 1) {
-                if (lane == 0 && row0 + r < N) Y[(u64)t * OS + row0 + r] = v;
+                if (lane == 0 && row0 + r < N && t0 + t < M) Y[(u64)(t0 + t) * OS + row0 + r] = v;
             } else if (lane == 0) {
                 red[warp][r * T + t] = v;
             }
@@ -200,7 +203,7 @@ __device__ __forceinline__ void nat_body(unsigned int bx, const unsigned int* __
         unsigned int o = (bx * groups + g) * GR + r;
         float v = 0.0f;
         for (unsigned int k = 0; k < KS; k++) v += red[g * KS + k][rt];
-        if (o < N) Y[(u64)t * OS + o] = v;
+        if (o < N && t0 + t < M) Y[(u64)(t0 + t) * OS + o] = v;
     }
 }
 
@@ -212,6 +215,16 @@ extern "C" __global__ void __launch_bounds__(256) fl_nat_t##T( \
     nat_body<NAT_TY, T, nat_gr(NAT_TY, T)>(blockIdx.x, XQ, W, Y, K, N, KS, hoff, soff, OS); \
 }
 NAT(1) NAT(2) NAT(3) NAT(4) NAT(5) NAT(6) NAT(7) NAT(8)
+// Wide windows (prefill): token tiles of 8 in turn over the same rows (the tile's weights are
+// re-read from L1/L2, not DRAM); per-token arithmetic is the T=8 kernel's.
+extern "C" __global__ void __launch_bounds__(256) fl_natw(
+    const unsigned int* __restrict__ XQ, const unsigned char* __restrict__ W, float* __restrict__ Y,
+    unsigned int K, unsigned int N, unsigned int KS, u64 hoff, u64 soff, unsigned int OS, unsigned int M) {
+    for (unsigned int t0 = 0; t0 < M; t0 += 8) {
+        if (t0) __syncthreads();
+        nat_body<NAT_TY, 8, nat_gr(NAT_TY, 8)>(blockIdx.x, XQ, W, Y, K, N, KS, hoff, soff, OS, M, t0);
+    }
+}
 // Prefill-only widths (flash-serve).
 NAT(16) NAT(32) NAT(64)
 #else
@@ -289,7 +302,7 @@ struct StSeg { u64 w; u64 hoff; u64 soff; unsigned int ty, n, ks, off; };
 // Blocks of segment s at window width T: rows per block (2 or 4 rows a warp) · 8 / KS.
 template <int T>
 __device__ __forceinline__ unsigned int st_blocks(const StSeg& s) {
-    unsigned int gr = s.ty == 0 ? (T == 1 ? 2 : 4) : nat_gr(s.ty, T);
+    unsigned int gr = s.ty == 0 ? (T == 1 ? 2 : (T <= 8 ? 4 : 1)) : nat_gr(s.ty, T);
     return (s.n + gr * 8 / s.ks - 1) / (gr * 8 / s.ks);
 }
 
@@ -297,7 +310,7 @@ template <int T>
 __device__ __forceinline__ void stack_body(const unsigned int* __restrict__ XQ, const float* __restrict__ X,
                                            const StSeg* __restrict__ SEGS, unsigned int nseg, float* __restrict__ Y,
                                            unsigned int K, unsigned int OS) {
-    constexpr int GB = T == 1 ? 2 : 4;  // the bf16 tile's rows a warp (gemv_rows)
+    constexpr int GB = T == 1 ? 2 : (T <= 8 ? 4 : 1);  // the bf16 tile's rows a warp (gemv_rows)
     unsigned int b = blockIdx.x, s = 0;
     for (; s < nseg; s++) {
         unsigned int nb = st_blocks<T>(SEGS[s]);
@@ -329,5 +342,6 @@ extern "C" __global__ void __launch_bounds__(256) fl_natst_t##T( \
     stack_body<T>(XQ, X, SEGS, nseg, Y, K, OS); \
 }
 NATST(1) NATST(2) NATST(3) NATST(4) NATST(5) NATST(6) NATST(7) NATST(8)
+NATST(16) NATST(32) NATST(64)
 #endif
 "#;
