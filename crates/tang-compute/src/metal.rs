@@ -121,7 +121,7 @@ impl MetalDevice {
         }
 
         let options = CompileOptions::new();
-        if fn_name == "rms_norm_modulation" {
+        if matches!(fn_name, "rms_norm_modulation" | "group_norm_affine") {
             options.set_fast_math_enabled(false);
         }
         let library = self
@@ -1987,6 +1987,65 @@ kernel void embedding(
         }
     }
 
+    fn group_norm_affine(
+        &self,
+        x: &MetalBuffer,
+        weight: &MetalBuffer,
+        bias: &MetalBuffer,
+        channels: usize,
+        spatial: usize,
+        groups: usize,
+        eps: f32,
+    ) -> MetalBuffer {
+        assert!(groups > 0 && channels > 0 && spatial > 0 && channels.is_multiple_of(groups));
+        assert_eq!(x.len(), channels * spatial);
+        assert_eq!(weight.len(), channels);
+        assert_eq!(bias.len(), channels);
+        for b in [x, weight, bias] {
+            assert_eq!(b.kind, Kind::F32);
+        }
+        let pipeline = self.get_pipeline(reduce_msl::VAE_MSL, "group_norm_affine");
+        let out = self.make_buffer_empty(x.len() * 4);
+        let params = self.make_buffer_u32(&[
+            channels as u32,
+            spatial as u32,
+            groups as u32,
+            eps.to_bits(),
+        ]);
+        self.dispatch_groups(
+            &pipeline,
+            &[&x.buffer, &weight.buffer, &bias.buffer, &out, &params],
+            (groups, 1),
+            256,
+        );
+        MetalBuffer {
+            buffer: out,
+            len: x.len(),
+            kind: Kind::F32,
+        }
+    }
+
+    fn upsample_nearest_2x(
+        &self,
+        x: &MetalBuffer,
+        channels: usize,
+        h: usize,
+        w: usize,
+    ) -> MetalBuffer {
+        assert!(channels > 0 && h > 0 && w > 0);
+        assert_eq!(x.len(), channels * h * w);
+        assert_eq!(x.kind, Kind::F32);
+        let pipeline = self.get_pipeline(reduce_msl::VAE_MSL, "upsample_nearest_2x");
+        let out = self.make_buffer_empty(x.len() * 16);
+        let params = self.make_buffer_u32(&[channels as u32, h as u32, w as u32]);
+        self.dispatch(&pipeline, &[&x.buffer, &out, &params], (x.len() * 4) as u64);
+        MetalBuffer {
+            buffer: out,
+            len: x.len() * 4,
+            kind: Kind::F32,
+        }
+    }
+
     fn gelu_tanh(&self, x: &MetalBuffer, n: usize) -> MetalBuffer {
         let pipeline = self.get_pipeline(llm_msl::FUSED_MSL, "gelu_tanh");
         let out = self.make_buffer_empty(n * 4);
@@ -3352,6 +3411,50 @@ mod tests {
                     .collect();
                 assert_eq!(got, want);
             }
+        }
+    }
+
+    #[test]
+    fn metal_vae_normalization_and_upsampling_match_cpu() {
+        let metal = get_metal_device();
+        let cpu = CpuDevice::new();
+        for (channels, h, w, groups) in [(12, 3, 5, 3), (512, 16, 16, 32), (128, 128, 128, 32)] {
+            for offset in [0., 10000.] {
+                let data: Vec<f32> = (0..channels * h * w)
+                    .map(|i| ((i * 17) % 97) as f32 / 13. - 3. + offset)
+                    .collect();
+                let weight: Vec<f32> = (0..channels).map(|i| 0.5 + (i % 11) as f32 / 11.).collect();
+                let bias: Vec<f32> = (0..channels).map(|i| (i % 7) as f32 / 7. - 0.5).collect();
+                let expected = cpu.download(&cpu.group_norm_affine(
+                    &cpu.upload(&data),
+                    &cpu.upload(&weight),
+                    &cpu.upload(&bias),
+                    channels,
+                    h * w,
+                    groups,
+                    1e-6,
+                ));
+                let actual = metal.download(&metal.group_norm_affine(
+                    &metal.upload(&data),
+                    &metal.upload(&weight),
+                    &metal.upload(&bias),
+                    channels,
+                    h * w,
+                    groups,
+                    1e-6,
+                ));
+                for (i, (a, b)) in actual.iter().zip(&expected).enumerate() {
+                    assert!(
+                        a.is_finite() && (a - b).abs() < 2e-5 * b.abs().max(1.),
+                        "{channels}x{h}x{w} offset {offset}, index {i}: {a} vs {b}"
+                    );
+                }
+            }
+            let data: Vec<f32> = (0..channels * h * w).map(|i| (i % 97) as f32).collect();
+            assert_eq!(
+                metal.download(&metal.upsample_nearest_2x(&metal.upload(&data), channels, h, w)),
+                cpu.download(&cpu.upsample_nearest_2x(&cpu.upload(&data), channels, h, w))
+            );
         }
     }
 

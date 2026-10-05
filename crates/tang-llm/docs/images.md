@@ -35,7 +35,9 @@ attention. Weights are BF16 on GPU; norms remain F32. The VAE upcasts to F32 and
 bounded tiled im2col/GEMM convolutions. Metal fuses DiT RMS normalization with channel
 scale or gated residual, keeping modulation on device. Bounded command batches limit
 temporary retention. `TANG_IMAGE_UNFUSED=1` preserves the earlier path for comparisons.
-Packing, final-layer modulation and VAE upsampling/convolution remain unfused.
+Metal also keeps group normalization with compact per-channel affine parameters and
+nearest-neighbor VAE upsampling on device. Packing, final-layer modulation and VAE
+convolution remain unfused.
 Broad quality and performance evaluation remains unfinished.
 
 ## Trained-weight smoke test
@@ -63,6 +65,14 @@ repeats produced byte-identical PNGs. Relative to the earlier implementation, ch
 pixels differed by at most one channel value, mean absolute channel error below 0.0011.
 One resident 512×512 request took 37.8 seconds. Reproducibility is scoped to a backend
 implementation; checkpoint hashes do not identify floating-point kernel changes.
+
+With device VAE normalization and upsampling, three resident 320×192 runs take
+7.699, 7.850 and 7.925 seconds; all three PNGs are byte-identical. Against the preceding
+fused-DiT implementation, the maximum RGB difference is one channel value, with mean
+channel errors below 0.000082. One 512×512 request takes 34.606 seconds and the
+128×128 regression passes at 2.809 seconds. The 82 Metal compute tests pass, as do
+all selected trained VAE boundaries at the existing 1e-3 tolerance (final max error
+2.4e-6) and random VAE references through 256×256 output (final max error 6.2e-6).
 
 ## Reference validation
 

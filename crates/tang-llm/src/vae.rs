@@ -1,6 +1,6 @@
 //! FLUX/Z-Image VAE decoder. v0 uses bounded, tiled im2col + device linear.
-//! Packing, upsampling and affine broadcasts are host operations; convolution
-//! scratch is bounded independently of the full image size.
+//! Convolution packing remains tiled on the host. Metal normalization and nearest
+//! upsampling stay on device; convolution scratch is bounded independently of image size.
 use crate::weights::Weights;
 use anyhow::{ensure, Result};
 use serde::Deserialize;
@@ -71,31 +71,15 @@ fn norm<D: ComputeDevice>(
     w: usize,
     groups: usize,
 ) -> D::Buffer {
-    let channels = n.weight.len();
-    let group_dim = channels / groups * h * w;
-    let normalized = dev.layer_norm(
+    dev.group_norm_affine(
         x,
-        &dev.upload(&vec![1.; group_dim]),
-        &dev.upload(&vec![0.; group_dim]),
+        &dev.upload(&n.weight),
+        &dev.upload(&n.bias),
+        n.weight.len(),
+        h * w,
         groups,
-        group_dim,
         1e-6,
-    );
-    let scale: Vec<_> = n
-        .weight
-        .iter()
-        .flat_map(|v| std::iter::repeat_n(*v, h * w))
-        .collect();
-    let bias: Vec<_> = n
-        .bias
-        .iter()
-        .flat_map(|v| std::iter::repeat_n(*v, h * w))
-        .collect();
-    let scale = dev.upload(&scale);
-    let bias = dev.upload(&bias);
-    dev.elementwise(&[&normalized, &scale, &bias], channels * h * w, &|v| {
-        v[0] * v[1] + v[2]
-    })
+    )
 }
 impl<B: ComputeBuffer> Conv<B> {
     fn run<D: ComputeDevice<Buffer = B>>(&self, dev: &D, x: &B, h: usize, w: usize) -> B {
@@ -353,20 +337,10 @@ impl<B: ComputeBuffer> Vae<B> {
                 trace(&format!("up.{i}.resnets.{j}"), &x);
             }
             if let Some(c) = &up.upsample {
-                let data = dev.download(&x);
-                let channels = data.len() / (h * w);
-                let mut enlarged = vec![0.; data.len() * 4];
-                for ch in 0..channels {
-                    for y in 0..h * 2 {
-                        for xx in 0..w * 2 {
-                            enlarged[(ch * h * 2 + y) * w * 2 + xx] =
-                                data[(ch * h + y / 2) * w + xx / 2];
-                        }
-                    }
-                }
+                let enlarged = dev.upsample_nearest_2x(&x, x.len() / (h * w), h, w);
                 h *= 2;
                 w *= 2;
-                x = c.run(dev, &dev.upload(&enlarged), h, w);
+                x = c.run(dev, &enlarged, h, w);
                 trace(&format!("up.{i}.upsample"), &x);
             }
         }

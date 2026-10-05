@@ -162,3 +162,50 @@ kernel void rms_norm(
     }
 }
 "#;
+
+/// NCHW normalization and spatial expansion without host transfers.
+pub const VAE_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void group_norm_affine(
+    device const float* x [[buffer(0)]], device const float* weight [[buffer(1)]],
+    device const float* bias [[buffer(2)]], device float* out [[buffer(3)]],
+    device const uint* p [[buffer(4)]],
+    uint group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+    uint size [[threads_per_threadgroup]]) {
+    uint dim = p[0] / p[2] * p[1], base = group * dim;
+    threadgroup float shared[256];
+    float sum = 0;
+    float anchor = x[base];
+    for (uint i = tid; i < dim; i += size) sum += x[base+i] - anchor;
+    shared[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = size/2; stride; stride >>= 1) {
+        if (tid < stride) shared[tid] += shared[tid+stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float mean = anchor + shared[0] / float(dim);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sum = 0;
+    for (uint i = tid; i < dim; i += size) { float d = x[base+i] - mean; sum += d*d; }
+    shared[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = size/2; stride; stride >>= 1) {
+        if (tid < stride) shared[tid] += shared[tid+stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = rsqrt(shared[0]/float(dim) + as_type<float>(p[3]));
+    for (uint i = tid; i < dim; i += size) {
+        uint c = (base+i)/p[1];
+        out[base+i] = ((x[base+i]-mean)*inv)*weight[c] + bias[c];
+    }
+}
+kernel void upsample_nearest_2x(
+    device const float* x [[buffer(0)]], device float* out [[buffer(1)]],
+    device const uint* p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+    uint h = p[1], w = p[2];
+    if (i >= p[0]*h*w*4) return;
+    uint c = i/(h*w*4), y = (i/(w*2))%(h*2), xx = i%(w*2);
+    out[i] = x[(c*h+y/2)*w+xx/2];
+}
+"#;

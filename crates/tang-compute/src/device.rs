@@ -1172,6 +1172,64 @@ pub trait ComputeDevice: Send {
         self.upload(&y)
     }
 
+    /// NCHW group normalization with compact per-channel affine parameters.
+    fn group_norm_affine(
+        &self,
+        x: &Self::Buffer,
+        weight: &Self::Buffer,
+        bias: &Self::Buffer,
+        channels: usize,
+        spatial: usize,
+        groups: usize,
+        eps: f32,
+    ) -> Self::Buffer {
+        assert!(groups > 0 && channels > 0 && spatial > 0 && channels.is_multiple_of(groups));
+        assert_eq!(x.len(), channels * spatial);
+        assert_eq!(weight.len(), channels);
+        assert_eq!(bias.len(), channels);
+        let dim = channels / groups * spatial;
+        let normalized = self.layer_norm(
+            x,
+            &self.upload(&vec![1.; dim]),
+            &self.upload(&vec![0.; dim]),
+            groups,
+            dim,
+            eps,
+        );
+        let (x, weight, bias) = (
+            self.download(&normalized),
+            self.download(weight),
+            self.download(bias),
+        );
+        self.upload(
+            &x.iter()
+                .enumerate()
+                .map(|(i, v)| v * weight[i / spatial] + bias[i / spatial])
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Nearest-neighbor 2x upsampling of one NCHW image.
+    fn upsample_nearest_2x(
+        &self,
+        x: &Self::Buffer,
+        channels: usize,
+        h: usize,
+        w: usize,
+    ) -> Self::Buffer {
+        assert!(channels > 0 && h > 0 && w > 0);
+        assert_eq!(x.len(), channels * h * w);
+        let x = self.download(x);
+        let mut out = vec![0.; x.len() * 4];
+        for (i, value) in out.iter_mut().enumerate() {
+            let c = i / (4 * h * w);
+            let y = (i / (2 * w)) % (2 * h);
+            let xx = i % (2 * w);
+            *value = x[(c * h + y / 2) * w + xx / 2];
+        }
+        self.upload(&out)
+    }
+
     /// GELU, tanh approximation, elementwise over `n` values.
     fn gelu_tanh(&self, x: &Self::Buffer, n: usize) -> Self::Buffer {
         let x = self.download(x);
