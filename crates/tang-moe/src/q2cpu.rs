@@ -167,7 +167,8 @@ pub enum Layout {
 impl Layout {
     /// tang-compute `ExpertBlob` plane offsets.
     const GU_SCALES: usize = 2 * crate::contract::FF * crate::contract::HIDDEN / 4;
-    const DOWN_CODES: usize = Self::GU_SCALES + 2 * crate::contract::FF * crate::contract::HIDDEN / 32;
+    const DOWN_CODES: usize =
+        Self::GU_SCALES + 2 * crate::contract::FF * crate::contract::HIDDEN / 32;
     const DOWN_SCALES: usize = Self::DOWN_CODES + crate::contract::HIDDEN * crate::contract::FF / 4;
 
     /// `(cb, cs, sb, ss)` of row `r` of an `[n, k]` matrix.
@@ -182,14 +183,19 @@ impl Layout {
             }
             Layout::DownTiled => {
                 let i = (r / 16) * (16 * crate::contract::FF / 128) + r % 16;
-                (Self::DOWN_CODES + 32 * i, 512, Self::DOWN_SCALES + 4 * i, 64)
+                (
+                    Self::DOWN_CODES + 32 * i,
+                    512,
+                    Self::DOWN_SCALES + 4 * i,
+                    64,
+                )
             }
         }
     }
 
     /// The 32 code bytes of group `g` of a row.
     #[inline]
-    fn pair<'a>(self, wb: &'a [u8], (cb, cs, _, _): (usize, usize, usize, usize), g: usize) -> &'a [u8] {
+    fn pair(self, wb: &[u8], (cb, cs, _, _): (usize, usize, usize, usize), g: usize) -> &[u8] {
         &wb[cb + g * cs..cb + g * cs + 32]
     }
 }
@@ -212,7 +218,9 @@ pub fn rows_in(
     assert!(k.is_multiple_of(128) && out.len() >= (r1 - r0) * t);
     if r1 > r0 {
         let (cb, cs, sb, ss) = layout.row(n, k, r1 - 1);
-        assert!(cb + (k / 128 - 1) * cs + 32 <= wb.len() && sb + (k / 128 - 1) * ss + 4 <= wb.len());
+        assert!(
+            cb + (k / 128 - 1) * cs + 32 <= wb.len() && sb + (k / 128 - 1) * ss + 4 <= wb.len()
+        );
     }
     for x in xs {
         assert_eq!(x.k, k);
@@ -574,8 +582,18 @@ pub(crate) mod tests {
                 }
             }
         };
-        put(&plain[ExpertBlob::GATE..ExpertBlob::UP], FF, HIDDEN, Layout::GuTiled { up: false });
-        put(&plain[ExpertBlob::UP..ExpertBlob::DOWN], FF, HIDDEN, Layout::GuTiled { up: true });
+        put(
+            &plain[ExpertBlob::GATE..ExpertBlob::UP],
+            FF,
+            HIDDEN,
+            Layout::GuTiled { up: false },
+        );
+        put(
+            &plain[ExpertBlob::UP..ExpertBlob::DOWN],
+            FF,
+            HIDDEN,
+            Layout::GuTiled { up: true },
+        );
         put(&plain[ExpertBlob::DOWN..], HIDDEN, FF, Layout::DownTiled);
         out
     }
@@ -588,15 +606,37 @@ pub(crate) mod tests {
         let xq = acts(&mut rng, 3, HIDDEN);
         let hq = acts(&mut rng, 3, FF);
         for t in [1, 3] {
-            let xs: Vec<XPrep> = (0..t).map(|r| XPrep::from_qact(&xq, QAct { m: 3, k: HIDDEN }, r)).collect();
-            let hs: Vec<XPrep> = (0..t).map(|r| XPrep::from_qact(&hq, QAct { m: 3, k: FF }, r)).collect();
+            let xs: Vec<XPrep> = (0..t)
+                .map(|r| XPrep::from_qact(&xq, QAct { m: 3, k: HIDDEN }, r))
+                .collect();
+            let hs: Vec<XPrep> = (0..t)
+                .map(|r| XPrep::from_qact(&hq, QAct { m: 3, k: FF }, r))
+                .collect();
             let xr: Vec<&XPrep> = xs.iter().collect();
             let hr: Vec<&XPrep> = hs.iter().collect();
             for isa in Isa::available() {
                 for (lay, pw, n, k, x) in [
-                    (Layout::GuTiled { up: false }, &plain[ExpertBlob::GATE..ExpertBlob::UP], FF, HIDDEN, &xr),
-                    (Layout::GuTiled { up: true }, &plain[ExpertBlob::UP..ExpertBlob::DOWN], FF, HIDDEN, &xr),
-                    (Layout::DownTiled, &plain[ExpertBlob::DOWN..], HIDDEN, FF, &hr),
+                    (
+                        Layout::GuTiled { up: false },
+                        &plain[ExpertBlob::GATE..ExpertBlob::UP],
+                        FF,
+                        HIDDEN,
+                        &xr,
+                    ),
+                    (
+                        Layout::GuTiled { up: true },
+                        &plain[ExpertBlob::UP..ExpertBlob::DOWN],
+                        FF,
+                        HIDDEN,
+                        &xr,
+                    ),
+                    (
+                        Layout::DownTiled,
+                        &plain[ExpertBlob::DOWN..],
+                        HIDDEN,
+                        FF,
+                        &hr,
+                    ),
                 ] {
                     let (r0, r1) = (5, n - 3);
                     let mut a = vec![0f32; (r1 - r0) * t];

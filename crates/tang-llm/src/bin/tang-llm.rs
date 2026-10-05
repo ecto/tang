@@ -369,7 +369,10 @@ fn serve_flash(args: &[String]) -> Result<()> {
         temp: 0.0,
         snapshots: 6,
         warm: Vec::new(),
-        snapshot_bytes: std::env::var("TANG_FLASH_SNAP_GB").ok().and_then(|v| v.parse::<f64>().ok()).map_or(12e9, |g| g * 1e9) as usize,
+        snapshot_bytes: std::env::var("TANG_FLASH_SNAP_GB")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .map_or(12e9, |g| g * 1e9) as usize,
         dump: None,
     };
     let (mut host, mut port) = ("127.0.0.1".to_string(), 8911u16);
@@ -395,7 +398,8 @@ fn serve_flash(args: &[String]) -> Result<()> {
             "--dump-ids" => s.dump = Some(PathBuf::from(val()?)),
             "--api-key-file" => {
                 let path = val()?;
-                key = Some(std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?);
+                key =
+                    Some(std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?);
             }
             other => bail!("unknown option {other}"),
         }
@@ -407,7 +411,13 @@ fn serve_flash(args: &[String]) -> Result<()> {
     let name = s
         .gguf
         .file_name()
-        .map(|n| n.to_string_lossy().split("-0000").next().unwrap_or_default().to_string())
+        .map(|n| {
+            n.to_string_lossy()
+                .split("-0000")
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        })
         .unwrap_or_default();
     let opts = tang_llm::server::Options {
         addr: format!("{host}:{port}"),

@@ -199,7 +199,11 @@ impl CudaComputeDevice {
 
     /// `fl` for the MoE kernels: the wide module above `MAX_T`.
     fn fl_moe(&self, name: &'static str, t: usize) -> CudaFunction {
-        if t > MAX_T { self.fl_wide(name) } else { self.fl(name) }
+        if t > MAX_T {
+            self.fl_wide(name)
+        } else {
+            self.fl(name)
+        }
     }
 
     pub(super) fn upload_bytes_impl(&self, bytes: &[u8]) -> CudaBuffer {
@@ -264,7 +268,13 @@ impl CudaComputeDevice {
                 self.gemv_rows("bf16_gemv", Some(x), None, s, out, (0, n), m, k, n);
             }
             // Prefill widths: the plain wide instantiation, else 8-column tiles (same bits).
-            CudaStorage::Bf16(s) if m > 8 && width_ok(m) && k.is_multiple_of(8) && !x.is_bf16() && !out.is_bf16() => {
+            CudaStorage::Bf16(s)
+                if m > 8
+                    && width_ok(m)
+                    && k.is_multiple_of(8)
+                    && !x.is_bf16()
+                    && !out.is_bf16() =>
+            {
                 if WIDE_T.contains(&m) {
                     self.gemv_rows("bf16_gemv", Some(x), None, s, out, (0, n), m, k, n);
                 } else {
@@ -360,7 +370,13 @@ impl CudaComputeDevice {
         // Rows per warp, as the kernel picks it: 2 for one column, 4 for more. The K split is
         // chosen from (n, k) alone (at 2 rows a warp), so a row's summation order doesn't depend
         // on the window width m.
-        let gr = if m == 1 { 2 } else if m <= MAX_T { 4 } else { 1 };
+        let gr = if m == 1 {
+            2
+        } else if m <= MAX_T {
+            4
+        } else {
+            1
+        };
         let mut ks = 1;
         while ks < 8
             && n.div_ceil(2 * 8 / ks) < 2 * super::llm::sm_count()
@@ -372,7 +388,12 @@ impl CudaComputeDevice {
             self.fl(GEMV_NAMES[GEMV_FMTS.iter().position(|&f| f == name).unwrap()][m - 1])
         } else {
             self.fl(wide_name(
-                ["fl_bf16_gemv_t", "fl_q2_gemv_t", "fl_q4x_gemv_t", "fl_q8x_gemv_t"][GEMV_FMTS.iter().position(|&f| f == name).unwrap()],
+                [
+                    "fl_bf16_gemv_t",
+                    "fl_q2_gemv_t",
+                    "fl_q4x_gemv_t",
+                    "fl_q8x_gemv_t",
+                ][GEMV_FMTS.iter().position(|&f| f == name).unwrap()],
                 m,
             ))
         };
@@ -432,19 +453,23 @@ impl CudaComputeDevice {
             )
             .into_boxed_str(),
         );
-        let (_module, f) = self.get_func_with_arch(src, if m <= MAX_T {
-            NAT_NAMES[m - 1]
-        } else if wide_plain() {
-            wide_name("fl_nat_t", m)
-        } else if wide_mma() {
-            "fl_natmma"
-        } else if let Some((tt, g)) = natw_variant() {
-            Box::leak(format!("fl_natw_{tt}x{g}").into_boxed_str())
-        } else if wide_v1() {
-            "fl_natw"
-        } else {
-            "fl_natw2"
-        }, "sm_86");
+        let (_module, f) = self.get_func_with_arch(
+            src,
+            if m <= MAX_T {
+                NAT_NAMES[m - 1]
+            } else if wide_plain() {
+                wide_name("fl_nat_t", m)
+            } else if wide_mma() {
+                "fl_natmma"
+            } else if let Some((tt, g)) = natw_variant() {
+                Box::leak(format!("fl_natw_{tt}x{g}").into_boxed_str())
+            } else if wide_v1() {
+                "fl_natw"
+            } else {
+                "fl_natw2"
+            },
+            "sm_86",
+        );
         self.llm_funcs.borrow_mut().insert(key, f.clone());
         f
     }
@@ -507,11 +532,24 @@ impl CudaComputeDevice {
             .segs
             .iter()
             .map(|g| {
-                let gr = g.ty.map_or(if m == 1 { 2 } else if m <= MAX_T { 4 } else { 1 }, |t| t.rows_per_warp(m));
+                let gr = g.ty.map_or(
+                    if m == 1 {
+                        2
+                    } else if m <= MAX_T {
+                        4
+                    } else {
+                        1
+                    },
+                    |t| t.rows_per_warp(m),
+                );
                 g.rows.div_ceil(gr * 8 / Self::stack_ks(g.ty, g.rows, s.k))
             })
             .sum();
-        let key = if m <= MAX_T { NATST_NAMES[m - 1] } else { wide_name("fl_natst_t", m) };
+        let key = if m <= MAX_T {
+            NATST_NAMES[m - 1]
+        } else {
+            wide_name("fl_natst_t", m)
+        };
         let f = match self.llm_funcs.borrow().get(key) {
             Some(f) => Some(f.clone()),
             None => None,
@@ -894,7 +932,20 @@ impl CudaComputeDevice {
             "fl_hc_fused_q8_t8",
         ];
         let wide = t > MAX_T && !wide_plain();
-        let f = if wide { self.fl(if w.q8 { "fl_hc_fusedw_q8" } else { "fl_hc_fusedw" }) } else { self.fl(match (w.q8, t <= MAX_T) { (true, true) => Q8[t - 1], (false, true) => NAMES[t - 1], (true, false) => wide_name("fl_hc_fused_q8_t", t), (false, false) => wide_name("fl_hc_fused_t", t) }) };
+        let f = if wide {
+            self.fl(if w.q8 {
+                "fl_hc_fusedw_q8"
+            } else {
+                "fl_hc_fusedw"
+            })
+        } else {
+            self.fl(match (w.q8, t <= MAX_T) {
+                (true, true) => Q8[t - 1],
+                (false, true) => NAMES[t - 1],
+                (true, false) => wide_name("fl_hc_fused_q8_t", t),
+                (false, false) => wide_name("fl_hc_fused_t", t),
+            })
+        };
         let blocks = self.coresident(&f, 512, 2);
         let (mut xn, mut lo) = scratch.f32_data_mut().split_at_mut(t * HC * HIDDEN);
         let any = w.norm;
@@ -966,8 +1017,7 @@ impl CudaComputeDevice {
             if wide {
                 l.arg(&tu);
             }
-            l.launch(grid((blocks, 1, 1), 512))
-                .unwrap();
+            l.launch(grid((blocks, 1, 1), 512)).unwrap();
         }
     }
 
@@ -1147,7 +1197,12 @@ impl CudaComputeDevice {
         plan: &mut CudaBuffer,
         t: usize,
     ) {
-        assert!(width_ok(t) && t <= MoePlan::WIDE_MAX && plan.len >= MoePlan::words(t) && table.len >= 2 * EXPERTS);
+        assert!(
+            width_ok(t)
+                && t <= MoePlan::WIDE_MAX
+                && plan.len >= MoePlan::words(t)
+                && table.len >= 2 * EXPERTS
+        );
         let f = self.fl_moe("fl_moe_plan", t);
         let threads = if t > MAX_T { 1024 } else { 128 };
         let tu = t as u32;
@@ -1216,7 +1271,8 @@ impl CudaComputeDevice {
         t: usize,
     ) {
         assert!(
-            scratch.len >= MoePlan::scratch_words_for(t) && parts.len >= MoePlan::parts_rows(t) * HIDDEN
+            scratch.len >= MoePlan::scratch_words_for(t)
+                && parts.len >= MoePlan::parts_rows(t) * HIDDEN
         );
         const GU: [&str; 8] = [
             "fl_moe_gu_t1",
@@ -1252,7 +1308,11 @@ impl CudaComputeDevice {
                 "fl_moe_fused_t7",
                 "fl_moe_fused_t8",
             ];
-            let f = if t > MAX_T { self.fl_wide("fl_moe_fused_t64") } else { self.fl(FUSED[t - 1]) };
+            let f = if t > MAX_T {
+                self.fl_wide("fl_moe_fused_t64")
+            } else {
+                self.fl(FUSED[t - 1])
+            };
             let blocks = self.coresident(&f, 128, 8);
             let mut sync = self.sync_words();
             let mut cnt = sync.slice_mut(SYNC_MOE..SYNC_MOE + MoePlan::cap(t) + 1);
@@ -1270,7 +1330,11 @@ impl CudaComputeDevice {
             }
             return;
         }
-        let f = if t > MAX_T { self.fl_wide("fl_moe_gu_t64") } else { self.fl(GU[t - 1]) };
+        let f = if t > MAX_T {
+            self.fl_wide("fl_moe_gu_t64")
+        } else {
+            self.fl(GU[t - 1])
+        };
         unsafe {
             self.stream
                 .launch_builder(&f)
@@ -1281,7 +1345,11 @@ impl CudaComputeDevice {
                 .launch(grid((16 * super::llm::sm_count(), 1, 1), 128))
                 .unwrap();
         }
-        let f = if t > MAX_T { self.fl_wide("fl_moe_down_t64") } else { self.fl(DOWN[t - 1]) };
+        let f = if t > MAX_T {
+            self.fl_wide("fl_moe_down_t64")
+        } else {
+            self.fl(DOWN[t - 1])
+        };
         unsafe {
             self.stream
                 .launch_builder(&f)
@@ -2716,8 +2784,10 @@ mod tests {
                         d.alloc_bf16(max_ctx * QSA_KV * QSA_D),
                         d.alloc_bf16(max_ctx * QSA_KV * QSA_D),
                     );
-                    let (mut ring, mut pooled) =
-                        (d.alloc_f32(QSA_RING * IDX_D), d.alloc_f32(max_ctx / 4 * IDX_D));
+                    let (mut ring, mut pooled) = (
+                        d.alloc_f32(QSA_RING * IDX_D),
+                        d.alloc_f32(max_ctx / 4 * IDX_D),
+                    );
                     let mut q = d.alloc_f32(fl::qsa_q_words(t));
                     for (pos0, proj) in &windows {
                         let cache = QsaCache {
@@ -3504,11 +3574,15 @@ mod tests {
                     g.alloc_bf16(max_ctx * QSA_KV * QSA_D),
                     g.alloc_bf16(max_ctx * QSA_KV * QSA_D),
                 );
-                let (mut ring, mut pooled) =
-                    (g.alloc_f32(QSA_RING * IDX_D), g.alloc_f32(max_ctx / 4 * IDX_D));
+                let (mut ring, mut pooled) = (
+                    g.alloc_f32(QSA_RING * IDX_D),
+                    g.alloc_f32(max_ctx / 4 * IDX_D),
+                );
                 let mut qs = vec![];
-                let starts: Vec<(usize, usize)> =
-                    [(0, 1), (1, 1), (2, 1)].into_iter().chain((3..n_tok).step_by(m).map(|p| (p, m))).collect();
+                let starts: Vec<(usize, usize)> = [(0, 1), (1, 1), (2, 1)]
+                    .into_iter()
+                    .chain((3..n_tok).step_by(m).map(|p| (p, m)))
+                    .collect();
                 for (p0, m) in starts {
                     let mut q = g.alloc_f32(fl::qsa_q_words(m));
                     let cache = QsaCache {
@@ -3665,7 +3739,11 @@ mod tests {
                         g.quantize_act_into(&g.upload_f32(&x[j * k..(j + 1) * k]), &mut q1, 1, k);
                         let mut y1 = g.alloc_f32(n);
                         g.native_linear_into(ty, &q1, &w, &mut y1, 1, k, n);
-                        same_bits(&y[j * n..(j + 1) * n], &g.download(&y1), &format!("native wide {ty:?} m={m} col {j}"));
+                        same_bits(
+                            &y[j * n..(j + 1) * n],
+                            &g.download(&y1),
+                            &format!("native wide {ty:?} m={m} col {j}"),
+                        );
                     }
                 }
             }
@@ -3701,7 +3779,10 @@ mod tests {
     #[test]
     fn cuda_window_width_invariance_wide() {
         on_gpu(|g| {
-            let ws: Vec<usize> = std::env::var("TANG_TEST_WIDE").ok().map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or(vec![16, 32, 64]);
+            let ws: Vec<usize> = std::env::var("TANG_TEST_WIDE")
+                .ok()
+                .map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
+                .unwrap_or(vec![16, 32, 64]);
             ws.iter().for_each(|&w| t_invariance_w(g, w))
         });
     }

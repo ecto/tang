@@ -99,12 +99,23 @@ impl Policy {
             calib: (0..10)
                 .map(|b| {
                     let p = (b as f64 + 0.5) / 10.0;
-                    let a = if p >= 0.9 { 0.985 } else if p >= 0.5 { 0.6 + (p - 0.5) * 0.8 } else { 0.3 + p * 0.6 };
+                    let a = if p >= 0.9 {
+                        0.985
+                    } else if p >= 0.5 {
+                        0.6 + (p - 0.5) * 0.8
+                    } else {
+                        0.3 + p * 0.6
+                    };
                     (4.0 * a, 4.0)
                 })
                 .collect(),
-            think_room: std::env::var("TANG_FLASH_THINK_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(MAX_T),
-            gate: std::env::var("TANG_FLASH_GATE").ok().and_then(|v| v.parse().ok()),
+            think_room: std::env::var("TANG_FLASH_THINK_STEPS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(MAX_T),
+            gate: std::env::var("TANG_FLASH_GATE")
+                .ok()
+                .and_then(|v| v.parse().ok()),
         }
     }
 
@@ -127,7 +138,10 @@ impl Policy {
                 best.0
             }
         };
-        (chain.iter().take(n).map(|x| x.0).collect(), chain.iter().take(n).map(|x| x.1).collect())
+        (
+            chain.iter().take(n).map(|x| x.0).collect(),
+            chain.iter().take(n).map(|x| x.1).collect(),
+        )
     }
 
     fn observe(&mut self, probs: &[f32], accepted: usize, width: usize, wall_ms: f64, mtp_ms: f64) {
@@ -217,9 +231,16 @@ pub struct FlashServe {
 fn args_as_objects(msgs: &mut Value) {
     for m in msgs.as_array_mut().into_iter().flatten() {
         for c in m["tool_calls"].as_array_mut().into_iter().flatten() {
-            let f = if c["function"].is_object() { &mut c["function"] } else { &mut *c };
+            let f = if c["function"].is_object() {
+                &mut c["function"]
+            } else {
+                &mut *c
+            };
             if let Some(a) = f["arguments"].as_str() {
-                f["arguments"] = serde_json::from_str(a).ok().filter(Value::is_object).unwrap_or_else(|| json!({}));
+                f["arguments"] = serde_json::from_str(a)
+                    .ok()
+                    .filter(Value::is_object)
+                    .unwrap_or_else(|| json!({}));
             }
         }
     }
@@ -259,7 +280,10 @@ impl FlashServe {
         e.warm()?;
         let tok = FlashTokenizer::from_gguf(e.gguf())?;
         let id = |p: &str| tok.token_id(p).with_context(|| format!("no {p} token"));
-        let mut eos: Vec<u32> = ["<|im_end|>", "<|endoftext|>"].iter().filter_map(|p| tok.token_id(p)).collect();
+        let mut eos: Vec<u32> = ["<|im_end|>", "<|endoftext|>"]
+            .iter()
+            .filter_map(|p| tok.token_id(p))
+            .collect();
         if let Ok(n) = e.gguf().meta_u64("tokenizer.ggml.eos_token_id") {
             eos.push(n as u32);
         }
@@ -307,7 +331,10 @@ impl FlashServe {
             clock: 0,
             temp: s.temp,
             sampling: s.sampling,
-            wide: std::env::var("TANG_FLASH_WIDE").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            wide: std::env::var("TANG_FLASH_WIDE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
             disk: s.disk.clone(),
             dump: s.dump.clone(),
             shape,
@@ -324,15 +351,26 @@ impl FlashServe {
                 prefill_span(&mut me.e, &ids, MAX_T, usize::MAX, me.wide, true)?;
             }
             me.e.reset();
-            eprintln!("tang-llm: wide prefill graphs (up to T={}) captured in {:.1} s", me.wide, t.elapsed().as_secs_f64());
+            eprintln!(
+                "tang-llm: wide prefill graphs (up to T={}) captured in {:.1} s",
+                me.wide,
+                t.elapsed().as_secs_f64()
+            );
         }
         for f in &s.warm {
             let t = Instant::now();
-            let body: Value = serde_json::from_str(&std::fs::read_to_string(f)?).with_context(|| format!("reading {}", f.display()))?;
+            let body: Value = serde_json::from_str(&std::fs::read_to_string(f)?)
+                .with_context(|| format!("reading {}", f.display()))?;
             let mut req = crate::server::parse(&body).map_err(|e| anyhow::anyhow!(e))?;
             req.prefill_only = true;
             me.generate(&req, &mut |_| true)?;
-            eprintln!("tang-llm: warmed {} ({} tokens, {} reused) in {:.1} s", f.display(), me.line.prompt, me.line.reused, t.elapsed().as_secs_f64());
+            eprintln!(
+                "tang-llm: warmed {} ({} tokens, {} reused) in {:.1} s",
+                f.display(),
+                me.line.prompt,
+                me.line.reused,
+                t.elapsed().as_secs_f64()
+            );
         }
         Ok(me)
     }
@@ -351,15 +389,29 @@ impl FlashServe {
             }
             let mut calls: Vec<(String, Value)> = Vec::new();
             for c in m["tool_calls"].as_array().into_iter().flatten() {
-                let f = if c["function"].is_object() { &c["function"] } else { c };
-                calls.push((f["name"].as_str().unwrap_or_default().to_string(), f["arguments"].clone()));
+                let f = if c["function"].is_object() {
+                    &c["function"]
+                } else {
+                    c
+                };
+                calls.push((
+                    f["name"].as_str().unwrap_or_default().to_string(),
+                    f["arguments"].clone(),
+                ));
             }
-            if !splice || m["reasoning_content"].as_str().is_some_and(|r| !r.trim().is_empty()) {
+            if !splice
+                || m["reasoning_content"]
+                    .as_str()
+                    .is_some_and(|r| !r.trim().is_empty())
+            {
                 continue;
             }
             let content = m["content"].as_str().unwrap_or_default().trim().to_string();
             // The newest match: the same visible reply can come from more than one generation.
-            let hit = self.memo.iter().rposition(|x| x.content.trim() == content && x.calls == calls);
+            let hit = self
+                .memo
+                .iter()
+                .rposition(|x| x.content.trim() == content && x.calls == calls);
             if let Some(i) = hit {
                 m["content"] = json!(MARK);
                 if let Some(o) = m.as_object_mut() {
@@ -405,7 +457,10 @@ impl FlashServe {
             };
             let head = &text[at..i];
             let open = "<|im_start|>assistant\n";
-            let head = if let Some(h) = head.strip_suffix("<think>\n\n</think>\n\n").filter(|h| h.ends_with(open)) {
+            let head = if let Some(h) = head
+                .strip_suffix("<think>\n\n</think>\n\n")
+                .filter(|h| h.ends_with(open))
+            {
                 h
             } else if head.ends_with(open) {
                 head
@@ -423,7 +478,9 @@ impl FlashServe {
             let mut msgs = req.messages.clone();
             args_as_objects(&mut msgs);
             let text = self.render(&msgs, req)?;
-            eprintln!("tang-llm: splicing skipped (template rendered generated turns unexpectedly)");
+            eprintln!(
+                "tang-llm: splicing skipped (template rendered generated turns unexpectedly)"
+            );
             return Ok((self.tok.encode(&text)?, text, 0));
         }
         for (piece, mi) in pieces {
@@ -463,21 +520,42 @@ impl FlashServe {
             self.save_disk(&tokens, &state, &full);
         }
         self.line.snap_ms += t.elapsed().as_secs_f64() * 1e3;
-        self.snaps.push(Snap { tokens, state, pos, pinned, used: clock });
+        self.snaps.push(Snap {
+            tokens,
+            state,
+            pos,
+            pinned,
+            used: clock,
+        });
         let size = |snaps: &[Snap]| {
             let mut seen = std::collections::HashSet::new();
             snaps
                 .iter()
-                .map(|s| s.state.bytes() + s.pos.iter().filter(|p| seen.insert(Arc::as_ptr(p))).map(|p| p.bytes()).sum::<usize>())
+                .map(|s| {
+                    s.state.bytes()
+                        + s.pos
+                            .iter()
+                            .filter(|p| seen.insert(Arc::as_ptr(p)))
+                            .map(|p| p.bytes())
+                            .sum::<usize>()
+                })
                 .sum::<usize>()
         };
         while self.snaps.len() > 1 && size(&self.snaps) > self.max_snap_bytes {
-            let lru = (0..self.snaps.len()).min_by_key(|&i| (self.snaps[i].pinned, self.snaps[i].used)).unwrap();
+            let lru = (0..self.snaps.len())
+                .min_by_key(|&i| (self.snaps[i].pinned, self.snaps[i].used))
+                .unwrap();
             self.snaps.swap_remove(lru);
         }
         // Least recently used first; pinned ones have their own (small) quota.
         for (want_pinned, cap) in [(false, self.max_snaps), (true, 4)] {
-            while self.snaps.iter().filter(|s| s.pinned == want_pinned).count() > cap {
+            while self
+                .snaps
+                .iter()
+                .filter(|s| s.pinned == want_pinned)
+                .count()
+                > cap
+            {
                 let lru = (0..self.snaps.len())
                     .filter(|&i| self.snaps[i].pinned == want_pinned)
                     .min_by_key(|&i| self.snaps[i].used)
@@ -489,12 +567,18 @@ impl FlashServe {
     }
 
     fn disk_path(&self, ids: &[u32]) -> Option<PathBuf> {
-        Some(self.disk.as_ref()?.join(format!("{}-{:016x}.state", ids.len(), hash(ids))))
+        Some(
+            self.disk
+                .as_ref()?
+                .join(format!("{}-{:016x}.state", ids.len(), hash(ids))),
+        )
     }
 
     /// Write a pinned state to disk (on a thread; the file appears complete or not at all).
     fn save_disk(&self, ids: &[u32], s: &RunningState, pos: &Positional) {
-        let Some(path) = self.disk_path(ids) else { return };
+        let Some(path) = self.disk_path(ids) else {
+            return;
+        };
         if path.exists() {
             return;
         }
@@ -517,7 +601,10 @@ impl FlashServe {
             bytes.extend_from_slice(&(p.len() as u64).to_le_bytes());
             bytes.extend_from_slice(p);
         }
-        let budget = std::env::var("TANG_FLASH_DISK_GB").ok().and_then(|v| v.parse::<f64>().ok()).map_or(8e9, |g| g * 1e9) as u64;
+        let budget = std::env::var("TANG_FLASH_DISK_GB")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .map_or(8e9, |g| g * 1e9) as u64;
         std::thread::spawn(move || {
             let tmp = path.with_extension("tmp");
             let r = std::fs::File::create(&tmp)
@@ -556,9 +643,15 @@ impl FlashServe {
         let mut best: Option<(usize, PathBuf)> = None;
         for ent in std::fs::read_dir(dir).ok()?.flatten() {
             let name = ent.file_name().to_string_lossy().to_string();
-            let Some(stem) = name.strip_suffix(".state") else { continue };
-            let Some((n, h)) = stem.split_once('-') else { continue };
-            let (Ok(n), Ok(h)) = (n.parse::<usize>(), u64::from_str_radix(h, 16)) else { continue };
+            let Some(stem) = name.strip_suffix(".state") else {
+                continue;
+            };
+            let Some((n, h)) = stem.split_once('-') else {
+                continue;
+            };
+            let (Ok(n), Ok(h)) = (n.parse::<usize>(), u64::from_str_radix(h, 16)) else {
+                continue;
+            };
             if n <= limit && n > best.as_ref().map_or(0, |b| b.0) && hash(&ids[..n]) == h {
                 best = Some((n, ent.path()));
             }
@@ -573,18 +666,28 @@ impl FlashServe {
                 *at += n;
                 Ok(s)
             }
-            let word = |b: &[u8], at: &mut usize| -> Result<usize> { Ok(u64::from_le_bytes(take(b, at, 8)?.try_into()?) as usize) };
+            let word = |b: &[u8], at: &mut usize| -> Result<usize> {
+                Ok(u64::from_le_bytes(take(b, at, 8)?.try_into()?) as usize)
+            };
             ensure!(b.get(..8) == Some(&b"TANGRS02"[..]), "not a state file");
             let len = word(&b, &mut at)?;
             ensure!(len == n, "length");
-            let tokens: Vec<u32> = take(&b, &mut at, 4 * len)?.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+            let tokens: Vec<u32> = take(&b, &mut at, 4 * len)?
+                .chunks(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
             ensure!(tokens == ids[..n], "tokens differ");
             ensure!(word(&b, &mut at)? == self.shape.len(), "parts");
             let mut parts = Vec::with_capacity(self.shape.len());
             for &want in &self.shape {
                 let k = word(&b, &mut at)?;
                 ensure!(k == want, "part size");
-                parts.push(take(&b, &mut at, 4 * k)?.chunks(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect());
+                parts.push(
+                    take(&b, &mut at, 4 * k)?
+                        .chunks(4)
+                        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                        .collect(),
+                );
             }
             let np = word(&b, &mut at)?;
             let mut pos = Vec::with_capacity(np);
@@ -617,7 +720,9 @@ impl FlashServe {
         let live = self.e.tokens.len();
         let live_ok = live <= limit && lcp(&self.e.tokens, ids) == live;
         let best = (0..self.snaps.len())
-            .filter(|&i| self.snaps[i].tokens.len() <= limit && ids.starts_with(&self.snaps[i].tokens))
+            .filter(|&i| {
+                self.snaps[i].tokens.len() <= limit && ids.starts_with(&self.snaps[i].tokens)
+            })
             .max_by_key(|&i| self.snaps[i].tokens.len());
         let snap_len = best.map_or(0, |i| self.snaps[i].tokens.len());
         let mut start = if live_ok { live } else { 0 };
@@ -651,7 +756,12 @@ impl FlashServe {
         self.line.restore_ms = t.elapsed().as_secs_f64() * 1e3;
         // Where to save states: the end of the system prompt (the second `<|im_start|>`) and
         // the last turn boundary (the last one, which opens the generation prompt).
-        let starts: Vec<usize> = ids.iter().enumerate().filter(|(_, &t)| t == self.im_start).map(|(i, _)| i).collect();
+        let starts: Vec<usize> = ids
+            .iter()
+            .enumerate()
+            .filter(|(_, &t)| t == self.im_start)
+            .map(|(i, _)| i)
+            .collect();
         let mut marks: Vec<(usize, bool)> = Vec::new();
         // The end of the tools block, which the template puts before the system text (that
         // has the working directory in it): the same for every session of a client.
@@ -673,7 +783,12 @@ impl FlashServe {
         marks.retain(|&(p, _)| p > start && p < ids.len());
         marks.dedup_by_key(|m| m.0);
         // The MTP only over the prompt's last positions (`TANG_FLASH_MTP_PREFILL`, default 512).
-        let mtp_from = ids.len().saturating_sub(std::env::var("TANG_FLASH_MTP_PREFILL").ok().and_then(|v| v.parse().ok()).unwrap_or(512));
+        let mtp_from = ids.len().saturating_sub(
+            std::env::var("TANG_FLASH_MTP_PREFILL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(512),
+        );
         let mut a = start;
         for (p, pinned) in marks {
             if p > a {
@@ -686,29 +801,62 @@ impl FlashServe {
         Ok((start, next))
     }
 
-    fn generate(&mut self, req: &Request, on: &mut dyn FnMut(Piece) -> bool) -> Result<(Finish, Usage)> {
+    fn generate(
+        &mut self,
+        req: &Request,
+        on: &mut dyn FnMut(Piece) -> bool,
+    ) -> Result<(Finish, Usage)> {
         let t0 = Instant::now();
         self.line = Line::default();
         let (ids, text, spliced) = self.prompt(req)?;
         self.line.spliced = spliced;
-        ensure!(ids.len() + 1 < self.ctx, "prompt is {} tokens; the context window is {}", ids.len(), self.ctx);
-        let limit = req.max_tokens.unwrap_or(usize::MAX).min(self.ctx - ids.len() - 1).max(1);
+        ensure!(
+            ids.len() + 1 < self.ctx,
+            "prompt is {} tokens; the context window is {}",
+            ids.len(),
+            self.ctx
+        );
+        let limit = req
+            .max_tokens
+            .unwrap_or(usize::MAX)
+            .min(self.ctx - ids.len() - 1)
+            .max(1);
         let thinking = req.think != Some(false);
         let card = match (self.sampling, thinking) {
             (SamplingMode::Greedy, _) => (self.temp, 0usize, 1.0f32, 0.0f32),
             (SamplingMode::ModelCard, true) => (1.0, 20, 0.95, 0.0),
             (SamplingMode::ModelCard, false) => (0.7, 20, 0.8, 1.5),
         };
-        let temp = if req.temperature_set { req.sampling.temperature.max(0.0) } else { card.0 };
-        let top_k = if req.top_k_set { req.sampling.top_k } else { card.1 };
-        let top_p = if req.top_p_set { req.sampling.top_p } else { card.2 };
+        let temp = if req.temperature_set {
+            req.sampling.temperature.max(0.0)
+        } else {
+            card.0
+        };
+        let top_k = if req.top_k_set {
+            req.sampling.top_k
+        } else {
+            card.1
+        };
+        let top_p = if req.top_p_set {
+            req.sampling.top_p
+        } else {
+            card.2
+        };
         let presence = req.presence_penalty.unwrap_or(card.3);
         self.e.temperature = temp;
         self.e.seed = req.sampling.seed as u32;
         if let Some(sp) = self.e.sampler_mut() {
             // top-k 0 (off) keeps the 64 best: the sampler's bound.
-            sp.top_k = if top_k == 0 { super::sampler::MAX_K } else { top_k };
-            sp.top_p = if top_p > 0.0 && top_p <= 1.0 { top_p } else { 1.0 };
+            sp.top_k = if top_k == 0 {
+                super::sampler::MAX_K
+            } else {
+                top_k
+            };
+            sp.top_p = if top_p > 0.0 && top_p <= 1.0 {
+                top_p
+            } else {
+                1.0
+            };
             sp.presence = presence;
         }
         self.e.sampler_begin(ids.len())?;
@@ -716,29 +864,38 @@ impl FlashServe {
         self.requests += 1;
         let tag = self.requests;
         if let Some(d) = &self.dump {
-            std::fs::write(d.join(format!("req-{tag}.ids")), ids.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" "))?;
+            std::fs::write(
+                d.join(format!("req-{tag}.ids")),
+                ids.iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )?;
         }
         let (reused, cur) = self.prefill(&ids, &text)?;
         let prefill_s = t0.elapsed().as_secs_f64();
         self.line.prompt = ids.len();
         self.line.reused = reused;
         self.line.prefill_ms = prefill_s * 1e3;
-        let usage = |out: usize, reasoning: usize, decode_s: f64, drafted: usize, accepted: usize| Usage {
-            prompt_tokens: ids.len(),
-            cached_tokens: reused,
-            completion_tokens: out,
-            reasoning_tokens: reasoning,
-            prefill_tok_s: (ids.len() - reused) as f64 / prefill_s.max(1e-9),
-            decode_tok_s: out as f64 / decode_s.max(1e-9),
-            draft_tokens: drafted,
-            accepted_tokens: accepted,
-        };
+        let usage =
+            |out: usize, reasoning: usize, decode_s: f64, drafted: usize, accepted: usize| Usage {
+                prompt_tokens: ids.len(),
+                cached_tokens: reused,
+                completion_tokens: out,
+                reasoning_tokens: reasoning,
+                prefill_tok_s: (ids.len() - reused) as f64 / prefill_s.max(1e-9),
+                decode_tok_s: out as f64 / decode_s.max(1e-9),
+                draft_tokens: drafted,
+                accepted_tokens: accepted,
+            };
         if req.prefill_only {
             self.line.finish = "prefill";
             return Ok((Finish::Stop, usage(0, 0, 0.0, 0, 0)));
         }
 
-        let gen_at = text.rfind("<|im_start|>assistant\n").map_or(text.len(), |i| i + "<|im_start|>assistant\n".len());
+        let gen_at = text
+            .rfind("<|im_start|>assistant\n")
+            .map_or(text.len(), |i| i + "<|im_start|>assistant\n".len());
         let tail = text[gen_at..].to_string();
         let opened = text.trim_end().ends_with("<think>");
         let mut parser = Parser::new(opened).with_tools(req.tools.as_ref());
@@ -755,14 +912,20 @@ impl FlashServe {
         let t1 = Instant::now();
         let mut pending = vec![cur];
         // Deliver pieces; false when the client went away.
-        let mut deliver = |pieces: Vec<Piece>, content: &mut String, calls: &mut Vec<(String, Value)>, first: &mut Option<f64>| -> bool {
+        let mut deliver = |pieces: Vec<Piece>,
+                           content: &mut String,
+                           calls: &mut Vec<(String, Value)>,
+                           first: &mut Option<f64>|
+         -> bool {
             for p in pieces {
                 if first.is_none() {
                     *first = Some(t0.elapsed().as_secs_f64() * 1e3);
                 }
                 match &p {
                     Piece::Text(t) => content.push_str(t),
-                    Piece::ToolCall { name, arguments } => calls.push((name.clone(), arguments.clone())),
+                    Piece::ToolCall { name, arguments } => {
+                        calls.push((name.clone(), arguments.clone()))
+                    }
                     Piece::Reasoning(_) => {}
                 }
                 if !on(p) {
@@ -789,7 +952,11 @@ impl FlashServe {
                 wrap |= think.step(tok);
                 if let Some(new) = detok.push(&self.tok, &out)? {
                     text_out.push_str(&new);
-                    let stop_at = req.stop.iter().filter_map(|s| text_out.find(s.as_str())).min();
+                    let stop_at = req
+                        .stop
+                        .iter()
+                        .filter_map(|s| text_out.find(s.as_str()))
+                        .min();
                     let new = match stop_at {
                         Some(i) => new[..new.len().saturating_sub(text_out.len() - i)].to_string(),
                         None => new,
@@ -847,7 +1014,8 @@ impl FlashServe {
             if self.e.use_mtp {
                 let wall = self.e.last.wall_ms;
                 let mtp = self.e.last_mtp_ms;
-                self.policy.observe(&probs, kept.len() - 1, drafts.len() + 1, wall, mtp);
+                self.policy
+                    .observe(&probs, kept.len() - 1, drafts.len() + 1, wall, mtp);
             }
             windows += 1;
             drafted += drafts.len();
@@ -862,14 +1030,27 @@ impl FlashServe {
         }
         let decode_s = t1.elapsed().as_secs_f64();
         // A reply that ended on its own can be spliced into the next prompt.
-        if matches!(finish, Finish::Stop | Finish::ToolCalls) && req.stop.iter().all(|s| !text_out.contains(s.as_str())) {
-            self.memo.push_back(Memo { content: content.clone(), calls: calls.clone(), tail, ids: out.clone() });
+        if matches!(finish, Finish::Stop | Finish::ToolCalls)
+            && req.stop.iter().all(|s| !text_out.contains(s.as_str()))
+        {
+            self.memo.push_back(Memo {
+                content: content.clone(),
+                calls: calls.clone(),
+                tail,
+                ids: out.clone(),
+            });
             while self.memo.len() > 256 {
                 self.memo.pop_front();
             }
         }
         if let Some(d) = &self.dump {
-            std::fs::write(d.join(format!("req-{tag}.out")), out.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" "))?;
+            std::fs::write(
+                d.join(format!("req-{tag}.out")),
+                out.iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )?;
         }
         self.line.ttft_ms = first.unwrap_or(t0.elapsed().as_secs_f64() * 1e3);
         self.line.decode = out.len();
@@ -884,14 +1065,23 @@ impl FlashServe {
             Finish::ToolCalls => "tool_calls",
             Finish::Cancelled => "cancelled",
         };
-        Ok((finish, usage(out.len(), think.reasoning, decode_s, drafted, accepted)))
+        Ok((
+            finish,
+            usage(out.len(), think.reasoning, decode_s, drafted, accepted),
+        ))
     }
 }
 
 impl Backend for FlashServe {
-    fn model_path(&self, _spec: &str) -> Result<PathBuf> { Ok(self.gguf.clone()) }
+    fn model_path(&self, _spec: &str) -> Result<PathBuf> {
+        Ok(self.gguf.clone())
+    }
 
-    fn complete(&mut self, req: &Request, on: &mut dyn FnMut(Piece) -> bool) -> Result<(Finish, Usage)> {
+    fn complete(
+        &mut self,
+        req: &Request,
+        on: &mut dyn FnMut(Piece) -> bool,
+    ) -> Result<(Finish, Usage)> {
         let r = self.generate(req, on);
         if r.is_err() {
             // Whatever the engine holds now is unknown: start over next time.
@@ -941,7 +1131,10 @@ impl Backend for FlashServe {
             }
             let ms = t.elapsed().as_secs_f64() * 1e3;
             if ms > 50.0 {
-                eprintln!("tang-llm: saved the running state at {} in {ms:.0} ms", self.e.tokens.len());
+                eprintln!(
+                    "tang-llm: saved the running state at {} in {ms:.0} ms",
+                    self.e.tokens.len()
+                );
             }
         }
     }
@@ -973,7 +1166,11 @@ pub fn resume_test(args: &[String]) -> Result<()> {
     }
     ensure!(ids.len() > 16, "need a prompt of more than 16 ids");
     let p = at.unwrap_or(ids.len() * 2 / 3 + 3);
-    let opts = Opts { max_ctx: (ids.len() + 256).next_multiple_of(1024), mtp, ..Opts::default() };
+    let opts = Opts {
+        max_ctx: (ids.len() + 256).next_multiple_of(1024),
+        mtp,
+        ..Opts::default()
+    };
     let mut e = Engine::load(&path, opts)?;
     e.use_graphs = true;
     e.warm()?;
@@ -986,7 +1183,8 @@ pub fn resume_test(args: &[String]) -> Result<()> {
             let mut cb = |pos0: usize, t: usize, lg: &[f32]| {
                 for i in 0..t {
                     if pos0 + i >= from {
-                        rows[(pos0 + i - from) * v..(pos0 + i - from + 1) * v].copy_from_slice(&lg[i * v..(i + 1) * v]);
+                        rows[(pos0 + i - from) * v..(pos0 + i - from + 1) * v]
+                            .copy_from_slice(&lg[i * v..(i + 1) * v]);
                     }
                 }
             };
@@ -994,7 +1192,12 @@ pub fn resume_test(args: &[String]) -> Result<()> {
         }
         Ok((rows, next))
     };
-    let bits = |a: &[f32], b: &[f32]| a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+    let bits = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count()
+    };
     // Straight through, split at p.
     e.reset();
     let (split, n_split) = run(&mut e, &[&ids[..p], &ids[p..]], p)?;
@@ -1027,11 +1230,24 @@ pub fn resume_test(args: &[String]) -> Result<()> {
         st.bytes() as f64 / 1e6,
         pos.bytes() as f64 / 1e6
     );
-    println!("  resumed vs straight (same windows): {} of {} logits differ; next token {} vs {}", bits(&resumed, &split), split.len(), n_resumed, n_split);
-    println!("  resumed after other prefills vs straight: {} of {} differ", bits(&resumed2, &split), split.len());
+    println!(
+        "  resumed vs straight (same windows): {} of {} logits differ; next token {} vs {}",
+        bits(&resumed, &split),
+        split.len(),
+        n_resumed,
+        n_split
+    );
+    println!(
+        "  resumed after other prefills vs straight: {} of {} differ",
+        bits(&resumed2, &split),
+        split.len()
+    );
     println!("  split at {p} vs one prefill (different window boundaries): {} of {} differ; next {} vs {}", bits(&split, &whole), split.len(), n_split, n_whole);
     let ok = bits(&resumed, &split) == 0 && bits(&resumed2, &split) == 0;
-    println!("resume test: {}", if ok { "PASS (bitwise)" } else { "FAIL" });
+    println!(
+        "resume test: {}",
+        if ok { "PASS (bitwise)" } else { "FAIL" }
+    );
     Ok(())
 }
 
@@ -1042,7 +1258,11 @@ pub fn default_disk(gguf: &Path) -> Option<PathBuf> {
         Ok(d) => Some(PathBuf::from(d)),
         Err(_) => {
             let name = gguf.file_stem()?.to_string_lossy().to_string();
-            Some(PathBuf::from(std::env::var_os("HOME")?).join(".cache/tang/flash-serve").join(name))
+            Some(
+                PathBuf::from(std::env::var_os("HOME")?)
+                    .join(".cache/tang/flash-serve")
+                    .join(name),
+            )
         }
     }
 }
@@ -1052,14 +1272,26 @@ pub fn default_disk(gguf: &Path) -> Option<PathBuf> {
 /// window's stats and the MTP time. The MTP's K/V for earlier positions stays unwritten: that
 /// only changes its drafts' acceptance, never the output (measured: no change in tokens/window
 /// at 2K and 10K with the last 512 positions).
-pub fn prefill_windows(e: &mut Engine, ids: &[u32], chunk: usize, mtp_from: usize) -> Result<(u32, Vec<super::engine::WinStats>, f64)> {
+pub fn prefill_windows(
+    e: &mut Engine,
+    ids: &[u32],
+    chunk: usize,
+    mtp_from: usize,
+) -> Result<(u32, Vec<super::engine::WinStats>, f64)> {
     prefill_span(e, ids, chunk, mtp_from, 0, true)
 }
 
 /// [`prefill_windows`] with wide prefill windows (`Engine::prefill_wide`, widths 16/32/64 up
 /// to `wide`; 0: none) for everything but the last `MAX_T` tokens when `last` (that window
 /// runs the head), or for all of it otherwise (the result's next token is then meaningless).
-pub fn prefill_span(e: &mut Engine, ids: &[u32], chunk: usize, mtp_from: usize, wide: usize, last: bool) -> Result<(u32, Vec<super::engine::WinStats>, f64)> {
+pub fn prefill_span(
+    e: &mut Engine,
+    ids: &[u32],
+    chunk: usize,
+    mtp_from: usize,
+    wide: usize,
+    last: bool,
+) -> Result<(u32, Vec<super::engine::WinStats>, f64)> {
     ensure!(!ids.is_empty(), "empty prompt");
     let pos_start = e.tokens.len();
     e.tokens.extend_from_slice(ids);
@@ -1077,7 +1309,9 @@ pub fn prefill_span(e: &mut Engine, ids: &[u32], chunk: usize, mtp_from: usize, 
         let out = e.window(pos, t, None)?;
         stats.push(e.last);
         if e.use_mtp && e.has_mtp() && pos + t > mtp_from {
-            let nexts: Vec<u32> = (0..t).map(|i| e.tokens.get(pos + i + 1).copied().unwrap_or(out[t - 1])).collect();
+            let nexts: Vec<u32> = (0..t)
+                .map(|i| e.tokens.get(pos + i + 1).copied().unwrap_or(out[t - 1]))
+                .collect();
             let t0 = Instant::now();
             e.mtp_last = e.mtp_draft(pos, &nexts)?;
             mtp_ms += t0.elapsed().as_secs_f64() * 1e3;
@@ -1101,13 +1335,20 @@ pub fn prefill_bench(args: &[String]) -> Result<()> {
     let mut quick = false;
     let mut chunks: Vec<usize> = Vec::new();
     let mut wides: Vec<usize> = Vec::new();
-    let list = |s: &str| -> Result<Vec<usize>> { s.split(',').map(|x| Ok(x.parse::<usize>()?)).collect() };
+    let list =
+        |s: &str| -> Result<Vec<usize>> { s.split(',').map(|x| Ok(x.parse::<usize>()?)).collect() };
     while let Some(a) = it.next() {
         let mut val = || it.next().with_context(|| format!("{a} needs a value"));
         match a.as_str() {
             "--ids-file" => {
                 for f in val()?.split(',') {
-                    ids.extend(std::fs::read_to_string(f)?.split(|c: char| c.is_whitespace() || c == ',').filter(|w| !w.is_empty()).map(|w| w.parse::<u32>()).collect::<Result<Vec<_>, _>>()?);
+                    ids.extend(
+                        std::fs::read_to_string(f)?
+                            .split(|c: char| c.is_whitespace() || c == ',')
+                            .filter(|w| !w.is_empty())
+                            .map(|w| w.parse::<u32>())
+                            .collect::<Result<Vec<_>, _>>()?,
+                    );
                 }
             }
             "--n" => ns = list(val()?)?,
@@ -1130,7 +1371,12 @@ pub fn prefill_bench(args: &[String]) -> Result<()> {
     while ids.len() < max_n {
         ids.extend_from_slice(&base);
     }
-    let opts = Opts { max_ctx: (max_n + 1024).next_multiple_of(1024), mtp, split: true, ..Opts::default() };
+    let opts = Opts {
+        max_ctx: (max_n + 1024).next_multiple_of(1024),
+        mtp,
+        split: true,
+        ..Opts::default()
+    };
     let mut e = Engine::load(&path, opts)?;
     eprintln!("{}", e.load_report);
     e.use_graphs = true;
@@ -1140,9 +1386,19 @@ pub fn prefill_bench(args: &[String]) -> Result<()> {
     let default_cap = e.pcie_cap;
     for &n in &ns {
         let p = &ids[..n];
-        let mut configs: Vec<(String, usize, usize, usize)> = vec![("served (mtp all, cap default)".into(), usize::MAX, default_cap, MAX_T)];
+        let mut configs: Vec<(String, usize, usize, usize)> = vec![(
+            "served (mtp all, cap default)".into(),
+            usize::MAX,
+            default_cap,
+            MAX_T,
+        )];
         for &w in &wides {
-            configs.push((format!("wide {w}, mtp last 512"), 512, default_cap, 1000 + w));
+            configs.push((
+                format!("wide {w}, mtp last 512"),
+                512,
+                default_cap,
+                1000 + w,
+            ));
         }
         for &c in &chunks {
             configs.push((format!("chunk {c}, mtp last 512"), 512, default_cap, c));
@@ -1183,8 +1439,21 @@ pub fn prefill_bench(args: &[String]) -> Result<()> {
                     "reference".to_string()
                 }
                 Some((wn, wl)) => {
-                    let d = wl.iter().zip(&lg).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
-                    format!("{} (next {} vs {}, {d} logits differ)", if d == 0 && *wn == next { "SAME" } else { "DIFFERS" }, next, wn)
+                    let d = wl
+                        .iter()
+                        .zip(&lg)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    format!(
+                        "{} (next {} vs {}, {d} logits differ)",
+                        if d == 0 && *wn == next {
+                            "SAME"
+                        } else {
+                            "DIFFERS"
+                        },
+                        next,
+                        wn
+                    )
                 }
             };
             // Decode 128 tokens with greedy MTP chains, for the drafts' acceptance.
@@ -1213,7 +1482,9 @@ pub fn prefill_bench(args: &[String]) -> Result<()> {
             }
             let w = st.len().max(1) as f64;
             let m = |f: fn(&super::engine::WinStats) -> f64| st.iter().map(f).sum::<f64>() / w;
-            let c = |f: fn(&super::engine::WinStats) -> usize| st.iter().map(f).sum::<usize>() as f64 / w;
+            let c = |f: fn(&super::engine::WinStats) -> usize| {
+                st.iter().map(f).sum::<usize>() as f64 / w
+            };
             println!(
                 "  {name:<34} {:7.0} tok/s ({:.2} s) | window {:.2} ms: GPU {:.2}, wait plan {:.2}, wait CPU rows {:.2}, host CPU experts {:.2}, plan {:.2}, MTP {:.2} | experts/window {:.0} distinct, {:.1} CPU, {:.1} PCIe, swaps {:.1} | {} | decode 128: {:.2} tok/window, {:.0} tok/s",
                 n as f64 / secs,
@@ -1245,7 +1516,15 @@ fn decode_n(e: &mut Engine, ids: &[u32], n: usize, drafts: bool) -> Result<Vec<u
     let mut cur = e.prefill(ids, MAX_T, None)?;
     let mut out = vec![cur];
     while out.len() < n {
-        let d: Vec<u32> = if drafts { e.mtp_last.iter().take((MAX_T - 1).min(n - out.len())).map(|x| x.0).collect() } else { Vec::new() };
+        let d: Vec<u32> = if drafts {
+            e.mtp_last
+                .iter()
+                .take((MAX_T - 1).min(n - out.len()))
+                .map(|x| x.0)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let kept = e.verify(cur, &d)?;
         out.extend_from_slice(&kept);
         cur = *kept.last().unwrap();
@@ -1264,13 +1543,22 @@ pub fn sampler_test(args: &[String]) -> Result<()> {
     while let Some(a) = it.next() {
         let mut val = || it.next().with_context(|| format!("{a} needs a value"));
         match a.as_str() {
-            "--ids-file" => ids = std::fs::read_to_string(val()?)?.split_whitespace().map(|w| w.parse::<u32>()).collect::<Result<_, _>>()?,
+            "--ids-file" => {
+                ids = std::fs::read_to_string(val()?)?
+                    .split_whitespace()
+                    .map(|w| w.parse::<u32>())
+                    .collect::<Result<_, _>>()?
+            }
             "--mtp" => mtp = Some(PathBuf::from(val()?)),
             "-n" => n = val()?.parse()?,
             s => bail!("unknown argument {s}"),
         }
     }
-    let opts = Opts { max_ctx: (ids.len() + n + 64).next_multiple_of(1024), mtp, ..Opts::default() };
+    let opts = Opts {
+        max_ctx: (ids.len() + n + 64).next_multiple_of(1024),
+        mtp,
+        ..Opts::default()
+    };
     let mut e = Engine::load(&path, opts)?;
     e.use_graphs = true;
     e.use_mtp = e.has_mtp();
@@ -1282,7 +1570,14 @@ pub fn sampler_test(args: &[String]) -> Result<()> {
     let mut check = |name: &str, a: &[u32], b: &[u32]| {
         let same = a == b;
         ok &= same;
-        println!("  {name}: {}{}", if same { "SAME" } else { "DIFFERS" }, a.iter().zip(b).position(|(x, y)| x != y).map_or(String::new(), |i| format!(" at {i}")));
+        println!(
+            "  {name}: {}{}",
+            if same { "SAME" } else { "DIFFERS" },
+            a.iter()
+                .zip(b)
+                .position(|(x, y)| x != y)
+                .map_or(String::new(), |i| format!(" at {i}"))
+        );
     };
     let set = |e: &mut Engine, temp: f32, k: usize, p: f32, pres: f32| {
         e.temperature = temp;
@@ -1296,7 +1591,17 @@ pub fn sampler_test(args: &[String]) -> Result<()> {
     set(&mut e, 0.0, 1, 1.0, 0.0);
     let g = decode_n(&mut e, &ids, n, true)?;
     check("greedy, sampler top-k 1 vs argmax", &g, &base);
-    for (name, t, k, p, pres) in [("thinking card (T 1.0, k 20, p 0.95)", 1.0, 20, 0.95, 0.0), ("answer card (T 0.7, k 20, p 0.8, presence 1.5)", 0.7, 20, 0.8, 1.5), ("greedy + presence 1.5", 0.0, 20, 1.0, 1.5)] {
+    for (name, t, k, p, pres) in [
+        ("thinking card (T 1.0, k 20, p 0.95)", 1.0, 20, 0.95, 0.0),
+        (
+            "answer card (T 0.7, k 20, p 0.8, presence 1.5)",
+            0.7,
+            20,
+            0.8,
+            1.5,
+        ),
+        ("greedy + presence 1.5", 0.0, 20, 1.0, 1.5),
+    ] {
         set(&mut e, t, k, p, pres);
         let a = decode_n(&mut e, &ids, n, false)?;
         let b = decode_n(&mut e, &ids, n, true)?;
@@ -1304,7 +1609,10 @@ pub fn sampler_test(args: &[String]) -> Result<()> {
         let c = decode_n(&mut e, &ids, n, true)?;
         check(&format!("{name}: repeat"), &c, &a);
         let differs = a.iter().zip(&base).filter(|(x, y)| x != y).count();
-        println!("    differs from greedy in {differs} of {n}; first {:?}", &a[..12.min(a.len())]);
+        println!(
+            "    differs from greedy in {differs} of {n}; first {:?}",
+            &a[..12.min(a.len())]
+        );
     }
     println!("sampler test: {}", if ok { "PASS" } else { "FAIL" });
     Ok(())

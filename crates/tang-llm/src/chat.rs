@@ -173,9 +173,14 @@ impl Parser {
     /// The request's `tools` (OpenAI format), so XML parameter values get their schema's types.
     pub fn with_tools(mut self, tools: Option<&Value>) -> Self {
         for t in tools.and_then(Value::as_array).into_iter().flatten() {
-            let f = if t["function"].is_object() { &t["function"] } else { t };
+            let f = if t["function"].is_object() {
+                &t["function"]
+            } else {
+                t
+            };
             if let Some(name) = f["name"].as_str() {
-                self.schemas.insert(name.to_string(), f["parameters"].clone());
+                self.schemas
+                    .insert(name.to_string(), f["parameters"].clone());
             }
         }
         self
@@ -361,7 +366,11 @@ pub fn parse_xml_call(
 fn typed(raw: &str, schema: &Value) -> Value {
     let types: Vec<&str> = match &schema["type"] {
         Value::String(t) => vec![t.as_str()],
-        Value::Array(a) => a.iter().filter_map(Value::as_str).filter(|t| *t != "null").collect(),
+        Value::Array(a) => a
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|t| *t != "null")
+            .collect(),
         _ if schema["anyOf"].is_array() || schema["oneOf"].is_array() => vec!["any"],
         _ => vec![],
     };
@@ -498,10 +507,19 @@ mod tests {
     #[test]
     fn xml_parameters_without_a_schema_are_strings_and_bad_numbers_fall_back() {
         let out = run_with(tools(), &["<tool_call>\n<function=Other>\n<parameter=n>\n5\n</parameter>\n</function>\n</tool_call><tool_call>\n<function=Read>\n<parameter=limit>\nmany\n</parameter>\n</function>\n</tool_call>"]);
-        assert_eq!(out, vec![
-            Piece::ToolCall { name: "Other".into(), arguments: serde_json::json!({"n": "5"}) },
-            Piece::ToolCall { name: "Read".into(), arguments: serde_json::json!({"limit": "many"}) },
-        ]);
+        assert_eq!(
+            out,
+            vec![
+                Piece::ToolCall {
+                    name: "Other".into(),
+                    arguments: serde_json::json!({"n": "5"})
+                },
+                Piece::ToolCall {
+                    name: "Read".into(),
+                    arguments: serde_json::json!({"limit": "many"})
+                },
+            ]
+        );
     }
 
     #[test]
@@ -516,8 +534,14 @@ mod tests {
         );
         // No parameters at all.
         assert_eq!(
-            run_with(tools(), &["<tool_call>\n<function=Read>\n</function>\n</tool_call>"]),
-            vec![Piece::ToolCall { name: "Read".into(), arguments: serde_json::json!({}) }]
+            run_with(
+                tools(),
+                &["<tool_call>\n<function=Read>\n</function>\n</tool_call>"]
+            ),
+            vec![Piece::ToolCall {
+                name: "Read".into(),
+                arguments: serde_json::json!({})
+            }]
         );
     }
 }

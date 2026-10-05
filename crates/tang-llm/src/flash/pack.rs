@@ -222,8 +222,7 @@ fn bf16_of(g: &Gguf, t: &TensorInfo) -> Result<Vec<u8>> {
     if t.ty == GgmlType::Bf16 {
         return Ok(g.bytes(t).to_vec());
     }
-    Ok(g
-        .dequantize(t)?
+    Ok(g.dequantize(t)?
         .iter()
         .flat_map(|&x| bf16_bits(x).to_le_bytes())
         .collect())
@@ -253,7 +252,12 @@ enum Job {
     HcQ8 { name: String, up: bool },
 }
 
-fn jobs(g: &Gguf, n_layer: usize, is_rec: &[bool], ple_layer: Option<usize>) -> Result<Vec<(String, Job)>> {
+fn jobs(
+    g: &Gguf,
+    n_layer: usize,
+    is_rec: &[bool],
+    ple_layer: Option<usize>,
+) -> Result<Vec<(String, Job)>> {
     let b = |l: usize, s: &str| format!("blk.{l}.{s}");
     let mut v: Vec<(String, Job)> = Vec::new();
     let hc = |v: &mut Vec<(String, Job)>, key: &str, pre: &str, inject: bool| {
@@ -267,7 +271,13 @@ fn jobs(g: &Gguf, n_layer: usize, is_rec: &[bool], ple_layer: Option<usize>) -> 
         v.push((format!("{key}.up"), Job::HcUp(format!("{pre}up.weight"))));
         for (part, up) in [("down", false), ("up", true), ("inject", false)] {
             if part != "inject" || inject {
-                v.push((format!("{key}.{part}.q8"), Job::HcQ8 { name: format!("{pre}{part}.weight"), up }));
+                v.push((
+                    format!("{key}.{part}.q8"),
+                    Job::HcQ8 {
+                        name: format!("{pre}{part}.weight"),
+                        up,
+                    },
+                ));
             }
         }
         if inject {
@@ -290,7 +300,12 @@ fn jobs(g: &Gguf, n_layer: usize, is_rec: &[bool], ple_layer: Option<usize>) -> 
                     names: vec![b(l, "attn_qkv.weight"), b(l, "attn_gate.weight")],
                     rows: GDN_PROJ,
                     class: "w_in",
-                    segs: vec![(b(l, "attn_qkv.weight"), 0), (b(l, "attn_gate.weight"), GDN_Z), (b(l, "ssm_alpha.weight"), GDN_A), (b(l, "ssm_beta.weight"), GDN_B)],
+                    segs: vec![
+                        (b(l, "attn_qkv.weight"), 0),
+                        (b(l, "attn_gate.weight"), GDN_Z),
+                        (b(l, "ssm_alpha.weight"), GDN_A),
+                        (b(l, "ssm_beta.weight"), GDN_B),
+                    ],
                 },
             ));
             v.push((
@@ -327,7 +342,13 @@ fn jobs(g: &Gguf, n_layer: usize, is_rec: &[bool], ple_layer: Option<usize>) -> 
                     ],
                     rows: QSA_PROJ,
                     class: "w_in",
-                    segs: vec![(b(l, "attn_q.weight"), 0), (b(l, "attn_k.weight"), QSA_K), (b(l, "attn_v.weight"), QSA_V), (b(l, "indexer.q_proj.weight"), QSA_IQ), (b(l, "indexer.k_proj.weight"), QSA_IK)],
+                    segs: vec![
+                        (b(l, "attn_q.weight"), 0),
+                        (b(l, "attn_k.weight"), QSA_K),
+                        (b(l, "attn_v.weight"), QSA_V),
+                        (b(l, "indexer.q_proj.weight"), QSA_IQ),
+                        (b(l, "indexer.k_proj.weight"), QSA_IK),
+                    ],
                 },
             ));
             v.push((
@@ -357,7 +378,10 @@ fn jobs(g: &Gguf, n_layer: usize, is_rec: &[bool], ple_layer: Option<usize>) -> 
         v.push((
             format!("{k}.router"),
             Job::Bf16Stack {
-                names: vec![b(l, "ffn_gate_inp.weight"), b(l, "ffn_gate_inp_shexp.weight")],
+                names: vec![
+                    b(l, "ffn_gate_inp.weight"),
+                    b(l, "ffn_gate_inp_shexp.weight"),
+                ],
             },
         ));
         v.push((
@@ -366,7 +390,10 @@ fn jobs(g: &Gguf, n_layer: usize, is_rec: &[bool], ple_layer: Option<usize>) -> 
                 names: vec![b(l, "ffn_gate_shexp.weight"), b(l, "ffn_up_shexp.weight")],
                 rows: 2 * FF,
                 class: "sh",
-                segs: vec![(b(l, "ffn_gate_shexp.weight"), 0), (b(l, "ffn_up_shexp.weight"), FF)],
+                segs: vec![
+                    (b(l, "ffn_gate_shexp.weight"), 0),
+                    (b(l, "ffn_up_shexp.weight"), FF),
+                ],
             },
         ));
         v.push((
@@ -426,7 +453,12 @@ fn jobs(g: &Gguf, n_layer: usize, is_rec: &[bool], ple_layer: Option<usize>) -> 
 /// instead of Q4X: `TANG_FLASH_BF16=w_in,sh`. A precision experiment knob (2-3.5× the bytes).
 pub fn bf16_classes() -> Vec<String> {
     std::env::var("TANG_FLASH_BF16")
-        .map(|v| v.split(',').filter(|s| !s.is_empty()).map(String::from).collect())
+        .map(|v| {
+            v.split(',')
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -451,7 +483,10 @@ pub fn dense_tag() -> String {
 /// (the default; `none` for Q4X everywhere).
 pub fn native_classes() -> Vec<String> {
     let v = std::env::var("TANG_FLASH_NATIVE").unwrap_or_else(|_| "w_in,w_out,sh,head".into());
-    v.split(',').filter(|s| !s.is_empty() && *s != "none").map(String::from).collect()
+    v.split(',')
+        .filter(|s| !s.is_empty() && *s != "none")
+        .map(String::from)
+        .collect()
 }
 
 fn ggml_id(t: GgmlType) -> Result<u64> {
@@ -488,19 +523,32 @@ fn run_job(g: &Gguf, job: &Job) -> Result<Built> {
                 let t = g.info(name)?;
                 let (tn, tk) = nk(t);
                 ensure!(k == 0 || k == tk, "{name}: width {tk} vs {k}");
-                ensure!(tk % 256 == 0 || t.ty.geometry().is_some_and(|(b, _)| b <= 64), "{name}: {tk} wide");
+                ensure!(
+                    tk % 256 == 0 || t.ty.geometry().is_some_and(|(b, _)| b <= 64),
+                    "{name}: {tk} wide"
+                );
                 k = tk;
                 total += tn;
-                while out.len() % 16 != 0 {
+                while !out.len().is_multiple_of(16) {
                     out.push(0);
                 }
-                ensure!(t.row_bytes()? + 15 <= 322 * 16, "{name}: {} B rows don't fit fe_gemv's stage", t.row_bytes()?);
-                meta.push([ggml_id(t.ty)?, tn as u64, t.row_bytes()? as u64, out.len() as u64, *off as u64]);
+                ensure!(
+                    t.row_bytes()? + 15 <= 322 * 16,
+                    "{name}: {} B rows don't fit fe_gemv's stage",
+                    t.row_bytes()?
+                );
+                meta.push([
+                    ggml_id(t.ty)?,
+                    tn as u64,
+                    t.row_bytes()? as u64,
+                    out.len() as u64,
+                    *off as u64,
+                ]);
                 out.extend_from_slice(g.bytes(t));
             }
             ensure!(total <= *rows, "{segs:?}: more rows than {rows}");
             return Ok((Fmt::Native, total, k, out, meta));
-                }
+        }
     }
     let (f, n, k, b) = run_job_plain(g, job)?;
     Ok((f, n, k, b, Vec::new()))
@@ -539,7 +587,12 @@ fn run_job_plain(g: &Gguf, job: &Job) -> Result<(Fmt, usize, usize, Vec<u8>)> {
                 .collect();
             let r = fl::hc_up_repack(&bits);
             let (n, k) = nk(t);
-            (Fmt::Bf16, n, k, r.iter().flat_map(|v| v.to_le_bytes()).collect())
+            (
+                Fmt::Bf16,
+                n,
+                k,
+                r.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            )
         }
         Job::HcQ8 { name, up } => {
             let t = g.info(name)?;
@@ -550,7 +603,9 @@ fn run_job_plain(g: &Gguf, job: &Job) -> Result<(Fmt, usize, usize, Vec<u8>)> {
             let (n, k) = nk(t);
             (Fmt::HcQ8, n, k, fl::hc_q8(&bits, n, k, *up))
         }
-        Job::Q4Stack { names, rows, class, .. } => {
+        Job::Q4Stack {
+            names, rows, class, ..
+        } => {
             let mut w = Vec::new();
             let mut k = 0;
             for name in names {
@@ -573,9 +628,18 @@ fn run_job_plain(g: &Gguf, job: &Job) -> Result<(Fmt, usize, usize, Vec<u8>)> {
 }
 
 /// Build (or find) the dense pack; returns the index and the data file path.
-pub fn dense(g: &Gguf, dir: &Path, n_layer: usize, is_rec: &[bool], ple_layer: Option<usize>) -> Result<(Vec<Entry>, PathBuf)> {
+pub fn dense(
+    g: &Gguf,
+    dir: &Path,
+    n_layer: usize,
+    is_rec: &[bool],
+    ple_layer: Option<usize>,
+) -> Result<(Vec<Entry>, PathBuf)> {
     let tag = dense_tag();
-    let (data, index) = (dir.join(format!("dense.{tag}.bin")), dir.join(format!("dense.{tag}.json")));
+    let (data, index) = (
+        dir.join(format!("dense.{tag}.bin")),
+        dir.join(format!("dense.{tag}.json")),
+    );
     if index.exists() && data.exists() {
         let e: Vec<Entry> = serde_json::from_slice(&std::fs::read(&index)?)?;
         return Ok((e, data));
@@ -589,8 +653,7 @@ pub fn dense(g: &Gguf, dir: &Path, n_layer: usize, is_rec: &[bool], ple_layer: O
     let mut off = 0u64;
     // A few jobs at a time in parallel (each is itself parallel over rows), written in order.
     for chunk in js.chunks(8) {
-        let built: Vec<Result<Built>> =
-            chunk.par_iter().map(|(_, j)| run_job(g, j)).collect();
+        let built: Vec<Result<Built>> = chunk.par_iter().map(|(_, j)| run_job(g, j)).collect();
         for ((name, _), b) in chunk.iter().zip(built) {
             let (fmt, n, k, bytes, segs) = b.with_context(|| format!("packing {name}"))?;
             f.write_all(&bytes)?;
@@ -628,7 +691,12 @@ pub fn drop_cache(f: &std::fs::File, off: u64, len: u64) {
     {
         use std::os::unix::io::AsRawFd;
         unsafe {
-            libc::posix_fadvise(f.as_raw_fd(), off as i64, len as i64, libc::POSIX_FADV_DONTNEED);
+            libc::posix_fadvise(
+                f.as_raw_fd(),
+                off as i64,
+                len as i64,
+                libc::POSIX_FADV_DONTNEED,
+            );
         }
     }
     #[cfg(not(target_os = "linux"))]
@@ -735,11 +803,19 @@ mod tests {
         let b = q4x_pack(&w, n, k);
         assert_eq!(b.len(), n * k / 2 + 4 * n * k / 64);
         let d = q4x_unpack(&b, n, k);
-        let e_ls: f64 = w.iter().zip(&d).map(|(a, b)| ((a - b) as f64).powi(2)).sum();
+        let e_ls: f64 = w
+            .iter()
+            .zip(&d)
+            .map(|(a, b)| ((a - b) as f64).powi(2))
+            .sum();
         // min/max RTN for comparison
         let (p, s, bi) = crate::weights::quantize_q4(&w, 64);
         let mm = q4x_unpack(&fl::q4x_repack(&p, &s, &bi, n, k), n, k);
-        let e_mm: f64 = w.iter().zip(&mm).map(|(a, b)| ((a - b) as f64).powi(2)).sum();
+        let e_mm: f64 = w
+            .iter()
+            .zip(&mm)
+            .map(|(a, b)| ((a - b) as f64).powi(2))
+            .sum();
         assert!(e_ls <= e_mm, "least squares {e_ls} vs min/max {e_mm}");
     }
 }

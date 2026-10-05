@@ -157,8 +157,13 @@ pub struct Sampler {
 }
 
 fn htod(addr: u64, bytes: &[u8]) -> Result<()> {
-    let r = unsafe { cudarc::driver::sys::cuMemcpyHtoD_v2(addr, bytes.as_ptr() as *const _, bytes.len()) };
-    ensure!(r == cudarc::driver::sys::CUresult::CUDA_SUCCESS, "cuMemcpyHtoD: {r:?}");
+    let r = unsafe {
+        cudarc::driver::sys::cuMemcpyHtoD_v2(addr, bytes.as_ptr() as *const _, bytes.len())
+    };
+    ensure!(
+        r == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+        "cuMemcpyHtoD: {r:?}"
+    );
     Ok(())
 }
 
@@ -202,9 +207,18 @@ impl Sampler {
 
     /// Before a window over `tokens[pos0..pos0 + t]`: flag the output accepted before it and
     /// write the parameters and the window's tokens.
-    pub fn stage(&mut self, dev: &CudaComputeDevice, tokens: &[u32], pos0: usize, t: usize) -> Result<()> {
+    pub fn stage(
+        &mut self,
+        dev: &CudaComputeDevice,
+        tokens: &[u32],
+        pos0: usize,
+        t: usize,
+    ) -> Result<()> {
         let base = dev.buffer_addr(&self.seen);
-        if self.gen_start != usize::MAX && pos0 < self.flagged_upto && self.flagged_upto > self.gen_start {
+        if self.gen_start != usize::MAX
+            && pos0 < self.flagged_upto
+            && self.flagged_upto > self.gen_start
+        {
             // The sequence went back past flagged output (a new prompt without `begin`): no
             // output history until the next `begin`.
             self.begin(dev, usize::MAX)?;
@@ -223,7 +237,11 @@ impl Sampler {
         w[0] = self.top_k.clamp(1, MAX_K) as u32;
         w[1] = self.top_p.to_bits();
         w[2] = self.presence.to_bits();
-        w[3] = if self.gen_start == usize::MAX { t as u32 } else { self.gen_start.saturating_sub(pos0).min(t) as u32 };
+        w[3] = if self.gen_start == usize::MAX {
+            t as u32
+        } else {
+            self.gen_start.saturating_sub(pos0).min(t) as u32
+        };
         for i in 0..t {
             w[4 + i] = tokens[pos0 + i];
         }
@@ -232,7 +250,15 @@ impl Sampler {
     }
 
     /// The two passes on `stream` (graph nodes): logits `[t][vocab]` to `ids[t]`.
-    pub fn enqueue(&self, dev: &CudaComputeDevice, stream: &Stream, logits: &B, ctl: &B, ids: &B, t: usize) {
+    pub fn enqueue(
+        &self,
+        dev: &CudaComputeDevice,
+        stream: &Stream,
+        logits: &B,
+        ctl: &B,
+        ids: &B,
+        t: usize,
+    ) {
         let (lg, n, part, prm, seen) = (
             dev.buffer_addr(logits),
             self.vocab as i32,
@@ -242,10 +268,24 @@ impl Sampler {
         );
         let (ctlp, idp, ns) = (dev.buffer_addr(ctl), dev.buffer_addr(ids), SLICES as i32);
         unsafe {
-            gpu::launch(self.k1, (SLICES as u32, t as u32, 1), (1024, 1, 1), 0, stream, tang_moe::args![lg, n, part, prm, seen])
-                .expect("launch fs_topk1");
-            gpu::launch(self.k2, (t as u32, 1, 1), (32, 1, 1), 0, stream, tang_moe::args![part, ns, prm, ctlp, idp])
-                .expect("launch fs_topk2");
+            gpu::launch(
+                self.k1,
+                (SLICES as u32, t as u32, 1),
+                (1024, 1, 1),
+                0,
+                stream,
+                tang_moe::args![lg, n, part, prm, seen],
+            )
+            .expect("launch fs_topk1");
+            gpu::launch(
+                self.k2,
+                (t as u32, 1, 1),
+                (32, 1, 1),
+                0,
+                stream,
+                tang_moe::args![part, ns, prm, ctlp, idp],
+            )
+            .expect("launch fs_topk2");
         }
     }
 }

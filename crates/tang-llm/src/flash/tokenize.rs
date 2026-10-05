@@ -23,7 +23,9 @@ pub struct FlashTokenizer {
 impl FlashTokenizer {
     pub fn from_gguf(g: &Gguf) -> Result<Self> {
         let arr = |k: &str| -> Result<&[crate::gguf::Value]> {
-            g.meta(k)?.as_array().with_context(|| format!("{k} is not an array"))
+            g.meta(k)?
+                .as_array()
+                .with_context(|| format!("{k} is not an array"))
         };
         let tokens: Vec<&str> = arr("tokenizer.ggml.tokens")?
             .iter()
@@ -42,15 +44,20 @@ impl FlashTokenizer {
             g.meta_str("tokenizer.ggml.model")? == "gpt2",
             "only byte-level BPE (gpt2) GGUF tokenizers are supported"
         );
-        ensure!(pre.starts_with("qwen"), "pre-tokenizer {pre} isn't supported");
+        ensure!(
+            pre.starts_with("qwen"),
+            "pre-tokenizer {pre} isn't supported"
+        );
         let mut vocab = serde_json::Map::new();
         let mut added = Vec::new();
         for (i, t) in tokens.iter().enumerate() {
             vocab.insert(t.to_string(), json!(i));
             // 3 = control, 4 = user-defined: matched literally, never split.
             if matches!(types.get(i), Some(3) | Some(4)) {
-                added.push(json!({"id": i, "content": t, "single_word": false, "lstrip": false,
-                    "rstrip": false, "normalized": false, "special": true}));
+                added.push(
+                    json!({"id": i, "content": t, "single_word": false, "lstrip": false,
+                    "rstrip": false, "normalized": false, "special": true}),
+                );
             }
         }
         let spec = json!({
@@ -101,13 +108,23 @@ impl FlashTokenizer {
     }
 
     pub fn decode(&self, ids: &[u32]) -> Result<String> {
-        self.tok.decode(ids, false).map_err(|e| anyhow!("decode: {e}"))
+        self.tok
+            .decode(ids, false)
+            .map_err(|e| anyhow!("decode: {e}"))
     }
 
     /// The chat template over a conversation (OpenAI messages, contents as strings, tool-call
     /// arguments as objects) and tools, with the generation prompt.
-    pub fn render(&self, messages: &Value, tools: Option<&Value>, think: Option<bool>) -> Result<String> {
-        let t = self.template.as_ref().context("the GGUF has no chat template")?;
+    pub fn render(
+        &self,
+        messages: &Value,
+        tools: Option<&Value>,
+        think: Option<bool>,
+    ) -> Result<String> {
+        let t = self
+            .template
+            .as_ref()
+            .context("the GGUF has no chat template")?;
         t.render(messages, tools, think)
     }
 
@@ -118,7 +135,10 @@ impl FlashTokenizer {
     /// The chat template applied to one user message (generation prompt added, thinking on
     /// unless `think` says otherwise).
     pub fn chat(&self, user: &str, think: Option<bool>) -> Result<String> {
-        let t = self.template.as_ref().context("the GGUF has no chat template")?;
+        let t = self
+            .template
+            .as_ref()
+            .context("the GGUF has no chat template")?;
         t.render(&json!([{"role": "user", "content": user}]), None, think)
     }
 }
@@ -147,7 +167,10 @@ pub fn cli(args: &[String]) -> Result<()> {
             "--check" => {
                 for f in it.by_ref() {
                     let s = std::fs::read_to_string(f)?;
-                    let ids: Vec<u32> = s.split_whitespace().map(|w| w.parse()).collect::<Result<_, _>>()?;
+                    let ids: Vec<u32> = s
+                        .split_whitespace()
+                        .map(|w| w.parse())
+                        .collect::<Result<_, _>>()?;
                     let text = t.decode(&ids)?;
                     let back = t.encode(&text)?;
                     let first = ids.iter().zip(&back).position(|(a, b)| a != b);
@@ -161,7 +184,8 @@ pub fn cli(args: &[String]) -> Result<()> {
                                 &ids[i..(i + 5).min(ids.len())],
                                 &back[i..(i + 5).min(back.len())]
                             ),
-                            None if back.len() != ids.len() => format!(" (lengths {} vs {})", ids.len(), back.len()),
+                            None if back.len() != ids.len() =>
+                                format!(" (lengths {} vs {})", ids.len(), back.len()),
                             None => String::new(),
                         }
                     );

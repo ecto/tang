@@ -426,7 +426,11 @@ impl MoePlan {
     pub const WIDE_CAP: usize = Self::WIDE_MAX * TOPK + Self::WIDE_MAX;
     /// Plan capacity at window width `m`.
     pub const fn cap(m: usize) -> usize {
-        if m <= MAX_T { Self::CAP } else { Self::WIDE_CAP }
+        if m <= MAX_T {
+            Self::CAP
+        } else {
+            Self::WIDE_CAP
+        }
     }
     /// Plan words at window width `m` (offsets as the constants above, with `cap(m)`).
     pub const fn words(m: usize) -> usize {
@@ -435,7 +439,11 @@ impl MoePlan {
     /// First `parts` row of the shared expert at window width `m`: `SHARED_ROW` up to `MAX_T`,
     /// `WIDE_MAX · TOPK` for wider (prefill) windows.
     pub const fn shared_row(m: usize) -> usize {
-        if m <= MAX_T { Self::SHARED_ROW } else { Self::WIDE_MAX * TOPK }
+        if m <= MAX_T {
+            Self::SHARED_ROW
+        } else {
+            Self::WIDE_MAX * TOPK
+        }
     }
     /// `parts` rows at window width `m`.
     pub const fn parts_rows(m: usize) -> usize {
@@ -443,7 +451,11 @@ impl MoePlan {
     }
     /// `moe_grouped_into` scratch words at window width `m`.
     pub fn scratch_words_for(m: usize) -> usize {
-        QAct { m: Self::cap(m), k: FF }.words()
+        QAct {
+            m: Self::cap(m),
+            k: FF,
+        }
+        .words()
     }
     /// Words of `moe_grouped_into` scratch: every entry's SwiGLU activations as int8
     /// (`QAct { m: CAP, k: FF }`, row = entry).

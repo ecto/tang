@@ -27,7 +27,11 @@ pub const MAX_STEPS: usize = 6;
 
 /// Draft steps per window: `TANG_FLASH_MTP_STEPS` (default 3).
 pub fn steps() -> usize {
-    std::env::var("TANG_FLASH_MTP_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(3).clamp(1, MAX_STEPS)
+    std::env::var("TANG_FLASH_MTP_STEPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3)
+        .clamp(1, MAX_STEPS)
 }
 
 /// Raw GGUF bytes of a 2-D tensor, its ggml id and row bytes.
@@ -70,7 +74,10 @@ pub fn raw(g: &Gguf, t: &TensorInfo) -> Result<Raw> {
 
 /// A tensor dequantized and rounded to bf16 bits.
 pub fn bf16(g: &Gguf, t: &TensorInfo) -> Result<Vec<u16>> {
-    Ok(g.dequantize(t)?.iter().map(|&x| super::pack::bf16_bits(x)).collect())
+    Ok(g.dequantize(t)?
+        .iter()
+        .map(|&x| super::pack::bf16_bits(x))
+        .collect())
 }
 
 /// Q8_0 → Q4_0 (ggml's quantize_row_q4_0: d = max / −8 of the block's largest-magnitude value).
@@ -78,28 +85,30 @@ pub fn q8_to_q4_0(src: &[u8]) -> Result<Vec<u8>> {
     ensure!(src.len() % 34 == 0, "Q8_0 size");
     let nb = src.len() / 34;
     let mut out = vec![0u8; nb * 18];
-    out.par_chunks_mut(18 * 4096).enumerate().try_for_each(|(c, o)| -> Result<()> {
-        let mut f = [0f32; 32];
-        for (i, dst) in o.chunks_mut(18).enumerate() {
-            let b = c * 4096 + i;
-            dequantize(GgmlType::Q8_0, &src[b * 34..b * 34 + 34], &mut f)?;
-            let mut max = 0f32;
-            for &x in &f {
-                if x.abs() > max.abs() {
-                    max = x;
+    out.par_chunks_mut(18 * 4096)
+        .enumerate()
+        .try_for_each(|(c, o)| -> Result<()> {
+            let mut f = [0f32; 32];
+            for (i, dst) in o.chunks_mut(18).enumerate() {
+                let b = c * 4096 + i;
+                dequantize(GgmlType::Q8_0, &src[b * 34..b * 34 + 34], &mut f)?;
+                let mut max = 0f32;
+                for &x in &f {
+                    if x.abs() > max.abs() {
+                        max = x;
+                    }
+                }
+                let d = max / -8.0;
+                let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+                dst[..2].copy_from_slice(&tang_compute::flash::f32_to_f16(d).to_le_bytes());
+                for j in 0..16 {
+                    let q0 = ((f[j] * id + 8.5) as i32).clamp(0, 15) as u8;
+                    let q1 = ((f[j + 16] * id + 8.5) as i32).clamp(0, 15) as u8;
+                    dst[2 + j] = q0 | (q1 << 4);
                 }
             }
-            let d = max / -8.0;
-            let id = if d != 0.0 { 1.0 / d } else { 0.0 };
-            dst[..2].copy_from_slice(&tang_compute::flash::f32_to_f16(d).to_le_bytes());
-            for j in 0..16 {
-                let q0 = ((f[j] * id + 8.5) as i32).clamp(0, 15) as u8;
-                let q1 = ((f[j + 16] * id + 8.5) as i32).clamp(0, 15) as u8;
-                dst[2 + j] = q0 | (q1 << 4);
-            }
-        }
-        Ok(())
-    })?;
+            Ok(())
+        })?;
     Ok(out)
 }
 
@@ -109,42 +118,48 @@ pub fn q8_to_q2_0(src: &[u8]) -> Result<Vec<u8>> {
     ensure!(src.len() % 68 == 0, "Q8_0 size (pairs of 32-blocks)");
     let nb = src.len() / 68;
     let mut out = vec![0u8; nb * 18];
-    out.par_chunks_mut(18 * 2048).enumerate().try_for_each(|(c, o)| -> Result<()> {
-        let mut f = [0f32; 64];
-        for (i, dst) in o.chunks_mut(18).enumerate() {
-            let b = c * 2048 + i;
-            dequantize(GgmlType::Q8_0, &src[b * 68..b * 68 + 68], &mut f)?;
-            let amax = f.iter().fold(0f32, |a, v| a.max(v.abs()));
-            let (mut best, mut bd) = (f64::INFINITY, 0f32);
-            if amax > 0.0 {
-                for step in 1..=24 {
-                    // levels {-d, 0, d, 2d}
-                    let d = amax * step as f32 / 24.0;
-                    let mut e = 0f64;
-                    for &x in &f {
-                        let q = ((x / d).round()).clamp(-1.0, 2.0);
-                        let r = (x - q * d) as f64;
-                        e += r * r;
-                    }
-                    if e < best {
-                        best = e;
-                        bd = d;
+    out.par_chunks_mut(18 * 2048)
+        .enumerate()
+        .try_for_each(|(c, o)| -> Result<()> {
+            let mut f = [0f32; 64];
+            for (i, dst) in o.chunks_mut(18).enumerate() {
+                let b = c * 2048 + i;
+                dequantize(GgmlType::Q8_0, &src[b * 68..b * 68 + 68], &mut f)?;
+                let amax = f.iter().fold(0f32, |a, v| a.max(v.abs()));
+                let (mut best, mut bd) = (f64::INFINITY, 0f32);
+                if amax > 0.0 {
+                    for step in 1..=24 {
+                        // levels {-d, 0, d, 2d}
+                        let d = amax * step as f32 / 24.0;
+                        let mut e = 0f64;
+                        for &x in &f {
+                            let q = ((x / d).round()).clamp(-1.0, 2.0);
+                            let r = (x - q * d) as f64;
+                            e += r * r;
+                        }
+                        if e < best {
+                            best = e;
+                            bd = d;
+                        }
                     }
                 }
+                let dh = tang_compute::flash::f32_to_f16(bd);
+                let d = tang_compute::flash::f16_to_f32(dh);
+                dst[..2].copy_from_slice(&dh.to_le_bytes());
+                for v in dst[2..].iter_mut() {
+                    *v = 0;
+                }
+                for (j, &x) in f.iter().enumerate() {
+                    let q = if d > 0.0 {
+                        ((x / d).round()).clamp(-1.0, 2.0) as i32 + 1
+                    } else {
+                        1
+                    };
+                    dst[2 + j / 4] |= (q as u8) << (2 * (j % 4));
+                }
             }
-            let dh = tang_compute::flash::f32_to_f16(bd);
-            let d = tang_compute::flash::f16_to_f32(dh);
-            dst[..2].copy_from_slice(&dh.to_le_bytes());
-            for v in dst[2..].iter_mut() {
-                *v = 0;
-            }
-            for (j, &x) in f.iter().enumerate() {
-                let q = if d > 0.0 { ((x / d).round()).clamp(-1.0, 2.0) as i32 + 1 } else { 1 };
-                dst[2 + j / 4] |= (q as u8) << (2 * (j % 4));
-            }
-        }
-        Ok(())
-    })?;
+            Ok(())
+        })?;
     Ok(out)
 }
 
@@ -159,15 +174,28 @@ pub fn f32_to_q2_0(f: &[f32]) -> Vec<u8> {
         if amax > 0.0 {
             for step in 1..=24 {
                 let d = amax * step as f32 / 24.0;
-                let e: f64 = x.iter().map(|&v| { let q = (v / d).round().clamp(-1.0, 2.0); ((v - q * d) as f64).powi(2) }).sum();
-                if e < best { best = e; bd = d; }
+                let e: f64 = x
+                    .iter()
+                    .map(|&v| {
+                        let q = (v / d).round().clamp(-1.0, 2.0);
+                        ((v - q * d) as f64).powi(2)
+                    })
+                    .sum();
+                if e < best {
+                    best = e;
+                    bd = d;
+                }
             }
         }
         let dh = tang_compute::flash::f32_to_f16(bd);
         let d = tang_compute::flash::f16_to_f32(dh);
         dst[..2].copy_from_slice(&dh.to_le_bytes());
         for (j, &v) in x.iter().enumerate() {
-            let q = if d > 0.0 { (v / d).round().clamp(-1.0, 2.0) as i32 + 1 } else { 1 };
+            let q = if d > 0.0 {
+                (v / d).round().clamp(-1.0, 2.0) as i32 + 1
+            } else {
+                1
+            };
             dst[2 + j / 4] |= (q as u8) << (2 * (j % 4));
         }
     });
@@ -182,9 +210,13 @@ pub fn upload_padded(dev: &CudaComputeDevice, b: &[u8]) -> B {
 
 pub fn open(path: &Path) -> Result<(Gguf, usize)> {
     let g = Gguf::open(path)?;
-    let layer = g.meta_u64("qwen4exp.block_count").context("MTP block count")? as usize - 1;
+    let layer = g
+        .meta_u64("qwen4exp.block_count")
+        .context("MTP block count")? as usize
+        - 1;
     ensure!(
-        g.get(&format!("blk.{layer}.nextn.eh_proj.weight")).is_some(),
+        g.get(&format!("blk.{layer}.nextn.eh_proj.weight"))
+            .is_some(),
         "{}: not an MTP file",
         path.display()
     );

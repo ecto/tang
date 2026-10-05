@@ -86,7 +86,11 @@ fn pin(cpu: usize) {
 impl NgramTable {
     pub fn open(g: &Gguf, p: &PleParams) -> Result<Self> {
         let t: &TensorInfo = g.info("per_layer_token_embd.weight")?;
-        ensure!(t.row_len() == p.head_dim, "PLE table rows are {} wide", t.row_len());
+        ensure!(
+            t.row_len() == p.head_dim,
+            "PLE table rows are {} wide",
+            t.row_len()
+        );
         let path = g.shard_paths()[t.shard].to_path_buf();
         #[cfg(target_os = "linux")]
         let direct = libc::O_DIRECT;
@@ -131,7 +135,10 @@ impl NgramTable {
             return Ok(b.clone());
         }
         self.reads.fetch_add(1, Relaxed);
-        ensure!((row as usize) < self.n_rows, "n-gram row {row} out of range");
+        ensure!(
+            (row as usize) < self.n_rows,
+            "n-gram row {row} out of range"
+        );
         let at = self.offset + row * self.row_bytes as u64;
         let start = at / PAGE as u64 * PAGE as u64;
         let end = (at + self.row_bytes as u64).div_ceil(PAGE as u64) * PAGE as u64;
@@ -164,11 +171,19 @@ impl NgramTable {
     pub fn gather(&self, tokens: &[u32], i0: usize, i1: usize, out: &mut [f32]) -> Result<()> {
         let per = self.p.n_heads();
         let rows: Vec<u64> = (i0..i1).flat_map(|i| self.p.rows(tokens, i)).collect();
-        ensure!(out.len() >= rows.len() * self.width && rows.len() == (i1 - i0) * per, "PLE gather");
-        let raws: Vec<Result<Box<[u8]>>> =
-            self.io.install(|| rows.par_iter().map(|&r| self.read_raw(r)).collect());
+        ensure!(
+            out.len() >= rows.len() * self.width && rows.len() == (i1 - i0) * per,
+            "PLE gather"
+        );
+        let raws: Vec<Result<Box<[u8]>>> = self
+            .io
+            .install(|| rows.par_iter().map(|&r| self.read_raw(r)).collect());
         for (h, raw) in raws.into_iter().enumerate() {
-            dequantize(self.ty, &raw?, &mut out[h * self.width..(h + 1) * self.width])?;
+            dequantize(
+                self.ty,
+                &raw?,
+                &mut out[h * self.width..(h + 1) * self.width],
+            )?;
         }
         Ok(())
     }

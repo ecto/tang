@@ -131,3 +131,14 @@ The integrated head passes 78 library tests (one pre-existing ignored) and both 
 tests; CUDA model-dependent integration tests compile but skip without `TANG_LLM_TEST_MODEL`.
 Flash keeps worker-local prompt rendering and a fixed model bundle: model load/unload is
 rejected, its background prefill does not yield, and dense KV block reporting is unavailable.
+
+Post-merge GPU validation also passes: `conflict-tcheck.log` records zero differing logits
+and bitwise-equal layer probes, and `conflict-spec.log` records greedy/sampled equality,
+including forced-wrong drafts. The isolated HTTP smoke test (`conflict-http.log`) returned
+`hello`, rejected both model-control requests with 400, and repeated the same completion
+with 53 cached prompt tokens. The test process was stopped; the deployed service and
+collector were unchanged.
+
+CI cleanup applies workspace rustfmt, removes the reported padding/slice/lifetime lints,
+and fills the sampling fields in the two iOS bridge requests. The exact Linux Clippy
+command passes with Rust 1.94.1, and the Mac iOS-bridge library/examples build passes.

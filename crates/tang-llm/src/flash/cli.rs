@@ -2,12 +2,12 @@
 //! command line.
 
 use super::engine::{Engine, ExpertMode, Opts, Probe, WinStats};
-use tang_compute::flash::MAX_T;
 use super::reference::top_logprobs;
 use anyhow::{bail, ensure, Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tang_compute::flash::shape::*;
+use tang_compute::flash::MAX_T;
 
 struct Args {
     path: PathBuf,
@@ -122,7 +122,8 @@ pub fn detok(vocab: &[String], ids: &[u32]) -> String {
     let mut n = 0u32;
     let mut map = std::collections::HashMap::new();
     for b in 0..256u32 {
-        let printable = (33..=126).contains(&b) || (161..=172).contains(&b) || (174..=255).contains(&b);
+        let printable =
+            (33..=126).contains(&b) || (161..=172).contains(&b) || (174..=255).contains(&b);
         let c = if printable {
             b
         } else {
@@ -155,7 +156,10 @@ fn prompt_ids(a: &Args) -> Result<Vec<u32>> {
     if let Some(p) = &a.prompt {
         return super::tokenize::encode_chat(&a.path, p, a.think);
     }
-    ensure!(!a.ids.is_empty(), "no prompt (--prompt-ids, --ids-file or --prompt)");
+    ensure!(
+        !a.ids.is_empty(),
+        "no prompt (--prompt-ids, --ids-file or --prompt)"
+    );
     Ok(a.ids.clone())
 }
 
@@ -179,7 +183,12 @@ fn split_line(s: &WinStats) -> String {
 }
 
 /// Decode `n` greedy tokens after `ids`; returns (generated, per-step stats, decode seconds).
-fn decode(e: &mut Engine, ids: &[u32], n: usize, chunk: usize) -> Result<(Vec<u32>, Vec<WinStats>, f64, f64)> {
+fn decode(
+    e: &mut Engine,
+    ids: &[u32],
+    n: usize,
+    chunk: usize,
+) -> Result<(Vec<u32>, Vec<WinStats>, f64, f64)> {
     e.reset();
     let t0 = Instant::now();
     let mut next = e.prefill(ids, chunk, None)?;
@@ -269,16 +278,32 @@ fn decode_spec(
     let mut calib: Vec<(f64, f64)> = (0..10)
         .map(|b| {
             let p = (b as f64 + 0.5) / 10.0;
-            let a = if p >= 0.9 { 0.985 } else if p >= 0.5 { 0.6 + (p - 0.5) * 0.8 } else { 0.3 + p * 0.6 };
+            let a = if p >= 0.9 {
+                0.985
+            } else if p >= 0.5 {
+                0.6 + (p - 0.5) * 0.8
+            } else {
+                0.3 + p * 0.6
+            };
             (4.0 * a, 4.0)
         })
         .collect();
     let mut mtp_probs: Vec<f32> = Vec::new();
-    let fixed_gate = std::env::var("TANG_FLASH_GATE").ok().and_then(|v| v.parse::<f32>().ok());
+    let fixed_gate = std::env::var("TANG_FLASH_GATE")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok());
     // Thinking spans: the prompt ends inside `<think>` (248068) until `</think>` (248069).
     let think_end = 248_069u32;
-    let mut in_think = ids.iter().rev().take(8).find(|&&x| x == 248_068 || x == think_end) == Some(&248_068);
-    let think_room: usize = std::env::var("TANG_FLASH_THINK_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(MAX_T);
+    let mut in_think = ids
+        .iter()
+        .rev()
+        .take(8)
+        .find(|&&x| x == 248_068 || x == think_end)
+        == Some(&248_068);
+    let think_room: usize = std::env::var("TANG_FLASH_THINK_STEPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(MAX_T);
     // TANG_FLASH_STOP_IDS=a,b: stop once any of these tokens is generated (data generation).
     let stop: Vec<u32> = std::env::var("TANG_FLASH_STOP_IDS")
         .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect())
@@ -329,7 +354,11 @@ fn decode_spec(
                 mtp_probs = e.mtp_last.iter().take(best.0).map(|x| x.1).collect();
                 // Hybrid: take the suffix drafter's longer proposal when it agrees with the
                 // MTP's first draft (a long earlier match: quoted text, code being repeated).
-                let sd = if kind == "hybrid" { sess.propose(room) } else { Default::default() };
+                let sd = if kind == "hybrid" {
+                    sess.propose(room)
+                } else {
+                    Default::default()
+                };
                 if !sd.tokens.is_empty()
                     && e.mtp_last.first().is_some_and(|x| x.0 == sd.tokens[0])
                     && sd.tokens.len() > d.len()
@@ -347,12 +376,29 @@ fn decode_spec(
                 rng ^= rng >> 7;
                 rng ^= rng << 17;
                 let k = 1 + (rng % room.max(1) as u64) as usize;
-                ((0..k.min(room)).map(|i| ((rng >> (8 * i)) % 248_000) as u32).collect(), None)
+                (
+                    (0..k.min(room))
+                        .map(|i| ((rng >> (8 * i)) % 248_000) as u32)
+                        .collect(),
+                    None,
+                )
             }
             _ if !oracle.is_empty() && kind.starts_with("fixed") => {
                 // Fixed width: the true continuation, never corrupted (every window T = k + 1).
-                let k = kind.split(':').nth(1).and_then(|v| v.parse().ok()).unwrap_or(3usize);
-                (oracle.iter().skip(out.len()).take(room.min(k)).copied().collect(), None)
+                let k = kind
+                    .split(':')
+                    .nth(1)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(3usize);
+                (
+                    oracle
+                        .iter()
+                        .skip(out.len())
+                        .take(room.min(k))
+                        .copied()
+                        .collect(),
+                    None,
+                )
             }
             _ if !oracle.is_empty() => {
                 // Oracle: the true continuation, with one token corrupted now and then.
@@ -372,7 +418,13 @@ fn decode_spec(
         let drafts = match (kind, fixed_gate) {
             ("mtp" | "hybrid", Some(g)) => {
                 // Fixed gate (TANG_FLASH_GATE=0.5): keep drafts while p >= g.
-                let d: Vec<u32> = e.mtp_last.iter().take_while(|x| x.1 >= g).take(room).map(|x| x.0).collect();
+                let d: Vec<u32> = e
+                    .mtp_last
+                    .iter()
+                    .take_while(|x| x.1 >= g)
+                    .take(room)
+                    .map(|x| x.0)
+                    .collect();
                 mtp_probs = e.mtp_last.iter().take(d.len()).map(|x| x.1).collect();
                 d
             }
@@ -452,14 +504,28 @@ fn spec_report(sp: &SpecStats) -> String {
         "{} windows, {:.2} tokens/window; widths {:?}; accepted by draft position:",
         sp.windows,
         sp.tokens as f64 / sp.windows.max(1) as f64,
-        sp.widths.iter().enumerate().filter(|(_, &c)| c > 0).map(|(w, c)| format!("T{w}:{c}")).collect::<Vec<_>>()
+        sp.widths
+            .iter()
+            .enumerate()
+            .filter(|(_, &c)| c > 0)
+            .map(|(w, c)| format!("T{w}:{c}"))
+            .collect::<Vec<_>>()
     );
     for (j, &(p, a)) in sp.by_pos.iter().enumerate() {
         if p > 0 {
-            s += &format!(" d{}={}/{} ({:.0}%)", j + 1, a, p, 100.0 * a as f64 / p as f64);
+            s += &format!(
+                " d{}={}/{} ({:.0}%)",
+                j + 1,
+                a,
+                p,
+                100.0 * a as f64 / p as f64
+            );
         }
     }
-    for (name, bp, wd) in [("thinking", &sp.by_pos_think, &sp.widths_think), ("answer", &sp.by_pos_answer, &sp.widths_answer)] {
+    for (name, bp, wd) in [
+        ("thinking", &sp.by_pos_think, &sp.widths_think),
+        ("answer", &sp.by_pos_answer, &sp.widths_answer),
+    ] {
         let w: usize = wd.iter().sum();
         if w == 0 {
             continue;
@@ -517,8 +583,19 @@ pub fn generate(args: &[String]) -> Result<()> {
     }
     let (out, stats, prefill_s, secs, sp) = decode_spec(&mut e, &ids, a.n, a.chunk, &a.draft)?;
     let vocab = e.vocab()?;
-    println!("prompt: {} tokens, prefill {:.2} s ({:.0} tok/s)", ids.len(), prefill_s, ids.len() as f64 / prefill_s);
-    println!("ids: {}", out.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" "));
+    println!(
+        "prompt: {} tokens, prefill {:.2} s ({:.0} tok/s)",
+        ids.len(),
+        prefill_s,
+        ids.len() as f64 / prefill_s
+    );
+    println!(
+        "ids: {}",
+        out.iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
     if !a.quiet {
         let g = crate::gguf::Gguf::open(&a.path)?;
         match super::tokenize::FlashTokenizer::from_gguf(&g).and_then(|t| t.decode(&out)) {
@@ -538,12 +615,24 @@ pub fn generate(args: &[String]) -> Result<()> {
     println!("speculation: {}", spec_report(&sp));
     println!("mean window: {}", split_line(&mean(&stats)));
     if let Some(cs) = e.cache_stats() {
-        println!("cache: hit rate {:.3} over the run ({} hits, {} misses, {} swaps)", cs.hit_rate(), cs.hits, cs.misses, cs.swaps);
+        println!(
+            "cache: hit rate {:.3} over the run ({} hits, {} misses, {} swaps)",
+            cs.hit_rate(),
+            cs.hits,
+            cs.misses,
+            cs.swaps
+        );
     }
     let (h, r) = e.ngram_stats();
     println!("n-gram rows: {r} reads, {h} cache hits");
     if let Some(p) = &a.out {
-        std::fs::write(p, out.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" "))?;
+        std::fs::write(
+            p,
+            out.iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(" "),
+        )?;
     }
     if let Some(p) = &a.dump_routing {
         e.save_routing(p)?;
@@ -649,11 +738,18 @@ pub fn parity(args: &[String]) -> Result<()> {
             a.chunk
         );
         for (pos, want, got, lp0, lp1) in misses.iter().take(12) {
-            println!("  top-1 differs at {pos}: ref {want} ({lp0:.3}, runner-up {lp1:.3}), engine {got}");
+            println!(
+                "  top-1 differs at {pos}: ref {want} ({lp0:.3}, runner-up {lp1:.3}), engine {got}"
+            );
         }
     }
     if let Some(cs) = e.cache_stats() {
-        println!("cache: hit rate {:.3} ({} hits, {} misses)", cs.hit_rate(), cs.hits, cs.misses);
+        println!(
+            "cache: hit rate {:.3} ({} hits, {} misses)",
+            cs.hit_rate(),
+            cs.hits,
+            cs.misses
+        );
     }
     if let Some(dir) = &a.dump {
         compare_dump(&e, dir, &probe)?;
@@ -666,12 +762,16 @@ pub fn parity(args: &[String]) -> Result<()> {
 
 fn read_f32(dir: &Path, name: &str) -> Result<Vec<f32>> {
     let b = std::fs::read(dir.join(format!("{name}.f32")))?;
-    Ok(b.chunks(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+    Ok(b.chunks(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
 }
 
 fn read_u32(dir: &Path, name: &str) -> Result<Vec<u32>> {
     let b = std::fs::read(dir.join(format!("{name}.u32")))?;
-    Ok(b.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+    Ok(b.chunks(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
 }
 
 fn rel(a: &[f32], b: &[f32]) -> f64 {
@@ -698,7 +798,12 @@ fn compare_dump(e: &Engine, dir: &Path, p: &Probe) -> Result<()> {
                 let want = read_u32(dir, &format!("L{l:02}.qsa_selected")).unwrap_or_default();
                 let same = *s == want;
                 let common = s.iter().filter(|c| want.binary_search(c).is_ok()).count();
-                format!(" qsa sel {} ({} of {} common)", if same { "identical" } else { "DIFFERS" }, common, want.len())
+                format!(
+                    " qsa sel {} ({} of {} common)",
+                    if same { "identical" } else { "DIFFERS" },
+                    common,
+                    want.len()
+                )
             }
             None => String::new(),
         };
@@ -746,19 +851,58 @@ pub fn bench(args: &[String]) -> Result<()> {
         w.sort_by(|a, b| a.total_cmp(b));
         w
     };
-    println!("flash-bench: context {} + {} new tokens, temp {}, drafts {}, graphs {}", ids.len(), a.n, a.temp, a.draft, e.use_graphs);
-    println!("  prefill            {:8.2} s ({:.0} tok/s, chunk {})", prefill_s, ids.len() as f64 / prefill_s, a.chunk);
-    println!("  decode             {:8.1} tok/s ({} tokens in {:.3} s)", tps, sp.tokens, secs);
+    println!(
+        "flash-bench: context {} + {} new tokens, temp {}, drafts {}, graphs {}",
+        ids.len(),
+        a.n,
+        a.temp,
+        a.draft,
+        e.use_graphs
+    );
+    println!(
+        "  prefill            {:8.2} s ({:.0} tok/s, chunk {})",
+        prefill_s,
+        ids.len() as f64 / prefill_s,
+        a.chunk
+    );
+    println!(
+        "  decode             {:8.1} tok/s ({} tokens in {:.3} s)",
+        tps, sp.tokens, secs
+    );
     println!("  speculation        {}", spec_report(&sp));
-    println!("  window wall        {:8.3} ms mean, {:.3} median, {:.3} p90", m.wall_ms, walls[walls.len() / 2], walls[walls.len() * 9 / 10]);
+    println!(
+        "  window wall        {:8.3} ms mean, {:.3} median, {:.3} p90",
+        m.wall_ms,
+        walls[walls.len() / 2],
+        walls[walls.len() * 9 / 10]
+    );
     println!("  GPU (graph)        {:8.3} ms", m.gpu_ms);
-    println!("    waiting for plan {:8.3} ms  (handoff A)", m.gpu_wait_a_ms);
-    println!("    waiting for CPU  {:8.3} ms  (CPU-miss time exposed)", m.gpu_wait_b_ms);
-    println!("  host prep          {:8.3} ms  (embedding; n-gram rows are read during layer 0)", m.host_prep_ms);
-    println!("  host: launch..served {:6.3} ms, ..drained {:.3} ms, boundary+tables {:.3} ms", m.serve_ms, m.drain_ms, m.post_ms);
+    println!(
+        "    waiting for plan {:8.3} ms  (handoff A)",
+        m.gpu_wait_a_ms
+    );
+    println!(
+        "    waiting for CPU  {:8.3} ms  (CPU-miss time exposed)",
+        m.gpu_wait_b_ms
+    );
+    println!(
+        "  host prep          {:8.3} ms  (embedding; n-gram rows are read during layer 0)",
+        m.host_prep_ms
+    );
+    println!(
+        "  host: launch..served {:6.3} ms, ..drained {:.3} ms, boundary+tables {:.3} ms",
+        m.serve_ms, m.drain_ms, m.post_ms
+    );
     println!("  host plan          {:8.3} ms", m.plan_ms);
-    println!("  after window: commit launch {:.3} ms, cache boundary + tables {:.3} ms", m.commit_host_ms, m.boundary_ms);
-    println!("  host CPU experts   {:8.3} ms ({:.1} of 48 layers/window without a doorbell wait)", m.cpu_ms, m.skipped as f64 / timed.len().max(1) as f64);
+    println!(
+        "  after window: commit launch {:.3} ms, cache boundary + tables {:.3} ms",
+        m.commit_host_ms, m.boundary_ms
+    );
+    println!(
+        "  host CPU experts   {:8.3} ms ({:.1} of 48 layers/window without a doorbell wait)",
+        m.cpu_ms,
+        m.skipped as f64 / timed.len().max(1) as f64
+    );
     println!(
         "  experts            {:.1} distinct/window, {:.2} on the CPU/window, {:.2} over PCIe/window, VRAM hit rate {:.3}, swaps {}",
         m.distinct as f64 / timed.len() as f64,
@@ -769,15 +913,34 @@ pub fn bench(args: &[String]) -> Result<()> {
     );
     let (h, r) = e.ngram_stats();
     println!("  n-gram rows        {r} reads, {h} cache hits");
-    println!("  first tokens: {}", out.iter().take(16).map(|v| v.to_string()).collect::<Vec<_>>().join(" "));
+    println!(
+        "  first tokens: {}",
+        out.iter()
+            .take(16)
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
     if a.prompt.is_some() && !a.quiet {
         let g = crate::gguf::Gguf::open(&a.path)?;
         let t = super::tokenize::FlashTokenizer::from_gguf(&g)?;
         let text = t.decode(&out)?;
-        println!("  text: {}", text.chars().take(600).collect::<String>().replace('\n', "\\n"));
+        println!(
+            "  text: {}",
+            text.chars()
+                .take(600)
+                .collect::<String>()
+                .replace('\n', "\\n")
+        );
     }
     if let Some(p) = &a.out {
-        std::fs::write(p, out.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" "))?;
+        std::fs::write(
+            p,
+            out.iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(" "),
+        )?;
     }
     if let Some(p) = &a.dump_routing {
         e.save_routing(p)?;
@@ -802,9 +965,23 @@ pub fn spec_test(args: &[String]) -> Result<()> {
         e.seed = a.seed;
         let (base, _, _, s0, sp0) = decode_spec(&mut e, &ids, a.n, a.chunk, "none")?;
         let f = std::env::temp_dir().join(format!("flash-oracle-{}.ids", std::process::id()));
-        std::fs::write(&f, base.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" "))?;
-        println!("temp {temp}: none   {:.1} tok/s  first {:?}", sp0.tokens as f64 / s0, &base[..base.len().min(12)]);
-        let mut kinds = vec!["suffix".to_string(), "wrong".to_string(), format!("oracle:{}", f.display())];
+        std::fs::write(
+            &f,
+            base.iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(" "),
+        )?;
+        println!(
+            "temp {temp}: none   {:.1} tok/s  first {:?}",
+            sp0.tokens as f64 / s0,
+            &base[..base.len().min(12)]
+        );
+        let mut kinds = vec![
+            "suffix".to_string(),
+            "wrong".to_string(),
+            format!("oracle:{}", f.display()),
+        ];
         if e.has_mtp() {
             kinds.insert(0, "mtp".into());
             kinds.insert(1, "hybrid".into());
@@ -826,7 +1003,14 @@ pub fn spec_test(args: &[String]) -> Result<()> {
         }
         let _ = std::fs::remove_file(&f);
     }
-    println!("{}", if ok { "spec test: PASS" } else { "spec test: FAIL" });
+    println!(
+        "{}",
+        if ok {
+            "spec test: PASS"
+        } else {
+            "spec test: FAIL"
+        }
+    );
     Ok(())
 }
 
@@ -870,10 +1054,21 @@ pub fn tcheck(args: &[String]) -> Result<()> {
         };
         runs.push((mode.to_string(), logits, probe));
     }
-    let bits = |x: &[f32], y: &[f32]| x.iter().zip(y).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+    let bits = |x: &[f32], y: &[f32]| {
+        x.iter()
+            .zip(y)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count()
+    };
     for i in 1..runs.len() {
         let (a0, b0) = (&runs[0], &runs[i]);
-        println!("{} vs {}: logits differ in {} of {} entries", a0.0, b0.0, bits(&a0.1, &b0.1), v);
+        println!(
+            "{} vs {}: logits differ in {} of {} entries",
+            a0.0,
+            b0.0,
+            bits(&a0.1, &b0.1),
+            v
+        );
         let mut first = None;
         for l in 0..e.hp.n_layer {
             let d = [
@@ -883,7 +1078,10 @@ pub fn tcheck(args: &[String]) -> Result<()> {
             ];
             if d.iter().any(|x| x.1 > 0) && first.is_none() {
                 first = Some(l);
-                println!("  first difference at layer {l}: {d:?}, router ids {:?} vs {:?}", a0.2.router_ids[l], b0.2.router_ids[l]);
+                println!(
+                    "  first difference at layer {l}: {d:?}, router ids {:?} vs {:?}",
+                    a0.2.router_ids[l], b0.2.router_ids[l]
+                );
             }
         }
         if first.is_none() {

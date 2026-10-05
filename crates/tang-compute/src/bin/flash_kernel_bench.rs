@@ -974,11 +974,22 @@ fn stack(g: &CudaComputeDevice) {
         (
             "GDN w_in IQ4_XS 10240 | Q4_K 6144 | bf16 48 | bf16 48",
             2560,
-            vec![(Some(NatType::Iq4Xs), 10240), (Some(NatType::Q4K), 6144), (None, 48), (None, 48)],
+            vec![
+                (Some(NatType::Iq4Xs), 10240),
+                (Some(NatType::Q4K), 6144),
+                (None, 48),
+                (None, 48),
+            ],
         ),
-        ("shared gate IQ4_XS 640 | up Q3_K 640", 2560, vec![(Some(NatType::Iq4Xs), 640), (Some(NatType::Q3K), 640)]),
+        (
+            "shared gate IQ4_XS 640 | up Q3_K 640",
+            2560,
+            vec![(Some(NatType::Iq4Xs), 640), (Some(NatType::Q3K), 640)],
+        ),
     ];
-    println!("stacked native GEMV: one launch vs one per segment, us per projection (48 in a graph)");
+    println!(
+        "stacked native GEMV: one launch vs one per segment, us per projection (48 in a graph)"
+    );
     for (name, k, parts) in cases {
         let n: usize = parts.iter().map(|p| p.1).sum();
         let stacks: Vec<_> = (0..48)
@@ -986,8 +997,12 @@ fn stack(g: &CudaComputeDevice) {
                 let (mut segs, mut off) = (vec![], 0);
                 for &(ty, rows) in &parts {
                     let w = match ty {
-                        Some(ty) => g.upload_native(ty, &random_gguf(ty, rows, k, rng.u()), rows, k),
-                        None => g.upload_bf16(&(0..rows * k).map(|_| bf16(rng.f(0.05))).collect::<Vec<_>>()),
+                        Some(ty) => {
+                            g.upload_native(ty, &random_gguf(ty, rows, k, rng.u()), rows, k)
+                        }
+                        None => g.upload_bf16(
+                            &(0..rows * k).map(|_| bf16(rng.f(0.05))).collect::<Vec<_>>(),
+                        ),
                     };
                     segs.push(NatSeg { ty, w, rows, off });
                     off += rows;
@@ -1009,16 +1024,26 @@ fn stack(g: &CudaComputeDevice) {
                         } else {
                             for sg in &st.segs {
                                 match sg.ty {
-                                    Some(ty) => g.native_linear_out_into(ty, &xq, &sg.w, &mut y, sg.off, n, t, k, sg.rows),
-                                    None => g.bf16_linear_out_into(&x, &sg.w, &mut y, sg.off, n, t, k, sg.rows),
+                                    Some(ty) => g.native_linear_out_into(
+                                        ty, &xq, &sg.w, &mut y, sg.off, n, t, k, sg.rows,
+                                    ),
+                                    None => g.bf16_linear_out_into(
+                                        &x, &sg.w, &mut y, sg.off, n, t, k, sg.rows,
+                                    ),
                                 }
                             }
                         }
                     }
                 });
                 graph.launch().unwrap();
-                let ms = (0..5).map(|_| g.event_ms(&mut || graph.launch().unwrap())).fold(f32::INFINITY, f32::min);
-                line += &format!(" T={t} {}: {:.1}", if stacked { "stacked" } else { "separate" }, ms as f64 * 1e3 / 48.0);
+                let ms = (0..5)
+                    .map(|_| g.event_ms(&mut || graph.launch().unwrap()))
+                    .fold(f32::INFINITY, f32::min);
+                line += &format!(
+                    " T={t} {}: {:.1}",
+                    if stacked { "stacked" } else { "separate" },
+                    ms as f64 * 1e3 / 48.0
+                );
             }
         }
         println!("{line}");
@@ -1192,7 +1217,10 @@ fn unfused() -> bool {
 
 /// `FKB_T=1,4,16`: window widths for the native and hc sweeps.
 fn widths(default: &[usize]) -> Vec<usize> {
-    std::env::var("FKB_T").ok().map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_else(|| default.to_vec())
+    std::env::var("FKB_T")
+        .ok()
+        .map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
+        .unwrap_or_else(|| default.to_vec())
 }
 
 fn main() {

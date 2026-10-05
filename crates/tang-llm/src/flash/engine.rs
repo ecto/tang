@@ -158,13 +158,28 @@ fn gemv_grid(n: usize, row16: i32) -> (u32, u32) {
 
 /// Shared memory per warp for a native GEMV's staged rows (bf16 rows aren't staged).
 fn row16(segs: &[[u64; 5]]) -> i32 {
-    let rb = segs.iter().filter(|s| s[0] != 30 && s[0] != 0).map(|s| s[2]).max().unwrap_or(0);
+    let rb = segs
+        .iter()
+        .filter(|s| s[0] != 30 && s[0] != 0)
+        .map(|s| s[2])
+        .max()
+        .unwrap_or(0);
     ((rb + 15).div_ceil(16) + 1) as i32
 }
 
 impl Dw {
     #[allow(clippy::too_many_arguments)]
-    fn apply(&self, dev: &CudaComputeDevice, nk: &NativeK, x: &B, xq: &B, out: &mut B, t: usize, k: usize, n: usize) {
+    fn apply(
+        &self,
+        dev: &CudaComputeDevice,
+        nk: &NativeK,
+        x: &B,
+        xq: &B,
+        out: &mut B,
+        t: usize,
+        k: usize,
+        n: usize,
+    ) {
         match self {
             Dw::Bf16(b) => dev.linear_into(x, b, out, t, k, n),
             Dw::Q4x(b) => dev.q4x_linear_into(xq, b, out, t, k, n),
@@ -172,9 +187,19 @@ impl Dw {
                 assert_eq!(*width, n, "native GEMV rows");
                 for (seg, rows, off) in segs {
                     match seg {
-                        KSeg::Nat(b, ty) => dev.native_linear_out_into(*ty, xq, b, out, *off, n, t, k, *rows),
+                        KSeg::Nat(b, ty) => {
+                            dev.native_linear_out_into(*ty, xq, b, out, *off, n, t, k, *rows)
+                        }
                         KSeg::Bf(b) => dev.bf16_linear_out_into(x, b, out, *off, n, t, k, *rows),
-                        KSeg::Own(d) => d.native_ptr(dev, nk, dev.buffer_addr(x), dev.buffer_addr(out) + (*off * 4) as u64, t, k, n),
+                        KSeg::Own(d) => d.native_ptr(
+                            dev,
+                            nk,
+                            dev.buffer_addr(x),
+                            dev.buffer_addr(out) + (*off * 4) as u64,
+                            t,
+                            k,
+                            n,
+                        ),
                     }
                 }
             }
@@ -192,8 +217,24 @@ impl Dw {
     /// Native GEMV on raw addresses: `t` rows of f32 `x` (`k` wide) at `xp`, outputs
     /// `out[t · ostride + seg offset + row]` at `op`.
     #[allow(clippy::too_many_arguments)]
-    fn native_ptr(&self, dev: &CudaComputeDevice, nk: &NativeK, xp: u64, op: u64, t: usize, k: usize, ostride: usize) {
-        let Dw::Native { segs, nseg, rows, row16, .. } = self else {
+    fn native_ptr(
+        &self,
+        dev: &CudaComputeDevice,
+        nk: &NativeK,
+        xp: u64,
+        op: u64,
+        t: usize,
+        k: usize,
+        ostride: usize,
+    ) {
+        let Dw::Native {
+            segs,
+            nseg,
+            rows,
+            row16,
+            ..
+        } = self
+        else {
             panic!("native_ptr on a non-native weight")
         };
         // Wider than MAX_T (wide prefill): slices of MAX_T tokens (each row's arithmetic doesn't
@@ -201,15 +242,37 @@ impl Dw {
         if t > MAX_T {
             for i in (0..t).step_by(MAX_T) {
                 let n = MAX_T.min(t - i);
-                self.native_ptr(dev, nk, xp + (i * k * 4) as u64, op + (i * ostride * 4) as u64, n, k, ostride);
+                self.native_ptr(
+                    dev,
+                    nk,
+                    xp + (i * k * 4) as u64,
+                    op + (i * ostride * 4) as u64,
+                    n,
+                    k,
+                    ostride,
+                );
             }
             return;
         }
-        let (sp, ns, os, r16, xq, ki) = (dev.buffer_addr(segs), *nseg, ostride as i32, *row16, nk.xq8, k as i32);
+        let (sp, ns, os, r16, xq, ki) = (
+            dev.buffer_addr(segs),
+            *nseg,
+            ostride as i32,
+            *row16,
+            nk.xq8,
+            k as i32,
+        );
         let s = ManuallyDrop::new(Stream(nk.stream));
         unsafe {
-            gpu::launch(nk.q8, ((k / 32) as u32, t as u32, 1), (32, 1, 1), 0, &s, tang_moe::args![xp, xq, ki])
-                .expect("fe_q8 launch");
+            gpu::launch(
+                nk.q8,
+                ((k / 32) as u32, t as u32, 1),
+                (32, 1, 1),
+                0,
+                &s,
+                tang_moe::args![xp, xq, ki],
+            )
+            .expect("fe_q8 launch");
             gpu::launch(
                 nk.f8[t - 1],
                 (rows.div_ceil(8) as u32, 1, 1),
@@ -517,7 +580,10 @@ pub struct Engine {
     mtp: Option<Box<Mtp>>,
     pub last_mtp_ms: f64,
     probe_buf: Option<B>,
-    train_dump: Option<(std::io::BufWriter<std::fs::File>, std::io::BufWriter<std::fs::File>)>,
+    train_dump: Option<(
+        std::io::BufWriter<std::fs::File>,
+        std::io::BufWriter<std::fs::File>,
+    )>,
     pub last_commit_ms: f64,
     pub last_mtp_gpu_ms: f64,
     defer_boundary: bool,
@@ -574,7 +640,9 @@ impl Engine {
         );
         let plep = hp.ple.clone().context("no PLE block")?;
         let dir = pack::cache_dir(path)?;
-        let warm = dir.join(format!("dense.{}.json", pack::dense_tag())).exists()
+        let warm = dir
+            .join(format!("dense.{}.json", pack::dense_tag()))
+            .exists()
             && dir.join(pack::EXPERTS_FILE).exists();
         let (entries, dense_path) =
             pack::dense(&g, &dir, hp.n_layer, &hp.is_recurrent, Some(plep.layer))?;
@@ -593,12 +661,16 @@ impl Engine {
         let by = pack::by_name(&entries);
         let df = std::fs::File::open(&dense_path)?;
         let get = |name: &str| -> Result<B> {
-            let e = by.get(name).with_context(|| format!("pack has no {name}"))?;
+            let e = by
+                .get(name)
+                .with_context(|| format!("pack has no {name}"))?;
             let b = pack::read_entry(&df, e)?;
             Ok(upload_entry(&dev, e, &b))
         };
         let dw = |name: &str| -> Result<Dw> {
-            let e = by.get(name).with_context(|| format!("pack has no {name}"))?;
+            let e = by
+                .get(name)
+                .with_context(|| format!("pack has no {name}"))?;
             let w = get(name)?;
             Ok(match e.fmt {
                 Fmt::Bf16 => Dw::Bf16(w),
@@ -610,18 +682,33 @@ impl Engine {
                     drop(w);
                     let mut segs = Vec::new();
                     for &[ty, rows, rb, off, out] in &e.segs {
-                        let (rows, rb, off, out) = (rows as usize, rb as usize, off as usize, out as usize);
+                        let (rows, rb, off, out) =
+                            (rows as usize, rb as usize, off as usize, out as usize);
                         let bytes = &raw[off..off + rows * rb];
                         let seg = match tang_compute::flash_native::NatType::from_ggml(ty as u32) {
                             Some(nt) => KSeg::Nat(dev.upload_native(nt, bytes, rows, e.k), nt),
-                            None if ty == 30 && std::env::var("TANG_FLASH_BF16_OWN").is_err() => KSeg::Bf(
-                                dev.upload_bf16(&bytes.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect::<Vec<_>>()),
-                            ),
+                            None if ty == 30 && std::env::var("TANG_FLASH_BF16_OWN").is_err() => {
+                                KSeg::Bf(
+                                    dev.upload_bf16(
+                                        &bytes
+                                            .chunks(2)
+                                            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                                            .collect::<Vec<_>>(),
+                                    ),
+                                )
+                            }
                             None => {
                                 let wb = super::mtp_gpu::upload_padded(&dev, bytes);
                                 let p = dev.buffer_addr(&wb);
                                 KSeg::Own(Dw::Native {
-                                    segs: dev.upload_u32(&[p as u32, (p >> 32) as u32, ty as u32, rows as u32, rb as u32, 0]),
+                                    segs: dev.upload_u32(&[
+                                        p as u32,
+                                        (p >> 32) as u32,
+                                        ty as u32,
+                                        rows as u32,
+                                        rb as u32,
+                                        0,
+                                    ]),
                                     _w: wb,
                                     nseg: 1,
                                     rows,
@@ -631,14 +718,26 @@ impl Engine {
                         };
                         segs.push((seg, rows, out));
                     }
-                    let stackable = segs.iter().all(|(s, _, _)| matches!(s, KSeg::Nat(..) | KSeg::Bf(_)));
+                    let stackable = segs
+                        .iter()
+                        .all(|(s, _, _)| matches!(s, KSeg::Nat(..) | KSeg::Bf(_)));
                     if stackable && !std::env::var("TANG_FLASH_KSTACK").is_ok_and(|v| v == "0") {
                         use tang_compute::flash_native::NatSeg;
                         let st: Vec<NatSeg<B>> = segs
                             .into_iter()
                             .map(|(s, rows, off)| match s {
-                                KSeg::Nat(w, ty) => NatSeg { ty: Some(ty), w, rows, off },
-                                KSeg::Bf(w) => NatSeg { ty: None, w, rows, off },
+                                KSeg::Nat(w, ty) => NatSeg {
+                                    ty: Some(ty),
+                                    w,
+                                    rows,
+                                    off,
+                                },
+                                KSeg::Bf(w) => NatSeg {
+                                    ty: None,
+                                    w,
+                                    rows,
+                                    off,
+                                },
                                 KSeg::Own(_) => unreachable!(),
                             })
                             .collect();
@@ -654,7 +753,14 @@ impl Engine {
                         .iter()
                         .flat_map(|&[ty, rows, rb, off, out]| {
                             let p = base + off;
-                            [p as u32, (p >> 32) as u32, ty as u32, rows as u32, rb as u32, out as u32]
+                            [
+                                p as u32,
+                                (p >> 32) as u32,
+                                ty as u32,
+                                rows as u32,
+                                rb as u32,
+                                out as u32,
+                            ]
                         })
                         .collect();
                     Dw::Native {
@@ -671,11 +777,17 @@ impl Engine {
         // A bf16 matrix through fe_gemv's pinned fma chains (the kernel track's bf16 GEMV
         // contracts differently per window width).
         let bf16_native = |name: &str| -> Result<Dw> {
-            let e = by.get(name).with_context(|| format!("pack has no {name}"))?;
+            let e = by
+                .get(name)
+                .with_context(|| format!("pack has no {name}"))?;
             ensure!(e.fmt == Fmt::Bf16, "{name} isn't bf16");
             let raw = pack::read_entry(&df, e)?;
             if std::env::var("TANG_FLASH_BF16_OWN").is_err() {
-                let w = dev.upload_bf16(&raw.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect::<Vec<_>>());
+                let w = dev.upload_bf16(
+                    &raw.chunks(2)
+                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .collect::<Vec<_>>(),
+                );
                 return Ok(Dw::Kn(vec![(KSeg::Bf(w), e.n, 0)], e.n));
             }
             let w = super::mtp_gpu::upload_padded(&dev, &raw);
@@ -697,7 +809,9 @@ impl Engine {
             if hc_q8 {
                 let q8 = |part: &str, n: usize, k: usize| -> Result<B> {
                     let name = format!("{key}.{part}.q8");
-                    let e = by.get(name.as_str()).with_context(|| format!("pack has no {name}"))?;
+                    let e = by
+                        .get(name.as_str())
+                        .with_context(|| format!("pack has no {name}"))?;
                     ensure!((e.n, e.k) == (n, k), "{name}: {}x{} vs {n}x{k}", e.n, e.k);
                     Ok(dev.upload_bytes(&pack::read_entry(&df, e)?))
                 };
@@ -706,7 +820,11 @@ impl Engine {
                     norm: get(&format!("{key}.norm"))?,
                     down: q8("down", HC_LR, w)?,
                     up: q8("up", w, HC_LR)?,
-                    inject: if inject { Some(q8("inject", HC, w)?) } else { None },
+                    inject: if inject {
+                        Some(q8("inject", HC, w)?)
+                    } else {
+                        None
+                    },
                     q8: true,
                 });
             }
@@ -783,7 +901,10 @@ impl Engine {
                 ensure!(e.fmt == Fmt::Q2Raw, "ple.key must be Q2_0");
                 let raw = pack::read_entry(&std::fs::File::open(&dense_path)?, e)?;
                 let nt = tang_compute::flash_native::NatType::Q2_0;
-                Dw::Kn(vec![(KSeg::Nat(dev.upload_native(nt, &raw, e.n, e.k), nt), e.n, 0)], e.n)
+                Dw::Kn(
+                    vec![(KSeg::Nat(dev.upload_native(nt, &raw, e.n, e.k), nt), e.n, 0)],
+                    e.n,
+                )
             },
             value: bf16_native("ple.value")?,
             nk: get("ple.nk")?,
@@ -850,14 +971,35 @@ impl Engine {
             .map_err(|e| anyhow!("{e}"))?;
         let f = |m: &Module, n: &str| m.func(n).map_err(|e| anyhow!("{e}"));
         let gm = gpu.module(kernels::GEMV_SRC).map_err(|e| anyhow!("{e}"))?;
-        let names = ["fe_gemv_t1", "fe_gemv_t2", "fe_gemv_t3", "fe_gemv_t4", "fe_gemv_t5", "fe_gemv_t6", "fe_gemv_t7", "fe_gemv_t8"];
+        let names = [
+            "fe_gemv_t1",
+            "fe_gemv_t2",
+            "fe_gemv_t3",
+            "fe_gemv_t4",
+            "fe_gemv_t5",
+            "fe_gemv_t6",
+            "fe_gemv_t7",
+            "fe_gemv_t8",
+        ];
         let mut fs = [std::ptr::null_mut(); MAX_T];
         for (i, n) in names.iter().enumerate() {
             fs[i] = f(&gm, n)?;
         }
         let mut f8s = [std::ptr::null_mut(); MAX_T];
         for (i, slot) in f8s.iter_mut().enumerate() {
-            *slot = f(&gm, ["fe_gemv8_t1", "fe_gemv8_t2", "fe_gemv8_t3", "fe_gemv8_t4", "fe_gemv8_t5", "fe_gemv8_t6", "fe_gemv8_t7", "fe_gemv8_t8"][i])?;
+            *slot = f(
+                &gm,
+                [
+                    "fe_gemv8_t1",
+                    "fe_gemv8_t2",
+                    "fe_gemv8_t3",
+                    "fe_gemv8_t4",
+                    "fe_gemv8_t5",
+                    "fe_gemv8_t6",
+                    "fe_gemv8_t7",
+                    "fe_gemv8_t8",
+                ][i],
+            )?;
         }
         for &f8 in &f8s {
             // Rows of up to ~12 KB staged per warp (Q8_0 at k = 6144 is 6.5 KB; 8 warps).
@@ -913,7 +1055,13 @@ impl Engine {
         };
         let mb = Mailbox::new(&gpu).map_err(|e| anyhow!("{e}"))?;
         let mut io = Io {
-            arena: HostArena::new(Io::BYTES, ArenaOptions { try_hugetlb: false, thp: false })?,
+            arena: HostArena::new(
+                Io::BYTES,
+                ArenaOptions {
+                    try_hugetlb: false,
+                    thp: false,
+                },
+            )?,
         };
         io.arena
             .register(&gpu.ctx, &[])
@@ -931,7 +1079,11 @@ impl Engine {
                     "flash: MTP layer loaded in {:.1} s, {:.2} GB VRAM (experts {})",
                     t.elapsed().as_secs_f64(),
                     (free_a - free_b) as f64 / 1e9,
-                    match m.ex_ty { 8 => "Q8_0", 42 => "Q2_0", _ => "Q4_0" }
+                    match m.ex_ty {
+                        8 => "Q8_0",
+                        42 => "Q2_0",
+                        _ => "Q4_0",
+                    }
                 );
                 Some(m)
             }
@@ -999,15 +1151,29 @@ impl Engine {
         };
         let t_experts = t2.elapsed().as_secs_f64();
         let (free2, _) = gpu.mem_info().map_err(|e| anyhow!("{e}"))?;
-        let tables: Vec<B> = (0..hp.n_layer).map(|_| dev.alloc_f32(2 * EXPERTS)).collect();
-        let host_tables: Vec<B> = (0..hp.n_layer).map(|_| dev.alloc_f32(2 * EXPERTS)).collect();
+        let tables: Vec<B> = (0..hp.n_layer)
+            .map(|_| dev.alloc_f32(2 * EXPERTS))
+            .collect();
+        let host_tables: Vec<B> = (0..hp.n_layer)
+            .map(|_| dev.alloc_f32(2 * EXPERTS))
+            .collect();
         let host_addrs = {
-            let mut a = HostArena::new(48 * EXPERTS * 8, ArenaOptions { try_hugetlb: false, thp: false })?;
+            let mut a = HostArena::new(
+                48 * EXPERTS * 8,
+                ArenaOptions {
+                    try_hugetlb: false,
+                    thp: false,
+                },
+            )?;
             a.register(&gpu.ctx, &[]).map_err(|e| anyhow!("{e}"))?;
-            unsafe { std::slice::from_raw_parts_mut(a.as_ptr() as *mut u64, 48 * EXPERTS) }.fill(u64::MAX);
+            unsafe { std::slice::from_raw_parts_mut(a.as_ptr() as *mut u64, 48 * EXPERTS) }
+                .fill(u64::MAX);
             a
         };
-        let mut exec = MissExec::new(Pool::new(&Pool::default_cpus(), std::time::Duration::from_millis(20)), Isa::detect());
+        let mut exec = MissExec::new(
+            Pool::new(&Pool::default_cpus(), std::time::Duration::from_millis(20)),
+            Isa::detect(),
+        );
         exec.tiled = true;
         let ngram = std::sync::Arc::new(NgramTable::open(&g, &plep)?);
         let load_report = format!(
@@ -1079,7 +1245,10 @@ impl Engine {
             last_mtp_gpu_ms: 0.0,
             defer_boundary: false,
             pending_boundary: false,
-            pcie_cap: std::env::var("TANG_FLASH_PCIE_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            pcie_cap: std::env::var("TANG_FLASH_PCIE_CAP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
             side: Stream::new().map_err(|e| anyhow!("{e}"))?,
             use_mtp: false,
             mtp_last: Vec::new(),
@@ -1105,7 +1274,11 @@ impl Engine {
             return Ok(uniform);
         };
         let b = std::fs::read(p).with_context(|| format!("reading profile {}", p.display()))?;
-        ensure!(b.len() == n_layer * EXPERTS * 4, "profile {} has the wrong size", p.display());
+        ensure!(
+            b.len() == n_layer * EXPERTS * 4,
+            "profile {} has the wrong size",
+            p.display()
+        );
         let counts: Vec<u32> = b
             .chunks(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -1141,7 +1314,13 @@ impl Engine {
 
     // ---- launch helpers
 
-    unsafe fn launch(&self, f: Fun, grid: (u32, u32, u32), block: u32, args: &mut [*mut std::ffi::c_void]) {
+    unsafe fn launch(
+        &self,
+        f: Fun,
+        grid: (u32, u32, u32),
+        block: u32,
+        args: &mut [*mut std::ffi::c_void],
+    ) {
         gpu::launch(f, grid, (block, 1, 1), 0, &self.stream, args).expect("launch");
     }
 
@@ -1166,8 +1345,15 @@ impl Engine {
         let n = (bytes / 4) as i32;
         let s = ManuallyDrop::new(Stream(stream));
         unsafe {
-            gpu::launch(self.k.copy, ((n as u32).div_ceil(256).max(1), 1, 1), (256, 1, 1), 0, &s, tang_moe::args![dst, src, n])
-                .expect("kcopy")
+            gpu::launch(
+                self.k.copy,
+                ((n as u32).div_ceil(256).max(1), 1, 1),
+                (256, 1, 1),
+                0,
+                &s,
+                tang_moe::args![dst, src, n],
+            )
+            .expect("kcopy")
         };
     }
 
@@ -1178,19 +1364,34 @@ impl Engine {
     /// Copy the window's inputs from pinned staging (graph nodes).
     fn enqueue_inputs(&self, t: usize) {
         self.kcopy(self.dev.buffer_addr(&self.s.ctl), self.io_dev(Io::CTL), 32);
-        self.kcopy(self.dev.buffer_addr(&self.s.emb), self.io_dev(Io::EMB), t * HIDDEN * 4);
+        self.kcopy(
+            self.dev.buffer_addr(&self.s.emb),
+            self.io_dev(Io::EMB),
+            t * HIDDEN * 4,
+        );
     }
 
     fn enqueue_outputs(&self, t: usize) {
-        self.kcopy(self.io_dev(Io::IDS), self.dev.buffer_addr(&self.s.out_ids), t * 4);
+        self.kcopy(
+            self.io_dev(Io::IDS),
+            self.dev.buffer_addr(&self.s.out_ids),
+            t * 4,
+        );
         if self.opts.split {
-            self.kcopy(self.io_dev(Io::STAMPS), self.dev.buffer_addr(&self.s.stamps), 48 * 8 * 8);
+            self.kcopy(
+                self.io_dev(Io::STAMPS),
+                self.dev.buffer_addr(&self.s.stamps),
+                48 * 8 * 8,
+            );
         }
     }
 
     /// The embedding into every stream.
     fn enqueue_embed(&mut self, t: usize) {
-        let (r, e) = (Self::addr(&self.s.r, &self.dev), Self::addr(&self.s.emb, &self.dev));
+        let (r, e) = (
+            Self::addr(&self.s.r, &self.dev),
+            Self::addr(&self.s.emb, &self.dev),
+        );
         self.stamp(0);
         unsafe {
             self.launch(
@@ -1230,16 +1431,45 @@ impl Engine {
                 self.dev.buffer_addr(&self.s.out_ids),
             );
             unsafe {
-                gpu::launch(self.k.wait, (1, 1, 1), (32, 1, 1), 0, &self.stream, tang_moe::args![mb, flag, ctlw, layer, src, n, dst])
-                    .expect("launch");
+                gpu::launch(
+                    self.k.wait,
+                    (1, 1, 1),
+                    (32, 1, 1),
+                    0,
+                    &self.stream,
+                    tang_moe::args![mb, flag, ctlw, layer, src, n, dst],
+                )
+                .expect("launch");
             }
-            self.kcopy(self.dev.buffer_addr(&self.s.ple_e), self.io_dev(Io::PLE), t * HIDDEN * 4);
+            self.kcopy(
+                self.dev.buffer_addr(&self.s.ple_e),
+                self.io_dev(Io::PLE),
+                t * HIDDEN * 4,
+            );
         }
         let dev = &self.dev;
         let s = &mut self.s;
         dev.quantize_act_into(&s.ple_e, &mut s.ple_eq, t, HIDDEN);
-        self.ple.key.apply(dev, &self.nk, &s.ple_e, &s.ple_eq, &mut s.ple_key, t, HIDDEN, HC * HIDDEN);
-        self.ple.value.apply(dev, &self.nk, &s.ple_e, &s.ple_eq, &mut s.ple_val, t, HIDDEN, HIDDEN);
+        self.ple.key.apply(
+            dev,
+            &self.nk,
+            &s.ple_e,
+            &s.ple_eq,
+            &mut s.ple_key,
+            t,
+            HIDDEN,
+            HC * HIDDEN,
+        );
+        self.ple.value.apply(
+            dev,
+            &self.nk,
+            &s.ple_e,
+            &s.ple_eq,
+            &mut s.ple_val,
+            t,
+            HIDDEN,
+            HIDDEN,
+        );
         let a = |b: &B| dev.buffer_addr(b);
         let (r, key, val, nk, nq, nc, conv, ring, ctl) = (
             a(&s.r),
@@ -1294,7 +1524,9 @@ impl Engine {
             (_, Some(q)) => &mut q.proj,
             _ => unreachable!(),
         };
-        layer.w_in.apply(dev, &self.nk, &s.x, &s.xq, proj, t, HIDDEN, layer.in_rows);
+        layer
+            .w_in
+            .apply(dev, &self.nk, &s.x, &s.xq, proj, t, HIDDEN, layer.in_rows);
         if !layer.w_in.native() {
             dev.linear_into(&s.x, &layer.side, &mut s.side, t, HIDDEN, layer.side_rows);
             let (dst, stride, off, src, w) = (
@@ -1343,7 +1575,9 @@ impl Engine {
             if !verify {
                 dev.gdn_conv_commit(&mut g.hist, &g.proj, GDN_PROJ, &s.ctl, t);
             }
-            layer.w_out.apply(dev, &self.nk, &s.y, &s.yq, &mut s.mix, t, GDN_V, HIDDEN);
+            layer
+                .w_out
+                .apply(dev, &self.nk, &s.y, &s.yq, &mut s.mix, t, GDN_V, HIDDEN);
         }
         if let Some(q) = layer.qsa.as_mut() {
             let norms = QsaNorms {
@@ -1370,7 +1604,15 @@ impl Engine {
                 EPS,
             );
             let max_blocks = self.opts.max_ctx.next_multiple_of(16) / IDX_BLOCK;
-            dev.qsa_select_into(&q.pooled, &s.q, &s.ctl, &mut s.scores, &mut s.sel, max_blocks, t);
+            dev.qsa_select_into(
+                &q.pooled,
+                &s.q,
+                &s.ctl,
+                &mut s.scores,
+                &mut s.sel,
+                max_blocks,
+                t,
+            );
             dev.qsa_attend_into(
                 &s.q,
                 &q.k,
@@ -1384,7 +1626,9 @@ impl Engine {
                 Some(&mut s.yq),
                 t,
             );
-            layer.w_out.apply(dev, &self.nk, &s.attn, &s.yq, &mut s.mix, t, QSA_OUT, HIDDEN);
+            layer.w_out.apply(
+                dev, &self.nk, &s.attn, &s.yq, &mut s.mix, t, QSA_OUT, HIDDEN,
+            );
         }
         dev.hc_read_into(
             &mut s.r,
@@ -1400,7 +1644,16 @@ impl Engine {
             t,
             EPS,
         );
-        layer.router.apply(dev, &self.nk, &s.x2, &s.xq, &mut s.logits, t, HIDDEN, ROUTER_ROWS);
+        layer.router.apply(
+            dev,
+            &self.nk,
+            &s.x2,
+            &s.xq,
+            &mut s.logits,
+            t,
+            HIDDEN,
+            ROUTER_ROWS,
+        );
         // Top-10 and the plan over VRAM-resident experts, on the GPU from its residency table;
         // the host computes the same misses from its own view of the table (both change only
         // between windows).
@@ -1418,17 +1671,32 @@ impl Engine {
         );
         {
             let (dst, src, n) = (
-                self.io.arena.device_ptr(Io::LIDS + l * 4 * WIDE * TOPK).expect("mapped"),
+                self.io
+                    .arena
+                    .device_ptr(Io::LIDS + l * 4 * WIDE * TOPK)
+                    .expect("mapped"),
                 a(&s.ids),
                 (t * TOPK) as i32,
             );
             unsafe {
-                gpu::launch(self.k.copy, (1, 1, 1), (256, 1, 1), 0, &self.stream, tang_moe::args![dst, src, n]).expect("launch")
+                gpu::launch(
+                    self.k.copy,
+                    (1, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    &self.stream,
+                    tang_moe::args![dst, src, n],
+                )
+                .expect("launch")
             };
         }
         let wide_pcie = self.wide && std::env::var("TANG_FLASH_WIDE_PCIE").is_ok_and(|v| v == "1");
         if self.pcie_cap > 0 || wide_pcie {
-            let cap = if wide_pcie { i32::MAX } else { self.pcie_cap as i32 };
+            let cap = if wide_pcie {
+                i32::MAX
+            } else {
+                self.pcie_cap as i32
+            };
             let (plan, ids, ht, ti) = (a(&s.plan), a(&s.ids), a(&self.host_tables[l]), t as i32);
             // The plan's layout at this width (MoePlan's offsets with cap(t)).
             let c = MoePlan::cap(t) as i32;
@@ -1436,8 +1704,15 @@ impl Engine {
             let (gs, et) = (gp + 2 * c, gp + 3 * c + 1);
             let (ed, mi) = (et + c, et + 2 * c);
             unsafe {
-                gpu::launch(self.k.pcie, (1, 1, 1), (32, 1, 1), 0, &self.stream, tang_moe::args![plan, ids, ht, ti, cap, gp, gs, et, ed, mi])
-                    .expect("launch")
+                gpu::launch(
+                    self.k.pcie,
+                    (1, 1, 1),
+                    (32, 1, 1),
+                    0,
+                    &self.stream,
+                    tang_moe::args![plan, ids, ht, ti, cap, gp, gs, et, ed, mi],
+                )
+                .expect("launch")
             };
         }
         // Publish ids and activations; the host computes the misses while the GPU runs the
@@ -1446,24 +1721,31 @@ impl Engine {
         let ctlw = a(&s.ctl) + 8; // window counter word
         let li = l as i32;
         if !wide_pcie {
-        {
-            let (ids, xq, xw, ti) = (a(&s.ids), a(&s.xq), QAct { m: t, k: HIDDEN }.words() as i32, t as i32);
-            unsafe {
-                gpu::launch(
-                    self.k.publish,
-                    (1, 1, 1),
-                    (512, 1, 1),
-                    0,
-                    &self.stream,
-                    tang_moe::args![mbp, ids, xq, xw, ctlw, li, ti],
-                )
-                .expect("launch")
-            };
-        }
+            {
+                let (ids, xq, xw, ti) = (
+                    a(&s.ids),
+                    a(&s.xq),
+                    QAct { m: t, k: HIDDEN }.words() as i32,
+                    t as i32,
+                );
+                unsafe {
+                    gpu::launch(
+                        self.k.publish,
+                        (1, 1, 1),
+                        (512, 1, 1),
+                        0,
+                        &self.stream,
+                        tang_moe::args![mbp, ids, xq, xw, ctlw, li, ti],
+                    )
+                    .expect("launch")
+                };
+            }
         }
         // SAFETY: every group address in the plan is a live VRAM slot or scratch blob.
         unsafe { dev.moe_grouped_into(&s.xq, &s.plan, &mut s.moe, &mut s.parts, t) };
-        layer.sh_gu.apply(dev, &self.nk, &s.x2, &s.xq, &mut s.gu, t, HIDDEN, 2 * FF);
+        layer
+            .sh_gu
+            .apply(dev, &self.nk, &s.x2, &s.xq, &mut s.gu, t, HIDDEN, 2 * FF);
         {
             let (gu, hq, hf, ff, ti) = (a(&s.gu), a(&s.hq), a(&s.hf), FF as i32, t as i32);
             unsafe {
@@ -1478,7 +1760,9 @@ impl Engine {
                 .expect("launch")
             };
         }
-        layer.sh_down.apply(dev, &self.nk, &s.hf, &s.hq, &mut s.shy, t, FF, HIDDEN);
+        layer
+            .sh_down
+            .apply(dev, &self.nk, &s.hf, &s.hq, &mut s.shy, t, FF, HIDDEN);
         {
             let (dst, src, n) = (
                 a(&s.parts) + (MoePlan::shared_row(t) * HIDDEN * 4) as u64,
@@ -1504,12 +1788,32 @@ impl Engine {
         for i in [st, st + 1] {
             if self.opts.split {
                 let (p, i) = (a(&s.stamps), i as i32);
-                unsafe { gpu::launch(self.k.stamp, (1, 1, 1), (1, 1, 1), 0, &self.stream, tang_moe::args![p, i]).expect("launch") };
+                unsafe {
+                    gpu::launch(
+                        self.k.stamp,
+                        (1, 1, 1),
+                        (1, 1, 1),
+                        0,
+                        &self.stream,
+                        tang_moe::args![p, i],
+                    )
+                    .expect("launch")
+                };
             }
         }
         if self.opts.split {
             let (p, i) = (a(&s.stamps), st as i32 + 2);
-            unsafe { gpu::launch(self.k.stamp, (1, 1, 1), (1, 1, 1), 0, &self.stream, tang_moe::args![p, i]).expect("launch") };
+            unsafe {
+                gpu::launch(
+                    self.k.stamp,
+                    (1, 1, 1),
+                    (1, 1, 1),
+                    0,
+                    &self.stream,
+                    tang_moe::args![p, i],
+                )
+                .expect("launch")
+            };
         }
         {
             let (flag, src, n, dst) = (
@@ -1533,7 +1837,17 @@ impl Engine {
         }
         if self.opts.split {
             let (p, i) = (a(&s.stamps), st as i32 + 3);
-            unsafe { gpu::launch(self.k.stamp, (1, 1, 1), (1, 1, 1), 0, &self.stream, tang_moe::args![p, i]).expect("launch") };
+            unsafe {
+                gpu::launch(
+                    self.k.stamp,
+                    (1, 1, 1),
+                    (1, 1, 1),
+                    0,
+                    &self.stream,
+                    tang_moe::args![p, i],
+                )
+                .expect("launch")
+            };
         }
         {
             let (list, parts) = (a(&s.list), a(&s.parts));
@@ -1575,7 +1889,8 @@ impl Engine {
             EPS,
         );
         let v = self.hp.n_vocab;
-        self.head.apply(dev, &self.nk, &s.x, &s.xq, &mut s.head, t, HIDDEN, v);
+        self.head
+            .apply(dev, &self.nk, &s.x, &s.xq, &mut s.head, t, HIDDEN, v);
         let (lg, ids, n, part, np, ctl) = (
             dev.buffer_addr(&s.head),
             dev.buffer_addr(&s.out_ids),
@@ -1588,10 +1903,24 @@ impl Engine {
             sp.enqueue(dev, &self.stream, &s.head, &s.ctl, &s.out_ids, t);
         } else {
             unsafe {
-                gpu::launch(self.k.argmax, (64, t as u32, 1), (1024, 1, 1), 0, &self.stream, tang_moe::args![lg, n, part, ctl])
-                    .expect("launch");
-                gpu::launch(self.k.argmax2, (t as u32, 1, 1), (32, 1, 1), 0, &self.stream, tang_moe::args![part, np, ids])
-                    .expect("launch");
+                gpu::launch(
+                    self.k.argmax,
+                    (64, t as u32, 1),
+                    (1024, 1, 1),
+                    0,
+                    &self.stream,
+                    tang_moe::args![lg, n, part, ctl],
+                )
+                .expect("launch");
+                gpu::launch(
+                    self.k.argmax2,
+                    (t as u32, 1, 1),
+                    (32, 1, 1),
+                    0,
+                    &self.stream,
+                    tang_moe::args![part, np, ids],
+                )
+                .expect("launch");
             }
         }
         self.stamp(1 + 4 * 48);
@@ -1599,7 +1928,13 @@ impl Engine {
 
     /// Everything a window enqueues, layer by layer; `between(l)` runs on the host after layer
     /// `l` is enqueued (eager mode serves it there).
-    fn enqueue_window(&mut self, t: usize, unfused: bool, verify: bool, between: &mut dyn FnMut(&mut Self, usize) -> Result<()>) -> Result<()> {
+    fn enqueue_window(
+        &mut self,
+        t: usize,
+        unfused: bool,
+        verify: bool,
+        between: &mut dyn FnMut(&mut Self, usize) -> Result<()>,
+    ) -> Result<()> {
         self.enqueue_inputs(t);
         self.enqueue_embed(t);
         let pl = self.ple.layer;
@@ -1644,7 +1979,18 @@ impl Engine {
                     ssm_a: &g.a,
                     norm: &g.norm,
                 };
-                dev.gdn_step(&mut g.state, &g.h, &g.proj, GDN_PROJ, &p, &mut s.y, None, t, GdnMode::Commit { win: &s.ctl }, EPS);
+                dev.gdn_step(
+                    &mut g.state,
+                    &g.h,
+                    &g.proj,
+                    GDN_PROJ,
+                    &p,
+                    &mut s.y,
+                    None,
+                    t,
+                    GdnMode::Commit { win: &s.ctl },
+                    EPS,
+                );
                 dev.gdn_conv_commit(&mut g.hist, &g.proj, GDN_PROJ, &s.ctl, t);
             }
         }
@@ -1698,7 +2044,9 @@ impl Engine {
     /// Serve layer `l` of the current window: plan, raise A, compute misses, raise B.
     fn serve(&mut self, l: usize, st: &mut WinStats) -> Result<()> {
         let seq = doorbell::seq(self.counter, l);
-        self.mb.wait_seq(seq, &self.stream).map_err(|e| anyhow!("layer {l}: {e}"))?;
+        self.mb
+            .wait_seq(seq, &self.stream)
+            .map_err(|e| anyhow!("layer {l}: {e}"))?;
         // The GPU only waits on layers with CPU misses; if it has already published a later
         // layer, this one had none.
         if self.mb.words(Mb::SEQ, 1)[0] != seq {
@@ -1730,13 +2078,20 @@ impl Engine {
                 }
                 seen.push(e);
                 if addr(e) == 0 {
-                    let toks = (0..n).filter(|&j| ids[j] == e).map(|j| (j / TOPK, j)).collect();
+                    let toks = (0..n)
+                        .filter(|&j| ids[j] == e)
+                        .map(|j| (j / TOPK, j))
+                        .collect();
                     m.push(tang_moe::miss::Missed { expert: e, toks });
                 }
             }
             m
         };
-        let streamed = if matches!(experts, Experts::Resident(_)) { self.pcie_cap.min(missed.len()) } else { 0 };
+        let streamed = if matches!(experts, Experts::Resident(_)) {
+            self.pcie_cap.min(missed.len())
+        } else {
+            0
+        };
         missed.drain(..streamed);
         let t1 = Instant::now();
         let blob = ExpertBlob::BYTES;
@@ -1744,7 +2099,9 @@ impl Engine {
             .iter()
             .map(|m| MissJob {
                 blob: match experts {
-                    Experts::Resident(rc) => rc.host_blob(base + m.expert).expect("missed expert has a host copy"),
+                    Experts::Resident(rc) => rc
+                        .host_blob(base + m.expert)
+                        .expect("missed expert has a host copy"),
                     Experts::Cpu(map) => {
                         let o = (base + m.expert) as usize * blob;
                         &map[o..o + blob]
@@ -1767,17 +2124,28 @@ impl Engine {
                 let mut sub = vec![0u32; qs.words()];
                 let (cw, sw) = (HIDDEN / 4, HIDDEN / 32);
                 sub[..n * cw].copy_from_slice(&xq[qa.codes(s0)..qa.codes(s0) + n * cw]);
-                sub[qs.scales(0)..qs.scales(0) + n * sw].copy_from_slice(&xq[qa.scales(s0)..qa.scales(s0) + n * sw]);
-                sub[qs.sums(0)..qs.sums(0) + n * sw].copy_from_slice(&xq[qa.sums(s0)..qa.sums(s0) + n * sw]);
+                sub[qs.scales(0)..qs.scales(0) + n * sw]
+                    .copy_from_slice(&xq[qa.scales(s0)..qa.scales(s0) + n * sw]);
+                sub[qs.sums(0)..qs.sums(0) + n * sw]
+                    .copy_from_slice(&xq[qa.sums(s0)..qa.sums(s0) + n * sw]);
                 let toks: Vec<Vec<(usize, usize)>> = jobs
                     .iter()
-                    .map(|j| j.toks.iter().filter(|&&(tk, _)| tk >= s0 && tk < s0 + n).map(|&(tk, d)| (tk - s0, d)).collect())
+                    .map(|j| {
+                        j.toks
+                            .iter()
+                            .filter(|&&(tk, _)| tk >= s0 && tk < s0 + n)
+                            .map(|&(tk, d)| (tk - s0, d))
+                            .collect()
+                    })
                     .collect();
                 let sj: Vec<MissJob> = jobs
                     .iter()
                     .zip(&toks)
                     .filter(|(_, tk)| !tk.is_empty())
-                    .map(|(j, tk)| MissJob { blob: j.blob, toks: tk })
+                    .map(|(j, tk)| MissJob {
+                        blob: j.blob,
+                        toks: tk,
+                    })
                     .collect();
                 // SAFETY: as above; ROWS holds the wide plan's rows (tang-moe `WIDE_CAP`).
                 unsafe { self.exec.run(&sub, n, &sj, self.mb.rows_ptr()) };
@@ -1799,15 +2167,31 @@ impl Engine {
     /// Run one window over `self.tokens[pos0..pos0 + t]` (all kept). Returns the argmax of each
     /// position's logits. With `probe`, runs eagerly and unfused and records the last token's
     /// intermediates.
-    pub fn window(&mut self, pos0: usize, t: usize, mut probe: Option<&mut Probe>) -> Result<Vec<u32>> {
+    pub fn window(
+        &mut self,
+        pos0: usize,
+        t: usize,
+        mut probe: Option<&mut Probe>,
+    ) -> Result<Vec<u32>> {
         self.window_mode(pos0, t, false, probe.take())
     }
 
     /// [`window`](Self::window) as a verify window (`verify`): the GDN state is only read; call
     /// [`commit`](Self::commit) with the number of tokens kept before the next window.
-    pub fn window_mode(&mut self, pos0: usize, t: usize, verify: bool, mut probe: Option<&mut Probe>) -> Result<Vec<u32>> {
+    pub fn window_mode(
+        &mut self,
+        pos0: usize,
+        t: usize,
+        verify: bool,
+        mut probe: Option<&mut Probe>,
+    ) -> Result<Vec<u32>> {
         ensure!((1..=MAX_T).contains(&t) && pos0 + t <= self.tokens.len());
-        ensure!(pos0 + t <= self.opts.max_ctx, "context {} > max {}", pos0 + t, self.opts.max_ctx);
+        ensure!(
+            pos0 + t <= self.opts.max_ctx,
+            "context {} > max {}",
+            pos0 + t,
+            self.opts.max_ctx
+        );
         let w0 = Instant::now();
         let mut st = WinStats {
             t,
@@ -1846,7 +2230,10 @@ impl Engine {
         self.dev.sync();
         // Routing of every layer (copied out by the graph): cache usage and statistics.
         for l in 0..self.layers.len() {
-            let mut d: Vec<u32> = self.io.u32s(Io::LIDS + l * 4 * WIDE * TOPK, t * TOPK).to_vec();
+            let mut d: Vec<u32> = self
+                .io
+                .u32s(Io::LIDS + l * 4 * WIDE * TOPK, t * TOPK)
+                .to_vec();
             d.sort_unstable();
             d.dedup();
             st.routed += t * TOPK;
@@ -1917,7 +2304,11 @@ impl Engine {
                 self.commit_graphs[t] = Some(g);
                 return Ok(());
             }
-            self.commit_graphs[t].as_ref().unwrap().launch(&self.stream).map_err(|e| anyhow!("{e}"))?;
+            self.commit_graphs[t]
+                .as_ref()
+                .unwrap()
+                .launch(&self.stream)
+                .map_err(|e| anyhow!("{e}"))?;
         } else {
             self.enqueue_commit(t);
         }
@@ -1938,7 +2329,9 @@ impl Engine {
 
     #[allow(clippy::mut_from_ref)]
     fn host_addrs_pinned(&self) -> &mut [u64] {
-        unsafe { std::slice::from_raw_parts_mut(self.host_addrs.as_ptr() as *mut u64, 48 * EXPERTS) }
+        unsafe {
+            std::slice::from_raw_parts_mut(self.host_addrs.as_ptr() as *mut u64, 48 * EXPERTS)
+        }
     }
 
     /// Copy the cache's residency table into the per-layer plan tables where it changed
@@ -1953,7 +2346,11 @@ impl Engine {
             for e in 0..EXPERTS {
                 let key = (base + e) as u32;
                 let a = rc.addr(key);
-                let hd = if a == 0 { rc.host_device_addr(key).unwrap_or(0) } else { 0 };
+                let hd = if a == 0 {
+                    rc.host_device_addr(key).unwrap_or(0)
+                } else {
+                    0
+                };
                 let ha = self.host_addrs_pinned();
                 if ha[base + e] != hd {
                     ha[base + e] = hd;
@@ -1965,7 +2362,11 @@ impl Engine {
                 }
             }
             if dirty {
-                self.kcopy(self.dev.buffer_addr(&self.tables[l]), rc.device_addrs() + (base * 8) as u64, EXPERTS * 8);
+                self.kcopy(
+                    self.dev.buffer_addr(&self.tables[l]),
+                    rc.device_addrs() + (base * 8) as u64,
+                    EXPERTS * 8,
+                );
                 self.kcopy(
                     self.dev.buffer_addr(&self.host_tables[l]),
                     self.host_addrs.device_ptr(base * 8).expect("mapped"),
@@ -1996,10 +2397,15 @@ impl Engine {
         self.dev.sync();
         let last = t - 1;
         let row = |v: Vec<f32>, w: usize| v[last * w..(last + 1) * w].to_vec();
-        p.mixer_out.push(row(self.dev.download(&self.s.mix), HIDDEN));
+        p.mixer_out
+            .push(row(self.dev.download(&self.s.mix), HIDDEN));
         let ids = self.dev.download(&self.s.ids);
-        p.router_ids
-            .push(ids[last * TOPK..(last + 1) * TOPK].iter().map(|v| v.to_bits()).collect());
+        p.router_ids.push(
+            ids[last * TOPK..(last + 1) * TOPK]
+                .iter()
+                .map(|v| v.to_bits())
+                .collect(),
+        );
         if self.layers[l].qsa.is_some() {
             let sel: Vec<u32> = self.dev.download(&self.s.sel)
                 [last * QSA_WIDTH..(last + 1) * QSA_WIDTH]
@@ -2013,10 +2419,19 @@ impl Engine {
         }
         // post_mixer: r with the mixer write applied is what hc_ffn read saw; r itself now
         // holds it (the write was applied inside that read).
-        p.post_mixer.push(row(self.dev.download(&self.s.r), HC * HIDDEN));
+        p.post_mixer
+            .push(row(self.dev.download(&self.s.r), HC * HIDDEN));
         let mut y = self.dev.alloc_f32(MAX_T * HIDDEN);
         let s = &self.s;
-        self.dev.moe_combine_into(&s.parts, &s.w, &s.logits, ROUTER_ROWS, Some(EXPERTS), &mut y, t);
+        self.dev.moe_combine_into(
+            &s.parts,
+            &s.w,
+            &s.logits,
+            ROUTER_ROWS,
+            Some(EXPERTS),
+            &mut y,
+            t,
+        );
         let yv = self.dev.download(&y);
         p.moe_out.push(row(yv.clone(), HIDDEN));
         let mut r = self.dev.download(&self.s.r);
@@ -2098,11 +2513,16 @@ impl Engine {
     /// mapped arena into a VRAM scratch buffer (the traffic a prefetch of predicted misses would
     /// make), so the window's slowdown can be measured.
     fn probe_traffic(&mut self) -> Result<()> {
-        let mb: usize = std::env::var("TANG_FLASH_PROBE_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let mb: usize = std::env::var("TANG_FLASH_PROBE_MB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         if mb == 0 {
             return Ok(());
         }
-        let Experts::Resident(rc) = &self.experts else { return Ok(()) };
+        let Experts::Resident(rc) = &self.experts else {
+            return Ok(());
+        };
         let blob = ExpertBlob::BYTES;
         let n = (mb << 20) / blob;
         if self.probe_buf.is_none() {
@@ -2137,7 +2557,10 @@ impl Engine {
         let (hw, iw) = self.train_dump.as_mut().unwrap();
         for (i, &nx) in next.iter().enumerate().take(n).skip(from) {
             let row = &r[i * HC * HIDDEN..(i + 1) * HC * HIDDEN];
-            let b: Vec<u8> = row.iter().flat_map(|&x| fl::f32_to_f16(x).to_le_bytes()).collect();
+            let b: Vec<u8> = row
+                .iter()
+                .flat_map(|&x| fl::f32_to_f16(x).to_le_bytes())
+                .collect();
             hw.write_all(&b)?;
             let p = pos0 + i;
             for v in [p as u32, self.tokens[p], nx] {
@@ -2151,7 +2574,12 @@ impl Engine {
     pub fn dump_mtp_train(&mut self, dir: &Path) -> Result<()> {
         std::fs::create_dir_all(dir)?;
         let f = |n: &str| -> Result<std::io::BufWriter<std::fs::File>> {
-            Ok(std::io::BufWriter::new(std::fs::OpenOptions::new().create(true).append(true).open(dir.join(n))?))
+            Ok(std::io::BufWriter::new(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(dir.join(n))?,
+            ))
         };
         self.train_dump = Some((f("h.f16")?, f("ids.u32")?));
         Ok(())
@@ -2185,13 +2613,19 @@ impl Engine {
         self.dump_train(pos, &kept, 0)?;
         self.last_mtp_ms = 0.0;
         let t0 = Instant::now();
-        let overlap = self.use_mtp && self.use_graphs && self.mtp.as_ref().is_some_and(|m| m.graphs[n].is_some());
+        let overlap = self.use_mtp
+            && self.use_graphs
+            && self.mtp.as_ref().is_some_and(|m| m.graphs[n].is_some());
         if overlap {
             self.mtp_stage(pos, &kept);
             let ev = gpu::Event::new(false).map_err(|e| anyhow!("{e}"))?;
             ev.record(&self.stream).map_err(|e| anyhow!("{e}"))?;
             self.side.wait(&ev).map_err(|e| anyhow!("{e}"))?;
-            self.mtp.as_ref().unwrap().graphs[n].as_ref().unwrap().launch(&self.side).map_err(|e| anyhow!("{e}"))?;
+            self.mtp.as_ref().unwrap().graphs[n]
+                .as_ref()
+                .unwrap()
+                .launch(&self.side)
+                .map_err(|e| anyhow!("{e}"))?;
         }
         let tc = Instant::now();
         if t > 1 {
@@ -2225,12 +2659,17 @@ impl Engine {
     pub fn vocab(&self) -> Result<Vec<String>> {
         let v = self.g.meta("tokenizer.ggml.tokens")?;
         let a = v.as_array().context("tokens")?;
-        Ok(a.iter().map(|x| x.as_str().unwrap_or("").to_string()).collect())
+        Ok(a.iter()
+            .map(|x| x.as_str().unwrap_or("").to_string())
+            .collect())
     }
 
     pub fn ngram_stats(&self) -> (u64, u64) {
         use std::sync::atomic::Ordering::Relaxed;
-        (self.ngram.hits.load(Relaxed), self.ngram.reads.load(Relaxed))
+        (
+            self.ngram.hits.load(Relaxed),
+            self.ngram.reads.load(Relaxed),
+        )
     }
 
     pub fn gguf(&self) -> &Gguf {
@@ -2267,7 +2706,12 @@ pub fn gemv_check(path: &Path) -> Result<()> {
         ((rng >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
     };
     for t in &g.tensors {
-        if t.dims.len() != 2 || t.name.contains("_exps") || t.name.starts_with("per_layer") || t.name == "token_embd.weight" || t.name.contains("hc_") {
+        if t.dims.len() != 2
+            || t.name.contains("_exps")
+            || t.name.starts_with("per_layer")
+            || t.name == "token_embd.weight"
+            || t.name.contains("hc_")
+        {
             continue;
         }
         let id = match t.ty {
@@ -2305,18 +2749,41 @@ pub fn gemv_check(path: &Path) -> Result<()> {
             let xv: Vec<f32> = (0..tt * k).map(|_| rnd()).collect();
             let x = dev.upload_f32(&xv);
             let out = dev.alloc_f32(tt * n);
-            let f = gm.func(&format!("fe_gemv_t{tt}")).map_err(|e| anyhow!("{e}"))?;
-            let (sp, ns, xp, ki, op, os) = (dev.buffer_addr(&segs), 1i32, dev.buffer_addr(&x), k as i32, dev.buffer_addr(&out), n as i32);
+            let f = gm
+                .func(&format!("fe_gemv_t{tt}"))
+                .map_err(|e| anyhow!("{e}"))?;
+            let (sp, ns, xp, ki, op, os) = (
+                dev.buffer_addr(&segs),
+                1i32,
+                dev.buffer_addr(&x),
+                k as i32,
+                dev.buffer_addr(&out),
+                n as i32,
+            );
             unsafe {
-                { let total = n as i32; gpu::launch(f, (grid, 1, 1), (128, 1, 1), smem, &stream, tang_moe::args![sp, ns, xp, ki, op, os, r16, total]) }
-                    .map_err(|e| anyhow!("{e}"))?
+                {
+                    let total = n as i32;
+                    gpu::launch(
+                        f,
+                        (grid, 1, 1),
+                        (128, 1, 1),
+                        smem,
+                        &stream,
+                        tang_moe::args![sp, ns, xp, ki, op, os, r16, total],
+                    )
+                }
+                .map_err(|e| anyhow!("{e}"))?
             };
             dev.sync();
             let got = dev.download(&out);
             for ti in 0..tt {
                 for r in 0..n {
-                    let want: f64 = (0..k).map(|i| wf[r * k + i] as f64 * xv[ti * k + i] as f64).sum();
-                    let mag: f64 = (0..k).map(|i| (wf[r * k + i] as f64 * xv[ti * k + i] as f64).abs()).sum();
+                    let want: f64 = (0..k)
+                        .map(|i| wf[r * k + i] as f64 * xv[ti * k + i] as f64)
+                        .sum();
+                    let mag: f64 = (0..k)
+                        .map(|i| (wf[r * k + i] as f64 * xv[ti * k + i] as f64).abs())
+                        .sum();
                     let e = (got[ti * n + r] as f64 - want).abs() / mag.max(1e-30);
                     worst = worst.max(e);
                 }
@@ -2330,16 +2797,47 @@ pub fn gemv_check(path: &Path) -> Result<()> {
             let xv: Vec<f32> = (0..tt * k).map(|_| rnd()).collect();
             let x = dev.upload_f32(&xv);
             let out = dev.alloc_f32(tt * n);
-            let (f, grid) = (gm.func(&format!("fe_gemv8_t{tt}")).map_err(|e| anyhow!("{e}"))?, n.div_ceil(8) as u32);
-            let (sp, ns, xp, xq, ki, op, os) = (dev.buffer_addr(&segs), 1i32, dev.buffer_addr(&x), dev.buffer_addr(&xqb), k as i32, dev.buffer_addr(&out), n as i32);
+            let (f, grid) = (
+                gm.func(&format!("fe_gemv8_t{tt}"))
+                    .map_err(|e| anyhow!("{e}"))?,
+                n.div_ceil(8) as u32,
+            );
+            let (sp, ns, xp, xq, ki, op, os) = (
+                dev.buffer_addr(&segs),
+                1i32,
+                dev.buffer_addr(&x),
+                dev.buffer_addr(&xqb),
+                k as i32,
+                dev.buffer_addr(&out),
+                n as i32,
+            );
             unsafe {
-                gpu::launch(q8, ((k / 32) as u32, tt as u32, 1), (32, 1, 1), 0, &stream, tang_moe::args![xp, xq, ki]).map_err(|e| anyhow!("{e}"))?;
-                gpu::launch(f, (grid, 1, 1), (128, 1, 1), 8 * 16 * r16 as u32, &stream, tang_moe::args![sp, ns, xp, xq, ki, op, os, r16])
-                    .map_err(|e| anyhow!("{e}"))?
+                gpu::launch(
+                    q8,
+                    ((k / 32) as u32, tt as u32, 1),
+                    (32, 1, 1),
+                    0,
+                    &stream,
+                    tang_moe::args![xp, xq, ki],
+                )
+                .map_err(|e| anyhow!("{e}"))?;
+                gpu::launch(
+                    f,
+                    (grid, 1, 1),
+                    (128, 1, 1),
+                    8 * 16 * r16 as u32,
+                    &stream,
+                    tang_moe::args![sp, ns, xp, xq, ki, op, os, r16],
+                )
+                .map_err(|e| anyhow!("{e}"))?
             };
             dev.sync();
             let got = dev.download(&out);
-            let qw: Vec<u8> = dev.download(&xqb).iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+            let qw: Vec<u8> = dev
+                .download(&xqb)
+                .iter()
+                .flat_map(|v| v.to_bits().to_le_bytes())
+                .collect();
             let xd = |ti: usize, i: usize| -> f64 {
                 let q = qw[ti * k + i] as i8 as f64;
                 let o = MAX_T * k + 4 * (ti * (k / 32) + i / 32);
@@ -2349,7 +2847,12 @@ pub fn gemv_check(path: &Path) -> Result<()> {
                 for r in 0..n {
                     let (mut want, mut mag) = (0f64, 0f64);
                     for i in 0..k {
-                        let v = wf[r * k + i] as f64 * if id == 30 { xv[ti * k + i] as f64 } else { xd(ti, i) };
+                        let v = wf[r * k + i] as f64
+                            * if id == 30 {
+                                xv[ti * k + i] as f64
+                            } else {
+                                xd(ti, i)
+                            };
                         want += v;
                         mag += v.abs();
                     }
@@ -2368,11 +2871,39 @@ pub fn gemv_check(path: &Path) -> Result<()> {
         for tt in [1usize, 4] {
             let x = dev.upload_f32(&vec![0.5f32; tt * k]);
             let out = dev.alloc_f32(tt * nf);
-            let (f, gridf) = (gm.func(&format!("fe_gemv8_t{tt}")).map_err(|e| anyhow!("{e}"))?, nf.div_ceil(8) as u32);
-            let (sp, ns, xp, xq, ki, op, os) = (dev.buffer_addr(&segf), 1i32, dev.buffer_addr(&x), dev.buffer_addr(&xqb), k as i32, dev.buffer_addr(&out), nf as i32);
+            let (f, gridf) = (
+                gm.func(&format!("fe_gemv8_t{tt}"))
+                    .map_err(|e| anyhow!("{e}"))?,
+                nf.div_ceil(8) as u32,
+            );
+            let (sp, ns, xp, xq, ki, op, os) = (
+                dev.buffer_addr(&segf),
+                1i32,
+                dev.buffer_addr(&x),
+                dev.buffer_addr(&xqb),
+                k as i32,
+                dev.buffer_addr(&out),
+                nf as i32,
+            );
             let mut run = || unsafe {
-                gpu::launch(q8, ((k / 32) as u32, tt as u32, 1), (32, 1, 1), 0, &stream, tang_moe::args![xp, xq, ki]).unwrap();
-                gpu::launch(f, (gridf, 1, 1), (128, 1, 1), 8 * 16 * r16 as u32, &stream, tang_moe::args![sp, ns, xp, xq, ki, op, os, r16]).unwrap()
+                gpu::launch(
+                    q8,
+                    ((k / 32) as u32, tt as u32, 1),
+                    (32, 1, 1),
+                    0,
+                    &stream,
+                    tang_moe::args![xp, xq, ki],
+                )
+                .unwrap();
+                gpu::launch(
+                    f,
+                    (gridf, 1, 1),
+                    (128, 1, 1),
+                    8 * 16 * r16 as u32,
+                    &stream,
+                    tang_moe::args![sp, ns, xp, xq, ki, op, os, r16],
+                )
+                .unwrap()
             };
             run();
             let ms = dev.event_ms(&mut || {
@@ -2412,21 +2943,53 @@ impl Engine {
                 .collect()
         };
         let dev = &self.dev;
-        let diff = |a: &[f32], b: &[f32]| a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+        let diff = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b)
+                .filter(|(x, y)| x.to_bits() != y.to_bits())
+                .count()
+        };
         let t = 8;
         // hc read
         let r8 = rnd(t * HC * HIDDEN, 1.0);
         let r1 = r8[7 * HC * HIDDEN..].to_vec();
         let (mut x8, mut x1) = (dev.alloc_f32(t * HIDDEN), dev.alloc_f32(HIDDEN));
-        let (mut q8, mut q1) = (dev.alloc_f32(QAct { m: t, k: HIDDEN }.words()), dev.alloc_f32(QAct { m: 1, k: HIDDEN }.words()));
+        let (mut q8, mut q1) = (
+            dev.alloc_f32(QAct { m: t, k: HIDDEN }.words()),
+            dev.alloc_f32(QAct { m: 1, k: HIDDEN }.words()),
+        );
         let (mut i8b, mut i1b) = (dev.alloc_f32(t * HC), dev.alloc_f32(HC));
         let mut hc = dev.alloc_f32(fl::hc_scratch_words(t));
         let (mut rb8, mut rb1) = (dev.upload_f32(&r8), dev.upload_f32(&r1));
         let w = self.layers[l].hc_a.w();
-        dev.hc_read_into(&mut rb8, None, &w, &mut x8, Some(&mut q8), Some(&mut i8b), &mut hc, t, EPS);
-        dev.hc_read_into(&mut rb1, None, &w, &mut x1, Some(&mut q1), Some(&mut i1b), &mut hc, 1, EPS);
+        dev.hc_read_into(
+            &mut rb8,
+            None,
+            &w,
+            &mut x8,
+            Some(&mut q8),
+            Some(&mut i8b),
+            &mut hc,
+            t,
+            EPS,
+        );
+        dev.hc_read_into(
+            &mut rb1,
+            None,
+            &w,
+            &mut x1,
+            Some(&mut q1),
+            Some(&mut i1b),
+            &mut hc,
+            1,
+            EPS,
+        );
         let (xa, xb) = (dev.download(&x8), dev.download(&x1));
-        println!("hc_read x: {} of {} differ", diff(&xa[7 * HIDDEN..], &xb), HIDDEN);
+        println!(
+            "hc_read x: {} of {} differ",
+            diff(&xa[7 * HIDDEN..], &xb),
+            HIDDEN
+        );
         // GEMVs on identical inputs
         let xv = rnd(t * HIDDEN, 1.0);
         let x8 = dev.upload_f32(&xv);
@@ -2437,21 +3000,39 @@ impl Engine {
         dev.quantize_act_into(&x1, &mut xq1, 1, HIDDEN);
         let n = self.layers[l].in_rows;
         let (mut o8, mut o1) = (dev.alloc_f32(t * n), dev.alloc_f32(n));
-        self.layers[l].w_in.apply(dev, &self.nk, &x8, &xq8, &mut o8, t, HIDDEN, n);
-        self.layers[l].w_in.apply(dev, &self.nk, &x1, &xq1, &mut o1, 1, HIDDEN, n);
+        self.layers[l]
+            .w_in
+            .apply(dev, &self.nk, &x8, &xq8, &mut o8, t, HIDDEN, n);
+        self.layers[l]
+            .w_in
+            .apply(dev, &self.nk, &x1, &xq1, &mut o1, 1, HIDDEN, n);
         let (a, b) = (dev.download(&o8), dev.download(&o1));
         println!("w_in GEMV: {} of {n} differ", diff(&a[7 * n..8 * n], &b));
         let (mut l8, mut l1) = (dev.alloc_f32(t * ROUTER_ROWS), dev.alloc_f32(ROUTER_ROWS));
-        self.layers[l].router.apply(dev, &self.nk, &x8, &xq8, &mut l8, t, HIDDEN, ROUTER_ROWS);
-        self.layers[l].router.apply(dev, &self.nk, &x1, &xq1, &mut l1, 1, HIDDEN, ROUTER_ROWS);
+        self.layers[l]
+            .router
+            .apply(dev, &self.nk, &x8, &xq8, &mut l8, t, HIDDEN, ROUTER_ROWS);
+        self.layers[l]
+            .router
+            .apply(dev, &self.nk, &x1, &xq1, &mut l1, 1, HIDDEN, ROUTER_ROWS);
         let (a, b) = (dev.download(&l8), dev.download(&l1));
-        println!("router bf16 GEMV: {} of {ROUTER_ROWS} differ", diff(&a[7 * ROUTER_ROWS..], &b));
+        println!(
+            "router bf16 GEMV: {} of {ROUTER_ROWS} differ",
+            diff(&a[7 * ROUTER_ROWS..], &b)
+        );
         // PLE value GEMV (bf16, 2560 x 2560)
         let (mut v8, mut v1) = (dev.alloc_f32(t * HIDDEN), dev.alloc_f32(HIDDEN));
-        self.ple.value.apply(dev, &self.nk, &x8, &xq8, &mut v8, t, HIDDEN, HIDDEN);
-        self.ple.value.apply(dev, &self.nk, &x1, &xq1, &mut v1, 1, HIDDEN, HIDDEN);
+        self.ple
+            .value
+            .apply(dev, &self.nk, &x8, &xq8, &mut v8, t, HIDDEN, HIDDEN);
+        self.ple
+            .value
+            .apply(dev, &self.nk, &x1, &xq1, &mut v1, 1, HIDDEN, HIDDEN);
         let (a, b) = (dev.download(&v8), dev.download(&v1));
-        println!("ple value bf16 GEMV: {} of {HIDDEN} differ", diff(&a[7 * HIDDEN..], &b));
+        println!(
+            "ple value bf16 GEMV: {} of {HIDDEN} differ",
+            diff(&a[7 * HIDDEN..], &b)
+        );
         // MoE combine + hc write
         {
             let parts_v = rnd(MoePlan::PARTS_ROWS * HIDDEN, 1.0);
@@ -2464,8 +3045,11 @@ impl Engine {
                 let row = parts_v[src..src + HIDDEN].to_vec();
                 p1[dst..dst + HIDDEN].copy_from_slice(&row);
             }
-            let row = parts_v[(MoePlan::SHARED_ROW + 7) * HIDDEN..(MoePlan::SHARED_ROW + 8) * HIDDEN].to_vec();
-            p1[MoePlan::SHARED_ROW * HIDDEN..(MoePlan::SHARED_ROW + 1) * HIDDEN].copy_from_slice(&row);
+            let row = parts_v
+                [(MoePlan::SHARED_ROW + 7) * HIDDEN..(MoePlan::SHARED_ROW + 8) * HIDDEN]
+                .to_vec();
+            p1[MoePlan::SHARED_ROW * HIDDEN..(MoePlan::SHARED_ROW + 1) * HIDDEN]
+                .copy_from_slice(&row);
             let (pb8, pb1) = (dev.upload_f32(&parts_v), dev.upload_f32(&p1));
             let (w8, w1) = (dev.upload_f32(&wv), dev.upload_f32(&wv[7 * TOPK..]));
             let (lg8, lg1) = (dev.upload_f32(&lv), dev.upload_f32(&lv[7 * ROUTER_ROWS..]));
@@ -2474,12 +3058,19 @@ impl Engine {
             dev.moe_combine_into(&pb8, &w8, &lg8, ROUTER_ROWS, Some(EXPERTS), &mut y8, t);
             dev.moe_combine_into(&pb1, &w1, &lg1, ROUTER_ROWS, Some(EXPERTS), &mut y1, 1);
             let (a, b) = (dev.download(&y8), dev.download(&y1));
-            println!("moe combine: {} of {HIDDEN} differ", diff(&a[7 * HIDDEN..], &b));
+            println!(
+                "moe combine: {} of {HIDDEN} differ",
+                diff(&a[7 * HIDDEN..], &b)
+            );
             let (mut ra, mut rb) = (dev.upload_f32(&r8), dev.upload_f32(&r1));
             dev.hc_write(&mut ra, &y8, &in8, t);
             dev.hc_write(&mut rb, &y1, &in1, 1);
             let (a, b) = (dev.download(&ra), dev.download(&rb));
-            println!("hc write: {} of {} differ", diff(&a[7 * HC * HIDDEN..], &b), HC * HIDDEN);
+            println!(
+                "hc write: {} of {} differ",
+                diff(&a[7 * HC * HIDDEN..], &b),
+                HC * HIDDEN
+            );
         }
         // GDN: eight committed T=1 steps vs one read-only T=8 walk from the same state.
         if self.layers[l].gdn.is_some() {
@@ -2487,7 +3078,12 @@ impl Engine {
             let st0 = rnd(fl::GDN_STATE, 0.05);
             let h0 = rnd(fl::GDN_HIST, 0.5);
             let g = self.layers[l].gdn.as_mut().unwrap();
-            let p = GdnParams { conv: &g.conv, dt_bias: &g.dt, ssm_a: &g.a, norm: &g.norm };
+            let p = GdnParams {
+                conv: &g.conv,
+                dt_bias: &g.dt,
+                ssm_a: &g.a,
+                norm: &g.norm,
+            };
             let mut st = dev.upload_f32(&st0);
             let hist = dev.upload_f32(&h0);
             let proj8 = dev.upload_f32(&pv);
@@ -2495,7 +3091,18 @@ impl Engine {
             let mut y8 = dev.alloc_f32(t * GDN_V);
             let mut yq8 = dev.alloc_f32(QAct { m: t, k: GDN_V }.words());
             dev.gdn_conv_into(&proj8, GDN_PROJ, &hist, p.conv, &mut h8, t, EPS);
-            dev.gdn_step(&mut st, &h8, &proj8, GDN_PROJ, &p, &mut y8, Some(&mut yq8), t, GdnMode::ReadOnly, EPS);
+            dev.gdn_step(
+                &mut st,
+                &h8,
+                &proj8,
+                GDN_PROJ,
+                &p,
+                &mut y8,
+                Some(&mut yq8),
+                t,
+                GdnMode::ReadOnly,
+                EPS,
+            );
             let ya = dev.download(&y8);
             let ha = dev.download(&h8);
             let mut st1 = dev.upload_f32(&st0);
@@ -2508,18 +3115,34 @@ impl Engine {
                 let mut y1 = dev.alloc_f32(GDN_V);
                 let mut yq1 = dev.alloc_f32(QAct { m: 1, k: GDN_V }.words());
                 dev.gdn_conv_into(&proj1, GDN_PROJ, &hist1, p.conv, &mut h1, 1, EPS);
-                dev.gdn_step(&mut st1, &h1, &proj1, GDN_PROJ, &p, &mut y1, Some(&mut yq1), 1, GdnMode::Commit { win: &ctl }, EPS);
+                dev.gdn_step(
+                    &mut st1,
+                    &h1,
+                    &proj1,
+                    GDN_PROJ,
+                    &p,
+                    &mut y1,
+                    Some(&mut yq1),
+                    1,
+                    GdnMode::Commit { win: &ctl },
+                    EPS,
+                );
                 dev.gdn_conv_commit(&mut hist1, &proj1, GDN_PROJ, &ctl, 1);
                 yb = dev.download(&y1);
                 hb = dev.download(&h1);
             }
-            println!("gdn conv h (token 7): {} of {GDN_CONV} differ", diff(&ha[7 * GDN_CONV..], &hb));
-            println!("gdn step y (token 7): {} of {GDN_V} differ", diff(&ya[7 * GDN_V..], &yb));
+            println!(
+                "gdn conv h (token 7): {} of {GDN_CONV} differ",
+                diff(&ha[7 * GDN_CONV..], &hb)
+            );
+            println!(
+                "gdn step y (token 7): {} of {GDN_V} differ",
+                diff(&ya[7 * GDN_V..], &yb)
+            );
         }
         Ok(())
     }
 }
-
 
 /// The MTP layer's weights and buffers ([`super::mtp_gpu`] for what it computes).
 struct Mtp {
@@ -2582,7 +3205,13 @@ struct Mtp {
 }
 
 impl Mtp {
-    fn load(dev: &CudaComputeDevice, main: &Gguf, path: &Path, max_ctx: usize, vocab: usize) -> Result<Self> {
+    fn load(
+        dev: &CudaComputeDevice,
+        main: &Gguf,
+        path: &Path,
+        max_ctx: usize,
+        vocab: usize,
+    ) -> Result<Self> {
         use super::mtp_gpu::{self as m, raw};
         let (g, l) = m::open(path)?;
         let t = |n: &str| g.info(&format!("blk.{l}.{n}"));
@@ -2604,7 +3233,14 @@ impl Mtp {
             let mut rows = 0;
             for (o, ty, r, rb, off) in meta {
                 let p = base + o;
-                words.extend_from_slice(&[p as u32, (p >> 32) as u32, ty as u32, r as u32, rb as u32, off as u32]);
+                words.extend_from_slice(&[
+                    p as u32,
+                    (p >> 32) as u32,
+                    ty as u32,
+                    r as u32,
+                    rb as u32,
+                    off as u32,
+                ]);
                 seg_meta.push([ty, r as u64, rb as u64, 0, off as u64]);
                 rows += r;
             }
@@ -2637,7 +3273,10 @@ impl Mtp {
         let q2 = !q8 && std::env::var("TANG_FLASH_MTP_Q2").is_ok_and(|v| v == "1");
         // The drafter's vocabulary: token ids [0, n) and the specials from 248044 on
         // (`TANG_FLASH_MTP_VOCAB`, default 106000: same acceptance as the full head on chat and code, 65536 costs code d1 96 -> 92%; 0 = all).
-        let vocab_lo: Option<usize> = match std::env::var("TANG_FLASH_MTP_VOCAB").ok().and_then(|v| v.parse::<usize>().ok()) {
+        let vocab_lo: Option<usize> = match std::env::var("TANG_FLASH_MTP_VOCAB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
             Some(0) => None,
             Some(n) if n < 248_044 => Some(n),
             Some(_) => None,
@@ -2645,9 +3284,20 @@ impl Mtp {
         };
         let mut ex: Vec<B> = Vec::new();
         let mut ex_rb = [0usize; 3];
-        for (i, n) in ["ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"].iter().enumerate() {
+        for (i, n) in [
+            "ffn_gate_exps.weight",
+            "ffn_up_exps.weight",
+            "ffn_down_exps.weight",
+        ]
+        .iter()
+        .enumerate()
+        {
             let ti = t(n)?;
-            ensure!(ti.ty == GgmlType::Q8_0, "{n}: {:?} MTP experts (Q8_0 expected)", ti.ty);
+            ensure!(
+                ti.ty == GgmlType::Q8_0,
+                "{n}: {:?} MTP experts (Q8_0 expected)",
+                ti.ty
+            );
             let k = ti.row_len();
             let b = if q8 {
                 g.bytes(ti).to_vec()
@@ -2656,11 +3306,21 @@ impl Mtp {
             } else {
                 m::q8_to_q4_0(g.bytes(ti))?
             };
-            ex_rb[i] = if q8 { k / 32 * 34 } else if q2 { k / 64 * 18 } else { k / 32 * 18 };
+            ex_rb[i] = if q8 {
+                k / 32 * 34
+            } else if q2 {
+                k / 64 * 18
+            } else {
+                k / 32 * 18
+            };
             ex.push(m::upload_padded(dev, &b));
         }
         let emb_t = main.info("token_embd.weight")?;
-        ensure!(emb_t.ty == GgmlType::Q3K, "main embedding is {:?} (Q3_K expected)", emb_t.ty);
+        ensure!(
+            emb_t.ty == GgmlType::Q3K,
+            "main embedding is {:?} (Q3_K expected)",
+            emb_t.ty
+        );
         let z = |n: usize| dev.alloc_f32(n);
         let pairs = MAX_T * TOPK;
         Ok(Mtp {
@@ -2681,10 +3341,25 @@ impl Mtp {
             qn: f32v("attn_q_norm.weight")?,
             kn: f32v("attn_k_norm.weight")?,
             w_out: native(&[("attn_output.weight", 0)], HIDDEN)?,
-            router: native(&[("ffn_gate_inp.weight", 0), ("ffn_gate_inp_shexp.weight", EXPERTS)], ROUTER_ROWS)?,
-            sh_gu: native(&[("ffn_gate_shexp.weight", 0), ("ffn_up_shexp.weight", FF)], 2 * FF)?,
+            router: native(
+                &[
+                    ("ffn_gate_inp.weight", 0),
+                    ("ffn_gate_inp_shexp.weight", EXPERTS),
+                ],
+                ROUTER_ROWS,
+            )?,
+            sh_gu: native(
+                &[("ffn_gate_shexp.weight", 0), ("ffn_up_shexp.weight", FF)],
+                2 * FF,
+            )?,
             sh_down: native(&[("ffn_down_shexp.weight", 0)], HIDDEN)?,
-            ex_ty: if q8 { 8 } else if q2 { 42 } else { 2 },
+            ex_ty: if q8 {
+                8
+            } else if q2 {
+                42
+            } else {
+                2
+            },
             ex: [ex.remove(0), ex.remove(0), ex.remove(0)],
             ex_rb,
             embed: {
@@ -2715,7 +3390,14 @@ impl Mtp {
                     let ty = m::ggml_id(ht.ty)?;
                     Some((
                         Dw::Native {
-                            segs: dev.upload_u32(&[p as u32, (p >> 32) as u32, ty as u32, rows as u32, rb as u32, 0]),
+                            segs: dev.upload_u32(&[
+                                p as u32,
+                                (p >> 32) as u32,
+                                ty as u32,
+                                rows as u32,
+                                rb as u32,
+                                0,
+                            ]),
                             _w: w,
                             nseg: 1,
                             rows,
@@ -2728,8 +3410,11 @@ impl Mtp {
                     None
                 }
             },
-            head2: if vocab_lo.is_some() && !std::env::var("TANG_FLASH_MTP_HEAD2").is_ok_and(|v| v == "0") {
-                let n_lo = vocab_lo.context("TANG_FLASH_MTP_HEAD2 needs a pruned draft vocabulary")?;
+            head2: if vocab_lo.is_some()
+                && !std::env::var("TANG_FLASH_MTP_HEAD2").is_ok_and(|v| v == "0")
+            {
+                let n_lo =
+                    vocab_lo.context("TANG_FLASH_MTP_HEAD2 needs a pruned draft vocabulary")?;
                 let ht = main.info("output.weight")?;
                 ensure!(ht.ty == GgmlType::Q5K, "head2 assumes a Q5_K head");
                 let rb = ht.row_bytes()?;
@@ -2740,11 +3425,13 @@ impl Mtp {
                 let rows = n_lo + vocab - hi_base;
                 let mut f = vec![0f32; rows * HIDDEN];
                 use rayon::prelude::*;
-                f.par_chunks_mut(HIDDEN * 1024).enumerate().try_for_each(|(i, o)| -> Result<()> {
-                    let r0 = i * 1024;
-                    let n = o.len() / HIDDEN;
-                    crate::gguf::dequantize(ht.ty, &b[r0 * rb..(r0 + n) * rb], o)
-                })?;
+                f.par_chunks_mut(HIDDEN * 1024).enumerate().try_for_each(
+                    |(i, o)| -> Result<()> {
+                        let r0 = i * 1024;
+                        let n = o.len() / HIDDEN;
+                        crate::gguf::dequantize(ht.ty, &b[r0 * rb..(r0 + n) * rb], o)
+                    },
+                )?;
                 let rows = rows;
                 let q2 = m::f32_to_q2_0(&f);
                 let q2rb = HIDDEN / 64 * 18;
@@ -2753,7 +3440,14 @@ impl Mtp {
                 let exact = m::upload_padded(dev, &b);
                 Some((
                     Dw::Native {
-                        segs: dev.upload_u32(&[p as u32, (p >> 32) as u32, 42, rows as u32, q2rb as u32, 0]),
+                        segs: dev.upload_u32(&[
+                            p as u32,
+                            (p >> 32) as u32,
+                            42,
+                            rows as u32,
+                            q2rb as u32,
+                            0,
+                        ]),
                         _w: w,
                         nseg: 1,
                         rows,
@@ -2802,40 +3496,109 @@ impl Engine {
         let mt = self.mtp.as_mut().expect("MTP loaded");
         let s = &mut self.s;
         let a = |b: &B| dev.buffer_addr(b);
-        let launch = |f: Fun, grid: (u32, u32, u32), block: u32, args: &mut [*mut std::ffi::c_void]| unsafe {
+        let launch = |f: Fun,
+                      grid: (u32, u32, u32),
+                      block: u32,
+                      args: &mut [*mut std::ffi::c_void]| unsafe {
             gpu::launch(f, grid, (block, 1, 1), 0, &st, args).expect("mtp launch")
         };
         let ctl = a(&mt.ctl[step]);
         // embedding of the cells' tokens (step 0: staged by the host), then [e ; hn] per stream
         {
-            let (tb, rb, tk, e, k, lo, hi) = (a(&mt.embed), mt.embed_rb as i32, a(&mt.toks), a(&mt.e), HIDDEN as i32, mt.emb_lo, mt.emb_hi);
+            let (tb, rb, tk, e, k, lo, hi) = (
+                a(&mt.embed),
+                mt.embed_rb as i32,
+                a(&mt.toks),
+                a(&mt.e),
+                HIDDEN as i32,
+                mt.emb_lo,
+                mt.emb_hi,
+            );
             if step > 0 {
-                launch(self.k.m_embed, (c as u32, 1, 1), 256, tang_moe::args![tb, rb, tk, e, k, lo, hi]);
+                launch(
+                    self.k.m_embed,
+                    (c as u32, 1, 1),
+                    256,
+                    tang_moe::args![tb, rb, tk, e, k, lo, hi],
+                );
             }
             let (en, h, hn, cat, eps) = (a(&mt.enorm), a(&mt.h), a(&mt.hnorm), a(&mt.cat), EPS);
-            launch(self.k.m_cat, ((c * HC) as u32, 1, 1), 256, tang_moe::args![e, en, h, hn, cat, eps]);
+            launch(
+                self.k.m_cat,
+                ((c * HC) as u32, 1, 1),
+                256,
+                tang_moe::args![e, en, h, hn, cat, eps],
+            );
         }
         // R = eh_proj [e ; hn[c]], 4c rows of 5120, eight at a time
         let rows = c * HC;
         for r0 in (0..rows).step_by(MAX_T) {
             let n = (rows - r0).min(MAX_T);
-            mt.eh.native_ptr(dev, &nk, a(&mt.cat) + (r0 * 2 * HIDDEN * 4) as u64, a(&mt.r) + (r0 * HIDDEN * 4) as u64, n, 2 * HIDDEN, HIDDEN);
+            mt.eh.native_ptr(
+                dev,
+                &nk,
+                a(&mt.cat) + (r0 * 2 * HIDDEN * 4) as u64,
+                a(&mt.r) + (r0 * HIDDEN * 4) as u64,
+                n,
+                2 * HIDDEN,
+                HIDDEN,
+            );
         }
-        dev.hc_read_into(&mut mt.r, None, &mt.hc_a.w(), &mut s.x, Some(&mut s.xq), Some(&mut s.inj_a), &mut s.hc, c, EPS);
-        let mp = super::mtp_gpu::MTP_PROJ;
-        mt.w_in.native_ptr(dev, &nk, a(&s.x), a(&mt.proj), c, HIDDEN, mp);
-        {
-            let (pr, stride, qn, kn, cs, sn, q, kc, vc, eps) =
-                (a(&mt.proj), mp as i32, a(&mt.qn), a(&mt.kn), a(&self.rope.0), a(&self.rope.1), a(&mt.q), a(&mt.kc), a(&mt.vc), EPS);
-            launch(self.k.m_prep, (c as u32, 26, 1), 256, tang_moe::args![pr, stride, qn, kn, cs, sn, ctl, q, kc, vc, eps]);
-            let (out, part, nch) = (a(&mt.attn), a(&mt.part), mt.nchunk as i32);
-            launch(self.k.m_attn_part, (c as u32, QSA_KV as u32, mt.nchunk as u32), 128, tang_moe::args![q, kc, vc, ctl, part, nch]);
-            launch(self.k.m_attn_merge, (c as u32, QSA_HEADS as u32, 1), 256, tang_moe::args![part, nch, pr, stride, out]);
-        }
-        mt.w_out.native_ptr(dev, &nk, a(&mt.attn), a(&s.mix), c, QSA_OUT, HIDDEN);
         dev.hc_read_into(
             &mut mt.r,
-            Some(HcPending::Write { y: &s.mix, inj: &s.inj_a }),
+            None,
+            &mt.hc_a.w(),
+            &mut s.x,
+            Some(&mut s.xq),
+            Some(&mut s.inj_a),
+            &mut s.hc,
+            c,
+            EPS,
+        );
+        let mp = super::mtp_gpu::MTP_PROJ;
+        mt.w_in
+            .native_ptr(dev, &nk, a(&s.x), a(&mt.proj), c, HIDDEN, mp);
+        {
+            let (pr, stride, qn, kn, cs, sn, q, kc, vc, eps) = (
+                a(&mt.proj),
+                mp as i32,
+                a(&mt.qn),
+                a(&mt.kn),
+                a(&self.rope.0),
+                a(&self.rope.1),
+                a(&mt.q),
+                a(&mt.kc),
+                a(&mt.vc),
+                EPS,
+            );
+            launch(
+                self.k.m_prep,
+                (c as u32, 26, 1),
+                256,
+                tang_moe::args![pr, stride, qn, kn, cs, sn, ctl, q, kc, vc, eps],
+            );
+            let (out, part, nch) = (a(&mt.attn), a(&mt.part), mt.nchunk as i32);
+            launch(
+                self.k.m_attn_part,
+                (c as u32, QSA_KV as u32, mt.nchunk as u32),
+                128,
+                tang_moe::args![q, kc, vc, ctl, part, nch],
+            );
+            launch(
+                self.k.m_attn_merge,
+                (c as u32, QSA_HEADS as u32, 1),
+                256,
+                tang_moe::args![part, nch, pr, stride, out],
+            );
+        }
+        mt.w_out
+            .native_ptr(dev, &nk, a(&mt.attn), a(&s.mix), c, QSA_OUT, HIDDEN);
+        dev.hc_read_into(
+            &mut mt.r,
+            Some(HcPending::Write {
+                y: &s.mix,
+                inj: &s.inj_a,
+            }),
             &mt.hc_f.w(),
             &mut s.x2,
             Some(&mut s.xq),
@@ -2844,31 +3607,83 @@ impl Engine {
             c,
             EPS,
         );
-        mt.router.native_ptr(dev, &nk, a(&s.x2), a(&s.logits), c, HIDDEN, ROUTER_ROWS);
+        mt.router
+            .native_ptr(dev, &nk, a(&s.x2), a(&s.logits), c, HIDDEN, ROUTER_ROWS);
         dev.router_topk_into(&s.logits, ROUTER_ROWS, EXPERTS, &mut s.ids, &mut s.w, c);
         // routed experts: gate | up rows per (token, rank), SwiGLU, down rows into parts
         {
             let pairs = (c * TOPK) as u32;
-            let (ids, x2, gu, hf, hq, parts) = (a(&s.ids), a(&s.x2), a(&mt.gu), a(&mt.hf), a(&mt.hq), a(&s.parts));
+            let (ids, x2, gu, hf, hq, parts) = (
+                a(&s.ids),
+                a(&s.x2),
+                a(&mt.gu),
+                a(&mt.hf),
+                a(&mt.hq),
+                a(&s.parts),
+            );
             let ty = mt.ex_ty;
             for (i, ooff) in [(0usize, 0i32), (1, FF as i32)] {
-                let (base, es, rb, rows, xd, k, os) =
-                    (a(&mt.ex[i]), (FF * mt.ex_rb[i]) as u64, mt.ex_rb[i] as i32, FF as i32, TOPK as i32, HIDDEN as i32, (2 * FF) as i32);
-                launch(self.k.m_moe, ((FF / 8) as u32, pairs, 1), 256, tang_moe::args![ty, base, es, rb, rows, ids, x2, xd, k, gu, os, ooff]);
+                let (base, es, rb, rows, xd, k, os) = (
+                    a(&mt.ex[i]),
+                    (FF * mt.ex_rb[i]) as u64,
+                    mt.ex_rb[i] as i32,
+                    FF as i32,
+                    TOPK as i32,
+                    HIDDEN as i32,
+                    (2 * FF) as i32,
+                );
+                launch(
+                    self.k.m_moe,
+                    ((FF / 8) as u32, pairs, 1),
+                    256,
+                    tang_moe::args![ty, base, es, rb, rows, ids, x2, xd, k, gu, os, ooff],
+                );
             }
             let (ff, np) = (FF as i32, pairs as i32);
-            launch(self.k.silu_q, ((FF / 32) as u32, pairs, 1), 32, tang_moe::args![gu, hq, hf, ff, np]);
-            let (base, es, rb, rows, xd, k, os, ooff) =
-                (a(&mt.ex[2]), (HIDDEN * mt.ex_rb[2]) as u64, mt.ex_rb[2] as i32, HIDDEN as i32, 1i32, FF as i32, HIDDEN as i32, 0i32);
-            launch(self.k.m_moe, ((HIDDEN / 8) as u32, pairs, 1), 256, tang_moe::args![ty, base, es, rb, rows, ids, hf, xd, k, parts, os, ooff]);
+            launch(
+                self.k.silu_q,
+                ((FF / 32) as u32, pairs, 1),
+                32,
+                tang_moe::args![gu, hq, hf, ff, np],
+            );
+            let (base, es, rb, rows, xd, k, os, ooff) = (
+                a(&mt.ex[2]),
+                (HIDDEN * mt.ex_rb[2]) as u64,
+                mt.ex_rb[2] as i32,
+                HIDDEN as i32,
+                1i32,
+                FF as i32,
+                HIDDEN as i32,
+                0i32,
+            );
+            launch(
+                self.k.m_moe,
+                ((HIDDEN / 8) as u32, pairs, 1),
+                256,
+                tang_moe::args![ty, base, es, rb, rows, ids, hf, xd, k, parts, os, ooff],
+            );
         }
         // shared expert into parts' shared rows
-        mt.sh_gu.native_ptr(dev, &nk, a(&s.x2), a(&s.gu), c, HIDDEN, 2 * FF);
+        mt.sh_gu
+            .native_ptr(dev, &nk, a(&s.x2), a(&s.gu), c, HIDDEN, 2 * FF);
         {
             let (gu, hq, hf, ff, ti) = (a(&s.gu), a(&s.hq), a(&s.hf), FF as i32, c as i32);
-            launch(self.k.silu_q, ((FF / 32) as u32, c as u32, 1), 32, tang_moe::args![gu, hq, hf, ff, ti]);
+            launch(
+                self.k.silu_q,
+                ((FF / 32) as u32, c as u32, 1),
+                32,
+                tang_moe::args![gu, hq, hf, ff, ti],
+            );
         }
-        mt.sh_down.native_ptr(dev, &nk, a(&s.hf), a(&s.parts) + (MoePlan::SHARED_ROW * HIDDEN * 4) as u64, c, FF, HIDDEN);
+        mt.sh_down.native_ptr(
+            dev,
+            &nk,
+            a(&s.hf),
+            a(&s.parts) + (MoePlan::SHARED_ROW * HIDDEN * 4) as u64,
+            c,
+            FF,
+            HIDDEN,
+        );
         dev.hc_read_into(
             &mut mt.r,
             Some(HcPending::Moe {
@@ -2893,11 +3708,34 @@ impl Engine {
             let rows = n_lo + self.hp.n_vocab - hi;
             h2.native_ptr(dev, &nk, xl, a(&mt.logits), 1, HIDDEN, rows);
             let (lg, n, part) = (a(&mt.logits), rows as i32, a(&mt.short));
-            launch(self.k.m_short1, (64, 1, 1), 1024, tang_moe::args![lg, n, part]);
-            let (np, hd, rbi, ids, pr, nl, hb) = (64i32, a(exact), *rb as i32, a(&mt.drafts[step]), a(&mt.probs[step]), *n_lo as i32, *hi as i32);
+            launch(
+                self.k.m_short1,
+                (64, 1, 1),
+                1024,
+                tang_moe::args![lg, n, part],
+            );
+            let (np, hd, rbi, ids, pr, nl, hb) = (
+                64i32,
+                a(exact),
+                *rb as i32,
+                a(&mt.drafts[step]),
+                a(&mt.probs[step]),
+                *n_lo as i32,
+                *hi as i32,
+            );
             let ex = part + (64 * 10 * 4) as u64;
-            launch(self.k.m_short2a, (32, 1, 1), 256, tang_moe::args![part, np, hd, rbi, xl, ex]);
-            launch(self.k.m_short2b, (1, 1, 1), 256, tang_moe::args![part, np, ex, ids, pr, nl, hb]);
+            launch(
+                self.k.m_short2a,
+                (32, 1, 1),
+                256,
+                tang_moe::args![part, np, hd, rbi, xl, ex],
+            );
+            launch(
+                self.k.m_short2b,
+                (1, 1, 1),
+                256,
+                tang_moe::args![part, np, ex, ids, pr, nl, hb],
+            );
             return;
         }
         let (v, n_lo, hi_base) = match &mt.dhead {
@@ -2908,14 +3746,32 @@ impl Engine {
             }
             None => {
                 let v = self.hp.n_vocab;
-                self.head.native_ptr(dev, &nk, xl, a(&mt.logits), 1, HIDDEN, v);
+                self.head
+                    .native_ptr(dev, &nk, xl, a(&mt.logits), 1, HIDDEN, v);
                 (v, v as i32, 0)
             }
         };
         {
-            let (lg, n, part, np, ids, pr) = (a(&mt.logits), v as i32, a(&mt.amax), 64i32, a(&mt.drafts[step]), a(&mt.probs[step]));
-            launch(self.k.m_amax1, (64, 1, 1), 1024, tang_moe::args![lg, n, part]);
-            launch(self.k.m_amax2, (1, 1, 1), 32, tang_moe::args![part, np, ids, pr, n_lo, hi_base]);
+            let (lg, n, part, np, ids, pr) = (
+                a(&mt.logits),
+                v as i32,
+                a(&mt.amax),
+                64i32,
+                a(&mt.drafts[step]),
+                a(&mt.probs[step]),
+            );
+            launch(
+                self.k.m_amax1,
+                (64, 1, 1),
+                1024,
+                tang_moe::args![lg, n, part],
+            );
+            launch(
+                self.k.m_amax2,
+                (1, 1, 1),
+                32,
+                tang_moe::args![part, np, ids, pr, n_lo, hi_base],
+            );
         }
     }
 
@@ -2934,17 +3790,40 @@ impl Engine {
             {
                 let mt = self.mtp.as_ref().unwrap();
                 let a = |b: &B| self.dev.buffer_addr(b);
-                let (r, h, d, tk, cp, cn) = (a(&mt.r), a(&mt.h), a(&mt.drafts[step - 1]), a(&mt.toks), a(&mt.ctl[step - 1]), a(&mt.ctl[step]));
+                let (r, h, d, tk, cp, cn) = (
+                    a(&mt.r),
+                    a(&mt.h),
+                    a(&mt.drafts[step - 1]),
+                    a(&mt.toks),
+                    a(&mt.ctl[step - 1]),
+                    a(&mt.ctl[step]),
+                );
                 unsafe {
-                    gpu::launch(self.k.m_next, (20, 1, 1), (512, 1, 1), 0, &self.stream, tang_moe::args![r, h, d, tk, cp, cn]).expect("launch")
+                    gpu::launch(
+                        self.k.m_next,
+                        (20, 1, 1),
+                        (512, 1, 1),
+                        0,
+                        &self.stream,
+                        tang_moe::args![r, h, d, tk, cp, cn],
+                    )
+                    .expect("launch")
                 };
             }
             self.enqueue_mtp_cells(step, 1);
         }
         let mt = self.mtp.as_ref().unwrap();
         for step in 0..steps {
-            self.kcopy(self.io_dev(Io::MTP_OUT + 64 * step), self.dev.buffer_addr(&mt.drafts[step]), 4 * MAX_T);
-            self.kcopy(self.io_dev(Io::MTP_OUT + 64 * step + 32), self.dev.buffer_addr(&mt.probs[step]), 4 * MAX_T);
+            self.kcopy(
+                self.io_dev(Io::MTP_OUT + 64 * step),
+                self.dev.buffer_addr(&mt.drafts[step]),
+                4 * MAX_T,
+            );
+            self.kcopy(
+                self.io_dev(Io::MTP_OUT + 64 * step + 32),
+                self.dev.buffer_addr(&mt.probs[step]),
+                4 * MAX_T,
+            );
         }
     }
 
@@ -3019,9 +3898,16 @@ impl Engine {
         if self.use_graphs && ready && std::env::var("TANG_FLASH_MTP_TIMING").is_ok() {
             let g = self.mtp.as_ref().unwrap().graphs[c].as_ref().unwrap() as *const Graph;
             let stream = ManuallyDrop::new(Stream(self.dev.cu_stream()));
-            self.last_mtp_gpu_ms = self.dev.event_ms(&mut || unsafe { &*g }.launch(&stream).expect("mtp graph")) as f64;
+            self.last_mtp_gpu_ms = self
+                .dev
+                .event_ms(&mut || unsafe { &*g }.launch(&stream).expect("mtp graph"))
+                as f64;
         } else if self.use_graphs && ready {
-            self.mtp.as_ref().unwrap().graphs[c].as_ref().unwrap().launch(&self.stream).map_err(|e| anyhow!("{e}"))?;
+            self.mtp.as_ref().unwrap().graphs[c]
+                .as_ref()
+                .unwrap()
+                .launch(&self.stream)
+                .map_err(|e| anyhow!("{e}"))?;
         } else {
             self.enqueue_mtp(c);
         }
@@ -3057,7 +3943,11 @@ pub struct RunningState {
 impl RunningState {
     /// Host bytes held.
     pub fn bytes(&self) -> usize {
-        4 * (self.gdn.iter().map(|(a, b)| a.len() + b.len()).sum::<usize>()
+        4 * (self
+            .gdn
+            .iter()
+            .map(|(a, b)| a.len() + b.len())
+            .sum::<usize>()
             + self.qsa_ring.iter().map(Vec::len).sum::<usize>()
             + self.ple_ring.len())
     }
@@ -3081,7 +3971,11 @@ impl RunningState {
 
     /// The inverse of [`parts`](Self::parts), for a model with `gdn_layers` GDN layers.
     pub fn from_parts(pos: usize, gdn_layers: usize, mut parts: Vec<Vec<f32>>) -> Result<Self> {
-        ensure!(parts.len() > 2 * gdn_layers, "state has {} parts", parts.len());
+        ensure!(
+            parts.len() > 2 * gdn_layers,
+            "state has {} parts",
+            parts.len()
+        );
         let ple_ring = parts.pop().unwrap();
         let qsa_ring = parts.split_off(2 * gdn_layers);
         let mut gdn = Vec::new();
@@ -3089,7 +3983,12 @@ impl RunningState {
         while let (Some(s), Some(h)) = (it.next(), it.next()) {
             gdn.push((s, h));
         }
-        Ok(RunningState { pos, gdn, qsa_ring, ple_ring })
+        Ok(RunningState {
+            pos,
+            gdn,
+            qsa_ring,
+            ple_ring,
+        })
     }
 }
 
@@ -3105,14 +4004,29 @@ impl Engine {
             .filter_map(|l| l.gdn.as_ref())
             .map(|g| (dev.download(&g.state), dev.download(&g.hist)))
             .collect();
-        let qsa_ring = self.layers.iter().filter_map(|l| l.qsa.as_ref()).map(|q| dev.download(&q.ring)).collect();
-        Ok(RunningState { pos: self.tokens.len(), gdn, qsa_ring, ple_ring: dev.download(&self.ple.ring) })
+        let qsa_ring = self
+            .layers
+            .iter()
+            .filter_map(|l| l.qsa.as_ref())
+            .map(|q| dev.download(&q.ring))
+            .collect();
+        Ok(RunningState {
+            pos: self.tokens.len(),
+            gdn,
+            qsa_ring,
+            ple_ring: dev.download(&self.ple.ring),
+        })
     }
 
     /// Resume at `s.pos` with `prefix` (`s.pos` tokens, the sequence `s` was saved after). MTP
     /// drafts are dropped until the next window.
     pub fn restore_running(&mut self, s: &RunningState, prefix: &[u32]) -> Result<()> {
-        ensure!(prefix.len() == s.pos, "prefix of {} tokens for a state at {}", prefix.len(), s.pos);
+        ensure!(
+            prefix.len() == s.pos,
+            "prefix of {} tokens for a state at {}",
+            prefix.len(),
+            s.pos
+        );
         self.side.sync().map_err(|e| anyhow!("{e}"))?;
         self.dev.sync();
         let mut gi = 0;
@@ -3125,11 +4039,17 @@ impl Engine {
                 gi += 1;
             }
             if let Some(q) = l.qsa.as_mut() {
-                self.dev.upload_into_f32(&mut q.ring, s.qsa_ring.get(qi).context("state has fewer QSA layers")?);
+                self.dev.upload_into_f32(
+                    &mut q.ring,
+                    s.qsa_ring.get(qi).context("state has fewer QSA layers")?,
+                );
                 qi += 1;
             }
         }
-        ensure!(gi == s.gdn.len() && qi == s.qsa_ring.len(), "state is for another model");
+        ensure!(
+            gi == s.gdn.len() && qi == s.qsa_ring.len(),
+            "state is for another model"
+        );
         self.dev.upload_into_f32(&mut self.ple.ring, &s.ple_ring);
         self.dev.sync();
         self.tokens.clear();
@@ -3190,9 +4110,16 @@ impl Engine {
             let mut host = vec![0u8; (r1 - r0) * row];
             if !host.is_empty() {
                 let r = unsafe {
-                    cudarc::driver::sys::cuMemcpyDtoH_v2(host.as_mut_ptr() as *mut _, addr + (r0 * row) as u64, host.len())
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        host.as_mut_ptr() as *mut _,
+                        addr + (r0 * row) as u64,
+                        host.len(),
+                    )
                 };
-                ensure!(r == cudarc::driver::sys::CUresult::CUDA_SUCCESS, "cuMemcpyDtoH: {r:?}");
+                ensure!(
+                    r == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+                    "cuMemcpyDtoH: {r:?}"
+                );
             }
             bufs.push(host);
         }
@@ -3202,19 +4129,32 @@ impl Engine {
     /// Write positions `from.max(p.from)..p.to` of `p` back.
     pub fn restore_positional(&mut self, p: &Positional, from: usize) -> Result<()> {
         let bufs = self.positional_bufs();
-        ensure!(bufs.len() == p.bufs.len(), "positional state is for another model");
+        ensure!(
+            bufs.len() == p.bufs.len(),
+            "positional state is for another model"
+        );
         self.side.sync().map_err(|e| anyhow!("{e}"))?;
         self.dev.sync();
         let from = from.max(p.from);
         for ((addr, per, row), host) in bufs.into_iter().zip(&p.bufs) {
             let (r0, r1, base) = (from / per, p.to / per, p.from / per);
-            ensure!(host.len() == (r1 - base) * row, "positional state size differs");
+            ensure!(
+                host.len() == (r1 - base) * row,
+                "positional state size differs"
+            );
             if r1 > r0 {
                 let src = &host[(r0 - base) * row..];
                 let r = unsafe {
-                    cudarc::driver::sys::cuMemcpyHtoD_v2(addr + (r0 * row) as u64, src.as_ptr() as *const _, (r1 - r0) * row)
+                    cudarc::driver::sys::cuMemcpyHtoD_v2(
+                        addr + (r0 * row) as u64,
+                        src.as_ptr() as *const _,
+                        (r1 - r0) * row,
+                    )
                 };
-                ensure!(r == cudarc::driver::sys::CUresult::CUDA_SUCCESS, "cuMemcpyHtoD: {r:?}");
+                ensure!(
+                    r == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+                    "cuMemcpyHtoD: {r:?}"
+                );
             }
         }
         Ok(())
@@ -3236,7 +4176,11 @@ impl Engine {
     /// the plain Gumbel-max over the whole vocabulary. Window graphs are recaptured.
     pub fn enable_sampler(&mut self) -> Result<()> {
         if self.sampler.is_none() {
-            self.sampler = Some(Box::new(super::sampler::Sampler::new(&self.gpu, &self.dev, self.hp.n_vocab)?));
+            self.sampler = Some(Box::new(super::sampler::Sampler::new(
+                &self.gpu,
+                &self.dev,
+                self.hp.n_vocab,
+            )?));
             for g in self.graphs.iter_mut() {
                 *g = None;
             }
@@ -3264,9 +4208,17 @@ impl Engine {
     /// rows), and there is no head: for every prompt window but the last.
     pub fn prefill_wide(&mut self, pos0: usize, t: usize) -> Result<WinStats> {
         ensure!(t > MAX_T && t <= WIDE && pos0 + t <= self.tokens.len());
-        ensure!(pos0 + t <= self.opts.max_ctx, "context {} > max {}", pos0 + t, self.opts.max_ctx);
+        ensure!(
+            pos0 + t <= self.opts.max_ctx,
+            "context {} > max {}",
+            pos0 + t,
+            self.opts.max_ctx
+        );
         let w0 = Instant::now();
-        let mut st = WinStats { t, ..Default::default() };
+        let mut st = WinStats {
+            t,
+            ..Default::default()
+        };
         self.stage(pos0, t)?;
         self.keys.clear();
         self.wide = true;
@@ -3292,7 +4244,10 @@ impl Engine {
         }
         // Routing from the ids copied out per layer: statistics and the cache's adaptation.
         for l in 0..self.layers.len() {
-            let mut d: Vec<u32> = self.io.u32s(Io::LIDS + l * 4 * WIDE * TOPK, t * TOPK).to_vec();
+            let mut d: Vec<u32> = self
+                .io
+                .u32s(Io::LIDS + l * 4 * WIDE * TOPK, t * TOPK)
+                .to_vec();
             d.sort_unstable();
             d.dedup();
             st.routed += t * TOPK;
@@ -3312,10 +4267,12 @@ impl Engine {
             let g = Graph::capture(&stream, |_| {
                 // SAFETY: `self` is not otherwise touched during capture.
                 let me = unsafe { &mut *me };
-                me.enqueue_window(t, false, false, &mut |_, _| Ok(())).map_err(|e| tang_moe::gpu::Error(format!("{e}")))
+                me.enqueue_window(t, false, false, &mut |_, _| Ok(()))
+                    .map_err(|e| tang_moe::gpu::Error(format!("{e}")))
             });
             self.wide = false;
-            self.wide_graphs.insert(t, g.map_err(|e| anyhow!("capture wide T={t}: {e}"))?);
+            self.wide_graphs
+                .insert(t, g.map_err(|e| anyhow!("capture wide T={t}: {e}"))?);
         }
         st.wall_ms = w0.elapsed().as_secs_f64() * 1e3;
         Ok(st)

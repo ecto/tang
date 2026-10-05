@@ -223,9 +223,9 @@ impl MissExec {
                 let (gl, gw, ul, uw) = if tiled {
                     (
                         Layout::GuTiled { up: false },
-                        &j.blob[..],
+                        j.blob,
                         Layout::GuTiled { up: true },
-                        &j.blob[..],
+                        j.blob,
                     )
                 } else {
                     (
@@ -287,7 +287,7 @@ impl MissExec {
                 let hs = &hk[..nt];
                 let mut y = [0f32; 64 * MAX_T];
                 let (dl, dw) = if tiled {
-                    (Layout::DownTiled, &j.blob[..])
+                    (Layout::DownTiled, j.blob)
                 } else {
                     (Layout::Plain, &j.blob[ExpertBlob::DOWN..ExpertBlob::BYTES])
                 };
