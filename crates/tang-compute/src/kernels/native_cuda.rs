@@ -212,6 +212,8 @@ extern "C" __global__ void __launch_bounds__(256) fl_nat_t##T( \
     nat_body<NAT_TY, T, nat_gr(NAT_TY, T)>(blockIdx.x, XQ, W, Y, K, N, KS, hoff, soff, OS); \
 }
 NAT(1) NAT(2) NAT(3) NAT(4) NAT(5) NAT(6) NAT(7) NAT(8)
+// Prefill-only widths (flash-serve).
+NAT(16) NAT(32) NAT(64)
 #else
 // ---- stacked: every segment of a stacked projection in one launch ----
 
