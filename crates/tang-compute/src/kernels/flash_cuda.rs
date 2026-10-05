@@ -1645,79 +1645,78 @@ __device__ __forceinline__ void tile_mma(const unsigned char* __restrict__ codes
     const unsigned int* xs = X + (u64)m_rows * kb;
     const unsigned int hoff = m_rows * nch;
     #define TM_ROW(e) (rmap ? rmap[min((unsigned int)(e), ne - 1)] : rbase + min((unsigned int)(e), ne - 1))
-    unsigned int rowB[2] = {TM_ROW(gid), TM_ROW(8 + gid)};
-    unsigned int rowE[2][2] = {{TM_ROW(2 * tig), TM_ROW(2 * tig + 1)}, {TM_ROW(8 + 2 * tig), TM_ROW(9 + 2 * tig)}};
-    #undef TM_ROW
-    float acc[2][2][2][4][2];  // [n tile][rr][ec][b][half]
-    #pragma unroll
-    for (int nt = 0; nt < 2; nt++)
+    #pragma unroll 1
+    for (unsigned int nt = 0; 8 * nt < ne; nt++) {
+        const unsigned int rowB = TM_ROW(8 * nt + gid);
+        const unsigned int rowE[2] = {TM_ROW(8 * nt + 2 * tig), TM_ROW(8 * nt + 2 * tig + 1)};
+        float acc[2][2][4][2];  // [rr][ec][b][half]
         #pragma unroll
         for (int rr = 0; rr < 2; rr++)
             #pragma unroll
             for (int ec = 0; ec < 2; ec++)
                 #pragma unroll
-                for (int b = 0; b < 4; b++) { acc[nt][rr][ec][b][0] = 0.0f; acc[nt][rr][ec][b][1] = 0.0f; }
-    const int NT = ne > 8 ? 2 : 1;
-    #pragma unroll 1
-    for (int g = 0; g < G; g++) {
-        uint4 w[2][2];
-        unsigned int dsw[2];
-        #pragma unroll
-        for (int rr = 0; rr < 2; rr++) {
-            const uint4* wp = (const uint4*)(codes + g * 512 + (gid + 8 * rr) * 32);
-            w[rr][0] = __ldg(wp);
-            w[rr][1] = __ldg(wp + 1);
-            dsw[rr] = __ldg((const unsigned int*)(scales + g * 64 + (gid + 8 * rr) * 4));
-        }
-        // A words: chunk b's 8 code bytes are (w[b/2] .x,.y | .z,.w); half 0 = first word.
-        unsigned int A[2][4][2];
-        #pragma unroll
-        for (int rr = 0; rr < 2; rr++) {
-            unsigned int cw[8] = {w[rr][0].x, w[rr][0].y, w[rr][0].z, w[rr][0].w, w[rr][1].x, w[rr][1].y, w[rr][1].z, w[rr][1].w};
+                for (int b = 0; b < 4; b++) { acc[rr][ec][b][0] = 0.0f; acc[rr][ec][b][1] = 0.0f; }
+        #pragma unroll 2
+        for (int g = 0; g < G; g++) {
+            uint4 w[2][2];
+            unsigned int dsw[2];
             #pragma unroll
-            for (int b = 0; b < 4; b++)
-                #pragma unroll
-                for (int hf = 0; hf < 2; hf++) A[rr][b][hf] = (cw[2 * b + hf] >> (2 * tig)) & 0x03030303u;
-        }
-        #pragma unroll
-        for (int nt = 0; nt < 2; nt++) {
-            if (nt >= NT) break;
-            int C[4][2][4];
+            for (int rr = 0; rr < 2; rr++) {
+                const uint4* wp = (const uint4*)(codes + g * 512 + (gid + 8 * rr) * 32);
+                w[rr][0] = __ldg(wp);
+                w[rr][1] = __ldg(wp + 1);
+                dsw[rr] = __ldg((const unsigned int*)(scales + g * 64 + (gid + 8 * rr) * 4));
+            }
+            const uint4* xp = (const uint4*)(X + (u64)rowB * kb + (4 * g) * 8);
+            float dx[2][4];
+            int nh[2][4];
             #pragma unroll
-            for (int b = 0; b < 4; b++)
+            for (int ec = 0; ec < 2; ec++) {
+                const unsigned int ci = rowE[ec] * nch + 4 * g;
+                uint4 d4 = CG ? __ldcg((const uint4*)(xs + ci)) : *(const uint4*)(xs + ci);
+                uint4 h4 = CG ? __ldcg((const uint4*)(xs + hoff + ci)) : *(const uint4*)(xs + hoff + ci);
+                dx[ec][0] = __uint_as_float(d4.x); dx[ec][1] = __uint_as_float(d4.y);
+                dx[ec][2] = __uint_as_float(d4.z); dx[ec][3] = __uint_as_float(d4.w);
+                nh[ec][0] = -(int)h4.x; nh[ec][1] = -(int)h4.y; nh[ec][2] = -(int)h4.z; nh[ec][3] = -(int)h4.w;
+            }
+            #pragma unroll
+            for (int b = 0; b < 4; b++) {
+                // Chunk b's 8 activation words (both halves); this thread's B word is word tig of each.
+                uint4 x0 = CG ? __ldcg(xp + 2 * b) : xp[2 * b], x1 = CG ? __ldcg(xp + 2 * b + 1) : xp[2 * b + 1];
+                unsigned int xw[2] = {tig == 0 ? x0.x : tig == 1 ? x0.y : tig == 2 ? x0.z : x0.w,
+                                      tig == 0 ? x1.x : tig == 1 ? x1.y : tig == 2 ? x1.z : x1.w};
                 #pragma unroll
                 for (int hf = 0; hf < 2; hf++) {
-                    const unsigned int* xp = X + (u64)rowB[nt] * kb + (4 * g + b) * 8 + hf * 4 + tig;
-                    unsigned int bw = CG ? __ldcg(xp) : *xp;
-                    mma16816(C[b][hf], A[0][b][hf], A[1][b][hf], bw);
-                }
-            #pragma unroll
-            for (int ec = 0; ec < 2; ec++)
-                #pragma unroll
-                for (int b = 0; b < 4; b++) {
-                    unsigned int ci = rowE[nt][ec] * nch + 4 * g + b;
-                    float dx = __uint_as_float(CG ? __ldcg(xs + ci) : xs[ci]);
-                    int nh = -(int)(CG ? __ldcg(xs + hoff + ci) : xs[hoff + ci]);
+                    unsigned int cw0 = (b < 2 ? (b == 0 ? (hf ? w[0][0].y : w[0][0].x) : (hf ? w[0][0].w : w[0][0].z))
+                                              : (b == 2 ? (hf ? w[0][1].y : w[0][1].x) : (hf ? w[0][1].w : w[0][1].z)));
+                    unsigned int cw1 = (b < 2 ? (b == 0 ? (hf ? w[1][0].y : w[1][0].x) : (hf ? w[1][0].w : w[1][0].z))
+                                              : (b == 2 ? (hf ? w[1][1].y : w[1][1].x) : (hf ? w[1][1].w : w[1][1].z)));
+                    int C[4];
+                    mma16816(C, (cw0 >> (2 * tig)) & 0x03030303u, (cw1 >> (2 * tig)) & 0x03030303u, xw[hf]);
                     #pragma unroll
                     for (int rr = 0; rr < 2; rr++) {
-                        float dd = h2f((unsigned short)(dsw[rr] >> (16 * (b >> 1)))) * dx;
-                        acc[nt][rr][ec][b][0] = __fmaf_rn((float)(C[b][0][2 * rr + ec] + nh), dd, acc[nt][rr][ec][b][0]);
-                        acc[nt][rr][ec][b][1] = __fmaf_rn((float)C[b][1][2 * rr + ec], dd, acc[nt][rr][ec][b][1]);
+                        float ds = h2f((unsigned short)(dsw[rr] >> (16 * (b >> 1))));
+                        #pragma unroll
+                        for (int ec = 0; ec < 2; ec++) {
+                            float dd = ds * dx[ec][b];
+                            int sv = hf ? C[2 * rr + ec] : C[2 * rr + ec] + nh[ec][b];
+                            acc[rr][ec][b][hf] = __fmaf_rn((float)sv, dd, acc[rr][ec][b][hf]);
+                        }
                     }
                 }
+            }
         }
-    }
-    #pragma unroll
-    for (int nt = 0; nt < 2; nt++)
         #pragma unroll
         for (int rr = 0; rr < 2; rr++)
             #pragma unroll
             for (int ec = 0; ec < 2; ec++) {
-                float (*a)[2] = acc[nt][rr][ec];
+                float (*a)[2] = acc[rr][ec];
                 float x = (a[0][0] + a[2][0]) + (a[1][0] + a[3][0]);
                 float y = (a[0][1] + a[2][1]) + (a[1][1] + a[3][1]);
                 out[gid + 8 * rr][8 * nt + 2 * tig + ec] = x + y;
             }
+    }
+    #undef TM_ROW
 }
 
 // Gate and up rows of every planned expert for its tokens, h = psilu(gate)·up quantized per
@@ -1799,7 +1798,11 @@ extern "C" __global__ void __launch_bounds__(128, 8) fl_moe_gu_t##T( \
 }
 MOE_GU(1) MOE_GU(2) MOE_GU(3) MOE_GU(4) MOE_GU(5) MOE_GU(6) MOE_GU(7) MOE_GU(8)
 #ifdef FLASH_WIDE
-MOE_GU(64)
+extern "C" __global__ void __launch_bounds__(128, 4) fl_moe_gu_t64(
+    const unsigned int* __restrict__ XQ, unsigned int Tm, const unsigned int* __restrict__ PLAN,
+    unsigned int* __restrict__ HQ) {
+    moe_gu_body<64>(XQ, Tm, PLAN, HQ);
+}
 #endif
 
 // Down rows of every planned expert against its entries' quantized h (HQ), into PARTS[dst]:
@@ -1891,7 +1894,10 @@ extern "C" __global__ void __launch_bounds__(256, 3) fl_moe_down_t##T( \
 }
 MOE_DOWN(1) MOE_DOWN(2) MOE_DOWN(3) MOE_DOWN(4) MOE_DOWN(5) MOE_DOWN(6) MOE_DOWN(7) MOE_DOWN(8)
 #ifdef FLASH_WIDE
-MOE_DOWN(64)
+extern "C" __global__ void __launch_bounds__(256, 2) fl_moe_down_t64(
+    const unsigned int* __restrict__ HQ, const unsigned int* __restrict__ PLAN, float* __restrict__ PARTS) {
+    moe_down_body<64>(HQ, PLAN, PARTS);
+}
 #endif
 
 // gu and down in one launch on a co-resident grid of 128-thread blocks: items are every group's
@@ -1939,7 +1945,11 @@ extern "C" __global__ void __launch_bounds__(128, 8) fl_moe_fused_t##T( \
 }
 MOE_FUSED(1) MOE_FUSED(2) MOE_FUSED(3) MOE_FUSED(4) MOE_FUSED(5) MOE_FUSED(6) MOE_FUSED(7) MOE_FUSED(8)
 #ifdef FLASH_WIDE
-MOE_FUSED(64)
+extern "C" __global__ void __launch_bounds__(128, 4) fl_moe_fused_t64(
+    const unsigned int* __restrict__ XQ, unsigned int Tm, const unsigned int* __restrict__ PLAN,
+    unsigned int* __restrict__ HQ, float* __restrict__ PARTS, unsigned int* __restrict__ CNT) {
+    moe_fused_body<64>(XQ, Tm, PLAN, HQ, PARTS, CNT);
+}
 #endif
 
 // y[t] = Σ_i w[t][i] parts[t·10 + i] (+ σ(logit[t][sg]) parts[SHARED_ROW + t]). Grid

@@ -50,6 +50,13 @@ fn wide_v1() -> bool {
     *U.get_or_init(|| std::env::var("TANG_FLASH_NATW").is_ok_and(|v| v == "v1"))
 }
 
+/// Wide native GEMV on int8 tensor cores (`fl_natmma`) unless `TANG_FLASH_NATW` picks a dp4a
+/// variant.
+fn wide_mma() -> bool {
+    static U: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *U.get_or_init(|| std::env::var("TANG_FLASH_NATW").is_ok_and(|v| v == "mma"))
+}
+
 /// `TANG_FLASH_NATW=16x4`: the wide native GEMV's token tile and rows a warp (A/B; instantiated
 /// 8x2 8x4 8x8 16x2 16x4 12x4 32x1 32x2).
 fn natw_variant() -> Option<(usize, usize)> {
@@ -58,6 +65,7 @@ fn natw_variant() -> Option<(usize, usize)> {
     // TANG_FLASH_NATW=v2 for fl_natw2 (decoded-weight reuse, slower), =v1 for fl_natw.
     *U.get_or_init(|| match std::env::var("TANG_FLASH_NATW") {
         Err(_) => Some((16, 4)),
+        Ok(v) if v == "mma" => None,
         Ok(v) => {
             let (a, b) = v.split_once('x')?;
             Some((a.parse().ok()?, b.parse().ok()?))
@@ -433,6 +441,8 @@ impl CudaComputeDevice {
             NAT_NAMES[m - 1]
         } else if wide_plain() {
             wide_name("fl_nat_t", m)
+        } else if wide_mma() {
+            "fl_natmma"
         } else if let Some((tt, g)) = natw_variant() {
             Box::leak(format!("fl_natw_{tt}x{g}").into_boxed_str())
         } else if wide_v1() {
@@ -588,6 +598,26 @@ impl CudaComputeDevice {
         );
         let mu = m as u32;
         let mut y = out.f32_data_mut().slice_mut(off..);
+        if tiled && wide_mma() {
+            // 16 rows a warp, 8 / ks row groups a block.
+            unsafe {
+                self.stream
+                    .launch_builder(&f)
+                    .arg(xq.f32_data())
+                    .arg(w.f32_data())
+                    .arg(&mut y)
+                    .arg(&ku)
+                    .arg(&nu)
+                    .arg(&ksu)
+                    .arg(&ho)
+                    .arg(&so)
+                    .arg(&os)
+                    .arg(&mu)
+                    .launch(grid((n.div_ceil(16 * 8 / ks), 1, 1), 256))
+                    .unwrap();
+            }
+            return;
+        }
         if v2 {
             // Up to 32 columns a launch (the kernel's shared accumulators).
             for t0 in (0..m).step_by(32) {
@@ -1215,7 +1245,8 @@ impl CudaComputeDevice {
         ];
         // A group has at most t entries (an expert appears once per token; the shared group has t).
         let tu = t as u32;
-        if !unfused() {
+        // Wide windows: the two-launch path (measured faster with tile_mma: T=64 8.4 vs 10.4 us/token).
+        if !unfused() && t <= MAX_T {
             const FUSED: [&str; 8] = [
                 "fl_moe_fused_t1",
                 "fl_moe_fused_t2",

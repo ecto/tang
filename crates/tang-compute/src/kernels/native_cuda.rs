@@ -236,6 +236,145 @@ extern "C" __global__ void __launch_bounds__(256) fl_natw_##TT##x##GR( \
     } \
 }
 NATWV(8, 2) NATWV(8, 4) NATWV(8, 8) NATWV(16, 2) NATWV(16, 4) NATWV(12, 4) NATWV(32, 1) NATWV(32, 2)
+// Wide windows on int8 tensor cores (prefill). A warp owns 16 rows (mma m16) of its K slice;
+// tokens go in tiles of 32 (four n8 tiles). The integer chunk sums come from mma.sync (exact);
+// the float steps are nat_body's: per (row, token) the chunks a lane would own (c0 + l + 32j,
+// "slot" l) chain in order from 0, and the 32 slot partials merge as warp_sum's xor tree does
+// (bit-reversed slot order, a binary-counter stack), then the KS sum in order. Bits equal the
+// T=1..8 kernels'.
+__device__ __forceinline__ void mma_k32(int c[4], const unsigned int a[4], const unsigned int b[2]) {
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
+                 : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(0), "r"(0), "r"(0), "r"(0));
+}
+__device__ __forceinline__ void mma_k16(int c[4], unsigned int a0, unsigned int a1, unsigned int b0) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%8,%9,%10};"
+                 : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
+                 : "r"(a0), "r"(a1), "r"(b0), "r"(0), "r"(0), "r"(0), "r"(0));
+}
+#define NM_NT 4
+extern "C" __global__ void __launch_bounds__(256) fl_natmma(
+    const unsigned int* __restrict__ XQ, const unsigned char* __restrict__ W, float* __restrict__ Y,
+    unsigned int K, unsigned int N, unsigned int KS, u64 hoff, u64 soff, unsigned int OS, unsigned int M) {
+    constexpr int TY = NAT_TY;
+    __shared__ float red[8][16][8 * NM_NT];
+    const unsigned int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, gid = lane >> 2, tig = lane & 3;
+    const unsigned int kw = warp % KS, rg = warp / KS, groups = 8 / KS;
+    const unsigned int row0 = (blockIdx.x * groups + rg) * 16;
+    const unsigned int nch = K / 32, c0 = kw * nch / KS, c1 = (kw + 1) * nch / KS;
+    const unsigned int kb = K / 4;
+    const unsigned int* xs = XQ + (u64)M * kb;
+    const unsigned int* xh = xs + (u64)M * nch;
+    const unsigned char* S = W + soff;
+    const unsigned char* D = S + (u64)N * nch * SPC;
+    const u64 sbytes = TY == 23 ? K / 256 * 12 : K / 256 * 20;
+    const unsigned int o[2] = {min(row0 + gid, N - 1), min(row0 + gid + 8, N - 1)};
+    for (unsigned int t0 = 0; t0 < M; t0 += 8 * NM_NT) {
+        // Tokens of this thread: B column gid of n tile nt; C columns 2 tig, 2 tig + 1.
+        unsigned int tb[NM_NT], te[NM_NT][2];
+        #pragma unroll
+        for (int nt = 0; nt < NM_NT; nt++) {
+            tb[nt] = min(t0 + 8 * nt + gid, M - 1);
+            te[nt][0] = min(t0 + 8 * nt + 2 * tig, M - 1);
+            te[nt][1] = min(t0 + 8 * nt + 2 * tig + 1, M - 1);
+        }
+        float st[5][NM_NT][4];
+        float v[NM_NT][4];
+        #pragma unroll 1
+        for (unsigned int i = 0; i < 32; i++) {
+            const unsigned int l = __brev(i) >> 27;
+            float cur[NM_NT][4];
+            #pragma unroll
+            for (int nt = 0; nt < NM_NT; nt++)
+                #pragma unroll
+                for (int k = 0; k < 4; k++) cur[nt][k] = 0.0f;
+            if (row0 < N) {
+                #pragma unroll 1
+                for (unsigned int c = c0 + l; c < c1; c += 32) {
+                    int op[2][8];
+                    float sc0[2], sc1[2], mn[2];
+                    #pragma unroll
+                    for (int r = 0; r < 2; r++) {
+                        u64 ch = (u64)o[r] * nch + c;
+                        operands<TY>(W + ch * LB, W + hoff + ch * (HB ? HB : 1), op[r]);
+                        chunk_scales<TY>(S, D, sbytes, o[r], c, ch, sc0[r], sc1[r], mn[r]);
+                    }
+                    #pragma unroll
+                    for (int nt = 0; nt < NM_NT; nt++) {
+                        const unsigned int* xb = XQ + (u64)tb[nt] * kb + c * 8;
+                        unsigned int b[2] = {__ldg(xb + tig), __ldg(xb + 4 + tig)};
+                        int C0[4], C1[4];
+                        if (PER16) {
+                            mma_k16(C0, (unsigned int)op[0][tig], (unsigned int)op[1][tig], b[0]);
+                            mma_k16(C1, (unsigned int)op[0][4 + tig], (unsigned int)op[1][4 + tig], b[1]);
+                        } else {
+                            unsigned int a[4] = {(unsigned int)op[0][tig], (unsigned int)op[1][tig],
+                                                 (unsigned int)op[0][4 + tig], (unsigned int)op[1][4 + tig]};
+                            mma_k32(C0, a, b);
+                        }
+                        #pragma unroll
+                        for (int ec = 0; ec < 2; ec++) {
+                            const unsigned int t = te[nt][ec];
+                            float dx = __uint_as_float(__ldg(xs + (u64)t * nch + c));
+                            float hx = HAS_MIN ? (float)(int)__ldg(xh + (u64)t * nch + c) : 0.0f;
+                            #pragma unroll
+                            for (int r = 0; r < 2; r++) {
+                                float vv;
+                                if (PER16) vv = __fmaf_rn(sc1[r], (float)C1[2 * r + ec], sc0[r] * (float)C0[2 * r + ec]);
+                                else if (HAS_MIN) vv = __fmaf_rn(sc0[r], (float)C0[2 * r + ec], -(mn[r] * hx));
+                                else vv = sc0[r] * (float)C0[2 * r + ec];
+                                cur[nt][2 * r + ec] = __fmaf_rn(dx, vv, cur[nt][2 * r + ec]);
+                            }
+                        }
+                    }
+                }
+            }
+            // Binary-counter merge: slot partials pair up as warp_sum's xor tree.
+            #pragma unroll
+            for (int nt = 0; nt < NM_NT; nt++)
+                #pragma unroll
+                for (int k = 0; k < 4; k++) v[nt][k] = cur[nt][k];
+            #pragma unroll
+            for (int lv = 0; lv < 5; lv++) {
+                if ((i >> lv) & 1) {
+                    #pragma unroll
+                    for (int nt = 0; nt < NM_NT; nt++)
+                        #pragma unroll
+                        for (int k = 0; k < 4; k++) v[nt][k] = st[lv][nt][k] + v[nt][k];
+                } else {
+                    #pragma unroll
+                    for (int nt = 0; nt < NM_NT; nt++)
+                        #pragma unroll
+                        for (int k = 0; k < 4; k++) st[lv][nt][k] = v[nt][k];
+                    break;
+                }
+            }
+        }
+        // v now holds the full warp sums (after i = 31).
+        if (KS > 1) __syncthreads();
+        #pragma unroll
+        for (int nt = 0; nt < NM_NT; nt++)
+            #pragma unroll
+            for (int k = 0; k < 4; k++) {
+                const unsigned int r = gid + 8 * (k >> 1), tl = 8 * nt + 2 * tig + (k & 1);
+                if (KS == 1) {
+                    if (row0 + r < N && t0 + tl < M) Y[(u64)(t0 + tl) * OS + row0 + r] = v[nt][k];
+                } else {
+                    red[warp][r][tl] = v[nt][k];
+                }
+            }
+        if (KS == 1) continue;
+        __syncthreads();
+        for (unsigned int idx = threadIdx.x; idx < groups * 16 * 8 * NM_NT; idx += 256) {
+            unsigned int g = idx / (16 * 8 * NM_NT), r = (idx / (8 * NM_NT)) % 16, tl = idx % (8 * NM_NT);
+            unsigned int oo = (blockIdx.x * groups + g) * 16 + r;
+            float sum = 0.0f;
+            for (unsigned int k = 0; k < KS; k++) sum += red[g * KS + k][r][tl];
+            if (oo < N && t0 + tl < M) Y[(u64)(t0 + tl) * OS + oo] = sum;
+        }
+    }
+}
+
 // Wide windows, decoded-weight reuse: one row a warp; a lane decodes NB of its chunks into
 // registers once, then runs them over every column of the launch (up to 32, accumulators in
 // shared memory, TT columns at a time in registers). Each column's chain is still its chunks in
