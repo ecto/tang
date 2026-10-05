@@ -50,7 +50,9 @@ pub trait ComputeDevice: Send {
     }
 
     /// Actual bytes per element retained by upload_bf16. CPU widens to f32.
-    fn bf16_storage_bytes(&self) -> usize { 4 }
+    fn bf16_storage_bytes(&self) -> usize {
+        4
+    }
 
     // -- Buffer lifecycle --
 

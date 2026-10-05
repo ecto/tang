@@ -63,7 +63,10 @@ impl Request {
             .context("size must be WIDTHxHEIGHT")?;
         let (w, h) = (w.parse::<usize>()?, h.parse::<usize>()?);
         ensure!(
-            (64..=1024).contains(&w) && (64..=1024).contains(&h) && w % 16 == 0 && h % 16 == 0,
+            (64..=1024).contains(&w)
+                && (64..=1024).contains(&h)
+                && w.is_multiple_of(16)
+                && h.is_multiple_of(16),
             "dimensions must be multiples of 16 between 64 and 1024"
         );
         Ok((w, h))

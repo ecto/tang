@@ -14,11 +14,14 @@ import requests
 from huggingface_hub import model_info
 
 root=Path(sys.argv[1]);root.mkdir(parents=True,exist_ok=True)
-info=model_info('Tongyi-MAI/Z-Image-Turbo',files_metadata=True)
+manifest_path=root/'conversion.json'
+previous=json.loads(manifest_path.read_text()) if manifest_path.exists() else None
+info=model_info('Tongyi-MAI/Z-Image-Turbo',revision=previous['revision'] if previous else 'f332072aa78be7aecdf3ee76d5c247082da564a6',files_metadata=True)
 revision=info.sha
 base=f'https://huggingface.co/Tongyi-MAI/Z-Image-Turbo/resolve/{revision}/'
 reserve=4*1024**3
-manifest={'repo':info.id,'revision':revision,'conversion':'F32 matrices to BF16 round-to-nearest-even; vectors unchanged','files':{}}
+manifest=previous or {'repo':info.id,'revision':revision,'conversion':'F32 matrices to BF16 round-to-nearest-even; vectors unchanged','files':{}}
+assert manifest['repo']==info.id and manifest['revision']==revision
 
 def read_exact(stream,n):
     chunks=[];left=n
@@ -30,12 +33,21 @@ def read_exact(stream,n):
 
 files=[s for s in info.siblings if s.rfilename.startswith(('transformer/','text_encoder/','vae/','tokenizer/','scheduler/')) and s.rfilename.endswith(('.json','.safetensors','.txt','.model','.jinja'))]
 # All text/VAE weights already use BF16; transformer storage is halved.
-expected=sum((s.size or 0)//2 if s.rfilename.startswith('transformer/') and s.rfilename.endswith('.safetensors') else (s.size or 0) for s in files)
+expected=sum((s.size or 0)//2 if s.rfilename.startswith('transformer/') and s.rfilename.endswith('.safetensors') else (s.size or 0) for s in files if s.rfilename not in manifest['files'])
 assert shutil.disk_usage(root).free >= expected+reserve, f'insufficient disk: need {expected+reserve} bytes'
 print(f'Pinned {revision}; approximately {expected/1e9:.2f} GB output',flush=True)
 for entry in files:
     name=entry.rfilename;dest=root/name;dest.parent.mkdir(parents=True,exist_ok=True)
-    if dest.exists():raise FileExistsError(dest)
+    if dest.exists():
+        record=manifest['files'].get(name)
+        assert record is not None,f'untracked existing file: {dest}'
+        digest=hashlib.sha256()
+        with dest.open('rb') as source:
+            while data:=source.read(16*1024**2):digest.update(data)
+        assert dest.stat().st_size==record['bytes'] and digest.hexdigest()==record['output_sha256'],f'completed output mismatch: {name}'
+        print(f'Verified completed {name}',flush=True)
+        continue
+    assert name not in manifest['files'],f'completed file missing: {name}'
     tmp=dest.with_suffix(dest.suffix+'.part')
     original=hashlib.sha256();converted=hashlib.sha256()
     print(f'Downloading {name}',flush=True)

@@ -28,7 +28,7 @@ pub struct Config {
 impl Config {
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            self.dim > 0 && self.n_heads > 0 && self.dim % self.n_heads == 0,
+            self.dim > 0 && self.n_heads > 0 && self.dim.is_multiple_of(self.n_heads),
             "invalid attention dimensions"
         );
         ensure!(
@@ -359,7 +359,7 @@ impl<B: ComputeBuffer> DiT<B> {
     ) -> Result<Vec<f32>> {
         let c = &self.cfg;
         ensure!(
-            height > 0 && width > 0 && height % 2 == 0 && width % 2 == 0,
+            height > 0 && width > 0 && height.is_multiple_of(2) && width.is_multiple_of(2),
             "latent dimensions must be positive/even"
         );
         ensure!(

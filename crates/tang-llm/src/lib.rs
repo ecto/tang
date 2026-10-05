@@ -8,12 +8,12 @@
 pub mod blocks;
 pub mod chat;
 pub mod config;
-pub mod draft;
 pub mod dit;
+pub mod draft;
 pub mod engine;
-pub mod kvstore;
 pub mod image_pipeline;
 pub mod image_server;
+pub mod kvstore;
 pub mod model;
 pub mod node;
 pub mod queue;
@@ -21,8 +21,8 @@ pub mod sample;
 pub mod scheduler;
 pub mod server;
 pub mod slots;
-pub mod vision;
 pub mod vae;
+pub mod vision;
 pub mod weights;
 
 pub use config::Config;
