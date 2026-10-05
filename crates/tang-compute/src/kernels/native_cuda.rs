@@ -1,8 +1,10 @@
 //! CUDA source for the native-type (NatX, `crate::flash_native`) int8-activation GEMV. One
-//! module per weight type (`native_source(ty)` prepends `#define TY <ggml id>`), so only the
-//! types a model uses are compiled. Kernels `fl_nat<ty>_t<T>`, T = 1..8 columns.
+//! module per weight type (`#define NAT_TY <ggml id>` prepended), so only the types a model
+//! uses are compiled; kernels `fl_nat_t<T>`, T = 1..8 columns. With `#define NAT_STACK`, the
+//! module instead holds `fl_natst_t<T>`: every segment of a stacked projection (any mix of types,
+//! bf16 included) in one launch.
 
-/// The kernel body; compiled with `TY` defined.
+/// The kernel source (see the module docs for its two forms).
 pub const NATIVE_CUDA: &str = r#"
 typedef unsigned long long u64;
 
@@ -32,6 +34,7 @@ __device__ __forceinline__ unsigned int iq4w(unsigned int n) {
 #define SPC ((TY == 12 || TY == 13) ? 2 : 0)
 
 // The eight dp4a operands (int8 lanes in activation order) of one chunk.
+template <int TY>
 __device__ __forceinline__ void operands(const unsigned char* L, const unsigned char* H, int op[8]) {
     if (LB == 16) {
         uint4 q = *(const uint4*)L;
@@ -74,6 +77,7 @@ __device__ __forceinline__ void operands(const unsigned char* L, const unsigned 
 // S is the scale plane: per-block f16 (Q4_0 / Q5_0 / IQ4_NL / Q2_0), 12 / 20 B headers per 256
 // (IQ4_XS, Q3_K, Q6_K; row stride sbytes), or for Q4_K / Q5_K the per-chunk SC plane with D the
 // per-256 SD plane (module docs of flash_native).
+template <int TY>
 __device__ __forceinline__ void chunk_scales(const unsigned char* S, const unsigned char* D, u64 sbytes, unsigned int o,
                                              unsigned int c, u64 g, float& sc0, float& sc1, float& mn) {
     mn = 0.0f;
@@ -99,14 +103,14 @@ __device__ __forceinline__ void chunk_scales(const unsigned char* S, const unsig
 
 // Y[t, o] = W[o] · x̂[t]: GR rows a warp, one 32-weight chunk a lane per step, KS warps
 // splitting K (8 / KS row groups a 256-thread block), as the other multi-column GEMVs.
-template <int T, int GR>
-__device__ __forceinline__ void nat_body(const unsigned int* __restrict__ XQ, const unsigned char* __restrict__ W,
+template <int TY, int T, int GR>
+__device__ __forceinline__ void nat_body(unsigned int bx, const unsigned int* __restrict__ XQ, const unsigned char* __restrict__ W,
                                          float* __restrict__ Y, unsigned int K, unsigned int N, unsigned int KS,
                                          u64 hoff, u64 soff, unsigned int OS) {
     __shared__ float red[8][GR * T];
     unsigned int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     unsigned int kw = warp % KS, rg = warp / KS, groups = 8 / KS;
-    unsigned int row0 = (blockIdx.x * groups + rg) * GR;
+    unsigned int row0 = (bx * groups + rg) * GR;
     unsigned int nch = K / 32, c0 = kw * nch / KS, c1 = (kw + 1) * nch / KS;
     const unsigned int kb = K / 4;
     const unsigned int* xs = XQ + (u64)T * kb;
@@ -127,8 +131,8 @@ __device__ __forceinline__ void nat_body(const unsigned int* __restrict__ XQ, co
             for (int r = 0; r < GR; r++) {
                 unsigned int o = min(row0 + r, N - 1);
                 u64 ch = (u64)o * nch + c;
-                operands(W + ch * LB, W + hoff + ch * (HB ? HB : 1), op[r]);
-                chunk_scales(S, D, sbytes, o, c, ch, sc0[r], sc1[r], mn[r]);
+                operands<TY>(W + ch * LB, W + hoff + ch * (HB ? HB : 1), op[r]);
+                chunk_scales<TY>(S, D, sbytes, o, c, ch, sc0[r], sc1[r], mn[r]);
             }
             #pragma unroll
             for (int t = 0; t < T; t++) {
@@ -171,18 +175,135 @@ __device__ __forceinline__ void nat_body(const unsigned int* __restrict__ XQ, co
     unsigned int i = threadIdx.x;
     if (i < groups * GR * T) {
         unsigned int g = i / (GR * T), rt = i % (GR * T), r = rt / T, t = rt % T;
-        unsigned int o = (blockIdx.x * groups + g) * GR + r;
+        unsigned int o = (bx * groups + g) * GR + r;
         float v = 0.0f;
         for (unsigned int k = 0; k < KS; k++) v += red[g * KS + k][rt];
         if (o < N) Y[(u64)t * OS + o] = v;
     }
 }
 
+#ifndef NAT_STACK
 #define NAT(T) \
 extern "C" __global__ void __launch_bounds__(256) fl_nat_t##T( \
     const unsigned int* __restrict__ XQ, const unsigned char* __restrict__ W, float* __restrict__ Y, \
     unsigned int K, unsigned int N, unsigned int KS, u64 hoff, u64 soff, unsigned int OS) { \
-    nat_body<T, (T == 1 ? 2 : 4)>(XQ, W, Y, K, N, KS, hoff, soff, OS); \
+    nat_body<NAT_TY, T, (T == 1 ? 2 : 4)>(blockIdx.x, XQ, W, Y, K, N, KS, hoff, soff, OS); \
 }
 NAT(1) NAT(2) NAT(3) NAT(4) NAT(5) NAT(6) NAT(7) NAT(8)
+#else
+// ---- stacked: every segment of a stacked projection in one launch ----
+
+__device__ __forceinline__ float bfv(unsigned int b) { return __uint_as_float(b << 16); }
+// acc + (w · (a, b)) for 8 bf16 weights in p, one pinned chain (flash_cuda's dot8_rn).
+__device__ __forceinline__ float dot8_rn(uint4 p, float4 a, float4 b, float acc) {
+    float s = __fmul_rn(bfv(p.x & 0xffff), a.x);
+    s = __fmaf_rn(bfv(p.x >> 16), a.y, s); s = __fmaf_rn(bfv(p.y & 0xffff), a.z, s);
+    s = __fmaf_rn(bfv(p.y >> 16), a.w, s); s = __fmaf_rn(bfv(p.z & 0xffff), b.x, s);
+    s = __fmaf_rn(bfv(p.z >> 16), b.y, s); s = __fmaf_rn(bfv(p.w & 0xffff), b.z, s);
+    s = __fmaf_rn(bfv(p.w >> 16), b.w, s);
+    return __fadd_rn(acc, s);
+}
+
+// The bf16 GEMV (flash_cuda gemv_body<0>: f32 activations, 8 weights a lane step), one tile.
+template <int T, int GR>
+__device__ __forceinline__ void bf16_body(unsigned int bx, const float* __restrict__ X, const unsigned char* __restrict__ W,
+                                          float* __restrict__ Y, unsigned int K, unsigned int N, unsigned int KS,
+                                          unsigned int OS) {
+    __shared__ float red[8][GR * T];
+    unsigned int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    unsigned int kw = warp % KS, rg = warp / KS, groups = 8 / KS;
+    unsigned int row0 = (bx * groups + rg) * GR;
+    unsigned int nv = K / 8, v0 = kw * nv / KS, v1 = (kw + 1) * nv / KS;
+    float acc[GR][T];
+    #pragma unroll
+    for (int r = 0; r < GR; r++)
+        #pragma unroll
+        for (int t = 0; t < T; t++) acc[r][t] = 0.0f;
+    if (row0 < N) {
+        for (unsigned int v = v0 + lane; v < v1; v += 32) {
+            uint4 wv[GR];
+            #pragma unroll
+            for (int r = 0; r < GR; r++) {
+                unsigned int o = min(row0 + r, N - 1);
+                wv[r] = ((const uint4*)(W + (u64)o * K * 2))[v];
+            }
+            #pragma unroll
+            for (int t = 0; t < T; t++) {
+                const float4* x4 = (const float4*)(X + (u64)t * K + v * 8);
+                float4 a = x4[0], b = x4[1];
+                #pragma unroll
+                for (int r = 0; r < GR; r++) acc[r][t] = dot8_rn(wv[r], a, b, acc[r][t]);
+            }
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < GR; r++)
+        #pragma unroll
+        for (int t = 0; t < T; t++) {
+            float v = warp_sum(acc[r][t]);
+            if (KS == 1) {
+                if (lane == 0 && row0 + r < N) Y[(u64)t * OS + row0 + r] = v;
+            } else if (lane == 0) {
+                red[warp][r * T + t] = v;
+            }
+        }
+    if (KS == 1) return;
+    __syncthreads();
+    unsigned int i = threadIdx.x;
+    if (i < groups * GR * T) {
+        unsigned int g = i / (GR * T), rt = i % (GR * T), r = rt / T, t = rt % T;
+        unsigned int o = (bx * groups + g) * GR + r;
+        float v = 0.0f;
+        for (unsigned int k = 0; k < KS; k++) v += red[g * KS + k][rt];
+        if (o < N) Y[(u64)t * OS + o] = v;
+    }
+}
+
+// Segment table entry (flash::NatStack): 8 words.
+struct StSeg { u64 w; u64 hoff; u64 soff; unsigned int ty, n, ks, off; };
+
+// Blocks of segment s at window width T: rows per block (2 or 4 rows a warp) · 8 / KS.
+template <int T>
+__device__ __forceinline__ unsigned int st_blocks(const StSeg& s) {
+    unsigned int gr = T == 1 ? 2 : 4;
+    return (s.n + gr * 8 / s.ks - 1) / (gr * 8 / s.ks);
+}
+
+template <int T>
+__device__ __forceinline__ void stack_body(const unsigned int* __restrict__ XQ, const float* __restrict__ X,
+                                           const StSeg* __restrict__ SEGS, unsigned int nseg, float* __restrict__ Y,
+                                           unsigned int K, unsigned int OS) {
+    constexpr int GR = T == 1 ? 2 : 4;
+    unsigned int b = blockIdx.x, s = 0;
+    for (; s < nseg; s++) {
+        unsigned int nb = st_blocks<T>(SEGS[s]);
+        if (b < nb) break;
+        b -= nb;
+    }
+    if (s >= nseg) return;
+    const StSeg sg = SEGS[s];
+    const unsigned char* W = (const unsigned char*)sg.w;
+    float* y = Y + sg.off;
+    switch (sg.ty) {
+        case 2: nat_body<2, T, GR>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
+        case 6: nat_body<6, T, GR>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
+        case 42: nat_body<42, T, GR>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
+        case 20: nat_body<20, T, GR>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
+        case 23: nat_body<23, T, GR>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
+        case 11: nat_body<11, T, GR>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
+        case 12: nat_body<12, T, GR>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
+        case 13: nat_body<13, T, GR>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
+        case 14: nat_body<14, T, GR>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
+        default: bf16_body<T, GR>(b, X, W, y, K, sg.n, sg.ks, OS); break;
+    }
+}
+
+#define NATST(T) \
+extern "C" __global__ void __launch_bounds__(256) fl_natst_t##T( \
+    const unsigned int* __restrict__ XQ, const float* __restrict__ X, const StSeg* __restrict__ SEGS, \
+    unsigned int nseg, float* __restrict__ Y, unsigned int K, unsigned int OS) { \
+    stack_body<T>(XQ, X, SEGS, nseg, Y, K, OS); \
+}
+NATST(1) NATST(2) NATST(3) NATST(4) NATST(5) NATST(6) NATST(7) NATST(8)
+#endif
 "#;
