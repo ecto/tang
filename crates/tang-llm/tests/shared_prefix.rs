@@ -64,6 +64,7 @@ fn req(system: &str, user: &str, key: &str, max: usize) -> Request {
         ]),
         images: vec![],
         tools: None,
+        response_schema: None,
         think: Some(false),
         thinking_budget: None,
         sampling: Sampling {

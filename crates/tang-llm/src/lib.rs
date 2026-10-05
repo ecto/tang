@@ -21,6 +21,7 @@ pub mod sample;
 pub mod scheduler;
 pub mod server;
 pub mod slots;
+mod structured;
 pub mod vae;
 pub mod vision;
 pub mod weights;

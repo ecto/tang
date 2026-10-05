@@ -116,6 +116,7 @@ fn run(e: &mut Engine<MetalDevice>, messages: Value, max_tokens: usize) -> Resul
         messages,
         images: Vec::new(),
         tools: None,
+        response_schema: None,
         think: Some(false),
         thinking_budget: None,
         sampling: Sampling {
@@ -191,6 +192,7 @@ pub unsafe extern "C" fn tang_chat(
             messages,
             images: Vec::new(),
             tools: None,
+            response_schema: None,
             think: Some(false),
             thinking_budget: None,
             sampling: Sampling::default(),

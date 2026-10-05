@@ -28,6 +28,8 @@ pub struct Request {
     /// Encoded images (PNG, JPEG, ...), in the order their markers appear.
     pub images: Vec<Vec<u8>>,
     pub tools: Option<Value>,
+    /// JSON schema enforced during sampling; reasoning and drafting are disabled.
+    pub response_schema: Option<Value>,
     pub think: Option<bool>,
     /// Most tokens to spend inside `<think>` before the reasoning is wrapped up (see
     /// [`ThinkBudget`]); `None` is unlimited.
@@ -121,9 +123,15 @@ pub struct Prompter {
 impl Prompter {
     /// The rendered prompt and its token ids.
     pub fn prompt(&self, req: &Request) -> Result<(String, Vec<u32>)> {
-        let mut prompt = self
-            .template
-            .render(&req.messages, req.tools.as_ref(), req.think)?;
+        let mut prompt = self.template.render(
+            &req.messages,
+            req.tools.as_ref(),
+            if req.response_schema.is_some() {
+                Some(false)
+            } else {
+                req.think
+            },
+        )?;
         if !req.images.is_empty() {
             let per = self
                 .image_tokens
@@ -179,6 +187,7 @@ pub struct Engine<D: ComputeDevice> {
     store: Option<crate::kvstore::Writer>,
     clock: u64,
     eos: Vec<u32>,
+    structured_factory: Option<llguidance::ParserFactory>,
     /// `<think>` and `</think>`, when the model has them.
     think_tags: Option<(u32, u32)>,
     /// What a spent thinking budget appends: a wrap-up sentence, `</think>`, a blank line.
@@ -315,6 +324,7 @@ impl<D: ComputeDevice> Engine<D> {
             store: None,
             clock: 0,
             eos,
+            structured_factory: None,
             think_tags,
             wrap_up,
             spec: None,
@@ -727,6 +737,28 @@ impl<D: ComputeDevice> Engine<D> {
         mut on: impl FnMut(Piece) -> bool,
         ctl: &mut dyn Control,
     ) -> Result<Outcome> {
+        let mut constraint = if let Some(schema) = &req.response_schema {
+            anyhow::ensure!(
+                req.stop.is_empty(),
+                "stop strings cannot be combined with structured output"
+            );
+            if self.structured_factory.is_none() {
+                self.structured_factory = Some(crate::structured::model_factory(
+                    &self.tok,
+                    self.model.cfg.vocab_size,
+                    *self
+                        .eos
+                        .first()
+                        .ok_or_else(|| anyhow!("model has no EOS token"))?,
+                )?);
+            }
+            Some(crate::structured::matcher(
+                self.structured_factory.as_ref().unwrap(),
+                schema.clone(),
+            )?)
+        } else {
+            None
+        };
         let (prompt, ids) = match prompt {
             Some(p) => p,
             None => self.prompter().prompt(req)?,
@@ -875,10 +907,14 @@ impl<D: ComputeDevice> Engine<D> {
         // every draft position. Every token is still sampled from the target's logits in order,
         // with the same sampler state, so the output is what plain decoding would produce; a
         // draft token only saves a forward when it equals the sampled token.
-        let mut sess = self.spec.as_ref().map(|s| {
-            let cost = s.cost.table(&s.cfg, s.cfg.max_draft + 1);
-            Session::new(&s.cfg, &s.global, s.calib.clone(), cost, &ids)
-        });
+        let mut sess = self
+            .spec
+            .as_ref()
+            .filter(|_| constraint.is_none())
+            .map(|s| {
+                let cost = s.cost.table(&s.cfg, s.cfg.max_draft + 1);
+                Session::new(&s.cfg, &s.global, s.calib.clone(), cost, &ids)
+            });
         // Decode forwards timed by width, for the cost model and stats.
         let mut timed: Vec<(usize, f64)> = Vec::new();
         let vocab = self.model.cfg.vocab_size;
@@ -892,7 +928,11 @@ impl<D: ComputeDevice> Engine<D> {
         let (mut drafted, mut accepted) = (0usize, 0usize);
 
         while out.len() < limit {
-            let next = sampler.sample(&rows[row * vocab..(row + 1) * vocab]);
+            let logits = &mut rows[row * vocab..(row + 1) * vocab];
+            if let Some(grammar) = constraint.as_mut() {
+                crate::structured::mask(grammar, logits, &self.eos)?;
+            }
+            let next = sampler.sample(logits);
             let hit = draft.tokens.get(row) == Some(&next);
             if row < draft.tokens.len() {
                 if let Some(s) = sess.as_mut() {
@@ -906,6 +946,9 @@ impl<D: ComputeDevice> Engine<D> {
             if self.eos.contains(&next) {
                 finish = Finish::Stop;
                 break;
+            }
+            if let Some(grammar) = constraint.as_mut() {
+                grammar.consume_token(next)?;
             }
             out.push(next);
             progress.generated = out.len();

@@ -33,6 +33,7 @@ fn req(user: &str, key: &str, max: usize) -> Request {
         messages: json!([{ "role": "user", "content": user }]),
         images: vec![],
         tools: None,
+        response_schema: None,
         think: Some(false),
         thinking_budget: None,
         sampling: Sampling {

@@ -82,6 +82,7 @@ fn requests() -> Vec<(&'static str, Request)> {
         messages: json!([{ "role": "user", "content": msg }]),
         images: vec![],
         tools: None,
+        response_schema: None,
         think: Some(think),
         thinking_budget: budget,
         sampling: s.clone(),

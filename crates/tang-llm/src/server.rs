@@ -597,6 +597,8 @@ async fn models(State(app): State<App>) -> Json<Value> {
             // `priority`: `x-frog-priority` orders requests.
             let mut caps = vec![
                 "completion",
+                "json_object",
+                "json_schema",
                 "thinking_budget",
                 "prompt_cache_key",
                 "prefill",
@@ -977,6 +979,7 @@ pub fn parse(body: &Value) -> Result<Request, String> {
         .get("messages")
         .filter(|m| m.is_array())
         .ok_or("messages must be an array")?;
+    let response_schema = crate::structured::response_schema(body).map_err(|e| e.to_string())?;
     let d = Sampling::default();
     let f = |k: &str| body[k].as_f64();
     let (messages, images) = normalize_messages(messages)?;
@@ -984,6 +987,7 @@ pub fn parse(body: &Value) -> Result<Request, String> {
         messages,
         images,
         tools: body.get("tools").cloned().filter(|t| !t.is_null()),
+        response_schema,
         think: body["chat_template_kwargs"]["enable_thinking"]
             .as_bool()
             .or(body["think"].as_bool())
