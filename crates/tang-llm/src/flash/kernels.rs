@@ -939,7 +939,7 @@ extern "C" __global__ void fe_mtp_next(const float* r, float* h, const unsigned*
 // heads of group g over its chunk (4 warps × 32 positions; lane owns 8 dims), merges its warps,
 // and writes per head (m, l, acc[256]) to part[c][g][j][12][258]. Chunks past the cell's
 // position write l = 0.
-#define MTP_CHUNK 128
+#define MTP_CHUNK 32
 extern "C" __global__ void __launch_bounds__(128) fe_mtp_attn_part(const float* q, const float* kc, const float* vc,
                                                                    const unsigned* ctl, float* part, int nchunk) {
     __shared__ float wm[4][12], wl[4][12];
