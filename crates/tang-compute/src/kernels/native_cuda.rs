@@ -25,6 +25,13 @@ __device__ __forceinline__ float warp_sum(float v) {
 // Per-chunk scale bytes of the super-block types' SC plane.
 #define SPC ((TY == 12 || TY == 13) ? 2 : 0)
 
+// Rows a warp (NatType::rows_per_warp): 2 for one column; for more, per type. Bits don't depend
+// on it (the K split is chosen from (n, k) alone); throughput does.
+// Measured at T=4 (flash-kernel-bench native): 2 rows for the IQ4 types and Q2_0 (+30..80 GB/s),
+// 4 for the rest (+40..150).
+#define NAT_GR_WIDE(ty) (((ty) == 20 || (ty) == 23 || (ty) == 42) ? 2 : 4)
+__host__ __device__ constexpr int nat_gr(int ty, int t) { return t == 1 ? 2 : NAT_GR_WIDE(ty); }
+
 // The eight dp4a operands (int8 lanes in activation order) of one chunk.
 template <int TY>
 __device__ __forceinline__ void operands(const unsigned char* L, const unsigned char* H, int op[8]) {
@@ -202,7 +209,7 @@ __device__ __forceinline__ void nat_body(unsigned int bx, const unsigned int* __
 extern "C" __global__ void __launch_bounds__(256) fl_nat_t##T( \
     const unsigned int* __restrict__ XQ, const unsigned char* __restrict__ W, float* __restrict__ Y, \
     unsigned int K, unsigned int N, unsigned int KS, u64 hoff, u64 soff, unsigned int OS) { \
-    nat_body<NAT_TY, T, (T == 1 ? 2 : 4)>(blockIdx.x, XQ, W, Y, K, N, KS, hoff, soff, OS); \
+    nat_body<NAT_TY, T, nat_gr(NAT_TY, T)>(blockIdx.x, XQ, W, Y, K, N, KS, hoff, soff, OS); \
 }
 NAT(1) NAT(2) NAT(3) NAT(4) NAT(5) NAT(6) NAT(7) NAT(8)
 #else
@@ -280,7 +287,7 @@ struct StSeg { u64 w; u64 hoff; u64 soff; unsigned int ty, n, ks, off; };
 // Blocks of segment s at window width T: rows per block (2 or 4 rows a warp) · 8 / KS.
 template <int T>
 __device__ __forceinline__ unsigned int st_blocks(const StSeg& s) {
-    unsigned int gr = T == 1 ? 2 : 4;
+    unsigned int gr = s.ty == 0 ? (T == 1 ? 2 : 4) : nat_gr(s.ty, T);
     return (s.n + gr * 8 / s.ks - 1) / (gr * 8 / s.ks);
 }
 
@@ -288,7 +295,7 @@ template <int T>
 __device__ __forceinline__ void stack_body(const unsigned int* __restrict__ XQ, const float* __restrict__ X,
                                            const StSeg* __restrict__ SEGS, unsigned int nseg, float* __restrict__ Y,
                                            unsigned int K, unsigned int OS) {
-    constexpr int GR = T == 1 ? 2 : 4;
+    constexpr int GB = T == 1 ? 2 : 4;  // the bf16 tile's rows a warp (gemv_rows)
     unsigned int b = blockIdx.x, s = 0;
     for (; s < nseg; s++) {
         unsigned int nb = st_blocks<T>(SEGS[s]);
@@ -300,16 +307,16 @@ __device__ __forceinline__ void stack_body(const unsigned int* __restrict__ XQ, 
     const unsigned char* W = (const unsigned char*)sg.w;
     float* y = Y + sg.off;
     switch (sg.ty) {
-        case 2: nat_body<2, T, GR>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
-        case 6: nat_body<6, T, GR>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
-        case 42: nat_body<42, T, GR>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
-        case 20: nat_body<20, T, GR>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
-        case 23: nat_body<23, T, GR>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
-        case 11: nat_body<11, T, GR>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
-        case 12: nat_body<12, T, GR>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
-        case 13: nat_body<13, T, GR>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
-        case 14: nat_body<14, T, GR>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
-        default: bf16_body<T, GR>(b, X, W, y, K, sg.n, sg.ks, OS); break;
+        case 2: nat_body<2, T, nat_gr(2, T)>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
+        case 6: nat_body<6, T, nat_gr(6, T)>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
+        case 42: nat_body<42, T, nat_gr(42, T)>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
+        case 20: nat_body<20, T, nat_gr(20, T)>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
+        case 23: nat_body<23, T, nat_gr(23, T)>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
+        case 11: nat_body<11, T, nat_gr(11, T)>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
+        case 12: nat_body<12, T, nat_gr(12, T)>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
+        case 13: nat_body<13, T, nat_gr(13, T)>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
+        case 14: nat_body<14, T, nat_gr(14, T)>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
+        default: bf16_body<T, GB>(b, X, W, y, K, sg.n, sg.ks, OS); break;
     }
 }
 

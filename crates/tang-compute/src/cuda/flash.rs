@@ -394,11 +394,13 @@ impl CudaComputeDevice {
         m: usize,
     ) {
         assert!((1..=MAX_T).contains(&m) && out.len >= m * s.n);
-        let gr = if m == 1 { 2 } else { 4 };
         let blocks: usize = s
             .segs
             .iter()
-            .map(|g| g.rows.div_ceil(gr * 8 / Self::stack_ks(g.ty, g.rows, s.k)))
+            .map(|g| {
+                let gr = g.ty.map_or(if m == 1 { 2 } else { 4 }, |t| t.rows_per_warp(m));
+                g.rows.div_ceil(gr * 8 / Self::stack_ks(g.ty, g.rows, s.k))
+            })
             .sum();
         let key = NATST_NAMES[m - 1];
         let f = match self.llm_funcs.borrow().get(key) {
@@ -457,7 +459,7 @@ impl CudaComputeDevice {
         // warps until there are ~2 blocks per SM at 2 rows a warp, keeping 32+ chunks per warp:
         // chosen from (n, k) alone, so a row's summation order (and its bits) doesn't depend on
         // the window width m.
-        let gr = if m == 1 { 2 } else { 4 };
+        let gr = ty.rows_per_warp(m);
         let mut ks = 1;
         while ks < 8
             && n.div_ceil(2 * 8 / ks) < 2 * super::llm::sm_count()

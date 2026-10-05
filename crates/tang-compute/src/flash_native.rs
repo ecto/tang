@@ -33,6 +33,16 @@
 
 use crate::flash::{f16_to_f32, q4x_slot, QAct};
 
+/// Rows a warp at more than one column, by type (kept in step with `NAT_GR_WIDE` in
+/// `kernels::native_cuda`).
+#[allow(non_snake_case)]
+fn WIDE_GR(ty: NatType) -> usize {
+    match ty {
+        NatType::Iq4Nl | NatType::Iq4Xs | NatType::Q2_0 => 2,
+        _ => 4,
+    }
+}
+
 /// A GGUF weight type the native GEMV reads (ggml type ids).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NatType {
@@ -145,6 +155,16 @@ impl NatType {
     /// Whether codes are unsigned with a per-32 min (`w = sc · code − mn`).
     pub fn has_min(self) -> bool {
         matches!(self, Self::Q4K | Self::Q5K)
+    }
+
+    /// Rows a warp of the native GEMV for an `m`-column window (the kernel's `nat_gr`): bits don't
+    /// depend on it, only throughput.
+    pub fn rows_per_warp(self, m: usize) -> usize {
+        if m == 1 {
+            2
+        } else {
+            WIDE_GR(self)
+        }
     }
 
     /// Whether the scale is per 16 weights.
