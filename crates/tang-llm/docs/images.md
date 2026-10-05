@@ -60,6 +60,21 @@ Validated with torch 2.14.1 / diffusers 0.40.0: DiT boundary errors below 1.1e-5
 VAE boundary errors below 2e-5 on CPU and Metal. Trained-weight inference also passed
 the smoke test above; full trained reference parity remains a separate validation task.
 
+The reference exporters also accept `--checkpoint <local-directory>` and use symlinks
+instead of copying weights. DiT export checks available RAM before loading its 24.6 GB
+fp32 reference. `--small-only` limits the exported case; the runner's `--case case-8.json`
+selects one case. Optional `--relative-tolerance` adds a relative term to the existing
+absolute bound. The runner reports every failure, relative L2 error and final output.
+
+Full converted trained DiT at 8×8 latents: final Metal output max error 4.07e-5, but
+nine late boundaries exceed `atol=1e-3, rtol=1e-6` (worst max error 0.00647). This strict
+boundary check remains failing; it is not covered by the random-checkpoint pass claim.
+Accurate CPU RMS statistics reduced the worst CPU boundary error from 0.0427 to 0.0093;
+forward/backward consistency and 97 affected regressions pass. Trained VAE at 4×4 latents
+passes all 20 Metal boundaries under the existing 1e-3 absolute bound, final max error
+2.8e-6. CPU final output is similarly close, but five hidden boundaries exceed its
+stricter 1e-4 bound. Larger trained DiT reference cases are being investigated separately.
+
 For constrained disk, `scripts/download_z_image.py <new-directory>` pins a public
 Hugging Face revision, streams F32 matrices into BF16, preserves vectors, verifies
 original LFS hashes, records converted hashes and retains 4 GiB disk headroom. It

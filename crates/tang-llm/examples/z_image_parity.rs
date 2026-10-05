@@ -18,7 +18,13 @@ struct Case {
     traces: BTreeMap<String, Vec<f32>>,
     output: Vec<f32>,
 }
-fn compare(name: &str, actual: &[f32], expected: &[f32], tolerance: f32) -> Result<()> {
+fn compare(
+    name: &str,
+    actual: &[f32],
+    expected: &[f32],
+    tolerance: f32,
+    relative: f32,
+) -> Result<()> {
     ensure!(
         actual.len() == expected.len(),
         "{name}: shape {} != {}",
@@ -27,24 +33,37 @@ fn compare(name: &str, actual: &[f32], expected: &[f32], tolerance: f32) -> Resu
     );
     let mut max = 0f32;
     let mut worst = 0usize;
+    let mut max_ratio = 0f32;
+    let mut squared_error = 0f64;
+    let mut squared_reference = 0f64;
     for (i, (&a, &e)) in actual.iter().zip(expected).enumerate() {
         ensure!(a.is_finite(), "{name}: nonfinite value at {i}");
         let err = (a - e).abs();
+        squared_error += (a as f64 - e as f64).powi(2);
+        squared_reference += (e as f64).powi(2);
+        max_ratio = max_ratio.max(err / (tolerance + relative * e.abs()));
         if err > max {
             max = err;
             worst = i;
         }
     }
-    println!("{name}: max abs {max:.8} at {worst}");
+    let relative_l2 = (squared_error / squared_reference.max(f64::MIN_POSITIVE)).sqrt();
+    println!("{name}: max abs {max:.8} at {worst}; relative L2 {relative_l2:.8}; max tolerance ratio {max_ratio:.6}");
     ensure!(
-        max < tolerance,
+        max_ratio <= 1.,
         "{name}: actual {} expected {} at {worst}",
         actual[worst],
         expected[worst]
     );
     Ok(())
 }
-fn run<D: ComputeDevice>(dev: D, root: &Path, file: &Path, tolerance: f32) -> Result<()> {
+fn run<D: ComputeDevice>(
+    dev: D,
+    root: &Path,
+    file: &Path,
+    tolerance: f32,
+    relative: f32,
+) -> Result<()> {
     let vae = root.join("vae-fixture").exists();
     let model = if vae {
         None
@@ -77,24 +96,50 @@ fn run<D: ComputeDevice>(dev: D, root: &Path, file: &Path, tolerance: f32) -> Re
             &mut trace,
         )?
     };
+    let mut failures = 0;
     for (name, expected) in case.traces {
-        compare(
+        if let Err(e) = compare(
             &name,
             seen.get(&name).context("missing trace")?,
             &expected,
             tolerance,
-        )?;
+            relative,
+        ) {
+            eprintln!("{e:#}");
+            failures += 1;
+        }
     }
-    compare("output", &out, &case.output, tolerance)
+    if let Err(e) = compare("output", &out, &case.output, tolerance, relative) {
+        eprintln!("{e:#}");
+        failures += 1;
+    }
+    ensure!(failures == 0, "{failures} boundaries exceeded tolerance");
+    Ok(())
 }
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     let root = Path::new(args.get(1).context("fixture directory required")?);
     let metal = args.iter().any(|a| a == "--metal");
-    let files = if root.join("vae-fixture").exists() {
-        ["case-4.json", "case-32.json"]
+    let relative = if let Some(index) = args.iter().position(|a| a == "--relative-tolerance") {
+        args.get(index + 1)
+            .context("relative tolerance missing")?
+            .parse::<f32>()?
     } else {
-        ["case-8.json", "case-32.json"]
+        0.
+    };
+    ensure!(
+        relative.is_finite() && relative >= 0.,
+        "invalid relative tolerance"
+    );
+    let files: Vec<&str> = if let Some(index) = args.iter().position(|a| a == "--case") {
+        vec![args
+            .get(index + 1)
+            .context("--case requires a filename")?
+            .as_str()]
+    } else if root.join("vae-fixture").exists() {
+        vec!["case-4.json", "case-32.json"]
+    } else {
+        vec!["case-8.json", "case-32.json"]
     };
     for file in files {
         println!("{file}:");
@@ -105,11 +150,12 @@ fn main() -> Result<()> {
                 root,
                 &root.join(file),
                 0.001,
+                relative,
             )?;
             #[cfg(not(feature = "metal"))]
             anyhow::bail!("rebuild with --features metal");
         } else {
-            run(CpuDevice::new(), root, &root.join(file), 0.0001)?;
+            run(CpuDevice::new(), root, &root.join(file), 0.0001, relative)?;
         }
     }
     Ok(())

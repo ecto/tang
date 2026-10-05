@@ -141,8 +141,9 @@ impl ComputeDevice for CpuDevice {
             let slice = &data.data[start..start + dim];
 
             // RMS = sqrt(mean(x^2) + eps)
-            let sq_sum: f32 = slice.iter().map(|x| x * x).sum();
-            let rms = (sq_sum / dim as f32 + eps).sqrt();
+            // Wide trained activations lose small contributions in a sequential f32 sum.
+            let sq_sum: f64 = slice.iter().map(|&x| (x as f64) * (x as f64)).sum();
+            let rms = ((sq_sum / dim as f64) as f32 + eps).sqrt();
             let inv_rms = 1.0 / rms;
 
             for d in 0..dim {
@@ -367,8 +368,8 @@ impl ComputeDevice for CpuDevice {
             let x = &input.data[base..base + dim];
 
             // Forward recompute
-            let sq_sum: f32 = x.iter().map(|v| v * v).sum();
-            let rms_sq = sq_sum / dim as f32 + eps;
+            let sq_sum: f64 = x.iter().map(|&v| (v as f64) * (v as f64)).sum();
+            let rms_sq = (sq_sum / dim as f64) as f32 + eps;
             let inv_rms = 1.0 / rms_sq.sqrt();
 
             // grad_weight accumulation
@@ -857,6 +858,33 @@ mod tests {
         let rms0 = (2.5f32 + 1e-5).sqrt();
         assert!((out[0] - 1.0 / rms0).abs() < 1e-5);
         assert!((out[1] - 2.0 / rms0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn cpu_rms_norm_retains_small_terms_in_wide_rows() {
+        let dev = CpuDevice::new();
+        let mut values = vec![1.; 3840];
+        values[0] = 10000.;
+        let output = dev.download(&dev.rms_norm(
+            &dev.upload(&values),
+            &dev.upload(&vec![1.; 3840]),
+            1,
+            3840,
+            1e-5,
+        ));
+        let expected = 10000. / (((100000000f64 + 3839.) / 3840.) as f32 + 1e-5).sqrt();
+        assert!((output[0] - expected).abs() < 1e-5);
+        let mut gradient = vec![0.; 3840];
+        gradient[0] = 1.;
+        let (_, weight_gradient) = dev.rms_norm_backward(
+            &dev.upload(&values),
+            &dev.upload(&vec![1.; 3840]),
+            &dev.upload(&gradient),
+            1,
+            3840,
+            1e-5,
+        );
+        assert!((dev.download(&weight_gradient)[0] - output[0]).abs() < 1e-5);
     }
 
     #[test]
