@@ -9,8 +9,9 @@ from diffusers import ZImageTransformer2DModel
 
 root = Path(sys.argv[1]); root.mkdir(parents=True, exist_ok=True)
 torch.manual_seed(20261005)
-model = ZImageTransformer2DModel(dim=24, n_heads=2, n_kv_heads=2, n_layers=2,
-    n_refiner_layers=2, in_channels=4, cap_feat_dim=16, axes_dims=[4,4,4],
+head128 = "--head128" in sys.argv
+model = ZImageTransformer2DModel(dim=256 if head128 else 24, n_heads=2, n_kv_heads=2, n_layers=2,
+    n_refiner_layers=2, in_channels=4, cap_feat_dim=16, axes_dims=[32,48,48] if head128 else [4,4,4],
     axes_lens=[1024,64,64]).float().eval()
 model.save_pretrained(root)
 for height,width,tokens in [(8,8,5),(32,32,35)]:

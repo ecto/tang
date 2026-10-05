@@ -227,23 +227,18 @@ fn check_memory<D: ComputeDevice>(root: &Path, dev: &D) -> Result<()> {
     }
     let required = stored * dev.bf16_storage_bytes() as u64 / 2 + 4 * 1024 * 1024 * 1024;
     let mut available = dev.free_memory_bytes() as u64;
-    #[cfg(target_os = "macos")]
+    // Follow the node's free/inactive-page policy. CUDA's VRAM probe is primary;
+    // unified-memory devices must also fit currently available host RAM.
     if available == 0 {
-        let total = std::process::Command::new("/usr/sbin/sysctl")
-            .args(["-n", "hw.memsize"])
-            .output()?;
-        let total = String::from_utf8(total.stdout)?.trim().parse::<u64>()?;
-        let output = std::process::Command::new("/usr/bin/memory_pressure")
-            .arg("-Q")
-            .output()?;
-        let text = String::from_utf8(output.stdout)?;
-        let percent = text
-            .lines()
-            .find_map(|l| l.strip_prefix("System-wide memory free percentage: "))
-            .and_then(|s| s.strip_suffix('%'))
-            .context("free-memory estimate unavailable")?
-            .parse::<u64>()?;
-        available = total * percent / 100;
+        available = crate::node::host_memory()
+            .map(|(_, free)| free)
+            .context("free-memory estimate unavailable")?;
+    } else if cfg!(target_os = "macos") {
+        available = available.min(
+            crate::node::host_memory()
+                .map(|(_, free)| free)
+                .context("free-memory estimate unavailable")?,
+        );
     }
     ensure!(available>=required,"not enough free device memory: need {required} bytes including scratch, have {available}; no resident models were evicted");
     Ok(())
