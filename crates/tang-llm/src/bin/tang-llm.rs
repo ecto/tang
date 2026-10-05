@@ -157,6 +157,9 @@ fn main() -> Result<()> {
         [c, d, ..] => (c.as_str(), PathBuf::from(d)),
         _ => bail!("usage: tang-llm <logits|generate> <model-dir> <ids...> [-n N] [--f32]"),
     };
+    if args.first().map(String::as_str) == Some("serve-images") {
+        return on_backend!(backend, serve_images(&args[1..]));
+    }
     if args.first().map(String::as_str) == Some("serve") {
         return serve(backend, &args[1..]);
     }
@@ -933,4 +936,25 @@ fn sim_spec(files: &[String]) -> Result<()> {
         toks as f64 / units.max(1e-9)
     );
     Ok(())
+}
+
+fn serve_images<D: ComputeDevice + 'static, F: Fn() -> Result<D> + Send + 'static>(make: F, args: &[String]) -> Result<()> {
+    let root = PathBuf::from(args.first().context("serve-images <pipeline-dir> [--host H] [--port P] [--api-key-file F]")?);
+    let (mut host, mut port, mut key) = ("127.0.0.1".to_owned(), 8913u16, None);
+    let mut options = args[1..].iter();
+    while let Some(option) = options.next() {
+        match option.as_str() {
+            "--host" => host = options.next().context("--host H")?.clone(),
+            "--port" => port = options.next().context("--port P")?.parse()?,
+            "--api-key-file" => {
+                let value = std::fs::read_to_string(options.next().context("--api-key-file F")?)?;
+                ensure_nonempty_key(&value)?; key = Some(value.trim().to_owned());
+            }
+            _ => bail!("unknown image server option {option}"),
+        }
+    }
+    tang_llm::image_server::serve(&format!("{host}:{port}"), root, key, make)
+}
+fn ensure_nonempty_key(key: &str) -> Result<()> {
+    anyhow::ensure!(!key.trim().is_empty(), "empty image server API key"); Ok(())
 }

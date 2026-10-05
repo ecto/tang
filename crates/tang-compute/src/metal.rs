@@ -712,6 +712,7 @@ fn multi_attn(k: &MetalBuffer, q_len: usize, n_heads: usize, n_kv: usize, d: usi
 }
 
 impl ComputeDevice for MetalDevice {
+    fn bf16_storage_bytes(&self) -> usize { 2 }
     type Buffer = MetalBuffer;
 
     fn dialect(&self) -> Dialect {

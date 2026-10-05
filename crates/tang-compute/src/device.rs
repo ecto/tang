@@ -49,6 +49,9 @@ pub trait ComputeDevice: Send {
         None
     }
 
+    /// Actual bytes per element retained by upload_bf16. CPU widens to f32.
+    fn bf16_storage_bytes(&self) -> usize { 4 }
+
     // -- Buffer lifecycle --
 
     /// Upload f32 data from CPU to device.
@@ -1107,9 +1110,12 @@ pub trait ComputeDevice: Send {
         let (x, w, b) = (self.download(x), self.download(w), self.download(b));
         let mut y = Vec::with_capacity(rows * dim);
         for r in x.chunks(dim).take(rows) {
-            let mean = r.iter().sum::<f32>() / dim as f32;
-            let var = r.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / dim as f32;
-            let inv = 1.0 / (var + eps).sqrt();
+            // Long VAE group-normalization rows amplify sequential f32
+            // reduction error. Accumulate statistics in f64, then apply in f32.
+            let mean = r.iter().map(|v| *v as f64).sum::<f64>() / dim as f64;
+            let var = r.iter().map(|v| (*v as f64 - mean).powi(2)).sum::<f64>() / dim as f64;
+            let inv = (1.0 / (var + eps as f64).sqrt()) as f32;
+            let mean = mean as f32;
             y.extend(
                 r.iter()
                     .enumerate()

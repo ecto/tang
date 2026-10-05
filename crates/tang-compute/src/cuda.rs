@@ -1113,6 +1113,7 @@ impl CudaComputeDevice {
 }
 
 impl ComputeDevice for CudaComputeDevice {
+    fn bf16_storage_bytes(&self) -> usize { 2 }
     type Buffer = CudaBuffer;
 
     fn dialect(&self) -> Dialect {
