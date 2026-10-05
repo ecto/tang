@@ -40,6 +40,8 @@ kernel void softmax(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float row_max = shared[0];
+    // Every SIMD group must read the maximum before phase 2 reuses shared[0].
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Phase 2: compute exp and sum
     float local_sum = 0.0f;

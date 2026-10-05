@@ -3280,6 +3280,46 @@ mod tests {
     }
 
     #[test]
+    fn metal_softmax_large_logits_at_256_columns_is_stable() {
+        let metal = get_metal_device();
+        let cpu = CpuDevice::new();
+        let (rows, cols) = (32, 256);
+        let values: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i * 7) % 251) as f32 - 125.)
+            .collect();
+        let expected = cpu.download(&cpu.softmax(&cpu.upload(&values), rows, cols));
+        for _ in 0..4 {
+            let actual = metal.download(&metal.softmax(&metal.upload(&values), rows, cols));
+            for (index, (&a, &b)) in actual.iter().zip(&expected).enumerate() {
+                assert!(
+                    a.is_finite() && (a - b).abs() < 1e-6,
+                    "softmax index {index}: {a} vs {b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn metal_swiglu_large_negative_gates_remain_finite() {
+        let metal = get_metal_device();
+        let gates = [-1000., -100., -90., -80., -20., 0., 20., 100., 1000.];
+        let up = vec![1f32; gates.len()];
+        let actual = metal.download(&metal.swiglu_fused_buf(
+            &metal.upload(&gates),
+            &metal.upload(&up),
+            gates.len(),
+        ));
+        for (&gate, &value) in gates.iter().zip(&actual) {
+            let expected = (gate as f64 / (1. + (-(gate as f64)).exp())) as f32;
+            assert!(value.is_finite(), "nonfinite SiLU at {gate}: {value}");
+            assert!(
+                (value - expected).abs() < 1e-5,
+                "SiLU at {gate}: {value} vs {expected}"
+            );
+        }
+    }
+
+    #[test]
     fn metal_fused_attention_prep_and_swiglu_vs_default() {
         let metal = get_metal_device();
         let (seq, nh, nkv, hd, pos, max) = (3, 4, 2, 64, 2, 8);
