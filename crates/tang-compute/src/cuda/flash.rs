@@ -613,7 +613,7 @@ impl CudaComputeDevice {
                     .arg(&so)
                     .arg(&os)
                     .arg(&mu)
-                    .launch(grid((n.div_ceil(16 * 8 / ks), 1, 1), 256))
+                    .launch(grid((n.div_ceil(16), 1, 1), 256))
                     .unwrap();
             }
             return;
