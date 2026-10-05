@@ -54,7 +54,7 @@ fn wide_v1() -> bool {
 /// variant.
 fn wide_mma() -> bool {
     static U: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *U.get_or_init(|| std::env::var("TANG_FLASH_NATW").is_err())
+    *U.get_or_init(|| std::env::var("TANG_FLASH_NATW").is_ok_and(|v| v == "mma"))
 }
 
 /// `TANG_FLASH_NATW=16x4`: the wide native GEMV's token tile and rows a warp (A/B; instantiated
@@ -65,6 +65,7 @@ fn natw_variant() -> Option<(usize, usize)> {
     // TANG_FLASH_NATW=v2 for fl_natw2 (decoded-weight reuse, slower), =v1 for fl_natw.
     *U.get_or_init(|| match std::env::var("TANG_FLASH_NATW") {
         Err(_) => Some((16, 4)),
+        Ok(v) if v == "mma" => None,
         Ok(v) => {
             let (a, b) = v.split_once('x')?;
             Some((a.parse().ok()?, b.parse().ok()?))
