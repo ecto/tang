@@ -33,13 +33,19 @@ typedef unsigned long long u64;
 #define QSA_NCH 33
 #define TOPK 10
 #define FF 640
+#ifndef PLAN_CAP
 #define PLAN_CAP 88
+#endif
 #define PLAN_GP 4
 #define PLAN_GS (PLAN_GP + 2 * PLAN_CAP)
 #define PLAN_ET (PLAN_GS + PLAN_CAP + 1)
 #define PLAN_ED (PLAN_ET + PLAN_CAP)
 #define PLAN_MISS (PLAN_ED + PLAN_CAP)
+#ifndef SHARED_ROW
 #define SHARED_ROW 80
+#endif
+// The shared expert's first parts row in a wide (prefill, T > 8) window: 64 · TOPK.
+#define WIDE_SHARED_ROW 640
 #define GU_CODES 0
 #define GU_SCALES 819200
 #define DOWN_CODES 921600
@@ -270,7 +276,7 @@ extern "C" __global__ void __launch_bounds__(256) fl_##NAME##_t##T( \
     const float* __restrict__ X, const unsigned int* __restrict__ XQ, \
     const unsigned char* __restrict__ W, float* __restrict__ Y, unsigned int K, unsigned int N, \
     unsigned int KS, unsigned int OS) { \
-    gemv_body<FMT, T, (T == 1 ? 2 : 4)>(X, XQ, W, Y, K, N, KS, OS); \
+    gemv_body<FMT, T, (T == 1 ? 2 : (T <= 8 ? 4 : 1))>(X, XQ, W, Y, K, N, KS, OS); \
 }
 #define GEMV_ALL(FMT, NAME) GEMV(FMT, NAME, 1) GEMV(FMT, NAME, 2) GEMV(FMT, NAME, 3) GEMV(FMT, NAME, 4) \
     GEMV(FMT, NAME, 5) GEMV(FMT, NAME, 6) GEMV(FMT, NAME, 7) GEMV(FMT, NAME, 8)
@@ -278,6 +284,11 @@ GEMV_ALL(0, bf16_gemv)
 GEMV_ALL(1, q2_gemv)
 GEMV_ALL(2, q4x_gemv)
 GEMV_ALL(3, q8x_gemv)
+// Prefill-only widths (one row a warp: the per-row arithmetic is the same at any width).
+GEMV(0, bf16_gemv, 16) GEMV(0, bf16_gemv, 32) GEMV(0, bf16_gemv, 64)
+GEMV(1, q2_gemv, 16) GEMV(1, q2_gemv, 32) GEMV(1, q2_gemv, 64)
+GEMV(2, q4x_gemv, 16) GEMV(2, q4x_gemv, 32) GEMV(2, q4x_gemv, 64)
+GEMV(3, q8x_gemv, 16) GEMV(3, q8x_gemv, 32) GEMV(3, q8x_gemv, 64)
 
 // ---- hyper-connections ----
 
@@ -791,6 +802,268 @@ HC_FUSED(1) HC_FUSED(2) HC_FUSED(3) HC_FUSED(4) HC_FUSED(5) HC_FUSED(6) HC_FUSED
 // Prefill-only widths (flash-serve).
 HC_FUSED(16) HC_FUSED(32)
 
+// Wide windows (prefill, M = 1..64 tokens): hc_fused_body with the token loop tiled by HW_TT.
+// Phase-1 and phase-2 weights are loaded into registers once and run over every tile; shared
+// memory and accumulators are a tile's. Each token's chains are the T kernels' (explicit fma
+// chains, the same K split and reduction order), so its bits don't depend on the width.
+#ifndef HW_TT
+#define HW_TT 8
+#endif
+#ifndef HW_MINB
+#define HW_MINB 1
+#endif
+#ifndef HW_T2
+#define HW_T2 16
+#endif
+template <bool Q8>
+__device__ __forceinline__ void hc_wide_body(
+    float* __restrict__ R, const float* __restrict__ Yp, const float* __restrict__ Ip, unsigned int mode,
+    const float* __restrict__ Wn, float eps, const float* __restrict__ PARTS, const float* __restrict__ Wr,
+    const float* __restrict__ L, unsigned int stride, int sg, const unsigned short* __restrict__ Wd,
+    const unsigned short* __restrict__ Wi, unsigned int rows, const unsigned short* __restrict__ Wu,
+    float* __restrict__ X, unsigned int* __restrict__ XQ, unsigned int quant, float* __restrict__ INJ,
+    float* __restrict__ XN, float* __restrict__ LO, unsigned int* __restrict__ bar, unsigned int M) {
+    float* PART = LO;  // [4][rows][M]
+    __shared__ float red[16][2 * HW_TT];
+    unsigned int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, nb = gridDim.x;
+    for (unsigned int item = blockIdx.x; item < HC * M; item += nb) {
+        unsigned int c = item % HC, t = item / HC;
+        float* row = R + ((u64)t * HC + c) * HIDDEN;
+        float g = mode ? 2.0f / (1.0f + expf(-(Ip[t * HC + c] * 0.25f))) : 0.0f;
+        float gs = (mode == 2 && sg >= 0) ? sigm(L[(u64)t * stride + sg]) : 0.0f;
+        float v[5], ss = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 5; i++) {
+            unsigned int d = tid + 512 * i;
+            float x = row[d];
+            if (mode) {
+                float y;
+                if (mode == 1) {
+                    y = Yp[(u64)t * HIDDEN + d];
+                } else {
+                    y = 0.0f;
+                    #pragma unroll
+                    for (int k = 0; k < TOPK; k++)
+                        y = __fmaf_rn(Wr[t * TOPK + k], PARTS[(u64)(t * TOPK + k) * HIDDEN + d], y);
+                    if (sg >= 0) y = __fmaf_rn(gs, PARTS[(u64)((M > 8 ? WIDE_SHARED_ROW : SHARED_ROW) + t) * HIDDEN + d], y);
+                }
+                x = __fmaf_rn(y, g, x);
+                row[d] = x;
+            }
+            v[i] = x;
+            ss = __fmaf_rn(x, x, ss);
+        }
+        ss = warp_sum(ss);
+        if (lane == 0) red[warp][0] = ss;
+        __syncthreads();
+        ss = 0.0f;
+        for (int w = 0; w < 16; w++) ss += red[w][0];
+        float rs = 1.0f / sqrtf(ss / (float)HIDDEN + eps);
+        #pragma unroll
+        for (int i = 0; i < 5; i++) {
+            unsigned int d = tid + 512 * i;
+            XN[(u64)t * HC * HIDDEN + c * HIDDEN + d] = v[i] * rs * Wn[c * HIDDEN + d];
+        }
+        __syncthreads();
+    }
+    grid_bar(bar, nb);
+#ifdef HC_STOP1
+    return;
+#endif
+    const unsigned int KW = HC * HIDDEN;
+    const unsigned int ngroups = (rows + 7) / 8;
+    for (unsigned int item = blockIdx.x; item < 4 * ngroups; item += nb) {
+        const unsigned int rg = item / 4, kq = item % 4, rp = warp % 4, ks = warp / 4;
+        const unsigned int r0 = 8 * rg + 2 * rp, koff = kq * 2560 + ks * 640;
+        const unsigned short* w[2];
+        const unsigned char* wq[2];
+        const unsigned short* ws[2];
+        #pragma unroll
+        for (int r = 0; r < 2; r++) {
+            unsigned int row = min(r0 + r, rows - 1);
+            w[r] = (row < HC_LR ? Wd + (u64)row * KW : Wi + (u64)(row - HC_LR) * KW) + koff;
+            if (Q8) {
+                const unsigned char* base = (const unsigned char*)(row < HC_LR ? Wd : Wi);
+                unsigned int rr = row < HC_LR ? row : row - HC_LR, nr = row < HC_LR ? HC_LR : HC;
+                wq[r] = base + (u64)rr * KW + koff;
+                ws[r] = (const unsigned short*)(base + (((u64)nr * KW + 15) & ~15ull)) + (u64)rr * (KW / 32) + koff / 32;
+            }
+        }
+        uint4 p0[3], p1[3];
+        uint2 c0[3], c1[3];
+        float d0[3], d1[3];
+        if (r0 < rows) {
+            #pragma unroll
+            for (int j = 0; j < 3; j++) {
+                unsigned int i = min(lane + 32 * j, 79u);
+                if (Q8) {
+                    c0[j] = __ldg((const uint2*)wq[0] + i); c1[j] = __ldg((const uint2*)wq[1] + i);
+                    d0[j] = h2f(__ldg(ws[0] + i / 4)); d1[j] = h2f(__ldg(ws[1] + i / 4));
+                } else {
+                    p0[j] = __ldg((const uint4*)w[0] + i); p1[j] = __ldg((const uint4*)w[1] + i);
+                }
+            }
+        }
+        for (unsigned int t0 = 0; t0 < M; t0 += HW_TT) {
+            float acc[2][HW_TT];
+            #pragma unroll
+            for (int r = 0; r < 2; r++)
+                #pragma unroll
+                for (int t = 0; t < HW_TT; t++) acc[r][t] = 0.0f;
+            if (r0 < rows) {
+                #pragma unroll
+                for (int j = 0; j < 3; j++) {
+                    unsigned int i = lane + 32 * j;
+                    if (i >= 80) break;
+                    #pragma unroll
+                    for (int t = 0; t < HW_TT; t++) {
+                        unsigned int tc = min(t0 + t, M - 1);
+                        const float4* x4 = (const float4*)(XN + (u64)tc * HC * HIDDEN + koff + i * 8);
+                        float4 a = x4[0], b = x4[1];
+                        if (Q8) {
+                            acc[0][t] = dot8q_rn(c0[j], d0[j], a, b, acc[0][t]);
+                            acc[1][t] = dot8q_rn(c1[j], d1[j], a, b, acc[1][t]);
+                        } else {
+                            acc[0][t] = dot8_rn(p0[j], a, b, acc[0][t]);
+                            acc[1][t] = dot8_rn(p1[j], a, b, acc[1][t]);
+                        }
+                    }
+                }
+            }
+            #pragma unroll
+            for (int r = 0; r < 2; r++)
+                #pragma unroll
+                for (int t = 0; t < HW_TT; t++) {
+                    float sm = warp_sum(acc[r][t]);
+                    if (lane == 0) red[warp][r * HW_TT + t] = sm;
+                }
+            __syncthreads();
+            if (tid < 8 * HW_TT) {
+                unsigned int rl = tid / HW_TT, t = tid % HW_TT, row = 8 * rg + rl;
+                if (row < rows && t0 + t < M) {
+                    unsigned int rpp = rl / 2, r = rl % 2;
+                    float v = red[rpp][r * HW_TT + t];
+                    for (int k = 1; k < 4; k++) v += red[rpp + 4 * k][r * HW_TT + t];
+                    PART[((u64)kq * rows + row) * M + t0 + t] = v;
+                }
+            }
+            __syncthreads();
+        }
+    }
+    grid_bar(bar, nb);
+#ifdef HC_STOP2
+    return;
+#endif
+    if (blockIdx.x == 0)
+        for (unsigned int i = tid; i < (rows - HC_LR) * M; i += 512) {
+            unsigned int row = HC_LR + i / M, t = i % M;
+            float v = PART[(u64)row * M + t];
+            for (int k = 1; k < 4; k++) v += PART[((u64)k * rows + row) * M + t];
+            INJ[t * HC + row - HC_LR] = v;
+        }
+    // Phase 2 (wide): the lo activations once to global (after PART), then warp items
+    // (output d, token tile) over the whole grid, then the quantization as (token, chunk) items.
+    float* LOW = LO + (u64)4 * (HC_LR + HC) * M;
+    for (unsigned int i = blockIdx.x * 512 + tid; i < M * HC_LR; i += nb * 512) {
+        unsigned int t = i / HC_LR, row = i % HC_LR;
+        float v = PART[(u64)row * M + t];
+        for (int k = 1; k < 4; k++) v += PART[((u64)k * rows + row) * M + t];
+        LOW[i] = silu(v * 0.25f);
+    }
+    grid_bar(bar, nb);
+    const unsigned int ntile = (M + HW_T2 - 1) / HW_T2, nw = nb * 16;
+    for (unsigned int it = blockIdx.x * 16 + warp; it < HIDDEN * ntile; it += nw) {
+        unsigned int d = it % HIDDEN, t0 = (it / HIDDEN) * HW_T2, tn = min(M - t0, (unsigned int)HW_T2);
+        const uint4* w = (const uint4*)(Wu + (u64)d * HC * HC_LR);
+        uint4 qv[5];
+        uint2 cv[5];
+        float dv[5];
+        if (Q8) {
+            const unsigned char* base = (const unsigned char*)Wu;
+            const unsigned short* sc = (const unsigned short*)(base + (((u64)HC * HIDDEN * HC_LR + 15) & ~15ull));
+            #pragma unroll
+            for (int j = 0; j < 5; j++) {
+                unsigned int p = (lane >> 2) + 8 * j;
+                cv[j] = __ldg((const uint2*)(base + (u64)d * HC * HC_LR) + lane + 32 * j);
+                dv[j] = h2f(__ldg(sc + (u64)((lane & 3) * HIDDEN + d) * (HC_LR / 32) + p / 4));
+            }
+        } else {
+            #pragma unroll
+            for (int j = 0; j < 5; j++) qv[j] = __ldg(w + lane + 32 * j);
+        }
+        float acc[HW_T2];
+        #pragma unroll
+        for (int t = 0; t < HW_T2; t++) acc[t] = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 5; j++) {
+            unsigned int p = (lane >> 2) + 8 * j;
+            if (Q8) {
+                #pragma unroll
+                for (int t = 0; t < HW_T2; t++) {
+                    const float4* l4 = (const float4*)(LOW + (u64)(t0 + min((unsigned int)t, tn - 1)) * HC_LR + p * 8);
+                    acc[t] = dot8q_rn(cv[j], dv[j], l4[0], l4[1], acc[t]);
+                }
+                continue;
+            }
+            uint4 qq = qv[j];
+            float wv[8] = {bf(qq.x & 0xffff), bf(qq.x >> 16), bf(qq.y & 0xffff), bf(qq.y >> 16),
+                           bf(qq.z & 0xffff), bf(qq.z >> 16), bf(qq.w & 0xffff), bf(qq.w >> 16)};
+            #pragma unroll
+            for (int t = 0; t < HW_T2; t++) {
+                const float4* l4 = (const float4*)(LOW + (u64)(t0 + min((unsigned int)t, tn - 1)) * HC_LR + p * 8);
+                float4 a = l4[0], b = l4[1];
+                float s8 = __fmul_rn(wv[0], a.x);
+                s8 = __fmaf_rn(wv[1], a.y, s8); s8 = __fmaf_rn(wv[2], a.z, s8); s8 = __fmaf_rn(wv[3], a.w, s8);
+                s8 = __fmaf_rn(wv[4], b.x, s8); s8 = __fmaf_rn(wv[5], b.y, s8); s8 = __fmaf_rn(wv[6], b.z, s8);
+                s8 = __fmaf_rn(wv[7], b.w, s8);
+                acc[t] = __fadd_rn(acc[t], s8);
+            }
+        }
+        #pragma unroll
+        for (int t = 0; t < HW_T2; t++) {
+            float v = acc[t];
+            v += __shfl_xor_sync(0xffffffffu, v, 4);
+            v += __shfl_xor_sync(0xffffffffu, v, 8);
+            v += __shfl_xor_sync(0xffffffffu, v, 16);
+            float g = sigm(v);
+            float g1 = __shfl_sync(0xffffffffu, g, 1), g2 = __shfl_sync(0xffffffffu, g, 2), g3 = __shfl_sync(0xffffffffu, g, 3);
+            if (lane == 0 && t < tn) {
+                const float* xn = XN + (u64)(t0 + t) * HC * HIDDEN + d;
+                float x = __fmaf_rn(xn[0], g, 0.0f);
+                x = __fmaf_rn(xn[HIDDEN], g1, x);
+                x = __fmaf_rn(xn[2 * HIDDEN], g2, x);
+                x = __fmaf_rn(xn[3 * HIDDEN], g3, x);
+                x *= 0.25f;
+                X[(u64)(t0 + t) * HIDDEN + d] = x;
+            }
+        }
+    }
+    if (!quant) return;
+    grid_bar(bar, nb);
+    for (unsigned int it = blockIdx.x * 16 + warp; it < M * (HIDDEN / 32); it += nw) {
+        unsigned int t = it / (HIDDEN / 32), q = it % (HIDDEN / 32);
+        quant_chunk(X[(u64)t * HIDDEN + q * 32 + lane], XQ, M, HIDDEN, t, q, lane);
+    }
+}
+extern "C" __global__ void __launch_bounds__(512, HW_MINB) fl_hc_fusedw(
+    float* R, const float* Yp, const float* Ip, unsigned int mode, const float* Wn, float eps,
+    const float* PARTS, const float* Wr, const float* L, unsigned int stride, int sg,
+    const unsigned short* Wd, const unsigned short* Wi, unsigned int rows, const unsigned short* Wu,
+    float* X, unsigned int* XQ, unsigned int quant, float* INJ, float* XN, float* LO, unsigned int* bar,
+    unsigned int M) {
+    hc_wide_body<false>(R, Yp, Ip, mode, Wn, eps, PARTS, Wr, L, stride, sg, Wd, Wi, rows, Wu, X, XQ, quant,
+                        INJ, XN, LO, bar, M);
+}
+extern "C" __global__ void __launch_bounds__(512, HW_MINB) fl_hc_fusedw_q8(
+    float* R, const float* Yp, const float* Ip, unsigned int mode, const float* Wn, float eps,
+    const float* PARTS, const float* Wr, const float* L, unsigned int stride, int sg,
+    const unsigned short* Wd, const unsigned short* Wi, unsigned int rows, const unsigned short* Wu,
+    float* X, unsigned int* XQ, unsigned int quant, float* INJ, float* XN, float* LO, unsigned int* bar,
+    unsigned int M) {
+    hc_wide_body<true>(R, Yp, Ip, mode, Wn, eps, PARTS, Wr, L, stride, sg, Wd, Wi, rows, Wu, X, XQ, quant,
+                       INJ, XN, LO, bar, M);
+}
+
 // ---- Gated DeltaNet ----
 
 // Grid GDN_CONV / 128 (one block per 128-channel head), block 128.
@@ -800,17 +1073,23 @@ extern "C" __global__ void fl_gdn_conv(const float* __restrict__ P, unsigned int
     __shared__ float red[4];
     unsigned int head = blockIdx.x, j = threadIdx.x, ch = head * 128 + j;
     float4 w = ((const float4*)Wc)[ch];
+    // Tokens in chunks of 8 (one chunk up to MAX_T; wider windows are prefill). e[i] is conv
+    // input row t0 + i of [hist | P].
+    for (unsigned int t0 = 0; t0 < T; t0 += 8) {
     float e[11];
-    e[0] = H0[ch]; e[1] = H0[GDN_CONV + ch]; e[2] = H0[2 * GDN_CONV + ch];
     #pragma unroll
-    for (unsigned int t = 0; t < 8; t++) e[3 + t] = t < T ? P[(u64)t * stride + ch] : 0.0f;
+    for (unsigned int i = 0; i < 11; i++) {
+        unsigned int p = t0 + i;
+        e[i] = p < 3 ? H0[p * GDN_CONV + ch] : (p - 3 < T ? P[(u64)(p - 3) * stride + ch] : 0.0f);
+    }
     #pragma unroll
-    for (unsigned int t = 0; t < 8; t++) {
+    for (unsigned int tl = 0; tl < 8; tl++) {
+        unsigned int t = t0 + tl;
         if (t >= T) break;
-        float acc = e[t] * w.x;
-        acc = __fmaf_rn(e[t + 1], w.y, acc);
-        acc = __fmaf_rn(e[t + 2], w.z, acc);
-        acc = __fmaf_rn(e[t + 3], w.w, acc);
+        float acc = e[tl] * w.x;
+        acc = __fmaf_rn(e[tl + 1], w.y, acc);
+        acc = __fmaf_rn(e[tl + 2], w.z, acc);
+        acc = __fmaf_rn(e[tl + 3], w.w, acc);
         float v = silu(acc);
         if (head < 2 * GDN_HK) {
             float ss = warp_sum(v * v);
@@ -821,6 +1100,7 @@ extern "C" __global__ void fl_gdn_conv(const float* __restrict__ P, unsigned int
             v *= 1.0f / sqrtf(ss + eps);
         }
         H[(u64)t * GDN_CONV + ch] = v;
+    }
     }
 }
 
@@ -860,21 +1140,26 @@ __device__ __forceinline__ void gdn_step_body(
     __shared__ float red2[4];
     unsigned int hv = blockIdx.x, hk = hv % GDN_HK, tid = threadIdx.x, j = tid & 127, rg = tid >> 7;
     unsigned int n = commit ? min(win[1], T) : T;
+    float st[32];
+    #pragma unroll
+    for (int r = 0; r < 32; r++) st[r] = S[((u64)(rg * 32 + r) * GDN_HV + hv) * 128 + j];
+    // Tokens in chunks of 8 (one chunk up to MAX_T; wider windows are prefill), the state in
+    // registers throughout: each token's arithmetic is the same at any width.
+    for (unsigned int t0 = 0; t0 < n; t0 += 8) {
+    const unsigned int nn = min(n - t0, 8u);
     if (FUSED) {
-        // The conv for this head's q, k and v channels (thread groups 0, 1, 2), fl_gdn_conv's
-        // arithmetic, including its L2-norm reduction order.
         __shared__ float cred[2][4];
         unsigned int ch = rg == 0 ? hk * 128 + j : (rg == 1 ? GDN_HK * 128 + hk * 128 + j : 2 * GDN_HK * 128 + hv * 128 + j);
         float4 w = rg < 3 ? ((const float4*)Wc)[ch] : make_float4(0, 0, 0, 0);
         float e[11];
-        e[0] = rg < 3 ? H0[ch] : 0.0f;
-        e[1] = rg < 3 ? H0[GDN_CONV + ch] : 0.0f;
-        e[2] = rg < 3 ? H0[2 * GDN_CONV + ch] : 0.0f;
         #pragma unroll
-        for (unsigned int t = 0; t < 8; t++) e[3 + t] = (t < n && rg < 3) ? P[(u64)t * stride + ch] : 0.0f;
+        for (unsigned int i = 0; i < 11; i++) {
+            unsigned int p = t0 + i;
+            e[i] = rg >= 3 ? 0.0f : (p < 3 ? H0[p * GDN_CONV + ch] : (p - 3 < n ? P[(u64)(p - 3) * stride + ch] : 0.0f));
+        }
         #pragma unroll
         for (unsigned int t = 0; t < 8; t++) {
-            if (t >= n) break;
+            if (t >= nn) break;
             float acc = e[t] * w.x;
             acc = __fmaf_rn(e[t + 1], w.y, acc);
             acc = __fmaf_rn(e[t + 2], w.z, acc);
@@ -891,29 +1176,26 @@ __device__ __forceinline__ void gdn_step_body(
             if (rg == 0) sq[t][j] = v;
             else if (rg == 1) sk[t][j] = v;
             else if (rg == 2) sv[t][j] = v;
-            else sz[t][j] = P[(u64)t * stride + GDN_Z + hv * 128 + j];
+            else sz[t][j] = P[(u64)(t0 + t) * stride + GDN_Z + hv * 128 + j];
         }
     } else {
-        for (unsigned int i = tid; i < n * 128; i += 512) {
+        for (unsigned int i = tid; i < nn * 128; i += 512) {
             unsigned int t = i >> 7, jj = i & 127;
-            const float* hh = Hc + (u64)t * GDN_CONV;
+            const float* hh = Hc + (u64)(t0 + t) * GDN_CONV;
             sq[t][jj] = hh[hk * 128 + jj];
             sk[t][jj] = hh[GDN_HK * 128 + hk * 128 + jj];
             sv[t][jj] = hh[2 * GDN_HK * 128 + hv * 128 + jj];
-            sz[t][jj] = P[(u64)t * stride + GDN_Z + hv * 128 + jj];
+            sz[t][jj] = P[(u64)(t0 + t) * stride + GDN_Z + hv * 128 + jj];
         }
     }
-    if (tid < n) {
-        float a = P[(u64)tid * stride + GDN_A + hv] + DT[hv];
+    if (tid < nn) {
+        float a = P[(u64)(t0 + tid) * stride + GDN_A + hv] + DT[hv];
         float sp = a > 20.0f ? a : log1pf(expf(a));
         sg[tid] = expf(sp * SA[hv]);
-        sb[tid] = sigm(P[(u64)tid * stride + GDN_B + hv]);
+        sb[tid] = sigm(P[(u64)(t0 + tid) * stride + GDN_B + hv]);
     }
-    float st[32];
-    #pragma unroll
-    for (int r = 0; r < 32; r++) st[r] = S[((u64)(rg * 32 + r) * GDN_HV + hv) * 128 + j];
     __syncthreads();
-    for (unsigned int t = 0; t < n; t++) {
+    for (unsigned int t = 0; t < nn; t++) {
         float g = sg[t];
         float p = 0.0f;
         #pragma unroll
@@ -944,10 +1226,11 @@ __device__ __forceinline__ void gdn_step_body(
             float ss = ((red2[0] + red2[1]) + red2[2]) + red2[3];
             float rs = 1.0f / sqrtf(ss / 128.0f + eps);
             float y = o * rs * NW[j] * sigm(sz[t][j]);
-            Y[(u64)t * GDN_V + hv * 128 + j] = y;
-            if (quant) quant_chunk(y, YQ, T, GDN_V, t, hv * 4 + (j >> 5), j & 31);
+            Y[(u64)(t0 + t) * GDN_V + hv * 128 + j] = y;
+            if (quant) quant_chunk(y, YQ, T, GDN_V, t0 + t, hv * 4 + (j >> 5), j & 31);
         }
         __syncthreads();
+    }
     }
     if (commit) {
         #pragma unroll
@@ -1035,10 +1318,10 @@ __device__ unsigned int scan128(unsigned int v, unsigned int* sc) {
         unsigned int n = __shfl_up_sync(0xffffffffu, v, o);
         if (lane >= o) v += n;
     }
-    if (lane == 31 && warp < 4) sc[warp] = v;
+    if (lane == 31) sc[warp] = v;
     __syncthreads();
     unsigned int off = 0;
-    for (unsigned int w = 0; w < warp && w < 4; w++) off += sc[w];
+    for (unsigned int w = 0; w < warp; w++) off += sc[w];
     __syncthreads();
     return v + off;
 }
@@ -1049,7 +1332,7 @@ __device__ unsigned int scan128(unsigned int v, unsigned int* sc) {
 __device__ void plan_core(const unsigned int* ids, const unsigned int* __restrict__ TABLE, u64 shared,
                           unsigned int* __restrict__ PLAN, unsigned int T) {
     __shared__ unsigned int first[PLAN_CAP], gid[PLAN_CAP], start[PLAN_CAP + 1];
-    __shared__ unsigned int sc[4];
+    __shared__ unsigned int sc[32];
     __shared__ unsigned int tot_g, tot_e, tot_m;
     unsigned int n = T * TOPK, tid = threadIdx.x;
     u64 p = 0;
@@ -1068,7 +1351,7 @@ __device__ void plan_core(const unsigned int* ids, const unsigned int* __restric
     unsigned int g_incl = scan128(res ? 1u : 0u, sc);
     unsigned int s_incl = scan128(cnt, sc);
     unsigned int m_incl = scan128(miss ? 1u : 0u, sc);
-    if (tid == 127) { tot_g = g_incl; tot_e = s_incl; tot_m = m_incl; }
+    if (tid == blockDim.x - 1) { tot_g = g_incl; tot_e = s_incl; tot_m = m_incl; }
     if (res) {
         unsigned int g = g_incl - 1, st = s_incl - cnt;
         gid[tid] = g;
@@ -1115,7 +1398,7 @@ __device__ void plan_core(const unsigned int* ids, const unsigned int* __restric
 extern "C" __global__ void fl_moe_plan(const unsigned int* __restrict__ IDS, const unsigned int* __restrict__ TABLE,
                                        u64 shared, unsigned int* __restrict__ PLAN, unsigned int T) {
     __shared__ unsigned int ids[PLAN_CAP];
-    if (threadIdx.x < T * TOPK) ids[threadIdx.x] = IDS[threadIdx.x];
+    for (unsigned int i = threadIdx.x; i < T * TOPK; i += blockDim.x) ids[i] = IDS[i];
     __syncthreads();
     plan_core(ids, TABLE, shared, PLAN, T);
 }
@@ -1129,8 +1412,8 @@ extern "C" __global__ void fl_moe_route(const float* __restrict__ L, unsigned in
                                         unsigned int* __restrict__ IDS, float* __restrict__ W,
                                         unsigned int* __restrict__ PLAN, unsigned int T) {
     __shared__ unsigned int ids[PLAN_CAP];
-    unsigned int lane = threadIdx.x & 31, t = threadIdx.x >> 5;
-    if (t < T) {
+    unsigned int lane = threadIdx.x & 31;
+    for (unsigned int t = threadIdx.x >> 5; t < T; t += blockDim.x >> 5) {
         unsigned int id;
         float w;
         router_warp(L + (u64)t * stride, NE, lane, &id, &w);
@@ -1140,7 +1423,8 @@ extern "C" __global__ void fl_moe_route(const float* __restrict__ L, unsigned in
             if (!forced) ids[t * TOPK + lane] = id;
         }
     }
-    if (forced && threadIdx.x < T * TOPK) ids[threadIdx.x] = FORCED[threadIdx.x];
+    if (forced)
+        for (unsigned int i = threadIdx.x; i < T * TOPK; i += blockDim.x) ids[i] = FORCED[i];
     __syncthreads();
     plan_core(ids, TABLE, shared, PLAN, T);
 }
@@ -1390,6 +1674,9 @@ extern "C" __global__ void __launch_bounds__(128, 8) fl_moe_gu_t##T( \
     moe_gu_body<T>(XQ, Tm, PLAN, HQ); \
 }
 MOE_GU(1) MOE_GU(2) MOE_GU(3) MOE_GU(4) MOE_GU(5) MOE_GU(6) MOE_GU(7) MOE_GU(8)
+#ifdef FLASH_WIDE
+MOE_GU(64)
+#endif
 
 // Down rows of every planned expert against its entries' quantized h (HQ), into PARTS[dst]:
 // one 16-row down tile of group g for a warp (160 per group). CG: read HQ through L2 only (it
@@ -1400,23 +1687,28 @@ __device__ __forceinline__ void moe_down_tile(const unsigned int* __restrict__ H
     unsigned int lane = threadIdx.x & 31;
     const unsigned int kb = FF / 4;
     const unsigned char* blob = plan_blob(PLAN, g);
-    unsigned int e0 = PLAN[PLAN_GS + g], ne = PLAN[PLAN_GS + g + 1] - e0;
-    unsigned int ents[NE];
+    unsigned int e0 = PLAN[PLAN_GS + g], ne_all = PLAN[PLAN_GS + g + 1] - e0;
+    // Entries in passes of DC (one pass up to T = 8; wide groups re-read the tile from L2).
+    constexpr int DC = NE > 8 ? 8 : NE;
+    for (unsigned int p0 = 0; p0 < ne_all; p0 += DC) {
+    unsigned int ne = min(ne_all - p0, (unsigned int)DC);
+    unsigned int ents[DC];
     #pragma unroll
-    for (int e = 0; e < NE; e++) ents[e] = e0 + e;
-    float a0[NE], a1[NE];
-    tile_dot<FF / 128, NE, CG>(blob + DOWN_CODES + (u64)tile * (FF / 128) * 512,
+    for (int e = 0; e < DC; e++) ents[e] = e0 + p0 + e;
+    float a0[DC], a1[DC];
+    tile_dot<FF / 128, DC, CG>(blob + DOWN_CODES + (u64)tile * (FF / 128) * 512,
                                blob + DOWN_SCALES + (u64)tile * (FF / 128) * 64, HQ, kb, PLAN_CAP, ents, ne, lane,
                                a0, a1);
-    unsigned int my_dst = lane < ne ? PLAN[PLAN_ED + e0 + lane] : 0;
+    unsigned int my_dst = lane < ne ? PLAN[PLAN_ED + e0 + p0 + lane] : 0;
     #pragma unroll
-    for (int e = 0; e < NE; e++) {
+    for (int e = 0; e < DC; e++) {
         unsigned int dst = __shfl_sync(0xffffffffu, my_dst, e);
         if (e < ne && (lane & 3) == 0) {
             float* out = PARTS + (u64)dst * HIDDEN + 16 * tile + (lane >> 2);
             out[0] = a0[e];
             out[8] = a1[e];
         }
+    }
     }
 }
 
@@ -1435,6 +1727,9 @@ extern "C" __global__ void __launch_bounds__(256, 3) fl_moe_down_t##T( \
     moe_down_body<T>(HQ, PLAN, PARTS); \
 }
 MOE_DOWN(1) MOE_DOWN(2) MOE_DOWN(3) MOE_DOWN(4) MOE_DOWN(5) MOE_DOWN(6) MOE_DOWN(7) MOE_DOWN(8)
+#ifdef FLASH_WIDE
+MOE_DOWN(64)
+#endif
 
 // gu and down in one launch on a co-resident grid of 128-thread blocks: items are every group's
 // 20 gu items, then every group's 40 down items (4 tiles, a warp each), taken in index order
@@ -1480,6 +1775,9 @@ extern "C" __global__ void __launch_bounds__(128, 8) fl_moe_fused_t##T( \
     moe_fused_body<T>(XQ, Tm, PLAN, HQ, PARTS, CNT); \
 }
 MOE_FUSED(1) MOE_FUSED(2) MOE_FUSED(3) MOE_FUSED(4) MOE_FUSED(5) MOE_FUSED(6) MOE_FUSED(7) MOE_FUSED(8)
+#ifdef FLASH_WIDE
+MOE_FUSED(64)
+#endif
 
 // y[t] = Σ_i w[t][i] parts[t·10 + i] (+ σ(logit[t][sg]) parts[SHARED_ROW + t]). Grid
 // (HIDDEN / 256, T).

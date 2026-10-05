@@ -418,6 +418,31 @@ impl MoePlan {
     pub const SHARED_ROW: usize = MAX_T * TOPK;
     /// Rows of `parts` ([`HIDDEN`] floats each).
     pub const PARTS_ROWS: usize = Self::CAP;
+    /// Widest prefill window (the wide plan layout's capacity).
+    pub const WIDE_MAX: usize = 64;
+    /// Wide (prefill, `MAX_T` < m <= `WIDE_MAX`) plan capacity: the same layout with this CAP.
+    pub const WIDE_CAP: usize = Self::WIDE_MAX * TOPK + Self::WIDE_MAX;
+    /// Plan capacity at window width `m`.
+    pub const fn cap(m: usize) -> usize {
+        if m <= MAX_T { Self::CAP } else { Self::WIDE_CAP }
+    }
+    /// Plan words at window width `m` (offsets as the constants above, with `cap(m)`).
+    pub const fn words(m: usize) -> usize {
+        Self::GROUP_PTR + 2 * Self::cap(m) + Self::cap(m) + 1 + 3 * Self::cap(m)
+    }
+    /// First `parts` row of the shared expert at window width `m`: `SHARED_ROW` up to `MAX_T`,
+    /// `WIDE_MAX · TOPK` for wider (prefill) windows.
+    pub const fn shared_row(m: usize) -> usize {
+        if m <= MAX_T { Self::SHARED_ROW } else { Self::WIDE_MAX * TOPK }
+    }
+    /// `parts` rows at window width `m`.
+    pub const fn parts_rows(m: usize) -> usize {
+        Self::cap(m)
+    }
+    /// `moe_grouped_into` scratch words at window width `m`.
+    pub fn scratch_words_for(m: usize) -> usize {
+        QAct { m: Self::cap(m), k: FF }.words()
+    }
     /// Words of `moe_grouped_into` scratch: every entry's SwiGLU activations as int8
     /// (`QAct { m: CAP, k: FF }`, row = entry).
     pub fn scratch_words() -> usize {
@@ -602,7 +627,8 @@ pub fn hc_q8_dequant(bytes: &[u8], n: usize, k: usize, up: bool) -> Vec<f32> {
 /// Words of `hc_read_into` scratch for a window of `t`: normalized streams `[t][HC·HIDDEN]`
 /// and the bottleneck: `[t][HC_LR]` (separate kernels) or the fused read's K-quarter partials `[4][HC_LR + HC][t]`.
 pub fn hc_scratch_words(t: usize) -> usize {
-    t * (HC * HIDDEN + 4 * (HC_LR + HC))
+    // Wide (prefill) windows also keep the lo activations ([t][HC_LR]) after the partials.
+    t * (HC * HIDDEN + 4 * (HC_LR + HC)) + if t > MAX_T { t * HC_LR } else { 0 }
 }
 
 // ---- QSA ----

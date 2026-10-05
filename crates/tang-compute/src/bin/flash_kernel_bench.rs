@@ -343,7 +343,13 @@ fn synthetic_ids(rng: &mut Rng, t: usize) -> (Vec<u32>, usize) {
         let fresh = if tt == 0 {
             TOPK
         } else {
-            [7, 7, 7, 6, 6, 6, 6][tt - 1]
+            if tt < 8 {
+                [7, 7, 7, 6, 6, 6, 6][tt - 1]
+            } else {
+                // Prefill windows (a guess, no routing traces yet): 2..4 fresh experts a token,
+                // ~170 distinct of 256 at T = 64.
+                (40 / (tt + 1)).clamp(2, 6).min(EXPERTS - union.len())
+            }
         };
         let mut row: Vec<u32> = vec![];
         while row.len() < fresh {
@@ -470,9 +476,9 @@ fn scratch(g: &CudaComputeDevice, t: usize) -> Scratch {
         w: z(t * TOPK),
         xq: z(QAct { m: t, k: HIDDEN }.words()),
         yq: z(QAct { m: t, k: GDN_V }.words()),
-        plan: z(MoePlan::WORDS),
-        moe: z(MoePlan::scratch_words()),
-        parts: z(MoePlan::PARTS_ROWS * HIDDEN),
+        plan: z(MoePlan::words(t)),
+        moe: z(MoePlan::scratch_words_for(t)),
+        parts: z(MoePlan::parts_rows(t) * HIDDEN),
         q: z(flash::qsa_q_words(t)),
         scores: z(t * MAX_CTX / 4),
         sel: z(t * QSA_WIDTH),
@@ -1063,7 +1069,7 @@ fn moe(g: &CudaComputeDevice) {
     }
     let shared = g.upload_bytes(&blob);
     println!("moe_grouped_into, 48 layers in one graph (GB/s of expert bytes read)");
-    for t in [1usize, 2, 4, 8] {
+    for t in widths(&[1, 2, 4, 8]) {
         let mut plans = vec![];
         let mut groups = 0;
         for l in 0..48 {
@@ -1075,7 +1081,7 @@ fn moe(g: &CudaComputeDevice) {
                     [p as u32, (p >> 32) as u32]
                 })
                 .collect();
-            let mut plan = g.alloc_f32(MoePlan::WORDS);
+            let mut plan = g.alloc_f32(MoePlan::words(t));
             g.moe_plan_into(
                 &g.upload_u32(&ids),
                 &g.upload_u32(&table),
@@ -1100,8 +1106,8 @@ fn moe(g: &CudaComputeDevice) {
             HIDDEN,
         );
         let (mut sc, mut parts) = (
-            g.alloc_f32(MoePlan::scratch_words()),
-            g.alloc_f32(MoePlan::PARTS_ROWS * HIDDEN),
+            g.alloc_f32(MoePlan::scratch_words_for(tw)),
+            g.alloc_f32(MoePlan::parts_rows(tw) * HIDDEN),
         );
         let graph = g.capture(&mut || {
             for p in &plans {
@@ -1117,9 +1123,10 @@ fn moe(g: &CudaComputeDevice) {
         );
         let bytes = groups * ExpertBlob::BYTES;
         println!(
-            "  T={t}: {:.1} groups/layer, {:6.1} us/layer, {:4.0} GB/s",
+            "  T={t}: {:.1} groups/layer, {:6.1} us/layer ({:.2} us/token), {:4.0} GB/s",
             groups as f64 / 48.0,
             ms as f64 * 1e3 / 48.0,
+            ms as f64 * 1e3 / 48.0 / t as f64,
             bytes as f64 / (ms as f64 * 1e6)
         );
     }
