@@ -93,8 +93,7 @@ fn parse(args: &[String]) -> Result<Args> {
         "invalid sequence/burn length"
     );
     ensure!(
-        a.steps > 0
-            && a.eval_every > 0
+        a.eval_every > 0
             && a.lr > 0.0
             && a.lr.is_finite()
             && a.beta > 0.0

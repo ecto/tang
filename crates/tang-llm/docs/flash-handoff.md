@@ -1,5 +1,9 @@
 # Qwen3.8-Flash-Next on tang: handoff
 
+Takeover update: the merged-head GPU exactness checks have been rerun, and an offline recursive
+MTP trainer is available. See [flash-mtp-results.md](flash-mtp-results.md) for measured results
+and [flash-mtp-train.md](flash-mtp-train.md) for commands and checkpoint format.
+
 Status as of 2026-10-05. Read with [fastest.md](fastest.md) (the plan), [strata.md](strata.md)
 (block math), [flash-next-tensors.md](flash-next-tensors.md) (tensor inventory, parity studies,
 corrections) and [beyond-strata.md](beyond-strata.md) (research ranking).
@@ -41,11 +45,14 @@ N-gram (PLE) rows are read from NVMe with O_DIRECT while layer 0 runs.
 ## Next steps, in order
 
 1. **Distill the MTP drafter on thinking text.** The two thinking-on cells are limited by draft
-   acceptance (chat/on d1/d2/d3 = 77/49/31%), not GPU time. Data:
+   acceptance (chat/on d1/d2/d3 = 77/49/31%), not GPU time.
+   Trainer: `flash-mtp-train` (`--features cuda,mtp-train`), documented above. Data:
    `mew:~/mtp-train/` (README there; final 4-stream residual fp16 + ids per generated position,
-   200 thinking-on prompts, 40 GB cap; `gen.sh` is resumable). Build a trainer on tang-ad/tang-train
-   that fine-tunes the MTP layer recursively three steps deep (FastMTP, arXiv 2509.18362), write
-   the weights back as a GGUF the engine loads, re-measure acceptance and the table.
+   200 thinking-on prompts, 40 GB cap; `gen.sh` is resumable). The first 50-update dense-cell
+   pilot is saved at `~/flash-codex/pilot50/`; routed experts and the main embedding/head stayed
+   frozen. Use held-out engine acceptance and throughput to select weights, then expand training
+   beyond the initial short-window pilot as needed. Neither pilot checkpoint improves the
+   deployed table overall; keep the original drafter (see the measured results above).
 2. **Why served wide prefill is slower than the bench.** Likely the chunk splitting at saved-state
    points and mixed window widths. Fix, then turn `TANG_FLASH_WIDE=64` back on.
 3. **Tensor-core native GEMV for prefill** (`fl_natmma`, `TANG_FLASH_NATW=mma`) is exact but

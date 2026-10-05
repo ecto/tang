@@ -70,6 +70,10 @@ jobs:
           --exclude tang-sheffer-wasm
           --exclude tang-gpu
 
+      - name: Test offline MTP trainer on CPU
+        if: ${{ hashFiles('crates/tang-llm/Cargo.toml') != '' }}
+        run: cargo test -p tang-llm --features mtp-train --lib
+
   metal:
     name: metal (macOS)
     runs-on: macos-latest

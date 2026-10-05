@@ -38,6 +38,9 @@ teacher-token accuracy, **not** measured speculative acceptance. Windows retain 
 positions but omit earlier K/V context. The burn-in prefix reduces, rather than eliminates, that
 approximation. Use the real engine to select a checkpoint.
 
+Training uses f32 activations and dequantized weights. Export requantization and the engine’s
+int8 activation contract can change acceptance; evaluate the exported file.
+
 Dense block tensors, including HC, router and shared expert, train. Routed experts and the main
 embedding/head stay frozen. There is no routed-expert optimizer state. Default loss covers the
 full vocabulary; `--vocab 106000` mirrors the drafter's restricted head but rejects any excluded
@@ -62,3 +65,8 @@ Every subprocess takes the GPU lock. `done` plus `exit-code` records completion 
 all subprocesses succeeded and speculative exactness printed PASS). The unfiltered logs retain
 per-position acceptance, all engine timings, configuration and generated tokens. The script
 inherits optional engine environment settings; keep those identical between checkpoints.
+
+Use `--steps 0` to evaluate an input MTP GGUF without updating or exporting weights. For a
+clean export-quantization comparison, point `--data` at the same frozen prompt snapshot and
+retain the training run’s sequence length, burn-in and vocabulary settings. The new output
+directory contains only its manifest and fixed held-out metrics.
