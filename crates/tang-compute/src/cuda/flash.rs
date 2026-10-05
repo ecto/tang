@@ -230,6 +230,18 @@ impl CudaComputeDevice {
             CudaStorage::Bf16(s) if direct && k.is_multiple_of(8) && m >= 1 => {
                 self.gemv_rows("bf16_gemv", Some(x), None, s, out, (0, n), m, k, n);
             }
+            // Prefill widths: the plain wide instantiation, else 8-column tiles (same bits).
+            CudaStorage::Bf16(s) if m > 8 && width_ok(m) && k.is_multiple_of(8) && !x.is_bf16() && !out.is_bf16() => {
+                if WIDE_T.contains(&m) {
+                    self.gemv_rows("bf16_gemv", Some(x), None, s, out, (0, n), m, k, n);
+                } else {
+                    for t0 in (0..m).step_by(8) {
+                        let mt = (m - t0).min(8);
+                        let xs = self.slice_buffer(x, t0 * k, mt * k);
+                        self.gemv_rows("bf16_gemv", Some(&xs), None, s, out, (t0 * n, n), mt, k, n);
+                    }
+                }
+            }
             _ => {
                 let y = self.linear(x, w, m, k, n);
                 self.write_into(out, 0, &y);
@@ -915,7 +927,7 @@ impl CudaComputeDevice {
         t: usize,
         eps: f32,
     ) {
-        assert!((1..=MAX_T).contains(&t));
+        assert!(width_ok(t));
         let f = self.fl("fl_gdn_conv");
         let (s, tu) = (stride as u32, t as u32);
         unsafe {
@@ -970,7 +982,7 @@ impl CudaComputeDevice {
         mode: GdnMode<'_, CudaBuffer>,
         eps: f32,
     ) {
-        assert!((1..=MAX_T).contains(&t));
+        assert!(width_ok(t));
         let quant = yq.is_some() as u32;
         let (win, commit) = match mode {
             GdnMode::ReadOnly => (h, 0u32),
@@ -1014,7 +1026,7 @@ impl CudaComputeDevice {
         mode: GdnMode<'_, CudaBuffer>,
         eps: f32,
     ) {
-        assert!((1..=MAX_T).contains(&t));
+        assert!(width_ok(t));
         let quant = yq.is_some() as u32;
         let (win, commit) = match mode {
             GdnMode::ReadOnly => (proj, 0u32),
@@ -1263,7 +1275,7 @@ impl CudaComputeDevice {
         t: usize,
         eps: f32,
     ) {
-        assert!((1..=MAX_T).contains(&t) && q.len >= crate::flash::qsa_q_words(t));
+        assert!(width_ok(t) && q.len >= crate::flash::qsa_q_words(t));
         let f = self.fl("fl_qsa_prep");
         let (s, tu) = (stride as u32, t as u32);
         unsafe {
@@ -3096,7 +3108,7 @@ mod tests {
             let ls = EXPERTS + 1;
             let r0 = rng.vec(tw * w, 2.0);
             let (y, injp) = (rng.vec(tw * HIDDEN, 1.0), rng.vec(tw * HC, 3.0));
-            let parts = rng.vec(MoePlan::PARTS_ROWS * HIDDEN, 1.0);
+            let parts = rng.vec(MoePlan::parts_rows(tw) * HIDDEN, 1.0);
             let (rw, logits) = (rng.vec(tw * TOPK, 0.3), rng.vec(tw * ls, 2.0));
             // One read over columns `cols` (parts rows remapped to the window's own rows).
             let read = |cols: &[usize], mode: u32| -> [Vec<f32>; 4] {
@@ -3104,7 +3116,7 @@ mod tests {
                 let pick = |v: &[f32], wd: usize| -> Vec<f32> {
                     cols.iter().flat_map(|&j| col(v, j, wd).to_vec()).collect()
                 };
-                let mut pr = vec![0f32; MoePlan::PARTS_ROWS * HIDDEN];
+                let mut pr = vec![0f32; MoePlan::parts_rows(m) * HIDDEN];
                 for (t, &j) in cols.iter().enumerate() {
                     for kk in 0..TOPK {
                         pr[(t * TOPK + kk) * HIDDEN..][..HIDDEN].copy_from_slice(col(
@@ -3113,9 +3125,9 @@ mod tests {
                             HIDDEN,
                         ));
                     }
-                    pr[(MoePlan::SHARED_ROW + t) * HIDDEN..][..HIDDEN].copy_from_slice(col(
+                    pr[(MoePlan::shared_row(m) + t) * HIDDEN..][..HIDDEN].copy_from_slice(col(
                         &parts,
-                        MoePlan::SHARED_ROW + j,
+                        MoePlan::shared_row(tw) + j,
                         HIDDEN,
                     ));
                 }
@@ -3198,8 +3210,8 @@ mod tests {
                 inv.eq(col(&w8, j, TOPK), &w1, &format!("router w col {j}"));
             }
         }
-        // Grouped experts (parts rows per token) and combine.
-        {
+        // Grouped experts (parts rows per token) and combine (wide: TODO, the plan is MAX_T-sized).
+        if tw <= MAX_T {
             let blobs: Vec<B> = (0..6)
                 .map(|_| {
                     g.upload_bytes(&ExpertBlob::from_gguf(
@@ -3396,7 +3408,7 @@ mod tests {
                 iq: &nb[2],
                 ik: &nb[3],
             };
-            let n_tok = 24;
+            let n_tok = if tw <= MAX_T { 24 } else { 2 * tw };
             let proj = rng.vec(n_tok * QSA_PROJ, 1.0);
             let prep = |m: usize| -> [Vec<f32>; 5] {
                 let (mut kc, mut vc) = (

@@ -833,7 +833,7 @@ __device__ __forceinline__ void hc_wide_body(
                     #pragma unroll
                     for (int k = 0; k < TOPK; k++)
                         y = __fmaf_rn(Wr[t * TOPK + k], PARTS[(u64)(t * TOPK + k) * HIDDEN + d], y);
-                    if (sg >= 0) y = __fmaf_rn(gs, PARTS[(u64)(SHARED_ROW + t) * HIDDEN + d], y);
+                    if (sg >= 0) y = __fmaf_rn(gs, PARTS[(u64)((M > 8 ? M * TOPK : SHARED_ROW) + t) * HIDDEN + d], y);
                 }
                 x = __fmaf_rn(y, g, x);
                 row[d] = x;
@@ -1058,17 +1058,23 @@ extern "C" __global__ void fl_gdn_conv(const float* __restrict__ P, unsigned int
     __shared__ float red[4];
     unsigned int head = blockIdx.x, j = threadIdx.x, ch = head * 128 + j;
     float4 w = ((const float4*)Wc)[ch];
+    // Tokens in chunks of 8 (one chunk up to MAX_T; wider windows are prefill). e[i] is conv
+    // input row t0 + i of [hist | P].
+    for (unsigned int t0 = 0; t0 < T; t0 += 8) {
     float e[11];
-    e[0] = H0[ch]; e[1] = H0[GDN_CONV + ch]; e[2] = H0[2 * GDN_CONV + ch];
     #pragma unroll
-    for (unsigned int t = 0; t < 8; t++) e[3 + t] = t < T ? P[(u64)t * stride + ch] : 0.0f;
+    for (unsigned int i = 0; i < 11; i++) {
+        unsigned int p = t0 + i;
+        e[i] = p < 3 ? H0[p * GDN_CONV + ch] : (p - 3 < T ? P[(u64)(p - 3) * stride + ch] : 0.0f);
+    }
     #pragma unroll
-    for (unsigned int t = 0; t < 8; t++) {
+    for (unsigned int tl = 0; tl < 8; tl++) {
+        unsigned int t = t0 + tl;
         if (t >= T) break;
-        float acc = e[t] * w.x;
-        acc = __fmaf_rn(e[t + 1], w.y, acc);
-        acc = __fmaf_rn(e[t + 2], w.z, acc);
-        acc = __fmaf_rn(e[t + 3], w.w, acc);
+        float acc = e[tl] * w.x;
+        acc = __fmaf_rn(e[tl + 1], w.y, acc);
+        acc = __fmaf_rn(e[tl + 2], w.z, acc);
+        acc = __fmaf_rn(e[tl + 3], w.w, acc);
         float v = silu(acc);
         if (head < 2 * GDN_HK) {
             float ss = warp_sum(v * v);
@@ -1079,6 +1085,7 @@ extern "C" __global__ void fl_gdn_conv(const float* __restrict__ P, unsigned int
             v *= 1.0f / sqrtf(ss + eps);
         }
         H[(u64)t * GDN_CONV + ch] = v;
+    }
     }
 }
 
@@ -1118,21 +1125,26 @@ __device__ __forceinline__ void gdn_step_body(
     __shared__ float red2[4];
     unsigned int hv = blockIdx.x, hk = hv % GDN_HK, tid = threadIdx.x, j = tid & 127, rg = tid >> 7;
     unsigned int n = commit ? min(win[1], T) : T;
+    float st[32];
+    #pragma unroll
+    for (int r = 0; r < 32; r++) st[r] = S[((u64)(rg * 32 + r) * GDN_HV + hv) * 128 + j];
+    // Tokens in chunks of 8 (one chunk up to MAX_T; wider windows are prefill), the state in
+    // registers throughout: each token's arithmetic is the same at any width.
+    for (unsigned int t0 = 0; t0 < n; t0 += 8) {
+    const unsigned int nn = min(n - t0, 8u);
     if (FUSED) {
-        // The conv for this head's q, k and v channels (thread groups 0, 1, 2), fl_gdn_conv's
-        // arithmetic, including its L2-norm reduction order.
         __shared__ float cred[2][4];
         unsigned int ch = rg == 0 ? hk * 128 + j : (rg == 1 ? GDN_HK * 128 + hk * 128 + j : 2 * GDN_HK * 128 + hv * 128 + j);
         float4 w = rg < 3 ? ((const float4*)Wc)[ch] : make_float4(0, 0, 0, 0);
         float e[11];
-        e[0] = rg < 3 ? H0[ch] : 0.0f;
-        e[1] = rg < 3 ? H0[GDN_CONV + ch] : 0.0f;
-        e[2] = rg < 3 ? H0[2 * GDN_CONV + ch] : 0.0f;
         #pragma unroll
-        for (unsigned int t = 0; t < 8; t++) e[3 + t] = (t < n && rg < 3) ? P[(u64)t * stride + ch] : 0.0f;
+        for (unsigned int i = 0; i < 11; i++) {
+            unsigned int p = t0 + i;
+            e[i] = rg >= 3 ? 0.0f : (p < 3 ? H0[p * GDN_CONV + ch] : (p - 3 < n ? P[(u64)(p - 3) * stride + ch] : 0.0f));
+        }
         #pragma unroll
         for (unsigned int t = 0; t < 8; t++) {
-            if (t >= n) break;
+            if (t >= nn) break;
             float acc = e[t] * w.x;
             acc = __fmaf_rn(e[t + 1], w.y, acc);
             acc = __fmaf_rn(e[t + 2], w.z, acc);
@@ -1149,29 +1161,26 @@ __device__ __forceinline__ void gdn_step_body(
             if (rg == 0) sq[t][j] = v;
             else if (rg == 1) sk[t][j] = v;
             else if (rg == 2) sv[t][j] = v;
-            else sz[t][j] = P[(u64)t * stride + GDN_Z + hv * 128 + j];
+            else sz[t][j] = P[(u64)(t0 + t) * stride + GDN_Z + hv * 128 + j];
         }
     } else {
-        for (unsigned int i = tid; i < n * 128; i += 512) {
+        for (unsigned int i = tid; i < nn * 128; i += 512) {
             unsigned int t = i >> 7, jj = i & 127;
-            const float* hh = Hc + (u64)t * GDN_CONV;
+            const float* hh = Hc + (u64)(t0 + t) * GDN_CONV;
             sq[t][jj] = hh[hk * 128 + jj];
             sk[t][jj] = hh[GDN_HK * 128 + hk * 128 + jj];
             sv[t][jj] = hh[2 * GDN_HK * 128 + hv * 128 + jj];
-            sz[t][jj] = P[(u64)t * stride + GDN_Z + hv * 128 + jj];
+            sz[t][jj] = P[(u64)(t0 + t) * stride + GDN_Z + hv * 128 + jj];
         }
     }
-    if (tid < n) {
-        float a = P[(u64)tid * stride + GDN_A + hv] + DT[hv];
+    if (tid < nn) {
+        float a = P[(u64)(t0 + tid) * stride + GDN_A + hv] + DT[hv];
         float sp = a > 20.0f ? a : log1pf(expf(a));
         sg[tid] = expf(sp * SA[hv]);
-        sb[tid] = sigm(P[(u64)tid * stride + GDN_B + hv]);
+        sb[tid] = sigm(P[(u64)(t0 + tid) * stride + GDN_B + hv]);
     }
-    float st[32];
-    #pragma unroll
-    for (int r = 0; r < 32; r++) st[r] = S[((u64)(rg * 32 + r) * GDN_HV + hv) * 128 + j];
     __syncthreads();
-    for (unsigned int t = 0; t < n; t++) {
+    for (unsigned int t = 0; t < nn; t++) {
         float g = sg[t];
         float p = 0.0f;
         #pragma unroll
@@ -1202,10 +1211,11 @@ __device__ __forceinline__ void gdn_step_body(
             float ss = ((red2[0] + red2[1]) + red2[2]) + red2[3];
             float rs = 1.0f / sqrtf(ss / 128.0f + eps);
             float y = o * rs * NW[j] * sigm(sz[t][j]);
-            Y[(u64)t * GDN_V + hv * 128 + j] = y;
-            if (quant) quant_chunk(y, YQ, T, GDN_V, t, hv * 4 + (j >> 5), j & 31);
+            Y[(u64)(t0 + t) * GDN_V + hv * 128 + j] = y;
+            if (quant) quant_chunk(y, YQ, T, GDN_V, t0 + t, hv * 4 + (j >> 5), j & 31);
         }
         __syncthreads();
+    }
     }
     if (commit) {
         #pragma unroll

@@ -418,6 +418,15 @@ impl MoePlan {
     pub const SHARED_ROW: usize = MAX_T * TOPK;
     /// Rows of `parts` ([`HIDDEN`] floats each).
     pub const PARTS_ROWS: usize = Self::CAP;
+    /// First `parts` row of the shared expert at window width `m`: `SHARED_ROW` up to `MAX_T`,
+    /// `m · TOPK` for wider (prefill) windows.
+    pub const fn shared_row(m: usize) -> usize {
+        if m <= MAX_T { Self::SHARED_ROW } else { m * TOPK }
+    }
+    /// `parts` rows at window width `m`.
+    pub const fn parts_rows(m: usize) -> usize {
+        if m <= MAX_T { Self::PARTS_ROWS } else { m * TOPK + m }
+    }
     /// Words of `moe_grouped_into` scratch: every entry's SwiGLU activations as int8
     /// (`QAct { m: CAP, k: FF }`, row = entry).
     pub fn scratch_words() -> usize {
