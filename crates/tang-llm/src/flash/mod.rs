@@ -19,6 +19,8 @@ pub mod pack;
 pub mod reference;
 pub mod requant;
 #[cfg(feature = "cuda")]
+pub mod sampler;
+#[cfg(feature = "cuda")]
 pub mod serve;
 pub mod tokenize;
 

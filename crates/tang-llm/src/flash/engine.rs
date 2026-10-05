@@ -510,6 +510,8 @@ pub struct Engine {
     pub use_mtp: bool,
     /// The last MTP pass's chain: (draft, probability) × 3.
     pub mtp_last: Vec<(u32, f32)>,
+    /// Top-k / top-p / presence-penalty sampling in the head (`enable_sampler`); `None`: argmax.
+    sampler: Option<Box<super::sampler::Sampler>>,
 }
 
 fn upload_entry(dev: &CudaComputeDevice, e: &Entry, b: &[u8]) -> B {
@@ -1048,6 +1050,7 @@ impl Engine {
             side: Stream::new().map_err(|e| anyhow!("{e}"))?,
             use_mtp: false,
             mtp_last: Vec::new(),
+            sampler: None,
         };
         if let Some(m) = mtp_loaded {
             eng.mtp = Some(Box::new(m));
@@ -1541,11 +1544,15 @@ impl Engine {
             64i32,
             dev.buffer_addr(&s.ctl),
         );
-        unsafe {
-            gpu::launch(self.k.argmax, (64, t as u32, 1), (1024, 1, 1), 0, &self.stream, tang_moe::args![lg, n, part, ctl])
-                .expect("launch");
-            gpu::launch(self.k.argmax2, (t as u32, 1, 1), (32, 1, 1), 0, &self.stream, tang_moe::args![part, np, ids])
-                .expect("launch");
+        if let Some(sp) = self.sampler.as_ref() {
+            sp.enqueue(dev, &self.stream, &s.head, &s.ctl, &s.out_ids, t);
+        } else {
+            unsafe {
+                gpu::launch(self.k.argmax, (64, t as u32, 1), (1024, 1, 1), 0, &self.stream, tang_moe::args![lg, n, part, ctl])
+                    .expect("launch");
+                gpu::launch(self.k.argmax2, (t as u32, 1, 1), (32, 1, 1), 0, &self.stream, tang_moe::args![part, np, ids])
+                    .expect("launch");
+            }
         }
         self.stamp(1 + 4 * 48);
     }
@@ -1609,6 +1616,9 @@ impl Engine {
         ctl[2] = self.counter;
         ctl[3] = self.seed;
         ctl[4] = self.temperature.to_bits();
+        if let Some(sp) = self.sampler.as_mut() {
+            sp.stage(&self.dev, &self.tokens, pos0, t)?;
+        }
         let emb_t = self.g.info("token_embd.weight")?.clone();
         let emb = self.io.f32s(Io::EMB, t * HIDDEN);
         for i in 0..t {
@@ -3059,5 +3069,41 @@ impl Engine {
             }
         }
         Ok(())
+    }
+}
+
+impl Engine {
+    /// Forget a captured window graph (recaptured on its next use), e.g. after changing
+    /// `pcie_cap`, which graphs bake in.
+    pub fn drop_window_graph(&mut self, t: usize, verify: bool) {
+        if let Some(g) = self.graphs.get_mut(t + if verify { MAX_T + 1 } else { 0 }) {
+            *g = None;
+        }
+    }
+}
+
+impl Engine {
+    /// Sample in the head with top-k / top-p / a presence penalty (`flash::sampler`) instead of
+    /// the plain Gumbel-max over the whole vocabulary. Window graphs are recaptured.
+    pub fn enable_sampler(&mut self) -> Result<()> {
+        if self.sampler.is_none() {
+            self.sampler = Some(Box::new(super::sampler::Sampler::new(&self.gpu, &self.dev, self.hp.n_vocab)?));
+            for g in self.graphs.iter_mut() {
+                *g = None;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn sampler_mut(&mut self) -> Option<&mut super::sampler::Sampler> {
+        self.sampler.as_deref_mut()
+    }
+
+    /// A new generation's output starts at position `pos` (penalties count output from there).
+    pub fn sampler_begin(&mut self, pos: usize) -> Result<()> {
+        match self.sampler.as_mut() {
+            Some(s) => s.begin(&self.dev, pos),
+            None => Ok(()),
+        }
     }
 }

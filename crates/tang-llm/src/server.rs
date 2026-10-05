@@ -374,6 +374,9 @@ pub fn parse(body: &Value) -> Result<Request, String> {
             .or((body["reasoning_effort"] == "none").then_some(false)),
         thinking_budget: thinking_budget(body),
         temperature_set: f("temperature").is_some(),
+        top_k_set: body["top_k"].as_u64().is_some(),
+        top_p_set: f("top_p").is_some(),
+        presence_penalty: f("presence_penalty").map(|v| v as f32),
         sampling: Sampling {
             temperature: f("temperature").map(|v| v as f32).unwrap_or(d.temperature),
             top_p: f("top_p").map(|v| v as f32).unwrap_or(d.top_p),

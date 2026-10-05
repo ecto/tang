@@ -204,6 +204,8 @@ fn main() -> Result<()> {
         "flash-spec-test" => return tang_llm::flash::cli::spec_test(&args[1..]),
         "flash-tcheck" => return tang_llm::flash::cli::tcheck(&args[1..]),
         "flash-resume-test" => return tang_llm::flash::serve::resume_test(&args[1..]),
+        "flash-sampler-test" => return tang_llm::flash::serve::sampler_test(&args[1..]),
+        "flash-prefill-bench" => return tang_llm::flash::serve::prefill_bench(&args[1..]),
         "flash-gemv-check" => return tang_llm::flash::engine::gemv_check(&dir),
         _ => {}
     }
@@ -341,6 +343,7 @@ fn serve_flash(args: &[String]) -> Result<()> {
     use tang_llm::flash::serve::{default_disk, FlashServe, Settings};
     let gguf = PathBuf::from(&args[0]);
     let mut s = Settings {
+        sampling: tang_llm::flash::serve::SamplingMode::Greedy,
         disk: default_disk(&gguf),
         gguf,
         mtp: None,
@@ -361,6 +364,13 @@ fn serve_flash(args: &[String]) -> Result<()> {
             "--ctx" => s.ctx = val()?.parse()?,
             "--mtp" => s.mtp = Some(PathBuf::from(val()?)),
             "--temp" => s.temp = val()?.parse()?,
+            "--sampling" => {
+                s.sampling = match val()?.as_str() {
+                    "greedy" => tang_llm::flash::serve::SamplingMode::Greedy,
+                    "model-card" => tang_llm::flash::serve::SamplingMode::ModelCard,
+                    m => bail!("--sampling greedy|model-card, not {m}"),
+                }
+            }
             "--snapshots" => s.snapshots = val()?.parse()?,
             "--dump-ids" => s.dump = Some(PathBuf::from(val()?)),
             "--api-key-file" => {

@@ -29,7 +29,18 @@ use std::sync::Arc;
 use std::time::Instant;
 use tang_compute::flash::MAX_T;
 
+/// What sampling a request gets for the parameters it doesn't name.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SamplingMode {
+    /// Temperature 0 (greedy); top-k/top-p/penalty only when asked for.
+    Greedy,
+    /// The model card's: thinking temperature 1.0, top-p 0.95, top-k 20; not thinking 0.7,
+    /// 0.8, 20 and a presence penalty of 1.5.
+    ModelCard,
+}
+
 pub struct Settings {
+    pub sampling: SamplingMode,
     pub gguf: PathBuf,
     pub mtp: Option<PathBuf>,
     pub ctx: usize,
@@ -165,6 +176,7 @@ struct Line {
     calls: usize,
     finish: &'static str,
     spliced: usize,
+    sampling: String,
 }
 
 pub struct FlashServe {
@@ -182,6 +194,7 @@ pub struct FlashServe {
     policy: Policy,
     clock: u64,
     temp: f32,
+    sampling: SamplingMode,
     disk: Option<PathBuf>,
     dump: Option<PathBuf>,
     /// Lengths of a running state's parts, to check states read from disk.
@@ -233,8 +246,9 @@ impl FlashServe {
         let mut e = Engine::load(&s.gguf, opts)?;
         eprintln!("{}", e.load_report);
         e.use_graphs = true;
-        e.warm()?;
         e.use_mtp = e.has_mtp();
+        e.enable_sampler()?;
+        e.warm()?;
         let tok = FlashTokenizer::from_gguf(e.gguf())?;
         let id = |p: &str| tok.token_id(p).with_context(|| format!("no {p} token"));
         let mut eos: Vec<u32> = ["<|im_end|>", "<|endoftext|>"].iter().filter_map(|p| tok.token_id(p)).collect();
@@ -283,6 +297,7 @@ impl FlashServe {
             policy: Policy::new(),
             clock: 0,
             temp: s.temp,
+            sampling: s.sampling,
             disk: s.disk.clone(),
             dump: s.dump.clone(),
             shape,
@@ -646,8 +661,26 @@ impl FlashServe {
         self.line.spliced = spliced;
         ensure!(ids.len() + 1 < self.ctx, "prompt is {} tokens; the context window is {}", ids.len(), self.ctx);
         let limit = req.max_tokens.unwrap_or(usize::MAX).min(self.ctx - ids.len() - 1).max(1);
-        self.e.temperature = if req.temperature_set { req.sampling.temperature.max(0.0) } else { self.temp };
+        let thinking = req.think != Some(false);
+        let card = match (self.sampling, thinking) {
+            (SamplingMode::Greedy, _) => (self.temp, 0usize, 1.0f32, 0.0f32),
+            (SamplingMode::ModelCard, true) => (1.0, 20, 0.95, 0.0),
+            (SamplingMode::ModelCard, false) => (0.7, 20, 0.8, 1.5),
+        };
+        let temp = if req.temperature_set { req.sampling.temperature.max(0.0) } else { card.0 };
+        let top_k = if req.top_k_set { req.sampling.top_k } else { card.1 };
+        let top_p = if req.top_p_set { req.sampling.top_p } else { card.2 };
+        let presence = req.presence_penalty.unwrap_or(card.3);
+        self.e.temperature = temp;
         self.e.seed = req.sampling.seed as u32;
+        if let Some(sp) = self.e.sampler_mut() {
+            // top-k 0 (off) keeps the 64 best: the sampler's bound.
+            sp.top_k = if top_k == 0 { super::sampler::MAX_K } else { top_k };
+            sp.top_p = if top_p > 0.0 && top_p <= 1.0 { top_p } else { 1.0 };
+            sp.presence = presence;
+        }
+        self.e.sampler_begin(ids.len())?;
+        self.line.sampling = format!("T {temp} k {top_k} p {top_p} pres {presence}");
         self.requests += 1;
         let tag = self.requests;
         if let Some(d) = &self.dump {
@@ -841,7 +874,7 @@ impl Backend for FlashServe {
         let l = &self.line;
         match result {
             Ok(_) => eprintln!(
-                "tang-llm: req {}: prompt {} (reused {}, prefilled {} in {:.0} ms = {:.0} tok/s; restore {:.0} ms, state saves {:.0} ms; {} turns spliced) | ttft {:.0} ms | decode {} tokens in {:.2} s = {:.1} tok/s, {} windows, {:.2} tokens/window, drafts {} {}/{} accepted | {} tool calls, {}",
+                "tang-llm: req {}: prompt {} (reused {}, prefilled {} in {:.0} ms = {:.0} tok/s; restore {:.0} ms, state saves {:.0} ms; {} turns spliced) | ttft {:.0} ms | decode {} tokens in {:.2} s = {:.1} tok/s, {} windows, {:.2} tokens/window, drafts {} {}/{} accepted | {} tool calls, {} | {}",
                 self.requests,
                 l.prompt,
                 l.reused,
@@ -861,7 +894,8 @@ impl Backend for FlashServe {
                 l.accepted,
                 l.drafted,
                 l.calls,
-                l.finish
+                l.finish,
+                l.sampling
             ),
             Err(e) => eprintln!("tang-llm: req {}: error: {e:#}", self.requests),
         }
@@ -977,4 +1011,216 @@ pub fn default_disk(gguf: &Path) -> Option<PathBuf> {
             Some(PathBuf::from(std::env::var_os("HOME")?).join(".cache/tang/flash-serve").join(name))
         }
     }
+}
+
+/// Prefill `ids` after the engine's sequence in windows of `chunk`, the MTP run only over the
+/// last `mtp_tail` positions (all of them: `usize::MAX`). Returns the sampled next token, each
+/// window's stats and the MTP time.
+pub fn prefill_windows(e: &mut Engine, ids: &[u32], chunk: usize, mtp_tail: usize) -> Result<(u32, Vec<super::engine::WinStats>, f64)> {
+    ensure!(!ids.is_empty(), "empty prompt");
+    let pos_start = e.tokens.len();
+    e.tokens.extend_from_slice(ids);
+    let end = e.tokens.len();
+    let (mut pos, mut next, mut stats, mut mtp_ms) = (pos_start, 0, Vec::new(), 0.0);
+    while pos < end {
+        let t = chunk.min(end - pos).clamp(1, MAX_T);
+        let out = e.window(pos, t, None)?;
+        stats.push(e.last);
+        if e.use_mtp && e.has_mtp() && end - pos <= mtp_tail.saturating_add(t) {
+            let nexts: Vec<u32> = (0..t).map(|i| e.tokens.get(pos + i + 1).copied().unwrap_or(out[t - 1])).collect();
+            let t0 = Instant::now();
+            e.mtp_last = e.mtp_draft(pos, &nexts)?;
+            mtp_ms += t0.elapsed().as_secs_f64() * 1e3;
+        }
+        next = out[t - 1];
+        pos += t;
+    }
+    Ok((next, stats, mtp_ms))
+}
+
+/// `tang-llm flash-prefill-bench <gguf> --ids-file F [--n 2048,10240] [--mtp M] [--caps 0,16,88]
+/// [--tails 0,512]`: prefill tok/s and the per-window split for the served prefill and its
+/// variants (MTP over the last N positions only, GPU-streamed misses via `pcie_cap`), each
+/// checked bitwise against the served path's last logits, with draft acceptance over 128
+/// decoded tokens after it.
+pub fn prefill_bench(args: &[String]) -> Result<()> {
+    let mut it = args.iter();
+    let path = PathBuf::from(it.next().context("first argument: the first GGUF shard")?);
+    let (mut ids, mut ns, mut mtp) = (Vec::<u32>::new(), vec![2048usize, 10240], None);
+    let (mut caps, mut tails) = (vec![16usize, 88], vec![0usize, 512]);
+    let list = |s: &str| -> Result<Vec<usize>> { s.split(',').map(|x| Ok(x.parse::<usize>()?)).collect() };
+    while let Some(a) = it.next() {
+        let mut val = || it.next().with_context(|| format!("{a} needs a value"));
+        match a.as_str() {
+            "--ids-file" => {
+                for f in val()?.split(',') {
+                    ids.extend(std::fs::read_to_string(f)?.split(|c: char| c.is_whitespace() || c == ',').filter(|w| !w.is_empty()).map(|w| w.parse::<u32>()).collect::<Result<Vec<_>, _>>()?);
+                }
+            }
+            "--n" => ns = list(val()?)?,
+            "--caps" => caps = list(val()?)?,
+            "--tails" => tails = list(val()?)?,
+            "--mtp" => mtp = Some(PathBuf::from(val()?)),
+            s => bail!("unknown argument {s}"),
+        }
+    }
+    ensure!(!ids.is_empty(), "--ids-file");
+    let max_n = *ns.iter().max().unwrap();
+    let base = ids.clone();
+    while ids.len() < max_n {
+        ids.extend_from_slice(&base);
+    }
+    let opts = Opts { max_ctx: (max_n + 1024).next_multiple_of(1024), mtp, split: true, ..Opts::default() };
+    let mut e = Engine::load(&path, opts)?;
+    eprintln!("{}", e.load_report);
+    e.use_graphs = true;
+    e.warm()?;
+    let has_mtp = e.has_mtp();
+    let v = e.hp.n_vocab;
+    let default_cap = e.pcie_cap;
+    for &n in &ns {
+        let p = &ids[..n];
+        let mut configs: Vec<(String, usize, usize)> = vec![("served (mtp all, cap default)".into(), usize::MAX, default_cap)];
+        for &t in &tails {
+            configs.push((format!("mtp last {t}"), t, default_cap));
+        }
+        for &c in &caps {
+            configs.push((format!("mtp last 512, pcie_cap {c}"), 512, c));
+        }
+        configs.push(("served again".into(), usize::MAX, default_cap));
+        let mut want: Option<(u32, Vec<f32>)> = None;
+        println!("prefill {n} tokens:");
+        for (name, tail, cap) in configs {
+            e.reset();
+            e.use_mtp = has_mtp;
+            if e.pcie_cap != cap {
+                e.pcie_cap = cap;
+                for t in 1..=MAX_T {
+                    e.drop_window_graph(t, false);
+                    e.drop_window_graph(t, true);
+                }
+            }
+            let t0 = Instant::now();
+            let (next, st, mtp_ms) = prefill_windows(&mut e, p, MAX_T, tail)?;
+            let secs = t0.elapsed().as_secs_f64();
+            let last_t = st.last().map_or(1, |s| s.t);
+            let lg = e.logits(last_t)[(last_t - 1) * v..].to_vec();
+            let same = match &want {
+                None => {
+                    want = Some((next, lg));
+                    "reference".to_string()
+                }
+                Some((wn, wl)) => {
+                    let d = wl.iter().zip(&lg).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+                    format!("{} (next {} vs {}, {d} logits differ)", if d == 0 && *wn == next { "SAME" } else { "DIFFERS" }, next, wn)
+                }
+            };
+            // Decode 128 tokens with greedy MTP chains, for the drafts' acceptance.
+            let (mut cur, mut toks, mut wins) = (next, 0usize, 0usize);
+            let t1 = Instant::now();
+            while toks < 128 && has_mtp {
+                let d: Vec<u32> = e.mtp_last.iter().take(MAX_T - 1).map(|x| x.0).collect();
+                let kept = e.verify(cur, &d)?;
+                toks += kept.len();
+                wins += 1;
+                cur = *kept.last().unwrap();
+            }
+            let dsecs = t1.elapsed().as_secs_f64();
+            let w = st.len().max(1) as f64;
+            let m = |f: fn(&super::engine::WinStats) -> f64| st.iter().map(f).sum::<f64>() / w;
+            let c = |f: fn(&super::engine::WinStats) -> usize| st.iter().map(f).sum::<usize>() as f64 / w;
+            println!(
+                "  {name:<34} {:7.0} tok/s ({:.2} s) | window {:.2} ms: GPU {:.2}, wait plan {:.2}, wait CPU rows {:.2}, host CPU experts {:.2}, plan {:.2}, MTP {:.2} | experts/window {:.0} distinct, {:.1} CPU, {:.1} PCIe, swaps {:.1} | {} | decode 128: {:.2} tok/window, {:.0} tok/s",
+                n as f64 / secs,
+                secs,
+                m(|s| s.wall_ms),
+                m(|s| s.gpu_ms),
+                m(|s| s.gpu_wait_a_ms),
+                m(|s| s.gpu_wait_b_ms),
+                m(|s| s.cpu_ms),
+                m(|s| s.plan_ms),
+                mtp_ms / w,
+                c(|s| s.distinct),
+                c(|s| s.missed),
+                c(|s| s.pcie),
+                c(|s| s.swaps),
+                same,
+                toks as f64 / wins.max(1) as f64,
+                toks as f64 / dsecs.max(1e-9),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Decode `n` tokens after `ids` from a fresh sequence, with MTP chains as drafts or none.
+fn decode_n(e: &mut Engine, ids: &[u32], n: usize, drafts: bool) -> Result<Vec<u32>> {
+    e.reset();
+    e.sampler_begin(ids.len())?;
+    let mut cur = e.prefill(ids, MAX_T, None)?;
+    let mut out = vec![cur];
+    while out.len() < n {
+        let d: Vec<u32> = if drafts { e.mtp_last.iter().take((MAX_T - 1).min(n - out.len())).map(|x| x.0).collect() } else { Vec::new() };
+        let kept = e.verify(cur, &d)?;
+        out.extend_from_slice(&kept);
+        cur = *kept.last().unwrap();
+    }
+    out.truncate(n);
+    Ok(out)
+}
+
+/// `tang-llm flash-sampler-test <gguf> --ids-file F --mtp M [-n N]`: the head sampler against
+/// the plain argmax (greedy, top-k 1: identical), and with and without drafts at the model
+/// card's settings (identical: drafts never change a sample).
+pub fn sampler_test(args: &[String]) -> Result<()> {
+    let mut it = args.iter();
+    let path = PathBuf::from(it.next().context("first argument: the first GGUF shard")?);
+    let (mut ids, mut mtp, mut n) = (Vec::<u32>::new(), None, 96usize);
+    while let Some(a) = it.next() {
+        let mut val = || it.next().with_context(|| format!("{a} needs a value"));
+        match a.as_str() {
+            "--ids-file" => ids = std::fs::read_to_string(val()?)?.split_whitespace().map(|w| w.parse::<u32>()).collect::<Result<_, _>>()?,
+            "--mtp" => mtp = Some(PathBuf::from(val()?)),
+            "-n" => n = val()?.parse()?,
+            s => bail!("unknown argument {s}"),
+        }
+    }
+    let opts = Opts { max_ctx: (ids.len() + n + 64).next_multiple_of(1024), mtp, ..Opts::default() };
+    let mut e = Engine::load(&path, opts)?;
+    e.use_graphs = true;
+    e.use_mtp = e.has_mtp();
+    e.warm()?;
+    let base = decode_n(&mut e, &ids, n, true)?;
+    e.enable_sampler()?;
+    e.warm()?;
+    let mut ok = true;
+    let mut check = |name: &str, a: &[u32], b: &[u32]| {
+        let same = a == b;
+        ok &= same;
+        println!("  {name}: {}{}", if same { "SAME" } else { "DIFFERS" }, a.iter().zip(b).position(|(x, y)| x != y).map_or(String::new(), |i| format!(" at {i}")));
+    };
+    let set = |e: &mut Engine, temp: f32, k: usize, p: f32, pres: f32| {
+        e.temperature = temp;
+        e.seed = 1234;
+        let s = e.sampler_mut().unwrap();
+        s.top_k = k;
+        s.top_p = p;
+        s.presence = pres;
+    };
+    println!("sampler test, {} prompt ids, {n} tokens:", ids.len());
+    set(&mut e, 0.0, 1, 1.0, 0.0);
+    let g = decode_n(&mut e, &ids, n, true)?;
+    check("greedy, sampler top-k 1 vs argmax", &g, &base);
+    for (name, t, k, p, pres) in [("thinking card (T 1.0, k 20, p 0.95)", 1.0, 20, 0.95, 0.0), ("answer card (T 0.7, k 20, p 0.8, presence 1.5)", 0.7, 20, 0.8, 1.5), ("greedy + presence 1.5", 0.0, 20, 1.0, 1.5)] {
+        set(&mut e, t, k, p, pres);
+        let a = decode_n(&mut e, &ids, n, false)?;
+        let b = decode_n(&mut e, &ids, n, true)?;
+        check(&format!("{name}: drafts vs none"), &b, &a);
+        let c = decode_n(&mut e, &ids, n, true)?;
+        check(&format!("{name}: repeat"), &c, &a);
+        let differs = a.iter().zip(&base).filter(|(x, y)| x != y).count();
+        println!("    differs from greedy in {differs} of {n}; first {:?}", &a[..12.min(a.len())]);
+    }
+    println!("sampler test: {}", if ok { "PASS" } else { "FAIL" });
+    Ok(())
 }

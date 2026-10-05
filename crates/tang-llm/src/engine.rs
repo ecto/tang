@@ -30,6 +30,10 @@ pub struct Request {
     pub sampling: Sampling,
     /// The request named a temperature (`sampling.temperature` is otherwise the default).
     pub temperature_set: bool,
+    /// Which of `sampling.top_k` / `top_p` the request named, and its presence penalty.
+    pub top_k_set: bool,
+    pub top_p_set: bool,
+    pub presence_penalty: Option<f32>,
     pub max_tokens: Option<usize>,
     pub stop: Vec<String>,
     /// The conversation this continues (`prompt_cache_key`), so it runs in that
