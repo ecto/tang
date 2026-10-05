@@ -63,6 +63,7 @@ impl<D: ComputeDevice> Model<D> {
     /// Load a checkpoint directory. Matrices are kept in `dtype` on device; norms stay f32.
     pub fn load(dev: D, dir: &Path, max_ctx: usize, dtype: Dtype) -> Result<Self> {
         let cfg = Config::from_json(&std::fs::read(dir.join("config.json"))?)?;
+        cfg.query_rescale()?;
         let w = Weights::open(dir)?;
         let gemma = cfg.is_gemma();
         // Multimodal checkpoints keep the language model under `language_model.`.
@@ -497,6 +498,7 @@ impl<D: ComputeDevice> Model<D> {
         );
         let (qd, kvd, ff) = (c.q_dim(), c.kv_dim(), c.intermediate_size);
         let eps = c.rms_norm_eps;
+        let query_scale = c.query_rescale()?;
         let shared = cache.pool().clone();
         let mut pool = blocks::lock(&shared);
         let ids = blocks::prepare(dev, &mut pool, cache, pos, pos + s);
@@ -511,7 +513,7 @@ impl<D: ComputeDevice> Model<D> {
             let a = dev.rms_norm(x, &w.attn_norm, s, h, eps);
             let qkv = dev.linear(&a, &w.wqkv, s, h, qd + 2 * kvd);
             let (cos, sin) = &self.ropes[w.rope];
-            let q = dev.attention_prep_paged(
+            let mut q = dev.attention_prep_paged(
                 &qkv,
                 w.q_norm.as_ref(),
                 w.k_norm.as_ref(),
@@ -525,6 +527,9 @@ impl<D: ComputeDevice> Model<D> {
                 pos,
                 eps,
             );
+            if query_scale != 1.0 {
+                dev.scale_buffer(&mut q, query_scale);
+            }
             let att =
                 dev.kv_attention_paged(&q, kp, vp, &pages, pos, s, (nh, nkv, hd), w.window, causal);
             let mut o = dev.linear(&att, &w.wo, s, qd, h);
@@ -631,6 +636,50 @@ mod conditioning_tests {
             pool: new_pool(2, 4, false, usize::MAX),
             dev,
         }
+    }
+
+    #[test]
+    fn explicit_attention_scalar_matches_rescaled_query_projection() {
+        let make = |scalar, projection_scale: f32| {
+            let mut model = tiny_model();
+            model.cfg.query_pre_attn_scalar = scalar;
+            for layer in &mut model.layers {
+                let mut qkv = vec![0.; 48];
+                let mut identity = vec![0.; 16];
+                for i in 0..4 {
+                    qkv[i * 4 + i] = projection_scale;
+                    qkv[16 + i * 4 + i] = 1.;
+                    qkv[32 + i * 4 + i] = 1.;
+                    identity[i * 4 + i] = 1.;
+                }
+                layer.wqkv = model.dev.upload(&qkv);
+                layer.wo = model.dev.upload(&identity);
+            }
+            model.lm_head = Some(model.dev.upload(&[1., 0., 0., 0., 0., 1., 0., 0.]));
+            let mut cache = model.new_cache();
+            model.forward(&[0, 1, 0], &mut cache, true).unwrap()
+        };
+        let actual = make(Some(8.), 1.);
+        let reference = make(None, (4f32 / 8.).sqrt());
+        let baseline = make(None, 1.);
+        assert!(actual
+            .iter()
+            .zip(&reference)
+            .all(|(a, b)| (a - b).abs() < 1e-5));
+        assert!(actual
+            .iter()
+            .zip(&baseline)
+            .any(|(a, b)| (a - b).abs() > 1e-3));
+        let mut cfg = tiny_model().cfg;
+        for invalid in [0., -1., f32::NAN, f32::INFINITY] {
+            cfg.query_pre_attn_scalar = Some(invalid);
+            assert!(cfg.query_rescale().is_err());
+        }
+        cfg.head_dim = Some(128);
+        cfg.query_pre_attn_scalar = Some(168.);
+        assert!(
+            (cfg.query_rescale().unwrap() / 128f32.sqrt() - 168f32.sqrt().recip()).abs() < 1e-7
+        );
     }
 
     #[test]

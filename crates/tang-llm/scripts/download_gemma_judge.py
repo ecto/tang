@@ -14,10 +14,10 @@ from urllib3.util.retry import Retry
 
 parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('output',type=Path)
-parser.add_argument('--model',choices=('4b','12b'),default='4b')
+parser.add_argument('--model',choices=('4b','12b','27b'),default='4b')
 args=parser.parse_args()
 repo=f'mlx-community/gemma-3-{args.model}-it-4bit'
-revision={'4b':'93724907d4ed1745d2fe50baadf3b0b01a65abf2','12b':'86cc6a8dedbc456dd0e4af01a9d09f396f77e558'}[args.model]
+revision={'4b':'93724907d4ed1745d2fe50baadf3b0b01a65abf2','12b':'86cc6a8dedbc456dd0e4af01a9d09f396f77e558','27b':'83acee3d10064661a7a39ead3732dddb16fe15bb'}[args.model]
 root=args.output;root.mkdir(parents=True,exist_ok=True)
 record=root/'download.json'
 manifest=json.loads(record.read_text()) if record.exists() else {'repo':repo,'revision':revision,'files':{}}

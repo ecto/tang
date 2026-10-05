@@ -150,6 +150,29 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Compensate for kernels whose attention scale is fixed to head_dim^-0.5.
+    pub fn query_rescale(&self) -> anyhow::Result<f32> {
+        let Some(scalar) = self.query_pre_attn_scalar else {
+            return Ok(1.0);
+        };
+        anyhow::ensure!(
+            scalar.is_finite() && scalar > 0.,
+            "invalid query_pre_attn_scalar"
+        );
+        anyhow::ensure!(
+            self.num_attention_heads > 0,
+            "attention heads must be positive"
+        );
+        let dim = self.head_dim();
+        anyhow::ensure!(dim > 0, "head dimension must be positive");
+        let factor = (dim as f32 / scalar).sqrt();
+        anyhow::ensure!(
+            factor.is_finite() && factor > 0.,
+            "invalid attention rescale"
+        );
+        Ok(factor)
+    }
+
     pub fn is_gemma(&self) -> bool {
         self.model_type.starts_with("gemma")
     }
