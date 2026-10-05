@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 use tang_compute::flash::MAX_T;
 
@@ -48,8 +49,8 @@ struct Snap {
     tokens: Vec<u32>,
     state: RunningState,
     /// Positions `0..tokens.len()` of the positional state (another sequence may have
-    /// overwritten them on the device since).
-    pos: Positional,
+    /// overwritten them on the device since), in segments shared with the states it extends.
+    pos: Vec<Arc<Positional>>,
     pinned: bool,
     used: u64,
 }
@@ -400,15 +401,32 @@ impl FlashServe {
         let t = Instant::now();
         let state = self.e.save_running()?;
         let n = self.e.tokens.len();
-        let pos = self.e.save_positional(0, n)?;
-        self.line.snap_ms += t.elapsed().as_secs_f64() * 1e3;
-        let tokens = self.e.tokens.clone();
-        if pinned {
-            self.save_disk(&tokens, &state, &pos);
+        // Only the positions past the longest saved state this one extends are copied.
+        let base = (0..self.snaps.len())
+            .filter(|&i| self.e.tokens.starts_with(&self.snaps[i].tokens))
+            .max_by_key(|&i| self.snaps[i].tokens.len());
+        let (mut pos, from) = match base {
+            Some(i) => (self.snaps[i].pos.clone(), self.snaps[i].tokens.len()),
+            None => (Vec::new(), 0),
+        };
+        if from < n {
+            pos.push(Arc::new(self.e.save_positional(from, n)?));
         }
+        let tokens = self.e.tokens.clone();
+        if pinned && self.disk_path(&tokens).is_some_and(|p| !p.exists()) {
+            let full = self.e.save_positional(0, n)?;
+            self.save_disk(&tokens, &state, &full);
+        }
+        self.line.snap_ms += t.elapsed().as_secs_f64() * 1e3;
         self.snaps.push(Snap { tokens, state, pos, pinned, used: clock });
-        let size = |s: &Snap| s.state.bytes() + s.pos.bytes();
-        while self.snaps.len() > 1 && self.snaps.iter().map(size).sum::<usize>() > self.max_snap_bytes {
+        let size = |snaps: &[Snap]| {
+            let mut seen = std::collections::HashSet::new();
+            snaps
+                .iter()
+                .map(|s| s.state.bytes() + s.pos.iter().filter(|p| seen.insert(Arc::as_ptr(p))).map(|p| p.bytes()).sum::<usize>())
+                .sum::<usize>()
+        };
+        while self.snaps.len() > 1 && size(&self.snaps) > self.max_snap_bytes {
             let lru = (0..self.snaps.len()).min_by_key(|&i| (self.snaps[i].pinned, self.snaps[i].used)).unwrap();
             self.snaps.swap_remove(lru);
         }
@@ -454,6 +472,7 @@ impl FlashServe {
             bytes.extend_from_slice(&(p.len() as u64).to_le_bytes());
             bytes.extend_from_slice(p);
         }
+        let budget = std::env::var("TANG_FLASH_DISK_GB").ok().and_then(|v| v.parse::<f64>().ok()).map_or(8e9, |g| g * 1e9) as u64;
         std::thread::spawn(move || {
             let tmp = path.with_extension("tmp");
             let r = std::fs::File::create(&tmp)
@@ -461,6 +480,27 @@ impl FlashServe {
                 .and_then(|_| std::fs::rename(&tmp, &path));
             if let Err(e) = r {
                 eprintln!("tang-llm: saving {}: {e}", path.display());
+            }
+            // Keep the directory under its budget, oldest first.
+            let Some(dir) = path.parent() else { return };
+            let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| e.path().extension().is_some_and(|x| x == "state"))
+                .filter_map(|e| {
+                    let m = e.metadata().ok()?;
+                    Some((m.modified().ok()?, m.len(), e.path()))
+                })
+                .collect();
+            files.sort();
+            let mut total: u64 = files.iter().map(|f| f.1).sum();
+            for (_, len, p) in files {
+                if total <= budget {
+                    break;
+                }
+                let _ = std::fs::remove_file(&p);
+                total -= len;
             }
         });
     }
@@ -510,7 +550,7 @@ impl FlashServe {
             Ok(Snap {
                 tokens,
                 state: RunningState::from_parts(n, self.gdn_layers, parts)?,
-                pos: Positional::from_parts(0, n, pos),
+                pos: vec![Arc::new(Positional::from_parts(0, n, pos))],
                 pinned: true,
                 used: 0,
             })
@@ -542,7 +582,9 @@ impl FlashServe {
             self.clock += 1;
             self.snaps[i].used = self.clock;
             let valid = lcp(&self.e.tokens, &self.snaps[i].tokens);
-            self.e.restore_positional(&self.snaps[i].pos, valid)?;
+            for p in &self.snaps[i].pos {
+                self.e.restore_positional(p, valid)?;
+            }
             let (tokens, state) = (&self.snaps[i].tokens, &self.snaps[i].state);
             self.e.restore_running(state, tokens)?;
             start = snap_len;
@@ -550,7 +592,9 @@ impl FlashServe {
             match self.load_disk(ids, limit).filter(|s| s.tokens.len() > 0) {
                 Some(s) => {
                     let valid = lcp(&self.e.tokens, &s.tokens);
-                    self.e.restore_positional(&s.pos, valid)?;
+                    for p in &s.pos {
+                        self.e.restore_positional(p, valid)?;
+                    }
                     self.e.restore_running(&s.state, &s.tokens)?;
                     start = s.tokens.len();
                     eprintln!("tang-llm: read the running state at {start} from disk");
