@@ -47,16 +47,21 @@ fn wide_plain() -> bool {
 /// `TANG_FLASH_WIDE_V1=1`: wide native GEMV on the re-decoding tile loop (`fl_natw`, A/B).
 fn wide_v1() -> bool {
     static U: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *U.get_or_init(|| std::env::var("TANG_FLASH_WIDE_V1").is_ok_and(|v| v == "1"))
+    *U.get_or_init(|| std::env::var("TANG_FLASH_NATW").is_ok_and(|v| v == "v1"))
 }
 
-/// `TANG_FLASH_NATW=16x4`: the wide native GEMV's token tile and rows a warp (A/B).
+/// `TANG_FLASH_NATW=16x4`: the wide native GEMV's token tile and rows a warp (A/B; instantiated
+/// 8x2 8x4 8x8 16x2 16x4 12x4 32x1 32x2).
 fn natw_variant() -> Option<(usize, usize)> {
     static U: std::sync::OnceLock<Option<(usize, usize)>> = std::sync::OnceLock::new();
-    *U.get_or_init(|| {
-        let v = std::env::var("TANG_FLASH_NATW").ok()?;
-        let (a, b) = v.split_once('x')?;
-        Some((a.parse().ok()?, b.parse().ok()?))
+    // Default 16x4 (measured best at T=32: Q3K/Q4K 2560->10240 96/105 us vs 8x4 146/112);
+    // TANG_FLASH_NATW=v2 for fl_natw2 (decoded-weight reuse, slower), =v1 for fl_natw.
+    *U.get_or_init(|| match std::env::var("TANG_FLASH_NATW") {
+        Err(_) => Some((16, 4)),
+        Ok(v) => {
+            let (a, b) = v.split_once('x')?;
+            Some((a.parse().ok()?, b.parse().ok()?))
+        }
     })
 }
 
