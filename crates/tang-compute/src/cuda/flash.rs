@@ -44,6 +44,22 @@ fn wide_plain() -> bool {
     *U.get_or_init(|| std::env::var("TANG_FLASH_WIDE_PLAIN").is_ok_and(|v| v == "1"))
 }
 
+/// `TANG_FLASH_WIDE_V1=1`: wide native GEMV on the re-decoding tile loop (`fl_natw`, A/B).
+fn wide_v1() -> bool {
+    static U: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *U.get_or_init(|| std::env::var("TANG_FLASH_WIDE_V1").is_ok_and(|v| v == "1"))
+}
+
+/// `TANG_FLASH_NATW=16x4`: the wide native GEMV's token tile and rows a warp (A/B).
+fn natw_variant() -> Option<(usize, usize)> {
+    static U: std::sync::OnceLock<Option<(usize, usize)>> = std::sync::OnceLock::new();
+    *U.get_or_init(|| {
+        let v = std::env::var("TANG_FLASH_NATW").ok()?;
+        let (a, b) = v.split_once('x')?;
+        Some((a.parse().ok()?, b.parse().ok()?))
+    })
+}
+
 /// Prefill-only window widths beyond `MAX_T` (instantiated for some kernels only).
 pub const WIDE_T: [usize; 3] = [16, 32, 64]; // hc_fused: 16, 32 only (t64 exceeds 48 KB static smem)
 
@@ -375,8 +391,12 @@ impl CudaComputeDevice {
             NAT_NAMES[m - 1]
         } else if wide_plain() {
             wide_name("fl_nat_t", m)
-        } else {
+        } else if let Some((tt, g)) = natw_variant() {
+            Box::leak(format!("fl_natw_{tt}x{g}").into_boxed_str())
+        } else if wide_v1() {
             "fl_natw"
+        } else {
+            "fl_natw2"
         }, "sm_86");
         self.llm_funcs.borrow_mut().insert(key, f.clone());
         f
@@ -502,7 +522,12 @@ impl CudaComputeDevice {
         // chosen from (n, k) alone, so a row's summation order (and its bits) doesn't depend on
         // the window width m.
         let tiled = m > MAX_T && !wide_plain();
-        let gr = ty.rows_per_warp(if tiled { MAX_T } else { m });
+        let v2 = tiled && !wide_v1() && natw_variant().is_none();
+        let gr = match natw_variant() {
+            Some((_, g)) if tiled => g,
+            _ if v2 => 1,
+            _ => ty.rows_per_warp(if tiled { MAX_T } else { m }),
+        };
         let mut ks = 1;
         while ks < 8
             && n.div_ceil(2 * 8 / ks) < 2 * super::llm::sm_count()
@@ -521,6 +546,31 @@ impl CudaComputeDevice {
         );
         let mu = m as u32;
         let mut y = out.f32_data_mut().slice_mut(off..);
+        if v2 {
+            // Up to 32 columns a launch (the kernel's shared accumulators).
+            for t0 in (0..m).step_by(32) {
+                let (t0u, mt) = (t0 as u32, (m - t0).min(32) as u32);
+                unsafe {
+                    self.stream
+                        .launch_builder(&f)
+                        .arg(xq.f32_data())
+                        .arg(w.f32_data())
+                        .arg(&mut y)
+                        .arg(&ku)
+                        .arg(&nu)
+                        .arg(&ksu)
+                        .arg(&ho)
+                        .arg(&so)
+                        .arg(&os)
+                        .arg(&mu)
+                        .arg(&t0u)
+                        .arg(&mt)
+                        .launch(grid((n.div_ceil(8 / ks), 1, 1), 256))
+                        .unwrap();
+                }
+            }
+            return;
+        }
         unsafe {
             let mut lb = self.stream.launch_builder(&f);
             lb.arg(xq.f32_data())
@@ -776,7 +826,8 @@ impl CudaComputeDevice {
             "fl_hc_fused_q8_t7",
             "fl_hc_fused_q8_t8",
         ];
-        let f = self.fl(match (w.q8, t <= MAX_T) { (true, true) => Q8[t - 1], (false, true) => NAMES[t - 1], (true, false) => wide_name("fl_hc_fused_q8_t", t), (false, false) => wide_name("fl_hc_fused_t", t) });
+        let wide = t > MAX_T && !wide_plain();
+        let f = if wide { self.fl(if w.q8 { "fl_hc_fusedw_q8" } else { "fl_hc_fusedw" }) } else { self.fl(match (w.q8, t <= MAX_T) { (true, true) => Q8[t - 1], (false, true) => NAMES[t - 1], (true, false) => wide_name("fl_hc_fused_q8_t", t), (false, false) => wide_name("fl_hc_fused_t", t) }) };
         let blocks = self.coresident(&f, 512, 2);
         let (mut xn, mut lo) = scratch.f32_data_mut().split_at_mut(t * HC * HIDDEN);
         let any = w.norm;
@@ -843,10 +894,12 @@ impl CudaComputeDevice {
                 Some(i) => l.arg(i.f32_data_mut()),
                 None => l.arg(&NULL),
             };
-            l.arg(&mut xn)
-                .arg(&mut lo)
-                .arg(&mut bar)
-                .launch(grid((blocks, 1, 1), 512))
+            let tu = t as u32;
+            l.arg(&mut xn).arg(&mut lo).arg(&mut bar);
+            if wide {
+                l.arg(&tu);
+            }
+            l.launch(grid((blocks, 1, 1), 512))
                 .unwrap();
         }
     }
@@ -2877,7 +2930,7 @@ mod tests {
         }
     }
 
-    fn t_invariance(g: &CudaComputeDevice) {
+    fn t_invariance_w(g: &CudaComputeDevice, tw: usize) {
         let mut inv = Inv(vec![]);
         let mut rng = Rng(0x7177);
         let quant = |x: &[f32], m: usize, k: usize| {
@@ -2887,12 +2940,12 @@ mod tests {
         };
         // quantize_act
         for k in [HIDDEN, GDN_V, FF] {
-            let x = rng.vec(TW * k, 2.0);
-            let q8 = g.download(&quant(&x, TW, k));
-            for j in 0..TW {
+            let x = rng.vec(tw * k, 2.0);
+            let q8 = g.download(&quant(&x, tw, k));
+            for j in 0..tw {
                 let q1 = g.download(&quant(col(&x, j, k), 1, k));
                 inv.eq(
-                    &qact_col(&q8, TW, k, j),
+                    &qact_col(&q8, tw, k, j),
                     &q1,
                     &format!("quantize k={k} col {j}"),
                 );
@@ -2991,15 +3044,15 @@ mod tests {
         }
         for (name, k, n, w, run) in &gemvs {
             let (k, n) = (*k, *n);
-            let x = rng.vec(TW * k, 1.5);
+            let x = rng.vec(tw * k, 1.5);
             let f32_in = name.starts_with("bf16");
             let in8 = if f32_in {
                 g.upload_f32(&x)
             } else {
-                quant(&x, TW, k)
+                quant(&x, tw, k)
             };
-            let y8 = g.download(&run(g, &in8, w, TW));
-            for j in 0..TW {
+            let y8 = g.download(&run(g, &in8, w, tw));
+            for j in 0..tw {
                 let in1 = if f32_in {
                     g.upload_f32(col(&x, j, k))
                 } else {
@@ -3041,10 +3094,10 @@ mod tests {
                 q8,
             };
             let ls = EXPERTS + 1;
-            let r0 = rng.vec(TW * w, 2.0);
-            let (y, injp) = (rng.vec(TW * HIDDEN, 1.0), rng.vec(TW * HC, 3.0));
+            let r0 = rng.vec(tw * w, 2.0);
+            let (y, injp) = (rng.vec(tw * HIDDEN, 1.0), rng.vec(tw * HC, 3.0));
             let parts = rng.vec(MoePlan::PARTS_ROWS * HIDDEN, 1.0);
-            let (rw, logits) = (rng.vec(TW * TOPK, 0.3), rng.vec(TW * ls, 2.0));
+            let (rw, logits) = (rng.vec(tw * TOPK, 0.3), rng.vec(tw * ls, 2.0));
             // One read over columns `cols` (parts rows remapped to the window's own rows).
             let read = |cols: &[usize], mode: u32| -> [Vec<f32>; 4] {
                 let m = cols.len();
@@ -3112,17 +3165,17 @@ mod tests {
                     g.download(&xq),
                 ]
             };
-            let all: Vec<usize> = (0..TW).collect();
+            let all: Vec<usize> = (0..tw).collect();
             for mode in 0..3 {
                 let o8 = read(&all, mode);
-                for j in 0..TW {
+                for j in 0..tw {
                     let o1 = read(&[j], mode);
                     let what = format!("hc_read q8={q8} pending={mode} col {j}");
                     inv.eq(col(&o8[0], j, HIDDEN), &o1[0], &format!("{what} x"));
                     inv.eq(col(&o8[1], j, HC), &o1[1], &format!("{what} inj"));
                     inv.eq(col(&o8[2], j, w), &o1[2], &format!("{what} r"));
                     inv.eq(
-                        &qact_col(&o8[3], TW, HIDDEN, j),
+                        &qact_col(&o8[3], tw, HIDDEN, j),
                         &o1[3],
                         &format!("{what} xq"),
                     );
@@ -3132,14 +3185,14 @@ mod tests {
         // Router top-k.
         {
             let stride = EXPERTS + 1;
-            let l = rng.vec(TW * stride, 4.0);
+            let l = rng.vec(tw * stride, 4.0);
             let topk = |v: &[f32], m: usize| {
                 let (mut i, mut w) = (g.alloc_f32(m * TOPK), g.alloc_f32(m * TOPK));
                 g.router_topk_into(&g.upload_f32(v), stride, EXPERTS, &mut i, &mut w, m);
                 (g.download(&i), g.download(&w))
             };
-            let (i8, w8) = topk(&l, TW);
-            for j in 0..TW {
+            let (i8, w8) = topk(&l, tw);
+            for j in 0..tw {
                 let (i1, w1) = topk(col(&l, j, stride), 1);
                 inv.eq(col(&i8, j, TOPK), &i1, &format!("router ids col {j}"));
                 inv.eq(col(&w8, j, TOPK), &w1, &format!("router w col {j}"));
@@ -3170,7 +3223,7 @@ mod tests {
             let gtab = g.upload_u32(&table);
             // Overlapping experts across tokens, so the T=8 groups hold several entries.
             let mut ids = vec![];
-            for tt in 0..TW {
+            for tt in 0..tw {
                 let mut row: Vec<u32> = vec![];
                 while row.len() < TOPK {
                     let e = (rng.u() % 16) as u32 * 3 + (tt as u32 % 2);
@@ -3180,9 +3233,9 @@ mod tests {
                 }
                 ids.extend(row);
             }
-            let x = rng.vec(TW * HIDDEN, 1.0);
-            let w = rng.vec(TW * TOPK, 0.3);
-            let logits = rng.vec(TW * (EXPERTS + 1), 2.0);
+            let x = rng.vec(tw * HIDDEN, 1.0);
+            let w = rng.vec(tw * TOPK, 0.3);
+            let logits = rng.vec(tw * (EXPERTS + 1), 2.0);
             let run = |cols: &[usize]| -> (Vec<f32>, Vec<f32>) {
                 let m = cols.len();
                 let pid: Vec<u32> = cols
@@ -3228,8 +3281,8 @@ mod tests {
                 );
                 (g.download(&parts), g.download(&y))
             };
-            let (p8, y8) = run(&(0..TW).collect::<Vec<_>>());
-            for j in 0..TW {
+            let (p8, y8) = run(&(0..tw).collect::<Vec<_>>());
+            for j in 0..tw {
                 let (p1, y1) = run(&[j]);
                 for kk in 0..TOPK {
                     inv.eq(
@@ -3248,7 +3301,7 @@ mod tests {
         }
         // GDN: one T=8 commit window vs eight T=1 commit windows (both launch shapes).
         {
-            let cs = gdn_case(&mut rng, TW);
+            let cs = gdn_case(&mut rng, tw);
             let (dt, a, norm, conv) = (
                 g.upload_f32(&cs.dt),
                 g.upload_f32(&cs.a),
@@ -3311,8 +3364,8 @@ mod tests {
                     }
                     (ys, yqs, g.download(&state), g.download(&hist))
                 };
-                let a8 = run(TW, 1);
-                let a1 = run(1, TW);
+                let a8 = run(tw, 1);
+                let a1 = run(1, tw);
                 let what = format!("gdn fused={fused}");
                 inv.eq(&a8.0, &a1.0, &format!("{what} y"));
                 inv.eq(&a8.1, &a1.1, &format!("{what} yq"));
@@ -3388,7 +3441,7 @@ mod tests {
                     g.download(&pooled)[..n_tok / 4 * IDX_D].to_vec(),
                 ]
             };
-            let (p8, p1) = (prep(TW), prep(1));
+            let (p8, p1) = (prep(tw), prep(1));
             for (i, nm) in ["q", "k cache", "v cache", "ring", "pooled"]
                 .iter()
                 .enumerate()
@@ -3408,12 +3461,12 @@ mod tests {
                 g.upload_bf16(&to_bits(&rng.vec(max_ctx * QSA_KV * QSA_D, 1.0))),
                 g.upload_f32(&pooled),
             );
-            let q8 = rng.vec(fl::qsa_q_words(TW), 1.0);
-            let pr8 = rng.vec(TW * QSA_PROJ, 2.0);
+            let q8 = rng.vec(fl::qsa_q_words(tw), 1.0);
+            let pr8 = rng.vec(tw * QSA_PROJ, 2.0);
             let (a, b) = (QSA_HEADS * QSA_D, IDX_HEADS * IDX_D);
             let qcol = |j: usize| -> Vec<f32> {
                 let mut v = q8[j * a..(j + 1) * a].to_vec();
-                v.extend_from_slice(&q8[TW * a + j * b..TW * a + (j + 1) * b]);
+                v.extend_from_slice(&q8[tw * a + j * b..tw * a + (j + 1) * b]);
                 v
             };
             for pos0 in [100usize, 3000] {
@@ -3451,8 +3504,8 @@ mod tests {
                         g.download(&oq),
                     )
                 };
-                let o8 = sel_att(&q8, &pr8, TW, pos0);
-                for j in 0..TW {
+                let o8 = sel_att(&q8, &pr8, tw, pos0);
+                for j in 0..tw {
                     let o1 = sel_att(&qcol(j), col(&pr8, j, QSA_PROJ), 1, pos0 + j);
                     let nbk = (pos0 + j + 1) / 4;
                     let what = format!("qsa pos0={pos0} col {j}");
@@ -3464,7 +3517,7 @@ mod tests {
                     inv.eq(col(&o8.1, j, QSA_WIDTH), &o1.1, &format!("{what} ids"));
                     inv.eq(col(&o8.2, j, QSA_OUT), &o1.2, &format!("{what} out"));
                     inv.eq(
-                        &qact_col(&o8.3, TW, QSA_OUT, j),
+                        &qact_col(&o8.3, tw, QSA_OUT, j),
                         &o1.3,
                         &format!("{what} outq"),
                     );
@@ -3538,7 +3591,16 @@ mod tests {
 
     #[test]
     fn cuda_window_width_invariance() {
-        on_gpu(t_invariance);
+        on_gpu(|g| t_invariance_w(g, TW));
+    }
+
+    /// Prefill widths: `TANG_TEST_WIDE=32,64` (default 16,32,64).
+    #[test]
+    fn cuda_window_width_invariance_wide() {
+        on_gpu(|g| {
+            let ws: Vec<usize> = std::env::var("TANG_TEST_WIDE").ok().map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or(vec![16, 32, 64]);
+            ws.iter().for_each(|&w| t_invariance_w(g, w))
+        });
     }
 
     #[test]

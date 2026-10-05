@@ -225,6 +225,108 @@ extern "C" __global__ void __launch_bounds__(256) fl_natw(
         nat_body<NAT_TY, 8, nat_gr(NAT_TY, 8)>(blockIdx.x, XQ, W, Y, K, N, KS, hoff, soff, OS, M, t0);
     }
 }
+// Variants of fl_natw: token tile TT, GR rows a warp (A/B: TANG_FLASH_NATW=TTxGR).
+#define NATWV(TT, GR) \
+extern "C" __global__ void __launch_bounds__(256) fl_natw_##TT##x##GR( \
+    const unsigned int* __restrict__ XQ, const unsigned char* __restrict__ W, float* __restrict__ Y, \
+    unsigned int K, unsigned int N, unsigned int KS, u64 hoff, u64 soff, unsigned int OS, unsigned int M) { \
+    for (unsigned int t0 = 0; t0 < M; t0 += TT) { \
+        if (t0) __syncthreads(); \
+        nat_body<NAT_TY, TT, GR>(blockIdx.x, XQ, W, Y, K, N, KS, hoff, soff, OS, M, t0); \
+    } \
+}
+NATWV(8, 2) NATWV(8, 4) NATWV(8, 8) NATWV(16, 2) NATWV(16, 4) NATWV(12, 4) NATWV(32, 1) NATWV(32, 2)
+// Wide windows, decoded-weight reuse: one row a warp; a lane decodes NB of its chunks into
+// registers once, then runs them over every column of the launch (up to 32, accumulators in
+// shared memory, TT columns at a time in registers). Each column's chain is still its chunks in
+// order, then warp_sum, then the KS sum: bits equal the T=1..8 kernels'.
+#define NW_NB 4
+#define NW_TT 16
+#define NW_MAX 32
+extern "C" __global__ void __launch_bounds__(256) fl_natw2(
+    const unsigned int* __restrict__ XQ, const unsigned char* __restrict__ W, float* __restrict__ Y,
+    unsigned int K, unsigned int N, unsigned int KS, u64 hoff, u64 soff, unsigned int OS, unsigned int M,
+    unsigned int t0, unsigned int MT) {
+    constexpr int TY = NAT_TY;
+    __shared__ float accs[NW_MAX][256];
+    __shared__ float red[8][NW_MAX];
+    unsigned int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    unsigned int kw = warp % KS, rg = warp / KS, groups = 8 / KS;
+    unsigned int o = blockIdx.x * groups + rg;
+    unsigned int nch = K / 32, c0 = kw * nch / KS, c1 = (kw + 1) * nch / KS;
+    const unsigned int kb = K / 4;
+    const unsigned int* xs = XQ + (u64)M * kb;
+    const unsigned int* xh = xs + (u64)M * nch;
+    const unsigned char* S = W + soff;
+    const unsigned char* D = S + (u64)N * nch * SPC;
+    const u64 sbytes = TY == 23 ? K / 256 * 12 : K / 256 * 20;
+    for (unsigned int t = 0; t < MT; t++) accs[t][threadIdx.x] = 0.0f;
+    unsigned int orow = min(o, N - 1);
+    if (o < N) {
+        for (unsigned int cb = c0 + lane; cb < c1; cb += 32 * NW_NB) {
+            int op[NW_NB][8];
+            float sc0[NW_NB], sc1[NW_NB], mn[NW_NB];
+            #pragma unroll
+            for (int b = 0; b < NW_NB; b++) {
+                unsigned int c = min(cb + b * 32, c1 - 1);
+                u64 ch = (u64)orow * nch + c;
+                operands<TY>(W + ch * LB, W + hoff + ch * (HB ? HB : 1), op[b]);
+                chunk_scales<TY>(S, D, sbytes, orow, c, ch, sc0[b], sc1[b], mn[b]);
+            }
+            for (unsigned int tt = 0; tt < MT; tt += NW_TT) {
+                float acc[NW_TT];
+                #pragma unroll
+                for (int t = 0; t < NW_TT; t++) acc[t] = tt + t < MT ? accs[tt + t][threadIdx.x] : 0.0f;
+                #pragma unroll
+                for (int b = 0; b < NW_NB; b++) {
+                    unsigned int c = cb + b * 32;
+                    if (c >= c1) break;
+                    #pragma unroll
+                    for (int t = 0; t < NW_TT; t++) {
+                        const unsigned int tc = t0 + min(tt + t, MT - 1);
+                        const uint4* xw = (const uint4*)(XQ + (u64)tc * kb + c * 8);
+                        uint4 xa = xw[0], xb = xw[1];
+                        float dx = __uint_as_float(xs[(u64)tc * nch + c]);
+                        float hx = HAS_MIN ? (float)(int)xh[(u64)tc * nch + c] : 0.0f;
+                        int s0 = __dp4a(op[b][0], (int)xa.x, 0);
+                        s0 = __dp4a(op[b][1], (int)xa.y, s0);
+                        s0 = __dp4a(op[b][2], (int)xa.z, s0);
+                        s0 = __dp4a(op[b][3], (int)xa.w, s0);
+                        int s1 = __dp4a(op[b][4], (int)xb.x, 0);
+                        s1 = __dp4a(op[b][5], (int)xb.y, s1);
+                        s1 = __dp4a(op[b][6], (int)xb.z, s1);
+                        s1 = __dp4a(op[b][7], (int)xb.w, s1);
+                        float v;
+                        if (PER16) v = __fmaf_rn(sc1[b], (float)s1, sc0[b] * (float)s0);
+                        else if (HAS_MIN) v = __fmaf_rn(sc0[b], (float)(s0 + s1), -(mn[b] * hx));
+                        else v = sc0[b] * (float)(s0 + s1);
+                        acc[t] = __fmaf_rn(dx, v, acc[t]);
+                    }
+                }
+                #pragma unroll
+                for (int t = 0; t < NW_TT; t++)
+                    if (tt + t < MT) accs[tt + t][threadIdx.x] = acc[t];
+            }
+        }
+    }
+    for (unsigned int t = 0; t < MT; t++) {
+        float v = warp_sum(accs[t][threadIdx.x]);
+        if (KS == 1) {
+            if (lane == 0 && o < N) Y[(u64)(t0 + t) * OS + o] = v;
+        } else if (lane == 0) {
+            red[warp][t] = v;
+        }
+    }
+    if (KS == 1) return;
+    __syncthreads();
+    for (unsigned int i = threadIdx.x; i < groups * MT; i += 256) {
+        unsigned int g = i / MT, t = i % MT;
+        unsigned int oo = blockIdx.x * groups + g;
+        float v = 0.0f;
+        for (unsigned int k = 0; k < KS; k++) v += red[g * KS + k][t];
+        if (oo < N) Y[(u64)(t0 + t) * OS + oo] = v;
+    }
+}
 // Prefill-only widths (flash-serve).
 NAT(16) NAT(32) NAT(64)
 #else
