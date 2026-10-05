@@ -109,6 +109,16 @@ nine late failures under that bound, final-output max error 5.45e-5 (relative L2
 the deterministic random-head128 cases still pass all boundaries below 8.3e-6. The old
 strict checks remain visible; they have not been silently relaxed.
 
+Reproduce an independent kernel-variation audit with the local trained checkpoint and
+an already exported case (release test-owned inference models first to fit fp32 RAM):
+
+```sh
+python crates/tang-llm/scripts/z_image_attention_audit.py \
+  --checkpoint /tmp/z-image-production/transformer \
+  --reference-case /tmp/z-image-trained-reference/case-8.json \
+  --output /tmp/attention-kernel-metrics.json
+```
+
 `scripts/download_gemma_judge.py <new-directory>` explicitly downloads a pinned public
 Gemma 3 4B MLX checkpoint, verifies hashes and preserves the same disk reserve. Language
 weights are Q4 and vision weights BF16. No judge weights download during inference.
