@@ -130,6 +130,8 @@ enum Dw {
     /// The kernel track's native GEMV (`native_linear_out_into`, NatX repack) per segment of a
     /// stacked projection (rows, output column), and the stack's width.
     Kn(Vec<(KSeg, usize, usize)>, usize),
+    /// `TANG_FLASH_KSTACK=1`: all of a Kn weight's segments in one launch (`native_stack_into`).
+    St(tang_compute::flash_native::NatStack<B>),
     Q4x(B),
     Bf16(B),
     Native {
@@ -173,6 +175,10 @@ impl Dw {
                     }
                 }
             }
+            Dw::St(st) => {
+                assert_eq!((st.n, st.k), (n, k), "stacked GEMV shape");
+                dev.native_stack_into(st, x, xq, out, t);
+            }
             Dw::Native { rows, .. } => {
                 assert_eq!(*rows, n, "native GEMV rows");
                 self.native_ptr(dev, nk, dev.buffer_addr(x), dev.buffer_addr(out), t, k, n);
@@ -205,7 +211,7 @@ impl Dw {
     }
 
     fn native(&self) -> bool {
-        matches!(self, Dw::Native { .. } | Dw::Kn(..))
+        matches!(self, Dw::Native { .. } | Dw::Kn(..) | Dw::St(..))
     }
 }
 
@@ -214,7 +220,7 @@ struct Hc {
     down: B,
     up: B,
     inject: Option<B>,
-    /// `TANG_FLASH_HC_Q8=1`: the matrices are `fl::hc_q8` buffers.
+    /// The matrices are `fl::hc_q8` buffers (default; `TANG_FLASH_HC_Q8=0` keeps bf16).
     q8: bool,
 }
 
@@ -347,6 +353,8 @@ struct Kern {
     m_amax1: Fun,
     m_amax2: Fun,
     m_next: Fun,
+    m_short1: Fun,
+    m_short2: Fun,
     publish: Fun,
     wait: Fun,
     copy_rows: Fun,
@@ -606,7 +614,21 @@ impl Engine {
                         };
                         segs.push((seg, rows, out));
                     }
-                    Dw::Kn(segs, e.n)
+                    let stackable = segs.iter().all(|(s, _, _)| matches!(s, KSeg::Nat(..) | KSeg::Bf(_)));
+                    if stackable && !std::env::var("TANG_FLASH_KSTACK").is_ok_and(|v| v == "0") {
+                        use tang_compute::flash_native::NatSeg;
+                        let st: Vec<NatSeg<B>> = segs
+                            .into_iter()
+                            .map(|(s, rows, off)| match s {
+                                KSeg::Nat(w, ty) => NatSeg { ty: Some(ty), w, rows, off },
+                                KSeg::Bf(w) => NatSeg { ty: None, w, rows, off },
+                                KSeg::Own(_) => unreachable!(),
+                            })
+                            .collect();
+                        Dw::St(dev.native_stack(st, e.n, e.k))
+                    } else {
+                        Dw::Kn(segs, e.n)
+                    }
                 }
                 Fmt::Native => {
                     let base = dev.buffer_addr(&w);
@@ -650,9 +672,10 @@ impl Engine {
                 row16: row16(&[[30, e.n as u64, rb, 0, 0]]),
             })
         };
-        // TANG_FLASH_HC_Q8=1: hyper-connection weights at 8 bits (fl::hc_q8), quantized here from
-        // the packed bf16 (the packed up is hc_up_repack'ed: back to GGUF order first).
-        let hc_q8 = std::env::var("TANG_FLASH_HC_Q8").is_ok_and(|v| v == "1");
+        // Hyper-connection weights at 8 bits (fl::hc_q8: Q8_0-style, f16 scale per 32 along each GGUF
+        // row), quantized here from the packed bf16 (the packed up is hc_up_repack'ed: back to GGUF
+        // order first). Default; TANG_FLASH_HC_Q8=0 keeps bf16.
+        let hc_q8 = !std::env::var("TANG_FLASH_HC_Q8").is_ok_and(|v| v == "0");
         let hc = |key: &str, inject: bool| -> Result<Hc> {
             if hc_q8 {
                 let bits = |name: &str| -> Result<Vec<u16>> {
@@ -862,6 +885,8 @@ impl Engine {
             m_amax1: f(&gm, "fe_amaxp1")?,
             m_amax2: f(&gm, "fe_amaxp2")?,
             m_next: f(&gm, "fe_mtp_next")?,
+            m_short1: f(&gm, "fe_short1")?,
+            m_short2: f(&gm, "fe_short2")?,
             embed: f(&m, "fe_embed")?,
             ple: f(&m, "fe_ple")?,
             silu_q: f(&m, "fe_silu_q")?,
@@ -2455,6 +2480,10 @@ struct Mtp {
     /// (`TANG_FLASH_MTP_VOCAB`, e.g. 32768; default 0 = the whole head: on code, 32768 costs d1 97% -> 91%). A drafter's vocabulary
     /// changes acceptance only.
     dhead: Option<(Dw, usize, usize)>,
+    /// `TANG_FLASH_MTP_HEAD2=1`: a Q2_0 copy of the draft head that shortlists 256 rows, rescored
+    /// exactly from the draft head's own (Q5_K) rows: (Q2 head, exact rows buffer, row bytes).
+    head2: Option<(Dw, B, usize)>,
+    short: B,
     kc: B,
     vc: B,
     /// Split-K attention partials: [8 cells][2 groups][nchunk][12 heads][258].
@@ -2628,6 +2657,44 @@ impl Mtp {
                     None
                 }
             },
+            head2: if std::env::var("TANG_FLASH_MTP_HEAD2").is_ok_and(|v| v == "1") {
+                let n_lo = vocab_lo.context("TANG_FLASH_MTP_HEAD2 needs a pruned draft vocabulary")?;
+                let ht = main.info("output.weight")?;
+                ensure!(ht.ty == GgmlType::Q5K, "head2 assumes a Q5_K head");
+                let rb = ht.row_bytes()?;
+                let hi_base = 248_044.min(vocab);
+                let all = main.bytes(ht);
+                let mut b = all[..n_lo * rb].to_vec();
+                b.extend_from_slice(&all[hi_base * rb..vocab * rb]);
+                let rows = n_lo + vocab - hi_base;
+                let mut f = vec![0f32; rows * HIDDEN];
+                use rayon::prelude::*;
+                f.par_chunks_mut(HIDDEN * 1024).enumerate().try_for_each(|(i, o)| -> Result<()> {
+                    let r0 = i * 1024;
+                    let n = o.len() / HIDDEN;
+                    crate::gguf::dequantize(ht.ty, &b[r0 * rb..(r0 + n) * rb], o)
+                })?;
+                let rows = rows;
+                let q2 = m::f32_to_q2_0(&f);
+                let q2rb = HIDDEN / 64 * 18;
+                let w = m::upload_padded(dev, &q2);
+                let p = dev.buffer_addr(&w);
+                let exact = m::upload_padded(dev, &b);
+                Some((
+                    Dw::Native {
+                        segs: dev.upload_u32(&[p as u32, (p >> 32) as u32, 42, rows as u32, q2rb as u32, 0]),
+                        _w: w,
+                        nseg: 1,
+                        rows,
+                        row16: row16(&[[42, rows as u64, q2rb as u64, 0, 0]]),
+                    },
+                    exact,
+                    rb,
+                ))
+            } else {
+                None
+            },
+            short: z(64 * 10),
             embed_rb: emb_t.row_bytes()?,
             kc: z(max_ctx * QSA_KV * QSA_D),
             vc: z(max_ctx * QSA_KV * QSA_D),
@@ -2751,6 +2818,15 @@ impl Engine {
         );
         // Only the last cell's draft is used: the head for that row alone.
         let xl = a(&s.x) + ((c - 1) * HIDDEN * 4) as u64;
+        if let (Some((h2, exact, rb)), Some((_, n_lo, hi))) = (&mt.head2, &mt.dhead) {
+            let rows = n_lo + self.hp.n_vocab - hi;
+            h2.native_ptr(dev, &nk, xl, a(&mt.logits), 1, HIDDEN, rows);
+            let (lg, n, part) = (a(&mt.logits), rows as i32, a(&mt.short));
+            launch(self.k.m_short1, (64, 1, 1), 1024, tang_moe::args![lg, n, part]);
+            let (np, hd, rbi, ids, pr, nl, hb) = (64i32, a(exact), *rb as i32, a(&mt.drafts[step]), a(&mt.probs[step]), *n_lo as i32, *hi as i32);
+            launch(self.k.m_short2, (1, 1, 1), 256, tang_moe::args![part, np, hd, rbi, xl, ids, pr, nl, hb]);
+            return;
+        }
         let (v, n_lo, hi_base) = match &mt.dhead {
             Some((h, n_lo, hi)) => {
                 let rows = n_lo + self.hp.n_vocab - hi;

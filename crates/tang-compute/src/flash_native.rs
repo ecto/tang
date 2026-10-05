@@ -553,6 +553,24 @@ pub fn nat_unpack(ty: NatType, wb: &[u8], n: usize, k: usize) -> NatIr {
     ir
 }
 
+/// One segment of a stacked projection: rows `off .. off + rows` of the output, a NatX weight of
+/// type `ty` (int8 activations) or, with `ty = None`, a bf16 weight (f32 activations).
+pub struct NatSeg<B> {
+    pub ty: Option<NatType>,
+    pub w: B,
+    pub rows: usize,
+    pub off: usize,
+}
+
+/// A stacked projection `[n, k]` (one launch on CUDA: `native_stack_into`). `table` is the
+/// backend's segment table (CUDA: 8 words a segment), `None` where unused.
+pub struct NatStack<B> {
+    pub segs: Vec<NatSeg<B>>,
+    pub table: Option<B>,
+    pub n: usize,
+    pub k: usize,
+}
+
 /// Test helpers (random GGUF blocks of each type), public for the GPU parity tests and the
 /// benchmark.
 pub mod tests {

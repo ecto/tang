@@ -1320,6 +1320,43 @@ pub trait ComputeDevice: Send {
         *out = self.upload_f32(&o);
     }
 
+    /// Build a stacked projection from its segments (weights already uploaded with
+    /// [`upload_native`](Self::upload_native) / `upload_bf16`).
+    fn native_stack(
+        &self,
+        segs: Vec<crate::flash_native::NatSeg<Self::Buffer>>,
+        n: usize,
+        k: usize,
+    ) -> crate::flash_native::NatStack<Self::Buffer> {
+        crate::flash_native::NatStack {
+            segs,
+            table: None,
+            n,
+            k,
+        }
+    }
+
+    /// `out[t · n + o]` for every segment of `s` (`x` f32 for bf16 segments, `xq` int8 for the
+    /// rest): bitwise the per-segment [`native_linear_out_into`](Self::native_linear_out_into) /
+    /// [`bf16_linear_out_into`](Self::bf16_linear_out_into) calls.
+    fn native_stack_into(
+        &self,
+        s: &crate::flash_native::NatStack<Self::Buffer>,
+        x: &Self::Buffer,
+        xq: &Self::Buffer,
+        out: &mut Self::Buffer,
+        m: usize,
+    ) {
+        for g in &s.segs {
+            match g.ty {
+                Some(ty) => {
+                    self.native_linear_out_into(ty, xq, &g.w, out, g.off, s.n, m, s.k, g.rows)
+                }
+                None => self.bf16_linear_out_into(x, &g.w, out, g.off, s.n, m, s.k, g.rows),
+            }
+        }
+    }
+
     /// Hyper-connection read for a window of `t` tokens: `r` is `[t][HC][HIDDEN]`; writes
     /// `x [t][HIDDEN]`, `xq` (when given) the same as int8 activations
     /// (`QAct { m: t, k: HIDDEN }`), and, when `w.inject` is set, `inj [t][HC]`. A `pending`

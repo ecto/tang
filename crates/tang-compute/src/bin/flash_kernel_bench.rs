@@ -959,6 +959,66 @@ fn native(g: &CudaComputeDevice) {
     }
 }
 
+/// Stacked projections: one `native_stack_into` launch against the per-segment launches, for
+/// the real layer shapes (GDN w_in, shared-expert gate|up), 48 copies over > L2.
+fn stack(g: &CudaComputeDevice) {
+    use tang_compute::flash_native::{tests::random_gguf, NatSeg, NatType};
+    let mut rng = Rng(0x5ac);
+    let cases: Vec<(&str, usize, Vec<(Option<NatType>, usize)>)> = vec![
+        (
+            "GDN w_in IQ4_XS 10240 | Q4_K 6144 | bf16 48 | bf16 48",
+            2560,
+            vec![(Some(NatType::Iq4Xs), 10240), (Some(NatType::Q4K), 6144), (None, 48), (None, 48)],
+        ),
+        ("shared gate IQ4_XS 640 | up Q3_K 640", 2560, vec![(Some(NatType::Iq4Xs), 640), (Some(NatType::Q3K), 640)]),
+    ];
+    println!("stacked native GEMV: one launch vs one per segment, us per projection (48 in a graph)");
+    for (name, k, parts) in cases {
+        let n: usize = parts.iter().map(|p| p.1).sum();
+        let stacks: Vec<_> = (0..48)
+            .map(|_| {
+                let (mut segs, mut off) = (vec![], 0);
+                for &(ty, rows) in &parts {
+                    let w = match ty {
+                        Some(ty) => g.upload_native(ty, &random_gguf(ty, rows, k, rng.u()), rows, k),
+                        None => g.upload_bf16(&(0..rows * k).map(|_| bf16(rng.f(0.05))).collect::<Vec<_>>()),
+                    };
+                    segs.push(NatSeg { ty, w, rows, off });
+                    off += rows;
+                }
+                g.native_stack(segs, n, k)
+            })
+            .collect();
+        let mut line = format!("  {name}:");
+        for t in [1usize, 4] {
+            let x = g.upload_f32(&rng.vec(t * k, 1.0));
+            let mut xq = g.alloc_f32(QAct { m: t, k }.words());
+            g.quantize_act_into(&x, &mut xq, t, k);
+            let mut y = g.alloc_f32(t * n);
+            for stacked in [false, true] {
+                let graph = g.capture(&mut || {
+                    for st in &stacks {
+                        if stacked {
+                            g.native_stack_into(st, &x, &xq, &mut y, t);
+                        } else {
+                            for sg in &st.segs {
+                                match sg.ty {
+                                    Some(ty) => g.native_linear_out_into(ty, &xq, &sg.w, &mut y, sg.off, n, t, k, sg.rows),
+                                    None => g.bf16_linear_out_into(&x, &sg.w, &mut y, sg.off, n, t, k, sg.rows),
+                                }
+                            }
+                        }
+                    }
+                });
+                graph.launch().unwrap();
+                let ms = (0..5).map(|_| g.event_ms(&mut || graph.launch().unwrap())).fold(f32::INFINITY, f32::min);
+                line += &format!(" T={t} {}: {:.1}", if stacked { "stacked" } else { "separate" }, ms as f64 * 1e3 / 48.0);
+            }
+        }
+        println!("{line}");
+    }
+}
+
 /// Routed experts alone: `moe_grouped_into` for 48 layers of synthetic routing (all experts
 /// resident, plus the shared expert), in one graph, for T = 1, 2, 4, 8.
 fn moe(g: &CudaComputeDevice) {
@@ -1130,6 +1190,7 @@ fn main() {
         Some("gemv") => gemv(&g),
         Some("moe") => moe(&g),
         Some("hc") => hc(&g),
+        Some("stack") => stack(&g),
         Some("native") => native(&g),
         Some("window") => {
             let ts: Vec<usize> = args[1..].iter().map(|a| a.parse().expect("T")).collect();
