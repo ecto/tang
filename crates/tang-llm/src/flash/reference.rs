@@ -606,6 +606,46 @@ pub struct FlashRef {
     /// The fast kernels' activation contract ([`Act::Int8`]) on every matmul whose weight isn't
     /// kept as bf16/f32.
     pub act_int8: bool,
+    /// Hyper-connection weight study: the format the HC matrices named in `hc_parts` (`down`,
+    /// `up`, `inject` of the layers, `out` for `output_hc_*`) are round-tripped through, and
+    /// whether their GEMVs then take int8 activations (the bf16 contract is f32).
+    pub hc_fmt: Format,
+    pub hc_parts: Vec<String>,
+    /// Per-part formats (`--hc-as down=q5,up=fp8,...`), checked before `hc_fmt`.
+    pub hc_mix: Vec<(String, Format)>,
+    pub hc_act_int8: bool,
+    /// Write the one-layer-ahead expert prediction study here (see [`lookahead`]).
+    pub lookahead: Option<PathBuf>,
+}
+
+/// Predicted experts kept per method in the lookahead study.
+pub const LA_PRED: usize = 32;
+
+/// Layer `l − 1`'s state for predicting layer `l`'s experts.
+struct LaPrev {
+    x: Vec<f32>,
+    r_mid: Vec<f32>,
+    r_post: Vec<f32>,
+    mean_delta: Vec<f32>,
+}
+
+/// Which HC matrix `name` is, for the HC precision study.
+fn hc_part(name: &str) -> Option<&'static str> {
+    if name.starts_with("output_hc_") {
+        return (name.ends_with("down.weight") || name.ends_with("up.weight")).then_some("out");
+    }
+    if !name.starts_with("blk.") || !name.contains(".hc_") {
+        return None;
+    }
+    if name.ends_with("_down.weight") {
+        Some("down")
+    } else if name.ends_with("_up.weight") {
+        Some("up")
+    } else if name.ends_with("_inject.weight") {
+        Some("inject")
+    } else {
+        None
+    }
 }
 
 /// One position's top-k next-token log-probabilities.
@@ -624,8 +664,16 @@ impl FlashRef {
             verbose: false,
             emulate_llama: false,
             qsa_dense: false,
-            dense: DensePolicy::F32,
+            dense: DensePolicy::f32(),
             act_int8: false,
+            hc_fmt: Format::Keep,
+            hc_mix: Vec::new(),
+            hc_parts: ["down", "up", "inject", "out"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            hc_act_int8: false,
+            lookahead: None,
         })
     }
 
@@ -639,6 +687,24 @@ impl FlashRef {
 
     pub(crate) fn load(&self, name: &str) -> Result<Mat> {
         let t = self.g.info(name)?;
+        if let Some(part) = hc_part(name) {
+            let act = if self.hc_act_int8 {
+                Act::Int8
+            } else {
+                Act::F32
+            };
+            if let Some((_, f)) = self.hc_mix.iter().find(|(p, _)| p == part) {
+                return Mat::from_info(&self.g, t, *f, act);
+            }
+            if self.hc_fmt != Format::Keep && self.hc_parts.iter().any(|p| p == part) {
+                let act = if self.hc_act_int8 {
+                    Act::Int8
+                } else {
+                    Act::F32
+                };
+                return Mat::from_info(&self.g, t, self.hc_fmt, act);
+            }
+        }
         let fmt = if t.dims.len() == 2 {
             self.dense.format(name, t.ty)
         } else {
@@ -712,6 +778,9 @@ impl FlashRef {
             }
         }
 
+        // one-layer-ahead expert prediction study: the previous layer's inputs, and the records
+        let mut la_prev: Option<LaPrev> = None;
+        let mut la_out: Vec<u16> = Vec::new();
         for l in 0..hp.n_layer {
             let lt = Instant::now();
             if hp.ple.as_ref().is_some_and(|p| p.layer == l) {
@@ -736,9 +805,25 @@ impl FlashRef {
                     &r[last * hc * n..(last + 1) * hc * n],
                 )?;
             }
+            let r_mid = self.lookahead.is_some().then(|| r.clone());
             let (x, inj) = self.hc_read(&r, t_len, &self.t(l, "hc_ffn_"), true)?;
             let y = self.moe(l, &x, t_len, dump.as_deref_mut())?;
             hc_write(&mut r, &y, &inj, t_len, hc, n);
+            if let Some(r_mid) = r_mid {
+                la_out.extend(self.lookahead_layer(l, la_prev.as_ref(), &x, t_len)?);
+                let mut mean_delta = vec![0f32; hc * n];
+                for t in 0..t_len {
+                    for (i, m) in mean_delta.iter_mut().enumerate() {
+                        *m += (r[t * hc * n + i] - r_mid[t * hc * n + i]) / t_len as f32;
+                    }
+                }
+                la_prev = Some(LaPrev {
+                    x: x.clone(),
+                    r_mid,
+                    r_post: r.clone(),
+                    mean_delta,
+                });
+            }
             if let Some(d) = dump.as_deref_mut() {
                 d.f32(
                     &format!("L{l:02}.moe_out"),
@@ -759,6 +844,16 @@ impl FlashRef {
                     start.elapsed().as_secs_f64()
                 );
             }
+        }
+
+        if let Some(p) = &self.lookahead {
+            let hdr = format!(
+                "{{\"layers\":{},\"tokens\":{t_len},\"k\":{},\"pred\":{LA_PRED},\"methods\":[\"x_l\",\"r_mid\",\"r_mid+mean_moe\",\"r_post\"]}}\n",
+                hp.n_layer, hp.n_expert_used
+            );
+            let mut b = hdr.into_bytes();
+            b.extend(la_out.iter().flat_map(|v| v.to_le_bytes()));
+            std::fs::write(p, b).with_context(|| format!("writing {}", p.display()))?;
         }
 
         // ---- head: the final hyper-connection read is the output norm
@@ -796,6 +891,64 @@ impl FlashRef {
             );
         }
         Ok((tops, r))
+    }
+
+    /// One layer's records for the lookahead study: per token, layer `l`'s true top-k (by router
+    /// logit), then the top-[`LA_PRED`] that layer `l`'s router gives on four stand-ins built from
+    /// layer `l − 1` (all `u16::MAX` for layer 0):
+    ///
+    /// 0. `x_{l-1}`, layer `l−1`'s MoE input, straight into router `l`;
+    /// 1. `hc_read_l(R_mid_{l-1})`, the residual after layer `l−1`'s mixer, before its MoE;
+    /// 2. `hc_read_l(R_mid_{l-1} + mean_t ΔR_moe_{l-1})`, plus the sequence-mean MoE write
+    ///    standing in for this token's ("quasi-hidden state", arXiv 2603.19289);
+    /// 3. `hc_read_l(R_post_{l-1})`, the residual after layer `l−1`'s MoE (available one step
+    ///    later: during layer `l`'s mixer).
+    fn lookahead_layer(
+        &self,
+        l: usize,
+        prev: Option<&LaPrev>,
+        x: &[f32],
+        t_len: usize,
+    ) -> Result<Vec<u16>> {
+        let hp = &self.hp;
+        let k = hp.n_expert_used;
+        let router = self.mat(l, "ffn_gate_inp.weight")?;
+        let rank = |lg: &[f32], m: usize| -> Vec<u16> {
+            let mut idx: Vec<usize> = (0..lg.len()).collect();
+            idx.sort_by(|&a, &b| lg[b].total_cmp(&lg[a]).then(a.cmp(&b)));
+            idx[..m].iter().map(|&e| e as u16).collect()
+        };
+        let truth = router.apply(x, t_len, false);
+        let ne = hp.n_expert;
+        let mut preds: Vec<Vec<f32>> = Vec::new();
+        if let Some(p) = prev {
+            let prefix = self.t(l, "hc_ffn_");
+            preds.push(router.apply(&p.x, t_len, false));
+            let (xb, _) = self.hc_read(&p.r_mid, t_len, &prefix, false)?;
+            preds.push(router.apply(&xb, t_len, false));
+            let w = p.mean_delta.len();
+            let rc: Vec<f32> = p
+                .r_mid
+                .iter()
+                .enumerate()
+                .map(|(i, v)| v + p.mean_delta[i % w])
+                .collect();
+            let (xc, _) = self.hc_read(&rc, t_len, &prefix, false)?;
+            preds.push(router.apply(&xc, t_len, false));
+            let (xd, _) = self.hc_read(&p.r_post, t_len, &prefix, false)?;
+            preds.push(router.apply(&xd, t_len, false));
+        }
+        let mut out = Vec::with_capacity(t_len * (k + 4 * LA_PRED));
+        for t in 0..t_len {
+            out.extend(rank(&truth[t * ne..(t + 1) * ne], k));
+            for m in 0..4 {
+                match preds.get(m) {
+                    Some(lg) => out.extend(rank(&lg[t * ne..(t + 1) * ne], LA_PRED)),
+                    None => out.extend(std::iter::repeat_n(u16::MAX, LA_PRED)),
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// `build_hc_mix`: collapse the 4 streams to the one vector a block reads, and (when `inject`)
@@ -1137,6 +1290,26 @@ impl FlashRef {
                 &format!("L{l:02}.qsa_selected"),
                 &sel_last.unwrap_or_default(),
             )?;
+            // the last token's indexer score of every complete block, selected or not
+            let nv = t_len / kp;
+            let qt = &qi[last * ih * idd..(last + 1) * ih * idd];
+            let scores: Vec<f32> = (0..nv)
+                .map(|b| {
+                    let kb = &pooled[b * idd..(b + 1) * idd];
+                    (0..ih)
+                        .map(|h| dot(&qt[h * idd..(h + 1) * idd], kb).max(0.0) * iscale)
+                        .sum()
+                })
+                .collect();
+            d.f32(&format!("L{l:02}.qsa_scores"), &[nv], &scores)?;
+            d.f32(&format!("L{l:02}.qsa_q_idx"), &[ih, idd], qt)?;
+            if nv > 0 {
+                d.f32(
+                    &format!("L{l:02}.qsa_pooled"),
+                    &[nv, idd],
+                    &pooled[..nv * idd],
+                )?;
+            }
         }
         let w_o = self.mat(l, "attn_output.weight")?;
         Ok(w_o.apply(&attn, t_len, false))
@@ -1455,7 +1628,15 @@ pub fn cli(args: &[String]) -> Result<()> {
     let mut llama_numerics = false;
     let mut qsa_dense = false;
     let mut act_int8 = false;
-    let mut dense = DensePolicy::F32;
+    let mut hc_fmt = Format::Keep;
+    let mut hc_mix = Vec::new();
+    let mut hc_parts: Vec<String> = ["down", "up", "inject", "out"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let mut hc_act_int8 = false;
+    let mut lookahead = None;
+    let mut dense = DensePolicy::f32();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--last" => last = Some(it.next().context("--last N")?.parse().context("--last N")?),
@@ -1477,6 +1658,29 @@ pub fn cli(args: &[String]) -> Result<()> {
             "--llama-numerics" => llama_numerics = true,
             "--qsa-dense" => qsa_dense = true,
             "--act-int8" => act_int8 = true,
+            "--hc-as" => {
+                let v = it.next().context("--hc-as FORMAT | part=format,...")?;
+                if v.contains('=') {
+                    for kv in v.split(',') {
+                        let (p, f) = kv.split_once('=').context("--hc-as part=format")?;
+                        hc_mix.push((p.to_string(), Format::parse_hc(f)?));
+                    }
+                } else {
+                    hc_fmt = Format::parse_hc(v)?;
+                }
+            }
+            "--hc-parts" => {
+                hc_parts = it
+                    .next()
+                    .context("--hc-parts down,up,inject,out")?
+                    .split(',')
+                    .map(String::from)
+                    .collect()
+            }
+            "--hc-act-int8" => hc_act_int8 = true,
+            "--lookahead" => {
+                lookahead = Some(PathBuf::from(it.next().context("--lookahead FILE")?))
+            }
             "--dense-as" => dense = DensePolicy::parse(it.next().context("--dense-as POLICY")?)?,
             s => ids.push(
                 s.parse()
@@ -1492,6 +1696,11 @@ pub fn cli(args: &[String]) -> Result<()> {
     m.emulate_llama = llama_numerics;
     m.qsa_dense = qsa_dense;
     m.act_int8 = act_int8;
+    m.hc_fmt = hc_fmt;
+    m.hc_mix = hc_mix;
+    m.hc_parts = hc_parts;
+    m.hc_act_int8 = hc_act_int8;
+    m.lookahead = lookahead;
     m.dense = dense;
     let from = ids.len() - last.unwrap_or(ids.len()).clamp(1, ids.len());
     let mut dump = dump_dir.as_deref().map(Dump::new).transpose()?;
