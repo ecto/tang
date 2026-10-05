@@ -245,7 +245,7 @@ pub fn encode(ty: GgmlType, v: &[f32]) -> Result<Vec<u8>> {
             .flat_map(|&v| crate::flash::pack::bf16_bits(v).to_le_bytes())
             .collect(),
         GgmlType::Q8_0 => {
-            ensure!(v.len() % 32 == 0, "Q8 alignment");
+            ensure!(v.len().is_multiple_of(32), "Q8 alignment");
             let mut b = Vec::new();
             for x in v.chunks_exact(32) {
                 let max = x.iter().map(|v| v.abs()).fold(0.0, f32::max);

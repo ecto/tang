@@ -177,18 +177,14 @@ fn moe<D: ComputeDevice>(
     let sh = t.mul(sh, sg);
     Ok(t.add(y, sh))
 }
-#[allow(clippy::too_many_arguments)]
-fn cell<D: ComputeDevice>(
+fn prepare<D: ComputeDevice>(
     t: &mut Tape<D>,
-    w: &mut Weights,
+    w: &Weights,
     ids: &BTreeMap<String, Id>,
     h: Id,
     tokens: &[u32],
-    pos: &[usize],
-    previous: &[(Id, Id)],
-    visible: Vec<Vec<usize>>,
     hp: &Hparams,
-) -> Result<CellOut> {
+) -> Result<(Id, Id, Option<Id>)> {
     let (n, hc, rows) = (hp.n_embd, hp.hc, tokens.len());
     let ti = w.main.info("token_embd.weight")?;
     let mut emb = Vec::with_capacity(rows * n);
@@ -209,6 +205,53 @@ fn cell<D: ComputeDevice>(
     let cat = t.gather(packed, cat);
     let r = linear(t, w, ids, cat, "nextn.eh_proj.weight", rows * hc);
     let (x, inj) = hc_read(t, w, ids, r, rows, "hc_attn_", hp, true);
+    Ok((r, x, inj))
+}
+fn teacher_kv<D: ComputeDevice>(
+    t: &mut Tape<D>,
+    w: &Weights,
+    ids: &BTreeMap<String, Id>,
+    x: Id,
+    pos: &[usize],
+    hp: &Hparams,
+) -> (Id, Id) {
+    let (rows, hd, nkv) = (pos.len(), hp.head_dim, hp.n_head_kv);
+    let k = linear(t, w, ids, x, "attn_k.weight", rows);
+    let k = t.norm(k, ids["attn_k_norm.weight"], hd, hp.eps);
+    let k = t.rope(k, nkv, hd, hp.n_rot, hp.rope_base, pos);
+    let v = linear(t, w, ids, x, "attn_v.weight", rows);
+    (k, v)
+}
+fn visibility(prefix: usize, counts: &[usize], rows: usize) -> Vec<Vec<usize>> {
+    (0..rows)
+        .map(|i| {
+            let mut mask: Vec<_> = (0..prefix + i + 1).collect();
+            if !counts.is_empty() {
+                let mut offset = prefix + counts[0];
+                for &count in &counts[1..] {
+                    mask.push(offset + i);
+                    offset += count;
+                }
+                mask.push(offset + i);
+            }
+            mask
+        })
+        .collect()
+}
+#[allow(clippy::too_many_arguments)]
+fn cell<D: ComputeDevice>(
+    t: &mut Tape<D>,
+    w: &mut Weights,
+    ids: &BTreeMap<String, Id>,
+    h: Id,
+    tokens: &[u32],
+    pos: &[usize],
+    previous: &[(Id, Id)],
+    visible: Vec<Vec<usize>>,
+    hp: &Hparams,
+) -> Result<CellOut> {
+    let rows = tokens.len();
+    let (r, x, inj) = prepare(t, w, ids, h, tokens, hp)?;
     let qf = linear(t, w, ids, x, "attn_q.weight", rows);
     let nh = hp.n_head;
     let nkv = hp.n_head_kv;
@@ -227,10 +270,7 @@ fn cell<D: ComputeDevice>(
     );
     let q = t.norm(q, ids["attn_q_norm.weight"], hd, hp.eps);
     let q = t.rope(q, nh, hd, hp.n_rot, hp.rope_base, pos);
-    let k = linear(t, w, ids, x, "attn_k.weight", rows);
-    let k = t.norm(k, ids["attn_k_norm.weight"], hd, hp.eps);
-    let k = t.rope(k, nkv, hd, hp.n_rot, hp.rope_base, pos);
-    let v = linear(t, w, ids, x, "attn_v.weight", rows);
+    let (k, v) = teacher_kv(t, w, ids, x, pos, hp);
     let ks: Vec<_> = previous
         .iter()
         .map(|p| p.0)
@@ -272,6 +312,14 @@ pub fn forward_full<D: ComputeDevice>(
     let width = hp.n_embd * hp.hc;
     let mut residual = t.constant(b.h.clone());
     let mut prev = Vec::new();
+    let prefix = if let Some(p) = &b.prefix {
+        let h = t.constant(p.h.clone());
+        let (_, x, _) = prepare(t, w, ids, h, &p.next_tokens, hp)?;
+        prev.push(teacher_kv(t, w, ids, x, &p.pos, hp));
+        p.pos.len()
+    } else {
+        0
+    };
     let mut logits = Vec::new();
     let mut counts = Vec::new();
     for depth in 1..=3 {
@@ -279,19 +327,7 @@ pub fn forward_full<D: ComputeDevice>(
         let h = t.gather(residual, (0..rows * width).collect());
         let tokens = &b.tokens[depth..depth + rows];
         let pos: Vec<_> = b.pos[..rows].iter().map(|&p| p + depth - 1).collect();
-        let mut visible = Vec::new();
-        for i in 0..rows {
-            let mut mask: Vec<_> = (0..=i).collect();
-            if depth > 1 {
-                let mut offset = counts[0];
-                for &count in &counts[1..] {
-                    mask.push(offset + i);
-                    offset += count;
-                }
-                mask.push(counts.iter().sum::<usize>() + i);
-            }
-            visible.push(mask);
-        }
+        let visible = visibility(prefix, &counts, rows);
         let out = cell(t, w, ids, h, tokens, &pos, &prev, visible, hp)?;
         residual = out.r;
         prev.push((out.k, out.v));
@@ -358,4 +394,28 @@ pub fn forward<D: ComputeDevice>(
         .iter()
         .map(|o| o.logits)
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::visibility;
+    #[test]
+    fn prefix_mask_excludes_future_teacher_and_other_recursive_chains() {
+        assert_eq!(
+            visibility(3, &[], 2),
+            vec![vec![0, 1, 2, 3], vec![0, 1, 2, 3, 4]]
+        );
+        assert_eq!(
+            visibility(3, &[5], 2),
+            vec![vec![0, 1, 2, 3, 8], vec![0, 1, 2, 3, 4, 9]]
+        );
+        assert_eq!(
+            visibility(3, &[5, 4], 2),
+            vec![vec![0, 1, 2, 3, 8, 12], vec![0, 1, 2, 3, 4, 9, 13]]
+        );
+        assert_eq!(
+            visibility(0, &[5, 4], 2),
+            vec![vec![0, 5, 9], vec![0, 1, 6, 10]]
+        );
+    }
 }

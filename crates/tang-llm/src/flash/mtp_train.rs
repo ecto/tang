@@ -34,9 +34,12 @@ struct Args {
     eval_every: usize,
     resume: Option<PathBuf>,
     check_forward: bool,
+    check_context: bool,
+    prefix_data: Option<PathBuf>,
+    eval_windows: usize,
 }
 fn parse(args: &[String]) -> Result<Args> {
-    let usage="flash-mtp-train <main.gguf> <mtp.gguf> --data DIR --out DIR [--steps 100 --seq 32 --burn 8 --lr 1e-5 --beta .8 --clip 1 --vocab 0 --seed 42 --eval-every 20 --resume DIR --cpu]";
+    let usage="flash-mtp-train <main.gguf> <mtp.gguf> --data DIR --out DIR [--steps 100 --seq 32 --burn 8 --lr 1e-5 --beta .8 --clip 1 --vocab 0 --seed 42 --eval-every 20 --eval-windows 1 --prefix-data DIR --resume DIR --cpu --check-context]";
     let mut it = args.iter();
     let main = it.next().context(usage)?.into();
     let mtp = it.next().context(usage)?.into();
@@ -57,10 +60,17 @@ fn parse(args: &[String]) -> Result<Args> {
         eval_every: 20,
         resume: None,
         check_forward: false,
+        check_context: false,
+        prefix_data: None,
+        eval_windows: 1,
     };
     while let Some(k) = it.next() {
         if k == "--cpu" {
             a.cpu = true;
+            continue;
+        }
+        if k == "--check-context" {
+            a.check_context = true;
             continue;
         }
         if k == "--check-forward" {
@@ -70,6 +80,8 @@ fn parse(args: &[String]) -> Result<Args> {
         let v = it.next().with_context(|| format!("{k} needs a value"))?;
         match k.as_str() {
             "--data" => a.data = v.into(),
+            "--prefix-data" => a.prefix_data = Some(v.into()),
+            "--eval-windows" => a.eval_windows = v.parse()?,
             "--out" => a.out = v.into(),
             "--steps" => a.steps = v.parse()?,
             "--seq" => a.seq = v.parse()?,
@@ -93,7 +105,8 @@ fn parse(args: &[String]) -> Result<Args> {
         "invalid sequence/burn length"
     );
     ensure!(
-        a.eval_every > 0
+        a.eval_windows > 0
+            && a.eval_every > 0
             && a.lr > 0.0
             && a.lr.is_finite()
             && a.beta > 0.0
@@ -135,7 +148,12 @@ fn run<D: ComputeDevice>(dev: &D, a: Args) -> Result<()> {
     );
     let mut w = Weights::open(&a.main, &a.mtp, a.lr, a.vocab)?;
     let hp = Hparams::from_gguf(&w.mtp)?;
-    let seqs = data::discover(&a.data, hp.hc * hp.n_embd)?;
+    let mut seqs = data::discover(&a.data, hp.hc * hp.n_embd)?;
+    if let Some(root) = &a.prefix_data {
+        for s in &mut seqs {
+            s.attach_prefix(root)?;
+        }
+    }
     let eligible: Vec<_> = seqs
         .iter()
         .enumerate()
@@ -145,17 +163,20 @@ fn run<D: ComputeDevice>(dev: &D, a: Args) -> Result<()> {
     let valid: Vec<_> = eligible
         .iter()
         .copied()
-        .filter(|&i| prompt_number(&seqs[i].path) % 10 == 0)
+        .filter(|&i| prompt_number(&seqs[i].path).is_multiple_of(10))
         .collect();
     let train: Vec<_> = eligible
         .iter()
         .copied()
-        .filter(|&i| prompt_number(&seqs[i].path) % 10 != 0)
+        .filter(|&i| !prompt_number(&seqs[i].path).is_multiple_of(10))
         .collect();
     ensure!(
         !train.is_empty() && !valid.is_empty(),
         "need completed training and held-out prompts (pNNN % 10 == 0 held out)"
     );
+    if a.check_context {
+        return check_context(dev, &mut w, &seqs[valid[0]], &hp, &a);
+    }
     if a.check_forward {
         return check_forward(dev, &mut w, &seqs[valid[0]], &hp, &a);
     }
@@ -167,7 +188,7 @@ fn run<D: ComputeDevice>(dev: &D, a: Args) -> Result<()> {
         rng = restored.1;
     }
     std::fs::create_dir_all(&a.out)?;
-    let manifest = serde_json::json!({"main":a.main,"mtp":a.mtp,"data":a.data,"steps":a.steps,"seq":a.seq,"burn":a.burn,"lr":a.lr,"beta":a.beta,"clip":a.clip,"vocab":a.vocab,"seed":a.seed,"resume":a.resume,"start_step":offset,"train":train.iter().map(|&i|&seqs[i].path).collect::<Vec<_>>(),"valid":valid.iter().map(|&i|&seqs[i].path).collect::<Vec<_>>(),"trainable":w.params.keys().collect::<Vec<_>>()});
+    let manifest = serde_json::json!({"main":a.main,"mtp":a.mtp,"data":a.data,"prefix_data":a.prefix_data,"eval_windows":a.eval_windows,"eval_every":a.eval_every,"context":if a.prefix_data.is_some(){"full-teacher-prefix"}else{"short-window"},"steps":a.steps,"seq":a.seq,"burn":a.burn,"lr":a.lr,"beta":a.beta,"clip":a.clip,"vocab":a.vocab,"seed":a.seed,"resume":a.resume,"start_step":offset,"train":train.iter().map(|&i|&seqs[i].path).collect::<Vec<_>>(),"valid":valid.iter().map(|&i|&seqs[i].path).collect::<Vec<_>>(),"trainable":w.params.keys().collect::<Vec<_>>()});
     std::fs::write(
         a.out.join("manifest.json"),
         serde_json::to_vec_pretty(&manifest)?,
@@ -193,7 +214,7 @@ fn run<D: ComputeDevice>(dev: &D, a: Args) -> Result<()> {
         drop(t);
         let norm = w.update(&leaves, grads, a.clip)?;
         dev.pool_clear();
-        let metric = serde_json::json!({"kind":"train","step":step,"prompt":s.path,"start":start,"ce":loss,"teacher_hits":hits,"teacher_total":totals,"grad_norm":norm,"seconds":now.elapsed().as_secs_f64()});
+        let metric = serde_json::json!({"kind":"train","step":step,"prompt":s.path,"start":start,"prefix_rows":b.prefix.as_ref().map_or(0,|p|p.pos.len()),"ce":loss,"teacher_hits":hits,"teacher_total":totals,"grad_norm":norm,"seconds":now.elapsed().as_secs_f64()});
         writeln!(log, "{metric}")?;
         log.flush()?;
         eprintln!(
@@ -237,19 +258,30 @@ fn evaluate<D: ComputeDevice>(
     // recursive accuracy as a diagnostic; actual greedy draft acceptance is measured by the engine.
     for &i in valid {
         let s = &seqs[i];
-        let start = (s.ids.len() - a.seq) / 2;
-        let b = s.batch(start, a.seq)?;
-        let mut t = tape::Tape::new(dev);
-        let leaves = w.leafs(&mut t);
-        let lg = model::forward(&mut t, w, &leaves, &b, hp)?;
-        let (l, _, h, n) = model::objective(&t, w, &lg, &b, a.beta, a.burn)?;
-        for d in 0..3 {
-            loss[d] += l[d] * n[d] as f64;
-            hits[d] += h[d];
-            total[d] += n[d];
+        for window in 0..a.eval_windows {
+            let start = if a.eval_windows == 1 {
+                (s.ids.len() - a.seq) / 2
+            } else {
+                (s.ids.len() - a.seq) * window / (a.eval_windows - 1)
+            };
+            let b = s.batch(start, a.seq)?;
+            let mut t = tape::Tape::new(dev);
+            let leaves = w.leafs(&mut t);
+            let lg = model::forward(&mut t, w, &leaves, &b, hp)?;
+            let (l, _, h, n) = model::objective(&t, w, &lg, &b, a.beta, a.burn)?;
+            for d in 0..3 {
+                loss[d] += l[d] * n[d] as f64;
+                hits[d] += h[d];
+                total[d] += n[d];
+            }
+            writeln!(
+                log,
+                "{}",
+                serde_json::json!({"kind":"valid_window","step":step,"prompt":s.path,"start":start,"prefix_rows":b.prefix.as_ref().map_or(0,|p|p.pos.len()),"ce":l,"teacher_hits":h,"teacher_total":n})
+            )?;
+            drop(t);
+            dev.pool_clear();
         }
-        drop(t);
-        dev.pool_clear();
     }
     for d in 0..3 {
         loss[d] /= total[d] as f64;
@@ -400,5 +432,108 @@ fn check_forward<D: ComputeDevice>(
         }
     }
     eprintln!("recursive CPU oracle parity: PASS");
+    Ok(())
+}
+
+/// Splitting a teacher prefix must preserve recursive outputs and parameter gradients.
+fn check_context<D: ComputeDevice>(
+    dev: &D,
+    w: &mut Weights,
+    s: &data::Sequence,
+    hp: &Hparams,
+    a: &Args,
+) -> Result<()> {
+    ensure!(
+        a.prefix_data.is_some(),
+        "--check-context requires --prefix-data"
+    );
+    let full = s.batch(0, 12)?;
+    let split = s.batch(4, 8)?;
+    let mut t = tape::Tape::new(dev);
+    let leaves = w.leafs(&mut t);
+    let out = model::forward_full(&mut t, w, &leaves, &split, hp)?;
+    let logits: Vec<_> = out.iter().map(|o| o.logits).collect();
+    let (_, seeds, _, _) = model::objective(&t, w, &logits, &split, a.beta, 0)?;
+    let expected: Vec<_> = out
+        .iter()
+        .map(|o| (t.data(o.r).to_vec(), t.data(o.logits).to_vec()))
+        .collect();
+    let grads = t.backward(&seeds);
+    let split_grads: std::collections::BTreeMap<_, _> = leaves
+        .iter()
+        .map(|(name, &id)| {
+            (
+                name.clone(),
+                grads[id]
+                    .clone()
+                    .unwrap_or_else(|| vec![0.0; t.data(id).len()]),
+            )
+        })
+        .collect();
+    drop(t);
+    dev.pool_clear();
+    let mut t = tape::Tape::new(dev);
+    let leaves = w.leafs(&mut t);
+    let out = model::forward_full(&mut t, w, &leaves, &full, hp)?;
+    let mut full_seeds = Vec::new();
+    for (d, o) in out.iter().enumerate() {
+        for (label, id, width, expected) in [
+            ("residual", o.r, hp.hc * hp.n_embd, &expected[d].0),
+            ("logits", o.logits, w.vocab.len(), &expected[d].1),
+        ] {
+            let values = &t.data(id)[4 * width..4 * width + expected.len()];
+            let rms = (values
+                .iter()
+                .zip(expected)
+                .map(|(a, b)| f64::from(a - b).powi(2))
+                .sum::<f64>()
+                / expected.len() as f64)
+                .sqrt();
+            let scale = (expected.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>()
+                / expected.len() as f64)
+                .sqrt();
+            eprintln!(
+                "context depth {} {label}: relative RMS {}",
+                d + 1,
+                rms / scale.max(1e-9)
+            );
+            ensure!(
+                rms / scale.max(1e-9) < 0.002,
+                "split context output differs"
+            );
+        }
+        let mut g = vec![0.0; t.data(o.logits).len()];
+        g[4 * w.vocab.len()..4 * w.vocab.len() + seeds[d].1.len()].copy_from_slice(&seeds[d].1);
+        full_seeds.push((o.logits, g));
+    }
+    let grads = t.backward(&full_seeds);
+    for (name, &id) in &leaves {
+        let expected = &split_grads[name];
+        let got = grads[id].as_deref().unwrap_or(&[]);
+        if got.is_empty() {
+            ensure!(
+                expected.iter().all(|&g| g == 0.0),
+                "missing prefix gradient {name}"
+            );
+            continue;
+        }
+        let error = got
+            .iter()
+            .zip(expected)
+            .map(|(a, b)| f64::from(a - b).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let scale = expected
+            .iter()
+            .map(|&v| f64::from(v).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        ensure!(
+            error / scale.max(1e-8) < 0.02,
+            "prefix gradient differs for {name}: {}",
+            error / scale.max(1e-8)
+        );
+    }
+    eprintln!("full-prefix split outputs and gradients: PASS");
     Ok(())
 }

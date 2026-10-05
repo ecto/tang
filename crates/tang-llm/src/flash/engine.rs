@@ -580,6 +580,7 @@ pub struct Engine {
     mtp: Option<Box<Mtp>>,
     pub last_mtp_ms: f64,
     probe_buf: Option<B>,
+    train_dump_prompt: bool,
     train_dump: Option<(
         std::io::BufWriter<std::fs::File>,
         std::io::BufWriter<std::fs::File>,
@@ -1240,6 +1241,7 @@ impl Engine {
             mtp: None,
             last_mtp_ms: 0.0,
             train_dump: None,
+            train_dump_prompt: false,
             probe_buf: None,
             last_commit_ms: 0.0,
             last_mtp_gpu_ms: 0.0,
@@ -2496,8 +2498,8 @@ impl Engine {
                 .collect();
             // Training pairs from generated text only: of the prompt, just its last position
             // (whose next token is the first generated one).
-            if pos + t == self.tokens.len() {
-                self.dump_train(pos, &nexts, t - 1)?;
+            if self.train_dump_prompt || pos + t == self.tokens.len() {
+                self.dump_train(pos, &nexts, if self.train_dump_prompt { 0 } else { t - 1 })?;
             }
             if self.use_mtp && self.mtp.is_some() {
                 self.mtp_last = self.mtp_draft(pos, &nexts)?;
@@ -2582,6 +2584,22 @@ impl Engine {
             ))
         };
         self.train_dump = Some((f("h.f16")?, f("ids.u32")?));
+        Ok(())
+    }
+
+    /// Include every prompt position in a separate residual sidecar. Generation dumps
+    /// retain their existing default of recording only the last prompt position.
+    pub fn dump_prompt_positions(&mut self, enabled: bool) {
+        self.train_dump_prompt = enabled;
+    }
+
+    pub fn finish_mtp_train_dump(&mut self) -> Result<()> {
+        use std::io::Write;
+        if let Some((mut h, mut ids)) = self.train_dump.take() {
+            h.flush()?;
+            ids.flush()?;
+        }
+        self.train_dump_prompt = false;
         Ok(())
     }
 
@@ -3202,6 +3220,7 @@ struct Mtp {
     probs: Vec<B>,
     graphs: Vec<Option<Graph>>,
     steps: usize,
+    graph_banks: std::collections::HashMap<usize, Vec<Option<Graph>>>,
 }
 
 impl Mtp {
@@ -3469,6 +3488,7 @@ impl Mtp {
             toks: z(MAX_T),
             ctl: (0..super::mtp_gpu::MAX_STEPS).map(|_| z(4)).collect(),
             steps: super::mtp_gpu::steps(),
+            graph_banks: Default::default(),
             e: z(MAX_T * HIDDEN),
             cat: z(MAX_T * HC * 2 * HIDDEN),
             r: z(MAX_T * HC * HIDDEN),
@@ -3876,6 +3896,28 @@ impl Engine {
                 (d, p)
             })
             .collect()
+    }
+
+    /// Switch chain length between requests. Captured MTP graphs include chain length;
+    /// retain a separate bank per length so panel runs never reuse a mismatched graph.
+    pub fn set_mtp_steps(&mut self, steps: usize) -> Result<()> {
+        ensure!(
+            (1..=super::mtp_gpu::MAX_STEPS).contains(&steps),
+            "invalid MTP steps"
+        );
+        self.side.sync().map_err(|e| anyhow!("{e}"))?;
+        self.dev.sync();
+        let m = self.mtp.as_mut().context("MTP layer not loaded")?;
+        if m.steps != steps {
+            let next = m
+                .graph_banks
+                .remove(&steps)
+                .unwrap_or_else(|| (0..=MAX_T).map(|_| None).collect());
+            let previous = std::mem::replace(&mut m.graphs, next);
+            m.graph_banks.insert(m.steps, previous);
+            m.steps = steps;
+        }
+        Ok(())
     }
 
     pub fn has_mtp(&self) -> bool {

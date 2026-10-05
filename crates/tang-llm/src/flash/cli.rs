@@ -242,6 +242,17 @@ fn decode_spec(
     chunk: usize,
     kind: &str,
 ) -> Result<(Vec<u32>, Vec<WinStats>, f64, f64, SpecStats)> {
+    decode_spec_options(e, ids, n, chunk, kind, None, None)
+}
+fn decode_spec_options(
+    e: &mut Engine,
+    ids: &[u32],
+    n: usize,
+    chunk: usize,
+    kind: &str,
+    draft_limit: Option<usize>,
+    stop_ids: Option<&[u32]>,
+) -> Result<(Vec<u32>, Vec<WinStats>, f64, f64, SpecStats)> {
     use crate::draft::{Calibration, DraftConfig, Global, Session};
     e.reset();
     e.use_mtp = kind == "mtp" || kind == "hybrid";
@@ -305,9 +316,11 @@ fn decode_spec(
         .and_then(|v| v.parse().ok())
         .unwrap_or(MAX_T);
     // TANG_FLASH_STOP_IDS=a,b: stop once any of these tokens is generated (data generation).
-    let stop: Vec<u32> = std::env::var("TANG_FLASH_STOP_IDS")
-        .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect())
-        .unwrap_or_default();
+    let stop: Vec<u32> = stop_ids.map(|ids| ids.to_vec()).unwrap_or_else(|| {
+        std::env::var("TANG_FLASH_STOP_IDS")
+            .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect())
+            .unwrap_or_default()
+    });
     let mut stop_seen = 0;
     while out.len() < n {
         if !stop.is_empty() {
@@ -326,6 +339,9 @@ fn decode_spec(
             };
         }
         let mut room = (MAX_T - 1).min(n - out.len());
+        if let Some(limit) = draft_limit {
+            room = room.min(limit);
+        }
         if in_think {
             room = room.min(think_room);
         }
@@ -1086,6 +1102,194 @@ pub fn tcheck(args: &[String]) -> Result<()> {
         }
         if first.is_none() {
             println!("  every probed layer bitwise equal");
+        }
+    }
+    Ok(())
+}
+
+/// Reconstruct missing prompt residuals once per corpus, without changing generation dumps.
+pub fn mtp_prefix(args: &[String]) -> Result<()> {
+    ensure!(
+        args.len() == 5 && args[1] == "--data" && args[3] == "--out",
+        "flash-mtp-prefix <main.gguf> --data DIR --out DIR"
+    );
+    let root = Path::new(&args[2]);
+    let out = Path::new(&args[4]);
+    ensure!(!out.exists(), "prefix output already exists");
+    let a = parse(&[args[0].clone(), "--max-ctx".into(), "512".into()])?;
+    let mut e = load(&a)?;
+    e.warm()?;
+    let g = crate::gguf::Gguf::open(&a.path)?;
+    let tok = super::tokenize::FlashTokenizer::from_gguf(&g)?;
+    let mut paths: Vec<_> = std::fs::read_dir(root)?
+        .filter_map(|x| x.ok().map(|x| x.path()))
+        .filter(|p| p.join("done").exists())
+        .collect();
+    paths.sort();
+    ensure!(!paths.is_empty(), "no completed sequences");
+    std::fs::create_dir(out)?;
+    for p in paths {
+        let prompt = std::fs::read_to_string(p.join("prompt.txt"))?;
+        let ids = tok.encode(&tok.chat(&prompt, None)?)?;
+        let pairs = std::fs::read(p.join("ids.u32"))?;
+        ensure!(pairs.len() >= 12, "empty source ids");
+        let first: [u32; 3] = std::array::from_fn(|i| {
+            u32::from_le_bytes(pairs[i * 4..i * 4 + 4].try_into().unwrap())
+        });
+        ensure!(
+            first[0] as usize + 1 == ids.len() && first[1] == *ids.last().unwrap(),
+            "prompt tokenization changed for {}",
+            p.display()
+        );
+        let dest = out.join(p.file_name().unwrap());
+        e.reset();
+        e.dump_mtp_train(&dest)?;
+        e.dump_prompt_positions(true);
+        let next = e.prefill(&ids, MAX_T, None)?;
+        e.finish_mtp_train_dump()?;
+        ensure!(
+            next == first[2],
+            "first generated token changed for {}",
+            p.display()
+        );
+        let residual = std::fs::read(dest.join("h.f16"))?;
+        let width = HC * HIDDEN * 2;
+        let mut source = std::fs::File::open(p.join("h.f16"))?;
+        let mut expected = vec![0u8; width];
+        std::io::Read::read_exact(&mut source, &mut expected)?;
+        ensure!(
+            residual.len() == ids.len() * width && residual[residual.len() - width..] == expected,
+            "last prompt residual is not bitwise equal for {}",
+            p.display()
+        );
+        std::fs::write(dest.join("done"), b"")?;
+        println!(
+            "prefix {}: {} positions, overlap bitwise equal",
+            p.file_name().unwrap().to_string_lossy(),
+            ids.len()
+        );
+    }
+    std::fs::write(out.join("done"), b"")?;
+    Ok(())
+}
+
+/// Repeated serving cells and held-out acceptance, with one engine load per checkpoint.
+pub fn bench_panel(args: &[String]) -> Result<()> {
+    let mut regular = Vec::new();
+    let (mut prompt_dir, mut heldout_dir, mut repeats) = (None, None, 3usize);
+    let mut it = args.iter();
+    while let Some(k) = it.next() {
+        match k.as_str() {
+            "--prompt-dir" => {
+                prompt_dir = Some(PathBuf::from(
+                    it.next().context("--prompt-dir needs a value")?,
+                ))
+            }
+            "--heldout-dir" => {
+                heldout_dir = Some(PathBuf::from(
+                    it.next().context("--heldout-dir needs a value")?,
+                ))
+            }
+            "--repeats" => repeats = it.next().context("--repeats needs a value")?.parse()?,
+            _ => regular.push(k.clone()),
+        }
+    }
+    ensure!(
+        repeats > 0 && (prompt_dir.is_some() || heldout_dir.is_some()),
+        "panel needs prompts and positive repeats"
+    );
+    let mut a = parse(&regular)?;
+    a.opts.split = true;
+    ensure!(a.opts.mtp.is_some(), "panel requires --mtp FILE");
+    let g = crate::gguf::Gguf::open(&a.path)?;
+    let tok = super::tokenize::FlashTokenizer::from_gguf(&g)?;
+    let mut serving = Vec::new();
+    if let Some(dir) = prompt_dir {
+        for (name, think, kind, limit) in [
+            ("code", false, "hybrid", 5),
+            ("chat", false, "mtp", 3),
+            ("code", true, "mtp", 3),
+            ("chat", true, "mtp", 3),
+        ] {
+            let text = std::fs::read_to_string(dir.join(format!("{name}4k.txt")))?;
+            let ids = tok.encode(&tok.chat(&text, Some(think))?)?;
+            serving.push((
+                format!("{name}/{}", if think { "on" } else { "off" }),
+                ids,
+                kind,
+                limit,
+            ));
+        }
+    }
+    let mut heldout = Vec::new();
+    if let Some(dir) = heldout_dir {
+        let mut paths: Vec<_> = std::fs::read_dir(dir)?
+            .filter_map(|x| x.ok().map(|x| x.path()))
+            .filter(|p| p.join("done").exists())
+            .collect();
+        paths.sort();
+        for p in paths {
+            let name = p.file_name().unwrap().to_string_lossy();
+            if name
+                .strip_prefix('p')
+                .and_then(|n| n.parse::<usize>().ok())
+                .is_some_and(|n| n.is_multiple_of(10))
+            {
+                let text = std::fs::read_to_string(p.join("prompt.txt"))?;
+                heldout.push((
+                    name.to_string(),
+                    tok.encode(&tok.chat(&text, None)?)?,
+                    "mtp",
+                    3,
+                ));
+            }
+        }
+    }
+    let longest = serving
+        .iter()
+        .chain(&heldout)
+        .map(|x| x.1.len())
+        .max()
+        .unwrap_or(0);
+    ensure!(longest > 0, "panel has no eligible prompts");
+    a.opts.max_ctx = a
+        .opts
+        .max_ctx
+        .max((longest + a.n + 8).next_multiple_of(1024));
+    eprintln!(
+        "panel: max_ctx {}, fixed slots {:?}, repeats {}, held-out {}",
+        a.opts.max_ctx,
+        a.opts.slots,
+        repeats,
+        heldout.len()
+    );
+    let mut e = load(&a)?;
+    for steps in [3, 5] {
+        e.set_mtp_steps(steps)?;
+        e.warm()?;
+    }
+    for (group, cases, rounds) in [("serving", serving, repeats), ("heldout", heldout, 1)] {
+        for repeat in 0..rounds {
+            for j in 0..cases.len() {
+                let (name, ids, kind, limit) = &cases[(j + repeat) % cases.len()];
+                e.set_mtp_steps(*limit)?;
+                let stop = if group == "heldout" {
+                    Some(&[248046, 248044][..])
+                } else {
+                    Some(&[][..])
+                };
+                let (mut out, _, prefill_s, secs, sp) =
+                    decode_spec_options(&mut e, ids, a.n, a.chunk, kind, Some(*limit), stop)?;
+                if group == "heldout" {
+                    if let Some(i) = out.iter().position(|t| [248046, 248044].contains(t)) {
+                        out.truncate(i + 1);
+                    }
+                }
+                println!(
+                    "{}",
+                    serde_json::json!({"kind":group,"case":name,"repeat":repeat,"prompt_tokens":ids.len(),"requested":a.n,"generated":out,"prefill_seconds":prefill_s,"seconds":secs,"tokens":sp.tokens,"windows":sp.windows,"tokens_per_second":sp.tokens as f64/secs,"tokens_per_window":sp.tokens as f64/sp.windows.max(1) as f64,"acceptance":sp.by_pos,"thinking_acceptance":sp.by_pos_think,"answer_acceptance":sp.by_pos_answer,"widths":sp.widths,"draft":kind,"draft_limit":limit})
+                );
+            }
         }
     }
     Ok(())

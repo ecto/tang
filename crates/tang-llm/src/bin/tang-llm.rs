@@ -216,8 +216,10 @@ fn main() -> Result<()> {
     }
     #[cfg(feature = "cuda")]
     match cmd {
+        "flash-mtp-prefix" => return tang_llm::flash::cli::mtp_prefix(&args[1..]),
         "flash-generate" => return tang_llm::flash::cli::generate(&args[1..]),
         "flash-parity" => return tang_llm::flash::cli::parity(&args[1..]),
+        "flash-bench-panel" => return tang_llm::flash::cli::bench_panel(&args[1..]),
         "flash-bench" => return tang_llm::flash::cli::bench(&args[1..]),
         "flash-spec-test" => return tang_llm::flash::cli::spec_test(&args[1..]),
         "flash-tcheck" => return tang_llm::flash::cli::tcheck(&args[1..]),

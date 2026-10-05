@@ -237,8 +237,7 @@ impl<'a, D: ComputeDevice> Tape<'a, D> {
         let cb = self.constant(c2);
         let a = self.mul(a, ca);
         let b = self.mul(b, cb);
-        let y = self.add(a, b);
-        y
+        self.add(a, b)
     }
     pub fn attention(
         &mut self,
