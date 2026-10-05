@@ -1449,6 +1449,14 @@ __device__ __forceinline__ float pexpf(float x) {
     return p * __int_as_float(((int)n + 127) << 23);
 }
 __device__ __forceinline__ float psilu(float x) { return x / (1.0f + pexpf(-x)); }
+// MOE_DP4A: the wide module's MoE on the dp4a tiles (A/B against tile_mma).
+__device__ __forceinline__ constexpr bool moe_dp4a() {
+#ifdef MOE_DP4A
+    return true;
+#else
+    return false;
+#endif
+}
 
 // Σ code · q over half a chunk: 4 code bytes (16 weights) against one [QAct] uint4 (the half's 4
 // activation words), field f of the code bytes pairing with word f.
@@ -1616,6 +1624,101 @@ __device__ __forceinline__ void tile_dot(const unsigned char* __restrict__ codes
     }
 }
 
+// ---- int8 tensor-core tile (prefill, wide module) ----
+// tile_dot's arithmetic with the integer half-chunk sums from mma.sync m16n8k16 (exact, so any
+// summation order gives the same int): per (row, entry, chunk b, half) the same chain over the
+// groups, a = fma((float)(S [+ nh]), h2f(ds) * dx, a), and the same tree ((b0 + b2) + (b1 + b3))
+// per half, then half 0 + half 1. Up to 16 entries (two n8 tiles); rows of entry e: rmap[e], or
+// rbase + e without a map. out[row][e] for the 16 tile rows.
+__device__ __forceinline__ void mma16816(int c[4], unsigned int a0, unsigned int a1, unsigned int b0) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%8,%9,%10};"
+                 : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
+                 : "r"(a0), "r"(a1), "r"(b0), "r"(0), "r"(0), "r"(0), "r"(0));
+}
+template <int G, bool CG>
+__device__ __forceinline__ void tile_mma(const unsigned char* __restrict__ codes, const unsigned char* __restrict__ scales,
+                                         const unsigned int* __restrict__ X, unsigned int kb, unsigned int m_rows,
+                                         const unsigned int* __restrict__ rmap, unsigned int rbase, unsigned int ne,
+                                         unsigned int lane, float (*out)[17]) {
+    const unsigned int nch = kb / 8, gid = lane >> 2, tig = lane & 3;
+    const unsigned int* xs = X + (u64)m_rows * kb;
+    const unsigned int hoff = m_rows * nch;
+    #define TM_ROW(e) (rmap ? rmap[min((unsigned int)(e), ne - 1)] : rbase + min((unsigned int)(e), ne - 1))
+    unsigned int rowB[2] = {TM_ROW(gid), TM_ROW(8 + gid)};
+    unsigned int rowE[2][2] = {{TM_ROW(2 * tig), TM_ROW(2 * tig + 1)}, {TM_ROW(8 + 2 * tig), TM_ROW(9 + 2 * tig)}};
+    #undef TM_ROW
+    float acc[2][2][2][4][2];  // [n tile][rr][ec][b][half]
+    #pragma unroll
+    for (int nt = 0; nt < 2; nt++)
+        #pragma unroll
+        for (int rr = 0; rr < 2; rr++)
+            #pragma unroll
+            for (int ec = 0; ec < 2; ec++)
+                #pragma unroll
+                for (int b = 0; b < 4; b++) { acc[nt][rr][ec][b][0] = 0.0f; acc[nt][rr][ec][b][1] = 0.0f; }
+    const int NT = ne > 8 ? 2 : 1;
+    #pragma unroll 1
+    for (int g = 0; g < G; g++) {
+        uint4 w[2][2];
+        unsigned int dsw[2];
+        #pragma unroll
+        for (int rr = 0; rr < 2; rr++) {
+            const uint4* wp = (const uint4*)(codes + g * 512 + (gid + 8 * rr) * 32);
+            w[rr][0] = __ldg(wp);
+            w[rr][1] = __ldg(wp + 1);
+            dsw[rr] = __ldg((const unsigned int*)(scales + g * 64 + (gid + 8 * rr) * 4));
+        }
+        // A words: chunk b's 8 code bytes are (w[b/2] .x,.y | .z,.w); half 0 = first word.
+        unsigned int A[2][4][2];
+        #pragma unroll
+        for (int rr = 0; rr < 2; rr++) {
+            unsigned int cw[8] = {w[rr][0].x, w[rr][0].y, w[rr][0].z, w[rr][0].w, w[rr][1].x, w[rr][1].y, w[rr][1].z, w[rr][1].w};
+            #pragma unroll
+            for (int b = 0; b < 4; b++)
+                #pragma unroll
+                for (int hf = 0; hf < 2; hf++) A[rr][b][hf] = (cw[2 * b + hf] >> (2 * tig)) & 0x03030303u;
+        }
+        #pragma unroll
+        for (int nt = 0; nt < 2; nt++) {
+            if (nt >= NT) break;
+            int C[4][2][4];
+            #pragma unroll
+            for (int b = 0; b < 4; b++)
+                #pragma unroll
+                for (int hf = 0; hf < 2; hf++) {
+                    const unsigned int* xp = X + (u64)rowB[nt] * kb + (4 * g + b) * 8 + hf * 4 + tig;
+                    unsigned int bw = CG ? __ldcg(xp) : *xp;
+                    mma16816(C[b][hf], A[0][b][hf], A[1][b][hf], bw);
+                }
+            #pragma unroll
+            for (int ec = 0; ec < 2; ec++)
+                #pragma unroll
+                for (int b = 0; b < 4; b++) {
+                    unsigned int ci = rowE[nt][ec] * nch + 4 * g + b;
+                    float dx = __uint_as_float(CG ? __ldcg(xs + ci) : xs[ci]);
+                    int nh = -(int)(CG ? __ldcg(xs + hoff + ci) : xs[hoff + ci]);
+                    #pragma unroll
+                    for (int rr = 0; rr < 2; rr++) {
+                        float dd = h2f((unsigned short)(dsw[rr] >> (16 * (b >> 1)))) * dx;
+                        acc[nt][rr][ec][b][0] = __fmaf_rn((float)(C[b][0][2 * rr + ec] + nh), dd, acc[nt][rr][ec][b][0]);
+                        acc[nt][rr][ec][b][1] = __fmaf_rn((float)C[b][1][2 * rr + ec], dd, acc[nt][rr][ec][b][1]);
+                    }
+                }
+        }
+    }
+    #pragma unroll
+    for (int nt = 0; nt < 2; nt++)
+        #pragma unroll
+        for (int rr = 0; rr < 2; rr++)
+            #pragma unroll
+            for (int ec = 0; ec < 2; ec++) {
+                float (*a)[2] = acc[nt][rr][ec];
+                float x = (a[0][0] + a[2][0]) + (a[1][0] + a[3][0]);
+                float y = (a[0][1] + a[2][1]) + (a[1][1] + a[3][1]);
+                out[gid + 8 * rr][8 * nt + 2 * tig + ec] = x + y;
+            }
+}
+
 // Gate and up rows of every planned expert for its tokens, h = psilu(gate)·up quantized per
 // [QAct] into HQ (m = PLAN_CAP rows of FF, row = entry). A gu item is (32-row h chunk q, group g),
 // 20 per group, for a 128-thread block: each warp takes one 16-row gu tile (8 h rows), the block
@@ -1632,6 +1735,26 @@ __device__ __forceinline__ void moe_gu_item(const unsigned int* __restrict__ XQ,
     // entries are live, so a wide instantiation costs what a T=4 one does on narrow groups.
     constexpr int EC = NE > 4 ? 4 : NE;
     __syncthreads();
+    if (NE > 8 && !moe_dp4a()) {
+        // Wide module: tensor-core tiles of 16 entries (tile_mma; same bits as tile_dot).
+        __shared__ float om[4][16][17];
+        for (unsigned int p0 = 0; p0 < ne; p0 += 16) {
+            unsigned int np = min(ne - p0, 16u);
+            tile_mma<HIDDEN / 128, false>(blob + GU_CODES + (u64)tile * (HIDDEN / 128) * 512,
+                                          blob + GU_SCALES + (u64)tile * (HIDDEN / 128) * 64, XQ, kb, T,
+                                          PLAN + PLAN_ET + e0 + p0, 0, np, lane, om[warp]);
+            __syncwarp();
+            for (unsigned int i = lane; i < 4 * np; i += 32) {
+                unsigned int k = i % 4, e = i / 4;
+                hs[p0 + e][8 * warp + k] = psilu(om[warp][2 * k][e]) * om[warp][2 * k + 1][e];
+                hs[p0 + e][8 * warp + 4 + k] = psilu(om[warp][2 * k + 8][e]) * om[warp][2 * k + 9][e];
+            }
+            __syncwarp();
+        }
+        __syncthreads();
+        for (unsigned int e = warp; e < ne; e += 4) quant_chunk(hs[e][lane], HQ, PLAN_CAP, FF, e0 + e, q, lane);
+        return;
+    }
     for (unsigned int p0 = 0; p0 < ne; p0 += EC) {
         unsigned int np = min(ne - p0, (unsigned int)EC);
         unsigned int tok[EC];
@@ -1688,6 +1811,45 @@ __device__ __forceinline__ void moe_down_tile(const unsigned int* __restrict__ H
     const unsigned int kb = FF / 4;
     const unsigned char* blob = plan_blob(PLAN, g);
     unsigned int e0 = PLAN[PLAN_GS + g], ne_all = PLAN[PLAN_GS + g + 1] - e0;
+    if (NE > 8 && !moe_dp4a()) {
+        __shared__ float om[8][16][17];
+        unsigned int w8 = (threadIdx.x >> 5) & 7;
+        for (unsigned int p0 = 0; p0 < ne_all; p0 += 16) {
+            unsigned int np = min(ne_all - p0, 16u);
+            tile_mma<FF / 128, CG>(blob + DOWN_CODES + (u64)tile * (FF / 128) * 512,
+                                   blob + DOWN_SCALES + (u64)tile * (FF / 128) * 64, HQ, kb, PLAN_CAP, nullptr,
+                                   e0 + p0, np, lane, om[w8]);
+            __syncwarp();
+            for (unsigned int i = lane; i < 16 * np; i += 32) {
+                unsigned int r = i % 16, e = i / 16, dst = PLAN[PLAN_ED + e0 + p0 + e];
+                PARTS[(u64)dst * HIDDEN + 16 * tile + r] = om[w8][r][e];
+            }
+            __syncwarp();
+        }
+        return;
+    }
+    if (NE <= 8) {
+        // Decode widths: one pass, the original code shape.
+        unsigned int ne = ne_all;
+        unsigned int ents[NE];
+        #pragma unroll
+        for (int e = 0; e < NE; e++) ents[e] = e0 + e;
+        float a0[NE], a1[NE];
+        tile_dot<FF / 128, NE, CG>(blob + DOWN_CODES + (u64)tile * (FF / 128) * 512,
+                                   blob + DOWN_SCALES + (u64)tile * (FF / 128) * 64, HQ, kb, PLAN_CAP, ents, ne, lane,
+                                   a0, a1);
+        unsigned int my_dst = lane < ne ? PLAN[PLAN_ED + e0 + lane] : 0;
+        #pragma unroll
+        for (int e = 0; e < NE; e++) {
+            unsigned int dst = __shfl_sync(0xffffffffu, my_dst, e);
+            if (e < ne && (lane & 3) == 0) {
+                float* out = PARTS + (u64)dst * HIDDEN + 16 * tile + (lane >> 2);
+                out[0] = a0[e];
+                out[8] = a1[e];
+            }
+        }
+        return;
+    }
     // Entries in passes of DC (one pass up to T = 8; wide groups re-read the tile from L2).
     constexpr int DC = NE > 8 ? 8 : NE;
     for (unsigned int p0 = 0; p0 < ne_all; p0 += DC) {

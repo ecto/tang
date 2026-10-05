@@ -177,7 +177,8 @@ impl CudaComputeDevice {
         }
         let src: &'static str = Box::leak(
             format!(
-                "#define FLASH_WIDE 1\n#define PLAN_CAP {}\n#define SHARED_ROW {}\n{FLASH_CUDA}",
+                "{}\n#define FLASH_WIDE 1\n#define PLAN_CAP {}\n#define SHARED_ROW {}\n{FLASH_CUDA}",
+                std::env::var("TANG_FL_DEFS").unwrap_or_default().replace(';', "\n"),
                 MoePlan::WIDE_CAP,
                 MoePlan::shared_row(MAX_T + 1)
             )
