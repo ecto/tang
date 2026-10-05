@@ -2883,3 +2883,99 @@ impl Engine {
         Ok(out)
     }
 }
+
+/// The running (non-positional) state after `pos` tokens: GDN state and conv history, the QSA
+/// indexer-key rings and the PLE ring (`docs/strata.md`, "State, KV, conversations"). Positional
+/// state (QSA K/V, pooled indexer keys, MTP K/V) is rewritten before it is read, so restoring
+/// this plus the token prefix resumes the sequence at `pos` (the server's prefix reuse).
+pub struct RunningState {
+    pub pos: usize,
+    gdn: Vec<(Vec<f32>, Vec<f32>)>,
+    qsa_ring: Vec<Vec<f32>>,
+    ple_ring: Vec<f32>,
+}
+
+impl RunningState {
+    /// Host bytes held.
+    pub fn bytes(&self) -> usize {
+        4 * (self.gdn.iter().map(|(a, b)| a.len() + b.len()).sum::<usize>()
+            + self.qsa_ring.iter().map(Vec::len).sum::<usize>()
+            + self.ple_ring.len())
+    }
+
+    /// Every buffer, in a fixed order (for saving to disk).
+    pub fn parts(&self) -> Vec<&[f32]> {
+        let mut v: Vec<&[f32]> = Vec::new();
+        for (s, h) in &self.gdn {
+            v.push(s);
+            v.push(h);
+        }
+        v.extend(self.qsa_ring.iter().map(Vec::as_slice));
+        v.push(&self.ple_ring);
+        v
+    }
+
+    /// GDN layers in the state (the first `2 ×` this many [`parts`](Self::parts) are theirs).
+    pub fn gdn_layers(&self) -> usize {
+        self.gdn.len()
+    }
+
+    /// The inverse of [`parts`](Self::parts), for a model with `gdn_layers` GDN layers.
+    pub fn from_parts(pos: usize, gdn_layers: usize, mut parts: Vec<Vec<f32>>) -> Result<Self> {
+        ensure!(parts.len() > 2 * gdn_layers, "state has {} parts", parts.len());
+        let ple_ring = parts.pop().unwrap();
+        let qsa_ring = parts.split_off(2 * gdn_layers);
+        let mut gdn = Vec::new();
+        let mut it = parts.into_iter();
+        while let (Some(s), Some(h)) = (it.next(), it.next()) {
+            gdn.push((s, h));
+        }
+        Ok(RunningState { pos, gdn, qsa_ring, ple_ring })
+    }
+}
+
+impl Engine {
+    /// Copy the running state out (after the last window's commit). The sequence is `tokens`.
+    pub fn save_running(&mut self) -> Result<RunningState> {
+        self.side.sync().map_err(|e| anyhow!("{e}"))?;
+        self.dev.sync();
+        let dev = &self.dev;
+        let gdn = self
+            .layers
+            .iter()
+            .filter_map(|l| l.gdn.as_ref())
+            .map(|g| (dev.download(&g.state), dev.download(&g.hist)))
+            .collect();
+        let qsa_ring = self.layers.iter().filter_map(|l| l.qsa.as_ref()).map(|q| dev.download(&q.ring)).collect();
+        Ok(RunningState { pos: self.tokens.len(), gdn, qsa_ring, ple_ring: dev.download(&self.ple.ring) })
+    }
+
+    /// Resume at `s.pos` with `prefix` (`s.pos` tokens, the sequence `s` was saved after). MTP
+    /// drafts are dropped until the next window.
+    pub fn restore_running(&mut self, s: &RunningState, prefix: &[u32]) -> Result<()> {
+        ensure!(prefix.len() == s.pos, "prefix of {} tokens for a state at {}", prefix.len(), s.pos);
+        self.side.sync().map_err(|e| anyhow!("{e}"))?;
+        self.dev.sync();
+        let mut gi = 0;
+        let mut qi = 0;
+        for l in &mut self.layers {
+            if let Some(g) = l.gdn.as_mut() {
+                let (st, h) = s.gdn.get(gi).context("state has fewer GDN layers")?;
+                self.dev.upload_into_f32(&mut g.state, st);
+                self.dev.upload_into_f32(&mut g.hist, h);
+                gi += 1;
+            }
+            if let Some(q) = l.qsa.as_mut() {
+                self.dev.upload_into_f32(&mut q.ring, s.qsa_ring.get(qi).context("state has fewer QSA layers")?);
+                qi += 1;
+            }
+        }
+        ensure!(gi == s.gdn.len() && qi == s.qsa_ring.len(), "state is for another model");
+        self.dev.upload_into_f32(&mut self.ple.ring, &s.ple_ring);
+        self.dev.sync();
+        self.tokens.clear();
+        self.tokens.extend_from_slice(prefix);
+        self.mtp_last.clear();
+        Ok(())
+    }
+}

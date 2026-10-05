@@ -104,6 +104,17 @@ impl FlashTokenizer {
         self.tok.decode(ids, false).map_err(|e| anyhow!("decode: {e}"))
     }
 
+    /// The chat template over a conversation (OpenAI messages, contents as strings, tool-call
+    /// arguments as objects) and tools, with the generation prompt.
+    pub fn render(&self, messages: &Value, tools: Option<&Value>, think: Option<bool>) -> Result<String> {
+        let t = self.template.as_ref().context("the GGUF has no chat template")?;
+        t.render(messages, tools, think)
+    }
+
+    pub fn token_id(&self, piece: &str) -> Option<u32> {
+        self.tok.token_to_id(piece)
+    }
+
     /// The chat template applied to one user message (generation prompt added, thinking on
     /// unless `think` says otherwise).
     pub fn chat(&self, user: &str, think: Option<bool>) -> Result<String> {

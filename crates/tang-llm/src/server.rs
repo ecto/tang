@@ -45,19 +45,58 @@ struct App {
     vision: bool,
 }
 
-/// Serve `engine` on `addr` until the process exits. `load` runs on the worker thread (so the
-/// GPU device is created where it's used). With `key`, requests must present it.
-pub fn serve<D, F>(addr: &str, model: String, key: Option<String>, load: F) -> anyhow::Result<()>
+/// What the server runs requests on: the dense [`Engine`], or the Flash-Next engine
+/// (`flash::serve`). It lives on the worker thread.
+pub trait Backend {
+    /// Generate a reply; `on` gets each piece and returns false to stop.
+    fn complete(&mut self, req: &Request, on: &mut dyn FnMut(Piece) -> bool) -> anyhow::Result<(Finish, Usage)>;
+    fn context_window(&self) -> usize;
+    fn vision(&self) -> bool {
+        false
+    }
+    /// After the reply has gone out (logging, saving caches).
+    fn after(&mut self, _req: &Request, _result: &anyhow::Result<(Finish, Usage)>) {}
+}
+
+impl<D: ComputeDevice + 'static> Backend for Engine<D> {
+    fn complete(&mut self, req: &Request, on: &mut dyn FnMut(Piece) -> bool) -> anyhow::Result<(Finish, Usage)> {
+        Engine::complete(self, req, on)
+    }
+
+    fn context_window(&self) -> usize {
+        Engine::context_window(self)
+    }
+
+    fn vision(&self) -> bool {
+        self.model.vision.is_some()
+    }
+
+    fn after(&mut self, req: &Request, result: &anyhow::Result<(Finish, Usage)>) {
+        if let Ok((_, u)) = result {
+            if self.speculation().is_some() {
+                eprintln!(
+                    "tang-llm: {} tokens at {:.1} tok/s, drafts {}/{} accepted",
+                    u.completion_tokens, u.decode_tok_s, u.accepted_tokens, u.draft_tokens
+                );
+            }
+            self.save(req.cache_key.as_deref());
+        }
+    }
+}
+
+/// Serve the backend `load` makes on `addr` until the process exits. `load` runs on the worker
+/// thread (so the GPU device is created where it's used). With `key`, requests must present it.
+pub fn serve<B, F>(addr: &str, model: String, key: Option<String>, load: F) -> anyhow::Result<()>
 where
-    D: ComputeDevice + 'static,
-    F: FnOnce() -> anyhow::Result<Engine<D>> + Send + 'static,
+    B: Backend + 'static,
+    F: FnOnce() -> anyhow::Result<B> + Send + 'static,
 {
     let (jobs, rx) = std_mpsc::channel::<Job>();
     let (ready_tx, ready_rx) = std_mpsc::channel();
     std::thread::spawn(move || {
         let mut engine = match load() {
             Ok(e) => {
-                let _ = ready_tx.send(Ok((e.context_window(), e.model.vision.is_some())));
+                let _ = ready_tx.send(Ok((e.context_window(), e.vision())));
                 e
             }
             Err(e) => {
@@ -67,24 +106,13 @@ where
         };
         for job in rx {
             let tx = job.tx.clone();
-            let result = engine.complete(&job.req, |p| tx.send(Out::Piece(p)).is_ok());
-            if let Ok((_, u)) = &result {
-                if engine.speculation().is_some() {
-                    eprintln!(
-                        "tang-llm: {} tokens at {:.1} tok/s, drafts {}/{} accepted",
-                        u.completion_tokens, u.decode_tok_s, u.accepted_tokens, u.draft_tokens
-                    );
-                }
-            }
-            let ok = result.is_ok();
-            let _ = match result {
-                Ok((finish, usage)) => job.tx.send(Out::Done(finish, usage)),
+            let result = engine.complete(&job.req, &mut |p| tx.send(Out::Piece(p)).is_ok());
+            let _ = match &result {
+                Ok((finish, usage)) => job.tx.send(Out::Done(*finish, usage.clone())),
                 Err(e) => job.tx.send(Out::Error(format!("{e:#}"))),
             };
             // After the reply, so saving never delays it.
-            if ok {
-                engine.save(job.req.cache_key.as_deref());
-            }
+            engine.after(&job.req, &result);
         }
     });
     let (ctx, vision) = ready_rx.recv()??;
@@ -345,6 +373,7 @@ pub fn parse(body: &Value) -> Result<Request, String> {
             .or(body["think"].as_bool())
             .or((body["reasoning_effort"] == "none").then_some(false)),
         thinking_budget: thinking_budget(body),
+        temperature_set: f("temperature").is_some(),
         sampling: Sampling {
             temperature: f("temperature").map(|v| v as f32).unwrap_or(d.temperature),
             top_p: f("top_p").map(|v| v as f32).unwrap_or(d.top_p),

@@ -18,6 +18,8 @@ pub mod ngram;
 pub mod pack;
 pub mod reference;
 pub mod requant;
+#[cfg(feature = "cuda")]
+pub mod serve;
 pub mod tokenize;
 
 use crate::gguf::{Gguf, TensorInfo};

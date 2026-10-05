@@ -203,6 +203,7 @@ fn main() -> Result<()> {
         "flash-bench" => return tang_llm::flash::cli::bench(&args[1..]),
         "flash-spec-test" => return tang_llm::flash::cli::spec_test(&args[1..]),
         "flash-tcheck" => return tang_llm::flash::cli::tcheck(&args[1..]),
+        "flash-resume-test" => return tang_llm::flash::serve::resume_test(&args[1..]),
         "flash-gemv-check" => return tang_llm::flash::engine::gemv_check(&dir),
         _ => {}
     }
@@ -333,7 +334,58 @@ fn run<D: ComputeDevice>(
     Ok(())
 }
 
+/// `tang-llm serve <first shard.gguf> [--mtp M] [--host H] [--port P] [--ctx N] [--api-key-file F]
+/// [--temp T] [--snapshots N] [--dump-ids DIR]`: the Flash-Next engine (`flash::serve`).
+#[cfg(feature = "cuda")]
+fn serve_flash(args: &[String]) -> Result<()> {
+    use tang_llm::flash::serve::{default_disk, FlashServe, Settings};
+    let gguf = PathBuf::from(&args[0]);
+    let mut s = Settings {
+        disk: default_disk(&gguf),
+        gguf,
+        mtp: None,
+        ctx: 32_768,
+        temp: 0.0,
+        snapshots: 6,
+        dump: None,
+    };
+    let (mut host, mut port) = ("127.0.0.1".to_string(), 8911u16);
+    let mut key = std::env::var("TANG_API_KEY").ok();
+    let mut it = args[1..].iter();
+    while let Some(a) = it.next() {
+        let mut val = || it.next().with_context(|| format!("{a} needs a value"));
+        match a.as_str() {
+            "--host" => host = val()?.clone(),
+            "--port" => port = val()?.parse()?,
+            "--ctx" => s.ctx = val()?.parse()?,
+            "--mtp" => s.mtp = Some(PathBuf::from(val()?)),
+            "--temp" => s.temp = val()?.parse()?,
+            "--snapshots" => s.snapshots = val()?.parse()?,
+            "--dump-ids" => s.dump = Some(PathBuf::from(val()?)),
+            "--api-key-file" => {
+                let path = val()?;
+                key = Some(std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?);
+            }
+            other => bail!("unknown option {other}"),
+        }
+    }
+    let key = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
+    if key.is_none() && !host.starts_with("127.") && host != "localhost" {
+        eprintln!("tang-llm: warning: listening on {host} without an API key; anyone who can reach it can use it");
+    }
+    let name = s
+        .gguf
+        .file_name()
+        .map(|n| n.to_string_lossy().split("-0000").next().unwrap_or_default().to_string())
+        .unwrap_or_default();
+    tang_llm::server::serve(&format!("{host}:{port}"), name, key, move || FlashServe::load(&s))
+}
+
 fn serve(backend: Backend, args: &[String]) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    if args.first().is_some_and(|a| a.ends_with(".gguf")) {
+        return serve_flash(args);
+    }
     let spec = args
         .first()
         .context("usage: tang-llm serve <model> [--host H] [--port P] [--ctx N] [--api-key-file F] [--f32 | --q4] [--no-speculate] [--kv-slots N|auto]")?
