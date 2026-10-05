@@ -277,7 +277,7 @@ fn decode_spec(
     let fixed_gate = std::env::var("TANG_FLASH_GATE").ok().and_then(|v| v.parse::<f32>().ok());
     // Thinking spans: the prompt ends inside `<think>` (248068) until `</think>` (248069).
     let think_end = 248_069u32;
-    let mut in_think = ids.iter().rev().take(4).any(|&x| x == 248_068);
+    let mut in_think = ids.iter().rev().take(8).find(|&&x| x == 248_068 || x == think_end) == Some(&248_068);
     let think_room: usize = std::env::var("TANG_FLASH_THINK_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(MAX_T);
     while out.len() < n {
         if out.len() >= 2 && started.is_none() {

@@ -613,7 +613,7 @@ impl Engine {
                         segs.push((seg, rows, out));
                     }
                     let stackable = segs.iter().all(|(s, _, _)| matches!(s, KSeg::Nat(..) | KSeg::Bf(_)));
-                    if stackable && std::env::var("TANG_FLASH_KSTACK").is_ok_and(|v| v == "1") {
+                    if stackable && !std::env::var("TANG_FLASH_KSTACK").is_ok_and(|v| v == "0") {
                         use tang_compute::flash_native::NatSeg;
                         let st: Vec<NatSeg<B>> = segs
                             .into_iter()
