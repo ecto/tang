@@ -209,3 +209,16 @@ kernel void upsample_nearest_2x(
     out[i] = x[(c*h+y/2)*w+xx/2];
 }
 "#;
+/// Device-resident channel broadcast for the final DiT modulation.
+pub const CHANNEL_MODULATION_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void channel_modulation(
+    device const float* data [[buffer(0)]],
+    device const float* scale [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint* p [[buffer(3)]],
+    uint i [[thread_position_in_grid]]) {
+    if (i < p[0]) out[i] = data[i] * (1.0f + scale[p[2] + i % p[1]]);
+}
+"#;

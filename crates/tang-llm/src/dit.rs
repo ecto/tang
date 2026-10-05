@@ -443,12 +443,13 @@ impl<B: ComputeBuffer> DiT<B> {
             }
         }
         let x = dev.layer_norm(&x, &self.norm_ones, &self.norm_zeros, rows, c.dim, 1e-6);
-        let scale = dev
-            .download(&self.final_mod.run(dev, &silu(dev, &time), 1))
-            .iter()
-            .map(|v| 1. + v)
-            .collect::<Vec<_>>();
-        let x = multiply_rows(dev, &x, &scale, rows);
+        let scale = self.final_mod.run(dev, &silu(dev, &time), 1);
+        let x = if self.fused_modulation {
+            dev.modulate_channels(&x, &scale, 0, rows, c.dim)
+        } else {
+            let scale: Vec<_> = dev.download(&scale).iter().map(|v| 1. + v).collect();
+            multiply_rows(dev, &x, &scale, rows)
+        };
         let out = self.final_out.run(dev, &x, rows);
         trace("final", &out);
         Ok(unpatchify(

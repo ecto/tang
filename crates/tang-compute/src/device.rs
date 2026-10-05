@@ -138,6 +138,26 @@ pub trait ComputeDevice: Send {
         eps: f32,
     ) -> Self::Buffer;
 
+    /// Multiply rows by channel modulation `1 + scale[offset..]` without
+    /// requiring a host-expanded scale matrix on accelerated backends.
+    fn modulate_channels(
+        &self,
+        data: &Self::Buffer,
+        scale: &Self::Buffer,
+        offset: usize,
+        rows: usize,
+        dim: usize,
+    ) -> Self::Buffer {
+        assert!(dim > 0 && data.len() == rows * dim && scale.len() >= offset + dim);
+        let values = self.download(scale);
+        let scale: Vec<f32> = values[offset..offset + dim]
+            .iter()
+            .map(|x| 1. + x)
+            .collect();
+        let expanded = self.upload(&scale.repeat(rows));
+        self.elementwise(&[data, &expanded], rows * dim, &|x| x[0] * x[1])
+    }
+
     /// RMS norm followed by channel modulation `1 + scale[offset..]`.
     /// Backends may fuse these operations without expanding the channel vector.
     fn rms_norm_scale(

@@ -121,7 +121,10 @@ impl MetalDevice {
         }
 
         let options = CompileOptions::new();
-        if matches!(fn_name, "rms_norm_modulation" | "group_norm_affine") {
+        if matches!(
+            fn_name,
+            "rms_norm_modulation" | "group_norm_affine" | "channel_modulation"
+        ) {
             options.set_fast_math_enabled(false);
         }
         let library = self
@@ -1934,6 +1937,32 @@ kernel void embedding(
         self.flash_attention(q, k, v, 0, n, nh, nh, hd, 0, true, None)
     }
 
+    fn modulate_channels(
+        &self,
+        data: &MetalBuffer,
+        scale: &MetalBuffer,
+        offset: usize,
+        rows: usize,
+        dim: usize,
+    ) -> MetalBuffer {
+        assert!(dim > 0 && data.len() == rows * dim && scale.len() >= offset + dim);
+        assert_eq!(data.kind, Kind::F32);
+        assert_eq!(scale.kind, Kind::F32);
+        let pipeline = self.get_pipeline(reduce_msl::CHANNEL_MODULATION_MSL, "channel_modulation");
+        let out = self.make_buffer_empty(rows * dim * 4);
+        let params = self.make_buffer_u32(&[(rows * dim) as u32, dim as u32, offset as u32]);
+        self.dispatch(
+            &pipeline,
+            &[&data.buffer, &scale.buffer, &out, &params],
+            (rows * dim) as u64,
+        );
+        MetalBuffer {
+            buffer: out,
+            len: rows * dim,
+            kind: Kind::F32,
+        }
+    }
+
     fn rms_norm_scale(
         &self,
         data: &MetalBuffer,
@@ -3547,6 +3576,37 @@ mod tests {
                 metal.download(&metal.upsample_nearest_2x(&metal.upload(&data), channels, h, w)),
                 cpu.download(&cpu.upsample_nearest_2x(&cpu.upload(&data), channels, h, w))
             );
+        }
+    }
+
+    #[test]
+    fn metal_channel_modulation_matches_cpu_without_expanded_scales() {
+        let metal = get_metal_device();
+        let cpu = CpuDevice::new();
+        for (rows, dim, offset) in [(3, 7, 2), (5, 128, 0), (2, 3840, 3840)] {
+            let data: Vec<f32> = (0..rows * dim)
+                .map(|i| ((i * 17) % 97) as f32 / 13. - 3.)
+                .collect();
+            let mut scale: Vec<f32> = (0..offset + dim + 3)
+                .map(|i| ((i * 11) % 31) as f32 / 7. - 2.)
+                .collect();
+            scale[offset] = -1.;
+            scale[offset + 1] = 1000.;
+            let actual = metal.download(&metal.modulate_channels(
+                &metal.upload(&data),
+                &metal.upload(&scale),
+                offset,
+                rows,
+                dim,
+            ));
+            let expected = cpu.download(&cpu.modulate_channels(
+                &cpu.upload(&data),
+                &cpu.upload(&scale),
+                offset,
+                rows,
+                dim,
+            ));
+            assert_eq!(actual, expected, "{rows}x{dim} offset {offset}");
         }
     }
 
