@@ -424,6 +424,27 @@ impl<D: ComputeDevice> Model<D> {
         Ok(x)
     }
 
+    /// Qwen conditioning used by diffusion pipelines: hidden_states[-2], before
+    /// the final decoder layer, final RMSNorm, and language-model head.
+    /// Returns a device-resident `[tokens.len(), hidden_size]` tensor. This uses
+    /// a separate cache so conditioning never changes a chat conversation's KV.
+    pub fn encode_penultimate(&self, tokens: &[u32]) -> Result<D::Buffer> {
+        anyhow::ensure!(!tokens.is_empty(), "no tokens");
+        anyhow::ensure!(tokens.len() <= self.max_ctx, "context full");
+        anyhow::ensure!(!self.layers.is_empty(), "encoder has no layers");
+        let mut x = self.embed(tokens)?;
+        let mut cache = self.new_cache();
+        self.decode_layers(
+            &mut x,
+            &mut cache,
+            tokens.len(),
+            0,
+            true,
+            self.layers.len() - 1,
+        )?;
+        Ok(x)
+    }
+
     /// Like `forward`, from hidden states instead of token ids (so image features can stand
     /// in for placeholder tokens). `tokens` are what the cache records for these positions.
     pub fn forward_hidden(
@@ -444,7 +465,7 @@ impl<D: ComputeDevice> Model<D> {
             self.max_ctx
         );
         let (h, eps) = (c.hidden_size, c.rms_norm_eps);
-        self.decode_layers(&mut x, cache, s, pos, causal)?;
+        self.decode_layers(&mut x, cache, s, pos, causal, self.layers.len())?;
         let (rows, x) = if all {
             (s, x)
         } else {
@@ -469,6 +490,7 @@ impl<D: ComputeDevice> Model<D> {
         s: usize,
         pos: usize,
         causal: bool,
+        layer_limit: usize,
     ) -> Result<()> {
         let c = &self.cfg;
         let dev = &self.dev;
@@ -489,7 +511,7 @@ impl<D: ComputeDevice> Model<D> {
             table: &table,
             block: BLOCK,
         };
-        for (l, w) in self.layers.iter().enumerate() {
+        for (l, w) in self.layers.iter().take(layer_limit).enumerate() {
             let (kp, vp) = pool.layer(l);
             let a = dev.rms_norm(x, &w.attn_norm, s, h, eps);
             let qkv = dev.linear(&a, &w.wqkv, s, h, qd + 2 * kvd);
@@ -564,4 +586,68 @@ fn rope_tables(head_dim: usize, max_pos: usize, theta: f32, scale: f32) -> (Vec<
         }
     }
     (cos, sin)
+}
+
+#[cfg(test)]
+mod conditioning_tests {
+    use super::*;
+    use tang_compute::CpuDevice;
+
+    #[test]
+    fn penultimate_is_pre_final_layer_without_norm_or_head() {
+        let dev = CpuDevice::new();
+        let cfg = Config::from_json(br#"{"model_type":"qwen3","hidden_size":4,"intermediate_size":4,"num_hidden_layers":2,"num_attention_heads":1,"num_key_value_heads":1,"vocab_size":2,"rms_norm_eps":0.000001,"rope_theta":10000}"#).unwrap();
+        let layer = |scale: f32| Layer {
+            attn_norm: dev.upload(&[1.; 4]),
+            wqkv: dev.upload(&[0.; 48]),
+            wo: dev.upload(&[0.; 16]),
+            q_norm: None,
+            k_norm: None,
+            mlp_norm: dev.upload(&[1.; 4]),
+            w_gate_up: dev.upload(&[
+                1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 1., 0., 0., 0., 0.,
+                1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
+            ]),
+            w_down: dev.upload(&[
+                scale, 0., 0., 0., 0., scale, 0., 0., 0., 0., scale, 0., 0., 0., 0., scale,
+            ]),
+            post_attn_norm: None,
+            post_mlp_norm: None,
+            window: 0,
+            rope: 0,
+        };
+        let layers = vec![layer(1.), layer(2.)];
+        let (cos, sin) = rope_tables(4, 32, 10000., 1.);
+        let model = Model {
+            cfg,
+            embed: dev.upload(&[1., 2., 3., 4., 4., 3., 2., 1.]),
+            layers,
+            norm: dev.upload(&[10.; 4]),
+            lm_head: Some(dev.upload(&[0.; 8])),
+            ropes: vec![(dev.upload(&cos), dev.upload(&sin))],
+            embed_scale: None,
+            vision: None,
+            max_ctx: 32,
+            pool: new_pool(2, 4, false, usize::MAX),
+            dev,
+        };
+        let result = model
+            .dev
+            .download(&model.encode_penultimate(&[0, 1]).unwrap());
+        for (row, original) in [[1f32, 2., 3., 4.], [4., 3., 2., 1.]].iter().enumerate() {
+            let denom = (original.iter().map(|x| x * x).sum::<f32>() / 4. + 0.000001).sqrt();
+            for i in 0..4 {
+                let x = original[i] / denom;
+                let expected = original[i] + x * x / (1. + (-x).exp());
+                assert!((result[row * 4 + i] - expected).abs() < 1e-5);
+            }
+        }
+        let mut cache = model.new_cache();
+        assert_eq!(
+            model.forward(&[0, 1], &mut cache, true).unwrap(),
+            vec![0.; 4]
+        );
+        assert!(model.encode_penultimate(&[]).is_err());
+        assert!(model.encode_penultimate(&[0; 33]).is_err());
+    }
 }
