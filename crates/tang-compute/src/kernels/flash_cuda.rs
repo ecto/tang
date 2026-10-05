@@ -800,7 +800,15 @@ HC_FUSED(16) HC_FUSED(32)
 // Phase-1 and phase-2 weights are loaded into registers once and run over every tile; shared
 // memory and accumulators are a tile's. Each token's chains are the T kernels' (explicit fma
 // chains, the same K split and reduction order), so its bits don't depend on the width.
+#ifndef HW_TT
 #define HW_TT 8
+#endif
+#ifndef HW_MINB
+#define HW_MINB 1
+#endif
+#ifndef HW_T2
+#define HW_T2 16
+#endif
 template <bool Q8>
 __device__ __forceinline__ void hc_wide_body(
     float* __restrict__ R, const float* __restrict__ Yp, const float* __restrict__ Ip, unsigned int mode,
@@ -811,8 +819,6 @@ __device__ __forceinline__ void hc_wide_body(
     float* __restrict__ XN, float* __restrict__ LO, unsigned int* __restrict__ bar, unsigned int M) {
     float* PART = LO;  // [4][rows][M]
     __shared__ float red[16][2 * HW_TT];
-    __shared__ float xs[64][32];
-    __shared__ __align__(16) float lo[HW_TT * HC_LR];
     unsigned int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, nb = gridDim.x;
     for (unsigned int item = blockIdx.x; item < HC * M; item += nb) {
         unsigned int c = item % HC, t = item / HC;
@@ -855,6 +861,9 @@ __device__ __forceinline__ void hc_wide_body(
         __syncthreads();
     }
     grid_bar(bar, nb);
+#ifdef HC_STOP1
+    return;
+#endif
     const unsigned int KW = HC * HIDDEN;
     const unsigned int ngroups = (rows + 7) / 8;
     for (unsigned int item = blockIdx.x; item < 4 * ngroups; item += nb) {
@@ -936,6 +945,9 @@ __device__ __forceinline__ void hc_wide_body(
         }
     }
     grid_bar(bar, nb);
+#ifdef HC_STOP2
+    return;
+#endif
     if (blockIdx.x == 0)
         for (unsigned int i = tid; i < (rows - HC_LR) * M; i += 512) {
             unsigned int row = HC_LR + i / M, t = i % M;
@@ -943,94 +955,91 @@ __device__ __forceinline__ void hc_wide_body(
             for (int k = 1; k < 4; k++) v += PART[((u64)k * rows + row) * M + t];
             INJ[t * HC + row - HC_LR] = v;
         }
-    if (blockIdx.x >= HIDDEN / 32) return;
-    for (unsigned int q = blockIdx.x; q < HIDDEN / 32; q += nb) {
-        #pragma unroll 1
-        for (int half = 0; half < 2; half++) {
-            unsigned int dl = warp + 16 * half, d = q * 32 + dl;
-            uint4 qv[5];
-            uint2 cv[5];
-            float dv[5];
-            const uint4* w = (const uint4*)(Wu + (u64)d * HC * HC_LR);
-            if (Q8) {
-                const unsigned char* base = (const unsigned char*)Wu;
-                const unsigned short* sc = (const unsigned short*)(base + (((u64)HC * HIDDEN * HC_LR + 15) & ~15ull));
-                #pragma unroll
-                for (int j = 0; j < 5; j++) {
-                    unsigned int p = (lane >> 2) + 8 * j;
-                    cv[j] = __ldg((const uint2*)(base + (u64)d * HC * HC_LR) + lane + 32 * j);
-                    dv[j] = h2f(__ldg(sc + (u64)((lane & 3) * HIDDEN + d) * (HC_LR / 32) + p / 4));
-                }
-            } else {
-                #pragma unroll
-                for (int j = 0; j < 5; j++) qv[j] = w[lane + 32 * j];
+    // Phase 2 (wide): the lo activations once to global (after PART), then warp items
+    // (output d, token tile) over the whole grid, then the quantization as (token, chunk) items.
+    float* LOW = LO + (u64)4 * (HC_LR + HC) * M;
+    for (unsigned int i = blockIdx.x * 512 + tid; i < M * HC_LR; i += nb * 512) {
+        unsigned int t = i / HC_LR, row = i % HC_LR;
+        float v = PART[(u64)row * M + t];
+        for (int k = 1; k < 4; k++) v += PART[((u64)k * rows + row) * M + t];
+        LOW[i] = silu(v * 0.25f);
+    }
+    grid_bar(bar, nb);
+    const unsigned int ntile = (M + HW_T2 - 1) / HW_T2, nw = nb * 16;
+    for (unsigned int it = blockIdx.x * 16 + warp; it < HIDDEN * ntile; it += nw) {
+        unsigned int d = it % HIDDEN, t0 = (it / HIDDEN) * HW_T2, tn = min(M - t0, (unsigned int)HW_T2);
+        const uint4* w = (const uint4*)(Wu + (u64)d * HC * HC_LR);
+        uint4 qv[5];
+        uint2 cv[5];
+        float dv[5];
+        if (Q8) {
+            const unsigned char* base = (const unsigned char*)Wu;
+            const unsigned short* sc = (const unsigned short*)(base + (((u64)HC * HIDDEN * HC_LR + 15) & ~15ull));
+            #pragma unroll
+            for (int j = 0; j < 5; j++) {
+                unsigned int p = (lane >> 2) + 8 * j;
+                cv[j] = __ldg((const uint2*)(base + (u64)d * HC * HC_LR) + lane + 32 * j);
+                dv[j] = h2f(__ldg(sc + (u64)((lane & 3) * HIDDEN + d) * (HC_LR / 32) + p / 4));
             }
-            for (unsigned int t0 = 0; t0 < M; t0 += HW_TT) {
-                unsigned int tn = min(M - t0, (unsigned int)HW_TT);
-                __syncthreads();
-                for (unsigned int i = tid; i < tn * HC_LR; i += 512) {
-                    unsigned int t = t0 + i / HC_LR, row = i % HC_LR;
-                    float v = PART[(u64)row * M + t];
-                    for (int k = 1; k < 4; k++) v += PART[((u64)k * rows + row) * M + t];
-                    lo[i] = silu(v * 0.25f);
-                }
-                __syncthreads();
-                float acc[HW_TT];
+        } else {
+            #pragma unroll
+            for (int j = 0; j < 5; j++) qv[j] = __ldg(w + lane + 32 * j);
+        }
+        float acc[HW_T2];
+        #pragma unroll
+        for (int t = 0; t < HW_T2; t++) acc[t] = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 5; j++) {
+            unsigned int p = (lane >> 2) + 8 * j;
+            if (Q8) {
                 #pragma unroll
-                for (int t = 0; t < HW_TT; t++) acc[t] = 0.0f;
-                #pragma unroll
-                for (int j = 0; j < 5; j++) {
-                    unsigned int p = (lane >> 2) + 8 * j;
-                    if (Q8) {
-                        #pragma unroll
-                        for (int t = 0; t < HW_TT; t++) {
-                            const float4* l4 = (const float4*)(lo + min((unsigned int)t, tn - 1) * HC_LR + p * 8);
-                            acc[t] = dot8q_rn(cv[j], dv[j], l4[0], l4[1], acc[t]);
-                        }
-                        continue;
-                    }
-                    uint4 qq = qv[j];
-                    float wv[8] = {bf(qq.x & 0xffff), bf(qq.x >> 16), bf(qq.y & 0xffff), bf(qq.y >> 16),
-                                   bf(qq.z & 0xffff), bf(qq.z >> 16), bf(qq.w & 0xffff), bf(qq.w >> 16)};
-                    #pragma unroll
-                    for (int t = 0; t < HW_TT; t++) {
-                        const float4* l4 = (const float4*)(lo + min((unsigned int)t, tn - 1) * HC_LR + p * 8);
-                        float4 a = l4[0], b = l4[1];
-                        float s8 = __fmul_rn(wv[0], a.x);
-                        s8 = __fmaf_rn(wv[1], a.y, s8); s8 = __fmaf_rn(wv[2], a.z, s8); s8 = __fmaf_rn(wv[3], a.w, s8);
-                        s8 = __fmaf_rn(wv[4], b.x, s8); s8 = __fmaf_rn(wv[5], b.y, s8); s8 = __fmaf_rn(wv[6], b.z, s8);
-                        s8 = __fmaf_rn(wv[7], b.w, s8);
-                        acc[t] = __fadd_rn(acc[t], s8);
-                    }
+                for (int t = 0; t < HW_T2; t++) {
+                    const float4* l4 = (const float4*)(LOW + (u64)(t0 + min((unsigned int)t, tn - 1)) * HC_LR + p * 8);
+                    acc[t] = dot8q_rn(cv[j], dv[j], l4[0], l4[1], acc[t]);
                 }
-                #pragma unroll
-                for (int t = 0; t < HW_TT; t++) {
-                    float v = acc[t];
-                    v += __shfl_xor_sync(0xffffffffu, v, 4);
-                    v += __shfl_xor_sync(0xffffffffu, v, 8);
-                    v += __shfl_xor_sync(0xffffffffu, v, 16);
-                    float g = sigm(v);
-                    float g1 = __shfl_sync(0xffffffffu, g, 1), g2 = __shfl_sync(0xffffffffu, g, 2), g3 = __shfl_sync(0xffffffffu, g, 3);
-                    if (lane == 0 && t < tn) {
-                        const float* xn = XN + (u64)(t0 + t) * HC * HIDDEN + d;
-                        float x = __fmaf_rn(xn[0], g, 0.0f);
-                        x = __fmaf_rn(xn[HIDDEN], g1, x);
-                        x = __fmaf_rn(xn[2 * HIDDEN], g2, x);
-                        x = __fmaf_rn(xn[3 * HIDDEN], g3, x);
-                        x *= 0.25f;
-                        X[(u64)(t0 + t) * HIDDEN + d] = x;
-                        xs[t0 + t][dl] = x;
-                    }
-                }
+                continue;
+            }
+            uint4 qq = qv[j];
+            float wv[8] = {bf(qq.x & 0xffff), bf(qq.x >> 16), bf(qq.y & 0xffff), bf(qq.y >> 16),
+                           bf(qq.z & 0xffff), bf(qq.z >> 16), bf(qq.w & 0xffff), bf(qq.w >> 16)};
+            #pragma unroll
+            for (int t = 0; t < HW_T2; t++) {
+                const float4* l4 = (const float4*)(LOW + (u64)(t0 + min((unsigned int)t, tn - 1)) * HC_LR + p * 8);
+                float4 a = l4[0], b = l4[1];
+                float s8 = __fmul_rn(wv[0], a.x);
+                s8 = __fmaf_rn(wv[1], a.y, s8); s8 = __fmaf_rn(wv[2], a.z, s8); s8 = __fmaf_rn(wv[3], a.w, s8);
+                s8 = __fmaf_rn(wv[4], b.x, s8); s8 = __fmaf_rn(wv[5], b.y, s8); s8 = __fmaf_rn(wv[6], b.z, s8);
+                s8 = __fmaf_rn(wv[7], b.w, s8);
+                acc[t] = __fadd_rn(acc[t], s8);
             }
         }
-        __syncthreads();
-        if (quant)
-            for (unsigned int t = warp; t < M; t += 16) quant_chunk(xs[t][lane], XQ, M, HIDDEN, t, q, lane);
-        __syncthreads();
+        #pragma unroll
+        for (int t = 0; t < HW_T2; t++) {
+            float v = acc[t];
+            v += __shfl_xor_sync(0xffffffffu, v, 4);
+            v += __shfl_xor_sync(0xffffffffu, v, 8);
+            v += __shfl_xor_sync(0xffffffffu, v, 16);
+            float g = sigm(v);
+            float g1 = __shfl_sync(0xffffffffu, g, 1), g2 = __shfl_sync(0xffffffffu, g, 2), g3 = __shfl_sync(0xffffffffu, g, 3);
+            if (lane == 0 && t < tn) {
+                const float* xn = XN + (u64)(t0 + t) * HC * HIDDEN + d;
+                float x = __fmaf_rn(xn[0], g, 0.0f);
+                x = __fmaf_rn(xn[HIDDEN], g1, x);
+                x = __fmaf_rn(xn[2 * HIDDEN], g2, x);
+                x = __fmaf_rn(xn[3 * HIDDEN], g3, x);
+                x *= 0.25f;
+                X[(u64)(t0 + t) * HIDDEN + d] = x;
+            }
+        }
+    }
+    if (!quant) return;
+    grid_bar(bar, nb);
+    for (unsigned int it = blockIdx.x * 16 + warp; it < M * (HIDDEN / 32); it += nw) {
+        unsigned int t = it / (HIDDEN / 32), q = it % (HIDDEN / 32);
+        quant_chunk(X[(u64)t * HIDDEN + q * 32 + lane], XQ, M, HIDDEN, t, q, lane);
     }
 }
-extern "C" __global__ void __launch_bounds__(512, 2) fl_hc_fusedw(
+extern "C" __global__ void __launch_bounds__(512, HW_MINB) fl_hc_fusedw(
     float* R, const float* Yp, const float* Ip, unsigned int mode, const float* Wn, float eps,
     const float* PARTS, const float* Wr, const float* L, unsigned int stride, int sg,
     const unsigned short* Wd, const unsigned short* Wi, unsigned int rows, const unsigned short* Wu,
@@ -1039,7 +1048,7 @@ extern "C" __global__ void __launch_bounds__(512, 2) fl_hc_fusedw(
     hc_wide_body<false>(R, Yp, Ip, mode, Wn, eps, PARTS, Wr, L, stride, sg, Wd, Wi, rows, Wu, X, XQ, quant,
                         INJ, XN, LO, bar, M);
 }
-extern "C" __global__ void __launch_bounds__(512, 2) fl_hc_fusedw_q8(
+extern "C" __global__ void __launch_bounds__(512, HW_MINB) fl_hc_fusedw_q8(
     float* R, const float* Yp, const float* Ip, unsigned int mode, const float* Wn, float eps,
     const float* PARTS, const float* Wr, const float* L, unsigned int stride, int sg,
     const unsigned short* Wd, const unsigned short* Wi, unsigned int rows, const unsigned short* Wu,

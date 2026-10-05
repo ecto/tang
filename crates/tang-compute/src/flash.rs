@@ -611,7 +611,8 @@ pub fn hc_q8_dequant(bytes: &[u8], n: usize, k: usize, up: bool) -> Vec<f32> {
 /// Words of `hc_read_into` scratch for a window of `t`: normalized streams `[t][HC·HIDDEN]`
 /// and the bottleneck: `[t][HC_LR]` (separate kernels) or the fused read's K-quarter partials `[4][HC_LR + HC][t]`.
 pub fn hc_scratch_words(t: usize) -> usize {
-    t * (HC * HIDDEN + 4 * (HC_LR + HC))
+    // Wide (prefill) windows also keep the lo activations ([t][HC_LR]) after the partials.
+    t * (HC * HIDDEN + 4 * (HC_LR + HC)) + if t > MAX_T { t * HC_LR } else { 0 }
 }
 
 // ---- QSA ----
