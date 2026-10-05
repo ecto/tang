@@ -130,6 +130,8 @@ enum Dw {
     /// The kernel track's native GEMV (`native_linear_out_into`, NatX repack) per segment of a
     /// stacked projection (rows, output column), and the stack's width.
     Kn(Vec<(KSeg, usize, usize)>, usize),
+    /// `TANG_FLASH_KSTACK=1`: all of a Kn weight's segments in one launch (`native_stack_into`).
+    St(tang_compute::flash_native::NatStack<B>),
     Q4x(B),
     Bf16(B),
     Native {
@@ -173,6 +175,10 @@ impl Dw {
                     }
                 }
             }
+            Dw::St(st) => {
+                assert_eq!((st.n, st.k), (n, k), "stacked GEMV shape");
+                dev.native_stack_into(st, x, xq, out, t);
+            }
             Dw::Native { rows, .. } => {
                 assert_eq!(*rows, n, "native GEMV rows");
                 self.native_ptr(dev, nk, dev.buffer_addr(x), dev.buffer_addr(out), t, k, n);
@@ -205,7 +211,7 @@ impl Dw {
     }
 
     fn native(&self) -> bool {
-        matches!(self, Dw::Native { .. } | Dw::Kn(..))
+        matches!(self, Dw::Native { .. } | Dw::Kn(..) | Dw::St(..))
     }
 }
 
@@ -606,7 +612,21 @@ impl Engine {
                         };
                         segs.push((seg, rows, out));
                     }
-                    Dw::Kn(segs, e.n)
+                    let stackable = segs.iter().all(|(s, _, _)| matches!(s, KSeg::Nat(..) | KSeg::Bf(_)));
+                    if stackable && std::env::var("TANG_FLASH_KSTACK").is_ok_and(|v| v == "1") {
+                        use tang_compute::flash_native::NatSeg;
+                        let st: Vec<NatSeg<B>> = segs
+                            .into_iter()
+                            .map(|(s, rows, off)| match s {
+                                KSeg::Nat(w, ty) => NatSeg { ty: Some(ty), w, rows, off },
+                                KSeg::Bf(w) => NatSeg { ty: None, w, rows, off },
+                                KSeg::Own(_) => unreachable!(),
+                            })
+                            .collect();
+                        Dw::St(dev.native_stack(st, e.n, e.k))
+                    } else {
+                        Dw::Kn(segs, e.n)
+                    }
                 }
                 Fmt::Native => {
                     let base = dev.buffer_addr(&w);
