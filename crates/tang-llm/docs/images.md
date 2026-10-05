@@ -32,12 +32,14 @@ step boundary. Latent previews and cancellation inside VAE decode remain unfinis
 The DiT follows the basic single-image path: RMSNorm/SwiGLU blocks, scale/tanh-gate
 modulation, interleaved axis RoPE, image/caption padding and refiners, and joint
 attention. Weights are BF16 on GPU; norms remain F32. The VAE upcasts to F32 and uses
-bounded tiled im2col/GEMM convolutions. Metal fuses DiT RMS normalization with channel
+implicit tiled GEMM convolution on Metal; other devices retain bounded host im2col. Metal fuses DiT RMS normalization with channel
 scale or gated residual, keeping modulation on device. Bounded command batches limit
 temporary retention. `TANG_IMAGE_UNFUSED=1` preserves the earlier path for comparisons.
 Metal also keeps group normalization with compact per-channel affine parameters and
-nearest-neighbor VAE upsampling on device. Packing, final-layer modulation and VAE
-convolution remain unfused.
+nearest-neighbor VAE upsampling on device. Convolution writes NCHW output with bias
+directly, without a full im2col allocation or activation downloads. Decoder block
+boundaries bound retained command-buffer resources. Packing and final-layer modulation
+remain unfused.
 Broad quality and performance evaluation remains unfinished.
 
 ## Trained-weight smoke test
@@ -73,6 +75,14 @@ channel errors below 0.000082. One 512×512 request takes 34.606 seconds and the
 128×128 regression passes at 2.809 seconds. The 82 Metal compute tests pass, as do
 all selected trained VAE boundaries at the existing 1e-3 tolerance (final max error
 2.4e-6) and random VAE references through 256×256 output (final max error 6.2e-6).
+
+Implicit Metal convolution further reduces three resident 320×192 requests to
+5.824/5.905/5.980 seconds and one 512×512 request to 24.534 seconds. All three resident
+PNGs are byte-identical, and 320×192 plus 512×512 outputs are byte-identical to the
+preceding device-normalization implementation. Real Frog 128×128 generation also
+passes at 2.364 seconds. All 83 Metal compute tests pass; selected trained and random
+VAE boundaries retain the preceding errors at unchanged tolerances. Convolution tests
+include 1×1/3×3 kernels, padding, non-aligned tiles and 512-channel layers.
 
 ## Reference validation
 

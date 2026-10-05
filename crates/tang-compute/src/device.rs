@@ -1172,6 +1172,62 @@ pub trait ComputeDevice: Send {
         self.upload(&y)
     }
 
+    /// Stride-one, same-padded odd-kernel convolution. Input/output NCHW;
+    /// weights [output, input, kernel, kernel]. Portable scratch is tiled.
+    fn conv2d_nchw(
+        &self,
+        x: &Self::Buffer,
+        weight: &Self::Buffer,
+        bias: &Self::Buffer,
+        input: usize,
+        output: usize,
+        h: usize,
+        w: usize,
+        kernel: usize,
+    ) -> Self::Buffer {
+        assert!(
+            input > 0 && output > 0 && h > 0 && w > 0 && kernel > 0 && !kernel.is_multiple_of(2)
+        );
+        assert_eq!(x.len(), input * h * w);
+        assert_eq!(weight.len(), output * input * kernel * kernel);
+        assert_eq!(bias.len(), output);
+        let data = self.download(x);
+        let n = h * w;
+        let k = input * kernel * kernel;
+        let pad = kernel / 2;
+        let mut result = vec![0.; n * output];
+        for start in (0..n).step_by(1024) {
+            let rows = (n - start).min(1024);
+            let mut columns = vec![0.; rows * k];
+            for r in 0..rows {
+                let y = (start + r) / w;
+                let xx = (start + r) % w;
+                let mut col = r * k;
+                for c in 0..input {
+                    for dy in 0..kernel {
+                        for dx in 0..kernel {
+                            let yy = y as isize + dy as isize - pad as isize;
+                            let xxx = xx as isize + dx as isize - pad as isize;
+                            if yy >= 0 && yy < h as isize && xxx >= 0 && xxx < w as isize {
+                                columns[col] = data[(c * h + yy as usize) * w + xxx as usize];
+                            }
+                            col += 1;
+                        }
+                    }
+                }
+            }
+            let product = self.linear(&self.upload(&columns), weight, rows, k, output);
+            let product = self.bias_add(&product, bias, rows * output, output);
+            let values = self.download(&product);
+            for r in 0..rows {
+                for c in 0..output {
+                    result[c * n + start + r] = values[r * output + c];
+                }
+            }
+        }
+        self.upload(&result)
+    }
+
     /// NCHW group normalization with compact per-channel affine parameters.
     fn group_norm_affine(
         &self,

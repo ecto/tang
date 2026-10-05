@@ -297,3 +297,51 @@ kernel void matmul_naive(
     C[row * N + col] = sum;
 }
 "#;
+
+/// Implicit im2col GEMM with bounded threadgroup tiles and direct NCHW output.
+/// Four SIMD groups compute a 32-spatial by 32-output-channel tile.
+pub const CONV2D_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void conv2d_nchw(
+    device const float* x [[buffer(0)]], device const float* weight [[buffer(1)]],
+    device const float* bias [[buffer(2)]], device float* out [[buffer(3)]],
+    device const uint* p [[buffer(4)]], uint2 tile [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+    uint input = p[0], output = p[1], h = p[2], w = p[3], ks = p[4];
+    uint spatial = h*w, kk = ks*ks, k = input*kk;
+    uint row_base = tile.y*32, col_base = tile.x*32;
+    threadgroup float a[32*8], b[32*8], result[32*32];
+    simdgroup_float8x8 acc[4];
+    for (uint j = 0; j < 4; j++) acc[j] = simdgroup_float8x8(0);
+    for (uint kb = 0; kb < k; kb += 8) {
+        for (uint i = tid; i < 256; i += 128) {
+            uint row = row_base+i/8, kval = kb+i%8, col = col_base+i/8;
+            float v = 0;
+            if (row < spatial && kval < k) {
+                int yy = int(row/w)+int((kval%kk)/ks)-int(ks/2);
+                int xx = int(row%w)+int(kval%ks)-int(ks/2);
+                if (yy >= 0 && yy < int(h) && xx >= 0 && xx < int(w))
+                    v = x[(kval/kk*h+uint(yy))*w+uint(xx)];
+            }
+            a[i] = v;
+            b[i] = col < output && kval < k ? weight[col*k+kval] : 0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 av;
+        simdgroup_load(av, a+sg*64, 8);
+        for (uint j = 0; j < 4; j++) {
+            simdgroup_float8x8 bv;
+            simdgroup_load(bv, b+j*64, 8, ulong2(0), true);
+            simdgroup_multiply_accumulate(acc[j], av, bv, acc[j]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint j = 0; j < 4; j++) simdgroup_store(acc[j], result+sg*8*32+j*8, 32);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < 1024; i += 128) {
+        uint row = row_base+i/32, col = col_base+i%32;
+        if (row < spatial && col < output) out[col*spatial+row] = result[i]+bias[col];
+    }
+}
+"#;

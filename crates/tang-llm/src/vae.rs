@@ -1,6 +1,5 @@
-//! FLUX/Z-Image VAE decoder. v0 uses bounded, tiled im2col + device linear.
-//! Convolution packing remains tiled on the host. Metal normalization and nearest
-//! upsampling stay on device; convolution scratch is bounded independently of image size.
+//! FLUX/Z-Image VAE decoder. Metal uses implicit tiled convolution, normalization
+//! and nearest upsampling on device. Portable convolution uses bounded host im2col.
 use crate::weights::Weights;
 use anyhow::{ensure, Result};
 use serde::Deserialize;
@@ -83,41 +82,16 @@ fn norm<D: ComputeDevice>(
 }
 impl<B: ComputeBuffer> Conv<B> {
     fn run<D: ComputeDevice<Buffer = B>>(&self, dev: &D, x: &B, h: usize, w: usize) -> B {
-        let data = dev.download(x);
-        let n = h * w;
-        let k = self.input * self.kernel * self.kernel;
-        let pad = self.kernel / 2;
-        let mut result = vec![0.; n * self.output];
-        for start in (0..n).step_by(1024) {
-            let rows = (n - start).min(1024);
-            let mut columns = vec![0.; rows * k];
-            for r in 0..rows {
-                let y = (start + r) / w;
-                let xx = (start + r) % w;
-                let mut col = r * k;
-                for c in 0..self.input {
-                    for dy in 0..self.kernel {
-                        for dx in 0..self.kernel {
-                            let yy = y as isize + dy as isize - pad as isize;
-                            let xxx = xx as isize + dx as isize - pad as isize;
-                            if yy >= 0 && yy < h as isize && xxx >= 0 && xxx < w as isize {
-                                columns[col] = data[(c * h + yy as usize) * w + xxx as usize];
-                            }
-                            col += 1;
-                        }
-                    }
-                }
-            }
-            let product = dev.linear(&dev.upload(&columns), &self.weight, rows, k, self.output);
-            let product = dev.bias_add(&product, &self.bias, rows * self.output, self.output);
-            let values = dev.download(&product);
-            for r in 0..rows {
-                for c in 0..self.output {
-                    result[c * n + start + r] = values[r * self.output + c];
-                }
-            }
-        }
-        dev.upload(&result)
+        dev.conv2d_nchw(
+            x,
+            &self.weight,
+            &self.bias,
+            self.input,
+            self.output,
+            h,
+            w,
+            self.kernel,
+        )
     }
 }
 impl<B: ComputeBuffer> Res<B> {
@@ -326,14 +300,19 @@ impl<B: ComputeBuffer> Vae<B> {
         let mut x = self.input.run(dev, &dev.upload(latent), h, w);
         trace("conv_in", &x);
         x = self.mid1.run(dev, &x, h, w, groups);
+        dev.sync();
         trace("mid.resnets.0", &x);
         x = self.attention.run(dev, &x, h, w, groups);
+        dev.sync();
         trace("mid.attention", &x);
         x = self.mid2.run(dev, &x, h, w, groups);
+        dev.sync();
         trace("mid.resnets.1", &x);
         for (i, up) in self.up.iter().enumerate() {
             for (j, r) in up.res.iter().enumerate() {
                 x = r.run(dev, &x, h, w, groups);
+                // Bound retained GPU activations now that convolution needs no host sync.
+                dev.sync();
                 trace(&format!("up.{i}.resnets.{j}"), &x);
             }
             if let Some(c) = &up.upsample {
@@ -341,6 +320,7 @@ impl<B: ComputeBuffer> Vae<B> {
                 h *= 2;
                 w *= 2;
                 x = c.run(dev, &enlarged, h, w);
+                dev.sync();
                 trace(&format!("up.{i}.upsample"), &x);
             }
         }

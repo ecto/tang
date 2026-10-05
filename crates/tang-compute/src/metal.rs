@@ -1987,6 +1987,48 @@ kernel void embedding(
         }
     }
 
+    fn conv2d_nchw(
+        &self,
+        x: &MetalBuffer,
+        weight: &MetalBuffer,
+        bias: &MetalBuffer,
+        input: usize,
+        output: usize,
+        h: usize,
+        w: usize,
+        kernel: usize,
+    ) -> MetalBuffer {
+        assert!(
+            input > 0 && output > 0 && h > 0 && w > 0 && kernel > 0 && !kernel.is_multiple_of(2)
+        );
+        assert_eq!(x.len(), input * h * w);
+        assert_eq!(weight.len(), output * input * kernel * kernel);
+        assert_eq!(bias.len(), output);
+        for b in [x, weight, bias] {
+            assert_eq!(b.kind, Kind::F32);
+        }
+        let pipeline = self.get_pipeline(matmul_msl::CONV2D_MSL, "conv2d_nchw");
+        let out = self.make_buffer_empty(output * h * w * 4);
+        let params = self.make_buffer_u32(&[
+            input as u32,
+            output as u32,
+            h as u32,
+            w as u32,
+            kernel as u32,
+        ]);
+        self.dispatch_groups(
+            &pipeline,
+            &[&x.buffer, &weight.buffer, &bias.buffer, &out, &params],
+            (output.div_ceil(32), (h * w).div_ceil(32)),
+            128,
+        );
+        MetalBuffer {
+            buffer: out,
+            len: output * h * w,
+            kind: Kind::F32,
+        }
+    }
+
     fn group_norm_affine(
         &self,
         x: &MetalBuffer,
@@ -3410,6 +3452,56 @@ mod tests {
                     .flat_map(|&t| all[t as usize * k..(t as usize + 1) * k].to_vec())
                     .collect();
                 assert_eq!(got, want);
+            }
+        }
+    }
+
+    #[test]
+    fn metal_implicit_convolution_matches_cpu_at_edges_and_vae_widths() {
+        let metal = get_metal_device();
+        let cpu = CpuDevice::new();
+        for (input, output, h, w, kernel) in [
+            (3, 5, 3, 7, 1),
+            (3, 5, 3, 7, 3),
+            (2, 1, 1, 1, 3),
+            (16, 512, 16, 16, 3),
+            (512, 512, 4, 4, 3),
+            (128, 3, 17, 19, 3),
+        ] {
+            let x: Vec<f32> = (0..input * h * w)
+                .map(|i| ((i * 17) % 97) as f32 / 41. - 1.)
+                .collect();
+            let weight: Vec<f32> = (0..output * input * kernel * kernel)
+                .map(|i| {
+                    (((i * 13) % 89) as f32 / 47. - 1.) / ((input * kernel * kernel) as f32).sqrt()
+                })
+                .collect();
+            let bias: Vec<f32> = (0..output).map(|i| (i % 7) as f32 / 7. - 0.5).collect();
+            let actual = metal.download(&metal.conv2d_nchw(
+                &metal.upload(&x),
+                &metal.upload(&weight),
+                &metal.upload(&bias),
+                input,
+                output,
+                h,
+                w,
+                kernel,
+            ));
+            let expected = cpu.download(&cpu.conv2d_nchw(
+                &cpu.upload(&x),
+                &cpu.upload(&weight),
+                &cpu.upload(&bias),
+                input,
+                output,
+                h,
+                w,
+                kernel,
+            ));
+            for (i, (a, b)) in actual.iter().zip(&expected).enumerate() {
+                assert!(
+                    a.is_finite() && (a - b).abs() < 3e-5 * b.abs().max(1.),
+                    "{input}->{output} {h}x{w} kernel {kernel}, index {i}: {a} vs {b}"
+                );
             }
         }
     }
