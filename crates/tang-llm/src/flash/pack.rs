@@ -27,7 +27,7 @@ use tang_compute::flash::shape::*;
 use tang_compute::flash::{self as fl, ExpertBlob};
 
 /// Bump when any packed format changes.
-pub const FORMAT: &str = "flash-pack-v1";
+pub const FORMAT: &str = "flash-pack-v2";
 
 /// The expert blobs' file; the name carries tang-compute's `ExpertBlob` layout version
 /// (v2: 32-byte groups of 16-row tiles).
@@ -46,6 +46,8 @@ pub enum Fmt {
     Q2Raw,
     /// Native GGUF tensors for `fe_gemv` (`Entry::segs` says where each starts).
     Native,
+    /// A hyper-connection weight as [`fl::hc_q8`] bytes (int8 codes, then f16 scales).
+    HcQ8,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -246,6 +248,9 @@ enum Job {
     Q2(String),
     /// The hyper-connection up projection, bf16, repacked by `hc_up_repack`.
     HcUp(String),
+    /// A hyper-connection weight quantized by [`fl::hc_q8`] (`up`: the up projection's codes
+    /// in the repacked order). Loaded instead of the bf16 copy unless `TANG_FLASH_HC_Q8=0`.
+    HcQ8 { name: String, up: bool },
 }
 
 fn jobs(g: &Gguf, n_layer: usize, is_rec: &[bool], ple_layer: Option<usize>) -> Result<Vec<(String, Job)>> {
@@ -260,6 +265,11 @@ fn jobs(g: &Gguf, n_layer: usize, is_rec: &[bool], ple_layer: Option<usize>) -> 
             },
         ));
         v.push((format!("{key}.up"), Job::HcUp(format!("{pre}up.weight"))));
+        for (part, up) in [("down", false), ("up", true), ("inject", false)] {
+            if part != "inject" || inject {
+                v.push((format!("{key}.{part}.q8"), Job::HcQ8 { name: format!("{pre}{part}.weight"), up }));
+            }
+        }
         if inject {
             v.push((
                 format!("{key}.inject"),
@@ -530,6 +540,15 @@ fn run_job_plain(g: &Gguf, job: &Job) -> Result<(Fmt, usize, usize, Vec<u8>)> {
             let r = fl::hc_up_repack(&bits);
             let (n, k) = nk(t);
             (Fmt::Bf16, n, k, r.iter().flat_map(|v| v.to_le_bytes()).collect())
+        }
+        Job::HcQ8 { name, up } => {
+            let t = g.info(name)?;
+            let bits: Vec<u16> = bf16_of(g, t)?
+                .chunks(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            let (n, k) = nk(t);
+            (Fmt::HcQ8, n, k, fl::hc_q8(&bits, n, k, *up))
         }
         Job::Q4Stack { names, rows, class, .. } => {
             let mut w = Vec::new();
