@@ -12,6 +12,7 @@ pub mod dit;
 pub mod draft;
 pub mod engine;
 pub mod image_pipeline;
+pub mod image_preview;
 pub mod image_server;
 pub mod kvstore;
 pub mod model;

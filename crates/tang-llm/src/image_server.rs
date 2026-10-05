@@ -27,7 +27,7 @@ use tang_compute::ComputeDevice;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 enum Out {
-    Progress(usize, usize),
+    Progress(crate::image_pipeline::Progress),
     Images(Vec<Generated>),
     Error(String),
 }
@@ -39,17 +39,26 @@ struct Job {
 struct App {
     jobs: std_mpsc::SyncSender<Job>,
     resident: Arc<AtomicBool>,
+    previews: bool,
 }
 
 #[derive(Clone)]
 pub(crate) struct ImageModel {
     pub path: PathBuf,
     pub resident: Arc<AtomicBool>,
+    previews: bool,
+}
+fn capabilities(previews: bool) -> Vec<&'static str> {
+    let mut caps = vec!["image_generation", "seed", "steps", "stream_progress"];
+    if previews {
+        caps.push("latent_previews");
+    }
+    caps
 }
 impl ImageModel {
     pub fn json(&self) -> Value {
         json!({"id":"z-image-turbo","object":"model","type":"image",
-            "capabilities":["image_generation","seed","steps","stream_progress"],
+            "capabilities":capabilities(self.previews),
             "resident":self.resident.load(Ordering::Relaxed)})
     }
 }
@@ -64,7 +73,7 @@ fn images_value(images: Vec<Generated>) -> Value {
 }
 async fn models(State(app): State<App>) -> Json<Value> {
     Json(
-        json!({"data":[{"id":"z-image-turbo","object":"model","type":"image","resident":app.resident.load(Ordering::Relaxed)}]}),
+        json!({"data":[{"id":"z-image-turbo","object":"model","type":"image","capabilities":capabilities(app.previews),"resident":app.resident.load(Ordering::Relaxed)}]}),
     )
 }
 async fn generate(
@@ -80,6 +89,16 @@ async fn generate(
             .into_response();
     }
     let stream = request.stream || headers.get("x-frog-progress").is_some_and(|v| v == "sse");
+    if request.preview && !stream {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":{"message":"previews require SSE streaming"}})),
+        )
+            .into_response();
+    }
+    if request.preview && !app.previews {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error":{"message":"latent previews unavailable; calibrate the installed VAE explicitly"}}))).into_response();
+    }
     let (tx, mut rx) = mpsc::unbounded_channel();
     if let Err(error) = app.jobs.try_send(Job { request, tx }) {
         let (status, message) = match error {
@@ -95,9 +114,14 @@ async fn generate(
         use tokio_stream::StreamExt;
         return Sse::new(events.map(|out| {
             Ok::<_, Infallible>(match out {
-                Out::Progress(step, of) => Event::default()
-                    .event("progress")
-                    .data(json!({"step":step,"of":of}).to_string()),
+                Out::Progress(progress) => {
+                    let mut value = json!({"step":progress.step,"of":progress.of,"image_index":progress.image_index});
+                    if let Some(png) = progress.preview_png {
+                        value["preview_b64"] = json!(STANDARD.encode(png));
+                        value["preview_kind"] = json!("approximate_latent");
+                    }
+                    Event::default().event("progress").data(value.to_string())
+                },
                 Out::Images(images) => Event::default()
                     .event("result")
                     .data(images_value(images).to_string()),
@@ -118,7 +142,7 @@ async fn generate(
                 )
                     .into_response()
             }
-            Out::Progress(_, _) => {}
+            Out::Progress(_) => {}
         }
     }
     (
@@ -132,10 +156,12 @@ where
     D: ComputeDevice + 'static,
     F: Fn() -> Result<D> + Send + 'static,
 {
+    let previews = root.join("preview.json").is_file();
     let (jobs, rx) = std_mpsc::sync_channel::<Job>(8);
     let resident = Arc::new(AtomicBool::new(false));
     let worker_resident = resident.clone();
     let model = ImageModel {
+        previews,
         path: root.clone(),
         resident: resident.clone(),
     };
@@ -168,8 +194,8 @@ where
             let result = pipeline
                 .as_ref()
                 .unwrap()
-                .generate(&job.request, &mut |step, of| {
-                    tx.send(Out::Progress(step, of)).is_ok()
+                .generate(&job.request, &mut |progress| {
+                    tx.send(Out::Progress(progress)).is_ok()
                 });
             let out = match result {
                 Ok(images) => Out::Images(images),
@@ -178,7 +204,11 @@ where
             let _ = job.tx.send(out);
         }
     });
-    let app = App { jobs, resident };
+    let app = App {
+        jobs,
+        resident,
+        previews,
+    };
     let router = Router::new()
         .route("/v1/images/generations", post(generate))
         .with_state(app.clone());
@@ -220,11 +250,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn preview_capability_requires_installed_calibration() {
+        assert!(!capabilities(false).contains(&"latent_previews"));
+        assert!(capabilities(true).contains(&"latent_previews"));
+    }
+
+    #[test]
+    fn preview_without_stream_is_rejected_before_queueing() {
+        let (jobs, receiver) = std_mpsc::sync_channel(8);
+        let app = App {
+            jobs,
+            resident: Arc::new(AtomicBool::new(false)),
+            previews: false,
+        };
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let request = Request {
+                model: "z-image-turbo".into(),
+                prompt: "frog".into(),
+                size: "64x64".into(),
+                n: 1,
+                seed: Some(42),
+                steps: 8,
+                stream: false,
+                preview: true,
+                response_format: None,
+            };
+            let response = generate(
+                State(app.clone()),
+                axum::http::HeaderMap::new(),
+                Json(request.clone()),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let mut streamed = request;
+            streamed.stream = true;
+            let response = generate(State(app), axum::http::HeaderMap::new(), Json(streamed)).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(receiver.try_recv().is_err());
+        });
+    }
+
+    #[test]
     fn full_image_queue_returns_429_instead_of_growing_without_bound() {
         let (jobs, _receiver) = std_mpsc::sync_channel(8);
         let app = App {
             jobs,
             resident: Arc::new(AtomicBool::new(false)),
+            previews: false,
         };
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
@@ -236,6 +308,7 @@ mod tests {
                 seed: Some(42),
                 steps: 8,
                 stream: true,
+                preview: false,
                 response_format: None,
             };
             let mut accepted = Vec::new();

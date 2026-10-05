@@ -157,6 +157,9 @@ fn main() -> Result<()> {
         [c, d, ..] => (c.as_str(), PathBuf::from(d)),
         _ => bail!("usage: tang-llm <logits|generate> <model-dir> <ids...> [-n N] [--f32]"),
     };
+    if cmd == "calibrate-image-preview" {
+        return on_backend!(backend, calibrate_image_preview(&args[1..]));
+    }
     if args.first().map(String::as_str) == Some("serve-images") {
         return on_backend!(backend, serve_images(&args[1..]));
     }
@@ -978,5 +981,33 @@ fn serve_images<D: ComputeDevice + 'static, F: Fn() -> Result<D> + Send + 'stati
 }
 fn ensure_nonempty_key(key: &str) -> Result<()> {
     anyhow::ensure!(!key.trim().is_empty(), "empty image server API key");
+    Ok(())
+}
+
+fn calibrate_image_preview<D: ComputeDevice, F: Fn() -> Result<D>>(
+    make: F,
+    args: &[String],
+) -> Result<()> {
+    use std::io::Write;
+    anyhow::ensure!(
+        args.len() == 2,
+        "calibrate-image-preview <vae-dir> <new-output.json>"
+    );
+    let output = PathBuf::from(&args[1]);
+    anyhow::ensure!(!output.exists(), "preview output already exists");
+    let record = tang_llm::image_preview::calibrate(make()?, std::path::Path::new(&args[0]))?;
+    let bytes = serde_json::to_vec_pretty(&record)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&output)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    println!(
+        "preview calibration saved to {}; held-out MSE {:.6}, constant baseline {:.6}",
+        output.display(),
+        record.held_out_mse,
+        record.constant_baseline_mse
+    );
     Ok(())
 }

@@ -30,6 +30,8 @@ pub struct Request {
     pub steps: usize,
     #[serde(default)]
     pub stream: bool,
+    #[serde(default)]
+    pub preview: bool,
     pub response_format: Option<String>,
 }
 fn default_size() -> String {
@@ -83,6 +85,13 @@ pub struct Generated {
     pub height: usize,
     pub model_hash: String,
 }
+pub struct Progress {
+    pub step: usize,
+    pub of: usize,
+    pub image_index: usize,
+    pub preview_png: Option<Vec<u8>>,
+}
+
 pub struct Pipeline<D: ComputeDevice> {
     pub encoder: Model<D>,
     dit: DiT<D::Buffer>,
@@ -91,6 +100,7 @@ pub struct Pipeline<D: ComputeDevice> {
     template: Template,
     shift: f32,
     model_hash: String,
+    preview: Result<Option<crate::image_preview::Projection>, String>,
 }
 impl<D: ComputeDevice> Pipeline<D> {
     pub fn load(dev: D, root: &Path) -> Result<Self> {
@@ -119,6 +129,24 @@ impl<D: ComputeDevice> Pipeline<D> {
         );
         let shift = cfg["shift"].as_f64().context("scheduler shift missing")? as f32;
         let model_hash = fingerprint(root)?;
+        let preview = (|| -> Result<Option<crate::image_preview::Projection>> {
+            let path = root.join("preview.json");
+            if !path.exists() {
+                return Ok(None);
+            }
+            ensure!(
+                path.metadata()?.len() <= 16 * 1024,
+                "preview calibration exceeds limit"
+            );
+            let calibration: crate::image_preview::Calibration =
+                serde_json::from_slice(&std::fs::read(path)?)?;
+            calibration.validate(
+                &vae.cfg,
+                &crate::image_preview::vae_hash(&root.join("vae"))?,
+            )?;
+            Ok(Some(calibration.projection))
+        })()
+        .map_err(|e| format!("{e:#}"));
         Ok(Self {
             encoder,
             dit,
@@ -127,14 +155,28 @@ impl<D: ComputeDevice> Pipeline<D> {
             template,
             shift,
             model_hash,
+            preview,
         })
     }
     pub fn generate(
         &self,
         request: &Request,
-        on: &mut dyn FnMut(usize, usize) -> bool,
+        on: &mut dyn FnMut(Progress) -> bool,
     ) -> Result<Vec<Generated>> {
         let (width, height) = request.dimensions()?;
+        let preview = if request.preview {
+            Some(
+                self.preview
+                    .as_ref()
+                    .map_err(|e| anyhow::anyhow!("preview calibration: {e}"))?
+                    .as_ref()
+                    .context(
+                        "preview calibration unavailable; run calibrate-image-preview explicitly",
+                    )?,
+            )
+        } else {
+            None
+        };
         let dev = &self.encoder.dev;
         let prompt = self.template.render(
             &json!([{"role":"user","content":request.prompt}]),
@@ -166,7 +208,16 @@ impl<D: ComputeDevice> Pipeline<D> {
                 .collect();
             for step in 0..request.steps {
                 ensure!(
-                    on(index * request.steps + step, request.n * request.steps),
+                    on(Progress {
+                        step: index * request.steps + step,
+                        of: request.n * request.steps,
+                        image_index: index,
+                        preview_png: if step > 0 {
+                            preview.map(|p| p.png(&latent, h, w)).transpose()?
+                        } else {
+                            None
+                        }
+                    }),
                     "generation cancelled"
                 );
                 let prediction = self.dit.forward(
@@ -186,7 +237,12 @@ impl<D: ComputeDevice> Pipeline<D> {
                 );
             }
             ensure!(
-                on((index + 1) * request.steps, request.n * request.steps),
+                on(Progress {
+                    step: (index + 1) * request.steps,
+                    of: request.n * request.steps,
+                    image_index: index,
+                    preview_png: preview.map(|p| p.png(&latent, h, w)).transpose()?
+                }),
                 "generation cancelled"
             );
             let scaled: Vec<_> = latent
@@ -320,12 +376,12 @@ fn check_memory<D: ComputeDevice>(root: &Path, dev: &D) -> Result<()> {
     Ok(())
 }
 /// Seeded SplitMix64 + Box-Muller; explicitly independent of PyTorch's RNG stream.
-struct Normal {
+pub(crate) struct Normal {
     state: u64,
     spare: Option<f32>,
 }
 impl Normal {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self {
             state: seed,
             spare: None,
@@ -339,7 +395,7 @@ impl Normal {
         z ^= z >> 31;
         ((z >> 11) as f64 + 0.5) / (1u64 << 53) as f64
     }
-    fn next(&mut self) -> f32 {
+    pub(crate) fn next(&mut self) -> f32 {
         if let Some(v) = self.spare.take() {
             return v;
         }
