@@ -396,17 +396,12 @@ impl<D: ComputeDevice> Model<D> {
         for (r, &(start, len, img)) in pieces.iter().enumerate() {
             let seg = self.dev.slice_buffer(&x, start * h, len * h);
             let last = r + 1 == pieces.len();
-            let logits =
-                self.forward_hidden(seg, &tokens[start..start + len], cache, all || last, !img)?;
+            let logits = self.forward_hidden(seg, &tokens[start..start + len], cache, all, !img)?;
             if all {
                 out.extend(logits);
             } else if last {
                 out = logits;
             }
-        }
-        if !all {
-            let v = self.cfg.vocab_size;
-            out = out.split_off(out.len() - v);
         }
         Ok(out)
     }
@@ -550,9 +545,15 @@ impl<D: ComputeDevice> Model<D> {
                 d = dev.rms_norm(&d, n, s, h, eps);
             }
             *x = dev.add_tensors_buf(x, &d, s * h);
-            // Let the GPU start on what's encoded so far.
+            // Large multimodal prefill pieces retain every temporary until their
+            // command buffers are released. Bound that retention across deep models;
+            // small text/decode batches keep the asynchronous path.
             if l % 4 == 3 {
-                dev.flush();
+                if s > 128 {
+                    dev.sync();
+                } else {
+                    dev.flush();
+                }
             }
         }
         Ok(())
@@ -593,8 +594,7 @@ mod conditioning_tests {
     use super::*;
     use tang_compute::CpuDevice;
 
-    #[test]
-    fn penultimate_is_pre_final_layer_without_norm_or_head() {
+    fn tiny_model() -> Model<CpuDevice> {
         let dev = CpuDevice::new();
         let cfg = Config::from_json(br#"{"model_type":"qwen3","hidden_size":4,"intermediate_size":4,"num_hidden_layers":2,"num_attention_heads":1,"num_key_value_heads":1,"vocab_size":2,"rms_norm_eps":0.000001,"rope_theta":10000}"#).unwrap();
         let layer = |scale: f32| Layer {
@@ -617,8 +617,8 @@ mod conditioning_tests {
             rope: 0,
         };
         let layers = vec![layer(1.), layer(2.)];
-        let (cos, sin) = rope_tables(4, 32, 10000., 1.);
-        let model = Model {
+        let (cos, sin) = rope_tables(4, 2048, 10000., 1.);
+        Model {
             cfg,
             embed: dev.upload(&[1., 2., 3., 4., 4., 3., 2., 1.]),
             layers,
@@ -627,10 +627,15 @@ mod conditioning_tests {
             ropes: vec![(dev.upload(&cos), dev.upload(&sin))],
             embed_scale: None,
             vision: None,
-            max_ctx: 32,
+            max_ctx: 2048,
             pool: new_pool(2, 4, false, usize::MAX),
             dev,
-        };
+        }
+    }
+
+    #[test]
+    fn penultimate_is_pre_final_layer_without_norm_or_head() {
+        let model = tiny_model();
         let result = model
             .dev
             .download(&model.encode_penultimate(&[0, 1]).unwrap());
@@ -648,6 +653,42 @@ mod conditioning_tests {
             vec![0.; 4]
         );
         assert!(model.encode_penultimate(&[]).is_err());
-        assert!(model.encode_penultimate(&[0; 33]).is_err());
+        assert!(model.encode_penultimate(&[0; 2049]).is_err());
+    }
+
+    #[test]
+    fn multimodal_last_logits_match_all_logits_across_text_chunks() {
+        let mut model = tiny_model();
+        model.cfg.vocab_size = 3;
+        model.cfg.image_token = Some(2);
+        model.embed = model
+            .dev
+            .upload(&[1., 2., 3., 4., 4., 3., 2., 1., 0., 0., 0., 0.]);
+        model.lm_head = Some(
+            model
+                .dev
+                .upload(&[1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0.]),
+        );
+        model.vision = Some(crate::vision::Vision::encoded_fixture(&model.dev, 4));
+        let mut tokens: Vec<u32> = (0..600).map(|i| i % 2).collect();
+        tokens.splice(590..590, [2; 4]);
+        tokens.splice(50..50, [2; 4]);
+        let features = [model.dev.upload(&[6.; 16]), model.dev.upload(&[9.; 16])];
+        let mut full_cache = model.new_cache();
+        let all = model
+            .forward_images(&tokens, &features, &mut full_cache, true)
+            .unwrap();
+        let mut last_cache = model.new_cache();
+        let last = model
+            .forward_images(&tokens, &features, &mut last_cache, false)
+            .unwrap();
+        assert_eq!(all.len(), tokens.len() * 3);
+        assert_eq!(last.len(), 3);
+        assert!(last
+            .iter()
+            .zip(&all[all.len() - 3..])
+            .all(|(a, b)| (a - b).abs() < 1e-5));
+        assert_eq!(full_cache.tokens, tokens);
+        assert_eq!(last_cache.tokens, tokens);
     }
 }

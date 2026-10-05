@@ -36,6 +36,8 @@ format correctness does not establish task completion.
 Inter-token indentation is limited to eight whitespace characters. This prevents
 a model from repeatedly generating whitespace before a required value until its
 token budget expires. String contents retain ordinary JSON whitespace and escapes.
+The compiler emits object keys in schema property order. Include requested optional
+fields before proceeding to later properties; skipped fields cannot be revisited.
 
 The [llguidance Rust example](https://github.com/guidance-ai/llguidance/blob/main/sample_parser/src/minimal.rs)
 shows the underlying mask/sample/consume API.
