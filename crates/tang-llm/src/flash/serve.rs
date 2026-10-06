@@ -334,7 +334,7 @@ impl FlashServe {
             wide: std::env::var("TANG_FLASH_WIDE")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
+                .unwrap_or(64),
             disk: s.disk.clone(),
             dump: s.dump.clone(),
             shape,
