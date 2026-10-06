@@ -36,6 +36,10 @@ fn req(user: &str, key: &str, max: usize) -> Request {
         response_schema: None,
         think: Some(false),
         thinking_budget: None,
+        temperature_set: true,
+        top_k_set: false,
+        top_p_set: false,
+        presence_penalty: None,
         sampling: Sampling {
             temperature: 0.0,
             ..Default::default()

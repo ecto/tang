@@ -1,0 +1,21 @@
+[package]
+name = "tang-moe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Offloaded MoE runtime substrate: pinned host arena, VRAM expert cache, pointer table"
+repository.workspace = true
+publish = false
+
+[features]
+default = []
+cuda = ["dep:cudarc"]
+
+[dependencies]
+libc = "0.2"
+cudarc = { version = "0.16", features = ["nvrtc", "cuda-version-from-build-system"], optional = true }
+
+[[bin]]
+name = "tang-moe-bench"
+required-features = ["cuda"]

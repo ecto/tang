@@ -10,6 +10,9 @@
 //! between chunks when an interactive request is waiting (see [`crate::queue`]).
 //!
 //! The model lives on one worker thread (GPU state isn't shareable); requests queue for it.
+//! Flash GGUF serving uses the same queue and HTTP routes, with prompt rendering on the
+//! worker because it depends on prior generated tokens. Its model is fixed: load/unload
+//! return 400, background prefills do not yield, and dense KV block reporting is unavailable.
 //!
 //! With an API key, every route but `/health` wants `Authorization: Bearer <key>`.
 
@@ -104,7 +107,7 @@ struct Loaded {
     /// Its weights' estimated device memory.
     need: Option<Need>,
     rates: Rates,
-    prompter: Prompter,
+    prompter: Option<Prompter>,
     kv: Kv,
 }
 
@@ -143,6 +146,114 @@ struct App {
     node: Arc<Node>,
 }
 
+/// A model owned by the server's worker thread. Backends may keep prompt rendering on
+/// that thread when it depends on mutable generation history (as Flash does).
+pub trait Backend {
+    fn complete(
+        &mut self,
+        req: &Request,
+        on: &mut dyn FnMut(Piece) -> bool,
+    ) -> anyhow::Result<(Finish, Usage)>;
+    fn context_window(&self) -> usize;
+    fn vision(&self) -> bool {
+        false
+    }
+    fn prompter(&self) -> Option<Prompter> {
+        None
+    }
+    fn model_path(&self, spec: &str) -> anyhow::Result<PathBuf> {
+        crate::resolve_model(spec)
+    }
+    /// Backends with a fixed GGUF/settings bundle do not support model swapping.
+    fn swappable() -> bool {
+        false
+    }
+    fn complete_with(
+        &mut self,
+        req: &Request,
+        _prompt: Option<(String, Vec<u32>)>,
+        on: &mut dyn FnMut(Piece) -> bool,
+        _ctl: &mut dyn Control,
+    ) -> anyhow::Result<Outcome> {
+        self.complete(req, on).map(|(f, u)| Outcome::Done(f, u))
+    }
+    fn block_hashes(&self) -> Vec<u64> {
+        Vec::new()
+    }
+    fn cached_keys(&self) -> Vec<(String, usize)> {
+        Vec::new()
+    }
+    fn kv_store_dir(&self) -> Option<&std::path::Path> {
+        None
+    }
+    fn kv_bytes(&self) -> usize {
+        0
+    }
+    fn flush_kv_store(&self) {}
+    /// Runs after the reply goes out, including failed requests.
+    fn after(&mut self, _req: &Request, _result: &anyhow::Result<(Finish, Usage)>) {}
+}
+
+impl<D: ComputeDevice + 'static> Backend for Engine<D> {
+    fn complete(
+        &mut self,
+        req: &Request,
+        on: &mut dyn FnMut(Piece) -> bool,
+    ) -> anyhow::Result<(Finish, Usage)> {
+        Engine::complete(self, req, on)
+    }
+    fn context_window(&self) -> usize {
+        Engine::context_window(self)
+    }
+    fn vision(&self) -> bool {
+        self.model.vision.is_some()
+    }
+    fn prompter(&self) -> Option<Prompter> {
+        Some(Engine::prompter(self))
+    }
+    fn swappable() -> bool {
+        true
+    }
+    fn complete_with(
+        &mut self,
+        req: &Request,
+        prompt: Option<(String, Vec<u32>)>,
+        on: &mut dyn FnMut(Piece) -> bool,
+        ctl: &mut dyn Control,
+    ) -> anyhow::Result<Outcome> {
+        Engine::complete_with(self, req, prompt, on, ctl)
+    }
+    fn block_hashes(&self) -> Vec<u64> {
+        Engine::block_hashes(self)
+    }
+    fn cached_keys(&self) -> Vec<(String, usize)> {
+        Engine::cached_keys(self)
+    }
+    fn kv_store_dir(&self) -> Option<&std::path::Path> {
+        Engine::kv_store_dir(self)
+    }
+    fn kv_bytes(&self) -> usize {
+        Engine::kv_bytes(self)
+    }
+    fn flush_kv_store(&self) {
+        Engine::flush_kv_store(self)
+    }
+    fn after(&mut self, req: &Request, result: &anyhow::Result<(Finish, Usage)>) {
+        if let Ok((_, usage)) = result {
+            if self.speculation().is_some() {
+                eprintln!(
+                    "tang-llm: {} tokens at {:.1} tok/s, drafts {}/{} accepted",
+                    usage.completion_tokens,
+                    usage.decode_tok_s,
+                    usage.accepted_tokens,
+                    usage.draft_tokens
+                );
+            }
+            self.save(req.cache_key.as_deref());
+        }
+    }
+}
+
 /// How to serve.
 pub struct Options {
     pub addr: String,
@@ -159,24 +270,25 @@ pub struct Options {
 
 /// Serve until the process exits. `load` makes an engine for a model (a directory or Hugging
 /// Face repo id); it runs on the worker thread, so the GPU device is created where it's used.
-pub fn serve<D, F>(opts: Options, load: F) -> anyhow::Result<()>
+pub fn serve<B, F>(opts: Options, load: F) -> anyhow::Result<()>
 where
-    D: ComputeDevice + 'static,
-    F: Fn(&str) -> anyhow::Result<Engine<D>> + Send + 'static,
+    B: Backend + 'static,
+    F: Fn(&str) -> anyhow::Result<B> + Send + 'static,
 {
-    serve_with_images(opts, load, None)
+    serve_with_images::<B, tang_compute::CpuDevice, F>(opts, load, None)
 }
 
 /// Serve chat/vision and a lazy resident image pipeline in one process. Heavy inference
 /// is serialized so both workers share scratch headroom; neither evicts the other's weights.
-pub fn serve_with_images<D, F>(
+pub fn serve_with_images<B, D, F>(
     opts: Options,
     load: F,
     image: Option<(PathBuf, fn() -> anyhow::Result<D>)>,
 ) -> anyhow::Result<()>
 where
+    B: Backend + 'static,
     D: ComputeDevice + 'static,
-    F: Fn(&str) -> anyhow::Result<Engine<D>> + Send + 'static,
+    F: Fn(&str) -> anyhow::Result<B> + Send + 'static,
 {
     let resources = Arc::<crate::image_server::Gate>::default();
     let image = image.map(|(root, make)| crate::image_server::mount(root, make, resources.clone()));
@@ -246,9 +358,9 @@ where
 }
 
 /// The model's thread: runs jobs from the queue, interactive first.
-struct Worker<D: ComputeDevice, F> {
+struct Worker<B: Backend, F> {
     node: Arc<Node>,
-    engine: Option<(String, Engine<D>)>,
+    engine: Option<(String, B)>,
     load: F,
 }
 
@@ -271,10 +383,10 @@ impl Control for Ctl<'_> {
     }
 }
 
-impl<D, F> Worker<D, F>
+impl<B, F> Worker<B, F>
 where
-    D: ComputeDevice,
-    F: Fn(&str) -> anyhow::Result<Engine<D>>,
+    B: Backend,
+    F: Fn(&str) -> anyhow::Result<B>,
 {
     fn run(&mut self) {
         loop {
@@ -293,7 +405,15 @@ where
                     let _ = reply.send(self.swap(&spec));
                 }
                 Job::Unload { reply } => {
-                    let _ = reply.send(Ok(self.unload()));
+                    let result = if B::swappable() {
+                        Ok(self.unload())
+                    } else {
+                        Err((
+                            StatusCode::BAD_REQUEST,
+                            "this backend has a fixed model; restart to change it".into(),
+                        ))
+                    };
+                    let _ = reply.send(result);
                 }
             }
         }
@@ -345,7 +465,7 @@ where
         let result = engine.complete_with(
             &req,
             prompt,
-            |p| piece_tx.send(Out::Piece(p)).is_ok(),
+            &mut |p| piece_tx.send(Out::Piece(p)).is_ok(),
             &mut ctl,
         );
         self.node.state().running = None;
@@ -402,21 +522,16 @@ where
                         (usage.prompt_tokens - b.cached_tokens) as f64 / (b.secs + secs).max(1e-9);
                 }
                 let engine = &mut self.engine.as_mut().expect("the engine that ran it").1;
-                if engine.speculation().is_some() {
-                    eprintln!(
-                        "tang-llm: {} tokens at {:.1} tok/s, drafts {}/{} accepted",
-                        usage.completion_tokens,
-                        usage.decode_tok_s,
-                        usage.accepted_tokens,
-                        usage.draft_tokens
-                    );
-                }
-                let _ = tx.send(Out::Done(finish, usage));
-                // After the reply, so saving never delays it.
-                engine.save(req.cache_key.as_deref());
+                let _ = tx.send(Out::Done(finish, usage.clone()));
+                engine.after(&req, &Ok((finish, usage)));
             }
             Err(e) => {
                 let _ = tx.send(Out::Error(format!("{e:#}")));
+                self.engine
+                    .as_mut()
+                    .expect("the engine that ran it")
+                    .1
+                    .after(&req, &Err(e));
             }
         }
     }
@@ -441,19 +556,19 @@ where
 
     /// Load `spec` (nothing else is loaded).
     fn load(&mut self, spec: &str) -> anyhow::Result<()> {
-        let path = crate::resolve_model(spec)?;
-        let need = crate::node::need(&path, self.node.dtype).ok();
         self.node.state().loading = Some((spec.to_string(), Instant::now()));
         let t = Instant::now();
         let loaded = (self.load)(spec);
         self.node.state().loading = None;
         let engine = loaded?;
+        let path = engine.model_path(spec)?;
+        let need = crate::node::need(&path, self.node.dtype).ok();
         let load_secs = t.elapsed().as_secs_f64();
         self.node.state().model = Some(Loaded {
             name: spec.to_string(),
             path,
             ctx: engine.context_window(),
-            vision: engine.model.vision.is_some(),
+            vision: engine.vision(),
             loaded_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|t| t.as_secs())
@@ -483,7 +598,7 @@ where
     }
 
     /// Device memory the loaded engine holds: its weights (estimated) and KV pool.
-    fn footprint(&self, e: &Engine<D>) -> u64 {
+    fn footprint(&self, e: &B) -> u64 {
         let weights = self
             .node
             .state()
@@ -497,6 +612,12 @@ where
     /// Load `spec` in place of the current model, if it fits in free memory plus what the
     /// current one would give back. Never takes memory anything else holds.
     fn swap(&mut self, spec: &str) -> Reply {
+        if !B::swappable() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "this backend has a fixed model; restart to change it".into(),
+            ));
+        }
         if self.engine.as_ref().is_some_and(|(n, _)| n == spec) {
             return Ok(json!({ "loaded": spec, "already": true }));
         }
@@ -802,22 +923,22 @@ async fn submit(
     // Off the model's thread: the queue knows the prompt's length, and the worker needn't
     // tokenize it again.
     let (req, prompt) = tokio::task::spawn_blocking(move || {
-        let p = prompter.prompt(&req);
+        let p = prompter.map(|p| p.prompt(&req)).transpose();
         (req, p)
     })
     .await
     .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let prompt = prompt.map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let (tx, rx) = mpsc::unbounded_channel();
-    let n = prompt.1.len();
+    let n = prompt.as_ref().map(|p| p.1.len());
     let job = Job::Complete {
         req: Box::new(req),
-        prompt: Some(prompt),
+        prompt,
         tx,
         model: model.clone(),
         before: None,
     };
-    app.node.queue.push(priority, Some(n), job);
+    app.node.queue.push(priority, n, job);
     Ok((model, rx))
 }
 
@@ -867,6 +988,97 @@ fn normalize_messages(messages: &Value) -> Result<(Value, Vec<Vec<u8>>), String>
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
+    use super::{Backend, Outcome, Request};
+
+    struct FixedBackend {
+        failed: bool,
+    }
+    impl Backend for FixedBackend {
+        fn context_window(&self) -> usize {
+            1024
+        }
+        fn complete(
+            &mut self,
+            _: &Request,
+            on: &mut dyn FnMut(Piece) -> bool,
+        ) -> anyhow::Result<(Finish, Usage)> {
+            if self.failed {
+                anyhow::bail!("generation failed")
+            }
+            on(Piece::Text("ok".into()));
+            Ok((
+                Finish::Stop,
+                Usage {
+                    prompt_tokens: 2,
+                    cached_tokens: 0,
+                    completion_tokens: 1,
+                    reasoning_tokens: 0,
+                    prefill_tok_s: 10.0,
+                    decode_tok_s: 20.0,
+                    draft_tokens: 0,
+                    accepted_tokens: 0,
+                },
+            ))
+        }
+        fn model_path(&self, _: &str) -> anyhow::Result<std::path::PathBuf> {
+            Ok("/weights/model.gguf".into())
+        }
+    }
+
+    #[test]
+    fn sampling_presence_survives_server_integration() {
+        let defaults = super::parse(&json!({"messages": []})).unwrap();
+        assert!(!defaults.temperature_set && !defaults.top_k_set && !defaults.top_p_set);
+        assert_eq!(defaults.presence_penalty, None);
+        let explicit = super::parse(&json!({"messages": [], "temperature": 0.0, "top_k": 0, "top_p": 1.0, "presence_penalty": 1.5})).unwrap();
+        assert!(explicit.temperature_set && explicit.top_k_set && explicit.top_p_set);
+        assert_eq!(explicit.presence_penalty, Some(1.5));
+    }
+
+    #[test]
+    fn fixed_backend_completion_and_failure_are_forwarded() {
+        let req = super::parse(&json!({"messages": []})).unwrap();
+        let mut e = FixedBackend { failed: false };
+        let mut pieces = Vec::new();
+        let outcome = e
+            .complete_with(
+                &req,
+                None,
+                &mut |p| {
+                    pieces.push(p);
+                    true
+                },
+                &mut (),
+            )
+            .unwrap();
+        assert!(matches!(outcome, Outcome::Done(Finish::Stop, u) if u.completion_tokens == 1));
+        assert!(matches!(&pieces[0], Piece::Text(t) if t == "ok"));
+        assert!(e.prompter().is_none());
+        e.failed = true;
+        assert!(e.complete_with(&req, None, &mut |_| true, &mut ()).is_err());
+    }
+
+    #[test]
+    fn fixed_backend_rejects_swaps_before_resolving_or_loading() {
+        let node = std::sync::Arc::new(super::Node {
+            id: "test".into(),
+            queue: crate::queue::Queue::new(),
+            state: std::sync::Mutex::new(super::NodeState::default()),
+            hardware: std::sync::Arc::new(crate::node::Hardware::default),
+            dtype: crate::model::Dtype::F32,
+            resources: Default::default(),
+            image: None,
+        });
+        let mut worker = super::Worker {
+            node,
+            engine: Some(("flash".into(), FixedBackend { failed: false })),
+            load: |_: &str| -> anyhow::Result<FixedBackend> { panic!("must not load") },
+        };
+        let err = worker.swap("does-not-exist").unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(worker.engine.as_ref().unwrap().0, "flash");
+    }
+
     #[test]
     fn content_is_always_a_string() {
         let m = serde_json::json!([
@@ -999,6 +1211,10 @@ pub fn parse(body: &Value) -> Result<Request, String> {
             .or(body["think"].as_bool())
             .or((body["reasoning_effort"] == "none").then_some(false)),
         thinking_budget: thinking_budget(body),
+        temperature_set: f("temperature").is_some(),
+        top_k_set: body["top_k"].as_u64().is_some(),
+        top_p_set: f("top_p").is_some(),
+        presence_penalty: f("presence_penalty").map(|v| v as f32),
         sampling: Sampling {
             temperature: f("temperature").map(|v| v as f32).unwrap_or(d.temperature),
             top_p: f("top_p").map(|v| v as f32).unwrap_or(d.top_p),

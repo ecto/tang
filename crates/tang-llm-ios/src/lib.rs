@@ -119,6 +119,10 @@ fn run(e: &mut Engine<MetalDevice>, messages: Value, max_tokens: usize) -> Resul
         response_schema: None,
         think: Some(false),
         thinking_budget: None,
+        temperature_set: true,
+        top_k_set: false,
+        top_p_set: false,
+        presence_penalty: None,
         sampling: Sampling {
             temperature: 0.0,
             ..Sampling::default()
@@ -195,6 +199,10 @@ pub unsafe extern "C" fn tang_chat(
             response_schema: None,
             think: Some(false),
             thinking_budget: None,
+            temperature_set: false,
+            top_k_set: false,
+            top_p_set: false,
+            presence_penalty: None,
             sampling: Sampling::default(),
             max_tokens: Some(max_tokens as usize),
             stop: Vec::new(),

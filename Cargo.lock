@@ -6082,16 +6082,23 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.22.1",
+ "cudarc 0.16.6",
  "image",
+ "libc",
  "llguidance",
  "memmap2",
  "minijinja",
  "minijinja-contrib",
+ "rayon",
  "safetensors",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tang-ad",
  "tang-compute",
+ "tang-moe",
+ "tang-tensor",
+ "tang-train",
  "tokenizers",
  "tokio",
  "tokio-stream",
@@ -6128,6 +6135,14 @@ dependencies = [
  "tokio-serde",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "tang-moe"
+version = "0.1.0"
+dependencies = [
+ "cudarc 0.16.6",
+ "libc",
 ]
 
 [[package]]

@@ -40,6 +40,16 @@ enum CudaStorage {
     Bf16(CudaSlice<u16>),
     /// Read-only 4-bit weights for `linear`/`embedding` (see `ComputeDevice::upload_q4`).
     Q4(Box<Q4Weight>),
+    /// Read-only Q2_0 weights in the repacked layout (`crate::flash::q2_repack`), for the Q2
+    /// ops only (`ComputeDevice::q2_linear_into`).
+    Q2(Box<Q2Weight>),
+}
+
+/// A repacked Q2_0 `[n, k]` matrix: `[n][k/4]` code bytes, then `[n][k/64]` fp16 scales.
+struct Q2Weight {
+    data: CudaSlice<u8>,
+    n: usize,
+    k: usize,
 }
 
 /// 4-bit affine weights in MLX's layout: `packed` holds 8 weights per u32 (low nibble first)
@@ -66,7 +76,7 @@ impl Drop for CudaBuffer {
             match storage {
                 CudaStorage::F32(slice) => p.put_f32(slice, self.len),
                 CudaStorage::Bf16(slice) => p.put_bf16(slice, self.len),
-                CudaStorage::Q4(_) => {}
+                CudaStorage::Q4(_) | CudaStorage::Q2(_) => {}
             }
         }
         // If no pool ref, storage is dropped normally (cudaFree)
@@ -94,6 +104,11 @@ impl ComputeBuffer for CudaBuffer {
             CudaStorage::Bf16(s) => {
                 let u16_data: Vec<u16> = s.stream().memcpy_dtov(s).unwrap();
                 u16_data.iter().map(|&b| bf16_to_f32(b)).collect()
+            }
+            // The raw repacked bytes, 4 per element (what the portable `upload_q2` stores).
+            CudaStorage::Q2(q) => {
+                let bytes: Vec<u8> = q.data.stream().memcpy_dtov(&q.data).unwrap();
+                crate::flash::words_of(&crate::flash::bytes_to_words(&bytes))
             }
             CudaStorage::Q4(q) => {
                 let stream = q.packed.stream();
@@ -153,6 +168,7 @@ impl CudaBuffer {
 
 use crate::pool::BufferPool;
 
+mod flash;
 mod llm;
 
 /// Extended pool diagnostics.
@@ -176,6 +192,9 @@ pub struct CudaComputeDevice {
     pool: Arc<Mutex<BufferPool>>,
     /// LLM kernels by name, so decode doesn't hash kernel sources on every launch.
     llm_funcs: RefCell<HashMap<&'static str, CudaFunction>>,
+    /// Self-resetting grid-barrier and completion counters for the fused Flash-Next kernels
+    /// (`cuda/flash.rs`), allocated on first use.
+    flash_sync: RefCell<Option<CudaSlice<u32>>>,
 }
 
 /// GPU 0's name, free and total memory, without making a device (no stream or cuBLAS handle):
@@ -219,6 +238,7 @@ impl CudaComputeDevice {
             mixed_precision: false,
             pool: Arc::new(Mutex::new(BufferPool::new())),
             llm_funcs: RefCell::new(HashMap::new()),
+            flash_sync: RefCell::new(None),
         })
     }
 
@@ -269,6 +289,7 @@ impl CudaComputeDevice {
             mixed_precision: true,
             pool: Arc::new(Mutex::new(BufferPool::new())),
             llm_funcs: RefCell::new(HashMap::new()),
+            flash_sync: RefCell::new(None),
         })
     }
 
@@ -806,7 +827,7 @@ impl CudaComputeDevice {
                 self.stream.memcpy_dtod(s, out.bf16_data_mut()).unwrap();
                 out
             }
-            CudaStorage::Q4(_) => panic!("4-bit weights can't be copied"),
+            CudaStorage::Q4(_) | CudaStorage::Q2(_) => panic!("4-bit weights can't be copied"),
         }
     }
 
@@ -827,7 +848,7 @@ impl CudaComputeDevice {
                 self.stream.memcpy_dtod(&view, out.bf16_data_mut()).unwrap();
                 out
             }
-            CudaStorage::Q4(_) => panic!("4-bit weights can't be sliced"),
+            CudaStorage::Q4(_) | CudaStorage::Q2(_) => panic!("4-bit weights can't be sliced"),
         }
     }
 
@@ -4077,7 +4098,7 @@ impl ComputeDevice for CudaComputeDevice {
                         .unwrap();
                 }
             }
-            CudaStorage::Q4(_) => panic!("4-bit weights are read-only"),
+            CudaStorage::Q4(_) | CudaStorage::Q2(_) => panic!("4-bit weights are read-only"),
         }
     }
 
@@ -4085,12 +4106,360 @@ impl ComputeDevice for CudaComputeDevice {
         self.upload_bf16_impl(bits)
     }
 
-    fn bf16_storage(&self) -> bool {
-        true
+    fn upload_bytes(&self, bytes: &[u8]) -> CudaBuffer {
+        self.upload_bytes_impl(bytes)
     }
 
     fn alloc_bf16(&self, len: usize) -> CudaBuffer {
         self.pool_alloc_bf16(len)
+    }
+
+    fn buffer_addr(&self, buf: &CudaBuffer) -> u64 {
+        self.buffer_addr_impl(buf)
+    }
+
+    fn upload_q2(&self, raw: &[u8], n: usize, k: usize) -> CudaBuffer {
+        self.upload_q2_impl(raw, n, k)
+    }
+
+    fn linear_into(
+        &self,
+        x: &CudaBuffer,
+        w: &CudaBuffer,
+        out: &mut CudaBuffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        self.linear_into_impl(x, w, out, m, k, n)
+    }
+
+    fn quantize_act_into(&self, x: &CudaBuffer, xq: &mut CudaBuffer, m: usize, k: usize) {
+        self.quantize_act_impl(x, xq, m, k)
+    }
+
+    fn q2_linear_into(
+        &self,
+        xq: &CudaBuffer,
+        w: &CudaBuffer,
+        out: &mut CudaBuffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        self.q2_linear_impl(xq, w, out, m, k, n)
+    }
+
+    fn q8x_linear_into(
+        &self,
+        xq: &CudaBuffer,
+        w: &CudaBuffer,
+        out: &mut CudaBuffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        self.q8x_linear_impl(xq, w, out, m, k, n)
+    }
+
+    fn native_linear_into(
+        &self,
+        ty: crate::flash_native::NatType,
+        xq: &CudaBuffer,
+        w: &CudaBuffer,
+        out: &mut CudaBuffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        self.native_linear_impl(ty, xq, w, out, 0, n, m, k, n)
+    }
+
+    fn bf16_linear_out_into(
+        &self,
+        x: &CudaBuffer,
+        w: &CudaBuffer,
+        out: &mut CudaBuffer,
+        off: usize,
+        ostride: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        self.bf16_linear_out_impl(x, w, out, off, ostride, m, k, n)
+    }
+
+    fn native_stack(
+        &self,
+        segs: Vec<crate::flash_native::NatSeg<CudaBuffer>>,
+        n: usize,
+        k: usize,
+    ) -> crate::flash_native::NatStack<CudaBuffer> {
+        self.native_stack_impl(segs, n, k)
+    }
+
+    fn native_stack_into(
+        &self,
+        s: &crate::flash_native::NatStack<CudaBuffer>,
+        x: &CudaBuffer,
+        xq: &CudaBuffer,
+        out: &mut CudaBuffer,
+        m: usize,
+    ) {
+        self.native_stack_into_impl(s, x, xq, out, m)
+    }
+
+    fn native_linear_out_into(
+        &self,
+        ty: crate::flash_native::NatType,
+        xq: &CudaBuffer,
+        w: &CudaBuffer,
+        out: &mut CudaBuffer,
+        off: usize,
+        ostride: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        self.native_linear_impl(ty, xq, w, out, off, ostride, m, k, n)
+    }
+
+    fn q4x_linear_into(
+        &self,
+        xq: &CudaBuffer,
+        w: &CudaBuffer,
+        out: &mut CudaBuffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        self.q4x_linear_impl(xq, w, out, m, k, n)
+    }
+
+    fn hc_read_into(
+        &self,
+        r: &mut CudaBuffer,
+        pending: Option<crate::flash::HcPending<'_, CudaBuffer>>,
+        w: &crate::flash::HcWeights<'_, CudaBuffer>,
+        x: &mut CudaBuffer,
+        xq: Option<&mut CudaBuffer>,
+        inj: Option<&mut CudaBuffer>,
+        scratch: &mut CudaBuffer,
+        t: usize,
+        eps: f32,
+    ) {
+        self.hc_read_impl(r, pending, w, x, xq, inj, scratch, t, eps)
+    }
+
+    fn hc_write(&self, r: &mut CudaBuffer, y: &CudaBuffer, inj: &CudaBuffer, t: usize) {
+        self.hc_write_impl(r, y, inj, t)
+    }
+
+    fn gdn_conv_into(
+        &self,
+        proj: &CudaBuffer,
+        stride: usize,
+        hist: &CudaBuffer,
+        conv: &CudaBuffer,
+        h: &mut CudaBuffer,
+        t: usize,
+        eps: f32,
+    ) {
+        self.gdn_conv_impl(proj, stride, hist, conv, h, t, eps)
+    }
+
+    fn gdn_conv_commit(
+        &self,
+        hist: &mut CudaBuffer,
+        proj: &CudaBuffer,
+        stride: usize,
+        win: &CudaBuffer,
+        t: usize,
+    ) {
+        self.gdn_conv_commit_impl(hist, proj, stride, win, t)
+    }
+
+    fn gdn_step(
+        &self,
+        state: &mut CudaBuffer,
+        h: &CudaBuffer,
+        proj: &CudaBuffer,
+        stride: usize,
+        p: &crate::flash::GdnParams<'_, CudaBuffer>,
+        y: &mut CudaBuffer,
+        yq: Option<&mut CudaBuffer>,
+        t: usize,
+        mode: crate::flash::GdnMode<'_, CudaBuffer>,
+        eps: f32,
+    ) {
+        self.gdn_step_impl(state, h, proj, stride, p, y, yq, t, mode, eps)
+    }
+
+    fn gdn_conv_step(
+        &self,
+        state: &mut CudaBuffer,
+        proj: &CudaBuffer,
+        stride: usize,
+        hist: &CudaBuffer,
+        p: &crate::flash::GdnParams<'_, CudaBuffer>,
+        y: &mut CudaBuffer,
+        yq: Option<&mut CudaBuffer>,
+        t: usize,
+        mode: crate::flash::GdnMode<'_, CudaBuffer>,
+        eps: f32,
+    ) {
+        self.gdn_conv_step_impl(state, proj, stride, hist, p, y, yq, t, mode, eps)
+    }
+
+    fn router_topk_into(
+        &self,
+        logits: &CudaBuffer,
+        stride: usize,
+        n_expert: usize,
+        ids: &mut CudaBuffer,
+        w: &mut CudaBuffer,
+        t: usize,
+    ) {
+        self.router_topk_impl(logits, stride, n_expert, ids, w, t)
+    }
+
+    fn moe_plan_into(
+        &self,
+        ids: &CudaBuffer,
+        table: &CudaBuffer,
+        shared: u64,
+        plan: &mut CudaBuffer,
+        t: usize,
+    ) {
+        self.moe_plan_impl(ids, table, shared, plan, t)
+    }
+
+    fn moe_route_into(
+        &self,
+        logits: &CudaBuffer,
+        stride: usize,
+        n_expert: usize,
+        forced: Option<&CudaBuffer>,
+        table: &CudaBuffer,
+        shared: u64,
+        ids: &mut CudaBuffer,
+        w: &mut CudaBuffer,
+        plan: &mut CudaBuffer,
+        t: usize,
+    ) {
+        self.moe_route_impl(
+            logits, stride, n_expert, forced, table, shared, ids, w, plan, t,
+        )
+    }
+
+    unsafe fn moe_grouped_into(
+        &self,
+        xq: &CudaBuffer,
+        plan: &CudaBuffer,
+        scratch: &mut CudaBuffer,
+        parts: &mut CudaBuffer,
+        t: usize,
+    ) {
+        self.moe_grouped_impl(xq, plan, scratch, parts, t)
+    }
+
+    fn moe_combine_into(
+        &self,
+        parts: &CudaBuffer,
+        w: &CudaBuffer,
+        logits: &CudaBuffer,
+        stride: usize,
+        sg: Option<usize>,
+        y: &mut CudaBuffer,
+        t: usize,
+    ) {
+        self.moe_combine_impl(parts, w, logits, stride, sg, y, t)
+    }
+
+    fn qsa_prep(
+        &self,
+        proj: &CudaBuffer,
+        stride: usize,
+        win: &CudaBuffer,
+        norms: &crate::flash::QsaNorms<'_, CudaBuffer>,
+        rope: (&CudaBuffer, &CudaBuffer),
+        q: &mut CudaBuffer,
+        cache: crate::flash::QsaCache<'_, CudaBuffer>,
+        t: usize,
+        eps: f32,
+    ) {
+        self.qsa_prep_impl(proj, stride, win, norms, rope, q, cache, t, eps)
+    }
+
+    fn qsa_select_into(
+        &self,
+        pooled: &CudaBuffer,
+        q: &CudaBuffer,
+        win: &CudaBuffer,
+        scores: &mut CudaBuffer,
+        ids: &mut CudaBuffer,
+        max_blocks: usize,
+        t: usize,
+    ) {
+        self.qsa_select_impl(pooled, q, win, scores, ids, max_blocks, t)
+    }
+
+    fn qsa_select_union_into(
+        &self,
+        pooled: &CudaBuffer,
+        q: &CudaBuffer,
+        win: &CudaBuffer,
+        scores: &mut CudaBuffer,
+        ids: &mut CudaBuffer,
+        union: &mut CudaBuffer,
+        max_blocks: usize,
+        t: usize,
+    ) {
+        self.qsa_select_union_impl(pooled, q, win, scores, ids, union, max_blocks, t)
+    }
+
+    fn qsa_attend_union_into(
+        &self,
+        q: &CudaBuffer,
+        k_cache: &CudaBuffer,
+        v_cache: &CudaBuffer,
+        _ids: &CudaBuffer,
+        union: &CudaBuffer,
+        max_blocks: usize,
+        proj: &CudaBuffer,
+        stride: usize,
+        win: &CudaBuffer,
+        scratch: &mut CudaBuffer,
+        out: &mut CudaBuffer,
+        outq: Option<&mut CudaBuffer>,
+        t: usize,
+    ) {
+        self.qsa_attend_union_impl(
+            q, k_cache, v_cache, union, max_blocks, proj, stride, win, scratch, out, outq, t,
+        )
+    }
+
+    fn qsa_attend_into(
+        &self,
+        q: &CudaBuffer,
+        k_cache: &CudaBuffer,
+        v_cache: &CudaBuffer,
+        ids: &CudaBuffer,
+        proj: &CudaBuffer,
+        stride: usize,
+        win: &CudaBuffer,
+        scratch: &mut CudaBuffer,
+        out: &mut CudaBuffer,
+        outq: Option<&mut CudaBuffer>,
+        t: usize,
+    ) {
+        self.qsa_attend_impl(
+            q, k_cache, v_cache, ids, proj, stride, win, scratch, out, outq, t,
+        )
+    }
+
+    fn bf16_storage(&self) -> bool {
+        true
     }
 
     fn download_bf16(&self, buf: &CudaBuffer) -> Vec<u16> {
@@ -4362,7 +4731,7 @@ impl ComputeDevice for CudaComputeDevice {
             CudaStorage::Bf16(s) => {
                 self.stream.memset_zeros(s).unwrap();
             }
-            CudaStorage::Q4(_) => panic!("4-bit weights are read-only"),
+            CudaStorage::Q4(_) | CudaStorage::Q2(_) => panic!("4-bit weights are read-only"),
         }
     }
 
