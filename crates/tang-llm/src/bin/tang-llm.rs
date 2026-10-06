@@ -963,7 +963,12 @@ fn serve_images<D: ComputeDevice + 'static, F: Fn() -> Result<D> + Send + 'stati
         args.first()
             .context("serve-images <pipeline-dir> [--host H] [--port P] [--api-key-file F]")?,
     );
-    let (mut host, mut port, mut key) = ("127.0.0.1".to_owned(), 8913u16, None);
+    let (mut host, mut port) = ("127.0.0.1".to_owned(), 8913u16);
+    // Same as `serve`: never on the command line itself, where `ps` would show it.
+    let mut key = std::env::var("TANG_API_KEY").ok();
+    if let Some(k) = &key {
+        ensure_nonempty_key(k)?;
+    }
     let mut options = args[1..].iter();
     while let Some(option) = options.next() {
         match option.as_str() {

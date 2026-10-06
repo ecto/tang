@@ -80,7 +80,7 @@ struct Node {
     hardware: Probe,
     dtype: Dtype,
     /// Serialize model loads and heavy inference across the judge and image workers.
-    resources: Arc<Mutex<()>>,
+    resources: Arc<crate::image_server::Gate>,
     image: Option<crate::image_server::ImageModel>,
 }
 
@@ -178,7 +178,7 @@ where
     D: ComputeDevice + 'static,
     F: Fn(&str) -> anyhow::Result<Engine<D>> + Send + 'static,
 {
-    let resources = Arc::new(Mutex::new(()));
+    let resources = Arc::<crate::image_server::Gate>::default();
     let image = image.map(|(root, make)| crate::image_server::mount(root, make, resources.clone()));
     let node = Arc::new(Node {
         id: crate::node::node_id(),
@@ -200,7 +200,7 @@ where
         };
         if let Some(spec) = first {
             let gate = w.node.resources.clone();
-            let _guard = gate.lock().unwrap_or_else(|e| e.into_inner());
+            let _guard = gate.lock();
             if let Err(e) = w.load(&spec) {
                 let _ = ready_tx.send(Err(e));
                 return;
@@ -280,7 +280,7 @@ where
         loop {
             let (ticket, job) = self.node.queue.pop();
             let gate = self.node.resources.clone();
-            let _guard = gate.lock().unwrap_or_else(|e| e.into_inner());
+            let _guard = gate.lock();
             match job {
                 Job::Complete {
                     req,
@@ -731,7 +731,7 @@ fn describe(node: &Node) -> Value {
         "models": { "loaded": loaded, "loading": loading, "on_disk": on_disk },
         "queue": { "running": running, "waiting": waiting },
         "image_model": node.image.as_ref().map(|image|json!({
-            "id":"z-image-turbo", "path":image.path, "resident":image.resident.load(std::sync::atomic::Ordering::Relaxed),
+            "id":crate::image_server::MODEL_ID, "path":image.path, "resident":image.resident.load(std::sync::atomic::Ordering::Relaxed),
         })),
     })
 }
@@ -741,6 +741,12 @@ async fn load_model(State(app): State<App>, Json(body): Json<Value>) -> Response
     let Some(spec) = body["model"].as_str().map(String::from) else {
         return error(StatusCode::BAD_REQUEST, "model must be a string");
     };
+    if spec == crate::image_server::MODEL_ID {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "image models load on first generation, not through /models/load",
+        );
+    }
     if app
         .node
         .state()

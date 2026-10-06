@@ -986,7 +986,14 @@ impl<D: ComputeDevice> Engine<D> {
                     }
                     None => new,
                 };
-                if !deliver(parser.push(&new), &mut tool_calls) {
+                // Constrained output is the grammar's JSON verbatim: tool-call or think
+                // markers inside a string value are data, not structure.
+                let pieces = if constraint.is_some() {
+                    vec![Piece::Text(new)]
+                } else {
+                    parser.push(&new)
+                };
+                if !deliver(pieces, &mut tool_calls) {
                     finish = Finish::Cancelled;
                     break;
                 }

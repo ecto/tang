@@ -330,7 +330,7 @@ impl<D: ComputeDevice> Model<D> {
         all: bool,
     ) -> Result<Vec<f32>> {
         let x = self.embed(tokens)?;
-        self.forward_hidden(x, tokens, cache, all, true)
+        self.forward_layers(x, tokens, cache, all, true, false)
     }
 
     /// An image's embeddings, ready to stand in for its placeholder tokens.
@@ -397,7 +397,8 @@ impl<D: ComputeDevice> Model<D> {
         for (r, &(start, len, img)) in pieces.iter().enumerate() {
             let seg = self.dev.slice_buffer(&x, start * h, len * h);
             let last = r + 1 == pieces.len();
-            let logits = self.forward_hidden(seg, &tokens[start..start + len], cache, all, !img)?;
+            let logits =
+                self.forward_layers(seg, &tokens[start..start + len], cache, all, !img, true)?;
             if all {
                 out.extend(logits);
             } else if last {
@@ -437,6 +438,7 @@ impl<D: ComputeDevice> Model<D> {
             0,
             true,
             self.layers.len() - 1,
+            true,
         )?;
         Ok(x)
     }
@@ -445,11 +447,25 @@ impl<D: ComputeDevice> Model<D> {
     /// in for placeholder tokens). `tokens` are what the cache records for these positions.
     pub fn forward_hidden(
         &self,
+        x: D::Buffer,
+        tokens: &[u32],
+        cache: &mut Cache<D::Buffer>,
+        all: bool,
+        causal: bool,
+    ) -> Result<Vec<f32>> {
+        self.forward_layers(x, tokens, cache, all, causal, false)
+    }
+
+    /// `forward_hidden`; `bound` waits for the GPU every few layers on large pieces, so
+    /// multimodal and conditioning prefill don't retain every temporary at once.
+    fn forward_layers(
+        &self,
         mut x: D::Buffer,
         tokens: &[u32],
         cache: &mut Cache<D::Buffer>,
         all: bool,
         causal: bool,
+        bound: bool,
     ) -> Result<Vec<f32>> {
         let c = &self.cfg;
         let dev = &self.dev;
@@ -461,7 +477,7 @@ impl<D: ComputeDevice> Model<D> {
             self.max_ctx
         );
         let (h, eps) = (c.hidden_size, c.rms_norm_eps);
-        self.decode_layers(&mut x, cache, s, pos, causal, self.layers.len())?;
+        self.decode_layers(&mut x, cache, s, pos, causal, self.layers.len(), bound)?;
         let (rows, x) = if all {
             (s, x)
         } else {
@@ -479,6 +495,7 @@ impl<D: ComputeDevice> Model<D> {
 
 impl<D: ComputeDevice> Model<D> {
     /// The decoder layers over hidden states `x` (`[s, hidden]`) at positions `pos..`.
+    #[allow(clippy::too_many_arguments)]
     fn decode_layers(
         &self,
         x: &mut D::Buffer,
@@ -487,6 +504,7 @@ impl<D: ComputeDevice> Model<D> {
         pos: usize,
         causal: bool,
         layer_limit: usize,
+        bound: bool,
     ) -> Result<()> {
         let c = &self.cfg;
         let dev = &self.dev;
@@ -550,11 +568,11 @@ impl<D: ComputeDevice> Model<D> {
                 d = dev.rms_norm(&d, n, s, h, eps);
             }
             *x = dev.add_tensors_buf(x, &d, s * h);
-            // Large multimodal prefill pieces retain every temporary until their
+            // Large multimodal and conditioning pieces retain every temporary until their
             // command buffers are released. Bound that retention across deep models;
-            // small text/decode batches keep the asynchronous path.
+            // text prefill and decode keep the asynchronous path.
             if l % 4 == 3 {
-                if s > 128 {
+                if bound && s > 128 {
                     dev.sync();
                 } else {
                     dev.flush();

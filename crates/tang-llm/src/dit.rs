@@ -110,7 +110,7 @@ pub struct DiT<B> {
     fused_modulation: bool,
 }
 fn silu<D: ComputeDevice>(dev: &D, x: &D::Buffer) -> D::Buffer {
-    dev.swiglu_fused_buf(x, &dev.upload(&vec![1.; x.len()]), x.len())
+    dev.silu_buf(x, x.len())
 }
 fn multiply_rows<D: ComputeDevice>(dev: &D, x: &D::Buffer, v: &[f32], rows: usize) -> D::Buffer {
     let repeated = dev.upload(&v.repeat(rows));

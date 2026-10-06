@@ -19,13 +19,13 @@ use std::{
     convert::Infallible,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc as std_mpsc, Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc as std_mpsc, Arc, Mutex, MutexGuard,
     },
 };
 use tang_compute::ComputeDevice;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 enum Out {
     Progress(crate::image_pipeline::Progress),
     Images(Vec<Generated>),
@@ -33,7 +33,7 @@ enum Out {
 }
 struct Job {
     request: Request,
-    tx: mpsc::UnboundedSender<Out>,
+    tx: mpsc::Sender<Out>,
 }
 #[derive(Clone)]
 struct App {
@@ -57,7 +57,7 @@ fn capabilities(previews: bool) -> Vec<&'static str> {
 }
 impl ImageModel {
     pub fn json(&self) -> Value {
-        json!({"id":"z-image-turbo","object":"model","type":"image",
+        json!({"id":MODEL_ID,"object":"model","type":"image",
             "capabilities":capabilities(self.previews),
             "resident":self.resident.load(Ordering::Relaxed)})
     }
@@ -69,11 +69,11 @@ pub(crate) struct Service {
 }
 fn images_value(images: Vec<Generated>) -> Value {
     let model_hash = images.first().map(|image| image.model_hash.clone());
-    json!({"model":"z-image-turbo","model_hash":model_hash,"data":images.into_iter().map(|image|json!({"b64_json":STANDARD.encode(image.png),"seed":image.seed,"steps":image.steps,"width":image.width,"height":image.height})).collect::<Vec<_>>()})
+    json!({"model":MODEL_ID,"model_hash":model_hash,"data":images.into_iter().map(|image|json!({"b64_json":STANDARD.encode(image.png),"seed":image.seed,"steps":image.steps,"width":image.width,"height":image.height})).collect::<Vec<_>>()})
 }
 async fn models(State(app): State<App>) -> Json<Value> {
     Json(
-        json!({"data":[{"id":"z-image-turbo","object":"model","type":"image","capabilities":capabilities(app.previews),"resident":app.resident.load(Ordering::Relaxed)}]}),
+        json!({"data":[{"id":MODEL_ID,"object":"model","type":"image","capabilities":capabilities(app.previews),"resident":app.resident.load(Ordering::Relaxed)}]}),
     )
 }
 async fn generate(
@@ -99,7 +99,7 @@ async fn generate(
     if request.preview && !app.previews {
         return (StatusCode::BAD_REQUEST, Json(json!({"error":{"message":"latent previews unavailable; calibrate the installed VAE explicitly"}}))).into_response();
     }
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(PROGRESS_BUFFER);
     if let Err(error) = app.jobs.try_send(Job { request, tx }) {
         let (status, message) = match error {
             std_mpsc::TrySendError::Full(_) => (StatusCode::TOO_MANY_REQUESTS, "image queue full"),
@@ -110,7 +110,7 @@ async fn generate(
         return (status, Json(json!({"error":{"message":message}}))).into_response();
     }
     if stream {
-        let events = UnboundedReceiverStream::new(rx);
+        let events = ReceiverStream::new(rx);
         use tokio_stream::StreamExt;
         return Sse::new(events.map(|out| {
             Ok::<_, Infallible>(match out {
@@ -151,7 +151,48 @@ async fn generate(
     )
         .into_response()
 }
-pub(crate) fn mount<D, F>(root: PathBuf, make_device: F, load_gate: Arc<Mutex<()>>) -> Service
+/// The GPU shared by chat and image work. Chat counts itself as waiting while it blocks,
+/// and image generation hands the GPU over between denoising steps when it does.
+#[derive(Default)]
+pub(crate) struct Gate {
+    lock: Mutex<()>,
+    waiting: AtomicUsize,
+}
+
+impl Gate {
+    /// Take the GPU for a chat job, signalling image work to yield.
+    pub(crate) fn lock(&self) -> MutexGuard<'_, ()> {
+        self.waiting.fetch_add(1, Ordering::SeqCst);
+        let guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.waiting.fetch_sub(1, Ordering::SeqCst);
+        guard
+    }
+
+    /// Take the GPU for image work, without counting as a waiter.
+    fn hold(&self) -> MutexGuard<'_, ()> {
+        self.lock.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Between image steps: if chat is waiting, release until every waiter has the GPU.
+    fn yield_to_waiters<'a>(&'a self, guard: &mut Option<MutexGuard<'a, ()>>) {
+        if self.waiting.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        guard.take();
+        while self.waiting.load(Ordering::SeqCst) > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        *guard = Some(self.hold());
+    }
+}
+
+/// The image model's id in `/v1/models` and responses.
+pub(crate) const MODEL_ID: &str = "z-image-turbo";
+
+/// Progress events buffered per request; a slow reader drops stale ones, never the result.
+const PROGRESS_BUFFER: usize = 16;
+
+pub(crate) fn mount<D, F>(root: PathBuf, make_device: F, gate: Arc<Gate>) -> Service
 where
     D: ComputeDevice + 'static,
     F: Fn() -> Result<D> + Send + 'static,
@@ -171,7 +212,7 @@ where
             if job.tx.is_closed() {
                 continue;
             }
-            let _guard = load_gate.lock().unwrap_or_else(|e| e.into_inner());
+            let mut guard = Some(gate.hold());
             if job.tx.is_closed() {
                 continue;
             }
@@ -185,7 +226,7 @@ where
                     Err(e) => {
                         let _ = job
                             .tx
-                            .send(Out::Error(format!("loading image model: {e:#}")));
+                            .blocking_send(Out::Error(format!("loading image model: {e:#}")));
                         continue;
                     }
                 }
@@ -195,13 +236,19 @@ where
                 .as_ref()
                 .unwrap()
                 .generate(&job.request, &mut |progress| {
-                    tx.send(Out::Progress(progress)).is_ok()
+                    gate.yield_to_waiters(&mut guard);
+                    // A full buffer only drops this update; a closed one cancels.
+                    !matches!(
+                        tx.try_send(Out::Progress(progress)),
+                        Err(mpsc::error::TrySendError::Closed(_))
+                    )
                 });
+            drop(guard);
             let out = match result {
                 Ok(images) => Out::Images(images),
                 Err(e) => Out::Error(format!("{e:#}")),
             };
-            let _ = job.tx.send(out);
+            let _ = job.tx.blocking_send(out);
         }
     });
     let app = App {
@@ -220,7 +267,7 @@ where
     D: ComputeDevice + 'static,
     F: Fn() -> Result<D> + Send + 'static,
 {
-    let service = mount(root, make_device, Arc::new(Mutex::new(())));
+    let service = mount(root, make_device, Arc::default());
     let api = service.router.merge(
         Router::new()
             .route("/v1/models", get(models))

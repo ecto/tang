@@ -142,17 +142,41 @@ impl<B: ComputeBuffer> Attention<B> {
         } else {
             // VAE uses one 512-wide head; tang's decoder attention kernels
             // stop at head_dim 256. The general GEMM/softmax path has no such limit.
-            let kt = dev.transpose_2d(&k, n, self.channels);
-            let mut scores = dev.matmul(&q, &kt, n, self.channels, n);
-            dev.scale_buffer(&mut scores, 1. / (self.channels as f32).sqrt());
-            let probabilities = dev.softmax(&scores, n, n);
-            dev.matmul(&probabilities, &v, n, n, self.channels)
+            single_head_attention(dev, &q, &k, &v, n, self.channels, QUERY_BLOCK)
         };
         let y = linear(&self.out, &attention);
         let y = dev.transpose_2d(&y, n, self.channels);
         dev.add_tensors_buf(x, &y, x.len())
     }
 }
+/// Query rows per block in the mid-block attention: the score matrix stays at most
+/// QUERY_BLOCK × n (64 MiB at 1024², not 1 GiB).
+const QUERY_BLOCK: usize = 1024;
+
+/// One-head softmax attention over `n` rows of width `c`, in blocks of query rows.
+fn single_head_attention<D: ComputeDevice>(
+    dev: &D,
+    q: &D::Buffer,
+    k: &D::Buffer,
+    v: &D::Buffer,
+    n: usize,
+    c: usize,
+    block: usize,
+) -> D::Buffer {
+    let kt = dev.transpose_2d(k, n, c);
+    let mut out = dev.alloc(n * c);
+    for start in (0..n).step_by(block) {
+        let rows = block.min(n - start);
+        let qb = dev.slice_buffer(q, start * c, rows * c);
+        let mut scores = dev.matmul(&qb, &kt, rows, c, n);
+        dev.scale_buffer(&mut scores, 1. / (c as f32).sqrt());
+        let probabilities = dev.softmax(&scores, rows, n);
+        let out_block = dev.matmul(&probabilities, v, rows, n, c);
+        dev.write_into(&mut out, start * c, &out_block);
+    }
+    out
+}
+
 impl<B: ComputeBuffer> Vae<B> {
     pub fn load<D: ComputeDevice<Buffer = B>>(dev: &D, dir: &Path) -> Result<Self> {
         let cfg: Config = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
@@ -328,5 +352,30 @@ impl<B: ComputeBuffer> Vae<B> {
         x = self.output.run(dev, &x, h, w);
         trace("output", &x);
         Ok(dev.download(&x))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tang_compute::CpuDevice;
+
+    #[test]
+    fn blocked_attention_matches_one_block() {
+        let dev = CpuDevice::new();
+        let (n, c) = (10, 4);
+        let data = |seed: f32| {
+            dev.upload(
+                &(0..n * c)
+                    .map(|i| ((i as f32 + seed) * 0.37).sin())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let (q, k, v) = (data(0.), data(1.), data(2.));
+        let whole = dev.download(&single_head_attention(&dev, &q, &k, &v, n, c, n));
+        let blocked = dev.download(&single_head_attention(&dev, &q, &k, &v, n, c, 3));
+        for (a, b) in whole.iter().zip(&blocked) {
+            assert!((a - b).abs() < 1e-6, "{a} vs {b}");
+        }
     }
 }

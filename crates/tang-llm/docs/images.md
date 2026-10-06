@@ -156,3 +156,7 @@ writes about 20.5 GB instead of storing the roughly 32.8 GB original checkpoint.
 Completed files can be resumed after size and SHA256 verification against the conversion
 manifest; interrupted partial files are refused. The converted files are a distinct artifact; do not insert them into the official
 repository's cache as if their hashes matched the originals.
+
+## Backends
+
+Image generation is supported on Metal only. The DiT and VAE ops (`rms_norm_scale`, `rms_norm_gate_residual`, `modulate_channels`, `conv2d_nchw`, `group_norm_affine`, `upsample_nearest_2x`) have no CUDA kernels yet. On CUDA they fall back to the trait defaults, which round-trip through the host. The results are correct but far too slow to use.
