@@ -403,7 +403,12 @@ struct Scratch {
     out_ids: B,
     amax: B,
     stamps: B,
+    /// PCIe share staging (`TANG_FLASH_PCIE_STAGE`): STAGE_MAX expert blobs and the source list.
+    stage: Option<(B, B)>,
 }
+
+/// Experts per layer the staged PCIe share brings into VRAM before the MoE kernel.
+const STAGE_MAX: usize = 32;
 
 /// Raw kernels: the engine's and the doorbell's.
 struct Kern {
@@ -417,6 +422,8 @@ struct Kern {
     argmax: Fun,
     argmax2: Fun,
     pcie: Fun,
+    pcie_staged: Fun,
+    stage_copy: Fun,
     wait_if: Fun,
     m_embed: Fun,
     m_cat: Fun,
@@ -960,6 +967,9 @@ impl Engine {
             out_ids: z(MAX_T),
             amax: z(MAX_T * 64 * 2),
             stamps: z(48 * 8 * 2),
+            stage: std::env::var("TANG_FLASH_PCIE_STAGE")
+                .is_ok_and(|v| v == "1")
+                .then(|| (z(STAGE_MAX * ExpertBlob::BYTES / 4), z(2 * (1 + STAGE_MAX)))),
         };
         dev.sync();
         let t_dense = t1.elapsed().as_secs_f64();
@@ -1046,6 +1056,8 @@ impl Engine {
             argmax: f(&m, "fe_argmax1")?,
             argmax2: f(&m, "fe_argmax2")?,
             pcie: f(&m, "fe_pcie_patch")?,
+            pcie_staged: f(&m, "fe_pcie_patch_staged")?,
+            stage_copy: f(&m, "fe_stage_copy")?,
             wait_if: f(&m, "fe_db_wait_if")?,
             publish: f(&db, "db_publish")?,
             wait: f(&db, "db_wait")?,
@@ -1499,6 +1511,7 @@ impl Engine {
     /// is applied inside this layer's first hyper-connection read.
     fn enqueue_layer(&mut self, l: usize, t: usize, fused: bool, verify: bool) {
         let dev = &self.dev;
+        let share = self.pcie_share();
         let s = &mut self.s;
         let layer = &mut self.layers[l];
         let pending = fused.then_some(HcPending::Moe {
@@ -1697,7 +1710,7 @@ impl Engine {
             let cap = if wide_pcie {
                 i32::MAX
             } else {
-                self.pcie_cap as i32
+                share as i32
             };
             let (plan, ids, ht, ti) = (a(&s.plan), a(&s.ids), a(&self.host_tables[l]), t as i32);
             // The plan's layout at this width (MoePlan's offsets with cap(t)).
@@ -1705,6 +1718,30 @@ impl Engine {
             let gp = MoePlan::GROUP_PTR as i32;
             let (gs, et) = (gp + 2 * c, gp + 3 * c + 1);
             let (ed, mi) = (et + c, et + 2 * c);
+            if let (Some((sb, lb)), false) = (&s.stage, wide_pcie) {
+                let (stage, blob, srcs, smax) =
+                    (a(sb), ExpertBlob::BYTES as u64, a(lb), STAGE_MAX as i32);
+                unsafe {
+                    gpu::launch(
+                        self.k.pcie_staged,
+                        (1, 1, 1),
+                        (32, 1, 1),
+                        0,
+                        &self.stream,
+                        tang_moe::args![plan, ids, ht, ti, cap, gp, gs, et, ed, mi, stage, blob, srcs, smax],
+                    )
+                    .expect("launch");
+                    gpu::launch(
+                        self.k.stage_copy,
+                        (STAGE_MAX as u32, 8, 1),
+                        (256, 1, 1),
+                        0,
+                        &self.stream,
+                        tang_moe::args![srcs, stage, blob],
+                    )
+                    .expect("launch")
+                };
+            } else {
             unsafe {
                 gpu::launch(
                     self.k.pcie,
@@ -1716,6 +1753,7 @@ impl Engine {
                 )
                 .expect("launch")
             };
+            }
         }
         // Publish ids and activations; the host computes the misses while the GPU runs the
         // hits and the shared expert (not in a wide prefill window: misses go over PCIe).
@@ -1824,7 +1862,7 @@ impl Engine {
                 (1 + MoePlan::cap(t)) as i32,
                 a(&s.list),
             );
-            let (plan, streamed) = (a(&s.plan), self.pcie_cap as i32);
+            let (plan, streamed) = (a(&s.plan), share as i32);
             unsafe {
                 gpu::launch(
                     self.k.wait_if,
@@ -2090,7 +2128,7 @@ impl Engine {
             m
         };
         let streamed = if matches!(experts, Experts::Resident(_)) {
-            self.pcie_cap.min(missed.len())
+            self.pcie_share().min(missed.len())
         } else {
             0
         };
@@ -4204,6 +4242,16 @@ impl Engine {
 }
 
 impl Engine {
+    /// Experts per layer the GPU reads from the host arena itself (`pcie_cap`, at most
+    /// `STAGE_MAX` when staged).
+    fn pcie_share(&self) -> usize {
+        if self.s.stage.is_some() {
+            self.pcie_cap.min(STAGE_MAX)
+        } else {
+            self.pcie_cap
+        }
+    }
+
     /// Forget a captured window graph (recaptured on its next use), e.g. after changing
     /// `pcie_cap`, which graphs bake in.
     pub fn drop_window_graph(&mut self, t: usize, verify: bool) {

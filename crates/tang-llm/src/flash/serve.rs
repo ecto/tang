@@ -789,15 +789,47 @@ impl FlashServe {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(512),
         );
+        let log = std::env::var("TANG_FLASH_SPAN_LOG").is_ok_and(|v| v == "1");
+        let span_line = |a: usize, b: usize, ms: f64, st: &[super::engine::WinStats], mtp: f64| {
+            let (wide, narrow): (Vec<_>, Vec<_>) = st.iter().partition(|s| s.t > MAX_T);
+            let sum = |v: &[&super::engine::WinStats], f: fn(&super::engine::WinStats) -> f64| {
+                v.iter().map(|s| f(s)).sum::<f64>()
+            };
+            eprintln!(
+                "  span {a}..{b} ({} tok) {ms:.0} ms = {:.0} tok/s | wide {} win {:.0} ms (cpu {:.0}, swaps {:.0}) | narrow {} win {:.0} ms (cpu {:.0}) | mtp {mtp:.0} ms",
+                b - a,
+                (b - a) as f64 / ms * 1e3,
+                wide.len(),
+                sum(&wide, |s| s.wall_ms),
+                sum(&wide, |s| s.cpu_ms),
+                sum(&wide, |s| s.swaps as f64),
+                narrow.len(),
+                sum(&narrow, |s| s.wall_ms),
+                sum(&narrow, |s| s.cpu_ms),
+            );
+        };
         let mut a = start;
         for (p, pinned) in marks {
             if p > a {
-                prefill_span(&mut self.e, &ids[a..p], MAX_T, mtp_from, self.wide, false)?;
+                let t = Instant::now();
+                let (_, st, mtp) =
+                    prefill_span(&mut self.e, &ids[a..p], MAX_T, mtp_from, self.wide, false)?;
+                if log {
+                    span_line(a, p, t.elapsed().as_secs_f64() * 1e3, &st, mtp);
+                }
                 a = p;
             }
+            let t = Instant::now();
             self.snapshot(pinned)?;
+            if log {
+                eprintln!("  snapshot at {a} (pinned {pinned}) {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
+            }
         }
-        let next = prefill_span(&mut self.e, &ids[a..], MAX_T, mtp_from, self.wide, true)?.0;
+        let t = Instant::now();
+        let (next, st, mtp) = prefill_span(&mut self.e, &ids[a..], MAX_T, mtp_from, self.wide, true)?;
+        if log {
+            span_line(a, ids.len(), t.elapsed().as_secs_f64() * 1e3, &st, mtp);
+        }
         Ok((start, next))
     }
 
@@ -1615,5 +1647,75 @@ pub fn sampler_test(args: &[String]) -> Result<()> {
         );
     }
     println!("sampler test: {}", if ok { "PASS" } else { "FAIL" });
+    Ok(())
+}
+
+/// `tang-llm flash-serve-replay <gguf> --mtp M [--wide W] [--state-dir D|none] [--fresh] IDS...`:
+/// the served prefill (`FlashServe::prefill`, saved states and all) over recorded prompts
+/// (`--dump-ids` files), each after dropping the live sequence (`--fresh`: and every saved
+/// state), with per-span timing (`TANG_FLASH_SPAN_LOG=1` is set).
+pub fn serve_replay(args: &[String]) -> Result<()> {
+    let mut it = args.iter();
+    let gguf = PathBuf::from(it.next().context("first argument: the first GGUF shard")?);
+    let (mut mtp, mut disk, mut files, mut fresh) = (None, None, Vec::new(), false);
+    let mut wide: Option<usize> = None;
+    let mut keep = usize::MAX;
+    while let Some(a) = it.next() {
+        let mut val = || it.next().with_context(|| format!("{a} needs a value"));
+        match a.as_str() {
+            "--mtp" => mtp = Some(PathBuf::from(val()?)),
+            "--wide" => wide = Some(val()?.parse()?),
+            "--state-dir" => {
+                let v = val()?;
+                disk = (v != "none").then(|| PathBuf::from(v));
+            }
+            "--fresh" => fresh = true,
+            "--keep-upto" => keep = val()?.parse()?,
+            f => files.push(PathBuf::from(f)),
+        }
+    }
+    if let Some(w) = wide {
+        std::env::set_var("TANG_FLASH_WIDE", w.to_string());
+    }
+    std::env::set_var("TANG_FLASH_SPAN_LOG", "1");
+    let s = Settings {
+        sampling: SamplingMode::Greedy,
+        gguf,
+        mtp,
+        ctx: 32_768,
+        temp: 0.0,
+        snapshots: 6,
+        snapshot_bytes: 12_000_000_000,
+        disk,
+        dump: None,
+        warm: Vec::new(),
+    };
+    let mut me = FlashServe::load(&s)?;
+    for f in &files {
+        let ids: Vec<u32> = std::fs::read_to_string(f)?
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .filter(|w| !w.is_empty())
+            .map(|w| w.parse::<u32>())
+            .collect::<Result<Vec<_>, _>>()?;
+        let text = me.tok.decode(&ids)?;
+        me.e.reset();
+        if fresh {
+            me.snaps.clear();
+        }
+        me.snaps.retain(|s| s.tokens.len() <= keep);
+        me.line = Line::default();
+        let t = Instant::now();
+        let (reused, next) = me.prefill(&ids, &text)?;
+        let secs = t.elapsed().as_secs_f64();
+        println!(
+            "{}: {} tokens, {reused} reused, {:.2} s = {:.0} tok/s (snapshots {:.0} ms, restore {:.0} ms), next {next}",
+            f.display(),
+            ids.len(),
+            secs,
+            (ids.len() - reused) as f64 / secs,
+            me.line.snap_ms,
+            me.line.restore_ms
+        );
+    }
     Ok(())
 }

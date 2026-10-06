@@ -146,6 +146,58 @@ extern "C" __global__ void fe_pcie_patch(unsigned* plan, const unsigned* ids, co
     plan[1] = ne;
 }
 
+// Staged PCIe share: as fe_pcie_patch, but each streamed expert's group points at a VRAM staging
+// blob (`stage` + k * blob bytes) and its host address goes to `srcs[1 + k]` (count in
+// srcs[0]) for fe_stage_copy to bring over with many loads in flight before the MoE kernel.
+extern "C" __global__ void fe_pcie_patch_staged(unsigned* plan, const unsigned* ids, const unsigned* hosttab,
+                                                int t, int cap, int gp, int gs, int et, int ed, int miss,
+                                                unsigned long long stage, unsigned long long blob,
+                                                unsigned long long* srcs, int smax) {
+    if (threadIdx.x != 0) return;
+    unsigned ng = plan[0], ne = plan[1];
+    const unsigned nm = plan[2];
+    int k = 0;
+    for (unsigned i = 0; i < nm && (int)i < cap && k < smax; i++) {
+        const unsigned e = plan[miss + i];
+        const unsigned lo = hosttab[2 * e], hi = hosttab[2 * e + 1];
+        if (lo == 0 && hi == 0) continue;
+        srcs[1 + k] = ((unsigned long long)hi << 32) | lo;
+        const unsigned long long d = stage + (unsigned long long)k * blob;
+        k++;
+        plan[gp + 2 * ng] = (unsigned)d;
+        plan[gp + 2 * ng + 1] = (unsigned)(d >> 32);
+        plan[gs + ng] = ne;
+        for (int j = 0; j < t * 10; j++)
+            if (ids[j] == e) { plan[et + ne] = j / 10; plan[ed + ne] = j; ne++; }
+        ng++;
+    }
+    srcs[0] = k;
+    plan[gs + ng] = ne;
+    plan[0] = ng;
+    plan[1] = ne;
+}
+
+// Copy the staged experts from mapped host memory: grid (smax, chunks), 256 threads, 4 x 16 B
+// loads in flight per thread. `blob` is a multiple of 16.
+extern "C" __global__ void fe_stage_copy(const unsigned long long* srcs, unsigned long long stage,
+                                         unsigned long long blob) {
+    const unsigned long long n = srcs[0];
+    if (blockIdx.x >= n) return;
+    const uint4* src = (const uint4*)srcs[1 + blockIdx.x];
+    uint4* dst = (uint4*)(stage + blockIdx.x * blob);
+    const unsigned long long words = blob / 16;
+    const unsigned long long per = (words + gridDim.y - 1) / gridDim.y;
+    const unsigned long long a = blockIdx.y * per;
+    const unsigned long long b = a + per < words ? a + per : words;
+    const unsigned stride = blockDim.x;
+    unsigned long long i = a + threadIdx.x;
+    for (; i + 3 * stride < b; i += 4 * stride) {
+        uint4 v0 = src[i], v1 = src[i + stride], v2 = src[i + 2 * stride], v3 = src[i + 3 * stride];
+        dst[i] = v0; dst[i + stride] = v1; dst[i + 2 * stride] = v2; dst[i + 3 * stride] = v3;
+    }
+    for (; i < b; i += stride) dst[i] = src[i];
+}
+
 // The doorbell's wait for CPU rows, skipped when this layer has no CPU misses: if the plan's
 // missing count is at most `streamed` (the PCIe share), write an empty row list and return;
 // otherwise as tang-moe's db_wait (one thread spins on the mapped flag, the block copies).
