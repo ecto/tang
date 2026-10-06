@@ -116,6 +116,9 @@ impl MissTimes {
 
 /// Max distinct missed experts per call (every routed slot of a full window).
 pub const MAX_MISSED: usize = MAX_T * TOPK;
+/// Widest activation set [`MissExec::run`] takes (prefill windows); each job still has at most
+/// `MAX_T` tokens.
+pub const MAX_WIDE: usize = 64;
 
 struct SendPtr<T>(*mut T);
 impl<T> Clone for SendPtr<T> {
@@ -152,7 +155,9 @@ impl MissExec {
             isa,
             split: 3,
             tiled: false,
-            x: (0..MAX_T).map(|_| XPrep::new(HIDDEN)).collect(),
+            x: (0..MAX_WIDE).map(|_| XPrep::new(HIDDEN)).collect(),
+            // Per-job stride is MAX_T tokens: callers (incl. the wide path) split each job's
+            // token list into chunks of at most MAX_T before `run`.
             h: vec![0.0; MAX_MISSED * MAX_T * FF],
             hprep: (0..MAX_MISSED * MAX_T).map(|_| XPrep::new(FF)).collect(),
         }
@@ -175,10 +180,10 @@ impl MissExec {
         if jobs.is_empty() {
             return tm;
         }
-        assert!(jobs.len() <= MAX_MISSED && t <= MAX_T);
+        assert!(jobs.len() <= MAX_MISSED && t <= MAX_WIDE);
         let t0 = Instant::now();
         let lx = QAct { m: t, k: HIDDEN };
-        let mut used = [false; MAX_T];
+        let mut used = [false; MAX_WIDE];
         for j in jobs {
             assert!(
                 j.blob.len() >= ExpertBlob::BYTES && !j.toks.is_empty() && j.toks.len() <= MAX_T

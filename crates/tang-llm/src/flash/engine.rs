@@ -403,7 +403,12 @@ struct Scratch {
     out_ids: B,
     amax: B,
     stamps: B,
+    /// PCIe share staging (`TANG_FLASH_PCIE_STAGE`): STAGE_MAX expert blobs and the source list.
+    stage: Option<(B, B)>,
 }
+
+/// Experts per layer the staged PCIe share brings into VRAM before the MoE kernel.
+const STAGE_MAX: usize = 32;
 
 /// Raw kernels: the engine's and the doorbell's.
 struct Kern {
@@ -417,6 +422,8 @@ struct Kern {
     argmax: Fun,
     argmax2: Fun,
     pcie: Fun,
+    pcie_staged: Fun,
+    stage_copy: Fun,
     wait_if: Fun,
     m_embed: Fun,
     m_cat: Fun,
@@ -960,6 +967,9 @@ impl Engine {
             out_ids: z(MAX_T),
             amax: z(MAX_T * 64 * 2),
             stamps: z(48 * 8 * 2),
+            stage: std::env::var("TANG_FLASH_PCIE_STAGE")
+                .is_ok_and(|v| v == "1")
+                .then(|| (z(STAGE_MAX * ExpertBlob::BYTES / 4), z(2 * (1 + STAGE_MAX)))),
         };
         dev.sync();
         let t_dense = t1.elapsed().as_secs_f64();
@@ -1046,6 +1056,8 @@ impl Engine {
             argmax: f(&m, "fe_argmax1")?,
             argmax2: f(&m, "fe_argmax2")?,
             pcie: f(&m, "fe_pcie_patch")?,
+            pcie_staged: f(&m, "fe_pcie_patch_staged")?,
+            stage_copy: f(&m, "fe_stage_copy")?,
             wait_if: f(&m, "fe_db_wait_if")?,
             publish: f(&db, "db_publish")?,
             wait: f(&db, "db_wait")?,
@@ -1499,6 +1511,7 @@ impl Engine {
     /// is applied inside this layer's first hyper-connection read.
     fn enqueue_layer(&mut self, l: usize, t: usize, fused: bool, verify: bool) {
         let dev = &self.dev;
+        let share = self.pcie_share();
         let s = &mut self.s;
         let layer = &mut self.layers[l];
         let pending = fused.then_some(HcPending::Moe {
@@ -1694,28 +1707,51 @@ impl Engine {
         }
         let wide_pcie = self.wide && std::env::var("TANG_FLASH_WIDE_PCIE").is_ok_and(|v| v == "1");
         if self.pcie_cap > 0 || wide_pcie {
-            let cap = if wide_pcie {
-                i32::MAX
-            } else {
-                self.pcie_cap as i32
-            };
+            let cap = if wide_pcie { i32::MAX } else { share as i32 };
             let (plan, ids, ht, ti) = (a(&s.plan), a(&s.ids), a(&self.host_tables[l]), t as i32);
             // The plan's layout at this width (MoePlan's offsets with cap(t)).
             let c = MoePlan::cap(t) as i32;
             let gp = MoePlan::GROUP_PTR as i32;
             let (gs, et) = (gp + 2 * c, gp + 3 * c + 1);
             let (ed, mi) = (et + c, et + 2 * c);
-            unsafe {
-                gpu::launch(
-                    self.k.pcie,
-                    (1, 1, 1),
-                    (32, 1, 1),
-                    0,
-                    &self.stream,
-                    tang_moe::args![plan, ids, ht, ti, cap, gp, gs, et, ed, mi],
-                )
-                .expect("launch")
-            };
+            if let (Some((sb, lb)), false) = (&s.stage, wide_pcie) {
+                let (stage, blob, srcs, smax) =
+                    (a(sb), ExpertBlob::BYTES as u64, a(lb), STAGE_MAX as i32);
+                unsafe {
+                    gpu::launch(
+                        self.k.pcie_staged,
+                        (1, 1, 1),
+                        (32, 1, 1),
+                        0,
+                        &self.stream,
+                        tang_moe::args![
+                            plan, ids, ht, ti, cap, gp, gs, et, ed, mi, stage, blob, srcs, smax
+                        ],
+                    )
+                    .expect("launch");
+                    gpu::launch(
+                        self.k.stage_copy,
+                        (STAGE_MAX as u32, 8, 1),
+                        (256, 1, 1),
+                        0,
+                        &self.stream,
+                        tang_moe::args![srcs, stage, blob],
+                    )
+                    .expect("launch")
+                };
+            } else {
+                unsafe {
+                    gpu::launch(
+                        self.k.pcie,
+                        (1, 1, 1),
+                        (32, 1, 1),
+                        0,
+                        &self.stream,
+                        tang_moe::args![plan, ids, ht, ti, cap, gp, gs, et, ed, mi],
+                    )
+                    .expect("launch")
+                };
+            }
         }
         // Publish ids and activations; the host computes the misses while the GPU runs the
         // hits and the shared expert (not in a wide prefill window: misses go over PCIe).
@@ -1824,7 +1860,7 @@ impl Engine {
                 (1 + MoePlan::cap(t)) as i32,
                 a(&s.list),
             );
-            let (plan, streamed) = (a(&s.plan), self.pcie_cap as i32);
+            let (plan, streamed) = (a(&s.plan), share as i32);
             unsafe {
                 gpu::launch(
                     self.k.wait_if,
@@ -2090,7 +2126,7 @@ impl Engine {
             m
         };
         let streamed = if matches!(experts, Experts::Resident(_)) {
-            self.pcie_cap.min(missed.len())
+            self.pcie_share().min(missed.len())
         } else {
             0
         };
@@ -2116,41 +2152,21 @@ impl Engine {
             // SAFETY: ROWS holds PARTS_ROWS rows; the GPU reads them only after FLAG_B.
             unsafe { self.exec.run(xq, t, &jobs, self.mb.rows_ptr()) };
         } else {
-            // Wide: in slices of MAX_T tokens (the executor's width), each with its own
-            // activations repacked and the jobs' tokens that fall in it; rows land at their
-            // window-wide dst. Each row's arithmetic is the T <= 8 path's.
-            let qa = tang_moe::contract::QAct { m: t, k: HIDDEN };
-            for s0 in (0..t).step_by(MAX_T) {
-                let n = MAX_T.min(t - s0);
-                let qs = tang_moe::contract::QAct { m: n, k: HIDDEN };
-                let mut sub = vec![0u32; qs.words()];
-                let (cw, sw) = (HIDDEN / 4, HIDDEN / 32);
-                sub[..n * cw].copy_from_slice(&xq[qa.codes(s0)..qa.codes(s0) + n * cw]);
-                sub[qs.scales(0)..qs.scales(0) + n * sw]
-                    .copy_from_slice(&xq[qa.scales(s0)..qa.scales(s0) + n * sw]);
-                sub[qs.sums(0)..qs.sums(0) + n * sw]
-                    .copy_from_slice(&xq[qa.sums(s0)..qa.sums(s0) + n * sw]);
-                let toks: Vec<Vec<(usize, usize)>> = jobs
-                    .iter()
-                    .map(|j| {
-                        j.toks
-                            .iter()
-                            .filter(|&&(tk, _)| tk >= s0 && tk < s0 + n)
-                            .map(|&(tk, d)| (tk - s0, d))
-                            .collect()
-                    })
-                    .collect();
-                let sj: Vec<MissJob> = jobs
-                    .iter()
-                    .zip(&toks)
-                    .filter(|(_, tk)| !tk.is_empty())
-                    .map(|(j, tk)| MissJob {
+            // Wide: one executor pass over the whole window per batch of jobs, so each missed
+            // expert's weights are read once (in chunks of at most MAX_T tokens per job) rather
+            // than once per 8-token slice. Each row's arithmetic is the T <= 8 path's.
+            let chunks: Vec<MissJob> = jobs
+                .iter()
+                .flat_map(|j| {
+                    j.toks.chunks(MAX_T).map(move |c| MissJob {
                         blob: j.blob,
-                        toks: tk,
+                        toks: c,
                     })
-                    .collect();
+                })
+                .collect();
+            for b in chunks.chunks(tang_moe::miss::MAX_MISSED) {
                 // SAFETY: as above; ROWS holds the wide plan's rows (tang-moe `WIDE_CAP`).
-                unsafe { self.exec.run(&sub, n, &sj, self.mb.rows_ptr()) };
+                unsafe { self.exec.run(xq, t, b, self.mb.rows_ptr()) };
             }
         }
         let dsts: Vec<u32> = missed
@@ -4204,6 +4220,16 @@ impl Engine {
 }
 
 impl Engine {
+    /// Experts per layer the GPU reads from the host arena itself (`pcie_cap`, at most
+    /// `STAGE_MAX` when staged).
+    fn pcie_share(&self) -> usize {
+        if self.s.stage.is_some() {
+            self.pcie_cap.min(STAGE_MAX)
+        } else {
+            self.pcie_cap
+        }
+    }
+
     /// Forget a captured window graph (recaptured on its next use), e.g. after changing
     /// `pcie_cap`, which graphs bake in.
     pub fn drop_window_graph(&mut self, t: usize, verify: bool) {
@@ -4300,7 +4326,27 @@ impl Engine {
                 self.keys.push(base + e);
             }
         }
-        st.swaps = self.boundary()?;
+        // A wide window is 8 decode windows' worth of routing: adapt the cache after every one
+        // (`TANG_FLASH_WIDE_ADAPT`, default 1; 0 keeps the decode cadence). Cold prompts are
+        // CPU-miss bound here, so moving their hot experts into VRAM sooner pays.
+        let every = std::env::var("TANG_FLASH_WIDE_ADAPT")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(1);
+        let mut old = None;
+        if let Experts::Resident(rc) = &mut self.experts {
+            let o = rc.policy.lfu.set_every(every);
+            if o == 0 || every == 0 {
+                rc.policy.lfu.set_every(o); // adaptation off, or the decode cadence asked for
+            } else {
+                old = Some(o);
+            }
+        }
+        let r = self.boundary();
+        if let (Some(o), Experts::Resident(rc)) = (old, &mut self.experts) {
+            rc.policy.lfu.set_every(o);
+        }
+        st.swaps = r?;
         self.counter = self.counter.wrapping_add(1);
         if self.use_graphs && !self.wide_graphs.contains_key(&t) {
             let stream = ManuallyDrop::new(Stream(self.dev.cu_stream()));

@@ -24,9 +24,11 @@ Decode, mew (RTX 3090 24 GB, i9-12900K, 64 GB), 4K context, 512 tokens, greedy, 
   `flash-tcheck` (a token's bits are the same at any window width) pass.
 - **Parity** vs the pure-Rust reference `flash-ref`: KL 0.0017–0.0067, inside the int8-activation
   band. The reference matches llama.cpp at KL 0.0015–0.007.
-- **Prefill**: ~350–370 tok/s with 8-token windows (default). 64-token windows reach 580 / 421
-  tok/s at 2K / 10K in `flash-prefill-bench`, but a served frog turn got slower, so they're off
-  (`TANG_FLASH_WIDE=64` to enable).
+- **Prefill**: 64-token windows are the served default (`TANG_FLASH_WIDE=0` for 8-token windows).
+  frog find-answer turn 1 (10,373 tokens): cold TTFT 35.9 s (8-token: 37.9 s), tools block
+  cached 8.2 s (10.7 s). Cold prompts are bound by CPU misses (expert weights read at ~30 GB/s
+  of DRAM) until the cache adapts; warm, `flash-serve-replay` runs 393 tok/s. The first wide
+  windows after load take ~33 s once (absorbed by the startup capture).
 - **Serving**: `tang-llm serve <gguf> --mtp <gguf>` speaks frog's OpenAI dialect: Qwen XML tool
   calls, thinking as `reasoning_content`, bitwise-exact prefix reuse (running + positional state
   snapshots, tools/system blocks pinned to disk), top-k/top-p/presence in the window graph.
@@ -53,12 +55,14 @@ N-gram (PLE) rows are read from NVMe with O_DIRECT while layer 0 runs.
    frozen. Use held-out engine acceptance and throughput to select weights, then expand training
    beyond the initial short-window pilot as needed. Neither pilot checkpoint improves the
    deployed table overall; keep the original drafter (see the measured results above).
-2. **Why served wide prefill is slower than the bench.** Likely the chunk splitting at saved-state
-   points and mixed window widths. Fix, then turn `TANG_FLASH_WIDE=64` back on.
+2. **Served wide prefill** (done): spans were never the problem; the wide CPU-miss path re-read
+   every missed expert per 8-token slice. Fixed (one executor pass per window) and the cache now
+   adapts every wide window. `flash-serve-replay` reproduces the server's prefill offline.
 3. **Tensor-core native GEMV for prefill** (`fl_natmma`, `TANG_FLASH_NATW=mma`) is exact but
    slower than dp4a (187 vs ~100 µs at T=32). Prefill ≥ 1,000 tok/s needs it plus a tiled bf16 path.
-4. **More loads in flight per host expert group** when the GPU reads missed experts over PCIe
-   (today ~4–5 GB/s effective, latency-bound; the link does 25 GB/s).
+4. **GPU reads of host experts** (measured, not adopted): staging the per-layer PCIe share into
+   VRAM with a wide copy kernel (`TANG_FLASH_PCIE_STAGE=1`) is no faster than direct reads, and
+   any share (8/16/32 per layer) loses to CPU-only misses both at T=8 and in wide windows.
 5. MTP: fuse chain steps; eh_proj and HC GEMVs are ~0.3 ms each.
 
 ## Working on mew

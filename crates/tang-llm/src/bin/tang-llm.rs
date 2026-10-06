@@ -232,6 +232,7 @@ fn main() -> Result<()> {
         "flash-resume-test" => return tang_llm::flash::serve::resume_test(&args[1..]),
         "flash-sampler-test" => return tang_llm::flash::serve::sampler_test(&args[1..]),
         "flash-prefill-bench" => return tang_llm::flash::serve::prefill_bench(&args[1..]),
+        "flash-serve-replay" => return tang_llm::flash::serve::serve_replay(&args[1..]),
         "flash-gemv-check" => return tang_llm::flash::engine::gemv_check(&dir),
         _ => {}
     }
