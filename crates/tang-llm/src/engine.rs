@@ -33,6 +33,12 @@ pub struct Request {
     /// [`ThinkBudget`]); `None` is unlimited.
     pub thinking_budget: Option<usize>,
     pub sampling: Sampling,
+    /// The request named a temperature (`sampling.temperature` is otherwise the default).
+    pub temperature_set: bool,
+    /// Which of `sampling.top_k` / `top_p` the request named, and its presence penalty.
+    pub top_k_set: bool,
+    pub top_p_set: bool,
+    pub presence_penalty: Option<f32>,
     pub max_tokens: Option<usize>,
     pub stop: Vec<String>,
     /// The conversation this continues (`prompt_cache_key`), so it runs in that
@@ -200,7 +206,7 @@ struct Slot<B> {
 }
 
 /// Qwen3's suggested way to end reasoning early: say so, then close the block.
-const WRAP_UP: &str =
+pub const WRAP_UP: &str =
     "\n\nConsidering the limited time, I have to give the solution based on the thinking directly now.\n";
 
 /// Caps reasoning at a token budget. Fed each generated token, it tracks whether decoding is

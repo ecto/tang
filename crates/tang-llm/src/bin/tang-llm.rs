@@ -43,6 +43,18 @@
 //! drafter without a model: tokens per verify forward and the speedup the cost curve predicts
 //! (`TANG_DRAFT_*` settings; `TANG_DRAFT_COST` defaults to the CUDA curve).
 //!
+//! `tang-llm gguf-info <file.gguf>` — metadata and a tensor inventory of a GGUF (all shards).
+//! `tang-llm gguf-rows <file.gguf> <tensor> <first> <n> <out.f32>` — rows dequantized to raw f32.
+//! `tang-llm flash-mtp <main.gguf> <mtp.gguf> --ids-file F [--from I] [--depth D] [--joint-hnorm]
+//! [--main-head] [--dump DIR]` — teacher-forced acceptance of chained MTP drafts (`flash::mtp`).
+//! `tang-llm flash-requant <file.gguf> [--no-errors] [policy...]` — per source type, the error of
+//! requantizing dense weights to Q4X / searched Q4X / Q8_0, and the dense bytes a decode step reads
+//! under each policy (`flash::requant::DensePolicy`).
+//! `tang-llm flash-ref <first shard.gguf> <token ids...> [--ids-file F] [--top K] [--last N]
+//! [--dump DIR] [-v]` — Qwen3.8-Flash-Next's slow f32 reference forward on the CPU: top-K
+//! next-token logprobs per position as JSON lines, and with `--dump` the last position's
+//! per-layer intermediates (see `flash::reference`).
+//!
 //! Every command takes `--device auto|metal|cuda|cpu` (auto: Metal, then CUDA, then the CPU,
 //! whichever is built in and present).
 
@@ -159,6 +171,63 @@ fn main() -> Result<()> {
     };
     if args.first().map(String::as_str) == Some("serve") {
         return serve(backend, &args[1..]);
+    }
+    if cmd == "gguf-info" {
+        let g = tang_llm::gguf::Gguf::open(&dir)?;
+        print!("{}", tang_llm::flash::inventory(&g)?);
+        return Ok(());
+    }
+    if cmd == "gguf-rows" {
+        // gguf-rows <gguf> <tensor> <first row> <n rows> <out.f32>: dequantized rows, raw f32
+        let usage = "gguf-rows <gguf> <tensor> <first row> <n rows> <out.f32>";
+        let g = tang_llm::gguf::Gguf::open(&dir)?;
+        let t = g.info(args.get(2).context(usage)?)?;
+        let first: usize = args.get(3).context(usage)?.parse().context(usage)?;
+        let n: usize = args.get(4).context(usage)?.parse().context(usage)?;
+        let v = g.rows(t, first, n)?;
+        let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        std::fs::write(args.get(5).context(usage)?, bytes)?;
+        return Ok(());
+    }
+    #[cfg(feature = "mtp-train")]
+    if cmd == "flash-mtp-train" {
+        return tang_llm::flash::mtp_train::cli(&args[1..]);
+    }
+    if cmd == "flash-mtp" {
+        return tang_llm::flash::mtp::cli(&args[1..]);
+    }
+    if cmd == "flash-requant" {
+        use tang_llm::flash::requant::{report, DensePolicy};
+        let g = tang_llm::gguf::Gguf::open(&dir)?;
+        let errors = !args[2..].iter().any(|a| a == "--no-errors");
+        let extra = args[2..]
+            .iter()
+            .filter(|a| *a != "--no-errors")
+            .map(|a| DensePolicy::parse(a))
+            .collect::<Result<Vec<_>>>()?;
+        print!("{}", report(&g, &extra, errors)?);
+        return Ok(());
+    }
+    if cmd == "flash-tokenize" {
+        return tang_llm::flash::tokenize::cli(&args[1..]);
+    }
+    if cmd == "flash-ref" {
+        return tang_llm::flash::reference::cli(&args[1..]);
+    }
+    #[cfg(feature = "cuda")]
+    match cmd {
+        "flash-mtp-prefix" => return tang_llm::flash::cli::mtp_prefix(&args[1..]),
+        "flash-generate" => return tang_llm::flash::cli::generate(&args[1..]),
+        "flash-parity" => return tang_llm::flash::cli::parity(&args[1..]),
+        "flash-bench-panel" => return tang_llm::flash::cli::bench_panel(&args[1..]),
+        "flash-bench" => return tang_llm::flash::cli::bench(&args[1..]),
+        "flash-spec-test" => return tang_llm::flash::cli::spec_test(&args[1..]),
+        "flash-tcheck" => return tang_llm::flash::cli::tcheck(&args[1..]),
+        "flash-resume-test" => return tang_llm::flash::serve::resume_test(&args[1..]),
+        "flash-sampler-test" => return tang_llm::flash::serve::sampler_test(&args[1..]),
+        "flash-prefill-bench" => return tang_llm::flash::serve::prefill_bench(&args[1..]),
+        "flash-gemv-check" => return tang_llm::flash::engine::gemv_check(&dir),
+        _ => {}
     }
     if cmd == "sim-spec" {
         return sim_spec(&args[1..]);
@@ -287,7 +356,86 @@ fn run<D: ComputeDevice>(
     Ok(())
 }
 
+/// `tang-llm serve <first shard.gguf> [--mtp M] [--host H] [--port P] [--ctx N] [--api-key-file F]
+/// [--temp T] [--snapshots N] [--dump-ids DIR]`: the Flash-Next engine (`flash::serve`).
+#[cfg(feature = "cuda")]
+fn serve_flash(args: &[String]) -> Result<()> {
+    use tang_llm::flash::serve::{default_disk, FlashServe, Settings};
+    let gguf = PathBuf::from(&args[0]);
+    let mut s = Settings {
+        sampling: tang_llm::flash::serve::SamplingMode::Greedy,
+        disk: default_disk(&gguf),
+        gguf,
+        mtp: None,
+        ctx: 32_768,
+        temp: 0.0,
+        snapshots: 6,
+        warm: Vec::new(),
+        snapshot_bytes: std::env::var("TANG_FLASH_SNAP_GB")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .map_or(12e9, |g| g * 1e9) as usize,
+        dump: None,
+    };
+    let (mut host, mut port) = ("127.0.0.1".to_string(), 8911u16);
+    let mut key = std::env::var("TANG_API_KEY").ok();
+    let mut it = args[1..].iter();
+    while let Some(a) = it.next() {
+        let mut val = || it.next().with_context(|| format!("{a} needs a value"));
+        match a.as_str() {
+            "--host" => host = val()?.clone(),
+            "--port" => port = val()?.parse()?,
+            "--ctx" => s.ctx = val()?.parse()?,
+            "--mtp" => s.mtp = Some(PathBuf::from(val()?)),
+            "--temp" => s.temp = val()?.parse()?,
+            "--sampling" => {
+                s.sampling = match val()?.as_str() {
+                    "greedy" => tang_llm::flash::serve::SamplingMode::Greedy,
+                    "model-card" => tang_llm::flash::serve::SamplingMode::ModelCard,
+                    m => bail!("--sampling greedy|model-card, not {m}"),
+                }
+            }
+            "--snapshots" => s.snapshots = val()?.parse()?,
+            "--warm-request" => s.warm.push(PathBuf::from(val()?)),
+            "--dump-ids" => s.dump = Some(PathBuf::from(val()?)),
+            "--api-key-file" => {
+                let path = val()?;
+                key =
+                    Some(std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?);
+            }
+            other => bail!("unknown option {other}"),
+        }
+    }
+    let key = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
+    if key.is_none() && !host.starts_with("127.") && host != "localhost" {
+        eprintln!("tang-llm: warning: listening on {host} without an API key; anyone who can reach it can use it");
+    }
+    let name = s
+        .gguf
+        .file_name()
+        .map(|n| {
+            n.to_string_lossy()
+                .split("-0000")
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .unwrap_or_default();
+    let opts = tang_llm::server::Options {
+        addr: format!("{host}:{port}"),
+        model: Some(name),
+        key,
+        dtype: Dtype::Q4,
+        hardware: probe(Backend::Cuda),
+    };
+    tang_llm::server::serve(opts, move |_name: &str| FlashServe::load(&s))
+}
+
 fn serve(backend: Backend, args: &[String]) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    if args.first().is_some_and(|a| a.ends_with(".gguf")) {
+        return serve_flash(args);
+    }
     let spec = args
         .first()
         .context("usage: tang-llm serve <model> [--host H] [--port P] [--ctx N] [--api-key-file F] [--f32 | --q4] [--no-speculate] [--kv-slots N|auto]")?

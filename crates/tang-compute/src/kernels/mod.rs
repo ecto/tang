@@ -45,3 +45,9 @@ pub mod noise_cuda;
 
 #[cfg(feature = "cuda")]
 pub mod llm_cuda;
+
+#[cfg(feature = "cuda")]
+pub mod flash_cuda;
+
+#[cfg(feature = "cuda")]
+pub mod native_cuda;
