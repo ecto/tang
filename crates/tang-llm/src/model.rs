@@ -63,6 +63,7 @@ impl<D: ComputeDevice> Model<D> {
     /// Load a checkpoint directory. Matrices are kept in `dtype` on device; norms stay f32.
     pub fn load(dev: D, dir: &Path, max_ctx: usize, dtype: Dtype) -> Result<Self> {
         let cfg = Config::from_json(&std::fs::read(dir.join("config.json"))?)?;
+        cfg.query_rescale()?;
         let w = Weights::open(dir)?;
         let gemma = cfg.is_gemma();
         // Multimodal checkpoints keep the language model under `language_model.`.
@@ -329,7 +330,7 @@ impl<D: ComputeDevice> Model<D> {
         all: bool,
     ) -> Result<Vec<f32>> {
         let x = self.embed(tokens)?;
-        self.forward_hidden(x, tokens, cache, all, true)
+        self.forward_layers(x, tokens, cache, all, true, false)
     }
 
     /// An image's embeddings, ready to stand in for its placeholder tokens.
@@ -397,16 +398,12 @@ impl<D: ComputeDevice> Model<D> {
             let seg = self.dev.slice_buffer(&x, start * h, len * h);
             let last = r + 1 == pieces.len();
             let logits =
-                self.forward_hidden(seg, &tokens[start..start + len], cache, all || last, !img)?;
+                self.forward_layers(seg, &tokens[start..start + len], cache, all, !img, true)?;
             if all {
                 out.extend(logits);
             } else if last {
                 out = logits;
             }
-        }
-        if !all {
-            let v = self.cfg.vocab_size;
-            out = out.split_off(out.len() - v);
         }
         Ok(out)
     }
@@ -424,15 +421,51 @@ impl<D: ComputeDevice> Model<D> {
         Ok(x)
     }
 
+    /// Qwen conditioning used by diffusion pipelines: hidden_states[-2], before
+    /// the final decoder layer, final RMSNorm, and language-model head.
+    /// Returns a device-resident `[tokens.len(), hidden_size]` tensor. This uses
+    /// a separate cache so conditioning never changes a chat conversation's KV.
+    pub fn encode_penultimate(&self, tokens: &[u32]) -> Result<D::Buffer> {
+        anyhow::ensure!(!tokens.is_empty(), "no tokens");
+        anyhow::ensure!(tokens.len() <= self.max_ctx, "context full");
+        anyhow::ensure!(!self.layers.is_empty(), "encoder has no layers");
+        let mut x = self.embed(tokens)?;
+        let mut cache = self.new_cache();
+        self.decode_layers(
+            &mut x,
+            &mut cache,
+            tokens.len(),
+            0,
+            true,
+            self.layers.len() - 1,
+            true,
+        )?;
+        Ok(x)
+    }
+
     /// Like `forward`, from hidden states instead of token ids (so image features can stand
     /// in for placeholder tokens). `tokens` are what the cache records for these positions.
     pub fn forward_hidden(
+        &self,
+        x: D::Buffer,
+        tokens: &[u32],
+        cache: &mut Cache<D::Buffer>,
+        all: bool,
+        causal: bool,
+    ) -> Result<Vec<f32>> {
+        self.forward_layers(x, tokens, cache, all, causal, false)
+    }
+
+    /// `forward_hidden`; `bound` waits for the GPU every few layers on large pieces, so
+    /// multimodal and conditioning prefill don't retain every temporary at once.
+    fn forward_layers(
         &self,
         mut x: D::Buffer,
         tokens: &[u32],
         cache: &mut Cache<D::Buffer>,
         all: bool,
         causal: bool,
+        bound: bool,
     ) -> Result<Vec<f32>> {
         let c = &self.cfg;
         let dev = &self.dev;
@@ -444,7 +477,7 @@ impl<D: ComputeDevice> Model<D> {
             self.max_ctx
         );
         let (h, eps) = (c.hidden_size, c.rms_norm_eps);
-        self.decode_layers(&mut x, cache, s, pos, causal)?;
+        self.decode_layers(&mut x, cache, s, pos, causal, self.layers.len(), bound)?;
         let (rows, x) = if all {
             (s, x)
         } else {
@@ -462,6 +495,7 @@ impl<D: ComputeDevice> Model<D> {
 
 impl<D: ComputeDevice> Model<D> {
     /// The decoder layers over hidden states `x` (`[s, hidden]`) at positions `pos..`.
+    #[allow(clippy::too_many_arguments)]
     fn decode_layers(
         &self,
         x: &mut D::Buffer,
@@ -469,6 +503,8 @@ impl<D: ComputeDevice> Model<D> {
         s: usize,
         pos: usize,
         causal: bool,
+        layer_limit: usize,
+        bound: bool,
     ) -> Result<()> {
         let c = &self.cfg;
         let dev = &self.dev;
@@ -480,6 +516,7 @@ impl<D: ComputeDevice> Model<D> {
         );
         let (qd, kvd, ff) = (c.q_dim(), c.kv_dim(), c.intermediate_size);
         let eps = c.rms_norm_eps;
+        let query_scale = c.query_rescale()?;
         let shared = cache.pool().clone();
         let mut pool = blocks::lock(&shared);
         let ids = blocks::prepare(dev, &mut pool, cache, pos, pos + s);
@@ -489,12 +526,12 @@ impl<D: ComputeDevice> Model<D> {
             table: &table,
             block: BLOCK,
         };
-        for (l, w) in self.layers.iter().enumerate() {
+        for (l, w) in self.layers.iter().take(layer_limit).enumerate() {
             let (kp, vp) = pool.layer(l);
             let a = dev.rms_norm(x, &w.attn_norm, s, h, eps);
             let qkv = dev.linear(&a, &w.wqkv, s, h, qd + 2 * kvd);
             let (cos, sin) = &self.ropes[w.rope];
-            let q = dev.attention_prep_paged(
+            let mut q = dev.attention_prep_paged(
                 &qkv,
                 w.q_norm.as_ref(),
                 w.k_norm.as_ref(),
@@ -508,6 +545,9 @@ impl<D: ComputeDevice> Model<D> {
                 pos,
                 eps,
             );
+            if query_scale != 1.0 {
+                dev.scale_buffer(&mut q, query_scale);
+            }
             let att =
                 dev.kv_attention_paged(&q, kp, vp, &pages, pos, s, (nh, nkv, hd), w.window, causal);
             let mut o = dev.linear(&att, &w.wo, s, qd, h);
@@ -528,9 +568,15 @@ impl<D: ComputeDevice> Model<D> {
                 d = dev.rms_norm(&d, n, s, h, eps);
             }
             *x = dev.add_tensors_buf(x, &d, s * h);
-            // Let the GPU start on what's encoded so far.
+            // Large multimodal and conditioning pieces retain every temporary until their
+            // command buffers are released. Bound that retention across deep models;
+            // text prefill and decode keep the asynchronous path.
             if l % 4 == 3 {
-                dev.flush();
+                if bound && s > 128 {
+                    dev.sync();
+                } else {
+                    dev.flush();
+                }
             }
         }
         Ok(())
@@ -564,4 +610,152 @@ fn rope_tables(head_dim: usize, max_pos: usize, theta: f32, scale: f32) -> (Vec<
         }
     }
     (cos, sin)
+}
+
+#[cfg(test)]
+mod conditioning_tests {
+    use super::*;
+    use tang_compute::CpuDevice;
+
+    fn tiny_model() -> Model<CpuDevice> {
+        let dev = CpuDevice::new();
+        let cfg = Config::from_json(br#"{"model_type":"qwen3","hidden_size":4,"intermediate_size":4,"num_hidden_layers":2,"num_attention_heads":1,"num_key_value_heads":1,"vocab_size":2,"rms_norm_eps":0.000001,"rope_theta":10000}"#).unwrap();
+        let layer = |scale: f32| Layer {
+            attn_norm: dev.upload(&[1.; 4]),
+            wqkv: dev.upload(&[0.; 48]),
+            wo: dev.upload(&[0.; 16]),
+            q_norm: None,
+            k_norm: None,
+            mlp_norm: dev.upload(&[1.; 4]),
+            w_gate_up: dev.upload(&[
+                1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 1., 0., 0., 0., 0.,
+                1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
+            ]),
+            w_down: dev.upload(&[
+                scale, 0., 0., 0., 0., scale, 0., 0., 0., 0., scale, 0., 0., 0., 0., scale,
+            ]),
+            post_attn_norm: None,
+            post_mlp_norm: None,
+            window: 0,
+            rope: 0,
+        };
+        let layers = vec![layer(1.), layer(2.)];
+        let (cos, sin) = rope_tables(4, 2048, 10000., 1.);
+        Model {
+            cfg,
+            embed: dev.upload(&[1., 2., 3., 4., 4., 3., 2., 1.]),
+            layers,
+            norm: dev.upload(&[10.; 4]),
+            lm_head: Some(dev.upload(&[0.; 8])),
+            ropes: vec![(dev.upload(&cos), dev.upload(&sin))],
+            embed_scale: None,
+            vision: None,
+            max_ctx: 2048,
+            pool: new_pool(2, 4, false, usize::MAX),
+            dev,
+        }
+    }
+
+    #[test]
+    fn explicit_attention_scalar_matches_rescaled_query_projection() {
+        let make = |scalar, projection_scale: f32| {
+            let mut model = tiny_model();
+            model.cfg.query_pre_attn_scalar = scalar;
+            for layer in &mut model.layers {
+                let mut qkv = vec![0.; 48];
+                let mut identity = vec![0.; 16];
+                for i in 0..4 {
+                    qkv[i * 4 + i] = projection_scale;
+                    qkv[16 + i * 4 + i] = 1.;
+                    qkv[32 + i * 4 + i] = 1.;
+                    identity[i * 4 + i] = 1.;
+                }
+                layer.wqkv = model.dev.upload(&qkv);
+                layer.wo = model.dev.upload(&identity);
+            }
+            model.lm_head = Some(model.dev.upload(&[1., 0., 0., 0., 0., 1., 0., 0.]));
+            let mut cache = model.new_cache();
+            model.forward(&[0, 1, 0], &mut cache, true).unwrap()
+        };
+        let actual = make(Some(8.), 1.);
+        let reference = make(None, (4f32 / 8.).sqrt());
+        let baseline = make(None, 1.);
+        assert!(actual
+            .iter()
+            .zip(&reference)
+            .all(|(a, b)| (a - b).abs() < 1e-5));
+        assert!(actual
+            .iter()
+            .zip(&baseline)
+            .any(|(a, b)| (a - b).abs() > 1e-3));
+        let mut cfg = tiny_model().cfg;
+        for invalid in [0., -1., f32::NAN, f32::INFINITY] {
+            cfg.query_pre_attn_scalar = Some(invalid);
+            assert!(cfg.query_rescale().is_err());
+        }
+        cfg.head_dim = Some(128);
+        cfg.query_pre_attn_scalar = Some(168.);
+        assert!(
+            (cfg.query_rescale().unwrap() / 128f32.sqrt() - 168f32.sqrt().recip()).abs() < 1e-7
+        );
+    }
+
+    #[test]
+    fn penultimate_is_pre_final_layer_without_norm_or_head() {
+        let model = tiny_model();
+        let result = model
+            .dev
+            .download(&model.encode_penultimate(&[0, 1]).unwrap());
+        for (row, original) in [[1f32, 2., 3., 4.], [4., 3., 2., 1.]].iter().enumerate() {
+            let denom = (original.iter().map(|x| x * x).sum::<f32>() / 4. + 0.000001).sqrt();
+            for i in 0..4 {
+                let x = original[i] / denom;
+                let expected = original[i] + x * x / (1. + (-x).exp());
+                assert!((result[row * 4 + i] - expected).abs() < 1e-5);
+            }
+        }
+        let mut cache = model.new_cache();
+        assert_eq!(
+            model.forward(&[0, 1], &mut cache, true).unwrap(),
+            vec![0.; 4]
+        );
+        assert!(model.encode_penultimate(&[]).is_err());
+        assert!(model.encode_penultimate(&[0; 2049]).is_err());
+    }
+
+    #[test]
+    fn multimodal_last_logits_match_all_logits_across_text_chunks() {
+        let mut model = tiny_model();
+        model.cfg.vocab_size = 3;
+        model.cfg.image_token = Some(2);
+        model.embed = model
+            .dev
+            .upload(&[1., 2., 3., 4., 4., 3., 2., 1., 0., 0., 0., 0.]);
+        model.lm_head = Some(
+            model
+                .dev
+                .upload(&[1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0.]),
+        );
+        model.vision = Some(crate::vision::Vision::encoded_fixture(&model.dev, 4));
+        let mut tokens: Vec<u32> = (0..600).map(|i| i % 2).collect();
+        tokens.splice(590..590, [2; 4]);
+        tokens.splice(50..50, [2; 4]);
+        let features = [model.dev.upload(&[6.; 16]), model.dev.upload(&[9.; 16])];
+        let mut full_cache = model.new_cache();
+        let all = model
+            .forward_images(&tokens, &features, &mut full_cache, true)
+            .unwrap();
+        let mut last_cache = model.new_cache();
+        let last = model
+            .forward_images(&tokens, &features, &mut last_cache, false)
+            .unwrap();
+        assert_eq!(all.len(), tokens.len() * 3);
+        assert_eq!(last.len(), 3);
+        assert!(last
+            .iter()
+            .zip(&all[all.len() - 3..])
+            .all(|(a, b)| (a - b).abs() < 1e-5));
+        assert_eq!(full_cache.tokens, tokens);
+        assert_eq!(last_cache.tokens, tokens);
+    }
 }

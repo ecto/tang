@@ -49,6 +49,11 @@ pub trait ComputeDevice: Send {
         None
     }
 
+    /// Actual bytes per element retained by upload_bf16. CPU widens to f32.
+    fn bf16_storage_bytes(&self) -> usize {
+        4
+    }
+
     // -- Buffer lifecycle --
 
     /// Upload f32 data from CPU to device.
@@ -132,6 +137,71 @@ pub trait ComputeDevice: Send {
         dim: usize,
         eps: f32,
     ) -> Self::Buffer;
+
+    /// Multiply rows by channel modulation `1 + scale[offset..]` without
+    /// requiring a host-expanded scale matrix on accelerated backends.
+    fn modulate_channels(
+        &self,
+        data: &Self::Buffer,
+        scale: &Self::Buffer,
+        offset: usize,
+        rows: usize,
+        dim: usize,
+    ) -> Self::Buffer {
+        assert!(dim > 0 && data.len() == rows * dim && scale.len() >= offset + dim);
+        let values = self.download(scale);
+        let scale: Vec<f32> = values[offset..offset + dim]
+            .iter()
+            .map(|x| 1. + x)
+            .collect();
+        let expanded = self.upload(&scale.repeat(rows));
+        self.elementwise(&[data, &expanded], rows * dim, &|x| x[0] * x[1])
+    }
+
+    /// RMS norm followed by channel modulation `1 + scale[offset..]`.
+    /// Backends may fuse these operations without expanding the channel vector.
+    fn rms_norm_scale(
+        &self,
+        data: &Self::Buffer,
+        weight: &Self::Buffer,
+        scale: &Self::Buffer,
+        offset: usize,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Self::Buffer {
+        let normalized = self.rms_norm(data, weight, rows, dim, eps);
+        let values = self.download(scale);
+        let scale: Vec<f32> = values[offset..offset + dim]
+            .iter()
+            .map(|x| 1. + x)
+            .collect();
+        let scale = self.upload(&scale.repeat(rows));
+        self.elementwise(&[&normalized, &scale], rows * dim, &|x| x[0] * x[1])
+    }
+
+    /// Residual plus RMS-normalized update gated by `tanh(gate[offset..])`.
+    fn rms_norm_gate_residual(
+        &self,
+        data: &Self::Buffer,
+        weight: &Self::Buffer,
+        gate: &Self::Buffer,
+        residual: &Self::Buffer,
+        offset: usize,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Self::Buffer {
+        let normalized = self.rms_norm(data, weight, rows, dim, eps);
+        let values = self.download(gate);
+        let gate: Vec<f32> = values[offset..offset + dim]
+            .iter()
+            .map(|x| x.tanh())
+            .collect();
+        let gate = self.upload(&gate.repeat(rows));
+        let update = self.elementwise(&[&normalized, &gate], rows * dim, &|x| x[0] * x[1]);
+        self.add_tensors_buf(residual, &update, rows * dim)
+    }
 
     /// Embedding lookup: weight[ids[i]] for each token.
     fn embedding(
@@ -748,6 +818,14 @@ pub trait ComputeDevice: Send {
         self.elementwise(&[a, b], numel, &|ids| ids[0] + ids[1])
     }
 
+    /// Unary SiLU, without constructing a tensor of ones for SwiGLU.
+    fn silu_buf(&self, input: &Self::Buffer, numel: usize) -> Self::Buffer {
+        use tang::Scalar;
+        self.elementwise(&[input], numel, &|ids| {
+            ids[0] / (ExprId::from_f64(1.0) + Scalar::exp(-ids[0]))
+        })
+    }
+
     /// SwiGLU activation: out[i] = silu(gate[i]) * up[i].
     /// Default: delegates to elementwise(). Override for fused bf16 kernel.
     fn swiglu_fused_buf(
@@ -1107,9 +1185,12 @@ pub trait ComputeDevice: Send {
         let (x, w, b) = (self.download(x), self.download(w), self.download(b));
         let mut y = Vec::with_capacity(rows * dim);
         for r in x.chunks(dim).take(rows) {
-            let mean = r.iter().sum::<f32>() / dim as f32;
-            let var = r.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / dim as f32;
-            let inv = 1.0 / (var + eps).sqrt();
+            // Long VAE group-normalization rows amplify sequential f32
+            // reduction error. Accumulate statistics in f64, then apply in f32.
+            let mean = r.iter().map(|v| *v as f64).sum::<f64>() / dim as f64;
+            let var = r.iter().map(|v| (*v as f64 - mean).powi(2)).sum::<f64>() / dim as f64;
+            let inv = (1.0 / (var + eps as f64).sqrt()) as f32;
+            let mean = mean as f32;
             y.extend(
                 r.iter()
                     .enumerate()
@@ -1117,6 +1198,120 @@ pub trait ComputeDevice: Send {
             );
         }
         self.upload(&y)
+    }
+
+    /// Stride-one, same-padded odd-kernel convolution. Input/output NCHW;
+    /// weights [output, input, kernel, kernel]. Portable scratch is tiled.
+    fn conv2d_nchw(
+        &self,
+        x: &Self::Buffer,
+        weight: &Self::Buffer,
+        bias: &Self::Buffer,
+        input: usize,
+        output: usize,
+        h: usize,
+        w: usize,
+        kernel: usize,
+    ) -> Self::Buffer {
+        assert!(
+            input > 0 && output > 0 && h > 0 && w > 0 && kernel > 0 && !kernel.is_multiple_of(2)
+        );
+        assert_eq!(x.len(), input * h * w);
+        assert_eq!(weight.len(), output * input * kernel * kernel);
+        assert_eq!(bias.len(), output);
+        let data = self.download(x);
+        let n = h * w;
+        let k = input * kernel * kernel;
+        let pad = kernel / 2;
+        let mut result = vec![0.; n * output];
+        for start in (0..n).step_by(1024) {
+            let rows = (n - start).min(1024);
+            let mut columns = vec![0.; rows * k];
+            for r in 0..rows {
+                let y = (start + r) / w;
+                let xx = (start + r) % w;
+                let mut col = r * k;
+                for c in 0..input {
+                    for dy in 0..kernel {
+                        for dx in 0..kernel {
+                            let yy = y as isize + dy as isize - pad as isize;
+                            let xxx = xx as isize + dx as isize - pad as isize;
+                            if yy >= 0 && yy < h as isize && xxx >= 0 && xxx < w as isize {
+                                columns[col] = data[(c * h + yy as usize) * w + xxx as usize];
+                            }
+                            col += 1;
+                        }
+                    }
+                }
+            }
+            let product = self.linear(&self.upload(&columns), weight, rows, k, output);
+            let product = self.bias_add(&product, bias, rows * output, output);
+            let values = self.download(&product);
+            for r in 0..rows {
+                for c in 0..output {
+                    result[c * n + start + r] = values[r * output + c];
+                }
+            }
+        }
+        self.upload(&result)
+    }
+
+    /// NCHW group normalization with compact per-channel affine parameters.
+    fn group_norm_affine(
+        &self,
+        x: &Self::Buffer,
+        weight: &Self::Buffer,
+        bias: &Self::Buffer,
+        channels: usize,
+        spatial: usize,
+        groups: usize,
+        eps: f32,
+    ) -> Self::Buffer {
+        assert!(groups > 0 && channels > 0 && spatial > 0 && channels.is_multiple_of(groups));
+        assert_eq!(x.len(), channels * spatial);
+        assert_eq!(weight.len(), channels);
+        assert_eq!(bias.len(), channels);
+        let dim = channels / groups * spatial;
+        let normalized = self.layer_norm(
+            x,
+            &self.upload(&vec![1.; dim]),
+            &self.upload(&vec![0.; dim]),
+            groups,
+            dim,
+            eps,
+        );
+        let (x, weight, bias) = (
+            self.download(&normalized),
+            self.download(weight),
+            self.download(bias),
+        );
+        self.upload(
+            &x.iter()
+                .enumerate()
+                .map(|(i, v)| v * weight[i / spatial] + bias[i / spatial])
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Nearest-neighbor 2x upsampling of one NCHW image.
+    fn upsample_nearest_2x(
+        &self,
+        x: &Self::Buffer,
+        channels: usize,
+        h: usize,
+        w: usize,
+    ) -> Self::Buffer {
+        assert!(channels > 0 && h > 0 && w > 0);
+        assert_eq!(x.len(), channels * h * w);
+        let x = self.download(x);
+        let mut out = vec![0.; x.len() * 4];
+        for (i, value) in out.iter_mut().enumerate() {
+            let c = i / (4 * h * w);
+            let y = (i / (2 * w)) % (2 * h);
+            let xx = i % (2 * w);
+            *value = x[(c * h + y / 2) * w + xx / 2];
+        }
+        self.upload(&out)
     }
 
     /// GELU, tanh approximation, elementwise over `n` values.

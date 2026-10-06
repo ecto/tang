@@ -21,6 +21,9 @@ pub fn cache_dir() -> Option<PathBuf> {
 /// This machine's node id: made once (128 random bits, hex) and kept in `<cache>/node-id`,
 /// so it survives restarts and model swaps. Without a cache directory it lasts the process.
 pub fn node_id() -> String {
+    // Concurrent listeners in one process must not truncate the same temporary file.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let path = cache_dir().map(|d| d.join("node-id"));
     if let Some(id) = path
         .as_ref()
@@ -34,10 +37,13 @@ pub fn node_id() -> String {
     if let Some(p) = path {
         let _ = p.parent().map(std::fs::create_dir_all);
         // Written whole, then renamed: two servers starting at once agree on one id.
-        let tmp = p.with_extension(format!("tmp{}", std::process::id()));
+        let tmp = p.with_extension(format!("tmp{}-{:016x}", std::process::id(), random_u64()));
         if std::fs::write(&tmp, &id).is_ok() && std::fs::rename(&tmp, &p).is_ok() {
             if let Ok(s) = std::fs::read_to_string(&p) {
-                return s.trim().to_string();
+                let s = s.trim();
+                if s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return s.to_string();
+                }
             }
         }
     }
@@ -393,6 +399,10 @@ mod tests {
         std::env::set_var("TANG_CACHE_DIR", &dir);
         let a = node_id();
         let b = node_id();
+        let threads: Vec<_> = (0..8).map(|_| std::thread::spawn(node_id)).collect();
+        for thread in threads {
+            assert_eq!(thread.join().unwrap(), a);
+        }
         std::env::remove_var("TANG_CACHE_DIR");
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(a, b);

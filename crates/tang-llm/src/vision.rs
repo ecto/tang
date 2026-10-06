@@ -35,6 +35,32 @@ pub struct Vision<B> {
 }
 
 impl<B> Vision<B> {
+    #[cfg(test)]
+    pub(crate) fn encoded_fixture<D: ComputeDevice<Buffer = B>>(
+        dev: &D,
+        text_hidden: usize,
+    ) -> Self {
+        Self {
+            cfg: VisionConfig {
+                hidden_size: 1,
+                image_size: 2,
+                intermediate_size: 1,
+                num_attention_heads: 1,
+                num_hidden_layers: 0,
+                patch_size: 1,
+                layer_norm_eps: 1e-6,
+            },
+            patch: (dev.upload(&[0.; 3]), dev.upload(&[0.])),
+            pos: dev.upload(&[0.; 4]),
+            layers: vec![],
+            post: (dev.upload(&[1.]), dev.upload(&[0.])),
+            mm_norm: dev.upload(&[1.]),
+            mm_proj: dev.upload(&vec![0.; text_hidden]),
+            text_hidden,
+            tokens: 4,
+        }
+    }
+
     pub fn load<D: ComputeDevice<Buffer = B>>(
         dev: &D,
         w: &Weights,

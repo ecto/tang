@@ -1,5 +1,46 @@
 //! MSL reduction kernels: softmax, rms_norm.
 
+/// DiT channel modulation and optional gated residual, without host downloads or
+/// expanded per-token scales. Same reduction layout as the standalone RMS kernel.
+pub const MODULATED_RMS_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void rms_norm_modulation(
+    device const float* input [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device const float* modulation [[buffer(2)]],
+    device const float* residual [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    device const uint* params [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint size [[threads_per_threadgroup]])
+{
+    uint dim = params[1], offset = params[2];
+    uint base = row * dim;
+    threadgroup float shared[256];
+    float sum = 0;
+    for (uint i = tid; i < dim; i += size) sum += input[base+i] * input[base+i];
+    shared[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = size/2; s > 0; s >>= 1) {
+        if (tid < s) shared[tid] += shared[tid+s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = rsqrt(shared[0]/float(dim) + as_type<float>(params[4]));
+    for (uint i = tid; i < dim; i += size) {
+        float normalized = input[base+i] * inv * weight[i];
+        if (params[3]) {
+            float gate = tanh(clamp(modulation[offset+i], -10.0f, 10.0f));
+            float update = normalized * gate;
+            output[base+i] = residual[base+i] + update;
+        } else {
+            output[base+i] = normalized * (1.0f + modulation[offset+i]);
+        }
+    }
+}
+"#;
+
 /// Row-wise softmax: each threadgroup handles one row.
 /// params: [n_rows, row_len]
 pub const SOFTMAX_MSL: &str = r#"
@@ -40,6 +81,8 @@ kernel void softmax(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float row_max = shared[0];
+    // Every SIMD group must read the maximum before phase 2 reuses shared[0].
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Phase 2: compute exp and sum
     float local_sum = 0.0f;
@@ -117,5 +160,65 @@ kernel void rms_norm(
     for (uint i = tid; i < dim; i += tg_size) {
         output[base + i] = input[base + i] * rms * weight[i];
     }
+}
+"#;
+
+/// NCHW normalization and spatial expansion without host transfers.
+pub const VAE_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void group_norm_affine(
+    device const float* x [[buffer(0)]], device const float* weight [[buffer(1)]],
+    device const float* bias [[buffer(2)]], device float* out [[buffer(3)]],
+    device const uint* p [[buffer(4)]],
+    uint group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+    uint size [[threads_per_threadgroup]]) {
+    uint dim = p[0] / p[2] * p[1], base = group * dim;
+    threadgroup float shared[256];
+    float sum = 0;
+    float anchor = x[base];
+    for (uint i = tid; i < dim; i += size) sum += x[base+i] - anchor;
+    shared[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = size/2; stride; stride >>= 1) {
+        if (tid < stride) shared[tid] += shared[tid+stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float mean = anchor + shared[0] / float(dim);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sum = 0;
+    for (uint i = tid; i < dim; i += size) { float d = x[base+i] - mean; sum += d*d; }
+    shared[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = size/2; stride; stride >>= 1) {
+        if (tid < stride) shared[tid] += shared[tid+stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = rsqrt(shared[0]/float(dim) + as_type<float>(p[3]));
+    for (uint i = tid; i < dim; i += size) {
+        uint c = (base+i)/p[1];
+        out[base+i] = ((x[base+i]-mean)*inv)*weight[c] + bias[c];
+    }
+}
+kernel void upsample_nearest_2x(
+    device const float* x [[buffer(0)]], device float* out [[buffer(1)]],
+    device const uint* p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+    uint h = p[1], w = p[2];
+    if (i >= p[0]*h*w*4) return;
+    uint c = i/(h*w*4), y = (i/(w*2))%(h*2), xx = i%(w*2);
+    out[i] = x[(c*h+y/2)*w+xx/2];
+}
+"#;
+/// Device-resident channel broadcast for the final DiT modulation.
+pub const CHANNEL_MODULATION_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void channel_modulation(
+    device const float* data [[buffer(0)]],
+    device const float* scale [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint* p [[buffer(3)]],
+    uint i [[thread_position_in_grid]]) {
+    if (i < p[0]) out[i] = data[i] * (1.0f + scale[p[2] + i % p[1]]);
 }
 "#;

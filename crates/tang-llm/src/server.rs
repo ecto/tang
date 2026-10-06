@@ -82,6 +82,9 @@ struct Node {
     state: Mutex<NodeState>,
     hardware: Probe,
     dtype: Dtype,
+    /// Serialize model loads and heavy inference across the judge and image workers.
+    resources: Arc<crate::image_server::Gate>,
+    image: Option<crate::image_server::ImageModel>,
 }
 
 #[derive(Default)]
@@ -272,12 +275,31 @@ where
     B: Backend + 'static,
     F: Fn(&str) -> anyhow::Result<B> + Send + 'static,
 {
+    serve_with_images::<B, tang_compute::CpuDevice, F>(opts, load, None)
+}
+
+/// Serve chat/vision and a lazy resident image pipeline in one process. Heavy inference
+/// is serialized so both workers share scratch headroom; neither evicts the other's weights.
+pub fn serve_with_images<B, D, F>(
+    opts: Options,
+    load: F,
+    image: Option<(PathBuf, fn() -> anyhow::Result<D>)>,
+) -> anyhow::Result<()>
+where
+    B: Backend + 'static,
+    D: ComputeDevice + 'static,
+    F: Fn(&str) -> anyhow::Result<B> + Send + 'static,
+{
+    let resources = Arc::<crate::image_server::Gate>::default();
+    let image = image.map(|(root, make)| crate::image_server::mount(root, make, resources.clone()));
     let node = Arc::new(Node {
         id: crate::node::node_id(),
         queue: Queue::new(),
         state: Mutex::new(NodeState::default()),
         hardware: opts.hardware,
         dtype: opts.dtype,
+        resources,
+        image: image.as_ref().map(|service| service.model.clone()),
     });
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let worker = node.clone();
@@ -289,6 +311,8 @@ where
             load,
         };
         if let Some(spec) = first {
+            let gate = w.node.resources.clone();
+            let _guard = gate.lock();
             if let Err(e) = w.load(&spec) {
                 let _ = ready_tx.send(Err(e));
                 return;
@@ -300,7 +324,7 @@ where
     ready_rx.recv()??;
 
     let app = App { node };
-    let api = Router::new()
+    let mut api = Router::new()
         .route("/v1/chat/completions", post(chat))
         .route("/v1/prefill", post(prefill))
         .route("/v1/models", get(models))
@@ -309,6 +333,9 @@ where
         .route("/models/load", post(load_model))
         .route("/models/unload", post(unload_model))
         .with_state(app);
+    if let Some(image) = image {
+        api = api.merge(image.router);
+    }
     let api = match opts.key {
         Some(key) => api.layer(middleware::from_fn_with_state(
             std::sync::Arc::new(key),
@@ -364,6 +391,8 @@ where
     fn run(&mut self) {
         loop {
             let (ticket, job) = self.node.queue.pop();
+            let gate = self.node.resources.clone();
+            let _guard = gate.lock();
             match job {
                 Job::Complete {
                     req,
@@ -654,7 +683,7 @@ where
 }
 
 /// Turn away requests without the key (compared in constant time).
-async fn require_key(
+pub(crate) async fn require_key(
     State(key): State<std::sync::Arc<String>>,
     req: HttpRequest,
     next: Next,
@@ -679,7 +708,7 @@ fn same(a: &[u8], b: &[u8]) -> bool {
 
 async fn models(State(app): State<App>) -> Json<Value> {
     let st = app.node.state();
-    let data: Vec<Value> = st
+    let mut data: Vec<Value> = st
         .model
         .iter()
         .map(|m| {
@@ -689,6 +718,8 @@ async fn models(State(app): State<App>) -> Json<Value> {
             // `priority`: `x-frog-priority` orders requests.
             let mut caps = vec![
                 "completion",
+                "json_object",
+                "json_schema",
                 "thinking_budget",
                 "prompt_cache_key",
                 "prefill",
@@ -700,6 +731,9 @@ async fn models(State(app): State<App>) -> Json<Value> {
             json!({ "id": m.name, "object": "model", "owned_by": "tang", "max_model_len": m.ctx, "capabilities": caps })
         })
         .collect();
+    if let Some(image) = &app.node.image {
+        data.push(image.json());
+    }
     Json(json!({ "object": "list", "data": data }))
 }
 
@@ -817,6 +851,9 @@ fn describe(node: &Node) -> Value {
         "hardware": hw.json(),
         "models": { "loaded": loaded, "loading": loading, "on_disk": on_disk },
         "queue": { "running": running, "waiting": waiting },
+        "image_model": node.image.as_ref().map(|image|json!({
+            "id":crate::image_server::MODEL_ID, "path":image.path, "resident":image.resident.load(std::sync::atomic::Ordering::Relaxed),
+        })),
     })
 }
 
@@ -825,6 +862,12 @@ async fn load_model(State(app): State<App>, Json(body): Json<Value>) -> Response
     let Some(spec) = body["model"].as_str().map(String::from) else {
         return error(StatusCode::BAD_REQUEST, "model must be a string");
     };
+    if spec == crate::image_server::MODEL_ID {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "image models load on first generation, not through /models/load",
+        );
+    }
     if app
         .node
         .state()
@@ -1023,6 +1066,8 @@ mod tests {
             state: std::sync::Mutex::new(super::NodeState::default()),
             hardware: std::sync::Arc::new(crate::node::Hardware::default),
             dtype: crate::model::Dtype::F32,
+            resources: Default::default(),
+            image: None,
         });
         let mut worker = super::Worker {
             node,
@@ -1152,6 +1197,7 @@ pub fn parse(body: &Value) -> Result<Request, String> {
         .get("messages")
         .filter(|m| m.is_array())
         .ok_or("messages must be an array")?;
+    let response_schema = crate::structured::response_schema(body).map_err(|e| e.to_string())?;
     let d = Sampling::default();
     let f = |k: &str| body[k].as_f64();
     let (messages, images) = normalize_messages(messages)?;
@@ -1159,6 +1205,7 @@ pub fn parse(body: &Value) -> Result<Request, String> {
         messages,
         images,
         tools: body.get("tools").cloned().filter(|t| !t.is_null()),
+        response_schema,
         think: body["chat_template_kwargs"]["enable_thinking"]
             .as_bool()
             .or(body["think"].as_bool())

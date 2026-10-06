@@ -121,6 +121,12 @@ impl MetalDevice {
         }
 
         let options = CompileOptions::new();
+        if matches!(
+            fn_name,
+            "rms_norm_modulation" | "group_norm_affine" | "channel_modulation"
+        ) {
+            options.set_fast_math_enabled(false);
+        }
         let library = self
             .device
             .new_library_with_source(source, &options)
@@ -186,6 +192,52 @@ impl MetalDevice {
             }
             f(enc_ref.as_ref().unwrap());
         });
+    }
+
+    fn modulated_rms(
+        &self,
+        data: &MetalBuffer,
+        weight: &MetalBuffer,
+        modulation: &MetalBuffer,
+        residual: Option<&MetalBuffer>,
+        offset: usize,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) -> MetalBuffer {
+        assert!(dim > 0 && data.len() == rows * dim && weight.len() == dim);
+        assert!(modulation.len() >= offset + dim);
+        assert!(residual.is_none_or(|r| r.len() == data.len()));
+        for buffer in [data, weight, modulation, residual.unwrap_or(data)] {
+            assert_eq!(buffer.kind, Kind::F32);
+        }
+        let pipeline = self.get_pipeline(reduce_msl::MODULATED_RMS_MSL, "rms_norm_modulation");
+        let output = self.make_buffer_empty(rows * dim * 4);
+        let params = self.make_buffer_u32(&[
+            rows as u32,
+            dim as u32,
+            offset as u32,
+            residual.is_some() as u32,
+            eps.to_bits(),
+        ]);
+        self.dispatch_groups(
+            &pipeline,
+            &[
+                &data.buffer,
+                &weight.buffer,
+                &modulation.buffer,
+                &residual.unwrap_or(data).buffer,
+                &output,
+                &params,
+            ],
+            (rows, 1),
+            dim.min(256).next_power_of_two(),
+        );
+        MetalBuffer {
+            buffer: output,
+            len: rows * dim,
+            kind: Kind::F32,
+        }
     }
 
     /// Close the open compute encoder (before a blit, or before committing).
@@ -712,6 +764,9 @@ fn multi_attn(k: &MetalBuffer, q_len: usize, n_heads: usize, n_kv: usize, d: usi
 }
 
 impl ComputeDevice for MetalDevice {
+    fn bf16_storage_bytes(&self) -> usize {
+        2
+    }
     type Buffer = MetalBuffer;
 
     fn dialect(&self) -> Dialect {
@@ -1882,6 +1937,59 @@ kernel void embedding(
         self.flash_attention(q, k, v, 0, n, nh, nh, hd, 0, true, None)
     }
 
+    fn modulate_channels(
+        &self,
+        data: &MetalBuffer,
+        scale: &MetalBuffer,
+        offset: usize,
+        rows: usize,
+        dim: usize,
+    ) -> MetalBuffer {
+        assert!(dim > 0 && data.len() == rows * dim && scale.len() >= offset + dim);
+        assert_eq!(data.kind, Kind::F32);
+        assert_eq!(scale.kind, Kind::F32);
+        let pipeline = self.get_pipeline(reduce_msl::CHANNEL_MODULATION_MSL, "channel_modulation");
+        let out = self.make_buffer_empty(rows * dim * 4);
+        let params = self.make_buffer_u32(&[(rows * dim) as u32, dim as u32, offset as u32]);
+        self.dispatch(
+            &pipeline,
+            &[&data.buffer, &scale.buffer, &out, &params],
+            (rows * dim) as u64,
+        );
+        MetalBuffer {
+            buffer: out,
+            len: rows * dim,
+            kind: Kind::F32,
+        }
+    }
+
+    fn rms_norm_scale(
+        &self,
+        data: &MetalBuffer,
+        weight: &MetalBuffer,
+        scale: &MetalBuffer,
+        offset: usize,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) -> MetalBuffer {
+        self.modulated_rms(data, weight, scale, None, offset, rows, dim, eps)
+    }
+
+    fn rms_norm_gate_residual(
+        &self,
+        data: &MetalBuffer,
+        weight: &MetalBuffer,
+        gate: &MetalBuffer,
+        residual: &MetalBuffer,
+        offset: usize,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) -> MetalBuffer {
+        self.modulated_rms(data, weight, gate, Some(residual), offset, rows, dim, eps)
+    }
+
     fn layer_norm(
         &self,
         x: &MetalBuffer,
@@ -1904,6 +2012,107 @@ kernel void embedding(
         MetalBuffer {
             buffer: out,
             len: rows * dim,
+            kind: Kind::F32,
+        }
+    }
+
+    fn conv2d_nchw(
+        &self,
+        x: &MetalBuffer,
+        weight: &MetalBuffer,
+        bias: &MetalBuffer,
+        input: usize,
+        output: usize,
+        h: usize,
+        w: usize,
+        kernel: usize,
+    ) -> MetalBuffer {
+        assert!(
+            input > 0 && output > 0 && h > 0 && w > 0 && kernel > 0 && !kernel.is_multiple_of(2)
+        );
+        assert_eq!(x.len(), input * h * w);
+        assert_eq!(weight.len(), output * input * kernel * kernel);
+        assert_eq!(bias.len(), output);
+        for b in [x, weight, bias] {
+            assert_eq!(b.kind, Kind::F32);
+        }
+        let pipeline = self.get_pipeline(matmul_msl::CONV2D_MSL, "conv2d_nchw");
+        let out = self.make_buffer_empty(output * h * w * 4);
+        let params = self.make_buffer_u32(&[
+            input as u32,
+            output as u32,
+            h as u32,
+            w as u32,
+            kernel as u32,
+        ]);
+        self.dispatch_groups(
+            &pipeline,
+            &[&x.buffer, &weight.buffer, &bias.buffer, &out, &params],
+            (output.div_ceil(32), (h * w).div_ceil(32)),
+            128,
+        );
+        MetalBuffer {
+            buffer: out,
+            len: output * h * w,
+            kind: Kind::F32,
+        }
+    }
+
+    fn group_norm_affine(
+        &self,
+        x: &MetalBuffer,
+        weight: &MetalBuffer,
+        bias: &MetalBuffer,
+        channels: usize,
+        spatial: usize,
+        groups: usize,
+        eps: f32,
+    ) -> MetalBuffer {
+        assert!(groups > 0 && channels > 0 && spatial > 0 && channels.is_multiple_of(groups));
+        assert_eq!(x.len(), channels * spatial);
+        assert_eq!(weight.len(), channels);
+        assert_eq!(bias.len(), channels);
+        for b in [x, weight, bias] {
+            assert_eq!(b.kind, Kind::F32);
+        }
+        let pipeline = self.get_pipeline(reduce_msl::VAE_MSL, "group_norm_affine");
+        let out = self.make_buffer_empty(x.len() * 4);
+        let params = self.make_buffer_u32(&[
+            channels as u32,
+            spatial as u32,
+            groups as u32,
+            eps.to_bits(),
+        ]);
+        self.dispatch_groups(
+            &pipeline,
+            &[&x.buffer, &weight.buffer, &bias.buffer, &out, &params],
+            (groups, 1),
+            256,
+        );
+        MetalBuffer {
+            buffer: out,
+            len: x.len(),
+            kind: Kind::F32,
+        }
+    }
+
+    fn upsample_nearest_2x(
+        &self,
+        x: &MetalBuffer,
+        channels: usize,
+        h: usize,
+        w: usize,
+    ) -> MetalBuffer {
+        assert!(channels > 0 && h > 0 && w > 0);
+        assert_eq!(x.len(), channels * h * w);
+        assert_eq!(x.kind, Kind::F32);
+        let pipeline = self.get_pipeline(reduce_msl::VAE_MSL, "upsample_nearest_2x");
+        let out = self.make_buffer_empty(x.len() * 16);
+        let params = self.make_buffer_u32(&[channels as u32, h as u32, w as u32]);
+        self.dispatch(&pipeline, &[&x.buffer, &out, &params], (x.len() * 4) as u64);
+        MetalBuffer {
+            buffer: out,
+            len: x.len() * 4,
             kind: Kind::F32,
         }
     }
@@ -2176,6 +2385,18 @@ kernel void bias_add(
 
     fn add_tensors_buf(&self, a: &MetalBuffer, b: &MetalBuffer, numel: usize) -> MetalBuffer {
         self.binary(a, b, numel, "add_f32")
+    }
+
+    fn silu_buf(&self, input: &MetalBuffer, numel: usize) -> MetalBuffer {
+        let pipeline = self.get_pipeline(llm_msl::ELEMENTWISE_MSL, "silu_f32");
+        let out = self.make_buffer_empty(numel * 4);
+        let params = self.make_buffer_u32(&[numel as u32]);
+        self.dispatch(&pipeline, &[&input.buffer, &out, &params], numel as u64);
+        MetalBuffer {
+            buffer: out,
+            len: numel,
+            kind: Kind::F32,
+        }
     }
 
     fn swiglu_fused_buf(&self, gate: &MetalBuffer, up: &MetalBuffer, numel: usize) -> MetalBuffer {
@@ -3273,6 +3494,238 @@ mod tests {
                     .collect();
                 assert_eq!(got, want);
             }
+        }
+    }
+
+    #[test]
+    fn metal_implicit_convolution_matches_cpu_at_edges_and_vae_widths() {
+        let metal = get_metal_device();
+        let cpu = CpuDevice::new();
+        for (input, output, h, w, kernel) in [
+            (3, 5, 3, 7, 1),
+            (3, 5, 3, 7, 3),
+            (2, 1, 1, 1, 3),
+            (16, 512, 16, 16, 3),
+            (512, 512, 4, 4, 3),
+            (128, 3, 17, 19, 3),
+        ] {
+            let x: Vec<f32> = (0..input * h * w)
+                .map(|i| ((i * 17) % 97) as f32 / 41. - 1.)
+                .collect();
+            let weight: Vec<f32> = (0..output * input * kernel * kernel)
+                .map(|i| {
+                    (((i * 13) % 89) as f32 / 47. - 1.) / ((input * kernel * kernel) as f32).sqrt()
+                })
+                .collect();
+            let bias: Vec<f32> = (0..output).map(|i| (i % 7) as f32 / 7. - 0.5).collect();
+            let actual = metal.download(&metal.conv2d_nchw(
+                &metal.upload(&x),
+                &metal.upload(&weight),
+                &metal.upload(&bias),
+                input,
+                output,
+                h,
+                w,
+                kernel,
+            ));
+            let expected = cpu.download(&cpu.conv2d_nchw(
+                &cpu.upload(&x),
+                &cpu.upload(&weight),
+                &cpu.upload(&bias),
+                input,
+                output,
+                h,
+                w,
+                kernel,
+            ));
+            for (i, (a, b)) in actual.iter().zip(&expected).enumerate() {
+                assert!(
+                    a.is_finite() && (a - b).abs() < 3e-5 * b.abs().max(1.),
+                    "{input}->{output} {h}x{w} kernel {kernel}, index {i}: {a} vs {b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn metal_vae_normalization_and_upsampling_match_cpu() {
+        let metal = get_metal_device();
+        let cpu = CpuDevice::new();
+        for (channels, h, w, groups) in [(12, 3, 5, 3), (512, 16, 16, 32), (128, 128, 128, 32)] {
+            for offset in [0., 10000.] {
+                let data: Vec<f32> = (0..channels * h * w)
+                    .map(|i| ((i * 17) % 97) as f32 / 13. - 3. + offset)
+                    .collect();
+                let weight: Vec<f32> = (0..channels).map(|i| 0.5 + (i % 11) as f32 / 11.).collect();
+                let bias: Vec<f32> = (0..channels).map(|i| (i % 7) as f32 / 7. - 0.5).collect();
+                let expected = cpu.download(&cpu.group_norm_affine(
+                    &cpu.upload(&data),
+                    &cpu.upload(&weight),
+                    &cpu.upload(&bias),
+                    channels,
+                    h * w,
+                    groups,
+                    1e-6,
+                ));
+                let actual = metal.download(&metal.group_norm_affine(
+                    &metal.upload(&data),
+                    &metal.upload(&weight),
+                    &metal.upload(&bias),
+                    channels,
+                    h * w,
+                    groups,
+                    1e-6,
+                ));
+                for (i, (a, b)) in actual.iter().zip(&expected).enumerate() {
+                    assert!(
+                        a.is_finite() && (a - b).abs() < 2e-5 * b.abs().max(1.),
+                        "{channels}x{h}x{w} offset {offset}, index {i}: {a} vs {b}"
+                    );
+                }
+            }
+            let data: Vec<f32> = (0..channels * h * w).map(|i| (i % 97) as f32).collect();
+            assert_eq!(
+                metal.download(&metal.upsample_nearest_2x(&metal.upload(&data), channels, h, w)),
+                cpu.download(&cpu.upsample_nearest_2x(&cpu.upload(&data), channels, h, w))
+            );
+        }
+    }
+
+    #[test]
+    fn metal_channel_modulation_matches_cpu_without_expanded_scales() {
+        let metal = get_metal_device();
+        let cpu = CpuDevice::new();
+        for (rows, dim, offset) in [(3, 7, 2), (5, 128, 0), (2, 3840, 3840)] {
+            let data: Vec<f32> = (0..rows * dim)
+                .map(|i| ((i * 17) % 97) as f32 / 13. - 3.)
+                .collect();
+            let mut scale: Vec<f32> = (0..offset + dim + 3)
+                .map(|i| ((i * 11) % 31) as f32 / 7. - 2.)
+                .collect();
+            scale[offset] = -1.;
+            scale[offset + 1] = 1000.;
+            let actual = metal.download(&metal.modulate_channels(
+                &metal.upload(&data),
+                &metal.upload(&scale),
+                offset,
+                rows,
+                dim,
+            ));
+            let expected = cpu.download(&cpu.modulate_channels(
+                &cpu.upload(&data),
+                &cpu.upload(&scale),
+                offset,
+                rows,
+                dim,
+            ));
+            assert_eq!(actual, expected, "{rows}x{dim} offset {offset}");
+        }
+    }
+
+    #[test]
+    fn metal_modulated_rms_matches_cpu_at_dit_widths_and_large_gates() {
+        let metal = get_metal_device();
+        let cpu = CpuDevice::new();
+        for (dim, rows) in [(24, 3), (128, 5), (3840, 2)] {
+            let data: Vec<f32> = (0..rows * dim)
+                .map(|i| ((i * 17) % 97) as f32 / 13. - 3.)
+                .collect();
+            let weight: Vec<f32> = (0..dim).map(|i| 0.5 + (i % 13) as f32 / 13.).collect();
+            let residual: Vec<f32> = (0..rows * dim)
+                .map(|i| ((i * 11) % 31) as f32 / 7. - 2.)
+                .collect();
+            let mut modulation: Vec<f32> = (0..4 * dim)
+                .map(|i| ((i * 13) % 27) as f32 / 9. - 1.5)
+                .collect();
+            modulation[dim] = -1000.;
+            modulation[dim + 1] = 1000.;
+            let (x, w, m, r) = (
+                metal.upload(&data),
+                metal.upload(&weight),
+                metal.upload(&modulation),
+                metal.upload(&residual),
+            );
+            let (cx, cw, cm, cr) = (
+                cpu.upload(&data),
+                cpu.upload(&weight),
+                cpu.upload(&modulation),
+                cpu.upload(&residual),
+            );
+            let actual = [
+                metal.download(&metal.rms_norm_scale(&x, &w, &m, 0, rows, dim, 1e-6)),
+                metal.download(&metal.rms_norm_gate_residual(&x, &w, &m, &r, dim, rows, dim, 1e-6)),
+            ];
+            let expected = [
+                cpu.download(&cpu.rms_norm_scale(&cx, &cw, &cm, 0, rows, dim, 1e-6)),
+                cpu.download(&cpu.rms_norm_gate_residual(&cx, &cw, &cm, &cr, dim, rows, dim, 1e-6)),
+            ];
+            for (a, b) in actual.iter().flatten().zip(expected.iter().flatten()) {
+                assert!(
+                    a.is_finite() && (a - b).abs() <= 2e-5 * b.abs().max(1.),
+                    "dim {dim}: {a} vs {b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn metal_softmax_large_logits_at_256_columns_is_stable() {
+        let metal = get_metal_device();
+        let cpu = CpuDevice::new();
+        let (rows, cols) = (32, 256);
+        let values: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i * 7) % 251) as f32 - 125.)
+            .collect();
+        let expected = cpu.download(&cpu.softmax(&cpu.upload(&values), rows, cols));
+        for _ in 0..4 {
+            let actual = metal.download(&metal.softmax(&metal.upload(&values), rows, cols));
+            for (index, (&a, &b)) in actual.iter().zip(&expected).enumerate() {
+                assert!(
+                    a.is_finite() && (a - b).abs() < 1e-6,
+                    "softmax index {index}: {a} vs {b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn metal_unary_silu_matches_cpu_and_previous_swiglu_path() {
+        let Some(metal) = MetalDevice::new() else {
+            return;
+        };
+        let cpu = crate::CpuDevice::new();
+        let data = [-1000., -100., -20., -5., -1., 0., 1., 5., 20., 100., 1000.];
+        let x = metal.upload(&data);
+        let actual = metal.download(&metal.silu_buf(&x, data.len()));
+        let previous = metal.download(&metal.swiglu_fused_buf(
+            &x,
+            &metal.upload(&vec![1.; data.len()]),
+            data.len(),
+        ));
+        let expected = cpu.download(&cpu.silu_buf(&cpu.upload(&data), data.len()));
+        assert_eq!(actual, previous);
+        for (a, b) in actual.iter().zip(expected) {
+            assert!(a.is_finite() && (a - b).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn metal_swiglu_large_negative_gates_remain_finite() {
+        let metal = get_metal_device();
+        let gates = [-1000., -100., -90., -80., -20., 0., 20., 100., 1000.];
+        let up = vec![1f32; gates.len()];
+        let actual = metal.download(&metal.swiglu_fused_buf(
+            &metal.upload(&gates),
+            &metal.upload(&up),
+            gates.len(),
+        ));
+        for (&gate, &value) in gates.iter().zip(&actual) {
+            let expected = (gate as f64 / (1. + (-(gate as f64)).exp())) as f32;
+            assert!(value.is_finite(), "nonfinite SiLU at {gate}: {value}");
+            assert!(
+                (value - expected).abs() < 1e-5,
+                "SiLU at {gate}: {value} vs {expected}"
+            );
         }
     }
 

@@ -169,6 +169,12 @@ fn main() -> Result<()> {
         [c, d, ..] => (c.as_str(), PathBuf::from(d)),
         _ => bail!("usage: tang-llm <logits|generate> <model-dir> <ids...> [-n N] [--f32]"),
     };
+    if cmd == "calibrate-image-preview" {
+        return on_backend!(backend, calibrate_image_preview(&args[1..]));
+    }
+    if args.first().map(String::as_str) == Some("serve-images") {
+        return on_backend!(backend, serve_images(&args[1..]));
+    }
     if args.first().map(String::as_str) == Some("serve") {
         return serve(backend, &args[1..]);
     }
@@ -442,6 +448,7 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
         .clone();
     let (mut port, mut ctx, mut dtype) = (8911u16, 32_768usize, Dtype::Bf16);
     let mut host = "127.0.0.1".to_string();
+    let mut image_pipeline = None;
     let mut slots = kv_slots(&std::env::var("TANG_KV_SLOTS").unwrap_or_else(|_| "1".into()))?;
     // Never on the command line itself, where `ps` would show it.
     let mut key = std::env::var("TANG_API_KEY").ok();
@@ -457,6 +464,9 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
             "--host" => host = it.next().context("--host H")?.clone(),
             "--port" => port = it.next().context("--port P")?.parse()?,
             "--ctx" => ctx = it.next().context("--ctx N")?.parse()?,
+            "--image-pipeline" => {
+                image_pipeline = Some(PathBuf::from(it.next().context("--image-pipeline DIR")?))
+            }
             "--kv-slots" => slots = kv_slots(it.next().context("--kv-slots N|auto")?)?,
             "--api-key-file" => {
                 let path = it.next().context("--api-key-file F")?;
@@ -491,7 +501,15 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
     };
     on_backend!(
         backend,
-        serve_on(opts, backend, ctx, speculate, slots, unified)
+        serve_on(
+            opts,
+            backend,
+            ctx,
+            speculate,
+            slots,
+            unified,
+            image_pipeline
+        )
     )
 }
 
@@ -650,9 +668,10 @@ fn serve_on<D: ComputeDevice + 'static>(
     speculate: bool,
     slots: Option<usize>,
     unified: bool,
+    image_pipeline: Option<PathBuf>,
 ) -> Result<()> {
     let dtype = opts.dtype;
-    tang_llm::server::serve(opts, move |name: &str| {
+    let loader = move |name: &str| {
         let t = Instant::now();
         let dir = tang_llm::resolve_model(name)?;
         let disk = kv_disk(name, dtype);
@@ -701,7 +720,8 @@ fn serve_on<D: ComputeDevice + 'static>(
             if e.model.kv_bf16() { "bf16" } else { "f32" },
         );
         Ok(e)
-    })
+    };
+    tang_llm::server::serve_with_images(opts, loader, image_pipeline.map(|root| (root, make)))
 }
 
 /// Options for the bench commands.
@@ -1079,6 +1099,68 @@ fn sim_spec(files: &[String]) -> Result<()> {
         toks as f64 / fwds.max(1) as f64,
         100.0 * accepted as f64 / drafted.max(1) as f64,
         toks as f64 / units.max(1e-9)
+    );
+    Ok(())
+}
+
+fn serve_images<D: ComputeDevice + 'static, F: Fn() -> Result<D> + Send + 'static>(
+    make: F,
+    args: &[String],
+) -> Result<()> {
+    let root = PathBuf::from(
+        args.first()
+            .context("serve-images <pipeline-dir> [--host H] [--port P] [--api-key-file F]")?,
+    );
+    let (mut host, mut port) = ("127.0.0.1".to_owned(), 8913u16);
+    // Same as `serve`: never on the command line itself, where `ps` would show it.
+    let mut key = std::env::var("TANG_API_KEY").ok();
+    if let Some(k) = &key {
+        ensure_nonempty_key(k)?;
+    }
+    let mut options = args[1..].iter();
+    while let Some(option) = options.next() {
+        match option.as_str() {
+            "--host" => host = options.next().context("--host H")?.clone(),
+            "--port" => port = options.next().context("--port P")?.parse()?,
+            "--api-key-file" => {
+                let value = std::fs::read_to_string(options.next().context("--api-key-file F")?)?;
+                ensure_nonempty_key(&value)?;
+                key = Some(value.trim().to_owned());
+            }
+            _ => bail!("unknown image server option {option}"),
+        }
+    }
+    tang_llm::image_server::serve(&format!("{host}:{port}"), root, key, make)
+}
+fn ensure_nonempty_key(key: &str) -> Result<()> {
+    anyhow::ensure!(!key.trim().is_empty(), "empty image server API key");
+    Ok(())
+}
+
+fn calibrate_image_preview<D: ComputeDevice, F: Fn() -> Result<D>>(
+    make: F,
+    args: &[String],
+) -> Result<()> {
+    use std::io::Write;
+    anyhow::ensure!(
+        args.len() == 2,
+        "calibrate-image-preview <vae-dir> <new-output.json>"
+    );
+    let output = PathBuf::from(&args[1]);
+    anyhow::ensure!(!output.exists(), "preview output already exists");
+    let record = tang_llm::image_preview::calibrate(make()?, std::path::Path::new(&args[0]))?;
+    let bytes = serde_json::to_vec_pretty(&record)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&output)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    println!(
+        "preview calibration saved to {}; held-out MSE {:.6}, constant baseline {:.6}",
+        output.display(),
+        record.held_out_mse,
+        record.constant_baseline_mse
     );
     Ok(())
 }
