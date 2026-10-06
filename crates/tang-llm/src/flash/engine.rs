@@ -1707,11 +1707,7 @@ impl Engine {
         }
         let wide_pcie = self.wide && std::env::var("TANG_FLASH_WIDE_PCIE").is_ok_and(|v| v == "1");
         if self.pcie_cap > 0 || wide_pcie {
-            let cap = if wide_pcie {
-                i32::MAX
-            } else {
-                share as i32
-            };
+            let cap = if wide_pcie { i32::MAX } else { share as i32 };
             let (plan, ids, ht, ti) = (a(&s.plan), a(&s.ids), a(&self.host_tables[l]), t as i32);
             // The plan's layout at this width (MoePlan's offsets with cap(t)).
             let c = MoePlan::cap(t) as i32;
@@ -1728,7 +1724,9 @@ impl Engine {
                         (32, 1, 1),
                         0,
                         &self.stream,
-                        tang_moe::args![plan, ids, ht, ti, cap, gp, gs, et, ed, mi, stage, blob, srcs, smax],
+                        tang_moe::args![
+                            plan, ids, ht, ti, cap, gp, gs, et, ed, mi, stage, blob, srcs, smax
+                        ],
                     )
                     .expect("launch");
                     gpu::launch(
@@ -1742,17 +1740,17 @@ impl Engine {
                     .expect("launch")
                 };
             } else {
-            unsafe {
-                gpu::launch(
-                    self.k.pcie,
-                    (1, 1, 1),
-                    (32, 1, 1),
-                    0,
-                    &self.stream,
-                    tang_moe::args![plan, ids, ht, ti, cap, gp, gs, et, ed, mi],
-                )
-                .expect("launch")
-            };
+                unsafe {
+                    gpu::launch(
+                        self.k.pcie,
+                        (1, 1, 1),
+                        (32, 1, 1),
+                        0,
+                        &self.stream,
+                        tang_moe::args![plan, ids, ht, ti, cap, gp, gs, et, ed, mi],
+                    )
+                    .expect("launch")
+                };
             }
         }
         // Publish ids and activations; the host computes the misses while the GPU runs the

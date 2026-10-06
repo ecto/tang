@@ -156,6 +156,8 @@ impl MissExec {
             split: 3,
             tiled: false,
             x: (0..MAX_WIDE).map(|_| XPrep::new(HIDDEN)).collect(),
+            // Per-job stride is MAX_T tokens: callers (incl. the wide path) split each job's
+            // token list into chunks of at most MAX_T before `run`.
             h: vec![0.0; MAX_MISSED * MAX_T * FF],
             hprep: (0..MAX_MISSED * MAX_T).map(|_| XPrep::new(FF)).collect(),
         }

@@ -822,11 +822,15 @@ impl FlashServe {
             let t = Instant::now();
             self.snapshot(pinned)?;
             if log {
-                eprintln!("  snapshot at {a} (pinned {pinned}) {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
+                eprintln!(
+                    "  snapshot at {a} (pinned {pinned}) {:.0} ms",
+                    t.elapsed().as_secs_f64() * 1e3
+                );
             }
         }
         let t = Instant::now();
-        let (next, st, mtp) = prefill_span(&mut self.e, &ids[a..], MAX_T, mtp_from, self.wide, true)?;
+        let (next, st, mtp) =
+            prefill_span(&mut self.e, &ids[a..], MAX_T, mtp_from, self.wide, true)?;
         if log {
             span_line(a, ids.len(), t.elapsed().as_secs_f64() * 1e3, &st, mtp);
         }
