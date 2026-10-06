@@ -121,6 +121,11 @@ pub struct CachePolicy {
 }
 
 impl CachePolicy {
+    /// Adapt every `every` windows from now on (0 = never); returns the previous setting.
+    pub fn set_every(&mut self, every: u32) -> u32 {
+        std::mem::replace(&mut self.params.every, every)
+    }
+
     pub fn new(geo: Geometry, n_slots: usize, params: AdaptParams) -> Self {
         CachePolicy {
             geo,

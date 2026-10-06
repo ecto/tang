@@ -4328,7 +4328,27 @@ impl Engine {
                 self.keys.push(base + e);
             }
         }
-        st.swaps = self.boundary()?;
+        // A wide window is 8 decode windows' worth of routing: adapt the cache after every one
+        // (`TANG_FLASH_WIDE_ADAPT`, default 1; 0 keeps the decode cadence). Cold prompts are
+        // CPU-miss bound here, so moving their hot experts into VRAM sooner pays.
+        let every = std::env::var("TANG_FLASH_WIDE_ADAPT")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(1);
+        let mut old = None;
+        if let Experts::Resident(rc) = &mut self.experts {
+            let o = rc.policy.lfu.set_every(every);
+            if o == 0 || every == 0 {
+                rc.policy.lfu.set_every(o); // adaptation off, or the decode cadence asked for
+            } else {
+                old = Some(o);
+            }
+        }
+        let r = self.boundary();
+        if let (Some(o), Experts::Resident(rc)) = (old, &mut self.experts) {
+            rc.policy.lfu.set_every(o);
+        }
+        st.swaps = r?;
         self.counter = self.counter.wrapping_add(1);
         if self.use_graphs && !self.wide_graphs.contains_key(&t) {
             let stream = ManuallyDrop::new(Stream(self.dev.cu_stream()));
