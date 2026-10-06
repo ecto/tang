@@ -2154,41 +2154,21 @@ impl Engine {
             // SAFETY: ROWS holds PARTS_ROWS rows; the GPU reads them only after FLAG_B.
             unsafe { self.exec.run(xq, t, &jobs, self.mb.rows_ptr()) };
         } else {
-            // Wide: in slices of MAX_T tokens (the executor's width), each with its own
-            // activations repacked and the jobs' tokens that fall in it; rows land at their
-            // window-wide dst. Each row's arithmetic is the T <= 8 path's.
-            let qa = tang_moe::contract::QAct { m: t, k: HIDDEN };
-            for s0 in (0..t).step_by(MAX_T) {
-                let n = MAX_T.min(t - s0);
-                let qs = tang_moe::contract::QAct { m: n, k: HIDDEN };
-                let mut sub = vec![0u32; qs.words()];
-                let (cw, sw) = (HIDDEN / 4, HIDDEN / 32);
-                sub[..n * cw].copy_from_slice(&xq[qa.codes(s0)..qa.codes(s0) + n * cw]);
-                sub[qs.scales(0)..qs.scales(0) + n * sw]
-                    .copy_from_slice(&xq[qa.scales(s0)..qa.scales(s0) + n * sw]);
-                sub[qs.sums(0)..qs.sums(0) + n * sw]
-                    .copy_from_slice(&xq[qa.sums(s0)..qa.sums(s0) + n * sw]);
-                let toks: Vec<Vec<(usize, usize)>> = jobs
-                    .iter()
-                    .map(|j| {
-                        j.toks
-                            .iter()
-                            .filter(|&&(tk, _)| tk >= s0 && tk < s0 + n)
-                            .map(|&(tk, d)| (tk - s0, d))
-                            .collect()
-                    })
-                    .collect();
-                let sj: Vec<MissJob> = jobs
-                    .iter()
-                    .zip(&toks)
-                    .filter(|(_, tk)| !tk.is_empty())
-                    .map(|(j, tk)| MissJob {
+            // Wide: one executor pass over the whole window per batch of jobs, so each missed
+            // expert's weights are read once (in chunks of at most MAX_T tokens per job) rather
+            // than once per 8-token slice. Each row's arithmetic is the T <= 8 path's.
+            let chunks: Vec<MissJob> = jobs
+                .iter()
+                .flat_map(|j| {
+                    j.toks.chunks(MAX_T).map(move |c| MissJob {
                         blob: j.blob,
-                        toks: tk,
+                        toks: c,
                     })
-                    .collect();
+                })
+                .collect();
+            for b in chunks.chunks(tang_moe::miss::MAX_MISSED) {
                 // SAFETY: as above; ROWS holds the wide plan's rows (tang-moe `WIDE_CAP`).
-                unsafe { self.exec.run(&sub, n, &sj, self.mb.rows_ptr()) };
+                unsafe { self.exec.run(xq, t, b, self.mb.rows_ptr()) };
             }
         }
         let dsts: Vec<u32> = missed
