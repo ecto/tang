@@ -807,11 +807,34 @@ kernels run on tensor cores.
 Per kernel at seq 512: five wmma matmuls 0.05–0.18 ms each, the
 elementwise and split kernels 2–14 µs each (the Vulkan path's ~0.1 ms
 per-kernel floor is gone), and the attention tile 1.25 ms — two thirds
-of the total. Attention on tensor cores (q·k and p·v as wmma fragments
-inside the online-softmax tile) is the one remaining piece between this
-and PyTorch's number; it is the same lowering applied inside a tile
-whose reduction is a monoid rather than a sum. Correctness: 5e-5
-relative against the f64 evaluation at seq 128 (TF32 inputs).
+of the total. Correctness: 5e-5 relative against the f64 evaluation at
+seq 128 (TF32 inputs).
+
+### Attention on tensor cores
+
+`cuda_flash_kernel` recognizes the fused attention comp — an
+online-softmax reduction over keys whose score is an inlined bilinear
+comp (here two terms, the rope even/odd halves) plus a mask over
+(i, j), whose value is a read along (j, lane), and whose normalizer is
+the epilogue map — and emits a flash kernel: 64 queries per 128-thread
+block, keys in 64-chunks, `S = Σ_t Q_t·K_tᵀ` and `O += P·V` as wmma
+TF32 fragments, the online softmax on the stored score block with the
+comp's own mask/value/normalizer expressions evaluated where they
+belong. Nothing attention-specific is hard-coded beyond that shape.
+
+| | before | after |
+|---|---|---|
+| attention kernel, seq 128 | 0.098 ms | **0.042** |
+| attention kernel, seq 512 | 1.25 | **0.150** |
+| block fwd, seq 128 | 0.62 | **0.59** |
+| block fwd, seq 512 | 1.86 | **0.76** |
+
+Six of the block's sixteen kernels now run on tensor cores. At seq 512
+the derived block forward (0.76 ms, GPU shared with another tenant at
+35%) is at PyTorch fp32's number (0.61 quiet / 1.21 loaded); the
+remaining per-kernel time is matmul tiles at 1.4–1.9× cuBLAS TF32 and
+the ~10 small kernels at a few µs each. Same error as before (5e-5
+relative at seq 128).
 
 What this does and does not show: the compiler derives the *structure* of
 the fast kernels (flash attention, register-tiled matmul, sequence

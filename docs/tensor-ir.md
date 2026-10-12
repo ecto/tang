@@ -162,8 +162,11 @@ schedule space; the compiler searches it.
   included; `to_cuda` emits whole programs (wmma tiles plus the other
   kernels transpiled from their WGSL) that `tang_bench::ir_cuda` runs
   through cudarc. The block forward runs in 0.62 ms at seq 128 on a 3090
-  with five kernels on tensor cores; the Metal fp32 kernel does not yet
-  beat the WGSL register tile. Attention is not on tensor cores yet.
+  with six kernels on tensor cores — the five matmul-shaped tiles and
+  the fused attention, which `cuda_flash_kernel` lowers to a wmma flash
+  kernel from the comp's structure (bilinear score, mask, value,
+  normalizer); the Metal fp32 kernel does not yet beat the WGSL
+  register tile.
 - The CUDA path is a separate runtime (tang-gpu runs on wgpu, which
   cannot dispatch CUDA); buffers do not interoperate between the two.
 - Scatter gradients reduce over the whole source coordinate they gate on;
