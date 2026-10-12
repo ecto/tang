@@ -260,7 +260,7 @@ pub fn random_spd_flat(size: usize) -> Vec<f64> {
 pub mod ir_gpu {
     use tang::Scalar;
     use tang_compile::tensor::wgsl::WgslProgram;
-    use tang_compile::tensor::{Monoid, TensorGraph, TensorId};
+    use tang_compile::tensor::{Arg, Form, Monoid, TensorGraph, TensorId, View};
     use tang_expr::ExprId;
     use tang_gpu::{GpuBuffer, GpuDevice, KernelCache};
 
@@ -288,7 +288,9 @@ pub mod ir_gpu {
             Self { program, buffers }
         }
 
-        fn buffer(&self, t: TensorId) -> &GpuBuffer {
+        /// The buffer holding `t` (inputs included), for feeding one
+        /// program's outputs into another's inputs.
+        pub fn buffer(&self, t: TensorId) -> &GpuBuffer {
             let t = self.program.storage(t);
             let i = self
                 .program
@@ -296,6 +298,17 @@ pub mod ir_gpu {
                 .iter()
                 .position(|b| b.node == t)
                 .unwrap();
+            &self.buffers[i]
+        }
+
+        /// Buffer of graph input `k`.
+        pub fn input_buffer(&self, k: usize) -> &GpuBuffer {
+            let i = self
+                .program
+                .buffers
+                .iter()
+                .position(|b| b.input == Some(k))
+                .expect("input not bound");
             &self.buffers[i]
         }
 
@@ -611,22 +624,27 @@ pub mod ir_gpu {
     }
 
     /// One Adam step as three maps over `[n]`: returns `(m', v', p')`.
-    /// Inputs: `p, g, m, v`. `bc1 = 1 - β1ᵗ`, `bc2 = 1 - β2ᵗ`.
-    #[allow(clippy::too_many_arguments)]
+    /// Inputs: `p, g, m, v, bc` where `bc = [1 - β1ᵗ, 1 - β2ᵗ]` is a
+    /// 2-element input so the step count changes without recompiling.
     pub fn adam_step(
         n: usize,
         lr: f64,
         beta1: f64,
         beta2: f64,
         eps: f64,
-        bc1: f64,
-        bc2: f64,
     ) -> (TensorGraph, [TensorId; 3]) {
         let mut g = TensorGraph::new();
         let p = g.input(&[n]);
         let grad = g.input(&[n]);
         let m = g.input(&[n]);
         let v = g.input(&[n]);
+        let bc = g.input(&[2]);
+        let bc_view = |k: i64| View {
+            forms: vec![Form {
+                coefs: vec![0],
+                offset: k,
+            }],
+        };
         let m2 = g
             .map(&[m, grad], |x| {
                 x[0] * ExprId::from_f64(beta1) + x[1] * ExprId::from_f64(1.0 - beta1)
@@ -637,12 +655,37 @@ pub mod ir_gpu {
                 x[0] * ExprId::from_f64(beta2) + x[1] * x[1] * ExprId::from_f64(1.0 - beta2)
             })
             .unwrap();
+        let id = |t: TensorId| Arg {
+            src: t,
+            view: View::identity(1, 1),
+        };
         let p2 = g
-            .map(&[p, m2, v2], |x| {
-                let m_hat = x[1] / ExprId::from_f64(bc1);
-                let v_hat = x[2] / ExprId::from_f64(bc2);
-                x[0] - ExprId::from_f64(lr) * m_hat / (v_hat.sqrt() + ExprId::from_f64(eps))
-            })
+            .comp(
+                &[n],
+                &[],
+                vec![
+                    id(p),
+                    id(m2),
+                    id(v2),
+                    Arg {
+                        src: bc,
+                        view: bc_view(0),
+                    },
+                    Arg {
+                        src: bc,
+                        view: bc_view(1),
+                    },
+                ],
+                None,
+                |x| {
+                    let m_hat = x[1] / x[3];
+                    let v_hat = x[2] / x[4];
+                    vec![
+                        x[0] - ExprId::from_f64(lr) * m_hat
+                            / (v_hat.sqrt() + ExprId::from_f64(eps)),
+                    ]
+                },
+            )
             .unwrap();
         (g, [m2, v2, p2])
     }
@@ -827,10 +870,9 @@ pub mod ir_gpu {
                 pb.to_vec_sync(&device),
             ];
 
-            let (graph, outs) = adam_step(
-                n, lr as f64, b1 as f64, b2 as f64, eps as f64, bc1 as f64, bc2 as f64,
-            );
-            let exe = Executable::new(&device, graph.to_wgsl(&outs), &[&p, &g, &m, &v]);
+            let (graph, outs) = adam_step(n, lr as f64, b1 as f64, b2 as f64, eps as f64);
+            let bc = [bc1, bc2];
+            let exe = Executable::new(&device, graph.to_wgsl(&outs), &[&p, &g, &m, &v, &bc]);
             exe.run(&device, &mut cache);
             cache.flush(&device);
             for (k, o) in outs.iter().enumerate() {
@@ -949,7 +991,7 @@ pub mod ir_gpu {
 /// hand-written `gpu_transformer_layer` prefill path in `gpu_inference`.
 pub mod ir_block {
     use tang::Scalar;
-    use tang_compile::tensor::{Arg, Form, Monoid, TensorGraph, TensorId, View};
+    use tang_compile::tensor::{numel, Arg, Form, Monoid, TensorGraph, TensorId, View};
     use tang_expr::ExprId;
 
     pub struct BlockDims {
@@ -1388,6 +1430,31 @@ pub mod ir_block {
             self.comp(&shape, &[], args, None, |v| vec![v[0] + v[1]])
                 .unwrap()
         }
+    }
+
+    /// `loss = mean((block(x) - target)²)` with gradients for every weight.
+    /// Returns the graph, `[loss, dwq, dwk, dwv, dwo, dgate, dup, ddown]`
+    /// and the index of the `target` input (last).
+    pub fn train_loss_graph(dims: &BlockDims) -> (TensorGraph, Vec<TensorId>, usize) {
+        let (mut g, out) = transformer_block(dims);
+        let shape = g.shape(out).to_vec();
+        let target = g.input(&shape);
+        let n = numel(&shape) as f64;
+        let sq = g
+            .map(&[out, target], |v| (v[0] - v[1]) * (v[0] - v[1]))
+            .unwrap();
+        let flat = g.reshape(sq, &[numel(&shape)]).unwrap();
+        let sum = g.reduce(flat, 0, Monoid::sum()).unwrap();
+        let loss = g.map(&[sum], |v| v[0] / ExprId::from_f64(n)).unwrap();
+        let wrt: Vec<TensorId> = [1usize, 3, 5, 7, 9, 11, 13]
+            .iter()
+            .map(|&i| TensorId::from_index(i))
+            .collect();
+        let grads = g.backward(loss, &wrt).unwrap();
+        let mut outs = vec![loss];
+        outs.extend(grads);
+        let target_idx = INPUTS.len() + if dims.kv_len != dims.seq { 2 } else { 0 };
+        (g, outs, target_idx)
     }
 
     /// Full compiler pipeline for the block.

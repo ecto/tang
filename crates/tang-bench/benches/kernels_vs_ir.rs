@@ -530,8 +530,9 @@ mod gpu_adam {
                     black_box(pb.to_vec_sync(&device));
                 })
             });
-            let (graph, outs) = adam_step(n, 1e-3, 0.9, 0.999, 1e-8, 0.19, 0.002);
-            let exe = Executable::new(&device, graph.to_wgsl(&outs), &[&p, &g, &m, &v]);
+            let (graph, outs) = adam_step(n, 1e-3, 0.9, 0.999, 1e-8);
+            let bc = [0.19f32, 0.002];
+            let exe = Executable::new(&device, graph.to_wgsl(&outs), &[&p, &g, &m, &v, &bc]);
             group.bench_function(BenchmarkId::new("ir", n), |b| {
                 b.iter(|| {
                     exe.run(&device, &mut cache);

@@ -473,3 +473,11 @@ input and all seven weights, then `substitute_maps` + `schedule_auto` +
 The asymmetry is the point: the hand path has a fast forward and a slow
 backward because a GPU backward for attention was never written. The
 derived path has neither problem, because nothing about it was written.
+
+### A derived training loop
+
+`examples/train_loop.rs`: block forward + MSE loss + backward for every
+weight as one 47-kernel program, Adam as one program per weight (bias
+corrections are a 2-element input, updated each step), new weights and
+moments fed back GPU-side with `GpuBuffer::copy_from`. Loss on a fixed
+target: 0.606 → 0.038 in 30 steps. Nothing in the loop is hand-written.
