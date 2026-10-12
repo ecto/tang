@@ -475,6 +475,13 @@ impl Ctx<'_> {
     }
 }
 
+/// The largest non-unit point dim other than `dx` (ties: the innermost).
+pub(super) fn largest_other(pts: &[usize], dx: usize) -> Option<usize> {
+    (0..pts.len())
+        .filter(|&d| d != dx && pts[d] > 1)
+        .max_by_key(|&d| pts[d])
+}
+
 /// An affine form over symbolic coords.
 fn sym_of(f: &Form, coords: &[Sym]) -> Sym {
     let mut s = Sym {
@@ -564,7 +571,9 @@ impl TensorGraph {
         // uniform across the workgroup.
         let mut non_unit = (0..k).rev().filter(|&d| pts[d] > 1);
         let dx = non_unit.next().unwrap_or(k - 1);
-        let dy = if by > 1 { non_unit.next() } else { None };
+        // rows: the largest remaining point dim (ties to the innermost),
+        // so a layout chosen for the consumer's reads still tiles well
+        let dy = if by > 1 { largest_other(pts, dx) } else { None };
         let others: Vec<usize> = (0..k).filter(|&d| d != dx && Some(d) != dy).collect();
         let nx = pts[dx];
         let ny = dy.map_or(1, |d| pts[d]);

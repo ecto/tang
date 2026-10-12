@@ -119,7 +119,7 @@ impl TensorGraph {
         let kdim = rank - 1;
         let mut non_unit = (0..pts.len()).rev().filter(|&d| pts[d] > 1);
         let dx = non_unit.next()?;
-        let dy = non_unit.next()?;
+        let dy = super::tile::largest_other(&pts, dx)?;
         let others: Vec<usize> = (0..pts.len()).filter(|&d| d != dx && d != dy).collect();
         let (n, m) = (pts[dx], pts[dy]);
         let addr_a = self.flat_addr(&rc.args[va], rank);

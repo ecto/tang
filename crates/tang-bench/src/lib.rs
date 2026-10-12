@@ -482,7 +482,9 @@ pub mod ir_gpu {
         let (g, outs) = g.stabilize_softmax(&[y]);
         let (g, outs) = g.substitute_maps(&outs);
         let (g, outs) = g.eliminate_common(&outs);
-        let (mut g, outs) = g.merge_siblings(&outs);
+        let (g, outs) = g.merge_siblings(&outs);
+        let (g, outs) = g.relayout(&outs);
+        let (mut g, outs) = g.merge_reduce_dims(&outs);
         g.schedule_auto(&outs);
         (g, outs[0])
     }
@@ -1702,7 +1704,9 @@ pub mod ir_block {
         let (g, outs) = g.stabilize_softmax(&[out]);
         let (g, outs) = g.substitute_maps(&outs);
         let (g, outs) = g.eliminate_common(&outs);
-        let (mut g, outs) = g.merge_siblings(&outs);
+        let (g, outs) = g.merge_siblings(&outs);
+        let (g, outs) = g.relayout(&outs);
+        let (mut g, outs) = g.merge_reduce_dims(&outs);
         g.schedule_auto(&outs);
         (g, outs[0])
     }
@@ -2027,7 +2031,9 @@ pub mod ir_block_gpu {
         outs.extend(grads);
         let (g, outs) = g.substitute_maps(&outs);
         let (g, outs) = g.eliminate_common(&outs);
-        let (mut g, outs) = g.merge_siblings(&outs);
+        let (g, outs) = g.merge_siblings(&outs);
+        let (g, outs) = g.relayout(&outs);
+        let (mut g, outs) = g.merge_reduce_dims(&outs);
         g.schedule_auto(&outs);
         let inputs: Vec<&[f32]> = p.cpu.iter().map(|v| v.as_slice()).collect();
         (
@@ -2328,7 +2334,9 @@ pub mod ir_block_gpu {
 
             let (g, outs) = g.substitute_maps(&grads);
             let (g, outs) = g.eliminate_common(&outs);
-            let (mut g, outs) = g.merge_siblings(&outs);
+            let (g, outs) = g.merge_siblings(&outs);
+            let (g, outs) = g.relayout(&outs);
+            let (mut g, outs) = g.merge_reduce_dims(&outs);
             g.schedule_auto(&outs);
             let program = g.to_wgsl(&outs);
             let n_kernels = program.kernels.len();

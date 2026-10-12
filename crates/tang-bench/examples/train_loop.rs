@@ -37,7 +37,9 @@ fn main() {
     let (g, outs, target_idx) = train_loss_graph(&p.dims);
     let (g, outs) = g.substitute_maps(&outs);
     let (g, outs) = g.eliminate_common(&outs);
-    let (mut g, outs) = g.merge_siblings(&outs);
+    let (g, outs) = g.merge_siblings(&outs);
+    let (g, outs) = g.relayout(&outs);
+    let (mut g, outs) = g.merge_reduce_dims(&outs);
     g.schedule_auto(&outs);
     let program = g.to_wgsl(&outs);
     println!("train program: {} kernels", program.kernels.len());
