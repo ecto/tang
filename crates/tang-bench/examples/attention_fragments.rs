@@ -32,6 +32,7 @@ fn main() {
         Ok("1") => vec![true],
         _ => vec![false, true],
     };
+    let samples: usize = std::env::var("ATT_SAMPLES").map_or(3, |s| s.parse().unwrap());
     for &h in &heads {
         for &causal in &causals {
             for &n in &ns {
@@ -41,7 +42,7 @@ fn main() {
                 let refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
                 let iters = 20;
                 let best = |exe: &Executable| {
-                    (0..3)
+                    (0..samples)
                         .map(|_| exe.time(&dev, iters))
                         .fold(f64::INFINITY, f64::min)
                 };

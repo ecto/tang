@@ -1181,8 +1181,9 @@ impl TensorGraph {
 // Attention on fragments
 // ---------------------------------------------------------------------------
 
-/// Query rows per threadgroup (4 SIMD groups × 8), keys per staged tile.
-const ATT_BQ: usize = 32;
+/// 8-row query fragments per SIMD group (4 SIMD groups, `32·ATT_RF` rows
+/// per threadgroup), keys per tile.
+const ATT_RF: usize = 1;
 const ATT_BK: usize = 32;
 /// Largest value-column block per threadgroup (wider `dv` is a grid axis).
 const ATT_BC: usize = 64;
@@ -1611,12 +1612,42 @@ impl TensorGraph {
         let (dr, dc) = (plan.dr, plan.dc);
         let (nq, nc, nk, dk) = (pts[dr], pts[dc], plan.nk, plan.dk);
         let others: Vec<usize> = (0..pk).filter(|&d| d != dr && d != dc).collect();
-        let (bq, bk) = (ATT_BQ, ATT_BK);
+        let rf = ATT_RF;
+        let (bq, bk) = (32 * rf, ATT_BK);
         let bc = nc.next_multiple_of(8).min(ATT_BC);
         let d8 = dk.next_multiple_of(8);
-        let (ldq, ldk, ldv, ldc) = (d8 + 8, d8 + 8, bc + 8, bc + 4);
-        // halves: Q staging, then K|V tiles, then the f32 result tile
-        let sm = (bq * ldq).max(bk * ldk + bk * ldv).max(2 * bq * ldc);
+        let (ldq, ldk, ldv) = (d8 + 8, d8 + 8, bc + 8);
+        // halves: Q staging, then K|V tiles
+        let rk = pk + 2;
+        let dq = self.direct_f16(&plan.q, rk);
+        let dkk = self.direct_f16(&plan.k, rk);
+        let dvv = self.direct_f16(&c.args[plan.v_arg], pk + 1);
+        // K and V fragments straight from device memory (no staging, no
+        // barriers) when both are direct unit-stride reads and every key
+        // tile and value block is full: (K row stride, V row stride)
+        let fragdev = match (&dkk, &dvv) {
+            (Some((_, kf)), Some((_, vf)))
+                if d8 == dk
+                    && nk % bk == 0
+                    && nc % bc == 0
+                    && kf.coefs[pk + 1] == 1
+                    && kf.coefs[dr] == 0
+                    && kf.coefs[dc] == 0
+                    && kf.coefs[pk] > 0
+                    && vf.coefs[dc] == 1
+                    && vf.coefs[dr] == 0
+                    && vf.coefs[pk] > 0 =>
+            {
+                Some((kf.coefs[pk], vf.coefs[pk]))
+            }
+            _ => None,
+        };
+        let kv_halves = if fragdev.is_some() {
+            0
+        } else {
+            bk * ldk + bk * ldv
+        };
+        let sm = (bq * ldq).max(kv_halves);
         let (tr, tc) = (nq.div_ceil(bq), nc.div_ceil(bc));
         let nlead: usize = others.iter().map(|&d| pts[d]).product();
         let n_tiles = tr * tc * nlead;
@@ -1652,7 +1683,6 @@ impl TensorGraph {
         writeln!(s, "kernel void k_main(KERNEL_PARAMS uint3 wid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {{").unwrap();
         writeln!(s, "    threadgroup float smem_f[{}];", sm / 2).unwrap();
         writeln!(s, "    threadgroup half* smem = (threadgroup half*)smem_f;").unwrap();
-        writeln!(s, "    threadgroup float Ls[{}];", w * bq).unwrap();
         writeln!(s, "    BUFS_INIT").unwrap();
         writeln!(s, "    const uint tile = wid.x + wid.y * 65535u;").unwrap();
         writeln!(s, "    if (tile >= {n_tiles}u) {{ return; }}").unwrap();
@@ -1679,10 +1709,6 @@ impl TensorGraph {
         writeln!(s, "    const uint m0 = tile_r * {bq}u;").unwrap();
         writeln!(s, "    const uint c0 = tile_c * {bc}u;").unwrap();
         // stage Q (zero-padded) and keep this SIMD group's rows in registers
-        let rk = pk + 2;
-        let dq = self.direct_f16(&plan.q, rk);
-        let dkk = self.direct_f16(&plan.k, rk);
-        let dvv = self.direct_f16(&c.args[plan.v_arg], pk + 1);
         let q_direct = d8 == dk
             && stage_direct(
                 &mut s,
@@ -1720,8 +1746,8 @@ impl TensorGraph {
             writeln!(s, "    }}").unwrap();
         }
         writeln!(s, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
-        writeln!(s, "    simdgroup_half8x8 fq[{nqf}];").unwrap();
-        writeln!(s, "    for (uint kk = 0u; kk < {nqf}u; kk++) simdgroup_load(fq[kk], &smem[(sg * 8u) * {ldq}u + kk * 8u], {ldq});").unwrap();
+        writeln!(s, "    simdgroup_half8x8 fqa[{}];", rf * nqf).unwrap();
+        writeln!(s, "    for (uint rr = 0u; rr < {rf}u; rr++) for (uint kk = 0u; kk < {nqf}u; kk++) simdgroup_load(fqa[rr * {nqf}u + kk], &smem[((sg * {rf}u + rr) * 8u) * {ldq}u + kk * 8u], {ldq});").unwrap();
         writeln!(s, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
         writeln!(s, "    threadgroup half* Ks = smem;").unwrap();
         writeln!(s, "    threadgroup half* Vs = smem + {};", bk * ldk).unwrap();
@@ -1730,14 +1756,44 @@ impl TensorGraph {
         writeln!(s, "    const uint qid = lane / 4u;").unwrap();
         writeln!(s, "    const uint fm = (qid & 4u) + (lane / 2u) % 4u;").unwrap();
         writeln!(s, "    const uint fn = (qid & 2u) * 2u + (lane % 2u) * 2u;").unwrap();
-        writeln!(s, "    const uint row = m0 + sg * 8u + fm;").unwrap();
-        writeln!(s, "    float mrow = {ATT_NEG};").unwrap();
+        // fragment rr of this SIMD group holds rows rowb + 8·rr
+        writeln!(s, "    const uint rowb = m0 + sg * {}u + fm;", 8 * rf).unwrap();
+        writeln!(s, "    float mrows[{rf}];").unwrap();
+        writeln!(
+            s,
+            "    for (uint rr = 0u; rr < {rf}u; rr++) mrows[rr] = {ATT_NEG};"
+        )
+        .unwrap();
         let row_slots: Vec<usize> = (1..w).filter(|&k| k != plan.pv_slot).collect();
         for &k in &row_slots {
-            writeln!(s, "    float lsum{k} = 0.0f;").unwrap();
+            writeln!(s, "    float lsums{k}[{rf}];").unwrap();
+            writeln!(
+                s,
+                "    for (uint rr = 0u; rr < {rf}u; rr++) lsums{k}[rr] = 0.0f;"
+            )
+            .unwrap();
         }
-        writeln!(s, "    simdgroup_float8x8 acc[{ncf}];").unwrap();
-        writeln!(s, "    for (uint cf = 0u; cf < {ncf}u; cf++) acc[cf] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);").unwrap();
+        writeln!(s, "    simdgroup_float8x8 acca[{}];", rf * ncf).unwrap();
+        writeln!(s, "    for (uint cf = 0u; cf < {}u; cf++) acca[cf] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);", rf * ncf).unwrap();
+        let base_of = |f: &super::Form| {
+            let mut e = format!("{}", f.offset);
+            for &d in &others {
+                if f.coefs[d] != 0 {
+                    e.push_str(&format!(" + {} * int(p{d})", f.coefs[d]));
+                }
+            }
+            e
+        };
+        if let (Some((sk, sv)), Some((kb, kf)), Some((vb, vf))) = (fragdev, &dkk, &dvv) {
+            let _ = (sk, sv);
+            writeln!(s, "    device const half* Kd = b{kb} + ({});", base_of(kf)).unwrap();
+            writeln!(
+                s,
+                "    device const half* Vd = b{vb} + ({}) + c0;",
+                base_of(vf)
+            )
+            .unwrap();
+        }
         writeln!(s, "    for (uint j0 = 0u; j0 < {nk}u; j0 += {bk}u) {{").unwrap();
         if let Some(f) = &plan.mask {
             // min of the affine mask condition over the tile's box
@@ -1772,97 +1828,102 @@ impl TensorGraph {
             writeln!(s, "        if ({e} > 0) {{ continue; }}").unwrap();
         }
         // stage K [j][k] and V [j][c]
-        let k_direct = d8 == dk
-            && stage_direct(
+        if fragdev.is_none() {
+            let k_direct = d8 == dk
+                && stage_direct(
+                    &mut s,
+                    dkk.as_ref(),
+                    &others,
+                    (pk, "j0", bk, nk),
+                    (pk + 1, "0u", d8, dk),
+                    "Ks",
+                    ldk,
+                    "        ",
+                );
+            if !k_direct {
+                writeln!(
+                    s,
+                    "        for (uint idx = tid; idx < {}u; idx += 128u) {{",
+                    bk * d8
+                )
+                .unwrap();
+                writeln!(
+                    s,
+                    "            const uint ji = idx / {d8}u; const uint ci = idx % {d8}u;"
+                )
+                .unwrap();
+                writeln!(s, "            float v = 0.0f;").unwrap();
+                writeln!(s, "            if (j0 + ji < {nk}u && ci < {dk}u) {{").unwrap();
+                writeln!(
+                    s,
+                    "                {} const uint r1 = ci;",
+                    coords("0u", "0u", "j0 + ji")
+                )
+                .unwrap();
+                writeln!(
+                    s,
+                    "                v = {};",
+                    arg_read(self, &syn, &syn.args[1])
+                )
+                .unwrap();
+                writeln!(s, "            }}").unwrap();
+                writeln!(s, "            Ks[ji * {ldk}u + ci] = half(v);").unwrap();
+                writeln!(s, "        }}").unwrap();
+            }
+            let v_direct = stage_direct(
                 &mut s,
-                dkk.as_ref(),
+                dvv.as_ref(),
                 &others,
                 (pk, "j0", bk, nk),
-                (pk + 1, "0u", d8, dk),
-                "Ks",
-                ldk,
+                (dc, "c0", bc, nc),
+                "Vs",
+                ldv,
                 "        ",
             );
-        if !k_direct {
+            if !v_direct {
+                writeln!(
+                    s,
+                    "        for (uint idx = tid; idx < {}u; idx += 128u) {{",
+                    bk * bc
+                )
+                .unwrap();
+                writeln!(
+                    s,
+                    "            const uint ji = idx / {bc}u; const uint ci = idx % {bc}u;"
+                )
+                .unwrap();
+                writeln!(s, "            float v = 0.0f;").unwrap();
+                writeln!(s, "            if (j0 + ji < {nk}u && c0 + ci < {nc}u) {{").unwrap();
+                writeln!(s, "                {}", coords("0u", "c0 + ci", "j0 + ji")).unwrap();
+                writeln!(
+                    s,
+                    "                v = {};",
+                    arg_read(self, c, &c.args[plan.v_arg])
+                )
+                .unwrap();
+                writeln!(s, "            }}").unwrap();
+                writeln!(s, "            Vs[ji * {ldv}u + ci] = half(v);").unwrap();
+                writeln!(s, "        }}").unwrap();
+            }
             writeln!(
                 s,
-                "        for (uint idx = tid; idx < {}u; idx += 128u) {{",
-                bk * d8
+                "        threadgroup_barrier(mem_flags::mem_threadgroup);"
             )
             .unwrap();
-            writeln!(
-                s,
-                "            const uint ji = idx / {d8}u; const uint ci = idx % {d8}u;"
-            )
-            .unwrap();
-            writeln!(s, "            float v = 0.0f;").unwrap();
-            writeln!(s, "            if (j0 + ji < {nk}u && ci < {dk}u) {{").unwrap();
-            writeln!(
-                s,
-                "                {} const uint r1 = ci;",
-                coords("0u", "0u", "j0 + ji")
-            )
-            .unwrap();
-            writeln!(
-                s,
-                "                v = {};",
-                arg_read(self, &syn, &syn.args[1])
-            )
-            .unwrap();
-            writeln!(s, "            }}").unwrap();
-            writeln!(s, "            Ks[ji * {ldk}u + ci] = half(v);").unwrap();
-            writeln!(s, "        }}").unwrap();
         }
-        let v_direct = stage_direct(
-            &mut s,
-            dvv.as_ref(),
-            &others,
-            (pk, "j0", bk, nk),
-            (dc, "c0", bc, nc),
-            "Vs",
-            ldv,
-            "        ",
-        );
-        if !v_direct {
-            writeln!(
-                s,
-                "        for (uint idx = tid; idx < {}u; idx += 128u) {{",
-                bk * bc
-            )
-            .unwrap();
-            writeln!(
-                s,
-                "            const uint ji = idx / {bc}u; const uint ci = idx % {bc}u;"
-            )
-            .unwrap();
-            writeln!(s, "            float v = 0.0f;").unwrap();
-            writeln!(s, "            if (j0 + ji < {nk}u && c0 + ci < {nc}u) {{").unwrap();
-            writeln!(s, "                {}", coords("0u", "c0 + ci", "j0 + ji")).unwrap();
-            writeln!(
-                s,
-                "                v = {};",
-                arg_read(self, c, &c.args[plan.v_arg])
-            )
-            .unwrap();
-            writeln!(s, "            }}").unwrap();
-            writeln!(s, "            Vs[ji * {ldv}u + ci] = half(v);").unwrap();
-            writeln!(s, "        }}").unwrap();
-        }
-        writeln!(
-            s,
-            "        threadgroup_barrier(mem_flags::mem_threadgroup);"
-        )
-        .unwrap();
         // S = Q·Kᵀ
-        writeln!(s, "        simdgroup_float8x8 sf[{nkf}];").unwrap();
-        writeln!(s, "        for (uint jf = 0u; jf < {nkf}u; jf++) sf[jf] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);").unwrap();
+        writeln!(s, "        simdgroup_float8x8 sfa[{}];", rf * nkf).unwrap();
+        writeln!(s, "        for (uint jf = 0u; jf < {}u; jf++) sfa[jf] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);", rf * nkf).unwrap();
         writeln!(s, "        for (uint kk = 0u; kk < {nqf}u; kk++) {{").unwrap();
         writeln!(s, "            for (uint jf = 0u; jf < {nkf}u; jf++) {{").unwrap();
         writeln!(s, "                simdgroup_half8x8 kf;").unwrap();
-        writeln!(s, "                simdgroup_load(kf, &Ks[(jf * 8u) * {ldk}u + kk * 8u], {ldk}, ulong2(0, 0), true);").unwrap();
+        match fragdev {
+            Some((sk, _)) => writeln!(s, "                simdgroup_load(kf, Kd + (j0 + jf * 8u) * {sk}u + kk * 8u, {sk}, ulong2(0, 0), true);").unwrap(),
+            None => writeln!(s, "                simdgroup_load(kf, &Ks[(jf * 8u) * {ldk}u + kk * 8u], {ldk}, ulong2(0, 0), true);").unwrap(),
+        }
         writeln!(
             s,
-            "                simdgroup_multiply_accumulate(sf[jf], fq[kk], kf, sf[jf]);"
+            "                for (uint rr = 0u; rr < {rf}u; rr++) simdgroup_multiply_accumulate(sfa[rr * {nkf}u + jf], fqa[rr * {nqf}u + kk], kf, sfa[rr * {nkf}u + jf]);"
         )
         .unwrap();
         writeln!(s, "            }}").unwrap();
@@ -1878,6 +1939,28 @@ impl TensorGraph {
                 }
             }
         };
+        writeln!(s, "        simdgroup_half8x8 pfa[{}];", rf * nkf).unwrap();
+        writeln!(s, "        for (uint rr = 0u; rr < {rf}u; rr++) {{").unwrap();
+        writeln!(s, "        const uint row = rowb + rr * 8u;").unwrap();
+        writeln!(s, "        thread float& mrow = mrows[rr];").unwrap();
+        for &k in &row_slots {
+            writeln!(s, "        thread float& lsum{k} = lsums{k}[rr];").unwrap();
+        }
+        writeln!(
+            s,
+            "        thread simdgroup_float8x8* sf = sfa + rr * {nkf}u;"
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "        thread simdgroup_half8x8* pf = pfa + rr * {nkf}u;"
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "        thread simdgroup_float8x8* acc = acca + rr * {ncf}u;"
+        )
+        .unwrap();
         writeln!(s, "        float sv[{}];", 2 * nkf).unwrap();
         writeln!(s, "        float tmax = {ATT_NEG};").unwrap();
         writeln!(s, "        for (uint jf = 0u; jf < {nkf}u; jf++) {{").unwrap();
@@ -1915,7 +1998,6 @@ impl TensorGraph {
             writeln!(s, "        lsum{k} *= alpha;").unwrap();
         }
         writeln!(s, "        for (uint cf = 0u; cf < {ncf}u; cf++) {{ acc[cf].thread_elements()[0] *= alpha; acc[cf].thread_elements()[1] *= alpha; }}").unwrap();
-        writeln!(s, "        simdgroup_half8x8 pf[{nkf}];").unwrap();
         writeln!(s, "        for (uint jf = 0u; jf < {nkf}u; jf++) {{").unwrap();
         writeln!(s, "            for (uint e = 0u; e < 2u; e++) {{").unwrap();
         writeln!(s, "                const uint key = j0 + jf * 8u + fn + e;").unwrap();
@@ -1976,65 +2058,60 @@ impl TensorGraph {
         }
         writeln!(s, "            }}").unwrap();
         writeln!(s, "        }}").unwrap();
+        writeln!(s, "        }}").unwrap();
         // O += P·V
         writeln!(s, "        for (uint jf = 0u; jf < {nkf}u; jf++) {{").unwrap();
         writeln!(s, "            for (uint cf = 0u; cf < {ncf}u; cf++) {{").unwrap();
         writeln!(s, "                simdgroup_half8x8 vf;").unwrap();
+        match fragdev {
+            Some((_, sv)) => writeln!(
+                s,
+                "                simdgroup_load(vf, Vd + (j0 + jf * 8u) * {sv}u + cf * 8u, {sv});"
+            )
+            .unwrap(),
+            None => writeln!(
+                s,
+                "                simdgroup_load(vf, &Vs[(jf * 8u) * {ldv}u + cf * 8u], {ldv});"
+            )
+            .unwrap(),
+        }
         writeln!(
             s,
-            "                simdgroup_load(vf, &Vs[(jf * 8u) * {ldv}u + cf * 8u], {ldv});"
-        )
-        .unwrap();
-        writeln!(
-            s,
-            "                simdgroup_multiply_accumulate(acc[cf], pf[jf], vf, acc[cf]);"
+            "                for (uint rr = 0u; rr < {rf}u; rr++) simdgroup_multiply_accumulate(acca[rr * {ncf}u + cf], pfa[rr * {nkf}u + jf], vf, acca[rr * {ncf}u + cf]);"
         )
         .unwrap();
         writeln!(s, "            }}").unwrap();
         writeln!(s, "        }}").unwrap();
-        writeln!(
-            s,
-            "        threadgroup_barrier(mem_flags::mem_threadgroup);"
-        )
-        .unwrap();
+        if fragdev.is_none() {
+            writeln!(
+                s,
+                "        threadgroup_barrier(mem_flags::mem_threadgroup);"
+            )
+            .unwrap();
+        }
         writeln!(s, "    }}").unwrap();
-        // per-row slots: lane partials → row totals
+        // write-out (and epilogue) straight from the fragments: a lane
+        // holds row fm, columns fn, fn + 1 of each 8×8 tile; per-row
+        // slots are reduced across the row's lanes (^1, ^8)
+        writeln!(s, "    for (uint rr = 0u; rr < {rf}u; rr++) {{").unwrap();
+        writeln!(s, "    const uint row = rowb + rr * 8u;").unwrap();
         for &k in &row_slots {
+            writeln!(s, "    float lsum{k} = lsums{k}[rr];").unwrap();
             writeln!(s, "    lsum{k} += simd_shuffle_xor(lsum{k}, 1u);").unwrap();
             writeln!(s, "    lsum{k} += simd_shuffle_xor(lsum{k}, 8u);").unwrap();
         }
-        writeln!(s, "    if ((lane & 9u) == 0u) {{").unwrap();
-        writeln!(s, "        Ls[sg * 8u + fm] = mrow;").unwrap();
-        for &k in &row_slots {
-            writeln!(s, "        Ls[{}u + sg * 8u + fm] = lsum{k};", k * bq).unwrap();
-        }
-        writeln!(s, "    }}").unwrap();
-        writeln!(s, "    threadgroup float* Cs = smem_f;").unwrap();
-        writeln!(s, "    for (uint cf = 0u; cf < {ncf}u; cf++) simdgroup_store(acc[cf], &Cs[(sg * 8u) * {ldc}u + cf * 8u], {ldc});").unwrap();
-        writeln!(s, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
-        // write-out (and epilogue)
-        writeln!(
-            s,
-            "    for (uint idx = tid; idx < {}u; idx += 128u) {{",
-            bq * bc
-        )
-        .unwrap();
-        writeln!(
-            s,
-            "        const uint ri = idx / {bc}u; const uint ci = idx % {bc}u;"
-        )
-        .unwrap();
-        writeln!(s, "        if (m0 + ri < {nq}u && c0 + ci < {nc}u) {{").unwrap();
-        writeln!(
-            s,
-            "        const uint p{dr} = m0 + ri; const uint p{dc} = c0 + ci;"
-        )
-        .unwrap();
+        writeln!(s, "    for (uint cf = 0u; cf < {ncf}u; cf++) {{").unwrap();
+        writeln!(s, "    for (uint e = 0u; e < 2u; e++) {{").unwrap();
+        writeln!(s, "        const uint col = c0 + cf * 8u + fn + e;").unwrap();
+        writeln!(s, "        if (row < {nq}u && col < {nc}u) {{").unwrap();
+        writeln!(s, "        const uint p{dr} = row; const uint p{dc} = col;").unwrap();
         for k in 0..w {
             let v = if k == plan.pv_slot {
-                format!("Cs[ri * {ldc}u + ci]")
+                format!("acca[rr * {ncf}u + cf].thread_elements()[e]")
+            } else if k == 0 {
+                "mrows[rr]".to_string()
             } else {
-                format!("Ls[{}u + ri]", k * bq)
+                format!("lsum{k}")
             };
             writeln!(s, "        const float sl{k} = {v};").unwrap();
         }
@@ -2099,11 +2176,13 @@ impl TensorGraph {
         }
         writeln!(s, "        }}").unwrap();
         writeln!(s, "    }}").unwrap();
+        writeln!(s, "    }}").unwrap();
+        writeln!(s, "    }}").unwrap();
         writeln!(s, "}}").unwrap();
         let points = numel_fixed(&fixed(self.comp_at(root).unwrap().points()));
         MslKernel {
             source: translate(self, &s, &reads, root).0,
-            threadgroup_bytes: 2 * sm + 4 * w * bq,
+            threadgroup_bytes: 2 * sm,
             entry: "k_main".into(),
             node: TensorId(root as u32),
             reads: reads.iter().map(|&j| TensorId(j as u32)).collect(),
