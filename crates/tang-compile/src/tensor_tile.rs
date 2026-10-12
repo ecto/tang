@@ -716,6 +716,10 @@ fn sym_of(f: &Form, coords: &[Sym]) -> Sym {
     s
 }
 
+/// Staged f32 words per workgroup: 16 KiB, WebGPU's guaranteed
+/// `maxComputeWorkgroupStorageSize` and within Metal's 32 KiB.
+pub(crate) const MAX_STAGE_WORDS: usize = 4096;
+
 /// Row-major flat index of symbolic coords over `shape`.
 fn flat(coords: &[Sym], shape: &[usize]) -> Sym {
     let mut acc = Sym::default();
@@ -763,9 +767,29 @@ pub(super) fn emit_scalar(
 }
 
 impl TensorGraph {
+    /// Element count of buffer `j` as a kernel expression.
+    fn buffer_len_expr(&self, j: usize) -> String {
+        if super::wgsl::dialect() == super::wgsl::Dialect::Msl {
+            // MSL has no runtime array length; the size is static
+            return format!("{}u", super::numel(&self.nodes[j].shape));
+        }
+        let per_word = match self.nodes[j].precision.storage {
+            Format::F16 => " * 2u",
+            _ => "",
+        };
+        format!("arrayLength(&b{j}){per_word}")
+    }
+
     /// Emit the tiled kernel for `root`, continuing `s` (which already
     /// holds the bindings and per-node functions).
-    pub(super) fn tile_kernel(&self, root: usize, mut s: String, reads: Vec<usize>) -> WgslKernel {
+    /// `None` when the staging cannot fit [`MAX_STAGE_WORDS`] even at a
+    /// one-step chunk; the caller then emits the untiled kernel.
+    pub(super) fn tile_kernel(
+        &self,
+        root: usize,
+        mut s: String,
+        reads: Vec<usize>,
+    ) -> Option<WgslKernel> {
         let c = self.comp_at(root).unwrap();
         // the reduction this kernel chunks: root, or the one inlined into
         // root when root is its epilogue map
@@ -908,8 +932,13 @@ impl TensorGraph {
             regions + comps
         };
         let mut chunk = chunk;
-        while chunk > 1 && staged(&ctx, chunk) > 4096 {
+        while chunk > 1 && staged(&ctx, chunk) > MAX_STAGE_WORDS {
             chunk -= 1;
+        }
+        // Still over at chunk 1 (wide inner reduce dims, e.g. Kokoro's
+        // iSTFT wanted 328 KiB): no valid tiled schedule on any target.
+        if staged(&ctx, chunk) > MAX_STAGE_WORDS {
+            return None;
         }
         ctx.chunk = chunk;
         run_epi(&mut ctx, &mut epi);
@@ -1235,13 +1264,9 @@ impl TensorGraph {
                 if !lay.window.is_empty() {
                     // a window spans lanes / steps past the edge: keep the
                     // read inside the buffer (those slots are never used)
-                    let per_word = match self.nodes[r.key.buffer].precision.storage {
-                        Format::F16 => " * 2u",
-                        _ => "",
-                    };
                     live.push_str(&format!(
-                        " && u32(a) < arrayLength(&b{}){per_word}",
-                        r.key.buffer
+                        " && u32(a) < {}",
+                        self.buffer_len_expr(r.key.buffer)
                     ));
                 }
                 writeln!(s, "            if ({live}) {{").unwrap();
@@ -1503,13 +1528,13 @@ impl TensorGraph {
         }
         writeln!(s, "}}").unwrap();
 
-        WgslKernel {
+        Some(WgslKernel {
             source: s,
             node: TensorId(root as u32),
             reads: reads.into_iter().map(|j| TensorId(j as u32)).collect(),
             points: pts.iter().product::<usize>() as u32,
             count: (n_tiles * threads) as u32,
             workgroup_size: threads as u32,
-        }
+        })
     }
 }

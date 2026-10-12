@@ -13,7 +13,7 @@
 //! `out`; `TANG_TILES` blocks of `TANG_THREADS` threads.
 use std::fmt::Write;
 
-use super::msl::Bilinear;
+use super::msl_mma::Bilinear;
 use super::tile::emit_scalar;
 use super::wgsl::{Target, WgslProgram};
 use super::{TensorGraph, TensorId};
@@ -91,7 +91,7 @@ impl TensorGraph {
         }
         writeln!(s, "    unsigned row0 = tile_y * {BLOCK}u;").unwrap();
         writeln!(s, "    unsigned col0 = tile_x * {BLOCK}u;").unwrap();
-        let lead_term = |addr: &super::msl::Addr| -> String {
+        let lead_term = |addr: &super::msl_mma::Addr| -> String {
             let mut t = format!("{}", addr.offset);
             for &d in &others {
                 if addr.coefs[d] != 0 {
@@ -120,7 +120,7 @@ impl TensorGraph {
         // staging, walking the buffer in address order
         let stage = |s: &mut String,
                      name: &str,
-                     addr: &super::msl::Addr,
+                     addr: &super::msl_mma::Addr,
                      pdim: usize,
                      base: &str,
                      extent: usize,
@@ -679,7 +679,7 @@ struct Flash {
     kd: usize,
 }
 
-use super::msl::Addr;
+use super::msl_mma::Addr;
 use super::vars_reachable;
 use super::{Arg, Op};
 use tang_expr::Node as ENode;

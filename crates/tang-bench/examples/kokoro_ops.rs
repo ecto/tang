@@ -762,6 +762,13 @@ fn main() {
         precision_main(&device, &mut cache, std::env::args().nth(2));
         return;
     }
+    if only.as_deref() == Some("msl") {
+        #[cfg(feature = "metal")]
+        msl::main(std::env::args().nth(2));
+        #[cfg(not(feature = "metal"))]
+        eprintln!("build with --features metal");
+        return;
+    }
     let want_op = |n: &str| only.as_deref().is_none_or(|o| n.starts_with(o));
     println!(
         "{} — kernel-only, {ITERS} launches per sample\n",
@@ -1134,12 +1141,10 @@ fn predict(
     Some(sg.precision_error(sin, &souts))
 }
 
-fn precision_main(device: &GpuDevice, cache: &mut KernelCache, only: Option<String>) {
-    let want_op = |n: &str| only.as_deref().is_none_or(|o| n.starts_with(o));
-    println!(
-        "{} — precision schedules, kernel-only, {ITERS} launches\n",
-        device.name
-    );
+/// The ops of the precision tables (`a`–`f` without `d`, plus `m`), full
+/// size with their f64 references, and `d` when `with_d`.
+fn prec_ops(only: Option<&str>, with_d: bool) -> Vec<PrecOp> {
+    let want_op = |n: &str| only.is_none_or(|o| n.starts_with(o));
     let mut ops: Vec<PrecOp> = Vec::new();
 
     if want_op("a") {
@@ -1270,6 +1275,42 @@ fn precision_main(device: &GpuDevice, cache: &mut KernelCache, only: Option<Stri
         });
     }
 
+    if with_d && want_op("d") {
+        let (c, t, k, dil) = (512, 2000, 7, 3);
+        let x = rand(c * t, 1, 1.0);
+        let w = rand(c * c * k, 2, 0.05);
+        let b = rand(c, 6, 0.1);
+        let alpha: Vec<f32> = rand(c, 7, 0.5).iter().map(|v| v + 1.0).collect();
+        let mut want = conv_ref(&f64s(&x), &f64s(&w), c, t, k, dil);
+        for ch in 0..c {
+            for tt in 0..t {
+                let z = want[ch * t + tt] + b[ch] as f64;
+                let a = alpha[ch] as f64;
+                want[ch * t + tt] = z + (a * z).sin().powi(2) / a;
+            }
+        }
+        let (g, outs) = conv_snake_graph(c, t, k, dil, false);
+        let (sg, so) = conv_snake_graph(32, 256, k, dil, false);
+        let si = small_inputs(&sg, 160, &[1.0, 0.05, 0.1, 1.0]);
+        ops.push(PrecOp {
+            name: "d conv + bias + snake",
+            g,
+            outs,
+            inputs: vec![x, w, b, alpha],
+            want,
+            names: vec!["x", "w", "b", "alpha"],
+            small: (sg, so, si),
+        });
+    }
+    ops
+}
+
+fn precision_main(device: &GpuDevice, cache: &mut KernelCache, only: Option<String>) {
+    println!(
+        "{} — precision schedules, kernel-only, {ITERS} launches\n",
+        device.name
+    );
+    let ops = prec_ops(only.as_deref(), false);
     if std::env::var("PREC_DEBUG").is_ok() {
         for op in &ops {
             let (sg, souts, sin) = &op.small;
@@ -1380,5 +1421,253 @@ fn precision_main(device: &GpuDevice, cache: &mut KernelCache, only: Option<Stri
     println!("\nf16 accumulators the 1e-3 budget rejects:\n\n| op | node | measured err |\n|---|---|---:|");
     for row in rejects {
         println!("{row}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// native Metal backend
+// ---------------------------------------------------------------------------
+
+/// `kokoro_ops msl [op]`: the same ops on the MSL lowering — f32 (naive,
+/// auto, per-kernel autotune), f16 operands on simdgroup fragments
+/// (forced, to show what they cost and buy), and the precision search
+/// with the fragment dimension under 1e-2 / 1e-3 budgets. Fwd+bwd rows
+/// for (a) and (f) in f32.
+#[cfg(feature = "metal")]
+mod msl {
+    use super::*;
+    use tang_bench::ir_msl::{self, Executable, MslDevice};
+
+    fn time(dev: &MslDevice, exe: &Executable) -> f64 {
+        (0..3)
+            .map(|_| exe.time(dev, ITERS))
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    fn run(
+        dev: &MslDevice,
+        g: &TensorGraph,
+        outs: &[TensorId],
+        inputs: &[&[f32]],
+        want: &[f64],
+    ) -> (f64, f64, usize) {
+        let prog = g.to_msl(outs);
+        if !Executable::fits(dev, &prog) {
+            // staging over the 32 KiB threadgroup limit: not runnable here
+            return (f64::INFINITY, f64::INFINITY, prog.kernels.len());
+        }
+        let exe = Executable::new(dev, prog, inputs);
+        exe.run(dev);
+        let err = rel_err(&exe.read(outs[0]), want);
+        (time(dev, &exe), err, exe.program.kernels.len())
+    }
+
+    pub fn main(only: Option<String>) {
+        let dev = MslDevice::new().expect("metal");
+        println!(
+            "{} — MSL backend, kernel-only, {ITERS} launches per sample\n",
+            dev.name
+        );
+        let ops = prec_ops(only.as_deref(), true);
+        let mut table = Vec::new();
+        for op in &ops {
+            let refs: Vec<&[f32]> = op.inputs.iter().map(|v| v.as_slice()).collect();
+            let (g, outs) = optimized(&op.g, &op.outs);
+            let mut auto = g.clone();
+            auto.schedule_auto(&outs);
+            let tuned = ir_msl::autotune_kernels(&dev, auto.clone(), &outs, &refs, 10).0;
+            let mut line = format!("{}:", op.name);
+            let mut best = (f64::INFINITY, "", 0.0);
+            for (sched, gv) in [("naive", &g), ("auto", &auto), ("autotune", &tuned)] {
+                let (ms, err, nk) = run(&dev, gv, &outs, &refs, &op.want);
+                line.push_str(&format!(
+                    "\n    f32 {sched:<8} {ms:8.3} ms  {nk} kernels  err {err:.1e}"
+                ));
+                if err <= 1e-5 && ms < best.0 {
+                    best = (ms, sched, err);
+                }
+            }
+            // forced: every fragment-eligible contraction on f16 fragments
+            let cands = ir_msl::fragment_candidates(&tuned, &outs);
+            let forced = if cands.is_empty() {
+                line.push_str("\n    f16 fragments: no eligible contraction");
+                "n/a".to_string()
+            } else {
+                let mut gf = tuned.clone();
+                for &t in &cands {
+                    let srcs: Vec<TensorId> = match &gf.nodes()[t.index()].op {
+                        Op::Comp(c) => {
+                            let core = c
+                                .args
+                                .iter()
+                                .find(|a| gf.nodes()[a.src.index()].inline && matches!(&gf.nodes()[a.src.index()].op, Op::Comp(r) if r.monoid.is_some()))
+                                .map_or(t, |a| a.src);
+                            match &gf.nodes()[core.index()].op {
+                                Op::Comp(cc) => cc.args.iter().map(|a| gf.storage(a.src)).collect(),
+                                _ => vec![],
+                            }
+                        }
+                        _ => vec![],
+                    };
+                    for s in srcs {
+                        gf.set_precision(s, Precision::storage(Format::F16));
+                    }
+                    gf.set_fragment(t, true);
+                }
+                let (ms, err, nk) = run(&dev, &gf, &outs, &refs, &op.want);
+                line.push_str(&format!(
+                    "\n    f16 fragments ({} nodes) {ms:8.3} ms  {nk} kernels  err {err:.1e}",
+                    cands.len()
+                ));
+                format!("{ms:.3} ({err:.0e})")
+            };
+            {
+                let gv = match best.1 {
+                    "naive" => &g,
+                    "auto" => &auto,
+                    _ => &tuned,
+                };
+                let exe = Executable::new(&dev, gv.to_msl(&outs), &refs);
+                let sep = (0..3)
+                    .map(|_| exe.time_separate(&dev, ITERS))
+                    .fold(f64::INFINITY, f64::min);
+                line.push_str(&format!(
+                    "\n    f32 {} with one command buffer per run: {sep:.3} ms",
+                    best.1
+                ));
+            }
+            let mut tuned_cols = Vec::new();
+            for rel in [1e-2, 1e-3] {
+                let r = ir_msl::tune_precision(
+                    &dev,
+                    tuned.clone(),
+                    &outs,
+                    &refs,
+                    std::slice::from_ref(&op.want),
+                    ErrorBudget::rel(rel),
+                    ITERS,
+                );
+                let assign = if r.assignment.is_empty() && r.fragments.is_empty() {
+                    "all f32".to_string()
+                } else {
+                    let mut parts: Vec<String> = r
+                        .assignment
+                        .iter()
+                        .map(|&(t, p)| {
+                            format!(
+                                "{} {}",
+                                describe(&r.graph, t, &op.names, &outs),
+                                fmt_prec(p)
+                            )
+                        })
+                        .collect();
+                    parts.extend(r.fragments.iter().map(|&t| {
+                        format!("{} on fragments", describe(&r.graph, t, &op.names, &outs))
+                    }));
+                    parts.join(", ")
+                };
+                line.push_str(&format!(
+                    "\n    tune @ {rel:.0e}: {:.3} → {:.3} ms  err {:.1e}  [{assign}]",
+                    r.base_ms, r.ms, r.error.max_rel
+                ));
+                for t in &r.trials {
+                    line.push_str(&format!(
+                        "\n        {:<24} err {:.1e}  {}",
+                        t.what,
+                        t.error.max_rel,
+                        match (t.kept, t.ms) {
+                            (true, Some(ms)) => format!("kept ({ms:.3} ms)"),
+                            (false, Some(ms)) => format!("no gain ({ms:.3} ms)"),
+                            _ => "over budget".into(),
+                        }
+                    ));
+                }
+                tuned_cols.push(format!("{:.3} [{assign}]", r.ms));
+            }
+            println!("{line}");
+            table.push(format!(
+                "| {} | {:.3} ({}) | {forced} | {} | {} |",
+                op.name, best.0, best.1, tuned_cols[0], tuned_cols[1]
+            ));
+        }
+        // forward + backward, f32
+        let want_op = |n: &str| only.as_deref().is_none_or(|o| n.starts_with(o));
+        let mut train = Vec::new();
+        if want_op("a") || want_op("train") {
+            let (c, t, k, dil) = (512, 2000, 7, 3);
+            let x = rand(c * t, 1, 1.0);
+            let w = rand(c * c * k, 2, 0.05);
+            let xw = vec![TensorId::from_index(0), TensorId::from_index(1)];
+            let (g, o) = conv_graph(c, t, k, dil, false);
+            let (gi, oi) = conv_graph(c, t, k, dil, true);
+            train.push(train_row(
+                &dev,
+                "a fwd+bwd (dx, dw)",
+                vec![("direct", g, o[0], xw.clone()), ("im2col", gi, oi[0], xw)],
+                &[&x, &w],
+            ));
+        }
+        if want_op("f") || want_op("train") {
+            let (cf, tf, ff) = (512, 200, 1536);
+            let inputs: Vec<Vec<f32>> = vec![
+                rand(cf * tf, 12, 1.0),
+                rand(cf * 7, 13, 0.3),
+                rand(cf, 14, 0.1),
+                rand(cf, 15, 0.2).iter().map(|v| v + 1.0).collect(),
+                rand(cf, 16, 0.1),
+                rand(ff * cf, 17, 0.04),
+                rand(ff, 18, 0.1),
+                rand(cf * ff, 19, 0.02),
+                rand(cf, 20, 0.1),
+            ];
+            let refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
+            let cn = convnext_graph(cf, tf, ff);
+            train.push(train_row(
+                &dev,
+                "f fwd+bwd (all params)",
+                vec![("convnext", cn.g, cn.y, cn.params)],
+                &refs,
+            ));
+        }
+        println!("\n| op | MSL f32 best (ms) | MSL f16 fragments, forced (ms, err) | tuned @1e-2 (ms) | tuned @1e-3 (ms) |");
+        println!("|---|---:|---:|---|---|");
+        for r in table {
+            println!("{r}");
+        }
+        for r in train {
+            println!("{r}");
+        }
+    }
+
+    fn train_row(
+        dev: &MslDevice,
+        name: &str,
+        algebras: Vec<(&'static str, TensorGraph, TensorId, Vec<TensorId>)>,
+        inputs: &[&[f32]],
+    ) -> String {
+        let mut best = (f64::INFINITY, String::new());
+        let mut line = format!("{name}:");
+        for (alg, mut g, y, wrt) in algebras {
+            let grads = g.backward(y, &wrt).unwrap();
+            let mut outs = vec![y];
+            outs.extend(grads);
+            let (g, outs) = optimized(&g, &outs);
+            let mut auto = g.clone();
+            auto.schedule_auto(&outs);
+            let tuned = ir_msl::autotune_kernels(dev, auto.clone(), &outs, inputs, 10).0;
+            for (sched, gv) in [("auto", auto), ("autotune", tuned)] {
+                let exe = Executable::new(dev, gv.to_msl(&outs), inputs);
+                let ms = time(dev, &exe);
+                line.push_str(&format!(
+                    "\n    {alg:>8}/{sched:<8} {ms:8.3} ms  {} kernels",
+                    exe.program.kernels.len()
+                ));
+                if ms < best.0 {
+                    best = (ms, format!("{alg}/{sched}"));
+                }
+            }
+        }
+        println!("{line}");
+        format!("| {name} | {:.3} ({}) | | | |", best.0, best.1)
     }
 }

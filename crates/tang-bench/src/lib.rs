@@ -257,6 +257,10 @@ pub fn random_spd_flat(size: usize) -> Vec<f64> {
 }
 
 /// Run tang-compile tensor graphs on the GPU, for the kernels-vs-IR benches.
+#[cfg(feature = "metal")]
+#[path = "ir_msl.rs"]
+pub mod ir_msl;
+
 pub mod ir_gpu {
     use tang::Scalar;
     use tang_compile::tensor::precision::{f16_bits, f16_from_bits};
@@ -280,7 +284,7 @@ pub mod ir_gpu {
     /// default everywhere.
     pub fn program_for(device: &GpuDevice, g: &TensorGraph, outputs: &[TensorId]) -> WgslProgram {
         if device.msl_passthrough && std::env::var("TANG_NATIVE").is_ok() {
-            g.to_msl(outputs)
+            g.to_msl_mma(outputs)
         } else {
             g.to_wgsl(outputs)
         }
@@ -1829,7 +1833,7 @@ pub mod ir_gpu {
             g.schedule_auto(&outs);
             let f64s = |v: &[f32]| v.iter().map(|&x| x as f64).collect::<Vec<f64>>();
             let want = g.eval(&[f64s(&a), f64s(&b), f64s(&bias)], &outs).remove(0);
-            let prog = g.to_msl(&outs);
+            let prog = g.to_msl_mma(&outs);
             assert!(
                 prog.kernels
                     .iter()

@@ -1092,3 +1092,110 @@ and measurement agree within ~1.5×. The AdaIN rows are the point: the
 same f16 variance is rejected with one thread walking T and admitted
 under a split, because the tree of 256 partial sums rounds at small
 magnitudes. Precision and thread mapping are one search space.
+
+## Native Metal backend: MSL lowering and simdgroup fragments (M4 Max, kernel-only)
+
+`TensorGraph::to_msl` lowers the same kernels as the WGSL path to Metal
+Shading Language and `tang_bench::ir_msl` runs them on buffers it owns
+(feature `metal`; see `docs/tensor-ir.md`). Two things change against
+WGSL: the kernels compile through Apple's compiler directly (no
+wgpu/naga, native `half`), and an f16 × f16 → f32 contraction can be
+scheduled onto `simdgroup_matrix` 8×8 fragments (`set_fragment`).
+
+Method: every timing is 50 launches encoded into one command buffer
+after a warm-up, one wait, divided; best of 3. WGSL is the existing
+`kernel_only` / `kokoro_ops` method (one wgpu submission per run, one
+sync); MPS is `scripts/torch_kokoro_ops.py` (5 warmups, 50 calls, one
+`torch.mps.synchronize`), f32 and with `f16` (weights and activations
+in half). All four were run serially in one session on an otherwise
+idle M4 Max. Every IR result is checked over the full output against an
+f64 reference (`err` = max |got − f64| / max |f64|).
+`cargo run --release -p tang-bench --features metal --example msl_kernels`,
+`... --example kokoro_ops -- msl`.
+
+### Matmul and attention
+
+| shape | WGSL best | MSL f32 best | MSL f16 operands, fragments | MPS f32 | MPS f16 |
+|---|---:|---:|---:|---:|---:|
+| matmul 1024³ | 0.587 (reg8), 3.66 TFLOP/s | 0.492 (auto), 4.37 | **0.191, 11.23** (err 8.3e-5) | 0.194, 11.08 | 0.176, 12.17 |
+| matmul 128×576×1536 | 0.176 (auto), 1.29 | 0.090 (reg2), 2.52 | **0.040, 5.72** (9.8e-5) | 0.045, 5.00 | 0.046, 4.98 |
+| matmul 512×576×1536 | 0.329 (auto), 2.75 | 0.214 (auto), 4.24 | **0.084, 10.79** (1.1e-4) | 0.097, 9.33 | 0.097, 9.37 |
+| attention n=512, d=64, causal | 0.240 (flash_auto) | 0.078 (naive) | — | 0.043 (sdpa) | 0.054 |
+| attention n=1024 | 0.746 (flash_auto) | 0.216 (naive) | — | 0.078 | 0.105 |
+
+(ms, TFLOP/s.) The same f16 operands *without* fragments (scalar 4×4
+register tile) run 0.498 / 0.099 / 0.213 ms: f16 storage alone buys
+nothing on these compute-bound shapes; the matrix unit is the whole win.
+An f16 output costs nothing either way now (native `half` stores: 0.190
+vs 0.191 ms; the WGSL path's packed-word atomics made it slower).
+
+### Kokoro ops
+
+| op | WGSL best | MSL f32 best | MSL tuned @ 1e-3 (choice) | err | MPS f32 | MPS f16 |
+|---|---:|---:|---:|---|---:|---:|
+| a conv1d 512→512 k7 d3 T2000 | 2.196 (3.34 TFLOP/s) | 2.296 (3.20) | **1.057 (6.94)** x, w f16, conv on fragments | 5.3e-5 | 0.920 (7.98) | 0.672 (10.9) |
+| b upsample 512→256 k20 s10 | 3.274 | 2.713 | 2.366: w, polyphase output f16; fragments rejected (3.77) | 4.6e-4 | 1.041 conv / 1.179 | 0.892 / 1.108 |
+| c iSTFT n_fft 20 hop 5 T4000 | 0.073 | **0.018** | 0.023: all f32 | 1.4e-6 | 0.119 manual / 0.325 | 0.110 / 0.310 |
+| d conv (a) + bias + snake | 2.201 | 2.363 | **1.066** x, w f16, fragments + snake epilogue (1 kernel) | 8.2e-5 | 0.820 | 0.786 |
+| e AdaIN C512 T2000 style128 | 0.205 | **0.030** | 0.028: x, W, out f16 | 5.1e-4 | 0.250 | 0.272 |
+| f ConvNeXt C512 T200 F1536 | 0.553 | 0.345 | 0.318: w1, normed act f16, pw1 on fragments | 2.0e-4 | 0.231 | 0.413 |
+| a fwd+bwd (dx, dw) | 6.064 | 4.125 (im2col) | f32 only | | 2.194 | 2.064 |
+| f fwd+bwd (all params) | 1.570 | 0.927 | f32 only | | 0.962 | 1.077 |
+
+"Tuned" is `ir_msl::tune_precision` from the MSL-autotuned f32 schedule:
+first, per contraction, the move "operands f16 + fragments"; then f16
+storage per buffer, largest first; then f16 accumulators (native
+rounding through `half`, timed like any move); a move is kept if the
+program stays within budget vs f64 and gets ≥ 3% faster, and the final
+choice is re-timed against f32. The 1e-2 budget made the same choices.
+
+What this shows, and where fragments do not help:
+
+- **Matmul reaches MPS.** Both operands are affine with a unit stride,
+  so interior tiles load fragments straight from device memory (the
+  spike's kernel shape: 64×64 tile, 2×2 SIMD groups of 4×4 fragments);
+  ragged edge tiles gather into threadgroup memory with zero padding.
+  11.2 TFLOP/s at 1024³ vs MPS f32 11.1 and f16 12.2; ahead of MPS at
+  the two transformer shapes.
+- **Conv as implicit GEMM: 2.2× over the f32 tile, still 1.15× (f32) /
+  1.6× (f16) behind MPS.** The weight `w[o, (c,k)]` flattens to one
+  unit-stride K and loads directly; `x[c, t + 3k − 9]` is guarded and
+  dilated, so it is gathered per K-chunk through its view (zero padding
+  at staging) — a 32×64 half tile per step with a div/mod per element.
+  Staging *both* operands cost 2.4 ms, no better than f32; loading the
+  weight directly is what got to 1.06. A windowed `x` stage (the f32
+  tiler's trick) and a larger K chunk are the next steps.
+- **The upsample's fragments lose (3.77 vs 2.71 ms f32).** Its weight
+  read `w[o, c, r + s·j]` does not flatten `(j, c)` onto one stride and
+  the phase `r` is a uniform batch dim, so both operands are gathered,
+  with small K (1024) per tile. The search rejected it and kept f16
+  storage instead (1.15×).
+- **ConvNeXt: fragments apply to one of the two pointwise matmuls.** The
+  first reads the materialized LayerNorm output (made f16), the second
+  reads GELU(h + b) through a substituted map, which `fragment_plan`
+  refuses (operands must be f16 buffers). At 0.3 GFLOP per matmul the
+  block is launch-bound anyway (8 kernels).
+- **Much of the f32 gain is the backend, not the kernel.** The MSL f32
+  kernels are the WGSL emitter's kernels, yet AdaIN (6 small kernels)
+  runs 0.030 vs 0.205 ms and the iSTFT 0.018 vs 0.073. With one command
+  buffer per run (wgpu's pattern) MSL is still 0.038 / 0.023 ms, so the
+  gap is wgpu/naga per-dispatch cost and code generation, not batching.
+  The same holds for the block-shaped work: attention's naive form
+  0.216 vs 0.746 ms and conv fwd+bwd 4.1 vs 6.1 ms. Big single kernels
+  (the conv) are a wash between the two.
+- **Attention has no fragment lowering yet** (QKᵀ and PV under the
+  online-softmax monoid). MSL's best is the materialized naive form;
+  MPS's sdpa is 2–3× ahead.
+- **Not measured as speedups:** f16 accumulators. The search tried every
+  remaining reduction with an f16 accumulator; none was kept (over budget
+  or no gain).
+- A pre-existing WGSL issue showed up here: the tiler can emit staging
+  larger than any device allows (iSTFT's OLA tile, 84016 floats = 328 KiB,
+  because the chunk-halving loop stops at chunk 1). wgpu rejects it at
+  pipeline creation (autotune catches the panic); Apple's compiler service
+  crashes on it (`XPC_ERROR_CONNECTION_INTERRUPTED`). MSL kernels now
+  carry `threadgroup_bytes` and the Metal autotuner skips candidates over
+  the device limit.
+- `kernel_only` hangs in its transformer-block section on this machine
+  (also on the base commit `fd193b4`); its matmul/attention rows above are
+  from the part that runs.

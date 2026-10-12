@@ -81,7 +81,7 @@ fn main() {
                 time_exe(&device, &mut cache, &exe, c)
             ));
             if name == "auto" && device.msl_passthrough {
-                let exe = Executable::new(&device, g.to_msl(&[c]), &[&a, &b]);
+                let exe = Executable::new(&device, g.to_msl_mma(&[c]), &[&a, &b]);
                 line.push_str(&format!(
                     "  mma {:.3}",
                     time_exe(&device, &mut cache, &exe, c)

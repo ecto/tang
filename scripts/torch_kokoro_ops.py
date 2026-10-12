@@ -1,12 +1,15 @@
 # PyTorch MPS reference timings for crates/tang-bench/examples/kokoro_ops.rs.
 # Same shapes, same method: 5 warmups, 50 launches, one torch.mps.synchronize.
-# fp32 throughout.
-#   ~/.cache/kv/bin/python scripts/torch_kokoro_ops.py
-import time, math
+# fp32 by default; `f16` as the first argument runs everything in half
+# (weights and activations; MPS accumulates matmul/conv in f32).
+#   ~/.cache/kv/bin/python scripts/torch_kokoro_ops.py [f16]
+import sys, time, math
 import torch, torch.nn.functional as F
 
 dev = "mps"
 ITERS = 50
+DT = torch.float16 if "f16" in sys.argv[1:] else torch.float32
+torch.set_default_dtype(DT)
 
 def bench(fn, iters=ITERS, warm=5):
     for _ in range(warm): fn()
@@ -17,10 +20,10 @@ def bench(fn, iters=ITERS, warm=5):
     return (time.perf_counter() - t) * 1e3 / iters
 
 def r(*shape, scale=1.0):
-    return (torch.rand(*shape, device=dev) * 2 - 1) * scale
+    return ((torch.rand(*shape, device=dev) * 2 - 1) * scale).to(DT)
 
 torch.manual_seed(0)
-print("torch", torch.__version__, "MPS fp32, kernel-only,", ITERS, "launches per sample\n")
+print("torch", torch.__version__, "MPS", DT, "kernel-only,", ITERS, "launches per sample\n")
 rows = []
 def row(name, ms, note=""):
     rows.append((name, ms, note)); print(f"{name}: {ms:.3f} ms {note}")
@@ -44,7 +47,7 @@ row("b polyphase conv1d only (no interleave)", bench(lambda: F.conv1d(F.pad(xu, 
 
 # (c) iSTFT head: [22, frames] -> exp/sin -> istft(n_fft 20, hop 5, hann, center)
 FR = 4000
-spec = r(1, 22, FR); win = torch.hann_window(20, device=dev)
+spec = r(1, 22, FR).float(); win = torch.hann_window(20, device=dev, dtype=torch.float32)  # MPS FFT: f32 only
 def istft():
     mag = torch.exp(spec[:, :11]); ph = torch.sin(spec[:, 11:])
     z = torch.polar(mag, ph)
@@ -110,6 +113,15 @@ def cn_train():
     y = blk(xfg)
     y.backward(torch.ones_like(y))
 row("f fwd+bwd (all params)", bench(cn_train))
+
+# kernel_only shapes: matmul (TFLOP/s) and causal attention, d = 64
+for (m, k, n) in [(1024, 1024, 1024), (128, 576, 1536), (512, 576, 1536)]:
+    a = r(m, k); b = r(k, n)
+    ms = bench(lambda: a @ b)
+    row(f"matmul {m}x{k}x{n}", ms, f"{2 * m * k * n / ms / 1e9:.2f} TFLOP/s")
+for n in (512, 1024):
+    q = r(1, 1, n, 64); kk = r(1, 1, n, 64); v = r(1, 1, n, 64)
+    row(f"attention n={n} sdpa causal", bench(lambda: F.scaled_dot_product_attention(q, kk, v, is_causal=True)))
 
 print("\n| op | MPS (ms) |\n|---|---:|")
 for n, ms, note in rows:

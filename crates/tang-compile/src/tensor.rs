@@ -43,7 +43,11 @@ pub mod cuda;
 #[path = "tensor_grad.rs"]
 mod grad;
 #[path = "tensor_msl.rs"]
-mod msl;
+pub mod msl;
+/// #34's f32 simdgroup-matrix tile (`to_msl_mma`, opt-in via TANG_NATIVE)
+/// and the affine/bilinear analysis the CUDA wmma lowering shares.
+#[path = "tensor_msl_mma.rs"]
+mod msl_mma;
 #[path = "tensor_precision.rs"]
 pub mod precision;
 #[path = "tensor_tile.rs"]
@@ -468,6 +472,11 @@ pub struct TNode {
     /// Schedule: points per thread along `(x, y)` within a tile — the
     /// register tile. `(1, 1)` is one point per thread.
     pub reg: (u32, u32),
+    /// Schedule: lower this tiled contraction onto matrix-unit fragments
+    /// (Metal `simdgroup_matrix`) on backends that have them. Only legal
+    /// for an f16 × f16 → f32 contraction; see
+    /// [`TensorGraph::fragment_plan`]. Backends without fragments ignore it.
+    pub fragment: bool,
     /// Schedule: number formats — storage of a materialized buffer (or
     /// input) and the running accumulator of a reduction. Default all
     /// f32. See [`Precision`].
@@ -687,6 +696,7 @@ impl TensorGraph {
             split: 0,
             tile: (0, 0, 0),
             reg: (1, 1),
+            fragment: false,
             precision: Precision::default(),
         });
         TensorId(self.nodes.len() as u32 - 1)
@@ -702,6 +712,7 @@ impl TensorGraph {
             split: 0,
             tile: (0, 0, 0),
             reg: (1, 1),
+            fragment: false,
             precision: Precision::default(),
         });
         TensorId(self.nodes.len() as u32 - 1)
@@ -732,6 +743,7 @@ impl TensorGraph {
             split: 0,
             tile: (0, 0, 0),
             reg: (1, 1),
+            fragment: false,
             precision: Precision::default(),
         });
         Ok(TensorId(self.nodes.len() as u32 - 1))
@@ -829,6 +841,7 @@ impl TensorGraph {
             split: 0,
             tile: (0, 0, 0),
             reg: (1, 1),
+            fragment: false,
             precision: Precision::default(),
             op: Op::Comp(comp),
         });
@@ -1301,6 +1314,7 @@ impl TensorGraph {
                 split: node.split,
                 tile: node.tile,
                 reg: node.reg,
+                fragment: node.fragment,
                 precision: node.precision,
             });
             remap[i] = Some(ng.nodes.len() - 1);
@@ -2341,6 +2355,7 @@ impl TensorGraph {
                     shape: out.clone(),
                     // siblings group by precision: all members share it
                     precision: self.nodes[members[0]].precision,
+                    fragment: false,
                     inline: false,
                     split: 0,
                     tile: (0, 0, 0),
@@ -3479,6 +3494,36 @@ mod tests {
         let chunk = sizes[1] / (64 * 7);
         assert!(chunk > 4, "chunk should grow past 4: {sizes:?}");
         assert_eq!(sizes[0], 82 * chunk, "x should be staged as one window");
+    }
+
+    #[test]
+    fn oversized_staging_falls_back_untiled() {
+        // r0 = c, inner k = 300: w[o, c, k] stages 16 rows × 300 taps per
+        // chunk step, 4800 words over the 16 KiB limit even at chunk 1
+        let mut g = TensorGraph::new();
+        let x = g.input(&[600, 512]);
+        let w = g.input(&[64, 600, 300]);
+        let y = conv1d(&mut g, x, w, 1, 150);
+        g.set_schedule(y, 0, (16, 16, 32), (1, 1));
+        let k = &g.to_wgsl(&[y]).kernels[0];
+        assert!(
+            !k.source.contains("var<workgroup>"),
+            "should not stage:\n{}",
+            k.source
+        );
+        assert_eq!(k.workgroup_size, 256);
+        let m = &g.to_msl(&[y]).kernels[0];
+        assert_eq!(m.threadgroup_bytes, 0);
+
+        // the same schedule with few taps still tiles, within the limit
+        let mut g = TensorGraph::new();
+        let x = g.input(&[600, 512]);
+        let w = g.input(&[64, 600, 7]);
+        let y = conv1d(&mut g, x, w, 1, 3);
+        g.set_schedule(y, 0, (16, 16, 32), (1, 1));
+        let m = &g.to_msl(&[y]).kernels[0];
+        assert!(m.threadgroup_bytes > 0);
+        assert!(m.threadgroup_bytes <= 4 * tile::MAX_STAGE_WORDS);
     }
 
     #[test]
