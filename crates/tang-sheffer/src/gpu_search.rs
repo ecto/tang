@@ -192,8 +192,8 @@ impl GpuSearcher {
         }))
         .map_err(|_| "no GPU adapter")?;
 
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("sheffer-gpu"),
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits {
@@ -205,8 +205,7 @@ impl GpuSearcher {
                 },
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::Off,
-            },
-        ))?;
+            }))?;
 
         // Compile shader
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {

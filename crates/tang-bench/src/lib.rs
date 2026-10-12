@@ -981,7 +981,6 @@ pub mod ir_gpu {
         }
 
         fn check_simdgroup_matmul(device: &GpuDevice, m: usize, k: usize, n: usize) {
-            let device = device;
             let mut cache = KernelCache::new();
             let mut rng = crate::Rng::new(5);
             let a: Vec<f32> = (0..m * k).map(|_| rng.f32() * 2.0 - 1.0).collect();

@@ -57,20 +57,18 @@ impl Rasterizer {
         .expect("no GPU adapter found");
 
         let adapter_limits = adapter.limits();
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("tang-3dgs"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits {
-                    max_storage_buffers_per_shader_stage:
-                        adapter_limits.max_storage_buffers_per_shader_stage,
-                    max_bind_groups: adapter_limits.max_bind_groups,
-                    ..wgpu::Limits::default()
-                },
-                memory_hints: wgpu::MemoryHints::Performance,
-                trace: wgpu::Trace::Off,
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("tang-3dgs"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits {
+                max_storage_buffers_per_shader_stage:
+                    adapter_limits.max_storage_buffers_per_shader_stage,
+                max_bind_groups: adapter_limits.max_bind_groups,
+                ..wgpu::Limits::default()
             },
-        ))
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+        }))
         .expect("failed to create GPU device");
 
         // Compile projection shader
