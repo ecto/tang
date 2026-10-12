@@ -910,6 +910,74 @@ parallelism) from the algebra, with no op-specific code, and picks per
 chip. It does not yet generate the instruction-level quality of a vendor
 library, and through this backend it cannot reach tensor cores at all.
 
+### Flash backward on tensor cores (CUDA)
+
+Two generalizations of the existing lowerings, recognized from the comps
+`backward` produces (`dump_train_cuda` prints them), no attention API:
+
+- **State-materializing forward.** `flash_tile` also matches an
+  online-softmax reduction whose score is read from a buffer (the training
+  step keeps `S` for the backward) and one that is itself the root,
+  writing its `(m, l, acc)` state. The score block is staged from the
+  buffer (keys fastest), `O += P·V` stays on wmma. Key tiles that the
+  affine mask covers are skipped (`score_mask`, now shared with the Metal
+  attention plan), and the block drops to two warps when four would leave
+  the device under-filled.
+- **dS recomputed in the dQ/dK tiles.** `bilinear_tile` accepts an operand
+  that is an inlined map over buffers and iotas; `cuda_mma_kernel`
+  evaluates the map while staging, each read composed through the map's
+  view, in the order of the buffer it reads along the most dims. dS
+  (`schedule_auto` already inlines it into every reducing consumer) is
+  rebuilt inside the dK tile (both rope halves, width 2) and the two dQ
+  tiles from `S`, `max`, `dP` and the two correction terms.
+
+Per kernel (`cuda_train_kernels`, min of 10; the 3090 at 98–99%
+utilization from other tenants throughout, so ±30% between runs):
+
+| kernel | seq 128 WGSL | native | seq 512 WGSL | native |
+|---|---|---|---|---|
+| online-softmax forward `[3,3,n,1,64,3]` | 0.070 | 0.029–0.037 | 0.254 | 0.119–0.125 |
+| dK (both halves), Σ over queries | 0.020 | 0.037 | 0.193 | 0.108 |
+| dQ half 1, Σ over keys | 0.015 | 0.026 | 0.131 | 0.087 |
+| dQ half 2 | 0.015 | 0.026 | 0.131 | 0.087 |
+
+Sum of best-per-kernel: 0.82 → 0.78 ms (seq 128), 2.35 → 2.06 ms (seq 512).
+At seq 128 the dQ/dK tiles lose (18 blocks); `Program::tuned` keeps the
+WGSL ones there. Gradients at seq 128 against the f64 evaluation: relative
+1.5–3.1e-4 on every weight gradient (unchanged from before; TF32). dwq and
+dwk are ~4e-19 in the reference (the loss does not reach them at this
+scale) — absolute error 2.7e-19, i.e. zero at the gradients' scale (1e6),
+so only the absolute error is meaningful there.
+
+Training step in one lock window (two alternating rounds, base = #46):
+
+| | base | this | PyTorch fp32 |
+|---|---|---|---|
+| block fwd+bwd, seq 128 | 1.68 / 2.39 | 1.52 / 1.95 | 2.11 |
+| block fwd+bwd, seq 512 | 5.88 / 7.10 | 5.91 / 5.30 | 5.07 |
+| `whole_model 4 128 cuda`, one block × 4 | 13.2 | 8.0 | — |
+
+(PyTorch's own reference was 2–3× slower than in a quiet window too: its
+seq-512 step is 1.85–2.15 ms when the GPU is free.) Under this load the
+end-to-end difference is inside the noise; the per-kernel table is the
+measurement that holds.
+
+Negatives:
+
+- Causal tile skipping did not change the forward's time (0.123 vs 0.125
+  ms): 72 blocks on 82 SMs, the last row block (no skipping) is the
+  critical path. Two warps per block (144 blocks) is ~5% faster; one warp
+  (288) is slower at seq 512 (0.200 ms: V staged once per 16 rows).
+- The dQ/dK tiles cannot skip masked tiles: dS has the max-gradient term
+  (`select(s == max)`) outside the masked exponential, so a masked
+  element is not provably zero from the comp.
+- The two dQ halves recompute dS twice: `merge_siblings` runs before
+  `schedule_auto` inlines dS, so they are not merged.
+- Not yet flash backward in full: S, P̃ = exp(S − max), dP and two n×n
+  correction terms are still materialized by their own kernels (≈ 0.25 ms
+  at seq 512). Recomputing them in the tiles needs dP = dO·Vᵀ as a nested
+  contraction inside the staging, which this lowering does not do.
+
 ### Split-K for tiles that cannot fill the device
 
 The training step's matmuls with small outputs and long reductions
