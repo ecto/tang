@@ -501,7 +501,9 @@ fn affine(f: &Form, prefix: &str) -> String {
 
 /// `arg_reads` with point coords named `{pts}d`; `replace` may
 /// substitute an expression for an arg's read.
-fn arg_reads_with(c: &Comp, pts: &str, replace: Option<&dyn Fn(&Arg) -> Option<String>>) -> String {
+type ReadReplace<'a> = Option<&'a dyn Fn(&Arg) -> Option<String>>;
+
+fn arg_reads_with(c: &Comp, pts: &str, replace: ReadReplace) -> String {
     let k = c.points().len();
     c.args
         .iter()

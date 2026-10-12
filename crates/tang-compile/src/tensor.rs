@@ -945,8 +945,8 @@ impl TensorGraph {
         let mut elem = vec![vec![false; pk]; w];
         for (e, &out) in c.body_outs.iter().enumerate() {
             var_dims(&c.body, out, &mut |v| {
-                for d in 0..pk {
-                    elem[e][d] |= c.args[v as usize].view.depends_on(d);
+                for (d, varies) in elem[e].iter_mut().enumerate() {
+                    *varies |= c.args[v as usize].view.depends_on(d);
                 }
             });
         }
