@@ -1,7 +1,14 @@
 //! Graph optimization and compilation passes for tang.
 //!
-//! Builds on [`tang_expr`] to provide optimization passes for tensor
-//! computation graphs:
+//! Two layers:
+//!
+//! - [`tensor`]: a tensor-level IR built from two ideas — affine
+//!   [`tensor::View`]s and one compute op, the comprehension
+//!   `out[i] = ⊕_k body(x[view(i,k)])` whose body and monoid are scalar
+//!   [`tang_expr`] graphs. Fusion is substitution, flash attention is a
+//!   rewrite to the online-softmax monoid, gradients are comprehensions,
+//!   and schedules (inline / split / tile) lower to WGSL kernels.
+//! - Scalar passes over [`tang_expr`] graphs:
 //!
 //! - **Constant folding** — evaluate pure-constant subgraphs at compile time
 //! - **Operator fusion** — fuse sequential element-wise ops into single kernels

@@ -3,3 +3,24 @@
 Graph optimization and compilation passes for tang
 
 Part of [tang](https://github.com/ecto/tang).
+
+## Tensor IR
+
+`tang_compile::tensor` is a tensor-level IR with two primitives:
+
+- **Views** — affine index maps. Broadcast, transpose, slice and stride
+  compose and never touch memory.
+- **Comprehensions** — `out[i…] = ⊕_{k…} body(x₀[view₀(i,k)], …)`, where
+  `body` and the monoid's combine are scalar `tang-expr` graphs. Map,
+  reduce and matmul are sugar.
+
+What falls out:
+
+- `substitute_maps` is the single fusion rule.
+- `stabilize_softmax` rewrites `max_j s` + `Σ_j g·exp(s−max)` into one
+  online-softmax reduction: flash attention is derived, not written.
+- `backward` differentiates a comprehension into comprehensions.
+- `schedule_inline` / `schedule_split` / `schedule_tile(_2d)` are
+  schedule decisions; `to_wgsl` lowers them to kernels (`tang-gpu` runs
+  them). See `BENCHMARKS.md` for derived attention and matmul against the
+  hand-written kernels.
