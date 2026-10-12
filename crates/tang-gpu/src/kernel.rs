@@ -887,7 +887,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             });
             pass.set_pipeline(&cached.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(count.div_ceil(workgroup_size), 1, 1);
+            // Grids wider than 65535 workgroups wrap into y; kernels
+            // linearize with `x + y * 65535`.
+            let groups = count.div_ceil(workgroup_size);
+            pass.dispatch_workgroups(groups.min(65535), groups.div_ceil(65535), 1);
         }
         self.submit_or_enqueue(device, encoder.finish());
     }

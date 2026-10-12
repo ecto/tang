@@ -25,7 +25,9 @@ pub struct WgslKernel {
     /// Nodes bound as read-only storage, in binding order. The output is
     /// bound after these, then a uniform `{points, 0, 0, 0}`.
     pub reads: Vec<TensorId>,
-    /// Threads to launch: `points` (or `points * split`).
+    /// Output points; goes in the uniform as `params.count`.
+    pub points: u32,
+    /// Threads to launch (`points`, padded or multiplied for workgroup schedules).
     pub count: u32,
     pub workgroup_size: u32,
 }
@@ -158,7 +160,7 @@ impl TensorGraph {
                 "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{"
             )
             .unwrap();
-            writeln!(s, "    let g = gid.x;").unwrap();
+            writeln!(s, "    let g = gid.x + gid.y * {}u;", 65535 * 256).unwrap();
             writeln!(s, "    if (g >= params.count) {{ return; }}").unwrap();
             emit_decompose(&mut s, "g", c.points(), "p");
             writeln!(s, "    let v = point_{root}({args});").unwrap();
@@ -170,6 +172,7 @@ impl TensorGraph {
                 source: s,
                 node: TensorId(root as u32),
                 reads,
+                points,
                 count: points,
                 workgroup_size: 256,
             };
@@ -186,7 +189,7 @@ impl TensorGraph {
             "fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{"
         )
         .unwrap();
-        writeln!(s, "    let g = wid.x;").unwrap();
+        writeln!(s, "    let g = wid.x + wid.y * 65535u;").unwrap();
         writeln!(s, "    let tid = lid.x;").unwrap();
         writeln!(s, "    if (g >= params.count) {{ return; }}").unwrap();
         emit_decompose(&mut s, "g", c.points(), "p");
@@ -231,6 +234,7 @@ impl TensorGraph {
             source: s,
             node: TensorId(root as u32),
             reads,
+            points,
             count: points * split,
             workgroup_size: split,
         }

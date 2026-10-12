@@ -309,7 +309,7 @@ pub mod ir_gpu {
                     &k.source,
                     &bufs,
                     &[out_idx],
-                    &[k.count, 0, 0, 0],
+                    &[k.points, 0, 0, 0],
                     k.count,
                     k.workgroup_size,
                 );
@@ -425,11 +425,64 @@ pub mod ir_gpu {
         .collect()
     }
 
+    /// `[m,k] x [k,n]` under each schedule the compiler can produce.
+    pub fn matmul_candidates(
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Vec<(&'static str, TensorGraph, TensorId)> {
+        let build = |schedule: &str| {
+            let mut g = TensorGraph::new();
+            let a = g.input(&[m, k]);
+            let b = g.input(&[k, n]);
+            let c = g.matmul(a, b).unwrap();
+            match schedule {
+                "split" => g.schedule_split(&[c], 64, 16),
+                "tiled" => g.schedule_tile(&[c], 64, 32, 16),
+                _ => {}
+            }
+            (g, c)
+        };
+        ["naive", "split", "tiled"]
+            .into_iter()
+            .map(|name| {
+                let (g, c) = build(name);
+                (name, g, c)
+            })
+            .collect()
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
         use tang_gpu::kv_attention_fused;
         use tang_gpu::GpuTensor;
+
+        #[test]
+        fn derived_matmul_matches_hand_kernel_on_gpu() {
+            let Ok(device) = GpuDevice::new_sync() else {
+                eprintln!("no GPU, skipping");
+                return;
+            };
+            let mut cache = KernelCache::new();
+            let (m, k, n) = (70, 50, 90);
+            let mut rng = crate::Rng::new(3);
+            let a: Vec<f32> = (0..m * k).map(|_| rng.f32() * 2.0 - 1.0).collect();
+            let b: Vec<f32> = (0..k * n).map(|_| rng.f32() * 2.0 - 1.0).collect();
+            let at = GpuTensor::from_slice(&device, &a, &[m, k]);
+            let bt = GpuTensor::from_slice(&device, &b, &[k, n]);
+            let want = tang_gpu::matmul::matmul(&device, &mut cache, &at, &bt)
+                .to_vec_flushed(&device, &mut cache);
+            for (name, g, c) in matmul_candidates(m, k, n) {
+                let exe = Executable::new(&device, g.to_wgsl(&[c]), &[&a, &b]);
+                exe.run(&device, &mut cache);
+                cache.flush(&device);
+                let got = exe.read(&device, c);
+                for (i, (x, y)) in got.iter().zip(&want).enumerate() {
+                    assert!((x - y).abs() < 1e-3, "{name}[{i}]: {x} vs {y}");
+                }
+            }
+        }
 
         #[test]
         fn derived_attention_matches_hand_kernel_on_gpu() {

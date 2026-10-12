@@ -278,5 +278,48 @@ mod gpu {
     }
 }
 
-criterion_group!(gpu_benches, gpu::bench_attention);
+mod gpu_matmul {
+    use super::*;
+    use tang_bench::ir_gpu::{matmul_candidates, Executable};
+    use tang_gpu::{GpuDevice, GpuTensor, KernelCache};
+
+    fn random(n: usize, seed: u64) -> Vec<f32> {
+        let mut rng = tang_bench::Rng::new(seed);
+        (0..n).map(|_| rng.f32() * 2.0 - 1.0).collect()
+    }
+
+    pub fn bench_matmul(c: &mut Criterion) {
+        let Ok(device) = GpuDevice::new_sync() else {
+            eprintln!("no GPU, skipping kvi_gpu_matmul");
+            return;
+        };
+        let mut cache = KernelCache::new();
+        let mut group = c.benchmark_group("kvi_gpu_matmul");
+        group.sample_size(20);
+        for &n in &[256usize, 1024] {
+            let (a, b) = (random(n * n, 1), random(n * n, 2));
+            let at = GpuTensor::from_slice(&device, &a, &[n, n]);
+            let bt = GpuTensor::from_slice(&device, &b, &[n, n]);
+            group.bench_function(BenchmarkId::new("hand", n), |bch| {
+                bch.iter(|| {
+                    let out = tang_gpu::matmul::matmul(&device, &mut cache, &at, &bt);
+                    black_box(out.to_vec_flushed(&device, &mut cache));
+                })
+            });
+            for (name, g, c) in matmul_candidates(n, n, n) {
+                let exe = Executable::new(&device, g.to_wgsl(&[c]), &[&a, &b]);
+                group.bench_function(BenchmarkId::new(format!("ir_{name}"), n), |bch| {
+                    bch.iter(|| {
+                        exe.run(&device, &mut cache);
+                        cache.flush(&device);
+                        black_box(exe.read(&device, c));
+                    })
+                });
+            }
+        }
+        group.finish();
+    }
+}
+
+criterion_group!(gpu_benches, gpu::bench_attention, gpu_matmul::bench_matmul);
 criterion_main!(benches, gpu_benches);

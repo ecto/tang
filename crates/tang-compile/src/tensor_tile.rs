@@ -401,7 +401,7 @@ impl TensorGraph {
         )
         .unwrap();
         writeln!(s, "    let tid = lid.x;").unwrap();
-        writeln!(s, "    let g_raw = wid.x * {b}u + tid;").unwrap();
+        writeln!(s, "    let g_raw = (wid.x + wid.y * 65535u) * {b}u + tid;").unwrap();
         writeln!(s, "    let is_live = g_raw < params.count;").unwrap();
         writeln!(s, "    let g = min(g_raw, params.count - 1u);").unwrap();
         emit_decompose(&mut s, "g", c.points(), "p");
@@ -470,6 +470,7 @@ impl TensorGraph {
             source: s,
             node: TensorId(root as u32),
             reads: reads.into_iter().map(|j| TensorId(j as u32)).collect(),
+            points,
             count: points.div_ceil(b) * b,
             workgroup_size: b,
         }

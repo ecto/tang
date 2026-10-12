@@ -326,3 +326,17 @@ Takeaways:
   the bottleneck; parallelism is. Which schedule is best is a property of
   the (graph, device, size) triple — hence `ir_gpu::autotune`, which tries
   the candidates on the device and keeps the fastest.
+
+### GPU: hand-written matmul vs matmul derived from tensor IR
+
+`hand` is `tang_gpu::matmul::matmul`. The IR version is one comprehension,
+`Σ_k a[i,k]·b[k,j]`, under the same three schedules. (The tiled schedule
+stages nothing here: with one point per thread every read varies across
+the workgroup. A 2-D point tile is the next schedule to add.)
+
+| n | hand | ir_naive | ir_split | ir_tiled |
+|---|---|---|---|---|
+| 256 | 1.42 ms | 1.48 ms | 2.38 ms | 1.40 ms |
+| 1024 | 4.11 ms | 4.23 ms | 12.2 ms | 4.34 ms |
+
+The derived matmul is within 3% of the hand kernel.
