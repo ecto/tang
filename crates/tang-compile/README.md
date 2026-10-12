@@ -24,3 +24,6 @@ What falls out:
   schedule decisions; `to_wgsl` lowers them to kernels (`tang-gpu` runs
   them). See `BENCHMARKS.md` for derived attention and matmul against the
   hand-written kernels.
+- Dims are `Dim::Fixed(n)` or `Dim::Sym("seq")`. Build, rewrite and
+  differentiate once with symbols; `bind` per size before scheduling,
+  evaluating or lowering.

@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use tang_expr::{ExprGraph, ExprId};
 
 use super::{
-    err, replay, Arg, Comp, Form, Monoid, MonoidKind, ShapeError, TensorGraph, TensorId, View,
+    err, replay, Arg, Comp, Dim, Form, Monoid, MonoidKind, ShapeError, TensorGraph, TensorId, View,
 };
 
 impl TensorGraph {
@@ -120,7 +120,7 @@ impl TensorGraph {
             rename[x] = Some(a_shape.len() + i);
         }
         let new_rank = a_shape.len() + free.len();
-        let red: Vec<usize> = free.iter().map(|&x| space[x]).collect();
+        let red: Vec<Dim> = free.iter().map(|&x| space[x]).collect();
 
         let rename_view = |v: &View| View {
             forms: v

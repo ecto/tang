@@ -19,7 +19,7 @@ use std::fmt::Write;
 use tang_expr::{ExprGraph, ExprId, Node};
 
 use super::wgsl::{identity, lit, WgslKernel};
-use super::{numel, Comp, Op, TensorGraph, TensorId};
+use super::{fixed, Comp, Op, TensorGraph, TensorId};
 
 /// Affine expression over named loop variables.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -209,13 +209,13 @@ impl Ctx<'_> {
         let node = &self.g.nodes[j];
         match &node.op {
             Op::Input(_) => {
-                let addr = flat(coords, &node.shape);
+                let addr = flat(coords, &fixed(&node.shape));
                 Val::Expr(self.buffer_read(j, addr))
             }
             Op::Comp(c) if self.reads.contains(&j) => {
                 let k = c.points().len();
-                let mut addr = flat(&coords[..k], c.points()).scaled(c.width() as i64);
-                addr.add(&flat(&coords[k..], &c.out[k..]));
+                let mut addr = flat(&coords[..k], &fixed(c.points())).scaled(c.width() as i64);
+                addr.add(&flat(&coords[k..], &fixed(&c.out[k..])));
                 Val::Expr(self.buffer_read(j, addr))
             }
             Op::Comp(c) => {
@@ -223,7 +223,7 @@ impl Ctx<'_> {
                 let n = self.fresh();
                 let w = c.width();
                 let red_vars: Vec<String> = (0..c.red.len()).map(|i| format!("q{n}_{i}")).collect();
-                for (v, &ext) in red_vars.iter().zip(&c.red) {
+                for (v, ext) in red_vars.iter().zip(fixed(&c.red)) {
                     self.extents.insert(v.clone(), ext);
                 }
                 let mut space: Vec<Sym> = coords[..k].to_vec();
@@ -244,7 +244,7 @@ impl Ctx<'_> {
                     return Val::Arr(format!("v{n}"));
                 };
                 writeln!(out, "var acc{n} = array<f32, {w}>({});", identity(m)).unwrap();
-                for (v, &ext) in red_vars.iter().zip(&c.red) {
+                for (v, ext) in red_vars.iter().zip(fixed(&c.red)) {
                     writeln!(
                         out,
                         "for (var {v}: u32 = 0u; {v} < {ext}u; {v} = {v} + 1u) {{"
@@ -273,7 +273,7 @@ impl Ctx<'_> {
         c.args
             .iter()
             .map(|a| {
-                let src_shape = self.g.nodes[a.src.n()].shape.clone();
+                let src_shape = fixed(&self.g.nodes[a.src.n()].shape);
                 let cs: Vec<Sym> = a
                     .view
                     .forms
@@ -361,9 +361,10 @@ impl TensorGraph {
         let (bx, by, chunk) = self.nodes[root].tile;
         let (bx, by, chunk) = (bx as usize, by as usize, chunk as usize);
         let w = c.width();
-        let pts = c.points();
+        let pts_v = fixed(c.points());
+        let pts = pts_v.as_slice();
         let k = pts.len();
-        let r_total = c.red[0];
+        let r_total = c.red[0].n();
         let m = c.monoid.as_ref().expect("tile needs a reduction");
         let threads = bx * by;
 
@@ -548,7 +549,7 @@ impl TensorGraph {
             source: s,
             node: TensorId(root as u32),
             reads: reads.into_iter().map(|j| TensorId(j as u32)).collect(),
-            points: numel(pts) as u32,
+            points: pts.iter().product::<usize>() as u32,
             count: (n_tiles * threads) as u32,
             workgroup_size: threads as u32,
         }

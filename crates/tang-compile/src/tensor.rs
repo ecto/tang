@@ -168,11 +168,11 @@ impl View {
     }
 
     /// Drop dependence on size-1 coordinates so equal views compare equal.
-    fn normalized(&self, space: &[usize]) -> View {
+    fn normalized(&self, space: &[Dim]) -> View {
         let mut v = self.clone();
         for f in &mut v.forms {
             for (c, &n) in f.coefs.iter_mut().zip(space) {
-                if n == 1 {
+                if n == Dim::Fixed(1) {
                     *c = 0;
                 }
             }
@@ -307,10 +307,10 @@ pub struct Arg {
 #[derive(Clone)]
 pub struct Comp {
     /// Output shape. The last `tuple` dims are produced per point.
-    pub out: Vec<usize>,
+    pub out: Vec<Dim>,
     /// Trailing out dims filled by the body (0 for ordinary comps).
     pub tuple: usize,
-    pub red: Vec<usize>,
+    pub red: Vec<Dim>,
     pub args: Vec<Arg>,
     pub body: ExprGraph,
     pub body_outs: Vec<ExprId>,
@@ -323,7 +323,7 @@ impl Comp {
     }
 
     /// Iterated out dims (excluding tuple dims).
-    fn points(&self) -> &[usize] {
+    fn points(&self) -> &[Dim] {
         &self.out[..self.out.len() - self.tuple]
     }
 
@@ -331,7 +331,7 @@ impl Comp {
         self.points().len() + self.red.len()
     }
 
-    fn space(&self) -> Vec<usize> {
+    fn space(&self) -> Vec<Dim> {
         self.points().iter().chain(&self.red).copied().collect()
     }
 }
@@ -346,7 +346,7 @@ pub enum Op {
 #[derive(Clone)]
 pub struct TNode {
     pub op: Op,
-    pub shape: Vec<usize>,
+    pub shape: Vec<Dim>,
     /// Schedule: recompute inside consumers instead of writing a buffer.
     pub inline: bool,
     /// Schedule: split the reduction across a workgroup of this many
@@ -373,8 +373,67 @@ pub(super) fn err<T>(msg: impl Into<String>) -> Result<T, ShapeError> {
     Err(ShapeError(msg.into()))
 }
 
-pub fn numel(shape: &[usize]) -> usize {
-    shape.iter().product()
+/// A tensor dimension: a fixed size or a named symbol (`"seq"`, `"batch"`).
+///
+/// Symbolic dims flow through construction, rewriting and autodiff.
+/// Anything that needs numbers — the interpreter, schedules, lowering —
+/// works on a graph after [`TensorGraph::bind`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Dim {
+    Fixed(usize),
+    Sym(&'static str),
+}
+
+impl Dim {
+    pub fn fixed(self) -> Option<usize> {
+        match self {
+            Dim::Fixed(n) => Some(n),
+            Dim::Sym(_) => None,
+        }
+    }
+
+    /// The size, panicking on an unbound symbol.
+    pub fn n(self) -> usize {
+        match self {
+            Dim::Fixed(n) => n,
+            Dim::Sym(name) => panic!("dim `{name}` is unbound; call TensorGraph::bind first"),
+        }
+    }
+}
+
+impl From<usize> for Dim {
+    fn from(n: usize) -> Self {
+        Dim::Fixed(n)
+    }
+}
+
+impl PartialEq<usize> for Dim {
+    fn eq(&self, other: &usize) -> bool {
+        *self == Dim::Fixed(*other)
+    }
+}
+
+impl std::fmt::Display for Dim {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Dim::Fixed(n) => write!(f, "{n}"),
+            Dim::Sym(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+/// Concrete sizes of a bound shape.
+pub fn fixed(shape: &[Dim]) -> Vec<usize> {
+    shape.iter().map(|d| d.n()).collect()
+}
+
+/// Number of elements of a bound shape.
+pub fn numel(shape: &[Dim]) -> usize {
+    shape.iter().map(|d| d.n()).product()
+}
+
+fn dims<D: Into<Dim> + Copy>(d: &[D]) -> Vec<Dim> {
+    d.iter().map(|&x| x.into()).collect()
 }
 
 #[derive(Clone, Default)]
@@ -392,16 +451,16 @@ impl TensorGraph {
         &self.nodes
     }
 
-    pub fn shape(&self, t: TensorId) -> &[usize] {
+    pub fn shape(&self, t: TensorId) -> &[Dim] {
         &self.nodes[t.n()].shape
     }
 
-    pub fn input(&mut self, dims: &[usize]) -> TensorId {
+    pub fn input<D: Into<Dim> + Copy>(&mut self, shape: &[D]) -> TensorId {
         let i = self.n_inputs;
         self.n_inputs += 1;
         self.nodes.push(TNode {
             op: Op::Input(i),
-            shape: dims.to_vec(),
+            shape: dims(shape),
             inline: false,
             split: 0,
             tile: (0, 0, 0),
@@ -411,10 +470,10 @@ impl TensorGraph {
 
     /// The general op. `f` receives one scalar per arg and returns the
     /// per-point values (`monoid.width` of them when reducing).
-    pub fn comp(
+    pub fn comp<D: Into<Dim> + Copy>(
         &mut self,
-        out: &[usize],
-        red: &[usize],
+        out: &[D],
+        red: &[D],
         args: Vec<Arg>,
         monoid: Option<Monoid>,
         f: impl FnOnce(&[ExprId]) -> Vec<ExprId>,
@@ -424,9 +483,9 @@ impl TensorGraph {
             f(&vars)
         });
         self.push_comp(Comp {
-            out: out.to_vec(),
+            out: dims(out),
             tuple: 0,
-            red: red.to_vec(),
+            red: dims(red),
             args,
             body,
             body_outs,
@@ -445,14 +504,17 @@ impl TensorGraph {
                     a.view.rank()
                 ));
             }
-            for (f, &n) in a.view.forms.iter().zip(src) {
-                let (lo, hi) = f.range(&space);
-                if lo < 0 || hi >= n as i64 {
-                    return err(format!("arg {i}: view reaches {lo}..={hi}, dim is {n}"));
+            let bound: Option<Vec<usize>> = space.iter().map(|d| d.fixed()).collect();
+            if let Some(space) = bound {
+                for (f, &n) in a.view.forms.iter().zip(src) {
+                    let (lo, hi) = f.range(&space);
+                    if lo < 0 || n.fixed().is_some_and(|n| hi >= n as i64) {
+                        return err(format!("arg {i}: view reaches {lo}..={hi}, dim is {n}"));
+                    }
                 }
             }
         }
-        let width = numel(&comp.out[comp.out.len() - comp.tuple..]);
+        let width = numel(&comp.out[comp.out.len() - comp.tuple..]); // tuple dims are always fixed
         if comp.width() != width {
             return err(format!(
                 "body produces {} values, tuple dims need {width}",
@@ -516,7 +578,7 @@ impl TensorGraph {
             return err(format!("axis {axis} out of range for {shape:?}"));
         }
         let mut out = shape.clone();
-        out[axis] = 1;
+        out[axis] = Dim::Fixed(1);
         let red = [shape[axis]];
         let r = shape.len();
         // iteration space = out dims ++ [axis]; source dim `axis` reads the red coord
@@ -531,7 +593,12 @@ impl TensorGraph {
     }
 
     /// Broadcast `x` (with size-1 dims) up to `shape`, as a view-only map.
-    pub fn broadcast(&mut self, x: TensorId, shape: &[usize]) -> Result<TensorId, ShapeError> {
+    pub fn broadcast<D: Into<Dim> + Copy>(
+        &mut self,
+        x: TensorId,
+        shape: &[D],
+    ) -> Result<TensorId, ShapeError> {
+        let shape = &dims(shape);
         let src = self.shape(x).to_vec();
         if src.len() != shape.len() {
             return err(format!("broadcast {src:?} -> {shape:?}: rank differs"));
@@ -541,7 +608,7 @@ impl TensorGraph {
             .iter()
             .zip(shape)
             .enumerate()
-            .map(|(d, (&s, &t))| match (s == t, s == 1) {
+            .map(|(d, (&s, &t))| match (s == t, s == Dim::Fixed(1)) {
                 (true, _) => Ok(Some(d)),
                 (false, true) => Ok(None),
                 _ => err(format!("broadcast {src:?} -> {shape:?}")),
@@ -566,7 +633,7 @@ impl TensorGraph {
         if perm.len() != r {
             return err(format!("transpose {src:?} by {perm:?}"));
         }
-        let shape: Vec<usize> = perm.iter().map(|&p| src[p]).collect();
+        let shape: Vec<Dim> = perm.iter().map(|&p| src[p]).collect();
         let args = vec![Arg {
             src: x,
             view: View::pick(r, &inv),
@@ -635,7 +702,7 @@ impl TensorGraph {
     }
 
     /// Live, non-inlined comps: the buffers a backend would allocate.
-    pub fn materialized(&self, outputs: &[TensorId]) -> Vec<(TensorId, Vec<usize>)> {
+    pub fn materialized(&self, outputs: &[TensorId]) -> Vec<(TensorId, Vec<Dim>)> {
         let live = self.live(outputs);
         (0..self.nodes.len())
             .filter(|&i| live[i] && !self.nodes[i].inline && self.comp_at(i).is_some())
@@ -758,7 +825,7 @@ impl TensorGraph {
     /// Canonical form of the expression `out` of `body` over `args`, with
     /// views over `space`: leaves renumbered in order of first use and
     /// size-1 coordinates dropped, so equal computations compare equal.
-    fn canon(body: &ExprGraph, out: ExprId, args: &[Arg], space: &[usize]) -> Canon {
+    fn canon(body: &ExprGraph, out: ExprId, args: &[Arg], space: &[Dim]) -> Canon {
         let mut leaves: Vec<Arg> = Vec::new();
         let mut g = ExprGraph::new();
         let vars: Vec<ExprId> = args
@@ -882,7 +949,7 @@ impl TensorGraph {
                     .map(|d| mem.m_view.forms.iter().position(|f| f.as_unit() == Some(d)))
                     .collect();
                 let extra: Vec<usize> = (0..n_out).filter(|&d| reads[d].is_none()).collect();
-                let extra_shape: Vec<usize> = extra.iter().map(|&d| c.out[d]).collect();
+                let extra_shape: Vec<usize> = extra.iter().map(|&d| c.out[d].n()).collect();
                 let base = outs.len() as i64;
 
                 // unroll the extra dims into tuple slots
@@ -948,7 +1015,7 @@ impl TensorGraph {
 
             let width = outs.len();
             let mut out = mc.out.clone();
-            out.push(width);
+            out.push(Dim::Fixed(width));
             let fused = g2
                 .push_comp(Comp {
                     out,
@@ -1093,7 +1160,7 @@ impl TensorGraph {
                 self.comp_at(i).is_some_and(|c| {
                     c.monoid.is_some()
                         && c.red.len() == 1
-                        && c.red[0] >= min_red
+                        && c.red[0].n() >= min_red
                         && (by == 1 || c.points().len() >= 2)
                 })
             })
@@ -1101,6 +1168,41 @@ impl TensorGraph {
         for i in targets {
             self.nodes[i].tile = (bx, by, chunk);
         }
+    }
+
+    /// Replace symbolic dims by sizes. Every `Sym` in the graph must be
+    /// named; the result is a concrete graph that can be scheduled,
+    /// evaluated and lowered.
+    pub fn bind(&self, bindings: &[(&str, usize)]) -> Result<TensorGraph, ShapeError> {
+        let sub = |d: &Dim| match d {
+            Dim::Fixed(n) => Ok(Dim::Fixed(*n)),
+            Dim::Sym(name) => bindings
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| Dim::Fixed(*v))
+                .ok_or_else(|| ShapeError(format!("bind: no value for dim `{name}`"))),
+        };
+        let mut g = self.clone();
+        for node in &mut g.nodes {
+            node.shape = node.shape.iter().map(sub).collect::<Result<_, _>>()?;
+            if let Op::Comp(c) = &mut node.op {
+                c.out = c.out.iter().map(sub).collect::<Result<_, _>>()?;
+                c.red = c.red.iter().map(sub).collect::<Result<_, _>>()?;
+            }
+        }
+        Ok(g)
+    }
+
+    /// `true` if no dim is symbolic.
+    pub fn is_bound(&self) -> bool {
+        self.nodes.iter().all(|n| {
+            let shape_ok = n.shape.iter().all(|d| d.fixed().is_some());
+            let comp_ok = match &n.op {
+                Op::Comp(c) => c.red.iter().all(|d| d.fixed().is_some()),
+                Op::Input(_) => true,
+            };
+            shape_ok && comp_ok
+        })
     }
 
     // -- reference interpreter -------------------------------------------------
@@ -1129,7 +1231,7 @@ impl TensorGraph {
             if let Some(c) = self.comp_at(i) {
                 let w = c.width();
                 let mut buf = vec![0.0; numel(c.points()) * w];
-                for (p, idx) in indices(c.points()).enumerate() {
+                for (p, idx) in indices(&fixed(c.points())).enumerate() {
                     ev.point(i, &idx, &mut buf[p * w..(p + 1) * w]);
                 }
                 ev.bufs[i] = buf;
@@ -1138,7 +1240,7 @@ impl TensorGraph {
         outputs
             .iter()
             .map(|o| {
-                indices(&self.nodes[o.n()].shape)
+                indices(&fixed(&self.nodes[o.n()].shape))
                     .map(|idx| ev.read(*o, &idx))
                     .collect()
             })
@@ -1170,17 +1272,17 @@ impl Evaluator<'_> {
     fn read(&self, t: TensorId, idx: &[usize]) -> f64 {
         let node = &self.g.nodes[t.n()];
         match &node.op {
-            Op::Input(k) => self.inputs[*k][flat_index(&node.shape, idx)],
+            Op::Input(k) => self.inputs[*k][flat_index(&fixed(&node.shape), idx)],
             Op::Comp(c) => {
                 let (pt, tup) = idx.split_at(c.points().len());
-                let slot = flat_index(&c.out[c.points().len()..], tup);
+                let slot = flat_index(&fixed(&c.out[c.points().len()..]), tup);
                 if node.inline {
                     let mut vals = vec![0.0; c.width()];
                     self.point(t.n(), pt, &mut vals);
                     return vals[slot];
                 }
                 let w = c.width();
-                self.bufs[t.n()][flat_index(c.points(), pt) * w + slot]
+                self.bufs[t.n()][flat_index(&fixed(c.points()), pt) * w + slot]
             }
         }
     }
@@ -1207,7 +1309,7 @@ impl Evaluator<'_> {
         let combine = k.combine.as_ref().unwrap();
         let mut elem = vec![0.0; w];
         let mut pair = vec![0.0; 2 * w];
-        for red_idx in indices(&c.red) {
+        for red_idx in indices(&fixed(&c.red)) {
             idx[base..].copy_from_slice(&red_idx);
             body_at(&idx, &mut elem);
             pair[..w].copy_from_slice(vals);
@@ -1222,7 +1324,7 @@ fn flat_index(shape: &[usize], idx: &[usize]) -> usize {
 }
 
 fn indices(shape: &[usize]) -> impl Iterator<Item = Vec<usize>> + '_ {
-    (0..numel(shape)).map(move |mut p| {
+    (0..shape.iter().product::<usize>()).map(move |mut p| {
         let mut idx = vec![0; shape.len()];
         for d in (0..shape.len()).rev() {
             idx[d] = p % shape[d];
@@ -1331,7 +1433,7 @@ mod tests {
 
     fn rmsnorm(g: &mut TensorGraph, x: TensorId) -> TensorId {
         let shape = g.shape(x).to_vec();
-        let dim = shape[1];
+        let dim = shape[1].n();
         let sq = g.map(&[x], |v| v[0] * v[0]).unwrap();
         let sum = g.reduce(sq, 1, Monoid::sum()).unwrap();
         let inv = g
@@ -1437,6 +1539,58 @@ mod tests {
         let o = g.matmul(p, v).unwrap(); // [n, dv]
         let lb = g.broadcast(l, &[n, dv]).unwrap();
         g.map(&[o, lb], |v| v[0] / v[1]).unwrap()
+    }
+
+    /// One symbolic graph serves every sequence length: rewrite and
+    /// differentiate with `n` unbound, bind per size, match fixed builds.
+    #[test]
+    fn symbolic_seq_len_binds_to_any_size() {
+        let (d, dv) = (4, 4);
+        let n = Dim::Sym("n");
+        let mut g = TensorGraph::new();
+        let q = g.input(&[n, Dim::Fixed(d)]);
+        let k = g.input(&[n, Dim::Fixed(d)]);
+        let v = g.input(&[n, Dim::Fixed(dv)]);
+        let y = naive_attention(&mut g, q, k, v, None);
+        assert!(!g.is_bound());
+        let grads = g.backward(y, &[q]).unwrap();
+        let (sg, outs) = g.substitute_maps(&[y, grads[0]]);
+        let (sg, outs) = sg.stabilize_softmax(&outs);
+        assert!(sg
+            .reduction_kinds(&outs)
+            .contains(&MonoidKind::OnlineSoftmax));
+        assert!(sg.bind(&[("m", 3)]).is_err(), "wrong symbol must fail");
+
+        for size in [5usize, 16] {
+            let mut bound = sg.bind(&[("n", size)]).unwrap();
+            assert!(bound.is_bound());
+            bound.schedule_inline(&outs);
+            let inputs = [
+                ramp(size * d, 0.05, -1.0),
+                ramp(size * d, 0.07, 0.3),
+                ramp(size * dv, 0.1, -2.0),
+            ];
+            let got = bound.eval(&inputs, &outs);
+
+            let mut fg = TensorGraph::new();
+            let fq = fg.input(&[size, d]);
+            let fk = fg.input(&[size, d]);
+            let fv = fg.input(&[size, dv]);
+            let fy = naive_attention(&mut fg, fq, fk, fv, None);
+            let fgr = fg.backward(fy, &[fq]).unwrap();
+            let want = fg.eval(&inputs, &[fy, fgr[0]]);
+            close(&got[0], &want[0]);
+            close(&got[1], &want[1]);
+        }
+    }
+
+    #[test]
+    fn unbound_graph_cannot_be_scheduled_or_evaluated() {
+        let mut g = TensorGraph::new();
+        let x = g.input(&[Dim::Sym("n"), Dim::Fixed(2)]);
+        let y = g.reduce(x, 1, Monoid::sum()).unwrap();
+        let r = std::panic::catch_unwind(|| g.eval(&[vec![0.0; 4]], &[y]));
+        assert!(r.is_err());
     }
 
     #[test]

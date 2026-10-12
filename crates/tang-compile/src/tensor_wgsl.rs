@@ -15,7 +15,7 @@ use std::fmt::Write;
 
 use tang_expr::{ExprGraph, ExprId, Node};
 
-use super::{numel, Comp, Monoid, Op, TensorGraph, TensorId};
+use super::{fixed, numel, Comp, Monoid, Op, TensorGraph, TensorId};
 
 /// One dispatch.
 pub struct WgslKernel {
@@ -162,7 +162,7 @@ impl TensorGraph {
             .unwrap();
             writeln!(s, "    let g = gid.x + gid.y * {}u;", 65535 * 256).unwrap();
             writeln!(s, "    if (g >= params.count) {{ return; }}").unwrap();
-            emit_decompose(&mut s, "g", c.points(), "p");
+            emit_decompose(&mut s, "g", &fixed(c.points()), "p");
             writeln!(s, "    let v = point_{root}({args});").unwrap();
             for slot in 0..w {
                 writeln!(s, "    out[g * {w}u + {slot}u] = v[{slot}];").unwrap();
@@ -192,14 +192,14 @@ impl TensorGraph {
         writeln!(s, "    let g = wid.x + wid.y * 65535u;").unwrap();
         writeln!(s, "    let tid = lid.x;").unwrap();
         writeln!(s, "    if (g >= params.count) {{ return; }}").unwrap();
-        emit_decompose(&mut s, "g", c.points(), "p");
+        emit_decompose(&mut s, "g", &fixed(c.points()), "p");
         writeln!(s, "    var acc = array<f32, {w}>({});", identity(m)).unwrap();
         writeln!(
             s,
             "    for (var ri: u32 = tid; ri < {r_total}u; ri = ri + {split}u) {{"
         )
         .unwrap();
-        emit_decompose(&mut s, "ri", &c.red, "r");
+        emit_decompose(&mut s, "ri", &fixed(&c.red), "r");
         writeln!(
             s,
             "        acc = combine_{root}(acc, body_{root}({}));",
@@ -252,7 +252,7 @@ impl TensorGraph {
         match &node.op {
             Op::Input(_) => {
                 writeln!(s, "fn read_{j}({coords}) -> f32 {{").unwrap();
-                writeln!(s, "    return b{j}[{}];", flat("c", 0, &node.shape)).unwrap();
+                writeln!(s, "    return b{j}[{}];", flat("c", 0, &fixed(&node.shape))).unwrap();
                 writeln!(s, "}}\n").unwrap();
             }
             Op::Comp(c) => {
@@ -268,10 +268,10 @@ impl TensorGraph {
                 }
 
                 writeln!(s, "fn read_{j}({coords}) -> f32 {{").unwrap();
-                let slot = flat("c", k, &c.out[k..]);
+                let slot = flat("c", k, &fixed(&c.out[k..]));
                 if materialized {
                     // buffer layout: [points][width]
-                    let pt = flat("c", 0, c.points());
+                    let pt = flat("c", 0, &fixed(c.points()));
                     writeln!(s, "    return b{j}[({pt}) * {w}u + ({slot})];").unwrap();
                 } else {
                     let args = (0..k)
@@ -303,7 +303,7 @@ impl TensorGraph {
         };
         writeln!(s, "    var acc = array<f32, {w}>({});", identity(m)).unwrap();
         let mut indent = String::from("    ");
-        for (i, &n) in c.red.iter().enumerate() {
+        for (i, n) in fixed(&c.red).into_iter().enumerate() {
             writeln!(
                 s,
                 "{indent}for (var r{i}: u32 = 0u; r{i} < {n}u; r{i} = r{i} + 1u) {{"

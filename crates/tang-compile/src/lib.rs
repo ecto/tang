@@ -7,7 +7,8 @@
 //!   `out[i] = ⊕_k body(x[view(i,k)])` whose body and monoid are scalar
 //!   [`tang_expr`] graphs. Fusion is substitution, flash attention is a
 //!   rewrite to the online-softmax monoid, gradients are comprehensions,
-//!   and schedules (inline / split / tile) lower to WGSL kernels.
+//!   dims may be symbolic until [`tensor::TensorGraph::bind`], and
+//!   schedules (inline / split / tile) lower to WGSL kernels.
 //! - Scalar passes over [`tang_expr`] graphs:
 //!
 //! - **Constant folding** — evaluate pure-constant subgraphs at compile time
