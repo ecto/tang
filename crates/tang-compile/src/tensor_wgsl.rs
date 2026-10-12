@@ -15,7 +15,7 @@ use std::fmt::Write;
 
 use tang_expr::{ExprGraph, ExprId, Node};
 
-use super::{fixed, numel, Arg, Comp, Form, Monoid, Op, TensorGraph, TensorId};
+use super::{fixed, numel, Arg, Comp, Form, Format, Monoid, Op, TensorGraph, TensorId};
 
 /// One dispatch.
 /// Which shading language a program's kernels are emitted in. `Msl`
@@ -46,8 +46,12 @@ pub struct WgslKernel {
 /// A buffer the program needs.
 pub struct BufferSpec {
     pub node: TensorId,
-    /// Length in f32s.
+    /// Length in elements.
     pub len: usize,
+    /// Element format of the buffer (the node's storage precision):
+    /// `F32` is `array<f32>`, `F16` is `array<f16>` (two per 32-bit word,
+    /// needs `wgpu::Features::SHADER_F16`).
+    pub format: Format,
     /// `Some(k)` if this is graph input `k`.
     pub input: Option<usize>,
 }
@@ -103,10 +107,16 @@ impl TensorGraph {
                     Op::Comp(c) => (numel(c.points()) * c.width(), None),
                     Op::Iota(_) | Op::Reshape(_) => unreachable!(),
                 };
+                let format = self.nodes[i].precision.storage;
+                assert!(
+                    format != Format::BF16,
+                    "bf16 storage is interpreter-only: WGSL has no bf16 type"
+                );
                 BufferSpec {
                     node: TensorId(i as u32),
                     len,
                     input,
+                    format,
                 }
             })
             .collect();
@@ -178,14 +188,16 @@ impl TensorGraph {
         for (b, &j) in reads.iter().enumerate() {
             writeln!(
                 s,
-                "@group(0) @binding({b}) var<storage, read> b{j}: array<f32>;"
+                "@group(0) @binding({b}) var<storage, read> b{j}: array<{}>;",
+                elem_ty(self.nodes[j].precision.storage)
             )
             .unwrap();
         }
         writeln!(
             s,
-            "@group(0) @binding({}) var<storage, read_write> out: array<f32>;",
-            reads.len()
+            "@group(0) @binding({}) var<storage, read_write> out: array<{}>;",
+            reads.len(),
+            out_ty(self.nodes[root].precision.storage)
         )
         .unwrap();
         writeln!(
@@ -203,6 +215,7 @@ impl TensorGraph {
         let k = c.points().len();
         let points = numel(c.points()) as u32;
         let split = self.nodes[root].split;
+        let out_f = self.nodes[root].precision.storage;
         if self.nodes[root].tile.0 > 0 {
             return self.tile_kernel(root, s, reads);
         }
@@ -224,7 +237,8 @@ impl TensorGraph {
             emit_decompose(&mut s, "g", &fixed(c.points()), "p");
             writeln!(s, "    let v = point_{root}({args});").unwrap();
             for slot in 0..w {
-                writeln!(s, "    out[g * {w}u + {slot}u] = v[{slot}];").unwrap();
+                let st = store(out_f, &format!("g * {w}u + {slot}u"), &format!("v[{slot}]"));
+                writeln!(s, "    {st}").unwrap();
             }
             writeln!(s, "}}").unwrap();
             return WgslKernel {
@@ -278,6 +292,7 @@ impl TensorGraph {
             "        ",
             &format!("body_{red_node}({})", arg_reads_with(self, rc, rp, None)),
             m,
+            self.nodes[red_node].precision.accum,
         );
         writeln!(s, "    }}").unwrap();
         writeln!(s, "    wg_acc[tid] = {};", acc_array(w)).unwrap();
@@ -299,7 +314,12 @@ impl TensorGraph {
         writeln!(s, "    if (tid == 0u) {{").unwrap();
         if red_node == root {
             for slot in 0..w {
-                writeln!(s, "        out[g * {w}u + {slot}u] = wg_acc[0][{slot}];").unwrap();
+                let st = store(
+                    out_f,
+                    &format!("g * {w}u + {slot}u"),
+                    &format!("wg_acc[0][{slot}]"),
+                );
+                writeln!(s, "        {st}").unwrap();
             }
         } else {
             let reads_epi = arg_reads_with(
@@ -312,7 +332,12 @@ impl TensorGraph {
             );
             writeln!(s, "        let epi = body_{root}({reads_epi});").unwrap();
             for slot in 0..w_out {
-                writeln!(s, "        out[g * {w_out}u + {slot}u] = epi[{slot}];").unwrap();
+                let st = store(
+                    out_f,
+                    &format!("g * {w_out}u + {slot}u"),
+                    &format!("epi[{slot}]"),
+                );
+                writeln!(s, "        {st}").unwrap();
             }
         }
         writeln!(s, "    }}").unwrap();
@@ -340,7 +365,12 @@ impl TensorGraph {
         match &node.op {
             Op::Input(_) => {
                 writeln!(s, "fn read_{j}({coords}) -> f32 {{").unwrap();
-                writeln!(s, "    return b{j}[{}];", flat("c", 0, &fixed(&node.shape))).unwrap();
+                let v = load(
+                    node.precision.storage,
+                    &format!("b{j}"),
+                    &flat("c", 0, &fixed(&node.shape)),
+                );
+                writeln!(s, "    return {v};").unwrap();
                 writeln!(s, "}}\n").unwrap();
             }
             Op::Iota(d) => {
@@ -370,7 +400,7 @@ impl TensorGraph {
                 if !materialized {
                     emit_scalar_fn(s, &format!("body_{j}"), &c.body, &c.body_outs, c.args.len());
                     if let Some(m) = &c.monoid {
-                        emit_combine(s, j, m);
+                        emit_combine(s, j, m, node.precision.accum);
                     }
                     self.emit_point(s, j, c);
                 }
@@ -380,7 +410,12 @@ impl TensorGraph {
                 if materialized {
                     // buffer layout: [points][width]
                     let pt = flat("c", 0, &fixed(c.points()));
-                    writeln!(s, "    return b{j}[({pt}) * {w}u + ({slot})];").unwrap();
+                    let v = load(
+                        node.precision.storage,
+                        &format!("b{j}"),
+                        &format!("({pt}) * {w}u + ({slot})"),
+                    );
+                    writeln!(s, "    return {v};").unwrap();
                 } else {
                     let args = (0..k)
                         .map(|d| format!("c{d}"))
@@ -419,7 +454,13 @@ impl TensorGraph {
             .unwrap();
             indent.push_str("    ");
         }
-        emit_step(s, &indent, &format!("body_{j}({reads})"), m);
+        emit_step(
+            s,
+            &indent,
+            &format!("body_{j}({reads})"),
+            m,
+            self.nodes[j].precision.accum,
+        );
         for _ in &c.red {
             indent.truncate(indent.len() - 4);
             writeln!(s, "{indent}}}").unwrap();
@@ -447,7 +488,7 @@ fn acc_array(w: usize) -> String {
 
 /// One reduction step: evaluate `elem` (an `array<f32, W>` expression)
 /// and fold it into the scalar accumulators with the combine inlined.
-fn emit_step(s: &mut String, indent: &str, elem: &str, m: &Monoid) {
+fn emit_step(s: &mut String, indent: &str, elem: &str, m: &Monoid, accum: Format) {
     let w = m.width;
     writeln!(s, "{indent}let el = {elem};").unwrap();
     let outs = emit_scalar_mapped(s, indent, &m.combine, &m.outs, "k", &|v| {
@@ -461,7 +502,7 @@ fn emit_step(s: &mut String, indent: &str, elem: &str, m: &Monoid) {
         writeln!(s, "{indent}let nx{i} = {o};").unwrap();
     }
     for i in 0..w {
-        writeln!(s, "{indent}acc{i} = nx{i};").unwrap();
+        writeln!(s, "{indent}acc{i} = {};", quant(accum, &format!("nx{i}"))).unwrap();
     }
 }
 
@@ -621,11 +662,11 @@ fn emit_scalar_fn(s: &mut String, name: &str, g: &ExprGraph, outs: &[ExprId], n_
         .collect::<Vec<_>>()
         .join(", ");
     writeln!(s, "fn {name}({params}) -> array<f32, {}> {{", outs.len()).unwrap();
-    emit_scalar_body(s, g, outs);
+    emit_scalar_body(s, g, outs, Format::F32);
     writeln!(s, "}}\n").unwrap();
 }
 
-fn emit_combine(s: &mut String, j: usize, m: &Monoid) {
+fn emit_combine(s: &mut String, j: usize, m: &Monoid, accum: Format) {
     let w = m.width;
     writeln!(
         s,
@@ -636,11 +677,11 @@ fn emit_combine(s: &mut String, j: usize, m: &Monoid) {
         writeln!(s, "    let v{i} = a[{i}];").unwrap();
         writeln!(s, "    let v{} = e[{i}];", w + i).unwrap();
     }
-    emit_scalar_body(s, &m.combine, &m.outs);
+    emit_scalar_body(s, &m.combine, &m.outs, accum);
     writeln!(s, "}}\n").unwrap();
 }
 
-fn emit_scalar_body(s: &mut String, g: &ExprGraph, outs: &[ExprId]) {
+fn emit_scalar_body(s: &mut String, g: &ExprGraph, outs: &[ExprId], round: Format) {
     let mut live: Vec<usize> = g.live_set(outs).into_iter().collect();
     live.sort_unstable();
     let nodes = g.nodes_slice();
@@ -665,6 +706,67 @@ fn emit_scalar_body(s: &mut String, g: &ExprGraph, outs: &[ExprId]) {
         };
         writeln!(s, "    let e{i} = {rhs};").unwrap();
     }
-    let vals = outs.iter().map(e).collect::<Vec<_>>().join(", ");
+    let vals = outs
+        .iter()
+        .map(|o| quant(round, &e(o)))
+        .collect::<Vec<_>>()
+        .join(", ");
     writeln!(s, "    return array<f32, {}>({vals});", outs.len()).unwrap();
+}
+
+/// WGSL element type of a read-only buffer in format `f`. f16 is packed
+/// two per `u32` (naga 24 has no `enable f16`; `unpack2x16float` is core
+/// WGSL), so it needs no device feature.
+pub(super) fn elem_ty(f: Format) -> &'static str {
+    match f {
+        Format::F32 => "f32",
+        Format::F16 => "u32",
+        Format::BF16 => panic!("bf16 storage is interpreter-only: WGSL has no bf16 type"),
+    }
+}
+
+/// Element type of the output buffer: packed f16 halves of one word are
+/// written by different threads, so the word is atomic.
+fn out_ty(f: Format) -> &'static str {
+    match f {
+        Format::F16 => "atomic<u32>",
+        f => elem_ty(f),
+    }
+}
+
+/// Element `idx` of buffer `buf` (format `f`), as the f32 the kernel
+/// computes in.
+pub(super) fn load(f: Format, buf: &str, idx: &str) -> String {
+    match f {
+        Format::F32 => format!("{buf}[{idx}]"),
+        Format::F16 => format!("unpack2x16float({buf}[({idx}) >> 1u])[({idx}) & 1u]"),
+        Format::BF16 => panic!("bf16 storage is interpreter-only: WGSL has no bf16 type"),
+    }
+}
+
+/// Statement writing f32 value `v` to `out[idx]` in format `f`. An f16
+/// half is merged into its word with two atomics on disjoint bits, so
+/// the neighbour's half is never clobbered whatever the interleaving.
+pub(super) fn store(f: Format, idx: &str, v: &str) -> String {
+    match f {
+        Format::F32 => format!("out[{idx}] = {v};"),
+        Format::F16 => format!(
+            "{{ let i_ = {idx}; let sh_ = (i_ & 1u) * 16u; \
+             atomicAnd(&out[i_ >> 1u], ~(0xffffu << sh_)); \
+             atomicOr(&out[i_ >> 1u], (pack2x16float(vec2<f32>({v}, 0.0)) & 0xffffu) << sh_); }}"
+        ),
+        Format::BF16 => panic!("bf16 storage is interpreter-only: WGSL has no bf16 type"),
+    }
+}
+
+/// An f32 accumulator value `e` rounded to format `f` (kept in an f32
+/// register): f16 accumulation as rounding after every combine, which
+/// is what the interpreter emulates. It reproduces the numerics of an
+/// f16 accumulator, not its speed.
+pub(super) fn quant(f: Format, e: &str) -> String {
+    match f {
+        Format::F32 => e.to_string(),
+        Format::F16 => format!("unpack2x16float(pack2x16float(vec2<f32>({e}, 0.0))).x"),
+        Format::BF16 => panic!("bf16 accumulation is interpreter-only"),
+    }
 }

@@ -23,7 +23,8 @@ use std::fmt::Write;
 
 use tang_expr::{ExprGraph, ExprId, Node};
 
-use super::wgsl::{identity, lit, WgslKernel};
+use super::wgsl::{identity, lit, load, quant, store, WgslKernel};
+use super::Format;
 use super::{fixed, Comp, Form, Op, TensorGraph, TensorId};
 
 /// Affine expression over named loop variables.
@@ -364,8 +365,9 @@ impl Ctx<'_> {
             // only staged regions apply a guard at load time
             self.guard = None;
         }
+        let fmt = self.g.nodes[j].precision.storage;
         if self.in_load {
-            return format!("b{j}[{}]", addr.wgsl());
+            return load(fmt, &format!("b{j}"), &addr.wgsl());
         }
         let px = addr.terms.get(&self.px).copied().unwrap_or(0);
         let py = self
@@ -381,7 +383,7 @@ impl Ctx<'_> {
             if !addr.terms.contains_key("r0") && has_inner {
                 return self.hoisted_read(j, addr);
             }
-            return format!("b{j}[{}]", addr.wgsl());
+            return load(fmt, &format!("b{j}"), &addr.wgsl());
         }
         let is_tiled = |k: &str| k == self.px || self.py.as_deref() == Some(k);
         let inner: Vec<(String, i64)> = addr
@@ -613,6 +615,8 @@ impl Ctx<'_> {
                         body[v as usize - w].clone()
                     }
                 });
+                let accum = self.g.nodes[j].precision.accum;
+                let combined: Vec<String> = combined.iter().map(|e| quant(accum, e)).collect();
                 writeln!(out, "acc{n} = array<f32, {w}>({});", combined.join(", ")).unwrap();
                 for _ in &c.red {
                     writeln!(out, "}}").unwrap();
@@ -1092,8 +1096,12 @@ impl TensorGraph {
             writeln!(s, "    for (var o: u32 = 0u; o < {span}u; o = o + 1u) {{").unwrap();
             writeln!(
                 s,
-                "        hoist_{i}[({flat}) * {span}u + o] = b{}[u32({}{addr} + i32(o))];",
-                h.buffer, h.lo
+                "        hoist_{i}[({flat}) * {span}u + o] = {};",
+                load(
+                    self.nodes[h.buffer].precision.storage,
+                    &format!("b{}", h.buffer),
+                    &format!("u32({}{addr} + i32(o))", h.lo)
+                )
             )
             .unwrap();
             writeln!(s, "    }}").unwrap();
@@ -1227,10 +1235,21 @@ impl TensorGraph {
                 if !lay.window.is_empty() {
                     // a window spans lanes / steps past the edge: keep the
                     // read inside the buffer (those slots are never used)
-                    live.push_str(&format!(" && u32(a) < arrayLength(&b{})", r.key.buffer));
+                    let per_word = match self.nodes[r.key.buffer].precision.storage {
+                        Format::F16 => " * 2u",
+                        _ => "",
+                    };
+                    live.push_str(&format!(
+                        " && u32(a) < arrayLength(&b{}){per_word}",
+                        r.key.buffer
+                    ));
                 }
                 writeln!(s, "            if ({live}) {{").unwrap();
-                let mut val = format!("b{}[u32(a)]", r.key.buffer);
+                let mut val = load(
+                    self.nodes[r.key.buffer].precision.storage,
+                    &format!("b{}", r.key.buffer),
+                    "u32(a)",
+                );
                 if let Some((coords, shape)) = &r.key.guard {
                     let cond = coords
                         .iter()
@@ -1267,12 +1286,12 @@ impl TensorGraph {
                 for c in 0..v {
                     let (addr, live) = component(&c.to_string());
                     writeln!(s, "            var e{c} = 0.0;").unwrap();
-                    writeln!(
-                        s,
-                        "            if ({live}) {{ e{c} = b{}[u32({addr})]; }}",
-                        r.key.buffer
-                    )
-                    .unwrap();
+                    let e = load(
+                        self.nodes[r.key.buffer].precision.storage,
+                        &format!("b{}", r.key.buffer),
+                        &format!("u32({addr})"),
+                    );
+                    writeln!(s, "            if ({live}) {{ e{c} = {e}; }}").unwrap();
                     elems.push(format!("e{c}"));
                 }
                 writeln!(
@@ -1399,7 +1418,9 @@ impl TensorGraph {
             for line in rename(&body).lines() {
                 writeln!(s, "            {line}").unwrap();
             }
-            let combined_t: Vec<String> = combined.iter().map(|e| rename(e)).collect();
+            let accum = self.nodes[red_node].precision.accum;
+            let combined_t: Vec<String> =
+                combined.iter().map(|e| quant(accum, &rename(e))).collect();
             writeln!(
                 s,
                 "            acc{t} = array<f32, {w}>({});",
@@ -1471,7 +1492,12 @@ impl TensorGraph {
                 writeln!(s, "        {line}").unwrap();
             }
             for (slot, val) in epi_vals.iter().enumerate() {
-                writeln!(s, "        out[g * {w_out}u + {slot}u] = {};", rename(val)).unwrap();
+                let st = store(
+                    self.nodes[root].precision.storage,
+                    &format!("g * {w_out}u + {slot}u"),
+                    &rename(val),
+                );
+                writeln!(s, "        {st}").unwrap();
             }
             writeln!(s, "    }}").unwrap();
         }

@@ -126,6 +126,10 @@ schedule fields on a node say *how*, and can't change the answer:
   memory once per reduce chunk: buffer reads (k/v tiles, the matmul `b`
   tile) and *inlined sub-computations* (the q·k scores) alike.
   Reduce-invariant per-thread reads (the q row) are hoisted to registers.
+- `precision` — number formats (`set_precision(t, Precision { storage,
+  accum })`): the format a materialized buffer or input is *stored* in
+  (`F32 | F16 | BF16`) and the format a reduction *accumulates* in
+  (`F32 | F16`). See [Precision is a schedule](#precision-is-a-schedule).
 - `schedule_auto` — the rules of thumb distilled from measurement;
   `autotune` tries candidate graphs on the device and keeps the fastest.
 
@@ -138,6 +142,54 @@ hand-written kernel is as an intrinsic: "this comprehension shape has a
 fast implementation on this chip". The compiler picks it when it wins and
 derives one when it doesn't. The existing kernels keep their speed and stop
 being forks.
+
+## Precision is a schedule
+
+f16 is not a different program; it is a different way to run the same
+one. So precision is a per-node schedule field, like `inline` and `tile`,
+and the graph stays math. Everything defaults to f32, which is exactly
+the old behaviour.
+
+- **Storage** applies where a value is written to memory: graph inputs
+  (weights) and materialized comps. An inlined comp has no buffer, so its
+  storage is ignored. Loads widen to f32; arithmetic is f32.
+- **Accum** applies to a reduction's running state: after every combine
+  step the state is rounded to the format.
+- **The interpreter predicts the error.** `eval` stays pure f64 and
+  ignores precision. `eval_emulated` rounds every stored value and every
+  accumulator step to its scheduled format (round to nearest even,
+  subnormals, overflow to ∞) while body arithmetic stays f64.
+  `precision_error` compares the two (`ErrorStats`: max / mean, abs /
+  relative to the output's largest magnitude); `ErrorBudget { max_rel,
+  max_abs }` admits or rejects a schedule. Emulation matches the GPU's
+  f16 kernels to 1 f16 ulp when the reduction order is the same.
+- **The reduction order is part of the error.** The interpreter folds a
+  reduction sequentially. A `split` schedule tree-combines 256 partial
+  sums, so the same f16 accumulator is far more accurate under it
+  (AdaIN's variance over T = 2000, measured on the GPU: 2.8e-4 under a
+  256-thread split, 1.3e-2 with one thread per row; the interpreter's
+  sequential prediction is 7.9e-3). Emulation models the sequential
+  order, the worst case.
+- **WGSL lowering.** naga 24 rejects `enable f16`, so f16 storage is
+  packed two per `u32` with core-WGSL `unpack2x16float` on load; a store
+  merges its half into the word with two atomics on disjoint bits
+  (neighbouring halves belong to different threads). No device feature
+  needed. f16 accumulation is lowered as a round-trip through
+  `pack2x16float` after each combine — the numerics of an f16
+  accumulator, not its speed. bf16 is interpreter-only (WGSL has no bf16
+  type; the lowering panics on it).
+- **Search.** `tang_bench::ir_gpu::tune_precision` takes a scheduled
+  graph and a budget, lowers buffers to f16 one at a time (largest
+  first), runs each on the device against the f64 reference, and keeps a
+  change only if the program stays within budget and gets faster (≥ 3%,
+  re-timed at the end against f32). Accumulators are tried against the
+  budget only.
+
+Set precision after the rewriting passes (they rebuild the graph); the
+schedule passes (`schedule_auto`, autotune) leave it alone. `backward`
+appends to the same graph, so a forward input stored in f16 is read as
+f16 by the gradient kernels too, and backward reductions (a snake's
+`dα = Σ_t …`) take their own precision.
 
 ## What the measurements say about the claim
 
@@ -178,6 +230,9 @@ schedule space; the compiler searches it.
   register tile.
 - The CUDA path is a separate runtime (tang-gpu runs on wgpu, which
   cannot dispatch CUDA); buffers do not interoperate between the two.
+- Native half arithmetic. Storage is f16, math is f32; matrix units
+  (Apple `simdgroup_matrix`, 11 TFLOP/s with f16 inputs vs ~3.3 for the
+  IR's f32 tiles) need an MSL emitter that reads the precision schedule.
 - Scatter gradients reduce over the whole source coordinate they gate on;
   a stride-2 read pays 2× in the backward pass. Fine for rope, not for a
   large gather.

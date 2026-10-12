@@ -1019,3 +1019,76 @@ What changed, and where the IR still loses:
   general), so a conv over `snake(adain(x))` would read a buffer, not
   splice. Splicing is valid whenever the map is zero on zero input
   (snake is); not done yet.
+
+## Precision schedules (M4 Max, Metal, kernel-only)
+
+Precision is a per-node schedule field (`set_precision`, see
+`docs/tensor-ir.md`): storage format of each buffer, accumulate format of
+each reduction. `tune_precision` starts from the per-kernel autotuned f32
+schedule, lowers one buffer at a time to f16 (largest first), runs it on
+the device against the f64 CPU reference, and keeps it only if the whole
+program stays within the error budget and is ≥ 3% faster; the final
+choice is re-timed best-of-3 against f32 and dropped if the gain does not
+hold. Error = max |got − f64| / max |f64|. "Predicted" is the f64
+interpreter's emulation (`precision_error`) of the same assignment on a
+small instance of the same builder.
+`cargo run --release -p tang-bench --example kokoro_ops -- precision`.
+
+| op | budget (rel) | f32 ms | chosen ms | speedup | chosen assignment | measured err | predicted err (small) |
+|---|---|---:|---:|---:|---|---:|---:|
+| a conv1d 512→512 k7 d3 T2000 | 1e-2 | 2.201 | 2.201 | 1.00× | all f32 | 4.0e-6 | 6.8e-7 |
+| a conv1d 512→512 k7 d3 T2000 | 1e-3 | 2.204 | 2.204 | 1.00× | all f32 | 4.0e-6 | 6.8e-7 |
+| b upsample 512→256 k20 s10 | 1e-2 | 3.919 | 3.662 | **1.07×** | w[256×512×20] f16 | 6.2e-5 | 1.4e-4 |
+| b upsample 512→256 k20 s10 | 1e-3 | 3.931 | 3.825 | 1.03× | w[256×512×20] f16 | 6.2e-5 | 1.4e-4 |
+| c iSTFT n_fft20 hop5 T4000 | 1e-2 | 0.073 | 0.073 | 1.00× | all f32 | 1.3e-6 | 9.3e-8 |
+| c iSTFT n_fft20 hop5 T4000 | 1e-3 | 0.074 | 0.072 | 1.02× | OLA output f16 | 3.0e-4 | 2.4e-4 |
+| e AdaIN C512 T2000 style128 | 1e-2 | 0.250 | 0.250 | 1.00× | all f32 | 7.3e-7 | 6.0e-7 |
+| e AdaIN C512 T2000 style128 | 1e-3 | 0.249 | 0.249 | 1.00× | all f32 | 7.3e-7 | 6.0e-7 |
+| f ConvNeXt C512 T200 F1536 | 1e-2 | 0.697 | 0.697 | 1.00× | all f32 | 9.7e-6 | 4.5e-8 |
+| f ConvNeXt C512 T200 F1536 | 1e-3 | 0.695 | 0.695 | 1.00× | all f32 | 9.7e-6 | 4.5e-8 |
+| matmul 1024³ | 1e-2 | 0.761 | 0.761 | 1.00× | all f32 | 1.8e-6 | 1.5e-6 |
+| matmul 1024³ | 1e-3 | 0.758 | 0.758 | 1.00× | all f32 | 1.8e-6 | 1.5e-6 |
+
+Every f16 *storage* trial fit both budgets (errors 1e-5–5e-4; an f16
+output costs ~3e-4, the half-ulp of the result). The search said no
+because almost nothing got faster:
+
+- **Without matrix units, f16 storage buys bandwidth only, and these
+  ops are not bandwidth-bound.** The convs and the 1024³ matmul run at
+  ~3.3 TFLOP/s from staged f32 tiles: compute-bound, halving the bytes
+  read changes nothing (a: x f16 2.18, w f16 2.23 vs 2.20 ms; matmul:
+  a/b f16 0.76 vs 0.76). The upsample is the one op whose weight read shows: its
+  10.5 MB `w` in f16 is 3–7% faster across runs. AdaIN, iSTFT and the
+  ConvNeXt block are a few hundred µs of 6–8 small kernels — launch- and
+  latency-bound at 80–100 GB/s against the M4 Max's ~400.
+- **f16 outputs never pay** (a: 2.21 vs 2.20 ms; matmul 0.80 vs 0.76):
+  two threads own the halves of one word, so the store is
+  two atomics. An emitter that gives each thread a pair of points (the
+  register tile already does) can write whole words.
+- Run-to-run noise on the M4 is ±5% for sub-ms programs, which is why a
+  kept choice is re-timed; earlier runs with a 2% bar "kept" AdaIN and
+  ConvNeXt assignments that re-timed at 0.97–1.00×.
+
+**Where the budget rejects f16.** Accumulators, not storage. f16
+accumulation is lowered as rounding after every combine (the numerics of
+an f16 accumulator; speed needs native half math), so these trials are
+judged on error only. At rel 1e-3:
+
+| op | reduction | measured (GPU) | predicted (interp., sequential) |
+|---|---|---:|---:|
+| a conv1d | out, Σ over (c, k) = 3584 terms | 3.1e-2 | 5.6e-3 (c = 32) |
+| b upsample | Σ over (j, c) = 1024 | 1.5e-2 | 2.6e-3 (c = 32) |
+| e AdaIN | variance Σ_t (x − μ)², T = 2000, one thread per row | 1.3e-2 | 7.9e-3 |
+| e AdaIN | same, 256-thread split schedule | 2.8e-4 (admitted) | |
+| e AdaIN | style projection W·s (128) | 2.9e-3 | 5.0e-4 (style 16) |
+| f ConvNeXt | LayerNorm statistic Σ over C = 512 (n10) | 6.9e-2 | 1.5e-4 (C = 32) |
+| f ConvNeXt | pointwise F→C matmul (1536) | 1.7e-2 | 1.4e-4 (F = 96) |
+| matmul 1024³ | Σ_k, 1024 terms | 1.5e-2 | 1.2e-2 |
+| snake `dα = Σ_t` (backward, T = 4096) | unit test | | > 1e-3, rejected |
+
+The predicted column is for the small instances, whose shorter sums
+round less; with the same reduction length (matmul, AdaIN) prediction
+and measurement agree within ~1.5×. The AdaIN rows are the point: the
+same f16 variance is rejected with one thread walking T and admitted
+under a split, because the tree of 256 partial sums rounds at small
+magnitudes. Precision and thread mapping are one search space.
