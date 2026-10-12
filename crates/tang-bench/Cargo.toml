@@ -88,3 +88,7 @@ name = "algebraic_e2e"
 [[example]]
 name = "msl_kernels"
 required-features = ["metal"]
+
+[[example]]
+name = "conv_frag"
+required-features = ["metal"]

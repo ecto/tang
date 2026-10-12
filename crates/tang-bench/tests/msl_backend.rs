@@ -515,3 +515,176 @@ fn pick_backend_runs_both() {
     );
     assert!(w.is_some() && m.is_some());
 }
+
+// ---------------------------------------------------------------------------
+// windowed fragment staging
+// ---------------------------------------------------------------------------
+
+/// Strided, dilated conv `y[o,τ] = Σ_{c,k} w[o,c,k]·x[c, s·τ + d·k − p]`,
+/// guarded, as one comp.
+fn conv_strided(
+    g: &mut TensorGraph,
+    x: TensorId,
+    w: TensorId,
+    tout: usize,
+    stride: i64,
+    dil: i64,
+    pad: i64,
+) -> TensorId {
+    let (ci, co, k) = (g.shape(x)[0].n(), g.shape(w)[0].n(), g.shape(w)[2].n());
+    let xv = View {
+        forms: vec![
+            Form::unit(4, 2),
+            Form {
+                coefs: vec![0, stride, 0, dil],
+                offset: -pad,
+            },
+        ],
+        guard: true,
+    };
+    g.comp(
+        &[co, tout],
+        &[ci, k],
+        vec![
+            Arg { src: x, view: xv },
+            Arg {
+                src: w,
+                view: View::pick(4, &[Some(0), Some(2), Some(3)]),
+            },
+        ],
+        Some(Monoid::sum()),
+        |v| vec![v[0] * v[1]],
+    )
+    .unwrap()
+}
+
+fn windowed(exe: &Executable) -> bool {
+    exe.program
+        .kernels
+        .iter()
+        .any(|k| k.fragment && k.source.contains("windowed operand"))
+}
+
+/// The conv's `x` staged once per (channel chunk, time tile) and read by
+/// every tap at a shifted offset: ragged time and channels, dilation,
+/// stride (phase-de-interleaved window), padding past both edges.
+#[test]
+fn fragment_window_conv_variants() {
+    let Some(dev) = dev() else { return };
+    let mut rng = tang_bench::Rng::new(31);
+    // (ci, co, t, k, stride, dil, pad)
+    for &(ci, co, t, k, st, dil, pad) in &[
+        (5, 7, 37, 3, 1, 1, 1),
+        (40, 33, 70, 7, 1, 3, 9),
+        (64, 128, 200, 7, 1, 1, 3),
+        (24, 72, 131, 5, 2, 1, 2),
+        (19, 20, 300, 4, 3, 2, 5),
+        (32, 64, 129, 3, 1, 5, 0),
+    ] {
+        let tout = ((t as i64 + 2 * pad - dil * (k as i64 - 1) - 1) / st + 1) as usize;
+        let mut g = TensorGraph::new();
+        let x = g.input(&[ci, t]);
+        let w = g.input(&[co, ci, k]);
+        let y = conv_strided(&mut g, x, w, tout, st, dil, pad);
+        f16_operands(&mut g, &[x, w]);
+        g.set_fragment(y, true);
+        let inputs = vec![rand(ci * t, &mut rng), rand(co * ci * k, &mut rng)];
+        let emu = g.eval_emulated(&f64s(&inputs), &[y]);
+        let name = format!("window conv {ci}->{co} t{t} k{k} s{st} d{dil} p{pad}");
+        let exe = check(&dev, &name, &g, &[y], &inputs, &emu, 1e-5);
+        assert!(windowed(&exe), "{name}: not windowed");
+    }
+}
+
+/// Polyphase upsample `out[o, q, r] = Σ_{j,c} x[c, q − j]·w[o, c, r + s·j]`:
+/// the phase `r` is a batch dim of the fragment tile, the tap `j` reads
+/// the window backwards.
+#[test]
+fn fragment_window_upsample() {
+    let Some(dev) = dev() else { return };
+    let mut rng = tang_bench::Rng::new(32);
+    for &(ci, co, t, s) in &[(16, 24, 50, 3), (40, 64, 130, 4)] {
+        let mut g = TensorGraph::new();
+        let x = g.input(&[ci, t]);
+        let w = g.input(&[co, ci, 2 * s]);
+        let f = |terms: &[(usize, i64)]| {
+            let mut fm = Form::zero(5);
+            for &(d, c) in terms {
+                fm.coefs[d] = c;
+            }
+            fm
+        };
+        let xv = View {
+            forms: vec![f(&[(4, 1)]), f(&[(1, 1), (3, -1)])],
+            guard: true,
+        };
+        let wv = View {
+            forms: vec![f(&[(0, 1)]), f(&[(4, 1)]), f(&[(2, 1), (3, s as i64)])],
+            guard: false,
+        };
+        let y = g
+            .comp(
+                &[co, t, s],
+                &[2, ci],
+                vec![Arg { src: x, view: xv }, Arg { src: w, view: wv }],
+                Some(Monoid::sum()),
+                |v| vec![v[0] * v[1]],
+            )
+            .unwrap();
+        f16_operands(&mut g, &[x, w]);
+        g.set_fragment(y, true);
+        let inputs = vec![rand(ci * t, &mut rng), rand(co * ci * 2 * s, &mut rng)];
+        let emu = g.eval_emulated(&f64s(&inputs), &[y]);
+        let exe = check(&dev, "window upsample", &g, &[y], &inputs, &emu, 1e-5);
+        assert!(windowed(&exe));
+    }
+}
+
+/// Backward of `Σ y ⊙ gy` through the conv on fragments: dx is a windowed
+/// transposed conv over gy (its weight read through an always-in-range
+/// guarded view), dw a GEMM over t with `x` staged along t. Both carry an
+/// unread third arg (the product rule's dropped factor).
+#[test]
+fn fragment_conv_backward() {
+    let Some(dev) = dev() else { return };
+    let mut rng = tang_bench::Rng::new(33);
+    for &(ci, co, t, k, dil) in &[(24, 40, 77, 3, 2), (64, 64, 150, 7, 3)] {
+        let pad = dil * (k as i64 - 1) / 2;
+        let mut g = TensorGraph::new();
+        let x = g.input(&[ci, t]);
+        let w = g.input(&[co, ci, k]);
+        let gy = g.input(&[co, t]);
+        let y = conv_strided(&mut g, x, w, t, 1, dil, pad);
+        let l = g.map(&[y, gy], |v| v[0] * v[1]).unwrap();
+        let grads = g.backward(l, &[x, w]).unwrap();
+        let outs = vec![y, grads[0], grads[1]];
+        let (g, outs) = g.substitute_maps(&outs);
+        let (mut g, outs) = g.eliminate_common(&outs);
+        let inputs = vec![
+            rand(ci * t, &mut rng),
+            rand(co * ci * k, &mut rng),
+            rand(co * t, &mut rng),
+        ];
+        let cands = tang_bench::ir_msl::fragment_candidates(&g, &outs);
+        assert!(
+            cands.contains(&outs[1]) && cands.contains(&outs[2]),
+            "dx, dw eligible: {cands:?}"
+        );
+        for &c in &cands {
+            for o in g.fragment_operands(c).unwrap() {
+                g.set_precision(o, Precision::storage(Format::F16));
+            }
+            g.set_fragment(c, true);
+        }
+        let emu = g.eval_emulated(&f64s(&inputs), &outs);
+        let exe = check(&dev, "frag conv backward", &g, &outs, &inputs, &emu, 1e-5);
+        for o in &outs[1..] {
+            assert!(exe
+                .program
+                .kernels
+                .iter()
+                .any(|k| k.node == *o && k.fragment));
+        }
+        assert!(windowed(&exe), "dx should be windowed");
+    }
+}

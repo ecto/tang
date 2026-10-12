@@ -453,6 +453,43 @@ fn conv_ref(x: &[f64], w: &[f64], c: usize, t: usize, k: usize, dil: i64) -> Vec
     y
 }
 
+/// Gradients of `Σ y ⊙ gy` for the "same" conv: `dx[c, τ] = Σ_{o,k}
+/// w[o,c,k]·gy[o, τ − d·k + p]`, `dw[o,c,k] = Σ_t gy[o,t]·x[c, t + d·k − p]`.
+fn conv_bwd_ref(
+    x: &[f64],
+    w: &[f64],
+    gy: &[f64],
+    c: usize,
+    t: usize,
+    k: usize,
+    dil: i64,
+) -> (Vec<f64>, Vec<f64>) {
+    let pad = dil * (k as i64 - 1) / 2;
+    let mut dx = vec![0.0; c * t];
+    let mut dw = vec![0.0; c * c * k];
+    for o in 0..c {
+        let g = &gy[o * t..(o + 1) * t];
+        for ci in 0..c {
+            let row = &x[ci * t..(ci + 1) * t];
+            for kk in 0..k {
+                let wv = w[(o * c + ci) * k + kk];
+                let sh = dil * kk as i64 - pad;
+                let mut acc = 0.0;
+                let dr = &mut dx[ci * t..(ci + 1) * t];
+                for (tt, &gv) in g.iter().enumerate() {
+                    let s = tt as i64 + sh;
+                    if (0..t as i64).contains(&s) {
+                        acc += gv * row[s as usize];
+                        dr[s as usize] += wv * gv;
+                    }
+                }
+                dw[(o * c + ci) * k + kk] = acc;
+            }
+        }
+    }
+    (dx, dw)
+}
+
 fn upsample_ref(x: &[f64], w: &[f64], ci: usize, co: usize, t: usize, s: usize) -> Vec<f64> {
     // conv_transpose1d(k = 2s, stride s, p = 0), cropped to t·s
     let k = 2 * s;
@@ -1597,6 +1634,9 @@ mod msl {
                 &[&x, &w],
             ));
         }
+        if want_op("a") || want_op("train") {
+            train.push(train_dy_row(&dev));
+        }
         if want_op("f") || want_op("train") {
             let (cf, tf, ff) = (512, 200, 1536);
             let inputs: Vec<Vec<f32>> = vec![
@@ -1627,6 +1667,76 @@ mod msl {
         for r in train {
             println!("{r}");
         }
+    }
+
+    /// Op (a) forward + backward with a given upstream gradient
+    /// (`L = Σ y ⊙ gy`, so dx and dw are real contractions with dy; with
+    /// `dy = 1` they collapse to sums). f32 autotuned, then
+    /// `tune_precision` (fragments for y, dx, dw) against f64 references.
+    fn train_dy_row(dev: &MslDevice) -> String {
+        let (c, t, k, dil) = (512, 2000, 7, 3);
+        let x = rand(c * t, 1, 1.0);
+        let w = rand(c * c * k, 2, 0.05);
+        let gy = rand(c * t, 3, 1.0);
+        let (mut g, o) = conv_graph(c, t, k, dil, false);
+        let gyi = g.input(&[c, t]);
+        let l = g.map(&[o[0], gyi], |v| v[0] * v[1]).unwrap();
+        let xw = [TensorId::from_index(0), TensorId::from_index(1)];
+        let grads = g.backward(l, &xw).unwrap();
+        let (g, outs) = optimized(&g, &[o[0], grads[0], grads[1]]);
+        let (xd, wd, gd) = (f64s(&x), f64s(&w), f64s(&gy));
+        let y = conv_ref(&xd, &wd, c, t, k, dil);
+        let (dx, dw) = conv_bwd_ref(&xd, &wd, &gd, c, t, k, dil);
+        let want = vec![y, dx, dw];
+        let inputs: [&[f32]; 3] = [&x, &w, &gy];
+        let mut auto = g.clone();
+        auto.schedule_auto(&outs);
+        let tuned = ir_msl::autotune_kernels(dev, auto, &outs, &inputs, 10).0;
+        let exe = Executable::new(dev, tuned.to_msl(&outs), &inputs);
+        let f32_ms = time(dev, &exe);
+        let f32_err = ir_msl::gpu_error(dev, &exe, &outs, &want).max_rel;
+        let mut line = format!(
+            "a fwd+bwd, dy given (y, dx, dw):\n    f32 autotune {f32_ms:8.3} ms  {} kernels  err {f32_err:.1e}",
+            exe.program.kernels.len()
+        );
+        let mut cols = Vec::new();
+        for rel in [1e-2, 1e-3] {
+            let r = ir_msl::tune_precision(
+                dev,
+                tuned.clone(),
+                &outs,
+                &inputs,
+                &want,
+                ErrorBudget::rel(rel),
+                ITERS,
+            );
+            let frags = r.fragments.len();
+            line.push_str(&format!(
+                "\n    tune @ {rel:.0e}: {:.3} → {:.3} ms  err {:.1e}  {frags} nodes on fragments",
+                r.base_ms, r.ms, r.error.max_rel
+            ));
+            for tr in &r.trials {
+                line.push_str(&format!(
+                    "\n        {:<24} err {:.1e}  {}",
+                    tr.what,
+                    tr.error.max_rel,
+                    match (tr.kept, tr.ms) {
+                        (true, Some(ms)) => format!("kept ({ms:.3} ms)"),
+                        (false, Some(ms)) => format!("no gain ({ms:.3} ms)"),
+                        _ => "over budget".into(),
+                    }
+                ));
+            }
+            cols.push(format!(
+                "{:.3} ({frags} on fragments, err {:.0e})",
+                r.ms, r.error.max_rel
+            ));
+        }
+        println!("{line}");
+        format!(
+            "| a fwd+bwd, dy given | {f32_ms:.3} (autotune) | | {} | {} |",
+            cols[0], cols[1]
+        )
     }
 
     fn train_row(
