@@ -23,6 +23,7 @@
 
 mod fusion;
 mod passes;
+pub mod tensor;
 
 pub use fusion::{FusedKernel, FusionGroup, FusionPlanner};
 pub use passes::{
