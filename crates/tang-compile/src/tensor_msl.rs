@@ -273,7 +273,58 @@ impl TensorGraph {
         writeln!(s, "    const uint sc = (sg % {gn}u) * {sn}u;").unwrap();
         writeln!(s, "    simdgroup_float8x8 acc[{am}][{an}];").unwrap();
         writeln!(s, "    for (uint i = 0u; i < {am}u; i++) for (uint j = 0u; j < {an}u; j++) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);").unwrap();
-        writeln!(s, "    for (uint k0 = 0u; k0 < {kt}u; k0 += {bk}u) {{").unwrap();
+        // Direct path: an operand whose address is affine with unit stride
+        // along k or along its free axis is loaded straight from device
+        // memory into fragments (no staging) on interior tiles.
+        let direct = |which: usize, free: usize| -> Option<(usize, i64, i64, String)> {
+            let a = &c.args[which];
+            if a.view.guard || kt % fk != 0 {
+                return None;
+            }
+            let src = self.storage(a.src).n();
+            let coef = self.affine_address(c, which)?;
+            let k0 = pts.len();
+            let sk = *coef.1.last().unwrap_or(&0);
+            // the reduce dims must flatten row-major onto one stride
+            let mut want = sk;
+            for i in (0..red.len()).rev() {
+                if coef.1[k0 + i] != want {
+                    return None;
+                }
+                want *= red[i] as i64;
+            }
+            let sf = coef.1[free];
+            if sk <= 0 || sf < 0 || !(sk == 1 || sf == 1) {
+                return None;
+            }
+            let mut base = format!("{}", coef.0);
+            for &d in &others {
+                if coef.1[d] != 0 {
+                    base.push_str(&format!(" + {} * int(p{d})", coef.1[d]));
+                }
+            }
+            Some((src, sk, sf, base))
+        };
+        let da = direct(plan.a, dm);
+        let db = direct(plan.b, dn);
+        // fragment loads of a direct operand at reduce index `kexpr`
+        let load_a = |k: &str| {
+            let (ja, ska, sma, _) = da.as_ref().unwrap();
+            let _ = ja;
+            if *ska == 1 {
+                format!("simdgroup_load(fa[i], pa + (sr + i * {fm}u) * {sma} + {k}, {sma})")
+            } else {
+                format!("simdgroup_load(fa[i], pa + (sr + i * {fm}u) + ({k}) * {ska}, {ska}, ulong2(0, 0), true)")
+            }
+        };
+        let load_b = |k: &str| {
+            let (_, skb, snb, _) = db.as_ref().unwrap();
+            if *snb == 1 {
+                format!("simdgroup_load(fb[j], pb + ({k}) * {skb} + sc + j * {fn_}u, {skb})")
+            } else {
+                format!("simdgroup_load(fb[j], pb + {k} + (sc + j * {fn_}u) * {snb}, {snb}, ulong2(0, 0), true)")
+            }
+        };
         // staging: A as [m][k], B as [k][n]; consecutive threads walk the
         // operand's fastest-moving tile axis
         let stage = |s: &mut String, which: usize, buf: &str, rows: usize, cols: usize, a_side: bool| {
@@ -302,18 +353,74 @@ impl TensorGraph {
             writeln!(s, "            {buf}[idx] = half(v);").unwrap();
             writeln!(s, "        }}").unwrap();
         };
-        stage(&mut s, plan.a, "As", bm, bk, true);
-        stage(&mut s, plan.b, "Bs", bk, bn, false);
-        writeln!(s, "        threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
-        writeln!(s, "        for (uint kk = 0u; kk < {bk}u; kk += {fk}u) {{").unwrap();
-        writeln!(s, "            simdgroup_half8x8 fa[{am}];").unwrap();
-        writeln!(s, "            simdgroup_half8x8 fb[{an}];").unwrap();
-        writeln!(s, "            for (uint i = 0u; i < {am}u; i++) simdgroup_load(fa[i], &As[(sr + i * {fm}u) * {bk}u + kk], {bk});").unwrap();
-        writeln!(s, "            for (uint j = 0u; j < {an}u; j++) simdgroup_load(fb[j], &Bs[kk * {bn}u + sc + j * {fn_}u], {bn});").unwrap();
-        writeln!(s, "            for (uint i = 0u; i < {am}u; i++) for (uint j = 0u; j < {an}u; j++) simdgroup_multiply_accumulate(acc[i][j], fa[i], fb[j], acc[i][j]);").unwrap();
-        writeln!(s, "        }}").unwrap();
-        writeln!(s, "        threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
-        writeln!(s, "    }}").unwrap();
+        // One reduce loop, each operand either loaded straight from device
+        // (`a_dev` / `b_dev`) or gathered into threadgroup memory.
+        let emit_loop = |s: &mut String, a_dev: bool, b_dev: bool| {
+            if a_dev {
+                let (ja, _, sma, basea) = da.as_ref().unwrap();
+                writeln!(s, "    device const half* pa = b{ja} + ({basea}) + int(m0) * {sma};").unwrap();
+            }
+            if b_dev {
+                let (jb, _, snb, baseb) = db.as_ref().unwrap();
+                writeln!(s, "    device const half* pb = b{jb} + ({baseb}) + int(n0) * {snb};").unwrap();
+            }
+            if a_dev && b_dev {
+                writeln!(s, "    for (uint k = 0u; k < {kt}u; k += {fk}u) {{").unwrap();
+                writeln!(s, "        simdgroup_half8x8 fa[{am}];").unwrap();
+                writeln!(s, "        simdgroup_half8x8 fb[{an}];").unwrap();
+                writeln!(s, "        for (uint i = 0u; i < {am}u; i++) {};", load_a("k")).unwrap();
+                writeln!(s, "        for (uint j = 0u; j < {an}u; j++) {};", load_b("k")).unwrap();
+                writeln!(s, "        for (uint i = 0u; i < {am}u; i++) for (uint j = 0u; j < {an}u; j++) simdgroup_multiply_accumulate(acc[i][j], fa[i], fb[j], acc[i][j]);").unwrap();
+                writeln!(s, "    }}").unwrap();
+                return;
+            }
+            writeln!(s, "    for (uint k0 = 0u; k0 < {kt}u; k0 += {bk}u) {{").unwrap();
+            if !a_dev {
+                stage(s, plan.a, "As", bm, bk, true);
+            }
+            if !b_dev {
+                stage(s, plan.b, "Bs", bk, bn, false);
+            }
+            writeln!(s, "        threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+            writeln!(s, "        for (uint kk = 0u; kk < {bk}u; kk += {fk}u) {{").unwrap();
+            writeln!(s, "            simdgroup_half8x8 fa[{am}];").unwrap();
+            writeln!(s, "            simdgroup_half8x8 fb[{an}];").unwrap();
+            if a_dev {
+                writeln!(s, "            for (uint i = 0u; i < {am}u; i++) {};", load_a("k0 + kk")).unwrap();
+            } else {
+                writeln!(s, "            for (uint i = 0u; i < {am}u; i++) simdgroup_load(fa[i], &As[(sr + i * {fm}u) * {bk}u + kk], {bk});").unwrap();
+            }
+            if b_dev {
+                writeln!(s, "            for (uint j = 0u; j < {an}u; j++) {};", load_b("k0 + kk")).unwrap();
+            } else {
+                writeln!(s, "            for (uint j = 0u; j < {an}u; j++) simdgroup_load(fb[j], &Bs[kk * {bn}u + sc + j * {fn_}u], {bn});").unwrap();
+            }
+            writeln!(s, "            for (uint i = 0u; i < {am}u; i++) for (uint j = 0u; j < {an}u; j++) simdgroup_multiply_accumulate(acc[i][j], fa[i], fb[j], acc[i][j]);").unwrap();
+            writeln!(s, "        }}").unwrap();
+            writeln!(s, "        threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+            writeln!(s, "    }}").unwrap();
+        };
+        // A direct operand alongside a staged one reads whole chunks, so
+        // the reduce extent must be a multiple of the chunk.
+        let hybrid = kt % bk == 0;
+        let m_int = format!("m0 + {bm}u <= {mm}u");
+        let n_int = format!("n0 + {bn}u <= {nn}u");
+        let fast = match (da.is_some(), db.is_some()) {
+            (true, true) => Some((format!("{m_int} && {n_int}"), true, true)),
+            (true, false) if hybrid => Some((m_int, true, false)),
+            (false, true) if hybrid => Some((n_int, false, true)),
+            _ => None,
+        };
+        match fast {
+            Some((cond, a_dev, b_dev)) => {
+                writeln!(s, "    if ({cond}) {{").unwrap();
+                emit_loop(&mut s, a_dev, b_dev);
+                writeln!(s, "    }} else {{").unwrap();
+                emit_loop(&mut s, false, false);
+                writeln!(s, "    }}").unwrap();
+            }
+            None => emit_loop(&mut s, false, false),
+        }
         writeln!(s, "    for (uint i = 0u; i < {am}u; i++) for (uint j = 0u; j < {an}u; j++) simdgroup_store(acc[i][j], &Cs[(sr + i * {fm}u) * {bn}u + sc + j * {fn_}u], {bn});").unwrap();
         writeln!(s, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
         // write-out (and epilogue) from the result tile
@@ -367,6 +474,37 @@ impl TensorGraph {
             threads: threads as u32,
             fragment: true,
         }
+    }
+}
+
+impl TensorGraph {
+    /// Element address of arg `which` of `c` in its storage buffer as
+    /// `(offset, coefficient per iteration dim)` — `None` unless the
+    /// source is a plain buffer (input, reshape of one, or a materialized
+    /// single-value comp).
+    fn affine_address(&self, c: &super::Comp, which: usize) -> Option<(i64, Vec<i64>)> {
+        let a = &c.args[which];
+        let src = a.src.n();
+        let storage = self.storage(a.src).n();
+        match &self.nodes[storage].op {
+            Op::Input(_) => {}
+            Op::Comp(sc) if sc.tuple == 0 && !self.nodes[storage].inline => {}
+            _ => return None,
+        }
+        // reshape keeps the flat index, so the reading node's own shape
+        // gives the strides
+        let shape = fixed(&self.nodes[src].shape);
+        let mut stride = 1i64;
+        let mut off = 0i64;
+        let mut coefs = vec![0i64; c.rank()];
+        for (f, &n) in a.view.forms.iter().zip(&shape).rev() {
+            off += f.offset * stride;
+            for (d, &k) in f.coefs.iter().enumerate() {
+                coefs[d] += k * stride;
+            }
+            stride *= n as i64;
+        }
+        Some((off, coefs))
     }
 }
 

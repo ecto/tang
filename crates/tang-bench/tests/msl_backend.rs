@@ -383,3 +383,30 @@ fn fragment_conv_implicit_gemm_with_epilogue() {
         assert!(exe.program.kernels.iter().any(|k| k.node == z && k.fragment));
     }
 }
+
+/// Transposed operands take the transposed device-load path (`a` stored
+/// `[k, m]`, `b` stored `[n, k]`: q·kᵀ's layout), interior and ragged.
+#[test]
+fn fragment_transposed_operands() {
+    let Some(dev) = dev() else { return };
+    let mut rng = tang_bench::Rng::new(24);
+    for (m, k, n) in [(128, 64, 256), (100, 72, 90)] {
+        let mut g = TensorGraph::new();
+        let at = g.input(&[k, m]);
+        let bt = g.input(&[n, k]);
+        let a = g.transpose(at, &[1, 0]).unwrap();
+        let b = g.transpose(bt, &[1, 0]).unwrap();
+        let c = g.matmul(a, b).unwrap();
+        let inputs = vec![rand(m * k, &mut rng), rand(k * n, &mut rng)];
+        let want = g.eval(&f64s(&inputs), &[c]);
+        let (mut g, outs) = g.substitute_maps(&[c]);
+        let c = outs[0];
+        f16_operands(&mut g, &[TensorId::from_index(0), TensorId::from_index(1)]);
+        g.set_fragment(c, true);
+        assert!(g.fragment_plan(c).is_some());
+        let emu = g.eval_emulated(&f64s(&inputs), &[c]);
+        let exe = check(&dev, &format!("frag T {m}x{k}x{n}"), &g, &[c], &inputs, &emu, 1e-5);
+        assert!(exe.program.kernels.iter().any(|k| k.fragment));
+        let _ = want;
+    }
+}

@@ -84,3 +84,7 @@ name = "algebraic_bits"
 
 [[example]]
 name = "algebraic_e2e"
+
+[[example]]
+name = "msl_kernels"
+required-features = ["metal"]
