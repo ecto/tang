@@ -42,6 +42,8 @@ use tang_expr::{trace, ExprGraph, ExprId, Node};
 pub mod cuda;
 #[path = "tensor_grad.rs"]
 mod grad;
+#[path = "tensor_memplan.rs"]
+pub mod memplan;
 #[path = "tensor_msl.rs"]
 pub mod msl;
 /// #34's f32 simdgroup-matrix tile (`to_msl_mma`, opt-in via TANG_NATIVE)

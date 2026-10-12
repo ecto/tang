@@ -261,6 +261,9 @@ pub fn random_spd_flat(size: usize) -> Vec<f64> {
 #[path = "ir_msl.rs"]
 pub mod ir_msl;
 
+/// Whole-model compilation: N blocks, loss, backward and AdamW as one graph.
+pub mod ir_model;
+
 pub mod ir_gpu {
     use tang::Scalar;
     use tang_compile::tensor::precision::{f16_bits, f16_from_bits};
@@ -2445,6 +2448,22 @@ pub mod ir_block {
     }
 
     pub fn transformer_block_nodes(dims: &BlockDims) -> (TensorGraph, BlockNodes) {
+        let mut g = TensorGraph::new();
+        let x = g.input(&[dims.seq, dims.d_model]);
+        let (nodes, _) = block_into(&mut g, x, None, dims);
+        (g, nodes)
+    }
+
+    /// Append one block reading `x: [seq, d_model]` to `g`. Its weights
+    /// become new inputs (`INPUTS` order after `x`), and so do the rope
+    /// tables unless `tables` passes shared ones. Returns the block's
+    /// nodes and weights `[wq, wk, wv, wo, w_gate, w_up, w_down]`.
+    pub fn block_into(
+        g: &mut TensorGraph,
+        x: TensorId,
+        tables: Option<(TensorId, TensorId)>,
+        dims: &BlockDims,
+    ) -> (BlockNodes, [TensorId; 7]) {
         let BlockDims {
             seq,
             kv_len,
@@ -2463,8 +2482,6 @@ pub mod ir_block {
         let half = head_dim / 2;
         let kv_dim = n_kv_heads * head_dim;
 
-        let mut g = TensorGraph::new();
-        let x = g.input(&[seq, d_model]);
         let wq = g.input(&[d_model, d_model]);
         let bq = g.input(&[d_model]);
         let wk = g.input(&[kv_dim, d_model]);
@@ -2479,15 +2496,15 @@ pub mod ir_block {
         let b_up = g.input(&[ff_dim]);
         let w_down = g.input(&[d_model, ff_dim]);
         let b_down = g.input(&[d_model]);
-        let cos = g.input(&[seq, half]);
-        let sin = g.input(&[seq, half]);
+        let (cos, sin) = tables.unwrap_or_else(|| (g.input(&[seq, half]), g.input(&[seq, half])));
+        let weights = [wq, wk, wv, wo, w_gate, w_up, w_down];
 
         let caches = decode.then(|| (g.input(&[kv_len, kv_dim]), g.input(&[kv_len, kv_dim])));
 
-        let normed = rmsnorm(&mut g, x);
-        let q = linear(&mut g, normed, wq, b(bq));
+        let normed = rmsnorm(g, x);
+        let q = linear(g, normed, wq, b(bq));
         let scale = 1.0 / (head_dim as f64).sqrt();
-        let (qe, qo) = rope_split(&mut g, q, n_heads, head_dim, cos, sin, scale, rope);
+        let (qe, qo) = rope_split(g, q, n_heads, head_dim, cos, sin, scale, rope);
         let (ke, ko, v) = match caches {
             // cache rows are already rotated: split even/odd by view only
             Some((k_cache, v_cache)) => {
@@ -2509,9 +2526,9 @@ pub mod ir_block {
                 (halves[0], halves[1], v_cache)
             }
             None => {
-                let k = linear(&mut g, normed, wk, b(bk));
-                let v = linear(&mut g, normed, wv, b(bv));
-                let (ke, ko) = rope_split(&mut g, k, n_kv_heads, head_dim, cos, sin, 1.0, rope);
+                let k = linear(g, normed, wk, b(bk));
+                let v = linear(g, normed, wv, b(bv));
+                let (ke, ko) = rope_split(g, k, n_kv_heads, head_dim, cos, sin, 1.0, rope);
                 (ke, ko, v)
             }
         };
@@ -2551,7 +2568,7 @@ pub mod ir_block {
                 |a| vec![a[0] * a[1] + a[2] * a[3]],
             )
             .unwrap();
-        let mask = super::ir_gpu::causal_mask_graph(&mut g, seq, kv_len);
+        let mask = super::ir_gpu::causal_mask_graph(g, seq, kv_len);
         let r4 = 4;
         let masked = g
             .comp(
@@ -2665,18 +2682,17 @@ pub mod ir_block {
             proj
         };
         let res1 = g.map(&[x, bob], |a| a[0] + a[1]).unwrap();
-        let normed2 = rmsnorm(&mut g, res1);
-        let gate = linear(&mut g, normed2, w_gate, b(b_gate));
-        let up = linear(&mut g, normed2, w_up, b(b_up));
+        let normed2 = rmsnorm(g, res1);
+        let gate = linear(g, normed2, w_gate, b(b_gate));
+        let up = linear(g, normed2, w_up, b(b_up));
         let act = g
             .map(&[gate, up], |a| {
                 a[0] / (ExprId::from_f64(1.0) + (-a[0]).exp()) * a[1]
             })
             .unwrap();
-        let ffn = linear(&mut g, act, w_down, b(b_down));
+        let ffn = linear(g, act, w_down, b(b_down));
         let out = g.map(&[res1, ffn], |a| a[0] + a[1]).unwrap();
         (
-            g,
             BlockNodes {
                 normed,
                 q,
@@ -2685,6 +2701,7 @@ pub mod ir_block {
                 proj: bob,
                 out,
             },
+            weights,
         )
     }
 
