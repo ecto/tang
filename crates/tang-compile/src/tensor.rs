@@ -1581,6 +1581,24 @@ impl TensorGraph {
                 for p in shared {
                     self.nodes[p].inline = true;
                 }
+            } else if c.red.len() == 1 && lanes >= 16 && rows {
+                // matmul-shaped: the 16×16 shared-memory tile, with a 4×4
+                // register tile once both axes are wide enough to fill it
+                // (won on an M4 and a 3090 alike; see BENCHMARKS.md)
+                let rows_n = pts
+                    .iter()
+                    .rev()
+                    .filter(|&&n| n > 1)
+                    .nth(1)
+                    .copied()
+                    .unwrap_or(1);
+                let reg = if lanes >= 64 && rows_n >= 64 {
+                    (4, 4)
+                } else {
+                    (1, 1)
+                };
+                self.nodes[i].tile = (16, 16, 32);
+                self.nodes[i].reg = reg;
             } else if pts.iter().product::<usize>() < MANY_POINTS {
                 self.nodes[i].split = 256;
             }
@@ -2067,13 +2085,14 @@ mod tests {
         assert_eq!(g.nodes()[y.n()].split, 0);
         assert_eq!(g.nodes()[y.n()].tile, (0, 0, 0));
 
-        // a plain matmul has nothing to share across lanes -> one thread per point
+        // a plain matmul: 16×16 shared-memory tile, 4×4 register tile when wide
         let mut g = TensorGraph::new();
         let a = g.input(&[256, 128]);
         let b = g.input(&[128, 64]);
         let c = g.matmul(a, b).unwrap();
         g.schedule_auto(&[c]);
-        assert_eq!(g.nodes()[c.n()].tile, (0, 0, 0));
+        assert_eq!(g.nodes()[c.n()].tile, (16, 16, 32));
+        assert_eq!(g.nodes()[c.n()].reg, (4, 4));
         assert_eq!(g.nodes()[c.n()].split, 0);
 
         // attention after the softmax rewrite: scores are lane-invariant -> tiled, scores inlined
