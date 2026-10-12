@@ -441,3 +441,12 @@ wins at these shapes (128×576×1536: tiled 1.39 ms vs one-thread-per-point
 2.66 ms vs hand 2.97 ms) although it lost at 1024². That is the whole
 argument in one table: the right schedule depends on the shape and the
 chip, and measuring beats remembering.
+
+### Derived backward pass
+
+`ir_block_gpu::tests::derived_block_backward_on_gpu` differentiates the
+whole block (`backward` on the algorithm graph), runs the gradient graph
+through `substitute_maps` + `schedule_auto` + `to_wgsl`, and compares the
+GPU gradients w.r.t. the input and `wq` against the f64 interpreter:
+max error 5e-7, 42 kernels. There is no hand-written backward kernel for
+any of it; rope and GQA gradients come out of the `iota`-gated scatter.

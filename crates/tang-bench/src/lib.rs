@@ -1794,6 +1794,68 @@ pub mod ir_block_gpu {
             );
         }
 
+        /// The block's backward graph, lowered and run on the GPU, matches
+        /// the f64 interpreter. No hand-written backward kernel anywhere.
+        #[test]
+        fn derived_block_backward_on_gpu() {
+            let Ok(device) = GpuDevice::new_sync() else {
+                eprintln!("no GPU, skipping");
+                return;
+            };
+            let mut cache = KernelCache::new();
+            let dims = BlockDims {
+                seq: 12,
+                kv_len: 12,
+                d_model: 64,
+                n_heads: 4,
+                n_kv_heads: 2,
+                head_dim: 16,
+                ff_dim: 48,
+            };
+            let mut rng = crate::Rng::new(31);
+            let x: Vec<f32> = (0..dims.seq * dims.d_model)
+                .map(|_| rng.f32() * 2.0 - 1.0)
+                .collect();
+            let p = params(&device, &mut cache, dims, x);
+            let (mut g, out) = transformer_block(&p.dims);
+            use tang_compile::tensor::TensorId;
+            let (xi, wq) = (TensorId::from_index(0), TensorId::from_index(1));
+            let grads = g.backward(out, &[xi, wq]).unwrap();
+
+            let f64_inputs: Vec<Vec<f64>> = p
+                .cpu
+                .iter()
+                .map(|v| v.iter().map(|x| *x as f64).collect())
+                .collect();
+            let want = g.eval(&f64_inputs, &grads);
+
+            let (g, outs) = g.substitute_maps(&grads);
+            let mut g = g;
+            g.schedule_auto(&outs);
+            let program = g.to_wgsl(&outs);
+            let n_kernels = program.kernels.len();
+            let inputs: Vec<&[f32]> = p.cpu.iter().map(|v| v.as_slice()).collect();
+            let exe = Executable::new(&device, program, &inputs);
+            let start = std::time::Instant::now();
+            exe.run(&device, &mut cache);
+            cache.flush(&device);
+            let got: Vec<Vec<f32>> = outs.iter().map(|o| exe.read(&device, *o)).collect();
+            eprintln!(
+                "block backward: {n_kernels} kernels, {:?} incl. readback",
+                start.elapsed()
+            );
+            for (k, (gw, gg)) in want.iter().zip(&got).enumerate() {
+                let scale = gw.iter().fold(0.0f64, |m, v| m.max(v.abs())) as f32;
+                let err = gg
+                    .iter()
+                    .zip(gw)
+                    .map(|(a, b)| (a - *b as f32).abs())
+                    .fold(0.0f32, f32::max);
+                eprintln!("grad {k}: max err {err} (scale {scale})");
+                assert!(err < 2e-3 * scale.max(1.0), "grad {k} diverges");
+            }
+        }
+
         #[test]
         fn derived_decode_block_matches_hand() {
             let Ok(device) = GpuDevice::new_sync() else {
