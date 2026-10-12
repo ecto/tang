@@ -486,6 +486,10 @@ impl TensorGraph {
             if lanes >= 64 && !rows {
                 out.push((0, (lanes.min(256) as u32, 1, 32)));
             }
+            if lanes >= 16 && rows {
+                // the classic shared-memory 2-D tile (matmul-shaped comps)
+                out.push((0, (16, 16, 32)));
+            }
         }
         out
     }

@@ -411,7 +411,17 @@ input. Nothing in the compiler knows what a transformer is.
 `ir_gpu::autotune_kernels` times every thread mapping in
 `schedule_candidates` for each materialized comp on the device, with the
 graph's real inputs in place, and keeps the fastest
-(`examples/block_autotune.rs`). On the transformer block it agrees with
-`schedule_auto` on all 10 kernels at seq 128 and 512: the rules of thumb
-are what the measurements say, and the measurement is there for the next
-chip where they aren't.
+(`examples/block_autotune.rs`). Candidates: one thread per point, a
+256-thread split, rows × lanes, and the classic 16×16 shared-memory tile.
+
+| seq | hand | `schedule_auto` | autotuned |
+|---|---|---|---|
+| 128 | 4.93 ms | 4.07 ms | 4.03 ms |
+| 512 | 24.3 ms | 15.3 ms | **13.5 ms** |
+
+The tuner agrees with `schedule_auto` on every reduction and attention
+kernel and overrides it on three projection matmuls, where the 16×16 tile
+wins at these shapes (128×576×1536: tiled 1.39 ms vs one-thread-per-point
+2.66 ms vs hand 2.97 ms) although it lost at 1024². That is the whole
+argument in one table: the right schedule depends on the shape and the
+chip, and measuring beats remembering.
