@@ -6,10 +6,11 @@ use tang_compile::tensor::TensorGraph;
 use tang_expr::ExprId;
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let dim = |i: usize, d: usize| args.get(i).map_or(d, |s| s.parse().unwrap());
-    let (m, k, n) = (dim(1, 1024), dim(2, 1024), dim(3, 1024));
-    let epilogue = args.get(4).is_some();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let dims: Vec<usize> = args.iter().filter_map(|s| s.parse().ok()).collect();
+    let dim = |i: usize| dims.get(i).copied().unwrap_or(1024);
+    let (m, k, n) = (dim(0), dim(1), dim(2));
+    let epilogue = args.iter().any(|s| s == "epi");
     let mut g = TensorGraph::new();
     let a = g.input(&[m, k]);
     let b = g.input(&[k, n]);
