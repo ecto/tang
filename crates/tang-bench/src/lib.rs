@@ -312,11 +312,13 @@ pub mod ir_gpu {
             &self.buffers[i]
         }
 
-        /// Dispatch every kernel in order.
+        /// Dispatch every kernel in order as one submission.
         pub fn run(&self, device: &GpuDevice, cache: &mut KernelCache) {
+            cache.begin_batch();
             for i in 0..self.program.kernels.len() {
                 self.run_kernel(device, cache, i);
             }
+            cache.flush(device);
         }
 
         /// Dispatch kernel `i` only (its inputs must already be computed).
@@ -743,12 +745,13 @@ pub mod ir_gpu {
                 "tiled" => g.schedule_tile_2d(&[c], 16, 16, 32, 16),
                 "reg2" => g.set_schedule(c, 0, (16, 16, 32), (2, 2)),
                 "reg4" => g.set_schedule(c, 0, (16, 16, 32), (4, 4)),
+                "reg8" => g.set_schedule(c, 0, (16, 16, 32), (8, 8)),
                 "auto" => g.schedule_auto(&[c]),
                 _ => {}
             }
             (g, c)
         };
-        ["naive", "split", "tiled", "reg2", "reg4", "auto"]
+        ["naive", "split", "tiled", "reg2", "reg4", "reg8", "auto"]
             .into_iter()
             .map(|name| {
                 let (g, c) = build(name);
