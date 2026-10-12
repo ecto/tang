@@ -1626,10 +1626,32 @@ at 4 layers, ~4 ms at 30 for 319 / 2399 launches): launch overhead is not
 the bottleneck at seq 128; the kernels are (PyTorch is still 1.6× faster,
 mostly cuBLAS GEMMs and its fused optimizer; see "Toward flash backward").
 Planning does not cost time; on CUDA it is slightly faster (fewer pages
-touched). Compile cost is real: 2399 kernels are 2399 distinct sources
-(node numbers differ per layer; 127–188 are distinct up to renaming), so
-the first wgpu run spends 237 s in shader compilation on the M4 and nvrtc
-takes 56 s on all cores of the 3090 host (cached as PTX in `target/tang-ptx`).
+touched).
+
+**Compile cost: canonical kernels.** Each layer's kernels used to embed
+node numbers in identifiers (`b{j}`, `read_{j}`, `point_{j}`, …), so the
+2399 kernels at 30 layers were 2399 distinct sources. Lowering now
+renumbers those in order of first appearance (`wgsl::canonical_source`,
+in `to_wgsl`, `to_cuda` and `to_msl`); bindings stay in `reads` order,
+so one compiled kernel serves every layer. Every source-keyed cache
+(`KernelCache`, `CudaDevice`, tuning caches) then hits across layers, and
+`CudaDevice` / `PlannedCuda` share an on-disk PTX cache
+(`~/.cache/tang/ptx`, `$TANG_PTX_CACHE`). wgpu's pipeline cache is
+Vulkan-only, so there is no persistent wgpu cache on the M4.
+
+| | before | after |
+|---|---|---|
+| distinct sources, 4 / 30 layers (wgsl) | 319 / 2399 | 92 / 92 |
+| distinct sources, 4 / 30 layers (cuda) | 319 / 2399 | 90 / 90 |
+| M4 wgpu first run, 30 layers (shader compiles) | 232.9 s | 8.4 s |
+| M4 wgpu first run, 4 layers | 29.7 s | 8.1 s |
+| 3090 nvrtc, 30 layers, cold (24 cores) | 49.0 s | 1.4 s |
+| 3090 module load, 30 layers, driver JIT cache off / warm | 35.7 s / 0.62 s | 1.95 s / 0.23 s |
+| 3090 nvrtc, 30 layers, PTX on disk | — | 0.02 s |
+
+Outputs (loss and every updated tensor) are bitwise identical before and
+after on both backends, and step time is unchanged (M4 30 layers naive
+87.7 vs 88.1 ms; 3090 planned + in place, graph, 28.5 vs 28.0 ms).
 
 **Cross-layer fusion.** The existing passes do fire across block
 boundaries, and the result is a warning. `substitute_maps` sees the

@@ -537,7 +537,7 @@ impl TensorGraph {
     /// lowerings on or off. Both programs have the same kernels in the
     /// same order with the same bindings, so a tuner can pick per kernel.
     pub fn to_cuda_with(&self, outputs: &[TensorId], native: bool) -> WgslProgram {
-        let mut program = self.to_program(outputs, Target::Wgsl);
+        let mut program = self.to_program_numbered(outputs, Target::Wgsl);
         for k in &mut program.kernels {
             let root = k.node.index();
             let reads: Vec<usize> = k.reads.iter().map(|t| t.index()).collect();
@@ -560,7 +560,7 @@ impl TensorGraph {
                 None => k.source = wgsl_to_cuda(&k.source, k.workgroup_size),
             }
         }
-        program
+        program.canonical()
     }
 }
 

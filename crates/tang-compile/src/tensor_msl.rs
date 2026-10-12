@@ -134,8 +134,8 @@ impl TensorGraph {
     /// [`fragment_plan`](Self::fragment_plan)) run on matrix fragments.
     pub fn to_msl_for(&self, outputs: &[TensorId], target: &FragmentTarget) -> MslProgram {
         with_dialect(Dialect::Msl, || {
-            let w = self.to_wgsl(outputs);
-            let kernels = w
+            let w = self.to_program_numbered(outputs, super::wgsl::Target::Wgsl);
+            let kernels: Vec<MslKernel> = w
                 .kernels
                 .into_iter()
                 .map(|k| {
@@ -161,6 +161,13 @@ impl TensorGraph {
                         threads: k.workgroup_size,
                         fragment: false,
                     }
+                })
+                .collect();
+            let kernels = kernels
+                .into_iter()
+                .map(|mut k| {
+                    k.source = super::wgsl::canonical_source(&k.source);
+                    k
                 })
                 .collect();
             MslProgram {

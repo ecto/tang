@@ -28,6 +28,100 @@ pub struct CudaDevice {
     functions: RefCell<HashMap<String, CudaFunction>>,
 }
 
+/// FNV-1a, for cache file names stable across processes and builds.
+fn fnv64(parts: &[&str]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for p in parts {
+        for b in p.bytes().chain([0xff]) {
+            h = (h ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// The on-disk PTX cache: `$TANG_PTX_CACHE`, else
+/// `$XDG_CACHE_HOME/tang/ptx` or `~/.cache/tang/ptx`; `None` (no disk
+/// cache) when `TANG_PTX_CACHE` is empty or there is no home.
+pub fn ptx_cache_dir() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    match std::env::var_os("TANG_PTX_CACHE") {
+        Some(d) if d.is_empty() => None,
+        Some(d) => Some(PathBuf::from(d)),
+        None => std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+            .map(|c| c.join("tang/ptx")),
+    }
+}
+
+/// `<cache>/<hash>.ptx` for `source` on `arch`, with the source beside it
+/// (`.cu`) to rule out hash collisions.
+fn ptx_paths(source: &str, arch: &str) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let (major, minor) = nvrtc_version();
+    let v = format!("{major}.{minor}");
+    let stem = format!("{:016x}", fnv64(&[source, arch, &v]));
+    let dir = ptx_cache_dir()?;
+    Some((
+        dir.join(format!("{stem}.ptx")),
+        dir.join(format!("{stem}.cu")),
+    ))
+}
+
+fn nvrtc_version() -> (i32, i32) {
+    let (mut major, mut minor) = (0, 0);
+    unsafe { cudarc::nvrtc::sys::nvrtcVersion(&mut major, &mut minor) };
+    (major, minor)
+}
+
+/// Whether [`ptx`] would compile `source` (it is not on disk).
+pub fn ptx_cached(source: &str, arch: &str) -> bool {
+    ptx_paths(source, arch).is_some_and(|(ptx, cu)| {
+        ptx.exists() && std::fs::read_to_string(cu).is_ok_and(|s| s == source)
+    })
+}
+
+/// PTX for `source` on `arch` (e.g. `"sm_86"`): from the on-disk cache
+/// ([`ptx_cache_dir`]), else nvrtc, written back. Needs no device, so a
+/// caller can fill the cache from many threads up front.
+pub fn ptx(source: &str, arch: &'static str) -> String {
+    let paths = ptx_paths(source, arch);
+    if let Some((ptx, cu)) = &paths {
+        if std::fs::read_to_string(cu).is_ok_and(|s| s == source) {
+            if let Ok(p) = std::fs::read_to_string(ptx) {
+                return p;
+            }
+        }
+    }
+    let include = std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".into());
+    let opts = CompileOptions {
+        arch: Some(arch),
+        include_paths: vec![format!("{include}/include")],
+        ..Default::default()
+    };
+    let out = compile_ptx_with_opts(source, opts)
+        .unwrap_or_else(|e| panic!("nvrtc: {e:?}\n{source}"))
+        .to_src();
+    if let Some((ptx, cu)) = paths {
+        // write-then-rename so concurrent writers never expose a torn file
+        let tmp = |p: &std::path::Path| {
+            p.with_extension(format!(
+                "tmp{}.{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ))
+        };
+        let put = |p: &std::path::Path, data: &str| -> std::io::Result<()> {
+            let t = tmp(p);
+            std::fs::write(&t, data)?;
+            std::fs::rename(&t, p)
+        };
+        let _ = std::fs::create_dir_all(ptx.parent().unwrap())
+            .and_then(|_| put(&ptx, &out))
+            .and_then(|_| put(&cu, source));
+    }
+    out
+}
+
 /// `#define TANG_SMEM n` in a kernel's source: its dynamic shared memory
 /// in bytes (0 when absent).
 pub fn dynamic_smem(src: &str) -> u32 {
@@ -82,14 +176,7 @@ impl CudaDevice {
         if let Some(f) = self.functions.borrow().get(source) {
             return f.clone();
         }
-        let include = std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".into());
-        let opts = CompileOptions {
-            arch: Some(self.arch),
-            include_paths: vec![format!("{include}/include")],
-            ..Default::default()
-        };
-        let ptx = compile_ptx_with_opts(source, opts)
-            .unwrap_or_else(|e| panic!("nvrtc: {e:?}\n{source}"));
+        let ptx = cudarc::nvrtc::Ptx::from_src(ptx(source, self.arch));
         let module = self.ctx.load_module(ptx).expect("load module");
         let f = module
             .load_function(tang_compile::tensor::cuda::CUDA_ENTRY)

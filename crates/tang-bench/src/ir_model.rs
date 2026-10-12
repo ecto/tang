@@ -328,6 +328,8 @@ pub fn canonical_source(src: &str) -> String {
 pub struct ProgramStats {
     pub kernels: usize,
     pub unique_kernels: usize,
+    /// distinct sources as emitted: what a source-keyed cache compiles
+    pub distinct_sources: usize,
     pub buffers: usize,
 }
 
@@ -339,9 +341,12 @@ pub fn program_stats(prog: &WgslProgram) -> ProgramStats {
         .collect();
     uniq.sort();
     uniq.dedup();
+    let distinct: std::collections::HashSet<&str> =
+        prog.kernels.iter().map(|k| k.source.as_str()).collect();
     ProgramStats {
         kernels: prog.kernels.len(),
         unique_kernels: uniq.len(),
+        distinct_sources: distinct.len(),
         buffers: prog.buffers.len(),
     }
 }
@@ -443,7 +448,6 @@ pub mod cuda {
     use tang_gpu::cudarc::driver::{
         CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
     };
-    use tang_gpu::cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 
     fn dynamic_smem(src: &str) -> u32 {
         src.lines()
@@ -452,53 +456,28 @@ pub mod cuda {
             .unwrap_or(0)
     }
 
-    /// Where the PTX for `source` is cached (`target/tang-ptx/<hash>.ptx`).
-    fn ptx_path(source: &str) -> std::path::PathBuf {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        source.hash(&mut h);
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tang-ptx");
-        dir.join(format!("{:016x}.ptx", h.finish()))
-    }
-
-    /// nvrtc every distinct kernel of `program` not yet in the PTX cache,
-    /// on all cores. Needs no GPU, so it can run outside a GPU lock.
+    /// nvrtc every distinct kernel of `program` not yet in tang-gpu's
+    /// on-disk PTX cache (`tang_gpu::cuda::ptx_cache_dir`), on all cores.
+    /// Needs no GPU, so it can run outside a GPU lock.
     pub fn compile_all(program: &WgslProgram) {
-        let include = std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".into());
-        let mut todo: Vec<&str> = program
-            .kernels
-            .iter()
-            .map(|k| k.source.as_str())
-            .filter(|s| !ptx_path(s).exists())
-            .collect();
+        let mut todo: Vec<&str> = program.kernels.iter().map(|k| k.source.as_str()).collect();
         todo.sort();
         todo.dedup();
-        if todo.is_empty() {
-            return;
-        }
-        std::fs::create_dir_all(ptx_path("").parent().unwrap()).expect("ptx cache dir");
+        todo.retain(|s| !tang_gpu::cuda::ptx_cached(s, ARCH));
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
         let next = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|s| {
-            for _ in 0..threads {
+            for _ in 0..threads.min(todo.len()) {
                 s.spawn(|| loop {
                     let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(src) = todo.get(i) else { break };
-                    let opts = CompileOptions {
-                        arch: Some("sm_86"),
-                        include_paths: vec![format!("{include}/include")],
-                        ..Default::default()
-                    };
-                    let ptx = compile_ptx_with_opts(src, opts)
-                        .unwrap_or_else(|e| panic!("nvrtc: {e:?}\n{src}"));
-                    let path = ptx_path(src);
-                    let tmp = path.with_extension(format!("tmp{i}"));
-                    std::fs::write(&tmp, ptx.to_src()).expect("write ptx");
-                    std::fs::rename(&tmp, &path).expect("rename ptx");
+                    tang_gpu::cuda::ptx(src, ARCH);
                 });
             }
         });
     }
+
+    const ARCH: &str = "sm_86";
 
     pub struct PlannedCuda {
         pub program: WgslProgram,
@@ -541,7 +520,7 @@ pub mod cuda {
                     functions.push(f.clone());
                     continue;
                 }
-                let ptx = std::fs::read_to_string(ptx_path(&k.source)).expect("cached ptx");
+                let ptx = tang_gpu::cuda::ptx(&k.source, ARCH);
                 let module = ctx
                     .load_module(tang_gpu::cudarc::nvrtc::Ptx::from_src(ptx))
                     .expect("load module");
@@ -720,6 +699,27 @@ mod tests {
         let plan = g.plan_memory(&prog, &couts, &donations(&g, &step, &couts));
         assert_eq!(plan.inplace.len(), 3 * step.params.len());
         assert!(plan.stats.planned_bytes < MemoryPlan::naive(&prog).stats.planned_bytes);
+    }
+
+    /// Layers are the same kernels at other node numbers: emitted sources
+    /// are canonical, so 30 stacked layers have no more distinct sources
+    /// than 4 (one compile per distinct kernel, not per layer).
+    #[test]
+    fn distinct_sources_do_not_grow_with_depth() {
+        let distinct = |layers| {
+            let step = train_step(&tiny(), layers, AdamW::default());
+            let outs = step.outputs();
+            let (g, couts) = compile_with_barriers(&step.graph, &outs, &step.boundaries);
+            let s = program_stats(&g.to_wgsl(&couts));
+            assert!(s.kernels > 6 * layers);
+            let c = program_stats(&g.to_cuda(&couts));
+            (s.distinct_sources, c.distinct_sources)
+        };
+        let (d4, d30) = (distinct(4), distinct(30));
+        assert_eq!(
+            d4, d30,
+            "distinct (wgsl, cuda) sources: 4 layers {d4:?}, 30 layers {d30:?}"
+        );
     }
 
     #[test]

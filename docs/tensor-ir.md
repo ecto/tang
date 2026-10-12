@@ -265,6 +265,15 @@ let y = p.read(&rt, outs[0]);
   file keyed by the device and both programs' sources (the CUDA analogue
   of `TuningCache`; the WGSL schedule autotuner still runs on the graph,
   before lowering).
+- Kernel sources are canonical (`wgsl::canonical_source`, applied by
+  `to_program`, `to_cuda` and `to_msl`): node numbers in identifiers
+  (`b{j}`, `read_{j}`, `body_{j}`, `point_{j}`, `combine_{j}`) are
+  renumbered in order of first appearance, so the same kernel at other
+  nodes (another layer) is the same string and binds its buffers by
+  `reads` order. Source-keyed caches — `KernelCache`, `CudaDevice`,
+  the tuning caches — then compile once per distinct kernel, not per
+  layer. `CudaDevice` also keeps PTX on disk (`cuda::ptx`, under
+  `$TANG_PTX_CACHE` or `~/.cache/tang/ptx`; empty disables it).
 - Interop: a program lives on one backend. Programs on the same runtime
   pass tensors with device copies; anything else is an explicit host
   round trip (`read`/`write`). On wgpu, `wgpu_buffer(t)` hands buffers to
