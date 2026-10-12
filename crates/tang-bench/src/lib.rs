@@ -2231,8 +2231,31 @@ pub mod ir_cuda {
         }
 
         /// Milliseconds per launch of kernel `i` alone.
+        /// Kernel `i`'s own time: the minimum over `5 * iters` single
+        /// launches, each bracketed by events. On a time-sliced GPU a
+        /// batch of launches almost always straddles another tenant's
+        /// slice; a single short launch usually does not.
         pub fn time_kernel(&self, i: usize, iters: usize) -> f64 {
-            self.time_with(iters, |e| e.run_kernel(i))
+            use cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT;
+            for _ in 0..3 {
+                self.run_kernel(i);
+            }
+            self.stream.synchronize().expect("sync");
+            (0..5 * iters)
+                .map(|_| {
+                    let a = self
+                        .stream
+                        .record_event(Some(CU_EVENT_DEFAULT))
+                        .expect("event");
+                    self.run_kernel(i);
+                    let b = self
+                        .stream
+                        .record_event(Some(CU_EVENT_DEFAULT))
+                        .expect("event");
+                    b.synchronize().expect("sync");
+                    a.elapsed_ms(&b).expect("elapsed") as f64
+                })
+                .fold(f64::INFINITY, f64::min)
         }
 
         /// The minimum over five batches of `iters` launches: a shared GPU
