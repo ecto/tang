@@ -518,7 +518,8 @@ pub mod cuda {
             plan: MemoryPlan,
             inputs: &[Vec<f32>],
         ) -> Self {
-            let stream = ctx.default_stream();
+            // the legacy default stream cannot be captured into a graph
+            let stream = ctx.new_stream().expect("stream");
             let slots = plan
                 .slot_words
                 .iter()
