@@ -193,21 +193,21 @@ impl TensorGraph {
         writeln!(s, "    let tid = lid.x;").unwrap();
         writeln!(s, "    if (g >= params.count) {{ return; }}").unwrap();
         emit_decompose(&mut s, "g", &fixed(c.points()), "p");
-        writeln!(s, "    var acc = array<f32, {w}>({});", identity(m)).unwrap();
+        emit_scalar_acc(&mut s, "    ", m);
         writeln!(
             s,
             "    for (var ri: u32 = tid; ri < {r_total}u; ri = ri + {split}u) {{"
         )
         .unwrap();
         emit_decompose(&mut s, "ri", &fixed(&c.red), "r");
-        writeln!(
-            s,
-            "        acc = combine_{root}(acc, body_{root}({}));",
-            arg_reads(c)
-        )
-        .unwrap();
+        emit_step(
+            &mut s,
+            "        ",
+            &format!("body_{root}({})", arg_reads(c)),
+            m,
+        );
         writeln!(s, "    }}").unwrap();
-        writeln!(s, "    wg_acc[tid] = acc;").unwrap();
+        writeln!(s, "    wg_acc[tid] = {};", acc_array(w)).unwrap();
         writeln!(s, "    workgroupBarrier();").unwrap();
         writeln!(
             s,
@@ -301,7 +301,7 @@ impl TensorGraph {
             writeln!(s, "}}\n").unwrap();
             return;
         };
-        writeln!(s, "    var acc = array<f32, {w}>({});", identity(m)).unwrap();
+        emit_scalar_acc(s, "    ", m);
         let mut indent = String::from("    ");
         for (i, n) in fixed(&c.red).into_iter().enumerate() {
             writeln!(
@@ -311,14 +311,87 @@ impl TensorGraph {
             .unwrap();
             indent.push_str("    ");
         }
-        writeln!(s, "{indent}acc = combine_{j}(acc, body_{j}({reads}));").unwrap();
+        emit_step(s, &indent, &format!("body_{j}({reads})"), m);
         for _ in &c.red {
             indent.truncate(indent.len() - 4);
             writeln!(s, "{indent}}}").unwrap();
         }
-        writeln!(s, "    return acc;").unwrap();
+        writeln!(s, "    return {};", acc_array(w)).unwrap();
         writeln!(s, "}}\n").unwrap();
     }
+}
+
+/// `var acc0: f32 = id0; …` — accumulator slots as scalars, so the
+/// combine runs in registers instead of copying `array<f32, W>` values.
+fn emit_scalar_acc(s: &mut String, indent: &str, m: &Monoid) {
+    for (i, v) in m.identity.iter().enumerate() {
+        writeln!(s, "{indent}var acc{i}: f32 = {};", lit(*v)).unwrap();
+    }
+}
+
+fn acc_array(w: usize) -> String {
+    let slots = (0..w)
+        .map(|i| format!("acc{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("array<f32, {w}>({slots})")
+}
+
+/// One reduction step: evaluate `elem` (an `array<f32, W>` expression)
+/// and fold it into the scalar accumulators with the combine inlined.
+fn emit_step(s: &mut String, indent: &str, elem: &str, m: &Monoid) {
+    let w = m.width;
+    writeln!(s, "{indent}let el = {elem};").unwrap();
+    let outs = emit_scalar_mapped(s, indent, &m.combine, &m.outs, "k", &|v| {
+        if (v as usize) < w {
+            format!("acc{v}")
+        } else {
+            format!("el[{}]", v as usize - w)
+        }
+    });
+    for (i, o) in outs.iter().enumerate() {
+        writeln!(s, "{indent}let nx{i} = {o};").unwrap();
+    }
+    for i in 0..w {
+        writeln!(s, "{indent}acc{i} = nx{i};").unwrap();
+    }
+}
+
+/// Emit `let {prefix}{i} = …;` for the live nodes of `g` and return the
+/// expressions for `outs`; `var_expr` names input var `i`.
+fn emit_scalar_mapped(
+    s: &mut String,
+    indent: &str,
+    g: &ExprGraph,
+    outs: &[ExprId],
+    prefix: &str,
+    var_expr: &dyn Fn(u16) -> String,
+) -> Vec<String> {
+    let mut live: Vec<usize> = g.live_set(outs).into_iter().collect();
+    live.sort_unstable();
+    let nodes = g.nodes_slice();
+    let e = |id: &ExprId| match nodes[id.index() as usize] {
+        Node::Var(v) => var_expr(v),
+        _ => format!("{prefix}{}", id.index()),
+    };
+    for i in live {
+        let rhs = match &nodes[i] {
+            Node::Var(_) => continue,
+            Node::Lit(b) => lit(f64::from_bits(*b)),
+            Node::Add(a, b) => format!("{} + {}", e(a), e(b)),
+            Node::Mul(a, b) => format!("{} * {}", e(a), e(b)),
+            Node::Neg(a) => format!("-{}", e(a)),
+            Node::Recip(a) => format!("1.0 / {}", e(a)),
+            Node::Sqrt(a) => format!("sqrt({})", e(a)),
+            Node::Sin(a) => format!("sin({})", e(a)),
+            Node::Atan2(a, b) => format!("atan2({}, {})", e(a), e(b)),
+            Node::Exp2(a) => format!("exp2({})", e(a)),
+            Node::Log2(a) => format!("log2({})", e(a)),
+            Node::Select(c, a, b) => format!("select({}, {}, {} > 0.0)", e(b), e(a), e(c)),
+        };
+        writeln!(s, "{indent}let {prefix}{i} = {rhs};").unwrap();
+    }
+    outs.iter().map(e).collect()
 }
 
 pub(super) fn identity(m: &Monoid) -> String {

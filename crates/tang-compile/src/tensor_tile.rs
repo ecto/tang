@@ -93,6 +93,39 @@ impl Region {
     }
 }
 
+/// A per-thread, reduce-invariant read: loaded once before the reduce
+/// loop into a private array indexed by the inner loop vars.
+struct Hoist {
+    buffer: usize,
+    /// (var, coefficient) for every var in the address (point coords and
+    /// inner vars; no `r0`), sorted
+    coefs: Vec<(String, i64)>,
+    lo: i64,
+    hi: i64,
+    /// (inner var, extent) in `coefs` order, inner vars only
+    inner: Vec<(String, usize)>,
+}
+
+impl Hoist {
+    fn span(&self) -> usize {
+        (self.hi - self.lo + 1) as usize
+    }
+    fn len(&self) -> usize {
+        self.inner.iter().map(|(_, e)| *e).product::<usize>() * self.span()
+    }
+}
+
+/// An inlined comp whose point coordinates depend on the reduce var but
+/// not on the lane (x) axis: computed cooperatively once per chunk into
+/// workgroup memory, indexed by `(ly, t)`.
+struct CompRegion {
+    node: usize,
+    /// point coords with `r0` and `py` as symbols
+    coords: Vec<Sym>,
+    width: usize,
+    uses_py: bool,
+}
+
 enum Val {
     Expr(String),
     Arr(String),
@@ -118,6 +151,10 @@ struct Ctx<'a> {
     /// extents of inner loop vars
     extents: BTreeMap<String, usize>,
     regions: Vec<Region>,
+    hoists: Vec<Hoist>,
+    comp_regions: Vec<CompRegion>,
+    /// inside a cooperative load loop: every read goes straight to its buffer
+    in_load: bool,
     /// first pass collects regions, second emits against them
     collect: bool,
     counter: usize,
@@ -131,6 +168,9 @@ impl Ctx<'_> {
 
     /// Read of buffer-backed node `j` at an address.
     fn buffer_read(&mut self, j: usize, addr: Sym) -> String {
+        if self.in_load {
+            return format!("b{j}[{}]", addr.wgsl());
+        }
         let px = addr.terms.get(&self.px).copied().unwrap_or(0);
         let py = self
             .py
@@ -140,6 +180,10 @@ impl Ctx<'_> {
             .unwrap_or(0);
         let shared = addr.terms.contains_key("r0") && (px == 0 || py == 0);
         if !shared {
+            let has_inner = addr.terms.keys().any(|k| !k.starts_with('p') && k != "r0");
+            if !addr.terms.contains_key("r0") && has_inner {
+                return self.hoisted_read(j, addr);
+            }
             return format!("b{j}[{}]", addr.wgsl());
         }
         let is_tiled = |k: &str| k == self.px || self.py.as_deref() == Some(k);
@@ -204,6 +248,52 @@ impl Ctx<'_> {
         )
     }
 
+    /// A read that does not depend on the reduce var: served from a
+    /// private array filled once per thread.
+    fn hoisted_read(&mut self, j: usize, addr: Sym) -> String {
+        let coefs: Vec<(String, i64)> = addr.terms.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        let idx = match self
+            .hoists
+            .iter()
+            .position(|h| h.buffer == j && h.coefs == coefs)
+        {
+            Some(i) => {
+                let h = &mut self.hoists[i];
+                h.lo = h.lo.min(addr.offset);
+                h.hi = h.hi.max(addr.offset);
+                i
+            }
+            None => {
+                let inner = coefs
+                    .iter()
+                    .filter(|(k, _)| !k.starts_with('p'))
+                    .map(|(k, _)| (k.clone(), self.extents[k]))
+                    .collect();
+                self.hoists.push(Hoist {
+                    buffer: j,
+                    coefs,
+                    lo: addr.offset,
+                    hi: addr.offset,
+                    inner,
+                });
+                self.hoists.len() - 1
+            }
+        };
+        if self.collect {
+            return String::new();
+        }
+        let h = &self.hoists[idx];
+        let mut flat = String::from("0u");
+        for (name, ext) in &h.inner {
+            flat = format!("({flat}) * {ext}u + {name}");
+        }
+        format!(
+            "hoist_{idx}[({flat}) * {}u + {}u]",
+            h.span(),
+            addr.offset - h.lo
+        )
+    }
+
     /// Value of node `j` at full-shape coordinates `coords`.
     fn expand(&mut self, out: &mut String, j: usize, coords: &[Sym]) -> Val {
         let node = &self.g.nodes[j];
@@ -217,6 +307,43 @@ impl Ctx<'_> {
                 let mut addr = flat(&coords[..k], &fixed(c.points())).scaled(c.width() as i64);
                 addr.add(&flat(&coords[k..], &fixed(&c.out[k..])));
                 Val::Expr(self.buffer_read(j, addr))
+            }
+            Op::Comp(c)
+                if !self.in_load && self.is_workgroup_shared(&coords[..c.points().len()]) =>
+            {
+                let k = c.points().len();
+                let w = c.width();
+                let pts: Vec<Sym> = coords[..k].to_vec();
+                let uses_py = self
+                    .py
+                    .as_ref()
+                    .is_some_and(|py| pts.iter().any(|c| c.terms.contains_key(py)));
+                let idx = match self
+                    .comp_regions
+                    .iter()
+                    .position(|r| r.node == j && r.coords == pts)
+                {
+                    Some(i) => i,
+                    None => {
+                        self.comp_regions.push(CompRegion {
+                            node: j,
+                            coords: pts,
+                            width: w,
+                            uses_py,
+                        });
+                        self.comp_regions.len() - 1
+                    }
+                };
+                if self.collect {
+                    return Val::Expr(String::new());
+                }
+                let slot = flat(&coords[k..], &fixed(&c.out[k..]));
+                let row = if uses_py { "ty" } else { "0u" };
+                Val::Expr(format!(
+                    "cstage_{idx}[(({row}) * {}u + (r0 - chunk)) * {w}u + {}]",
+                    self.chunk,
+                    slot.wgsl()
+                ))
             }
             Op::Comp(c) => {
                 let k = c.points().len();
@@ -297,6 +424,16 @@ impl Ctx<'_> {
                 v.slot(&slot)
             })
             .collect()
+    }
+
+    /// Point coords that vary with the reduce var but not the lane axis.
+    fn is_workgroup_shared(&self, pts: &[Sym]) -> bool {
+        let on_r0 = pts.iter().any(|c| c.terms.contains_key("r0"));
+        let on_px = pts.iter().any(|c| c.terms.contains_key(&self.px));
+        let inner = pts
+            .iter()
+            .any(|c| c.terms.keys().any(|k| k != "r0" && !k.starts_with('p')));
+        on_r0 && !on_px && !inner && self.bx > 1
     }
 
     fn tuple_rank(&self, j: usize) -> usize {
@@ -390,6 +527,9 @@ impl TensorGraph {
             chunk,
             extents: BTreeMap::new(),
             regions: Vec::new(),
+            hoists: Vec::new(),
+            comp_regions: Vec::new(),
+            in_load: false,
             collect: true,
             counter: 0,
         };
@@ -434,6 +574,59 @@ impl TensorGraph {
             )
             .unwrap();
         }
+        // Cooperative loads for shared comps are expanded in the load
+        // phase with r0 := chunk + t and py := tile_y*by + ly.
+        let mut comp_loads: Vec<(usize, String)> = Vec::new();
+        for i in 0..ctx.comp_regions.len() {
+            let r = &ctx.comp_regions[i];
+            let rows = if r.uses_py { by } else { 1 };
+            writeln!(
+                s,
+                "var<workgroup> cstage_{i}: array<f32, {}>;",
+                rows * chunk * r.width
+            )
+            .unwrap();
+            let mut sub = |c: &Sym| {
+                let mut out = Sym {
+                    offset: c.offset,
+                    ..Default::default()
+                };
+                for (k, v) in &c.terms {
+                    if k == "r0" {
+                        out.add(&Sym::var("chunk").scaled(*v));
+                        out.add(&Sym::var("t").scaled(*v));
+                    } else if Some(k) == ctx.py.as_ref() {
+                        out.add(&Sym::var("gy").scaled(*v));
+                    } else {
+                        out.add(&Sym::var(k).scaled(*v));
+                    }
+                }
+                out
+            };
+            let coords: Vec<Sym> = r.coords.iter().map(&mut sub).collect();
+            let node = r.node;
+            let width = r.width;
+            let mut code = String::new();
+            ctx.in_load = true;
+            let saved = ctx.counter;
+            ctx.counter = 1000 * (i + 1);
+            let v = ctx.expand(&mut code, node, &coords);
+            ctx.counter = saved;
+            ctx.in_load = false;
+            for slot in 0..width {
+                let sl = Sym {
+                    offset: slot as i64,
+                    ..Default::default()
+                };
+                writeln!(
+                    code,
+                    "cstage_{i}[((ly) * {chunk}u + t) * {width}u + {slot}u] = {};",
+                    v.slot(&sl)
+                )
+                .unwrap();
+            }
+            comp_loads.push((rows, code));
+        }
 
         writeln!(s, "@compute @workgroup_size({threads})").unwrap();
         writeln!(
@@ -459,6 +652,37 @@ impl TensorGraph {
         writeln!(s, "    let p{dx} = min(x_raw, {}u);", nx - 1).unwrap();
         if let Some(dy) = dy {
             writeln!(s, "    let p{dy} = min(y_raw, {}u);", ny - 1).unwrap();
+        }
+        for (i, h) in ctx.hoists.iter().enumerate() {
+            writeln!(s, "    var hoist_{i}: array<f32, {}>;", h.len()).unwrap();
+            writeln!(s, "    {{").unwrap();
+            let mut flat = String::from("0u");
+            for (name, ext) in &h.inner {
+                writeln!(
+                    s,
+                    "    for (var {name}: u32 = 0u; {name} < {ext}u; {name} = {name} + 1u) {{"
+                )
+                .unwrap();
+                flat = format!("({flat}) * {ext}u + {name}");
+            }
+            let span = h.span();
+            let addr = h
+                .coefs
+                .iter()
+                .map(|(k, c)| format!(" + {c} * i32({k})"))
+                .collect::<String>();
+            writeln!(s, "    for (var o: u32 = 0u; o < {span}u; o = o + 1u) {{").unwrap();
+            writeln!(
+                s,
+                "        hoist_{i}[({flat}) * {span}u + o] = b{}[u32({}{addr} + i32(o))];",
+                h.buffer, h.lo
+            )
+            .unwrap();
+            writeln!(s, "    }}").unwrap();
+            for _ in &h.inner {
+                writeln!(s, "    }}").unwrap();
+            }
+            writeln!(s, "    }}").unwrap();
         }
         writeln!(s, "    var acc = array<f32, {w}>({});", identity(m)).unwrap();
         writeln!(
@@ -511,6 +735,29 @@ impl TensorGraph {
             .unwrap();
             writeln!(s, "            }}").unwrap();
             writeln!(s, "        }}").unwrap();
+        }
+        for (i, (rows, code)) in comp_loads.iter().enumerate() {
+            let total = rows * chunk;
+            writeln!(
+                s,
+                "        for (var idx: u32 = tid; idx < {total}u; idx = idx + {threads}u) {{"
+            )
+            .unwrap();
+            writeln!(s, "            let t = idx % {chunk}u;").unwrap();
+            writeln!(s, "            let ly = idx / {chunk}u;").unwrap();
+            writeln!(
+                s,
+                "            let gy = min(tile_y * {by}u + ly, {}u);",
+                ny - 1
+            )
+            .unwrap();
+            writeln!(s, "            if (chunk + t < {r_total}u) {{").unwrap();
+            for line in code.lines() {
+                writeln!(s, "                {line}").unwrap();
+            }
+            writeln!(s, "            }}").unwrap();
+            writeln!(s, "        }}").unwrap();
+            let _ = i;
         }
         writeln!(s, "        workgroupBarrier();").unwrap();
         writeln!(

@@ -305,27 +305,32 @@ Single head, d = 64, f32. `hand` is `kv_attention_fused`. The `ir_*`
 columns are the same naive `softmax(q·kᵀ/√d + mask)·v` graph under
 different compiler schedules: `naive` materializes the n×n scores;
 `flash` is after `substitute_maps` + `stabilize_softmax` (one
-online-softmax reduction, q·k recomputed inside, nothing n×n in memory);
-`split` adds a 256-thread tree reduction per row; `tiled` adds 64 rows per
-workgroup with k/v staged in workgroup memory. Times include ~1.3 ms of
-submit + readback.
+online-softmax reduction over `[rows, value-columns]` points with q·k
+recomputed inside, nothing n×n in memory); `split` adds a 256-thread tree
+reduction per point; `tiled` is `schedule_tile_2d` with 64 value-column
+lanes × 4 rows per workgroup, the k/v tiles *and the q·k scores* staged
+cooperatively in workgroup memory per 32-key chunk. Times include ~1.3 ms
+of submit + readback; `autotune`'s kernel-only timing of `tiled` at
+n = 1024 is ~0.5 ms.
 
 | n | hand | ir_naive | ir_flash | ir_flash_split | ir_flash_tiled |
 |---|---|---|---|---|---|
-| 128 | 1.34 ms | 1.67 ms | 1.33 ms | 3.58 ms | 1.34 ms |
-| 512 | 4.09 ms | **2.26 ms** | 4.15 ms | 3.88 ms | 4.22 ms |
-| 1024 | 10.6 ms | **3.56 ms** | 7.74 ms | 6.84 ms | 8.05 ms |
+| 128 | 1.33 ms | 1.68 ms | 1.33 ms | 3.6 ms | 1.40 ms |
+| 512 | 4.26 ms | 2.30 ms | 4.15 ms | 5.1 ms | **2.99 ms** |
+| 1024 | 10.3 ms | 3.9 ms | 7.7 ms | 16.5 ms | **1.35 ms** |
 
 Takeaways:
 
-- Every derived schedule matches the hand kernel's output; none of them
-  contains attention-specific code.
-- The derived flash kernels beat the hand-written one at n = 1024.
-- On this chip at these sizes the *naive* schedule wins: the n×n buffer
-  (4 MB) is cheap, and n² threads beat n workgroups. Memory traffic is not
-  the bottleneck; parallelism is. Which schedule is best is a property of
-  the (graph, device, size) triple — hence `ir_gpu::autotune`, which tries
-  the candidates on the device and keeps the fastest.
+- Every derived schedule matches the hand kernel's output (checked at
+  n = 100, 512, 1024); none contains attention-specific code.
+- The tiled schedule is flash attention's real structure — rows × lanes,
+  cooperative score tiles, online softmax — and it came out of three
+  general rules: substitution, the online-softmax monoid rewrite, and
+  "stage anything the lane axis does not depend on". At n = 1024 it is
+  7.6× faster than the hand kernel and ~3× faster than the naive graph.
+- The lane layout is only good *with* tiling: `split` recomputes the
+  scores per lane and regresses. Schedules are not independent of the
+  algebra, which is why `schedule_auto` looks for a lane axis first.
 
 ### GPU: hand-written matmul vs matmul derived from tensor IR
 
@@ -368,10 +373,11 @@ rather than a fixed heuristic.
 ### `schedule_auto`
 
 A fixed rule distilled from the tables above: a materialized reduction
-with fewer than 2¹⁴ output points and a reduce axis of at least 64 is
-split across a 256-thread workgroup; everything else stays one thread per
-point. It picks split for the attention reduction and rmsnorm and naive
-for matmul, landing within noise of the best hand-picked schedule in each
-case (attention 5.30 ms vs split 5.47; rmsnorm 2.31 vs 2.30; matmul
-5.36 vs naive 5.45). It does not choose between algebras — materialized
-scores vs online softmax — which is still `autotune`'s job.
+whose points end in a lane axis (16–256 wide, with rows above it) is
+tiled rows × lanes with cooperative staging; otherwise one with fewer than
+2¹⁴ points and a reduce axis ≥ 64 is split across a 256-thread workgroup;
+everything else stays one thread per point. It lands within noise of the
+best hand-picked schedule for attention (tiled), rmsnorm (split) and
+matmul (naive-ish; the tile does not pay here). It does not choose between
+algebras — materialized scores vs online softmax — which is `autotune`'s
+job.

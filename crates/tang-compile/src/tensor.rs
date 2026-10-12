@@ -929,77 +929,107 @@ impl TensorGraph {
         for ((m_node, _), members) in groups {
             let mc = self.comp_at(m_node).unwrap();
             let m_out = mc.out.len();
-            let fused_rank = m_out + 1;
+
+            // Extra out dims of members (e.g. the value column of Σ_j p·v)
+            // become point dims of the fused comp, so a lane per column
+            // can share the reduction. All members must agree on them.
+            let member_extra: Vec<(Vec<Option<usize>>, Vec<usize>)> = members
+                .iter()
+                .map(|mem| {
+                    let c = self.comp_at(mem.node).unwrap();
+                    let n_out = c.points().len();
+                    let reads: Vec<Option<usize>> = (0..n_out)
+                        .map(|d| mem.m_view.forms.iter().position(|f| f.as_unit() == Some(d)))
+                        .collect();
+                    // size-1 dims carry no lanes; they are neither read nor extra
+                    let extra: Vec<usize> = (0..n_out)
+                        .filter(|&d| reads[d].is_none() && c.out[d] != Dim::Fixed(1))
+                        .collect();
+                    (reads, extra)
+                })
+                .collect();
+            let extra_shape: Vec<Dim> = member_extra
+                .iter()
+                .zip(&members)
+                .map(|((_, extra), mem)| {
+                    let c = self.comp_at(mem.node).unwrap();
+                    extra.iter().map(|&d| c.out[d]).collect::<Vec<Dim>>()
+                })
+                .max_by_key(|v| v.len())
+                .unwrap_or_default();
+            let agree = member_extra.iter().zip(&members).all(|((_, extra), mem)| {
+                let c = self.comp_at(mem.node).unwrap();
+                let mine: Vec<Dim> = extra.iter().map(|&d| c.out[d]).collect();
+                mine.is_empty() || mine == extra_shape
+            });
+            if !agree {
+                continue;
+            }
+            let e = extra_shape.len();
+            let fused_rank = m_out + e + 1;
+
             let mut body = ExprGraph::new();
             let mut args: Vec<Arg> = Vec::new();
-            // slot 0: s, taken from the max's own body (same space as the fused comp)
+            // slot 0: s, from the max's own body, re-indexed into the fused space
+            let m_ext = View {
+                forms: (0..=m_out)
+                    .map(|d| Form::unit(fused_rank, if d == m_out { m_out + e } else { d }))
+                    .collect(),
+            };
             let m_vars: Vec<ExprId> = mc
                 .args
                 .iter()
-                .map(|a| body.var(intern_arg(&mut args, a.clone()) as u16))
+                .map(|a| {
+                    let leaf = Arg {
+                        src: a.src,
+                        view: a.view.compose(&m_ext, fused_rank),
+                    };
+                    body.var(intern_arg(&mut args, leaf) as u16)
+                })
                 .collect();
             let mut outs = replay(&mc.body, &mc.body_outs, &m_vars, &mut body);
             let mut projections = Vec::new();
 
-            for mem in &members {
+            for (mem, (reads, extra)) in members.iter().zip(&member_extra) {
                 let c = self.comp_at(mem.node).unwrap();
                 let n_out = c.points().len();
-                // member out dim -> which m out dim reads it (None: extra dim)
-                let reads: Vec<Option<usize>> = (0..n_out)
-                    .map(|d| mem.m_view.forms.iter().position(|f| f.as_unit() == Some(d)))
-                    .collect();
-                let extra: Vec<usize> = (0..n_out).filter(|&d| reads[d].is_none()).collect();
-                let extra_shape: Vec<usize> = extra.iter().map(|&d| c.out[d].n()).collect();
-                let base = outs.len() as i64;
-
-                // unroll the extra dims into tuple slots
-                for e in indices(&extra_shape) {
-                    let forms = (0..c.rank())
+                let slot = outs.len() as i64;
+                let inv = View {
+                    forms: (0..c.rank())
                         .map(|d| match reads.get(d) {
                             Some(Some(j)) => Form::unit(fused_rank, *j),
-                            Some(None) => {
-                                let k = extra.iter().position(|x| *x == d).unwrap();
-                                Form::constant(fused_rank, e[k] as i64)
-                            }
-                            None => Form::unit(fused_rank, m_out),
+                            // lane dim, or a size-1 dim that is always 0
+                            Some(None) => match extra.iter().position(|x| *x == d) {
+                                Some(k) => Form::unit(fused_rank, m_out + k),
+                                None => Form::zero(fused_rank),
+                            },
+                            None => Form::unit(fused_rank, m_out + e),
                         })
-                        .collect();
-                    let inv = View { forms };
-                    let _ = mem.s;
-                    let used = mem.g.map_or_else(Vec::new, |g| vars_reachable(&c.body, g));
-                    let vars: Vec<ExprId> = c
-                        .args
-                        .iter()
-                        .enumerate()
-                        .map(|(k, a)| {
-                            if !used.contains(&(k as u16)) {
-                                return ExprId::ZERO;
-                            }
-                            let leaf = Arg {
-                                src: a.src,
-                                view: a.view.compose(&inv, fused_rank),
-                            };
-                            body.var(intern_arg(&mut args, leaf) as u16)
-                        })
-                        .collect();
-                    outs.push(match mem.g {
-                        Some(g) => replay(&c.body, &[g], &vars, &mut body)[0],
-                        None => body.lit(1.0),
-                    });
-                }
-
-                // member[o] == fused[m_view(o), base + flat(extra coords)]
-                let strides = {
-                    let mut s = vec![1i64; extra.len()];
-                    for k in (0..extra.len().saturating_sub(1)).rev() {
-                        s[k] = s[k + 1] * extra_shape[k + 1] as i64;
-                    }
-                    s
+                        .collect(),
                 };
-                let mut slot = Form::constant(n_out, base);
-                for (k, &d) in extra.iter().enumerate() {
-                    slot.coefs[d] = strides[k];
-                }
+                let _ = mem.s;
+                let used = mem.g.map_or_else(Vec::new, |g| vars_reachable(&c.body, g));
+                let vars: Vec<ExprId> = c
+                    .args
+                    .iter()
+                    .enumerate()
+                    .map(|(k, a)| {
+                        if !used.contains(&(k as u16)) {
+                            return ExprId::ZERO;
+                        }
+                        let leaf = Arg {
+                            src: a.src,
+                            view: a.view.compose(&inv, fused_rank),
+                        };
+                        body.var(intern_arg(&mut args, leaf) as u16)
+                    })
+                    .collect();
+                outs.push(match mem.g {
+                    Some(g) => replay(&c.body, &[g], &vars, &mut body)[0],
+                    None => body.lit(1.0),
+                });
+
+                // member[o] == fused[m_view(o), extra coords (0 if absent), slot]
                 let mut proj: Vec<Form> = mem
                     .m_view
                     .forms
@@ -1009,12 +1039,19 @@ impl TensorGraph {
                         offset: f.offset,
                     })
                     .collect();
-                proj.push(slot);
+                for k in 0..e {
+                    proj.push(match extra.get(k) {
+                        Some(&d) => Form::unit(n_out, d),
+                        None => Form::zero(n_out),
+                    });
+                }
+                proj.push(Form::constant(n_out, slot));
                 projections.push((mem.node, View { forms: proj }));
             }
 
             let width = outs.len();
             let mut out = mc.out.clone();
+            out.extend(extra_shape.iter().copied());
             out.push(Dim::Fixed(width));
             let fused = g2
                 .push_comp(Comp {
@@ -1030,6 +1067,9 @@ impl TensorGraph {
             for (node, proj) in projections {
                 redirect.insert(node, (fused.n(), proj));
             }
+        }
+        if redirect.is_empty() {
+            return (self.clone(), outputs.to_vec());
         }
 
         for node in &mut g2.nodes {
@@ -1094,6 +1134,14 @@ impl TensorGraph {
     /// the consumer's iteration space is no larger than the producer's
     /// point count, i.e. inlining evaluates each point at most once.
     pub fn schedule_inline(&mut self, outputs: &[TensorId]) {
+        self.schedule_inline_up_to(outputs, 1);
+    }
+
+    /// Like [`schedule_inline`](Self::schedule_inline) but allows the
+    /// consumer to evaluate the producer up to `factor` times per point.
+    /// Worth it when the consumer's extra points are lanes that a tiled
+    /// schedule computes the shared part for cooperatively.
+    pub fn schedule_inline_up_to(&mut self, outputs: &[TensorId], factor: usize) {
         let live = self.live(outputs);
         let uses = self.use_counts(outputs, &live);
         let is_output = |i: usize| outputs.iter().any(|o| o.n() == i);
@@ -1108,7 +1156,11 @@ impl TensorGraph {
         }
         for i in 0..n {
             let Some(c) = self.comp_at(i) else { continue };
-            if live[i] && uses[i] == 1 && !is_output(i) && consumer_space[i] <= numel(c.points()) {
+            if live[i]
+                && uses[i] == 1
+                && !is_output(i)
+                && consumer_space[i] <= factor * numel(c.points())
+            {
                 self.nodes[i].inline = true;
             }
         }
@@ -1205,26 +1257,39 @@ impl TensorGraph {
         })
     }
 
-    /// Default thread mapping for a bound graph, from the measured rule
-    /// of thumb in `BENCHMARKS.md`: a reduction with few output points
-    /// starves the GPU one-thread-per-point, so split it across a
-    /// workgroup; one with many points is already parallel enough.
+    /// Default thread mapping for a bound graph, from the measured rules
+    /// of thumb in `BENCHMARKS.md`: a reduction whose points end in a lane
+    /// axis (attention's value columns) is tiled rows × lanes with shared
+    /// work staged cooperatively; a reduction with few output points is
+    /// split across a workgroup; one with many points is already parallel
+    /// enough one-thread-per-point.
     /// `autotune` over candidate graphs still decides which *algebra* to
     /// run (e.g. materialized scores vs online softmax).
     pub fn schedule_auto(&mut self, outputs: &[TensorId]) {
         const MANY_POINTS: usize = 1 << 14;
+        const LANES: usize = 16;
         self.schedule_inline(outputs);
         let live = self.live(outputs);
-        let targets: Vec<usize> = (0..self.nodes.len())
+        let reductions: Vec<usize> = (0..self.nodes.len())
             .filter(|&i| live[i] && !self.nodes[i].inline)
             .filter(|&i| {
-                self.comp_at(i).is_some_and(|c| {
-                    c.monoid.is_some() && numel(c.points()) < MANY_POINTS && numel(&c.red) >= 64
-                })
+                self.comp_at(i)
+                    .is_some_and(|c| c.monoid.is_some() && numel(&c.red) >= 64)
             })
             .collect();
-        for i in targets {
-            self.nodes[i].split = 256;
+        for i in reductions {
+            let c = self.comp_at(i).unwrap();
+            let pts = fixed(c.points());
+            let lanes = pts.iter().rev().find(|&&n| n > 1).copied().unwrap_or(1);
+            let rows = pts.iter().rev().filter(|&&n| n > 1).nth(1).is_some();
+            if c.red.len() == 1 && (LANES..=256).contains(&lanes) && rows {
+                // a lane axis: rows × lanes per workgroup, shared reads and
+                // shared sub-computations staged cooperatively
+                let by = (256 / lanes).max(1) as u32;
+                self.nodes[i].tile = (lanes as u32, by, 32);
+            } else if pts.iter().product::<usize>() < MANY_POINTS {
+                self.nodes[i].split = 256;
+            }
         }
     }
 
@@ -1587,7 +1652,7 @@ mod tests {
         for size in [5usize, 16] {
             let mut bound = sg.bind(&[("n", size)]).unwrap();
             assert!(bound.is_bound());
-            bound.schedule_inline(&outs);
+            bound.schedule_inline_up_to(&outs, dv);
             let inputs = [
                 ramp(size * d, 0.05, -1.0),
                 ramp(size * d, 0.07, 0.3),
@@ -1622,6 +1687,16 @@ mod tests {
         let y = g.reduce(x, 1, Monoid::sum()).unwrap();
         g.schedule_auto(&[y]);
         assert_eq!(g.nodes()[y.n()].split, 0);
+        assert_eq!(g.nodes()[y.n()].tile, (0, 0, 0));
+
+        // rows x lanes points with a wide reduce -> 2-D tile over lanes
+        let mut g = TensorGraph::new();
+        let a = g.input(&[256, 128]);
+        let b = g.input(&[128, 64]);
+        let c = g.matmul(a, b).unwrap();
+        g.schedule_auto(&[c]);
+        assert_eq!(g.nodes()[c.n()].tile, (64, 4, 32));
+        assert_eq!(g.nodes()[c.n()].split, 0);
     }
 
     #[test]
@@ -1673,7 +1748,7 @@ mod tests {
 
         let (g, outs) = g.substitute_maps(&[y]);
         let (mut g, outs) = g.stabilize_softmax(&outs);
-        g.schedule_inline(&outs);
+        g.schedule_inline_up_to(&outs, dv);
 
         // flash: one online-softmax reduction, q·k recomputed inside it,
         // and nothing n×n ever hits memory.
@@ -1692,7 +1767,7 @@ mod tests {
             mats.iter().all(|(_, s)| numel(s) < n * n),
             "materialized: {mats:?}"
         );
-        // scores (inlined), online reduce [n, 1, 2+dv], final divide
+        // scores (inlined), online reduce [n, 1, dv, 3], final divide
         assert_eq!(g.count_comps(&outs), 3);
         assert_eq!(mats.len(), 2);
 

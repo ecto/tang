@@ -357,7 +357,7 @@ pub mod ir_gpu {
         let (g, y) = naive_attention(n, d, dv);
         let (g, outs) = g.substitute_maps(&[y]);
         let (mut g, outs) = g.stabilize_softmax(&outs);
-        g.schedule_inline(&outs);
+        g.schedule_inline_up_to(&outs, dv);
         (g, outs[0])
     }
 
@@ -374,7 +374,8 @@ pub mod ir_gpu {
     /// tiling, derived from the views.
     pub fn flash_attention_tiled(n: usize, d: usize, dv: usize) -> (TensorGraph, TensorId) {
         let (mut g, y) = flash_attention(n, d, dv);
-        g.schedule_tile(&[y], 64, 32, 64);
+        // lanes over the value column, 4 rows per workgroup
+        g.schedule_tile_2d(&[y], dv as u32, 4, 32, 64);
         (g, y)
     }
 
@@ -413,6 +414,7 @@ pub mod ir_gpu {
         let (g, y) = naive_attention(n, d, dv);
         let (g, outs) = g.substitute_maps(&[y]);
         let (mut g, outs) = g.stabilize_softmax(&outs);
+        g.schedule_inline_up_to(&outs, dv);
         g.schedule_auto(&outs);
         (g, outs[0])
     }
@@ -593,17 +595,22 @@ pub mod ir_gpu {
                 return;
             };
             let mut cache = KernelCache::new();
-            let (n, d) = (100, 16);
+            for (n, d) in [(100, 16), (512, 64), (1024, 64)] {
+                check_attention_size(&device, &mut cache, n, d);
+            }
+        }
+
+        fn check_attention_size(device: &GpuDevice, cache: &mut KernelCache, n: usize, d: usize) {
             let mut rng = crate::Rng::new(7);
             let q: Vec<f32> = (0..n * d).map(|_| rng.f32() * 2.0 - 1.0).collect();
             let k: Vec<f32> = (0..n * d).map(|_| rng.f32() * 2.0 - 1.0).collect();
             let v: Vec<f32> = (0..n * d).map(|_| rng.f32() * 2.0 - 1.0).collect();
 
-            let qt = GpuTensor::from_slice(&device, &q, &[n, d]);
-            let kt = GpuTensor::from_slice(&device, &k, &[n, d]);
-            let vt = GpuTensor::from_slice(&device, &v, &[n, d]);
-            let want = kv_attention_fused(&device, &mut cache, &qt, &kt, &vt, n, n, 1, 1, d, 0)
-                .to_vec_flushed(&device, &mut cache);
+            let qt = GpuTensor::from_slice(device, &q, &[n, d]);
+            let kt = GpuTensor::from_slice(device, &k, &[n, d]);
+            let vt = GpuTensor::from_slice(device, &v, &[n, d]);
+            let want = kv_attention_fused(device, cache, &qt, &kt, &vt, n, n, 1, 1, d, 0)
+                .to_vec_flushed(device, cache);
             let mask = causal_mask(n);
 
             // CPU reference
@@ -631,10 +638,10 @@ pub mod ir_gpu {
             }
             for (name, g, y) in attention_candidates(n, d, d) {
                 let program = g.to_wgsl(&[y]);
-                let exe = Executable::new(&device, program, &[&q, &k, &v, &mask]);
-                exe.run(&device, &mut cache);
-                cache.flush(&device);
-                let got = exe.read(&device, y);
+                let exe = Executable::new(device, program, &[&q, &k, &v, &mask]);
+                exe.run(device, cache);
+                cache.flush(device);
+                let got = exe.read(device, y);
                 assert_eq!(got.len(), want.len());
                 for (i, (a, b)) in got.iter().zip(&want).enumerate() {
                     assert!((a - b).abs() < 1e-4, "{name}[{i}]: {a} vs {b}");
@@ -642,14 +649,14 @@ pub mod ir_gpu {
             }
 
             let (name, exe, y, t) = autotune(
-                &device,
-                &mut cache,
+                device,
+                cache,
                 attention_candidates(n, d, d),
                 &[&q, &k, &v, &mask],
                 3,
             );
             eprintln!("autotune picked {name} at {t:?}");
-            let got = exe.read(&device, y);
+            let got = exe.read(device, y);
             for (i, (a, b)) in got.iter().zip(&want).enumerate() {
                 assert!((a - b).abs() < 1e-4, "auto[{i}]: {a} vs {b}");
             }
