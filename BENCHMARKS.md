@@ -877,6 +877,33 @@ is about ±15%.) The forward is at PyTorch's level; the training step is
 yet) — a flash-backward lowering is the same kind of work as the forward
 one.
 
+### Toward flash backward: three generic scheduling fixes
+
+The training step's breakdown showed its time spread over attention-backward
+kernels that were scheduled badly for generic reasons, not for lack of an
+attention-specific lowering:
+
+- **Tiles need reuse.** `schedule_auto`'s matmul rule now requires an
+  operand shared along the lanes and one shared along the rows; `Σⱼ` and
+  `maxⱼ` over the 512×512 attention tensors (no operand shared across a
+  tile) become split reductions instead of staging-only tiles.
+- **`split_reduce_dims`.** A reduction over several dims with a small one
+  (≤ 16) becomes an inner reduction over the rest — keeping the small dim
+  as a leading point dim — and an unrolled monoid fold. dK for grouped
+  heads, `Σ_{r,i} dS·q`, becomes `Σ_r (Σ_i …)`, and the inner one tiles
+  (0.46 → 0.19 ms at seq 512).
+- **Recompute big maps in every reducing consumer.** A map all of whose
+  consumers reduce, and that is bigger than their outputs, is inlined
+  into each of them and staged cooperatively — dS (n² per head) is
+  recomputed inside the dQ and dK tiles instead of written out, which is
+  the flash-backward structure.
+
+`CudaExecutable` and `torch_bench.py` now both report the minimum over
+five batches. End-to-end numbers after these changes are pending a quiet
+window on the 3090: during this session it ran at 99% utilization from
+other jobs (two RL trainers, a voice model, an image server, video
+encodes), which slowed PyTorch's reference run by 2–3× as well.
+
 What this does and does not show: the compiler derives the *structure* of
 the fast kernels (flash attention, register-tiled matmul, sequence
 parallelism) from the algebra, with no op-specific code, and picks per
