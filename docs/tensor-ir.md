@@ -88,8 +88,8 @@ schedule fields on a node say *how*, and can't change the answer:
 - `split` — one workgroup per point; threads stride the reduce space and
   tree-combine through workgroup memory. Valid for any monoid because
   combine is associative — including online softmax.
-- `tile` / `tile_2d` — a `bx × by` block of points per workgroup, one
-  point per thread. The emitter inlines the closure into one loop nest,
+- `tile` / `tile_2d` — a `bx × by` block of threads per workgroup, each
+  owning an `rx × ry` register tile of points (`reg`). The emitter inlines the closure into one loop nest,
   tracks every address as an affine form over the loop variables, and
   stages anything that does not depend on the lane axis in workgroup
   memory once per reduce chunk: buffer reads (k/v tiles, the matmul `b`

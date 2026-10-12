@@ -554,3 +554,30 @@ M4 figures earlier in this file were measured on a different day;
 absolute times on that machine drift by ±2× with its power state (the
 same commit measured 1.35 ms and 3.8 ms for tiled attention an hour
 apart). Compare columns within one table, not across days.
+
+## Register tiles (both chips)
+
+`TNode.reg = (rx, ry)`: each thread owns an rx×ry block of points of a
+16×16-thread tile, with its own accumulators and hoisted reads; the
+staged tiles grow to 64×64 points. Same emitter, same staging rules —
+the only new idea is "more than one point per thread". Matmul 1024²,
+`cargo bench ... kvi_gpu_matmul`:
+
+| | hand | one point/thread tile | 2×2 | 4×4 |
+|---|---|---|---|---|
+| M4 Max (floor ~1.8 ms) | 6.82 ms | 5.74 ms | 5.51 ms | **5.23 ms** |
+| RTX 3090 (floor ~1.25 ms) | 2.27 ms | 2.41 ms | 1.98 ms | **1.92 ms** |
+
+Kernel-only that is roughly 1.5× the hand matmul on both chips. With the
+register tiles in the autotuner's candidate list the transformer block
+moves again (per-kernel autotune, fresh cache):
+
+| block | hand | derived, autotuned |
+|---|---|---|
+| M4 seq 128 | 5.02 ms | **3.65 ms** |
+| M4 seq 512 | 23.9 ms | **5.61 ms** |
+| 3090 seq 128 | 4.94 ms | **3.89 ms** |
+| 3090 seq 512 | 13.1 ms | **6.71 ms** |
+
+(3090 hand numbers in this run are ~50% above the earlier run on the same
+code; that box was not idle. The derived column moved by the same factor.)
