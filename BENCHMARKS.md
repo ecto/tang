@@ -756,6 +756,35 @@ second dialect with no op-specific code, epilogue included. The CUDA
 dialect (tensor cores proper, where the gap to PyTorch lives) is the
 same shape of work with nvcc in the loop.
 
+### Tensor cores: the CUDA dialect (RTX 3090, nvcc harness)
+
+The same bilinear tile lowered to CUDA C++ with `wmma` 16×16×8 TF32
+fragments (`tensor_cuda.rs`; 64×64 block, four warps of 32×32, operands
+staged through shared memory from any affine layout, epilogue on the
+stored block). tang-gpu runs on wgpu and cannot dispatch CUDA, so this
+is measured by `scripts/cuda_bench.cu`: the derived kernel and
+`cublasSgemm` (fp32, then `CUBLAS_TF32_TENSOR_OP_MATH`) on the same
+device, CUDA events, 50 launches. Error is against fp32 cuBLAS; TF32
+inputs give ~1e-3 relative, as expected.
+
+| shape | tang wmma (TF32) | tang WGSL (fp32) | cuBLAS fp32 | cuBLAS TF32 |
+|---|---|---|---|---|
+| 1024² | **0.150 ms** (14 TFLOPS) | 0.28 | 0.113 | 0.079 |
+| 1024² + bias + silu epilogue | 0.159 | — | 0.107 (+ separate kernels) | 0.079 |
+| 128×576×1536 | 0.052 | 0.10 | 0.031 | 0.015 |
+| 512×576×1536 | 0.091 (10 TFLOPS) | 0.16 | 0.053 | 0.048 |
+| 4096³ | 6.58 (21 TFLOPS) | — | 5.67 | 3.98 |
+
+First cut, no tuning: 1.4–1.9× cuBLAS TF32 at the LLM shapes, 1.65× at
+4096³, with the bias/activation epilogue fused for free (cuBLAS needs
+extra launches for that). The remaining gap is the standard GEMM
+engineering — 128×128 blocks with 8 warps, `cp.async` double buffering,
+`ldmatrix`-friendly swizzles — on top of a lowering that now exists.
+Together with the WGSL numbers above this is the whole picture: the
+derived kernels are 2–4× faster than tang's hand kernels through the
+portable path, and within 2× of cuBLAS through the native one, from one
+comprehension and no op-specific code.
+
 What this does and does not show: the compiler derives the *structure* of
 the fast kernels (flash attention, register-tiled matmul, sequence
 parallelism) from the algebra, with no op-specific code, and picks per

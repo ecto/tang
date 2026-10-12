@@ -156,10 +156,15 @@ schedule space; the compiler searches it.
 
 ## Not yet
 
-- Native codegen is a first cut: matmul-shaped tiles lower to Metal
-  simdgroup matrices (`tensor_msl.rs`, via wgpu's MSL passthrough) with
-  their epilogues, but the fp32 kernel does not yet beat the WGSL
-  register tile on an M4; CUDA/tensor cores are not started.
+- Native codegen is a first cut. Matmul-shaped tiles lower to Metal
+  simdgroup matrices (`tensor_msl.rs`, via wgpu's MSL passthrough) and
+  to CUDA `wmma` TF32 tensor cores (`tensor_cuda.rs`), epilogues
+  included. The CUDA kernel runs at 14–21 TFLOPS on a 3090, within 2× of
+  cuBLAS TF32; the Metal fp32 kernel does not yet beat the WGSL register
+  tile. Neither is dispatched by tang-gpu yet: Metal is opt-in, CUDA is
+  measured through an nvcc harness (`scripts/cuda_bench.cu`), since wgpu
+  cannot run CUDA. A CUDA runtime path (cudarc or driver-API FFI with
+  buffer interop) is the next piece.
 - Scatter gradients reduce over the whole source coordinate they gate on;
   a stride-2 read pays 2× in the backward pass. Fine for rope, not for a
   large gather.
