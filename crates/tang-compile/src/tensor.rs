@@ -2083,9 +2083,11 @@ impl TensorGraph {
             let k = c.points().len();
             let rank = c.rank();
             let w = c.width();
-            // inner space: points, the small dim, the other reduce dims
-            let order: Vec<usize> = (0..k)
-                .chain([k + f])
+            // inner space: the small dim first (so the original points keep
+            // their lane and row axes), the points, the other reduce dims
+            let order: Vec<usize> = [k + f]
+                .into_iter()
+                .chain(0..k)
                 .chain((0..reds.len()).filter(|&r| r != f).map(|r| k + r))
                 .collect();
             let inner_args: Vec<Arg> = c
@@ -2106,8 +2108,8 @@ impl TensorGraph {
                     },
                 })
                 .collect();
-            let mut inner_out: Vec<Dim> = c.points().to_vec();
-            inner_out.push(Dim::Fixed(nf));
+            let mut inner_out: Vec<Dim> = vec![Dim::Fixed(nf)];
+            inner_out.extend_from_slice(c.points());
             inner_out.extend_from_slice(&c.out[k..]);
             let inner = Comp {
                 out: inner_out.clone(),
@@ -2136,8 +2138,8 @@ impl TensorGraph {
             let args: Vec<Arg> = (0..nf)
                 .flat_map(|fi| {
                     (0..w).map(move |slot| {
-                        let mut forms: Vec<Form> = (0..k).map(|d| Form::unit(k, d)).collect();
-                        forms.push(Form::constant(k, fi as i64));
+                        let mut forms: Vec<Form> = vec![Form::constant(k, fi as i64)];
+                        forms.extend((0..k).map(|d| Form::unit(k, d)));
                         if c.tuple == 1 {
                             forms.push(Form::constant(k, slot as i64));
                         }
