@@ -253,18 +253,26 @@ schedule space; the compiler searches it.
 
 ## Not yet
 
-- Fragments for attention (QKᵀ and PV under the online-softmax
+- Fragments for attention on Metal (QKᵀ and PV under the online-softmax
   schedule) and for operands that are inlined maps (ConvNeXt's
   LayerNorm-normalized activation feeds its pointwise matmul through a
-  substituted map, so `fragment_plan` refuses it); a CUDA `wmma` emitter.
+  substituted map, so `fragment_plan` refuses it).
 - Body arithmetic in `half`. Storage and accumulators honour f16; scalar
   body math is f32 on every path.
 - #34's f32 simdgroup-matrix tile (`tensor_msl_mma.rs`, `to_msl_mma`,
   run through wgpu's MSL passthrough, opt-in with `TANG_NATIVE`) and the
-  CUDA `wmma` TF32 lowering (`tensor_cuda.rs`, 14–21 TFLOPS on a 3090)
-  coexist with the whole-IR MSL backend (`tensor_msl.rs`, `to_msl`).
-  The f32 Metal tile does not beat the WGSL register tile on an M4, so
-  `pick_backend` only weighs WGSL against the native f16 backend.
+  CUDA path coexist with the whole-IR MSL backend (`tensor_msl.rs`,
+  `to_msl`). The f32 Metal tile does not beat the WGSL register tile on
+  an M4, so `pick_backend` only weighs WGSL against the native f16
+  backend.
+- CUDA: `to_cuda` emits whole programs (wmma TF32 tiles plus the other
+  kernels transpiled from their WGSL) that `tang_bench::ir_cuda` runs
+  through cudarc. The block forward runs in 0.62 ms at seq 128 on a 3090
+  with six kernels on tensor cores — the five matmul-shaped tiles and the
+  fused attention, which `cuda_flash_kernel` lowers to a wmma flash
+  kernel from the comp's structure. It is a separate runtime (wgpu cannot
+  dispatch CUDA); buffers do not interoperate, and it does not yet read
+  the precision schedule (f16/bf16 wmma).
 - Scatter gradients reduce over the whole source coordinate they gate on;
   a stride-2 read pays 2× in the backward pass. Fine for rope, not for a
   large gather.
