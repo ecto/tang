@@ -16,7 +16,9 @@ Part of [tang](https://github.com/ecto/tang).
 
 What falls out:
 
-- `substitute_maps` is the single fusion rule.
+- `substitute_maps` is the single fusion rule (cost-aware: a map is not
+  recomputed inside a reduction unless it is cheap); `eliminate_common`
+  merges identical comps.
 - `stabilize_softmax` rewrites `max_j s` + `Σ_j g·exp(s−max)` into one
   online-softmax reduction: flash attention is derived, not written.
 - `backward` differentiates a comprehension into comprehensions.
