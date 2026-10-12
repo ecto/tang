@@ -238,6 +238,45 @@ surface syntax is rewritten to MSL. What changes:
   tries fragments wherever the node's precision admits them. WGSL stays
   the portable default.
 
+## Running programs: one API, wgpu or CUDA
+
+`tang_gpu::program` runs a lowered program on whichever backend the
+machine has:
+
+```rust
+let rt = Runtime::select()?;            // CUDA if present (feature `cuda`), else wgpu
+let p = Program::compile(&rt, &g, &outs, &inputs);
+p.run(&rt);
+let y = p.read(&rt, outs[0]);
+```
+
+- `Runtime` is `Wgpu { device, cache }` or `Cuda(CudaDevice)`.
+  `select` takes CUDA when tang-gpu is built with `cuda`, `libcuda` and
+  nvrtc load (cudarc dynamic loading — the feature builds and runs
+  without NVIDIA hardware) and a device exists; `TANG_BACKEND=wgpu|cuda`
+  forces one. `rt.lower(&g, &outs)` is `to_wgsl` (or MSL tiles with
+  `TANG_NATIVE`) on wgpu and `to_cuda` on CUDA.
+- `Program` owns the program's buffers on that backend: `run`,
+  `run_kernel`, `read`, `write`, `time`, `time_kernel`, and `copy`, a
+  device-side copy of one program's tensor into another's (how the
+  training step hands gradients to Adam and Adam hands weights back).
+- `Program::tuned` on CUDA times each tensor-core kernel against its
+  transpiled-WGSL twin and keeps the faster, caching the choice in a
+  file keyed by the device and both programs' sources (the CUDA analogue
+  of `TuningCache`; the WGSL schedule autotuner still runs on the graph,
+  before lowering).
+- Interop: a program lives on one backend. Programs on the same runtime
+  pass tensors with device copies; anything else is an explicit host
+  round trip (`read`/`write`). On wgpu, `wgpu_buffer(t)` hands buffers to
+  tang-gpu's hand kernels as before; on CUDA the hand kernels do not run,
+  so a CUDA path has to be IR end to end — the derived forward, the
+  training step and Adam are (`examples/train_loop.rs`,
+  `examples/cuda_block.rs`). No Vulkan/CUDA zero-copy sharing.
+- Memory plans: `Program::with_plan` takes a `BufferPlan` (buffer → slot,
+  slot sizes) and allocates slots instead of one buffer per tensor, so a
+  planner that assigns tensors with disjoint lifetimes to shared slots
+  plugs in without touching the runner.
+
 ## What the measurements say about the claim
 
 The winning schedule is a property of (graph, chip, size), not of the op:
@@ -276,13 +315,13 @@ schedule space; the compiler searches it.
   an M4, so `pick_backend` only weighs WGSL against the native f16
   backend.
 - CUDA: `to_cuda` emits whole programs (wmma TF32 tiles plus the other
-  kernels transpiled from their WGSL) that `tang_bench::ir_cuda` runs
-  through cudarc. The block forward runs in 0.62 ms at seq 128 on a 3090
+  kernels transpiled from their WGSL) that `tang_gpu::program` runs
+  through cudarc (above). The block forward runs in 0.62 ms at seq 128 on a 3090
   with six kernels on tensor cores — the five matmul-shaped tiles and the
   fused attention, which `cuda_flash_kernel` lowers to a wmma flash
-  kernel from the comp's structure. It is a separate runtime (wgpu cannot
-  dispatch CUDA); buffers do not interoperate, and it does not yet read
-  the precision schedule (f16/bf16 wmma).
+  kernel from the comp's structure. CUDA buffers do not interoperate
+  with wgpu ones (host copies at the boundary), and the lowering does not
+  yet read the precision schedule (f16/bf16 wmma).
 - Scatter gradients reduce over the whole source coordinate they gate on;
   a stride-2 read pays 2× in the backward pass. Fine for rope, not for a
   large gather.
