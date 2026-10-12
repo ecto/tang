@@ -488,7 +488,11 @@ impl TensorGraph {
         if c.monoid.is_none() {
             return out;
         }
-        out.push((256, (0, 0, 0)));
+        // a tree-combine of a wide tuple through workgroup memory is never
+        // the answer (59 ms for attention's 66-wide state on a 3090)
+        if c.width() <= 8 {
+            out.push((256, (0, 0, 0)));
+        }
         if c.red.len() == 1 {
             let pts = fixed(c.points());
             let lanes = pts.iter().rev().find(|&&n| n > 1).copied().unwrap_or(1);

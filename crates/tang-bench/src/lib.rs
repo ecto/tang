@@ -508,6 +508,16 @@ pub mod ir_gpu {
                 exe.run_kernel(device, cache, i);
                 cache.flush(device);
                 let _ = exe.read(device, node);
+                // one timed run first: a variant far behind the best so
+                // far is not worth `iters` more
+                let probe = std::time::Instant::now();
+                exe.run_kernel(device, cache, i);
+                cache.flush(device);
+                let _ = exe.read(device, node);
+                let probe = probe.elapsed();
+                if best.is_some_and(|b| probe > b.2 * 4) {
+                    continue;
+                }
                 let start = std::time::Instant::now();
                 for _ in 0..iters {
                     exe.run_kernel(device, cache, i);
