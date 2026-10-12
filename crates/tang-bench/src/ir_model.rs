@@ -712,10 +712,14 @@ mod tests {
             let (g, couts) = compile_with_barriers(&step.graph, &outs, &step.boundaries);
             let s = program_stats(&g.to_wgsl(&couts));
             assert!(s.kernels > 6 * layers);
-            s.distinct_sources
+            let c = program_stats(&g.to_cuda(&couts));
+            (s.distinct_sources, c.distinct_sources)
         };
         let (d4, d30) = (distinct(4), distinct(30));
-        assert_eq!(d4, d30, "distinct sources: 4 layers {d4}, 30 layers {d30}");
+        assert_eq!(
+            d4, d30,
+            "distinct (wgsl, cuda) sources: 4 layers {d4:?}, 30 layers {d30:?}"
+        );
     }
 
     #[test]

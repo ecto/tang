@@ -100,8 +100,9 @@ pub struct WgslProgram {
 
 /// Identifier prefixes the emitters follow with a graph node number:
 /// buffers `b{j}` and per-node functions `read_{j}`, `body_{j}`,
-/// `point_{j}`, `combine_{j}`.
-const NODE_PREFIXES: [&str; 5] = ["b", "read_", "body_", "point_", "combine_"];
+/// `point_{j}`, `combine_{j}`, and the CUDA transpiler's buffer
+/// parameters `p_b{j}`.
+const NODE_PREFIXES: [&str; 6] = ["b", "read_", "body_", "point_", "combine_", "p_b"];
 
 /// `src` with the node numbers in node-named identifiers (see
 /// `NODE_PREFIXES`) renumbered `0, 1, …` in order of first appearance.
