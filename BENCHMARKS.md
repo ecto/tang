@@ -657,11 +657,15 @@ Where the gap is, and how much of it this path can close:
   WGSL/wgpu today (no cooperative-matrix extension). That is the other
   2–4× PyTorch has, and it is a backend question (MSL simdgroup matrices,
   CUDA via `tang-expr`'s CUDA dialect), not a schedule question.
-- **Launch overhead.** The block issues 16 kernels (72 with backward),
-  each submitted as its own command buffer through wgpu; seq 128 forward
-  is 1.97 ms for ~0.6 ms of math. One command buffer per program and
-  epilogue fusion (bias/activation into the matmul's write-out) would
-  take most of that; PyTorch's 0.295 ms is ~10 cuBLAS/flash launches.
+- **Launch overhead.** The block issued 20 kernels (72 with backward)
+  when this table was taken, each as its own command buffer through
+  wgpu; seq 128 forward was 1.97 ms for ~0.6 ms of math. Since then:
+  one submission per program, and three fusion passes — epilogue
+  fusion (bias, activation and the softmax normalizer run on the thread
+  holding the final accumulator), views through affine reshapes, and
+  sibling-reduction merging (gate and up projections as one
+  tuple-valued matmul) — bring the forward block to 16 kernels (62
+  with backward). PyTorch's 0.295 ms is ~10 cuBLAS/flash launches.
 - **Attention.** Flash-attention proper keeps the (m, l, acc) state in
   registers across a 64-key tile computed as two small tensor-core
   matmuls; ours recomputes q·k cooperatively into shared memory with
