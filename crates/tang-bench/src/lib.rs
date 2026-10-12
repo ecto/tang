@@ -425,6 +425,69 @@ pub mod ir_gpu {
         (g, outs[0])
     }
 
+    /// One kernel's winning thread mapping and its measured time.
+    pub struct TunedKernel {
+        pub node: TensorId,
+        pub split: u32,
+        pub tile: (u32, u32, u32),
+        pub time: std::time::Duration,
+    }
+
+    /// Per-kernel autotuning: for every materialized comp, time each
+    /// thread mapping from `schedule_candidates` on this device (with the
+    /// graph's real inputs already computed) and keep the fastest. The
+    /// algebra and materialization are left as scheduled; only `split`
+    /// and `tile` change, so buffers stay valid across variants.
+    pub fn autotune_kernels(
+        device: &GpuDevice,
+        cache: &mut KernelCache,
+        mut g: TensorGraph,
+        outputs: &[TensorId],
+        inputs: &[&[f32]],
+        iters: usize,
+    ) -> (TensorGraph, Vec<TunedKernel>) {
+        let base = Executable::new(device, g.to_wgsl(outputs), inputs);
+        base.run(device, cache);
+        cache.flush(device);
+        let _ = base.read(device, outputs[0]);
+        let mut log = Vec::new();
+        for i in 0..base.program.kernels.len() {
+            let node = base.program.kernels[i].node;
+            let mut best: Option<(u32, (u32, u32, u32), std::time::Duration)> = None;
+            for (split, tile) in g.schedule_candidates(node) {
+                let mut variant = g.clone();
+                variant.set_schedule(node, split, tile);
+                let exe = Executable::new(device, variant.to_wgsl(outputs), inputs);
+                // inputs of kernel i: run everything before it once
+                for j in 0..i {
+                    exe.run_kernel(device, cache, j);
+                }
+                exe.run_kernel(device, cache, i);
+                cache.flush(device);
+                let _ = exe.read(device, node);
+                let start = std::time::Instant::now();
+                for _ in 0..iters {
+                    exe.run_kernel(device, cache, i);
+                }
+                cache.flush(device);
+                let _ = exe.read(device, node);
+                let t = start.elapsed() / iters as u32;
+                if best.is_none_or(|b| t < b.2) {
+                    best = Some((split, tile, t));
+                }
+            }
+            let (split, tile, time) = best.unwrap();
+            g.set_schedule(node, split, tile);
+            log.push(TunedKernel {
+                node,
+                split,
+                tile,
+                time,
+            });
+        }
+        (g, log)
+    }
+
     /// All attention schedules the compiler currently knows how to produce.
     pub fn attention_candidates(
         n: usize,

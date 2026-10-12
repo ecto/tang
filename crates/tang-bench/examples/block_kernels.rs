@@ -19,7 +19,9 @@ fn main() {
     let prog = g.to_wgsl(&[y]);
     let device = GpuDevice::new_sync().expect("gpu");
     let mut cache = KernelCache::new();
-    let x: Vec<f32> = (0..seq * 576).map(|i| ((i * 7919) % 97) as f32 * 0.01 - 0.5).collect();
+    let x: Vec<f32> = (0..seq * 576)
+        .map(|i| ((i * 7919) % 97) as f32 * 0.01 - 0.5)
+        .collect();
     let p = params(&device, &mut cache, dims, x);
     let inputs: Vec<&[f32]> = p.cpu.iter().map(|v| v.as_slice()).collect();
     let exe = Executable::new(&device, prog, &inputs);
@@ -47,5 +49,8 @@ fn main() {
             k.reads.len()
         );
     }
-    println!("{total:7.3} ms  total over {} kernels (each incl. one readback)", exe.program.kernels.len());
+    println!(
+        "{total:7.3} ms  total over {} kernels (each incl. one readback)",
+        exe.program.kernels.len()
+    );
 }

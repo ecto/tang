@@ -405,3 +405,13 @@ sub-computation to share, which is now the rule.)
 GQA's `head / heads_per_group` is not affine, so heads are expressed as
 `[groups, per_group]` dims and the views do the rest; the causal mask is an
 input. Nothing in the compiler knows what a transformer is.
+
+### Per-kernel autotuning
+
+`ir_gpu::autotune_kernels` times every thread mapping in
+`schedule_candidates` for each materialized comp on the device, with the
+graph's real inputs in place, and keeps the fastest
+(`examples/block_autotune.rs`). On the transformer block it agrees with
+`schedule_auto` on all 10 kernels at seq 128 and 512: the rules of thumb
+are what the measurements say, and the measurement is there for the next
+chip where they aren't.

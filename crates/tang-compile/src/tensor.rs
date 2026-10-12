@@ -456,6 +456,40 @@ impl TensorGraph {
         &self.nodes
     }
 
+    /// Set a node's thread-mapping schedule (`split`, `tile`), e.g. from
+    /// an autotuner. Materialization (`inline`) is left alone: it changes
+    /// which kernels exist, not how one runs.
+    pub fn set_schedule(&mut self, t: TensorId, split: u32, tile: (u32, u32, u32)) {
+        self.nodes[t.n()].split = split;
+        self.nodes[t.n()].tile = tile;
+    }
+
+    /// Thread mappings worth trying for a materialized comp on a GPU:
+    /// one thread per point, a workgroup split (reductions), and rows ×
+    /// lanes tiles (single-axis reductions with a lane dim).
+    pub fn schedule_candidates(&self, t: TensorId) -> Vec<(u32, (u32, u32, u32))> {
+        let mut out = vec![(0, (0, 0, 0))];
+        let Some(c) = self.comp_at(t.n()) else {
+            return out;
+        };
+        if c.monoid.is_none() {
+            return out;
+        }
+        out.push((256, (0, 0, 0)));
+        if c.red.len() == 1 {
+            let pts = fixed(c.points());
+            let lanes = pts.iter().rev().find(|&&n| n > 1).copied().unwrap_or(1);
+            let rows = pts.iter().rev().filter(|&&n| n > 1).nth(1).is_some();
+            if (16..=128).contains(&lanes) && rows {
+                out.push((0, (lanes as u32, (256 / lanes) as u32, 32)));
+            }
+            if lanes >= 64 && !rows {
+                out.push((0, (lanes.min(256) as u32, 1, 32)));
+            }
+        }
+        out
+    }
+
     pub fn shape(&self, t: TensorId) -> &[Dim] {
         &self.nodes[t.n()].shape
     }
