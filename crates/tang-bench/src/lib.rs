@@ -330,8 +330,21 @@ pub mod ir_gpu {
 
     /// Additive causal mask: 0 where `j <= i`, a large negative otherwise.
     pub fn causal_mask(n: usize) -> Vec<f32> {
-        (0..n * n)
-            .map(|p| if p % n <= p / n { 0.0 } else { -1e30 })
+        causal_mask_kv(n, n)
+    }
+
+    /// `[q_len, kv_len]` mask for queries at positions `kv_len - q_len ..`:
+    /// query `i` sees keys `j <= kv_len - q_len + i`.
+    pub fn causal_mask_kv(q_len: usize, kv_len: usize) -> Vec<f32> {
+        let start = kv_len - q_len;
+        (0..q_len * kv_len)
+            .map(|p| {
+                if p % kv_len <= start + p / kv_len {
+                    0.0
+                } else {
+                    -1e30
+                }
+            })
             .collect()
     }
 
@@ -833,7 +846,12 @@ pub mod ir_block {
     use tang_expr::ExprId;
 
     pub struct BlockDims {
+        /// query tokens
         pub seq: usize,
+        /// keys/values attended to. `== seq`: prefill, k/v computed from
+        /// `x`. `> seq`: decode, rotated k/v caches are graph inputs and
+        /// the queries sit at positions `kv_len - seq ..`.
+        pub kv_len: usize,
         pub d_model: usize,
         pub n_heads: usize,
         pub n_kv_heads: usize,
@@ -846,6 +864,8 @@ pub mod ir_block {
         "x", "wq", "bq", "wk", "bk", "wv", "bv", "wo", "bo", "w_gate", "b_gate", "w_up", "b_up",
         "w_down", "b_down", "cos", "sin", "mask",
     ];
+    // Decode adds `k_cache`, `v_cache` (rotated, `[kv_len, kv_dim]`)
+    // between `sin` and `mask`.
 
     fn unit(rank: usize, d: usize) -> Form {
         let mut f = Form {
@@ -980,12 +1000,14 @@ pub mod ir_block {
     pub fn transformer_block_nodes(dims: &BlockDims) -> (TensorGraph, BlockNodes) {
         let BlockDims {
             seq,
+            kv_len,
             d_model,
             n_heads,
             n_kv_heads,
             head_dim,
             ff_dim,
         } = *dims;
+        let decode = kv_len != seq;
         let groups = n_kv_heads;
         let per_group = n_heads / n_kv_heads;
         let half = head_dim / 2;
@@ -1010,13 +1032,37 @@ pub mod ir_block {
         let cos = g.input(&[seq, half]);
         let sin = g.input(&[seq, half]);
 
+        let caches = decode.then(|| (g.input(&[kv_len, kv_dim]), g.input(&[kv_len, kv_dim])));
+
         let normed = rmsnorm(&mut g, x);
         let q = linear(&mut g, normed, wq, bq);
-        let k = linear(&mut g, normed, wk, bk);
-        let v = linear(&mut g, normed, wv, bv);
         let scale = 1.0 / (head_dim as f64).sqrt();
         let (qe, qo) = rope_split(&mut g, q, n_heads, head_dim, cos, sin, scale);
-        let (ke, ko) = rope_split(&mut g, k, n_kv_heads, head_dim, cos, sin, 1.0);
+        let (ke, ko, v) = match caches {
+            // cache rows are already rotated: split even/odd by view only
+            Some((k_cache, v_cache)) => {
+                let halves = [0i64, 1].map(|off| {
+                    let view = View {
+                        forms: vec![unit(3, 0), form(3, &[(1, head_dim as i64), (2, 2)], off)],
+                    };
+                    g.comp(
+                        &[kv_len, n_kv_heads, half],
+                        &[],
+                        vec![Arg { src: k_cache, view }],
+                        None,
+                        |v| vec![v[0]],
+                    )
+                    .unwrap()
+                });
+                (halves[0], halves[1], v_cache)
+            }
+            None => {
+                let k = linear(&mut g, normed, wk, bk);
+                let v = linear(&mut g, normed, wv, bv);
+                let (ke, ko) = rope_split(&mut g, k, n_kv_heads, head_dim, cos, sin, 1.0);
+                (ke, ko, v)
+            }
+        };
 
         // scores[gr, r, i, j] = Σ_i' qe[i, 3g+r, i']·ke[j, g, i'] + qo·ko  (+ causal mask)
         // space: (g, r, i, j, i')
@@ -1031,7 +1077,7 @@ pub mod ir_block {
         let kv = View {
             forms: vec![unit(r5, 3), unit(r5, 0), unit(r5, 4)],
         };
-        let s_out = [groups, per_group, seq, seq];
+        let s_out = [groups, per_group, seq, kv_len];
         let scores = g
             .comp(
                 &s_out,
@@ -1056,7 +1102,7 @@ pub mod ir_block {
         // input-free trick: mask = (j - i > 0 ? -1e30 : 0) via a map over an
         // index view is impossible without coordinate access, so the
         // mask is a graph input like in `naive_attention`.
-        let mask = g.input(&[seq, seq]);
+        let mask = g.input(&[seq, kv_len]);
         let r4 = 4;
         let masked = g
             .comp(
@@ -1087,7 +1133,7 @@ pub mod ir_block {
         let o = g
             .comp(
                 &o_out,
-                &[seq],
+                &[kv_len],
                 vec![
                     Arg {
                         src: p,
@@ -1227,7 +1273,7 @@ pub mod ir_block {
 /// Hand-written vs derived transformer block on the GPU.
 pub mod ir_block_gpu {
     use super::ir_block::{compiled_block, transformer_block, BlockDims};
-    use super::ir_gpu::{causal_mask, Executable};
+    use super::ir_gpu::{causal_mask_kv, Executable};
     use tang_gpu::nn::bias_add;
     use tang_gpu::*;
 
@@ -1243,6 +1289,9 @@ pub mod ir_block_gpu {
         pub up: GpuLinear,
         pub down: GpuLinear,
         pub rope: GpuInterleavedRoPE,
+        /// Rotated k/v caches `[kv_len, kv_dim]` for decode dims.
+        pub k_cache: Option<GpuTensor>,
+        pub v_cache: Option<GpuTensor>,
         pub dims: BlockDims,
         /// IR inputs in `ir_block::INPUTS` order (x first).
         pub cpu: Vec<Vec<f32>>,
@@ -1256,6 +1305,7 @@ pub mod ir_block_gpu {
     ) -> Params {
         let BlockDims {
             seq,
+            kv_len,
             d_model,
             n_kv_heads,
             head_dim,
@@ -1270,17 +1320,34 @@ pub mod ir_block_gpu {
         let gate = GpuLinear::kaiming(device, d_model, ff_dim, 46);
         let up = GpuLinear::kaiming(device, d_model, ff_dim, 47);
         let down = GpuLinear::kaiming(device, ff_dim, d_model, 48);
-        let rope = GpuInterleavedRoPE::new(device, head_dim, seq.max(16), 10000.0);
+        let rope = GpuInterleavedRoPE::new(device, head_dim, kv_len.max(16), 10000.0);
         let mut cpu = vec![x];
         for l in [&wq, &wk, &wv, &wo, &gate, &up, &down] {
             cpu.push(l.weight.to_vec_flushed(device, cache));
             cpu.push(l.bias.to_vec_flushed(device, cache));
         }
         let half = head_dim / 2;
-        cpu.push(rope.cos_table.to_vec_flushed(device, cache)[..seq * half].to_vec());
-        cpu.push(rope.sin_table.to_vec_flushed(device, cache)[..seq * half].to_vec());
-        cpu.push(causal_mask(seq));
+        let start = kv_len - seq;
+        cpu.push(
+            rope.cos_table.to_vec_flushed(device, cache)[start * half..kv_len * half].to_vec(),
+        );
+        cpu.push(
+            rope.sin_table.to_vec_flushed(device, cache)[start * half..kv_len * half].to_vec(),
+        );
+        let (k_cache, v_cache) = if kv_len != seq {
+            let mut rng = crate::Rng::new(77);
+            let kc: Vec<f32> = (0..kv_len * kv).map(|_| rng.f32() * 2.0 - 1.0).collect();
+            let vc: Vec<f32> = (0..kv_len * kv).map(|_| rng.f32() * 2.0 - 1.0).collect();
+            cpu.push(kc.clone());
+            cpu.push(vc.clone());
+            (Some(kc), Some(vc))
+        } else {
+            (None, None)
+        };
+        cpu.push(causal_mask_kv(seq, kv_len));
         Params {
+            k_cache: k_cache.map(|kc| GpuTensor::from_slice(device, &kc, &[kv_len, kv])),
+            v_cache: v_cache.map(|vc| GpuTensor::from_slice(device, &vc, &[kv_len, kv])),
             ln1: GpuRMSNorm::new(device, d_model, 1e-6),
             ln2: GpuRMSNorm::new(device, d_model, 1e-6),
             wq,
@@ -1327,18 +1394,27 @@ pub mod ir_block_gpu {
             let out = matmul::matmul(device, cache, x, &wt);
             bias_add(device, cache, &out, &l.bias)
         };
+        let start = d.kv_len - d.seq;
         let normed = p.ln1.forward(device, cache, input);
         let q = linear(cache, &p.wq, &normed);
-        let k = linear(cache, &p.wk, &normed);
-        let v = linear(cache, &p.wv, &normed);
         let q3 = q
             .clone_gpu_batched(device, cache)
             .reshape(&[d.seq, d.n_heads, d.head_dim]);
-        let k3 = k.reshape(&[d.seq, d.n_kv_heads, d.head_dim]);
-        let qr = p.rope.forward(device, cache, &q3, 0);
-        let kr = p.rope.forward(device, cache, &k3, 0);
+        let qr = p.rope.forward(device, cache, &q3, start);
         let q_flat = qr.reshape(&[d.seq, d.n_heads * d.head_dim]);
-        let k_flat = kr.reshape(&[d.seq, d.n_kv_heads * d.head_dim]);
+        let (k_flat, v) = match (&p.k_cache, &p.v_cache) {
+            (Some(kc), Some(vc)) => (
+                kc.clone_gpu_batched(device, cache),
+                vc.clone_gpu_batched(device, cache),
+            ),
+            _ => {
+                let k = linear(cache, &p.wk, &normed);
+                let v = linear(cache, &p.wv, &normed);
+                let k3 = k.reshape(&[d.seq, d.n_kv_heads, d.head_dim]);
+                let kr = p.rope.forward(device, cache, &k3, 0);
+                (kr.reshape(&[d.seq, d.n_kv_heads * d.head_dim]), v)
+            }
+        };
         let attn = kv_attention_fused(
             device,
             cache,
@@ -1346,11 +1422,11 @@ pub mod ir_block_gpu {
             &k_flat,
             &v,
             d.seq,
-            d.seq,
+            d.kv_len,
             d.n_heads,
             d.n_kv_heads,
             d.head_dim,
-            0,
+            start,
         );
         let proj = linear(cache, &p.wo, &attn);
         let res1 = add_tensors(device, cache, input, &proj);
@@ -1396,9 +1472,10 @@ pub mod ir_block_gpu {
         let (g, y) = compiled_block(&p.dims);
         let inputs: Vec<&[f32]> = p.cpu.iter().map(|v| v.as_slice()).collect();
         let path = format!(
-            "{}/target/tang-tuning-block-{}.txt",
+            "{}/target/tang-tuning-block-{}-{}.txt",
             env!("CARGO_MANIFEST_DIR"),
-            p.dims.seq
+            p.dims.seq,
+            p.dims.kv_len
         );
         let tc = super::ir_gpu::TuningCache::new(path);
         let (g, from_cache) = tc.tune(device, cache, g, &[y], &inputs);
@@ -1526,6 +1603,7 @@ pub mod ir_block_gpu {
             let mut cache = KernelCache::new();
             let dims = BlockDims {
                 seq: 12,
+                kv_len: 12,
                 d_model: 96,
                 n_heads: 6,
                 n_kv_heads: 2,
@@ -1636,6 +1714,46 @@ pub mod ir_block_gpu {
         }
 
         #[test]
+        fn derived_decode_block_matches_hand() {
+            let Ok(device) = GpuDevice::new_sync() else {
+                eprintln!("no GPU, skipping");
+                return;
+            };
+            let mut cache = KernelCache::new();
+            let dims = BlockDims {
+                seq: 2,
+                kv_len: 40,
+                d_model: 192,
+                n_heads: 6,
+                n_kv_heads: 2,
+                head_dim: 32,
+                ff_dim: 256,
+            };
+            let mut rng = crate::Rng::new(21);
+            let x: Vec<f32> = (0..dims.seq * dims.d_model)
+                .map(|_| rng.f32() * 2.0 - 1.0)
+                .collect();
+            let input = GpuTensor::from_slice(&device, &x, &[dims.seq, dims.d_model]);
+            let p = params(&device, &mut cache, dims, x);
+            let want =
+                hand_forward(&device, &mut cache, &p, &input).to_vec_flushed(&device, &mut cache);
+            let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            for scheduled in [false, true] {
+                let (exe, y) = ir_executable(&device, &p, scheduled);
+                exe.run(&device, &mut cache);
+                cache.flush(&device);
+                let got = exe.read(&device, y);
+                let err = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                eprintln!("decode ir(scheduled={scheduled}) vs hand: max err {err}");
+                assert!(err < 1e-3 * scale.max(1.0));
+            }
+        }
+
+        #[test]
         fn derived_block_matches_hand_block_on_gpu() {
             let Ok(device) = GpuDevice::new_sync() else {
                 eprintln!("no GPU, skipping");
@@ -1644,6 +1762,7 @@ pub mod ir_block_gpu {
             let mut cache = KernelCache::new();
             let dims = BlockDims {
                 seq: 24,
+                kv_len: 24,
                 d_model: 192,
                 n_heads: 6,
                 n_kv_heads: 2,

@@ -399,7 +399,19 @@ with the hand path and with the f64 interpreter to 5e-7.
 
 `ir_tuned` is the per-kernel autotuner's schedule, measured once per
 (program, device) and kept in a `TuningCache` file (`crates/tang-bench/
-target/tang-tuning-block-<seq>.txt`); later runs load it.
+target/tang-tuning-block-<seq>-<kv>.txt`); later runs load it.
+
+Decode (one query token against a rotated k/v cache, the launch-bound
+regime where hand kernels were expected to look best):
+
+| q / kv | hand | ir_auto | ir_tuned |
+|---|---|---|---|
+| 1 / 256 | 4.75 ms | **2.96 ms** | 2.98 ms |
+| 1 / 1024 | 7.78 ms | 2.79 ms | **2.73 ms** |
+
+The derived block issues 10 kernels to the hand path's ~16 and its
+attention kernel reads the cache once; both matter when every dispatch
+costs more than the math.
 
 (10 kernels; `examples/block_kernels.rs` times each one. An earlier
 version of `schedule_auto` lane-tiled the plain k/v projections and lost

@@ -395,9 +395,10 @@ mod gpu_block {
         let mut cache = KernelCache::new();
         let mut group = c.benchmark_group("kvi_gpu_transformer_block");
         group.sample_size(20);
-        for &seq in &[128usize, 512] {
+        for &(seq, kv_len) in &[(128usize, 128usize), (512, 512), (1, 256), (1, 1024)] {
             let dims = BlockDims {
                 seq,
+                kv_len,
                 d_model: 576,
                 n_heads: 9,
                 n_kv_heads: 3,
@@ -408,14 +409,19 @@ mod gpu_block {
             let x: Vec<f32> = (0..seq * 576).map(|_| rng.f32() * 2.0 - 1.0).collect();
             let input = GpuTensor::from_slice(&device, &x, &[seq, 576]);
             let p = params(&device, &mut cache, dims, x);
-            group.bench_function(BenchmarkId::new("hand", seq), |b| {
+            let id = if seq == kv_len {
+                format!("prefill_{seq}")
+            } else {
+                format!("decode_q{seq}_kv{kv_len}")
+            };
+            group.bench_function(BenchmarkId::new("hand", &id), |b| {
                 b.iter(|| {
                     let out = hand_forward(&device, &mut cache, &p, &input);
                     black_box(out.to_vec_flushed(&device, &mut cache));
                 })
             });
             let (exe, y) = ir_executable(&device, &p, true);
-            group.bench_function(BenchmarkId::new("ir_auto", seq), |b| {
+            group.bench_function(BenchmarkId::new("ir_auto", &id), |b| {
                 b.iter(|| {
                     exe.run(&device, &mut cache);
                     cache.flush(&device);
@@ -423,7 +429,7 @@ mod gpu_block {
                 })
             });
             let (exe, y) = ir_executable_tuned(&device, &mut cache, &p);
-            group.bench_function(BenchmarkId::new("ir_tuned", seq), |b| {
+            group.bench_function(BenchmarkId::new("ir_tuned", &id), |b| {
                 b.iter(|| {
                     exe.run(&device, &mut cache);
                     cache.flush(&device);

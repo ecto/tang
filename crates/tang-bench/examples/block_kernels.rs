@@ -9,6 +9,7 @@ fn main() {
     let seq = 128;
     let dims = BlockDims {
         seq,
+        kv_len: seq,
         d_model: 576,
         n_heads: 9,
         n_kv_heads: 3,
