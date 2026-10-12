@@ -261,8 +261,8 @@ pub mod ir_gpu {
     use tang::Scalar;
     use tang_compile::tensor::precision::{f16_bits, f16_from_bits};
     use tang_compile::tensor::wgsl::WgslProgram;
-    use tang_compile::tensor::{ErrorBudget, ErrorStats, Format, Op, Precision};
     use tang_compile::tensor::{Arg, Form, Monoid, ScheduleCandidate, TensorGraph, TensorId, View};
+    use tang_compile::tensor::{ErrorBudget, ErrorStats, Format, Op, Precision};
     use tang_expr::ExprId;
     use tang_gpu::{GpuBuffer, GpuDevice, KernelCache};
 
@@ -651,7 +651,7 @@ pub mod ir_gpu {
             .iter()
             .map(|b| (b.node, cur.buffer_bytes(b.node)))
             .collect();
-        bufs.sort_by(|a, b| b.1.cmp(&a.1));
+        bufs.sort_by_key(|b| std::cmp::Reverse(b.1));
         for (node, _) in bufs {
             let mut p = cur.precision(node);
             p.storage = Format::F16;
@@ -676,9 +676,7 @@ pub mod ir_gpu {
 
         let reductions: Vec<TensorId> = (0..cur.nodes().len())
             .map(TensorId::from_index)
-            .filter(|&t| {
-                matches!(&cur.nodes()[t.index()].op, Op::Comp(c) if c.monoid.is_some())
-            })
+            .filter(|&t| matches!(&cur.nodes()[t.index()].op, Op::Comp(c) if c.monoid.is_some()))
             .collect();
         for node in reductions {
             let mut p = cur.precision(node);
@@ -1316,11 +1314,21 @@ pub mod ir_gpu {
                     for t in [ga, gb, gbias, z] {
                         g.set_precision(t, half);
                     }
-                    g.set_precision(y, Precision { storage: Format::F16, accum });
+                    g.set_precision(
+                        y,
+                        Precision {
+                            storage: Format::F16,
+                            accum,
+                        },
+                    );
                     g.set_schedule(y, split, tile, reg);
                     let emu = g.eval_emulated(&inputs, &[y, z]);
                     let exe = Executable::new(&device, g.to_wgsl(&[y, z]), &[&a, &b, &bias]);
-                    assert!(exe.program.kernels.iter().all(|k| k.source.contains("unpack2x16float")));
+                    assert!(exe
+                        .program
+                        .kernels
+                        .iter()
+                        .all(|k| k.source.contains("unpack2x16float")));
                     exe.run(&device, &mut cache);
                     cache.flush(&device);
                     // the f16 accumulator rounds in the interpreter's order
@@ -1381,7 +1389,10 @@ pub mod ir_gpu {
                 3,
             );
             assert!(tight.assignment.is_empty());
-            assert!(tight.trials.iter().all(|t| !ErrorBudget::rel(1e-5).admits(&t.error)));
+            assert!(tight
+                .trials
+                .iter()
+                .all(|t| !ErrorBudget::rel(1e-5).admits(&t.error)));
             let loose = tune_precision(
                 &device,
                 &mut cache,

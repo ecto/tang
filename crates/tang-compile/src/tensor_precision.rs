@@ -226,17 +226,17 @@ mod tests {
             (1.0, 0x3c00),
             (-2.0, 0xc000),
             (0.5, 0x3800),
-            (65504.0, 0x7bff),           // max finite
-            (2f64.powi(-14), 0x0400),    // min normal
-            (2f64.powi(-24), 0x0001),    // min subnormal
+            (65504.0, 0x7bff),                 // max finite
+            (2f64.powi(-14), 0x0400),          // min normal
+            (2f64.powi(-24), 0x0001),          // min subnormal
             (1023.0 * 2f64.powi(-24), 0x03ff), // max subnormal
             (1.0 / 3.0, 0x3555),
             (std::f64::consts::PI, 0x4248),
-            (65520.0, 0x7c00),           // halfway past max: ties to even → ∞
+            (65520.0, 0x7c00), // halfway past max: ties to even → ∞
             (65519.0, 0x7bff),
             (1e6, 0x7c00),
             (-1e6, 0xfc00),
-            (2f64.powi(-25), 0x0000),    // half the min subnormal: tie → even (0)
+            (2f64.powi(-25), 0x0000), // half the min subnormal: tie → even (0)
             (3.0 * 2f64.powi(-25), 0x0002), // 1.5 ulp: tie → even (2)
             (1.0 + 2f64.powi(-11), 0x3c00), // tie between 1 and 1+2⁻¹⁰ → even
             (1.0 + 3.0 * 2f64.powi(-11), 0x3c02),
@@ -265,7 +265,7 @@ mod tests {
             (1.0 + 2f64.powi(-8), 0x3f80), // tie → even
             (1.0 + 3.0 * 2f64.powi(-8), 0x3f82),
             (3.0e38, 0x7f62),
-            (3.4e38, 0x7f80), // above max bf16 (3.39e38) + half ulp → ∞
+            (3.4e38, 0x7f80),          // above max bf16 (3.39e38) + half ulp → ∞
             (2f64.powi(-133), 0x0001), // min subnormal
         ];
         for &(x, bits) in cases {
@@ -290,9 +290,15 @@ mod tests {
         let s = g.reduce(x, 1, Monoid::sum()).unwrap();
         assert!(g.nodes().iter().all(|n| n.precision == Precision::F32));
         let xs: Vec<f64> = (0..256).map(|i| (i as f64 * 0.37).sin()).collect();
-        let a = g.eval(&[xs.clone()], &[s]);
-        g.set_precision(s, Precision { storage: Format::F16, accum: Format::F16 });
-        assert_eq!(g.eval(&[xs.clone()], &[s]), a);
+        let a = g.eval(std::slice::from_ref(&xs), &[s]);
+        g.set_precision(
+            s,
+            Precision {
+                storage: Format::F16,
+                accum: Format::F16,
+            },
+        );
+        assert_eq!(g.eval(std::slice::from_ref(&xs), &[s]), a);
         assert_ne!(g.eval_emulated(&[xs], &[s]), a);
     }
 
@@ -304,14 +310,22 @@ mod tests {
         let mut g = TensorGraph::new();
         let x = g.input(&[1, n]);
         let s = g.reduce(x, 1, Monoid::sum()).unwrap();
-        let xs = vec![(0..n).map(|i| 0.01 + 0.001 * ((i % 7) as f64)).collect::<Vec<_>>()];
+        let xs = vec![(0..n)
+            .map(|i| 0.01 + 0.001 * ((i % 7) as f64))
+            .collect::<Vec<_>>()];
         let budget = ErrorBudget::rel(1e-2);
         // f16 storage of the input alone is fine (each term off by ≤ 2⁻¹¹)
         g.set_precision(x, Precision::storage(Format::F16));
         let st = g.precision_error(&xs, &[s]);
         assert!(budget.admits(&st), "{st:?}");
         // accumulating in f16 is not
-        g.set_precision(s, Precision { storage: Format::F32, accum: Format::F16 });
+        g.set_precision(
+            s,
+            Precision {
+                storage: Format::F32,
+                accum: Format::F16,
+            },
+        );
         let st = g.precision_error(&xs, &[s]);
         assert!(!budget.admits(&st), "{st:?}");
         assert!(st.max_rel > 0.05, "{st:?}");
@@ -326,7 +340,7 @@ mod tests {
         let y = g.map(&[x], |v| v[0] * v[0] + v[0]).unwrap();
         g.set_precision(y, Precision::storage(Format::F16));
         let xs: Vec<f64> = (0..8).map(|i| 0.1 + i as f64 * 0.731).collect();
-        let want = g.eval(&[xs.clone()], &[y]);
+        let want = g.eval(std::slice::from_ref(&xs), &[y]);
         let got = g.eval_emulated(&[xs], &[y]);
         for (a, b) in got[0].iter().zip(&want[0]) {
             assert_eq!(*a, Format::F16.round(*b));
@@ -354,7 +368,9 @@ mod tests {
         g.set_precision(x, Precision::storage(Format::F16));
         let grads = g.backward(y, &[x, a]).unwrap();
         let da = grads[1];
-        let xs: Vec<f64> = (0..c * t).map(|i| ((i * 7919) % 1000) as f64 / 500.0 - 1.0).collect();
+        let xs: Vec<f64> = (0..c * t)
+            .map(|i| ((i * 7919) % 1000) as f64 / 500.0 - 1.0)
+            .collect();
         let inputs = vec![xs, vec![0.8, 1.3]];
         let budget = ErrorBudget::rel(1e-3);
         // f16 x, f32 accumulation: within budget
@@ -367,19 +383,29 @@ mod tests {
             .collect();
         assert!(!long.is_empty(), "dα reduces over t");
         for &r in &long {
-            g.set_precision(r, Precision { storage: Format::F32, accum: Format::F16 });
+            g.set_precision(
+                r,
+                Precision {
+                    storage: Format::F32,
+                    accum: Format::F16,
+                },
+            );
         }
         let st = g.precision_error(&inputs, &[da]);
-        assert!(!budget.admits(&st), "f16 dα over T={t} should blow the budget: {st:?}");
+        assert!(
+            !budget.admits(&st),
+            "f16 dα over T={t} should blow the budget: {st:?}"
+        );
         // the lowering honours both: x read as packed f16, dα rounded per step
         let p = g.to_wgsl(&[y, da]);
         let xb = p.buffers.iter().find(|b| b.node == x).unwrap();
         assert_eq!(xb.format, Format::F16);
-        assert!(p.kernels.iter().any(|k| k.source.contains("pack2x16float(vec2<f32>(")));
         assert!(p
             .kernels
             .iter()
-            .filter(|k| k.reads.contains(&x))
-            .all(|k| k.source.contains(&format!("unpack2x16float(b{}", x.index()))));
+            .any(|k| k.source.contains("pack2x16float(vec2<f32>(")));
+        assert!(p.kernels.iter().filter(|k| k.reads.contains(&x)).all(|k| k
+            .source
+            .contains(&format!("unpack2x16float(b{}", x.index()))));
     }
 }

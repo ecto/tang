@@ -395,7 +395,13 @@ impl TensorGraph {
             .unwrap();
             indent.push_str("    ");
         }
-        emit_step(s, &indent, &format!("body_{j}({reads})"), m, self.nodes[j].precision.accum);
+        emit_step(
+            s,
+            &indent,
+            &format!("body_{j}({reads})"),
+            m,
+            self.nodes[j].precision.accum,
+        );
         for _ in &c.red {
             indent.truncate(indent.len() - 4);
             writeln!(s, "{indent}}}").unwrap();

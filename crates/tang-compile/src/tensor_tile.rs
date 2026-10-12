@@ -1164,10 +1164,8 @@ impl TensorGraph {
                 writeln!(s, "            {line}").unwrap();
             }
             let accum = self.nodes[core].precision.accum;
-            let combined_t: Vec<String> = combined
-                .iter()
-                .map(|e| quant(accum, &rename(e)))
-                .collect();
+            let combined_t: Vec<String> =
+                combined.iter().map(|e| quant(accum, &rename(e))).collect();
             writeln!(
                 s,
                 "            acc{t} = array<f32, {w}>({});",

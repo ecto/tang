@@ -12,8 +12,7 @@ use std::time::Instant;
 use tang::Scalar;
 use tang_bench::ir_gpu::{autotune_kernels, tune_precision, Executable};
 use tang_compile::tensor::{
-    Arg, ErrorBudget, ErrorStats, Form, Format, Monoid, Op, Precision, TensorGraph, TensorId,
-    View,
+    Arg, ErrorBudget, ErrorStats, Form, Format, Monoid, Op, Precision, TensorGraph, TensorId, View,
 };
 use tang_expr::ExprId;
 use tang_gpu::{GpuDevice, KernelCache};
@@ -1058,7 +1057,11 @@ fn matmul_ref(a: &[f64], b: &[f64], m: usize, k: usize, n: usize) -> Vec<f64> {
 }
 
 fn small_inputs(g: &TensorGraph, seed: u64, scales: &[f32]) -> Vec<Vec<f64>> {
-    let n_in = g.nodes().iter().filter(|n| matches!(n.op, Op::Input(_))).count();
+    let n_in = g
+        .nodes()
+        .iter()
+        .filter(|n| matches!(n.op, Op::Input(_)))
+        .count();
     (0..n_in)
         .map(|k| {
             let node = g
@@ -1104,7 +1107,11 @@ fn fmt_prec(p: Precision) -> String {
 /// The small instance with the same precision assignment, error predicted
 /// by the interpreter (`None` if the passes produced a different node
 /// layout at the small size, so ids don't line up).
-fn predict(op: &PrecOp, full: &TensorGraph, assignment: &[(TensorId, Precision)]) -> Option<ErrorStats> {
+fn predict(
+    op: &PrecOp,
+    full: &TensorGraph,
+    assignment: &[(TensorId, Precision)],
+) -> Option<ErrorStats> {
     let (sg, souts, sin) = &op.small;
     let (mut sg, souts) = optimized(sg, souts);
     if sg.nodes().len() != full.nodes().len() {
@@ -1119,7 +1126,10 @@ fn predict(op: &PrecOp, full: &TensorGraph, assignment: &[(TensorId, Precision)]
 
 fn precision_main(device: &GpuDevice, cache: &mut KernelCache, only: Option<String>) {
     let want_op = |n: &str| only.as_deref().is_none_or(|o| n.starts_with(o));
-    println!("{} — precision schedules, kernel-only, {ITERS} launches\n", device.name);
+    println!(
+        "{} — precision schedules, kernel-only, {ITERS} launches\n",
+        device.name
+    );
     let mut ops: Vec<PrecOp> = Vec::new();
 
     if want_op("a") {
@@ -1167,11 +1177,7 @@ fn precision_main(device: &GpuDevice, cache: &mut KernelCache, only: Option<Stri
         let (g, outs) = istft_graph(frames);
         let sf = 200;
         let (sg, so) = istft_graph(sf);
-        let si = vec![
-            f64s(&rand(22 * sf, 120, 1.0)),
-            hann(20),
-            istft_env(sf),
-        ];
+        let si = vec![f64s(&rand(22 * sf, 120, 1.0)), hann(20), istft_env(sf)];
         ops.push(PrecOp {
             name: "c iSTFT n_fft20 hop5 T4000",
             g,
@@ -1216,7 +1222,12 @@ fn precision_main(device: &GpuDevice, cache: &mut KernelCache, only: Option<Stri
             rand(cf * ff, 19, 0.02),
             rand(cf, 20, 0.1),
         ];
-        let want = convnext_ref(&inputs.iter().map(|v| f64s(v)).collect::<Vec<_>>(), cf, tf, ff);
+        let want = convnext_ref(
+            &inputs.iter().map(|v| f64s(v)).collect::<Vec<_>>(),
+            cf,
+            tf,
+            ff,
+        );
         let cn = convnext_graph(cf, tf, ff);
         let sm = convnext_graph(32, 24, 96);
         let si = small_inputs(&sm.g, 140, &[1.0, 0.3, 0.1, 0.2, 0.1, 0.04, 0.1, 0.02, 0.1]);
@@ -1258,9 +1269,18 @@ fn precision_main(device: &GpuDevice, cache: &mut KernelCache, only: Option<Stri
                 if let Op::Comp(c) = &n.op {
                     if c.monoid.is_some() {
                         let mut v = g.clone();
-                        v.set_precision(TensorId::from_index(i), Precision { storage: Format::F32, accum: Format::F16 });
+                        v.set_precision(
+                            TensorId::from_index(i),
+                            Precision {
+                                storage: Format::F32,
+                                accum: Format::F16,
+                            },
+                        );
                         let e = v.precision_error(sin, &outs);
-                        println!("{} n{i} inline={} red={:?} out={:?} acc f16 → {:.1e}", op.name, n.inline, c.red, n.shape, e.max_rel);
+                        println!(
+                            "{} n{i} inline={} red={:?} out={:?} acc f16 → {:.1e}",
+                            op.name, n.inline, c.red, n.shape, e.max_rel
+                        );
                     }
                 }
             }
@@ -1278,13 +1298,28 @@ fn precision_main(device: &GpuDevice, cache: &mut KernelCache, only: Option<Stri
         let want = vec![op.want.clone()];
         for rel in [1e-2, 1e-3] {
             let budget = ErrorBudget::rel(rel);
-            let r = tune_precision(device, cache, tuned.clone(), &outs, &refs, &want, budget, ITERS);
+            let r = tune_precision(
+                device,
+                cache,
+                tuned.clone(),
+                &outs,
+                &refs,
+                &want,
+                budget,
+                ITERS,
+            );
             let assign = if r.assignment.is_empty() {
                 "all f32".to_string()
             } else {
                 r.assignment
                     .iter()
-                    .map(|&(t, p)| format!("{} {}", describe(&r.graph, t, &op.names, &outs), fmt_prec(p)))
+                    .map(|&(t, p)| {
+                        format!(
+                            "{} {}",
+                            describe(&r.graph, t, &op.names, &outs),
+                            fmt_prec(p)
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join(", ")
             };
