@@ -260,7 +260,7 @@ pub fn random_spd_flat(size: usize) -> Vec<f64> {
 pub mod ir_gpu {
     use tang::Scalar;
     use tang_compile::tensor::wgsl::WgslProgram;
-    use tang_compile::tensor::{Arg, Form, Monoid, TensorGraph, TensorId, View};
+    use tang_compile::tensor::{Arg, Form, Monoid, ScheduleCandidate, TensorGraph, TensorId, View};
     use tang_expr::ExprId;
     use tang_gpu::{GpuBuffer, GpuDevice, KernelCache};
 
@@ -497,7 +497,7 @@ pub mod ir_gpu {
         let mut log = Vec::new();
         for i in 0..base.program.kernels.len() {
             let node = base.program.kernels[i].node;
-            let mut best: Option<(u32, (u32, u32, u32), (u32, u32), std::time::Duration)> = None;
+            let mut best: Option<(ScheduleCandidate, std::time::Duration)> = None;
             for (split, tile, reg) in g.schedule_candidates(node) {
                 let mut variant = g.clone();
                 variant.set_schedule(node, split, tile, reg);
@@ -516,7 +516,7 @@ pub mod ir_gpu {
                 cache.flush(device);
                 let _ = exe.read(device, node);
                 let probe = probe.elapsed();
-                if best.is_some_and(|b| probe > b.3 * 4) {
+                if best.is_some_and(|b| probe > b.1 * 4) {
                     continue;
                 }
                 let start = std::time::Instant::now();
@@ -526,11 +526,11 @@ pub mod ir_gpu {
                 cache.flush(device);
                 let _ = exe.read(device, node);
                 let t = start.elapsed() / iters as u32;
-                if best.is_none_or(|b| t < b.3) {
-                    best = Some((split, tile, reg, t));
+                if best.is_none_or(|b| t < b.1) {
+                    best = Some(((split, tile, reg), t));
                 }
             }
-            let (split, tile, reg, time) = best.unwrap();
+            let ((split, tile, reg), time) = best.unwrap();
             g.set_schedule(node, split, tile, reg);
             log.push(TunedKernel {
                 node,

@@ -57,20 +57,20 @@ pub struct Form {
 }
 
 impl Form {
-    fn zero(rank: usize) -> Self {
+    pub fn zero(rank: usize) -> Self {
         Self {
             coefs: vec![0; rank],
             offset: 0,
         }
     }
 
-    fn unit(rank: usize, d: usize) -> Self {
+    pub fn unit(rank: usize, d: usize) -> Self {
         let mut f = Self::zero(rank);
         f.coefs[d] = 1;
         f
     }
 
-    fn constant(rank: usize, c: i64) -> Self {
+    pub fn constant(rank: usize, c: i64) -> Self {
         let mut f = Self::zero(rank);
         f.offset = c;
         f
@@ -379,6 +379,9 @@ pub struct TNode {
     pub reg: (u32, u32),
 }
 
+/// `(split, tile, reg)` — one thread mapping for a comp.
+pub type ScheduleCandidate = (u32, (u32, u32, u32), (u32, u32));
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShapeError(pub String);
 
@@ -490,7 +493,7 @@ impl TensorGraph {
     /// Thread mappings worth trying for a materialized comp on a GPU:
     /// one thread per point, a workgroup split (reductions), and rows ×
     /// lanes tiles (single-axis reductions with a lane dim).
-    pub fn schedule_candidates(&self, t: TensorId) -> Vec<(u32, (u32, u32, u32), (u32, u32))> {
+    pub fn schedule_candidates(&self, t: TensorId) -> Vec<ScheduleCandidate> {
         let mut out = vec![(0, (0, 0, 0), (1, 1))];
         let Some(c) = self.comp_at(t.n()) else {
             return out;
@@ -1605,6 +1608,139 @@ impl TensorGraph {
         }
     }
 
+    /// Placement: split the (single) reduce axis of comp `t` into `parts`
+    /// partial reductions over contiguous slices — each a comp that can
+    /// live on its own device — plus a combine that folds the partials
+    /// with the monoid. Returns `(graph, partials, combined)`; the
+    /// combined node is interchangeable with `t`. Tiling a reduce axis
+    /// across threads and sharding it across devices are the same
+    /// transform; this is the latter with the all-reduce written as a
+    /// comprehension over the partial results.
+    pub fn shard_reduction(
+        &self,
+        t: TensorId,
+        parts: usize,
+    ) -> Result<(TensorGraph, Vec<TensorId>, TensorId), ShapeError> {
+        let Some(c) = self.comp_at(t.n()) else {
+            return err("shard_reduction: not a comp");
+        };
+        let Some(m) = &c.monoid else {
+            return err("shard_reduction: not a reduction");
+        };
+        if c.red.len() != 1 {
+            return err("shard_reduction: one reduce axis only");
+        }
+        let total = c.red[0].n();
+        if parts == 0 || total % parts != 0 {
+            return err(format!(
+                "shard_reduction: {total} keys do not split into {parts}"
+            ));
+        }
+        let per = total / parts;
+        let red_coord = c.points().len();
+        let mut g = self.clone();
+        let partials: Vec<TensorId> = (0..parts)
+            .map(|p| {
+                let shift = (p * per) as i64;
+                let args = c
+                    .args
+                    .iter()
+                    .map(|a| Arg {
+                        src: a.src,
+                        view: View {
+                            forms: a
+                                .view
+                                .forms
+                                .iter()
+                                .map(|f| Form {
+                                    coefs: f.coefs.clone(),
+                                    offset: f.offset + f.coefs[red_coord] * shift,
+                                })
+                                .collect(),
+                        },
+                    })
+                    .collect();
+                let mut out = c.out.clone();
+                if c.tuple == 0 {
+                    out.push(Dim::Fixed(1));
+                }
+                g.push_comp(Comp {
+                    out,
+                    tuple: 1,
+                    red: vec![Dim::Fixed(per)],
+                    args,
+                    body: c.body.clone(),
+                    body_outs: c.body_outs.clone(),
+                    monoid: Some(m.clone()),
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let acc = g.fold_partials(&partials, m)?;
+        // present the result in `t`'s own shape
+        let combined = if c.tuple == 0 {
+            g.reshape(acc, &c.out.clone())?
+        } else {
+            acc
+        };
+        Ok((g, partials, combined))
+    }
+
+    /// The all-reduce as a comprehension: fold tuple-valued partial
+    /// results `[points…, width]` with the monoid's combine, slot by slot.
+    /// The partials may be inputs (results shipped from other devices).
+    pub fn fold_partials(
+        &mut self,
+        partials: &[TensorId],
+        m: &Monoid,
+    ) -> Result<TensorId, ShapeError> {
+        let Some(&first) = partials.first() else {
+            return err("fold_partials: no partials");
+        };
+        let shape = self.shape(first).to_vec();
+        let w = m.width;
+        if shape.last() != Some(&Dim::Fixed(w)) {
+            return err(format!(
+                "fold_partials: shape {shape:?} does not end in width {w}"
+            ));
+        }
+        let rank = shape.len() - 1;
+        let slot_view = |s: usize| View {
+            forms: (0..rank)
+                .map(|d| Form::unit(rank, d))
+                .chain([Form::constant(rank, s as i64)])
+                .collect(),
+        };
+        let mut acc = first;
+        for &p in &partials[1..] {
+            let mut args = Vec::new();
+            for s in 0..w {
+                args.push(Arg {
+                    src: acc,
+                    view: slot_view(s),
+                });
+            }
+            for s in 0..w {
+                args.push(Arg {
+                    src: p,
+                    view: slot_view(s),
+                });
+            }
+            let mut body = ExprGraph::new();
+            let vars: Vec<ExprId> = (0..2 * w).map(|i| body.var(i as u16)).collect();
+            let outs = replay(&m.combine, &m.outs, &vars, &mut body);
+            acc = self.push_comp(Comp {
+                out: shape.clone(),
+                tuple: 1,
+                red: vec![],
+                args,
+                body,
+                body_outs: outs,
+                monoid: None,
+            })?;
+        }
+        Ok(acc)
+    }
+
     // -- reference interpreter -------------------------------------------------
 
     /// Evaluate `outputs`. Materialized nodes are computed once into
@@ -1925,6 +2061,45 @@ mod tests {
         assert!(g
             .comp(&[2, 3], &[], vec![out_of_bounds], None, |v| vec![v[0]])
             .is_err());
+    }
+
+    /// Sharding the key axis of the flash-fused attention across two
+    /// "devices" and folding the partial (m, l, acc) states with the
+    /// online-softmax combine reproduces the unsharded result exactly.
+    #[test]
+    fn sharded_online_softmax_is_the_all_reduce() {
+        let (n, d, dv) = (8, 4, 4);
+        let mut g = TensorGraph::new();
+        let q = g.input(&[n, d]);
+        let k = g.input(&[n, d]);
+        let v = g.input(&[n, dv]);
+        let y = naive_attention(&mut g, q, k, v, false);
+        let (g, outs) = g.stabilize_softmax(&[y]);
+        let (g, _outs) = g.substitute_maps(&outs);
+        let fused = (0..g.nodes().len())
+            .find(|&i| matches!(&g.nodes()[i].op, Op::Comp(c) if c.tuple == 1))
+            .unwrap();
+        let fused = TensorId::from_index(fused);
+        let (sg, partials, combined) = g.shard_reduction(fused, 2).unwrap();
+        assert_eq!(partials.len(), 2);
+        let inputs = [
+            ramp(n * d, 0.05, -1.0),
+            ramp(n * d, 0.07, 0.3),
+            ramp(n * dv, 0.1, -2.0),
+        ];
+        let want = g.eval(&inputs, &[fused]).remove(0);
+        let got = sg.eval(&inputs, &[combined]).remove(0);
+        close(&got, &want);
+        // and a plain sum, which must shard too
+        let mut g = TensorGraph::new();
+        let x = g.input(&[3, 6]);
+        let s = g.reduce(x, 1, Monoid::sum()).unwrap();
+        let (sg, _, c) = g.shard_reduction(s, 3).unwrap();
+        let data = ramp(18, 0.5, -1.0);
+        close(
+            &sg.eval(std::slice::from_ref(&data), &[c])[0],
+            &g.eval(std::slice::from_ref(&data), &[s])[0],
+        );
     }
 
     #[test]
