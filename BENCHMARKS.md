@@ -617,3 +617,59 @@ attention's 256 keys as two partial (m, l, acc) states on two wgpu
 devices and merges them with the online-softmax combine: max error
 1.7e-6 (M4) / 1.4e-6 (3090) against the single-device result. Transport
 is host-mediated; the IR side of sequence parallelism is done.
+
+## Against PyTorch (RTX 3090, kernel-only)
+
+Everything above compares derived kernels with tang's own hand-written
+ones, and every criterion number includes ~1.3 ms of submit + readback.
+This section is the comparison that matters: `scripts/torch_bench.py`
+(PyTorch 2.10 + cu128, CUDA events, fp32 with TF32 off) against
+`examples/kernel_only.rs` (50 launches, one sync, divide) on the same
+3090, same shapes.
+
+| op | tang hand | tang derived (best) | PyTorch fp32 | derived ÷ torch |
+|---|---|---|---|---|
+| matmul 1024² | 1.38 ms | 0.54 ms (4×4 register tile) | **0.112 ms** (TF32: 0.079) | 4.8× |
+| matmul 128×576×1536 | 0.38 | 0.20 | **0.030** | 7× |
+| matmul 512×576×1536 | 0.65 | 0.28 | **0.053** | 5× |
+| causal attention n=512, d=64 | 1.31 | 0.27 | **0.090** (sdpa) / 0.040 (naive) | 3–7× |
+| causal attention n=1024 | 3.55 | 0.77 | **0.180** / 0.078 | 4–10× |
+| transformer block fwd, seq 128 | 2.25 | 1.97 | **0.295** | 6.7× |
+| transformer block fwd, seq 512 | 10.1 | 4.41 | **0.610** | 7× |
+| block fwd+bwd, seq 128 | (CPU bwd) | 5.0 | **1.32** | 3.8× |
+| block fwd+bwd, seq 512 | (CPU bwd) | 10.1 | **1.73** | 5.9× |
+| adam step 4M | 0.85 | 0.54 | **0.395** | 1.4× |
+
+So the derived kernels are 2–4× faster than tang's hand-written ones and
+4–7× slower than PyTorch. Both statements are true; only the second one
+says how fast this is.
+
+Where the gap is, and how much of it this path can close:
+
+- **Matmul instruction quality.** 0.54 ms at 1024² is ~4 TFLOPS; cuBLAS
+  fp32 reaches ~19 TFLOPS on this part. The derived tile uses scalar
+  loads, a 4×4 register tile, 32-wide chunks with a barrier each, and no
+  double buffering. An 8×8 register tile with `vec4` loads and a 128×128
+  block is the known recipe for ~10–15 TFLOPS in a portable shader —
+  roughly 3× from here, within ~2× of cuBLAS. That is the ceiling for
+  fp32 through WGSL.
+- **Tensor cores are off the table.** TF32/FP16 MMA is not reachable from
+  WGSL/wgpu today (no cooperative-matrix extension). That is the other
+  2–4× PyTorch has, and it is a backend question (MSL simdgroup matrices,
+  CUDA via `tang-expr`'s CUDA dialect), not a schedule question.
+- **Launch overhead.** The block issues 16 kernels (72 with backward),
+  each submitted as its own command buffer through wgpu; seq 128 forward
+  is 1.97 ms for ~0.6 ms of math. One command buffer per program and
+  epilogue fusion (bias/activation into the matmul's write-out) would
+  take most of that; PyTorch's 0.295 ms is ~10 cuBLAS/flash launches.
+- **Attention.** Flash-attention proper keeps the (m, l, acc) state in
+  registers across a 64-key tile computed as two small tensor-core
+  matmuls; ours recomputes q·k cooperatively into shared memory with
+  scalar FMAs. Same structure, 4–10× slower execution, for the two
+  reasons above.
+
+What this does and does not show: the compiler derives the *structure* of
+the fast kernels (flash attention, register-tiled matmul, sequence
+parallelism) from the algebra, with no op-specific code, and picks per
+chip. It does not yet generate the instruction-level quality of a vendor
+library, and through this backend it cannot reach tensor cores at all.
