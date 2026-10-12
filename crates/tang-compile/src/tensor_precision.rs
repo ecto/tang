@@ -404,8 +404,13 @@ mod tests {
             .kernels
             .iter()
             .any(|k| k.source.contains("pack2x16float(vec2<f32>(")));
-        assert!(p.kernels.iter().filter(|k| k.reads.contains(&x)).all(|k| k
-            .source
-            .contains(&format!("unpack2x16float(b{}", x.index()))));
+        // canonical sources name read `i` `b{i}` (bindings come first)
+        assert!(p
+            .kernels
+            .iter()
+            .all(|k| match k.reads.iter().position(|r| *r == x) {
+                Some(i) => k.source.contains(&format!("unpack2x16float(b{i}")),
+                None => true,
+            }));
     }
 }

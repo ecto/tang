@@ -98,7 +98,62 @@ pub struct WgslProgram {
     pub aliases: Vec<(TensorId, TensorId)>,
 }
 
+/// Identifier prefixes the emitters follow with a graph node number:
+/// buffers `b{j}` and per-node functions `read_{j}`, `body_{j}`,
+/// `point_{j}`, `combine_{j}`.
+const NODE_PREFIXES: [&str; 5] = ["b", "read_", "body_", "point_", "combine_"];
+
+/// `src` with the node numbers in node-named identifiers (see
+/// `NODE_PREFIXES`) renumbered `0, 1, …` in order of first appearance.
+/// The renaming is a bijection on numbers applied to every such
+/// identifier, so the kernel means the same thing; two kernels that
+/// differ only in which nodes they touch become the same string. Binding
+/// order is unchanged (`reads`), so one compiled source serves every
+/// launch. Shapes, constants and views are literals and stay as they are.
+pub fn canonical_source(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut out = String::with_capacity(src.len());
+    let mut numbers: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !ident(bytes[i]) {
+            let start = i;
+            while i < bytes.len() && !ident(bytes[i]) {
+                i += 1;
+            }
+            out.push_str(&src[start..i]);
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && ident(bytes[i]) {
+            i += 1;
+        }
+        let tok = &src[start..i];
+        let digits = tok.len() - tok.bytes().rev().take_while(u8::is_ascii_digit).count();
+        let (head, num) = tok.split_at(digits);
+        if num.is_empty() || !NODE_PREFIXES.contains(&head) || bytes[start].is_ascii_digit() {
+            out.push_str(tok);
+            continue;
+        }
+        let k = numbers.iter().position(|n| *n == num).unwrap_or_else(|| {
+            numbers.push(num);
+            numbers.len() - 1
+        });
+        write!(out, "{head}{k}").unwrap();
+    }
+    out
+}
+
 impl WgslProgram {
+    /// Every kernel source made [canonical](canonical_source).
+    pub fn canonical(mut self) -> Self {
+        for k in &mut self.kernels {
+            k.source = canonical_source(&k.source);
+        }
+        self
+    }
+
     /// The buffer-owning node for `t` (itself unless `t` is a reshape).
     pub fn storage(&self, t: TensorId) -> TensorId {
         self.aliases
@@ -121,7 +176,17 @@ impl TensorGraph {
         self.to_program(outputs, Target::MslMma)
     }
 
+    /// Lower to kernels. Sources are [canonical](canonical_source): the
+    /// same kernel at different node numbers (say, in another layer) is
+    /// the same string, so source-keyed caches compile it once.
     pub fn to_program(&self, outputs: &[TensorId], target: Target) -> WgslProgram {
+        self.to_program_numbered(outputs, target).canonical()
+    }
+
+    /// [`to_program`](Self::to_program) without
+    /// [`canonical_source`]: identifiers still carry graph node numbers,
+    /// which backends that rewrite the WGSL by node (MSL) rely on.
+    pub(super) fn to_program_numbered(&self, outputs: &[TensorId], target: Target) -> WgslProgram {
         let live = self.live(outputs);
         let n = self.nodes.len();
         let needs_buffer = |i: usize| {
@@ -846,5 +911,62 @@ pub(super) fn quant(f: Format, e: &str) -> String {
         Format::F32 => e.to_string(),
         Format::F16 => format!("unpack2x16float(pack2x16float(vec2<f32>({e}, 0.0))).x"),
         Format::BF16 => panic!("bf16 accumulation is interpreter-only"),
+    }
+}
+
+#[cfg(test)]
+mod canonical_tests {
+    use super::canonical_source;
+    use crate::tensor::TensorGraph;
+
+    #[test]
+    fn renames_node_numbers_only() {
+        let a = "var<storage> b12: array<vec4<f32>>; fn read_12() { point_7(b12[3u]); body_7(); combine_7(); }";
+        let b = "var<storage> b40: array<vec4<f32>>; fn read_40() { point_9(b40[3u]); body_9(); combine_9(); }";
+        assert_eq!(canonical_source(a), canonical_source(b));
+        assert_eq!(
+            canonical_source(a),
+            "var<storage> b0: array<vec4<f32>>; fn read_0() { point_1(b0[3u]); body_1(); combine_1(); }"
+        );
+        // a different literal or wiring stays different
+        assert_ne!(
+            canonical_source(a),
+            canonical_source(&a.replace("3u", "4u"))
+        );
+        assert_ne!(
+            canonical_source(a),
+            canonical_source(&a.replace("point_7(b12", "point_12(b12"))
+        );
+        // builtins and locals with digits are untouched
+        let c = "let acc3 = vec4<f32>(); half2 x; float4 y; __shfl_xor_sync(1); m16n8k8";
+        assert_eq!(canonical_source(c), c);
+    }
+
+    /// `x · W_l` for `layers` square weights: the same kernel per layer.
+    fn chain(layers: usize, n: usize) -> (TensorGraph, Vec<crate::tensor::TensorId>) {
+        let mut g = TensorGraph::new();
+        let mut h = g.input(&[8, n]);
+        for _ in 0..layers {
+            let w = g.input(&[n, n]);
+            h = g.matmul(h, w).unwrap();
+        }
+        (g, vec![h])
+    }
+
+    #[test]
+    fn same_kernel_at_other_nodes_is_one_source() {
+        let sources = |layers, n| {
+            let (g, y) = chain(layers, n);
+            let p = g.to_wgsl(&y);
+            let mut s: Vec<String> = p.kernels.into_iter().map(|k| k.source).collect();
+            s.sort();
+            s.dedup();
+            s
+        };
+        let (s3, s9) = (sources(3, 16), sources(9, 16));
+        assert_eq!(s3, s9);
+        // other shapes are other kernels
+        let s9b = sources(9, 32);
+        assert!(s9b.iter().all(|s| !s9.contains(s)));
     }
 }

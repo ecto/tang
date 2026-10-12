@@ -130,10 +130,11 @@ fn build(seq: usize, layers: usize, cuda: bool) -> Built {
         }
     }
     println!(
-        "layers {layers} seq {seq}: {} graph nodes -> {} compiled; {} kernels ({} distinct up to renaming), {} buffers",
+        "layers {layers} seq {seq}: {} graph nodes -> {} compiled; {} kernels ({} distinct sources, {} up to renaming), {} buffers",
         step.graph.nodes().len(),
         g.nodes().len(),
         s.kernels,
+        s.distinct_sources,
         s.unique_kernels,
         s.buffers
     );
