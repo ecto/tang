@@ -452,6 +452,54 @@ pub mod cuda {
             .unwrap_or(0)
     }
 
+    /// Where the PTX for `source` is cached (`target/tang-ptx/<hash>.ptx`).
+    fn ptx_path(source: &str) -> std::path::PathBuf {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        source.hash(&mut h);
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tang-ptx");
+        dir.join(format!("{:016x}.ptx", h.finish()))
+    }
+
+    /// nvrtc every distinct kernel of `program` not yet in the PTX cache,
+    /// on all cores. Needs no GPU, so it can run outside a GPU lock.
+    pub fn compile_all(program: &WgslProgram) {
+        let include = std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".into());
+        let mut todo: Vec<&str> = program
+            .kernels
+            .iter()
+            .map(|k| k.source.as_str())
+            .filter(|s| !ptx_path(s).exists())
+            .collect();
+        todo.sort();
+        todo.dedup();
+        if todo.is_empty() {
+            return;
+        }
+        std::fs::create_dir_all(ptx_path("").parent().unwrap()).expect("ptx cache dir");
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(src) = todo.get(i) else { break };
+                    let opts = CompileOptions {
+                        arch: Some("sm_86"),
+                        include_paths: vec![format!("{include}/include")],
+                        ..Default::default()
+                    };
+                    let ptx = compile_ptx_with_opts(src, opts)
+                        .unwrap_or_else(|e| panic!("nvrtc: {e:?}\n{src}"));
+                    let path = ptx_path(src);
+                    let tmp = path.with_extension(format!("tmp{i}"));
+                    std::fs::write(&tmp, ptx.to_src()).expect("write ptx");
+                    std::fs::rename(&tmp, &path).expect("rename ptx");
+                });
+            }
+        });
+    }
+
     pub struct PlannedCuda {
         pub program: WgslProgram,
         pub plan: MemoryPlan,
@@ -480,7 +528,7 @@ pub mod cuda {
                     None => stream.alloc_zeros::<f32>(w).expect("alloc"),
                 })
                 .collect();
-            let include = std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".into());
+            compile_all(&program);
             let mut by_source: HashMap<&str, CudaFunction> = HashMap::new();
             let mut functions = Vec::new();
             for k in &program.kernels {
@@ -488,14 +536,10 @@ pub mod cuda {
                     functions.push(f.clone());
                     continue;
                 }
-                let opts = CompileOptions {
-                    arch: Some("sm_86"),
-                    include_paths: vec![format!("{include}/include")],
-                    ..Default::default()
-                };
-                let ptx = compile_ptx_with_opts(&k.source, opts)
-                    .unwrap_or_else(|e| panic!("nvrtc: {e:?}\n{}", k.source));
-                let module = ctx.load_module(ptx).expect("load module");
+                let ptx = std::fs::read_to_string(ptx_path(&k.source)).expect("cached ptx");
+                let module = ctx
+                    .load_module(cudarc::nvrtc::Ptx::from_src(ptx))
+                    .expect("load module");
                 let f = module
                     .load_function(tang_compile::tensor::cuda::CUDA_ENTRY)
                     .expect("entry");

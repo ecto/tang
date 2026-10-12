@@ -362,9 +362,17 @@ fn main() {
     if std::env::var("FUSION").is_ok() {
         fusion_report(seq, layers);
     }
-    let b = build(seq, layers, mode == "cuda");
+    let b = build(seq, layers, mode.starts_with("cuda"));
     match mode {
         "wgpu" => run_wgpu(&b, layers, seq),
+        // nvrtc only (no GPU): fill the PTX cache outside the GPU lock
+        #[cfg(feature = "cuda")]
+        "cuda-compile" => {
+            let t = Instant::now();
+            tang_bench::ir_model::cuda::compile_all(&b.prog);
+            tang_bench::ir_model::cuda::compile_all(&build(seq, 1, true).prog);
+            println!("  nvrtc {:.2?}", t.elapsed());
+        }
         #[cfg(feature = "cuda")]
         "cuda" => run_cuda(&b, layers, seq),
         _ => {}
