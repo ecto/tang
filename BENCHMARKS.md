@@ -330,13 +330,15 @@ Takeaways:
 ### GPU: hand-written matmul vs matmul derived from tensor IR
 
 `hand` is `tang_gpu::matmul::matmul`. The IR version is one comprehension,
-`Σ_k a[i,k]·b[k,j]`, under the same three schedules. (The tiled schedule
-stages nothing here: with one point per thread every read varies across
-the workgroup. A 2-D point tile is the next schedule to add.)
+`Σ_k a[i,k]·b[k,j]`, under the same three schedules; `tiled` is a 16×16
+point tile per workgroup with the `a` and `b` tiles staged in workgroup
+memory (`schedule_tile_2d`), the classic shared-memory matmul, derived.
 
 | n | hand | ir_naive | ir_split | ir_tiled |
 |---|---|---|---|---|
-| 256 | 1.42 ms | 1.48 ms | 2.38 ms | 1.40 ms |
-| 1024 | 4.11 ms | 4.23 ms | 12.2 ms | 4.34 ms |
+| 256 | 1.50 ms | 1.47 ms | 2.38 ms | 1.45 ms |
+| 1024 | 4.14 ms | 4.2–5.6 ms | 12.3 ms | 5.73 ms |
 
-The derived matmul is within 3% of the hand kernel.
+The derived matmul is at parity with the hand kernel. Shared-memory
+staging does not pay on this chip either: the operands already live in
+cache, so the extra barriers cost more than the global reads they save.

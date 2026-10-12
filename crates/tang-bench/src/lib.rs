@@ -438,7 +438,7 @@ pub mod ir_gpu {
             let c = g.matmul(a, b).unwrap();
             match schedule {
                 "split" => g.schedule_split(&[c], 64, 16),
-                "tiled" => g.schedule_tile(&[c], 64, 32, 16),
+                "tiled" => g.schedule_tile_2d(&[c], 16, 16, 32, 16),
                 _ => {}
             }
             (g, c)

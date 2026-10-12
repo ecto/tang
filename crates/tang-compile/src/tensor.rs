@@ -350,10 +350,10 @@ pub struct TNode {
     /// Schedule: split the reduction across a workgroup of this many
     /// threads, tree-combined with the monoid (0 = one thread per point).
     pub split: u32,
-    /// Schedule: `(points per workgroup, reduce chunk)`. Each thread owns
-    /// one point; reads that are the same for every thread in the
-    /// workgroup are staged chunk by chunk in workgroup memory.
-    pub tile: (u32, u32),
+    /// Schedule: `(tile over last point dim, tile over second-to-last,
+    /// reduce chunk)`. Each thread owns one point; reads shared along a
+    /// tile axis are staged chunk by chunk in workgroup memory.
+    pub tile: (u32, u32, u32),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -402,7 +402,7 @@ impl TensorGraph {
             shape: dims.to_vec(),
             inline: false,
             split: 0,
-            tile: (0, 0),
+            tile: (0, 0, 0),
         });
         TensorId(self.nodes.len() as u32 - 1)
     }
@@ -471,7 +471,7 @@ impl TensorGraph {
             shape: comp.out.clone(),
             inline: false,
             split: 0,
-            tile: (0, 0),
+            tile: (0, 0, 0),
             op: Op::Comp(comp),
         });
         Ok(TensorId(self.nodes.len() as u32 - 1))
@@ -1069,16 +1069,35 @@ impl TensorGraph {
     /// `chunk` reduce indices. This is the structure of flash attention
     /// and of a shared-memory matmul, derived from the views alone.
     pub fn schedule_tile(&mut self, outputs: &[TensorId], points: u32, chunk: u32, min_red: usize) {
+        self.schedule_tile_2d(outputs, points, 1, chunk, min_red);
+    }
+
+    /// Like [`schedule_tile`](Self::schedule_tile) with a `bx × by` block
+    /// of points per workgroup over the last two point dims. Reads that
+    /// vary along only one tile axis (matmul's `a[i,k]`, `b[k,j]`) are
+    /// staged once per workgroup instead of once per thread.
+    pub fn schedule_tile_2d(
+        &mut self,
+        outputs: &[TensorId],
+        bx: u32,
+        by: u32,
+        chunk: u32,
+        min_red: usize,
+    ) {
         let live = self.live(outputs);
         let targets: Vec<usize> = (0..self.nodes.len())
             .filter(|&i| live[i] && !self.nodes[i].inline && self.nodes[i].split == 0)
             .filter(|&i| {
-                self.comp_at(i)
-                    .is_some_and(|c| c.monoid.is_some() && c.red.len() == 1 && c.red[0] >= min_red)
+                self.comp_at(i).is_some_and(|c| {
+                    c.monoid.is_some()
+                        && c.red.len() == 1
+                        && c.red[0] >= min_red
+                        && (by == 1 || c.points().len() >= 2)
+                })
             })
             .collect();
         for i in targets {
-            self.nodes[i].tile = (points, chunk);
+            self.nodes[i].tile = (bx, by, chunk);
         }
     }
 
