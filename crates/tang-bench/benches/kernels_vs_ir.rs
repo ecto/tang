@@ -456,7 +456,7 @@ mod gpu_train {
         let mut cache = KernelCache::new();
         let mut group = c.benchmark_group("kvi_gpu_train_step");
         group.sample_size(10);
-        for &seq in &[32usize, 128] {
+        for &seq in &[32usize, 128, 512] {
             let dims = BlockDims {
                 seq,
                 kv_len: seq,
