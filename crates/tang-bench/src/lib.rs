@@ -272,6 +272,18 @@ pub mod ir_gpu {
         pub buffers: Vec<GpuBuffer>,
     }
 
+    /// The program for `device`. Native simdgroup-matrix tiles (Metal,
+    /// `TANG_NATIVE=1`) are correct but, as first cut, slower than the
+    /// WGSL register tile on an M4 (see BENCHMARKS.md), so WGSL is the
+    /// default everywhere.
+    pub fn program_for(device: &GpuDevice, g: &TensorGraph, outputs: &[TensorId]) -> WgslProgram {
+        if device.msl_passthrough && std::env::var("TANG_NATIVE").is_ok() {
+            g.to_msl(outputs)
+        } else {
+            g.to_wgsl(outputs)
+        }
+    }
+
     impl Executable {
         pub fn new(device: &GpuDevice, program: WgslProgram, inputs: &[&[f32]]) -> Self {
             let buffers = program
@@ -318,7 +330,10 @@ pub mod ir_gpu {
             for i in 0..self.program.kernels.len() {
                 self.run_kernel(device, cache, i);
             }
-            cache.flush(device);
+            // leaving the cache in batch mode would make a later
+            // `to_vec_sync` (the hand path's readbacks) wait on work that
+            // was never submitted
+            cache.end_batch(device);
         }
 
         /// Dispatch kernel `i` only (its inputs must already be computed).
@@ -466,7 +481,10 @@ pub mod ir_gpu {
         let (g, y) = naive_attention(n, d, dv);
         let (g, outs) = g.stabilize_softmax(&[y]);
         let (g, outs) = g.substitute_maps(&outs);
-        let (mut g, outs) = g.eliminate_common(&outs);
+        let (g, outs) = g.eliminate_common(&outs);
+        let (g, outs) = g.merge_siblings(&outs);
+        let (g, outs) = g.relayout(&outs);
+        let (mut g, outs) = g.merge_reduce_dims(&outs);
         g.schedule_auto(&outs);
         (g, outs[0])
     }
@@ -747,18 +765,29 @@ pub mod ir_gpu {
                 "reg2" => g.set_schedule(c, 0, (16, 16, 32), (2, 2)),
                 "reg4" => g.set_schedule(c, 0, (16, 16, 32), (4, 4)),
                 "reg8" => g.set_schedule(c, 0, (16, 16, 32), (8, 8)),
+                "reg4c64" => g.set_schedule(c, 0, (16, 16, 64), (4, 4)),
+                "reg8x4" => g.set_schedule(c, 0, (16, 16, 32), (8, 4)),
+                "reg4x8" => g.set_schedule(c, 0, (16, 16, 32), (4, 8)),
+                "reg4c16" => g.set_schedule(c, 0, (16, 16, 16), (4, 4)),
+                "reg8c16" => g.set_schedule(c, 0, (16, 16, 16), (8, 8)),
+                "reg8c8" => g.set_schedule(c, 0, (16, 16, 8), (8, 8)),
+                "reg8b8" => g.set_schedule(c, 0, (8, 8, 32), (8, 8)),
+                "reg4b32" => g.set_schedule(c, 0, (32, 8, 32), (4, 4)),
                 "auto" => g.schedule_auto(&[c]),
                 _ => {}
             }
             (g, c)
         };
-        ["naive", "split", "tiled", "reg2", "reg4", "reg8", "auto"]
-            .into_iter()
-            .map(|name| {
-                let (g, c) = build(name);
-                (name, g, c)
-            })
-            .collect()
+        [
+            "naive", "split", "tiled", "reg2", "reg4", "reg8", "reg4c64", "reg8x4", "reg4x8",
+            "reg4c16", "reg8c16", "reg8c8", "reg8b8", "reg4b32", "auto",
+        ]
+        .into_iter()
+        .map(|name| {
+            let (g, c) = build(name);
+            (name, g, c)
+        })
+        .collect()
     }
 
     /// RMSNorm over `[rows, dim]` with weight = 1, under each schedule.
@@ -1350,6 +1379,65 @@ pub mod ir_gpu {
             }
         }
 
+        /// On Metal, the tiled matmul (and its bias epilogue) lowers to
+        /// simdgroup matrices; same answer as the WGSL tile.
+        #[test]
+        fn simdgroup_matrix_matmul_matches_on_metal() {
+            let Ok(device) = GpuDevice::new_sync() else {
+                return;
+            };
+            if !device.msl_passthrough {
+                eprintln!("no MSL passthrough on {}, skipping", device.name);
+                return;
+            }
+            // ragged shapes take the staged path, full tiles the direct one
+            for (m, k, n) in [(130, 70, 200), (128, 64, 192)] {
+                check_simdgroup_matmul(&device, m, k, n);
+            }
+        }
+
+        fn check_simdgroup_matmul(device: &GpuDevice, m: usize, k: usize, n: usize) {
+            let mut cache = KernelCache::new();
+            let mut rng = crate::Rng::new(5);
+            let a: Vec<f32> = (0..m * k).map(|_| rng.f32() * 2.0 - 1.0).collect();
+            let b: Vec<f32> = (0..k * n).map(|_| rng.f32() * 2.0 - 1.0).collect();
+            let bias: Vec<f32> = (0..n).map(|_| rng.f32()).collect();
+            // y = a·bᵀ-free plain matmul + bias, then silu: the bias and
+            // activation are the tile's epilogue
+            let mut g = TensorGraph::new();
+            let ai = g.input(&[m, k]);
+            let bi = g.input(&[k, n]);
+            let bb = g.input(&[n]);
+            let c = g.matmul(ai, bi).unwrap();
+            let bb1 = g.reshape(bb, &[1, n]).unwrap();
+            let bbc = g.broadcast(bb1, &[m, n]).unwrap();
+            let y = g
+                .map(&[c, bbc], |v| {
+                    let s = v[0] + v[1];
+                    s / (ExprId::from_f64(1.0) + (-s).exp())
+                })
+                .unwrap();
+            let (mut g, outs) = g.substitute_maps(&[y]);
+            g.schedule_auto(&outs);
+            let f64s = |v: &[f32]| v.iter().map(|&x| x as f64).collect::<Vec<f64>>();
+            let want = g.eval(&[f64s(&a), f64s(&b), f64s(&bias)], &outs).remove(0);
+            let prog = g.to_msl(&outs);
+            assert!(
+                prog.kernels
+                    .iter()
+                    .any(|k| k.source.starts_with("#include")),
+                "expected a native kernel"
+            );
+            let exe = Executable::new(device, prog, &[&a, &b, &bias]);
+            exe.run(device, &mut cache);
+            cache.flush(device);
+            let got = exe.read(device, outs[0]);
+            assert_eq!(got.len(), want.len());
+            for (i, (&x, &y)) in got.iter().zip(&want).enumerate() {
+                assert!((x as f64 - y).abs() < 2e-3, "{m}x{k}x{n} [{i}]: {x} vs {y}");
+            }
+        }
+
         #[test]
         fn derived_attention_matches_hand_kernel_on_gpu() {
             let Ok(device) = GpuDevice::new_sync() else {
@@ -1427,6 +1515,135 @@ pub mod ir_gpu {
 
 /// A whole transformer block derived from tensor IR, mirroring the
 /// hand-written `gpu_transformer_layer` prefill path in `gpu_inference`.
+
+/// Running a [`TensorGraph::to_cuda`](tang_compile::tensor::TensorGraph::to_cuda)
+/// program on an NVIDIA GPU through the CUDA driver (cudarc): nvrtc
+/// compiles each kernel — wmma tensor-core tiles and transpiled WGSL
+/// alike — and the kernels launch in program order on one stream.
+#[cfg(feature = "cuda")]
+pub mod ir_cuda {
+    use std::sync::Arc;
+
+    use cudarc::driver::{
+        CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+    };
+    use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
+    use tang_compile::tensor::wgsl::WgslProgram;
+    use tang_compile::tensor::TensorId;
+
+    pub struct CudaExecutable {
+        pub program: WgslProgram,
+        pub stream: Arc<CudaStream>,
+        buffers: Vec<CudaSlice<f32>>,
+        functions: Vec<CudaFunction>,
+    }
+
+    impl CudaExecutable {
+        /// Compile every kernel and allocate every buffer; inputs uploaded.
+        pub fn new(ctx: &Arc<CudaContext>, program: WgslProgram, inputs: &[&[f32]]) -> Self {
+            let stream = ctx.default_stream();
+            let buffers = program
+                .buffers
+                .iter()
+                .map(|b| match b.input {
+                    Some(k) => stream.memcpy_stod(inputs[k]).expect("upload"),
+                    None => stream.alloc_zeros::<f32>(b.len.max(1)).expect("alloc"),
+                })
+                .collect();
+            let include = std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".into());
+            let functions = program
+                .kernels
+                .iter()
+                .map(|k| {
+                    let opts = CompileOptions {
+                        arch: Some("sm_86"),
+                        include_paths: vec![format!("{include}/include")],
+                        ..Default::default()
+                    };
+                    let ptx = compile_ptx_with_opts(&k.source, opts)
+                        .unwrap_or_else(|e| panic!("nvrtc: {e:?}\n{}", k.source));
+                    let module = ctx.load_module(ptx).expect("load module");
+                    module
+                        .load_function(tang_compile::tensor::cuda::CUDA_ENTRY)
+                        .expect("entry")
+                })
+                .collect();
+            Self {
+                program,
+                stream,
+                buffers,
+                functions,
+            }
+        }
+
+        fn index(&self, t: TensorId) -> usize {
+            let t = self.program.storage(t);
+            self.program
+                .buffers
+                .iter()
+                .position(|b| b.node == t)
+                .expect("buffer")
+        }
+
+        /// Launch every kernel in order (asynchronously on the stream).
+        pub fn run(&self) {
+            for i in 0..self.program.kernels.len() {
+                self.run_kernel(i);
+            }
+        }
+
+        /// Launch kernel `i` only.
+        pub fn run_kernel(&self, i: usize) {
+            for (k, f) in std::iter::once((&self.program.kernels[i], &self.functions[i])) {
+                let groups = k.count.div_ceil(k.workgroup_size);
+                let cfg = LaunchConfig {
+                    grid_dim: (groups, 1, 1),
+                    block_dim: (k.workgroup_size, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut launch = self.stream.launch_builder(f);
+                for t in &k.reads {
+                    launch.arg(&self.buffers[self.index(*t)]);
+                }
+                launch.arg(&self.buffers[self.index(k.node)]);
+                launch.arg(&k.points);
+                unsafe { launch.launch(cfg) }.expect("launch");
+            }
+        }
+
+        pub fn read(&self, t: TensorId) -> Vec<f32> {
+            self.stream.synchronize().expect("sync");
+            self.stream
+                .memcpy_dtov(&self.buffers[self.index(t)])
+                .expect("download")
+        }
+
+        /// Milliseconds per run over `iters` launches of the whole program
+        /// (wall clock around a stream sync; launches are asynchronous).
+        pub fn time(&self, iters: usize) -> f64 {
+            self.time_with(iters, |e| e.run())
+        }
+
+        /// Milliseconds per launch of kernel `i` alone.
+        pub fn time_kernel(&self, i: usize, iters: usize) -> f64 {
+            self.time_with(iters, |e| e.run_kernel(i))
+        }
+
+        fn time_with(&self, iters: usize, f: impl Fn(&Self)) -> f64 {
+            for _ in 0..3 {
+                f(self);
+            }
+            self.stream.synchronize().expect("sync");
+            let t = std::time::Instant::now();
+            for _ in 0..iters {
+                f(self);
+            }
+            self.stream.synchronize().expect("sync");
+            t.elapsed().as_secs_f64() * 1e3 / iters as f64
+        }
+    }
+}
+
 pub mod ir_block {
     use tang::Scalar;
     use tang_compile::tensor::{numel, Arg, Form, Monoid, TensorGraph, TensorId, View};
@@ -1913,7 +2130,10 @@ pub mod ir_block {
         let (g, out) = transformer_block(dims);
         let (g, outs) = g.stabilize_softmax(&[out]);
         let (g, outs) = g.substitute_maps(&outs);
-        let (mut g, outs) = g.eliminate_common(&outs);
+        let (g, outs) = g.eliminate_common(&outs);
+        let (g, outs) = g.merge_siblings(&outs);
+        let (g, outs) = g.relayout(&outs);
+        let (mut g, outs) = g.merge_reduce_dims(&outs);
         g.schedule_auto(&outs);
         (g, outs[0])
     }
@@ -1999,7 +2219,7 @@ pub mod ir_block {
 /// Hand-written vs derived transformer block on the GPU.
 pub mod ir_block_gpu {
     use super::ir_block::{compiled_block, transformer_block, BlockDims};
-    use super::ir_gpu::Executable;
+    use super::ir_gpu::{program_for, Executable};
     use tang_gpu::nn::bias_add;
     use tang_gpu::*;
 
@@ -2184,7 +2404,10 @@ pub mod ir_block_gpu {
             (g, outs[0])
         };
         let inputs: Vec<&[f32]> = p.cpu.iter().map(|v| v.as_slice()).collect();
-        (Executable::new(device, g.to_wgsl(&[y]), &inputs), y)
+        (
+            Executable::new(device, program_for(device, &g, &[y]), &inputs),
+            y,
+        )
     }
 
     /// tang-gpu's hand-written trainable block (`GpuTrainTransformerBlock`:
@@ -2234,10 +2457,16 @@ pub mod ir_block_gpu {
         let mut outs = vec![out];
         outs.extend(grads);
         let (g, outs) = g.substitute_maps(&outs);
-        let (mut g, outs) = g.eliminate_common(&outs);
+        let (g, outs) = g.eliminate_common(&outs);
+        let (g, outs) = g.merge_siblings(&outs);
+        let (g, outs) = g.relayout(&outs);
+        let (mut g, outs) = g.merge_reduce_dims(&outs);
         g.schedule_auto(&outs);
         let inputs: Vec<&[f32]> = p.cpu.iter().map(|v| v.as_slice()).collect();
-        (Executable::new(device, g.to_wgsl(&outs), &inputs), outs)
+        (
+            Executable::new(device, program_for(device, &g, &outs), &inputs),
+            outs,
+        )
     }
 
     /// The block under the per-kernel autotuner, cached in
@@ -2531,7 +2760,10 @@ pub mod ir_block_gpu {
             let want = g.eval(&f64_inputs, &grads);
 
             let (g, outs) = g.substitute_maps(&grads);
-            let (mut g, outs) = g.eliminate_common(&outs);
+            let (g, outs) = g.eliminate_common(&outs);
+            let (g, outs) = g.merge_siblings(&outs);
+            let (g, outs) = g.relayout(&outs);
+            let (mut g, outs) = g.merge_reduce_dims(&outs);
             g.schedule_auto(&outs);
             let program = g.to_wgsl(&outs);
             let n_kernels = program.kernels.len();

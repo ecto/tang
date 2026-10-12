@@ -66,6 +66,28 @@ views. Map→map, map→reduce, transpose→anything: same rule. Reductions are
 not substituted — they are *inlined* by a schedule decision, which is the
 difference between algebra and scheduling.
 
+**Reshape is a view, not a copy.** A row-major reshape of a map is read
+through the map's own coordinates whenever the reshape only merges dims
+seen from the reader (`View::through_reshape`); the reshape node
+dissolves and the map inlines like any other. Only a reshape that splits
+a source dim — which needs `/` and `%` — keeps its source materialized.
+
+**Epilogues ride the reduction.** A map that reads a reduction
+point-for-point — a bias, an activation, the `acc / l` that finishes an
+online softmax — never gets its own kernel: the tiled and split
+schedules run it on the thread that holds the final accumulator. Any
+affine read of the reduction's points qualifies, and each arg picks a
+constant tuple slot. A slot that cannot vary along a point dim (the
+softmax row sum along its lanes, found through the monoid's combine) may
+be read at any coordinate of that dim, since every thread's accumulator
+agrees there.
+
+**Siblings share a pass.** Two reductions over the same space with the
+same monoid, read by the same consumers, are one reduction under the
+product monoid (`merge_siblings`): the gate and up projections of a
+SwiGLU MLP become one tuple-valued comp, their activation becomes its
+epilogue, and the normed input is read once.
+
 **Flash attention is a rewrite.** Online softmax is a monoid over
 `(max, sum, acc…)`. `stabilize_softmax` finds `m = max_j s` and every
 `Σ_j g·exp(s − m)` over the same `s` (compared as canonical
@@ -143,8 +165,15 @@ schedule space; the compiler searches it.
 
 ## Not yet
 
-- Codegen beyond WGSL (MSL/CUDA emitters exist in `tang-expr` for scalar
-  bodies; the loop-nest emitters are WGSL-only).
+- Native codegen is a first cut. Matmul-shaped tiles lower to Metal
+  simdgroup matrices (`tensor_msl.rs`, via wgpu's MSL passthrough) and
+  to CUDA `wmma` TF32 tensor cores (`tensor_cuda.rs`), epilogues
+  included. The CUDA kernel runs at 14–21 TFLOPS on a 3090, within 2× of
+  cuBLAS TF32; the Metal fp32 kernel does not yet beat the WGSL register
+  tile. Neither is dispatched by tang-gpu yet: Metal is opt-in, CUDA is
+  measured through an nvcc harness (`scripts/cuda_bench.cu`), since wgpu
+  cannot run CUDA. A CUDA runtime path (cudarc or driver-API FFI with
+  buffer interop) is the next piece.
 - Scatter gradients reduce over the whole source coordinate they gate on;
   a stride-2 read pays 2× in the backward pass. Fine for rope, not for a
   large gather.

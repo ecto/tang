@@ -610,9 +610,19 @@ fn convnext_ref(p: &[Vec<f64>], c: usize, t: usize, f: usize) -> Vec<f64> {
 // driver
 // ---------------------------------------------------------------------------
 
+/// The graph passes before scheduling. `merge_reduce_dims` runs before
+/// `schedule_auto`'s multi-dim tiler: mergeable reduce dims become one,
+/// the tiler handles what stays split (a conv's `(c, k)`).
+/// `TANG_NO_MERGE=1` skips merge_siblings / relayout / merge_reduce_dims.
 fn optimized(g: &TensorGraph, outs: &[TensorId]) -> (TensorGraph, Vec<TensorId>) {
     let (g, outs) = g.substitute_maps(outs);
-    g.eliminate_common(&outs)
+    let (g, outs) = g.eliminate_common(&outs);
+    if std::env::var_os("TANG_NO_MERGE").is_some() {
+        return (g, outs);
+    }
+    let (g, outs) = g.merge_siblings(&outs);
+    let (g, outs) = g.relayout(&outs);
+    g.merge_reduce_dims(&outs)
 }
 
 struct Row {
