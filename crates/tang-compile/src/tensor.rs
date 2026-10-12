@@ -844,9 +844,28 @@ impl TensorGraph {
 
     // -- passes ---------------------------------------------------------------
 
-    /// Fuse every map (comp without reduction) into its consumers by
-    /// splicing its body and composing views. Dead nodes are dropped.
+    /// Fuse maps (comps without reduction) into their consumers by
+    /// splicing their bodies and composing views. Dead nodes are dropped.
+    ///
+    /// A map is substituted when every consumer evaluates it at most once
+    /// per element, or when it is cheap enough to recompute freely: one
+    /// buffer read and no transcendental. Anything else that a reduction
+    /// would re-evaluate once per output column — a normalization, a
+    /// residual add, an activation with an `exp` — stays materialized,
+    /// which is what a hand-written pipeline does too. Rewrites that need
+    /// the fully spliced expression (`stabilize_softmax`) splice on their
+    /// own, so run them first.
     pub fn substitute_maps(&self, outputs: &[TensorId]) -> (TensorGraph, Vec<TensorId>) {
+        self.substitute_maps_with(outputs, true)
+    }
+
+    /// [`substitute_maps`](Self::substitute_maps) with `cost_aware =
+    /// false` substituting every map unconditionally.
+    pub fn substitute_maps_with(
+        &self,
+        outputs: &[TensorId],
+        cost_aware: bool,
+    ) -> (TensorGraph, Vec<TensorId>) {
         let n = self.nodes.len();
         let live = self.live(outputs);
         let is_output = |i: usize| outputs.iter().any(|o| o.n() == i);
@@ -860,12 +879,48 @@ impl TensorGraph {
             }
             r
         };
+        // recompute factor per producer: max over consumers of
+        // consumer space / producer points (unknown when symbolic)
+        let mut recompute = vec![Some(0usize); n];
+        for i in (0..n).filter(|&i| live[i]) {
+            if let Some(c) = self.comp_at(i) {
+                let space: Option<usize> = c.space().iter().map(|d| d.fixed()).product();
+                for a in &c.args {
+                    let p = a.src.n();
+                    let pts: Option<usize> =
+                        self.nodes[p].shape.iter().map(|d| d.fixed()).product();
+                    recompute[p] = match (recompute[p], space, pts) {
+                        (Some(r), Some(s), Some(q)) if q > 0 => Some(r.max(s.div_ceil(q))),
+                        _ => None,
+                    };
+                }
+            }
+        }
+        let cheap = |c: &Comp| {
+            let reads = c
+                .args
+                .iter()
+                .filter(|a| !matches!(self.nodes[a.src.n()].op, Op::Iota(_)))
+                .count();
+            let live = c.body.live_set(&c.body_outs);
+            let nodes = c.body.nodes_slice();
+            let transcendental = live.iter().any(|&k| {
+                matches!(
+                    nodes[k],
+                    Node::Exp2(_) | Node::Log2(_) | Node::Sqrt(_) | Node::Sin(_) | Node::Atan2(..)
+                )
+            });
+            reads <= 1 && !transcendental
+        };
         let inline: Vec<bool> = (0..n)
             .map(|i| {
-                self.comp_at(i)
-                    .is_some_and(|c| c.red.is_empty() && c.tuple == 0)
-                    && !is_output(i)
-                    && !reshaped[i]
+                self.comp_at(i).is_some_and(|c| {
+                    c.red.is_empty()
+                        && c.tuple == 0
+                        && !is_output(i)
+                        && !reshaped[i]
+                        && (!cost_aware || recompute[i] == Some(1) || cheap(c))
+                })
             })
             .collect();
 
@@ -915,6 +970,41 @@ impl TensorGraph {
             .map(|o| TensorId(remap[o.n()].unwrap() as u32))
             .collect();
         (ng, outs)
+    }
+
+    /// `comp_at(i)` with every producer map spliced in, as a standalone
+    /// `Comp`. Used by rewrites that match on expressions regardless of
+    /// where the materialization boundaries ended up.
+    fn effective(&self, i: usize) -> Option<Comp> {
+        let c = self.comp_at(i)?;
+        let n = self.nodes.len();
+        let inline: Vec<bool> = (0..n)
+            .map(|j| {
+                j != i
+                    && self
+                        .comp_at(j)
+                        .is_some_and(|c| c.red.is_empty() && c.tuple == 0)
+            })
+            .collect();
+        let remap: Vec<Option<usize>> = (0..n).map(Some).collect();
+        let rank = c.rank();
+        let mut body = ExprGraph::new();
+        let mut args: Vec<Arg> = Vec::new();
+        let vars: Vec<ExprId> = c
+            .args
+            .iter()
+            .map(|a| self.splice(a, rank, &inline, &remap, &mut body, &mut args))
+            .collect();
+        let body_outs = replay(&c.body, &c.body_outs, &vars, &mut body);
+        Some(Comp {
+            out: c.out.clone(),
+            tuple: c.tuple,
+            red: c.red.clone(),
+            args,
+            body,
+            body_outs,
+            monoid: c.monoid.clone(),
+        })
     }
 
     /// Expression for `arg` inside a consumer of iteration rank `rank`:
@@ -981,7 +1071,7 @@ impl TensorGraph {
     /// Does `m_arg` (as read by `c`) hold `max` over `c`'s reduce coord of
     /// exactly the expression `s` of `c`'s body? Returns `s`'s canonical form.
     fn is_row_max_of(&self, c: &Comp, s: ExprId, m_arg: &Arg) -> Option<Canon> {
-        let mc = self.comp_at(m_arg.src.n())?;
+        let mc = &self.effective(m_arg.src.n())?;
         let n_out = c.points().len();
         let structural = mc.monoid.as_ref().map(Monoid::kind) == Some(MonoidKind::Max)
             && mc.tuple == 0
@@ -1027,7 +1117,8 @@ impl TensorGraph {
         // (max node, canonical s) -> members
         let mut groups: HashMap<(usize, Canon), Vec<Member>> = HashMap::new();
         for i in 0..self.nodes.len() {
-            let Some(c) = self.comp_at(i) else { continue };
+            let Some(c) = self.effective(i) else { continue };
+            let c = &c;
             let sum = c.monoid.as_ref().map(Monoid::kind) == Some(MonoidKind::Sum);
             if !sum || c.red.len() != 1 || c.tuple != 0 || is_output(i) {
                 continue;
@@ -1056,7 +1147,7 @@ impl TensorGraph {
         // member node -> (fused node, projection from member out coords to fused coords)
         let mut redirect: HashMap<usize, (usize, View)> = HashMap::new();
         for ((m_node, _), members) in groups {
-            let mc = self.comp_at(m_node).unwrap();
+            let mc = &self.effective(m_node).unwrap();
             let m_out = mc.out.len();
 
             // Extra out dims of members (e.g. the value column of Σ_j p·v)
@@ -1065,7 +1156,7 @@ impl TensorGraph {
             let member_extra: Vec<(Vec<Option<usize>>, Vec<usize>)> = members
                 .iter()
                 .map(|mem| {
-                    let c = self.comp_at(mem.node).unwrap();
+                    let c = self.effective(mem.node).unwrap();
                     let n_out = c.points().len();
                     let reads: Vec<Option<usize>> = (0..n_out)
                         .map(|d| mem.m_view.forms.iter().position(|f| f.as_unit() == Some(d)))
@@ -1081,13 +1172,13 @@ impl TensorGraph {
                 .iter()
                 .zip(&members)
                 .map(|((_, extra), mem)| {
-                    let c = self.comp_at(mem.node).unwrap();
+                    let c = self.effective(mem.node).unwrap();
                     extra.iter().map(|&d| c.out[d]).collect::<Vec<Dim>>()
                 })
                 .max_by_key(|v| v.len())
                 .unwrap_or_default();
             let agree = member_extra.iter().zip(&members).all(|((_, extra), mem)| {
-                let c = self.comp_at(mem.node).unwrap();
+                let c = self.effective(mem.node).unwrap();
                 let mine: Vec<Dim> = extra.iter().map(|&d| c.out[d]).collect();
                 mine.is_empty() || mine == extra_shape
             });
@@ -1120,7 +1211,7 @@ impl TensorGraph {
             let mut projections = Vec::new();
 
             for (mem, (reads, extra)) in members.iter().zip(&member_extra) {
-                let c = self.comp_at(mem.node).unwrap();
+                let c = &self.effective(mem.node).unwrap();
                 let n_out = c.points().len();
                 let slot = outs.len() as i64;
                 let inv = View {
@@ -1732,8 +1823,13 @@ mod tests {
         }
         close(&g.eval(std::slice::from_ref(&data), &[y])[0], &want);
 
-        // sq folds into the reduction; inv + broadcast fold into the output map
+        // sq folds into the reduction; the broadcast folds into the output
+        // map; inv (a sqrt, recomputed dim× if inlined) stays materialized
         let (fg, outs) = g.substitute_maps(&[y]);
+        assert_eq!(fg.count_comps(&outs), 3);
+        close(&fg.eval(std::slice::from_ref(&data), &outs)[0], &want);
+        // unconditional substitution folds everything into two comps
+        let (fg, outs) = g.substitute_maps_with(&[y], false);
         assert_eq!(fg.count_comps(&outs), 2);
         close(&fg.eval(&[data], &outs)[0], &want);
     }

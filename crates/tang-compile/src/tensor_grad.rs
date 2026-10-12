@@ -392,8 +392,10 @@ mod tests {
                 assert!((x - y).abs() < 1e-9, "{x} vs {y}");
             }
         }
-        // ones · 2c (map) folds into the gradient reductions: only comps left
-        // are the forward matmul and the two gradient reductions.
+        // ones · 2c reads two buffers, so cost-aware substitution keeps it
+        // materialized: forward matmul, the dy map, two gradient reductions.
+        assert_eq!(fg.count_comps(&outs), 4);
+        let (fg, outs) = g.substitute_maps_with(&grads, false);
         assert_eq!(fg.count_comps(&outs), 3);
     }
 

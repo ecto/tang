@@ -405,8 +405,8 @@ pub mod ir_gpu {
     /// reduction with `q·k` recomputed inside, nothing n×n materialized.
     pub fn flash_attention(n: usize, d: usize, dv: usize) -> (TensorGraph, TensorId) {
         let (g, y) = naive_attention(n, d, dv);
-        let (g, outs) = g.substitute_maps(&[y]);
-        let (mut g, outs) = g.stabilize_softmax(&outs);
+        let (g, outs) = g.stabilize_softmax(&[y]);
+        let (mut g, outs) = g.substitute_maps(&outs);
         g.schedule_inline_up_to(&outs, dv);
         (g, outs[0])
     }
@@ -462,8 +462,8 @@ pub mod ir_gpu {
     /// [`flash_attention`] under [`TensorGraph::schedule_auto`].
     pub fn flash_attention_auto(n: usize, d: usize, dv: usize) -> (TensorGraph, TensorId) {
         let (g, y) = naive_attention(n, d, dv);
-        let (g, outs) = g.substitute_maps(&[y]);
-        let (mut g, outs) = g.stabilize_softmax(&outs);
+        let (g, outs) = g.stabilize_softmax(&[y]);
+        let (mut g, outs) = g.substitute_maps(&outs);
         g.schedule_auto(&outs);
         (g, outs[0])
     }
@@ -1460,8 +1460,8 @@ pub mod ir_block {
     /// Full compiler pipeline for the block.
     pub fn compiled_block(dims: &BlockDims) -> (TensorGraph, TensorId) {
         let (g, out) = transformer_block(dims);
-        let (g, outs) = g.substitute_maps(&[out]);
-        let (mut g, outs) = g.stabilize_softmax(&outs);
+        let (g, outs) = g.stabilize_softmax(&[out]);
+        let (mut g, outs) = g.substitute_maps(&outs);
         g.schedule_auto(&outs);
         (g, outs[0])
     }
