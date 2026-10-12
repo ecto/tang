@@ -785,6 +785,69 @@ derived kernels are 2–4× faster than tang's hand kernels through the
 portable path, and within 2× of cuBLAS through the native one, from one
 comprehension and no op-specific code.
 
+### The whole block on CUDA (`to_cuda` + cudarc, RTX 3090)
+
+`TensorGraph::to_cuda` emits a program for the CUDA driver: matmul-shaped
+tiles as the wmma kernel above, every other kernel the WGSL transpiled
+to CUDA C++ (generated WGSL is regular enough that a line-level
+translation with a 20-line prelude covers the naive, split and tile
+emitters — no second emitter). `tang_bench::ir_cuda::CudaExecutable`
+compiles with nvrtc and launches in program order. Two layout passes
+landed on the way: `relayout` (a producer's point dims reordered to
+its consumer's reads) and `merge_reduce_dims` (adjacent reduce dims
+read contiguously fold into one), which turn the attention-output
+projection Σ_{g,r,d} into a 576-wide matmul — so 5 of the block's 16
+kernels run on tensor cores.
+
+| | CUDA (5 kernels on tensor cores) | Vulkan/WGSL | PyTorch fp32 |
+|---|---|---|---|
+| block fwd, seq 128 | **0.62 ms** | 1.06 | 0.30 / 0.57 |
+| block fwd, seq 512 | **1.86 ms** | 3.34 | 0.61 / 1.21 |
+
+Per kernel at seq 512: five wmma matmuls 0.05–0.18 ms each, the
+elementwise and split kernels 2–14 µs each (the Vulkan path's ~0.1 ms
+per-kernel floor is gone), and the attention tile 1.25 ms — two thirds
+of the total. Correctness: 5e-5 relative against the f64 evaluation at
+seq 128 (TF32 inputs).
+
+### Attention on tensor cores
+
+`cuda_flash_kernel` recognizes the fused attention comp — an
+online-softmax reduction over keys whose score is an inlined bilinear
+comp (here two terms, the rope even/odd halves) plus a mask over
+(i, j), whose value is a read along (j, lane), and whose normalizer is
+the epilogue map — and emits a flash kernel: 64 queries per 128-thread
+block, keys in 64-chunks, `S = Σ_t Q_t·K_tᵀ` and `O += P·V` as wmma
+TF32 fragments, the online softmax on the stored score block with the
+comp's own mask/value/normalizer expressions evaluated where they
+belong. Nothing attention-specific is hard-coded beyond that shape.
+
+| | before | after |
+|---|---|---|
+| attention kernel, seq 128 | 0.098 ms | **0.042** |
+| attention kernel, seq 512 | 1.25 | **0.150** |
+| block fwd, seq 128 | 0.62 | **0.59** |
+| block fwd, seq 512 | 1.86 | **0.76** |
+
+Six of the block's sixteen kernels now run on tensor cores. Back to
+back in one session (GPU shared with another tenant at ~27%), the
+like-for-like comparison — tang's CUDA path uses TF32 tensor cores, so
+PyTorch gets `allow_tf32` too:
+
+| block forward | PyTorch fp32 | PyTorch TF32 | tang (CUDA, TF32) |
+|---|---|---|---|
+| seq 128 | 0.32 ms | 0.34 | 0.59 |
+| seq 512 | 0.98 | 0.48 | **0.78** |
+
+So at seq 512 the derived block is 1.6× PyTorch-TF32 and faster than
+PyTorch-fp32; at seq 128 it is launch-bound (16 launches to PyTorch's
+~10 fused cuBLAS/sdpa calls) at 1.8×. The remaining per-kernel time is
+the matmul tiles at 1.4–1.9× cuBLAS TF32 and the ten small kernels at
+a few µs each; the next rungs are the standard GEMM ladder (128×128
+blocks, `cp.async` pipelining) and fusing the small kernels into their
+neighbours' prologues. Same error as before (5e-5 relative at seq
+128).
+
 What this does and does not show: the compiler derives the *structure* of
 the fast kernels (flash attention, register-tiled matmul, sequence
 parallelism) from the algebra, with no op-specific code, and picks per

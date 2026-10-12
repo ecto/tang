@@ -958,7 +958,7 @@ impl TensorGraph {
 
     // -- analysis -----------------------------------------------------------
 
-    fn comp_at(&self, i: usize) -> Option<&Comp> {
+    pub fn comp_at(&self, i: usize) -> Option<&Comp> {
         match &self.nodes[i].op {
             Op::Comp(c) => Some(c),
             Op::Input(_) | Op::Iota(_) | Op::Reshape(_) => None,
@@ -2723,7 +2723,7 @@ pub(super) fn replay(
 }
 
 /// Input vars reachable from `out`.
-fn vars_reachable(g: &ExprGraph, out: ExprId) -> Vec<u16> {
+pub(super) fn vars_reachable(g: &ExprGraph, out: ExprId) -> Vec<u16> {
     let live = g.live_set(&[out]);
     let nodes = g.nodes_slice();
     live.iter()

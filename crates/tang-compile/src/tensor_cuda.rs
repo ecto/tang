@@ -293,6 +293,7 @@ impl TensorGraph {
             let reads: Vec<usize> = k.reads.iter().map(|t| t.index()).collect();
             let native = if self.nodes[root].tile.0 > 0 {
                 self.cuda_mma_kernel(root, &reads)
+                    .or_else(|| self.cuda_flash_kernel(root, &reads))
             } else {
                 None
             };
@@ -647,6 +648,658 @@ fn rewrite_ctor(s: &str, prefix: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+// ---------------------------------------------------------------------------
+// Attention on tensor cores
+// ---------------------------------------------------------------------------
+
+/// The shape of a fused attention: an online-softmax reduction over keys
+/// whose score is an inlined bilinear comp (`Σ_d q[i,d]·k[j,d]`, possibly
+/// several such terms), plus a mask over (i, j); whose value is a read
+/// along (j, lane) — and a map reading it point-for-point (the
+/// normalizer). Recognized by [`TensorGraph::flash_tile`].
+struct Flash {
+    red_node: usize,
+    /// index of the arg carrying the score comp, and that comp's node
+    score_arg: usize,
+    score_node: usize,
+    /// (q buffer, q address over the score space, k buffer, k address)
+    terms: Vec<(usize, Addr, usize, Addr)>,
+    /// score space dim ↔ reduction space dim, for the score's point dims
+    score_to_red: Vec<usize>,
+    /// reduction space: query dim, lane dim, others (incl. unit dims)
+    dy: usize,
+    dx: usize,
+    others: Vec<usize>,
+    pts: Vec<usize>,
+    m: usize,
+    n_keys: usize,
+    d_lanes: usize,
+    kd: usize,
+}
+
+use super::msl::Addr;
+use super::vars_reachable;
+use super::{Arg, Op};
+use tang_expr::Node as ENode;
+
+impl TensorGraph {
+    fn flash_tile(&self, root: usize, reads: &[usize]) -> Option<Flash> {
+        let c = self.comp_at(root)?;
+        let red_node = self.tiled_reduction(root)?;
+        if red_node == root {
+            return None;
+        }
+        let rc = self.comp_at(red_node)?;
+        let m = rc.monoid.as_ref()?;
+        if m.kind() != super::MonoidKind::OnlineSoftmax || m.width != 3 || rc.red.len() != 1 {
+            return None;
+        }
+        let storage = |j: usize| self.storage(TensorId(j as u32)).n();
+        let is_buffer = |j: usize| reads.contains(&storage(j));
+        let pts = super::fixed(rc.points());
+        let rank = rc.rank();
+        let jdim = rank - 1;
+        let dx = (0..pts.len()).rev().find(|&d| pts[d] > 1)?;
+        let dy = super::tile::largest_other(&pts, dx)?;
+        let others: Vec<usize> = (0..pts.len()).filter(|&d| d != dx && d != dy).collect();
+        let d_lanes = pts[dx];
+        if !d_lanes.is_multiple_of(16) || d_lanes > 64 {
+            return None;
+        }
+        // body outs: (score + mask, 1, value)
+        let nodes = rc.body.nodes_slice();
+        let [e_s, e_one, e_v] = rc.body_outs[..] else {
+            return None;
+        };
+        match nodes[e_one.index() as usize] {
+            ENode::Lit(b) if f64::from_bits(b) == 1.0 => {}
+            _ => return None,
+        }
+        // the one inlined comp the score reads; everything else it touches
+        // is an iota or a buffer not varying along the lanes
+        let s_vars = vars_reachable(&rc.body, e_s);
+        let mut score_arg = None;
+        for &v in &s_vars {
+            let a = &rc.args[v as usize];
+            let p = a.src.n();
+            match &self.nodes[p].op {
+                Op::Comp(_) if self.nodes[p].inline => {
+                    if score_arg.is_some() {
+                        return None;
+                    }
+                    score_arg = Some(v as usize);
+                }
+                Op::Iota(_) => {}
+                _ if is_buffer(p) => {
+                    if self.flat_addr(a, rank).coefs[dx] != 0 {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+        }
+        let score_arg = score_arg?;
+        // the value: buffers/iotas not varying along the query dim
+        for &v in &vars_reachable(&rc.body, e_v) {
+            let a = &rc.args[v as usize];
+            let p = a.src.n();
+            let ok = match &self.nodes[p].op {
+                Op::Iota(_) => true,
+                _ => is_buffer(p),
+            };
+            if !ok || self.flat_addr(a, rank).coefs[dy] != 0 {
+                return None;
+            }
+        }
+        // the score comp: Σ_d of products, each q-like × k-like
+        let sa = &rc.args[score_arg];
+        let score_node = sa.src.n();
+        let sc = self.comp_at(score_node)?;
+        if sc.red.len() != 1
+            || sc.monoid.as_ref()?.kind() != super::MonoidKind::Sum
+            || sc.width() != 1
+        {
+            return None;
+        }
+        // score dims ↔ reduction dims: the view is a pick
+        let score_to_red: Vec<usize> = sa
+            .view
+            .forms
+            .iter()
+            .map(|f| {
+                let d = (0..rank).find(|&d| f.coefs[d] != 0)?;
+                (f.coefs[d] == 1 && f.offset == 0).then_some(d)
+            })
+            .collect::<Option<_>>()?;
+        if score_to_red.len() != sc.points().len() {
+            return None;
+        }
+        let s_i = score_to_red.iter().position(|&d| d == dy)?;
+        let s_j = score_to_red.iter().position(|&d| d == jdim)?;
+        let srank = sc.rank();
+        let sd = srank - 1;
+        let mut pairs = Vec::new();
+        let snodes = sc.body.nodes_slice();
+        fn products(nodes: &[ENode], e: tang_expr::ExprId, out: &mut Vec<(usize, usize)>) -> bool {
+            match nodes[e.index() as usize] {
+                ENode::Add(a, b) => products(nodes, a, out) && products(nodes, b, out),
+                ENode::Mul(a, b) => match (nodes[a.index() as usize], nodes[b.index() as usize]) {
+                    (ENode::Var(p), ENode::Var(q)) => {
+                        out.push((p as usize, q as usize));
+                        true
+                    }
+                    _ => false,
+                },
+                _ => false,
+            }
+        }
+        if !products(snodes, sc.body_outs[0], &mut pairs) {
+            return None;
+        }
+        let mut terms = Vec::new();
+        for (p, q) in pairs {
+            let (ap, aq) = (&sc.args[p], &sc.args[q]);
+            if !is_buffer(ap.src.n()) || !is_buffer(aq.src.n()) {
+                return None;
+            }
+            let (addr_p, addr_q) = (self.flat_addr(ap, srank), self.flat_addr(aq, srank));
+            let q_like = |a: &Addr| a.coefs[s_j] == 0 && a.coefs[sd] != 0;
+            let k_like = |a: &Addr| a.coefs[s_i] == 0 && a.coefs[sd] != 0;
+            if q_like(&addr_p) && k_like(&addr_q) {
+                terms.push((storage(ap.src.n()), addr_p, storage(aq.src.n()), addr_q));
+            } else if q_like(&addr_q) && k_like(&addr_p) {
+                terms.push((storage(aq.src.n()), addr_q, storage(ap.src.n()), addr_p));
+            } else {
+                return None;
+            }
+        }
+        let kd = sc.red[0].n();
+        if kd % 8 != 0 {
+            return None;
+        }
+        // the normalizer reads the reduction point-for-point and nothing
+        // but buffers otherwise
+        self.epilogue_read(c, red_node)?;
+        for a in &c.args {
+            if a.src.n() != red_node && !is_buffer(a.src.n()) {
+                return None;
+            }
+        }
+        Some(Flash {
+            red_node,
+            score_arg,
+            score_node,
+            terms,
+            score_to_red,
+            dy,
+            dx,
+            others,
+            m: pts[dy],
+            n_keys: rc.red[0].n(),
+            d_lanes,
+            kd,
+            pts,
+        })
+    }
+
+    /// CUDA source for `root` as a tensor-core flash-attention tile:
+    /// 64 queries per 128-thread block, keys in chunks of 64, `S = Q·Kᵀ`
+    /// and `O += P·V` as wmma TF32 fragments, the online softmax in
+    /// between on the stored score block, the comp's mask, value and
+    /// normalizer expressions evaluated where they belong.
+    pub fn cuda_flash_kernel(&self, root: usize, reads: &[usize]) -> Option<String> {
+        let f = self.flash_tile(root, reads)?;
+        let c = self.comp_at(root)?;
+        let rc = self.comp_at(f.red_node)?;
+        let rank = rc.rank();
+        let jdim = rank - 1;
+        let storage = |j: usize| self.storage(TensorId(j as u32)).n();
+        const BI: usize = 64;
+        const BJ: usize = 64;
+        const T: usize = 128;
+        let d = f.d_lanes;
+        let kd = f.kd;
+        let (ldk, lds, ldv, ldo) = (kd + 8, BJ + 8, d + 8, d + 8);
+        let n_terms = f.terms.len();
+        let ks_floats = n_terms * BJ * ldk;
+        let smem_floats = ks_floats.max(BI * ldk * n_terms) + BJ * lds + BJ * ldv + BI * ldo;
+        let tiles_i = f.m.div_ceil(BI);
+        let n_tiles = tiles_i * f.others.iter().map(|&d| f.pts[d]).product::<usize>();
+        let w_out = c.width();
+
+        // coordinate names in the reduction's space
+        let coord = |dim: usize| -> String {
+            if dim == jdim {
+                "(int)jj".into()
+            } else if dim == f.dy {
+                "(int)ii".into()
+            } else if dim == f.dx {
+                "(int)nn".into()
+            } else {
+                format!("(int)p{dim}")
+            }
+        };
+        let addr_expr = |a: &Addr, coord: &dyn Fn(usize) -> String| -> String {
+            let mut e = format!("{}", a.offset);
+            for (dim, &cf) in a.coefs.iter().enumerate() {
+                if cf != 0 {
+                    e.push_str(&format!(" + {cf} * {}", coord(dim)));
+                }
+            }
+            e
+        };
+        // an arg of the reduction as a CUDA expression at the current coords
+        let arg_value = |a: &Arg| -> String {
+            match &self.nodes[a.src.n()].op {
+                Op::Iota(dd) => {
+                    let fm = &a.view.forms[*dd];
+                    let mut e = format!("{}", fm.offset);
+                    for (dim, &cf) in fm.coefs.iter().enumerate() {
+                        if cf != 0 {
+                            e.push_str(&format!(" + {cf} * {}", coord(dim)));
+                        }
+                    }
+                    format!("(float)({e})")
+                }
+                _ => format!(
+                    "b{}[(unsigned)({})]",
+                    storage(a.src.n()),
+                    addr_expr(&self.flat_addr(a, rank), &coord)
+                ),
+            }
+        };
+        // score-space coordinate names: its point dims map to reduction
+        // dims; its reduce dim is the head-dim index `dd`
+        let score_coord = |dim: usize| -> String {
+            if dim == f.score_to_red.len() {
+                "(int)dd".into()
+            } else {
+                coord(f.score_to_red[dim])
+            }
+        };
+
+        let mut s = String::new();
+        writeln!(
+            s,
+            "// Auto-generated by tang-compile: flash attention on wmma (TF32)"
+        )
+        .unwrap();
+        writeln!(s, "#include <mma.h>").unwrap();
+        writeln!(s, "using namespace nvcuda;").unwrap();
+        writeln!(s, "#define TANG_TILES {n_tiles}").unwrap();
+        writeln!(s, "#define TANG_THREADS {T}").unwrap();
+        writeln!(s, "#define TANG_SMEM {}", smem_floats * 4).unwrap();
+        writeln!(s, "#define select(f, t, c) ((c) ? (t) : (f))").unwrap();
+        let mut params: Vec<String> = reads
+            .iter()
+            .map(|&j| format!("const float* __restrict__ b{j}"))
+            .collect();
+        params.push("float* __restrict__ out".into());
+        params.push("unsigned count".into());
+        writeln!(
+            s,
+            "extern \"C\" __global__ void __launch_bounds__({T}) main0({}) {{",
+            params.join(", ")
+        )
+        .unwrap();
+        writeln!(s, "    (void)count;").unwrap();
+        writeln!(s, "    extern __shared__ __align__(32) float smem[];").unwrap();
+        writeln!(s, "    float* Ks = smem;").unwrap();
+        writeln!(
+            s,
+            "    float* Ss = smem + {};",
+            ks_floats.max(BI * ldk * n_terms)
+        )
+        .unwrap();
+        writeln!(s, "    float* Vs = Ss + {};", BJ * lds).unwrap();
+        writeln!(s, "    float* Os = Vs + {};", BJ * ldv).unwrap();
+        writeln!(s, "    unsigned tile = blockIdx.x;").unwrap();
+        writeln!(s, "    if (tile >= {n_tiles}u) return;").unwrap();
+        writeln!(s, "    unsigned tile_i = tile % {tiles_i}u;").unwrap();
+        writeln!(s, "    unsigned lead = tile / {tiles_i}u;").unwrap();
+        for &dim in f.others.iter().rev() {
+            writeln!(s, "    unsigned p{dim} = lead % {}u;", f.pts[dim]).unwrap();
+            writeln!(s, "    lead = lead / {}u;", f.pts[dim]).unwrap();
+        }
+        writeln!(s, "    unsigned i0 = tile_i * {BI}u;").unwrap();
+        writeln!(s, "    unsigned tid = threadIdx.x;").unwrap();
+        writeln!(s, "    unsigned warp = tid / 32u;").unwrap();
+        writeln!(s, "    unsigned row = tid / 2u;").unwrap();
+        writeln!(s, "    unsigned half = tid % 2u;").unwrap();
+        // Q fragments: stage Q (reusing the K area), load per warp, keep
+        writeln!(
+            s,
+            "    for (unsigned idx = tid; idx < {}u; idx += {T}u) {{",
+            n_terms * BI * kd
+        )
+        .unwrap();
+        writeln!(s, "        unsigned t = idx / {}u; unsigned r = (idx / {kd}u) % {BI}u; unsigned dd = idx % {kd}u;", BI * kd).unwrap();
+        writeln!(s, "        unsigned ii = i0 + r;").unwrap();
+        writeln!(s, "        float v = 0.0f;").unwrap();
+        writeln!(s, "        if (ii < {}u) {{", f.m).unwrap();
+        for (t, (qb, qa, _, _)) in f.terms.iter().enumerate() {
+            writeln!(
+                s,
+                "            if (t == {t}u) v = b{qb}[(unsigned)({})];",
+                addr_expr(qa, &score_coord)
+            )
+            .unwrap();
+        }
+        writeln!(s, "        }}").unwrap();
+        writeln!(s, "        Ks[t * {}u + r * {ldk}u + dd] = v;", BI * ldk).unwrap();
+        writeln!(s, "    }}").unwrap();
+        writeln!(s, "    __syncthreads();").unwrap();
+        let nq = kd / 8;
+        writeln!(s, "    wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> qf[{n_terms}][{nq}];").unwrap();
+        writeln!(
+            s,
+            "    for (unsigned t = 0; t < {n_terms}u; t++) for (unsigned q = 0; q < {nq}u; q++) {{"
+        )
+        .unwrap();
+        writeln!(s, "        wmma::load_matrix_sync(qf[t][q], Ks + t * {}u + (warp * 16u) * {ldk}u + q * 8u, {ldk}u);", BI * ldk).unwrap();
+        writeln!(s, "        for (int e = 0; e < qf[t][q].num_elements; e++) qf[t][q].x[e] = wmma::__float_to_tf32(qf[t][q].x[e]);").unwrap();
+        writeln!(s, "    }}").unwrap();
+        writeln!(s, "    __syncthreads();").unwrap();
+        writeln!(
+            s,
+            "    for (unsigned idx = tid; idx < {}u; idx += {T}u) Os[idx] = 0.0f;",
+            BI * ldo
+        )
+        .unwrap();
+        writeln!(s, "    float m_row = -3.0e38f; float l_row = 0.0f;").unwrap();
+        writeln!(
+            s,
+            "    for (unsigned j0 = 0u; j0 < {}u; j0 += {BJ}u) {{",
+            f.n_keys
+        )
+        .unwrap();
+        // stage K terms and V
+        writeln!(
+            s,
+            "        for (unsigned idx = tid; idx < {}u; idx += {T}u) {{",
+            n_terms * BJ * kd
+        )
+        .unwrap();
+        writeln!(s, "            unsigned t = idx / {}u; unsigned r = (idx / {kd}u) % {BJ}u; unsigned dd = idx % {kd}u;", BJ * kd).unwrap();
+        writeln!(s, "            unsigned jj = j0 + r;").unwrap();
+        writeln!(s, "            float v = 0.0f;").unwrap();
+        writeln!(s, "            if (jj < {}u) {{", f.n_keys).unwrap();
+        for (t, (_, _, kb, ka)) in f.terms.iter().enumerate() {
+            writeln!(
+                s,
+                "                if (t == {t}u) v = b{kb}[(unsigned)({})];",
+                addr_expr(ka, &score_coord)
+            )
+            .unwrap();
+        }
+        writeln!(s, "            }}").unwrap();
+        writeln!(
+            s,
+            "            Ks[t * {}u + r * {ldk}u + dd] = v;",
+            BJ * ldk
+        )
+        .unwrap();
+        writeln!(s, "        }}").unwrap();
+        writeln!(
+            s,
+            "        for (unsigned idx = tid; idx < {}u; idx += {T}u) {{",
+            BJ * d
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "            unsigned r = idx / {d}u; unsigned nn = idx % {d}u; unsigned jj = j0 + r;"
+        )
+        .unwrap();
+        writeln!(s, "            float v = 0.0f;").unwrap();
+        writeln!(s, "            if (jj < {}u) {{", f.n_keys).unwrap();
+        {
+            let vals: Vec<String> = rc.args.iter().map(arg_value).collect();
+            let mut body = String::new();
+            let outs = emit_scalar(&mut body, &rc.body, &[rc.body_outs[2]], "v0_", &|v| {
+                vals[v as usize].clone()
+            });
+            for line in body.lines() {
+                writeln!(
+                    s,
+                    "                {}",
+                    float_literals(&line.replacen("let ", "float ", 1))
+                )
+                .unwrap();
+            }
+            writeln!(s, "                v = {};", outs[0]).unwrap();
+        }
+        writeln!(s, "            }}").unwrap();
+        writeln!(s, "            Vs[r * {ldv}u + nn] = v;").unwrap();
+        writeln!(s, "        }}").unwrap();
+        writeln!(s, "        __syncthreads();").unwrap();
+        // S = Σ_t Q_t · K_tᵀ for this warp's 16 rows × 64 keys
+        writeln!(s, "        {{").unwrap();
+        writeln!(
+            s,
+            "            wmma::fragment<wmma::accumulator, 16, 16, 8, float> sf[{}];",
+            BJ / 16
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "            for (unsigned cb = 0; cb < {}u; cb++) wmma::fill_fragment(sf[cb], 0.0f);",
+            BJ / 16
+        )
+        .unwrap();
+        writeln!(s, "            for (unsigned t = 0; t < {n_terms}u; t++) for (unsigned q = 0; q < {nq}u; q++) {{").unwrap();
+        writeln!(
+            s,
+            "                for (unsigned cb = 0; cb < {}u; cb++) {{",
+            BJ / 16
+        )
+        .unwrap();
+        writeln!(s, "                    wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::col_major> kf;").unwrap();
+        writeln!(s, "                    wmma::load_matrix_sync(kf, Ks + t * {}u + (cb * 16u) * {ldk}u + q * 8u, {ldk}u);", BJ * ldk).unwrap();
+        writeln!(s, "                    for (int e = 0; e < kf.num_elements; e++) kf.x[e] = wmma::__float_to_tf32(kf.x[e]);").unwrap();
+        writeln!(
+            s,
+            "                    wmma::mma_sync(sf[cb], qf[t][q], kf, sf[cb]);"
+        )
+        .unwrap();
+        writeln!(s, "                }}").unwrap();
+        writeln!(s, "            }}").unwrap();
+        writeln!(s, "            for (unsigned cb = 0; cb < {}u; cb++) wmma::store_matrix_sync(Ss + (warp * 16u) * {lds}u + cb * 16u, sf[cb], {lds}u, wmma::mem_row_major);", BJ / 16).unwrap();
+        writeln!(s, "        }}").unwrap();
+        writeln!(s, "        __syncthreads();").unwrap();
+        // online softmax on the score block: two threads per row
+        writeln!(s, "        {{").unwrap();
+        writeln!(s, "            unsigned ii = i0 + row;").unwrap();
+        writeln!(s, "            float mloc = -3.0e38f;").unwrap();
+        writeln!(
+            s,
+            "            for (unsigned c = 0; c < {}u; c++) {{",
+            BJ / 2
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "                unsigned jl = half * {}u + c; unsigned jj = j0 + jl;",
+            BJ / 2
+        )
+        .unwrap();
+        writeln!(s, "                float sval = Ss[row * {lds}u + jl];").unwrap();
+        {
+            let vals: Vec<String> = rc
+                .args
+                .iter()
+                .enumerate()
+                .map(|(k, a)| {
+                    if k == f.score_arg {
+                        "sval".to_string()
+                    } else {
+                        arg_value(a)
+                    }
+                })
+                .collect();
+            let mut body = String::new();
+            let outs = emit_scalar(&mut body, &rc.body, &[rc.body_outs[0]], "s0_", &|v| {
+                vals[v as usize].clone()
+            });
+            for line in body.lines() {
+                writeln!(
+                    s,
+                    "                {}",
+                    float_literals(&line.replacen("let ", "float ", 1))
+                )
+                .unwrap();
+            }
+            writeln!(
+                s,
+                "                float sc = (jj < {}u) ? ({}) : -3.0e38f;",
+                f.n_keys, outs[0]
+            )
+            .unwrap();
+        }
+        writeln!(s, "                Ss[row * {lds}u + jl] = sc;").unwrap();
+        writeln!(s, "                mloc = fmaxf(mloc, sc);").unwrap();
+        writeln!(s, "            }}").unwrap();
+        writeln!(
+            s,
+            "            mloc = fmaxf(mloc, __shfl_xor_sync(0xffffffffu, mloc, 1));"
+        )
+        .unwrap();
+        writeln!(s, "            float m_new = fmaxf(m_row, mloc);").unwrap();
+        writeln!(s, "            float alpha = expf(m_row - m_new);").unwrap();
+        writeln!(s, "            float lsum = 0.0f;").unwrap();
+        writeln!(
+            s,
+            "            for (unsigned c = 0; c < {}u; c++) {{",
+            BJ / 2
+        )
+        .unwrap();
+        writeln!(s, "                unsigned jl = half * {}u + c;", BJ / 2).unwrap();
+        writeln!(
+            s,
+            "                float p = expf(Ss[row * {lds}u + jl] - m_new);"
+        )
+        .unwrap();
+        writeln!(s, "                Ss[row * {lds}u + jl] = p; lsum += p;").unwrap();
+        writeln!(s, "            }}").unwrap();
+        writeln!(
+            s,
+            "            lsum += __shfl_xor_sync(0xffffffffu, lsum, 1);"
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "            l_row = l_row * alpha + lsum; m_row = m_new;"
+        )
+        .unwrap();
+        writeln!(s, "            for (unsigned c = 0; c < {}u; c++) Os[row * {ldo}u + half * {}u + c] *= alpha;", d / 2, d / 2).unwrap();
+        writeln!(s, "        }}").unwrap();
+        writeln!(s, "        __syncthreads();").unwrap();
+        // O += P · V
+        writeln!(
+            s,
+            "        for (unsigned cb = 0; cb < {}u; cb++) {{",
+            d / 16
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "            wmma::fragment<wmma::accumulator, 16, 16, 8, float> of;"
+        )
+        .unwrap();
+        writeln!(s, "            wmma::load_matrix_sync(of, Os + (warp * 16u) * {ldo}u + cb * 16u, {ldo}u, wmma::mem_row_major);").unwrap();
+        writeln!(
+            s,
+            "            for (unsigned q = 0; q < {}u; q++) {{",
+            BJ / 8
+        )
+        .unwrap();
+        writeln!(s, "                wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> pf;").unwrap();
+        writeln!(s, "                wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::row_major> vf;").unwrap();
+        writeln!(s, "                wmma::load_matrix_sync(pf, Ss + (warp * 16u) * {lds}u + q * 8u, {lds}u);").unwrap();
+        writeln!(s, "                wmma::load_matrix_sync(vf, Vs + (q * 8u) * {ldv}u + cb * 16u, {ldv}u);").unwrap();
+        writeln!(s, "                for (int e = 0; e < pf.num_elements; e++) pf.x[e] = wmma::__float_to_tf32(pf.x[e]);").unwrap();
+        writeln!(s, "                for (int e = 0; e < vf.num_elements; e++) vf.x[e] = wmma::__float_to_tf32(vf.x[e]);").unwrap();
+        writeln!(s, "                wmma::mma_sync(of, pf, vf, of);").unwrap();
+        writeln!(s, "            }}").unwrap();
+        writeln!(s, "            wmma::store_matrix_sync(Os + (warp * 16u) * {ldo}u + cb * 16u, of, {ldo}u, wmma::mem_row_major);").unwrap();
+        writeln!(s, "        }}").unwrap();
+        writeln!(s, "        __syncthreads();").unwrap();
+        writeln!(s, "    }}").unwrap();
+        // epilogue: the normalizer at (ii, nn), written in root's layout
+        let ep = self.epilogue_read(c, f.red_node)?;
+        // root coord for each root dim: the reduction dim whose form picks it
+        let root_rank = c.points().len();
+        let mut root_coord: Vec<Option<String>> = vec![None; root_rank];
+        for (rdim, fm) in ep.iter().enumerate() {
+            if let Some(d) = (0..root_rank).find(|&d| fm.coefs[d] != 0) {
+                root_coord[d] = Some(coord(rdim));
+            }
+        }
+        let root_coord: Vec<String> = root_coord.into_iter().collect::<Option<_>>()?;
+        writeln!(s, "    {{").unwrap();
+        writeln!(s, "        unsigned ii = i0 + row;").unwrap();
+        writeln!(s, "        if (ii < {}u) {{", f.m).unwrap();
+        writeln!(
+            s,
+            "            for (unsigned c = 0; c < {}u; c++) {{",
+            d / 2
+        )
+        .unwrap();
+        writeln!(s, "                unsigned nn = half * {}u + c;", d / 2).unwrap();
+        writeln!(s, "                float acc_v = Os[row * {ldo}u + nn];").unwrap();
+        {
+            let rcoord = |dim: usize| root_coord[dim].clone();
+            let vals: Vec<String> = c
+                .args
+                .iter()
+                .map(|a| {
+                    if a.src.n() == f.red_node {
+                        match self.epilogue_slot(a) {
+                            0 => "m_row".to_string(),
+                            1 => "l_row".to_string(),
+                            _ => "acc_v".to_string(),
+                        }
+                    } else {
+                        let addr = self.flat_addr(a, root_rank);
+                        format!(
+                            "b{}[(unsigned)({})]",
+                            storage(a.src.n()),
+                            addr_expr(&addr, &rcoord)
+                        )
+                    }
+                })
+                .collect();
+            let mut body = String::new();
+            let outs = emit_scalar(&mut body, &c.body, &c.body_outs, "e0_", &|v| {
+                vals[v as usize].clone()
+            });
+            for line in body.lines() {
+                writeln!(
+                    s,
+                    "                {}",
+                    float_literals(&line.replacen("let ", "float ", 1))
+                )
+                .unwrap();
+            }
+            let pts_root = super::fixed(c.points());
+            let mut flat = String::from("0u");
+            for (dd, &np) in pts_root.iter().enumerate() {
+                flat = format!("({flat}) * {np}u + (unsigned)({})", root_coord[dd]);
+            }
+            writeln!(s, "                unsigned g = {flat};").unwrap();
+            for (slot, v) in outs.iter().enumerate() {
+                writeln!(s, "                out[g * {w_out}u + {slot}u] = {v};").unwrap();
+            }
+        }
+        writeln!(s, "            }}").unwrap();
+        writeln!(s, "        }}").unwrap();
+        writeln!(s, "    }}").unwrap();
+        writeln!(s, "}}").unwrap();
+        let _ = f.score_node;
+        Some(s)
+    }
 }
 
 #[cfg(test)]

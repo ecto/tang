@@ -62,6 +62,11 @@ for T in (128, 512):
     theta = pos / (10000 ** (2*i/HD)); cos, sin = theta.cos().unsqueeze(1), theta.sin().unsqueeze(1)
     with torch.no_grad():
         print(f"block fwd seq={T} fp32: {bench(lambda: blk(x,cos,sin)):.3f} ms")
+        # tang's CUDA path runs its matmuls and attention on TF32 tensor
+        # cores; this is the like-for-like PyTorch setting
+        torch.backends.cuda.matmul.allow_tf32 = True
+        print(f"block fwd seq={T} tf32: {bench(lambda: blk(x,cos,sin)):.3f} ms")
+        torch.backends.cuda.matmul.allow_tf32 = False
     xg = x.clone().requires_grad_(True)
     def step():
         blk.zero_grad(set_to_none=True)

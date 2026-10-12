@@ -220,12 +220,16 @@ schedule space; the compiler searches it.
 - Native codegen is a first cut. Matmul-shaped tiles lower to Metal
   simdgroup matrices (`tensor_msl.rs`, via wgpu's MSL passthrough) and
   to CUDA `wmma` TF32 tensor cores (`tensor_cuda.rs`), epilogues
-  included. The CUDA kernel runs at 14–21 TFLOPS on a 3090, within 2× of
-  cuBLAS TF32; the Metal fp32 kernel does not yet beat the WGSL register
-  tile. Neither is dispatched by tang-gpu yet: Metal is opt-in, CUDA is
-  measured through an nvcc harness (`scripts/cuda_bench.cu`), since wgpu
-  cannot run CUDA. A CUDA runtime path (cudarc or driver-API FFI with
-  buffer interop) is the next piece.
+  included; `to_cuda` emits whole programs (wmma tiles plus the other
+  kernels transpiled from their WGSL) that `tang_bench::ir_cuda` runs
+  through cudarc. The block forward runs in 0.62 ms at seq 128 on a 3090
+  with six kernels on tensor cores — the five matmul-shaped tiles and
+  the fused attention, which `cuda_flash_kernel` lowers to a wmma flash
+  kernel from the comp's structure (bilinear score, mask, value,
+  normalizer); the Metal fp32 kernel does not yet beat the WGSL
+  register tile.
+- The CUDA path is a separate runtime (tang-gpu runs on wgpu, which
+  cannot dispatch CUDA); buffers do not interoperate between the two.
 - Native half arithmetic. Storage is f16, math is f32; matrix units
   (Apple `simdgroup_matrix`, 11 TFLOP/s with f16 inputs vs ~3.3 for the
   IR's f32 tiles) need an MSL emitter that reads the precision schedule.
