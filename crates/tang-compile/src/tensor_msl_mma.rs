@@ -42,12 +42,21 @@ pub(super) struct Addr {
 /// One product of the bilinear body: buffers (storage nodes) of the two
 /// operands and their addresses over the reduction's space; A has no
 /// coefficient on `dx`, B none on `dy`.
+///
+/// An operand may instead be an inlined map over buffers (`map_a` /
+/// `map_b`: the index of its arg in the reduction): the value is
+/// recomputed where it is staged — dS of an attention backward, rebuilt
+/// in every dQ/dK tile from the tensors it is a pointwise function of.
+/// Its `buf` is then the map's node and its `addr` the map's row-major
+/// address (for the staging order).
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct Term {
     pub buf_a: usize,
     pub addr_a: Addr,
     pub buf_b: usize,
     pub addr_b: Addr,
+    pub map_a: Option<usize>,
+    pub map_b: Option<usize>,
 }
 
 /// A matmul-shaped tile (see [`TensorGraph::bilinear_tile`]).
@@ -154,6 +163,25 @@ impl TensorGraph {
         let (n, m) = (pts[dx], pts[dy]);
         let storage = |j: usize| self.storage(TensorId(j as u32)).n();
         let is_buffer = |j: usize| reads.contains(&storage(j));
+        // an inlined map over buffers and iotas, read through plain views:
+        // recomputed at staging
+        let is_map = |a: &Arg| -> bool {
+            let p = a.src.n();
+            if a.view.guard || !self.nodes[p].inline {
+                return false;
+            }
+            let Some(mc) = self.comp_at(p) else {
+                return false;
+            };
+            mc.monoid.is_none()
+                && mc.red.is_empty()
+                && mc.width() == 1
+                && mc.args.iter().all(|s| {
+                    !s.view.guard
+                        && (matches!(self.nodes[s.src.n()].op, super::Op::Iota(_))
+                            || is_buffer(s.src.n()))
+                })
+        };
         let mut outs: Vec<Vec<Term>> = Vec::with_capacity(out_pairs.len());
         for pairs in out_pairs {
             let mut terms = Vec::with_capacity(pairs.len());
@@ -169,14 +197,48 @@ impl TensorGraph {
                     } else {
                         return None;
                     };
-                if !is_buffer(rc.args[a_arg].src.n()) || !is_buffer(rc.args[b_arg].src.n()) {
-                    return None;
-                }
+                let operand = |v: usize| -> Option<(usize, Option<usize>)> {
+                    let a = &rc.args[v];
+                    if is_buffer(a.src.n()) {
+                        Some((storage(a.src.n()), None))
+                    } else if is_map(a) {
+                        Some((a.src.n(), Some(v)))
+                    } else {
+                        None
+                    }
+                };
+                let (buf_a, map_a) = operand(a_arg)?;
+                let (buf_b, map_b) = operand(b_arg)?;
+                // a map is staged in the order of the buffer it reads
+                // along the most dims (its own layout may be transposed)
+                let layout = |v: usize, addr: Addr| -> Addr {
+                    let outer = &rc.args[v];
+                    let mc = self.comp_at(outer.src.n()).unwrap();
+                    mc.args
+                        .iter()
+                        .filter(|s| is_buffer(s.src.n()))
+                        .map(|s| {
+                            let view = s.view.compose(&outer.view, rank);
+                            self.flat_addr(&Arg { src: s.src, view }, rank)
+                        })
+                        .max_by_key(|a| a.coefs.iter().filter(|&&c| c != 0).count())
+                        .unwrap_or(addr)
+                };
+                let addr_a = match map_a {
+                    Some(v) => layout(v, addr_a),
+                    None => addr_a,
+                };
+                let addr_b = match map_b {
+                    Some(v) => layout(v, addr_b),
+                    None => addr_b,
+                };
                 terms.push(Term {
-                    buf_a: storage(rc.args[a_arg].src.n()),
+                    buf_a,
                     addr_a,
-                    buf_b: storage(rc.args[b_arg].src.n()),
+                    buf_b,
                     addr_b,
+                    map_a,
+                    map_b,
                 });
             }
             outs.push(terms);
@@ -218,7 +280,11 @@ impl TensorGraph {
         let (LDA, LDB, LDC) = (CHUNK + PAD, BLOCK + PAD, BLOCK + PAD);
         let c = self.comp_at(root)?;
         let t = self.bilinear_tile(root, reads)?;
-        if t.terms.len() != 1 || t.outs.len() != 1 {
+        if t.terms.len() != 1
+            || t.outs.len() != 1
+            || t.terms[0].map_a.is_some()
+            || t.terms[0].map_b.is_some()
+        {
             return None;
         }
         let Bilinear {

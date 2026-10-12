@@ -2593,6 +2593,53 @@ pub mod ir_block {
     mod tests {
         use super::*;
 
+        /// The training step's attention backward lowers to tensor cores:
+        /// the state-materializing online-softmax forward (score read from
+        /// its buffer) as a flash tile writing `(m, l, acc)`, and the
+        /// dQ/dK contractions with dS recomputed in the staging of every
+        /// tile instead of read from a buffer.
+        #[test]
+        fn training_attention_lowers_to_wmma() {
+            let dims = BlockDims {
+                seq: 128,
+                kv_len: 128,
+                rope: true,
+                bias: true,
+                d_model: 576,
+                n_heads: 9,
+                n_kv_heads: 3,
+                head_dim: 64,
+                ff_dim: 1536,
+            };
+            let (g, outs, _) = train_loss_graph(&dims);
+            let (g, outs) = g.stabilize_softmax(&outs);
+            let (g, outs) = g.substitute_maps(&outs);
+            let (g, outs) = g.eliminate_common(&outs);
+            let (g, outs) = g.merge_siblings(&outs);
+            let (g, outs) = g.relayout(&outs);
+            let (g, outs) = g.merge_reduce_dims(&outs);
+            let (mut g, outs) = g.split_reduce_dims(&outs);
+            g.schedule_auto(&outs);
+            let p = g.to_cuda(&outs);
+            let flash: Vec<_> = p
+                .kernels
+                .iter()
+                .filter(|k| k.source.contains("flash attention on wmma"))
+                .collect();
+            assert_eq!(flash.len(), 1, "the online-softmax forward");
+            assert!(flash[0].source.contains("out[g * 3u + 1u] = l_row;"));
+            // causal key tiles are skipped, derived from the mask
+            assert!(flash[0].source.contains("continue;"));
+            // dS is a map staged in place in the dQ/dK tiles: the tiles
+            // read every tensor it is a pointwise function of
+            let recomputed = p
+                .kernels
+                .iter()
+                .filter(|k| k.source.contains("wmma (TF32) tile") && k.source.contains("exp2("))
+                .count();
+            assert_eq!(recomputed, 3, "dK (both rope halves) and two dQ halves");
+        }
+
         /// The whole block is differentiable: gradients of `sum(out)`
         /// w.r.t. the input and a weight match finite differences.
         #[test]

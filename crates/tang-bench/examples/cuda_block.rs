@@ -91,7 +91,7 @@ fn main() {
         exe.run(&rt);
         let got = exe.read(&rt, y);
         println!("block seq={seq}: output digest {:016x}", digest(&got));
-        if seq == 128 {
+        if seq == 128 && std::env::var("TANG_NO_CHECK").is_err() {
             let f64s: Vec<Vec<f64>> = inputs
                 .iter()
                 .map(|v| v.iter().map(|&x| x as f64).collect())
