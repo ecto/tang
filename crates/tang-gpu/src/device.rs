@@ -34,6 +34,9 @@ pub struct GpuDevice {
     pub(crate) queue: wgpu::Queue,
     /// Adapter name and backend, e.g. `"Apple M4 Max (Metal)"`.
     pub name: String,
+    /// Native MSL kernels can be dispatched (Metal, with wgpu's
+    /// shader passthrough).
+    pub msl_passthrough: bool,
 }
 
 impl GpuDevice {
@@ -47,7 +50,7 @@ impl GpuDevice {
                 force_fallback_adapter: false,
             })
             .await
-            .ok_or(GpuError::NoAdapter)?;
+            .map_err(|_| GpuError::NoAdapter)?;
 
         // Generated kernels bind one storage buffer per tensor they read;
         // a fused block kernel can need more than the default 8. Ask for
@@ -60,24 +63,27 @@ impl GpuDevice {
             .max_compute_workgroup_storage_size
             .max(limits.max_compute_workgroup_storage_size);
 
+        // Native shader passthrough (MSL on Metal) lets generated kernels
+        // use what WGSL cannot express — simdgroup matrices.
+        let required_features = adapter.features() & wgpu::Features::MSL_SHADER_PASSTHROUGH;
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("tang-gpu"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: limits,
-                    memory_hints: wgpu::MemoryHints::Performance,
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("tang-gpu"),
+                required_features,
+                required_limits: limits,
+                memory_hints: wgpu::MemoryHints::Performance,
+                trace: wgpu::Trace::Off,
+            })
             .await?;
 
         let info = adapter.get_info();
         let name = format!("{} ({:?})", info.name, info.backend);
+        let msl_passthrough = required_features.contains(wgpu::Features::MSL_SHADER_PASSTHROUGH);
         Ok(Self {
             device,
             queue,
             name,
+            msl_passthrough,
         })
     }
 
