@@ -1182,7 +1182,8 @@ impl TensorGraph {
 // ---------------------------------------------------------------------------
 
 /// 8-row query fragments per SIMD group (4 SIMD groups, `32·ATT_RF` rows
-/// per threadgroup), keys per tile.
+/// per threadgroup), keys per tile. Measured on M4 Max: RF 2 and BK 64
+/// are both slower (register pressure), so 32 × 32 it is.
 const ATT_RF: usize = 1;
 const ATT_BK: usize = 32;
 /// Largest value-column block per threadgroup (wider `dv` is a grid axis).
@@ -1628,8 +1629,8 @@ impl TensorGraph {
         let fragdev = match (&dkk, &dvv) {
             (Some((_, kf)), Some((_, vf)))
                 if d8 == dk
-                    && nk % bk == 0
-                    && nc % bc == 0
+                    && nk.is_multiple_of(bk)
+                    && nc.is_multiple_of(bc)
                     && kf.coefs[pk + 1] == 1
                     && kf.coefs[dr] == 0
                     && kf.coefs[dc] == 0
@@ -1940,27 +1941,11 @@ impl TensorGraph {
             }
         };
         writeln!(s, "        simdgroup_half8x8 pfa[{}];", rf * nkf).unwrap();
-        writeln!(s, "        for (uint rr = 0u; rr < {rf}u; rr++) {{").unwrap();
-        writeln!(s, "        const uint row = rowb + rr * 8u;").unwrap();
-        writeln!(s, "        thread float& mrow = mrows[rr];").unwrap();
-        for &k in &row_slots {
-            writeln!(s, "        thread float& lsum{k} = lsums{k}[rr];").unwrap();
-        }
-        writeln!(
-            s,
-            "        thread simdgroup_float8x8* sf = sfa + rr * {nkf}u;"
-        )
-        .unwrap();
-        writeln!(
-            s,
-            "        thread simdgroup_half8x8* pf = pfa + rr * {nkf}u;"
-        )
-        .unwrap();
-        writeln!(
-            s,
-            "        thread simdgroup_float8x8* acc = acca + rr * {ncf}u;"
-        )
-        .unwrap();
+        // one copy per row fragment, every index constant (references or
+        // pointers into the fragment arrays spill them)
+        let blk_start = s.len();
+        writeln!(s, "        {{").unwrap();
+        writeln!(s, "        const uint row = rowb + RR8u;").unwrap();
         writeln!(s, "        float sv[{}];", 2 * nkf).unwrap();
         writeln!(s, "        float tmax = {ATT_NEG};").unwrap();
         writeln!(s, "        for (uint jf = 0u; jf < {nkf}u; jf++) {{").unwrap();
@@ -2059,6 +2044,19 @@ impl TensorGraph {
         writeln!(s, "            }}").unwrap();
         writeln!(s, "        }}").unwrap();
         writeln!(s, "        }}").unwrap();
+        let blk = s.split_off(blk_start);
+        for rr in 0..rf {
+            let mut b = blk
+                .replace("RR8u", &format!("{}u", 8 * rr))
+                .replace("sf[", &format!("sfa[{}u + ", rr * nkf))
+                .replace("pf[", &format!("pfa[{}u + ", rr * nkf))
+                .replace("acc[", &format!("acca[{}u + ", rr * ncf))
+                .replace("mrow", &format!("mrows[{rr}]"));
+            for &k in &row_slots {
+                b = b.replace(&format!("lsum{k}"), &format!("lsums{k}[{rr}]"));
+            }
+            s.push_str(&b);
+        }
         // O += P·V
         writeln!(s, "        for (uint jf = 0u; jf < {nkf}u; jf++) {{").unwrap();
         writeln!(s, "            for (uint cf = 0u; cf < {ncf}u; cf++) {{").unwrap();
@@ -2181,7 +2179,7 @@ impl TensorGraph {
         writeln!(s, "}}").unwrap();
         let points = numel_fixed(&fixed(self.comp_at(root).unwrap().points()));
         MslKernel {
-            source: translate(self, &s, &reads, root).0,
+            source: translate(self, &unroll_const_loops(&s), &reads, root).0,
             threadgroup_bytes: 2 * sm,
             entry: "k_main".into(),
             node: TensorId(root as u32),
@@ -2220,9 +2218,9 @@ fn stage_direct(
             .iter()
             .enumerate()
             .all(|(d, &c)| d == col_dim || c % 4 == 0)
-        && cols % 4 == 0
-        && col_lim % 4 == 0
-        && ld % 4 == 0;
+        && cols.is_multiple_of(4)
+        && col_lim.is_multiple_of(4)
+        && ld.is_multiple_of(4);
     if !aligned {
         return false;
     }
@@ -2261,6 +2259,88 @@ fn stage_direct(
     writeln!(s, "{pad}    }}").unwrap();
     writeln!(s, "{pad}}}").unwrap();
     true
+}
+
+/// Unroll every `for (uint x = 0u; x < Nu; x++) body` in MSL text into N
+/// scopes `{ const uint x = i; body }` (nested loops too): indices into
+/// fragment arrays and `thread_elements()` become constants, which the
+/// Metal compiler otherwise may leave dynamic and spill to the stack.
+fn unroll_const_loops(src: &str) -> String {
+    let b = src.as_bytes();
+    let mut out = String::with_capacity(src.len() * 2);
+    let mut i = 0;
+    while let Some(off) = src[i..].find("for (uint ") {
+        let at = i + off;
+        out.push_str(&src[i..at]);
+        let head_end = matching(src, at + 4);
+        let head = &src[at + 5..head_end];
+        let parsed = (|| {
+            let mut parts = head.split(';').map(str::trim);
+            let init = parts.next()?.strip_prefix("uint ")?;
+            let (var, start) = init.split_once('=')?;
+            let var = var.trim();
+            if start.trim() != "0u" {
+                return None;
+            }
+            let cond = parts.next()?;
+            let n: usize = cond
+                .strip_prefix(var)?
+                .trim()
+                .strip_prefix('<')?
+                .trim()
+                .strip_suffix('u')?
+                .parse()
+                .ok()?;
+            (parts.next()? == format!("{var}++") && n <= 16).then(|| (var.to_string(), n))
+        })();
+        let Some((var, n)) = parsed else {
+            out.push_str(&src[at..head_end + 1]);
+            i = head_end + 1;
+            continue;
+        };
+        let mut j = head_end + 1;
+        while b[j] == b' ' {
+            j += 1;
+        }
+        let (body, end) = if b[j] == b'{' {
+            let mut depth = 0;
+            let mut k = j;
+            loop {
+                match b[k] {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                k += 1;
+            }
+            (&src[j + 1..k], k + 1)
+        } else {
+            let mut depth = 0;
+            let mut k = j;
+            loop {
+                match b[k] {
+                    b'(' | b'[' | b'{' => depth += 1,
+                    b')' | b']' | b'}' => depth -= 1,
+                    b';' if depth == 0 => break,
+                    _ => {}
+                }
+                k += 1;
+            }
+            (&src[j..k + 1], k + 1)
+        };
+        let body = unroll_const_loops(body);
+        for v in 0..n {
+            write!(out, "{{ const uint {var} = {v}u; {body} }}").unwrap();
+        }
+        i = end;
+    }
+    out.push_str(&src[i..]);
+    out
 }
 
 fn numel_fixed(p: &[usize]) -> usize {

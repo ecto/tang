@@ -766,6 +766,10 @@ fn fragment_attention() {
         (4, 1, 96, 32, 32, true),
         (1, 1, 77, 40, 24, true),
         (1, 2, 70, 48, 136, false),
+        // full tiles: K/V fragments straight from device memory
+        (2, 2, 256, 64, 64, true),
+        (2, 2, 256, 64, 64, false),
+        (1, 1, 128, 64, 128, false),
     ] {
         let name = format!("attn hk{hk} g{gq} n{n} d{d} dv{dv} causal {causal}");
         let (g, y) = flash_attention_heads_fragment(hk, gq, n, d, dv, causal);
