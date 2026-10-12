@@ -488,6 +488,98 @@ pub mod ir_gpu {
         (g, log)
     }
 
+    /// Schedules chosen by [`autotune_kernels`], stored per (program,
+    /// device) so the measurement is paid once per chip. Plain text:
+    /// one `node split bx by chunk` line per kernel under a header line.
+    pub struct TuningCache {
+        pub path: std::path::PathBuf,
+    }
+
+    /// `(node index, split, tile)` as stored in the cache.
+    type Entry = (usize, u32, (u32, u32, u32));
+
+    impl TuningCache {
+        pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
+            Self { path: path.into() }
+        }
+
+        /// Hash of the untuned kernels' sources plus the device name.
+        fn key(device: &GpuDevice, g: &TensorGraph, outputs: &[TensorId]) -> u64 {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            device.name.hash(&mut h);
+            let mut plain = g.clone();
+            for k in g.to_wgsl(outputs).kernels {
+                plain.set_schedule(k.node, 0, (0, 0, 0));
+            }
+            for k in plain.to_wgsl(outputs).kernels {
+                k.source.hash(&mut h);
+            }
+            h.finish()
+        }
+
+        fn load(&self, key: u64) -> Option<Vec<Entry>> {
+            let text = std::fs::read_to_string(&self.path).ok()?;
+            let mut lines = text.lines();
+            let header = lines.next()?;
+            if header != format!("tang-tuning {key:016x}") {
+                return None;
+            }
+            lines
+                .map(|l| {
+                    let v: Vec<u32> = l
+                        .split_whitespace()
+                        .filter_map(|x| x.parse().ok())
+                        .collect();
+                    (v.len() == 5).then(|| (v[0] as usize, v[1], (v[2], v[3], v[4])))
+                })
+                .collect()
+        }
+
+        fn store(&self, key: u64, log: &[TunedKernel]) {
+            let mut text = format!("tang-tuning {key:016x}\n");
+            for k in log {
+                text.push_str(&format!(
+                    "{} {} {} {} {}\n",
+                    k.node.index(),
+                    k.split,
+                    k.tile.0,
+                    k.tile.1,
+                    k.tile.2
+                ));
+            }
+            if let Some(dir) = self.path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if let Err(e) = std::fs::write(&self.path, text) {
+                eprintln!("tuning cache: could not write {}: {e}", self.path.display());
+            }
+        }
+
+        /// Tuned graph: from the cache if the (program, device) matches,
+        /// otherwise measured now and cached.
+        pub fn tune(
+            &self,
+            device: &GpuDevice,
+            cache: &mut KernelCache,
+            g: TensorGraph,
+            outputs: &[TensorId],
+            inputs: &[&[f32]],
+        ) -> (TensorGraph, bool) {
+            let key = Self::key(device, &g, outputs);
+            if let Some(entries) = self.load(key) {
+                let mut g = g;
+                for (node, split, tile) in entries {
+                    g.set_schedule(TensorId::from_index(node), split, tile);
+                }
+                return (g, true);
+            }
+            let (g, log) = autotune_kernels(device, cache, g, outputs, inputs, 10);
+            self.store(key, &log);
+            (g, false)
+        }
+    }
+
     /// All attention schedules the compiler currently knows how to produce.
     pub fn attention_candidates(
         n: usize,
@@ -1294,6 +1386,34 @@ pub mod ir_block_gpu {
         (Executable::new(device, g.to_wgsl(&[y]), &inputs), y)
     }
 
+    /// The block under the per-kernel autotuner, cached in
+    /// `target/tang-tuning-block-<seq>.txt` for this device.
+    pub fn ir_executable_tuned(
+        device: &GpuDevice,
+        cache: &mut KernelCache,
+        p: &Params,
+    ) -> (Executable, tang_compile::tensor::TensorId) {
+        let (g, y) = compiled_block(&p.dims);
+        let inputs: Vec<&[f32]> = p.cpu.iter().map(|v| v.as_slice()).collect();
+        let path = format!(
+            "{}/target/tang-tuning-block-{}.txt",
+            env!("CARGO_MANIFEST_DIR"),
+            p.dims.seq
+        );
+        let tc = super::ir_gpu::TuningCache::new(path);
+        let (g, from_cache) = tc.tune(device, cache, g, &[y], &inputs);
+        eprintln!(
+            "block seq {}: schedule {}",
+            p.dims.seq,
+            if from_cache {
+                "from tuning cache"
+            } else {
+                "measured and cached"
+            }
+        );
+        (Executable::new(device, g.to_wgsl(&[y]), &inputs), y)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1556,6 +1676,18 @@ pub mod ir_block_gpu {
             };
             let (hand_err, hand_i) = worst(&want);
             eprintln!("hand vs f64: max err {hand_err} at {hand_i} (scale {scale})");
+            {
+                let (exe, y) = ir_executable_tuned(&device, &mut cache, &p);
+                exe.run(&device, &mut cache);
+                cache.flush(&device);
+                let got = exe.read(&device, y);
+                let (ir_err, _) = worst(&got);
+                eprintln!("ir(tuned) vs f64: max err {ir_err}");
+                assert!(
+                    ir_err < 2e-3 * scale.max(1.0),
+                    "tuned ir diverges from f64 reference"
+                );
+            }
             for scheduled in [false, true] {
                 let (exe, y) = ir_executable(&device, &p, scheduled);
                 exe.run(&device, &mut cache);

@@ -301,6 +301,11 @@ impl TensorId {
     pub fn index(self) -> usize {
         self.0 as usize
     }
+
+    /// Handle for node `index` (no validation).
+    pub fn from_index(index: usize) -> Self {
+        TensorId(index as u32)
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]

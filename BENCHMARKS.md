@@ -392,10 +392,14 @@ IR graph (`tang_bench::ir_block`) and run under `substitute_maps` +
 `stabilize_softmax` + `schedule_auto`. Identical weights; outputs agree
 with the hand path and with the f64 interpreter to 5e-7.
 
-| seq | hand | ir_auto |
-|---|---|---|
-| 128 | 5.15 ms | **4.61 ms** |
-| 512 | 24.1 ms | **14.3 ms** |
+| seq | hand | ir_auto | ir_tuned |
+|---|---|---|---|
+| 128 | 5.07 ms | 4.63 ms | **4.45 ms** |
+| 512 | 24.1 ms | 14.3 ms | **13.9 ms** |
+
+`ir_tuned` is the per-kernel autotuner's schedule, measured once per
+(program, device) and kept in a `TuningCache` file (`crates/tang-bench/
+target/tang-tuning-block-<seq>.txt`); later runs load it.
 
 (10 kernels; `examples/block_kernels.rs` times each one. An earlier
 version of `schedule_auto` lane-tiled the plain k/v projections and lost

@@ -32,6 +32,8 @@ impl From<wgpu::RequestDeviceError> for GpuError {
 pub struct GpuDevice {
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
+    /// Adapter name and backend, e.g. `"Apple M4 Max (Metal)"`.
+    pub name: String,
 }
 
 impl GpuDevice {
@@ -70,7 +72,13 @@ impl GpuDevice {
             )
             .await?;
 
-        Ok(Self { device, queue })
+        let info = adapter.get_info();
+        let name = format!("{} ({:?})", info.name, info.backend);
+        Ok(Self {
+            device,
+            queue,
+            name,
+        })
     }
 
     /// Create a GPU device synchronously (blocks on async).

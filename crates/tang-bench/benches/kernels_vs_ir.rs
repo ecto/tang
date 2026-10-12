@@ -384,7 +384,7 @@ mod gpu_norm {
 mod gpu_block {
     use super::*;
     use tang_bench::ir_block::BlockDims;
-    use tang_bench::ir_block_gpu::{hand_forward, ir_executable, params};
+    use tang_bench::ir_block_gpu::{hand_forward, ir_executable, ir_executable_tuned, params};
     use tang_gpu::{GpuDevice, GpuTensor, KernelCache};
 
     pub fn bench_block(c: &mut Criterion) {
@@ -416,6 +416,14 @@ mod gpu_block {
             });
             let (exe, y) = ir_executable(&device, &p, true);
             group.bench_function(BenchmarkId::new("ir_auto", seq), |b| {
+                b.iter(|| {
+                    exe.run(&device, &mut cache);
+                    cache.flush(&device);
+                    black_box(exe.read(&device, y));
+                })
+            });
+            let (exe, y) = ir_executable_tuned(&device, &mut cache, &p);
+            group.bench_function(BenchmarkId::new("ir_tuned", seq), |b| {
                 b.iter(|| {
                     exe.run(&device, &mut cache);
                     cache.flush(&device);
