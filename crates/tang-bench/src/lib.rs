@@ -601,7 +601,9 @@ pub mod ir_gpu {
     /// materialized intermediates), largest first; each is lowered to f16
     /// storage on top of what has been kept so far, run, checked against
     /// `want` (the f64 reference for `outputs`) and timed. A change is
-    /// kept if the whole program stays within `budget` and gets faster.
+    /// kept if the whole program stays within `budget` and gets at least
+    /// 3% faster; the final choice is re-timed against the f32 baseline
+    /// and dropped if the gain does not hold up.
     ///
     /// Then every reduction is tried with an f16 accumulator, checked
     /// against the budget only: the lowering models f16 accumulation by
@@ -623,15 +625,22 @@ pub mod ir_gpu {
         let measure = |cache: &mut KernelCache, g: &TensorGraph, timed: bool| {
             let exe = Executable::new(device, g.to_wgsl(outputs), inputs);
             let err = gpu_error(device, cache, &exe, outputs, want);
-            let ms = (timed && budget.admits(&err))
-                .then(|| time_program(device, cache, &exe, outputs[0], iters));
+            // best of three: one run of a sub-ms program is mostly clock noise
+            let ms = (timed && budget.admits(&err)).then(|| {
+                (0..3)
+                    .map(|_| time_program(device, cache, &exe, outputs[0], iters))
+                    .fold(f64::INFINITY, f64::min)
+            });
             (err, ms)
         };
+        // first timing warms clocks and pipelines; the second is the baseline
+        let _ = measure(cache, &g, true);
         let (base_error, base_ms) = measure(cache, &g, true);
         let base_ms = base_ms.unwrap_or_else(|| {
             let exe = Executable::new(device, g.to_wgsl(outputs), inputs);
             time_program(device, cache, &exe, outputs[0], iters)
         });
+        let base = g.clone();
         let mut cur = g;
         let (mut cur_err, mut cur_ms) = (base_error, base_ms);
         let mut trials = Vec::new();
@@ -649,8 +658,8 @@ pub mod ir_gpu {
             let mut v = cur.clone();
             v.set_precision(node, p);
             let (err, ms) = measure(cache, &v, true);
-            // a change must buy at least 2% to be worth its error
-            let kept = ms.is_some_and(|t| t < cur_ms * 0.98);
+            // a change must buy at least 3% to be worth its error
+            let kept = ms.is_some_and(|t| t < cur_ms * 0.97);
             trials.push(PrecisionTrial {
                 node,
                 precision: p,
@@ -686,11 +695,36 @@ pub mod ir_gpu {
             });
         }
 
-        let assignment = (0..cur.nodes().len())
+        let assignment: Vec<(TensorId, Precision)> = (0..cur.nodes().len())
             .map(TensorId::from_index)
             .filter(|&t| cur.precision(t) != Precision::F32)
             .map(|t| (t, cur.precision(t)))
             .collect();
+        // the reported pair is re-timed back to back, best of three each,
+        // so clock ramp-up during the search does not flatter either side
+        let (mut base_ms, mut cur_ms) = (base_ms, cur_ms);
+        if !assignment.is_empty() {
+            let b = Executable::new(device, base.to_wgsl(outputs), inputs);
+            let c = Executable::new(device, cur.to_wgsl(outputs), inputs);
+            base_ms = f64::INFINITY;
+            cur_ms = f64::INFINITY;
+            for _ in 0..3 {
+                base_ms = base_ms.min(time_program(device, cache, &b, outputs[0], iters));
+                cur_ms = cur_ms.min(time_program(device, cache, &c, outputs[0], iters));
+            }
+            // a choice that does not survive the re-time was noise: keep f32
+            if cur_ms >= base_ms * 0.99 {
+                return PrecisionTune {
+                    graph: base,
+                    assignment: Vec::new(),
+                    error: base_error,
+                    base_error,
+                    base_ms,
+                    ms: base_ms,
+                    trials,
+                };
+            }
+        }
         PrecisionTune {
             graph: cur,
             assignment,

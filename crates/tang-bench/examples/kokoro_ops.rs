@@ -10,8 +10,11 @@
 use std::time::Instant;
 
 use tang::Scalar;
-use tang_bench::ir_gpu::{autotune_kernels, Executable};
-use tang_compile::tensor::{Arg, Form, Monoid, TensorGraph, TensorId, View};
+use tang_bench::ir_gpu::{autotune_kernels, tune_precision, Executable};
+use tang_compile::tensor::{
+    Arg, ErrorBudget, ErrorStats, Form, Format, Monoid, Op, Precision, TensorGraph, TensorId,
+    View,
+};
 use tang_expr::ExprId;
 use tang_gpu::{GpuDevice, KernelCache};
 
@@ -746,6 +749,10 @@ fn main() {
     let device = GpuDevice::new_sync().expect("gpu");
     let mut cache = KernelCache::new();
     let only: Option<String> = std::env::args().nth(1);
+    if only.as_deref() == Some("precision") {
+        precision_main(&device, &mut cache, std::env::args().nth(2));
+        return;
+    }
     let want_op = |n: &str| only.as_deref().is_none_or(|o| n.starts_with(o));
     println!(
         "{} — kernel-only, {ITERS} launches per sample\n",
@@ -1008,5 +1015,325 @@ fn main() {
     println!("|---|---:|---|");
     for r in rows {
         println!("| {} | {:.3} | {} |", r.name, r.best, r.schedule);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// precision schedules
+// ---------------------------------------------------------------------------
+
+/// One op for the precision search: the full-size graph with inputs and
+/// its f64 reference, input names for the report, and a small instance
+/// of the same builder for the interpreter's prediction.
+struct PrecOp {
+    name: &'static str,
+    g: TensorGraph,
+    outs: Vec<TensorId>,
+    inputs: Vec<Vec<f32>>,
+    want: Vec<f64>,
+    names: Vec<&'static str>,
+    small: (TensorGraph, Vec<TensorId>, Vec<Vec<f64>>),
+}
+
+fn matmul_graph(m: usize, k: usize, n: usize) -> (TensorGraph, Vec<TensorId>) {
+    let mut g = TensorGraph::new();
+    let a = g.input(&[m, k]);
+    let b = g.input(&[k, n]);
+    let y = g.matmul(a, b).unwrap();
+    (g, vec![y])
+}
+
+fn matmul_ref(a: &[f64], b: &[f64], m: usize, k: usize, n: usize) -> Vec<f64> {
+    let mut y = vec![0.0; m * n];
+    for i in 0..m {
+        for kk in 0..k {
+            let av = a[i * k + kk];
+            let row = &b[kk * n..(kk + 1) * n];
+            for (yv, bv) in y[i * n..(i + 1) * n].iter_mut().zip(row) {
+                *yv += av * bv;
+            }
+        }
+    }
+    y
+}
+
+fn small_inputs(g: &TensorGraph, seed: u64, scales: &[f32]) -> Vec<Vec<f64>> {
+    let n_in = g.nodes().iter().filter(|n| matches!(n.op, Op::Input(_))).count();
+    (0..n_in)
+        .map(|k| {
+            let node = g
+                .nodes()
+                .iter()
+                .find(|n| matches!(n.op, Op::Input(i) if i == k))
+                .unwrap();
+            let len = node.shape.iter().map(|d| d.n()).product();
+            f64s(&rand(len, seed + k as u64, scales[k]))
+        })
+        .collect()
+}
+
+/// `name[shape]` of a node, for the assignment column.
+fn describe(g: &TensorGraph, t: TensorId, names: &[&str], outs: &[TensorId]) -> String {
+    let n = &g.nodes()[t.index()];
+    let shape = n
+        .shape
+        .iter()
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>()
+        .join("×");
+    match n.op {
+        Op::Input(k) => format!("{}[{shape}]", names[k]),
+        _ if outs.contains(&t) => format!("out[{shape}]"),
+        _ => format!("n{}[{shape}]", t.index()),
+    }
+}
+
+fn fmt_prec(p: Precision) -> String {
+    let f = |f: Format| match f {
+        Format::F32 => "f32",
+        Format::F16 => "f16",
+        Format::BF16 => "bf16",
+    };
+    if p.accum == Format::F32 {
+        f(p.storage).to_string()
+    } else {
+        format!("{} acc {}", f(p.storage), f(p.accum))
+    }
+}
+
+/// The small instance with the same precision assignment, error predicted
+/// by the interpreter (`None` if the passes produced a different node
+/// layout at the small size, so ids don't line up).
+fn predict(op: &PrecOp, full: &TensorGraph, assignment: &[(TensorId, Precision)]) -> Option<ErrorStats> {
+    let (sg, souts, sin) = &op.small;
+    let (mut sg, souts) = optimized(sg, souts);
+    if sg.nodes().len() != full.nodes().len() {
+        return None;
+    }
+    for &(t, p) in assignment {
+        sg.set_inline(t, full.nodes()[t.index()].inline);
+        sg.set_precision(t, p);
+    }
+    Some(sg.precision_error(sin, &souts))
+}
+
+fn precision_main(device: &GpuDevice, cache: &mut KernelCache, only: Option<String>) {
+    let want_op = |n: &str| only.as_deref().is_none_or(|o| n.starts_with(o));
+    println!("{} — precision schedules, kernel-only, {ITERS} launches\n", device.name);
+    let mut ops: Vec<PrecOp> = Vec::new();
+
+    if want_op("a") {
+        let (c, t, k, dil) = (512, 2000, 7, 3);
+        let x = rand(c * t, 1, 1.0);
+        let w = rand(c * c * k, 2, 0.05);
+        let want = conv_ref(&f64s(&x), &f64s(&w), c, t, k, dil);
+        let (g, outs) = conv_graph(c, t, k, dil, false);
+        let (sg, so) = conv_graph(32, 256, k, dil, false);
+        let si = small_inputs(&sg, 100, &[1.0, 0.05]);
+        ops.push(PrecOp {
+            name: "a conv1d 512→512 k7 d3 T2000",
+            g,
+            outs,
+            inputs: vec![x, w],
+            want,
+            names: vec!["x", "w"],
+            small: (sg, so, si),
+        });
+    }
+    if want_op("b") {
+        let (ci, co, t, s) = (512, 256, 2000, 10);
+        let xu = rand(ci * t, 3, 1.0);
+        let wu = rand(co * ci * 2 * s, 4, 0.05);
+        let want = upsample_ref(&f64s(&xu), &f64s(&wu), ci, co, t, s);
+        let (g, outs) = upsample_graph(ci, co, t, s);
+        let (sg, so) = upsample_graph(32, 16, 64, s);
+        let si = small_inputs(&sg, 110, &[1.0, 0.05]);
+        ops.push(PrecOp {
+            name: "b upsample 512→256 k20 s10",
+            g,
+            outs,
+            inputs: vec![xu, wu],
+            want,
+            names: vec!["x", "w"],
+            small: (sg, so, si),
+        });
+    }
+    if want_op("c") {
+        let frames = 4000;
+        let spec = rand(22 * frames, 5, 1.0);
+        let win: Vec<f32> = hann(20).iter().map(|&v| v as f32).collect();
+        let env: Vec<f32> = istft_env(frames).iter().map(|&v| v as f32).collect();
+        let want = istft_ref(&f64s(&spec), frames);
+        let (g, outs) = istft_graph(frames);
+        let sf = 200;
+        let (sg, so) = istft_graph(sf);
+        let si = vec![
+            f64s(&rand(22 * sf, 120, 1.0)),
+            hann(20),
+            istft_env(sf),
+        ];
+        ops.push(PrecOp {
+            name: "c iSTFT n_fft20 hop5 T4000",
+            g,
+            outs,
+            inputs: vec![spec, win, env],
+            want,
+            names: vec!["spec", "win", "env"],
+            small: (sg, so, si),
+        });
+    }
+    if want_op("e") {
+        let (c, t, sd) = (512, 2000, 128);
+        let xa = rand(c * t, 8, 1.0);
+        let st = rand(sd, 9, 1.0);
+        let wa = rand(2 * c * sd, 10, 0.1);
+        let ba = rand(2 * c, 11, 0.1);
+        let want = adain_ref(&f64s(&xa), &f64s(&st), &f64s(&wa), &f64s(&ba), c, t, sd);
+        let (g, outs) = adain_graph(c, t, sd);
+        // same T: the per-channel statistics are the long reductions
+        let (sg, so) = adain_graph(8, t, 16);
+        let si = small_inputs(&sg, 130, &[1.0, 1.0, 0.1, 0.1]);
+        ops.push(PrecOp {
+            name: "e AdaIN C512 T2000 style128",
+            g,
+            outs,
+            inputs: vec![xa, st, wa, ba],
+            want,
+            names: vec!["x", "style", "W", "b"],
+            small: (sg, so, si),
+        });
+    }
+    if want_op("f") {
+        let (cf, tf, ff) = (512, 200, 1536);
+        let inputs: Vec<Vec<f32>> = vec![
+            rand(cf * tf, 12, 1.0),
+            rand(cf * 7, 13, 0.3),
+            rand(cf, 14, 0.1),
+            rand(cf, 15, 0.2).iter().map(|v| v + 1.0).collect(),
+            rand(cf, 16, 0.1),
+            rand(ff * cf, 17, 0.04),
+            rand(ff, 18, 0.1),
+            rand(cf * ff, 19, 0.02),
+            rand(cf, 20, 0.1),
+        ];
+        let want = convnext_ref(&inputs.iter().map(|v| f64s(v)).collect::<Vec<_>>(), cf, tf, ff);
+        let cn = convnext_graph(cf, tf, ff);
+        let sm = convnext_graph(32, 24, 96);
+        let si = small_inputs(&sm.g, 140, &[1.0, 0.3, 0.1, 0.2, 0.1, 0.04, 0.1, 0.02, 0.1]);
+        ops.push(PrecOp {
+            name: "f ConvNeXt C512 T200 F1536",
+            g: cn.g,
+            outs: vec![cn.y],
+            inputs,
+            want,
+            names: vec!["x", "dw", "db", "ln_g", "ln_b", "w1", "b1", "w2", "b2"],
+            small: (sm.g, vec![sm.y], si),
+        });
+    }
+    if want_op("m") {
+        let n = 1024;
+        let a = rand(n * n, 40, 1.0);
+        let b = rand(n * n, 41, 1.0);
+        let want = matmul_ref(&f64s(&a), &f64s(&b), n, n, n);
+        let (g, outs) = matmul_graph(n, n, n);
+        let (sg, so) = matmul_graph(64, n, 64);
+        let si = small_inputs(&sg, 150, &[1.0, 1.0]);
+        ops.push(PrecOp {
+            name: "m matmul 1024³",
+            g,
+            outs,
+            inputs: vec![a, b],
+            want,
+            names: vec!["a", "b"],
+            small: (sg, so, si),
+        });
+    }
+
+    if std::env::var("PREC_DEBUG").is_ok() {
+        for op in &ops {
+            let (sg, souts, sin) = &op.small;
+            let (mut g, outs) = optimized(sg, souts);
+            g.schedule_auto(&outs);
+            for (i, n) in g.nodes().iter().enumerate() {
+                if let Op::Comp(c) = &n.op {
+                    if c.monoid.is_some() {
+                        let mut v = g.clone();
+                        v.set_precision(TensorId::from_index(i), Precision { storage: Format::F32, accum: Format::F16 });
+                        let e = v.precision_error(sin, &outs);
+                        println!("{} n{i} inline={} red={:?} out={:?} acc f16 → {:.1e}", op.name, n.inline, c.red, n.shape, e.max_rel);
+                    }
+                }
+            }
+        }
+        return;
+    }
+    let mut table = Vec::new();
+    let mut rejects = Vec::new();
+    for op in &ops {
+        let refs: Vec<&[f32]> = op.inputs.iter().map(|v| v.as_slice()).collect();
+        let (g, outs) = optimized(&op.g, &op.outs);
+        let mut auto = g.clone();
+        auto.schedule_auto(&outs);
+        let tuned = autotune_kernels(device, cache, auto, &outs, &refs, 10).0;
+        let want = vec![op.want.clone()];
+        for rel in [1e-2, 1e-3] {
+            let budget = ErrorBudget::rel(rel);
+            let r = tune_precision(device, cache, tuned.clone(), &outs, &refs, &want, budget, ITERS);
+            let assign = if r.assignment.is_empty() {
+                "all f32".to_string()
+            } else {
+                r.assignment
+                    .iter()
+                    .map(|&(t, p)| format!("{} {}", describe(&r.graph, t, &op.names, &outs), fmt_prec(p)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let pred = predict(op, &r.graph, &r.assignment)
+                .map_or("n/a".into(), |e| format!("{:.1e}", e.max_rel));
+            println!(
+                "{} @ rel {rel:.0e}: f32 {:.3} ms (err {:.1e}) → {:.3} ms (err {:.1e}, predicted {pred})  [{assign}]",
+                op.name, r.base_ms, r.base_error.max_rel, r.ms, r.error.max_rel
+            );
+            for t in &r.trials {
+                let verdict = match (t.kept, t.ms, budget.admits(&t.error)) {
+                    (true, _, _) => "kept".to_string(),
+                    (false, Some(ms), _) => format!("no gain ({ms:.3} ms)"),
+                    (false, None, true) => "within budget (accum: speed not modeled)".into(),
+                    (false, None, false) => "REJECTED: over budget".into(),
+                };
+                println!(
+                    "    {:<28} {:<12} err {:.1e}  {verdict}",
+                    describe(&r.graph, t.node, &op.names, &outs),
+                    fmt_prec(t.precision),
+                    t.error.max_rel
+                );
+                if rel == 1e-3 && t.precision.accum == Format::F16 && !budget.admits(&t.error) {
+                    rejects.push(format!(
+                        "| {} | {} {} | {:.1e} |",
+                        op.name,
+                        describe(&r.graph, t.node, &op.names, &outs),
+                        fmt_prec(t.precision),
+                        t.error.max_rel
+                    ));
+                }
+            }
+            table.push(format!(
+                "| {} | {rel:.0e} | {:.3} | {:.3} | {:.2}× | {assign} | {:.1e} | {pred} |",
+                op.name,
+                r.base_ms,
+                r.ms,
+                r.base_ms / r.ms,
+                r.error.max_rel
+            ));
+        }
+    }
+    println!("\n| op | budget (rel) | f32 ms | chosen ms | speedup | chosen assignment | measured err vs f64 | interp-predicted err (small) |");
+    println!("|---|---|---:|---:|---:|---|---:|---:|");
+    for row in table {
+        println!("{row}");
+    }
+    println!("\nf16 accumulators the 1e-3 budget rejects:\n\n| op | node | measured err |\n|---|---|---:|");
+    for row in rejects {
+        println!("{row}");
     }
 }
