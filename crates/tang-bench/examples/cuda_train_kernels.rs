@@ -34,7 +34,12 @@ fn main() {
     let (tg, outs) = tg.merge_reduce_dims(&outs);
     let (mut tg, outs) = tg.split_reduce_dims(&outs);
     tg.schedule_auto(&outs);
-    let native = tg.to_cuda_with(&outs, true);
+    // TANG_MMA_VARIANT=v: the matmul tiles in block shape MMA_SHAPES[v]
+    let variant = std::env::var("TANG_MMA_VARIANT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let native = tg.to_cuda_variant(&outs, Some(variant));
     let plain = tg.to_cuda_with(&outs, false);
     let n_inputs = native.buffers.iter().filter(|b| b.input.is_some()).count();
     let inputs: Vec<Vec<f32>> = (0..n_inputs)

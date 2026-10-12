@@ -1048,6 +1048,58 @@ reductions over 512 keys at tile (32, 8, 32) (0.19, 0.13, 0.13 ms, no
 native lowering) — the flash-backward work — and the 512×512 score
 recomputations.
 
+### The GEMM ladder: `mma.sync`, `cp.async`, block shapes as candidates (RTX 3090)
+
+`cuda_mma_kernel` is rewritten on raw PTX instead of `wmma`. It is still generic over any affine operand layout, multi-term and multi-output tiles, and split-K.
+- `mma.sync` m16n8k8 TF32 with documented fragment layouts. The epilogue (bias, activation, split-K partials and their reduction) runs straight from the accumulator registers, so the stored-C shared block is gone.
+- `cp.async` staging into a ring of `stages` buffers (16-byte copies where the shared row is contiguous and aligned in global memory, 4-byte zero-filling copies for any other layout, synchronous stores for map operands). One barrier per chunk, and the next k step's fragments load while this one's mma issue.
+- Fragments read as `float2`: the k slots and the columns inside a fragment pair are permuted (a reduction is order-free, and output columns are ours to place). Padding is chosen so these reads are conflict-free (A stride ≡ 8, B ≡ 4 mod 32).
+- TF32 rounding as one integer add (`x + 0x1000`; the mma ignores the low 13 bits). This is the same round-to-nearest-away as `cvt.rna`, which is emulated in about 4 instructions on sm_86. Errors are unchanged.
+- Staging loops have a fixed trip count where threads tile the block evenly, so the index math hoists out of the k loop.
+
+The block shape is a schedule parameter, `MmaShape { bm, bn, warps, chunk, stages, split_target }`. `MMA_SHAPES` lists six candidates: 64×64/4 warps with chunk 32 and 3 stages; the same without split-K; chunk 16 with 4 stages; chunk 32 with 2 stages and the old split-K target of 246; 128×64/4 warps; and 128×128/8 warps. `Program::tuned` now times every distinct variant of every native kernel against the transpiled WGSL, keeps the fastest per kernel, and caches the choice.
+
+Per matmul, nvcc harness (`scripts/cuda_bench.cu`, which now reports the minimum over 10 batches of 20 launches), quiet GPU:
+
+| shape | before (wmma) | default shape | best shape | cuBLAS fp32 | cuBLAS TF32 |
+|---|---|---|---|---|---|
+| 1024² | 0.144 ms | 0.103 | **0.088** (128×128/8w) | 0.105 | 0.079 |
+| 512×576×1536 | 0.085 | 0.051 | **0.046** (64², k16×4) | 0.052 | 0.046 |
+| 512×576×192 | 0.024 | 0.024 | **0.016** (64², no split) | 0.016 | 0.013 |
+| 512×1536×576 | 0.110 | **0.040** | 0.040 | 0.075 | 0.042 |
+
+The derived tiles now match or beat cuBLAS TF32 at the model's two large shapes. They are 1.1× behind it at 1024² and 1.25× behind at the small q/k/v projection.
+
+Flash forward: fold the grouped-query heads into the block. A lead dim that neither the keys, the values nor the mask depend on (the 3 query heads sharing a K/V head) becomes part of the block's rows, so K and V are staged once for all of them. The query slice per head is picked so the device still fills (16 rows × 3 heads at seq 512).
+
+| attention forward kernel | before | folded |
+|---|---|---|
+| seq 128 | 0.053 ms | **0.046** |
+| seq 512 | 0.287 | **0.177** |
+
+End to end, same lock window, 4 interleaved rounds. tang varied less than 2%. PyTorch is the best of the rounds; it was clean only in the first window, 22:19, and 2–4× slower under load at 22:54.
+
+| | tang main (#49) | tang now | PyTorch best fp32 / TF32 |
+|---|---|---|---|
+| block fwd, seq 128 | 0.263 ms | **0.210** | 0.300 / 0.307 |
+| block fwd+bwd, seq 128 | 0.682 | **0.572** | 1.232 / — |
+| block fwd, seq 512 | 0.726 | 0.48–0.49 | 0.593 / **0.454** |
+| block fwd+bwd, seq 512 | 1.939 | **1.574** | 1.721 / — |
+
+Correctness:
+- forward at seq 128: 7.8e-5 relative to the f64 evaluation, unchanged;
+- training-step gradients: 2.6–3.1e-4 relative, for every one of the six block shapes forced in turn (`TANG_MMA_VARIANT`), the same as before.
+
+Negatives, measured and not kept as defaults:
+- 128×128 blocks lose at every model shape: there are too few tiles for 82 SMs (8–24 blocks). They only win at 1024². With 4 warps of 64×64 they lose even there (0.13–0.17 ms), and so do 128×64 blocks at these sizes.
+- Split-K at the old target (246 blocks) is now a loss on most shapes. The faster mainloop makes the partial round trip dominate (512×1536×576: 0.040 without split, 0.058 with it). Its target is 100 by default and it remains a candidate; the tuner picks it for some seq-128 tiles.
+- Conflict-free `float2` fragment reads: no measurable change on their own, kept because they are not slower.
+- Register double-buffering of fragments across k steps: no change on its own. It is kept: it is the structure the larger warp tiles need.
+- Dropping TF32 rounding altogether (raw fp32 bits): no faster than the 1-add rounding, and 3× the error.
+- `asm volatile` on the mma: no difference.
+- Flash with 32-query slices × 3 heads (96 rows) needs more than 99 KB of shared memory and falls back. 16 × 3 is the shape that fits and fills.
+
+What is left at seq 512 forward (0.48 vs 0.45 ms TF32): attention is still 0.18 ms. Its O accumulator round-trips through shared memory every key chunk (wmma's accumulator layout is opaque). The next step is moving it to `mma.sync` with O in registers and K/V through `cp.async`.
 ## Kokoro-shaped ops (M4 Max, Metal, kernel-only)
 
 TTS vocoder ops (Kokoro's iSTFTNet decoder, Vocos-style ConvNeXt) derived

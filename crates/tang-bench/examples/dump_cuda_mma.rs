@@ -2,6 +2,7 @@
 //! (optionally with a bias + silu epilogue), for `scripts/cuda_bench.cu`:
 //! `dump_cuda_mma M K N [epilogue]`.
 use tang::Scalar;
+use tang_compile::tensor::cuda::{MmaShape, MMA_SHAPES};
 use tang_compile::tensor::TensorGraph;
 use tang_expr::ExprId;
 
@@ -29,7 +30,31 @@ fn main() {
     };
     let (mut g, outs) = g.substitute_maps(&[y]);
     g.schedule_auto(&outs);
-    let (src, reads) = g.cuda_mma_program(&outs).expect("matmul-shaped tile");
+    // TANG_MMA_SHAPE: an index into MMA_SHAPES, or bm,bn,warps_m,warps_n[,chunk[,stages[,split_target]]]
+    let shape = match std::env::var("TANG_MMA_SHAPE") {
+        Ok(v) => {
+            let f: Vec<usize> = v.split(',').filter_map(|x| x.parse().ok()).collect();
+            if f.len() == 1 {
+                MMA_SHAPES[f[0]]
+            } else {
+                let mut sh = MmaShape::new(f[0], f[1], f[2], f[3]);
+                if let Some(&c) = f.get(4) {
+                    sh.chunk = c;
+                }
+                if let Some(&st) = f.get(5) {
+                    sh.stages = st;
+                }
+                if let Some(&t) = f.get(6) {
+                    sh.split_target = t;
+                }
+                sh
+            }
+        }
+        Err(_) => MMA_SHAPES[0],
+    };
+    let (src, reads) = g
+        .cuda_mma_program_shaped(&outs, shape)
+        .expect("matmul-shaped tile");
     println!("#define TANG_M {m}\n#define TANG_K {k}\n#define TANG_N {n}");
     println!("#define TANG_EPILOGUE {}", epilogue as u32);
     // the kernel takes its read buffers in binding order; name them by
@@ -42,7 +67,7 @@ fn main() {
         })
         .collect();
     println!(
-        "#define TANG_LAUNCH(a, b, bias, out) main0<<<TANG_TILES, TANG_THREADS>>>({}, out, 0u)",
+        "#define TANG_LAUNCH(a, b, bias, out) main0<<<TANG_TILES, TANG_THREADS, TANG_SMEM>>>({}, out, 0u)",
         names.join(", ")
     );
     print!("{src}");

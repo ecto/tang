@@ -1,7 +1,7 @@
 //! One runner for tensor-IR programs on every backend.
 //!
 //! A [`TensorGraph`] lowers to a [`WgslProgram`] (kernels + buffer specs)
-//! for wgpu (`to_wgsl`, or MSL passthrough) or for CUDA (`to_cuda`: wmma
+//! for wgpu (`to_wgsl`, or MSL passthrough) or for CUDA (`to_cuda`: mma
 //! tensor-core tiles plus transpiled WGSL). [`Runtime`] picks the backend
 //! once — CUDA when the `cuda` feature is on and an NVIDIA device with
 //! nvrtc is present, wgpu otherwise — and [`Program`] owns the buffers of
@@ -584,46 +584,91 @@ impl Program {
         inputs: &[&[f32]],
         cache: Option<&std::path::Path>,
     ) -> (Self, TuneReport) {
-        let native_p = g.to_cuda_with(outputs, true);
-        let plain_p = g.to_cuda_with(outputs, false);
-        assert_eq!(native_p.kernels.len(), plain_p.kernels.len());
-        let differs: Vec<usize> = (0..native_p.kernels.len())
-            .filter(|&i| native_p.kernels[i].source != plain_p.kernels[i].source)
+        use tang_compile::tensor::cuda::MMA_SHAPES;
+        // variant 0: every kernel transpiled; 1 + v: the tensor-core
+        // tiles in block shape MMA_SHAPES[v]
+        let mut variants: Vec<WgslProgram> = std::iter::once(None)
+            .chain((0..MMA_SHAPES.len()).map(Some))
+            .map(|v| g.to_cuda_variant(outputs, v))
             .collect();
+        let n_k = variants[0].kernels.len();
+        assert!(variants.iter().all(|p| p.kernels.len() == n_k));
+        // per kernel, the variants worth timing: distinct sources only
+        let candidates: Vec<Vec<usize>> = (0..n_k)
+            .map(|i| {
+                let mut c: Vec<usize> = Vec::new();
+                for (v, p) in variants.iter().enumerate() {
+                    let src = &p.kernels[i].source;
+                    if !c.iter().any(|&u| variants[u].kernels[i].source == *src) {
+                        c.push(v);
+                    }
+                }
+                c
+            })
+            .collect();
+        let differs: Vec<usize> = (0..n_k).filter(|&i| candidates[i].len() > 1).collect();
         let key = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
             rt.name().hash(&mut h);
-            for k in native_p.kernels.iter().chain(&plain_p.kernels) {
-                k.source.hash(&mut h);
+            for p in &variants {
+                for k in &p.kernels {
+                    k.source.hash(&mut h);
+                }
             }
             h.finish()
         };
         let header = format!("tang-cuda-tuning {key:016x}");
-        let cached: Option<Vec<usize>> = cache.and_then(|p| {
+        // cache lines: `kernel variant` for every tuned kernel not on variant 1
+        let cached: Option<Vec<(usize, usize)>> = cache.and_then(|p| {
             let text = std::fs::read_to_string(p).ok()?;
             let mut lines = text.lines();
-            (lines.next()? == header).then(|| lines.filter_map(|l| l.trim().parse().ok()).collect())
+            (lines.next()? == header).then(|| {
+                lines
+                    .filter_map(|l| {
+                        let (i, v) = l.trim().split_once(' ')?;
+                        Some((i.parse().ok()?, v.parse().ok()?))
+                    })
+                    .collect()
+            })
         });
         let from_cache = cached.is_some();
-        let (mut native_p, mut plain_p) = (native_p, plain_p);
-        let plain_kernels: Vec<usize> = match cached {
-            Some(v) => v,
+        let mut choice: Vec<usize> = (0..n_k)
+            .map(|i| usize::from(candidates[i].len() > 1))
+            .collect();
+        match cached {
+            Some(v) => {
+                for (i, c) in v {
+                    if i < n_k && c < variants.len() {
+                        choice[i] = c;
+                    }
+                }
+            }
             None => {
-                let native = Self::new(rt, native_p, inputs);
-                let plain = Self::new(rt, plain_p, inputs);
-                // every kernel's inputs exist once a whole run has gone through
-                native.run(rt);
-                plain.run(rt);
-                let v: Vec<usize> = differs
-                    .iter()
-                    .copied()
-                    .filter(|&i| plain.time_kernel(rt, i, 10) < native.time_kernel(rt, i, 10))
+                let progs: Vec<Self> = variants
+                    .drain(..)
+                    .map(|p| Self::new(rt, p, inputs))
                     .collect();
+                // every kernel's inputs exist once a whole run has gone through
+                for p in &progs {
+                    p.run(rt);
+                }
+                for &i in &differs {
+                    let mut best = (f64::INFINITY, 0);
+                    for &v in &candidates[i] {
+                        let t = progs[v].time_kernel(rt, i, 10);
+                        if t < best.0 {
+                            best = (t, v);
+                        }
+                    }
+                    choice[i] = best.1;
+                }
                 if let Some(p) = cache {
                     let mut text = header.clone();
-                    for i in &v {
-                        text.push_str(&format!("\n{i}"));
+                    for &i in &differs {
+                        if choice[i] != 1 {
+                            text.push_str(&format!("\n{i} {}", choice[i]));
+                        }
                     }
                     text.push('\n');
                     if let Some(dir) = p.parent() {
@@ -633,17 +678,22 @@ impl Program {
                         eprintln!("tuning cache: could not write {}: {e}", p.display());
                     }
                 }
-                native_p = native.program;
-                plain_p = plain.program;
-                v
+                variants = progs.into_iter().map(|p| p.program).collect();
             }
-        };
-        let mut program = native_p;
-        for &i in &plain_kernels {
-            std::mem::swap(&mut program.kernels[i], &mut plain_p.kernels[i]);
+        }
+        let mut program = variants.remove(0);
+        for (i, &c) in choice.iter().enumerate() {
+            if c != 0 {
+                std::mem::swap(&mut program.kernels[i], &mut variants[c - 1].kernels[i]);
+            }
+        }
+        if std::env::var_os("TANG_TUNE_VERBOSE").is_some() {
+            for &i in &differs {
+                eprintln!("tune: kernel {i} -> variant {}", choice[i]);
+            }
         }
         let report = TuneReport {
-            native_kept: differs.len() - plain_kernels.len(),
+            native_kept: differs.iter().filter(|&&i| choice[i] != 0).count(),
             native_total: differs.len(),
             from_cache,
         };

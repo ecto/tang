@@ -2635,7 +2635,7 @@ pub mod ir_block {
             let recomputed = p
                 .kernels
                 .iter()
-                .filter(|k| k.source.contains("wmma (TF32) tile") && k.source.contains("exp2("))
+                .filter(|k| k.source.contains("mma (TF32) tile") && k.source.contains("exp2("))
                 .count();
             assert_eq!(recomputed, 3, "dK (both rope halves) and two dQ halves");
         }
