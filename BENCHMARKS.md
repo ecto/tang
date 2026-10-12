@@ -910,6 +910,52 @@ parallelism) from the algebra, with no op-specific code, and picks per
 chip. It does not yet generate the instruction-level quality of a vendor
 library, and through this backend it cannot reach tensor cores at all.
 
+### Split-K for tiles that cannot fill the device
+
+The training step's matmuls with small outputs and long reductions
+(dx through the 1536-wide MLP, the grouped-head dK/dV over 1536 or 512)
+had 24–72 64×64 blocks for 82 SMs. `cuda_mma_kernel` now splits the
+reduction until there are about 246 blocks (each split keeps ≥ 4 chunks):
+each split stores its partial block to a module-scope buffer, the last
+to arrive (an atomic counter per tile, reset after use) sums the splits
+in fixed order and runs the epilogue. Multi-output tiles whose stored C
+would outgrow the operand stages use the same global path, so their
+shared memory is the stages only — the merged gate/up tile now beats the
+WGSL one instead of losing on occupancy. With that, the tuner keeps all
+19 native kernels in the training step (was 13 at seq 128, 12 at 512).
+
+Per-kernel timing is now the minimum over single event-bracketed
+launches: the 3090 was at 98% from other tenants (time-sliced), and
+batched wall-clock put a ~0.23 ms slice floor under every kernel.
+Kernel times below are contention-free; end-to-end ones are not.
+
+| kernel (seq 512) | before (best of native/WGSL) | split-K |
+|---|---|---|
+| dx, `[512,3,64]` Σ over 1536 | 0.146 ms | 0.044 |
+| dx MLP down, `[512,576]` Σ 1536 | 0.172 | 0.106 |
+| gate/up backward, `[512,576,2]` Σ 1536 | 0.312 | 0.203 |
+| gate/up forward, `[512,1536,2]` Σ 576 | 0.209 | 0.150 |
+| q/k/v/o projections, `[512,192|576]` Σ 576 | 0.050–0.054 | 0.025–0.040 |
+| sum of all 62 kernels | 2.89 | 2.36 |
+| sum of all 62 kernels, seq 128 | 1.34 | 0.83 |
+
+End to end, same lock window (contended; torch slowed too):
+
+| | tang before | tang split-K | PyTorch fp32 | PyTorch TF32 |
+|---|---|---|---|---|
+| block fwd, seq 128 | 1.61 ms | 0.55 | 0.56 | 0.52 |
+| block fwd, seq 512 | 1.60 | 1.22 | 1.27 | 0.92 |
+| block fwd+bwd, seq 128 | 2.87 | 1.59 | 2.38 | — |
+| block fwd+bwd, seq 512 | 5.78 | 4.79 | 3.60 | — |
+
+Every gradient matches the f64 evaluation as before (relative error
+1.5–3e-4 on gradients of magnitude 1e6, identical with split-K off).
+Remaining at seq 512: the materialized online-softmax forward (0.25 ms,
+score from a buffer, no native lowering yet), the attention-backward
+reductions over 512 keys at tile (32, 8, 32) (0.19, 0.13, 0.13 ms, no
+native lowering) — the flash-backward work — and the 512×512 score
+recomputations.
+
 ## Kokoro-shaped ops (M4 Max, Metal, kernel-only)
 
 TTS vocoder ops (Kokoro's iSTFTNet decoder, Vocos-style ConvNeXt) derived

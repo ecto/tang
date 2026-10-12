@@ -515,8 +515,34 @@ impl Program {
         time_with(rt, iters, || self.run(rt))
     }
 
-    /// Milliseconds per launch of kernel `i` alone.
+    /// Milliseconds per launch of kernel `i` alone. On CUDA: the minimum
+    /// over `5 * iters` single launches, each bracketed by events — on a
+    /// time-sliced GPU a batch of launches almost always straddles another
+    /// tenant's slice, a single short launch usually does not.
     pub fn time_kernel(&self, rt: &Runtime, i: usize, iters: usize) -> f64 {
+        #[cfg(feature = "cuda")]
+        if let Runtime::Cuda(dev) = rt {
+            use cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT;
+            for _ in 0..3 {
+                self.run_kernel(rt, i);
+            }
+            rt.sync();
+            return (0..5 * iters)
+                .map(|_| {
+                    let a = dev
+                        .stream
+                        .record_event(Some(CU_EVENT_DEFAULT))
+                        .expect("event");
+                    self.run_kernel(rt, i);
+                    let b = dev
+                        .stream
+                        .record_event(Some(CU_EVENT_DEFAULT))
+                        .expect("event");
+                    b.synchronize().expect("sync");
+                    a.elapsed_ms(&b).expect("elapsed") as f64
+                })
+                .fold(f64::INFINITY, f64::min);
+        }
         time_with(rt, iters, || {
             self.run_kernel(rt, i);
             #[allow(irrefutable_let_patterns)]
