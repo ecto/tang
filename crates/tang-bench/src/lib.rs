@@ -610,6 +610,43 @@ pub mod ir_gpu {
         }
     }
 
+    /// One Adam step as three maps over `[n]`: returns `(m', v', p')`.
+    /// Inputs: `p, g, m, v`. `bc1 = 1 - β1ᵗ`, `bc2 = 1 - β2ᵗ`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn adam_step(
+        n: usize,
+        lr: f64,
+        beta1: f64,
+        beta2: f64,
+        eps: f64,
+        bc1: f64,
+        bc2: f64,
+    ) -> (TensorGraph, [TensorId; 3]) {
+        let mut g = TensorGraph::new();
+        let p = g.input(&[n]);
+        let grad = g.input(&[n]);
+        let m = g.input(&[n]);
+        let v = g.input(&[n]);
+        let m2 = g
+            .map(&[m, grad], |x| {
+                x[0] * ExprId::from_f64(beta1) + x[1] * ExprId::from_f64(1.0 - beta1)
+            })
+            .unwrap();
+        let v2 = g
+            .map(&[v, grad], |x| {
+                x[0] * ExprId::from_f64(beta2) + x[1] * x[1] * ExprId::from_f64(1.0 - beta2)
+            })
+            .unwrap();
+        let p2 = g
+            .map(&[p, m2, v2], |x| {
+                let m_hat = x[1] / ExprId::from_f64(bc1);
+                let v_hat = x[2] / ExprId::from_f64(bc2);
+                x[0] - ExprId::from_f64(lr) * m_hat / (v_hat.sqrt() + ExprId::from_f64(eps))
+            })
+            .unwrap();
+        (g, [m2, v2, p2])
+    }
+
     /// All attention schedules the compiler currently knows how to produce.
     pub fn attention_candidates(
         n: usize,
@@ -750,6 +787,60 @@ pub mod ir_gpu {
             let got = exe.read(&device, y);
             for (i, (a, b)) in got.iter().zip(&want).enumerate() {
                 assert!((a - b).abs() < 1e-4, "swiglu[{i}]: {a} vs {b}");
+            }
+        }
+
+        #[test]
+        fn derived_adam_matches_hand_kernel_on_gpu() {
+            let Ok(device) = GpuDevice::new_sync() else {
+                eprintln!("no GPU, skipping");
+                return;
+            };
+            let mut cache = KernelCache::new();
+            let n = 1000;
+            let mut rng = crate::Rng::new(8);
+            let mut rand = |s: f32| {
+                (0..n)
+                    .map(|_| (rng.f32() * 2.0 - 1.0) * s)
+                    .collect::<Vec<f32>>()
+            };
+            let (p, g, m, v) = (
+                rand(1.0),
+                rand(0.1),
+                rand(0.01),
+                rand(0.001).iter().map(|x| x.abs()).collect::<Vec<f32>>(),
+            );
+            let (lr, b1, b2, eps, bc1, bc2) =
+                (1e-3f32, 0.9f32, 0.999f32, 1e-8f32, 0.19f32, 0.002f32);
+
+            let pb = GpuBuffer::from_slice(&device, &p);
+            let gb = GpuBuffer::from_slice(&device, &g);
+            let mb = GpuBuffer::from_slice(&device, &m);
+            let vb = GpuBuffer::from_slice(&device, &v);
+            cache.dispatch_adam(
+                &device, &pb, &gb, &mb, &vb, n as u32, lr, b1, b2, eps, bc1, bc2,
+            );
+            cache.flush(&device);
+            let want = [
+                mb.to_vec_sync(&device),
+                vb.to_vec_sync(&device),
+                pb.to_vec_sync(&device),
+            ];
+
+            let (graph, outs) = adam_step(
+                n, lr as f64, b1 as f64, b2 as f64, eps as f64, bc1 as f64, bc2 as f64,
+            );
+            let exe = Executable::new(&device, graph.to_wgsl(&outs), &[&p, &g, &m, &v]);
+            exe.run(&device, &mut cache);
+            cache.flush(&device);
+            for (k, o) in outs.iter().enumerate() {
+                let got = exe.read(&device, *o);
+                for (i, (a, b)) in got.iter().zip(&want[k]).enumerate() {
+                    assert!(
+                        (a - b).abs() < 1e-5 * (1.0 + b.abs()),
+                        "adam out {k}[{i}]: {a} vs {b}"
+                    );
+                }
             }
         }
 

@@ -494,8 +494,59 @@ mod gpu_train {
     }
 }
 
+mod gpu_adam {
+    use super::*;
+    use tang_bench::ir_gpu::{adam_step, Executable};
+    use tang_gpu::{GpuBuffer, GpuDevice, KernelCache};
+
+    pub fn bench_adam(c: &mut Criterion) {
+        let Ok(device) = GpuDevice::new_sync() else {
+            eprintln!("no GPU, skipping kvi_gpu_adam");
+            return;
+        };
+        let mut cache = KernelCache::new();
+        let mut group = c.benchmark_group("kvi_gpu_adam");
+        group.sample_size(20);
+        for &n in &[65_536usize, 4_194_304] {
+            let mut rng = tang_bench::Rng::new(3);
+            let mut rand = |s: f32| {
+                (0..n)
+                    .map(|_| (rng.f32() * 2.0 - 1.0) * s)
+                    .collect::<Vec<f32>>()
+            };
+            let (p, g, m, v) = (rand(1.0), rand(0.1), rand(0.01), rand(0.001));
+            let (pb, gb, mb, vb) = (
+                GpuBuffer::from_slice(&device, &p),
+                GpuBuffer::from_slice(&device, &g),
+                GpuBuffer::from_slice(&device, &m),
+                GpuBuffer::from_slice(&device, &v),
+            );
+            group.bench_function(BenchmarkId::new("hand", n), |b| {
+                b.iter(|| {
+                    cache.dispatch_adam(
+                        &device, &pb, &gb, &mb, &vb, n as u32, 1e-3, 0.9, 0.999, 1e-8, 0.19, 0.002,
+                    );
+                    cache.flush(&device);
+                    black_box(pb.to_vec_sync(&device));
+                })
+            });
+            let (graph, outs) = adam_step(n, 1e-3, 0.9, 0.999, 1e-8, 0.19, 0.002);
+            let exe = Executable::new(&device, graph.to_wgsl(&outs), &[&p, &g, &m, &v]);
+            group.bench_function(BenchmarkId::new("ir", n), |b| {
+                b.iter(|| {
+                    exe.run(&device, &mut cache);
+                    cache.flush(&device);
+                    black_box(exe.read(&device, outs[2]));
+                })
+            });
+        }
+        group.finish();
+    }
+}
+
 criterion_group!(
     gpu_benches,
+    gpu_adam::bench_adam,
     gpu_train::bench_train_step,
     gpu_block::bench_block,
     gpu::bench_attention,

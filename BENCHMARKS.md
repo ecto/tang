@@ -364,6 +364,11 @@ after `substitute_maps`: one Sum reduction and one map.
 | 65 536 | 1.57 ms | 1.55 ms |
 | 4 194 304 | 2.09 ms | 2.25 ms |
 
+| adam step | hand (`dispatch_adam`, 1 in-place kernel) | ir (3 maps) |
+|---|---|---|
+| 65 536 | 1.59 ms | 1.63 ms |
+| 4 194 304 | 2.34 ms | 2.38 ms |
+
 Note the winner flips: attention wanted the naive schedule, rmsnorm wants
 the split one (its reduce axis is 2048 wide and there are only 2048 rows,
 so one thread per row starves the GPU). Same compiler, same cost of
