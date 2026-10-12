@@ -38,6 +38,8 @@ use std::collections::HashMap;
 use tang::Scalar;
 use tang_expr::{trace, ExprGraph, ExprId, Node};
 
+#[path = "tensor_tile.rs"]
+mod tile;
 #[path = "tensor_wgsl.rs"]
 pub mod wgsl;
 
@@ -348,6 +350,10 @@ pub struct TNode {
     /// Schedule: split the reduction across a workgroup of this many
     /// threads, tree-combined with the monoid (0 = one thread per point).
     pub split: u32,
+    /// Schedule: `(points per workgroup, reduce chunk)`. Each thread owns
+    /// one point; reads that are the same for every thread in the
+    /// workgroup are staged chunk by chunk in workgroup memory.
+    pub tile: (u32, u32),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -396,6 +402,7 @@ impl TensorGraph {
             shape: dims.to_vec(),
             inline: false,
             split: 0,
+            tile: (0, 0),
         });
         TensorId(self.nodes.len() as u32 - 1)
     }
@@ -464,6 +471,7 @@ impl TensorGraph {
             shape: comp.out.clone(),
             inline: false,
             split: 0,
+            tile: (0, 0),
             op: Op::Comp(comp),
         });
         Ok(TensorId(self.nodes.len() as u32 - 1))
@@ -700,6 +708,7 @@ impl TensorGraph {
                 shape: node.shape.clone(),
                 inline: node.inline,
                 split: node.split,
+                tile: node.tile,
             });
             remap[i] = Some(ng.nodes.len() - 1);
         }
@@ -1051,6 +1060,25 @@ impl TensorGraph {
             .collect();
         for i in targets {
             self.nodes[i].split = threads;
+        }
+    }
+
+    /// Schedule: materialized single-axis reductions with at least
+    /// `min_red` elements per point get `points` threads per workgroup
+    /// (one point each) and stage workgroup-invariant reads in chunks of
+    /// `chunk` reduce indices. This is the structure of flash attention
+    /// and of a shared-memory matmul, derived from the views alone.
+    pub fn schedule_tile(&mut self, outputs: &[TensorId], points: u32, chunk: u32, min_red: usize) {
+        let live = self.live(outputs);
+        let targets: Vec<usize> = (0..self.nodes.len())
+            .filter(|&i| live[i] && !self.nodes[i].inline && self.nodes[i].split == 0)
+            .filter(|&i| {
+                self.comp_at(i)
+                    .is_some_and(|c| c.monoid.is_some() && c.red.len() == 1 && c.red[0] >= min_red)
+            })
+            .collect();
+        for i in targets {
+            self.nodes[i].tile = (points, chunk);
         }
     }
 

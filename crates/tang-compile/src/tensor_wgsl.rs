@@ -142,6 +142,9 @@ impl TensorGraph {
         let k = c.points().len();
         let points = numel(c.points()) as u32;
         let split = self.nodes[root].split;
+        if self.nodes[root].tile.0 > 0 {
+            return self.tile_kernel(root, s, reads);
+        }
         let reads = reads.into_iter().map(|j| TensorId(j as u32)).collect();
 
         if split == 0 {
@@ -314,7 +317,7 @@ impl TensorGraph {
     }
 }
 
-fn identity(m: &Monoid) -> String {
+pub(super) fn identity(m: &Monoid) -> String {
     m.identity
         .iter()
         .map(|v| lit(*v))
@@ -368,7 +371,7 @@ fn flat(prefix: &str, start: usize, shape: &[usize]) -> String {
 }
 
 /// `g` → `p0..pk` over `shape`, row-major.
-fn emit_decompose(s: &mut String, g: &str, shape: &[usize], prefix: &str) {
+pub(super) fn emit_decompose(s: &mut String, g: &str, shape: &[usize], prefix: &str) {
     let mut rem = g.to_string();
     for d in (0..shape.len()).rev() {
         let n = shape[d];
@@ -377,7 +380,7 @@ fn emit_decompose(s: &mut String, g: &str, shape: &[usize], prefix: &str) {
     }
 }
 
-fn lit(v: f64) -> String {
+pub(super) fn lit(v: f64) -> String {
     if v == f64::NEG_INFINITY {
         return "-3.4028235e38".into();
     }

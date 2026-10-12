@@ -369,6 +369,15 @@ pub mod ir_gpu {
         (g, y)
     }
 
+    /// [`flash_attention`] with 64 query rows per workgroup and k/v
+    /// staged in workgroup memory 32 keys at a time — flash attention's
+    /// tiling, derived from the views.
+    pub fn flash_attention_tiled(n: usize, d: usize, dv: usize) -> (TensorGraph, TensorId) {
+        let (mut g, y) = flash_attention(n, d, dv);
+        g.schedule_tile(&[y], 64, 32, 64);
+        (g, y)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -422,6 +431,7 @@ pub mod ir_gpu {
                 ("naive", naive_attention(n, d, d)),
                 ("flash", flash_attention(n, d, d)),
                 ("flash_split", flash_attention_split(n, d, d)),
+                ("flash_tiled", flash_attention_tiled(n, d, d)),
             ] {
                 let program = g.to_wgsl(&[y]);
                 let exe = Executable::new(&device, program, &[&q, &k, &v, &mask]);
