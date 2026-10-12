@@ -2510,7 +2510,7 @@ pub(super) fn replay(
 }
 
 /// Input vars reachable from `out`.
-fn vars_reachable(g: &ExprGraph, out: ExprId) -> Vec<u16> {
+pub(super) fn vars_reachable(g: &ExprGraph, out: ExprId) -> Vec<u16> {
     let live = g.live_set(&[out]);
     let nodes = g.nodes_slice();
     live.iter()
