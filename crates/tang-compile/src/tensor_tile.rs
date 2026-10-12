@@ -266,7 +266,7 @@ impl Ctx<'_> {
             points *= self.bx;
         }
         format!(
-            "stage_{idx}[(({local}) * {}u + {}u) * {points}u + ({point})]",
+            "stage_{idx}[buf_{idx} + (({local}) * {}u + {}u) * {points}u + ({point})]",
             r.span(),
             addr.offset - r.lo
         )
@@ -686,19 +686,27 @@ impl TensorGraph {
             (axis, points, 1)
         };
         let vec_w: Vec<usize> = ctx.regions.iter().map(|r| axis_of(r).2).collect();
+        // Double buffering: while a chunk is reduced from one stage set,
+        // the next chunk's loads are in flight into registers and land
+        // in the other set after the reduce loop — one barrier per
+        // chunk and the global-load latency hidden behind the FMAs.
+        // Only for kernels whose staged data all comes straight from
+        // buffers (no cooperatively computed sub-comps).
+        let dbl = ctx.comp_regions.is_empty() && !ctx.regions.is_empty();
+        let sets = if dbl { 2 } else { 1 };
         for (i, r) in ctx.regions.iter().enumerate() {
             if vec_w[i] == 4 {
                 writeln!(
                     s,
                     "var<workgroup> stage_{i}: array<vec4<f32>, {}>;",
-                    region_total(r) / 4
+                    sets * region_total(r) / 4
                 )
                 .unwrap();
             } else {
                 writeln!(
                     s,
                     "var<workgroup> stage_{i}: array<f32, {}>;",
-                    region_total(r)
+                    sets * region_total(r)
                 )
                 .unwrap();
             }
@@ -845,20 +853,15 @@ impl TensorGraph {
             s.push_str(&hoist_fill.replace("hoist_", &format!("hoist{t}_")));
             writeln!(s, "    }}").unwrap();
         }
-        writeln!(
-            s,
-            "    for (var chunk: u32 = 0u; chunk < {r_total}u; chunk = chunk + {chunk}u) {{"
-        )
-        .unwrap();
-        for (i, r) in ctx.regions.iter().enumerate() {
+        // One region's load, as text with `CHUNK` for the chunk base: the
+        // decomposition of `idx` into stage coords (`sidx`) and the global
+        // reads `e0..e{v-1}`, so a caller can direct the value to the stage
+        // or to a prefetch register.
+        let region_load = |i: usize, r: &Region| -> (usize, String, String) {
             let v = vec_w[i];
             let total = region_total(r) / v;
             let span = r.span();
-            writeln!(
-                s,
-                "        for (var idx: u32 = tid; idx < {total}u; idx = idx + {threads}u) {{"
-            )
-            .unwrap();
+            let mut d = String::new();
             // The stage is point-minor (lanes innermost, then offset,
             // inner vars, t) so the reduce loop's reads are conflict-free.
             // The load loop walks the *buffer* in address order instead —
@@ -882,18 +885,17 @@ impl TensorGraph {
             dims.push(("t".into(), chunk, r.key.red));
             let mut load_order: Vec<usize> = (0..dims.len()).collect();
             load_order.sort_by_key(|&d| dims[d].2.unsigned_abs());
-            writeln!(s, "            var rem = idx;").unwrap();
-            for &d in &load_order {
-                let (name, ext, _) = &dims[d];
-                writeln!(s, "            let {name} = rem % {ext}u;").unwrap();
-                writeln!(s, "            rem = rem / {ext}u;").unwrap();
+            writeln!(d, "var rem = idx;").unwrap();
+            for &k in &load_order {
+                let (name, ext, _) = &dims[k];
+                writeln!(d, "let {name} = rem % {ext}u;").unwrap();
+                writeln!(d, "rem = rem / {ext}u;").unwrap();
             }
             let mut sidx = String::from("0u");
             for (name, ext, _) in dims.iter().rev() {
                 sidx = format!("({sidx}) * {ext}u + {name}");
             }
-            // address and liveness of component `c` (the point coordinate
-            // is lx·v + c along the vectorized axis)
+            writeln!(d, "let sidx = {sidx};").unwrap();
             let component = |c: usize| -> (String, String) {
                 let mut addr = format!("{}", r.lo);
                 let mut live = String::from("true");
@@ -908,60 +910,108 @@ impl TensorGraph {
                 for (name, coef) in &r.key.inner {
                     addr.push_str(&format!(" + {coef} * i32({name})"));
                 }
-                addr.push_str(&format!(" + {} * i32(chunk + t) + i32(o)", r.key.red));
-                live.push_str(&format!(" && chunk + t < {r_total}u"));
+                addr.push_str(&format!(" + {} * i32(CHUNK + t) + i32(o)", r.key.red));
+                live.push_str(&format!(" && CHUNK + t < {r_total}u"));
                 for (name, coef) in &r.key.uniform {
                     addr.push_str(&format!(" + {coef} * i32({name})"));
                 }
                 (addr, live)
             };
+            let mut g = String::new();
             for c in 0..v {
                 if r.key.px != 0 {
-                    writeln!(
-                        s,
-                        "            let gx{c} = tile_x * {px_n}u + lx * {v}u + {c}u;"
-                    )
-                    .unwrap();
+                    writeln!(g, "let gx{c} = tile_x * {px_n}u + lx * {v}u + {c}u;").unwrap();
                 }
                 if r.key.py != 0 {
-                    writeln!(
-                        s,
-                        "            let gy{c} = tile_y * {py_n}u + ly * {v}u + {c}u;"
-                    )
-                    .unwrap();
+                    writeln!(g, "let gy{c} = tile_y * {py_n}u + ly * {v}u + {c}u;").unwrap();
                 }
             }
-            if v == 1 {
-                let (addr, live) = component(0);
-                writeln!(s, "            if ({live}) {{").unwrap();
+            for c in 0..v {
+                let (addr, live) = component(c);
+                writeln!(g, "var e{c} = 0.0;").unwrap();
                 writeln!(
-                    s,
-                    "                stage_{i}[{sidx}] = b{}[u32({addr})];",
+                    g,
+                    "if ({live}) {{ e{c} = b{}[u32({addr})]; }}",
                     r.key.buffer
                 )
                 .unwrap();
-                writeln!(s, "            }}").unwrap();
+            }
+            let value = if v == 1 {
+                "e0".to_string()
             } else {
-                let mut elems = Vec::with_capacity(v);
-                for c in 0..v {
-                    let (addr, live) = component(c);
-                    writeln!(s, "            var e{c} = 0.0;").unwrap();
-                    writeln!(
-                        s,
-                        "            if ({live}) {{ e{c} = b{}[u32({addr})]; }}",
-                        r.key.buffer
-                    )
-                    .unwrap();
-                    elems.push(format!("e{c}"));
-                }
+                format!(
+                    "vec{v}<f32>({})",
+                    (0..v)
+                        .map(|c| format!("e{c}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            writeln!(g, "let val = {value};").unwrap();
+            (total, d, g)
+        };
+        let indent = |text: &str, pad: &str| -> String {
+            text.lines().map(|l| format!("{pad}{l}\n")).collect()
+        };
+        // loads straight into stage set `set` for chunk base `chunk_expr`
+        let direct_loads = |s: &mut String, chunk_expr: &str, set_off: &dyn Fn(usize) -> String| {
+            for (i, r) in ctx.regions.iter().enumerate() {
+                let (total, d, g) = region_load(i, r);
                 writeln!(
                     s,
-                    "            stage_{i}[{sidx}] = vec{v}<f32>({});",
-                    elems.join(", ")
+                    "        for (var idx: u32 = tid; idx < {total}u; idx = idx + {threads}u) {{"
                 )
                 .unwrap();
+                s.push_str(&indent(&d, "            "));
+                s.push_str(&indent(&g.replace("CHUNK", chunk_expr), "            "));
+                writeln!(s, "            stage_{i}[{} + sidx] = val;", set_off(i)).unwrap();
+                writeln!(s, "        }}").unwrap();
             }
-            writeln!(s, "        }}").unwrap();
+        };
+        let set_total = |i: usize| region_total(&ctx.regions[i]) / vec_w[i];
+        if dbl {
+            direct_loads(&mut s, "0u", &|_| "0u".to_string());
+            writeln!(s, "    workgroupBarrier();").unwrap();
+        }
+        writeln!(
+            s,
+            "    for (var chunk: u32 = 0u; chunk < {r_total}u; chunk = chunk + {chunk}u) {{"
+        )
+        .unwrap();
+        if dbl {
+            writeln!(s, "        let cur = (chunk / {chunk}u) % 2u;").unwrap();
+            writeln!(s, "        let has_next = chunk + {chunk}u < {r_total}u;").unwrap();
+            for (i, r) in ctx.regions.iter().enumerate() {
+                let (total, d, g) = region_load(i, r);
+                let iters = total.div_ceil(threads);
+                let ty = if vec_w[i] == 4 { "vec4<f32>" } else { "f32" };
+                writeln!(s, "        var pre_{i}: array<{ty}, {iters}>;").unwrap();
+                writeln!(s, "        if (has_next) {{").unwrap();
+                writeln!(
+                    s,
+                    "        for (var it: u32 = 0u; it < {iters}u; it = it + 1u) {{"
+                )
+                .unwrap();
+                writeln!(s, "            let idx = tid + it * {threads}u;").unwrap();
+                writeln!(s, "            if (idx < {total}u) {{").unwrap();
+                s.push_str(&indent(&d, "            "));
+                s.push_str(&indent(
+                    &g.replace("CHUNK", &format!("(chunk + {chunk}u)")),
+                    "            ",
+                ));
+                writeln!(s, "            pre_{i}[it] = val;").unwrap();
+                writeln!(s, "            }}").unwrap();
+                writeln!(s, "        }}").unwrap();
+                writeln!(s, "        }}").unwrap();
+            }
+            for i in 0..ctx.regions.len() {
+                writeln!(s, "        let buf_{i} = cur * {}u;", set_total(i)).unwrap();
+            }
+        } else {
+            direct_loads(&mut s, "chunk", &|_| "0u".to_string());
+            for i in 0..ctx.regions.len() {
+                writeln!(s, "        let buf_{i} = 0u;").unwrap();
+            }
         }
         for (i, (rows, code)) in comp_loads.iter().enumerate() {
             let total = rows * chunk;
@@ -986,7 +1036,9 @@ impl TensorGraph {
             writeln!(s, "        }}").unwrap();
             let _ = i;
         }
-        writeln!(s, "        workgroupBarrier();").unwrap();
+        if !dbl {
+            writeln!(s, "        workgroupBarrier();").unwrap();
+        }
         writeln!(
             s,
             "        for (var r0: u32 = chunk; r0 < min(chunk + {chunk}u, {r_total}u); r0 = r0 + 1u) {{"
@@ -1012,14 +1064,14 @@ impl TensorGraph {
                 if v == 4 {
                     writeln!(
                         s,
-                        "            let svec{n}_g{g} = stage_{}[({base}) / 4u + ({first}) / 4u + {g}u];",
+                        "            let svec{n}_g{g} = stage_{0}[buf_{0} + ({base}) / 4u + ({first}) / 4u + {g}u];",
                         site.region
                     )
                     .unwrap();
                 } else {
                     writeln!(
                         s,
-                        "            let svec{n}_g{g} = stage_{}[{base} + {first} + {g}u];",
+                        "            let svec{n}_g{g} = stage_{0}[buf_{0} + {base} + {first} + {g}u];",
                         site.region
                     )
                     .unwrap();
@@ -1076,6 +1128,30 @@ impl TensorGraph {
             writeln!(s, "            }}").unwrap();
         }
         writeln!(s, "        }}").unwrap();
+        if dbl {
+            writeln!(s, "        if (has_next) {{").unwrap();
+            for (i, r) in ctx.regions.iter().enumerate() {
+                let (total, d, _) = region_load(i, r);
+                let iters = total.div_ceil(threads);
+                writeln!(
+                    s,
+                    "        for (var it: u32 = 0u; it < {iters}u; it = it + 1u) {{"
+                )
+                .unwrap();
+                writeln!(s, "            let idx = tid + it * {threads}u;").unwrap();
+                writeln!(s, "            if (idx < {total}u) {{").unwrap();
+                s.push_str(&indent(&d, "            "));
+                writeln!(
+                    s,
+                    "            stage_{i}[(1u - cur) * {}u + sidx] = pre_{i}[it];",
+                    set_total(i)
+                )
+                .unwrap();
+                writeln!(s, "            }}").unwrap();
+                writeln!(s, "        }}").unwrap();
+            }
+            writeln!(s, "        }}").unwrap();
+        }
         writeln!(s, "        workgroupBarrier();").unwrap();
         writeln!(s, "    }}").unwrap();
         for &(i, j) in &copies {
