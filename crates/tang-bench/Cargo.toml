@@ -46,6 +46,8 @@ harness = false
 
 [features]
 default = []
+# Native Metal backend for the tensor IR (MSL emitter + runtime).
+metal = ["dep:metal"]
 # Reassociable float ops in hot reductions. Requires Rust 1.98+.
 threads = ["tang-la/threads", "tang-tensor/threads", "tang-train/threads", "tang-infer/threads"]
 algebraic = [
@@ -69,6 +71,7 @@ tang-gpu    = { workspace = true }
 tang-train  = { workspace = true }
 tang-tensor = { workspace = true }
 tang-infer  = { workspace = true }
+metal       = { version = "0.33", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

@@ -720,6 +720,19 @@ fn emit_scalar(
 }
 
 impl TensorGraph {
+    /// Element count of buffer `j` as a kernel expression.
+    fn buffer_len_expr(&self, j: usize) -> String {
+        if super::wgsl::dialect() == super::wgsl::Dialect::Msl {
+            // MSL has no runtime array length; the size is static
+            return format!("{}u", super::numel(&self.nodes[j].shape));
+        }
+        let per_word = match self.nodes[j].precision.storage {
+            Format::F16 => " * 2u",
+            _ => "",
+        };
+        format!("arrayLength(&b{j}){per_word}")
+    }
+
     /// Emit the tiled kernel for `root`, continuing `s` (which already
     /// holds the bindings and per-node functions).
     pub(super) fn tile_kernel(&self, root: usize, mut s: String, reads: Vec<usize>) -> WgslKernel {
@@ -1068,14 +1081,7 @@ impl TensorGraph {
             if !lay.window.is_empty() {
                 // a window spans lanes / steps past the edge: keep the
                 // read inside the buffer (those slots are never used)
-                let per_word = match self.nodes[r.key.buffer].precision.storage {
-                    Format::F16 => " * 2u",
-                    _ => "",
-                };
-                live.push_str(&format!(
-                    " && u32(a) < arrayLength(&b{}){per_word}",
-                    r.key.buffer
-                ));
+                live.push_str(&format!(" && u32(a) < {}", self.buffer_len_expr(r.key.buffer)));
             }
             writeln!(s, "            if ({live}) {{").unwrap();
             let mut val = load(

@@ -17,6 +17,39 @@ use tang_expr::{ExprGraph, ExprId, Node};
 
 use super::{fixed, numel, Comp, Format, Monoid, Op, TensorGraph, TensorId};
 
+/// Target language of the shared emitters. The kernel structure and the
+/// index algebra are the same for WGSL and MSL; only buffer element
+/// access (`load`/`store`/`quant`) differs per dialect, and `tensor_msl`
+/// rewrites the remaining WGSL syntax. Set for the duration of one
+/// lowering by [`with_dialect`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Dialect {
+    Wgsl,
+    /// Native `half` buffers: one element per index, no packing.
+    Msl,
+}
+
+thread_local! {
+    static DIALECT: std::cell::Cell<Dialect> = const { std::cell::Cell::new(Dialect::Wgsl) };
+}
+
+pub(super) fn dialect() -> Dialect {
+    DIALECT.with(|d| d.get())
+}
+
+/// Run `f` with the emitters producing dialect `d`.
+pub(super) fn with_dialect<T>(d: Dialect, f: impl FnOnce() -> T) -> T {
+    let prev = DIALECT.with(|c| c.replace(d));
+    struct Reset(Dialect);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            DIALECT.with(|c| c.set(self.0));
+        }
+    }
+    let _reset = Reset(prev);
+    f()
+}
+
 /// One dispatch.
 pub struct WgslKernel {
     pub source: String,
@@ -88,7 +121,7 @@ impl TensorGraph {
                 };
                 let format = self.nodes[i].precision.storage;
                 assert!(
-                    format != Format::BF16,
+                    format != Format::BF16 || dialect() == Dialect::Msl,
                     "bf16 storage is interpreter-only: WGSL has no bf16 type"
                 );
                 BufferSpec {
@@ -139,8 +172,9 @@ impl TensorGraph {
         order
     }
 
-    fn kernel_for(&self, root: usize) -> WgslKernel {
-        let c = self.comp_at(root).unwrap();
+    /// Bindings plus the per-node functions (`read_j`, `point_j`, …) of
+    /// `root`'s kernel, and the buffer-backed nodes it reads (binding order).
+    pub(super) fn kernel_preamble(&self, root: usize) -> (String, Vec<usize>) {
         let order = self.inline_closure(root);
         let reads: Vec<usize> = order
             .iter()
@@ -184,6 +218,12 @@ impl TensorGraph {
         for &j in &order {
             self.emit_node(&mut s, j, &reads);
         }
+        (s, reads)
+    }
+
+    fn kernel_for(&self, root: usize) -> WgslKernel {
+        let c = self.comp_at(root).unwrap();
+        let (mut s, reads) = self.kernel_preamble(root);
 
         let w = c.width();
         let k = c.points().len();
@@ -449,7 +489,7 @@ fn emit_step(s: &mut String, indent: &str, elem: &str, m: &Monoid, accum: Format
 
 /// Emit `let {prefix}{i} = …;` for the live nodes of `g` and return the
 /// expressions for `outs`; `var_expr` names input var `i`.
-fn emit_scalar_mapped(
+pub(super) fn emit_scalar_mapped(
     s: &mut String,
     indent: &str,
     g: &ExprGraph,
@@ -494,6 +534,16 @@ pub(super) fn identity(m: &Monoid) -> String {
 
 /// `read_src(view(p…, r…))` for every arg, as call arguments.
 fn arg_reads(g: &TensorGraph, c: &Comp) -> String {
+    c.args
+        .iter()
+        .map(|a| arg_read(g, c, a))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Value of one arg of `c` at point coords `p…` and reduce coords `r…`
+/// (in scope as variables), zero-padded if the view is guarded.
+pub(super) fn arg_read(g: &TensorGraph, c: &Comp, a: &super::Arg) -> String {
     let k = c.points().len();
     let coord_name = |d: usize| {
         if d < k {
@@ -502,41 +552,35 @@ fn arg_reads(g: &TensorGraph, c: &Comp) -> String {
             format!("r{}", d - k)
         }
     };
-    c.args
+    let signed: Vec<String> = a
+        .view
+        .forms
         .iter()
-        .map(|a| {
-            let signed: Vec<String> = a
-                .view
-                .forms
-                .iter()
-                .map(|f| {
-                    let mut terms = vec![format!("{}", f.offset)];
-                    for (d, &coef) in f.coefs.iter().enumerate() {
-                        if coef != 0 {
-                            terms.push(format!("{coef} * i32({})", coord_name(d)));
-                        }
-                    }
-                    format!("({})", terms.join(" + "))
-                })
-                .collect();
-            let idx: Vec<String> = signed.iter().map(|e| format!("u32({e})")).collect();
-            let read = format!("read_{}({})", a.src.n(), idx.join(", "));
-            if !a.view.guard {
-                return read;
+        .map(|f| {
+            let mut terms = vec![format!("{}", f.offset)];
+            for (d, &coef) in f.coefs.iter().enumerate() {
+                if coef != 0 {
+                    terms.push(format!("{coef} * i32({})", coord_name(d)));
+                }
             }
-            // zero padding: the read itself may wrap (robust buffer
-            // access keeps it in bounds); the select discards it
-            let shape = fixed(&g.nodes[a.src.n()].shape);
-            let cond = signed
-                .iter()
-                .zip(&shape)
-                .map(|(e, n)| format!("(u32({e}) < {n}u)"))
-                .collect::<Vec<_>>()
-                .join(" && ");
-            format!("select(0.0, {read}, {cond})")
+            format!("({})", terms.join(" + "))
         })
+        .collect();
+    let idx: Vec<String> = signed.iter().map(|e| format!("u32({e})")).collect();
+    let read = format!("read_{}({})", a.src.n(), idx.join(", "));
+    if !a.view.guard {
+        return read;
+    }
+    // zero padding: the read itself may wrap (robust buffer
+    // access keeps it in bounds); the select discards it
+    let shape = fixed(&g.nodes[a.src.n()].shape);
+    let cond = signed
+        .iter()
+        .zip(&shape)
+        .map(|(e, n)| format!("(u32({e}) < {n}u)"))
         .collect::<Vec<_>>()
-        .join(", ")
+        .join(" && ");
+    format!("select(0.0, {read}, {cond})")
 }
 
 /// Row-major flat index of coords `prefix{start}..` over `shape`.
@@ -639,6 +683,10 @@ fn emit_scalar_body(s: &mut String, g: &ExprGraph, outs: &[ExprId], round: Forma
 /// two per `u32` (naga 24 has no `enable f16`; `unpack2x16float` is core
 /// WGSL), so it needs no device feature.
 pub(super) fn elem_ty(f: Format) -> &'static str {
+    if dialect() == Dialect::Msl {
+        // header lines are rewritten by the MSL lowering; any name will do
+        return "f32";
+    }
     match f {
         Format::F32 => "f32",
         Format::F16 => "u32",
@@ -658,6 +706,12 @@ fn out_ty(f: Format) -> &'static str {
 /// Element `idx` of buffer `buf` (format `f`), as the f32 the kernel
 /// computes in.
 pub(super) fn load(f: Format, buf: &str, idx: &str) -> String {
+    if dialect() == Dialect::Msl {
+        return match f {
+            Format::F32 => format!("{buf}[{idx}]"),
+            _ => format!("f32({buf}[{idx}])"),
+        };
+    }
     match f {
         Format::F32 => format!("{buf}[{idx}]"),
         Format::F16 => format!("unpack2x16float({buf}[({idx}) >> 1u])[({idx}) & 1u]"),
@@ -669,6 +723,13 @@ pub(super) fn load(f: Format, buf: &str, idx: &str) -> String {
 /// half is merged into its word with two atomics on disjoint bits, so
 /// the neighbour's half is never clobbered whatever the interleaving.
 pub(super) fn store(f: Format, idx: &str, v: &str) -> String {
+    if dialect() == Dialect::Msl {
+        return match f {
+            Format::F32 => format!("out[{idx}] = {v};"),
+            Format::F16 => format!("out[{idx}] = half({v});"),
+            Format::BF16 => format!("out[{idx}] = bfloat({v});"),
+        };
+    }
     match f {
         Format::F32 => format!("out[{idx}] = {v};"),
         Format::F16 => format!(
@@ -685,6 +746,13 @@ pub(super) fn store(f: Format, idx: &str, v: &str) -> String {
 /// is what the interpreter emulates. It reproduces the numerics of an
 /// f16 accumulator, not its speed.
 pub(super) fn quant(f: Format, e: &str) -> String {
+    if dialect() == Dialect::Msl {
+        return match f {
+            Format::F32 => e.to_string(),
+            Format::F16 => format!("f32(half({e}))"),
+            Format::BF16 => format!("f32(bfloat({e}))"),
+        };
+    }
     match f {
         Format::F32 => e.to_string(),
         Format::F16 => format!("unpack2x16float(pack2x16float(vec2<f32>({e}, 0.0))).x"),

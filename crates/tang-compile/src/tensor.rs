@@ -46,6 +46,8 @@ pub mod precision;
 mod tile;
 #[path = "tensor_wgsl.rs"]
 pub mod wgsl;
+#[path = "tensor_msl.rs"]
+pub mod msl;
 pub use precision::{ErrorBudget, ErrorStats, Format, Precision};
 
 // ---------------------------------------------------------------------------
@@ -411,6 +413,11 @@ pub struct TNode {
     /// Schedule: points per thread along `(x, y)` within a tile — the
     /// register tile. `(1, 1)` is one point per thread.
     pub reg: (u32, u32),
+    /// Schedule: lower this tiled contraction onto matrix-unit fragments
+    /// (Metal `simdgroup_matrix`) on backends that have them. Only legal
+    /// for an f16 × f16 → f32 contraction; see
+    /// [`TensorGraph::fragment_plan`]. Backends without fragments ignore it.
+    pub fragment: bool,
     /// Schedule: number formats — storage of a materialized buffer (or
     /// input) and the running accumulator of a reduction. Default all
     /// f32. See [`Precision`].
@@ -636,6 +643,7 @@ impl TensorGraph {
             split: 0,
             tile: (0, 0, 0),
             reg: (1, 1),
+            fragment: false,
             precision: Precision::default(),
         });
         TensorId(self.nodes.len() as u32 - 1)
@@ -651,6 +659,7 @@ impl TensorGraph {
             split: 0,
             tile: (0, 0, 0),
             reg: (1, 1),
+            fragment: false,
             precision: Precision::default(),
         });
         TensorId(self.nodes.len() as u32 - 1)
@@ -681,6 +690,7 @@ impl TensorGraph {
             split: 0,
             tile: (0, 0, 0),
             reg: (1, 1),
+            fragment: false,
             precision: Precision::default(),
         });
         Ok(TensorId(self.nodes.len() as u32 - 1))
@@ -778,6 +788,7 @@ impl TensorGraph {
             split: 0,
             tile: (0, 0, 0),
             reg: (1, 1),
+            fragment: false,
             precision: Precision::default(),
             op: Op::Comp(comp),
         });
@@ -1096,6 +1107,7 @@ impl TensorGraph {
                 split: node.split,
                 tile: node.tile,
                 reg: node.reg,
+                fragment: node.fragment,
                 precision: node.precision,
             });
             remap[i] = Some(ng.nodes.len() - 1);

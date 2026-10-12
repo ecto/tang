@@ -257,6 +257,10 @@ pub fn random_spd_flat(size: usize) -> Vec<f64> {
 }
 
 /// Run tang-compile tensor graphs on the GPU, for the kernels-vs-IR benches.
+#[cfg(feature = "metal")]
+#[path = "ir_msl.rs"]
+pub mod ir_msl;
+
 pub mod ir_gpu {
     use tang::Scalar;
     use tang_compile::tensor::precision::{f16_bits, f16_from_bits};
