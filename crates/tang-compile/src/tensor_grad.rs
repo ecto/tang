@@ -9,9 +9,10 @@
 //! is pushed through the same renaming, and the scalar body is
 //! differentiated by `tang_expr`'s symbolic `diff`.
 //!
-//! Supported: `Sum` reductions and maps, width 1, pick views for the
-//! differentiated arg (any affine view for the others). Not yet: `Max`
-//! (needs select), tuple monoids, non-injective views such as diagonals.
+//! Supported: `Sum`/`Max` reductions and maps, width 1, pick views for
+//! the differentiated arg (any affine view for the others). `Max` routes
+//! the gradient to every element equal to the max. Not yet: tuple
+//! monoids, non-injective views such as diagonals.
 //! Differentiate the *algorithm* graph, then optimize forward and backward
 //! together.
 
@@ -45,7 +46,7 @@ impl TensorGraph {
             let Some(c) = self.comp_at(j) else { continue };
             let c = c.clone();
             for a in 0..c.args.len() {
-                let g = self.arg_grad(&c, a, dy)?;
+                let g = self.arg_grad(TensorId(j as u32), &c, a, dy)?;
                 let src = c.args[a].src.n();
                 let acc = match grads.get(&src) {
                     Some(&prev) => self.map(&[prev, g], |v| v[0] + v[1])?,
@@ -67,12 +68,19 @@ impl TensorGraph {
     }
 
     /// `∂L/∂(arg a of c)` given `dy = ∂L/∂c`.
-    fn arg_grad(&mut self, c: &Comp, a: usize, dy: TensorId) -> Result<TensorId, ShapeError> {
+    fn arg_grad(
+        &mut self,
+        self_id: TensorId,
+        c: &Comp,
+        a: usize,
+        dy: TensorId,
+    ) -> Result<TensorId, ShapeError> {
         if c.tuple != 0 || c.width() != 1 {
             return err("backward: tuple-valued comps are not differentiable yet");
         }
-        match c.monoid.as_ref().map(Monoid::kind) {
-            None | Some(MonoidKind::Sum) => {}
+        let kind = c.monoid.as_ref().map(Monoid::kind);
+        match kind {
+            None | Some(MonoidKind::Sum) | Some(MonoidKind::Max) => {}
             Some(k) => {
                 return err(format!(
                     "backward: {k:?} reductions are not differentiable yet"
@@ -150,7 +158,23 @@ impl TensorGraph {
         let mut body = ExprGraph::new();
         let vars: Vec<ExprId> = (0..=c.args.len()).map(|i| body.var(i as u16)).collect();
         let dexpr = replay(&src, &[d], &vars[1..], &mut body)[0];
-        let out = body.mul(vars[0], dexpr);
+        let mut out = body.mul(vars[0], dexpr);
+        if kind == Some(MonoidKind::Max) {
+            // Gate to the argmax: read the forward max like dy and keep
+            // the term only where body == max.
+            let m = body.var(args.len() as u16);
+            args.push(Arg {
+                src: self_id,
+                view: args[0].view.clone(),
+            });
+            let val = replay(&src, &[c.body_outs[0]], &vars[1..], &mut body)[0];
+            let (nm, nv) = (body.neg(m), body.neg(val));
+            let below = body.add(val, nm); // val - m
+            let above = body.add(m, nv); // m - val
+            let inner = body.select(above, ExprId::ZERO, ExprId::ONE);
+            let hit = body.select(below, ExprId::ZERO, inner);
+            out = body.mul(out, hit);
+        }
 
         self.push_comp(Comp {
             out: a_shape,
@@ -267,10 +291,58 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_monoid_is_an_error() {
+    fn max_routes_gradient_to_argmax() {
         let mut g = TensorGraph::new();
         let x = g.input(&[2, 3]);
         let m = g.reduce(x, 1, Monoid::max()).unwrap();
-        assert!(g.backward(m, &[x]).is_err());
+        let grads = g.backward(m, &[x]).unwrap();
+        let got = g
+            .eval(&[vec![1.0, 5.0, 2.0, 7.0, 0.0, 3.0]], &grads)
+            .remove(0);
+        assert_eq!(got, vec![0.0, 1.0, 0.0, 1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn attention_grads() {
+        let (n, d) = (4, 3);
+        let mut g = TensorGraph::new();
+        let q = g.input(&[n, d]);
+        let k = g.input(&[n, d]);
+        let v = g.input(&[n, d]);
+        let kt = g.transpose(k, &[1, 0]).unwrap();
+        let s = g.matmul(q, kt).unwrap();
+        let m = g.reduce(s, 1, Monoid::max()).unwrap();
+        let mb = g.broadcast(m, &[n, n]).unwrap();
+        let p = g.map(&[s, mb], |x| (x[0] - x[1]).exp()).unwrap();
+        let l = g.reduce(p, 1, Monoid::sum()).unwrap();
+        let o = g.matmul(p, v).unwrap();
+        let lb = g.broadcast(l, &[n, d]).unwrap();
+        let y = g.map(&[o, lb], |x| x[0] / x[1]).unwrap();
+        let grads = g.backward(y, &[q, k, v]).unwrap();
+        let inputs = [
+            ramp(n * d, 0.3, -0.5),
+            ramp(n * d, 0.2, 0.1),
+            ramp(n * d, 0.4, -1.0),
+        ];
+        for (i, &gr) in grads.iter().enumerate() {
+            check_grad(&g, y, &inputs, i, gr);
+        }
+    }
+
+    #[test]
+    fn tuple_monoid_is_an_error() {
+        let mut g = TensorGraph::new();
+        let x = g.input(&[2, 3]);
+        let m = g.reduce(x, 1, Monoid::max()).unwrap();
+        let mb = g.broadcast(m, &[2, 3]).unwrap();
+        let p = g.map(&[x, mb], |v| (v[0] - v[1]).exp()).unwrap();
+        let l = g.reduce(p, 1, Monoid::sum()).unwrap();
+        let y = g.map(&[l], |v| v[0] * v[0]).unwrap();
+        let (g, outs) = g.substitute_maps(&[y]);
+        let (mut g, outs) = g.stabilize_softmax(&outs);
+        assert!(g
+            .reduction_kinds(&outs)
+            .contains(&MonoidKind::OnlineSoftmax));
+        assert!(g.backward(outs[0], &[]).is_err());
     }
 }
