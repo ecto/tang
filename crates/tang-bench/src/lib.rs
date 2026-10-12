@@ -2082,6 +2082,15 @@ pub mod ir_cuda {
     use tang_compile::tensor::wgsl::WgslProgram;
     use tang_compile::tensor::TensorId;
 
+    /// `#define TANG_SMEM n` in a kernel's source: its dynamic shared
+    /// memory in bytes (0 when absent).
+    fn dynamic_smem(src: &str) -> u32 {
+        src.lines()
+            .find_map(|l| l.strip_prefix("#define TANG_SMEM "))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
     pub struct CudaExecutable {
         pub program: WgslProgram,
         pub stream: Arc<CudaStream>,
@@ -2114,9 +2123,20 @@ pub mod ir_cuda {
                     let ptx = compile_ptx_with_opts(&k.source, opts)
                         .unwrap_or_else(|e| panic!("nvrtc: {e:?}\n{}", k.source));
                     let module = ctx.load_module(ptx).expect("load module");
-                    module
+                    let f = module
                         .load_function(tang_compile::tensor::cuda::CUDA_ENTRY)
-                        .expect("entry")
+                        .expect("entry");
+                    // kernels that want more dynamic shared memory than the
+                    // default 48 KB say so in their source
+                    let smem = dynamic_smem(&k.source);
+                    if smem > 48 * 1024 {
+                        f.set_attribute(
+                            cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                            smem as i32,
+                        )
+                        .expect("smem attribute");
+                    }
+                    f
                 })
                 .collect();
             Self {
@@ -2150,7 +2170,7 @@ pub mod ir_cuda {
                 let cfg = LaunchConfig {
                     grid_dim: (groups, 1, 1),
                     block_dim: (k.workgroup_size, 1, 1),
-                    shared_mem_bytes: 0,
+                    shared_mem_bytes: dynamic_smem(&k.source),
                 };
                 let mut launch = self.stream.launch_builder(f);
                 for t in &k.reads {
