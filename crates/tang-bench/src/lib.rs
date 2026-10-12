@@ -255,3 +255,184 @@ pub fn random_spd_flat(size: usize) -> Vec<f64> {
     }
     result
 }
+
+/// Run tang-compile tensor graphs on the GPU, for the kernels-vs-IR benches.
+pub mod ir_gpu {
+    use tang::Scalar;
+    use tang_compile::tensor::wgsl::WgslProgram;
+    use tang_compile::tensor::{Monoid, TensorGraph, TensorId};
+    use tang_expr::ExprId;
+    use tang_gpu::{GpuBuffer, GpuDevice, KernelCache};
+
+    /// Buffers for a program: graph inputs in order, then materialized
+    /// intermediates. Reused across runs.
+    pub struct Executable {
+        pub program: WgslProgram,
+        /// `buffers[i]` backs `program.buffers[i].0`.
+        pub buffers: Vec<GpuBuffer>,
+    }
+
+    impl Executable {
+        pub fn new(device: &GpuDevice, program: WgslProgram, inputs: &[&[f32]]) -> Self {
+            let buffers = program
+                .buffers
+                .iter()
+                .map(|b| match b.input {
+                    Some(k) => {
+                        assert_eq!(inputs[k].len(), b.len, "input {k} has wrong length");
+                        GpuBuffer::from_slice(device, inputs[k])
+                    }
+                    None => GpuBuffer::uninit(device, b.len),
+                })
+                .collect();
+            Self { program, buffers }
+        }
+
+        fn buffer(&self, t: TensorId) -> &GpuBuffer {
+            let i = self
+                .program
+                .buffers
+                .iter()
+                .position(|b| b.node == t)
+                .unwrap();
+            &self.buffers[i]
+        }
+
+        /// Dispatch every kernel in order.
+        pub fn run(&self, device: &GpuDevice, cache: &mut KernelCache) {
+            for k in &self.program.kernels {
+                let mut bufs: Vec<&GpuBuffer> = k.reads.iter().map(|t| self.buffer(*t)).collect();
+                bufs.push(self.buffer(k.node));
+                let out_idx = bufs.len() - 1;
+                cache.dispatch_buffers(
+                    device,
+                    &k.source,
+                    &bufs,
+                    &[out_idx],
+                    &[k.count, 0, 0, 0],
+                    k.count,
+                    k.workgroup_size,
+                );
+            }
+        }
+
+        pub fn read(&self, device: &GpuDevice, t: TensorId) -> Vec<f32> {
+            self.buffer(t).to_vec_sync(device)
+        }
+    }
+
+    /// Additive causal mask: 0 where `j <= i`, a large negative otherwise.
+    pub fn causal_mask(n: usize) -> Vec<f32> {
+        (0..n * n)
+            .map(|p| if p % n <= p / n { 0.0 } else { -1e30 })
+            .collect()
+    }
+
+    /// Single-head causal `softmax(q·kᵀ/√d + mask)·v`, written naively.
+    /// Inputs: q `[n,d]`, k `[n,d]`, v `[n,dv]`, mask `[n,n]`.
+    pub fn naive_attention(n: usize, d: usize, dv: usize) -> (TensorGraph, TensorId) {
+        let mut g = TensorGraph::new();
+        let q = g.input(&[n, d]);
+        let k = g.input(&[n, d]);
+        let v = g.input(&[n, dv]);
+        let mask = g.input(&[n, n]);
+        let scale = 1.0 / (d as f64).sqrt();
+        let qs = g.map(&[q], |x| x[0] * ExprId::from_f64(scale)).unwrap();
+        let kt = g.transpose(k, &[1, 0]).unwrap();
+        let s = g.matmul(qs, kt).unwrap();
+        let s = g.map(&[s, mask], |x| x[0] + x[1]).unwrap();
+        let m = g.reduce(s, 1, Monoid::max()).unwrap();
+        let mb = g.broadcast(m, &[n, n]).unwrap();
+        let p = g.map(&[s, mb], |x| (x[0] - x[1]).exp()).unwrap();
+        let l = g.reduce(p, 1, Monoid::sum()).unwrap();
+        let o = g.matmul(p, v).unwrap();
+        let lb = g.broadcast(l, &[n, dv]).unwrap();
+        let y = g.map(&[o, lb], |x| x[0] / x[1]).unwrap();
+        (g, y)
+    }
+
+    /// Naive attention after the full pass pipeline: one online-softmax
+    /// reduction with `q·k` recomputed inside, nothing n×n materialized.
+    pub fn flash_attention(n: usize, d: usize, dv: usize) -> (TensorGraph, TensorId) {
+        let (g, y) = naive_attention(n, d, dv);
+        let (g, outs) = g.substitute_maps(&[y]);
+        let (mut g, outs) = g.stabilize_softmax(&outs);
+        g.schedule_inline(&outs);
+        (g, outs[0])
+    }
+
+    /// [`flash_attention`] with the online-softmax reduction split across
+    /// a 256-thread workgroup per query row.
+    pub fn flash_attention_split(n: usize, d: usize, dv: usize) -> (TensorGraph, TensorId) {
+        let (mut g, y) = flash_attention(n, d, dv);
+        g.schedule_split(&[y], 256, 64);
+        (g, y)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use tang_gpu::kv_attention_fused;
+        use tang_gpu::GpuTensor;
+
+        #[test]
+        fn derived_attention_matches_hand_kernel_on_gpu() {
+            let Ok(device) = GpuDevice::new_sync() else {
+                eprintln!("no GPU, skipping");
+                return;
+            };
+            let mut cache = KernelCache::new();
+            let (n, d) = (100, 16);
+            let mut rng = crate::Rng::new(7);
+            let q: Vec<f32> = (0..n * d).map(|_| rng.f32() * 2.0 - 1.0).collect();
+            let k: Vec<f32> = (0..n * d).map(|_| rng.f32() * 2.0 - 1.0).collect();
+            let v: Vec<f32> = (0..n * d).map(|_| rng.f32() * 2.0 - 1.0).collect();
+
+            let qt = GpuTensor::from_slice(&device, &q, &[n, d]);
+            let kt = GpuTensor::from_slice(&device, &k, &[n, d]);
+            let vt = GpuTensor::from_slice(&device, &v, &[n, d]);
+            let want = kv_attention_fused(&device, &mut cache, &qt, &kt, &vt, n, n, 1, 1, d, 0)
+                .to_vec_flushed(&device, &mut cache);
+            let mask = causal_mask(n);
+
+            // CPU reference
+            let mut cpu = vec![0.0f32; n * d];
+            for i in 0..n {
+                let sc: Vec<f32> = (0..n)
+                    .map(|j| {
+                        let dot = (0..d).map(|t| q[i * d + t] * k[j * d + t]).sum::<f32>();
+                        if j <= i {
+                            dot / (d as f32).sqrt()
+                        } else {
+                            -1e30
+                        }
+                    })
+                    .collect();
+                let m = sc.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let w: Vec<f32> = sc.iter().map(|s| (s - m).exp()).collect();
+                let l: f32 = w.iter().sum();
+                for c in 0..d {
+                    cpu[i * d + c] = (0..n).map(|j| w[j] * v[j * d + c]).sum::<f32>() / l;
+                }
+            }
+            for (i, (a, b)) in want.iter().zip(&cpu).enumerate() {
+                assert!((a - b).abs() < 1e-4, "hand[{i}]: {a} vs {b}");
+            }
+            for (name, (g, y)) in [
+                ("naive", naive_attention(n, d, d)),
+                ("flash", flash_attention(n, d, d)),
+                ("flash_split", flash_attention_split(n, d, d)),
+            ] {
+                let program = g.to_wgsl(&[y]);
+                let exe = Executable::new(&device, program, &[&q, &k, &v, &mask]);
+                exe.run(&device, &mut cache);
+                cache.flush(&device);
+                let got = exe.read(&device, y);
+                assert_eq!(got.len(), want.len());
+                for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+                    assert!((a - b).abs() < 1e-4, "{name}[{i}]: {a} vs {b}");
+                }
+            }
+        }
+    }
+}

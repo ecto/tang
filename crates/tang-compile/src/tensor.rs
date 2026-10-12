@@ -38,6 +38,9 @@ use std::collections::HashMap;
 use tang::Scalar;
 use tang_expr::{trace, ExprGraph, ExprId, Node};
 
+#[path = "tensor_wgsl.rs"]
+pub mod wgsl;
+
 // ---------------------------------------------------------------------------
 // Views
 // ---------------------------------------------------------------------------
@@ -342,6 +345,9 @@ pub struct TNode {
     pub shape: Vec<usize>,
     /// Schedule: recompute inside consumers instead of writing a buffer.
     pub inline: bool,
+    /// Schedule: split the reduction across a workgroup of this many
+    /// threads, tree-combined with the monoid (0 = one thread per point).
+    pub split: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -389,6 +395,7 @@ impl TensorGraph {
             op: Op::Input(i),
             shape: dims.to_vec(),
             inline: false,
+            split: 0,
         });
         TensorId(self.nodes.len() as u32 - 1)
     }
@@ -456,6 +463,7 @@ impl TensorGraph {
         self.nodes.push(TNode {
             shape: comp.out.clone(),
             inline: false,
+            split: 0,
             op: Op::Comp(comp),
         });
         Ok(TensorId(self.nodes.len() as u32 - 1))
@@ -691,6 +699,7 @@ impl TensorGraph {
                 op,
                 shape: node.shape.clone(),
                 inline: node.inline,
+                split: node.split,
             });
             remap[i] = Some(ng.nodes.len() - 1);
         }
@@ -735,30 +744,62 @@ impl TensorGraph {
         replay(&c.body, &c.body_outs, &vars, body)[0]
     }
 
+    /// Canonical form of the expression `out` of `body` over `args`, with
+    /// views over `space`: leaves renumbered in order of first use and
+    /// size-1 coordinates dropped, so equal computations compare equal.
+    fn canon(body: &ExprGraph, out: ExprId, args: &[Arg], space: &[usize]) -> Canon {
+        let mut leaves: Vec<Arg> = Vec::new();
+        let mut g = ExprGraph::new();
+        let vars: Vec<ExprId> = args
+            .iter()
+            .enumerate()
+            .map(|(k, a)| {
+                if !vars_reachable(body, out).contains(&(k as u16)) {
+                    return ExprId::ZERO;
+                }
+                let leaf = Arg {
+                    src: a.src,
+                    view: a.view.normalized(space),
+                };
+                g.var(intern_arg(&mut leaves, leaf) as u16)
+            })
+            .collect();
+        let out = replay(body, &[out], &vars, &mut g)[0];
+        Canon {
+            leaves,
+            nodes: g.nodes_slice()[..=out.index() as usize].to_vec(),
+        }
+    }
+
     /// Does `m_arg` (as read by `c`) hold `max` over `c`'s reduce coord of
-    /// exactly what `c` reads through `s_arg`?
-    fn is_row_max_of(&self, c: &Comp, s_arg: &Arg, m_arg: &Arg) -> bool {
-        let Some(mc) = self.comp_at(m_arg.src.n()) else {
-            return false;
-        };
+    /// exactly the expression `s` of `c`'s body? Returns `s`'s canonical form.
+    fn is_row_max_of(&self, c: &Comp, s: ExprId, m_arg: &Arg) -> Option<Canon> {
+        let mc = self.comp_at(m_arg.src.n())?;
         let n_out = c.points().len();
         let structural = mc.monoid.as_ref().map(Monoid::kind) == Some(MonoidKind::Max)
             && mc.tuple == 0
-            && mc.args.len() == 1
             && mc.red.len() == 1
             && c.red.len() == 1
-            && mc.body.node(mc.body_outs[0]) == Node::Var(0)
             && !m_arg.view.depends_on(n_out);
         if !structural {
-            return false;
+            return None;
         }
         // Extend c's view of m with "m's reduce coord = c's reduce coord",
-        // then push m's own view of s through it: must land on c's view of s.
+        // push m's args through it, and compare m's body with `s`.
         let mut ext = m_arg.view.clone();
         ext.forms.push(Form::unit(c.rank(), n_out));
         let space = c.space();
-        let via_m = mc.args[0].view.compose(&ext, c.rank()).normalized(&space);
-        via_m == s_arg.view.normalized(&space)
+        let m_args: Vec<Arg> = mc
+            .args
+            .iter()
+            .map(|a| Arg {
+                src: a.src,
+                view: a.view.compose(&ext, c.rank()),
+            })
+            .collect();
+        let via_m = Self::canon(&mc.body, mc.body_outs[0], &m_args, &space);
+        let direct = Self::canon(&c.body, s, &c.args, &space);
+        (via_m == direct).then_some(direct)
     }
 
     /// Rewrite `m = max_j s` and every `Σ_j g·exp(s − m)` over the same
@@ -772,27 +813,32 @@ impl TensorGraph {
         struct Member {
             node: usize,
             m_view: View,
+            s: ExprId,
             g: Option<ExprId>,
         }
         let is_output = |i: usize| outputs.iter().any(|o| o.n() == i);
-        // max node -> members
-        let mut groups: HashMap<usize, Vec<Member>> = HashMap::new();
+        // (max node, canonical s) -> members
+        let mut groups: HashMap<(usize, Canon), Vec<Member>> = HashMap::new();
         for i in 0..self.nodes.len() {
             let Some(c) = self.comp_at(i) else { continue };
             let sum = c.monoid.as_ref().map(Monoid::kind) == Some(MonoidKind::Sum);
             if !sum || c.red.len() != 1 || c.tuple != 0 || is_output(i) {
                 continue;
             }
-            let Some((s_var, m_var, g)) = match_exp_diff(&c.body, c.body_outs[0]) else {
+            let Some((s, m_var, g)) = match_exp_diff(&c.body, c.body_outs[0]) else {
                 continue;
             };
-            let (s_arg, m_arg) = (&c.args[s_var as usize], &c.args[m_var as usize]);
-            if self.is_row_max_of(c, s_arg, m_arg) {
-                groups.entry(m_arg.src.n()).or_default().push(Member {
-                    node: i,
-                    m_view: m_arg.view.clone(),
-                    g,
-                });
+            let m_arg = &c.args[m_var as usize];
+            if let Some(canon) = self.is_row_max_of(c, s, m_arg) {
+                groups
+                    .entry((m_arg.src.n(), canon))
+                    .or_default()
+                    .push(Member {
+                        node: i,
+                        m_view: m_arg.view.clone(),
+                        s,
+                        g,
+                    });
             }
         }
         if groups.is_empty() {
@@ -802,13 +848,19 @@ impl TensorGraph {
         let mut g2 = self.clone();
         // member node -> (fused node, projection from member out coords to fused coords)
         let mut redirect: HashMap<usize, (usize, View)> = HashMap::new();
-        for (m_node, members) in groups {
+        for ((m_node, _), members) in groups {
             let mc = self.comp_at(m_node).unwrap();
             let m_out = mc.out.len();
             let fused_rank = m_out + 1;
             let mut body = ExprGraph::new();
-            let mut args = vec![mc.args[0].clone()];
-            let mut outs = vec![body.var(0)];
+            let mut args: Vec<Arg> = Vec::new();
+            // slot 0: s, taken from the max's own body (same space as the fused comp)
+            let m_vars: Vec<ExprId> = mc
+                .args
+                .iter()
+                .map(|a| body.var(intern_arg(&mut args, a.clone()) as u16))
+                .collect();
+            let mut outs = replay(&mc.body, &mc.body_outs, &m_vars, &mut body);
             let mut projections = Vec::new();
 
             for mem in &members {
@@ -835,6 +887,7 @@ impl TensorGraph {
                         })
                         .collect();
                     let inv = View { forms };
+                    let _ = mem.s;
                     let used = mem.g.map_or_else(Vec::new, |g| vars_reachable(&c.body, g));
                     let vars: Vec<ExprId> = c
                         .args
@@ -980,6 +1033,24 @@ impl TensorGraph {
             if live[i] && uses[i] == 1 && !is_output(i) && consumer_space[i] <= numel(c.points()) {
                 self.nodes[i].inline = true;
             }
+        }
+    }
+
+    /// Schedule: every materialized reduction with at least `min_red`
+    /// elements per point is split across a workgroup of `threads`.
+    /// The monoid's combine is associative, so this is always valid —
+    /// including for tuple-state monoids like online softmax.
+    pub fn schedule_split(&mut self, outputs: &[TensorId], threads: u32, min_red: usize) {
+        let live = self.live(outputs);
+        let targets: Vec<usize> = (0..self.nodes.len())
+            .filter(|&i| live[i] && !self.nodes[i].inline)
+            .filter(|&i| {
+                self.comp_at(i)
+                    .is_some_and(|c| c.monoid.is_some() && numel(&c.red) >= min_red)
+            })
+            .collect();
+        for i in targets {
+            self.nodes[i].split = threads;
         }
     }
 
@@ -1150,21 +1221,29 @@ fn vars_reachable(g: &ExprGraph, out: ExprId) -> Vec<u16> {
         .collect()
 }
 
-/// Match `g · exp(s − m)` (or just `exp(s − m)`) where `s`, `m` are vars.
-/// `exp(x)` lowers to `exp2(x · log2e)` and `a − b` to `add(a, neg(b))`.
-fn match_exp_diff(g: &ExprGraph, out: ExprId) -> Option<(u16, u16, Option<ExprId>)> {
+/// Canonical expression for structural comparison (see [`TensorGraph::canon`]).
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct Canon {
+    leaves: Vec<Arg>,
+    nodes: Vec<Node>,
+}
+
+/// Match `g · exp(s − m)` (or just `exp(s − m)`) where `m` is a var and
+/// `s` is any expression. `exp(x)` lowers to `exp2(x · log2e)` and
+/// `a − b` to `add(a, neg(b))`.
+fn match_exp_diff(g: &ExprGraph, out: ExprId) -> Option<(ExprId, u16, Option<ExprId>)> {
     let n = g.nodes_slice();
     let at = |e: ExprId| n[e.index() as usize];
-    let exp_diff = |e: ExprId| -> Option<(u16, u16)> {
+    let exp_diff = |e: ExprId| -> Option<(ExprId, u16)> {
         let Node::Exp2(x) = at(e) else { return None };
         let Node::Mul(d, l) = at(x) else { return None };
         if at(l) != Node::lit(std::f64::consts::LOG2_E) {
             return None;
         }
-        let Node::Add(a, nb) = at(d) else { return None };
+        let Node::Add(s, nb) = at(d) else { return None };
         let Node::Neg(b) = at(nb) else { return None };
-        match (at(a), at(b)) {
-            (Node::Var(s), Node::Var(m)) => Some((s, m)),
+        match at(b) {
+            Node::Var(m) => Some((s, m)),
             _ => None,
         }
     };
@@ -1282,12 +1361,21 @@ mod tests {
         assert_eq!(Monoid::online_softmax(2).kind(), MonoidKind::OnlineSoftmax);
     }
 
-    /// softmax(q·kᵀ)·v with every intermediate written out.
-    fn naive_attention(g: &mut TensorGraph, q: TensorId, k: TensorId, v: TensorId) -> TensorId {
+    /// softmax(q·kᵀ [+ mask])·v with every intermediate written out.
+    fn naive_attention(
+        g: &mut TensorGraph,
+        q: TensorId,
+        k: TensorId,
+        v: TensorId,
+        mask: Option<TensorId>,
+    ) -> TensorId {
         let n = g.shape(q)[0];
         let dv = g.shape(v)[1];
         let kt = g.transpose(k, &[1, 0]).unwrap();
-        let s = g.matmul(q, kt).unwrap(); // [n, n]
+        let mut s = g.matmul(q, kt).unwrap(); // [n, n]
+        if let Some(mask) = mask {
+            s = g.map(&[s, mask], |v| v[0] + v[1]).unwrap();
+        }
         let m = g.reduce(s, 1, Monoid::max()).unwrap(); // [n, 1]
         let mb = g.broadcast(m, &[n, n]).unwrap();
         let p = g.map(&[s, mb], |v| (v[0] - v[1]).exp()).unwrap(); // [n, n]
@@ -1299,18 +1387,37 @@ mod tests {
 
     #[test]
     fn attention_is_derived_not_written() {
+        check_attention_derivation(false);
+    }
+
+    /// With a mask, `s` in `exp(s − max_j s)` is `scores + mask`, not a
+    /// bare arg: the matcher must compare expressions, not vars.
+    #[test]
+    fn causal_attention_is_derived_too() {
+        check_attention_derivation(true);
+    }
+
+    fn check_attention_derivation(causal: bool) {
         let (n, d, dv) = (16, 4, 4);
         let mut g = TensorGraph::new();
         let q = g.input(&[n, d]);
         let k = g.input(&[n, d]);
         let v = g.input(&[n, dv]);
-        let y = naive_attention(&mut g, q, k, v);
+        let mask = causal.then(|| g.input(&[n, n]));
+        let y = naive_attention(&mut g, q, k, v, mask);
 
-        let inputs = [
+        let mut inputs = vec![
             ramp(n * d, 0.05, -1.0),
             ramp(n * d, 0.07, 0.3),
             ramp(n * dv, 0.1, -2.0),
         ];
+        if causal {
+            inputs.push(
+                (0..n * n)
+                    .map(|p| if p % n <= p / n { 0.0 } else { -1e30 })
+                    .collect(),
+            );
+        }
         let want = g.eval(&inputs, &[y]).remove(0);
 
         // naive: scores and p are materialized n×n

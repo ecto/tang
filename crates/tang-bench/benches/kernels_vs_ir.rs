@@ -134,7 +134,10 @@ fn bench_rmsnorm(c: &mut Criterion) {
             group.bench_function(BenchmarkId::new(name, format!("{batch}x{dim}")), |b| {
                 b.iter(|| {
                     for r in 0..batch {
-                        f(&rows[r * dim..(r + 1) * dim], &mut out[r * dim..(r + 1) * dim]);
+                        f(
+                            &rows[r * dim..(r + 1) * dim],
+                            &mut out[r * dim..(r + 1) * dim],
+                        );
                     }
                     black_box(&out);
                 })
@@ -212,4 +215,66 @@ fn bench_matvec(c: &mut Criterion) {
 }
 
 criterion_group!(benches, bench_swiglu_act, bench_rmsnorm, bench_matvec);
-criterion_main!(benches);
+
+// ---------------------------------------------------------------------------
+// GPU: hand-written fused causal attention vs attention derived from tensor IR
+// ---------------------------------------------------------------------------
+
+mod gpu {
+    use super::*;
+    use tang_bench::ir_gpu::{
+        causal_mask, flash_attention, flash_attention_split, naive_attention, Executable,
+    };
+    use tang_gpu::{kv_attention_fused, GpuDevice, GpuTensor, KernelCache};
+
+    fn random(n: usize, seed: u64) -> Vec<f32> {
+        let mut rng = tang_bench::Rng::new(seed);
+        (0..n).map(|_| rng.f32() * 2.0 - 1.0).collect()
+    }
+
+    pub fn bench_attention(c: &mut Criterion) {
+        let Ok(device) = GpuDevice::new_sync() else {
+            eprintln!("no GPU, skipping kvi_gpu_attention");
+            return;
+        };
+        let mut cache = KernelCache::new();
+        let mut group = c.benchmark_group("kvi_gpu_attention");
+        group.sample_size(20);
+        let d = 64;
+        for &n in &[128usize, 512, 1024] {
+            let (q, k, v) = (random(n * d, 1), random(n * d, 2), random(n * d, 3));
+            let mask = causal_mask(n);
+
+            let qt = GpuTensor::from_slice(&device, &q, &[n, d]);
+            let kt = GpuTensor::from_slice(&device, &k, &[n, d]);
+            let vt = GpuTensor::from_slice(&device, &v, &[n, d]);
+            group.bench_function(BenchmarkId::new("hand", n), |b| {
+                b.iter(|| {
+                    let out =
+                        kv_attention_fused(&device, &mut cache, &qt, &kt, &vt, n, n, 1, 1, d, 0);
+                    cache.flush(&device);
+                    black_box(out.to_vec_flushed(&device, &mut cache));
+                })
+            });
+
+            for (name, (g, y)) in [
+                ("ir_naive", naive_attention(n, d, d)),
+                ("ir_flash", flash_attention(n, d, d)),
+                ("ir_flash_split", flash_attention_split(n, d, d)),
+            ] {
+                let exe = Executable::new(&device, g.to_wgsl(&[y]), &[&q, &k, &v, &mask]);
+                group.bench_function(BenchmarkId::new(name, n), |b| {
+                    b.iter(|| {
+                        exe.run(&device, &mut cache);
+                        cache.flush(&device);
+                        black_box(exe.read(&device, y));
+                    })
+                });
+            }
+        }
+        group.finish();
+    }
+}
+
+criterion_group!(gpu_benches, gpu::bench_attention);
+criterion_main!(benches, gpu_benches);

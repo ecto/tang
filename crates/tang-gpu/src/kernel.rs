@@ -824,6 +824,74 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         self.submit_or_enqueue(device, encoder.finish());
     }
 
+    /// Dispatch a kernel over arbitrary storage buffers.
+    ///
+    /// Binding `i` is `buffers[i]` (read-only unless listed in `writable`);
+    /// the last binding is a uniform of `params`. Launches
+    /// `count.div_ceil(workgroup_size)` workgroups along x.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_buffers(
+        &mut self,
+        device: &GpuDevice,
+        wgsl: &str,
+        buffers: &[&GpuBuffer],
+        writable: &[usize],
+        params: &[u32; 4],
+        count: u32,
+        workgroup_size: u32,
+    ) {
+        let mut bindings: Vec<BindingSpec> = (0..buffers.len())
+            .map(|i| BindingSpec::Storage {
+                read_only: !writable.contains(&i),
+            })
+            .collect();
+        bindings.push(BindingSpec::Uniform);
+        let hash = Self::hash_wgsl(wgsl);
+        let cached = self.get_or_compile_dynamic(device, wgsl, hash, &bindings);
+
+        use wgpu::util::DeviceExt;
+        let params_buf = device
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("tang-gpu params"),
+                contents: bytemuck::cast_slice(params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let mut entries: Vec<wgpu::BindGroupEntry> = buffers
+            .iter()
+            .enumerate()
+            .map(|(i, b)| wgpu::BindGroupEntry {
+                binding: i as u32,
+                resource: b.buffer.as_entire_binding(),
+            })
+            .collect();
+        entries.push(wgpu::BindGroupEntry {
+            binding: buffers.len() as u32,
+            resource: params_buf.as_entire_binding(),
+        });
+        let bind_group = device.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tang-gpu bind group"),
+            layout: &cached.bind_group_layout,
+            entries: &entries,
+        });
+
+        let mut encoder = device
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("tang-gpu dispatch"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("tang-gpu compute"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&cached.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(count.div_ceil(workgroup_size), 1, 1);
+        }
+        self.submit_or_enqueue(device, encoder.finish());
+    }
+
     /// Get or compile a pipeline with an arbitrary binding layout.
     ///
     /// Each `BindingSpec` describes one binding: its type and read-only flag.
