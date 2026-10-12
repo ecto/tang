@@ -5983,7 +5983,6 @@ name = "tang-bench"
 version = "0.1.0"
 dependencies = [
  "criterion",
- "cudarc 0.16.6",
  "glam",
  "metal 0.33.0",
  "nalgebra",
@@ -6032,9 +6031,11 @@ version = "0.1.0"
 dependencies = [
  "approx",
  "bytemuck",
+ "cudarc 0.16.6",
  "pollster",
  "safetensors",
  "tang",
+ "tang-compile",
  "tang-expr",
  "tang-tensor",
  "tang-train",

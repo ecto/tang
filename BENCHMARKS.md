@@ -910,6 +910,52 @@ parallelism) from the algebra, with no op-specific code, and picks per
 chip. It does not yet generate the instruction-level quality of a vendor
 library, and through this backend it cannot reach tensor cores at all.
 
+### Split-K for tiles that cannot fill the device
+
+The training step's matmuls with small outputs and long reductions
+(dx through the 1536-wide MLP, the grouped-head dK/dV over 1536 or 512)
+had 24–72 64×64 blocks for 82 SMs. `cuda_mma_kernel` now splits the
+reduction until there are about 246 blocks (each split keeps ≥ 4 chunks):
+each split stores its partial block to a module-scope buffer, the last
+to arrive (an atomic counter per tile, reset after use) sums the splits
+in fixed order and runs the epilogue. Multi-output tiles whose stored C
+would outgrow the operand stages use the same global path, so their
+shared memory is the stages only — the merged gate/up tile now beats the
+WGSL one instead of losing on occupancy. With that, the tuner keeps all
+19 native kernels in the training step (was 13 at seq 128, 12 at 512).
+
+Per-kernel timing is now the minimum over single event-bracketed
+launches: the 3090 was at 98% from other tenants (time-sliced), and
+batched wall-clock put a ~0.23 ms slice floor under every kernel.
+Kernel times below are contention-free; end-to-end ones are not.
+
+| kernel (seq 512) | before (best of native/WGSL) | split-K |
+|---|---|---|
+| dx, `[512,3,64]` Σ over 1536 | 0.146 ms | 0.044 |
+| dx MLP down, `[512,576]` Σ 1536 | 0.172 | 0.106 |
+| gate/up backward, `[512,576,2]` Σ 1536 | 0.312 | 0.203 |
+| gate/up forward, `[512,1536,2]` Σ 576 | 0.209 | 0.150 |
+| q/k/v/o projections, `[512,192|576]` Σ 576 | 0.050–0.054 | 0.025–0.040 |
+| sum of all 62 kernels | 2.89 | 2.36 |
+| sum of all 62 kernels, seq 128 | 1.34 | 0.83 |
+
+End to end, same lock window (contended; torch slowed too):
+
+| | tang before | tang split-K | PyTorch fp32 | PyTorch TF32 |
+|---|---|---|---|---|
+| block fwd, seq 128 | 1.61 ms | 0.55 | 0.56 | 0.52 |
+| block fwd, seq 512 | 1.60 | 1.22 | 1.27 | 0.92 |
+| block fwd+bwd, seq 128 | 2.87 | 1.59 | 2.38 | — |
+| block fwd+bwd, seq 512 | 5.78 | 4.79 | 3.60 | — |
+
+Every gradient matches the f64 evaluation as before (relative error
+1.5–3e-4 on gradients of magnitude 1e6, identical with split-K off).
+Remaining at seq 512: the materialized online-softmax forward (0.25 ms,
+score from a buffer, no native lowering yet), the attention-backward
+reductions over 512 keys at tile (32, 8, 32) (0.19, 0.13, 0.13 ms, no
+native lowering) — the flash-backward work — and the 512×512 score
+recomputations.
+
 ## Kokoro-shaped ops (M4 Max, Metal, kernel-only)
 
 TTS vocoder ops (Kokoro's iSTFTNet decoder, Vocos-style ConvNeXt) derived
@@ -1430,3 +1476,83 @@ What this shows:
   non-causal). Ragged shapes (n not a multiple of 32, dv not a multiple
   of the 64-column block) take the staged `half4`/gather path with
   barriers.
+
+## Whole-model compilation (spike)
+
+`examples/whole_model.rs [layers] [seq] [wgpu|cuda|cuda-compile|stats]`
+builds N SmolLM2-135M-like blocks (d 576, 9 heads, 3 kv heads, head dim
+64, ff 1536, rope, no biases), an MSE loss, the full backward and an
+AdamW update of all 7N projection weights as **one** `TensorGraph`
+(`tang_bench::ir_model::train_step`), compiles it with the block's pass
+pipeline, lowers it to one program and runs a step as one submission.
+f32 everywhere, seq 128. `scripts/torch_model_bench.py` is the PyTorch
+reference (same model, `AdamW`, CUDA events).
+
+**Memory planning** (`TensorGraph::plan_memory`, `tensor_memplan.rs`):
+buffers get storage slots by liveness over the kernel order, and the
+AdamW writes `p′, m′, v′` go into `p, m, v` when legal (point-for-point
+map, every other reader of the donor already ran; update kernels are
+sunk past the backward kernels that still read the old weight). wgpu
+cannot bind one buffer read-only and read-write in a dispatch, so it
+gets slots but no in-place updates. "Persistent" is params + m + v +
+data; everything else is intermediates (activations, gradients, and the
+naive plan's separate `p′, m′, v′`).
+
+| layers | kernels | persistent | intermediates naive | planned | planned + in place | **peak** naive / planned / + in place | PyTorch peak (fused / foreach AdamW) |
+|---|---|---|---|---|---|---|---|
+| 1  | 79   | 41 MB   | 69 MB   | 44 MB   | 18 MB  | 110 / 85 / 59 MB | — |
+| 4  | 319  | 163 MB  | 276 MB  | 172 MB  | 67 MB  | 439 / 334 / **229 MB** | 239 / 293 MB |
+| 30 | 2399 | 1216 MB | 2076 MB | 1280 MB | 470 MB | 3291 / 2496 / **1685 MB** | 1673 / 2085 MB |
+
+Planning plus in-place updates cuts the step's peak by 49% at 30 layers,
+to PyTorch's fused-AdamW peak. Slots alone barely move the peak (the
+live lower bound over this order is 1215 MB at 30 layers): the separate
+`p′, m′, v′` outputs live to the end, so in place is where the bytes are.
+Kernel order is still `to_wgsl`'s node order; a memory-aware schedule
+(run each weight's update as soon as its gradient exists) is the next
+lever. Graph build + passes + lowering + planning at 30 layers: 0.3 s +
+0.6 s + 0.1 s + 0.03 s.
+
+**Step time.** M4 Max (wgpu, one submission per step) and RTX 3090
+(CUDA, one stream, optionally the whole step captured as one CUDA graph).
+The 3090 was shared — 97% utilized by other tenants for all of these runs
+— so its absolute numbers are inflated; minimum over repeats.
+
+| | 4 layers | 30 layers |
+|---|---|---|
+| M4 wgpu, naive buffers | 11.6 ms | 87.6 ms |
+| M4 wgpu, planned slots | 11.7 ms | 89.4 ms |
+| M4 wgpu, one block's step × N | 3.0 × 4 = 12.0 ms | 3.18 × 30 = 95.4 ms |
+| 3090 CUDA, naive (graph) | 14.7 (13.8) ms | 117.0 (112.5) ms |
+| 3090 CUDA, planned + in place (graph) | 14.7 (13.9) ms | 108.2 (104.8) ms |
+| 3090 CUDA, one block's step × N (graph) | 3.31 (3.36) × 4 = 13.2 ms | 3.44 (3.36) × 30 = 103 ms |
+| 3090 PyTorch eager, AdamW fused fp32 / tf32 | 8.0 / 7.5 ms | 66.7 / 63.0 ms |
+
+One graph per step is 8% faster than N separate block steps on the M4 at
+30 layers and on par on the 3090. CUDA-graph capture saves 4–6% (~0.8 ms
+at 4 layers, ~4 ms at 30 for 319 / 2399 launches): launch overhead is not
+the bottleneck at seq 128; the kernels are (PyTorch is still 1.6× faster,
+mostly cuBLAS GEMMs and its fused optimizer; see "Toward flash backward").
+Planning does not cost time; on CUDA it is slightly faster (fewer pages
+touched). Compile cost is real: 2399 kernels are 2399 distinct sources
+(node numbers differ per layer; 127–188 are distinct up to renaming), so
+the first wgpu run spends 237 s in shader compilation on the M4 and nvrtc
+takes 56 s on all cores of the 3090 host (cached as PTX in `target/tang-ptx`).
+
+**Cross-layer fusion.** The existing passes do fire across block
+boundaries, and the result is a warning. `substitute_maps` sees the
+residual stream `h₁ = h₀ + attn₀ + ffn₀, …` as a chain of maps each read
+point-for-point (recompute factor 1) and splices all of it: the stacked
+forward drops one kernel per boundary (481 vs 30 × 17 = 510), but every
+reader of `h_N` — and of the residual gradient in the backward — now
+recomputes `x + Σ` over all earlier blocks. The widest kernel reads 35
+buffers at 4 layers and 269 at 30 (O(N) reads per kernel, O(N²) traffic);
+wgpu rejects it from 2 layers on (16 storage buffers per stage), and on
+CUDA the 30-layer step is 152 ms instead of 105 ms. `compile_with_barriers`
+keeps each block's output and its gradient materialized (passed to the
+passes as extra outputs); the widest kernel then reads 11 buffers at any
+depth and the step is 30 × (one block's kernels) + 29 (the residual
+gradient between blocks; a lone block never computes `dx`). So: no net
+kernels saved across layers once the stream is materialized, and a cost
+model for map substitution needs a fan-in bound, not just the recompute
+factor.

@@ -65,12 +65,20 @@
 
 pub mod backward;
 pub mod buffer;
+#[cfg(feature = "cuda")]
+pub mod cuda;
+/// The driver bindings tang-gpu's CUDA backend is built on, for code that
+/// needs the driver directly (CUDA graph capture in tang-bench's planned
+/// whole-model runner).
+#[cfg(feature = "cuda")]
+pub use cudarc;
 pub mod device;
 pub mod kernel;
 pub mod llm;
 pub mod matmul;
 pub mod module;
 pub mod nn;
+pub mod program;
 pub mod realize;
 pub mod reduce;
 pub mod safetensors;
@@ -91,6 +99,7 @@ pub use nn::{
     add_tensors, bias_add, gelu, relu, relu_backward, softmax, GpuAttention, GpuLayerNorm,
     GpuTransformerBlock,
 };
+pub use program::{BackendKind, BufferPlan, Program, Runtime, TuneReport};
 pub use realize::{map_elementwise, map_elementwise_multi};
 pub use reduce::{reduce_max, reduce_mean, reduce_sum, reduce_sum_all};
 pub use safetensors::{load_safetensors, save_safetensors};

@@ -1,20 +1,30 @@
-//! The transformer block and the matmul candidates on CUDA: the derived
-//! program (`to_cuda`: wmma tensor-core tiles + transpiled WGSL) run
-//! through the driver, checked against the CPU evaluation and timed.
-//! Needs `--features cuda` and an NVIDIA GPU.
-#[cfg(not(feature = "cuda"))]
+//! The transformer block and the matmul candidates through tang-gpu's
+//! program runner. With `--features cuda` on an NVIDIA GPU that is CUDA
+//! (`to_cuda`: wmma tensor-core tiles + transpiled WGSL, tuned per
+//! kernel); otherwise wgpu (`TANG_BACKEND=wgpu` forces it). Checked
+//! against the CPU evaluation and timed.
 fn main() {
-    eprintln!("build with --features cuda");
-}
-
-#[cfg(feature = "cuda")]
-fn main() {
-    use cudarc::driver::CudaContext;
     use tang_bench::ir_block::{compiled_block, train_loss_graph, BlockDims};
-    use tang_bench::ir_cuda::CudaExecutable;
     use tang_compile::tensor::TensorGraph;
+    use tang_gpu::program::{Program, Runtime};
 
-    let ctx = CudaContext::new(0).expect("cuda");
+    let rt = Runtime::select().expect("gpu");
+    println!("backend: {:?} — {}", rt.kind(), rt.name());
+    let tuning = |name: String| {
+        std::path::PathBuf::from(format!(
+            "{}/target/tang-tuning-{name}.txt",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+    };
+    // order-sensitive checksum of a result, for comparing runs bit for bit
+    let digest = |v: &[f32]| -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for x in v {
+            x.to_bits().hash(&mut h);
+        }
+        h.finish()
+    };
     let mut rng = tang_bench::Rng::new(7);
     let mut rand = |n: usize| -> Vec<f32> { (0..n).map(|_| rng.f32() * 2.0 - 1.0).collect() };
 
@@ -26,9 +36,9 @@ fn main() {
         let c = g.matmul(a, b).unwrap();
         g.schedule_auto(&[c]);
         let (av, bv) = (rand(m * k), rand(k * n));
-        let exe = CudaExecutable::new(&ctx, g.to_cuda(&[c]), &[&av, &bv]);
+        let exe = Program::compile(&rt, &g, &[c], &[&av, &bv]);
         let native = exe.program.kernels[0].source.contains("wmma");
-        let ms = exe.time(50);
+        let ms = exe.time(&rt, 50);
         println!("matmul {m}x{k}x{n}: {ms:.3} ms (native wmma: {native})");
     }
 
@@ -46,7 +56,7 @@ fn main() {
             ff_dim: 1536,
         };
         let (g, y) = compiled_block(&dims);
-        let program = g.to_cuda(&[y]);
+        let program = rt.lower(&g, &[y]);
         let n_native = program
             .kernels
             .iter()
@@ -66,10 +76,21 @@ fn main() {
             .collect();
         let refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
         drop(program);
-        let (exe, kept) = CudaExecutable::new_tuned(&ctx, &g, &[y], &refs);
-        println!("block seq={seq}: tuned, {kept} of {n_native} native kernels kept");
-        exe.run();
-        let got = exe.read(y);
+        let (exe, report) = Program::tuned(
+            &rt,
+            &g,
+            &[y],
+            &refs,
+            Some(&tuning(format!("cuda-block-{seq}"))),
+        );
+        println!(
+            "block seq={seq}: tuned{}, {} of {n_native} native kernels kept",
+            if report.from_cache { " (cached)" } else { "" },
+            report.native_kept
+        );
+        exe.run(&rt);
+        let got = exe.read(&rt, y);
+        println!("block seq={seq}: output digest {:016x}", digest(&got));
         if seq == 128 {
             let f64s: Vec<Vec<f64>> = inputs
                 .iter()
@@ -84,7 +105,7 @@ fn main() {
             let scale = want.iter().map(|y| y.abs()).fold(0.0, f64::max);
             println!("block seq={seq}: max err {err:.2e} (max |ref| {scale:.2})");
         }
-        let ms = exe.time(50);
+        let ms = exe.time(&rt, 50);
         println!(
             "block seq={seq}: fwd {ms:.3} ms ({} kernels, {n_native} on tensor cores)",
             exe.program.kernels.len()
@@ -93,7 +114,7 @@ fn main() {
             let node = &g.nodes()[k.node.index()];
             println!(
                 "  {:7.3} ms  node {:?} shape {:?} split {} tile {:?} {}",
-                exe.time_kernel(i, 20),
+                exe.time_kernel(&rt, i, 20),
                 k.node,
                 node.shape,
                 node.split,
@@ -115,7 +136,7 @@ fn main() {
         let (tg, outs) = tg.merge_reduce_dims(&outs);
         let (mut tg, outs) = tg.split_reduce_dims(&outs);
         tg.schedule_auto(&outs);
-        let program = tg.to_cuda(&outs);
+        let program = rt.lower(&tg, &outs);
         let n_native = program
             .kernels
             .iter()
@@ -126,13 +147,30 @@ fn main() {
         let mut refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
         refs.push(&target);
         drop(program);
-        let (train, kept) = CudaExecutable::new_tuned(&ctx, &tg, &outs, &refs);
-        let ms = train.time(50);
+        let (train, report) = Program::tuned(
+            &rt,
+            &tg,
+            &outs,
+            &refs,
+            Some(&tuning(format!("cuda-train-{seq}"))),
+        );
+        let kept = report.native_kept;
+        train.run(&rt);
+        let mut all = Vec::new();
+        for &o in &outs {
+            all.extend(train.read(&rt, o));
+        }
+        println!(
+            "block seq={seq}: train loss {:.6}, outputs digest {:016x}",
+            all[0],
+            digest(&all)
+        );
+        let ms = train.time(&rt, 50);
         println!(
             "block seq={seq}: fwd+bwd {ms:.3} ms ({n_kernels} kernels, {kept} of {n_native} native kept)"
         );
         let mut slow: Vec<(f64, usize)> = (0..n_kernels)
-            .map(|i| (train.time_kernel(i, 10), i))
+            .map(|i| (train.time_kernel(&rt, i, 10), i))
             .collect();
         slow.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
         let total: f64 = slow.iter().map(|x| x.0).sum();

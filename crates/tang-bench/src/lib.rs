@@ -261,6 +261,9 @@ pub fn random_spd_flat(size: usize) -> Vec<f64> {
 #[path = "ir_msl.rs"]
 pub mod ir_msl;
 
+/// Whole-model compilation: N blocks, loss, backward and AdamW as one graph.
+pub mod ir_model;
+
 pub mod ir_gpu {
     use tang::Scalar;
     use tang_compile::tensor::precision::{f16_bits, f16_from_bits};
@@ -2065,198 +2068,18 @@ pub mod ir_gpu {
     }
 }
 
-/// A whole transformer block derived from tensor IR, mirroring the
-/// hand-written `gpu_transformer_layer` prefill path in `gpu_inference`.
-
 /// Running a [`TensorGraph::to_cuda`](tang_compile::tensor::TensorGraph::to_cuda)
-/// program on an NVIDIA GPU through the CUDA driver (cudarc): nvrtc
-/// compiles each kernel — wmma tensor-core tiles and transpiled WGSL
-/// alike — and the kernels launch in program order on one stream.
+/// program on an NVIDIA GPU. The executor now lives in tang-gpu
+/// ([`tang_gpu::program`]): one `Program` API for wgpu and CUDA, with
+/// `Runtime::select` picking CUDA when it is available.
 #[cfg(feature = "cuda")]
 pub mod ir_cuda {
-    use std::sync::Arc;
-
-    use cudarc::driver::{
-        CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
-    };
-    use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
-    use tang_compile::tensor::wgsl::WgslProgram;
-    use tang_compile::tensor::TensorId;
-
-    /// `#define TANG_SMEM n` in a kernel's source: its dynamic shared
-    /// memory in bytes (0 when absent).
-    fn dynamic_smem(src: &str) -> u32 {
-        src.lines()
-            .find_map(|l| l.strip_prefix("#define TANG_SMEM "))
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0)
-    }
-
-    pub struct CudaExecutable {
-        pub program: WgslProgram,
-        pub stream: Arc<CudaStream>,
-        buffers: Vec<CudaSlice<f32>>,
-        functions: Vec<CudaFunction>,
-    }
-
-    impl CudaExecutable {
-        /// Compile every kernel and allocate every buffer; inputs uploaded.
-        pub fn new(ctx: &Arc<CudaContext>, program: WgslProgram, inputs: &[&[f32]]) -> Self {
-            let stream = ctx.default_stream();
-            let buffers = program
-                .buffers
-                .iter()
-                .map(|b| match b.input {
-                    Some(k) => stream.memcpy_stod(inputs[k]).expect("upload"),
-                    None => stream.alloc_zeros::<f32>(b.len.max(1)).expect("alloc"),
-                })
-                .collect();
-            let include = std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".into());
-            let functions = program
-                .kernels
-                .iter()
-                .map(|k| {
-                    let opts = CompileOptions {
-                        arch: Some("sm_86"),
-                        include_paths: vec![format!("{include}/include")],
-                        ..Default::default()
-                    };
-                    let ptx = compile_ptx_with_opts(&k.source, opts)
-                        .unwrap_or_else(|e| panic!("nvrtc: {e:?}\n{}", k.source));
-                    let module = ctx.load_module(ptx).expect("load module");
-                    let f = module
-                        .load_function(tang_compile::tensor::cuda::CUDA_ENTRY)
-                        .expect("entry");
-                    // kernels that want more dynamic shared memory than the
-                    // default 48 KB say so in their source
-                    let smem = dynamic_smem(&k.source);
-                    if smem > 48 * 1024 {
-                        f.set_attribute(
-                            cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                            smem as i32,
-                        )
-                        .expect("smem attribute");
-                    }
-                    f
-                })
-                .collect();
-            Self {
-                program,
-                stream,
-                buffers,
-                functions,
-            }
-        }
-
-        /// Compile `graph`'s CUDA program twice — tensor-core lowerings on
-        /// and off — and keep, per kernel, whichever runs faster on this
-        /// device. Returns the executable and how many kernels kept the
-        /// native version.
-        pub fn new_tuned(
-            ctx: &Arc<CudaContext>,
-            graph: &tang_compile::tensor::TensorGraph,
-            outputs: &[TensorId],
-            inputs: &[&[f32]],
-        ) -> (Self, usize) {
-            let native = Self::new(ctx, graph.to_cuda_with(outputs, true), inputs);
-            let plain = Self::new(ctx, graph.to_cuda_with(outputs, false), inputs);
-            // every kernel's inputs exist once a whole run has gone through
-            native.run();
-            plain.run();
-            let mut exe = native;
-            let mut kept = 0;
-            for i in 0..exe.program.kernels.len() {
-                if exe.program.kernels[i].source == plain.program.kernels[i].source {
-                    continue;
-                }
-                let (tn, tp) = (exe.time_kernel(i, 10), plain.time_kernel(i, 10));
-                if tp < tn {
-                    exe.program.kernels[i].source = plain.program.kernels[i].source.clone();
-                    exe.program.kernels[i].count = plain.program.kernels[i].count;
-                    exe.program.kernels[i].workgroup_size = plain.program.kernels[i].workgroup_size;
-                    exe.functions[i] = plain.functions[i].clone();
-                } else {
-                    kept += 1;
-                }
-            }
-            (exe, kept)
-        }
-
-        fn index(&self, t: TensorId) -> usize {
-            let t = self.program.storage(t);
-            self.program
-                .buffers
-                .iter()
-                .position(|b| b.node == t)
-                .expect("buffer")
-        }
-
-        /// Launch every kernel in order (asynchronously on the stream).
-        pub fn run(&self) {
-            for i in 0..self.program.kernels.len() {
-                self.run_kernel(i);
-            }
-        }
-
-        /// Launch kernel `i` only.
-        pub fn run_kernel(&self, i: usize) {
-            for (k, f) in std::iter::once((&self.program.kernels[i], &self.functions[i])) {
-                let groups = k.count.div_ceil(k.workgroup_size);
-                let cfg = LaunchConfig {
-                    grid_dim: (groups, 1, 1),
-                    block_dim: (k.workgroup_size, 1, 1),
-                    shared_mem_bytes: dynamic_smem(&k.source),
-                };
-                let mut launch = self.stream.launch_builder(f);
-                for t in &k.reads {
-                    launch.arg(&self.buffers[self.index(*t)]);
-                }
-                launch.arg(&self.buffers[self.index(k.node)]);
-                launch.arg(&k.points);
-                unsafe { launch.launch(cfg) }.expect("launch");
-            }
-        }
-
-        pub fn read(&self, t: TensorId) -> Vec<f32> {
-            self.stream.synchronize().expect("sync");
-            self.stream
-                .memcpy_dtov(&self.buffers[self.index(t)])
-                .expect("download")
-        }
-
-        /// Milliseconds per run over `iters` launches of the whole program
-        /// (wall clock around a stream sync; launches are asynchronous).
-        pub fn time(&self, iters: usize) -> f64 {
-            self.time_with(iters, |e| e.run())
-        }
-
-        /// Milliseconds per launch of kernel `i` alone.
-        pub fn time_kernel(&self, i: usize, iters: usize) -> f64 {
-            self.time_with(iters, |e| e.run_kernel(i))
-        }
-
-        /// The minimum over five batches of `iters` launches: a shared GPU
-        /// (another tenant) only ever adds time, so the minimum is the
-        /// closest estimate of the kernel's own cost.
-        fn time_with(&self, iters: usize, f: impl Fn(&Self)) -> f64 {
-            for _ in 0..3 {
-                f(self);
-            }
-            self.stream.synchronize().expect("sync");
-            (0..5)
-                .map(|_| {
-                    let t = std::time::Instant::now();
-                    for _ in 0..iters {
-                        f(self);
-                    }
-                    self.stream.synchronize().expect("sync");
-                    t.elapsed().as_secs_f64() * 1e3 / iters as f64
-                })
-                .fold(f64::INFINITY, f64::min)
-        }
-    }
+    pub use tang_gpu::cuda::CudaDevice;
+    pub use tang_gpu::program::{Program, Runtime, TuneReport};
 }
 
+/// A whole transformer block derived from tensor IR, mirroring the
+/// hand-written `gpu_transformer_layer` prefill path in `gpu_inference`.
 pub mod ir_block {
     use tang::Scalar;
     use tang_compile::tensor::{numel, Arg, Form, Monoid, TensorGraph, TensorId, View};
@@ -2445,6 +2268,22 @@ pub mod ir_block {
     }
 
     pub fn transformer_block_nodes(dims: &BlockDims) -> (TensorGraph, BlockNodes) {
+        let mut g = TensorGraph::new();
+        let x = g.input(&[dims.seq, dims.d_model]);
+        let (nodes, _) = block_into(&mut g, x, None, dims);
+        (g, nodes)
+    }
+
+    /// Append one block reading `x: [seq, d_model]` to `g`. Its weights
+    /// become new inputs (`INPUTS` order after `x`), and so do the rope
+    /// tables unless `tables` passes shared ones. Returns the block's
+    /// nodes and weights `[wq, wk, wv, wo, w_gate, w_up, w_down]`.
+    pub fn block_into(
+        g: &mut TensorGraph,
+        x: TensorId,
+        tables: Option<(TensorId, TensorId)>,
+        dims: &BlockDims,
+    ) -> (BlockNodes, [TensorId; 7]) {
         let BlockDims {
             seq,
             kv_len,
@@ -2463,8 +2302,6 @@ pub mod ir_block {
         let half = head_dim / 2;
         let kv_dim = n_kv_heads * head_dim;
 
-        let mut g = TensorGraph::new();
-        let x = g.input(&[seq, d_model]);
         let wq = g.input(&[d_model, d_model]);
         let bq = g.input(&[d_model]);
         let wk = g.input(&[kv_dim, d_model]);
@@ -2479,15 +2316,15 @@ pub mod ir_block {
         let b_up = g.input(&[ff_dim]);
         let w_down = g.input(&[d_model, ff_dim]);
         let b_down = g.input(&[d_model]);
-        let cos = g.input(&[seq, half]);
-        let sin = g.input(&[seq, half]);
+        let (cos, sin) = tables.unwrap_or_else(|| (g.input(&[seq, half]), g.input(&[seq, half])));
+        let weights = [wq, wk, wv, wo, w_gate, w_up, w_down];
 
         let caches = decode.then(|| (g.input(&[kv_len, kv_dim]), g.input(&[kv_len, kv_dim])));
 
-        let normed = rmsnorm(&mut g, x);
-        let q = linear(&mut g, normed, wq, b(bq));
+        let normed = rmsnorm(g, x);
+        let q = linear(g, normed, wq, b(bq));
         let scale = 1.0 / (head_dim as f64).sqrt();
-        let (qe, qo) = rope_split(&mut g, q, n_heads, head_dim, cos, sin, scale, rope);
+        let (qe, qo) = rope_split(g, q, n_heads, head_dim, cos, sin, scale, rope);
         let (ke, ko, v) = match caches {
             // cache rows are already rotated: split even/odd by view only
             Some((k_cache, v_cache)) => {
@@ -2509,9 +2346,9 @@ pub mod ir_block {
                 (halves[0], halves[1], v_cache)
             }
             None => {
-                let k = linear(&mut g, normed, wk, b(bk));
-                let v = linear(&mut g, normed, wv, b(bv));
-                let (ke, ko) = rope_split(&mut g, k, n_kv_heads, head_dim, cos, sin, 1.0, rope);
+                let k = linear(g, normed, wk, b(bk));
+                let v = linear(g, normed, wv, b(bv));
+                let (ke, ko) = rope_split(g, k, n_kv_heads, head_dim, cos, sin, 1.0, rope);
                 (ke, ko, v)
             }
         };
@@ -2551,7 +2388,7 @@ pub mod ir_block {
                 |a| vec![a[0] * a[1] + a[2] * a[3]],
             )
             .unwrap();
-        let mask = super::ir_gpu::causal_mask_graph(&mut g, seq, kv_len);
+        let mask = super::ir_gpu::causal_mask_graph(g, seq, kv_len);
         let r4 = 4;
         let masked = g
             .comp(
@@ -2665,18 +2502,17 @@ pub mod ir_block {
             proj
         };
         let res1 = g.map(&[x, bob], |a| a[0] + a[1]).unwrap();
-        let normed2 = rmsnorm(&mut g, res1);
-        let gate = linear(&mut g, normed2, w_gate, b(b_gate));
-        let up = linear(&mut g, normed2, w_up, b(b_up));
+        let normed2 = rmsnorm(g, res1);
+        let gate = linear(g, normed2, w_gate, b(b_gate));
+        let up = linear(g, normed2, w_up, b(b_up));
         let act = g
             .map(&[gate, up], |a| {
                 a[0] / (ExprId::from_f64(1.0) + (-a[0]).exp()) * a[1]
             })
             .unwrap();
-        let ffn = linear(&mut g, act, w_down, b(b_down));
+        let ffn = linear(g, act, w_down, b(b_down));
         let out = g.map(&[res1, ffn], |a| a[0] + a[1]).unwrap();
         (
-            g,
             BlockNodes {
                 normed,
                 q,
@@ -2685,6 +2521,7 @@ pub mod ir_block {
                 proj: bob,
                 out,
             },
+            weights,
         )
     }
 
