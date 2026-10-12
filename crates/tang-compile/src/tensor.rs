@@ -1904,30 +1904,25 @@ impl TensorGraph {
         let live = self.live(outputs);
         let n = self.nodes.len();
         let is_output = |i: usize| outputs.iter().any(|o| o.n() == i);
-        // (consumer, arg index) per producer, when unique
-        let mut reader: Vec<Option<(usize, usize)>> = vec![None; n];
-        let mut readers: Vec<usize> = vec![0; n];
+        // (consumer, arg index) pairs per producer; a reshape reader
+        // pins the layout
+        let mut readers: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
+        let mut pinned = vec![false; n];
         for i in (0..n).filter(|&i| live[i]) {
             match &self.nodes[i].op {
                 Op::Comp(c) => {
                     for (k, a) in c.args.iter().enumerate() {
-                        readers[a.src.n()] += 1;
-                        reader[a.src.n()] = Some((i, k));
+                        readers[a.src.n()].push((i, k));
                     }
                 }
-                Op::Reshape(src) => readers[src.n()] += 2,
+                Op::Reshape(src) => pinned[src.n()] = true,
                 _ => {}
             }
         }
-        for p in (0..n).filter(|&p| live[p] && !is_output(p) && readers[p] == 1) {
-            let Some(pc) = self.comp_at(p) else { continue };
-            let Some((ci, k)) = reader[p] else { continue };
-            let cc = self.comp_at(ci).unwrap();
-            let view = &cc.args[k].view;
-            let kp = pc.points().len();
-            let kc = cc.points().len();
-            // which consumer dim each producer point dim is picked from
-            let picks: Option<Vec<Option<usize>>> = view.forms[..kp]
+        // which consumer dim each producer point dim is picked from, when
+        // the view is a pick
+        let picks_of = |view: &View, kp: usize| -> Option<Vec<Option<usize>>> {
+            view.forms[..kp]
                 .iter()
                 .map(|f| {
                     if f.coefs.iter().all(|&c| c == 0) {
@@ -1939,8 +1934,34 @@ impl TensorGraph {
                         && f.coefs.iter().filter(|&&c| c != 0).count() == 1)
                         .then_some(Some(d))
                 })
-                .collect();
-            let Some(picks) = picks else { continue };
+                .collect()
+        };
+        for p in
+            (0..n).filter(|&p| live[p] && !is_output(p) && !pinned[p] && !readers[p].is_empty())
+        {
+            let Some(pc) = self.comp_at(p) else { continue };
+            let kp = pc.points().len();
+            // every reader must read by a pick (so its forms can follow a
+            // permutation); the layout follows the reader that reduces
+            // over the most of the producer's dims
+            let mut best: Option<(usize, Vec<Option<usize>>, usize)> = None;
+            let mut all_picks = true;
+            for &(ci, k) in &readers[p] {
+                let cc = self.comp_at(ci).unwrap();
+                let Some(picks) = picks_of(&cc.args[k].view, kp) else {
+                    all_picks = false;
+                    break;
+                };
+                let kc = cc.points().len();
+                let n_red = picks.iter().filter(|s| s.is_some_and(|s| s >= kc)).count();
+                if best.as_ref().is_none_or(|b| n_red > b.0) {
+                    best = Some((n_red, picks, kc));
+                }
+            }
+            if !all_picks {
+                continue;
+            }
+            let Some((_, picks, kc)) = best else { continue };
             let mut order: Vec<usize> = (0..kp)
                 .filter(|&d| picks[d].is_some_and(|s| s < kc))
                 .collect();
@@ -1970,16 +1991,18 @@ impl TensorGraph {
                 }
             }
             g.nodes[p].shape = pm.out.clone();
-            // consumer: its forms into the producer follow the new dim order
-            let Op::Comp(cm) = &mut g.nodes[ci].op else {
-                unreachable!()
-            };
-            let forms: Vec<Form> = order
-                .iter()
-                .map(|&d| cm.args[k].view.forms[d].clone())
-                .chain(cm.args[k].view.forms[kp..].iter().cloned())
-                .collect();
-            cm.args[k].view = View { forms };
+            // consumers: their forms into the producer follow the new order
+            for &(ci, k) in &readers[p] {
+                let Op::Comp(cm) = &mut g.nodes[ci].op else {
+                    unreachable!()
+                };
+                let forms: Vec<Form> = order
+                    .iter()
+                    .map(|&d| cm.args[k].view.forms[d].clone())
+                    .chain(cm.args[k].view.forms[kp..].iter().cloned())
+                    .collect();
+                cm.args[k].view = View { forms };
+            }
         }
         (g, outputs.to_vec())
     }

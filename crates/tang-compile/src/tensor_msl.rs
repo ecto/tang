@@ -33,22 +33,33 @@ const THREADS: usize = 128;
 const PAD: usize = 4;
 
 /// An operand's flat address as an affine form over the comp's space.
+#[derive(Clone)]
 pub(super) struct Addr {
     pub offset: i64,
     pub coefs: Vec<i64>,
+}
+
+/// One product of the bilinear body: buffers (storage nodes) of the two
+/// operands and their addresses over the reduction's space; A has no
+/// coefficient on `dx`, B none on `dy`.
+pub(super) struct Term {
+    pub buf_a: usize,
+    pub addr_a: Addr,
+    pub buf_b: usize,
+    pub addr_b: Addr,
 }
 
 /// A matmul-shaped tile (see [`TensorGraph::bilinear_tile`]).
 pub(super) struct Bilinear {
     pub red_node: usize,
     pub epilogue: bool,
-    /// buffers (storage nodes) of the two operands
+    /// the first term (the Metal lowering handles one)
     pub buf_a: usize,
     pub buf_b: usize,
-    /// their addresses over the reduction's space; A has no coefficient
-    /// on `dx`, B none on `dy`
     pub addr_a: Addr,
     pub addr_b: Addr,
+    /// every term of the sum
+    pub terms: Vec<Term>,
     pub pts: Vec<usize>,
     /// tile axes: columns, rows; the remaining point dims are `others`
     pub dx: usize,
@@ -104,15 +115,26 @@ impl TensorGraph {
         if c.points().len() != rc.points().len() {
             return None;
         }
-        // body: exactly a product of two leaf reads
+        // body: a sum of products of two leaf reads (several terms when
+        // an operand is split, e.g. rope's even/odd halves)
         let nodes = rc.body.nodes_slice();
-        let (va, vb) = match nodes[rc.body_outs[0].index() as usize] {
-            Node::Mul(x, y) => match (nodes[x.index() as usize], nodes[y.index() as usize]) {
-                (Node::Var(p), Node::Var(q)) => (p as usize, q as usize),
-                _ => return None,
-            },
-            _ => return None,
-        };
+        fn products(nodes: &[Node], e: tang_expr::ExprId, out: &mut Vec<(usize, usize)>) -> bool {
+            match nodes[e.index() as usize] {
+                Node::Add(a, b) => products(nodes, a, out) && products(nodes, b, out),
+                Node::Mul(x, y) => match (nodes[x.index() as usize], nodes[y.index() as usize]) {
+                    (Node::Var(p), Node::Var(q)) => {
+                        out.push((p as usize, q as usize));
+                        true
+                    }
+                    _ => false,
+                },
+                _ => false,
+            }
+        }
+        let mut pairs = Vec::new();
+        if !products(nodes, rc.body_outs[0], &mut pairs) || pairs.is_empty() {
+            return None;
+        }
         let pts = fixed(rc.points());
         let k_total = rc.red[0].n();
         let rank = rc.rank();
@@ -122,20 +144,29 @@ impl TensorGraph {
         let dy = super::tile::largest_other(&pts, dx)?;
         let others: Vec<usize> = (0..pts.len()).filter(|&d| d != dx && d != dy).collect();
         let (n, m) = (pts[dx], pts[dy]);
-        let addr_a = self.flat_addr(&rc.args[va], rank);
-        let addr_b = self.flat_addr(&rc.args[vb], rank);
-        // A varies along rows (dy) and k, B along cols (dx) and k
-        let (a_arg, b_arg, addr_a, addr_b) = if addr_a.coefs[dx] == 0 && addr_b.coefs[dy] == 0 {
-            (va, vb, addr_a, addr_b)
-        } else if addr_a.coefs[dy] == 0 && addr_b.coefs[dx] == 0 {
-            (vb, va, addr_b, addr_a)
-        } else {
-            return None;
-        };
         let storage = |j: usize| self.storage(TensorId(j as u32)).n();
         let is_buffer = |j: usize| reads.contains(&storage(j));
-        if !is_buffer(rc.args[a_arg].src.n()) || !is_buffer(rc.args[b_arg].src.n()) {
-            return None;
+        let mut terms = Vec::with_capacity(pairs.len());
+        for (va, vb) in pairs {
+            let addr_a = self.flat_addr(&rc.args[va], rank);
+            let addr_b = self.flat_addr(&rc.args[vb], rank);
+            // A varies along rows (dy) and k, B along cols (dx) and k
+            let (a_arg, b_arg, addr_a, addr_b) = if addr_a.coefs[dx] == 0 && addr_b.coefs[dy] == 0 {
+                (va, vb, addr_a, addr_b)
+            } else if addr_a.coefs[dy] == 0 && addr_b.coefs[dx] == 0 {
+                (vb, va, addr_b, addr_a)
+            } else {
+                return None;
+            };
+            if !is_buffer(rc.args[a_arg].src.n()) || !is_buffer(rc.args[b_arg].src.n()) {
+                return None;
+            }
+            terms.push(Term {
+                buf_a: storage(rc.args[a_arg].src.n()),
+                addr_a,
+                buf_b: storage(rc.args[b_arg].src.n()),
+                addr_b,
+            });
         }
         // epilogue args: the reduction, or buffers read at affine addresses
         if epilogue {
@@ -148,10 +179,11 @@ impl TensorGraph {
         Some(Bilinear {
             red_node,
             epilogue,
-            buf_a: storage(rc.args[a_arg].src.n()),
-            buf_b: storage(rc.args[b_arg].src.n()),
-            addr_a,
-            addr_b,
+            buf_a: terms[0].buf_a,
+            buf_b: terms[0].buf_b,
+            addr_a: terms[0].addr_a.clone(),
+            addr_b: terms[0].addr_b.clone(),
+            terms,
             pts,
             dx,
             dy,
@@ -171,6 +203,9 @@ impl TensorGraph {
         let (LDA, LDB, LDC) = (CHUNK + PAD, BLOCK + PAD, BLOCK + PAD);
         let c = self.comp_at(root)?;
         let t = self.bilinear_tile(root, reads)?;
+        if t.terms.len() != 1 {
+            return None;
+        }
         let Bilinear {
             red_node,
             epilogue,
@@ -186,6 +221,7 @@ impl TensorGraph {
             n,
             k_total,
             kdim,
+            ..
         } = t;
         let storage = |j: usize| self.storage(TensorId(j as u32)).n();
         let tiles_x = n.div_ceil(BLOCK);
