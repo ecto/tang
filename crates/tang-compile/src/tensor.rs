@@ -38,6 +38,8 @@ use std::collections::HashMap;
 use tang::Scalar;
 use tang_expr::{trace, ExprGraph, ExprId, Node};
 
+#[path = "tensor_grad.rs"]
+mod grad;
 #[path = "tensor_tile.rs"]
 mod tile;
 #[path = "tensor_wgsl.rs"]
@@ -367,7 +369,7 @@ impl std::fmt::Display for ShapeError {
 
 impl std::error::Error for ShapeError {}
 
-fn err<T>(msg: impl Into<String>) -> Result<T, ShapeError> {
+pub(super) fn err<T>(msg: impl Into<String>) -> Result<T, ShapeError> {
     Err(ShapeError(msg.into()))
 }
 
@@ -1231,7 +1233,12 @@ fn indices(shape: &[usize]) -> impl Iterator<Item = Vec<usize>> + '_ {
 }
 
 /// Copy the subgraph under `outs` into `dst`, substituting `Var(i)` with `vars[i]`.
-fn replay(src: &ExprGraph, outs: &[ExprId], vars: &[ExprId], dst: &mut ExprGraph) -> Vec<ExprId> {
+pub(super) fn replay(
+    src: &ExprGraph,
+    outs: &[ExprId],
+    vars: &[ExprId],
+    dst: &mut ExprGraph,
+) -> Vec<ExprId> {
     let nodes = src.nodes_slice();
     let last = outs.iter().map(|o| o.index()).max().unwrap_or(0) as usize;
     let mut map: Vec<ExprId> = Vec::with_capacity(last + 1);
