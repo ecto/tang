@@ -547,7 +547,8 @@ pub mod ir_gpu {
         let (g, outs) = g.eliminate_common(&outs);
         let (g, outs) = g.merge_siblings(&outs);
         let (g, outs) = g.relayout(&outs);
-        let (mut g, outs) = g.merge_reduce_dims(&outs);
+        let (g, outs) = g.merge_reduce_dims(&outs);
+        let (mut g, outs) = g.split_reduce_dims(&outs);
         g.schedule_auto(&outs);
         (g, outs[0])
     }
@@ -2147,6 +2148,40 @@ pub mod ir_cuda {
             }
         }
 
+        /// Compile `graph`'s CUDA program twice — tensor-core lowerings on
+        /// and off — and keep, per kernel, whichever runs faster on this
+        /// device. Returns the executable and how many kernels kept the
+        /// native version.
+        pub fn new_tuned(
+            ctx: &Arc<CudaContext>,
+            graph: &tang_compile::tensor::TensorGraph,
+            outputs: &[TensorId],
+            inputs: &[&[f32]],
+        ) -> (Self, usize) {
+            let native = Self::new(ctx, graph.to_cuda_with(outputs, true), inputs);
+            let plain = Self::new(ctx, graph.to_cuda_with(outputs, false), inputs);
+            // every kernel's inputs exist once a whole run has gone through
+            native.run();
+            plain.run();
+            let mut exe = native;
+            let mut kept = 0;
+            for i in 0..exe.program.kernels.len() {
+                if exe.program.kernels[i].source == plain.program.kernels[i].source {
+                    continue;
+                }
+                let (tn, tp) = (exe.time_kernel(i, 10), plain.time_kernel(i, 10));
+                if tp < tn {
+                    exe.program.kernels[i].source = plain.program.kernels[i].source.clone();
+                    exe.program.kernels[i].count = plain.program.kernels[i].count;
+                    exe.program.kernels[i].workgroup_size = plain.program.kernels[i].workgroup_size;
+                    exe.functions[i] = plain.functions[i].clone();
+                } else {
+                    kept += 1;
+                }
+            }
+            (exe, kept)
+        }
+
         fn index(&self, t: TensorId) -> usize {
             let t = self.program.storage(t);
             self.program
@@ -2200,17 +2235,24 @@ pub mod ir_cuda {
             self.time_with(iters, |e| e.run_kernel(i))
         }
 
+        /// The minimum over five batches of `iters` launches: a shared GPU
+        /// (another tenant) only ever adds time, so the minimum is the
+        /// closest estimate of the kernel's own cost.
         fn time_with(&self, iters: usize, f: impl Fn(&Self)) -> f64 {
             for _ in 0..3 {
                 f(self);
             }
             self.stream.synchronize().expect("sync");
-            let t = std::time::Instant::now();
-            for _ in 0..iters {
-                f(self);
-            }
-            self.stream.synchronize().expect("sync");
-            t.elapsed().as_secs_f64() * 1e3 / iters as f64
+            (0..5)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    for _ in 0..iters {
+                        f(self);
+                    }
+                    self.stream.synchronize().expect("sync");
+                    t.elapsed().as_secs_f64() * 1e3 / iters as f64
+                })
+                .fold(f64::INFINITY, f64::min)
         }
     }
 }
@@ -2704,7 +2746,8 @@ pub mod ir_block {
         let (g, outs) = g.eliminate_common(&outs);
         let (g, outs) = g.merge_siblings(&outs);
         let (g, outs) = g.relayout(&outs);
-        let (mut g, outs) = g.merge_reduce_dims(&outs);
+        let (g, outs) = g.merge_reduce_dims(&outs);
+        let (mut g, outs) = g.split_reduce_dims(&outs);
         g.schedule_auto(&outs);
         (g, outs[0])
     }
@@ -3031,7 +3074,8 @@ pub mod ir_block_gpu {
         let (g, outs) = g.eliminate_common(&outs);
         let (g, outs) = g.merge_siblings(&outs);
         let (g, outs) = g.relayout(&outs);
-        let (mut g, outs) = g.merge_reduce_dims(&outs);
+        let (g, outs) = g.merge_reduce_dims(&outs);
+        let (mut g, outs) = g.split_reduce_dims(&outs);
         g.schedule_auto(&outs);
         let inputs: Vec<&[f32]> = p.cpu.iter().map(|v| v.as_slice()).collect();
         (
@@ -3334,7 +3378,8 @@ pub mod ir_block_gpu {
             let (g, outs) = g.eliminate_common(&outs);
             let (g, outs) = g.merge_siblings(&outs);
             let (g, outs) = g.relayout(&outs);
-            let (mut g, outs) = g.merge_reduce_dims(&outs);
+            let (g, outs) = g.merge_reduce_dims(&outs);
+            let (mut g, outs) = g.split_reduce_dims(&outs);
             g.schedule_auto(&outs);
             let program = g.to_wgsl(&outs);
             let n_kernels = program.kernels.len();

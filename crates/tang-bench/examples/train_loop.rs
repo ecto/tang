@@ -39,7 +39,8 @@ fn main() {
     let (g, outs) = g.eliminate_common(&outs);
     let (g, outs) = g.merge_siblings(&outs);
     let (g, outs) = g.relayout(&outs);
-    let (mut g, outs) = g.merge_reduce_dims(&outs);
+    let (g, outs) = g.merge_reduce_dims(&outs);
+    let (mut g, outs) = g.split_reduce_dims(&outs);
     g.schedule_auto(&outs);
     let program = g.to_wgsl(&outs);
     println!("train program: {} kernels", program.kernels.len());

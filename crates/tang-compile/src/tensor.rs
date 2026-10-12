@@ -1919,11 +1919,47 @@ impl TensorGraph {
             .filter(|&i| {
                 self.tiled_reduction(i)
                     .and_then(|r| self.comp_at(r))
-                    .is_some_and(|c| numel(&c.red) >= 64)
+                    .is_some_and(|c| numel(&c.red) >= 16)
             })
             .collect();
         let uses = self.use_counts(outputs, &live);
         let is_output = |i: usize| outputs.iter().any(|o| o.n() == i);
+        // a map every one of whose consumers reduces may be recomputed in
+        // each of them (flash backward recomputes dS in dQ and dK alike)
+        let mut consumers_reduce = vec![true; self.nodes.len()];
+        for j in (0..self.nodes.len()).filter(|&j| live[j]) {
+            match &self.nodes[j].op {
+                Op::Comp(c) => {
+                    for a in &c.args {
+                        if c.monoid.is_none() {
+                            consumers_reduce[a.src.n()] = false;
+                        }
+                    }
+                }
+                Op::Reshape(src) => consumers_reduce[src.n()] = false,
+                _ => {}
+            }
+        }
+        // ... and only when it is bigger than what they produce, so writing
+        // it out would cost more traffic than recomputing it
+        let mut consumer_points = vec![0usize; self.nodes.len()];
+        for j in (0..self.nodes.len()).filter(|&j| live[j]) {
+            if let Some(c) = self.comp_at(j) {
+                let pts = numel(c.points());
+                for a in &c.args {
+                    consumer_points[a.src.n()] = consumer_points[a.src.n()].max(pts);
+                }
+            }
+        }
+        let recomputable: Vec<bool> = (0..self.nodes.len())
+            .map(|p| {
+                uses[p] == 1
+                    || (consumers_reduce[p]
+                        && self.comp_at(p).is_some_and(|pc| {
+                            pc.red.is_empty() && numel(pc.points()) > consumer_points[p]
+                        }))
+            })
+            .collect();
         for i in reductions {
             // schedule by the reduction's shape, even when `i` is its epilogue
             let c = self.comp_at(self.tiled_reduction(i).unwrap()).unwrap();
@@ -1938,7 +1974,7 @@ impl TensorGraph {
                 .map(|lane| {
                     c.args
                         .iter()
-                        .filter(|a| !a.view.depends_on(lane) && uses[a.src.n()] == 1)
+                        .filter(|a| !a.view.depends_on(lane) && recomputable[a.src.n()])
                         .map(|a| a.src.n())
                         .filter(|&p| !is_output(p) && self.comp_at(p).is_some())
                         .collect()
@@ -1953,7 +1989,16 @@ impl TensorGraph {
                 for p in shared {
                     self.nodes[p].inline = true;
                 }
-            } else if tileable_red(&c.red) && lanes >= 16 && rows {
+            } else if tileable_red(&c.red) && lanes >= 16 && rows && {
+                // reuse: some operand is shared along the lanes and some
+                // along the rows — otherwise a tile only adds staging
+                let row_dim = lane_dim.and_then(|dx| tile::largest_other(&pts, dx));
+                let real = |a: &&Arg| !matches!(self.nodes[a.src.n()].op, Op::Iota(_));
+                let lane = lane_dim.unwrap();
+                c.args.iter().filter(real).any(|a| !a.view.depends_on(lane))
+                    && row_dim
+                        .is_some_and(|r| c.args.iter().filter(real).any(|a| !a.view.depends_on(r)))
+            } {
                 // matmul-shaped: the 16×16 shared-memory tile, with a 4×4
                 // register tile once both axes are wide enough to fill it
                 // (won on an M4 and a 3090 alike; see BENCHMARKS.md)
@@ -2077,30 +2122,25 @@ impl TensorGraph {
         let live = self.live(outputs);
         let n = self.nodes.len();
         let is_output = |i: usize| outputs.iter().any(|o| o.n() == i);
-        // (consumer, arg index) per producer, when unique
-        let mut reader: Vec<Option<(usize, usize)>> = vec![None; n];
-        let mut readers: Vec<usize> = vec![0; n];
+        // (consumer, arg index) pairs per producer; a reshape reader
+        // pins the layout
+        let mut readers: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
+        let mut pinned = vec![false; n];
         for i in (0..n).filter(|&i| live[i]) {
             match &self.nodes[i].op {
                 Op::Comp(c) => {
                     for (k, a) in c.args.iter().enumerate() {
-                        readers[a.src.n()] += 1;
-                        reader[a.src.n()] = Some((i, k));
+                        readers[a.src.n()].push((i, k));
                     }
                 }
-                Op::Reshape(src) => readers[src.n()] += 2,
+                Op::Reshape(src) => pinned[src.n()] = true,
                 _ => {}
             }
         }
-        for p in (0..n).filter(|&p| live[p] && !is_output(p) && readers[p] == 1) {
-            let Some(pc) = self.comp_at(p) else { continue };
-            let Some((ci, k)) = reader[p] else { continue };
-            let cc = self.comp_at(ci).unwrap();
-            let view = &cc.args[k].view;
-            let kp = pc.points().len();
-            let kc = cc.points().len();
-            // which consumer dim each producer point dim is picked from
-            let picks: Option<Vec<Option<usize>>> = view.forms[..kp]
+        // which consumer dim each producer point dim is picked from, when
+        // the view is a pick
+        let picks_of = |view: &View, kp: usize| -> Option<Vec<Option<usize>>> {
+            view.forms[..kp]
                 .iter()
                 .map(|f| {
                     if f.coefs.iter().all(|&c| c == 0) {
@@ -2112,8 +2152,34 @@ impl TensorGraph {
                         && f.coefs.iter().filter(|&&c| c != 0).count() == 1)
                         .then_some(Some(d))
                 })
-                .collect();
-            let Some(picks) = picks else { continue };
+                .collect()
+        };
+        for p in
+            (0..n).filter(|&p| live[p] && !is_output(p) && !pinned[p] && !readers[p].is_empty())
+        {
+            let Some(pc) = self.comp_at(p) else { continue };
+            let kp = pc.points().len();
+            // every reader must read by a pick (so its forms can follow a
+            // permutation); the layout follows the reader that reduces
+            // over the most of the producer's dims
+            let mut best: Option<(usize, Vec<Option<usize>>, usize)> = None;
+            let mut all_picks = true;
+            for &(ci, k) in &readers[p] {
+                let cc = self.comp_at(ci).unwrap();
+                let Some(picks) = picks_of(&cc.args[k].view, kp) else {
+                    all_picks = false;
+                    break;
+                };
+                let kc = cc.points().len();
+                let n_red = picks.iter().filter(|s| s.is_some_and(|s| s >= kc)).count();
+                if best.as_ref().is_none_or(|b| n_red > b.0) {
+                    best = Some((n_red, picks, kc));
+                }
+            }
+            if !all_picks {
+                continue;
+            }
+            let Some((_, picks, kc)) = best else { continue };
             let mut order: Vec<usize> = (0..kp)
                 .filter(|&d| picks[d].is_some_and(|s| s < kc))
                 .collect();
@@ -2143,21 +2209,152 @@ impl TensorGraph {
                 }
             }
             g.nodes[p].shape = pm.out.clone();
-            // consumer: its forms into the producer follow the new dim order
-            let Op::Comp(cm) = &mut g.nodes[ci].op else {
-                unreachable!()
-            };
-            let forms: Vec<Form> = order
-                .iter()
-                .map(|&d| cm.args[k].view.forms[d].clone())
-                .chain(cm.args[k].view.forms[kp..].iter().cloned())
-                .collect();
-            cm.args[k].view = View {
-                forms,
-                guard: cm.args[k].view.guard,
-            };
+            // consumers: their forms into the producer follow the new order
+            for &(ci, k) in &readers[p] {
+                let Op::Comp(cm) = &mut g.nodes[ci].op else {
+                    unreachable!()
+                };
+                let forms: Vec<Form> = order
+                    .iter()
+                    .map(|&d| cm.args[k].view.forms[d].clone())
+                    .chain(cm.args[k].view.forms[kp..].iter().cloned())
+                    .collect();
+                cm.args[k].view = View {
+                    forms,
+                    guard: cm.args[k].view.guard,
+                };
+            }
         }
         (g, outputs.to_vec())
+    }
+
+    /// A reduction over several dims with a small one among them
+    /// (≤ `SMALL` elements) is two reductions: the inner one over the
+    /// rest, keeping the small dim as a point dim, and an outer one
+    /// folding the small dim with the same monoid (states combine like
+    /// elements — the property the split schedule relies on). The inner
+    /// reduction then has one reduce dim and tiles; the outer one is tiny.
+    /// `Σ_{r,i} dS[i,g,r,j]·q[i,g,r,d]` (dK for grouped heads) becomes
+    /// `Σ_r (Σ_i …)`.
+    pub fn split_reduce_dims(&self, outputs: &[TensorId]) -> (TensorGraph, Vec<TensorId>) {
+        const SMALL: usize = 16;
+        let mut g = self.clone();
+        let live = self.live(outputs);
+        let mut redirect: Vec<usize> = (0..self.nodes.len()).collect();
+        for i in (0..self.nodes.len()).filter(|&i| live[i]) {
+            let Some(c) = self.comp_at(i) else { continue };
+            let Some(m) = c.monoid.clone() else { continue };
+            if c.red.len() < 2 || c.tuple > 1 {
+                continue;
+            }
+            let reds: Option<Vec<usize>> = c.red.iter().map(|d| d.fixed()).collect();
+            let Some(reds) = reds else { continue };
+            // the smallest reduce dim, if small
+            let Some((f, &nf)) = reds.iter().enumerate().min_by_key(|(_, n)| **n) else {
+                continue;
+            };
+            if nf > SMALL {
+                continue;
+            }
+            let k = c.points().len();
+            let rank = c.rank();
+            let w = c.width();
+            // inner space: the small dim first (so the original points keep
+            // their lane and row axes), the points, the other reduce dims
+            let order: Vec<usize> = [k + f]
+                .into_iter()
+                .chain(0..k)
+                .chain((0..reds.len()).filter(|&r| r != f).map(|r| k + r))
+                .collect();
+            let inner_args: Vec<Arg> = c
+                .args
+                .iter()
+                .map(|a| Arg {
+                    src: a.src,
+                    view: View {
+                        forms: a
+                            .view
+                            .forms
+                            .iter()
+                            .map(|fm| Form {
+                                coefs: order.iter().map(|&d| fm.coefs[d]).collect(),
+                                offset: fm.offset,
+                            })
+                            .collect(),
+                        guard: a.view.guard,
+                    },
+                })
+                .collect();
+            let mut inner_out: Vec<Dim> = vec![Dim::Fixed(nf)];
+            inner_out.extend_from_slice(c.points());
+            inner_out.extend_from_slice(&c.out[k..]);
+            let inner = Comp {
+                out: inner_out.clone(),
+                tuple: c.tuple,
+                red: (0..reds.len())
+                    .filter(|&r| r != f)
+                    .map(|r| c.red[r])
+                    .collect(),
+                args: inner_args,
+                body: c.body.clone(),
+                body_outs: c.body_outs.clone(),
+                monoid: Some(m.clone()),
+            };
+            let inner_id = g.nodes.len();
+            g.nodes.push(TNode {
+                shape: inner_out,
+                inline: false,
+                split: 0,
+                tile: (0, 0, 0),
+                reg: (1, 1),
+                fragment: false,
+                precision: Precision::default(),
+                op: Op::Comp(inner),
+            });
+            // outer: a map folding the nf partial states with the monoid's
+            // combine, unrolled — a map, so it never absorbs the inner
+            // reduction back into a naive loop
+            let args: Vec<Arg> = (0..nf)
+                .flat_map(|fi| {
+                    (0..w).map(move |slot| {
+                        let mut forms: Vec<Form> = vec![Form::constant(k, fi as i64)];
+                        forms.extend((0..k).map(|d| Form::unit(k, d)));
+                        if c.tuple == 1 {
+                            forms.push(Form::constant(k, slot as i64));
+                        }
+                        Arg {
+                            src: TensorId(inner_id as u32),
+                            view: View {
+                                forms,
+                                guard: false,
+                            },
+                        }
+                    })
+                })
+                .collect();
+            let mut body = ExprGraph::new();
+            let vars: Vec<ExprId> = (0..nf * w).map(|v| body.var(v as u16)).collect();
+            let mut acc: Vec<ExprId> = vars[..w].to_vec();
+            for fi in 1..nf {
+                let mut ins = acc.clone();
+                ins.extend_from_slice(&vars[fi * w..(fi + 1) * w]);
+                acc = replay(&m.combine, &m.outs, &ins, &mut body);
+            }
+            let outer = Comp {
+                out: c.out.clone(),
+                tuple: c.tuple,
+                red: vec![],
+                args,
+                body,
+                body_outs: acc,
+                monoid: None,
+            };
+            let _ = rank;
+            g.nodes[i].op = Op::Comp(outer);
+            redirect[i] = i;
+        }
+        let _ = redirect;
+        g.eliminate_dead(outputs)
     }
 
     /// Two adjacent reduce dims that every arg reads either not at all
@@ -3022,6 +3219,41 @@ mod tests {
             vec![Dim::Fixed(groups * hd)]
         );
         close(&mg.eval(&inputs, &outs)[0], &want);
+    }
+
+    #[test]
+    fn split_reduce_dims_factors_a_small_dim() {
+        // y[j, d] = Σ_{r, i} a[i, r, j] · b[i, r, d], r small
+        let (n, r, dd) = (32, 3, 8);
+        let mut g = TensorGraph::new();
+        let a = g.input(&[n, r, n]);
+        let b = g.input(&[n, r, dd]);
+        let y = g
+            .comp(
+                &[n, dd],
+                &[r, n],
+                vec![
+                    Arg {
+                        src: a,
+                        view: View::pick(4, &[Some(3), Some(2), Some(0)]),
+                    },
+                    Arg {
+                        src: b,
+                        view: View::pick(4, &[Some(3), Some(2), Some(1)]),
+                    },
+                ],
+                Some(Monoid::sum()),
+                |v| vec![v[0] * v[1]],
+            )
+            .unwrap();
+        let inputs = [ramp(n * r * n, 0.01, -0.3), ramp(n * r * dd, 0.02, 0.1)];
+        let want = g.eval(&inputs, &[y]).remove(0);
+        let (sg, outs) = g.split_reduce_dims(&[y]);
+        let c = sg.comp_at(outs[0].n()).unwrap();
+        assert!(c.red.is_empty() && c.args.len() == r);
+        let inner = sg.comp_at(c.args[0].src.n()).unwrap();
+        assert_eq!(inner.red, vec![Dim::Fixed(n)]);
+        close(&sg.eval(&inputs, &outs)[0], &want);
     }
 
     #[test]

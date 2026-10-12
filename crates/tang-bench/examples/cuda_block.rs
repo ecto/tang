@@ -65,7 +65,9 @@ fn main() {
             })
             .collect();
         let refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
-        let exe = CudaExecutable::new(&ctx, program, &refs);
+        drop(program);
+        let (exe, kept) = CudaExecutable::new_tuned(&ctx, &g, &[y], &refs);
+        println!("block seq={seq}: tuned, {kept} of {n_native} native kernels kept");
         exe.run();
         let got = exe.read(y);
         if seq == 128 {
@@ -110,7 +112,8 @@ fn main() {
         let (tg, outs) = tg.eliminate_common(&outs);
         let (tg, outs) = tg.merge_siblings(&outs);
         let (tg, outs) = tg.relayout(&outs);
-        let (mut tg, outs) = tg.merge_reduce_dims(&outs);
+        let (tg, outs) = tg.merge_reduce_dims(&outs);
+        let (mut tg, outs) = tg.split_reduce_dims(&outs);
         tg.schedule_auto(&outs);
         let program = tg.to_cuda(&outs);
         let n_native = program
@@ -122,24 +125,49 @@ fn main() {
         let target = vec![0.0f32; seq * 576];
         let mut refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
         refs.push(&target);
-        let train = CudaExecutable::new(&ctx, program, &refs);
+        drop(program);
+        let (train, kept) = CudaExecutable::new_tuned(&ctx, &tg, &outs, &refs);
         let ms = train.time(50);
         println!(
-            "block seq={seq}: fwd+bwd {ms:.3} ms ({n_kernels} kernels, {n_native} on tensor cores)"
+            "block seq={seq}: fwd+bwd {ms:.3} ms ({n_kernels} kernels, {kept} of {n_native} native kept)"
         );
         let mut slow: Vec<(f64, usize)> = (0..n_kernels)
             .map(|i| (train.time_kernel(i, 10), i))
             .collect();
         slow.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-        for (ms, i) in slow.iter().take(6) {
+        let total: f64 = slow.iter().map(|x| x.0).sum();
+        println!("  (sum of kernels {total:.3} ms)");
+        for (ms, i) in slow.iter().take(14) {
             let k = &train.program.kernels[*i];
             let node = &tg.nodes()[k.node.index()];
+            let c = tg.comp_at(k.node.index());
+            let args: Vec<String> = c
+                .map(|c| {
+                    c.args
+                        .iter()
+                        .map(|a| {
+                            format!(
+                                "{}{:?}",
+                                a.src.index(),
+                                tg.nodes()[a.src.index()]
+                                    .shape
+                                    .iter()
+                                    .map(|d| d.n())
+                                    .collect::<Vec<_>>()
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             println!(
-                "  {ms:7.3} ms  node {:?} shape {:?} red {:?} tile {:?} {}",
+                "  {ms:7.3} ms  node {:?} shape {:?} red {:?} monoid {:?} split {} tile {:?} args [{}] {}",
                 k.node,
-                node.shape,
-                tg.comp_at(k.node.index()).map(|c| c.red.clone()),
+                node.shape.iter().map(|d| d.n()).collect::<Vec<_>>(),
+                c.map(|c| c.red.iter().map(|d| d.n()).collect::<Vec<_>>()),
+                c.and_then(|c| c.monoid.as_ref().map(|m| m.kind())),
+                node.split,
                 node.tile,
+                args.join(" "),
                 if k.source.contains("wmma") {
                     "wmma"
                 } else {
