@@ -1577,6 +1577,31 @@ impl TensorGraph {
         }
     }
 
+    /// `a` as a direct f16 buffer read: the buffer node and the flat
+    /// element offset as an affine form over the comp's coords (rank
+    /// `rank`), when `a` reads an unguarded view of an f16 input.
+    fn direct_f16(&self, a: &super::Arg, rank: usize) -> Option<(usize, super::Form)> {
+        let j = a.src.n();
+        if a.view.guard
+            || self.storage(a.src).n() != j
+            || !matches!(self.nodes[j].op, Op::Input(_))
+            || self.nodes[j].precision.storage != Format::F16
+        {
+            return None;
+        }
+        let shape = fixed(&self.nodes[j].shape);
+        let mut flat = super::Form::zero(rank);
+        let mut stride = 1i64;
+        for (f, &n) in a.view.forms.iter().zip(&shape).rev() {
+            flat.offset += f.offset * stride;
+            for (x, &c) in flat.coefs.iter_mut().zip(&f.coefs) {
+                *x += c * stride;
+            }
+            stride *= n as i64;
+        }
+        Some((j, flat))
+    }
+
     fn attention_kernel(&self, root: usize, plan: &AttentionPlan) -> MslKernel {
         let (pre, reads) = self.kernel_preamble(root);
         let c = self.comp_at(plan.red).unwrap();
@@ -1654,29 +1679,46 @@ impl TensorGraph {
         writeln!(s, "    const uint m0 = tile_r * {bq}u;").unwrap();
         writeln!(s, "    const uint c0 = tile_c * {bc}u;").unwrap();
         // stage Q (zero-padded) and keep this SIMD group's rows in registers
-        writeln!(
-            s,
-            "    for (uint idx = tid; idx < {}u; idx += 128u) {{",
-            bq * d8
-        )
-        .unwrap();
-        writeln!(
-            s,
-            "        const uint ri = idx / {d8}u; const uint ci = idx % {d8}u;"
-        )
-        .unwrap();
-        writeln!(s, "        float v = 0.0f;").unwrap();
-        writeln!(s, "        if (m0 + ri < {nq}u && ci < {dk}u) {{").unwrap();
-        writeln!(
-            s,
-            "            {} const uint r1 = ci;",
-            coords("m0 + ri", "0u", "0u")
-        )
-        .unwrap();
-        writeln!(s, "            v = {};", arg_read(self, &syn, &syn.args[0])).unwrap();
-        writeln!(s, "        }}").unwrap();
-        writeln!(s, "        smem[ri * {ldq}u + ci] = half(v);").unwrap();
-        writeln!(s, "    }}").unwrap();
+        let rk = pk + 2;
+        let dq = self.direct_f16(&plan.q, rk);
+        let dkk = self.direct_f16(&plan.k, rk);
+        let dvv = self.direct_f16(&c.args[plan.v_arg], pk + 1);
+        let q_direct = d8 == dk
+            && stage_direct(
+                &mut s,
+                dq.as_ref(),
+                &others,
+                (dr, "m0", bq, nq),
+                (pk + 1, "0u", d8, dk),
+                "smem",
+                ldq,
+                "    ",
+            );
+        if !q_direct {
+            writeln!(
+                s,
+                "    for (uint idx = tid; idx < {}u; idx += 128u) {{",
+                bq * d8
+            )
+            .unwrap();
+            writeln!(
+                s,
+                "        const uint ri = idx / {d8}u; const uint ci = idx % {d8}u;"
+            )
+            .unwrap();
+            writeln!(s, "        float v = 0.0f;").unwrap();
+            writeln!(s, "        if (m0 + ri < {nq}u && ci < {dk}u) {{").unwrap();
+            writeln!(
+                s,
+                "            {} const uint r1 = ci;",
+                coords("m0 + ri", "0u", "0u")
+            )
+            .unwrap();
+            writeln!(s, "            v = {};", arg_read(self, &syn, &syn.args[0])).unwrap();
+            writeln!(s, "        }}").unwrap();
+            writeln!(s, "        smem[ri * {ldq}u + ci] = half(v);").unwrap();
+            writeln!(s, "    }}").unwrap();
+        }
         writeln!(s, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
         writeln!(s, "    simdgroup_half8x8 fq[{nqf}];").unwrap();
         writeln!(s, "    for (uint kk = 0u; kk < {nqf}u; kk++) simdgroup_load(fq[kk], &smem[(sg * 8u) * {ldq}u + kk * 8u], {ldq});").unwrap();
@@ -1730,57 +1772,82 @@ impl TensorGraph {
             writeln!(s, "        if ({e} > 0) {{ continue; }}").unwrap();
         }
         // stage K [j][k] and V [j][c]
-        writeln!(
-            s,
-            "        for (uint idx = tid; idx < {}u; idx += 128u) {{",
-            bk * d8
-        )
-        .unwrap();
-        writeln!(
-            s,
-            "            const uint ji = idx / {d8}u; const uint ci = idx % {d8}u;"
-        )
-        .unwrap();
-        writeln!(s, "            float v = 0.0f;").unwrap();
-        writeln!(s, "            if (j0 + ji < {nk}u && ci < {dk}u) {{").unwrap();
-        writeln!(
-            s,
-            "                {} const uint r1 = ci;",
-            coords("0u", "0u", "j0 + ji")
-        )
-        .unwrap();
-        writeln!(
-            s,
-            "                v = {};",
-            arg_read(self, &syn, &syn.args[1])
-        )
-        .unwrap();
-        writeln!(s, "            }}").unwrap();
-        writeln!(s, "            Ks[ji * {ldk}u + ci] = half(v);").unwrap();
-        writeln!(s, "        }}").unwrap();
-        writeln!(
-            s,
-            "        for (uint idx = tid; idx < {}u; idx += 128u) {{",
-            bk * bc
-        )
-        .unwrap();
-        writeln!(
-            s,
-            "            const uint ji = idx / {bc}u; const uint ci = idx % {bc}u;"
-        )
-        .unwrap();
-        writeln!(s, "            float v = 0.0f;").unwrap();
-        writeln!(s, "            if (j0 + ji < {nk}u && c0 + ci < {nc}u) {{").unwrap();
-        writeln!(s, "                {}", coords("0u", "c0 + ci", "j0 + ji")).unwrap();
-        writeln!(
-            s,
-            "                v = {};",
-            arg_read(self, c, &c.args[plan.v_arg])
-        )
-        .unwrap();
-        writeln!(s, "            }}").unwrap();
-        writeln!(s, "            Vs[ji * {ldv}u + ci] = half(v);").unwrap();
-        writeln!(s, "        }}").unwrap();
+        let k_direct = d8 == dk
+            && stage_direct(
+                &mut s,
+                dkk.as_ref(),
+                &others,
+                (pk, "j0", bk, nk),
+                (pk + 1, "0u", d8, dk),
+                "Ks",
+                ldk,
+                "        ",
+            );
+        if !k_direct {
+            writeln!(
+                s,
+                "        for (uint idx = tid; idx < {}u; idx += 128u) {{",
+                bk * d8
+            )
+            .unwrap();
+            writeln!(
+                s,
+                "            const uint ji = idx / {d8}u; const uint ci = idx % {d8}u;"
+            )
+            .unwrap();
+            writeln!(s, "            float v = 0.0f;").unwrap();
+            writeln!(s, "            if (j0 + ji < {nk}u && ci < {dk}u) {{").unwrap();
+            writeln!(
+                s,
+                "                {} const uint r1 = ci;",
+                coords("0u", "0u", "j0 + ji")
+            )
+            .unwrap();
+            writeln!(
+                s,
+                "                v = {};",
+                arg_read(self, &syn, &syn.args[1])
+            )
+            .unwrap();
+            writeln!(s, "            }}").unwrap();
+            writeln!(s, "            Ks[ji * {ldk}u + ci] = half(v);").unwrap();
+            writeln!(s, "        }}").unwrap();
+        }
+        let v_direct = stage_direct(
+            &mut s,
+            dvv.as_ref(),
+            &others,
+            (pk, "j0", bk, nk),
+            (dc, "c0", bc, nc),
+            "Vs",
+            ldv,
+            "        ",
+        );
+        if !v_direct {
+            writeln!(
+                s,
+                "        for (uint idx = tid; idx < {}u; idx += 128u) {{",
+                bk * bc
+            )
+            .unwrap();
+            writeln!(
+                s,
+                "            const uint ji = idx / {bc}u; const uint ci = idx % {bc}u;"
+            )
+            .unwrap();
+            writeln!(s, "            float v = 0.0f;").unwrap();
+            writeln!(s, "            if (j0 + ji < {nk}u && c0 + ci < {nc}u) {{").unwrap();
+            writeln!(s, "                {}", coords("0u", "c0 + ci", "j0 + ji")).unwrap();
+            writeln!(
+                s,
+                "                v = {};",
+                arg_read(self, c, &c.args[plan.v_arg])
+            )
+            .unwrap();
+            writeln!(s, "            }}").unwrap();
+            writeln!(s, "            Vs[ji * {ldv}u + ci] = half(v);").unwrap();
+            writeln!(s, "        }}").unwrap();
+        }
         writeln!(
             s,
             "        threadgroup_barrier(mem_flags::mem_threadgroup);"
@@ -2046,6 +2113,75 @@ impl TensorGraph {
             fragment: true,
         }
     }
+}
+
+/// Stage a `rows × cols` tile of a direct f16 buffer read into threadgroup
+/// memory with `half4` copies (see [`TensorGraph::direct_f16`]): `flat`
+/// is unit-stride along `col_dim`; coords in `others` are in scope as
+/// `p{d}`. Out-of-range rows/columns are zero. `false` (nothing emitted)
+/// when the read is not 4-aligned.
+#[allow(clippy::too_many_arguments)]
+fn stage_direct(
+    s: &mut String,
+    direct: Option<&(usize, super::Form)>,
+    others: &[usize],
+    (row_dim, row0, rows, row_lim): (usize, &str, usize, usize),
+    (col_dim, col0, cols, col_lim): (usize, &str, usize, usize),
+    dst: &str,
+    ld: usize,
+    pad: &str,
+) -> bool {
+    let Some((buf, flat)) = direct else {
+        return false;
+    };
+    let aligned = flat.offset % 4 == 0
+        && flat.coefs[col_dim] == 1
+        && flat
+            .coefs
+            .iter()
+            .enumerate()
+            .all(|(d, &c)| d == col_dim || c % 4 == 0)
+        && cols % 4 == 0
+        && col_lim % 4 == 0
+        && ld % 4 == 0;
+    if !aligned {
+        return false;
+    }
+    let mut base = format!("{}", flat.offset);
+    for &d in others {
+        if flat.coefs[d] != 0 {
+            base.push_str(&format!(" + {} * int(p{d})", flat.coefs[d]));
+        }
+    }
+    let rc = flat.coefs[row_dim];
+    let c4 = cols / 4;
+    writeln!(s, "{pad}{{").unwrap();
+    writeln!(s, "{pad}    const int base = {base};").unwrap();
+    writeln!(
+        s,
+        "{pad}    for (uint idx = tid; idx < {}u; idx += 128u) {{",
+        rows * c4
+    )
+    .unwrap();
+    writeln!(
+        s,
+        "{pad}        const uint ri = idx / {c4}u; const uint ci = (idx % {c4}u) * 4u;"
+    )
+    .unwrap();
+    writeln!(s, "{pad}        half4 v = half4(0);").unwrap();
+    writeln!(
+        s,
+        "{pad}        if ({row0} + ri < {row_lim}u && {col0} + ci < {col_lim}u) {{ v = *(device const half4*)(b{buf} + (base + {rc} * int({row0} + ri) + int({col0} + ci))); }}"
+    )
+    .unwrap();
+    writeln!(
+        s,
+        "{pad}        *(threadgroup half4*)(&{dst}[ri * {ld}u + ci]) = v;"
+    )
+    .unwrap();
+    writeln!(s, "{pad}    }}").unwrap();
+    writeln!(s, "{pad}}}").unwrap();
+    true
 }
 
 fn numel_fixed(p: &[usize]) -> usize {
