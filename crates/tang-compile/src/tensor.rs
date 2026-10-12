@@ -1215,9 +1215,17 @@ impl TensorGraph {
     }
 
     /// Live nodes in dependency order (post-order DFS from the outputs).
+    /// Live inputs come first, in their original order, so a graph's
+    /// input ids survive every pass.
     fn topo(&self, outputs: &[TensorId]) -> Vec<usize> {
-        let mut order = Vec::new();
+        let live = self.live(outputs);
+        let mut order: Vec<usize> = (0..self.nodes.len())
+            .filter(|&i| live[i] && matches!(self.nodes[i].op, Op::Input(_)))
+            .collect();
         let mut seen = vec![false; self.nodes.len()];
+        for &i in &order {
+            seen[i] = true;
+        }
         let mut stack: Vec<(usize, bool)> = outputs.iter().map(|o| (o.n(), false)).collect();
         while let Some((i, done)) = stack.pop() {
             if done {

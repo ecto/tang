@@ -86,12 +86,19 @@ impl TensorGraph {
         a: usize,
         dy: TensorId,
     ) -> Result<TensorId, ShapeError> {
-        if c.tuple != 0 || c.width() != 1 {
+        let kind = c.monoid.as_ref().map(Monoid::kind);
+        // Online softmax: slots (m, acc₁…accₖ) with accᵢ = Σ_j gᵢ·exp(s_j − m).
+        // Differentiated with the forward's m and acc read back, the
+        // argmax gated like Max, so the flash-fused graph has a backward.
+        let online = c.tuple == 1 && kind == Some(MonoidKind::OnlineSoftmax);
+        if (c.tuple != 0 || c.width() != 1) && !online {
             return err("backward: tuple-valued comps are not differentiable yet");
         }
-        let kind = c.monoid.as_ref().map(Monoid::kind);
         match kind {
-            None | Some(MonoidKind::Sum) | Some(MonoidKind::Max) => {}
+            None
+            | Some(MonoidKind::Sum)
+            | Some(MonoidKind::Max)
+            | Some(MonoidKind::OnlineSoftmax) => {}
             Some(k) => {
                 return err(format!(
                     "backward: {k:?} reductions are not differentiable yet"
@@ -140,29 +147,88 @@ impl TensorGraph {
                 })
                 .collect(),
         };
-        // dy is indexed by the old out coords
-        let dy_view = View {
+        // dy is indexed by the old out coords (plus a slot for tuple comps)
+        let w = c.width();
+        let dy_view = |slot: Option<i64>| View {
             forms: (0..c.points().len())
                 .map(|x| Form::unit(new_rank, rename[x].unwrap()))
+                .chain(slot.map(|s| Form::constant(new_rank, s)))
                 .collect(),
         };
-        let mut args = vec![Arg {
-            src: dy,
-            view: dy_view,
-        }];
+        let mut args: Vec<Arg> = Vec::new();
+        if online {
+            for s in 0..w {
+                args.push(Arg {
+                    src: dy,
+                    view: dy_view(Some(s as i64)),
+                });
+            }
+            for s in 0..w {
+                args.push(Arg {
+                    src: self_id,
+                    view: dy_view(Some(s as i64)),
+                });
+            }
+        } else {
+            args.push(Arg {
+                src: dy,
+                view: dy_view(None),
+            });
+        }
+        let base = args.len();
         args.extend(c.args.iter().map(|x| Arg {
             src: x.src,
             view: rename_view(&x.view),
         }));
 
-        // body' = dy · ∂body/∂x_a
         let mut src = c.body.clone();
-        let d = src.diff(c.body_outs[0], a as u16);
-        let d = src.simplify(d);
         let mut body = ExprGraph::new();
-        let vars: Vec<ExprId> = (0..=c.args.len()).map(|i| body.var(i as u16)).collect();
-        let dexpr = replay(&src, &[d], &vars[1..], &mut body)[0];
-        let mut out = body.mul(vars[0], dexpr);
+        let vars: Vec<ExprId> = (0..base + c.args.len())
+            .map(|i| body.var(i as u16))
+            .collect();
+        let arg_vars = &vars[base..];
+        let mut out;
+        if online {
+            // s, ∂s/∂a, e = exp(s − m), [s == m]
+            let ds = src.diff(c.body_outs[0], a as u16);
+            let ds = src.simplify(ds);
+            let r = replay(&src, &[c.body_outs[0], ds], arg_vars, &mut body);
+            let (s, ds) = (r[0], r[1]);
+            let m = vars[w];
+            let nm = body.neg(m);
+            let diff = body.add(s, nm);
+            let l2e = body.lit(std::f64::consts::LOG2_E);
+            let scaled = body.mul(diff, l2e);
+            let e = body.exp2(scaled);
+            let ns = body.neg(s);
+            let below = body.add(m, ns); // m - s
+            let inner = body.select(below, ExprId::ZERO, ExprId::ONE);
+            let hit = body.select(diff, ExprId::ZERO, inner); // s == m
+            let hit_ds = body.mul(hit, ds);
+            // slot 0 (m) behaves like Max
+            out = body.mul(vars[0], hit_ds);
+            for i in 1..w {
+                let dg = src.diff(c.body_outs[i], a as u16);
+                let dg = src.simplify(dg);
+                let r = replay(&src, &[c.body_outs[i], dg], arg_vars, &mut body);
+                let (g, dg) = (r[0], r[1]);
+                let g_ds = body.mul(g, ds);
+                let inner = body.add(dg, g_ds);
+                let direct = body.mul(e, inner);
+                let acc = vars[w + i];
+                let via_m = body.mul(acc, hit_ds);
+                let nvm = body.neg(via_m);
+                let d_acc = body.add(direct, nvm);
+                let term = body.mul(vars[i], d_acc);
+                out = body.add(out, term);
+            }
+        } else {
+            // body' = dy · ∂body/∂x_a
+            let d = src.diff(c.body_outs[0], a as u16);
+            let d = src.simplify(d);
+            let dexpr = replay(&src, &[d], arg_vars, &mut body)[0];
+            out = body.mul(vars[0], dexpr);
+        }
 
         // scatter dims: gate by [iota_d == renamed form]
         if !scatter.is_empty() {
@@ -208,7 +274,7 @@ impl TensorGraph {
                 src: self_id,
                 view: args[0].view.clone(),
             });
-            let val = replay(&src, &[c.body_outs[0]], &vars[1..], &mut body)[0];
+            let val = replay(&src, &[c.body_outs[0]], arg_vars, &mut body)[0];
             let (nm, nv) = (body.neg(m), body.neg(val));
             let below = body.add(val, nm); // val - m
             let above = body.add(m, nv); // m - val
@@ -404,8 +470,53 @@ mod tests {
         }
     }
 
+    /// Gradients through the flash-fused graph equal the naive graph's.
     #[test]
-    fn tuple_monoid_is_an_error() {
+    fn flash_attention_grads_match_naive() {
+        let (n, d) = (6, 4);
+        let build = || {
+            let mut g = TensorGraph::new();
+            let q = g.input(&[n, d]);
+            let k = g.input(&[n, d]);
+            let v = g.input(&[n, d]);
+            let kt = g.transpose(k, &[1, 0]).unwrap();
+            let s = g.matmul(q, kt).unwrap();
+            let m = g.reduce(s, 1, Monoid::max()).unwrap();
+            let mb = g.broadcast(m, &[n, n]).unwrap();
+            let p = g.map(&[s, mb], |x| (x[0] - x[1]).exp()).unwrap();
+            let l = g.reduce(p, 1, Monoid::sum()).unwrap();
+            let o = g.matmul(p, v).unwrap();
+            let lb = g.broadcast(l, &[n, d]).unwrap();
+            let y = g.map(&[o, lb], |x| x[0] / x[1]).unwrap();
+            (g, q, k, v, y)
+        };
+        let inputs = [
+            ramp(n * d, 0.3, -0.5),
+            ramp(n * d, 0.2, 0.1),
+            ramp(n * d, 0.4, -1.0),
+        ];
+        let (mut naive, q, k, v, y) = build();
+        let ng = naive.backward(y, &[q, k, v]).unwrap();
+        let want = naive.eval(&inputs, &ng);
+
+        let (g, q, k, v, y) = build();
+        let (g, outs) = g.substitute_maps(&[y]);
+        let (mut g, outs) = g.stabilize_softmax(&outs);
+        assert!(g
+            .reduction_kinds(&outs)
+            .contains(&MonoidKind::OnlineSoftmax));
+        // inputs keep their ids through the passes (they come first)
+        let fg = g.backward(outs[0], &[q, k, v]).unwrap();
+        let got = g.eval(&inputs, &fg);
+        for (w, gg) in want.iter().zip(&got) {
+            for (x, y) in w.iter().zip(gg) {
+                assert!((x - y).abs() <= 1e-9 * (1.0 + y.abs()), "{x} vs {y}");
+            }
+        }
+    }
+
+    #[test]
+    fn online_softmax_backward_is_supported() {
         let mut g = TensorGraph::new();
         let x = g.input(&[2, 3]);
         let m = g.reduce(x, 1, Monoid::max()).unwrap();
@@ -418,6 +529,6 @@ mod tests {
         assert!(g
             .reduction_kinds(&outs)
             .contains(&MonoidKind::OnlineSoftmax));
-        assert!(g.backward(outs[0], &[]).is_err());
+        assert!(g.backward(outs[0], &[x]).is_ok());
     }
 }

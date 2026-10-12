@@ -74,7 +74,10 @@ body is differentiated by `tang-expr`'s symbolic `diff`. A dim read through
 any other form — an offset, a stride, a diagonal, a broadcast — stays an
 out dim and the body is gated by `[coord == form]` using `iota`, the
 coordinates-as-values node. `Max` gates the term to the argmax with a
-select. The backward graph is an ordinary graph; the same passes optimize
+select. The online-softmax monoid has its own rule: with the forward's
+`m` and accumulators read back, `∂accᵢ/∂s_j = gᵢ·exp(s_j−m) − accᵢ·[s_j = m]`,
+so the flash-fused graph differentiates too and its gradients equal the
+naive graph's. The backward graph is an ordinary graph; the same passes optimize
 it. A whole transformer block (`tang-bench::ir_block`) differentiates this
 way and matches finite differences.
 
@@ -125,7 +128,6 @@ schedule space; the compiler searches it.
 
 - Codegen beyond WGSL (MSL/CUDA emitters exist in `tang-expr` for scalar
   bodies; the loop-nest emitters are WGSL-only).
-- Gradients of tuple monoids (differentiate before `stabilize_softmax`).
 - Scatter gradients reduce over the whole source coordinate they gate on;
   a stride-2 read pays 2× in the backward pass. Fine for rope, not for a
   large gather.
