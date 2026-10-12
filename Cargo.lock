@@ -6030,6 +6030,8 @@ dependencies = [
  "safetensors",
  "tang",
  "tang-expr",
+ "tang-tensor",
+ "tang-train",
  "wgpu",
 ]
 

@@ -27,3 +27,6 @@ name = "quantum_poet"
 
 [dev-dependencies]
 approx = "0.5"
+# the physics_surrogate example trains on the CPU first
+tang-tensor = { workspace = true }
+tang-train = { workspace = true }
