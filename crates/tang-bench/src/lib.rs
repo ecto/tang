@@ -318,7 +318,10 @@ pub mod ir_gpu {
             for i in 0..self.program.kernels.len() {
                 self.run_kernel(device, cache, i);
             }
-            cache.flush(device);
+            // leaving the cache in batch mode would make a later
+            // `to_vec_sync` (the hand path's readbacks) wait on work that
+            // was never submitted
+            cache.end_batch(device);
         }
 
         /// Dispatch kernel `i` only (its inputs must already be computed).

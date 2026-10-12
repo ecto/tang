@@ -37,6 +37,13 @@ impl KernelCache {
         self.batching = true;
     }
 
+    /// Submit what is pending and go back to submitting every dispatch
+    /// as it is issued.
+    pub fn end_batch(&mut self, device: &GpuDevice) {
+        self.flush(device);
+        self.batching = false;
+    }
+
     /// Submit all pending command buffers to the GPU queue.
     /// Must be called before any buffer readback (to_vec_sync).
     pub fn flush(&mut self, device: &GpuDevice) {

@@ -803,35 +803,52 @@ impl TensorGraph {
                 "        for (var idx: u32 = tid; idx < {total}u; idx = idx + {threads}u) {{"
             )
             .unwrap();
-            // point-minor: lanes innermost, then offset, inner vars, t
-            let points =
-                (if r.key.py != 0 { by } else { 1 }) * (if r.key.px != 0 { bx } else { 1 });
+            // The stage is point-minor (lanes innermost, then offset,
+            // inner vars, t) so the reduce loop's reads are conflict-free.
+            // The load loop walks the *buffer* in address order instead —
+            // the var with the smallest address stride innermost — so a
+            // warp's loads coalesce; each element is then written to its
+            // point-minor slot.
+            // (name, extent, address coefficient), in stage order
+            let mut dims: Vec<(String, usize, i64)> = Vec::new();
+            if r.key.px != 0 {
+                dims.push(("lx".into(), px_n, r.key.px));
+            }
+            if r.key.py != 0 {
+                dims.push(("ly".into(), py_n, r.key.py));
+            }
+            dims.push(("o".into(), span, 1));
+            for ((name, coef), &ext) in r.key.inner.iter().zip(&r.extents).rev() {
+                dims.push((name.clone(), ext, *coef));
+            }
+            dims.push(("t".into(), chunk, r.key.red));
+            let mut load_order: Vec<usize> = (0..dims.len()).collect();
+            load_order.sort_by_key(|&d| dims[d].2.unsigned_abs());
             writeln!(s, "            var rem = idx;").unwrap();
+            for &d in &load_order {
+                let (name, ext, _) = &dims[d];
+                writeln!(s, "            let {name} = rem % {ext}u;").unwrap();
+                writeln!(s, "            rem = rem / {ext}u;").unwrap();
+            }
+            let mut sidx = String::from("0u");
+            for (name, ext, _) in dims.iter().rev() {
+                sidx = format!("({sidx}) * {ext}u + {name}");
+            }
             let mut addr = format!("{}", r.lo);
             let mut live = String::from("true");
             if r.key.px != 0 {
-                writeln!(s, "            let lx = rem % {px_n}u;").unwrap();
-                writeln!(s, "            rem = rem / {px_n}u;").unwrap();
                 writeln!(s, "            let gx = tile_x * {px_n}u + lx;").unwrap();
                 addr.push_str(&format!(" + {} * i32(gx)", r.key.px));
                 live.push_str(&format!(" && gx < {nx}u"));
             }
             if r.key.py != 0 {
-                writeln!(s, "            let ly = rem % {py_n}u;").unwrap();
-                writeln!(s, "            rem = rem / {py_n}u;").unwrap();
                 writeln!(s, "            let gy = tile_y * {py_n}u + ly;").unwrap();
                 addr.push_str(&format!(" + {} * i32(gy)", r.key.py));
                 live.push_str(&format!(" && gy < {ny}u"));
             }
-            let _ = points;
-            writeln!(s, "            let o = rem % {span}u;").unwrap();
-            writeln!(s, "            rem = rem / {span}u;").unwrap();
-            for ((name, coef), &ext) in r.key.inner.iter().zip(&r.extents).rev() {
-                writeln!(s, "            let {name} = rem % {ext}u;").unwrap();
-                writeln!(s, "            rem = rem / {ext}u;").unwrap();
+            for (name, coef) in &r.key.inner {
                 addr.push_str(&format!(" + {coef} * i32({name})"));
             }
-            writeln!(s, "            let t = rem % {chunk}u;").unwrap();
             addr.push_str(&format!(" + {} * i32(chunk + t) + i32(o)", r.key.red));
             live.push_str(&format!(" && chunk + t < {r_total}u"));
 
@@ -841,7 +858,7 @@ impl TensorGraph {
             writeln!(s, "            if ({live}) {{").unwrap();
             writeln!(
                 s,
-                "                stage_{i}[idx] = b{}[u32({addr})];",
+                "                stage_{i}[{sidx}] = b{}[u32({addr})];",
                 r.key.buffer
             )
             .unwrap();
