@@ -491,18 +491,65 @@ fn cuda_type(ty: &str) -> String {
     panic!("wgsl type {ty}")
 }
 
-/// `name: array<T, N>` → `T name[N]` (nested arrays nest)
+/// `name: array<T, N>` → `T name[N]`, with `T` itself an `Arr<M>` for a
+/// nested array (workgroup accumulators) and `Vec4` for vec4 stages.
 fn cuda_array_decl(name: &str, ty: &str) -> String {
     let ty = ty.trim();
     if let Some(inner) = ty.strip_prefix("array<").and_then(|r| r.strip_suffix('>')) {
-        // split at the last ", "
-        let (elem, n) = inner.rsplit_once(", ").expect("array len");
-        if elem.starts_with("array<") || elem == "vec4<f32>" || elem == "f32" {
-            let e = cuda_array_decl("", elem);
-            return format!("{} {name}[{n}]", e.trim());
+        if let Some((elem, n)) = inner.rsplit_once(", ") {
+            let elem = elem.trim();
+            // outer dimension is a C array; the element type is a value type
+            if elem.starts_with("array<") || elem == "vec4<f32>" {
+                return format!("{} {name}[{n}]", cuda_type(elem));
+            }
         }
     }
     format!("{} {name}", cuda_type(ty))
+}
+
+/// Float literals get an `f` suffix so the math stays single precision.
+fn float_literals(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + 8);
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        let prev_ident = i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+        if c.is_ascii_digit() && !prev_ident {
+            let start = i;
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+            }
+            let mut is_float = false;
+            if i < b.len() && b[i] == b'.' {
+                is_float = true;
+                i += 1;
+                while i < b.len() && b[i].is_ascii_digit() {
+                    i += 1;
+                }
+            }
+            if i < b.len() && (b[i] == b'e' || b[i] == b'E') && is_float {
+                let mut j = i + 1;
+                if j < b.len() && (b[j] == b'+' || b[j] == b'-') {
+                    j += 1;
+                }
+                if j < b.len() && b[j].is_ascii_digit() {
+                    i = j;
+                    while i < b.len() && b[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                }
+            }
+            out.push_str(&s[start..i]);
+            if is_float {
+                out.push('f');
+            }
+            continue;
+        }
+        out.push(c as char);
+        i += 1;
+    }
+    out
 }
 
 /// One statement line. Bindings become `auto`, typed `var`s their type,
@@ -545,7 +592,7 @@ fn cuda_stmt(t: &str) -> String {
     // `Arr<N>(a, b)` → `Arr<N>{{a, b}}`; `Vec4{a, …)` → `Vec4{{a, …}}`
     s = rewrite_ctor(&s, "Arr<");
     s = rewrite_ctor(&s, "Vec4{");
-    s
+    float_literals(&s)
 }
 
 /// Turn `PREFIX…(args)` constructor calls into brace initialization.
