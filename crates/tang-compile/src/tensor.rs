@@ -64,6 +64,13 @@ impl Form {
         }
     }
 
+    fn scaled(&self, c: i64) -> Form {
+        Form {
+            coefs: self.coefs.iter().map(|x| x * c).collect(),
+            offset: self.offset * c,
+        }
+    }
+
     pub fn unit(rank: usize, d: usize) -> Self {
         let mut f = Self::zero(rank);
         f.coefs[d] = 1;
@@ -165,6 +172,45 @@ impl View {
                 .map(|f| f.compose(&inner.forms, rank))
                 .collect(),
         }
+    }
+
+    /// This view reads a tensor of shape `dst` that is a row-major reshape
+    /// of one of shape `src`. When every `src` dim is a contiguous product
+    /// of `dst` dims (a merge, seen from `dst`), the read is affine in the
+    /// source's coordinates and this returns the equivalent view into
+    /// `src`. A reshape that splits a source dim across destination dims
+    /// (`[s, d] -> [s*d]`) is not affine (it needs `/` and `%`): `None`.
+    pub fn through_reshape(&self, dst: &[Dim], src: &[Dim]) -> Option<View> {
+        let dst: Vec<usize> = dst.iter().map(|d| d.fixed()).collect::<Option<_>>()?;
+        let src: Vec<usize> = src.iter().map(|d| d.fixed()).collect::<Option<_>>()?;
+        let rank = self.rank();
+        let mut forms = Vec::with_capacity(src.len());
+        let mut d = 0;
+        for &n in &src {
+            // consume dst dims d.. until their product is n
+            let start = d;
+            let mut prod = 1;
+            while prod < n {
+                prod *= *dst.get(d)?;
+                d += 1;
+            }
+            if prod != n {
+                return None;
+            }
+            // src coord = Σ stride_k · dst_coord_k over the run
+            let mut f = Form::zero(rank);
+            let mut stride = 1i64;
+            for k in (start..d).rev() {
+                let scaled = self.forms[k].scaled(stride);
+                for (o, i) in f.coefs.iter_mut().zip(&scaled.coefs) {
+                    *o += i;
+                }
+                f.offset += scaled.offset;
+                stride *= dst[k] as i64;
+            }
+            forms.push(f);
+        }
+        (d == dst.len()).then_some(View { forms })
     }
 
     /// Drop dependence on size-1 coordinates so equal views compare equal.
@@ -917,12 +963,20 @@ impl TensorGraph {
         let n = self.nodes.len();
         let live = self.live(outputs);
         let is_output = |i: usize| outputs.iter().any(|o| o.n() == i);
-        // a map read through a reshape must stay materialized
+        // a map read through a reshape stays materialized unless every
+        // such reshape is affine (see `View::through_reshape`), in which
+        // case the reshape dissolves into the reader's view
         let reshaped: Vec<bool> = {
             let mut r = vec![false; n];
             for i in 0..n {
                 if let Op::Reshape(src) = self.nodes[i].op {
-                    r[src.n()] = true;
+                    let rank = self.nodes[i].shape.len();
+                    let affine = View::identity(rank, rank)
+                        .through_reshape(&self.nodes[i].shape, &self.nodes[src.n()].shape)
+                        .is_some();
+                    if !affine || is_output(i) {
+                        r[src.n()] = true;
+                    }
                 }
             }
             r
@@ -977,7 +1031,12 @@ impl TensorGraph {
             n_inputs: self.n_inputs,
         };
         let mut remap: Vec<Option<usize>> = vec![None; n];
-        for i in (0..n).filter(|&i| live[i] && !inline[i]) {
+        // an affine reshape of an inlined map dissolves into its readers
+        let dissolved = |i: usize| match self.nodes[i].op {
+            Op::Reshape(src) => inline[src.n()],
+            _ => false,
+        };
+        for i in (0..n).filter(|&i| live[i] && !inline[i] && !dissolved(i)) {
             let node = &self.nodes[i];
             let op = match &node.op {
                 Op::Input(k) => Op::Input(*k),
@@ -1068,6 +1127,18 @@ impl TensorGraph {
         args: &mut Vec<Arg>,
     ) -> ExprId {
         let p = arg.src.n();
+        // an affine reshape of an inlineable map: read the map directly
+        if let Op::Reshape(src) = self.nodes[p].op {
+            if inline[src.n()] {
+                if let Some(view) = arg
+                    .view
+                    .through_reshape(&self.nodes[p].shape, &self.nodes[src.n()].shape)
+                {
+                    let through = Arg { src, view };
+                    return self.splice(&through, rank, inline, remap, body, args);
+                }
+            }
+        }
         if !inline[p] {
             let leaf = Arg {
                 src: TensorId(remap[p].unwrap() as u32),
@@ -2198,6 +2269,46 @@ mod tests {
         close(
             &sg.eval(std::slice::from_ref(&data), &[c])[0],
             &g.eval(std::slice::from_ref(&data), &[s])[0],
+        );
+    }
+
+    #[test]
+    fn maps_substitute_through_affine_reshapes() {
+        // m = 2x read as [4, 2, 4] by a comp: the reshape is a merge seen
+        // from the reader, so m folds into the reader and no buffer remains
+        let mut g = TensorGraph::new();
+        let x = g.input(&[4, 8]);
+        let m = g.map(&[x], |v| v[0] * ExprId::from_f64(2.0)).unwrap();
+        let r = g.reshape(m, &[4, 2, 4]).unwrap();
+        let y = g
+            .comp(
+                &[4, 2],
+                &[4],
+                vec![Arg {
+                    src: r,
+                    view: View::pick(3, &[Some(0), Some(1), Some(2)]),
+                }],
+                Some(Monoid::sum()),
+                |v| vec![v[0]],
+            )
+            .unwrap();
+        let data = ramp(32, 0.25, -1.0);
+        let want = g.eval(std::slice::from_ref(&data), &[y]).remove(0);
+        let (fg, outs) = g.substitute_maps(&[y]);
+        assert_eq!(fg.count_comps(&outs), 1);
+        close(&fg.eval(std::slice::from_ref(&data), &outs)[0], &want);
+
+        // a splitting reshape ([4, 8] -> [32]) is not affine: m stays
+        let mut g = TensorGraph::new();
+        let x = g.input(&[4, 8]);
+        let m = g.map(&[x], |v| v[0] * ExprId::from_f64(2.0)).unwrap();
+        let r = g.reshape(m, &[32]).unwrap();
+        let y = g.reduce(r, 0, Monoid::sum()).unwrap();
+        let (fg, outs) = g.substitute_maps(&[y]);
+        assert_eq!(fg.count_comps(&outs), 2);
+        close(
+            &fg.eval(std::slice::from_ref(&data), &outs)[0],
+            &g.eval(std::slice::from_ref(&data), &[y])[0],
         );
     }
 
