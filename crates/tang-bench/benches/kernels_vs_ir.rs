@@ -398,6 +398,8 @@ mod gpu_block {
             let dims = BlockDims {
                 seq,
                 kv_len,
+                rope: true,
+                bias: true,
                 d_model: 576,
                 n_heads: 9,
                 n_kv_heads: 3,
@@ -440,8 +442,61 @@ mod gpu_block {
     }
 }
 
+mod gpu_train {
+    use super::*;
+    use tang_bench::ir_block::BlockDims;
+    use tang_bench::ir_block_gpu::{hand_train_block, ir_train_executable, params};
+    use tang_gpu::{GpuDevice, GpuTensor, GpuTrainModule, KernelCache};
+
+    pub fn bench_train_step(c: &mut Criterion) {
+        let Ok(device) = GpuDevice::new_sync() else {
+            eprintln!("no GPU, skipping kvi_gpu_train_step");
+            return;
+        };
+        let mut cache = KernelCache::new();
+        let mut group = c.benchmark_group("kvi_gpu_train_step");
+        group.sample_size(10);
+        for &seq in &[32usize, 128] {
+            let dims = BlockDims {
+                seq,
+                kv_len: seq,
+                rope: false,
+                bias: false,
+                d_model: 576,
+                n_heads: 9,
+                n_kv_heads: 3,
+                head_dim: 64,
+                ff_dim: 1536,
+            };
+            let mut rng = tang_bench::Rng::new(1);
+            let x: Vec<f32> = (0..seq * 576).map(|_| rng.f32() * 2.0 - 1.0).collect();
+            let input = GpuTensor::from_slice(&device, &x, &[seq, 576]);
+            let ones = GpuTensor::from_slice(&device, &vec![1.0f32; seq * 576], &[seq, 576]);
+            let p = params(&device, &mut cache, dims, x);
+            let mut hand = hand_train_block(&device, &mut cache, &p);
+            group.bench_function(BenchmarkId::new("hand_fwd_bwd", seq), |b| {
+                b.iter(|| {
+                    let out = hand.forward_train(&device, &mut cache, &input);
+                    let dx = hand.backward(&device, &mut cache, &ones);
+                    black_box((out, dx.to_vec_flushed(&device, &mut cache)));
+                })
+            });
+            let (exe, outs) = ir_train_executable(&device, &p);
+            group.bench_function(BenchmarkId::new("ir_fwd_bwd", seq), |b| {
+                b.iter(|| {
+                    exe.run(&device, &mut cache);
+                    cache.flush(&device);
+                    black_box(exe.read(&device, outs[1]));
+                })
+            });
+        }
+        group.finish();
+    }
+}
+
 criterion_group!(
     gpu_benches,
+    gpu_train::bench_train_step,
     gpu_block::bench_block,
     gpu::bench_attention,
     gpu_matmul::bench_matmul,

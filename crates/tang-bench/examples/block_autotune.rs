@@ -14,6 +14,8 @@ fn main() {
     let dims = BlockDims {
         seq,
         kv_len: seq,
+        rope: true,
+        bias: true,
         d_model: 576,
         n_heads: 9,
         n_kv_heads: 3,

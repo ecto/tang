@@ -450,3 +450,21 @@ through `substitute_maps` + `schedule_auto` + `to_wgsl`, and compares the
 GPU gradients w.r.t. the input and `wq` against the f64 interpreter:
 max error 5e-7, 42 kernels. There is no hand-written backward kernel for
 any of it; rope and GQA gradients come out of the `iota`-gated scatter.
+
+### GPU: a training step, hand-written vs derived
+
+`GpuTrainTransformerBlock` is tang-gpu's hand-written trainable block (no
+rope, no biases; its attention backward runs on the CPU over copied
+activations — nobody wrote the GPU version). The derived step is the same
+block built in IR with `rope: false, bias: false`, `backward` for the
+input and all seven weights, then `substitute_maps` + `schedule_auto` +
+`to_wgsl`, one program. All nine outputs match to ~1e-6.
+
+| seq | hand fwd+bwd | derived fwd+bwd |
+|---|---|---|
+| 32 | 60.9 ms | **4.87 ms** |
+| 128 | 174 ms | **10.1 ms** |
+
+The asymmetry is the point: the hand path has a fast forward and a slow
+backward because a GPU backward for attention was never written. The
+derived path has neither problem, because nothing about it was written.

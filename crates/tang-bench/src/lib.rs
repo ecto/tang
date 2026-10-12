@@ -868,6 +868,11 @@ pub mod ir_block {
         /// `x`. `> seq`: decode, rotated k/v caches are graph inputs and
         /// the queries sit at positions `kv_len - seq ..`.
         pub kv_len: usize,
+        /// interleaved RoPE on q/k (the inference block); off matches the
+        /// hand-written trainable block, which has neither rope nor biases
+        pub rope: bool,
+        /// biases on every projection
+        pub bias: bool,
         pub d_model: usize,
         pub n_heads: usize,
         pub n_kv_heads: usize,
@@ -903,10 +908,11 @@ pub mod ir_block {
         f
     }
 
-    /// `x · wᵀ + b` for `w: [out, in]`, `b: [out]`.
-    fn linear(g: &mut TensorGraph, x: TensorId, w: TensorId, b: TensorId) -> TensorId {
+    /// `x · wᵀ + b` for `w: [out, in]`, `b: [out]` (`b = None`: no bias).
+    fn linear(g: &mut TensorGraph, x: TensorId, w: TensorId, b: Option<TensorId>) -> TensorId {
         let wt = g.transpose(w, &[1, 0]).unwrap();
         let y = g.matmul(x, wt).unwrap();
+        let Some(b) = b else { return y };
         let shape = g.shape(y).to_vec();
         let rank = shape.len();
         let args = vec![
@@ -942,6 +948,7 @@ pub mod ir_block {
 
     /// Interleaved RoPE on `x: [seq, heads*head_dim]` as two tensors of
     /// even/odd rotated components, `[seq, heads, head_dim/2]`, scaled.
+    #[allow(clippy::too_many_arguments)]
     fn rope_split(
         g: &mut TensorGraph,
         x: TensorId,
@@ -950,6 +957,7 @@ pub mod ir_block {
         cos: TensorId,
         sin: TensorId,
         scale: f64,
+        rope: bool,
     ) -> (TensorId, TensorId) {
         let seq = g.shape(x)[0].n();
         let half = head_dim / 2;
@@ -963,6 +971,23 @@ pub mod ir_block {
         let tv = View {
             forms: vec![unit(3, 0), unit(3, 2)],
         };
+        if !rope {
+            // no rotation: just the even/odd halves, scaled
+            let halves = [0i64, 1].map(|parity| {
+                g.comp(
+                    &out,
+                    &[],
+                    vec![Arg {
+                        src: x,
+                        view: xv(parity),
+                    }],
+                    None,
+                    |v| vec![v[0] * ExprId::from_f64(scale)],
+                )
+                .unwrap()
+            });
+            return (halves[0], halves[1]);
+        }
         let args = |g: &TensorGraph| {
             let _ = g;
             vec![
@@ -1019,6 +1044,8 @@ pub mod ir_block {
         let BlockDims {
             seq,
             kv_len,
+            rope,
+            bias,
             d_model,
             n_heads,
             n_kv_heads,
@@ -1026,6 +1053,7 @@ pub mod ir_block {
             ff_dim,
         } = *dims;
         let decode = kv_len != seq;
+        let b = |t: TensorId| bias.then_some(t);
         let groups = n_kv_heads;
         let per_group = n_heads / n_kv_heads;
         let half = head_dim / 2;
@@ -1053,9 +1081,9 @@ pub mod ir_block {
         let caches = decode.then(|| (g.input(&[kv_len, kv_dim]), g.input(&[kv_len, kv_dim])));
 
         let normed = rmsnorm(&mut g, x);
-        let q = linear(&mut g, normed, wq, bq);
+        let q = linear(&mut g, normed, wq, b(bq));
         let scale = 1.0 / (head_dim as f64).sqrt();
-        let (qe, qo) = rope_split(&mut g, q, n_heads, head_dim, cos, sin, scale);
+        let (qe, qo) = rope_split(&mut g, q, n_heads, head_dim, cos, sin, scale, rope);
         let (ke, ko, v) = match caches {
             // cache rows are already rotated: split even/odd by view only
             Some((k_cache, v_cache)) => {
@@ -1076,9 +1104,9 @@ pub mod ir_block {
                 (halves[0], halves[1], v_cache)
             }
             None => {
-                let k = linear(&mut g, normed, wk, bk);
-                let v = linear(&mut g, normed, wv, bv);
-                let (ke, ko) = rope_split(&mut g, k, n_kv_heads, head_dim, cos, sin, 1.0);
+                let k = linear(&mut g, normed, wk, b(bk));
+                let v = linear(&mut g, normed, wv, b(bv));
+                let (ke, ko) = rope_split(&mut g, k, n_kv_heads, head_dim, cos, sin, 1.0, rope);
                 (ke, ko, v)
             }
         };
@@ -1218,17 +1246,21 @@ pub mod ir_block {
                 |a| vec![a[0] * a[1]],
             )
             .unwrap();
-        let bob = g.broadcast_bias(proj, bo);
+        let bob = if bias {
+            g.broadcast_bias(proj, bo)
+        } else {
+            proj
+        };
         let res1 = g.map(&[x, bob], |a| a[0] + a[1]).unwrap();
         let normed2 = rmsnorm(&mut g, res1);
-        let gate = linear(&mut g, normed2, w_gate, b_gate);
-        let up = linear(&mut g, normed2, w_up, b_up);
+        let gate = linear(&mut g, normed2, w_gate, b(b_gate));
+        let up = linear(&mut g, normed2, w_up, b(b_up));
         let act = g
             .map(&[gate, up], |a| {
                 a[0] / (ExprId::from_f64(1.0) + (-a[0]).exp()) * a[1]
             })
             .unwrap();
-        let ffn = linear(&mut g, act, w_down, b_down);
+        let ffn = linear(&mut g, act, w_down, b(b_down));
         let out = g.map(&[res1, ffn], |a| a[0] + a[1]).unwrap();
         (
             g,
@@ -1287,6 +1319,8 @@ pub mod ir_block {
             let dims = BlockDims {
                 seq: 3,
                 kv_len: 3,
+                rope: true,
+                bias: true,
                 d_model: 8,
                 n_heads: 2,
                 n_kv_heads: 1,
@@ -1543,6 +1577,58 @@ pub mod ir_block_gpu {
         (Executable::new(device, g.to_wgsl(&[y]), &inputs), y)
     }
 
+    /// tang-gpu's hand-written trainable block (`GpuTrainTransformerBlock`:
+    /// no rope, no biases) loaded with the same weights as `p`.
+    pub fn hand_train_block(
+        device: &GpuDevice,
+        cache: &mut KernelCache,
+        p: &Params,
+    ) -> GpuTrainTransformerBlock {
+        let d = &p.dims;
+        assert!(
+            !d.rope && !d.bias,
+            "the hand trainable block has no rope/biases"
+        );
+        let mut attn =
+            GpuCausalAttention::zeros(device, d.d_model, d.n_heads, d.n_kv_heads, d.head_dim);
+        attn.wq = p.wq.weight.clone_gpu_batched(device, cache);
+        attn.wk = p.wk.weight.clone_gpu_batched(device, cache);
+        attn.wv = p.wv.weight.clone_gpu_batched(device, cache);
+        attn.wo = p.wo.weight.clone_gpu_batched(device, cache);
+        let mut ffn = GpuSwiGLU::zeros(device, d.d_model, d.ff_dim);
+        ffn.gate_proj = p.gate.weight.clone_gpu_batched(device, cache);
+        ffn.up_proj = p.up.weight.clone_gpu_batched(device, cache);
+        ffn.down_proj = p.down.weight.clone_gpu_batched(device, cache);
+        GpuTrainTransformerBlock::new(
+            GpuRMSNorm::new(device, d.d_model, 1e-6),
+            attn,
+            GpuRMSNorm::new(device, d.d_model, 1e-6),
+            ffn,
+        )
+    }
+
+    /// Forward + backward of the derived block as one program: outputs
+    /// are `[out, dx, dwq, dwk, dwv, dwo, dgate, dup, ddown]` for
+    /// `loss = sum(out)`.
+    pub fn ir_train_executable(
+        device: &GpuDevice,
+        p: &Params,
+    ) -> (Executable, Vec<tang_compile::tensor::TensorId>) {
+        use tang_compile::tensor::TensorId;
+        let (mut g, out) = transformer_block(&p.dims);
+        let wrt: Vec<TensorId> = [0usize, 1, 3, 5, 7, 9, 11, 13]
+            .iter()
+            .map(|&i| TensorId::from_index(i))
+            .collect();
+        let grads = g.backward(out, &wrt).unwrap();
+        let mut outs = vec![out];
+        outs.extend(grads);
+        let (mut g, outs) = g.substitute_maps(&outs);
+        g.schedule_auto(&outs);
+        let inputs: Vec<&[f32]> = p.cpu.iter().map(|v| v.as_slice()).collect();
+        (Executable::new(device, g.to_wgsl(&outs), &inputs), outs)
+    }
+
     /// The block under the per-kernel autotuner, cached in
     /// `target/tang-tuning-block-<seq>.txt` for this device.
     pub fn ir_executable_tuned(
@@ -1685,6 +1771,8 @@ pub mod ir_block_gpu {
             let dims = BlockDims {
                 seq: 12,
                 kv_len: 12,
+                rope: true,
+                bias: true,
                 d_model: 96,
                 n_heads: 6,
                 n_kv_heads: 2,
@@ -1806,6 +1894,8 @@ pub mod ir_block_gpu {
             let dims = BlockDims {
                 seq: 12,
                 kv_len: 12,
+                rope: true,
+                bias: true,
                 d_model: 64,
                 n_heads: 4,
                 n_kv_heads: 2,
@@ -1856,6 +1946,82 @@ pub mod ir_block_gpu {
             }
         }
 
+        /// Hand-written trainable block (forward_train + backward) vs the
+        /// derived forward + backward on identical weights.
+        #[test]
+        fn derived_train_step_matches_hand_train_block() {
+            let Ok(device) = GpuDevice::new_sync() else {
+                eprintln!("no GPU, skipping");
+                return;
+            };
+            let mut cache = KernelCache::new();
+            let dims = BlockDims {
+                seq: 10,
+                kv_len: 10,
+                rope: false,
+                bias: false,
+                d_model: 48,
+                n_heads: 4,
+                n_kv_heads: 2,
+                head_dim: 12,
+                ff_dim: 32,
+            };
+            let mut rng = crate::Rng::new(41);
+            let x: Vec<f32> = (0..dims.seq * dims.d_model)
+                .map(|_| rng.f32() * 2.0 - 1.0)
+                .collect();
+            let input = GpuTensor::from_slice(&device, &x, &[dims.seq, dims.d_model]);
+            let p = params(&device, &mut cache, dims, x);
+
+            let mut hand = hand_train_block(&device, &mut cache, &p);
+            let out_hand = hand
+                .forward_train(&device, &mut cache, &input)
+                .to_vec_flushed(&device, &mut cache);
+            let ones = GpuTensor::from_slice(
+                &device,
+                &vec![1.0f32; p.dims.seq * p.dims.d_model],
+                &[p.dims.seq, p.dims.d_model],
+            );
+            let dx_hand = hand
+                .backward(&device, &mut cache, &ones)
+                .to_vec_flushed(&device, &mut cache);
+            // gradients(): ln1 weight, wq, wk, wv, wo, ln2 weight, gate, up, down
+            let hand_grads: Vec<Vec<f32>> = hand
+                .gradients()
+                .iter()
+                .map(|g| {
+                    g.map(|t| t.to_vec_flushed(&device, &mut cache))
+                        .unwrap_or_default()
+                })
+                .collect();
+
+            let (exe, outs) = ir_train_executable(&device, &p);
+            exe.run(&device, &mut cache);
+            cache.flush(&device);
+            let got: Vec<Vec<f32>> = outs.iter().map(|o| exe.read(&device, *o)).collect();
+
+            let check = |name: &str, a: &[f32], b: &[f32]| {
+                assert_eq!(a.len(), b.len(), "{name} length");
+                let scale = b.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                let err = a
+                    .iter()
+                    .zip(b)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0f32, f32::max);
+                eprintln!("{name}: max err {err} (scale {scale})");
+                assert!(err < 2e-3 * scale.max(1.0), "{name} diverges");
+            };
+            check("out", &got[0], &out_hand);
+            check("dx", &got[1], &dx_hand);
+            check("dwq", &got[2], &hand_grads[1]);
+            check("dwk", &got[3], &hand_grads[2]);
+            check("dwv", &got[4], &hand_grads[3]);
+            check("dwo", &got[5], &hand_grads[4]);
+            check("dgate", &got[6], &hand_grads[6]);
+            check("dup", &got[7], &hand_grads[7]);
+            check("ddown", &got[8], &hand_grads[8]);
+        }
+
         #[test]
         fn derived_decode_block_matches_hand() {
             let Ok(device) = GpuDevice::new_sync() else {
@@ -1866,6 +2032,8 @@ pub mod ir_block_gpu {
             let dims = BlockDims {
                 seq: 2,
                 kv_len: 40,
+                rope: true,
+                bias: true,
                 d_model: 192,
                 n_heads: 6,
                 n_kv_heads: 2,
@@ -1906,6 +2074,8 @@ pub mod ir_block_gpu {
             let dims = BlockDims {
                 seq: 24,
                 kv_len: 24,
+                rope: true,
+                bias: true,
                 d_model: 192,
                 n_heads: 6,
                 n_kv_heads: 2,
