@@ -54,11 +54,8 @@ fn main() {
     eprintln!("train: {} kernels", prog.kernels.len());
     for (i, k) in prog.kernels.iter().enumerate() {
         eprintln!(
-            "  k{i} node {} points {} count {} wg {}",
-            format!("{:?}", k.node),
-            k.points,
-            k.count,
-            k.workgroup_size
+            "  k{i} node {:?} points {} count {} wg {}",
+            k.node, k.points, k.count, k.workgroup_size
         );
     }
     let train = Executable::new(&device, prog, &inputs);

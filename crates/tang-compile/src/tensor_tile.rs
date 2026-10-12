@@ -158,9 +158,6 @@ struct Ctx<'a> {
     py: Option<String>,
     bx: usize,
     by: usize,
-    /// register tile
-    rx: usize,
-    ry: usize,
     chunk: usize,
     sites: Vec<Site>,
     /// extents of inner loop vars
@@ -582,8 +579,6 @@ impl TensorGraph {
             py: dy.map(|d| format!("p{d}")),
             bx: px_n,
             by: py_n,
-            rx,
-            ry,
             chunk,
             sites: Vec::new(),
             extents: BTreeMap::new(),
