@@ -13,11 +13,6 @@ fn main() {
     use tang_gpu::program::{Program, Runtime};
 
     let seq: usize = std::env::args().nth(1).map_or(512, |s| s.parse().unwrap());
-    let rt = Runtime::select().expect("gpu");
-    assert!(
-        matches!(rt, Runtime::Cuda(_)),
-        "needs the CUDA backend (an NVIDIA GPU, --features cuda)"
-    );
     let mut rng = tang_bench::Rng::new(7);
     let dims = BlockDims {
         seq,
@@ -54,6 +49,30 @@ fn main() {
         })
         .collect();
     let refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
+    if let Ok(path) = std::env::var("TANG_CHECK") {
+        // the f64 reference is slow and needs no GPU: computed once into
+        // `path` before touching the device (run it outside the GPU lock)
+        if std::fs::metadata(&path).is_err() {
+            let f64s: Vec<Vec<f64>> = inputs
+                .iter()
+                .map(|v| v.iter().map(|&x| x as f64).collect())
+                .collect();
+            let want = tg.eval(&f64s, &outs);
+            let bytes: Vec<u8> = want
+                .iter()
+                .flatten()
+                .flat_map(|x| x.to_le_bytes())
+                .collect();
+            std::fs::write(&path, bytes).unwrap();
+            println!("wrote reference to {path}");
+            return;
+        }
+    }
+    let rt = Runtime::select().expect("gpu");
+    assert!(
+        matches!(rt, Runtime::Cuda(_)),
+        "needs the CUDA backend (an NVIDIA GPU, --features cuda)"
+    );
     if let Ok(dir) = std::env::var("TANG_DUMP") {
         for (i, (k, kp)) in native.kernels.iter().zip(&plain.kernels).enumerate() {
             let n = k.node.index();
@@ -69,8 +88,9 @@ fn main() {
         // every output (loss and gradients) against the f64 evaluation,
         // which is slow: computed once into `path` (run without the GPU
         // lock), then compared on later runs
-        let want: Vec<Vec<f64>> = match std::fs::read(&path) {
-            Ok(bytes) => {
+        let want: Vec<Vec<f64>> = {
+            let bytes = std::fs::read(&path).unwrap();
+            {
                 let flat: Vec<f64> = bytes
                     .chunks(8)
                     .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
@@ -83,21 +103,6 @@ fn main() {
                         flat[at - len..at].to_vec()
                     })
                     .collect()
-            }
-            Err(_) => {
-                let f64s: Vec<Vec<f64>> = inputs
-                    .iter()
-                    .map(|v| v.iter().map(|&x| x as f64).collect())
-                    .collect();
-                let want = tg.eval(&f64s, &outs);
-                let bytes: Vec<u8> = want
-                    .iter()
-                    .flatten()
-                    .flat_map(|x| x.to_le_bytes())
-                    .collect();
-                std::fs::write(&path, bytes).unwrap();
-                println!("wrote reference to {path}");
-                return;
             }
         };
         for (o, w) in outs.iter().zip(&want) {

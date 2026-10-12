@@ -1272,6 +1272,39 @@ impl TensorGraph {
         }
     }
 
+    /// The affine mask condition of an online-softmax reduction whose slot
+    /// 0 is `score + select(cond, ≤ −1e20, 0)` (`score` the arg
+    /// `score_arg`), `cond` affine in iotas: where `cond > 0` the element
+    /// contributes nothing, so a tile where it holds everywhere is skipped.
+    pub(super) fn score_mask(&self, c: &super::Comp, score_arg: usize) -> Option<super::Form> {
+        let n = c.body.nodes_slice();
+        let is_score = |e: tang_expr::ExprId| matches!(n[e.index() as usize], Node::Var(v) if v as usize == score_arg);
+        let Node::Add(x, y) = n[c.body_outs[0].index() as usize] else {
+            return None;
+        };
+        if !is_score(x) && !is_score(y) {
+            return None;
+        }
+        let other = if is_score(x) { y } else { x };
+        let Node::Select(cnd, a, b) = n[other.index() as usize] else {
+            return None;
+        };
+        let lit = |e: tang_expr::ExprId| match n[e.index() as usize] {
+            Node::Lit(b) => Some(f64::from_bits(b)),
+            _ => None,
+        };
+        match (lit(a), lit(b)) {
+            (Some(neg), Some(zero)) if neg <= -1e20 && zero == 0.0 => self
+                .affine_of(c, cnd)
+                .filter(|(_, k)| k.fract() == 0.0)
+                .map(|(mut f, k)| {
+                    f.offset += k as i64;
+                    f
+                }),
+            _ => None,
+        }
+    }
+
     /// `e` as an affine form over `c`'s space when it is built from iota
     /// reads, literals, `+`, `−` and literal scaling.
     fn affine_of(&self, c: &super::Comp, e: tang_expr::ExprId) -> Option<(super::Form, f64)> {
@@ -1468,36 +1501,7 @@ impl TensorGraph {
                 return None;
             }
         }
-        // mask: slot 0 = score + select(cond, ≤ −1e20, 0), cond affine
-        let mask = {
-            let n = c.body.nodes_slice();
-            let is_score = |e: tang_expr::ExprId| matches!(n[e.index() as usize], Node::Var(v) if v as usize == score_arg);
-            match n[c.body_outs[0].index() as usize] {
-                Node::Add(x, y) if is_score(x) || is_score(y) => {
-                    let other = if is_score(x) { y } else { x };
-                    match n[other.index() as usize] {
-                        Node::Select(cnd, a, b) => {
-                            let lit = |e: tang_expr::ExprId| match n[e.index() as usize] {
-                                Node::Lit(b) => Some(f64::from_bits(b)),
-                                _ => None,
-                            };
-                            match (lit(a), lit(b)) {
-                                (Some(neg), Some(zero)) if neg <= -1e20 && zero == 0.0 => self
-                                    .affine_of(c, cnd)
-                                    .filter(|(_, k)| k.fract() == 0.0)
-                                    .map(|(mut f, k)| {
-                                        f.offset += k as i64;
-                                        f
-                                    }),
-                                _ => None,
-                            }
-                        }
-                        _ => None,
-                    }
-                }
-                _ => None,
-            }
-        };
+        let mask = self.score_mask(c, score_arg);
         Some(AttentionPlan {
             red,
             score_arg,
