@@ -1309,3 +1309,68 @@ tile box it gives a uniform skip test). TFLOP/s counts 4·h·n²·d (×½ causal
   guarded views, any per-row slots, dv blocked as a grid axis, GQA via
   `[hk, g]` heads). Folding `flash_tile` onto `attention_plan` is a
   follow-up.
+
+#### Speed pass (supersedes the fragment column above)
+
+Same harness (`ATT_HEADS`, `ATT_CAUSAL`, `ATT_SAMPLES` select shapes;
+best of 7), SDPA from the same `gpu-lock` window. The 4-head rows at
+n = 128–512, non-causal, are the phoneme-encoder shape of the voice
+model.
+
+| heads | causal | n | f32-auto | fragment | vs f32 | TFLOP/s | SDPA f32 | SDPA f16 | vs SDPA f16 |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | no | 512 | 0.080 | **0.029** | 2.75× | 2.32 | 0.169 | 0.084 | 2.9× faster |
+| 1 | no | 1024 | 0.250 | **0.052** | 4.82× | 5.17 | 0.076 | 0.099 | 1.9× faster |
+| 1 | no | 4096 | 3.311 | **0.504** | 6.57× | 8.52 | 0.555 | 0.517 | 1.03× faster |
+| 1 | yes | 512 | 0.086 | **0.030** | 2.88× | 1.12 | 0.046 | 0.054 | 1.8× faster |
+| 1 | yes | 1024 | 0.280 | **0.054** | 5.21× | 2.50 | 0.080 | 0.099 | 1.8× faster |
+| 1 | yes | 4096 | 3.768 | **0.298** | 12.6× | 7.20 | 0.408 | 0.462 | 1.6× faster |
+| 4 | no | 128 | 0.024 | **0.012** | 1.96× | 1.35 | 0.058 | 0.069 | 5.8× faster |
+| 4 | no | 256 | 0.067 | **0.018** | 3.68× | 3.71 | 0.095 | 0.049 | 2.7× faster |
+| 4 | no | 512 | 0.222 | **0.041** | 5.44× | 6.57 | 0.051 | 0.055 | 1.3× faster |
+| 4 | no | 4096 | 13.01 | 1.967 | 6.61× | 8.73 | 1.722 | 1.496 | 1.31× slower |
+| 4 | yes | 4096 | 15.03 | 0.835 | 18.0× | 10.3 | 0.993 | 0.871 | 1.04× faster |
+| 8 | no | 512 | 0.422 | 0.069 | 6.09× | 7.74 | 0.080 | 0.071 | 1.03× faster |
+| 8 | no | 1024 | 1.660 | **0.221** | 7.53× | 9.74 | 0.250 | 0.235 | 1.06× faster |
+| 8 | no | 4096 | 26.15 | 3.411 | 7.67× | 10.1 | 3.459 | 2.696 | 1.27× slower |
+| 8 | yes | 512 | 0.482 | **0.047** | 10.3× | 5.72 | 0.062 | 0.066 | 1.4× faster |
+| 8 | yes | 1024 | 1.925 | **0.124** | 15.5× | 8.65 | 0.166 | 0.153 | 1.23× faster |
+| 8 | yes | 4096 | 29.85 | 1.669 | 17.9× | 10.3 | 1.874 | 1.506 | 1.11× slower |
+
+(ms.) ~3 → ~10 TFLOP/s. Each change measured on its own (8 heads, d 64,
+ms before → after; the GPU is shared, so ±10% run to run):
+
+| change | 8h n1024 | 8h n4096 | 8h n4096 causal | 1h n512 | kept |
+|---|---|---|---|---|---|
+| baseline (PR #40) | 0.785 | 16.46 | 7.77 | 0.182 | |
+| Q/K/V staged with `half4` copies when the read is a direct unit-stride f16 view (`direct_f16`, `stage_direct`) | 0.533 | 11.48 | 6.31 | 0.121 | yes |
+| `exp2` with log2 e folded into the score | 0.546 | 11.88 | 6.55 | 0.111 | no (no change: fast-math `exp` already is `exp2`) |
+| K/V fragments `simdgroup_load`ed straight from device memory when every key tile and value block is full — no staging, no barriers in the key loop | 0.495 | 10.69 | 4.75 | 0.100 | yes |
+| epilogue from the accumulator registers (lane owns row `fm`, cols `fn`, `fn+1`): no result tile, no row-stat tile, threadgroup memory 9.6 → 4.6 KB | 0.452 | 7.85 | 4.39 | 0.104 | yes |
+| 16 rows per SIMD group (RF 2) via references into the fragment arrays | 0.648 | 11.76 | 8.22 | 0.231 | no (spills) |
+| **every constant-trip loop unrolled in the generated text** (`unroll_const_loops`: `{ const uint jf = 3u; … }` scopes) | **0.230** | **3.85** | **1.98** | **0.031** | yes |
+| then RF 2 again (fully unrolled) | 0.279 | 4.13 | 2.11 | 0.107 | no |
+| then BK 64 | 0.266 | 4.37 | 2.55 | 0.035 | no |
+| then `exp2` again | 0.255 | 3.85 | 2.04 | 0.030 | no (neutral) |
+
+What this shows:
+
+- **The big one was the compiler, not the algorithm.** The kernel indexed
+  `simdgroup_matrix` arrays and `thread_elements()` with loop variables;
+  Metal left some of those loops rolled and the fragments went through
+  the stack. Ablations before the fix said as much: dropping the K/V
+  loads or the `exp`s changed nothing, so the MMA loop itself was
+  stalled. Unrolling in the emitter (constant indices everywhere)
+  doubled throughput on every shape. Any fragment kernel that indexes
+  fragment arrays dynamically should get the same pass.
+- Bigger register tiles (16 rows per SIMD group, BK 64) lose on M4 at
+  d = 64: register pressure costs more occupancy than the extra
+  fragment reuse buys. MLX's 8 rows × BK 32 is the right shape here.
+- Key-split (flash-decoding) was not needed for the targets: 1 head
+  n = 512 runs 0.029 ms, 2.75× under f32-auto and 2.9× under SDPA f16,
+  despite only 16 threadgroups. It stays the lever for single-query /
+  very short-query decode.
+- Still behind SDPA f16 by 1.1–1.3× at n = 4096 (8 heads; 4 heads
+  non-causal). Ragged shapes (n not a multiple of 32, dv not a multiple
+  of the 64-column block) take the staged `half4`/gather path with
+  barriers.

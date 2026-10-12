@@ -1,6 +1,6 @@
 """PyTorch MPS scaled_dot_product_attention, the comparison point for
 `cargo run --release -p tang-bench --features metal --example attention_fragments`.
-Same shapes: d = 64, heads 1 and 8, causal and not. 20 launches per
+Same shapes: d = 64, heads 1, 4, 8 (ATT_HEADS), causal and not. 20 launches per
 sample, one sync, best of three; f32 and f16.
 
     ~/.cache/kv/bin/python scripts/torch_attention.py [n ...]
@@ -16,8 +16,11 @@ d, iters = 64, 20
 dev = torch.device("mps")
 print(f"torch {torch.__version__} MPS SDPA, d = {d}, ms")
 print("heads causal     n    sdpa-f32   sdpa-f16")
-for h in (1, 8):
-    for causal in (False, True):
+import os
+heads = [int(h) for h in os.environ.get("ATT_HEADS", "1,4,8").split(",")]
+causals = {"0": [False], "1": [True]}.get(os.environ.get("ATT_CAUSAL", ""), [False, True])
+for h in heads:
+    for causal in causals:
         for n in ns:
             row = []
             for dt in (torch.float32, torch.float16):

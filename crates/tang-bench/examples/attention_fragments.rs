@@ -1,6 +1,6 @@
 //! Derived flash attention on the native Metal backend: the best f32
 //! schedule (`schedule_auto`, MSL) vs simdgroup fragments (q/k/v f16, f32
-//! accumulate). d = dv = 64; single head and 8 heads; causal and not.
+//! accumulate). d = dv = 64; 1, 4 and 8 heads (`ATT_HEADS`); causal and not.
 //! Kernel-only, 20 launches per sample, best of three; each fragment run
 //! is checked against the f32 kernel.
 //!
@@ -22,8 +22,19 @@ fn main() {
     let d = 64;
     println!("{} — attention, d = dv = {d}, kernel-only ms", dev.name);
     println!("heads causal     n   f32-auto   fragment  speedup  TFLOP/s(frag)  max|diff|");
-    for &h in &[1usize, 8] {
-        for causal in [false, true] {
+    let heads: Vec<usize> = std::env::var("ATT_HEADS")
+        .unwrap_or_else(|_| "1,4,8".into())
+        .split(',')
+        .map(|h| h.parse().unwrap())
+        .collect();
+    let causals: Vec<bool> = match std::env::var("ATT_CAUSAL").as_deref() {
+        Ok("0") => vec![false],
+        Ok("1") => vec![true],
+        _ => vec![false, true],
+    };
+    let samples: usize = std::env::var("ATT_SAMPLES").map_or(3, |s| s.parse().unwrap());
+    for &h in &heads {
+        for &causal in &causals {
             for &n in &ns {
                 let mut rng = tang_bench::Rng::new(5);
                 let mut r = |k: usize| (0..k).map(|_| rng.f32() * 2.0 - 1.0).collect::<Vec<f32>>();
@@ -31,7 +42,7 @@ fn main() {
                 let refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
                 let iters = 20;
                 let best = |exe: &Executable| {
-                    (0..3)
+                    (0..samples)
                         .map(|_| exe.time(&dev, iters))
                         .fold(f64::INFINITY, f64::min)
                 };
