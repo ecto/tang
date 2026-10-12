@@ -672,27 +672,46 @@ Where the gap is, and how much of it this path can close:
   scalar FMAs. Same structure, 4–10× slower execution, for the two
   reasons above.
 
-### After the fusion passes (RTX 3090, same script, GPU shared with another process at ~55%)
+### After the fusion passes and vec4 stage reads
 
-| op | before | after | PyTorch |
-|---|---|---|---|
-| block fwd, seq 128 | 1.97 ms | **1.46 ms** (16 kernels) | 0.295 |
-| block fwd+bwd, seq 128 | 5.0 | **3.55** (62 kernels) | 1.32 |
-| block fwd, seq 512 | 4.41 | 4.75 | 0.610 |
-| block fwd+bwd, seq 512 | 10.1 | 13.2 | 1.73 |
-| matmul 1024² | 0.54 | 0.54 (`reg8` 0.44) | 0.112 |
-| attention n=1024 | 0.77 | 0.74 | 0.180 |
+Same script, both chips, one run each. The 3090 run had the GPU to
+itself (1% util); its CPU was loaded (load avg 26), which is why the
+PyTorch block numbers — launch-bound on the CPU side — came out higher
+than the first table's. Both PyTorch columns are shown.
 
-The seq-128 numbers are launch-bound and show the fusion work (−26%
-forward, −29% training step). The seq-512 numbers are compute-bound and
-moved with the other tenant's load, not with the code. Walking the
-staged regions in address order (coalesced loads) changed nothing at
-1024²: the tile is bound by shared-memory load issue (8 scalar loads per
-16 FMAs with a 4×4 register tile), which is why 8×8 now edges ahead.
-The next step on this axis is `vec4` reads of the point-minor stage —
-a thread's register-tile points are contiguous there — which cuts the
-load count 4× and is the known recipe for 10–15 TFLOPS in a portable
-shader.
+| op | 3090 before | 3090 after | PyTorch (1st / this run) | M4 after |
+|---|---|---|---|---|
+| matmul 1024² | 0.54 ms | **0.28** (7.6 TFLOPS) | 0.112 / 0.114 | 0.52 |
+| matmul 128×576×1536 | 0.20 | **0.10** | 0.030 / 0.035 | 0.13 |
+| matmul 512×576×1536 | 0.28 | **0.16** | 0.053 / 0.054 | 0.23 |
+| attention n=512 | 0.27 | 0.25 | 0.090 | 0.26 |
+| attention n=1024 | 0.77 | 0.74 | 0.180 | 0.76 |
+| block fwd, seq 128 | 1.97 | **1.06** (16 kernels) | 0.295 / 0.566 | 1.14 |
+| block fwd, seq 512 | 4.41 | **3.34** | 0.610 / 1.208 | 3.37 |
+| block fwd+bwd, seq 128 | 5.0 | **3.15** (62 kernels) | 1.32 / 2.11 | 3.53 |
+| block fwd+bwd, seq 512 | 10.1 | **8.19** | 1.73 / 1.99 | 13.2 |
+| adam 4M | 0.54 | 0.47 | 0.395 / 0.451 | — |
+
+What moved it:
+
+- **Fusion** (epilogues for tuple-state reductions, views through
+  affine reshapes, sibling merging) plus one submission per program:
+  the launch-bound seq-128 block, −46% forward, −37% training step.
+- **`vec4` reads of the point-minor stage.** A thread's register-tile
+  points are contiguous there, so a 4-wide tile reads each operand as
+  one vector per r0 instead of four scalars: matmul 1024² 0.54 → 0.28 ms
+  on the 3090 and 0.78 → 0.52 on the M4. This is the shared-memory
+  load-issue bound the previous section predicted; the next rungs on the
+  same ladder are 8×8 tiles with vec4 (now that loads are cheap enough
+  to feed them), `vec4` global loads into the stage, and double
+  buffering.
+- Coalesced staging loads alone changed nothing measurable; the tile
+  was never global-load bound at these sizes.
+
+The gap to PyTorch is now 2.5× on matmul, 3–4× on attention and the
+block forward, 4× on the training step (against its quieter numbers).
+What remains is tensor cores (unreachable from WGSL; a backend
+question) and the rest of the instruction-quality ladder above.
 
 What this does and does not show: the compiler derives the *structure* of
 the fast kernels (flash attention, register-tiled matmul, sequence
