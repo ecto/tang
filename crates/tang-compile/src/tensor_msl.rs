@@ -1225,7 +1225,10 @@ pub struct AttentionPlan {
 
 impl TensorGraph {
     /// Flatten a product body into its var factors and literal scale.
-    fn product_factors(g: &tang_expr::ExprGraph, root: tang_expr::ExprId) -> Option<(Vec<u16>, f64)> {
+    fn product_factors(
+        g: &tang_expr::ExprGraph,
+        root: tang_expr::ExprId,
+    ) -> Option<(Vec<u16>, f64)> {
         let nodes = g.nodes_slice();
         let mut vars = Vec::new();
         let mut scale = 1.0;
@@ -1341,7 +1344,11 @@ impl TensorGraph {
         if red != root {
             self.attention_epilogue(root, red)?;
         }
-        let pts: Vec<usize> = c.points().iter().map(|d| d.fixed()).collect::<Option<_>>()?;
+        let pts: Vec<usize> = c
+            .points()
+            .iter()
+            .map(|d| d.fixed())
+            .collect::<Option<_>>()?;
         let pk = pts.len();
         let nk = c.red[0].fixed()?;
         let live_vars = |out: tang_expr::ExprId| -> Vec<usize> {
@@ -1415,7 +1422,9 @@ impl TensorGraph {
         for (slot, &out) in c.body_outs.iter().enumerate().skip(1) {
             let vars = live_vars(out);
             let wide = vars.iter().any(|&v| {
-                (0..pk).any(|d| d != dr && c.args[v].view.depends_on(d) && pts[d] > 1 && !q.view.depends_on(d))
+                (0..pk).any(|d| {
+                    d != dr && c.args[v].view.depends_on(d) && pts[d] > 1 && !q.view.depends_on(d)
+                })
             });
             if !wide {
                 continue;
@@ -1628,7 +1637,13 @@ impl TensorGraph {
         writeln!(s, "    const uint tile_c = tile % {tc}u;").unwrap();
         writeln!(s, "    uint lead = (tile / {tc}u) % {nlead}u;").unwrap();
         if heavy_last {
-            writeln!(s, "    const uint tile_r = {}u - tile / {}u;", tr - 1, tc * nlead).unwrap();
+            writeln!(
+                s,
+                "    const uint tile_r = {}u - tile / {}u;",
+                tr - 1,
+                tc * nlead
+            )
+            .unwrap();
         } else {
             writeln!(s, "    const uint tile_r = tile / {}u;", tc * nlead).unwrap();
         }
@@ -1639,11 +1654,25 @@ impl TensorGraph {
         writeln!(s, "    const uint m0 = tile_r * {bq}u;").unwrap();
         writeln!(s, "    const uint c0 = tile_c * {bc}u;").unwrap();
         // stage Q (zero-padded) and keep this SIMD group's rows in registers
-        writeln!(s, "    for (uint idx = tid; idx < {}u; idx += 128u) {{", bq * d8).unwrap();
-        writeln!(s, "        const uint ri = idx / {d8}u; const uint ci = idx % {d8}u;").unwrap();
+        writeln!(
+            s,
+            "    for (uint idx = tid; idx < {}u; idx += 128u) {{",
+            bq * d8
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "        const uint ri = idx / {d8}u; const uint ci = idx % {d8}u;"
+        )
+        .unwrap();
         writeln!(s, "        float v = 0.0f;").unwrap();
         writeln!(s, "        if (m0 + ri < {nq}u && ci < {dk}u) {{").unwrap();
-        writeln!(s, "            {} const uint r1 = ci;", coords("m0 + ri", "0u", "0u")).unwrap();
+        writeln!(
+            s,
+            "            {} const uint r1 = ci;",
+            coords("m0 + ri", "0u", "0u")
+        )
+        .unwrap();
         writeln!(s, "            v = {};", arg_read(self, &syn, &syn.args[0])).unwrap();
         writeln!(s, "        }}").unwrap();
         writeln!(s, "        smem[ri * {ldq}u + ci] = half(v);").unwrap();
@@ -1682,32 +1711,81 @@ impl TensorGraph {
                     e.push_str(&format!(" + {coef} * ({at})"));
                 }
             };
-            term(f.coefs[dr], "int(m0)".into(), format!("int(min(m0 + {bq}u, {nq}u)) - 1"));
-            term(f.coefs[dc], "int(c0)".into(), format!("int(min(c0 + {bc}u, {nc}u)) - 1"));
-            term(f.coefs[pk], "int(j0)".into(), format!("int(min(j0 + {bk}u, {nk}u)) - 1"));
+            term(
+                f.coefs[dr],
+                "int(m0)".into(),
+                format!("int(min(m0 + {bq}u, {nq}u)) - 1"),
+            );
+            term(
+                f.coefs[dc],
+                "int(c0)".into(),
+                format!("int(min(c0 + {bc}u, {nc}u)) - 1"),
+            );
+            term(
+                f.coefs[pk],
+                "int(j0)".into(),
+                format!("int(min(j0 + {bk}u, {nk}u)) - 1"),
+            );
             writeln!(s, "        // the mask covers this whole key tile: skip it").unwrap();
             writeln!(s, "        if ({e} > 0) {{ continue; }}").unwrap();
         }
         // stage K [j][k] and V [j][c]
-        writeln!(s, "        for (uint idx = tid; idx < {}u; idx += 128u) {{", bk * d8).unwrap();
-        writeln!(s, "            const uint ji = idx / {d8}u; const uint ci = idx % {d8}u;").unwrap();
+        writeln!(
+            s,
+            "        for (uint idx = tid; idx < {}u; idx += 128u) {{",
+            bk * d8
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "            const uint ji = idx / {d8}u; const uint ci = idx % {d8}u;"
+        )
+        .unwrap();
         writeln!(s, "            float v = 0.0f;").unwrap();
         writeln!(s, "            if (j0 + ji < {nk}u && ci < {dk}u) {{").unwrap();
-        writeln!(s, "                {} const uint r1 = ci;", coords("0u", "0u", "j0 + ji")).unwrap();
-        writeln!(s, "                v = {};", arg_read(self, &syn, &syn.args[1])).unwrap();
+        writeln!(
+            s,
+            "                {} const uint r1 = ci;",
+            coords("0u", "0u", "j0 + ji")
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "                v = {};",
+            arg_read(self, &syn, &syn.args[1])
+        )
+        .unwrap();
         writeln!(s, "            }}").unwrap();
         writeln!(s, "            Ks[ji * {ldk}u + ci] = half(v);").unwrap();
         writeln!(s, "        }}").unwrap();
-        writeln!(s, "        for (uint idx = tid; idx < {}u; idx += 128u) {{", bk * bc).unwrap();
-        writeln!(s, "            const uint ji = idx / {bc}u; const uint ci = idx % {bc}u;").unwrap();
+        writeln!(
+            s,
+            "        for (uint idx = tid; idx < {}u; idx += 128u) {{",
+            bk * bc
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "            const uint ji = idx / {bc}u; const uint ci = idx % {bc}u;"
+        )
+        .unwrap();
         writeln!(s, "            float v = 0.0f;").unwrap();
         writeln!(s, "            if (j0 + ji < {nk}u && c0 + ci < {nc}u) {{").unwrap();
         writeln!(s, "                {}", coords("0u", "c0 + ci", "j0 + ji")).unwrap();
-        writeln!(s, "                v = {};", arg_read(self, c, &c.args[plan.v_arg])).unwrap();
+        writeln!(
+            s,
+            "                v = {};",
+            arg_read(self, c, &c.args[plan.v_arg])
+        )
+        .unwrap();
         writeln!(s, "            }}").unwrap();
         writeln!(s, "            Vs[ji * {ldv}u + ci] = half(v);").unwrap();
         writeln!(s, "        }}").unwrap();
-        writeln!(s, "        threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+        writeln!(
+            s,
+            "        threadgroup_barrier(mem_flags::mem_threadgroup);"
+        )
+        .unwrap();
         // S = Q·Kᵀ
         writeln!(s, "        simdgroup_float8x8 sf[{nkf}];").unwrap();
         writeln!(s, "        for (uint jf = 0u; jf < {nkf}u; jf++) sf[jf] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);").unwrap();
@@ -1715,7 +1793,11 @@ impl TensorGraph {
         writeln!(s, "            for (uint jf = 0u; jf < {nkf}u; jf++) {{").unwrap();
         writeln!(s, "                simdgroup_half8x8 kf;").unwrap();
         writeln!(s, "                simdgroup_load(kf, &Ks[(jf * 8u) * {ldk}u + kk * 8u], {ldk}, ulong2(0, 0), true);").unwrap();
-        writeln!(s, "                simdgroup_multiply_accumulate(sf[jf], fq[kk], kf, sf[jf]);").unwrap();
+        writeln!(
+            s,
+            "                simdgroup_multiply_accumulate(sf[jf], fq[kk], kf, sf[jf]);"
+        )
+        .unwrap();
         writeln!(s, "            }}").unwrap();
         writeln!(s, "        }}").unwrap();
         // slot-0 element value at (row, key) in this lane's registers
@@ -1736,10 +1818,21 @@ impl TensorGraph {
         writeln!(s, "                const uint key = j0 + jf * 8u + fn + e;").unwrap();
         writeln!(s, "                float val = {ATT_NEG};").unwrap();
         writeln!(s, "                if (row < {nq}u && key < {nk}u) {{").unwrap();
-        writeln!(s, "                    const float sx = sf[jf].thread_elements()[e] * {scale};").unwrap();
+        writeln!(
+            s,
+            "                    const float sx = sf[jf].thread_elements()[e] * {scale};"
+        )
+        .unwrap();
         writeln!(s, "                    {}", coords("row", "0u", "key")).unwrap();
         let vf = var_of("s0_");
-        let outs = emit_scalar_mapped(&mut s, "                    ", &c.body, &c.body_outs[..1], "s0_", &vf);
+        let outs = emit_scalar_mapped(
+            &mut s,
+            "                    ",
+            &c.body,
+            &c.body_outs[..1],
+            "s0_",
+            &vf,
+        );
         writeln!(s, "                    val = {};", outs[0]).unwrap();
         writeln!(s, "                }}").unwrap();
         writeln!(s, "                sv[jf * 2u + e] = val;").unwrap();
@@ -1759,8 +1852,16 @@ impl TensorGraph {
         writeln!(s, "        for (uint jf = 0u; jf < {nkf}u; jf++) {{").unwrap();
         writeln!(s, "            for (uint e = 0u; e < 2u; e++) {{").unwrap();
         writeln!(s, "                const uint key = j0 + jf * 8u + fn + e;").unwrap();
-        writeln!(s, "                const bool ok = row < {nq}u && key < {nk}u;").unwrap();
-        writeln!(s, "                const float p = ok ? exp(sv[jf * 2u + e] - mnew) : 0.0f;").unwrap();
+        writeln!(
+            s,
+            "                const bool ok = row < {nq}u && key < {nk}u;"
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "                const float p = ok ? exp(sv[jf * 2u + e] - mnew) : 0.0f;"
+        )
+        .unwrap();
         writeln!(s, "                pf[jf].thread_elements()[e] = half(p);").unwrap();
         // per-row slots
         let simple: Vec<(usize, Option<f64>)> = row_slots
@@ -1776,17 +1877,31 @@ impl TensorGraph {
             .collect();
         for (k, lit) in &simple {
             if let Some(v) = lit {
-                writeln!(s, "                lsum{k} += p * {};", super::wgsl::lit(*v)).unwrap();
+                writeln!(
+                    s,
+                    "                lsum{k} += p * {};",
+                    super::wgsl::lit(*v)
+                )
+                .unwrap();
             }
         }
-        let general: Vec<usize> = simple.iter().filter(|x| x.1.is_none()).map(|x| x.0).collect();
+        let general: Vec<usize> = simple
+            .iter()
+            .filter(|x| x.1.is_none())
+            .map(|x| x.0)
+            .collect();
         if !general.is_empty() {
             writeln!(s, "                if (ok) {{").unwrap();
-            writeln!(s, "                    const float sx = sf[jf].thread_elements()[e] * {scale};").unwrap();
+            writeln!(
+                s,
+                "                    const float sx = sf[jf].thread_elements()[e] * {scale};"
+            )
+            .unwrap();
             writeln!(s, "                    {}", coords("row", "0u", "key")).unwrap();
             let outs: Vec<tang_expr::ExprId> = general.iter().map(|&k| c.body_outs[k]).collect();
             let vf = var_of("g_");
-            let vals = emit_scalar_mapped(&mut s, "                    ", &c.body, &outs, "g_", &vf);
+            let vals =
+                emit_scalar_mapped(&mut s, "                    ", &c.body, &outs, "g_", &vf);
             for (k, v) in general.iter().zip(vals) {
                 writeln!(s, "                    lsum{k} += p * {v};").unwrap();
             }
@@ -1798,11 +1913,23 @@ impl TensorGraph {
         writeln!(s, "        for (uint jf = 0u; jf < {nkf}u; jf++) {{").unwrap();
         writeln!(s, "            for (uint cf = 0u; cf < {ncf}u; cf++) {{").unwrap();
         writeln!(s, "                simdgroup_half8x8 vf;").unwrap();
-        writeln!(s, "                simdgroup_load(vf, &Vs[(jf * 8u) * {ldv}u + cf * 8u], {ldv});").unwrap();
-        writeln!(s, "                simdgroup_multiply_accumulate(acc[cf], pf[jf], vf, acc[cf]);").unwrap();
+        writeln!(
+            s,
+            "                simdgroup_load(vf, &Vs[(jf * 8u) * {ldv}u + cf * 8u], {ldv});"
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "                simdgroup_multiply_accumulate(acc[cf], pf[jf], vf, acc[cf]);"
+        )
+        .unwrap();
         writeln!(s, "            }}").unwrap();
         writeln!(s, "        }}").unwrap();
-        writeln!(s, "        threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+        writeln!(
+            s,
+            "        threadgroup_barrier(mem_flags::mem_threadgroup);"
+        )
+        .unwrap();
         writeln!(s, "    }}").unwrap();
         // per-row slots: lane partials → row totals
         for &k in &row_slots {
@@ -1819,10 +1946,23 @@ impl TensorGraph {
         writeln!(s, "    for (uint cf = 0u; cf < {ncf}u; cf++) simdgroup_store(acc[cf], &Cs[(sg * 8u) * {ldc}u + cf * 8u], {ldc});").unwrap();
         writeln!(s, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
         // write-out (and epilogue)
-        writeln!(s, "    for (uint idx = tid; idx < {}u; idx += 128u) {{", bq * bc).unwrap();
-        writeln!(s, "        const uint ri = idx / {bc}u; const uint ci = idx % {bc}u;").unwrap();
+        writeln!(
+            s,
+            "    for (uint idx = tid; idx < {}u; idx += 128u) {{",
+            bq * bc
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "        const uint ri = idx / {bc}u; const uint ci = idx % {bc}u;"
+        )
+        .unwrap();
         writeln!(s, "        if (m0 + ri < {nq}u && c0 + ci < {nc}u) {{").unwrap();
-        writeln!(s, "        const uint p{dr} = m0 + ri; const uint p{dc} = c0 + ci;").unwrap();
+        writeln!(
+            s,
+            "        const uint p{dr} = m0 + ri; const uint p{dc} = c0 + ci;"
+        )
+        .unwrap();
         for k in 0..w {
             let v = if k == plan.pv_slot {
                 format!("Cs[ri * {ldc}u + ci]")
@@ -1842,7 +1982,12 @@ impl TensorGraph {
         if root == plan.red {
             writeln!(s, "        const uint g = {};", flat("p", &pts)).unwrap();
             for k in 0..w {
-                writeln!(s, "        {}", store(out_f, &format!("g * {w}u + {k}u"), &format!("sl{k}"))).unwrap();
+                writeln!(
+                    s,
+                    "        {}",
+                    store(out_f, &format!("g * {w}u + {k}u"), &format!("sl{k}"))
+                )
+                .unwrap();
             }
         } else {
             let map = self.attention_epilogue(root, plan.red).unwrap();
@@ -1869,11 +2014,19 @@ impl TensorGraph {
                     }
                 })
                 .collect();
-            let vals = emit_scalar_mapped(&mut s, "        ", &mc.body, &mc.body_outs, "e_", &|v| args[v as usize].clone());
+            let vals =
+                emit_scalar_mapped(&mut s, "        ", &mc.body, &mc.body_outs, "e_", &|v| {
+                    args[v as usize].clone()
+                });
             writeln!(s, "        const uint g = {};", flat("p", &rpts)).unwrap();
             let mw = mc.width();
             for (slot, v) in vals.iter().enumerate() {
-                writeln!(s, "        {}", store(out_f, &format!("g * {mw}u + {slot}u"), v)).unwrap();
+                writeln!(
+                    s,
+                    "        {}",
+                    store(out_f, &format!("g * {mw}u + {slot}u"), v)
+                )
+                .unwrap();
             }
             writeln!(s, "        }}").unwrap();
         }

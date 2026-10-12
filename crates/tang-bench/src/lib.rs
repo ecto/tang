@@ -682,7 +682,7 @@ pub mod ir_gpu {
         let (mut g, y) = fused_attention_heads(hk, gq, n, d, dv, causal);
         let inputs: Vec<TensorId> = (0..g.nodes().len())
             .filter(|&i| matches!(g.nodes()[i].op, Op::Input(_)))
-            .map(|i| TensorId::from_index(i))
+            .map(TensorId::from_index)
             .collect();
         for t in inputs {
             g.set_precision(t, Precision::storage(Format::F16));

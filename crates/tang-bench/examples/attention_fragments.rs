@@ -10,8 +10,15 @@ use tang_bench::ir_msl::{Executable, MslDevice};
 
 fn main() {
     let dev = MslDevice::new().expect("metal");
-    let args: Vec<usize> = std::env::args().skip(1).filter_map(|a| a.parse().ok()).collect();
-    let ns = if args.is_empty() { vec![512, 1024, 2048, 4096] } else { args };
+    let args: Vec<usize> = std::env::args()
+        .skip(1)
+        .filter_map(|a| a.parse().ok())
+        .collect();
+    let ns = if args.is_empty() {
+        vec![512, 1024, 2048, 4096]
+    } else {
+        args
+    };
     let d = 64;
     println!("{} — attention, d = dv = {d}, kernel-only ms", dev.name);
     println!("heads causal     n   f32-auto   fragment  speedup  TFLOP/s(frag)  max|diff|");
@@ -23,7 +30,11 @@ fn main() {
                 let inputs = [r(h * n * d), r(h * n * d), r(h * n * d)];
                 let refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
                 let iters = 20;
-                let best = |exe: &Executable| (0..3).map(|_| exe.time(&dev, iters)).fold(f64::INFINITY, f64::min);
+                let best = |exe: &Executable| {
+                    (0..3)
+                        .map(|_| exe.time(&dev, iters))
+                        .fold(f64::INFINITY, f64::min)
+                };
                 let (g, y) = flash_attention_heads_auto(h, 1, n, d, d, causal);
                 let e32 = Executable::new(&dev, g.to_msl(&[y]), &refs);
                 e32.run(&dev);
@@ -31,7 +42,11 @@ fn main() {
                 let ef = Executable::new(&dev, gf.to_msl(&[yf]), &refs);
                 ef.run(&dev);
                 assert!(ef.program.kernels[0].fragment);
-                let diff = e32.read(y).iter().zip(ef.read(yf)).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+                let diff = e32
+                    .read(y)
+                    .iter()
+                    .zip(ef.read(yf))
+                    .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
                 let (t32, tf) = (best(&e32), best(&ef));
                 let flop = 4.0 * (h * n * n * d) as f64 * if causal { 0.5 } else { 1.0 };
                 println!(

@@ -770,7 +770,11 @@ fn fragment_attention() {
         let name = format!("attn hk{hk} g{gq} n{n} d{d} dv{dv} causal {causal}");
         let (g, y) = flash_attention_heads_fragment(hk, gq, n, d, dv, causal);
         assert!(g.attention_plan(y).is_some(), "{name}: no plan");
-        assert_eq!(g.attention_plan(y).unwrap().mask.is_some(), causal, "{name}: mask");
+        assert_eq!(
+            g.attention_plan(y).unwrap().mask.is_some(),
+            causal,
+            "{name}: mask"
+        );
         let inputs = vec![
             rand(hk * gq * n * d, &mut rng),
             rand(hk * n * d, &mut rng),
@@ -780,12 +784,28 @@ fn fragment_attention() {
         // check it on the small shapes, use a direct f64 attention above
         let f = |r: bool| attention_ref(&inputs, hk, gq, n, d, dv, causal, r);
         if n * n * d * dv * hk * gq <= 200 * 200 * 64 * 64 {
-            assert_close(&g.eval_emulated(&f64s(&inputs), &[y])[0], &f(true), 1e-5, &name);
+            assert_close(
+                &g.eval_emulated(&f64s(&inputs), &[y])[0],
+                &f(true),
+                1e-5,
+                &name,
+            );
         }
         // P is rounded to f16 before P·V (the emulation keeps it exact)
         let exe = check(&dev, &name, &g, &[y], &inputs, &[f(true)], 4e-3);
-        assert!(exe.program.kernels.len() == 1 && exe.program.kernels[0].fragment, "{name}");
-        check(&dev, &format!("{name} vs f64"), &g, &[y], &inputs, &[f(false)], 8e-3);
+        assert!(
+            exe.program.kernels.len() == 1 && exe.program.kernels[0].fragment,
+            "{name}"
+        );
+        check(
+            &dev,
+            &format!("{name} vs f64"),
+            &g,
+            &[y],
+            &inputs,
+            &[f(false)],
+            8e-3,
+        );
     }
 }
 
@@ -885,7 +905,10 @@ fn tune_precision_picks_attention_fragments() {
     let refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
     let r = tune_precision(&dev, g, &[y], &refs, &want, ErrorBudget::rel(1e-2), 10);
     for t in &r.trials {
-        eprintln!("{} err {:.2e} ms {:?} kept {}", t.what, t.error.max_rel, t.ms, t.kept);
+        eprintln!(
+            "{} err {:.2e} ms {:?} kept {}",
+            t.what, t.error.max_rel, t.ms, t.kept
+        );
     }
     assert!(r.fragments.contains(&y), "fragment candidate not kept");
     assert!(r.error.max_rel <= 1e-2);

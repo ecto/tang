@@ -4,7 +4,11 @@
 use tang_compile::tensor::{Op, TensorGraph, TensorId};
 
 fn dump(g: &TensorGraph, outs: &[TensorId]) {
-    let mat: Vec<usize> = g.materialized(outs).iter().map(|(t, _)| t.index()).collect();
+    let mat: Vec<usize> = g
+        .materialized(outs)
+        .iter()
+        .map(|(t, _)| t.index())
+        .collect();
     for (i, n) in g.nodes().iter().enumerate() {
         let shape: Vec<usize> = n.shape.iter().map(|d| d.n()).collect();
         match &n.op {
@@ -18,9 +22,17 @@ fn dump(g: &TensorGraph, outs: &[TensorId]) {
                     c.monoid.as_ref().map(|m| (m.kind(), m.width))
                 );
                 for (k, a) in c.args.iter().enumerate() {
-                    let f: Vec<(Vec<i64>, i64)> =
-                        a.view.forms.iter().map(|f| (f.coefs.clone(), f.offset)).collect();
-                    println!("    arg{k} <- #{} guard {} {f:?}", a.src.index(), a.view.guard);
+                    let f: Vec<(Vec<i64>, i64)> = a
+                        .view
+                        .forms
+                        .iter()
+                        .map(|f| (f.coefs.clone(), f.offset))
+                        .collect();
+                    println!(
+                        "    arg{k} <- #{} guard {} {f:?}",
+                        a.src.index(),
+                        a.view.guard
+                    );
                 }
                 for (k, o) in c.body_outs.iter().enumerate() {
                     println!("    out{k} = {}", c.body.fmt_expr(*o));
@@ -31,7 +43,10 @@ fn dump(g: &TensorGraph, outs: &[TensorId]) {
             _ => println!("#{i} other {shape:?}"),
         }
     }
-    println!("outputs {:?}", outs.iter().map(|t| t.index()).collect::<Vec<_>>());
+    println!(
+        "outputs {:?}",
+        outs.iter().map(|t| t.index()).collect::<Vec<_>>()
+    );
 }
 
 fn main() {
@@ -44,10 +59,17 @@ fn main() {
     let (g, y) = tang_bench::ir_gpu::fused_attention_heads(hk, gq, n, d, d, causal);
     dump(&g, &[y]);
     kernels("heads", &g, y);
-    return;
-    for (name, (g, y)) in [("flash", tang_bench::ir_gpu::flash_attention(n, d, d)), ("auto", tang_bench::ir_gpu::flash_attention_auto(n, d, d))] {
+    if args.get(6).is_none_or(|a| a != "all") {
+        return;
+    }
+    for (name, (g, y)) in [
+        ("flash", tang_bench::ir_gpu::flash_attention(n, d, d)),
+        ("auto", tang_bench::ir_gpu::flash_attention_auto(n, d, d)),
+    ] {
         kernels(name, &g, y);
-        if name == "auto" { dump(&g, &[y]); }
+        if name == "auto" {
+            dump(&g, &[y]);
+        }
     }
 }
 
