@@ -370,10 +370,13 @@ pub struct TNode {
     /// Schedule: split the reduction across a workgroup of this many
     /// threads, tree-combined with the monoid (0 = one thread per point).
     pub split: u32,
-    /// Schedule: `(tile over last point dim, tile over second-to-last,
-    /// reduce chunk)`. Each thread owns one point; reads shared along a
-    /// tile axis are staged chunk by chunk in workgroup memory.
+    /// Schedule: `(threads over last point dim, threads over second-to-last,
+    /// reduce chunk)`. Reads shared along a tile axis are staged chunk by
+    /// chunk in workgroup memory.
     pub tile: (u32, u32, u32),
+    /// Schedule: points per thread along `(x, y)` within a tile — the
+    /// register tile. `(1, 1)` is one point per thread.
+    pub reg: (u32, u32),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -472,16 +475,23 @@ impl TensorGraph {
     /// Set a node's thread-mapping schedule (`split`, `tile`), e.g. from
     /// an autotuner. Materialization (`inline`) is left alone: it changes
     /// which kernels exist, not how one runs.
-    pub fn set_schedule(&mut self, t: TensorId, split: u32, tile: (u32, u32, u32)) {
+    pub fn set_schedule(
+        &mut self,
+        t: TensorId,
+        split: u32,
+        tile: (u32, u32, u32),
+        reg: (u32, u32),
+    ) {
         self.nodes[t.n()].split = split;
         self.nodes[t.n()].tile = tile;
+        self.nodes[t.n()].reg = reg;
     }
 
     /// Thread mappings worth trying for a materialized comp on a GPU:
     /// one thread per point, a workgroup split (reductions), and rows ×
     /// lanes tiles (single-axis reductions with a lane dim).
-    pub fn schedule_candidates(&self, t: TensorId) -> Vec<(u32, (u32, u32, u32))> {
-        let mut out = vec![(0, (0, 0, 0))];
+    pub fn schedule_candidates(&self, t: TensorId) -> Vec<(u32, (u32, u32, u32), (u32, u32))> {
+        let mut out = vec![(0, (0, 0, 0), (1, 1))];
         let Some(c) = self.comp_at(t.n()) else {
             return out;
         };
@@ -491,21 +501,24 @@ impl TensorGraph {
         // a tree-combine of a wide tuple through workgroup memory is never
         // the answer (59 ms for attention's 66-wide state on a 3090)
         if c.width() <= 8 {
-            out.push((256, (0, 0, 0)));
+            out.push((256, (0, 0, 0), (1, 1)));
         }
         if c.red.len() == 1 {
             let pts = fixed(c.points());
             let lanes = pts.iter().rev().find(|&&n| n > 1).copied().unwrap_or(1);
             let rows = pts.iter().rev().filter(|&&n| n > 1).nth(1).is_some();
             if (16..=128).contains(&lanes) && rows {
-                out.push((0, (lanes as u32, (256 / lanes) as u32, 32)));
+                out.push((0, (lanes as u32, (256 / lanes) as u32, 32), (1, 1)));
             }
             if lanes >= 64 && !rows {
-                out.push((0, (lanes.min(256) as u32, 1, 32)));
+                out.push((0, (lanes.min(256) as u32, 1, 32), (1, 1)));
             }
             if lanes >= 16 && rows {
-                // the classic shared-memory 2-D tile (matmul-shaped comps)
-                out.push((0, (16, 16, 32)));
+                // the classic shared-memory 2-D tile (matmul-shaped comps),
+                // one point per thread and with 2×2 / 4×4 register tiles
+                out.push((0, (16, 16, 32), (1, 1)));
+                out.push((0, (16, 16, 32), (2, 2)));
+                out.push((0, (16, 16, 32), (4, 4)));
             }
         }
         out
@@ -524,6 +537,7 @@ impl TensorGraph {
             inline: false,
             split: 0,
             tile: (0, 0, 0),
+            reg: (1, 1),
         });
         TensorId(self.nodes.len() as u32 - 1)
     }
@@ -537,6 +551,7 @@ impl TensorGraph {
             inline: false,
             split: 0,
             tile: (0, 0, 0),
+            reg: (1, 1),
         });
         TensorId(self.nodes.len() as u32 - 1)
     }
@@ -565,6 +580,7 @@ impl TensorGraph {
             inline: false,
             split: 0,
             tile: (0, 0, 0),
+            reg: (1, 1),
         });
         Ok(TensorId(self.nodes.len() as u32 - 1))
     }
@@ -660,6 +676,7 @@ impl TensorGraph {
             inline: false,
             split: 0,
             tile: (0, 0, 0),
+            reg: (1, 1),
             op: Op::Comp(comp),
         });
         Ok(TensorId(self.nodes.len() as u32 - 1))
@@ -966,6 +983,7 @@ impl TensorGraph {
                 inline: node.inline,
                 split: node.split,
                 tile: node.tile,
+                reg: node.reg,
             });
             remap[i] = Some(ng.nodes.len() - 1);
         }

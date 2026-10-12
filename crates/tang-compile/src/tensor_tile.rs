@@ -234,11 +234,11 @@ impl Ctx<'_> {
         let mut points = 1usize;
         let mut point = String::from("0u");
         if r.key.py != 0 {
-            point = format!("({point}) * {}u + ty", self.by);
+            point = format!("({point}) * {}u + ly_", self.by);
             points *= self.by;
         }
         if r.key.px != 0 {
-            point = format!("({point}) * {}u + tx", self.bx);
+            point = format!("({point}) * {}u + lx_", self.bx);
             points *= self.bx;
         }
         let mut local = String::from("(r0 - chunk)");
@@ -349,7 +349,7 @@ impl Ctx<'_> {
                     return Val::Expr(String::new());
                 }
                 let slot = flat(&coords[k..], &fixed(&c.out[k..]));
-                let row = if uses_py { "ty" } else { "0u" };
+                let row = if uses_py { "ly_" } else { "0u" };
                 Val::Expr(format!(
                     "cstage_{idx}[(({row}) * {}u + (r0 - chunk)) * {w}u + {}]",
                     self.chunk,
@@ -508,6 +508,10 @@ impl TensorGraph {
         let c = self.comp_at(root).unwrap();
         let (bx, by, chunk) = self.nodes[root].tile;
         let (bx, by, chunk) = (bx as usize, by as usize, chunk as usize);
+        let (rx, ry) = self.nodes[root].reg;
+        let (rx, ry) = (rx.max(1) as usize, ry.max(1) as usize);
+        // points per workgroup along x / y; threads own rx × ry of them
+        let (px_n, py_n) = (bx * rx, by * ry);
         let w = c.width();
         let pts_v = fixed(c.points());
         let pts = pts_v.as_slice();
@@ -524,8 +528,8 @@ impl TensorGraph {
         let others: Vec<usize> = (0..k).filter(|&d| d != dx && Some(d) != dy).collect();
         let nx = pts[dx];
         let ny = dy.map_or(1, |d| pts[d]);
-        let tiles_x = nx.div_ceil(bx);
-        let tiles_y = ny.div_ceil(by);
+        let tiles_x = nx.div_ceil(px_n);
+        let tiles_y = ny.div_ceil(py_n);
         let n_tiles = tiles_x * tiles_y * others.iter().map(|&d| pts[d]).product::<usize>();
 
         let mut ctx = Ctx {
@@ -533,8 +537,8 @@ impl TensorGraph {
             reads: &reads,
             px: format!("p{dx}"),
             py: dy.map(|d| format!("p{d}")),
-            bx,
-            by,
+            bx: px_n,
+            by: py_n,
             chunk,
             extents: BTreeMap::new(),
             regions: Vec::new(),
@@ -571,8 +575,8 @@ impl TensorGraph {
         let combined = run(&mut ctx, &mut body);
 
         let region_total = |r: &Region| {
-            (if r.key.py != 0 { by } else { 1 })
-                * (if r.key.px != 0 { bx } else { 1 })
+            (if r.key.py != 0 { py_n } else { 1 })
+                * (if r.key.px != 0 { px_n } else { 1 })
                 * chunk
                 * r.inner_n()
                 * r.span()
@@ -590,7 +594,7 @@ impl TensorGraph {
         let mut comp_loads: Vec<(usize, String)> = Vec::new();
         for i in 0..ctx.comp_regions.len() {
             let r = &ctx.comp_regions[i];
-            let rows = if r.uses_py { by } else { 1 };
+            let rows = if r.uses_py { py_n } else { 1 };
             writeln!(
                 s,
                 "var<workgroup> cstage_{i}: array<f32, {}>;",
@@ -657,15 +661,32 @@ impl TensorGraph {
             writeln!(s, "    let p{d} = lead % {}u;", pts[d]).unwrap();
             writeln!(s, "    lead = lead / {}u;", pts[d]).unwrap();
         }
-        writeln!(s, "    let x_raw = tile_x * {bx}u + tx;").unwrap();
-        writeln!(s, "    let y_raw = tile_y * {by}u + ty;").unwrap();
-        writeln!(s, "    let is_live = x_raw < {nx}u && y_raw < {ny}u;").unwrap();
-        writeln!(s, "    let p{dx} = min(x_raw, {}u);", nx - 1).unwrap();
-        if let Some(dy) = dy {
-            writeln!(s, "    let p{dy} = min(y_raw, {}u);", ny - 1).unwrap();
+        // one copy of the per-point state per register-tile element
+        let copies: Vec<(usize, usize)> =
+            (0..ry).flat_map(|j| (0..rx).map(move |i| (i, j))).collect();
+        let tag = |i: usize, j: usize| format!("_{i}_{j}");
+        for &(i, j) in &copies {
+            let t = tag(i, j);
+            writeln!(
+                s,
+                "    let x_raw{t} = tile_x * {px_n}u + tx * {rx}u + {i}u;"
+            )
+            .unwrap();
+            writeln!(
+                s,
+                "    let y_raw{t} = tile_y * {py_n}u + ty * {ry}u + {j}u;"
+            )
+            .unwrap();
+            writeln!(
+                s,
+                "    let is_live{t} = x_raw{t} < {nx}u && y_raw{t} < {ny}u;"
+            )
+            .unwrap();
         }
+        // per-copy preamble: point coords, hoisted reads, accumulators
+        let mut hoist_fill = String::new();
         for (i, h) in ctx.hoists.iter().enumerate() {
-            writeln!(s, "    var hoist_{i}: array<f32, {}>;", h.len()).unwrap();
+            let s = &mut hoist_fill;
             writeln!(s, "    {{").unwrap();
             let mut flat = String::from("0u");
             for (name, ext) in &h.inner {
@@ -695,7 +716,21 @@ impl TensorGraph {
             }
             writeln!(s, "    }}").unwrap();
         }
-        writeln!(s, "    var acc = array<f32, {w}>({});", identity(m)).unwrap();
+        let hoist_lens: Vec<usize> = ctx.hoists.iter().map(|h| h.len()).collect();
+        for &(i, j) in &copies {
+            let t = tag(i, j);
+            for (hi, len) in hoist_lens.iter().enumerate() {
+                writeln!(s, "    var hoist{t}_{hi}: array<f32, {len}>;").unwrap();
+            }
+            writeln!(s, "    var acc{t} = array<f32, {w}>({});", identity(m)).unwrap();
+            writeln!(s, "    {{").unwrap();
+            writeln!(s, "    let p{dx} = min(x_raw{t}, {}u);", nx - 1).unwrap();
+            if let Some(dy) = dy {
+                writeln!(s, "    let p{dy} = min(y_raw{t}, {}u);", ny - 1).unwrap();
+            }
+            s.push_str(&hoist_fill.replace("hoist_", &format!("hoist{t}_")));
+            writeln!(s, "    }}").unwrap();
+        }
         writeln!(
             s,
             "    for (var chunk: u32 = 0u; chunk < {r_total}u; chunk = chunk + {chunk}u) {{"
@@ -716,16 +751,16 @@ impl TensorGraph {
             let mut addr = format!("{}", r.lo);
             let mut live = String::from("true");
             if r.key.px != 0 {
-                writeln!(s, "            let lx = rem % {bx}u;").unwrap();
-                writeln!(s, "            rem = rem / {bx}u;").unwrap();
-                writeln!(s, "            let gx = tile_x * {bx}u + lx;").unwrap();
+                writeln!(s, "            let lx = rem % {px_n}u;").unwrap();
+                writeln!(s, "            rem = rem / {px_n}u;").unwrap();
+                writeln!(s, "            let gx = tile_x * {px_n}u + lx;").unwrap();
                 addr.push_str(&format!(" + {} * i32(gx)", r.key.px));
                 live.push_str(&format!(" && gx < {nx}u"));
             }
             if r.key.py != 0 {
-                writeln!(s, "            let ly = rem % {by}u;").unwrap();
-                writeln!(s, "            rem = rem / {by}u;").unwrap();
-                writeln!(s, "            let gy = tile_y * {by}u + ly;").unwrap();
+                writeln!(s, "            let ly = rem % {py_n}u;").unwrap();
+                writeln!(s, "            rem = rem / {py_n}u;").unwrap();
+                writeln!(s, "            let gy = tile_y * {py_n}u + ly;").unwrap();
                 addr.push_str(&format!(" + {} * i32(gy)", r.key.py));
                 live.push_str(&format!(" && gy < {ny}u"));
             }
@@ -765,7 +800,7 @@ impl TensorGraph {
             writeln!(s, "            let ly = idx / {chunk}u;").unwrap();
             writeln!(
                 s,
-                "            let gy = min(tile_y * {by}u + ly, {}u);",
+                "            let gy = min(tile_y * {py_n}u + ly, {}u);",
                 ny - 1
             )
             .unwrap();
@@ -783,31 +818,57 @@ impl TensorGraph {
             "        for (var r0: u32 = chunk; r0 < min(chunk + {chunk}u, {r_total}u); r0 = r0 + 1u) {{"
         )
         .unwrap();
-        for line in body.lines() {
-            writeln!(s, "            {line}").unwrap();
+        for &(i, j) in &copies {
+            let t = tag(i, j);
+            writeln!(s, "            {{").unwrap();
+            writeln!(s, "            let p{dx} = min(x_raw{t}, {}u);", nx - 1).unwrap();
+            if let Some(dy) = dy {
+                writeln!(s, "            let p{dy} = min(y_raw{t}, {}u);", ny - 1).unwrap();
+            }
+            writeln!(s, "            let lx_ = tx * {rx}u + {i}u;").unwrap();
+            writeln!(s, "            let ly_ = ty * {ry}u + {j}u;").unwrap();
+            let rename = |text: &str| {
+                text.replace("acc[", &format!("acc{t}["))
+                    .replace("hoist_", &format!("hoist{t}_"))
+            };
+            for line in rename(&body).lines() {
+                writeln!(s, "            {line}").unwrap();
+            }
+            let combined_t: Vec<String> = combined.iter().map(|e| rename(e)).collect();
+            writeln!(
+                s,
+                "            acc{t} = array<f32, {w}>({});",
+                combined_t.join(", ")
+            )
+            .unwrap();
+            writeln!(s, "            }}").unwrap();
         }
-        writeln!(
-            s,
-            "            acc = array<f32, {w}>({});",
-            combined.join(", ")
-        )
-        .unwrap();
         writeln!(s, "        }}").unwrap();
         writeln!(s, "        workgroupBarrier();").unwrap();
         writeln!(s, "    }}").unwrap();
-        writeln!(s, "    if (is_live) {{").unwrap();
-        let point_flat = {
-            let mut acc = String::from("0u");
-            for (d, n) in pts.iter().enumerate() {
-                acc = format!("({acc}) * {n}u + p{d}");
+        for &(i, j) in &copies {
+            let t = tag(i, j);
+            writeln!(s, "    if (is_live{t}) {{").unwrap();
+            let point_flat = {
+                let mut acc = String::from("0u");
+                for (d, n) in pts.iter().enumerate() {
+                    let coord = if d == dx {
+                        format!("x_raw{t}")
+                    } else if Some(d) == dy {
+                        format!("y_raw{t}")
+                    } else {
+                        format!("p{d}")
+                    };
+                    acc = format!("({acc}) * {n}u + {coord}");
+                }
+                acc
+            };
+            writeln!(s, "        let g = {point_flat};").unwrap();
+            for slot in 0..w {
+                writeln!(s, "        out[g * {w}u + {slot}u] = acc{t}[{slot}];").unwrap();
             }
-            acc
-        };
-        writeln!(s, "        let g = {point_flat};").unwrap();
-        for slot in 0..w {
-            writeln!(s, "        out[g * {w}u + {slot}u] = acc[{slot}];").unwrap();
+            writeln!(s, "    }}").unwrap();
         }
-        writeln!(s, "    }}").unwrap();
         writeln!(s, "}}").unwrap();
 
         WgslKernel {

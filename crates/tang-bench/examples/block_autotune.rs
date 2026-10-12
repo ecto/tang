@@ -36,10 +36,11 @@ fn main() {
     for k in &log {
         let auto = &g.nodes()[k.node.index()];
         println!(
-            "node {:>2}: tuned split {:>3} tile {:?} {:>8.3} ms   (auto: split {} tile {:?})",
+            "node {:>2}: tuned split {:>3} tile {:?} reg {:?} {:>8.3} ms   (auto: split {} tile {:?})",
             k.node.index(),
             k.split,
             k.tile,
+            k.reg,
             k.time.as_secs_f64() * 1e3,
             auto.split,
             auto.tile

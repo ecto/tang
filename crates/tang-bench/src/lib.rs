@@ -473,6 +473,7 @@ pub mod ir_gpu {
         pub node: TensorId,
         pub split: u32,
         pub tile: (u32, u32, u32),
+        pub reg: (u32, u32),
         pub time: std::time::Duration,
     }
 
@@ -496,10 +497,10 @@ pub mod ir_gpu {
         let mut log = Vec::new();
         for i in 0..base.program.kernels.len() {
             let node = base.program.kernels[i].node;
-            let mut best: Option<(u32, (u32, u32, u32), std::time::Duration)> = None;
-            for (split, tile) in g.schedule_candidates(node) {
+            let mut best: Option<(u32, (u32, u32, u32), (u32, u32), std::time::Duration)> = None;
+            for (split, tile, reg) in g.schedule_candidates(node) {
                 let mut variant = g.clone();
-                variant.set_schedule(node, split, tile);
+                variant.set_schedule(node, split, tile, reg);
                 let exe = Executable::new(device, variant.to_wgsl(outputs), inputs);
                 // inputs of kernel i: run everything before it once
                 for j in 0..i {
@@ -515,7 +516,7 @@ pub mod ir_gpu {
                 cache.flush(device);
                 let _ = exe.read(device, node);
                 let probe = probe.elapsed();
-                if best.is_some_and(|b| probe > b.2 * 4) {
+                if best.is_some_and(|b| probe > b.3 * 4) {
                     continue;
                 }
                 let start = std::time::Instant::now();
@@ -525,16 +526,17 @@ pub mod ir_gpu {
                 cache.flush(device);
                 let _ = exe.read(device, node);
                 let t = start.elapsed() / iters as u32;
-                if best.is_none_or(|b| t < b.2) {
-                    best = Some((split, tile, t));
+                if best.is_none_or(|b| t < b.3) {
+                    best = Some((split, tile, reg, t));
                 }
             }
-            let (split, tile, time) = best.unwrap();
-            g.set_schedule(node, split, tile);
+            let (split, tile, reg, time) = best.unwrap();
+            g.set_schedule(node, split, tile, reg);
             log.push(TunedKernel {
                 node,
                 split,
                 tile,
+                reg,
                 time,
             });
         }
@@ -548,8 +550,8 @@ pub mod ir_gpu {
         pub path: std::path::PathBuf,
     }
 
-    /// `(node index, split, tile)` as stored in the cache.
-    type Entry = (usize, u32, (u32, u32, u32));
+    /// `(node index, split, tile, reg)` as stored in the cache.
+    type Entry = (usize, u32, (u32, u32, u32), (u32, u32));
 
     impl TuningCache {
         pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
@@ -563,7 +565,7 @@ pub mod ir_gpu {
             device.name.hash(&mut h);
             let mut plain = g.clone();
             for k in g.to_wgsl(outputs).kernels {
-                plain.set_schedule(k.node, 0, (0, 0, 0));
+                plain.set_schedule(k.node, 0, (0, 0, 0), (1, 1));
             }
             for k in plain.to_wgsl(outputs).kernels {
                 k.source.hash(&mut h);
@@ -584,7 +586,11 @@ pub mod ir_gpu {
                         .split_whitespace()
                         .filter_map(|x| x.parse().ok())
                         .collect();
-                    (v.len() == 5).then(|| (v[0] as usize, v[1], (v[2], v[3], v[4])))
+                    match v.len() {
+                        5 => Some((v[0] as usize, v[1], (v[2], v[3], v[4]), (1, 1))),
+                        7 => Some((v[0] as usize, v[1], (v[2], v[3], v[4]), (v[5], v[6]))),
+                        _ => None,
+                    }
                 })
                 .collect()
         }
@@ -593,12 +599,14 @@ pub mod ir_gpu {
             let mut text = format!("tang-tuning {key:016x}\n");
             for k in log {
                 text.push_str(&format!(
-                    "{} {} {} {} {}\n",
+                    "{} {} {} {} {} {} {}\n",
                     k.node.index(),
                     k.split,
                     k.tile.0,
                     k.tile.1,
-                    k.tile.2
+                    k.tile.2,
+                    k.reg.0,
+                    k.reg.1
                 ));
             }
             if let Some(dir) = self.path.parent() {
@@ -622,8 +630,8 @@ pub mod ir_gpu {
             let key = Self::key(device, &g, outputs);
             if let Some(entries) = self.load(key) {
                 let mut g = g;
-                for (node, split, tile) in entries {
-                    g.set_schedule(TensorId::from_index(node), split, tile);
+                for (node, split, tile, reg) in entries {
+                    g.set_schedule(TensorId::from_index(node), split, tile, reg);
                 }
                 return (g, true);
             }
@@ -732,12 +740,14 @@ pub mod ir_gpu {
             match schedule {
                 "split" => g.schedule_split(&[c], 64, 16),
                 "tiled" => g.schedule_tile_2d(&[c], 16, 16, 32, 16),
+                "reg2" => g.set_schedule(c, 0, (16, 16, 32), (2, 2)),
+                "reg4" => g.set_schedule(c, 0, (16, 16, 32), (4, 4)),
                 "auto" => g.schedule_auto(&[c]),
                 _ => {}
             }
             (g, c)
         };
-        ["naive", "split", "tiled", "auto"]
+        ["naive", "split", "tiled", "reg2", "reg4", "auto"]
             .into_iter()
             .map(|name| {
                 let (g, c) = build(name);
