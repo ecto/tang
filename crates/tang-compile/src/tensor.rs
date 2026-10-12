@@ -1799,10 +1799,24 @@ impl TensorGraph {
                 _ => {}
             }
         }
+        // ... and only when it is bigger than what they produce, so writing
+        // it out would cost more traffic than recomputing it
+        let mut consumer_points = vec![0usize; self.nodes.len()];
+        for j in (0..self.nodes.len()).filter(|&j| live[j]) {
+            if let Some(c) = self.comp_at(j) {
+                let pts = numel(c.points());
+                for a in &c.args {
+                    consumer_points[a.src.n()] = consumer_points[a.src.n()].max(pts);
+                }
+            }
+        }
         let recomputable: Vec<bool> = (0..self.nodes.len())
             .map(|p| {
                 uses[p] == 1
-                    || (consumers_reduce[p] && self.comp_at(p).is_some_and(|pc| pc.red.is_empty()))
+                    || (consumers_reduce[p]
+                        && self.comp_at(p).is_some_and(|pc| {
+                            pc.red.is_empty() && numel(pc.points()) > consumer_points[p]
+                        }))
             })
             .collect();
         for i in reductions {
@@ -2116,30 +2130,40 @@ impl TensorGraph {
                 reg: (1, 1),
                 op: Op::Comp(inner),
             });
-            // outer: Σ_f inner[p…, f, slot] per state slot
-            let orank = k + 1;
-            let args: Vec<Arg> = (0..w)
-                .map(|slot| {
-                    let mut forms: Vec<Form> = (0..k).map(|d| Form::unit(orank, d)).collect();
-                    forms.push(Form::unit(orank, k));
-                    if c.tuple == 1 {
-                        forms.push(Form::constant(orank, slot as i64));
-                    }
-                    Arg {
-                        src: TensorId(inner_id as u32),
-                        view: View { forms },
-                    }
+            // outer: a map folding the nf partial states with the monoid's
+            // combine, unrolled — a map, so it never absorbs the inner
+            // reduction back into a naive loop
+            let args: Vec<Arg> = (0..nf)
+                .flat_map(|fi| {
+                    (0..w).map(move |slot| {
+                        let mut forms: Vec<Form> = (0..k).map(|d| Form::unit(k, d)).collect();
+                        forms.push(Form::constant(k, fi as i64));
+                        if c.tuple == 1 {
+                            forms.push(Form::constant(k, slot as i64));
+                        }
+                        Arg {
+                            src: TensorId(inner_id as u32),
+                            view: View { forms },
+                        }
+                    })
                 })
                 .collect();
-            let (body, body_outs) = trace(|| (0..w).map(|v| ExprId::var(v as u16)).collect());
+            let mut body = ExprGraph::new();
+            let vars: Vec<ExprId> = (0..nf * w).map(|v| body.var(v as u16)).collect();
+            let mut acc: Vec<ExprId> = vars[..w].to_vec();
+            for fi in 1..nf {
+                let mut ins = acc.clone();
+                ins.extend_from_slice(&vars[fi * w..(fi + 1) * w]);
+                acc = replay(&m.combine, &m.outs, &ins, &mut body);
+            }
             let outer = Comp {
                 out: c.out.clone(),
                 tuple: c.tuple,
-                red: vec![Dim::Fixed(nf)],
+                red: vec![],
                 args,
                 body,
-                body_outs,
-                monoid: Some(m),
+                body_outs: acc,
+                monoid: None,
             };
             let _ = rank;
             g.nodes[i].op = Op::Comp(outer);
@@ -2990,7 +3014,7 @@ mod tests {
         let want = g.eval(&inputs, &[y]).remove(0);
         let (sg, outs) = g.split_reduce_dims(&[y]);
         let c = sg.comp_at(outs[0].n()).unwrap();
-        assert_eq!(c.red, vec![Dim::Fixed(r)]);
+        assert!(c.red.is_empty() && c.args.len() == r);
         let inner = sg.comp_at(c.args[0].src.n()).unwrap();
         assert_eq!(inner.red, vec![Dim::Fixed(n)]);
         close(&sg.eval(&inputs, &outs)[0], &want);
