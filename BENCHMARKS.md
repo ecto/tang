@@ -853,13 +853,13 @@ because almost nothing got faster:
 - **Without matrix units, f16 storage buys bandwidth only, and these
   ops are not bandwidth-bound.** The convs and the 1024³ matmul run at
   ~3.3 TFLOP/s from staged f32 tiles: compute-bound, halving the bytes
-  read changes nothing (a: x/w f16 2.21 vs 2.20 ms; matmul: 0.76 vs
-  0.76). The upsample is the one op whose weight read shows: its
+  read changes nothing (a: x f16 2.18, w f16 2.23 vs 2.20 ms; matmul:
+  a/b f16 0.76 vs 0.76). The upsample is the one op whose weight read shows: its
   10.5 MB `w` in f16 is 3–7% faster across runs. AdaIN, iSTFT and the
   ConvNeXt block are a few hundred µs of 6–8 small kernels — launch- and
   latency-bound at 80–100 GB/s against the M4 Max's ~400.
-- **f16 outputs cost more than they save** (a: 2.25 vs 2.20 ms; matmul
-  0.82 vs 0.76): two threads own the halves of one word, so the store is
+- **f16 outputs never pay** (a: 2.21 vs 2.20 ms; matmul 0.80 vs 0.76):
+  two threads own the halves of one word, so the store is
   two atomics. An emitter that gives each thread a pair of points (the
   register tile already does) can write whole words.
 - Run-to-run noise on the M4 is ±5% for sub-ms programs, which is why a
@@ -878,7 +878,7 @@ judged on error only. At rel 1e-3:
 | e AdaIN | variance Σ_t (x − μ)², T = 2000, one thread per row | 1.3e-2 | 7.9e-3 |
 | e AdaIN | same, 256-thread split schedule | 2.8e-4 (admitted) | |
 | e AdaIN | style projection W·s (128) | 2.9e-3 | 5.0e-4 (style 16) |
-| f ConvNeXt | LayerNorm mean over C = 512 | 6.9e-2 | 1.5e-4 (C = 32) |
+| f ConvNeXt | LayerNorm statistic Σ over C = 512 (n10) | 6.9e-2 | 1.5e-4 (C = 32) |
 | f ConvNeXt | pointwise F→C matmul (1536) | 1.7e-2 | 1.4e-4 (F = 96) |
 | matmul 1024³ | Σ_k, 1024 terms | 1.5e-2 | 1.2e-2 |
 | snake `dα = Σ_t` (backward, T = 4096) | unit test | | > 1e-3, rejected |
