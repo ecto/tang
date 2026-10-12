@@ -1,0 +1,215 @@
+//! Hand-written kernels vs the same math decomposed into tang IR.
+//!
+//! Each block runs three ways:
+//! - `hand`   — the existing hand-written path (tang-train / tang-tensor)
+//! - `ir`     — traced into a `tang_expr::ExprGraph`, compiled as-is
+//! - `ir_opt` — same graph after the tang-compile pass pipeline
+//!
+//! Plus `build` groups that time trace + passes + compile, since that cost
+//! is what grows with model size in a scalar IR.
+//!
+//! Blocks:
+//! - `swiglu_act` — silu(g) * u, purely elementwise (IR's best case)
+//! - `rmsnorm`    — a row reduction followed by elementwise scale
+//! - `matvec`     — y = W x, the op that dominates real models
+//!
+//! Node counts are printed to stderr once per size.
+
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use tang::Scalar;
+use tang_compile::{EliminateDeadCode, FoldConstants, PassManager, SimplifyAlgebraic};
+use tang_expr::compile::CompiledMany;
+use tang_expr::{trace, ExprGraph, ExprId};
+use tang_tensor::{Shape, Tensor};
+use tang_train::{Module, RMSNorm};
+
+fn passes() -> PassManager {
+    let mut pm = PassManager::new();
+    pm.add(FoldConstants);
+    pm.add(SimplifyAlgebraic);
+    pm.add(EliminateDeadCode);
+    pm
+}
+
+/// Compile a graph, optionally running the pass pipeline first.
+fn compile(g: &ExprGraph, outs: &[ExprId], opt: bool) -> (CompiledMany, usize) {
+    if !opt {
+        return (g.compile_many(outs), g.live_set(outs).len());
+    }
+    let (g2, outs2) = passes().run(g, outs);
+    (g2.compile_many(&outs2), g2.live_set(&outs2).len())
+}
+
+// ---------------------------------------------------------------------------
+// SwiGLU activation: out = silu(g) * u
+// ---------------------------------------------------------------------------
+
+fn trace_swiglu_act() -> (ExprGraph, Vec<ExprId>) {
+    let (g, out) = trace(|| {
+        let gate = ExprId::var(0);
+        let up = ExprId::var(1);
+        let silu = gate / (ExprId::from_f64(1.0) + (-gate).exp());
+        silu * up
+    });
+    (g, vec![out])
+}
+
+fn bench_swiglu_act(c: &mut Criterion) {
+    let mut group = c.benchmark_group("kvi_swiglu_act");
+    for &n in &[4_096usize, 65_536, 1_048_576] {
+        let gate: Vec<f64> = (0..n).map(|i| (i as f64) * 1e-4 - 1.0).collect();
+        let up: Vec<f64> = (0..n).map(|i| (i as f64) * 2e-4).collect();
+        let mut out = vec![0.0f64; n];
+
+        group.bench_function(BenchmarkId::new("hand", n), |b| {
+            b.iter(|| {
+                for i in 0..n {
+                    let g = gate[i];
+                    out[i] = g / (1.0 + (-g).exp()) * up[i];
+                }
+                black_box(&out);
+            })
+        });
+
+        let (g, outs) = trace_swiglu_act();
+        for opt in [false, true] {
+            let (f, nodes) = compile(&g, &outs, opt);
+            if n == 4_096 {
+                eprintln!("swiglu_act opt={opt}: {nodes} live nodes per element");
+            }
+            let name = if opt { "ir_opt" } else { "ir" };
+            group.bench_function(BenchmarkId::new(name, n), |b| {
+                let mut o = [0.0f64; 1];
+                b.iter(|| {
+                    for i in 0..n {
+                        f(&[gate[i], up[i]], &mut o);
+                        out[i] = o[0];
+                    }
+                    black_box(&out);
+                })
+            });
+        }
+    }
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// RMSNorm over one row of `dim`, weight = 1 (matches RMSNorm::new)
+// ---------------------------------------------------------------------------
+
+fn trace_rmsnorm(dim: usize) -> (ExprGraph, Vec<ExprId>) {
+    trace(|| {
+        let xs: Vec<ExprId> = (0..dim).map(|i| ExprId::var(i as u16)).collect();
+        let mut sq = ExprId::from_f64(0.0);
+        for &x in &xs {
+            sq = sq + x * x;
+        }
+        let rms = (sq / ExprId::from_f64(dim as f64) + ExprId::from_f64(1e-6)).sqrt();
+        let inv = ExprId::from_f64(1.0) / rms;
+        let w = ExprId::from_f64(1.0);
+        xs.iter().map(|&x| w * (x * inv)).collect()
+    })
+}
+
+fn bench_rmsnorm(c: &mut Criterion) {
+    let mut group = c.benchmark_group("kvi_rmsnorm");
+    let batch = 16;
+    for &dim in &[64usize, 576, 2048] {
+        let input = Tensor::from_fn(Shape::from_slice(&[batch, dim]), |idx| {
+            ((idx[0] * dim + idx[1]) as f64) * 0.01
+        });
+        let rows: Vec<f64> = input.data().to_vec();
+        let mut out = vec![0.0f64; batch * dim];
+
+        let mut norm = RMSNorm::<f64>::new(dim);
+        group.bench_function(BenchmarkId::new("hand", format!("{batch}x{dim}")), |b| {
+            b.iter(|| black_box(norm.forward(&input)))
+        });
+
+        let (g, outs) = trace_rmsnorm(dim);
+        for opt in [false, true] {
+            let (f, nodes) = compile(&g, &outs, opt);
+            eprintln!("rmsnorm dim={dim} opt={opt}: {nodes} live nodes per row");
+            let name = if opt { "ir_opt" } else { "ir" };
+            group.bench_function(BenchmarkId::new(name, format!("{batch}x{dim}")), |b| {
+                b.iter(|| {
+                    for r in 0..batch {
+                        f(&rows[r * dim..(r + 1) * dim], &mut out[r * dim..(r + 1) * dim]);
+                    }
+                    black_box(&out);
+                })
+            });
+        }
+
+        group.bench_function(BenchmarkId::new("build", format!("{batch}x{dim}")), |b| {
+            b.iter(|| {
+                let (g, outs) = trace_rmsnorm(dim);
+                black_box(compile(&g, &outs, true));
+            })
+        });
+    }
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Matvec y = W x, W is n x n. W and x are both IR vars (n*n + n inputs),
+// so n is capped by the u16 var index: n = 255 is the largest that fits.
+// ---------------------------------------------------------------------------
+
+fn trace_matvec(n: usize) -> (ExprGraph, Vec<ExprId>) {
+    trace(|| {
+        let w = |i: usize, j: usize| ExprId::var((i * n + j) as u16);
+        let x: Vec<ExprId> = (0..n).map(|j| ExprId::var((n * n + j) as u16)).collect();
+        (0..n)
+            .map(|i| {
+                let mut acc = ExprId::from_f64(0.0);
+                for j in 0..n {
+                    acc = acc + w(i, j) * x[j];
+                }
+                acc
+            })
+            .collect()
+    })
+}
+
+fn bench_matvec(c: &mut Criterion) {
+    let mut group = c.benchmark_group("kvi_matvec");
+    for &n in &[16usize, 64, 128, 255] {
+        let w = Tensor::from_fn(Shape::from_slice(&[n, n]), |idx| {
+            ((idx[0] * n + idx[1]) as f64) * 1e-3
+        });
+        let x = Tensor::from_fn(Shape::from_slice(&[n, 1]), |idx| (idx[0] as f64) * 1e-2);
+
+        group.bench_function(BenchmarkId::new("hand", n), |b| {
+            b.iter(|| black_box(w.matmul(&x)))
+        });
+
+        let mut inputs: Vec<f64> = w.data().to_vec();
+        inputs.extend_from_slice(x.data());
+        let mut out = vec![0.0f64; n];
+
+        let (g, outs) = trace_matvec(n);
+        for opt in [false, true] {
+            let (f, nodes) = compile(&g, &outs, opt);
+            eprintln!("matvec n={n} opt={opt}: {nodes} live nodes");
+            let name = if opt { "ir_opt" } else { "ir" };
+            group.bench_function(BenchmarkId::new(name, n), |b| {
+                b.iter(|| {
+                    f(&inputs, &mut out);
+                    black_box(&out);
+                })
+            });
+        }
+
+        group.bench_function(BenchmarkId::new("build", n), |b| {
+            b.iter(|| {
+                let (g, outs) = trace_matvec(n);
+                black_box(compile(&g, &outs, true));
+            })
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_swiglu_act, bench_rmsnorm, bench_matvec);
+criterion_main!(benches);

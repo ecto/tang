@@ -5984,6 +5984,7 @@ dependencies = [
  "rand 0.8.5",
  "tang",
  "tang-ad",
+ "tang-compile",
  "tang-expr",
  "tang-gpu",
  "tang-infer",

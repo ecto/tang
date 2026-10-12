@@ -40,6 +40,10 @@ harness = false
 name = "gpu_inference"
 harness = false
 
+[[bench]]
+name = "kernels_vs_ir"
+harness = false
+
 [features]
 default = []
 # Reassociable float ops in hot reductions. Requires Rust 1.98+.
@@ -60,6 +64,7 @@ tang        = { workspace = true, features = ["std"] }
 tang-la     = { workspace = true, features = ["std"] }
 tang-ad     = { workspace = true }
 tang-expr   = { workspace = true }
+tang-compile = { workspace = true }
 tang-gpu    = { workspace = true }
 tang-train  = { workspace = true }
 tang-tensor = { workspace = true }
