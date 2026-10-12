@@ -142,7 +142,8 @@ fn main() {
         let (g, outs) = g.eliminate_common(&outs);
         let (g, outs) = g.merge_siblings(&outs);
         let (g, outs) = g.relayout(&outs);
-        let (mut g, outs) = g.merge_reduce_dims(&outs);
+        let (g, outs) = g.merge_reduce_dims(&outs);
+        let (mut g, outs) = g.split_reduce_dims(&outs);
         g.schedule_auto(&outs);
         let target = vec![0.0f32; seq * 576];
         let mut inputs: Vec<&[f32]> = p.cpu.iter().map(|v| v.as_slice()).collect();

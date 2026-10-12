@@ -1783,6 +1783,28 @@ impl TensorGraph {
             .collect();
         let uses = self.use_counts(outputs, &live);
         let is_output = |i: usize| outputs.iter().any(|o| o.n() == i);
+        // a map every one of whose consumers reduces may be recomputed in
+        // each of them (flash backward recomputes dS in dQ and dK alike)
+        let mut consumers_reduce = vec![true; self.nodes.len()];
+        for j in (0..self.nodes.len()).filter(|&j| live[j]) {
+            match &self.nodes[j].op {
+                Op::Comp(c) => {
+                    for a in &c.args {
+                        if c.monoid.is_none() {
+                            consumers_reduce[a.src.n()] = false;
+                        }
+                    }
+                }
+                Op::Reshape(src) => consumers_reduce[src.n()] = false,
+                _ => {}
+            }
+        }
+        let recomputable: Vec<bool> = (0..self.nodes.len())
+            .map(|p| {
+                uses[p] == 1
+                    || (consumers_reduce[p] && self.comp_at(p).is_some_and(|pc| pc.red.is_empty()))
+            })
+            .collect();
         for i in reductions {
             // schedule by the reduction's shape, even when `i` is its epilogue
             let c = self.comp_at(self.tiled_reduction(i).unwrap()).unwrap();
@@ -1799,7 +1821,7 @@ impl TensorGraph {
                 .map(|lane| {
                     c.args
                         .iter()
-                        .filter(|a| !a.view.depends_on(lane) && uses[a.src.n()] == 1)
+                        .filter(|a| !a.view.depends_on(lane) && recomputable[a.src.n()])
                         .map(|a| a.src.n())
                         .filter(|&p| !is_output(p) && self.comp_at(p).is_some())
                         .collect()
@@ -1814,7 +1836,16 @@ impl TensorGraph {
                 for p in shared {
                     self.nodes[p].inline = true;
                 }
-            } else if c.red.len() == 1 && lanes >= 16 && rows {
+            } else if c.red.len() == 1 && lanes >= 16 && rows && {
+                // reuse: some operand is shared along the lanes and some
+                // along the rows — otherwise a tile only adds staging
+                let row_dim = lane_dim.and_then(|dx| tile::largest_other(&pts, dx));
+                let real = |a: &&Arg| !matches!(self.nodes[a.src.n()].op, Op::Iota(_));
+                let lane = lane_dim.unwrap();
+                c.args.iter().filter(real).any(|a| !a.view.depends_on(lane))
+                    && row_dim
+                        .is_some_and(|r| c.args.iter().filter(real).any(|a| !a.view.depends_on(r)))
+            } {
                 // matmul-shaped: the 16×16 shared-memory tile, with a 4×4
                 // register tile once both axes are wide enough to fill it
                 // (won on an M4 and a 3090 alike; see BENCHMARKS.md)
@@ -2005,6 +2036,117 @@ impl TensorGraph {
             }
         }
         (g, outputs.to_vec())
+    }
+
+    /// A reduction over several dims with a small one among them
+    /// (≤ `SMALL` elements) is two reductions: the inner one over the
+    /// rest, keeping the small dim as a point dim, and an outer one
+    /// folding the small dim with the same monoid (states combine like
+    /// elements — the property the split schedule relies on). The inner
+    /// reduction then has one reduce dim and tiles; the outer one is tiny.
+    /// `Σ_{r,i} dS[i,g,r,j]·q[i,g,r,d]` (dK for grouped heads) becomes
+    /// `Σ_r (Σ_i …)`.
+    pub fn split_reduce_dims(&self, outputs: &[TensorId]) -> (TensorGraph, Vec<TensorId>) {
+        const SMALL: usize = 16;
+        let mut g = self.clone();
+        let live = self.live(outputs);
+        let mut redirect: Vec<usize> = (0..self.nodes.len()).collect();
+        for i in (0..self.nodes.len()).filter(|&i| live[i]) {
+            let Some(c) = self.comp_at(i) else { continue };
+            let Some(m) = c.monoid.clone() else { continue };
+            if c.red.len() < 2 || c.tuple > 1 {
+                continue;
+            }
+            let reds: Option<Vec<usize>> = c.red.iter().map(|d| d.fixed()).collect();
+            let Some(reds) = reds else { continue };
+            // the smallest reduce dim, if small
+            let Some((f, &nf)) = reds.iter().enumerate().min_by_key(|(_, n)| **n) else {
+                continue;
+            };
+            if nf > SMALL {
+                continue;
+            }
+            let k = c.points().len();
+            let rank = c.rank();
+            let w = c.width();
+            // inner space: points, the small dim, the other reduce dims
+            let order: Vec<usize> = (0..k)
+                .chain([k + f])
+                .chain((0..reds.len()).filter(|&r| r != f).map(|r| k + r))
+                .collect();
+            let inner_args: Vec<Arg> = c
+                .args
+                .iter()
+                .map(|a| Arg {
+                    src: a.src,
+                    view: View {
+                        forms: a
+                            .view
+                            .forms
+                            .iter()
+                            .map(|fm| Form {
+                                coefs: order.iter().map(|&d| fm.coefs[d]).collect(),
+                                offset: fm.offset,
+                            })
+                            .collect(),
+                    },
+                })
+                .collect();
+            let mut inner_out: Vec<Dim> = c.points().to_vec();
+            inner_out.push(Dim::Fixed(nf));
+            inner_out.extend_from_slice(&c.out[k..]);
+            let inner = Comp {
+                out: inner_out.clone(),
+                tuple: c.tuple,
+                red: (0..reds.len())
+                    .filter(|&r| r != f)
+                    .map(|r| c.red[r])
+                    .collect(),
+                args: inner_args,
+                body: c.body.clone(),
+                body_outs: c.body_outs.clone(),
+                monoid: Some(m.clone()),
+            };
+            let inner_id = g.nodes.len();
+            g.nodes.push(TNode {
+                shape: inner_out,
+                inline: false,
+                split: 0,
+                tile: (0, 0, 0),
+                reg: (1, 1),
+                op: Op::Comp(inner),
+            });
+            // outer: Σ_f inner[p…, f, slot] per state slot
+            let orank = k + 1;
+            let args: Vec<Arg> = (0..w)
+                .map(|slot| {
+                    let mut forms: Vec<Form> = (0..k).map(|d| Form::unit(orank, d)).collect();
+                    forms.push(Form::unit(orank, k));
+                    if c.tuple == 1 {
+                        forms.push(Form::constant(orank, slot as i64));
+                    }
+                    Arg {
+                        src: TensorId(inner_id as u32),
+                        view: View { forms },
+                    }
+                })
+                .collect();
+            let (body, body_outs) = trace(|| (0..w).map(|v| ExprId::var(v as u16)).collect());
+            let outer = Comp {
+                out: c.out.clone(),
+                tuple: c.tuple,
+                red: vec![Dim::Fixed(nf)],
+                args,
+                body,
+                body_outs,
+                monoid: Some(m),
+            };
+            let _ = rank;
+            g.nodes[i].op = Op::Comp(outer);
+            redirect[i] = i;
+        }
+        let _ = redirect;
+        g.eliminate_dead(outputs)
     }
 
     /// Two adjacent reduce dims that every arg reads either not at all
@@ -2817,6 +2959,41 @@ mod tests {
             vec![Dim::Fixed(groups * hd)]
         );
         close(&mg.eval(&inputs, &outs)[0], &want);
+    }
+
+    #[test]
+    fn split_reduce_dims_factors_a_small_dim() {
+        // y[j, d] = Σ_{r, i} a[i, r, j] · b[i, r, d], r small
+        let (n, r, dd) = (32, 3, 8);
+        let mut g = TensorGraph::new();
+        let a = g.input(&[n, r, n]);
+        let b = g.input(&[n, r, dd]);
+        let y = g
+            .comp(
+                &[n, dd],
+                &[r, n],
+                vec![
+                    Arg {
+                        src: a,
+                        view: View::pick(4, &[Some(3), Some(2), Some(0)]),
+                    },
+                    Arg {
+                        src: b,
+                        view: View::pick(4, &[Some(3), Some(2), Some(1)]),
+                    },
+                ],
+                Some(Monoid::sum()),
+                |v| vec![v[0] * v[1]],
+            )
+            .unwrap();
+        let inputs = [ramp(n * r * n, 0.01, -0.3), ramp(n * r * dd, 0.02, 0.1)];
+        let want = g.eval(&inputs, &[y]).remove(0);
+        let (sg, outs) = g.split_reduce_dims(&[y]);
+        let c = sg.comp_at(outs[0].n()).unwrap();
+        assert_eq!(c.red, vec![Dim::Fixed(r)]);
+        let inner = sg.comp_at(c.args[0].src.n()).unwrap();
+        assert_eq!(inner.red, vec![Dim::Fixed(n)]);
+        close(&sg.eval(&inputs, &outs)[0], &want);
     }
 
     #[test]

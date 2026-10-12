@@ -112,7 +112,8 @@ fn main() {
         let (tg, outs) = tg.eliminate_common(&outs);
         let (tg, outs) = tg.merge_siblings(&outs);
         let (tg, outs) = tg.relayout(&outs);
-        let (mut tg, outs) = tg.merge_reduce_dims(&outs);
+        let (tg, outs) = tg.merge_reduce_dims(&outs);
+        let (mut tg, outs) = tg.split_reduce_dims(&outs);
         tg.schedule_auto(&outs);
         let program = tg.to_cuda(&outs);
         let n_native = program
