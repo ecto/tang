@@ -650,29 +650,6 @@ fn rewrite_ctor(s: &str, prefix: &str) -> String {
     out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::float_literals;
-
-    #[test]
-    fn literals_stay_single_precision() {
-        assert_eq!(float_literals("auto x = -1e30;"), "auto x = -1e30f;");
-        assert_eq!(
-            float_literals("let y = 1.5 * e4 + 2u;"),
-            "let y = 1.5f * e4 + 2u;"
-        );
-        assert_eq!(float_literals("c0_14 = 1.442695;"), "c0_14 = 1.442695f;");
-        assert_eq!(
-            float_literals("v[3] = 3.4028235e38"),
-            "v[3] = 3.4028235e38f"
-        );
-        assert_eq!(
-            float_literals("stage_0[idx * 64u + 1u]"),
-            "stage_0[idx * 64u + 1u]"
-        );
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Attention on tensor cores
 // ---------------------------------------------------------------------------
@@ -728,7 +705,7 @@ impl TensorGraph {
         let dy = super::tile::largest_other(&pts, dx)?;
         let others: Vec<usize> = (0..pts.len()).filter(|&d| d != dx && d != dy).collect();
         let d_lanes = pts[dx];
-        if d_lanes % 16 != 0 || d_lanes > 64 {
+        if !d_lanes.is_multiple_of(16) || d_lanes > 64 {
             return None;
         }
         // body outs: (score + mask, 1, value)
@@ -844,9 +821,7 @@ impl TensorGraph {
         }
         // the normalizer reads the reduction point-for-point and nothing
         // but buffers otherwise
-        if self.epilogue_read(c, red_node).is_none() {
-            return None;
-        }
+        self.epilogue_read(c, red_node)?;
         for a in &c.args {
             if a.src.n() != red_node && !is_buffer(a.src.n()) {
                 return None;
@@ -1291,7 +1266,7 @@ impl TensorGraph {
                         format!(
                             "b{}[(unsigned)({})]",
                             storage(a.src.n()),
-                            addr_expr(&addr, &|dd| rcoord(dd).replace("(int)", "(int)"))
+                            addr_expr(&addr, &rcoord)
                         )
                     }
                 })
@@ -1324,5 +1299,28 @@ impl TensorGraph {
         writeln!(s, "}}").unwrap();
         let _ = f.score_node;
         Some(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::float_literals;
+
+    #[test]
+    fn literals_stay_single_precision() {
+        assert_eq!(float_literals("auto x = -1e30;"), "auto x = -1e30f;");
+        assert_eq!(
+            float_literals("let y = 1.5 * e4 + 2u;"),
+            "let y = 1.5f * e4 + 2u;"
+        );
+        assert_eq!(float_literals("c0_14 = 1.442695;"), "c0_14 = 1.442695f;");
+        assert_eq!(
+            float_literals("v[3] = 3.4028235e38"),
+            "v[3] = 3.4028235e38f"
+        );
+        assert_eq!(
+            float_literals("stage_0[idx * 64u + 1u]"),
+            "stage_0[idx * 64u + 1u]"
+        );
     }
 }
