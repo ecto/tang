@@ -1491,7 +1491,7 @@ Planning does not cost time; on CUDA it is slightly faster (fewer pages
 touched). Compile cost is real: 2399 kernels are 2399 distinct sources
 (node numbers differ per layer; 127–188 are distinct up to renaming), so
 the first wgpu run spends 237 s in shader compilation on the M4 and nvrtc
-takes 56 s on 24 threads (cached as PTX in `target/tang-ptx`).
+takes 56 s on all cores of the 3090 host (cached as PTX in `target/tang-ptx`).
 
 **Cross-layer fusion.** The existing passes do fire across block
 boundaries, and the result is a warning. `substitute_maps` sees the
