@@ -1778,7 +1778,7 @@ impl TensorGraph {
             .filter(|&i| {
                 self.tiled_reduction(i)
                     .and_then(|r| self.comp_at(r))
-                    .is_some_and(|c| numel(&c.red) >= 64)
+                    .is_some_and(|c| numel(&c.red) >= 16)
             })
             .collect();
         let uses = self.use_counts(outputs, &live);

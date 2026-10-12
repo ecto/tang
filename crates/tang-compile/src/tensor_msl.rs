@@ -33,7 +33,7 @@ const THREADS: usize = 128;
 const PAD: usize = 4;
 
 /// An operand's flat address as an affine form over the comp's space.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) struct Addr {
     pub offset: i64,
     pub coefs: Vec<i64>,
@@ -42,6 +42,7 @@ pub(super) struct Addr {
 /// One product of the bilinear body: buffers (storage nodes) of the two
 /// operands and their addresses over the reduction's space; A has no
 /// coefficient on `dx`, B none on `dy`.
+#[derive(Clone, PartialEq, Eq)]
 pub(super) struct Term {
     pub buf_a: usize,
     pub addr_a: Addr,
@@ -58,8 +59,11 @@ pub(super) struct Bilinear {
     pub buf_b: usize,
     pub addr_a: Addr,
     pub addr_b: Addr,
-    /// every term of the sum
+    /// every term of the sum (of the first output)
     pub terms: Vec<Term>,
+    /// per output value (a tuple-valued reduction has several, e.g. a
+    /// merged gate/up projection), the terms of its sum
+    pub outs: Vec<Vec<Term>>,
     pub pts: Vec<usize>,
     /// tile axes: columns, rows; the remaining point dims are `others`
     pub dx: usize,
@@ -102,7 +106,7 @@ impl TensorGraph {
         let red_node = self.tiled_reduction(root)?;
         let rc = self.comp_at(red_node)?;
         let epilogue = red_node != root;
-        if rc.red.len() != 1 || rc.width() != 1 || rc.tuple != 0 {
+        if rc.red.len() != 1 || rc.tuple > 1 {
             return None;
         }
         // the epilogue must read the reduction at its own coordinates
@@ -131,9 +135,13 @@ impl TensorGraph {
                 _ => false,
             }
         }
-        let mut pairs = Vec::new();
-        if !products(nodes, rc.body_outs[0], &mut pairs) || pairs.is_empty() {
-            return None;
+        let mut out_pairs: Vec<Vec<(usize, usize)>> = Vec::new();
+        for &o in &rc.body_outs {
+            let mut pairs = Vec::new();
+            if !products(nodes, o, &mut pairs) || pairs.is_empty() {
+                return None;
+            }
+            out_pairs.push(pairs);
         }
         let pts = fixed(rc.points());
         let k_total = rc.red[0].n();
@@ -146,28 +154,34 @@ impl TensorGraph {
         let (n, m) = (pts[dx], pts[dy]);
         let storage = |j: usize| self.storage(TensorId(j as u32)).n();
         let is_buffer = |j: usize| reads.contains(&storage(j));
-        let mut terms = Vec::with_capacity(pairs.len());
-        for (va, vb) in pairs {
-            let addr_a = self.flat_addr(&rc.args[va], rank);
-            let addr_b = self.flat_addr(&rc.args[vb], rank);
-            // A varies along rows (dy) and k, B along cols (dx) and k
-            let (a_arg, b_arg, addr_a, addr_b) = if addr_a.coefs[dx] == 0 && addr_b.coefs[dy] == 0 {
-                (va, vb, addr_a, addr_b)
-            } else if addr_a.coefs[dy] == 0 && addr_b.coefs[dx] == 0 {
-                (vb, va, addr_b, addr_a)
-            } else {
-                return None;
-            };
-            if !is_buffer(rc.args[a_arg].src.n()) || !is_buffer(rc.args[b_arg].src.n()) {
-                return None;
+        let mut outs: Vec<Vec<Term>> = Vec::with_capacity(out_pairs.len());
+        for pairs in out_pairs {
+            let mut terms = Vec::with_capacity(pairs.len());
+            for (va, vb) in pairs {
+                let addr_a = self.flat_addr(&rc.args[va], rank);
+                let addr_b = self.flat_addr(&rc.args[vb], rank);
+                // A varies along rows (dy) and k, B along cols (dx) and k
+                let (a_arg, b_arg, addr_a, addr_b) =
+                    if addr_a.coefs[dx] == 0 && addr_b.coefs[dy] == 0 {
+                        (va, vb, addr_a, addr_b)
+                    } else if addr_a.coefs[dy] == 0 && addr_b.coefs[dx] == 0 {
+                        (vb, va, addr_b, addr_a)
+                    } else {
+                        return None;
+                    };
+                if !is_buffer(rc.args[a_arg].src.n()) || !is_buffer(rc.args[b_arg].src.n()) {
+                    return None;
+                }
+                terms.push(Term {
+                    buf_a: storage(rc.args[a_arg].src.n()),
+                    addr_a,
+                    buf_b: storage(rc.args[b_arg].src.n()),
+                    addr_b,
+                });
             }
-            terms.push(Term {
-                buf_a: storage(rc.args[a_arg].src.n()),
-                addr_a,
-                buf_b: storage(rc.args[b_arg].src.n()),
-                addr_b,
-            });
+            outs.push(terms);
         }
+        let terms = outs[0].clone();
         // epilogue args: the reduction, or buffers read at affine addresses
         if epilogue {
             for a in &c.args {
@@ -184,6 +198,7 @@ impl TensorGraph {
             addr_a: terms[0].addr_a.clone(),
             addr_b: terms[0].addr_b.clone(),
             terms,
+            outs,
             pts,
             dx,
             dy,
@@ -203,7 +218,7 @@ impl TensorGraph {
         let (LDA, LDB, LDC) = (CHUNK + PAD, BLOCK + PAD, BLOCK + PAD);
         let c = self.comp_at(root)?;
         let t = self.bilinear_tile(root, reads)?;
-        if t.terms.len() != 1 {
+        if t.terms.len() != 1 || t.outs.len() != 1 {
             return None;
         }
         let Bilinear {
