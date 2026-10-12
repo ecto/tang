@@ -785,6 +785,34 @@ derived kernels are 2–4× faster than tang's hand kernels through the
 portable path, and within 2× of cuBLAS through the native one, from one
 comprehension and no op-specific code.
 
+### The whole block on CUDA (`to_cuda` + cudarc, RTX 3090)
+
+`TensorGraph::to_cuda` emits a program for the CUDA driver: matmul-shaped
+tiles as the wmma kernel above, every other kernel the WGSL transpiled
+to CUDA C++ (generated WGSL is regular enough that a line-level
+translation with a 20-line prelude covers the naive, split and tile
+emitters — no second emitter). `tang_bench::ir_cuda::CudaExecutable`
+compiles with nvrtc and launches in program order. Two layout passes
+landed on the way: `relayout` (a producer's point dims reordered to
+its consumer's reads) and `merge_reduce_dims` (adjacent reduce dims
+read contiguously fold into one), which turn the attention-output
+projection Σ_{g,r,d} into a 576-wide matmul — so 5 of the block's 16
+kernels run on tensor cores.
+
+| | CUDA (5 kernels on tensor cores) | Vulkan/WGSL | PyTorch fp32 |
+|---|---|---|---|
+| block fwd, seq 128 | **0.62 ms** | 1.06 | 0.30 / 0.57 |
+| block fwd, seq 512 | **1.86 ms** | 3.34 | 0.61 / 1.21 |
+
+Per kernel at seq 512: five wmma matmuls 0.05–0.18 ms each, the
+elementwise and split kernels 2–14 µs each (the Vulkan path's ~0.1 ms
+per-kernel floor is gone), and the attention tile 1.25 ms — two thirds
+of the total. Attention on tensor cores (q·k and p·v as wmma fragments
+inside the online-softmax tile) is the one remaining piece between this
+and PyTorch's number; it is the same lowering applied inside a tile
+whose reduction is a monoid rather than a sum. Correctness: 5e-5
+relative against the f64 evaluation at seq 128 (TF32 inputs).
+
 What this does and does not show: the compiler derives the *structure* of
 the fast kernels (flash attention, register-tiled matmul, sequence
 parallelism) from the algebra, with no op-specific code, and picks per

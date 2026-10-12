@@ -159,12 +159,13 @@ schedule space; the compiler searches it.
 - Native codegen is a first cut. Matmul-shaped tiles lower to Metal
   simdgroup matrices (`tensor_msl.rs`, via wgpu's MSL passthrough) and
   to CUDA `wmma` TF32 tensor cores (`tensor_cuda.rs`), epilogues
-  included. The CUDA kernel runs at 14–21 TFLOPS on a 3090, within 2× of
-  cuBLAS TF32; the Metal fp32 kernel does not yet beat the WGSL register
-  tile. Neither is dispatched by tang-gpu yet: Metal is opt-in, CUDA is
-  measured through an nvcc harness (`scripts/cuda_bench.cu`), since wgpu
-  cannot run CUDA. A CUDA runtime path (cudarc or driver-API FFI with
-  buffer interop) is the next piece.
+  included; `to_cuda` emits whole programs (wmma tiles plus the other
+  kernels transpiled from their WGSL) that `tang_bench::ir_cuda` runs
+  through cudarc. The block forward runs in 0.62 ms at seq 128 on a 3090
+  with five kernels on tensor cores; the Metal fp32 kernel does not yet
+  beat the WGSL register tile. Attention is not on tensor cores yet.
+- The CUDA path is a separate runtime (tang-gpu runs on wgpu, which
+  cannot dispatch CUDA); buffers do not interoperate between the two.
 - Scatter gradients reduce over the whole source coordinate they gate on;
   a stride-2 read pays 2× in the backward pass. Fine for rope, not for a
   large gather.
