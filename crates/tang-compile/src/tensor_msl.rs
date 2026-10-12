@@ -267,8 +267,6 @@ impl TensorGraph {
             && (cpa == 1 || cka == 1)
             && (cpb == 1 || ckb == 1);
         if direct {
-            let buf_a = buf_a;
-            let buf_b = buf_b;
             // A fragment (rows sr+8i.., k kk..): row-major when k is the
             // unit stride, else stored transposed
             let (lda, ta) = if cka == 1 {
