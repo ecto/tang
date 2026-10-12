@@ -96,8 +96,173 @@ impl Region {
     fn span(&self) -> usize {
         (self.hi - self.lo + 1) as usize
     }
-    fn inner_n(&self) -> usize {
-        self.extents.iter().product()
+
+    /// Staging layout for a `px_n × py_n` tile and `chunk` reduce steps.
+    ///
+    /// Every var of the region (lanes, `t = r0 − chunk`, inner vars) is
+    /// either a grid axis — one staged copy per value — or folded into a
+    /// window over the address line. A conv's `x[c, t + d·k − p]` folds
+    /// the lane `t` and tap `k` into one `tile_t + d·(K − 1)` window
+    /// instead of `K` overlapping copies. A var is folded when that
+    /// shrinks the region: a window grown by `|coef|·(ext − 1)` beats
+    /// `ext` copies of it.
+    fn layout(
+        &self,
+        names: (&str, Option<&str>),
+        px_n: usize,
+        py_n: usize,
+        chunk: usize,
+    ) -> Layout {
+        let mut vars: Vec<LVar> = vec![LVar {
+            kind: LKind::T,
+            name: "r0".into(),
+            coef: self.key.red,
+            ext: chunk,
+        }];
+        for ((name, coef), &ext) in self.key.inner.iter().zip(&self.extents) {
+            vars.push(LVar {
+                kind: LKind::Inner,
+                name: name.clone(),
+                coef: *coef,
+                ext,
+            });
+        }
+        if self.key.py != 0 {
+            vars.push(LVar {
+                kind: LKind::Y,
+                name: names.1.unwrap().into(),
+                coef: self.key.py,
+                ext: py_n,
+            });
+        }
+        if self.key.px != 0 {
+            vars.push(LVar {
+                kind: LKind::X,
+                name: names.0.into(),
+                coef: self.key.px,
+                ext: px_n,
+            });
+        }
+        // Greedy folds. A neutral fold (the lane axis alone: a 64-wide
+        // window is 64 copies of one) can enable the next one (the taps),
+        // so try with neutral folds allowed and keep that only if it ends
+        // smaller.
+        let fold = |neutral: bool| {
+            let mut size = self.span() as i64;
+            let mut win = vec![false; vars.len()];
+            loop {
+                let best = (0..vars.len())
+                    .filter(|&i| !win[i] && vars[i].ext > 1)
+                    .map(|i| {
+                        let grown = size + vars[i].coef.abs() * (vars[i].ext as i64 - 1);
+                        (i, grown as f64 / (size as f64 * vars[i].ext as f64))
+                    })
+                    .filter(|&(_, ratio)| ratio < 1.0 || (neutral && ratio <= 1.0))
+                    .min_by(|a, b| a.1.total_cmp(&b.1));
+                let Some((i, _)) = best else { break };
+                win[i] = true;
+                size += vars[i].coef.abs() * (vars[i].ext as i64 - 1);
+            }
+            // A guarded window must recover its guarded coordinate from
+            // the window position: one source coord may depend on it.
+            let mut guard_coord = None;
+            if let Some((coords, shape)) = &self.key.guard {
+                let on_win: Vec<usize> = (0..coords.len())
+                    .filter(|&c| {
+                        vars.iter()
+                            .zip(&win)
+                            .any(|(v, &w)| w && coords[c].terms.contains_key(&v.name))
+                    })
+                    .collect();
+                match on_win.as_slice() {
+                    [] => {}
+                    [c] => {
+                        guard_coord = Some((*c, shape[c + 1..].iter().product::<usize>() as i64))
+                    }
+                    _ => {
+                        win.iter_mut().for_each(|w| *w = false);
+                        size = self.span() as i64;
+                    }
+                }
+            }
+            let grid: usize = vars
+                .iter()
+                .zip(&win)
+                .filter(|(_, &w)| !w)
+                .map(|(v, _)| v.ext)
+                .product();
+            (grid * size as usize, size, win, guard_coord)
+        };
+        let strict = fold(false);
+        let loose = fold(true);
+        let (_, size, win, guard_coord) = if loose.0 < strict.0 { loose } else { strict };
+        let wmin: i64 = vars
+            .iter()
+            .zip(&win)
+            .filter(|(_, &w)| w)
+            .map(|(v, _)| (v.coef * (v.ext as i64 - 1)).min(0))
+            .sum();
+        let (mut grid, mut window) = (Vec::new(), Vec::new());
+        for (v, w) in vars.into_iter().zip(win) {
+            if w {
+                window.push(v)
+            } else {
+                grid.push(v)
+            }
+        }
+        Layout {
+            grid,
+            window,
+            wsize: size as usize,
+            wmin,
+            guard_coord,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LKind {
+    T,
+    Inner,
+    Y,
+    X,
+}
+
+#[derive(Clone, Debug)]
+struct LVar {
+    kind: LKind,
+    /// the var's name in address forms (`r0`, `u1`, `p1`, …)
+    name: String,
+    coef: i64,
+    ext: usize,
+}
+
+/// How a region sits in workgroup memory: grid axes in order (`t`, inner
+/// vars, then lanes innermost so consecutive lanes hit consecutive words),
+/// with the window between the inner vars and the lanes.
+struct Layout {
+    grid: Vec<LVar>,
+    window: Vec<LVar>,
+    /// window length in elements (the offset span when nothing is folded)
+    wsize: usize,
+    /// smallest `Σ coef·var` over the window vars (≤ 0)
+    wmin: i64,
+    /// `(coord, row-major stride)` of the guarded source coord that
+    /// depends on window vars
+    guard_coord: Option<(usize, i64)>,
+}
+
+impl Layout {
+    fn total(&self) -> usize {
+        self.grid.iter().map(|v| v.ext).product::<usize>() * self.wsize
+    }
+    /// grid axes outside the window, then inside (lanes)
+    fn split(&self) -> (Vec<&LVar>, Vec<&LVar>) {
+        let lane = |v: &&LVar| matches!(v.kind, LKind::X | LKind::Y);
+        (
+            self.grid.iter().filter(|v| !lane(v)).collect(),
+            self.grid.iter().filter(lane).collect(),
+        )
     }
 }
 
@@ -253,27 +418,27 @@ impl Ctx<'_> {
             return String::new();
         }
         let r = &self.regions[idx];
-        // Point-minor layout: ((t * innerN + inner) * span + o) * P + point,
-        // so consecutive lanes hit consecutive words (no bank conflicts).
-        let mut points = 1usize;
-        let mut point = String::from("0u");
-        if r.key.py != 0 {
-            point = format!("({point}) * {}u + ly_", self.by);
-            points *= self.by;
+        let lay = r.layout((&self.px, self.py.as_deref()), self.bx, self.by, self.chunk);
+        let local = |v: &LVar| match v.kind {
+            LKind::T => "(r0 - chunk)".to_string(),
+            LKind::Inner => v.name.clone(),
+            LKind::Y => "ly_".to_string(),
+            LKind::X => "lx_".to_string(),
+        };
+        let mut wpos = format!("{}", addr.offset - r.lo - lay.wmin);
+        for v in &lay.window {
+            wpos.push_str(&format!(" + {} * i32({})", v.coef, local(v)));
         }
-        if r.key.px != 0 {
-            point = format!("({point}) * {}u + lx_", self.bx);
-            points *= self.bx;
+        let (outer, lanes) = lay.split();
+        let mut index = String::from("0u");
+        for v in &outer {
+            index = format!("({index}) * {}u + {}", v.ext, local(v));
         }
-        let mut local = String::from("(r0 - chunk)");
-        for ((name, _), &ext) in r.key.inner.iter().zip(&r.extents) {
-            local = format!("({local}) * {ext}u + {name}");
+        index = format!("({index}) * {}u + u32({wpos})", lay.wsize);
+        for v in &lanes {
+            index = format!("({index}) * {}u + {}", v.ext, local(v));
         }
-        format!(
-            "stage_{idx}[(({local}) * {}u + {}u) * {points}u + ({point})]",
-            r.span(),
-            addr.offset - r.lo
-        )
+        format!("stage_{idx}[{index}]")
     }
 
     /// A read that does not depend on the reduce var: served from a
@@ -661,11 +826,8 @@ impl TensorGraph {
                 .regions
                 .iter()
                 .map(|r| {
-                    (if r.key.py != 0 { py_n } else { 1 })
-                        * (if r.key.px != 0 { px_n } else { 1 })
-                        * chunk
-                        * r.inner_n()
-                        * r.span()
+                    r.layout((&ctx.px, ctx.py.as_deref()), px_n, py_n, chunk)
+                        .total()
                 })
                 .sum();
             let comps: usize = ctx
@@ -677,7 +839,7 @@ impl TensorGraph {
         };
         let mut chunk = chunk;
         while chunk > 1 && staged(&ctx, chunk) > 4096 {
-            chunk /= 2;
+            chunk -= 1;
         }
         ctx.chunk = chunk;
         ctx.collect = false;
@@ -685,20 +847,13 @@ impl TensorGraph {
         body.clear();
         let combined = run(&mut ctx, &mut body);
 
-        let region_total = |r: &Region| {
-            (if r.key.py != 0 { py_n } else { 1 })
-                * (if r.key.px != 0 { px_n } else { 1 })
-                * chunk
-                * r.inner_n()
-                * r.span()
-        };
-        for (i, r) in ctx.regions.iter().enumerate() {
-            writeln!(
-                s,
-                "var<workgroup> stage_{i}: array<f32, {}>;",
-                region_total(r)
-            )
-            .unwrap();
+        let layouts: Vec<Layout> = ctx
+            .regions
+            .iter()
+            .map(|r| r.layout((&ctx.px, ctx.py.as_deref()), px_n, py_n, chunk))
+            .collect();
+        for (i, lay) in layouts.iter().enumerate() {
+            writeln!(s, "var<workgroup> stage_{i}: array<f32, {}>;", lay.total()).unwrap();
         }
         // Cooperative loads for shared comps are expanded in the load
         // phase with r0 := chunk + t and py := tile_y*by + ly.
@@ -847,75 +1002,92 @@ impl TensorGraph {
             "    for (var chunk: u32 = 0u; chunk < {r_total}u; chunk = chunk + {chunk}u) {{"
         )
         .unwrap();
-        for (i, r) in ctx.regions.iter().enumerate() {
-            let total = region_total(r);
-            let span = r.span();
+        for (i, (r, lay)) in ctx.regions.iter().zip(&layouts).enumerate() {
+            let total = lay.total();
             writeln!(
                 s,
                 "        for (var idx: u32 = tid; idx < {total}u; idx = idx + {threads}u) {{"
             )
             .unwrap();
-            // point-minor: lanes innermost, then offset, inner vars, t
-            let points =
-                (if r.key.py != 0 { by } else { 1 }) * (if r.key.px != 0 { bx } else { 1 });
+            // decompose innermost first: lanes, window, inner vars, t
             writeln!(s, "            var rem = idx;").unwrap();
-            let mut addr = format!("{}", r.lo);
+            let (outer, lanes) = lay.split();
+            // global value of a grid var, and of a window var's base
+            let global = |v: &LVar| match v.kind {
+                LKind::T => "chunk + t".to_string(),
+                LKind::Inner => v.name.clone(),
+                LKind::Y => "gy".to_string(),
+                LKind::X => "gx".to_string(),
+            };
+            let base = |v: &LVar| match v.kind {
+                LKind::T => "chunk".to_string(),
+                LKind::Inner => "0u".to_string(),
+                LKind::Y => format!("tile_y * {py_n}u"),
+                LKind::X => format!("tile_x * {px_n}u"),
+            };
             let mut live = String::from("true");
-            if r.key.px != 0 {
-                writeln!(s, "            let lx = rem % {px_n}u;").unwrap();
-                writeln!(s, "            rem = rem / {px_n}u;").unwrap();
-                writeln!(s, "            let gx = tile_x * {px_n}u + lx;").unwrap();
-                addr.push_str(&format!(" + {} * i32(gx)", r.key.px));
-                live.push_str(&format!(" && gx < {nx}u"));
-            }
-            if r.key.py != 0 {
-                writeln!(s, "            let ly = rem % {py_n}u;").unwrap();
-                writeln!(s, "            rem = rem / {py_n}u;").unwrap();
-                writeln!(s, "            let gy = tile_y * {py_n}u + ly;").unwrap();
-                addr.push_str(&format!(" + {} * i32(gy)", r.key.py));
-                live.push_str(&format!(" && gy < {ny}u"));
-            }
-            let _ = points;
-            writeln!(s, "            let o = rem % {span}u;").unwrap();
-            writeln!(s, "            rem = rem / {span}u;").unwrap();
-            for ((name, coef), &ext) in r.key.inner.iter().zip(&r.extents).rev() {
-                writeln!(s, "            let {name} = rem % {ext}u;").unwrap();
+            for v in lanes.iter().rev() {
+                let (l, g, n, tile, ext) = match v.kind {
+                    LKind::X => ("lx", "gx", nx, "tile_x", px_n),
+                    _ => ("ly", "gy", ny, "tile_y", py_n),
+                };
+                writeln!(s, "            let {l} = rem % {ext}u;").unwrap();
                 writeln!(s, "            rem = rem / {ext}u;").unwrap();
-                addr.push_str(&format!(" + {coef} * i32({name})"));
+                writeln!(s, "            let {g} = {tile} * {ext}u + {l};").unwrap();
+                live.push_str(&format!(" && {g} < {n}u"));
             }
-            writeln!(s, "            let t = rem % {chunk}u;").unwrap();
-            addr.push_str(&format!(" + {} * i32(chunk + t) + i32(o)", r.key.red));
-            live.push_str(&format!(" && chunk + t < {r_total}u"));
-
+            writeln!(s, "            let w = rem % {}u;", lay.wsize).unwrap();
+            writeln!(s, "            rem = rem / {}u;", lay.wsize).unwrap();
+            for v in outer.iter().rev() {
+                let name = if v.kind == LKind::T { "t" } else { &v.name };
+                writeln!(s, "            let {name} = rem % {}u;", v.ext).unwrap();
+                writeln!(s, "            rem = rem / {}u;", v.ext).unwrap();
+                if v.kind == LKind::T {
+                    live.push_str(&format!(" && chunk + t < {r_total}u"));
+                }
+            }
+            let mut addr = format!("{} + i32(w)", r.lo + lay.wmin);
+            for v in &lay.grid {
+                addr.push_str(&format!(" + {} * i32({})", v.coef, global(v)));
+            }
+            for v in &lay.window {
+                addr.push_str(&format!(" + {} * i32({})", v.coef, base(v)));
+            }
             for (name, coef) in &r.key.uniform {
                 addr.push_str(&format!(" + {coef} * i32({name})"));
             }
+            writeln!(s, "            let a = {addr};").unwrap();
+            if !lay.window.is_empty() {
+                // a window spans lanes / steps past the edge: keep the
+                // read inside the buffer (those slots are never used)
+                live.push_str(&format!(" && u32(a) < arrayLength(&b{})", r.key.buffer));
+            }
             writeln!(s, "            if ({live}) {{").unwrap();
-            let mut val = format!("b{}[u32({addr})]", r.key.buffer);
+            let mut val = format!("b{}[u32(a)]", r.key.buffer);
             if let Some((coords, shape)) = &r.key.guard {
-                let rename = |c: &Sym| {
-                    let mut out = Sym {
-                        offset: c.offset,
-                        ..Default::default()
-                    };
-                    for (k, v) in &c.terms {
-                        let name = if *k == ctx.px {
-                            "gx"
-                        } else if Some(k) == ctx.py.as_ref() {
-                            "gy"
-                        } else if k == "r0" {
-                            "chunk + t"
-                        } else {
-                            k.as_str()
-                        };
-                        out.add(&Sym::var(name).scaled(*v));
-                    }
-                    out
-                };
                 let cond = coords
                     .iter()
                     .zip(shape)
-                    .map(|(c, n)| format!("({} < {n}u)", rename(c).wgsl()))
+                    .enumerate()
+                    .map(|(ci, (c, n))| {
+                        let mut parts = vec![c.offset.to_string()];
+                        for (k, v) in &c.terms {
+                            let var = lay.grid.iter().chain(&lay.window).find(|lv| &lv.name == k);
+                            let windowed = lay.window.iter().any(|lv| &lv.name == k);
+                            let e = match var {
+                                Some(lv) if windowed => base(lv),
+                                Some(lv) => global(lv),
+                                None => k.clone(),
+                            };
+                            parts.push(format!("{v} * i32({e})"));
+                        }
+                        if let Some((gc, stride)) = lay.guard_coord {
+                            if gc == ci {
+                                parts.push(format!("({} + i32(w)) / {stride}", lay.wmin));
+                            }
+                        }
+                        format!("(u32({}) < {n}u)", parts.join(" + "))
+                    })
                     .collect::<Vec<_>>()
                     .join(" && ");
                 val = format!("select(0.0, {val}, {cond})");

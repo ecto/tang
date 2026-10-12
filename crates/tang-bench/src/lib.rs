@@ -1090,6 +1090,116 @@ pub mod ir_gpu {
             }
         }
 
+        /// Windowed staging: the lane axis and the taps of a conv's `x`
+        /// read share one staged window per chunk. Covers lane strides,
+        /// wide dilation, negative tap coefficients, a guarded windowed
+        /// coord that is not the last source dim (`x` stored `[t, c]`),
+        /// ragged tiles and register tiles.
+        #[test]
+        fn windowed_staging_on_gpu() {
+            let Ok(device) = GpuDevice::new_sync() else {
+                eprintln!("no GPU, skipping");
+                return;
+            };
+            let mut cache = KernelCache::new();
+            let mut rng = crate::Rng::new(17);
+            // (ci, co, t, k, dil, stride, tap sign, x transposed)
+            for &(ci, co, t, k, dil, st, sign, xt) in &[
+                (24, 20, 77, 7, 5, 1, 1, false),
+                (17, 33, 61, 5, 2, 2, 1, false),
+                (20, 18, 45, 4, 1, 1, -1, false),
+                (21, 19, 53, 5, 3, 1, 1, true),
+                (16, 40, 100, 3, 1, 1, -1, true),
+            ] {
+                let tin = t * st as usize;
+                let pad = dil * (k as i64 - 1) / 2;
+                let mut g = TensorGraph::new();
+                let x = g.input(&if xt { [tin, ci] } else { [ci, tin] });
+                let w = g.input(&[co, ci, k]);
+                let tf = Form {
+                    coefs: vec![0, st, 0, sign * dil],
+                    offset: -pad,
+                };
+                let forms = if xt {
+                    vec![tf, Form::unit(4, 2)]
+                } else {
+                    vec![Form::unit(4, 2), tf]
+                };
+                let y = g
+                    .comp(
+                        &[co, t],
+                        &[ci, k],
+                        vec![
+                            Arg {
+                                src: x,
+                                view: View { forms, guard: true },
+                            },
+                            Arg {
+                                src: w,
+                                view: View::pick(4, &[Some(0), Some(2), Some(3)]),
+                            },
+                        ],
+                        Some(Monoid::sum()),
+                        |v| vec![v[0] * v[1]],
+                    )
+                    .unwrap();
+                let inputs = vec![
+                    (0..ci * tin)
+                        .map(|_| rng.f32() * 2.0 - 1.0)
+                        .collect::<Vec<f32>>(),
+                    (0..co * ci * k).map(|_| rng.f32() * 2.0 - 1.0).collect(),
+                ];
+                let f64s: Vec<Vec<f64>> = inputs
+                    .iter()
+                    .map(|v| v.iter().map(|&x| x as f64).collect())
+                    .collect();
+                let want = g.eval(&f64s, &[y]);
+                for (tile, reg) in [
+                    ((16, 16, 32), (1, 1)),
+                    ((16, 16, 32), (2, 2)),
+                    ((16, 16, 32), (4, 4)),
+                    ((64, 1, 8), (1, 1)),
+                    ((32, 8, 32), (1, 1)),
+                ] {
+                    let mut gt = g.clone();
+                    gt.set_schedule(y, 0, tile, reg);
+                    let name = format!(
+                        "window conv {ci}x{co}x{t} k{k} d{dil} s{st} sign{sign} xt{xt} {tile:?} {reg:?}"
+                    );
+                    check_vs_interp(&device, &mut cache, &name, &gt, &[y], &inputs, &want);
+                }
+                // forward + backward (dx, dw) under auto and every candidate
+                let mut gb = g.clone();
+                let grads = gb
+                    .backward(y, &[TensorId::from_index(0), TensorId::from_index(1)])
+                    .unwrap();
+                let mut outs = vec![y];
+                outs.extend(grads);
+                let want = gb.eval(&f64s, &outs);
+                let (gb, outs) = gb.substitute_maps(&outs);
+                let (mut gb, outs) = gb.eliminate_common(&outs);
+                gb.schedule_auto(&outs);
+                check_vs_interp(
+                    &device,
+                    &mut cache,
+                    "window bwd auto",
+                    &gb,
+                    &outs,
+                    &inputs,
+                    &want,
+                );
+                for o in &outs {
+                    for (split, tile, reg) in gb.schedule_candidates(*o) {
+                        let mut gv = gb.clone();
+                        gv.set_schedule(*o, split, tile, reg);
+                        let name =
+                            format!("window bwd node {} {split} {tile:?} {reg:?}", o.index());
+                        check_vs_interp(&device, &mut cache, &name, &gv, &outs, &inputs, &want);
+                    }
+                }
+            }
+        }
+
         /// conv + bias + snake: the map becomes the tiled conv's epilogue
         /// (one kernel), for every tile candidate, forward and backward.
         #[test]

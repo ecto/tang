@@ -2676,6 +2676,34 @@ mod tests {
     }
 
     #[test]
+    fn windowed_staging_shrinks_conv_regions() {
+        // x[c, t + 3k − 9] over a 64-lane tile: one 64 + 3·6 = 82 wide
+        // window per staged channel instead of 7 copies of 64
+        let mut g = TensorGraph::new();
+        let x = g.input(&[512, 2000]);
+        let w = g.input(&[512, 512, 7]);
+        let y = conv1d(&mut g, x, w, 3, 9);
+        g.schedule_auto(&[y]);
+        let src = &g.to_wgsl(&[y]).kernels[0].source;
+        if std::env::var("TANG_DUMP").is_ok() {
+            eprintln!("{src}");
+        }
+        let sizes: Vec<usize> = src
+            .lines()
+            .filter_map(|l| l.strip_prefix("var<workgroup> stage_"))
+            .map(|l| {
+                let n = l.rsplit("array<f32, ").next().unwrap();
+                n.trim_end_matches(">;").parse().unwrap()
+            })
+            .collect();
+        assert_eq!(sizes.len(), 2);
+        assert!(sizes.iter().sum::<usize>() <= 4096);
+        let chunk = sizes[1] / (64 * 7);
+        assert!(chunk > 4, "chunk should grow past 4: {sizes:?}");
+        assert_eq!(sizes[0], 82 * chunk, "x should be staged as one window");
+    }
+
+    #[test]
     fn guarded_view_is_zero_padding() {
         let (ci, co, t, k, dil) = (3, 2, 7, 3, 2);
         let pad = dil * (k as i64 - 1) / 2;
