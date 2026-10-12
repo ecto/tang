@@ -908,16 +908,16 @@ encodes), which slowed PyTorch's reference run by 2–3× as well.
 
 This is the state after the CUDA backend in tang-gpu (#43), split-K (#44), whole-model compilation (#45) and the flash-backward contractions (#47), at commit `4a033e4`.
 
-Method: three rounds under `flock ~/tang-gpu.lock`, with GPU utilization from other tenants between 1% and 98%. Both sides report the minimum over five batches.
+Method: four rounds under `flock ~/tang-gpu.lock`, with GPU utilization from other tenants between 1% and 98%. Both sides report the minimum over five batches.
 - tang's numbers moved less than 3% across the rounds.
 - PyTorch's moved 2–4×, so the PyTorch column is the best value seen in any round.
 - tang runs its matmuls and attention as TF32 on tensor cores. PyTorch is shown in fp32 and, where `torch_bench.py` measures it, TF32.
 
 | | tang (CUDA) | PyTorch best (fp32 / TF32) | ratio |
 |---|---|---|---|
-| block fwd, seq 128 | **0.27 ms** | 0.32 / 0.32 | tang 1.2× faster |
-| block fwd+bwd, seq 128 | **0.69** | 1.30 / — | tang 1.9× faster |
-| block fwd, seq 512 | 0.72 | 0.64 / **0.48** | PyTorch TF32 1.5× faster |
+| block fwd, seq 128 | **0.27 ms** | 0.29 / 0.31 | tang 1.1× faster |
+| block fwd+bwd, seq 128 | **0.69** | 1.28 / — | tang 1.85× faster |
+| block fwd, seq 512 | 0.72 | 0.60 / **0.45** | PyTorch TF32 1.6× faster |
 | block fwd+bwd, seq 512 | 1.94 | **1.72** / — | PyTorch 1.13× faster |
 | 4-layer training step (fwd + bwd + AdamW), seq 128 | **3.60** (planned, in place, CUDA graph) | 4.27 fused AdamW | tang 1.2× faster |
 | 4-layer step, peak memory | **229 MB** | 239 MB fused AdamW / 293 foreach | |
