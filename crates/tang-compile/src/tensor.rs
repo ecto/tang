@@ -1608,6 +1608,66 @@ impl TensorGraph {
         }
     }
 
+    /// Common-subexpression elimination over comps: two live comps with
+    /// the same args, views, body, reduce dims and monoid are one comp.
+    /// Backward graphs produce many such twins (the same strided read of
+    /// a weight for several gradients).
+    pub fn eliminate_common(&self, outputs: &[TensorId]) -> (TensorGraph, Vec<TensorId>) {
+        let n = self.nodes.len();
+        let mut g = self.clone();
+        let mut seen: HashMap<Vec<u8>, usize> = HashMap::new();
+        let mut redirect: Vec<usize> = (0..n).collect();
+        for i in 0..n {
+            // rewrite args through earlier redirects first
+            if let Op::Comp(c) = &mut g.nodes[i].op {
+                for a in &mut c.args {
+                    a.src = TensorId(redirect[a.src.n()] as u32);
+                }
+            } else if let Op::Reshape(src) = &mut g.nodes[i].op {
+                *src = TensorId(redirect[src.n()] as u32);
+            }
+            let Op::Comp(c) = &g.nodes[i].op else {
+                continue;
+            };
+            let key = format!(
+                "{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}",
+                c.out,
+                c.red,
+                c.tuple,
+                c.args
+                    .iter()
+                    .map(|a| (
+                        a.src.n(),
+                        a.view
+                            .forms
+                            .iter()
+                            .map(|f| (f.coefs.clone(), f.offset))
+                            .collect::<Vec<_>>()
+                    ))
+                    .collect::<Vec<_>>(),
+                c.body.nodes_slice(),
+                c.body_outs,
+                c.monoid.as_ref().map(|m| (
+                    m.identity.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    m.combine.nodes_slice().to_vec(),
+                    m.outs.clone()
+                ))
+            )
+            .into_bytes();
+            match seen.get(&key) {
+                Some(&first) => redirect[i] = first,
+                None => {
+                    seen.insert(key, i);
+                }
+            }
+        }
+        let outs: Vec<TensorId> = outputs
+            .iter()
+            .map(|o| TensorId(redirect[o.n()] as u32))
+            .collect();
+        g.eliminate_dead(&outs)
+    }
+
     /// Placement: split the (single) reduce axis of comp `t` into `parts`
     /// partial reductions over contiguous slices — each a comp that can
     /// live on its own device — plus a combine that folds the partials
@@ -2100,6 +2160,21 @@ mod tests {
             &sg.eval(std::slice::from_ref(&data), &[c])[0],
             &g.eval(std::slice::from_ref(&data), &[s])[0],
         );
+    }
+
+    #[test]
+    fn eliminate_common_merges_twins() {
+        let mut g = TensorGraph::new();
+        let x = g.input(&[4, 4]);
+        let a = g.map(&[x], |v| v[0] * v[0]).unwrap();
+        let b = g.map(&[x], |v| v[0] * v[0]).unwrap(); // twin of a
+        let c = g.map(&[x], |v| v[0] + v[0]).unwrap(); // different body
+        let y = g.map(&[a, b, c], |v| v[0] + v[1] + v[2]).unwrap();
+        let data = ramp(16, 0.3, -1.0);
+        let want = g.eval(std::slice::from_ref(&data), &[y]).remove(0);
+        let (cg, outs) = g.eliminate_common(&[y]);
+        assert_eq!(cg.count_comps(&outs), 3);
+        close(&cg.eval(std::slice::from_ref(&data), &outs)[0], &want);
     }
 
     #[test]

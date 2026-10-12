@@ -463,7 +463,8 @@ pub mod ir_gpu {
     pub fn flash_attention_auto(n: usize, d: usize, dv: usize) -> (TensorGraph, TensorId) {
         let (g, y) = naive_attention(n, d, dv);
         let (g, outs) = g.stabilize_softmax(&[y]);
-        let (mut g, outs) = g.substitute_maps(&outs);
+        let (g, outs) = g.substitute_maps(&outs);
+        let (mut g, outs) = g.eliminate_common(&outs);
         g.schedule_auto(&outs);
         (g, outs[0])
     }
@@ -1481,7 +1482,8 @@ pub mod ir_block {
     pub fn compiled_block(dims: &BlockDims) -> (TensorGraph, TensorId) {
         let (g, out) = transformer_block(dims);
         let (g, outs) = g.stabilize_softmax(&[out]);
-        let (mut g, outs) = g.substitute_maps(&outs);
+        let (g, outs) = g.substitute_maps(&outs);
+        let (mut g, outs) = g.eliminate_common(&outs);
         g.schedule_auto(&outs);
         (g, outs[0])
     }
@@ -1801,7 +1803,8 @@ pub mod ir_block_gpu {
         let grads = g.backward(out, &wrt).unwrap();
         let mut outs = vec![out];
         outs.extend(grads);
-        let (mut g, outs) = g.substitute_maps(&outs);
+        let (g, outs) = g.substitute_maps(&outs);
+        let (mut g, outs) = g.eliminate_common(&outs);
         g.schedule_auto(&outs);
         let inputs: Vec<&[f32]> = p.cpu.iter().map(|v| v.as_slice()).collect();
         (Executable::new(device, g.to_wgsl(&outs), &inputs), outs)
@@ -2098,7 +2101,7 @@ pub mod ir_block_gpu {
             let want = g.eval(&f64_inputs, &grads);
 
             let (g, outs) = g.substitute_maps(&grads);
-            let mut g = g;
+            let (mut g, outs) = g.eliminate_common(&outs);
             g.schedule_auto(&outs);
             let program = g.to_wgsl(&outs);
             let n_kernels = program.kernels.len();

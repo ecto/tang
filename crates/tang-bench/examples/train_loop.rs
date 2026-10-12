@@ -35,7 +35,8 @@ fn main() {
     let p = params(&device, &mut cache, dims, x);
 
     let (g, outs, target_idx) = train_loss_graph(&p.dims);
-    let (mut g, outs) = g.substitute_maps(&outs);
+    let (g, outs) = g.substitute_maps(&outs);
+    let (mut g, outs) = g.eliminate_common(&outs);
     g.schedule_auto(&outs);
     let program = g.to_wgsl(&outs);
     println!("train program: {} kernels", program.kernels.len());
