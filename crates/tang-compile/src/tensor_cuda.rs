@@ -609,11 +609,7 @@ fn rewrite_ctor(s: &str, prefix: &str) -> String {
             prefix.len() - 1
         } else {
             match after.find('(') {
-                Some(p)
-                    if after[..p].chars().all(|c| c != ' ' || true) && after[..p].contains('>') =>
-                {
-                    p
-                }
+                Some(p) if after[..p].contains('>') => p,
                 _ => {
                     out.push_str(&after[..prefix.len()]);
                     rest = &after[prefix.len()..];

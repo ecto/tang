@@ -1995,8 +1995,7 @@ impl TensorGraph {
         let mut g = self.clone();
         let live = self.live(outputs);
         for i in (0..self.nodes.len()).filter(|&i| live[i]) {
-            loop {
-                let Some(c) = g.comp_at(i) else { break };
+            while let Some(c) = g.comp_at(i) {
                 let k = c.points().len();
                 // the innermost mergeable pair, if any
                 let found = (2..=c.red.len()).rev().find_map(|d| {
