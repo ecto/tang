@@ -257,10 +257,16 @@ pub fn random_spd_flat(size: usize) -> Vec<f64> {
 }
 
 /// Run tang-compile tensor graphs on the GPU, for the kernels-vs-IR benches.
+#[cfg(feature = "metal")]
+#[path = "ir_msl.rs"]
+pub mod ir_msl;
+
 pub mod ir_gpu {
     use tang::Scalar;
+    use tang_compile::tensor::precision::{f16_bits, f16_from_bits};
     use tang_compile::tensor::wgsl::WgslProgram;
     use tang_compile::tensor::{Arg, Form, Monoid, ScheduleCandidate, TensorGraph, TensorId, View};
+    use tang_compile::tensor::{ErrorBudget, ErrorStats, Format, Op, Precision};
     use tang_expr::ExprId;
     use tang_gpu::{GpuBuffer, GpuDevice, KernelCache};
 
@@ -278,7 +284,7 @@ pub mod ir_gpu {
     /// default everywhere.
     pub fn program_for(device: &GpuDevice, g: &TensorGraph, outputs: &[TensorId]) -> WgslProgram {
         if device.msl_passthrough && std::env::var("TANG_NATIVE").is_ok() {
-            g.to_msl(outputs)
+            g.to_msl_mma(outputs)
         } else {
             g.to_wgsl(outputs)
         }
@@ -289,15 +295,32 @@ pub mod ir_gpu {
             let buffers = program
                 .buffers
                 .iter()
-                .map(|b| match b.input {
-                    Some(k) => {
+                .map(|b| match (b.input, b.format) {
+                    (Some(k), Format::F32) => {
                         assert_eq!(inputs[k].len(), b.len, "input {k} has wrong length");
                         GpuBuffer::from_slice(device, inputs[k])
                     }
-                    None => GpuBuffer::uninit(device, b.len),
+                    (Some(k), Format::F16) => {
+                        assert_eq!(inputs[k].len(), b.len, "input {k} has wrong length");
+                        GpuBuffer::from_u32_slice(device, &pack_f16(inputs[k]))
+                    }
+                    (None, Format::F32) => GpuBuffer::uninit(device, b.len),
+                    (None, Format::F16) => GpuBuffer::uninit(device, b.len.div_ceil(2)),
+                    (_, Format::BF16) => unreachable!("bf16 is interpreter-only"),
                 })
                 .collect();
             Self { program, buffers }
+        }
+
+        /// Format of the buffer holding `t`.
+        pub fn format(&self, t: TensorId) -> Format {
+            let t = self.program.storage(t);
+            self.program
+                .buffers
+                .iter()
+                .find(|b| b.node == t)
+                .unwrap()
+                .format
         }
 
         /// The buffer holding `t` (inputs included), for feeding one
@@ -354,9 +377,49 @@ pub mod ir_gpu {
             }
         }
 
+        /// Read `t` back as f32 (f16 buffers are widened exactly).
         pub fn read(&self, device: &GpuDevice, t: TensorId) -> Vec<f32> {
-            self.buffer(t).to_vec_sync(device)
+            let raw = self.buffer(t).to_vec_sync(device);
+            match self.format(t) {
+                Format::F16 => {
+                    let n = self
+                        .program
+                        .buffers
+                        .iter()
+                        .find(|b| b.node == self.program.storage(t))
+                        .unwrap()
+                        .len;
+                    unpack_f16(&raw, n)
+                }
+                _ => raw,
+            }
         }
+    }
+
+    /// f32 values → IEEE f16 (round to nearest even), two per u32 word,
+    /// little end first — the byte layout of a WGSL `array<f16>`.
+    pub fn pack_f16(v: &[f32]) -> Vec<u32> {
+        v.chunks(2)
+            .map(|p| {
+                let lo = f16_bits(p[0] as f64) as u32;
+                let hi = p.get(1).map_or(0, |&x| f16_bits(x as f64) as u32);
+                lo | (hi << 16)
+            })
+            .collect()
+    }
+
+    /// Inverse of [`pack_f16`]: the first `n` halves of `words` (read
+    /// back as f32 bit patterns), widened to f32.
+    pub fn unpack_f16(words: &[f32], n: usize) -> Vec<f32> {
+        words
+            .iter()
+            .flat_map(|w| {
+                let b = w.to_bits();
+                [b as u16, (b >> 16) as u16]
+            })
+            .take(n)
+            .map(|h| f16_from_bits(h) as f32)
+            .collect()
     }
 
     /// Additive causal mask: 0 where `j <= i`, a large negative otherwise.
@@ -488,6 +551,349 @@ pub mod ir_gpu {
         let (mut g, outs) = g.split_reduce_dims(&outs);
         g.schedule_auto(&outs);
         (g, outs[0])
+    }
+
+    /// Grouped-query attention, written naively: q `[hk, g, n, d]` (`g`
+    /// query heads share each of the `hk` kv heads), k `[hk, n, d]`, v
+    /// `[hk, n, dv]` → `[hk, g, n, dv]`; `softmax(q·kᵀ/√d (+ causal mask))·v`.
+    /// Multi-head attention is `g = 1`, a single head `hk = g = 1`. Keeping
+    /// the query heads as `[hk, g]` keeps every view affine.
+    pub fn naive_attention_heads(
+        hk: usize,
+        gq: usize,
+        n: usize,
+        d: usize,
+        dv: usize,
+        causal: bool,
+    ) -> (TensorGraph, TensorId) {
+        let mut g = TensorGraph::new();
+        let q = g.input(&[hk, gq, n, d]);
+        let k = g.input(&[hk, n, d]);
+        let v = g.input(&[hk, n, dv]);
+        let scale = 1.0 / (d as f64).sqrt();
+        let qs = g.map(&[q], |x| x[0] * ExprId::from_f64(scale)).unwrap();
+        // space [h, g, i, j | c]
+        let s = g
+            .comp(
+                &[hk, gq, n, n],
+                &[d],
+                vec![
+                    Arg {
+                        src: qs,
+                        view: View::pick(5, &[Some(0), Some(1), Some(2), Some(4)]),
+                    },
+                    Arg {
+                        src: k,
+                        view: View::pick(5, &[Some(0), Some(3), Some(4)]),
+                    },
+                ],
+                Some(Monoid::sum()),
+                |x| vec![x[0] * x[1]],
+            )
+            .unwrap();
+        let s = if causal {
+            let i = g.iota(&[hk, gq, n, n], 2);
+            let j = g.iota(&[hk, gq, n, n], 3);
+            g.map(&[s, i, j], |x| {
+                let above = x[2] - x[1];
+                let m = tang_expr::with_graph(|eg| {
+                    let neg = eg.lit(-1e30);
+                    eg.select(above, neg, ExprId::ZERO)
+                });
+                x[0] + m
+            })
+            .unwrap()
+        } else {
+            s
+        };
+        let m = g.reduce(s, 3, Monoid::max()).unwrap();
+        let mb = g.broadcast(m, &[hk, gq, n, n]).unwrap();
+        let p = g.map(&[s, mb], |x| (x[0] - x[1]).exp()).unwrap();
+        let l = g.reduce(p, 3, Monoid::sum()).unwrap();
+        // space [h, g, i, c | j]
+        let o = g
+            .comp(
+                &[hk, gq, n, dv],
+                &[n],
+                vec![
+                    Arg {
+                        src: p,
+                        view: View::pick(5, &[Some(0), Some(1), Some(2), Some(4)]),
+                    },
+                    Arg {
+                        src: v,
+                        view: View::pick(5, &[Some(0), Some(4), Some(3)]),
+                    },
+                ],
+                Some(Monoid::sum()),
+                |x| vec![x[0] * x[1]],
+            )
+            .unwrap();
+        let lb = g.broadcast(l, &[hk, gq, n, dv]).unwrap();
+        let y = g.map(&[o, lb], |x| x[0] / x[1]).unwrap();
+        (g, y)
+    }
+
+    /// [`naive_attention_heads`] after the full pass pipeline (one fused
+    /// online-softmax kernel), unscheduled.
+    pub fn fused_attention_heads(
+        hk: usize,
+        gq: usize,
+        n: usize,
+        d: usize,
+        dv: usize,
+        causal: bool,
+    ) -> (TensorGraph, TensorId) {
+        let (g, y) = naive_attention_heads(hk, gq, n, d, dv, causal);
+        let (g, outs) = g.stabilize_softmax(&[y]);
+        let (g, outs) = g.substitute_maps(&outs);
+        let (g, outs) = g.eliminate_common(&outs);
+        let (g, outs) = g.merge_siblings(&outs);
+        let (g, outs) = g.relayout(&outs);
+        let (mut g, outs) = g.merge_reduce_dims(&outs);
+        g.schedule_inline_up_to(&outs, dv);
+        (g, outs[0])
+    }
+
+    /// [`fused_attention_heads`] under [`TensorGraph::schedule_auto`]: the
+    /// best f32 schedule the WGSL/MSL emitters derive.
+    pub fn flash_attention_heads_auto(
+        hk: usize,
+        gq: usize,
+        n: usize,
+        d: usize,
+        dv: usize,
+        causal: bool,
+    ) -> (TensorGraph, TensorId) {
+        let (mut g, y) = fused_attention_heads(hk, gq, n, d, dv, causal);
+        g.schedule_auto(&[y]);
+        (g, y)
+    }
+
+    /// [`fused_attention_heads`] on simdgroup fragments: q, k, v stored
+    /// f16, f32 accumulation, the fused kernel flagged `fragment`.
+    pub fn flash_attention_heads_fragment(
+        hk: usize,
+        gq: usize,
+        n: usize,
+        d: usize,
+        dv: usize,
+        causal: bool,
+    ) -> (TensorGraph, TensorId) {
+        let (mut g, y) = fused_attention_heads(hk, gq, n, d, dv, causal);
+        let inputs: Vec<TensorId> = (0..g.nodes().len())
+            .filter(|&i| matches!(g.nodes()[i].op, Op::Input(_)))
+            .map(TensorId::from_index)
+            .collect();
+        for t in inputs {
+            g.set_precision(t, Precision::storage(Format::F16));
+        }
+        g.set_fragment(y, true);
+        (g, y)
+    }
+
+    /// Mean time of one whole-program run (5 warmups, `iters` launches,
+    /// one sync), in ms.
+    pub fn time_program(
+        device: &GpuDevice,
+        cache: &mut KernelCache,
+        exe: &Executable,
+        out: TensorId,
+        iters: usize,
+    ) -> f64 {
+        for _ in 0..5 {
+            exe.run(device, cache);
+        }
+        cache.flush(device);
+        let _ = exe.read(device, out);
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            exe.run(device, cache);
+        }
+        cache.flush(device);
+        let _ = exe.read(device, out);
+        start.elapsed().as_secs_f64() * 1e3 / iters as f64
+    }
+
+    /// Run `g` on the GPU and compare every output with `want` (f64).
+    pub fn gpu_error(
+        device: &GpuDevice,
+        cache: &mut KernelCache,
+        exe: &Executable,
+        outputs: &[TensorId],
+        want: &[Vec<f64>],
+    ) -> ErrorStats {
+        exe.run(device, cache);
+        cache.flush(device);
+        let got: Vec<Vec<f64>> = outputs
+            .iter()
+            .map(|o| exe.read(device, *o).iter().map(|&v| v as f64).collect())
+            .collect();
+        ErrorStats::compare(&got, want)
+    }
+
+    /// One precision candidate the search tried.
+    pub struct PrecisionTrial {
+        pub node: TensorId,
+        pub precision: Precision,
+        /// Measured on the GPU against the f64 reference.
+        pub error: ErrorStats,
+        /// Whole-program time with this change (ms); `None` if not timed
+        /// (over budget, or an accumulator change — see [`tune_precision`]).
+        pub ms: Option<f64>,
+        pub kept: bool,
+    }
+
+    /// Result of [`tune_precision`].
+    pub struct PrecisionTune {
+        /// The input graph with the chosen precision schedule.
+        pub graph: TensorGraph,
+        /// Nodes whose precision changed from all-f32.
+        pub assignment: Vec<(TensorId, Precision)>,
+        /// GPU error of the chosen schedule vs the f64 reference.
+        pub error: ErrorStats,
+        pub base_error: ErrorStats,
+        pub base_ms: f64,
+        pub ms: f64,
+        pub trials: Vec<PrecisionTrial>,
+    }
+
+    /// Greedy precision search under an error budget, measured on the
+    /// device. Candidates are the program's buffers (inputs, weights and
+    /// materialized intermediates), largest first; each is lowered to f16
+    /// storage on top of what has been kept so far, run, checked against
+    /// `want` (the f64 reference for `outputs`) and timed. A change is
+    /// kept if the whole program stays within `budget` and gets at least
+    /// 3% faster; the final choice is re-timed against the f32 baseline
+    /// and dropped if the gain does not hold up.
+    ///
+    /// Then every reduction is tried with an f16 accumulator, checked
+    /// against the budget only: the lowering models f16 accumulation by
+    /// rounding an f32 register after each combine, which reproduces its
+    /// numerics but not its speed (that needs native f16 / simdgroup
+    /// math). Those trials report admitted-or-rejected and are not kept.
+    /// bf16 is interpreter-only and not a GPU candidate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tune_precision(
+        device: &GpuDevice,
+        cache: &mut KernelCache,
+        g: TensorGraph,
+        outputs: &[TensorId],
+        inputs: &[&[f32]],
+        want: &[Vec<f64>],
+        budget: ErrorBudget,
+        iters: usize,
+    ) -> PrecisionTune {
+        let measure = |cache: &mut KernelCache, g: &TensorGraph, timed: bool| {
+            let exe = Executable::new(device, g.to_wgsl(outputs), inputs);
+            let err = gpu_error(device, cache, &exe, outputs, want);
+            // best of three: one run of a sub-ms program is mostly clock noise
+            let ms = (timed && budget.admits(&err)).then(|| {
+                (0..3)
+                    .map(|_| time_program(device, cache, &exe, outputs[0], iters))
+                    .fold(f64::INFINITY, f64::min)
+            });
+            (err, ms)
+        };
+        // first timing warms clocks and pipelines; the second is the baseline
+        let _ = measure(cache, &g, true);
+        let (base_error, base_ms) = measure(cache, &g, true);
+        let base_ms = base_ms.unwrap_or_else(|| {
+            let exe = Executable::new(device, g.to_wgsl(outputs), inputs);
+            time_program(device, cache, &exe, outputs[0], iters)
+        });
+        let base = g.clone();
+        let mut cur = g;
+        let (mut cur_err, mut cur_ms) = (base_error, base_ms);
+        let mut trials = Vec::new();
+
+        let mut bufs: Vec<(TensorId, usize)> = cur
+            .to_wgsl(outputs)
+            .buffers
+            .iter()
+            .map(|b| (b.node, cur.buffer_bytes(b.node)))
+            .collect();
+        bufs.sort_by_key(|b| std::cmp::Reverse(b.1));
+        for (node, _) in bufs {
+            let mut p = cur.precision(node);
+            p.storage = Format::F16;
+            let mut v = cur.clone();
+            v.set_precision(node, p);
+            let (err, ms) = measure(cache, &v, true);
+            // a change must buy at least 3% to be worth its error
+            let kept = ms.is_some_and(|t| t < cur_ms * 0.97);
+            trials.push(PrecisionTrial {
+                node,
+                precision: p,
+                error: err,
+                ms,
+                kept,
+            });
+            if kept {
+                cur = v;
+                cur_err = err;
+                cur_ms = ms.unwrap();
+            }
+        }
+
+        let reductions: Vec<TensorId> = (0..cur.nodes().len())
+            .map(TensorId::from_index)
+            .filter(|&t| matches!(&cur.nodes()[t.index()].op, Op::Comp(c) if c.monoid.is_some()))
+            .collect();
+        for node in reductions {
+            let mut p = cur.precision(node);
+            p.accum = Format::F16;
+            let mut v = cur.clone();
+            v.set_precision(node, p);
+            let (err, _) = measure(cache, &v, false);
+            trials.push(PrecisionTrial {
+                node,
+                precision: p,
+                error: err,
+                ms: None,
+                kept: false,
+            });
+        }
+
+        let assignment: Vec<(TensorId, Precision)> = (0..cur.nodes().len())
+            .map(TensorId::from_index)
+            .filter(|&t| cur.precision(t) != Precision::F32)
+            .map(|t| (t, cur.precision(t)))
+            .collect();
+        // the reported pair is re-timed back to back, best of three each,
+        // so clock ramp-up during the search does not flatter either side
+        let (mut base_ms, mut cur_ms) = (base_ms, cur_ms);
+        if !assignment.is_empty() {
+            let b = Executable::new(device, base.to_wgsl(outputs), inputs);
+            let c = Executable::new(device, cur.to_wgsl(outputs), inputs);
+            base_ms = f64::INFINITY;
+            cur_ms = f64::INFINITY;
+            for _ in 0..3 {
+                base_ms = base_ms.min(time_program(device, cache, &b, outputs[0], iters));
+                cur_ms = cur_ms.min(time_program(device, cache, &c, outputs[0], iters));
+            }
+            // a choice that does not survive the re-time was noise: keep f32
+            if cur_ms >= base_ms * 0.99 {
+                return PrecisionTune {
+                    graph: base,
+                    assignment: Vec::new(),
+                    error: base_error,
+                    base_error,
+                    base_ms,
+                    ms: base_ms,
+                    trials,
+                };
+            }
+        }
+        PrecisionTune {
+            graph: cur,
+            assignment,
+            error: cur_err,
+            base_error,
+            base_ms,
+            ms: cur_ms,
+            trials,
+        }
     }
 
     /// One kernel's winning thread mapping and its measured time.
@@ -680,6 +1086,7 @@ pub mod ir_gpu {
         let v = g.input(&[n]);
         let bc = g.input(&[2]);
         let bc_view = |k: i64| View {
+            guard: false,
             forms: vec![Form {
                 coefs: vec![0],
                 offset: k,
@@ -966,6 +1373,564 @@ pub mod ir_gpu {
             }
         }
 
+        /// Direct conv `y[o,t] = Σ_{c,k} w[o,c,k]·x[c, t + d·k − p]`, guarded.
+        fn conv_graph(
+            ci: usize,
+            co: usize,
+            t: usize,
+            k: usize,
+            dil: i64,
+        ) -> (TensorGraph, TensorId) {
+            let pad = dil * (k as i64 - 1) / 2;
+            let mut g = TensorGraph::new();
+            let x = g.input(&[ci, t]);
+            let w = g.input(&[co, ci, k]);
+            let xv = View {
+                forms: vec![
+                    Form::unit(4, 2),
+                    Form {
+                        coefs: vec![0, 1, 0, dil],
+                        offset: -pad,
+                    },
+                ],
+                guard: true,
+            };
+            let y = g
+                .comp(
+                    &[co, t],
+                    &[ci, k],
+                    vec![
+                        Arg { src: x, view: xv },
+                        Arg {
+                            src: w,
+                            view: View::pick(4, &[Some(0), Some(2), Some(3)]),
+                        },
+                    ],
+                    Some(Monoid::sum()),
+                    |v| vec![v[0] * v[1]],
+                )
+                .unwrap();
+            (g, y)
+        }
+
+        fn check_vs_interp(
+            device: &GpuDevice,
+            cache: &mut KernelCache,
+            name: &str,
+            g: &TensorGraph,
+            outs: &[TensorId],
+            inputs: &[Vec<f32>],
+            want: &[Vec<f64>],
+        ) {
+            // backward graphs reduce long f32 sums (dα over all of t)
+            let tol = if outs.len() > 1 { 1e-4 } else { 1e-5 };
+            let refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
+            let exe = Executable::new(device, g.to_wgsl(outs), &refs);
+            exe.run(device, cache);
+            cache.flush(device);
+            for (o, w) in outs.iter().zip(want) {
+                let got = exe.read(device, *o);
+                let scale = w.iter().fold(1e-30f64, |m, v| m.max(v.abs()));
+                for (i, (a, b)) in got.iter().zip(w).enumerate() {
+                    assert!(
+                        (*a as f64 - b).abs() < tol * scale,
+                        "{name} out {}[{i}]: {a} vs {b}",
+                        o.index()
+                    );
+                }
+            }
+        }
+
+        /// f16 bit distance between two values (same sign assumed).
+        fn f16_ulps(a: f64, b: f64) -> i32 {
+            use tang_compile::tensor::precision::f16_bits;
+            (f16_bits(a) as i32 - f16_bits(b) as i32).abs()
+        }
+
+        /// The interpreter's precision emulation predicts the GPU's f16
+        /// kernels: f16 inputs, f16 intermediates and outputs, f32 or
+        /// f16 accumulators, through every emitter (one thread per point,
+        /// workgroup split, tiled + register tiles).
+        #[test]
+        fn precision_emulation_matches_gpu_f16() {
+            let Ok(device) = GpuDevice::new_sync() else {
+                eprintln!("no GPU, skipping");
+                return;
+            };
+            let mut cache = KernelCache::new();
+            let (m, k, n) = (48, 96, 80);
+            let mut rng = crate::Rng::new(7);
+            let a: Vec<f32> = (0..m * k).map(|_| rng.f32() * 2.0 - 1.0).collect();
+            let b: Vec<f32> = (0..k * n).map(|_| rng.f32() * 2.0 - 1.0).collect();
+            let bias: Vec<f32> = (0..n).map(|_| rng.f32()).collect();
+            let inputs = vec![
+                a.iter().map(|&v| v as f64).collect::<Vec<_>>(),
+                b.iter().map(|&v| v as f64).collect(),
+                bias.iter().map(|&v| v as f64).collect(),
+            ];
+            let half = Precision::storage(Format::F16);
+            #[allow(clippy::type_complexity)]
+            let schedules: [(&str, u32, (u32, u32, u32), (u32, u32)); 4] = [
+                ("point", 0, (0, 0, 0), (1, 1)),
+                ("split", 64, (0, 0, 0), (1, 1)),
+                ("tile", 0, (16, 16, 32), (1, 1)),
+                ("tile 2x2", 0, (16, 16, 32), (2, 2)),
+            ];
+            for accum in [Format::F32, Format::F16] {
+                for (name, split, tile, reg) in schedules {
+                    let mut g = TensorGraph::new();
+                    let ga = g.input(&[m, k]);
+                    let gb = g.input(&[k, n]);
+                    let gbias = g.input(&[1, n]);
+                    let y = g.matmul(ga, gb).unwrap();
+                    let bb = g.broadcast(gbias, &[m, n]).unwrap();
+                    let z = g.map(&[y, bb], |v| v[0] * v[0] + v[1]).unwrap();
+                    for t in [ga, gb, gbias, z] {
+                        g.set_precision(t, half);
+                    }
+                    g.set_precision(
+                        y,
+                        Precision {
+                            storage: Format::F16,
+                            accum,
+                        },
+                    );
+                    g.set_schedule(y, split, tile, reg);
+                    let emu = g.eval_emulated(&inputs, &[y, z]);
+                    let exe = Executable::new(&device, g.to_wgsl(&[y, z]), &[&a, &b, &bias]);
+                    assert!(exe
+                        .program
+                        .kernels
+                        .iter()
+                        .all(|k| k.source.contains("unpack2x16float")));
+                    exe.run(&device, &mut cache);
+                    cache.flush(&device);
+                    // the f16 accumulator rounds in the interpreter's order
+                    // only when one thread walks the whole reduction
+                    let sequential = split == 0;
+                    // otherwise rounding steps happen in another order
+                    let tol = match (sequential, accum) {
+                        (true, _) => 1,
+                        (false, Format::F32) => 1,
+                        (false, _) => 8,
+                    };
+                    // z = y² + bias: an ulp of y is ~2 ulps of z
+                    for ((o, want), tol) in [y, z].iter().zip(&emu).zip([tol, 2 * tol + 1]) {
+                        let got = exe.read(&device, *o);
+                        let worst = got
+                            .iter()
+                            .zip(want)
+                            .map(|(&g, &w)| f16_ulps(g as f64, w))
+                            .max()
+                            .unwrap();
+                        assert!(
+                            worst <= tol,
+                            "{name} accum {accum:?} out {}: {worst} f16 ulps off emulation",
+                            o.index()
+                        );
+                    }
+                }
+            }
+        }
+
+        /// The search on a small matmul: lowering storage stays within a
+        /// loose budget and a tight one rejects f16 outright.
+        #[test]
+        fn tune_precision_respects_budget() {
+            let Ok(device) = GpuDevice::new_sync() else {
+                eprintln!("no GPU, skipping");
+                return;
+            };
+            let mut cache = KernelCache::new();
+            let n = 128;
+            let mut rng = crate::Rng::new(3);
+            let a: Vec<f32> = (0..n * n).map(|_| rng.f32() * 2.0 - 1.0).collect();
+            let b: Vec<f32> = (0..n * n).map(|_| rng.f32() * 2.0 - 1.0).collect();
+            let mut g = TensorGraph::new();
+            let ga = g.input(&[n, n]);
+            let gb = g.input(&[n, n]);
+            let y = g.matmul(ga, gb).unwrap();
+            let f64s = |v: &[f32]| v.iter().map(|&x| x as f64).collect::<Vec<_>>();
+            let want = g.eval(&[f64s(&a), f64s(&b)], &[y]);
+            let tight = tune_precision(
+                &device,
+                &mut cache,
+                g.clone(),
+                &[y],
+                &[&a, &b],
+                &want,
+                ErrorBudget::rel(1e-5),
+                3,
+            );
+            assert!(tight.assignment.is_empty());
+            assert!(tight
+                .trials
+                .iter()
+                .all(|t| !ErrorBudget::rel(1e-5).admits(&t.error)));
+            let loose = tune_precision(
+                &device,
+                &mut cache,
+                g,
+                &[y],
+                &[&a, &b],
+                &want,
+                ErrorBudget::rel(1e-2),
+                3,
+            );
+            assert!(ErrorBudget::rel(1e-2).admits(&loose.error));
+            // every storage trial fits a 1e-2 budget on a 128-long dot product
+            assert!(loose
+                .trials
+                .iter()
+                .filter(|t| t.precision.accum == Format::F32)
+                .all(|t| ErrorBudget::rel(1e-2).admits(&t.error)));
+        }
+
+        /// Multi-dim reductions (`red = (c, k)`) through the tiled
+        /// emitter: guarded + dilated reads, ragged tiles, register tiles,
+        /// and the backward graph (`dx` reduces over `(o, k)`).
+        #[test]
+        fn multi_dim_reductions_tile_on_gpu() {
+            let Ok(device) = GpuDevice::new_sync() else {
+                eprintln!("no GPU, skipping");
+                return;
+            };
+            let mut cache = KernelCache::new();
+            let mut rng = crate::Rng::new(11);
+            for &(ci, co, t, k, dil) in &[(5, 7, 37, 3, 1), (40, 33, 70, 7, 3), (19, 64, 130, 5, 2)]
+            {
+                let (g, y) = conv_graph(ci, co, t, k, dil);
+                let inputs = vec![
+                    (0..ci * t)
+                        .map(|_| rng.f32() * 2.0 - 1.0)
+                        .collect::<Vec<f32>>(),
+                    (0..co * ci * k).map(|_| rng.f32() * 2.0 - 1.0).collect(),
+                ];
+                let f64s: Vec<Vec<f64>> = inputs
+                    .iter()
+                    .map(|v| v.iter().map(|&x| x as f64).collect())
+                    .collect();
+                let want = g.eval(&f64s, &[y]);
+                for (tile, reg) in [
+                    ((16, 16, 32), (1, 1)),
+                    ((16, 16, 32), (2, 2)),
+                    ((16, 16, 32), (4, 4)),
+                    ((64, 1, 8), (1, 1)),
+                ] {
+                    let mut gt = g.clone();
+                    gt.set_schedule(y, 0, tile, reg);
+                    let name = format!("conv {ci}x{co}x{t} k{k} d{dil} {tile:?} {reg:?}");
+                    check_vs_interp(&device, &mut cache, &name, &gt, &[y], &inputs, &want);
+                }
+                let mut ga = g.clone();
+                ga.schedule_auto(&[y]);
+                if ci * k >= 64 {
+                    assert!(
+                        ga.nodes()[y.index()].tile.0 > 0,
+                        "auto should tile the direct conv"
+                    );
+                }
+                check_vs_interp(&device, &mut cache, "conv auto", &ga, &[y], &inputs, &want);
+
+                // forward + backward
+                let mut gb = g.clone();
+                let grads = gb
+                    .backward(y, &[TensorId::from_index(0), TensorId::from_index(1)])
+                    .unwrap();
+                let mut outs = vec![y];
+                outs.extend(grads);
+                let want = gb.eval(&f64s, &outs);
+                let (gb, outs) = gb.substitute_maps(&outs);
+                let (mut gb, outs) = gb.eliminate_common(&outs);
+                gb.schedule_auto(&outs);
+                let multi_tiled = outs.iter().any(|o| {
+                    let nd = &gb.nodes()[o.index()];
+                    matches!(&nd.op, tang_compile::tensor::Op::Comp(c) if c.red.len() > 1)
+                        && nd.tile.0 > 0
+                });
+                if ci >= 16 {
+                    assert!(multi_tiled, "dx should take the multi-dim tiled path");
+                }
+                check_vs_interp(
+                    &device,
+                    &mut cache,
+                    "conv fwd+bwd auto",
+                    &gb,
+                    &outs,
+                    &inputs,
+                    &want,
+                );
+                for o in &outs {
+                    for (split, tile, reg) in gb.schedule_candidates(*o) {
+                        let mut gv = gb.clone();
+                        gv.set_schedule(*o, split, tile, reg);
+                        let name = format!("bwd node {} {split} {tile:?} {reg:?}", o.index());
+                        check_vs_interp(&device, &mut cache, &name, &gv, &outs, &inputs, &want);
+                    }
+                }
+            }
+        }
+
+        /// Windowed staging: the lane axis and the taps of a conv's `x`
+        /// read share one staged window per chunk. Covers lane strides,
+        /// wide dilation, negative tap coefficients, a guarded windowed
+        /// coord that is not the last source dim (`x` stored `[t, c]`),
+        /// ragged tiles and register tiles.
+        #[test]
+        fn windowed_staging_on_gpu() {
+            let Ok(device) = GpuDevice::new_sync() else {
+                eprintln!("no GPU, skipping");
+                return;
+            };
+            let mut cache = KernelCache::new();
+            let mut rng = crate::Rng::new(17);
+            // (ci, co, t, k, dil, stride, tap sign, x transposed)
+            for &(ci, co, t, k, dil, st, sign, xt) in &[
+                (24, 20, 77, 7, 5, 1, 1, false),
+                (17, 33, 61, 5, 2, 2, 1, false),
+                (20, 18, 45, 4, 1, 1, -1, false),
+                (21, 19, 53, 5, 3, 1, 1, true),
+                (16, 40, 100, 3, 1, 1, -1, true),
+            ] {
+                let tin = t * st as usize;
+                let pad = dil * (k as i64 - 1) / 2;
+                let mut g = TensorGraph::new();
+                let x = g.input(&if xt { [tin, ci] } else { [ci, tin] });
+                let w = g.input(&[co, ci, k]);
+                let tf = Form {
+                    coefs: vec![0, st, 0, sign * dil],
+                    offset: -pad,
+                };
+                let forms = if xt {
+                    vec![tf, Form::unit(4, 2)]
+                } else {
+                    vec![Form::unit(4, 2), tf]
+                };
+                let y = g
+                    .comp(
+                        &[co, t],
+                        &[ci, k],
+                        vec![
+                            Arg {
+                                src: x,
+                                view: View { forms, guard: true },
+                            },
+                            Arg {
+                                src: w,
+                                view: View::pick(4, &[Some(0), Some(2), Some(3)]),
+                            },
+                        ],
+                        Some(Monoid::sum()),
+                        |v| vec![v[0] * v[1]],
+                    )
+                    .unwrap();
+                let inputs = vec![
+                    (0..ci * tin)
+                        .map(|_| rng.f32() * 2.0 - 1.0)
+                        .collect::<Vec<f32>>(),
+                    (0..co * ci * k).map(|_| rng.f32() * 2.0 - 1.0).collect(),
+                ];
+                let f64s: Vec<Vec<f64>> = inputs
+                    .iter()
+                    .map(|v| v.iter().map(|&x| x as f64).collect())
+                    .collect();
+                let want = g.eval(&f64s, &[y]);
+                for (tile, reg) in [
+                    ((16, 16, 32), (1, 1)),
+                    ((16, 16, 32), (2, 2)),
+                    ((16, 16, 32), (4, 4)),
+                    ((64, 1, 8), (1, 1)),
+                    ((32, 8, 32), (1, 1)),
+                ] {
+                    let mut gt = g.clone();
+                    gt.set_schedule(y, 0, tile, reg);
+                    let name = format!(
+                        "window conv {ci}x{co}x{t} k{k} d{dil} s{st} sign{sign} xt{xt} {tile:?} {reg:?}"
+                    );
+                    check_vs_interp(&device, &mut cache, &name, &gt, &[y], &inputs, &want);
+                }
+                // forward + backward (dx, dw) under auto and every candidate
+                let mut gb = g.clone();
+                let grads = gb
+                    .backward(y, &[TensorId::from_index(0), TensorId::from_index(1)])
+                    .unwrap();
+                let mut outs = vec![y];
+                outs.extend(grads);
+                let want = gb.eval(&f64s, &outs);
+                let (gb, outs) = gb.substitute_maps(&outs);
+                let (mut gb, outs) = gb.eliminate_common(&outs);
+                gb.schedule_auto(&outs);
+                check_vs_interp(
+                    &device,
+                    &mut cache,
+                    "window bwd auto",
+                    &gb,
+                    &outs,
+                    &inputs,
+                    &want,
+                );
+                for o in &outs {
+                    for (split, tile, reg) in gb.schedule_candidates(*o) {
+                        let mut gv = gb.clone();
+                        gv.set_schedule(*o, split, tile, reg);
+                        let name =
+                            format!("window bwd node {} {split} {tile:?} {reg:?}", o.index());
+                        check_vs_interp(&device, &mut cache, &name, &gv, &outs, &inputs, &want);
+                    }
+                }
+            }
+        }
+
+        /// conv + bias + snake: the map becomes the tiled conv's epilogue
+        /// (one kernel), for every tile candidate, forward and backward.
+        #[test]
+        fn epilogue_fuses_into_tiled_conv_on_gpu() {
+            let Ok(device) = GpuDevice::new_sync() else {
+                eprintln!("no GPU, skipping");
+                return;
+            };
+            let mut cache = KernelCache::new();
+            let (ci, co, t, k, dil) = (24, 40, 75, 5, 2);
+            let (mut g, y) = conv_graph(ci, co, t, k, dil);
+            let b = g.input(&[co, 1]);
+            let alpha = g.input(&[co, 1]);
+            let bb = g.broadcast(b, &[co, t]).unwrap();
+            let ab = g.broadcast(alpha, &[co, t]).unwrap();
+            let out = g
+                .map(&[y, bb, ab], |v| {
+                    let z = v[0] + v[1];
+                    let s = (v[2] * z).sin();
+                    z + s * s / v[2]
+                })
+                .unwrap();
+            let mut rng = crate::Rng::new(13);
+            let inputs = vec![
+                (0..ci * t)
+                    .map(|_| rng.f32() * 2.0 - 1.0)
+                    .collect::<Vec<f32>>(),
+                (0..co * ci * k).map(|_| rng.f32() * 2.0 - 1.0).collect(),
+                (0..co).map(|_| rng.f32() * 0.2).collect(),
+                (0..co).map(|_| 1.0 + rng.f32() * 0.5).collect(),
+            ];
+            let f64s: Vec<Vec<f64>> = inputs
+                .iter()
+                .map(|v| v.iter().map(|&x| x as f64).collect())
+                .collect();
+            let want = g.eval(&f64s, &[out]);
+            let (go, outs) = g.substitute_maps(&[out]);
+            let mut ga = go.clone();
+            ga.schedule_auto(&outs);
+            assert_eq!(ga.to_wgsl(&outs).kernels.len(), 1, "snake should fuse");
+            check_vs_interp(
+                &device,
+                &mut cache,
+                "epilogue auto",
+                &ga,
+                &outs,
+                &inputs,
+                &want,
+            );
+            let cands = ga.schedule_candidates(outs[0]);
+            assert!(cands.iter().any(|c| c.1 .0 > 0));
+            for (split, tile, reg) in cands.into_iter().filter(|c| c.1 .0 > 0) {
+                let mut gv = ga.clone();
+                gv.set_schedule(outs[0], split, tile, reg);
+                let name = format!("epilogue {tile:?} {reg:?}");
+                check_vs_interp(&device, &mut cache, &name, &gv, &outs, &inputs, &want);
+            }
+
+            // backward through the snake: dx, dw, db, dα
+            let wrt: Vec<TensorId> = (0..4).map(TensorId::from_index).collect();
+            let grads = g.backward(out, &wrt).unwrap();
+            let mut all = vec![out];
+            all.extend(grads);
+            let want = g.eval(&f64s, &all);
+            let (gb, all) = g.substitute_maps(&all);
+            let (mut gb, all) = gb.eliminate_common(&all);
+            gb.schedule_auto(&all);
+            check_vs_interp(
+                &device,
+                &mut cache,
+                "epilogue fwd+bwd",
+                &gb,
+                &all,
+                &inputs,
+                &want,
+            );
+        }
+
+        /// Polyphase upsample `y[o,q,r] = Σ_{j,c} x[c, q−j]·w[o, c, r + s·j]`:
+        /// reduce `(j, c)` with the chunked axis second, and a narrow
+        /// trailing point dim `r` that the tile treats as uniform.
+        #[test]
+        fn polyphase_upsample_tiles_on_gpu() {
+            let Ok(device) = GpuDevice::new_sync() else {
+                eprintln!("no GPU, skipping");
+                return;
+            };
+            let mut cache = KernelCache::new();
+            let (ci, co, t, s) = (70, 40, 50, 3);
+            let mut g = TensorGraph::new();
+            let x = g.input(&[ci, t]);
+            let w = g.input(&[co, ci, 2 * s]);
+            let f = |terms: &[(usize, i64)]| {
+                let mut f = Form::zero(5);
+                for &(d, c) in terms {
+                    f.coefs[d] = c;
+                }
+                f
+            };
+            let xv = View {
+                forms: vec![f(&[(4, 1)]), f(&[(1, 1), (3, -1)])],
+                guard: true,
+            };
+            let wv = View {
+                forms: vec![f(&[(0, 1)]), f(&[(4, 1)]), f(&[(2, 1), (3, s as i64)])],
+                guard: false,
+            };
+            let y = g
+                .comp(
+                    &[co, t, s],
+                    &[2, ci],
+                    vec![Arg { src: x, view: xv }, Arg { src: w, view: wv }],
+                    Some(Monoid::sum()),
+                    |v| vec![v[0] * v[1]],
+                )
+                .unwrap();
+            let mut rng = crate::Rng::new(12);
+            let inputs = vec![
+                (0..ci * t)
+                    .map(|_| rng.f32() * 2.0 - 1.0)
+                    .collect::<Vec<f32>>(),
+                (0..co * ci * 2 * s)
+                    .map(|_| rng.f32() * 2.0 - 1.0)
+                    .collect(),
+            ];
+            let f64s: Vec<Vec<f64>> = inputs
+                .iter()
+                .map(|v| v.iter().map(|&x| x as f64).collect())
+                .collect();
+            let want = g.eval(&f64s, &[y]);
+            let mut ga = g.clone();
+            ga.schedule_auto(&[y]);
+            assert!(ga.nodes()[y.index()].tile.0 > 0);
+            check_vs_interp(
+                &device,
+                &mut cache,
+                "upsample auto",
+                &ga,
+                &[y],
+                &inputs,
+                &want,
+            );
+            for (split, tile, reg) in g.schedule_candidates(y) {
+                let mut gv = g.clone();
+                gv.set_schedule(y, split, tile, reg);
+                let name = format!("upsample {split} {tile:?} {reg:?}");
+                check_vs_interp(&device, &mut cache, &name, &gv, &[y], &inputs, &want);
+            }
+        }
+
         /// On Metal, the tiled matmul (and its bias epilogue) lowers to
         /// simdgroup matrices; same answer as the WGSL tile.
         #[test]
@@ -1008,7 +1973,7 @@ pub mod ir_gpu {
             g.schedule_auto(&outs);
             let f64s = |v: &[f32]| v.iter().map(|&x| x as f64).collect::<Vec<f64>>();
             let want = g.eval(&[f64s(&a), f64s(&b), f64s(&bias)], &outs).remove(0);
-            let prog = g.to_msl(&outs);
+            let prog = g.to_msl_mma(&outs);
             assert!(
                 prog.kernels
                     .iter()
@@ -1359,6 +2324,7 @@ pub mod ir_block {
             Arg {
                 src: b,
                 view: View {
+                    guard: false,
                     forms: vec![unit(rank, 1)],
                 },
             },
@@ -1402,9 +2368,11 @@ pub mod ir_block {
         // which is what makes the block differentiable through rope.
         let x = g.reshape(x, &[seq, heads, half, 2]).unwrap();
         let xv = |parity: i64| View {
+            guard: false,
             forms: vec![unit(3, 0), unit(3, 1), unit(3, 2), form(3, &[], parity)],
         };
         let tv = View {
+            guard: false,
             forms: vec![unit(3, 0), unit(3, 2)],
         };
         if !rope {
@@ -1526,6 +2494,7 @@ pub mod ir_block {
                 let k4 = g.reshape(k_cache, &[kv_len, n_kv_heads, half, 2]).unwrap();
                 let halves = [0i64, 1].map(|parity| {
                     let view = View {
+                        guard: false,
                         forms: vec![unit(3, 0), unit(3, 1), unit(3, 2), form(3, &[], parity)],
                     };
                     g.comp(
@@ -1554,9 +2523,11 @@ pub mod ir_block {
         let qe = g.reshape(qe, &[seq, groups, per_group, half]).unwrap();
         let qo = g.reshape(qo, &[seq, groups, per_group, half]).unwrap();
         let qv = View {
+            guard: false,
             forms: vec![unit(r5, 2), unit(r5, 0), unit(r5, 1), unit(r5, 4)],
         };
         let kv = View {
+            guard: false,
             forms: vec![unit(r5, 3), unit(r5, 0), unit(r5, 4)],
         };
         let s_out = [groups, per_group, seq, kv_len];
@@ -1594,6 +2565,7 @@ pub mod ir_block {
                     Arg {
                         src: mask,
                         view: View {
+                            guard: false,
                             forms: vec![unit(r4, 2), unit(r4, 3)],
                         },
                     },
@@ -1617,12 +2589,14 @@ pub mod ir_block {
                     Arg {
                         src: p,
                         view: View {
+                            guard: false,
                             forms: vec![unit(5, 0), unit(5, 1), unit(5, 2), unit(5, 4)],
                         },
                     },
                     Arg {
                         src: v3,
                         view: View {
+                            guard: false,
                             forms: vec![unit(5, 4), unit(5, 0), unit(5, 3)],
                         },
                     },
@@ -1638,6 +2612,7 @@ pub mod ir_block {
                 vec![Arg {
                     src: l,
                     view: View {
+                        guard: false,
                         forms: vec![
                             unit(4, 0),
                             unit(4, 1),
@@ -1668,12 +2643,14 @@ pub mod ir_block {
                     Arg {
                         src: y,
                         view: View {
+                            guard: false,
                             forms: vec![unit(5, 2), unit(5, 3), unit(5, 0), unit(5, 4)],
                         },
                     },
                     Arg {
                         src: wo4,
                         view: View {
+                            guard: false,
                             forms: vec![unit(5, 1), unit(5, 2), unit(5, 3), unit(5, 4)],
                         },
                     },
@@ -1726,6 +2703,7 @@ pub mod ir_block {
                 Arg {
                     src: b,
                     view: View {
+                        guard: false,
                         forms: vec![unit(2, 1)],
                     },
                 },

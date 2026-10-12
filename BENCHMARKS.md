@@ -909,3 +909,524 @@ the fast kernels (flash attention, register-tiled matmul, sequence
 parallelism) from the algebra, with no op-specific code, and picks per
 chip. It does not yet generate the instruction-level quality of a vendor
 library, and through this backend it cannot reach tensor cores at all.
+
+## Kokoro-shaped ops (M4 Max, Metal, kernel-only)
+
+TTS vocoder ops (Kokoro's iSTFTNet decoder, Vocos-style ConvNeXt) derived
+from the IR, against PyTorch 2.14.1 on MPS. Both sides: fp32, 5 warmups,
+50 launches, one sync (`examples/kokoro_ops.rs`,
+`scripts/torch_kokoro_ops.py`). Every IR output is checked against a
+straightforward f64 CPU reference (max error / max |ref| ≤ 1e-5, all ops
+pass at 1e-6–1e-5); forward+backward is checked on a small instance
+against the f64 interpreter (≤ 2e-7).
+
+These ops need zero padding, so this branch adds **guarded views**: a
+`View` with `guard: true` may read outside its source and gets 0 there.
+Same-padded and dilated convs, the polyphase upsampler and the iSTFT
+overlap-add are all guarded views; nothing op-specific was added. The
+backward of a guarded read eliminates an out coordinate (`t = τ − 3k + 9`)
+instead of scattering, so `dx` of a conv is a gather with a guarded `dy`
+read, not a reduction over all of `t`.
+
+Before = the first cut of this section (single-reduce tiler, im2col for
+convs); after = multi-dim tiled reductions + epilogue fusion (below). MPS
+rerun alongside the "after" column; it moved between runs (a 0.85→0.71,
+f 0.41→0.24 ms), so both are listed. The M4 was noisy on later runs (a
+direct/auto 2.43 vs 3.10 ms back to back); the table takes the best of
+three full runs.
+
+| op | before (ms) | after (ms) | windowed (ms) | windowed: algebra / schedule | MPS (ms) | windowed / MPS |
+|---|---:|---:|---:|---|---:|---:|
+| a conv1d 512→512 k7 d3, T 2000 | 2.926 im2col | 2.408 | **2.199** | direct / autotune (1 kernel), 3.34 TFLOP/s | 0.855 | 2.6× slower |
+| b upsample 512→256 k20 s10, T 2000 → 20000 | 3.544 | 3.381 | 3.321 | unfold + bmm / auto (3); direct polyphase 3.98 (was 3.75) | 1.072 conv only · 1.274 | 3.1× slower |
+| c iSTFT n_fft 20 hop 5, 4000 frames | 0.085 | 0.052 | 0.074 | DFT inlined into OLA / autotune (1) | 0.110 | 1.5× faster |
+| d conv (a) + bias + snake | 3.021 im2col | 2.421 | **2.197** | direct + snake epilogue / auto (1 kernel) | 0.847 | 2.6× slower |
+| e AdaIN C 512 T 2000, style 128 | 0.214 | 0.213 | 0.197 | auto (6) | 0.245 | 1.2× faster |
+| f ConvNeXt block C 512 T 200 F 1536 | 0.571 | 0.544 | 0.550 | auto (8) | 0.246 | 2.2× slower |
+| a fwd+bwd (dx, dw) | 6.137 | 6.173 im2col · 7.003 direct | 6.263 im2col · 6.627 direct (was 6.936) | im2col / auto (5) | 2.244 | 2.8× slower |
+| f fwd+bwd (all 9 params) | 1.606 | 1.591 | 1.619 | auto (30) | 1.031 | 1.6× slower |
+
+**Windowed staging** (this column): a staged read affine in the lane
+axis, `t` and the unrolled inner reduce dims folds the overlapping vars
+into one window per chunk. The conv's `x[c, t + 3k − 9]` stages
+`64 + 3·6 = 82` floats per channel instead of `7 × 64`, so under the
+16 KiB cap the chunk grows from 4 to 7 (the weight tile, 448 floats per
+channel, is now the limit). Guarded windows rebuild the guarded coord
+from the window position, so zero padding stays at staging. Windowed and
+before columns are best of 3 serial runs on an otherwise idle M4 Max
+(the machine was still noisy: one run of three was ~1.3× slow across the
+board); "before" re-measured alongside: a 2.407, b 3.415, d 2.398,
+a fwd+bwd 5.967 im2col. MPS best of 3 from the same session. The
+polyphase upsample's direct kernel did not improve (its x window is
+already small next to the `w[o, c, r + s·j]` tile).
+
+Full per-schedule run, after (naive / `schedule_auto` / per-kernel autotune):
+
+| op | algebra | naive | auto | autotune | before: auto |
+|---|---|---:|---:|---:|---:|
+| a | direct conv (1 kernel) | 12.39 | **2.43** | **2.41** | 12.69 |
+| a | im2col | 34.34 | 2.96 | 2.95 | 2.93 |
+| b | direct polyphase (1 kernel) | 15.87 | 3.64 | 3.68 | 15.73 |
+| b | unfold + bmm + transpose | 20.91 | 3.38 | 3.40 | 3.55 |
+| c | DFT + OLA | 0.112 | 0.052 | 0.054 | 0.086 |
+| d | direct + snake (epilogue-fused: 1 kernel) | 12.57 | **2.46** | **2.42** | 12.88 (2 kernels) |
+| d | direct, conv inlined under snake (1 kernel, untiled) | 12.32 | | | 12.36 |
+| d | im2col + snake map | 34.33 | 2.95 | 2.94 | 3.02 |
+| e | | 0.437 | 0.213 | 0.442 | 0.214 |
+| f | | 1.20 | 0.544 | 0.608 | 0.571 |
+| a fwd+bwd | direct | 36.71 | 7.00 | 7.03 | 44.03 |
+| a fwd+bwd | im2col | 73.71 | 6.17 | 6.20 | 6.14 |
+| f fwd+bwd | | 4.20 | 1.59 | 1.67 | 1.61 |
+
+**Merged with #34** (generalized epilogues, `merge_siblings`, `relayout`,
+`merge_reduce_dims` in `kokoro_ops`' pass list, coalesced + vec4 staging).
+Same session, M4 Max, best schedule per op; the #35 binary rerun
+alongside (the M4 throttled later in the session, so only the first
+back-to-back pair is listed):
+
+| op | #35 windowed (ms) | merged (ms) | merged: algebra / schedule |
+|---|---:|---:|---|
+| a conv1d | 2.216 | **2.036** | im2col / auto (direct/auto 2.30) |
+| b upsample | 3.276 | **2.474** | bmm / auto (2 kernels, was 3) |
+| c iSTFT | 0.075 | 0.072 | dft+ola / auto |
+| d conv + bias + snake | 2.183 | **2.039** | im2col / autotune (direct/auto 2.31, 1 kernel) |
+| e AdaIN | 0.194 | **0.157** | auto (4 kernels, was 6) |
+| f ConvNeXt block | 0.579 | **0.429** | autotune (7 kernels, was 8) |
+| a fwd+bwd | 6.383 | **4.816** | im2col / auto |
+| f fwd+bwd | 1.643 | **1.246** | auto (30) |
+
+Direct conv alone (one kernel) is unchanged within noise: interleaved
+#35/merged runs on the throttled machine gave 2.81/3.98, 3.93/3.89,
+3.81/3.83 ms. The exp/log epilogue rule survives as a schedule
+heuristic (`unfuse_heavy_epilogue`): under a register tile, an epilogue
+with exp/log runs as its own map.
+
+What changed, and where the IR still loses:
+
+- **Multi-dim reductions tile.** `tile_kernel` now chunks the largest
+  reduce dim as `r0` and runs the others (`u{i}`: a conv's taps, the
+  polyphase `j`) as inner loops inside each chunk step — unrolled when
+  their product is ≤ 16, outside the register-tile copies so all 16
+  copies share one staged read per step. Staged regions just gain the
+  inner vars (they already supported them for nested comps).
+  `tileable_red` accepts any reduction whose non-chunked dims multiply to
+  ≤ 32. No conv-specific code: dx of the conv (`red = (o, k)`) and the
+  polyphase upsample (`red = (j, c)`) take the same path.
+- **Guards are applied when staging.** A guarded read used to stage the
+  (possibly wrapped) value and `select` at every use — 16 copies × 7 taps
+  of compares per step; 16.6 → 5.5 ms on its own. The region key now
+  carries the guard's source coords, so the zero padding happens once per
+  staged element.
+- **Occupancy, not staging, was the last 2×.** Inner dims multiply every
+  staged region (x: chunk·7·64, w: chunk·7·64). At chunk 8 that was 28 KiB
+  of workgroup memory — one workgroup per M4 core — and 5.0 ms; capping
+  staged memory at 16 KiB (chunk 4, also the WebGPU default limit) gives
+  2.4 ms. The cap applies to every tiled kernel, halving the chunk until
+  it fits.
+- **Narrow trailing point dims are uniform, not lanes.** `tile_axes` picks
+  the last two point dims ≥ 16 as the tile's x / y, so `dw[o, c, k]`
+  tiles over `(o, c)` with `k` per-workgroup (36 → 7 ms fwd+bwd) and the
+  polyphase `[o, q, r]` tiles over `(o, q)` with `r` uniform (15.6 →
+  3.6 ms).
+- **Epilogue fusion.** When a tiled reduction's only consumer is a map
+  over the same points (identity view, unguarded), `schedule_auto` moves
+  the tile schedule onto the map and inlines the reduction; the tiled
+  kernel evaluates the map at write-out. (d) is now one kernel at (a)'s
+  cost (2.42 vs 2.41 ms), and ConvNeXt's residual add fuses into the
+  second pointwise matmul (9 → 8 kernels). Autotune sees an epilogue map's
+  candidates as its reduction's tile candidates. A GELU epilogue measured
+  *slower* fused (block 0.60 vs 0.56 ms), so maps containing exp/log stay
+  separate — a measured rule, not a principled one.
+- **Still 3× behind MPS on convs.** 2.4 ms for 7.3 GFLOP is ~3 TFLOP/s;
+  MPS's 0.71 ms is ~10. The tile is the generic 16×16 threads × 4×4
+  registers with scalar f32 shared-memory reads; MPS uses simdgroup
+  matrix ops. The x region also stages each tap separately (`chunk·7·64`
+  floats where the sliding window needs `chunk·(64 + 18)`), which is what
+  forces chunk 4. A windowed region (merge an inner var into the offset
+  span when its coefficient is a multiple of a lane coefficient) and
+  `simdgroup_matrix`-style lowering are the next two steps.
+- **fwd+bwd of the conv: im2col still wins (6.2 vs 7.0 ms).** Both
+  gradients tile now, but `dw` re-stages `dy` for each of the 7 taps
+  (`k` is per-workgroup) and the guarded `x` read inside it is staged per
+  tap as above.
+
+- **The upsample.** `conv_transpose1d` on MPS takes a 24 ms slow path; the
+  same math as a polyphase conv1d (2 taps, 2560 output channels) is
+  1.17 ms there. The IR's direct polyphase comp (reduce over `(j, c)`) now
+  tiles (3.6 ms, was 15.6); unfold + one matmul per phase is 3.4 ms. The IR computes `conv_transpose1d(p = 0)` cropped to 20000
+  samples — identical FLOPs to `p = 5`, offset by 5 samples (a `p = 5`
+  form needs a third tap or a guarded weight read).
+- **iSTFT wins** because `schedule_auto` inlines the 11-bin inverse DFT
+  into the overlap-add (each output sample recomputes its 4 frames), so
+  the whole head is one launch with no frame buffer. `torch.istft` is
+  several kernels (complex polar, irfft, window, fold, envelope divide).
+- **AdaIN wins** on launch structure: the stats are reductions and
+  everything elementwise splices into one map.
+- **ConvNeXt at T = 200 is launch-bound** (9 kernels forward, 30 for
+  forward+backward; the two pointwise matmuls are only 0.3 GFLOP each).
+  LayerNorm's mean and variance are separate reductions over C, each
+  re-reading the depthwise conv output.
+- **Autotune ≥ auto here, sometimes worse** (AdaIN 0.45 vs 0.21 ms,
+  ConvNeXt 0.88 vs 0.57). It times each kernel in isolation for 10
+  launches with the rest of the program cold; on these sub-0.1 ms kernels
+  that measurement is noise-dominated. The tuner should time in program
+  context and with more launches.
+- Guarded reads of a map keep that map materialized (`f(0) ≠ 0` in
+  general), so a conv over `snake(adain(x))` would read a buffer, not
+  splice. Splicing is valid whenever the map is zero on zero input
+  (snake is); not done yet.
+
+## Precision schedules (M4 Max, Metal, kernel-only)
+
+Precision is a per-node schedule field (`set_precision`, see
+`docs/tensor-ir.md`): storage format of each buffer, accumulate format of
+each reduction. `tune_precision` starts from the per-kernel autotuned f32
+schedule, lowers one buffer at a time to f16 (largest first), runs it on
+the device against the f64 CPU reference, and keeps it only if the whole
+program stays within the error budget and is ≥ 3% faster; the final
+choice is re-timed best-of-3 against f32 and dropped if the gain does not
+hold. Error = max |got − f64| / max |f64|. "Predicted" is the f64
+interpreter's emulation (`precision_error`) of the same assignment on a
+small instance of the same builder.
+`cargo run --release -p tang-bench --example kokoro_ops -- precision`.
+
+| op | budget (rel) | f32 ms | chosen ms | speedup | chosen assignment | measured err | predicted err (small) |
+|---|---|---:|---:|---:|---|---:|---:|
+| a conv1d 512→512 k7 d3 T2000 | 1e-2 | 2.201 | 2.201 | 1.00× | all f32 | 4.0e-6 | 6.8e-7 |
+| a conv1d 512→512 k7 d3 T2000 | 1e-3 | 2.204 | 2.204 | 1.00× | all f32 | 4.0e-6 | 6.8e-7 |
+| b upsample 512→256 k20 s10 | 1e-2 | 3.919 | 3.662 | **1.07×** | w[256×512×20] f16 | 6.2e-5 | 1.4e-4 |
+| b upsample 512→256 k20 s10 | 1e-3 | 3.931 | 3.825 | 1.03× | w[256×512×20] f16 | 6.2e-5 | 1.4e-4 |
+| c iSTFT n_fft20 hop5 T4000 | 1e-2 | 0.073 | 0.073 | 1.00× | all f32 | 1.3e-6 | 9.3e-8 |
+| c iSTFT n_fft20 hop5 T4000 | 1e-3 | 0.074 | 0.072 | 1.02× | OLA output f16 | 3.0e-4 | 2.4e-4 |
+| e AdaIN C512 T2000 style128 | 1e-2 | 0.250 | 0.250 | 1.00× | all f32 | 7.3e-7 | 6.0e-7 |
+| e AdaIN C512 T2000 style128 | 1e-3 | 0.249 | 0.249 | 1.00× | all f32 | 7.3e-7 | 6.0e-7 |
+| f ConvNeXt C512 T200 F1536 | 1e-2 | 0.697 | 0.697 | 1.00× | all f32 | 9.7e-6 | 4.5e-8 |
+| f ConvNeXt C512 T200 F1536 | 1e-3 | 0.695 | 0.695 | 1.00× | all f32 | 9.7e-6 | 4.5e-8 |
+| matmul 1024³ | 1e-2 | 0.761 | 0.761 | 1.00× | all f32 | 1.8e-6 | 1.5e-6 |
+| matmul 1024³ | 1e-3 | 0.758 | 0.758 | 1.00× | all f32 | 1.8e-6 | 1.5e-6 |
+
+Every f16 *storage* trial fit both budgets (errors 1e-5–5e-4; an f16
+output costs ~3e-4, the half-ulp of the result). The search said no
+because almost nothing got faster:
+
+- **Without matrix units, f16 storage buys bandwidth only, and these
+  ops are not bandwidth-bound.** The convs and the 1024³ matmul run at
+  ~3.3 TFLOP/s from staged f32 tiles: compute-bound, halving the bytes
+  read changes nothing (a: x f16 2.18, w f16 2.23 vs 2.20 ms; matmul:
+  a/b f16 0.76 vs 0.76). The upsample is the one op whose weight read shows: its
+  10.5 MB `w` in f16 is 3–7% faster across runs. AdaIN, iSTFT and the
+  ConvNeXt block are a few hundred µs of 6–8 small kernels — launch- and
+  latency-bound at 80–100 GB/s against the M4 Max's ~400.
+- **f16 outputs never pay** (a: 2.21 vs 2.20 ms; matmul 0.80 vs 0.76):
+  two threads own the halves of one word, so the store is
+  two atomics. An emitter that gives each thread a pair of points (the
+  register tile already does) can write whole words.
+- Run-to-run noise on the M4 is ±5% for sub-ms programs, which is why a
+  kept choice is re-timed; earlier runs with a 2% bar "kept" AdaIN and
+  ConvNeXt assignments that re-timed at 0.97–1.00×.
+
+**Where the budget rejects f16.** Accumulators, not storage. f16
+accumulation is lowered as rounding after every combine (the numerics of
+an f16 accumulator; speed needs native half math), so these trials are
+judged on error only. At rel 1e-3:
+
+| op | reduction | measured (GPU) | predicted (interp., sequential) |
+|---|---|---:|---:|
+| a conv1d | out, Σ over (c, k) = 3584 terms | 3.1e-2 | 5.6e-3 (c = 32) |
+| b upsample | Σ over (j, c) = 1024 | 1.5e-2 | 2.6e-3 (c = 32) |
+| e AdaIN | variance Σ_t (x − μ)², T = 2000, one thread per row | 1.3e-2 | 7.9e-3 |
+| e AdaIN | same, 256-thread split schedule | 2.8e-4 (admitted) | |
+| e AdaIN | style projection W·s (128) | 2.9e-3 | 5.0e-4 (style 16) |
+| f ConvNeXt | LayerNorm statistic Σ over C = 512 (n10) | 6.9e-2 | 1.5e-4 (C = 32) |
+| f ConvNeXt | pointwise F→C matmul (1536) | 1.7e-2 | 1.4e-4 (F = 96) |
+| matmul 1024³ | Σ_k, 1024 terms | 1.5e-2 | 1.2e-2 |
+| snake `dα = Σ_t` (backward, T = 4096) | unit test | | > 1e-3, rejected |
+
+The predicted column is for the small instances, whose shorter sums
+round less; with the same reduction length (matmul, AdaIN) prediction
+and measurement agree within ~1.5×. The AdaIN rows are the point: the
+same f16 variance is rejected with one thread walking T and admitted
+under a split, because the tree of 256 partial sums rounds at small
+magnitudes. Precision and thread mapping are one search space.
+
+## Native Metal backend: MSL lowering and simdgroup fragments (M4 Max, kernel-only)
+
+`TensorGraph::to_msl` lowers the same kernels as the WGSL path to Metal
+Shading Language and `tang_bench::ir_msl` runs them on buffers it owns
+(feature `metal`; see `docs/tensor-ir.md`). Two things change against
+WGSL: the kernels compile through Apple's compiler directly (no
+wgpu/naga, native `half`), and an f16 × f16 → f32 contraction can be
+scheduled onto `simdgroup_matrix` 8×8 fragments (`set_fragment`).
+
+Method: every timing is 50 launches encoded into one command buffer
+after a warm-up, one wait, divided; best of 3. WGSL is the existing
+`kernel_only` / `kokoro_ops` method (one wgpu submission per run, one
+sync); MPS is `scripts/torch_kokoro_ops.py` (5 warmups, 50 calls, one
+`torch.mps.synchronize`), f32 and with `f16` (weights and activations
+in half). All four were run serially in one session on an otherwise
+idle M4 Max. Every IR result is checked over the full output against an
+f64 reference (`err` = max |got − f64| / max |f64|).
+`cargo run --release -p tang-bench --features metal --example msl_kernels`,
+`... --example kokoro_ops -- msl`.
+
+### Matmul and attention
+
+| shape | WGSL best | MSL f32 best | MSL f16 operands, fragments | MPS f32 | MPS f16 |
+|---|---:|---:|---:|---:|---:|
+| matmul 1024³ | 0.587 (reg8), 3.66 TFLOP/s | 0.492 (auto), 4.37 | **0.191, 11.23** (err 8.3e-5) | 0.194, 11.08 | 0.176, 12.17 |
+| matmul 128×576×1536 | 0.176 (auto), 1.29 | 0.090 (reg2), 2.52 | **0.040, 5.72** (9.8e-5) | 0.045, 5.00 | 0.046, 4.98 |
+| matmul 512×576×1536 | 0.329 (auto), 2.75 | 0.214 (auto), 4.24 | **0.084, 10.79** (1.1e-4) | 0.097, 9.33 | 0.097, 9.37 |
+| attention n=512, d=64, causal | 0.240 (flash_auto) | 0.078 (naive) | — | 0.043 (sdpa) | 0.054 |
+| attention n=1024 | 0.746 (flash_auto) | 0.216 (naive) | — | 0.078 | 0.105 |
+
+(ms, TFLOP/s.) The same f16 operands *without* fragments (scalar 4×4
+register tile) run 0.498 / 0.099 / 0.213 ms: f16 storage alone buys
+nothing on these compute-bound shapes; the matrix unit is the whole win.
+An f16 output costs nothing either way now (native `half` stores: 0.190
+vs 0.191 ms; the WGSL path's packed-word atomics made it slower).
+
+### Kokoro ops
+
+| op | WGSL best | MSL f32 best | MSL tuned @ 1e-3 (choice) | err | **MSL windowed fragments** | MPS f32 | MPS f16 |
+|---|---:|---:|---:|---|---:|---:|---:|
+| a conv1d 512→512 k7 d3 T2000 | 2.196 (3.34 TFLOP/s) | 2.296 (3.20) | 1.057 (6.94) x, w f16, conv on fragments | 5.3e-5 | **0.693 (10.6)** | 0.920 (7.98) | 0.672 (10.9) |
+| b upsample 512→256 k20 s10 | 3.274 | 2.713 | 2.366: w, polyphase output f16; fragments rejected (3.77) | 4.6e-4 | **1.317** (8.0), err 8.4e-5 | 1.041 conv / 1.179 | 0.892 / 1.108 |
+| c iSTFT n_fft 20 hop 5 T4000 | 0.073 | **0.018** | 0.023: all f32 | 1.4e-6 | — | 0.119 manual / 0.325 | 0.110 / 0.310 |
+| d conv (a) + bias + snake | 2.201 | 2.363 | 1.066 x, w f16, fragments + snake epilogue (1 kernel) | 8.2e-5 | **0.698** (tuned; 1 kernel) | 0.820 | 0.786 |
+| e AdaIN C512 T2000 style128 | 0.205 | **0.030** | 0.028: x, W, out f16 | 5.1e-4 | — | 0.250 | 0.272 |
+| f ConvNeXt C512 T200 F1536 | 0.553 | 0.345 | 0.318: w1, normed act f16, pw1 on fragments | 2.0e-4 | 0.312 (pw2 eligible now, not kept: 0.420 forced) | 0.231 | 0.413 |
+| a fwd+bwd (dx, dw) | 6.064 | 4.125 (im2col) | f32 only | | see next row | 2.194 | 2.064 |
+| a fwd+bwd, dy given (y, dx, dw) | | 6.4 (autotune, loaded machine) | y, dx, dw on fragments (err 3.4e-4) | 3.4e-4 | **2.069** (y 0.69 · dx 0.69 · dw 0.67) | 2.194 | 2.064 |
+| f fwd+bwd (all params) | 1.570 | 0.927 | f32 only | | — | 0.962 | 1.077 |
+
+**Windowed fragments column** (PR on top of #37, `examples/conv_frag.rs`
+and `kokoro_ops -- msl`). Measured on a *loaded* machine (a browser
+process held the GPU; the f32 rows above re-measured 1.0–2× slower than
+listed), so every number in this column is the min of two interleaved
+rounds with MPS in the same window. MPS in that window: a 0.810 (f16) /
+0.864 (f32), b conv-only 0.897 / 1.059 and with interleave 1.063 / 1.241,
+d 0.763 / 0.825, fwd+bwd 2.071 / 2.290. Against those, a and d are ahead
+of MPS f16 (0.69 vs 0.81, 0.70 vs 0.76) and fwd+bwd ties it; against the
+idle-machine MPS figures in the table, a is 3% behind MPS f16 (0.693 vs
+0.672), d ahead (0.698 vs 0.786), fwd+bwd level (2.07 vs 2.06), and the
+upsample still behind MPS f32 (1.32 vs 1.04). Every output is checked
+against f64; the forward ops sit at 5–8e-5, fwd+bwd at 3.4e-4 under the
+1e-3 budget (`tune_precision` puts y, dx and dw all on fragments).
+
+What changed:
+
+- **Windowed staging.** A conv-shaped operand (one reduce dim read
+  through its own forms, the free axis plus all other reduce dims through
+  one form `st·n + Σ coef·tap`) is staged once per (channel chunk, time
+  tile) as one zero-padded window — 16 × 83 halves for op a instead of a
+  per-K-step im2col gather — de-interleaved by stride phase, and each tap
+  loads its fragments from it at a shifted offset. The weight is staged
+  once per chunk for all taps as tap planes `[k][o][c]`, one thread per
+  `(o, c)` copying its taps with constant offsets. A/B in one process:
+  conv 0.693 vs 1.048 ms gather, upsample 1.317 vs 3.630.
+- **Where the time went** (op a): the MMA loop alone (staging stubbed)
+  is 0.59 ms = 12.4 TFLOP/s; staging the weight through the generic view
+  read cost +0.6 ms, the tap-fastest store order bank-conflicted (stride
+  bm·cb) for another +0.3; one thread per (o, c) walking c fixed both.
+  Measured and dropped: double-buffered staging (one barrier per chunk,
+  0.74 vs 0.69), 128-wide n tiles (2×4 groups 0.82; 2×2 groups spill),
+  per-lane `thread_elements` assembly of A from a natural-layout tile
+  (1.57), 8 vs 16 channel chunks (equal).
+- **Upsample** is bound by its weight reads `w[o, c, r + s·j]`: for one
+  phase they are 40 B apart (0.93 ms with the loads stubbed vs 1.32).
+  Ordering tiles batch(phase)-fastest so the ten phases of one tile share
+  lines in L2 took it from 1.91 to 1.32. Folding the phase into the tile
+  (one window, ten weight slices) is the remaining step.
+- **Backward.** `dy = 1` (the fwd+bwd row) collapses dx and dw to plain
+  sums, so the fragment row uses `L = Σ y ⊙ gy` (MPS times
+  `backward(ones)`, same cost). dx is a transposed conv over gy and takes
+  the window path (its weight view is guarded but provably in range, so
+  it is staged as affine). dw is a GEMM over t per tap; its
+  `x[c, t + 3k − 9]` is guarded, so it now loads fragments straight from
+  device memory on every K chunk whose reads are all in range and
+  gathers only the edge chunks: 2.24 → 0.67 ms. `fragment_plan` accepts
+  `v_i · v_j` bodies with unread extra args (gradients keep the product
+  rule's dropped factor).
+- **ConvNeXt's second pointwise** (operand = inlined GELU map) is now
+  eligible: the map is evaluated at staging and rounded to f16. It does
+  not pay here (forced 0.420 vs 0.312 kept): GELU is recomputed per
+  output-row tile, and at 0.3 GFLOP the block is launch-bound.
+
+"Tuned" is `ir_msl::tune_precision` from the MSL-autotuned f32 schedule:
+first, per contraction, the move "operands f16 + fragments"; then f16
+storage per buffer, largest first; then f16 accumulators (native
+rounding through `half`, timed like any move); a move is kept if the
+program stays within budget vs f64 and gets ≥ 3% faster, and the final
+choice is re-timed against f32. The 1e-2 budget made the same choices.
+
+What this shows, and where fragments do not help:
+
+- **Matmul reaches MPS.** Both operands are affine with a unit stride,
+  so interior tiles load fragments straight from device memory (the
+  spike's kernel shape: 64×64 tile, 2×2 SIMD groups of 4×4 fragments);
+  ragged edge tiles gather into threadgroup memory with zero padding.
+  11.2 TFLOP/s at 1024³ vs MPS f32 11.1 and f16 12.2; ahead of MPS at
+  the two transformer shapes.
+- **Conv as implicit GEMM: 2.2× over the f32 tile, still 1.15× (f32) /
+  1.6× (f16) behind MPS.** The weight `w[o, (c,k)]` flattens to one
+  unit-stride K and loads directly; `x[c, t + 3k − 9]` is guarded and
+  dilated, so it is gathered per K-chunk through its view (zero padding
+  at staging) — a 32×64 half tile per step with a div/mod per element.
+  Staging *both* operands cost 2.4 ms, no better than f32; loading the
+  weight directly is what got to 1.06. A windowed `x` stage (the f32
+  tiler's trick) and a larger K chunk are the next steps.
+- **The upsample's fragments lose (3.77 vs 2.71 ms f32).** Its weight
+  read `w[o, c, r + s·j]` does not flatten `(j, c)` onto one stride and
+  the phase `r` is a uniform batch dim, so both operands are gathered,
+  with small K (1024) per tile. The search rejected it and kept f16
+  storage instead (1.15×).
+- **ConvNeXt: fragments apply to one of the two pointwise matmuls.** The
+  first reads the materialized LayerNorm output (made f16), the second
+  reads GELU(h + b) through a substituted map, which `fragment_plan`
+  refuses (operands must be f16 buffers). At 0.3 GFLOP per matmul the
+  block is launch-bound anyway (8 kernels).
+- **Much of the f32 gain is the backend, not the kernel.** The MSL f32
+  kernels are the WGSL emitter's kernels, yet AdaIN (6 small kernels)
+  runs 0.030 vs 0.205 ms and the iSTFT 0.018 vs 0.073. With one command
+  buffer per run (wgpu's pattern) MSL is still 0.038 / 0.023 ms, so the
+  gap is wgpu/naga per-dispatch cost and code generation, not batching.
+  The same holds for the block-shaped work: attention's naive form
+  0.216 vs 0.746 ms and conv fwd+bwd 4.1 vs 6.1 ms. Big single kernels
+  (the conv) are a wash between the two.
+- **Attention has no fragment lowering yet** (QKᵀ and PV under the
+  online-softmax monoid). MSL's best is the materialized naive form;
+  MPS's sdpa is 2–3× ahead.
+- **Not measured as speedups:** f16 accumulators. The search tried every
+  remaining reduction with an f16 accumulator; none was kept (over budget
+  or no gain).
+- A pre-existing WGSL issue showed up here: the tiler can emit staging
+  larger than any device allows (iSTFT's OLA tile, 84016 floats = 328 KiB,
+  because the chunk-halving loop stops at chunk 1). wgpu rejects it at
+  pipeline creation (autotune catches the panic); Apple's compiler service
+  crashes on it (`XPC_ERROR_CONNECTION_INTERRUPTED`). MSL kernels now
+  carry `threadgroup_bytes` and the Metal autotuner skips candidates over
+  the device limit.
+- `kernel_only` hangs in its transformer-block section on this machine
+  (also on the base commit `fd193b4`); its matmul/attention rows above are
+  from the part that runs.
+
+### Flash attention on simdgroup fragments (M4 Max, kernel-only)
+
+`cargo run --release -p tang-bench --features metal --example attention_fragments`
+vs `scripts/torch_attention.py`. Both ran interleaved in one
+`gpu-lock` window (two rounds; round 2 shown, round 1 within ~5%).
+d = dv = 64; q/k/v random in [−1, 1]. `f32-auto` is the derived graph
+under `schedule_auto` lowered to MSL (the best f32 schedule we have for
+the multi-head graph); `fragment` is the same graph with q/k/v stored
+f16 and the fused kernel flagged `fragment`: S = Q·Kᵀ on half
+fragments (f32 acc), online softmax in registers (MLX lane layout), P
+cast to half, O += P·V on fragments, normalizer fused. Causal runs skip
+key tiles the mask covers — derived from the graph (the mask
+`select(j − i, −1e30, 0)` is affine in the iota args; evaluated at the
+tile box it gives a uniform skip test). TFLOP/s counts 4·h·n²·d (×½ causal).
+
+| heads | causal | n | f32-auto | fragment | vs f32 | TFLOP/s | SDPA f32 | SDPA f16 |
+|---|---|---|---|---|---|---|---|---|
+| 1 | no | 512 | 0.080 | 0.154 | 0.52× | 0.43 | 0.173 | 0.079 |
+| 1 | no | 1024 | 0.250 | 0.314 | 0.80× | 0.85 | 0.077 | 0.100 |
+| 1 | no | 2048 | 0.860 | 0.678 | 1.27× | 1.58 | 0.179 | 0.189 |
+| 1 | no | 4096 | 3.304 | 1.506 | 2.19× | 2.85 | 0.554 | 0.516 |
+| 1 | yes | 512 | 0.088 | 0.148 | 0.60× | 0.23 | 0.046 | 0.054 |
+| 1 | yes | 1024 | 0.281 | 0.290 | 0.97× | 0.46 | 0.081 | 0.099 |
+| 1 | yes | 2048 | 0.977 | 0.590 | 1.65× | 0.91 | 0.165 | 0.191 |
+| 1 | yes | 4096 | 3.743 | 1.238 | 3.02× | 1.73 | 0.409 | 0.463 |
+| 8 | no | 512 | 0.422 | 0.191 | 2.21× | 2.81 | 0.081 | 0.073 |
+| 8 | no | 1024 | 1.659 | 0.780 | 2.13× | 2.75 | 0.251 | 0.233 |
+| 8 | no | 2048 | 6.449 | 2.951 | 2.18× | 2.91 | 0.882 | 0.757 |
+| 8 | no | 4096 | 26.50 | 12.59 | 2.11× | 2.73 | 3.654 | 2.992 |
+| 8 | yes | 512 | 0.508 | 0.175 | 2.91× | 1.54 | 0.065 | 0.069 |
+| 8 | yes | 1024 | 2.068 | 0.440 | 4.70× | 2.44 | 0.167 | 0.150 |
+| 8 | yes | 2048 | 8.224 | 1.637 | 5.02× | 2.62 | 0.534 | 0.461 |
+| 8 | yes | 4096 | 33.23 | 5.788 | 5.74× | 2.97 | 1.951 | 1.626 |
+
+(ms.) Honest reading:
+
+- Against our own f32 path the fragment kernel wins 2–5.7× once there is
+  enough work (8 heads, or n ≥ 2048 single-head); causal gains more
+  because skipped tiles are free. Max |fragment − f32| is 0.6–1.9e-3 (P
+  and q/k/v in half); `tune_precision` keeps it under a 1% budget vs f64.
+- Against PyTorch MPS SDPA it is **3–4× slower** at 8 heads × 4096 and
+  worse on small single-head problems (grid of n/32 threadgroups is too
+  small to fill the GPU: 16 groups at n = 512). ~3 TFLOP/s against
+  SDPA's ~10. Known gaps, in likely order of payoff: K/V staged by a
+  generic `arg_read` gather each tile (scalar loads, two barriers, no
+  double buffering, no direct device fragment loads); BK = 32 keys and
+  8 rows per SIMD group (MLX uses larger query tiles per SIMD group and
+  `exp2` with log2e folded into the scale); single-head small-n needs
+  key-split (flash-decoding) parallelism.
+- The CUDA wmma flash kernel from #34 (`flash_tile`) matches a narrower
+  pattern (exact `(score, 1, v)` slots, unscaled score, d_lanes ∈ 16..64);
+  the Metal `attention_plan` is a superset (literal scale, ragged d/n/dv,
+  guarded views, any per-row slots, dv blocked as a grid axis, GQA via
+  `[hk, g]` heads). Folding `flash_tile` onto `attention_plan` is a
+  follow-up.
+
+#### Speed pass (supersedes the fragment column above)
+
+Same harness (`ATT_HEADS`, `ATT_CAUSAL`, `ATT_SAMPLES` select shapes;
+best of 7), SDPA from the same `gpu-lock` window. The 4-head rows at
+n = 128–512, non-causal, are the phoneme-encoder shape of the voice
+model.
+
+| heads | causal | n | f32-auto | fragment | vs f32 | TFLOP/s | SDPA f32 | SDPA f16 | vs SDPA f16 |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | no | 512 | 0.080 | **0.029** | 2.75× | 2.32 | 0.169 | 0.084 | 2.9× faster |
+| 1 | no | 1024 | 0.250 | **0.052** | 4.82× | 5.17 | 0.076 | 0.099 | 1.9× faster |
+| 1 | no | 4096 | 3.311 | **0.504** | 6.57× | 8.52 | 0.555 | 0.517 | 1.03× faster |
+| 1 | yes | 512 | 0.086 | **0.030** | 2.88× | 1.12 | 0.046 | 0.054 | 1.8× faster |
+| 1 | yes | 1024 | 0.280 | **0.054** | 5.21× | 2.50 | 0.080 | 0.099 | 1.8× faster |
+| 1 | yes | 4096 | 3.768 | **0.298** | 12.6× | 7.20 | 0.408 | 0.462 | 1.6× faster |
+| 4 | no | 128 | 0.024 | **0.012** | 1.96× | 1.35 | 0.058 | 0.069 | 5.8× faster |
+| 4 | no | 256 | 0.067 | **0.018** | 3.68× | 3.71 | 0.095 | 0.049 | 2.7× faster |
+| 4 | no | 512 | 0.222 | **0.041** | 5.44× | 6.57 | 0.051 | 0.055 | 1.3× faster |
+| 4 | no | 4096 | 13.01 | 1.967 | 6.61× | 8.73 | 1.722 | 1.496 | 1.31× slower |
+| 4 | yes | 4096 | 15.03 | 0.835 | 18.0× | 10.3 | 0.993 | 0.871 | 1.04× faster |
+| 8 | no | 512 | 0.422 | 0.069 | 6.09× | 7.74 | 0.080 | 0.071 | 1.03× faster |
+| 8 | no | 1024 | 1.660 | **0.221** | 7.53× | 9.74 | 0.250 | 0.235 | 1.06× faster |
+| 8 | no | 4096 | 26.15 | 3.411 | 7.67× | 10.1 | 3.459 | 2.696 | 1.27× slower |
+| 8 | yes | 512 | 0.482 | **0.047** | 10.3× | 5.72 | 0.062 | 0.066 | 1.4× faster |
+| 8 | yes | 1024 | 1.925 | **0.124** | 15.5× | 8.65 | 0.166 | 0.153 | 1.23× faster |
+| 8 | yes | 4096 | 29.85 | 1.669 | 17.9× | 10.3 | 1.874 | 1.506 | 1.11× slower |
+
+(ms.) ~3 → ~10 TFLOP/s. Each change measured on its own (8 heads, d 64,
+ms before → after; the GPU is shared, so ±10% run to run):
+
+| change | 8h n1024 | 8h n4096 | 8h n4096 causal | 1h n512 | kept |
+|---|---|---|---|---|---|
+| baseline (PR #40) | 0.785 | 16.46 | 7.77 | 0.182 | |
+| Q/K/V staged with `half4` copies when the read is a direct unit-stride f16 view (`direct_f16`, `stage_direct`) | 0.533 | 11.48 | 6.31 | 0.121 | yes |
+| `exp2` with log2 e folded into the score | 0.546 | 11.88 | 6.55 | 0.111 | no (no change: fast-math `exp` already is `exp2`) |
+| K/V fragments `simdgroup_load`ed straight from device memory when every key tile and value block is full — no staging, no barriers in the key loop | 0.495 | 10.69 | 4.75 | 0.100 | yes |
+| epilogue from the accumulator registers (lane owns row `fm`, cols `fn`, `fn+1`): no result tile, no row-stat tile, threadgroup memory 9.6 → 4.6 KB | 0.452 | 7.85 | 4.39 | 0.104 | yes |
+| 16 rows per SIMD group (RF 2) via references into the fragment arrays | 0.648 | 11.76 | 8.22 | 0.231 | no (spills) |
+| **every constant-trip loop unrolled in the generated text** (`unroll_const_loops`: `{ const uint jf = 3u; … }` scopes) | **0.230** | **3.85** | **1.98** | **0.031** | yes |
+| then RF 2 again (fully unrolled) | 0.279 | 4.13 | 2.11 | 0.107 | no |
+| then BK 64 | 0.266 | 4.37 | 2.55 | 0.035 | no |
+| then `exp2` again | 0.255 | 3.85 | 2.04 | 0.030 | no (neutral) |
+
+What this shows:
+
+- **The big one was the compiler, not the algorithm.** The kernel indexed
+  `simdgroup_matrix` arrays and `thread_elements()` with loop variables;
+  Metal left some of those loops rolled and the fragments went through
+  the stack. Ablations before the fix said as much: dropping the K/V
+  loads or the `exp`s changed nothing, so the MMA loop itself was
+  stalled. Unrolling in the emitter (constant indices everywhere)
+  doubled throughput on every shape. Any fragment kernel that indexes
+  fragment arrays dynamically should get the same pass.
+- Bigger register tiles (16 rows per SIMD group, BK 64) lose on M4 at
+  d = 64: register pressure costs more occupancy than the extra
+  fragment reuse buys. MLX's 8 rows × BK 32 is the right shape here.
+- Key-split (flash-decoding) was not needed for the targets: 1 head
+  n = 512 runs 0.029 ms, 2.75× under f32-auto and 2.9× under SDPA f16,
+  despite only 16 threadgroups. It stays the lever for single-query /
+  very short-query decode.
+- Still behind SDPA f16 by 1.1–1.3× at n = 4096 (8 heads; 4 heads
+  non-causal). Ragged shapes (n not a multiple of 32, dv not a multiple
+  of the 64-column block) take the staged `half4`/gather path with
+  barriers.

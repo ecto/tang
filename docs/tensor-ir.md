@@ -32,6 +32,15 @@ compose by substitution and never touch memory. Because they are the only
 way a comprehension addresses its inputs, every layout decision is a view
 and every view is analyzable.
 
+A view can be *guarded*: a read outside the source returns 0 instead of
+being a shape error. That is zero padding as a view — same-padded and
+dilated convolutions, transposed (polyphase) convolutions and overlap-add
+are guarded reads. The guard follows the leaf read through composition;
+a map read through a guarded view stays materialized, since `f(0)` need
+not be 0. The gradient of a guarded read eliminates a coordinate rather
+than scattering: for `x[c, t + 3k − 9]`, `dx[c, τ]` reads `dy[o, τ − 3k + 9]`
+through a guard, so padding contributions never reach `x`.
+
 **Comprehensions.** The only compute op:
 
 ```
@@ -117,6 +126,10 @@ schedule fields on a node say *how*, and can't change the answer:
   memory once per reduce chunk: buffer reads (k/v tiles, the matmul `b`
   tile) and *inlined sub-computations* (the q·k scores) alike.
   Reduce-invariant per-thread reads (the q row) are hoisted to registers.
+- `precision` — number formats (`set_precision(t, Precision { storage,
+  accum })`): the format a materialized buffer or input is *stored* in
+  (`F32 | F16 | BF16`) and the format a reduction *accumulates* in
+  (`F32 | F16`). See [Precision is a schedule](#precision-is-a-schedule).
 - `schedule_auto` — the rules of thumb distilled from measurement;
   `autotune` tries candidate graphs on the device and keeps the fastest.
 
@@ -129,6 +142,101 @@ hand-written kernel is as an intrinsic: "this comprehension shape has a
 fast implementation on this chip". The compiler picks it when it wins and
 derives one when it doesn't. The existing kernels keep their speed and stop
 being forks.
+
+## Precision is a schedule
+
+f16 is not a different program; it is a different way to run the same
+one. So precision is a per-node schedule field, like `inline` and `tile`,
+and the graph stays math. Everything defaults to f32, which is exactly
+the old behaviour.
+
+- **Storage** applies where a value is written to memory: graph inputs
+  (weights) and materialized comps. An inlined comp has no buffer, so its
+  storage is ignored. Loads widen to f32; arithmetic is f32.
+- **Accum** applies to a reduction's running state: after every combine
+  step the state is rounded to the format.
+- **The interpreter predicts the error.** `eval` stays pure f64 and
+  ignores precision. `eval_emulated` rounds every stored value and every
+  accumulator step to its scheduled format (round to nearest even,
+  subnormals, overflow to ∞) while body arithmetic stays f64.
+  `precision_error` compares the two (`ErrorStats`: max / mean, abs /
+  relative to the output's largest magnitude); `ErrorBudget { max_rel,
+  max_abs }` admits or rejects a schedule. Emulation matches the GPU's
+  f16 kernels to 1 f16 ulp when the reduction order is the same.
+- **The reduction order is part of the error.** The interpreter folds a
+  reduction sequentially. A `split` schedule tree-combines 256 partial
+  sums, so the same f16 accumulator is far more accurate under it
+  (AdaIN's variance over T = 2000, measured on the GPU: 2.8e-4 under a
+  256-thread split, 1.3e-2 with one thread per row; the interpreter's
+  sequential prediction is 7.9e-3). Emulation models the sequential
+  order, the worst case.
+- **WGSL lowering.** naga 24 rejects `enable f16`, so f16 storage is
+  packed two per `u32` with core-WGSL `unpack2x16float` on load; a store
+  merges its half into the word with two atomics on disjoint bits
+  (neighbouring halves belong to different threads). No device feature
+  needed. f16 accumulation is lowered as a round-trip through
+  `pack2x16float` after each combine — the numerics of an f16
+  accumulator, not its speed. bf16 is interpreter-only (WGSL has no bf16
+  type; the lowering panics on it).
+- **Search.** `tang_bench::ir_gpu::tune_precision` takes a scheduled
+  graph and a budget, lowers buffers to f16 one at a time (largest
+  first), runs each on the device against the f64 reference, and keeps a
+  change only if the program stays within budget and gets faster (≥ 3%,
+  re-timed at the end against f32). Accumulators are tried against the
+  budget only.
+
+Set precision after the rewriting passes (they rebuild the graph); the
+schedule passes (`schedule_auto`, autotune) leave it alone. `backward`
+appends to the same graph, so a forward input stored in f16 is read as
+f16 by the gradient kernels too, and backward reductions (a snake's
+`dα = Σ_t …`) take their own precision.
+
+## Metal backend (MSL)
+
+`TensorGraph::to_msl` lowers the same kernels as `to_wgsl` to Metal
+Shading Language (`tensor_msl.rs`). The emitters are shared: the point,
+split and tiled schedules, register tiles, multi-dim reductions,
+windowed staging, guarded views, epilogue fusion and tuple monoids are
+produced once, with a `Dialect` switch for buffer access, and the WGSL
+surface syntax is rewritten to MSL. What changes:
+
+- **Native formats.** f16 buffers are `half` (one element per index, a
+  plain store; no packed words, no atomics), bf16 buffers are `bfloat`.
+  f16 accumulators round through `half` after every combine.
+- **Guards are lazy.** WGSL `select` evaluates both arms and relies on
+  robust buffer access; MSL has none, so a guarded read is a ternary that
+  never issues the out-of-range load.
+- **Fragment lowering** (`set_fragment`, `fragment_plan`): a materialized
+  `Σ_r A(m, r)·B(r, n)` — or an elementwise map over one, as epilogue —
+  whose two operands are f16 buffers and whose accumulator is f32 runs on
+  `simdgroup_half8x8` × `simdgroup_half8x8` → `simdgroup_float8x8`. `m`
+  and `n` are the tile axes; other point dims are batch. The reduce dims
+  are flattened, so a conv's `(c, k)` is one K and conv is implicit GEMM.
+  An operand whose address is affine with unit stride along k or along
+  its free axis (matmul's `a`, `b`, `bᵀ`; a conv's weight) is loaded into
+  fragments straight from device memory on interior tiles; any other
+  operand (a conv's guarded, dilated `x`) is gathered through its view
+  into threadgroup `half` tiles, zero-padded at staging, and ragged edge
+  tiles stage both. A conv-shaped operand — one reduce dim ("rows",
+  channels) read through its own forms, the free axis and every other
+  reduce dim ("taps") through one form `st·n + Σ coef·tap + …` — is
+  instead staged once per (row chunk, n tile) as one zero-padded
+  *window*, de-interleaved by stride phase, and each tap's fragments load
+  from it at a shifted offset (conv `x`, a polyphase upsample's `x`, conv
+  dx's `dy`). The other operand is then staged once per chunk for all
+  taps as tap planes. The body may be any `v_i · v_j` with further
+  unread args (gradients keep the product rule's dropped factor), and an
+  operand may be an inlined elementwise map, evaluated while staging and
+  rounded to f16 there (the emulator does not model that rounding).
+  The result tile goes through threadgroup memory,
+  where the epilogue map runs before the write-out. Fragment geometry
+  (`FragmentTarget`: fragment shape, SIMD width, threadgroup memory,
+  tile) is data, so a CUDA `wmma` lowering can reuse the plan.
+- **Runtime.** `tang_bench::ir_msl` (feature `metal`) owns its Metal
+  buffers end to end; `tune_precision` there adds the candidate
+  "operands f16 + fragments" per contraction, and `autotune_kernels`
+  tries fragments wherever the node's precision admits them. WGSL stays
+  the portable default.
 
 ## What the measurements say about the claim
 
@@ -156,19 +264,25 @@ schedule space; the compiler searches it.
 
 ## Not yet
 
-- Native codegen is a first cut. Matmul-shaped tiles lower to Metal
-  simdgroup matrices (`tensor_msl.rs`, via wgpu's MSL passthrough) and
-  to CUDA `wmma` TF32 tensor cores (`tensor_cuda.rs`), epilogues
-  included; `to_cuda` emits whole programs (wmma tiles plus the other
+- Fragments for attention on Metal (QKᵀ and PV under the online-softmax
+  schedule). A polyphase upsample still re-stages its weight per phase
+  (the phase is a batch dim of the tile).
+- Body arithmetic in `half`. Storage and accumulators honour f16; scalar
+  body math is f32 on every path.
+- #34's f32 simdgroup-matrix tile (`tensor_msl_mma.rs`, `to_msl_mma`,
+  run through wgpu's MSL passthrough, opt-in with `TANG_NATIVE`) and the
+  CUDA path coexist with the whole-IR MSL backend (`tensor_msl.rs`,
+  `to_msl`). The f32 Metal tile does not beat the WGSL register tile on
+  an M4, so `pick_backend` only weighs WGSL against the native f16
+  backend.
+- CUDA: `to_cuda` emits whole programs (wmma TF32 tiles plus the other
   kernels transpiled from their WGSL) that `tang_bench::ir_cuda` runs
   through cudarc. The block forward runs in 0.62 ms at seq 128 on a 3090
-  with six kernels on tensor cores — the five matmul-shaped tiles and
-  the fused attention, which `cuda_flash_kernel` lowers to a wmma flash
-  kernel from the comp's structure (bilinear score, mask, value,
-  normalizer); the Metal fp32 kernel does not yet beat the WGSL
-  register tile.
-- The CUDA path is a separate runtime (tang-gpu runs on wgpu, which
-  cannot dispatch CUDA); buffers do not interoperate between the two.
+  with six kernels on tensor cores — the five matmul-shaped tiles and the
+  fused attention, which `cuda_flash_kernel` lowers to a wmma flash
+  kernel from the comp's structure. It is a separate runtime (wgpu cannot
+  dispatch CUDA); buffers do not interoperate, and it does not yet read
+  the precision schedule (f16/bf16 wmma).
 - Scatter gradients reduce over the whole source coordinate they gate on;
   a stride-2 read pays 2× in the backward pass. Fine for rope, not for a
   large gather.

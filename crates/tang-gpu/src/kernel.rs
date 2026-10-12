@@ -11,6 +11,9 @@ pub(crate) struct CachedPipeline {
     pub bind_group_layout: wgpu::BindGroupLayout,
 }
 
+/// Command buffers a batch holds before it is submitted anyway.
+const MAX_PENDING: usize = 32;
+
 /// Cache of compiled WGSL compute pipelines, keyed by source hash.
 /// Supports command batching: when `batching` is true, dispatches are
 /// accumulated and submitted together on `flush()`.
@@ -61,6 +64,12 @@ impl KernelCache {
     pub(crate) fn submit_or_enqueue(&mut self, device: &GpuDevice, cmd: wgpu::CommandBuffer) {
         if self.batching {
             self.pending.push(cmd);
+            // Metal allows 64 live command buffers per queue and blocks
+            // forever creating the 65th if none can complete: an unflushed
+            // batch must not grow past that.
+            if self.pending.len() >= MAX_PENDING {
+                self.flush(device);
+            }
         } else {
             device.queue.submit(std::iter::once(cmd));
         }

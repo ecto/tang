@@ -46,6 +46,8 @@ harness = false
 
 [features]
 default = []
+# Native Metal backend for the tensor IR (MSL emitter + runtime).
+metal = ["dep:metal"]
 # CUDA runtime for `TensorGraph::to_cuda` programs (cudarc, dynamic
 # loading of libcuda/libnvrtc at run time; needs CUDA 12.x on the host).
 cuda = ["dep:cudarc"]
@@ -73,6 +75,7 @@ tang-train  = { workspace = true }
 tang-tensor = { workspace = true }
 cudarc      = { version = "0.16", features = ["cuda-12080"], optional = true }
 tang-infer  = { workspace = true }
+metal       = { version = "0.33", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -85,3 +88,11 @@ name = "algebraic_bits"
 
 [[example]]
 name = "algebraic_e2e"
+
+[[example]]
+name = "msl_kernels"
+required-features = ["metal"]
+
+[[example]]
+name = "conv_frag"
+required-features = ["metal"]
