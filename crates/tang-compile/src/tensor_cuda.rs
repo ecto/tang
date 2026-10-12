@@ -1,10 +1,12 @@
-//! Native CUDA lowering of matmul-shaped tiles: tensor cores via `wmma`.
+//! Native CUDA lowering of matmul-shaped tiles: tensor cores via `mma`.
 //!
 //! The same bilinear tile the Metal lowering recognizes
-//! (`bilinear_tile`) emitted as CUDA C++: a 64×64 block per 128-thread
-//! block, four warps of 32×32, operands staged through shared memory
-//! from any affine layout, `wmma` 16×16×8 TF32 fragments with fp32
-//! accumulation, and the comp's epilogue run on the stored block.
+//! (`bilinear_tile`) emitted as CUDA C++: an [`MmaShape`] block (64×64 on
+//! four warps up to 128×128 on eight), operands staged through
+//! double-buffered shared memory from any affine layout (`cp.async`,
+//! 16-byte where the layout allows), `mma.sync` m16n8k8 TF32 fragments
+//! with fp32 accumulation, and the comp's epilogue run on the
+//! accumulator registers. The flash-attention kernel keeps `wmma`.
 //!
 //! tang-gpu runs on wgpu, which cannot dispatch CUDA; this emitter
 //! produces source for an external harness (`scripts/cuda_bench.cu`,
@@ -18,22 +20,103 @@ use super::tile::emit_scalar;
 use super::wgsl::{Target, WgslProgram};
 use super::{TensorGraph, TensorId};
 
-const BLOCK: usize = 64;
-const CHUNK: usize = 32;
-const THREADS: usize = 128;
-/// Padded row strides: past the bank period, and keeping every fragment
-/// pointer 32-byte aligned as `wmma::load_matrix_sync` requires.
-const LDA: usize = CHUNK + 8;
-const LDB: usize = BLOCK + 8;
-const LDC: usize = BLOCK + 8;
+/// A tensor-core tile's block shape: a `bm × bn` output block per thread
+/// block of `warps_m × warps_n` warps (each a `bm/warps_m × bn/warps_n`
+/// warp tile of 16×8 `mma` fragments), the reduction staged `chunk` at a
+/// time through `stages` shared-memory buffers (2: the next chunk's copy,
+/// `cp.async` where the operand is a plain read, overlaps this chunk's
+/// math).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MmaShape {
+    pub bm: usize,
+    pub bn: usize,
+    pub warps_m: usize,
+    pub warps_n: usize,
+    pub chunk: usize,
+    pub stages: usize,
+}
+
+impl MmaShape {
+    pub const fn new(bm: usize, bn: usize, warps_m: usize, warps_n: usize) -> Self {
+        Self {
+            bm,
+            bn,
+            warps_m,
+            warps_n,
+            chunk: 32,
+            stages: 2,
+        }
+    }
+    fn threads(&self) -> usize {
+        32 * self.warps_m * self.warps_n
+    }
+    /// Row strides of the staged operands. Fragments are read as `float2`
+    /// (see the k and column pairing in the kernel): A `[bm][chunk]` as 8
+    /// rows × 4 pairs per half-warp-pair (stride ≡ 8 mod 32 is
+    /// conflict-free), B `[chunk][bn]` as 4 rows × 4 pairs per half warp
+    /// (≡ 4 mod 32). Both stay multiples of 4 floats for 16-byte
+    /// `cp.async`.
+    fn lda(&self) -> usize {
+        self.chunk + 8
+    }
+    fn ldb(&self) -> usize {
+        self.bn + 4
+    }
+}
+
+/// The block shapes a tuner chooses between, per kernel; the first is the
+/// default. 64×64 / 4 warps suits small outputs (more blocks to fill the
+/// device), 128×128 / 8 warps large ones (half the staging per flop).
+pub const MMA_SHAPES: [MmaShape; 4] = [
+    MmaShape::new(64, 64, 2, 2),
+    MmaShape::new(128, 128, 2, 4),
+    MmaShape::new(128, 64, 4, 2),
+    MmaShape::new(64, 128, 2, 4),
+];
+
+/// The PTX helpers the tensor-core kernels share: TF32 rounding, `mma`
+/// m16n8k8, and `cp.async` (zero-filling when the source is out of range).
+const MMA_PRELUDE: &str = r#"static __device__ __forceinline__ unsigned tang_tf32(float x) {
+    // round to nearest, ties away (cvt.rna): the mma reads only the top
+    // 19 bits, so adding half a TF32 ulp is the whole conversion
+    return __float_as_uint(x) + 0x1000u;
+}
+static __device__ __forceinline__ void tang_mma(float* c, const unsigned* a, const unsigned* b) {
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+static __device__ __forceinline__ void tang_cp4(float* dst, const float* src, bool ok) {
+    unsigned d = (unsigned)__cvta_generic_to_shared(dst);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" :: "r"(d), "l"(src), "r"(ok ? 4 : 0));
+}
+static __device__ __forceinline__ void tang_cp16(float* dst, const float* src, bool ok) {
+    unsigned d = (unsigned)__cvta_generic_to_shared(dst);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(d), "l"(src), "r"(ok ? 16 : 0));
+}
+static __device__ __forceinline__ void tang_cp_commit() { asm volatile("cp.async.commit_group;"); }
+template <int N> static __device__ __forceinline__ void tang_cp_wait() { asm volatile("cp.async.wait_group %0;" :: "n"(N)); }
+"#;
 
 impl TensorGraph {
-    /// CUDA source for `root` as a tensor-core tile, or `None` when it is
-    /// not matmul-shaped. Several terms (a sum of products) and several
-    /// outputs (a tuple-valued reduction such as merged gate/up
-    /// projections) share one kernel: distinct operands are staged once,
-    /// each output accumulates its own fragments.
+    /// CUDA source for `root` as a tensor-core tile in the default block
+    /// shape, or `None` when it is not matmul-shaped.
     pub fn cuda_mma_kernel(&self, root: usize, reads: &[usize]) -> Option<String> {
+        self.cuda_mma_kernel_shaped(root, reads, MMA_SHAPES[0])
+    }
+
+    /// CUDA source for `root` as a tensor-core tile of block shape `sh`,
+    /// or `None` when it is not matmul-shaped (or does not fit). Several
+    /// terms (a sum of products) and several outputs (a tuple-valued
+    /// reduction such as merged gate/up projections) share one kernel:
+    /// distinct operands are staged once, each output accumulates its own
+    /// fragments, and the epilogue runs on the accumulator registers.
+    pub fn cuda_mma_kernel_shaped(
+        &self,
+        root: usize,
+        reads: &[usize],
+        sh: MmaShape,
+    ) -> Option<String> {
         let c = self.comp_at(root)?;
         let Bilinear {
             red_node,
@@ -49,6 +132,15 @@ impl TensorGraph {
             kdim,
             ..
         } = self.bilinear_tile(root, reads)?;
+        let (bm, bn, chunk) = (sh.bm, sh.bn, sh.chunk);
+        let threads = sh.threads();
+        let (lda, ldb) = (sh.lda(), sh.ldb());
+        // per warp: fm × fn fragments of 16×8
+        let (wtm, wtn) = (bm / sh.warps_m, bn / sh.warps_n);
+        let (fm, fnn) = (wtm / 16, wtn / 8);
+        if fm == 0 || wtm % 16 != 0 || wtn % 16 != 0 || chunk % 8 != 0 {
+            return None;
+        }
         let n_outs = outs.len();
         // distinct operand stages; each (output, term) is an (A, B) pair
         let mut a_stages: Vec<(usize, super::msl_mma::Addr, Option<usize>)> = Vec::new();
@@ -75,42 +167,48 @@ impl TensorGraph {
             }
             uses.push(u);
         }
+        // accumulators: n_outs × fm × fnn × 4 floats per thread
+        if n_outs * fm * fnn * 4 > 128 {
+            return None;
+        }
         let storage = |j: usize| self.storage(TensorId(j as u32)).n();
-        let tiles_x = n.div_ceil(BLOCK);
-        let tiles_y = m.div_ceil(BLOCK);
+        let tiles_x = n.div_ceil(bn);
+        let tiles_y = m.div_ceil(bm);
         let n_base = tiles_x * tiles_y * others.iter().map(|&d| pts[d]).product::<usize>();
-        let splits = split_k(n_base, k_total);
+        let splits = split_k(n_base, k_total, chunk, bm * bn);
         let n_tiles = n_base * splits;
         let w_out = c.width();
-        let a_floats = a_stages.len() * BLOCK * LDA;
-        let b_floats = b_stages.len() * CHUNK * LDB;
-        // split-K partials, and a stored C that would outgrow the operand
-        // stages (several outputs), go through global memory instead
-        let stored_c = n_outs * BLOCK * LDC;
-        let via_global = splits > 1 || stored_c > a_floats + b_floats;
-        let c_floats = if via_global { 0 } else { stored_c };
-        let arena = (a_floats + b_floats).max(c_floats);
-        // static shared memory: 48 KB
-        if arena * 4 > 48 * 1024 {
+        let a_floats = bm * lda;
+        let b_floats = chunk * ldb;
+        let stage_floats = a_stages.len() * a_floats + b_stages.len() * b_floats;
+        let smem_floats = sh.stages * stage_floats;
+        // dynamic shared memory, within the 3090's 99 KB per block
+        if smem_floats * 4 > 99 * 1024 {
             return None;
         }
 
         let mut s = String::new();
-        writeln!(s, "// Auto-generated by tang-compile: wmma (TF32) tile").unwrap();
-        writeln!(s, "#include <mma.h>").unwrap();
-        writeln!(s, "using namespace nvcuda;").unwrap();
+        writeln!(s, "// Auto-generated by tang-compile: mma (TF32) tile").unwrap();
+        writeln!(
+            s,
+            "// block {bm}x{bn}, {}x{} warps, chunk {chunk}, {} stages",
+            sh.warps_m, sh.warps_n, sh.stages
+        )
+        .unwrap();
         writeln!(s, "#define TANG_TILES {n_tiles}").unwrap();
-        writeln!(s, "#define TANG_THREADS {THREADS}").unwrap();
+        writeln!(s, "#define TANG_THREADS {threads}").unwrap();
+        writeln!(s, "#define TANG_SMEM {}", smem_floats * 4).unwrap();
         writeln!(s, "#define TANG_OUT_LEN {}", numel_pts(&pts) * w_out).unwrap();
         writeln!(s, "#define select(f, t, c) ((c) ? (t) : (f))").unwrap();
-        if via_global {
+        s.push_str(MMA_PRELUDE);
+        if splits > 1 {
             // per-split partial blocks, and an arrival counter per output
             // tile (the last split to arrive reduces and runs the
             // epilogue, then resets its counter for the next launch)
             writeln!(
                 s,
-                "__device__ __align__(32) float tang_partial[{}];",
-                n_tiles * n_outs * BLOCK * BLOCK
+                "__device__ float tang_partial[{}];",
+                n_tiles * n_outs * bm * bn
             )
             .unwrap();
             writeln!(s, "__device__ unsigned tang_arrived[{n_base}];").unwrap();
@@ -123,33 +221,27 @@ impl TensorGraph {
         params.push("unsigned count".into());
         writeln!(
             s,
-            "extern \"C\" __global__ void __launch_bounds__({THREADS}) main0({}) {{",
+            "extern \"C\" __global__ void __launch_bounds__({threads}) main0({}) {{",
             params.join(", ")
         )
         .unwrap();
         writeln!(s, "    (void)count;").unwrap();
-        writeln!(s, "    __shared__ __align__(32) float smem[{arena}];").unwrap();
-        for t in 0..a_stages.len() {
-            writeln!(s, "    float* As{t} = smem + {}u;", t * BLOCK * LDA).unwrap();
-        }
-        for t in 0..b_stages.len() {
-            writeln!(
-                s,
-                "    float* Bs{t} = smem + {}u;",
-                a_floats + t * CHUNK * LDB
-            )
-            .unwrap();
-        }
-        writeln!(s, "    float* Cs = smem;").unwrap();
+        writeln!(s, "    extern __shared__ __align__(16) float smem[];").unwrap();
         writeln!(s, "    unsigned tile = blockIdx.x;").unwrap();
         writeln!(s, "    if (tile >= {n_tiles}u) return;").unwrap();
-        let per_split = k_total.div_ceil(CHUNK).div_ceil(splits) * CHUNK;
+        let per_split = k_total.div_ceil(chunk).div_ceil(splits) * chunk;
         writeln!(s, "    unsigned split = tile / {n_base}u;").unwrap();
         writeln!(s, "    tile = tile % {n_base}u;").unwrap();
         writeln!(s, "    unsigned k_begin = split * {per_split}u;").unwrap();
         writeln!(
             s,
             "    unsigned k_end = min(k_begin + {per_split}u, {k_total}u);"
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "    unsigned n_chunks = k_end > k_begin ? (k_end - k_begin + {}u) / {chunk}u : 0u;",
+            chunk - 1
         )
         .unwrap();
         writeln!(s, "    unsigned tile_x = tile % {tiles_x}u;").unwrap();
@@ -159,8 +251,8 @@ impl TensorGraph {
             writeln!(s, "    unsigned p{d} = lead % {}u;", pts[d]).unwrap();
             writeln!(s, "    lead = lead / {}u;", pts[d]).unwrap();
         }
-        writeln!(s, "    unsigned row0 = tile_y * {BLOCK}u;").unwrap();
-        writeln!(s, "    unsigned col0 = tile_x * {BLOCK}u;").unwrap();
+        writeln!(s, "    unsigned row0 = tile_y * {bm}u;").unwrap();
+        writeln!(s, "    unsigned col0 = tile_x * {bn}u;").unwrap();
         let lead_term = |addr: &super::msl_mma::Addr| -> String {
             let mut t = format!("{}", addr.offset);
             for &d in &others {
@@ -180,48 +272,114 @@ impl TensorGraph {
         let rank = rc.rank();
         writeln!(s, "    unsigned tid = threadIdx.x;").unwrap();
         writeln!(s, "    unsigned warp = tid / 32u;").unwrap();
-        writeln!(s, "    unsigned wr = (warp / 2u) * 32u;").unwrap();
-        writeln!(s, "    unsigned wc = (warp % 2u) * 32u;").unwrap();
-        writeln!(
-            s,
-            "    wmma::fragment<wmma::accumulator, 16, 16, 8, float> acc[{n_outs}][2][2];"
-        )
-        .unwrap();
-        writeln!(s, "    for (int w = 0; w < {n_outs}; w++) for (int i = 0; i < 2; i++) for (int j = 0; j < 2; j++) wmma::fill_fragment(acc[w][i][j], 0.0f);").unwrap();
-        writeln!(
-            s,
-            "    for (unsigned k0 = k_begin; k0 < k_end; k0 += {CHUNK}u) {{"
-        )
-        .unwrap();
-        // staging, walking the buffer in address order
+        writeln!(s, "    unsigned lane = tid % 32u;").unwrap();
+        writeln!(s, "    unsigned gq = lane / 4u, tq = lane % 4u;").unwrap();
+        writeln!(s, "    unsigned wr = (warp / {}u) * {wtm}u;", sh.warps_n).unwrap();
+        writeln!(s, "    unsigned wc = (warp % {}u) * {wtn}u;", sh.warps_n).unwrap();
+        writeln!(s, "    float acc[{n_outs}][{fm}][{fnn}][4];").unwrap();
+        writeln!(s, "    #pragma unroll").unwrap();
+        writeln!(s, "    for (int w = 0; w < {n_outs}; w++) for (int i = 0; i < {fm}; i++) for (int j = 0; j < {fnn}; j++) for (int r = 0; r < 4; r++) acc[w][i][j][r] = 0.0f;").unwrap();
+
+        // staging of one chunk into buffer `buf`, walking the global
+        // buffer in address order
+        writeln!(s, "    auto load = [&](unsigned buf, unsigned k0) {{").unwrap();
+        writeln!(s, "        float* st = smem + buf * {stage_floats}u;").unwrap();
         let stage = |s: &mut String,
-                     name: &str,
+                     off: usize,
                      base: &str,
                      addr: &super::msl_mma::Addr,
                      pdim: usize,
                      origin: &str,
                      extent: usize,
+                     block: usize,
                      buf: usize,
                      map: Option<usize>,
                      row_major: bool| {
             let (cp, ck) = (addr.coefs[pdim], addr.coefs[kdim]);
+            let slot = |pt: &str, kk: &str| {
+                if row_major {
+                    format!("st + {off}u + {pt} * {lda}u + {kk}")
+                } else {
+                    format!("st + {off}u + {kk} * {ldb}u + {pt}")
+                }
+            };
+            // 16-byte copies along the shared row: the global stride
+            // there is 1 and every vector start is 4-aligned and either
+            // wholly in range or wholly out
+            let lead_aligned = addr.offset % 4 == 0 && others.iter().all(|&d| addr.coefs[d] % 4 == 0);
+            let vec4 = map.is_none()
+                && lead_aligned
+                && if row_major {
+                    ck == 1 && cp % 4 == 0 && k_total % 4 == 0 && chunk % 4 == 0
+                } else {
+                    cp == 1 && ck % 4 == 0 && extent % 4 == 0 && block % 4 == 0
+                };
+            if vec4 {
+                let (inner, outer) = if row_major { (chunk, block) } else { (block, chunk) };
+                let nv = inner / 4;
+                let total = inner * outer / 4;
+                // a fixed trip count where the threads tile the block
+                // evenly: every thread keeps its column, rows step by a
+                // constant, and the index math hoists out of the k loop
+                let (o, i) = if row_major { ("pt", "kk") } else { ("kk", "pt") };
+                if total % threads == 0 && threads % nv == 0 {
+                    writeln!(s, "        #pragma unroll").unwrap();
+                    writeln!(
+                        s,
+                        "        for (unsigned q = 0u; q < {}u; q++) {{",
+                        total / threads
+                    )
+                    .unwrap();
+                    writeln!(
+                        s,
+                        "            unsigned {i} = (tid % {nv}u) * 4u; unsigned {o} = tid / {nv}u + q * {}u;",
+                        threads / nv
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(
+                        s,
+                        "        for (unsigned idx = tid; idx < {total}u; idx += {threads}u) {{"
+                    )
+                    .unwrap();
+                    writeln!(
+                        s,
+                        "            unsigned {i} = (idx % {nv}u) * 4u; unsigned {o} = idx / {nv}u;"
+                    )
+                    .unwrap();
+                }
+                writeln!(
+                    s,
+                    "            unsigned gp = {origin} + pt; unsigned gk = k0 + kk;"
+                )
+                .unwrap();
+                writeln!(s, "            bool ok = gp < {extent}u && gk < {k_total}u;").unwrap();
+                writeln!(
+                    s,
+                    "            tang_cp16({}, b{buf} + (ok ? (unsigned)({base} + {cp} * (int)gp + {ck} * (int)gk) : 0u), ok);",
+                    slot("pt", "kk")
+                )
+                .unwrap();
+                writeln!(s, "        }}").unwrap();
+                return;
+            }
             let k_inner = ck.unsigned_abs() <= cp.unsigned_abs();
             writeln!(
                 s,
-                "        for (unsigned idx = tid; idx < {}u; idx += {THREADS}u) {{",
-                BLOCK * CHUNK
+                "        for (unsigned idx = tid; idx < {}u; idx += {threads}u) {{",
+                block * chunk
             )
             .unwrap();
             if k_inner {
                 writeln!(
                     s,
-                    "            unsigned kk = idx % {CHUNK}u; unsigned pt = idx / {CHUNK}u;"
+                    "            unsigned kk = idx % {chunk}u; unsigned pt = idx / {chunk}u;"
                 )
                 .unwrap();
             } else {
                 writeln!(
                     s,
-                    "            unsigned pt = idx % {BLOCK}u; unsigned kk = idx / {BLOCK}u;"
+                    "            unsigned pt = idx % {block}u; unsigned kk = idx / {block}u;"
                 )
                 .unwrap();
             }
@@ -230,15 +388,12 @@ impl TensorGraph {
                 "            unsigned gp = {origin} + pt; unsigned gk = k0 + kk;"
             )
             .unwrap();
-            let slot = if row_major {
-                format!("pt * {LDA}u + kk")
-            } else {
-                format!("kk * {LDB}u + pt")
-            };
             let Some(v) = map else {
+                writeln!(s, "            bool ok = gp < {extent}u && gk < {k_total}u;").unwrap();
                 writeln!(
                     s,
-                    "            {name}[{slot}] = (gp < {extent}u && gk < {k_total}u) ? b{buf}[(unsigned)({base} + {cp} * (int)gp + {ck} * (int)gk)] : 0.0f;"
+                    "            tang_cp4({}, b{buf} + (ok ? (unsigned)({base} + {cp} * (int)gp + {ck} * (int)gk) : 0u), ok);",
+                    slot("pt", "kk")
                 )
                 .unwrap();
                 writeln!(s, "        }}").unwrap();
@@ -295,7 +450,7 @@ impl TensorGraph {
                 &mut body,
                 &mc.body,
                 &mc.body_outs,
-                &format!("{name}_"),
+                &format!("m{off}_"),
                 &|x| vals[x as usize].clone(),
             );
             for line in body.lines() {
@@ -308,18 +463,19 @@ impl TensorGraph {
             }
             writeln!(s, "                v = {};", outs[0]).unwrap();
             writeln!(s, "            }}").unwrap();
-            writeln!(s, "            {name}[{slot}] = v;").unwrap();
+            writeln!(s, "            *({}) = v;", slot("pt", "kk")).unwrap();
             writeln!(s, "        }}").unwrap();
         };
         for (t, (buf, addr, map)) in a_stages.iter().enumerate() {
             stage(
                 &mut s,
-                &format!("As{t}"),
+                t * a_floats,
                 &format!("base_a{t}"),
                 addr,
                 dy,
                 "row0",
                 m,
+                bm,
                 *buf,
                 *map,
                 true,
@@ -328,102 +484,165 @@ impl TensorGraph {
         for (t, (buf, addr, map)) in b_stages.iter().enumerate() {
             stage(
                 &mut s,
-                &format!("Bs{t}"),
+                a_stages.len() * a_floats + t * b_floats,
                 &format!("base_b{t}"),
                 addr,
                 dx,
                 "col0",
                 n,
+                bn,
                 *buf,
                 *map,
                 false,
             );
         }
-        writeln!(s, "        __syncthreads();").unwrap();
-        writeln!(
-            s,
-            "        for (unsigned kk = 0u; kk < {CHUNK}u; kk += 8u) {{"
-        )
-        .unwrap();
-        writeln!(s, "            wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> a[{}][2];", a_stages.len()).unwrap();
-        writeln!(s, "            wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::row_major> b[{}][2];", b_stages.len()).unwrap();
-        for t in 0..a_stages.len() {
-            writeln!(s, "            for (int i = 0; i < 2; i++) {{").unwrap();
-            writeln!(s, "                wmma::load_matrix_sync(a[{t}][i], As{t} + (wr + 16u * i) * {LDA}u + kk, {LDA}u);").unwrap();
-            writeln!(s, "                for (int e = 0; e < a[{t}][i].num_elements; e++) a[{t}][i].x[e] = wmma::__float_to_tf32(a[{t}][i].x[e]);").unwrap();
-            writeln!(s, "            }}").unwrap();
-        }
-        for t in 0..b_stages.len() {
-            writeln!(s, "            for (int j = 0; j < 2; j++) {{").unwrap();
-            writeln!(s, "                wmma::load_matrix_sync(b[{t}][j], Bs{t} + kk * {LDB}u + wc + 16u * j, {LDB}u);").unwrap();
-            writeln!(s, "                for (int e = 0; e < b[{t}][j].num_elements; e++) b[{t}][j].x[e] = wmma::__float_to_tf32(b[{t}][j].x[e]);").unwrap();
-            writeln!(s, "            }}").unwrap();
-        }
-        for (w, u) in uses.iter().enumerate() {
-            for (ai, bi) in u {
-                writeln!(s, "            for (int i = 0; i < 2; i++) for (int j = 0; j < 2; j++) wmma::mma_sync(acc[{w}][i][j], a[{ai}][i], b[{bi}][j], acc[{w}][i][j]);").unwrap();
+        writeln!(s, "        tang_cp_commit();").unwrap();
+        writeln!(s, "    }};").unwrap();
+
+        // fragments for k step `kk` of buffer `buf` into register set
+        // `par`. A reduction is order-free, so within each 8-wide k step
+        // the mma k slots (tq, tq + 4) read staged columns (2tq, 2tq + 1)
+        // of A and rows (2tq, 2tq + 1) of B: one float2 per A row pair.
+        // Columns are ours to place too: fragments (2jp, 2jp + 1) take
+        // staged columns 2gq and 2gq + 1 of their 16, one float2 per B row.
+        let n_a = a_stages.len();
+        let n_b = b_stages.len();
+        writeln!(s, "    unsigned af[2][{n_a}][{fm}][4];").unwrap();
+        writeln!(s, "    unsigned bf[2][{n_b}][{fnn}][2];").unwrap();
+        let frags = |s: &mut String, par: usize, buf: &str, kk: &str| {
+            writeln!(s, "        {{").unwrap();
+            writeln!(s, "        const float* st = smem + ({buf}) * {stage_floats}u;").unwrap();
+            for t in 0..n_a {
+                writeln!(s, "        #pragma unroll").unwrap();
+                writeln!(s, "        for (int i = 0; i < {fm}; i++) {{").unwrap();
+                writeln!(s, "            const float* p = st + {}u + (wr + 16u * i + gq) * {lda}u + ({kk}) + 2u * tq;", t * a_floats).unwrap();
+                writeln!(s, "            float2 lo = *(const float2*)p, hi = *(const float2*)(p + {}u);", 8 * lda).unwrap();
+                writeln!(s, "            af[{par}][{t}][i][0] = tang_tf32(lo.x); af[{par}][{t}][i][1] = tang_tf32(hi.x);").unwrap();
+                writeln!(s, "            af[{par}][{t}][i][2] = tang_tf32(lo.y); af[{par}][{t}][i][3] = tang_tf32(hi.y);").unwrap();
+                writeln!(s, "        }}").unwrap();
             }
+            for t in 0..n_b {
+                writeln!(s, "        #pragma unroll").unwrap();
+                writeln!(s, "        for (int jp = 0; jp < {}; jp++) {{", fnn / 2).unwrap();
+                writeln!(s, "            const float* p = st + {}u + (({kk}) + 2u * tq) * {ldb}u + wc + 16u * jp + 2u * gq;", n_a * a_floats + t * b_floats).unwrap();
+                writeln!(s, "            float2 r0 = *(const float2*)p, r1 = *(const float2*)(p + {ldb}u);").unwrap();
+                writeln!(s, "            bf[{par}][{t}][2 * jp][0] = tang_tf32(r0.x); bf[{par}][{t}][2 * jp][1] = tang_tf32(r1.x);").unwrap();
+                writeln!(s, "            bf[{par}][{t}][2 * jp + 1][0] = tang_tf32(r0.y); bf[{par}][{t}][2 * jp + 1][1] = tang_tf32(r1.y);").unwrap();
+                writeln!(s, "        }}").unwrap();
+            }
+            writeln!(s, "        }}").unwrap();
+        };
+        let mmas = |s: &mut String, par: usize| {
+            for (w, u) in uses.iter().enumerate() {
+                for (ai, bi) in u {
+                    writeln!(s, "        #pragma unroll").unwrap();
+                    writeln!(s, "        for (int i = 0; i < {fm}; i++) for (int j = 0; j < {fnn}; j++) tang_mma(acc[{w}][i][j], af[{par}][{ai}][i], bf[{par}][{bi}][j]);").unwrap();
+                }
+            }
+        };
+        let steps = chunk / 8;
+        if sh.stages >= 2 {
+            // a ring of `stages` buffers, chunk c + stages - 1 in flight
+            // while chunk c is multiplied; the fragments of the next k step
+            // load while this one's mma issue (across the chunk boundary
+            // too, after the one barrier per chunk)
+            let st = sh.stages;
+            writeln!(s, "    #pragma unroll").unwrap();
+            writeln!(s, "    for (unsigned c = 0u; c < {}u; c++) {{ if (c < n_chunks) load(c, k_begin + c * {chunk}u); else tang_cp_commit(); }}", st - 1).unwrap();
+            writeln!(s, "    tang_cp_wait<{}>();", st - 2).unwrap();
+            writeln!(s, "    __syncthreads();").unwrap();
+            writeln!(s, "    if (n_chunks > 0u) {{").unwrap();
+            frags(&mut s, 0, "0u", "0u");
+            writeln!(s, "    }}").unwrap();
+            writeln!(s, "    for (unsigned c = 0u; c < n_chunks; c++) {{").unwrap();
+            writeln!(s, "        unsigned nc = c + {}u;", st - 1).unwrap();
+            writeln!(s, "        if (nc < n_chunks) load(nc % {st}u, k_begin + nc * {chunk}u); else tang_cp_commit();").unwrap();
+            for ks in 0..steps {
+                let par = ks % 2;
+                if ks + 1 < steps {
+                    frags(&mut s, 1 - par, &format!("c % {st}u"), &format!("{}u", (ks + 1) * 8));
+                } else {
+                    writeln!(s, "        tang_cp_wait<{}>();", st - 2).unwrap();
+                    writeln!(s, "        __syncthreads();").unwrap();
+                    writeln!(s, "        if (c + 1u < n_chunks) {{").unwrap();
+                    frags(&mut s, 1 - par, &format!("(c + 1u) % {st}u"), "0u");
+                    writeln!(s, "        }}").unwrap();
+                }
+                mmas(&mut s, par);
+            }
+            if steps % 2 == 1 {
+                // odd step count: the next chunk's first fragments landed
+                // in set 1; move them to set 0
+                writeln!(s, "        #pragma unroll").unwrap();
+                writeln!(s, "        for (int t = 0; t < {n_a}; t++) for (int i = 0; i < {fm}; i++) for (int e = 0; e < 4; e++) af[0][t][i][e] = af[1][t][i][e];").unwrap();
+                writeln!(s, "        #pragma unroll").unwrap();
+                writeln!(s, "        for (int t = 0; t < {n_b}; t++) for (int j = 0; j < {fnn}; j++) for (int e = 0; e < 2; e++) bf[0][t][j][e] = bf[1][t][j][e];").unwrap();
+            }
+            writeln!(s, "    }}").unwrap();
+        } else {
+            writeln!(s, "    for (unsigned c = 0u; c < n_chunks; c++) {{").unwrap();
+            writeln!(s, "        load(0u, k_begin + c * {chunk}u);").unwrap();
+            writeln!(s, "        tang_cp_wait<0>();").unwrap();
+            writeln!(s, "        __syncthreads();").unwrap();
+            for ks in 0..steps {
+                frags(&mut s, 0, "0u", &format!("{}u", ks * 8));
+                mmas(&mut s, 0);
+            }
+            writeln!(s, "        __syncthreads();").unwrap();
+            writeln!(s, "    }}").unwrap();
         }
-        writeln!(s, "        }}").unwrap();
-        writeln!(s, "        __syncthreads();").unwrap();
-        writeln!(s, "    }}").unwrap();
-        if via_global {
-            let bb = BLOCK * BLOCK;
+
+        // the epilogue straight from the accumulators: element r of
+        // fragment (i, j) is row gq + 8·(r/2) and mma column 2·tq + r%2,
+        // staged column 2·(that) + j%2 of the fragment pair's 16
+        let bb = bm * bn;
+        let frag_loop = |s: &mut String| {
+            writeln!(s, "    #pragma unroll").unwrap();
+            writeln!(s, "    for (int i = 0; i < {fm}; i++)").unwrap();
+            writeln!(s, "    #pragma unroll").unwrap();
+            writeln!(s, "    for (int j = 0; j < {fnn}; j++)").unwrap();
+            writeln!(s, "    #pragma unroll").unwrap();
+            writeln!(s, "    for (int r = 0; r < 4; r++) {{").unwrap();
+            writeln!(s, "        unsigned lr = wr + 16u * i + gq + 8u * (r / 2);").unwrap();
+            writeln!(s, "        unsigned lc = wc + 16u * (j / 2) + 4u * tq + 2u * (r % 2) + (j % 2);").unwrap();
+        };
+        if splits > 1 {
             writeln!(
                 s,
                 "    float* part = tang_partial + (split * {n_base}u + tile) * {}u;",
                 n_outs * bb
             )
             .unwrap();
-            writeln!(s, "    for (int w = 0; w < {n_outs}; w++) for (int i = 0; i < 2; i++) for (int j = 0; j < 2; j++) wmma::store_matrix_sync(part + w * {bb}u + (wr + 16u * i) * {BLOCK}u + wc + 16u * j, acc[w][i][j], {BLOCK}u, wmma::mem_row_major);").unwrap();
+            frag_loop(&mut s);
+            writeln!(s, "        for (int w = 0; w < {n_outs}; w++) part[w * {bb}u + lr * {bn}u + lc] = acc[w][i][j][r];").unwrap();
+            writeln!(s, "    }}").unwrap();
             writeln!(s, "    __threadfence();").unwrap();
             writeln!(s, "    __syncthreads();").unwrap();
-            if splits > 1 {
-                writeln!(s, "    __shared__ unsigned last;").unwrap();
-                writeln!(s, "    if (tid == 0u) {{").unwrap();
-                writeln!(
-                    s,
-                    "        last = atomicAdd(&tang_arrived[tile], 1u) == {}u;",
-                    splits - 1
-                )
-                .unwrap();
-                writeln!(s, "        if (last) tang_arrived[tile] = 0u;").unwrap();
-                writeln!(s, "    }}").unwrap();
-                writeln!(s, "    __syncthreads();").unwrap();
-                writeln!(s, "    if (!last) return;").unwrap();
-                writeln!(s, "    __threadfence();").unwrap();
-            }
-        } else {
-            writeln!(s, "    for (int w = 0; w < {n_outs}; w++) for (int i = 0; i < 2; i++) for (int j = 0; j < 2; j++) wmma::store_matrix_sync(Cs + w * {}u + (wr + 16u * i) * {LDC}u + wc + 16u * j, acc[w][i][j], {LDC}u, wmma::mem_row_major);", BLOCK * LDC).unwrap();
+            writeln!(s, "    __shared__ unsigned last;").unwrap();
+            writeln!(s, "    if (tid == 0u) {{").unwrap();
+            writeln!(
+                s,
+                "        last = atomicAdd(&tang_arrived[tile], 1u) == {}u;",
+                splits - 1
+            )
+            .unwrap();
+            writeln!(s, "        if (last) tang_arrived[tile] = 0u;").unwrap();
+            writeln!(s, "    }}").unwrap();
             writeln!(s, "    __syncthreads();").unwrap();
+            writeln!(s, "    if (!last) return;").unwrap();
+            writeln!(s, "    __threadfence();").unwrap();
         }
-        writeln!(
-            s,
-            "    for (unsigned idx = tid; idx < {}u; idx += {THREADS}u) {{",
-            BLOCK * BLOCK
-        )
-        .unwrap();
-        writeln!(s, "        unsigned p{dy} = row0 + idx / {BLOCK}u;").unwrap();
-        writeln!(s, "        unsigned p{dx} = col0 + idx % {BLOCK}u;").unwrap();
+        frag_loop(&mut s);
+        writeln!(s, "        unsigned p{dy} = row0 + lr;").unwrap();
+        writeln!(s, "        unsigned p{dx} = col0 + lc;").unwrap();
         writeln!(s, "        if (p{dy} < {m}u && p{dx} < {n}u) {{").unwrap();
-        writeln!(
-            s,
-            "            unsigned cidx = (idx / {BLOCK}u) * {LDC}u + idx % {BLOCK}u;"
-        )
-        .unwrap();
         for w in 0..n_outs {
-            if via_global {
+            if splits > 1 {
                 // the splits in a fixed order: deterministic
-                let bb = BLOCK * BLOCK;
                 writeln!(s, "            float red{w} = 0.0f;").unwrap();
-                writeln!(s, "            for (unsigned sp = 0u; sp < {splits}u; sp++) red{w} += __ldcg(tang_partial + (sp * {n_base}u + tile) * {}u + {}u + idx);", n_outs * bb, w * bb).unwrap();
+                writeln!(s, "            for (unsigned sp = 0u; sp < {splits}u; sp++) red{w} += __ldcg(tang_partial + (sp * {n_base}u + tile) * {}u + {}u + lr * {bn}u + lc);", n_outs * bb, w * bb).unwrap();
             } else {
-                writeln!(
-                    s,
-                    "            float red{w} = Cs[{}u + cidx];",
-                    w * BLOCK * LDC
-                )
-                .unwrap();
+                writeln!(s, "            float red{w} = acc[{w}][i][j][r];").unwrap();
             }
         }
         let vals: Vec<String> = if epilogue {
@@ -476,6 +695,15 @@ impl TensorGraph {
     /// The CUDA tensor-core kernel for the one tiled matmul in `outputs`'
     /// program, with its read buffers in binding order. For the harness.
     pub fn cuda_mma_program(&self, outputs: &[TensorId]) -> Option<(String, Vec<TensorId>)> {
+        self.cuda_mma_program_shaped(outputs, MMA_SHAPES[0])
+    }
+
+    /// [`cuda_mma_program`](Self::cuda_mma_program) in block shape `sh`.
+    pub fn cuda_mma_program_shaped(
+        &self,
+        outputs: &[TensorId],
+        sh: MmaShape,
+    ) -> Option<(String, Vec<TensorId>)> {
         let live = self.live(outputs);
         for root in (0..self.nodes.len()).filter(|&i| live[i] && !self.nodes[i].inline) {
             if self.nodes[root].tile.0 == 0 {
@@ -491,7 +719,7 @@ impl TensorGraph {
                         && !matches!(self.nodes[j].op, super::Op::Iota(_) | super::Op::Reshape(_))
                 })
                 .collect();
-            if let Some(src) = self.cuda_mma_kernel(root, &reads) {
+            if let Some(src) = self.cuda_mma_kernel_shaped(root, &reads, sh) {
                 return Some((src, reads.iter().map(|&j| TensorId(j as u32)).collect()));
             }
         }
@@ -500,15 +728,16 @@ impl TensorGraph {
 }
 
 /// How many ways to split a tile's reduction (split-K): enough blocks to
-/// fill the device (about three 64×64 tiles resident per SM on 82 SMs)
-/// while every split keeps at least four chunks of the reduction.
-fn split_k(n_tiles: usize, k_total: usize) -> usize {
+/// fill the device (about three 64×64 tiles resident per SM on 82 SMs,
+/// fewer of the larger blocks) while every split keeps at least four
+/// chunks of the reduction.
+fn split_k(n_tiles: usize, k_total: usize, chunk: usize, block_area: usize) -> usize {
     let target: usize = std::env::var("TANG_SPLITK_TARGET")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(246);
+        .unwrap_or((246 * 64 * 64 / block_area).max(164));
     let mut s = 1;
-    while n_tiles * s * 2 <= target && k_total.div_ceil(CHUNK) >= s * 2 * 4 && s < 16 {
+    while n_tiles * s * 2 <= target && k_total.div_ceil(chunk) >= s * 2 * 4 && s < 16 {
         s *= 2;
     }
     s
