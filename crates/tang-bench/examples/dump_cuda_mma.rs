@@ -42,7 +42,7 @@ fn main() {
         })
         .collect();
     println!(
-        "#define TANG_LAUNCH(a, b, bias, out) tang_kernel<<<TANG_TILES, TANG_THREADS>>>({}, out)",
+        "#define TANG_LAUNCH(a, b, bias, out) main0<<<TANG_TILES, TANG_THREADS>>>({}, out, 0u)",
         names.join(", ")
     );
     print!("{src}");

@@ -5983,6 +5983,7 @@ name = "tang-bench"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "cudarc 0.16.6",
  "glam",
  "nalgebra",
  "rand 0.8.5",

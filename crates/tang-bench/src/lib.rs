@@ -1099,6 +1099,120 @@ pub mod ir_gpu {
 
 /// A whole transformer block derived from tensor IR, mirroring the
 /// hand-written `gpu_transformer_layer` prefill path in `gpu_inference`.
+
+/// Running a [`TensorGraph::to_cuda`](tang_compile::tensor::TensorGraph::to_cuda)
+/// program on an NVIDIA GPU through the CUDA driver (cudarc): nvrtc
+/// compiles each kernel — wmma tensor-core tiles and transpiled WGSL
+/// alike — and the kernels launch in program order on one stream.
+#[cfg(feature = "cuda")]
+pub mod ir_cuda {
+    use std::sync::Arc;
+
+    use cudarc::driver::{
+        CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+    };
+    use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
+    use tang_compile::tensor::wgsl::WgslProgram;
+    use tang_compile::tensor::TensorId;
+
+    pub struct CudaExecutable {
+        pub program: WgslProgram,
+        pub stream: Arc<CudaStream>,
+        buffers: Vec<CudaSlice<f32>>,
+        functions: Vec<CudaFunction>,
+    }
+
+    impl CudaExecutable {
+        /// Compile every kernel and allocate every buffer; inputs uploaded.
+        pub fn new(ctx: &Arc<CudaContext>, program: WgslProgram, inputs: &[&[f32]]) -> Self {
+            let stream = ctx.default_stream();
+            let buffers = program
+                .buffers
+                .iter()
+                .map(|b| match b.input {
+                    Some(k) => stream.memcpy_stod(inputs[k]).expect("upload"),
+                    None => stream.alloc_zeros::<f32>(b.len.max(1)).expect("alloc"),
+                })
+                .collect();
+            let include = std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".into());
+            let functions = program
+                .kernels
+                .iter()
+                .map(|k| {
+                    let opts = CompileOptions {
+                        arch: Some("sm_86"),
+                        include_paths: vec![format!("{include}/include")],
+                        ..Default::default()
+                    };
+                    let ptx = compile_ptx_with_opts(&k.source, opts)
+                        .unwrap_or_else(|e| panic!("nvrtc: {e:?}\n{}", k.source));
+                    let module = ctx.load_module(ptx).expect("load module");
+                    module
+                        .load_function(tang_compile::tensor::cuda::CUDA_ENTRY)
+                        .expect("entry")
+                })
+                .collect();
+            Self {
+                program,
+                stream,
+                buffers,
+                functions,
+            }
+        }
+
+        fn index(&self, t: TensorId) -> usize {
+            let t = self.program.storage(t);
+            self.program
+                .buffers
+                .iter()
+                .position(|b| b.node == t)
+                .expect("buffer")
+        }
+
+        /// Launch every kernel in order (asynchronously on the stream).
+        pub fn run(&self) {
+            for (k, f) in self.program.kernels.iter().zip(&self.functions) {
+                let groups = k.count.div_ceil(k.workgroup_size);
+                let cfg = LaunchConfig {
+                    grid_dim: (groups, 1, 1),
+                    block_dim: (k.workgroup_size, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut launch = self.stream.launch_builder(f);
+                for t in &k.reads {
+                    launch.arg(&self.buffers[self.index(*t)]);
+                }
+                launch.arg(&self.buffers[self.index(k.node)]);
+                launch.arg(&k.points);
+                unsafe { launch.launch(cfg) }.expect("launch");
+            }
+        }
+
+        pub fn read(&self, t: TensorId) -> Vec<f32> {
+            self.stream.synchronize().expect("sync");
+            self.stream
+                .memcpy_dtov(&self.buffers[self.index(t)])
+                .expect("download")
+        }
+
+        /// Milliseconds per run over `iters` launches of the whole program.
+        pub fn time(&self, ctx: &Arc<CudaContext>, iters: usize) -> f64 {
+            for _ in 0..3 {
+                self.run();
+            }
+            let start = ctx.new_event(None).expect("event");
+            let end = ctx.new_event(None).expect("event");
+            start.record(&self.stream).expect("record");
+            for _ in 0..iters {
+                self.run();
+            }
+            end.record(&self.stream).expect("record");
+            end.synchronize().expect("sync");
+            start.elapsed_ms(&end).expect("elapsed") as f64 / iters as f64
+        }
+    }
+}
+
 pub mod ir_block {
     use tang::Scalar;
     use tang_compile::tensor::{numel, Arg, Form, Monoid, TensorGraph, TensorId, View};

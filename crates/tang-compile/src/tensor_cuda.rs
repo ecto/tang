@@ -15,6 +15,7 @@ use std::fmt::Write;
 
 use super::msl::Bilinear;
 use super::tile::emit_scalar;
+use super::wgsl::{Target, WgslProgram};
 use super::{TensorGraph, TensorId};
 
 const BLOCK: usize = 64;
@@ -67,12 +68,14 @@ impl TensorGraph {
             .map(|&j| format!("const float* __restrict__ b{j}"))
             .collect();
         params.push("float* __restrict__ out".into());
+        params.push("unsigned count".into());
         writeln!(
             s,
-            "extern \"C\" __global__ void __launch_bounds__({THREADS}) tang_kernel({}) {{",
+            "extern \"C\" __global__ void __launch_bounds__({THREADS}) main0({}) {{",
             params.join(", ")
         )
         .unwrap();
+        writeln!(s, "    (void)count;").unwrap();
         writeln!(s, "    __shared__ __align__(32) float smem[{arena}];").unwrap();
         writeln!(s, "    float* As = smem;").unwrap();
         writeln!(s, "    float* Bs = smem + {}u;", BLOCK * LDA).unwrap();
@@ -270,4 +273,310 @@ impl TensorGraph {
 
 fn numel_pts(pts: &[usize]) -> usize {
     pts.iter().product()
+}
+
+/// The CUDA calling convention every kernel of a [`to_cuda`] program
+/// follows: `extern "C" __global__ void main0(const float* b{j}…, float* out,
+/// unsigned count)` with the reads in `WgslKernel::reads` order, launched
+/// as `count / workgroup_size` blocks of `workgroup_size` threads.
+pub const CUDA_ENTRY: &str = "main0";
+
+impl TensorGraph {
+    /// The program as CUDA C++ (for nvrtc): matmul-shaped tiles as wmma
+    /// tensor-core kernels, everything else the WGSL kernels transpiled.
+    /// Same `WgslProgram` shape — sources, reads, counts — so a runtime
+    /// drives both the same way.
+    pub fn to_cuda(&self, outputs: &[TensorId]) -> WgslProgram {
+        let mut program = self.to_program(outputs, Target::Wgsl);
+        for k in &mut program.kernels {
+            let root = k.node.index();
+            let reads: Vec<usize> = k.reads.iter().map(|t| t.index()).collect();
+            let native = if self.nodes[root].tile.0 > 0 {
+                self.cuda_mma_kernel(root, &reads)
+            } else {
+                None
+            };
+            match native {
+                Some(src) => {
+                    k.source = src;
+                    k.workgroup_size = THREADS as u32;
+                    k.count = {
+                        let n_tiles: usize = src_define(&k.source, "TANG_TILES");
+                        (n_tiles * THREADS) as u32
+                    };
+                }
+                None => k.source = wgsl_to_cuda(&k.source, k.workgroup_size),
+            }
+        }
+        program
+    }
+}
+
+fn src_define(src: &str, name: &str) -> usize {
+    src.lines()
+        .find_map(|l| l.strip_prefix(&format!("#define {name} ")))
+        .and_then(|v| v.trim().parse().ok())
+        .expect("define")
+}
+
+/// Generated WGSL is a small, regular language: typed `fn`s over `f32`,
+/// `u32` and `array<f32, N>`, `let`/`var` bindings, `for` loops over
+/// `u32`, workgroup arrays, and a `main` over builtin ids. That maps to
+/// CUDA C++ line by line with a short prelude (`Arr<N>` for arrays,
+/// `Vec4` for vec4, `select` as a macro) — no second emitter.
+pub fn wgsl_to_cuda(wgsl: &str, workgroup_size: u32) -> String {
+    let mut out = String::new();
+    out.push_str(CUDA_PRELUDE);
+    let mut reads: Vec<String> = Vec::new();
+    let mut body = String::new();
+    for line in wgsl.lines() {
+        let t = line.trim_start();
+        let indent = &line[..line.len() - t.len()];
+        if t.starts_with("struct Params") {
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("@group(0) @binding(") {
+            // `N) var<storage, read> bJ: array<f32>;`
+            if rest.contains("var<uniform>") {
+                continue;
+            }
+            let name = rest
+                .split("var<")
+                .nth(1)
+                .and_then(|r| r.split('>').nth(1))
+                .map(|r| {
+                    r.trim()
+                        .trim_end_matches(':')
+                        .split(':')
+                        .next()
+                        .unwrap()
+                        .trim()
+                        .to_string()
+                })
+                .expect("binding name");
+            if name == "out" {
+                body.push_str("__shared__ float* out;\n");
+            } else {
+                body.push_str(&format!("__shared__ const float* {name};\n"));
+                reads.push(name);
+            }
+            continue;
+        }
+        if t.starts_with("@compute") {
+            continue;
+        }
+        if t.starts_with("fn main(") {
+            let mut params: Vec<String> = reads
+                .iter()
+                .map(|n| format!("const float* p_{n}"))
+                .collect();
+            params.push("float* p_out".into());
+            params.push("unsigned count".into());
+            body.push_str(&format!(
+                "extern \"C\" __global__ void __launch_bounds__({workgroup_size}) main0({}) {{\n",
+                params.join(", ")
+            ));
+            body.push_str("    if (threadIdx.x == 0u) {\n");
+            for n in &reads {
+                body.push_str(&format!("        {n} = p_{n};\n"));
+            }
+            body.push_str("        out = p_out;\n        params.count = count;\n    }\n    __syncthreads();\n");
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("var<workgroup> ") {
+            // `name: array<T, N>;`
+            let (name, ty) = rest
+                .trim_end_matches(';')
+                .split_once(": ")
+                .expect("workgroup var");
+            body.push_str(&format!(
+                "{}__shared__ {};\n",
+                indent,
+                cuda_array_decl(name, ty)
+            ));
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("fn ") {
+            // `name(params) -> T {`
+            let (sig, ret) = rest.split_once(" -> ").expect("fn return");
+            let ret = ret.trim_end_matches(" {").trim_end_matches('{').trim();
+            let (name, params) = sig.split_once('(').expect("fn params");
+            let params = params.trim_end_matches(')');
+            let params: Vec<String> = params
+                .split(", ")
+                .filter(|p| !p.is_empty())
+                .map(|p| {
+                    let (n, ty) = p.split_once(": ").expect("param");
+                    format!("{} {n}", cuda_type(ty))
+                })
+                .collect();
+            body.push_str(&format!(
+                "{indent}__device__ __forceinline__ {} {name}({}) {{\n",
+                cuda_type(ret),
+                params.join(", ")
+            ));
+            continue;
+        }
+        body.push_str(indent);
+        body.push_str(&cuda_stmt(t));
+        body.push('\n');
+    }
+    out.push_str("__shared__ Params params;\n");
+    out.push_str(&body);
+    out
+}
+
+const CUDA_PRELUDE: &str = r#"// Auto-generated by tang-compile: WGSL kernel as CUDA C++
+struct Params { unsigned count; };
+template <int N> struct Arr {
+    float v[N];
+    __device__ __forceinline__ float& operator[](unsigned i) { return v[i]; }
+    __device__ __forceinline__ float operator[](unsigned i) const { return v[i]; }
+};
+struct Vec4 {
+    float v[4];
+    __device__ __forceinline__ float& operator[](unsigned i) { return v[i]; }
+    __device__ __forceinline__ float operator[](unsigned i) const { return v[i]; }
+};
+#define select(f, t, c) ((c) ? (t) : (f))
+__device__ __forceinline__ unsigned min(unsigned a, unsigned b) { return a < b ? a : b; }
+"#;
+
+fn cuda_type(ty: &str) -> String {
+    let ty = ty.trim();
+    if ty == "f32" {
+        return "float".into();
+    }
+    if ty == "u32" {
+        return "unsigned".into();
+    }
+    if ty == "i32" {
+        return "int".into();
+    }
+    if ty == "bool" {
+        return "bool".into();
+    }
+    if let Some(n) = ty
+        .strip_prefix("array<f32, ")
+        .and_then(|r| r.strip_suffix('>'))
+    {
+        return format!("Arr<{n}>");
+    }
+    if ty == "vec4<f32>" {
+        return "Vec4".into();
+    }
+    panic!("wgsl type {ty}")
+}
+
+/// `name: array<T, N>` → `T name[N]` (nested arrays nest)
+fn cuda_array_decl(name: &str, ty: &str) -> String {
+    let ty = ty.trim();
+    if let Some(inner) = ty.strip_prefix("array<").and_then(|r| r.strip_suffix('>')) {
+        // split at the last ", "
+        let (elem, n) = inner.rsplit_once(", ").expect("array len");
+        if elem.starts_with("array<") || elem == "vec4<f32>" || elem == "f32" {
+            let e = cuda_array_decl("", elem);
+            return format!("{} {name}[{n}]", e.trim());
+        }
+    }
+    format!("{} {name}", cuda_type(ty))
+}
+
+/// One statement line. Bindings become `auto`, typed `var`s their type,
+/// loops over `u32`, casts and constructors their C++ spellings.
+fn cuda_stmt(t: &str) -> String {
+    let mut s = t.to_string();
+    if let Some(rest) = s.strip_prefix("let ") {
+        s = format!("auto {rest}");
+    } else if let Some(rest) = s.strip_prefix("var ") {
+        // `var x: T = e;` or `var x: T;` or `var x = e;`
+        let (lhs, rhs) = match rest.split_once(" = ") {
+            Some((l, r)) => (l, Some(r)),
+            None => (rest.trim_end_matches(';'), None),
+        };
+        let decl = match lhs.split_once(": ") {
+            Some((n, ty)) => cuda_array_decl(n, ty),
+            None => format!("auto {lhs}"),
+        };
+        s = match rhs {
+            Some(r) => format!("{decl} = {r}"),
+            None => format!("{decl};"),
+        };
+    } else if let Some(rest) = s.strip_prefix("for (var ") {
+        // `for (var i: u32 = a; …`
+        let (n, rest) = rest.split_once(": u32 = ").expect("for var");
+        s = format!("for (unsigned {n} = {rest}");
+    }
+    s = s
+        .replace("array<f32, ", "Arr<")
+        .replace("vec4<f32>(", "Vec4{")
+        .replace("u32(", "(unsigned)(")
+        .replace("i32(", "(int)(")
+        .replace("f32(", "(float)(")
+        .replace("workgroupBarrier()", "__syncthreads()")
+        .replace("gid.x", "(blockIdx.x * blockDim.x + threadIdx.x)")
+        .replace("gid.y", "blockIdx.y")
+        .replace("wid.x", "blockIdx.x")
+        .replace("wid.y", "blockIdx.y")
+        .replace("lid.x", "threadIdx.x");
+    // `Arr<N>(a, b)` → `Arr<N>{{a, b}}`; `Vec4{a, …)` → `Vec4{{a, …}}`
+    s = rewrite_ctor(&s, "Arr<");
+    s = rewrite_ctor(&s, "Vec4{");
+    s
+}
+
+/// Turn `PREFIX…(args)` constructor calls into brace initialization.
+fn rewrite_ctor(s: &str, prefix: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(i) = rest.find(prefix) {
+        out.push_str(&rest[..i]);
+        let after = &rest[i..];
+        // find the opening paren/brace of the argument list
+        let open = if prefix.ends_with('{') {
+            prefix.len() - 1
+        } else {
+            match after.find('(') {
+                Some(p)
+                    if after[..p].chars().all(|c| c != ' ' || true) && after[..p].contains('>') =>
+                {
+                    p
+                }
+                _ => {
+                    out.push_str(&after[..prefix.len()]);
+                    rest = &after[prefix.len()..];
+                    continue;
+                }
+            }
+        };
+        // Arr<N> followed by a space (a declaration), not a constructor
+        if !prefix.ends_with('{') && after[..open].contains(' ') {
+            out.push_str(&after[..prefix.len()]);
+            rest = &after[prefix.len()..];
+            continue;
+        }
+        let mut depth = 0usize;
+        let mut close = None;
+        for (k, ch) in after[open..].char_indices() {
+            match ch {
+                '(' | '{' => depth += 1,
+                ')' | '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + k);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let close = close.expect("ctor close");
+        out.push_str(&after[..open]);
+        out.push_str("{{");
+        out.push_str(&after[open + 1..close]);
+        out.push_str("}}");
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    out
 }
