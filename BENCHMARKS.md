@@ -581,3 +581,19 @@ moves again (per-kernel autotune, fresh cache):
 
 (3090 hand numbers in this run are ~50% above the earlier run on the same
 code; that box was not idle. The derived column moved by the same factor.)
+
+### `schedule_auto` after the second chip
+
+With the register-tiled matmul in its rules, `schedule_auto` alone — no
+measurement — now beats the hand path on both chips:
+
+| block, rules only | hand | derived (`schedule_auto`) |
+|---|---|---|
+| M4 seq 128 | 5.87 ms | **3.44 ms** |
+| M4 seq 512 | 23.9 ms | **5.55 ms** |
+| 3090 seq 128 | 3.05 ms | **2.61 ms** |
+| 3090 seq 512 | 10.8 ms | **5.58 ms** |
+| matmul 1024², M4 | 6.81 ms | **4.61 ms** |
+| matmul 1024², 3090 | 2.27 ms | **1.90 ms** |
+
+The tuner still exists for the next chip; the rules are what it found.
