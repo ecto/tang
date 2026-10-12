@@ -679,7 +679,7 @@ struct Flash {
     kd: usize,
 }
 
-use super::msl::Addr;
+use super::msl_mma::Addr;
 use super::vars_reachable;
 use super::{Arg, Op};
 use tang_expr::Node as ENode;
