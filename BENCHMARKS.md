@@ -597,3 +597,13 @@ measurement — now beats the hand path on both chips:
 | matmul 1024², 3090 | 2.27 ms | **1.90 ms** |
 
 The tuner still exists for the next chip; the rules are what it found.
+
+### Training step at seq 512
+
+| | hand fwd+bwd | derived fwd+bwd |
+|---|---|---|
+| M4 Max | 1.01 s | **17.5 ms** |
+| RTX 3090 | 1.15 s | **11.3 ms** |
+
+The hand path's CPU-side attention backward is quadratic in sequence
+length; the derived one is a graph like any other.
