@@ -86,7 +86,10 @@ agrees there.
 same monoid, read by the same consumers, are one reduction under the
 product monoid (`merge_siblings`): the gate and up projections of a
 SwiGLU MLP become one tuple-valued comp, their activation becomes its
-epilogue, and the normed input is read once.
+epilogue, and the normed input is read once. Siblings that read the same
+big map `schedule_auto` will recompute in each reader (dS, read by both
+rope halves of dQ) merge too, so it is recomputed once; `split_reduce_dims`
+runs the merge again for siblings the layout passes expose.
 
 **Flash attention is a rewrite.** Online softmax is a monoid over
 `(max, sum, acc…)`. `stabilize_softmax` finds `m = max_j s` and every
@@ -323,12 +326,12 @@ schedule space; the compiler searches it.
   `to_msl`). The f32 Metal tile does not beat the WGSL register tile on
   an M4, so `pick_backend` only weighs WGSL against the native f16
   backend.
-- CUDA: `to_cuda` emits whole programs (wmma TF32 tiles plus the other
-  kernels transpiled from their WGSL) that `tang_gpu::program` runs
-  through cudarc (above). The block forward runs in 0.62 ms at seq 128 on a 3090
-  with six kernels on tensor cores — the five matmul-shaped tiles and the
-  fused attention, which `cuda_flash_kernel` lowers to a wmma flash
-  kernel from the comp's structure. CUDA buffers do not interoperate
+- CUDA: `to_cuda` emits whole programs (`mma.sync` TF32 tiles plus the
+  other kernels transpiled from their WGSL) that `tang_gpu::program` runs
+  through cudarc (above). The matmul-shaped tiles and the fused attention
+  run on tensor cores; `cuda_flash_kernel` lowers the attention from the
+  comp's structure to a flash kernel with O and the softmax state in
+  `mma` registers (BENCHMARKS.md, "Flash attention on `mma.sync`"). CUDA buffers do not interoperate
   with wgpu ones (host copies at the boundary), and the lowering does not
   yet read the precision schedule (f16/bf16 wmma).
 - Scatter gradients reduce over the whole source coordinate they gate on;

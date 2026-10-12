@@ -2597,9 +2597,10 @@ pub mod ir_block {
         /// the state-materializing online-softmax forward (score read from
         /// its buffer) as a flash tile writing `(m, l, acc)`, and the
         /// dQ/dK contractions with dS recomputed in the staging of every
-        /// tile instead of read from a buffer.
+        /// tile instead of read from a buffer, the two dQ halves merged
+        /// into one tile so dS is recomputed once for both.
         #[test]
-        fn training_attention_lowers_to_wmma() {
+        fn training_attention_lowers_to_tensor_cores() {
             let dims = BlockDims {
                 seq: 128,
                 kv_len: 128,
@@ -2624,12 +2625,12 @@ pub mod ir_block {
             let flash: Vec<_> = p
                 .kernels
                 .iter()
-                .filter(|k| k.source.contains("flash attention on wmma"))
+                .filter(|k| k.source.contains("flash attention on mma"))
                 .collect();
             assert_eq!(flash.len(), 1, "the online-softmax forward");
-            assert!(flash[0].source.contains("out[g * 3u + 1u] = l_row;"));
+            assert!(flash[0].source.contains("out[g * 3u + 1u] = l_v;"));
             // causal key tiles are skipped, derived from the mask
-            assert!(flash[0].source.contains("continue;"));
+            assert!(flash[0].source.contains("c_lo = min(c_lo, c)"));
             // dS is a map staged in place in the dQ/dK tiles: the tiles
             // read every tensor it is a pointwise function of
             let recomputed = p
@@ -2637,7 +2638,7 @@ pub mod ir_block {
                 .iter()
                 .filter(|k| k.source.contains("mma (TF32) tile") && k.source.contains("exp2("))
                 .count();
-            assert_eq!(recomputed, 3, "dK (both rope halves) and two dQ halves");
+            assert_eq!(recomputed, 2, "dK and dQ, each both rope halves");
         }
 
         /// The whole block is differentiable: gradients of `sum(out)`
