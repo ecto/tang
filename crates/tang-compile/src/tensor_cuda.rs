@@ -23,9 +23,10 @@ use super::{TensorGraph, TensorId};
 /// A tensor-core tile's block shape: a `bm × bn` output block per thread
 /// block of `warps_m × warps_n` warps (each a `bm/warps_m × bn/warps_n`
 /// warp tile of 16×8 `mma` fragments), the reduction staged `chunk` at a
-/// time through `stages` shared-memory buffers (2: the next chunk's copy,
-/// `cp.async` where the operand is a plain read, overlaps this chunk's
-/// math).
+/// time through a ring of `stages` shared-memory buffers (`cp.async`
+/// where the operand is a plain read, so the next chunks' copies overlap
+/// this chunk's math), and split-K up to about `split_target` blocks
+/// (1: never split).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MmaShape {
     pub bm: usize,
@@ -34,6 +35,7 @@ pub struct MmaShape {
     pub warps_n: usize,
     pub chunk: usize,
     pub stages: usize,
+    pub split_target: usize,
 }
 
 impl MmaShape {
@@ -44,8 +46,15 @@ impl MmaShape {
             warps_m,
             warps_n,
             chunk: 32,
-            stages: 2,
+            stages: 3,
+            split_target: 100,
         }
+    }
+    const fn with(mut self, chunk: usize, stages: usize, split_target: usize) -> Self {
+        self.chunk = chunk;
+        self.stages = stages;
+        self.split_target = split_target;
+        self
     }
     fn threads(&self) -> usize {
         32 * self.warps_m * self.warps_n
@@ -65,13 +74,16 @@ impl MmaShape {
 }
 
 /// The block shapes a tuner chooses between, per kernel; the first is the
-/// default. 64×64 / 4 warps suits small outputs (more blocks to fill the
-/// device), 128×128 / 8 warps large ones (half the staging per flop).
-pub const MMA_SHAPES: [MmaShape; 4] = [
+/// default. 64×64 on four warps fills the device at the model's sizes;
+/// the larger blocks halve the staging per flop where there are enough
+/// output tiles; split-K only pays when tiles are very few.
+pub const MMA_SHAPES: [MmaShape; 6] = [
     MmaShape::new(64, 64, 2, 2),
-    MmaShape::new(128, 128, 2, 4),
-    MmaShape::new(128, 64, 4, 2),
-    MmaShape::new(64, 128, 2, 4),
+    MmaShape::new(64, 64, 2, 2).with(32, 3, 1),
+    MmaShape::new(64, 64, 2, 2).with(16, 4, 1),
+    MmaShape::new(64, 64, 2, 2).with(32, 2, 246),
+    MmaShape::new(128, 64, 2, 2),
+    MmaShape::new(128, 128, 2, 4).with(32, 2, 100),
 ];
 
 /// The PTX helpers the tensor-core kernels share: TF32 rounding, `mma`
@@ -175,7 +187,7 @@ impl TensorGraph {
         let tiles_x = n.div_ceil(bn);
         let tiles_y = m.div_ceil(bm);
         let n_base = tiles_x * tiles_y * others.iter().map(|&d| pts[d]).product::<usize>();
-        let splits = split_k(n_base, k_total, chunk, bm * bn);
+        let splits = split_k(n_base, k_total, chunk, sh.split_target);
         let n_tiles = n_base * splits;
         let w_out = c.width();
         let a_floats = bm * lda;
@@ -306,23 +318,32 @@ impl TensorGraph {
             // 16-byte copies along the shared row: the global stride
             // there is 1 and every vector start is 4-aligned and either
             // wholly in range or wholly out
-            let lead_aligned = addr.offset % 4 == 0 && others.iter().all(|&d| addr.coefs[d] % 4 == 0);
+            let lead_aligned =
+                addr.offset % 4 == 0 && others.iter().all(|&d| addr.coefs[d] % 4 == 0);
             let vec4 = map.is_none()
                 && lead_aligned
                 && if row_major {
                     ck == 1 && cp % 4 == 0 && k_total % 4 == 0 && chunk % 4 == 0
                 } else {
-                    cp == 1 && ck % 4 == 0 && extent % 4 == 0 && block % 4 == 0
+                    cp == 1 && ck % 4 == 0 && extent.is_multiple_of(4) && block.is_multiple_of(4)
                 };
             if vec4 {
-                let (inner, outer) = if row_major { (chunk, block) } else { (block, chunk) };
+                let (inner, outer) = if row_major {
+                    (chunk, block)
+                } else {
+                    (block, chunk)
+                };
                 let nv = inner / 4;
                 let total = inner * outer / 4;
                 // a fixed trip count where the threads tile the block
                 // evenly: every thread keeps its column, rows step by a
                 // constant, and the index math hoists out of the k loop
-                let (o, i) = if row_major { ("pt", "kk") } else { ("kk", "pt") };
-                if total % threads == 0 && threads % nv == 0 {
+                let (o, i) = if row_major {
+                    ("pt", "kk")
+                } else {
+                    ("kk", "pt")
+                };
+                if total % threads == 0 && threads.is_multiple_of(nv) {
                     writeln!(s, "        #pragma unroll").unwrap();
                     writeln!(
                         s,
@@ -353,7 +374,11 @@ impl TensorGraph {
                     "            unsigned gp = {origin} + pt; unsigned gk = k0 + kk;"
                 )
                 .unwrap();
-                writeln!(s, "            bool ok = gp < {extent}u && gk < {k_total}u;").unwrap();
+                writeln!(
+                    s,
+                    "            bool ok = gp < {extent}u && gk < {k_total}u;"
+                )
+                .unwrap();
                 writeln!(
                     s,
                     "            tang_cp16({}, b{buf} + (ok ? (unsigned)({base} + {cp} * (int)gp + {ck} * (int)gk) : 0u), ok);",
@@ -389,7 +414,11 @@ impl TensorGraph {
             )
             .unwrap();
             let Some(v) = map else {
-                writeln!(s, "            bool ok = gp < {extent}u && gk < {k_total}u;").unwrap();
+                writeln!(
+                    s,
+                    "            bool ok = gp < {extent}u && gk < {k_total}u;"
+                )
+                .unwrap();
                 writeln!(
                     s,
                     "            tang_cp4({}, b{buf} + (ok ? (unsigned)({base} + {cp} * (int)gp + {ck} * (int)gk) : 0u), ok);",
@@ -511,12 +540,21 @@ impl TensorGraph {
         writeln!(s, "    unsigned bf[2][{n_b}][{fnn}][2];").unwrap();
         let frags = |s: &mut String, par: usize, buf: &str, kk: &str| {
             writeln!(s, "        {{").unwrap();
-            writeln!(s, "        const float* st = smem + ({buf}) * {stage_floats}u;").unwrap();
+            writeln!(
+                s,
+                "        const float* st = smem + ({buf}) * {stage_floats}u;"
+            )
+            .unwrap();
             for t in 0..n_a {
                 writeln!(s, "        #pragma unroll").unwrap();
                 writeln!(s, "        for (int i = 0; i < {fm}; i++) {{").unwrap();
                 writeln!(s, "            const float* p = st + {}u + (wr + 16u * i + gq) * {lda}u + ({kk}) + 2u * tq;", t * a_floats).unwrap();
-                writeln!(s, "            float2 lo = *(const float2*)p, hi = *(const float2*)(p + {}u);", 8 * lda).unwrap();
+                writeln!(
+                    s,
+                    "            float2 lo = *(const float2*)p, hi = *(const float2*)(p + {}u);",
+                    8 * lda
+                )
+                .unwrap();
                 writeln!(s, "            af[{par}][{t}][i][0] = tang_tf32(lo.x); af[{par}][{t}][i][1] = tang_tf32(hi.x);").unwrap();
                 writeln!(s, "            af[{par}][{t}][i][2] = tang_tf32(lo.y); af[{par}][{t}][i][3] = tang_tf32(hi.y);").unwrap();
                 writeln!(s, "        }}").unwrap();
@@ -525,7 +563,11 @@ impl TensorGraph {
                 writeln!(s, "        #pragma unroll").unwrap();
                 writeln!(s, "        for (int jp = 0; jp < {}; jp++) {{", fnn / 2).unwrap();
                 writeln!(s, "            const float* p = st + {}u + (({kk}) + 2u * tq) * {ldb}u + wc + 16u * jp + 2u * gq;", n_a * a_floats + t * b_floats).unwrap();
-                writeln!(s, "            float2 r0 = *(const float2*)p, r1 = *(const float2*)(p + {ldb}u);").unwrap();
+                writeln!(
+                    s,
+                    "            float2 r0 = *(const float2*)p, r1 = *(const float2*)(p + {ldb}u);"
+                )
+                .unwrap();
                 writeln!(s, "            bf[{par}][{t}][2 * jp][0] = tang_tf32(r0.x); bf[{par}][{t}][2 * jp][1] = tang_tf32(r1.x);").unwrap();
                 writeln!(s, "            bf[{par}][{t}][2 * jp + 1][0] = tang_tf32(r0.y); bf[{par}][{t}][2 * jp + 1][1] = tang_tf32(r1.y);").unwrap();
                 writeln!(s, "        }}").unwrap();
@@ -560,7 +602,12 @@ impl TensorGraph {
             for ks in 0..steps {
                 let par = ks % 2;
                 if ks + 1 < steps {
-                    frags(&mut s, 1 - par, &format!("c % {st}u"), &format!("{}u", (ks + 1) * 8));
+                    frags(
+                        &mut s,
+                        1 - par,
+                        &format!("c % {st}u"),
+                        &format!("{}u", (ks + 1) * 8),
+                    );
                 } else {
                     writeln!(s, "        tang_cp_wait<{}>();", st - 2).unwrap();
                     writeln!(s, "        __syncthreads();").unwrap();
@@ -604,7 +651,11 @@ impl TensorGraph {
             writeln!(s, "    #pragma unroll").unwrap();
             writeln!(s, "    for (int r = 0; r < 4; r++) {{").unwrap();
             writeln!(s, "        unsigned lr = wr + 16u * i + gq + 8u * (r / 2);").unwrap();
-            writeln!(s, "        unsigned lc = wc + 16u * (j / 2) + 4u * tq + 2u * (r % 2) + (j % 2);").unwrap();
+            writeln!(
+                s,
+                "        unsigned lc = wc + 16u * (j / 2) + 4u * tq + 2u * (r % 2) + (j % 2);"
+            )
+            .unwrap();
         };
         if splits > 1 {
             writeln!(
@@ -727,15 +778,14 @@ impl TensorGraph {
     }
 }
 
-/// How many ways to split a tile's reduction (split-K): enough blocks to
-/// fill the device (about three 64×64 tiles resident per SM on 82 SMs,
-/// fewer of the larger blocks) while every split keeps at least four
-/// chunks of the reduction.
-fn split_k(n_tiles: usize, k_total: usize, chunk: usize, block_area: usize) -> usize {
+/// How many ways to split a tile's reduction (split-K): up to `target`
+/// blocks (the shape's, or `TANG_SPLITK_TARGET`) while every split keeps
+/// at least four chunks of the reduction.
+fn split_k(n_tiles: usize, k_total: usize, chunk: usize, target: usize) -> usize {
     let target: usize = std::env::var("TANG_SPLITK_TARGET")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or((246 * 64 * 64 / block_area).max(164));
+        .unwrap_or(target);
     let mut s = 1;
     while n_tiles * s * 2 <= target && k_total.div_ceil(chunk) >= s * 2 * 4 && s < 16 {
         s *= 2;
@@ -754,7 +804,7 @@ fn numel_pts(pts: &[usize]) -> usize {
 pub const CUDA_ENTRY: &str = "main0";
 
 impl TensorGraph {
-    /// The program as CUDA C++ (for nvrtc): matmul-shaped tiles as wmma
+    /// The program as CUDA C++ (for nvrtc): matmul-shaped tiles as mma
     /// tensor-core kernels, everything else the WGSL kernels transpiled.
     /// Same `WgslProgram` shape — sources, reads, counts — so a runtime
     /// drives both the same way.
@@ -766,15 +816,23 @@ impl TensorGraph {
     /// lowerings on or off. Both programs have the same kernels in the
     /// same order with the same bindings, so a tuner can pick per kernel.
     pub fn to_cuda_with(&self, outputs: &[TensorId], native: bool) -> WgslProgram {
+        self.to_cuda_variant(outputs, native.then_some(0))
+    }
+
+    /// [`to_cuda`](Self::to_cuda) with the matmul tiles in block shape
+    /// `MMA_SHAPES[v]`, or every kernel transpiled for `None`. All
+    /// variants have the same kernels in the same order with the same
+    /// bindings, so a tuner can pick a variant per kernel.
+    pub fn to_cuda_variant(&self, outputs: &[TensorId], variant: Option<usize>) -> WgslProgram {
         let mut program = self.to_program_numbered(outputs, Target::Wgsl);
         for k in &mut program.kernels {
             let root = k.node.index();
             let reads: Vec<usize> = k.reads.iter().map(|t| t.index()).collect();
-            let native = if native && self.nodes[root].tile.0 > 0 {
-                self.cuda_mma_kernel(root, &reads)
-                    .or_else(|| self.cuda_flash_kernel(root, &reads))
-            } else {
-                None
+            let native = match variant {
+                Some(v) if self.nodes[root].tile.0 > 0 => self
+                    .cuda_mma_kernel_shaped(root, &reads, MMA_SHAPES[v])
+                    .or_else(|| self.cuda_flash_kernel(root, &reads)),
+                _ => None,
             };
             match native {
                 Some(src) => {
@@ -1383,6 +1441,30 @@ impl TensorGraph {
     /// and `O += P·V` as wmma TF32 fragments, the online softmax in
     /// between on the stored score block, the comp's mask, value and
     /// normalizer expressions evaluated where they belong.
+    /// A lead dim of the flash tile that neither the keys nor anything
+    /// else of the reduction but the queries depends on, for
+    /// `cuda_flash_kernel` to fold into its rows (grouped-query heads).
+    fn flash_fold(&self, f: &Flash, rc: &super::Comp) -> Option<usize> {
+        if f.score_buf.is_some() || std::env::var_os("TANG_FLASH_NOFOLD").is_some() {
+            return None;
+        }
+        let rank = rc.rank();
+        f.others.iter().copied().rev().find(|&fd| {
+            f.pts[fd] > 1
+                && f.terms.iter().all(|(_, _, _, ka)| {
+                    (0..f.score_to_red.len())
+                        .all(|sd| f.score_to_red[sd] != fd || ka.coefs[sd] == 0)
+                })
+                && rc.args.iter().enumerate().all(|(k, a)| {
+                    k == f.score_arg
+                        || match &self.nodes[a.src.n()].op {
+                            Op::Iota(dd) => a.view.forms[*dd].coefs[fd] == 0,
+                            _ => self.flat_addr(a, rank).coefs[fd] == 0,
+                        }
+                })
+        })
+    }
+
     pub fn cuda_flash_kernel(&self, root: usize, reads: &[usize]) -> Option<String> {
         let f = self.flash_tile(root, reads)?;
         let c = self.comp_at(root)?;
@@ -1395,22 +1477,56 @@ impl TensorGraph {
         // that keeps about two blocks per SM (82 SMs), else two (one warp
         // per block measured slower: V is staged once per 16 rows)
         let lead: usize = f.others.iter().map(|&d| f.pts[d]).product();
-        let bi = if f.m.div_ceil(64) * lead >= 164 {
-            64
-        } else {
-            32
+        // a lead dim the keys and values do not depend on (the query
+        // heads sharing a grouped K/V head) folds into the block's rows:
+        // K and V are staged once for all of them
+        let fold = self.flash_fold(&f, rc);
+        let nf = fold.map_or(1, |fd| f.pts[fd]);
+        let bi = match std::env::var("TANG_FLASH_BI")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            Some(b) => b,
+            None if fold.is_some() => {
+                // the largest query slice that still fills the device
+                let blocks = |b: usize| f.m.div_ceil(b) * lead / nf;
+                [64, 32, 16]
+                    .into_iter()
+                    .find(|&b| blocks(b) >= 82 && nf * b <= 128)
+                    .unwrap_or(16)
+            }
+            None if f.m.div_ceil(64) * lead >= 164 => 64,
+            None => 32,
         };
+        // BI queries of each of the nf folded heads: R rows, 16 per warp
         #[allow(non_snake_case)]
-        let (BI, T) = (bi, 2 * bi);
+        let (BI, R) = (bi, nf * bi);
+        #[allow(non_snake_case)]
+        let T = 2 * R;
+        if R % 16 != 0 || T > 1024 {
+            return None;
+        }
         let d = f.d_lanes;
         let kd = f.kd;
         let nq = kd / 8;
         let (ldk, lds, ldv, ldo) = (kd + 8, BJ + 8, d + 8, d + 8);
         let n_terms = f.terms.len();
-        let ks_floats = (n_terms * BJ * ldk).max(BI * ldk * n_terms);
-        let smem_floats = ks_floats + BJ * lds + BJ * ldv + BI * ldo;
+        let ks_floats = (n_terms * BJ * ldk).max(R * ldk * n_terms);
+        let smem_floats = ks_floats + R.max(BJ) * lds + BJ * ldv + R * ldo;
+        if smem_floats * 4 > 99 * 1024 {
+            return None;
+        }
         let tiles_i = f.m.div_ceil(BI);
-        let n_tiles = tiles_i * f.others.iter().map(|&d| f.pts[d]).product::<usize>();
+        let n_tiles = tiles_i * lead / nf;
+        // the row's query and folded head, where per-row code needs them
+        let row_coords = |s: &mut String, indent: &str, r: &str| match fold {
+            Some(fd) => writeln!(
+                s,
+                "{indent}unsigned p{fd} = {r} / {BI}u; unsigned ii = i0 + {r} % {BI}u;"
+            )
+            .unwrap(),
+            None => writeln!(s, "{indent}unsigned ii = i0 + {r};").unwrap(),
+        };
         let w_out = c.width();
 
         // coordinate names in the reduction's space
@@ -1492,13 +1608,13 @@ impl TensorGraph {
         writeln!(s, "    extern __shared__ __align__(32) float smem[];").unwrap();
         writeln!(s, "    float* Ks = smem;").unwrap();
         writeln!(s, "    float* Ss = smem + {ks_floats};").unwrap();
-        writeln!(s, "    float* Vs = Ss + {};", BJ * lds).unwrap();
+        writeln!(s, "    float* Vs = Ss + {};", R.max(BJ) * lds).unwrap();
         writeln!(s, "    float* Os = Vs + {};", BJ * ldv).unwrap();
         writeln!(s, "    unsigned tile = blockIdx.x;").unwrap();
         writeln!(s, "    if (tile >= {n_tiles}u) return;").unwrap();
         writeln!(s, "    unsigned tile_i = tile % {tiles_i}u;").unwrap();
         writeln!(s, "    unsigned lead = tile / {tiles_i}u;").unwrap();
-        for &dim in f.others.iter().rev() {
+        for &dim in f.others.iter().rev().filter(|&&dim| Some(dim) != fold) {
             writeln!(s, "    unsigned p{dim} = lead % {}u;", f.pts[dim]).unwrap();
             writeln!(s, "    lead = lead / {}u;", f.pts[dim]).unwrap();
         }
@@ -1512,11 +1628,11 @@ impl TensorGraph {
             writeln!(
                 s,
                 "    for (unsigned idx = tid; idx < {}u; idx += {T}u) {{",
-                n_terms * BI * kd
+                n_terms * R * kd
             )
             .unwrap();
-            writeln!(s, "        unsigned t = idx / {}u; unsigned r = (idx / {kd}u) % {BI}u; unsigned dd = idx % {kd}u;", BI * kd).unwrap();
-            writeln!(s, "        unsigned ii = i0 + r;").unwrap();
+            writeln!(s, "        unsigned t = idx / {}u; unsigned r = (idx / {kd}u) % {R}u; unsigned dd = idx % {kd}u;", R * kd).unwrap();
+            row_coords(&mut s, "        ", "r");
             writeln!(s, "        float v = 0.0f;").unwrap();
             writeln!(s, "        if (ii < {}u) {{", f.m).unwrap();
             for (t, (qb, qa, _, _)) in f.terms.iter().enumerate() {
@@ -1528,7 +1644,7 @@ impl TensorGraph {
                 .unwrap();
             }
             writeln!(s, "        }}").unwrap();
-            writeln!(s, "        Ks[t * {}u + r * {ldk}u + dd] = v;", BI * ldk).unwrap();
+            writeln!(s, "        Ks[t * {}u + r * {ldk}u + dd] = v;", R * ldk).unwrap();
             writeln!(s, "    }}").unwrap();
             writeln!(s, "    __syncthreads();").unwrap();
             writeln!(s, "    wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> qf[{n_terms}][{nq}];").unwrap();
@@ -1537,7 +1653,7 @@ impl TensorGraph {
             "    for (unsigned t = 0; t < {n_terms}u; t++) for (unsigned q = 0; q < {nq}u; q++) {{"
         )
             .unwrap();
-            writeln!(s, "        wmma::load_matrix_sync(qf[t][q], Ks + t * {}u + (warp * 16u) * {ldk}u + q * 8u, {ldk}u);", BI * ldk).unwrap();
+            writeln!(s, "        wmma::load_matrix_sync(qf[t][q], Ks + t * {}u + (warp * 16u) * {ldk}u + q * 8u, {ldk}u);", R * ldk).unwrap();
             writeln!(s, "        for (int e = 0; e < qf[t][q].num_elements; e++) qf[t][q].x[e] = wmma::__float_to_tf32(qf[t][q].x[e]);").unwrap();
             writeln!(s, "    }}").unwrap();
             writeln!(s, "    __syncthreads();").unwrap();
@@ -1545,7 +1661,7 @@ impl TensorGraph {
         writeln!(
             s,
             "    for (unsigned idx = tid; idx < {}u; idx += {T}u) Os[idx] = 0.0f;",
-            BI * ldo
+            R * ldo
         )
         .unwrap();
         writeln!(s, "    float m_row = -3.0e38f; float l_row = 0.0f;").unwrap();
@@ -1707,7 +1823,7 @@ impl TensorGraph {
         }
         // online softmax on the score block: two threads per row
         writeln!(s, "        {{").unwrap();
-        writeln!(s, "            unsigned ii = i0 + row;").unwrap();
+        row_coords(&mut s, "            ", "row");
         writeln!(s, "            float mloc = -3.0e38f;").unwrap();
         writeln!(
             s,
@@ -1826,7 +1942,7 @@ impl TensorGraph {
         if !f.epilogue {
             // the root is the reduction: its (m, l, acc) state per point
             writeln!(s, "    {{").unwrap();
-            writeln!(s, "        unsigned ii = i0 + row;").unwrap();
+            row_coords(&mut s, "        ", "row");
             writeln!(s, "        if (ii < {}u) {{", f.m).unwrap();
             writeln!(
                 s,
@@ -1865,7 +1981,7 @@ impl TensorGraph {
         }
         let root_coord: Vec<String> = root_coord.into_iter().collect::<Option<_>>()?;
         writeln!(s, "    {{").unwrap();
-        writeln!(s, "        unsigned ii = i0 + row;").unwrap();
+        row_coords(&mut s, "        ", "row");
         writeln!(s, "        if (ii < {}u) {{", f.m).unwrap();
         writeln!(
             s,

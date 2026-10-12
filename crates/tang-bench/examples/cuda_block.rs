@@ -1,6 +1,6 @@
 //! The transformer block and the matmul candidates through tang-gpu's
 //! program runner. With `--features cuda` on an NVIDIA GPU that is CUDA
-//! (`to_cuda`: wmma tensor-core tiles + transpiled WGSL, tuned per
+//! (`to_cuda`: mma tensor-core tiles + transpiled WGSL, tuned per
 //! kernel); otherwise wgpu (`TANG_BACKEND=wgpu` forces it). Checked
 //! against the CPU evaluation and timed.
 fn main() {
@@ -28,7 +28,7 @@ fn main() {
     let mut rng = tang_bench::Rng::new(7);
     let mut rand = |n: usize| -> Vec<f32> { (0..n).map(|_| rng.f32() * 2.0 - 1.0).collect() };
 
-    // matmul: wmma tile vs CPU
+    // matmul: mma tile vs CPU
     for (m, k, n) in [(1024usize, 1024usize, 1024usize), (512, 576, 1536)] {
         let mut g = TensorGraph::new();
         let a = g.input(&[m, k]);
@@ -37,9 +37,9 @@ fn main() {
         g.schedule_auto(&[c]);
         let (av, bv) = (rand(m * k), rand(k * n));
         let exe = Program::compile(&rt, &g, &[c], &[&av, &bv]);
-        let native = exe.program.kernels[0].source.contains("wmma");
+        let native = exe.program.kernels[0].source.contains("mma");
         let ms = exe.time(&rt, 50);
-        println!("matmul {m}x{k}x{n}: {ms:.3} ms (native wmma: {native})");
+        println!("matmul {m}x{k}x{n}: {ms:.3} ms (native mma: {native})");
     }
 
     // block forward
@@ -60,7 +60,7 @@ fn main() {
         let n_native = program
             .kernels
             .iter()
-            .filter(|k| k.source.contains("wmma"))
+            .filter(|k| k.source.contains("mma"))
             .count();
         let n_inputs = program.buffers.iter().filter(|b| b.input.is_some()).count();
         let inputs: Vec<Vec<f32>> = (0..n_inputs)
@@ -88,6 +88,11 @@ fn main() {
             if report.from_cache { " (cached)" } else { "" },
             report.native_kept
         );
+        if let Ok(dir) = std::env::var("TANG_DUMP") {
+            for (i, k) in exe.program.kernels.iter().enumerate() {
+                std::fs::write(format!("{dir}/fwd{seq}_k{i:02}.cu"), &k.source).unwrap();
+            }
+        }
         exe.run(&rt);
         let got = exe.read(&rt, y);
         println!("block seq={seq}: output digest {:016x}", digest(&got));
@@ -119,11 +124,7 @@ fn main() {
                 node.shape,
                 node.split,
                 node.tile,
-                if k.source.contains("wmma") {
-                    "wmma"
-                } else {
-                    ""
-                }
+                if k.source.contains("mma") { "mma" } else { "" }
             );
         }
         // training step: loss + every gradient, same pipeline
@@ -140,7 +141,7 @@ fn main() {
         let n_native = program
             .kernels
             .iter()
-            .filter(|k| k.source.contains("wmma"))
+            .filter(|k| k.source.contains("mma"))
             .count();
         let n_kernels = program.kernels.len();
         let target = vec![0.0f32; seq * 576];
@@ -206,8 +207,8 @@ fn main() {
                 node.split,
                 node.tile,
                 args.join(" "),
-                if k.source.contains("wmma") {
-                    "wmma"
+                if k.source.contains("mma") {
+                    "mma"
                 } else {
                     ""
                 }

@@ -30,7 +30,7 @@ fn main() {
     };
     let (mut g, outs) = g.substitute_maps(&[y]);
     g.schedule_auto(&outs);
-    // TANG_MMA_SHAPE: an index into MMA_SHAPES, or bm,bn,warps_m,warps_n[,chunk[,stages]]
+    // TANG_MMA_SHAPE: an index into MMA_SHAPES, or bm,bn,warps_m,warps_n[,chunk[,stages[,split_target]]]
     let shape = match std::env::var("TANG_MMA_SHAPE") {
         Ok(v) => {
             let f: Vec<usize> = v.split(',').filter_map(|x| x.parse().ok()).collect();
@@ -43,6 +43,9 @@ fn main() {
                 }
                 if let Some(&st) = f.get(5) {
                     sh.stages = st;
+                }
+                if let Some(&t) = f.get(6) {
+                    sh.split_target = t;
                 }
                 sh
             }
