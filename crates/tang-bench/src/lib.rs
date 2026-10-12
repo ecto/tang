@@ -289,6 +289,7 @@ pub mod ir_gpu {
         }
 
         fn buffer(&self, t: TensorId) -> &GpuBuffer {
+            let t = self.program.storage(t);
             let i = self
                 .program
                 .buffers
@@ -953,9 +954,11 @@ pub mod ir_block {
         let seq = g.shape(x)[0].n();
         let half = head_dim / 2;
         let out = [seq, heads, half];
-        // space coords: (s, h, i); x[s, h*head_dim + 2i (+1)]
-        let xv = |off: i64| View {
-            forms: vec![unit(3, 0), form(3, &[(1, head_dim as i64), (2, 2)], off)],
+        // x viewed as [s, h, i, parity]: every read below is a pick view,
+        // which is what makes the block differentiable through rope.
+        let x = g.reshape(x, &[seq, heads, half, 2]).unwrap();
+        let xv = |parity: i64| View {
+            forms: vec![unit(3, 0), unit(3, 1), unit(3, 2), form(3, &[], parity)],
         };
         let tv = View {
             forms: vec![unit(3, 0), unit(3, 2)],
@@ -1056,14 +1059,15 @@ pub mod ir_block {
         let (ke, ko, v) = match caches {
             // cache rows are already rotated: split even/odd by view only
             Some((k_cache, v_cache)) => {
-                let halves = [0i64, 1].map(|off| {
+                let k4 = g.reshape(k_cache, &[kv_len, n_kv_heads, half, 2]).unwrap();
+                let halves = [0i64, 1].map(|parity| {
                     let view = View {
-                        forms: vec![unit(3, 0), form(3, &[(1, head_dim as i64), (2, 2)], off)],
+                        forms: vec![unit(3, 0), unit(3, 1), unit(3, 2), form(3, &[], parity)],
                     };
                     g.comp(
                         &[kv_len, n_kv_heads, half],
                         &[],
-                        vec![Arg { src: k_cache, view }],
+                        vec![Arg { src: k4, view }],
                         None,
                         |v| vec![v[0]],
                     )
@@ -1082,12 +1086,11 @@ pub mod ir_block {
         // scores[gr, r, i, j] = Σ_i' qe[i, 3g+r, i']·ke[j, g, i'] + qo·ko  (+ causal mask)
         // space: (g, r, i, j, i')
         let r5 = 5;
+        // heads as [group, member]: q read through a reshape, pick views only
+        let qe = g.reshape(qe, &[seq, groups, per_group, half]).unwrap();
+        let qo = g.reshape(qo, &[seq, groups, per_group, half]).unwrap();
         let qv = View {
-            forms: vec![
-                unit(r5, 2),
-                form(r5, &[(0, per_group as i64), (1, 1)], 0),
-                unit(r5, 4),
-            ],
+            forms: vec![unit(r5, 2), unit(r5, 0), unit(r5, 1), unit(r5, 4)],
         };
         let kv = View {
             forms: vec![unit(r5, 3), unit(r5, 0), unit(r5, 4)],
@@ -1141,6 +1144,7 @@ pub mod ir_block {
         let l = g.reduce(p, 3, Monoid::sum()).unwrap();
         // o[g, r, i, c] = Σ_j p[g,r,i,j] · v[j, g*head_dim + c]; space (g, r, i, c, j)
         let o_out = [groups, per_group, seq, head_dim];
+        let v3 = g.reshape(v, &[kv_len, groups, head_dim]).unwrap();
         let o = g
             .comp(
                 &o_out,
@@ -1153,9 +1157,9 @@ pub mod ir_block {
                         },
                     },
                     Arg {
-                        src: v,
+                        src: v3,
                         view: View {
-                            forms: vec![unit(5, 4), form(5, &[(0, head_dim as i64), (3, 1)], 0)],
+                            forms: vec![unit(5, 4), unit(5, 0), unit(5, 3)],
                         },
                     },
                 ],
@@ -1189,6 +1193,9 @@ pub mod ir_block {
 
         // proj[i, n] = Σ_{g,r,c} y[g,r,i,c] · wo[n, (3g+r)*head_dim + c] + bo[n]
         // space (i, n, g, r, c)
+        let wo4 = g
+            .reshape(wo, &[d_model, groups, per_group, head_dim])
+            .unwrap();
         let proj = g
             .comp(
                 &[seq, d_model],
@@ -1201,20 +1208,9 @@ pub mod ir_block {
                         },
                     },
                     Arg {
-                        src: wo,
+                        src: wo4,
                         view: View {
-                            forms: vec![
-                                unit(5, 1),
-                                form(
-                                    5,
-                                    &[
-                                        (2, (per_group * head_dim) as i64),
-                                        (3, head_dim as i64),
-                                        (4, 1),
-                                    ],
-                                    0,
-                                ),
-                            ],
+                            forms: vec![unit(5, 1), unit(5, 2), unit(5, 3), unit(5, 4)],
                         },
                     },
                 ],
@@ -1278,6 +1274,81 @@ pub mod ir_block {
         let (mut g, outs) = g.stabilize_softmax(&outs);
         g.schedule_auto(&outs);
         (g, outs[0])
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The whole block is differentiable: gradients of `sum(out)`
+        /// w.r.t. the input and a weight match finite differences.
+        #[test]
+        fn block_backward_matches_finite_differences() {
+            let dims = BlockDims {
+                seq: 3,
+                kv_len: 3,
+                d_model: 8,
+                n_heads: 2,
+                n_kv_heads: 1,
+                head_dim: 4,
+                ff_dim: 6,
+            };
+            let (mut g, out) = transformer_block(&dims);
+            let x = TensorId::from_index(0);
+            let wq = TensorId::from_index(1);
+            let grads = g.backward(out, &[x, wq]).unwrap();
+
+            let mut rng = crate::Rng::new(5);
+            let mut inputs: Vec<Vec<f64>> = Vec::new();
+            let sizes = [
+                3 * 8, // x
+                8 * 8,
+                8, // wq, bq
+                4 * 8,
+                4, // wk, bk
+                4 * 8,
+                4, // wv, bv
+                8 * 8,
+                8, // wo, bo
+                6 * 8,
+                6, // gate
+                6 * 8,
+                6, // up
+                8 * 6,
+                8, // down
+                3 * 2,
+                3 * 2, // cos, sin
+            ];
+            for n in sizes {
+                inputs.push((0..n).map(|_| rng.f64() * 0.8 - 0.4).collect());
+            }
+            // real rope tables for positions 0..3
+            for pos in 0..3 {
+                for i in 0..2 {
+                    let theta = pos as f64 / 10000f64.powf(2.0 * i as f64 / 4.0);
+                    inputs[15][pos * 2 + i] = theta.cos();
+                    inputs[16][pos * 2 + i] = theta.sin();
+                }
+            }
+
+            let f = |inp: &[Vec<f64>]| g.eval(inp, &[out]).remove(0).iter().sum::<f64>();
+            let got = g.eval(&inputs, &grads);
+            for (which, idx) in [(0usize, 0usize), (1, 1)] {
+                let h = 1e-5;
+                for i in 0..inputs[idx].len() {
+                    let mut plus = inputs.clone();
+                    plus[idx][i] += h;
+                    let mut minus = inputs.clone();
+                    minus[idx][i] -= h;
+                    let fd = (f(&plus) - f(&minus)) / (2.0 * h);
+                    let an = got[which][i];
+                    assert!(
+                        (an - fd).abs() <= 1e-4 * (1.0 + fd.abs()),
+                        "input {idx}[{i}]: analytic {an} vs fd {fd}"
+                    );
+                }
+            }
+        }
     }
 }
 

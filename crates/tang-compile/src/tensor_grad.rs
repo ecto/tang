@@ -21,7 +21,8 @@ use std::collections::HashMap;
 use tang_expr::{ExprGraph, ExprId};
 
 use super::{
-    err, replay, Arg, Comp, Dim, Form, Monoid, MonoidKind, ShapeError, TensorGraph, TensorId, View,
+    err, replay, Arg, Comp, Dim, Form, Monoid, MonoidKind, Op, ShapeError, TensorGraph, TensorId,
+    View,
 };
 
 impl TensorGraph {
@@ -43,6 +44,16 @@ impl TensorGraph {
                 continue;
             }
             let Some(&dy) = grads.get(&j) else { continue };
+            if let Op::Reshape(src) = self.nodes[j].op {
+                let shape = self.shape(src).to_vec();
+                let g = self.reshape(dy, &shape)?;
+                let acc = match grads.get(&src.n()) {
+                    Some(&prev) => self.map(&[prev, g], |v| v[0] + v[1])?,
+                    None => g,
+                };
+                grads.insert(src.n(), acc);
+                continue;
+            }
             let Some(c) = self.comp_at(j) else { continue };
             let c = c.clone();
             for a in 0..c.args.len() {
@@ -92,27 +103,20 @@ impl TensorGraph {
         let arg = &c.args[a];
         let a_shape = self.shape(arg.src).to_vec();
 
-        // Which old iteration coord each dim of `a` picks (None: broadcast).
-        let picks: Vec<Option<usize>> = arg
-            .view
-            .forms
-            .iter()
-            .map(|f| {
-                if f.coefs.iter().all(|&x| x == 0) && f.offset == 0 {
-                    Ok(None)
-                } else {
-                    f.as_unit().map(Some).ok_or_else(|| {
-                        ShapeError("backward: non-pick view on differentiated arg".into())
-                    })
-                }
-            })
-            .collect::<Result<_, _>>()?;
+        // A dim of `a` that reads one iteration coord outright is inverted
+        // by renaming that coord. Any other form — broadcast, offset,
+        // stride, diagonal, sum of coords — becomes a *scatter dim*: its
+        // coordinate stays an out dim and the body is gated by
+        // `[coord == form(...)]`, with the form's coords reduced over.
         let mut rename: Vec<Option<usize>> = vec![None; old_rank];
-        for (d, p) in picks.iter().enumerate() {
-            if let Some(coord) = p {
-                if rename[*coord].replace(d).is_some() {
-                    return err("backward: view reads one coord twice (diagonal)");
-                }
+        let mut scatter: Vec<usize> = Vec::new();
+        for (d, f) in arg.view.forms.iter().enumerate() {
+            let zero = f.coefs.iter().all(|&x| x == 0) && f.offset == 0;
+            match f.as_unit() {
+                Some(coord) if rename[coord].is_none() => rename[coord] = Some(d),
+                // size-1 dim read at 0: nothing to gate
+                _ if zero && a_shape[d] == Dim::Fixed(1) => {}
+                _ => scatter.push(d),
             }
         }
         let free: Vec<usize> = (0..old_rank).filter(|&x| rename[x].is_none()).collect();
@@ -159,6 +163,43 @@ impl TensorGraph {
         let vars: Vec<ExprId> = (0..=c.args.len()).map(|i| body.var(i as u16)).collect();
         let dexpr = replay(&src, &[d], &vars[1..], &mut body)[0];
         let mut out = body.mul(vars[0], dexpr);
+
+        // scatter dims: gate by [iota_d == renamed form]
+        if !scatter.is_empty() {
+            let mut full: Vec<Dim> = a_shape.clone();
+            full.extend(red.iter().copied());
+            let mut coord_var = |k: usize, body: &mut ExprGraph, args: &mut Vec<Arg>| {
+                let io = self.iota(&full, k);
+                args.push(Arg {
+                    src: io,
+                    view: View::identity(new_rank, new_rank),
+                });
+                body.var((args.len() - 1) as u16)
+            };
+            for &d in &scatter {
+                let f = rename_view(&View {
+                    forms: vec![arg.view.forms[d].clone()],
+                })
+                .forms
+                .remove(0);
+                let mut target = body.lit(f.offset as f64);
+                for (k, &coef) in f.coefs.iter().enumerate() {
+                    if coef != 0 {
+                        let v = coord_var(k, &mut body, &mut args);
+                        let cl = body.lit(coef as f64);
+                        let t = body.mul(cl, v);
+                        target = body.add(target, t);
+                    }
+                }
+                let here = coord_var(d, &mut body, &mut args);
+                let (nt, nh) = (body.neg(target), body.neg(here));
+                let above = body.add(here, nt); // here - target
+                let below = body.add(target, nh); // target - here
+                let inner = body.select(below, ExprId::ZERO, ExprId::ONE);
+                let hit = body.select(above, ExprId::ZERO, inner);
+                out = body.mul(out, hit);
+            }
+        }
         if kind == Some(MonoidKind::Max) {
             // Gate to the argmax: read the forward max like dy and keep
             // the term only where body == max.
@@ -288,6 +329,40 @@ mod tests {
         // ones · 2c (map) folds into the gradient reductions: only comps left
         // are the forward matmul and the two gradient reductions.
         assert_eq!(fg.count_comps(&outs), 3);
+    }
+
+    #[test]
+    fn grads_through_reshape_and_strided_views() {
+        // y[a, b] = sum_k r[a, 2k+1] * w[k, b] with r = reshape(x, [3, 4])
+        let mut g = TensorGraph::new();
+        let x = g.input(&[2, 6]);
+        let w = g.input(&[2, 5]);
+        let r = g.reshape(x, &[3, 4]).unwrap();
+        let odd = g
+            .comp(
+                &[3, 2],
+                &[],
+                vec![Arg {
+                    src: r,
+                    view: View {
+                        forms: vec![
+                            Form::unit(2, 0),
+                            Form {
+                                coefs: vec![0, 2],
+                                offset: 1,
+                            },
+                        ],
+                    },
+                }],
+                None,
+                |v| vec![v[0]],
+            )
+            .unwrap();
+        let y = g.matmul(odd, w).unwrap();
+        let grads = g.backward(y, &[x, w]).unwrap();
+        let inputs = [ramp(12, 0.3, -1.0), ramp(10, 0.2, 0.1)];
+        check_grad(&g, y, &inputs, 0, grads[0]);
+        check_grad(&g, y, &inputs, 1, grads[1]);
     }
 
     #[test]

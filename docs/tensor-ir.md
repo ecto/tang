@@ -70,9 +70,13 @@ materialized. Logsumexp, Welford variance and top-k are the same move.
 gradient w.r.t. `x` through a pick view is found by *renaming
 coordinates*: the coords `v` picks become `x`'s out dims, the rest become
 reduce dims, every other view is pushed through the same renaming, and the
-body is differentiated by `tang-expr`'s symbolic `diff`. `Max` gates the
-term to the argmax with a select. The backward graph is an ordinary graph;
-the same passes optimize it.
+body is differentiated by `tang-expr`'s symbolic `diff`. A dim read through
+any other form — an offset, a stride, a diagonal, a broadcast — stays an
+out dim and the body is gated by `[coord == form]` using `iota`, the
+coordinates-as-values node. `Max` gates the term to the argmax with a
+select. The backward graph is an ordinary graph; the same passes optimize
+it. A whole transformer block (`tang-bench::ir_block`) differentiates this
+way and matches finite differences.
 
 **Schedules are separate from algebra.** A comprehension says *what*. The
 schedule fields on a node say *how*, and can't change the answer:
@@ -122,6 +126,9 @@ schedule space; the compiler searches it.
 - Codegen beyond WGSL (MSL/CUDA emitters exist in `tang-expr` for scalar
   bodies; the loop-nest emitters are WGSL-only).
 - Gradients of tuple monoids (differentiate before `stabilize_softmax`).
+- Scatter gradients reduce over the whole source coordinate they gate on;
+  a stride-2 read pays 2× in the backward pass. Fine for rope, not for a
+  large gather.
 - Non-affine indexing — KV-cache paging, MoE routing — needs a `Gather`
   view that reads an index tensor, which blocks some fusion.
 - Placement: splitting an axis across devices is the same transform as

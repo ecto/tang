@@ -303,6 +303,12 @@ impl Ctx<'_> {
                 Val::Expr(self.buffer_read(j, addr))
             }
             Op::Iota(d) => Val::Expr(format!("f32({})", coords[*d].wgsl())),
+            Op::Reshape(_) => {
+                // flat index into the storage node's buffer; affine
+                let storage = self.g.storage(TensorId(j as u32)).n();
+                let addr = flat(coords, &fixed(&node.shape));
+                Val::Expr(self.buffer_read(storage, addr))
+            }
             Op::Comp(c) if self.reads.contains(&j) => {
                 let k = c.points().len();
                 let mut addr = flat(&coords[..k], &fixed(c.points())).scaled(c.width() as i64);
@@ -440,7 +446,7 @@ impl Ctx<'_> {
     fn tuple_rank(&self, j: usize) -> usize {
         match &self.g.nodes[j].op {
             Op::Comp(c) => c.tuple,
-            Op::Input(_) | Op::Iota(_) => 0,
+            Op::Input(_) | Op::Iota(_) | Op::Reshape(_) => 0,
         }
     }
 }

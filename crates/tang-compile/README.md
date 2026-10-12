@@ -27,3 +27,9 @@ What falls out:
 - Dims are `Dim::Fixed(n)` or `Dim::Sym("seq")`. Build, rewrite and
   differentiate once with symbols; `bind` per size before scheduling,
   evaluating or lowering.
+- `iota` gives a body its coordinates (masks, positional tables);
+  `reshape` is a zero-cost alias so strided reads are pick views.
+- `backward` inverts pick views by renaming coordinates and everything
+  else (offset, stride, diagonal, broadcast) by an indicator scatter, so a
+  whole transformer block — rmsnorm, rope, GQA attention, SwiGLU — is
+  differentiable (see `tang-bench::ir_block`).

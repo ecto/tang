@@ -46,21 +46,41 @@ pub struct WgslProgram {
     pub kernels: Vec<WgslKernel>,
     /// Every node that needs a buffer: inputs and materialized comps.
     pub buffers: Vec<BufferSpec>,
+    /// `(reshape node, node whose buffer holds its bytes)`.
+    pub aliases: Vec<(TensorId, TensorId)>,
+}
+
+impl WgslProgram {
+    /// The buffer-owning node for `t` (itself unless `t` is a reshape).
+    pub fn storage(&self, t: TensorId) -> TensorId {
+        self.aliases
+            .iter()
+            .find(|(r, _)| *r == t)
+            .map_or(t, |(_, s)| *s)
+    }
 }
 
 impl TensorGraph {
     pub fn to_wgsl(&self, outputs: &[TensorId]) -> WgslProgram {
         let live = self.live(outputs);
         let n = self.nodes.len();
-        let needs_buffer =
-            |i: usize| live[i] && !self.nodes[i].inline && !matches!(self.nodes[i].op, Op::Iota(_));
+        let needs_buffer = |i: usize| {
+            live[i]
+                && !self.nodes[i].inline
+                && !matches!(self.nodes[i].op, Op::Iota(_) | Op::Reshape(_))
+        };
+        // reshapes alias their storage node's buffer
+        let aliases: Vec<(TensorId, TensorId)> = (0..n)
+            .filter(|&i| live[i] && matches!(self.nodes[i].op, Op::Reshape(_)))
+            .map(|i| (TensorId(i as u32), self.storage(TensorId(i as u32))))
+            .collect();
         let buffers = (0..n)
             .filter(|&i| needs_buffer(i))
             .map(|i| {
                 let (len, input) = match &self.nodes[i].op {
                     Op::Input(k) => (numel(&self.nodes[i].shape), Some(*k)),
                     Op::Comp(c) => (numel(c.points()) * c.width(), None),
-                    Op::Iota(_) => unreachable!(),
+                    Op::Iota(_) | Op::Reshape(_) => unreachable!(),
                 };
                 BufferSpec {
                     node: TensorId(i as u32),
@@ -75,7 +95,11 @@ impl TensorGraph {
             .map(|i| self.kernel_for(i))
             .collect();
 
-        WgslProgram { kernels, buffers }
+        WgslProgram {
+            kernels,
+            buffers,
+            aliases,
+        }
     }
 
     /// Nodes reachable from `i` through inlined comps, including `i`,
@@ -93,10 +117,13 @@ impl TensorGraph {
                 continue;
             }
             stack.push((j, true));
-            if let Some(c) = self.comp_at(j) {
-                if j == i || self.nodes[j].inline {
-                    stack.extend(c.args.iter().map(|a| (a.src.n(), false)));
-                }
+            let descend = match &self.nodes[j].op {
+                Op::Comp(_) => j == i || self.nodes[j].inline,
+                Op::Reshape(_) => true,
+                Op::Input(_) | Op::Iota(_) => false,
+            };
+            if descend {
+                stack.extend(self.deps(j).into_iter().map(|d| (d, false)));
             }
         }
         order
@@ -109,7 +136,9 @@ impl TensorGraph {
             .iter()
             .copied()
             .filter(|&j| {
-                j != root && !self.nodes[j].inline && !matches!(self.nodes[j].op, Op::Iota(_))
+                j != root
+                    && !self.nodes[j].inline
+                    && !matches!(self.nodes[j].op, Op::Iota(_) | Op::Reshape(_))
             })
             .collect();
 
@@ -262,6 +291,21 @@ impl TensorGraph {
             Op::Iota(d) => {
                 writeln!(s, "fn read_{j}({coords}) -> f32 {{").unwrap();
                 writeln!(s, "    return f32(c{d});").unwrap();
+                writeln!(s, "}}\n").unwrap();
+            }
+            Op::Reshape(src) => {
+                // same bytes: flat index here is the flat index there
+                let src_shape = fixed(&self.nodes[src.n()].shape);
+                writeln!(s, "fn read_{j}({coords}) -> f32 {{").unwrap();
+                writeln!(s, "    var p = {};", flat("c", 0, &fixed(&node.shape))).unwrap();
+                let mut args = Vec::new();
+                for d in (0..src_shape.len()).rev() {
+                    writeln!(s, "    let s{d} = p % {}u;", src_shape[d]).unwrap();
+                    writeln!(s, "    p = p / {}u;", src_shape[d]).unwrap();
+                    args.push(format!("s{d}"));
+                }
+                args.reverse();
+                writeln!(s, "    return read_{}({});", src.n(), args.join(", ")).unwrap();
                 writeln!(s, "}}\n").unwrap();
             }
             Op::Comp(c) => {

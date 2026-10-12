@@ -353,6 +353,11 @@ pub enum Op {
     /// The coordinate along `dim` at every point, as a value. Lets a body
     /// see where it is: causal masks, positional tables, slice gradients.
     Iota(usize),
+    /// The same bytes as `src` (row-major) under this node's shape. Costs
+    /// nothing: readers address the source buffer. Its source is always
+    /// materialized, so strided and offset views over a reshape stay
+    /// affine (and `backward` can invert them as pick views).
+    Reshape(TensorId),
     Comp(Comp),
 }
 
@@ -530,6 +535,52 @@ impl TensorGraph {
             tile: (0, 0, 0),
         });
         TensorId(self.nodes.len() as u32 - 1)
+    }
+
+    /// `x` viewed row-major under `shape` (same number of elements).
+    pub fn reshape<D: Into<Dim> + Copy>(
+        &mut self,
+        x: TensorId,
+        shape: &[D],
+    ) -> Result<TensorId, ShapeError> {
+        let shape = dims(shape);
+        let src = self.shape(x).to_vec();
+        let same = match (
+            src.iter().map(|d| d.fixed()).collect::<Option<Vec<_>>>(),
+            shape.iter().map(|d| d.fixed()).collect::<Option<Vec<_>>>(),
+        ) {
+            (Some(a), Some(b)) => a.iter().product::<usize>() == b.iter().product::<usize>(),
+            _ => true, // symbolic: trusted until bind
+        };
+        if !same {
+            return err(format!("reshape {src:?} -> {shape:?}"));
+        }
+        self.nodes.push(TNode {
+            op: Op::Reshape(x),
+            shape,
+            inline: false,
+            split: 0,
+            tile: (0, 0, 0),
+        });
+        Ok(TensorId(self.nodes.len() as u32 - 1))
+    }
+
+    /// The node whose buffer holds `t`'s bytes: `t` itself, or the source
+    /// behind a chain of reshapes.
+    pub fn storage(&self, t: TensorId) -> TensorId {
+        match self.nodes[t.n()].op {
+            Op::Reshape(src) => self.storage(src),
+            _ => t,
+        }
+    }
+
+    /// Nodes `i` reads.
+    pub(super) fn deps(&self, i: usize) -> Vec<usize> {
+        match &self.nodes[i].op {
+            Op::Comp(c) => c.args.iter().map(|a| a.src.n()).collect(),
+            Op::Reshape(src) => vec![src.n()],
+            Op::Input(_) | Op::Iota(_) => Vec::new(),
+        }
     }
 
     /// The general op. `f` receives one scalar per arg and returns the
@@ -736,7 +787,7 @@ impl TensorGraph {
     fn comp_at(&self, i: usize) -> Option<&Comp> {
         match &self.nodes[i].op {
             Op::Comp(c) => Some(c),
-            Op::Input(_) | Op::Iota(_) => None,
+            Op::Input(_) | Op::Iota(_) | Op::Reshape(_) => None,
         }
     }
 
@@ -747,9 +798,7 @@ impl TensorGraph {
             if std::mem::replace(&mut live[i], true) {
                 continue;
             }
-            if let Some(c) = self.comp_at(i) {
-                stack.extend(c.args.iter().map(|a| a.src.n()));
-            }
+            stack.extend(self.deps(i));
         }
         live
     }
@@ -758,10 +807,8 @@ impl TensorGraph {
     fn use_counts(&self, outputs: &[TensorId], live: &[bool]) -> Vec<usize> {
         let mut uses = vec![0; self.nodes.len()];
         for i in (0..self.nodes.len()).filter(|&i| live[i]) {
-            if let Some(c) = self.comp_at(i) {
-                for a in &c.args {
-                    uses[a.src.n()] += 1;
-                }
+            for d in self.deps(i) {
+                uses[d] += 1;
             }
         }
         for o in outputs {
@@ -803,11 +850,22 @@ impl TensorGraph {
         let n = self.nodes.len();
         let live = self.live(outputs);
         let is_output = |i: usize| outputs.iter().any(|o| o.n() == i);
+        // a map read through a reshape must stay materialized
+        let reshaped: Vec<bool> = {
+            let mut r = vec![false; n];
+            for i in 0..n {
+                if let Op::Reshape(src) = self.nodes[i].op {
+                    r[src.n()] = true;
+                }
+            }
+            r
+        };
         let inline: Vec<bool> = (0..n)
             .map(|i| {
                 self.comp_at(i)
                     .is_some_and(|c| c.red.is_empty() && c.tuple == 0)
                     && !is_output(i)
+                    && !reshaped[i]
             })
             .collect();
 
@@ -821,6 +879,7 @@ impl TensorGraph {
             let op = match &node.op {
                 Op::Input(k) => Op::Input(*k),
                 Op::Iota(d) => Op::Iota(*d),
+                Op::Reshape(src) => Op::Reshape(TensorId(remap[src.n()].unwrap() as u32)),
                 Op::Comp(c) => {
                     let rank = c.rank();
                     let mut body = ExprGraph::new();
@@ -1169,9 +1228,7 @@ impl TensorGraph {
                 continue;
             }
             stack.push((i, true));
-            if let Some(c) = self.comp_at(i) {
-                stack.extend(c.args.iter().map(|a| (a.src.n(), false)));
-            }
+            stack.extend(self.deps(i).into_iter().map(|d| (d, false)));
         }
         order
     }
@@ -1185,10 +1242,14 @@ impl TensorGraph {
         };
         for i in self.topo(outputs) {
             let mut node = self.nodes[i].clone();
-            if let Op::Comp(c) = &mut node.op {
-                for a in &mut c.args {
-                    a.src = TensorId(remap[a.src.n()].unwrap() as u32);
+            match &mut node.op {
+                Op::Comp(c) => {
+                    for a in &mut c.args {
+                        a.src = TensorId(remap[a.src.n()].unwrap() as u32);
+                    }
                 }
+                Op::Reshape(src) => *src = TensorId(remap[src.n()].unwrap() as u32),
+                Op::Input(_) | Op::Iota(_) => {}
             }
             ng.nodes.push(node);
             remap[i] = Some(ng.nodes.len() - 1);
@@ -1224,11 +1285,21 @@ impl TensorGraph {
                 }
             }
         }
+        let reshaped: Vec<bool> = {
+            let mut r = vec![false; n];
+            for i in 0..n {
+                if let Op::Reshape(src) = self.nodes[i].op {
+                    r[src.n()] = true;
+                }
+            }
+            r
+        };
         for i in 0..n {
             let Some(c) = self.comp_at(i) else { continue };
             if live[i]
                 && uses[i] == 1
                 && !is_output(i)
+                && !reshaped[i]
                 && consumer_space[i] <= factor * numel(c.points())
             {
                 self.nodes[i].inline = true;
@@ -1321,7 +1392,7 @@ impl TensorGraph {
             let shape_ok = n.shape.iter().all(|d| d.fixed().is_some());
             let comp_ok = match &n.op {
                 Op::Comp(c) => c.red.iter().all(|d| d.fixed().is_some()),
-                Op::Input(_) | Op::Iota(_) => true,
+                Op::Input(_) | Op::Iota(_) | Op::Reshape(_) => true,
             };
             shape_ok && comp_ok
         })
@@ -1400,7 +1471,7 @@ impl TensorGraph {
                         body: c.body.compile_many(&c.body_outs),
                         combine: c.monoid.as_ref().map(|m| m.combine.compile_many(&m.outs)),
                     }),
-                    Op::Input(_) | Op::Iota(_) => None,
+                    Op::Input(_) | Op::Iota(_) | Op::Reshape(_) => None,
                 })
                 .collect(),
         };
@@ -1451,6 +1522,17 @@ impl Evaluator<'_> {
         match &node.op {
             Op::Input(k) => self.inputs[*k][flat_index(&fixed(&node.shape), idx)],
             Op::Iota(d) => idx[*d] as f64,
+            Op::Reshape(src) => {
+                let flat = flat_index(&fixed(&node.shape), idx);
+                let src_shape = fixed(&self.g.nodes[src.n()].shape);
+                let mut coords = vec![0; src_shape.len()];
+                let mut p = flat;
+                for d in (0..src_shape.len()).rev() {
+                    coords[d] = p % src_shape[d];
+                    p /= src_shape[d];
+                }
+                self.read(*src, &coords)
+            }
             Op::Comp(c) => {
                 let (pt, tup) = idx.split_at(c.points().len());
                 let slot = flat_index(&fixed(&c.out[c.points().len()..]), tup);
@@ -1697,6 +1779,46 @@ mod tests {
         assert_eq!(got, vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0]);
         let (fg, outs) = g.substitute_maps(&[t]);
         assert_eq!(fg.eval(&[], &outs)[0], got);
+    }
+
+    #[test]
+    fn reshape_is_a_free_alias() {
+        let mut g = TensorGraph::new();
+        let x = g.input(&[2, 6]);
+        let r = g.reshape(x, &[3, 4]).unwrap();
+        // strided pick view over the reshape: r[a, 2b] for a<3, b<2
+        let picked = g
+            .comp(
+                &[3, 2],
+                &[],
+                vec![Arg {
+                    src: r,
+                    view: View {
+                        forms: vec![
+                            Form::unit(2, 0),
+                            Form {
+                                coefs: vec![0, 2],
+                                offset: 1,
+                            },
+                        ],
+                    },
+                }],
+                None,
+                |v| vec![v[0]],
+            )
+            .unwrap();
+        let data: Vec<f64> = (0..12).map(|i| i as f64).collect();
+        let got = g.eval(std::slice::from_ref(&data), &[picked]).remove(0);
+        assert_eq!(got, vec![1.0, 3.0, 5.0, 7.0, 9.0, 11.0]);
+        assert!(g.reshape(x, &[5]).is_err());
+        // the reshape has no buffer: nothing to materialize but the comp
+        assert_eq!(g.materialized(&[picked]).len(), 1);
+        let (fg, outs) = fg_subst(&g, &[picked]);
+        assert_eq!(fg.eval(std::slice::from_ref(&data), &outs)[0], got);
+    }
+
+    fn fg_subst(g: &TensorGraph, outs: &[TensorId]) -> (TensorGraph, Vec<TensorId>) {
+        g.substitute_maps(outs)
     }
 
     #[test]
