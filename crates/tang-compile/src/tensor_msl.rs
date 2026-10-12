@@ -33,15 +33,38 @@ const THREADS: usize = 128;
 const PAD: usize = 4;
 
 /// An operand's flat address as an affine form over the comp's space.
-struct Addr {
-    offset: i64,
-    coefs: Vec<i64>,
+pub(super) struct Addr {
+    pub offset: i64,
+    pub coefs: Vec<i64>,
+}
+
+/// A matmul-shaped tile (see [`TensorGraph::bilinear_tile`]).
+pub(super) struct Bilinear {
+    pub red_node: usize,
+    pub epilogue: bool,
+    /// buffers (storage nodes) of the two operands
+    pub buf_a: usize,
+    pub buf_b: usize,
+    /// their addresses over the reduction's space; A has no coefficient
+    /// on `dx`, B none on `dy`
+    pub addr_a: Addr,
+    pub addr_b: Addr,
+    pub pts: Vec<usize>,
+    /// tile axes: columns, rows; the remaining point dims are `others`
+    pub dx: usize,
+    pub dy: usize,
+    pub others: Vec<usize>,
+    pub m: usize,
+    pub n: usize,
+    pub k_total: usize,
+    /// index of the reduce axis in the space
+    pub kdim: usize,
 }
 
 impl TensorGraph {
     /// Flat address of `a` (row-major over its source's shape) as an
     /// affine form over the iteration space.
-    fn flat_addr(&self, a: &Arg, rank: usize) -> Addr {
+    pub(super) fn flat_addr(&self, a: &Arg, rank: usize) -> Addr {
         let shape = fixed(&self.nodes[a.src.n()].shape);
         let mut stride = 1i64;
         let mut addr = Addr {
@@ -58,12 +81,12 @@ impl TensorGraph {
         addr
     }
 
-    /// The Metal simdgroup-matrix kernel for `root`, if it is (or is the
-    /// epilogue of) a bilinear reduction with a 2-D tile; `None` means
-    /// use the WGSL tile.
-    pub(super) fn msl_mma_kernel(&self, root: usize, reads: &[usize]) -> Option<WgslKernel> {
-        #[allow(non_snake_case)]
-        let (LDA, LDB, LDC) = (CHUNK + PAD, BLOCK + PAD, BLOCK + PAD);
+    /// The bilinear tile behind `root`, if `root` is (or is the epilogue
+    /// of) a reduction over one axis whose body is a product of two leaf
+    /// reads, each varying along one of the two tile axes and the reduce
+    /// axis — the shape a matrix unit computes. Shared by the native
+    /// lowerings (Metal simdgroup matrices, CUDA wmma).
+    pub(super) fn bilinear_tile(&self, root: usize, reads: &[usize]) -> Option<Bilinear> {
         let c = self.comp_at(root)?;
         let red_node = self.tiled_reduction(root)?;
         let rc = self.comp_at(red_node)?;
@@ -109,10 +132,8 @@ impl TensorGraph {
         } else {
             return None;
         };
-        let is_buffer = |j: usize| {
-            let j = self.storage(TensorId(j as u32)).n();
-            reads.contains(&j)
-        };
+        let storage = |j: usize| self.storage(TensorId(j as u32)).n();
+        let is_buffer = |j: usize| reads.contains(&storage(j));
         if !is_buffer(rc.args[a_arg].src.n()) || !is_buffer(rc.args[b_arg].src.n()) {
             return None;
         }
@@ -124,8 +145,49 @@ impl TensorGraph {
                 }
             }
         }
-        let storage = |j: usize| self.storage(TensorId(j as u32)).n();
+        Some(Bilinear {
+            red_node,
+            epilogue,
+            buf_a: storage(rc.args[a_arg].src.n()),
+            buf_b: storage(rc.args[b_arg].src.n()),
+            addr_a,
+            addr_b,
+            pts,
+            dx,
+            dy,
+            others,
+            m,
+            n,
+            k_total,
+            kdim,
+        })
+    }
 
+    /// The Metal simdgroup-matrix kernel for `root`, if it is (or is the
+    /// epilogue of) a bilinear reduction with a 2-D tile; `None` means
+    /// use the WGSL tile.
+    pub(super) fn msl_mma_kernel(&self, root: usize, reads: &[usize]) -> Option<WgslKernel> {
+        #[allow(non_snake_case)]
+        let (LDA, LDB, LDC) = (CHUNK + PAD, BLOCK + PAD, BLOCK + PAD);
+        let c = self.comp_at(root)?;
+        let t = self.bilinear_tile(root, reads)?;
+        let Bilinear {
+            red_node,
+            epilogue,
+            buf_a,
+            buf_b,
+            addr_a,
+            addr_b,
+            pts,
+            dx,
+            dy,
+            others,
+            m,
+            n,
+            k_total,
+            kdim,
+        } = t;
+        let storage = |j: usize| self.storage(TensorId(j as u32)).n();
         let tiles_x = n.div_ceil(BLOCK);
         let tiles_y = m.div_ceil(BLOCK);
         let n_tiles = tiles_x * tiles_y * others.iter().map(|&d| pts[d]).product::<usize>();
@@ -205,8 +267,8 @@ impl TensorGraph {
             && (cpa == 1 || cka == 1)
             && (cpb == 1 || ckb == 1);
         if direct {
-            let buf_a = storage(rc.args[a_arg].src.n());
-            let buf_b = storage(rc.args[b_arg].src.n());
+            let buf_a = buf_a;
+            let buf_b = buf_b;
             // A fragment (rows sr+8i.., k kk..): row-major when k is the
             // unit stride, else stored transposed
             let (lda, ta) = if cka == 1 {
@@ -280,26 +342,8 @@ impl TensorGraph {
             .unwrap();
                 writeln!(s, "        }}").unwrap();
             };
-            stage(
-                &mut s,
-                "As",
-                &addr_a,
-                dy,
-                "row0",
-                m,
-                storage(rc.args[a_arg].src.n()),
-                true,
-            );
-            stage(
-                &mut s,
-                "Bs",
-                &addr_b,
-                dx,
-                "col0",
-                n,
-                storage(rc.args[b_arg].src.n()),
-                false,
-            );
+            stage(&mut s, "As", &addr_a, dy, "row0", m, buf_a, true);
+            stage(&mut s, "Bs", &addr_b, dx, "col0", n, buf_b, false);
             writeln!(
                 s,
                 "        threadgroup_barrier(mem_flags::mem_threadgroup);"

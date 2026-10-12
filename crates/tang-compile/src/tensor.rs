@@ -38,6 +38,8 @@ use std::collections::HashMap;
 use tang::Scalar;
 use tang_expr::{trace, ExprGraph, ExprId, Node};
 
+#[path = "tensor_cuda.rs"]
+mod cuda;
 #[path = "tensor_grad.rs"]
 mod grad;
 #[path = "tensor_msl.rs"]

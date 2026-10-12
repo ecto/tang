@@ -125,7 +125,7 @@ impl TensorGraph {
 
     /// Nodes reachable from `i` through inlined comps, including `i`,
     /// in dependency order.
-    fn inline_closure(&self, i: usize) -> Vec<usize> {
+    pub(super) fn inline_closure(&self, i: usize) -> Vec<usize> {
         let mut order = Vec::new();
         let mut seen = HashSet::new();
         let mut stack = vec![(i, false)];
