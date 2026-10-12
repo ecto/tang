@@ -5,14 +5,19 @@ torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 dev = "cuda"
 
-def bench(fn, iters=50, warm=10):
+def bench(fn, iters=50, warm=10, batches=5):
+    # minimum over batches: same estimator as tang's CUDA executor, robust
+    # to another tenant on the GPU
     for _ in range(warm): fn()
     torch.cuda.synchronize()
-    s = torch.cuda.Event(enable_timing=True); e = torch.cuda.Event(enable_timing=True)
-    s.record()
-    for _ in range(iters): fn()
-    e.record(); torch.cuda.synchronize()
-    return s.elapsed_time(e) / iters
+    best = float("inf")
+    for _ in range(batches):
+        s = torch.cuda.Event(enable_timing=True); e = torch.cuda.Event(enable_timing=True)
+        s.record()
+        for _ in range(iters): fn()
+        e.record(); torch.cuda.synchronize()
+        best = min(best, s.elapsed_time(e) / iters)
+    return best
 
 print("torch", torch.__version__, torch.cuda.get_device_name(0), "fp32 (tf32 off)")
 # matmul 1024^2

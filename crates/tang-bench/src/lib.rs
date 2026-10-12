@@ -1270,17 +1270,24 @@ pub mod ir_cuda {
             self.time_with(iters, |e| e.run_kernel(i))
         }
 
+        /// The minimum over five batches of `iters` launches: a shared GPU
+        /// (another tenant) only ever adds time, so the minimum is the
+        /// closest estimate of the kernel's own cost.
         fn time_with(&self, iters: usize, f: impl Fn(&Self)) -> f64 {
             for _ in 0..3 {
                 f(self);
             }
             self.stream.synchronize().expect("sync");
-            let t = std::time::Instant::now();
-            for _ in 0..iters {
-                f(self);
-            }
-            self.stream.synchronize().expect("sync");
-            t.elapsed().as_secs_f64() * 1e3 / iters as f64
+            (0..5)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    for _ in 0..iters {
+                        f(self);
+                    }
+                    self.stream.synchronize().expect("sync");
+                    t.elapsed().as_secs_f64() * 1e3 / iters as f64
+                })
+                .fold(f64::INFINITY, f64::min)
         }
     }
 }
