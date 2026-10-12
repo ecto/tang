@@ -518,6 +518,10 @@ pub mod cuda {
             plan: MemoryPlan,
             inputs: &[Vec<f32>],
         ) -> Self {
+            // one stream does all the work, so cross-stream event tracking
+            // is unneeded, and its events would break graph capture
+            // SAFETY: every slot is used only on `stream`
+            unsafe { ctx.disable_event_tracking() };
             // the legacy default stream cannot be captured into a graph
             let stream = ctx.new_stream().expect("stream");
             let slots = plan
