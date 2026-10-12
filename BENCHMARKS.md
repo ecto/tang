@@ -607,3 +607,13 @@ The tuner still exists for the next chip; the rules are what it found.
 
 The hand path's CPU-side attention backward is quadratic in sequence
 length; the derived one is a graph like any other.
+
+### Placement
+
+`shard_reduction` splits a reduce axis into partial reductions (one per
+device) and `fold_partials` writes the all-reduce as a comprehension over
+the monoid's combine. `examples/shard_attention.rs` runs the flash-fused
+attention's 256 keys as two partial (m, l, acc) states on two wgpu
+devices and merges them with the online-softmax combine: max error
+1.7e-6 (M4) / 1.4e-6 (3090) against the single-device result. Transport
+is host-mediated; the IR side of sequence parallelism is done.

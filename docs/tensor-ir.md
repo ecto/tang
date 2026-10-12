@@ -141,8 +141,10 @@ schedule space; the compiler searches it.
   large gather.
 - Non-affine indexing — KV-cache paging, MoE routing — needs a `Gather`
   view that reads an index tensor, which blocks some fusion.
-- Placement: splitting an axis across devices is the same transform as
-  tiling it across a workgroup, with an all-reduce as the combine. The
-  machinery is here; the runtime is not.
+- Placement is a transform now (`shard_reduction` + `fold_partials`:
+  partial reductions over slices, the all-reduce as a comprehension over
+  the monoid's combine; `examples/shard_attention.rs` runs flash
+  attention's key axis across two devices), but the transport is
+  host-mediated. A device-to-device runtime is the missing piece.
 - A real cost model. `schedule_auto` is three measured rules; `autotune`
   is the honest answer until there is one.
