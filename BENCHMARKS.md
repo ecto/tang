@@ -829,12 +829,24 @@ belong. Nothing attention-specific is hard-coded beyond that shape.
 | block fwd, seq 128 | 0.62 | **0.59** |
 | block fwd, seq 512 | 1.86 | **0.76** |
 
-Six of the block's sixteen kernels now run on tensor cores. At seq 512
-the derived block forward (0.76 ms, GPU shared with another tenant at
-35%) is at PyTorch fp32's number (0.61 quiet / 1.21 loaded); the
-remaining per-kernel time is matmul tiles at 1.4–1.9× cuBLAS TF32 and
-the ~10 small kernels at a few µs each. Same error as before (5e-5
-relative at seq 128).
+Six of the block's sixteen kernels now run on tensor cores. Back to
+back in one session (GPU shared with another tenant at ~27%), the
+like-for-like comparison — tang's CUDA path uses TF32 tensor cores, so
+PyTorch gets `allow_tf32` too:
+
+| block forward | PyTorch fp32 | PyTorch TF32 | tang (CUDA, TF32) |
+|---|---|---|---|
+| seq 128 | 0.32 ms | 0.34 | 0.59 |
+| seq 512 | 0.98 | 0.48 | **0.78** |
+
+So at seq 512 the derived block is 1.6× PyTorch-TF32 and faster than
+PyTorch-fp32; at seq 128 it is launch-bound (16 launches to PyTorch's
+~10 fused cuBLAS/sdpa calls) at 1.8×. The remaining per-kernel time is
+the matmul tiles at 1.4–1.9× cuBLAS TF32 and the ten small kernels at
+a few µs each; the next rungs are the standard GEMM ladder (128×128
+blocks, `cp.async` pipelining) and fusing the small kernels into their
+neighbours' prologues. Same error as before (5e-5 relative at seq
+128).
 
 What this does and does not show: the compiler derives the *structure* of
 the fast kernels (flash attention, register-tiled matmul, sequence
