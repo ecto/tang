@@ -528,12 +528,14 @@ fn float_literals(s: &str) -> String {
                     i += 1;
                 }
             }
-            if i < b.len() && (b[i] == b'e' || b[i] == b'E') && is_float {
+            // an exponent makes it a float too (`1e30`)
+            if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
                 let mut j = i + 1;
                 if j < b.len() && (b[j] == b'+' || b[j] == b'-') {
                     j += 1;
                 }
                 if j < b.len() && b[j].is_ascii_digit() {
+                    is_float = true;
                     i = j;
                     while i < b.len() && b[i].is_ascii_digit() {
                         i += 1;
@@ -649,4 +651,27 @@ fn rewrite_ctor(s: &str, prefix: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::float_literals;
+
+    #[test]
+    fn literals_stay_single_precision() {
+        assert_eq!(float_literals("auto x = -1e30;"), "auto x = -1e30f;");
+        assert_eq!(
+            float_literals("let y = 1.5 * e4 + 2u;"),
+            "let y = 1.5f * e4 + 2u;"
+        );
+        assert_eq!(float_literals("c0_14 = 1.442695;"), "c0_14 = 1.442695f;");
+        assert_eq!(
+            float_literals("v[3] = 3.4028235e38"),
+            "v[3] = 3.4028235e38f"
+        );
+        assert_eq!(
+            float_literals("stage_0[idx * 64u + 1u]"),
+            "stage_0[idx * 64u + 1u]"
+        );
+    }
 }
