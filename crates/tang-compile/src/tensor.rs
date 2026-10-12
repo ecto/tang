@@ -495,12 +495,9 @@ impl TensorGraph {
     /// lanes tiles (single-axis reductions with a lane dim).
     pub fn schedule_candidates(&self, t: TensorId) -> Vec<ScheduleCandidate> {
         let mut out = vec![(0, (0, 0, 0), (1, 1))];
-        let Some(c) = self.comp_at(t.n()) else {
+        let Some(c) = self.tiled_reduction(t.n()).and_then(|r| self.comp_at(r)) else {
             return out;
         };
-        if c.monoid.is_none() {
-            return out;
-        }
         // a tree-combine of a wide tuple through workgroup memory is never
         // the answer (59 ms for attention's 66-wide state on a 3090)
         if c.width() <= 8 {
@@ -839,6 +836,33 @@ impl TensorGraph {
             uses[o.n()] += 1;
         }
         uses
+    }
+
+    /// The reduction a tiled schedule of `root` iterates: `root` itself,
+    /// or the single-use single-axis reduction inlined into it when `root`
+    /// is a map reading it point-for-point (its epilogue: bias, activation).
+    pub fn tiled_reduction(&self, root: usize) -> Option<usize> {
+        let c = self.comp_at(root)?;
+        if c.monoid.is_some() {
+            return Some(root);
+        }
+        let mut found = None;
+        for a in &c.args {
+            let p = a.src.n();
+            let Some(pc) = self.comp_at(p) else { continue };
+            if self.nodes[p].inline && pc.monoid.is_some() {
+                let ok = pc.red.len() == 1
+                    && pc.tuple == 0
+                    && pc.width() == 1
+                    && a.view == View::identity(c.rank(), c.rank())
+                    && found.is_none();
+                if !ok {
+                    return None;
+                }
+                found = Some(p);
+            }
+        }
+        found
     }
 
     /// Live, non-inlined comps: the buffers a backend would allocate.
@@ -1418,15 +1442,28 @@ impl TensorGraph {
             }
             r
         };
-        // consumers that are reductions can absorb a producer; a map
-        // cannot, because that would hide the producer's reduction from
-        // every tiled schedule (a matmul folded into its bias add is
-        // only ever one thread per point)
+        // A reduction may be absorbed by a reduction, or by a map that
+        // reads it point-for-point (the map becomes the reduction's
+        // epilogue — bias, activation — and the tiled schedules see
+        // through it via `tiled_reduction`). Any other map consumer would
+        // hide the reduction from tiling, so it stays materialized.
         let mut consumer_reduces = vec![false; n];
         for i in (0..n).filter(|&i| live[i]) {
             if let Some(c) = self.comp_at(i) {
+                let epilogue_ok = c.monoid.is_none()
+                    && c.args
+                        .iter()
+                        .filter(|a| self.comp_at(a.src.n()).is_some_and(|p| p.monoid.is_some()))
+                        .count()
+                        == 1;
                 for a in &c.args {
-                    consumer_reduces[a.src.n()] = c.monoid.is_some();
+                    let p = a.src.n();
+                    let as_epilogue = epilogue_ok
+                        && self.comp_at(p).is_some_and(|pc| {
+                            pc.red.len() == 1 && pc.tuple == 0 && pc.width() == 1
+                        })
+                        && a.view == View::identity(c.rank(), c.rank());
+                    consumer_reduces[p] = c.monoid.is_some() || as_epilogue;
                 }
             }
         }
@@ -1551,14 +1588,16 @@ impl TensorGraph {
         let reductions: Vec<usize> = (0..self.nodes.len())
             .filter(|&i| live[i] && !self.nodes[i].inline)
             .filter(|&i| {
-                self.comp_at(i)
-                    .is_some_and(|c| c.monoid.is_some() && numel(&c.red) >= 64)
+                self.tiled_reduction(i)
+                    .and_then(|r| self.comp_at(r))
+                    .is_some_and(|c| numel(&c.red) >= 64)
             })
             .collect();
         let uses = self.use_counts(outputs, &live);
         let is_output = |i: usize| outputs.iter().any(|o| o.n() == i);
         for i in reductions {
-            let c = self.comp_at(i).unwrap();
+            // schedule by the reduction's shape, even when `i` is its epilogue
+            let c = self.comp_at(self.tiled_reduction(i).unwrap()).unwrap();
             let pts = fixed(c.points());
             let lane_dim = (0..pts.len()).rev().find(|&d| pts[d] > 1);
             let lanes = lane_dim.map_or(1, |d| pts[d]);

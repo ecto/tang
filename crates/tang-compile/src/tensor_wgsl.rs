@@ -212,9 +212,15 @@ impl TensorGraph {
         }
 
         // One workgroup per point; threads stride the flattened reduce
-        // space, then tree-combine through workgroup memory.
-        let m = c.monoid.as_ref().expect("split needs a reduction");
-        let r_total = numel(&c.red);
+        // space, then tree-combine through workgroup memory. `root` may be
+        // the epilogue map of the reduction it chunks (see
+        // `tiled_reduction`); the map's body then runs on thread 0 after
+        // the tree with the reduction's var bound to the result.
+        let red_node = self.tiled_reduction(root).expect("split needs a reduction");
+        let rc = self.comp_at(red_node).unwrap();
+        let m = rc.monoid.as_ref().expect("split needs a reduction");
+        let (w, w_out) = (rc.width(), c.width());
+        let r_total = numel(&rc.red);
         writeln!(s, "var<workgroup> wg_acc: array<array<f32, {w}>, {split}>;").unwrap();
         writeln!(s, "@compute @workgroup_size({split})").unwrap();
         writeln!(
@@ -232,11 +238,11 @@ impl TensorGraph {
             "    for (var ri: u32 = tid; ri < {r_total}u; ri = ri + {split}u) {{"
         )
         .unwrap();
-        emit_decompose(&mut s, "ri", &fixed(&c.red), "r");
+        emit_decompose(&mut s, "ri", &fixed(&rc.red), "r");
         emit_step(
             &mut s,
             "        ",
-            &format!("body_{root}({})", arg_reads(c)),
+            &format!("body_{red_node}({})", arg_reads(rc)),
             m,
         );
         writeln!(s, "    }}").unwrap();
@@ -250,15 +256,23 @@ impl TensorGraph {
         writeln!(s, "        if (tid < stride) {{").unwrap();
         writeln!(
             s,
-            "            wg_acc[tid] = combine_{root}(wg_acc[tid], wg_acc[tid + stride]);"
+            "            wg_acc[tid] = combine_{red_node}(wg_acc[tid], wg_acc[tid + stride]);"
         )
         .unwrap();
         writeln!(s, "        }}").unwrap();
         writeln!(s, "        workgroupBarrier();").unwrap();
         writeln!(s, "    }}").unwrap();
         writeln!(s, "    if (tid == 0u) {{").unwrap();
-        for slot in 0..w {
-            writeln!(s, "        out[g * {w}u + {slot}u] = wg_acc[0][{slot}];").unwrap();
+        if red_node == root {
+            for slot in 0..w {
+                writeln!(s, "        out[g * {w}u + {slot}u] = wg_acc[0][{slot}];").unwrap();
+            }
+        } else {
+            let reads_epi = arg_reads_with(c, Some((red_node, "wg_acc[0][0]")));
+            writeln!(s, "        let epi = body_{root}({reads_epi});").unwrap();
+            for slot in 0..w_out {
+                writeln!(s, "        out[g * {w_out}u + {slot}u] = epi[{slot}];").unwrap();
+            }
         }
         writeln!(s, "    }}").unwrap();
         writeln!(s, "}}").unwrap();
@@ -457,6 +471,11 @@ pub(super) fn identity(m: &Monoid) -> String {
 
 /// `read_src(view(p…, r…))` for every arg, as call arguments.
 fn arg_reads(c: &Comp) -> String {
+    arg_reads_with(c, None)
+}
+
+/// `arg_reads`, with the arg reading `node` replaced by `expr`.
+fn arg_reads_with(c: &Comp, replace: Option<(usize, &str)>) -> String {
     let k = c.points().len();
     let coord_name = |d: usize| {
         if d < k {
@@ -482,7 +501,10 @@ fn arg_reads(c: &Comp) -> String {
                     format!("u32({})", terms.join(" + "))
                 })
                 .collect();
-            format!("read_{}({})", a.src.n(), idx.join(", "))
+            match replace {
+                Some((node, expr)) if a.src.n() == node => expr.to_string(),
+                _ => format!("read_{}({})", a.src.n(), idx.join(", ")),
+            }
         })
         .collect::<Vec<_>>()
         .join(", ")

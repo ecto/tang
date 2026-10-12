@@ -746,18 +746,25 @@ pub mod ir_gpu {
                 "reg2" => g.set_schedule(c, 0, (16, 16, 32), (2, 2)),
                 "reg4" => g.set_schedule(c, 0, (16, 16, 32), (4, 4)),
                 "reg8" => g.set_schedule(c, 0, (16, 16, 32), (8, 8)),
+                "reg4c64" => g.set_schedule(c, 0, (16, 16, 64), (4, 4)),
+                "reg8x4" => g.set_schedule(c, 0, (16, 16, 32), (8, 4)),
+                "reg4x8" => g.set_schedule(c, 0, (16, 16, 32), (4, 8)),
+                "reg4c16" => g.set_schedule(c, 0, (16, 16, 16), (4, 4)),
                 "auto" => g.schedule_auto(&[c]),
                 _ => {}
             }
             (g, c)
         };
-        ["naive", "split", "tiled", "reg2", "reg4", "reg8", "auto"]
-            .into_iter()
-            .map(|name| {
-                let (g, c) = build(name);
-                (name, g, c)
-            })
-            .collect()
+        [
+            "naive", "split", "tiled", "reg2", "reg4", "reg8", "reg4c64", "reg8x4", "reg4x8",
+            "reg4c16", "auto",
+        ]
+        .into_iter()
+        .map(|name| {
+            let (g, c) = build(name);
+            (name, g, c)
+        })
+        .collect()
     }
 
     /// RMSNorm over `[rows, dim]` with weight = 1, under each schedule.

@@ -506,18 +506,24 @@ impl TensorGraph {
     /// holds the bindings and per-node functions).
     pub(super) fn tile_kernel(&self, root: usize, mut s: String, reads: Vec<usize>) -> WgslKernel {
         let c = self.comp_at(root).unwrap();
+        // the reduction this kernel chunks: root, or the one inlined into
+        // root when root is its epilogue map
+        let red_node = self.tiled_reduction(root).expect("tile needs a reduction");
+        let rc = self.comp_at(red_node).unwrap();
+        let epilogue = red_node != root;
         let (bx, by, chunk) = self.nodes[root].tile;
         let (bx, by, chunk) = (bx as usize, by as usize, chunk as usize);
         let (rx, ry) = self.nodes[root].reg;
         let (rx, ry) = (rx.max(1) as usize, ry.max(1) as usize);
         // points per workgroup along x / y; threads own rx × ry of them
         let (px_n, py_n) = (bx * rx, by * ry);
-        let w = c.width();
+        let w = rc.width();
+        let w_out = c.width();
         let pts_v = fixed(c.points());
         let pts = pts_v.as_slice();
         let k = pts.len();
-        let r_total = c.red[0].n();
-        let m = c.monoid.as_ref().expect("tile needs a reduction");
+        let r_total = rc.red[0].n();
+        let m = rc.monoid.as_ref().expect("tile needs a reduction");
         let threads = bx * by;
 
         // Tile the last two non-unit point dims; everything else is
@@ -553,9 +559,12 @@ impl TensorGraph {
             .map(|d| Sym::var(&format!("p{d}")))
             .chain([Sym::var("r0")])
             .collect();
+        // the chunked loop body: the reduction's body + combine. With an
+        // epilogue, the reduction is read point-for-point so its space is
+        // root's points ++ r0 as well.
         let run = |ctx: &mut Ctx, body: &mut String| {
-            let arg_vals = ctx.arg_values(body, c, &space);
-            let vals = emit_scalar(body, &c.body, &c.body_outs, "t0_", &|v| {
+            let arg_vals = ctx.arg_values(body, rc, &space);
+            let vals = emit_scalar(body, &rc.body, &rc.body_outs, "t0_", &|v| {
                 arg_vals[v as usize].clone()
             });
             emit_scalar(body, &m.combine, &m.outs, "c0_", &|v| {
@@ -566,13 +575,56 @@ impl TensorGraph {
                 }
             })
         };
+        // the epilogue: root's body with the reduction's var bound to acc
+        let run_epi = |ctx: &mut Ctx, body: &mut String| -> Vec<String> {
+            if !epilogue {
+                return (0..w).map(|s| format!("acc[{s}]")).collect();
+            }
+            let pts_syms: Vec<Sym> = (0..k).map(|d| Sym::var(&format!("p{d}"))).collect();
+            let mut vals: Vec<String> = Vec::new();
+            for a in &c.args {
+                if a.src.n() == red_node {
+                    vals.push("acc[0]".to_string());
+                    continue;
+                }
+                let src_shape = fixed(&self.nodes[a.src.n()].shape);
+                let cs: Vec<Sym> = a
+                    .view
+                    .forms
+                    .iter()
+                    .map(|f| {
+                        let mut sy = Sym {
+                            offset: f.offset,
+                            ..Default::default()
+                        };
+                        for (d, &coef) in f.coefs.iter().enumerate() {
+                            if coef != 0 {
+                                sy.add(&pts_syms[d].scaled(coef));
+                            }
+                        }
+                        sy
+                    })
+                    .collect();
+                let pk = src_shape.len() - ctx.tuple_rank(a.src.n());
+                let slot = flat(&cs[pk..], &src_shape[pk..]);
+                let v = ctx.expand(body, a.src.n(), &cs);
+                vals.push(v.slot(&slot));
+            }
+            emit_scalar(body, &c.body, &c.body_outs, "e0_", &|v| {
+                vals[v as usize].clone()
+            })
+        };
         // Expand twice: first to discover staged regions, then for real.
         let mut body = String::new();
+        let mut epi = String::new();
         run(&mut ctx, &mut body);
+        run_epi(&mut ctx, &mut epi);
         ctx.collect = false;
         ctx.counter = 0;
         body.clear();
+        epi.clear();
         let combined = run(&mut ctx, &mut body);
+        let epi_vals = run_epi(&mut ctx, &mut epi);
 
         let region_total = |r: &Region| {
             (if r.key.py != 0 { py_n } else { 1 })
@@ -864,8 +916,21 @@ impl TensorGraph {
                 acc
             };
             writeln!(s, "        let g = {point_flat};").unwrap();
-            for slot in 0..w {
-                writeln!(s, "        out[g * {w}u + {slot}u] = acc{t}[{slot}];").unwrap();
+            writeln!(s, "        let p{dx} = x_raw{t};").unwrap();
+            if let Some(dy) = dy {
+                writeln!(s, "        let p{dy} = y_raw{t};").unwrap();
+            }
+            writeln!(s, "        let lx_ = tx * {rx}u + {i}u;").unwrap();
+            writeln!(s, "        let ly_ = ty * {ry}u + {j}u;").unwrap();
+            let rename = |text: &str| {
+                text.replace("acc[", &format!("acc{t}["))
+                    .replace("hoist_", &format!("hoist{t}_"))
+            };
+            for line in rename(&epi).lines() {
+                writeln!(s, "        {line}").unwrap();
+            }
+            for (slot, val) in epi_vals.iter().enumerate() {
+                writeln!(s, "        out[g * {w_out}u + {slot}u] = {};", rename(val)).unwrap();
             }
             writeln!(s, "    }}").unwrap();
         }
