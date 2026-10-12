@@ -1171,7 +1171,14 @@ pub mod ir_cuda {
 
         /// Launch every kernel in order (asynchronously on the stream).
         pub fn run(&self) {
-            for (k, f) in self.program.kernels.iter().zip(&self.functions) {
+            for i in 0..self.program.kernels.len() {
+                self.run_kernel(i);
+            }
+        }
+
+        /// Launch kernel `i` only.
+        pub fn run_kernel(&self, i: usize) {
+            for (k, f) in std::iter::once((&self.program.kernels[i], &self.functions[i])) {
                 let groups = k.count.div_ceil(k.workgroup_size);
                 let cfg = LaunchConfig {
                     grid_dim: (groups, 1, 1),
@@ -1198,13 +1205,22 @@ pub mod ir_cuda {
         /// Milliseconds per run over `iters` launches of the whole program
         /// (wall clock around a stream sync; launches are asynchronous).
         pub fn time(&self, iters: usize) -> f64 {
+            self.time_with(iters, |e| e.run())
+        }
+
+        /// Milliseconds per launch of kernel `i` alone.
+        pub fn time_kernel(&self, i: usize, iters: usize) -> f64 {
+            self.time_with(iters, |e| e.run_kernel(i))
+        }
+
+        fn time_with(&self, iters: usize, f: impl Fn(&Self)) -> f64 {
             for _ in 0..3 {
-                self.run();
+                f(self);
             }
             self.stream.synchronize().expect("sync");
             let t = std::time::Instant::now();
             for _ in 0..iters {
-                self.run();
+                f(self);
             }
             self.stream.synchronize().expect("sync");
             t.elapsed().as_secs_f64() * 1e3 / iters as f64

@@ -87,5 +87,21 @@ fn main() {
             "block seq={seq}: fwd {ms:.3} ms ({} kernels, {n_native} on tensor cores)",
             exe.program.kernels.len()
         );
+        for (i, k) in exe.program.kernels.iter().enumerate() {
+            let node = &g.nodes()[k.node.index()];
+            println!(
+                "  {:7.3} ms  node {:?} shape {:?} split {} tile {:?} {}",
+                exe.time_kernel(i, 20),
+                k.node,
+                node.shape,
+                node.split,
+                node.tile,
+                if k.source.contains("wmma") {
+                    "wmma"
+                } else {
+                    ""
+                }
+            );
+        }
     }
 }
