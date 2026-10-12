@@ -848,6 +848,35 @@ blocks, `cp.async` pipelining) and fusing the small kernels into their
 neighbours' prologues. Same error as before (5e-5 relative at seq
 128).
 
+### Training step on CUDA, and choosing per kernel
+
+The training step (forward + every gradient, 62 kernels) runs through the
+same path. Two more lowering generalizations went in: bilinear tiles
+with several terms (rope's even/odd halves) and several outputs (the
+merged gate/up projection as one width-2 wmma tile, operands staged
+once). The width-2 tile turned out *slower* than the WGSL tile for
+gate/up (0.25 vs 0.18 ms at seq 512: its stored-C block doubles shared
+memory and halves occupancy). Instead of a threshold,
+`CudaExecutable::new_tuned` compiles the program with the native
+lowerings on and off — same kernels, same bindings — and keeps, per
+kernel, whichever is faster on the device. It keeps 4 of 7 native
+forward kernels at seq 128, 3 of 7 at seq 512, and 9–13 of 21 in the
+training step.
+
+| | tang CUDA (tuned) | PyTorch fp32 | PyTorch TF32 |
+|---|---|---|---|
+| block fwd, seq 128 | 0.58 ms | 0.32 | 0.34 |
+| block fwd, seq 512 | 0.81 | 0.98 | 0.48 |
+| block fwd+bwd, seq 128 | 2.18 | 1.46 | — |
+| block fwd+bwd, seq 512 | 4.80 | 2.15 | — |
+
+(3090 shared with another tenant; run-to-run spread on the training step
+is about ±15%.) The forward is at PyTorch's level; the training step is
+1.5–2.2× behind, and its slowest kernels are the attention backward
+(score recomputation and the online-softmax gradient, not on tensor cores
+yet) — a flash-backward lowering is the same kind of work as the forward
+one.
+
 What this does and does not show: the compiler derives the *structure* of
 the fast kernels (flash attention, register-tiled matmul, sequence
 parallelism) from the algebra, with no op-specific code, and picks per
