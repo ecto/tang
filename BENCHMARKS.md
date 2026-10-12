@@ -672,6 +672,28 @@ Where the gap is, and how much of it this path can close:
   scalar FMAs. Same structure, 4–10× slower execution, for the two
   reasons above.
 
+### After the fusion passes (RTX 3090, same script, GPU shared with another process at ~55%)
+
+| op | before | after | PyTorch |
+|---|---|---|---|
+| block fwd, seq 128 | 1.97 ms | **1.46 ms** (16 kernels) | 0.295 |
+| block fwd+bwd, seq 128 | 5.0 | **3.55** (62 kernels) | 1.32 |
+| block fwd, seq 512 | 4.41 | 4.75 | 0.610 |
+| block fwd+bwd, seq 512 | 10.1 | 13.2 | 1.73 |
+| matmul 1024² | 0.54 | 0.54 (`reg8` 0.44) | 0.112 |
+| attention n=1024 | 0.77 | 0.74 | 0.180 |
+
+The seq-128 numbers are launch-bound and show the fusion work (−26%
+forward, −29% training step). The seq-512 numbers are compute-bound and
+moved with the other tenant's load, not with the code. Walking the
+staged regions in address order (coalesced loads) changed nothing at
+1024²: the tile is bound by shared-memory load issue (8 scalar loads per
+16 FMAs with a 4×4 register tile), which is why 8×8 now edges ahead.
+The next step on this axis is `vec4` reads of the point-minor stage —
+a thread's register-tile points are contiguous there — which cuts the
+load count 4× and is the known recipe for 10–15 TFLOPS in a portable
+shader.
+
 What this does and does not show: the compiler derives the *structure* of
 the fast kernels (flash attention, register-tiled matmul, sequence
 parallelism) from the algebra, with no op-specific code, and picks per
