@@ -410,6 +410,34 @@ pub struct TNode {
     pub reg: (u32, u32),
 }
 
+/// Reduce dims the tiled emitter handles: one chunked axis (the largest)
+/// plus small inner axes looped inside each chunk step — a conv's
+/// `(c, k)`, a polyphase upsample's `(j, c)`. The inner product bounds
+/// how much each staged region grows.
+pub(crate) fn tileable_red(red: &[Dim]) -> bool {
+    let Some(r) = red.iter().map(|d| d.fixed()).collect::<Option<Vec<_>>>() else {
+        return false;
+    };
+    let Some(&big) = r.iter().max() else {
+        return false;
+    };
+    r.iter().product::<usize>() / big.max(1) <= 32
+}
+
+/// The point dims a tile maps to its `(x, y)` axes: the last two dims of
+/// at least 16 (falling back to any non-unit dim), so a narrow trailing
+/// dim — a conv weight gradient's taps `k` in `dw[o, c, k]`, a polyphase
+/// upsample's phase `r` — becomes a uniform (per-workgroup) coordinate
+/// instead of a 7-wide lane axis.
+pub(crate) fn tile_axes(pts: &[usize]) -> (Option<usize>, Option<usize>) {
+    let order: Vec<usize> = (0..pts.len())
+        .rev()
+        .filter(|&d| pts[d] >= 16)
+        .chain((0..pts.len()).rev().filter(|&d| pts[d] > 1 && pts[d] < 16))
+        .collect();
+    (order.first().copied(), order.get(1).copied())
+}
+
 /// `(split, tile, reg)` — one thread mapping for a comp.
 pub type ScheduleCandidate = (u32, (u32, u32, u32), (u32, u32));
 
@@ -544,10 +572,11 @@ impl TensorGraph {
         if c.width() <= 8 {
             out.push((256, (0, 0, 0), (1, 1)));
         }
-        if c.red.len() == 1 {
+        if tileable_red(&c.red) {
             let pts = fixed(c.points());
-            let lanes = pts.iter().rev().find(|&&n| n > 1).copied().unwrap_or(1);
-            let rows = pts.iter().rev().filter(|&&n| n > 1).nth(1).is_some();
+            let (ax, ay) = tile_axes(&pts);
+            let lanes = ax.map_or(1, |d| pts[d]);
+            let rows = ay.is_some();
             if (16..=128).contains(&lanes) && rows {
                 out.push((0, (lanes as u32, (256 / lanes) as u32, 32), (1, 1)));
             }
@@ -1546,8 +1575,8 @@ impl TensorGraph {
             .filter(|&i| {
                 self.comp_at(i).is_some_and(|c| {
                     c.monoid.is_some()
-                        && c.red.len() == 1
-                        && c.red[0].n() >= min_red
+                        && tileable_red(&c.red)
+                        && c.red.iter().map(|d| d.n()).max().unwrap_or(0) >= min_red
                         && (by == 1 || c.points().len() >= 2)
                 })
             })
@@ -1617,9 +1646,9 @@ impl TensorGraph {
         for i in reductions {
             let c = self.comp_at(i).unwrap();
             let pts = fixed(c.points());
-            let lane_dim = (0..pts.len()).rev().find(|&d| pts[d] > 1);
+            let (lane_dim, row_dim) = tile_axes(&pts);
             let lanes = lane_dim.map_or(1, |d| pts[d]);
-            let rows = pts.iter().rev().filter(|&&n| n > 1).nth(1).is_some();
+            let rows = row_dim.is_some();
             // Producers the lane axis does not depend on: a tile computes
             // them once per workgroup instead of once per lane.
             let shared: Vec<usize> = lane_dim
@@ -1641,17 +1670,11 @@ impl TensorGraph {
                 for p in shared {
                     self.nodes[p].inline = true;
                 }
-            } else if c.red.len() == 1 && lanes >= 16 && rows {
+            } else if tileable_red(&c.red) && lanes >= 16 && rows {
                 // matmul-shaped: the 16×16 shared-memory tile, with a 4×4
                 // register tile once both axes are wide enough to fill it
                 // (won on an M4 and a 3090 alike; see BENCHMARKS.md)
-                let rows_n = pts
-                    .iter()
-                    .rev()
-                    .filter(|&&n| n > 1)
-                    .nth(1)
-                    .copied()
-                    .unwrap_or(1);
+                let rows_n = row_dim.map_or(1, |d| pts[d]);
                 let reg = if lanes >= 64 && rows_n >= 64 {
                     (4, 4)
                 } else {
@@ -2549,6 +2572,25 @@ mod tests {
             }
         }
         y
+    }
+
+    #[test]
+    fn schedule_auto_tiles_multi_dim_reductions() {
+        // direct conv: red (c, k) -> chunked c, inner k; 2-D register tile
+        let mut g = TensorGraph::new();
+        let x = g.input(&[64, 200]);
+        let w = g.input(&[96, 64, 7]);
+        let y = conv1d(&mut g, x, w, 3, 9);
+        g.schedule_auto(&[y]);
+        assert_eq!(g.nodes()[y.n()].tile, (16, 16, 32));
+        assert_eq!(g.nodes()[y.n()].reg, (4, 4));
+        // too many inner elements per chunk step: not tiled
+        assert!(!tileable_red(&dims(&[64, 9, 9])));
+        assert!(tileable_red(&dims(&[512, 7])));
+        // a narrow trailing point dim is uniform, not the lane axis
+        assert_eq!(tile_axes(&[512, 512, 7]), (Some(1), Some(0)));
+        assert_eq!(tile_axes(&[256, 2000, 10]), (Some(1), Some(0)));
+        assert_eq!(tile_axes(&[1, 8]), (Some(1), None));
     }
 
     #[test]

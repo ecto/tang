@@ -74,6 +74,9 @@ struct RegionKey {
     inner: Vec<(String, i64)>,
     /// (uniform var, coefficient): leading point dims
     uniform: Vec<(String, i64)>,
+    /// zero-padding guard applied at load time: the source coords and
+    /// shape of a guarded view (exact offsets, so no span merging)
+    guard: Option<(Vec<Sym>, Vec<usize>)>,
 }
 
 struct Region {
@@ -157,6 +160,10 @@ struct Ctx<'a> {
     in_load: bool,
     /// first pass collects regions, second emits against them
     collect: bool,
+    /// pending guard of the arg being read (see `RegionKey::guard`)
+    guard: Option<(Vec<Sym>, Vec<usize>)>,
+    /// the last read consumed `guard`: its value is already zero-padded
+    guard_done: bool,
     counter: usize,
 }
 
@@ -168,6 +175,10 @@ impl Ctx<'_> {
 
     /// Read of buffer-backed node `j` at an address.
     fn buffer_read(&mut self, j: usize, addr: Sym) -> String {
+        if !(addr.terms.contains_key("r0") && !self.in_load) {
+            // only staged regions apply a guard at load time
+            self.guard = None;
+        }
         if self.in_load {
             return format!("b{j}[{}]", addr.wgsl());
         }
@@ -180,6 +191,7 @@ impl Ctx<'_> {
             .unwrap_or(0);
         let shared = addr.terms.contains_key("r0") && (px == 0 || py == 0);
         if !shared {
+            self.guard = None;
             let has_inner = addr.terms.keys().any(|k| !k.starts_with('p') && k != "r0");
             if !addr.terms.contains_key("r0") && has_inner {
                 return self.hoisted_read(j, addr);
@@ -206,7 +218,11 @@ impl Ctx<'_> {
             red: addr.terms["r0"],
             inner,
             uniform,
+            guard: self.guard.take(),
         };
+        if key.guard.is_some() {
+            self.guard_done = true;
+        }
         let idx = match self.regions.iter().position(|r| r.key == key) {
             Some(i) => {
                 let r = &mut self.regions[i];
@@ -431,9 +447,18 @@ impl Ctx<'_> {
                     .collect();
                 let pk = src_shape.len() - self.tuple_rank(a.src.n());
                 let slot = flat(&cs[pk..], &src_shape[pk..]);
+                let direct = match &self.g.nodes[a.src.n()].op {
+                    Op::Input(_) | Op::Reshape(_) => true,
+                    Op::Comp(_) => self.reads.contains(&a.src.n()),
+                    Op::Iota(_) => false,
+                };
+                self.guard = (a.view.guard && direct && pk == src_shape.len())
+                    .then(|| (cs.clone(), src_shape.clone()));
+                self.guard_done = false;
                 let v = self.expand(out, a.src.n(), &cs);
+                self.guard = None;
                 let v = v.slot(&slot);
-                if !a.view.guard || self.collect {
+                if !a.view.guard || self.collect || std::mem::take(&mut self.guard_done) {
                     return v;
                 }
                 // zero padding: the (possibly wrapped) read is discarded
@@ -527,15 +552,34 @@ impl TensorGraph {
         let pts_v = fixed(c.points());
         let pts = pts_v.as_slice();
         let k = pts.len();
-        let r_total = c.red[0].n();
+        // Multi-dim reductions: the largest reduce dim is the chunked
+        // `r0`; the others (`u{i}`, e.g. a conv's taps) are inner loops
+        // inside each chunk step, staged alongside it like any inner var.
+        let red = fixed(&c.red);
+        let rsel = (0..red.len())
+            .rev()
+            .max_by_key(|&i| red[i])
+            .expect("tile needs a reduce dim");
+        let red_name = |i: usize| {
+            if i == rsel {
+                "r0".to_string()
+            } else {
+                format!("u{i}")
+            }
+        };
+        let inner_red: Vec<(String, usize)> = (0..red.len())
+            .filter(|&i| i != rsel)
+            .map(|i| (red_name(i), red[i]))
+            .collect();
+        let r_total = red[rsel];
         let m = c.monoid.as_ref().expect("tile needs a reduction");
         let threads = bx * by;
 
         // Tile the last two non-unit point dims; everything else is
         // uniform across the workgroup.
-        let mut non_unit = (0..k).rev().filter(|&d| pts[d] > 1);
-        let dx = non_unit.next().unwrap_or(k - 1);
-        let dy = if by > 1 { non_unit.next() } else { None };
+        let (ax, ay) = super::tile_axes(pts);
+        let dx = ax.unwrap_or(k - 1);
+        let dy = if by > 1 { ay } else { None };
         let others: Vec<usize> = (0..k).filter(|&d| d != dx && Some(d) != dy).collect();
         let nx = pts[dx];
         let ny = dy.map_or(1, |d| pts[d]);
@@ -557,12 +601,17 @@ impl TensorGraph {
             comp_regions: Vec::new(),
             in_load: false,
             collect: true,
+            guard: None,
+            guard_done: false,
             counter: 0,
         };
         ctx.extents.insert("r0".into(), r_total);
+        for (name, n) in &inner_red {
+            ctx.extents.insert(name.clone(), *n);
+        }
         let space: Vec<Sym> = (0..k)
             .map(|d| Sym::var(&format!("p{d}")))
-            .chain([Sym::var("r0")])
+            .chain((0..red.len()).map(|i| Sym::var(&red_name(i))))
             .collect();
         let run = |ctx: &mut Ctx, body: &mut String| {
             let arg_vals = ctx.arg_values(body, c, &space);
@@ -580,6 +629,34 @@ impl TensorGraph {
         // Expand twice: first to discover staged regions, then for real.
         let mut body = String::new();
         run(&mut ctx, &mut body);
+        // Keep workgroup memory within 16 KiB (the WebGPU default): halve
+        // the chunk until the staged regions fit. Inner reduce dims
+        // multiply every region; at 28 KiB a direct conv ran one
+        // workgroup per core on an M4 and took 5.0 ms, at 14 KiB 2.4 ms.
+        let staged = |ctx: &Ctx, chunk: usize| {
+            let regions: usize = ctx
+                .regions
+                .iter()
+                .map(|r| {
+                    (if r.key.py != 0 { py_n } else { 1 })
+                        * (if r.key.px != 0 { px_n } else { 1 })
+                        * chunk
+                        * r.inner_n()
+                        * r.span()
+                })
+                .sum();
+            let comps: usize = ctx
+                .comp_regions
+                .iter()
+                .map(|r| (if r.uses_py { py_n } else { 1 }) * chunk * r.width)
+                .sum();
+            regions + comps
+        };
+        let mut chunk = chunk;
+        while chunk > 1 && staged(&ctx, chunk) > 4096 {
+            chunk /= 2;
+        }
+        ctx.chunk = chunk;
         ctx.collect = false;
         ctx.counter = 0;
         body.clear();
@@ -791,12 +868,36 @@ impl TensorGraph {
                 addr.push_str(&format!(" + {coef} * i32({name})"));
             }
             writeln!(s, "            if ({live}) {{").unwrap();
-            writeln!(
-                s,
-                "                stage_{i}[idx] = b{}[u32({addr})];",
-                r.key.buffer
-            )
-            .unwrap();
+            let mut val = format!("b{}[u32({addr})]", r.key.buffer);
+            if let Some((coords, shape)) = &r.key.guard {
+                let rename = |c: &Sym| {
+                    let mut out = Sym {
+                        offset: c.offset,
+                        ..Default::default()
+                    };
+                    for (k, v) in &c.terms {
+                        let name = if *k == ctx.px {
+                            "gx"
+                        } else if Some(k) == ctx.py.as_ref() {
+                            "gy"
+                        } else if k == "r0" {
+                            "chunk + t"
+                        } else {
+                            k.as_str()
+                        };
+                        out.add(&Sym::var(name).scaled(*v));
+                    }
+                    out
+                };
+                let cond = coords
+                    .iter()
+                    .zip(shape)
+                    .map(|(c, n)| format!("({} < {n}u)", rename(c).wgsl()))
+                    .collect::<Vec<_>>()
+                    .join(" && ");
+                val = format!("select(0.0, {val}, {cond})");
+            }
+            writeln!(s, "                stage_{i}[idx] = {val};").unwrap();
             writeln!(s, "            }}").unwrap();
             writeln!(s, "        }}").unwrap();
         }
@@ -829,6 +930,9 @@ impl TensorGraph {
             "        for (var r0: u32 = chunk; r0 < min(chunk + {chunk}u, {r_total}u); r0 = r0 + 1u) {{"
         )
         .unwrap();
+        // inner reduce dims loop outside the register-tile copies, so every
+        // copy shares the staged reads of one (r0, u…) step
+        let outer = std::mem::take(&mut s);
         for &(i, j) in &copies {
             let t = tag(i, j);
             writeln!(s, "            {{").unwrap();
@@ -853,6 +957,34 @@ impl TensorGraph {
             )
             .unwrap();
             writeln!(s, "            }}").unwrap();
+        }
+        let step = std::mem::replace(&mut s, outer);
+        let n_inner: usize = inner_red.iter().map(|(_, n)| n).product();
+        if n_inner <= 16 {
+            // small inner extents (conv taps): unrolled, each step a
+            // constant the compiler folds into the staged addresses
+            for flat in 0..n_inner {
+                writeln!(s, "        {{").unwrap();
+                let mut rem = flat;
+                for (name, n) in inner_red.iter().rev() {
+                    writeln!(s, "        let {name}: u32 = {}u;", rem % n).unwrap();
+                    rem /= n;
+                }
+                s.push_str(&step);
+                writeln!(s, "        }}").unwrap();
+            }
+        } else {
+            for (name, n) in &inner_red {
+                writeln!(
+                    s,
+                    "        for (var {name}: u32 = 0u; {name} < {n}u; {name} = {name} + 1u) {{"
+                )
+                .unwrap();
+            }
+            s.push_str(&step);
+            for _ in &inner_red {
+                writeln!(s, "        }}").unwrap();
+            }
         }
         writeln!(s, "        }}").unwrap();
         writeln!(s, "        workgroupBarrier();").unwrap();

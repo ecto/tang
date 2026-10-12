@@ -937,6 +937,229 @@ pub mod ir_gpu {
             }
         }
 
+        /// Direct conv `y[o,t] = Σ_{c,k} w[o,c,k]·x[c, t + d·k − p]`, guarded.
+        fn conv_graph(
+            ci: usize,
+            co: usize,
+            t: usize,
+            k: usize,
+            dil: i64,
+        ) -> (TensorGraph, TensorId) {
+            let pad = dil * (k as i64 - 1) / 2;
+            let mut g = TensorGraph::new();
+            let x = g.input(&[ci, t]);
+            let w = g.input(&[co, ci, k]);
+            let xv = View {
+                forms: vec![
+                    Form::unit(4, 2),
+                    Form {
+                        coefs: vec![0, 1, 0, dil],
+                        offset: -pad,
+                    },
+                ],
+                guard: true,
+            };
+            let y = g
+                .comp(
+                    &[co, t],
+                    &[ci, k],
+                    vec![
+                        Arg { src: x, view: xv },
+                        Arg {
+                            src: w,
+                            view: View::pick(4, &[Some(0), Some(2), Some(3)]),
+                        },
+                    ],
+                    Some(Monoid::sum()),
+                    |v| vec![v[0] * v[1]],
+                )
+                .unwrap();
+            (g, y)
+        }
+
+        fn check_vs_interp(
+            device: &GpuDevice,
+            cache: &mut KernelCache,
+            name: &str,
+            g: &TensorGraph,
+            outs: &[TensorId],
+            inputs: &[Vec<f32>],
+            want: &[Vec<f64>],
+        ) {
+            let refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
+            let exe = Executable::new(device, g.to_wgsl(outs), &refs);
+            exe.run(device, cache);
+            cache.flush(device);
+            for (o, w) in outs.iter().zip(want) {
+                let got = exe.read(device, *o);
+                let scale = w.iter().fold(1e-30f64, |m, v| m.max(v.abs()));
+                for (i, (a, b)) in got.iter().zip(w).enumerate() {
+                    assert!(
+                        (*a as f64 - b).abs() < 1e-5 * scale,
+                        "{name} out {}[{i}]: {a} vs {b}",
+                        o.index()
+                    );
+                }
+            }
+        }
+
+        /// Multi-dim reductions (`red = (c, k)`) through the tiled
+        /// emitter: guarded + dilated reads, ragged tiles, register tiles,
+        /// and the backward graph (`dx` reduces over `(o, k)`).
+        #[test]
+        fn multi_dim_reductions_tile_on_gpu() {
+            let Ok(device) = GpuDevice::new_sync() else {
+                eprintln!("no GPU, skipping");
+                return;
+            };
+            let mut cache = KernelCache::new();
+            let mut rng = crate::Rng::new(11);
+            for &(ci, co, t, k, dil) in &[(5, 7, 37, 3, 1), (40, 33, 70, 7, 3), (19, 64, 130, 5, 2)]
+            {
+                let (g, y) = conv_graph(ci, co, t, k, dil);
+                let inputs = vec![
+                    (0..ci * t)
+                        .map(|_| rng.f32() * 2.0 - 1.0)
+                        .collect::<Vec<f32>>(),
+                    (0..co * ci * k).map(|_| rng.f32() * 2.0 - 1.0).collect(),
+                ];
+                let f64s: Vec<Vec<f64>> = inputs
+                    .iter()
+                    .map(|v| v.iter().map(|&x| x as f64).collect())
+                    .collect();
+                let want = g.eval(&f64s, &[y]);
+                for (tile, reg) in [
+                    ((16, 16, 32), (1, 1)),
+                    ((16, 16, 32), (2, 2)),
+                    ((16, 16, 32), (4, 4)),
+                    ((64, 1, 8), (1, 1)),
+                ] {
+                    let mut gt = g.clone();
+                    gt.set_schedule(y, 0, tile, reg);
+                    let name = format!("conv {ci}x{co}x{t} k{k} d{dil} {tile:?} {reg:?}");
+                    check_vs_interp(&device, &mut cache, &name, &gt, &[y], &inputs, &want);
+                }
+                let mut ga = g.clone();
+                ga.schedule_auto(&[y]);
+                if ci * k >= 64 {
+                    assert!(
+                        ga.nodes()[y.index()].tile.0 > 0,
+                        "auto should tile the direct conv"
+                    );
+                }
+                check_vs_interp(&device, &mut cache, "conv auto", &ga, &[y], &inputs, &want);
+
+                // forward + backward
+                let mut gb = g.clone();
+                let grads = gb
+                    .backward(y, &[TensorId::from_index(0), TensorId::from_index(1)])
+                    .unwrap();
+                let mut outs = vec![y];
+                outs.extend(grads);
+                let want = gb.eval(&f64s, &outs);
+                let (gb, outs) = gb.substitute_maps(&outs);
+                let (mut gb, outs) = gb.eliminate_common(&outs);
+                gb.schedule_auto(&outs);
+                let multi_tiled = outs.iter().any(|o| {
+                    let nd = &gb.nodes()[o.index()];
+                    matches!(&nd.op, tang_compile::tensor::Op::Comp(c) if c.red.len() > 1)
+                        && nd.tile.0 > 0
+                });
+                if ci >= 16 {
+                    assert!(multi_tiled, "dx should take the multi-dim tiled path");
+                }
+                check_vs_interp(
+                    &device,
+                    &mut cache,
+                    "conv fwd+bwd auto",
+                    &gb,
+                    &outs,
+                    &inputs,
+                    &want,
+                );
+                for o in &outs {
+                    for (split, tile, reg) in gb.schedule_candidates(*o) {
+                        let mut gv = gb.clone();
+                        gv.set_schedule(*o, split, tile, reg);
+                        let name = format!("bwd node {} {split} {tile:?} {reg:?}", o.index());
+                        check_vs_interp(&device, &mut cache, &name, &gv, &outs, &inputs, &want);
+                    }
+                }
+            }
+        }
+
+        /// Polyphase upsample `y[o,q,r] = Σ_{j,c} x[c, q−j]·w[o, c, r + s·j]`:
+        /// reduce `(j, c)` with the chunked axis second, and a narrow
+        /// trailing point dim `r` that the tile treats as uniform.
+        #[test]
+        fn polyphase_upsample_tiles_on_gpu() {
+            let Ok(device) = GpuDevice::new_sync() else {
+                eprintln!("no GPU, skipping");
+                return;
+            };
+            let mut cache = KernelCache::new();
+            let (ci, co, t, s) = (70, 40, 50, 3);
+            let mut g = TensorGraph::new();
+            let x = g.input(&[ci, t]);
+            let w = g.input(&[co, ci, 2 * s]);
+            let f = |terms: &[(usize, i64)]| {
+                let mut f = Form::zero(5);
+                for &(d, c) in terms {
+                    f.coefs[d] = c;
+                }
+                f
+            };
+            let xv = View {
+                forms: vec![f(&[(4, 1)]), f(&[(1, 1), (3, -1)])],
+                guard: true,
+            };
+            let wv = View {
+                forms: vec![f(&[(0, 1)]), f(&[(4, 1)]), f(&[(2, 1), (3, s as i64)])],
+                guard: false,
+            };
+            let y = g
+                .comp(
+                    &[co, t, s],
+                    &[2, ci],
+                    vec![Arg { src: x, view: xv }, Arg { src: w, view: wv }],
+                    Some(Monoid::sum()),
+                    |v| vec![v[0] * v[1]],
+                )
+                .unwrap();
+            let mut rng = crate::Rng::new(12);
+            let inputs = vec![
+                (0..ci * t)
+                    .map(|_| rng.f32() * 2.0 - 1.0)
+                    .collect::<Vec<f32>>(),
+                (0..co * ci * 2 * s)
+                    .map(|_| rng.f32() * 2.0 - 1.0)
+                    .collect(),
+            ];
+            let f64s: Vec<Vec<f64>> = inputs
+                .iter()
+                .map(|v| v.iter().map(|&x| x as f64).collect())
+                .collect();
+            let want = g.eval(&f64s, &[y]);
+            let mut ga = g.clone();
+            ga.schedule_auto(&[y]);
+            assert!(ga.nodes()[y.index()].tile.0 > 0);
+            check_vs_interp(
+                &device,
+                &mut cache,
+                "upsample auto",
+                &ga,
+                &[y],
+                &inputs,
+                &want,
+            );
+            for (split, tile, reg) in g.schedule_candidates(y) {
+                let mut gv = g.clone();
+                gv.set_schedule(y, split, tile, reg);
+                let name = format!("upsample {split} {tile:?} {reg:?}");
+                check_vs_interp(&device, &mut cache, &name, &gv, &[y], &inputs, &want);
+            }
+        }
+
         #[test]
         fn derived_attention_matches_hand_kernel_on_gpu() {
             let Ok(device) = GpuDevice::new_sync() else {
