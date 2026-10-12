@@ -269,7 +269,7 @@ impl TensorGraph {
         let root = t.n();
         let rc = self.comp_at(root)?;
         let core = if rc.monoid.is_none() {
-            self.epilogue_core(root)?
+            self.tiled_reduction(root).filter(|&r| r != root)?
         } else {
             root
         };
