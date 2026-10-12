@@ -1253,3 +1253,59 @@ What this shows, and where fragments do not help:
 - `kernel_only` hangs in its transformer-block section on this machine
   (also on the base commit `fd193b4`); its matmul/attention rows above are
   from the part that runs.
+
+### Flash attention on simdgroup fragments (M4 Max, kernel-only)
+
+`cargo run --release -p tang-bench --features metal --example attention_fragments`
+vs `scripts/torch_attention.py`. Both ran interleaved in one
+`gpu-lock` window (two rounds; round 2 shown, round 1 within ~5%).
+d = dv = 64; q/k/v random in [−1, 1]. `f32-auto` is the derived graph
+under `schedule_auto` lowered to MSL (the best f32 schedule we have for
+the multi-head graph); `fragment` is the same graph with q/k/v stored
+f16 and the fused kernel flagged `fragment`: S = Q·Kᵀ on half
+fragments (f32 acc), online softmax in registers (MLX lane layout), P
+cast to half, O += P·V on fragments, normalizer fused. Causal runs skip
+key tiles the mask covers — derived from the graph (the mask
+`select(j − i, −1e30, 0)` is affine in the iota args; evaluated at the
+tile box it gives a uniform skip test). TFLOP/s counts 4·h·n²·d (×½ causal).
+
+| heads | causal | n | f32-auto | fragment | vs f32 | TFLOP/s | SDPA f32 | SDPA f16 |
+|---|---|---|---|---|---|---|---|---|
+| 1 | no | 512 | 0.080 | 0.154 | 0.52× | 0.43 | 0.173 | 0.079 |
+| 1 | no | 1024 | 0.250 | 0.314 | 0.80× | 0.85 | 0.077 | 0.100 |
+| 1 | no | 2048 | 0.860 | 0.678 | 1.27× | 1.58 | 0.179 | 0.189 |
+| 1 | no | 4096 | 3.304 | 1.506 | 2.19× | 2.85 | 0.554 | 0.516 |
+| 1 | yes | 512 | 0.088 | 0.148 | 0.60× | 0.23 | 0.046 | 0.054 |
+| 1 | yes | 1024 | 0.281 | 0.290 | 0.97× | 0.46 | 0.081 | 0.099 |
+| 1 | yes | 2048 | 0.977 | 0.590 | 1.65× | 0.91 | 0.165 | 0.191 |
+| 1 | yes | 4096 | 3.743 | 1.238 | 3.02× | 1.73 | 0.409 | 0.463 |
+| 8 | no | 512 | 0.422 | 0.191 | 2.21× | 2.81 | 0.081 | 0.073 |
+| 8 | no | 1024 | 1.659 | 0.780 | 2.13× | 2.75 | 0.251 | 0.233 |
+| 8 | no | 2048 | 6.449 | 2.951 | 2.18× | 2.91 | 0.882 | 0.757 |
+| 8 | no | 4096 | 26.50 | 12.59 | 2.11× | 2.73 | 3.654 | 2.992 |
+| 8 | yes | 512 | 0.508 | 0.175 | 2.91× | 1.54 | 0.065 | 0.069 |
+| 8 | yes | 1024 | 2.068 | 0.440 | 4.70× | 2.44 | 0.167 | 0.150 |
+| 8 | yes | 2048 | 8.224 | 1.637 | 5.02× | 2.62 | 0.534 | 0.461 |
+| 8 | yes | 4096 | 33.23 | 5.788 | 5.74× | 2.97 | 1.951 | 1.626 |
+
+(ms.) Honest reading:
+
+- Against our own f32 path the fragment kernel wins 2–5.7× once there is
+  enough work (8 heads, or n ≥ 2048 single-head); causal gains more
+  because skipped tiles are free. Max |fragment − f32| is 0.6–1.9e-3 (P
+  and q/k/v in half); `tune_precision` keeps it under a 1% budget vs f64.
+- Against PyTorch MPS SDPA it is **3–4× slower** at 8 heads × 4096 and
+  worse on small single-head problems (grid of n/32 threadgroups is too
+  small to fill the GPU: 16 groups at n = 512). ~3 TFLOP/s against
+  SDPA's ~10. Known gaps, in likely order of payoff: K/V staged by a
+  generic `arg_read` gather each tile (scalar loads, two barriers, no
+  double buffering, no direct device fragment loads); BK = 32 keys and
+  8 rows per SIMD group (MLX uses larger query tiles per SIMD group and
+  `exp2` with log2e folded into the scale); single-head small-n needs
+  key-split (flash-decoding) parallelism.
+- The CUDA wmma flash kernel from #34 (`flash_tile`) matches a narrower
+  pattern (exact `(score, 1, v)` slots, unscaled score, d_lanes ∈ 16..64);
+  the Metal `attention_plan` is a superset (literal scale, ragged d/n/dv,
+  guarded views, any per-row slots, dv blocked as a grid axis, GQA via
+  `[hk, g]` heads). Folding `flash_tile` onto `attention_plan` is a
+  follow-up.

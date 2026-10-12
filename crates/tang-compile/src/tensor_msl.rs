@@ -144,6 +144,9 @@ impl TensorGraph {
                     if let Some(plan) = frag.then(|| self.fragment_plan(k.node)).flatten() {
                         return self.fragment_kernel(root, &plan, target);
                     }
+                    if let Some(plan) = frag.then(|| self.attention_plan(k.node)).flatten() {
+                        return self.attention_kernel(root, &plan);
+                    }
                     let reads: Vec<usize> = k.reads.iter().map(|t| t.n()).collect();
                     let groups = (k.count as usize).div_ceil(k.workgroup_size as usize);
                     let (source, threadgroup_bytes) = translate(self, &k.source, &reads, root);
@@ -1172,6 +1175,881 @@ impl TensorGraph {
         }
         Some((off, coefs))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Attention on fragments
+// ---------------------------------------------------------------------------
+
+/// Query rows per threadgroup (4 SIMD groups × 8), keys per staged tile.
+const ATT_BQ: usize = 32;
+const ATT_BK: usize = 32;
+/// Largest value-column block per threadgroup (wider `dv` is a grid axis).
+const ATT_BC: usize = 64;
+/// Largest score reduction (head dim) whose query fragments stay in registers.
+const ATT_MAX_D: usize = 256;
+/// Finite "minus infinity" (fast math need not honour ∞).
+const ATT_NEG: &str = "-3.0e38f";
+
+/// How an online-softmax reduction maps onto fragments (see
+/// [`TensorGraph::attention_plan`]).
+#[derive(Clone)]
+pub struct AttentionPlan {
+    /// The online-softmax reduction (the root, or under its epilogue).
+    pub red: usize,
+    /// Arg of `red` that reads the score comp, and that comp.
+    pub score_arg: usize,
+    pub score: usize,
+    /// Literal factor of the score body (`v_i·v_j·lit`), applied in f32.
+    pub scale: f64,
+    /// `Q` (`A`, independent of the key) and `K` (independent of the
+    /// row) reads, composed onto `red`'s space ++ `[head dim]`.
+    pub q: super::Arg,
+    pub k: super::Arg,
+    /// Score reduction extent (head dim) and key extent.
+    pub dk: usize,
+    pub nk: usize,
+    /// Point dims of `red`: query rows, value columns; the rest are grid
+    /// axes (batch, heads).
+    pub dr: usize,
+    pub dc: usize,
+    /// The state slot that is `Σ p·V` (its body a single read of `V`, arg
+    /// `v_arg`); every other slot past 0 is a per-row sum `Σ p·g(i, j)`.
+    pub pv_slot: usize,
+    pub v_arg: usize,
+    /// Affine mask condition over `red`'s space when slot 0 is
+    /// `score + select(c, ≤ −1e20, 0)`: a key tile where `c > 0`
+    /// everywhere contributes nothing and is skipped.
+    pub mask: Option<super::Form>,
+}
+
+impl TensorGraph {
+    /// Flatten a product body into its var factors and literal scale.
+    fn product_factors(
+        g: &tang_expr::ExprGraph,
+        root: tang_expr::ExprId,
+    ) -> Option<(Vec<u16>, f64)> {
+        let nodes = g.nodes_slice();
+        let mut vars = Vec::new();
+        let mut scale = 1.0;
+        let mut stack = vec![root];
+        while let Some(e) = stack.pop() {
+            match nodes[e.index() as usize] {
+                Node::Mul(a, b) => {
+                    stack.push(a);
+                    stack.push(b);
+                }
+                Node::Var(v) => vars.push(v),
+                Node::Lit(b) => scale *= f64::from_bits(b),
+                Node::Neg(a) => {
+                    scale = -scale;
+                    stack.push(a);
+                }
+                _ => return None,
+            }
+        }
+        Some((vars, scale))
+    }
+
+    /// The single-red-dim inline sum `Σ_k A·B·lit` an arg reads: `(A arg,
+    /// B arg, lit)` of that comp.
+    fn score_comp(&self, src: usize) -> Option<(usize, usize, f64)> {
+        let c = self.comp_at(src)?;
+        if !self.nodes[src].inline
+            || c.monoid.as_ref()?.kind() != MonoidKind::Sum
+            || c.width() != 1
+            || c.tuple != 0
+            || c.red.len() != 1
+        {
+            return None;
+        }
+        let (vars, scale) = Self::product_factors(&c.body, c.body_outs[0])?;
+        match vars[..] {
+            [a, b] if a != b => Some((a as usize, b as usize, scale)),
+            _ => None,
+        }
+    }
+
+    /// `e` as an affine form over `c`'s space when it is built from iota
+    /// reads, literals, `+`, `−` and literal scaling.
+    fn affine_of(&self, c: &super::Comp, e: tang_expr::ExprId) -> Option<(super::Form, f64)> {
+        let nodes = c.body.nodes_slice();
+        let rank = c.rank();
+        match nodes[e.index() as usize] {
+            Node::Lit(b) => Some((super::Form::zero(rank), f64::from_bits(b))),
+            Node::Var(v) => {
+                let a = &c.args[v as usize];
+                match self.nodes[a.src.n()].op {
+                    Op::Iota(d) if !a.view.guard => Some((a.view.forms[d].clone(), 0.0)),
+                    _ => None,
+                }
+            }
+            Node::Add(x, y) => {
+                let (fx, cx) = self.affine_of(c, x)?;
+                let (fy, cy) = self.affine_of(c, y)?;
+                let mut f = fx;
+                f.offset += fy.offset;
+                for (a, b) in f.coefs.iter_mut().zip(&fy.coefs) {
+                    *a += b;
+                }
+                Some((f, cx + cy))
+            }
+            Node::Neg(x) => {
+                let (f, k) = self.affine_of(c, x)?;
+                Some((f.scaled(-1), -k))
+            }
+            Node::Mul(x, y) => {
+                let lit = |e: tang_expr::ExprId| match nodes[e.index() as usize] {
+                    Node::Lit(b) => {
+                        let v = f64::from_bits(b);
+                        (v.fract() == 0.0).then_some(v as i64)
+                    }
+                    _ => None,
+                };
+                let (k, other) = match (lit(x), lit(y)) {
+                    (Some(k), _) => (k, y),
+                    (_, Some(k)) => (k, x),
+                    _ => return None,
+                };
+                let (f, c0) = self.affine_of(c, other)?;
+                Some((f.scaled(k), c0 * k as f64))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `t` (scheduled `fragment`) is attention that runs on f16
+    /// fragments with f32 accumulation: an online-softmax reduction over
+    /// keys `j` (as the root, or under an epilogue map that reads it
+    /// point-for-point) whose
+    /// - slot 0 is `score + rest`, `score = Σ_k Q·K·lit` an inlined sum
+    ///   over one dim with `Q` independent of `j` and `K` of the query row,
+    ///   `rest` any function of args that do not vary along the value
+    ///   column (a mask);
+    /// - one slot is a single read of `V(j, c)` (`O += P·V`), the others
+    ///   functions of `(i, j)` summed per row (the normalizer `1`);
+    /// - `Q`, `K`, `V` are f16 buffers, the accumulator f32.
+    pub fn attention_plan(&self, t: TensorId) -> Option<AttentionPlan> {
+        let root = t.n();
+        let red = self.tiled_reduction(root)?;
+        let c = self.comp_at(red)?;
+        let m = c.monoid.as_ref()?;
+        if m.kind() != MonoidKind::OnlineSoftmax
+            || c.red.len() != 1
+            || c.tuple != 1
+            || self.nodes[red].precision.accum != Format::F32
+        {
+            return None;
+        }
+        if red != root {
+            self.attention_epilogue(root, red)?;
+        }
+        let pts: Vec<usize> = c
+            .points()
+            .iter()
+            .map(|d| d.fixed())
+            .collect::<Option<_>>()?;
+        let pk = pts.len();
+        let nk = c.red[0].fixed()?;
+        let live_vars = |out: tang_expr::ExprId| -> Vec<usize> {
+            let n = c.body.nodes_slice();
+            c.body
+                .live_set(&[out])
+                .into_iter()
+                .filter_map(|k| match n[k] {
+                    Node::Var(v) => Some(v as usize),
+                    _ => None,
+                })
+                .collect()
+        };
+        // slot 0: exactly one score read
+        let s_vars = live_vars(c.body_outs[0]);
+        let mut score = None;
+        for &v in &s_vars {
+            if let Some(sc) = self.score_comp(c.args[v].src.n()) {
+                if score.replace((v, sc)).is_some() {
+                    return None;
+                }
+            }
+        }
+        let (score_arg, (ia, ib, scale)) = score?;
+        let sn = c.args[score_arg].src.n();
+        let sc = self.comp_at(sn)?;
+        let dk = sc.red[0].fixed()?;
+        if dk > ATT_MAX_D {
+            return None;
+        }
+        // compose the score's operand reads onto [red space ++ k]
+        let rank = pk + 2;
+        let ra = &c.args[score_arg];
+        let mut inner: Vec<super::Form> = ra
+            .view
+            .forms
+            .iter()
+            .map(|f| {
+                let mut g = f.clone();
+                g.coefs.push(0);
+                g
+            })
+            .collect();
+        inner.push(super::Form::unit(rank, pk + 1));
+        let inner = super::View {
+            forms: inner,
+            guard: ra.view.guard,
+        };
+        let comp = |a: &super::Arg| super::Arg {
+            src: a.src,
+            view: a.view.compose(&inner, rank),
+        };
+        let (qa, ka) = (comp(&sc.args[ia]), comp(&sc.args[ib]));
+        let j = pk;
+        let (q, k) = if !qa.view.depends_on(j) {
+            (qa, ka)
+        } else {
+            (ka, qa)
+        };
+        if q.view.depends_on(j) {
+            return None;
+        }
+        // rows: what Q varies along and K does not — the innermost such
+        // dim of Q's address
+        let qaddr = self.flat_addr(&q, rank);
+        let dr = (0..pk)
+            .filter(|&d| pts[d] > 1 && q.view.depends_on(d) && !k.view.depends_on(d))
+            .min_by_key(|&d| qaddr.coefs[d].unsigned_abs())?;
+        // slots
+        let mut pv = None;
+        for (slot, &out) in c.body_outs.iter().enumerate().skip(1) {
+            let vars = live_vars(out);
+            let wide = vars.iter().any(|&v| {
+                (0..pk).any(|d| {
+                    d != dr && c.args[v].view.depends_on(d) && pts[d] > 1 && !q.view.depends_on(d)
+                })
+            });
+            if !wide {
+                continue;
+            }
+            let n = c.body.nodes_slice();
+            let Node::Var(v) = n[out.index() as usize] else {
+                return None;
+            };
+            if pv.replace((slot, v as usize)).is_some() {
+                return None;
+            }
+        }
+        let (pv_slot, v_arg) = pv?;
+        let va = &c.args[v_arg];
+        if va.view.depends_on(dr) {
+            return None;
+        }
+        let dcs: Vec<usize> = (0..pk)
+            .filter(|&d| pts[d] > 1 && va.view.depends_on(d) && !q.view.depends_on(d))
+            .collect();
+        let [dc] = dcs[..] else { return None };
+        // nothing but the PV slot may vary along the value column
+        for (slot, &out) in c.body_outs.iter().enumerate() {
+            if slot == pv_slot {
+                continue;
+            }
+            for v in live_vars(out) {
+                if v != score_arg && c.args[v].view.depends_on(dc) {
+                    return None;
+                }
+            }
+        }
+        if q.view.depends_on(dc) || k.view.depends_on(dc) {
+            return None;
+        }
+        // f16 operands
+        for a in [&q, &k, va] {
+            if !self.f16_buffer(a.src) {
+                return None;
+            }
+        }
+        // mask: slot 0 = score + select(cond, ≤ −1e20, 0), cond affine
+        let mask = {
+            let n = c.body.nodes_slice();
+            let is_score = |e: tang_expr::ExprId| matches!(n[e.index() as usize], Node::Var(v) if v as usize == score_arg);
+            match n[c.body_outs[0].index() as usize] {
+                Node::Add(x, y) if is_score(x) || is_score(y) => {
+                    let other = if is_score(x) { y } else { x };
+                    match n[other.index() as usize] {
+                        Node::Select(cnd, a, b) => {
+                            let lit = |e: tang_expr::ExprId| match n[e.index() as usize] {
+                                Node::Lit(b) => Some(f64::from_bits(b)),
+                                _ => None,
+                            };
+                            match (lit(a), lit(b)) {
+                                (Some(neg), Some(zero)) if neg <= -1e20 && zero == 0.0 => self
+                                    .affine_of(c, cnd)
+                                    .filter(|(_, k)| k.fract() == 0.0)
+                                    .map(|(mut f, k)| {
+                                        f.offset += k as i64;
+                                        f
+                                    }),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        };
+        Some(AttentionPlan {
+            red,
+            score_arg,
+            score: sn,
+            scale,
+            q,
+            k,
+            dk,
+            nk,
+            dr,
+            dc,
+            pv_slot,
+            v_arg,
+            mask,
+        })
+    }
+
+    /// For an epilogue `root` over online-softmax `red`: for each root
+    /// point dim, the `red` point dim it is (a pure pick), or `None` for a
+    /// size-1 root dim. Every non-unit `red` point dim must be picked.
+    fn attention_epilogue(&self, root: usize, red: usize) -> Option<Vec<Option<usize>>> {
+        let c = self.comp_at(root)?;
+        let rc = self.comp_at(red)?;
+        let forms = self.epilogue_read(c, red)?;
+        let rk = c.points().len();
+        let rpts = fixed(rc.points());
+        let mut map = vec![None; rk];
+        for (r, f) in forms.iter().enumerate() {
+            let nz: Vec<usize> = (0..rk).filter(|&d| f.coefs[d] != 0).collect();
+            match nz[..] {
+                [] if f.offset == 0 && rpts[r] == 1 => {}
+                [d] if f.coefs[d] == 1 && f.offset == 0 && map[d].is_none() => map[d] = Some(r),
+                _ => return None,
+            }
+        }
+        let cpts = fixed(c.points());
+        for (d, m) in map.iter().enumerate() {
+            if m.is_none() && cpts[d] != 1 {
+                return None;
+            }
+        }
+        for (r, &n) in rpts.iter().enumerate() {
+            if n > 1 && !map.contains(&Some(r)) {
+                return None;
+            }
+        }
+        Some(map)
+    }
+
+    /// Storage buffers of `t`'s attention operands `Q`, `K`, `V`.
+    pub fn attention_operands(&self, t: TensorId) -> Option<[TensorId; 3]> {
+        let root = t.n();
+        let red = self.tiled_reduction(root)?;
+        let c = self.comp_at(red)?;
+        if c.monoid.as_ref()?.kind() != MonoidKind::OnlineSoftmax {
+            return None;
+        }
+        // like the plan, without the precision gate
+        let mut ops = Vec::new();
+        for (v, a) in c.args.iter().enumerate() {
+            if let Some((ia, ib, _)) = self.score_comp(a.src.n()) {
+                let sc = self.comp_at(a.src.n())?;
+                ops.push(self.storage(sc.args[ia].src));
+                ops.push(self.storage(sc.args[ib].src));
+                let _ = v;
+            }
+        }
+        for &out in &c.body_outs[1..] {
+            if let Node::Var(v) = c.body.nodes_slice()[out.index() as usize] {
+                let s = self.storage(c.args[v as usize].src);
+                if matches!(self.nodes[s.n()].op, Op::Input(_) | Op::Comp(_)) {
+                    ops.push(s);
+                }
+            }
+        }
+        match ops[..] {
+            [q, k, v] => Some([q, k, v]),
+            _ => None,
+        }
+    }
+
+    fn attention_kernel(&self, root: usize, plan: &AttentionPlan) -> MslKernel {
+        let (pre, reads) = self.kernel_preamble(root);
+        let c = self.comp_at(plan.red).unwrap();
+        let pts = fixed(c.points());
+        let pk = pts.len();
+        let w = c.width();
+        let (dr, dc) = (plan.dr, plan.dc);
+        let (nq, nc, nk, dk) = (pts[dr], pts[dc], plan.nk, plan.dk);
+        let others: Vec<usize> = (0..pk).filter(|&d| d != dr && d != dc).collect();
+        let (bq, bk) = (ATT_BQ, ATT_BK);
+        let bc = nc.next_multiple_of(8).min(ATT_BC);
+        let d8 = dk.next_multiple_of(8);
+        let (ldq, ldk, ldv, ldc) = (d8 + 8, d8 + 8, bc + 8, bc + 4);
+        // halves: Q staging, then K|V tiles, then the f32 result tile
+        let sm = (bq * ldq).max(bk * ldk + bk * ldv).max(2 * bq * ldc);
+        let (tr, tc) = (nq.div_ceil(bq), nc.div_ceil(bc));
+        let nlead: usize = others.iter().map(|&d| pts[d]).product();
+        let n_tiles = tr * tc * nlead;
+        let (nqf, ncf, nkf) = (d8 / 8, bc / 8, bk / 8);
+        let scale = super::wgsl::lit(plan.scale);
+        // synthetic comp over red space ++ [k]: r0 = key, r1 = head dim
+        let syn = super::Comp {
+            out: c.out.clone(),
+            tuple: c.tuple,
+            red: vec![c.red[0], super::Dim::Fixed(dk)],
+            args: vec![plan.q.clone(), plan.k.clone()],
+            body: c.body.clone(),
+            body_outs: c.body_outs.clone(),
+            monoid: None,
+        };
+        // red-space coords in scope as p{d}, r0
+        let coords = |row: &str, col: &str, key: &str| -> String {
+            format!("const uint p{dr} = {row}; const uint p{dc} = {col}; const uint r0 = {key};")
+        };
+        let unit_pts: String = others
+            .iter()
+            .filter(|&&d| pts[d] == 1)
+            .map(|d| format!(" const uint p{d} = 0u;"))
+            .collect();
+        let _ = unit_pts;
+
+        let mut s = pre;
+        writeln!(
+            s,
+            "// attention on fragments: rows p{dr} ({nq}), value cols p{dc} ({nc}), keys {nk}, head dim {dk}, scale {scale}"
+        )
+        .unwrap();
+        writeln!(s, "kernel void k_main(KERNEL_PARAMS uint3 wid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {{").unwrap();
+        writeln!(s, "    threadgroup float smem_f[{}];", sm / 2).unwrap();
+        writeln!(s, "    threadgroup half* smem = (threadgroup half*)smem_f;").unwrap();
+        writeln!(s, "    threadgroup float Ls[{}];", w * bq).unwrap();
+        writeln!(s, "    BUFS_INIT").unwrap();
+        writeln!(s, "    const uint tile = wid.x + wid.y * 65535u;").unwrap();
+        writeln!(s, "    if (tile >= {n_tiles}u) {{ return; }}").unwrap();
+        // rows slowest; under a mask that lightens low rows (causal: c = j − i)
+        // the heavy row tiles are dispatched first
+        let heavy_last = plan.mask.as_ref().is_some_and(|f| f.coefs[dr] < 0);
+        writeln!(s, "    const uint tile_c = tile % {tc}u;").unwrap();
+        writeln!(s, "    uint lead = (tile / {tc}u) % {nlead}u;").unwrap();
+        if heavy_last {
+            writeln!(
+                s,
+                "    const uint tile_r = {}u - tile / {}u;",
+                tr - 1,
+                tc * nlead
+            )
+            .unwrap();
+        } else {
+            writeln!(s, "    const uint tile_r = tile / {}u;", tc * nlead).unwrap();
+        }
+        for &d in others.iter().rev() {
+            writeln!(s, "    const uint p{d} = lead % {}u;", pts[d]).unwrap();
+            writeln!(s, "    lead = lead / {}u;", pts[d]).unwrap();
+        }
+        writeln!(s, "    const uint m0 = tile_r * {bq}u;").unwrap();
+        writeln!(s, "    const uint c0 = tile_c * {bc}u;").unwrap();
+        // stage Q (zero-padded) and keep this SIMD group's rows in registers
+        writeln!(
+            s,
+            "    for (uint idx = tid; idx < {}u; idx += 128u) {{",
+            bq * d8
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "        const uint ri = idx / {d8}u; const uint ci = idx % {d8}u;"
+        )
+        .unwrap();
+        writeln!(s, "        float v = 0.0f;").unwrap();
+        writeln!(s, "        if (m0 + ri < {nq}u && ci < {dk}u) {{").unwrap();
+        writeln!(
+            s,
+            "            {} const uint r1 = ci;",
+            coords("m0 + ri", "0u", "0u")
+        )
+        .unwrap();
+        writeln!(s, "            v = {};", arg_read(self, &syn, &syn.args[0])).unwrap();
+        writeln!(s, "        }}").unwrap();
+        writeln!(s, "        smem[ri * {ldq}u + ci] = half(v);").unwrap();
+        writeln!(s, "    }}").unwrap();
+        writeln!(s, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+        writeln!(s, "    simdgroup_half8x8 fq[{nqf}];").unwrap();
+        writeln!(s, "    for (uint kk = 0u; kk < {nqf}u; kk++) simdgroup_load(fq[kk], &smem[(sg * 8u) * {ldq}u + kk * 8u], {ldq});").unwrap();
+        writeln!(s, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+        writeln!(s, "    threadgroup half* Ks = smem;").unwrap();
+        writeln!(s, "    threadgroup half* Vs = smem + {};", bk * ldk).unwrap();
+        // MLX's lane layout of an 8×8 fragment: each lane holds one row,
+        // two adjacent columns; a row's 8 columns live on lanes ^1 and ^8
+        writeln!(s, "    const uint qid = lane / 4u;").unwrap();
+        writeln!(s, "    const uint fm = (qid & 4u) + (lane / 2u) % 4u;").unwrap();
+        writeln!(s, "    const uint fn = (qid & 2u) * 2u + (lane % 2u) * 2u;").unwrap();
+        writeln!(s, "    const uint row = m0 + sg * 8u + fm;").unwrap();
+        writeln!(s, "    float mrow = {ATT_NEG};").unwrap();
+        let row_slots: Vec<usize> = (1..w).filter(|&k| k != plan.pv_slot).collect();
+        for &k in &row_slots {
+            writeln!(s, "    float lsum{k} = 0.0f;").unwrap();
+        }
+        writeln!(s, "    simdgroup_float8x8 acc[{ncf}];").unwrap();
+        writeln!(s, "    for (uint cf = 0u; cf < {ncf}u; cf++) acc[cf] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);").unwrap();
+        writeln!(s, "    for (uint j0 = 0u; j0 < {nk}u; j0 += {bk}u) {{").unwrap();
+        if let Some(f) = &plan.mask {
+            // min of the affine mask condition over the tile's box
+            let mut e = format!("{}", f.offset);
+            for &d in &others {
+                if f.coefs[d] != 0 {
+                    e.push_str(&format!(" + {} * int(p{d})", f.coefs[d]));
+                }
+            }
+            let mut term = |coef: i64, lo: String, hi: String| {
+                if coef != 0 {
+                    let at = if coef > 0 { lo } else { hi };
+                    e.push_str(&format!(" + {coef} * ({at})"));
+                }
+            };
+            term(
+                f.coefs[dr],
+                "int(m0)".into(),
+                format!("int(min(m0 + {bq}u, {nq}u)) - 1"),
+            );
+            term(
+                f.coefs[dc],
+                "int(c0)".into(),
+                format!("int(min(c0 + {bc}u, {nc}u)) - 1"),
+            );
+            term(
+                f.coefs[pk],
+                "int(j0)".into(),
+                format!("int(min(j0 + {bk}u, {nk}u)) - 1"),
+            );
+            writeln!(s, "        // the mask covers this whole key tile: skip it").unwrap();
+            writeln!(s, "        if ({e} > 0) {{ continue; }}").unwrap();
+        }
+        // stage K [j][k] and V [j][c]
+        writeln!(
+            s,
+            "        for (uint idx = tid; idx < {}u; idx += 128u) {{",
+            bk * d8
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "            const uint ji = idx / {d8}u; const uint ci = idx % {d8}u;"
+        )
+        .unwrap();
+        writeln!(s, "            float v = 0.0f;").unwrap();
+        writeln!(s, "            if (j0 + ji < {nk}u && ci < {dk}u) {{").unwrap();
+        writeln!(
+            s,
+            "                {} const uint r1 = ci;",
+            coords("0u", "0u", "j0 + ji")
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "                v = {};",
+            arg_read(self, &syn, &syn.args[1])
+        )
+        .unwrap();
+        writeln!(s, "            }}").unwrap();
+        writeln!(s, "            Ks[ji * {ldk}u + ci] = half(v);").unwrap();
+        writeln!(s, "        }}").unwrap();
+        writeln!(
+            s,
+            "        for (uint idx = tid; idx < {}u; idx += 128u) {{",
+            bk * bc
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "            const uint ji = idx / {bc}u; const uint ci = idx % {bc}u;"
+        )
+        .unwrap();
+        writeln!(s, "            float v = 0.0f;").unwrap();
+        writeln!(s, "            if (j0 + ji < {nk}u && c0 + ci < {nc}u) {{").unwrap();
+        writeln!(s, "                {}", coords("0u", "c0 + ci", "j0 + ji")).unwrap();
+        writeln!(
+            s,
+            "                v = {};",
+            arg_read(self, c, &c.args[plan.v_arg])
+        )
+        .unwrap();
+        writeln!(s, "            }}").unwrap();
+        writeln!(s, "            Vs[ji * {ldv}u + ci] = half(v);").unwrap();
+        writeln!(s, "        }}").unwrap();
+        writeln!(
+            s,
+            "        threadgroup_barrier(mem_flags::mem_threadgroup);"
+        )
+        .unwrap();
+        // S = Q·Kᵀ
+        writeln!(s, "        simdgroup_float8x8 sf[{nkf}];").unwrap();
+        writeln!(s, "        for (uint jf = 0u; jf < {nkf}u; jf++) sf[jf] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);").unwrap();
+        writeln!(s, "        for (uint kk = 0u; kk < {nqf}u; kk++) {{").unwrap();
+        writeln!(s, "            for (uint jf = 0u; jf < {nkf}u; jf++) {{").unwrap();
+        writeln!(s, "                simdgroup_half8x8 kf;").unwrap();
+        writeln!(s, "                simdgroup_load(kf, &Ks[(jf * 8u) * {ldk}u + kk * 8u], {ldk}, ulong2(0, 0), true);").unwrap();
+        writeln!(
+            s,
+            "                simdgroup_multiply_accumulate(sf[jf], fq[kk], kf, sf[jf]);"
+        )
+        .unwrap();
+        writeln!(s, "            }}").unwrap();
+        writeln!(s, "        }}").unwrap();
+        // slot-0 element value at (row, key) in this lane's registers
+        let var_of = |pfx: &'static str| {
+            move |v: u16| -> String {
+                if v as usize == plan.score_arg {
+                    "sx".to_string()
+                } else {
+                    let _ = pfx;
+                    arg_read(self, c, &c.args[v as usize])
+                }
+            }
+        };
+        writeln!(s, "        float sv[{}];", 2 * nkf).unwrap();
+        writeln!(s, "        float tmax = {ATT_NEG};").unwrap();
+        writeln!(s, "        for (uint jf = 0u; jf < {nkf}u; jf++) {{").unwrap();
+        writeln!(s, "            for (uint e = 0u; e < 2u; e++) {{").unwrap();
+        writeln!(s, "                const uint key = j0 + jf * 8u + fn + e;").unwrap();
+        writeln!(s, "                float val = {ATT_NEG};").unwrap();
+        writeln!(s, "                if (row < {nq}u && key < {nk}u) {{").unwrap();
+        writeln!(
+            s,
+            "                    const float sx = sf[jf].thread_elements()[e] * {scale};"
+        )
+        .unwrap();
+        writeln!(s, "                    {}", coords("row", "0u", "key")).unwrap();
+        let vf = var_of("s0_");
+        let outs = emit_scalar_mapped(
+            &mut s,
+            "                    ",
+            &c.body,
+            &c.body_outs[..1],
+            "s0_",
+            &vf,
+        );
+        writeln!(s, "                    val = {};", outs[0]).unwrap();
+        writeln!(s, "                }}").unwrap();
+        writeln!(s, "                sv[jf * 2u + e] = val;").unwrap();
+        writeln!(s, "                tmax = max(tmax, val);").unwrap();
+        writeln!(s, "            }}").unwrap();
+        writeln!(s, "        }}").unwrap();
+        writeln!(s, "        tmax = max(tmax, simd_shuffle_xor(tmax, 1u));").unwrap();
+        writeln!(s, "        tmax = max(tmax, simd_shuffle_xor(tmax, 8u));").unwrap();
+        writeln!(s, "        const float mnew = max(mrow, tmax);").unwrap();
+        writeln!(s, "        const float alpha = exp(mrow - mnew);").unwrap();
+        writeln!(s, "        mrow = mnew;").unwrap();
+        for &k in &row_slots {
+            writeln!(s, "        lsum{k} *= alpha;").unwrap();
+        }
+        writeln!(s, "        for (uint cf = 0u; cf < {ncf}u; cf++) {{ acc[cf].thread_elements()[0] *= alpha; acc[cf].thread_elements()[1] *= alpha; }}").unwrap();
+        writeln!(s, "        simdgroup_half8x8 pf[{nkf}];").unwrap();
+        writeln!(s, "        for (uint jf = 0u; jf < {nkf}u; jf++) {{").unwrap();
+        writeln!(s, "            for (uint e = 0u; e < 2u; e++) {{").unwrap();
+        writeln!(s, "                const uint key = j0 + jf * 8u + fn + e;").unwrap();
+        writeln!(
+            s,
+            "                const bool ok = row < {nq}u && key < {nk}u;"
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "                const float p = ok ? exp(sv[jf * 2u + e] - mnew) : 0.0f;"
+        )
+        .unwrap();
+        writeln!(s, "                pf[jf].thread_elements()[e] = half(p);").unwrap();
+        // per-row slots
+        let simple: Vec<(usize, Option<f64>)> = row_slots
+            .iter()
+            .map(|&k| {
+                let out = c.body_outs[k];
+                let lit = match c.body.nodes_slice()[out.index() as usize] {
+                    Node::Lit(b) => Some(f64::from_bits(b)),
+                    _ => None,
+                };
+                (k, lit)
+            })
+            .collect();
+        for (k, lit) in &simple {
+            if let Some(v) = lit {
+                writeln!(
+                    s,
+                    "                lsum{k} += p * {};",
+                    super::wgsl::lit(*v)
+                )
+                .unwrap();
+            }
+        }
+        let general: Vec<usize> = simple
+            .iter()
+            .filter(|x| x.1.is_none())
+            .map(|x| x.0)
+            .collect();
+        if !general.is_empty() {
+            writeln!(s, "                if (ok) {{").unwrap();
+            writeln!(
+                s,
+                "                    const float sx = sf[jf].thread_elements()[e] * {scale};"
+            )
+            .unwrap();
+            writeln!(s, "                    {}", coords("row", "0u", "key")).unwrap();
+            let outs: Vec<tang_expr::ExprId> = general.iter().map(|&k| c.body_outs[k]).collect();
+            let vf = var_of("g_");
+            let vals =
+                emit_scalar_mapped(&mut s, "                    ", &c.body, &outs, "g_", &vf);
+            for (k, v) in general.iter().zip(vals) {
+                writeln!(s, "                    lsum{k} += p * {v};").unwrap();
+            }
+            writeln!(s, "                }}").unwrap();
+        }
+        writeln!(s, "            }}").unwrap();
+        writeln!(s, "        }}").unwrap();
+        // O += P·V
+        writeln!(s, "        for (uint jf = 0u; jf < {nkf}u; jf++) {{").unwrap();
+        writeln!(s, "            for (uint cf = 0u; cf < {ncf}u; cf++) {{").unwrap();
+        writeln!(s, "                simdgroup_half8x8 vf;").unwrap();
+        writeln!(
+            s,
+            "                simdgroup_load(vf, &Vs[(jf * 8u) * {ldv}u + cf * 8u], {ldv});"
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "                simdgroup_multiply_accumulate(acc[cf], pf[jf], vf, acc[cf]);"
+        )
+        .unwrap();
+        writeln!(s, "            }}").unwrap();
+        writeln!(s, "        }}").unwrap();
+        writeln!(
+            s,
+            "        threadgroup_barrier(mem_flags::mem_threadgroup);"
+        )
+        .unwrap();
+        writeln!(s, "    }}").unwrap();
+        // per-row slots: lane partials → row totals
+        for &k in &row_slots {
+            writeln!(s, "    lsum{k} += simd_shuffle_xor(lsum{k}, 1u);").unwrap();
+            writeln!(s, "    lsum{k} += simd_shuffle_xor(lsum{k}, 8u);").unwrap();
+        }
+        writeln!(s, "    if ((lane & 9u) == 0u) {{").unwrap();
+        writeln!(s, "        Ls[sg * 8u + fm] = mrow;").unwrap();
+        for &k in &row_slots {
+            writeln!(s, "        Ls[{}u + sg * 8u + fm] = lsum{k};", k * bq).unwrap();
+        }
+        writeln!(s, "    }}").unwrap();
+        writeln!(s, "    threadgroup float* Cs = smem_f;").unwrap();
+        writeln!(s, "    for (uint cf = 0u; cf < {ncf}u; cf++) simdgroup_store(acc[cf], &Cs[(sg * 8u) * {ldc}u + cf * 8u], {ldc});").unwrap();
+        writeln!(s, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+        // write-out (and epilogue)
+        writeln!(
+            s,
+            "    for (uint idx = tid; idx < {}u; idx += 128u) {{",
+            bq * bc
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "        const uint ri = idx / {bc}u; const uint ci = idx % {bc}u;"
+        )
+        .unwrap();
+        writeln!(s, "        if (m0 + ri < {nq}u && c0 + ci < {nc}u) {{").unwrap();
+        writeln!(
+            s,
+            "        const uint p{dr} = m0 + ri; const uint p{dc} = c0 + ci;"
+        )
+        .unwrap();
+        for k in 0..w {
+            let v = if k == plan.pv_slot {
+                format!("Cs[ri * {ldc}u + ci]")
+            } else {
+                format!("Ls[{}u + ri]", k * bq)
+            };
+            writeln!(s, "        const float sl{k} = {v};").unwrap();
+        }
+        let out_f = self.nodes[root].precision.storage;
+        let flat = |prefix: &str, pts: &[usize]| {
+            let mut e = String::from("0u");
+            for (d, n) in pts.iter().enumerate() {
+                e = format!("({e}) * {n}u + {prefix}{d}");
+            }
+            e
+        };
+        if root == plan.red {
+            writeln!(s, "        const uint g = {};", flat("p", &pts)).unwrap();
+            for k in 0..w {
+                writeln!(
+                    s,
+                    "        {}",
+                    store(out_f, &format!("g * {w}u + {k}u"), &format!("sl{k}"))
+                )
+                .unwrap();
+            }
+        } else {
+            let map = self.attention_epilogue(root, plan.red).unwrap();
+            let mc = self.comp_at(root).unwrap();
+            let rpts = fixed(mc.points());
+            for (d, m) in map.iter().enumerate() {
+                match m {
+                    Some(r) => writeln!(s, "        const uint t{d} = p{r};").unwrap(),
+                    None => writeln!(s, "        const uint t{d} = 0u;").unwrap(),
+                }
+            }
+            writeln!(s, "        {{").unwrap();
+            for d in 0..rpts.len() {
+                writeln!(s, "        const uint p{d} = t{d};").unwrap();
+            }
+            let args: Vec<String> = mc
+                .args
+                .iter()
+                .map(|a| {
+                    if a.src.n() == plan.red {
+                        format!("sl{}", self.epilogue_slot(a))
+                    } else {
+                        arg_read(self, mc, a)
+                    }
+                })
+                .collect();
+            let vals =
+                emit_scalar_mapped(&mut s, "        ", &mc.body, &mc.body_outs, "e_", &|v| {
+                    args[v as usize].clone()
+                });
+            writeln!(s, "        const uint g = {};", flat("p", &rpts)).unwrap();
+            let mw = mc.width();
+            for (slot, v) in vals.iter().enumerate() {
+                writeln!(
+                    s,
+                    "        {}",
+                    store(out_f, &format!("g * {mw}u + {slot}u"), v)
+                )
+                .unwrap();
+            }
+            writeln!(s, "        }}").unwrap();
+        }
+        writeln!(s, "        }}").unwrap();
+        writeln!(s, "    }}").unwrap();
+        writeln!(s, "}}").unwrap();
+        let points = numel_fixed(&fixed(self.comp_at(root).unwrap().points()));
+        MslKernel {
+            source: translate(self, &s, &reads, root).0,
+            threadgroup_bytes: 2 * sm + 4 * w * bq,
+            entry: "k_main".into(),
+            node: TensorId(root as u32),
+            reads: reads.iter().map(|&j| TensorId(j as u32)).collect(),
+            points: points as u32,
+            groups: grid(n_tiles),
+            threads: 128,
+            fragment: true,
+        }
+    }
+}
+
+fn numel_fixed(p: &[usize]) -> usize {
+    p.iter().product()
 }
 
 // ---------------------------------------------------------------------------

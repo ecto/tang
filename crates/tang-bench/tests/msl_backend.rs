@@ -742,3 +742,174 @@ fn fragment_inlined_map_operand() {
         assert!(exe.program.kernels.iter().all(|kk| kk.node != act));
     }
 }
+
+/// Flash attention on simdgroup fragments, derived from the naive graph:
+/// S = Q·Kᵀ and O += P·V on f16 fragments, the online softmax in
+/// registers, the normalizer fused. Ragged rows/keys/head dims, causal
+/// (with derived key-tile skipping) and not, multi-head and GQA. Judged
+/// against the f16-storage emulation and the pure f64 reference.
+#[test]
+fn fragment_attention() {
+    let Some(dev) = dev() else { return };
+    use tang_bench::ir_gpu::flash_attention_heads_fragment;
+    let mut rng = tang_bench::Rng::new(41);
+    // (kv heads, query heads per kv head, n, d, dv, causal)
+    for (hk, gq, n, d, dv, causal) in [
+        (1, 1, 100, 64, 64, true),
+        (1, 1, 100, 64, 64, false),
+        (1, 1, 1000, 64, 64, true),
+        (1, 1, 1000, 64, 64, false),
+        (1, 1, 512, 64, 64, true),
+        (1, 1, 512, 64, 64, false),
+        (2, 3, 130, 64, 64, true),
+        (2, 3, 130, 64, 64, false),
+        (4, 1, 96, 32, 32, true),
+        (1, 1, 77, 40, 24, true),
+        (1, 2, 70, 48, 136, false),
+    ] {
+        let name = format!("attn hk{hk} g{gq} n{n} d{d} dv{dv} causal {causal}");
+        let (g, y) = flash_attention_heads_fragment(hk, gq, n, d, dv, causal);
+        assert!(g.attention_plan(y).is_some(), "{name}: no plan");
+        assert_eq!(
+            g.attention_plan(y).unwrap().mask.is_some(),
+            causal,
+            "{name}: mask"
+        );
+        let inputs = vec![
+            rand(hk * gq * n * d, &mut rng),
+            rand(hk * n * d, &mut rng),
+            rand(hk * n * dv, &mut rng),
+        ];
+        // the interpreter recomputes the score per value column (n²·d·dv):
+        // check it on the small shapes, use a direct f64 attention above
+        let f = |r: bool| attention_ref(&inputs, hk, gq, n, d, dv, causal, r);
+        if n * n * d * dv * hk * gq <= 200 * 200 * 64 * 64 {
+            assert_close(
+                &g.eval_emulated(&f64s(&inputs), &[y])[0],
+                &f(true),
+                1e-5,
+                &name,
+            );
+        }
+        // P is rounded to f16 before P·V (the emulation keeps it exact)
+        let exe = check(&dev, &name, &g, &[y], &inputs, &[f(true)], 4e-3);
+        assert!(
+            exe.program.kernels.len() == 1 && exe.program.kernels[0].fragment,
+            "{name}"
+        );
+        check(
+            &dev,
+            &format!("{name} vs f64"),
+            &g,
+            &[y],
+            &inputs,
+            &[f(false)],
+            8e-3,
+        );
+    }
+}
+
+/// f32 operands are not eligible: the fragment flag falls back.
+#[test]
+fn fragment_attention_needs_f16() {
+    use tang_bench::ir_gpu::fused_attention_heads;
+    let (mut g, y) = fused_attention_heads(1, 1, 64, 32, 32, true);
+    g.set_fragment(y, true);
+    assert!(g.attention_plan(y).is_none());
+}
+
+fn assert_close(a: &[f64], b: &[f64], tol: f64, name: &str) {
+    assert_eq!(a.len(), b.len());
+    for (i, (x, y)) in a.iter().zip(b).enumerate() {
+        assert!((x - y).abs() <= tol, "{name} ref[{i}]: {x} vs {y}");
+    }
+}
+
+/// Direct f64 GQA attention (inputs optionally rounded to f16 first, as
+/// the f16-storage emulation does).
+#[allow(clippy::too_many_arguments)]
+fn attention_ref(
+    inputs: &[Vec<f32>],
+    hk: usize,
+    gq: usize,
+    n: usize,
+    d: usize,
+    dv: usize,
+    causal: bool,
+    round: bool,
+) -> Vec<f64> {
+    let r = |x: f32| {
+        if round {
+            Format::F16.round(x as f64)
+        } else {
+            x as f64
+        }
+    };
+    let (q, k, v) = (&inputs[0], &inputs[1], &inputs[2]);
+    let scale = 1.0 / (d as f64).sqrt();
+    let mut y = vec![0.0; hk * gq * n * dv];
+    let mut s = vec![0.0; n];
+    for h in 0..hk {
+        for gi in 0..gq {
+            for i in 0..n {
+                let qo = ((h * gq + gi) * n + i) * d;
+                let mut mx = f64::NEG_INFINITY;
+                for (j, sj) in s.iter_mut().enumerate() {
+                    let ko = (h * n + j) * d;
+                    let mut acc = 0.0;
+                    for c in 0..d {
+                        acc += r(q[qo + c]) * scale * r(k[ko + c]);
+                    }
+                    if causal && j > i {
+                        acc += -1e30;
+                    }
+                    *sj = acc;
+                    mx = mx.max(acc);
+                }
+                let mut l = 0.0;
+                let yo = ((h * gq + gi) * n + i) * dv;
+                for (j, sj) in s.iter().enumerate() {
+                    let p = (sj - mx).exp();
+                    l += p;
+                    for c in 0..dv {
+                        y[yo + c] += p * r(v[(h * n + j) * dv + c]);
+                    }
+                }
+                for c in 0..dv {
+                    y[yo + c] /= l;
+                }
+            }
+        }
+    }
+    y
+}
+
+/// `tune_precision` offers the attention fragment kernel as a candidate
+/// and keeps it under a 1% error budget against f64.
+#[test]
+fn tune_precision_picks_attention_fragments() {
+    let Some(dev) = dev() else { return };
+    use tang_bench::ir_gpu::flash_attention_heads_auto;
+    use tang_bench::ir_msl::{fragment_candidates, tune_precision};
+    use tang_compile::tensor::ErrorBudget;
+    let (hk, gq, n, d) = (2, 4, 1024, 64);
+    let (g, y) = flash_attention_heads_auto(hk, gq, n, d, d, true);
+    assert_eq!(fragment_candidates(&g, &[y]), vec![y]);
+    let mut rng = tang_bench::Rng::new(43);
+    let inputs = vec![
+        rand(hk * gq * n * d, &mut rng),
+        rand(hk * n * d, &mut rng),
+        rand(hk * n * d, &mut rng),
+    ];
+    let want = vec![attention_ref(&inputs, hk, gq, n, d, d, true, false)];
+    let refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
+    let r = tune_precision(&dev, g, &[y], &refs, &want, ErrorBudget::rel(1e-2), 10);
+    for t in &r.trials {
+        eprintln!(
+            "{} err {:.2e} ms {:?} kept {}",
+            t.what, t.error.max_rel, t.ms, t.kept
+        );
+    }
+    assert!(r.fragments.contains(&y), "fragment candidate not kept");
+    assert!(r.error.max_rel <= 1e-2);
+}

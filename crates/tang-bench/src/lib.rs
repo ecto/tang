@@ -552,6 +552,145 @@ pub mod ir_gpu {
         (g, outs[0])
     }
 
+    /// Grouped-query attention, written naively: q `[hk, g, n, d]` (`g`
+    /// query heads share each of the `hk` kv heads), k `[hk, n, d]`, v
+    /// `[hk, n, dv]` → `[hk, g, n, dv]`; `softmax(q·kᵀ/√d (+ causal mask))·v`.
+    /// Multi-head attention is `g = 1`, a single head `hk = g = 1`. Keeping
+    /// the query heads as `[hk, g]` keeps every view affine.
+    pub fn naive_attention_heads(
+        hk: usize,
+        gq: usize,
+        n: usize,
+        d: usize,
+        dv: usize,
+        causal: bool,
+    ) -> (TensorGraph, TensorId) {
+        let mut g = TensorGraph::new();
+        let q = g.input(&[hk, gq, n, d]);
+        let k = g.input(&[hk, n, d]);
+        let v = g.input(&[hk, n, dv]);
+        let scale = 1.0 / (d as f64).sqrt();
+        let qs = g.map(&[q], |x| x[0] * ExprId::from_f64(scale)).unwrap();
+        // space [h, g, i, j | c]
+        let s = g
+            .comp(
+                &[hk, gq, n, n],
+                &[d],
+                vec![
+                    Arg {
+                        src: qs,
+                        view: View::pick(5, &[Some(0), Some(1), Some(2), Some(4)]),
+                    },
+                    Arg {
+                        src: k,
+                        view: View::pick(5, &[Some(0), Some(3), Some(4)]),
+                    },
+                ],
+                Some(Monoid::sum()),
+                |x| vec![x[0] * x[1]],
+            )
+            .unwrap();
+        let s = if causal {
+            let i = g.iota(&[hk, gq, n, n], 2);
+            let j = g.iota(&[hk, gq, n, n], 3);
+            g.map(&[s, i, j], |x| {
+                let above = x[2] - x[1];
+                let m = tang_expr::with_graph(|eg| {
+                    let neg = eg.lit(-1e30);
+                    eg.select(above, neg, ExprId::ZERO)
+                });
+                x[0] + m
+            })
+            .unwrap()
+        } else {
+            s
+        };
+        let m = g.reduce(s, 3, Monoid::max()).unwrap();
+        let mb = g.broadcast(m, &[hk, gq, n, n]).unwrap();
+        let p = g.map(&[s, mb], |x| (x[0] - x[1]).exp()).unwrap();
+        let l = g.reduce(p, 3, Monoid::sum()).unwrap();
+        // space [h, g, i, c | j]
+        let o = g
+            .comp(
+                &[hk, gq, n, dv],
+                &[n],
+                vec![
+                    Arg {
+                        src: p,
+                        view: View::pick(5, &[Some(0), Some(1), Some(2), Some(4)]),
+                    },
+                    Arg {
+                        src: v,
+                        view: View::pick(5, &[Some(0), Some(4), Some(3)]),
+                    },
+                ],
+                Some(Monoid::sum()),
+                |x| vec![x[0] * x[1]],
+            )
+            .unwrap();
+        let lb = g.broadcast(l, &[hk, gq, n, dv]).unwrap();
+        let y = g.map(&[o, lb], |x| x[0] / x[1]).unwrap();
+        (g, y)
+    }
+
+    /// [`naive_attention_heads`] after the full pass pipeline (one fused
+    /// online-softmax kernel), unscheduled.
+    pub fn fused_attention_heads(
+        hk: usize,
+        gq: usize,
+        n: usize,
+        d: usize,
+        dv: usize,
+        causal: bool,
+    ) -> (TensorGraph, TensorId) {
+        let (g, y) = naive_attention_heads(hk, gq, n, d, dv, causal);
+        let (g, outs) = g.stabilize_softmax(&[y]);
+        let (g, outs) = g.substitute_maps(&outs);
+        let (g, outs) = g.eliminate_common(&outs);
+        let (g, outs) = g.merge_siblings(&outs);
+        let (g, outs) = g.relayout(&outs);
+        let (mut g, outs) = g.merge_reduce_dims(&outs);
+        g.schedule_inline_up_to(&outs, dv);
+        (g, outs[0])
+    }
+
+    /// [`fused_attention_heads`] under [`TensorGraph::schedule_auto`]: the
+    /// best f32 schedule the WGSL/MSL emitters derive.
+    pub fn flash_attention_heads_auto(
+        hk: usize,
+        gq: usize,
+        n: usize,
+        d: usize,
+        dv: usize,
+        causal: bool,
+    ) -> (TensorGraph, TensorId) {
+        let (mut g, y) = fused_attention_heads(hk, gq, n, d, dv, causal);
+        g.schedule_auto(&[y]);
+        (g, y)
+    }
+
+    /// [`fused_attention_heads`] on simdgroup fragments: q, k, v stored
+    /// f16, f32 accumulation, the fused kernel flagged `fragment`.
+    pub fn flash_attention_heads_fragment(
+        hk: usize,
+        gq: usize,
+        n: usize,
+        d: usize,
+        dv: usize,
+        causal: bool,
+    ) -> (TensorGraph, TensorId) {
+        let (mut g, y) = fused_attention_heads(hk, gq, n, d, dv, causal);
+        let inputs: Vec<TensorId> = (0..g.nodes().len())
+            .filter(|&i| matches!(g.nodes()[i].op, Op::Input(_)))
+            .map(TensorId::from_index)
+            .collect();
+        for t in inputs {
+            g.set_precision(t, Precision::storage(Format::F16));
+        }
+        g.set_fragment(y, true);
+        (g, y)
+    }
+
     /// Mean time of one whole-program run (5 warmups, `iters` launches,
     /// one sync), in ms.
     pub fn time_program(
