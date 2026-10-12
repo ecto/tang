@@ -349,7 +349,7 @@ impl Ctx<'_> {
 
     /// Read of buffer-backed node `j` at an address.
     fn buffer_read(&mut self, j: usize, addr: Sym) -> String {
-        if !(addr.terms.contains_key("r0") && !self.in_load) {
+        if !addr.terms.contains_key("r0") || self.in_load {
             // only staged regions apply a guard at load time
             self.guard = None;
         }
