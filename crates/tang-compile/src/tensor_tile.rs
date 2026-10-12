@@ -140,6 +140,17 @@ impl Val {
     }
 }
 
+/// A read of a staged region inside the reduce loop body: `local` and
+/// `off` fix the element along the reduce/inner/offset axes, the point
+/// axis is the thread's register tile. The body refers to it by a token
+/// (`svec{n}_`); the r0 loop loads it once per thread, as a `vec4` when
+/// the register tile makes the thread's points contiguous.
+struct Site {
+    region: usize,
+    local: String,
+    off: usize,
+}
+
 struct Ctx<'a> {
     g: &'a TensorGraph,
     reads: &'a [usize],
@@ -147,7 +158,11 @@ struct Ctx<'a> {
     py: Option<String>,
     bx: usize,
     by: usize,
+    /// register tile
+    rx: usize,
+    ry: usize,
     chunk: usize,
+    sites: Vec<Site>,
     /// extents of inner loop vars
     extents: BTreeMap<String, usize>,
     regions: Vec<Region>,
@@ -229,6 +244,18 @@ impl Ctx<'_> {
             return String::new();
         }
         let r = &self.regions[idx];
+        let mut local = String::from("(r0 - chunk)");
+        for ((name, _), &ext) in r.key.inner.iter().zip(&r.extents) {
+            local = format!("({local}) * {ext}u + {name}");
+        }
+        if r.key.inner.is_empty() {
+            self.sites.push(Site {
+                region: idx,
+                local,
+                off: (addr.offset - r.lo) as usize,
+            });
+            return format!("svec{}_", self.sites.len() - 1);
+        }
         // Point-minor layout: ((t * innerN + inner) * span + o) * P + point,
         // so consecutive lanes hit consecutive words (no bank conflicts).
         let mut points = 1usize;
@@ -240,10 +267,6 @@ impl Ctx<'_> {
         if r.key.px != 0 {
             point = format!("({point}) * {}u + lx_", self.bx);
             points *= self.bx;
-        }
-        let mut local = String::from("(r0 - chunk)");
-        for ((name, _), &ext) in r.key.inner.iter().zip(&r.extents) {
-            local = format!("({local}) * {ext}u + {name}");
         }
         format!(
             "stage_{idx}[(({local}) * {}u + {}u) * {points}u + ({point})]",
@@ -559,7 +582,10 @@ impl TensorGraph {
             py: dy.map(|d| format!("p{d}")),
             bx: px_n,
             by: py_n,
+            rx,
+            ry,
             chunk,
+            sites: Vec::new(),
             extents: BTreeMap::new(),
             regions: Vec::new(),
             hoists: Vec::new(),
@@ -640,13 +666,47 @@ impl TensorGraph {
                 * r.inner_n()
                 * r.span()
         };
+        // (point axis: 'x' | 'y' | '-', points, vector width) per region:
+        // a thread's rx (ry) consecutive points along the tile axis are
+        // contiguous in the point-minor stage, so a register tile that is
+        // a multiple of 4 wide reads them as vec4s
+        let axis_of = |r: &Region| -> (char, usize, usize) {
+            if r.key.inner.is_empty() {
+                if r.key.px != 0 && r.key.py == 0 && px_n % 4 == 0 && rx % 4 == 0 {
+                    return ('x', px_n, 4);
+                }
+                if r.key.py != 0 && r.key.px == 0 && py_n % 4 == 0 && ry % 4 == 0 {
+                    return ('y', py_n, 4);
+                }
+            }
+            let points =
+                (if r.key.py != 0 { py_n } else { 1 }) * (if r.key.px != 0 { px_n } else { 1 });
+            let axis = if r.key.px != 0 && r.key.py == 0 {
+                'x'
+            } else if r.key.py != 0 && r.key.px == 0 {
+                'y'
+            } else {
+                '-'
+            };
+            (axis, points, 1)
+        };
+        let vec_w: Vec<usize> = ctx.regions.iter().map(|r| axis_of(r).2).collect();
         for (i, r) in ctx.regions.iter().enumerate() {
-            writeln!(
-                s,
-                "var<workgroup> stage_{i}: array<f32, {}>;",
-                region_total(r)
-            )
-            .unwrap();
+            if vec_w[i] == 4 {
+                writeln!(
+                    s,
+                    "var<workgroup> stage_{i}: array<vec4<f32>, {}>;",
+                    region_total(r) / 4
+                )
+                .unwrap();
+            } else {
+                writeln!(
+                    s,
+                    "var<workgroup> stage_{i}: array<f32, {}>;",
+                    region_total(r)
+                )
+                .unwrap();
+            }
         }
         // Cooperative loads for shared comps are expanded in the load
         // phase with r0 := chunk + t and py := tile_y*by + ly.
@@ -796,7 +856,8 @@ impl TensorGraph {
         )
         .unwrap();
         for (i, r) in ctx.regions.iter().enumerate() {
-            let total = region_total(r);
+            let v = vec_w[i];
+            let total = region_total(r) / v;
             let span = r.span();
             writeln!(
                 s,
@@ -808,14 +869,16 @@ impl TensorGraph {
             // The load loop walks the *buffer* in address order instead —
             // the var with the smallest address stride innermost — so a
             // warp's loads coalesce; each element is then written to its
-            // point-minor slot.
+            // point-minor slot. A vec4 stage is filled a whole vector at
+            // a time (`v` consecutive points along the tile axis), since
+            // component writes from different threads would race.
             // (name, extent, address coefficient), in stage order
             let mut dims: Vec<(String, usize, i64)> = Vec::new();
             if r.key.px != 0 {
-                dims.push(("lx".into(), px_n, r.key.px));
+                dims.push(("lx".into(), px_n / v, r.key.px));
             }
             if r.key.py != 0 {
-                dims.push(("ly".into(), py_n, r.key.py));
+                dims.push(("ly".into(), py_n / v, r.key.py));
             }
             dims.push(("o".into(), span, 1));
             for ((name, coef), &ext) in r.key.inner.iter().zip(&r.extents).rev() {
@@ -834,35 +897,75 @@ impl TensorGraph {
             for (name, ext, _) in dims.iter().rev() {
                 sidx = format!("({sidx}) * {ext}u + {name}");
             }
-            let mut addr = format!("{}", r.lo);
-            let mut live = String::from("true");
-            if r.key.px != 0 {
-                writeln!(s, "            let gx = tile_x * {px_n}u + lx;").unwrap();
-                addr.push_str(&format!(" + {} * i32(gx)", r.key.px));
-                live.push_str(&format!(" && gx < {nx}u"));
+            // address and liveness of component `c` (the point coordinate
+            // is lx·v + c along the vectorized axis)
+            let component = |c: usize| -> (String, String) {
+                let mut addr = format!("{}", r.lo);
+                let mut live = String::from("true");
+                if r.key.px != 0 {
+                    addr.push_str(&format!(" + {} * i32(gx{c})", r.key.px));
+                    live.push_str(&format!(" && gx{c} < {nx}u"));
+                }
+                if r.key.py != 0 {
+                    addr.push_str(&format!(" + {} * i32(gy{c})", r.key.py));
+                    live.push_str(&format!(" && gy{c} < {ny}u"));
+                }
+                for (name, coef) in &r.key.inner {
+                    addr.push_str(&format!(" + {coef} * i32({name})"));
+                }
+                addr.push_str(&format!(" + {} * i32(chunk + t) + i32(o)", r.key.red));
+                live.push_str(&format!(" && chunk + t < {r_total}u"));
+                for (name, coef) in &r.key.uniform {
+                    addr.push_str(&format!(" + {coef} * i32({name})"));
+                }
+                (addr, live)
+            };
+            for c in 0..v {
+                if r.key.px != 0 {
+                    writeln!(
+                        s,
+                        "            let gx{c} = tile_x * {px_n}u + lx * {v}u + {c}u;"
+                    )
+                    .unwrap();
+                }
+                if r.key.py != 0 {
+                    writeln!(
+                        s,
+                        "            let gy{c} = tile_y * {py_n}u + ly * {v}u + {c}u;"
+                    )
+                    .unwrap();
+                }
             }
-            if r.key.py != 0 {
-                writeln!(s, "            let gy = tile_y * {py_n}u + ly;").unwrap();
-                addr.push_str(&format!(" + {} * i32(gy)", r.key.py));
-                live.push_str(&format!(" && gy < {ny}u"));
+            if v == 1 {
+                let (addr, live) = component(0);
+                writeln!(s, "            if ({live}) {{").unwrap();
+                writeln!(
+                    s,
+                    "                stage_{i}[{sidx}] = b{}[u32({addr})];",
+                    r.key.buffer
+                )
+                .unwrap();
+                writeln!(s, "            }}").unwrap();
+            } else {
+                let mut elems = Vec::with_capacity(v);
+                for c in 0..v {
+                    let (addr, live) = component(c);
+                    writeln!(s, "            var e{c} = 0.0;").unwrap();
+                    writeln!(
+                        s,
+                        "            if ({live}) {{ e{c} = b{}[u32({addr})]; }}",
+                        r.key.buffer
+                    )
+                    .unwrap();
+                    elems.push(format!("e{c}"));
+                }
+                writeln!(
+                    s,
+                    "            stage_{i}[{sidx}] = vec{v}<f32>({});",
+                    elems.join(", ")
+                )
+                .unwrap();
             }
-            for (name, coef) in &r.key.inner {
-                addr.push_str(&format!(" + {coef} * i32({name})"));
-            }
-            addr.push_str(&format!(" + {} * i32(chunk + t) + i32(o)", r.key.red));
-            live.push_str(&format!(" && chunk + t < {r_total}u"));
-
-            for (name, coef) in &r.key.uniform {
-                addr.push_str(&format!(" + {coef} * i32({name})"));
-            }
-            writeln!(s, "            if ({live}) {{").unwrap();
-            writeln!(
-                s,
-                "                stage_{i}[{sidx}] = b{}[u32({addr})];",
-                r.key.buffer
-            )
-            .unwrap();
-            writeln!(s, "            }}").unwrap();
             writeln!(s, "        }}").unwrap();
         }
         for (i, (rows, code)) in comp_loads.iter().enumerate() {
@@ -894,6 +997,49 @@ impl TensorGraph {
             "        for (var r0: u32 = chunk; r0 < min(chunk + {chunk}u, {r_total}u); r0 = r0 + 1u) {{"
         )
         .unwrap();
+        // staged reads, once per thread per r0: the thread's points along
+        // the tile axis, in groups of the vector width
+        for (n, site) in ctx.sites.iter().enumerate() {
+            let r = &ctx.regions[site.region];
+            let (axis, points, v) = axis_of(r);
+            let base = format!(
+                "(({}) * {}u + {}u) * {points}u",
+                site.local,
+                r.span(),
+                site.off
+            );
+            let (reg, first) = match axis {
+                'x' => (rx, format!("tx * {rx}u")),
+                'y' => (ry, format!("ty * {ry}u")),
+                _ => (1, "0u".to_string()),
+            };
+            for g in 0..reg / v {
+                if v == 4 {
+                    writeln!(
+                        s,
+                        "            let svec{n}_g{g} = stage_{}[({base}) / 4u + ({first}) / 4u + {g}u];",
+                        site.region
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(
+                        s,
+                        "            let svec{n}_g{g} = stage_{}[{base} + {first} + {g}u];",
+                        site.region
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        let site_names: Vec<(String, char, usize)> = ctx
+            .sites
+            .iter()
+            .enumerate()
+            .map(|(n, site)| {
+                let (axis, _, v) = axis_of(&ctx.regions[site.region]);
+                (format!("svec{n}_"), axis, v)
+            })
+            .collect();
         for &(i, j) in &copies {
             let t = tag(i, j);
             writeln!(s, "            {{").unwrap();
@@ -904,8 +1050,23 @@ impl TensorGraph {
             writeln!(s, "            let lx_ = tx * {rx}u + {i}u;").unwrap();
             writeln!(s, "            let ly_ = ty * {ry}u + {j}u;").unwrap();
             let rename = |text: &str| {
-                text.replace("acc[", &format!("acc{t}["))
-                    .replace("hoist_", &format!("hoist{t}_"))
+                let mut out = text
+                    .replace("acc[", &format!("acc{t}["))
+                    .replace("hoist_", &format!("hoist{t}_"));
+                for (name, axis, v) in &site_names {
+                    let k = match axis {
+                        'x' => i,
+                        'y' => j,
+                        _ => 0,
+                    };
+                    let val = if *v == 4 {
+                        format!("{name}g{}[{}]", k / 4, k % 4)
+                    } else {
+                        format!("{name}g{k}")
+                    };
+                    out = out.replace(name, &val);
+                }
+                out
             };
             for line in rename(&body).lines() {
                 writeln!(s, "            {line}").unwrap();
