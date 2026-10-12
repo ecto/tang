@@ -408,6 +408,15 @@ pub mod ir_gpu {
         best.expect("at least one candidate")
     }
 
+    /// [`flash_attention`] under [`TensorGraph::schedule_auto`].
+    pub fn flash_attention_auto(n: usize, d: usize, dv: usize) -> (TensorGraph, TensorId) {
+        let (g, y) = naive_attention(n, d, dv);
+        let (g, outs) = g.substitute_maps(&[y]);
+        let (mut g, outs) = g.stabilize_softmax(&outs);
+        g.schedule_auto(&outs);
+        (g, outs[0])
+    }
+
     /// All attention schedules the compiler currently knows how to produce.
     pub fn attention_candidates(
         n: usize,
@@ -419,6 +428,7 @@ pub mod ir_gpu {
             ("flash", flash_attention(n, d, dv)),
             ("flash_split", flash_attention_split(n, d, dv)),
             ("flash_tiled", flash_attention_tiled(n, d, dv)),
+            ("flash_auto", flash_attention_auto(n, d, dv)),
         ]
         .into_iter()
         .map(|(name, (g, y))| (name, g, y))
@@ -439,11 +449,12 @@ pub mod ir_gpu {
             match schedule {
                 "split" => g.schedule_split(&[c], 64, 16),
                 "tiled" => g.schedule_tile_2d(&[c], 16, 16, 32, 16),
+                "auto" => g.schedule_auto(&[c]),
                 _ => {}
             }
             (g, c)
         };
-        ["naive", "split", "tiled"]
+        ["naive", "split", "tiled", "auto"]
             .into_iter()
             .map(|name| {
                 let (g, c) = build(name);
@@ -474,11 +485,12 @@ pub mod ir_gpu {
             match schedule {
                 "split" => g.schedule_split(&outs, 256, 64),
                 "tiled" => g.schedule_tile(&outs, 64, 32, 64),
+                "auto" => g.schedule_auto(&outs),
                 _ => {}
             }
             (g, outs[0])
         };
-        ["naive", "split", "tiled"]
+        ["naive", "split", "tiled", "auto"]
             .into_iter()
             .map(|name| {
                 let (g, y) = build(name);

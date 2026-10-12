@@ -364,3 +364,14 @@ the split one (its reduce axis is 2048 wide and there are only 2048 rows,
 so one thread per row starves the GPU). Same compiler, same cost of
 being wrong, different answer per op — which is the case for autotuning
 rather than a fixed heuristic.
+
+### `schedule_auto`
+
+A fixed rule distilled from the tables above: a materialized reduction
+with fewer than 2¹⁴ output points and a reduce axis of at least 64 is
+split across a 256-thread workgroup; everything else stays one thread per
+point. It picks split for the attention reduction and rmsnorm and naive
+for matmul, landing within noise of the best hand-picked schedule in each
+case (attention 5.30 ms vs split 5.47; rmsnorm 2.31 vs 2.30; matmul
+5.36 vs naive 5.45). It does not choose between algebras — materialized
+scores vs online softmax — which is still `autotune`'s job.

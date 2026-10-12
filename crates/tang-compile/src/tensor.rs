@@ -1205,6 +1205,29 @@ impl TensorGraph {
         })
     }
 
+    /// Default thread mapping for a bound graph, from the measured rule
+    /// of thumb in `BENCHMARKS.md`: a reduction with few output points
+    /// starves the GPU one-thread-per-point, so split it across a
+    /// workgroup; one with many points is already parallel enough.
+    /// `autotune` over candidate graphs still decides which *algebra* to
+    /// run (e.g. materialized scores vs online softmax).
+    pub fn schedule_auto(&mut self, outputs: &[TensorId]) {
+        const MANY_POINTS: usize = 1 << 14;
+        self.schedule_inline(outputs);
+        let live = self.live(outputs);
+        let targets: Vec<usize> = (0..self.nodes.len())
+            .filter(|&i| live[i] && !self.nodes[i].inline)
+            .filter(|&i| {
+                self.comp_at(i).is_some_and(|c| {
+                    c.monoid.is_some() && numel(c.points()) < MANY_POINTS && numel(&c.red) >= 64
+                })
+            })
+            .collect();
+        for i in targets {
+            self.nodes[i].split = 256;
+        }
+    }
+
     // -- reference interpreter -------------------------------------------------
 
     /// Evaluate `outputs`. Materialized nodes are computed once into
@@ -1582,6 +1605,23 @@ mod tests {
             close(&got[0], &want[0]);
             close(&got[1], &want[1]);
         }
+    }
+
+    #[test]
+    fn schedule_auto_splits_narrow_reductions_only() {
+        // 64 rows x 2048: few points, wide reduce -> split
+        let mut g = TensorGraph::new();
+        let x = g.input(&[64, 2048]);
+        let y = g.reduce(x, 1, Monoid::sum()).unwrap();
+        g.schedule_auto(&[y]);
+        assert_eq!(g.nodes()[y.n()].split, 256);
+
+        // 1M points x 8: plenty of threads -> one thread per point
+        let mut g = TensorGraph::new();
+        let x = g.input(&[1 << 20, 8]);
+        let y = g.reduce(x, 1, Monoid::sum()).unwrap();
+        g.schedule_auto(&[y]);
+        assert_eq!(g.nodes()[y.n()].split, 0);
     }
 
     #[test]

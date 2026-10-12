@@ -222,10 +222,7 @@ criterion_group!(benches, bench_swiglu_act, bench_rmsnorm, bench_matvec);
 
 mod gpu {
     use super::*;
-    use tang_bench::ir_gpu::{
-        causal_mask, flash_attention, flash_attention_split, flash_attention_tiled,
-        naive_attention, Executable,
-    };
+    use tang_bench::ir_gpu::{attention_candidates, causal_mask, Executable};
     use tang_gpu::{kv_attention_fused, GpuDevice, GpuTensor, KernelCache};
 
     fn random(n: usize, seed: u64) -> Vec<f32> {
@@ -258,14 +255,9 @@ mod gpu {
                 })
             });
 
-            for (name, (g, y)) in [
-                ("ir_naive", naive_attention(n, d, d)),
-                ("ir_flash", flash_attention(n, d, d)),
-                ("ir_flash_split", flash_attention_split(n, d, d)),
-                ("ir_flash_tiled", flash_attention_tiled(n, d, d)),
-            ] {
+            for (name, g, y) in attention_candidates(n, d, d) {
                 let exe = Executable::new(&device, g.to_wgsl(&[y]), &[&q, &k, &v, &mask]);
-                group.bench_function(BenchmarkId::new(name, n), |b| {
+                group.bench_function(BenchmarkId::new(format!("ir_{name}"), n), |b| {
                     b.iter(|| {
                         exe.run(&device, &mut cache);
                         cache.flush(&device);
