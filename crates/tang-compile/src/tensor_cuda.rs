@@ -103,12 +103,42 @@ pub struct FlashShape {
 /// The flash shapes a tuner chooses between, one per [`MMA_SHAPES`]
 /// variant; the first is the default.
 pub const FLASH_SHAPES: [FlashShape; 6] = [
-    FlashShape { bi: 0, bj: 32, stages: 2, kw: 2 },
-    FlashShape { bi: 0, bj: 64, stages: 2, kw: 1 },
-    FlashShape { bi: 0, bj: 16, stages: 3, kw: 2 },
-    FlashShape { bi: 0, bj: 16, stages: 2, kw: 4 },
-    FlashShape { bi: 32, bj: 32, stages: 2, kw: 2 },
-    FlashShape { bi: 0, bj: 32, stages: 3, kw: 1 },
+    FlashShape {
+        bi: 0,
+        bj: 32,
+        stages: 2,
+        kw: 2,
+    },
+    FlashShape {
+        bi: 0,
+        bj: 64,
+        stages: 2,
+        kw: 1,
+    },
+    FlashShape {
+        bi: 0,
+        bj: 16,
+        stages: 3,
+        kw: 2,
+    },
+    FlashShape {
+        bi: 0,
+        bj: 16,
+        stages: 2,
+        kw: 4,
+    },
+    FlashShape {
+        bi: 32,
+        bj: 32,
+        stages: 2,
+        kw: 2,
+    },
+    FlashShape {
+        bi: 0,
+        bj: 32,
+        stages: 3,
+        kw: 1,
+    },
 ];
 
 /// The PTX helpers the tensor-core kernels share: TF32 rounding, `mma`
@@ -1659,8 +1689,7 @@ impl TensorGraph {
             a.coefs[inner] == 1
                 && a.offset % 4 == 0
                 && extent % 4 == 0
-                && a
-                    .coefs
+                && a.coefs
                     .iter()
                     .enumerate()
                     .all(|(dim, &cf)| dim == inner || cf % 4 == 0)
@@ -1828,8 +1857,16 @@ impl TensorGraph {
                 8 * ldk
             )
             .unwrap();
-            writeln!(s, "        qf[t][q][0] = tang_tf32(lo.x); qf[t][q][1] = tang_tf32(hi.x);").unwrap();
-            writeln!(s, "        qf[t][q][2] = tang_tf32(lo.y); qf[t][q][3] = tang_tf32(hi.y);").unwrap();
+            writeln!(
+                s,
+                "        qf[t][q][0] = tang_tf32(lo.x); qf[t][q][1] = tang_tf32(hi.x);"
+            )
+            .unwrap();
+            writeln!(
+                s,
+                "        qf[t][q][2] = tang_tf32(lo.y); qf[t][q][3] = tang_tf32(hi.y);"
+            )
+            .unwrap();
             writeln!(s, "    }}").unwrap();
             writeln!(s, "    __syncthreads();").unwrap();
         }
@@ -1970,7 +2007,11 @@ impl TensorGraph {
         let nof = d / 8;
         writeln!(s, "    float o[{nof}][4];").unwrap();
         writeln!(s, "    #pragma unroll").unwrap();
-        writeln!(s, "    for (int j = 0; j < {nof}; j++) for (int r = 0; r < 4; r++) o[j][r] = 0.0f;").unwrap();
+        writeln!(
+            s,
+            "    for (int j = 0; j < {nof}; j++) for (int r = 0; r < 4; r++) o[j][r] = 0.0f;"
+        )
+        .unwrap();
         writeln!(s, "    float m_row[2] = {{-3.0e38f, -3.0e38f}};").unwrap();
         // per-thread partial row sums (the quad's are summed at the end)
         writeln!(s, "    float l_row[2] = {{0.0f, 0.0f}};").unwrap();
@@ -1993,7 +2034,11 @@ impl TensorGraph {
         )
         .unwrap();
         writeln!(s, "        }}").unwrap();
-        writeln!(s, "        const float* st = smem + (c % {st}u) * {stage_floats}u;").unwrap();
+        writeln!(
+            s,
+            "        const float* st = smem + (c % {st}u) * {stage_floats}u;"
+        )
+        .unwrap();
         writeln!(s, "        unsigned j0 = c * {bjs}u + kbase;").unwrap();
         writeln!(s, "        float sc[{nsf}][4];").unwrap();
         if has_k {
@@ -2012,7 +2057,11 @@ impl TensorGraph {
                 bjs * ldk
             )
             .unwrap();
-            writeln!(s, "            unsigned kf[2] = {{tang_tf32(kv.x), tang_tf32(kv.y)}};").unwrap();
+            writeln!(
+                s,
+                "            unsigned kf[2] = {{tang_tf32(kv.x), tang_tf32(kv.y)}};"
+            )
+            .unwrap();
             writeln!(s, "            tang_mma(sc[j], qf[t][q], kf);").unwrap();
             writeln!(s, "        }}").unwrap();
         }
@@ -2026,7 +2075,11 @@ impl TensorGraph {
         writeln!(s, "            for (int j = 0; j < {nsf}; j++)").unwrap();
         writeln!(s, "            #pragma unroll").unwrap();
         writeln!(s, "            for (int e = 0; e < 2; e++) {{").unwrap();
-        writeln!(s, "                unsigned jj = j0 + 8u * j + 2u * tq + e;").unwrap();
+        writeln!(
+            s,
+            "                unsigned jj = j0 + 8u * j + 2u * tq + e;"
+        )
+        .unwrap();
         if let Some((sb, sa)) = &f.score_buf {
             writeln!(
                 s,
@@ -2211,7 +2264,11 @@ impl TensorGraph {
                 "            float lg = g == 0 ? l_row[h] : smem[{lo}u + g * {R}u + lr];"
             )
             .unwrap();
-            writeln!(s, "            sc_g[g][h] = expf(mg - mx); l += lg * sc_g[g][h];").unwrap();
+            writeln!(
+                s,
+                "            sc_g[g][h] = expf(mg - mx); l += lg * sc_g[g][h];"
+            )
+            .unwrap();
             writeln!(s, "        }}").unwrap();
             writeln!(s, "        m_row[h] = mx; l_row[h] = l;").unwrap();
             writeln!(s, "    }}").unwrap();
@@ -2229,7 +2286,11 @@ impl TensorGraph {
         frag_loop(&mut s);
         writeln!(s, "        unsigned nn = lc;").unwrap();
         row_coords(&mut s, "        ", "lr");
-        writeln!(s, "        float m_v = m_row[r / 2], l_v = l_row[r / 2], acc_v = o[j][r];").unwrap();
+        writeln!(
+            s,
+            "        float m_v = m_row[r / 2], l_v = l_row[r / 2], acc_v = o[j][r];"
+        )
+        .unwrap();
         writeln!(s, "        if (ii < {}u) {{", f.m).unwrap();
         if !f.epilogue {
             // the root is the reduction: its (m, l, acc) state per point
