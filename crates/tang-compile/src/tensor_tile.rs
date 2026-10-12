@@ -1081,7 +1081,10 @@ impl TensorGraph {
             if !lay.window.is_empty() {
                 // a window spans lanes / steps past the edge: keep the
                 // read inside the buffer (those slots are never used)
-                live.push_str(&format!(" && u32(a) < {}", self.buffer_len_expr(r.key.buffer)));
+                live.push_str(&format!(
+                    " && u32(a) < {}",
+                    self.buffer_len_expr(r.key.buffer)
+                ));
             }
             writeln!(s, "            if ({live}) {{").unwrap();
             let mut val = load(

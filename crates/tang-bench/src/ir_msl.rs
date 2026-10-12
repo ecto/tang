@@ -43,6 +43,12 @@ impl MslDevice {
         if let Some(p) = self.pipelines.borrow().get(source) {
             return p.clone();
         }
+        if let Ok(dir) = std::env::var("MSL_DUMP") {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            source.hash(&mut h);
+            let _ = std::fs::write(format!("{dir}/{:016x}.metal", h.finish()), source);
+        }
         let opts = CompileOptions::new();
         opts.set_fast_math_enabled(self.fast_math);
         let lib = self
@@ -74,7 +80,17 @@ fn bytes_of<T>(v: &[T]) -> &[u8] {
 }
 
 impl Executable {
+    /// Whether every kernel's threadgroup memory fits the device.
+    pub fn fits(dev: &MslDevice, program: &MslProgram) -> bool {
+        let limit = dev.device.max_threadgroup_memory_length() as usize;
+        program.kernels.iter().all(|k| k.threadgroup_bytes <= limit)
+    }
+
     pub fn new(dev: &MslDevice, program: MslProgram, inputs: &[&[f32]]) -> Self {
+        assert!(
+            Self::fits(dev, &program),
+            "a kernel's threadgroup memory exceeds the device limit"
+        );
         let opts = MTLResourceOptions::StorageModeShared;
         let mk = |b: &[u8]| {
             dev.device
@@ -198,10 +214,36 @@ impl Executable {
 
     /// Mean ms of kernels `range` over `iters` back-to-back runs in one
     /// command buffer (after a warm-up submission): kernel-only time.
-    pub fn time_kernels(&self, dev: &MslDevice, range: std::ops::Range<usize>, iters: usize) -> f64 {
+    pub fn time_kernels(
+        &self,
+        dev: &MslDevice,
+        range: std::ops::Range<usize>,
+        iters: usize,
+    ) -> f64 {
         self.submit(dev, range.clone(), 3);
         let t = Instant::now();
         self.submit(dev, range, iters);
+        t.elapsed().as_secs_f64() * 1e3 / iters as f64
+    }
+
+    /// Mean ms of one whole-program run with one command buffer per run
+    /// (committed back to back, one wait at the end): the launch pattern
+    /// of the wgpu path, which submits once per run.
+    pub fn time_separate(&self, dev: &MslDevice, iters: usize) -> f64 {
+        self.run(dev);
+        let t = Instant::now();
+        let mut last = None;
+        for _ in 0..iters {
+            let cb = dev.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            for i in 0..self.program.kernels.len() {
+                self.encode(enc, i);
+            }
+            enc.end_encoding();
+            cb.commit();
+            last = Some(cb.to_owned());
+        }
+        last.unwrap().wait_until_completed();
         t.elapsed().as_secs_f64() * 1e3 / iters as f64
     }
 
@@ -329,9 +371,8 @@ pub fn tune_precision(
     };
     let _ = measure(&g);
     let (base_error, base_ms) = measure(&g);
-    let base_ms = base_ms.unwrap_or_else(|| {
-        Executable::new(dev, g.to_msl(outputs), inputs).time(dev, iters)
-    });
+    let base_ms =
+        base_ms.unwrap_or_else(|| Executable::new(dev, g.to_msl(outputs), inputs).time(dev, iters));
     let base = g.clone();
     let mut cur = g;
     let (mut cur_err, mut cur_ms) = (base_error, base_ms);
@@ -456,6 +497,9 @@ pub fn tune_precision(
     }
 }
 
+/// `(split, tile, reg, fragment)`: one Metal thread mapping.
+type MslCandidate = (u32, (u32, u32, u32), (u32, u32), bool);
+
 /// One kernel's winning mapping on Metal.
 pub struct TunedKernel {
     pub node: TensorId,
@@ -481,7 +525,7 @@ pub fn autotune_kernels(
     let nodes: Vec<TensorId> = base.program.kernels.iter().map(|k| k.node).collect();
     let mut log = Vec::new();
     for (i, node) in nodes.into_iter().enumerate() {
-        let mut cands: Vec<(u32, (u32, u32, u32), (u32, u32), bool)> = g
+        let mut cands: Vec<MslCandidate> = g
             .schedule_candidates(node)
             .into_iter()
             .map(|(s, t, r)| (s, t, r, false))
@@ -489,12 +533,16 @@ pub fn autotune_kernels(
         if g.fragment_plan(node).is_some() {
             cands.push((0, (0, 0, 0), (1, 1), true));
         }
-        let mut best: Option<((u32, (u32, u32, u32), (u32, u32), bool), f64)> = None;
+        let mut best: Option<(MslCandidate, f64)> = None;
         for (split, tile, reg, frag) in cands {
             let mut v = g.clone();
             v.set_schedule(node, split, tile, reg);
             v.set_fragment(node, frag);
-            let exe = Executable::new(dev, v.to_msl(outputs), inputs);
+            let prog = v.to_msl(outputs);
+            if !Executable::fits(dev, &prog) {
+                continue;
+            }
+            let exe = Executable::new(dev, prog, inputs);
             exe.submit(dev, 0..i + 1, 1);
             let ms = exe.time_kernels(dev, i..i + 1, iters);
             if best.is_none_or(|b| ms < b.1) {
@@ -514,4 +562,53 @@ pub fn autotune_kernels(
         });
     }
     (g, log)
+}
+
+/// The backend dimension of the search: run the same scheduled graph
+/// through WGSL (wgpu) and through native MSL, check both against `want`
+/// under `budget`, and return the faster admitted one with both timings
+/// (`None` where a backend could not run it or missed the budget).
+#[allow(clippy::too_many_arguments)]
+pub fn pick_backend(
+    wgpu: &tang_gpu::GpuDevice,
+    cache: &mut tang_gpu::KernelCache,
+    dev: &MslDevice,
+    g: &TensorGraph,
+    outputs: &[TensorId],
+    inputs: &[&[f32]],
+    want: &[Vec<f64>],
+    budget: ErrorBudget,
+    iters: usize,
+) -> (Backend, Option<f64>, Option<f64>) {
+    use crate::ir_gpu;
+    // WGSL has no fragments and no bf16; it ignores `fragment`
+    let wgsl = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let exe = ir_gpu::Executable::new(wgpu, g.to_wgsl(outputs), inputs);
+        let err = ir_gpu::gpu_error(wgpu, cache, &exe, outputs, want);
+        budget.admits(&err).then(|| {
+            (0..3)
+                .map(|_| ir_gpu::time_program(wgpu, cache, &exe, outputs[0], iters))
+                .fold(f64::INFINITY, f64::min)
+        })
+    }))
+    .ok()
+    .flatten();
+    let prog = g.to_msl(outputs);
+    let msl = Executable::fits(dev, &prog)
+        .then(|| {
+            let exe = Executable::new(dev, prog, inputs);
+            let err = gpu_error(dev, &exe, outputs, want);
+            budget.admits(&err).then(|| {
+                (0..3)
+                    .map(|_| exe.time(dev, iters))
+                    .fold(f64::INFINITY, f64::min)
+            })
+        })
+        .flatten();
+    let backend = match (wgsl, msl) {
+        (Some(w), Some(m)) if w <= m => Backend::Wgsl,
+        (Some(_), None) => Backend::Wgsl,
+        _ => Backend::Msl,
+    };
+    (backend, wgsl, msl)
 }

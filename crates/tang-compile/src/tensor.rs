@@ -40,14 +40,14 @@ use tang_expr::{trace, ExprGraph, ExprId, Node};
 
 #[path = "tensor_grad.rs"]
 mod grad;
+#[path = "tensor_msl.rs"]
+pub mod msl;
 #[path = "tensor_precision.rs"]
 pub mod precision;
 #[path = "tensor_tile.rs"]
 mod tile;
 #[path = "tensor_wgsl.rs"]
 pub mod wgsl;
-#[path = "tensor_msl.rs"]
-pub mod msl;
 pub use precision::{ErrorBudget, ErrorStats, Format, Precision};
 
 // ---------------------------------------------------------------------------

@@ -169,6 +169,42 @@ appends to the same graph, so a forward input stored in f16 is read as
 f16 by the gradient kernels too, and backward reductions (a snake's
 `dα = Σ_t …`) take their own precision.
 
+## Metal backend (MSL)
+
+`TensorGraph::to_msl` lowers the same kernels as `to_wgsl` to Metal
+Shading Language (`tensor_msl.rs`). The emitters are shared: the point,
+split and tiled schedules, register tiles, multi-dim reductions,
+windowed staging, guarded views, epilogue fusion and tuple monoids are
+produced once, with a `Dialect` switch for buffer access, and the WGSL
+surface syntax is rewritten to MSL. What changes:
+
+- **Native formats.** f16 buffers are `half` (one element per index, a
+  plain store; no packed words, no atomics), bf16 buffers are `bfloat`.
+  f16 accumulators round through `half` after every combine.
+- **Guards are lazy.** WGSL `select` evaluates both arms and relies on
+  robust buffer access; MSL has none, so a guarded read is a ternary that
+  never issues the out-of-range load.
+- **Fragment lowering** (`set_fragment`, `fragment_plan`): a materialized
+  `Σ_r A(m, r)·B(r, n)` — or an elementwise map over one, as epilogue —
+  whose two operands are f16 buffers and whose accumulator is f32 runs on
+  `simdgroup_half8x8` × `simdgroup_half8x8` → `simdgroup_float8x8`. `m`
+  and `n` are the tile axes; other point dims are batch. The reduce dims
+  are flattened, so a conv's `(c, k)` is one K and conv is implicit GEMM.
+  An operand whose address is affine with unit stride along k or along
+  its free axis (matmul's `a`, `b`, `bᵀ`; a conv's weight) is loaded into
+  fragments straight from device memory on interior tiles; any other
+  operand (a conv's guarded, dilated `x`) is gathered through its view
+  into threadgroup `half` tiles, zero-padded at staging, and ragged edge
+  tiles stage both. The result tile goes through threadgroup memory,
+  where the epilogue map runs before the write-out. Fragment geometry
+  (`FragmentTarget`: fragment shape, SIMD width, threadgroup memory,
+  tile) is data, so a CUDA `wmma` lowering can reuse the plan.
+- **Runtime.** `tang_bench::ir_msl` (feature `metal`) owns its Metal
+  buffers end to end; `tune_precision` there adds the candidate
+  "operands f16 + fragments" per contraction, and `autotune_kernels`
+  tries fragments wherever the node's precision admits them. WGSL stays
+  the portable default.
+
 ## What the measurements say about the claim
 
 The winning schedule is a property of (graph, chip, size), not of the op:
@@ -195,11 +231,12 @@ schedule space; the compiler searches it.
 
 ## Not yet
 
-- Native half arithmetic. Storage is f16, math is f32; matrix units
-  (Apple `simdgroup_matrix`, 11 TFLOP/s with f16 inputs vs ~3.3 for the
-  IR's f32 tiles) need an MSL emitter that reads the precision schedule.
-- Codegen beyond WGSL (MSL/CUDA emitters exist in `tang-expr` for scalar
-  bodies; the loop-nest emitters are WGSL-only).
+- Fragments for attention (QKᵀ and PV under the online-softmax
+  schedule) and for operands that are inlined maps (ConvNeXt's
+  LayerNorm-normalized activation feeds its pointwise matmul through a
+  substituted map, so `fragment_plan` refuses it); a CUDA `wmma` emitter.
+- Body arithmetic in `half`. Storage and accumulators honour f16; scalar
+  body math is f32 on every path.
 - Scatter gradients reduce over the whole source coordinate they gate on;
   a stride-2 read pays 2× in the backward pass. Fine for rope, not for a
   large gather.

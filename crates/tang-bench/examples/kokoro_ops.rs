@@ -1434,8 +1434,19 @@ mod msl {
             .fold(f64::INFINITY, f64::min)
     }
 
-    fn run(dev: &MslDevice, g: &TensorGraph, outs: &[TensorId], inputs: &[&[f32]], want: &[f64]) -> (f64, f64, usize) {
-        let exe = Executable::new(dev, g.to_msl(outs), inputs);
+    fn run(
+        dev: &MslDevice,
+        g: &TensorGraph,
+        outs: &[TensorId],
+        inputs: &[&[f32]],
+        want: &[f64],
+    ) -> (f64, f64, usize) {
+        let prog = g.to_msl(outs);
+        if !Executable::fits(dev, &prog) {
+            // staging over the 32 KiB threadgroup limit: not runnable here
+            return (f64::INFINITY, f64::INFINITY, prog.kernels.len());
+        }
+        let exe = Executable::new(dev, prog, inputs);
         exe.run(dev);
         let err = rel_err(&exe.read(outs[0]), want);
         (time(dev, &exe), err, exe.program.kernels.len())
@@ -1443,7 +1454,10 @@ mod msl {
 
     pub fn main(only: Option<String>) {
         let dev = MslDevice::new().expect("metal");
-        println!("{} — MSL backend, kernel-only, {ITERS} launches per sample\n", dev.name);
+        println!(
+            "{} — MSL backend, kernel-only, {ITERS} launches per sample\n",
+            dev.name
+        );
         let ops = prec_ops(only.as_deref(), true);
         let mut table = Vec::new();
         for op in &ops {
@@ -1456,7 +1470,9 @@ mod msl {
             let mut best = (f64::INFINITY, "", 0.0);
             for (sched, gv) in [("naive", &g), ("auto", &auto), ("autotune", &tuned)] {
                 let (ms, err, nk) = run(&dev, gv, &outs, &refs, &op.want);
-                line.push_str(&format!("\n    f32 {sched:<8} {ms:8.3} ms  {nk} kernels  err {err:.1e}"));
+                line.push_str(&format!(
+                    "\n    f32 {sched:<8} {ms:8.3} ms  {nk} kernels  err {err:.1e}"
+                ));
                 if err <= 1e-5 && ms < best.0 {
                     best = (ms, sched, err);
                 }
@@ -1495,6 +1511,21 @@ mod msl {
                 ));
                 format!("{ms:.3} ({err:.0e})")
             };
+            {
+                let gv = match best.1 {
+                    "naive" => &g,
+                    "auto" => &auto,
+                    _ => &tuned,
+                };
+                let exe = Executable::new(&dev, gv.to_msl(&outs), &refs);
+                let sep = (0..3)
+                    .map(|_| exe.time_separate(&dev, ITERS))
+                    .fold(f64::INFINITY, f64::min);
+                line.push_str(&format!(
+                    "\n    f32 {} with one command buffer per run: {sep:.3} ms",
+                    best.1
+                ));
+            }
             let mut tuned_cols = Vec::new();
             for rel in [1e-2, 1e-3] {
                 let r = ir_msl::tune_precision(
@@ -1502,7 +1533,7 @@ mod msl {
                     tuned.clone(),
                     &outs,
                     &refs,
-                    &[op.want.clone()],
+                    std::slice::from_ref(&op.want),
                     ErrorBudget::rel(rel),
                     ITERS,
                 );
@@ -1512,9 +1543,17 @@ mod msl {
                     let mut parts: Vec<String> = r
                         .assignment
                         .iter()
-                        .map(|&(t, p)| format!("{} {}", describe(&r.graph, t, &op.names, &outs), fmt_prec(p)))
+                        .map(|&(t, p)| {
+                            format!(
+                                "{} {}",
+                                describe(&r.graph, t, &op.names, &outs),
+                                fmt_prec(p)
+                            )
+                        })
                         .collect();
-                    parts.extend(r.fragments.iter().map(|&t| format!("{} on fragments", describe(&r.graph, t, &op.names, &outs))));
+                    parts.extend(r.fragments.iter().map(|&t| {
+                        format!("{} on fragments", describe(&r.graph, t, &op.names, &outs))
+                    }));
                     parts.join(", ")
                 };
                 line.push_str(&format!(
@@ -1551,7 +1590,12 @@ mod msl {
             let xw = vec![TensorId::from_index(0), TensorId::from_index(1)];
             let (g, o) = conv_graph(c, t, k, dil, false);
             let (gi, oi) = conv_graph(c, t, k, dil, true);
-            train.push(train_row(&dev, "a fwd+bwd (dx, dw)", vec![("direct", g, o[0], xw.clone()), ("im2col", gi, oi[0], xw)], &[&x, &w]));
+            train.push(train_row(
+                &dev,
+                "a fwd+bwd (dx, dw)",
+                vec![("direct", g, o[0], xw.clone()), ("im2col", gi, oi[0], xw)],
+                &[&x, &w],
+            ));
         }
         if want_op("f") || want_op("train") {
             let (cf, tf, ff) = (512, 200, 1536);
@@ -1568,7 +1612,12 @@ mod msl {
             ];
             let refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
             let cn = convnext_graph(cf, tf, ff);
-            train.push(train_row(&dev, "f fwd+bwd (all params)", vec![("convnext", cn.g, cn.y, cn.params)], &refs));
+            train.push(train_row(
+                &dev,
+                "f fwd+bwd (all params)",
+                vec![("convnext", cn.g, cn.y, cn.params)],
+                &refs,
+            ));
         }
         println!("\n| op | MSL f32 best (ms) | MSL f16 fragments, forced (ms, err) | tuned @1e-2 (ms) | tuned @1e-3 (ms) |");
         println!("|---|---:|---:|---|---|");
@@ -1599,7 +1648,10 @@ mod msl {
             for (sched, gv) in [("auto", auto), ("autotune", tuned)] {
                 let exe = Executable::new(dev, gv.to_msl(&outs), inputs);
                 let ms = time(dev, &exe);
-                line.push_str(&format!("\n    {alg:>8}/{sched:<8} {ms:8.3} ms  {} kernels", exe.program.kernels.len()));
+                line.push_str(&format!(
+                    "\n    {alg:>8}/{sched:<8} {ms:8.3} ms  {} kernels",
+                    exe.program.kernels.len()
+                ));
                 if ms < best.0 {
                     best = (ms, format!("{alg}/{sched}"));
                 }

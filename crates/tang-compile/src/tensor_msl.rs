@@ -96,6 +96,10 @@ pub struct MslKernel {
     pub threads: u32,
     /// Lowered onto matrix fragments.
     pub fragment: bool,
+    /// Threadgroup memory the kernel declares, bytes. A schedule whose
+    /// staging does not fit the device (32 KiB on Apple GPUs) is not a
+    /// valid candidate there.
+    pub threadgroup_bytes: usize,
 }
 
 pub struct MslProgram {
@@ -142,8 +146,10 @@ impl TensorGraph {
                     }
                     let reads: Vec<usize> = k.reads.iter().map(|t| t.n()).collect();
                     let groups = (k.count as usize).div_ceil(k.workgroup_size as usize);
+                    let (source, threadgroup_bytes) = translate(self, &k.source, &reads, root);
                     MslKernel {
-                        source: translate(self, &k.source, &reads, root),
+                        source,
+                        threadgroup_bytes,
                         entry: "k_main".into(),
                         node: k.node,
                         reads: k.reads,
@@ -195,11 +201,18 @@ impl TensorGraph {
             _ => return None,
         };
         let vars = (&nodes[x.index() as usize], &nodes[y.index() as usize]);
-        if !matches!(vars, (Node::Var(0), Node::Var(1)) | (Node::Var(1), Node::Var(0))) {
+        if !matches!(
+            vars,
+            (Node::Var(0), Node::Var(1)) | (Node::Var(1), Node::Var(0))
+        ) {
             return None;
         }
         c.red.iter().try_for_each(|d| d.fixed().map(|_| ()))?;
-        let pts: Vec<usize> = c.points().iter().map(|d| d.fixed()).collect::<Option<_>>()?;
+        let pts: Vec<usize> = c
+            .points()
+            .iter()
+            .map(|d| d.fixed())
+            .collect::<Option<_>>()?;
         let (Some(dn), Some(dm)) = tile_axes(&pts) else {
             return None;
         };
@@ -223,13 +236,7 @@ impl TensorGraph {
         } else {
             return None;
         };
-        Some(FragmentPlan {
-            core,
-            a,
-            b,
-            dm,
-            dn,
-        })
+        Some(FragmentPlan { core, a, b, dm, dn })
     }
 
     fn fragment_kernel(&self, root: usize, plan: &FragmentPlan, t: &FragmentTarget) -> MslKernel {
@@ -278,7 +285,7 @@ impl TensorGraph {
         // memory into fragments (no staging) on interior tiles.
         let direct = |which: usize, free: usize| -> Option<(usize, i64, i64, String)> {
             let a = &c.args[which];
-            if a.view.guard || kt % fk != 0 {
+            if a.view.guard || !kt.is_multiple_of(fk) {
                 return None;
             }
             let src = self.storage(a.src).n();
@@ -327,49 +334,78 @@ impl TensorGraph {
         };
         // staging: A as [m][k], B as [k][n]; consecutive threads walk the
         // operand's fastest-moving tile axis
-        let stage = |s: &mut String, which: usize, buf: &str, rows: usize, cols: usize, a_side: bool| {
-            writeln!(s, "        for (uint idx = tid; idx < {}u; idx += {threads}u) {{", rows * cols).unwrap();
-            writeln!(s, "            const uint ri = idx / {cols}u;").unwrap();
-            writeln!(s, "            const uint ci = idx % {cols}u;").unwrap();
-            let (gpt, gk, ext) = if a_side {
-                ("m0 + ri", "k0 + ci", mm)
-            } else {
-                ("n0 + ci", "k0 + ri", nn)
+        let stage =
+            |s: &mut String, which: usize, buf: &str, rows: usize, cols: usize, a_side: bool| {
+                writeln!(
+                    s,
+                    "        for (uint idx = tid; idx < {}u; idx += {threads}u) {{",
+                    rows * cols
+                )
+                .unwrap();
+                writeln!(s, "            const uint ri = idx / {cols}u;").unwrap();
+                writeln!(s, "            const uint ci = idx % {cols}u;").unwrap();
+                let (gpt, gk, ext) = if a_side {
+                    ("m0 + ri", "k0 + ci", mm)
+                } else {
+                    ("n0 + ci", "k0 + ri", nn)
+                };
+                writeln!(s, "            const uint gp = {gpt};").unwrap();
+                writeln!(s, "            const uint gk = {gk};").unwrap();
+                writeln!(s, "            float v = 0.0f;").unwrap();
+                writeln!(s, "            if (gp < {ext}u && gk < {kt}u) {{").unwrap();
+                let (dp, dz) = if a_side { (dm, dn) } else { (dn, dm) };
+                writeln!(s, "                const uint p{dp} = gp;").unwrap();
+                writeln!(s, "                const uint p{dz} = 0u;").unwrap();
+                let mut dec = String::new();
+                emit_decompose(&mut dec, "gk", &red, "r");
+                for line in dec.lines() {
+                    writeln!(s, "            {line}").unwrap();
+                }
+                writeln!(
+                    s,
+                    "                v = {};",
+                    arg_read(self, c, &c.args[which])
+                )
+                .unwrap();
+                writeln!(s, "            }}").unwrap();
+                writeln!(s, "            {buf}[idx] = half(v);").unwrap();
+                writeln!(s, "        }}").unwrap();
             };
-            writeln!(s, "            const uint gp = {gpt};").unwrap();
-            writeln!(s, "            const uint gk = {gk};").unwrap();
-            writeln!(s, "            float v = 0.0f;").unwrap();
-            writeln!(s, "            if (gp < {ext}u && gk < {kt}u) {{").unwrap();
-            let (dp, dz) = if a_side { (dm, dn) } else { (dn, dm) };
-            writeln!(s, "                const uint p{dp} = gp;").unwrap();
-            writeln!(s, "                const uint p{dz} = 0u;").unwrap();
-            let mut dec = String::new();
-            emit_decompose(&mut dec, "gk", &red, "r");
-            for line in dec.lines() {
-                writeln!(s, "            {line}").unwrap();
-            }
-            writeln!(s, "                v = {};", arg_read(self, c, &c.args[which])).unwrap();
-            writeln!(s, "            }}").unwrap();
-            writeln!(s, "            {buf}[idx] = half(v);").unwrap();
-            writeln!(s, "        }}").unwrap();
-        };
         // One reduce loop, each operand either loaded straight from device
         // (`a_dev` / `b_dev`) or gathered into threadgroup memory.
         let emit_loop = |s: &mut String, a_dev: bool, b_dev: bool| {
             if a_dev {
                 let (ja, _, sma, basea) = da.as_ref().unwrap();
-                writeln!(s, "    device const half* pa = b{ja} + ({basea}) + int(m0) * {sma};").unwrap();
+                writeln!(
+                    s,
+                    "    device const half* pa = b{ja} + ({basea}) + int(m0) * {sma};"
+                )
+                .unwrap();
             }
             if b_dev {
                 let (jb, _, snb, baseb) = db.as_ref().unwrap();
-                writeln!(s, "    device const half* pb = b{jb} + ({baseb}) + int(n0) * {snb};").unwrap();
+                writeln!(
+                    s,
+                    "    device const half* pb = b{jb} + ({baseb}) + int(n0) * {snb};"
+                )
+                .unwrap();
             }
             if a_dev && b_dev {
                 writeln!(s, "    for (uint k = 0u; k < {kt}u; k += {fk}u) {{").unwrap();
                 writeln!(s, "        simdgroup_half8x8 fa[{am}];").unwrap();
                 writeln!(s, "        simdgroup_half8x8 fb[{an}];").unwrap();
-                writeln!(s, "        for (uint i = 0u; i < {am}u; i++) {};", load_a("k")).unwrap();
-                writeln!(s, "        for (uint j = 0u; j < {an}u; j++) {};", load_b("k")).unwrap();
+                writeln!(
+                    s,
+                    "        for (uint i = 0u; i < {am}u; i++) {};",
+                    load_a("k")
+                )
+                .unwrap();
+                writeln!(
+                    s,
+                    "        for (uint j = 0u; j < {an}u; j++) {};",
+                    load_b("k")
+                )
+                .unwrap();
                 writeln!(s, "        for (uint i = 0u; i < {am}u; i++) for (uint j = 0u; j < {an}u; j++) simdgroup_multiply_accumulate(acc[i][j], fa[i], fb[j], acc[i][j]);").unwrap();
                 writeln!(s, "    }}").unwrap();
                 return;
@@ -381,28 +417,46 @@ impl TensorGraph {
             if !b_dev {
                 stage(s, plan.b, "Bs", bk, bn, false);
             }
-            writeln!(s, "        threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+            writeln!(
+                s,
+                "        threadgroup_barrier(mem_flags::mem_threadgroup);"
+            )
+            .unwrap();
             writeln!(s, "        for (uint kk = 0u; kk < {bk}u; kk += {fk}u) {{").unwrap();
             writeln!(s, "            simdgroup_half8x8 fa[{am}];").unwrap();
             writeln!(s, "            simdgroup_half8x8 fb[{an}];").unwrap();
             if a_dev {
-                writeln!(s, "            for (uint i = 0u; i < {am}u; i++) {};", load_a("k0 + kk")).unwrap();
+                writeln!(
+                    s,
+                    "            for (uint i = 0u; i < {am}u; i++) {};",
+                    load_a("k0 + kk")
+                )
+                .unwrap();
             } else {
                 writeln!(s, "            for (uint i = 0u; i < {am}u; i++) simdgroup_load(fa[i], &As[(sr + i * {fm}u) * {bk}u + kk], {bk});").unwrap();
             }
             if b_dev {
-                writeln!(s, "            for (uint j = 0u; j < {an}u; j++) {};", load_b("k0 + kk")).unwrap();
+                writeln!(
+                    s,
+                    "            for (uint j = 0u; j < {an}u; j++) {};",
+                    load_b("k0 + kk")
+                )
+                .unwrap();
             } else {
                 writeln!(s, "            for (uint j = 0u; j < {an}u; j++) simdgroup_load(fb[j], &Bs[kk * {bn}u + sc + j * {fn_}u], {bn});").unwrap();
             }
             writeln!(s, "            for (uint i = 0u; i < {am}u; i++) for (uint j = 0u; j < {an}u; j++) simdgroup_multiply_accumulate(acc[i][j], fa[i], fb[j], acc[i][j]);").unwrap();
             writeln!(s, "        }}").unwrap();
-            writeln!(s, "        threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+            writeln!(
+                s,
+                "        threadgroup_barrier(mem_flags::mem_threadgroup);"
+            )
+            .unwrap();
             writeln!(s, "    }}").unwrap();
         };
         // A direct operand alongside a staged one reads whole chunks, so
         // the reduce extent must be a multiple of the chunk.
-        let hybrid = kt % bk == 0;
+        let hybrid = kt.is_multiple_of(bk);
         let m_int = format!("m0 + {bm}u <= {mm}u");
         let n_int = format!("n0 + {bn}u <= {nn}u");
         let fast = match (da.is_some(), db.is_some()) {
@@ -424,7 +478,12 @@ impl TensorGraph {
         writeln!(s, "    for (uint i = 0u; i < {am}u; i++) for (uint j = 0u; j < {an}u; j++) simdgroup_store(acc[i][j], &Cs[(sr + i * {fm}u) * {bn}u + sc + j * {fn_}u], {bn});").unwrap();
         writeln!(s, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
         // write-out (and epilogue) from the result tile
-        writeln!(s, "    for (uint idx = tid; idx < {}u; idx += {threads}u) {{", bm * bn).unwrap();
+        writeln!(
+            s,
+            "    for (uint idx = tid; idx < {}u; idx += {threads}u) {{",
+            bm * bn
+        )
+        .unwrap();
         writeln!(s, "        const uint gm = m0 + idx / {bn}u;").unwrap();
         writeln!(s, "        const uint gn = n0 + idx % {bn}u;").unwrap();
         writeln!(s, "        if (gm < {mm}u && gn < {nn}u) {{").unwrap();
@@ -452,12 +511,18 @@ impl TensorGraph {
                     }
                 })
                 .collect();
-            let vals = emit_scalar_mapped(&mut s, "        ", &mc.body, &mc.body_outs, "e_", &|v| {
-                args[v as usize].clone()
-            });
+            let vals =
+                emit_scalar_mapped(&mut s, "        ", &mc.body, &mc.body_outs, "e_", &|v| {
+                    args[v as usize].clone()
+                });
             let mw = mc.width();
             for (slot, v) in vals.iter().enumerate() {
-                writeln!(s, "        {}", store(out_f, &format!("g * {mw}u + {slot}u"), v)).unwrap();
+                writeln!(
+                    s,
+                    "        {}",
+                    store(out_f, &format!("g * {mw}u + {slot}u"), v)
+                )
+                .unwrap();
             }
         }
         writeln!(s, "        }}").unwrap();
@@ -465,7 +530,8 @@ impl TensorGraph {
         writeln!(s, "}}").unwrap();
 
         MslKernel {
-            source: translate(self, &s, &reads, root),
+            source: translate(self, &s, &reads, root).0,
+            threadgroup_bytes: t.staging_bytes(),
             entry: "k_main".into(),
             node: TensorId(root as u32),
             reads: reads.iter().map(|&j| TensorId(j as u32)).collect(),
@@ -531,7 +597,7 @@ inline void workgroupBarrier() { threadgroup_barrier(mem_flags::mem_threadgroup)
 
 /// Rewrite an emitter's WGSL-syntax kernel (or a fragment kernel, already
 /// MSL in its `main`) to MSL.
-fn translate(g: &TensorGraph, src: &str, reads: &[usize], root: usize) -> String {
+fn translate(g: &TensorGraph, src: &str, reads: &[usize], root: usize) -> (String, usize) {
     let mut out = String::from(PRELUDE);
     // buffers: helper functions see them through `B`
     writeln!(out, "struct Bufs {{").unwrap();
@@ -563,6 +629,7 @@ fn translate(g: &TensorGraph, src: &str, reads: &[usize], root: usize) -> String
     let bufs_init = format!("Bufs B{{{}}};", names.join(", "));
 
     let mut shared = Vec::new();
+    let mut tg_bytes = 0;
     let mut body = String::new();
     for line in src.lines() {
         let t = line.trim_start();
@@ -572,8 +639,17 @@ fn translate(g: &TensorGraph, src: &str, reads: &[usize], root: usize) -> String
         if let Some(rest) = t.strip_prefix("var<workgroup> ") {
             // `name: array<T, N>;` → `threadgroup T name[N];`
             let (name, ty) = rest.trim_end_matches(';').split_once(": ").unwrap();
-            let inner = ty.strip_prefix("array<").unwrap().strip_suffix('>').unwrap();
+            let inner = ty
+                .strip_prefix("array<")
+                .unwrap()
+                .strip_suffix('>')
+                .unwrap();
             let (elem, n) = inner.rsplit_once(", ").unwrap();
+            let width = match elem.strip_prefix("array<f32, ") {
+                Some(w) => w.trim_end_matches('>').parse::<usize>().unwrap(),
+                None => 1,
+            };
+            tg_bytes += 4 * width * n.parse::<usize>().unwrap();
             shared.push(format!("    threadgroup {elem} {name}[{n}];"));
             continue;
         }
@@ -603,7 +679,7 @@ fn translate(g: &TensorGraph, src: &str, reads: &[usize], root: usize) -> String
         writeln!(body, "{}", statement(&line)).unwrap();
     }
     out.push_str(&body);
-    out
+    (out, tg_bytes)
 }
 
 /// `fn name(a: T, …) -> R {` → `R name(thread const Bufs& B, T a, …) {`.
@@ -752,7 +828,11 @@ fn selects(s: &str) -> String {
     let close = matching(s, open);
     let parts = split_top(&s[open + 1..close]);
     assert_eq!(parts.len(), 3, "select arity: {s}");
-    let (f, t, c) = (selects(parts[0].trim()), selects(parts[1].trim()), selects(parts[2].trim()));
+    let (f, t, c) = (
+        selects(parts[0].trim()),
+        selects(parts[1].trim()),
+        selects(parts[2].trim()),
+    );
     format!(
         "{}(({c}) ? ({t}) : ({f})){}",
         &s[..pos],
@@ -911,7 +991,10 @@ mod tests {
             statement("var acc = array<f32, 2>(1e-5, b2[i]);"),
             "auto acc = array<f32, 2>{1e-5f, B.b2[i]};"
         );
-        assert_eq!(statement("let v = point_4();"), "const auto v = point_4(B);");
+        assert_eq!(
+            statement("let v = point_4();"),
+            "const auto v = point_4(B);"
+        );
         assert_eq!(
             signature("fn combine_3(a: array<f32, 2>, e: array<f32, 2>) -> array<f32, 2> {"),
             "array<f32, 2> combine_3(thread const Bufs& B, array<f32, 2> a, array<f32, 2> e) {"

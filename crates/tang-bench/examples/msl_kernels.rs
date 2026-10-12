@@ -30,7 +30,10 @@ fn matmul_ref(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f64> {
     for i in 0..m {
         for kk in 0..k {
             let av = a[i * k + kk] as f64;
-            for (yv, bv) in y[i * n..(i + 1) * n].iter_mut().zip(&b[kk * n..(kk + 1) * n]) {
+            for (yv, bv) in y[i * n..(i + 1) * n]
+                .iter_mut()
+                .zip(&b[kk * n..(kk + 1) * n])
+            {
                 *yv += av * *bv as f64;
             }
         }
@@ -45,7 +48,13 @@ fn time(dev: &MslDevice, exe: &Executable) -> f64 {
         .fold(f64::INFINITY, f64::min)
 }
 
-fn run(dev: &MslDevice, g: &TensorGraph, y: TensorId, inputs: &[&[f32]], want: &[f64]) -> (f64, f64) {
+fn run(
+    dev: &MslDevice,
+    g: &TensorGraph,
+    y: TensorId,
+    inputs: &[&[f32]],
+    want: &[f64],
+) -> (f64, f64) {
     let exe = Executable::new(dev, g.to_msl(&[y]), inputs);
     exe.run(dev);
     let err = rel_err(&exe.read(y), want);
@@ -54,8 +63,15 @@ fn run(dev: &MslDevice, g: &TensorGraph, y: TensorId, inputs: &[&[f32]], want: &
 
 fn main() {
     let dev = MslDevice::new().expect("metal");
-    println!("{} — MSL backend, kernel-only, {ITERS} launches per sample\n", dev.name);
-    for (m, k, n) in [(1024usize, 1024usize, 1024usize), (128, 576, 1536), (512, 576, 1536)] {
+    println!(
+        "{} — MSL backend, kernel-only, {ITERS} launches per sample\n",
+        dev.name
+    );
+    for (m, k, n) in [
+        (1024usize, 1024usize, 1024usize),
+        (128, 576, 1536),
+        (512, 576, 1536),
+    ] {
         let (a, b) = (rand(m * k, 1), rand(k * n, 2));
         let want = matmul_ref(&a, &b, m, k, n);
         let flop = 2.0 * (m * k * n) as f64;

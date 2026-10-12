@@ -66,7 +66,9 @@ fn matmul_graph(m: usize, k: usize, n: usize) -> (TensorGraph, TensorId) {
     (g, c)
 }
 
-const MAPPINGS: [(&str, u32, (u32, u32, u32), (u32, u32)); 6] = [
+type Mapping = (&'static str, u32, (u32, u32, u32), (u32, u32));
+
+const MAPPINGS: [Mapping; 6] = [
     ("point", 0, (0, 0, 0), (1, 1)),
     ("split", 64, (0, 0, 0), (1, 1)),
     ("tile", 0, (16, 16, 32), (1, 1)),
@@ -86,7 +88,15 @@ fn matmul_every_mapping_f32() {
         for (name, split, tile, reg) in MAPPINGS {
             let mut gv = g.clone();
             gv.set_schedule(c, split, tile, reg);
-            check(&dev, &format!("{m}x{k}x{n} {name}"), &gv, &[c], &inputs, &want, 1e-5);
+            check(
+                &dev,
+                &format!("{m}x{k}x{n} {name}"),
+                &gv,
+                &[c],
+                &inputs,
+                &want,
+                1e-5,
+            );
         }
     }
 }
@@ -98,7 +108,11 @@ fn f16_storage_and_accum_match_emulation() {
     let Some(dev) = dev() else { return };
     let mut rng = tang_bench::Rng::new(7);
     let (m, k, n) = (48, 96, 80);
-    let inputs = vec![rand(m * k, &mut rng), rand(k * n, &mut rng), rand(n, &mut rng)];
+    let inputs = vec![
+        rand(m * k, &mut rng),
+        rand(k * n, &mut rng),
+        rand(n, &mut rng),
+    ];
     let half = Precision::storage(Format::F16);
     for accum in [Format::F32, Format::F16] {
         for (name, split, tile, reg) in MAPPINGS {
@@ -112,13 +126,27 @@ fn f16_storage_and_accum_match_emulation() {
             for t in [ga, gb, gbias, z] {
                 g.set_precision(t, half);
             }
-            g.set_precision(y, Precision { storage: Format::F16, accum });
+            g.set_precision(
+                y,
+                Precision {
+                    storage: Format::F16,
+                    accum,
+                },
+            );
             g.set_schedule(y, split, tile, reg);
             let emu = g.eval_emulated(&f64s(&inputs), &[y, z]);
             // the emulation sums in a fixed order; the GPU's split/tile
             // order differs, so allow a couple of f16 ulps of the result
             let tol = if accum == Format::F16 { 2e-2 } else { 2e-3 };
-            check(&dev, &format!("f16 {accum:?} {name}"), &g, &[y, z], &inputs, &emu, tol);
+            check(
+                &dev,
+                &format!("f16 {accum:?} {name}"),
+                &g,
+                &[y, z],
+                &inputs,
+                &emu,
+                tol,
+            );
         }
     }
 }
@@ -209,7 +237,11 @@ fn conv_epilogue_fused_f32() {
             s + s.sin() * s.sin()
         })
         .unwrap();
-    let inputs = vec![rand(ci * t, &mut rng), rand(co * ci * k, &mut rng), rand(co, &mut rng)];
+    let inputs = vec![
+        rand(ci * t, &mut rng),
+        rand(co * ci * k, &mut rng),
+        rand(co, &mut rng),
+    ];
     let want = g.eval(&f64s(&inputs), &[z]);
     let (g, outs) = g.substitute_maps(&[z]);
     let mut g = g;
@@ -227,7 +259,11 @@ fn attention_online_softmax_f32() {
     use tang_bench::ir_gpu::{flash_attention, naive_attention};
     let mut rng = tang_bench::Rng::new(9);
     for (n, d) in [(64, 16), (130, 32)] {
-        let inputs = vec![rand(n * d, &mut rng), rand(n * d, &mut rng), rand(n * d, &mut rng)];
+        let inputs = vec![
+            rand(n * d, &mut rng),
+            rand(n * d, &mut rng),
+            rand(n * d, &mut rng),
+        ];
         let (g, y) = naive_attention(n, d, d);
         let want = g.eval(&f64s(&inputs), &[y]);
         check(&dev, "naive", &g, &[y], &inputs, &want, 1e-5);
@@ -301,20 +337,44 @@ fn f16_operands(g: &mut TensorGraph, ts: &[TensorId]) {
 fn fragment_matmul_ragged() {
     let Some(dev) = dev() else { return };
     let mut rng = tang_bench::Rng::new(21);
-    for (m, k, n) in [(100, 100, 100), (128, 576, 1536), (64, 64, 64), (7, 300, 33)] {
+    for (m, k, n) in [
+        (100, 100, 100),
+        (128, 576, 1536),
+        (64, 64, 64),
+        (7, 300, 33),
+    ] {
         let (mut g, c) = matmul_graph(m, k, n);
         let inputs = vec![rand(m * k, &mut rng), rand(k * n, &mut rng)];
-        assert!(g.fragment_plan(c).is_none(), "f32 operands must not get fragments");
+        assert!(
+            g.fragment_plan(c).is_none(),
+            "f32 operands must not get fragments"
+        );
         f16_operands(&mut g, &[TensorId::from_index(0), TensorId::from_index(1)]);
         assert!(g.fragment_plan(c).is_some());
         g.set_fragment(c, true);
         let emu = g.eval_emulated(&f64s(&inputs), &[c]);
-        let exe = check(&dev, &format!("frag {m}x{k}x{n}"), &g, &[c], &inputs, &emu, 1e-5);
+        let exe = check(
+            &dev,
+            &format!("frag {m}x{k}x{n}"),
+            &g,
+            &[c],
+            &inputs,
+            &emu,
+            1e-5,
+        );
         assert!(exe.program.kernels[0].fragment);
         // f16 output
         g.set_precision(c, Precision::storage(Format::F16));
         let emu = g.eval_emulated(&f64s(&inputs), &[c]);
-        check(&dev, &format!("frag {m}x{k}x{n} f16 out"), &g, &[c], &inputs, &emu, 1e-3);
+        check(
+            &dev,
+            &format!("frag {m}x{k}x{n} f16 out"),
+            &g,
+            &[c],
+            &inputs,
+            &emu,
+            1e-3,
+        );
     }
 }
 
@@ -364,7 +424,11 @@ fn fragment_conv_implicit_gemm_with_epilogue() {
         let bias = g.input(&[co, 1]);
         let bb = g.broadcast(bias, &[co, t]).unwrap();
         let z = g.map(&[y, bb], |v| v[0] + v[1]).unwrap();
-        let inputs = vec![rand(ci * t, &mut rng), rand(co * ci * k, &mut rng), rand(co, &mut rng)];
+        let inputs = vec![
+            rand(ci * t, &mut rng),
+            rand(co * ci * k, &mut rng),
+            rand(co, &mut rng),
+        ];
         f16_operands(&mut g, &[TensorId::from_index(0), TensorId::from_index(1)]);
         let emu = g.eval_emulated(&f64s(&inputs), &[z]);
         // unfused: the conv itself on fragments
@@ -380,7 +444,11 @@ fn fragment_conv_implicit_gemm_with_epilogue() {
         let exe = check(&dev, "frag conv epilogue", &gf, &[z], &inputs, &emu, 1e-5);
         // the conv has no kernel of its own: it is the map's epilogue core
         assert!(exe.program.kernels.iter().all(|k| k.node != y));
-        assert!(exe.program.kernels.iter().any(|k| k.node == z && k.fragment));
+        assert!(exe
+            .program
+            .kernels
+            .iter()
+            .any(|k| k.node == z && k.fragment));
     }
 }
 
@@ -405,8 +473,45 @@ fn fragment_transposed_operands() {
         g.set_fragment(c, true);
         assert!(g.fragment_plan(c).is_some());
         let emu = g.eval_emulated(&f64s(&inputs), &[c]);
-        let exe = check(&dev, &format!("frag T {m}x{k}x{n}"), &g, &[c], &inputs, &emu, 1e-5);
+        let exe = check(
+            &dev,
+            &format!("frag T {m}x{k}x{n}"),
+            &g,
+            &[c],
+            &inputs,
+            &emu,
+            1e-5,
+        );
         assert!(exe.program.kernels.iter().any(|k| k.fragment));
         let _ = want;
     }
+}
+
+/// The backend dimension: the same graph through WGSL and MSL, both
+/// checked against the f64 reference.
+#[test]
+fn pick_backend_runs_both() {
+    let Some(dev) = dev() else { return };
+    let Ok(wgpu) = tang_gpu::GpuDevice::new_sync() else {
+        return;
+    };
+    let mut cache = tang_gpu::KernelCache::new();
+    let mut rng = tang_bench::Rng::new(25);
+    let (mut g, c) = matmul_graph(96, 80, 112);
+    g.schedule_auto(&[c]);
+    let inputs = vec![rand(96 * 80, &mut rng), rand(80 * 112, &mut rng)];
+    let want = g.eval(&f64s(&inputs), &[c]);
+    let refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
+    let (_, w, m) = tang_bench::ir_msl::pick_backend(
+        &wgpu,
+        &mut cache,
+        &dev,
+        &g,
+        &[c],
+        &refs,
+        &want,
+        tang_compile::tensor::ErrorBudget::rel(1e-5),
+        10,
+    );
+    assert!(w.is_some() && m.is_some());
 }
