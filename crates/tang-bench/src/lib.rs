@@ -259,7 +259,9 @@ pub fn random_spd_flat(size: usize) -> Vec<f64> {
 /// Run tang-compile tensor graphs on the GPU, for the kernels-vs-IR benches.
 pub mod ir_gpu {
     use tang::Scalar;
+    use tang_compile::tensor::precision::{f16_bits, f16_from_bits};
     use tang_compile::tensor::wgsl::WgslProgram;
+    use tang_compile::tensor::{ErrorBudget, ErrorStats, Format, Op, Precision};
     use tang_compile::tensor::{Arg, Form, Monoid, ScheduleCandidate, TensorGraph, TensorId, View};
     use tang_expr::ExprId;
     use tang_gpu::{GpuBuffer, GpuDevice, KernelCache};
@@ -277,15 +279,32 @@ pub mod ir_gpu {
             let buffers = program
                 .buffers
                 .iter()
-                .map(|b| match b.input {
-                    Some(k) => {
+                .map(|b| match (b.input, b.format) {
+                    (Some(k), Format::F32) => {
                         assert_eq!(inputs[k].len(), b.len, "input {k} has wrong length");
                         GpuBuffer::from_slice(device, inputs[k])
                     }
-                    None => GpuBuffer::uninit(device, b.len),
+                    (Some(k), Format::F16) => {
+                        assert_eq!(inputs[k].len(), b.len, "input {k} has wrong length");
+                        GpuBuffer::from_u32_slice(device, &pack_f16(inputs[k]))
+                    }
+                    (None, Format::F32) => GpuBuffer::uninit(device, b.len),
+                    (None, Format::F16) => GpuBuffer::uninit(device, b.len.div_ceil(2)),
+                    (_, Format::BF16) => unreachable!("bf16 is interpreter-only"),
                 })
                 .collect();
             Self { program, buffers }
+        }
+
+        /// Format of the buffer holding `t`.
+        pub fn format(&self, t: TensorId) -> Format {
+            let t = self.program.storage(t);
+            self.program
+                .buffers
+                .iter()
+                .find(|b| b.node == t)
+                .unwrap()
+                .format
         }
 
         /// The buffer holding `t` (inputs included), for feeding one
@@ -339,9 +358,49 @@ pub mod ir_gpu {
             }
         }
 
+        /// Read `t` back as f32 (f16 buffers are widened exactly).
         pub fn read(&self, device: &GpuDevice, t: TensorId) -> Vec<f32> {
-            self.buffer(t).to_vec_sync(device)
+            let raw = self.buffer(t).to_vec_sync(device);
+            match self.format(t) {
+                Format::F16 => {
+                    let n = self
+                        .program
+                        .buffers
+                        .iter()
+                        .find(|b| b.node == self.program.storage(t))
+                        .unwrap()
+                        .len;
+                    unpack_f16(&raw, n)
+                }
+                _ => raw,
+            }
         }
+    }
+
+    /// f32 values → IEEE f16 (round to nearest even), two per u32 word,
+    /// little end first — the byte layout of a WGSL `array<f16>`.
+    pub fn pack_f16(v: &[f32]) -> Vec<u32> {
+        v.chunks(2)
+            .map(|p| {
+                let lo = f16_bits(p[0] as f64) as u32;
+                let hi = p.get(1).map_or(0, |&x| f16_bits(x as f64) as u32);
+                lo | (hi << 16)
+            })
+            .collect()
+    }
+
+    /// Inverse of [`pack_f16`]: the first `n` halves of `words` (read
+    /// back as f32 bit patterns), widened to f32.
+    pub fn unpack_f16(words: &[f32], n: usize) -> Vec<f32> {
+        words
+            .iter()
+            .flat_map(|w| {
+                let b = w.to_bits();
+                [b as u16, (b >> 16) as u16]
+            })
+            .take(n)
+            .map(|h| f16_from_bits(h) as f32)
+            .collect()
     }
 
     /// Additive causal mask: 0 where `j <= i`, a large negative otherwise.
@@ -469,6 +528,178 @@ pub mod ir_gpu {
         let (mut g, outs) = g.eliminate_common(&outs);
         g.schedule_auto(&outs);
         (g, outs[0])
+    }
+
+    /// Mean time of one whole-program run (5 warmups, `iters` launches,
+    /// one sync), in ms.
+    pub fn time_program(
+        device: &GpuDevice,
+        cache: &mut KernelCache,
+        exe: &Executable,
+        out: TensorId,
+        iters: usize,
+    ) -> f64 {
+        for _ in 0..5 {
+            exe.run(device, cache);
+        }
+        cache.flush(device);
+        let _ = exe.read(device, out);
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            exe.run(device, cache);
+        }
+        cache.flush(device);
+        let _ = exe.read(device, out);
+        start.elapsed().as_secs_f64() * 1e3 / iters as f64
+    }
+
+    /// Run `g` on the GPU and compare every output with `want` (f64).
+    pub fn gpu_error(
+        device: &GpuDevice,
+        cache: &mut KernelCache,
+        exe: &Executable,
+        outputs: &[TensorId],
+        want: &[Vec<f64>],
+    ) -> ErrorStats {
+        exe.run(device, cache);
+        cache.flush(device);
+        let got: Vec<Vec<f64>> = outputs
+            .iter()
+            .map(|o| exe.read(device, *o).iter().map(|&v| v as f64).collect())
+            .collect();
+        ErrorStats::compare(&got, want)
+    }
+
+    /// One precision candidate the search tried.
+    pub struct PrecisionTrial {
+        pub node: TensorId,
+        pub precision: Precision,
+        /// Measured on the GPU against the f64 reference.
+        pub error: ErrorStats,
+        /// Whole-program time with this change (ms); `None` if not timed
+        /// (over budget, or an accumulator change — see [`tune_precision`]).
+        pub ms: Option<f64>,
+        pub kept: bool,
+    }
+
+    /// Result of [`tune_precision`].
+    pub struct PrecisionTune {
+        /// The input graph with the chosen precision schedule.
+        pub graph: TensorGraph,
+        /// Nodes whose precision changed from all-f32.
+        pub assignment: Vec<(TensorId, Precision)>,
+        /// GPU error of the chosen schedule vs the f64 reference.
+        pub error: ErrorStats,
+        pub base_error: ErrorStats,
+        pub base_ms: f64,
+        pub ms: f64,
+        pub trials: Vec<PrecisionTrial>,
+    }
+
+    /// Greedy precision search under an error budget, measured on the
+    /// device. Candidates are the program's buffers (inputs, weights and
+    /// materialized intermediates), largest first; each is lowered to f16
+    /// storage on top of what has been kept so far, run, checked against
+    /// `want` (the f64 reference for `outputs`) and timed. A change is
+    /// kept if the whole program stays within `budget` and gets faster.
+    ///
+    /// Then every reduction is tried with an f16 accumulator, checked
+    /// against the budget only: the lowering models f16 accumulation by
+    /// rounding an f32 register after each combine, which reproduces its
+    /// numerics but not its speed (that needs native f16 / simdgroup
+    /// math). Those trials report admitted-or-rejected and are not kept.
+    /// bf16 is interpreter-only and not a GPU candidate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tune_precision(
+        device: &GpuDevice,
+        cache: &mut KernelCache,
+        g: TensorGraph,
+        outputs: &[TensorId],
+        inputs: &[&[f32]],
+        want: &[Vec<f64>],
+        budget: ErrorBudget,
+        iters: usize,
+    ) -> PrecisionTune {
+        let measure = |cache: &mut KernelCache, g: &TensorGraph, timed: bool| {
+            let exe = Executable::new(device, g.to_wgsl(outputs), inputs);
+            let err = gpu_error(device, cache, &exe, outputs, want);
+            let ms = (timed && budget.admits(&err))
+                .then(|| time_program(device, cache, &exe, outputs[0], iters));
+            (err, ms)
+        };
+        let (base_error, base_ms) = measure(cache, &g, true);
+        let base_ms = base_ms.unwrap_or_else(|| {
+            let exe = Executable::new(device, g.to_wgsl(outputs), inputs);
+            time_program(device, cache, &exe, outputs[0], iters)
+        });
+        let mut cur = g;
+        let (mut cur_err, mut cur_ms) = (base_error, base_ms);
+        let mut trials = Vec::new();
+
+        let mut bufs: Vec<(TensorId, usize)> = cur
+            .to_wgsl(outputs)
+            .buffers
+            .iter()
+            .map(|b| (b.node, cur.buffer_bytes(b.node)))
+            .collect();
+        bufs.sort_by(|a, b| b.1.cmp(&a.1));
+        for (node, _) in bufs {
+            let mut p = cur.precision(node);
+            p.storage = Format::F16;
+            let mut v = cur.clone();
+            v.set_precision(node, p);
+            let (err, ms) = measure(cache, &v, true);
+            // a change must buy at least 2% to be worth its error
+            let kept = ms.is_some_and(|t| t < cur_ms * 0.98);
+            trials.push(PrecisionTrial {
+                node,
+                precision: p,
+                error: err,
+                ms,
+                kept,
+            });
+            if kept {
+                cur = v;
+                cur_err = err;
+                cur_ms = ms.unwrap();
+            }
+        }
+
+        let reductions: Vec<TensorId> = (0..cur.nodes().len())
+            .map(TensorId::from_index)
+            .filter(|&t| {
+                matches!(&cur.nodes()[t.index()].op, Op::Comp(c) if c.monoid.is_some())
+            })
+            .collect();
+        for node in reductions {
+            let mut p = cur.precision(node);
+            p.accum = Format::F16;
+            let mut v = cur.clone();
+            v.set_precision(node, p);
+            let (err, _) = measure(cache, &v, false);
+            trials.push(PrecisionTrial {
+                node,
+                precision: p,
+                error: err,
+                ms: None,
+                kept: false,
+            });
+        }
+
+        let assignment = (0..cur.nodes().len())
+            .map(TensorId::from_index)
+            .filter(|&t| cur.precision(t) != Precision::F32)
+            .map(|t| (t, cur.precision(t)))
+            .collect();
+        PrecisionTune {
+            graph: cur,
+            assignment,
+            error: cur_err,
+            base_error,
+            base_ms,
+            ms: cur_ms,
+            trials,
+        }
     }
 
     /// One kernel's winning thread mapping and its measured time.
@@ -1003,6 +1234,137 @@ pub mod ir_gpu {
                     );
                 }
             }
+        }
+
+        /// f16 bit distance between two values (same sign assumed).
+        fn f16_ulps(a: f64, b: f64) -> i32 {
+            use tang_compile::tensor::precision::f16_bits;
+            (f16_bits(a) as i32 - f16_bits(b) as i32).abs()
+        }
+
+        /// The interpreter's precision emulation predicts the GPU's f16
+        /// kernels: f16 inputs, f16 intermediates and outputs, f32 or
+        /// f16 accumulators, through every emitter (one thread per point,
+        /// workgroup split, tiled + register tiles).
+        #[test]
+        fn precision_emulation_matches_gpu_f16() {
+            let Ok(device) = GpuDevice::new_sync() else {
+                eprintln!("no GPU, skipping");
+                return;
+            };
+            let mut cache = KernelCache::new();
+            let (m, k, n) = (48, 96, 80);
+            let mut rng = crate::Rng::new(7);
+            let a: Vec<f32> = (0..m * k).map(|_| rng.f32() * 2.0 - 1.0).collect();
+            let b: Vec<f32> = (0..k * n).map(|_| rng.f32() * 2.0 - 1.0).collect();
+            let bias: Vec<f32> = (0..n).map(|_| rng.f32()).collect();
+            let inputs = vec![
+                a.iter().map(|&v| v as f64).collect::<Vec<_>>(),
+                b.iter().map(|&v| v as f64).collect(),
+                bias.iter().map(|&v| v as f64).collect(),
+            ];
+            let half = Precision::storage(Format::F16);
+            let schedules: [(&str, u32, (u32, u32, u32), (u32, u32)); 4] = [
+                ("point", 0, (0, 0, 0), (1, 1)),
+                ("split", 64, (0, 0, 0), (1, 1)),
+                ("tile", 0, (16, 16, 32), (1, 1)),
+                ("tile 2x2", 0, (16, 16, 32), (2, 2)),
+            ];
+            for accum in [Format::F32, Format::F16] {
+                for (name, split, tile, reg) in schedules {
+                    let mut g = TensorGraph::new();
+                    let ga = g.input(&[m, k]);
+                    let gb = g.input(&[k, n]);
+                    let gbias = g.input(&[1, n]);
+                    let y = g.matmul(ga, gb).unwrap();
+                    let bb = g.broadcast(gbias, &[m, n]).unwrap();
+                    let z = g.map(&[y, bb], |v| v[0] * v[0] + v[1]).unwrap();
+                    for t in [ga, gb, gbias, z] {
+                        g.set_precision(t, half);
+                    }
+                    g.set_precision(y, Precision { storage: Format::F16, accum });
+                    g.set_schedule(y, split, tile, reg);
+                    let emu = g.eval_emulated(&inputs, &[y, z]);
+                    let exe = Executable::new(&device, g.to_wgsl(&[y, z]), &[&a, &b, &bias]);
+                    assert!(exe.program.kernels.iter().all(|k| k.source.contains("unpack2x16float")));
+                    exe.run(&device, &mut cache);
+                    cache.flush(&device);
+                    // the f16 accumulator rounds in the interpreter's order
+                    // only when one thread walks the whole reduction
+                    let sequential = split == 0;
+                    // otherwise rounding steps happen in another order
+                    let tol = match (sequential, accum) {
+                        (true, _) => 1,
+                        (false, Format::F32) => 1,
+                        (false, _) => 8,
+                    };
+                    // z = y² + bias: an ulp of y is ~2 ulps of z
+                    for ((o, want), tol) in [y, z].iter().zip(&emu).zip([tol, 2 * tol + 1]) {
+                        let got = exe.read(&device, *o);
+                        let worst = got
+                            .iter()
+                            .zip(want)
+                            .map(|(&g, &w)| f16_ulps(g as f64, w))
+                            .max()
+                            .unwrap();
+                        assert!(
+                            worst <= tol,
+                            "{name} accum {accum:?} out {}: {worst} f16 ulps off emulation",
+                            o.index()
+                        );
+                    }
+                }
+            }
+        }
+
+        /// The search on a small matmul: lowering storage stays within a
+        /// loose budget and a tight one rejects f16 outright.
+        #[test]
+        fn tune_precision_respects_budget() {
+            let Ok(device) = GpuDevice::new_sync() else {
+                eprintln!("no GPU, skipping");
+                return;
+            };
+            let mut cache = KernelCache::new();
+            let n = 128;
+            let mut rng = crate::Rng::new(3);
+            let a: Vec<f32> = (0..n * n).map(|_| rng.f32() * 2.0 - 1.0).collect();
+            let b: Vec<f32> = (0..n * n).map(|_| rng.f32() * 2.0 - 1.0).collect();
+            let mut g = TensorGraph::new();
+            let ga = g.input(&[n, n]);
+            let gb = g.input(&[n, n]);
+            let y = g.matmul(ga, gb).unwrap();
+            let f64s = |v: &[f32]| v.iter().map(|&x| x as f64).collect::<Vec<_>>();
+            let want = g.eval(&[f64s(&a), f64s(&b)], &[y]);
+            let tight = tune_precision(
+                &device,
+                &mut cache,
+                g.clone(),
+                &[y],
+                &[&a, &b],
+                &want,
+                ErrorBudget::rel(1e-5),
+                3,
+            );
+            assert!(tight.assignment.is_empty());
+            assert!(tight.trials.iter().all(|t| !ErrorBudget::rel(1e-5).admits(&t.error)));
+            let loose = tune_precision(
+                &device,
+                &mut cache,
+                g,
+                &[y],
+                &[&a, &b],
+                &want,
+                ErrorBudget::rel(1e-2),
+                3,
+            );
+            assert!(ErrorBudget::rel(1e-2).admits(&loose.error));
+            // every storage trial fits a 1e-2 budget on a 128-long dot product
+            assert!(loose
+                .trials
+                .iter()
+                .filter(|t| t.precision.accum == Format::F32)
+                .all(|t| ErrorBudget::rel(1e-2).admits(&t.error)));
         }
 
         /// Multi-dim reductions (`red = (c, k)`) through the tiled

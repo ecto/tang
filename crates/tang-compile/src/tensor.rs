@@ -44,6 +44,9 @@ mod grad;
 mod tile;
 #[path = "tensor_wgsl.rs"]
 pub mod wgsl;
+#[path = "tensor_precision.rs"]
+pub mod precision;
+pub use precision::{ErrorBudget, ErrorStats, Format, Precision};
 
 // ---------------------------------------------------------------------------
 // Views
@@ -408,6 +411,10 @@ pub struct TNode {
     /// Schedule: points per thread along `(x, y)` within a tile — the
     /// register tile. `(1, 1)` is one point per thread.
     pub reg: (u32, u32),
+    /// Schedule: number formats — storage of a materialized buffer (or
+    /// input) and the running accumulator of a reduction. Default all
+    /// f32. See [`Precision`].
+    pub precision: Precision,
 }
 
 /// Reduce dims the tiled emitter handles: one chunked axis (the largest)
@@ -556,6 +563,19 @@ impl TensorGraph {
         self.nodes[t.n()].inline = inline;
     }
 
+    /// Schedule: the number formats of `t` — `storage` for its buffer
+    /// (inputs and materialized comps; ignored when inlined) and `accum`
+    /// for its running reduction state. Precision is a schedule, not a
+    /// type: the graph stays math, and [`TensorGraph::eval`] ignores it.
+    /// [`TensorGraph::eval_emulated`] and the WGSL lowering honour it.
+    pub fn set_precision(&mut self, t: TensorId, p: Precision) {
+        self.nodes[t.n()].precision = p;
+    }
+
+    pub fn precision(&self, t: TensorId) -> Precision {
+        self.nodes[t.n()].precision
+    }
+
     /// Thread mappings worth trying for a materialized comp on a GPU:
     /// one thread per point, a workgroup split (reductions), and rows ×
     /// lanes tiles (single-axis reductions with a lane dim).
@@ -616,6 +636,7 @@ impl TensorGraph {
             split: 0,
             tile: (0, 0, 0),
             reg: (1, 1),
+            precision: Precision::default(),
         });
         TensorId(self.nodes.len() as u32 - 1)
     }
@@ -630,6 +651,7 @@ impl TensorGraph {
             split: 0,
             tile: (0, 0, 0),
             reg: (1, 1),
+            precision: Precision::default(),
         });
         TensorId(self.nodes.len() as u32 - 1)
     }
@@ -659,6 +681,7 @@ impl TensorGraph {
             split: 0,
             tile: (0, 0, 0),
             reg: (1, 1),
+            precision: Precision::default(),
         });
         Ok(TensorId(self.nodes.len() as u32 - 1))
     }
@@ -755,6 +778,7 @@ impl TensorGraph {
             split: 0,
             tile: (0, 0, 0),
             reg: (1, 1),
+            precision: Precision::default(),
             op: Op::Comp(comp),
         });
         Ok(TensorId(self.nodes.len() as u32 - 1))
@@ -1072,6 +1096,7 @@ impl TensorGraph {
                 split: node.split,
                 tile: node.tile,
                 reg: node.reg,
+                precision: node.precision,
             });
             remap[i] = Some(ng.nodes.len() - 1);
         }
@@ -1970,9 +1995,24 @@ impl TensorGraph {
     /// Evaluate `outputs`. Materialized nodes are computed once into
     /// buffers; inlined nodes are recomputed at every point they are read.
     pub fn eval(&self, inputs: &[Vec<f64>], outputs: &[TensorId]) -> Vec<Vec<f64>> {
+        self.eval_with(inputs, outputs, false)
+    }
+
+    /// [`TensorGraph::eval`] under the graph's precision schedule: every
+    /// stored value (inputs, materialized buffers) is rounded to its
+    /// node's storage format, and a reduction's running state is rounded
+    /// to its accum format after every combine step (round to nearest
+    /// even, subnormals, overflow to ∞). Body arithmetic stays f64, so
+    /// this predicts what a schedule costs in accuracy without a GPU.
+    pub fn eval_emulated(&self, inputs: &[Vec<f64>], outputs: &[TensorId]) -> Vec<Vec<f64>> {
+        self.eval_with(inputs, outputs, true)
+    }
+
+    fn eval_with(&self, inputs: &[Vec<f64>], outputs: &[TensorId], emulate: bool) -> Vec<Vec<f64>> {
         let live = self.live(outputs);
         let mut ev = Evaluator {
             g: self,
+            emulate,
             inputs,
             bufs: vec![Vec::new(); self.nodes.len()],
             compiled: self
@@ -1993,6 +2033,10 @@ impl TensorGraph {
                 let mut buf = vec![0.0; numel(c.points()) * w];
                 for (p, idx) in indices(&fixed(c.points())).enumerate() {
                     ev.point(i, &idx, &mut buf[p * w..(p + 1) * w]);
+                }
+                if emulate {
+                    let f = self.nodes[i].precision.storage;
+                    buf.iter_mut().for_each(|v| *v = f.round(*v));
                 }
                 ev.bufs[i] = buf;
             }
@@ -2022,6 +2066,8 @@ struct Compiled {
 
 struct Evaluator<'a> {
     g: &'a TensorGraph,
+    /// Round stored values and accumulators per the precision schedule.
+    emulate: bool,
     inputs: &'a [Vec<f64>],
     bufs: Vec<Vec<f64>>,
     compiled: Vec<Option<Compiled>>,
@@ -2032,7 +2078,14 @@ impl Evaluator<'_> {
     fn read(&self, t: TensorId, idx: &[usize]) -> f64 {
         let node = &self.g.nodes[t.n()];
         match &node.op {
-            Op::Input(k) => self.inputs[*k][flat_index(&fixed(&node.shape), idx)],
+            Op::Input(k) => {
+                let v = self.inputs[*k][flat_index(&fixed(&node.shape), idx)];
+                if self.emulate {
+                    node.precision.storage.round(v)
+                } else {
+                    v
+                }
+            }
             Op::Iota(d) => idx[*d] as f64,
             Op::Reshape(src) => {
                 let flat = flat_index(&fixed(&node.shape), idx);
@@ -2091,6 +2144,10 @@ impl Evaluator<'_> {
             pair[..w].copy_from_slice(vals);
             pair[w..].copy_from_slice(&elem);
             combine(&pair, vals);
+            if self.emulate {
+                let f = self.g.nodes[i].precision.accum;
+                vals.iter_mut().for_each(|v| *v = f.round(*v));
+            }
         }
     }
 }
