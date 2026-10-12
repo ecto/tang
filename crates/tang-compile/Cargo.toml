@@ -12,4 +12,5 @@ categories = ["compilers", "mathematics"]
 include = ["src/**/*", "README.md"]
 
 [dependencies]
+tang      = { workspace = true }
 tang-expr = { workspace = true }

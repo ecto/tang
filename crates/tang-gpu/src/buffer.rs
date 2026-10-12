@@ -84,7 +84,7 @@ impl GpuBuffer {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).ok();
         });
-        device.device.poll(wgpu::Maintain::Wait);
+        device.device.poll(wgpu::PollType::Wait).expect("poll");
         rx.recv().unwrap().unwrap();
 
         let data = slice.get_mapped_range();
@@ -116,6 +116,27 @@ impl GpuBuffer {
 
     /// Clone this buffer entirely on the GPU (no CPU readback).
     /// Submits immediately — prefer `clone_gpu_batched` when batching commands.
+    /// Upload `data` (same length) into this buffer.
+    pub fn write(&self, device: &GpuDevice, data: &[f32]) {
+        assert_eq!(self.len, data.len(), "write: length mismatch");
+        device
+            .queue
+            .write_buffer(&self.buffer, 0, bytemuck::cast_slice(data));
+    }
+
+    /// Overwrite this buffer with `src`'s contents (same length), GPU-side,
+    /// queued through `cache` so it orders with pending kernels.
+    pub fn copy_from(&self, device: &GpuDevice, cache: &mut crate::KernelCache, src: &GpuBuffer) {
+        assert_eq!(self.len, src.len, "copy_from: length mismatch");
+        let mut encoder = device
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("tang-gpu copy_from"),
+            });
+        encoder.copy_buffer_to_buffer(&src.buffer, 0, &self.buffer, 0, self.byte_size());
+        cache.submit_or_enqueue(device, encoder.finish());
+    }
+
     pub fn clone_gpu(&self, device: &GpuDevice) -> GpuBuffer {
         let dst = Self::uninit(device, self.len);
         let mut encoder = device

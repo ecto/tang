@@ -37,6 +37,13 @@ impl KernelCache {
         self.batching = true;
     }
 
+    /// Submit what is pending and go back to submitting every dispatch
+    /// as it is issued.
+    pub fn end_batch(&mut self, device: &GpuDevice) {
+        self.flush(device);
+        self.batching = false;
+    }
+
     /// Submit all pending command buffers to the GPU queue.
     /// Must be called before any buffer readback (to_vec_sync).
     pub fn flush(&mut self, device: &GpuDevice) {
@@ -824,6 +831,77 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         self.submit_or_enqueue(device, encoder.finish());
     }
 
+    /// Dispatch a kernel over arbitrary storage buffers.
+    ///
+    /// Binding `i` is `buffers[i]` (read-only unless listed in `writable`);
+    /// the last binding is a uniform of `params`. Launches
+    /// `count.div_ceil(workgroup_size)` workgroups along x.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_buffers(
+        &mut self,
+        device: &GpuDevice,
+        wgsl: &str,
+        buffers: &[&GpuBuffer],
+        writable: &[usize],
+        params: &[u32; 4],
+        count: u32,
+        workgroup_size: u32,
+    ) {
+        let mut bindings: Vec<BindingSpec> = (0..buffers.len())
+            .map(|i| BindingSpec::Storage {
+                read_only: !writable.contains(&i),
+            })
+            .collect();
+        bindings.push(BindingSpec::Uniform);
+        let hash = Self::hash_wgsl(wgsl);
+        let cached = self.get_or_compile_dynamic_wg(device, wgsl, hash, &bindings, workgroup_size);
+
+        use wgpu::util::DeviceExt;
+        let params_buf = device
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("tang-gpu params"),
+                contents: bytemuck::cast_slice(params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let mut entries: Vec<wgpu::BindGroupEntry> = buffers
+            .iter()
+            .enumerate()
+            .map(|(i, b)| wgpu::BindGroupEntry {
+                binding: i as u32,
+                resource: b.buffer.as_entire_binding(),
+            })
+            .collect();
+        entries.push(wgpu::BindGroupEntry {
+            binding: buffers.len() as u32,
+            resource: params_buf.as_entire_binding(),
+        });
+        let bind_group = device.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tang-gpu bind group"),
+            layout: &cached.bind_group_layout,
+            entries: &entries,
+        });
+
+        let mut encoder = device
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("tang-gpu dispatch"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("tang-gpu compute"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&cached.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            // Grids wider than 65535 workgroups wrap into y; kernels
+            // linearize with `x + y * 65535`.
+            let groups = count.div_ceil(workgroup_size);
+            pass.dispatch_workgroups(groups.min(65535), groups.div_ceil(65535), 1);
+        }
+        self.submit_or_enqueue(device, encoder.finish());
+    }
+
     /// Get or compile a pipeline with an arbitrary binding layout.
     ///
     /// Each `BindingSpec` describes one binding: its type and read-only flag.
@@ -835,18 +913,56 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         hash: u64,
         bindings: &[BindingSpec],
     ) -> &CachedPipeline {
-        self.pipelines
-            .entry(hash)
-            .or_insert_with(|| Self::compile_dynamic(device, wgsl, bindings))
+        // WGSL carries its own workgroup size; the value only matters
+        // for native MSL, which goes through `dispatch_buffers`
+        self.get_or_compile_dynamic_wg(device, wgsl, hash, bindings, 1)
     }
 
-    fn compile_dynamic(device: &GpuDevice, wgsl: &str, bindings: &[BindingSpec]) -> CachedPipeline {
-        let module = device
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("tang-gpu kernel dynamic"),
-                source: wgpu::ShaderSource::Wgsl(wgsl.into()),
-            });
+    /// `get_or_compile_dynamic` with the threadgroup size a native
+    /// (MSL) kernel is dispatched with.
+    pub(crate) fn get_or_compile_dynamic_wg(
+        &mut self,
+        device: &GpuDevice,
+        wgsl: &str,
+        hash: u64,
+        bindings: &[BindingSpec],
+        workgroup_size: u32,
+    ) -> &CachedPipeline {
+        self.pipelines
+            .entry(hash)
+            .or_insert_with(|| Self::compile_dynamic(device, wgsl, bindings, workgroup_size))
+    }
+
+    fn compile_dynamic(
+        device: &GpuDevice,
+        wgsl: &str,
+        bindings: &[BindingSpec],
+        workgroup_size: u32,
+    ) -> CachedPipeline {
+        // Native MSL (from tang-compile's simdgroup-matrix lowering)
+        // goes straight to the Metal compiler; bindings map to buffer
+        // indices in order, which is how the kernel declares them.
+        let module = if wgsl.starts_with("#include") {
+            unsafe {
+                device.device.create_shader_module_passthrough(
+                    wgpu::ShaderModuleDescriptorPassthrough::Msl(wgpu::ShaderModuleDescriptorMsl {
+                        label: Some("tang-gpu kernel msl"),
+                        source: wgsl.into(),
+                        entry_point: "main0".into(),
+                        // the threadgroup size (wgpu-hal passes it to
+                        // Metal as threads-per-threadgroup)
+                        num_workgroups: (workgroup_size, 1, 1),
+                    }),
+                )
+            }
+        } else {
+            device
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("tang-gpu kernel dynamic"),
+                    source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+                })
+        };
 
         let entries: Vec<wgpu::BindGroupLayoutEntry> = bindings
             .iter()
@@ -895,7 +1011,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 label: Some("tang-gpu pipeline dynamic"),
                 layout: Some(&pipeline_layout),
                 module: &module,
-                entry_point: Some("main"),
+                entry_point: Some(if wgsl.starts_with("#include") {
+                    "main0"
+                } else {
+                    "main"
+                }),
                 compilation_options: Default::default(),
                 cache: None,
             });

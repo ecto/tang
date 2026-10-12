@@ -10,3 +10,6 @@
 
 # editor/tool backups
 *.bak
+
+# per-device autotune cache written by tang-bench
+/crates/tang-bench/target

@@ -1617,7 +1617,7 @@ fn main(
     let out_base = query_pos * params.n_heads * params.head_dim + head * params.head_dim;
     for (var d = tid; d < params.head_dim; d = d + WG) {{
         var acc: f32 = 0.0;
-        for (var kp: u32 = 0u; kp <= max_attend; kp = kp + 1u) {{
+        for (var kp: u32 = 0u; kp <= max_attend && kp < params.kv_len; kp = kp + 1u) {{
             let v_base = kp * kv_stride + kv_head * params.head_dim;
             let k_base = kp * kv_stride + kv_head * params.head_dim;
             var dot: f32 = 0.0;

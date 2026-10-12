@@ -40,8 +40,15 @@ harness = false
 name = "gpu_inference"
 harness = false
 
+[[bench]]
+name = "kernels_vs_ir"
+harness = false
+
 [features]
 default = []
+# CUDA runtime for `TensorGraph::to_cuda` programs (cudarc, dynamic
+# loading of libcuda/libnvrtc at run time; needs CUDA 12.x on the host).
+cuda = ["dep:cudarc"]
 # Reassociable float ops in hot reductions. Requires Rust 1.98+.
 threads = ["tang-la/threads", "tang-tensor/threads", "tang-train/threads", "tang-infer/threads"]
 algebraic = [
@@ -60,9 +67,11 @@ tang        = { workspace = true, features = ["std"] }
 tang-la     = { workspace = true, features = ["std"] }
 tang-ad     = { workspace = true }
 tang-expr   = { workspace = true }
+tang-compile = { workspace = true }
 tang-gpu    = { workspace = true }
 tang-train  = { workspace = true }
 tang-tensor = { workspace = true }
+cudarc      = { version = "0.16", features = ["cuda-12080"], optional = true }
 tang-infer  = { workspace = true }
 
 [dev-dependencies]

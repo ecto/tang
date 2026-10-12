@@ -279,3 +279,577 @@ Based on single-layer GPU benchmarks extrapolated to 30 layers:
 
 Decode is memory-bandwidth-bound: attention scales linearly with KV cache length.
 LM head matmul (576x49152) adds ~1.3 ms per decode step.
+
+## Kernels vs tensor IR (`kernels_vs_ir`)
+
+**Date:** 2026-10-11. Same hardware. See `crates/tang-compile/src/tensor.rs`
+for the IR (views + comprehensions + monoids) and `tensor_wgsl.rs` /
+`tensor_tile.rs` for the schedules.
+
+### CPU: hand kernels vs the *scalar* `tang-expr` IR (f64)
+
+The scalar IR interprets a closure per element and cannot express a tensor
+op as one node, so it loses everywhere and the gap grows with size. This is
+the motivation for the tensor-level IR, not a result about it.
+
+| block | size | hand | ir | ir_opt | trace+compile |
+|---|---|---|---|---|---|
+| swiglu act | 1M | 2.6 ms | 42.8 ms | 42.4 ms | – |
+| rmsnorm | 16×576 | 15 µs | 90 µs | 78 µs | 77 ms |
+| rmsnorm | 16×2048 | 52 µs | 330 µs | 281 µs | 1.06 s |
+| matvec | 255 | 14 µs | 414 µs | 534 µs | 92 ms |
+
+### GPU: hand-written causal attention vs attention *derived* from tensor IR
+
+Single head, d = 64, f32. `hand` is `kv_attention_fused`. The `ir_*`
+columns are the same naive `softmax(q·kᵀ/√d + mask)·v` graph under
+different compiler schedules: `naive` materializes the n×n scores;
+`flash` is after `substitute_maps` + `stabilize_softmax` (one
+online-softmax reduction over `[rows, value-columns]` points with q·k
+recomputed inside, nothing n×n in memory); `split` adds a 256-thread tree
+reduction per point; `tiled` is `schedule_tile_2d` with 64 value-column
+lanes × 4 rows per workgroup, the k/v tiles *and the q·k scores* staged
+cooperatively in workgroup memory per 32-key chunk. Times include ~1.3 ms
+of submit + readback; `autotune`'s kernel-only timing of `tiled` at
+n = 1024 is ~0.5 ms.
+
+| n | hand | ir_naive | ir_flash | ir_flash_split | ir_flash_tiled |
+|---|---|---|---|---|---|
+| 128 | 1.33 ms | 1.68 ms | 1.33 ms | 3.6 ms | 1.40 ms |
+| 512 | 4.26 ms | 2.30 ms | 4.15 ms | 5.1 ms | **2.99 ms** |
+| 1024 | 10.3 ms | 3.9 ms | 7.7 ms | 16.5 ms | **1.35 ms** |
+
+Takeaways:
+
+- Every derived schedule matches the hand kernel's output (checked at
+  n = 100, 512, 1024); none contains attention-specific code.
+- The tiled schedule is flash attention's real structure — rows × lanes,
+  cooperative score tiles, online softmax — and it came out of three
+  general rules: substitution, the online-softmax monoid rewrite, and
+  "stage anything the lane axis does not depend on". At n = 1024 it is
+  7.6× faster than the hand kernel and ~3× faster than the naive graph.
+- The lane layout is only good *with* tiling: `split` recomputes the
+  scores per lane and regresses. Schedules are not independent of the
+  algebra, which is why `schedule_auto` looks for a lane axis first.
+
+### GPU: hand-written matmul vs matmul derived from tensor IR
+
+`hand` is `tang_gpu::matmul::matmul`. The IR version is one comprehension,
+`Σ_k a[i,k]·b[k,j]`, under the same three schedules; `tiled` is a 16×16
+point tile per workgroup with the `a` and `b` tiles staged in workgroup
+memory (`schedule_tile_2d`), the classic shared-memory matmul, derived.
+
+| n | hand | ir_naive | ir_split | ir_tiled |
+|---|---|---|---|---|
+| 256 | 1.50 ms | 1.47 ms | 2.38 ms | 1.45 ms |
+| 1024 | 4.14 ms | 4.2–5.6 ms | 12.3 ms | 5.73 ms |
+
+The derived matmul is at parity with the hand kernel. Shared-memory
+staging does not pay on this chip either: the operands already live in
+cache, so the extra barriers cost more than the global reads they save.
+
+### GPU: rmsnorm and swiglu, hand vs derived
+
+`hand` is `GpuRMSNorm::forward` (one workgroup per row, shared-memory
+reduction) and `swiglu_fused_pub`. The IR rmsnorm is `x · rsqrt(mean(x²)+ε)`
+after `substitute_maps`: one Sum reduction and one map.
+
+| rmsnorm | hand | ir_naive | ir_split | ir_tiled |
+|---|---|---|---|---|
+| 128×576 | 1.46 ms | 1.49 ms | 1.48 ms | 1.50 ms |
+| 2048×2048 | 2.16 ms | 3.90 ms | **2.31 ms** | 6.32 ms |
+
+| swiglu | hand | ir |
+|---|---|---|
+| 65 536 | 1.57 ms | 1.55 ms |
+| 4 194 304 | 2.09 ms | 2.25 ms |
+
+| adam step | hand (`dispatch_adam`, 1 in-place kernel) | ir (3 maps) |
+|---|---|---|
+| 65 536 | 1.59 ms | 1.63 ms |
+| 4 194 304 | 2.34 ms | 2.38 ms |
+
+Note the winner flips: attention wanted the naive schedule, rmsnorm wants
+the split one (its reduce axis is 2048 wide and there are only 2048 rows,
+so one thread per row starves the GPU). Same compiler, same cost of
+being wrong, different answer per op — which is the case for autotuning
+rather than a fixed heuristic.
+
+### `schedule_auto`
+
+A fixed rule distilled from the tables above: a materialized reduction
+whose points end in a lane axis (16–128 wide, with rows above it) *and*
+that has a lane-invariant single-use producer to share is tiled rows ×
+lanes with that producer inlined and staged cooperatively; otherwise one
+with fewer than 2¹⁴ points and a reduce axis ≥ 64 is split across a
+256-thread workgroup; everything else stays one thread per point. It lands within noise of the
+best hand-picked schedule for attention (tiled), rmsnorm (split) and
+matmul (naive-ish; the tile does not pay here). It does not choose between
+algebras — materialized scores vs online softmax — which is `autotune`'s
+job.
+
+### GPU: a whole transformer block, hand-written vs derived
+
+The `gpu_transformer_layer` prefill path (rmsnorm → q/k/v → interleaved
+RoPE → GQA causal attention (9 heads, 3 kv heads, d=64) → wo → residual →
+rmsnorm → SwiGLU → residual, d_model 576, ff 1536) rebuilt as one tensor
+IR graph (`tang_bench::ir_block`) and run under `substitute_maps` +
+`stabilize_softmax` + `schedule_auto`. Identical weights; outputs agree
+with the hand path and with the f64 interpreter to 5e-7.
+
+| seq | hand | ir_auto | ir_tuned |
+|---|---|---|---|
+| 128 | 5.07 ms | 4.63 ms | **4.45 ms** |
+| 512 | 24.1 ms | 14.3 ms | **13.9 ms** |
+
+`ir_tuned` is the per-kernel autotuner's schedule, measured once per
+(program, device) and kept in a `TuningCache` file (`crates/tang-bench/
+target/tang-tuning-block-<seq>-<kv>.txt`); later runs load it.
+
+Decode (one query token against a rotated k/v cache, the launch-bound
+regime where hand kernels were expected to look best):
+
+| q / kv | hand | ir_auto | ir_tuned |
+|---|---|---|---|
+| 1 / 256 | 4.75 ms | **2.96 ms** | 2.98 ms |
+| 1 / 1024 | 7.78 ms | 2.79 ms | **2.73 ms** |
+
+The derived block issues 10 kernels to the hand path's ~16 and its
+attention kernel reads the cache once; both matter when every dispatch
+costs more than the math.
+
+(10 kernels; `examples/block_kernels.rs` times each one. An earlier
+version of `schedule_auto` lane-tiled the plain k/v projections and lost
+1.5 ms to it — the tile only pays when there is a lane-invariant
+sub-computation to share, which is now the rule.)
+
+GQA's `head / heads_per_group` is not affine, so heads are expressed as
+`[groups, per_group]` dims and the views do the rest; the causal mask is an
+input. Nothing in the compiler knows what a transformer is.
+
+### Per-kernel autotuning
+
+`ir_gpu::autotune_kernels` times every thread mapping in
+`schedule_candidates` for each materialized comp on the device, with the
+graph's real inputs in place, and keeps the fastest
+(`examples/block_autotune.rs`). Candidates: one thread per point, a
+256-thread split, rows × lanes, and the classic 16×16 shared-memory tile.
+
+| seq | hand | `schedule_auto` | autotuned |
+|---|---|---|---|
+| 128 | 4.93 ms | 4.07 ms | 4.03 ms |
+| 512 | 24.3 ms | 15.3 ms | **13.5 ms** |
+
+The tuner agrees with `schedule_auto` on every reduction and attention
+kernel and overrides it on three projection matmuls, where the 16×16 tile
+wins at these shapes (128×576×1536: tiled 1.39 ms vs one-thread-per-point
+2.66 ms vs hand 2.97 ms) although it lost at 1024². That is the whole
+argument in one table: the right schedule depends on the shape and the
+chip, and measuring beats remembering.
+
+### Derived backward pass
+
+`ir_block_gpu::tests::derived_block_backward_on_gpu` differentiates the
+whole block (`backward` on the algorithm graph), runs the gradient graph
+through `substitute_maps` + `schedule_auto` + `to_wgsl`, and compares the
+GPU gradients w.r.t. the input and `wq` against the f64 interpreter:
+max error 5e-7, 42 kernels. There is no hand-written backward kernel for
+any of it; rope and GQA gradients come out of the `iota`-gated scatter.
+
+### GPU: a training step, hand-written vs derived
+
+`GpuTrainTransformerBlock` is tang-gpu's hand-written trainable block (no
+rope, no biases; its attention backward runs on the CPU over copied
+activations — nobody wrote the GPU version). The derived step is the same
+block built in IR with `rope: false, bias: false`, `backward` for the
+input and all seven weights, then `substitute_maps` + `schedule_auto` +
+`to_wgsl`, one program. All nine outputs match to ~1e-6.
+
+| seq | hand fwd+bwd | derived fwd+bwd |
+|---|---|---|
+| 32 | 60.9 ms | **4.87 ms** |
+| 128 | 174 ms | **10.1 ms** |
+
+The asymmetry is the point: the hand path has a fast forward and a slow
+backward because a GPU backward for attention was never written. The
+derived path has neither problem, because nothing about it was written.
+
+### A derived training loop
+
+`examples/train_loop.rs`: block forward + MSE loss + backward for every
+weight as one 47-kernel program, Adam as one program per weight (bias
+corrections are a 2-element input, updated each step), new weights and
+moments fed back GPU-side with `GpuBuffer::copy_from`. Loss on a fixed
+target: 0.606 → 0.038 in 30 steps. Nothing in the loop is hand-written.
+
+## M4 Max, one consistent run (2026-10-12, final branch state)
+
+The sections above were measured on different days as the branch grew
+and the machine's power state wandered. This table is one run of
+`cargo bench -p tang-bench --bench kernels_vs_ir -- kvi_gpu` on the final
+code; the readback floor during this run was ~1.8 ms (the machine was in
+its slow state, so absolute times are ~1.5× the earlier sections).
+
+| op | hand | best derived | schedule |
+|---|---|---|---|
+| causal attention 128 | 3.70 ms | **1.82 ms** | tiled |
+| causal attention 512 | 4.91 ms | **2.02 ms** | auto (tiled) |
+| causal attention 1024 | 10.9 ms | **3.31 ms** | naive (n² threads) |
+| matmul 1024² | 6.68 ms | 5.49 ms | auto |
+| rmsnorm 2048×2048 | 2.52 ms | 2.70 ms | auto (split) |
+| swiglu 4M | 2.50 ms | 2.71 ms | map |
+| adam step 4M | 2.67 ms | 2.71 ms | map |
+| transformer block seq 128 | 5.02 ms | **3.74 ms** | auto |
+| transformer block seq 512 | 23.9 ms | **10.1 ms** | per-kernel autotune |
+| decode block q1 / kv 256 | 5.29 ms | **2.13 ms** | auto |
+| decode block q1 / kv 1024 | 8.80 ms | **3.28 ms** | per-kernel autotune |
+| training step seq 32 | 65.8 ms | **4.73 ms** | auto |
+| training step seq 128 | 179 ms | **7.96 ms** | auto |
+
+## Kernels vs tensor IR on an RTX 3090 (Vulkan)
+
+**Date:** 2026-10-12. Ubuntu 24.04, driver 580, wgpu Vulkan backend. Same
+branch, same code, no per-chip knowledge anywhere in the compiler; the
+tuning cache is keyed by device name. Readback floor is ~1.25 ms here.
+
+All 11 GPU tests pass with the same ~1e-6 errors as on the M4.
+
+| op | hand | best derived | schedule |
+|---|---|---|---|
+| causal attention 1024, d=64 | 3.85 ms | **1.40 ms** | tiled rows×lanes |
+| causal attention 512 | 1.88 ms | 1.42 ms | tiled |
+| matmul 1024² | 2.31 ms | 2.35 ms | 16×16 tile |
+| rmsnorm 2048×2048 | 5.96 ms | 6.05 ms | naive (16 MB readback) |
+| swiglu 4M | 6.62 ms | 6.22 ms | map |
+| adam step 4M | 5.88 ms | 5.97 ms | map |
+| transformer block seq 128 | 3.13 ms | **2.50 ms** | per-kernel autotune |
+| transformer block seq 512 | 10.4 ms | **6.20 ms** | per-kernel autotune |
+| decode block q1 / kv 256 | 2.49 ms | 1.71 ms | per-kernel autotune |
+| decode block q1 / kv 1024 | 3.85 ms | 1.68 ms | auto |
+| training step seq 32 | 53.6 ms | **3.71 ms** | auto |
+| training step seq 128 | 175 ms | **9.64 ms** | auto |
+
+What the second chip taught the compiler (all of it landed in this
+branch):
+
+- The block initially *lost* here (5.5 ms vs 3.0) while winning on the
+  M4. Per-kernel profiling showed `substitute_maps` folding the
+  normalization, residual add and SwiGLU activation (with its `exp`) into
+  the projection matmuls' bodies — recomputed once per output column.
+  The M4 shrugged; the 3090 did not. Substitution is now cost-aware.
+- Folding a matmul into its bias-add map (one thread per point) hid the
+  reduction from every tiled schedule. Reductions now stay materialized
+  under maps; that is what let the autotuner pick the 16×16 tile for the
+  projections and take the block from 5.1 ms to 2.5 ms.
+- The staged tiles were laid out point-major, so consecutive lanes read
+  words 32 apart: 32-way bank conflicts. Point-minor layout took the
+  16×16 matmul tile from 6.25 ms to 2.35 ms (hand parity) on the 3090
+  and changed nothing on the M4.
+- `schedule_auto`'s rules of thumb were distilled on the M4 and are
+  wrong for matmul here (naive 2.77 vs tiled 2.35); `split` on a 66-wide
+  tuple is catastrophic on NVIDIA (59 ms). The per-kernel autotuner is
+  the answer on both chips, with the rules as its starting point.
+
+M4 figures earlier in this file were measured on a different day;
+absolute times on that machine drift by ±2× with its power state (the
+same commit measured 1.35 ms and 3.8 ms for tiled attention an hour
+apart). Compare columns within one table, not across days.
+
+## Register tiles (both chips)
+
+`TNode.reg = (rx, ry)`: each thread owns an rx×ry block of points of a
+16×16-thread tile, with its own accumulators and hoisted reads; the
+staged tiles grow to 64×64 points. Same emitter, same staging rules —
+the only new idea is "more than one point per thread". Matmul 1024²,
+`cargo bench ... kvi_gpu_matmul`:
+
+| | hand | one point/thread tile | 2×2 | 4×4 |
+|---|---|---|---|---|
+| M4 Max (floor ~1.8 ms) | 6.82 ms | 5.74 ms | 5.51 ms | **5.23 ms** |
+| RTX 3090 (floor ~1.25 ms) | 2.27 ms | 2.41 ms | 1.98 ms | **1.92 ms** |
+
+Kernel-only that is roughly 1.5× the hand matmul on both chips. With the
+register tiles in the autotuner's candidate list the transformer block
+moves again (per-kernel autotune, fresh cache):
+
+| block | hand | derived, autotuned |
+|---|---|---|
+| M4 seq 128 | 5.02 ms | **3.65 ms** |
+| M4 seq 512 | 23.9 ms | **5.61 ms** |
+| 3090 seq 128 | 4.94 ms | **3.89 ms** |
+| 3090 seq 512 | 13.1 ms | **6.71 ms** |
+
+(3090 hand numbers in this run are ~50% above the earlier run on the same
+code; that box was not idle. The derived column moved by the same factor.)
+
+### `schedule_auto` after the second chip
+
+With the register-tiled matmul in its rules, `schedule_auto` alone — no
+measurement — now beats the hand path on both chips:
+
+| block, rules only | hand | derived (`schedule_auto`) |
+|---|---|---|
+| M4 seq 128 | 5.87 ms | **3.44 ms** |
+| M4 seq 512 | 23.9 ms | **5.55 ms** |
+| 3090 seq 128 | 3.05 ms | **2.61 ms** |
+| 3090 seq 512 | 10.8 ms | **5.58 ms** |
+| matmul 1024², M4 | 6.81 ms | **4.61 ms** |
+| matmul 1024², 3090 | 2.27 ms | **1.90 ms** |
+
+The tuner still exists for the next chip; the rules are what it found.
+
+### Training step at seq 512
+
+| | hand fwd+bwd | derived fwd+bwd |
+|---|---|---|
+| M4 Max | 1.01 s | **17.5 ms** |
+| RTX 3090 | 1.15 s | **11.3 ms** |
+
+The hand path's CPU-side attention backward is quadratic in sequence
+length; the derived one is a graph like any other.
+
+### Placement
+
+`shard_reduction` splits a reduce axis into partial reductions (one per
+device) and `fold_partials` writes the all-reduce as a comprehension over
+the monoid's combine. `examples/shard_attention.rs` runs the flash-fused
+attention's 256 keys as two partial (m, l, acc) states on two wgpu
+devices and merges them with the online-softmax combine: max error
+1.7e-6 (M4) / 1.4e-6 (3090) against the single-device result. Transport
+is host-mediated; the IR side of sequence parallelism is done.
+
+## Against PyTorch (RTX 3090, kernel-only)
+
+Everything above compares derived kernels with tang's own hand-written
+ones, and every criterion number includes ~1.3 ms of submit + readback.
+This section is the comparison that matters: `scripts/torch_bench.py`
+(PyTorch 2.10 + cu128, CUDA events, fp32 with TF32 off) against
+`examples/kernel_only.rs` (50 launches, one sync, divide) on the same
+3090, same shapes.
+
+| op | tang hand | tang derived (best) | PyTorch fp32 | derived ÷ torch |
+|---|---|---|---|---|
+| matmul 1024² | 1.38 ms | 0.54 ms (4×4 register tile) | **0.112 ms** (TF32: 0.079) | 4.8× |
+| matmul 128×576×1536 | 0.38 | 0.20 | **0.030** | 7× |
+| matmul 512×576×1536 | 0.65 | 0.28 | **0.053** | 5× |
+| causal attention n=512, d=64 | 1.31 | 0.27 | **0.090** (sdpa) / 0.040 (naive) | 3–7× |
+| causal attention n=1024 | 3.55 | 0.77 | **0.180** / 0.078 | 4–10× |
+| transformer block fwd, seq 128 | 2.25 | 1.97 | **0.295** | 6.7× |
+| transformer block fwd, seq 512 | 10.1 | 4.41 | **0.610** | 7× |
+| block fwd+bwd, seq 128 | (CPU bwd) | 5.0 | **1.32** | 3.8× |
+| block fwd+bwd, seq 512 | (CPU bwd) | 10.1 | **1.73** | 5.9× |
+| adam step 4M | 0.85 | 0.54 | **0.395** | 1.4× |
+
+So the derived kernels are 2–4× faster than tang's hand-written ones and
+4–7× slower than PyTorch. Both statements are true; only the second one
+says how fast this is.
+
+Where the gap is, and how much of it this path can close:
+
+- **Matmul instruction quality.** 0.54 ms at 1024² is ~4 TFLOPS; cuBLAS
+  fp32 reaches ~19 TFLOPS on this part. The derived tile uses scalar
+  loads, a 4×4 register tile, 32-wide chunks with a barrier each, and no
+  double buffering. An 8×8 register tile with `vec4` loads and a 128×128
+  block is the known recipe for ~10–15 TFLOPS in a portable shader —
+  roughly 3× from here, within ~2× of cuBLAS. That is the ceiling for
+  fp32 through WGSL.
+- **Tensor cores are off the table.** TF32/FP16 MMA is not reachable from
+  WGSL/wgpu today (no cooperative-matrix extension). That is the other
+  2–4× PyTorch has, and it is a backend question (MSL simdgroup matrices,
+  CUDA via `tang-expr`'s CUDA dialect), not a schedule question.
+- **Launch overhead.** The block issued 20 kernels (72 with backward)
+  when this table was taken, each as its own command buffer through
+  wgpu; seq 128 forward was 1.97 ms for ~0.6 ms of math. Since then:
+  one submission per program, and three fusion passes — epilogue
+  fusion (bias, activation and the softmax normalizer run on the thread
+  holding the final accumulator), views through affine reshapes, and
+  sibling-reduction merging (gate and up projections as one
+  tuple-valued matmul) — bring the forward block to 16 kernels (62
+  with backward). PyTorch's 0.295 ms is ~10 cuBLAS/flash launches.
+- **Attention.** Flash-attention proper keeps the (m, l, acc) state in
+  registers across a 64-key tile computed as two small tensor-core
+  matmuls; ours recomputes q·k cooperatively into shared memory with
+  scalar FMAs. Same structure, 4–10× slower execution, for the two
+  reasons above.
+
+### After the fusion passes and vec4 stage reads
+
+Same script, both chips, one run each. The 3090 run had the GPU to
+itself (1% util); its CPU was loaded (load avg 26), which is why the
+PyTorch block numbers — launch-bound on the CPU side — came out higher
+than the first table's. Both PyTorch columns are shown.
+
+| op | 3090 before | 3090 after | PyTorch (1st / this run) | M4 after |
+|---|---|---|---|---|
+| matmul 1024² | 0.54 ms | **0.28** (7.6 TFLOPS) | 0.112 / 0.114 | 0.52 |
+| matmul 128×576×1536 | 0.20 | **0.10** | 0.030 / 0.035 | 0.13 |
+| matmul 512×576×1536 | 0.28 | **0.16** | 0.053 / 0.054 | 0.23 |
+| attention n=512 | 0.27 | 0.25 | 0.090 | 0.26 |
+| attention n=1024 | 0.77 | 0.74 | 0.180 | 0.76 |
+| block fwd, seq 128 | 1.97 | **1.06** (16 kernels) | 0.295 / 0.566 | 1.14 |
+| block fwd, seq 512 | 4.41 | **3.34** | 0.610 / 1.208 | 3.37 |
+| block fwd+bwd, seq 128 | 5.0 | **3.15** (62 kernels) | 1.32 / 2.11 | 3.53 |
+| block fwd+bwd, seq 512 | 10.1 | **8.19** | 1.73 / 1.99 | 13.2 |
+| adam 4M | 0.54 | 0.47 | 0.395 / 0.451 | — |
+
+What moved it:
+
+- **Fusion** (epilogues for tuple-state reductions, views through
+  affine reshapes, sibling merging) plus one submission per program:
+  the launch-bound seq-128 block, −46% forward, −37% training step.
+- **`vec4` reads of the point-minor stage.** A thread's register-tile
+  points are contiguous there, so a 4-wide tile reads each operand as
+  one vector per r0 instead of four scalars: matmul 1024² 0.54 → 0.28 ms
+  on the 3090 and 0.78 → 0.52 on the M4. This is the shared-memory
+  load-issue bound the previous section predicted; the next rungs on the
+  same ladder are 8×8 tiles with vec4 (now that loads are cheap enough
+  to feed them), `vec4` global loads into the stage, and double
+  buffering.
+- Coalesced staging loads alone changed nothing measurable; the tile
+  was never global-load bound at these sizes.
+- With vec4 reads in place, a sweep of 8×8 register tiles (chunk 8, 16,
+  32), an 8×8-thread block and a 32×8 block at 1024² still lands on
+  16×16 threads × 4×4 × chunk 32 on both chips (3090: 0.29 ms vs 0.35
+  for 8×8; M4: 0.53 vs 0.50 for 8×8 chunk 16 — within noise), so
+  `schedule_auto`'s rule stands. 8×8 is register-pressure bound: more
+  FMAs per load but fewer workgroups in flight.
+- Double-buffered staging (two stage sets, next chunk prefetched into
+  registers during the reduce loop, one barrier per chunk) was tried and
+  reverted: on the M4 the dynamically indexed prefetch arrays spill and
+  the 4×4 chunk-32 tile went from 0.53 to 3.2 ms; on the 3090 it was
+  neutral (0.28–0.33). Without async copies, the extra registers cost
+  more than the hidden latency is worth on either chip.
+
+The gap to PyTorch is now 2.5× on matmul, 3–4× on attention and the
+block forward, 4× on the training step (against its quieter numbers).
+What remains is tensor cores (unreachable from WGSL; a backend
+question) and the rest of the instruction-quality ladder above.
+
+### A native dialect: Metal simdgroup matrices (first cut)
+
+`tensor_msl.rs` lowers a matmul-shaped tile — one reduce axis, body
+`a·b`, each operand read along one tile axis and the reduce axis, any
+affine layout — to MSL with `simdgroup_float8x8` fragments, through
+wgpu 25's MSL passthrough. The comp's epilogue (bias, activation) runs
+on the stored block. Kernels that don't fit stay WGSL, so a program is a
+mix. Correct on ragged shapes (staged tiles) and full tiles (fragments
+loaded straight from device memory); 12/12 GPU tests.
+
+M4 Max, kernel-only (`mma` column of `kernel_only`):
+
+| shape | WGSL 4×4 register tile | simdgroup matrices |
+|---|---|---|
+| 1024² | 0.56 ms | 0.93 |
+| 128×576×1536 | 0.13 | 0.27 |
+| 512×576×1536 | 0.25 | 0.48 |
+
+So on this chip the first-cut fp32 simdgroup kernel is 1.7–2× *slower*
+than the FMA tile. Ablations: the staged version spent two thirds of
+its time in scalar staging; fragments straight from memory halved
+that but the MMA loop itself runs at ~2.3 TFLOPS, where the FMA tile
+runs at 3.7. MLX's fp32 GEMM on the same hardware shows what the
+instruction is worth with vectorized staging, swizzled tiles and
+deeper software pipelining; that is engineering on top of a lowering
+that now exists, and `program_for` keeps WGSL the default until it
+wins. The structural claim stands: the same comprehension lowered to a
+second dialect with no op-specific code, epilogue included. The CUDA
+dialect (tensor cores proper, where the gap to PyTorch lives) is the
+same shape of work with nvcc in the loop.
+
+### Tensor cores: the CUDA dialect (RTX 3090, nvcc harness)
+
+The same bilinear tile lowered to CUDA C++ with `wmma` 16×16×8 TF32
+fragments (`tensor_cuda.rs`; 64×64 block, four warps of 32×32, operands
+staged through shared memory from any affine layout, epilogue on the
+stored block). tang-gpu runs on wgpu and cannot dispatch CUDA, so this
+is measured by `scripts/cuda_bench.cu`: the derived kernel and
+`cublasSgemm` (fp32, then `CUBLAS_TF32_TENSOR_OP_MATH`) on the same
+device, CUDA events, 50 launches. Error is against fp32 cuBLAS; TF32
+inputs give ~1e-3 relative, as expected.
+
+| shape | tang wmma (TF32) | tang WGSL (fp32) | cuBLAS fp32 | cuBLAS TF32 |
+|---|---|---|---|---|
+| 1024² | **0.150 ms** (14 TFLOPS) | 0.28 | 0.113 | 0.079 |
+| 1024² + bias + silu epilogue | 0.159 | — | 0.107 (+ separate kernels) | 0.079 |
+| 128×576×1536 | 0.052 | 0.10 | 0.031 | 0.015 |
+| 512×576×1536 | 0.091 (10 TFLOPS) | 0.16 | 0.053 | 0.048 |
+| 4096³ | 6.58 (21 TFLOPS) | — | 5.67 | 3.98 |
+
+First cut, no tuning: 1.4–1.9× cuBLAS TF32 at the LLM shapes, 1.65× at
+4096³, with the bias/activation epilogue fused for free (cuBLAS needs
+extra launches for that). The remaining gap is the standard GEMM
+engineering — 128×128 blocks with 8 warps, `cp.async` double buffering,
+`ldmatrix`-friendly swizzles — on top of a lowering that now exists.
+Together with the WGSL numbers above this is the whole picture: the
+derived kernels are 2–4× faster than tang's hand kernels through the
+portable path, and within 2× of cuBLAS through the native one, from one
+comprehension and no op-specific code.
+
+### The whole block on CUDA (`to_cuda` + cudarc, RTX 3090)
+
+`TensorGraph::to_cuda` emits a program for the CUDA driver: matmul-shaped
+tiles as the wmma kernel above, every other kernel the WGSL transpiled
+to CUDA C++ (generated WGSL is regular enough that a line-level
+translation with a 20-line prelude covers the naive, split and tile
+emitters — no second emitter). `tang_bench::ir_cuda::CudaExecutable`
+compiles with nvrtc and launches in program order. Two layout passes
+landed on the way: `relayout` (a producer's point dims reordered to
+its consumer's reads) and `merge_reduce_dims` (adjacent reduce dims
+read contiguously fold into one), which turn the attention-output
+projection Σ_{g,r,d} into a 576-wide matmul — so 5 of the block's 16
+kernels run on tensor cores.
+
+| | CUDA (5 kernels on tensor cores) | Vulkan/WGSL | PyTorch fp32 |
+|---|---|---|---|
+| block fwd, seq 128 | **0.62 ms** | 1.06 | 0.30 / 0.57 |
+| block fwd, seq 512 | **1.86 ms** | 3.34 | 0.61 / 1.21 |
+
+Per kernel at seq 512: five wmma matmuls 0.05–0.18 ms each, the
+elementwise and split kernels 2–14 µs each (the Vulkan path's ~0.1 ms
+per-kernel floor is gone), and the attention tile 1.25 ms — two thirds
+of the total. Correctness: 5e-5 relative against the f64 evaluation at
+seq 128 (TF32 inputs).
+
+### Attention on tensor cores
+
+`cuda_flash_kernel` recognizes the fused attention comp — an
+online-softmax reduction over keys whose score is an inlined bilinear
+comp (here two terms, the rope even/odd halves) plus a mask over
+(i, j), whose value is a read along (j, lane), and whose normalizer is
+the epilogue map — and emits a flash kernel: 64 queries per 128-thread
+block, keys in 64-chunks, `S = Σ_t Q_t·K_tᵀ` and `O += P·V` as wmma
+TF32 fragments, the online softmax on the stored score block with the
+comp's own mask/value/normalizer expressions evaluated where they
+belong. Nothing attention-specific is hard-coded beyond that shape.
+
+| | before | after |
+|---|---|---|
+| attention kernel, seq 128 | 0.098 ms | **0.042** |
+| attention kernel, seq 512 | 1.25 | **0.150** |
+| block fwd, seq 128 | 0.62 | **0.59** |
+| block fwd, seq 512 | 1.86 | **0.76** |
+
+Six of the block's sixteen kernels now run on tensor cores. Back to
+back in one session (GPU shared with another tenant at ~27%), the
+like-for-like comparison — tang's CUDA path uses TF32 tensor cores, so
+PyTorch gets `allow_tf32` too:
+
+| block forward | PyTorch fp32 | PyTorch TF32 | tang (CUDA, TF32) |
+|---|---|---|---|
+| seq 128 | 0.32 ms | 0.34 | 0.59 |
+| seq 512 | 0.98 | 0.48 | **0.78** |
+
+So at seq 512 the derived block is 1.6× PyTorch-TF32 and faster than
+PyTorch-fp32; at seq 128 it is launch-bound (16 launches to PyTorch's
+~10 fused cuBLAS/sdpa calls) at 1.8×. The remaining per-kernel time is
+the matmul tiles at 1.4–1.9× cuBLAS TF32 and the ten small kernels at
+a few µs each; the next rungs are the standard GEMM ladder (128×128
+blocks, `cp.async` pipelining) and fusing the small kernels into their
+neighbours' prologues. Same error as before (5e-5 relative at seq
+128).
+
+What this does and does not show: the compiler derives the *structure* of
+the fast kernels (flash attention, register-tiled matmul, sequence
+parallelism) from the algebra, with no op-specific code, and picks per
+chip. It does not yet generate the instruction-level quality of a vendor
+library, and through this backend it cannot reach tensor cores at all.
