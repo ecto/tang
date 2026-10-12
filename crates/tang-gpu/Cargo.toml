@@ -18,6 +18,16 @@ wgpu = { workspace = true }
 bytemuck = { workspace = true }
 pollster = { workspace = true }
 safetensors = { workspace = true }
+# tensor-IR programs (`program::Program`)
+tang-compile = { workspace = true }
+# CUDA backend: the driver and nvrtc are loaded at run time, so the
+# feature builds (and the binary runs, falling back to wgpu) on machines
+# without NVIDIA hardware or a CUDA toolkit.
+cudarc = { version = "0.16", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-12080"], optional = true }
+
+[features]
+default = []
+cuda = ["dep:cudarc"]
 
 [[example]]
 name = "physics_surrogate"

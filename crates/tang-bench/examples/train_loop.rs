@@ -1,10 +1,12 @@
 //! A training loop that is entirely derived: block forward + MSE loss +
 //! backward for every weight as one program, Adam as another, weights
-//! fed back GPU-side. Prints the loss going down.
+//! fed back device-side. Prints the loss going down. Runs on tang-gpu's
+//! selected backend: CUDA with `--features cuda` on NVIDIA, else wgpu.
 use tang_bench::ir_block::{train_loss_graph, BlockDims};
 use tang_bench::ir_block_gpu::params;
-use tang_bench::ir_gpu::{adam_step, Executable};
+use tang_bench::ir_gpu::adam_step;
 use tang_compile::tensor::TensorId;
+use tang_gpu::program::{Program, Runtime};
 use tang_gpu::{GpuDevice, KernelCache};
 
 fn main() {
@@ -32,7 +34,12 @@ fn main() {
     let target: Vec<f32> = (0..n)
         .map(|i| ((i * 104729) % 89) as f32 * 0.02 - 0.9)
         .collect();
+    // the weights are initialized by tang-gpu's hand layers (wgpu) and
+    // read back; the training itself runs on the selected backend
     let p = params(&device, &mut cache, dims, x);
+    drop((device, cache));
+    let rt = Runtime::select().expect("gpu");
+    println!("backend: {:?} — {}", rt.kind(), rt.name());
 
     let (g, outs, target_idx) = train_loss_graph(&p.dims);
     let (g, outs) = g.substitute_maps(&outs);
@@ -42,36 +49,31 @@ fn main() {
     let (g, outs) = g.merge_reduce_dims(&outs);
     let (mut g, outs) = g.split_reduce_dims(&outs);
     g.schedule_auto(&outs);
-    let program = g.to_wgsl(&outs);
+    let program = rt.lower(&g, &outs);
     println!("train program: {} kernels", program.kernels.len());
     let mut inputs: Vec<&[f32]> = p.cpu.iter().map(|v| v.as_slice()).collect();
     inputs.push(&target);
     assert_eq!(inputs.len(), target_idx + 1);
-    let train = Executable::new(&device, program, &inputs);
+    let train = Program::new(&rt, program, &inputs);
 
     // one Adam program per weight, with its own m/v state
     let weight_inputs = [1usize, 3, 5, 7, 9, 11, 13];
     let (lr, b1, b2, eps) = (1e-3f64, 0.9f64, 0.999f64, 1e-8f64);
-    let adams: Vec<(usize, Executable, [TensorId; 3])> = weight_inputs
+    let adams: Vec<(usize, Program, [TensorId; 3])> = weight_inputs
         .iter()
         .map(|&k| {
             let len = p.cpu[k].len();
             let (ag, aouts) = adam_step(len, lr, b1, b2, eps);
             let zeros = vec![0.0f32; len];
             let bc = [1.0f32, 1.0];
-            let exe = Executable::new(
-                &device,
-                ag.to_wgsl(&aouts),
-                &[&p.cpu[k], &zeros, &zeros, &zeros, &bc],
-            );
+            let exe = Program::compile(&rt, &ag, &aouts, &[&p.cpu[k], &zeros, &zeros, &zeros, &bc]);
             (k, exe, aouts)
         })
         .collect();
 
     for step in 1..=steps {
-        train.run(&device, &mut cache);
-        cache.flush(&device);
-        let loss = train.read(&device, outs[0])[0];
+        train.run(&rt);
+        let loss = train.read(&rt, outs[0])[0];
         println!("step {step:>3}: loss {loss:.6}");
         let bc = [
             (1.0 - b1.powi(step as i32)) as f32,
@@ -79,20 +81,13 @@ fn main() {
         ];
         for (j, (k, adam, aouts)) in adams.iter().enumerate() {
             // adam inputs: p, g, m, v, bc ; outputs m', v', p'
-            adam.input_buffer(4).write(&device, &bc);
-            adam.input_buffer(0)
-                .copy_from(&device, &mut cache, train.input_buffer(*k));
-            adam.input_buffer(1)
-                .copy_from(&device, &mut cache, train.buffer(outs[1 + j]));
-            adam.run(&device, &mut cache);
-            adam.input_buffer(2)
-                .copy_from(&device, &mut cache, adam.buffer(aouts[0]));
-            adam.input_buffer(3)
-                .copy_from(&device, &mut cache, adam.buffer(aouts[1]));
-            train
-                .input_buffer(*k)
-                .copy_from(&device, &mut cache, adam.buffer(aouts[2]));
+            adam.write(&rt, adam.input(4), &bc);
+            adam.copy(&rt, adam.input(0), &train, train.input(*k));
+            adam.copy(&rt, adam.input(1), &train, outs[1 + j]);
+            adam.run(&rt);
+            adam.copy(&rt, adam.input(2), adam, aouts[0]);
+            adam.copy(&rt, adam.input(3), adam, aouts[1]);
+            train.copy(&rt, train.input(*k), adam, aouts[2]);
         }
-        cache.flush(&device);
     }
 }
