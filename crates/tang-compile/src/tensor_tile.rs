@@ -349,7 +349,7 @@ impl Ctx<'_> {
 
     /// Read of buffer-backed node `j` at an address.
     fn buffer_read(&mut self, j: usize, addr: Sym) -> String {
-        if !(addr.terms.contains_key("r0") && !self.in_load) {
+        if !addr.terms.contains_key("r0") || self.in_load {
             // only staged regions apply a guard at load time
             self.guard = None;
         }
@@ -674,6 +674,10 @@ impl Ctx<'_> {
 }
 
 /// Row-major flat index of symbolic coords over `shape`.
+/// Staged f32 words per workgroup: 16 KiB, WebGPU's guaranteed
+/// `maxComputeWorkgroupStorageSize` and within Metal's 32 KiB.
+pub(crate) const MAX_STAGE_WORDS: usize = 4096;
+
 fn flat(coords: &[Sym], shape: &[usize]) -> Sym {
     let mut acc = Sym::default();
     for (c, &n) in coords.iter().zip(shape) {
@@ -735,7 +739,14 @@ impl TensorGraph {
 
     /// Emit the tiled kernel for `root`, continuing `s` (which already
     /// holds the bindings and per-node functions).
-    pub(super) fn tile_kernel(&self, root: usize, mut s: String, reads: Vec<usize>) -> WgslKernel {
+    /// `None` when the staging cannot fit [`MAX_STAGE_WORDS`] even at a
+    /// one-step chunk; the caller then emits the untiled kernel.
+    pub(super) fn tile_kernel(
+        &self,
+        root: usize,
+        mut s: String,
+        reads: Vec<usize>,
+    ) -> Option<WgslKernel> {
         // A map root is an epilogue: tile the reduction it applies to and
         // evaluate the map at write-out.
         let epilogue = self.comp_at(root).unwrap().monoid.is_none();
@@ -855,8 +866,13 @@ impl TensorGraph {
             regions + comps
         };
         let mut chunk = chunk;
-        while chunk > 1 && staged(&ctx, chunk) > 4096 {
+        while chunk > 1 && staged(&ctx, chunk) > MAX_STAGE_WORDS {
             chunk -= 1;
+        }
+        // Still over at chunk 1 (wide inner reduce dims, e.g. Kokoro's
+        // iSTFT wanted 328 KiB): no valid tiled schedule on any target.
+        if staged(&ctx, chunk) > MAX_STAGE_WORDS {
+            return None;
         }
         ctx.chunk = chunk;
         ctx.collect = false;
@@ -1275,13 +1291,13 @@ impl TensorGraph {
         }
         writeln!(s, "}}").unwrap();
 
-        WgslKernel {
+        Some(WgslKernel {
             source: s,
             node: TensorId(root as u32),
             reads: reads.into_iter().map(|j| TensorId(j as u32)).collect(),
             points: pts.iter().product::<usize>() as u32,
             count: (n_tiles * threads) as u32,
             workgroup_size: threads as u32,
-        }
+        })
     }
 }
