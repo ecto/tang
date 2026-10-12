@@ -342,3 +342,25 @@ memory (`schedule_tile_2d`), the classic shared-memory matmul, derived.
 The derived matmul is at parity with the hand kernel. Shared-memory
 staging does not pay on this chip either: the operands already live in
 cache, so the extra barriers cost more than the global reads they save.
+
+### GPU: rmsnorm and swiglu, hand vs derived
+
+`hand` is `GpuRMSNorm::forward` (one workgroup per row, shared-memory
+reduction) and `swiglu_fused_pub`. The IR rmsnorm is `x · rsqrt(mean(x²)+ε)`
+after `substitute_maps`: one Sum reduction and one map.
+
+| rmsnorm | hand | ir_naive | ir_split | ir_tiled |
+|---|---|---|---|---|
+| 128×576 | 1.46 ms | 1.49 ms | 1.48 ms | 1.50 ms |
+| 2048×2048 | 2.16 ms | 3.90 ms | **2.31 ms** | 6.32 ms |
+
+| swiglu | hand | ir |
+|---|---|---|
+| 65 536 | 1.57 ms | 1.55 ms |
+| 4 194 304 | 2.09 ms | 2.25 ms |
+
+Note the winner flips: attention wanted the naive schedule, rmsnorm wants
+the split one (its reduce axis is 2048 wide and there are only 2048 rows,
+so one thread per row starves the GPU). Same compiler, same cost of
+being wrong, different answer per op — which is the case for autotuning
+rather than a fixed heuristic.

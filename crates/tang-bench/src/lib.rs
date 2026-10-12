@@ -452,11 +452,101 @@ pub mod ir_gpu {
             .collect()
     }
 
+    /// RMSNorm over `[rows, dim]` with weight = 1, under each schedule.
+    pub fn rmsnorm_candidates(
+        rows: usize,
+        dim: usize,
+    ) -> Vec<(&'static str, TensorGraph, TensorId)> {
+        let build = |schedule: &str| {
+            let mut g = TensorGraph::new();
+            let x = g.input(&[rows, dim]);
+            let sq = g.map(&[x], |v| v[0] * v[0]).unwrap();
+            let sum = g.reduce(sq, 1, Monoid::sum()).unwrap();
+            let inv = g
+                .map(&[sum], |v| {
+                    ExprId::from_f64(1.0)
+                        / (v[0] / ExprId::from_f64(dim as f64) + ExprId::from_f64(1e-6)).sqrt()
+                })
+                .unwrap();
+            let inv = g.broadcast(inv, &[rows, dim]).unwrap();
+            let y = g.map(&[x, inv], |v| v[0] * v[1]).unwrap();
+            let (mut g, outs) = g.substitute_maps(&[y]);
+            match schedule {
+                "split" => g.schedule_split(&outs, 256, 64),
+                "tiled" => g.schedule_tile(&outs, 64, 32, 64),
+                _ => {}
+            }
+            (g, outs[0])
+        };
+        ["naive", "split", "tiled"]
+            .into_iter()
+            .map(|name| {
+                let (g, y) = build(name);
+                (name, g, y)
+            })
+            .collect()
+    }
+
+    /// `silu(gate) * up`: pure elementwise, one map.
+    pub fn swiglu_graph(n: usize) -> (TensorGraph, TensorId) {
+        let mut g = TensorGraph::new();
+        let gate = g.input(&[n]);
+        let up = g.input(&[n]);
+        let y = g
+            .map(&[gate, up], |v| {
+                v[0] / (ExprId::from_f64(1.0) + (-v[0]).exp()) * v[1]
+            })
+            .unwrap();
+        (g, y)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
         use tang_gpu::kv_attention_fused;
         use tang_gpu::GpuTensor;
+
+        #[test]
+        fn derived_rmsnorm_and_swiglu_match_hand_kernels_on_gpu() {
+            let Ok(device) = GpuDevice::new_sync() else {
+                eprintln!("no GPU, skipping");
+                return;
+            };
+            let mut cache = KernelCache::new();
+            let (rows, dim) = (37, 100);
+            let mut rng = crate::Rng::new(5);
+            let x: Vec<f32> = (0..rows * dim).map(|_| rng.f32() * 2.0 - 1.0).collect();
+            let xt = GpuTensor::from_slice(&device, &x, &[rows, dim]);
+            let norm = tang_gpu::GpuRMSNorm::new(&device, dim, 1e-6);
+            let want = norm
+                .forward(&device, &mut cache, &xt)
+                .to_vec_flushed(&device, &mut cache);
+            for (name, g, y) in rmsnorm_candidates(rows, dim) {
+                let exe = Executable::new(&device, g.to_wgsl(&[y]), &[&x]);
+                exe.run(&device, &mut cache);
+                cache.flush(&device);
+                let got = exe.read(&device, y);
+                for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+                    assert!((a - b).abs() < 1e-4, "rmsnorm {name}[{i}]: {a} vs {b}");
+                }
+            }
+
+            let n = 1000;
+            let gate: Vec<f32> = (0..n).map(|_| rng.f32() * 4.0 - 2.0).collect();
+            let up: Vec<f32> = (0..n).map(|_| rng.f32() * 2.0 - 1.0).collect();
+            let gt = GpuTensor::from_slice(&device, &gate, &[n]);
+            let ut = GpuTensor::from_slice(&device, &up, &[n]);
+            let want = tang_gpu::swiglu_fused_pub(&device, &mut cache, &gt, &ut)
+                .to_vec_flushed(&device, &mut cache);
+            let (g, y) = swiglu_graph(n);
+            let exe = Executable::new(&device, g.to_wgsl(&[y]), &[&gate, &up]);
+            exe.run(&device, &mut cache);
+            cache.flush(&device);
+            let got = exe.read(&device, y);
+            for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+                assert!((a - b).abs() < 1e-4, "swiglu[{i}]: {a} vs {b}");
+            }
+        }
 
         #[test]
         fn derived_matmul_matches_hand_kernel_on_gpu() {

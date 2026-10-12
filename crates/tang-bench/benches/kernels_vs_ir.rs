@@ -321,5 +321,78 @@ mod gpu_matmul {
     }
 }
 
-criterion_group!(gpu_benches, gpu::bench_attention, gpu_matmul::bench_matmul);
+mod gpu_norm {
+    use super::*;
+    use tang_bench::ir_gpu::{rmsnorm_candidates, swiglu_graph, Executable};
+    use tang_gpu::{GpuDevice, GpuTensor, KernelCache};
+
+    fn random(n: usize, seed: u64) -> Vec<f32> {
+        let mut rng = tang_bench::Rng::new(seed);
+        (0..n).map(|_| rng.f32() * 2.0 - 1.0).collect()
+    }
+
+    pub fn bench_rmsnorm_swiglu(c: &mut Criterion) {
+        let Ok(device) = GpuDevice::new_sync() else {
+            eprintln!("no GPU, skipping kvi_gpu_rmsnorm");
+            return;
+        };
+        let mut cache = KernelCache::new();
+        let mut group = c.benchmark_group("kvi_gpu_rmsnorm");
+        group.sample_size(20);
+        for &(rows, dim) in &[(128usize, 576usize), (2048, 2048)] {
+            let x = random(rows * dim, 1);
+            let xt = GpuTensor::from_slice(&device, &x, &[rows, dim]);
+            let norm = tang_gpu::GpuRMSNorm::new(&device, dim, 1e-6);
+            let id = format!("{rows}x{dim}");
+            group.bench_function(BenchmarkId::new("hand", &id), |b| {
+                b.iter(|| {
+                    let out = norm.forward(&device, &mut cache, &xt);
+                    black_box(out.to_vec_flushed(&device, &mut cache));
+                })
+            });
+            for (name, g, y) in rmsnorm_candidates(rows, dim) {
+                let exe = Executable::new(&device, g.to_wgsl(&[y]), &[&x]);
+                group.bench_function(BenchmarkId::new(format!("ir_{name}"), &id), |b| {
+                    b.iter(|| {
+                        exe.run(&device, &mut cache);
+                        cache.flush(&device);
+                        black_box(exe.read(&device, y));
+                    })
+                });
+            }
+        }
+        group.finish();
+
+        let mut group = c.benchmark_group("kvi_gpu_swiglu");
+        group.sample_size(20);
+        for &n in &[65_536usize, 4_194_304] {
+            let (gate, up) = (random(n, 2), random(n, 3));
+            let gt = GpuTensor::from_slice(&device, &gate, &[n]);
+            let ut = GpuTensor::from_slice(&device, &up, &[n]);
+            group.bench_function(BenchmarkId::new("hand", n), |b| {
+                b.iter(|| {
+                    let out = tang_gpu::swiglu_fused_pub(&device, &mut cache, &gt, &ut);
+                    black_box(out.to_vec_flushed(&device, &mut cache));
+                })
+            });
+            let (g, y) = swiglu_graph(n);
+            let exe = Executable::new(&device, g.to_wgsl(&[y]), &[&gate, &up]);
+            group.bench_function(BenchmarkId::new("ir", n), |b| {
+                b.iter(|| {
+                    exe.run(&device, &mut cache);
+                    cache.flush(&device);
+                    black_box(exe.read(&device, y));
+                })
+            });
+        }
+        group.finish();
+    }
+}
+
+criterion_group!(
+    gpu_benches,
+    gpu::bench_attention,
+    gpu_matmul::bench_matmul,
+    gpu_norm::bench_rmsnorm_swiglu
+);
 criterion_main!(benches, gpu_benches);
