@@ -47,12 +47,23 @@ impl GpuDevice {
             .await
             .ok_or(GpuError::NoAdapter)?;
 
+        // Generated kernels bind one storage buffer per tensor they read;
+        // a fused block kernel can need more than the default 8. Ask for
+        // what the adapter has, within reason.
+        let adapter_limits = adapter.limits();
+        let mut limits = wgpu::Limits::default();
+        limits.max_storage_buffers_per_shader_stage =
+            adapter_limits.max_storage_buffers_per_shader_stage.min(16);
+        limits.max_compute_workgroup_storage_size = adapter_limits
+            .max_compute_workgroup_storage_size
+            .max(limits.max_compute_workgroup_storage_size);
+
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("tang-gpu"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
+                    required_limits: limits,
                     memory_hints: wgpu::MemoryHints::Performance,
                 },
                 None,

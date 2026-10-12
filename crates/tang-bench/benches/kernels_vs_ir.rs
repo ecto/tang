@@ -102,7 +102,7 @@ fn trace_rmsnorm(dim: usize) -> (ExprGraph, Vec<ExprId>) {
         let xs: Vec<ExprId> = (0..dim).map(|i| ExprId::var(i as u16)).collect();
         let mut sq = ExprId::from_f64(0.0);
         for &x in &xs {
-            sq = sq + x * x;
+            sq += x * x;
         }
         let rms = (sq / ExprId::from_f64(dim as f64) + ExprId::from_f64(1e-6)).sqrt();
         let inv = ExprId::from_f64(1.0) / rms;
@@ -147,7 +147,7 @@ fn bench_rmsnorm(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("build", format!("{batch}x{dim}")), |b| {
             b.iter(|| {
                 let (g, outs) = trace_rmsnorm(dim);
-                black_box(compile(&g, &outs, true));
+                black_box(compile(&g, &outs, true).1);
             })
         });
     }
@@ -166,8 +166,8 @@ fn trace_matvec(n: usize) -> (ExprGraph, Vec<ExprId>) {
         (0..n)
             .map(|i| {
                 let mut acc = ExprId::from_f64(0.0);
-                for j in 0..n {
-                    acc = acc + w(i, j) * x[j];
+                for (j, &xj) in x.iter().enumerate() {
+                    acc += w(i, j) * xj;
                 }
                 acc
             })
@@ -381,8 +381,55 @@ mod gpu_norm {
     }
 }
 
+mod gpu_block {
+    use super::*;
+    use tang_bench::ir_block::BlockDims;
+    use tang_bench::ir_block_gpu::{hand_forward, ir_executable, params};
+    use tang_gpu::{GpuDevice, GpuTensor, KernelCache};
+
+    pub fn bench_block(c: &mut Criterion) {
+        let Ok(device) = GpuDevice::new_sync() else {
+            eprintln!("no GPU, skipping kvi_gpu_block");
+            return;
+        };
+        let mut cache = KernelCache::new();
+        let mut group = c.benchmark_group("kvi_gpu_transformer_block");
+        group.sample_size(20);
+        for &seq in &[128usize, 512] {
+            let dims = BlockDims {
+                seq,
+                d_model: 576,
+                n_heads: 9,
+                n_kv_heads: 3,
+                head_dim: 64,
+                ff_dim: 1536,
+            };
+            let mut rng = tang_bench::Rng::new(1);
+            let x: Vec<f32> = (0..seq * 576).map(|_| rng.f32() * 2.0 - 1.0).collect();
+            let input = GpuTensor::from_slice(&device, &x, &[seq, 576]);
+            let p = params(&device, &mut cache, dims, x);
+            group.bench_function(BenchmarkId::new("hand", seq), |b| {
+                b.iter(|| {
+                    let out = hand_forward(&device, &mut cache, &p, &input);
+                    black_box(out.to_vec_flushed(&device, &mut cache));
+                })
+            });
+            let (exe, y) = ir_executable(&device, &p, true);
+            group.bench_function(BenchmarkId::new("ir_auto", seq), |b| {
+                b.iter(|| {
+                    exe.run(&device, &mut cache);
+                    cache.flush(&device);
+                    black_box(exe.read(&device, y));
+                })
+            });
+        }
+        group.finish();
+    }
+}
+
 criterion_group!(
     gpu_benches,
+    gpu_block::bench_block,
     gpu::bench_attention,
     gpu_matmul::bench_matmul,
     gpu_norm::bench_rmsnorm_swiglu

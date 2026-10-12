@@ -381,3 +381,21 @@ best hand-picked schedule for attention (tiled), rmsnorm (split) and
 matmul (naive-ish; the tile does not pay here). It does not choose between
 algebras — materialized scores vs online softmax — which is `autotune`'s
 job.
+
+### GPU: a whole transformer block, hand-written vs derived
+
+The `gpu_transformer_layer` prefill path (rmsnorm → q/k/v → interleaved
+RoPE → GQA causal attention (9 heads, 3 kv heads, d=64) → wo → residual →
+rmsnorm → SwiGLU → residual, d_model 576, ff 1536) rebuilt as one tensor
+IR graph (`tang_bench::ir_block`) and run under `substitute_maps` +
+`stabilize_softmax` + `schedule_auto`. Identical weights; outputs agree
+with the hand path and with the f64 interpreter to 5e-7.
+
+| seq | hand | ir_auto |
+|---|---|---|
+| 128 | 5.04 ms | 5.86 ms |
+| 512 | 24.0 ms | **19.6 ms** |
+
+GQA's `head / heads_per_group` is not affine, so heads are expressed as
+`[groups, per_group]` dims and the views do the rest; the causal mask is an
+input. Nothing in the compiler knows what a transformer is.

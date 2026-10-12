@@ -414,7 +414,6 @@ pub mod ir_gpu {
         let (g, y) = naive_attention(n, d, dv);
         let (g, outs) = g.substitute_maps(&[y]);
         let (mut g, outs) = g.stabilize_softmax(&outs);
-        g.schedule_inline_up_to(&outs, dv);
         g.schedule_auto(&outs);
         (g, outs[0])
     }
@@ -660,6 +659,850 @@ pub mod ir_gpu {
             for (i, (a, b)) in got.iter().zip(&want).enumerate() {
                 assert!((a - b).abs() < 1e-4, "auto[{i}]: {a} vs {b}");
             }
+        }
+    }
+}
+
+/// A whole transformer block derived from tensor IR, mirroring the
+/// hand-written `gpu_transformer_layer` prefill path in `gpu_inference`.
+pub mod ir_block {
+    use tang::Scalar;
+    use tang_compile::tensor::{Arg, Form, Monoid, TensorGraph, TensorId, View};
+    use tang_expr::ExprId;
+
+    pub struct BlockDims {
+        pub seq: usize,
+        pub d_model: usize,
+        pub n_heads: usize,
+        pub n_kv_heads: usize,
+        pub head_dim: usize,
+        pub ff_dim: usize,
+    }
+
+    /// Input order for the graph's buffers.
+    pub const INPUTS: [&str; 18] = [
+        "x", "wq", "bq", "wk", "bk", "wv", "bv", "wo", "bo", "w_gate", "b_gate", "w_up", "b_up",
+        "w_down", "b_down", "cos", "sin", "mask",
+    ];
+
+    fn unit(rank: usize, d: usize) -> Form {
+        let mut f = Form {
+            coefs: vec![0; rank],
+            offset: 0,
+        };
+        f.coefs[d] = 1;
+        f
+    }
+
+    fn form(rank: usize, terms: &[(usize, i64)], offset: i64) -> Form {
+        let mut f = Form {
+            coefs: vec![0; rank],
+            offset,
+        };
+        for &(d, c) in terms {
+            f.coefs[d] += c;
+        }
+        f
+    }
+
+    /// `x · wᵀ + b` for `w: [out, in]`, `b: [out]`.
+    fn linear(g: &mut TensorGraph, x: TensorId, w: TensorId, b: TensorId) -> TensorId {
+        let wt = g.transpose(w, &[1, 0]).unwrap();
+        let y = g.matmul(x, wt).unwrap();
+        let shape = g.shape(y).to_vec();
+        let rank = shape.len();
+        let args = vec![
+            Arg {
+                src: y,
+                view: View::identity(rank, rank),
+            },
+            Arg {
+                src: b,
+                view: View {
+                    forms: vec![unit(rank, 1)],
+                },
+            },
+        ];
+        g.comp(&shape, &[], args, None, |v| vec![v[0] + v[1]])
+            .unwrap()
+    }
+
+    fn rmsnorm(g: &mut TensorGraph, x: TensorId) -> TensorId {
+        let shape = g.shape(x).to_vec();
+        let dim = shape[1].n();
+        let sq = g.map(&[x], |v| v[0] * v[0]).unwrap();
+        let sum = g.reduce(sq, 1, Monoid::sum()).unwrap();
+        let inv = g
+            .map(&[sum], |v| {
+                ExprId::from_f64(1.0)
+                    / (v[0] / ExprId::from_f64(dim as f64) + ExprId::from_f64(1e-6)).sqrt()
+            })
+            .unwrap();
+        let inv = g.broadcast(inv, &shape).unwrap();
+        g.map(&[x, inv], |v| v[0] * v[1]).unwrap()
+    }
+
+    /// Interleaved RoPE on `x: [seq, heads*head_dim]` as two tensors of
+    /// even/odd rotated components, `[seq, heads, head_dim/2]`, scaled.
+    fn rope_split(
+        g: &mut TensorGraph,
+        x: TensorId,
+        heads: usize,
+        head_dim: usize,
+        cos: TensorId,
+        sin: TensorId,
+        scale: f64,
+    ) -> (TensorId, TensorId) {
+        let seq = g.shape(x)[0].n();
+        let half = head_dim / 2;
+        let out = [seq, heads, half];
+        // space coords: (s, h, i); x[s, h*head_dim + 2i (+1)]
+        let xv = |off: i64| View {
+            forms: vec![unit(3, 0), form(3, &[(1, head_dim as i64), (2, 2)], off)],
+        };
+        let tv = View {
+            forms: vec![unit(3, 0), unit(3, 2)],
+        };
+        let args = |g: &TensorGraph| {
+            let _ = g;
+            vec![
+                Arg {
+                    src: x,
+                    view: xv(0),
+                },
+                Arg {
+                    src: x,
+                    view: xv(1),
+                },
+                Arg {
+                    src: cos,
+                    view: tv.clone(),
+                },
+                Arg {
+                    src: sin,
+                    view: tv.clone(),
+                },
+            ]
+        };
+        // Literals must be created inside the body closure: `from_f64`
+        // writes to the graph being traced.
+        let even = g
+            .comp(&out, &[], args(g), None, |v| {
+                vec![(v[0] * v[2] - v[1] * v[3]) * ExprId::from_f64(scale)]
+            })
+            .unwrap();
+        let odd = g
+            .comp(&out, &[], args(g), None, |v| {
+                vec![(v[0] * v[3] + v[1] * v[2]) * ExprId::from_f64(scale)]
+            })
+            .unwrap();
+        (even, odd)
+    }
+
+    /// Intermediates of the IR block, for stage-by-stage comparison.
+    pub struct BlockNodes {
+        pub normed: TensorId,
+        pub q: TensorId,
+        pub qe: TensorId,
+        pub attn: TensorId,
+        pub proj: TensorId,
+        pub out: TensorId,
+    }
+
+    /// Build the block. Returns the graph and its output `[seq, d_model]`.
+    pub fn transformer_block(dims: &BlockDims) -> (TensorGraph, TensorId) {
+        let (g, n) = transformer_block_nodes(dims);
+        (g, n.out)
+    }
+
+    pub fn transformer_block_nodes(dims: &BlockDims) -> (TensorGraph, BlockNodes) {
+        let BlockDims {
+            seq,
+            d_model,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            ff_dim,
+        } = *dims;
+        let groups = n_kv_heads;
+        let per_group = n_heads / n_kv_heads;
+        let half = head_dim / 2;
+        let kv_dim = n_kv_heads * head_dim;
+
+        let mut g = TensorGraph::new();
+        let x = g.input(&[seq, d_model]);
+        let wq = g.input(&[d_model, d_model]);
+        let bq = g.input(&[d_model]);
+        let wk = g.input(&[kv_dim, d_model]);
+        let bk = g.input(&[kv_dim]);
+        let wv = g.input(&[kv_dim, d_model]);
+        let bv = g.input(&[kv_dim]);
+        let wo = g.input(&[d_model, d_model]);
+        let bo = g.input(&[d_model]);
+        let w_gate = g.input(&[ff_dim, d_model]);
+        let b_gate = g.input(&[ff_dim]);
+        let w_up = g.input(&[ff_dim, d_model]);
+        let b_up = g.input(&[ff_dim]);
+        let w_down = g.input(&[d_model, ff_dim]);
+        let b_down = g.input(&[d_model]);
+        let cos = g.input(&[seq, half]);
+        let sin = g.input(&[seq, half]);
+
+        let normed = rmsnorm(&mut g, x);
+        let q = linear(&mut g, normed, wq, bq);
+        let k = linear(&mut g, normed, wk, bk);
+        let v = linear(&mut g, normed, wv, bv);
+        let scale = 1.0 / (head_dim as f64).sqrt();
+        let (qe, qo) = rope_split(&mut g, q, n_heads, head_dim, cos, sin, scale);
+        let (ke, ko) = rope_split(&mut g, k, n_kv_heads, head_dim, cos, sin, 1.0);
+
+        // scores[gr, r, i, j] = Σ_i' qe[i, 3g+r, i']·ke[j, g, i'] + qo·ko  (+ causal mask)
+        // space: (g, r, i, j, i')
+        let r5 = 5;
+        let qv = View {
+            forms: vec![
+                unit(r5, 2),
+                form(r5, &[(0, per_group as i64), (1, 1)], 0),
+                unit(r5, 4),
+            ],
+        };
+        let kv = View {
+            forms: vec![unit(r5, 3), unit(r5, 0), unit(r5, 4)],
+        };
+        let s_out = [groups, per_group, seq, seq];
+        let scores = g
+            .comp(
+                &s_out,
+                &[half],
+                vec![
+                    Arg {
+                        src: qe,
+                        view: qv.clone(),
+                    },
+                    Arg {
+                        src: ke,
+                        view: kv.clone(),
+                    },
+                    Arg { src: qo, view: qv },
+                    Arg { src: ko, view: kv },
+                ],
+                Some(Monoid::sum()),
+                |a| vec![a[0] * a[1] + a[2] * a[3]],
+            )
+            .unwrap();
+        // causal mask as a comparison on coordinates is not affine; use an
+        // input-free trick: mask = (j - i > 0 ? -1e30 : 0) via a map over an
+        // index view is impossible without coordinate access, so the
+        // mask is a graph input like in `naive_attention`.
+        let mask = g.input(&[seq, seq]);
+        let r4 = 4;
+        let masked = g
+            .comp(
+                &s_out,
+                &[],
+                vec![
+                    Arg {
+                        src: scores,
+                        view: View::identity(r4, r4),
+                    },
+                    Arg {
+                        src: mask,
+                        view: View {
+                            forms: vec![unit(r4, 2), unit(r4, 3)],
+                        },
+                    },
+                ],
+                None,
+                |a| vec![a[0] + a[1]],
+            )
+            .unwrap();
+        let m = g.reduce(masked, 3, Monoid::max()).unwrap();
+        let mb = g.broadcast(m, &s_out).unwrap();
+        let p = g.map(&[masked, mb], |a| (a[0] - a[1]).exp()).unwrap();
+        let l = g.reduce(p, 3, Monoid::sum()).unwrap();
+        // o[g, r, i, c] = Σ_j p[g,r,i,j] · v[j, g*head_dim + c]; space (g, r, i, c, j)
+        let o_out = [groups, per_group, seq, head_dim];
+        let o = g
+            .comp(
+                &o_out,
+                &[seq],
+                vec![
+                    Arg {
+                        src: p,
+                        view: View {
+                            forms: vec![unit(5, 0), unit(5, 1), unit(5, 2), unit(5, 4)],
+                        },
+                    },
+                    Arg {
+                        src: v,
+                        view: View {
+                            forms: vec![unit(5, 4), form(5, &[(0, head_dim as i64), (3, 1)], 0)],
+                        },
+                    },
+                ],
+                Some(Monoid::sum()),
+                |a| vec![a[0] * a[1]],
+            )
+            .unwrap();
+        let lb = g
+            .comp(
+                &o_out,
+                &[],
+                vec![Arg {
+                    src: l,
+                    view: View {
+                        forms: vec![
+                            unit(4, 0),
+                            unit(4, 1),
+                            unit(4, 2),
+                            Form {
+                                coefs: vec![0; 4],
+                                offset: 0,
+                            },
+                        ],
+                    },
+                }],
+                None,
+                |a| vec![a[0]],
+            )
+            .unwrap();
+        let y = g.map(&[o, lb], |a| a[0] / a[1]).unwrap();
+
+        // proj[i, n] = Σ_{g,r,c} y[g,r,i,c] · wo[n, (3g+r)*head_dim + c] + bo[n]
+        // space (i, n, g, r, c)
+        let proj = g
+            .comp(
+                &[seq, d_model],
+                &[groups, per_group, head_dim],
+                vec![
+                    Arg {
+                        src: y,
+                        view: View {
+                            forms: vec![unit(5, 2), unit(5, 3), unit(5, 0), unit(5, 4)],
+                        },
+                    },
+                    Arg {
+                        src: wo,
+                        view: View {
+                            forms: vec![
+                                unit(5, 1),
+                                form(
+                                    5,
+                                    &[
+                                        (2, (per_group * head_dim) as i64),
+                                        (3, head_dim as i64),
+                                        (4, 1),
+                                    ],
+                                    0,
+                                ),
+                            ],
+                        },
+                    },
+                ],
+                Some(Monoid::sum()),
+                |a| vec![a[0] * a[1]],
+            )
+            .unwrap();
+        let bob = g.broadcast_bias(proj, bo);
+        let res1 = g.map(&[x, bob], |a| a[0] + a[1]).unwrap();
+        let normed2 = rmsnorm(&mut g, res1);
+        let gate = linear(&mut g, normed2, w_gate, b_gate);
+        let up = linear(&mut g, normed2, w_up, b_up);
+        let act = g
+            .map(&[gate, up], |a| {
+                a[0] / (ExprId::from_f64(1.0) + (-a[0]).exp()) * a[1]
+            })
+            .unwrap();
+        let ffn = linear(&mut g, act, w_down, b_down);
+        let out = g.map(&[res1, ffn], |a| a[0] + a[1]).unwrap();
+        (
+            g,
+            BlockNodes {
+                normed,
+                q,
+                qe,
+                attn: y,
+                proj: bob,
+                out,
+            },
+        )
+    }
+
+    trait BiasExt {
+        fn broadcast_bias(&mut self, x: TensorId, b: TensorId) -> TensorId;
+    }
+
+    impl BiasExt for TensorGraph {
+        fn broadcast_bias(&mut self, x: TensorId, b: TensorId) -> TensorId {
+            let shape = self.shape(x).to_vec();
+            let args = vec![
+                Arg {
+                    src: x,
+                    view: View::identity(2, 2),
+                },
+                Arg {
+                    src: b,
+                    view: View {
+                        forms: vec![unit(2, 1)],
+                    },
+                },
+            ];
+            self.comp(&shape, &[], args, None, |v| vec![v[0] + v[1]])
+                .unwrap()
+        }
+    }
+
+    /// Full compiler pipeline for the block.
+    pub fn compiled_block(dims: &BlockDims) -> (TensorGraph, TensorId) {
+        let (g, out) = transformer_block(dims);
+        let (g, outs) = g.substitute_maps(&[out]);
+        let (mut g, outs) = g.stabilize_softmax(&outs);
+        g.schedule_auto(&outs);
+        (g, outs[0])
+    }
+}
+
+/// Hand-written vs derived transformer block on the GPU.
+pub mod ir_block_gpu {
+    use super::ir_block::{compiled_block, transformer_block, BlockDims};
+    use super::ir_gpu::{causal_mask, Executable};
+    use tang_gpu::nn::bias_add;
+    use tang_gpu::*;
+
+    /// The hand path's parameters, plus CPU copies for the IR graph.
+    pub struct Params {
+        pub ln1: GpuRMSNorm,
+        pub ln2: GpuRMSNorm,
+        pub wq: GpuLinear,
+        pub wk: GpuLinear,
+        pub wv: GpuLinear,
+        pub wo: GpuLinear,
+        pub gate: GpuLinear,
+        pub up: GpuLinear,
+        pub down: GpuLinear,
+        pub rope: GpuInterleavedRoPE,
+        pub dims: BlockDims,
+        /// IR inputs in `ir_block::INPUTS` order (x first).
+        pub cpu: Vec<Vec<f32>>,
+    }
+
+    pub fn params(
+        device: &GpuDevice,
+        cache: &mut KernelCache,
+        dims: BlockDims,
+        x: Vec<f32>,
+    ) -> Params {
+        let BlockDims {
+            seq,
+            d_model,
+            n_kv_heads,
+            head_dim,
+            ff_dim,
+            ..
+        } = dims;
+        let kv = n_kv_heads * head_dim;
+        let wq = GpuLinear::kaiming(device, d_model, d_model, 42);
+        let wk = GpuLinear::kaiming(device, d_model, kv, 43);
+        let wv = GpuLinear::kaiming(device, d_model, kv, 44);
+        let wo = GpuLinear::kaiming(device, d_model, d_model, 45);
+        let gate = GpuLinear::kaiming(device, d_model, ff_dim, 46);
+        let up = GpuLinear::kaiming(device, d_model, ff_dim, 47);
+        let down = GpuLinear::kaiming(device, ff_dim, d_model, 48);
+        let rope = GpuInterleavedRoPE::new(device, head_dim, seq.max(16), 10000.0);
+        let mut cpu = vec![x];
+        for l in [&wq, &wk, &wv, &wo, &gate, &up, &down] {
+            cpu.push(l.weight.to_vec_flushed(device, cache));
+            cpu.push(l.bias.to_vec_flushed(device, cache));
+        }
+        let half = head_dim / 2;
+        cpu.push(rope.cos_table.to_vec_flushed(device, cache)[..seq * half].to_vec());
+        cpu.push(rope.sin_table.to_vec_flushed(device, cache)[..seq * half].to_vec());
+        cpu.push(causal_mask(seq));
+        Params {
+            ln1: GpuRMSNorm::new(device, d_model, 1e-6),
+            ln2: GpuRMSNorm::new(device, d_model, 1e-6),
+            wq,
+            wk,
+            wv,
+            wo,
+            gate,
+            up,
+            down,
+            rope,
+            dims,
+            cpu,
+        }
+    }
+
+    pub struct HandNodes {
+        pub normed: GpuTensor,
+        pub q: GpuTensor,
+        pub qr: GpuTensor,
+        pub attn: GpuTensor,
+        pub proj: GpuTensor,
+        pub out: GpuTensor,
+    }
+
+    /// The hand-written prefill path from `gpu_inference`, without the KV cache.
+    pub fn hand_forward(
+        device: &GpuDevice,
+        cache: &mut KernelCache,
+        p: &Params,
+        input: &GpuTensor,
+    ) -> GpuTensor {
+        hand_forward_nodes(device, cache, p, input).out
+    }
+
+    pub fn hand_forward_nodes(
+        device: &GpuDevice,
+        cache: &mut KernelCache,
+        p: &Params,
+        input: &GpuTensor,
+    ) -> HandNodes {
+        let d = &p.dims;
+        let linear = |cache: &mut KernelCache, l: &GpuLinear, x: &GpuTensor| {
+            let wt = l.weight.transpose_gpu(device, cache);
+            let out = matmul::matmul(device, cache, x, &wt);
+            bias_add(device, cache, &out, &l.bias)
+        };
+        let normed = p.ln1.forward(device, cache, input);
+        let q = linear(cache, &p.wq, &normed);
+        let k = linear(cache, &p.wk, &normed);
+        let v = linear(cache, &p.wv, &normed);
+        let q3 = q
+            .clone_gpu_batched(device, cache)
+            .reshape(&[d.seq, d.n_heads, d.head_dim]);
+        let k3 = k.reshape(&[d.seq, d.n_kv_heads, d.head_dim]);
+        let qr = p.rope.forward(device, cache, &q3, 0);
+        let kr = p.rope.forward(device, cache, &k3, 0);
+        let q_flat = qr.reshape(&[d.seq, d.n_heads * d.head_dim]);
+        let k_flat = kr.reshape(&[d.seq, d.n_kv_heads * d.head_dim]);
+        let attn = kv_attention_fused(
+            device,
+            cache,
+            &q_flat,
+            &k_flat,
+            &v,
+            d.seq,
+            d.seq,
+            d.n_heads,
+            d.n_kv_heads,
+            d.head_dim,
+            0,
+        );
+        let proj = linear(cache, &p.wo, &attn);
+        let res1 = add_tensors(device, cache, input, &proj);
+        let normed2 = p.ln2.forward(device, cache, &res1);
+        let gate = linear(cache, &p.gate, &normed2);
+        let up = linear(cache, &p.up, &normed2);
+        let act = swiglu_fused_pub(device, cache, &gate, &up);
+        let ffn = linear(cache, &p.down, &act);
+        let out = add_tensors(device, cache, &res1, &ffn);
+        HandNodes {
+            normed,
+            q,
+            qr: q_flat,
+            attn,
+            proj,
+            out,
+        }
+    }
+
+    pub fn ir_executable(
+        device: &GpuDevice,
+        p: &Params,
+        scheduled: bool,
+    ) -> (Executable, tang_compile::tensor::TensorId) {
+        let (g, y) = if scheduled {
+            compiled_block(&p.dims)
+        } else {
+            let (g, y) = transformer_block(&p.dims);
+            let (g, outs) = g.substitute_maps(&[y]);
+            (g, outs[0])
+        };
+        let inputs: Vec<&[f32]> = p.cpu.iter().map(|v| v.as_slice()).collect();
+        (Executable::new(device, g.to_wgsl(&[y]), &inputs), y)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Each hand-written stage against a plain CPU implementation.
+        #[test]
+        fn hand_block_pieces_vs_cpu() {
+            let Ok(device) = GpuDevice::new_sync() else {
+                eprintln!("no GPU, skipping");
+                return;
+            };
+            let mut cache = KernelCache::new();
+            let (seq, heads, kv_heads, hd) = (8usize, 6usize, 2usize, 32usize);
+            let mut rng = crate::Rng::new(3);
+            let q: Vec<f32> = (0..seq * heads * hd)
+                .map(|_| rng.f32() * 2.0 - 1.0)
+                .collect();
+            let k: Vec<f32> = (0..seq * kv_heads * hd)
+                .map(|_| rng.f32() * 2.0 - 1.0)
+                .collect();
+            let v: Vec<f32> = (0..seq * kv_heads * hd)
+                .map(|_| rng.f32() * 2.0 - 1.0)
+                .collect();
+            let rope = GpuInterleavedRoPE::new(&device, hd, 64, 10000.0);
+            let cos = rope.cos_table.to_vec_flushed(&device, &mut cache);
+            let sin = rope.sin_table.to_vec_flushed(&device, &mut cache);
+            let half = hd / 2;
+
+            // rope
+            let q3 = GpuTensor::from_slice(&device, &q, &[seq, heads, hd]);
+            let qr = rope
+                .forward(&device, &mut cache, &q3, 0)
+                .to_vec_flushed(&device, &mut cache);
+            let mut qr_cpu = vec![0.0f32; q.len()];
+            for s in 0..seq {
+                for h in 0..heads {
+                    for i in 0..half {
+                        let b = (s * heads + h) * hd;
+                        let (c, sn) = (cos[s * half + i], sin[s * half + i]);
+                        qr_cpu[b + 2 * i] = q[b + 2 * i] * c - q[b + 2 * i + 1] * sn;
+                        qr_cpu[b + 2 * i + 1] = q[b + 2 * i] * sn + q[b + 2 * i + 1] * c;
+                    }
+                }
+            }
+            let err = qr
+                .iter()
+                .zip(&qr_cpu)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+            eprintln!("hand rope max err {err}");
+            assert!(err < 1e-4, "hand rope");
+
+            // gqa causal attention on unrotated q/k
+            let qt = GpuTensor::from_slice(&device, &q, &[seq, heads * hd]);
+            let kt = GpuTensor::from_slice(&device, &k, &[seq, kv_heads * hd]);
+            let vt = GpuTensor::from_slice(&device, &v, &[seq, kv_heads * hd]);
+            let attn = kv_attention_fused(
+                &device, &mut cache, &qt, &kt, &vt, seq, seq, heads, kv_heads, hd, 0,
+            )
+            .to_vec_flushed(&device, &mut cache);
+            let per_group = heads / kv_heads;
+            let scale = 1.0 / (hd as f32).sqrt();
+            let mut attn_cpu = vec![0.0f32; seq * heads * hd];
+            for i in 0..seq {
+                for h in 0..heads {
+                    let g = h / per_group;
+                    let sc: Vec<f32> = (0..=i)
+                        .map(|j| {
+                            (0..hd)
+                                .map(|d| {
+                                    q[i * heads * hd + h * hd + d]
+                                        * k[j * kv_heads * hd + g * hd + d]
+                                })
+                                .sum::<f32>()
+                                * scale
+                        })
+                        .collect();
+                    let m = sc.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let w: Vec<f32> = sc.iter().map(|s| (s - m).exp()).collect();
+                    let l: f32 = w.iter().sum();
+                    for d in 0..hd {
+                        attn_cpu[i * heads * hd + h * hd + d] = (0..=i)
+                            .map(|j| w[j] * v[j * kv_heads * hd + g * hd + d])
+                            .sum::<f32>()
+                            / l;
+                    }
+                }
+            }
+            let (err, at) = attn
+                .iter()
+                .zip(&attn_cpu)
+                .enumerate()
+                .map(|(i, (a, b))| ((a - b).abs(), i))
+                .fold((0.0, 0), |m, x| if x.0 > m.0 { x } else { m });
+            eprintln!(
+                "hand gqa attention max err {err} at {at} (row {}, head {})",
+                at / (heads * hd),
+                (at % (heads * hd)) / hd
+            );
+            assert!(err < 1e-4, "hand gqa attention");
+        }
+
+        /// Stage-by-stage: hand GPU intermediates vs the f64 interpreter.
+        #[test]
+        fn hand_block_stages_vs_f64() {
+            let Ok(device) = GpuDevice::new_sync() else {
+                eprintln!("no GPU, skipping");
+                return;
+            };
+            let mut cache = KernelCache::new();
+            let dims = BlockDims {
+                seq: 12,
+                d_model: 96,
+                n_heads: 6,
+                n_kv_heads: 2,
+                head_dim: 16,
+                ff_dim: 64,
+            };
+            let mut rng = crate::Rng::new(11);
+            let x: Vec<f32> = (0..dims.seq * dims.d_model)
+                .map(|_| rng.f32() * 2.0 - 1.0)
+                .collect();
+            let input = GpuTensor::from_slice(&device, &x, &[dims.seq, dims.d_model]);
+            let p = params(&device, &mut cache, dims, x);
+            let h = hand_forward_nodes(&device, &mut cache, &p, &input);
+            let (g, n) = super::super::ir_block::transformer_block_nodes(&p.dims);
+            let f64_inputs: Vec<Vec<f64>> = p
+                .cpu
+                .iter()
+                .map(|v| v.iter().map(|x| *x as f64).collect())
+                .collect();
+            let cpu = g.eval(&f64_inputs, &[n.normed, n.q, n.qe, n.attn, n.proj, n.out]);
+            let d = &p.dims;
+            let err = |a: &[f32], b: &[f64]| {
+                a.iter()
+                    .zip(b)
+                    .map(|(a, b)| (a - *b as f32).abs())
+                    .fold(0.0f32, f32::max)
+            };
+            eprintln!(
+                "normed err {}",
+                err(&h.normed.to_vec_flushed(&device, &mut cache), &cpu[0])
+            );
+            eprintln!(
+                "q err {}",
+                err(&h.q.to_vec_flushed(&device, &mut cache), &cpu[1])
+            );
+            let qr = h.qr.to_vec_flushed(&device, &mut cache);
+            let scale = 1.0 / (d.head_dim as f32).sqrt();
+            let half = d.head_dim / 2;
+            let mut qe_hand = vec![0.0f32; d.seq * d.n_heads * half];
+            for s in 0..d.seq {
+                for hh in 0..d.n_heads {
+                    for i in 0..half {
+                        qe_hand[(s * d.n_heads + hh) * half + i] =
+                            qr[s * d.n_heads * d.head_dim + hh * d.head_dim + 2 * i] * scale;
+                    }
+                }
+            }
+            eprintln!("qe err {}", err(&qe_hand, &cpu[2]));
+            // rope formula on the CPU, applied to the hand's own q with the hand's table
+            let q_hand = h.q.to_vec_flushed(&device, &mut cache);
+            let (cos, sin) = (&p.cpu[15], &p.cpu[16]);
+            let mut qr_cpu = vec![0.0f32; q_hand.len()];
+            for s in 0..d.seq {
+                for hh in 0..d.n_heads {
+                    for i in 0..half {
+                        let b = s * d.n_heads * d.head_dim + hh * d.head_dim;
+                        let (c, sn) = (cos[s * half + i], sin[s * half + i]);
+                        qr_cpu[b + 2 * i] = q_hand[b + 2 * i] * c - q_hand[b + 2 * i + 1] * sn;
+                        qr_cpu[b + 2 * i + 1] = q_hand[b + 2 * i] * sn + q_hand[b + 2 * i + 1] * c;
+                    }
+                }
+            }
+            let (e, at) = qr
+                .iter()
+                .zip(&qr_cpu)
+                .enumerate()
+                .map(|(i, (a, b))| ((a - b).abs(), i))
+                .fold((0.0f32, 0), |m, x| if x.0 > m.0 { x } else { m });
+            eprintln!(
+                "hand qr vs cpu rope(hand q): err {e} at {at} (row {}): gpu {} cpu {}",
+                at / (d.n_heads * d.head_dim),
+                qr[at],
+                qr_cpu[at]
+            );
+            let attn = h.attn.to_vec_flushed(&device, &mut cache);
+            let per = d.n_heads / d.n_kv_heads;
+            let mut attn_ir = vec![0.0f64; attn.len()];
+            for g_ in 0..d.n_kv_heads {
+                for r in 0..per {
+                    for s in 0..d.seq {
+                        for c in 0..d.head_dim {
+                            let src = ((g_ * per + r) * d.seq + s) * d.head_dim + c;
+                            attn_ir[s * d.n_heads * d.head_dim + (g_ * per + r) * d.head_dim + c] =
+                                cpu[3][src];
+                        }
+                    }
+                }
+            }
+            let (e, at) = attn
+                .iter()
+                .zip(&attn_ir)
+                .enumerate()
+                .map(|(i, (a, b))| ((a - *b as f32).abs(), i))
+                .fold((0.0f32, 0), |m, x| if x.0 > m.0 { x } else { m });
+            eprintln!(
+                "attn err {e} at {at} (row {}, head {})",
+                at / (d.n_heads * d.head_dim),
+                (at % (d.n_heads * d.head_dim)) / d.head_dim
+            );
+            eprintln!(
+                "proj err {}",
+                err(&h.proj.to_vec_flushed(&device, &mut cache), &cpu[4])
+            );
+            eprintln!(
+                "out err {}",
+                err(&h.out.to_vec_flushed(&device, &mut cache), &cpu[5])
+            );
+        }
+
+        #[test]
+        fn derived_block_matches_hand_block_on_gpu() {
+            let Ok(device) = GpuDevice::new_sync() else {
+                eprintln!("no GPU, skipping");
+                return;
+            };
+            let mut cache = KernelCache::new();
+            let dims = BlockDims {
+                seq: 24,
+                d_model: 192,
+                n_heads: 6,
+                n_kv_heads: 2,
+                head_dim: 32,
+                ff_dim: 256,
+            };
+            let mut rng = crate::Rng::new(9);
+            let x: Vec<f32> = (0..dims.seq * dims.d_model)
+                .map(|_| rng.f32() * 2.0 - 1.0)
+                .collect();
+            let input = GpuTensor::from_slice(&device, &x, &[dims.seq, dims.d_model]);
+            let p = params(&device, &mut cache, dims, x);
+            let want =
+                hand_forward(&device, &mut cache, &p, &input).to_vec_flushed(&device, &mut cache);
+            // f64 reference from the interpreter on the unscheduled graph
+            let (g, y) = transformer_block(&p.dims);
+            let f64_inputs: Vec<Vec<f64>> = p
+                .cpu
+                .iter()
+                .map(|v| v.iter().map(|x| *x as f64).collect())
+                .collect();
+            let cpu = g.eval(&f64_inputs, &[y]).remove(0);
+            let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let worst = |got: &[f32]| {
+                got.iter()
+                    .zip(&cpu)
+                    .enumerate()
+                    .map(|(i, (a, b))| ((a - *b as f32).abs(), i))
+                    .fold((0.0f32, 0usize), |m, x| if x.0 > m.0 { x } else { m })
+            };
+            let (hand_err, hand_i) = worst(&want);
+            eprintln!("hand vs f64: max err {hand_err} at {hand_i} (scale {scale})");
+            for scheduled in [false, true] {
+                let (exe, y) = ir_executable(&device, &p, scheduled);
+                exe.run(&device, &mut cache);
+                cache.flush(&device);
+                let got = exe.read(&device, y);
+                assert_eq!(got.len(), want.len());
+                let (ir_err, ir_i) = worst(&got);
+                eprintln!("ir(scheduled={scheduled}) vs f64: max err {ir_err} at {ir_i}");
+                assert!(
+                    ir_err < 2e-3 * scale.max(1.0),
+                    "ir diverges from f64 reference"
+                );
+            }
+            assert!(
+                hand_err < 2e-3 * scale.max(1.0),
+                "hand diverges from f64 reference"
+            );
         }
     }
 }

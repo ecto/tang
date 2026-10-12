@@ -470,6 +470,11 @@ impl TensorGraph {
 
     /// The general op. `f` receives one scalar per arg and returns the
     /// per-point values (`monoid.width` of them when reducing).
+    ///
+    /// `f` runs inside a fresh `tang_expr` trace: every literal
+    /// (`ExprId::from_f64`) and operation must be created *inside* the
+    /// closure. An `ExprId` made outside refers to some other graph and
+    /// silently means the wrong node.
     pub fn comp<D: Into<Dim> + Copy>(
         &mut self,
         out: &[D],
@@ -1277,16 +1282,32 @@ impl TensorGraph {
                     .is_some_and(|c| c.monoid.is_some() && numel(&c.red) >= 64)
             })
             .collect();
+        let uses = self.use_counts(outputs, &live);
+        let is_output = |i: usize| outputs.iter().any(|o| o.n() == i);
         for i in reductions {
             let c = self.comp_at(i).unwrap();
             let pts = fixed(c.points());
-            let lanes = pts.iter().rev().find(|&&n| n > 1).copied().unwrap_or(1);
+            let lane_dim = (0..pts.len()).rev().find(|&d| pts[d] > 1);
+            let lanes = lane_dim.map_or(1, |d| pts[d]);
             let rows = pts.iter().rev().filter(|&&n| n > 1).nth(1).is_some();
             if c.red.len() == 1 && (LANES..=256).contains(&lanes) && rows {
-                // a lane axis: rows × lanes per workgroup, shared reads and
-                // shared sub-computations staged cooperatively
+                // A lane axis: rows × lanes per workgroup, shared reads and
+                // shared sub-computations staged cooperatively. Producers
+                // the lanes do not depend on are inlined too: the tile
+                // computes them once per workgroup instead of per lane.
                 let by = (256 / lanes).max(1) as u32;
+                let lane = lane_dim.unwrap();
+                let shared: Vec<usize> = c
+                    .args
+                    .iter()
+                    .filter(|a| !a.view.depends_on(lane) && uses[a.src.n()] == 1)
+                    .map(|a| a.src.n())
+                    .filter(|&p| !is_output(p) && self.comp_at(p).is_some())
+                    .collect();
                 self.nodes[i].tile = (lanes as u32, by, 32);
+                for p in shared {
+                    self.nodes[p].inline = true;
+                }
             } else if pts.iter().product::<usize>() < MANY_POINTS {
                 self.nodes[i].split = 256;
             }
