@@ -432,7 +432,18 @@ impl Ctx<'_> {
                 let pk = src_shape.len() - self.tuple_rank(a.src.n());
                 let slot = flat(&cs[pk..], &src_shape[pk..]);
                 let v = self.expand(out, a.src.n(), &cs);
-                v.slot(&slot)
+                let v = v.slot(&slot);
+                if !a.view.guard || self.collect {
+                    return v;
+                }
+                // zero padding: the (possibly wrapped) read is discarded
+                let cond = cs
+                    .iter()
+                    .zip(&src_shape)
+                    .map(|(c, n)| format!("({} < {n}u)", c.wgsl()))
+                    .collect::<Vec<_>>()
+                    .join(" && ");
+                format!("select(0.0, {v}, {cond})")
             })
             .collect()
     }

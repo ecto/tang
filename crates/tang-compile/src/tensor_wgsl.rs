@@ -236,7 +236,7 @@ impl TensorGraph {
         emit_step(
             &mut s,
             "        ",
-            &format!("body_{root}({})", arg_reads(c)),
+            &format!("body_{root}({})", arg_reads(self, c)),
             m,
         );
         writeln!(s, "    }}").unwrap();
@@ -348,7 +348,7 @@ impl TensorGraph {
             .collect::<Vec<_>>()
             .join(", ");
         writeln!(s, "fn point_{j}({params}) -> array<f32, {w}> {{").unwrap();
-        let reads = arg_reads(c);
+        let reads = arg_reads(self, c);
         let Some(m) = &c.monoid else {
             writeln!(s, "    return body_{j}({reads});").unwrap();
             writeln!(s, "}}\n").unwrap();
@@ -456,7 +456,7 @@ pub(super) fn identity(m: &Monoid) -> String {
 }
 
 /// `read_src(view(p…, r…))` for every arg, as call arguments.
-fn arg_reads(c: &Comp) -> String {
+fn arg_reads(g: &TensorGraph, c: &Comp) -> String {
     let k = c.points().len();
     let coord_name = |d: usize| {
         if d < k {
@@ -468,7 +468,7 @@ fn arg_reads(c: &Comp) -> String {
     c.args
         .iter()
         .map(|a| {
-            let idx: Vec<String> = a
+            let signed: Vec<String> = a
                 .view
                 .forms
                 .iter()
@@ -479,10 +479,24 @@ fn arg_reads(c: &Comp) -> String {
                             terms.push(format!("{coef} * i32({})", coord_name(d)));
                         }
                     }
-                    format!("u32({})", terms.join(" + "))
+                    format!("({})", terms.join(" + "))
                 })
                 .collect();
-            format!("read_{}({})", a.src.n(), idx.join(", "))
+            let idx: Vec<String> = signed.iter().map(|e| format!("u32({e})")).collect();
+            let read = format!("read_{}({})", a.src.n(), idx.join(", "));
+            if !a.view.guard {
+                return read;
+            }
+            // zero padding: the read itself may wrap (robust buffer
+            // access keeps it in bounds); the select discards it
+            let shape = fixed(&g.nodes[a.src.n()].shape);
+            let cond = signed
+                .iter()
+                .zip(&shape)
+                .map(|(e, n)| format!("(u32({e}) < {n}u)"))
+                .collect::<Vec<_>>()
+                .join(" && ");
+            format!("select(0.0, {read}, {cond})")
         })
         .collect::<Vec<_>>()
         .join(", ")

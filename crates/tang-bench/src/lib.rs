@@ -661,6 +661,7 @@ pub mod ir_gpu {
         let v = g.input(&[n]);
         let bc = g.input(&[2]);
         let bc_view = |k: i64| View {
+            guard: false,
             forms: vec![Form {
                 coefs: vec![0],
                 offset: k,
@@ -1080,6 +1081,7 @@ pub mod ir_block {
             Arg {
                 src: b,
                 view: View {
+                    guard: false,
                     forms: vec![unit(rank, 1)],
                 },
             },
@@ -1123,9 +1125,11 @@ pub mod ir_block {
         // which is what makes the block differentiable through rope.
         let x = g.reshape(x, &[seq, heads, half, 2]).unwrap();
         let xv = |parity: i64| View {
+            guard: false,
             forms: vec![unit(3, 0), unit(3, 1), unit(3, 2), form(3, &[], parity)],
         };
         let tv = View {
+            guard: false,
             forms: vec![unit(3, 0), unit(3, 2)],
         };
         if !rope {
@@ -1247,6 +1251,7 @@ pub mod ir_block {
                 let k4 = g.reshape(k_cache, &[kv_len, n_kv_heads, half, 2]).unwrap();
                 let halves = [0i64, 1].map(|parity| {
                     let view = View {
+                        guard: false,
                         forms: vec![unit(3, 0), unit(3, 1), unit(3, 2), form(3, &[], parity)],
                     };
                     g.comp(
@@ -1275,9 +1280,11 @@ pub mod ir_block {
         let qe = g.reshape(qe, &[seq, groups, per_group, half]).unwrap();
         let qo = g.reshape(qo, &[seq, groups, per_group, half]).unwrap();
         let qv = View {
+            guard: false,
             forms: vec![unit(r5, 2), unit(r5, 0), unit(r5, 1), unit(r5, 4)],
         };
         let kv = View {
+            guard: false,
             forms: vec![unit(r5, 3), unit(r5, 0), unit(r5, 4)],
         };
         let s_out = [groups, per_group, seq, kv_len];
@@ -1315,6 +1322,7 @@ pub mod ir_block {
                     Arg {
                         src: mask,
                         view: View {
+                            guard: false,
                             forms: vec![unit(r4, 2), unit(r4, 3)],
                         },
                     },
@@ -1338,12 +1346,14 @@ pub mod ir_block {
                     Arg {
                         src: p,
                         view: View {
+                            guard: false,
                             forms: vec![unit(5, 0), unit(5, 1), unit(5, 2), unit(5, 4)],
                         },
                     },
                     Arg {
                         src: v3,
                         view: View {
+                            guard: false,
                             forms: vec![unit(5, 4), unit(5, 0), unit(5, 3)],
                         },
                     },
@@ -1359,6 +1369,7 @@ pub mod ir_block {
                 vec![Arg {
                     src: l,
                     view: View {
+                        guard: false,
                         forms: vec![
                             unit(4, 0),
                             unit(4, 1),
@@ -1389,12 +1400,14 @@ pub mod ir_block {
                     Arg {
                         src: y,
                         view: View {
+                            guard: false,
                             forms: vec![unit(5, 2), unit(5, 3), unit(5, 0), unit(5, 4)],
                         },
                     },
                     Arg {
                         src: wo4,
                         view: View {
+                            guard: false,
                             forms: vec![unit(5, 1), unit(5, 2), unit(5, 3), unit(5, 4)],
                         },
                     },
@@ -1447,6 +1460,7 @@ pub mod ir_block {
                 Arg {
                     src: b,
                     view: View {
+                        guard: false,
                         forms: vec![unit(2, 1)],
                     },
                 },
