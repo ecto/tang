@@ -673,3 +673,92 @@ the fast kernels (flash attention, register-tiled matmul, sequence
 parallelism) from the algebra, with no op-specific code, and picks per
 chip. It does not yet generate the instruction-level quality of a vendor
 library, and through this backend it cannot reach tensor cores at all.
+
+## Kokoro-shaped ops (M4 Max, Metal, kernel-only)
+
+TTS vocoder ops (Kokoro's iSTFTNet decoder, Vocos-style ConvNeXt) derived
+from the IR, against PyTorch 2.14.1 on MPS. Both sides: fp32, 5 warmups,
+50 launches, one sync (`examples/kokoro_ops.rs`,
+`scripts/torch_kokoro_ops.py`). Every IR output is checked against a
+straightforward f64 CPU reference (max error / max |ref| ≤ 1e-5, all ops
+pass at 1e-6–1e-5); forward+backward is checked on a small instance
+against the f64 interpreter (≤ 2e-7).
+
+These ops need zero padding, so this branch adds **guarded views**: a
+`View` with `guard: true` may read outside its source and gets 0 there.
+Same-padded and dilated convs, the polyphase upsampler and the iSTFT
+overlap-add are all guarded views; nothing op-specific was added. The
+backward of a guarded read eliminates an out coordinate (`t = τ − 3k + 9`)
+instead of scattering, so `dx` of a conv is a gather with a guarded `dy`
+read, not a reduction over all of `t`.
+
+| op | IR best (ms) | algebra / schedule | MPS (ms) | IR / MPS |
+|---|---:|---|---:|---:|
+| a conv1d 512→512 k7 d3, T 2000 | 2.926 | im2col / auto (2 kernels) | 0.850 | 3.4× slower |
+| b upsample 512→256 k20 s10, T 2000 → 20000 | 3.544 | unfold + per-phase bmm / autotune (3) | 24.414 `conv_transpose1d` · 1.173 polyphase `conv1d` | 6.9× faster · 3.0× slower |
+| c iSTFT n_fft 20 hop 5, 4000 frames | 0.085 | DFT inlined into OLA / autotune (1) | 0.493 `torch.istft` · 0.197 irfft+fold | 5.8× faster · 2.3× faster |
+| d conv (a) + bias + snake | 3.021 | im2col / auto (3) | 0.889 | 3.4× slower |
+| e AdaIN C 512 T 2000, style 128 | 0.214 | auto (6) | 0.440 | 2.1× faster |
+| f ConvNeXt block C 512 T 200 F 1536 | 0.571 | auto (9) | 0.408 | 1.4× slower |
+| a fwd+bwd (dx, dw) | 6.137 | im2col / auto (5) | 2.232 | 2.7× slower |
+| f fwd+bwd (all 9 params) | 1.606 | auto (30) | 1.038 | 1.5× slower |
+
+Full per-schedule run (naive / `schedule_auto` / per-kernel autotune):
+
+| op | algebra | naive | auto | autotune |
+|---|---|---:|---:|---:|
+| a | direct conv (1 kernel) | 12.32 | 12.69 | 12.40 |
+| a | im2col | 34.31 | 2.93 | 2.95 |
+| b | direct polyphase (1 kernel) | 15.63 | 15.73 | 16.40 |
+| b | unfold + bmm + transpose | 21.52 | 3.55 | 3.54 |
+| c | DFT + OLA | 0.107 | 0.086 | 0.085 |
+| d | direct + snake map | 12.92 | 12.88 | 12.96 |
+| d | direct, conv inlined under snake (1 kernel) | 12.36 | | |
+| d | im2col + snake map | 35.05 | 3.02 | 3.06 |
+| e | | 0.452 | 0.214 | 0.447 |
+| f | | 1.178 | 0.571 | 0.876 |
+| a fwd+bwd | direct | 44.68 | 44.03 | 44.28 |
+| a fwd+bwd | im2col | 74.16 | 6.14 | 6.17 |
+| f fwd+bwd | | 4.94 | 1.61 | 2.06 |
+
+Notes, including where the IR loses and why:
+
+- **Convs lose 3.4× because the tiled emitter handles one reduce dim.** A
+  direct conv reduces over `(c, k)`; `tile_kernel` stages and register-tiles
+  only `red.len() == 1`, so the direct algebra runs one thread per point
+  with no reuse (12.3 ms). im2col rewrites it into a single-reduce matmul
+  over `c·k` and gets the 16×16 / 4×4 register tile (2.9 ms), paying a
+  28 MB unfold buffer and a second launch. MPS's conv is 0.85 ms
+  (~8.6 TFLOP/s). Tiling a multi-dim reduction (or flattening `(c, k)`
+  with an affine guarded read per tap) is the missing piece.
+- **Epilogues don't fuse into tiled reductions.** snake costs only
+  ~0.1 ms as its own map, but "one kernel" is only reachable by inlining
+  the conv under the map, which forces the untiled direct schedule
+  (12.4 ms). Fusing an elementwise epilogue into the tiled kernel's
+  write-out would make (d) = (a).
+- **The upsample.** `conv_transpose1d` on MPS takes a 24 ms slow path; the
+  same math as a polyphase conv1d (2 taps, 2560 output channels) is
+  1.17 ms there. The IR's direct polyphase comp (reduce over `(j, c)`) hits
+  the same one-reduce-dim wall (15.6 ms); unfold + one matmul per phase
+  is 3.5 ms. The IR computes `conv_transpose1d(p = 0)` cropped to 20000
+  samples — identical FLOPs to `p = 5`, offset by 5 samples (a `p = 5`
+  form needs a third tap or a guarded weight read).
+- **iSTFT wins** because `schedule_auto` inlines the 11-bin inverse DFT
+  into the overlap-add (each output sample recomputes its 4 frames), so
+  the whole head is one launch with no frame buffer. `torch.istft` is
+  several kernels (complex polar, irfft, window, fold, envelope divide).
+- **AdaIN wins** on launch structure: the stats are reductions and
+  everything elementwise splices into one map.
+- **ConvNeXt at T = 200 is launch-bound** (9 kernels forward, 30 for
+  forward+backward; the two pointwise matmuls are only 0.3 GFLOP each).
+  LayerNorm's mean and variance are separate reductions over C, each
+  re-reading the depthwise conv output.
+- **Autotune ≥ auto here, sometimes worse** (AdaIN 0.45 vs 0.21 ms,
+  ConvNeXt 0.88 vs 0.57). It times each kernel in isolation for 10
+  launches with the rest of the program cold; on these sub-0.1 ms kernels
+  that measurement is noise-dominated. The tuner should time in program
+  context and with more launches.
+- Guarded reads of a map keep that map materialized (`f(0) ≠ 0` in
+  general), so a conv over `snake(adain(x))` would read a buffer, not
+  splice. Splicing is valid whenever the map is zero on zero input
+  (snake is); not done yet.
