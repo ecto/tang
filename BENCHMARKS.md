@@ -692,55 +692,95 @@ backward of a guarded read eliminates an out coordinate (`t = τ − 3k + 9`)
 instead of scattering, so `dx` of a conv is a gather with a guarded `dy`
 read, not a reduction over all of `t`.
 
-| op | IR best (ms) | algebra / schedule | MPS (ms) | IR / MPS |
-|---|---:|---|---:|---:|
-| a conv1d 512→512 k7 d3, T 2000 | 2.926 | im2col / auto (2 kernels) | 0.850 | 3.4× slower |
-| b upsample 512→256 k20 s10, T 2000 → 20000 | 3.544 | unfold + per-phase bmm / autotune (3) | 24.414 `conv_transpose1d` · 1.173 polyphase `conv1d` | 6.9× faster · 3.0× slower |
-| c iSTFT n_fft 20 hop 5, 4000 frames | 0.085 | DFT inlined into OLA / autotune (1) | 0.493 `torch.istft` · 0.197 irfft+fold | 5.8× faster · 2.3× faster |
-| d conv (a) + bias + snake | 3.021 | im2col / auto (3) | 0.889 | 3.4× slower |
-| e AdaIN C 512 T 2000, style 128 | 0.214 | auto (6) | 0.440 | 2.1× faster |
-| f ConvNeXt block C 512 T 200 F 1536 | 0.571 | auto (9) | 0.408 | 1.4× slower |
-| a fwd+bwd (dx, dw) | 6.137 | im2col / auto (5) | 2.232 | 2.7× slower |
-| f fwd+bwd (all 9 params) | 1.606 | auto (30) | 1.038 | 1.5× slower |
+Before = the first cut of this section (single-reduce tiler, im2col for
+convs); after = multi-dim tiled reductions + epilogue fusion (below). MPS
+rerun alongside the "after" column; it moved between runs (a 0.85→0.71,
+f 0.41→0.24 ms), so both are listed. The M4 was noisy on later runs (a
+direct/auto 2.43 vs 3.10 ms back to back); the table takes the best of
+three full runs.
 
-Full per-schedule run (naive / `schedule_auto` / per-kernel autotune):
+| op | before (ms) | after (ms) | after: algebra / schedule | MPS (ms) then · now | after / MPS now |
+|---|---:|---:|---|---:|---:|
+| a conv1d 512→512 k7 d3, T 2000 | 2.926 im2col | **2.408** | direct / autotune (1 kernel) | 0.850 · 0.712 | 3.4× slower |
+| b upsample 512→256 k20 s10, T 2000 → 20000 | 3.544 | 3.381 | unfold + bmm / auto (3); direct polyphase now 3.64 (1) | polyphase conv1d 1.173 · 1.176 | 2.9× slower |
+| c iSTFT n_fft 20 hop 5, 4000 frames | 0.085 | 0.052 | DFT inlined into OLA / auto (1) | irfft+fold 0.197 · 0.111 | 2.1× faster |
+| d conv (a) + bias + snake | 3.021 im2col | **2.421** | direct, snake as tiled epilogue / autotune (**1 kernel**) | 0.889 · 0.813 | 3.0× slower |
+| e AdaIN C 512 T 2000, style 128 | 0.214 | 0.213 | auto (6) | 0.440 · 0.233 | 1.1× faster |
+| f ConvNeXt block C 512 T 200 F 1536 | 0.571 | 0.544 | auto (8: residual epilogue fused) | 0.408 · 0.244 | 2.2× slower |
+| a fwd+bwd (dx, dw) | 6.137 im2col | 6.173 im2col · 7.003 direct | im2col / auto (5) | 2.232 · 2.169 | 2.8× slower |
+| f fwd+bwd (all 9 params) | 1.606 | 1.591 | auto (30) | 1.038 · 0.982 | 1.6× slower |
 
-| op | algebra | naive | auto | autotune |
-|---|---|---:|---:|---:|
-| a | direct conv (1 kernel) | 12.32 | 12.69 | 12.40 |
-| a | im2col | 34.31 | 2.93 | 2.95 |
-| b | direct polyphase (1 kernel) | 15.63 | 15.73 | 16.40 |
-| b | unfold + bmm + transpose | 21.52 | 3.55 | 3.54 |
-| c | DFT + OLA | 0.107 | 0.086 | 0.085 |
-| d | direct + snake map | 12.92 | 12.88 | 12.96 |
-| d | direct, conv inlined under snake (1 kernel) | 12.36 | | |
-| d | im2col + snake map | 35.05 | 3.02 | 3.06 |
-| e | | 0.452 | 0.214 | 0.447 |
-| f | | 1.178 | 0.571 | 0.876 |
-| a fwd+bwd | direct | 44.68 | 44.03 | 44.28 |
-| a fwd+bwd | im2col | 74.16 | 6.14 | 6.17 |
-| f fwd+bwd | | 4.94 | 1.61 | 2.06 |
+Full per-schedule run, after (naive / `schedule_auto` / per-kernel autotune):
 
-Notes, including where the IR loses and why:
+| op | algebra | naive | auto | autotune | before: auto |
+|---|---|---:|---:|---:|---:|
+| a | direct conv (1 kernel) | 12.39 | **2.43** | **2.41** | 12.69 |
+| a | im2col | 34.34 | 2.96 | 2.95 | 2.93 |
+| b | direct polyphase (1 kernel) | 15.87 | 3.64 | 3.68 | 15.73 |
+| b | unfold + bmm + transpose | 20.91 | 3.38 | 3.40 | 3.55 |
+| c | DFT + OLA | 0.112 | 0.052 | 0.054 | 0.086 |
+| d | direct + snake (epilogue-fused: 1 kernel) | 12.57 | **2.46** | **2.42** | 12.88 (2 kernels) |
+| d | direct, conv inlined under snake (1 kernel, untiled) | 12.32 | | | 12.36 |
+| d | im2col + snake map | 34.33 | 2.95 | 2.94 | 3.02 |
+| e | | 0.437 | 0.213 | 0.442 | 0.214 |
+| f | | 1.20 | 0.544 | 0.608 | 0.571 |
+| a fwd+bwd | direct | 36.71 | 7.00 | 7.03 | 44.03 |
+| a fwd+bwd | im2col | 73.71 | 6.17 | 6.20 | 6.14 |
+| f fwd+bwd | | 4.20 | 1.59 | 1.67 | 1.61 |
 
-- **Convs lose 3.4× because the tiled emitter handles one reduce dim.** A
-  direct conv reduces over `(c, k)`; `tile_kernel` stages and register-tiles
-  only `red.len() == 1`, so the direct algebra runs one thread per point
-  with no reuse (12.3 ms). im2col rewrites it into a single-reduce matmul
-  over `c·k` and gets the 16×16 / 4×4 register tile (2.9 ms), paying a
-  28 MB unfold buffer and a second launch. MPS's conv is 0.85 ms
-  (~8.6 TFLOP/s). Tiling a multi-dim reduction (or flattening `(c, k)`
-  with an affine guarded read per tap) is the missing piece.
-- **Epilogues don't fuse into tiled reductions.** snake costs only
-  ~0.1 ms as its own map, but "one kernel" is only reachable by inlining
-  the conv under the map, which forces the untiled direct schedule
-  (12.4 ms). Fusing an elementwise epilogue into the tiled kernel's
-  write-out would make (d) = (a).
+What changed, and where the IR still loses:
+
+- **Multi-dim reductions tile.** `tile_kernel` now chunks the largest
+  reduce dim as `r0` and runs the others (`u{i}`: a conv's taps, the
+  polyphase `j`) as inner loops inside each chunk step — unrolled when
+  their product is ≤ 16, outside the register-tile copies so all 16
+  copies share one staged read per step. Staged regions just gain the
+  inner vars (they already supported them for nested comps).
+  `tileable_red` accepts any reduction whose non-chunked dims multiply to
+  ≤ 32. No conv-specific code: dx of the conv (`red = (o, k)`) and the
+  polyphase upsample (`red = (j, c)`) take the same path.
+- **Guards are applied when staging.** A guarded read used to stage the
+  (possibly wrapped) value and `select` at every use — 16 copies × 7 taps
+  of compares per step; 16.6 → 5.5 ms on its own. The region key now
+  carries the guard's source coords, so the zero padding happens once per
+  staged element.
+- **Occupancy, not staging, was the last 2×.** Inner dims multiply every
+  staged region (x: chunk·7·64, w: chunk·7·64). At chunk 8 that was 28 KiB
+  of workgroup memory — one workgroup per M4 core — and 5.0 ms; capping
+  staged memory at 16 KiB (chunk 4, also the WebGPU default limit) gives
+  2.4 ms. The cap applies to every tiled kernel, halving the chunk until
+  it fits.
+- **Narrow trailing point dims are uniform, not lanes.** `tile_axes` picks
+  the last two point dims ≥ 16 as the tile's x / y, so `dw[o, c, k]`
+  tiles over `(o, c)` with `k` per-workgroup (36 → 7 ms fwd+bwd) and the
+  polyphase `[o, q, r]` tiles over `(o, q)` with `r` uniform (15.6 →
+  3.6 ms).
+- **Epilogue fusion.** When a tiled reduction's only consumer is a map
+  over the same points (identity view, unguarded), `schedule_auto` moves
+  the tile schedule onto the map and inlines the reduction; the tiled
+  kernel evaluates the map at write-out. (d) is now one kernel at (a)'s
+  cost (2.42 vs 2.41 ms), and ConvNeXt's residual add fuses into the
+  second pointwise matmul (9 → 8 kernels). Autotune sees an epilogue map's
+  candidates as its reduction's tile candidates. A GELU epilogue measured
+  *slower* fused (block 0.60 vs 0.56 ms), so maps containing exp/log stay
+  separate — a measured rule, not a principled one.
+- **Still 3× behind MPS on convs.** 2.4 ms for 7.3 GFLOP is ~3 TFLOP/s;
+  MPS's 0.71 ms is ~10. The tile is the generic 16×16 threads × 4×4
+  registers with scalar f32 shared-memory reads; MPS uses simdgroup
+  matrix ops. The x region also stages each tap separately (`chunk·7·64`
+  floats where the sliding window needs `chunk·(64 + 18)`), which is what
+  forces chunk 4. A windowed region (merge an inner var into the offset
+  span when its coefficient is a multiple of a lane coefficient) and
+  `simdgroup_matrix`-style lowering are the next two steps.
+- **fwd+bwd of the conv: im2col still wins (6.2 vs 7.0 ms).** Both
+  gradients tile now, but `dw` re-stages `dy` for each of the 7 taps
+  (`k` is per-workgroup) and the guarded `x` read inside it is staged per
+  tap as above.
+
 - **The upsample.** `conv_transpose1d` on MPS takes a 24 ms slow path; the
   same math as a polyphase conv1d (2 taps, 2560 output channels) is
-  1.17 ms there. The IR's direct polyphase comp (reduce over `(j, c)`) hits
-  the same one-reduce-dim wall (15.6 ms); unfold + one matmul per phase
-  is 3.5 ms. The IR computes `conv_transpose1d(p = 0)` cropped to 20000
+  1.17 ms there. The IR's direct polyphase comp (reduce over `(j, c)`) now
+  tiles (3.6 ms, was 15.6); unfold + one matmul per phase is 3.4 ms. The IR computes `conv_transpose1d(p = 0)` cropped to 20000
   samples — identical FLOPs to `p = 5`, offset by 5 samples (a `p = 5`
   form needs a third tap or a guarded weight read).
 - **iSTFT wins** because `schedule_auto` inlines the 11-bin inverse DFT
