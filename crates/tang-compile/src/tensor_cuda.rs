@@ -1564,7 +1564,7 @@ impl TensorGraph {
         let (bj, kw) = (sh.bj, sh.kw);
         // keys per pipeline step, over all warp groups
         let bjs = bj * kw;
-        if bj % 8 != 0 || sh.stages < 2 || kw == 0 {
+        if !bj.is_multiple_of(8) || sh.stages < 2 || kw == 0 {
             return None;
         }
         let lead: usize = f.others.iter().map(|&d| f.pts[d]).product();
@@ -1593,7 +1593,7 @@ impl TensorGraph {
         // BI queries of each of the nf folded heads: R rows, 16 per warp
         #[allow(non_snake_case)]
         let (BI, R) = (bi, nf * bi);
-        if R % 16 != 0 {
+        if !R.is_multiple_of(16) {
             return None;
         }
         let row_warps = R / 16;
@@ -1688,7 +1688,7 @@ impl TensorGraph {
         let vec4 = |a: &Addr, inner: usize, extent: usize| {
             a.coefs[inner] == 1
                 && a.offset % 4 == 0
-                && extent % 4 == 0
+                && extent.is_multiple_of(4)
                 && a.coefs
                     .iter()
                     .enumerate()
