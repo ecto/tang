@@ -688,3 +688,57 @@ fn fragment_conv_backward() {
         assert!(windowed(&exe), "dx should be windowed");
     }
 }
+
+/// A matmul whose operand is an inlined map (ConvNeXt's second pointwise:
+/// `w2 · gelu(h + b1)`): the map is evaluated while staging and its value
+/// rounded to f16 in threadgroup memory. Ragged shapes, with the map on
+/// either side; checked against f64 at f16-operand tolerance (the
+/// emulator does not round inlined values).
+#[test]
+fn fragment_inlined_map_operand() {
+    let Some(dev) = dev() else { return };
+    let mut rng = tang_bench::Rng::new(34);
+    for &(m, k, n, map_on_b) in &[
+        (40, 96, 70, true),
+        (128, 200, 64, true),
+        (70, 33, 100, false),
+    ] {
+        let mut g = TensorGraph::new();
+        let (ws, hs) = if map_on_b {
+            ([m, k], [k, n])
+        } else {
+            ([k, n], [m, k])
+        };
+        let w = g.input(&ws);
+        let h = g.input(&hs);
+        let bias = g.input(&[1, 1]);
+        let bb = g.broadcast(bias, &hs).unwrap();
+        let act = g
+            .map(&[h, bb], |v| (v[0] + v[1]) * (v[0] + v[1]).sin())
+            .unwrap();
+        let c = if map_on_b {
+            g.matmul(w, act)
+        } else {
+            g.matmul(act, w)
+        }
+        .unwrap();
+        g.set_inline(act, true);
+        f16_operands(&mut g, &[w]);
+        assert!(g.fragment_plan(c).is_some(), "inlined map operand plan");
+        g.set_fragment(c, true);
+        let inputs = vec![
+            rand(g.shape(w).iter().map(|d| d.n()).product(), &mut rng),
+            rand(hs.iter().product(), &mut rng),
+            vec![0.25],
+        ];
+        // reference: f64 with the f16 weight
+        let want = g.eval_emulated(&f64s(&inputs), &[c]);
+        let exe = check(&dev, "frag inlined map", &g, &[c], &inputs, &want, 3e-3);
+        assert!(exe
+            .program
+            .kernels
+            .iter()
+            .any(|kk| kk.node == c && kk.fragment));
+        assert!(exe.program.kernels.iter().all(|kk| kk.node != act));
+    }
+}

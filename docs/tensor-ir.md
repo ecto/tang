@@ -195,7 +195,18 @@ surface syntax is rewritten to MSL. What changes:
   fragments straight from device memory on interior tiles; any other
   operand (a conv's guarded, dilated `x`) is gathered through its view
   into threadgroup `half` tiles, zero-padded at staging, and ragged edge
-  tiles stage both. The result tile goes through threadgroup memory,
+  tiles stage both. A conv-shaped operand — one reduce dim ("rows",
+  channels) read through its own forms, the free axis and every other
+  reduce dim ("taps") through one form `st·n + Σ coef·tap + …` — is
+  instead staged once per (row chunk, n tile) as one zero-padded
+  *window*, de-interleaved by stride phase, and each tap's fragments load
+  from it at a shifted offset (conv `x`, a polyphase upsample's `x`, conv
+  dx's `dy`). The other operand is then staged once per chunk for all
+  taps as tap planes. The body may be any `v_i · v_j` with further
+  unread args (gradients keep the product rule's dropped factor), and an
+  operand may be an inlined elementwise map, evaluated while staging and
+  rounded to f16 there (the emulator does not model that rounding).
+  The result tile goes through threadgroup memory,
   where the epilogue map runs before the write-out. Fragment geometry
   (`FragmentTarget`: fragment shape, SIMD width, threadgroup memory,
   tile) is data, so a CUDA `wmma` lowering can reuse the plan.
@@ -232,9 +243,8 @@ schedule space; the compiler searches it.
 ## Not yet
 
 - Fragments for attention (QKᵀ and PV under the online-softmax
-  schedule) and for operands that are inlined maps (ConvNeXt's
-  LayerNorm-normalized activation feeds its pointwise matmul through a
-  substituted map, so `fragment_plan` refuses it); a CUDA `wmma` emitter.
+  schedule); a CUDA `wmma` emitter. A polyphase upsample still re-stages
+  its weight per phase (the phase is a batch dim of the tile).
 - Body arithmetic in `half`. Storage and accumulators honour f16; scalar
   body math is f32 on every path.
 - Scatter gradients reduce over the whole source coordinate they gate on;
