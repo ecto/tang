@@ -32,6 +32,15 @@ compose by substitution and never touch memory. Because they are the only
 way a comprehension addresses its inputs, every layout decision is a view
 and every view is analyzable.
 
+A view can be *guarded*: a read outside the source returns 0 instead of
+being a shape error. That is zero padding as a view — same-padded and
+dilated convolutions, transposed (polyphase) convolutions and overlap-add
+are guarded reads. The guard follows the leaf read through composition;
+a map read through a guarded view stays materialized, since `f(0)` need
+not be 0. The gradient of a guarded read eliminates a coordinate rather
+than scattering: for `x[c, t + 3k − 9]`, `dx[c, τ]` reads `dy[o, τ − 3k + 9]`
+through a guard, so padding contributions never reach `x`.
+
 **Comprehensions.** The only compute op:
 
 ```

@@ -10,8 +10,13 @@
 //! cooperatively once per chunk. Attention stages its k/v tiles, matmul
 //! stages both its `a` and `b` tiles. Nothing here knows about either.
 //!
-//! Point coordinates `p{k-1}` (x) and `p{k-2}` (y) are tiled; any leading
-//! point dims are uniform across the workgroup.
+//! The tile's x / y axes are the last two point dims of at least 16
+//! (`tile_axes`); every other point dim is uniform across the workgroup.
+//!
+//! Multi-dim reductions (a conv's `(c, k)`) chunk their largest reduce dim
+//! as `r0` and unroll the small ones (`u{i}`) inside each chunk step;
+//! guarded reads are zero-padded when staged. A map root is an epilogue:
+//! the reduction it applies to is tiled and the map runs at write-out.
 
 use std::collections::BTreeMap;
 use std::fmt::Write;
@@ -74,6 +79,9 @@ struct RegionKey {
     inner: Vec<(String, i64)>,
     /// (uniform var, coefficient): leading point dims
     uniform: Vec<(String, i64)>,
+    /// zero-padding guard applied at load time: the source coords and
+    /// shape of a guarded view (exact offsets, so no span merging)
+    guard: Option<(Vec<Sym>, Vec<usize>)>,
 }
 
 struct Region {
@@ -88,8 +96,173 @@ impl Region {
     fn span(&self) -> usize {
         (self.hi - self.lo + 1) as usize
     }
-    fn inner_n(&self) -> usize {
-        self.extents.iter().product()
+
+    /// Staging layout for a `px_n × py_n` tile and `chunk` reduce steps.
+    ///
+    /// Every var of the region (lanes, `t = r0 − chunk`, inner vars) is
+    /// either a grid axis — one staged copy per value — or folded into a
+    /// window over the address line. A conv's `x[c, t + d·k − p]` folds
+    /// the lane `t` and tap `k` into one `tile_t + d·(K − 1)` window
+    /// instead of `K` overlapping copies. A var is folded when that
+    /// shrinks the region: a window grown by `|coef|·(ext − 1)` beats
+    /// `ext` copies of it.
+    fn layout(
+        &self,
+        names: (&str, Option<&str>),
+        px_n: usize,
+        py_n: usize,
+        chunk: usize,
+    ) -> Layout {
+        let mut vars: Vec<LVar> = vec![LVar {
+            kind: LKind::T,
+            name: "r0".into(),
+            coef: self.key.red,
+            ext: chunk,
+        }];
+        for ((name, coef), &ext) in self.key.inner.iter().zip(&self.extents) {
+            vars.push(LVar {
+                kind: LKind::Inner,
+                name: name.clone(),
+                coef: *coef,
+                ext,
+            });
+        }
+        if self.key.py != 0 {
+            vars.push(LVar {
+                kind: LKind::Y,
+                name: names.1.unwrap().into(),
+                coef: self.key.py,
+                ext: py_n,
+            });
+        }
+        if self.key.px != 0 {
+            vars.push(LVar {
+                kind: LKind::X,
+                name: names.0.into(),
+                coef: self.key.px,
+                ext: px_n,
+            });
+        }
+        // Greedy folds. A neutral fold (the lane axis alone: a 64-wide
+        // window is 64 copies of one) can enable the next one (the taps),
+        // so try with neutral folds allowed and keep that only if it ends
+        // smaller.
+        let fold = |neutral: bool| {
+            let mut size = self.span() as i64;
+            let mut win = vec![false; vars.len()];
+            loop {
+                let best = (0..vars.len())
+                    .filter(|&i| !win[i] && vars[i].ext > 1)
+                    .map(|i| {
+                        let grown = size + vars[i].coef.abs() * (vars[i].ext as i64 - 1);
+                        (i, grown as f64 / (size as f64 * vars[i].ext as f64))
+                    })
+                    .filter(|&(_, ratio)| ratio < 1.0 || (neutral && ratio <= 1.0))
+                    .min_by(|a, b| a.1.total_cmp(&b.1));
+                let Some((i, _)) = best else { break };
+                win[i] = true;
+                size += vars[i].coef.abs() * (vars[i].ext as i64 - 1);
+            }
+            // A guarded window must recover its guarded coordinate from
+            // the window position: one source coord may depend on it.
+            let mut guard_coord = None;
+            if let Some((coords, shape)) = &self.key.guard {
+                let on_win: Vec<usize> = (0..coords.len())
+                    .filter(|&c| {
+                        vars.iter()
+                            .zip(&win)
+                            .any(|(v, &w)| w && coords[c].terms.contains_key(&v.name))
+                    })
+                    .collect();
+                match on_win.as_slice() {
+                    [] => {}
+                    [c] => {
+                        guard_coord = Some((*c, shape[c + 1..].iter().product::<usize>() as i64))
+                    }
+                    _ => {
+                        win.iter_mut().for_each(|w| *w = false);
+                        size = self.span() as i64;
+                    }
+                }
+            }
+            let grid: usize = vars
+                .iter()
+                .zip(&win)
+                .filter(|(_, &w)| !w)
+                .map(|(v, _)| v.ext)
+                .product();
+            (grid * size as usize, size, win, guard_coord)
+        };
+        let strict = fold(false);
+        let loose = fold(true);
+        let (_, size, win, guard_coord) = if loose.0 < strict.0 { loose } else { strict };
+        let wmin: i64 = vars
+            .iter()
+            .zip(&win)
+            .filter(|(_, &w)| w)
+            .map(|(v, _)| (v.coef * (v.ext as i64 - 1)).min(0))
+            .sum();
+        let (mut grid, mut window) = (Vec::new(), Vec::new());
+        for (v, w) in vars.into_iter().zip(win) {
+            if w {
+                window.push(v)
+            } else {
+                grid.push(v)
+            }
+        }
+        Layout {
+            grid,
+            window,
+            wsize: size as usize,
+            wmin,
+            guard_coord,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LKind {
+    T,
+    Inner,
+    Y,
+    X,
+}
+
+#[derive(Clone, Debug)]
+struct LVar {
+    kind: LKind,
+    /// the var's name in address forms (`r0`, `u1`, `p1`, …)
+    name: String,
+    coef: i64,
+    ext: usize,
+}
+
+/// How a region sits in workgroup memory: grid axes in order (`t`, inner
+/// vars, then lanes innermost so consecutive lanes hit consecutive words),
+/// with the window between the inner vars and the lanes.
+struct Layout {
+    grid: Vec<LVar>,
+    window: Vec<LVar>,
+    /// window length in elements (the offset span when nothing is folded)
+    wsize: usize,
+    /// smallest `Σ coef·var` over the window vars (≤ 0)
+    wmin: i64,
+    /// `(coord, row-major stride)` of the guarded source coord that
+    /// depends on window vars
+    guard_coord: Option<(usize, i64)>,
+}
+
+impl Layout {
+    fn total(&self) -> usize {
+        self.grid.iter().map(|v| v.ext).product::<usize>() * self.wsize
+    }
+    /// grid axes outside the window, then inside (lanes)
+    fn split(&self) -> (Vec<&LVar>, Vec<&LVar>) {
+        let lane = |v: &&LVar| matches!(v.kind, LKind::X | LKind::Y);
+        (
+            self.grid.iter().filter(|v| !lane(v)).collect(),
+            self.grid.iter().filter(lane).collect(),
+        )
     }
 }
 
@@ -169,6 +342,13 @@ struct Ctx<'a> {
     in_load: bool,
     /// first pass collects regions, second emits against them
     collect: bool,
+    /// node whose value is already in a named array (an epilogue's
+    /// reduction, read back from its accumulator)
+    subst: Option<(usize, String)>,
+    /// pending guard of the arg being read (see `RegionKey::guard`)
+    guard: Option<(Vec<Sym>, Vec<usize>)>,
+    /// the last read consumed `guard`: its value is already zero-padded
+    guard_done: bool,
     counter: usize,
 }
 
@@ -180,6 +360,10 @@ impl Ctx<'_> {
 
     /// Read of buffer-backed node `j` at an address.
     fn buffer_read(&mut self, j: usize, addr: Sym) -> String {
+        if !addr.terms.contains_key("r0") || self.in_load {
+            // only staged regions apply a guard at load time
+            self.guard = None;
+        }
         if self.in_load {
             return format!("b{j}[{}]", addr.wgsl());
         }
@@ -192,6 +376,7 @@ impl Ctx<'_> {
             .unwrap_or(0);
         let shared = addr.terms.contains_key("r0") && (px == 0 || py == 0);
         if !shared {
+            self.guard = None;
             let has_inner = addr.terms.keys().any(|k| !k.starts_with('p') && k != "r0");
             if !addr.terms.contains_key("r0") && has_inner {
                 return self.hoisted_read(j, addr);
@@ -218,7 +403,11 @@ impl Ctx<'_> {
             red: addr.terms["r0"],
             inner,
             uniform,
+            guard: self.guard.take(),
         };
+        if key.guard.is_some() {
+            self.guard_done = true;
+        }
         let idx = match self.regions.iter().position(|r| r.key == key) {
             Some(i) => {
                 let r = &mut self.regions[i];
@@ -241,35 +430,37 @@ impl Ctx<'_> {
             return String::new();
         }
         let r = &self.regions[idx];
-        let mut local = String::from("(r0 - chunk)");
-        for ((name, _), &ext) in r.key.inner.iter().zip(&r.extents) {
-            local = format!("({local}) * {ext}u + {name}");
-        }
-        if r.key.inner.is_empty() {
+        let lay = r.layout((&self.px, self.py.as_deref()), self.bx, self.by, self.chunk);
+        if r.key.inner.is_empty() && lay.window.is_empty() {
+            // a plain point-minor region: the r0 loop loads the thread's
+            // points once (as vec4s when they are contiguous), see `Site`
             self.sites.push(Site {
                 region: idx,
-                local,
+                local: "(r0 - chunk)".into(),
                 off: (addr.offset - r.lo) as usize,
             });
             return format!("svec{}_", self.sites.len() - 1);
         }
-        // Point-minor layout: ((t * innerN + inner) * span + o) * P + point,
-        // so consecutive lanes hit consecutive words (no bank conflicts).
-        let mut points = 1usize;
-        let mut point = String::from("0u");
-        if r.key.py != 0 {
-            point = format!("({point}) * {}u + ly_", self.by);
-            points *= self.by;
+        let local = |v: &LVar| match v.kind {
+            LKind::T => "(r0 - chunk)".to_string(),
+            LKind::Inner => v.name.clone(),
+            LKind::Y => "ly_".to_string(),
+            LKind::X => "lx_".to_string(),
+        };
+        let mut wpos = format!("{}", addr.offset - r.lo - lay.wmin);
+        for v in &lay.window {
+            wpos.push_str(&format!(" + {} * i32({})", v.coef, local(v)));
         }
-        if r.key.px != 0 {
-            point = format!("({point}) * {}u + lx_", self.bx);
-            points *= self.bx;
+        let (outer, lanes) = lay.split();
+        let mut index = String::from("0u");
+        for v in &outer {
+            index = format!("({index}) * {}u + {}", v.ext, local(v));
         }
-        format!(
-            "stage_{idx}[(({local}) * {}u + {}u) * {points}u + ({point})]",
-            r.span(),
-            addr.offset - r.lo
-        )
+        index = format!("({index}) * {}u + u32({wpos})", lay.wsize);
+        for v in &lanes {
+            index = format!("({index}) * {}u + {}", v.ext, local(v));
+        }
+        format!("stage_{idx}[{index}]")
     }
 
     /// A read that does not depend on the reduce var: served from a
@@ -320,6 +511,11 @@ impl Ctx<'_> {
 
     /// Value of node `j` at full-shape coordinates `coords`.
     fn expand(&mut self, out: &mut String, j: usize, coords: &[Sym]) -> Val {
+        if let Some((n, name)) = &self.subst {
+            if *n == j {
+                return Val::Arr(name.clone());
+            }
+        }
         let node = &self.g.nodes[j];
         match &node.op {
             Op::Input(_) => {
@@ -451,8 +647,28 @@ impl Ctx<'_> {
                     .collect();
                 let pk = src_shape.len() - self.tuple_rank(a.src.n());
                 let slot = flat(&cs[pk..], &src_shape[pk..]);
+                let direct = match &self.g.nodes[a.src.n()].op {
+                    Op::Input(_) | Op::Reshape(_) => true,
+                    Op::Comp(_) => self.reads.contains(&a.src.n()),
+                    Op::Iota(_) => false,
+                };
+                self.guard = (a.view.guard && direct && pk == src_shape.len())
+                    .then(|| (cs.clone(), src_shape.clone()));
+                self.guard_done = false;
                 let v = self.expand(out, a.src.n(), &cs);
-                v.slot(&slot)
+                self.guard = None;
+                let v = v.slot(&slot);
+                if !a.view.guard || self.collect || std::mem::take(&mut self.guard_done) {
+                    return v;
+                }
+                // zero padding: the (possibly wrapped) read is discarded
+                let cond = cs
+                    .iter()
+                    .zip(&src_shape)
+                    .map(|(c, n)| format!("({} < {n}u)", c.wgsl()))
+                    .collect::<Vec<_>>()
+                    .join(" && ");
+                format!("select(0.0, {v}, {cond})")
             })
             .collect()
     }
@@ -563,17 +779,34 @@ impl TensorGraph {
         let pts_v = fixed(c.points());
         let pts = pts_v.as_slice();
         let k = pts.len();
-        let r_total = rc.red[0].n();
+        // Multi-dim reductions: the largest reduce dim is the chunked
+        // `r0`; the others (`u{i}`, e.g. a conv's taps) are inner loops
+        // inside each chunk step, staged alongside it like any inner var.
+        let red = fixed(&rc.red);
+        let rsel = (0..red.len())
+            .rev()
+            .max_by_key(|&i| red[i])
+            .expect("tile needs a reduce dim");
+        let red_name = |i: usize| {
+            if i == rsel {
+                "r0".to_string()
+            } else {
+                format!("u{i}")
+            }
+        };
+        let inner_red: Vec<(String, usize)> = (0..red.len())
+            .filter(|&i| i != rsel)
+            .map(|i| (red_name(i), red[i]))
+            .collect();
+        let r_total = red[rsel];
         let m = rc.monoid.as_ref().expect("tile needs a reduction");
         let threads = bx * by;
 
         // Tile the last two non-unit point dims; everything else is
         // uniform across the workgroup.
-        let mut non_unit = (0..k).rev().filter(|&d| pts[d] > 1);
-        let dx = non_unit.next().unwrap_or(k - 1);
-        // rows: the largest remaining point dim (ties to the innermost),
-        // so a layout chosen for the consumer's reads still tiles well
-        let dy = if by > 1 { largest_other(pts, dx) } else { None };
+        let (ax, ay) = super::tile_axes(pts);
+        let dx = ax.unwrap_or(k - 1);
+        let dy = if by > 1 { ay } else { None };
         let others: Vec<usize> = (0..k).filter(|&d| d != dx && Some(d) != dy).collect();
         let nx = pts[dx];
         let ny = dy.map_or(1, |d| pts[d]);
@@ -596,11 +829,18 @@ impl TensorGraph {
             comp_regions: Vec::new(),
             in_load: false,
             collect: true,
+            subst: None,
+            guard: None,
+            guard_done: false,
             counter: 0,
         };
         ctx.extents.insert("r0".into(), r_total);
+        for (name, n) in &inner_red {
+            ctx.extents.insert(name.clone(), *n);
+        }
         let pts_syms: Vec<Sym> = (0..k).map(|d| Sym::var(&format!("p{d}"))).collect();
-        // the reduction's point coords: root's, or the epilogue's view of them
+        // the reduction's point coords: root's, or the epilogue's view of
+        // them; then its reduce coords (`r0` and the unrolled `u{i}`)
         let space: Vec<Sym> = if epilogue {
             self.epilogue_read(c, red_node)
                 .unwrap()
@@ -611,11 +851,8 @@ impl TensorGraph {
             pts_syms.clone()
         }
         .into_iter()
-        .chain([Sym::var("r0")])
+        .chain((0..red.len()).map(|i| Sym::var(&red_name(i))))
         .collect();
-        // the chunked loop body: the reduction's body + combine. With an
-        // epilogue, the reduction is read point-for-point so its space is
-        // root's points ++ r0 as well.
         let run = |ctx: &mut Ctx, body: &mut String| {
             let arg_vals = ctx.arg_values(body, rc, &space);
             let vals = emit_scalar(body, &rc.body, &rc.body_outs, "t0_", &|v| {
@@ -629,24 +866,15 @@ impl TensorGraph {
                 }
             })
         };
-        // the epilogue: root's body with the reduction's var bound to acc
+        // the epilogue: root's body with the reduction's value bound to
+        // the accumulator
         let run_epi = |ctx: &mut Ctx, body: &mut String| -> Vec<String> {
             if !epilogue {
                 return (0..w).map(|s| format!("acc[{s}]")).collect();
             }
-            let mut vals: Vec<String> = Vec::new();
-            for a in &c.args {
-                if a.src.n() == red_node {
-                    vals.push(format!("acc[{}]", self.epilogue_slot(a)));
-                    continue;
-                }
-                let src_shape = fixed(&self.nodes[a.src.n()].shape);
-                let cs: Vec<Sym> = a.view.forms.iter().map(|f| sym_of(f, &pts_syms)).collect();
-                let pk = src_shape.len() - ctx.tuple_rank(a.src.n());
-                let slot = flat(&cs[pk..], &src_shape[pk..]);
-                let v = ctx.expand(body, a.src.n(), &cs);
-                vals.push(v.slot(&slot));
-            }
+            ctx.subst = Some((red_node, "acc".into()));
+            let vals = ctx.arg_values(body, c, &pts_syms);
+            ctx.subst = None;
             emit_scalar(body, &c.body, &c.body_outs, "e0_", &|v| {
                 vals[v as usize].clone()
             })
@@ -655,6 +883,31 @@ impl TensorGraph {
         let mut body = String::new();
         let mut epi = String::new();
         run(&mut ctx, &mut body);
+        // Keep workgroup memory within 16 KiB (the WebGPU default): halve
+        // the chunk until the staged regions fit. Inner reduce dims
+        // multiply every region; at 28 KiB a direct conv ran one
+        // workgroup per core on an M4 and took 5.0 ms, at 14 KiB 2.4 ms.
+        let staged = |ctx: &Ctx, chunk: usize| {
+            let regions: usize = ctx
+                .regions
+                .iter()
+                .map(|r| {
+                    r.layout((&ctx.px, ctx.py.as_deref()), px_n, py_n, chunk)
+                        .total()
+                })
+                .sum();
+            let comps: usize = ctx
+                .comp_regions
+                .iter()
+                .map(|r| (if r.uses_py { py_n } else { 1 }) * chunk * r.width)
+                .sum();
+            regions + comps
+        };
+        let mut chunk = chunk;
+        while chunk > 1 && staged(&ctx, chunk) > 4096 {
+            chunk -= 1;
+        }
+        ctx.chunk = chunk;
         run_epi(&mut ctx, &mut epi);
         ctx.collect = false;
         ctx.counter = 0;
@@ -663,53 +916,63 @@ impl TensorGraph {
         let combined = run(&mut ctx, &mut body);
         let epi_vals = run_epi(&mut ctx, &mut epi);
 
-        let region_total = |r: &Region| {
-            (if r.key.py != 0 { py_n } else { 1 })
-                * (if r.key.px != 0 { px_n } else { 1 })
-                * chunk
-                * r.inner_n()
-                * r.span()
-        };
-        // (point axis: 'x' | 'y' | '-', points, vector width) per region:
-        // a thread's rx (ry) consecutive points along the tile axis are
-        // contiguous in the point-minor stage, so a register tile that is
-        // a multiple of 4 wide reads them as vec4s
-        let axis_of = |r: &Region| -> (char, usize, usize) {
-            if r.key.inner.is_empty() {
-                if r.key.px != 0 && r.key.py == 0 && px_n % 4 == 0 && rx % 4 == 0 {
-                    return ('x', px_n, 4);
-                }
-                if r.key.py != 0 && r.key.px == 0 && py_n % 4 == 0 && ry % 4 == 0 {
-                    return ('y', py_n, 4);
-                }
-            }
-            let points =
-                (if r.key.py != 0 { py_n } else { 1 }) * (if r.key.px != 0 { px_n } else { 1 });
-            let axis = if r.key.px != 0 && r.key.py == 0 {
-                'x'
+        let layouts: Vec<Layout> = ctx
+            .regions
+            .iter()
+            .map(|r| r.layout((&ctx.px, ctx.py.as_deref()), px_n, py_n, chunk))
+            .collect();
+        // (point axis: 'x' | 'y' | '-', vector width) of a site region (no
+        // inner vars, no window): a thread's rx (ry) consecutive points
+        // along the tile axis are contiguous in the point-minor stage, so
+        // a register tile that is a multiple of 4 wide reads them as vec4s
+        let axis_of = |r: &Region| -> (char, usize) {
+            let v4 = r.key.inner.is_empty() && r.key.guard.is_none();
+            if r.key.px != 0 && r.key.py == 0 {
+                (
+                    'x',
+                    if v4 && px_n % 4 == 0 && rx % 4 == 0 {
+                        4
+                    } else {
+                        1
+                    },
+                )
             } else if r.key.py != 0 && r.key.px == 0 {
-                'y'
+                (
+                    'y',
+                    if v4 && py_n % 4 == 0 && ry % 4 == 0 {
+                        4
+                    } else {
+                        1
+                    },
+                )
             } else {
-                '-'
-            };
-            (axis, points, 1)
+                ('-', 1)
+            }
         };
-        let vec_w: Vec<usize> = ctx.regions.iter().map(|r| axis_of(r).2).collect();
-        for (i, r) in ctx.regions.iter().enumerate() {
+        // vec4 stages only where a site reads them; windowed / inner-var
+        // regions stay scalar
+        let vec_w: Vec<usize> = ctx
+            .regions
+            .iter()
+            .zip(&layouts)
+            .map(|(r, lay)| {
+                if r.key.inner.is_empty() && lay.window.is_empty() {
+                    axis_of(r).1
+                } else {
+                    1
+                }
+            })
+            .collect();
+        for (i, lay) in layouts.iter().enumerate() {
             if vec_w[i] == 4 {
                 writeln!(
                     s,
                     "var<workgroup> stage_{i}: array<vec4<f32>, {}>;",
-                    region_total(r) / 4
+                    lay.total() / 4
                 )
                 .unwrap();
             } else {
-                writeln!(
-                    s,
-                    "var<workgroup> stage_{i}: array<f32, {}>;",
-                    region_total(r)
-                )
-                .unwrap();
+                writeln!(s, "var<workgroup> stage_{i}: array<f32, {}>;", lay.total()).unwrap();
             }
         }
         // Cooperative loads for shared comps are expanded in the load
@@ -859,37 +1122,40 @@ impl TensorGraph {
             "    for (var chunk: u32 = 0u; chunk < {r_total}u; chunk = chunk + {chunk}u) {{"
         )
         .unwrap();
-        for (i, r) in ctx.regions.iter().enumerate() {
+        for (i, (r, lay)) in ctx.regions.iter().zip(&layouts).enumerate() {
             let v = vec_w[i];
-            let total = region_total(r) / v;
-            let span = r.span();
+            let total = lay.total() / v;
             writeln!(
                 s,
                 "        for (var idx: u32 = tid; idx < {total}u; idx = idx + {threads}u) {{"
             )
             .unwrap();
-            // The stage is point-minor (lanes innermost, then offset,
-            // inner vars, t) so the reduce loop's reads are conflict-free.
-            // The load loop walks the *buffer* in address order instead —
-            // the var with the smallest address stride innermost — so a
-            // warp's loads coalesce; each element is then written to its
-            // point-minor slot. A vec4 stage is filled a whole vector at
-            // a time (`v` consecutive points along the tile axis), since
-            // component writes from different threads would race.
+            // The stage is point-minor (grid vars, window, lanes innermost)
+            // so the reduce loop's reads are conflict-free. The load loop
+            // walks the *buffer* in address order instead — the var with
+            // the smallest address stride innermost — so a warp's loads
+            // coalesce; each element is then written to its stage slot. A
+            // vec4 stage is filled a whole vector at a time (`v`
+            // consecutive points along the tile axis), since component
+            // writes from different threads would race.
+            let (outer, lanes) = lay.split();
+            let lane_name = |v: &LVar| if v.kind == LKind::X { "lx" } else { "ly" };
             // (name, extent, address coefficient), in stage order
             let mut dims: Vec<(String, usize, i64)> = Vec::new();
-            if r.key.px != 0 {
-                dims.push(("lx".into(), px_n / v, r.key.px));
+            for o in &outer {
+                let name = if o.kind == LKind::T {
+                    "t".into()
+                } else {
+                    o.name.clone()
+                };
+                dims.push((name, o.ext, o.coef));
             }
-            if r.key.py != 0 {
-                dims.push(("ly".into(), py_n / v, r.key.py));
+            dims.push(("w".into(), lay.wsize, 1));
+            for l in &lanes {
+                dims.push((lane_name(l).into(), l.ext / v, l.coef));
             }
-            dims.push(("o".into(), span, 1));
-            for ((name, coef), &ext) in r.key.inner.iter().zip(&r.extents).rev() {
-                dims.push((name.clone(), ext, *coef));
-            }
-            dims.push(("t".into(), chunk, r.key.red));
-            let mut load_order: Vec<usize> = (0..dims.len()).collect();
+            // ties: the innermost stage dim first
+            let mut load_order: Vec<usize> = (0..dims.len()).rev().collect();
             load_order.sort_by_key(|&d| dims[d].2.unsigned_abs());
             writeln!(s, "            var rem = idx;").unwrap();
             for &d in &load_order {
@@ -898,62 +1164,108 @@ impl TensorGraph {
                 writeln!(s, "            rem = rem / {ext}u;").unwrap();
             }
             let mut sidx = String::from("0u");
-            for (name, ext, _) in dims.iter().rev() {
+            for (name, ext, _) in &dims {
                 sidx = format!("({sidx}) * {ext}u + {name}");
             }
-            // address and liveness of component `c` (the point coordinate
-            // is lx·v + c along the vectorized axis)
-            let component = |c: usize| -> (String, String) {
-                let mut addr = format!("{}", r.lo);
+            // global value of a grid var (lanes of component `c`), and of a
+            // window var's base
+            let global = |v: &LVar, c: &str| match v.kind {
+                LKind::T => "chunk + t".to_string(),
+                LKind::Inner => v.name.clone(),
+                LKind::Y => format!("gy{c}"),
+                LKind::X => format!("gx{c}"),
+            };
+            let base = |v: &LVar| match v.kind {
+                LKind::T => "chunk".to_string(),
+                LKind::Inner => "0u".to_string(),
+                LKind::Y => format!("tile_y * {py_n}u"),
+                LKind::X => format!("tile_x * {px_n}u"),
+            };
+            for c in 0..v {
+                for l in &lanes {
+                    let (g, tile, ext, ln) = match l.kind {
+                        LKind::X => ("gx", "tile_x", px_n, "lx"),
+                        _ => ("gy", "tile_y", py_n, "ly"),
+                    };
+                    let sfx = if v == 1 { String::new() } else { c.to_string() };
+                    if v == 1 {
+                        writeln!(s, "            let {g} = {tile} * {ext}u + {ln};").unwrap();
+                    } else {
+                        writeln!(
+                            s,
+                            "            let {g}{sfx} = {tile} * {ext}u + {ln} * {v}u + {c}u;"
+                        )
+                        .unwrap();
+                    }
+                }
+            }
+            // address and liveness of component `c`
+            let component = |c: &str| -> (String, String) {
                 let mut live = String::from("true");
-                if r.key.px != 0 {
-                    addr.push_str(&format!(" + {} * i32(gx{c})", r.key.px));
-                    live.push_str(&format!(" && gx{c} < {nx}u"));
+                for l in &lanes {
+                    let n = if l.kind == LKind::X { nx } else { ny };
+                    live.push_str(&format!(" && {} < {n}u", global(l, c)));
                 }
-                if r.key.py != 0 {
-                    addr.push_str(&format!(" + {} * i32(gy{c})", r.key.py));
-                    live.push_str(&format!(" && gy{c} < {ny}u"));
+                if outer.iter().any(|o| o.kind == LKind::T) {
+                    live.push_str(&format!(" && chunk + t < {r_total}u"));
                 }
-                for (name, coef) in &r.key.inner {
-                    addr.push_str(&format!(" + {coef} * i32({name})"));
+                let mut addr = format!("{} + i32(w)", r.lo + lay.wmin);
+                for g in &lay.grid {
+                    addr.push_str(&format!(" + {} * i32({})", g.coef, global(g, c)));
                 }
-                addr.push_str(&format!(" + {} * i32(chunk + t) + i32(o)", r.key.red));
-                live.push_str(&format!(" && chunk + t < {r_total}u"));
+                for wv in &lay.window {
+                    addr.push_str(&format!(" + {} * i32({})", wv.coef, base(wv)));
+                }
                 for (name, coef) in &r.key.uniform {
                     addr.push_str(&format!(" + {coef} * i32({name})"));
                 }
                 (addr, live)
             };
-            for c in 0..v {
-                if r.key.px != 0 {
-                    writeln!(
-                        s,
-                        "            let gx{c} = tile_x * {px_n}u + lx * {v}u + {c}u;"
-                    )
-                    .unwrap();
-                }
-                if r.key.py != 0 {
-                    writeln!(
-                        s,
-                        "            let gy{c} = tile_y * {py_n}u + ly * {v}u + {c}u;"
-                    )
-                    .unwrap();
-                }
-            }
             if v == 1 {
-                let (addr, live) = component(0);
+                let (addr, mut live) = component("");
+                writeln!(s, "            let a = {addr};").unwrap();
+                if !lay.window.is_empty() {
+                    // a window spans lanes / steps past the edge: keep the
+                    // read inside the buffer (those slots are never used)
+                    live.push_str(&format!(" && u32(a) < arrayLength(&b{})", r.key.buffer));
+                }
                 writeln!(s, "            if ({live}) {{").unwrap();
-                writeln!(
-                    s,
-                    "                stage_{i}[{sidx}] = b{}[u32({addr})];",
-                    r.key.buffer
-                )
-                .unwrap();
+                let mut val = format!("b{}[u32(a)]", r.key.buffer);
+                if let Some((coords, shape)) = &r.key.guard {
+                    let cond = coords
+                        .iter()
+                        .zip(shape)
+                        .enumerate()
+                        .map(|(ci, (c, n))| {
+                            let mut parts = vec![c.offset.to_string()];
+                            for (k, v) in &c.terms {
+                                let var =
+                                    lay.grid.iter().chain(&lay.window).find(|lv| &lv.name == k);
+                                let windowed = lay.window.iter().any(|lv| &lv.name == k);
+                                let e = match var {
+                                    Some(lv) if windowed => base(lv),
+                                    Some(lv) => global(lv, ""),
+                                    None => k.clone(),
+                                };
+                                parts.push(format!("{v} * i32({e})"));
+                            }
+                            if let Some((gc, stride)) = lay.guard_coord {
+                                if gc == ci {
+                                    parts.push(format!("({} + i32(w)) / {stride}", lay.wmin));
+                                }
+                            }
+                            format!("(u32({}) < {n}u)", parts.join(" + "))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" && ");
+                    val = format!("select(0.0, {val}, {cond})");
+                }
+                writeln!(s, "                stage_{i}[{sidx}] = {val};").unwrap();
                 writeln!(s, "            }}").unwrap();
             } else {
                 let mut elems = Vec::with_capacity(v);
                 for c in 0..v {
-                    let (addr, live) = component(c);
+                    let (addr, live) = component(&c.to_string());
                     writeln!(s, "            var e{c} = 0.0;").unwrap();
                     writeln!(
                         s,
@@ -1001,11 +1313,20 @@ impl TensorGraph {
             "        for (var r0: u32 = chunk; r0 < min(chunk + {chunk}u, {r_total}u); r0 = r0 + 1u) {{"
         )
         .unwrap();
-        // staged reads, once per thread per r0: the thread's points along
-        // the tile axis, in groups of the vector width
+        // staged reads of site regions, once per thread per r0 (outside
+        // the inner reduce dims: a site's address does not depend on
+        // them): the thread's points along the tile axis, in groups of
+        // the vector width
         for (n, site) in ctx.sites.iter().enumerate() {
             let r = &ctx.regions[site.region];
-            let (axis, points, v) = axis_of(r);
+            let (axis, _) = axis_of(r);
+            let v = vec_w[site.region];
+            let points: usize = layouts[site.region]
+                .split()
+                .1
+                .iter()
+                .map(|l| l.ext)
+                .product();
             let base = format!(
                 "(({}) * {}u + {}u) * {points}u",
                 site.local,
@@ -1040,10 +1361,13 @@ impl TensorGraph {
             .iter()
             .enumerate()
             .map(|(n, site)| {
-                let (axis, _, v) = axis_of(&ctx.regions[site.region]);
-                (format!("svec{n}_"), axis, v)
+                let (axis, _) = axis_of(&ctx.regions[site.region]);
+                (format!("svec{n}_"), axis, vec_w[site.region])
             })
             .collect();
+        // inner reduce dims loop outside the register-tile copies, so every
+        // copy shares the staged reads of one (r0, u…) step
+        let outer = std::mem::take(&mut s);
         for &(i, j) in &copies {
             let t = tag(i, j);
             writeln!(s, "            {{").unwrap();
@@ -1083,6 +1407,34 @@ impl TensorGraph {
             )
             .unwrap();
             writeln!(s, "            }}").unwrap();
+        }
+        let step = std::mem::replace(&mut s, outer);
+        let n_inner: usize = inner_red.iter().map(|(_, n)| n).product();
+        if n_inner <= 16 {
+            // small inner extents (conv taps): unrolled, each step a
+            // constant the compiler folds into the staged addresses
+            for flat in 0..n_inner {
+                writeln!(s, "        {{").unwrap();
+                let mut rem = flat;
+                for (name, n) in inner_red.iter().rev() {
+                    writeln!(s, "        let {name}: u32 = {}u;", rem % n).unwrap();
+                    rem /= n;
+                }
+                s.push_str(&step);
+                writeln!(s, "        }}").unwrap();
+            }
+        } else {
+            for (name, n) in &inner_red {
+                writeln!(
+                    s,
+                    "        for (var {name}: u32 = 0u; {name} < {n}u; {name} = {name} + 1u) {{"
+                )
+                .unwrap();
+            }
+            s.push_str(&step);
+            for _ in &inner_red {
+                writeln!(s, "        }}").unwrap();
+            }
         }
         writeln!(s, "        }}").unwrap();
         writeln!(s, "        workgroupBarrier();").unwrap();

@@ -140,6 +140,10 @@ impl Form {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct View {
     pub forms: Vec<Form>,
+    /// Reads outside the source return 0 instead of being a shape error:
+    /// zero padding as a view. The guard travels with the leaf read through
+    /// composition, and a gradient through it scatters only in range.
+    pub guard: bool,
 }
 
 impl View {
@@ -150,7 +154,10 @@ impl View {
             .iter()
             .map(|p| p.map_or_else(|| Form::zero(rank), |d| Form::unit(rank, d)))
             .collect();
-        Self { forms }
+        Self {
+            forms,
+            guard: false,
+        }
     }
 
     /// Identity over the first `src_rank` coordinates of a `rank`-dim space.
@@ -166,10 +173,34 @@ impl View {
         self.forms.iter().map(|f| f.eval(idx) as usize).collect()
     }
 
+    /// Coordinates in `shape`, or `None` when a guarded read falls outside.
+    fn coords_in(&self, idx: &[usize], shape: &[usize]) -> Option<Vec<usize>> {
+        if !self.guard {
+            return Some(self.coords(idx));
+        }
+        self.forms
+            .iter()
+            .zip(shape)
+            .map(|(f, &n)| {
+                let c = f.eval(idx);
+                (0..n as i64).contains(&c).then_some(c as usize)
+            })
+            .collect()
+    }
+
+    /// A view that may read outside its source; out-of-range reads are 0.
+    pub fn guarded(mut self) -> Self {
+        self.guard = true;
+        self
+    }
+
     /// `self ∘ inner`: this view is over a space whose coordinates are
     /// given by `inner` over a `rank`-dim space.
     fn compose(&self, inner: &View, rank: usize) -> View {
         View {
+            // one side is always a plain view: either a guarded leaf read
+            // pushed through an unguarded consumer, or the reverse
+            guard: self.guard || inner.guard,
             forms: self
                 .forms
                 .iter()
@@ -185,6 +216,10 @@ impl View {
     /// `src`. A reshape that splits a source dim across destination dims
     /// (`[s, d] -> [s*d]`) is not affine (it needs `/` and `%`): `None`.
     pub fn through_reshape(&self, dst: &[Dim], src: &[Dim]) -> Option<View> {
+        // a guard bounds the reshape's coords, not the source's
+        if self.guard {
+            return None;
+        }
         let dst: Vec<usize> = dst.iter().map(|d| d.fixed()).collect::<Option<_>>()?;
         let src: Vec<usize> = src.iter().map(|d| d.fixed()).collect::<Option<_>>()?;
         let rank = self.rank();
@@ -214,7 +249,10 @@ impl View {
             }
             forms.push(f);
         }
-        (d == dst.len()).then_some(View { forms })
+        (d == dst.len()).then_some(View {
+            forms,
+            guard: false,
+        })
     }
 
     /// Drop dependence on size-1 coordinates so equal views compare equal.
@@ -429,6 +467,39 @@ pub struct TNode {
     pub reg: (u32, u32),
 }
 
+/// Reduce dims the tiled emitter handles: one chunked axis (the largest)
+/// plus small inner axes looped inside each chunk step — a conv's
+/// `(c, k)`, a polyphase upsample's `(j, c)`. The inner product bounds
+/// how much each staged region grows.
+pub(crate) fn tileable_red(red: &[Dim]) -> bool {
+    let Some(r) = red.iter().map(|d| d.fixed()).collect::<Option<Vec<_>>>() else {
+        return false;
+    };
+    let Some(&big) = r.iter().max() else {
+        return false;
+    };
+    r.iter().product::<usize>() / big.max(1) <= 32
+}
+
+/// The point dims a tile maps to its `(x, y)` axes. Lanes (x): the
+/// innermost dim of at least 16 (falling back to the innermost non-unit
+/// dim), so a narrow trailing dim — a conv weight gradient's taps `k` in
+/// `dw[o, c, k]`, a polyphase upsample's phase `r` — becomes a uniform
+/// (per-workgroup) coordinate instead of a 7-wide lane axis. Rows (y):
+/// the largest other non-unit dim (ties: the innermost), so a layout
+/// chosen for the consumer's reads (`relayout`) still tiles well.
+pub(crate) fn tile_axes(pts: &[usize]) -> (Option<usize>, Option<usize>) {
+    let x = (0..pts.len())
+        .rev()
+        .find(|&d| pts[d] >= 16)
+        .or_else(|| (0..pts.len()).rev().find(|&d| pts[d] > 1));
+    (x, x.and_then(|dx| tile::largest_other(pts, dx)))
+}
+
+/// How `merge_reduce_dims` rewrites one arg: `None` leaves it, `Some((d0,
+/// shape))` reads a reshape of its source with dims `d0, d0 + 1` merged.
+type MergePlan = Option<(usize, Vec<Dim>)>;
+
 /// `(split, tile, reg)` — one thread mapping for a comp.
 pub type ScheduleCandidate = (u32, (u32, u32, u32), (u32, u32));
 
@@ -540,6 +611,13 @@ impl TensorGraph {
         self.nodes[t.n()].reg = reg;
     }
 
+    /// Schedule: recompute `t` inside its consumers (`true`) or write it
+    /// to a buffer. `schedule_inline` decides this by rule; this is the
+    /// manual override, e.g. to fuse a reduction under its epilogue map.
+    pub fn set_inline(&mut self, t: TensorId, inline: bool) {
+        self.nodes[t.n()].inline = inline;
+    }
+
     /// Thread mappings worth trying for a materialized comp on a GPU:
     /// one thread per point, a workgroup split (reductions), and rows ×
     /// lanes tiles (single-axis reductions with a lane dim).
@@ -553,13 +631,11 @@ impl TensorGraph {
         if c.width() <= 8 {
             out.push((256, (0, 0, 0), (1, 1)));
         }
-        if c.red.len() == 1 {
+        if tileable_red(&c.red) {
             let pts = fixed(c.points());
-            let lane_dim = (0..pts.len()).rev().find(|&d| pts[d] > 1);
-            let lanes = lane_dim.map_or(1, |d| pts[d]);
-            let rows = lane_dim
-                .and_then(|dx| tile::largest_other(&pts, dx))
-                .is_some();
+            let (ax, ay) = tile_axes(&pts);
+            let lanes = ax.map_or(1, |d| pts[d]);
+            let rows = ay.is_some();
             if (16..=128).contains(&lanes) && rows {
                 out.push((0, (lanes as u32, (256 / lanes) as u32, 32), (1, 1)));
             }
@@ -698,7 +774,7 @@ impl TensorGraph {
                 ));
             }
             let bound: Option<Vec<usize>> = space.iter().map(|d| d.fixed()).collect();
-            if let Some(space) = bound {
+            if let (Some(space), false) = (bound, a.view.guard) {
                 for (f, &n) in a.view.forms.iter().zip(src) {
                     let (lo, hi) = f.range(&space);
                     if lo < 0 || n.fixed().is_some_and(|n| hi >= n as i64) {
@@ -910,6 +986,10 @@ impl TensorGraph {
         let mut points: Vec<Option<Form>> = vec![None; pk];
         let mut fallback: Option<Vec<Form>> = None;
         for a in c.args.iter().filter(|a| a.src.n() == p) {
+            // a guarded read is 0 outside: not the accumulator
+            if a.view.guard {
+                return None;
+            }
             let (pt, state) = a.view.forms.split_at(pk);
             if state.iter().any(|f| f.coefs.iter().any(|&x| x != 0)) {
                 return None;
@@ -1016,7 +1096,7 @@ impl TensorGraph {
             let p = a.src.n();
             let Some(pc) = self.comp_at(p) else { continue };
             if self.nodes[p].inline && pc.monoid.is_some() {
-                let ok = pc.red.len() == 1
+                let ok = (pc.red.len() == 1 || tileable_red(&pc.red))
                     && (found.is_none() || found == Some(p))
                     && self.epilogue_read(c, p).is_some();
                 if !ok {
@@ -1131,6 +1211,15 @@ impl TensorGraph {
             });
             reads <= 1 && !transcendental
         };
+        // a map read through a guarded view must stay materialized
+        let mut guarded = vec![false; n];
+        for i in (0..n).filter(|&i| live[i]) {
+            if let Some(c) = self.comp_at(i) {
+                for a in c.args.iter().filter(|a| a.view.guard) {
+                    guarded[a.src.n()] = true;
+                }
+            }
+        }
         let inline: Vec<bool> = (0..n)
             .map(|i| {
                 self.comp_at(i).is_some_and(|c| {
@@ -1138,6 +1227,7 @@ impl TensorGraph {
                         && c.tuple == 0
                         && !is_output(i)
                         && !reshaped[i]
+                        && !guarded[i]
                         && (!cost_aware || recompute[i] == Some(1) || cheap(c))
                 })
             })
@@ -1245,8 +1335,9 @@ impl TensorGraph {
     ) -> ExprId {
         let p = arg.src.n();
         // an affine reshape of an inlineable map: read the map directly
+        // (not under a guard: its bounds are the reshape's shape)
         if let Op::Reshape(src) = self.nodes[p].op {
-            if inline[src.n()] {
+            if inline[src.n()] && !arg.view.guard {
                 if let Some(view) = arg
                     .view
                     .through_reshape(&self.nodes[p].shape, &self.nodes[src.n()].shape)
@@ -1256,7 +1347,8 @@ impl TensorGraph {
                 }
             }
         }
-        if !inline[p] {
+        // a guarded read of a map is 0 outside, not the map of 0: keep it a leaf
+        if !inline[p] || arg.view.guard {
             let leaf = Arg {
                 src: TensorId(remap[p].unwrap() as u32),
                 view: arg.view.clone(),
@@ -1429,6 +1521,7 @@ impl TensorGraph {
             let mut args: Vec<Arg> = Vec::new();
             // slot 0: s, from the max's own body, re-indexed into the fused space
             let m_ext = View {
+                guard: false,
                 forms: (0..=m_out)
                     .map(|d| Form::unit(fused_rank, if d == m_out { m_out + e } else { d }))
                     .collect(),
@@ -1452,6 +1545,7 @@ impl TensorGraph {
                 let n_out = c.points().len();
                 let slot = outs.len() as i64;
                 let inv = View {
+                    guard: false,
                     forms: (0..c.rank())
                         .map(|d| match reads.get(d) {
                             Some(Some(j)) => Form::unit(fused_rank, *j),
@@ -1503,7 +1597,13 @@ impl TensorGraph {
                     });
                 }
                 proj.push(Form::constant(n_out, slot));
-                projections.push((mem.node, View { forms: proj }));
+                projections.push((
+                    mem.node,
+                    View {
+                        guard: false,
+                        forms: proj,
+                    },
+                ));
             }
 
             let width = outs.len();
@@ -1649,7 +1749,9 @@ impl TensorGraph {
                 for a in &c.args {
                     let p = a.src.n();
                     let as_epilogue = epilogue_ok
-                        && self.comp_at(p).is_some_and(|pc| pc.red.len() == 1)
+                        && self
+                            .comp_at(p)
+                            .is_some_and(|pc| pc.red.len() == 1 || tileable_red(&pc.red))
                         && self.epilogue_read(c, p).is_some();
                     consumer_reduces[p] = c.monoid.is_some() || as_epilogue;
                 }
@@ -1714,8 +1816,8 @@ impl TensorGraph {
             .filter(|&i| {
                 self.comp_at(i).is_some_and(|c| {
                     c.monoid.is_some()
-                        && c.red.len() == 1
-                        && c.red[0].n() >= min_red
+                        && tileable_red(&c.red)
+                        && c.red.iter().map(|d| d.n()).max().unwrap_or(0) >= min_red
                         && (by == 1 || c.points().len() >= 2)
                 })
             })
@@ -1787,12 +1889,10 @@ impl TensorGraph {
             // schedule by the reduction's shape, even when `i` is its epilogue
             let c = self.comp_at(self.tiled_reduction(i).unwrap()).unwrap();
             let pts = fixed(c.points());
-            let lane_dim = (0..pts.len()).rev().find(|&d| pts[d] > 1);
+            let (lane_dim, row_dim) = tile_axes(&pts);
             let lanes = lane_dim.map_or(1, |d| pts[d]);
-            let rows_n = lane_dim
-                .and_then(|dx| tile::largest_other(&pts, dx))
-                .map_or(1, |d| pts[d]);
-            let rows = rows_n > 1;
+            let rows_n = row_dim.map_or(1, |d| pts[d]);
+            let rows = row_dim.is_some();
             // Producers the lane axis does not depend on: a tile computes
             // them once per workgroup instead of once per lane.
             let shared: Vec<usize> = lane_dim
@@ -1814,7 +1914,7 @@ impl TensorGraph {
                 for p in shared {
                     self.nodes[p].inline = true;
                 }
-            } else if c.red.len() == 1 && lanes >= 16 && rows {
+            } else if tileable_red(&c.red) && lanes >= 16 && rows {
                 // matmul-shaped: the 16×16 shared-memory tile, with a 4×4
                 // register tile once both axes are wide enough to fill it
                 // (won on an M4 and a 3090 alike; see BENCHMARKS.md)
@@ -1828,7 +1928,41 @@ impl TensorGraph {
             } else if pts.iter().product::<usize>() < MANY_POINTS {
                 self.nodes[i].split = 256;
             }
+            if self.nodes[i].tile.0 > 0 {
+                self.unfuse_heavy_epilogue(i);
+            }
         }
+    }
+
+    /// Schedule heuristic for a tiled epilogue map `m` (see
+    /// [`tiled_reduction`](Self::tiled_reduction)): measured on an M4, a
+    /// GELU epilogue (exp2 + recip per point, once per register-tile
+    /// copy) made ConvNeXt's F×C matmul slower fused (0.60 vs 0.56 ms
+    /// block) while snake/bias/residual epilogues win. Under a register
+    /// tile, an epilogue with exp/log hands the tile back to its
+    /// reduction and runs as its own map. Returns whether it unfused.
+    pub fn unfuse_heavy_epilogue(&mut self, m: usize) -> bool {
+        let Some(r) = self.tiled_reduction(m).filter(|&r| r != m) else {
+            return false;
+        };
+        if self.nodes[m].reg == (1, 1) {
+            return false;
+        }
+        let heavy = self.comp_at(m).is_some_and(|c| {
+            c.body
+                .nodes_slice()
+                .iter()
+                .any(|n| matches!(n, Node::Exp2(_) | Node::Log2(_)))
+        });
+        if !heavy {
+            return false;
+        }
+        self.nodes[r].inline = false;
+        self.nodes[r].tile = self.nodes[m].tile;
+        self.nodes[r].reg = self.nodes[m].reg;
+        self.nodes[m].tile = (0, 0, 0);
+        self.nodes[m].reg = (1, 1);
+        true
     }
 
     /// Common-subexpression elimination over comps: two live comps with
@@ -1979,7 +2113,10 @@ impl TensorGraph {
                 .map(|&d| cm.args[k].view.forms[d].clone())
                 .chain(cm.args[k].view.forms[kp..].iter().cloned())
                 .collect();
-            cm.args[k].view = View { forms };
+            cm.args[k].view = View {
+                forms,
+                guard: cm.args[k].view.guard,
+            };
         }
         (g, outputs.to_vec())
     }
@@ -2001,10 +2138,17 @@ impl TensorGraph {
                 let found = (2..=c.red.len()).rev().find_map(|d| {
                     let (outer, inner) = (k + d - 2, k + d - 1);
                     let n_inner = c.red[d - 1].fixed()?;
-                    let plan: Option<Vec<Option<(usize, Vec<Dim>)>>> = c
+                    let plan: Option<Vec<MergePlan>> = c
                         .args
                         .iter()
-                        .map(|a| g.merge_plan(a, outer, inner, n_inner))
+                        .map(|a| {
+                            // a guarded read's bounds are per source dim
+                            let reads = a.view.depends_on(outer) || a.view.depends_on(inner);
+                            if a.view.guard && reads {
+                                return None;
+                            }
+                            g.merge_plan(a, outer, inner, n_inner)
+                        })
                         .collect();
                     plan.map(|p| (d, p))
                 });
@@ -2033,7 +2177,10 @@ impl TensorGraph {
                         .collect();
                     args.push(Arg {
                         src,
-                        view: View { forms },
+                        view: View {
+                            forms,
+                            guard: a.view.guard,
+                        },
                     });
                 }
                 let n_inner = c.red[d - 1].fixed().unwrap();
@@ -2244,6 +2391,7 @@ impl TensorGraph {
                     .map(|a| Arg {
                         src: a.src,
                         view: View {
+                            guard: false,
                             forms: a
                                 .view
                                 .forms
@@ -2301,6 +2449,7 @@ impl TensorGraph {
         }
         let rank = shape.len() - 1;
         let slot_view = |s: usize| View {
+            guard: false,
             forms: (0..rank)
                 .map(|d| Form::unit(rank, d))
                 .chain([Form::constant(rank, s as i64)])
@@ -2441,7 +2590,11 @@ impl Evaluator<'_> {
         idx.extend(std::iter::repeat_n(0, c.red.len()));
         let mut body_at = |idx: &[usize], elem: &mut [f64]| {
             for (j, a) in c.args.iter().enumerate() {
-                arg_vals[j] = self.read(a.src, &a.view.coords(idx));
+                let shape = fixed(&self.g.nodes[a.src.n()].shape);
+                arg_vals[j] = match a.view.coords_in(idx, &shape) {
+                    Some(at) => self.read(a.src, &at),
+                    None => 0.0,
+                };
             }
             (k.body)(&arg_vals, elem);
         };
@@ -2862,9 +3015,18 @@ mod tests {
         assert_eq!(mg.count_comps(&outs), 2);
         close(&mg.eval(&inputs, &outs)[0], &want);
         let mut mg = mg;
+        let mut fused = mg.clone();
+        fused.schedule_inline(&outs);
+        assert_eq!(fused.materialized(&outs).len(), 1);
+        assert!(fused
+            .tiled_reduction(outs[0].n())
+            .is_some_and(|r| r != outs[0].n()));
         mg.schedule_auto(&outs);
-        assert_eq!(mg.materialized(&outs).len(), 1);
-        assert_eq!(mg.nodes()[outs[0].n()].tile, (16, 16, 32));
+        // under the 4×4 register tile the SiLU (exp) epilogue is handed
+        // back to its own map (`unfuse_heavy_epilogue`): two kernels
+        assert_eq!(mg.materialized(&outs).len(), 2);
+        let r = mg.tiled_reduction(outs[0].n());
+        assert_eq!(r, None);
         close(&mg.eval(&inputs, &outs)[0], &want);
 
         // siblings with different consumers stay apart: merging would
@@ -2920,6 +3082,7 @@ mod tests {
                 vec![Arg {
                     src: r,
                     view: View {
+                        guard: false,
                         forms: vec![
                             Form::unit(2, 0),
                             Form {
@@ -3156,5 +3319,199 @@ mod tests {
         assert_eq!(mats.len(), 1);
 
         close(&g.eval(&inputs, &outs)[0], &want);
+    }
+
+    /// `y[o, t] = Σ_{c,k} w[o,c,k] · x[c, t + d·k − p]` with zero padding.
+    fn conv1d(g: &mut TensorGraph, x: TensorId, w: TensorId, dil: i64, pad: i64) -> TensorId {
+        let (ci, t) = (g.shape(x)[0].n(), g.shape(x)[1].n());
+        let (co, k) = (g.shape(w)[0].n(), g.shape(w)[2].n());
+        // space: (o, t, c, k)
+        let xv = View {
+            forms: vec![
+                Form::unit(4, 2),
+                Form {
+                    coefs: vec![0, 1, 0, dil],
+                    offset: -pad,
+                },
+            ],
+            guard: true,
+        };
+        let wv = View::pick(4, &[Some(0), Some(2), Some(3)]);
+        g.comp(
+            &[co, t],
+            &[ci, k],
+            vec![Arg { src: x, view: xv }, Arg { src: w, view: wv }],
+            Some(Monoid::sum()),
+            |v| vec![v[0] * v[1]],
+        )
+        .unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn conv1d_ref(
+        x: &[f64],
+        w: &[f64],
+        ci: usize,
+        co: usize,
+        t: usize,
+        k: usize,
+        dil: i64,
+        pad: i64,
+    ) -> Vec<f64> {
+        let mut y = vec![0.0; co * t];
+        for o in 0..co {
+            for tt in 0..t {
+                for c in 0..ci {
+                    for kk in 0..k {
+                        let s = tt as i64 + dil * kk as i64 - pad;
+                        if (0..t as i64).contains(&s) {
+                            y[o * t + tt] += w[(o * ci + c) * k + kk] * x[c * t + s as usize];
+                        }
+                    }
+                }
+            }
+        }
+        y
+    }
+
+    #[test]
+    fn schedule_auto_tiles_multi_dim_reductions() {
+        // direct conv: red (c, k) -> chunked c, inner k; 2-D register tile
+        let mut g = TensorGraph::new();
+        let x = g.input(&[64, 200]);
+        let w = g.input(&[96, 64, 7]);
+        let y = conv1d(&mut g, x, w, 3, 9);
+        g.schedule_auto(&[y]);
+        assert_eq!(g.nodes()[y.n()].tile, (16, 16, 32));
+        assert_eq!(g.nodes()[y.n()].reg, (4, 4));
+        // too many inner elements per chunk step: not tiled
+        assert!(!tileable_red(&dims(&[64, 9, 9])));
+        assert!(tileable_red(&dims(&[512, 7])));
+        // a narrow trailing point dim is uniform, not the lane axis
+        assert_eq!(tile_axes(&[512, 512, 7]), (Some(1), Some(0)));
+        assert_eq!(tile_axes(&[256, 2000, 10]), (Some(1), Some(0)));
+        assert_eq!(tile_axes(&[1, 8]), (Some(1), None));
+    }
+
+    #[test]
+    fn windowed_staging_shrinks_conv_regions() {
+        // x[c, t + 3k − 9] over a 64-lane tile: one 64 + 3·6 = 82 wide
+        // window per staged channel instead of 7 copies of 64
+        let mut g = TensorGraph::new();
+        let x = g.input(&[512, 2000]);
+        let w = g.input(&[512, 512, 7]);
+        let y = conv1d(&mut g, x, w, 3, 9);
+        g.schedule_auto(&[y]);
+        let src = &g.to_wgsl(&[y]).kernels[0].source;
+        if std::env::var("TANG_DUMP").is_ok() {
+            eprintln!("{src}");
+        }
+        let sizes: Vec<usize> = src
+            .lines()
+            .filter_map(|l| l.strip_prefix("var<workgroup> stage_"))
+            .map(|l| {
+                let n = l.rsplit("array<f32, ").next().unwrap();
+                n.trim_end_matches(">;").parse().unwrap()
+            })
+            .collect();
+        assert_eq!(sizes.len(), 2);
+        assert!(sizes.iter().sum::<usize>() <= 4096);
+        let chunk = sizes[1] / (64 * 7);
+        assert!(chunk > 4, "chunk should grow past 4: {sizes:?}");
+        assert_eq!(sizes[0], 82 * chunk, "x should be staged as one window");
+    }
+
+    #[test]
+    fn guarded_view_is_zero_padding() {
+        let (ci, co, t, k, dil) = (3, 2, 7, 3, 2);
+        let pad = dil * (k as i64 - 1) / 2;
+        let mut g = TensorGraph::new();
+        let x = g.input(&[ci, t]);
+        let w = g.input(&[co, ci, k]);
+        let y = conv1d(&mut g, x, w, dil, pad);
+        let (xv, wv) = (ramp(ci * t, 0.3, -1.0), ramp(co * ci * k, 0.2, -0.4));
+        let want = conv1d_ref(&xv, &wv, ci, co, t, k, dil, pad);
+        close(&g.eval(&[xv.clone(), wv.clone()], &[y])[0], &want);
+
+        // the same read unguarded is still a shape error
+        let mut g2 = TensorGraph::new();
+        let x2 = g2.input(&[ci, t]);
+        let w2 = g2.input(&[co, ci, k]);
+        let mut bad = View::pick(4, &[Some(2), Some(1)]);
+        bad.forms[1].coefs[3] = dil;
+        bad.forms[1].offset = -pad;
+        let r = g2.comp(
+            &[co, t],
+            &[ci, k],
+            vec![
+                Arg {
+                    src: x2,
+                    view: bad.clone(),
+                },
+                Arg {
+                    src: w2,
+                    view: View::pick(4, &[Some(0), Some(2), Some(3)]),
+                },
+            ],
+            Some(Monoid::sum()),
+            |v| vec![v[0] * v[1]],
+        );
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn guarded_read_of_a_map_stays_materialized() {
+        // y = conv(snake(x)): snake(0) ≠ 0 in general, so the map is not
+        // spliced through the guarded read (it would pad with f(0))
+        let (ci, co, t, k) = (2, 2, 6, 3);
+        let mut g = TensorGraph::new();
+        let x = g.input(&[ci, t]);
+        let w = g.input(&[co, ci, k]);
+        let shifted = g.map(&[x], |v| v[0] + ExprId::from_f64(1.0)).unwrap();
+        let y = conv1d(&mut g, shifted, w, 1, 1);
+        let (xv, wv) = (ramp(ci * t, 0.3, -1.0), ramp(co * ci * k, 0.2, -0.4));
+        let xs: Vec<f64> = xv.iter().map(|v| v + 1.0).collect();
+        let want = conv1d_ref(&xs, &wv, ci, co, t, k, 1, 1);
+        let (fg, outs) = g.substitute_maps_with(&[y], false);
+        assert_eq!(fg.count_comps(&outs), 2);
+        close(&fg.eval(&[xv, wv], &outs)[0], &want);
+    }
+
+    #[test]
+    fn guarded_reads_compose_through_spliced_maps() {
+        // pad is a map with a guarded read; its consumer reads it plainly,
+        // so it splices away and the guard follows the leaf
+        let t = 5;
+        let mut g = TensorGraph::new();
+        let x = g.input(&[t]);
+        let pv = View {
+            forms: vec![Form {
+                coefs: vec![1],
+                offset: -2,
+            }],
+            guard: true,
+        };
+        let padded = g
+            .comp(&[t + 4], &[], vec![Arg { src: x, view: pv }], None, |v| {
+                vec![v[0]]
+            })
+            .unwrap();
+        let y = g
+            .map(&[padded], |v| v[0] * v[0] + ExprId::from_f64(1.0))
+            .unwrap();
+        let xv = ramp(t, 0.3, -1.0);
+        let want: Vec<f64> = (0..t + 4)
+            .map(|i| {
+                let v = if (2..t + 2).contains(&i) {
+                    xv[i - 2]
+                } else {
+                    0.0
+                };
+                v * v + 1.0
+            })
+            .collect();
+        let (fg, outs) = g.substitute_maps_with(&[y], false);
+        assert_eq!(fg.count_comps(&outs), 1);
+        close(&fg.eval(&[xv], &outs)[0], &want);
     }
 }

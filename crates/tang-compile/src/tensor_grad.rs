@@ -126,32 +126,91 @@ impl TensorGraph {
                 _ => scatter.push(d),
             }
         }
-        let free: Vec<usize> = (0..old_rank).filter(|&x| rename[x].is_none()).collect();
+        // A guarded read's `t + 3k − 9` is inverted by *eliminating* an
+        // out coord with coefficient ±1: `t = τ − 3k + 9`. The coord may
+        // then leave its range, so every view that reads it is guarded —
+        // dy among them, which zeroes the out-of-range terms. Contributions
+        // the forward dropped as padding never reach `a`.
+        let n_points = c.points().len();
+        let mut elim: Vec<Option<usize>> = vec![None; old_rank];
+        if arg.view.guard {
+            scatter.retain(|&d| {
+                let f = &arg.view.forms[d];
+                let pick = (0..n_points).find(|&x| {
+                    f.coefs[x].abs() == 1
+                        && rename[x].is_none()
+                        && elim[x].is_none()
+                        && arg
+                            .view
+                            .forms
+                            .iter()
+                            .enumerate()
+                            .all(|(e, g)| e == d || g.coefs[x] == 0)
+                        && arg.view.forms[d]
+                            .coefs
+                            .iter()
+                            .enumerate()
+                            .all(|(y, &cy)| y == x || cy == 0 || elim[y].is_none())
+                });
+                match pick {
+                    Some(x) => {
+                        elim[x] = Some(d);
+                        false
+                    }
+                    None => true,
+                }
+            });
+        }
+        let free: Vec<usize> = (0..old_rank)
+            .filter(|&x| rename[x].is_none() && elim[x].is_none())
+            .collect();
         for (i, &x) in free.iter().enumerate() {
             rename[x] = Some(a_shape.len() + i);
         }
         let new_rank = a_shape.len() + free.len();
         let red: Vec<Dim> = free.iter().map(|&x| space[x]).collect();
-
-        let rename_view = |v: &View| View {
-            forms: v
-                .forms
-                .iter()
-                .map(|f| {
-                    let mut nf = Form::zero(new_rank);
-                    nf.offset = f.offset;
-                    for (x, &coef) in f.coefs.iter().enumerate() {
-                        nf.coefs[rename[x].unwrap()] += coef;
+        // old coord -> affine form over the new space
+        let mut subst: Vec<Form> = (0..old_rank)
+            .map(|x| rename[x].map_or_else(|| Form::zero(new_rank), |n| Form::unit(new_rank, n)))
+            .collect();
+        for x in 0..old_rank {
+            let Some(d) = elim[x] else { continue };
+            let f = &arg.view.forms[d];
+            let sgn = f.coefs[x]; // ±1
+            let mut e = Form::unit(new_rank, d);
+            e.offset -= f.offset;
+            for (y, &cy) in f.coefs.iter().enumerate() {
+                if y != x && cy != 0 {
+                    for (o, i) in e.coefs.iter_mut().zip(&subst[y].coefs) {
+                        *o -= cy * i;
                     }
-                    nf
-                })
-                .collect(),
+                    e.offset -= cy * subst[y].offset;
+                }
+            }
+            for v in e.coefs.iter_mut() {
+                *v *= sgn;
+            }
+            e.offset *= sgn;
+            subst[x] = e;
+        }
+        // A guarded arg's coords may also be renamed onto a wider range
+        // (a source longer than the space reads), so guard every read.
+        let guard_all = arg.view.guard;
+        let subst_view = View {
+            guard: false,
+            forms: subst.clone(),
+        };
+        let rename_view = |v: &View| {
+            let mut r = v.compose(&subst_view, new_rank);
+            r.guard = v.guard || guard_all;
+            r
         };
         // dy is indexed by the old out coords (plus a slot for tuple comps)
         let w = c.width();
         let dy_view = |slot: Option<i64>| View {
+            guard: guard_all,
             forms: (0..c.points().len())
-                .map(|x| Form::unit(new_rank, rename[x].unwrap()))
+                .map(|x| subst[x].clone())
                 .chain(slot.map(|s| Form::constant(new_rank, s)))
                 .collect(),
         };
@@ -244,6 +303,7 @@ impl TensorGraph {
             };
             for &d in &scatter {
                 let f = rename_view(&View {
+                    guard: false,
                     forms: vec![arg.view.forms[d].clone()],
                 })
                 .forms
@@ -413,6 +473,7 @@ mod tests {
                 vec![Arg {
                     src: r,
                     view: View {
+                        guard: false,
                         forms: vec![
                             Form::unit(2, 0),
                             Form {
@@ -532,5 +593,125 @@ mod tests {
             .reduction_kinds(&outs)
             .contains(&MonoidKind::OnlineSoftmax));
         assert!(g.backward(outs[0], &[x]).is_ok());
+    }
+
+    #[test]
+    fn grads_through_guarded_conv() {
+        // y[o,t] = Σ_{c,k} w[o,c,k]·x[c, t + 2k − 2], zero padded
+        let (ci, co, t, k) = (2, 3, 6, 3);
+        let mut g = TensorGraph::new();
+        let x = g.input(&[ci, t]);
+        let w = g.input(&[co, ci, k]);
+        let xv = View {
+            forms: vec![
+                Form::unit(4, 2),
+                Form {
+                    coefs: vec![0, 1, 0, 2],
+                    offset: -2,
+                },
+            ],
+            guard: true,
+        };
+        let y = g
+            .comp(
+                &[co, t],
+                &[ci, k],
+                vec![
+                    Arg { src: x, view: xv },
+                    Arg {
+                        src: w,
+                        view: View::pick(4, &[Some(0), Some(2), Some(3)]),
+                    },
+                ],
+                Some(Monoid::sum()),
+                |v| vec![v[0] * v[1]],
+            )
+            .unwrap();
+        let act = g.map(&[y], |v| v[0] * v[0]).unwrap();
+        let grads = g.backward(act, &[x, w]).unwrap();
+        let inputs = [ramp(ci * t, 0.3, -1.0), ramp(co * ci * k, 0.2, -0.4)];
+        check_grad(&g, act, &inputs, 0, grads[0]);
+        check_grad(&g, act, &inputs, 1, grads[1]);
+        // dx is a gather by renaming, not a scatter over all of t: no iota
+        assert!(g.nodes()[grads[0].index()..]
+            .iter()
+            .all(|n| !matches!(n.op, Op::Iota(_))));
+    }
+
+    #[test]
+    fn grads_through_guarded_polyphase_upsample() {
+        // out[o, q, r] = Σ_{j,c} x[c, q − j] · w[o, c, r + s·j]  (conv_transpose)
+        let (ci, co, t, s, taps) = (2, 2, 4, 3, 2);
+        let mut g = TensorGraph::new();
+        let x = g.input(&[ci, t]);
+        let w = g.input(&[co, ci, s * taps]);
+        // space: (o, q, r, j, c)
+        let xv = View {
+            forms: vec![
+                Form::unit(5, 4),
+                Form {
+                    coefs: vec![0, 1, 0, -1, 0],
+                    offset: 0,
+                },
+            ],
+            guard: true,
+        };
+        let wv = View {
+            forms: vec![
+                Form::unit(5, 0),
+                Form::unit(5, 4),
+                Form {
+                    coefs: vec![0, 0, 1, s as i64, 0],
+                    offset: 0,
+                },
+            ],
+            guard: false,
+        };
+        let y = g
+            .comp(
+                &[co, t, s],
+                &[taps, ci],
+                vec![Arg { src: x, view: xv }, Arg { src: w, view: wv }],
+                Some(Monoid::sum()),
+                |v| vec![v[0] * v[1]],
+            )
+            .unwrap();
+        let act = g.map(&[y], |v| v[0] * v[0]).unwrap();
+        let grads = g.backward(act, &[x, w]).unwrap();
+        let inputs = [ramp(ci * t, 0.3, -1.0), ramp(co * ci * s * taps, 0.2, -0.4)];
+        check_grad(&g, act, &inputs, 0, grads[0]);
+        check_grad(&g, act, &inputs, 1, grads[1]);
+        // and the optimized backward agrees
+        let want = g.eval(&inputs, &grads);
+        let (fg, outs) = g.substitute_maps(&grads);
+        let got = fg.eval(&inputs, &outs);
+        for (a, b) in want.iter().zip(&got) {
+            for (x, y) in a.iter().zip(b) {
+                assert!((x - y).abs() < 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn guarded_crop_backward_stays_in_range() {
+        // y[t] = x[t − 2] for t in 0..4 from an x of length 7: the renamed
+        // coord τ ranges over 7 but dy only has 4
+        let mut g = TensorGraph::new();
+        let x = g.input(&[7]);
+        let v = View {
+            forms: vec![Form {
+                coefs: vec![1],
+                offset: -2,
+            }],
+            guard: true,
+        };
+        let y = g
+            .comp(&[4], &[], vec![Arg { src: x, view: v }], None, |v| {
+                vec![v[0] * v[0]]
+            })
+            .unwrap();
+        let grads = g.backward(y, &[x]).unwrap();
+        let inputs = [ramp(7, 0.3, -1.0)];
+        check_grad(&g, y, &inputs, 0, grads[0]);
     }
 }

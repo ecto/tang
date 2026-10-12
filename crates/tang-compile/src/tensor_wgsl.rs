@@ -276,7 +276,7 @@ impl TensorGraph {
         emit_step(
             &mut s,
             "        ",
-            &format!("body_{red_node}({})", arg_reads_with(rc, rp, None)),
+            &format!("body_{red_node}({})", arg_reads_with(self, rc, rp, None)),
             m,
         );
         writeln!(s, "    }}").unwrap();
@@ -303,6 +303,7 @@ impl TensorGraph {
             }
         } else {
             let reads_epi = arg_reads_with(
+                self,
                 c,
                 "p",
                 Some(&|a: &Arg| {
@@ -402,7 +403,7 @@ impl TensorGraph {
             .collect::<Vec<_>>()
             .join(", ");
         writeln!(s, "fn point_{j}({params}) -> array<f32, {w}> {{").unwrap();
-        let reads = arg_reads(c);
+        let reads = arg_reads(self, c);
         let Some(m) = &c.monoid else {
             writeln!(s, "    return body_{j}({reads});").unwrap();
             writeln!(s, "}}\n").unwrap();
@@ -510,8 +511,8 @@ pub(super) fn identity(m: &Monoid) -> String {
 }
 
 /// `read_src(view(p…, r…))` for every arg, as call arguments.
-fn arg_reads(c: &Comp) -> String {
-    arg_reads_with(c, "p", None)
+fn arg_reads(g: &TensorGraph, c: &Comp) -> String {
+    arg_reads_with(g, c, "p", None)
 }
 
 /// `u32(offset + Σ coef·{prefix}d)`.
@@ -529,7 +530,7 @@ fn affine(f: &Form, prefix: &str) -> String {
 /// substitute an expression for an arg's read.
 type ReadReplace<'a> = Option<&'a dyn Fn(&Arg) -> Option<String>>;
 
-fn arg_reads_with(c: &Comp, pts: &str, replace: ReadReplace) -> String {
+fn arg_reads_with(g: &TensorGraph, c: &Comp, pts: &str, replace: ReadReplace) -> String {
     let k = c.points().len();
     c.args
         .iter()
@@ -537,7 +538,7 @@ fn arg_reads_with(c: &Comp, pts: &str, replace: ReadReplace) -> String {
             if let Some(e) = replace.and_then(|r| r(a)) {
                 return e;
             }
-            let idx: Vec<String> = a
+            let signed: Vec<String> = a
                 .view
                 .forms
                 .iter()
@@ -553,10 +554,24 @@ fn arg_reads_with(c: &Comp, pts: &str, replace: ReadReplace) -> String {
                             terms.push(format!("{coef} * i32({name})"));
                         }
                     }
-                    format!("u32({})", terms.join(" + "))
+                    format!("({})", terms.join(" + "))
                 })
                 .collect();
-            format!("read_{}({})", a.src.n(), idx.join(", "))
+            let idx: Vec<String> = signed.iter().map(|e| format!("u32({e})")).collect();
+            let read = format!("read_{}({})", a.src.n(), idx.join(", "));
+            if !a.view.guard {
+                return read;
+            }
+            // zero padding: the read itself may wrap (robust buffer
+            // access keeps it in bounds); the select discards it
+            let shape = fixed(&g.nodes[a.src.n()].shape);
+            let cond = signed
+                .iter()
+                .zip(&shape)
+                .map(|(e, n)| format!("(u32({e}) < {n}u)"))
+                .collect::<Vec<_>>()
+                .join(" && ");
+            format!("select(0.0, {read}, {cond})")
         })
         .collect::<Vec<_>>()
         .join(", ")
