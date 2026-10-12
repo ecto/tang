@@ -858,7 +858,7 @@ impl TensorGraph {
 
     // -- analysis -----------------------------------------------------------
 
-    fn comp_at(&self, i: usize) -> Option<&Comp> {
+    pub fn comp_at(&self, i: usize) -> Option<&Comp> {
         match &self.nodes[i].op {
             Op::Comp(c) => Some(c),
             Op::Input(_) | Op::Iota(_) | Op::Reshape(_) => None,
