@@ -18,6 +18,19 @@ use tang_compile::tensor::memplan::MemoryPlan;
 use tang_compile::tensor::wgsl::WgslProgram;
 use tang_compile::tensor::{TensorGraph, TensorId};
 
+/// FNV-1a over the f32 bits of every output, to compare runs bitwise.
+fn bits_hash(outs: impl Iterator<Item = Vec<f32>>) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for v in outs {
+        for x in v {
+            for b in x.to_bits().to_le_bytes() {
+                h = (h ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+    }
+    h
+}
+
 fn mb(b: usize) -> f64 {
     b as f64 / (1 << 20) as f64
 }
@@ -248,6 +261,10 @@ fn run_wgpu(b: &Built, layers: usize, seq: usize) {
     );
     planned.run(&device, &mut cache);
     let loss_p = planned.read(&device, b.outs[0]);
+    println!(
+        "  output bits hash {:016x}",
+        bits_hash(b.outs.iter().map(|&t| planned.read(&device, t)))
+    );
     let p_p = planned.read(&device, b.outs[1]);
     let dp = p_n
         .iter()
@@ -329,6 +346,10 @@ fn run_cuda(b: &Built, layers: usize, seq: usize) {
     );
     inplace.run();
     let loss_i = inplace.read(b.outs[0]);
+    println!(
+        "  output bits hash {:016x}",
+        bits_hash(b.outs.iter().map(|&t| inplace.read(t)))
+    );
     let p_i = inplace.read(b.outs[1]);
     let dp = p_n
         .iter()
