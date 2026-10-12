@@ -713,6 +713,12 @@ What moved it:
   for 8×8; M4: 0.53 vs 0.50 for 8×8 chunk 16 — within noise), so
   `schedule_auto`'s rule stands. 8×8 is register-pressure bound: more
   FMAs per load but fewer workgroups in flight.
+- Double-buffered staging (two stage sets, next chunk prefetched into
+  registers during the reduce loop, one barrier per chunk) was tried and
+  reverted: on the M4 the dynamically indexed prefetch arrays spill and
+  the 4×4 chunk-32 tile went from 0.53 to 3.2 ms; on the 3090 it was
+  neutral (0.28–0.33). Without async copies, the extra registers cost
+  more than the hidden latency is worth on either chip.
 
 The gap to PyTorch is now 2.5× on matmul, 3–4× on attention and the
 block forward, 4× on the training step (against its quieter numbers).
