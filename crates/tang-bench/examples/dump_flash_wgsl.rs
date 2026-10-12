@@ -1,10 +1,27 @@
-//! Print the WGSL that tang-compile derives for tiled causal attention.
+//! Print the kernels tang-compile derives for tiled causal attention.
+//! `dump_flash_wgsl [n] [d] [full]`; with `full` the WGSL is printed too.
 fn main() {
-    let (g, y) = tang_bench::ir_gpu::flash_attention_tiled(128, 4, 4);
-    for k in g.to_wgsl(&[y]).kernels {
+    let args: Vec<String> = std::env::args().collect();
+    let n = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(128);
+    let d = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(4);
+    let full = args.get(3).is_some();
+    let (g, y) = tang_bench::ir_gpu::flash_attention_tiled(n, d, d);
+    let prog = g.to_wgsl(&[y]);
+    for k in &prog.kernels {
+        let node = &g.nodes()[k.node.index()];
         println!(
-            "// ===== kernel for node {:?}, reads {:?}, count {}\n{}",
-            k.node, k.reads, k.count, k.source
+            "// ===== kernel node {} shape {:?} inline-closure reads {:?} count {} wg {} split {} tile {:?}",
+            k.node.index(),
+            node.shape.iter().map(|d| d.n()).collect::<Vec<_>>(),
+            k.reads,
+            k.count,
+            k.workgroup_size,
+            node.split,
+            node.tile
         );
+        if full {
+            println!("{}", k.source);
+        }
     }
+    println!("materialized: {:?}", g.materialized(&[y]));
 }

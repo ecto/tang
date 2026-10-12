@@ -481,3 +481,52 @@ weight as one 47-kernel program, Adam as one program per weight (bias
 corrections are a 2-element input, updated each step), new weights and
 moments fed back GPU-side with `GpuBuffer::copy_from`. Loss on a fixed
 target: 0.606 → 0.038 in 30 steps. Nothing in the loop is hand-written.
+
+## Kernels vs tensor IR on an RTX 3090 (Vulkan)
+
+**Date:** 2026-10-12. Ubuntu 24.04, driver 580, wgpu Vulkan backend. Same
+branch, same code, no per-chip knowledge anywhere in the compiler; the
+tuning cache is keyed by device name. Readback floor is ~1.25 ms here.
+
+All 11 GPU tests pass with the same ~1e-6 errors as on the M4.
+
+| op | hand | best derived | schedule |
+|---|---|---|---|
+| causal attention 1024, d=64 | 3.85 ms | **1.40 ms** | tiled rows×lanes |
+| causal attention 512 | 1.88 ms | 1.42 ms | tiled |
+| matmul 1024² | 2.31 ms | 2.35 ms | 16×16 tile |
+| rmsnorm 2048×2048 | 5.96 ms | 6.05 ms | naive (16 MB readback) |
+| swiglu 4M | 6.62 ms | 6.22 ms | map |
+| adam step 4M | 5.88 ms | 5.97 ms | map |
+| transformer block seq 128 | 3.13 ms | **2.50 ms** | per-kernel autotune |
+| transformer block seq 512 | 10.4 ms | **6.20 ms** | per-kernel autotune |
+| decode block q1 / kv 256 | 2.49 ms | 1.71 ms | per-kernel autotune |
+| decode block q1 / kv 1024 | 3.85 ms | 1.68 ms | auto |
+| training step seq 32 | 53.6 ms | **3.71 ms** | auto |
+| training step seq 128 | 175 ms | **9.64 ms** | auto |
+
+What the second chip taught the compiler (all of it landed in this
+branch):
+
+- The block initially *lost* here (5.5 ms vs 3.0) while winning on the
+  M4. Per-kernel profiling showed `substitute_maps` folding the
+  normalization, residual add and SwiGLU activation (with its `exp`) into
+  the projection matmuls' bodies — recomputed once per output column.
+  The M4 shrugged; the 3090 did not. Substitution is now cost-aware.
+- Folding a matmul into its bias-add map (one thread per point) hid the
+  reduction from every tiled schedule. Reductions now stay materialized
+  under maps; that is what let the autotuner pick the 16×16 tile for the
+  projections and take the block from 5.1 ms to 2.5 ms.
+- The staged tiles were laid out point-major, so consecutive lanes read
+  words 32 apart: 32-way bank conflicts. Point-minor layout took the
+  16×16 matmul tile from 6.25 ms to 2.35 ms (hand parity) on the 3090
+  and changed nothing on the M4.
+- `schedule_auto`'s rules of thumb were distilled on the M4 and are
+  wrong for matmul here (naive 2.77 vs tiled 2.35); `split` on a 66-wide
+  tuple is catastrophic on NVIDIA (59 ms). The per-kernel autotuner is
+  the answer on both chips, with the rules as its starting point.
+
+M4 figures earlier in this file were measured on a different day;
+absolute times on that machine drift by ±2× with its power state (the
+same commit measured 1.35 ms and 3.8 ms for tiled attention an hour
+apart). Compare columns within one table, not across days.

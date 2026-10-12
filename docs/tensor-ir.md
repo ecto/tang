@@ -119,6 +119,14 @@ The winning schedule is a property of (graph, chip, size), not of the op:
 - Matmul wants one thread per point; shared-memory tiling does not pay
   because the operands already sit in cache.
 
+Then the same branch ran on an RTX 3090. The attention and matmul results
+held; the transformer block *lost* until three chip-agnostic fixes landed
+(cost-aware substitution, keeping reductions schedulable under their
+epilogue maps, bank-conflict-free tile layout), after which the autotuned
+block beat the hand path there too (2.5 vs 3.1 ms, 6.2 vs 10.4 ms). The
+rules of thumb distilled on the M4 pick the wrong matmul schedule on
+NVIDIA; the per-kernel tuner picks the right one on both.
+
 That is the strong form of the claim: decomposing into IR and choosing the
 schedule per target is not just as good as hand kernels, it is the only
 way to be right on every chip at once. A hand kernel is one point in the
