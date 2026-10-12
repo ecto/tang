@@ -10,7 +10,7 @@ fn main() {
 #[cfg(feature = "cuda")]
 fn main() {
     use cudarc::driver::CudaContext;
-    use tang_bench::ir_block::{compiled_block, BlockDims};
+    use tang_bench::ir_block::{compiled_block, train_loss_graph, BlockDims};
     use tang_bench::ir_cuda::CudaExecutable;
     use tang_compile::tensor::TensorGraph;
 
@@ -95,6 +95,50 @@ fn main() {
                 k.node,
                 node.shape,
                 node.split,
+                node.tile,
+                if k.source.contains("wmma") {
+                    "wmma"
+                } else {
+                    ""
+                }
+            );
+        }
+        // training step: loss + every gradient, same pipeline
+        let (tg, outs, _) = train_loss_graph(&dims);
+        let (tg, outs) = tg.stabilize_softmax(&outs);
+        let (tg, outs) = tg.substitute_maps(&outs);
+        let (tg, outs) = tg.eliminate_common(&outs);
+        let (tg, outs) = tg.merge_siblings(&outs);
+        let (tg, outs) = tg.relayout(&outs);
+        let (mut tg, outs) = tg.merge_reduce_dims(&outs);
+        tg.schedule_auto(&outs);
+        let program = tg.to_cuda(&outs);
+        let n_native = program
+            .kernels
+            .iter()
+            .filter(|k| k.source.contains("wmma"))
+            .count();
+        let n_kernels = program.kernels.len();
+        let target = vec![0.0f32; seq * 576];
+        let mut refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
+        refs.push(&target);
+        let train = CudaExecutable::new(&ctx, program, &refs);
+        let ms = train.time(50);
+        println!(
+            "block seq={seq}: fwd+bwd {ms:.3} ms ({n_kernels} kernels, {n_native} on tensor cores)"
+        );
+        let mut slow: Vec<(f64, usize)> = (0..n_kernels)
+            .map(|i| (train.time_kernel(i, 10), i))
+            .collect();
+        slow.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        for (ms, i) in slow.iter().take(6) {
+            let k = &train.program.kernels[*i];
+            let node = &tg.nodes()[k.node.index()];
+            println!(
+                "  {ms:7.3} ms  node {:?} shape {:?} red {:?} tile {:?} {}",
+                k.node,
+                node.shape,
+                tg.comp_at(k.node.index()).map(|c| c.red.clone()),
                 node.tile,
                 if k.source.contains("wmma") {
                     "wmma"
