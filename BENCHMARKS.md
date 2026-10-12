@@ -699,16 +699,30 @@ f 0.41→0.24 ms), so both are listed. The M4 was noisy on later runs (a
 direct/auto 2.43 vs 3.10 ms back to back); the table takes the best of
 three full runs.
 
-| op | before (ms) | after (ms) | after: algebra / schedule | MPS (ms) then · now | after / MPS now |
-|---|---:|---:|---|---:|---:|
-| a conv1d 512→512 k7 d3, T 2000 | 2.926 im2col | **2.408** | direct / autotune (1 kernel) | 0.850 · 0.712 | 3.4× slower |
-| b upsample 512→256 k20 s10, T 2000 → 20000 | 3.544 | 3.381 | unfold + bmm / auto (3); direct polyphase now 3.64 (1) | polyphase conv1d 1.173 · 1.176 | 2.9× slower |
-| c iSTFT n_fft 20 hop 5, 4000 frames | 0.085 | 0.052 | DFT inlined into OLA / auto (1) | irfft+fold 0.197 · 0.111 | 2.1× faster |
-| d conv (a) + bias + snake | 3.021 im2col | **2.421** | direct, snake as tiled epilogue / autotune (**1 kernel**) | 0.889 · 0.813 | 3.0× slower |
-| e AdaIN C 512 T 2000, style 128 | 0.214 | 0.213 | auto (6) | 0.440 · 0.233 | 1.1× faster |
-| f ConvNeXt block C 512 T 200 F 1536 | 0.571 | 0.544 | auto (8: residual epilogue fused) | 0.408 · 0.244 | 2.2× slower |
-| a fwd+bwd (dx, dw) | 6.137 im2col | 6.173 im2col · 7.003 direct | im2col / auto (5) | 2.232 · 2.169 | 2.8× slower |
-| f fwd+bwd (all 9 params) | 1.606 | 1.591 | auto (30) | 1.038 · 0.982 | 1.6× slower |
+| op | before (ms) | after (ms) | windowed (ms) | windowed: algebra / schedule | MPS (ms) | windowed / MPS |
+|---|---:|---:|---:|---|---:|---:|
+| a conv1d 512→512 k7 d3, T 2000 | 2.926 im2col | 2.408 | **2.199** | direct / autotune (1 kernel), 3.34 TFLOP/s | 0.855 | 2.6× slower |
+| b upsample 512→256 k20 s10, T 2000 → 20000 | 3.544 | 3.381 | 3.321 | unfold + bmm / auto (3); direct polyphase 3.98 (was 3.75) | 1.072 conv only · 1.274 | 3.1× slower |
+| c iSTFT n_fft 20 hop 5, 4000 frames | 0.085 | 0.052 | 0.074 | DFT inlined into OLA / autotune (1) | 0.110 | 1.5× faster |
+| d conv (a) + bias + snake | 3.021 im2col | 2.421 | **2.197** | direct + snake epilogue / auto (1 kernel) | 0.847 | 2.6× slower |
+| e AdaIN C 512 T 2000, style 128 | 0.214 | 0.213 | 0.197 | auto (6) | 0.245 | 1.2× faster |
+| f ConvNeXt block C 512 T 200 F 1536 | 0.571 | 0.544 | 0.550 | auto (8) | 0.246 | 2.2× slower |
+| a fwd+bwd (dx, dw) | 6.137 | 6.173 im2col · 7.003 direct | 6.263 im2col · 6.627 direct (was 6.936) | im2col / auto (5) | 2.244 | 2.8× slower |
+| f fwd+bwd (all 9 params) | 1.606 | 1.591 | 1.619 | auto (30) | 1.031 | 1.6× slower |
+
+**Windowed staging** (this column): a staged read affine in the lane
+axis, `t` and the unrolled inner reduce dims folds the overlapping vars
+into one window per chunk. The conv's `x[c, t + 3k − 9]` stages
+`64 + 3·6 = 82` floats per channel instead of `7 × 64`, so under the
+16 KiB cap the chunk grows from 4 to 7 (the weight tile, 448 floats per
+channel, is now the limit). Guarded windows rebuild the guarded coord
+from the window position, so zero padding stays at staging. Windowed and
+before columns are best of 3 serial runs on an otherwise idle M4 Max
+(the machine was still noisy: one run of three was ~1.3× slow across the
+board); "before" re-measured alongside: a 2.407, b 3.415, d 2.398,
+a fwd+bwd 5.967 im2col. MPS best of 3 from the same session. The
+polyphase upsample's direct kernel did not improve (its x window is
+already small next to the `w[o, c, r + s·j]` tile).
 
 Full per-schedule run, after (naive / `schedule_auto` / per-kernel autotune):
 
