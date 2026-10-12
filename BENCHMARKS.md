@@ -482,6 +482,30 @@ corrections are a 2-element input, updated each step), new weights and
 moments fed back GPU-side with `GpuBuffer::copy_from`. Loss on a fixed
 target: 0.606 → 0.038 in 30 steps. Nothing in the loop is hand-written.
 
+## M4 Max, one consistent run (2026-10-12, final branch state)
+
+The sections above were measured on different days as the branch grew
+and the machine's power state wandered. This table is one run of
+`cargo bench -p tang-bench --bench kernels_vs_ir -- kvi_gpu` on the final
+code; the readback floor during this run was ~1.8 ms (the machine was in
+its slow state, so absolute times are ~1.5× the earlier sections).
+
+| op | hand | best derived | schedule |
+|---|---|---|---|
+| causal attention 128 | 3.70 ms | **1.82 ms** | tiled |
+| causal attention 512 | 4.91 ms | **2.02 ms** | auto (tiled) |
+| causal attention 1024 | 10.9 ms | **3.31 ms** | naive (n² threads) |
+| matmul 1024² | 6.68 ms | 5.49 ms | auto |
+| rmsnorm 2048×2048 | 2.52 ms | 2.70 ms | auto (split) |
+| swiglu 4M | 2.50 ms | 2.71 ms | map |
+| adam step 4M | 2.67 ms | 2.71 ms | map |
+| transformer block seq 128 | 5.02 ms | **3.74 ms** | auto |
+| transformer block seq 512 | 23.9 ms | **10.1 ms** | per-kernel autotune |
+| decode block q1 / kv 256 | 5.29 ms | **2.13 ms** | auto |
+| decode block q1 / kv 1024 | 8.80 ms | **3.28 ms** | per-kernel autotune |
+| training step seq 32 | 65.8 ms | **4.73 ms** | auto |
+| training step seq 128 | 179 ms | **7.96 ms** | auto |
+
 ## Kernels vs tensor IR on an RTX 3090 (Vulkan)
 
 **Date:** 2026-10-12. Ubuntu 24.04, driver 580, wgpu Vulkan backend. Same
