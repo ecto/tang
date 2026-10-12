@@ -28,7 +28,7 @@ fn main() {
         let (av, bv) = (rand(m * k), rand(k * n));
         let exe = CudaExecutable::new(&ctx, g.to_cuda(&[c]), &[&av, &bv]);
         let native = exe.program.kernels[0].source.contains("wmma");
-        let ms = exe.time(&ctx, 50);
+        let ms = exe.time(50);
         println!("matmul {m}x{k}x{n}: {ms:.3} ms (native wmma: {native})");
     }
 
@@ -82,7 +82,7 @@ fn main() {
             let scale = want.iter().map(|y| y.abs()).fold(0.0, f64::max);
             println!("block seq={seq}: max err {err:.2e} (max |ref| {scale:.2})");
         }
-        let ms = exe.time(&ctx, 50);
+        let ms = exe.time(50);
         println!(
             "block seq={seq}: fwd {ms:.3} ms ({} kernels, {n_native} on tensor cores)",
             exe.program.kernels.len()

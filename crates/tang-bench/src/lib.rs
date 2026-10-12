@@ -1195,20 +1195,19 @@ pub mod ir_cuda {
                 .expect("download")
         }
 
-        /// Milliseconds per run over `iters` launches of the whole program.
-        pub fn time(&self, ctx: &Arc<CudaContext>, iters: usize) -> f64 {
+        /// Milliseconds per run over `iters` launches of the whole program
+        /// (wall clock around a stream sync; launches are asynchronous).
+        pub fn time(&self, iters: usize) -> f64 {
             for _ in 0..3 {
                 self.run();
             }
-            let start = ctx.new_event(None).expect("event");
-            let end = ctx.new_event(None).expect("event");
-            start.record(&self.stream).expect("record");
+            self.stream.synchronize().expect("sync");
+            let t = std::time::Instant::now();
             for _ in 0..iters {
                 self.run();
             }
-            end.record(&self.stream).expect("record");
-            end.synchronize().expect("sync");
-            start.elapsed_ms(&end).expect("elapsed") as f64 / iters as f64
+            self.stream.synchronize().expect("sync");
+            t.elapsed().as_secs_f64() * 1e3 / iters as f64
         }
     }
 }
