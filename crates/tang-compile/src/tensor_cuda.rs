@@ -402,8 +402,8 @@ pub fn wgsl_to_cuda(wgsl: &str, workgroup_size: u32) -> String {
             let ret = ret.trim_end_matches(" {").trim_end_matches('{').trim();
             let (name, params) = sig.split_once('(').expect("fn params");
             let params = params.trim_end_matches(')');
-            let params: Vec<String> = params
-                .split(", ")
+            let params: Vec<String> = split_top(params)
+                .into_iter()
                 .filter(|p| !p.is_empty())
                 .map(|p| {
                     let (n, ty) = p.split_once(": ").expect("param");
@@ -441,6 +441,29 @@ struct Vec4 {
 #define select(f, t, c) ((c) ? (t) : (f))
 __device__ __forceinline__ unsigned min(unsigned a, unsigned b) { return a < b ? a : b; }
 "#;
+
+/// Split on `, ` outside angle brackets (`a: array<f32, 2>, b: f32`).
+fn split_top(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut depth, mut start) = (0usize, 0usize);
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'<' => depth += 1,
+            b'>' => depth -= 1,
+            b',' if depth == 0 && b.get(i + 1) == Some(&b' ') => {
+                out.push(&s[start..i]);
+                start = i + 2;
+                i += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push(&s[start..]);
+    out
+}
 
 fn cuda_type(ty: &str) -> String {
     let ty = ty.trim();
