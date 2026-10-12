@@ -466,7 +466,8 @@ pub mod ir_gpu {
         let (g, y) = naive_attention(n, d, dv);
         let (g, outs) = g.stabilize_softmax(&[y]);
         let (g, outs) = g.substitute_maps(&outs);
-        let (mut g, outs) = g.eliminate_common(&outs);
+        let (g, outs) = g.eliminate_common(&outs);
+        let (mut g, outs) = g.merge_siblings(&outs);
         g.schedule_auto(&outs);
         (g, outs[0])
     }
@@ -1493,7 +1494,8 @@ pub mod ir_block {
         let (g, out) = transformer_block(dims);
         let (g, outs) = g.stabilize_softmax(&[out]);
         let (g, outs) = g.substitute_maps(&outs);
-        let (mut g, outs) = g.eliminate_common(&outs);
+        let (g, outs) = g.eliminate_common(&outs);
+        let (mut g, outs) = g.merge_siblings(&outs);
         g.schedule_auto(&outs);
         (g, outs[0])
     }
@@ -1814,7 +1816,8 @@ pub mod ir_block_gpu {
         let mut outs = vec![out];
         outs.extend(grads);
         let (g, outs) = g.substitute_maps(&outs);
-        let (mut g, outs) = g.eliminate_common(&outs);
+        let (g, outs) = g.eliminate_common(&outs);
+        let (mut g, outs) = g.merge_siblings(&outs);
         g.schedule_auto(&outs);
         let inputs: Vec<&[f32]> = p.cpu.iter().map(|v| v.as_slice()).collect();
         (Executable::new(device, g.to_wgsl(&outs), &inputs), outs)
@@ -2111,7 +2114,8 @@ pub mod ir_block_gpu {
             let want = g.eval(&f64_inputs, &grads);
 
             let (g, outs) = g.substitute_maps(&grads);
-            let (mut g, outs) = g.eliminate_common(&outs);
+            let (g, outs) = g.eliminate_common(&outs);
+            let (mut g, outs) = g.merge_siblings(&outs);
             g.schedule_auto(&outs);
             let program = g.to_wgsl(&outs);
             let n_kernels = program.kernels.len();

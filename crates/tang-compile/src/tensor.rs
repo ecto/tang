@@ -1888,6 +1888,124 @@ impl TensorGraph {
         g.eliminate_dead(&outs)
     }
 
+    /// Sibling reductions — the same points, reduce dims and monoid,
+    /// each one value per point, read by exactly the same consumers —
+    /// become one comp producing all of them (the product monoid, one
+    /// tuple dim). A map over the siblings then reads a single reduction
+    /// and is its epilogue: the gate and up projections of a SwiGLU MLP
+    /// and their activation are one kernel, with one pass over the
+    /// shared operand.
+    pub fn merge_siblings(&self, outputs: &[TensorId]) -> (TensorGraph, Vec<TensorId>) {
+        const MAX_GROUP: usize = 4;
+        let n = self.nodes.len();
+        let live = self.live(outputs);
+        let is_output = |i: usize| outputs.iter().any(|o| o.n() == i);
+        let mut consumers: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for i in (0..n).filter(|&i| live[i]) {
+            for d in self.deps(i) {
+                if consumers[d].last() != Some(&i) {
+                    consumers[d].push(i);
+                }
+            }
+        }
+        let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut order: Vec<String> = Vec::new();
+        for i in (0..n).filter(|&i| live[i] && !is_output(i)) {
+            let Some(c) = self.comp_at(i) else { continue };
+            let Some(m) = &c.monoid else { continue };
+            let readers = &consumers[i];
+            if c.tuple != 0
+                || c.width() != 1
+                || readers.is_empty()
+                || readers.iter().any(|&r| self.comp_at(r).is_none())
+            {
+                continue;
+            }
+            let key = format!(
+                "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+                c.out,
+                c.red,
+                m.identity.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                m.combine.nodes_slice(),
+                m.outs,
+                readers
+            );
+            let g = groups.entry(key.clone()).or_insert_with(|| {
+                order.push(key);
+                Vec::new()
+            });
+            g.push(i);
+        }
+        let mut g = self.clone();
+        // member -> (merged node, slot)
+        let mut slot_of: Vec<Option<(usize, usize)>> = vec![None; n];
+        for key in &order {
+            for members in groups[key].chunks(MAX_GROUP).filter(|m| m.len() > 1) {
+                let first = self.comp_at(members[0]).unwrap();
+                let k = members.len();
+                let mut args: Vec<Arg> = Vec::new();
+                let mut body = ExprGraph::new();
+                let mut body_outs = Vec::with_capacity(k);
+                let mut combine = ExprGraph::new();
+                let acc: Vec<ExprId> = (0..k).map(|j| combine.var(j as u16)).collect();
+                let el: Vec<ExprId> = (0..k).map(|j| combine.var((k + j) as u16)).collect();
+                let mut outs = Vec::with_capacity(k);
+                let mut identity = Vec::with_capacity(k);
+                for (j, &i) in members.iter().enumerate() {
+                    let c = self.comp_at(i).unwrap();
+                    let vars: Vec<ExprId> = c
+                        .args
+                        .iter()
+                        .map(|a| body.var(intern_arg(&mut args, a.clone()) as u16))
+                        .collect();
+                    body_outs.push(replay(&c.body, &c.body_outs, &vars, &mut body)[0]);
+                    let m = c.monoid.as_ref().unwrap();
+                    outs.push(replay(&m.combine, &m.outs, &[acc[j], el[j]], &mut combine)[0]);
+                    identity.push(m.identity[0]);
+                }
+                let mut out = first.out.clone();
+                out.push(Dim::Fixed(k));
+                let merged = g.nodes.len();
+                g.nodes.push(TNode {
+                    shape: out.clone(),
+                    inline: false,
+                    split: 0,
+                    tile: (0, 0, 0),
+                    reg: (1, 1),
+                    op: Op::Comp(Comp {
+                        out,
+                        tuple: 1,
+                        red: first.red.clone(),
+                        args,
+                        body,
+                        body_outs,
+                        monoid: Some(Monoid {
+                            width: k,
+                            identity,
+                            combine,
+                            outs,
+                        }),
+                    }),
+                });
+                for (j, &i) in members.iter().enumerate() {
+                    slot_of[i] = Some((merged, j));
+                }
+            }
+        }
+        for i in 0..n {
+            if let Op::Comp(c) = &mut g.nodes[i].op {
+                let rank = c.rank();
+                for a in &mut c.args {
+                    if let Some((merged, slot)) = slot_of[a.src.n()] {
+                        a.src = TensorId(merged as u32);
+                        a.view.forms.push(Form::constant(rank, slot as i64));
+                    }
+                }
+            }
+        }
+        g.eliminate_dead(outputs)
+    }
+
     /// Placement: split the (single) reduce axis of comp `t` into `parts`
     /// partial reductions over contiguous slices — each a comp that can
     /// live on its own device — plus a combine that folds the partials
@@ -2420,6 +2538,52 @@ mod tests {
             &fg.eval(std::slice::from_ref(&data), &outs)[0],
             &g.eval(std::slice::from_ref(&data), &[y])[0],
         );
+    }
+
+    #[test]
+    fn merge_siblings_fuses_gate_and_up_with_their_activation() {
+        // swiglu: silu(x·wg) * (x·wu) — two reductions over the same
+        // space with the same consumer become one, and the activation
+        // is that reduction's epilogue: one kernel
+        let mut g = TensorGraph::new();
+        let x = g.input(&[64, 64]);
+        let wg = g.input(&[64, 128]);
+        let wu = g.input(&[64, 128]);
+        let gate = g.matmul(x, wg).unwrap();
+        let up = g.matmul(x, wu).unwrap();
+        let y = g
+            .map(&[gate, up], |v| {
+                let one = ExprId::from_f64(1.0);
+                v[0] / (one + (-v[0]).exp()) * v[1]
+            })
+            .unwrap();
+        let inputs = [
+            ramp(64 * 64, 0.01, -0.5),
+            ramp(64 * 128, 0.003, -0.2),
+            ramp(64 * 128, -0.002, 0.3),
+        ];
+        let want = g.eval(&inputs, &[y]).remove(0);
+        let (mg, outs) = g.merge_siblings(&[y]);
+        assert_eq!(mg.count_comps(&outs), 2);
+        close(&mg.eval(&inputs, &outs)[0], &want);
+        let mut mg = mg;
+        mg.schedule_auto(&outs);
+        assert_eq!(mg.materialized(&outs).len(), 1);
+        assert_eq!(mg.nodes()[outs[0].n()].tile, (16, 16, 32));
+        close(&mg.eval(&inputs, &outs)[0], &want);
+
+        // siblings with different consumers stay apart: merging would
+        // cost each of them its own epilogue
+        let mut g = TensorGraph::new();
+        let x = g.input(&[64, 64]);
+        let wg = g.input(&[64, 128]);
+        let wu = g.input(&[64, 128]);
+        let gate = g.matmul(x, wg).unwrap();
+        let up = g.matmul(x, wu).unwrap();
+        let a = g.map(&[gate], |v| v[0] * ExprId::from_f64(2.0)).unwrap();
+        let b = g.map(&[up], |v| v[0] * ExprId::from_f64(3.0)).unwrap();
+        let (mg, outs) = g.merge_siblings(&[a, b]);
+        assert_eq!(mg.count_comps(&outs), 4);
     }
 
     #[test]
