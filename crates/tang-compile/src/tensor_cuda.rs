@@ -103,12 +103,12 @@ pub struct FlashShape {
 /// The flash shapes a tuner chooses between, one per [`MMA_SHAPES`]
 /// variant; the first is the default.
 pub const FLASH_SHAPES: [FlashShape; 6] = [
-    FlashShape { bi: 0, bj: 64, stages: 2, kw: 1 },
-    FlashShape { bi: 0, bj: 32, stages: 3, kw: 1 },
-    FlashShape { bi: 0, bj: 64, stages: 2, kw: 2 },
     FlashShape { bi: 0, bj: 32, stages: 2, kw: 2 },
-    FlashShape { bi: 16, bj: 64, stages: 2, kw: 1 },
-    FlashShape { bi: 0, bj: 32, stages: 2, kw: 1 },
+    FlashShape { bi: 0, bj: 64, stages: 2, kw: 1 },
+    FlashShape { bi: 0, bj: 16, stages: 3, kw: 2 },
+    FlashShape { bi: 0, bj: 16, stages: 2, kw: 4 },
+    FlashShape { bi: 32, bj: 32, stages: 2, kw: 2 },
+    FlashShape { bi: 0, bj: 32, stages: 3, kw: 1 },
 ];
 
 /// The PTX helpers the tensor-core kernels share: TF32 rounding, `mma`
