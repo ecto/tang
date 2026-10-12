@@ -874,7 +874,10 @@ impl TensorGraph {
     fn use_counts(&self, outputs: &[TensorId], live: &[bool]) -> Vec<usize> {
         let mut uses = vec![0; self.nodes.len()];
         for i in (0..self.nodes.len()).filter(|&i| live[i]) {
-            for d in self.deps(i) {
+            let mut deps = self.deps(i);
+            deps.sort_unstable();
+            deps.dedup();
+            for d in deps {
                 uses[d] += 1;
             }
         }
@@ -882,6 +885,115 @@ impl TensorGraph {
             uses[o.n()] += 1;
         }
         uses
+    }
+
+    /// How a map reads a reduction point-for-point, when it does: the
+    /// reduction's point coordinates as affine forms over the map's
+    /// points (shared by every arg that reads it), with each arg's view
+    /// into the tuple dims a constant. Such a map is the reduction's
+    /// epilogue: every value it needs is one thread's final accumulator.
+    ///
+    /// A state slot that does not vary along a point dim (the row sum of
+    /// an online softmax along its lanes) may be read at any coordinate
+    /// of that dim: every thread's accumulator holds the same value.
+    pub(super) fn epilogue_read(&self, c: &Comp, p: usize) -> Option<Vec<Form>> {
+        let pc = self.comp_at(p)?;
+        let pk = pc.points().len();
+        let varies = self.slot_varies(pc);
+        let mut points: Vec<Option<Form>> = vec![None; pk];
+        let mut fallback: Option<Vec<Form>> = None;
+        for a in c.args.iter().filter(|a| a.src.n() == p) {
+            let (pt, state) = a.view.forms.split_at(pk);
+            if state.iter().any(|f| f.coefs.iter().any(|&x| x != 0)) {
+                return None;
+            }
+            let slot = self.epilogue_slot(a);
+            for d in (0..pk).filter(|&d| varies[slot][d]) {
+                match &points[d] {
+                    Some(q) if *q != pt[d] => return None,
+                    Some(_) => {}
+                    None => points[d] = Some(pt[d].clone()),
+                }
+            }
+            fallback.get_or_insert_with(|| pt.to_vec());
+        }
+        let fallback = fallback?;
+        Some(
+            points
+                .into_iter()
+                .zip(fallback)
+                .map(|(p, f)| p.unwrap_or(f))
+                .collect(),
+        )
+    }
+
+    /// `[slot][dim]`: whether state slot `slot` of reduction `c` can vary
+    /// along point dim `dim`. A slot varies along a dim when, through the
+    /// monoid's combine, it depends on an element value whose body reads
+    /// an arg along that dim.
+    fn slot_varies(&self, c: &Comp) -> Vec<Vec<bool>> {
+        let w = c.width();
+        let pk = c.points().len();
+        let var_dims = |g: &ExprGraph, out: ExprId, f: &mut dyn FnMut(u16)| {
+            for k in g.live_set(&[out]) {
+                if let Node::Var(v) = g.nodes_slice()[k] {
+                    f(v);
+                }
+            }
+        };
+        // element slot e varies along d when body out e reads an arg along d
+        let mut elem = vec![vec![false; pk]; w];
+        for (e, &out) in c.body_outs.iter().enumerate() {
+            var_dims(&c.body, out, &mut |v| {
+                for d in 0..pk {
+                    elem[e][d] |= c.args[v as usize].view.depends_on(d);
+                }
+            });
+        }
+        let Some(m) = &c.monoid else { return elem };
+        // state slot k depends on element slots and other state slots
+        let deps: Vec<(Vec<usize>, Vec<usize>)> = m
+            .outs
+            .iter()
+            .map(|&out| {
+                let (mut st, mut el) = (Vec::new(), Vec::new());
+                var_dims(&m.combine, out, &mut |v| {
+                    if (v as usize) < w {
+                        st.push(v as usize)
+                    } else {
+                        el.push(v as usize - w)
+                    }
+                });
+                (st, el)
+            })
+            .collect();
+        let mut varies = vec![vec![false; pk]; w];
+        loop {
+            let mut changed = false;
+            for k in 0..w {
+                for d in 0..pk {
+                    let v = deps[k].1.iter().any(|&e| elem[e][d])
+                        || deps[k].0.iter().any(|&j| varies[j][d]);
+                    if v && !varies[k][d] {
+                        varies[k][d] = true;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                return varies;
+            }
+        }
+    }
+
+    /// Constant tuple slot an epilogue arg reads from its reduction.
+    pub(super) fn epilogue_slot(&self, a: &Arg) -> usize {
+        let pc = self.comp_at(a.src.n()).unwrap();
+        let pk = pc.points().len();
+        a.view.forms[pk..]
+            .iter()
+            .zip(&pc.out[pk..])
+            .fold(0usize, |acc, (f, d)| acc * d.n() + f.offset as usize)
     }
 
     /// The reduction a tiled schedule of `root` iterates: `root` itself,
@@ -898,10 +1010,8 @@ impl TensorGraph {
             let Some(pc) = self.comp_at(p) else { continue };
             if self.nodes[p].inline && pc.monoid.is_some() {
                 let ok = pc.red.len() == 1
-                    && pc.tuple == 0
-                    && pc.width() == 1
-                    && a.view == View::identity(c.rank(), c.rank())
-                    && found.is_none();
+                    && (found.is_none() || found == Some(p))
+                    && self.epilogue_read(c, p).is_some();
                 if !ok {
                     return None;
                 }
@@ -1521,19 +1631,19 @@ impl TensorGraph {
         let mut consumer_reduces = vec![false; n];
         for i in (0..n).filter(|&i| live[i]) {
             if let Some(c) = self.comp_at(i) {
-                let epilogue_ok = c.monoid.is_none()
-                    && c.args
-                        .iter()
-                        .filter(|a| self.comp_at(a.src.n()).is_some_and(|p| p.monoid.is_some()))
-                        .count()
-                        == 1;
+                let mut reductions: Vec<usize> = c
+                    .args
+                    .iter()
+                    .map(|a| a.src.n())
+                    .filter(|&p| self.comp_at(p).is_some_and(|pc| pc.monoid.is_some()))
+                    .collect();
+                reductions.dedup();
+                let epilogue_ok = c.monoid.is_none() && reductions.len() == 1;
                 for a in &c.args {
                     let p = a.src.n();
                     let as_epilogue = epilogue_ok
-                        && self.comp_at(p).is_some_and(|pc| {
-                            pc.red.len() == 1 && pc.tuple == 0 && pc.width() == 1
-                        })
-                        && a.view == View::identity(c.rank(), c.rank());
+                        && self.comp_at(p).is_some_and(|pc| pc.red.len() == 1)
+                        && self.epilogue_read(c, p).is_some();
                     consumer_reduces[p] = c.monoid.is_some() || as_epilogue;
                 }
             }
@@ -2495,7 +2605,8 @@ mod tests {
         assert_eq!(g.nodes()[c.n()].reg, (4, 4));
         assert_eq!(g.nodes()[c.n()].split, 0);
 
-        // attention after the softmax rewrite: scores are lane-invariant -> tiled, scores inlined
+        // attention after the softmax rewrite: scores are lane-invariant ->
+        // tiled, scores inlined, the normalizer is the tile's epilogue
         let (n, d, dv) = (64, 16, 32);
         let mut g = TensorGraph::new();
         let q = g.input(&[n, d]);
@@ -2510,8 +2621,10 @@ mod tests {
             .iter()
             .position(|nd| matches!(&nd.op, Op::Comp(c) if c.tuple == 1))
             .unwrap();
-        assert_eq!(g.nodes()[fused].tile, (dv as u32, 8, 32));
-        assert_eq!(g.materialized(&outs).len(), 2);
+        assert!(g.nodes()[fused].inline);
+        assert_eq!(g.nodes()[outs[0].n()].tile, (dv as u32, 8, 32));
+        assert_eq!(g.tiled_reduction(outs[0].n()), Some(fused));
+        assert_eq!(g.materialized(&outs).len(), 1);
     }
 
     #[test]
@@ -2578,9 +2691,10 @@ mod tests {
             mats.iter().all(|(_, s)| numel(s) < n * n),
             "materialized: {mats:?}"
         );
-        // scores (inlined), online reduce [n, 1, dv, 3], final divide
+        // scores (inlined), online reduce [n, 1, dv, 3] (inlined into its
+        // normalizing epilogue), final divide: one kernel
         assert_eq!(g.count_comps(&outs), 3);
-        assert_eq!(mats.len(), 2);
+        assert_eq!(mats.len(), 1);
 
         close(&g.eval(&inputs, &outs)[0], &want);
     }

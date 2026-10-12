@@ -15,7 +15,7 @@ use std::fmt::Write;
 
 use tang_expr::{ExprGraph, ExprId, Node};
 
-use super::{fixed, numel, Comp, Monoid, Op, TensorGraph, TensorId};
+use super::{fixed, numel, Arg, Comp, Form, Monoid, Op, TensorGraph, TensorId};
 
 /// One dispatch.
 pub struct WgslKernel {
@@ -232,6 +232,13 @@ impl TensorGraph {
         writeln!(s, "    let tid = lid.x;").unwrap();
         writeln!(s, "    if (g >= params.count) {{ return; }}").unwrap();
         emit_decompose(&mut s, "g", &fixed(c.points()), "p");
+        // the reduction's point coords as the epilogue reads them
+        if red_node != root {
+            let forms = self.epilogue_read(c, red_node).unwrap();
+            for (d, f) in forms.iter().enumerate() {
+                writeln!(s, "    let q{d} = {};", affine(f, "p")).unwrap();
+            }
+        }
         emit_scalar_acc(&mut s, "    ", m);
         writeln!(
             s,
@@ -239,10 +246,11 @@ impl TensorGraph {
         )
         .unwrap();
         emit_decompose(&mut s, "ri", &fixed(&rc.red), "r");
+        let rp = if red_node != root { "q" } else { "p" };
         emit_step(
             &mut s,
             "        ",
-            &format!("body_{red_node}({})", arg_reads(rc)),
+            &format!("body_{red_node}({})", arg_reads_with(rc, rp, None)),
             m,
         );
         writeln!(s, "    }}").unwrap();
@@ -268,7 +276,13 @@ impl TensorGraph {
                 writeln!(s, "        out[g * {w}u + {slot}u] = wg_acc[0][{slot}];").unwrap();
             }
         } else {
-            let reads_epi = arg_reads_with(c, Some((red_node, "wg_acc[0][0]")));
+            let reads_epi = arg_reads_with(
+                c,
+                "p",
+                Some(&|a: &Arg| {
+                    (a.src.n() == red_node).then(|| format!("wg_acc[0][{}]", self.epilogue_slot(a)))
+                }),
+            );
             writeln!(s, "        let epi = body_{root}({reads_epi});").unwrap();
             for slot in 0..w_out {
                 writeln!(s, "        out[g * {w_out}u + {slot}u] = epi[{slot}];").unwrap();
@@ -471,22 +485,30 @@ pub(super) fn identity(m: &Monoid) -> String {
 
 /// `read_src(view(p…, r…))` for every arg, as call arguments.
 fn arg_reads(c: &Comp) -> String {
-    arg_reads_with(c, None)
+    arg_reads_with(c, "p", None)
 }
 
-/// `arg_reads`, with the arg reading `node` replaced by `expr`.
-fn arg_reads_with(c: &Comp, replace: Option<(usize, &str)>) -> String {
-    let k = c.points().len();
-    let coord_name = |d: usize| {
-        if d < k {
-            format!("p{d}")
-        } else {
-            format!("r{}", d - k)
+/// `u32(offset + Σ coef·{prefix}d)`.
+fn affine(f: &Form, prefix: &str) -> String {
+    let mut terms = vec![format!("{}", f.offset)];
+    for (d, &coef) in f.coefs.iter().enumerate() {
+        if coef != 0 {
+            terms.push(format!("{coef} * i32({prefix}{d})"));
         }
-    };
+    }
+    format!("u32({})", terms.join(" + "))
+}
+
+/// `arg_reads` with point coords named `{pts}d`; `replace` may
+/// substitute an expression for an arg's read.
+fn arg_reads_with(c: &Comp, pts: &str, replace: Option<&dyn Fn(&Arg) -> Option<String>>) -> String {
+    let k = c.points().len();
     c.args
         .iter()
         .map(|a| {
+            if let Some(e) = replace.and_then(|r| r(a)) {
+                return e;
+            }
             let idx: Vec<String> = a
                 .view
                 .forms
@@ -495,16 +517,18 @@ fn arg_reads_with(c: &Comp, replace: Option<(usize, &str)>) -> String {
                     let mut terms = vec![format!("{}", f.offset)];
                     for (d, &coef) in f.coefs.iter().enumerate() {
                         if coef != 0 {
-                            terms.push(format!("{coef} * i32({})", coord_name(d)));
+                            let name = if d < k {
+                                format!("{pts}{d}")
+                            } else {
+                                format!("r{}", d - k)
+                            };
+                            terms.push(format!("{coef} * i32({name})"));
                         }
                     }
                     format!("u32({})", terms.join(" + "))
                 })
                 .collect();
-            match replace {
-                Some((node, expr)) if a.src.n() == node => expr.to_string(),
-                _ => format!("read_{}({})", a.src.n(), idx.join(", ")),
-            }
+            format!("read_{}({})", a.src.n(), idx.join(", "))
         })
         .collect::<Vec<_>>()
         .join(", ")

@@ -19,7 +19,7 @@ use std::fmt::Write;
 use tang_expr::{ExprGraph, ExprId, Node};
 
 use super::wgsl::{identity, lit, WgslKernel};
-use super::{fixed, Comp, Op, TensorGraph, TensorId};
+use super::{fixed, Comp, Form, Op, TensorGraph, TensorId};
 
 /// Affine expression over named loop variables.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -455,6 +455,20 @@ impl Ctx<'_> {
     }
 }
 
+/// An affine form over symbolic coords.
+fn sym_of(f: &Form, coords: &[Sym]) -> Sym {
+    let mut s = Sym {
+        offset: f.offset,
+        ..Default::default()
+    };
+    for (d, &coef) in f.coefs.iter().enumerate() {
+        if coef != 0 {
+            s.add(&coords[d].scaled(coef));
+        }
+    }
+    s
+}
+
 /// Row-major flat index of symbolic coords over `shape`.
 fn flat(coords: &[Sym], shape: &[usize]) -> Sym {
     let mut acc = Sym::default();
@@ -555,10 +569,20 @@ impl TensorGraph {
             counter: 0,
         };
         ctx.extents.insert("r0".into(), r_total);
-        let space: Vec<Sym> = (0..k)
-            .map(|d| Sym::var(&format!("p{d}")))
-            .chain([Sym::var("r0")])
-            .collect();
+        let pts_syms: Vec<Sym> = (0..k).map(|d| Sym::var(&format!("p{d}"))).collect();
+        // the reduction's point coords: root's, or the epilogue's view of them
+        let space: Vec<Sym> = if epilogue {
+            self.epilogue_read(c, red_node)
+                .unwrap()
+                .iter()
+                .map(|f| sym_of(f, &pts_syms))
+                .collect()
+        } else {
+            pts_syms.clone()
+        }
+        .into_iter()
+        .chain([Sym::var("r0")])
+        .collect();
         // the chunked loop body: the reduction's body + combine. With an
         // epilogue, the reduction is read point-for-point so its space is
         // root's points ++ r0 as well.
@@ -580,31 +604,14 @@ impl TensorGraph {
             if !epilogue {
                 return (0..w).map(|s| format!("acc[{s}]")).collect();
             }
-            let pts_syms: Vec<Sym> = (0..k).map(|d| Sym::var(&format!("p{d}"))).collect();
             let mut vals: Vec<String> = Vec::new();
             for a in &c.args {
                 if a.src.n() == red_node {
-                    vals.push("acc[0]".to_string());
+                    vals.push(format!("acc[{}]", self.epilogue_slot(a)));
                     continue;
                 }
                 let src_shape = fixed(&self.nodes[a.src.n()].shape);
-                let cs: Vec<Sym> = a
-                    .view
-                    .forms
-                    .iter()
-                    .map(|f| {
-                        let mut sy = Sym {
-                            offset: f.offset,
-                            ..Default::default()
-                        };
-                        for (d, &coef) in f.coefs.iter().enumerate() {
-                            if coef != 0 {
-                                sy.add(&pts_syms[d].scaled(coef));
-                            }
-                        }
-                        sy
-                    })
-                    .collect();
+                let cs: Vec<Sym> = a.view.forms.iter().map(|f| sym_of(f, &pts_syms)).collect();
                 let pk = src_shape.len() - ctx.tuple_rank(a.src.n());
                 let slot = flat(&cs[pk..], &src_shape[pk..]);
                 let v = ctx.expand(body, a.src.n(), &cs);
