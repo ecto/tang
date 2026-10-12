@@ -707,6 +707,12 @@ What moved it:
   buffering.
 - Coalesced staging loads alone changed nothing measurable; the tile
   was never global-load bound at these sizes.
+- With vec4 reads in place, a sweep of 8×8 register tiles (chunk 8, 16,
+  32), an 8×8-thread block and a 32×8 block at 1024² still lands on
+  16×16 threads × 4×4 × chunk 32 on both chips (3090: 0.29 ms vs 0.35
+  for 8×8; M4: 0.53 vs 0.50 for 8×8 chunk 16 — within noise), so
+  `schedule_auto`'s rule stands. 8×8 is register-pressure bound: more
+  FMAs per load but fewer workgroups in flight.
 
 The gap to PyTorch is now 2.5× on matmul, 3–4× on attention and the
 block forward, 4× on the training step (against its quieter numbers).
