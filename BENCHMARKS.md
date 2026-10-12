@@ -279,3 +279,50 @@ Based on single-layer GPU benchmarks extrapolated to 30 layers:
 
 Decode is memory-bandwidth-bound: attention scales linearly with KV cache length.
 LM head matmul (576x49152) adds ~1.3 ms per decode step.
+
+## Kernels vs tensor IR (`kernels_vs_ir`)
+
+**Date:** 2026-10-11. Same hardware. See `crates/tang-compile/src/tensor.rs`
+for the IR (views + comprehensions + monoids) and `tensor_wgsl.rs` /
+`tensor_tile.rs` for the schedules.
+
+### CPU: hand kernels vs the *scalar* `tang-expr` IR (f64)
+
+The scalar IR interprets a closure per element and cannot express a tensor
+op as one node, so it loses everywhere and the gap grows with size. This is
+the motivation for the tensor-level IR, not a result about it.
+
+| block | size | hand | ir | ir_opt | trace+compile |
+|---|---|---|---|---|---|
+| swiglu act | 1M | 2.6 ms | 42.8 ms | 42.4 ms | – |
+| rmsnorm | 16×576 | 15 µs | 90 µs | 78 µs | 77 ms |
+| rmsnorm | 16×2048 | 52 µs | 330 µs | 281 µs | 1.06 s |
+| matvec | 255 | 14 µs | 414 µs | 534 µs | 92 ms |
+
+### GPU: hand-written causal attention vs attention *derived* from tensor IR
+
+Single head, d = 64, f32. `hand` is `kv_attention_fused`. The `ir_*`
+columns are the same naive `softmax(q·kᵀ/√d + mask)·v` graph under
+different compiler schedules: `naive` materializes the n×n scores;
+`flash` is after `substitute_maps` + `stabilize_softmax` (one
+online-softmax reduction, q·k recomputed inside, nothing n×n in memory);
+`split` adds a 256-thread tree reduction per row; `tiled` adds 64 rows per
+workgroup with k/v staged in workgroup memory. Times include ~1.3 ms of
+submit + readback.
+
+| n | hand | ir_naive | ir_flash | ir_flash_split | ir_flash_tiled |
+|---|---|---|---|---|---|
+| 128 | 1.34 ms | 1.67 ms | 1.33 ms | 3.58 ms | 1.34 ms |
+| 512 | 4.09 ms | **2.26 ms** | 4.15 ms | 3.88 ms | 4.22 ms |
+| 1024 | 10.6 ms | **3.56 ms** | 7.74 ms | 6.84 ms | 8.05 ms |
+
+Takeaways:
+
+- Every derived schedule matches the hand kernel's output; none of them
+  contains attention-specific code.
+- The derived flash kernels beat the hand-written one at n = 1024.
+- On this chip at these sizes the *naive* schedule wins: the n×n buffer
+  (4 MB) is cheap, and n² threads beat n workgroups. Memory traffic is not
+  the bottleneck; parallelism is. Which schedule is best is a property of
+  the (graph, device, size) triple — hence `ir_gpu::autotune`, which tries
+  the candidates on the device and keeps the fastest.

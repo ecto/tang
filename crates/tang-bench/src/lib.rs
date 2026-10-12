@@ -378,6 +378,53 @@ pub mod ir_gpu {
         (g, y)
     }
 
+    /// Try every candidate schedule on this device and keep the fastest.
+    /// This is the whole point: the algorithm is fixed, the schedule is
+    /// whatever the chip at hand prefers.
+    pub fn autotune(
+        device: &GpuDevice,
+        cache: &mut KernelCache,
+        candidates: Vec<(&'static str, TensorGraph, TensorId)>,
+        inputs: &[&[f32]],
+        iters: usize,
+    ) -> (&'static str, Executable, TensorId, std::time::Duration) {
+        let mut best: Option<(&'static str, Executable, TensorId, std::time::Duration)> = None;
+        for (name, g, y) in candidates {
+            let exe = Executable::new(device, g.to_wgsl(&[y]), inputs);
+            exe.run(device, cache);
+            cache.flush(device);
+            let _ = exe.read(device, y); // warm pipelines
+            let start = std::time::Instant::now();
+            for _ in 0..iters {
+                exe.run(device, cache);
+            }
+            cache.flush(device);
+            let _ = exe.read(device, y);
+            let t = start.elapsed() / iters as u32;
+            if best.as_ref().is_none_or(|b| t < b.3) {
+                best = Some((name, exe, y, t));
+            }
+        }
+        best.expect("at least one candidate")
+    }
+
+    /// All attention schedules the compiler currently knows how to produce.
+    pub fn attention_candidates(
+        n: usize,
+        d: usize,
+        dv: usize,
+    ) -> Vec<(&'static str, TensorGraph, TensorId)> {
+        [
+            ("naive", naive_attention(n, d, dv)),
+            ("flash", flash_attention(n, d, dv)),
+            ("flash_split", flash_attention_split(n, d, dv)),
+            ("flash_tiled", flash_attention_tiled(n, d, dv)),
+        ]
+        .into_iter()
+        .map(|(name, (g, y))| (name, g, y))
+        .collect()
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -427,12 +474,7 @@ pub mod ir_gpu {
             for (i, (a, b)) in want.iter().zip(&cpu).enumerate() {
                 assert!((a - b).abs() < 1e-4, "hand[{i}]: {a} vs {b}");
             }
-            for (name, (g, y)) in [
-                ("naive", naive_attention(n, d, d)),
-                ("flash", flash_attention(n, d, d)),
-                ("flash_split", flash_attention_split(n, d, d)),
-                ("flash_tiled", flash_attention_tiled(n, d, d)),
-            ] {
+            for (name, g, y) in attention_candidates(n, d, d) {
                 let program = g.to_wgsl(&[y]);
                 let exe = Executable::new(&device, program, &[&q, &k, &v, &mask]);
                 exe.run(&device, &mut cache);
@@ -442,6 +484,19 @@ pub mod ir_gpu {
                 for (i, (a, b)) in got.iter().zip(&want).enumerate() {
                     assert!((a - b).abs() < 1e-4, "{name}[{i}]: {a} vs {b}");
                 }
+            }
+
+            let (name, exe, y, t) = autotune(
+                &device,
+                &mut cache,
+                attention_candidates(n, d, d),
+                &[&q, &k, &v, &mask],
+                3,
+            );
+            eprintln!("autotune picked {name} at {t:?}");
+            let got = exe.read(&device, y);
+            for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+                assert!((a - b).abs() < 1e-4, "auto[{i}]: {a} vs {b}");
             }
         }
     }
