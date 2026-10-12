@@ -291,24 +291,10 @@ fn with_f16_operands(g: &TensorGraph, t: TensorId) -> TensorGraph {
     v
 }
 
-/// Buffers holding the operands of `t`'s core contraction.
+/// Buffers holding the operands of `t`'s core contraction (the two
+/// factors of its product body; unread args are left alone).
 fn operand_buffers(g: &TensorGraph, t: TensorId) -> Vec<TensorId> {
-    let nodes = g.nodes();
-    let core = match &nodes[t.index()].op {
-        Op::Comp(c) if c.monoid.is_none() => c
-            .args
-            .iter()
-            .find(|a| {
-                nodes[a.src.index()].inline
-                    && matches!(&nodes[a.src.index()].op, Op::Comp(r) if r.monoid.is_some())
-            })
-            .map_or(t, |a| a.src),
-        _ => t,
-    };
-    match &nodes[core.index()].op {
-        Op::Comp(c) => c.args.iter().map(|a| g.storage(a.src)).collect(),
-        _ => Vec::new(),
-    }
+    g.fragment_operands(t).map_or(Vec::new(), |o| o.to_vec())
 }
 
 /// Which backend a tuned graph runs on.

@@ -196,25 +196,13 @@ impl TensorGraph {
         };
         let c = self.comp_at(core)?;
         let m = c.monoid.as_ref()?;
-        if m.kind() != MonoidKind::Sum || c.width() != 1 || c.tuple != 0 || c.args.len() != 2 {
+        if m.kind() != MonoidKind::Sum || c.width() != 1 || c.tuple != 0 {
             return None;
         }
         if self.nodes[core].precision.accum != Format::F32 {
             return None;
         }
-        // body is exactly v0·v1
-        let nodes = c.body.nodes_slice();
-        let (x, y) = match nodes[c.body_outs[0].index() as usize] {
-            Node::Mul(x, y) => (x, y),
-            _ => return None,
-        };
-        let vars = (&nodes[x.index() as usize], &nodes[y.index() as usize]);
-        if !matches!(
-            vars,
-            (Node::Var(0), Node::Var(1)) | (Node::Var(1), Node::Var(0))
-        ) {
-            return None;
-        }
+        let (u, v) = Self::product_operands(c)?;
         c.red.iter().try_for_each(|d| d.fixed().map(|_| ()))?;
         let pts: Vec<usize> = c
             .points()
@@ -224,27 +212,87 @@ impl TensorGraph {
         let (Some(dn), Some(dm)) = tile_axes(&pts) else {
             return None;
         };
-        // operands: buffer-backed f16
-        for a in &c.args {
-            let s = self.storage(a.src).n();
-            let backed = match &self.nodes[s].op {
-                Op::Input(_) => true,
-                Op::Comp(_) => !self.nodes[s].inline,
-                _ => false,
-            };
-            if !backed || self.nodes[s].precision.storage != Format::F16 {
+        // operands: buffer-backed f16, or an inlined elementwise map
+        // (materialized into threadgroup `half` while staging: the map runs
+        // in f32 and its value is rounded to f16 there)
+        for a in [&c.args[u], &c.args[v]] {
+            if !(self.f16_buffer(a.src) || self.inline_map(a.src)) {
                 return None;
             }
         }
         let dep = |i: usize, d: usize| c.args[i].view.depends_on(d);
-        let (a, b) = if !dep(0, dn) && !dep(1, dm) {
-            (0, 1)
-        } else if !dep(1, dn) && !dep(0, dm) {
-            (1, 0)
+        let (a, b) = if !dep(u, dn) && !dep(v, dm) {
+            (u, v)
+        } else if !dep(v, dn) && !dep(u, dm) {
+            (v, u)
         } else {
             return None;
         };
         Some(FragmentPlan { core, a, b, dm, dn })
+    }
+
+    fn f16_buffer(&self, t: TensorId) -> bool {
+        let s = self.storage(t).n();
+        let backed = match &self.nodes[s].op {
+            Op::Input(_) => true,
+            Op::Comp(_) => !self.nodes[s].inline,
+            _ => false,
+        };
+        backed && self.nodes[s].precision.storage == Format::F16
+    }
+
+    /// `t` is an inlined single-value map (no reduction).
+    fn inline_map(&self, t: TensorId) -> bool {
+        let n = &self.nodes[t.n()];
+        n.inline
+            && matches!(&n.op, Op::Comp(c) if c.monoid.is_none() && c.tuple == 0 && c.width() == 1)
+    }
+
+    /// Arg indices `(i, j)` of a body that is exactly `v_i · v_j`, `i ≠ j`.
+    /// Other args may be present and unread (a gradient keeps the factor
+    /// the product rule dropped as an argument).
+    pub(crate) fn product_operands(c: &super::Comp) -> Option<(usize, usize)> {
+        let nodes = c.body.nodes_slice();
+        let (x, y) = match nodes[c.body_outs[0].index() as usize] {
+            Node::Mul(x, y) => (x, y),
+            _ => return None,
+        };
+        match (&nodes[x.index() as usize], &nodes[y.index() as usize]) {
+            (Node::Var(i), Node::Var(j)) if i != j => Some((*i as usize, *j as usize)),
+            _ => None,
+        }
+    }
+
+    /// The contraction operands (storage buffers) `t` would read on
+    /// fragments: the two factors of its core's `v_i · v_j` body.
+    pub fn fragment_operands(&self, t: TensorId) -> Option<[TensorId; 2]> {
+        let root = t.n();
+        let rc = self.comp_at(root)?;
+        let core = if rc.monoid.is_none() {
+            self.tiled_reduction(root).filter(|&r| r != root)?
+        } else {
+            root
+        };
+        let c = self.comp_at(core)?;
+        let (i, j) = Self::product_operands(c)?;
+        Some([self.storage(c.args[i].src), self.storage(c.args[j].src)])
+    }
+
+    /// Whether every coordinate `arg` reads over the iteration box lies in
+    /// its source: its guard never fires.
+    fn view_in_bounds(&self, c: &super::Comp, which: usize) -> bool {
+        let a = &c.args[which];
+        let ext: Vec<i64> = c.space().iter().map(|d| d.n() as i64).collect();
+        let shape = fixed(&self.nodes[a.src.n()].shape);
+        a.view.forms.iter().zip(&shape).all(|(f, &n)| {
+            let (mut lo, mut hi) = (f.offset, f.offset);
+            for (k, e) in f.coefs.iter().zip(&ext) {
+                let span = k * (e - 1);
+                lo += span.min(0);
+                hi += span.max(0);
+            }
+            lo >= 0 && hi < n as i64
+        })
     }
 
     fn fragment_kernel(&self, root: usize, plan: &FragmentPlan, t: &FragmentTarget) -> MslKernel {
@@ -256,28 +304,72 @@ impl TensorGraph {
         let (dm, dn) = (plan.dm, plan.dn);
         let (mm, nn) = (pts[dm], pts[dn]);
         let others: Vec<usize> = (0..pts.len()).filter(|&d| d != dm && d != dn).collect();
+        let win = self.window_operand(c, plan, &pts, t);
+        // Gather staging walks the operand's contiguous device axis: k for
+        // A (and m when A is stored transposed), n for B (and k when B is
+        // stored transposed, e.g. a weight gradient's `x[c, t + d·k]`).
+        // Walking the threadgroup tile's slow axis pads its rows by one
+        // word so those stores do not conflict.
+        let unit = |which: usize, d: usize| {
+            self.affine_address(c, which)
+                .is_some_and(|(_, co)| co[d].abs() == 1 && co.last().copied() != Some(1))
+        };
+        let a_mfast = unit(plan.a, dm);
+        let b_kfast = self
+            .affine_address(c, plan.b)
+            .is_some_and(|(_, co)| co.last().copied() == Some(1) && co[dn].abs() != 1);
+        let a_ld = if a_mfast { t.tile.2 + 2 } else { t.tile.2 };
+        let b_ld = if b_kfast { t.tile.1 + 2 } else { t.tile.1 };
         let (bm, bn, bk) = t.tile;
         let (fm, fn_, fk) = t.frag;
         let (gm, gn) = t.groups;
         let threads = t.threads();
         let (sm, sn) = (bm / gm, bn / gn); // per-SIMD-group sub-tile
         let (am, an) = (sm / fm, sn / fn_); // fragments per SIMD group
-        assert!(t.staging_bytes() <= t.threadgroup_mem);
+        assert!(win.is_some() || t.staging_bytes() <= t.threadgroup_mem);
         let (tx, ty) = (nn.div_ceil(bn), mm.div_ceil(bm));
         let n_tiles = tx * ty * others.iter().map(|&d| pts[d]).product::<usize>();
 
         let mut s = pre;
         writeln!(s, "// fragment lowering: m = p{dm}, n = p{dn}, K = {kt}").unwrap();
         writeln!(s, "kernel void k_main(KERNEL_PARAMS uint3 wid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {{").unwrap();
-        writeln!(s, "    threadgroup half As[{}];", bm * bk).unwrap();
-        writeln!(s, "    threadgroup half Bs[{}];", bk * bn).unwrap();
-        writeln!(s, "    threadgroup float Cs[{}];", bm * bn).unwrap();
+        match &win {
+            Some(w) => {
+                // Cs aliases the operand staging: it is written after the
+                // reduce loop's last barrier
+                writeln!(s, "    threadgroup half smem[{}];", w.bytes(t) / 2).unwrap();
+                writeln!(s, "    threadgroup half* As = smem;").unwrap();
+                writeln!(
+                    s,
+                    "    threadgroup half* Xs = smem + {};",
+                    w.nbuf * w.a_len(bm)
+                )
+                .unwrap();
+                writeln!(s, "    threadgroup float* Cs = (threadgroup float*)smem;").unwrap();
+            }
+            None => {
+                writeln!(s, "    threadgroup half As[{}];", bm * a_ld).unwrap();
+                writeln!(s, "    threadgroup half Bs[{}];", bk * b_ld).unwrap();
+            }
+        }
+        if win.is_none() {
+            writeln!(s, "    threadgroup float Cs[{}];", bm * bn).unwrap();
+        }
         writeln!(s, "    BUFS_INIT").unwrap();
         writeln!(s, "    const uint tile = wid.x + wid.y * 65535u;").unwrap();
         writeln!(s, "    if (tile >= {n_tiles}u) {{ return; }}").unwrap();
-        writeln!(s, "    const uint tile_x = tile % {tx}u;").unwrap();
-        writeln!(s, "    const uint tile_y = (tile / {tx}u) % {ty}u;").unwrap();
-        writeln!(s, "    uint lead = tile / {}u;", tx * ty).unwrap();
+        let nlead: usize = others.iter().map(|&d| pts[d]).product();
+        if win.is_some() {
+            // batch dims fastest: neighbouring threadgroups (e.g. the
+            // phases of a polyphase conv) read neighbouring weights
+            writeln!(s, "    const uint tile_x = (tile / {nlead}u) % {tx}u;").unwrap();
+            writeln!(s, "    const uint tile_y = tile / {}u;", nlead * tx).unwrap();
+            writeln!(s, "    uint lead = tile % {nlead}u;").unwrap();
+        } else {
+            writeln!(s, "    const uint tile_x = tile % {tx}u;").unwrap();
+            writeln!(s, "    const uint tile_y = (tile / {tx}u) % {ty}u;").unwrap();
+            writeln!(s, "    uint lead = tile / {}u;", tx * ty).unwrap();
+        }
         for &d in others.iter().rev() {
             writeln!(s, "    const uint p{d} = lead % {}u;", pts[d]).unwrap();
             writeln!(s, "    lead = lead / {}u;", pts[d]).unwrap();
@@ -293,7 +385,7 @@ impl TensorGraph {
         // memory into fragments (no staging) on interior tiles.
         let direct = |which: usize, free: usize| -> Option<(usize, i64, i64, String)> {
             let a = &c.args[which];
-            if a.view.guard || !kt.is_multiple_of(fk) {
+            if !kt.is_multiple_of(fk) {
                 return None;
             }
             let src = self.storage(a.src).n();
@@ -320,8 +412,11 @@ impl TensorGraph {
             }
             Some((src, sk, sf, base))
         };
+        // a guarded operand loads directly only on chunks whose reads are
+        // all in range (checked per chunk below)
         let da = direct(plan.a, dm);
         let db = direct(plan.b, dn);
+        let (ga, gb) = (c.args[plan.a].view.guard, c.args[plan.b].view.guard);
         // fragment loads of a direct operand at reduce index `kexpr`
         let load_a = |k: &str| {
             let (ja, ska, sma, _) = da.as_ref().unwrap();
@@ -350,8 +445,18 @@ impl TensorGraph {
                     rows * cols
                 )
                 .unwrap();
-                writeln!(s, "            const uint ri = idx / {cols}u;").unwrap();
-                writeln!(s, "            const uint ci = idx % {cols}u;").unwrap();
+                let (row_fast, ld) = if a_side {
+                    (a_mfast, a_ld)
+                } else {
+                    (b_kfast, b_ld)
+                };
+                if row_fast {
+                    writeln!(s, "            const uint ri = idx % {rows}u;").unwrap();
+                    writeln!(s, "            const uint ci = idx / {rows}u;").unwrap();
+                } else {
+                    writeln!(s, "            const uint ri = idx / {cols}u;").unwrap();
+                    writeln!(s, "            const uint ci = idx % {cols}u;").unwrap();
+                }
                 let (gpt, gk, ext) = if a_side {
                     ("m0 + ri", "k0 + ci", mm)
                 } else {
@@ -376,7 +481,7 @@ impl TensorGraph {
                 )
                 .unwrap();
                 writeln!(s, "            }}").unwrap();
-                writeln!(s, "            {buf}[idx] = half(v);").unwrap();
+                writeln!(s, "            {buf}[ri * {ld}u + ci] = half(v);").unwrap();
                 writeln!(s, "        }}").unwrap();
             };
         // One reduce loop, each operand either loaded straight from device
@@ -441,7 +546,7 @@ impl TensorGraph {
                 )
                 .unwrap();
             } else {
-                writeln!(s, "            for (uint i = 0u; i < {am}u; i++) simdgroup_load(fa[i], &As[(sr + i * {fm}u) * {bk}u + kk], {bk});").unwrap();
+                writeln!(s, "            for (uint i = 0u; i < {am}u; i++) simdgroup_load(fa[i], &As[(sr + i * {fm}u) * {a_ld}u + kk], {a_ld});").unwrap();
             }
             if b_dev {
                 writeln!(
@@ -451,7 +556,7 @@ impl TensorGraph {
                 )
                 .unwrap();
             } else {
-                writeln!(s, "            for (uint j = 0u; j < {an}u; j++) simdgroup_load(fb[j], &Bs[kk * {bn}u + sc + j * {fn_}u], {bn});").unwrap();
+                writeln!(s, "            for (uint j = 0u; j < {an}u; j++) simdgroup_load(fb[j], &Bs[kk * {b_ld}u + sc + j * {fn_}u], {b_ld});").unwrap();
             }
             writeln!(s, "            for (uint i = 0u; i < {am}u; i++) for (uint j = 0u; j < {an}u; j++) simdgroup_multiply_accumulate(acc[i][j], fa[i], fb[j], acc[i][j]);").unwrap();
             writeln!(s, "        }}").unwrap();
@@ -467,21 +572,113 @@ impl TensorGraph {
         let hybrid = kt.is_multiple_of(bk);
         let m_int = format!("m0 + {bm}u <= {mm}u");
         let n_int = format!("n0 + {bn}u <= {nn}u");
-        let fast = match (da.is_some(), db.is_some()) {
+        let fast = match (da.is_some() && !ga, db.is_some() && !gb) {
             (true, true) => Some((format!("{m_int} && {n_int}"), true, true)),
-            (true, false) if hybrid => Some((m_int, true, false)),
-            (false, true) if hybrid => Some((n_int, false, true)),
+            (true, false) if hybrid => Some((m_int.clone(), true, false)),
+            (false, true) if hybrid => Some((n_int.clone(), false, true)),
             _ => None,
         };
-        match fast {
-            Some((cond, a_dev, b_dev)) => {
+        // per-chunk direct: both operands affine, one or both guarded, one
+        // reduce dim (so a chunk is one interval of it)
+        let chunked = win.is_none() && red.len() == 1 && da.is_some() && db.is_some() && (ga || gb);
+        match (&win, fast) {
+            (Some(w), _) => self.emit_window_loop(&mut s, c, plan, &pts, w, t),
+            _ if chunked => {
+                let k0 = pts.len();
+                // in-range test of a guarded operand over one chunk
+                let inb = |which: usize, free: usize, origin: &str, ext: usize| -> Vec<String> {
+                    let a = &c.args[which];
+                    if !a.view.guard {
+                        return Vec::new();
+                    }
+                    let shape = fixed(&self.nodes[a.src.n()].shape);
+                    a.view
+                        .forms
+                        .iter()
+                        .zip(&shape)
+                        .map(|(f, &n)| {
+                            let mut e = format!("{}", f.offset);
+                            for &d in &others {
+                                if f.coefs[d] != 0 {
+                                    e.push_str(&format!(" + {} * int(p{d})", f.coefs[d]));
+                                }
+                            }
+                            let (cf, ck) = (f.coefs[free], f.coefs[k0]);
+                            e.push_str(&format!(" + {cf} * int({origin}) + {ck} * int(k0)"));
+                            let lo = cf.min(0) * (ext as i64 - 1) + ck.min(0) * (bk as i64 - 1);
+                            let hi = cf.max(0) * (ext as i64 - 1) + ck.max(0) * (bk as i64 - 1);
+                            format!("({e}) + {lo} >= 0 && ({e}) + {hi} < {n}")
+                        })
+                        .collect()
+                };
+                let mut conds = vec![
+                    format!("{m_int} && {n_int}"),
+                    format!("k0 + {bk}u <= {kt}u"),
+                ];
+                conds.extend(inb(plan.a, dm, "m0", bm));
+                conds.extend(inb(plan.b, dn, "n0", bn));
+                let (ja, _, sma, basea) = da.as_ref().unwrap();
+                let (jb, _, snb, baseb) = db.as_ref().unwrap();
+                writeln!(
+                    s,
+                    "    device const half* pa = b{ja} + ({basea}) + int(m0) * {sma};"
+                )
+                .unwrap();
+                writeln!(
+                    s,
+                    "    device const half* pb = b{jb} + ({baseb}) + int(n0) * {snb};"
+                )
+                .unwrap();
+                writeln!(s, "    for (uint k0 = 0u; k0 < {kt}u; k0 += {bk}u) {{").unwrap();
+                writeln!(s, "        if ({}) {{", conds.join(" && ")).unwrap();
+                writeln!(s, "        for (uint kk = 0u; kk < {bk}u; kk += {fk}u) {{").unwrap();
+                writeln!(s, "            simdgroup_half8x8 fa[{am}];").unwrap();
+                writeln!(s, "            simdgroup_half8x8 fb[{an}];").unwrap();
+                writeln!(
+                    s,
+                    "            for (uint i = 0u; i < {am}u; i++) {};",
+                    load_a("k0 + kk")
+                )
+                .unwrap();
+                writeln!(
+                    s,
+                    "            for (uint j = 0u; j < {an}u; j++) {};",
+                    load_b("k0 + kk")
+                )
+                .unwrap();
+                writeln!(s, "            for (uint i = 0u; i < {am}u; i++) for (uint j = 0u; j < {an}u; j++) simdgroup_multiply_accumulate(acc[i][j], fa[i], fb[j], acc[i][j]);").unwrap();
+                writeln!(s, "        }}").unwrap();
+                writeln!(s, "        continue;").unwrap();
+                writeln!(s, "        }}").unwrap();
+                stage(&mut s, plan.a, "As", bm, bk, true);
+                stage(&mut s, plan.b, "Bs", bk, bn, false);
+                writeln!(
+                    s,
+                    "        threadgroup_barrier(mem_flags::mem_threadgroup);"
+                )
+                .unwrap();
+                writeln!(s, "        for (uint kk = 0u; kk < {bk}u; kk += {fk}u) {{").unwrap();
+                writeln!(s, "            simdgroup_half8x8 fa[{am}];").unwrap();
+                writeln!(s, "            simdgroup_half8x8 fb[{an}];").unwrap();
+                writeln!(s, "            for (uint i = 0u; i < {am}u; i++) simdgroup_load(fa[i], &As[(sr + i * {fm}u) * {a_ld}u + kk], {a_ld});").unwrap();
+                writeln!(s, "            for (uint j = 0u; j < {an}u; j++) simdgroup_load(fb[j], &Bs[kk * {b_ld}u + sc + j * {fn_}u], {b_ld});").unwrap();
+                writeln!(s, "            for (uint i = 0u; i < {am}u; i++) for (uint j = 0u; j < {an}u; j++) simdgroup_multiply_accumulate(acc[i][j], fa[i], fb[j], acc[i][j]);").unwrap();
+                writeln!(s, "        }}").unwrap();
+                writeln!(
+                    s,
+                    "        threadgroup_barrier(mem_flags::mem_threadgroup);"
+                )
+                .unwrap();
+                writeln!(s, "    }}").unwrap();
+            }
+            (None, Some((cond, a_dev, b_dev))) => {
                 writeln!(s, "    if ({cond}) {{").unwrap();
                 emit_loop(&mut s, a_dev, b_dev);
                 writeln!(s, "    }} else {{").unwrap();
                 emit_loop(&mut s, false, false);
                 writeln!(s, "    }}").unwrap();
             }
-            None => emit_loop(&mut s, false, false),
+            (None, None) => emit_loop(&mut s, false, false),
         }
         writeln!(s, "    for (uint i = 0u; i < {am}u; i++) for (uint j = 0u; j < {an}u; j++) simdgroup_store(acc[i][j], &Cs[(sr + i * {fm}u) * {bn}u + sc + j * {fn_}u], {bn});").unwrap();
         writeln!(s, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
@@ -539,7 +736,9 @@ impl TensorGraph {
 
         MslKernel {
             source: translate(self, &s, &reads, root).0,
-            threadgroup_bytes: t.staging_bytes(),
+            threadgroup_bytes: win
+                .as_ref()
+                .map_or(2 * (bm * a_ld + bk * b_ld) + 4 * bm * bn, |w| w.bytes(t)),
             entry: "k_main".into(),
             node: TensorId(root as u32),
             reads: reads.iter().map(|&j| TensorId(j as u32)).collect(),
@@ -547,6 +746,399 @@ impl TensorGraph {
             groups: grid(n_tiles),
             threads: threads as u32,
             fragment: true,
+        }
+    }
+}
+
+/// A sliding-window operand of a fragment contraction (conv-shaped `B`):
+/// its view reads one "row" reduce dim (channels) through forms of its
+/// own, and the free dim `n` plus every other reduce dim ("taps") through
+/// one "time" form `st·n + Σ coef·tap + …`. One zero-padded window per
+/// (row chunk, n tile) is staged in threadgroup memory, de-interleaved by
+/// phase `u mod st`, and each tap's `B` fragments load from it at a
+/// shifted offset: the taps reuse one staged window instead of each
+/// re-gathering its own copy (implicit-GEMM gather).
+///
+/// `A` is staged once per chunk for every tap, as tap planes
+/// `[tap][m][c]`; with an affine, unguarded `A` (a weight) each thread
+/// copies all taps of one `(m, c)` with constant offsets. Staging is
+/// double-buffered when two copies fit: one barrier per chunk.
+#[derive(Clone, Debug)]
+pub(crate) struct Window {
+    src: usize,
+    shape: Vec<usize>,
+    forms: Vec<super::Form>,
+    tform: usize,
+    row: usize,
+    taps: Vec<usize>,
+    st: i64,
+    minoff: i64,
+    span: i64,
+    /// Row-dim chunk staged per step.
+    pub cb: usize,
+    /// Tap combinations (product of tap extents).
+    ntaps: usize,
+    /// Staging buffers (2: double-buffered).
+    nbuf: usize,
+}
+
+impl Window {
+    fn a_len(&self, bm: usize) -> usize {
+        bm * self.cb * self.ntaps
+    }
+    fn wp(&self, bn: usize) -> usize {
+        bn + (self.span / self.st) as usize + 1
+    }
+    fn row_stride(&self, bn: usize) -> usize {
+        self.st as usize * self.wp(bn)
+    }
+    fn x_len(&self, bn: usize) -> usize {
+        self.cb * self.row_stride(bn)
+    }
+    /// Threadgroup bytes: the staging buffers, which the f32 result tile
+    /// aliases after the reduce loop.
+    fn bytes(&self, t: &FragmentTarget) -> usize {
+        let (bm, bn, _) = t.tile;
+        (2 * self.nbuf * (self.a_len(bm) + self.x_len(bn))).max(4 * bm * bn)
+    }
+}
+
+impl TensorGraph {
+    /// The windowed reading of `B`, if its view is conv-shaped (see
+    /// [`Window`]) and its staging fits the target. `TANG_MSL_NO_WINDOW`
+    /// disables it (A/B against the implicit-GEMM gather).
+    pub(crate) fn window_operand(
+        &self,
+        c: &super::Comp,
+        plan: &FragmentPlan,
+        pts: &[usize],
+        t: &FragmentTarget,
+    ) -> Option<Window> {
+        if std::env::var_os("TANG_MSL_NO_WINDOW").is_some() {
+            return None;
+        }
+        let arg = &c.args[plan.b];
+        if !self.f16_buffer(arg.src) {
+            return None;
+        }
+        let k0 = pts.len();
+        let red = fixed(&c.red);
+        let (dm, dn) = (plan.dm, plan.dn);
+        let forms = &arg.view.forms;
+        let tform = forms.iter().position(|f| f.coefs[dn] != 0)?;
+        let tf = &forms[tform];
+        let st = tf.coefs[dn];
+        if st <= 0 || tf.coefs[dm] != 0 {
+            return None;
+        }
+        let mut row = None;
+        let mut taps = Vec::new();
+        for r in 0..red.len() {
+            let in_t = tf.coefs[k0 + r] != 0;
+            let elsewhere = forms
+                .iter()
+                .enumerate()
+                .any(|(i, f)| i != tform && f.coefs[k0 + r] != 0);
+            match (in_t, elsewhere) {
+                (true, true) => return None,
+                (false, true) => {
+                    if row.replace(r).is_some() {
+                        return None;
+                    }
+                }
+                _ => taps.push(r),
+            }
+        }
+        let row = row?;
+        if !taps.iter().any(|&r| tf.coefs[k0 + r] != 0) {
+            return None;
+        }
+        for (i, f) in forms.iter().enumerate() {
+            if i != tform && (f.coefs[dn] != 0 || f.coefs[dm] != 0) {
+                return None;
+            }
+        }
+        let (mut minoff, mut maxoff) = (0i64, 0i64);
+        for &r in &taps {
+            let e = tf.coefs[k0 + r] * (red[r] as i64 - 1);
+            minoff += e.min(0);
+            maxoff += e.max(0);
+        }
+        let mut w = Window {
+            src: self.storage(arg.src).n(),
+            shape: fixed(&self.nodes[arg.src.n()].shape),
+            forms: forms.clone(),
+            tform,
+            row,
+            ntaps: taps.iter().map(|&r| red[r]).product(),
+            taps,
+            st,
+            minoff,
+            span: maxoff - minoff,
+            cb: 0,
+            nbuf: 0,
+        };
+        // 16- and 8-channel chunks measured equal on op (a) (0.69 / 0.70
+        // ms); double buffering (one barrier per chunk) measured slower
+        // (0.74), so it is opt-in: `TANG_MSL_WINDOW_BUFFERS=2`
+        let rows = red[row].next_multiple_of(8);
+        let nbuf: usize = std::env::var("TANG_MSL_WINDOW_BUFFERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1)
+            .clamp(1, 2);
+        [16usize, 8].into_iter().find_map(|cb| {
+            w.cb = cb.min(rows);
+            w.nbuf = nbuf;
+            (w.bytes(t) <= t.threadgroup_mem).then(|| w.clone())
+        })
+    }
+
+    fn emit_window_loop(
+        &self,
+        s: &mut String,
+        c: &super::Comp,
+        plan: &FragmentPlan,
+        pts: &[usize],
+        w: &Window,
+        t: &FragmentTarget,
+    ) {
+        let red = fixed(&c.red);
+        let k0 = pts.len();
+        let (dm, dn) = (plan.dm, plan.dn);
+        let mm = pts[dm];
+        let (bm, bn, _) = t.tile;
+        let (fm, fn_, _) = t.frag;
+        let threads = t.threads();
+        let (am, an) = (bm / t.groups.0 / fm, bn / t.groups.1 / fn_);
+        let (cb, st, ntaps) = (w.cb, w.st, w.ntaps);
+        let wp = w.wp(bn);
+        let rs = w.row_stride(bn);
+        let (al, xl) = (w.a_len(bm), w.x_len(bn));
+        let uw = st as usize * (bn - 1) + w.span as usize + 1;
+        let crow = red[w.row];
+        let others: Vec<usize> = (0..pts.len()).filter(|&d| d != dm && d != dn).collect();
+        let tf = &w.forms[w.tform];
+        // tap ti's values of the tap dims
+        let tap_vals = |ti: usize| {
+            let mut rem = ti;
+            let mut vals = vec![0i64; red.len()];
+            for &r in w.taps.iter().rev() {
+                vals[r] = (rem % red[r]) as i64;
+                rem /= red[r];
+            }
+            vals
+        };
+
+        // ---- staging of chunk `c0` into `Ad` / `Xd`
+        let mut stage = String::new();
+        let st_ = &mut stage;
+        // the window
+        writeln!(
+            st_,
+            "        for (uint idx = tid; idx < {}u; idx += {threads}u) {{",
+            cb * uw
+        )
+        .unwrap();
+        writeln!(st_, "            const uint cl = idx / {uw}u;").unwrap();
+        writeln!(st_, "            const uint u = idx % {uw}u;").unwrap();
+        writeln!(st_, "            const uint gc = c0 + cl;").unwrap();
+        writeln!(st_, "            half v = half(0.0f);").unwrap();
+        writeln!(st_, "            if (gc < {crow}u) {{").unwrap();
+        let mut conds = Vec::new();
+        for (i, f) in w.forms.iter().enumerate() {
+            let mut e = format!("{}", f.offset);
+            for &d in &others {
+                if f.coefs[d] != 0 {
+                    e.push_str(&format!(" + {} * int(p{d})", f.coefs[d]));
+                }
+            }
+            if i == w.tform {
+                e.push_str(&format!(" + {st} * int(n0) + {} + int(u)", w.minoff));
+            } else if f.coefs[k0 + w.row] != 0 {
+                e.push_str(&format!(" + {} * int(gc)", f.coefs[k0 + w.row]));
+            }
+            writeln!(st_, "                const int x{i} = {e};").unwrap();
+            conds.push(format!("x{i} >= 0 && x{i} < {}", w.shape[i]));
+        }
+        let mut terms = Vec::new();
+        let mut stride = 1i64;
+        for i in (0..w.forms.len()).rev() {
+            terms.push(format!("x{i} * {stride}"));
+            stride *= w.shape[i] as i64;
+        }
+        let addr = if terms.is_empty() {
+            "0".into()
+        } else {
+            terms.join(" + ")
+        };
+        // every coordinate is bounds-checked, guarded view or not: the
+        // window overhangs the tile
+        writeln!(
+            st_,
+            "                if ({}) {{ v = b{}[{addr}]; }}",
+            conds.join(" && "),
+            w.src
+        )
+        .unwrap();
+        writeln!(st_, "            }}").unwrap();
+        writeln!(
+            st_,
+            "            Xd[cl * {rs}u + (u % {st}u) * {wp}u + u / {st}u] = v;"
+        )
+        .unwrap();
+        writeln!(st_, "        }}").unwrap();
+        // A, every tap, as planes Ad[tap][m][c]
+        let affine = (!c.args[plan.a].view.guard || self.view_in_bounds(c, plan.a))
+            .then(|| self.affine_address(c, plan.a))
+            .flatten()
+            .filter(|(_, co)| co[dn] == 0);
+        writeln!(
+            st_,
+            "        for (uint idx = tid; idx < {}u; idx += {threads}u) {{",
+            bm * cb
+        )
+        .unwrap();
+        writeln!(st_, "            const uint mi = idx / {cb}u;").unwrap();
+        writeln!(st_, "            const uint cl = idx % {cb}u;").unwrap();
+        writeln!(
+            st_,
+            "            const bool ok = m0 + mi < {mm}u && c0 + cl < {crow}u;"
+        )
+        .unwrap();
+        match affine {
+            Some((off, co)) => {
+                // one thread per (m, c), every tap at a constant offset;
+                // consecutive threads walk c, so the plane stores never
+                // conflict
+                let ja = self.storage(c.args[plan.a].src).n();
+                let mut base = format!("{off}");
+                for &d in &others {
+                    if co[d] != 0 {
+                        base.push_str(&format!(" + {} * int(p{d})", co[d]));
+                    }
+                }
+                writeln!(
+                    st_,
+                    "            device const half* q = b{ja} + ({base}) + int(m0 + mi) * {} + int(c0 + cl) * {};",
+                    co[dm],
+                    co[k0 + w.row]
+                )
+                .unwrap();
+                for ti in 0..ntaps {
+                    let vals = tap_vals(ti);
+                    let o: i64 = w.taps.iter().map(|&r| co[k0 + r] * vals[r]).sum();
+                    writeln!(
+                        st_,
+                        "            Ad[{}u + idx] = ok ? q[{o}] : half(0.0f);",
+                        ti * bm * cb
+                    )
+                    .unwrap();
+                }
+            }
+            None => {
+                writeln!(st_, "            if (ok) {{").unwrap();
+                writeln!(st_, "                const uint p{dm} = m0 + mi;").unwrap();
+                writeln!(st_, "                const uint p{dn} = 0u;").unwrap();
+                writeln!(st_, "                const uint r{} = c0 + cl;", w.row).unwrap();
+                for ti in 0..ntaps {
+                    let vals = tap_vals(ti);
+                    writeln!(st_, "                {{").unwrap();
+                    for &r in &w.taps {
+                        writeln!(st_, "                const uint r{r} = {}u;", vals[r]).unwrap();
+                    }
+                    writeln!(
+                        st_,
+                        "                Ad[{}u + idx] = half({});",
+                        ti * bm * cb,
+                        arg_read(self, c, &c.args[plan.a])
+                    )
+                    .unwrap();
+                    writeln!(st_, "                }}").unwrap();
+                }
+                writeln!(st_, "            }} else {{").unwrap();
+                for ti in 0..ntaps {
+                    writeln!(
+                        st_,
+                        "                Ad[{}u + idx] = half(0.0f);",
+                        ti * bm * cb
+                    )
+                    .unwrap();
+                }
+                writeln!(st_, "            }}").unwrap();
+            }
+        }
+        writeln!(st_, "        }}").unwrap();
+
+        // ---- fragments of the staged chunk in `Ac` / `Xc`
+        let mut comp = String::new();
+        let cm = &mut comp;
+        writeln!(cm, "        for (uint kk = 0u; kk < {cb}u; kk += 8u) {{").unwrap();
+        writeln!(cm, "            simdgroup_half8x8 fa[{am}];").unwrap();
+        writeln!(cm, "            simdgroup_half8x8 fb[{an}];").unwrap();
+        for ti in 0..ntaps {
+            let vals = tap_vals(ti);
+            let off: i64 = w
+                .taps
+                .iter()
+                .map(|&r| tf.coefs[k0 + r] * vals[r])
+                .sum::<i64>()
+                - w.minoff;
+            let boff = (off % st) as usize * wp + (off / st) as usize;
+            writeln!(cm, "            for (uint i = 0u; i < {am}u; i++) simdgroup_load(fa[i], &Ac[{}u + (sr + i * {fm}u) * {cb}u + kk], {cb});", ti * bm * cb).unwrap();
+            writeln!(cm, "            for (uint j = 0u; j < {an}u; j++) simdgroup_load(fb[j], &Xc[kk * {rs}u + {boff}u + sc + j * {fn_}u], {rs});").unwrap();
+            writeln!(cm, "            for (uint i = 0u; i < {am}u; i++) for (uint j = 0u; j < {an}u; j++) simdgroup_multiply_accumulate(acc[i][j], fa[i], fb[j], acc[i][j]);").unwrap();
+        }
+        writeln!(cm, "        }}").unwrap();
+
+        writeln!(s, "    // windowed operand: rows r{}, taps {:?}, stride {st}, window {uw}, chunk {cb}, {} buffer(s)", w.row, w.taps, w.nbuf).unwrap();
+        if w.nbuf == 2 {
+            writeln!(s, "    {{").unwrap();
+            writeln!(s, "        const uint c0 = 0u;").unwrap();
+            writeln!(s, "        threadgroup half* Ad = As;").unwrap();
+            writeln!(s, "        threadgroup half* Xd = Xs;").unwrap();
+            s.push_str(&stage);
+            writeln!(s, "    }}").unwrap();
+            writeln!(s, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+            writeln!(
+                s,
+                "    for (uint cc = 0u, buf = 0u; cc < {crow}u; cc += {cb}u, buf ^= 1u) {{"
+            )
+            .unwrap();
+            writeln!(s, "        if (cc + {cb}u < {crow}u) {{").unwrap();
+            writeln!(s, "        const uint c0 = cc + {cb}u;").unwrap();
+            writeln!(s, "        threadgroup half* Ad = As + (buf ^ 1u) * {al}u;").unwrap();
+            writeln!(s, "        threadgroup half* Xd = Xs + (buf ^ 1u) * {xl}u;").unwrap();
+            s.push_str(&stage);
+            writeln!(s, "        }}").unwrap();
+            writeln!(s, "        threadgroup const half* Ac = As + buf * {al}u;").unwrap();
+            writeln!(s, "        threadgroup const half* Xc = Xs + buf * {xl}u;").unwrap();
+            s.push_str(&comp);
+            writeln!(
+                s,
+                "        threadgroup_barrier(mem_flags::mem_threadgroup);"
+            )
+            .unwrap();
+            writeln!(s, "    }}").unwrap();
+        } else {
+            writeln!(s, "    for (uint c0 = 0u; c0 < {crow}u; c0 += {cb}u) {{").unwrap();
+            writeln!(s, "        threadgroup half* Ad = As;").unwrap();
+            writeln!(s, "        threadgroup half* Xd = Xs;").unwrap();
+            s.push_str(&stage);
+            writeln!(
+                s,
+                "        threadgroup_barrier(mem_flags::mem_threadgroup);"
+            )
+            .unwrap();
+            writeln!(s, "        threadgroup const half* Ac = As;").unwrap();
+            writeln!(s, "        threadgroup const half* Xc = Xs;").unwrap();
+            s.push_str(&comp);
+            writeln!(
+                s,
+                "        threadgroup_barrier(mem_flags::mem_threadgroup);"
+            )
+            .unwrap();
+            writeln!(s, "    }}").unwrap();
         }
     }
 }

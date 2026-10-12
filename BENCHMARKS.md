@@ -1131,16 +1131,70 @@ vs 0.191 ms; the WGSL path's packed-word atomics made it slower).
 
 ### Kokoro ops
 
-| op | WGSL best | MSL f32 best | MSL tuned @ 1e-3 (choice) | err | MPS f32 | MPS f16 |
-|---|---:|---:|---:|---|---:|---:|
-| a conv1d 512→512 k7 d3 T2000 | 2.196 (3.34 TFLOP/s) | 2.296 (3.20) | **1.057 (6.94)** x, w f16, conv on fragments | 5.3e-5 | 0.920 (7.98) | 0.672 (10.9) |
-| b upsample 512→256 k20 s10 | 3.274 | 2.713 | 2.366: w, polyphase output f16; fragments rejected (3.77) | 4.6e-4 | 1.041 conv / 1.179 | 0.892 / 1.108 |
-| c iSTFT n_fft 20 hop 5 T4000 | 0.073 | **0.018** | 0.023: all f32 | 1.4e-6 | 0.119 manual / 0.325 | 0.110 / 0.310 |
-| d conv (a) + bias + snake | 2.201 | 2.363 | **1.066** x, w f16, fragments + snake epilogue (1 kernel) | 8.2e-5 | 0.820 | 0.786 |
-| e AdaIN C512 T2000 style128 | 0.205 | **0.030** | 0.028: x, W, out f16 | 5.1e-4 | 0.250 | 0.272 |
-| f ConvNeXt C512 T200 F1536 | 0.553 | 0.345 | 0.318: w1, normed act f16, pw1 on fragments | 2.0e-4 | 0.231 | 0.413 |
-| a fwd+bwd (dx, dw) | 6.064 | 4.125 (im2col) | f32 only | | 2.194 | 2.064 |
-| f fwd+bwd (all params) | 1.570 | 0.927 | f32 only | | 0.962 | 1.077 |
+| op | WGSL best | MSL f32 best | MSL tuned @ 1e-3 (choice) | err | **MSL windowed fragments** | MPS f32 | MPS f16 |
+|---|---:|---:|---:|---|---:|---:|---:|
+| a conv1d 512→512 k7 d3 T2000 | 2.196 (3.34 TFLOP/s) | 2.296 (3.20) | 1.057 (6.94) x, w f16, conv on fragments | 5.3e-5 | **0.693 (10.6)** | 0.920 (7.98) | 0.672 (10.9) |
+| b upsample 512→256 k20 s10 | 3.274 | 2.713 | 2.366: w, polyphase output f16; fragments rejected (3.77) | 4.6e-4 | **1.317** (8.0), err 8.4e-5 | 1.041 conv / 1.179 | 0.892 / 1.108 |
+| c iSTFT n_fft 20 hop 5 T4000 | 0.073 | **0.018** | 0.023: all f32 | 1.4e-6 | — | 0.119 manual / 0.325 | 0.110 / 0.310 |
+| d conv (a) + bias + snake | 2.201 | 2.363 | 1.066 x, w f16, fragments + snake epilogue (1 kernel) | 8.2e-5 | **0.698** (tuned; 1 kernel) | 0.820 | 0.786 |
+| e AdaIN C512 T2000 style128 | 0.205 | **0.030** | 0.028: x, W, out f16 | 5.1e-4 | — | 0.250 | 0.272 |
+| f ConvNeXt C512 T200 F1536 | 0.553 | 0.345 | 0.318: w1, normed act f16, pw1 on fragments | 2.0e-4 | 0.312 (pw2 eligible now, not kept: 0.420 forced) | 0.231 | 0.413 |
+| a fwd+bwd (dx, dw) | 6.064 | 4.125 (im2col) | f32 only | | see next row | 2.194 | 2.064 |
+| a fwd+bwd, dy given (y, dx, dw) | | 6.4 (autotune, loaded machine) | y, dx, dw on fragments (err 3.4e-4) | 3.4e-4 | **2.069** (y 0.69 · dx 0.69 · dw 0.67) | 2.194 | 2.064 |
+| f fwd+bwd (all params) | 1.570 | 0.927 | f32 only | | — | 0.962 | 1.077 |
+
+**Windowed fragments column** (PR on top of #37, `examples/conv_frag.rs`
+and `kokoro_ops -- msl`). Measured on a *loaded* machine (a browser
+process held the GPU; the f32 rows above re-measured 1.0–2× slower than
+listed), so every number in this column is the min of two interleaved
+rounds with MPS in the same window. MPS in that window: a 0.810 (f16) /
+0.864 (f32), b conv-only 0.897 / 1.059 and with interleave 1.063 / 1.241,
+d 0.763 / 0.825, fwd+bwd 2.071 / 2.290. Against those, a and d are ahead
+of MPS f16 (0.69 vs 0.81, 0.70 vs 0.76) and fwd+bwd ties it; against the
+idle-machine MPS figures in the table, a is 3% behind MPS f16 (0.693 vs
+0.672), d ahead (0.698 vs 0.786), fwd+bwd level (2.07 vs 2.06), and the
+upsample still behind MPS f32 (1.32 vs 1.04). Every output is checked
+against f64; the forward ops sit at 5–8e-5, fwd+bwd at 3.4e-4 under the
+1e-3 budget (`tune_precision` puts y, dx and dw all on fragments).
+
+What changed:
+
+- **Windowed staging.** A conv-shaped operand (one reduce dim read
+  through its own forms, the free axis plus all other reduce dims through
+  one form `st·n + Σ coef·tap`) is staged once per (channel chunk, time
+  tile) as one zero-padded window — 16 × 83 halves for op a instead of a
+  per-K-step im2col gather — de-interleaved by stride phase, and each tap
+  loads its fragments from it at a shifted offset. The weight is staged
+  once per chunk for all taps as tap planes `[k][o][c]`, one thread per
+  `(o, c)` copying its taps with constant offsets. A/B in one process:
+  conv 0.693 vs 1.048 ms gather, upsample 1.317 vs 3.630.
+- **Where the time went** (op a): the MMA loop alone (staging stubbed)
+  is 0.59 ms = 12.4 TFLOP/s; staging the weight through the generic view
+  read cost +0.6 ms, the tap-fastest store order bank-conflicted (stride
+  bm·cb) for another +0.3; one thread per (o, c) walking c fixed both.
+  Measured and dropped: double-buffered staging (one barrier per chunk,
+  0.74 vs 0.69), 128-wide n tiles (2×4 groups 0.82; 2×2 groups spill),
+  per-lane `thread_elements` assembly of A from a natural-layout tile
+  (1.57), 8 vs 16 channel chunks (equal).
+- **Upsample** is bound by its weight reads `w[o, c, r + s·j]`: for one
+  phase they are 40 B apart (0.93 ms with the loads stubbed vs 1.32).
+  Ordering tiles batch(phase)-fastest so the ten phases of one tile share
+  lines in L2 took it from 1.91 to 1.32. Folding the phase into the tile
+  (one window, ten weight slices) is the remaining step.
+- **Backward.** `dy = 1` (the fwd+bwd row) collapses dx and dw to plain
+  sums, so the fragment row uses `L = Σ y ⊙ gy` (MPS times
+  `backward(ones)`, same cost). dx is a transposed conv over gy and takes
+  the window path (its weight view is guarded but provably in range, so
+  it is staged as affine). dw is a GEMM over t per tap; its
+  `x[c, t + 3k − 9]` is guarded, so it now loads fragments straight from
+  device memory on every K chunk whose reads are all in range and
+  gathers only the edge chunks: 2.24 → 0.67 ms. `fragment_plan` accepts
+  `v_i · v_j` bodies with unread extra args (gradients keep the product
+  rule's dropped factor).
+- **ConvNeXt's second pointwise** (operand = inlined GELU map) is now
+  eligible: the map is evaluated at staging and rounded to f16. It does
+  not pay here (forced 0.420 vs 0.312 kept): GELU is recomputed per
+  output-row tile, and at 0.3 GFLOP the block is launch-bound.
 
 "Tuned" is `ir_msl::tune_precision` from the MSL-autotuned f32 schedule:
 first, per contraction, the move "operands f16 + fragments"; then f16
