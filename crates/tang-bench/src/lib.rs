@@ -754,6 +754,10 @@ pub mod ir_gpu {
                 "reg8x4" => g.set_schedule(c, 0, (16, 16, 32), (8, 4)),
                 "reg4x8" => g.set_schedule(c, 0, (16, 16, 32), (4, 8)),
                 "reg4c16" => g.set_schedule(c, 0, (16, 16, 16), (4, 4)),
+                "reg8c16" => g.set_schedule(c, 0, (16, 16, 16), (8, 8)),
+                "reg8c8" => g.set_schedule(c, 0, (16, 16, 8), (8, 8)),
+                "reg8b8" => g.set_schedule(c, 0, (8, 8, 32), (8, 8)),
+                "reg4b32" => g.set_schedule(c, 0, (32, 8, 32), (4, 4)),
                 "auto" => g.schedule_auto(&[c]),
                 _ => {}
             }
@@ -761,7 +765,7 @@ pub mod ir_gpu {
         };
         [
             "naive", "split", "tiled", "reg2", "reg4", "reg8", "reg4c64", "reg8x4", "reg4x8",
-            "reg4c16", "auto",
+            "reg4c16", "reg8c16", "reg8c8", "reg8b8", "reg4b32", "auto",
         ]
         .into_iter()
         .map(|name| {
