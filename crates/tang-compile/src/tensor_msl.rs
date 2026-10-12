@@ -182,7 +182,15 @@ impl TensorGraph {
         let root = t.n();
         let rc = self.comp_at(root)?;
         let core = if rc.monoid.is_none() {
-            self.epilogue_core(root)?
+            // fragments write the reduction's points: only an epilogue
+            // that reads it point-for-point (identity view) fuses
+            let r = self.tiled_reduction(root).filter(|&r| r != root)?;
+            let k = rc.points().len();
+            let read = self.epilogue_read(rc, r)?;
+            if read != super::View::identity(k, k).forms || self.comp_at(r)?.out != rc.out {
+                return None;
+            }
+            r
         } else {
             root
         };
@@ -1183,6 +1191,7 @@ using namespace metal;
 typedef uint u32;
 typedef int i32;
 typedef float f32;
+template <typename T> using vec4 = vec<T, 4>;
 struct Params { uint count; uint _p1; uint _p2; uint _p3; };
 inline void workgroupBarrier() { threadgroup_barrier(mem_flags::mem_threadgroup); }
 ";
@@ -1239,6 +1248,8 @@ fn translate(g: &TensorGraph, src: &str, reads: &[usize], root: usize) -> (Strin
             let (elem, n) = inner.rsplit_once(", ").unwrap();
             let width = match elem.strip_prefix("array<f32, ") {
                 Some(w) => w.trim_end_matches('>').parse::<usize>().unwrap(),
+                // vec4 point-minor stages (`tensor_tile` sites)
+                None if elem.starts_with("vec4<") => 4,
                 None => 1,
             };
             tg_bytes += 4 * width * n.parse::<usize>().unwrap();

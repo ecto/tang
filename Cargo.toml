@@ -78,7 +78,7 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
 tracing = "0.1"
-wgpu = "24"
+wgpu = "25"
 bytemuck = { version = "1.14", features = ["derive"] }
 pollster = "0.4"
 safetensors = "0.4"

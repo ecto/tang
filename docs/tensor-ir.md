@@ -66,6 +66,28 @@ views. Map→map, map→reduce, transpose→anything: same rule. Reductions are
 not substituted — they are *inlined* by a schedule decision, which is the
 difference between algebra and scheduling.
 
+**Reshape is a view, not a copy.** A row-major reshape of a map is read
+through the map's own coordinates whenever the reshape only merges dims
+seen from the reader (`View::through_reshape`); the reshape node
+dissolves and the map inlines like any other. Only a reshape that splits
+a source dim — which needs `/` and `%` — keeps its source materialized.
+
+**Epilogues ride the reduction.** A map that reads a reduction
+point-for-point — a bias, an activation, the `acc / l` that finishes an
+online softmax — never gets its own kernel: the tiled and split
+schedules run it on the thread that holds the final accumulator. Any
+affine read of the reduction's points qualifies, and each arg picks a
+constant tuple slot. A slot that cannot vary along a point dim (the
+softmax row sum along its lanes, found through the monoid's combine) may
+be read at any coordinate of that dim, since every thread's accumulator
+agrees there.
+
+**Siblings share a pass.** Two reductions over the same space with the
+same monoid, read by the same consumers, are one reduction under the
+product monoid (`merge_siblings`): the gate and up projections of a
+SwiGLU MLP become one tuple-valued comp, their activation becomes its
+epilogue, and the normed input is read once.
+
 **Flash attention is a rewrite.** Online softmax is a monoid over
 `(max, sum, acc…)`. `stabilize_softmax` finds `m = max_j s` and every
 `Σ_j g·exp(s − m)` over the same `s` (compared as canonical
@@ -247,6 +269,12 @@ schedule space; the compiler searches it.
   its weight per phase (the phase is a batch dim of the tile).
 - Body arithmetic in `half`. Storage and accumulators honour f16; scalar
   body math is f32 on every path.
+- #34's f32 simdgroup-matrix tile (`tensor_msl_mma.rs`, `to_msl_mma`,
+  run through wgpu's MSL passthrough, opt-in with `TANG_NATIVE`) and the
+  CUDA `wmma` TF32 lowering (`tensor_cuda.rs`, 14–21 TFLOPS on a 3090)
+  coexist with the whole-IR MSL backend (`tensor_msl.rs`, `to_msl`).
+  The f32 Metal tile does not beat the WGSL register tile on an M4, so
+  `pick_backend` only weighs WGSL against the native f16 backend.
 - Scatter gradients reduce over the whole source coordinate they gate on;
   a stride-2 read pays 2× in the backward pass. Fine for rope, not for a
   large gather.
