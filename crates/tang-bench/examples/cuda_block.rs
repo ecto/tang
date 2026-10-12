@@ -65,7 +65,9 @@ fn main() {
             })
             .collect();
         let refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
-        let exe = CudaExecutable::new(&ctx, program, &refs);
+        drop(program);
+        let (exe, kept) = CudaExecutable::new_tuned(&ctx, &g, &[y], &refs);
+        println!("block seq={seq}: tuned, {kept} of {n_native} native kernels kept");
         exe.run();
         let got = exe.read(y);
         if seq == 128 {
@@ -122,10 +124,11 @@ fn main() {
         let target = vec![0.0f32; seq * 576];
         let mut refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
         refs.push(&target);
-        let train = CudaExecutable::new(&ctx, program, &refs);
+        drop(program);
+        let (train, kept) = CudaExecutable::new_tuned(&ctx, &tg, &outs, &refs);
         let ms = train.time(50);
         println!(
-            "block seq={seq}: fwd+bwd {ms:.3} ms ({n_kernels} kernels, {n_native} on tensor cores)"
+            "block seq={seq}: fwd+bwd {ms:.3} ms ({n_kernels} kernels, {kept} of {n_native} native kept)"
         );
         let mut slow: Vec<(f64, usize)> = (0..n_kernels)
             .map(|i| (train.time_kernel(i, 10), i))

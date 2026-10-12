@@ -1182,6 +1182,40 @@ pub mod ir_cuda {
             }
         }
 
+        /// Compile `graph`'s CUDA program twice — tensor-core lowerings on
+        /// and off — and keep, per kernel, whichever runs faster on this
+        /// device. Returns the executable and how many kernels kept the
+        /// native version.
+        pub fn new_tuned(
+            ctx: &Arc<CudaContext>,
+            graph: &tang_compile::tensor::TensorGraph,
+            outputs: &[TensorId],
+            inputs: &[&[f32]],
+        ) -> (Self, usize) {
+            let native = Self::new(ctx, graph.to_cuda_with(outputs, true), inputs);
+            let plain = Self::new(ctx, graph.to_cuda_with(outputs, false), inputs);
+            // every kernel's inputs exist once a whole run has gone through
+            native.run();
+            plain.run();
+            let mut exe = native;
+            let mut kept = 0;
+            for i in 0..exe.program.kernels.len() {
+                if exe.program.kernels[i].source == plain.program.kernels[i].source {
+                    continue;
+                }
+                let (tn, tp) = (exe.time_kernel(i, 10), plain.time_kernel(i, 10));
+                if tp < tn {
+                    exe.program.kernels[i].source = plain.program.kernels[i].source.clone();
+                    exe.program.kernels[i].count = plain.program.kernels[i].count;
+                    exe.program.kernels[i].workgroup_size = plain.program.kernels[i].workgroup_size;
+                    exe.functions[i] = plain.functions[i].clone();
+                } else {
+                    kept += 1;
+                }
+            }
+            (exe, kept)
+        }
+
         fn index(&self, t: TensorId) -> usize {
             let t = self.program.storage(t);
             self.program

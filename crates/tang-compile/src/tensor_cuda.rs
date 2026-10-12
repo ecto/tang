@@ -378,11 +378,18 @@ impl TensorGraph {
     /// Same `WgslProgram` shape — sources, reads, counts — so a runtime
     /// drives both the same way.
     pub fn to_cuda(&self, outputs: &[TensorId]) -> WgslProgram {
+        self.to_cuda_with(outputs, true)
+    }
+
+    /// [`to_cuda`](Self::to_cuda), with the native (tensor-core)
+    /// lowerings on or off. Both programs have the same kernels in the
+    /// same order with the same bindings, so a tuner can pick per kernel.
+    pub fn to_cuda_with(&self, outputs: &[TensorId], native: bool) -> WgslProgram {
         let mut program = self.to_program(outputs, Target::Wgsl);
         for k in &mut program.kernels {
             let root = k.node.index();
             let reads: Vec<usize> = k.reads.iter().map(|t| t.index()).collect();
-            let native = if self.nodes[root].tile.0 > 0 {
+            let native = if native && self.nodes[root].tile.0 > 0 {
                 self.cuda_mma_kernel(root, &reads)
                     .or_else(|| self.cuda_flash_kernel(root, &reads))
             } else {
