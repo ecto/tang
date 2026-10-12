@@ -134,15 +134,39 @@ fn main() {
             .map(|i| (train.time_kernel(i, 10), i))
             .collect();
         slow.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-        for (ms, i) in slow.iter().take(6) {
+        let total: f64 = slow.iter().map(|x| x.0).sum();
+        println!("  (sum of kernels {total:.3} ms)");
+        for (ms, i) in slow.iter().take(14) {
             let k = &train.program.kernels[*i];
             let node = &tg.nodes()[k.node.index()];
+            let c = tg.comp_at(k.node.index());
+            let args: Vec<String> = c
+                .map(|c| {
+                    c.args
+                        .iter()
+                        .map(|a| {
+                            format!(
+                                "{}{:?}",
+                                a.src.index(),
+                                tg.nodes()[a.src.index()]
+                                    .shape
+                                    .iter()
+                                    .map(|d| d.n())
+                                    .collect::<Vec<_>>()
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             println!(
-                "  {ms:7.3} ms  node {:?} shape {:?} red {:?} tile {:?} {}",
+                "  {ms:7.3} ms  node {:?} shape {:?} red {:?} monoid {:?} split {} tile {:?} args [{}] {}",
                 k.node,
-                node.shape,
-                tg.comp_at(k.node.index()).map(|c| c.red.clone()),
+                node.shape.iter().map(|d| d.n()).collect::<Vec<_>>(),
+                c.map(|c| c.red.iter().map(|d| d.n()).collect::<Vec<_>>()),
+                c.and_then(|c| c.monoid.as_ref().map(|m| m.kind())),
+                node.split,
                 node.tile,
+                args.join(" "),
                 if k.source.contains("wmma") {
                     "wmma"
                 } else {
