@@ -276,7 +276,10 @@ pub fn fragment_candidates(g: &TensorGraph, outputs: &[TensorId]) -> Vec<TensorI
     prog.kernels
         .iter()
         .map(|k| k.node)
-        .filter(|&t| with_f16_operands(g, t).fragment_plan(t).is_some())
+        .filter(|&t| {
+            let v = with_f16_operands(g, t);
+            v.fragment_plan(t).is_some() || v.attention_plan(t).is_some()
+        })
         .collect()
 }
 
@@ -292,9 +295,13 @@ fn with_f16_operands(g: &TensorGraph, t: TensorId) -> TensorGraph {
 }
 
 /// Buffers holding the operands of `t`'s core contraction (the two
-/// factors of its product body; unread args are left alone).
+/// factors of its product body; unread args are left alone), or of its
+/// attention (`Q`, `K`, `V`).
 fn operand_buffers(g: &TensorGraph, t: TensorId) -> Vec<TensorId> {
-    g.fragment_operands(t).map_or(Vec::new(), |o| o.to_vec())
+    g.fragment_operands(t)
+        .map(|o| o.to_vec())
+        .or_else(|| g.attention_operands(t).map(|o| o.to_vec()))
+        .unwrap_or_default()
 }
 
 /// Which backend a tuned graph runs on.
