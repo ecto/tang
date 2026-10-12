@@ -1393,12 +1393,25 @@ impl TensorGraph {
             }
             r
         };
+        // consumers that are reductions can absorb a producer; a map
+        // cannot, because that would hide the producer's reduction from
+        // every tiled schedule (a matmul folded into its bias add is
+        // only ever one thread per point)
+        let mut consumer_reduces = vec![false; n];
+        for i in (0..n).filter(|&i| live[i]) {
+            if let Some(c) = self.comp_at(i) {
+                for a in &c.args {
+                    consumer_reduces[a.src.n()] = c.monoid.is_some();
+                }
+            }
+        }
         for i in 0..n {
             let Some(c) = self.comp_at(i) else { continue };
             if live[i]
                 && uses[i] == 1
                 && !is_output(i)
                 && !reshaped[i]
+                && (c.monoid.is_none() || consumer_reduces[i])
                 && consumer_space[i] <= factor * numel(c.points())
             {
                 self.nodes[i].inline = true;

@@ -43,8 +43,18 @@ fn main() {
         let _ = exe.read(&device, k.node);
         let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
         total += ms;
+        let desc = match &node.op {
+            tang_compile::tensor::Op::Comp(c) => format!(
+                "red {:?} {:?} args {:?} body {} nodes",
+                c.red.iter().map(|d| d.n()).collect::<Vec<_>>(),
+                c.monoid.as_ref().map(|m| m.kind()),
+                c.args.iter().map(|a| a.src.index()).collect::<Vec<_>>(),
+                c.body.live_set(&c.body_outs).len()
+            ),
+            _ => String::new(),
+        };
         println!(
-            "{ms:7.3} ms  node {:>2} shape {:?} split {} tile {:?} reads {}",
+            "{ms:7.3} ms  node {:>2} shape {:?} split {} tile {:?} reads {} | {desc}",
             k.node.index(),
             node.shape.iter().map(|d| d.n()).collect::<Vec<_>>(),
             node.split,

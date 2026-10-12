@@ -229,20 +229,24 @@ impl Ctx<'_> {
             return String::new();
         }
         let r = &self.regions[idx];
-        // local index: (((ly * bx + lx) * chunk + t) * innerN + inner) * span + (off - lo)
-        let mut local = String::from("0u");
+        // Point-minor layout: ((t * innerN + inner) * span + o) * P + point,
+        // so consecutive lanes hit consecutive words (no bank conflicts).
+        let mut points = 1usize;
+        let mut point = String::from("0u");
         if r.key.py != 0 {
-            local = format!("({local}) * {}u + ty", self.by);
+            point = format!("({point}) * {}u + ty", self.by);
+            points *= self.by;
         }
         if r.key.px != 0 {
-            local = format!("({local}) * {}u + tx", self.bx);
+            point = format!("({point}) * {}u + tx", self.bx);
+            points *= self.bx;
         }
-        local = format!("({local}) * {}u + (r0 - chunk)", self.chunk);
+        let mut local = String::from("(r0 - chunk)");
         for ((name, _), &ext) in r.key.inner.iter().zip(&r.extents) {
             local = format!("({local}) * {ext}u + {name}");
         }
         format!(
-            "stage_{idx}[({local}) * {}u + {}u]",
+            "stage_{idx}[(({local}) * {}u + {}u) * {points}u + ({point})]",
             r.span(),
             addr.offset - r.lo
         )
@@ -705,18 +709,12 @@ impl TensorGraph {
                 "        for (var idx: u32 = tid; idx < {total}u; idx = idx + {threads}u) {{"
             )
             .unwrap();
-            writeln!(s, "            let o = idx % {span}u;").unwrap();
-            writeln!(s, "            var rem = idx / {span}u;").unwrap();
+            // point-minor: lanes innermost, then offset, inner vars, t
+            let points =
+                (if r.key.py != 0 { by } else { 1 }) * (if r.key.px != 0 { bx } else { 1 });
+            writeln!(s, "            var rem = idx;").unwrap();
             let mut addr = format!("{}", r.lo);
-            for ((name, coef), &ext) in r.key.inner.iter().zip(&r.extents).rev() {
-                writeln!(s, "            let {name} = rem % {ext}u;").unwrap();
-                writeln!(s, "            rem = rem / {ext}u;").unwrap();
-                addr.push_str(&format!(" + {coef} * i32({name})"));
-            }
-            writeln!(s, "            let t = rem % {chunk}u;").unwrap();
-            writeln!(s, "            rem = rem / {chunk}u;").unwrap();
-            addr.push_str(&format!(" + {} * i32(chunk + t) + i32(o)", r.key.red));
-            let mut live = format!("chunk + t < {r_total}u");
+            let mut live = String::from("true");
             if r.key.px != 0 {
                 writeln!(s, "            let lx = rem % {bx}u;").unwrap();
                 writeln!(s, "            rem = rem / {bx}u;").unwrap();
@@ -726,10 +724,23 @@ impl TensorGraph {
             }
             if r.key.py != 0 {
                 writeln!(s, "            let ly = rem % {by}u;").unwrap();
+                writeln!(s, "            rem = rem / {by}u;").unwrap();
                 writeln!(s, "            let gy = tile_y * {by}u + ly;").unwrap();
                 addr.push_str(&format!(" + {} * i32(gy)", r.key.py));
                 live.push_str(&format!(" && gy < {ny}u"));
             }
+            let _ = points;
+            writeln!(s, "            let o = rem % {span}u;").unwrap();
+            writeln!(s, "            rem = rem / {span}u;").unwrap();
+            for ((name, coef), &ext) in r.key.inner.iter().zip(&r.extents).rev() {
+                writeln!(s, "            let {name} = rem % {ext}u;").unwrap();
+                writeln!(s, "            rem = rem / {ext}u;").unwrap();
+                addr.push_str(&format!(" + {coef} * i32({name})"));
+            }
+            writeln!(s, "            let t = rem % {chunk}u;").unwrap();
+            addr.push_str(&format!(" + {} * i32(chunk + t) + i32(o)", r.key.red));
+            live.push_str(&format!(" && chunk + t < {r_total}u"));
+
             for (name, coef) in &r.key.uniform {
                 addr.push_str(&format!(" + {coef} * i32({name})"));
             }
