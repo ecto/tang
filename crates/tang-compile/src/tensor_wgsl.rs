@@ -232,7 +232,9 @@ impl TensorGraph {
         let out_f = self.nodes[root].precision.storage;
         let accum = self.nodes[root].precision.accum;
         if self.nodes[root].tile.0 > 0 {
-            return self.tile_kernel(root, s, reads);
+            if let Some(k) = self.tile_kernel(root, s.clone(), reads.clone()) {
+                return k;
+            }
         }
         let reads = reads.into_iter().map(|j| TensorId(j as u32)).collect();
 

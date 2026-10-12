@@ -2773,6 +2773,36 @@ mod tests {
     }
 
     #[test]
+    fn oversized_staging_falls_back_untiled() {
+        // r0 = c, inner k = 300: w[o, c, k] stages 16 rows × 300 taps per
+        // chunk step, 4800 words over the 16 KiB limit even at chunk 1
+        let mut g = TensorGraph::new();
+        let x = g.input(&[600, 512]);
+        let w = g.input(&[64, 600, 300]);
+        let y = conv1d(&mut g, x, w, 1, 150);
+        g.set_schedule(y, 0, (16, 16, 32), (1, 1));
+        let k = &g.to_wgsl(&[y]).kernels[0];
+        assert!(
+            !k.source.contains("var<workgroup>"),
+            "should not stage:\n{}",
+            k.source
+        );
+        assert_eq!(k.workgroup_size, 256);
+        let m = &g.to_msl(&[y]).kernels[0];
+        assert_eq!(m.threadgroup_bytes, 0);
+
+        // the same schedule with few taps still tiles, within the limit
+        let mut g = TensorGraph::new();
+        let x = g.input(&[600, 512]);
+        let w = g.input(&[64, 600, 7]);
+        let y = conv1d(&mut g, x, w, 1, 3);
+        g.set_schedule(y, 0, (16, 16, 32), (1, 1));
+        let m = &g.to_msl(&[y]).kernels[0];
+        assert!(m.threadgroup_bytes > 0);
+        assert!(m.threadgroup_bytes <= 4 * tile::MAX_STAGE_WORDS);
+    }
+
+    #[test]
     fn guarded_view_is_zero_padding() {
         let (ci, co, t, k, dil) = (3, 2, 7, 3, 2);
         let pad = dil * (k as i64 - 1) / 2;
