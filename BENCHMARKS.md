@@ -657,16 +657,133 @@ Where the gap is, and how much of it this path can close:
   WGSL/wgpu today (no cooperative-matrix extension). That is the other
   2–4× PyTorch has, and it is a backend question (MSL simdgroup matrices,
   CUDA via `tang-expr`'s CUDA dialect), not a schedule question.
-- **Launch overhead.** The block issues 16 kernels (72 with backward),
-  each submitted as its own command buffer through wgpu; seq 128 forward
-  is 1.97 ms for ~0.6 ms of math. One command buffer per program and
-  epilogue fusion (bias/activation into the matmul's write-out) would
-  take most of that; PyTorch's 0.295 ms is ~10 cuBLAS/flash launches.
+- **Launch overhead.** The block issued 20 kernels (72 with backward)
+  when this table was taken, each as its own command buffer through
+  wgpu; seq 128 forward was 1.97 ms for ~0.6 ms of math. Since then:
+  one submission per program, and three fusion passes — epilogue
+  fusion (bias, activation and the softmax normalizer run on the thread
+  holding the final accumulator), views through affine reshapes, and
+  sibling-reduction merging (gate and up projections as one
+  tuple-valued matmul) — bring the forward block to 16 kernels (62
+  with backward). PyTorch's 0.295 ms is ~10 cuBLAS/flash launches.
 - **Attention.** Flash-attention proper keeps the (m, l, acc) state in
   registers across a 64-key tile computed as two small tensor-core
   matmuls; ours recomputes q·k cooperatively into shared memory with
   scalar FMAs. Same structure, 4–10× slower execution, for the two
   reasons above.
+
+### After the fusion passes and vec4 stage reads
+
+Same script, both chips, one run each. The 3090 run had the GPU to
+itself (1% util); its CPU was loaded (load avg 26), which is why the
+PyTorch block numbers — launch-bound on the CPU side — came out higher
+than the first table's. Both PyTorch columns are shown.
+
+| op | 3090 before | 3090 after | PyTorch (1st / this run) | M4 after |
+|---|---|---|---|---|
+| matmul 1024² | 0.54 ms | **0.28** (7.6 TFLOPS) | 0.112 / 0.114 | 0.52 |
+| matmul 128×576×1536 | 0.20 | **0.10** | 0.030 / 0.035 | 0.13 |
+| matmul 512×576×1536 | 0.28 | **0.16** | 0.053 / 0.054 | 0.23 |
+| attention n=512 | 0.27 | 0.25 | 0.090 | 0.26 |
+| attention n=1024 | 0.77 | 0.74 | 0.180 | 0.76 |
+| block fwd, seq 128 | 1.97 | **1.06** (16 kernels) | 0.295 / 0.566 | 1.14 |
+| block fwd, seq 512 | 4.41 | **3.34** | 0.610 / 1.208 | 3.37 |
+| block fwd+bwd, seq 128 | 5.0 | **3.15** (62 kernels) | 1.32 / 2.11 | 3.53 |
+| block fwd+bwd, seq 512 | 10.1 | **8.19** | 1.73 / 1.99 | 13.2 |
+| adam 4M | 0.54 | 0.47 | 0.395 / 0.451 | — |
+
+What moved it:
+
+- **Fusion** (epilogues for tuple-state reductions, views through
+  affine reshapes, sibling merging) plus one submission per program:
+  the launch-bound seq-128 block, −46% forward, −37% training step.
+- **`vec4` reads of the point-minor stage.** A thread's register-tile
+  points are contiguous there, so a 4-wide tile reads each operand as
+  one vector per r0 instead of four scalars: matmul 1024² 0.54 → 0.28 ms
+  on the 3090 and 0.78 → 0.52 on the M4. This is the shared-memory
+  load-issue bound the previous section predicted; the next rungs on the
+  same ladder are 8×8 tiles with vec4 (now that loads are cheap enough
+  to feed them), `vec4` global loads into the stage, and double
+  buffering.
+- Coalesced staging loads alone changed nothing measurable; the tile
+  was never global-load bound at these sizes.
+- With vec4 reads in place, a sweep of 8×8 register tiles (chunk 8, 16,
+  32), an 8×8-thread block and a 32×8 block at 1024² still lands on
+  16×16 threads × 4×4 × chunk 32 on both chips (3090: 0.29 ms vs 0.35
+  for 8×8; M4: 0.53 vs 0.50 for 8×8 chunk 16 — within noise), so
+  `schedule_auto`'s rule stands. 8×8 is register-pressure bound: more
+  FMAs per load but fewer workgroups in flight.
+- Double-buffered staging (two stage sets, next chunk prefetched into
+  registers during the reduce loop, one barrier per chunk) was tried and
+  reverted: on the M4 the dynamically indexed prefetch arrays spill and
+  the 4×4 chunk-32 tile went from 0.53 to 3.2 ms; on the 3090 it was
+  neutral (0.28–0.33). Without async copies, the extra registers cost
+  more than the hidden latency is worth on either chip.
+
+The gap to PyTorch is now 2.5× on matmul, 3–4× on attention and the
+block forward, 4× on the training step (against its quieter numbers).
+What remains is tensor cores (unreachable from WGSL; a backend
+question) and the rest of the instruction-quality ladder above.
+
+### A native dialect: Metal simdgroup matrices (first cut)
+
+`tensor_msl.rs` lowers a matmul-shaped tile — one reduce axis, body
+`a·b`, each operand read along one tile axis and the reduce axis, any
+affine layout — to MSL with `simdgroup_float8x8` fragments, through
+wgpu 25's MSL passthrough. The comp's epilogue (bias, activation) runs
+on the stored block. Kernels that don't fit stay WGSL, so a program is a
+mix. Correct on ragged shapes (staged tiles) and full tiles (fragments
+loaded straight from device memory); 12/12 GPU tests.
+
+M4 Max, kernel-only (`mma` column of `kernel_only`):
+
+| shape | WGSL 4×4 register tile | simdgroup matrices |
+|---|---|---|
+| 1024² | 0.56 ms | 0.93 |
+| 128×576×1536 | 0.13 | 0.27 |
+| 512×576×1536 | 0.25 | 0.48 |
+
+So on this chip the first-cut fp32 simdgroup kernel is 1.7–2× *slower*
+than the FMA tile. Ablations: the staged version spent two thirds of
+its time in scalar staging; fragments straight from memory halved
+that but the MMA loop itself runs at ~2.3 TFLOPS, where the FMA tile
+runs at 3.7. MLX's fp32 GEMM on the same hardware shows what the
+instruction is worth with vectorized staging, swizzled tiles and
+deeper software pipelining; that is engineering on top of a lowering
+that now exists, and `program_for` keeps WGSL the default until it
+wins. The structural claim stands: the same comprehension lowered to a
+second dialect with no op-specific code, epilogue included. The CUDA
+dialect (tensor cores proper, where the gap to PyTorch lives) is the
+same shape of work with nvcc in the loop.
+
+### Tensor cores: the CUDA dialect (RTX 3090, nvcc harness)
+
+The same bilinear tile lowered to CUDA C++ with `wmma` 16×16×8 TF32
+fragments (`tensor_cuda.rs`; 64×64 block, four warps of 32×32, operands
+staged through shared memory from any affine layout, epilogue on the
+stored block). tang-gpu runs on wgpu and cannot dispatch CUDA, so this
+is measured by `scripts/cuda_bench.cu`: the derived kernel and
+`cublasSgemm` (fp32, then `CUBLAS_TF32_TENSOR_OP_MATH`) on the same
+device, CUDA events, 50 launches. Error is against fp32 cuBLAS; TF32
+inputs give ~1e-3 relative, as expected.
+
+| shape | tang wmma (TF32) | tang WGSL (fp32) | cuBLAS fp32 | cuBLAS TF32 |
+|---|---|---|---|---|
+| 1024² | **0.150 ms** (14 TFLOPS) | 0.28 | 0.113 | 0.079 |
+| 1024² + bias + silu epilogue | 0.159 | — | 0.107 (+ separate kernels) | 0.079 |
+| 128×576×1536 | 0.052 | 0.10 | 0.031 | 0.015 |
+| 512×576×1536 | 0.091 (10 TFLOPS) | 0.16 | 0.053 | 0.048 |
+| 4096³ | 6.58 (21 TFLOPS) | — | 5.67 | 3.98 |
+
+First cut, no tuning: 1.4–1.9× cuBLAS TF32 at the LLM shapes, 1.65× at
+4096³, with the bias/activation epilogue fused for free (cuBLAS needs
+extra launches for that). The remaining gap is the standard GEMM
+engineering — 128×128 blocks with 8 warps, `cp.async` double buffering,
+`ldmatrix`-friendly swizzles — on top of a lowering that now exists.
+Together with the WGSL numbers above this is the whole picture: the
+derived kernels are 2–4× faster than tang's hand kernels through the
+portable path, and within 2× of cuBLAS through the native one, from one
+comprehension and no op-specific code.
 
 What this does and does not show: the compiler derives the *structure* of
 the fast kernels (flash attention, register-tiled matmul, sequence
@@ -741,6 +858,29 @@ Full per-schedule run, after (naive / `schedule_auto` / per-kernel autotune):
 | a fwd+bwd | direct | 36.71 | 7.00 | 7.03 | 44.03 |
 | a fwd+bwd | im2col | 73.71 | 6.17 | 6.20 | 6.14 |
 | f fwd+bwd | | 4.20 | 1.59 | 1.67 | 1.61 |
+
+**Merged with #34** (generalized epilogues, `merge_siblings`, `relayout`,
+`merge_reduce_dims` in `kokoro_ops`' pass list, coalesced + vec4 staging).
+Same session, M4 Max, best schedule per op; the #35 binary rerun
+alongside (the M4 throttled later in the session, so only the first
+back-to-back pair is listed):
+
+| op | #35 windowed (ms) | merged (ms) | merged: algebra / schedule |
+|---|---:|---:|---|
+| a conv1d | 2.216 | **2.036** | im2col / auto (direct/auto 2.30) |
+| b upsample | 3.276 | **2.474** | bmm / auto (2 kernels, was 3) |
+| c iSTFT | 0.075 | 0.072 | dft+ola / auto |
+| d conv + bias + snake | 2.183 | **2.039** | im2col / autotune (direct/auto 2.31, 1 kernel) |
+| e AdaIN | 0.194 | **0.157** | auto (4 kernels, was 6) |
+| f ConvNeXt block | 0.579 | **0.429** | autotune (7 kernels, was 8) |
+| a fwd+bwd | 6.383 | **4.816** | im2col / auto |
+| f fwd+bwd | 1.643 | **1.246** | auto (30) |
+
+Direct conv alone (one kernel) is unchanged within noise: interleaved
+#35/merged runs on the throttled machine gave 2.81/3.98, 3.93/3.89,
+3.81/3.83 ms. The exp/log epilogue rule survives as a schedule
+heuristic (`unfuse_heavy_epilogue`): under a register tile, an epilogue
+with exp/log runs as its own map.
 
 What changed, and where the IR still loses:
 

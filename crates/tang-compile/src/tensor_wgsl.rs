@@ -15,7 +15,7 @@ use std::fmt::Write;
 
 use tang_expr::{ExprGraph, ExprId, Node};
 
-use super::{fixed, numel, Comp, Format, Monoid, Op, TensorGraph, TensorId};
+use super::{fixed, numel, Arg, Comp, Form, Format, Monoid, Op, TensorGraph, TensorId};
 
 /// Target language of the shared emitters. The kernel structure and the
 /// index algebra are the same for WGSL and MSL; only buffer element
@@ -51,7 +51,18 @@ pub(super) fn with_dialect<T>(d: Dialect, f: impl FnOnce() -> T) -> T {
 }
 
 /// One dispatch.
+/// Which shading language a [`WgslProgram`]'s kernels are emitted in.
+/// `MslMma` lowers matmul-shaped f32 tiles to simdgroup matrices (see
+/// `tensor_msl_mma.rs`) and emits WGSL for the rest; a backend tells the
+/// two apart by the source (MSL starts with `#include`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    Wgsl,
+    MslMma,
+}
+
 pub struct WgslKernel {
+    /// WGSL, or MSL when it starts with `#include` (entry point `main0`).
     pub source: String,
     /// Node this kernel materializes.
     pub node: TensorId,
@@ -99,6 +110,18 @@ impl WgslProgram {
 
 impl TensorGraph {
     pub fn to_wgsl(&self, outputs: &[TensorId]) -> WgslProgram {
+        self.to_program(outputs, Target::Wgsl)
+    }
+
+    /// Like [`to_wgsl`](Self::to_wgsl) with matmul-shaped f32 tiles
+    /// lowered to Metal simdgroup matrices (`tensor_msl_mma.rs`, run
+    /// through wgpu's MSL passthrough); everything else stays WGSL. The
+    /// whole-program native backend is [`to_msl`](Self::to_msl).
+    pub fn to_msl_mma(&self, outputs: &[TensorId]) -> WgslProgram {
+        self.to_program(outputs, Target::MslMma)
+    }
+
+    pub fn to_program(&self, outputs: &[TensorId], target: Target) -> WgslProgram {
         let live = self.live(outputs);
         let n = self.nodes.len();
         let needs_buffer = |i: usize| {
@@ -135,7 +158,7 @@ impl TensorGraph {
 
         let kernels = (0..n)
             .filter(|&i| needs_buffer(i) && self.comp_at(i).is_some())
-            .map(|i| self.kernel_for(i))
+            .map(|i| self.kernel_for(i, target))
             .collect();
 
         WgslProgram {
@@ -147,7 +170,7 @@ impl TensorGraph {
 
     /// Nodes reachable from `i` through inlined comps, including `i`,
     /// in dependency order.
-    fn inline_closure(&self, i: usize) -> Vec<usize> {
+    pub(super) fn inline_closure(&self, i: usize) -> Vec<usize> {
         let mut order = Vec::new();
         let mut seen = HashSet::new();
         let mut stack = vec![(i, false)];
@@ -221,16 +244,20 @@ impl TensorGraph {
         (s, reads)
     }
 
-    fn kernel_for(&self, root: usize) -> WgslKernel {
+    fn kernel_for(&self, root: usize, target: Target) -> WgslKernel {
         let c = self.comp_at(root).unwrap();
         let (mut s, reads) = self.kernel_preamble(root);
+        if target == Target::MslMma && self.nodes[root].tile.0 > 0 {
+            if let Some(k) = self.msl_mma_kernel(root, &reads) {
+                return k;
+            }
+        }
 
         let w = c.width();
         let k = c.points().len();
         let points = numel(c.points()) as u32;
         let split = self.nodes[root].split;
         let out_f = self.nodes[root].precision.storage;
-        let accum = self.nodes[root].precision.accum;
         if self.nodes[root].tile.0 > 0 {
             if let Some(k) = self.tile_kernel(root, s.clone(), reads.clone()) {
                 return k;
@@ -269,9 +296,15 @@ impl TensorGraph {
         }
 
         // One workgroup per point; threads stride the flattened reduce
-        // space, then tree-combine through workgroup memory.
-        let m = c.monoid.as_ref().expect("split needs a reduction");
-        let r_total = numel(&c.red);
+        // space, then tree-combine through workgroup memory. `root` may be
+        // the epilogue map of the reduction it chunks (see
+        // `tiled_reduction`); the map's body then runs on thread 0 after
+        // the tree with the reduction's var bound to the result.
+        let red_node = self.tiled_reduction(root).expect("split needs a reduction");
+        let rc = self.comp_at(red_node).unwrap();
+        let m = rc.monoid.as_ref().expect("split needs a reduction");
+        let (w, w_out) = (rc.width(), c.width());
+        let r_total = numel(&rc.red);
         writeln!(s, "var<workgroup> wg_acc: array<array<f32, {w}>, {split}>;").unwrap();
         writeln!(s, "@compute @workgroup_size({split})").unwrap();
         writeln!(
@@ -283,19 +316,27 @@ impl TensorGraph {
         writeln!(s, "    let tid = lid.x;").unwrap();
         writeln!(s, "    if (g >= params.count) {{ return; }}").unwrap();
         emit_decompose(&mut s, "g", &fixed(c.points()), "p");
+        // the reduction's point coords as the epilogue reads them
+        if red_node != root {
+            let forms = self.epilogue_read(c, red_node).unwrap();
+            for (d, f) in forms.iter().enumerate() {
+                writeln!(s, "    let q{d} = {};", affine(f, "p")).unwrap();
+            }
+        }
         emit_scalar_acc(&mut s, "    ", m);
         writeln!(
             s,
             "    for (var ri: u32 = tid; ri < {r_total}u; ri = ri + {split}u) {{"
         )
         .unwrap();
-        emit_decompose(&mut s, "ri", &fixed(&c.red), "r");
+        emit_decompose(&mut s, "ri", &fixed(&rc.red), "r");
+        let rp = if red_node != root { "q" } else { "p" };
         emit_step(
             &mut s,
             "        ",
-            &format!("body_{root}({})", arg_reads(self, c)),
+            &format!("body_{red_node}({})", arg_reads_with(self, rc, rp, None)),
             m,
-            accum,
+            self.nodes[red_node].precision.accum,
         );
         writeln!(s, "    }}").unwrap();
         writeln!(s, "    wg_acc[tid] = {};", acc_array(w)).unwrap();
@@ -308,20 +349,40 @@ impl TensorGraph {
         writeln!(s, "        if (tid < stride) {{").unwrap();
         writeln!(
             s,
-            "            wg_acc[tid] = combine_{root}(wg_acc[tid], wg_acc[tid + stride]);"
+            "            wg_acc[tid] = combine_{red_node}(wg_acc[tid], wg_acc[tid + stride]);"
         )
         .unwrap();
         writeln!(s, "        }}").unwrap();
         writeln!(s, "        workgroupBarrier();").unwrap();
         writeln!(s, "    }}").unwrap();
         writeln!(s, "    if (tid == 0u) {{").unwrap();
-        for slot in 0..w {
-            let st = store(
-                out_f,
-                &format!("g * {w}u + {slot}u"),
-                &format!("wg_acc[0][{slot}]"),
+        if red_node == root {
+            for slot in 0..w {
+                let st = store(
+                    out_f,
+                    &format!("g * {w}u + {slot}u"),
+                    &format!("wg_acc[0][{slot}]"),
+                );
+                writeln!(s, "        {st}").unwrap();
+            }
+        } else {
+            let reads_epi = arg_reads_with(
+                self,
+                c,
+                "p",
+                Some(&|a: &Arg| {
+                    (a.src.n() == red_node).then(|| format!("wg_acc[0][{}]", self.epilogue_slot(a)))
+                }),
             );
-            writeln!(s, "        {st}").unwrap();
+            writeln!(s, "        let epi = body_{root}({reads_epi});").unwrap();
+            for slot in 0..w_out {
+                let st = store(
+                    out_f,
+                    &format!("g * {w_out}u + {slot}u"),
+                    &format!("epi[{slot}]"),
+                );
+                writeln!(s, "        {st}").unwrap();
+            }
         }
         writeln!(s, "    }}").unwrap();
         writeln!(s, "}}").unwrap();
@@ -536,9 +597,31 @@ pub(super) fn identity(m: &Monoid) -> String {
 
 /// `read_src(view(p…, r…))` for every arg, as call arguments.
 fn arg_reads(g: &TensorGraph, c: &Comp) -> String {
+    arg_reads_with(g, c, "p", None)
+}
+
+/// `u32(offset + Σ coef·{prefix}d)`.
+fn affine(f: &Form, prefix: &str) -> String {
+    let mut terms = vec![format!("{}", f.offset)];
+    for (d, &coef) in f.coefs.iter().enumerate() {
+        if coef != 0 {
+            terms.push(format!("{coef} * i32({prefix}{d})"));
+        }
+    }
+    format!("u32({})", terms.join(" + "))
+}
+
+/// `arg_reads` with point coords named `{pts}d`; `replace` may
+/// substitute an expression for an arg's read.
+type ReadReplace<'a> = Option<&'a dyn Fn(&Arg) -> Option<String>>;
+
+fn arg_reads_with(g: &TensorGraph, c: &Comp, pts: &str, replace: ReadReplace) -> String {
     c.args
         .iter()
-        .map(|a| arg_read(g, c, a))
+        .map(|a| match replace.and_then(|r| r(a)) {
+            Some(e) => e,
+            None => arg_read_with(g, c, a, pts),
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -546,10 +629,14 @@ fn arg_reads(g: &TensorGraph, c: &Comp) -> String {
 /// Value of one arg of `c` at point coords `p…` and reduce coords `r…`
 /// (in scope as variables), zero-padded if the view is guarded.
 pub(super) fn arg_read(g: &TensorGraph, c: &Comp, a: &super::Arg) -> String {
+    arg_read_with(g, c, a, "p")
+}
+
+fn arg_read_with(g: &TensorGraph, c: &Comp, a: &super::Arg, pts: &str) -> String {
     let k = c.points().len();
     let coord_name = |d: usize| {
         if d < k {
-            format!("p{d}")
+            format!("{pts}{d}")
         } else {
             format!("r{}", d - k)
         }
