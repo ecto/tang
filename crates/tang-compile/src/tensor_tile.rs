@@ -10,8 +10,13 @@
 //! cooperatively once per chunk. Attention stages its k/v tiles, matmul
 //! stages both its `a` and `b` tiles. Nothing here knows about either.
 //!
-//! Point coordinates `p{k-1}` (x) and `p{k-2}` (y) are tiled; any leading
-//! point dims are uniform across the workgroup.
+//! The tile's x / y axes are the last two point dims of at least 16
+//! (`tile_axes`); every other point dim is uniform across the workgroup.
+//!
+//! Multi-dim reductions (a conv's `(c, k)`) chunk their largest reduce dim
+//! as `r0` and unroll the small ones (`u{i}`) inside each chunk step;
+//! guarded reads are zero-padded when staged. A map root is an epilogue:
+//! the reduction it applies to is tiled and the map runs at write-out.
 
 use std::collections::BTreeMap;
 use std::fmt::Write;
@@ -160,6 +165,9 @@ struct Ctx<'a> {
     in_load: bool,
     /// first pass collects regions, second emits against them
     collect: bool,
+    /// node whose value is already in a named array (an epilogue's
+    /// reduction, read back from its accumulator)
+    subst: Option<(usize, String)>,
     /// pending guard of the arg being read (see `RegionKey::guard`)
     guard: Option<(Vec<Sym>, Vec<usize>)>,
     /// the last read consumed `guard`: its value is already zero-padded
@@ -316,6 +324,11 @@ impl Ctx<'_> {
 
     /// Value of node `j` at full-shape coordinates `coords`.
     fn expand(&mut self, out: &mut String, j: usize, coords: &[Sym]) -> Val {
+        if let Some((n, name)) = &self.subst {
+            if *n == j {
+                return Val::Arr(name.clone());
+            }
+        }
         let node = &self.g.nodes[j];
         match &node.op {
             Op::Input(_) => {
@@ -541,7 +554,16 @@ impl TensorGraph {
     /// Emit the tiled kernel for `root`, continuing `s` (which already
     /// holds the bindings and per-node functions).
     pub(super) fn tile_kernel(&self, root: usize, mut s: String, reads: Vec<usize>) -> WgslKernel {
-        let c = self.comp_at(root).unwrap();
+        // A map root is an epilogue: tile the reduction it applies to and
+        // evaluate the map at write-out.
+        let epilogue = self.comp_at(root).unwrap().monoid.is_none();
+        let core = if epilogue {
+            self.epilogue_core(root)
+                .expect("tiled map without an epilogue reduction")
+        } else {
+            root
+        };
+        let c = self.comp_at(core).unwrap();
         let (bx, by, chunk) = self.nodes[root].tile;
         let (bx, by, chunk) = (bx as usize, by as usize, chunk as usize);
         let (rx, ry) = self.nodes[root].reg;
@@ -601,6 +623,7 @@ impl TensorGraph {
             comp_regions: Vec::new(),
             in_load: false,
             collect: true,
+            subst: None,
             guard: None,
             guard_done: false,
             counter: 0,
@@ -1007,8 +1030,34 @@ impl TensorGraph {
                 acc
             };
             writeln!(s, "        let g = {point_flat};").unwrap();
-            for slot in 0..w {
-                writeln!(s, "        out[g * {w}u + {slot}u] = acc{t}[{slot}];").unwrap();
+            if epilogue {
+                let mc = self.comp_at(root).unwrap();
+                writeln!(s, "        let p{dx} = x_raw{t};").unwrap();
+                if let Some(dy) = dy {
+                    writeln!(s, "        let p{dy} = y_raw{t};").unwrap();
+                }
+                let space: Vec<Sym> = (0..k).map(|d| Sym::var(&format!("p{d}"))).collect();
+                let mut code = String::new();
+                ctx.in_load = true;
+                ctx.subst = Some((core, format!("acc{t}")));
+                ctx.counter = 5000;
+                let args = ctx.arg_values(&mut code, mc, &space);
+                ctx.subst = None;
+                ctx.in_load = false;
+                let vals = emit_scalar(&mut code, &mc.body, &mc.body_outs, "e_", &|v| {
+                    args[v as usize].clone()
+                });
+                for line in code.lines() {
+                    writeln!(s, "        {line}").unwrap();
+                }
+                let mw = mc.width();
+                for (slot, v) in vals.iter().enumerate() {
+                    writeln!(s, "        out[g * {mw}u + {slot}u] = {v};").unwrap();
+                }
+            } else {
+                for slot in 0..w {
+                    writeln!(s, "        out[g * {w}u + {slot}u] = acc{t}[{slot}];").unwrap();
+                }
             }
             writeln!(s, "    }}").unwrap();
         }

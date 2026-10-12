@@ -986,6 +986,8 @@ pub mod ir_gpu {
             inputs: &[Vec<f32>],
             want: &[Vec<f64>],
         ) {
+            // backward graphs reduce long f32 sums (dα over all of t)
+            let tol = if outs.len() > 1 { 1e-4 } else { 1e-5 };
             let refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
             let exe = Executable::new(device, g.to_wgsl(outs), &refs);
             exe.run(device, cache);
@@ -995,7 +997,7 @@ pub mod ir_gpu {
                 let scale = w.iter().fold(1e-30f64, |m, v| m.max(v.abs()));
                 for (i, (a, b)) in got.iter().zip(w).enumerate() {
                     assert!(
-                        (*a as f64 - b).abs() < 1e-5 * scale,
+                        (*a as f64 - b).abs() < tol * scale,
                         "{name} out {}[{i}]: {a} vs {b}",
                         o.index()
                     );
@@ -1086,6 +1088,84 @@ pub mod ir_gpu {
                     }
                 }
             }
+        }
+
+        /// conv + bias + snake: the map becomes the tiled conv's epilogue
+        /// (one kernel), for every tile candidate, forward and backward.
+        #[test]
+        fn epilogue_fuses_into_tiled_conv_on_gpu() {
+            let Ok(device) = GpuDevice::new_sync() else {
+                eprintln!("no GPU, skipping");
+                return;
+            };
+            let mut cache = KernelCache::new();
+            let (ci, co, t, k, dil) = (24, 40, 75, 5, 2);
+            let (mut g, y) = conv_graph(ci, co, t, k, dil);
+            let b = g.input(&[co, 1]);
+            let alpha = g.input(&[co, 1]);
+            let bb = g.broadcast(b, &[co, t]).unwrap();
+            let ab = g.broadcast(alpha, &[co, t]).unwrap();
+            let out = g
+                .map(&[y, bb, ab], |v| {
+                    let z = v[0] + v[1];
+                    let s = (v[2] * z).sin();
+                    z + s * s / v[2]
+                })
+                .unwrap();
+            let mut rng = crate::Rng::new(13);
+            let inputs = vec![
+                (0..ci * t)
+                    .map(|_| rng.f32() * 2.0 - 1.0)
+                    .collect::<Vec<f32>>(),
+                (0..co * ci * k).map(|_| rng.f32() * 2.0 - 1.0).collect(),
+                (0..co).map(|_| rng.f32() * 0.2).collect(),
+                (0..co).map(|_| 1.0 + rng.f32() * 0.5).collect(),
+            ];
+            let f64s: Vec<Vec<f64>> = inputs
+                .iter()
+                .map(|v| v.iter().map(|&x| x as f64).collect())
+                .collect();
+            let want = g.eval(&f64s, &[out]);
+            let (go, outs) = g.substitute_maps(&[out]);
+            let mut ga = go.clone();
+            ga.schedule_auto(&outs);
+            assert_eq!(ga.to_wgsl(&outs).kernels.len(), 1, "snake should fuse");
+            check_vs_interp(
+                &device,
+                &mut cache,
+                "epilogue auto",
+                &ga,
+                &outs,
+                &inputs,
+                &want,
+            );
+            let cands = ga.schedule_candidates(outs[0]);
+            assert!(cands.iter().any(|c| c.1 .0 > 0));
+            for (split, tile, reg) in cands.into_iter().filter(|c| c.1 .0 > 0) {
+                let mut gv = ga.clone();
+                gv.set_schedule(outs[0], split, tile, reg);
+                let name = format!("epilogue {tile:?} {reg:?}");
+                check_vs_interp(&device, &mut cache, &name, &gv, &outs, &inputs, &want);
+            }
+
+            // backward through the snake: dx, dw, db, dα
+            let wrt: Vec<TensorId> = (0..4).map(TensorId::from_index).collect();
+            let grads = g.backward(out, &wrt).unwrap();
+            let mut all = vec![out];
+            all.extend(grads);
+            let want = g.eval(&f64s, &all);
+            let (gb, all) = g.substitute_maps(&all);
+            let (mut gb, all) = gb.eliminate_common(&all);
+            gb.schedule_auto(&all);
+            check_vs_interp(
+                &device,
+                &mut cache,
+                "epilogue fwd+bwd",
+                &gb,
+                &all,
+                &inputs,
+                &want,
+            );
         }
 
         /// Polyphase upsample `y[o,q,r] = Σ_{j,c} x[c, q−j]·w[o, c, r + s·j]`:

@@ -565,6 +565,14 @@ impl TensorGraph {
             return out;
         };
         if c.monoid.is_none() {
+            // an epilogue map is scheduled as the reduction it applies to
+            if let Some(r) = self.epilogue_core(t.n()) {
+                out.extend(
+                    self.schedule_candidates(TensorId(r as u32))
+                        .into_iter()
+                        .filter(|(split, tile, _)| *split == 0 && tile.0 > 0),
+                );
+            }
             return out;
         }
         // a tree-combine of a wide tuple through workgroup memory is never
@@ -1685,7 +1693,81 @@ impl TensorGraph {
             } else if pts.iter().product::<usize>() < MANY_POINTS {
                 self.nodes[i].split = 256;
             }
+            if self.nodes[i].tile.0 > 0 && uses[i] == 1 && !is_output(i) {
+                self.fuse_epilogue(i, &live);
+            }
         }
+    }
+
+    /// Epilogue fusion: when the only consumer of tiled reduction `r` is
+    /// an elementwise map over the same points (bias, snake, GELU, a
+    /// residual add), the map takes over `r`'s tile schedule and `r` is
+    /// inlined: the tiled kernel applies the map at write-out instead of
+    /// a second launch. Returns whether it fused.
+    pub fn fuse_epilogue(&mut self, r: usize, live: &[bool]) -> bool {
+        let consumers: Vec<usize> = (0..self.nodes.len())
+            .filter(|&j| live[j] && self.deps(j).contains(&r))
+            .collect();
+        let [m] = consumers[..] else {
+            return false;
+        };
+        if self.nodes[m].inline || self.nodes[m].tile.0 > 0 || self.nodes[m].split > 0 {
+            return false;
+        }
+        // Measured on an M4: a GELU epilogue (exp2 + recip per point,
+        // once per register-tile copy) made ConvNeXt's F×C matmul slower
+        // fused (0.60 vs 0.56 ms block) while snake/bias/residual epilogues
+        // win; keep exp/log epilogues as their own map.
+        let heavy = self.comp_at(m).is_some_and(|c| {
+            c.body
+                .nodes_slice()
+                .iter()
+                .any(|n| matches!(n, tang_expr::Node::Exp2(_) | tang_expr::Node::Log2(_)))
+        });
+        if heavy {
+            return false;
+        }
+        let was = self.nodes[r].inline;
+        self.nodes[r].inline = true;
+        if self.epilogue_core(m) != Some(r) {
+            self.nodes[r].inline = was;
+            return false;
+        }
+        self.nodes[m].tile = self.nodes[r].tile;
+        self.nodes[m].reg = self.nodes[r].reg;
+        self.nodes[r].tile = (0, 0, 0);
+        self.nodes[r].reg = (1, 1);
+        true
+    }
+
+    /// The inlined reduction a map `m` applies as an epilogue: its single
+    /// arg that is an inlined reduction, read unguarded at exactly `m`'s
+    /// points. A tile schedule on such a map tiles that reduction.
+    pub(crate) fn epilogue_core(&self, m: usize) -> Option<usize> {
+        let c = self.comp_at(m)?;
+        if c.monoid.is_some() || c.tuple != 0 {
+            return None;
+        }
+        let mut cores = c.args.iter().filter(|a| {
+            self.nodes[a.src.n()].inline
+                && self.comp_at(a.src.n()).is_some_and(|r| r.monoid.is_some())
+        });
+        let a = cores.next()?;
+        if cores.next().is_some() || a.view.guard {
+            return None;
+        }
+        let r = self.comp_at(a.src.n())?;
+        if r.tuple != 0 || r.out != c.out || a.view.forms.len() != c.out.len() {
+            return None;
+        }
+        let identity = a.view.forms.iter().enumerate().all(|(d, f)| {
+            f.offset == 0
+                && f.coefs
+                    .iter()
+                    .enumerate()
+                    .all(|(e, &v)| v == i64::from(e == d))
+        });
+        identity.then_some(a.src.n())
     }
 
     /// Common-subexpression elimination over comps: two live comps with
