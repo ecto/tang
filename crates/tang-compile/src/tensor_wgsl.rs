@@ -52,13 +52,15 @@ impl TensorGraph {
     pub fn to_wgsl(&self, outputs: &[TensorId]) -> WgslProgram {
         let live = self.live(outputs);
         let n = self.nodes.len();
-        let needs_buffer = |i: usize| live[i] && !self.nodes[i].inline;
+        let needs_buffer =
+            |i: usize| live[i] && !self.nodes[i].inline && !matches!(self.nodes[i].op, Op::Iota(_));
         let buffers = (0..n)
             .filter(|&i| needs_buffer(i))
             .map(|i| {
                 let (len, input) = match &self.nodes[i].op {
                     Op::Input(k) => (numel(&self.nodes[i].shape), Some(*k)),
                     Op::Comp(c) => (numel(c.points()) * c.width(), None),
+                    Op::Iota(_) => unreachable!(),
                 };
                 BufferSpec {
                     node: TensorId(i as u32),
@@ -106,7 +108,9 @@ impl TensorGraph {
         let reads: Vec<usize> = order
             .iter()
             .copied()
-            .filter(|&j| j != root && !self.nodes[j].inline)
+            .filter(|&j| {
+                j != root && !self.nodes[j].inline && !matches!(self.nodes[j].op, Op::Iota(_))
+            })
             .collect();
 
         let mut s = String::new();
@@ -253,6 +257,11 @@ impl TensorGraph {
             Op::Input(_) => {
                 writeln!(s, "fn read_{j}({coords}) -> f32 {{").unwrap();
                 writeln!(s, "    return b{j}[{}];", flat("c", 0, &fixed(&node.shape))).unwrap();
+                writeln!(s, "}}\n").unwrap();
+            }
+            Op::Iota(d) => {
+                writeln!(s, "fn read_{j}({coords}) -> f32 {{").unwrap();
+                writeln!(s, "    return f32(c{d});").unwrap();
                 writeln!(s, "}}\n").unwrap();
             }
             Op::Comp(c) => {

@@ -302,6 +302,7 @@ impl Ctx<'_> {
                 let addr = flat(coords, &fixed(&node.shape));
                 Val::Expr(self.buffer_read(j, addr))
             }
+            Op::Iota(d) => Val::Expr(format!("f32({})", coords[*d].wgsl())),
             Op::Comp(c) if self.reads.contains(&j) => {
                 let k = c.points().len();
                 let mut addr = flat(&coords[..k], &fixed(c.points())).scaled(c.width() as i64);
@@ -439,7 +440,7 @@ impl Ctx<'_> {
     fn tuple_rank(&self, j: usize) -> usize {
         match &self.g.nodes[j].op {
             Op::Comp(c) => c.tuple,
-            Op::Input(_) => 0,
+            Op::Input(_) | Op::Iota(_) => 0,
         }
     }
 }

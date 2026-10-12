@@ -348,14 +348,30 @@ pub mod ir_gpu {
             .collect()
     }
 
-    /// Single-head causal `softmax(q·kᵀ/√d + mask)·v`, written naively.
-    /// Inputs: q `[n,d]`, k `[n,d]`, v `[n,dv]`, mask `[n,n]`.
+    /// `[q_len, kv_len]` additive causal mask from coordinates: query `i`
+    /// (at position `kv_len - q_len + i`) sees keys `j` up to that position.
+    pub fn causal_mask_graph(g: &mut TensorGraph, q_len: usize, kv_len: usize) -> TensorId {
+        let i = g.iota(&[q_len, kv_len], 0);
+        let j = g.iota(&[q_len, kv_len], 1);
+        let start = (kv_len - q_len) as f64;
+        g.map(&[i, j], |v| {
+            let above = v[1] - v[0] - ExprId::from_f64(start); // > 0 when j > start + i
+            tang_expr::with_graph(|eg| {
+                let neg = eg.lit(-1e30);
+                eg.select(above, neg, ExprId::ZERO)
+            })
+        })
+        .unwrap()
+    }
+
+    /// Single-head causal `softmax(q·kᵀ/√d + mask)·v`, written naively,
+    /// mask built in-graph. Inputs: q `[n,d]`, k `[n,d]`, v `[n,dv]`.
     pub fn naive_attention(n: usize, d: usize, dv: usize) -> (TensorGraph, TensorId) {
         let mut g = TensorGraph::new();
         let q = g.input(&[n, d]);
         let k = g.input(&[n, d]);
         let v = g.input(&[n, dv]);
-        let mask = g.input(&[n, n]);
+        let mask = causal_mask_graph(&mut g, n, n);
         let scale = 1.0 / (d as f64).sqrt();
         let qs = g.map(&[q], |x| x[0] * ExprId::from_f64(scale)).unwrap();
         let kt = g.transpose(k, &[1, 0]).unwrap();
@@ -785,7 +801,6 @@ pub mod ir_gpu {
             let vt = GpuTensor::from_slice(device, &v, &[n, d]);
             let want = kv_attention_fused(device, cache, &qt, &kt, &vt, n, n, 1, 1, d, 0)
                 .to_vec_flushed(device, cache);
-            let mask = causal_mask(n);
 
             // CPU reference
             let mut cpu = vec![0.0f32; n * d];
@@ -812,7 +827,7 @@ pub mod ir_gpu {
             }
             for (name, g, y) in attention_candidates(n, d, d) {
                 let program = g.to_wgsl(&[y]);
-                let exe = Executable::new(device, program, &[&q, &k, &v, &mask]);
+                let exe = Executable::new(device, program, &[&q, &k, &v]);
                 exe.run(device, cache);
                 cache.flush(device);
                 let got = exe.read(device, y);
@@ -826,7 +841,7 @@ pub mod ir_gpu {
                 device,
                 cache,
                 attention_candidates(n, d, d),
-                &[&q, &k, &v, &mask],
+                &[&q, &k, &v],
                 3,
             );
             eprintln!("autotune picked {name} at {t:?}");
@@ -860,12 +875,12 @@ pub mod ir_block {
     }
 
     /// Input order for the graph's buffers.
-    pub const INPUTS: [&str; 18] = [
+    pub const INPUTS: [&str; 17] = [
         "x", "wq", "bq", "wk", "bk", "wv", "bv", "wo", "bo", "w_gate", "b_gate", "w_up", "b_up",
-        "w_down", "b_down", "cos", "sin", "mask",
+        "w_down", "b_down", "cos", "sin",
     ];
-    // Decode adds `k_cache`, `v_cache` (rotated, `[kv_len, kv_dim]`)
-    // between `sin` and `mask`.
+    // Decode adds `k_cache`, `v_cache` (rotated, `[kv_len, kv_dim]`) after
+    // `sin`. The causal mask is built in-graph from coordinates.
 
     fn unit(rank: usize, d: usize) -> Form {
         let mut f = Form {
@@ -1098,11 +1113,7 @@ pub mod ir_block {
                 |a| vec![a[0] * a[1] + a[2] * a[3]],
             )
             .unwrap();
-        // causal mask as a comparison on coordinates is not affine; use an
-        // input-free trick: mask = (j - i > 0 ? -1e30 : 0) via a map over an
-        // index view is impossible without coordinate access, so the
-        // mask is a graph input like in `naive_attention`.
-        let mask = g.input(&[seq, kv_len]);
+        let mask = super::ir_gpu::causal_mask_graph(&mut g, seq, kv_len);
         let r4 = 4;
         let masked = g
             .comp(
@@ -1273,7 +1284,7 @@ pub mod ir_block {
 /// Hand-written vs derived transformer block on the GPU.
 pub mod ir_block_gpu {
     use super::ir_block::{compiled_block, transformer_block, BlockDims};
-    use super::ir_gpu::{causal_mask_kv, Executable};
+    use super::ir_gpu::Executable;
     use tang_gpu::nn::bias_add;
     use tang_gpu::*;
 
@@ -1344,7 +1355,6 @@ pub mod ir_block_gpu {
         } else {
             (None, None)
         };
-        cpu.push(causal_mask_kv(seq, kv_len));
         Params {
             k_cache: k_cache.map(|kc| GpuTensor::from_slice(device, &kc, &[kv_len, kv])),
             v_cache: v_cache.map(|vc| GpuTensor::from_slice(device, &vc, &[kv_len, kv])),

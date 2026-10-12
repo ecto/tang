@@ -350,6 +350,9 @@ impl Comp {
 #[allow(clippy::large_enum_variant)]
 pub enum Op {
     Input(usize),
+    /// The coordinate along `dim` at every point, as a value. Lets a body
+    /// see where it is: causal masks, positional tables, slice gradients.
+    Iota(usize),
     Comp(Comp),
 }
 
@@ -508,6 +511,19 @@ impl TensorGraph {
         self.n_inputs += 1;
         self.nodes.push(TNode {
             op: Op::Input(i),
+            shape: dims(shape),
+            inline: false,
+            split: 0,
+            tile: (0, 0, 0),
+        });
+        TensorId(self.nodes.len() as u32 - 1)
+    }
+
+    /// `out[i…] = i[dim]` as a float. No buffer: reads compute the
+    /// coordinate through the consumer's view.
+    pub fn iota<D: Into<Dim> + Copy>(&mut self, shape: &[D], dim: usize) -> TensorId {
+        self.nodes.push(TNode {
+            op: Op::Iota(dim),
             shape: dims(shape),
             inline: false,
             split: 0,
@@ -720,7 +736,7 @@ impl TensorGraph {
     fn comp_at(&self, i: usize) -> Option<&Comp> {
         match &self.nodes[i].op {
             Op::Comp(c) => Some(c),
-            Op::Input(_) => None,
+            Op::Input(_) | Op::Iota(_) => None,
         }
     }
 
@@ -804,6 +820,7 @@ impl TensorGraph {
             let node = &self.nodes[i];
             let op = match &node.op {
                 Op::Input(k) => Op::Input(*k),
+                Op::Iota(d) => Op::Iota(*d),
                 Op::Comp(c) => {
                     let rank = c.rank();
                     let mut body = ExprGraph::new();
@@ -1304,7 +1321,7 @@ impl TensorGraph {
             let shape_ok = n.shape.iter().all(|d| d.fixed().is_some());
             let comp_ok = match &n.op {
                 Op::Comp(c) => c.red.iter().all(|d| d.fixed().is_some()),
-                Op::Input(_) => true,
+                Op::Input(_) | Op::Iota(_) => true,
             };
             shape_ok && comp_ok
         })
@@ -1383,7 +1400,7 @@ impl TensorGraph {
                         body: c.body.compile_many(&c.body_outs),
                         combine: c.monoid.as_ref().map(|m| m.combine.compile_many(&m.outs)),
                     }),
-                    Op::Input(_) => None,
+                    Op::Input(_) | Op::Iota(_) => None,
                 })
                 .collect(),
         };
@@ -1433,6 +1450,7 @@ impl Evaluator<'_> {
         let node = &self.g.nodes[t.n()];
         match &node.op {
             Op::Input(k) => self.inputs[*k][flat_index(&fixed(&node.shape), idx)],
+            Op::Iota(d) => idx[*d] as f64,
             Op::Comp(c) => {
                 let (pt, tup) = idx.split_at(c.points().len());
                 let slot = flat_index(&fixed(&c.out[c.points().len()..]), tup);
@@ -1671,25 +1689,52 @@ mod tests {
     }
 
     #[test]
+    fn iota_is_the_coordinate_through_any_view() {
+        let mut g = TensorGraph::new();
+        let j = g.iota(&[2, 3], 1);
+        let t = g.transpose(j, &[1, 0]).unwrap(); // t[a, b] = j[b, a] = a
+        let got = g.eval(&[], &[t]).remove(0);
+        assert_eq!(got, vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0]);
+        let (fg, outs) = g.substitute_maps(&[t]);
+        assert_eq!(fg.eval(&[], &outs)[0], got);
+    }
+
+    #[test]
     fn monoid_kinds() {
         assert_eq!(Monoid::sum().kind(), MonoidKind::Sum);
         assert_eq!(Monoid::max().kind(), MonoidKind::Max);
         assert_eq!(Monoid::online_softmax(2).kind(), MonoidKind::OnlineSoftmax);
     }
 
-    /// softmax(q·kᵀ [+ mask])·v with every intermediate written out.
+    /// `[n, n]` additive causal mask built in-graph from coordinates:
+    /// 0 where `j <= i`, a large negative where `j > i`.
+    fn causal_mask(g: &mut TensorGraph, n: Dim) -> TensorId {
+        let i = g.iota(&[n, n], 0);
+        let j = g.iota(&[n, n], 1);
+        g.map(&[i, j], |v| {
+            let above = v[1] - v[0]; // > 0 when j > i
+            tang_expr::with_graph(|eg| {
+                let neg = eg.lit(-1e30);
+                eg.select(above, neg, ExprId::ZERO)
+            })
+        })
+        .unwrap()
+    }
+
+    /// softmax(q·kᵀ [+ causal mask])·v with every intermediate written out.
     fn naive_attention(
         g: &mut TensorGraph,
         q: TensorId,
         k: TensorId,
         v: TensorId,
-        mask: Option<TensorId>,
+        causal: bool,
     ) -> TensorId {
         let n = g.shape(q)[0];
         let dv = g.shape(v)[1];
         let kt = g.transpose(k, &[1, 0]).unwrap();
         let mut s = g.matmul(q, kt).unwrap(); // [n, n]
-        if let Some(mask) = mask {
+        if causal {
+            let mask = causal_mask(g, n);
             s = g.map(&[s, mask], |v| v[0] + v[1]).unwrap();
         }
         let m = g.reduce(s, 1, Monoid::max()).unwrap(); // [n, 1]
@@ -1711,7 +1756,7 @@ mod tests {
         let q = g.input(&[n, Dim::Fixed(d)]);
         let k = g.input(&[n, Dim::Fixed(d)]);
         let v = g.input(&[n, Dim::Fixed(dv)]);
-        let y = naive_attention(&mut g, q, k, v, None);
+        let y = naive_attention(&mut g, q, k, v, true);
         assert!(!g.is_bound());
         let grads = g.backward(y, &[q]).unwrap();
         let (sg, outs) = g.substitute_maps(&[y, grads[0]]);
@@ -1736,7 +1781,7 @@ mod tests {
             let fq = fg.input(&[size, d]);
             let fk = fg.input(&[size, d]);
             let fv = fg.input(&[size, dv]);
-            let fy = naive_attention(&mut fg, fq, fk, fv, None);
+            let fy = naive_attention(&mut fg, fq, fk, fv, true);
             let fgr = fg.backward(fy, &[fq]).unwrap();
             let want = fg.eval(&inputs, &[fy, fgr[0]]);
             close(&got[0], &want[0]);
@@ -1776,7 +1821,7 @@ mod tests {
         let q = g.input(&[n, d]);
         let k = g.input(&[n, d]);
         let v = g.input(&[n, dv]);
-        let y = naive_attention(&mut g, q, k, v, None);
+        let y = naive_attention(&mut g, q, k, v, false);
         let (g, outs) = g.substitute_maps(&[y]);
         let (mut g, outs) = g.stabilize_softmax(&outs);
         g.schedule_auto(&outs);
@@ -1816,22 +1861,18 @@ mod tests {
         let q = g.input(&[n, d]);
         let k = g.input(&[n, d]);
         let v = g.input(&[n, dv]);
-        let mask = causal.then(|| g.input(&[n, n]));
-        let y = naive_attention(&mut g, q, k, v, mask);
+        let y = naive_attention(&mut g, q, k, v, causal);
 
-        let mut inputs = vec![
+        let inputs = [
             ramp(n * d, 0.05, -1.0),
             ramp(n * d, 0.07, 0.3),
             ramp(n * dv, 0.1, -2.0),
         ];
-        if causal {
-            inputs.push(
-                (0..n * n)
-                    .map(|p| if p % n <= p / n { 0.0 } else { -1e30 })
-                    .collect(),
-            );
-        }
         let want = g.eval(&inputs, &[y]).remove(0);
+        if causal {
+            // row 0 attends only to itself: y[0] == v[0]
+            close(&want[..dv], &inputs[2][..dv]);
+        }
 
         // naive: scores and p are materialized n×n
         assert!(g.materialized(&[y]).iter().any(|(_, s)| numel(s) == n * n));
