@@ -300,7 +300,14 @@ pub mod ir_gpu {
 
         /// Dispatch every kernel in order.
         pub fn run(&self, device: &GpuDevice, cache: &mut KernelCache) {
-            for k in &self.program.kernels {
+            for i in 0..self.program.kernels.len() {
+                self.run_kernel(device, cache, i);
+            }
+        }
+
+        /// Dispatch kernel `i` only (its inputs must already be computed).
+        pub fn run_kernel(&self, device: &GpuDevice, cache: &mut KernelCache, i: usize) {
+            for k in std::iter::once(&self.program.kernels[i]) {
                 let mut bufs: Vec<&GpuBuffer> = k.reads.iter().map(|t| self.buffer(*t)).collect();
                 bufs.push(self.buffer(k.node));
                 let out_idx = bufs.len() - 1;

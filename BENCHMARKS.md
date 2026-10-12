@@ -373,10 +373,11 @@ rather than a fixed heuristic.
 ### `schedule_auto`
 
 A fixed rule distilled from the tables above: a materialized reduction
-whose points end in a lane axis (16–256 wide, with rows above it) is
-tiled rows × lanes with cooperative staging; otherwise one with fewer than
-2¹⁴ points and a reduce axis ≥ 64 is split across a 256-thread workgroup;
-everything else stays one thread per point. It lands within noise of the
+whose points end in a lane axis (16–128 wide, with rows above it) *and*
+that has a lane-invariant single-use producer to share is tiled rows ×
+lanes with that producer inlined and staged cooperatively; otherwise one
+with fewer than 2¹⁴ points and a reduce axis ≥ 64 is split across a
+256-thread workgroup; everything else stays one thread per point. It lands within noise of the
 best hand-picked schedule for attention (tiled), rmsnorm (split) and
 matmul (naive-ish; the tile does not pay here). It does not choose between
 algebras — materialized scores vs online softmax — which is `autotune`'s
@@ -393,8 +394,13 @@ with the hand path and with the f64 interpreter to 5e-7.
 
 | seq | hand | ir_auto |
 |---|---|---|
-| 128 | 5.04 ms | 5.86 ms |
-| 512 | 24.0 ms | **19.6 ms** |
+| 128 | 5.15 ms | **4.61 ms** |
+| 512 | 24.1 ms | **14.3 ms** |
+
+(10 kernels; `examples/block_kernels.rs` times each one. An earlier
+version of `schedule_auto` lane-tiled the plain k/v projections and lost
+1.5 ms to it — the tile only pays when there is a lane-invariant
+sub-computation to share, which is now the rule.)
 
 GQA's `head / heads_per_group` is not affine, so heads are expressed as
 `[groups, per_group]` dims and the views do the rest; the causal mask is an

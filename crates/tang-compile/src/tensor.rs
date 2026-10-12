@@ -296,6 +296,11 @@ impl TensorId {
     fn n(self) -> usize {
         self.0 as usize
     }
+
+    /// Index into [`TensorGraph::nodes`].
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -1290,20 +1295,23 @@ impl TensorGraph {
             let lane_dim = (0..pts.len()).rev().find(|&d| pts[d] > 1);
             let lanes = lane_dim.map_or(1, |d| pts[d]);
             let rows = pts.iter().rev().filter(|&&n| n > 1).nth(1).is_some();
-            if c.red.len() == 1 && (LANES..=256).contains(&lanes) && rows {
-                // A lane axis: rows × lanes per workgroup, shared reads and
-                // shared sub-computations staged cooperatively. Producers
-                // the lanes do not depend on are inlined too: the tile
-                // computes them once per workgroup instead of per lane.
-                let by = (256 / lanes).max(1) as u32;
-                let lane = lane_dim.unwrap();
-                let shared: Vec<usize> = c
-                    .args
-                    .iter()
-                    .filter(|a| !a.view.depends_on(lane) && uses[a.src.n()] == 1)
-                    .map(|a| a.src.n())
-                    .filter(|&p| !is_output(p) && self.comp_at(p).is_some())
-                    .collect();
+            // Producers the lane axis does not depend on: a tile computes
+            // them once per workgroup instead of once per lane.
+            let shared: Vec<usize> = lane_dim
+                .map(|lane| {
+                    c.args
+                        .iter()
+                        .filter(|a| !a.view.depends_on(lane) && uses[a.src.n()] == 1)
+                        .map(|a| a.src.n())
+                        .filter(|&p| !is_output(p) && self.comp_at(p).is_some())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let by = (256 / lanes).max(1) as u32;
+            if c.red.len() == 1 && (LANES..=128).contains(&lanes) && rows && !shared.is_empty() {
+                // Rows × lanes per workgroup with the shared sub-computation
+                // staged cooperatively. Without one (a plain matmul) the
+                // tile has nothing to share and one thread per point wins.
                 self.nodes[i].tile = (lanes as u32, by, 32);
                 for p in shared {
                     self.nodes[p].inline = true;
@@ -1710,14 +1718,32 @@ mod tests {
         assert_eq!(g.nodes()[y.n()].split, 0);
         assert_eq!(g.nodes()[y.n()].tile, (0, 0, 0));
 
-        // rows x lanes points with a wide reduce -> 2-D tile over lanes
+        // a plain matmul has nothing to share across lanes -> one thread per point
         let mut g = TensorGraph::new();
         let a = g.input(&[256, 128]);
         let b = g.input(&[128, 64]);
         let c = g.matmul(a, b).unwrap();
         g.schedule_auto(&[c]);
-        assert_eq!(g.nodes()[c.n()].tile, (64, 4, 32));
+        assert_eq!(g.nodes()[c.n()].tile, (0, 0, 0));
         assert_eq!(g.nodes()[c.n()].split, 0);
+
+        // attention after the softmax rewrite: scores are lane-invariant -> tiled, scores inlined
+        let (n, d, dv) = (64, 16, 32);
+        let mut g = TensorGraph::new();
+        let q = g.input(&[n, d]);
+        let k = g.input(&[n, d]);
+        let v = g.input(&[n, dv]);
+        let y = naive_attention(&mut g, q, k, v, None);
+        let (g, outs) = g.substitute_maps(&[y]);
+        let (mut g, outs) = g.stabilize_softmax(&outs);
+        g.schedule_auto(&outs);
+        let fused = g
+            .nodes()
+            .iter()
+            .position(|nd| matches!(&nd.op, Op::Comp(c) if c.tuple == 1))
+            .unwrap();
+        assert_eq!(g.nodes()[fused].tile, (dv as u32, 8, 32));
+        assert_eq!(g.materialized(&outs).len(), 2);
     }
 
     #[test]
