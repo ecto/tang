@@ -68,8 +68,8 @@ impl Rasterizer {
                     ..wgpu::Limits::default()
                 },
                 memory_hints: wgpu::MemoryHints::Performance,
+                trace: wgpu::Trace::Off,
             },
-            None,
         ))
         .expect("failed to create GPU device");
 
@@ -751,7 +751,7 @@ impl Rasterizer {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             tx.send(r).ok();
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll(wgpu::PollType::Wait).expect("poll");
         rx.recv().unwrap().unwrap();
 
         let data = slice.get_mapped_range();
@@ -778,7 +778,7 @@ impl Rasterizer {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             tx.send(r).ok();
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll(wgpu::PollType::Wait).expect("poll");
         rx.recv().unwrap().unwrap();
 
         let data = slice.get_mapped_range();

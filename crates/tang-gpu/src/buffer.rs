@@ -84,7 +84,7 @@ impl GpuBuffer {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).ok();
         });
-        device.device.poll(wgpu::Maintain::Wait);
+        device.device.poll(wgpu::PollType::Wait).expect("poll");
         rx.recv().unwrap().unwrap();
 
         let data = slice.get_mapped_range();

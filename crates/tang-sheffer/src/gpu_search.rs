@@ -190,7 +190,7 @@ impl GpuSearcher {
             compatible_surface: None,
             force_fallback_adapter: false,
         }))
-        .ok_or("no GPU adapter")?;
+        .map_err(|_| "no GPU adapter")?;
 
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
@@ -204,8 +204,8 @@ impl GpuSearcher {
                     ..wgpu::Limits::default()
                 },
                 memory_hints: wgpu::MemoryHints::Performance,
+                trace: wgpu::Trace::Off,
             },
-            None,
         ))?;
 
         // Compile shader
@@ -495,7 +495,7 @@ impl GpuSearcher {
 
         let slice = self.hit_count_readback.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll(wgpu::PollType::Wait).expect("poll");
         let count = {
             let data = slice.get_mapped_range();
             let arr: [u32; 1] = *bytemuck::from_bytes::<[u32; 1]>(&data);
@@ -519,7 +519,7 @@ impl GpuSearcher {
 
         let slice = self.hit_readback.slice(..byte_count);
         slice.map_async(wgpu::MapMode::Read, |_| {});
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll(wgpu::PollType::Wait).expect("poll");
         let hits: Vec<GpuHit> = {
             let data = slice.get_mapped_range();
             bytemuck::cast_slice::<u8, GpuHit>(&data).to_vec()

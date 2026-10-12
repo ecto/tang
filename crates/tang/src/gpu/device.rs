@@ -45,7 +45,7 @@ impl GpuDevice {
                 force_fallback_adapter: false,
             })
             .await
-            .ok_or(GpuError::NoAdapter)?;
+            .map_err(|_| GpuError::NoAdapter)?;
 
         let (device, queue) = adapter
             .request_device(
@@ -54,8 +54,8 @@ impl GpuDevice {
                     required_features: wgpu::Features::empty(),
                     required_limits: wgpu::Limits::default(),
                     memory_hints: wgpu::MemoryHints::Performance,
+                    trace: wgpu::Trace::Off,
                 },
-                None,
             )
             .await?;
 
