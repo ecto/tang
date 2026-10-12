@@ -207,7 +207,7 @@ fn bench_matvec(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("build", n), |b| {
             b.iter(|| {
                 let (g, outs) = trace_matvec(n);
-                black_box(compile(&g, &outs, true));
+                black_box(compile(&g, &outs, true).1);
             })
         });
     }
