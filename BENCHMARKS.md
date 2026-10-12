@@ -725,6 +725,37 @@ block forward, 4× on the training step (against its quieter numbers).
 What remains is tensor cores (unreachable from WGSL; a backend
 question) and the rest of the instruction-quality ladder above.
 
+### A native dialect: Metal simdgroup matrices (first cut)
+
+`tensor_msl.rs` lowers a matmul-shaped tile — one reduce axis, body
+`a·b`, each operand read along one tile axis and the reduce axis, any
+affine layout — to MSL with `simdgroup_float8x8` fragments, through
+wgpu 25's MSL passthrough. The comp's epilogue (bias, activation) runs
+on the stored block. Kernels that don't fit stay WGSL, so a program is a
+mix. Correct on ragged shapes (staged tiles) and full tiles (fragments
+loaded straight from device memory); 12/12 GPU tests.
+
+M4 Max, kernel-only (`mma` column of `kernel_only`):
+
+| shape | WGSL 4×4 register tile | simdgroup matrices |
+|---|---|---|
+| 1024² | 0.56 ms | 0.93 |
+| 128×576×1536 | 0.13 | 0.27 |
+| 512×576×1536 | 0.25 | 0.48 |
+
+So on this chip the first-cut fp32 simdgroup kernel is 1.7–2× *slower*
+than the FMA tile. Ablations: the staged version spent two thirds of
+its time in scalar staging; fragments straight from memory halved
+that but the MMA loop itself runs at ~2.3 TFLOPS, where the FMA tile
+runs at 3.7. MLX's fp32 GEMM on the same hardware shows what the
+instruction is worth with vectorized staging, swizzled tiles and
+deeper software pipelining; that is engineering on top of a lowering
+that now exists, and `program_for` keeps WGSL the default until it
+wins. The structural claim stands: the same comprehension lowered to a
+second dialect with no op-specific code, epilogue included. The CUDA
+dialect (tensor cores proper, where the gap to PyTorch lives) is the
+same shape of work with nvcc in the loop.
+
 What this does and does not show: the compiler derives the *structure* of
 the fast kernels (flash attention, register-tiled matmul, sequence
 parallelism) from the algebra, with no op-specific code, and picks per

@@ -34,6 +34,9 @@ pub struct GpuDevice {
     pub(crate) queue: wgpu::Queue,
     /// Adapter name and backend, e.g. `"Apple M4 Max (Metal)"`.
     pub name: String,
+    /// Native MSL kernels can be dispatched (Metal, with wgpu's
+    /// shader passthrough).
+    pub msl_passthrough: bool,
 }
 
 impl GpuDevice {
@@ -75,10 +78,12 @@ impl GpuDevice {
 
         let info = adapter.get_info();
         let name = format!("{} ({:?})", info.name, info.backend);
+        let msl_passthrough = required_features.contains(wgpu::Features::MSL_SHADER_PASSTHROUGH);
         Ok(Self {
             device,
             queue,
             name,
+            msl_passthrough,
         })
     }
 

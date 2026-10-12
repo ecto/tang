@@ -272,6 +272,18 @@ pub mod ir_gpu {
         pub buffers: Vec<GpuBuffer>,
     }
 
+    /// The program for `device`. Native simdgroup-matrix tiles (Metal,
+    /// `TANG_NATIVE=1`) are correct but, as first cut, slower than the
+    /// WGSL register tile on an M4 (see BENCHMARKS.md), so WGSL is the
+    /// default everywhere.
+    pub fn program_for(device: &GpuDevice, g: &TensorGraph, outputs: &[TensorId]) -> WgslProgram {
+        if device.msl_passthrough && std::env::var("TANG_NATIVE").is_ok() {
+            g.to_msl(outputs)
+        } else {
+            g.to_wgsl(outputs)
+        }
+    }
+
     impl Executable {
         pub fn new(device: &GpuDevice, program: WgslProgram, inputs: &[&[f32]]) -> Self {
             let buffers = program
@@ -951,6 +963,66 @@ pub mod ir_gpu {
             }
         }
 
+        /// On Metal, the tiled matmul (and its bias epilogue) lowers to
+        /// simdgroup matrices; same answer as the WGSL tile.
+        #[test]
+        fn simdgroup_matrix_matmul_matches_on_metal() {
+            let Ok(device) = GpuDevice::new_sync() else {
+                return;
+            };
+            if !device.msl_passthrough {
+                eprintln!("no MSL passthrough on {}, skipping", device.name);
+                return;
+            }
+            // ragged shapes take the staged path, full tiles the direct one
+            for (m, k, n) in [(130, 70, 200), (128, 64, 192)] {
+                check_simdgroup_matmul(&device, m, k, n);
+            }
+        }
+
+        fn check_simdgroup_matmul(device: &GpuDevice, m: usize, k: usize, n: usize) {
+            let device = device;
+            let mut cache = KernelCache::new();
+            let mut rng = crate::Rng::new(5);
+            let a: Vec<f32> = (0..m * k).map(|_| rng.f32() * 2.0 - 1.0).collect();
+            let b: Vec<f32> = (0..k * n).map(|_| rng.f32() * 2.0 - 1.0).collect();
+            let bias: Vec<f32> = (0..n).map(|_| rng.f32()).collect();
+            // y = a·bᵀ-free plain matmul + bias, then silu: the bias and
+            // activation are the tile's epilogue
+            let mut g = TensorGraph::new();
+            let ai = g.input(&[m, k]);
+            let bi = g.input(&[k, n]);
+            let bb = g.input(&[n]);
+            let c = g.matmul(ai, bi).unwrap();
+            let bb1 = g.reshape(bb, &[1, n]).unwrap();
+            let bbc = g.broadcast(bb1, &[m, n]).unwrap();
+            let y = g
+                .map(&[c, bbc], |v| {
+                    let s = v[0] + v[1];
+                    s / (ExprId::from_f64(1.0) + (-s).exp())
+                })
+                .unwrap();
+            let (mut g, outs) = g.substitute_maps(&[y]);
+            g.schedule_auto(&outs);
+            let f64s = |v: &[f32]| v.iter().map(|&x| x as f64).collect::<Vec<f64>>();
+            let want = g.eval(&[f64s(&a), f64s(&b), f64s(&bias)], &outs).remove(0);
+            let prog = g.to_msl(&outs);
+            assert!(
+                prog.kernels
+                    .iter()
+                    .any(|k| k.source.starts_with("#include")),
+                "expected a native kernel"
+            );
+            let exe = Executable::new(device, prog, &[&a, &b, &bias]);
+            exe.run(device, &mut cache);
+            cache.flush(device);
+            let got = exe.read(device, outs[0]);
+            assert_eq!(got.len(), want.len());
+            for (i, (&x, &y)) in got.iter().zip(&want).enumerate() {
+                assert!((x as f64 - y).abs() < 2e-3, "{m}x{k}x{n} [{i}]: {x} vs {y}");
+            }
+        }
+
         #[test]
         fn derived_attention_matches_hand_kernel_on_gpu() {
             let Ok(device) = GpuDevice::new_sync() else {
@@ -1588,7 +1660,7 @@ pub mod ir_block {
 /// Hand-written vs derived transformer block on the GPU.
 pub mod ir_block_gpu {
     use super::ir_block::{compiled_block, transformer_block, BlockDims};
-    use super::ir_gpu::Executable;
+    use super::ir_gpu::{program_for, Executable};
     use tang_gpu::nn::bias_add;
     use tang_gpu::*;
 
@@ -1773,7 +1845,10 @@ pub mod ir_block_gpu {
             (g, outs[0])
         };
         let inputs: Vec<&[f32]> = p.cpu.iter().map(|v| v.as_slice()).collect();
-        (Executable::new(device, g.to_wgsl(&[y]), &inputs), y)
+        (
+            Executable::new(device, program_for(device, &g, &[y]), &inputs),
+            y,
+        )
     }
 
     /// tang-gpu's hand-written trainable block (`GpuTrainTransformerBlock`:
@@ -1827,7 +1902,10 @@ pub mod ir_block_gpu {
         let (mut g, outs) = g.merge_siblings(&outs);
         g.schedule_auto(&outs);
         let inputs: Vec<&[f32]> = p.cpu.iter().map(|v| v.as_slice()).collect();
-        (Executable::new(device, g.to_wgsl(&outs), &inputs), outs)
+        (
+            Executable::new(device, program_for(device, &g, &outs), &inputs),
+            outs,
+        )
     }
 
     /// The block under the per-kernel autotuner, cached in

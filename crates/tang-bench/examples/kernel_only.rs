@@ -4,7 +4,9 @@
 use std::time::Instant;
 use tang_bench::ir_block::{train_loss_graph, BlockDims};
 use tang_bench::ir_block_gpu::{hand_forward, ir_executable, params};
-use tang_bench::ir_gpu::{adam_step, attention_candidates, matmul_candidates, Executable};
+use tang_bench::ir_gpu::{
+    adam_step, attention_candidates, matmul_candidates, program_for, Executable,
+};
 use tang_compile::tensor::TensorId;
 use tang_gpu::{kv_attention_fused, GpuBuffer, GpuDevice, GpuTensor, KernelCache};
 
@@ -78,6 +80,13 @@ fn main() {
                 "  {name} {:.3}",
                 time_exe(&device, &mut cache, &exe, c)
             ));
+            if name == "auto" && device.msl_passthrough {
+                let exe = Executable::new(&device, g.to_msl(&[c]), &[&a, &b]);
+                line.push_str(&format!(
+                    "  mma {:.3}",
+                    time_exe(&device, &mut cache, &exe, c)
+                ));
+            }
         }
         println!("{line}");
     }
@@ -136,7 +145,7 @@ fn main() {
         let target = vec![0.0f32; seq * 576];
         let mut inputs: Vec<&[f32]> = p.cpu.iter().map(|v| v.as_slice()).collect();
         inputs.push(&target);
-        let train = Executable::new(&device, g.to_wgsl(&outs), &inputs);
+        let train = Executable::new(&device, program_for(&device, &g, &outs), &inputs);
         let bwd = time_exe(&device, &mut cache, &train, outs[0]);
         println!("block seq={seq}: fwd hand {hand:.3} ms  fwd ir_auto {ir:.3} ms  fwd+bwd ir_auto {bwd:.3} ms ({} kernels)", train.program.kernels.len());
     }

@@ -40,6 +40,8 @@ use tang_expr::{trace, ExprGraph, ExprId, Node};
 
 #[path = "tensor_grad.rs"]
 mod grad;
+#[path = "tensor_msl.rs"]
+mod msl;
 #[path = "tensor_tile.rs"]
 mod tile;
 #[path = "tensor_wgsl.rs"]

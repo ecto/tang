@@ -501,7 +501,7 @@ fn flat(coords: &[Sym], shape: &[usize]) -> Sym {
 
 /// Emit `let {prefix}{i} = …;` for the live nodes of `g` and return the
 /// expressions for `outs`. `var_expr` names input var `i`.
-fn emit_scalar(
+pub(super) fn emit_scalar(
     out: &mut String,
     g: &ExprGraph,
     outs: &[ExprId],

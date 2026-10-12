@@ -156,8 +156,10 @@ schedule space; the compiler searches it.
 
 ## Not yet
 
-- Codegen beyond WGSL (MSL/CUDA emitters exist in `tang-expr` for scalar
-  bodies; the loop-nest emitters are WGSL-only).
+- Native codegen is a first cut: matmul-shaped tiles lower to Metal
+  simdgroup matrices (`tensor_msl.rs`, via wgpu's MSL passthrough) with
+  their epilogues, but the fp32 kernel does not yet beat the WGSL
+  register tile on an M4; CUDA/tensor cores are not started.
 - Scatter gradients reduce over the whole source coordinate they gate on;
   a stride-2 read pays 2× in the backward pass. Fine for rope, not for a
   large gather.
