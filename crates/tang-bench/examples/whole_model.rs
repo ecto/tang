@@ -299,7 +299,7 @@ fn run_wgpu(b: &Built, layers: usize, seq: usize) {
 #[cfg(feature = "cuda")]
 fn run_cuda(b: &Built, layers: usize, seq: usize) {
     use tang_bench::ir_model::cuda::PlannedCuda;
-    let ctx = cudarc::driver::CudaContext::new(0).expect("cuda");
+    let ctx = tang_gpu::cudarc::driver::CudaContext::new(0).expect("cuda");
     let t = Instant::now();
     let mut naive = PlannedCuda::new(
         &ctx,

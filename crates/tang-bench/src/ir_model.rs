@@ -437,13 +437,13 @@ pub mod cuda {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use cudarc::driver::{
-        CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
-    };
-    use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
     use tang_compile::tensor::memplan::MemoryPlan;
     use tang_compile::tensor::wgsl::WgslProgram;
     use tang_compile::tensor::TensorId;
+    use tang_gpu::cudarc::driver::{
+        CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+    };
+    use tang_gpu::cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 
     fn dynamic_smem(src: &str) -> u32 {
         src.lines()
@@ -508,7 +508,7 @@ pub mod cuda {
         functions: Vec<CudaFunction>,
         /// distinct kernel sources compiled
         pub compiled: usize,
-        graph: Option<cudarc::driver::CudaGraph>,
+        graph: Option<tang_gpu::cudarc::driver::CudaGraph>,
     }
 
     impl PlannedCuda {
@@ -543,7 +543,7 @@ pub mod cuda {
                 }
                 let ptx = std::fs::read_to_string(ptx_path(&k.source)).expect("cached ptx");
                 let module = ctx
-                    .load_module(cudarc::nvrtc::Ptx::from_src(ptx))
+                    .load_module(tang_gpu::cudarc::nvrtc::Ptx::from_src(ptx))
                     .expect("load module");
                 let f = module
                     .load_function(tang_compile::tensor::cuda::CUDA_ENTRY)
@@ -551,7 +551,7 @@ pub mod cuda {
                 let smem = dynamic_smem(&k.source);
                 if smem > 48 * 1024 {
                     f.set_attribute(
-                        cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        tang_gpu::cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                         smem as i32,
                     )
                     .expect("smem attribute");
@@ -604,7 +604,7 @@ pub mod cuda {
 
         /// Capture one step as a CUDA graph; later `run`s replay it.
         pub fn capture(&mut self) {
-            use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
+            use tang_gpu::cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
             self.stream.synchronize().expect("sync");
             self.stream
                 .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
