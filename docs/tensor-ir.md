@@ -304,11 +304,16 @@ let y = p.read(&rt, outs[0]);
   `run_kernel`, `read`, `write`, `time`, `time_kernel`, and `copy`, a
   device-side copy of one program's tensor into another's (how the
   training step hands gradients to Adam and Adam hands weights back).
-- `Program::tuned` on CUDA times each tensor-core kernel against its
-  transpiled-WGSL twin and keeps the faster, caching the choice in a
-  file keyed by the device and both programs' sources (the CUDA analogue
-  of `TuningCache`; the WGSL schedule autotuner still runs on the graph,
-  before lowering).
+- `Program::tuned` times, per kernel, the backend-native lowering
+  against the portable one and keeps the faster, caching the choice in
+  a file keyed by the device and every variant's sources: on CUDA the
+  tensor-core tiles (each `MMA_SHAPES` block shape) against transpiled
+  WGSL, on Metal the simdgroup-matrix MSL tiles (`to_msl_mma`, what
+  `TANG_NATIVE=1` forces everywhere) against WGSL; other wgpu adapters
+  have one lowering, so it is `compile`. The WGSL *schedule* autotuner
+  (`ir_gpu::autotune_kernels`, `TuningCache`) is a different search —
+  graph rewrites before lowering — and composes with it: tune the graph,
+  then `tuned` lowers it.
 - Kernel sources are canonical (`wgsl::canonical_source`, applied by
   `to_program`, `to_cuda` and `to_msl`): node numbers in identifiers
   (`b{j}`, `read_{j}`, `body_{j}`, `point_{j}`, `combine_{j}`) are
@@ -326,9 +331,24 @@ let y = p.read(&rt, outs[0]);
   training step and Adam are (`examples/train_loop.rs`,
   `examples/cuda_block.rs`). No Vulkan/CUDA zero-copy sharing.
 - Memory plans: `Program::with_plan` takes a `BufferPlan` (buffer → slot,
-  slot sizes) and allocates slots instead of one buffer per tensor, so a
-  planner that assigns tensors with disjoint lifetimes to shared slots
-  plugs in without touching the runner.
+  slot sizes, kernel order) and allocates slots instead of one buffer per
+  tensor. `Program::planned` takes `plan_memory`'s `MemoryPlan` directly.
+  On CUDA a plan may update in place (AdamW's `p2` in `p`'s slot); wgpu
+  cannot bind one buffer read-only and read-write in one dispatch, so it
+  refuses such plans. Slot offsets are not needed: the planner gives each
+  tensor a whole slot.
+- CUDA graphs: on `Runtime::cuda_capturable()` (its own stream, cudarc
+  event tracking off) `Program::capture` records one run; later `run`s
+  replay it. `tang_gpu::cuda::precompile` fills the PTX cache on all
+  cores without a GPU.
+- `tang_bench::ir_gpu::Executable` is a thin wrapper over
+  `Program::on_wgpu` for callers that own a `GpuDevice` and `KernelCache`.
+- Exact stabilizer gradients: `backward` drops the gradient of a
+  stabilizing softmax max (exact in real arithmetic). With
+  `backward_with(.., BackwardOptions { exact_stabilizers: true })` or
+  `TANG_EXACT_STABILIZERS=1` the `[s == m]` terms are kept, which in a
+  saturated (one-hot) softmax restores the true ~0 dWq/dWk instead of
+  `dP − D` rounding noise.
 
 ## What the measurements say about the claim
 
