@@ -13,6 +13,8 @@
 //   k <file.cl> <wg> <count> <points> <nargs> <buf>...   reads, then out
 //   outputs P
 //   o <buf> <file.bin>
+//   candidates C                          optional: schedule candidates
+//   c <base k> <file.cl> <wg> <count> <points> <nargs> <buf>...
 //
 // Inputs are DIR/in<k>.bin, raw bytes in the buffer's storage format.
 // Kernels are built once per distinct source (canonical sources repeat),
@@ -20,6 +22,13 @@
 // `max_reps`), and per-kernel / whole-program times are the minimum over
 // repeats of OpenCL profiling events. Writes DIR/<output files> and
 // DIR/times.txt (`kernel i ms` lines, then `program ms`).
+//
+// Candidates (from `opencl_export tune-export`) are alternative kernels
+// for base kernel `k` that write the same buffer. After the program runs,
+// each is timed (min of up to 5 runs; one run if it is > 4x the base) and
+// its output compared with the base kernel's; DIR/tune.txt gets `device
+// <name>` then `c i ms rel_err` lines. The SoC temperature is checked
+// before every candidate: at >= 82 C the run pauses until <= 78 C.
 #define CL_TARGET_OPENCL_VERSION 300
 #include <CL/cl.h>
 #include <stdio.h>
@@ -56,6 +65,20 @@ static char *slurp(const char *dir, const char *name, size_t *len) {
     fclose(f);
     if (len) *len = n;
     return buf;
+}
+
+static int max_temp(void) {
+    int best = 0;
+    for (int z = 0; z < 128; z++) {
+        char path[128];
+        snprintf(path, sizeof path, "/sys/class/thermal/thermal_zone%d/temp", z);
+        FILE *f = fopen(path, "r");
+        if (!f) continue;
+        int t;
+        if (fscanf(f, "%d", &t) == 1 && t > best && t < 200000) best = t;
+        fclose(f);
+    }
+    return best;
 }
 
 static double now(void) {
@@ -126,6 +149,25 @@ int main(int argc, char **argv) {
     for (int i = 0; i < nout; i++) {
         sscanf(cur, " o %d %255s%n", &out_buf[i], out_file[i], &used);
         cur += used;
+    }
+    int nc = 0;
+    if (sscanf(cur, " candidates %d%n", &nc, &used) == 1) cur += used;
+    else nc = 0;
+    Kernel *cs = calloc(nc ? nc : 1, sizeof *cs);
+    int *cbase = calloc(nc ? nc : 1, sizeof(int));
+    for (int i = 0; i < nc; i++) {
+        Kernel *k = &cs[i];
+        if (sscanf(cur, " c %d %255s %u %u %u %u%n", &cbase[i], k->file, &k->wg, &k->count,
+                   &k->points, &k->nargs, &used) != 6) {
+            fprintf(stderr, "bad candidate line %d\n", i);
+            return 1;
+        }
+        cur += used;
+        k->args = calloc(k->nargs, sizeof(int));
+        for (unsigned a = 0; a < k->nargs; a++) {
+            sscanf(cur, " %d%n", &k->args[a], &used);
+            cur += used;
+        }
     }
 
     cl_platform_id plat;
@@ -260,6 +302,98 @@ int main(int argc, char **argv) {
     for (int i = 0; i < nk; i++)
         printf("  k%-3d %9.3f ms  wg %4u  groups %6u  %s\n", i, best[i], ks[i].wg,
                (ks[i].count + ks[i].wg - 1) / ks[i].wg, ks[i].file);
+
+    if (nc > 0) {
+        char tp[4096];
+        snprintf(tp, sizeof tp, "%s/tune.txt", dir);
+        FILE *tu = fopen(tp, "w");
+        fprintf(tu, "device %s\n", name);
+        double gpu_ms = 0;
+        float *ref = NULL, *got = NULL;
+        int ref_k = -1;
+        for (int c = 0; c < nc; c++) {
+            Kernel *k = &cs[c];
+            int b = cbase[c];
+            int ob = k->args[k->nargs - 1];
+            size_t n = bytes[ob];
+            if (b != ref_k) {
+                free(ref);
+                free(got);
+                ref = malloc(n);
+                got = malloc(n);
+                CHECK(clEnqueueReadBuffer(q, mem[ob], CL_TRUE, 0, n, ref, 0, NULL, NULL), "snap");
+                ref_k = b;
+            }
+            int t = max_temp();
+            if (t >= 82000 || gpu_ms > 1500) {
+                if (t >= 82000) printf("hot (%d mC), pausing\n", t);
+                do {
+                    struct timespec ts = {3, 0};
+                    nanosleep(&ts, NULL);
+                    t = max_temp();
+                } while (t > 78000);
+                gpu_ms = 0;
+            }
+            const char *src = slurp(dir, k->file, NULL);
+            cl_program pr = clCreateProgramWithSource(ctx, 1, &src, NULL, &err);
+            CHECK(err, "candidate program");
+            if (clBuildProgram(pr, 1, &dev, opts, NULL, NULL) != CL_SUCCESS) {
+                fprintf(tu, "c %d build-failed\n", c);
+                clReleaseProgram(pr);
+                continue;
+            }
+            cl_kernel kk = clCreateKernel(pr, "main0", &err);
+            CHECK(err, "candidate kernel");
+            for (unsigned a = 0; a < k->nargs; a++)
+                CHECK(clSetKernelArg(kk, a, sizeof(cl_mem), &mem[k->args[a]]), "arg");
+            CHECK(clSetKernelArg(kk, k->nargs, sizeof(unsigned), &k->points), "arg count");
+            double bestc = 1e30;
+            for (int r = 0; r < 6; r++) {
+                size_t local = k->wg;
+                size_t global = (k->count + local - 1) / local * local;
+                cl_event e1;
+                CHECK(clEnqueueNDRangeKernel(q, kk, 1, NULL, &global, &local, 0, NULL, &e1),
+                      k->file);
+                CHECK(clFinish(q), "clFinish");
+                cl_ulong s0, s1;
+                clGetEventProfilingInfo(e1, CL_PROFILING_COMMAND_START, sizeof s0, &s0, NULL);
+                clGetEventProfilingInfo(e1, CL_PROFILING_COMMAND_END, sizeof s1, &s1, NULL);
+                clReleaseEvent(e1);
+                double ms = (s1 - s0) * 1e-6;
+                gpu_ms += ms;
+                if (r > 0 && ms < bestc) bestc = ms;
+                if (r == 0 && ms > 4 * best[b] + 0.05) {
+                    bestc = ms;
+                    break;
+                }
+            }
+            CHECK(clEnqueueReadBuffer(q, mem[ob], CL_TRUE, 0, n, got, 0, NULL, NULL), "cand out");
+            double e = 0, sc = 0;
+            for (size_t i = 0; i < n / 4; i++) {
+                double d = (double)got[i] - (double)ref[i];
+                if (d < 0) d = -d;
+                if (d != d) d = 1e30;
+                if (d > e) e = d;
+                double a = ref[i] < 0 ? -ref[i] : ref[i];
+                if (a > sc) sc = a;
+            }
+            fprintf(tu, "c %d %.6f %.3e\n", c, bestc, e / (sc > 1e-30 ? sc : 1e-30));
+            clReleaseKernel(kk);
+            clReleaseProgram(pr);
+            free((void *)src);
+            // restore the base kernel's output after its last candidate
+            if (c + 1 == nc || cbase[c + 1] != b) {
+                size_t local = ks[b].wg;
+                size_t global = (ks[b].count + local - 1) / local * local;
+                CHECK(clEnqueueNDRangeKernel(q, ks[b].kernel, 1, NULL, &global, &local, 0, NULL,
+                                             NULL),
+                      "restore");
+                CHECK(clFinish(q), "clFinish");
+            }
+        }
+        fclose(tu);
+        printf("timed %d candidates, max temp %d mC\n", nc, max_temp());
+    }
 
     for (int i = 0; i < nout; i++) {
         size_t n = bytes[out_buf[i]];
