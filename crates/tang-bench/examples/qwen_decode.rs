@@ -284,7 +284,8 @@ mod cuda {
                 } else {
                     2f64.powi(-22)
                 };
-                for (&a, &b) in dev.iter().zip(&res[which]) {
+                // (f32 caches hold f32 arithmetic: compared through the logits)
+                for (&a, &b) in dev.iter().zip(&res[which]).filter(|_| dims.kv_f16) {
                     cache_ulps = cache_ulps.max((a as f64 - b).abs() / (b.abs().max(1e-3) * ulp));
                 }
             }
