@@ -65,11 +65,6 @@ fn main() {
         };
         let (g, y) = compiled_block(&dims);
         let program = rt.lower(&g, &[y]);
-        let n_native = program
-            .kernels
-            .iter()
-            .filter(|k| k.source.contains("mma"))
-            .count();
         let n_inputs = program.buffers.iter().filter(|b| b.input.is_some()).count();
         let inputs: Vec<Vec<f32>> = (0..n_inputs)
             .map(|k| {
@@ -106,9 +101,10 @@ fn main() {
             Some(&tuning(format!("cuda-block-{seq}"))),
         );
         println!(
-            "block seq={seq}: tuned{}, {} of {n_native} native kernels kept",
+            "block seq={seq}: tuned{}, {} of {} native kernels kept",
             if report.from_cache { " (cached)" } else { "" },
-            report.native_kept
+            report.native_kept,
+            report.native_total
         );
         if let Ok(dir) = std::env::var("TANG_DUMP") {
             for (i, k) in exe.program.kernels.iter().enumerate() {
@@ -137,8 +133,9 @@ fn main() {
         }
         let ms = exe.time(&rt, 50);
         println!(
-            "block seq={seq}: fwd {ms:.3} ms ({} kernels, {n_native} on tensor cores)",
-            exe.program.kernels.len()
+            "block seq={seq}: fwd {ms:.3} ms ({} kernels, {} native)",
+            exe.program.kernels.len(),
+            report.native_kept
         );
         for (i, k) in exe.program.kernels.iter().enumerate() {
             let node = &g.nodes()[k.node.index()];
