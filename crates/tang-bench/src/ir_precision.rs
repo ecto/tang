@@ -277,3 +277,32 @@ pub fn read_assignment(g: &mut TensorGraph, text: &str) {
         g.set_precision(t, p);
     }
 }
+
+/// f64 outputs to a file (a reference computed outside the GPU lock).
+pub fn write_f64s(path: &str, v: &[Vec<f64>]) {
+    let mut bytes = Vec::new();
+    bytes.extend((v.len() as u64).to_le_bytes());
+    for o in v {
+        bytes.extend((o.len() as u64).to_le_bytes());
+        for x in o {
+            bytes.extend(x.to_le_bytes());
+        }
+    }
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// Inverse of [`write_f64s`].
+pub fn read_f64s(path: &str) -> Vec<Vec<f64>> {
+    let b = std::fs::read(path).unwrap();
+    let word = |i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+    let mut at = 8;
+    (0..word(0))
+        .map(|_| {
+            let n = word(at) as usize;
+            at += 8;
+            let o = (0..n).map(|i| f64::from_bits(word(at + 8 * i))).collect();
+            at += 8 * n;
+            o
+        })
+        .collect()
+}

@@ -102,33 +102,6 @@ fn all(g: &TensorGraph, outs: &[TensorId], f: Format) -> TensorGraph {
     v
 }
 
-fn write_f64s(path: &str, v: &[Vec<f64>]) {
-    let mut bytes = Vec::new();
-    bytes.extend((v.len() as u64).to_le_bytes());
-    for o in v {
-        bytes.extend((o.len() as u64).to_le_bytes());
-        for x in o {
-            bytes.extend(x.to_le_bytes());
-        }
-    }
-    std::fs::write(path, bytes).unwrap();
-}
-
-fn read_f64s(path: &str) -> Vec<Vec<f64>> {
-    let b = std::fs::read(path).unwrap();
-    let word = |i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
-    let mut at = 8;
-    (0..word(0))
-        .map(|_| {
-            let n = word(at) as usize;
-            at += 8;
-            let o = (0..n).map(|i| f64::from_bits(word(at + 8 * i))).collect();
-            at += 8 * n;
-            o
-        })
-        .collect()
-}
-
 fn settings(c: &Case, dir: &str) -> Vec<(String, TensorGraph)> {
     let mut out = vec![
         ("f32".to_string(), c.g.clone()),
@@ -175,7 +148,7 @@ fn main() {
                     .iter()
                     .map(|v| v.iter().map(|&x| x as f64).collect())
                     .collect();
-                write_f64s(&ref_path, &c.g.eval(&f64s, &c.outs));
+                ir_precision::write_f64s(&ref_path, &c.g.eval(&f64s, &c.outs));
                 println!("{name}: reference in {:.1?}", t.elapsed());
                 #[cfg(feature = "cuda")]
                 {
@@ -208,7 +181,7 @@ fn main() {
             }
             "tune" => {
                 let rt = tang_gpu::program::Runtime::select().expect("gpu");
-                let want = read_f64s(&ref_path);
+                let want = ir_precision::read_f64s(&ref_path);
                 let refs: Vec<&[f32]> = c.inputs.iter().map(|v| v.as_slice()).collect();
                 let r = ir_precision::tune_precision(
                     &rt,
@@ -256,7 +229,7 @@ fn main() {
             "measure" => {
                 use tang_gpu::program::{Program, Runtime};
                 let rt = Runtime::select().expect("gpu");
-                let want = read_f64s(&ref_path);
+                let want = ir_precision::read_f64s(&ref_path);
                 let refs: Vec<&[f32]> = c.inputs.iter().map(|v| v.as_slice()).collect();
                 let rounds: usize = std::env::var("TANG_ROUNDS")
                     .ok()
