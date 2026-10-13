@@ -23,8 +23,9 @@
 //! so a read at a runtime index — the embedding row of a token, the rope
 //! angles of a position, the chunk token that cache row `j` receives — is
 //! written as a sum with one live term: `Σ_v select(v == tok, E[v], 0)`,
-//! the equality as two half-planes `select(tok − v + ½, select(v − tok
-//! + ½, …, 0), 0)`. The value is exact (one term plus zeros), the
+//! the equality as two half-planes
+//! `select(tok − v + ½, select(v − tok + ½, …, 0), 0)`. The value is
+//! exact (one term plus zeros), the
 //! interpreter runs it as written, and the decode lowering turns the two
 //! predicates into loop bounds, so the loop has one iteration.
 //!
@@ -860,7 +861,13 @@ pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<
     let all: Vec<TensorId> = dg.outputs.iter().chain(&dg.keep).copied().collect();
     let (g, outs) = dg.g.substitute_maps(&all);
     let (g, outs) = g.eliminate_common(&outs);
-    let (g, outs) = g.merge_siblings(&outs);
+    // gate|up as one tuple-valued matmul: CUDA's tiles take it; Metal's
+    // simdgroup tile takes one output, so a prefill there keeps them apart
+    let (g, outs) = if dg.seq > 1 && !half_tiles {
+        (g, outs)
+    } else {
+        g.merge_siblings(&outs)
+    };
     let (mut g, outs) = if dg.seq > 1 {
         g.merge_reduce_dims(&outs)
     } else {

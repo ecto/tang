@@ -14,9 +14,11 @@
 //!     --ctx C          KV capacity (default 4352)
 //!     --chunks a,b,…   prefill the prompt in chunks of these sizes (one
 //!                      prefill program per size; default: decode steps)
+//!     --time-prefill   device time of each prefill program
 //!     --out FILE       write the generated ids
+//!     --logits FILE    with --chunks: the last chunk's next-token logits (f32)
 //!     --force FILE     teacher-force these ids through decode steps instead,
-//!     --logits FILE    writing every step's logits (f32) from --from on
+//!                      writing every step's logits to --logits from --from on
 //!     --from P         (default 0)
 //!     --bench L        device time of a decode step at context lengths L (comma list)
 //!     --profile        per-kernel times of a decode step
@@ -483,7 +485,10 @@ fn tiny() {
     let res = pg.eval_emulated(&pcpu, &pre.dg.outputs);
     let perr = rel_err(&got, &res[0]);
     let mut pre_ulps = 0.0;
-    check_caches(&pre, &res, &mut pre_ulps);
+    // (f32 caches hold f32 arithmetic: compared through the logits)
+    if dims.kv_f16 {
+        check_caches(&pre, &res, &mut pre_ulps);
+    }
     // rows of the cache the prefill did not own are untouched
     println!(
         "prefill {seq} tokens at {p0}: rel logit err {perr:.2e}, caches within {pre_ulps:.1} ulp, next {next} (interpreter {}), position {npos}",

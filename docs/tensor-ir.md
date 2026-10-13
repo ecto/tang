@@ -373,10 +373,18 @@ let y = p.read(&rt, outs[0]);
   On CUDA a plan may update in place (AdamW's `p2` in `p`'s slot); wgpu
   cannot bind one buffer read-only and read-write in one dispatch, so it
   refuses such plans. Slot offsets are not needed: the planner gives each
-  tensor a whole slot.
+  tensor a whole slot. A kernel that does not bind its donor among its
+  reads (the decode lowering's in-place updates on Metal read the old
+  value through `out`) is accepted on wgpu too.
+- Shared buffers: `Program::with_shared` binds some inputs to another
+  program's buffers (`Shared { input, from, tensor }`), with nothing
+  allocated or uploaded for them; in-place writes are seen by both. A
+  prefill and a decode program hold one copy of the weights and KV caches
+  this way (`examples/qwen_decode.rs`).
 - CUDA graphs: on `Runtime::cuda_capturable()` (its own stream, cudarc
   event tracking off) `Program::capture` records one run; later `run`s
-  replay it. `tang_gpu::cuda::precompile` fills the PTX cache on all
+  replay it. On wgpu, `capture` builds every kernel's pipeline, bind group
+  and uniform once, so a run is one command buffer with one compute pass. `tang_gpu::cuda::precompile` fills the PTX cache on all
   cores without a GPU.
 - `tang_bench::ir_gpu::Executable` is a thin wrapper over
   `Program::on_wgpu` for callers that own a `GpuDevice` and `KernelCache`.

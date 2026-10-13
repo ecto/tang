@@ -1358,6 +1358,57 @@ The f16 cache halved attention's bytes against f32 (scores 0.95 → 0.73 ms, `p�
 - *Batching beyond 1, and paged or variable-length caches.*
 - *A standalone, uncontended re-measurement once mew's hardware is checked.*
 
+### Qwen3-8B through the tensor IR on Metal (M4 Max): shared weights, offset prefill, on-device argmax
+
+The follow-up to the CUDA section above, run entirely on the M4 Max (mew was unavailable). The same graph builder, `tang_bench::ir_qwen::step_graph(dims, seq, kctx)`, now covers everything a step needs on the device. The runner is `examples/qwen_decode.rs` (`tiny`, `model`, `reference`, `compare`); `qwen_tok` maps text to ids and back with the Qwen3 tokenizer.
+
+**What changed**
+
+- *Metal lowering.* `TensorGraph::to_msl_decode` (`tensor_msl_gemv.rs`) generates the same kernels as `to_cuda_decode` and transliterates them to MSL: warps become simdgroups (`simd_shuffle_xor`), the packed 4-bit, bf16 and f16 loads become Metal helpers, and the grid wraps into y past 65535 threadgroups. An in-place update does not bind its donor among its reads; it reads the old value through `out`, because wgpu refuses one buffer bound both ways. Kernels with no decode lowering stay WGSL. The CUDA sources are byte-identical to #56's for #56's graphs: all kernel sources of the decode and prefill graphs, tiny and 8B-shaped, were diffed before and after every lowering change.
+- *One compute pass per run.* On wgpu, `Program::capture` builds each kernel's pipeline, bind group and uniform once, so a run is one command buffer. Before, each of the 510 kernels was its own command buffer.
+- *Shared weights.* `Program::with_shared` binds inputs to another program's buffers. The decode program owns the weights, the KV caches and `state`; every prefill program borrows all 765 of them and allocates only its chunk input and intermediates.
+- *Prefill from an offset.* A prefill reads `[tokens…, p0]` from a `chunk` input. It appends cache rows `p0..p0+seq` and attends causally over cache rows `0..kctx`. The window `kctx` is a compile-time view of the shared full-capacity cache, so the cost does not depend on its 4352 capacity. Row `j` receives token `j − p0`, an index known only at run time, so the IR expresses it as a sum with one live term, `Σ_t pick(t, j − p0, k_rot[t])`, where `pick` is two nested `select` half-planes. The lowering's in-place update evaluates an inlined reduction as a loop whose bounds come from those predicates, so the loop has one iteration. The embedding row of a token and the rope angles of a position are the same kind of gather: they read the 4-bit embedding table and a `[cos|sin][ctx]` table on the device. Warp reductions now take both a lower and an upper runtime bound, and the bounds may depend on point coordinates (a per-token id).
+- *Next token on the device.* `Monoid::argmax` is an `(index, value)` tuple monoid that keeps the first maximum on ties. `TensorGraph::comp_tuple` builds the reduction over the logits. An in-place map writes `(argmax, position + 1)` over `state`. The decode loop is one `run` and one 8-byte `state` readback per token, with no host writes.
+
+**Correctness** (f16 KV caches throughout)
+
+| check | result |
+|---|---|
+| tiny random model vs the interpreter (f64, f16 caches emulated): 9 decode steps, a 6-token prefill at p0 = 9, one more decode | rel. logit error ≤ 3.4e-6 (f32 caches: 1.1e-6); caches within 1 f16 ulp; on-device argmax and `state` equal the interpreter's at every step |
+| full model, teacher-forced on prompt + tang's 64 greedy tokens, vs a CPU f32 reference (checkpoint dequantized exactly, f64 accumulation, `qwen_decode reference`) | max \|logit error\| 3.3e-2 at logits up to 57.3 (5.8e-4 relative), mean 2.0e-3; argmax 65/65 equal, so the reference's greedy text is tang's 64 tokens |
+| greedy text, 24-token prompt | 64 tokens from a 24-token prefill + on-device decode identical to #56's design run on Metal (prompt as 24 decode steps, host argmax) |
+| offset prefill: 300 tokens, then 200 more from p0 = 300, vs one 500-token prefill | next-token logits bit-identical (max error 0); 64 greedy tokens identical |
+
+The 3.3e-2 is larger than #56's 1.7e-4, which was measured with f32 caches. The likely causes are the f16 caches (a one-ulp flip of a cached K or V moves a logit by ~1e-4 of its scale, and these flips accumulate over 36 layers) and Metal's fast-math `exp`/`sqrt`. The model was not rerun with f32 caches against the reference, so the split between the two is not measured.
+
+**Memory** (bytes allocated by the programs)
+
+| | decode | + prefill programs | total |
+|---|---|---|---|
+| shared (this PR) | 5.26 GB: 4.6 GB weights incl. the 4-bit embedding table, 0.64 GB f16 KV at 4352 positions | 0.5–1.3 GB of intermediates each (seq 24: 0.53; 500: 1.28; 300 + 200: 0.89 + 0.81) | 5.8–7.0 GB |
+| separate programs (#56) | 4.6 GB + KV | another 4.3 GB of weights per prefill program, plus its own cache | ~11 GB for one prefill program |
+
+The largest prefill intermediate is one layer's dequantized gate weight in f32: Metal's simdgroup tile stages f32, so the prefill weights are not stored f16 there.
+
+**Speed. Caveat: the GPU was busy.** For the whole session another process kept the M4's GPU at 94–100% device utilization (`ioreg` "Device Utilization %", read with my runs idle). It was the user's, so I left it running. Every number below is a contended minimum, varies about 2× from run to run, and is a lower bound on what the code does on an idle M4.
+
+| | decode, len 32 | decode, len 4096 | prefill 512 |
+|---|---|---|---|
+| speed of light (546 GB/s ÷ 4.3 GB) | 125 tok/s | ~110 tok/s (+0.6 GB KV) | — |
+| #56's design on Metal (host embed, step write, 600 KB logits readback, host argmax) | 107 ms device (32 ms in one run with 4 rows per warp); 7.9 tok/s end to end | 131 ms | — |
+| this PR, device step (min of 3×5 batches of 20) | 99 ms (10 tok/s, 8% SOL) | 87 ms (11.5 tok/s, 10%) | 8.7 s (59 tok/s) |
+| this PR, end to end (run + `state` readback) | 7.1–9.1 tok/s | — | — |
+
+Under this contention the end-to-end difference between host argmax and on-device argmax was not measurable: both loops are dominated by the device step. The isolated q|k|v GEMV (`examples/qwen_gemv.rs`: 16–32 copies in one pass) reached 150–200 GB/s. It was insensitive to rows per warp (2/4/8), warps per threadgroup (2/4/8) and unrolling, and a hand-unpacked variant without the vector-index arithmetic was within noise. So the GEMV itself runs at about a third of the bandwidth it would get on an idle GPU, or less. Without a quiet GPU I could not separate kernel quality from contention.
+
+Prefill is slow for structural reasons as well as contention: the four projections per layer run on the f32 simdgroup tile over f32 dequantized weights (gate and up are unmerged on Metal because the tile takes one output), and attention runs through the warp kernels. A 4-bit simdgroup-matrix GEMM that dequantizes while staging (to `half`) would remove both the f32 weight writes and the f32 staging.
+
+**Not done / next**
+
+- Re-measure on an idle M4; then tune the Metal GEMV (an MLX-style `qmv` with x staged in threadgroup memory is the obvious candidate) and the per-dispatch cost of the ~510 kernels.
+- A 4-bit half-precision simdgroup GEMM for prefill.
+- The CUDA paths compile (`cargo build -p tang-bench --features cuda`) but were not run (see the PR).
+
 ## Kokoro-shaped ops (M4 Max, Metal, kernel-only)
 
 TTS vocoder ops (Kokoro's iSTFTNet decoder, Vocos-style ConvNeXt) derived
