@@ -78,13 +78,16 @@ impl MmaShape {
 /// default. 64×64 on four warps fills the device at the model's sizes;
 /// the larger blocks halve the staging per flop where there are enough
 /// output tiles; split-K only pays when tiles are very few.
-pub const MMA_SHAPES: [MmaShape; 6] = [
+pub const MMA_SHAPES: [MmaShape; 7] = [
     MmaShape::new(64, 64, 2, 2),
     MmaShape::new(64, 64, 2, 2).with(32, 3, 1),
     MmaShape::new(64, 64, 2, 2).with(16, 4, 1),
     MmaShape::new(64, 64, 2, 2).with(32, 2, 246),
     MmaShape::new(128, 64, 2, 2),
     MmaShape::new(128, 128, 2, 4).with(32, 2, 100),
+    // 32 rows on two warps: twice the blocks where tiles are few (the
+    // attention-backward tiles at short sequences)
+    MmaShape::new(32, 64, 1, 2),
 ];
 
 /// A flash-attention tile's shape: `bi` queries per folded head per
@@ -100,8 +103,8 @@ pub struct FlashShape {
     pub kw: usize,
 }
 
-/// The flash shapes a tuner chooses between, one per [`MMA_SHAPES`]
-/// variant; the first is the default.
+/// The flash shapes a tuner chooses between, paired with [`MMA_SHAPES`]
+/// variants by index modulo their count; the first is the default.
 pub const FLASH_SHAPES: [FlashShape; 6] = [
     FlashShape {
         bi: 0,
