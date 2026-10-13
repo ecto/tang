@@ -2375,7 +2375,183 @@ impl TensorGraph {
         // `merge_siblings` could not see before them (the two halves of
         // dQ, both reading dS): merge them now
         let (g, outputs) = g.eliminate_dead(outputs);
+        let (g, outputs) = g.hoist_invariant_factors(&outputs);
         g.merge_siblings(&outputs)
+    }
+
+    /// Distributivity for sums: `Σ_k f(i)·g(i, k)` is `f(i) · Σ_k g(i, k)`,
+    /// so factors of a sum's body that do not read the reduce coords move
+    /// to a map over the reduction (`Σ_c P̃·dO·V` becomes `P̃ · Σ_c dO·V`,
+    /// a plain bilinear contraction a tile can run as a GEMM). A sum over
+    /// size-1 dims only is a map. Maps exposed this way are substituted
+    /// into their readers again.
+    pub fn hoist_invariant_factors(&self, outputs: &[TensorId]) -> (TensorGraph, Vec<TensorId>) {
+        let mut g = self.clone();
+        let live = self.live(outputs);
+        let mut changed = false;
+        // args no body output reads (the product rule's dropped factor)
+        // are reads all the same for a kernel: drop them
+        for i in (0..self.nodes.len()).filter(|&i| live[i]) {
+            let Some(c) = self.comp_at(i) else { continue };
+            let mut used = vec![false; c.args.len()];
+            for &o in &c.body_outs {
+                for v in vars_reachable(&c.body, o) {
+                    used[v as usize] = true;
+                }
+            }
+            if used.iter().all(|&u| u) {
+                continue;
+            }
+            let mut body = ExprGraph::new();
+            let mut args = Vec::new();
+            let vars: Vec<ExprId> = c
+                .args
+                .iter()
+                .zip(&used)
+                .map(|(a, &u)| {
+                    if !u {
+                        return ExprId::ZERO;
+                    }
+                    args.push(a.clone());
+                    body.var((args.len() - 1) as u16)
+                })
+                .collect();
+            let body_outs = replay(&c.body, &c.body_outs, &vars, &mut body);
+            let body_outs = body_outs.into_iter().map(|o| body.simplify(o)).collect();
+            let mut c = c.clone();
+            c.args = args;
+            c.body = body;
+            c.body_outs = body_outs;
+            g.nodes[i].op = Op::Comp(c);
+            changed = true;
+        }
+        let pruned = g.clone();
+        for i in (0..self.nodes.len()).filter(|&i| live[i]) {
+            let Some(c) = pruned.comp_at(i) else { continue };
+            let sum = c.monoid.as_ref().map(Monoid::kind) == Some(MonoidKind::Sum);
+            if !sum || c.tuple != 0 || c.width() != 1 || c.red.is_empty() {
+                continue;
+            }
+            let k = c.points().len();
+            let rank = c.rank();
+            // the args' views with the reduce coords dropped (valid where
+            // they do not read them)
+            let point_view = |v: &View| View {
+                guard: v.guard,
+                forms: v
+                    .forms
+                    .iter()
+                    .map(|f| Form {
+                        coefs: f.coefs[..k].to_vec(),
+                        offset: f.offset,
+                    })
+                    .collect(),
+            };
+            if c.red.iter().all(|d| *d == Dim::Fixed(1)) {
+                let mut m = c.clone();
+                for a in &mut m.args {
+                    a.view = point_view(&a.view);
+                }
+                m.red.clear();
+                m.monoid = None;
+                g.nodes[i].op = Op::Comp(m);
+                changed = true;
+                continue;
+            }
+            let nodes = c.body.nodes_slice();
+            let mut factors = Vec::new();
+            let mut stack = vec![c.body_outs[0]];
+            while let Some(e) = stack.pop() {
+                match nodes[e.index() as usize] {
+                    Node::Mul(a, b) => stack.extend([a, b]),
+                    _ => factors.push(e),
+                }
+            }
+            let invariant = |e: ExprId| {
+                vars_reachable(&c.body, e).iter().all(|&v| {
+                    c.args[v as usize]
+                        .view
+                        .forms
+                        .iter()
+                        .all(|f| f.coefs[k..].iter().all(|&x| x == 0))
+                })
+            };
+            let (inv, var): (Vec<ExprId>, Vec<ExprId>) =
+                factors.iter().partition(|&&e| invariant(e));
+            let real = inv
+                .iter()
+                .any(|&e| nodes[e.index() as usize].as_f64().is_none());
+            if !real || var.is_empty() {
+                continue;
+            }
+            let build = |fs: &[ExprId],
+                         body: &mut ExprGraph,
+                         args: &mut Vec<Arg>,
+                         view: &dyn Fn(&View) -> View| {
+                let vars: Vec<ExprId> = c
+                    .args
+                    .iter()
+                    .enumerate()
+                    .map(|(v, a)| {
+                        let used = fs
+                            .iter()
+                            .any(|&e| vars_reachable(&c.body, e).contains(&(v as u16)));
+                        if !used {
+                            return ExprId::ZERO;
+                        }
+                        let leaf = Arg {
+                            src: a.src,
+                            view: view(&a.view),
+                        };
+                        body.var(intern_arg(args, leaf) as u16)
+                    })
+                    .collect();
+                let vals = replay(&c.body, fs, &vars, body);
+                vals.into_iter()
+                    .reduce(|x, y| body.mul(x, y))
+                    .expect("factors")
+            };
+            let mut rbody = ExprGraph::new();
+            let mut rargs = Vec::new();
+            let rout = build(&var, &mut rbody, &mut rargs, &|v: &View| v.clone());
+            let inner = Comp {
+                out: c.out.clone(),
+                tuple: 0,
+                red: c.red.clone(),
+                args: rargs,
+                body: rbody,
+                body_outs: vec![rout],
+                monoid: c.monoid.clone(),
+            };
+            let inner_id = g.nodes.len();
+            let mut node = self.nodes[i].clone();
+            node.op = Op::Comp(inner);
+            g.nodes.push(node);
+            let mut mbody = ExprGraph::new();
+            let mut margs = vec![Arg {
+                src: TensorId(inner_id as u32),
+                view: View::identity(k, k),
+            }];
+            let r = mbody.var(0);
+            let f = build(&inv, &mut mbody, &mut margs, &point_view);
+            let out = mbody.mul(r, f);
+            let _ = rank;
+            g.nodes[i].op = Op::Comp(Comp {
+                out: c.out.clone(),
+                tuple: 0,
+                red: vec![],
+                args: margs,
+                body: mbody,
+                body_outs: vec![out],
+                monoid: None,
+            });
+            changed = true;
+        }
+        if !changed {
+            return (self.clone(), outputs.to_vec());
+        }
+        let (g, outs) = g.eliminate_dead(outputs);
+        g.substitute_maps(&outs)
     }
 
     /// Two adjacent reduce dims that every arg reads either not at all
