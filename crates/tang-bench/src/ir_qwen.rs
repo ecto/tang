@@ -83,6 +83,11 @@ pub struct DecodeGraph {
     pub g: TensorGraph,
     /// `[logits, k_cache'₀, v_cache'₀, k_cache'₁, …]`.
     pub outputs: Vec<TensorId>,
+    /// The residual stream after each attention and MLP block, kept
+    /// materialized: a residual read once per element would otherwise be
+    /// substituted into its readers, and the stream would become a sum
+    /// over every earlier layer.
+    pub keep: Vec<TensorId>,
     pub inputs: Vec<InputSpec>,
 }
 
@@ -252,6 +257,7 @@ pub fn decode_graph(dims: &QwenDims) -> DecodeGraph {
     let v_off = (q_rows + kvh * hd) as i64;
     let scale = 1.0 / (hd as f64).sqrt();
     let mut outputs = Vec::new();
+    let mut keep = Vec::new();
     // the residual stream: (tensor, offset)
     let mut x = (step, 0i64);
     for l in 0..layers {
@@ -499,6 +505,7 @@ pub fn decode_graph(dims: &QwenDims) -> DecodeGraph {
             .unwrap();
         let down = b.linear(act, 0, down_w);
         let res2 = b.add(res1, 0, down, d);
+        keep.extend([res1, res2]);
         x = (res2, 0);
     }
     let norm = b.input("model.norm".into(), &[d], None);
@@ -509,17 +516,21 @@ pub fn decode_graph(dims: &QwenDims) -> DecodeGraph {
     DecodeGraph {
         g: b.g,
         outputs,
+        keep,
         inputs: b.inputs,
     }
 }
 
 /// The passes for decode: maps fused, siblings (gate/up) merged,
-/// epilogues inlined. Returns the graph and its outputs (same order).
+/// epilogues inlined. Returns the graph and its outputs: `dg.outputs`
+/// (same order), then `dg.keep`.
 pub fn compiled_decode(dg: &DecodeGraph) -> (TensorGraph, Vec<TensorId>) {
-    let (g, outs) = dg.g.substitute_maps(&dg.outputs);
+    let all: Vec<TensorId> = dg.outputs.iter().chain(&dg.keep).copied().collect();
+    let (g, outs) = dg.g.substitute_maps(&all);
     let (g, outs) = g.eliminate_common(&outs);
     let (mut g, outs) = g.merge_siblings(&outs);
     g.schedule_inline(&outs);
+    g.schedule_epilogues(&outs);
     (g, outs)
 }
 

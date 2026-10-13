@@ -137,7 +137,8 @@ struct Kernel {
 
 const PRELUDE: &str = r#"#define select(f, t, c) ((c) ? (t) : (f))
 __device__ __forceinline__ float tang_u4(const float* b, int a) {
-    return (float)((__ldg((const unsigned*)b + (a >> 3)) >> ((a & 7) * 4)) & 15u);
+    unsigned q = (__ldg((const unsigned*)b + (a >> 3)) >> ((a & 7) * 4)) & 15u;
+    return __uint_as_float(0x4b000000u | q) - 8388608.0f;
 }
 __device__ __forceinline__ float tang_bf16(const float* b, int a) {
     unsigned w = __ldg((const unsigned*)b + (a >> 1));
@@ -213,6 +214,45 @@ impl TensorGraph {
         DecodeProgram {
             program: program.canonical(),
             native,
+        }
+    }
+}
+
+impl TensorGraph {
+    /// Schedule: inline a reduction into the map that reads it point for
+    /// point when that map reads no other reduction and is its only
+    /// reader — the map becomes the reduction kernel's epilogue (a
+    /// residual add, an activation over merged gate/up). Unlike
+    /// `schedule_inline` this takes reductions over any number of reduce
+    /// dims, which the warp kernels handle.
+    pub fn schedule_epilogues(&mut self, outputs: &[TensorId]) {
+        let live = self.live(outputs);
+        let uses = self.use_counts(outputs, &live);
+        let is_output = |i: usize| outputs.iter().any(|o| o.n() == i);
+        for i in (0..self.nodes.len()).filter(|&i| live[i]) {
+            let Some(c) = self.comp_at(i) else { continue };
+            if c.monoid.is_some() {
+                continue;
+            }
+            let mut reds: Vec<usize> = c
+                .args
+                .iter()
+                .map(|a| a.src.n())
+                .filter(|&p| self.comp_at(p).is_some_and(|pc| pc.monoid.is_some()))
+                .collect();
+            reds.dedup();
+            let [p] = reds[..] else { continue };
+            let pc = self.comp_at(p).unwrap();
+            let pk = pc.points().len();
+            if uses[p] != 1
+                || is_output(p)
+                || self.nodes[p].inline
+                || c.points().len() != pk
+                || self.epilogue_read(c, p) != Some(super::View::identity(pk, pk).forms)
+            {
+                continue;
+            }
+            self.nodes[p].inline = true;
         }
     }
 }
@@ -658,7 +698,12 @@ impl Lowering<'_> {
         let ks = if groups < 512 { 8.max(warps) } else { 1 };
         let threads = if ks > 1 { 32 * ks } else { 32 * warps };
         let gpb = threads / 32 / ks;
-        let blocks = groups.div_ceil(gpb);
+        let blocks = if point_cond.is_some() && ks == 1 {
+            // a grid-stride loop over the live groups
+            groups.div_ceil(gpb).min(2048)
+        } else {
+            groups.div_ceil(gpb)
+        };
         let chunks_inner = ri / vec;
         let n_chunks: usize = red[..red.len() - 1].iter().product::<usize>() * chunks_inner;
 
@@ -696,14 +741,51 @@ impl Lowering<'_> {
             "    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;"
         )
         .unwrap();
-        writeln!(s, "    const int grp = blockIdx.x * {gpb} + warp / {ks};").unwrap();
-        writeln!(s, "    const int ks = warp % {ks};").unwrap();
+        // a point condition along one point dim bounds the live groups:
+        // that dim is the slowest in the group order, and a grid-stride
+        // loop stops at the bound
+        let dyn_dim = point_cond.as_ref().and_then(|cd| {
+            let dims: Vec<usize> = (0..pk).filter(|&d| cd.coefs[d] != 0.0).collect();
+            match dims[..] {
+                [d] if cd.coefs[d] < 0.0 && ks == 1 => Some(d),
+                _ => None,
+            }
+        });
         if ks == 1 {
-            writeln!(s, "    if (grp >= {groups}) return;").unwrap();
+            let limit = match dyn_dim {
+                Some(d) => {
+                    let cd = point_cond.as_ref().unwrap();
+                    let base = self.cond_base(cd, &leaves, &[], &[]);
+                    writeln!(
+                        s,
+                        "    const int glimit = min({}, max(0, (int)ceilf(({base}) / {}))) * {};",
+                        pts[d],
+                        flit(-cd.coefs[d]),
+                        groups / pts[d]
+                    )
+                    .unwrap();
+                    "glimit".to_string()
+                }
+                None => format!("{groups}"),
+            };
+            writeln!(s, "    const int ks = 0;").unwrap();
+            writeln!(
+                s,
+                "    for (int grp = blockIdx.x * {gpb} + warp; grp < {limit}; grp += gridDim.x * {gpb}) {{"
+            )
+            .unwrap();
+        } else {
+            writeln!(s, "    const int grp = blockIdx.x;").unwrap();
+            writeln!(s, "    const int ks = warp;").unwrap();
         }
         // group -> point coords (the register dim in steps of rt)
         let mut rem = "grp".to_string();
-        for d in (0..pk).rev() {
+        let order: Vec<usize> = (0..pk)
+            .rev()
+            .filter(|&d| Some(d) != dyn_dim)
+            .chain(dyn_dim)
+            .collect();
+        for d in order {
             let n = if reg.is_some_and(|(r, _)| r == d) {
                 pts[d] / rt
             } else {
@@ -842,8 +924,10 @@ impl Lowering<'_> {
             match class[i] {
                 0 => format!("h{i}[{}]", ri_(l)),
                 1 => match l.pack {
+                    // 2^23 + q as a float, minus 2^23: no int-to-float
+                    // conversion (quarter rate) per weight
                     Some(Packing::U4) => format!(
-                        "(float)(((&u{i}[{}].x)[e >> 3] >> ((e & 7) * 4)) & 15u)",
+                        "(__uint_as_float(0x4b000000u | (((&u{i}[{}].x)[e >> 3] >> ((e & 7) * 4)) & 15u)) - 8388608.0f)",
                         ri_(l)
                     ),
                     _ => format!("(&v{i}[{}][e >> 2].x)[e & 3]", ri_(l)),
@@ -955,6 +1039,9 @@ impl Lowering<'_> {
             writeln!(s, "        out[o * {w_out} + {slot}] = {v};").unwrap();
         }
         writeln!(s, "    }}").unwrap();
+        if ks == 1 {
+            writeln!(s, "    }}").unwrap();
+        }
         writeln!(s, "}}").unwrap();
         Some(Kernel {
             source: s,
