@@ -26,6 +26,11 @@ fn main() {
         h.finish()
     };
     let mut rng = tang_bench::Rng::new(7);
+    // TANG_FWD_REF=<path>: the seq-128 f64 reference is read from `path`;
+    // with TANG_REF_ONLY set it is computed into `path` and nothing runs
+    // on the device (so it can run outside a GPU lock)
+    let fwd_ref = std::env::var("TANG_FWD_REF").ok();
+    let ref_only = std::env::var_os("TANG_REF_ONLY").is_some();
     let mut rand = |n: usize| -> Vec<f32> { (0..n).map(|_| rng.f32() * 2.0 - 1.0).collect() };
 
     // matmul: mma tile vs CPU
@@ -36,6 +41,9 @@ fn main() {
         let c = g.matmul(a, b).unwrap();
         g.schedule_auto(&[c]);
         let (av, bv) = (rand(m * k), rand(k * n));
+        if ref_only {
+            continue;
+        }
         let exe = Program::compile(&rt, &g, &[c], &[&av, &bv]);
         let native = exe.program.kernels[0].source.contains("mma");
         let ms = exe.time(&rt, 50);
@@ -76,6 +84,20 @@ fn main() {
             .collect();
         let refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
         drop(program);
+        let reference = || {
+            let f64s: Vec<Vec<f64>> = inputs
+                .iter()
+                .map(|v| v.iter().map(|&x| x as f64).collect())
+                .collect();
+            g.eval(&f64s, &[y]).remove(0)
+        };
+        if ref_only {
+            let path = fwd_ref.as_deref().expect("TANG_FWD_REF");
+            let bytes: Vec<u8> = reference().iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(path, bytes).unwrap();
+            println!("wrote reference to {path}");
+            return;
+        }
         let (exe, report) = Program::tuned(
             &rt,
             &g,
@@ -97,11 +119,14 @@ fn main() {
         let got = exe.read(&rt, y);
         println!("block seq={seq}: output digest {:016x}", digest(&got));
         if seq == 128 && std::env::var("TANG_NO_CHECK").is_err() {
-            let f64s: Vec<Vec<f64>> = inputs
-                .iter()
-                .map(|v| v.iter().map(|&x| x as f64).collect())
-                .collect();
-            let want = g.eval(&f64s, &[y]).remove(0);
+            let want: Vec<f64> = match &fwd_ref {
+                Some(path) => std::fs::read(path)
+                    .unwrap()
+                    .chunks(8)
+                    .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+                    .collect(),
+                None => reference(),
+            };
             let err = got
                 .iter()
                 .zip(&want)

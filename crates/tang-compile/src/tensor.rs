@@ -2237,7 +2237,8 @@ impl TensorGraph {
     /// elements — the property the split schedule relies on). The inner
     /// reduction then has one reduce dim and tiles; the outer one is tiny.
     /// `Σ_{r,i} dS[i,g,r,j]·q[i,g,r,d]` (dK for grouped heads) becomes
-    /// `Σ_r (Σ_i …)`.
+    /// `Σ_r (Σ_i …)`. Sibling reductions exposed by then are merged
+    /// ([`merge_siblings`](Self::merge_siblings)).
     pub fn split_reduce_dims(&self, outputs: &[TensorId]) -> (TensorGraph, Vec<TensorId>) {
         const SMALL: usize = 16;
         let mut g = self.clone();
@@ -2356,7 +2357,11 @@ impl TensorGraph {
             redirect[i] = i;
         }
         let _ = redirect;
-        g.eliminate_dead(outputs)
+        // the layout passes and the split expose sibling reductions that
+        // `merge_siblings` could not see before them (the two halves of
+        // dQ, both reading dS): merge them now
+        let (g, outputs) = g.eliminate_dead(outputs);
+        g.merge_siblings(&outputs)
     }
 
     /// Two adjacent reduce dims that every arg reads either not at all
@@ -2491,28 +2496,50 @@ impl TensorGraph {
                 }
             }
         }
+        // a big map that only reductions read (and that is bigger than
+        // any of them): `schedule_auto` recomputes it inside each reader,
+        // so siblings reading it share that recomputation once merged
+        let recomputed = |p: usize| {
+            self.comp_at(p).is_some_and(|pc| {
+                pc.monoid.is_none()
+                    && pc.red.is_empty()
+                    && !is_output(p)
+                    && consumers[p].iter().all(|&r| {
+                        self.comp_at(r).is_some_and(|rc| {
+                            rc.monoid.is_some() && numel(rc.points()) < numel(pc.points())
+                        })
+                    })
+            })
+        };
         let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
         let mut order: Vec<String> = Vec::new();
         for i in (0..n).filter(|&i| live[i] && !is_output(i)) {
             let Some(c) = self.comp_at(i) else { continue };
             let Some(m) = &c.monoid else { continue };
             let readers = &consumers[i];
+            // the same readers, or a shared recomputed operand (then a
+            // reader that is not a comp, a reshape, reads the member's
+            // slot of the merged reduction through a copy)
+            let shared = c.args.iter().map(|a| a.src.n()).find(|&p| recomputed(p));
             if c.tuple != 0
                 || c.width() != 1
                 || readers.is_empty()
-                || readers.iter().any(|&r| self.comp_at(r).is_none())
+                || (shared.is_none() && readers.iter().any(|&r| self.comp_at(r).is_none()))
             {
                 continue;
             }
             let key = format!(
-                "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+                "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}",
                 self.nodes[i].precision,
                 c.out,
                 c.red,
                 m.identity.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
                 m.combine.nodes_slice(),
                 m.outs,
-                readers
+                match shared {
+                    Some(p) => format!("via {p}"),
+                    None => format!("{readers:?}"),
+                }
             );
             let g = groups.entry(key.clone()).or_insert_with(|| {
                 order.push(key);
@@ -2576,6 +2603,27 @@ impl TensorGraph {
                 });
                 for (j, &i) in members.iter().enumerate() {
                     slot_of[i] = Some((merged, j));
+                    if consumers[i].iter().all(|&r| self.comp_at(r).is_some()) {
+                        continue;
+                    }
+                    let c = self.comp_at(i).unwrap();
+                    let rank = c.out.len();
+                    let mut view = View::identity(rank, rank);
+                    view.forms.push(Form::constant(rank, j as i64));
+                    let mut body = ExprGraph::new();
+                    let v = body.var(0);
+                    g.nodes[i].op = Op::Comp(Comp {
+                        out: c.out.clone(),
+                        tuple: 0,
+                        red: Vec::new(),
+                        args: vec![Arg {
+                            src: TensorId(merged as u32),
+                            view,
+                        }],
+                        body,
+                        body_outs: vec![v],
+                        monoid: None,
+                    });
                 }
             }
         }
@@ -2583,6 +2631,9 @@ impl TensorGraph {
             if let Op::Comp(c) = &mut g.nodes[i].op {
                 let rank = c.rank();
                 for a in &mut c.args {
+                    if slot_of[i].is_some_and(|(m, _)| m == a.src.n()) {
+                        continue;
+                    }
                     if let Some((merged, slot)) = slot_of[a.src.n()] {
                         a.src = TensorId(merged as u32);
                         a.view.forms.push(Form::constant(rank, slot as i64));

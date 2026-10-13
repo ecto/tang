@@ -6,7 +6,8 @@
 //! double-buffered shared memory from any affine layout (`cp.async`,
 //! 16-byte where the layout allows), `mma.sync` m16n8k8 TF32 fragments
 //! with fp32 accumulation, and the comp's epilogue run on the
-//! accumulator registers. The flash-attention kernel keeps `wmma`.
+//! accumulator registers. Flash attention uses the same fragments
+//! ([`FlashShape`]).
 //!
 //! tang-gpu runs on wgpu, which cannot dispatch CUDA; this emitter
 //! produces source for an external harness (`scripts/cuda_bench.cu`,
@@ -84,6 +85,60 @@ pub const MMA_SHAPES: [MmaShape; 6] = [
     MmaShape::new(64, 64, 2, 2).with(32, 2, 246),
     MmaShape::new(128, 64, 2, 2),
     MmaShape::new(128, 128, 2, 4).with(32, 2, 100),
+];
+
+/// A flash-attention tile's shape: `bi` queries per folded head per
+/// block (0: chosen from the problem so the device fills), `bj` keys per
+/// warp group per pipeline step, a `cp.async` ring of `stages` key/value
+/// buffers, and `kw` warp groups splitting each step's keys (their
+/// softmax states merged at the end).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlashShape {
+    pub bi: usize,
+    pub bj: usize,
+    pub stages: usize,
+    pub kw: usize,
+}
+
+/// The flash shapes a tuner chooses between, one per [`MMA_SHAPES`]
+/// variant; the first is the default.
+pub const FLASH_SHAPES: [FlashShape; 6] = [
+    FlashShape {
+        bi: 0,
+        bj: 32,
+        stages: 2,
+        kw: 2,
+    },
+    FlashShape {
+        bi: 0,
+        bj: 64,
+        stages: 2,
+        kw: 1,
+    },
+    FlashShape {
+        bi: 0,
+        bj: 16,
+        stages: 3,
+        kw: 2,
+    },
+    FlashShape {
+        bi: 0,
+        bj: 16,
+        stages: 2,
+        kw: 4,
+    },
+    FlashShape {
+        bi: 32,
+        bj: 32,
+        stages: 2,
+        kw: 2,
+    },
+    FlashShape {
+        bi: 0,
+        bj: 32,
+        stages: 3,
+        kw: 1,
+    },
 ];
 
 /// The PTX helpers the tensor-core kernels share: TF32 rounding, `mma`
@@ -831,7 +886,13 @@ impl TensorGraph {
             let native = match variant {
                 Some(v) if self.nodes[root].tile.0 > 0 => self
                     .cuda_mma_kernel_shaped(root, &reads, MMA_SHAPES[v])
-                    .or_else(|| self.cuda_flash_kernel(root, &reads)),
+                    .or_else(|| {
+                        self.cuda_flash_kernel_shaped(
+                            root,
+                            &reads,
+                            FLASH_SHAPES[v % FLASH_SHAPES.len()],
+                        )
+                    }),
                 _ => None,
             };
             match native {
@@ -1436,11 +1497,6 @@ impl TensorGraph {
         })
     }
 
-    /// CUDA source for `root` as a tensor-core flash-attention tile:
-    /// 64 queries per 128-thread block, keys in chunks of 64, `S = Q·Kᵀ`
-    /// and `O += P·V` as wmma TF32 fragments, the online softmax in
-    /// between on the stored score block, the comp's mask, value and
-    /// normalizer expressions evaluated where they belong.
     /// A lead dim of the flash tile that neither the keys nor anything
     /// else of the reduction but the queries depends on, for
     /// `cuda_flash_kernel` to fold into its rows (grouped-query heads).
@@ -1465,17 +1521,52 @@ impl TensorGraph {
         })
     }
 
+    /// CUDA source for `root` as a tensor-core flash-attention tile in
+    /// the default shape ([`FLASH_SHAPES`]`[0]`).
     pub fn cuda_flash_kernel(&self, root: usize, reads: &[usize]) -> Option<String> {
+        self.cuda_flash_kernel_shaped(root, reads, FLASH_SHAPES[0])
+    }
+
+    /// CUDA source for `root` as a flash-attention tile on `mma.sync`
+    /// m16n8k8 TF32, or `None` when it is not attention-shaped. Each warp
+    /// owns 16 rows (queries × folded heads); per key chunk it computes
+    /// `S = Σ_t Q_t·K_tᵀ` into accumulator registers, runs the comp's
+    /// mask and the online softmax on them (row statistics reduced
+    /// across the fragment's quad), and feeds the same registers as the
+    /// A operand of `O += P·V`: the accumulator's column pair (2tq,
+    /// 2tq + 1) is the A fragment's k pair (tq, tq + 4) once the keys of
+    /// each 8-wide step are permuted, which a reduction allows. O and the
+    /// row statistics stay in registers across chunks; K and V come
+    /// through a `cp.async` ring of `sh.stages` buffers; `sh.kw` warp
+    /// groups split each chunk's keys and merge their states at the end.
+    pub fn cuda_flash_kernel_shaped(
+        &self,
+        root: usize,
+        reads: &[usize],
+        sh: FlashShape,
+    ) -> Option<String> {
         let f = self.flash_tile(root, reads)?;
         let c = self.comp_at(root)?;
         let rc = self.comp_at(f.red_node)?;
         let rank = rc.rank();
         let jdim = rank - 1;
         let storage = |j: usize| self.storage(TensorId(j as u32)).n();
-        const BJ: usize = 64;
-        // 16 query rows per warp, two threads per row; four warps when
-        // that keeps about two blocks per SM (82 SMs), else two (one warp
-        // per block measured slower: V is staged once per 16 rows)
+        let sh = match std::env::var("TANG_FLASH_SHAPE") {
+            Ok(v) => {
+                let p: Vec<usize> = v.split(',').filter_map(|x| x.parse().ok()).collect();
+                match p[..] {
+                    [bi, bj, stages, kw] => FlashShape { bi, bj, stages, kw },
+                    _ => sh,
+                }
+            }
+            Err(_) => sh,
+        };
+        let (bj, kw) = (sh.bj, sh.kw);
+        // keys per pipeline step, over all warp groups
+        let bjs = bj * kw;
+        if !bj.is_multiple_of(8) || sh.stages < 2 || kw == 0 {
+            return None;
+        }
         let lead: usize = f.others.iter().map(|&d| f.pts[d]).product();
         // a lead dim the keys and values do not depend on (the query
         // heads sharing a grouped K/V head) folds into the block's rows:
@@ -1487,6 +1578,7 @@ impl TensorGraph {
             .and_then(|v| v.parse().ok())
         {
             Some(b) => b,
+            None if sh.bi > 0 => sh.bi,
             None if fold.is_some() => {
                 // the largest query slice that still fills the device
                 let blocks = |b: usize| f.m.div_ceil(b) * lead / nf;
@@ -1501,32 +1593,43 @@ impl TensorGraph {
         // BI queries of each of the nf folded heads: R rows, 16 per warp
         #[allow(non_snake_case)]
         let (BI, R) = (bi, nf * bi);
+        if !R.is_multiple_of(16) {
+            return None;
+        }
+        let row_warps = R / 16;
         #[allow(non_snake_case)]
-        let T = 2 * R;
-        if R % 16 != 0 || T > 1024 {
+        let T = 32 * row_warps * kw;
+        if T > 1024 {
             return None;
         }
         let d = f.d_lanes;
         let kd = f.kd;
         let nq = kd / 8;
-        let (ldk, lds, ldv, ldo) = (kd + 8, BJ + 8, d + 8, d + 8);
         let n_terms = f.terms.len();
-        let ks_floats = (n_terms * BJ * ldk).max(R * ldk * n_terms);
-        let smem_floats = ks_floats + R.max(BJ) * lds + BJ * ldv + R * ldo;
+        let has_k = f.score_buf.is_none();
+        // fragments in registers: Q (n_terms × nq × 4), S (bj/8 × 4), O (d/8 × 4)
+        if n_terms * nq * 4 + bj / 2 + d / 2 > 160 {
+            return None;
+        }
+        // row strides: K rows are read 8 keys × 4 float2 per half warp
+        // (≡ 8 mod 32 is conflict-free), V rows 4 keys × 4 float2 (≡ 4)
+        let (ldk, ldv) = (kd + 8, d + 4);
+        let k_floats = if has_k { n_terms * bjs * ldk } else { 0 };
+        let stage_floats = k_floats + bjs * ldv;
+        let q_floats = if has_k { n_terms * R * ldk } else { 0 };
+        let ldo = d + 4;
+        let merge_floats = if kw > 1 {
+            2 * kw * R + (kw - 1) * R * ldo
+        } else {
+            0
+        };
+        let smem_floats = (sh.stages * stage_floats).max(q_floats).max(merge_floats);
         if smem_floats * 4 > 99 * 1024 {
             return None;
         }
         let tiles_i = f.m.div_ceil(BI);
         let n_tiles = tiles_i * lead / nf;
-        // the row's query and folded head, where per-row code needs them
-        let row_coords = |s: &mut String, indent: &str, r: &str| match fold {
-            Some(fd) => writeln!(
-                s,
-                "{indent}unsigned p{fd} = {r} / {BI}u; unsigned ii = i0 + {r} % {BI}u;"
-            )
-            .unwrap(),
-            None => writeln!(s, "{indent}unsigned ii = i0 + {r};").unwrap(),
-        };
+        let n_chunks = f.n_keys.div_ceil(bjs);
         let w_out = c.width();
 
         // coordinate names in the reduction's space
@@ -1579,19 +1682,64 @@ impl TensorGraph {
                 coord(f.score_to_red[dim])
             }
         };
+        // a read that is contiguous along `inner` and 16-byte aligned at
+        // every vector start (the other coefficients and the offset are
+        // multiples of 4), so it stages with 16-byte `cp.async`
+        let vec4 = |a: &Addr, inner: usize, extent: usize| {
+            a.coefs[inner] == 1
+                && a.offset % 4 == 0
+                && extent.is_multiple_of(4)
+                && a.coefs
+                    .iter()
+                    .enumerate()
+                    .all(|(dim, &cf)| dim == inner || cf % 4 == 0)
+        };
+        // the row's query and folded head, where per-row code needs them
+        let row_coords = |s: &mut String, indent: &str, r: &str| match fold {
+            Some(fd) => writeln!(
+                s,
+                "{indent}unsigned p{fd} = ({r}) / {BI}u; unsigned ii = i0 + ({r}) % {BI}u;"
+            )
+            .unwrap(),
+            None => writeln!(s, "{indent}unsigned ii = i0 + ({r});").unwrap(),
+        };
+        let emit_body = |s: &mut String,
+                         indent: &str,
+                         body: &tang_expr::ExprGraph,
+                         outs: &[tang_expr::ExprId],
+                         prefix: &str,
+                         vals: &[String]|
+         -> Vec<String> {
+            let mut b = String::new();
+            let o = emit_scalar(&mut b, body, outs, prefix, &|v| vals[v as usize].clone());
+            for line in b.lines() {
+                writeln!(
+                    s,
+                    "{indent}{}",
+                    float_literals(&line.replacen("let ", "float ", 1))
+                )
+                .unwrap();
+            }
+            o
+        };
 
         let mut s = String::new();
         writeln!(
             s,
-            "// Auto-generated by tang-compile: flash attention on wmma (TF32)"
+            "// Auto-generated by tang-compile: flash attention on mma (TF32)"
         )
         .unwrap();
-        writeln!(s, "#include <mma.h>").unwrap();
-        writeln!(s, "using namespace nvcuda;").unwrap();
+        writeln!(
+            s,
+            "// {R} rows ({nf} x {BI}), keys {bj} x {kw} groups, {} stages",
+            sh.stages
+        )
+        .unwrap();
         writeln!(s, "#define TANG_TILES {n_tiles}").unwrap();
         writeln!(s, "#define TANG_THREADS {T}").unwrap();
         writeln!(s, "#define TANG_SMEM {}", smem_floats * 4).unwrap();
         writeln!(s, "#define select(f, t, c) ((c) ? (t) : (f))").unwrap();
+        s.push_str(MMA_PRELUDE);
         let mut params: Vec<String> = reads
             .iter()
             .map(|&j| format!("const float* __restrict__ b{j}"))
@@ -1605,13 +1753,10 @@ impl TensorGraph {
         )
         .unwrap();
         writeln!(s, "    (void)count;").unwrap();
-        writeln!(s, "    extern __shared__ __align__(32) float smem[];").unwrap();
-        writeln!(s, "    float* Ks = smem;").unwrap();
-        writeln!(s, "    float* Ss = smem + {ks_floats};").unwrap();
-        writeln!(s, "    float* Vs = Ss + {};", R.max(BJ) * lds).unwrap();
-        writeln!(s, "    float* Os = Vs + {};", BJ * ldv).unwrap();
-        writeln!(s, "    unsigned tile = blockIdx.x;").unwrap();
-        writeln!(s, "    if (tile >= {n_tiles}u) return;").unwrap();
+        writeln!(s, "    extern __shared__ __align__(16) float smem[];").unwrap();
+        // the longest (least masked) row blocks first
+        writeln!(s, "    unsigned tile = {}u - blockIdx.x;", n_tiles - 1).unwrap();
+        writeln!(s, "    if (blockIdx.x >= {n_tiles}u) return;").unwrap();
         writeln!(s, "    unsigned tile_i = tile % {tiles_i}u;").unwrap();
         writeln!(s, "    unsigned lead = tile / {tiles_i}u;").unwrap();
         for &dim in f.others.iter().rev().filter(|&&dim| Some(dim) != fold) {
@@ -1621,60 +1766,17 @@ impl TensorGraph {
         writeln!(s, "    unsigned i0 = tile_i * {BI}u;").unwrap();
         writeln!(s, "    unsigned tid = threadIdx.x;").unwrap();
         writeln!(s, "    unsigned warp = tid / 32u;").unwrap();
-        writeln!(s, "    unsigned row = tid / 2u;").unwrap();
-        writeln!(s, "    unsigned half = tid % 2u;").unwrap();
-        if f.score_buf.is_none() {
-            // Q fragments: stage Q (reusing the K area), load per warp, keep
-            writeln!(
-                s,
-                "    for (unsigned idx = tid; idx < {}u; idx += {T}u) {{",
-                n_terms * R * kd
-            )
-            .unwrap();
-            writeln!(s, "        unsigned t = idx / {}u; unsigned r = (idx / {kd}u) % {R}u; unsigned dd = idx % {kd}u;", R * kd).unwrap();
-            row_coords(&mut s, "        ", "r");
-            writeln!(s, "        float v = 0.0f;").unwrap();
-            writeln!(s, "        if (ii < {}u) {{", f.m).unwrap();
-            for (t, (qb, qa, _, _)) in f.terms.iter().enumerate() {
-                writeln!(
-                    s,
-                    "            if (t == {t}u) v = b{qb}[(unsigned)({})];",
-                    addr_expr(qa, &score_coord)
-                )
-                .unwrap();
-            }
-            writeln!(s, "        }}").unwrap();
-            writeln!(s, "        Ks[t * {}u + r * {ldk}u + dd] = v;", R * ldk).unwrap();
-            writeln!(s, "    }}").unwrap();
-            writeln!(s, "    __syncthreads();").unwrap();
-            writeln!(s, "    wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> qf[{n_terms}][{nq}];").unwrap();
-            writeln!(
-            s,
-            "    for (unsigned t = 0; t < {n_terms}u; t++) for (unsigned q = 0; q < {nq}u; q++) {{"
-        )
-            .unwrap();
-            writeln!(s, "        wmma::load_matrix_sync(qf[t][q], Ks + t * {}u + (warp * 16u) * {ldk}u + q * 8u, {ldk}u);", R * ldk).unwrap();
-            writeln!(s, "        for (int e = 0; e < qf[t][q].num_elements; e++) qf[t][q].x[e] = wmma::__float_to_tf32(qf[t][q].x[e]);").unwrap();
-            writeln!(s, "    }}").unwrap();
-            writeln!(s, "    __syncthreads();").unwrap();
-        }
-        writeln!(
-            s,
-            "    for (unsigned idx = tid; idx < {}u; idx += {T}u) Os[idx] = 0.0f;",
-            R * ldo
-        )
-        .unwrap();
-        writeln!(s, "    float m_row = -3.0e38f; float l_row = 0.0f;").unwrap();
-        writeln!(
-            s,
-            "    for (unsigned j0 = 0u; j0 < {}u; j0 += {BJ}u) {{",
-            f.n_keys
-        )
-        .unwrap();
+        writeln!(s, "    unsigned lane = tid % 32u;").unwrap();
+        writeln!(s, "    unsigned gq = lane / 4u, tq = lane % 4u;").unwrap();
+        // warp group (which keys of a chunk) and the warp's first row
+        writeln!(s, "    unsigned wg = warp / {row_warps}u;").unwrap();
+        writeln!(s, "    unsigned wrow = (warp % {row_warps}u) * 16u;").unwrap();
+        writeln!(s, "    unsigned kbase = wg * {bj}u;").unwrap();
+
+        // the key-chunk range: chunks the affine mask covers entirely
+        // (block-uniform) are left out at either end
+        writeln!(s, "    unsigned c_lo = 0u, c_hi = {n_chunks}u;").unwrap();
         if let Some(fm) = self.score_mask(rc, f.score_arg) {
-            // the minimum of the affine mask condition over this tile's
-            // box: where it is positive the whole key tile is masked out
-            // (block-uniform, so the barriers below stay matched)
             let mut e = format!("{}", fm.offset);
             for (dim, &cf) in fm.coefs.iter().enumerate() {
                 if cf == 0 {
@@ -1683,7 +1785,7 @@ impl TensorGraph {
                 let (lo, hi) = if dim == jdim {
                     (
                         "(int)j0".to_string(),
-                        format!("(int)min(j0 + {BJ}u, {}u) - 1", f.n_keys),
+                        format!("(int)min(j0 + {bjs}u, {}u) - 1", f.n_keys),
                     )
                 } else if dim == f.dy {
                     (
@@ -1692,152 +1794,304 @@ impl TensorGraph {
                     )
                 } else if dim == f.dx {
                     ("0".to_string(), format!("{}", d - 1))
+                } else if Some(dim) == fold {
+                    ("0".to_string(), format!("{}", nf - 1))
                 } else {
                     (format!("(int)p{dim}"), format!("(int)p{dim}"))
                 };
                 let at = if cf > 0 { lo } else { hi };
                 e.push_str(&format!(" + {cf} * ({at})"));
             }
-            writeln!(s, "        if ({e} > 0) continue;").unwrap();
-        }
-        if f.score_buf.is_none() {
-            // stage K terms and V
+            writeln!(s, "    c_lo = {n_chunks}u; c_hi = 0u;").unwrap();
+            writeln!(s, "    for (unsigned c = 0u; c < {n_chunks}u; c++) {{").unwrap();
+            writeln!(s, "        unsigned j0 = c * {bjs}u;").unwrap();
             writeln!(
                 s,
-                "        for (unsigned idx = tid; idx < {}u; idx += {T}u) {{",
-                n_terms * BJ * kd
+                "        if (!({e} > 0)) {{ c_lo = min(c_lo, c); c_hi = c + 1u; }}"
             )
             .unwrap();
-            writeln!(s, "            unsigned t = idx / {}u; unsigned r = (idx / {kd}u) % {BJ}u; unsigned dd = idx % {kd}u;", BJ * kd).unwrap();
-            writeln!(s, "            unsigned jj = j0 + r;").unwrap();
-            writeln!(s, "            float v = 0.0f;").unwrap();
-            writeln!(s, "            if (jj < {}u) {{", f.n_keys).unwrap();
-            for (t, (_, _, kb, ka)) in f.terms.iter().enumerate() {
+            writeln!(s, "    }}").unwrap();
+        }
+
+        // Q fragments, staged once through shared memory and kept as TF32
+        // (the head-dim pair 2tq, 2tq + 1 in mma k slots tq, tq + 4)
+        if has_k {
+            writeln!(s, "    unsigned qf[{n_terms}][{nq}][4];").unwrap();
+            for (t, (qb, qa, _, _)) in f.terms.iter().enumerate() {
                 writeln!(
                     s,
-                    "                if (t == {t}u) v = b{kb}[(unsigned)({})];",
-                    addr_expr(ka, &score_coord)
+                    "    for (unsigned idx = tid; idx < {}u; idx += {T}u) {{",
+                    R * kd
                 )
                 .unwrap();
+                writeln!(
+                    s,
+                    "        unsigned r = idx / {kd}u; unsigned dd = idx % {kd}u;"
+                )
+                .unwrap();
+                row_coords(&mut s, "        ", "r");
+                writeln!(
+                    s,
+                    "        smem[{}u + r * {ldk}u + dd] = ii < {}u ? b{qb}[(unsigned)({})] : 0.0f;",
+                    t * R * ldk,
+                    f.m,
+                    addr_expr(qa, &score_coord)
+                )
+                .unwrap();
+                writeln!(s, "    }}").unwrap();
             }
-            writeln!(s, "            }}").unwrap();
+            writeln!(s, "    __syncthreads();").unwrap();
+            writeln!(s, "    #pragma unroll").unwrap();
+            writeln!(s, "    for (int t = 0; t < {n_terms}; t++)").unwrap();
+            writeln!(s, "    #pragma unroll").unwrap();
+            writeln!(s, "    for (int q = 0; q < {nq}; q++) {{").unwrap();
             writeln!(
                 s,
-                "            Ks[t * {}u + r * {ldk}u + dd] = v;",
-                BJ * ldk
+                "        const float* p = smem + t * {}u + (wrow + gq) * {ldk}u + q * 8u + 2u * tq;",
+                R * ldk
             )
             .unwrap();
+            writeln!(
+                s,
+                "        float2 lo = *(const float2*)p, hi = *(const float2*)(p + {}u);",
+                8 * ldk
+            )
+            .unwrap();
+            writeln!(
+                s,
+                "        qf[t][q][0] = tang_tf32(lo.x); qf[t][q][1] = tang_tf32(hi.x);"
+            )
+            .unwrap();
+            writeln!(
+                s,
+                "        qf[t][q][2] = tang_tf32(lo.y); qf[t][q][3] = tang_tf32(hi.y);"
+            )
+            .unwrap();
+            writeln!(s, "    }}").unwrap();
+            writeln!(s, "    __syncthreads();").unwrap();
+        }
+
+        // staging of one key chunk (K terms, then V) into buffer `buf`
+        writeln!(s, "    auto load = [&](unsigned buf, unsigned j0) {{").unwrap();
+        writeln!(s, "        float* st = smem + buf * {stage_floats}u;").unwrap();
+        if has_k {
+            for (t, (_, _, kb, ka)) in f.terms.iter().enumerate() {
+                let off = t * bjs * ldk;
+                if vec4(ka, f.score_to_red.len(), kd) {
+                    writeln!(
+                        s,
+                        "        for (unsigned idx = tid; idx < {}u; idx += {T}u) {{",
+                        bjs * kd / 4
+                    )
+                    .unwrap();
+                    writeln!(
+                        s,
+                        "            unsigned r = idx / {}u; unsigned dd = (idx % {}u) * 4u; unsigned jj = j0 + r;",
+                        kd / 4,
+                        kd / 4
+                    )
+                    .unwrap();
+                    writeln!(s, "            bool ok = jj < {}u;", f.n_keys).unwrap();
+                    writeln!(
+                        s,
+                        "            tang_cp16(st + {off}u + r * {ldk}u + dd, b{kb} + (ok ? (unsigned)({}) : 0u), ok);",
+                        addr_expr(ka, &score_coord)
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(
+                        s,
+                        "        for (unsigned idx = tid; idx < {}u; idx += {T}u) {{",
+                        bjs * kd
+                    )
+                    .unwrap();
+                    writeln!(
+                        s,
+                        "            unsigned r = idx / {kd}u; unsigned dd = idx % {kd}u; unsigned jj = j0 + r;"
+                    )
+                    .unwrap();
+                    writeln!(s, "            bool ok = jj < {}u;", f.n_keys).unwrap();
+                    writeln!(
+                        s,
+                        "            tang_cp4(st + {off}u + r * {ldk}u + dd, b{kb} + (ok ? (unsigned)({}) : 0u), ok);",
+                        addr_expr(ka, &score_coord)
+                    )
+                    .unwrap();
+                }
+                writeln!(s, "        }}").unwrap();
+            }
+        }
+        {
+            // the value: a plain read stages asynchronously; any other
+            // expression is evaluated while staging
+            let e_v = rc.body_outs[2];
+            let plain = match rc.body.nodes_slice()[e_v.index() as usize] {
+                ENode::Var(v) => {
+                    let a = &rc.args[v as usize];
+                    (!matches!(self.nodes[a.src.n()].op, Op::Iota(_)))
+                        .then(|| (storage(a.src.n()), self.flat_addr(a, rank)))
+                }
+                _ => None,
+            };
+            match plain {
+                Some((vb, va)) if vec4(&va, f.dx, d) => {
+                    writeln!(
+                        s,
+                        "        for (unsigned idx = tid; idx < {}u; idx += {T}u) {{",
+                        bjs * d / 4
+                    )
+                    .unwrap();
+                    writeln!(
+                        s,
+                        "            unsigned r = idx / {}u; unsigned nn = (idx % {}u) * 4u; unsigned jj = j0 + r;",
+                        d / 4,
+                        d / 4
+                    )
+                    .unwrap();
+                    writeln!(s, "            bool ok = jj < {}u;", f.n_keys).unwrap();
+                    writeln!(
+                        s,
+                        "            tang_cp16(st + {k_floats}u + r * {ldv}u + nn, b{vb} + (ok ? (unsigned)({}) : 0u), ok);",
+                        addr_expr(&va, &coord)
+                    )
+                    .unwrap();
+                }
+                Some((vb, va)) => {
+                    writeln!(
+                        s,
+                        "        for (unsigned idx = tid; idx < {}u; idx += {T}u) {{",
+                        bjs * d
+                    )
+                    .unwrap();
+                    writeln!(
+                        s,
+                        "            unsigned r = idx / {d}u; unsigned nn = idx % {d}u; unsigned jj = j0 + r;"
+                    )
+                    .unwrap();
+                    writeln!(s, "            bool ok = jj < {}u;", f.n_keys).unwrap();
+                    writeln!(
+                        s,
+                        "            tang_cp4(st + {k_floats}u + r * {ldv}u + nn, b{vb} + (ok ? (unsigned)({}) : 0u), ok);",
+                        addr_expr(&va, &coord)
+                    )
+                    .unwrap();
+                }
+                None => {
+                    writeln!(
+                        s,
+                        "        for (unsigned idx = tid; idx < {}u; idx += {T}u) {{",
+                        bjs * d
+                    )
+                    .unwrap();
+                    writeln!(
+                        s,
+                        "            unsigned r = idx / {d}u; unsigned nn = idx % {d}u; unsigned jj = j0 + r;"
+                    )
+                    .unwrap();
+                    writeln!(s, "            float v = 0.0f;").unwrap();
+                    writeln!(s, "            if (jj < {}u) {{", f.n_keys).unwrap();
+                    let vals: Vec<String> = rc.args.iter().map(arg_value).collect();
+                    let o = emit_body(&mut s, "                ", &rc.body, &[e_v], "v0_", &vals);
+                    writeln!(s, "                v = {};", o[0]).unwrap();
+                    writeln!(s, "            }}").unwrap();
+                    writeln!(s, "            st[{k_floats}u + r * {ldv}u + nn] = v;").unwrap();
+                }
+            }
             writeln!(s, "        }}").unwrap();
         }
+        writeln!(s, "        tang_cp_commit();").unwrap();
+        writeln!(s, "    }};").unwrap();
+
+        // per thread: rows wrow + gq and wrow + gq + 8 (h = 0, 1)
+        let nsf = bj / 8;
+        let nof = d / 8;
+        writeln!(s, "    float o[{nof}][4];").unwrap();
+        writeln!(s, "    #pragma unroll").unwrap();
         writeln!(
             s,
-            "        for (unsigned idx = tid; idx < {}u; idx += {T}u) {{",
-            BJ * d
+            "    for (int j = 0; j < {nof}; j++) for (int r = 0; r < 4; r++) o[j][r] = 0.0f;"
         )
         .unwrap();
+        writeln!(s, "    float m_row[2] = {{-3.0e38f, -3.0e38f}};").unwrap();
+        // per-thread partial row sums (the quad's are summed at the end)
+        writeln!(s, "    float l_row[2] = {{0.0f, 0.0f}};").unwrap();
+        let st = sh.stages;
+        writeln!(s, "    #pragma unroll").unwrap();
         writeln!(
             s,
-            "            unsigned r = idx / {d}u; unsigned nn = idx % {d}u; unsigned jj = j0 + r;"
+            "    for (unsigned c = 0u; c < {}u; c++) {{ if (c_lo + c < c_hi) load((c_lo + c) % {st}u, (c_lo + c) * {bjs}u); else tang_cp_commit(); }}",
+            st - 1
         )
         .unwrap();
-        writeln!(s, "            float v = 0.0f;").unwrap();
-        writeln!(s, "            if (jj < {}u) {{", f.n_keys).unwrap();
-        {
-            let vals: Vec<String> = rc.args.iter().map(arg_value).collect();
-            let mut body = String::new();
-            let outs = emit_scalar(&mut body, &rc.body, &[rc.body_outs[2]], "v0_", &|v| {
-                vals[v as usize].clone()
-            });
-            for line in body.lines() {
-                writeln!(
-                    s,
-                    "                {}",
-                    float_literals(&line.replacen("let ", "float ", 1))
-                )
-                .unwrap();
-            }
-            writeln!(s, "                v = {};", outs[0]).unwrap();
-        }
-        writeln!(s, "            }}").unwrap();
-        writeln!(s, "            Vs[r * {ldv}u + nn] = v;").unwrap();
-        writeln!(s, "        }}").unwrap();
+        writeln!(s, "    for (unsigned c = c_lo; c < c_hi; c++) {{").unwrap();
+        writeln!(s, "        tang_cp_wait<{}>();", st - 2).unwrap();
         writeln!(s, "        __syncthreads();").unwrap();
+        writeln!(s, "        {{").unwrap();
+        writeln!(s, "            unsigned nc = c + {}u;", st - 1).unwrap();
+        writeln!(
+            s,
+            "            if (nc < c_hi) load(nc % {st}u, nc * {bjs}u); else tang_cp_commit();"
+        )
+        .unwrap();
+        writeln!(s, "        }}").unwrap();
+        writeln!(
+            s,
+            "        const float* st = smem + (c % {st}u) * {stage_floats}u;"
+        )
+        .unwrap();
+        writeln!(s, "        unsigned j0 = c * {bjs}u + kbase;").unwrap();
+        writeln!(s, "        float sc[{nsf}][4];").unwrap();
+        if has_k {
+            // S = Σ_t Q_t · K_tᵀ: key fragment j holds keys 8j .. 8j + 7
+            writeln!(s, "        #pragma unroll").unwrap();
+            writeln!(s, "        for (int j = 0; j < {nsf}; j++) for (int r = 0; r < 4; r++) sc[j][r] = 0.0f;").unwrap();
+            writeln!(s, "        #pragma unroll").unwrap();
+            writeln!(s, "        for (int t = 0; t < {n_terms}; t++)").unwrap();
+            writeln!(s, "        #pragma unroll").unwrap();
+            writeln!(s, "        for (int q = 0; q < {nq}; q++)").unwrap();
+            writeln!(s, "        #pragma unroll").unwrap();
+            writeln!(s, "        for (int j = 0; j < {nsf}; j++) {{").unwrap();
+            writeln!(
+                s,
+                "            float2 kv = *(const float2*)(st + t * {}u + (kbase + 8u * j + gq) * {ldk}u + 8u * q + 2u * tq);",
+                bjs * ldk
+            )
+            .unwrap();
+            writeln!(
+                s,
+                "            unsigned kf[2] = {{tang_tf32(kv.x), tang_tf32(kv.y)}};"
+            )
+            .unwrap();
+            writeln!(s, "            tang_mma(sc[j], qf[t][q], kf);").unwrap();
+            writeln!(s, "        }}").unwrap();
+        }
+        // the comp's score expression (mask) on each element, then the
+        // online softmax per row half
+        writeln!(s, "        #pragma unroll").unwrap();
+        writeln!(s, "        for (int h = 0; h < 2; h++) {{").unwrap();
+        row_coords(&mut s, "            ", "wrow + gq + 8u * h");
+        writeln!(s, "            float mloc = -3.0e38f;").unwrap();
+        writeln!(s, "            #pragma unroll").unwrap();
+        writeln!(s, "            for (int j = 0; j < {nsf}; j++)").unwrap();
+        writeln!(s, "            #pragma unroll").unwrap();
+        writeln!(s, "            for (int e = 0; e < 2; e++) {{").unwrap();
+        writeln!(
+            s,
+            "                unsigned jj = j0 + 8u * j + 2u * tq + e;"
+        )
+        .unwrap();
         if let Some((sb, sa)) = &f.score_buf {
-            // the score block straight from its buffer, keys fastest
             writeln!(
                 s,
-                "        for (unsigned idx = tid; idx < {}u; idx += {T}u) {{",
-                BI * BJ
-            )
-            .unwrap();
-            writeln!(
-                s,
-                "            unsigned r = idx / {BJ}u; unsigned jl = idx % {BJ}u; unsigned ii = i0 + r; unsigned jj = j0 + jl;"
-            )
-            .unwrap();
-            writeln!(
-                s,
-                "            Ss[r * {lds}u + jl] = (ii < {}u && jj < {}u) ? b{sb}[(unsigned)({})] : 0.0f;",
+                "                float sval = (ii < {}u && jj < {}u) ? b{sb}[(unsigned)({})] : 0.0f;",
                 f.m,
                 f.n_keys,
                 addr_expr(sa, &coord)
             )
             .unwrap();
-            writeln!(s, "        }}").unwrap();
-            writeln!(s, "        __syncthreads();").unwrap();
         } else {
-            // S = Σ_t Q_t · K_tᵀ for this warp's 16 rows × 64 keys
-            writeln!(s, "        {{").unwrap();
-            writeln!(
-                s,
-                "            wmma::fragment<wmma::accumulator, 16, 16, 8, float> sf[{}];",
-                BJ / 16
-            )
-            .unwrap();
-            writeln!(
-            s,
-            "            for (unsigned cb = 0; cb < {}u; cb++) wmma::fill_fragment(sf[cb], 0.0f);",
-            BJ / 16
-        )
-            .unwrap();
-            writeln!(s, "            for (unsigned t = 0; t < {n_terms}u; t++) for (unsigned q = 0; q < {nq}u; q++) {{").unwrap();
-            writeln!(
-                s,
-                "                for (unsigned cb = 0; cb < {}u; cb++) {{",
-                BJ / 16
-            )
-            .unwrap();
-            writeln!(s, "                    wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::col_major> kf;").unwrap();
-            writeln!(s, "                    wmma::load_matrix_sync(kf, Ks + t * {}u + (cb * 16u) * {ldk}u + q * 8u, {ldk}u);", BJ * ldk).unwrap();
-            writeln!(s, "                    for (int e = 0; e < kf.num_elements; e++) kf.x[e] = wmma::__float_to_tf32(kf.x[e]);").unwrap();
-            writeln!(
-                s,
-                "                    wmma::mma_sync(sf[cb], qf[t][q], kf, sf[cb]);"
-            )
-            .unwrap();
-            writeln!(s, "                }}").unwrap();
-            writeln!(s, "            }}").unwrap();
-            writeln!(s, "            for (unsigned cb = 0; cb < {}u; cb++) wmma::store_matrix_sync(Ss + (warp * 16u) * {lds}u + cb * 16u, sf[cb], {lds}u, wmma::mem_row_major);", BJ / 16).unwrap();
-            writeln!(s, "        }}").unwrap();
-            writeln!(s, "        __syncthreads();").unwrap();
+            writeln!(s, "                float sval = sc[j][2 * h + e];").unwrap();
         }
-        // online softmax on the score block: two threads per row
-        writeln!(s, "        {{").unwrap();
-        row_coords(&mut s, "            ", "row");
-        writeln!(s, "            float mloc = -3.0e38f;").unwrap();
-        writeln!(
-            s,
-            "            for (unsigned c = 0; c < {}u; c++) {{",
-            BJ / 2
-        )
-        .unwrap();
-        writeln!(
-            s,
-            "                unsigned jl = half * {}u + c; unsigned jj = j0 + jl;",
-            BJ / 2
-        )
-        .unwrap();
-        writeln!(s, "                float sval = Ss[row * {lds}u + jl];").unwrap();
         {
             let vals: Vec<String> = rc
                 .args
@@ -1851,147 +2105,214 @@ impl TensorGraph {
                     }
                 })
                 .collect();
-            let mut body = String::new();
-            let outs = emit_scalar(&mut body, &rc.body, &[rc.body_outs[0]], "s0_", &|v| {
-                vals[v as usize].clone()
-            });
-            for line in body.lines() {
-                writeln!(
-                    s,
-                    "                {}",
-                    float_literals(&line.replacen("let ", "float ", 1))
-                )
-                .unwrap();
-            }
+            let o = emit_body(
+                &mut s,
+                "                ",
+                &rc.body,
+                &[rc.body_outs[0]],
+                "s0_",
+                &vals,
+            );
             writeln!(
                 s,
-                "                float sc = (jj < {}u) ? ({}) : -3.0e38f;",
-                f.n_keys, outs[0]
+                "                float v = (jj < {}u) ? ({}) : -3.0e38f;",
+                f.n_keys, o[0]
             )
             .unwrap();
         }
-        writeln!(s, "                Ss[row * {lds}u + jl] = sc;").unwrap();
-        writeln!(s, "                mloc = fmaxf(mloc, sc);").unwrap();
+        writeln!(s, "                sc[j][2 * h + e] = v;").unwrap();
+        writeln!(s, "                mloc = fmaxf(mloc, v);").unwrap();
         writeln!(s, "            }}").unwrap();
         writeln!(
             s,
             "            mloc = fmaxf(mloc, __shfl_xor_sync(0xffffffffu, mloc, 1));"
         )
         .unwrap();
-        writeln!(s, "            float m_new = fmaxf(m_row, mloc);").unwrap();
-        writeln!(s, "            float alpha = expf(m_row - m_new);").unwrap();
+        writeln!(
+            s,
+            "            mloc = fmaxf(mloc, __shfl_xor_sync(0xffffffffu, mloc, 2));"
+        )
+        .unwrap();
+        writeln!(s, "            float m_new = fmaxf(m_row[h], mloc);").unwrap();
+        writeln!(s, "            float alpha = expf(m_row[h] - m_new);").unwrap();
         writeln!(s, "            float lsum = 0.0f;").unwrap();
+        writeln!(s, "            #pragma unroll").unwrap();
+        writeln!(s, "            for (int j = 0; j < {nsf}; j++)").unwrap();
+        writeln!(s, "            #pragma unroll").unwrap();
+        writeln!(s, "            for (int e = 0; e < 2; e++) {{").unwrap();
         writeln!(
             s,
-            "            for (unsigned c = 0; c < {}u; c++) {{",
-            BJ / 2
+            "                float p = expf(sc[j][2 * h + e] - m_new); sc[j][2 * h + e] = p; lsum += p;"
         )
         .unwrap();
-        writeln!(s, "                unsigned jl = half * {}u + c;", BJ / 2).unwrap();
-        writeln!(
-            s,
-            "                float p = expf(Ss[row * {lds}u + jl] - m_new);"
-        )
-        .unwrap();
-        writeln!(s, "                Ss[row * {lds}u + jl] = p; lsum += p;").unwrap();
         writeln!(s, "            }}").unwrap();
         writeln!(
             s,
-            "            lsum += __shfl_xor_sync(0xffffffffu, lsum, 1);"
+            "            l_row[h] = l_row[h] * alpha + lsum; m_row[h] = m_new;"
         )
         .unwrap();
+        writeln!(s, "            #pragma unroll").unwrap();
         writeln!(
             s,
-            "            l_row = l_row * alpha + lsum; m_row = m_new;"
+            "            for (int j = 0; j < {nof}; j++) {{ o[j][2 * h] *= alpha; o[j][2 * h + 1] *= alpha; }}"
         )
         .unwrap();
-        writeln!(s, "            for (unsigned c = 0; c < {}u; c++) Os[row * {ldo}u + half * {}u + c] *= alpha;", d / 2, d / 2).unwrap();
         writeln!(s, "        }}").unwrap();
-        writeln!(s, "        __syncthreads();").unwrap();
-        // O += P · V
+        // O += P · V, P straight from the score registers
+        writeln!(s, "        #pragma unroll").unwrap();
+        writeln!(s, "        for (int j = 0; j < {nsf}; j++) {{").unwrap();
         writeln!(
             s,
-            "        for (unsigned cb = 0; cb < {}u; cb++) {{",
-            d / 16
+            "            unsigned pf[4] = {{tang_tf32(sc[j][0]), tang_tf32(sc[j][2]), tang_tf32(sc[j][1]), tang_tf32(sc[j][3])}};"
+        )
+        .unwrap();
+        writeln!(s, "            #pragma unroll").unwrap();
+        writeln!(s, "            for (int jp = 0; jp < {}; jp++) {{", d / 16).unwrap();
+        writeln!(
+            s,
+            "                const float* vp = st + {k_floats}u + (kbase + 8u * j + 2u * tq) * {ldv}u + 16u * jp + 2u * gq;"
         )
         .unwrap();
         writeln!(
             s,
-            "            wmma::fragment<wmma::accumulator, 16, 16, 8, float> of;"
+            "                float2 r0 = *(const float2*)vp, r1 = *(const float2*)(vp + {ldv}u);"
         )
         .unwrap();
-        writeln!(s, "            wmma::load_matrix_sync(of, Os + (warp * 16u) * {ldo}u + cb * 16u, {ldo}u, wmma::mem_row_major);").unwrap();
         writeln!(
             s,
-            "            for (unsigned q = 0; q < {}u; q++) {{",
-            BJ / 8
+            "                unsigned v0[2] = {{tang_tf32(r0.x), tang_tf32(r1.x)}}, v1[2] = {{tang_tf32(r0.y), tang_tf32(r1.y)}};"
         )
         .unwrap();
-        writeln!(s, "                wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> pf;").unwrap();
-        writeln!(s, "                wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::row_major> vf;").unwrap();
-        writeln!(s, "                wmma::load_matrix_sync(pf, Ss + (warp * 16u) * {lds}u + q * 8u, {lds}u);").unwrap();
-        writeln!(s, "                wmma::load_matrix_sync(vf, Vs + (q * 8u) * {ldv}u + cb * 16u, {ldv}u);").unwrap();
-        writeln!(s, "                for (int e = 0; e < pf.num_elements; e++) pf.x[e] = wmma::__float_to_tf32(pf.x[e]);").unwrap();
-        writeln!(s, "                for (int e = 0; e < vf.num_elements; e++) vf.x[e] = wmma::__float_to_tf32(vf.x[e]);").unwrap();
-        writeln!(s, "                wmma::mma_sync(of, pf, vf, of);").unwrap();
+        writeln!(
+            s,
+            "                tang_mma(o[2 * jp], pf, v0); tang_mma(o[2 * jp + 1], pf, v1);"
+        )
+        .unwrap();
         writeln!(s, "            }}").unwrap();
-        writeln!(s, "            wmma::store_matrix_sync(Os + (warp * 16u) * {ldo}u + cb * 16u, of, {ldo}u, wmma::mem_row_major);").unwrap();
         writeln!(s, "        }}").unwrap();
-        writeln!(s, "        __syncthreads();").unwrap();
         writeln!(s, "    }}").unwrap();
-        if !f.epilogue {
-            // the root is the reduction: its (m, l, acc) state per point
-            writeln!(s, "    {{").unwrap();
-            row_coords(&mut s, "        ", "row");
-            writeln!(s, "        if (ii < {}u) {{", f.m).unwrap();
+        writeln!(s, "    tang_cp_wait<0>();").unwrap();
+        // the quad's partial row sums
+        writeln!(s, "    #pragma unroll").unwrap();
+        writeln!(s, "    for (int h = 0; h < 2; h++) {{").unwrap();
+        writeln!(
+            s,
+            "        l_row[h] += __shfl_xor_sync(0xffffffffu, l_row[h], 1);"
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "        l_row[h] += __shfl_xor_sync(0xffffffffu, l_row[h], 2);"
+        )
+        .unwrap();
+        writeln!(s, "    }}").unwrap();
+        // element r of O fragment j: row gq + 8·(r/2), lane (the V column
+        // pairing above) 16·(j/2) + 4·tq + 2·(r%2) + j%2
+        let frag_loop = |s: &mut String| {
+            writeln!(s, "    #pragma unroll").unwrap();
+            writeln!(s, "    for (int j = 0; j < {nof}; j++)").unwrap();
+            writeln!(s, "    #pragma unroll").unwrap();
+            writeln!(s, "    for (int r = 0; r < 4; r++) {{").unwrap();
+            writeln!(s, "        unsigned lr = wrow + gq + 8u * (r / 2);").unwrap();
             writeln!(
                 s,
-                "            for (unsigned c = 0; c < {}u; c++) {{",
-                d / 2
+                "        unsigned lc = 16u * (j / 2) + 4u * tq + 2u * (r % 2) + (j % 2);"
             )
             .unwrap();
-            writeln!(s, "                unsigned nn = half * {}u + c;", d / 2).unwrap();
+        };
+        if kw > 1 {
+            // groups 1.. hand their (m, l, O) to group 0 through shared memory
+            let (mo, lo, oo) = (0, kw * R, 2 * kw * R);
+            writeln!(s, "    __syncthreads();").unwrap();
+            writeln!(s, "    if (gq < 8u && tq == 0u) {{").unwrap();
+            writeln!(s, "        for (int h = 0; h < 2; h++) {{").unwrap();
+            writeln!(s, "            unsigned lr = wrow + gq + 8u * h;").unwrap();
+            writeln!(s, "            smem[{mo}u + wg * {R}u + lr] = m_row[h];").unwrap();
+            writeln!(s, "            smem[{lo}u + wg * {R}u + lr] = l_row[h];").unwrap();
+            writeln!(s, "        }}").unwrap();
+            writeln!(s, "    }}").unwrap();
+            writeln!(s, "    if (wg > 0u) {{").unwrap();
+            frag_loop(&mut s);
+            writeln!(
+                s,
+                "        smem[{oo}u + ((wg - 1u) * {R}u + lr) * {ldo}u + lc] = o[j][r];"
+            )
+            .unwrap();
+            writeln!(s, "    }}").unwrap();
+            writeln!(s, "    }}").unwrap();
+            writeln!(s, "    __syncthreads();").unwrap();
+            writeln!(s, "    if (wg > 0u) return;").unwrap();
+            writeln!(s, "    float sc_g[{kw}][2];").unwrap();
+            writeln!(s, "    #pragma unroll").unwrap();
+            writeln!(s, "    for (int h = 0; h < 2; h++) {{").unwrap();
+            writeln!(s, "        unsigned lr = wrow + gq + 8u * h;").unwrap();
+            writeln!(s, "        float mx = m_row[h];").unwrap();
+            writeln!(
+                s,
+                "        for (int g = 1; g < {kw}; g++) mx = fmaxf(mx, smem[{mo}u + g * {R}u + lr]);"
+            )
+            .unwrap();
+            writeln!(s, "        float l = 0.0f;").unwrap();
+            writeln!(s, "        for (int g = 0; g < {kw}; g++) {{").unwrap();
+            writeln!(
+                s,
+                "            float mg = g == 0 ? m_row[h] : smem[{mo}u + g * {R}u + lr];"
+            )
+            .unwrap();
+            writeln!(
+                s,
+                "            float lg = g == 0 ? l_row[h] : smem[{lo}u + g * {R}u + lr];"
+            )
+            .unwrap();
+            writeln!(
+                s,
+                "            sc_g[g][h] = expf(mg - mx); l += lg * sc_g[g][h];"
+            )
+            .unwrap();
+            writeln!(s, "        }}").unwrap();
+            writeln!(s, "        m_row[h] = mx; l_row[h] = l;").unwrap();
+            writeln!(s, "    }}").unwrap();
+            frag_loop(&mut s);
+            writeln!(s, "        float acc = o[j][r] * sc_g[0][r / 2];").unwrap();
+            writeln!(
+                s,
+                "        for (int g = 1; g < {kw}; g++) acc += smem[{oo}u + ((g - 1) * {R}u + lr) * {ldo}u + lc] * sc_g[g][r / 2];"
+            )
+            .unwrap();
+            writeln!(s, "        o[j][r] = acc;").unwrap();
+            writeln!(s, "    }}").unwrap();
+        }
+        // the output per (row, lane): the state, or the normalizer
+        frag_loop(&mut s);
+        writeln!(s, "        unsigned nn = lc;").unwrap();
+        row_coords(&mut s, "        ", "lr");
+        writeln!(
+            s,
+            "        float m_v = m_row[r / 2], l_v = l_row[r / 2], acc_v = o[j][r];"
+        )
+        .unwrap();
+        writeln!(s, "        if (ii < {}u) {{", f.m).unwrap();
+        if !f.epilogue {
+            // the root is the reduction: its (m, l, acc) state per point
             let mut flat = String::from("0u");
             for (dd, &np) in f.pts.iter().enumerate() {
                 flat = format!("({flat}) * {np}u + (unsigned)({})", coord(dd));
             }
-            writeln!(s, "                unsigned g = {flat};").unwrap();
-            writeln!(s, "                out[g * {w_out}u + 0u] = m_row;").unwrap();
-            writeln!(s, "                out[g * {w_out}u + 1u] = l_row;").unwrap();
-            writeln!(
-                s,
-                "                out[g * {w_out}u + 2u] = Os[row * {ldo}u + nn];"
-            )
-            .unwrap();
-            writeln!(s, "            }}").unwrap();
-            writeln!(s, "        }}").unwrap();
-            writeln!(s, "    }}").unwrap();
-            writeln!(s, "}}").unwrap();
-            return Some(s);
-        }
-        // epilogue: the normalizer at (ii, nn), written in root's layout
-        let ep = self.epilogue_read(c, f.red_node)?;
-        // root coord for each root dim: the reduction dim whose form picks it
-        let root_rank = c.points().len();
-        let mut root_coord: Vec<Option<String>> = vec![None; root_rank];
-        for (rdim, fm) in ep.iter().enumerate() {
-            if let Some(d) = (0..root_rank).find(|&d| fm.coefs[d] != 0) {
-                root_coord[d] = Some(coord(rdim));
+            writeln!(s, "            unsigned g = {flat};").unwrap();
+            writeln!(s, "            out[g * {w_out}u + 0u] = m_v;").unwrap();
+            writeln!(s, "            out[g * {w_out}u + 1u] = l_v;").unwrap();
+            writeln!(s, "            out[g * {w_out}u + 2u] = acc_v;").unwrap();
+        } else {
+            // the normalizer at (ii, nn), written in root's layout
+            let ep = self.epilogue_read(c, f.red_node)?;
+            let root_rank = c.points().len();
+            let mut root_coord: Vec<Option<String>> = vec![None; root_rank];
+            for (rdim, fm) in ep.iter().enumerate() {
+                if let Some(dd) = (0..root_rank).find(|&dd| fm.coefs[dd] != 0) {
+                    root_coord[dd] = Some(coord(rdim));
+                }
             }
-        }
-        let root_coord: Vec<String> = root_coord.into_iter().collect::<Option<_>>()?;
-        writeln!(s, "    {{").unwrap();
-        row_coords(&mut s, "        ", "row");
-        writeln!(s, "        if (ii < {}u) {{", f.m).unwrap();
-        writeln!(
-            s,
-            "            for (unsigned c = 0; c < {}u; c++) {{",
-            d / 2
-        )
-        .unwrap();
-        writeln!(s, "                unsigned nn = half * {}u + c;", d / 2).unwrap();
-        writeln!(s, "                float acc_v = Os[row * {ldo}u + nn];").unwrap();
-        {
+            let root_coord: Vec<String> = root_coord.into_iter().collect::<Option<_>>()?;
             let rcoord = |dim: usize| root_coord[dim].clone();
             let vals: Vec<String> = c
                 .args
@@ -1999,8 +2320,8 @@ impl TensorGraph {
                 .map(|a| {
                     if a.src.n() == f.red_node {
                         match self.epilogue_slot(a) {
-                            0 => "m_row".to_string(),
-                            1 => "l_row".to_string(),
+                            0 => "m_v".to_string(),
+                            1 => "l_v".to_string(),
                             _ => "acc_v".to_string(),
                         }
                     } else {
@@ -2013,29 +2334,17 @@ impl TensorGraph {
                     }
                 })
                 .collect();
-            let mut body = String::new();
-            let outs = emit_scalar(&mut body, &c.body, &c.body_outs, "e0_", &|v| {
-                vals[v as usize].clone()
-            });
-            for line in body.lines() {
-                writeln!(
-                    s,
-                    "                {}",
-                    float_literals(&line.replacen("let ", "float ", 1))
-                )
-                .unwrap();
-            }
+            let outs = emit_body(&mut s, "            ", &c.body, &c.body_outs, "e0_", &vals);
             let pts_root = super::fixed(c.points());
             let mut flat = String::from("0u");
             for (dd, &np) in pts_root.iter().enumerate() {
                 flat = format!("({flat}) * {np}u + (unsigned)({})", root_coord[dd]);
             }
-            writeln!(s, "                unsigned g = {flat};").unwrap();
+            writeln!(s, "            unsigned g = {flat};").unwrap();
             for (slot, v) in outs.iter().enumerate() {
-                writeln!(s, "                out[g * {w_out}u + {slot}u] = {v};").unwrap();
+                writeln!(s, "            out[g * {w_out}u + {slot}u] = {v};").unwrap();
             }
         }
-        writeln!(s, "            }}").unwrap();
         writeln!(s, "        }}").unwrap();
         writeln!(s, "    }}").unwrap();
         writeln!(s, "}}").unwrap();
