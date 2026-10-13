@@ -5,6 +5,12 @@
 //!
 //!   opencl_export export ROOT [CASE...]   # ROOT/CASE/{manifest.txt,k*.cl,in*.bin,ref*.bin}
 //!   opencl_export check  ROOT [CASE...]   # reads ROOT/CASE/out*.bin (+ times.txt)
+//!   opencl_export tune-export ROOT CASE... # + every kernel's schedule candidates
+//!   opencl_export tune-pick ROOT CACHE_DIR CASE... # fastest correct one per kernel
+//!
+//! With `TANG_CL_TUNING=CACHE_DIR`, `export` applies `CACHE_DIR/CASE.txt`
+//! (a `TuningCache` keyed by the device name in `CACHE_DIR/device.txt` and
+//! the untuned OpenCL sources) when its key matches.
 //!
 //! Cases: `mm1024_<sched>`, `mm512_<sched>` (512×576×1536) for every
 //! matmul candidate, `block128` (SmolLM-shaped block forward), `train128`
@@ -13,7 +19,8 @@
 use std::fmt::Write as _;
 use std::path::Path;
 use tang_bench::ir_block::{compiled_block, train_loss_graph, BlockDims};
-use tang_compile::tensor::{Format, TensorGraph, TensorId};
+use tang_bench::ir_gpu::TuningCache;
+use tang_compile::tensor::{Format, ScheduleCandidate, TensorGraph, TensorId};
 
 struct Case {
     name: String,
@@ -146,16 +153,25 @@ fn cases(filter: &[String]) -> Vec<Case> {
             reference: None,
         });
     }
-    if want("gru") {
+    if want("gru") || want("grufused") {
         for (batch, obs, hidden) in [(1usize, 64usize, 256usize), (64, 64, 256)] {
             let (g, outs) = gru_step(batch, obs, hidden);
             let mut rng = tang_bench::Rng::new(7);
-            let inputs = input_lens(&g, &outs)
+            let inputs: Vec<Vec<f32>> = input_lens(&g, &outs)
                 .into_iter()
                 .map(|n| rand(&mut rng, n, 0.2))
                 .collect();
             out.push(Case {
                 name: format!("gru_b{batch}"),
+                flops: 2.0 * (batch * 3 * hidden * (obs + hidden)) as f64,
+                g,
+                outs,
+                inputs: inputs.clone(),
+                reference: None,
+            });
+            let (g, outs) = gru_fused(batch, obs, hidden);
+            out.push(Case {
+                name: format!("grufused_b{batch}"),
                 flops: 2.0 * (batch * 3 * hidden * (obs + hidden)) as f64,
                 g,
                 outs,
@@ -225,6 +241,94 @@ fn gru_step(batch: usize, obs: usize, hidden: usize) -> (TensorGraph, Vec<Tensor
     (g, outs)
 }
 
+/// The same GRU step with the input and hidden contractions concatenated
+/// along one reduce axis of `obs + hidden` (guarded views read zero past
+/// each operand's end), so all four gate sums `r, z, i_n, h_n` share a
+/// reduce space; `merge_siblings` makes them one tuple reduction whose
+/// epilogue is the gate math: one kernel per step. Same inputs as
+/// [`gru_step`].
+fn gru_fused(batch: usize, obs: usize, hidden: usize) -> (TensorGraph, Vec<TensorId>) {
+    use tang::Scalar;
+    use tang_compile::tensor::{Arg, Form, Monoid, View};
+    use tang_expr::ExprId;
+    let mut g = TensorGraph::new();
+    let x = g.input(&[batch, obs]);
+    let h = g.input(&[batch, hidden]);
+    let mut w = Vec::new();
+    for _ in 0..3 {
+        let w_i = g.input(&[obs, hidden]);
+        let w_h = g.input(&[hidden, hidden]);
+        let b_i = g.input(&[1, hidden]);
+        let b_h = g.input(&[1, hidden]);
+        w.push((w_i, w_h, b_i, b_h));
+    }
+    let k = obs + hidden;
+    let shifted = |d: usize| Form {
+        offset: -(obs as i64),
+        ..Form::unit(3, d)
+    };
+    let xv = || View {
+        forms: vec![Form::unit(3, 0), Form::unit(3, 2)],
+        guard: true,
+    };
+    let hv = || View {
+        forms: vec![Form::unit(3, 0), shifted(2)],
+        guard: true,
+    };
+    let wiv = || View {
+        forms: vec![Form::unit(3, 2), Form::unit(3, 1)],
+        guard: true,
+    };
+    let whv = || View {
+        forms: vec![shifted(2), Form::unit(3, 1)],
+        guard: true,
+    };
+    let mut sum = |g: &mut TensorGraph, args: Vec<Arg>| {
+        let two = args.len() == 4;
+        g.comp(&[batch, hidden], &[k], args, Some(Monoid::sum()), |v| {
+            if two {
+                vec![v[0] * v[1] + v[2] * v[3]]
+            } else {
+                vec![v[0] * v[1]]
+            }
+        })
+        .unwrap()
+    };
+    let a = |src, view| Arg { src, view };
+    let r = sum(
+        &mut g,
+        vec![a(x, xv()), a(w[0].0, wiv()), a(h, hv()), a(w[0].1, whv())],
+    );
+    let z = sum(
+        &mut g,
+        vec![a(x, xv()), a(w[1].0, wiv()), a(h, hv()), a(w[1].1, whv())],
+    );
+    let i_n = sum(&mut g, vec![a(x, xv()), a(w[2].0, wiv())]);
+    let h_n = sum(&mut g, vec![a(h, hv()), a(w[2].1, whv())]);
+    let bias: Vec<TensorId> = w
+        .iter()
+        .flat_map(|&(_, _, b_i, b_h)| [b_i, b_h])
+        .map(|b| g.broadcast(b, &[batch, hidden]).unwrap())
+        .collect();
+    let one = || ExprId::from_f64(1.0);
+    let sigmoid = |e: ExprId| one() / (one() + (-e).exp());
+    let mut ins = vec![r, z, i_n, h_n, h];
+    ins.extend(&bias);
+    let h_next = g
+        .map(&ins, |v| {
+            let r = sigmoid(v[0] + v[5] + v[6]);
+            let z = sigmoid(v[1] + v[7] + v[8]);
+            let n = (v[2] + v[9] + r * (v[3] + v[10])).tanh();
+            (one() - z) * n + z * v[4]
+        })
+        .unwrap();
+    let (g, outs) = g.substitute_maps(&[h_next]);
+    let (g, outs) = g.eliminate_common(&outs);
+    let (mut g, outs) = g.merge_siblings(&outs);
+    g.schedule_auto(&outs);
+    (g, outs)
+}
+
 fn bytes_of(format: Format, len: usize) -> usize {
     match format {
         Format::F32 => 4 * len,
@@ -232,7 +336,107 @@ fn bytes_of(format: Format, len: usize) -> usize {
     }
 }
 
-fn export(root: &Path, c: &Case) {
+/// Schedules worth timing on a small-CU GPU for `t`: tang-compile's
+/// candidates plus, for matmul-shaped tiles, register tiles up to 8×8,
+/// shorter k chunks and 8×8-thread groups (more, smaller work-groups), and
+/// for workgroup splits, 64 and 128 threads.
+fn adreno_candidates(g: &TensorGraph, t: TensorId) -> Vec<ScheduleCandidate> {
+    let mut out = g.schedule_candidates(t);
+    if out.contains(&(0, (16, 16, 32), (1, 1))) {
+        for tile in [
+            (16, 16, 32),
+            (16, 16, 16),
+            (16, 16, 8),
+            (8, 8, 32),
+            (8, 8, 16),
+        ] {
+            for reg in [(2, 2), (4, 4), (4, 8), (8, 4), (8, 8)] {
+                out.push((0, tile, reg));
+            }
+        }
+    }
+    if out.iter().any(|c| c.0 == 256) {
+        out.push((64, (0, 0, 0), (1, 1)));
+        out.push((128, (0, 0, 0), (1, 1)));
+    }
+    let mut seen = Vec::new();
+    out.retain(|c| {
+        let new = !seen.contains(c);
+        seen.push(*c);
+        new
+    });
+    out
+}
+
+fn schedule_of(g: &TensorGraph, t: TensorId) -> ScheduleCandidate {
+    let n = &g.nodes()[t.index()];
+    (n.split, n.tile, n.reg)
+}
+
+/// f16-storage variants of a case (the precision schedule of #36/#55,
+/// enumerated rather than searched: the device is offline): `_hops`
+/// stores every register-tile operand (matmul inputs, weights included)
+/// in f16, `_hall` every buffer but the outputs. Arithmetic and
+/// accumulation stay f32. Error is still measured against the f64 `eval`.
+fn f16_variants(c: &Case) -> Vec<Case> {
+    use tang_compile::tensor::Precision;
+    let ops: Vec<TensorId> = tang_bench::ir_precision::moves(&c.g, &c.outs, &c.outs)
+        .into_iter()
+        .next()
+        .map(|m| m.buffers)
+        .unwrap_or_default();
+    let all: Vec<TensorId> =
+        c.g.to_opencl(&c.outs)
+            .buffers
+            .iter()
+            .map(|b| b.node)
+            .filter(|n| !c.outs.iter().any(|o| c.g.storage(*o) == *n))
+            .collect();
+    [("hops", ops), ("hall", all)]
+        .into_iter()
+        .filter(|(_, b)| !b.is_empty())
+        .map(|(tag, bufs)| {
+            let mut g = c.g.clone();
+            for b in bufs {
+                g.set_precision(b, Precision::storage(Format::F16));
+            }
+            Case {
+                name: format!("{}_{tag}", c.name),
+                g,
+                outs: c.outs.clone(),
+                flops: c.flops,
+                inputs: c.inputs.clone(),
+                reference: c.reference.clone(),
+            }
+        })
+        .collect()
+}
+
+/// Apply `CACHE_DIR/CASE.txt` if `TANG_CL_TUNING` is set and the key matches.
+fn apply_tuning(c: &mut Case) {
+    let Ok(dir) = std::env::var("TANG_CL_TUNING") else {
+        return;
+    };
+    let dir = Path::new(&dir);
+    let Ok(device) = std::fs::read_to_string(dir.join("device.txt")) else {
+        return;
+    };
+    let cache = TuningCache::new(dir.join(format!("{}.txt", c.name)));
+    let key = TuningCache::key_with(device.trim(), &c.g, &c.outs, |g, o| g.to_opencl(o));
+    if let Some(entries) = cache.load(key) {
+        for (node, split, tile, reg) in &entries {
+            c.g.set_schedule(TensorId::from_index(*node), *split, *tile, *reg);
+        }
+        println!(
+            "{}: {} tuned kernels from {}",
+            c.name,
+            entries.len(),
+            cache.path.display()
+        );
+    }
+}
+
+fn export(root: &Path, c: &Case, tune: bool) {
     let dir = root.join(&c.name);
     std::fs::create_dir_all(&dir).unwrap();
     let p = c.g.to_opencl(&c.outs);
@@ -246,9 +450,17 @@ fn export(root: &Path, c: &Case) {
         let input = b.input.map_or(-1, |k| k as i64);
         writeln!(m, "b {} {input}", bytes_of(b.format, b.len)).unwrap();
         if let Some(k) = b.input {
-            assert_eq!(b.format, Format::F32, "f32 inputs only");
-            let data: Vec<u8> = c.inputs[k].iter().flat_map(|x| x.to_le_bytes()).collect();
-            assert_eq!(data.len(), 4 * b.len);
+            let data: Vec<u8> = match b.format {
+                Format::F32 => c.inputs[k].iter().flat_map(|x| x.to_le_bytes()).collect(),
+                Format::F16 => c.inputs[k]
+                    .iter()
+                    .flat_map(|&x| {
+                        tang_compile::tensor::precision::f16_bits(x as f64).to_le_bytes()
+                    })
+                    .collect(),
+                f => panic!("{f:?} inputs"),
+            };
+            assert_eq!(data.len(), bytes_of(b.format, b.len));
             std::fs::write(dir.join(format!("in{k}.bin")), data).unwrap();
         }
     }
@@ -276,6 +488,73 @@ fn export(root: &Path, c: &Case) {
     writeln!(m, "outputs {}", c.outs.len()).unwrap();
     for (o, &t) in c.outs.iter().enumerate() {
         writeln!(m, "o {} out{o}.bin", buf_index(t)).unwrap();
+    }
+    if tune {
+        // every base kernel's alternatives, writing the same buffer
+        let mut lines = Vec::new();
+        let mut meta = String::new();
+        let mut files: Vec<String> = Vec::new();
+        for (i, k) in p.kernels.iter().enumerate() {
+            let cur = schedule_of(&c.g, k.node);
+            for s in adreno_candidates(&c.g, k.node) {
+                if s == cur {
+                    continue;
+                }
+                let mut g = c.g.clone();
+                g.set_schedule(k.node, s.0, s.1, s.2);
+                let p2 = g.to_opencl(&c.outs);
+                let Some(k2) = p2.kernels.iter().find(|k2| k2.node == k.node) else {
+                    continue;
+                };
+                if k2.source == k.source && k2.workgroup_size == k.workgroup_size {
+                    continue;
+                }
+                let file = match files.iter().position(|f| {
+                    std::fs::read_to_string(dir.join(f)).is_ok_and(|x| x == k2.source)
+                }) {
+                    Some(j) => files[j].clone(),
+                    None => {
+                        let f = format!("c{:03}.cl", files.len());
+                        std::fs::write(dir.join(&f), &k2.source).unwrap();
+                        files.push(f.clone());
+                        f
+                    }
+                };
+                let args: Vec<String> = k2
+                    .reads
+                    .iter()
+                    .chain(std::iter::once(&k2.node))
+                    .map(|&t| buf_index(t).to_string())
+                    .collect();
+                writeln!(
+                    meta,
+                    "{} {i} {} {} {} {} {} {} {}",
+                    lines.len(),
+                    k.node.index(),
+                    s.0,
+                    s.1 .0,
+                    s.1 .1,
+                    s.1 .2,
+                    s.2 .0,
+                    s.2 .1
+                )
+                .unwrap();
+                lines.push(format!(
+                    "c {i} {file} {} {} {} {} {}",
+                    k2.workgroup_size,
+                    k2.count,
+                    k2.points,
+                    args.len(),
+                    args.join(" ")
+                ));
+            }
+        }
+        writeln!(m, "candidates {}", lines.len()).unwrap();
+        for l in &lines {
+            writeln!(m, "{l}").unwrap();
+        }
+        std::fs::write(dir.join("cands.txt"), meta).unwrap();
+        println!("{}: {} candidates", c.name, lines.len());
     }
     std::fs::write(dir.join("manifest.txt"), m).unwrap();
     // the f64 reference is kept across re-exports (same seeded inputs)
@@ -323,6 +602,9 @@ fn check(root: &Path, name: &str) {
         .find_map(|l| l.strip_prefix("program "))
         .map_or(f64::NAN, |v| v.parse().unwrap());
     let (mut err, mut scale) = (0.0f64, 0.0f64);
+    // worst output relative to its own max |ref| (a small gradient next
+    // to a large one is invisible in the pooled figure)
+    let mut worst_own = 0.0f64;
     let mut o = 0;
     while dir.join(format!("ref{o}.bin")).exists() {
         let want = read_f64(&dir.join(format!("ref{o}.bin")));
@@ -337,22 +619,102 @@ fn check(root: &Path, name: &str) {
             }
         };
         assert_eq!(got.len(), want.len(), "{name} output {o} length");
+        let mut own = 0.0f64;
         for (&g, &w) in got.iter().zip(&want) {
             let e = (g as f64 - w).abs();
-            err = if e.is_nan() {
-                f64::INFINITY
-            } else {
-                err.max(e)
-            };
+            let e = if e.is_nan() { f64::INFINITY } else { e };
+            err = err.max(e);
+            own = own.max(e);
         }
-        scale = want.iter().fold(scale, |s, w| s.max(w.abs()));
+        let own_scale = want.iter().fold(0.0f64, |s, w| s.max(w.abs()));
+        worst_own = worst_own.max(own / own_scale.max(1e-30));
+        scale = scale.max(own_scale);
         o += 1;
     }
     let gflops = flops / (prog_ms * 1e-3) / 1e9;
     println!(
-        "{name:16} {prog_ms:9.3} ms  {gflops:7.1} GFLOP/s  max err {err:.2e}  (max |ref| {scale:.2}, rel {:.1e})",
+        "{name:20} {prog_ms:9.3} ms  {gflops:7.1} GFLOP/s  max err {err:.2e}  (max |ref| {scale:.2}, rel {:.1e}, worst output rel {worst_own:.1e})",
         err / scale.max(1e-30)
     );
+}
+
+/// Pick each kernel's fastest candidate that matches the base output
+/// (relative error ≤ 1e-4 — f32 reassociation, not a different answer) and
+/// beats the base kernel; write them as a `TuningCache`.
+fn tune_pick(root: &Path, cache_dir: &Path, c: &Case) {
+    let dir = root.join(&c.name);
+    let tune = std::fs::read_to_string(dir.join("tune.txt")).expect("tune.txt");
+    let times = std::fs::read_to_string(dir.join("times.txt")).expect("times.txt");
+    let meta = std::fs::read_to_string(dir.join("cands.txt")).expect("cands.txt");
+    let device = tune
+        .lines()
+        .find_map(|l| l.strip_prefix("device "))
+        .expect("device line")
+        .trim()
+        .to_string();
+    let base: Vec<f64> = times
+        .lines()
+        .filter_map(|l| l.strip_prefix("kernel "))
+        .map(|l| l.split_whitespace().nth(1).unwrap().parse().unwrap())
+        .collect();
+    let mut timed = std::collections::HashMap::new();
+    for l in tune.lines().filter_map(|l| l.strip_prefix("c ")) {
+        let v: Vec<&str> = l.split_whitespace().collect();
+        if let (Some(ms), Some(err)) = (v.get(1), v.get(2)) {
+            if let (Ok(ms), Ok(err)) = (ms.parse::<f64>(), err.parse::<f64>()) {
+                timed.insert(v[0].parse::<usize>().unwrap(), (ms, err));
+            }
+        }
+    }
+    let p = c.g.to_opencl(&c.outs);
+    let mut best: Vec<(f64, ScheduleCandidate)> = p
+        .kernels
+        .iter()
+        .enumerate()
+        .map(|(i, k)| (base[i], schedule_of(&c.g, k.node)))
+        .collect();
+    let (mut wrong, mut n) = (0, 0);
+    for l in meta.lines() {
+        let v: Vec<u32> = l.split_whitespace().map(|x| x.parse().unwrap()).collect();
+        let (ci, ki) = (v[0] as usize, v[1] as usize);
+        let s = (v[3], (v[4], v[5], v[6]), (v[7], v[8]));
+        let Some(&(ms, err)) = timed.get(&ci) else {
+            continue;
+        };
+        n += 1;
+        if err > 1e-4 {
+            wrong += 1;
+            continue;
+        }
+        if ms < best[ki].0 {
+            best[ki] = (ms, s);
+        }
+    }
+    let before: f64 = base.iter().sum();
+    let after: f64 = best.iter().map(|b| b.0).sum();
+    println!(
+        "{}: {n} candidates timed ({wrong} wrong), sum of kernels {before:.3} -> {after:.3} ms",
+        c.name
+    );
+    for (i, k) in p.kernels.iter().enumerate() {
+        let cur = schedule_of(&c.g, k.node);
+        if best[i].1 != cur {
+            println!(
+                "  k{i:<3} {:8.3} -> {:8.3} ms  {cur:?} -> {:?}",
+                base[i], best[i].0, best[i].1
+            );
+        }
+    }
+    let entries: Vec<_> = p
+        .kernels
+        .iter()
+        .zip(&best)
+        .map(|(k, b)| (k.node.index(), b.1 .0, b.1 .1, b.1 .2))
+        .collect();
+    std::fs::create_dir_all(cache_dir).unwrap();
+    std::fs::write(cache_dir.join("device.txt"), format!("{device}\n")).unwrap();
+    let key = TuningCache::key_with(&device, &c.g, &c.outs, |g, o| g.to_opencl(o));
+    TuningCache::new(cache_dir.join(format!("{}.txt", c.name))).store_entries(key, &entries);
 }
 
 fn main() {
@@ -362,9 +724,24 @@ fn main() {
         _ => panic!("usage: opencl_export export|check ROOT [CASE...]"),
     };
     match cmd {
-        "export" => {
-            for c in cases(&filter) {
-                export(root, &c);
+        "export" | "tune-export" => {
+            let f16 = std::env::var("TANG_CL_F16").is_ok();
+            for mut c in cases(&filter) {
+                apply_tuning(&mut c);
+                export(root, &c, cmd == "tune-export");
+                if f16 {
+                    for v in f16_variants(&c) {
+                        export(root, &v, false);
+                    }
+                }
+            }
+        }
+        "tune-pick" => {
+            let (cache_dir, filter) = filter
+                .split_first()
+                .expect("tune-pick ROOT CACHE_DIR CASE...");
+            for c in cases(filter) {
+                tune_pick(root, Path::new(cache_dir), &c);
             }
         }
         "check" => {
