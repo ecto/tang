@@ -238,6 +238,35 @@ impl TensorGraph {
         if n_outs * fm * fnn * 4 > 128 {
             return None;
         }
+        // contractions nested in a map operand (S = Q·Kᵀ in dS): per
+        // staged operand, A stages first, then B
+        let rc = self.comp_at(red_node)?;
+        let rank = rc.rank();
+        let nwarps = sh.warps_m * sh.warps_n;
+        let lds = chunk + 4;
+        let mut nested: Vec<Vec<Nested>> = Vec::new();
+        let mut nest_regs = 0;
+        let mut scratch_floats = 0;
+        for (side_a, stages) in [(true, &a_stages), (false, &b_stages)] {
+            for (_, _, map) in stages.iter() {
+                let (pdim, block) = if side_a { (dy, bm) } else { (dx, bn) };
+                let plan = match map {
+                    Some(v) => self.nested_plan(rc, rank, *v, pdim, kdim, reads)?,
+                    None => Vec::new(),
+                };
+                if !plan.is_empty() && (block % nwarps != 0 || (block / nwarps) % 16 != 0) {
+                    return None;
+                }
+                for nst in &plan {
+                    nest_regs += nst.terms.len() * (block / nwarps / 16) * (nst.e / 8) * 4;
+                    scratch_floats += block * lds;
+                }
+                nested.push(plan);
+            }
+        }
+        if nest_regs > 96 {
+            return None;
+        }
         let storage = |j: usize| self.storage(TensorId(j as u32)).n();
         let tiles_x = n.div_ceil(bn);
         let tiles_y = m.div_ceil(bm);
@@ -248,7 +277,21 @@ impl TensorGraph {
         let a_floats = bm * lda;
         let b_floats = chunk * ldb;
         let stage_floats = a_stages.len() * a_floats + b_stages.len() * b_floats;
-        let smem_floats = sh.stages * stage_floats;
+        let scratch0 = sh.stages * stage_floats;
+        let scratch_off: Vec<usize> = {
+            let mut at = 0;
+            nested
+                .iter()
+                .enumerate()
+                .map(|(o, plan)| {
+                    let block = if o < a_stages.len() { bm } else { bn };
+                    let here = at;
+                    at += plan.len() * block * lds;
+                    here
+                })
+                .collect()
+        };
+        let smem_floats = scratch0 + scratch_floats;
         // dynamic shared memory, within the 3090's 99 KB per block
         if smem_floats * 4 > 99 * 1024 {
             // Many distinct operands (a multi-output, multi-term tile such
@@ -346,8 +389,6 @@ impl TensorGraph {
         for (t, (_, addr, _)) in b_stages.iter().enumerate() {
             writeln!(s, "    int base_b{t} = {};", lead_term(addr)).unwrap();
         }
-        let rc = self.comp_at(red_node)?;
-        let rank = rc.rank();
         writeln!(s, "    unsigned tid = threadIdx.x;").unwrap();
         writeln!(s, "    unsigned warp = tid / 32u;").unwrap();
         writeln!(s, "    unsigned lane = tid % 32u;").unwrap();
@@ -357,12 +398,62 @@ impl TensorGraph {
         writeln!(s, "    float acc[{n_outs}][{fm}][{fnn}][4];").unwrap();
         writeln!(s, "    #pragma unroll").unwrap();
         writeln!(s, "    for (int w = 0; w < {n_outs}; w++) for (int i = 0; i < {fm}; i++) for (int j = 0; j < {fnn}; j++) for (int r = 0; r < 4; r++) acc[w][i][j][r] = 0.0f;").unwrap();
+        // The side of each nested contraction that does not move with k
+        // (the staged operand's own rows: K for S in dK) is held in mma A
+        // fragments for the whole kernel; warp w owns rows rpw·w … of
+        // the block. k slots (tq, tq + 4) take e = 8q + 2tq, +1, the
+        // pairing the flash forward uses, so S is the same sum it was.
+        let n_a_stages = a_stages.len();
+        for (o, plan) in nested.iter().enumerate() {
+            let (origin, extent, block) = if o < n_a_stages {
+                ("row0", m, bm)
+            } else {
+                ("col0", n, bn)
+            };
+            let nfm = block / nwarps / 16;
+            for (q, nst) in plan.iter().enumerate() {
+                let ne = nst.e / 8;
+                for (t, term) in nst.terms.iter().enumerate() {
+                    let name = format!("nf{o}_{q}_{t}");
+                    writeln!(s, "    unsigned {name}[{nfm}][{ne}][4];").unwrap();
+                    let (cp, ce) = (term.p_addr.coefs[nst.pdim], term.p_addr.coefs[rank]);
+                    let base = lead_term(&term.p_addr);
+                    writeln!(s, "    #pragma unroll").unwrap();
+                    writeln!(s, "    for (int i = 0; i < {nfm}; i++)").unwrap();
+                    writeln!(s, "    #pragma unroll").unwrap();
+                    writeln!(s, "    for (int q = 0; q < {ne}; q++)").unwrap();
+                    writeln!(s, "    #pragma unroll").unwrap();
+                    writeln!(s, "    for (int r = 0; r < 4; r++) {{").unwrap();
+                    writeln!(
+                        s,
+                        "        unsigned gp = {origin} + warp * {}u + 16u * i + gq + 8u * (r % 2);",
+                        block / nwarps
+                    )
+                    .unwrap();
+                    writeln!(s, "        int e = 8 * q + 2 * (int)tq + r / 2;").unwrap();
+                    writeln!(
+                        s,
+                        "        float x = gp < {extent}u ? b{}[(unsigned)({base} + {cp} * (int)gp + {ce} * e)] : 0.0f;",
+                        term.p_buf
+                    )
+                    .unwrap();
+                    let scale = if term.coef == 1.0 {
+                        String::new()
+                    } else {
+                        format!("{:?}f * ", term.coef as f32)
+                    };
+                    writeln!(s, "        {name}[i][q][r] = tang_tf32({scale}x);").unwrap();
+                    writeln!(s, "    }}").unwrap();
+                }
+            }
+        }
 
         // staging of one chunk into buffer `buf`, walking the global
         // buffer in address order
         writeln!(s, "    auto load = [&](unsigned buf, unsigned k0) {{").unwrap();
         writeln!(s, "        float* st = smem + buf * {stage_floats}u;").unwrap();
         let stage = |s: &mut String,
+                     o: usize,
                      off: usize,
                      base: &str,
                      addr: &super::msl_mma::Addr,
@@ -454,6 +545,50 @@ impl TensorGraph {
                 writeln!(s, "        }}").unwrap();
                 return;
             }
+            // nested contractions: this chunk's block of each, by mma,
+            // into scratch rows (block) × columns (chunk)
+            let plan = &nested[o];
+            let mut scratch_at: Vec<Option<usize>> =
+                vec![None; map.map_or(0, |v| self.comp_at(rc.args[v].src.n()).unwrap().args.len())];
+            if !plan.is_empty() {
+                let nfm = block / nwarps / 16;
+                let nfn = chunk / 8;
+                writeln!(s, "        __syncthreads();").unwrap();
+                for (q, nst) in plan.iter().enumerate() {
+                    let at = scratch0 + scratch_off[o] + q * block * lds;
+                    scratch_at[nst.arg] = Some(at);
+                    let ne = nst.e / 8;
+                    writeln!(s, "        {{").unwrap();
+                    writeln!(s, "        float ra[{nfm}][{nfn}][4];").unwrap();
+                    writeln!(s, "        #pragma unroll").unwrap();
+                    writeln!(s, "        for (int i = 0; i < {nfm}; i++) for (int j = 0; j < {nfn}; j++) for (int r = 0; r < 4; r++) ra[i][j][r] = 0.0f;").unwrap();
+                    for (t, term) in nst.terms.iter().enumerate() {
+                        let (ck, ce) = (term.k_addr.coefs[kdim], term.k_addr.coefs[rank]);
+                        let base = lead_term(&term.k_addr);
+                        writeln!(s, "        #pragma unroll").unwrap();
+                        writeln!(s, "        for (int q = 0; q < {ne}; q++)").unwrap();
+                        writeln!(s, "        #pragma unroll").unwrap();
+                        writeln!(s, "        for (int j = 0; j < {nfn}; j++) {{").unwrap();
+                        writeln!(s, "            unsigned gk = k0 + 8u * j + gq; int e = 8 * q + 2 * (int)tq;").unwrap();
+                        writeln!(s, "            bool ok = gk < {k_total}u;").unwrap();
+                        writeln!(s, "            const float* src = b{} + (ok ? (unsigned)({base} + {ck} * (int)gk + {ce} * e) : 0u);", term.k_buf).unwrap();
+                        writeln!(s, "            unsigned kf[2] = {{tang_tf32(ok ? src[0] : 0.0f), tang_tf32(ok ? src[{ce}] : 0.0f)}};").unwrap();
+                        writeln!(s, "            #pragma unroll").unwrap();
+                        writeln!(s, "            for (int i = 0; i < {nfm}; i++) tang_mma(ra[i][j], nf{o}_{q}_{t}[i][q], kf);").unwrap();
+                        writeln!(s, "        }}").unwrap();
+                    }
+                    writeln!(s, "        #pragma unroll").unwrap();
+                    writeln!(s, "        for (int i = 0; i < {nfm}; i++) for (int j = 0; j < {nfn}; j++) for (int r = 0; r < 4; r++)").unwrap();
+                    writeln!(
+                        s,
+                        "            smem[{at}u + (warp * {}u + 16u * i + gq + 8u * (r / 2)) * {lds}u + 8u * j + 2u * tq + (r % 2)] = ra[i][j][r];",
+                        block / nwarps
+                    )
+                    .unwrap();
+                    writeln!(s, "        }}").unwrap();
+                }
+                writeln!(s, "        __syncthreads();").unwrap();
+            }
             let k_inner = ck.unsigned_abs() <= cp.unsigned_abs();
             writeln!(
                 s,
@@ -519,7 +654,11 @@ impl TensorGraph {
             let vals: Vec<String> = mc
                 .args
                 .iter()
-                .map(|sa| {
+                .enumerate()
+                .map(|(ai, sa)| {
+                    if let Some(at) = scratch_at[ai] {
+                        return format!("smem[{at}u + pt * {lds}u + kk]");
+                    }
                     let view = sa.view.compose(&outer.view, rank);
                     match &self.nodes[sa.src.n()].op {
                         super::Op::Iota(dd) => {
@@ -564,6 +703,7 @@ impl TensorGraph {
         for (t, (buf, addr, map)) in a_stages.iter().enumerate() {
             stage(
                 &mut s,
+                t,
                 t * a_floats,
                 &format!("base_a{t}"),
                 addr,
@@ -579,6 +719,7 @@ impl TensorGraph {
         for (t, (buf, addr, map)) in b_stages.iter().enumerate() {
             stage(
                 &mut s,
+                a_stages.len() + t,
                 a_stages.len() * a_floats + t * b_floats,
                 &format!("base_b{t}"),
                 addr,
@@ -847,6 +988,115 @@ impl TensorGraph {
 /// How many ways to split a tile's reduction (split-K): up to `target`
 /// blocks (the shape's, or `TANG_SPLITK_TARGET`) while every split keeps
 /// at least four chunks of the reduction.
+/// A sum of products `Σ_e U(row, e)·V(k, e)` nested in a staged map
+/// operand: `U` moves with the operand's rows only (held in registers),
+/// `V` with the outer reduction's k (read per chunk).
+struct Nested {
+    /// the map's arg it replaces
+    arg: usize,
+    /// the nested reduce dim's extent
+    e: usize,
+    pdim: usize,
+    terms: Vec<NestedTerm>,
+}
+
+struct NestedTerm {
+    coef: f64,
+    p_buf: usize,
+    /// addresses over the outer space plus the nested dim (last)
+    p_addr: Addr,
+    k_buf: usize,
+    k_addr: Addr,
+}
+
+impl TensorGraph {
+    /// The contractions nested in map operand `v` of `rc`, each a sum of
+    /// products of buffers splitting into a side along `pdim` (the
+    /// staged rows) and one along `kdim`. `None` when a nested arg does
+    /// not have that shape.
+    fn nested_plan(
+        &self,
+        rc: &super::Comp,
+        rank: usize,
+        v: usize,
+        pdim: usize,
+        kdim: usize,
+        reads: &[usize],
+    ) -> Option<Vec<Nested>> {
+        let storage = |j: usize| self.storage(TensorId(j as u32)).n();
+        let outer = &rc.args[v];
+        let mc = self.comp_at(outer.src.n())?;
+        let mut plan = Vec::new();
+        for (ai, sa) in mc.args.iter().enumerate() {
+            let j = sa.src.n();
+            let Some(r) = self.comp_at(j) else { continue };
+            if !self.nodes[j].inline || r.red.is_empty() {
+                continue;
+            }
+            let e = r.red[0].fixed()?;
+            if r.red.len() != 1 || !e.is_multiple_of(8) || e > 128 {
+                return None;
+            }
+            let terms = super::bilinear_terms(&r.body, r.body_outs[0])?;
+            // the nested reduction's points over the outer space, its
+            // reduce coord appended as coord `rank`
+            let pv = sa.view.compose(&outer.view, rank);
+            let inner = super::View {
+                guard: false,
+                forms: pv
+                    .forms
+                    .iter()
+                    .map(|f| {
+                        let mut f = f.clone();
+                        f.coefs.push(0);
+                        f
+                    })
+                    .chain(std::iter::once(super::Form::unit(rank + 1, rank)))
+                    .collect(),
+            };
+            let leaf = |x: u16| -> Option<(usize, Addr)> {
+                let a = &r.args[x as usize];
+                if a.view.guard || !reads.contains(&storage(a.src.n())) {
+                    return None;
+                }
+                let view = a.view.compose(&inner, rank + 1);
+                Some((
+                    storage(a.src.n()),
+                    self.flat_addr(&Arg { src: a.src, view }, rank + 1),
+                ))
+            };
+            let mut nterms = Vec::new();
+            for (coef, x, y) in terms {
+                let (bx, ax) = leaf(x)?;
+                let (by, ay) = leaf(y)?;
+                let p_side = |a: &Addr| a.coefs[kdim] == 0;
+                let k_side = |a: &Addr| a.coefs[pdim] == 0;
+                let ((p_buf, p_addr), (k_buf, k_addr)) = if p_side(&ax) && k_side(&ay) {
+                    ((bx, ax), (by, ay))
+                } else if p_side(&ay) && k_side(&ax) {
+                    ((by, ay), (bx, ax))
+                } else {
+                    return None;
+                };
+                nterms.push(NestedTerm {
+                    coef,
+                    p_buf,
+                    p_addr,
+                    k_buf,
+                    k_addr,
+                });
+            }
+            plan.push(Nested {
+                arg: ai,
+                e,
+                pdim,
+                terms: nterms,
+            });
+        }
+        Some(plan)
+    }
+}
+
 fn split_k(n_tiles: usize, k_total: usize, chunk: usize, target: usize) -> usize {
     let target: usize = std::env::var("TANG_SPLITK_TARGET")
         .ok()
