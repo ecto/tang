@@ -1193,4 +1193,78 @@ mod tests {
             }
         }
     }
+
+    /// CUDA: half tiles over transposed operands (B stored [n, k] like a
+    /// weight, A stored [k, m] like a weight gradient's activation) are
+    /// staged in their native m16n8k16 layouts and match the emulator.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_half_mma_layouts() {
+        use tang_compile::tensor::{cuda::MMA_SHAPES, Precision};
+        let Some(rt) = Runtime::cuda() else { return };
+        let (m, k, n) = (136, 200, 72);
+        for (ta, tb) in [(false, true), (true, false), (true, true)] {
+            for (f, b_f) in [
+                (Format::F16, Format::F16),
+                (Format::BF16, Format::BF16),
+                (Format::F16, Format::F32),
+            ] {
+                let mut g = TensorGraph::new();
+                let a_shape = if ta { [k, m] } else { [m, k] };
+                let a_in = g.input(&a_shape);
+                let b_shape = if tb { [n, k] } else { [k, n] };
+                let b_in = g.input(&b_shape);
+                let a = if ta {
+                    g.transpose(a_in, &[1, 0]).unwrap()
+                } else {
+                    a_in
+                };
+                let b = if tb {
+                    g.transpose(b_in, &[1, 0]).unwrap()
+                } else {
+                    b_in
+                };
+                let c = g.matmul(a, b).unwrap();
+                let (mut g, outs) = g.substitute_maps(&[c]);
+                g.schedule_auto(&outs);
+                let c = outs[0];
+                g.set_precision(a_in, Precision::storage(f));
+                g.set_precision(b_in, Precision::storage(b_f));
+                let av: Vec<f32> = (0..m * k)
+                    .map(|i| ((i * 7) % 13) as f32 * 0.1 - 0.6)
+                    .collect();
+                let bv: Vec<f32> = (0..k * n)
+                    .map(|i| ((i * 5) % 11) as f32 * 0.1 - 0.5)
+                    .collect();
+                let want = g.eval_emulated(
+                    &[
+                        av.iter().map(|&x| x as f64).collect(),
+                        bv.iter().map(|&x| x as f64).collect(),
+                    ],
+                    &[c],
+                );
+                let scale = want[0].iter().fold(0.0f64, |m, x| m.max(x.abs()));
+                let tol = if b_f == f { 1e-5 } else { 1e-3 };
+                for v in 0..MMA_SHAPES.len() {
+                    let program = g.to_cuda_variant(&[c], Some(v));
+                    assert!(
+                        program.kernels[0].source.contains("m16n8k16"),
+                        "{ta}/{tb} {f:?} variant {v} is not on half mma"
+                    );
+                    let p = Program::new(&rt, program, &[&av, &bv]);
+                    p.run(&rt);
+                    let got = p.read(&rt, c);
+                    let err = got
+                        .iter()
+                        .zip(&want[0])
+                        .map(|(x, y)| ((*x as f64) - y).abs())
+                        .fold(0.0, f64::max);
+                    assert!(
+                        err <= tol * scale,
+                        "{ta}/{tb} {f:?}/{b_f:?} v{v}: err {err:e}"
+                    );
+                }
+            }
+        }
+    }
 }

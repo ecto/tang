@@ -327,6 +327,28 @@ impl TensorGraph {
             Some(_) => (chunk + 8, sh.bn + 8),
             None => (sh.lda(), sh.ldb()),
         };
+        // Half tiles stage an operand in the layout its global reads are
+        // contiguous in. A B operand contiguous along k (a weight stored
+        // [out, in]) is staged [n][k]: m16n8k16's B fragments pair k, so
+        // each register is one 32-bit load. An A operand contiguous along
+        // m (a transposed activation in a weight gradient) is staged
+        // [k][m], its fragment rows paired so that one 32-bit word holds
+        // rows gq and gq + 8 (split with byte permutes). Every plain
+        // operand on the side must agree; the epilogue's row and column
+        // maps follow. TF32 tiles keep [m][k] and [k][n].
+        let all_plain = |stages: &[(usize, super::msl_mma::Addr, Option<usize>)],
+                         f: &dyn Fn(&super::msl_mma::Addr) -> bool| {
+            let mut plain = stages.iter().filter(|st| st.2.is_none()).peekable();
+            plain.peek().is_some() && plain.all(|st| f(&st.1))
+        };
+        let b_col =
+            half.is_some() && all_plain(&b_stages, &|a| a.coefs[kdim] == 1 && a.coefs[dx] != 1);
+        let a_pair =
+            half.is_some() && all_plain(&a_stages, &|a| a.coefs[dy] == 1 && a.coefs[kdim] != 1);
+        // shared row strides: an odd number of 16-byte units ([n][k] B,
+        // like A), ≡ 8 mod 16 halves for the row-paired [k][m] A (like B)
+        let ldat = bm + 8;
+        let ldbt = chunk + 8;
         // accumulators: n_outs × fm × fnn × 4 floats per thread
         if n_outs * fm * fnn * 4 > 128 {
             return None;
@@ -368,8 +390,8 @@ impl TensorGraph {
         let splits = split_k(n_base, k_total, chunk, sh.split_target);
         let n_tiles = n_base * splits;
         let w_out = c.width();
-        let a_floats = bm * lda;
-        let b_floats = chunk * ldb;
+        let a_floats = if a_pair { chunk * ldat } else { bm * lda };
+        let b_floats = if b_col { bn * ldbt } else { chunk * ldb };
         let stage_floats = a_stages.len() * a_floats + b_stages.len() * b_floats;
         let smem_floats = sh.stages * stage_floats;
         // dynamic shared memory, within the 3090's 99 KB per block
@@ -642,13 +664,14 @@ impl TensorGraph {
                      block: usize,
                      buf: usize,
                      map: Option<usize>,
-                     row_major: bool| {
+                     row_major: bool,
+                     ldst: usize| {
             let (cp, ck) = (addr.coefs[pdim], addr.coefs[kdim]);
             let slot = |pt: &str, kk: &str| {
                 if row_major {
-                    format!("st + {off}u + {pt} * {lda}u + {kk}")
+                    format!("st + {off}u + {pt} * {ldst}u + {kk}")
                 } else {
-                    format!("st + {off}u + {kk} * {ldb}u + {pt}")
+                    format!("st + {off}u + {kk} * {ldst}u + {pt}")
                 }
             };
             // 16-byte copies along the shared row: the global stride
@@ -956,7 +979,8 @@ impl TensorGraph {
                 bm,
                 *buf,
                 *map,
-                true,
+                !a_pair,
+                if a_pair { ldat } else { lda },
             );
         }
         for (t, (buf, addr, map)) in b_stages.iter().enumerate() {
@@ -972,7 +996,8 @@ impl TensorGraph {
                 bn,
                 *buf,
                 *map,
-                false,
+                b_col,
+                if b_col { ldbt } else { ldb },
             );
         }
         writeln!(s, "        tang_cp_commit();").unwrap();
@@ -1003,6 +1028,17 @@ impl TensorGraph {
             for t in 0..n_a {
                 writeln!(s, "        #pragma unroll").unwrap();
                 writeln!(s, "        for (int i = 0; i < {fm}; i++) {{").unwrap();
+                if a_pair {
+                    // rows gq, gq + 8 of fragment i are staged rows
+                    // 16i + 2gq, + 1: one word, both rows
+                    writeln!(s, "            const unsigned short* p = st + {}u + (({kk}) + 2u * tq) * {ldat}u + wr + 16u * i + 2u * gq;", t * a_floats).unwrap();
+                    writeln!(s, "            unsigned r0 = *(const unsigned*)p, r1 = *(const unsigned*)(p + {ldat}u);").unwrap();
+                    writeln!(s, "            unsigned r8 = *(const unsigned*)(p + {}u), r9 = *(const unsigned*)(p + {}u);", 8 * ldat, 9 * ldat).unwrap();
+                    writeln!(s, "            af[{par}][{t}][i][0] = __byte_perm(r0, r1, 0x5410); af[{par}][{t}][i][1] = __byte_perm(r0, r1, 0x7632);").unwrap();
+                    writeln!(s, "            af[{par}][{t}][i][2] = __byte_perm(r8, r9, 0x5410); af[{par}][{t}][i][3] = __byte_perm(r8, r9, 0x7632);").unwrap();
+                    writeln!(s, "        }}").unwrap();
+                    continue;
+                }
                 writeln!(s, "            const unsigned short* p = st + {}u + (wr + 16u * i + gq) * {lda}u + ({kk}) + 2u * tq;", t * a_floats).unwrap();
                 writeln!(s, "            af[{par}][{t}][i][0] = *(const unsigned*)p; af[{par}][{t}][i][1] = *(const unsigned*)(p + {}u);", 8 * lda).unwrap();
                 writeln!(s, "            af[{par}][{t}][i][2] = *(const unsigned*)(p + 8u); af[{par}][{t}][i][3] = *(const unsigned*)(p + {}u);", 8 * lda + 8).unwrap();
@@ -1010,6 +1046,14 @@ impl TensorGraph {
             }
             for t in 0..n_b {
                 writeln!(s, "        #pragma unroll").unwrap();
+                if b_col {
+                    // [n][k]: column gq of fragment j is staged row 8j + gq
+                    writeln!(s, "        for (int j = 0; j < {fnn}; j++) {{").unwrap();
+                    writeln!(s, "            const unsigned short* p = st + {}u + (wc + 8u * j + gq) * {ldbt}u + ({kk}) + 2u * tq;", n_a * a_floats + t * b_floats).unwrap();
+                    writeln!(s, "            bf[{par}][{t}][j][0] = *(const unsigned*)p; bf[{par}][{t}][j][1] = *(const unsigned*)(p + 8u);").unwrap();
+                    writeln!(s, "        }}").unwrap();
+                    continue;
+                }
                 writeln!(s, "        for (int jp = 0; jp < {}; jp++) {{", fnn / 2).unwrap();
                 writeln!(s, "            const unsigned short* p = st + {}u + (({kk}) + 2u * tq) * {ldb}u + wc + 16u * jp + 2u * gq;", n_a * a_floats + t * b_floats).unwrap();
                 writeln!(s, "            unsigned r0 = *(const unsigned*)p, r1 = *(const unsigned*)(p + {ldb}u);").unwrap();
@@ -1146,12 +1190,20 @@ impl TensorGraph {
             writeln!(s, "    for (int j = 0; j < {fnn}; j++)").unwrap();
             writeln!(s, "    #pragma unroll").unwrap();
             writeln!(s, "    for (int r = 0; r < 4; r++) {{").unwrap();
-            writeln!(s, "        unsigned lr = wr + 16u * i + gq + 8u * (r / 2);").unwrap();
-            writeln!(
-                s,
-                "        unsigned lc = wc + 16u * (j / 2) + 4u * tq + 2u * (r % 2) + (j % 2);"
-            )
-            .unwrap();
+            if a_pair {
+                writeln!(s, "        unsigned lr = wr + 16u * i + 2u * gq + (r / 2);").unwrap();
+            } else {
+                writeln!(s, "        unsigned lr = wr + 16u * i + gq + 8u * (r / 2);").unwrap();
+            }
+            if b_col {
+                writeln!(s, "        unsigned lc = wc + 8u * j + 2u * tq + (r % 2);").unwrap();
+            } else {
+                writeln!(
+                    s,
+                    "        unsigned lc = wc + 16u * (j / 2) + 4u * tq + 2u * (r % 2) + (j % 2);"
+                )
+                .unwrap();
+            }
         };
         if splits > 1 {
             writeln!(
