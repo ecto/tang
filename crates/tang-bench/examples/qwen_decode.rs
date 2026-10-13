@@ -5,7 +5,9 @@
 //!
 //! ```text
 //! qwen_decode tiny                      random small model: GPU vs the interpreter
-//! qwen_decode model <dir> <ids> [opts]  MLX 4-bit checkpoint
+//! qwen_decode model <dir> <ids> [opts]  MLX 4-bit checkpoint, decode
+//! qwen_decode prefill <dir> <ids> [--logits FILE NEXT] [--profile]
+//!                                       the prompt as one step (tensor cores)
 //!     --gen N        greedy tokens after the prompt (default 64)
 //!     --ctx C        KV capacity (default 4352)
 //!     --logits FILE  write every step's logits (f32) for a reference check
@@ -26,6 +28,7 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("tiny") => cuda::tiny(),
         Some("model") => cuda::model(&args[1..]),
+        Some("prefill") => cuda::prefill(&args[1..]),
         _ => eprintln!("usage: qwen_decode tiny | model <dir> <ids> [opts]"),
     }
 }
@@ -124,7 +127,16 @@ mod cuda {
         fn new(dims: &QwenDims, inputs: &[Vec<f32>], dg: &DecodeGraph) -> Self {
             let t = Instant::now();
             let (g, outs) = compiled_decode(dg);
-            let opts = decode_opts(dg, &outs, dims.layers);
+            let mut opts = decode_opts(dg, &outs, dims.layers);
+            let env = |k: &str| {
+                std::env::var(k)
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0)
+            };
+            opts.rows = env("TANG_DECODE_ROWS");
+            opts.warps = env("TANG_DECODE_WARPS");
+            opts.unroll = env("TANG_DECODE_UNROLL");
             let dp = g.to_cuda_decode(&outs, &opts);
             let native = dp.native.clone();
             let program = dp.program;
@@ -156,12 +168,7 @@ mod cuda {
 
         /// One decode step: `x` the token's embedding at position `pos`.
         fn step(&self, x: &[f32], pos: usize) {
-            let (cos, sin) = rope_angles(&self.dims, pos);
-            let mut s = Vec::with_capacity(self.dims.step_len());
-            s.extend_from_slice(x);
-            s.extend_from_slice(&cos);
-            s.extend_from_slice(&sin);
-            s.push((pos + 1) as f32);
+            let s = step_input(&self.dims, &[x.to_vec()], pos);
             self.prog.write(&self.rt, self.step, &s);
             self.prog.run(&self.rt);
         }
@@ -502,6 +509,144 @@ mod cuda {
         }
         if args.iter().any(|a| a == "--profile") {
             profile(&sess);
+        }
+    }
+
+    /// Kernels reordered so that a kernel reading only graph inputs (a
+    /// weight's dequantization) runs just before its first reader: with
+    /// a liveness memory plan, one layer's f32 weights are live at a time.
+    fn lazy_order(program: &mut WgslProgram) {
+        let n = program.kernels.len();
+        let producer: HashMap<TensorId, usize> = program
+            .kernels
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (program.storage(k.node), i))
+            .collect();
+        let deps: Vec<Vec<usize>> = program
+            .kernels
+            .iter()
+            .map(|k| {
+                k.reads
+                    .iter()
+                    .filter_map(|t| producer.get(&program.storage(*t)).copied())
+                    .collect()
+            })
+            .collect();
+        let leaf: Vec<bool> = deps.iter().map(|d| d.is_empty()).collect();
+        let mut order = Vec::with_capacity(n);
+        let mut placed = vec![false; n];
+        for i in 0..n {
+            if leaf[i] {
+                continue;
+            }
+            for &d in &deps[i] {
+                if leaf[d] && !placed[d] {
+                    placed[d] = true;
+                    order.push(d);
+                }
+            }
+            placed[i] = true;
+            order.push(i);
+        }
+        order.extend((0..n).filter(|&i| !placed[i]));
+        let mut ks: Vec<Option<_>> = program.kernels.drain(..).map(Some).collect();
+        program.kernels = order.iter().map(|&i| ks[i].take().unwrap()).collect();
+    }
+
+    /// Prefill: the prompt as one step of `seq = len(ids)` tokens.
+    pub fn prefill(args: &[String]) {
+        use tang_compile::tensor::memplan::MemoryPlan;
+        let dir = &args[0];
+        let ids: Vec<usize> = std::fs::read_to_string(&args[1])
+            .unwrap()
+            .split_whitespace()
+            .map(|t| t.parse().unwrap())
+            .collect();
+        let seq = ids.len();
+        let dims = QwenDims::qwen3_8b(seq);
+        let t = Instant::now();
+        let st = St::open(&format!("{dir}/model.safetensors"));
+        let dg = step_graph(&dims, seq);
+        let inputs = load_inputs(&st, &dg);
+        eprintln!("weights read in {:.1}s", t.elapsed().as_secs_f64());
+        let t = Instant::now();
+        let (g, outs) = compiled_decode(&dg);
+        let opts = decode_opts(&dg, &outs, dims.layers);
+        let dp = g.to_cuda_decode(&outs, &opts);
+        let mut program = dp.program;
+        lazy_order(&mut program);
+        let input_t = |k: usize| {
+            program
+                .buffers
+                .iter()
+                .find(|b| b.input == Some(k))
+                .unwrap()
+                .node
+        };
+        let donate: Vec<(TensorId, TensorId)> =
+            opts.inplace.iter().map(|&(o, k)| (o, input_t(k))).collect();
+        let plan: MemoryPlan = g.plan_memory(&program, &outs, &donate);
+        let mma = program
+            .kernels
+            .iter()
+            .filter(|k| k.source.contains("mma"))
+            .count();
+        eprintln!(
+            "lowered: {} kernels ({mma} mma tiles) in {:.2}s; {} donations; intermediates {:.0} MB (naive {:.0} MB)",
+            program.kernels.len(),
+            t.elapsed().as_secs_f64(),
+            plan.inplace.len(),
+            plan.stats.planned_bytes as f64 / 1e6,
+            plan.stats.naive_bytes as f64 / 1e6
+        );
+        let rt = Runtime::cuda_capturable().expect("cuda");
+        let refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
+        let t = Instant::now();
+        let mut prog = Program::planned(&rt, program, &refs, &plan);
+        drop(inputs);
+        eprintln!("compiled + uploaded in {:.2}s", t.elapsed().as_secs_f64());
+        let xs: Vec<Vec<f32>> = ids.iter().map(|&t| embed(&st, t, dims.d_model)).collect();
+        let s = step_input(&dims, &xs, 0);
+        prog.write(&rt, prog.input(0), &s);
+        prog.run(&rt);
+        rt.sync();
+        prog.capture(&rt);
+        let logits = prog.read(&rt, outs[0]);
+        let ms = prog.time(&rt, 3);
+        println!(
+            "prefill {seq} tokens: {ms:.1} ms device ({:.0} tok/s), next token {}",
+            seq as f64 * 1e3 / ms,
+            argmax(&logits)
+        );
+        if let Some(i) = args.iter().position(|a| a == "--logits") {
+            let bytes: Vec<u8> = logits.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(&args[i + 1], bytes).unwrap();
+            std::fs::write(&args[i + 2], argmax(&logits).to_string()).unwrap();
+        }
+        if args.iter().any(|a| a == "--profile") {
+            let mut groups: Vec<(String, f64, usize)> = Vec::new();
+            for (i, k) in prog.program.kernels.iter().enumerate() {
+                let ms = prog.time_kernel(&rt, i, 2);
+                let kind = k
+                    .source
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim_start_matches("// Auto-generated by tang-compile: ")
+                    .to_string();
+                match groups.iter_mut().find(|g| g.0 == kind) {
+                    Some(g) => {
+                        g.1 += ms;
+                        g.2 += 1
+                    }
+                    None => groups.push((kind, ms, 1)),
+                }
+            }
+            groups.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            for (k, ms, n) in groups {
+                println!("  {ms:8.2} ms  {n:4}x  {k}");
+            }
         }
     }
 

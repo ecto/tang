@@ -1,19 +1,23 @@
-//! Qwen3 decode as one tensor-IR graph per step.
+//! Qwen3 as one tensor-IR graph per step: decode (one token) and
+//! prefill (`seq` tokens from an empty cache).
 //!
-//! The step reads one token's embedding and its rope angles from a
-//! `step` input, runs every layer against KV caches of fixed capacity
-//! `ctx`, and writes the logits and the caches' new rows. Weights are
+//! A step reads its tokens' embeddings and rope angles from a `step`
+//! input, runs every layer against KV caches of fixed capacity `ctx`, and
+//! writes the last token's logits and the caches' new rows. Weights are
 //! MLX 4-bit: per projection a `[rows, cols/64, 64]` tensor of nibbles
-//! (logical values 0..=15) and bf16 `[rows, cols/64]` scales and biases;
-//! the dequantization `q·s + b` is a map the matmul reads, so it is
-//! inlined and evaluated where the packed words are loaded
-//! (`to_cuda_decode`, `Packing::U4`).
+//! (logical values 0..=15) and bf16 `[rows, cols/64]` scales and biases.
+//! The dequantization `q·s + b` is a map the matmul reads: in decode it
+//! is inlined and evaluated where the packed words are loaded
+//! (`to_cuda_decode`, `Packing::U4`); in prefill, where each weight is
+//! read by `seq` tokens, it stays materialized and the matmul is a
+//! tensor-core tile over it.
 //!
-//! Attention masks positions past the current length `len` with
-//! `select(len − j − ½, …, identity)` in every reduction over the cache
+//! Attention masks key positions past each query's position with
+//! `select(pos − j + ½, …, identity)` in every reduction over the cache
 //! axis; `to_cuda_decode` turns those into loop bounds, so a step reads
 //! `len` rows of cache, not `ctx`. The cache updates are maps
-//! `select(j == len − 1, new, old)` that overwrite the cache in place.
+//! `select(len − seq ≤ j < len, new, old)` that overwrite the cache in
+//! place.
 use tang::Scalar;
 use tang_compile::tensor::cuda_gemv::{DecodeOpts, Packing};
 use tang_compile::tensor::{Arg, Form, Monoid, TensorGraph, TensorId, View};
@@ -59,9 +63,11 @@ impl QwenDims {
         (self.heads + 2 * self.kv_heads) * self.head_dim
     }
 
-    /// `x`, `cos`, `sin` (head_dim/2 each), `len`.
-    pub fn step_len(&self) -> usize {
-        self.d_model + self.head_dim + 1
+    /// The step input for `seq` tokens: `x [seq, d]`, `cos [seq, hd/2]`,
+    /// `sin [seq, hd/2]`, then `len` (positions in the cache after the
+    /// step).
+    pub fn step_len(&self, seq: usize) -> usize {
+        seq * (self.d_model + self.head_dim) + 1
     }
 }
 
@@ -81,6 +87,8 @@ pub const LAYER_INPUTS: [&str; 21] = [
 
 pub struct DecodeGraph {
     pub g: TensorGraph,
+    /// Tokens per step.
+    pub seq: usize,
     /// `[logits, k_cache'₀, v_cache'₀, k_cache'₁, …]`.
     pub outputs: Vec<TensorId>,
     /// The residual stream after each attention and MLP block, kept
@@ -103,6 +111,10 @@ fn form(rank: usize, terms: &[(usize, i64)], offset: i64) -> Form {
     f
 }
 
+fn ident(rank: usize) -> Vec<Form> {
+    (0..rank).map(|d| unit(rank, d)).collect()
+}
+
 fn arg(src: TensorId, forms: Vec<Form>) -> Arg {
     Arg {
         src,
@@ -111,6 +123,19 @@ fn arg(src: TensorId, forms: Vec<Form>) -> Arg {
             forms,
         },
     }
+}
+
+fn select(c: ExprId, t: ExprId, f: ExprId) -> ExprId {
+    tang_expr::with_graph(|g| g.select(c, t, f))
+}
+
+/// Rows of a per-token tensor: a `[seq, n]` comp, or the flat `step`
+/// input at `off` with row stride `stride`.
+#[derive(Clone, Copy)]
+struct Rows {
+    src: TensorId,
+    off: i64,
+    stride: i64,
 }
 
 struct Builder {
@@ -128,6 +153,23 @@ impl Builder {
         self.g.input(shape)
     }
 
+    /// Read row `t` element `k` of `x` (forms over the comp's space).
+    fn row(&self, x: Rows, t: Form, k: Form) -> Arg {
+        if self.g.shape(x.src).len() == 1 {
+            let mut f = k;
+            f.offset += x.off;
+            for (c, tc) in f.coefs.iter_mut().zip(&t.coefs) {
+                *c += x.stride * tc;
+            }
+            f.offset += x.stride * t.offset;
+            arg(x.src, vec![f])
+        } else {
+            let mut k = k;
+            k.offset += x.off;
+            arg(x.src, vec![t, k])
+        }
+    }
+
     /// A 4-bit projection `[rows, cols]`: nibbles, scales, biases.
     fn q4(&mut self, name: &str, rows: usize, cols: usize) -> [TensorId; 3] {
         let groups = cols / GROUP;
@@ -142,12 +184,12 @@ impl Builder {
         ]
     }
 
-    /// `y[n] = Σ_k x[k]·(q[n,k]·s[n,k/64] + b[n,k/64])`, `x` a vector
-    /// read at `x_off + k`.
-    fn linear(&mut self, x: TensorId, x_off: i64, w: [TensorId; 3]) -> TensorId {
+    /// `y[t, n] = Σ_k x[t, k]·(q[n,k]·s[n,k/64] + b[n,k/64])` over `seq`
+    /// rows of `x` starting at row `t0`.
+    fn linear(&mut self, x: Rows, seq: usize, t0: i64, w: [TensorId; 3]) -> TensorId {
         let shape = self.g.shape(w[0]).to_vec();
         let (rows, groups) = (shape[0].n(), shape[1].n());
-        // dequantization: a map over the nibbles, inlined into the matmul
+        // dequantization: a map over the nibbles the matmul reads
         let r3 = 3;
         let dq = self
             .g
@@ -155,7 +197,7 @@ impl Builder {
                 &[rows, groups, GROUP],
                 &[],
                 vec![
-                    arg(w[0], vec![unit(r3, 0), unit(r3, 1), unit(r3, 2)]),
+                    arg(w[0], ident(3)),
                     arg(w[1], vec![unit(r3, 0), unit(r3, 1)]),
                     arg(w[2], vec![unit(r3, 0), unit(r3, 1)]),
                 ],
@@ -163,46 +205,66 @@ impl Builder {
                 |v| vec![v[0] * v[1] + v[2]],
             )
             .unwrap();
-        // space (n, g, j)
+        if seq > 1 {
+            // many rows: the weight is read by every one, so the
+            // dequantized weight is materialized (seq-fold recompute
+            // otherwise) and the matmul runs over one flat k — a
+            // tensor-core tile
+            let k = groups * GROUP;
+            let dq = self.g.reshape(dq, &[rows, k]).unwrap();
+            let xa = self.row(x, form(3, &[(0, 1)], t0), unit(3, 2));
+            return self
+                .g
+                .comp(
+                    &[seq, rows],
+                    &[k],
+                    vec![xa, arg(dq, vec![unit(3, 1), unit(3, 2)])],
+                    Some(Monoid::sum()),
+                    |v| vec![v[0] * v[1]],
+                )
+                .unwrap();
+        }
+        // space (t, n, g, j)
+        let r4 = 4;
+        let xa = self.row(
+            x,
+            form(r4, &[(0, 1)], t0),
+            form(r4, &[(2, GROUP as i64), (3, 1)], 0),
+        );
         self.g
             .comp(
-                &[rows],
+                &[seq, rows],
                 &[groups, GROUP],
-                vec![
-                    arg(x, vec![form(r3, &[(1, GROUP as i64), (2, 1)], x_off)]),
-                    arg(dq, vec![unit(r3, 0), unit(r3, 1), unit(r3, 2)]),
-                ],
+                vec![xa, arg(dq, vec![unit(r4, 1), unit(r4, 2), unit(r4, 3)])],
                 Some(Monoid::sum()),
                 |v| vec![v[0] * v[1]],
             )
             .unwrap()
     }
 
-    /// `Σ_k x[off + k]²` over `n` elements, as a `[1]` tensor.
-    fn sum_sq(&mut self, x: TensorId, off: i64, n: usize) -> TensorId {
+    /// RMSNorm of `seq` rows of `x` (from row `t0`, `n` wide) with weight `w`.
+    fn rms_norm(
+        &mut self,
+        x: Rows,
+        seq: usize,
+        t0: i64,
+        n: usize,
+        w: TensorId,
+        eps: f64,
+    ) -> TensorId {
+        let xa = self.row(x, form(2, &[(0, 1)], t0), unit(2, 1));
+        let ss = self
+            .g
+            .comp(&[seq], &[n], vec![xa], Some(Monoid::sum()), |v| {
+                vec![v[0] * v[0]]
+            })
+            .unwrap();
+        let xa = self.row(x, form(2, &[(0, 1)], t0), unit(2, 1));
         self.g
             .comp(
-                &[1usize],
-                &[n],
-                vec![arg(x, vec![form(2, &[(1, 1)], off)])],
-                Some(Monoid::sum()),
-                |v| vec![v[0] * v[0]],
-            )
-            .unwrap()
-    }
-
-    /// RMSNorm of `x[off..off+n]` with weight `w`: a `[n]` map.
-    fn rms_norm(&mut self, x: TensorId, off: i64, n: usize, w: TensorId, eps: f64) -> TensorId {
-        let ss = self.sum_sq(x, off, n);
-        self.g
-            .comp(
-                &[n],
+                &[seq, n],
                 &[],
-                vec![
-                    arg(x, vec![form(1, &[(0, 1)], off)]),
-                    arg(ss, vec![Form::zero(1)]),
-                    arg(w, vec![unit(1, 0)]),
-                ],
+                vec![xa, arg(ss, vec![unit(2, 0)]), arg(w, vec![unit(2, 1)])],
                 None,
                 |v| {
                     let inv = ExprId::from_f64(1.0)
@@ -213,25 +275,26 @@ impl Builder {
             .unwrap()
     }
 
-    /// `a[i] + b[i]` over `[n]`.
-    fn add(&mut self, a: TensorId, a_off: i64, b: TensorId, n: usize) -> TensorId {
+    /// `a[t, i] + b[t, i]` over `[seq, n]`.
+    fn add(&mut self, a: Rows, b: TensorId, seq: usize, n: usize) -> TensorId {
+        let aa = self.row(a, unit(2, 0), unit(2, 1));
         self.g
-            .comp(
-                &[n],
-                &[],
-                vec![
-                    arg(a, vec![form(1, &[(0, 1)], a_off)]),
-                    arg(b, vec![unit(1, 0)]),
-                ],
-                None,
-                |v| vec![v[0] + v[1]],
-            )
+            .comp(&[seq, n], &[], vec![aa, arg(b, ident(2))], None, |v| {
+                vec![v[0] + v[1]]
+            })
             .unwrap()
     }
 }
 
-/// The decode step for `dims`.
+/// The decode step (one token at position `len − 1`).
 pub fn decode_graph(dims: &QwenDims) -> DecodeGraph {
+    step_graph(dims, 1)
+}
+
+/// A step over `seq` tokens. `seq == 1`: decode at any position.
+/// `seq > 1`: prefill of positions `0..seq` (the step's `len` must be
+/// `seq`; the cache rows are the tokens').
+pub fn step_graph(dims: &QwenDims, seq: usize) -> DecodeGraph {
     let QwenDims {
         d_model: d,
         heads,
@@ -244,22 +307,41 @@ pub fn decode_graph(dims: &QwenDims) -> DecodeGraph {
         eps,
         ..
     } = *dims;
+    // prefill reads token j for cache row j: a plain (unguarded) view
+    // needs as many tokens as rows
+    assert!(seq == 1 || seq == ctx, "prefill needs ctx == seq");
     let half = hd / 2;
     let per = heads / kvh;
     let mut b = Builder {
         g: TensorGraph::new(),
         inputs: Vec::new(),
     };
-    let step = b.input("step".into(), &[dims.step_len()], None);
-    let (cos_off, sin_off, len_off) = (d as i64, (d + half) as i64, (d + hd) as i64);
+    let step = b.input("step".into(), &[dims.step_len(seq)], None);
+    let x_rows = Rows {
+        src: step,
+        off: 0,
+        stride: d as i64,
+    };
+    let cos_rows = Rows {
+        src: step,
+        off: (seq * d) as i64,
+        stride: half as i64,
+    };
+    let sin_rows = Rows {
+        src: step,
+        off: (seq * d + seq * half) as i64,
+        stride: half as i64,
+    };
+    let len_off = (seq * (d + hd)) as i64;
+    let len_at = |rank: usize| arg(step, vec![Form::constant(rank, len_off)]);
     let q_rows = heads * hd;
     let k_off = q_rows as i64;
     let v_off = (q_rows + kvh * hd) as i64;
     let scale = 1.0 / (hd as f64).sqrt();
+    let seq_f = seq as f64;
     let mut outputs = Vec::new();
     let mut keep = Vec::new();
-    // the residual stream: (tensor, offset)
-    let mut x = (step, 0i64);
+    let mut x = x_rows;
     for l in 0..layers {
         let p = |s: &str| format!("model.layers.{l}.{s}");
         let qkv_w = b.q4(&p("qkv"), dims.qkv_rows(), d);
@@ -274,21 +356,30 @@ pub fn decode_graph(dims: &QwenDims) -> DecodeGraph {
         let k_cache = b.input(p("k_cache"), &[kvh, ctx, 2, half], None);
         let v_cache = b.input(p("v_cache"), &[kvh, hd, ctx], None);
 
-        let normed = b.rms_norm(x.0, x.1, d, ln1, eps);
-        let qkv = b.linear(normed, 0, qkv_w);
-        // per-head Σ x² of q and k heads: [heads + kvh]
+        let normed = b.rms_norm(x, seq, 0, d, ln1, eps);
+        let normed = Rows {
+            src: normed,
+            off: 0,
+            stride: d as i64,
+        };
+        let qkv = b.linear(normed, seq, 0, qkv_w);
+        // per-head Σ x² of q and k heads: [seq, heads + kvh]
         let nh = heads + kvh;
         let hss =
             b.g.comp(
-                &[nh],
+                &[seq, nh],
                 &[hd],
-                vec![arg(qkv, vec![form(2, &[(0, hd as i64), (1, 1)], 0)])],
+                vec![arg(
+                    qkv,
+                    vec![unit(3, 0), form(3, &[(1, hd as i64), (2, 1)], 0)],
+                )],
                 Some(Monoid::sum()),
                 |v| vec![v[0] * v[0]],
             )
             .unwrap();
-        // QK-norm then rotate-half rope over (head, half h, i): element
-        // 64h+i pairs with 64(1−h)+i, the sign of the sin term is 2h−1
+        // QK-norm then rotate-half rope over (t, head…, half h, i):
+        // element 64h+i pairs with 64(1−h)+i, the sin term's sign is 2h−1
+        #[allow(clippy::too_many_arguments)]
         let roped = |b: &mut Builder,
                      base: i64,
                      out: &[usize],
@@ -310,18 +401,20 @@ pub fn decode_graph(dims: &QwenDims) -> DecodeGraph {
             let w_self = form(rank, &[(h, half as i64), (i, 1)], 0);
             let w_other = form(rank, &[(h, -(half as i64)), (i, 1)], half as i64);
             let iota = b.g.iota(out, h);
+            let cos = b.row(cos_rows, unit(rank, 0), unit(rank, i));
+            let sin = b.row(sin_rows, unit(rank, 0), unit(rank, i));
             b.g.comp(
                 out,
                 &[],
                 vec![
-                    arg(qkv, vec![self_f]),
-                    arg(qkv, vec![other]),
+                    arg(qkv, vec![unit(rank, 0), self_f]),
+                    arg(qkv, vec![unit(rank, 0), other]),
                     arg(w, vec![w_self]),
                     arg(w, vec![w_other]),
-                    arg(hss, vec![ss_head]),
-                    arg(step, vec![form(rank, &[(i, 1)], cos_off)]),
-                    arg(step, vec![form(rank, &[(i, 1)], sin_off)]),
-                    arg(iota, (0..rank).map(|d| unit(rank, d)).collect()),
+                    arg(hss, vec![unit(rank, 0), ss_head]),
+                    cos,
+                    sin,
+                    arg(iota, ident(rank)),
                 ],
                 None,
                 |v| {
@@ -334,41 +427,44 @@ pub fn decode_graph(dims: &QwenDims) -> DecodeGraph {
             )
             .unwrap()
         };
-        // q: [kvh, per, 2, half], head kvh·per + r, scaled by 1/√hd
+        // q: [seq, kvh, per, 2, half], head kvh·per + r, scaled by 1/√hd
         let q_rot = roped(
             &mut b,
             0,
-            &[kvh, per, 2, half],
-            form(4, &[(0, (per * hd) as i64), (1, hd as i64)], 0),
-            2,
+            &[seq, kvh, per, 2, half],
+            form(5, &[(1, (per * hd) as i64), (2, hd as i64)], 0),
             3,
-            form(4, &[(0, per as i64), (1, 1)], 0),
+            4,
+            form(5, &[(1, per as i64), (2, 1)], 0),
             qn,
             scale,
         );
-        // k: [kvh, 2, half]
+        // k: [seq, kvh, 2, half]
         let k_rot = roped(
             &mut b,
             k_off,
-            &[kvh, 2, half],
-            form(3, &[(0, hd as i64)], 0),
-            1,
+            &[seq, kvh, 2, half],
+            form(4, &[(1, hd as i64)], 0),
             2,
-            form(3, &[(0, 1)], heads as i64),
+            3,
+            form(4, &[(1, 1)], heads as i64),
             kn,
             1.0,
         );
-        // cache rows at pos = len − 1, in place
-        let len_at = |rank: usize| arg(step, vec![Form::constant(rank, len_off)]);
-        let at_pos = |len: ExprId, j: ExprId, new: ExprId, old: ExprId| {
-            let pos = len - ExprId::from_f64(1.0);
-            let half_ = ExprId::from_f64(0.5);
-            let le = pos - j + half_;
-            let ge = j - pos + ExprId::from_f64(0.5);
-            tang_expr::with_graph(|g| {
-                let inner = g.select(ge, new, old);
-                g.select(le, inner, old)
-            })
+        // cache rows len−seq ≤ j < len, in place; token t = j − (len − seq),
+        // which is affine when seq == 1 (t = 0) or len == seq (t = j)
+        let in_step = |len: ExprId, j: ExprId, new: ExprId, old: ExprId| {
+            let le = len - ExprId::from_f64(1.0) - j + ExprId::from_f64(0.5);
+            let ge = j - len + ExprId::from_f64(seq_f) + ExprId::from_f64(0.5);
+            let inner = select(ge, new, old);
+            select(le, inner, old)
+        };
+        let tok = |rank: usize, j: usize| {
+            if seq == 1 {
+                Form::zero(rank)
+            } else {
+                unit(rank, j)
+            }
         };
         let kc_shape = [kvh, ctx, 2, half];
         let j_iota = b.g.iota(&kc_shape, 1);
@@ -377,13 +473,13 @@ pub fn decode_graph(dims: &QwenDims) -> DecodeGraph {
                 &kc_shape,
                 &[],
                 vec![
-                    arg(k_rot, vec![unit(4, 0), unit(4, 2), unit(4, 3)]),
-                    arg(k_cache, (0..4).map(|d| unit(4, d)).collect()),
-                    arg(j_iota, (0..4).map(|d| unit(4, d)).collect()),
+                    arg(k_rot, vec![tok(4, 1), unit(4, 0), unit(4, 2), unit(4, 3)]),
+                    arg(k_cache, ident(4)),
+                    arg(j_iota, ident(4)),
                     len_at(4),
                 ],
                 None,
-                |v| vec![at_pos(v[3], v[2], v[0], v[1])],
+                |v| vec![in_step(v[3], v[2], v[0], v[1])],
             )
             .unwrap();
         let vc_shape = [kvh, hd, ctx];
@@ -393,142 +489,192 @@ pub fn decode_graph(dims: &QwenDims) -> DecodeGraph {
                 &vc_shape,
                 &[],
                 vec![
-                    arg(qkv, vec![form(3, &[(0, hd as i64), (1, 1)], v_off)]),
-                    arg(v_cache, (0..3).map(|d| unit(3, d)).collect()),
-                    arg(jv_iota, (0..3).map(|d| unit(3, d)).collect()),
+                    arg(
+                        qkv,
+                        vec![tok(3, 2), form(3, &[(0, hd as i64), (1, 1)], v_off)],
+                    ),
+                    arg(v_cache, ident(3)),
+                    arg(jv_iota, ident(3)),
                     len_at(3),
                 ],
                 None,
-                |v| vec![at_pos(v[3], v[2], v[0], v[1])],
+                |v| vec![in_step(v[3], v[2], v[0], v[1])],
             )
             .unwrap();
         outputs.push(k_new);
         outputs.push(v_new);
 
-        // valid position: j < len
-        let valid = |len: ExprId, j: ExprId| len - j - ExprId::from_f64(0.5);
-        // scores[kvh, r, j] over (h, i): space (kvh, r, j, h, i)
-        let s_shape = [kvh, per, ctx];
-        let js = b.g.iota(&[kvh, per, ctx, 2, half], 2);
+        // causal: key j is visible to token t at position len − seq + t
+        let visible = |len: ExprId, t: ExprId, j: ExprId| {
+            len - ExprId::from_f64(seq_f) + t - j + ExprId::from_f64(0.5)
+        };
+        // scores[t, kvh, r, j] over (h, i): space (t, kvh, r, j, h, i)
+        let sp = [seq, kvh, per, ctx, 2, half];
+        let (ts, js) = (b.g.iota(&sp, 0), b.g.iota(&sp, 3));
         let scores =
             b.g.comp(
-                &s_shape,
+                &[seq, kvh, per, ctx],
                 &[2, half],
                 vec![
-                    arg(q_rot, vec![unit(5, 0), unit(5, 1), unit(5, 3), unit(5, 4)]),
-                    arg(k_new, vec![unit(5, 0), unit(5, 2), unit(5, 3), unit(5, 4)]),
-                    arg(js, (0..5).map(|d| unit(5, d)).collect()),
-                    len_at(5),
+                    arg(
+                        q_rot,
+                        vec![unit(6, 0), unit(6, 1), unit(6, 2), unit(6, 4), unit(6, 5)],
+                    ),
+                    arg(k_new, vec![unit(6, 1), unit(6, 3), unit(6, 4), unit(6, 5)]),
+                    arg(ts, ident(6)),
+                    arg(js, ident(6)),
+                    len_at(6),
                 ],
                 Some(Monoid::sum()),
                 |v| {
-                    let c = valid(v[3], v[2]);
-                    let qk = v[0] * v[1];
+                    let c = visible(v[4], v[2], v[3]);
                     let z = ExprId::from_f64(0.0);
-                    vec![tang_expr::with_graph(|g| g.select(c, qk, z))]
+                    vec![select(c, v[0] * v[1], z)]
                 },
             )
             .unwrap();
-        // softmax statistics over j: space (kvh, r, j)
-        let jr = b.g.iota(&[kvh, per, ctx], 2);
+        // softmax statistics over j: space (t, kvh, r, j)
+        let sp = [seq, kvh, per, ctx];
+        let (tr, jr) = (b.g.iota(&sp, 0), b.g.iota(&sp, 3));
         let s_args = |m: Option<TensorId>| {
             let mut a = vec![
-                arg(scores, vec![unit(3, 0), unit(3, 1), unit(3, 2)]),
-                arg(jr, vec![unit(3, 0), unit(3, 1), unit(3, 2)]),
-                len_at(3),
+                arg(scores, ident(4)),
+                arg(tr, ident(4)),
+                arg(jr, ident(4)),
+                len_at(4),
             ];
             if let Some(m) = m {
-                a.push(arg(m, vec![unit(3, 0), unit(3, 1)]));
+                a.push(arg(m, vec![unit(4, 0), unit(4, 1), unit(4, 2)]));
             }
             a
         };
         let m =
             b.g.comp(
-                &[kvh, per],
+                &[seq, kvh, per],
                 &[ctx],
                 s_args(None),
                 Some(Monoid::max()),
                 |v| {
-                    let c = valid(v[2], v[1]);
+                    let c = visible(v[3], v[1], v[2]);
                     let lo = ExprId::from_f64(-1e30);
-                    vec![tang_expr::with_graph(|g| g.select(c, v[0], lo))]
+                    vec![select(c, v[0], lo)]
                 },
             )
             .unwrap();
         let lsum =
             b.g.comp(
-                &[kvh, per],
+                &[seq, kvh, per],
                 &[ctx],
                 s_args(Some(m)),
                 Some(Monoid::sum()),
                 |v| {
-                    let c = valid(v[2], v[1]);
-                    let p = (v[0] - v[3]).exp();
+                    let c = visible(v[3], v[1], v[2]);
                     let z = ExprId::from_f64(0.0);
-                    vec![tang_expr::with_graph(|g| g.select(c, p, z))]
+                    vec![select(c, (v[0] - v[4]).exp(), z)]
                 },
             )
             .unwrap();
-        // attn[kvh, r, c] = Σ_j p·v / l: space (kvh, r, c, j)
-        let jo = b.g.iota(&[kvh, per, hd, ctx], 3);
+        // attn[t, kvh, r, c] = Σ_j p·v / l: space (t, kvh, r, c, j)
+        let sp = [seq, kvh, per, hd, ctx];
+        let (to, jo) = (b.g.iota(&sp, 0), b.g.iota(&sp, 4));
+        let mlv = vec![unit(5, 0), unit(5, 1), unit(5, 2)];
         let attn =
             b.g.comp(
-                &[kvh, per, hd],
+                &[seq, kvh, per, hd],
                 &[ctx],
                 vec![
-                    arg(scores, vec![unit(4, 0), unit(4, 1), unit(4, 3)]),
-                    arg(m, vec![unit(4, 0), unit(4, 1)]),
-                    arg(lsum, vec![unit(4, 0), unit(4, 1)]),
-                    arg(v_new, vec![unit(4, 0), unit(4, 2), unit(4, 3)]),
-                    arg(jo, (0..4).map(|d| unit(4, d)).collect()),
-                    len_at(4),
+                    arg(scores, vec![unit(5, 0), unit(5, 1), unit(5, 2), unit(5, 4)]),
+                    arg(m, mlv.clone()),
+                    arg(lsum, mlv),
+                    arg(v_new, vec![unit(5, 1), unit(5, 3), unit(5, 4)]),
+                    arg(to, ident(5)),
+                    arg(jo, ident(5)),
+                    len_at(5),
                 ],
                 Some(Monoid::sum()),
                 |v| {
-                    let c = valid(v[5], v[4]);
+                    let c = visible(v[6], v[4], v[5]);
                     let pv = (v[0] - v[1]).exp() * v[3] / v[2];
                     let z = ExprId::from_f64(0.0);
-                    vec![tang_expr::with_graph(|g| g.select(c, pv, z))]
+                    vec![select(c, pv, z)]
                 },
             )
             .unwrap();
-        let attn = b.g.reshape(attn, &[q_rows]).unwrap();
-        let proj = b.linear(attn, 0, o_w);
-        let res1 = b.add(x.0, x.1, proj, d);
-        let normed2 = b.rms_norm(res1, 0, d, ln2, eps);
-        let gate = b.linear(normed2, 0, gate_w);
-        let up = b.linear(normed2, 0, up_w);
+        let attn = b.g.reshape(attn, &[seq, q_rows]).unwrap();
+        let attn = Rows {
+            src: attn,
+            off: 0,
+            stride: q_rows as i64,
+        };
+        let proj = b.linear(attn, seq, 0, o_w);
+        let res1 = b.add(x, proj, seq, d);
+        let res1_rows = Rows {
+            src: res1,
+            off: 0,
+            stride: d as i64,
+        };
+        let normed2 = b.rms_norm(res1_rows, seq, 0, d, ln2, eps);
+        let normed2 = Rows {
+            src: normed2,
+            off: 0,
+            stride: d as i64,
+        };
+        let gate = b.linear(normed2, seq, 0, gate_w);
+        let up = b.linear(normed2, seq, 0, up_w);
         let act =
             b.g.map(&[gate, up], |a| {
                 a[0] / (ExprId::from_f64(1.0) + (-a[0]).exp()) * a[1]
             })
             .unwrap();
-        let down = b.linear(act, 0, down_w);
-        let res2 = b.add(res1, 0, down, d);
+        let act = Rows {
+            src: act,
+            off: 0,
+            stride: ff as i64,
+        };
+        let down = b.linear(act, seq, 0, down_w);
+        let res2 = b.add(res1_rows, down, seq, d);
         keep.extend([res1, res2]);
-        x = (res2, 0);
+        x = Rows {
+            src: res2,
+            off: 0,
+            stride: d as i64,
+        };
     }
+    // logits of the last token only
     let norm = b.input("model.norm".into(), &[d], None);
     let lm = b.q4("lm_head", vocab, d);
-    let normed = b.rms_norm(x.0, x.1, d, norm, eps);
-    let logits = b.linear(normed, 0, lm);
+    let normed = b.rms_norm(x, 1, seq as i64 - 1, d, norm, eps);
+    let normed = Rows {
+        src: normed,
+        off: 0,
+        stride: d as i64,
+    };
+    let logits = b.linear(normed, 1, 0, lm);
     outputs.insert(0, logits);
     DecodeGraph {
         g: b.g,
+        seq,
         outputs,
         keep,
         inputs: b.inputs,
     }
 }
 
-/// The passes for decode: maps fused, siblings (gate/up) merged,
-/// epilogues inlined. Returns the graph and its outputs: `dg.outputs`
-/// (same order), then `dg.keep`.
+/// The passes: maps fused, siblings (gate/up) merged, epilogues
+/// inlined; for prefill (`seq > 1`) the reduce dims of the matmuls
+/// merged, so they are tensor-core tiles over the dequantized weights.
+/// Returns the graph and its outputs: `dg.outputs` (same order), then
+/// `dg.keep`.
 pub fn compiled_decode(dg: &DecodeGraph) -> (TensorGraph, Vec<TensorId>) {
     let all: Vec<TensorId> = dg.outputs.iter().chain(&dg.keep).copied().collect();
     let (g, outs) = dg.g.substitute_maps(&all);
     let (g, outs) = g.eliminate_common(&outs);
-    let (mut g, outs) = g.merge_siblings(&outs);
+    let (g, outs) = g.merge_siblings(&outs);
+    let (mut g, outs) = if dg.seq > 1 {
+        g.merge_reduce_dims(&outs)
+    } else {
+        (g, outs)
+    };
     g.schedule_inline(&outs);
     g.schedule_epilogues(&outs);
     (g, outs)
@@ -551,6 +697,7 @@ pub fn decode_opts(dg: &DecodeGraph, outputs: &[TensorId], layers: usize) -> Dec
     DecodeOpts {
         packed,
         inplace,
+        mma: dg.seq > 1,
         ..Default::default()
     }
 }
@@ -565,6 +712,25 @@ pub fn rope_angles(dims: &QwenDims, pos: usize) -> (Vec<f32>, Vec<f32>) {
             (a.cos() as f32, a.sin() as f32)
         })
         .unzip()
+}
+
+/// The step input for tokens `xs` (embeddings) at positions
+/// `pos0..pos0 + xs.len()`.
+pub fn step_input(dims: &QwenDims, xs: &[Vec<f32>], pos0: usize) -> Vec<f32> {
+    let seq = xs.len();
+    let mut s = Vec::with_capacity(dims.step_len(seq));
+    for x in xs {
+        s.extend_from_slice(x);
+    }
+    let angles: Vec<_> = (0..seq).map(|t| rope_angles(dims, pos0 + t)).collect();
+    for (c, _) in &angles {
+        s.extend_from_slice(c);
+    }
+    for (_, sn) in &angles {
+        s.extend_from_slice(sn);
+    }
+    s.push((pos0 + seq) as f32);
+    s
 }
 
 #[cfg(test)]
@@ -594,12 +760,33 @@ mod tests {
         let opts = decode_opts(&dg, &outs, dims.layers);
         let p = g.to_cuda_decode(&outs, &opts);
         let transpiled = p.native.iter().filter(|n| !**n).count();
-        for (k, n) in p.program.kernels.iter().zip(&p.native) {
-            if !n {
-                eprintln!("transpiled: {} points", k.points);
-            }
-        }
         assert!(p.native.iter().filter(|n| **n).count() >= 10 * dims.layers);
         assert!(transpiled <= 4 * dims.layers + 2, "{transpiled} transpiled");
+        // packed weights are sized in words
+        let q = p
+            .program
+            .buffers
+            .iter()
+            .find(|b| b.input == Some(1))
+            .unwrap();
+        assert_eq!(q.len, dims.qkv_rows() * dims.d_model / 8);
+    }
+
+    #[test]
+    fn prefill_graph_lowers() {
+        let dims = tiny();
+        let dg = step_graph(&dims, dims.ctx);
+        let (g, outs) = compiled_decode(&dg);
+        let opts = decode_opts(&dg, &outs, dims.layers);
+        let p = g.to_cuda_decode(&outs, &opts);
+        let mma = p
+            .program
+            .kernels
+            .iter()
+            .filter(|k| k.source.contains("mma"))
+            .count();
+        // the seven projections per layer are tensor-core tiles (gate/up
+        // merged: six)
+        assert!(mma >= 5 * dims.layers, "{mma} mma tiles");
     }
 }
