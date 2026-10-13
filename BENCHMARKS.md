@@ -1297,6 +1297,67 @@ Negatives:
 - **Flash attention in half saves little at these lengths**: 0.014 → 0.011 ms at seq 128 and flat at 512, against 0.12 → 0.057 for gate/up.
 - **PyTorch bf16 autocast is slower than its fp32 at seq 128** (0.350 vs 0.303 ms forward), from per-op cast kernels. tang casts inside the tiles.
 
+### Qwen3-8B through the tensor IR on CUDA (RTX 3090, batch 1)
+
+The whole model, MLX 4-bit (`mlx-community/Qwen3-8B-4bit`: group 64, bf16 scales and biases), runs as **one IR graph per step**: `tang_bench::ir_qwen::step_graph`, lowered by `TensorGraph::to_cuda_decode` (`tensor_cuda_gemv.rs`), run through `Program` with the KV caches updated in place and the step captured as a CUDA graph. The runner is `examples/qwen_decode.rs` (`tiny`, `model`, `prefill`).
+
+**What the lowering adds** (see the module docs):
+
+- *Warp reductions.* A reduction, or the map that reads it point for point (its epilogue), runs as one warp per point group. Lanes stride the reduce space a vector chunk at a time, and the body is evaluated generically. Each leaf is classified per chunk: invariant (one load), unit-stride (`float4` or `uint4`), or scalar. A short point dim that the largest operand ignores (the 4 query heads of a GQA group), or a GEMV's rows, is unrolled per thread.
+- *Packed storage.* The nibbles are 8 per word, scales and biases are bf16 pairs, and the KV caches are f16 pairs. The graph sees logical values. The dequantization `q·s + b` is a map the matmul reads; it is inlined and evaluated in registers as the `uint4` streams in (`2²³ + q` as a float, minus `2²³`: no int-to-float per weight).
+- *Runtime bounds.* Every reduction over the cache axis is `select(pos − j + ½, x, identity)`, with `pos` read from the step input. The lowering turns that into loop bounds (scores: a grid-stride loop that stops at the live rows). A step reads `len` rows of a 4352-row cache, not all of them. The cache update `select(j == pos, new, old)` is written over its donor and visits only that row.
+- *Schedules:* `schedule_epilogues` (residual adds and SwiGLU fused into the GEMVs over two reduce dims) and `schedule_decode_maps` (RMSNorm and the roped key recomputed inside their GEMV or cache update). The residual stream is kept materialized; substituting it everywhere made each layer read every earlier layer's outputs. Gate and up are merged siblings, and q|k|v is one 6144-row weight.
+
+A decode step has 506 kernels: 470 lowered here, and 36 transpiled (the roped q).
+
+**Correctness.** The reference is a CPU f32 forward with the checkpoint dequantized exactly (PyTorch on mew). Teacher-forced on tang's own 64 greedy tokens (21-token prompt, f32 caches): max |logit error| 1.7e-4 (logits up to 51.6, mean 2.2e-5), and 64/64 argmax agree. So the reference's greedy text is tang's. The tiny random model (`qwen_decode tiny`) matches the interpreter at 1e-6 relative with f32 caches. With f16 caches it matches at 1e-4: the device caches are within 1 f16 ulp of the reference's, and a one-ulp flip of a cached value accounts for the rest. Prefill of 512 tokens on f16 tensor cores: next-token logits within 7.5e-3 of the reference, argmax equal. The full-model check with f16 caches could not be rerun: see the caveat below.
+
+**Speed** (the 3090 was shared with a GAN training job at ~98% SM for the whole session, so every number has 1.5–2× noise. Device step times are the minimum of 5 batches of 20 graph replays, best of the runs).
+
+| | decode, short ctx | decode, 4k ctx | prefill 512 |
+|---|---|---|---|
+| speed of light (936 GB/s) | 220 tok/s (4.26 GB of weights + scales) | 192 tok/s (+0.6 GB f16 KV) | — |
+| tang IR, device step | **8.2 ms: 122 tok/s (55% SOL)** | **9.6 ms: 104 tok/s (54%)** | **662 ms: 774 tok/s** (f16 tiles; TF32: 606) |
+| tang IR, host loop (embed, write, replay, read 151k logits) | 55–59 tok/s | — | — |
+| tang-llm engine (resident server, speculative drafting on) | 52–217 tok/s by acceptance; ~25–48 ms per verify forward | 51–164 tok/s | 535–757 tok/s (≈3000-token prompts: 477) |
+| llama.cpp | not installed on mew. Building it and fetching a GGUF needs downloads I did not make | | |
+
+The host loop is half the device rate. Each step does three synchronous transfers: `Program::write` syncs, and a 600 KB logits readback follows every replay. Under time-slicing with another process, each sync waits a slice. An in-graph argmax would remove the readback.
+
+**Where the 4k step goes** (sum of isolated launches, 10.3 ms; rows-per-warp 4):
+
+| kernels | ms | per launch | achieved |
+|---|---|---|---|
+| gate\|up GEMV + SwiGLU (36) | 2.76 | 77 µs | 738 GB/s |
+| down GEMV + residual (36) | 1.84 | 51 µs | 554 GB/s |
+| qkv GEMV (36) | 1.25 | 35 µs | 409 GB/s |
+| attention `Σ p·v / l` (36) | 1.13 | 31 µs | f16 V, 8.9 MB/layer |
+| o GEMV + residual (36) | 0.75 | 21 µs | 450 GB/s |
+| scores `q·k` (36) | 0.73 | 20 µs | f16 K |
+| LM head GEMV (1) | 0.56 | 564 µs | 620 GB/s |
+| softmax max/sum (72), cache row writes (72), norms (73), q rope (36), qk-norm sums (36) | 1.32 | 3–6 µs | launch-bound |
+
+The gap to SOL (8.2 ms against 4.55 ms at short context) splits about evenly:
+
+- *Small GEMVs below bandwidth.* The 4096- and 6144-row projections reach 410–450 GB/s against 740 GB/s for the merged 24576-row gate|up. They have fewer bytes in flight per warp, and a 20–35 µs kernel pays its ramp and tail.
+- *Fixed per-kernel cost.* About 300 of the 506 launches are small reductions and maps at 3–6 µs each, roughly 1.3 ms. Fusing the softmax statistics into one kernel, the two cache writes into one, and a norm's sum into its map are the next steps.
+- *At 4k:* attention is ~1.9 ms, f16 K and V at about 75% of bandwidth.
+
+The f16 cache halved attention's bytes against f32 (scores 0.95 → 0.73 ms, `p·v` 1.17 → 1.13 ms with the extra unpacking). The int4 decode without int-to-float conversions made no measurable difference, so the GEMVs are not ALU-bound. Rows-per-warp 4 against 2 was 0–8% faster, inside the noise.
+
+**Prefill** is the same graph builder at `seq = 512` (positions from 0, `ctx = seq`). The cost-aware substitution keeps each dequantized weight materialized, because 512 tokens read it. `merge_reduce_dims` then leaves a plain matmul, and it runs on `cuda_mma_kernel`. With the dequantized weights stored f16 (#55's m16n8k16 tiles, activations converted while staging), the 144 tiles take 280 ms, about 25 TFLOP/s; they took 552 ms in TF32. Dequantization takes 27 ms: 7.5 B f16 writes. Attention and norms through the warp kernels take 86 ms, and the cache writes 20 ms (one thread per column loops over the 512 rows). `ir_qwen::plan_slots` keeps one layer's f16 weights live, so intermediates take 1.0 GB.
+
+**Caveat: mew's storage went bad mid-session.** Partway through, reading the Hugging Face copy of the checkpoint on mew started failing with EFAULT at 3.7 GB (`dd` reproduces it). One decode run before that read garbage weights: its logits were wrong while the tiny test still passed. A copy sent from the M4 (sha256 `f2d29621…`, equal to the blob name) sits in `~/qwenir/model`. The rerun of the full-model checks on it stalled: the process was stuck in the kernel freeing page tables, and the machine's clock was barely advancing. The decode correctness figures above come from the run before the fault (f32 caches). The f16-cache and rows-4 speed figures come from runs whose weights may have been corrupt; corrupt weights change the values, not the bytes moved.
+
+**Missing for production in tang-llm:**
+
+- *Weight sharing between programs.* Prefill and decode are separate `Program`s, each with a 4.3 GB copy of the weights. Fixing this needs either shared buffers in `Program` or one program with two captured kernel subsets.
+- *Chunked prefill from a nonzero position.* Token `t` of a chunk lands in cache row `pos0 + t`, a data-dependent view (a guarded or offset view the lowering can address).
+- *Sampling and stopping on the device.* An in-graph argmax or top-k avoids the logits readback.
+- *A tuner for the decode kernels.* Rows per warp, warps and unroll per kernel, through `Program::tuned`.
+- *Batching beyond 1, and paged or variable-length caches.*
+- *A standalone, uncontended re-measurement once mew's hardware is checked.*
+
 ## Kokoro-shaped ops (M4 Max, Metal, kernel-only)
 
 TTS vocoder ops (Kokoro's iSTFTNet decoder, Vocos-style ConvNeXt) derived
