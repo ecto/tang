@@ -108,6 +108,20 @@ fn settings(c: &Case, dir: &str) -> Vec<(String, TensorGraph)> {
         ("f16".to_string(), all(&c.g, &c.outs, Format::F16)),
         ("bf16".to_string(), all(&c.g, &c.outs, Format::BF16)),
     ];
+    // only the tensor-core tiles' operands in half
+    if let Some(m) = ir_precision::moves(&c.g, &c.outs, &[])
+        .into_iter()
+        .find(|m| m.what.starts_with("all"))
+    {
+        out.push((
+            "tiles-f16".into(),
+            ir_precision::apply(&c.g, &m, Format::F16),
+        ));
+        out.push((
+            "tiles-bf16".into(),
+            ir_precision::apply(&c.g, &m, Format::BF16),
+        ));
+    }
     if let Ok(text) = std::fs::read_to_string(format!("{dir}/{}.prec", c.name)) {
         let mut t = c.g.clone();
         ir_precision::read_assignment(&mut t, &text);
@@ -280,6 +294,30 @@ fn main() {
                 }
                 for (s, _, best, ks) in &progs {
                     println!("{name} {s}: {best:.3} ms whole program, {ks:.3} ms sum of kernels");
+                }
+                // TANG_PER_KERNEL: each kernel's fastest launch per setting
+                if std::env::var_os("TANG_PER_KERNEL").is_some() {
+                    let n = progs[0].1.program.kernels.len();
+                    for i in 0..n {
+                        let mut line = format!(
+                            "{name} kernel {i:2} node {:3}",
+                            progs[0].1.program.kernels[i].node.index()
+                        );
+                        for (s, p, _, _) in &progs {
+                            if p.program.kernels.len() != n {
+                                continue;
+                            }
+                            let k = &p.program.kernels[i];
+                            let kind = match k.source.lines().next().unwrap_or("") {
+                                l if l.contains("(F16)") => "h",
+                                l if l.contains("(BF16)") => "b",
+                                l if l.contains("TF32") => "t",
+                                _ => "w",
+                            };
+                            line.push_str(&format!("  {s} {:.4}{kind}", p.time_kernel(&rt, i, 20)));
+                        }
+                        println!("{line}");
+                    }
                 }
             }
             _ => panic!("phase {phase}"),
