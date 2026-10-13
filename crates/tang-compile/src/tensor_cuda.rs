@@ -374,6 +374,83 @@ impl TensorGraph {
         }
         writeln!(s, "    unsigned row0 = tile_y * {bm}u;").unwrap();
         writeln!(s, "    unsigned col0 = tile_x * {bn}u;").unwrap();
+        // A staged map in every term that is provably zero where an
+        // affine condition holds (the causal mask inside P̃ = exp(S + mask
+        // − m), so inside dS too): chunks where it holds over the whole
+        // block contribute nothing and are left out of the k range.
+        let common = |side_a: bool| -> Option<usize> {
+            let mut it = uses
+                .iter()
+                .flatten()
+                .map(|&(ai, bi)| if side_a { ai } else { bi });
+            let first = it.next()?;
+            it.all(|x| x == first).then_some(first)
+        };
+        let zero_cond = [(true, common(true)), (false, common(false))]
+            .into_iter()
+            .find_map(|(side_a, st)| {
+                let st = st?;
+                let map = if side_a {
+                    a_stages[st].2
+                } else {
+                    b_stages[st].2
+                };
+                self.map_zero_cond(rc, map?)
+            })
+            .filter(|f| others.iter().all(|&d| f.coefs[d] == 0));
+        if let Some(f) = &zero_cond {
+            // the condition's minimum over the block × chunk box
+            let lo_hi = |d: usize, lo: String, hi: String| -> String {
+                let cf = f.coefs[d];
+                match cf.cmp(&0) {
+                    std::cmp::Ordering::Greater => format!(" + {cf} * (int)({lo})"),
+                    std::cmp::Ordering::Less => format!(" + {cf} * (int)({hi})"),
+                    std::cmp::Ordering::Equal => String::new(),
+                }
+            };
+            let min = format!(
+                "{}{}{}{}",
+                f.offset,
+                lo_hi(
+                    dy,
+                    "row0".into(),
+                    format!("min(row0 + {}u, {}u)", bm - 1, m - 1)
+                ),
+                lo_hi(
+                    dx,
+                    "col0".into(),
+                    format!("min(col0 + {}u, {}u)", bn - 1, n - 1)
+                ),
+                lo_hi(
+                    kdim,
+                    "k0".into(),
+                    format!("min(k0 + {}u, {}u)", chunk - 1, k_total - 1)
+                ),
+            );
+            writeln!(s, "    {{").unwrap();
+            writeln!(s, "        unsigned lo = k_end, hi = k_begin;").unwrap();
+            writeln!(s, "        for (unsigned c = 0u; c < n_chunks; c++) {{").unwrap();
+            writeln!(s, "            unsigned k0 = k_begin + c * {chunk}u;").unwrap();
+            writeln!(s, "            if ({min} > 0) continue;").unwrap();
+            writeln!(
+                s,
+                "            lo = min(lo, k0); hi = max(hi, min(k0 + {chunk}u, k_end));"
+            )
+            .unwrap();
+            writeln!(s, "        }}").unwrap();
+            writeln!(
+                s,
+                "        if (hi > lo) {{ k_begin = lo; k_end = hi; }} else k_end = k_begin;"
+            )
+            .unwrap();
+            writeln!(
+                s,
+                "        n_chunks = k_end > k_begin ? (k_end - k_begin + {}u) / {chunk}u : 0u;",
+                chunk - 1
+            )
+            .unwrap();
+            writeln!(s, "    }}").unwrap();
+        }
         let lead_term = |addr: &super::msl_mma::Addr| -> String {
             let mut t = format!("{}", addr.offset);
             for &d in &others {
@@ -1010,6 +1087,77 @@ struct NestedTerm {
 }
 
 impl TensorGraph {
+    /// An affine form over `rc`'s space where map operand `v` of `rc` is
+    /// zero wherever it is positive: the map's value has a factor
+    /// `exp2(… + κ·select(cond, ≤ −1e20, 0))` with `κ > 0` (a masked
+    /// exponential), the other terms finite.
+    fn map_zero_cond(&self, rc: &super::Comp, v: usize) -> Option<super::Form> {
+        let rank = rc.rank();
+        let outer = &rc.args[v];
+        let mc = self.comp_at(outer.src.n())?;
+        // the map with its reads seen from rc's space
+        let seen = super::Comp {
+            out: rc.points().to_vec(),
+            tuple: 0,
+            red: rc.red.clone(),
+            args: mc
+                .args
+                .iter()
+                .map(|a| Arg {
+                    src: a.src,
+                    view: a.view.compose(&outer.view, rank),
+                })
+                .collect(),
+            body: mc.body.clone(),
+            body_outs: mc.body_outs.clone(),
+            monoid: None,
+        };
+        let nodes = seen.body.nodes_slice();
+        let lit = |e: tang_expr::ExprId| nodes[e.index() as usize].as_f64();
+        // where the exponent is −∞ in effect
+        fn neg_inf(
+            g: &TensorGraph,
+            c: &super::Comp,
+            nodes: &[ENode],
+            e: tang_expr::ExprId,
+        ) -> Option<super::Form> {
+            let lit = |e: tang_expr::ExprId| nodes[e.index() as usize].as_f64();
+            match nodes[e.index() as usize] {
+                ENode::Add(a, b) => neg_inf(g, c, nodes, a).or_else(|| neg_inf(g, c, nodes, b)),
+                ENode::Mul(a, b) => match (lit(a), lit(b)) {
+                    (Some(k), _) if k > 0.0 => neg_inf(g, c, nodes, b),
+                    (_, Some(k)) if k > 0.0 => neg_inf(g, c, nodes, a),
+                    _ => None,
+                },
+                ENode::Select(cnd, t, f) => match (lit(t), lit(f)) {
+                    (Some(neg), Some(zero)) if neg <= -1e20 && zero == 0.0 => g
+                        .affine_of(c, cnd)
+                        .filter(|(_, k)| k.fract() == 0.0)
+                        .map(|(mut f, k)| {
+                            f.offset += k as i64;
+                            f
+                        }),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        let mut stack = vec![seen.body_outs[0]];
+        while let Some(e) = stack.pop() {
+            match nodes[e.index() as usize] {
+                ENode::Mul(a, b) => stack.extend([a, b]),
+                ENode::Exp2(x) => {
+                    if let Some(f) = neg_inf(self, &seen, nodes, x) {
+                        return Some(f);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let _ = lit;
+        None
+    }
+
     /// The contractions nested in map operand `v` of `rc`, each a sum of
     /// products of buffers splitting into a side along `pdim` (the
     /// staged rows) and one along `kdim`. `None` when a nested arg does
