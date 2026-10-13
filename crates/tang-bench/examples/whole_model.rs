@@ -468,7 +468,15 @@ fn main() {
                     .map(|k| k.source.clone())
                     .collect::<Vec<_>>()
             };
-            let (a, c) = (sources(&b.prog), sources(&build(seq, 1, true).prog));
+            let (mut a, c) = (sources(&b.prog), sources(&build(seq, 1, true).prog));
+            // with TANG_TUNE, every lowering `Program::tuned` will time
+            if std::env::var_os("TANG_TUNE").is_some() {
+                for v in std::iter::once(None)
+                    .chain((0..tang_compile::tensor::cuda::MMA_SHAPES.len()).map(Some))
+                {
+                    a.extend(sources(&b.g.to_cuda_variant(&b.outs, v)));
+                }
+            }
             tang_gpu::cuda::precompile(a.iter().chain(&c).map(|s| s.as_str()), "sm_86");
             println!("  nvrtc {:.2?}", t.elapsed());
         }
