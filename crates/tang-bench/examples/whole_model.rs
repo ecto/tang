@@ -336,12 +336,35 @@ fn run_wgpu(b: &Built, layers: usize, seq: usize) {
 fn run_cuda(b: &Built, layers: usize, seq: usize) {
     // own stream, event tracking off: what CUDA Graph capture needs
     let rt = Runtime::cuda_capturable().expect("cuda");
+    // TANG_TUNE: every kernel at its fastest lowering (`Program::tuned`:
+    // tensor-core tile shapes against transpiled WGSL). The kernels and
+    // buffers are the same in every variant, so the memory plans hold.
+    let tuned;
+    let prog = if std::env::var_os("TANG_TUNE").is_some() {
+        let refs: Vec<&[f32]> = b.step.inputs.iter().map(|v| v.as_slice()).collect();
+        let tag = std::env::var("TANG_PRECISION_TILES").unwrap_or_else(|_| "f32".into());
+        let path = format!(
+            "{}/target/tang-tuning-whole-model-{layers}-{seq}-{tag}.txt",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let (p, rep) = Program::tuned(&rt, &b.g, &b.outs, &refs, Some(std::path::Path::new(&path)));
+        println!(
+            "  tuned: {} of {} native kernels kept{}",
+            rep.native_kept,
+            rep.native_total,
+            if rep.from_cache { " (cached)" } else { "" }
+        );
+        tuned = p.program;
+        &tuned
+    } else {
+        &b.prog
+    };
     let t = Instant::now();
-    let mut naive = planned(&rt, &b.prog, &b.naive, &b.step.inputs);
+    let mut naive = planned(&rt, prog, &b.naive, &b.step.inputs);
     println!(
         "  cuda: {} kernels, {} distinct sources compiled in {:.2?}",
         b.prog.kernels.len(),
-        program_stats(&b.prog).distinct_sources,
+        program_stats(prog).distinct_sources,
         t.elapsed()
     );
     naive.run(&rt);
@@ -355,7 +378,7 @@ fn run_cuda(b: &Built, layers: usize, seq: usize) {
     naive.capture(&rt);
     let tng = naive.time(&rt, 5);
     drop(naive);
-    let mut inplace = planned(&rt, &b.prog, &b.inplace, &b.step.inputs);
+    let mut inplace = planned(&rt, prog, &b.inplace, &b.step.inputs);
     inplace.run(&rt);
     let loss_i = inplace.read(&rt, b.outs[0]);
     println!(
@@ -381,7 +404,7 @@ fn run_cuda(b: &Built, layers: usize, seq: usize) {
     }
     {
         // the first replay of a captured step from fresh state
-        let mut fresh = planned(&rt, &b.prog, &b.inplace, &b.step.inputs);
+        let mut fresh = planned(&rt, prog, &b.inplace, &b.step.inputs);
         fresh.capture(&rt);
         fresh.run(&rt);
         println!(
