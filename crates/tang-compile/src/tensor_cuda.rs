@@ -305,12 +305,28 @@ impl TensorGraph {
             Some(&f) if halves.iter().any(|&g| g != f) => return None,
             Some(&f) => Some(f),
         };
+        // Half elements are half the bytes and a k16 step twice the work
+        // of a TF32 k8 step: the k chunk doubles (TANG_HALF_CHUNK=1 keeps
+        // it), so a stage holds the same bytes and every barrier covers
+        // as many mma as on TF32.
+        let chunk = match half {
+            Some(_) => {
+                chunk
+                    * std::env::var("TANG_HALF_CHUNK")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(2usize)
+            }
+            None => chunk,
+        };
         if half.is_some() && !chunk.is_multiple_of(16) {
             return None;
         }
         let esz = if half.is_some() { 2 } else { 4 };
-        let (lda, ldb) = (sh.lda(), sh.ldb());
-        let ldb = if half.is_some() { sh.bn + 8 } else { ldb };
+        let (lda, ldb) = match half {
+            Some(_) => (chunk + 8, sh.bn + 8),
+            None => (sh.lda(), sh.ldb()),
+        };
         // accumulators: n_outs × fm × fnn × 4 floats per thread
         if n_outs * fm * fnn * 4 > 128 {
             return None;
