@@ -1,19 +1,34 @@
 //! Dump a Qwen-shaped step program (no device needed):
 //!
-//! - `qwen_dump <dir> [seq]`: a small model's kernels into `<dir>`;
+//! - `qwen_dump <dir> [seq] [--msl]`: a small model's kernels into `<dir>`
+//!   (CUDA, or Metal with `--msl`);
 //! - `qwen_dump --plan <seq>`: Qwen3-8B's step over `seq` tokens, its
 //!   kernels by kind and the memory plan.
 fn main() {
     use tang_bench::ir_qwen::*;
     let mut args = std::env::args().skip(1);
     let first = args.next().expect("output dir or --plan");
-    let seq: usize = args.next().map_or(1, |s| s.parse().unwrap());
+    let rest: Vec<String> = args.collect();
+    let msl = rest.iter().any(|a| a == "--msl");
+    let seq: usize = rest
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .map_or(1, |s| s.parse().unwrap());
     if first == "--plan" {
-        let dims = QwenDims::qwen3_8b(if seq == 1 { 4352 } else { seq });
-        let dg = step_graph(&dims, seq);
-        let (g, outs) = compiled_decode(&dg);
-        let opts = decode_opts(&dg, &outs, dims.layers);
-        let mut program = g.to_cuda_decode(&outs, &opts).program;
+        let dims = QwenDims::qwen3_8b(4352);
+        let kctx = if seq == 1 {
+            4352
+        } else {
+            seq.next_multiple_of(64)
+        };
+        let dg = step_graph(&dims, seq, kctx);
+        let (g, outs) = compiled_decode(&dg, !msl);
+        let opts = decode_opts(&dg, &outs);
+        let mut program = if msl {
+            g.to_msl_decode(&outs, &opts).program
+        } else {
+            g.to_cuda_decode(&outs, &opts).program
+        };
         lazy_order(&mut program);
         let input_t = |k: usize| {
             program
@@ -96,15 +111,19 @@ fn main() {
         ff: 192,
         vocab: 256,
         layers: 1,
-        ctx: if seq == 1 { 16 } else { seq },
+        ctx: 16.max(seq),
         eps: 1e-6,
         theta: 1e4,
         kv_f16: true,
     };
-    let dg = step_graph(&dims, seq);
-    let (g, outs) = compiled_decode(&dg);
-    let opts = decode_opts(&dg, &outs, dims.layers);
-    let p = g.to_cuda_decode(&outs, &opts);
+    let dg = step_graph(&dims, seq, dims.ctx);
+    let (g, outs) = compiled_decode(&dg, !msl);
+    let opts = decode_opts(&dg, &outs);
+    let p = if msl {
+        g.to_msl_decode(&outs, &opts)
+    } else {
+        g.to_cuda_decode(&outs, &opts)
+    };
     for (i, (k, n)) in p.program.kernels.iter().zip(&p.native).enumerate() {
         let node = &g.nodes()[k.node.index()];
         println!(
@@ -113,6 +132,13 @@ fn main() {
             k.reads.len(),
             k.source.lines().next().unwrap_or("")
         );
-        std::fs::write(format!("{first}/k{i:02}.cu"), &k.source).unwrap();
+        let ext = if k.source.starts_with("#include") {
+            "metal"
+        } else if msl {
+            "wgsl"
+        } else {
+            "cu"
+        };
+        std::fs::write(format!("{first}/k{i:02}.{ext}"), &k.source).unwrap();
     }
 }

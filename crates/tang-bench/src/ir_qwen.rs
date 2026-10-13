@@ -1,20 +1,36 @@
 //! Qwen3 as one tensor-IR graph per step: decode (one token) and
-//! prefill (`seq` tokens from an empty cache).
+//! prefill (`seq` tokens continuing the cache from any position).
 //!
-//! A step reads its tokens' embeddings and rope angles from a `step`
-//! input, runs every layer against KV caches of fixed capacity `ctx`, and
-//! writes the last token's logits and the caches' new rows. Weights are
-//! MLX 4-bit: per projection a `[rows, cols/64, 64]` tensor of nibbles
-//! (logical values 0..=15) and bf16 `[rows, cols/64]` scales and biases.
-//! The dequantization `q·s + b` is a map the matmul reads: in decode it
-//! is inlined and evaluated where the packed words are loaded
-//! (`to_cuda_decode`, `Packing::U4`); in prefill, where each weight is
-//! read by `seq` tokens, it stays materialized and the matmul is a
-//! tensor-core tile over it.
+//! A step runs every layer against KV caches of fixed capacity `ctx` and
+//! ends with the greedy next token. Everything a decode step needs is on
+//! the device: a `state` input `(token, position)` holds the token to
+//! feed and where it goes, the step looks up its embedding and rope
+//! angles there, and writes `(argmax, position + 1)` back over `state`.
+//! The host loop reads one token id per step and writes nothing. A
+//! prefill step reads its tokens and start position `p0` from a `chunk`
+//! input, appends their K/V rows to the caches, attends causally over
+//! the cache's `p0` older rows and its own, and writes `state` likewise.
+//!
+//! Weights are MLX 4-bit: per projection a `[rows, cols/64, 64]` tensor
+//! of nibbles (logical values 0..=15) and bf16 `[rows, cols/64]` scales
+//! and biases. The dequantization `q·s + b` is a map the matmul reads: in
+//! decode it is inlined and evaluated where the packed words are loaded
+//! (`to_cuda_decode` / `to_msl_decode`, `Packing::U4`); in prefill, where
+//! each weight is read by `seq` tokens, it stays materialized and the
+//! matmul is a tensor-core (simdgroup-matrix) tile over it.
+//!
+//! **Data-dependent reads are bounded sums.** The IR's views are affine,
+//! so a read at a runtime index — the embedding row of a token, the rope
+//! angles of a position, the chunk token that cache row `j` receives — is
+//! written as a sum with one live term: `Σ_v select(v == tok, E[v], 0)`,
+//! the equality as two half-planes `select(tok − v + ½, select(v − tok
+//! + ½, …, 0), 0)`. The value is exact (one term plus zeros), the
+//! interpreter runs it as written, and the decode lowering turns the two
+//! predicates into loop bounds, so the loop has one iteration.
 //!
 //! Attention masks key positions past each query's position with
 //! `select(pos − j + ½, …, identity)` in every reduction over the cache
-//! axis; `to_cuda_decode` turns those into loop bounds, so a step reads
+//! axis, which the lowering also turns into loop bounds: a step reads
 //! `len` rows of cache, not `ctx`. The cache updates are maps
 //! `select(len − seq ≤ j < len, new, old)` that overwrite the cache in
 //! place.
@@ -68,13 +84,6 @@ impl QwenDims {
     pub fn qkv_rows(&self) -> usize {
         (self.heads + 2 * self.kv_heads) * self.head_dim
     }
-
-    /// The step input for `seq` tokens: `x [seq, d]`, `cos [seq, hd/2]`,
-    /// `sin [seq, hd/2]`, then `len` (positions in the cache after the
-    /// step).
-    pub fn step_len(&self, seq: usize) -> usize {
-        seq * (self.d_model + self.head_dim) + 1
-    }
 }
 
 /// One graph input: name (MLX tensor name stem), logical shape, packing.
@@ -95,7 +104,11 @@ pub struct DecodeGraph {
     pub g: TensorGraph,
     /// Tokens per step.
     pub seq: usize,
-    /// `[logits, k_cache'₀, v_cache'₀, k_cache'₁, …]`.
+    /// Cache rows attention reads (`ctx` for decode; a prefill reads only
+    /// the first `kctx`, which must cover its positions).
+    pub kctx: usize,
+    /// `[logits, state', k_cache'₀, v_cache'₀, k_cache'₁, …]`: the last
+    /// token's logits, then the in-place outputs.
     pub outputs: Vec<TensorId>,
     /// The residual stream after each attention and MLP block, kept
     /// materialized: a residual read once per element would otherwise be
@@ -103,6 +116,32 @@ pub struct DecodeGraph {
     /// over every earlier layer.
     pub keep: Vec<TensorId>,
     pub inputs: Vec<InputSpec>,
+}
+
+impl DecodeGraph {
+    /// Index of the graph input called `name`.
+    pub fn input(&self, name: &str) -> usize {
+        self.inputs
+            .iter()
+            .position(|s| s.name == name)
+            .unwrap_or_else(|| panic!("no input {name}"))
+    }
+
+    /// `(output, input)` pairs written in place: `state` and the caches.
+    pub fn inplace(&self) -> Vec<(TensorId, usize)> {
+        let mut v = vec![(self.outputs[1], self.input("state"))];
+        for l in 0..(self.outputs.len() - 2) / 2 {
+            v.push((
+                self.outputs[2 + 2 * l],
+                self.input(&format!("model.layers.{l}.k_cache")),
+            ));
+            v.push((
+                self.outputs[3 + 2 * l],
+                self.input(&format!("model.layers.{l}.v_cache")),
+            ));
+        }
+        v
+    }
 }
 
 fn unit(rank: usize, d: usize) -> Form {
@@ -133,6 +172,17 @@ fn arg(src: TensorId, forms: Vec<Form>) -> Arg {
 
 fn select(c: ExprId, t: ExprId, f: ExprId) -> ExprId {
     tang_expr::with_graph(|g| g.select(c, t, f))
+}
+
+fn lit(v: f64) -> ExprId {
+    ExprId::from_f64(v)
+}
+
+/// `x` where `a == b` (integers as floats), else 0: the one live term of
+/// a gather written as a sum.
+fn pick(a: ExprId, b: ExprId, x: ExprId) -> ExprId {
+    let z = lit(0.0);
+    select(a - b + lit(0.5), select(b - a + lit(0.5), x, z), z)
 }
 
 /// Rows of a per-token tensor: a `[seq, n]` comp, or the flat `step`
@@ -292,15 +342,16 @@ impl Builder {
     }
 }
 
-/// The decode step (one token at position `len − 1`).
+/// The decode step (one token, at the position `state` holds).
 pub fn decode_graph(dims: &QwenDims) -> DecodeGraph {
-    step_graph(dims, 1)
+    step_graph(dims, 1, dims.ctx)
 }
 
-/// A step over `seq` tokens. `seq == 1`: decode at any position.
-/// `seq > 1`: prefill of positions `0..seq` (the step's `len` must be
-/// `seq`; the cache rows are the tokens').
-pub fn step_graph(dims: &QwenDims, seq: usize) -> DecodeGraph {
+/// A step over `seq` tokens. `seq == 1`: decode — token and position
+/// from `state`. `seq > 1`: prefill — tokens and start position `p0`
+/// from `chunk` (`[tok₀ … tok_{seq−1}, p0]`), positions `p0..p0 + seq`;
+/// attention reads cache rows `0..kctx`, so `p0 + seq ≤ kctx ≤ ctx`.
+pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
     let QwenDims {
         d_model: d,
         heads,
@@ -313,41 +364,98 @@ pub fn step_graph(dims: &QwenDims, seq: usize) -> DecodeGraph {
         eps,
         ..
     } = *dims;
-    // prefill reads token j for cache row j: a plain (unguarded) view
-    // needs as many tokens as rows
-    assert!(seq == 1 || seq == ctx, "prefill needs ctx == seq");
+    assert!(
+        seq <= kctx && kctx <= ctx,
+        "a step's positions must fit the window"
+    );
     let half = hd / 2;
     let per = heads / kvh;
+    let groups = d / GROUP;
     let mut b = Builder {
         g: TensorGraph::new(),
         inputs: Vec::new(),
     };
-    let step = b.input("step".into(), &[dims.step_len(seq)], None);
-    let x_rows = Rows {
-        src: step,
-        off: 0,
-        stride: d as i64,
+    let state = b.input("state".into(), &[2], None);
+    let chunk = (seq > 1).then(|| b.input("chunk".into(), &[seq + 1], None));
+    // `len`: cache rows filled after the step; token t sits at
+    // position len − seq + t. Decode: state's position + 1; prefill:
+    // p0 + seq.
+    let (len_src, len_off, len_add) = match chunk {
+        Some(c) => (c, seq as i64, seq as f64),
+        None => (state, 1, 1.0),
     };
+    let len_at = |rank: usize| arg(len_src, vec![Form::constant(rank, len_off)]);
+    let lenv = |v: ExprId| v + lit(len_add);
+    let seq_f = seq as f64;
+    // token t's id (`t`: its row form)
+    let tok_at = |rank: usize, t: Form| match chunk {
+        Some(c) => arg(c, vec![t]),
+        None => arg(state, vec![Form::constant(rank, 0)]),
+    };
+
+    // x[t, g, j] = Σ_v pick(v, tok_t, E[v, g, j]): the embedding row
+    let ew = b.q4("embed", vocab, d);
+    let esp = [seq, groups, GROUP, vocab];
+    let v_iota = b.g.iota(&esp, 3);
+    let x3 =
+        b.g.comp(
+            &[seq, groups, GROUP],
+            &[vocab],
+            vec![
+                arg(ew[0], vec![unit(4, 3), unit(4, 1), unit(4, 2)]),
+                arg(ew[1], vec![unit(4, 3), unit(4, 1)]),
+                arg(ew[2], vec![unit(4, 3), unit(4, 1)]),
+                tok_at(4, unit(4, 0)),
+                arg(v_iota, ident(4)),
+            ],
+            Some(Monoid::sum()),
+            |v| vec![pick(v[4], v[3], v[0] * v[1] + v[2])],
+        )
+        .unwrap();
+    let x0 = b.g.reshape(x3, &[seq, d]).unwrap();
+    // rope angles of each token's position, from a [cos | sin][ctx, half] table
+    let rope = b.input("rope".into(), &[2, ctx, half], None);
+    let rsp = [seq, 2, half, ctx];
+    let (rp, rt) = (b.g.iota(&rsp, 3), b.g.iota(&rsp, 0));
+    let cs =
+        b.g.comp(
+            &[seq, 2, half],
+            &[ctx],
+            vec![
+                arg(rope, vec![unit(4, 1), unit(4, 3), unit(4, 2)]),
+                arg(rp, ident(4)),
+                arg(rt, ident(4)),
+                len_at(4),
+            ],
+            Some(Monoid::sum()),
+            |v| {
+                let pos = lenv(v[3]) - lit(seq_f) + v[2];
+                vec![pick(v[1], pos, v[0])]
+            },
+        )
+        .unwrap();
+    let cs = b.g.reshape(cs, &[seq, hd]).unwrap();
     let cos_rows = Rows {
-        src: step,
-        off: (seq * d) as i64,
-        stride: half as i64,
+        src: cs,
+        off: 0,
+        stride: hd as i64,
     };
     let sin_rows = Rows {
-        src: step,
-        off: (seq * d + seq * half) as i64,
-        stride: half as i64,
+        src: cs,
+        off: half as i64,
+        stride: hd as i64,
     };
-    let len_off = (seq * (d + hd)) as i64;
-    let len_at = |rank: usize| arg(step, vec![Form::constant(rank, len_off)]);
     let q_rows = heads * hd;
     let k_off = q_rows as i64;
     let v_off = (q_rows + kvh * hd) as i64;
     let scale = 1.0 / (hd as f64).sqrt();
-    let seq_f = seq as f64;
     let mut outputs = Vec::new();
     let mut keep = Vec::new();
-    let mut x = x_rows;
+    let mut x = Rows {
+        src: x0,
+        off: 0,
+        stride: d as i64,
+    };
     for l in 0..layers {
         let p = |s: &str| format!("model.layers.{l}.{s}");
         let qkv_w = b.q4(&p("qkv"), dims.qkv_rows(), d);
@@ -458,69 +566,113 @@ pub fn step_graph(dims: &QwenDims, seq: usize) -> DecodeGraph {
             kn,
             1.0,
         );
-        // cache rows len−seq ≤ j < len, in place; token t = j − (len − seq),
-        // which is affine when seq == 1 (t = 0) or len == seq (t = j)
+        // cache rows len−seq ≤ j < len, in place
         let in_step = |len: ExprId, j: ExprId, new: ExprId, old: ExprId| {
-            let le = len - ExprId::from_f64(1.0) - j + ExprId::from_f64(0.5);
-            let ge = j - len + ExprId::from_f64(seq_f) + ExprId::from_f64(0.5);
-            let inner = select(ge, new, old);
-            select(le, inner, old)
+            let le = len - lit(1.0) - j + lit(0.5);
+            let ge = j - len + lit(seq_f) + lit(0.5);
+            select(le, select(ge, new, old), old)
         };
-        let tok = |rank: usize, j: usize| {
-            if seq == 1 {
-                Form::zero(rank)
-            } else {
-                unit(rank, j)
-            }
-        };
+        // the token row j receives: decode, the one token; prefill, token
+        // j − p0 — a runtime offset, so a sum over the chunk with one live
+        // term (`pick`) that the lowering runs as a one-iteration loop
         let kc_shape = [kvh, ctx, 2, half];
+        let vc_shape = [kvh, hd, ctx];
+        let (k_val, v_val) = if seq == 1 {
+            (
+                arg(
+                    k_rot,
+                    vec![Form::zero(4), unit(4, 0), unit(4, 2), unit(4, 3)],
+                ),
+                arg(
+                    qkv,
+                    vec![Form::zero(3), form(3, &[(0, hd as i64), (1, 1)], v_off)],
+                ),
+            )
+        } else {
+            let sp = [kvh, ctx, 2, half, seq];
+            let (j, t) = (b.g.iota(&sp, 1), b.g.iota(&sp, 4));
+            let kp =
+                b.g.comp(
+                    &kc_shape,
+                    &[seq],
+                    vec![
+                        arg(k_rot, vec![unit(5, 4), unit(5, 0), unit(5, 2), unit(5, 3)]),
+                        arg(j, ident(5)),
+                        arg(t, ident(5)),
+                        len_at(5),
+                    ],
+                    Some(Monoid::sum()),
+                    |v| {
+                        let p0 = lenv(v[3]) - lit(seq_f);
+                        vec![pick(v[2], v[1] - p0, v[0])]
+                    },
+                )
+                .unwrap();
+            let sp = [kvh, hd, ctx, seq];
+            let (j, t) = (b.g.iota(&sp, 2), b.g.iota(&sp, 3));
+            let vp =
+                b.g.comp(
+                    &vc_shape,
+                    &[seq],
+                    vec![
+                        arg(
+                            qkv,
+                            vec![unit(4, 3), form(4, &[(0, hd as i64), (1, 1)], v_off)],
+                        ),
+                        arg(j, ident(4)),
+                        arg(t, ident(4)),
+                        len_at(4),
+                    ],
+                    Some(Monoid::sum()),
+                    |v| {
+                        let p0 = lenv(v[3]) - lit(seq_f);
+                        vec![pick(v[2], v[1] - p0, v[0])]
+                    },
+                )
+                .unwrap();
+            (arg(kp, ident(4)), arg(vp, ident(3)))
+        };
         let j_iota = b.g.iota(&kc_shape, 1);
         let k_new =
             b.g.comp(
                 &kc_shape,
                 &[],
                 vec![
-                    arg(k_rot, vec![tok(4, 1), unit(4, 0), unit(4, 2), unit(4, 3)]),
+                    k_val,
                     arg(k_cache, ident(4)),
                     arg(j_iota, ident(4)),
                     len_at(4),
                 ],
                 None,
-                |v| vec![in_step(v[3], v[2], v[0], v[1])],
+                |v| vec![in_step(lenv(v[3]), v[2], v[0], v[1])],
             )
             .unwrap();
-        let vc_shape = [kvh, hd, ctx];
         let jv_iota = b.g.iota(&vc_shape, 2);
         let v_new =
             b.g.comp(
                 &vc_shape,
                 &[],
                 vec![
-                    arg(
-                        qkv,
-                        vec![tok(3, 2), form(3, &[(0, hd as i64), (1, 1)], v_off)],
-                    ),
+                    v_val,
                     arg(v_cache, ident(3)),
                     arg(jv_iota, ident(3)),
                     len_at(3),
                 ],
                 None,
-                |v| vec![in_step(v[3], v[2], v[0], v[1])],
+                |v| vec![in_step(lenv(v[3]), v[2], v[0], v[1])],
             )
             .unwrap();
         outputs.push(k_new);
         outputs.push(v_new);
 
         // causal: key j is visible to token t at position len − seq + t
-        let visible = |len: ExprId, t: ExprId, j: ExprId| {
-            len - ExprId::from_f64(seq_f) + t - j + ExprId::from_f64(0.5)
-        };
+        let visible = |len: ExprId, t: ExprId, j: ExprId| lenv(len) - lit(seq_f) + t - j + lit(0.5);
         // scores[t, kvh, r, j] over (h, i): space (t, kvh, r, j, h, i)
-        let sp = [seq, kvh, per, ctx, 2, half];
+        let sp = [seq, kvh, per, kctx, 2, half];
         let (ts, js) = (b.g.iota(&sp, 0), b.g.iota(&sp, 3));
         let scores =
             b.g.comp(
-                &[seq, kvh, per, ctx],
+                &[seq, kvh, per, kctx],
                 &[2, half],
                 vec![
                     arg(
@@ -535,13 +687,12 @@ pub fn step_graph(dims: &QwenDims, seq: usize) -> DecodeGraph {
                 Some(Monoid::sum()),
                 |v| {
                     let c = visible(v[4], v[2], v[3]);
-                    let z = ExprId::from_f64(0.0);
-                    vec![select(c, v[0] * v[1], z)]
+                    vec![select(c, v[0] * v[1], lit(0.0))]
                 },
             )
             .unwrap();
         // softmax statistics over j: space (t, kvh, r, j)
-        let sp = [seq, kvh, per, ctx];
+        let sp = [seq, kvh, per, kctx];
         let (tr, jr) = (b.g.iota(&sp, 0), b.g.iota(&sp, 3));
         let s_args = |m: Option<TensorId>| {
             let mut a = vec![
@@ -558,37 +709,35 @@ pub fn step_graph(dims: &QwenDims, seq: usize) -> DecodeGraph {
         let m =
             b.g.comp(
                 &[seq, kvh, per],
-                &[ctx],
+                &[kctx],
                 s_args(None),
                 Some(Monoid::max()),
                 |v| {
                     let c = visible(v[3], v[1], v[2]);
-                    let lo = ExprId::from_f64(-1e30);
-                    vec![select(c, v[0], lo)]
+                    vec![select(c, v[0], lit(-1e30))]
                 },
             )
             .unwrap();
         let lsum =
             b.g.comp(
                 &[seq, kvh, per],
-                &[ctx],
+                &[kctx],
                 s_args(Some(m)),
                 Some(Monoid::sum()),
                 |v| {
                     let c = visible(v[3], v[1], v[2]);
-                    let z = ExprId::from_f64(0.0);
-                    vec![select(c, (v[0] - v[4]).exp(), z)]
+                    vec![select(c, (v[0] - v[4]).exp(), lit(0.0))]
                 },
             )
             .unwrap();
         // attn[t, kvh, r, c] = Σ_j p·v / l: space (t, kvh, r, c, j)
-        let sp = [seq, kvh, per, hd, ctx];
+        let sp = [seq, kvh, per, hd, kctx];
         let (to, jo) = (b.g.iota(&sp, 0), b.g.iota(&sp, 4));
         let mlv = vec![unit(5, 0), unit(5, 1), unit(5, 2)];
         let attn =
             b.g.comp(
                 &[seq, kvh, per, hd],
-                &[ctx],
+                &[kctx],
                 vec![
                     arg(scores, vec![unit(5, 0), unit(5, 1), unit(5, 2), unit(5, 4)]),
                     arg(m, mlv.clone()),
@@ -602,8 +751,7 @@ pub fn step_graph(dims: &QwenDims, seq: usize) -> DecodeGraph {
                 |v| {
                     let c = visible(v[6], v[4], v[5]);
                     let pv = (v[0] - v[1]).exp() * v[3] / v[2];
-                    let z = ExprId::from_f64(0.0);
-                    vec![select(c, pv, z)]
+                    vec![select(c, pv, lit(0.0))]
                 },
             )
             .unwrap();
@@ -657,10 +805,45 @@ pub fn step_graph(dims: &QwenDims, seq: usize) -> DecodeGraph {
         stride: d as i64,
     };
     let logits = b.linear(normed, 1, 0, lm);
+    // greedy: (index, value) of the first maximum
+    let vi = b.g.iota(&[vocab], 0);
+    let am =
+        b.g.comp_tuple(
+            &[2],
+            &[vocab],
+            vec![
+                arg(logits, vec![Form::zero(1), unit(1, 0)]),
+                arg(vi, ident(1)),
+            ],
+            Some(Monoid::argmax()),
+            |v| vec![v[1], v[0]],
+        )
+        .unwrap();
+    // state ← (argmax, len): the next step's token and its position
+    let si = b.g.iota(&[2], 0);
+    let state_new =
+        b.g.comp(
+            &[2],
+            &[],
+            vec![
+                arg(am, vec![Form::constant(1, 0)]),
+                len_at(1),
+                arg(state, ident(1)),
+                arg(si, ident(1)),
+            ],
+            None,
+            |v| {
+                let val = select(lit(0.5) - v[3], v[0], lenv(v[1]));
+                vec![select(lit(1.5) - v[3], val, v[2])]
+            },
+        )
+        .unwrap();
+    outputs.insert(0, state_new);
     outputs.insert(0, logits);
     DecodeGraph {
         g: b.g,
         seq,
+        kctx,
         outputs,
         keep,
         inputs: b.inputs,
@@ -669,10 +852,11 @@ pub fn step_graph(dims: &QwenDims, seq: usize) -> DecodeGraph {
 
 /// The passes: maps fused, siblings (gate/up) merged, epilogues
 /// inlined; for prefill (`seq > 1`) the reduce dims of the matmuls
-/// merged, so they are tensor-core tiles over the dequantized weights.
-/// Returns the graph and its outputs: `dg.outputs` (same order), then
-/// `dg.keep`.
-pub fn compiled_decode(dg: &DecodeGraph) -> (TensorGraph, Vec<TensorId>) {
+/// merged, so they are tensor-core tiles over the dequantized weights,
+/// stored f16 when `half_tiles` (CUDA's m16n8k16 tiles; Metal's
+/// simdgroup tile stages f32). Returns the graph and its outputs:
+/// `dg.outputs` (same order), then `dg.keep`.
+pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<TensorId>) {
     let all: Vec<TensorId> = dg.outputs.iter().chain(&dg.keep).copied().collect();
     let (g, outs) = dg.g.substitute_maps(&all);
     let (g, outs) = g.eliminate_common(&outs);
@@ -695,7 +879,7 @@ pub fn compiled_decode(dg: &DecodeGraph) -> (TensorGraph, Vec<TensorId>) {
         .collect();
     let caches = outs[1..dg.outputs.len()].to_vec();
     g.schedule_decode_maps(&outs, &u4, &caches);
-    if dg.seq > 1 && std::env::var_os("TANG_PREFILL_TF32").is_none() {
+    if dg.seq > 1 && half_tiles && std::env::var_os("TANG_PREFILL_TF32").is_none() {
         // prefill: the dequantized weights stored f16, so the matmuls run
         // on f16 tensor cores (the f32 activations are converted while
         // staging)
@@ -717,20 +901,23 @@ pub fn compiled_decode(dg: &DecodeGraph) -> (TensorGraph, Vec<TensorId>) {
     (g, outs)
 }
 
-/// Packed inputs and the in-place cache updates for `to_cuda_decode`.
-pub fn decode_opts(dg: &DecodeGraph, outputs: &[TensorId], layers: usize) -> DecodeOpts {
+/// Packed inputs and the in-place updates (`state`, the caches) for
+/// `to_cuda_decode` / `to_msl_decode`; `outputs` from [`compiled_decode`].
+pub fn decode_opts(dg: &DecodeGraph, outputs: &[TensorId]) -> DecodeOpts {
     let packed = dg
         .inputs
         .iter()
         .enumerate()
         .filter_map(|(k, s)| s.packing.map(|p| (k, p)))
         .collect();
-    let mut inplace = Vec::new();
-    for l in 0..layers {
-        let base = 1 + l * LAYER_INPUTS.len();
-        inplace.push((outputs[1 + 2 * l], base + 19));
-        inplace.push((outputs[2 + 2 * l], base + 20));
-    }
+    let inplace = dg
+        .inplace()
+        .into_iter()
+        .map(|(t, k)| {
+            let i = dg.outputs.iter().position(|&o| o == t).unwrap();
+            (outputs[i], k)
+        })
+        .collect();
     DecodeOpts {
         packed,
         inplace,
@@ -871,7 +1058,7 @@ pub fn lazy_order(program: &mut WgslProgram) {
     program.kernels = order.iter().map(|&i| ks[i].take().unwrap()).collect();
 }
 
-/// `cos`/`sin` of rope at `pos` (`head_dim/2` each).
+/// `cos`/`sin` of rope at `pos` (`head_dim/2` each), from f64 angles.
 pub fn rope_angles(dims: &QwenDims, pos: usize) -> (Vec<f32>, Vec<f32>) {
     let half = dims.head_dim / 2;
     (0..half)
@@ -883,23 +1070,18 @@ pub fn rope_angles(dims: &QwenDims, pos: usize) -> (Vec<f32>, Vec<f32>) {
         .unzip()
 }
 
-/// The step input for tokens `xs` (embeddings) at positions
-/// `pos0..pos0 + xs.len()`.
-pub fn step_input(dims: &QwenDims, xs: &[Vec<f32>], pos0: usize) -> Vec<f32> {
-    let seq = xs.len();
-    let mut s = Vec::with_capacity(dims.step_len(seq));
-    for x in xs {
-        s.extend_from_slice(x);
-    }
-    let angles: Vec<_> = (0..seq).map(|t| rope_angles(dims, pos0 + t)).collect();
-    for (c, _) in &angles {
-        s.extend_from_slice(c);
-    }
-    for (_, sn) in &angles {
-        s.extend_from_slice(sn);
-    }
-    s.push((pos0 + seq) as f32);
-    s
+/// The `rope` input: `[cos | sin][ctx][head_dim/2]`.
+pub fn rope_table(dims: &QwenDims) -> Vec<f32> {
+    let rows: Vec<_> = (0..dims.ctx).map(|p| rope_angles(dims, p)).collect();
+    let mut t: Vec<f32> = rows.iter().flat_map(|(c, _)| c.iter().copied()).collect();
+    t.extend(rows.iter().flat_map(|(_, s)| s.iter().copied()));
+    t
+}
+
+/// The `chunk` input of a prefill: its tokens, then the position of the
+/// first.
+pub fn chunk_input(tokens: &[usize], p0: usize) -> Vec<f32> {
+    tokens.iter().chain([&p0]).map(|&t| t as f32).collect()
 }
 
 #[cfg(test)]
@@ -926,28 +1108,33 @@ mod tests {
     fn decode_graph_lowers() {
         let dims = tiny();
         let dg = decode_graph(&dims);
-        let (g, outs) = compiled_decode(&dg);
-        let opts = decode_opts(&dg, &outs, dims.layers);
-        let p = g.to_cuda_decode(&outs, &opts);
-        let transpiled = p.native.iter().filter(|n| !**n).count();
-        assert!(p.native.iter().filter(|n| **n).count() >= 10 * dims.layers);
-        assert!(transpiled <= 4 * dims.layers + 2, "{transpiled} transpiled");
-        // packed weights are sized in words
-        let q = p
-            .program
-            .buffers
-            .iter()
-            .find(|b| b.input == Some(1))
-            .unwrap();
-        assert_eq!(q.len, dims.qkv_rows() * dims.d_model / 8);
+        let (g, outs) = compiled_decode(&dg, true);
+        let opts = decode_opts(&dg, &outs);
+        for p in [
+            g.to_cuda_decode(&outs, &opts),
+            g.to_msl_decode(&outs, &opts),
+        ] {
+            let transpiled = p.native.iter().filter(|n| !**n).count();
+            assert!(p.native.iter().filter(|n| **n).count() >= 10 * dims.layers);
+            assert!(transpiled <= dims.layers + 2, "{transpiled} transpiled");
+            // packed weights are sized in words
+            let k = dg.input("model.layers.0.qkv.q");
+            let q = p
+                .program
+                .buffers
+                .iter()
+                .find(|b| b.input == Some(k))
+                .unwrap();
+            assert_eq!(q.len, dims.qkv_rows() * dims.d_model / 8);
+        }
     }
 
     #[test]
     fn prefill_graph_lowers() {
         let dims = tiny();
-        let dg = step_graph(&dims, dims.ctx);
-        let (g, outs) = compiled_decode(&dg);
-        let opts = decode_opts(&dg, &outs, dims.layers);
+        let dg = step_graph(&dims, 6, dims.ctx);
+        let (g, outs) = compiled_decode(&dg, true);
+        let opts = decode_opts(&dg, &outs);
         let p = g.to_cuda_decode(&outs, &opts);
         let mma = p
             .program
@@ -957,5 +1144,13 @@ mod tests {
             .count();
         // qkv (fused rows), o, gate|up (merged siblings), down per layer
         assert_eq!(mma, 4 * dims.layers, "{mma} mma tiles");
+        // the cache updates are the one-iteration gathers, in place
+        let inplace = p
+            .program
+            .kernels
+            .iter()
+            .filter(|k| k.source.contains("in-place"))
+            .count();
+        assert_eq!(inplace, 2 * dims.layers + 1);
     }
 }
