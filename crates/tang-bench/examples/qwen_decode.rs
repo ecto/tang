@@ -240,6 +240,7 @@ mod cuda {
             }
         }
         let mut worst: f64 = 0.0;
+        let mut cache_ulps: f64 = 0.0;
         for pos in 0..dims.ctx {
             let x: Vec<f32> = (0..dims.d_model).map(|_| rng.f32()).collect();
             sess.step(&x, pos);
@@ -262,29 +263,29 @@ mod cuda {
                 cpu[base + 19] = kv(&res[1 + 2 * l]);
                 cpu[base + 20] = kv(&res[2 + 2 * l]);
             }
-            // the device caches against the reference's (layer 0)
-            for (which, o) in [(1usize, "k"), (2, "v")] {
+            // the device caches against the reference's (layer 0), in
+            // units of the cache format's rounding (f16: 2^-11 relative;
+            // an f32 difference in the value can flip it by one ulp)
+            for which in [1usize, 2] {
                 let raw = sess.prog.read(&sess.rt, sess.outs[which]);
                 let dev: Vec<f32> = if dims.kv_f16 {
+                    use tang_compile::tensor::precision::f16_from_bits;
                     raw.iter()
                         .flat_map(|w| {
-                            use tang_compile::tensor::precision::f16_from_bits;
                             let b = w.to_bits();
-                            [
-                                f16_from_bits(b as u16) as f32,
-                                f16_from_bits((b >> 16) as u16) as f32,
-                            ]
+                            [b as u16, (b >> 16) as u16].map(|h| f16_from_bits(h) as f32)
                         })
                         .collect()
                 } else {
                     raw
                 };
-                let e = dev
-                    .iter()
-                    .zip(&res[which])
-                    .fold(0.0f64, |m, (&a, &b)| m.max((a as f64 - b).abs()));
-                if pos < 2 {
-                    println!("pos {pos}: layer 0 {o} cache max err {e:.2e}");
+                let ulp = if dims.kv_f16 {
+                    2f64.powi(-10)
+                } else {
+                    2f64.powi(-22)
+                };
+                for (&a, &b) in dev.iter().zip(&res[which]) {
+                    cache_ulps = cache_ulps.max((a as f64 - b).abs() / (b.abs().max(1e-3) * ulp));
                 }
             }
             let want = &res[0];
@@ -302,8 +303,17 @@ mod cuda {
                 );
             }
         }
-        println!("tiny: worst relative logit error {worst:.2e}");
-        assert!(worst < 1e-4, "GPU decode disagrees with the interpreter");
+        println!(
+            "tiny: worst relative logit error {worst:.2e}, caches within {cache_ulps:.1} ulp ({})",
+            if dims.kv_f16 { "f16" } else { "f32" }
+        );
+        // f16 caches: a one-ulp flip of a cached value moves the logits by
+        // about 1e-4 of their scale
+        let tol = if dims.kv_f16 { 1e-3 } else { 1e-4 };
+        assert!(
+            worst < tol && cache_ulps <= 1.0,
+            "GPU decode disagrees with the interpreter"
+        );
     }
 
     // ------------------------------------------------------------------
