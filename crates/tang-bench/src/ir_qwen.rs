@@ -785,8 +785,7 @@ mod tests {
             .iter()
             .filter(|k| k.source.contains("mma"))
             .count();
-        // the seven projections per layer are tensor-core tiles (gate/up
-        // merged: six)
-        assert!(mma >= 5 * dims.layers, "{mma} mma tiles");
+        // qkv (fused rows), o, gate|up (merged siblings), down per layer
+        assert_eq!(mma, 4 * dims.layers, "{mma} mma tiles");
     }
 }
