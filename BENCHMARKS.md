@@ -1955,3 +1955,107 @@ projections launched as 6–48 work-groups of 256 on 6 CUs (k13: 2.3 ms, 48
 groups; k15: 1.7 ms, 18 groups): occupancy, not arithmetic — the schedule
 chosen for desktop GPUs underfills the Adreno. Whole-program tuning per
 kernel on the device (pick the schedule per node by timing) is the next step.
+
+### Per-kernel tuning, f16 storage and the GRU (Adreno 740)
+
+**Tuning.** `opencl_export tune-export ROOT CASE` writes, next to the
+program, every kernel's schedule candidates (tang-compile's
+`schedule_candidates` plus register tiles up to 8×8, k chunks 8/16/32,
+8×8-thread groups, and 64/128-thread splits). `tang_cl` times each one
+after the program runs (min of 5 launches; one launch if it is >4× the base),
+compares its output with the base kernel's, and checks the SoC temperature
+before every candidate (pauses at 82 °C until ≤78 °C). `tune-pick` keeps the
+fastest candidate within 1e-4 of the base and writes a `TuningCache`
+(`tools/opencl-runner/tuning/`, keyed by `QUALCOMM Adreno(TM) 740` + the
+untuned OpenCL sources); `TANG_CL_TUNING=DIR opencl_export export` applies it.
+
+| program | `schedule_auto` | tuned per kernel | candidates timed |
+|---|---|---|---|
+| block forward, seq 128 (17 kernels) | 7.71 ms | **6.13 ms** (−20%) | 212 |
+| loss + 7 grads, seq 128 (51 kernels) | 18.96 ms (sum of kernels) | **14.34 ms** (sum of kernels) | 689 |
+
+The training-step figure is the sum of the chosen kernels' times from the
+tuning run. The tuned program was exported but not re-run end to end,
+because the robot dropped off the network first.
+
+What won, per kernel:
+- The 6- and 18-group projections (16×16 threads, 4×4 registers) went to
+  8×8-thread groups with 4×4 or 4×8 registers (4× the groups): 0.436 →
+  0.356 ms and 0.623 → 0.515 ms.
+- The 48-group MLP matmuls kept 16×16 threads with 4×8 registers and a 16
+  chunk: 2.29 → 1.60 ms and 1.72 → 1.35 ms.
+- In the backward, the rows×lanes attention tiles (64×4 and 32×8) lose to
+  register tiles: 0.75 → 0.16 ms and 0.42 → 0.25 ms.
+- Small splits: 64 threads beat 256.
+
+**Rule (not yet applied to `schedule_auto`).** On a 6-CU part, a register
+tile launching fewer than ~4 groups per CU wants 8×8-thread groups, and
+4×8 registers beat 4×4 everywhere. Desktop GPUs were tuned the other way,
+so this belongs in a device-aware default, which needs a CU count that
+`schedule_auto` does not take yet. Left for a follow-up.
+
+**False rejects.** All 59 candidates rejected in the backward belong to
+three kernels whose outputs are cancellation noise: the dQ/dK gradients
+have an f64 magnitude of ~4e-19 and come out as f32 noise of ~20, both for
+the base kernel and for every candidate. The 1e-4 rule then rejects them
+correctly, but for the wrong reason. These two outputs also show that the
+pooled error figure in the table above (7.7e-8) hides an output whose own
+relative error is meaningless; `check` now prints the worst per-output
+relative error as well.
+
+**f16 storage** (the precision schedule enumerated, not searched: `_hops` is
+every register-tile operand in f16, `_hall` is every buffer but the outputs;
+arithmetic and accumulation stay f32; error is against the f64 `eval`):
+
+| case | f32 | f16 tile operands | f16 all buffers | keep? |
+|---|---|---|---|---|
+| matmul 1024³ (`reg8c8`) | 6.66 ms, 1.8e-6 | 7.80 ms, 8.0e-5 | 7.80 ms, 8.0e-5 | no (slower) |
+| matmul 512×576×1536 (`reg4x8`) | 3.30 ms, 1.4e-6 | 3.30 ms, 9.9e-5 | 3.30 ms, 9.9e-5 | no (same) |
+| block forward (tuned) | 6.13 ms, 1.9e-6 | 6.09 ms, 7.5e-5 | 6.03 ms, **inf** (activations > 65504) | no (noise) |
+| GRU step, batch 1 | 0.207 ms, 1.8e-7 | 0.181 ms, 1.8e-7 | **0.121 ms**, 4.1e-4 | yes: f16 everything |
+| GRU step, batch 64 | 0.596 ms, 2.0e-7 | 0.591 ms, 4.1e-4 | 0.582 ms, 4.1e-4 | no (noise) |
+
+The matmuls here are compute-bound and the tile already stages through
+local memory, so halving the bytes saves nothing. The f16-loading tile is
+slower at 1024³, where the conversions cost more than the traffic they
+save. Only the batch-1 GRU, a weight-streaming GEMV, gains (−42%). f16
+*arithmetic* (`half` math under `cl_khr_fp16`, the 2× FMA peak) needs a
+half-typed body emitter in the lowering; tang's f16 accumulation is
+emulated by rounding in f32, so it was not tried.
+The f16-storage training step was exported but not run (disconnect).
+
+**GRU latency.** `tools/opencl-runner/launch.c` gives the overhead floor
+of one launch (one 64-item group, one store), with vendor services
+running (load 7–11):
+
+| | median | min | p95 |
+|---|---|---|---|
+| enqueue + `clFinish` | 540–606 µs | 120–200 µs | 1.05–1.57 ms |
+| enqueue + `clFlush` + spin on the event | 380–423 µs | 109–111 µs | 0.90–1.34 ms |
+| device time of the kernel | 3.8 µs | | |
+| back-to-back, one finish | 13–59 µs per launch | | |
+
+The fused GRU step (`grufused_b*`) concatenates the input and hidden
+contractions on one reduce axis of `obs + hidden`, with guarded views
+reading zero past each operand. `merge_siblings` then makes the four gate
+sums one tuple reduction with the gate math as its epilogue, so the step
+compiles to **one kernel** at batch 1 (7 before) and two at batch 64.
+
+| case | kernels | device time | wall (enqueue all + finish, min) |
+|---|---|---|---|
+| GRU batch 1 | 7 | 0.207 ms | 0.655 ms |
+| GRU batch 1, fused | 1 | 0.211 ms | 0.676 ms |
+| GRU batch 1, f16 storage | 7 | 0.121 ms | 0.623 ms |
+| GRU batch 1, fused, f16 | 1 | 0.131 ms | 0.681 ms |
+| GRU batch 64 | 7 | 0.596 ms | 1.03 ms |
+| GRU batch 64, fused | 2 | 0.844 ms | 1.30 ms |
+
+The fused kernel uses `schedule_auto`'s 256-thread split (256 groups); its
+per-kernel tuning was exported but did not run before the disconnect. For a
+control loop the round trip is the limit, not the math. Each step costs at
+least ~0.11 ms and typically ~0.4–0.6 ms of submit-and-wait, with a p95
+above 1 ms under the vendor load. So 1 kHz is out of reach with one
+synchronous step per tick, and 500 Hz works at the median but misses
+deadlines at p95. To get there, enqueue several steps per submit (the
+back-to-back cost is 13–59 µs per launch), keep the loop on the GPU, or run
+the batch-1 GRU on the CPU.
