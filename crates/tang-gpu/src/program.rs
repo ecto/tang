@@ -1127,14 +1127,15 @@ mod tests {
 
     /// CUDA: a matmul whose operands are f16 (bf16) runs on m16n8k16
     /// fragments in every block shape and matches the emulator (fp32
-    /// accumulation, the output stored in the operands' format or f32).
+    /// accumulation, the output stored in the operands' format or f32);
+    /// with an f32 B operand too (converted while staging).
     #[cfg(feature = "cuda")]
     #[test]
     fn cuda_half_mma_matches_emulation() {
         use tang_compile::tensor::{cuda::MMA_SHAPES, Precision};
         let Some(rt) = Runtime::cuda() else { return };
         for f in [Format::F16, Format::BF16] {
-            for out_f in [Format::F32, f] {
+            for (out_f, b_f) in [(Format::F32, f), (f, f), (Format::F32, Format::F32)] {
                 let (m, k, n) = (200, 136, 72);
                 let mut g = TensorGraph::new();
                 let a = g.input(&[m, k]);
@@ -1143,8 +1144,8 @@ mod tests {
                 let (mut g, outs) = g.substitute_maps(&[c]);
                 g.schedule_auto(&outs);
                 let c = outs[0];
-                for t in [a, b] {
-                    g.set_precision(t, Precision::storage(f));
+                for (t, tf) in [(a, f), (b, b_f)] {
+                    g.set_precision(t, Precision::storage(tf));
                 }
                 g.set_precision(c, Precision::storage(out_f));
                 let av: Vec<f32> = (0..m * k)
@@ -1170,7 +1171,9 @@ mod tests {
                     let p = Program::new(&rt, program, &[&av, &bv]);
                     p.run(&rt);
                     let got = p.read(&rt, c);
-                    let tol = if out_f == Format::F32 {
+                    // a mixed tile rounds its f32 operand to the format (the
+                    // emulator does not)
+                    let tol = if out_f == Format::F32 && b_f == f {
                         1e-5
                     } else if f == Format::F16 {
                         1e-3
@@ -1182,7 +1185,10 @@ mod tests {
                         .zip(&want[0])
                         .map(|(x, y)| ((*x as f64) - y).abs())
                         .fold(0.0, f64::max);
-                    assert!(err <= tol * scale, "{f:?}/{out_f:?} v{v}: err {err:e}");
+                    assert!(
+                        err <= tol * scale,
+                        "{f:?}/{b_f:?}/{out_f:?} v{v}: err {err:e}"
+                    );
                 }
             }
         }

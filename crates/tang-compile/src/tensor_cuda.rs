@@ -183,6 +183,7 @@ fn mma16_prelude(f: super::Format) -> String {
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }}
+static __device__ __forceinline__ unsigned tang_pack2(float lo, float hi) {{ unsigned d; asm("cvt.rn.{ty}x2.f32 %0, %1, %2;" : "=r"(d) : "f"(hi), "f"(lo)); return d; }}
 static __device__ __forceinline__ void tang_cp16h(unsigned short* dst, const unsigned short* src, bool ok) {{
     unsigned d = (unsigned)__cvta_generic_to_shared(dst);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(d), "l"(src), "r"(ok ? 16 : 0));
@@ -292,10 +293,16 @@ impl TensorGraph {
             .filter(|st| st.2.is_none())
             .map(|st| fmt(st.0))
             .collect();
-        let half = match plain.first() {
+        // f32 operands beside half ones (fp32 master weights) are
+        // converted to the half format while staging
+        let halves: Vec<super::Format> = plain
+            .iter()
+            .copied()
+            .filter(|&f| f != super::Format::F32)
+            .collect();
+        let half = match halves.first() {
             None => None,
-            Some(&f) if plain.iter().any(|&g| g != f) => return None,
-            Some(&super::Format::F32) => None,
+            Some(&f) if halves.iter().any(|&g| g != f) => return None,
             Some(&f) => Some(f),
         };
         if half.is_some() && chunk % 16 != 0 {
@@ -631,8 +638,10 @@ impl TensorGraph {
             // 16-byte copies along the shared row: the global stride
             // there is 1 and every vector start is 4-aligned and either
             // wholly in range or wholly out
-            // elements per 16-byte vector
-            let w: i64 = if half.is_some() { 8 } else { 4 };
+            // an f32 operand of a half tile: converted while staging
+            let conv = half.is_some() && map.is_none() && fmt(buf) == super::Format::F32;
+            // elements per vector (16 bytes of the operand)
+            let w: i64 = if half.is_some() && !conv { 8 } else { 4 };
             let lead_aligned =
                 addr.offset % w == 0 && others.iter().all(|&d| addr.coefs[d] % w == 0);
             let wu = w as usize;
@@ -695,13 +704,27 @@ impl TensorGraph {
                     "            bool ok = gp < {extent}u && gk < {k_total}u;"
                 )
                 .unwrap();
-                writeln!(
-                    s,
-                    "            {}({}, b{buf} + (ok ? (unsigned)({base} + {cp} * (int)gp + {ck} * (int)gk) : 0u), ok);",
-                    if half.is_some() { "tang_cp16h" } else { "tang_cp16" },
-                    slot("pt", "kk")
-                )
-                .unwrap();
+                if conv {
+                    writeln!(
+                        s,
+                        "            float4 x = ok ? __ldg((const float4*)(b{buf} + (unsigned)({base} + {cp} * (int)gp + {ck} * (int)gk))) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);"
+                    )
+                    .unwrap();
+                    writeln!(
+                        s,
+                        "            *(uint2*)({}) = make_uint2(tang_pack2(x.x, x.y), tang_pack2(x.z, x.w));",
+                        slot("pt", "kk")
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(
+                        s,
+                        "            {}({}, b{buf} + (ok ? (unsigned)({base} + {cp} * (int)gp + {ck} * (int)gk) : 0u), ok);",
+                        if half.is_some() { "tang_cp16h" } else { "tang_cp16" },
+                        slot("pt", "kk")
+                    )
+                    .unwrap();
+                }
                 writeln!(s, "        }}").unwrap();
                 return;
             }
@@ -797,10 +820,17 @@ impl TensorGraph {
                 )
                 .unwrap();
                 if half.is_some() {
-                    // cp.async copies 4 bytes at least: a plain copy
+                    // cp.async copies 4 bytes at least: a plain copy (an
+                    // f32 operand converted)
+                    let x = format!("b{buf}[(unsigned)({base} + {cp} * (int)gp + {ck} * (int)gk)]");
+                    let x = match (conv, half) {
+                        (false, _) => x,
+                        (true, Some(super::Format::BF16)) => format!("tang_f2b({x})"),
+                        (true, _) => format!("tang_f2h({x})"),
+                    };
                     writeln!(
                         s,
-                        "            *({}) = ok ? b{buf}[(unsigned)({base} + {cp} * (int)gp + {ck} * (int)gk)] : (unsigned short)0;",
+                        "            *({}) = ok ? {x} : (unsigned short)0;",
                         slot("pt", "kk")
                     )
                     .unwrap();
@@ -1480,26 +1510,15 @@ impl TensorGraph {
         for k in &mut program.kernels {
             let root = k.node.index();
             let reads: Vec<usize> = k.reads.iter().map(|t| t.index()).collect();
-            // the flash kernels read and write f32 buffers
-            let f32_only = reads.iter().chain([&root]).all(|&j| {
-                self.nodes[self.storage(TensorId(j as u32)).n()]
-                    .precision
-                    .storage
-                    == super::Format::F32
-            });
             let native = match variant {
                 Some(v) if self.nodes[root].tile.0 > 0 => self
                     .cuda_mma_kernel_shaped(root, &reads, MMA_SHAPES[v])
                     .or_else(|| {
-                        f32_only
-                            .then(|| {
-                                self.cuda_flash_kernel_shaped(
-                                    root,
-                                    &reads,
-                                    FLASH_SHAPES[v % FLASH_SHAPES.len()],
-                                )
-                            })
-                            .flatten()
+                        self.cuda_flash_kernel_shaped(
+                            root,
+                            &reads,
+                            FLASH_SHAPES[v % FLASH_SHAPES.len()],
+                        )
                     }),
                 _ => None,
             };
@@ -1517,6 +1536,70 @@ impl TensorGraph {
             }
         }
         program.canonical()
+    }
+}
+
+impl TensorGraph {
+    /// The tensor-core kernels of [`to_cuda`](Self::to_cuda) and, for
+    /// each, the buffers its tiles stage as plain operands (a matmul's two
+    /// factors, attention's Q, K and V): stored in f16 (bf16) together,
+    /// the kernel runs on m16n8k16 f16 (bf16) fragments. What a precision
+    /// search moves as one candidate.
+    pub fn cuda_tile_operands(&self, outputs: &[TensorId]) -> Vec<(TensorId, Vec<TensorId>)> {
+        let mut g = self.clone();
+        g.schedule_nested_contractions(outputs);
+        let program = super::wgsl::with_dialect(super::wgsl::Dialect::Cuda, || {
+            g.to_program_numbered(outputs, Target::Wgsl)
+        });
+        program
+            .kernels
+            .iter()
+            .filter_map(|k| {
+                let root = k.node.index();
+                if g.nodes[root].tile.0 == 0 {
+                    return None;
+                }
+                let reads: Vec<usize> = k.reads.iter().map(|t| t.index()).collect();
+                let mut bufs: Vec<usize> = Vec::new();
+                if g.cuda_mma_kernel(root, &reads).is_some() {
+                    let b = g.bilinear_tile(root, &reads)?;
+                    for t in b.outs.iter().flatten() {
+                        if t.map_a.is_none() {
+                            bufs.push(t.buf_a);
+                        }
+                        if t.map_b.is_none() {
+                            bufs.push(t.buf_b);
+                        }
+                    }
+                } else if g.cuda_flash_kernel(root, &reads).is_some() {
+                    let f = g.flash_tile(root, &reads)?;
+                    if f.score_buf.is_none() {
+                        for (qb, _, kb, _) in &f.terms {
+                            bufs.push(*qb);
+                            bufs.push(*kb);
+                        }
+                    }
+                    let rc = g.comp_at(f.red_node)?;
+                    let e_v = rc.body_outs[2];
+                    if let ENode::Var(v) = rc.body.nodes_slice()[e_v.index() as usize] {
+                        let a = &rc.args[v as usize];
+                        if !matches!(g.nodes[a.src.n()].op, Op::Iota(_)) {
+                            bufs.push(g.storage(a.src).n());
+                        }
+                    }
+                } else {
+                    return None;
+                }
+                bufs.sort_unstable();
+                bufs.dedup();
+                (!bufs.is_empty()).then(|| {
+                    (
+                        k.node,
+                        bufs.into_iter().map(|b| TensorId(b as u32)).collect(),
+                    )
+                })
+            })
+            .collect()
     }
 }
 
@@ -2186,6 +2269,28 @@ impl TensorGraph {
         let rank = rc.rank();
         let jdim = rank - 1;
         let storage = |j: usize| self.storage(TensorId(j as u32)).n();
+        if self.nodes[f.red_node].precision.accum != super::Format::F32 {
+            return None;
+        }
+        let fmt = |j: usize| self.nodes[j].precision.storage;
+        let ld = |j: usize, idx: &str| -> String {
+            match fmt(j) {
+                super::Format::F32 => format!("b{j}[{idx}]"),
+                super::Format::F16 => format!("tang_h2f(b{j}[{idx}])"),
+                super::Format::BF16 => format!("tang_b2f(b{j}[{idx}])"),
+            }
+        };
+        let elem = |f: super::Format| {
+            if f == super::Format::F32 {
+                "float"
+            } else {
+                "unsigned short"
+            }
+        };
+        let typed = reads
+            .iter()
+            .chain([&root])
+            .any(|&j| fmt(j) != super::Format::F32);
         let sh = match std::env::var("TANG_FLASH_SHAPE") {
             Ok(v) => {
                 let p: Vec<usize> = v.split(',').filter_map(|x| x.parse().ok()).collect();
@@ -2242,13 +2347,53 @@ impl TensorGraph {
         let nq = kd / 8;
         let n_terms = f.terms.len();
         let has_k = f.score_buf.is_none();
+        // the value: a plain read, or an expression evaluated at staging
+        let e_v = rc.body_outs[2];
+        let plain_v = match rc.body.nodes_slice()[e_v.index() as usize] {
+            ENode::Var(v) => {
+                let a = &rc.args[v as usize];
+                (!matches!(self.nodes[a.src.n()].op, Op::Iota(_)))
+                    .then(|| (storage(a.src.n()), self.flat_addr(a, rank)))
+            }
+            _ => None,
+        };
+        // Q, K and V stored in f16 (bf16): m16n8k16 fragments for S and
+        // for P·V, P rounded to the format from the score registers.
+        // Plain operands must agree.
+        let mut plain: Vec<super::Format> = Vec::new();
+        if has_k {
+            for (qb, _, kb, _) in &f.terms {
+                plain.push(fmt(*qb));
+                plain.push(fmt(*kb));
+            }
+        }
+        if let Some((vb, _)) = &plain_v {
+            plain.push(fmt(*vb));
+        }
+        let half = match plain.first() {
+            None => None,
+            Some(&g) if plain.iter().any(|&x| x != g) => return None,
+            Some(&super::Format::F32) => None,
+            Some(&g) => Some(g),
+        };
+        if half.is_some() && (!kd.is_multiple_of(16) || !bj.is_multiple_of(16)) {
+            return None;
+        }
+        let esz = if half.is_some() { 2 } else { 4 };
         // fragments in registers: Q (n_terms × nq × 4), S (bj/8 × 4), O (d/8 × 4)
         if n_terms * nq * 4 + bj / 2 + d / 2 > 160 {
             return None;
         }
         // row strides: K rows are read 8 keys × 4 float2 per half warp
         // (≡ 8 mod 32 is conflict-free), V rows 4 keys × 4 float2 (≡ 4)
-        let (ldk, ldv) = (kd + 8, d + 4);
+        // halves: K and Q rows are read 8 rows × 4 words (a row stride of
+        // an odd number of 16-byte units is conflict-free), V rows 4 × 8
+        // words two rows apart (likewise)
+        let (ldk, ldv) = if half.is_some() {
+            (kd + 8, d + 8)
+        } else {
+            (kd + 8, d + 4)
+        };
         let k_floats = if has_k { n_terms * bjs * ldk } else { 0 };
         let stage_floats = k_floats + bjs * ldv;
         let q_floats = if has_k { n_terms * R * ldk } else { 0 };
@@ -2258,8 +2403,11 @@ impl TensorGraph {
         } else {
             0
         };
-        let smem_floats = (sh.stages * stage_floats).max(q_floats).max(merge_floats);
-        if smem_floats * 4 > 99 * 1024 {
+        // staging and Q in elements of `esz` bytes; the merge in floats
+        let smem_bytes = (sh.stages * stage_floats * esz)
+            .max(q_floats * esz)
+            .max(merge_floats * 4);
+        if smem_bytes > 99 * 1024 {
             return None;
         }
         let tiles_i = f.m.div_ceil(BI);
@@ -2301,10 +2449,12 @@ impl TensorGraph {
                     }
                     format!("(float)({e})")
                 }
-                _ => format!(
-                    "b{}[(unsigned)({})]",
+                _ => ld(
                     storage(a.src.n()),
-                    addr_expr(&self.flat_addr(a, rank), &coord)
+                    &format!(
+                        "(unsigned)({})",
+                        addr_expr(&self.flat_addr(a, rank), &coord)
+                    ),
                 ),
             }
         };
@@ -2319,15 +2469,17 @@ impl TensorGraph {
         };
         // a read that is contiguous along `inner` and 16-byte aligned at
         // every vector start (the other coefficients and the offset are
-        // multiples of 4), so it stages with 16-byte `cp.async`
+        // multiples of the vector width), so it stages with 16-byte
+        // `cp.async`
+        let wv: usize = if half.is_some() { 8 } else { 4 };
         let vec4 = |a: &Addr, inner: usize, extent: usize| {
             a.coefs[inner] == 1
-                && a.offset % 4 == 0
-                && extent.is_multiple_of(4)
+                && a.offset % wv as i64 == 0
+                && extent.is_multiple_of(wv)
                 && a.coefs
                     .iter()
                     .enumerate()
-                    .all(|(dim, &cf)| dim == inner || cf % 4 == 0)
+                    .all(|(dim, &cf)| dim == inner || cf % wv as i64 == 0)
         };
         // the row's query and folded head, where per-row code needs them
         let row_coords = |s: &mut String, indent: &str, r: &str| match fold {
@@ -2359,9 +2511,14 @@ impl TensorGraph {
         };
 
         let mut s = String::new();
+        let kind = match half {
+            None => "TF32",
+            Some(super::Format::BF16) => "BF16",
+            Some(_) => "F16",
+        };
         writeln!(
             s,
-            "// Auto-generated by tang-compile: flash attention on mma (TF32)"
+            "// Auto-generated by tang-compile: flash attention on mma ({kind})"
         )
         .unwrap();
         writeln!(
@@ -2372,14 +2529,20 @@ impl TensorGraph {
         .unwrap();
         writeln!(s, "#define TANG_TILES {n_tiles}").unwrap();
         writeln!(s, "#define TANG_THREADS {T}").unwrap();
-        writeln!(s, "#define TANG_SMEM {}", smem_floats * 4).unwrap();
+        writeln!(s, "#define TANG_SMEM {smem_bytes}").unwrap();
         writeln!(s, "#define select(f, t, c) ((c) ? (t) : (f))").unwrap();
         s.push_str(MMA_PRELUDE);
+        if typed {
+            s.push_str(HALF_PRELUDE);
+        }
+        if let Some(hf) = half {
+            s.push_str(&mma16_prelude(hf));
+        }
         let mut params: Vec<String> = reads
             .iter()
-            .map(|&j| format!("const float* __restrict__ b{j}"))
+            .map(|&j| format!("const {}* __restrict__ b{j}", elem(fmt(j))))
             .collect();
-        params.push("float* __restrict__ out".into());
+        params.push(format!("{}* __restrict__ out", elem(fmt(root))));
         params.push("unsigned count".into());
         writeln!(
             s,
@@ -2465,50 +2628,99 @@ impl TensorGraph {
                 )
                 .unwrap();
                 row_coords(&mut s, "        ", "r");
-                writeln!(
-                    s,
-                    "        smem[{}u + r * {ldk}u + dd] = ii < {}u ? b{qb}[(unsigned)({})] : 0.0f;",
-                    t * R * ldk,
-                    f.m,
-                    addr_expr(qa, &score_coord)
-                )
-                .unwrap();
+                if half.is_some() {
+                    writeln!(
+                        s,
+                        "        ((unsigned short*)smem)[{}u + r * {ldk}u + dd] = ii < {}u ? b{qb}[(unsigned)({})] : (unsigned short)0;",
+                        t * R * ldk,
+                        f.m,
+                        addr_expr(qa, &score_coord)
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(
+                        s,
+                        "        smem[{}u + r * {ldk}u + dd] = ii < {}u ? b{qb}[(unsigned)({})] : 0.0f;",
+                        t * R * ldk,
+                        f.m,
+                        addr_expr(qa, &score_coord)
+                    )
+                    .unwrap();
+                }
                 writeln!(s, "    }}").unwrap();
             }
             writeln!(s, "    __syncthreads();").unwrap();
             writeln!(s, "    #pragma unroll").unwrap();
             writeln!(s, "    for (int t = 0; t < {n_terms}; t++)").unwrap();
             writeln!(s, "    #pragma unroll").unwrap();
-            writeln!(s, "    for (int q = 0; q < {nq}; q++) {{").unwrap();
-            writeln!(
+            if half.is_some() {
+                // m16n8k16 A: (row gq | gq + 8) × (dd 2tq.. | 2tq + 8..)
+                writeln!(s, "    for (int q = 0; q < {}; q++) {{", kd / 16).unwrap();
+                writeln!(
+                    s,
+                    "        const unsigned short* p = (const unsigned short*)smem + t * {}u + (wrow + gq) * {ldk}u + q * 16u + 2u * tq;",
+                    R * ldk
+                )
+                .unwrap();
+                writeln!(
+                    s,
+                    "        qf[t][q][0] = *(const unsigned*)p; qf[t][q][1] = *(const unsigned*)(p + {}u);",
+                    8 * ldk
+                )
+                .unwrap();
+                writeln!(
+                    s,
+                    "        qf[t][q][2] = *(const unsigned*)(p + 8u); qf[t][q][3] = *(const unsigned*)(p + {}u);",
+                    8 * ldk + 8
+                )
+                .unwrap();
+                writeln!(s, "    }}").unwrap();
+                writeln!(s, "    __syncthreads();").unwrap();
+            } else {
+                writeln!(s, "    for (int q = 0; q < {nq}; q++) {{").unwrap();
+                writeln!(
                 s,
                 "        const float* p = smem + t * {}u + (wrow + gq) * {ldk}u + q * 8u + 2u * tq;",
                 R * ldk
             )
             .unwrap();
-            writeln!(
-                s,
-                "        float2 lo = *(const float2*)p, hi = *(const float2*)(p + {}u);",
-                8 * ldk
-            )
-            .unwrap();
-            writeln!(
-                s,
-                "        qf[t][q][0] = tang_tf32(lo.x); qf[t][q][1] = tang_tf32(hi.x);"
-            )
-            .unwrap();
-            writeln!(
-                s,
-                "        qf[t][q][2] = tang_tf32(lo.y); qf[t][q][3] = tang_tf32(hi.y);"
-            )
-            .unwrap();
-            writeln!(s, "    }}").unwrap();
-            writeln!(s, "    __syncthreads();").unwrap();
+                writeln!(
+                    s,
+                    "        float2 lo = *(const float2*)p, hi = *(const float2*)(p + {}u);",
+                    8 * ldk
+                )
+                .unwrap();
+                writeln!(
+                    s,
+                    "        qf[t][q][0] = tang_tf32(lo.x); qf[t][q][1] = tang_tf32(hi.x);"
+                )
+                .unwrap();
+                writeln!(
+                    s,
+                    "        qf[t][q][2] = tang_tf32(lo.y); qf[t][q][3] = tang_tf32(hi.y);"
+                )
+                .unwrap();
+                writeln!(s, "    }}").unwrap();
+                writeln!(s, "    __syncthreads();").unwrap();
+            }
         }
 
         // staging of one key chunk (K terms, then V) into buffer `buf`
         writeln!(s, "    auto load = [&](unsigned buf, unsigned j0) {{").unwrap();
-        writeln!(s, "        float* st = smem + buf * {stage_floats}u;").unwrap();
+        if half.is_some() {
+            writeln!(
+                s,
+                "        unsigned short* st = (unsigned short*)smem + buf * {stage_floats}u;"
+            )
+            .unwrap();
+        } else {
+            writeln!(s, "        float* st = smem + buf * {stage_floats}u;").unwrap();
+        }
+        let cp16 = if half.is_some() {
+            "tang_cp16h"
+        } else {
+            "tang_cp16"
+        };
         if has_k {
             for (t, (_, _, kb, ka)) in f.terms.iter().enumerate() {
                 let off = t * bjs * ldk;
@@ -2516,20 +2728,20 @@ impl TensorGraph {
                     writeln!(
                         s,
                         "        for (unsigned idx = tid; idx < {}u; idx += {T}u) {{",
-                        bjs * kd / 4
+                        bjs * kd / wv
                     )
                     .unwrap();
                     writeln!(
                         s,
-                        "            unsigned r = idx / {}u; unsigned dd = (idx % {}u) * 4u; unsigned jj = j0 + r;",
-                        kd / 4,
-                        kd / 4
+                        "            unsigned r = idx / {}u; unsigned dd = (idx % {}u) * {wv}u; unsigned jj = j0 + r;",
+                        kd / wv,
+                        kd / wv
                     )
                     .unwrap();
                     writeln!(s, "            bool ok = jj < {}u;", f.n_keys).unwrap();
                     writeln!(
                         s,
-                        "            tang_cp16(st + {off}u + r * {ldk}u + dd, b{kb} + (ok ? (unsigned)({}) : 0u), ok);",
+                        "            {cp16}(st + {off}u + r * {ldk}u + dd, b{kb} + (ok ? (unsigned)({}) : 0u), ok);",
                         addr_expr(ka, &score_coord)
                     )
                     .unwrap();
@@ -2546,12 +2758,21 @@ impl TensorGraph {
                     )
                     .unwrap();
                     writeln!(s, "            bool ok = jj < {}u;", f.n_keys).unwrap();
-                    writeln!(
-                        s,
-                        "            tang_cp4(st + {off}u + r * {ldk}u + dd, b{kb} + (ok ? (unsigned)({}) : 0u), ok);",
-                        addr_expr(ka, &score_coord)
-                    )
-                    .unwrap();
+                    if half.is_some() {
+                        writeln!(
+                            s,
+                            "            st[{off}u + r * {ldk}u + dd] = ok ? b{kb}[(unsigned)({})] : (unsigned short)0;",
+                            addr_expr(ka, &score_coord)
+                        )
+                        .unwrap();
+                    } else {
+                        writeln!(
+                            s,
+                            "            tang_cp4(st + {off}u + r * {ldk}u + dd, b{kb} + (ok ? (unsigned)({}) : 0u), ok);",
+                            addr_expr(ka, &score_coord)
+                        )
+                        .unwrap();
+                    }
                 }
                 writeln!(s, "        }}").unwrap();
             }
@@ -2559,34 +2780,25 @@ impl TensorGraph {
         {
             // the value: a plain read stages asynchronously; any other
             // expression is evaluated while staging
-            let e_v = rc.body_outs[2];
-            let plain = match rc.body.nodes_slice()[e_v.index() as usize] {
-                ENode::Var(v) => {
-                    let a = &rc.args[v as usize];
-                    (!matches!(self.nodes[a.src.n()].op, Op::Iota(_)))
-                        .then(|| (storage(a.src.n()), self.flat_addr(a, rank)))
-                }
-                _ => None,
-            };
-            match plain {
+            match plain_v.clone() {
                 Some((vb, va)) if vec4(&va, f.dx, d) => {
                     writeln!(
                         s,
                         "        for (unsigned idx = tid; idx < {}u; idx += {T}u) {{",
-                        bjs * d / 4
+                        bjs * d / wv
                     )
                     .unwrap();
                     writeln!(
                         s,
-                        "            unsigned r = idx / {}u; unsigned nn = (idx % {}u) * 4u; unsigned jj = j0 + r;",
-                        d / 4,
-                        d / 4
+                        "            unsigned r = idx / {}u; unsigned nn = (idx % {}u) * {wv}u; unsigned jj = j0 + r;",
+                        d / wv,
+                        d / wv
                     )
                     .unwrap();
                     writeln!(s, "            bool ok = jj < {}u;", f.n_keys).unwrap();
                     writeln!(
                         s,
-                        "            tang_cp16(st + {k_floats}u + r * {ldv}u + nn, b{vb} + (ok ? (unsigned)({}) : 0u), ok);",
+                        "            {cp16}(st + {k_floats}u + r * {ldv}u + nn, b{vb} + (ok ? (unsigned)({}) : 0u), ok);",
                         addr_expr(&va, &coord)
                     )
                     .unwrap();
@@ -2604,12 +2816,21 @@ impl TensorGraph {
                     )
                     .unwrap();
                     writeln!(s, "            bool ok = jj < {}u;", f.n_keys).unwrap();
-                    writeln!(
-                        s,
-                        "            tang_cp4(st + {k_floats}u + r * {ldv}u + nn, b{vb} + (ok ? (unsigned)({}) : 0u), ok);",
-                        addr_expr(&va, &coord)
-                    )
-                    .unwrap();
+                    if half.is_some() {
+                        writeln!(
+                            s,
+                            "            st[{k_floats}u + r * {ldv}u + nn] = ok ? b{vb}[(unsigned)({})] : (unsigned short)0;",
+                            addr_expr(&va, &coord)
+                        )
+                        .unwrap();
+                    } else {
+                        writeln!(
+                            s,
+                            "            tang_cp4(st + {k_floats}u + r * {ldv}u + nn, b{vb} + (ok ? (unsigned)({}) : 0u), ok);",
+                            addr_expr(&va, &coord)
+                        )
+                        .unwrap();
+                    }
                 }
                 None => {
                     writeln!(
@@ -2629,7 +2850,12 @@ impl TensorGraph {
                     let o = emit_body(&mut s, "                ", &rc.body, &[e_v], "v0_", &vals);
                     writeln!(s, "                v = {};", o[0]).unwrap();
                     writeln!(s, "            }}").unwrap();
-                    writeln!(s, "            st[{k_floats}u + r * {ldv}u + nn] = v;").unwrap();
+                    let v = match half {
+                        Some(super::Format::BF16) => "tang_f2b(v)",
+                        Some(_) => "tang_f2h(v)",
+                        None => "v",
+                    };
+                    writeln!(s, "            st[{k_floats}u + r * {ldv}u + nn] = {v};").unwrap();
                 }
             }
             writeln!(s, "        }}").unwrap();
@@ -2669,11 +2895,19 @@ impl TensorGraph {
         )
         .unwrap();
         writeln!(s, "        }}").unwrap();
-        writeln!(
-            s,
-            "        const float* st = smem + (c % {st}u) * {stage_floats}u;"
-        )
-        .unwrap();
+        if half.is_some() {
+            writeln!(
+                s,
+                "        const unsigned short* st = (const unsigned short*)smem + (c % {st}u) * {stage_floats}u;"
+            )
+            .unwrap();
+        } else {
+            writeln!(
+                s,
+                "        const float* st = smem + (c % {st}u) * {stage_floats}u;"
+            )
+            .unwrap();
+        }
         writeln!(s, "        unsigned j0 = c * {bjs}u + kbase;").unwrap();
         writeln!(s, "        float sc[{nsf}][4];").unwrap();
         if has_k {
@@ -2683,22 +2917,42 @@ impl TensorGraph {
             writeln!(s, "        #pragma unroll").unwrap();
             writeln!(s, "        for (int t = 0; t < {n_terms}; t++)").unwrap();
             writeln!(s, "        #pragma unroll").unwrap();
-            writeln!(s, "        for (int q = 0; q < {nq}; q++)").unwrap();
-            writeln!(s, "        #pragma unroll").unwrap();
-            writeln!(s, "        for (int j = 0; j < {nsf}; j++) {{").unwrap();
-            writeln!(
+            if half.is_some() {
+                // m16n8k16 B: key 8j + gq, dd (2tq.. | 2tq + 8..)
+                writeln!(s, "        for (int q = 0; q < {}; q++)", kd / 16).unwrap();
+                writeln!(s, "        #pragma unroll").unwrap();
+                writeln!(s, "        for (int j = 0; j < {nsf}; j++) {{").unwrap();
+                writeln!(
+                    s,
+                    "            const unsigned short* kp = st + t * {}u + (kbase + 8u * j + gq) * {ldk}u + 16u * q + 2u * tq;",
+                    bjs * ldk
+                )
+                .unwrap();
+                writeln!(
+                    s,
+                    "            unsigned kf[2] = {{*(const unsigned*)kp, *(const unsigned*)(kp + 8u)}};"
+                )
+                .unwrap();
+                writeln!(s, "            tang_mma16(sc[j], qf[t][q], kf);").unwrap();
+                writeln!(s, "        }}").unwrap();
+            } else {
+                writeln!(s, "        for (int q = 0; q < {nq}; q++)").unwrap();
+                writeln!(s, "        #pragma unroll").unwrap();
+                writeln!(s, "        for (int j = 0; j < {nsf}; j++) {{").unwrap();
+                writeln!(
                 s,
                 "            float2 kv = *(const float2*)(st + t * {}u + (kbase + 8u * j + gq) * {ldk}u + 8u * q + 2u * tq);",
                 bjs * ldk
             )
             .unwrap();
-            writeln!(
-                s,
-                "            unsigned kf[2] = {{tang_tf32(kv.x), tang_tf32(kv.y)}};"
-            )
-            .unwrap();
-            writeln!(s, "            tang_mma(sc[j], qf[t][q], kf);").unwrap();
-            writeln!(s, "        }}").unwrap();
+                writeln!(
+                    s,
+                    "            unsigned kf[2] = {{tang_tf32(kv.x), tang_tf32(kv.y)}};"
+                )
+                .unwrap();
+                writeln!(s, "            tang_mma(sc[j], qf[t][q], kf);").unwrap();
+                writeln!(s, "        }}").unwrap();
+            }
         }
         // the comp's score expression (mask) on each element, then the
         // online softmax per row half
@@ -2718,10 +2972,10 @@ impl TensorGraph {
         if let Some((sb, sa)) = &f.score_buf {
             writeln!(
                 s,
-                "                float sval = (ii < {}u && jj < {}u) ? b{sb}[(unsigned)({})] : 0.0f;",
+                "                float sval = (ii < {}u && jj < {}u) ? {} : 0.0f;",
                 f.m,
                 f.n_keys,
-                addr_expr(sa, &coord)
+                ld(*sb, &format!("(unsigned)({})", addr_expr(sa, &coord)))
             )
             .unwrap();
         } else {
@@ -2794,37 +3048,68 @@ impl TensorGraph {
         .unwrap();
         writeln!(s, "        }}").unwrap();
         // O += P · V, P straight from the score registers
-        writeln!(s, "        #pragma unroll").unwrap();
-        writeln!(s, "        for (int j = 0; j < {nsf}; j++) {{").unwrap();
-        writeln!(
+        if half.is_some() {
+            // m16n8k16 A over keys 16jk..: score fragments 2jk, 2jk + 1;
+            // B: V rows 16jk + 2tq, +1 (| +8, +9), column words split
+            // into the fragment pair as in the tiles
+            writeln!(s, "        #pragma unroll").unwrap();
+            writeln!(s, "        for (int jk = 0; jk < {}; jk++) {{", nsf / 2).unwrap();
+            writeln!(s, "            unsigned pf[4] = {{tang_pack2(sc[2 * jk][0], sc[2 * jk][1]), tang_pack2(sc[2 * jk][2], sc[2 * jk][3]), tang_pack2(sc[2 * jk + 1][0], sc[2 * jk + 1][1]), tang_pack2(sc[2 * jk + 1][2], sc[2 * jk + 1][3])}};").unwrap();
+            writeln!(s, "            #pragma unroll").unwrap();
+            writeln!(s, "            for (int jp = 0; jp < {}; jp++) {{", d / 16).unwrap();
+            writeln!(
+                s,
+                "                const unsigned short* vp = st + {k_floats}u + (kbase + 16u * jk + 2u * tq) * {ldv}u + 16u * jp + 2u * gq;"
+            )
+            .unwrap();
+            writeln!(
+                s,
+                "                unsigned r0 = *(const unsigned*)vp, r1 = *(const unsigned*)(vp + {ldv}u), r8 = *(const unsigned*)(vp + {}u), r9 = *(const unsigned*)(vp + {}u);",
+                8 * ldv,
+                9 * ldv
+            )
+            .unwrap();
+            writeln!(s, "                unsigned v0[2] = {{__byte_perm(r0, r1, 0x5410), __byte_perm(r8, r9, 0x5410)}}, v1[2] = {{__byte_perm(r0, r1, 0x7632), __byte_perm(r8, r9, 0x7632)}};").unwrap();
+            writeln!(
+                s,
+                "                tang_mma16(o[2 * jp], pf, v0); tang_mma16(o[2 * jp + 1], pf, v1);"
+            )
+            .unwrap();
+            writeln!(s, "            }}").unwrap();
+            writeln!(s, "        }}").unwrap();
+        } else {
+            writeln!(s, "        #pragma unroll").unwrap();
+            writeln!(s, "        for (int j = 0; j < {nsf}; j++) {{").unwrap();
+            writeln!(
             s,
             "            unsigned pf[4] = {{tang_tf32(sc[j][0]), tang_tf32(sc[j][2]), tang_tf32(sc[j][1]), tang_tf32(sc[j][3])}};"
         )
         .unwrap();
-        writeln!(s, "            #pragma unroll").unwrap();
-        writeln!(s, "            for (int jp = 0; jp < {}; jp++) {{", d / 16).unwrap();
-        writeln!(
+            writeln!(s, "            #pragma unroll").unwrap();
+            writeln!(s, "            for (int jp = 0; jp < {}; jp++) {{", d / 16).unwrap();
+            writeln!(
             s,
             "                const float* vp = st + {k_floats}u + (kbase + 8u * j + 2u * tq) * {ldv}u + 16u * jp + 2u * gq;"
         )
         .unwrap();
-        writeln!(
+            writeln!(
             s,
             "                float2 r0 = *(const float2*)vp, r1 = *(const float2*)(vp + {ldv}u);"
         )
-        .unwrap();
-        writeln!(
+            .unwrap();
+            writeln!(
             s,
             "                unsigned v0[2] = {{tang_tf32(r0.x), tang_tf32(r1.x)}}, v1[2] = {{tang_tf32(r0.y), tang_tf32(r1.y)}};"
         )
         .unwrap();
-        writeln!(
-            s,
-            "                tang_mma(o[2 * jp], pf, v0); tang_mma(o[2 * jp + 1], pf, v1);"
-        )
-        .unwrap();
-        writeln!(s, "            }}").unwrap();
-        writeln!(s, "        }}").unwrap();
+            writeln!(
+                s,
+                "                tang_mma(o[2 * jp], pf, v0); tang_mma(o[2 * jp + 1], pf, v1);"
+            )
+            .unwrap();
+            writeln!(s, "            }}").unwrap();
+            writeln!(s, "        }}").unwrap();
+        }
         writeln!(s, "    }}").unwrap();
         writeln!(s, "    tang_cp_wait<0>();").unwrap();
         // the quad's partial row sums
@@ -2934,9 +3219,14 @@ impl TensorGraph {
                 flat = format!("({flat}) * {np}u + (unsigned)({})", coord(dd));
             }
             writeln!(s, "            unsigned g = {flat};").unwrap();
-            writeln!(s, "            out[g * {w_out}u + 0u] = m_v;").unwrap();
-            writeln!(s, "            out[g * {w_out}u + 1u] = l_v;").unwrap();
-            writeln!(s, "            out[g * {w_out}u + 2u] = acc_v;").unwrap();
+            let st_v = |v: &str| match fmt(root) {
+                super::Format::F32 => v.to_string(),
+                super::Format::F16 => format!("tang_f2h({v})"),
+                super::Format::BF16 => format!("tang_f2b({v})"),
+            };
+            writeln!(s, "            out[g * {w_out}u + 0u] = {};", st_v("m_v")).unwrap();
+            writeln!(s, "            out[g * {w_out}u + 1u] = {};", st_v("l_v")).unwrap();
+            writeln!(s, "            out[g * {w_out}u + 2u] = {};", st_v("acc_v")).unwrap();
         } else {
             // the normalizer at (ii, nn), written in root's layout
             let ep = self.epilogue_read(c, f.red_node)?;
@@ -2961,10 +3251,9 @@ impl TensorGraph {
                         }
                     } else {
                         let addr = self.flat_addr(a, root_rank);
-                        format!(
-                            "b{}[(unsigned)({})]",
+                        ld(
                             storage(a.src.n()),
-                            addr_expr(&addr, &rcoord)
+                            &format!("(unsigned)({})", addr_expr(&addr, &rcoord)),
                         )
                     }
                 })
@@ -2977,6 +3266,11 @@ impl TensorGraph {
             }
             writeln!(s, "            unsigned g = {flat};").unwrap();
             for (slot, v) in outs.iter().enumerate() {
+                let v = match fmt(root) {
+                    super::Format::F32 => v.clone(),
+                    super::Format::F16 => format!("tang_f2h({v})"),
+                    super::Format::BF16 => format!("tang_f2b({v})"),
+                };
                 writeln!(s, "            out[g * {w_out}u + {slot}u] = {v};").unwrap();
             }
         }
