@@ -25,11 +25,22 @@
 //! By default every materialized tensor gets its own allocation. A
 //! [`BufferPlan`] maps the program's buffers onto fewer slots (tensors
 //! with disjoint lifetimes sharing one allocation); [`Program::with_plan`]
-//! allocates the slots instead. A whole-model memory planner only has to
-//! produce that mapping.
+//! allocates the slots instead and runs the kernels in the plan's order.
+//! `TensorGraph::plan_memory`'s [`MemoryPlan`] converts directly
+//! ([`BufferPlan::from_memory_plan`], [`Program::planned`]). On CUDA a
+//! plan may update in place (an output sharing its input's slot); wgpu
+//! cannot bind one buffer read-only and read-write in the same dispatch,
+//! so there such plans are refused.
+//!
+//! # CUDA graphs
+//!
+//! On a runtime from [`Runtime::cuda_capturable`] (its own stream,
+//! cudarc's event tracking off), [`Program::capture`] records one run as
+//! a CUDA graph; later [`Program::run`]s replay it.
 
 use std::cell::{RefCell, RefMut};
 
+use tang_compile::tensor::memplan::MemoryPlan;
 use tang_compile::tensor::precision::{f16_bits, f16_from_bits};
 use tang_compile::tensor::wgsl::WgslProgram;
 use tang_compile::tensor::{Format, TensorGraph, TensorId};
@@ -92,6 +103,16 @@ impl Runtime {
             return None;
         }
         CudaDevice::new(0).map(Self::Cuda)
+    }
+
+    /// CUDA device 0 set up for [`Program::capture`]
+    /// ([`CudaDevice::new_capturable`]).
+    #[cfg(feature = "cuda")]
+    pub fn cuda_capturable() -> Option<Self> {
+        if !CudaDevice::has_nvrtc() {
+            return None;
+        }
+        CudaDevice::new_capturable(0).map(Self::Cuda)
     }
 
     pub fn kind(&self) -> BackendKind {
@@ -164,15 +185,35 @@ impl Runtime {
 pub struct BufferPlan {
     pub slot: Vec<usize>,
     pub slot_len: Vec<usize>,
+    /// Kernel indices in execution order (a topological order the slot
+    /// sharing is valid for).
+    pub order: Vec<usize>,
 }
 
 impl BufferPlan {
-    /// One slot per buffer — what [`Program::new`] uses.
+    /// One slot per buffer, program order — what [`Program::new`] uses.
     pub fn identity(program: &WgslProgram) -> Self {
         Self {
             slot: (0..program.buffers.len()).collect(),
             slot_len: program.buffers.iter().map(words).collect(),
+            order: (0..program.kernels.len()).collect(),
         }
+    }
+
+    /// The slots and order of a liveness plan from
+    /// `TensorGraph::plan_memory`, in-place donations included.
+    pub fn from_memory_plan(plan: &MemoryPlan) -> Self {
+        Self {
+            slot: plan.slot.clone(),
+            slot_len: plan.slot_words.clone(),
+            order: plan.order.clone(),
+        }
+    }
+}
+
+impl From<&MemoryPlan> for BufferPlan {
+    fn from(plan: &MemoryPlan) -> Self {
+        Self::from_memory_plan(plan)
     }
 }
 
@@ -186,12 +227,30 @@ fn words(b: &tang_compile::tensor::wgsl::BufferSpec) -> usize {
     .max(1)
 }
 
+fn check_plan(program: &WgslProgram, inputs: &[&[f32]], plan: &BufferPlan) {
+    assert_eq!(plan.slot.len(), program.buffers.len(), "plan size");
+    let mut order = plan.order.clone();
+    order.sort_unstable();
+    assert!(
+        order.iter().copied().eq(0..program.kernels.len()),
+        "plan order is not a permutation of the kernels"
+    );
+    for (i, b) in program.buffers.iter().enumerate() {
+        assert!(words(b) <= plan.slot_len[plan.slot[i]], "slot too small");
+        if let Some(k) = b.input {
+            assert_eq!(inputs[k].len(), b.len, "input {k} has wrong length");
+        }
+    }
+}
+
 enum Storage {
     Wgpu(Vec<GpuBuffer>),
     #[cfg(feature = "cuda")]
     Cuda {
         slots: Vec<cudarc::driver::CudaSlice<f32>>,
         functions: Vec<cudarc::driver::CudaFunction>,
+        /// One captured run ([`Program::capture`]).
+        graph: Option<cudarc::driver::CudaGraph>,
     },
 }
 
@@ -203,6 +262,8 @@ pub struct Program {
     slot: Vec<usize>,
     /// Per kernel: slots of its reads then its output.
     args: Vec<Vec<usize>>,
+    /// Kernel indices in the order [`run`](Self::run) launches them.
+    order: Vec<usize>,
 }
 
 /// What [`Program::tuned`] did.
@@ -235,40 +296,11 @@ impl Program {
         inputs: &[&[f32]],
         plan: &BufferPlan,
     ) -> Self {
-        assert_eq!(plan.slot.len(), program.buffers.len(), "plan size");
-        for (i, b) in program.buffers.iter().enumerate() {
-            assert!(words(b) <= plan.slot_len[plan.slot[i]], "slot too small");
-            if let Some(k) = b.input {
-                assert_eq!(inputs[k].len(), b.len, "input {k} has wrong length");
-            }
-        }
-        let storage = match rt {
-            Runtime::Wgpu { device, .. } => {
-                let mut slots: Vec<GpuBuffer> = plan
-                    .slot_len
-                    .iter()
-                    .map(|&n| GpuBuffer::uninit(device, n))
-                    .collect();
-                for (i, b) in program.buffers.iter().enumerate() {
-                    let Some(k) = b.input else { continue };
-                    let s = plan.slot[i];
-                    // a whole-slot input is uploaded as its own buffer, as
-                    // the old executor did
-                    let fresh = match b.format {
-                        Format::F16 => GpuBuffer::from_u32_slice(device, &pack_f16(inputs[k])),
-                        Format::F32 => GpuBuffer::from_slice(device, inputs[k]),
-                        Format::BF16 => unreachable!("bf16 is interpreter-only"),
-                    };
-                    if fresh.len() == plan.slot_len[s] {
-                        slots[s] = fresh;
-                    } else {
-                        write_wgpu(device, &slots[s], b.format, inputs[k]);
-                    }
-                }
-                Storage::Wgpu(slots)
-            }
+        match rt {
+            Runtime::Wgpu { device, .. } => Self::wgpu_with_plan(device, program, inputs, plan),
             #[cfg(feature = "cuda")]
             Runtime::Cuda(d) => {
+                check_plan(&program, inputs, plan);
                 let mut slots: Vec<_> = plan
                     .slot_len
                     .iter()
@@ -280,19 +312,89 @@ impl Program {
                         d.stream.memcpy_htod(inputs[k], &mut view).expect("upload");
                     }
                 }
+                // nvrtc the missing kernels on all cores, then load
+                crate::cuda::precompile(program.kernels.iter().map(|k| k.source.as_str()), d.arch);
                 let functions = program
                     .kernels
                     .iter()
                     .map(|k| d.function(&k.source))
                     .collect();
-                Storage::Cuda { slots, functions }
+                let storage = Storage::Cuda {
+                    slots,
+                    functions,
+                    graph: None,
+                };
+                Self::assemble(program, storage, plan)
             }
-        };
+        }
+    }
+
+    /// Lower nothing: allocate `program` with the slots and order of a
+    /// [`MemoryPlan`] (in-place donations need CUDA).
+    pub fn planned(
+        rt: &Runtime,
+        program: WgslProgram,
+        inputs: &[&[f32]],
+        plan: &MemoryPlan,
+    ) -> Self {
+        Self::with_plan(rt, program, inputs, &BufferPlan::from_memory_plan(plan))
+    }
+
+    /// [`Program::new`] on a bare wgpu device, for callers that keep
+    /// their own device and [`KernelCache`] (run it with
+    /// [`dispatch`](Self::dispatch)).
+    pub fn on_wgpu(device: &GpuDevice, program: WgslProgram, inputs: &[&[f32]]) -> Self {
+        let plan = BufferPlan::identity(&program);
+        Self::wgpu_with_plan(device, program, inputs, &plan)
+    }
+
+    fn wgpu_with_plan(
+        device: &GpuDevice,
+        program: WgslProgram,
+        inputs: &[&[f32]],
+        plan: &BufferPlan,
+    ) -> Self {
+        check_plan(&program, inputs, plan);
+        let mut slots: Vec<GpuBuffer> = plan
+            .slot_len
+            .iter()
+            .map(|&n| GpuBuffer::uninit(device, n))
+            .collect();
+        for (i, b) in program.buffers.iter().enumerate() {
+            let Some(k) = b.input else { continue };
+            let s = plan.slot[i];
+            // a whole-slot input is uploaded as its own buffer, as the old
+            // executor did
+            let fresh = match b.format {
+                Format::F16 => GpuBuffer::from_u32_slice(device, &pack_f16(inputs[k])),
+                Format::F32 => GpuBuffer::from_slice(device, inputs[k]),
+                Format::BF16 => unreachable!("bf16 is interpreter-only"),
+            };
+            if fresh.len() == plan.slot_len[s] {
+                slots[s] = fresh;
+            } else {
+                write_wgpu(device, &slots[s], b.format, inputs[k]);
+            }
+        }
+        let p = Self::assemble(program, Storage::Wgpu(slots), plan);
+        for (i, a) in p.args.iter().enumerate() {
+            let (out, reads) = a.split_last().unwrap();
+            assert!(
+                !reads.contains(out),
+                "kernel {i} updates a slot in place: wgpu cannot bind one buffer \
+                 read-only and read-write in one dispatch (plan without donations)"
+            );
+        }
+        p
+    }
+
+    fn assemble(program: WgslProgram, storage: Storage, plan: &BufferPlan) -> Self {
         let mut p = Self {
             program,
             storage,
             slot: plan.slot.clone(),
             args: Vec::new(),
+            order: plan.order.clone(),
         };
         p.args = p
             .program
@@ -346,25 +448,79 @@ impl Program {
         }
     }
 
-    /// Run every kernel in order (one submission on wgpu, asynchronous
-    /// launches on the CUDA stream).
+    /// Run every kernel in plan order (one submission on wgpu,
+    /// asynchronous launches on the CUDA stream, or one graph launch once
+    /// [`capture`](Self::capture)d).
     pub fn run(&self, rt: &Runtime) {
         match rt {
-            Runtime::Wgpu { device, cache } => {
-                let mut cache = cache.borrow_mut();
-                cache.begin_batch();
-                for i in 0..self.program.kernels.len() {
-                    self.run_wgpu(device, &mut cache, i);
-                }
-                cache.end_batch(device);
-            }
+            Runtime::Wgpu { device, cache } => self.dispatch(device, &mut cache.borrow_mut()),
             #[cfg(feature = "cuda")]
             Runtime::Cuda(d) => {
-                for i in 0..self.program.kernels.len() {
-                    self.run_cuda(d, i);
+                if let Storage::Cuda { graph: Some(g), .. } = &self.storage {
+                    g.launch().expect("graph launch");
+                    return;
                 }
+                self.launch_all(d);
             }
         }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn launch_all(&self, d: &CudaDevice) {
+        for &i in &self.order {
+            self.run_cuda(d, i);
+        }
+    }
+
+    /// [`run`](Self::run) on a bare wgpu device and kernel cache: every
+    /// kernel as one submission.
+    pub fn dispatch(&self, device: &GpuDevice, cache: &mut KernelCache) {
+        cache.begin_batch();
+        for &i in &self.order {
+            self.run_wgpu(device, cache, i);
+        }
+        // leaving the cache in batch mode would make a later
+        // `to_vec_sync` (the hand path's readbacks) wait on work that was
+        // never submitted
+        cache.end_batch(device);
+    }
+
+    /// [`run_kernel`](Self::run_kernel) on a bare wgpu device.
+    pub fn dispatch_kernel(&self, device: &GpuDevice, cache: &mut KernelCache, i: usize) {
+        self.run_wgpu(device, cache, i);
+    }
+
+    /// Record one run as a CUDA graph; later [`run`](Self::run)s replay
+    /// it (same kernels, same slots — host writes between runs are seen).
+    /// Needs a runtime from [`Runtime::cuda_capturable`]. A no-op on wgpu.
+    pub fn capture(&mut self, rt: &Runtime) {
+        #[cfg(feature = "cuda")]
+        if let Runtime::Cuda(d) = rt {
+            use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
+            assert!(
+                d.capturable(),
+                "capture needs Runtime::cuda_capturable (own stream, no event tracking)"
+            );
+            if let Storage::Cuda { graph, .. } = &mut self.storage {
+                *graph = None;
+            }
+            d.sync();
+            d.stream
+                .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+                .expect("begin capture");
+            self.launch_all(d);
+            let g = d
+                .stream
+                .end_capture(
+                    CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+                )
+                .expect("end capture");
+            if let Storage::Cuda { graph, .. } = &mut self.storage {
+                *graph = g;
+            }
+            return;
+        }
+        let _ = rt;
     }
 
     /// Run kernel `i` only (its inputs must already be computed).
@@ -398,7 +554,10 @@ impl Program {
     #[cfg(feature = "cuda")]
     fn run_cuda(&self, d: &CudaDevice, i: usize) {
         use cudarc::driver::{LaunchConfig, PushKernelArg};
-        let Storage::Cuda { slots, functions } = &self.storage else {
+        let Storage::Cuda {
+            slots, functions, ..
+        } = &self.storage
+        else {
             panic!("program and runtime are on different backends")
         };
         let k = &self.program.kernels[i];
@@ -417,27 +576,37 @@ impl Program {
 
     /// Read `t` back as f32 (waits for queued work; f16 widened exactly).
     pub fn read(&self, rt: &Runtime, t: TensorId) -> Vec<f32> {
-        let b = &self.program.buffers[self.buffer_index(t)];
         match (rt, &self.storage) {
-            (Runtime::Wgpu { device, cache }, Storage::Wgpu(s)) => {
+            (Runtime::Wgpu { device, cache }, Storage::Wgpu(_)) => {
                 cache.borrow_mut().flush(device);
-                let raw = s[self.slot_of(t)].to_vec_sync(device);
-                match b.format {
-                    Format::F16 => unpack_f16(&raw, b.len),
-                    _ => raw[..b.len].to_vec(),
-                }
+                self.read_wgpu(device, t)
             }
             #[cfg(feature = "cuda")]
             (Runtime::Cuda(d), Storage::Cuda { slots, .. }) => {
-                let mut out = vec![0.0f32; b.len];
+                let n = self.program.buffers[self.buffer_index(t)].len;
+                let mut out = vec![0.0f32; n];
                 d.stream
-                    .memcpy_dtoh(&slots[self.slot_of(t)].slice(0..b.len), &mut out)
+                    .memcpy_dtoh(&slots[self.slot_of(t)].slice(0..n), &mut out)
                     .expect("download");
                 d.sync();
                 out
             }
             #[allow(unreachable_patterns)]
             _ => panic!("program and runtime are on different backends"),
+        }
+    }
+
+    /// [`read`](Self::read) on a bare wgpu device (work queued in a
+    /// [`KernelCache`] batch must be flushed first).
+    pub fn read_wgpu(&self, device: &GpuDevice, t: TensorId) -> Vec<f32> {
+        let b = &self.program.buffers[self.buffer_index(t)];
+        let Some(buf) = self.wgpu_buffer(t) else {
+            panic!("program is not on wgpu")
+        };
+        let raw = buf.to_vec_sync(device);
+        match b.format {
+            Format::F16 => unpack_f16(&raw, b.len),
+            _ => raw[..b.len].to_vec(),
         }
     }
 
@@ -551,14 +720,22 @@ impl Program {
             }
         })
     }
-
-    /// Lower `g` and tune it for `rt`. On CUDA, every kernel with a
-    /// tensor-core lowering is timed against its transpiled-WGSL twin and
-    /// the faster one kept; the choices are stored in `cache` (keyed by the
-    /// device and both programs' sources) so the measurement is paid once
-    /// per chip. On wgpu this is [`Program::compile`] (the WGSL schedule
-    /// autotuner, `tang_bench::ir_gpu::TuningCache`, runs on the graph
-    /// before lowering).
+    /// Lower `g` and tune it for `rt`: per kernel, the backend-native
+    /// lowering is timed against the portable one and the faster kept.
+    ///
+    /// - CUDA: every tensor-core tile (in each `MMA_SHAPES` block shape)
+    ///   against its transpiled-WGSL twin.
+    /// - wgpu on Metal (MSL passthrough): every simdgroup-matrix MSL tile
+    ///   (`to_msl_mma`, what `TANG_NATIVE=1` forces for all kernels)
+    ///   against its WGSL kernel.
+    /// - other wgpu adapters have one lowering: [`Program::compile`].
+    ///
+    /// The choices are stored in `cache` (keyed by the device and every
+    /// variant's sources) so the measurement is paid once per chip. The
+    /// WGSL *schedule* autotuner (`tang_bench::ir_gpu::autotune_kernels`,
+    /// `TuningCache`) is a different search — over graph rewrites, before
+    /// lowering — and composes with this one: tune the graph, then lower
+    /// it here.
     pub fn tuned(
         rt: &Runtime,
         g: &TensorGraph,
@@ -567,30 +744,46 @@ impl Program {
         cache: Option<&std::path::Path>,
     ) -> (Self, TuneReport) {
         match rt {
-            Runtime::Wgpu { .. } => {
-                let _ = cache;
-                (Self::compile(rt, g, outputs, inputs), TuneReport::default())
+            Runtime::Wgpu { device, .. } => {
+                let variants = vec![g.to_wgsl(outputs), g.to_msl_mma(outputs)];
+                let same_bindings = variants[0].kernels.len() == variants[1].kernels.len()
+                    && variants[0]
+                        .kernels
+                        .iter()
+                        .zip(&variants[1].kernels)
+                        .all(|(a, b)| a.node == b.node && a.reads == b.reads);
+                if !device.msl_passthrough || !same_bindings {
+                    let program = variants.into_iter().next().unwrap();
+                    return (Self::new(rt, program, inputs), TuneReport::default());
+                }
+                Self::tune_variants(rt, variants, "tang-wgpu-tuning", inputs, cache)
             }
             #[cfg(feature = "cuda")]
-            Runtime::Cuda(_) => Self::tuned_cuda(rt, g, outputs, inputs, cache),
+            Runtime::Cuda(_) => {
+                use tang_compile::tensor::cuda::MMA_SHAPES;
+                // variant 0: every kernel transpiled; 1 + v: the
+                // tensor-core tiles in block shape MMA_SHAPES[v]
+                let variants: Vec<WgslProgram> = std::iter::once(None)
+                    .chain((0..MMA_SHAPES.len()).map(Some))
+                    .map(|v| g.to_cuda_variant(outputs, v))
+                    .collect();
+                Self::tune_variants(rt, variants, "tang-cuda-tuning", inputs, cache)
+            }
         }
     }
 
-    #[cfg(feature = "cuda")]
-    fn tuned_cuda(
+    /// Pick a variant per kernel. `variants[0]` is the portable lowering,
+    /// the rest native ones with the same kernels and bindings; kernels
+    /// whose sources differ are timed, the others take variant 0. Cache
+    /// file: a `<tag> <key>` header, then `kernel variant` for every tuned
+    /// kernel not on variant 1.
+    fn tune_variants(
         rt: &Runtime,
-        g: &TensorGraph,
-        outputs: &[TensorId],
+        mut variants: Vec<WgslProgram>,
+        tag: &str,
         inputs: &[&[f32]],
         cache: Option<&std::path::Path>,
     ) -> (Self, TuneReport) {
-        use tang_compile::tensor::cuda::MMA_SHAPES;
-        // variant 0: every kernel transpiled; 1 + v: the tensor-core
-        // tiles in block shape MMA_SHAPES[v]
-        let mut variants: Vec<WgslProgram> = std::iter::once(None)
-            .chain((0..MMA_SHAPES.len()).map(Some))
-            .map(|v| g.to_cuda_variant(outputs, v))
-            .collect();
         let n_k = variants[0].kernels.len();
         assert!(variants.iter().all(|p| p.kernels.len() == n_k));
         // per kernel, the variants worth timing: distinct sources only
@@ -618,7 +811,7 @@ impl Program {
             }
             h.finish()
         };
-        let header = format!("tang-cuda-tuning {key:016x}");
+        let header = format!("{tag} {key:016x}");
         // cache lines: `kernel variant` for every tuned kernel not on variant 1
         let cached: Option<Vec<(usize, usize)>> = cache.and_then(|p| {
             let text = std::fs::read_to_string(p).ok()?;

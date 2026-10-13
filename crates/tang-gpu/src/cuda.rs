@@ -80,6 +80,27 @@ pub fn ptx_cached(source: &str, arch: &str) -> bool {
     })
 }
 
+/// nvrtc every distinct source in `sources` not yet in the on-disk PTX
+/// cache, on all cores. Needs no device (so it can run outside a GPU
+/// lock); [`CudaDevice::function`] then only loads.
+pub fn precompile<'a>(sources: impl IntoIterator<Item = &'a str>, arch: &'static str) {
+    let mut todo: Vec<&str> = sources.into_iter().collect();
+    todo.sort();
+    todo.dedup();
+    todo.retain(|s| !ptx_cached(s, arch));
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..threads.min(todo.len()) {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(src) = todo.get(i) else { break };
+                ptx(src, arch);
+            });
+        }
+    });
+}
+
 /// PTX for `source` on `arch` (e.g. `"sm_86"`): from the on-disk cache
 /// ([`ptx_cache_dir`]), else nvrtc, written back. Needs no device, so a
 /// caller can fill the cache from many threads up front.
@@ -156,6 +177,26 @@ impl CudaDevice {
             arch,
             functions: RefCell::new(HashMap::new()),
         })
+    }
+
+    /// Device `ordinal` set up for CUDA Graph capture
+    /// ([`Program::capture`](crate::program::Program::capture)): work goes
+    /// on a stream of its own (the legacy default stream cannot be
+    /// captured) and cudarc's cross-stream event tracking is off (its
+    /// events would break capture; everything here is on one stream, so
+    /// there is nothing to order).
+    pub fn new_capturable(ordinal: usize) -> Option<Self> {
+        let mut d = Self::new(ordinal)?;
+        // SAFETY: every allocation of this device is used only on `stream`
+        unsafe { d.ctx.disable_event_tracking() };
+        d.stream = d.ctx.new_stream().ok()?;
+        Some(d)
+    }
+
+    /// Whether [`Program::capture`](crate::program::Program::capture)
+    /// can capture on this device's stream.
+    pub fn capturable(&self) -> bool {
+        !self.stream.cu_stream().is_null() && !self.ctx.is_event_tracking()
     }
 
     /// nvrtc can be loaded too (a driver without the toolkit cannot

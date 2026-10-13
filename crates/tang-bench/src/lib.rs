@@ -266,19 +266,26 @@ pub mod ir_model;
 
 pub mod ir_gpu {
     use tang::Scalar;
-    use tang_compile::tensor::precision::{f16_bits, f16_from_bits};
     use tang_compile::tensor::wgsl::WgslProgram;
     use tang_compile::tensor::{Arg, Form, Monoid, ScheduleCandidate, TensorGraph, TensorId, View};
     use tang_compile::tensor::{ErrorBudget, ErrorStats, Format, Op, Precision};
     use tang_expr::ExprId;
     use tang_gpu::{GpuBuffer, GpuDevice, KernelCache};
 
-    /// Buffers for a program: graph inputs in order, then materialized
-    /// intermediates. Reused across runs.
-    pub struct Executable {
-        pub program: WgslProgram,
-        /// `buffers[i]` backs `program.buffers[i].0`.
-        pub buffers: Vec<GpuBuffer>,
+    pub use tang_gpu::program::{pack_f16, unpack_f16};
+
+    /// A [`Program`](tang_gpu::program::Program) on a caller-owned wgpu
+    /// device and [`KernelCache`]: the benchmarks' and hand path's
+    /// spelling of it. Everything (allocation, f16 packing, dispatch) is
+    /// the program's; this only keeps the `(device, cache)` signatures.
+    /// Derefs to the program (`exe.program`, `wgpu_buffer`, …).
+    pub struct Executable(pub tang_gpu::program::Program);
+
+    impl std::ops::Deref for Executable {
+        type Target = tang_gpu::program::Program;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
     }
 
     /// The program for `device`. Native simdgroup-matrix tiles (Metal,
@@ -295,134 +302,34 @@ pub mod ir_gpu {
 
     impl Executable {
         pub fn new(device: &GpuDevice, program: WgslProgram, inputs: &[&[f32]]) -> Self {
-            let buffers = program
-                .buffers
-                .iter()
-                .map(|b| match (b.input, b.format) {
-                    (Some(k), Format::F32) => {
-                        assert_eq!(inputs[k].len(), b.len, "input {k} has wrong length");
-                        GpuBuffer::from_slice(device, inputs[k])
-                    }
-                    (Some(k), Format::F16) => {
-                        assert_eq!(inputs[k].len(), b.len, "input {k} has wrong length");
-                        GpuBuffer::from_u32_slice(device, &pack_f16(inputs[k]))
-                    }
-                    (None, Format::F32) => GpuBuffer::uninit(device, b.len),
-                    (None, Format::F16) => GpuBuffer::uninit(device, b.len.div_ceil(2)),
-                    (_, Format::BF16) => unreachable!("bf16 is interpreter-only"),
-                })
-                .collect();
-            Self { program, buffers }
-        }
-
-        /// Format of the buffer holding `t`.
-        pub fn format(&self, t: TensorId) -> Format {
-            let t = self.program.storage(t);
-            self.program
-                .buffers
-                .iter()
-                .find(|b| b.node == t)
-                .unwrap()
-                .format
+            Self(tang_gpu::program::Program::on_wgpu(device, program, inputs))
         }
 
         /// The buffer holding `t` (inputs included), for feeding one
         /// program's outputs into another's inputs.
         pub fn buffer(&self, t: TensorId) -> &GpuBuffer {
-            let t = self.program.storage(t);
-            let i = self
-                .program
-                .buffers
-                .iter()
-                .position(|b| b.node == t)
-                .unwrap();
-            &self.buffers[i]
+            self.0.wgpu_buffer(t).expect("wgpu program")
         }
 
         /// Buffer of graph input `k`.
         pub fn input_buffer(&self, k: usize) -> &GpuBuffer {
-            let i = self
-                .program
-                .buffers
-                .iter()
-                .position(|b| b.input == Some(k))
-                .expect("input not bound");
-            &self.buffers[i]
+            self.buffer(self.0.input(k))
         }
 
         /// Dispatch every kernel in order as one submission.
         pub fn run(&self, device: &GpuDevice, cache: &mut KernelCache) {
-            cache.begin_batch();
-            for i in 0..self.program.kernels.len() {
-                self.run_kernel(device, cache, i);
-            }
-            // leaving the cache in batch mode would make a later
-            // `to_vec_sync` (the hand path's readbacks) wait on work that
-            // was never submitted
-            cache.end_batch(device);
+            self.0.dispatch(device, cache);
         }
 
         /// Dispatch kernel `i` only (its inputs must already be computed).
         pub fn run_kernel(&self, device: &GpuDevice, cache: &mut KernelCache, i: usize) {
-            for k in std::iter::once(&self.program.kernels[i]) {
-                let mut bufs: Vec<&GpuBuffer> = k.reads.iter().map(|t| self.buffer(*t)).collect();
-                bufs.push(self.buffer(k.node));
-                let out_idx = bufs.len() - 1;
-                cache.dispatch_buffers(
-                    device,
-                    &k.source,
-                    &bufs,
-                    &[out_idx],
-                    &[k.points, 0, 0, 0],
-                    k.count,
-                    k.workgroup_size,
-                );
-            }
+            self.0.dispatch_kernel(device, cache, i);
         }
 
         /// Read `t` back as f32 (f16 buffers are widened exactly).
         pub fn read(&self, device: &GpuDevice, t: TensorId) -> Vec<f32> {
-            let raw = self.buffer(t).to_vec_sync(device);
-            match self.format(t) {
-                Format::F16 => {
-                    let n = self
-                        .program
-                        .buffers
-                        .iter()
-                        .find(|b| b.node == self.program.storage(t))
-                        .unwrap()
-                        .len;
-                    unpack_f16(&raw, n)
-                }
-                _ => raw,
-            }
+            self.0.read_wgpu(device, t)
         }
-    }
-
-    /// f32 values → IEEE f16 (round to nearest even), two per u32 word,
-    /// little end first — the byte layout of a WGSL `array<f16>`.
-    pub fn pack_f16(v: &[f32]) -> Vec<u32> {
-        v.chunks(2)
-            .map(|p| {
-                let lo = f16_bits(p[0] as f64) as u32;
-                let hi = p.get(1).map_or(0, |&x| f16_bits(x as f64) as u32);
-                lo | (hi << 16)
-            })
-            .collect()
-    }
-
-    /// Inverse of [`pack_f16`]: the first `n` halves of `words` (read
-    /// back as f32 bit patterns), widened to f32.
-    pub fn unpack_f16(words: &[f32], n: usize) -> Vec<f32> {
-        words
-            .iter()
-            .flat_map(|w| {
-                let b = w.to_bits();
-                [b as u16, (b >> 16) as u16]
-            })
-            .take(n)
-            .map(|h| f16_from_bits(h) as f32)
-            .collect()
     }
 
     /// Additive causal mask: 0 where `j <= i`, a large negative otherwise.

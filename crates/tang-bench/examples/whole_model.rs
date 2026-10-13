@@ -17,6 +17,7 @@ use tang_bench::ir_model::{
 use tang_compile::tensor::memplan::MemoryPlan;
 use tang_compile::tensor::wgsl::WgslProgram;
 use tang_compile::tensor::{TensorGraph, TensorId};
+use tang_gpu::program::{Program, Runtime};
 
 /// FNV-1a over the f32 bits of every output, to compare runs bitwise.
 fn bits_hash(outs: impl Iterator<Item = Vec<f32>>) -> u64 {
@@ -212,60 +213,41 @@ fn clone_prog(p: &WgslProgram) -> WgslProgram {
     }
 }
 
-fn clone_plan(p: &MemoryPlan) -> MemoryPlan {
-    MemoryPlan {
-        order: p.order.clone(),
-        slot: p.slot.clone(),
-        slot_words: p.slot_words.clone(),
-        slot_input: p.slot_input.clone(),
-        inplace: p.inplace.clone(),
-        stats: p.stats,
-    }
+fn planned(rt: &Runtime, prog: &WgslProgram, plan: &MemoryPlan, inputs: &[Vec<f32>]) -> Program {
+    let refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
+    Program::planned(rt, clone_prog(prog), &refs, plan)
 }
 
 fn run_wgpu(b: &Built, layers: usize, seq: usize) {
-    use tang_bench::ir_model::PlannedExecutable;
-    use tang_gpu::{GpuDevice, KernelCache};
-    let device = GpuDevice::new_sync().expect("gpu");
-    let mut cache = KernelCache::new();
-    let time = |exe: &PlannedExecutable, cache: &mut KernelCache| {
+    let rt = Runtime::wgpu().expect("gpu");
+    let time = |exe: &Program| {
         let mut best = f64::INFINITY;
-        exe.run(&device, cache);
-        let _ = exe.read(&device, b.outs[0]);
+        exe.run(&rt);
+        let _ = exe.read(&rt, b.outs[0]);
         for _ in 0..3 {
             let t = Instant::now();
             for _ in 0..3 {
-                exe.run(&device, cache);
+                exe.run(&rt);
             }
-            let _ = exe.read(&device, b.outs[0]);
+            let _ = exe.read(&rt, b.outs[0]);
             best = best.min(t.elapsed().as_secs_f64() * 1e3 / 3.0);
         }
         best
     };
     let t = Instant::now();
-    let naive = PlannedExecutable::new(
-        &device,
-        clone_prog(&b.prog),
-        clone_plan(&b.naive),
-        &b.step.inputs,
-    );
-    naive.run(&device, &mut cache);
-    let loss_n = naive.read(&device, b.outs[0]);
-    let p_n = naive.read(&device, b.outs[1]);
+    let naive = planned(&rt, &b.prog, &b.naive, &b.step.inputs);
+    naive.run(&rt);
+    let loss_n = naive.read(&rt, b.outs[0]);
+    let p_n = naive.read(&rt, b.outs[1]);
     println!("  wgpu first run (shader compiles) {:.2?}", t.elapsed());
-    let planned = PlannedExecutable::new(
-        &device,
-        clone_prog(&b.prog),
-        clone_plan(&b.planned),
-        &b.step.inputs,
-    );
-    planned.run(&device, &mut cache);
-    let loss_p = planned.read(&device, b.outs[0]);
+    let planned_exe = planned(&rt, &b.prog, &b.planned, &b.step.inputs);
+    planned_exe.run(&rt);
+    let loss_p = planned_exe.read(&rt, b.outs[0]);
     println!(
         "  output bits hash {:016x}",
-        bits_hash(b.outs.iter().map(|&t| planned.read(&device, t)))
+        bits_hash(b.outs.iter().map(|&t| planned_exe.read(&rt, t)))
     );
-    let p_p = planned.read(&device, b.outs[1]);
+    let p_p = planned_exe.read(&rt, b.outs[1]);
     let dp = p_n
         .iter()
         .zip(&p_p)
@@ -290,22 +272,22 @@ fn run_wgpu(b: &Built, layers: usize, seq: usize) {
             .fold(0.0, f64::max);
         println!("  cpu loss {} (max |Δp'| gpu vs cpu {dp:e})", want[0][0]);
     }
-    let tn = time(&naive, &mut cache);
-    let tp = time(&planned, &mut cache);
+    let tn = time(&naive);
+    let tp = time(&planned_exe);
     drop(naive);
-    drop(planned);
+    drop(planned_exe);
     // one block's step, timed alone
     let one = build(seq, 1, false);
-    let e1 = PlannedExecutable::new(&device, one.prog, one.planned, &one.step.inputs);
+    let e1 = planned(&rt, &one.prog, &one.planned, &one.step.inputs);
     let mut best = f64::INFINITY;
-    e1.run(&device, &mut cache);
-    let _ = e1.read(&device, one.outs[0]);
+    e1.run(&rt);
+    let _ = e1.read(&rt, one.outs[0]);
     for _ in 0..3 {
         let t = Instant::now();
         for _ in 0..5 {
-            e1.run(&device, &mut cache);
+            e1.run(&rt);
         }
-        let _ = e1.read(&device, one.outs[0]);
+        let _ = e1.read(&rt, one.outs[0]);
         best = best.min(t.elapsed().as_secs_f64() * 1e3 / 5.0);
     }
     println!(
@@ -316,41 +298,45 @@ fn run_wgpu(b: &Built, layers: usize, seq: usize) {
 
 #[cfg(feature = "cuda")]
 fn run_cuda(b: &Built, layers: usize, seq: usize) {
-    use tang_bench::ir_model::cuda::PlannedCuda;
-    let ctx = tang_gpu::cudarc::driver::CudaContext::new(0).expect("cuda");
+    // own stream, event tracking off: what CUDA Graph capture needs
+    let rt = Runtime::cuda_capturable().expect("cuda");
     let t = Instant::now();
-    let mut naive = PlannedCuda::new(
-        &ctx,
-        clone_prog(&b.prog),
-        clone_plan(&b.naive),
-        &b.step.inputs,
-    );
+    let mut naive = planned(&rt, &b.prog, &b.naive, &b.step.inputs);
     println!(
         "  cuda: {} kernels, {} distinct sources compiled in {:.2?}",
         b.prog.kernels.len(),
-        naive.compiled,
+        program_stats(&b.prog).distinct_sources,
         t.elapsed()
     );
-    naive.run();
-    let loss_n = naive.read(b.outs[0]);
-    let p_n = naive.read(b.outs[1]);
-    let tn = naive.time(5, 5);
-    naive.capture();
-    let tng = naive.time(5, 5);
-    drop(naive);
-    let mut inplace = PlannedCuda::new(
-        &ctx,
-        clone_prog(&b.prog),
-        clone_plan(&b.inplace),
-        &b.step.inputs,
+    naive.run(&rt);
+    println!(
+        "  naive output bits hash {:016x}",
+        bits_hash(b.outs.iter().map(|&t| naive.read(&rt, t)))
     );
-    inplace.run();
-    let loss_i = inplace.read(b.outs[0]);
+    let loss_n = naive.read(&rt, b.outs[0]);
+    let p_n = naive.read(&rt, b.outs[1]);
+    let tn = naive.time(&rt, 5);
+    naive.capture(&rt);
+    let tng = naive.time(&rt, 5);
+    drop(naive);
+    let mut inplace = planned(&rt, &b.prog, &b.inplace, &b.step.inputs);
+    inplace.run(&rt);
+    let loss_i = inplace.read(&rt, b.outs[0]);
     println!(
         "  output bits hash {:016x}",
-        bits_hash(b.outs.iter().map(|&t| inplace.read(t)))
+        bits_hash(b.outs.iter().map(|&t| inplace.read(&rt, t)))
     );
-    let p_i = inplace.read(b.outs[1]);
+    let p_i = inplace.read(&rt, b.outs[1]);
+    {
+        // the first replay of a captured step from fresh state
+        let mut fresh = planned(&rt, &b.prog, &b.inplace, &b.step.inputs);
+        fresh.capture(&rt);
+        fresh.run(&rt);
+        println!(
+            "  graph output bits hash {:016x}",
+            bits_hash(b.outs.iter().map(|&t| fresh.read(&rt, t)))
+        );
+    }
     let dp = p_n
         .iter()
         .zip(&p_i)
@@ -360,15 +346,15 @@ fn run_cuda(b: &Built, layers: usize, seq: usize) {
         "  loss naive {} planned+in-place {} (max |Δp'| {dp:e})",
         loss_n[0], loss_i[0]
     );
-    let ti = inplace.time(5, 5);
-    inplace.capture();
-    let tig = inplace.time(5, 5);
+    let ti = inplace.time(&rt, 5);
+    inplace.capture(&rt);
+    let tig = inplace.time(&rt, 5);
     drop(inplace);
     let one = build(seq, 1, true);
-    let mut e1 = PlannedCuda::new(&ctx, one.prog, one.inplace, &one.step.inputs);
-    let t1 = e1.time(10, 5);
-    e1.capture();
-    let t1g = e1.time(10, 5);
+    let mut e1 = planned(&rt, &one.prog, &one.inplace, &one.step.inputs);
+    let t1 = e1.time(&rt, 10);
+    e1.capture(&rt);
+    let t1g = e1.time(&rt, 10);
     println!(
         "  cuda step: naive {tn:.2} ms (graph {tng:.2}), planned+in-place {ti:.2} ms (graph {tig:.2}); one block's step {t1:.2} ms (graph {t1g:.2}) × {layers} = {:.2} ms",
         t1 * layers as f64
@@ -391,8 +377,14 @@ fn main() {
         #[cfg(feature = "cuda")]
         "cuda-compile" => {
             let t = Instant::now();
-            tang_bench::ir_model::cuda::compile_all(&b.prog);
-            tang_bench::ir_model::cuda::compile_all(&build(seq, 1, true).prog);
+            let sources = |p: &WgslProgram| {
+                p.kernels
+                    .iter()
+                    .map(|k| k.source.clone())
+                    .collect::<Vec<_>>()
+            };
+            let (a, c) = (sources(&b.prog), sources(&build(seq, 1, true).prog));
+            tang_gpu::cuda::precompile(a.iter().chain(&c).map(|s| s.as_str()), "sm_86");
             println!("  nvrtc {:.2?}", t.elapsed());
         }
         #[cfg(feature = "cuda")]
