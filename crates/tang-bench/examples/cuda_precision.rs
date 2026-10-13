@@ -192,7 +192,8 @@ fn main() {
                     budget,
                     &[],
                     &formats,
-                    20,
+                    min_gain(),
+                    8,
                 );
                 for t in &r.trials {
                     println!(
@@ -284,4 +285,12 @@ fn main() {
             _ => panic!("phase {phase}"),
         }
     }
+}
+
+/// `TANG_MIN_GAIN`: the fraction a precision move must save (default 0.01).
+fn min_gain() -> f64 {
+    std::env::var("TANG_MIN_GAIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.01)
 }

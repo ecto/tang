@@ -476,6 +476,7 @@ fn main() {
                 budget,
                 &graph_inputs(&b.prog),
                 &[Format::F16, Format::BF16],
+                min_gain(),
                 5,
             );
             for t in &r.trials {
@@ -506,4 +507,12 @@ fn main() {
         }
         _ => {}
     }
+}
+
+/// `TANG_MIN_GAIN`: the fraction a precision move must save (default 0.01).
+fn min_gain() -> f64 {
+    std::env::var("TANG_MIN_GAIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.01)
 }

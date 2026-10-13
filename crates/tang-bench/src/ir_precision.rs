@@ -9,8 +9,9 @@
 //!    transpiled fallback.
 //! 2. **Per buffer.** Every remaining f32 buffer, largest first.
 //! 3. Each candidate is run against the f64 reference. It is kept only if
-//!    the program stays within the [`ErrorBudget`] and gets at least 3%
-//!    faster than the schedule so far. At the end, the result is re-timed
+//!    the program stays within the [`ErrorBudget`] and gets `min_gain`
+//!    faster than the schedule so far (a move "all tiles" comes first:
+//!    single block-sized matmuls gain a few percent each). At the end, the result is re-timed
 //!    against the f32 baseline, and the change is dropped if the gain is
 //!    under 1%.
 //!
@@ -66,6 +67,8 @@ pub fn moves(g: &TensorGraph, outputs: &[TensorId], exclude: &[TensorId]) -> Vec
             (k, bufs)
         })
         .filter(|(_, bufs)| !bufs.is_empty())
+        .collect::<Vec<_>>()
+        .into_iter()
         .map(|(k, bufs)| Move {
             what: format!(
                 "tile {} operands {:?}",
@@ -75,6 +78,20 @@ pub fn moves(g: &TensorGraph, outputs: &[TensorId], exclude: &[TensorId]) -> Vec
             buffers: bufs,
         })
         .collect();
+    // every tile at once first: each block-sized matmul is a few percent
+    // of a program, so the tiles' gains only clear the bar together
+    if out.len() > 1 {
+        let mut all: Vec<TensorId> = out.iter().flat_map(|m| m.buffers.clone()).collect();
+        all.sort_unstable_by_key(|t| t.index());
+        all.dedup();
+        out.insert(
+            0,
+            Move {
+                what: format!("all {} tiles", out.len()),
+                buffers: all,
+            },
+        );
+    }
     let mut bufs: Vec<(TensorId, usize)> = g
         .to_cuda(outputs)
         .buffers
@@ -150,7 +167,7 @@ pub fn candidate_sources(
 /// Greedy precision search on `rt` (see the module docs). `formats` are
 /// the storage formats tried per move, in order (e.g. `[F16, BF16]`).
 /// The fastest admitted format is taken if it beats the current schedule
-/// by 3%.
+/// by `min_gain` (a fraction: 0.01 is 1%, about the cost's noise).
 #[allow(clippy::too_many_arguments)]
 pub fn tune_precision(
     rt: &Runtime,
@@ -161,6 +178,7 @@ pub fn tune_precision(
     budget: ErrorBudget,
     exclude: &[TensorId],
     formats: &[Format],
+    min_gain: f64,
     iters: usize,
 ) -> PrecisionTune {
     // A time-sliced GPU (another tenant at full load) halves or doubles
@@ -213,8 +231,8 @@ pub fn tune_precision(
             }
         }
         if let Some((v, p, err, r, i)) = best {
-            // a change must buy at least 3% to be worth its error
-            if r < 0.97 {
+            // a change must buy `min_gain` to be worth its error
+            if r < 1.0 - min_gain {
                 trials[i].kept = true;
                 cur = v;
                 cur_p = p;
