@@ -255,7 +255,9 @@ impl TensorGraph {
                     Some(v) => self.nested_plan(rc, rank, *v, pdim, kdim, reads)?,
                     None => Vec::new(),
                 };
-                if !plan.is_empty() && (block % nwarps != 0 || (block / nwarps) % 16 != 0) {
+                if !plan.is_empty()
+                    && (!block.is_multiple_of(nwarps) || !(block / nwarps).is_multiple_of(16))
+                {
                     return None;
                 }
                 let nfm = block / nwarps / 16;

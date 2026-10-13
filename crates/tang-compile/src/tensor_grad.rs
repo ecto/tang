@@ -846,6 +846,40 @@ mod tests {
         }
     }
 
+    /// `Σ_k f(i)·g(i, k)` becomes `f(i)·Σ_k g(i, k)`, with the same values.
+    #[test]
+    fn invariant_factors_leave_sums() {
+        let mut g = TensorGraph::new();
+        let a = g.input(&[3]);
+        let b = g.input(&[3, 4]);
+        let ab = g
+            .comp(
+                &[3],
+                &[4],
+                vec![
+                    Arg {
+                        src: a,
+                        view: View::pick(2, &[Some(0)]),
+                    },
+                    Arg {
+                        src: b,
+                        view: View::identity(2, 2),
+                    },
+                ],
+                Some(Monoid::sum()),
+                |v| vec![v[0] * v[1] * v[1]],
+            )
+            .unwrap();
+        let inputs = [ramp(3, 0.3, -0.5), ramp(12, 0.2, 0.1)];
+        let want = g.eval(&inputs, &[ab]);
+        let (h, outs) = g.hoist_invariant_factors(&[ab]);
+        assert!(h.comp_at(outs[0].index()).unwrap().monoid.is_none());
+        let got = h.eval(&inputs, &outs);
+        for (x, y) in want[0].iter().zip(&got[0]) {
+            assert!((x - y).abs() < 1e-12, "{x} vs {y}");
+        }
+    }
+
     #[test]
     fn online_softmax_backward_is_supported() {
         let mut g = TensorGraph::new();
