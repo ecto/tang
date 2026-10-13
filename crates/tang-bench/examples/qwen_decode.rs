@@ -225,6 +225,18 @@ mod cuda {
             .iter()
             .map(|v| v.iter().map(|&x| x as f64).collect())
             .collect();
+        // the reference stores the updated caches in f16 like the device
+        // (the interpreter's precision emulation), so the current row is
+        // rounded before attention reads it there too
+        let mut gref = dg.g.clone();
+        if dims.kv_f16 {
+            use tang_compile::tensor::{Format, Precision};
+            for l in 0..dims.layers {
+                for t in [dg.outputs[1 + 2 * l], dg.outputs[2 + 2 * l]] {
+                    gref.set_precision(t, Precision::storage(Format::F16));
+                }
+            }
+        }
         let mut worst: f64 = 0.0;
         for pos in 0..dims.ctx {
             let x: Vec<f32> = (0..dims.d_model).map(|_| rng.f32()).collect();
@@ -235,7 +247,7 @@ mod cuda {
             s.extend(cos.iter().chain(&sin).map(|&v| v as f64));
             s.push((pos + 1) as f64);
             cpu[0] = s;
-            let res = dg.g.eval(&cpu, &dg.outputs);
+            let res = gref.eval_emulated(&cpu, &dg.outputs);
             for l in 0..dims.layers {
                 let base = 1 + l * LAYER_INPUTS.len();
                 let kv = |v: &Vec<f64>| -> Vec<f64> {
