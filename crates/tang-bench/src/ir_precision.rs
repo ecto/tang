@@ -271,7 +271,15 @@ pub fn tune_precision(
                 kept: false,
             });
             if let Some(t) = ms {
-                if best.as_ref().is_none_or(|b| t < b.2) {
+                // formats within `min_gain` of each other: the more accurate
+                let better = |b: &(TensorGraph, ErrorStats, f64, usize)| {
+                    if (t - b.2).abs() <= b.2 * min_gain {
+                        err.max_rel < b.1.max_rel
+                    } else {
+                        t < b.2
+                    }
+                };
+                if best.as_ref().is_none_or(better) {
                     best = Some((v, err, t, trials.len() - 1));
                 }
             }
