@@ -26,7 +26,8 @@ use tang_gpu::program::{Program, Runtime};
 pub struct PrecisionTrial {
     pub what: String,
     pub error: ErrorStats,
-    /// Whole-program time (ms); `None` when over budget.
+    /// Sum of the program's per-kernel times (ms, fastest single launch
+    /// each); `None` when over budget.
     pub ms: Option<f64>,
     /// Time relative to the schedule so far, measured in the same window.
     pub vs: Option<f64>,
@@ -39,6 +40,7 @@ pub struct PrecisionTune {
     pub assignment: Vec<(TensorId, Precision)>,
     pub error: ErrorStats,
     pub base_error: ErrorStats,
+    /// Sums of per-kernel times (ms) of the f32 and chosen schedules.
     pub base_ms: f64,
     pub ms: f64,
     pub trials: Vec<PrecisionTrial>,
@@ -161,20 +163,22 @@ pub fn tune_precision(
     formats: &[Format],
     iters: usize,
 ) -> PrecisionTune {
-    // A shared GPU's speed drifts by 2x within seconds, so a candidate is
-    // timed against the current schedule in the same window: interleaved
-    // rounds, best of each, compared as a ratio.
-    let duel = |a: &Program, b: &Program| {
-        let (mut ta, mut tb) = (f64::INFINITY, f64::INFINITY);
-        for _ in 0..3 {
-            ta = ta.min(a.time(rt, iters));
-            tb = tb.min(b.time(rt, iters));
-        }
-        (ta, tb)
+    // A time-sliced GPU (another tenant at full load) halves or doubles
+    // a whole program's wall time from one batch to the next; a single
+    // short launch usually runs between the other tenant's slices. So a
+    // program's cost is the sum over its kernels of the fastest of many
+    // single launches (`Program::time_kernel`), and a candidate is
+    // compared with the current schedule as a ratio of those sums.
+    let cost = |p: &Program| -> f64 {
+        p.run(rt);
+        (0..p.program.kernels.len())
+            .map(|i| p.time_kernel(rt, i, iters))
+            .sum()
     };
+    let duel = |a: &Program, b: &Program| (cost(a), cost(b));
     let base_p = Program::compile(rt, &g, outputs, inputs);
     let base_error = program_error(rt, &base_p, outputs, want);
-    let base_ms = base_p.time(rt, iters);
+    let base_ms = cost(&base_p);
     let base = g.clone();
     let mut cur = g;
     let mut cur_p = base_p;

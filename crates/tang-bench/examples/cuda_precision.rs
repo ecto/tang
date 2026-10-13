@@ -265,16 +265,20 @@ fn main() {
                         "{name} {s}: rel err {:.2e} (mean {:.2e}), {} of {} native, {half_mma} on half mma, digest {h:016x}",
                         err.max_rel, err.mean_rel, rep.native_kept, rep.native_total
                     );
-                    progs.push((s, p, f64::INFINITY));
+                    progs.push((s, p, f64::INFINITY, f64::INFINITY));
                 }
                 // interleaved rounds, best of each
                 for _ in 0..rounds {
-                    for (_, p, best) in progs.iter_mut() {
+                    for (_, p, best, ks) in progs.iter_mut() {
                         *best = best.min(p.time(&rt, 50));
+                        let sum: f64 = (0..p.program.kernels.len())
+                            .map(|i| p.time_kernel(&rt, i, 20))
+                            .sum();
+                        *ks = ks.min(sum);
                     }
                 }
-                for (s, _, best) in &progs {
-                    println!("{name} {s}: {best:.3} ms");
+                for (s, _, best, ks) in &progs {
+                    println!("{name} {s}: {best:.3} ms whole program, {ks:.3} ms sum of kernels");
                 }
             }
             _ => panic!("phase {phase}"),
