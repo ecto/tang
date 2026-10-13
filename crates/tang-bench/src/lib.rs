@@ -261,6 +261,10 @@ pub fn random_spd_flat(size: usize) -> Vec<f64> {
 #[path = "ir_msl.rs"]
 pub mod ir_msl;
 
+/// Precision search through `tang_gpu::program::Program` (CUDA or wgpu).
+#[path = "ir_precision.rs"]
+pub mod ir_precision;
+
 /// Whole-model compilation: N blocks, loss, backward and AdamW as one graph.
 pub mod ir_model;
 

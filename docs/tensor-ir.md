@@ -220,7 +220,7 @@ the old behaviour.
   (neighbouring halves belong to different threads). No device feature
   needed. f16 accumulation is lowered as a round-trip through
   `pack2x16float` after each combine — the numerics of an f16
-  accumulator, not its speed. bf16 is interpreter-only (WGSL has no bf16
+  accumulator, not its speed. bf16 is not available on WGSL (it has no bf16
   type; the lowering panics on it).
 - **Search.** `tang_bench::ir_gpu::tune_precision` takes a scheduled
   graph and a budget, lowers buffers to f16 one at a time (largest
@@ -228,6 +228,43 @@ the old behaviour.
   change only if the program stays within budget and gets faster (≥ 3%,
   re-timed at the end against f32). Accumulators are tried against the
   budget only.
+
+- **CUDA lowering.** `to_cuda` emits the shared kernels under a CUDA
+  dialect: f16 and bf16 buffers are native 16-bit arrays (`unsigned
+  short`), one element per index, converted with PTX `cvt`. No headers,
+  no packing, no atomics. On the host, `Program` packs and unpacks them
+  two per word. The tensor-core tiles follow storage:
+  - A matmul tile whose staged operands are f16 (bf16) runs on
+    `mma.sync` m16n8k16 f16 (bf16) fragments with fp32 accumulation
+    instead of TF32 m16n8k8. It stages halves with 16-byte `cp.async`,
+    and stages twice the k per chunk, so a stage is the same bytes as a
+    TF32 one.
+  - An f32 operand beside a half one (fp32 master weights) is rounded to
+    the half format while it is staged.
+  - Flash attention with f16 (bf16) Q, K and V computes S = Q·Kᵀ and
+    O += P·V on m16n8k16. P is packed from the score registers with
+    `cvt.rn.f16x2`.
+  - Epilogue reads and output stores are typed, so a tile may read and
+    write any mix of formats.
+  - An f16 accumulator (`accum`) keeps a kernel on the transpiled path.
+
+  With no node in half precision, every CUDA source is byte-identical to
+  the f32-only lowering.
+- **Search on CUDA.** `tang_bench::ir_precision::tune_precision` runs
+  through `Program` (CUDA or wgpu), with the Metal search's flow. Its
+  moves are tried in this order:
+  1. one move with every tensor-core tile's operands in half at once;
+  2. each tile's operand group (`TensorGraph::cuda_tile_operands`);
+  3. single buffers, largest first.
+
+  Each move is tried in each format of a list (f16, bf16) and checked
+  against the f64 reference under the budget. A move is kept if it saves
+  `min_gain` (1% by default). An `exclude` set keeps a training step's
+  weights and AdamW state in f32. Cost is the sum over kernels of the
+  fastest single launch: on a time-sliced GPU, whole-program times swing
+  by 2× between batches. `examples/cuda_precision.rs` and `whole_model
+  prec-ref | prec-tune` run the phases with the f64 references and nvrtc
+  outside the GPU lock.
 
 Set precision after the rewriting passes (they rebuild the graph); the
 schedule passes (`schedule_auto`, autotune) leave it alone. `backward`
