@@ -1,10 +1,93 @@
-//! Dump a small Qwen-shaped step program's kernels:
-//! `cargo run -p tang-bench --example qwen_dump -- <dir> [seq]`.
+//! Dump a Qwen-shaped step program (no device needed):
+//!
+//! - `qwen_dump <dir> [seq]`: a small model's kernels into `<dir>`;
+//! - `qwen_dump --plan <seq>`: Qwen3-8B's step over `seq` tokens, its
+//!   kernels by kind and the memory plan.
 fn main() {
     use tang_bench::ir_qwen::*;
     let mut args = std::env::args().skip(1);
-    let dir = args.next().expect("output dir");
+    let first = args.next().expect("output dir or --plan");
     let seq: usize = args.next().map_or(1, |s| s.parse().unwrap());
+    if first == "--plan" {
+        let dims = QwenDims::qwen3_8b(if seq == 1 { 4352 } else { seq });
+        let dg = step_graph(&dims, seq);
+        let (g, outs) = compiled_decode(&dg);
+        let opts = decode_opts(&dg, &outs, dims.layers);
+        let mut program = g.to_cuda_decode(&outs, &opts).program;
+        lazy_order(&mut program);
+        let input_t = |k: usize| {
+            program
+                .buffers
+                .iter()
+                .find(|b| b.input == Some(k))
+                .unwrap()
+                .node
+        };
+        let donate: Vec<_> = opts.inplace.iter().map(|&(o, k)| (o, input_t(k))).collect();
+        let plan = g.plan_memory(&program, &outs, &donate);
+        let mut kinds: Vec<(String, usize)> = Vec::new();
+        for k in &program.kernels {
+            let kind = k.source.lines().next().unwrap_or("").to_string();
+            match kinds.iter_mut().find(|x| x.0 == kind) {
+                Some(x) => x.1 += 1,
+                None => kinds.push((kind, 1)),
+            }
+        }
+        for (k, n) in kinds {
+            println!("{n:5}  {k}");
+        }
+        let (slot, slot_words) = plan_slots(&program, &outs, &opts.inplace);
+        if std::env::var_os("QWEN_DUMP_SLOTS").is_some() {
+            for (s, &w) in slot_words.iter().enumerate() {
+                let users: Vec<_> = (0..slot.len())
+                    .filter(|&b| slot[b] == s)
+                    .map(|b| {
+                        let n = program.buffers[b].node;
+                        (program.buffers[b].input, g.nodes()[n.index()].shape.clone())
+                    })
+                    .collect();
+                if w > 2_500_000 && users[0].0.is_none() {
+                    println!(
+                        "slot {s}: {:.1} MB, {} users, first {:?}",
+                        w as f64 * 4e-6,
+                        users.len(),
+                        users[0].1
+                    );
+                }
+            }
+            // who reads the first users of the last few slots
+            for b in (0..slot.len()).filter(|&b| slot[b] + 3 >= slot_words.len()) {
+                let node = program.buffers[b].node;
+                let readers: Vec<usize> = program
+                    .kernels
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, k)| k.reads.iter().any(|&t| program.storage(t) == node))
+                    .map(|(i, _)| i)
+                    .collect();
+                let writer = program.kernels.iter().position(|k| k.node == node);
+                println!(
+                    "buffer {b} {:?}: written by {writer:?}, read by {readers:?}",
+                    g.nodes()[node.index()].shape
+                );
+            }
+        }
+        println!(
+            "plan_slots: {:.0} MB in {} slots",
+            slot_words.iter().sum::<usize>() as f64 * 4e-6,
+            slot_words.len()
+        );
+        let s = plan.stats;
+        println!(
+            "persistent {:.0} MB, intermediates planned {:.0} MB (live peak {:.0} MB, naive {:.0} MB), {} in place",
+            s.persistent_bytes as f64 / 1e6,
+            s.planned_bytes as f64 / 1e6,
+            s.live_peak_bytes as f64 / 1e6,
+            s.naive_bytes as f64 / 1e6,
+            plan.inplace.len()
+        );
+        return;
+    }
     let dims = QwenDims {
         d_model: 128,
         heads: 4,
@@ -16,6 +99,7 @@ fn main() {
         ctx: if seq == 1 { 16 } else { seq },
         eps: 1e-6,
         theta: 1e4,
+        kv_f16: true,
     };
     let dg = step_graph(&dims, seq);
     let (g, outs) = compiled_decode(&dg);
@@ -23,17 +107,12 @@ fn main() {
     let p = g.to_cuda_decode(&outs, &opts);
     for (i, (k, n)) in p.program.kernels.iter().zip(&p.native).enumerate() {
         let node = &g.nodes()[k.node.index()];
-        let red = g
-            .tiled_reduction(k.node.index())
-            .and_then(|r| g.comp_at(r))
-            .map(|c| c.red.clone());
         println!(
-            "k{i:02} native={n} shape={:?} red={:?} reads={} {}",
+            "k{i:02} native={n} shape={:?} reads={} {}",
             node.shape,
-            red,
             k.reads.len(),
-            k.source.lines().nth(0).unwrap_or("")
+            k.source.lines().next().unwrap_or("")
         );
-        std::fs::write(format!("{dir}/k{i:02}.cu"), &k.source).unwrap();
+        std::fs::write(format!("{first}/k{i:02}.cu"), &k.source).unwrap();
     }
 }

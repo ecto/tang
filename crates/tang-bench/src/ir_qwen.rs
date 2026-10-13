@@ -18,8 +18,11 @@
 //! `len` rows of cache, not `ctx`. The cache updates are maps
 //! `select(len − seq ≤ j < len, new, old)` that overwrite the cache in
 //! place.
+use std::collections::HashMap;
 use tang::Scalar;
 use tang_compile::tensor::cuda_gemv::{DecodeOpts, Packing};
+
+use tang_compile::tensor::wgsl::WgslProgram;
 use tang_compile::tensor::{Arg, Form, Monoid, TensorGraph, TensorId, View};
 use tang_expr::ExprId;
 
@@ -39,6 +42,8 @@ pub struct QwenDims {
     pub ctx: usize,
     pub eps: f64,
     pub theta: f64,
+    /// KV caches stored as f16 (`Packing::F16`) instead of f32.
+    pub kv_f16: bool,
 }
 
 impl QwenDims {
@@ -55,6 +60,7 @@ impl QwenDims {
             ctx,
             eps: 1e-6,
             theta: 1e6,
+            kv_f16: true,
         }
     }
 
@@ -353,8 +359,9 @@ pub fn step_graph(dims: &QwenDims, seq: usize) -> DecodeGraph {
         let ln2 = b.input(p("ln2"), &[d], None);
         let qn = b.input(p("q_norm"), &[hd], None);
         let kn = b.input(p("k_norm"), &[hd], None);
-        let k_cache = b.input(p("k_cache"), &[kvh, ctx, 2, half], None);
-        let v_cache = b.input(p("v_cache"), &[kvh, hd, ctx], None);
+        let kv = dims.kv_f16.then_some(Packing::F16);
+        let k_cache = b.input(p("k_cache"), &[kvh, ctx, 2, half], kv);
+        let v_cache = b.input(p("v_cache"), &[kvh, hd, ctx], kv);
 
         let normed = b.rms_norm(x, seq, 0, d, ln1, eps);
         let normed = Rows {
@@ -702,6 +709,131 @@ pub fn decode_opts(dg: &DecodeGraph, outputs: &[TensorId], layers: usize) -> Dec
     }
 }
 
+/// Slots for `program`'s buffers in kernel order: inputs keep their own,
+/// an in-place output shares its donor's (`inplace`: output tensor,
+/// input index), every other buffer takes a free slot of exactly its
+/// size, else the smallest free one that fits, else a new one. Same-role
+/// buffers of successive layers have the same size, so a step needs about
+/// one layer's worth of intermediates. Returns `(slot, slot_words)`.
+pub fn plan_slots(
+    program: &WgslProgram,
+    outputs: &[TensorId],
+    inplace: &[(TensorId, usize)],
+) -> (Vec<usize>, Vec<usize>) {
+    let nb = program.buffers.len();
+    let buf_of = |t: TensorId| {
+        let t = program.storage(t);
+        program.buffers.iter().position(|b| b.node == t).unwrap()
+    };
+    let words = |b: usize| program.buffers[b].len.max(1);
+    let mut last = vec![0usize; nb];
+    for (p, k) in program.kernels.iter().enumerate() {
+        for &t in k.reads.iter().chain([&k.node]) {
+            last[buf_of(t)] = p;
+        }
+    }
+    for &t in outputs {
+        last[buf_of(t)] = usize::MAX;
+    }
+    let mut slot = vec![usize::MAX; nb];
+    let mut slot_words: Vec<usize> = Vec::new();
+    for (b, spec) in program.buffers.iter().enumerate() {
+        if spec.input.is_some() {
+            slot[b] = slot_words.len();
+            slot_words.push(words(b));
+        }
+    }
+    for &(o, k) in inplace {
+        let d = program
+            .buffers
+            .iter()
+            .position(|b| b.input == Some(k))
+            .unwrap();
+        slot[buf_of(o)] = slot[d];
+        last[buf_of(o)] = usize::MAX;
+        last[d] = usize::MAX;
+    }
+    let mut free: Vec<usize> = Vec::new();
+    for (p, k) in program.kernels.iter().enumerate() {
+        let b = buf_of(k.node);
+        if slot[b] == usize::MAX {
+            let w = words(b);
+            // an exact fit, else a new slot when the best fit would waste
+            // more than half of it (it is someone else's exact fit later)
+            let pick = free.iter().position(|&s| slot_words[s] == w).or_else(|| {
+                free.iter()
+                    .enumerate()
+                    .filter(|(_, &s)| slot_words[s] >= w && slot_words[s] <= 2 * w)
+                    .min_by_key(|(_, &s)| slot_words[s])
+                    .map(|(i, _)| i)
+            });
+            slot[b] = match pick {
+                Some(i) => free.swap_remove(i),
+                None => {
+                    slot_words.push(w);
+                    slot_words.len() - 1
+                }
+            };
+        }
+        // buffers whose last use is this kernel free their slots
+        let mut dying: Vec<usize> = k
+            .reads
+            .iter()
+            .chain([&k.node])
+            .map(|&t| buf_of(t))
+            .filter(|&x| last[x] == p && program.buffers[x].input.is_none())
+            .collect();
+        dying.sort_unstable();
+        dying.dedup();
+        for x in dying {
+            free.push(slot[x]);
+        }
+    }
+    (slot, slot_words)
+}
+
+/// Kernels reordered so that a kernel reading only graph inputs (a
+/// weight's dequantization) runs just before its first reader: with
+/// a liveness memory plan, one layer's f32 weights are live at a time.
+pub fn lazy_order(program: &mut WgslProgram) {
+    let n = program.kernels.len();
+    let producer: HashMap<TensorId, usize> = program
+        .kernels
+        .iter()
+        .enumerate()
+        .map(|(i, k)| (program.storage(k.node), i))
+        .collect();
+    let deps: Vec<Vec<usize>> = program
+        .kernels
+        .iter()
+        .map(|k| {
+            k.reads
+                .iter()
+                .filter_map(|t| producer.get(&program.storage(*t)).copied())
+                .collect()
+        })
+        .collect();
+    let leaf: Vec<bool> = deps.iter().map(|d| d.is_empty()).collect();
+    let mut order = Vec::with_capacity(n);
+    let mut placed = vec![false; n];
+    for i in 0..n {
+        if leaf[i] {
+            continue;
+        }
+        for &d in &deps[i] {
+            if leaf[d] && !placed[d] {
+                placed[d] = true;
+                order.push(d);
+            }
+        }
+        placed[i] = true;
+        order.push(i);
+    }
+    order.extend((0..n).filter(|&i| !placed[i]));
+    let mut ks: Vec<Option<_>> = program.kernels.drain(..).map(Some).collect();
+    program.kernels = order.iter().map(|&i| ks[i].take().unwrap()).collect();
+}
+
 /// `cos`/`sin` of rope at `pos` (`head_dim/2` each).
 pub fn rope_angles(dims: &QwenDims, pos: usize) -> (Vec<f32>, Vec<f32>) {
     let half = dims.head_dim / 2;
@@ -749,6 +881,7 @@ mod tests {
             ctx: 16,
             eps: 1e-6,
             theta: 1e4,
+            kv_f16: false,
         }
     }
 

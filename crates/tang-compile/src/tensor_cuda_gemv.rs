@@ -62,6 +62,10 @@ pub enum Packing {
     /// bfloat16, two per word, element `i` in the `i % 2` half (the raw
     /// little-endian bytes of a bf16 array).
     Bf16,
+    /// IEEE binary16, two per word, element `i` in the `i % 2` half. An
+    /// in-place output over an f16 input (a KV cache) is written as f16
+    /// (round to nearest even).
+    F16,
 }
 
 impl Packing {
@@ -69,7 +73,16 @@ impl Packing {
     pub fn words(self, len: usize) -> usize {
         match self {
             Packing::U4 => len.div_ceil(8),
-            Packing::Bf16 => len.div_ceil(2),
+            Packing::Bf16 | Packing::F16 => len.div_ceil(2),
+        }
+    }
+
+    /// The f32 value of the 16-bit `bits` (an unsigned expression).
+    fn half(self, bits: &str) -> String {
+        match self {
+            Packing::Bf16 => format!("__uint_as_float(({bits}) << 16)"),
+            Packing::F16 => format!("tang_h2f({bits})"),
+            Packing::U4 => unreachable!(),
         }
     }
 }
@@ -150,6 +163,25 @@ __device__ __forceinline__ float tang_bf16(const float* b, int a) {
     unsigned w = __ldg((const unsigned*)b + (a >> 1));
     return __uint_as_float((a & 1) ? (w & 0xffff0000u) : (w << 16));
 }
+__device__ __forceinline__ float tang_h2f(unsigned h) {
+    float f;
+    unsigned short s = (unsigned short)h;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(s));
+    return f;
+}
+__device__ __forceinline__ unsigned tang_f2h(float f) {
+    unsigned short s;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(s) : "f"(f));
+    return (unsigned)s;
+}
+__device__ __forceinline__ unsigned tang_f2bf(float f) {
+    unsigned b = __float_as_uint(f);
+    return (b + 0x7fffu + ((b >> 16) & 1u)) >> 16;
+}
+__device__ __forceinline__ float tang_f16(const float* b, int a) {
+    unsigned w = __ldg((const unsigned*)b + (a >> 1));
+    return tang_h2f((a & 1) ? (w >> 16) : (w & 0xffffu));
+}
 "#;
 
 impl TensorGraph {
@@ -174,6 +206,13 @@ impl TensorGraph {
             .iter()
             .map(|&(t, k)| (self.storage(t).n(), input_node(k)))
             .collect();
+        // an in-place output is stored like its donor
+        let mut packed = packed;
+        for &(o, d) in &inplace {
+            if let Some(&p) = packed.get(&d) {
+                packed.insert(o, p);
+            }
+        }
         let mut native = Vec::with_capacity(program.kernels.len());
         for k in &mut program.kernels {
             let root = k.node.index();
@@ -328,6 +367,7 @@ fn load(buf: usize, pack: Option<Packing>, a: &str) -> String {
         None => format!("__ldg(b{buf} + ({a}))"),
         Some(Packing::U4) => format!("tang_u4(b{buf}, {a})"),
         Some(Packing::Bf16) => format!("tang_bf16(b{buf}, {a})"),
+        Some(Packing::F16) => format!("tang_f16(b{buf}, {a})"),
     }
 }
 
@@ -670,7 +710,7 @@ impl Lowering<'_> {
                     && match l.pack {
                         None => aligned(l, 4),
                         Some(Packing::U4) => vec == 32 && aligned(l, 32),
-                        Some(Packing::Bf16) => false,
+                        Some(Packing::Bf16 | Packing::F16) => aligned(l, 4),
                     }
                 {
                     1
@@ -926,7 +966,21 @@ impl Lowering<'_> {
                             )
                             .unwrap();
                         }
-                        _ => {
+                        Some(Packing::Bf16 | Packing::F16) => {
+                            // four 16-bit values per uint2
+                            writeln!(s, "        uint2 w{i}[{nr}][{}];", vec / 4).unwrap();
+                            writeln!(s, "        #pragma unroll").unwrap();
+                            writeln!(s, "        for (int r = 0; r < {nr}; r++)").unwrap();
+                            writeln!(s, "        #pragma unroll").unwrap();
+                            writeln!(
+                                s,
+                                "        for (int q = 0; q < {}; q++) w{i}[r][q] = __ldg((const uint2*)b{} + (({a}) >> 2) + q);",
+                                vec / 4,
+                                l.buf
+                            )
+                            .unwrap();
+                        }
+                        None => {
                             writeln!(s, "        float4 v{i}[{nr}][{}];", vec / 4).unwrap();
                             writeln!(s, "        #pragma unroll").unwrap();
                             writeln!(s, "        for (int r = 0; r < {nr}; r++)").unwrap();
@@ -960,7 +1014,11 @@ impl Lowering<'_> {
                         "(__uint_as_float(0x4b000000u | (((&u{i}[{}].x)[e >> 3] >> ((e & 7) * 4)) & 15u)) - 8388608.0)",
                         ri_(l)
                     ),
-                    _ => format!("(&v{i}[{}][e >> 2].x)[e & 3]", ri_(l)),
+                    Some(p @ (Packing::Bf16 | Packing::F16)) => p.half(&format!(
+                        "(((&w{i}[{}][e >> 2].x)[(e >> 1) & 1] >> (16 * (e & 1))) & 0xffffu)",
+                        ri_(l)
+                    )),
+                    None => format!("(&v{i}[{}][e >> 2].x)[e & 3]", ri_(l)),
                 },
                 _ => load(l.buf, l.pack, &addr_expr(&l.addr, &coords)),
             }
@@ -1226,7 +1284,26 @@ impl Lowering<'_> {
             .filter(|&d| conds.iter().any(|cd| cd.coefs[d] != 0.0))
             .collect();
         let [dp] = dims[..] else { return None };
-        let rest: usize = (0..pk).filter(|&d| d != dp).map(|d| pts[d]).product();
+        // a 16-bit output: a thread writes whole words — two neighbours
+        // along the innermost dim, or (when that is the bounded dim, whose
+        // points are all this thread's) one half by read-modify-write
+        let pack = self.packed.get(&root).copied();
+        if pack == Some(Packing::U4) {
+            return None;
+        }
+        let last = pk - 1;
+        let pair = pack.is_some() && dp != last;
+        if pair && pts[last] % 2 != 0 {
+            return None;
+        }
+        let extent = |d: usize| {
+            if pair && d == last {
+                pts[d] / 2
+            } else {
+                pts[d]
+            }
+        };
+        let rest: usize = (0..pk).filter(|&d| d != dp).map(extent).product();
         let threads = 256;
         let blocks = rest.div_ceil(threads);
         let mut s = String::new();
@@ -1255,8 +1332,9 @@ impl Lowering<'_> {
         writeln!(s, "    if (t >= {rest}) return;").unwrap();
         let mut rem = "t".to_string();
         for d in (0..pk).rev().filter(|&d| d != dp) {
-            writeln!(s, "    const int p{d} = ({rem}) % {};", pts[d]).unwrap();
-            rem = format!("({rem}) / {}", pts[d]);
+            let mul = if pair && d == last { " * 2" } else { "" };
+            writeln!(s, "    const int p{d} = (({rem}) % {}){mul};", extent(d)).unwrap();
+            rem = format!("({rem}) / {}", extent(d));
         }
         let coords: Vec<String> = (0..pk).map(|d| format!("p{d}")).collect();
         let others: Vec<usize> = (0..pk).filter(|&d| d != dp).collect();
@@ -1277,22 +1355,54 @@ impl Lowering<'_> {
         }
         writeln!(s, "    for (int p{dp} = lo; p{dp} < hi; p{dp}++) {{").unwrap();
         let mut ctr = 0usize;
-        let el = |i: usize| {
-            let l: &Leaf = &leaves[i];
-            load(l.buf, l.pack, &addr_expr(&l.addr, &coords))
+        let mut value = |s: &mut String, coords: &[String], prefix: &str| {
+            let el = |i: usize| {
+                let l: &Leaf = &leaves[i];
+                load(l.buf, l.pack, &addr_expr(&l.addr, coords))
+            };
+            let vals: Vec<String> = args
+                .iter()
+                .map(|a| self.emit_val(s, a, coords, "        ", &mut ctr, &el))
+                .collect();
+            emit(s, &c.body, &[e], prefix, "        ", &|v| {
+                vals[v as usize].clone()
+            })[0]
+                .clone()
         };
-        let vals: Vec<String> = args
-            .iter()
-            .map(|a| self.emit_val(&mut s, a, &coords, "        ", &mut ctr, &el))
-            .collect();
-        let y = emit(&mut s, &c.body, &[e], "x_", "        ", &|v| {
-            vals[v as usize].clone()
-        });
         let mut flat = "0".to_string();
         for (d, &np) in pts.iter().enumerate() {
             flat = format!("({flat}) * {np} + p{d}");
         }
-        writeln!(s, "        out[{flat}] = {};", y[0]).unwrap();
+        let y = value(&mut s, &coords, "x_");
+        let to16 = |v: &str| match pack {
+            Some(Packing::F16) => format!("tang_f2h({v})"),
+            _ => format!("tang_f2bf({v})"),
+        };
+        match pack {
+            None => writeln!(s, "        out[{flat}] = {y};").unwrap(),
+            Some(_) if pair => {
+                let mut c1 = coords.clone();
+                c1[last] = format!("(p{last} + 1)");
+                let y1 = value(&mut s, &c1, "z_");
+                writeln!(
+                    s,
+                    "        ((unsigned*)out)[({flat}) >> 1] = {} | ({} << 16);",
+                    to16(&y),
+                    to16(&y1)
+                )
+                .unwrap();
+            }
+            Some(_) => {
+                writeln!(s, "        const int f = {flat};").unwrap();
+                writeln!(s, "        unsigned* o = (unsigned*)out + (f >> 1);").unwrap();
+                writeln!(s, "        const unsigned h = {};", to16(&y)).unwrap();
+                writeln!(
+                    s,
+                    "        *o = (f & 1) ? ((*o & 0xffffu) | (h << 16)) : ((*o & 0xffff0000u) | h);"
+                )
+                .unwrap();
+            }
+        }
         writeln!(s, "    }}").unwrap();
         writeln!(s, "}}").unwrap();
         Some(Kernel {

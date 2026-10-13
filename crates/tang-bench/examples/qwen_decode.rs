@@ -45,6 +45,12 @@ mod cuda {
     use tang_gpu::program::{BufferPlan, Program, Runtime};
 
     /// f32 → bf16 → f32, round to nearest even.
+    /// f32 → f16 → f32, round to nearest even.
+    fn f16_round(x: f32) -> f32 {
+        use tang_compile::tensor::precision::{f16_bits, f16_from_bits};
+        f16_from_bits(f16_bits(x as f64)) as f32
+    }
+
     fn bf16_round(x: f32) -> f32 {
         let b = x.to_bits();
         let r = b.wrapping_add(0x7fff + ((b >> 16) & 1)) & 0xffff_0000;
@@ -75,38 +81,14 @@ mod cuda {
             .collect()
     }
 
-    /// One slot per buffer, except in-place outputs, which share their
-    /// donor input's slot.
-    fn alias_plan(program: &WgslProgram, inplace: &[(TensorId, usize)]) -> BufferPlan {
-        let n = program.buffers.len();
-        let buf_of = |t: TensorId| {
-            let t = program.storage(t);
-            program.buffers.iter().position(|b| b.node == t).unwrap()
-        };
-        let input_buf = |k: usize| {
-            program
-                .buffers
-                .iter()
-                .position(|b| b.input == Some(k))
-                .unwrap()
-        };
-        let mut owner: Vec<usize> = (0..n).collect();
-        for &(out, k) in inplace {
-            owner[buf_of(out)] = input_buf(k);
-        }
-        let mut slot_of_owner = HashMap::new();
-        let mut slot = vec![0; n];
-        let mut slot_len: Vec<usize> = Vec::new();
-        for i in 0..n {
-            let o = owner[i];
-            let s = *slot_of_owner.entry(o).or_insert_with(|| {
-                slot_len.push(0);
-                slot_len.len() - 1
-            });
-            slot[i] = s;
-            let words = program.buffers[i].len.max(1);
-            slot_len[s] = slot_len[s].max(words);
-        }
+    /// The program's buffers on slots (`ir_qwen::plan_slots`): in-place
+    /// outputs share their donor's, intermediates are reused by liveness.
+    fn slot_plan(
+        program: &WgslProgram,
+        outputs: &[TensorId],
+        inplace: &[(TensorId, usize)],
+    ) -> BufferPlan {
+        let (slot, slot_len) = plan_slots(program, outputs, inplace);
         BufferPlan {
             slot,
             slot_len,
@@ -146,7 +128,7 @@ mod cuda {
                 native.iter().filter(|n| **n).count(),
                 t.elapsed().as_secs_f64()
             );
-            let plan = alias_plan(&program, &opts.inplace);
+            let plan = slot_plan(&program, &outs, &opts.inplace);
             let rt = Runtime::cuda_capturable().expect("cuda");
             let refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
             let t = Instant::now();
@@ -202,6 +184,7 @@ mod cuda {
             ctx: 24,
             eps: 1e-6,
             theta: 1e4,
+            kv_f16: std::env::var("TANG_KV_F32").is_err(),
         };
         let dg = decode_graph(&dims);
         let mut rng = tang_bench::Rng::new(11);
@@ -218,7 +201,10 @@ mod cuda {
                 Some(Packing::Bf16) => (0..n)
                     .map(|_| bf16_round(-0.08 * (1.0 + 0.1 * rng.f32())))
                     .collect(),
-                None if s.name.ends_with("cache") || s.name == "step" => vec![0.0; n],
+                Some(Packing::F16) | None if s.name.ends_with("cache") || s.name == "step" => {
+                    vec![0.0; n]
+                }
+                Some(Packing::F16) => unreachable!("only the caches are f16"),
                 None => (0..n).map(|_| 1.0 + 0.2 * rng.f32()).collect(),
             };
             logical.push(v);
@@ -230,6 +216,7 @@ mod cuda {
             .map(|(s, v)| match s.packing {
                 Some(Packing::U4) => pack_u4(v),
                 Some(Packing::Bf16) => pack_bf16(v),
+                Some(Packing::F16) => vec![0.0; Packing::F16.words(v.len())],
                 None => v.clone(),
             })
             .collect();
@@ -251,8 +238,15 @@ mod cuda {
             let res = dg.g.eval(&cpu, &dg.outputs);
             for l in 0..dims.layers {
                 let base = 1 + l * LAYER_INPUTS.len();
-                cpu[base + 19] = res[1 + 2 * l].clone();
-                cpu[base + 20] = res[2 + 2 * l].clone();
+                let kv = |v: &Vec<f64>| -> Vec<f64> {
+                    if dims.kv_f16 {
+                        v.iter().map(|&x| f16_round(x as f32) as f64).collect()
+                    } else {
+                        v.clone()
+                    }
+                };
+                cpu[base + 19] = kv(&res[1 + 2 * l]);
+                cpu[base + 20] = kv(&res[2 + 2 * l]);
             }
             let want = &res[0];
             let scale = want.iter().fold(0.0f64, |m, v| m.max(v.abs()));
@@ -362,7 +356,7 @@ mod cuda {
                 let n: usize = s.shape.iter().product();
                 let name = &s.name;
                 if name == "step" || name.ends_with("cache") {
-                    return vec![0.0; n];
+                    return vec![0.0; s.packing.map_or(n, |p| p.words(n))];
                 }
                 if name == "model.norm" {
                     return st.bf16("model.norm.weight");
@@ -431,7 +425,8 @@ mod cuda {
         };
         let gen: usize = opt("--gen").map_or(64, |v| v.parse().unwrap());
         let ctx: usize = opt("--ctx").map_or(4352, |v| v.parse().unwrap());
-        let dims = QwenDims::qwen3_8b(ctx);
+        let mut dims = QwenDims::qwen3_8b(ctx);
+        dims.kv_f16 = std::env::var("TANG_KV_F32").is_err();
         let t = Instant::now();
         let st = St::open(&format!("{dir}/model.safetensors"));
         let dg = decode_graph(&dims);
@@ -512,51 +507,8 @@ mod cuda {
         }
     }
 
-    /// Kernels reordered so that a kernel reading only graph inputs (a
-    /// weight's dequantization) runs just before its first reader: with
-    /// a liveness memory plan, one layer's f32 weights are live at a time.
-    fn lazy_order(program: &mut WgslProgram) {
-        let n = program.kernels.len();
-        let producer: HashMap<TensorId, usize> = program
-            .kernels
-            .iter()
-            .enumerate()
-            .map(|(i, k)| (program.storage(k.node), i))
-            .collect();
-        let deps: Vec<Vec<usize>> = program
-            .kernels
-            .iter()
-            .map(|k| {
-                k.reads
-                    .iter()
-                    .filter_map(|t| producer.get(&program.storage(*t)).copied())
-                    .collect()
-            })
-            .collect();
-        let leaf: Vec<bool> = deps.iter().map(|d| d.is_empty()).collect();
-        let mut order = Vec::with_capacity(n);
-        let mut placed = vec![false; n];
-        for i in 0..n {
-            if leaf[i] {
-                continue;
-            }
-            for &d in &deps[i] {
-                if leaf[d] && !placed[d] {
-                    placed[d] = true;
-                    order.push(d);
-                }
-            }
-            placed[i] = true;
-            order.push(i);
-        }
-        order.extend((0..n).filter(|&i| !placed[i]));
-        let mut ks: Vec<Option<_>> = program.kernels.drain(..).map(Some).collect();
-        program.kernels = order.iter().map(|&i| ks[i].take().unwrap()).collect();
-    }
-
     /// Prefill: the prompt as one step of `seq = len(ids)` tokens.
     pub fn prefill(args: &[String]) {
-        use tang_compile::tensor::memplan::MemoryPlan;
         let dir = &args[0];
         let ids: Vec<usize> = std::fs::read_to_string(&args[1])
             .unwrap()
@@ -564,7 +516,8 @@ mod cuda {
             .map(|t| t.parse().unwrap())
             .collect();
         let seq = ids.len();
-        let dims = QwenDims::qwen3_8b(seq);
+        let mut dims = QwenDims::qwen3_8b(seq);
+        dims.kv_f16 = std::env::var("TANG_KV_F32").is_err();
         let t = Instant::now();
         let st = St::open(&format!("{dir}/model.safetensors"));
         let dg = step_graph(&dims, seq);
@@ -576,34 +529,29 @@ mod cuda {
         let dp = g.to_cuda_decode(&outs, &opts);
         let mut program = dp.program;
         lazy_order(&mut program);
-        let input_t = |k: usize| {
-            program
-                .buffers
-                .iter()
-                .find(|b| b.input == Some(k))
-                .unwrap()
-                .node
-        };
-        let donate: Vec<(TensorId, TensorId)> =
-            opts.inplace.iter().map(|&(o, k)| (o, input_t(k))).collect();
-        let plan: MemoryPlan = g.plan_memory(&program, &outs, &donate);
+        let plan = slot_plan(&program, &outs, &opts.inplace);
         let mma = program
             .kernels
             .iter()
             .filter(|k| k.source.contains("mma"))
             .count();
+        let persistent: usize = program
+            .buffers
+            .iter()
+            .filter(|b| b.input.is_some())
+            .map(|b| b.len)
+            .sum();
         eprintln!(
-            "lowered: {} kernels ({mma} mma tiles) in {:.2}s; {} donations; intermediates {:.0} MB (naive {:.0} MB)",
+            "lowered: {} kernels ({mma} mma tiles) in {:.2}s; weights + caches {:.0} MB, intermediates {:.0} MB",
             program.kernels.len(),
             t.elapsed().as_secs_f64(),
-            plan.inplace.len(),
-            plan.stats.planned_bytes as f64 / 1e6,
-            plan.stats.naive_bytes as f64 / 1e6
+            persistent as f64 * 4e-6,
+            (plan.slot_len.iter().sum::<usize>() - persistent) as f64 * 4e-6
         );
         let rt = Runtime::cuda_capturable().expect("cuda");
         let refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
         let t = Instant::now();
-        let mut prog = Program::planned(&rt, program, &refs, &plan);
+        let mut prog = Program::with_plan(&rt, program, &refs, &plan);
         drop(inputs);
         eprintln!("compiled + uploaded in {:.2}s", t.elapsed().as_secs_f64());
         let xs: Vec<Vec<f32>> = ids.iter().map(|&t| embed(&st, t, dims.d_model)).collect();
