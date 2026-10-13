@@ -483,7 +483,10 @@ fn main() {
                     "  {:<48} rel {:.2e} {} {}",
                     t.what,
                     t.error.max_rel,
-                    t.ms.map_or("over budget".to_string(), |m| format!("{m:.3} ms")),
+                    t.ms.zip(t.vs)
+                        .map_or("over budget".to_string(), |(m, r)| format!(
+                            "{m:.3} ms ({r:.3}x current)"
+                        )),
                     if t.kept { "kept" } else { "" }
                 );
             }

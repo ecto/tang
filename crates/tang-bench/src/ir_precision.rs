@@ -28,6 +28,8 @@ pub struct PrecisionTrial {
     pub error: ErrorStats,
     /// Whole-program time (ms); `None` when over budget.
     pub ms: Option<f64>,
+    /// Time relative to the schedule so far, measured in the same window.
+    pub vs: Option<f64>,
     pub kept: bool,
 }
 
@@ -159,19 +161,24 @@ pub fn tune_precision(
     formats: &[Format],
     iters: usize,
 ) -> PrecisionTune {
-    let measure = |g: &TensorGraph| {
-        let p = Program::compile(rt, g, outputs, inputs);
-        let err = program_error(rt, &p, outputs, want);
-        let ms = budget.admits(&err).then(|| p.time(rt, iters));
-        (err, ms)
+    // A shared GPU's speed drifts by 2x within seconds, so a candidate is
+    // timed against the current schedule in the same window: interleaved
+    // rounds, best of each, compared as a ratio.
+    let duel = |a: &Program, b: &Program| {
+        let (mut ta, mut tb) = (f64::INFINITY, f64::INFINITY);
+        for _ in 0..3 {
+            ta = ta.min(a.time(rt, iters));
+            tb = tb.min(b.time(rt, iters));
+        }
+        (ta, tb)
     };
-    let _ = measure(&g);
-    let (base_error, base_ms) = measure(&g);
-    let base_ms =
-        base_ms.unwrap_or_else(|| Program::compile(rt, &g, outputs, inputs).time(rt, iters));
+    let base_p = Program::compile(rt, &g, outputs, inputs);
+    let base_error = program_error(rt, &base_p, outputs, want);
+    let base_ms = base_p.time(rt, iters);
     let base = g.clone();
     let mut cur = g;
-    let (mut cur_err, mut cur_ms) = (base_error, base_ms);
+    let mut cur_p = base_p;
+    let mut cur_err = base_error;
     let mut trials = Vec::new();
     for m in moves(&cur, outputs, exclude) {
         if m.buffers
@@ -180,35 +187,34 @@ pub fn tune_precision(
         {
             continue;
         }
-        let mut best: Option<(TensorGraph, ErrorStats, f64)> = None;
+        // (graph, program, error, candidate ÷ current)
+        let mut best: Option<(TensorGraph, Program, ErrorStats, f64, usize)> = None;
         for &f in formats {
             let v = apply(&cur, &m, f);
-            let (err, ms) = measure(&v);
+            let p = Program::compile(rt, &v, outputs, inputs);
+            let err = program_error(rt, &p, outputs, want);
+            let ms = budget.admits(&err).then(|| duel(&cur_p, &p));
             trials.push(PrecisionTrial {
                 what: format!("{} {f:?}", m.what),
                 error: err,
-                ms,
+                ms: ms.map(|(_, t)| t),
+                vs: ms.map(|(c, t)| t / c),
                 kept: false,
             });
-            if let Some(t) = ms {
-                if best.as_ref().is_none_or(|b| t < b.2) {
-                    best = Some((v, err, t));
+            if let Some((c, t)) = ms {
+                let r = t / c;
+                if best.as_ref().is_none_or(|b| r < b.3) {
+                    best = Some((v, p, err, r, trials.len() - 1));
                 }
             }
         }
-        if let Some((v, err, t)) = best {
-            if t < cur_ms * 0.97 {
-                let tag = format!("{:?}", v.precision(m.buffers[0]).storage);
-                if let Some(tr) = trials
-                    .iter_mut()
-                    .rev()
-                    .find(|tr| tr.what == format!("{} {tag}", m.what))
-                {
-                    tr.kept = true;
-                }
+        if let Some((v, p, err, r, i)) = best {
+            // a change must buy at least 3% to be worth its error
+            if r < 0.97 {
+                trials[i].kept = true;
                 cur = v;
+                cur_p = p;
                 cur_err = err;
-                cur_ms = t;
             }
         }
     }
@@ -217,16 +223,10 @@ pub fn tune_precision(
         .filter(|&t| cur.precision(t) != Precision::F32)
         .map(|t| (t, cur.precision(t)))
         .collect();
-    let (mut base_ms, mut cur_ms) = (base_ms, cur_ms);
+    let (mut base_ms, mut cur_ms) = (base_ms, base_ms);
     if !assignment.is_empty() {
         let b = Program::compile(rt, &base, outputs, inputs);
-        let c = Program::compile(rt, &cur, outputs, inputs);
-        base_ms = f64::INFINITY;
-        cur_ms = f64::INFINITY;
-        for _ in 0..3 {
-            base_ms = base_ms.min(b.time(rt, iters));
-            cur_ms = cur_ms.min(c.time(rt, iters));
-        }
+        (base_ms, cur_ms) = duel(&b, &cur_p);
         if cur_ms >= base_ms * 0.99 {
             return PrecisionTune {
                 graph: base,
