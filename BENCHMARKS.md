@@ -2059,3 +2059,35 @@ synchronous step per tick, and 500 Hz works at the median but misses
 deadlines at p95. To get there, enqueue several steps per submit (the
 back-to-back cost is 13–59 µs per launch), keep the loop on the GPU, or run
 the batch-1 GRU on the CPU.
+
+#### After the reconnect (robot rebooted, 48–64 °C, load 7–10)
+
+Training step at seq 128, tuned per kernel and run end to end. Error is
+the worst per-output relative error, leaving out the two dQ/dK gradients:
+their f64 values are ~4e-19, so their output is pure f32 noise.
+
+| variant | program | worst output rel | keep? |
+|---|---|---|---|
+| f32, `schedule_auto` (#58) | 19.1 ms | 7.7e-6 | |
+| f32, tuned | **14.57 ms** (−24%) | 7.7e-6 | yes |
+| tuned, f16 tile operands | 14.53 ms | 3.1e-4 | no: within budget, but no gain |
+| tuned, f16 all buffers | 14.27 ms | inf/NaN (overflow) | no |
+
+GRU step after tuning the fused kernel and the unfused one alike
+(time = device events, wall = enqueue all + finish, min of 20):
+
+| case | kernels | device | wall | rel err |
+|---|---|---|---|---|
+| batch 1, tuned (64/128 splits) | 7 | 0.101 ms | 0.463 ms | 1.8e-7 |
+| batch 1, tuned, f16 storage | 7 | **0.086 ms** | **0.267 ms** | 4.1e-4 |
+| batch 1, fused, tuned (128 split) | 1 | 0.189 ms | 0.358 ms | 1.8e-7 |
+| batch 1, fused, tuned, f16 | 1 | 0.108 ms | 0.420 ms | 4.1e-4 |
+| batch 64, tuned (8×8 groups) | 7 | **0.421 ms** | 0.954 ms | 2.0e-7 |
+| batch 64, fused, tuned | 2 | 0.693 ms | 1.061 ms | 2.0e-7 |
+
+Fusing cuts the launches, but the fused kernel is slower on the device.
+Each output point reduces 320 terms (split 128), while the unfused GEMVs
+split six short reductions across more groups. Wall times are dominated
+by the 0.1–0.6 ms submit-and-wait floor and vary by ±0.2 ms from run to
+run, so fused versus unfused wall time is not resolved at batch 1. The
+latency conclusion above still holds.
