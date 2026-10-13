@@ -50,6 +50,9 @@ pub mod msl;
 /// and the affine/bilinear analysis the CUDA wmma lowering shares.
 #[path = "tensor_msl_mma.rs"]
 mod msl_mma;
+/// OpenCL C (Adreno and other mobile GPUs): the WGSL kernels transpiled.
+#[path = "tensor_opencl.rs"]
+pub mod opencl;
 #[path = "tensor_precision.rs"]
 pub mod precision;
 #[path = "tensor_tile.rs"]

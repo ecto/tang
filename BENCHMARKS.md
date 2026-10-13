@@ -1919,3 +1919,39 @@ gradient between blocks; a lone block never computes `dx`). So: no net
 kernels saved across layers once the stream is materialized, and a cost
 model for map substitution needs a fan-in bound, not just the recompute
 factor.
+
+## OpenCL on the Booster K1 (Adreno 740, QCS8550)
+
+`to_opencl` (WGSL kernels transpiled to OpenCL C) exported by
+`cargo run --release -p tang-bench --example opencl_export -- export ROOT`,
+run on the robot by `tools/opencl-runner/tang_cl.c` (gcc, no Rust), checked
+on the Mac against the f64 `eval` (`opencl_export check ROOT`). Times are the
+minimum over ≤30 repeats of OpenCL profiling events (first kernel start to
+last kernel end), default build options. The SoC also runs vendor services
+(load average 7–17 during the runs), so treat these as ±5%.
+
+Device peak measured with `tools/opencl-runner/peak.c`: fp32 FMA 1501
+GFLOP/s, fp16 FMA 2996 GFLOP/s, device copy 49.5 GB/s. Max single
+allocation 256 MiB.
+
+| case | time | throughput | max err (rel to max \|ref\|) |
+|---|---|---|---|
+| matmul 1024³, best schedule (`reg8c8`) | 6.66 ms | 322 GFLOP/s (21% of fp32 peak) | 2.5e-3 (1.8e-6) |
+| matmul 1024³, `schedule_auto` (`reg4`) | 10.56 ms | 203 GFLOP/s | 2.5e-3 (1.8e-6) |
+| matmul 512×576×1536, best (`reg4x8`) | 3.31 ms | 274 GFLOP/s | 1.2e-3 (1.4e-6) |
+| matmul 512×576×1536, `schedule_auto` | 4.78 ms | 189 GFLOP/s | 1.2e-3 (1.4e-6) |
+| block forward, seq 128 (17 kernels) | 7.71 ms | 122 GFLOP/s | 1.1e0 (1.9e-6) |
+| block loss + 7 grads, seq 128 (51 kernels) | 19.1 ms | 148 GFLOP/s (≈3× fwd FLOPs) | 2.0e4 (7.7e-8) |
+| GRU step, batch 1, obs 64, hidden 256 | 0.205 ms | 2.4 GFLOP/s | 1.1e-7 (1.8e-7) |
+| GRU step, batch 64 | 0.596 ms | 53 GFLOP/s | 1.2e-7 (2.0e-7) |
+
+What the Adreno likes (matmul candidate sweep, both shapes): 8×8 or 4×8
+register tiles are ~1.45× the 4×4 tile `schedule_auto` picks; a 8-deep k
+chunk (`reg8c8`) is best at 1024³; `split` (small groups, many partials) is
+pathological here (1.3 s at 1024³) and `tiled` is 6× slower than the register
+tiles. `-cl-mad-enable` / `-cl-fast-relaxed-math` change nothing (the
+compiler already contracts). In the block, the slowest kernels are the
+projections launched as 6–48 work-groups of 256 on 6 CUs (k13: 2.3 ms, 48
+groups; k15: 1.7 ms, 18 groups): occupancy, not arithmetic — the schedule
+chosen for desktop GPUs underfills the Adreno. Whole-program tuning per
+kernel on the device (pick the schedule per node by timing) is the next step.
