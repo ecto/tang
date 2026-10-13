@@ -1100,6 +1100,49 @@ Negatives, measured and not kept as defaults:
 - Flash with 32-query slices × 3 heads (96 rows) needs more than 99 KB of shared memory and falls back. 16 × 3 is the shape that fits and fills.
 
 What is left at seq 512 forward (0.48 vs 0.45 ms TF32): attention is still 0.18 ms. Its O accumulator round-trips through shared memory every key chunk (wmma's accumulator layout is opaque). The next step is moving it to `mma.sync` with O in registers and K/V through `cp.async`.
+### Flash attention on `mma.sync` (RTX 3090)
+
+`cuda_flash_kernel` is rewritten on the GEMM ladder's raw `mma.sync` m16n8k8 TF32 fragments. It recognizes the same comps as before: the inference form (normalizer epilogue), the training step's state-materializing forward (score from a buffer, writes `(m, l, acc)`), folded grouped-query heads, and causal key ranges derived from the mask.
+- Each warp owns 16 rows. `S = Σ_t Q_t·K_tᵀ` accumulates into registers. The comp's mask expression and the online softmax run on those registers, with the row max reduced across the fragment's quad.
+- The same registers are the A operand of `O += P·V`, with no shuffle and no shared-memory round trip. The accumulator's column pair (2tq, 2tq + 1) is the A fragment's k pair (tq, tq + 4) once the keys inside each 8-wide step are permuted, which a reduction allows. V's columns are paired the way the GEMM pairs B's, so its fragments are `float2` reads (row strides chosen conflict-free).
+- O, the row max and the per-thread partial row sums stay in registers across key chunks. The quad's sums are added once at the end, and the epilogue (normalizer or state) runs from the registers.
+- K and V come through a `cp.async` ring. K uses 16-byte copies where its layout is contiguous along the head dim. V here is a map (value + bias), so it is evaluated while staging, as the GEMM does for map operands.
+- Masked key chunks at either end of a row block's range are left out of the pipeline. The heaviest row blocks launch first.
+- The shape is a schedule parameter, `FlashShape { bi, bj, stages, kw }`. `kw` warp groups split each step's keys and merge their `(m, l, O)` through shared memory at the end, which doubles the warps for the same rows (96 three-warp blocks at seq 512 otherwise). `FLASH_SHAPES` has one candidate per `MMA_SHAPES` variant, so `Program::tuned` picks per kernel.
+
+The two dQ halves are one tile now. `merge_siblings` also merges siblings that read the same big map `schedule_auto` recomputes in every reader (dS). It used to require identical readers, and the halves are read through different reshapes; a reshape reader gets a copy of its slot. `split_reduce_dims` runs the merge again, because the halves only appear after the layout passes. dS is recomputed once for both halves.
+
+Per kernel (minimum over single launches, 3090 at 1–30% utilization from other tenants, 00:06–00:12):
+
+| kernel | seq 128 before | after | seq 512 before | after |
+|---|---|---|---|---|
+| attention forward (inference) | 0.047 ms | **0.013** | 0.178 | **0.032** |
+| online-softmax forward of the training step, `(m, l, acc)` | 0.030 | **0.014** | 0.118 | **0.053** |
+| dQ, both halves | 0.020 + 0.020 | **0.023** + 2 × 0.004 copies | 0.116 + 0.117 | **0.126** + 0.009 |
+
+Flash shapes at seq 512 (one contended window, so only the ranking holds): 32 keys × 2 warp groups 0.039 ms; 64 keys × 1 group 0.052; 32 × 1 with 3 stages 0.056; 16 × 4 stages 0.068; a fixed 32-query slice 0.069. 64 keys × 2 groups does not fit in 99 KB with two stages and falls back. The default is now 32 × 2.
+
+End to end: six interleaved rounds under `flock`, 23:41–00:06, each round base (#50, `35d629d`), this branch, then PyTorch. The GPU was at 1–22% at round starts. Best of each:
+
+| | tang main (#50) | tang now | PyTorch best fp32 / TF32 |
+|---|---|---|---|
+| block fwd, seq 128 | 0.215 ms | **0.178** | 0.306 / 0.286 |
+| block fwd+bwd, seq 128 | 0.567 | **0.552** | 1.196 / — |
+| block fwd, seq 512 | 0.484 | **0.328** | 0.602 / 0.449 |
+| block fwd+bwd, seq 512 | 1.575 | **1.467** | 1.719 / — |
+| 4-layer training step, seq 128 (planned, in place, CUDA graph) | 4.03 | **3.92** | 4.40 fused AdamW (4.41 TF32) |
+
+The seq-512 forward is now 1.37× faster than PyTorch TF32; it was 1.07× slower.
+
+Correctness at seq 128, against the f64 evaluation (computed outside the GPU lock):
+- forward: 7.8e-5 relative, for every one of the six flash shapes forced in turn (`TANG_FLASH_SHAPE=bi,bj,stages,kw`), the same as before;
+- training step: loss 1.2e-5, weight gradients 1.5–3.1e-4 relative, for every flash shape, the same as before. dwq and dwk are about 4e-19 in the reference, so they are compared by absolute error, which is 2.6e-19.
+
+Not done, and why:
+- **The backward still materializes S, P̃, dP and the two correction terms.** At seq 512 these are about 0.04 ms each (S, P̃, the max-gradient row sum), plus the dP tile and two smaller maps. Recomputing them in the dQ/dK/dV tiles needs two things this branch does not have:
+  - S and dP as nested contractions: a small GEMM per staged block, on tensor cores, inside the staging of the outer tile. The scalar version, 128 FMAs per staged dS element, would cost more than the materialization it removes.
+  - Removing the max-gradient terms, `select(s == max)·Σ…`. They are identically zero, since softmax is invariant to the shift, but only numerically so. While they remain, the stabilizing max over S has to be materialized for the row sums, and masked tiles cannot be skipped. The forward's online-softmax state already holds the same max, but `eliminate_common` cannot see that the two are equal.
+- The dQ merge costs two 4 µs copies, because the halves are read through reshapes that a slot view cannot express.
 ## Kokoro-shaped ops (M4 Max, Metal, kernel-only)
 
 TTS vocoder ops (Kokoro's iSTFTNet decoder, Vocos-style ConvNeXt) derived
