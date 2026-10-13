@@ -180,7 +180,7 @@ fn main() {
                 #[cfg(feature = "cuda")]
                 {
                     let t = std::time::Instant::now();
-                    let srcs = ir_precision::candidate_sources(&c.g, &c.outs, &formats);
+                    let srcs = ir_precision::candidate_sources(&c.g, &c.outs, &[], &formats);
                     tang_gpu::cuda::precompile(srcs.iter().map(|s| s.as_str()), "sm_86");
                     println!(
                         "{name}: {} candidate sources, nvrtc {:.1?}",
@@ -217,6 +217,7 @@ fn main() {
                     &refs,
                     &want,
                     budget,
+                    &[],
                     &formats,
                     20,
                 );

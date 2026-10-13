@@ -50,11 +50,18 @@ pub struct Move {
 }
 
 /// The search's moves on `g`, in order: tile operand groups, then single
-/// buffers, largest first.
-pub fn moves(g: &TensorGraph, outputs: &[TensorId]) -> Vec<Move> {
+/// buffers, largest first. Buffers in `exclude` stay f32 (a training
+/// step's weights and optimizer state: fp32 master copies; a half tile
+/// converts an f32 operand while staging).
+pub fn moves(g: &TensorGraph, outputs: &[TensorId], exclude: &[TensorId]) -> Vec<Move> {
     let mut out: Vec<Move> = g
         .cuda_tile_operands(outputs)
         .into_iter()
+        .map(|(k, bufs)| {
+            let bufs: Vec<TensorId> = bufs.into_iter().filter(|b| !exclude.contains(b)).collect();
+            (k, bufs)
+        })
+        .filter(|(_, bufs)| !bufs.is_empty())
         .map(|(k, bufs)| Move {
             what: format!(
                 "tile {} operands {:?}",
@@ -68,6 +75,7 @@ pub fn moves(g: &TensorGraph, outputs: &[TensorId]) -> Vec<Move> {
         .to_cuda(outputs)
         .buffers
         .iter()
+        .filter(|b| !exclude.contains(&b.node))
         .map(|b| (b.node, g.buffer_bytes(b.node)))
         .collect();
     bufs.sort_by_key(|b| std::cmp::Reverse(b.1));
@@ -110,8 +118,13 @@ pub fn program_error(
 /// search (no GPU needed), so that nvrtc does not run while the GPU is
 /// held. Sources for other combinations of kept moves still compile
 /// during the search.
-pub fn candidate_sources(g: &TensorGraph, outputs: &[TensorId], formats: &[Format]) -> Vec<String> {
-    let ms = moves(g, outputs);
+pub fn candidate_sources(
+    g: &TensorGraph,
+    outputs: &[TensorId],
+    exclude: &[TensorId],
+    formats: &[Format],
+) -> Vec<String> {
+    let ms = moves(g, outputs, exclude);
     let mut graphs = vec![g.clone()];
     for &f in formats {
         let mut acc = g.clone();
@@ -142,6 +155,7 @@ pub fn tune_precision(
     inputs: &[&[f32]],
     want: &[Vec<f64>],
     budget: ErrorBudget,
+    exclude: &[TensorId],
     formats: &[Format],
     iters: usize,
 ) -> PrecisionTune {
@@ -159,7 +173,7 @@ pub fn tune_precision(
     let mut cur = g;
     let (mut cur_err, mut cur_ms) = (base_error, base_ms);
     let mut trials = Vec::new();
-    for m in moves(&cur, outputs) {
+    for m in moves(&cur, outputs, exclude) {
         if m.buffers
             .iter()
             .all(|&b| cur.precision(b).storage != Format::F32)
