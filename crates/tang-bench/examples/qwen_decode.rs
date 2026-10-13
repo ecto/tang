@@ -102,6 +102,7 @@ mod cuda {
         dims: QwenDims,
         step: TensorId,
         logits: TensorId,
+        outs: Vec<TensorId>,
         native: Vec<bool>,
     }
 
@@ -144,6 +145,7 @@ mod cuda {
                 dims: dims.clone(),
                 step,
                 logits: outs[0],
+                outs: outs.clone(),
                 native,
             }
         }
@@ -259,6 +261,31 @@ mod cuda {
                 };
                 cpu[base + 19] = kv(&res[1 + 2 * l]);
                 cpu[base + 20] = kv(&res[2 + 2 * l]);
+            }
+            // the device caches against the reference's (layer 0)
+            for (which, o) in [(1usize, "k"), (2, "v")] {
+                let raw = sess.prog.read(&sess.rt, sess.outs[which]);
+                let dev: Vec<f32> = if dims.kv_f16 {
+                    raw.iter()
+                        .flat_map(|w| {
+                            use tang_compile::tensor::precision::f16_from_bits;
+                            let b = w.to_bits();
+                            [
+                                f16_from_bits(b as u16) as f32,
+                                f16_from_bits((b >> 16) as u16) as f32,
+                            ]
+                        })
+                        .collect()
+                } else {
+                    raw
+                };
+                let e = dev
+                    .iter()
+                    .zip(&res[which])
+                    .fold(0.0f64, |m, (&a, &b)| m.max((a as f64 - b).abs()));
+                if e > 1e-3 && pos < 3 {
+                    println!("pos {pos}: layer 0 {o} cache max err {e:.2e}");
+                }
             }
             let want = &res[0];
             let scale = want.iter().fold(0.0f64, |m, v| m.max(v.abs()));
