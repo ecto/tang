@@ -1665,6 +1665,20 @@ impl TensorGraph {
             for (node, proj) in projections {
                 redirect.insert(node, (fused.n(), proj));
             }
+            // The online state's slot 0 is the same max, bit for bit (max
+            // is exact in any order), so the max's other readers (the
+            // backward's `exp(s − m)`) read it there instead of a second
+            // reduction over `s`.
+            if !is_output(m_node) {
+                let proj = View {
+                    guard: false,
+                    forms: (0..m_out)
+                        .map(|d| Form::unit(m_out, d))
+                        .chain((0..=e).map(|_| Form::zero(m_out)))
+                        .collect(),
+                };
+                redirect.entry(m_node).or_insert((fused.n(), proj));
+            }
         }
         if redirect.is_empty() {
             return (self.clone(), outputs.to_vec());

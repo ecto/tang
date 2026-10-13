@@ -16,9 +16,9 @@
 //! Differentiate the *algorithm* graph, then optimize forward and backward
 //! together.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use tang_expr::{ExprGraph, ExprId};
+use tang_expr::{ExprGraph, ExprId, Node};
 
 use super::{
     err, replay, Arg, Comp, Dim, Form, Monoid, MonoidKind, Op, ShapeError, TensorGraph, TensorId,
@@ -36,6 +36,9 @@ impl TensorGraph {
             self.comp(&shape, &[], vec![], None, |_| vec![ExprId::ONE])?
         };
         grads.insert(y.n(), ones);
+        // Stabilizing maxes: `y` provably does not depend on them, so
+        // their gradient is exactly zero and is not built at all.
+        let stable = self.stabilizer_maxes(y);
 
         // Reverse order over the original nodes; everything appended by
         // this pass sits after `y` and is never a dependency of it.
@@ -57,6 +60,9 @@ impl TensorGraph {
             let Some(c) = self.comp_at(j) else { continue };
             let c = c.clone();
             for a in 0..c.args.len() {
+                if stable.contains(&c.args[a].src.n()) {
+                    continue;
+                }
                 let g = self.arg_grad(TensorId(j as u32), &c, a, dy)?;
                 let src = c.args[a].src.n();
                 let acc = match grads.get(&src) {
@@ -76,6 +82,120 @@ impl TensorGraph {
                 }
             })
             .collect()
+    }
+
+    /// Max reductions `m` that `y` does not depend on: every use of `m`
+    /// is a shift `exp(x − m)` whose results reach `y` only through
+    /// expressions homogeneous of degree 0 in `t = exp(−m)`, the
+    /// normalized ratios of a softmax. The argument is exact, not
+    /// numerical: each node downstream of `m` is classified as `t^k·h`
+    /// (`Hom(k)`, `h` independent of `m`) or `a + κ·m` (`Lin(κ)`), with
+    /// the row of `m` its factor comes from tracked as a view, and the
+    /// rules only use identities (`t^a·t^b = t^(a+b)`, `Σ_j t·h_j =
+    /// t·Σ_j h_j` when `t`'s row does not depend on `j`, `2^(a+κm) =
+    /// 2^a·t^(−κ ln 2)`). A node of degree 0 is then a function of the
+    /// other inputs alone, so `∂y/∂m ≡ 0` and every `[s == m]` term of
+    /// `m`'s gradient sums to zero identically. Any use the rules do not
+    /// cover disqualifies `m`.
+    pub fn stabilizer_maxes(&self, y: TensorId) -> HashSet<usize> {
+        let live = &self.live(&[y]);
+        let mut found = HashSet::new();
+        for m in 0..self.nodes.len() {
+            if !live[m] || m == y.n() {
+                continue;
+            }
+            let Some(mc) = self.comp_at(m) else { continue };
+            let is_max = mc.monoid.as_ref().map(Monoid::kind) == Some(MonoidKind::Max);
+            if !is_max || mc.tuple != 0 || mc.width() != 1 {
+                continue;
+            }
+            if self.shift_invariant(m, y, live) {
+                found.insert(m);
+            }
+        }
+        found
+    }
+
+    fn shift_invariant(&self, m: usize, y: TensorId, live: &[bool]) -> bool {
+        let m_rank = self.nodes[m].shape.len();
+        // node -> (degree, factor view: node coords -> m coords)
+        let mut dep: HashMap<usize, (Deg, View)> = HashMap::new();
+        dep.insert(m, (Deg::Lin(1.0), View::identity(m_rank, m_rank)));
+        let mut used = false;
+        for i in m + 1..self.nodes.len() {
+            if !live[i] || !self.deps(i).iter().any(|d| dep.contains_key(d)) {
+                continue;
+            }
+            used = true;
+            let Some(c) = self.comp_at(i) else {
+                return false; // a reshape of an m-dependent value
+            };
+            if c.tuple != 0 || c.width() != 1 {
+                return false;
+            }
+            let rank = c.rank();
+            let mut factor: Option<View> = None;
+            let mut arg_deg = Vec::with_capacity(c.args.len());
+            for a in &c.args {
+                match dep.get(&a.src.n()) {
+                    None => arg_deg.push(Deg::Hom(0.0)),
+                    Some((d, f)) => {
+                        if a.view.guard && matches!(d, Deg::Lin(_)) {
+                            return false;
+                        }
+                        let fv = f.compose(&a.view, rank);
+                        match &factor {
+                            None => factor = Some(fv),
+                            Some(prev) if prev.forms == fv.forms => {}
+                            Some(_) => return false,
+                        }
+                        arg_deg.push(*d);
+                    }
+                }
+            }
+            let Some(d) = body_degree(&c.body, c.body_outs[0], &arg_deg) else {
+                return false;
+            };
+            if d.is_clean() {
+                continue; // independent of m from here on
+            }
+            if i == y.n() {
+                return false;
+            }
+            let factor = factor.expect("a dependent body reads a dependent arg");
+            let n_pts = c.points().len();
+            if !c.red.is_empty() {
+                let sum = c.monoid.as_ref().map(Monoid::kind) == Some(MonoidKind::Sum);
+                let ok = sum
+                    && matches!(d, Deg::Hom(_))
+                    && factor
+                        .forms
+                        .iter()
+                        .all(|f| f.coefs[n_pts..].iter().all(|&x| x == 0));
+                if !ok {
+                    return false;
+                }
+            }
+            let forms = factor
+                .forms
+                .iter()
+                .map(|f| Form {
+                    coefs: f.coefs[..n_pts].to_vec(),
+                    offset: f.offset,
+                })
+                .collect();
+            dep.insert(
+                i,
+                (
+                    d,
+                    View {
+                        guard: false,
+                        forms,
+                    },
+                ),
+            );
+        }
+        used
     }
 
     /// `∂L/∂(arg a of c)` given `dy = ∂L/∂c`.
@@ -355,6 +475,116 @@ impl TensorGraph {
     }
 }
 
+/// How a scalar depends on a stabilizing max `m`, with `t = exp(−m)`:
+/// `Hom(k)` is `t^k·h`, `Lin(κ)` is `a + κ·m` (`h`, `a` independent of
+/// `m`). `Hom(0)` and `Lin(0)` are both independent of `m`.
+#[derive(Clone, Copy, Debug)]
+enum Deg {
+    Hom(f64),
+    Lin(f64),
+}
+
+impl Deg {
+    fn is_clean(self) -> bool {
+        match self {
+            Deg::Hom(k) | Deg::Lin(k) => k.abs() < 1e-9,
+        }
+    }
+
+    /// The coefficient of `m` if this is affine in `m`.
+    fn lin(self) -> Option<f64> {
+        match self {
+            Deg::Lin(k) => Some(k),
+            d if d.is_clean() => Some(0.0),
+            _ => None,
+        }
+    }
+}
+
+fn same(a: f64, b: f64) -> bool {
+    (a - b).abs() < 1e-9
+}
+
+/// Degree of `out` given the degrees of the body's vars, or `None` when
+/// the rules cannot establish one.
+fn body_degree(g: &ExprGraph, out: ExprId, vars: &[Deg]) -> Option<Deg> {
+    let nodes = g.nodes_slice();
+    let mut memo: Vec<Option<Option<Deg>>> = vec![None; nodes.len()];
+    go_degree(nodes, out, vars, &mut memo)
+}
+
+fn go_degree(
+    nodes: &[Node],
+    id: ExprId,
+    vars: &[Deg],
+    memo: &mut Vec<Option<Option<Deg>>>,
+) -> Option<Deg> {
+    let k = id.index() as usize;
+    if let Some(r) = memo[k] {
+        return r;
+    }
+    let lit = |e: ExprId| nodes[e.index() as usize].as_f64();
+    let clean = Deg::Hom(0.0);
+    let mut go = |e: ExprId| go_degree(nodes, e, vars, memo);
+    let r = (|| match nodes[k] {
+        Node::Var(v) => Some(vars.get(v as usize).copied().unwrap_or(clean)),
+        Node::Lit(_) => Some(clean),
+        Node::Neg(a) => match go(a)? {
+            Deg::Lin(x) => Some(Deg::Lin(-x)),
+            h => Some(h),
+        },
+        Node::Add(a, b) => {
+            let (da, db) = (go(a)?, go(b)?);
+            match (da, db) {
+                _ if lit(a) == Some(0.0) => Some(db),
+                _ if lit(b) == Some(0.0) => Some(da),
+                (Deg::Hom(x), Deg::Hom(y)) if same(x, y) => Some(da),
+                _ => Some(Deg::Lin(da.lin()? + db.lin()?)),
+            }
+        }
+        Node::Mul(a, b) => {
+            let (da, db) = (go(a)?, go(b)?);
+            match (da, db) {
+                (Deg::Hom(x), Deg::Hom(y)) => Some(Deg::Hom(x + y)),
+                (Deg::Lin(x), _) => Some(Deg::Lin(x * lit(b)?)),
+                (_, Deg::Lin(y)) => Some(Deg::Lin(y * lit(a)?)),
+            }
+        }
+        Node::Recip(a) => match go(a)? {
+            Deg::Hom(x) => Some(Deg::Hom(-x)),
+            d => d.is_clean().then_some(clean),
+        },
+        Node::Sqrt(a) => match go(a)? {
+            Deg::Hom(x) => Some(Deg::Hom(x / 2.0)),
+            d => d.is_clean().then_some(clean),
+        },
+        // 2^(a + κm) = 2^a · e^(κ ln2 · m) = 2^a · t^(−κ ln 2)
+        Node::Exp2(a) => match go(a)? {
+            Deg::Lin(x) => Some(Deg::Hom(-x * std::f64::consts::LN_2)),
+            d => d.is_clean().then_some(clean),
+        },
+        Node::Sin(a) | Node::Log2(a) => go(a)?.is_clean().then_some(clean),
+        Node::Atan2(a, b) => (go(a)?.is_clean() && go(b)?.is_clean()).then_some(clean),
+        Node::Select(c, a, b) => {
+            if !go(c)?.is_clean() {
+                return None;
+            }
+            let (da, db) = (go(a)?, go(b)?);
+            match (da, db) {
+                // t^k·0 = 0: a zero arm takes the other's degree
+                (_, Deg::Hom(_)) if lit(a) == Some(0.0) => Some(db),
+                (Deg::Hom(_), _) if lit(b) == Some(0.0) => Some(da),
+                (Deg::Hom(x), Deg::Hom(y)) if same(x, y) => Some(da),
+                (Deg::Lin(x), Deg::Lin(y)) if same(x, y) => Some(da),
+                _ => (da.is_clean() && db.is_clean()).then_some(clean),
+            }
+        }
+    })()
+    .map(|d| if d.is_clean() { clean } else { d });
+    memo[k] = Some(r);
+    r
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,6 +805,44 @@ mod tests {
             for (x, y) in w.iter().zip(gg) {
                 assert!((x - y).abs() <= 1e-9 * (1.0 + y.abs()), "{x} vs {y}");
             }
+        }
+    }
+
+    /// The attention max is a stabilizer: its gradient is dropped, and
+    /// the gradients still match finite differences. An unnormalized
+    /// `Σ exp(s − m)` or the max itself as output keeps it.
+    #[test]
+    fn stabilizing_max_has_no_gradient() {
+        let (n, d) = (4, 3);
+        let mut g = TensorGraph::new();
+        let q = g.input(&[n, d]);
+        let k = g.input(&[n, d]);
+        let v = g.input(&[n, d]);
+        let kt = g.transpose(k, &[1, 0]).unwrap();
+        let s = g.matmul(q, kt).unwrap();
+        let m = g.reduce(s, 1, Monoid::max()).unwrap();
+        let mb = g.broadcast(m, &[n, n]).unwrap();
+        let p = g.map(&[s, mb], |x| (x[0] - x[1]).exp()).unwrap();
+        let l = g.reduce(p, 1, Monoid::sum()).unwrap();
+        let o = g.matmul(p, v).unwrap();
+        let lb = g.broadcast(l, &[n, d]).unwrap();
+        let y = g.map(&[o, lb], |x| x[0] / x[1]).unwrap();
+        let sq = g.map(&[y], |x| x[0] * x[0]).unwrap();
+        assert_eq!(g.stabilizer_maxes(sq).len(), 1);
+        assert!(g.stabilizer_maxes(l).is_empty());
+        assert!(g.stabilizer_maxes(m).is_empty());
+        let before = g.nodes().len();
+        let grads = g.backward(sq, &[q, k, v]).unwrap();
+        // no argmax gate: nothing in the backward reads m's gradient
+        assert!(!g.nodes()[before..].iter().any(|t| matches!(&t.op,
+            Op::Comp(c) if c.args.iter().any(|a| a.src == m) && c.red.len() == 1 && c.out == g.shape(s))));
+        let inputs = [
+            ramp(n * d, 0.3, -0.5),
+            ramp(n * d, 0.2, 0.1),
+            ramp(n * d, 0.4, -1.0),
+        ];
+        for (i, &gr) in grads.iter().enumerate() {
+            check_grad(&g, sq, &inputs, i, gr);
         }
     }
 
