@@ -18,8 +18,8 @@
 //! Accumulators stay f32: the tensor-core kernels accumulate in fp32, and
 //! an f16 accumulator would put a kernel on the transpiled path.
 //!
-//! Candidates lower with the default tile shape (`Runtime::lower`). Tune
-//! the result's tile shapes afterwards with `Program::tuned`.
+//! On CUDA each kernel is costed at its best tile shape (what
+//! `Program::tuned` picks), so run the result through `Program::tuned`.
 use tang_compile::tensor::{ErrorBudget, ErrorStats, Format, Precision, TensorGraph, TensorId};
 use tang_gpu::program::{Program, Runtime};
 
@@ -157,7 +157,16 @@ pub fn candidate_sources(
     }
     let mut out: Vec<String> = graphs
         .iter()
-        .flat_map(|v| v.to_cuda(outputs).kernels.into_iter().map(|k| k.source))
+        .flat_map(|v| {
+            std::iter::once(None)
+                .chain((0..tang_compile::tensor::cuda::MMA_SHAPES.len()).map(Some))
+                .flat_map(move |s| {
+                    v.to_cuda_variant(outputs, s)
+                        .kernels
+                        .into_iter()
+                        .map(|k| k.source)
+                })
+        })
         .collect();
     out.sort_unstable();
     out.dedup();
@@ -185,21 +194,58 @@ pub fn tune_precision(
     // a whole program's wall time from one batch to the next; a single
     // short launch usually runs between the other tenant's slices. So a
     // program's cost is the sum over its kernels of the fastest of many
-    // single launches (`Program::time_kernel`), and a candidate is
-    // compared with the current schedule as a ratio of those sums.
-    let cost = |p: &Program| -> f64 {
-        p.run(rt);
-        (0..p.program.kernels.len())
-            .map(|i| p.time_kernel(rt, i, iters))
-            .sum()
+    // single launches (`Program::time_kernel`). On CUDA a kernel is
+    // costed at its best lowering over every tile shape — what
+    // `Program::tuned` will pick; half tiles want other shapes than TF32
+    // ones — memoized by the kernel's sources, so a candidate only times
+    // the kernels it changes.
+    let mut memo: std::collections::HashMap<u64, f64> = std::collections::HashMap::new();
+    let mut cost = |g: &TensorGraph| -> f64 {
+        use std::hash::{Hash, Hasher};
+        let variants: Vec<Option<usize>> = match rt.kind() {
+            tang_gpu::program::BackendKind::Cuda => std::iter::once(None)
+                .chain((0..tang_compile::tensor::cuda::MMA_SHAPES.len()).map(Some))
+                .collect(),
+            _ => vec![Some(0)],
+        };
+        let lower = |v: Option<usize>| match rt.kind() {
+            tang_gpu::program::BackendKind::Cuda => g.to_cuda_variant(outputs, v),
+            _ => rt.lower(g, outputs),
+        };
+        let progs: Vec<_> = variants.iter().map(|&v| lower(v)).collect();
+        let n = progs[0].kernels.len();
+        let keys: Vec<u64> = (0..n)
+            .map(|i| {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                for p in &progs {
+                    p.kernels[i].source.hash(&mut h);
+                }
+                h.finish()
+            })
+            .collect();
+        let missing: Vec<usize> = (0..n).filter(|i| !memo.contains_key(&keys[*i])).collect();
+        if !missing.is_empty() {
+            let mut best = vec![f64::INFINITY; n];
+            for prog in progs {
+                let p = Program::new(rt, prog, inputs);
+                p.run(rt);
+                for &i in &missing {
+                    best[i] = best[i].min(p.time_kernel(rt, i, iters));
+                }
+            }
+            for &i in &missing {
+                memo.insert(keys[i], best[i]);
+            }
+        }
+        keys.iter().map(|k| memo[k]).sum()
     };
-    let duel = |a: &Program, b: &Program| (cost(a), cost(b));
     let base_p = Program::compile(rt, &g, outputs, inputs);
     let base_error = program_error(rt, &base_p, outputs, want);
-    let base_ms = cost(&base_p);
+    drop(base_p);
+    let base_ms = cost(&g);
     let base = g.clone();
     let mut cur = g;
-    let mut cur_p = base_p;
+    let mut cur_ms = base_ms;
     let mut cur_err = base_error;
     let mut trials = Vec::new();
     for m in moves(&cur, outputs, exclude) {
@@ -209,34 +255,34 @@ pub fn tune_precision(
         {
             continue;
         }
-        // (graph, program, error, candidate ÷ current)
-        let mut best: Option<(TensorGraph, Program, ErrorStats, f64, usize)> = None;
+        // (graph, error, cost, trial index)
+        let mut best: Option<(TensorGraph, ErrorStats, f64, usize)> = None;
         for &f in formats {
             let v = apply(&cur, &m, f);
             let p = Program::compile(rt, &v, outputs, inputs);
             let err = program_error(rt, &p, outputs, want);
-            let ms = budget.admits(&err).then(|| duel(&cur_p, &p));
+            drop(p);
+            let ms = budget.admits(&err).then(|| cost(&v));
             trials.push(PrecisionTrial {
                 what: format!("{} {f:?}", m.what),
                 error: err,
-                ms: ms.map(|(_, t)| t),
-                vs: ms.map(|(c, t)| t / c),
+                ms,
+                vs: ms.map(|t| t / cur_ms),
                 kept: false,
             });
-            if let Some((c, t)) = ms {
-                let r = t / c;
-                if best.as_ref().is_none_or(|b| r < b.3) {
-                    best = Some((v, p, err, r, trials.len() - 1));
+            if let Some(t) = ms {
+                if best.as_ref().is_none_or(|b| t < b.2) {
+                    best = Some((v, err, t, trials.len() - 1));
                 }
             }
         }
-        if let Some((v, p, err, r, i)) = best {
+        if let Some((v, err, t, i)) = best {
             // a change must buy `min_gain` to be worth its error
-            if r < 1.0 - min_gain {
+            if t < cur_ms * (1.0 - min_gain) {
                 trials[i].kept = true;
                 cur = v;
-                cur_p = p;
                 cur_err = err;
+                cur_ms = t;
             }
         }
     }
@@ -245,10 +291,8 @@ pub fn tune_precision(
         .filter(|&t| cur.precision(t) != Precision::F32)
         .map(|t| (t, cur.precision(t)))
         .collect();
-    let (mut base_ms, mut cur_ms) = (base_ms, base_ms);
     if !assignment.is_empty() {
-        let b = Program::compile(rt, &base, outputs, inputs);
-        (base_ms, cur_ms) = duel(&b, &cur_p);
+        // the memoized costs are fastest launches: a gain under 1% is noise
         if cur_ms >= base_ms * 0.99 {
             return PrecisionTune {
                 graph: base,
