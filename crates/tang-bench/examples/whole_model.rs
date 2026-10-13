@@ -99,6 +99,34 @@ fn build(seq: usize, layers: usize, cuda: bool) -> Built {
         tang_bench::ir_precision::read_assignment(&mut g, &text);
         println!("  precision: {} buffers from {path}", text.lines().count());
     }
+    // TANG_PRECISION_TILES=f16|bf16: the precision search's first move
+    // alone — every tensor-core tile's operands in half, graph inputs
+    // (weights, AdamW state, data) kept f32
+    if let Ok(f) = std::env::var("TANG_PRECISION_TILES") {
+        use tang_bench::ir_precision;
+        let f = match f.as_str() {
+            "bf16" => tang_compile::tensor::Format::BF16,
+            _ => tang_compile::tensor::Format::F16,
+        };
+        let inputs: Vec<TensorId> = g
+            .to_cuda(&couts)
+            .buffers
+            .iter()
+            .filter(|b| b.input.is_some())
+            .map(|b| b.node)
+            .collect();
+        if let Some(m) = ir_precision::moves(&g, &couts, &inputs)
+            .into_iter()
+            .find(|m| m.what.starts_with("all"))
+        {
+            println!(
+                "  precision: {} ({} buffers) in {f:?}",
+                m.what,
+                m.buffers.len()
+            );
+            g = ir_precision::apply(&g, &m, f);
+        }
+    }
     let t_passes = t.elapsed();
     let t = Instant::now();
     let prog = if cuda {
