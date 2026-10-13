@@ -107,6 +107,8 @@ pub struct DecodeOpts {
     /// matmul-shaped kernel: prefill, where a weight is read by many
     /// tokens.
     pub mma: bool,
+    /// Block shape of those tiles (`MMA_SHAPES` index).
+    pub mma_shape: usize,
 }
 
 /// What [`TensorGraph::to_cuda_decode`] produced.
@@ -228,7 +230,8 @@ impl TensorGraph {
                 if !opts.mma || reads.iter().any(|j| packed.contains_key(j)) {
                     return None;
                 }
-                let source = self.cuda_mma_kernel(root, &reads)?;
+                let shape = super::cuda::MMA_SHAPES[opts.mma_shape % super::cuda::MMA_SHAPES.len()];
+                let source = self.cuda_mma_kernel_shaped(root, &reads, shape)?;
                 let define = |name: &str| -> usize {
                     source
                         .lines()
@@ -319,6 +322,66 @@ impl TensorGraph {
                 continue;
             }
             self.nodes[p].inline = true;
+        }
+    }
+
+    /// Schedule: recompute a materialized map inside its readers when
+    /// every reader is a matrix–vector product over a 4-bit weight
+    /// (graph input `u4`; the GEMV is bound by the weight's bytes, so the
+    /// map's few loads and flops per element are free: the RMSNorm that
+    /// feeds a projection) or an in-place update in `inplace` (which only
+    /// evaluates its predicated rows: the roped key of the cache row).
+    /// Saves a kernel and a round trip per such map.
+    pub fn schedule_decode_maps(
+        &mut self,
+        outputs: &[TensorId],
+        u4: &[usize],
+        inplace: &[TensorId],
+    ) {
+        let live = self.live(outputs);
+        let n = self.nodes.len();
+        let is_output = |i: usize| outputs.iter().any(|o| o.n() == i);
+        let u4_nodes: Vec<usize> = (0..n)
+            .filter(|&i| matches!(self.nodes[i].op, Op::Input(k) if u4.contains(&k)))
+            .collect();
+        let gemv = |c: &super::Comp| {
+            c.monoid.is_some() && c.args.iter().any(|a| u4_nodes.contains(&a.src.n()))
+        };
+        let mut readers: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut reshaped = vec![false; n];
+        for i in (0..n).filter(|&i| live[i]) {
+            match &self.nodes[i].op {
+                Op::Comp(c) => {
+                    for a in &c.args {
+                        readers[a.src.n()].push(i);
+                    }
+                }
+                Op::Reshape(src) => reshaped[src.n()] = true,
+                _ => {}
+            }
+        }
+        for i in (0..n).filter(|&i| live[i]) {
+            let Some(c) = self.comp_at(i) else { continue };
+            if c.monoid.is_some()
+                || c.tuple != 0
+                || self.nodes[i].inline
+                || is_output(i)
+                || reshaped[i]
+                || readers[i].is_empty()
+                // an epilogue (it holds an inlined reduction) stays put
+                || c.args.iter().any(|a| {
+                    let p = a.src.n();
+                    self.nodes[p].inline && self.comp_at(p).is_some_and(|pc| pc.monoid.is_some())
+                })
+            {
+                continue;
+            }
+            let ok = readers[i]
+                .iter()
+                .all(|&r| inplace.iter().any(|t| t.n() == r) || self.comp_at(r).is_some_and(gemv));
+            if ok {
+                self.nodes[i].inline = true;
+            }
         }
     }
 }

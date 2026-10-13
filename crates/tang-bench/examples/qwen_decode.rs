@@ -120,6 +120,7 @@ mod cuda {
             opts.rows = env("TANG_DECODE_ROWS");
             opts.warps = env("TANG_DECODE_WARPS");
             opts.unroll = env("TANG_DECODE_UNROLL");
+            opts.mma_shape = env("TANG_MMA_SHAPE");
             let dp = g.to_cuda_decode(&outs, &opts);
             let native = dp.native.clone();
             let program = dp.program;
@@ -575,7 +576,11 @@ mod cuda {
         eprintln!("weights read in {:.1}s", t.elapsed().as_secs_f64());
         let t = Instant::now();
         let (g, outs) = compiled_decode(&dg);
-        let opts = decode_opts(&dg, &outs, dims.layers);
+        let mut opts = decode_opts(&dg, &outs, dims.layers);
+        opts.mma_shape = std::env::var("TANG_MMA_SHAPE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         let dp = g.to_cuda_decode(&outs, &opts);
         let mut program = dp.program;
         lazy_order(&mut program);

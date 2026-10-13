@@ -684,6 +684,17 @@ pub fn compiled_decode(dg: &DecodeGraph) -> (TensorGraph, Vec<TensorId>) {
     };
     g.schedule_inline(&outs);
     g.schedule_epilogues(&outs);
+    // the norms feeding a 4-bit GEMV and the roped key of a cache update
+    // are recomputed where they are read
+    let u4: Vec<usize> = dg
+        .inputs
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.packing == Some(Packing::U4))
+        .map(|(k, _)| k)
+        .collect();
+    let caches = outs[1..dg.outputs.len()].to_vec();
+    g.schedule_decode_maps(&outs, &u4, &caches);
     (g, outs)
 }
 
