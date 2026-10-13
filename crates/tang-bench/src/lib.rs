@@ -2593,12 +2593,12 @@ pub mod ir_block {
     mod tests {
         use super::*;
 
-        /// The training step's attention backward lowers to tensor cores:
-        /// the state-materializing online-softmax forward (score read from
-        /// its buffer) as a flash tile writing `(m, l, acc)`, and the
-        /// dQ/dK contractions with dS recomputed in the staging of every
-        /// tile instead of read from a buffer, the two dQ halves merged
-        /// into one tile so dS is recomputed once for both.
+        /// The training step's attention backward lowers to tensor cores
+        /// as flash backward: the online-softmax forward as a flash tile
+        /// writing `(m, l, acc)`, and the dQ/dK/dV contractions with dS
+        /// and P̃ recomputed in the staging of every tile, S and dP as
+        /// nested mma contractions, the two dQ halves merged into one
+        /// tile so dS is recomputed once for both.
         #[test]
         fn training_attention_lowers_to_tensor_cores() {
             let dims = BlockDims {
@@ -2638,7 +2638,29 @@ pub mod ir_block {
                 .iter()
                 .filter(|k| k.source.contains("mma (TF32) tile") && k.source.contains("exp2("))
                 .count();
-            assert_eq!(recomputed, 2, "dK and dQ, each both rope halves");
+            assert_eq!(recomputed, 3, "dK and dQ (both rope halves), dV");
+            // S = Q·Kᵀ and dP = dO·Vᵀ run as mma inside those tiles, and
+            // nothing n×n per head is written out
+            let nested = p
+                .kernels
+                .iter()
+                .filter(|k| k.source.contains("tang_mma(ra0["))
+                .count();
+            assert_eq!(nested, 3);
+            for k in &p.kernels {
+                let seq_dims = tang_compile::tensor::fixed(g.shape(k.node))
+                    .iter()
+                    .filter(|&&d| d == 128)
+                    .count();
+                assert!(seq_dims < 2, "an n×n tensor is materialized");
+            }
+            // masked query/key chunks are left out of the k range
+            let skipping = p
+                .kernels
+                .iter()
+                .filter(|k| k.source.contains("unsigned lo = k_end"))
+                .count();
+            assert_eq!(skipping, 3);
         }
 
         /// The whole block is differentiable: gradients of `sum(out)`

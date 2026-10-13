@@ -1314,7 +1314,11 @@ impl TensorGraph {
 
     /// `e` as an affine form over `c`'s space when it is built from iota
     /// reads, literals, `+`, `−` and literal scaling.
-    fn affine_of(&self, c: &super::Comp, e: tang_expr::ExprId) -> Option<(super::Form, f64)> {
+    pub(super) fn affine_of(
+        &self,
+        c: &super::Comp,
+        e: tang_expr::ExprId,
+    ) -> Option<(super::Form, f64)> {
         let nodes = c.body.nodes_slice();
         let rank = c.rank();
         match nodes[e.index() as usize] {

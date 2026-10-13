@@ -78,13 +78,16 @@ impl MmaShape {
 /// default. 64×64 on four warps fills the device at the model's sizes;
 /// the larger blocks halve the staging per flop where there are enough
 /// output tiles; split-K only pays when tiles are very few.
-pub const MMA_SHAPES: [MmaShape; 6] = [
+pub const MMA_SHAPES: [MmaShape; 7] = [
     MmaShape::new(64, 64, 2, 2),
     MmaShape::new(64, 64, 2, 2).with(32, 3, 1),
     MmaShape::new(64, 64, 2, 2).with(16, 4, 1),
     MmaShape::new(64, 64, 2, 2).with(32, 2, 246),
     MmaShape::new(128, 64, 2, 2),
     MmaShape::new(128, 128, 2, 4).with(32, 2, 100),
+    // 32 rows on two warps: twice the blocks where tiles are few (the
+    // attention-backward tiles at short sequences)
+    MmaShape::new(32, 64, 1, 2),
 ];
 
 /// A flash-attention tile's shape: `bi` queries per folded head per
@@ -100,8 +103,8 @@ pub struct FlashShape {
     pub kw: usize,
 }
 
-/// The flash shapes a tuner chooses between, one per [`MMA_SHAPES`]
-/// variant; the first is the default.
+/// The flash shapes a tuner chooses between, paired with [`MMA_SHAPES`]
+/// variants by index modulo their count; the first is the default.
 pub const FLASH_SHAPES: [FlashShape; 6] = [
     FlashShape {
         bi: 0,
@@ -238,6 +241,36 @@ impl TensorGraph {
         if n_outs * fm * fnn * 4 > 128 {
             return None;
         }
+        // contractions nested in a map operand (S = Q·Kᵀ in dS): per
+        // staged operand, A stages first, then B
+        let rc = self.comp_at(red_node)?;
+        let rank = rc.rank();
+        let nwarps = sh.warps_m * sh.warps_n;
+        let mut nested: Vec<Vec<Nested>> = Vec::new();
+        let mut nest_regs = 0;
+        for (side_a, stages) in [(true, &a_stages), (false, &b_stages)] {
+            for (_, _, map) in stages.iter() {
+                let (pdim, block) = if side_a { (dy, bm) } else { (dx, bn) };
+                let plan = match map {
+                    Some(v) => self.nested_plan(rc, rank, *v, pdim, kdim, reads)?,
+                    None => Vec::new(),
+                };
+                if !plan.is_empty()
+                    && (!block.is_multiple_of(nwarps) || !(block / nwarps).is_multiple_of(16))
+                {
+                    return None;
+                }
+                let nfm = block / nwarps / 16;
+                for nst in &plan {
+                    // the invariant side's fragments, and the accumulators
+                    nest_regs += nst.terms.len() * nfm * (nst.e / 8) * 4 + nfm * (chunk / 8) * 4;
+                }
+                nested.push(plan);
+            }
+        }
+        if nest_regs > 96 {
+            return None;
+        }
         let storage = |j: usize| self.storage(TensorId(j as u32)).n();
         let tiles_x = n.div_ceil(bn);
         let tiles_y = m.div_ceil(bm);
@@ -251,7 +284,18 @@ impl TensorGraph {
         let smem_floats = sh.stages * stage_floats;
         // dynamic shared memory, within the 3090's 99 KB per block
         if smem_floats * 4 > 99 * 1024 {
-            return None;
+            // Many distinct operands (a multi-output, multi-term tile such
+            // as the gate/up backward): shrink the ring, then the chunk,
+            // rather than leave the shape without a lowering.
+            let mut fit = sh;
+            if sh.stages > 2 {
+                fit.stages -= 1;
+            } else if sh.chunk > 16 {
+                fit.chunk /= 2;
+            } else {
+                return None;
+            }
+            return self.cuda_mma_kernel_shaped(root, reads, fit);
         }
 
         let mut s = String::new();
@@ -320,6 +364,83 @@ impl TensorGraph {
         }
         writeln!(s, "    unsigned row0 = tile_y * {bm}u;").unwrap();
         writeln!(s, "    unsigned col0 = tile_x * {bn}u;").unwrap();
+        // A staged map in every term that is provably zero where an
+        // affine condition holds (the causal mask inside P̃ = exp(S + mask
+        // − m), so inside dS too): chunks where it holds over the whole
+        // block contribute nothing and are left out of the k range.
+        let common = |side_a: bool| -> Option<usize> {
+            let mut it = uses
+                .iter()
+                .flatten()
+                .map(|&(ai, bi)| if side_a { ai } else { bi });
+            let first = it.next()?;
+            it.all(|x| x == first).then_some(first)
+        };
+        let zero_cond = [(true, common(true)), (false, common(false))]
+            .into_iter()
+            .find_map(|(side_a, st)| {
+                let st = st?;
+                let map = if side_a {
+                    a_stages[st].2
+                } else {
+                    b_stages[st].2
+                };
+                self.map_zero_cond(rc, map?)
+            })
+            .filter(|f| others.iter().all(|&d| f.coefs[d] == 0));
+        if let Some(f) = &zero_cond {
+            // the condition's minimum over the block × chunk box
+            let lo_hi = |d: usize, lo: String, hi: String| -> String {
+                let cf = f.coefs[d];
+                match cf.cmp(&0) {
+                    std::cmp::Ordering::Greater => format!(" + {cf} * (int)({lo})"),
+                    std::cmp::Ordering::Less => format!(" + {cf} * (int)({hi})"),
+                    std::cmp::Ordering::Equal => String::new(),
+                }
+            };
+            let min = format!(
+                "{}{}{}{}",
+                f.offset,
+                lo_hi(
+                    dy,
+                    "row0".into(),
+                    format!("min(row0 + {}u, {}u)", bm - 1, m - 1)
+                ),
+                lo_hi(
+                    dx,
+                    "col0".into(),
+                    format!("min(col0 + {}u, {}u)", bn - 1, n - 1)
+                ),
+                lo_hi(
+                    kdim,
+                    "k0".into(),
+                    format!("min(k0 + {}u, {}u)", chunk - 1, k_total - 1)
+                ),
+            );
+            writeln!(s, "    {{").unwrap();
+            writeln!(s, "        unsigned lo = k_end, hi = k_begin;").unwrap();
+            writeln!(s, "        for (unsigned c = 0u; c < n_chunks; c++) {{").unwrap();
+            writeln!(s, "            unsigned k0 = k_begin + c * {chunk}u;").unwrap();
+            writeln!(s, "            if ({min} > 0) continue;").unwrap();
+            writeln!(
+                s,
+                "            lo = min(lo, k0); hi = max(hi, min(k0 + {chunk}u, k_end));"
+            )
+            .unwrap();
+            writeln!(s, "        }}").unwrap();
+            writeln!(
+                s,
+                "        if (hi > lo) {{ k_begin = lo; k_end = hi; }} else k_end = k_begin;"
+            )
+            .unwrap();
+            writeln!(
+                s,
+                "        n_chunks = k_end > k_begin ? (k_end - k_begin + {}u) / {chunk}u : 0u;",
+                chunk - 1
+            )
+            .unwrap();
+            writeln!(s, "    }}").unwrap();
+        }
         let lead_term = |addr: &super::msl_mma::Addr| -> String {
             let mut t = format!("{}", addr.offset);
             for &d in &others {
@@ -335,8 +456,6 @@ impl TensorGraph {
         for (t, (_, addr, _)) in b_stages.iter().enumerate() {
             writeln!(s, "    int base_b{t} = {};", lead_term(addr)).unwrap();
         }
-        let rc = self.comp_at(red_node)?;
-        let rank = rc.rank();
         writeln!(s, "    unsigned tid = threadIdx.x;").unwrap();
         writeln!(s, "    unsigned warp = tid / 32u;").unwrap();
         writeln!(s, "    unsigned lane = tid % 32u;").unwrap();
@@ -346,12 +465,62 @@ impl TensorGraph {
         writeln!(s, "    float acc[{n_outs}][{fm}][{fnn}][4];").unwrap();
         writeln!(s, "    #pragma unroll").unwrap();
         writeln!(s, "    for (int w = 0; w < {n_outs}; w++) for (int i = 0; i < {fm}; i++) for (int j = 0; j < {fnn}; j++) for (int r = 0; r < 4; r++) acc[w][i][j][r] = 0.0f;").unwrap();
+        // The side of each nested contraction that does not move with k
+        // (the staged operand's own rows: K for S in dK) is held in mma A
+        // fragments for the whole kernel; warp w owns rows rpw·w … of
+        // the block. k slots (tq, tq + 4) take e = 8q + 2tq, +1, the
+        // pairing the flash forward uses, so S is the same sum it was.
+        let n_a_stages = a_stages.len();
+        for (o, plan) in nested.iter().enumerate() {
+            let (origin, extent, block) = if o < n_a_stages {
+                ("row0", m, bm)
+            } else {
+                ("col0", n, bn)
+            };
+            let nfm = block / nwarps / 16;
+            for (q, nst) in plan.iter().enumerate() {
+                let ne = nst.e / 8;
+                for (t, term) in nst.terms.iter().enumerate() {
+                    let name = format!("nf{o}_{q}_{t}");
+                    writeln!(s, "    unsigned {name}[{nfm}][{ne}][4];").unwrap();
+                    let (cp, ce) = (term.p_addr.coefs[nst.pdim], term.p_addr.coefs[rank]);
+                    let base = lead_term(&term.p_addr);
+                    writeln!(s, "    #pragma unroll").unwrap();
+                    writeln!(s, "    for (int i = 0; i < {nfm}; i++)").unwrap();
+                    writeln!(s, "    #pragma unroll").unwrap();
+                    writeln!(s, "    for (int q = 0; q < {ne}; q++)").unwrap();
+                    writeln!(s, "    #pragma unroll").unwrap();
+                    writeln!(s, "    for (int r = 0; r < 4; r++) {{").unwrap();
+                    writeln!(
+                        s,
+                        "        unsigned gp = {origin} + warp * {}u + 16u * i + gq + 8u * (r % 2);",
+                        block / nwarps
+                    )
+                    .unwrap();
+                    writeln!(s, "        int e = 8 * q + 2 * (int)tq + r / 2;").unwrap();
+                    writeln!(
+                        s,
+                        "        float x = gp < {extent}u ? b{}[(unsigned)({base} + {cp} * (int)gp + {ce} * e)] : 0.0f;",
+                        term.p_buf
+                    )
+                    .unwrap();
+                    let scale = if term.coef == 1.0 {
+                        String::new()
+                    } else {
+                        format!("{:?}f * ", term.coef as f32)
+                    };
+                    writeln!(s, "        {name}[i][q][r] = tang_tf32({scale}x);").unwrap();
+                    writeln!(s, "    }}").unwrap();
+                }
+            }
+        }
 
         // staging of one chunk into buffer `buf`, walking the global
         // buffer in address order
         writeln!(s, "    auto load = [&](unsigned buf, unsigned k0) {{").unwrap();
         writeln!(s, "        float* st = smem + buf * {stage_floats}u;").unwrap();
         let stage = |s: &mut String,
+                     o: usize,
                      off: usize,
                      base: &str,
                      addr: &super::msl_mma::Addr,
@@ -443,25 +612,73 @@ impl TensorGraph {
                 writeln!(s, "        }}").unwrap();
                 return;
             }
-            let k_inner = ck.unsigned_abs() <= cp.unsigned_abs();
-            writeln!(
-                s,
-                "        for (unsigned idx = tid; idx < {}u; idx += {threads}u) {{",
-                block * chunk
-            )
-            .unwrap();
-            if k_inner {
+            // nested contractions: this chunk's block of each, by mma,
+            // in registers; the map is then evaluated on the accumulator
+            // elements (rows: warp w's rpw of the block; columns: the
+            // chunk) and written straight to its stage
+            let plan = &nested[o];
+            let fused = !plan.is_empty();
+            let mut ra_of: Vec<Option<usize>> =
+                vec![None; map.map_or(0, |v| self.comp_at(rc.args[v].src.n()).unwrap().args.len())];
+            if fused {
+                let rpw = block / nwarps;
+                let nfm = rpw / 16;
+                let nfn = chunk / 8;
+                writeln!(s, "        {{").unwrap();
+                for (q, nst) in plan.iter().enumerate() {
+                    ra_of[nst.arg] = Some(q);
+                    let ne = nst.e / 8;
+                    writeln!(s, "        float ra{q}[{nfm}][{nfn}][4];").unwrap();
+                    writeln!(s, "        #pragma unroll").unwrap();
+                    writeln!(s, "        for (int i = 0; i < {nfm}; i++) for (int j = 0; j < {nfn}; j++) for (int r = 0; r < 4; r++) ra{q}[i][j][r] = 0.0f;").unwrap();
+                    for (t, term) in nst.terms.iter().enumerate() {
+                        let (ck, ce) = (term.k_addr.coefs[kdim], term.k_addr.coefs[rank]);
+                        let base = lead_term(&term.k_addr);
+                        writeln!(s, "        #pragma unroll").unwrap();
+                        writeln!(s, "        for (int q = 0; q < {ne}; q++)").unwrap();
+                        writeln!(s, "        #pragma unroll").unwrap();
+                        writeln!(s, "        for (int j = 0; j < {nfn}; j++) {{").unwrap();
+                        writeln!(s, "            unsigned gk = k0 + 8u * j + gq; int e = 8 * q + 2 * (int)tq;").unwrap();
+                        writeln!(s, "            bool ok = gk < {k_total}u;").unwrap();
+                        writeln!(s, "            const float* src = b{} + (ok ? (unsigned)({base} + {ck} * (int)gk + {ce} * e) : 0u);", term.k_buf).unwrap();
+                        writeln!(s, "            unsigned kf[2] = {{tang_tf32(ok ? src[0] : 0.0f), tang_tf32(ok ? src[{ce}] : 0.0f)}};").unwrap();
+                        writeln!(s, "            #pragma unroll").unwrap();
+                        writeln!(s, "            for (int i = 0; i < {nfm}; i++) tang_mma(ra{q}[i][j], nf{o}_{q}_{t}[i][q], kf);").unwrap();
+                        writeln!(s, "        }}").unwrap();
+                    }
+                }
+                writeln!(s, "        #pragma unroll").unwrap();
+                writeln!(s, "        for (int i = 0; i < {nfm}; i++)").unwrap();
+                writeln!(s, "        #pragma unroll").unwrap();
+                writeln!(s, "        for (int j = 0; j < {nfn}; j++)").unwrap();
+                writeln!(s, "        #pragma unroll").unwrap();
+                writeln!(s, "        for (int r = 0; r < 4; r++) {{").unwrap();
                 writeln!(
                     s,
-                    "            unsigned kk = idx % {chunk}u; unsigned pt = idx / {chunk}u;"
+                    "            unsigned pt = warp * {rpw}u + 16u * i + gq + 8u * (r / 2); unsigned kk = 8u * j + 2u * tq + (r % 2);"
                 )
                 .unwrap();
             } else {
+                let k_inner = ck.unsigned_abs() <= cp.unsigned_abs();
                 writeln!(
                     s,
-                    "            unsigned pt = idx % {block}u; unsigned kk = idx / {block}u;"
+                    "        for (unsigned idx = tid; idx < {}u; idx += {threads}u) {{",
+                    block * chunk
                 )
                 .unwrap();
+                if k_inner {
+                    writeln!(
+                        s,
+                        "            unsigned kk = idx % {chunk}u; unsigned pt = idx / {chunk}u;"
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(
+                        s,
+                        "            unsigned pt = idx % {block}u; unsigned kk = idx / {block}u;"
+                    )
+                    .unwrap();
+                }
             }
             writeln!(
                 s,
@@ -508,7 +725,11 @@ impl TensorGraph {
             let vals: Vec<String> = mc
                 .args
                 .iter()
-                .map(|sa| {
+                .enumerate()
+                .map(|(ai, sa)| {
+                    if let Some(q) = ra_of[ai] {
+                        return format!("ra{q}[i][j][r]");
+                    }
                     let view = sa.view.compose(&outer.view, rank);
                     match &self.nodes[sa.src.n()].op {
                         super::Op::Iota(dd) => {
@@ -549,10 +770,14 @@ impl TensorGraph {
             writeln!(s, "            }}").unwrap();
             writeln!(s, "            *({}) = v;", slot("pt", "kk")).unwrap();
             writeln!(s, "        }}").unwrap();
+            if fused {
+                writeln!(s, "        }}").unwrap();
+            }
         };
         for (t, (buf, addr, map)) in a_stages.iter().enumerate() {
             stage(
                 &mut s,
+                t,
                 t * a_floats,
                 &format!("base_a{t}"),
                 addr,
@@ -568,6 +793,7 @@ impl TensorGraph {
         for (t, (buf, addr, map)) in b_stages.iter().enumerate() {
             stage(
                 &mut s,
+                a_stages.len() + t,
                 a_stages.len() * a_floats + t * b_floats,
                 &format!("base_b{t}"),
                 addr,
@@ -836,6 +1062,186 @@ impl TensorGraph {
 /// How many ways to split a tile's reduction (split-K): up to `target`
 /// blocks (the shape's, or `TANG_SPLITK_TARGET`) while every split keeps
 /// at least four chunks of the reduction.
+/// A sum of products `Σ_e U(row, e)·V(k, e)` nested in a staged map
+/// operand: `U` moves with the operand's rows only (held in registers),
+/// `V` with the outer reduction's k (read per chunk).
+struct Nested {
+    /// the map's arg it replaces
+    arg: usize,
+    /// the nested reduce dim's extent
+    e: usize,
+    pdim: usize,
+    terms: Vec<NestedTerm>,
+}
+
+struct NestedTerm {
+    coef: f64,
+    p_buf: usize,
+    /// addresses over the outer space plus the nested dim (last)
+    p_addr: Addr,
+    k_buf: usize,
+    k_addr: Addr,
+}
+
+impl TensorGraph {
+    /// An affine form over `rc`'s space where map operand `v` of `rc` is
+    /// zero wherever it is positive: the map's value has a factor
+    /// `exp2(… + κ·select(cond, ≤ −1e20, 0))` with `κ > 0` (a masked
+    /// exponential), the other terms finite.
+    fn map_zero_cond(&self, rc: &super::Comp, v: usize) -> Option<super::Form> {
+        let rank = rc.rank();
+        let outer = &rc.args[v];
+        let mc = self.comp_at(outer.src.n())?;
+        // the map with its reads seen from rc's space
+        let seen = super::Comp {
+            out: rc.points().to_vec(),
+            tuple: 0,
+            red: rc.red.clone(),
+            args: mc
+                .args
+                .iter()
+                .map(|a| Arg {
+                    src: a.src,
+                    view: a.view.compose(&outer.view, rank),
+                })
+                .collect(),
+            body: mc.body.clone(),
+            body_outs: mc.body_outs.clone(),
+            monoid: None,
+        };
+        let nodes = seen.body.nodes_slice();
+        let lit = |e: tang_expr::ExprId| nodes[e.index() as usize].as_f64();
+        // where the exponent is −∞ in effect
+        fn neg_inf(
+            g: &TensorGraph,
+            c: &super::Comp,
+            nodes: &[ENode],
+            e: tang_expr::ExprId,
+        ) -> Option<super::Form> {
+            let lit = |e: tang_expr::ExprId| nodes[e.index() as usize].as_f64();
+            match nodes[e.index() as usize] {
+                ENode::Add(a, b) => neg_inf(g, c, nodes, a).or_else(|| neg_inf(g, c, nodes, b)),
+                ENode::Mul(a, b) => match (lit(a), lit(b)) {
+                    (Some(k), _) if k > 0.0 => neg_inf(g, c, nodes, b),
+                    (_, Some(k)) if k > 0.0 => neg_inf(g, c, nodes, a),
+                    _ => None,
+                },
+                ENode::Select(cnd, t, f) => match (lit(t), lit(f)) {
+                    (Some(neg), Some(zero)) if neg <= -1e20 && zero == 0.0 => g
+                        .affine_of(c, cnd)
+                        .filter(|(_, k)| k.fract() == 0.0)
+                        .map(|(mut f, k)| {
+                            f.offset += k as i64;
+                            f
+                        }),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        let mut stack = vec![seen.body_outs[0]];
+        while let Some(e) = stack.pop() {
+            match nodes[e.index() as usize] {
+                ENode::Mul(a, b) => stack.extend([a, b]),
+                ENode::Exp2(x) => {
+                    if let Some(f) = neg_inf(self, &seen, nodes, x) {
+                        return Some(f);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let _ = lit;
+        None
+    }
+
+    /// The contractions nested in map operand `v` of `rc`, each a sum of
+    /// products of buffers splitting into a side along `pdim` (the
+    /// staged rows) and one along `kdim`. `None` when a nested arg does
+    /// not have that shape.
+    fn nested_plan(
+        &self,
+        rc: &super::Comp,
+        rank: usize,
+        v: usize,
+        pdim: usize,
+        kdim: usize,
+        reads: &[usize],
+    ) -> Option<Vec<Nested>> {
+        let storage = |j: usize| self.storage(TensorId(j as u32)).n();
+        let outer = &rc.args[v];
+        let mc = self.comp_at(outer.src.n())?;
+        let mut plan = Vec::new();
+        for (ai, sa) in mc.args.iter().enumerate() {
+            let j = sa.src.n();
+            let Some(r) = self.comp_at(j) else { continue };
+            if !self.nodes[j].inline || r.red.is_empty() {
+                continue;
+            }
+            let e = r.red[0].fixed()?;
+            if r.red.len() != 1 || !e.is_multiple_of(8) || e > 128 {
+                return None;
+            }
+            let terms = super::bilinear_terms(&r.body, r.body_outs[0])?;
+            // the nested reduction's points over the outer space, its
+            // reduce coord appended as coord `rank`
+            let pv = sa.view.compose(&outer.view, rank);
+            let inner = super::View {
+                guard: false,
+                forms: pv
+                    .forms
+                    .iter()
+                    .map(|f| {
+                        let mut f = f.clone();
+                        f.coefs.push(0);
+                        f
+                    })
+                    .chain(std::iter::once(super::Form::unit(rank + 1, rank)))
+                    .collect(),
+            };
+            let leaf = |x: u16| -> Option<(usize, Addr)> {
+                let a = &r.args[x as usize];
+                if a.view.guard || !reads.contains(&storage(a.src.n())) {
+                    return None;
+                }
+                let view = a.view.compose(&inner, rank + 1);
+                Some((
+                    storage(a.src.n()),
+                    self.flat_addr(&Arg { src: a.src, view }, rank + 1),
+                ))
+            };
+            let mut nterms = Vec::new();
+            for (coef, x, y) in terms {
+                let (bx, ax) = leaf(x)?;
+                let (by, ay) = leaf(y)?;
+                let p_side = |a: &Addr| a.coefs[kdim] == 0;
+                let k_side = |a: &Addr| a.coefs[pdim] == 0;
+                let ((p_buf, p_addr), (k_buf, k_addr)) = if p_side(&ax) && k_side(&ay) {
+                    ((bx, ax), (by, ay))
+                } else if p_side(&ay) && k_side(&ax) {
+                    ((by, ay), (bx, ax))
+                } else {
+                    return None;
+                };
+                nterms.push(NestedTerm {
+                    coef,
+                    p_buf,
+                    p_addr,
+                    k_buf,
+                    k_addr,
+                });
+            }
+            plan.push(Nested {
+                arg: ai,
+                e,
+                pdim,
+                terms: nterms,
+            });
+        }
+        Some(plan)
+    }
+}
+
 fn split_k(n_tiles: usize, k_total: usize, chunk: usize, target: usize) -> usize {
     let target: usize = std::env::var("TANG_SPLITK_TARGET")
         .ok()
@@ -878,7 +1284,22 @@ impl TensorGraph {
     /// `MMA_SHAPES[v]`, or every kernel transpiled for `None`. All
     /// variants have the same kernels in the same order with the same
     /// bindings, so a tuner can pick a variant per kernel.
+    ///
+    /// Short contractions read only by tiles are nested in them
+    /// ([`schedule_nested_contractions`](Self::schedule_nested_contractions)):
+    /// the tensor-core tiles recompute them per staged block, so every
+    /// variant lowers that schedule.
     pub fn to_cuda_variant(&self, outputs: &[TensorId], variant: Option<usize>) -> WgslProgram {
+        let mut nested = self.clone();
+        nested.schedule_nested_contractions(outputs);
+        nested.to_cuda_variant_scheduled(outputs, variant)
+    }
+
+    fn to_cuda_variant_scheduled(
+        &self,
+        outputs: &[TensorId],
+        variant: Option<usize>,
+    ) -> WgslProgram {
         let mut program = self.to_program_numbered(outputs, Target::Wgsl);
         for k in &mut program.kernels {
             let root = k.node.index();

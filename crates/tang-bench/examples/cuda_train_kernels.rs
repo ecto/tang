@@ -41,6 +41,12 @@ fn main() {
         .unwrap_or(0);
     let native = tg.to_cuda_variant(&outs, Some(variant));
     let plain = tg.to_cuda_with(&outs, false);
+    // TANG_SCALE: the inputs' range (default 0.1, where the block's
+    // softmax saturates to one-hot rows; smaller keeps it soft)
+    let scale: f32 = std::env::var("TANG_SCALE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.1);
     let n_inputs = native.buffers.iter().filter(|b| b.input.is_some()).count();
     let inputs: Vec<Vec<f32>> = (0..n_inputs)
         .map(|k| {
@@ -50,7 +56,7 @@ fn main() {
                 .find(|b| b.input == Some(k))
                 .unwrap()
                 .len;
-            (0..len).map(|_| (rng.f32() * 2.0 - 1.0) * 0.1).collect()
+            (0..len).map(|_| (rng.f32() * 2.0 - 1.0) * scale).collect()
         })
         .collect();
     let refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
@@ -110,18 +116,20 @@ fn main() {
                     .collect()
             }
         };
-        for (o, w) in outs.iter().zip(&want) {
-            let got = n.read(&rt, *o);
-            let err = got
-                .iter()
-                .zip(w)
-                .map(|(&x, &y)| (x as f64 - y).abs())
-                .fold(0.0, f64::max);
-            let scale = w.iter().map(|y| y.abs()).fold(0.0, f64::max);
-            println!(
-                "check {o:?}: max err {err:.2e} / max |ref| {scale:.2e} = {:.2e}",
-                err / scale.max(1e-30)
-            );
+        for (prog, which) in [(&n, "native"), (&p, "plain")] {
+            for (o, w) in outs.iter().zip(&want) {
+                let got = prog.read(&rt, *o);
+                let err = got
+                    .iter()
+                    .zip(w)
+                    .map(|(&x, &y)| (x as f64 - y).abs())
+                    .fold(0.0, f64::max);
+                let scale = w.iter().map(|y| y.abs()).fold(0.0, f64::max);
+                println!(
+                    "check {which} {o:?}: max err {err:.2e} / max |ref| {scale:.2e} = {:.2e}",
+                    err / scale.max(1e-30)
+                );
+            }
         }
     }
     let (mut tot_best, mut tot_plain) = (0.0, 0.0);

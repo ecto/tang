@@ -115,6 +115,47 @@ naive graph's. The backward graph is an ordinary graph; the same passes optimize
 it. A whole transformer block (`tang-bench::ir_block`) differentiates this
 way and matches finite differences.
 
+**A stabilizing max has no gradient.** Softmax is invariant to shifting
+its scores, so the `[s == m]` terms of a stabilizing max's gradient sum to
+zero, but only in exact arithmetic, and while they exist the max has to be
+materialized and masked tiles cannot be skipped. `backward` drops them when
+it can prove the loss does not depend on `m`
+(`stabilizer_maxes`). Each node downstream of `m` gets a degree in
+`t = exp(−m)`: `t^k·h` or `a + κ·m`, with `h` and `a` free of `m`, and with
+the row of `m` its factor comes from tracked as a view. The rules only use
+identities: `t^a·t^b = t^(a+b)`, `Σ_j t·h_j = t·Σ_j h_j` when `t`'s row does not
+depend on `j`, and `2^(a+κm) = 2^a·t^(−κ ln 2)`. `o/l` is then degree 0, a
+function of the scores alone. If every path from `m` ends at a degree-0 node,
+`∂L/∂m ≡ 0` and `m`'s gradient is not built. Any use the rules do not cover
+disqualifies `m`. `stabilize_softmax` then points the max's remaining
+readers (the backward's `exp(s − m)`) at the online state's slot 0, which
+holds the same max bit for bit. The f64 evaluation of the training step is
+unchanged (2.7e-19 absolute at gradients of 1e6).
+
+**Sums distribute.** `hoist_invariant_factors` moves the factors of a
+sum's body that do not read the reduce coords out to a map over the
+reduction: `Σ_c P̃·dO·V` becomes `P̃·Σ_c dO·V`, a plain contraction. A sum
+over size-1 dims becomes a map, and args that no body output reads are
+dropped, since a kernel would still bind them.
+
+**Flash backward is nesting.** A short contraction (one reduce dim, at most
+128) whose every reader is a tile, or a map recomputed in tiles, is inlined
+(`schedule_nested_contractions`, applied by `to_cuda`). The attention
+backward then reads `S = Q·Kᵀ` and `dP = dO·Vᵀ` only through `P̃` and `dS`,
+which the dQ, dK and dV tiles recompute, so nothing n×n is written.
+`cuda_mma_kernel` runs each nested contraction as `mma` per staged block:
+- the side along the operand's rows (K for dK) stays in A fragments for
+  the whole kernel;
+- the side along k is read per chunk;
+- each warp evaluates the map (`dS`, `P̃`) on its accumulator registers and
+  writes the stage directly.
+
+The k slots are paired as in the flash forward, so the recomputed `S` is
+the same sum the forward reduced. Chunks where a staged operand of every
+term is a masked exponential, zero by an affine condition (`map_zero_cond`),
+are left out of the k range. `merge_reduce_dims` leaves a map over a
+contraction this big unmerged, since a reshape would pin it to memory.
+
 **Schedules are separate from algebra.** A comprehension says *what*. The
 schedule fields on a node say *how*, and can't change the answer:
 

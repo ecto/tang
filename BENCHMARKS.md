@@ -1143,6 +1143,76 @@ Not done, and why:
   - S and dP as nested contractions: a small GEMM per staged block, on tensor cores, inside the staging of the outer tile. The scalar version, 128 FMAs per staged dS element, would cost more than the materialization it removes.
   - Removing the max-gradient terms, `select(s == max)·Σ…`. They are identically zero, since softmax is invariant to the shift, but only numerically so. While they remain, the stabilizing max over S has to be materialized for the row sums, and masked tiles cannot be skipped. The forward's online-softmax state already holds the same max, but `eliminate_common` cannot see that the two are equal.
 - The dQ merge costs two 4 µs copies, because the halves are read through reshapes that a slot view cannot express.
+### Flash backward: no n×n tensors in the attention backward (RTX 3090)
+
+The training step's attention backward no longer writes S, P̃, dP or the correction terms. Four generic changes get there, plus one lowering gap fixed on the way. Each is described in `docs/tensor-ir.md`.
+
+- **The stabilizing max has no gradient** (`backward`, `stabilizer_maxes`). The degree analysis in `t = exp(−m)` proves the loss does not depend on the attention max, so its `[s == m]` terms are not built. The materialized max over S and its row-sum kernels are gone. `stabilize_softmax` points the backward's reads of the max at the online state's slot 0. The f64 evaluation of the training step equals main's to 2.7e-19 absolute, with gradients around 1e6.
+- **Sums distribute** (`hoist_invariant_factors`, run at the end of `split_reduce_dims`). `Σ_c P̃·dO·V` becomes `P̃·Σ_c dO·V`, a sum over a size-1 dim becomes a map, and unread args are dropped. That last step removed 9 more kernels from the step: their unread reads had pinned maps to memory.
+- **Nested contractions** (`schedule_nested_contractions`, applied by `to_cuda`). S and dP are inlined into the dQ, dK and dV tiles through dS and P̃. `cuda_mma_kernel` computes them per staged block on `mma`:
+  - the row side stays in A fragments for the whole kernel;
+  - the k side is read per chunk;
+  - the map is evaluated on the accumulator registers and written straight to its stage.
+  
+  The recomputed S takes the same k-slot pairing as the flash forward, so it is the sum the forward reduced. `merge_reduce_dims` keeps dV's `(r, i)` unmerged so P̃ can be recomputed there.
+- **Masked chunks are skipped.** A staged operand that is a masked exponential in every term gives an affine zero condition. Chunks of queries (dK, dV) or keys (dQ) where that condition holds over the whole block are left out of the k range.
+- **The gate/up backward at the default shape.** The multi-output, multi-term `[seq,576,2]` Σ1536 tile overflowed shared memory at 3 stages and had no lowering. A shape that overflows now gives up a ring stage, then halves its chunk. A 32×64 two-warp shape joins `MMA_SHAPES` as a candidate.
+
+Per kernel: `cuda_train_kernels`, minimum over single launches. The attention backward and the gate/up backward, main (#51) against this branch:
+
+| kernel | seq 128 main | this | seq 512 main | this |
+|---|---|---|---|---|
+| S = Q·Kᵀ | 0.012 | nested | 0.058 | nested |
+| max over S | 0.009 | (state slot 0) | 0.022 | (state slot 0) |
+| P̃ = exp(S − m) | 0.006 | nested | 0.041 | nested |
+| dP | 0.007 | nested | 0.043 | nested |
+| the P̃·D term and max-gradient row sums (3 kernels) | 0.018 | gone | 0.083 | gone |
+| online-softmax forward | 0.014 | 0.020 (S inline) | 0.055 | 0.046 |
+| dV | 0.017 | 0.017 | 0.041 | 0.052 |
+| dK (both rope halves) | 0.023 | 0.023 | 0.127 | 0.074 |
+| dQ (both rope halves) | 0.019 | 0.026 | 0.126 | 0.079 |
+| D = rowsum(dO∘O) (this branch: and its 1/l scale) | 0.009 | 0.011 | 0.022 | 0.023 |
+| gate/up backward `[seq,576,2]` Σ1536, default shape | 0.303 (no lowering) | 0.048 | 0.312 (no lowering) | 0.104 |
+| sum of best per kernel, whole step | 0.92 (63 kernels) | 0.60 (49) | 1.80 (63) | 1.22 (49) |
+
+Each change on its own, as a sum of best per kernel. These are cumulative, in commit order, with two rounds each:
+
+| | seq 128 | seq 512 |
+|---|---|---|
+| main (#51) | 0.918 | 1.802 |
+| + max gradient dropped | 0.881 | 1.736 |
+| + gate/up default shape | 0.637 | 1.513 |
+| + sums distribute, unread args dropped | 0.600 | 1.442 |
+| + nested S, dP through shared scratch | 0.620 | 1.308 |
+| + masked chunks skipped | 0.618 | 1.309 |
+| + map on the accumulator registers (final) | 0.598 | 1.223 |
+
+End to end: three interleaved rounds under `flock`, 01:34–01:37 UTC. Each round ran every build, then PyTorch, for the block, and the same for the 4-layer step. The 3090 was at 1–100% utilization from other tenants at round starts. Best of each:
+
+| | main (#51) | − max grad | + gate/up | + distribute | + P̃ in dV, skip | this branch | PyTorch fp32 / TF32 |
+|---|---|---|---|---|---|---|---|
+| block fwd+bwd, seq 128 | 0.550 | 0.541 | 0.520 | 0.507 | 0.505 | **0.490** | 1.223 / — |
+| block fwd+bwd, seq 512 | 1.466 | 1.403 | 1.398 | 1.353 | 1.302 | **1.144** | 1.733 / — |
+| 4-layer step, seq 128 (planned, in place, CUDA graph) | 3.93 | 3.96 | 2.82 | 2.77 | 2.75 | **2.72** | 4.37 fused AdamW / 4.42 |
+
+The "+ P̃ in dV, skip" column is commit `589eb8d`. Its `cuda_block` and `whole_model` did not call the nesting pass yet (only `cuda_train_kernels` did), so it measures dV's unmerged reduction dims and the skip without nesting.
+
+The 4-layer step went from 3.93 to 2.72 ms. Most of that, 1.1 ms, is the gate/up fix: `whole_model` lowers at the default shape without the tuner, so on main each layer's gate/up backward ran as transpiled WGSL. The block fwd+bwd at seq 512 is now 1.51× faster than PyTorch fp32, up from 1.18×. At seq 128 it is 2.5×.
+
+Correctness at seq 128, against the f64 evaluation (computed outside the GPU lock):
+- inputs at the bench's default range (±0.1): loss 1.2e-5 relative, weight gradients 1.5–3.1e-4 relative, the same as main.
+  - dwq and dwk are about 4e-19 in the reference, because the softmax rows saturate to one-hot. Their absolute error is now 1.2e3 and 1.9e3 against gradients of 1e6, where on main it was 2.7e-19.
+  - On main, the max-gradient term cancelled `dP·P` exactly at the argmax: the same dP kernel computed both, so the result was 0 bit for bit.
+  - Now dS = P̃·(dP − D) takes dP from TF32 operands and D = rowsum(dO∘O) in fp32. That is FlashAttention-2's formulation, and its error is at the TF32 level of the other gradients.
+- inputs at ±0.02, where the softmax is soft and dwq/dwk are not zero (`TANG_SCALE=0.02`): main and this branch are equally accurate (dwq 3.3e-3 / 3.4e-3, dwk 1.4e-3 / 1.0e-3, others 1.8–4.7e-4 relative), for all seven block shapes forced in turn (`TANG_MMA_VARIANT=0..6`).
+
+Negatives:
+- At seq 128 the nested tiles with scratch were slower than materializing (0.620 vs 0.600 sum of best). dK and dQ have 18 blocks there. Evaluating the map on the accumulator registers (no scratch, no barriers) was needed to win at both lengths.
+- The 32×64 two-warp shape helps dV and dQ at seq 128 by 2–5 µs. It loses at seq 512 (dK 0.112 vs 0.074). It is kept as a tuner candidate only.
+- Shapes with 128-row blocks get no nested lowering: their invariant-side fragments exceed the 96-register budget. The tuner does not pick them for these tiles anyway.
+- Skipping masked chunks barely shows (0.618 vs 0.620 at seq 128, flat at seq 512). The blocks whose rows are least masked are the critical path, as with the forward. The heaviest-first launch order the flash forward uses is not done here.
+- The transpiled-WGSL twins of the nested tiles are scalar loops (1.4–2.4 ms at seq 512). They exist only so the tuner has a fallback, and it never picks them.
+
 ## Kokoro-shaped ops (M4 Max, Metal, kernel-only)
 
 TTS vocoder ops (Kokoro's iSTFTNet decoder, Vocos-style ConvNeXt) derived

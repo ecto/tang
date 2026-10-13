@@ -173,13 +173,26 @@ impl TensorGraph {
             let Some(mc) = self.comp_at(p) else {
                 return false;
             };
+            // a short contraction over buffers nested in the map (S = Q·Kᵀ
+            // inside dS): lowerings that can run it per staged block do
+            let nested = |j: usize| {
+                self.nodes[j].inline
+                    && self.comp_at(j).is_some_and(|r| {
+                        r.monoid.as_ref().map(super::Monoid::kind) == Some(super::MonoidKind::Sum)
+                            && r.red.len() == 1
+                            && r.tuple == 0
+                            && super::bilinear_terms(&r.body, r.body_outs[0]).is_some()
+                            && r.args.iter().all(|x| !x.view.guard && is_buffer(x.src.n()))
+                    })
+            };
             mc.monoid.is_none()
                 && mc.red.is_empty()
                 && mc.width() == 1
                 && mc.args.iter().all(|s| {
                     !s.view.guard
                         && (matches!(self.nodes[s.src.n()].op, super::Op::Iota(_))
-                            || is_buffer(s.src.n()))
+                            || is_buffer(s.src.n())
+                            || nested(s.src.n()))
                 })
         };
         let mut outs: Vec<Vec<Term>> = Vec::with_capacity(out_pairs.len());
