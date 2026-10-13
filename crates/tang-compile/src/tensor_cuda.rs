@@ -305,7 +305,7 @@ impl TensorGraph {
             Some(&f) if halves.iter().any(|&g| g != f) => return None,
             Some(&f) => Some(f),
         };
-        if half.is_some() && chunk % 16 != 0 {
+        if half.is_some() && !chunk.is_multiple_of(16) {
             return None;
         }
         let esz = if half.is_some() { 2 } else { 4 };
@@ -668,7 +668,7 @@ impl TensorGraph {
                 } else {
                     ("kk", "pt")
                 };
-                if total % threads == 0 && threads.is_multiple_of(nv) {
+                if total.is_multiple_of(threads) && threads.is_multiple_of(nv) {
                     writeln!(s, "        #pragma unroll").unwrap();
                     writeln!(
                         s,
