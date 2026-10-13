@@ -59,6 +59,12 @@ impl GpuDevice {
         let mut limits = wgpu::Limits::default();
         limits.max_storage_buffers_per_shader_stage =
             adapter_limits.max_storage_buffers_per_shader_stage.min(16);
+        // whole weight matrices are single buffers (an LM head's 4-bit
+        // nibbles are 311 MB): as large as the adapter allows
+        limits.max_buffer_size = adapter_limits.max_buffer_size.max(limits.max_buffer_size);
+        limits.max_storage_buffer_binding_size = adapter_limits
+            .max_storage_buffer_binding_size
+            .max(limits.max_storage_buffer_binding_size);
         limits.max_compute_workgroup_storage_size = adapter_limits
             .max_compute_workgroup_storage_size
             .max(limits.max_compute_workgroup_storage_size);

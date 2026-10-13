@@ -17,12 +17,6 @@
 //! ```
 //!
 //! `<ids>` is a file of whitespace-separated token ids (the prompt).
-#[cfg(not(feature = "cuda"))]
-fn main() {
-    eprintln!("qwen_decode needs --features cuda");
-}
-
-#[cfg(feature = "cuda")]
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -33,7 +27,6 @@ fn main() {
     }
 }
 
-#[cfg(feature = "cuda")]
 mod cuda {
     use std::collections::HashMap;
     use std::time::Instant;
@@ -42,7 +35,28 @@ mod cuda {
     use tang_compile::tensor::cuda_gemv::Packing;
     use tang_compile::tensor::wgsl::WgslProgram;
     use tang_compile::tensor::TensorId;
-    use tang_gpu::program::{BufferPlan, Program, Runtime};
+    use tang_gpu::program::{BackendKind, BufferPlan, Program, Runtime};
+
+    /// CUDA when built with it and present, else wgpu (Metal: MSL).
+    fn runtime() -> Runtime {
+        #[cfg(feature = "cuda")]
+        if let Some(rt) = Runtime::cuda_capturable() {
+            return rt;
+        }
+        Runtime::wgpu().expect("no GPU")
+    }
+
+    fn lower(
+        rt: &Runtime,
+        g: &tang_compile::tensor::TensorGraph,
+        outs: &[TensorId],
+        opts: &tang_compile::tensor::cuda_gemv::DecodeOpts,
+    ) -> tang_compile::tensor::cuda_gemv::DecodeProgram {
+        match rt.kind() {
+            BackendKind::Cuda => g.to_cuda_decode(outs, opts),
+            BackendKind::Wgpu => g.to_msl_decode(outs, opts),
+        }
+    }
 
     /// f32 → bf16 → f32, round to nearest even.
     /// f32 → f16 → f32, round to nearest even.
@@ -121,7 +135,8 @@ mod cuda {
             opts.warps = env("TANG_DECODE_WARPS");
             opts.unroll = env("TANG_DECODE_UNROLL");
             opts.mma_shape = env("TANG_MMA_SHAPE");
-            let dp = g.to_cuda_decode(&outs, &opts);
+            let rt = runtime();
+            let dp = lower(&rt, &g, &outs, &opts);
             let native = dp.native.clone();
             let program = dp.program;
             eprintln!(
@@ -131,7 +146,6 @@ mod cuda {
                 t.elapsed().as_secs_f64()
             );
             let plan = slot_plan(&program, &outs, &opts.inplace);
-            let rt = Runtime::cuda_capturable().expect("cuda");
             let refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
             let t = Instant::now();
             let mut prog = Program::with_plan(&rt, program, &refs, &plan);
@@ -581,7 +595,8 @@ mod cuda {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        let dp = g.to_cuda_decode(&outs, &opts);
+        let rt = runtime();
+        let dp = lower(&rt, &g, &outs, &opts);
         let mut program = dp.program;
         lazy_order(&mut program);
         let plan = slot_plan(&program, &outs, &opts.inplace);
@@ -603,7 +618,7 @@ mod cuda {
             persistent as f64 * 4e-6,
             (plan.slot_len.iter().sum::<usize>() - persistent) as f64 * 4e-6
         );
-        let rt = Runtime::cuda_capturable().expect("cuda");
+
         let refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
         let t = Instant::now();
         let mut prog = Program::with_plan(&rt, program, &refs, &plan);

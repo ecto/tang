@@ -50,6 +50,8 @@ pub mod memplan;
 pub mod msl;
 /// #34's f32 simdgroup-matrix tile (`to_msl_mma`, opt-in via TANG_NATIVE)
 /// and the affine/bilinear analysis the CUDA wmma lowering shares.
+#[path = "tensor_msl_gemv.rs"]
+mod msl_gemv;
 #[path = "tensor_msl_mma.rs"]
 mod msl_mma;
 #[path = "tensor_precision.rs"]
@@ -334,6 +336,19 @@ impl Monoid {
 
     pub fn max() -> Self {
         Self::build(1, vec![f64::NEG_INFINITY], |a, e| vec![max(a[0], e[0])])
+    }
+
+    /// State `(i, v)`, element `(j, w)`: the larger value with its index,
+    /// the smaller index on a tie (so the result is the first maximum,
+    /// whatever the combine order). Identity `(0, -f32::MAX)`.
+    pub fn argmax() -> Self {
+        Self::build(2, vec![0.0, -(f32::MAX as f64)], |a, e| {
+            let (i, v, j, w) = (a[0], a[1], e[0], e[1]);
+            let d = w - v;
+            let sel = |c, t, f| tang_expr::with_graph(|g| g.select(c, t, f));
+            let tie = sel(i - j, j, i);
+            vec![sel(d, j, sel(-d, i, tie)), sel(d, w, v)]
+        })
     }
 
     /// State `(m, acc₁…accₖ)`, element `(s, g₁…gₖ)`:
@@ -794,6 +809,32 @@ impl TensorGraph {
         self.push_comp(Comp {
             out: dims(out),
             tuple: 0,
+            red: dims(red),
+            args,
+            body,
+            body_outs,
+            monoid,
+        })
+    }
+
+    /// [`comp`](Self::comp) whose body produces a tuple: the output's
+    /// last dim (of size the body's width) holds a point's values — the
+    /// state of a tuple monoid such as [`Monoid::argmax`].
+    pub fn comp_tuple<D: Into<Dim> + Copy>(
+        &mut self,
+        out: &[D],
+        red: &[D],
+        args: Vec<Arg>,
+        monoid: Option<Monoid>,
+        f: impl FnOnce(&[ExprId]) -> Vec<ExprId>,
+    ) -> Result<TensorId, ShapeError> {
+        let (body, body_outs) = trace(|| {
+            let vars: Vec<ExprId> = (0..args.len()).map(|i| ExprId::var(i as u16)).collect();
+            f(&vars)
+        });
+        self.push_comp(Comp {
+            out: dims(out),
+            tuple: 1,
             red: dims(red),
             args,
             body,

@@ -911,6 +911,62 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         self.submit_or_enqueue(device, encoder.finish());
     }
 
+    /// The pipeline and bind group layout [`dispatch_buffers`] would use
+    /// for `wgsl` over `n` storage buffers (then the uniform).
+    pub(crate) fn pipeline(
+        &mut self,
+        device: &GpuDevice,
+        wgsl: &str,
+        n: usize,
+        writable: &[usize],
+        workgroup_size: u32,
+    ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
+        let mut bindings: Vec<BindingSpec> = (0..n)
+            .map(|i| BindingSpec::Storage {
+                read_only: !writable.contains(&i),
+            })
+            .collect();
+        bindings.push(BindingSpec::Uniform);
+        let hash = Self::hash_wgsl(wgsl);
+        let c = self.get_or_compile_dynamic_wg(device, wgsl, hash, &bindings, workgroup_size);
+        (c.pipeline.clone(), c.bind_group_layout.clone())
+    }
+
+    /// A bind group of `buffers` then a uniform holding `params`.
+    pub(crate) fn bind(
+        &mut self,
+        device: &GpuDevice,
+        layout: &wgpu::BindGroupLayout,
+        buffers: &[&GpuBuffer],
+        params: &[u32; 4],
+    ) -> wgpu::BindGroup {
+        use wgpu::util::DeviceExt;
+        let params_buf = device
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("tang-gpu params"),
+                contents: bytemuck::cast_slice(params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let mut entries: Vec<wgpu::BindGroupEntry> = buffers
+            .iter()
+            .enumerate()
+            .map(|(i, b)| wgpu::BindGroupEntry {
+                binding: i as u32,
+                resource: b.buffer.as_entire_binding(),
+            })
+            .collect();
+        entries.push(wgpu::BindGroupEntry {
+            binding: buffers.len() as u32,
+            resource: params_buf.as_entire_binding(),
+        });
+        device.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tang-gpu bind group"),
+            layout,
+            entries: &entries,
+        })
+    }
+
     /// Get or compile a pipeline with an arbitrary binding layout.
     ///
     /// Each `BindingSpec` describes one binding: its type and read-only flag.
