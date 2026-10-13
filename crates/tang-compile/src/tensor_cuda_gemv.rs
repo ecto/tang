@@ -927,7 +927,7 @@ impl Lowering<'_> {
                     // 2^23 + q as a float, minus 2^23: no int-to-float
                     // conversion (quarter rate) per weight
                     Some(Packing::U4) => format!(
-                        "(__uint_as_float(0x4b000000u | (((&u{i}[{}].x)[e >> 3] >> ((e & 7) * 4)) & 15u)) - 8388608.0f)",
+                        "(__uint_as_float(0x4b000000u | (((&u{i}[{}].x)[e >> 3] >> ((e & 7) * 4)) & 15u)) - 8388608.0)",
                         ri_(l)
                     ),
                     _ => format!("(&v{i}[{}][e >> 2].x)[e & 3]", ri_(l)),
