@@ -774,6 +774,10 @@ fn model(args: &[String]) {
                 total += pre.bytes;
                 steps.push(pre);
             }
+            // the last chunk's next-token logits
+            if let (Some(p), Some(last)) = (opt("--logits"), steps.last()) {
+                write_f32(&p, &last.logits(&rt));
+            }
         }
         None => {
             for (pos, &tok) in ids.iter().enumerate() {

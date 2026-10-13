@@ -708,7 +708,7 @@ impl Program {
         };
         let mut launch = d.stream.launch_builder(&functions[i]);
         for &s in &self.args[i] {
-            launch.arg(&slots[s]);
+            launch.arg(&*slots[s]);
         }
         launch.arg(&k.points);
         unsafe { launch.launch(cfg) }.expect("launch");
