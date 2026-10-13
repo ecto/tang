@@ -5987,6 +5987,7 @@ dependencies = [
  "metal 0.33.0",
  "nalgebra",
  "rand 0.8.5",
+ "serde_json",
  "tang",
  "tang-ad",
  "tang-compile",

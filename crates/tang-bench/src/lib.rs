@@ -260,6 +260,8 @@ pub fn random_spd_flat(size: usize) -> Vec<f64> {
 #[cfg(feature = "metal")]
 #[path = "ir_msl.rs"]
 pub mod ir_msl;
+#[path = "ir_qwen.rs"]
+pub mod ir_qwen;
 
 /// Whole-model compilation: N blocks, loss, backward and AdamW as one graph.
 pub mod ir_model;
