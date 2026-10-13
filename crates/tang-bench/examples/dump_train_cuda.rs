@@ -31,7 +31,6 @@ fn main() {
     let (tg, outs) = tg.merge_reduce_dims(&outs);
     let (mut tg, outs) = tg.split_reduce_dims(&outs);
     tg.schedule_auto(&outs);
-    tg.schedule_nested_contractions(&outs);
     let native = tg.to_cuda_with(&outs, true);
     let plain = tg.to_cuda_with(&outs, false);
     let dump = |g: &tang_compile::tensor::TensorGraph, n: usize, indent: &str| {

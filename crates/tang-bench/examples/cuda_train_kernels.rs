@@ -34,7 +34,6 @@ fn main() {
     let (tg, outs) = tg.merge_reduce_dims(&outs);
     let (mut tg, outs) = tg.split_reduce_dims(&outs);
     tg.schedule_auto(&outs);
-    tg.schedule_nested_contractions(&outs);
     // TANG_MMA_VARIANT=v: the matmul tiles in block shape MMA_SHAPES[v]
     let variant = std::env::var("TANG_MMA_VARIANT")
         .ok()

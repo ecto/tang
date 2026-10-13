@@ -1287,7 +1287,22 @@ impl TensorGraph {
     /// `MMA_SHAPES[v]`, or every kernel transpiled for `None`. All
     /// variants have the same kernels in the same order with the same
     /// bindings, so a tuner can pick a variant per kernel.
+    ///
+    /// Short contractions read only by tiles are nested in them
+    /// ([`schedule_nested_contractions`](Self::schedule_nested_contractions)):
+    /// the tensor-core tiles recompute them per staged block, so every
+    /// variant lowers that schedule.
     pub fn to_cuda_variant(&self, outputs: &[TensorId], variant: Option<usize>) -> WgslProgram {
+        let mut nested = self.clone();
+        nested.schedule_nested_contractions(outputs);
+        nested.to_cuda_variant_scheduled(outputs, variant)
+    }
+
+    fn to_cuda_variant_scheduled(
+        &self,
+        outputs: &[TensorId],
+        variant: Option<usize>,
+    ) -> WgslProgram {
         let mut program = self.to_program_numbered(outputs, Target::Wgsl);
         for k in &mut program.kernels {
             let root = k.node.index();
