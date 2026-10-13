@@ -283,7 +283,7 @@ mod cuda {
                     .iter()
                     .zip(&res[which])
                     .fold(0.0f64, |m, (&a, &b)| m.max((a as f64 - b).abs()));
-                if e > 1e-3 && pos < 3 {
+                if pos < 2 {
                     println!("pos {pos}: layer 0 {o} cache max err {e:.2e}");
                 }
             }
