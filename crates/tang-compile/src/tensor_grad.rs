@@ -25,10 +25,45 @@ use super::{
     View,
 };
 
+/// Options for [`TensorGraph::backward_with`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BackwardOptions {
+    /// Keep the gradient terms of stabilizing maxes
+    /// ([`stabilizer_maxes`](TensorGraph::stabilizer_maxes)) instead of
+    /// dropping them. The terms sum to zero in real arithmetic, so the
+    /// default (off) is exact there and cheaper; in floating point,
+    /// keeping them reproduces the gradient the explicit `[s == m]`
+    /// routing gives, which matters when the softmax saturates (one-hot
+    /// rows, true dWq/dWk ≈ 0): dropping them leaves the rounding noise
+    /// of `dP − D` (as FlashAttention-2 does) instead of the cancellation.
+    pub exact_stabilizers: bool,
+}
+
+impl BackwardOptions {
+    /// The default, with `TANG_EXACT_STABILIZERS=1` turning
+    /// [`exact_stabilizers`](Self::exact_stabilizers) on.
+    pub fn from_env() -> Self {
+        Self {
+            exact_stabilizers: std::env::var("TANG_EXACT_STABILIZERS").is_ok_and(|v| v == "1"),
+        }
+    }
+}
+
 impl TensorGraph {
     /// Gradients of `sum(y)` with respect to each of `wrt`, appended to
     /// this graph. A `wrt` that `y` does not depend on gets a zero map.
+    /// Options from the environment ([`BackwardOptions::from_env`]).
     pub fn backward(&mut self, y: TensorId, wrt: &[TensorId]) -> Result<Vec<TensorId>, ShapeError> {
+        self.backward_with(y, wrt, BackwardOptions::from_env())
+    }
+
+    /// [`backward`](Self::backward) with explicit options.
+    pub fn backward_with(
+        &mut self,
+        y: TensorId,
+        wrt: &[TensorId],
+        opts: BackwardOptions,
+    ) -> Result<Vec<TensorId>, ShapeError> {
         let live = self.live(&[y]);
         let mut grads: HashMap<usize, TensorId> = HashMap::new();
         let ones = {
@@ -37,8 +72,13 @@ impl TensorGraph {
         };
         grads.insert(y.n(), ones);
         // Stabilizing maxes: `y` provably does not depend on them, so
-        // their gradient is exactly zero and is not built at all.
-        let stable = self.stabilizer_maxes(y);
+        // their gradient is exactly zero and is not built at all (unless
+        // `opts` asks for the terms anyway).
+        let stable = if opts.exact_stabilizers {
+            HashSet::new()
+        } else {
+            self.stabilizer_maxes(y)
+        };
 
         // Reverse order over the original nodes; everything appended by
         // this pass sits after `y` and is never a dependency of it.
@@ -1015,5 +1055,79 @@ mod tests {
         let grads = g.backward(y, &[x]).unwrap();
         let inputs = [ramp(7, 0.3, -1.0)];
         check_grad(&g, y, &inputs, 0, grads[0]);
+    }
+
+    /// A softmax attention whose rows saturate (one-hot), `sum(y²)`, and
+    /// the f64 gradients w.r.t. q, k, v under `backward_fn`.
+    fn saturated_attention_grads(
+        backward_fn: impl Fn(&mut TensorGraph, TensorId, &[TensorId]) -> Vec<TensorId>,
+    ) -> Vec<Vec<f64>> {
+        let (n, d) = (6, 4);
+        let mut g = TensorGraph::new();
+        let q = g.input(&[n, d]);
+        let k = g.input(&[n, d]);
+        let v = g.input(&[n, d]);
+        let kt = g.transpose(k, &[1, 0]).unwrap();
+        let s = g.matmul(q, kt).unwrap();
+        let m = g.reduce(s, 1, Monoid::max()).unwrap();
+        let mb = g.broadcast(m, &[n, n]).unwrap();
+        let p = g.map(&[s, mb], |x| (x[0] - x[1]).exp()).unwrap();
+        let l = g.reduce(p, 1, Monoid::sum()).unwrap();
+        let o = g.matmul(p, v).unwrap();
+        let lb = g.broadcast(l, &[n, d]).unwrap();
+        let y = g.map(&[o, lb], |x| x[0] / x[1]).unwrap();
+        let sq = g.map(&[y], |x| x[0] * x[0]).unwrap();
+        let grads = backward_fn(&mut g, sq, &[q, k, v]);
+        // logits spread over hundreds: every row's softmax is one-hot
+        let inputs = [
+            ramp(n * d, 0.9, -40.0),
+            ramp(n * d, 0.7, 5.0),
+            ramp(n * d, 0.4, -1.0),
+        ];
+        g.eval(&inputs, &grads)
+    }
+
+    fn bits_hash(vs: &[Vec<f64>]) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for x in vs.iter().flatten() {
+            for b in x.to_bits().to_le_bytes() {
+                h = (h ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+        h
+    }
+
+    /// Saturated softmax: the f64 gradients of q and k are ~1e-63 (zero
+    /// up to the one-hot tails). `exact_stabilizers` rebuilds the
+    /// max-gradient terms and gives, bit for bit, what `backward` gave
+    /// before stabilizing maxes were dropped (hash recorded on #52's
+    /// parent, d1122a2^1). The default is the fast path, unchanged.
+    #[test]
+    fn exact_stabilizers_restore_the_saturated_gradient() {
+        const BEFORE_DROPPING_MAX_GRADIENTS: u64 = 0x8500_844f_f35f_70f8;
+        let exact = saturated_attention_grads(|g, y, w| {
+            let opts = BackwardOptions {
+                exact_stabilizers: true,
+            };
+            g.backward_with(y, w, opts).unwrap()
+        });
+        assert_eq!(bits_hash(&exact), BEFORE_DROPPING_MAX_GRADIENTS);
+        let fast = saturated_attention_grads(|g, y, w| {
+            g.backward_with(y, w, BackwardOptions::default()).unwrap()
+        });
+        assert_ne!(bits_hash(&fast), BEFORE_DROPPING_MAX_GRADIENTS);
+        assert!(!BackwardOptions::default().exact_stabilizers);
+        if std::env::var_os("TANG_EXACT_STABILIZERS").is_none() {
+            let plain = saturated_attention_grads(|g, y, w| g.backward(y, w).unwrap());
+            assert_eq!(bits_hash(&plain), bits_hash(&fast), "default changed");
+        }
+        eprintln!("fast {:016x} dq {:?}", bits_hash(&fast), &fast[0][..8]);
+        // v's gradient does not involve the max either way
+        assert_eq!(exact[2], fast[2]);
+        for (a, b) in exact.iter().zip(&fast).take(2) {
+            for (x, y) in a.iter().zip(b) {
+                assert!((x - y).abs() < 1e-9, "{x} vs {y}");
+            }
+        }
     }
 }

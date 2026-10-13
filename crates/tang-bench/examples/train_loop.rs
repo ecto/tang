@@ -74,7 +74,10 @@ fn main() {
     for step in 1..=steps {
         train.run(&rt);
         let loss = train.read(&rt, outs[0])[0];
-        println!("step {step:>3}: loss {loss:.6}");
+        println!(
+            "step {step:>3}: loss {loss:.6} (bits {:08x})",
+            loss.to_bits()
+        );
         let bc = [
             (1.0 - b1.powi(step as i32)) as f32,
             (1.0 - b2.powi(step as i32)) as f32,

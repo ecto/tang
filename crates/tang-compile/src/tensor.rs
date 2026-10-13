@@ -56,6 +56,7 @@ pub mod precision;
 mod tile;
 #[path = "tensor_wgsl.rs"]
 pub mod wgsl;
+pub use grad::BackwardOptions;
 pub use precision::{ErrorBudget, ErrorStats, Format, Precision};
 
 // ---------------------------------------------------------------------------

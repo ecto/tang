@@ -163,11 +163,6 @@ fn main() {
         let (mut tg, outs) = tg.split_reduce_dims(&outs);
         tg.schedule_auto(&outs);
         let program = rt.lower(&tg, &outs);
-        let n_native = program
-            .kernels
-            .iter()
-            .filter(|k| k.source.contains("mma"))
-            .count();
         let n_kernels = program.kernels.len();
         let target = vec![0.0f32; seq * 576];
         let mut refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
@@ -193,7 +188,8 @@ fn main() {
         );
         let ms = train.time(&rt, 50);
         println!(
-            "block seq={seq}: fwd+bwd {ms:.3} ms ({n_kernels} kernels, {kept} of {n_native} native kept)"
+            "block seq={seq}: fwd+bwd {ms:.3} ms ({n_kernels} kernels, {kept} of {} native kept)",
+            report.native_total
         );
         let mut slow: Vec<(f64, usize)> = (0..n_kernels)
             .map(|i| (train.time_kernel(&rt, i, 10), i))
