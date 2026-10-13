@@ -695,6 +695,25 @@ pub fn compiled_decode(dg: &DecodeGraph) -> (TensorGraph, Vec<TensorId>) {
         .collect();
     let caches = outs[1..dg.outputs.len()].to_vec();
     g.schedule_decode_maps(&outs, &u4, &caches);
+    if dg.seq > 1 && std::env::var_os("TANG_PREFILL_TF32").is_none() {
+        // prefill: the dequantized weights stored f16, so the matmuls run
+        // on f16 tensor cores (the f32 activations are converted while
+        // staging)
+        use tang_compile::tensor::{Format, Op, Precision};
+        let u4_nodes: Vec<usize> = (0..g.nodes().len())
+            .filter(|&i| matches!(g.nodes()[i].op, Op::Input(k) if u4.contains(&k)))
+            .collect();
+        for i in 0..g.nodes().len() {
+            let n = &g.nodes()[i];
+            let is_dq = !n.inline
+                && g.comp_at(i).is_some_and(|c| {
+                    c.monoid.is_none() && c.args.iter().any(|a| u4_nodes.contains(&a.src.index()))
+                });
+            if is_dq {
+                g.set_precision(TensorId::from_index(i), Precision::storage(Format::F16));
+            }
+        }
+    }
     (g, outs)
 }
 
@@ -736,7 +755,14 @@ pub fn plan_slots(
         let t = program.storage(t);
         program.buffers.iter().position(|b| b.node == t).unwrap()
     };
-    let words = |b: usize| program.buffers[b].len.max(1);
+    let words = |b: usize| {
+        let spec = &program.buffers[b];
+        match spec.format {
+            tang_compile::tensor::Format::F32 => spec.len,
+            _ => spec.len.div_ceil(2),
+        }
+        .max(1)
+    };
     let mut last = vec![0usize; nb];
     for (p, k) in program.kernels.iter().enumerate() {
         for &t in k.reads.iter().chain([&k.node]) {

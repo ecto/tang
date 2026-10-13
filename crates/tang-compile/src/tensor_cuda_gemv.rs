@@ -1250,8 +1250,15 @@ impl Lowering<'_> {
             .map(|a| self.tree(a, pk, &mut leaves))
             .collect::<Option<Vec<_>>>()?;
         let n: usize = pts.iter().product();
+        // stored as f16 (a dequantized weight a half tile reads): a thread
+        // writes a word, two neighbouring points
+        let half = self.g.nodes[root].precision.storage == super::Format::F16;
+        if half && (w != 1 || n % 2 != 0) {
+            return None;
+        }
+        let per = if half { 2 } else { 1 };
         let threads = 256;
-        let blocks = n.div_ceil(threads);
+        let blocks = (n / per).div_ceil(threads);
         let mut s = String::new();
         writeln!(
             s,
@@ -1274,8 +1281,15 @@ impl Lowering<'_> {
             params.join(", ")
         )
         .unwrap();
-        writeln!(s, "    const int t = blockIdx.x * {threads} + threadIdx.x;").unwrap();
-        writeln!(s, "    if (t >= {n}) return;").unwrap();
+        writeln!(
+            s,
+            "    const int tt = blockIdx.x * {threads} + threadIdx.x;"
+        )
+        .unwrap();
+        writeln!(s, "    if (tt >= {}) return;", n / per).unwrap();
+        writeln!(s, "    unsigned hw[2] = {{0u, 0u}};").unwrap();
+        writeln!(s, "    for (int u = 0; u < {per}; u++) {{").unwrap();
+        writeln!(s, "    const int t = tt * {per} + u;").unwrap();
         let mut rem = "t".to_string();
         for d in (0..pk).rev() {
             writeln!(s, "    const int p{d} = ({rem}) % {};", pts[d]).unwrap();
@@ -1294,8 +1308,15 @@ impl Lowering<'_> {
         let y = emit(&mut s, &c.body, &c.body_outs, "x_", "    ", &|v| {
             vals[v as usize].clone()
         });
-        for (slot, v) in y.iter().enumerate() {
-            writeln!(s, "    out[t * {w} + {slot}] = {v};").unwrap();
+        if half {
+            writeln!(s, "    hw[u] = tang_f2h({});", y[0]).unwrap();
+            writeln!(s, "    }}").unwrap();
+            writeln!(s, "    ((unsigned*)out)[tt] = hw[0] | (hw[1] << 16);").unwrap();
+        } else {
+            for (slot, v) in y.iter().enumerate() {
+                writeln!(s, "    out[t * {w} + {slot}] = {v};").unwrap();
+            }
+            writeln!(s, "    }}").unwrap();
         }
         writeln!(s, "}}").unwrap();
         Some(Kernel {
