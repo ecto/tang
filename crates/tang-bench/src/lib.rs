@@ -2644,7 +2644,7 @@ pub mod ir_block {
             let nested = p
                 .kernels
                 .iter()
-                .filter(|k| k.source.contains("tang_mma(ra["))
+                .filter(|k| k.source.contains("tang_mma(ra0["))
                 .count();
             assert_eq!(nested, 3);
             for k in &p.kernels {
