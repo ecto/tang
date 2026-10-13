@@ -754,10 +754,10 @@ impl Lowering<'_> {
         let vec = if leaves
             .iter()
             .any(|l| unit(l) && l.pack == Some(Packing::U4) && aligned(l, 32))
-            && ri % 32 == 0
+            && ri.is_multiple_of(32)
         {
             32
-        } else if ri % 4 == 0 && leaves.iter().any(|l| unit(l) && l.pack.is_none()) {
+        } else if ri.is_multiple_of(4) && leaves.iter().any(|l| unit(l) && l.pack.is_none()) {
             4
         } else {
             1
@@ -802,7 +802,7 @@ impl Lowering<'_> {
                 reg = (0..pk)
                     .rev()
                     .find(|&d| pts[d] > 1)
-                    .filter(|&d| rows > 1 && pts[d] % rows == 0 && hl.addr.coefs[d] != 0)
+                    .filter(|&d| rows > 1 && pts[d].is_multiple_of(rows) && hl.addr.coefs[d] != 0)
                     .map(|d| (d, rows));
             }
         }
@@ -1253,7 +1253,7 @@ impl Lowering<'_> {
         // stored as f16 (a dequantized weight a half tile reads): a thread
         // writes a word, two neighbouring points
         let half = self.g.nodes[root].precision.storage == super::Format::F16;
-        if half && (w != 1 || n % 2 != 0) {
+        if half && (w != 1 || !n.is_multiple_of(2)) {
             return None;
         }
         let per = if half { 2 } else { 1 };
@@ -1377,7 +1377,7 @@ impl Lowering<'_> {
         }
         let last = pk - 1;
         let pair = pack.is_some() && dp != last;
-        if pair && pts[last] % 2 != 0 {
+        if pair && !pts[last].is_multiple_of(2) {
             return None;
         }
         let extent = |d: usize| {
