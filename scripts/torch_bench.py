@@ -72,11 +72,23 @@ for T in (128, 512):
         torch.backends.cuda.matmul.allow_tf32 = True
         print(f"block fwd seq={T} tf32: {bench(lambda: blk(x,cos,sin)):.3f} ms")
         torch.backends.cuda.matmul.allow_tf32 = False
+        # mixed precision: fp32 weights, bf16 matmuls and attention
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            print(f"block fwd seq={T} bf16 autocast: {bench(lambda: blk(x,cos,sin)):.3f} ms")
     xg = x.clone().requires_grad_(True)
     def step():
         blk.zero_grad(set_to_none=True)
         out = blk(xg,cos,sin); out.sum().backward()
     print(f"block fwd+bwd seq={T} fp32: {bench(step):.3f} ms")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    print(f"block fwd+bwd seq={T} tf32: {bench(step):.3f} ms")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    def step_amp():
+        blk.zero_grad(set_to_none=True)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            out = blk(xg,cos,sin)
+        out.float().sum().backward()
+    print(f"block fwd+bwd seq={T} bf16 autocast: {bench(step_amp):.3f} ms")
 # adam 4M
 p = torch.randn(4_194_304, device=dev); g = torch.randn_like(p)*0.1
 opt = torch.optim.Adam([torch.nn.Parameter(p)], lr=1e-3, foreach=True)

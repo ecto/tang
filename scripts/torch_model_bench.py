@@ -43,12 +43,15 @@ x = torch.randn(T, D, device=dev); target = torch.randn(T, D, device=dev)
 pos = torch.arange(T, device=dev).float().unsqueeze(1); i = torch.arange(HD//2, device=dev).float()
 theta = pos / (10000 ** (2*i/HD)); cos, sin = theta.cos().unsqueeze(1), theta.sin().unsqueeze(1)
 
-def run(opt):
+def run(opt, amp=False):
     def step():
         opt.zero_grad(set_to_none=True)
-        h = x
-        for b in model: h = b(h, cos, sin)
-        F.mse_loss(h, target).backward()
+        # bf16 autocast: fp32 master weights and AdamW, bf16 matmuls and
+        # attention (bf16 needs no loss scaling)
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
+            h = x
+            for b in model: h = b(h, cos, sin)
+        F.mse_loss(h.float(), target).backward()
         opt.step()
     return step
 
@@ -61,3 +64,10 @@ for tf32 in (False, True):
         ms = bench(run(opt))
         peak = torch.cuda.max_memory_allocated() / 2**20
         print(f"step {'tf32' if tf32 else 'fp32'} adamw-{kind}: {ms:.2f} ms, peak allocated {peak:.0f} MB")
+torch.backends.cuda.matmul.allow_tf32 = False
+for kind in ("foreach", "fused"):
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01, **{kind: True})
+    torch.cuda.reset_peak_memory_stats()
+    ms = bench(run(opt, amp=True))
+    peak = torch.cuda.max_memory_allocated() / 2**20
+    print(f"step bf16-autocast adamw-{kind}: {ms:.2f} ms, peak allocated {peak:.0f} MB")
