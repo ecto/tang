@@ -3090,10 +3090,30 @@ impl TensorGraph {
         for i in (0..self.nodes.len()).filter(|&i| live[i] && !self.nodes[i].inline) {
             if let Some(c) = self.comp_at(i) {
                 let w = c.width();
-                let mut buf = vec![0.0; numel(c.points()) * w];
-                for (p, idx) in indices(&fixed(c.points())).enumerate() {
-                    ev.point(i, &idx, &mut buf[p * w..(p + 1) * w]);
-                }
+                let pts = fixed(c.points());
+                let n = numel(c.points());
+                let mut buf = vec![0.0; n * w];
+                // points are independent: evaluate them on all cores (the
+                // result does not depend on the split)
+                let threads = std::thread::available_parallelism()
+                    .map_or(1, |t| t.get())
+                    .min(n.div_ceil(256))
+                    .max(1);
+                let per = n.div_ceil(threads);
+                let ev_ref = &ev;
+                std::thread::scope(|sc| {
+                    for (t, chunk) in buf.chunks_mut(per * w).enumerate() {
+                        let pts = &pts;
+                        sc.spawn(move || {
+                            let start = t * per;
+                            for (p, idx) in
+                                indices(pts).skip(start).take(chunk.len() / w).enumerate()
+                            {
+                                ev_ref.point(i, &idx, &mut chunk[p * w..(p + 1) * w]);
+                            }
+                        });
+                    }
+                });
                 if emulate {
                     let f = self.nodes[i].precision.storage;
                     buf.iter_mut().for_each(|v| *v = f.round(*v));

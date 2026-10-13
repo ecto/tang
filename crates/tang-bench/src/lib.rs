@@ -263,6 +263,10 @@ pub mod ir_msl;
 #[path = "ir_qwen.rs"]
 pub mod ir_qwen;
 
+/// Precision search through `tang_gpu::program::Program` (CUDA or wgpu).
+#[path = "ir_precision.rs"]
+pub mod ir_precision;
+
 /// Whole-model compilation: N blocks, loss, backward and AdamW as one graph.
 pub mod ir_model;
 

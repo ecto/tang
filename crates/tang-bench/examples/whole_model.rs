@@ -16,6 +16,8 @@ use tang_bench::ir_model::{
 };
 use tang_compile::tensor::memplan::MemoryPlan;
 use tang_compile::tensor::wgsl::WgslProgram;
+#[cfg(feature = "cuda")]
+use tang_compile::tensor::Format;
 use tang_compile::tensor::{TensorGraph, TensorId};
 use tang_gpu::program::{Program, Runtime};
 
@@ -90,7 +92,41 @@ fn build(seq: usize, layers: usize, cuda: bool) -> Built {
     } else {
         step.boundaries.clone()
     };
-    let (g, couts) = compile_with_barriers(&step.graph, &outs, &barriers);
+    let (mut g, couts) = compile_with_barriers(&step.graph, &outs, &barriers);
+    // TANG_PRECISION=<file>: a precision schedule from `prec-tune`
+    if let Ok(path) = std::env::var("TANG_PRECISION") {
+        let text = std::fs::read_to_string(&path).expect("precision file");
+        tang_bench::ir_precision::read_assignment(&mut g, &text);
+        println!("  precision: {} buffers from {path}", text.lines().count());
+    }
+    // TANG_PRECISION_TILES=f16|bf16: the precision search's first move
+    // alone — every tensor-core tile's operands in half, graph inputs
+    // (weights, AdamW state, data) kept f32
+    if let Ok(f) = std::env::var("TANG_PRECISION_TILES") {
+        use tang_bench::ir_precision;
+        let f = match f.as_str() {
+            "bf16" => tang_compile::tensor::Format::BF16,
+            _ => tang_compile::tensor::Format::F16,
+        };
+        let inputs: Vec<TensorId> = g
+            .to_cuda(&couts)
+            .buffers
+            .iter()
+            .filter(|b| b.input.is_some())
+            .map(|b| b.node)
+            .collect();
+        if let Some(m) = ir_precision::moves(&g, &couts, &inputs)
+            .into_iter()
+            .find(|m| m.what.starts_with("all"))
+        {
+            println!(
+                "  precision: {} ({} buffers) in {f:?}",
+                m.what,
+                m.buffers.len()
+            );
+            g = ir_precision::apply(&g, &m, f);
+        }
+    }
     let t_passes = t.elapsed();
     let t = Instant::now();
     let prog = if cuda {
@@ -300,12 +336,35 @@ fn run_wgpu(b: &Built, layers: usize, seq: usize) {
 fn run_cuda(b: &Built, layers: usize, seq: usize) {
     // own stream, event tracking off: what CUDA Graph capture needs
     let rt = Runtime::cuda_capturable().expect("cuda");
+    // TANG_TUNE: every kernel at its fastest lowering (`Program::tuned`:
+    // tensor-core tile shapes against transpiled WGSL). The kernels and
+    // buffers are the same in every variant, so the memory plans hold.
+    let tuned;
+    let prog = if std::env::var_os("TANG_TUNE").is_some() {
+        let refs: Vec<&[f32]> = b.step.inputs.iter().map(|v| v.as_slice()).collect();
+        let tag = std::env::var("TANG_PRECISION_TILES").unwrap_or_else(|_| "f32".into());
+        let path = format!(
+            "{}/target/tang-tuning-whole-model-{layers}-{seq}-{tag}.txt",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let (p, rep) = Program::tuned(&rt, &b.g, &b.outs, &refs, Some(std::path::Path::new(&path)));
+        println!(
+            "  tuned: {} of {} native kernels kept{}",
+            rep.native_kept,
+            rep.native_total,
+            if rep.from_cache { " (cached)" } else { "" }
+        );
+        tuned = p.program;
+        &tuned
+    } else {
+        &b.prog
+    };
     let t = Instant::now();
-    let mut naive = planned(&rt, &b.prog, &b.naive, &b.step.inputs);
+    let mut naive = planned(&rt, prog, &b.naive, &b.step.inputs);
     println!(
         "  cuda: {} kernels, {} distinct sources compiled in {:.2?}",
         b.prog.kernels.len(),
-        program_stats(&b.prog).distinct_sources,
+        program_stats(prog).distinct_sources,
         t.elapsed()
     );
     naive.run(&rt);
@@ -319,7 +378,7 @@ fn run_cuda(b: &Built, layers: usize, seq: usize) {
     naive.capture(&rt);
     let tng = naive.time(&rt, 5);
     drop(naive);
-    let mut inplace = planned(&rt, &b.prog, &b.inplace, &b.step.inputs);
+    let mut inplace = planned(&rt, prog, &b.inplace, &b.step.inputs);
     inplace.run(&rt);
     let loss_i = inplace.read(&rt, b.outs[0]);
     println!(
@@ -327,9 +386,25 @@ fn run_cuda(b: &Built, layers: usize, seq: usize) {
         bits_hash(b.outs.iter().map(|&t| inplace.read(&rt, t)))
     );
     let p_i = inplace.read(&rt, b.outs[1]);
+    // TANG_REF=<file>: error of every output against the f64 reference
+    // (from `prec-ref`)
+    if let Ok(path) = std::env::var("TANG_REF") {
+        let want = tang_bench::ir_precision::read_f64s(&path);
+        let got: Vec<Vec<f64>> = b
+            .outs
+            .iter()
+            .map(|&t| inplace.read(&rt, t).iter().map(|&x| x as f64).collect())
+            .collect();
+        let e = tang_compile::tensor::ErrorStats::compare(&got, &want);
+        let loss = tang_compile::tensor::ErrorStats::compare(&got[..1], &want[..1]);
+        println!(
+            "  error vs f64: max rel {:.2e} (mean {:.2e}) over all outputs; loss rel {:.2e}",
+            e.max_rel, e.mean_rel, loss.max_rel
+        );
+    }
     {
         // the first replay of a captured step from fresh state
-        let mut fresh = planned(&rt, &b.prog, &b.inplace, &b.step.inputs);
+        let mut fresh = planned(&rt, prog, &b.inplace, &b.step.inputs);
         fresh.capture(&rt);
         fresh.run(&rt);
         println!(
@@ -362,6 +437,16 @@ fn run_cuda(b: &Built, layers: usize, seq: usize) {
     let _ = &b.g;
 }
 
+/// The program's graph inputs (weights, AdamW state, data).
+#[cfg(feature = "cuda")]
+fn graph_inputs(p: &WgslProgram) -> Vec<TensorId> {
+    p.buffers
+        .iter()
+        .filter(|b| b.input.is_some())
+        .map(|b| b.node)
+        .collect()
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let layers: usize = args.get(1).map_or(4, |s| s.parse().unwrap());
@@ -383,12 +468,110 @@ fn main() {
                     .map(|k| k.source.clone())
                     .collect::<Vec<_>>()
             };
-            let (a, c) = (sources(&b.prog), sources(&build(seq, 1, true).prog));
+            let (mut a, c) = (sources(&b.prog), sources(&build(seq, 1, true).prog));
+            // with TANG_TUNE, every lowering `Program::tuned` will time
+            if std::env::var_os("TANG_TUNE").is_some() {
+                for v in std::iter::once(None)
+                    .chain((0..tang_compile::tensor::cuda::MMA_SHAPES.len()).map(Some))
+                {
+                    a.extend(sources(&b.g.to_cuda_variant(&b.outs, v)));
+                }
+            }
             tang_gpu::cuda::precompile(a.iter().chain(&c).map(|s| s.as_str()), "sm_86");
             println!("  nvrtc {:.2?}", t.elapsed());
         }
         #[cfg(feature = "cuda")]
         "cuda" => run_cuda(&b, layers, seq),
+        // precision search, phase 1 (CPU): the f64 reference of every
+        // output, and nvrtc for the search's candidates
+        #[cfg(feature = "cuda")]
+        "prec-ref" => {
+            use tang_bench::ir_precision;
+            let path = args.get(4).expect("reference path");
+            let t = Instant::now();
+            let inputs: Vec<Vec<f64>> = b
+                .step
+                .inputs
+                .iter()
+                .map(|v| v.iter().map(|&x| x as f64).collect())
+                .collect();
+            ir_precision::write_f64s(path, &b.g.eval(&inputs, &b.outs));
+            println!("  reference in {:.1?}", t.elapsed());
+            let t = Instant::now();
+            let srcs = ir_precision::candidate_sources(
+                &b.g,
+                &b.outs,
+                &graph_inputs(&b.prog),
+                &[Format::F16, Format::BF16],
+            );
+            tang_gpu::cuda::precompile(srcs.iter().map(|s| s.as_str()), "sm_86");
+            println!(
+                "  {} candidate sources, nvrtc {:.1?}",
+                srcs.len(),
+                t.elapsed()
+            );
+        }
+        // phase 2 (GPU): the search; graph inputs (weights, AdamW state,
+        // data) stay f32. Writes the schedule to `<reference>.prec`
+        #[cfg(feature = "cuda")]
+        "prec-tune" => {
+            use tang_bench::ir_precision;
+            let path = args.get(4).expect("reference path");
+            let want = ir_precision::read_f64s(path);
+            let rt = Runtime::select().expect("gpu");
+            let refs: Vec<&[f32]> = b.step.inputs.iter().map(|v| v.as_slice()).collect();
+            let budget = tang_compile::tensor::ErrorBudget::rel(
+                std::env::var("TANG_BUDGET")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1e-2),
+            );
+            let r = ir_precision::tune_precision(
+                &rt,
+                b.g.clone(),
+                &b.outs,
+                &refs,
+                &want,
+                budget,
+                &graph_inputs(&b.prog),
+                &[Format::F16, Format::BF16],
+                min_gain(),
+                5,
+            );
+            for t in &r.trials {
+                println!(
+                    "  {:<48} rel {:.2e} {} {}",
+                    t.what,
+                    t.error.max_rel,
+                    t.ms.zip(t.vs)
+                        .map_or("over budget".to_string(), |(m, r)| format!(
+                            "{m:.3} ms ({r:.3}x current)"
+                        )),
+                    if t.kept { "kept" } else { "" }
+                );
+            }
+            println!(
+                "  f32 {:.3} ms (rel {:.2e}) -> {:.3} ms (rel {:.2e}), {} buffers changed",
+                r.base_ms,
+                r.base_error.max_rel,
+                r.ms,
+                r.error.max_rel,
+                r.assignment.len()
+            );
+            std::fs::write(
+                format!("{path}.prec"),
+                ir_precision::write_assignment(&r.assignment),
+            )
+            .unwrap();
+        }
         _ => {}
     }
+}
+
+/// `TANG_MIN_GAIN`: the fraction a precision move must save (default 0.01).
+fn min_gain() -> f64 {
+    std::env::var("TANG_MIN_GAIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.01)
 }

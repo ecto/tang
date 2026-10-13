@@ -1213,6 +1213,90 @@ Negatives:
 - Skipping masked chunks barely shows (0.618 vs 0.620 at seq 128, flat at seq 512). The blocks whose rows are least masked are the critical path, as with the forward. The heaviest-first launch order the flash forward uses is not done here.
 - The transpiled-WGSL twins of the nested tiles are scalar loops (1.4–2.4 ms at seq 512). They exist only so the tuner has a fallback, and it never picks them.
 
+### Precision schedules on CUDA: f16/bf16 storage, m16n8k16 tensor cores (RTX 3090)
+
+f16 and bf16 storage now lower on CUDA (see `docs/tensor-ir.md`, "Precision is a schedule"). The tensor-core tiles and flash attention run on `mma.sync` m16n8k16 f16/bf16 with fp32 accumulation when their operands are stored in half precision. `ir_precision::tune_precision` picks the schedule under an error budget against the f64 evaluation.
+
+The 3090 was shared the whole time (tang-llm at 100% utilization), so the f32 baseline itself ran up to 2× its earlier numbers. Everything below is the best of six interleaved rounds (best of four for the 4-layer step), each run under `flock`, and the tang settings and PyTorch alternated within a round. Treat the figures as ratios within one window, not as absolute times.
+
+**One matmul tile, by operand format** (`cuda_half_matmul`, fastest single launch over every block shape):
+
+| m×k×n | TF32 | f16 | bf16 | f16 × f32 (B converted while staging) |
+|---|---|---|---|---|
+| 128×576×1536 | 0.0195 ms (11.6 TFLOP/s) | 0.0133 (17.0) | 0.0123 (18.4) | 0.0174 (13.0) |
+| 512×576×1536 | 0.0471 (19.2) | 0.0287 (31.6) | 0.0287 (31.6) | 0.0328 (27.6) |
+| 512×1536×576 | 0.0420 (21.6) | 0.0256 (35.4) | 0.0246 (36.9) | 0.0369 (24.6) |
+| 1024³ | 0.0860 (25.0) | 0.0522 (41.1) | 0.0522 (41.1) | 0.0573 (37.4) |
+| 4096³ | 4.56 (30.2) | 1.99 (68.9) | 2.00 (68.9) | 2.70 (50.9) |
+
+At 4096³, f16 reaches 69 TFLOP/s, close to the 3090's dense FP16 peak with fp32 accumulation (about 71).
+
+**The block and its fwd+bwd, by setting** (`cuda_precision`, every setting through `Program::tuned`). Times are whole-program `Program::time`, the metric `cuda_block` reports. Errors are max relative against f64 (mean in parentheses); fwd+bwd inputs are at ±0.02, where the softmax is soft (`TANG_SCALE=0.02`, see the flash-backward section):
+
+| | f32 (TF32 tiles) | tiles in f16 | tiles in bf16 | `tune_precision` | all storage f16 | all storage bf16 |
+|---|---|---|---|---|---|---|
+| fwd, seq 128 | 0.197 ms, 8.3e-5 | 0.114, 8.0e-5 | 0.113, 5.9e-4 | 0.114, 8.0e-5 | 0.111, **inf** | 0.111, 1.4e-2 |
+| fwd, seq 512 | 0.343, 1.1e-4 | 0.201, 1.0e-4 | 0.204, 6.8e-4 | **0.189**, 1.1e-4 | 0.187, **inf** | 0.190, 1.4e-2 |
+| fwd+bwd, seq 128 | 0.536, 3.4e-3 (4.4e-4) | 0.406, 3.3e-3 (4.6e-4) | 0.406, 2.5e-2 | **0.376**, 3.3e-3 (4.6e-4) | 0.392, 1.0 | 0.390, 0.25 |
+| fwd+bwd, seq 512 | 1.243, 2.1e-3 (3.2e-4) | 0.876, 1.9e-3 (3.5e-4) | 0.819, 1.6e-2 | 0.878, 4.5e-3 (1.3e-3) | 0.835, 1.0 | 0.846, 0.21 |
+
+Sums of the per-kernel fastest launches (the search's cost, steadier under contention):
+
+| | f32 | tiles f16 | `tune_precision` |
+|---|---|---|---|
+| fwd 128 | 0.201 | 0.137 | 0.137 |
+| fwd 512 | 0.351 | 0.222 | 0.212 |
+| fwd+bwd 128 | 0.557 | 0.438 | 0.438 |
+| fwd+bwd 512 | 1.169 | 0.838 | 0.827 |
+
+**What `tune_precision` keeps** (budget 1e-2 relative, f16 and bf16 tried per move, a move kept if it saves 1%):
+- In every case, first the move "all tiles' operands in f16". The search tried bf16 too: in the forward it is as fast and 7× less accurate, and in training it is over budget.
+- The kept buffers: the seven weight matrices, the normed activations feeding Q/K/V and gate/up, Q, K and V (both rope halves), the attention output, the gate/up product and the down projection's input. In training, also the transposed activations and gradients the weight-gradient tiles read (`[576, seq]`, `[1536, seq]`) and the attention-backward operands.
+- Then a few single buffers: in fwd 128, the rope table and the attention input of `wo`; in fwd 512, gate/up's output and the block input. In fwd+bwd 512 it added gate/up's output in bf16, which saves 1.1% and doubles the error (2.1e-3 → 4.5e-3). That is a weak keep at the 1% threshold.
+- Nothing else cleared the threshold: the small vectors (biases, norms) and the accumulators. Accumulators are not candidates on CUDA, since an f16 accumulator keeps a tile off the tensor cores.
+
+**Against PyTorch**, same windows, best of each (`torch_bench.py` now with bf16 autocast, and TF32 for fwd+bwd):
+
+| | tang f32 | tang `tune_precision` | PyTorch fp32 | PyTorch TF32 | PyTorch bf16 autocast |
+|---|---|---|---|---|---|
+| block fwd, seq 128 | 0.197 | **0.114** | 0.303 | 0.306 | 0.350 |
+| block fwd, seq 512 | 0.343 | **0.189** | 0.657 | 0.484 | 0.280 |
+| block fwd+bwd, seq 128 | 0.536 | **0.376** | 1.264 | 1.233 | 1.329 |
+| block fwd+bwd, seq 512 | 1.243 | **0.878** | 1.873 | 1.622 | 1.764 |
+
+Against PyTorch bf16 autocast, the block forward is 3.1× faster at seq 128 and 1.48× at 512. The fwd+bwd is 3.5× at seq 128 and 2.0× at 512. Against tang's own f32, half precision is 1.7–1.8× faster for the forward and 1.4× for fwd+bwd.
+
+**The 4-layer training step** (`whole_model 4 128 cuda`, planned, in place, CUDA graph):
+- `TANG_PRECISION_TILES=f16|bf16` applies the search's first move: every tile's operands in half, with weights, AdamW state and data kept f32 (fp32 master weights; half tiles convert them while staging).
+- `TANG_TUNE=1` lowers each kernel at its tuned shape. Untuned, the half tiles sit at the default shape, which suits TF32.
+- The full search is not run on this graph: about 830 candidate sources, hours of lock time.
+- The error is over every output (loss, p', m', v') against f64. m′ after one step is the gradient, so its error is the gradient's.
+
+| | best (CUDA graph) | mean rel. error | loss rel. error |
+|---|---|---|---|
+| tang f32, untuned (main's setting) | 5.95 ms | 1.5e-4 | 1.5e-6 |
+| tang f32, tuned | 5.80 | 1.5e-4 | 1.2e-6 |
+| tang tiles f16, tuned | **5.05** | 5.1e-3 | 5.1e-7 |
+| tang tiles bf16, tuned | **5.05** | 1.3e-3 | 1.9e-6 |
+| PyTorch fused AdamW: fp32 / TF32 / bf16 autocast | 4.48 / 4.21 / 4.40 | | |
+
+In these windows the step ran at about 2.2× its quiet-machine time (2.72 ms), while PyTorch ran at about its earlier 4.4. So the ranking against PyTorch is not established here; the earlier quiet-machine runs had tang ahead. Within tang, half tiles are 13% faster than f32 in the same windows. bf16 gives four times smaller gradient error than f16 at the same speed: f16's range loses the small gradients without loss scaling.
+
+f32 path: with no node in half precision, every CUDA source is byte-identical to main's (block fwd and train, seq 128/512, all 8 lowering variants). The digests match main bit for bit: `cuda_block` `20c8ff36…` / `47b96240…` / `5cff2ba3…` / `57e0a808…`, `whole_model 4 128 cuda` `9f41a84e…`, and every step of `train_loop`.
+
+Negatives:
+- **Half tiles were slower than TF32 until the operands were staged in their own layout** (0.12 → 0.17 ms for gate/up at seq 512). The block's weights are stored [out, in], so the B operand is contiguous along k. The first half path only had a 16-byte `cp.async` path for n-contiguous B and fell back to synchronous 2-byte loads. Staging k-contiguous B as [n][k] (m16n8k16's native B layout, one 32-bit load per register) and m-contiguous A as [k][m] with paired rows fixed it: gate/up went 0.122 → 0.057.
+- **All storage in f16 overflows** (inf in the forward, relative error 1.0 in training). **All storage in bf16** costs 1.4e-2 in the forward and 0.2 in training. Only the tile operands go half; the softmax statistics, norms and residual stream stay f32.
+- **In training, f16 tiles' gradients are 4× less accurate than bf16's** (mean 5.1e-3 vs 1.3e-3 on the 4-layer step). The block fwd+bwd budget still admits f16, at a max error equal to f32's, because the max is set by other outputs.
+- **Doubling the k chunk for half tiles is a wash per shape.** It wins 512×1536×576 (0.0256 vs 0.0276) and loses 512×576×1536 (0.0317 vs 0.0287). It stays the default, and the shape tuner picks among the doubled shapes; `TANG_HALF_CHUNK=1` turns it off.
+- **Converting an f32 operand while staging costs about a third of the f16 gain** (f16 × f32 at 13–51 TFLOP/s against 17–69). It is what keeps fp32 master weights cheap without a separate cast kernel, but storing the weights in half is faster for inference.
+- **The search had to stop timing whole programs.** On the time-sliced GPU, the same program's wall time swung 2× between batches, and "same window" ratios still ranged from 0.5× to 2.2×. The cost became the sum of per-kernel fastest single launches.
+- **It also had to cost each kernel at its best tile shape.** At the default shape, all tiles in f16 measured 1.08× slower in fwd+bwd, while `Program::tuned` made them 20% faster. Kernel costs are memoized by source, so a candidate times only the kernels it changes.
+- **A single tile's move gains 2–3%**, below the old 3% threshold, so every move was rejected. The search now tries all tiles at once first, with a 1% threshold.
+- **The noise floor is about ±1.5%.** Moves that set 576-element vectors to bf16 were kept for 1–4% "gains" that cannot be real. The final re-check against f32 only guards the total.
+- **Flash attention in half saves little at these lengths**: 0.014 → 0.011 ms at seq 128 and flat at 512, against 0.12 → 0.057 for gate/up.
+- **PyTorch bf16 autocast is slower than its fp32 at seq 128** (0.350 vs 0.303 ms forward), from per-op cast kernels. tang casts inside the tiles.
+
 ## Kokoro-shaped ops (M4 Max, Metal, kernel-only)
 
 TTS vocoder ops (Kokoro's iSTFTNet decoder, Vocos-style ConvNeXt) derived

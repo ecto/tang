@@ -769,8 +769,8 @@ pub(super) fn emit_scalar(
 impl TensorGraph {
     /// Element count of buffer `j` as a kernel expression.
     fn buffer_len_expr(&self, j: usize) -> String {
-        if super::wgsl::dialect() == super::wgsl::Dialect::Msl {
-            // MSL has no runtime array length; the size is static
+        if super::wgsl::dialect() != super::wgsl::Dialect::Wgsl {
+            // MSL and CUDA have no runtime array length; the size is static
             return format!("{}u", super::numel(&self.nodes[j].shape));
         }
         let per_word = match self.nodes[j].precision.storage {

@@ -9,7 +9,7 @@ use crate::node::{ExprId, Node};
 pub type CompiledExpr = Box<dyn Fn(&[f64]) -> f64>;
 
 /// Compiled multi-output expression closure.
-pub type CompiledMany = Box<dyn Fn(&[f64], &mut [f64])>;
+pub type CompiledMany = Box<dyn Fn(&[f64], &mut [f64]) + Send + Sync>;
 
 impl ExprGraph {
     /// Compile a single expression to a closure `&[f64] -> f64`.
