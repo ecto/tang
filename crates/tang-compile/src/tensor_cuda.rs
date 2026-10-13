@@ -1580,7 +1580,14 @@ fn float_literals(s: &str) -> String {
 fn cuda_stmt(t: &str) -> String {
     let mut s = t.to_string();
     if let Some(rest) = s.strip_prefix("let ") {
-        s = format!("auto {rest}");
+        // `let x: T = e;` keeps its type; `let x = e;` is `auto`
+        s = match rest.split_once(" = ") {
+            Some((l, r)) if l.contains(": ") => {
+                let (n, ty) = l.split_once(": ").unwrap();
+                format!("const {} = {r}", cuda_array_decl(n, ty))
+            }
+            _ => format!("auto {rest}"),
+        };
     } else if let Some(rest) = s.strip_prefix("var ") {
         // `var x: T = e;` or `var x: T;` or `var x = e;`
         let (lhs, rhs) = match rest.split_once(" = ") {
@@ -2776,7 +2783,14 @@ impl TensorGraph {
 
 #[cfg(test)]
 mod tests {
-    use super::float_literals;
+    use super::{cuda_stmt, float_literals};
+
+    /// A typed `let` (tile unroll offsets) keeps its type in C++.
+    #[test]
+    fn typed_let_is_typed() {
+        assert_eq!(cuda_stmt("let u0: u32 = 1u;"), "const unsigned u0 = 1u;");
+        assert_eq!(cuda_stmt("let x = a + b;"), "auto x = a + b;");
+    }
 
     #[test]
     fn literals_stay_single_precision() {
