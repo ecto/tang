@@ -251,7 +251,18 @@ impl TensorGraph {
         let smem_floats = sh.stages * stage_floats;
         // dynamic shared memory, within the 3090's 99 KB per block
         if smem_floats * 4 > 99 * 1024 {
-            return None;
+            // Many distinct operands (a multi-output, multi-term tile such
+            // as the gate/up backward): shrink the ring, then the chunk,
+            // rather than leave the shape without a lowering.
+            let mut fit = sh;
+            if sh.stages > 2 {
+                fit.stages -= 1;
+            } else if sh.chunk > 16 {
+                fit.chunk /= 2;
+            } else {
+                return None;
+            }
+            return self.cuda_mma_kernel_shaped(root, reads, fit);
         }
 
         let mut s = String::new();
