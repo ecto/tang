@@ -1124,4 +1124,67 @@ mod tests {
             }
         }
     }
+
+    /// CUDA: a matmul whose operands are f16 (bf16) runs on m16n8k16
+    /// fragments in every block shape and matches the emulator (fp32
+    /// accumulation, the output stored in the operands' format or f32).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_half_mma_matches_emulation() {
+        use tang_compile::tensor::{cuda::MMA_SHAPES, Precision};
+        let Some(rt) = Runtime::cuda() else { return };
+        for f in [Format::F16, Format::BF16] {
+            for out_f in [Format::F32, f] {
+                let (m, k, n) = (200, 136, 72);
+                let mut g = TensorGraph::new();
+                let a = g.input(&[m, k]);
+                let b = g.input(&[k, n]);
+                let c = g.matmul(a, b).unwrap();
+                let (mut g, outs) = g.substitute_maps(&[c]);
+                g.schedule_auto(&outs);
+                let c = outs[0];
+                for t in [a, b] {
+                    g.set_precision(t, Precision::storage(f));
+                }
+                g.set_precision(c, Precision::storage(out_f));
+                let av: Vec<f32> = (0..m * k)
+                    .map(|i| ((i * 7) % 13) as f32 * 0.1 - 0.6)
+                    .collect();
+                let bv: Vec<f32> = (0..k * n)
+                    .map(|i| ((i * 5) % 11) as f32 * 0.1 - 0.5)
+                    .collect();
+                let want = g.eval_emulated(
+                    &[
+                        av.iter().map(|&x| x as f64).collect(),
+                        bv.iter().map(|&x| x as f64).collect(),
+                    ],
+                    &[c],
+                );
+                let scale = want[0].iter().fold(0.0f64, |m, x| m.max(x.abs()));
+                for v in 0..MMA_SHAPES.len() {
+                    let program = g.to_cuda_variant(&[c], Some(v));
+                    assert!(
+                        program.kernels[0].source.contains("m16n8k16"),
+                        "{f:?} variant {v} is not on half mma"
+                    );
+                    let p = Program::new(&rt, program, &[&av, &bv]);
+                    p.run(&rt);
+                    let got = p.read(&rt, c);
+                    let tol = if out_f == Format::F32 {
+                        1e-5
+                    } else if f == Format::F16 {
+                        1e-3
+                    } else {
+                        8e-3
+                    };
+                    let err = got
+                        .iter()
+                        .zip(&want[0])
+                        .map(|(x, y)| ((*x as f64) - y).abs())
+                        .fold(0.0, f64::max);
+                    assert!(err <= tol * scale, "{f:?}/{out_f:?} v{v}: err {err:e}");
+                }
+            }
+        }
+    }
 }
