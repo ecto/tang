@@ -41,7 +41,9 @@
 use std::cell::{RefCell, RefMut};
 
 use tang_compile::tensor::memplan::MemoryPlan;
-use tang_compile::tensor::precision::{bf16_bits, bf16_from_bits, f16_bits, f16_from_bits};
+#[cfg(feature = "cuda")]
+use tang_compile::tensor::precision::{bf16_bits, bf16_from_bits};
+use tang_compile::tensor::precision::{f16_bits, f16_from_bits};
 use tang_compile::tensor::wgsl::WgslProgram;
 use tang_compile::tensor::{Format, TensorGraph, TensorId};
 
@@ -947,6 +949,7 @@ fn copy_wgpu(
 
 /// Host values in a buffer's device layout, as f32 words (f16/bf16 two
 /// per word; f32 as is).
+#[cfg(feature = "cuda")]
 fn pack_words(format: Format, data: &[f32]) -> std::borrow::Cow<'_, [f32]> {
     let bits = |x: f32| match format {
         Format::BF16 => bf16_bits(x as f64) as u32,
@@ -962,6 +965,7 @@ fn pack_words(format: Format, data: &[f32]) -> std::borrow::Cow<'_, [f32]> {
 }
 
 /// Inverse of [`pack_words`]: the first `n` elements, widened to f32.
+#[cfg(feature = "cuda")]
 fn unpack_words(format: Format, words: &[f32], n: usize) -> Vec<f32> {
     match format {
         Format::F32 => words[..n].to_vec(),
