@@ -41,7 +41,7 @@
 use std::cell::{RefCell, RefMut};
 
 use tang_compile::tensor::memplan::MemoryPlan;
-use tang_compile::tensor::precision::{f16_bits, f16_from_bits};
+use tang_compile::tensor::precision::{bf16_bits, bf16_from_bits, f16_bits, f16_from_bits};
 use tang_compile::tensor::wgsl::WgslProgram;
 use tang_compile::tensor::{Format, TensorGraph, TensorId};
 
@@ -217,11 +217,12 @@ impl From<&MemoryPlan> for BufferPlan {
     }
 }
 
-/// f32 words a buffer needs (f16 packs two per word on wgpu; CUDA
-/// programs keep f32 buffers).
+/// f32 words a buffer needs (f16 and bf16 pack two per word, element
+/// `i` at half `i`: WGSL's packed words and CUDA's `unsigned short`
+/// buffers share the layout).
 fn words(b: &tang_compile::tensor::wgsl::BufferSpec) -> usize {
     match b.format {
-        Format::F16 => b.len.div_ceil(2),
+        Format::F16 | Format::BF16 => b.len.div_ceil(2),
         _ => b.len,
     }
     .max(1)
@@ -308,8 +309,9 @@ impl Program {
                     .collect();
                 for (i, b) in program.buffers.iter().enumerate() {
                     if let Some(k) = b.input {
-                        let mut view = slots[plan.slot[i]].slice_mut(0..b.len);
-                        d.stream.memcpy_htod(inputs[k], &mut view).expect("upload");
+                        let host = pack_words(b.format, inputs[k]);
+                        let mut view = slots[plan.slot[i]].slice_mut(0..host.len());
+                        d.stream.memcpy_htod(&host[..], &mut view).expect("upload");
                     }
                 }
                 // nvrtc the missing kernels on all cores, then load
@@ -583,13 +585,14 @@ impl Program {
             }
             #[cfg(feature = "cuda")]
             (Runtime::Cuda(d), Storage::Cuda { slots, .. }) => {
-                let n = self.program.buffers[self.buffer_index(t)].len;
+                let b = &self.program.buffers[self.buffer_index(t)];
+                let n = words(b);
                 let mut out = vec![0.0f32; n];
                 d.stream
                     .memcpy_dtoh(&slots[self.slot_of(t)].slice(0..n), &mut out)
                     .expect("download");
                 d.sync();
-                out
+                unpack_words(b.format, &out, b.len)
             }
             #[allow(unreachable_patterns)]
             _ => panic!("program and runtime are on different backends"),
@@ -623,9 +626,10 @@ impl Program {
             #[cfg(feature = "cuda")]
             (Runtime::Cuda(d), Storage::Cuda { slots, .. }) => {
                 use cudarc::driver::DevicePtr;
+                let host = pack_words(b.format, data);
                 let (dst, _sync) = slots[s].device_ptr(&d.stream);
                 unsafe {
-                    cudarc::driver::result::memcpy_htod_async(dst, data, d.stream.cu_stream())
+                    cudarc::driver::result::memcpy_htod_async(dst, &host[..], d.stream.cu_stream())
                 }
                 .expect("upload");
                 // `data` is borrowed only for this call
@@ -667,7 +671,7 @@ impl Program {
                     cudarc::driver::result::memcpy_dtod_async(
                         dp,
                         sp,
-                        db.len * 4,
+                        words(db) * 4,
                         dev.stream.cu_stream(),
                     )
                 }
@@ -941,6 +945,39 @@ fn copy_wgpu(
     cache.enqueue(enc.finish());
 }
 
+/// Host values in a buffer's device layout, as f32 words (f16/bf16 two
+/// per word; f32 as is).
+fn pack_words(format: Format, data: &[f32]) -> std::borrow::Cow<'_, [f32]> {
+    let bits = |x: f32| match format {
+        Format::BF16 => bf16_bits(x as f64) as u32,
+        _ => f16_bits(x as f64) as u32,
+    };
+    match format {
+        Format::F32 => std::borrow::Cow::Borrowed(data),
+        _ => data
+            .chunks(2)
+            .map(|p| f32::from_bits(bits(p[0]) | p.get(1).map_or(0, |&x| bits(x) << 16)))
+            .collect(),
+    }
+}
+
+/// Inverse of [`pack_words`]: the first `n` elements, widened to f32.
+fn unpack_words(format: Format, words: &[f32], n: usize) -> Vec<f32> {
+    match format {
+        Format::F32 => words[..n].to_vec(),
+        Format::F16 => unpack_f16(words, n),
+        Format::BF16 => words
+            .iter()
+            .flat_map(|w| {
+                let b = w.to_bits();
+                [b as u16, (b >> 16) as u16]
+            })
+            .take(n)
+            .map(|h| bf16_from_bits(h) as f32)
+            .collect(),
+    }
+}
+
 /// f32 values → IEEE f16 (round to nearest even), two per u32 word,
 /// little end first — the byte layout of a WGSL `array<f16>`.
 pub fn pack_f16(v: &[f32]) -> Vec<u32> {
@@ -1028,5 +1065,63 @@ mod tests {
         q.copy(&rt, q.input(0), &p, p.input(0));
         q.run(&rt);
         assert_eq!(q.read(&rt, c), first);
+    }
+
+    /// CUDA: f16 and bf16 storage (inputs, an intermediate and the
+    /// output, with a half accumulator) matches the emulator.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_half_storage_matches_emulation() {
+        use tang::Scalar;
+        use tang_compile::tensor::Precision;
+        use tang_expr::ExprId;
+        let Some(rt) = Runtime::cuda() else { return };
+        for f in [Format::F16, Format::BF16] {
+            let mut g = TensorGraph::new();
+            let a = g.input(&[37, 29]);
+            let b = g.input(&[29, 23]);
+            let c = g.matmul(a, b).unwrap();
+            let d = g
+                .map(&[c], |v| {
+                    v[0] * ExprId::from_f64(0.5) + ExprId::from_f64(1.0)
+                })
+                .unwrap();
+            let (mut g, outs) = g.substitute_maps(&[d]);
+            g.schedule_auto(&outs);
+            let d = outs[0];
+            let full = Precision {
+                storage: f,
+                accum: f,
+            };
+            for t in [a, b] {
+                g.set_precision(t, Precision::storage(f));
+            }
+            g.set_precision(d, full);
+            let av: Vec<f32> = (0..37 * 29)
+                .map(|i| ((i * 7) % 13) as f32 * 0.1 - 0.6)
+                .collect();
+            let bv: Vec<f32> = (0..29 * 23)
+                .map(|i| ((i * 5) % 11) as f32 * 0.1 - 0.5)
+                .collect();
+            let p = Program::compile(&rt, &g, &[d], &[&av, &bv]);
+            assert!(p.program.buffers.iter().any(|b| b.format == f));
+            p.run(&rt);
+            let got = p.read(&rt, d);
+            let want = g.eval_emulated(
+                &[
+                    av.iter().map(|&x| x as f64).collect(),
+                    bv.iter().map(|&x| x as f64).collect(),
+                ],
+                &[d],
+            );
+            let scale = want[0].iter().fold(0.0f64, |m, x| m.max(x.abs()));
+            let ulp = if f == Format::F16 { 1e-3 } else { 8e-3 };
+            for (x, y) in got.iter().zip(&want[0]) {
+                assert!(
+                    ((*x as f64) - y).abs() <= 4.0 * ulp * scale,
+                    "{f:?}: {x} vs {y}"
+                );
+            }
+        }
     }
 }

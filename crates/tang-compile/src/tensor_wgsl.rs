@@ -27,6 +27,10 @@ pub(super) enum Dialect {
     Wgsl,
     /// Native `half` buffers: one element per index, no packing.
     Msl,
+    /// WGSL text for `wgsl_to_cuda`: 16-bit buffers are native
+    /// (`array<f16>` / `array<bf16>` become `unsigned short*`), one
+    /// element per index, converted with PTX `cvt` (`tang_h2f` …).
+    Cuda,
 }
 
 thread_local! {
@@ -210,7 +214,7 @@ impl TensorGraph {
                 };
                 let format = self.nodes[i].precision.storage;
                 assert!(
-                    format != Format::BF16 || dialect() == Dialect::Msl,
+                    format != Format::BF16 || dialect() != Dialect::Wgsl,
                     "bf16 storage is interpreter-only: WGSL has no bf16 type"
                 );
                 BufferSpec {
@@ -842,6 +846,13 @@ pub(super) fn elem_ty(f: Format) -> &'static str {
         // header lines are rewritten by the MSL lowering; any name will do
         return "f32";
     }
+    if dialect() == Dialect::Cuda {
+        return match f {
+            Format::F32 => "f32",
+            Format::F16 => "f16",
+            Format::BF16 => "bf16",
+        };
+    }
     match f {
         Format::F32 => "f32",
         Format::F16 => "u32",
@@ -853,7 +864,7 @@ pub(super) fn elem_ty(f: Format) -> &'static str {
 /// written by different threads, so the word is atomic.
 fn out_ty(f: Format) -> &'static str {
     match f {
-        Format::F16 => "atomic<u32>",
+        Format::F16 if dialect() == Dialect::Wgsl => "atomic<u32>",
         f => elem_ty(f),
     }
 }
@@ -865,6 +876,13 @@ pub(super) fn load(f: Format, buf: &str, idx: &str) -> String {
         return match f {
             Format::F32 => format!("{buf}[{idx}]"),
             _ => format!("f32({buf}[{idx}])"),
+        };
+    }
+    if dialect() == Dialect::Cuda {
+        return match f {
+            Format::F32 => format!("{buf}[{idx}]"),
+            Format::F16 => format!("tang_h2f({buf}[{idx}])"),
+            Format::BF16 => format!("tang_b2f({buf}[{idx}])"),
         };
     }
     match f {
@@ -883,6 +901,13 @@ pub(super) fn store(f: Format, idx: &str, v: &str) -> String {
             Format::F32 => format!("out[{idx}] = {v};"),
             Format::F16 => format!("out[{idx}] = half({v});"),
             Format::BF16 => format!("out[{idx}] = bfloat({v});"),
+        };
+    }
+    if dialect() == Dialect::Cuda {
+        return match f {
+            Format::F32 => format!("out[{idx}] = {v};"),
+            Format::F16 => format!("out[{idx}] = tang_f2h({v});"),
+            Format::BF16 => format!("out[{idx}] = tang_f2b({v});"),
         };
     }
     match f {
@@ -906,6 +931,13 @@ pub(super) fn quant(f: Format, e: &str) -> String {
             Format::F32 => e.to_string(),
             Format::F16 => format!("f32(half({e}))"),
             Format::BF16 => format!("f32(bfloat({e}))"),
+        };
+    }
+    if dialect() == Dialect::Cuda {
+        return match f {
+            Format::F32 => e.to_string(),
+            Format::F16 => format!("tang_h2f(tang_f2h({e}))"),
+            Format::BF16 => format!("tang_b2f(tang_f2b({e}))"),
         };
     }
     match f {
