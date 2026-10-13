@@ -246,10 +246,8 @@ impl TensorGraph {
         let rc = self.comp_at(red_node)?;
         let rank = rc.rank();
         let nwarps = sh.warps_m * sh.warps_n;
-        let lds = chunk + 4;
         let mut nested: Vec<Vec<Nested>> = Vec::new();
         let mut nest_regs = 0;
-        let mut scratch_floats = 0;
         for (side_a, stages) in [(true, &a_stages), (false, &b_stages)] {
             for (_, _, map) in stages.iter() {
                 let (pdim, block) = if side_a { (dy, bm) } else { (dx, bn) };
@@ -260,9 +258,10 @@ impl TensorGraph {
                 if !plan.is_empty() && (block % nwarps != 0 || (block / nwarps) % 16 != 0) {
                     return None;
                 }
+                let nfm = block / nwarps / 16;
                 for nst in &plan {
-                    nest_regs += nst.terms.len() * (block / nwarps / 16) * (nst.e / 8) * 4;
-                    scratch_floats += block * lds;
+                    // the invariant side's fragments, and the accumulators
+                    nest_regs += nst.terms.len() * nfm * (nst.e / 8) * 4 + nfm * (chunk / 8) * 4;
                 }
                 nested.push(plan);
             }
@@ -280,21 +279,7 @@ impl TensorGraph {
         let a_floats = bm * lda;
         let b_floats = chunk * ldb;
         let stage_floats = a_stages.len() * a_floats + b_stages.len() * b_floats;
-        let scratch0 = sh.stages * stage_floats;
-        let scratch_off: Vec<usize> = {
-            let mut at = 0;
-            nested
-                .iter()
-                .enumerate()
-                .map(|(o, plan)| {
-                    let block = if o < a_stages.len() { bm } else { bn };
-                    let here = at;
-                    at += plan.len() * block * lds;
-                    here
-                })
-                .collect()
-        };
-        let smem_floats = scratch0 + scratch_floats;
+        let smem_floats = sh.stages * stage_floats;
         // dynamic shared memory, within the 3090's 99 KB per block
         if smem_floats * 4 > 99 * 1024 {
             // Many distinct operands (a multi-output, multi-term tile such
@@ -626,22 +611,24 @@ impl TensorGraph {
                 return;
             }
             // nested contractions: this chunk's block of each, by mma,
-            // into scratch rows (block) × columns (chunk)
+            // in registers; the map is then evaluated on the accumulator
+            // elements (rows: warp w's rpw of the block; columns: the
+            // chunk) and written straight to its stage
             let plan = &nested[o];
-            let mut scratch_at: Vec<Option<usize>> =
+            let fused = !plan.is_empty();
+            let mut ra_of: Vec<Option<usize>> =
                 vec![None; map.map_or(0, |v| self.comp_at(rc.args[v].src.n()).unwrap().args.len())];
-            if !plan.is_empty() {
-                let nfm = block / nwarps / 16;
+            if fused {
+                let rpw = block / nwarps;
+                let nfm = rpw / 16;
                 let nfn = chunk / 8;
-                writeln!(s, "        __syncthreads();").unwrap();
+                writeln!(s, "        {{").unwrap();
                 for (q, nst) in plan.iter().enumerate() {
-                    let at = scratch0 + scratch_off[o] + q * block * lds;
-                    scratch_at[nst.arg] = Some(at);
+                    ra_of[nst.arg] = Some(q);
                     let ne = nst.e / 8;
-                    writeln!(s, "        {{").unwrap();
-                    writeln!(s, "        float ra[{nfm}][{nfn}][4];").unwrap();
+                    writeln!(s, "        float ra{q}[{nfm}][{nfn}][4];").unwrap();
                     writeln!(s, "        #pragma unroll").unwrap();
-                    writeln!(s, "        for (int i = 0; i < {nfm}; i++) for (int j = 0; j < {nfn}; j++) for (int r = 0; r < 4; r++) ra[i][j][r] = 0.0f;").unwrap();
+                    writeln!(s, "        for (int i = 0; i < {nfm}; i++) for (int j = 0; j < {nfn}; j++) for (int r = 0; r < 4; r++) ra{q}[i][j][r] = 0.0f;").unwrap();
                     for (t, term) in nst.terms.iter().enumerate() {
                         let (ck, ce) = (term.k_addr.coefs[kdim], term.k_addr.coefs[rank]);
                         let base = lead_term(&term.k_addr);
@@ -654,40 +641,42 @@ impl TensorGraph {
                         writeln!(s, "            const float* src = b{} + (ok ? (unsigned)({base} + {ck} * (int)gk + {ce} * e) : 0u);", term.k_buf).unwrap();
                         writeln!(s, "            unsigned kf[2] = {{tang_tf32(ok ? src[0] : 0.0f), tang_tf32(ok ? src[{ce}] : 0.0f)}};").unwrap();
                         writeln!(s, "            #pragma unroll").unwrap();
-                        writeln!(s, "            for (int i = 0; i < {nfm}; i++) tang_mma(ra[i][j], nf{o}_{q}_{t}[i][q], kf);").unwrap();
+                        writeln!(s, "            for (int i = 0; i < {nfm}; i++) tang_mma(ra{q}[i][j], nf{o}_{q}_{t}[i][q], kf);").unwrap();
                         writeln!(s, "        }}").unwrap();
                     }
-                    writeln!(s, "        #pragma unroll").unwrap();
-                    writeln!(s, "        for (int i = 0; i < {nfm}; i++) for (int j = 0; j < {nfn}; j++) for (int r = 0; r < 4; r++)").unwrap();
-                    writeln!(
-                        s,
-                        "            smem[{at}u + (warp * {}u + 16u * i + gq + 8u * (r / 2)) * {lds}u + 8u * j + 2u * tq + (r % 2)] = ra[i][j][r];",
-                        block / nwarps
-                    )
-                    .unwrap();
-                    writeln!(s, "        }}").unwrap();
                 }
-                writeln!(s, "        __syncthreads();").unwrap();
-            }
-            let k_inner = ck.unsigned_abs() <= cp.unsigned_abs();
-            writeln!(
-                s,
-                "        for (unsigned idx = tid; idx < {}u; idx += {threads}u) {{",
-                block * chunk
-            )
-            .unwrap();
-            if k_inner {
+                writeln!(s, "        #pragma unroll").unwrap();
+                writeln!(s, "        for (int i = 0; i < {nfm}; i++)").unwrap();
+                writeln!(s, "        #pragma unroll").unwrap();
+                writeln!(s, "        for (int j = 0; j < {nfn}; j++)").unwrap();
+                writeln!(s, "        #pragma unroll").unwrap();
+                writeln!(s, "        for (int r = 0; r < 4; r++) {{").unwrap();
                 writeln!(
                     s,
-                    "            unsigned kk = idx % {chunk}u; unsigned pt = idx / {chunk}u;"
+                    "            unsigned pt = warp * {rpw}u + 16u * i + gq + 8u * (r / 2); unsigned kk = 8u * j + 2u * tq + (r % 2);"
                 )
                 .unwrap();
             } else {
+                let k_inner = ck.unsigned_abs() <= cp.unsigned_abs();
                 writeln!(
                     s,
-                    "            unsigned pt = idx % {block}u; unsigned kk = idx / {block}u;"
+                    "        for (unsigned idx = tid; idx < {}u; idx += {threads}u) {{",
+                    block * chunk
                 )
                 .unwrap();
+                if k_inner {
+                    writeln!(
+                        s,
+                        "            unsigned kk = idx % {chunk}u; unsigned pt = idx / {chunk}u;"
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(
+                        s,
+                        "            unsigned pt = idx % {block}u; unsigned kk = idx / {block}u;"
+                    )
+                    .unwrap();
+                }
             }
             writeln!(
                 s,
@@ -736,8 +725,8 @@ impl TensorGraph {
                 .iter()
                 .enumerate()
                 .map(|(ai, sa)| {
-                    if let Some(at) = scratch_at[ai] {
-                        return format!("smem[{at}u + pt * {lds}u + kk]");
+                    if let Some(q) = ra_of[ai] {
+                        return format!("ra{q}[i][j][r]");
                     }
                     let view = sa.view.compose(&outer.view, rank);
                     match &self.nodes[sa.src.n()].op {
@@ -779,6 +768,9 @@ impl TensorGraph {
             writeln!(s, "            }}").unwrap();
             writeln!(s, "            *({}) = v;", slot("pt", "kk")).unwrap();
             writeln!(s, "        }}").unwrap();
+            if fused {
+                writeln!(s, "        }}").unwrap();
+            }
         };
         for (t, (buf, addr, map)) in a_stages.iter().enumerate() {
             stage(
