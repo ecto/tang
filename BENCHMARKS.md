@@ -2031,3 +2031,291 @@ gradient between blocks; a lone block never computes `dx`). So: no net
 kernels saved across layers once the stream is materialized, and a cost
 model for map substitution needs a fan-in bound, not just the recompute
 factor.
+
+## OpenCL on the Booster K1 (Adreno 740, QCS8550)
+
+`to_opencl` (WGSL kernels transpiled to OpenCL C) exported by
+`cargo run --release -p tang-bench --example opencl_export -- export ROOT`,
+run on the robot by `tools/opencl-runner/tang_cl.c` (gcc, no Rust), checked
+on the Mac against the f64 `eval` (`opencl_export check ROOT`). Times are the
+minimum over ≤30 repeats of OpenCL profiling events (first kernel start to
+last kernel end), default build options. The SoC also runs vendor services
+(load average 7–17 during the runs), so treat these as ±5%.
+
+Device peak measured with `tools/opencl-runner/peak.c`: fp32 FMA 1501
+GFLOP/s, fp16 FMA 2996 GFLOP/s, device copy 49.5 GB/s. Max single
+allocation 256 MiB.
+
+| case | time | throughput | max err (rel to max \|ref\|) |
+|---|---|---|---|
+| matmul 1024³, best schedule (`reg8c8`) | 6.66 ms | 322 GFLOP/s (21% of fp32 peak) | 2.5e-3 (1.8e-6) |
+| matmul 1024³, `schedule_auto` (`reg4`) | 10.56 ms | 203 GFLOP/s | 2.5e-3 (1.8e-6) |
+| matmul 512×576×1536, best (`reg4x8`) | 3.31 ms | 274 GFLOP/s | 1.2e-3 (1.4e-6) |
+| matmul 512×576×1536, `schedule_auto` | 4.78 ms | 189 GFLOP/s | 1.2e-3 (1.4e-6) |
+| block forward, seq 128 (17 kernels) | 7.71 ms | 122 GFLOP/s | 1.1e0 (1.9e-6) |
+| block loss + 7 grads, seq 128 (51 kernels) | 19.1 ms | 148 GFLOP/s (≈3× fwd FLOPs) | 2.0e4 (7.7e-8) |
+| GRU step, batch 1, obs 64, hidden 256 | 0.205 ms | 2.4 GFLOP/s | 1.1e-7 (1.8e-7) |
+| GRU step, batch 64 | 0.596 ms | 53 GFLOP/s | 1.2e-7 (2.0e-7) |
+
+What the Adreno likes (matmul candidate sweep, both shapes): 8×8 or 4×8
+register tiles are ~1.45× the 4×4 tile `schedule_auto` picks; a 8-deep k
+chunk (`reg8c8`) is best at 1024³; `split` (small groups, many partials) is
+pathological here (1.3 s at 1024³) and `tiled` is 6× slower than the register
+tiles. `-cl-mad-enable` / `-cl-fast-relaxed-math` change nothing (the
+compiler already contracts). In the block, the slowest kernels are the
+projections launched as 6–48 work-groups of 256 on 6 CUs (k13: 2.3 ms, 48
+groups; k15: 1.7 ms, 18 groups): occupancy, not arithmetic — the schedule
+chosen for desktop GPUs underfills the Adreno. Whole-program tuning per
+kernel on the device (pick the schedule per node by timing) is the next step.
+
+### Per-kernel tuning, f16 storage and the GRU (Adreno 740)
+
+**Tuning.** `opencl_export tune-export ROOT CASE` writes, next to the
+program, every kernel's schedule candidates (tang-compile's
+`schedule_candidates` plus register tiles up to 8×8, k chunks 8/16/32,
+8×8-thread groups, and 64/128-thread splits). `tang_cl` times each one
+after the program runs (min of 5 launches; one launch if it is >4× the base),
+compares its output with the base kernel's, and checks the SoC temperature
+before every candidate (pauses at 82 °C until ≤78 °C). `tune-pick` keeps the
+fastest candidate within 1e-4 of the base and writes a `TuningCache`
+(`tools/opencl-runner/tuning/`, keyed by `QUALCOMM Adreno(TM) 740` + the
+untuned OpenCL sources); `TANG_CL_TUNING=DIR opencl_export export` applies it.
+
+| program | `schedule_auto` | tuned per kernel | candidates timed |
+|---|---|---|---|
+| block forward, seq 128 (17 kernels) | 7.71 ms | **6.13 ms** (−20%) | 212 |
+| loss + 7 grads, seq 128 (51 kernels) | 18.96 ms (sum of kernels) | **14.34 ms** (sum of kernels) | 689 |
+
+The training-step figure is the sum of the chosen kernels' times from the
+tuning run. The tuned program was exported but not re-run end to end,
+because the robot dropped off the network first.
+
+What won, per kernel:
+- The 6- and 18-group projections (16×16 threads, 4×4 registers) went to
+  8×8-thread groups with 4×4 or 4×8 registers (4× the groups): 0.436 →
+  0.356 ms and 0.623 → 0.515 ms.
+- The 48-group MLP matmuls kept 16×16 threads with 4×8 registers and a 16
+  chunk: 2.29 → 1.60 ms and 1.72 → 1.35 ms.
+- In the backward, the rows×lanes attention tiles (64×4 and 32×8) lose to
+  register tiles: 0.75 → 0.16 ms and 0.42 → 0.25 ms.
+- Small splits: 64 threads beat 256.
+
+**Rule (not yet applied to `schedule_auto`).** On a 6-CU part, a register
+tile launching fewer than ~4 groups per CU wants 8×8-thread groups, and
+4×8 registers beat 4×4 everywhere. Desktop GPUs were tuned the other way,
+so this belongs in a device-aware default, which needs a CU count that
+`schedule_auto` does not take yet. Left for a follow-up.
+
+**False rejects.** All 59 candidates rejected in the backward belong to
+three kernels whose outputs are cancellation noise: the dQ/dK gradients
+have an f64 magnitude of ~4e-19 and come out as f32 noise of ~20, both for
+the base kernel and for every candidate. The 1e-4 rule then rejects them
+correctly, but for the wrong reason. These two outputs also show that the
+pooled error figure in the table above (7.7e-8) hides an output whose own
+relative error is meaningless; `check` now prints the worst per-output
+relative error as well.
+
+**f16 storage** (the precision schedule enumerated, not searched: `_hops` is
+every register-tile operand in f16, `_hall` is every buffer but the outputs;
+arithmetic and accumulation stay f32; error is against the f64 `eval`):
+
+| case | f32 | f16 tile operands | f16 all buffers | keep? |
+|---|---|---|---|---|
+| matmul 1024³ (`reg8c8`) | 6.66 ms, 1.8e-6 | 7.80 ms, 8.0e-5 | 7.80 ms, 8.0e-5 | no (slower) |
+| matmul 512×576×1536 (`reg4x8`) | 3.30 ms, 1.4e-6 | 3.30 ms, 9.9e-5 | 3.30 ms, 9.9e-5 | no (same) |
+| block forward (tuned) | 6.13 ms, 1.9e-6 | 6.09 ms, 7.5e-5 | 6.03 ms, **inf** (activations > 65504) | no (noise) |
+| GRU step, batch 1 | 0.207 ms, 1.8e-7 | 0.181 ms, 1.8e-7 | **0.121 ms**, 4.1e-4 | yes: f16 everything |
+| GRU step, batch 64 | 0.596 ms, 2.0e-7 | 0.591 ms, 4.1e-4 | 0.582 ms, 4.1e-4 | no (noise) |
+
+The matmuls here are compute-bound and the tile already stages through
+local memory, so halving the bytes saves nothing. The f16-loading tile is
+slower at 1024³, where the conversions cost more than the traffic they
+save. Only the batch-1 GRU, a weight-streaming GEMV, gains (−42%). f16
+*arithmetic* (`half` math under `cl_khr_fp16`, the 2× FMA peak) needs a
+half-typed body emitter in the lowering; tang's f16 accumulation is
+emulated by rounding in f32, so it was not tried.
+The f16-storage training step was exported but not run (disconnect).
+
+**GRU latency.** `tools/opencl-runner/launch.c` gives the overhead floor
+of one launch (one 64-item group, one store), with vendor services
+running (load 7–11):
+
+| | median | min | p95 |
+|---|---|---|---|
+| enqueue + `clFinish` | 540–606 µs | 120–200 µs | 1.05–1.57 ms |
+| enqueue + `clFlush` + spin on the event | 380–423 µs | 109–111 µs | 0.90–1.34 ms |
+| device time of the kernel | 3.8 µs | | |
+| back-to-back, one finish | 13–59 µs per launch | | |
+
+The fused GRU step (`grufused_b*`) concatenates the input and hidden
+contractions on one reduce axis of `obs + hidden`, with guarded views
+reading zero past each operand. `merge_siblings` then makes the four gate
+sums one tuple reduction with the gate math as its epilogue, so the step
+compiles to **one kernel** at batch 1 (7 before) and two at batch 64.
+
+| case | kernels | device time | wall (enqueue all + finish, min) |
+|---|---|---|---|
+| GRU batch 1 | 7 | 0.207 ms | 0.655 ms |
+| GRU batch 1, fused | 1 | 0.211 ms | 0.676 ms |
+| GRU batch 1, f16 storage | 7 | 0.121 ms | 0.623 ms |
+| GRU batch 1, fused, f16 | 1 | 0.131 ms | 0.681 ms |
+| GRU batch 64 | 7 | 0.596 ms | 1.03 ms |
+| GRU batch 64, fused | 2 | 0.844 ms | 1.30 ms |
+
+The fused kernel uses `schedule_auto`'s 256-thread split (256 groups); its
+per-kernel tuning was exported but did not run before the disconnect. For a
+control loop the round trip is the limit, not the math. Each step costs at
+least ~0.11 ms and typically ~0.4–0.6 ms of submit-and-wait, with a p95
+above 1 ms under the vendor load. So 1 kHz is out of reach with one
+synchronous step per tick, and 500 Hz works at the median but misses
+deadlines at p95. To get there, enqueue several steps per submit (the
+back-to-back cost is 13–59 µs per launch), keep the loop on the GPU, or run
+the batch-1 GRU on the CPU.
+
+#### After the reconnect (robot rebooted, 48–64 °C, load 7–10)
+
+Training step at seq 128, tuned per kernel and run end to end. Error is
+the worst per-output relative error, leaving out the two dQ/dK gradients:
+their f64 values are ~4e-19, so their output is pure f32 noise.
+
+| variant | program | worst output rel | keep? |
+|---|---|---|---|
+| f32, `schedule_auto` (#58) | 19.1 ms | 7.7e-6 | |
+| f32, tuned | **14.57 ms** (−24%) | 7.7e-6 | yes |
+| tuned, f16 tile operands | 14.53 ms | 3.1e-4 | no: within budget, but no gain |
+| tuned, f16 all buffers | 14.27 ms | inf/NaN (overflow) | no |
+
+GRU step after tuning the fused kernel and the unfused one alike
+(time = device events, wall = enqueue all + finish, min of 20):
+
+| case | kernels | device | wall | rel err |
+|---|---|---|---|---|
+| batch 1, tuned (64/128 splits) | 7 | 0.101 ms | 0.463 ms | 1.8e-7 |
+| batch 1, tuned, f16 storage | 7 | **0.086 ms** | **0.267 ms** | 4.1e-4 |
+| batch 1, fused, tuned (128 split) | 1 | 0.189 ms | 0.358 ms | 1.8e-7 |
+| batch 1, fused, tuned, f16 | 1 | 0.108 ms | 0.420 ms | 4.1e-4 |
+| batch 64, tuned (8×8 groups) | 7 | **0.421 ms** | 0.954 ms | 2.0e-7 |
+| batch 64, fused, tuned | 2 | 0.693 ms | 1.061 ms | 2.0e-7 |
+
+Fusing cuts the launches, but the fused kernel is slower on the device.
+Each output point reduces 320 terms (split 128), while the unfused GEMVs
+split six short reductions across more groups. Wall times are dominated
+by the 0.1–0.6 ms submit-and-wait floor and vary by ±0.2 ms from run to
+run, so fused versus unfused wall time is not resolved at batch 1. The
+latency conclusion above still holds.
+
+## CPU backend: `to_c` on the Booster K1's Cortex-X3 (and the M4)
+
+`to_c` turns a program into one C file (`docs/tensor-ir.md`, "CPU backend
+(C)"). `cargo run --release -p tang-bench --example cpu_export -- export
+ROOT` writes the cases. On the robot, `tools/cpu-runner/run_all.sh ROOT 7`
+builds each one with gcc 11.4 (`-O3 -march=armv8.6-a+fp16+fp16fml
+-mtune=cortex-x1`; gcc 11 knows neither the X3 nor the A715) and runs it.
+`cpu_export check ROOT` then compares the results with the f64 `eval` on
+the Mac.
+
+Each run is single-threaded, pinned with `sched_setaffinity` to cpu7, the
+QCS8550's one Cortex-X3 (3.19 GHz). It is `nice -n 10` and back to back:
+`tang_run()` is timed with `CLOCK_MONOTONIC` around every step, after a
+warm-up of up to 500 steps / 0.5 s. A run is capped at 4 s, and the script
+waits for the hottest thermal zone to be ≤ 78 °C before each one. Vendor
+services kept load at 6–16 and cpu7 about 22% busy. `SCHED_FIFO` works
+without root on this image (`TANG_FIFO=1`), so it was used only for short
+batch-1 runs (≤ 0.35 s). In longer runs RT throttling stalls the task for
+~50–100 ms once a second, and it would starve whatever else is on the
+core.
+
+Inputs are uniform in ±0.2. The GRU is ipse-world's `GruCell` (obs 64,
+hidden 256, PyTorch gate convention). The MLP is a locomotion-style
+policy: 64 → 256 → 256 → 12, ELU. All times are µs per step.
+
+**Batch 1, `SCHED_FIFO`, 10 000 steps**
+
+| case | min | median | p99 | p99.9 | max | rel err vs f64 |
+|---|---|---|---|---|---|---|
+| GRU step (1 kernel) | 19.5 | **22.5** | 36.6 | 48.7 | 62 | 1.8e-7 |
+| GRU, f16 storage | 28.4 | 30.9 | 40.7 | 61.3 | 89 | 4.1e-4 |
+| GRU, `grufused` graph | 25.3 | 30.9 | 56.8 | 68.3 | 132 | 1.8e-7 |
+| MLP policy (3 kernels) | 5.8 | **6.7** | 12.7 | 25.7 | 57 | 5.5e-7 |
+| MLP, f16 storage | 10.1 | 10.5 | 16.5 | 30.9 | 58 | 3.7e-5 |
+
+A second FIFO pass under heavier vendor load (load 16) gave GRU 20.2 /
+23.9 / 36.8 / 49.8 and MLP 5.9 / 7.0 / 10.8 / 17.3 (min / median / p99 /
+p99.9).
+
+**Batch 1, `SCHED_OTHER` (niced), 20 000 steps, load 6–11**
+
+| case | min | median | p99 | p99.9 | max |
+|---|---|---|---|---|---|
+| GRU step | 19.3 | 22.8 | 81.5 | 318 | 11 209 |
+| MLP policy | 5.8 | 6.5 | 35.3 | 83 | 455 |
+
+The niced tail is scheduling: the vendor processes preempt a nice-10 task
+for up to 11 ms. The FIFO rows are what a real-time control thread sees.
+
+**Against the hand-written loop and the other devices (GRU, batch 1)**
+
+| | min | median | p99 | p99.9 |
+|---|---|---|---|---|
+| `to_c`, X3, FIFO | 19.5 | **22.5** | 36.6 | 48.7 |
+| naive C, dot per output (strided `W` column), X3 | 226 | 263 | 503 | 772 |
+| naive C, k outside j (row of `W` inner, vectorized), X3 | 25.5 | 30.8 | 79.7 | 287 |
+| `to_c`, M4 (P-core, no pinning), f32 / f16 storage | 10 / 8 | 15 / 9 | 20 / 12 | 28 / 21 |
+| Adreno 740, tuned, f16 storage (#59): device time | | 86 | | |
+| Adreno 740, same: wall (enqueue + finish), min of 20 | 267 | | | |
+| Adreno 740 submit-and-wait floor (`launch.c`) | 109–200 | 380–606 | p95 900–1570 | |
+
+The M4 GRU numbers are from a quiet run. Later runs on the loaded Mac
+were 1.5–2× slower (see the host notes). The naive loops are checked too:
+1.8e-7, the same as `to_c`.
+
+**Batch 64 and the block (single core)**
+
+| case | `to_c`, X3 | `to_c`, M4 | Adreno 740 (#59) |
+|---|---|---|---|
+| GRU step, batch 64 | 1.34 ms median (1.06 min, FIFO); 1.8–2.8 ms niced at load 7–16 | 0.46 ms | 0.42 ms device, 0.95 ms wall |
+| MLP policy, batch 64 | 0.43 ms median (FIFO); 0.54–0.84 ms niced | 0.32 ms | — |
+| block forward, seq 128 (no flash; 20 kernels) | 50–66 ms | 30 ms | **6.13 ms** (tuned) |
+| block forward, seq 128, GPU pass order (flash) | 84–113 ms | 50 ms | 6.13 ms |
+
+All cases agree with the f64 `eval`: 2.0e-7 (GRU b64), 2.9e-7 (MLP b64),
+8.0e-7 (block), and 4e-4 / 8e-4 with f16 storage.
+
+What the numbers say:
+- **Batch-1 control belongs on the CPU.** One X3 core runs the GRU
+  world-model step in 22 µs and the policy in 7 µs, with a FIFO p99.9 of
+  49 µs and 26 µs. A 1 kHz tick (1000 µs) has a 20× margin for both
+  together. The Adreno spends 86 µs of device time on the same GRU step,
+  and its submit-and-wait alone has a median of 380–606 µs, with a p95
+  above 1 ms.
+- **The lowering beats the hand-written loop.** It is 12× faster than
+  the textbook dot product and 1.35× faster than a cache-friendly
+  hand-written loop. It comes from the IR with no GRU-specific code.
+- **Batched rollouts and the transformer belong on the GPU**, off the
+  control thread. GRU batch 64 takes 1.3 ms on one X3 core against 0.42
+  ms of Adreno device time. The seq-128 block takes 50–66 ms against
+  6.13 ms. The CPU lowering is register-blocked GEMM at ~15–20
+  GFLOP/s, with no cache tiling and no threads.
+- **f16 storage is slower on the X3.** With gcc 11 the `__fp16 → f32`
+  widening costs more than the halved bytes save, even though the f16 GRU
+  (0.5 MB) fits the X3's 1 MB L2 and the f32 one (0.98 MB) does not quite.
+  On the M4 it helps (15 → 9 µs). f16 arithmetic (`fmla .8h`) was not tried.
+- **Register block size is device-dependent.** The batch-64 GRU is
+  1.34 ms with a 128-float accumulator block, 1.5–1.8 ms at 64 and 1.66
+  ms at 32. Batch 1 is fastest at 64 floats (the defaults now). gcc 11
+  spills the 64-float block when unrolling: the inner loop reloads the
+  `W` pointers from the stack.
+- The `grufused` graph (one guarded reduction over `obs + hidden`) is
+  slower on the CPU (31 vs 22 µs at batch 1, 10–20 ms vs 1.3–2.8 ms at
+  batch 64). Its guards sit in the inner loop and its 4-wide tuple state
+  shrinks the vector chunk. The plain graph already fuses to one kernel
+  on the CPU.
+
+Thermals and load: idle the hottest zone sits at 73–76 °C. A 4 s run on
+the X3 takes it to 80–86 °C (89 °C once, with the vendor stack also busy).
+So the script cools to ≤ 78 °C before every run. Each run is one core for
+≤ 4.5 s, so the 1-minute load moved only with the vendor stack: 6–11 for
+most runs, and 15–16 near the end, when vendor processes (`motion`,
+`hippocampus`, `optic`, …) were busier. `~/tang-probe/cpu/` was 66 MB
+during the runs. The cases were deleted afterwards, and only the runner
+sources remain.

@@ -256,6 +256,9 @@ pub fn random_spd_flat(size: usize) -> Vec<f64> {
     result
 }
 
+/// GRU world-model step and MLP policy graphs (control-loop cases).
+pub mod ir_control;
+
 /// Run tang-compile tensor graphs on the GPU, for the kernels-vs-IR benches.
 #[cfg(feature = "metal")]
 #[path = "ir_msl.rs"]
@@ -895,7 +898,7 @@ pub mod ir_gpu {
     }
 
     /// `(node index, split, tile, reg)` as stored in the cache.
-    type Entry = (usize, u32, (u32, u32, u32), (u32, u32));
+    pub type Entry = (usize, u32, (u32, u32, u32), (u32, u32));
 
     impl TuningCache {
         pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
@@ -904,20 +907,33 @@ pub mod ir_gpu {
 
         /// Hash of the untuned kernels' sources plus the device name.
         fn key(device: &GpuDevice, g: &TensorGraph, outputs: &[TensorId]) -> u64 {
+            Self::key_with(&device.name, g, outputs, |g, o| g.to_wgsl(o))
+        }
+
+        /// The cache key for any lowering (`to_wgsl`, `to_opencl`, …): the
+        /// device name plus the sources of the program with every kernel's
+        /// schedule reset, so tuning does not change the key.
+        pub fn key_with(
+            device_name: &str,
+            g: &TensorGraph,
+            outputs: &[TensorId],
+            lower: impl Fn(&TensorGraph, &[TensorId]) -> WgslProgram,
+        ) -> u64 {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
-            device.name.hash(&mut h);
+            device_name.hash(&mut h);
             let mut plain = g.clone();
-            for k in g.to_wgsl(outputs).kernels {
+            for k in lower(g, outputs).kernels {
                 plain.set_schedule(k.node, 0, (0, 0, 0), (1, 1));
             }
-            for k in plain.to_wgsl(outputs).kernels {
+            for k in lower(&plain, outputs).kernels {
                 k.source.hash(&mut h);
             }
             h.finish()
         }
 
-        fn load(&self, key: u64) -> Option<Vec<Entry>> {
+        /// Entries stored under `key`, if the cache holds that key.
+        pub fn load(&self, key: u64) -> Option<Vec<Entry>> {
             let text = std::fs::read_to_string(&self.path).ok()?;
             let mut lines = text.lines();
             let header = lines.next()?;
@@ -940,17 +956,20 @@ pub mod ir_gpu {
         }
 
         fn store(&self, key: u64, log: &[TunedKernel]) {
+            let entries: Vec<Entry> = log
+                .iter()
+                .map(|k| (k.node.index(), k.split, k.tile, k.reg))
+                .collect();
+            self.store_entries(key, &entries);
+        }
+
+        /// Write `entries` under `key` (replacing the file).
+        pub fn store_entries(&self, key: u64, entries: &[Entry]) {
             let mut text = format!("tang-tuning {key:016x}\n");
-            for k in log {
+            for (node, split, tile, reg) in entries {
                 text.push_str(&format!(
-                    "{} {} {} {} {} {} {}\n",
-                    k.node.index(),
-                    k.split,
-                    k.tile.0,
-                    k.tile.1,
-                    k.tile.2,
-                    k.reg.0,
-                    k.reg.1
+                    "{node} {split} {} {} {} {} {}\n",
+                    tile.0, tile.1, tile.2, reg.0, reg.1
                 ));
             }
             if let Some(dir) = self.path.parent() {

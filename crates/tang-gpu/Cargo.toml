@@ -20,6 +20,8 @@ pollster = { workspace = true }
 safetensors = { workspace = true }
 # tensor-IR programs (`program::Program`)
 tang-compile = { workspace = true }
+# CPU runtime (`cpu::CpuProgram`): dlopen the compiled C
+libloading = "0.8"
 # CUDA backend: the driver and nvrtc are loaded at run time, so the
 # feature builds (and the binary runs, falling back to wgpu) on machines
 # without NVIDIA hardware or a CUDA toolkit.

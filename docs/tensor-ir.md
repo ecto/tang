@@ -319,6 +319,57 @@ surface syntax is rewritten to MSL. What changes:
   tries fragments wherever the node's precision admits them. WGSL stays
   the portable default.
 
+## CPU backend (C)
+
+`to_c` lowers a program to one C file for the system compiler. It exists
+for batch-1 control steps, where a GPU round trip costs more than the
+math. On the Booster K1 one synchronous Adreno submit costs 0.1–0.6 ms,
+while a GRU step is 0.02 ms of work on one Cortex-X3 core.
+
+It lowers the comps directly rather than transpiling the WGSL kernels.
+A WGSL kernel is written per thread: the thread mapping (`split`, `tile`,
+`reg`) is baked into index arithmetic and barriers. A loop nest would
+have to be recovered from thread ids, and on one core that decomposition
+is pure overhead. The comprehension already *is* a loop nest: points and
+reduce dims become `for` loops with constant trip counts, and every read
+is an affine index into a `restrict` pointer. GPU schedule fields are
+ignored. `inline` and `precision` are honoured.
+
+- **Vector dim.** Each kernel picks the point dim that most args read
+  with unit stride. Chunks of it form the innermost loop, so gcc/clang
+  vectorize across output points and keep the accumulators in
+  registers. The reduce loops sit outside: for `Σ_k x[i,k]·W[k,j]` the
+  inner loop streams a row of `W`.
+- **Lane mode.** When no point dim is contiguous but the innermost reduce
+  dim is (`x·Wᵀ` with `W` stored `[out, in]`), the innermost loop instead
+  runs over 4 consecutive reduce steps into 4 partial accumulators per
+  point, and the monoid folds them at the end. This works for any monoid.
+- **Row block.** Four points along a second dim are unrolled in the
+  source, so a weight row loaded once feeds four rows.
+- **Epilogues fuse.** A map that reads reductions point-for-point, and is
+  their only reader, computes them in its own kernel. That holds whether
+  `schedule_auto` inlined them or not. The GRU step (six contractions and
+  the gate math) is one kernel.
+- **No inlined reductions otherwise.** A GPU tile stages an inlined
+  reduction per chunk, but a CPU loop would redo the whole sum at every
+  read. Any other inlined reduction is materialized.
+- **Program.** Kernels are canonical and deduplicated. Buffers are static
+  arrays laid out by `plan_memory`. `tang_run()` calls the kernels in plan
+  order and allocates nothing. Callers write inputs and read outputs in
+  place (`tang_input(k)`, `tang_output(i)`). f16 and bf16 storage are
+  `__fp16` and `uint16_t`: loads widen to f32, and arithmetic is f32.
+
+`tang_gpu::cpu::CpuProgram` compiles the file with `$TANG_CC` (default
+`cc`), `dlopen`s it, and exposes `write_input`, `run` and `read_output`.
+On a target without Rust (the robot), `tools/cpu-runner/bench.c`
+`#include`s the exported file and is built with gcc. Measurements are in
+BENCHMARKS.md ("CPU backend").
+
+Not done yet: the flash-attention form (online softmax with the value
+column as a point dim) recomputes its exponentials for every column, so
+the CPU pass order skips `stabilize_softmax`. There is also no f16
+arithmetic and no multi-core split.
+
 ## Running programs: one API, wgpu or CUDA
 
 `tang_gpu::program` runs a lowered program on whichever backend the

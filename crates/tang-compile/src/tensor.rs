@@ -38,6 +38,9 @@ use std::collections::HashMap;
 use tang::Scalar;
 use tang_expr::{trace, ExprGraph, ExprId, Node};
 
+/// Plain C for CPUs (`to_c`): comps lowered directly to loops.
+#[path = "tensor_c.rs"]
+pub mod c;
 #[path = "tensor_cuda.rs"]
 pub mod cuda;
 #[path = "tensor_cuda_gemv.rs"]
@@ -54,6 +57,9 @@ pub mod msl;
 mod msl_gemv;
 #[path = "tensor_msl_mma.rs"]
 mod msl_mma;
+/// OpenCL C (Adreno and other mobile GPUs): the WGSL kernels transpiled.
+#[path = "tensor_opencl.rs"]
+pub mod opencl;
 #[path = "tensor_precision.rs"]
 pub mod precision;
 #[path = "tensor_tile.rs"]
