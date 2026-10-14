@@ -1004,10 +1004,71 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         bindings: &[BindingSpec],
         workgroup_size: u32,
     ) -> CachedPipeline {
+        // TANG_COMPILE_DUTY (0..1): hold shader compilation (ours and the
+        // driver's, which on the Adreno is most of it) to a CPU duty cycle,
+        // for boards that overheat compiling hundreds of pipelines at once
+        let start = std::time::Instant::now();
+        let pipe = Self::compile_dynamic_now(device, wgsl, bindings, workgroup_size);
+        if let Some(d) = std::env::var("TANG_COMPILE_DUTY")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|d| d.clamp(0.01, 1.0))
+        {
+            std::thread::sleep(start.elapsed().mul_f64(1.0 / d - 1.0));
+        }
+        pipe
+    }
+
+    fn compile_dynamic_now(
+        device: &GpuDevice,
+        wgsl: &str,
+        bindings: &[BindingSpec],
+        workgroup_size: u32,
+    ) -> CachedPipeline {
         // Native MSL (from tang-compile's simdgroup-matrix lowering)
         // goes straight to the Metal compiler; bindings map to buffer
         // indices in order, which is how the kernel declares them.
-        let module = if wgsl.starts_with("#include") {
+        // Adreno's Vulkan driver miscompiles naga's SPIR-V for some tang
+        // kernels (a RoPE map in Qwen decode came out wrong on the K1's
+        // Adreno 740, right on NVIDIA and Metal); through naga's GLSL writer
+        // and glslang it is right. Default there; TANG_WGSL_VIA_GLSL=0/1 forces.
+        let via_glsl = !wgsl.starts_with('#')
+            && device.spirv_passthrough
+            && match std::env::var("TANG_WGSL_VIA_GLSL").as_deref() {
+                Ok("1") => true,
+                Ok("0") => false,
+                _ => device.name.contains("Adreno"),
+            };
+        let module = if via_glsl {
+            // a WGSL kernel through naga's GLSL writer and shaderc instead
+            // of naga's SPIR-V writer
+            let spirv = compile_glsl(&wgsl_to_glsl(wgsl));
+            unsafe {
+                device.device.create_shader_module_passthrough(
+                    wgpu::ShaderModuleDescriptorPassthrough::SpirV(
+                        wgpu::ShaderModuleDescriptorSpirV {
+                            label: Some("tang-gpu kernel wgsl via glsl"),
+                            source: spirv.into(),
+                        },
+                    ),
+                )
+            }
+        } else if wgsl.starts_with("#version") {
+            // GLSL compute (tang-compile's Vulkan decode lowering):
+            // compiled to SPIR-V here and passed straight to the driver;
+            // bindings are declared in the order `bindings` lists them.
+            let spirv = compile_glsl(wgsl);
+            unsafe {
+                device.device.create_shader_module_passthrough(
+                    wgpu::ShaderModuleDescriptorPassthrough::SpirV(
+                        wgpu::ShaderModuleDescriptorSpirV {
+                            label: Some("tang-gpu kernel glsl"),
+                            source: spirv.into(),
+                        },
+                    ),
+                )
+            }
+        } else if wgsl.starts_with("#include") {
             unsafe {
                 device.device.create_shader_module_passthrough(
                     wgpu::ShaderModuleDescriptorPassthrough::Msl(wgpu::ShaderModuleDescriptorMsl {
@@ -1079,6 +1140,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 entry_point: Some(if wgsl.starts_with("#include") {
                     "main0"
                 } else {
+                    // WGSL and GLSL kernels both enter at `main`
                     "main"
                 }),
                 compilation_options: Default::default(),
@@ -1111,4 +1173,152 @@ impl Default for KernelCache {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// GLSL compute source to SPIR-V words (Vulkan 1.1), with shaderc, through
+/// the on-disk cache ([`spirv_cache_dir`]): a decode program is ~500
+/// kernels, minutes of CPU on a phone-class SoC, so each compiles once.
+/// (`TANG_COMPILE_DUTY` paces the whole pipeline build, driver included:
+/// see `compile_dynamic`.)
+#[cfg(feature = "glsl")]
+fn compile_glsl(src: &str) -> Vec<u32> {
+    let level = if std::env::var("TANG_GLSL_OPT").as_deref() == Ok("0") {
+        shaderc::OptimizationLevel::Zero
+    } else {
+        shaderc::OptimizationLevel::Performance
+    };
+    let paths = spirv_cache_dir().map(|dir| {
+        let stem = format!("{:016x}", fnv64(&[src, "vulkan1.1", &format!("{level:?}")]));
+        (
+            dir.join(format!("{stem}.spv")),
+            dir.join(format!("{stem}.comp")),
+        )
+    });
+    if let Some((spv, comp)) = &paths {
+        if std::fs::read_to_string(comp).is_ok_and(|s| s == src) {
+            if let Ok(bytes) = std::fs::read(spv) {
+                if bytes.len() % 4 == 0 && !bytes.is_empty() {
+                    return bytes
+                        .chunks_exact(4)
+                        .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+                        .collect();
+                }
+            }
+        }
+    }
+    let t = std::time::Instant::now();
+    let compiler = shaderc::Compiler::new().expect("shaderc");
+    let mut opts = shaderc::CompileOptions::new().expect("shaderc options");
+    opts.set_target_env(
+        shaderc::TargetEnv::Vulkan,
+        shaderc::EnvVersion::Vulkan1_1 as u32,
+    );
+    // TANG_GLSL_OPT=0 hands the driver unoptimized SPIR-V
+    opts.set_optimization_level(level);
+    let words = match compiler.compile_into_spirv(
+        src,
+        shaderc::ShaderKind::Compute,
+        "tang.comp",
+        "main",
+        Some(&opts),
+    ) {
+        Ok(a) => a.as_binary().to_vec(),
+        Err(e) => panic!("GLSL kernel failed to compile: {e}\n{src}"),
+    };
+    if let Some((spv, comp)) = &paths {
+        if let Some(dir) = spv.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        // the binary first: a reader trusts the pair only once the source matches
+        if std::fs::write(spv, bytes).is_ok() {
+            let _ = std::fs::write(comp, src);
+        }
+    }
+    let _ = t;
+    words
+}
+
+/// The on-disk SPIR-V cache: `$TANG_SPIRV_CACHE`, else
+/// `$XDG_CACHE_HOME/tang/spirv` or `~/.cache/tang/spirv`; `None` (no disk
+/// cache) when `TANG_SPIRV_CACHE` is empty or there is no home.
+#[cfg(feature = "glsl")]
+pub fn spirv_cache_dir() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    match std::env::var_os("TANG_SPIRV_CACHE") {
+        Some(d) if d.is_empty() => None,
+        Some(d) => Some(PathBuf::from(d)),
+        None => std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+            .map(|c| c.join("tang/spirv")),
+    }
+}
+
+/// FNV-1a over `parts`, each followed by a 0 byte.
+#[cfg(feature = "glsl")]
+fn fnv64(parts: &[&str]) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for p in parts {
+        for b in p.bytes().chain([0]) {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    }
+    h
+}
+
+/// Without the `glsl` feature there is no GLSL compiler to hand a kernel to.
+#[cfg(not(feature = "glsl"))]
+fn compile_glsl(_src: &str) -> Vec<u32> {
+    panic!("a GLSL kernel needs tang-gpu built with the `glsl` feature")
+}
+
+/// A WGSL compute kernel as desktop GLSL 450 (naga's GLSL writer), its
+/// `@group(0) @binding(i)` resources at `binding = i`.
+#[cfg(feature = "glsl")]
+fn wgsl_to_glsl(wgsl: &str) -> String {
+    use naga::back::glsl;
+    let module = naga::front::wgsl::parse_str(wgsl).expect("WGSL kernel parses");
+    let info = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .expect("WGSL kernel validates");
+    let mut binding_map = glsl::BindingMap::default();
+    for (_, gv) in module.global_variables.iter() {
+        if let Some(rb) = &gv.binding {
+            binding_map.insert(rb.clone(), rb.binding as u8);
+        }
+    }
+    let options = glsl::Options {
+        version: glsl::Version::Desktop(450),
+        writer_flags: glsl::WriterFlags::empty(),
+        binding_map,
+        zero_initialize_workgroup_memory: true,
+    };
+    let pipeline = glsl::PipelineOptions {
+        shader_stage: naga::ShaderStage::Compute,
+        entry_point: "main".into(),
+        multiview: None,
+    };
+    let mut out = String::new();
+    glsl::Writer::new(
+        &mut out,
+        &module,
+        &info,
+        &options,
+        &pipeline,
+        naga::proc::BoundsCheckPolicies::default(),
+    )
+    .expect("GLSL writer")
+    .write()
+    .expect("GLSL from WGSL");
+    out
+}
+
+#[cfg(not(feature = "glsl"))]
+fn wgsl_to_glsl(_wgsl: &str) -> String {
+    panic!("TANG_WGSL_VIA_GLSL needs tang-gpu built with the `glsl` feature")
 }

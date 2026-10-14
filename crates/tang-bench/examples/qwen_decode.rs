@@ -65,9 +65,16 @@ fn lower(
     outs: &[TensorId],
     opts: &tang_compile::tensor::cuda_gemv::DecodeOpts,
 ) -> DecodeProgram {
-    match rt.kind() {
-        BackendKind::Cuda => g.to_cuda_decode(outs, opts),
-        BackendKind::Wgpu => g.to_msl_decode(outs, opts),
+    match rt {
+        // Vulkan (the K1's Adreno, ...): the decode kernels as GLSL,
+        // compiled to SPIR-V by tang-gpu (feature `glsl`)
+        Runtime::Wgpu { device, .. } if !device.msl_passthrough && device.spirv_passthrough => {
+            g.to_glsl_decode(outs, opts)
+        }
+        _ => match rt.kind() {
+            BackendKind::Cuda => g.to_cuda_decode(outs, opts),
+            BackendKind::Wgpu => g.to_msl_decode(outs, opts),
+        },
     }
 }
 
@@ -97,8 +104,13 @@ fn slot_plan(
 struct Step {
     dg: DecodeGraph,
     prog: Program,
-    /// `dg.outputs` in the compiled graph, then `dg.keep`.
+    /// `dg.outputs` in the compiled graph, then `dg.keep`; with
+    /// `QWEN_KEEP_ALL`, every kernel's result after those (from `named`).
     outs: Vec<TensorId>,
+    /// How many of `outs` are the step's own outputs.
+    named: usize,
+    /// The compiled graph `outs` index (for checking kernels one by one).
+    g: TensorGraph,
     native: Vec<bool>,
     /// Bytes this program allocated (shared buffers count for their owner).
     bytes: usize,
@@ -118,13 +130,30 @@ impl Step {
     ) -> Self {
         let t = Instant::now();
         let dg = step_graph(dims, seq, kctx);
-        let (g, outs) = compiled_decode(&dg, rt.kind() == BackendKind::Cuda);
-        let mut opts = decode_opts(&dg, &outs);
-        opts.rows = env("TANG_DECODE_ROWS");
-        opts.warps = env("TANG_DECODE_WARPS");
-        opts.unroll = env("TANG_DECODE_UNROLL");
-        opts.mma_shape = env("TANG_MMA_SHAPE");
-        let dp = lower(rt, &g, &outs, &opts);
+        let (g, mut outs) = compiled_decode(&dg, rt.kind() == BackendKind::Cuda);
+        let named = outs.len();
+        let options = |outs: &[TensorId]| {
+            let mut opts = decode_opts(&dg, outs);
+            opts.rows = env("TANG_DECODE_ROWS");
+            opts.warps = env("TANG_DECODE_WARPS");
+            opts.unroll = env("TANG_DECODE_UNROLL");
+            opts.mma_shape = env("TANG_MMA_SHAPE");
+            opts
+        };
+        let mut opts = options(&outs);
+        let mut dp = lower(rt, &g, &outs, &opts);
+        // QWEN_KEEP_ALL=POS: every kernel's result is an output too, so a
+        // test can compare each against the interpreter (debugging aid;
+        // it changes fusion where a result had been inlined)
+        if std::env::var_os("QWEN_KEEP_ALL").is_some() {
+            for k in &dp.program.kernels {
+                if !outs.contains(&k.node) {
+                    outs.push(k.node);
+                }
+            }
+            opts = options(&outs);
+            dp = lower(rt, &g, &outs, &opts);
+        }
         let native = dp.native.clone();
         let mut program = dp.program;
         if seq > 1 {
@@ -160,14 +189,8 @@ impl Step {
                 .collect(),
             None => Vec::new(),
         };
-        let mut words = inputs(&dg);
         // own inputs left empty (a prefill's chunk) start zeroed
-        for (k, s) in dg.inputs.iter().enumerate() {
-            if words[k].is_empty() && !shared.iter().any(|sh| sh.input == k) {
-                let n: usize = s.shape.iter().product();
-                words[k] = vec![0.0; s.packing.map_or(n, |p| p.words(n))];
-            }
-        }
+        let words = inputs(&dg);
         let refs: Vec<&[f32]> = words.iter().map(|v| v.as_slice()).collect();
         let owned: usize = {
             let mut borrowed = vec![false; plan.slot_len.len()];
@@ -203,6 +226,8 @@ impl Step {
             dg,
             prog,
             outs,
+            named,
+            g,
             native,
             bytes: owned,
         }
@@ -223,8 +248,14 @@ impl Step {
             .write(rt, self.tensor("state"), &[tok as f32, pos as f32]);
     }
 
+    /// The full logits: block 0, then the other vocabulary blocks.
     fn logits(&self, rt: &Runtime) -> Vec<f32> {
-        self.prog.read(rt, self.outs[0])
+        let mut l = self.prog.read(rt, self.outs[0]);
+        let first = self.dg.outputs.len() + self.dg.keep.len();
+        for i in 0..self.dg.logit_chunks.len() {
+            l.extend(self.prog.read(rt, self.outs[first + i]));
+        }
+        l
     }
 
     /// Prefill: `tokens` at positions `p0..`, then `state` holds the next
@@ -309,7 +340,21 @@ fn tiny_dims() -> QwenDims {
         eps: 1e-6,
         theta: 1e4,
         kv_f16: std::env::var("TANG_KV_F32").is_err(),
+        // QWEN_VOCAB_CHUNKS=2 exercises the split embedding and LM head
+        vocab_chunks: env("QWEN_VOCAB_CHUNKS").max(1),
     }
+}
+
+/// The interpreter's `dg.outputs`, with `[0]` the full logits (every
+/// vocabulary block concatenated).
+fn eval_full(g: &TensorGraph, inputs: &[Vec<f64>], dg: &DecodeGraph) -> Vec<Vec<f64>> {
+    let all: Vec<TensorId> = dg.outputs.iter().chain(&dg.logit_chunks).copied().collect();
+    let mut res = g.eval_emulated(inputs, &all);
+    let extra: Vec<Vec<f64>> = res.split_off(dg.outputs.len());
+    for e in extra {
+        res[0].extend(e);
+    }
+    res
 }
 
 /// Random logical inputs for `dg` (caches and the step inputs zero).
@@ -353,6 +398,24 @@ fn device_words(dg: &DecodeGraph, logical: &[Vec<f32>]) -> Vec<Vec<f32>> {
             None => v.clone(),
         })
         .collect()
+}
+
+/// `QWEN_LOAD_DUTY` (0..1, unset = 1): the fraction of wall time the
+/// checkpoint conversion may keep a core busy. A robot without
+/// cooling trips its thermal limit while loading at full speed.
+fn load_duty() -> f64 {
+    std::env::var("QWEN_LOAD_DUTY")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map_or(1.0, |d| d.clamp(0.01, 1.0))
+}
+
+/// Sleep so the work since `start` was `load_duty()` of the time.
+fn pace(start: Instant) {
+    let d = load_duty();
+    if d < 1.0 {
+        std::thread::sleep(start.elapsed().mul_f64(1.0 / d - 1.0));
+    }
 }
 
 /// Worst relative error of `got` against `want`.
@@ -441,8 +504,25 @@ fn tiny() {
         let got = dec.logits(&rt);
         let (next, npos) = dec.state(&rt);
         cpu[dg.input("state")] = vec![tok as f64, pos as f64];
-        let res = gref.eval_emulated(&cpu, &dg.outputs);
+        let res = eval_full(&gref, &cpu, &dg);
         worst = worst.max(rel_err(&got, &res[0]));
+        let check_at: usize = std::env::var("QWEN_KEEP_ALL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if pos == check_at && dec.outs.len() > dec.named {
+            // QWEN_KEEP_ALL=POS: each kernel's result against the interpreter
+            let extra = &dec.outs[dec.named..];
+            let want = dec.g.eval_emulated(&cpu, extra);
+            for (i, (&t, w)) in extra.iter().zip(&want).enumerate() {
+                let got: Vec<f32> = dec.prog.read(&rt, t);
+                let e = rel_err(&got, w);
+                println!(
+                    "  kernel result {i:3} ({t:?}, {} values): rel err {e:.2e}",
+                    w.len()
+                );
+            }
+        }
         if dims.kv_f16 {
             check_caches(&dec, &res, &mut cache_ulps);
         }
@@ -490,7 +570,7 @@ fn tiny() {
             }
         })
         .collect();
-    let res = pg.eval_emulated(&pcpu, &pre.dg.outputs);
+    let res = eval_full(&pg, &pcpu, &pre.dg);
     let perr = rel_err(&got, &res[0]);
     let mut pre_ulps = 0.0;
     // (f32 caches hold f32 arithmetic: compared through the logits)
@@ -517,7 +597,7 @@ fn tiny() {
     dec.prog.run(&rt);
     let got = dec.logits(&rt);
     cpu[dg.input("state")] = vec![next as f64, npos as f64];
-    let res = gref.eval_emulated(&cpu, &dg.outputs);
+    let res = eval_full(&gref, &cpu, &dg);
     let derr = rel_err(&got, &res[0]);
     println!("decode after the prefill: rel logit err {derr:.2e}");
     pcpu.clear();
@@ -540,14 +620,17 @@ fn tiny() {
 // MLX checkpoint
 
 struct St {
-    bytes: Vec<u8>,
+    // mapped, not read: on the 10 GB robot a read copy plus the converted
+    // words overflow RAM into zram, whose compression heats every core
+    bytes: memmap2::Mmap,
     base: usize,
     index: HashMap<String, (String, Vec<usize>, usize, usize)>,
 }
 
 impl St {
     fn open(path: &str) -> Self {
-        let bytes = std::fs::read(path).expect("read safetensors");
+        let f = std::fs::File::open(path).expect("open safetensors");
+        let bytes = unsafe { memmap2::Mmap::map(&f) }.expect("map safetensors");
         let n = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
         let header: serde_json::Value = serde_json::from_slice(&bytes[8..8 + n]).unwrap();
         let mut index = HashMap::new();
@@ -621,8 +704,13 @@ impl St {
     }
 }
 
-/// Device inputs for a step graph from an MLX checkpoint.
-fn load_inputs(st: &St, dims: &QwenDims, dg: &DecodeGraph) -> Vec<Vec<f32>> {
+/// Device inputs for a step graph from an MLX checkpoint, converted as the
+/// iterator is drawn (empty for state, which starts zeroed).
+fn load_inputs<'a>(
+    st: &'a St,
+    dims: &'a QwenDims,
+    dg: &'a DecodeGraph,
+) -> impl Iterator<Item = Vec<f32>> + 'a {
     let proj = |p: &str| -> &'static [&'static str] {
         match p {
             "qkv" => &["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"],
@@ -639,50 +727,71 @@ fn load_inputs(st: &St, dims: &QwenDims, dg: &DecodeGraph) -> Vec<Vec<f32>> {
         "b" => "biases",
         _ => unreachable!(),
     };
-    dg.inputs
-        .iter()
-        .map(|s| {
-            let n: usize = s.shape.iter().product();
-            let name = &s.name;
-            if name == "state" || name == "chunk" || name.ends_with("cache") {
-                return vec![0.0; s.packing.map_or(n, |p| p.words(n))];
-            }
-            if name == "rope" {
-                return rope_table(dims);
-            }
-            if name == "model.norm" {
-                return st.bf16("model.norm.weight");
-            }
-            if let Some(rest) = name.strip_prefix("lm_head.") {
-                return st.words(&format!("lm_head.{}", suffix(rest)));
-            }
-            if let Some(rest) = name.strip_prefix("embed.") {
-                return st.words(&format!("model.embed_tokens.{}", suffix(rest)));
-            }
-            // model.layers.{l}.{what}
-            let rest = name.strip_prefix("model.layers.").unwrap();
-            let (l, what) = rest.split_once('.').unwrap();
-            let pre = format!("model.layers.{l}.");
-            match what {
-                "ln1" => st.bf16(&format!("{pre}input_layernorm.weight")),
-                "ln2" => st.bf16(&format!("{pre}post_attention_layernorm.weight")),
-                "q_norm" => st.bf16(&format!("{pre}self_attn.q_norm.weight")),
-                "k_norm" => st.bf16(&format!("{pre}self_attn.k_norm.weight")),
-                _ => {
-                    let (p, part) = what.split_once('.').unwrap();
-                    // row-major [rows, …]: concatenating rows is
-                    // concatenating the word arrays
-                    let mut v = Vec::new();
-                    for t in proj(p) {
-                        v.extend(st.words(&format!("{pre}{t}.{}", suffix(part))));
-                    }
-                    let want = s.packing.unwrap().words(n);
-                    assert_eq!(v.len(), want, "{name}");
-                    v
+    let one = move |s: &InputSpec| -> Vec<f32> {
+        let n: usize = s.shape.iter().product();
+        let name = &s.name;
+        if name == "state" || name == "chunk" || name.ends_with("cache") {
+            return Vec::new();
+        }
+        if name == "rope" {
+            return rope_table(dims);
+        }
+        if name == "model.norm" {
+            return st.bf16("model.norm.weight");
+        }
+        // the embedding and LM head, whole (`embed.q`) or as row block
+        // `c` of `dims.vocab_chunks` (`embed.2.q`): rows are contiguous
+        // in the packed words
+        let block = |base: &str, rest: &str| -> Vec<f32> {
+            let (c, part) = match rest.split_once('.') {
+                Some((c, part)) => (c.parse::<usize>().ok(), part),
+                None => (None, rest),
+            };
+            let w = st.words(&format!("{base}.{}", suffix(part)));
+            match c {
+                None => w,
+                Some(c) => {
+                    let per = w.len() / dims.vocab_chunks;
+                    w[c * per..(c + 1) * per].to_vec()
                 }
             }
-        })
-        .collect()
+        };
+        if let Some(rest) = name.strip_prefix("lm_head.") {
+            return block("lm_head", rest);
+        }
+        if let Some(rest) = name.strip_prefix("embed.") {
+            return block("model.embed_tokens", rest);
+        }
+        // model.layers.{l}.{what}
+        let rest = name.strip_prefix("model.layers.").unwrap();
+        let (l, what) = rest.split_once('.').unwrap();
+        let pre = format!("model.layers.{l}.");
+        match what {
+            "ln1" => st.bf16(&format!("{pre}input_layernorm.weight")),
+            "ln2" => st.bf16(&format!("{pre}post_attention_layernorm.weight")),
+            "q_norm" => st.bf16(&format!("{pre}self_attn.q_norm.weight")),
+            "k_norm" => st.bf16(&format!("{pre}self_attn.k_norm.weight")),
+            _ => {
+                let (p, part) = what.split_once('.').unwrap();
+                // row-major [rows, …]: concatenating rows is
+                // concatenating the word arrays
+                let mut v = Vec::new();
+                for t in proj(p) {
+                    v.extend(st.words(&format!("{pre}{t}.{}", suffix(part))));
+                }
+                let want = s.packing.unwrap().words(n);
+                assert_eq!(v.len(), want, "{name}");
+                v
+            }
+        }
+    };
+    // QWEN_LOAD_DUTY: hold the conversion to a CPU duty cycle (a hot robot)
+    dg.inputs.iter().map(move |s| {
+        let t = Instant::now();
+        let v = one(s);
+        pace(t);
+        v
+    })
 }
 
 fn read_ids(path: &str) -> Vec<usize> {
@@ -719,11 +828,37 @@ fn model(args: &[String]) {
     let mut dims = QwenDims::qwen3_8b(ctx);
     dims.kv_f16 = std::env::var("TANG_KV_F32").is_err();
     let rt = runtime();
+    // a 311 MB 4-bit LM head exceeds Vulkan's 128 MiB storage binding on
+    // the Adreno: four blocks of the vocabulary there (QWEN_VOCAB_CHUNKS
+    // overrides)
+    dims.vocab_chunks = match env("QWEN_VOCAB_CHUNKS") {
+        0 => match &rt {
+            Runtime::Wgpu { device, .. } if !device.msl_passthrough => 4,
+            _ => 1,
+        },
+        n => n,
+    };
     eprintln!("runtime: {}", rt.name());
     let t = Instant::now();
     let st = St::open(&format!("{dir}/model.safetensors"));
     eprintln!("checkpoint read in {:.1}s", t.elapsed().as_secs_f64());
-    let dec = Step::new(&rt, &dims, 1, ctx, &|dg| load_inputs(&st, &dims, dg), None);
+    // weights stream in one tensor at a time: converting them all first
+    // would hold a second 4.6 GB copy, which the 10 GB robot swaps to zram
+    let dec = Step::new(
+        &rt,
+        &dims,
+        1,
+        ctx,
+        &|dg| vec![Vec::new(); dg.inputs.len()],
+        None,
+    );
+    let t = Instant::now();
+    for (k, v) in load_inputs(&st, &dims, &dec.dg).enumerate() {
+        if !v.is_empty() {
+            dec.prog.write(&rt, dec.prog.input(k), &v);
+        }
+    }
+    eprintln!("weights uploaded in {:.1}s", t.elapsed().as_secs_f64());
     let mut total = dec.bytes;
 
     if let Some(force) = opt("--force") {

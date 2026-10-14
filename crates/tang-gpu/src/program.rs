@@ -241,7 +241,10 @@ fn check_plan(program: &WgslProgram, inputs: &[&[f32]], plan: &BufferPlan, share
     for (i, b) in program.buffers.iter().enumerate() {
         assert!(words(b) <= plan.slot_len[plan.slot[i]], "slot too small");
         if let Some(k) = b.input.filter(|k| !shared.contains(k)) {
-            assert_eq!(inputs[k].len(), b.len, "input {k} has wrong length");
+            assert!(
+                inputs[k].is_empty() || inputs[k].len() == b.len,
+                "input {k} has wrong length"
+            );
         }
     }
 }
@@ -314,7 +317,9 @@ impl Program {
         Self::with_plan(rt, program, inputs, &plan)
     }
 
-    /// Allocate the slots of `plan` and upload the inputs.
+    /// Allocate the slots of `plan` and upload the inputs; an empty input
+    /// is left zeroed, to [`write`](Self::write) later (a large model
+    /// streams its weights in without a second host copy).
     pub fn with_plan(
         rt: &Runtime,
         program: WgslProgram,
@@ -379,7 +384,7 @@ impl Program {
                     })
                     .collect();
                 for (i, b) in program.buffers.iter().enumerate() {
-                    if let Some(k) = b.input.filter(|&k| own(k)) {
+                    if let Some(k) = b.input.filter(|&k| own(k) && !inputs[k].is_empty()) {
                         let host = pack_words(b.format, inputs[k]);
                         let slot = Rc::get_mut(&mut slots[plan.slot[i]]).expect("own slot");
                         let mut view = slot.slice_mut(0..host.len());
@@ -449,7 +454,7 @@ impl Program {
             })
             .collect();
         for (i, b) in program.buffers.iter().enumerate() {
-            let Some(k) = b.input.filter(|&k| own(k)) else {
+            let Some(k) = b.input.filter(|&k| own(k) && !inputs[k].is_empty()) else {
                 continue;
             };
             let s = plan.slot[i];
@@ -760,6 +765,11 @@ impl Program {
             (Runtime::Wgpu { device, cache }, Storage::Wgpu(slots)) => {
                 cache.borrow_mut().flush(device);
                 write_wgpu(device, &slots[s], b.format, data);
+                // the queue holds a staging copy of every write until a
+                // submit retires it: streaming a model's weights in would
+                // otherwise keep them all in host memory at once
+                device.queue.submit([]);
+                device.device.poll(wgpu::PollType::Wait).ok();
             }
             #[cfg(feature = "cuda")]
             (Runtime::Cuda(d), Storage::Cuda { slots, .. }) => {

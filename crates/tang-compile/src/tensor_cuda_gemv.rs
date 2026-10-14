@@ -92,6 +92,7 @@ impl Packing {
 pub(super) enum DecodeTarget {
     Cuda,
     Msl,
+    Glsl,
 }
 
 /// Options of [`TensorGraph::to_cuda_decode`].
@@ -253,6 +254,10 @@ impl TensorGraph {
                 if !opts.mma || reads.iter().any(|j| packed.contains_key(j)) {
                     return None;
                 }
+                // no matrix-tile lowering in GLSL yet: the warp kernels
+                if target == DecodeTarget::Glsl {
+                    return None;
+                }
                 if target == DecodeTarget::Msl {
                     return super::msl_gemv::mma_kernel(self, root, &reads);
                 }
@@ -290,6 +295,14 @@ impl TensorGraph {
                             }
                             let kept: Vec<usize> = k.reads.iter().map(|t| t.index()).collect();
                             super::msl_gemv::transliterate(&kern.source, &kept, donor)
+                        }
+                        DecodeTarget::Glsl => {
+                            // as for Metal: the donor is bound once, as `out`
+                            if let Some(d) = donor {
+                                k.reads.retain(|t| t.index() != d);
+                            }
+                            let kept: Vec<usize> = k.reads.iter().map(|t| t.index()).collect();
+                            super::glsl_gemv::transliterate(&kern.source, &kept, donor)
                         }
                     };
                     k.workgroup_size = kern.threads as u32;
