@@ -45,6 +45,9 @@ pub mod c;
 pub mod cuda;
 #[path = "tensor_cuda_gemv.rs"]
 pub mod cuda_gemv;
+/// Vulkan decode lowering: the decode kernels as GLSL (SPIR-V passthrough).
+#[path = "tensor_glsl_gemv.rs"]
+pub mod glsl_gemv;
 #[path = "tensor_grad.rs"]
 mod grad;
 #[path = "tensor_memplan.rs"]

@@ -26,10 +26,14 @@ libloading = "0.8"
 # feature builds (and the binary runs, falling back to wgpu) on machines
 # without NVIDIA hardware or a CUDA toolkit.
 cudarc = { version = "0.16", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-12080"], optional = true }
+# GLSL -> SPIR-V for the Vulkan decode kernels (`to_glsl_decode`), built
+# from source so the binary needs no shaderc on the target (the K1 has none).
+shaderc = { version = "0.10", features = ["build-from-source"], optional = true }
 
 [features]
 default = []
 cuda = ["dep:cudarc"]
+glsl = ["dep:shaderc"]
 
 [[example]]
 name = "physics_surrogate"

@@ -1007,7 +1007,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Native MSL (from tang-compile's simdgroup-matrix lowering)
         // goes straight to the Metal compiler; bindings map to buffer
         // indices in order, which is how the kernel declares them.
-        let module = if wgsl.starts_with("#include") {
+        let module = if wgsl.starts_with("#version") {
+            // GLSL compute (tang-compile's Vulkan decode lowering):
+            // compiled to SPIR-V here and passed straight to the driver;
+            // bindings are declared in the order `bindings` lists them.
+            let spirv = compile_glsl(wgsl);
+            unsafe {
+                device.device.create_shader_module_passthrough(
+                    wgpu::ShaderModuleDescriptorPassthrough::SpirV(
+                        wgpu::ShaderModuleDescriptorSpirV {
+                            label: Some("tang-gpu kernel glsl"),
+                            source: spirv.into(),
+                        },
+                    ),
+                )
+            }
+        } else if wgsl.starts_with("#include") {
             unsafe {
                 device.device.create_shader_module_passthrough(
                     wgpu::ShaderModuleDescriptorPassthrough::Msl(wgpu::ShaderModuleDescriptorMsl {
@@ -1079,6 +1094,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 entry_point: Some(if wgsl.starts_with("#include") {
                     "main0"
                 } else {
+                    // WGSL and GLSL kernels both enter at `main`
                     "main"
                 }),
                 compilation_options: Default::default(),
@@ -1111,4 +1127,32 @@ impl Default for KernelCache {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// GLSL compute source to SPIR-V words (Vulkan 1.1), with shaderc.
+#[cfg(feature = "glsl")]
+fn compile_glsl(src: &str) -> Vec<u32> {
+    let compiler = shaderc::Compiler::new().expect("shaderc");
+    let mut opts = shaderc::CompileOptions::new().expect("shaderc options");
+    opts.set_target_env(
+        shaderc::TargetEnv::Vulkan,
+        shaderc::EnvVersion::Vulkan1_1 as u32,
+    );
+    opts.set_optimization_level(shaderc::OptimizationLevel::Performance);
+    match compiler.compile_into_spirv(
+        src,
+        shaderc::ShaderKind::Compute,
+        "tang.comp",
+        "main",
+        Some(&opts),
+    ) {
+        Ok(a) => a.as_binary().to_vec(),
+        Err(e) => panic!("GLSL kernel failed to compile: {e}\n{src}"),
+    }
+}
+
+/// Without the `glsl` feature there is no GLSL compiler to hand a kernel to.
+#[cfg(not(feature = "glsl"))]
+fn compile_glsl(_src: &str) -> Vec<u32> {
+    panic!("a GLSL kernel needs tang-gpu built with the `glsl` feature")
 }

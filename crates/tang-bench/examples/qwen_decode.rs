@@ -65,9 +65,16 @@ fn lower(
     outs: &[TensorId],
     opts: &tang_compile::tensor::cuda_gemv::DecodeOpts,
 ) -> DecodeProgram {
-    match rt.kind() {
-        BackendKind::Cuda => g.to_cuda_decode(outs, opts),
-        BackendKind::Wgpu => g.to_msl_decode(outs, opts),
+    match rt {
+        // Vulkan (the K1's Adreno, ...): the decode kernels as GLSL,
+        // compiled to SPIR-V by tang-gpu (feature `glsl`)
+        Runtime::Wgpu { device, .. } if !device.msl_passthrough && device.spirv_passthrough => {
+            g.to_glsl_decode(outs, opts)
+        }
+        _ => match rt.kind() {
+            BackendKind::Cuda => g.to_cuda_decode(outs, opts),
+            BackendKind::Wgpu => g.to_msl_decode(outs, opts),
+        },
     }
 }
 
