@@ -1004,6 +1004,27 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         bindings: &[BindingSpec],
         workgroup_size: u32,
     ) -> CachedPipeline {
+        // TANG_COMPILE_DUTY (0..1): hold shader compilation (ours and the
+        // driver's, which on the Adreno is most of it) to a CPU duty cycle,
+        // for boards that overheat compiling hundreds of pipelines at once
+        let start = std::time::Instant::now();
+        let pipe = Self::compile_dynamic_now(device, wgsl, bindings, workgroup_size);
+        if let Some(d) = std::env::var("TANG_COMPILE_DUTY")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|d| d.clamp(0.01, 1.0))
+        {
+            std::thread::sleep(start.elapsed().mul_f64(1.0 / d - 1.0));
+        }
+        pipe
+    }
+
+    fn compile_dynamic_now(
+        device: &GpuDevice,
+        wgsl: &str,
+        bindings: &[BindingSpec],
+        workgroup_size: u32,
+    ) -> CachedPipeline {
         // Native MSL (from tang-compile's simdgroup-matrix lowering)
         // goes straight to the Metal compiler; bindings map to buffer
         // indices in order, which is how the kernel declares them.
@@ -1157,8 +1178,8 @@ impl Default for KernelCache {
 /// GLSL compute source to SPIR-V words (Vulkan 1.1), with shaderc, through
 /// the on-disk cache ([`spirv_cache_dir`]): a decode program is ~500
 /// kernels, minutes of CPU on a phone-class SoC, so each compiles once.
-/// `TANG_COMPILE_DUTY` (0..1) paces compiles that do run, for boards that
-/// overheat at full load.
+/// (`TANG_COMPILE_DUTY` paces the whole pipeline build, driver included:
+/// see `compile_dynamic`.)
 #[cfg(feature = "glsl")]
 fn compile_glsl(src: &str) -> Vec<u32> {
     let level = if std::env::var("TANG_GLSL_OPT").as_deref() == Ok("0") {
@@ -1214,13 +1235,7 @@ fn compile_glsl(src: &str) -> Vec<u32> {
             let _ = std::fs::write(comp, src);
         }
     }
-    if let Some(d) = std::env::var("TANG_COMPILE_DUTY")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .map(|d| d.clamp(0.01, 1.0))
-    {
-        std::thread::sleep(t.elapsed().mul_f64(1.0 / d - 1.0));
-    }
+    let _ = t;
     words
 }
 

@@ -189,14 +189,8 @@ impl Step {
                 .collect(),
             None => Vec::new(),
         };
-        let mut words = inputs(&dg);
         // own inputs left empty (a prefill's chunk) start zeroed
-        for (k, s) in dg.inputs.iter().enumerate() {
-            if words[k].is_empty() && !shared.iter().any(|sh| sh.input == k) {
-                let n: usize = s.shape.iter().product();
-                words[k] = vec![0.0; s.packing.map_or(n, |p| p.words(n))];
-            }
-        }
+        let words = inputs(&dg);
         let refs: Vec<&[f32]> = words.iter().map(|v| v.as_slice()).collect();
         let owned: usize = {
             let mut borrowed = vec![false; plan.slot_len.len()];
@@ -407,7 +401,7 @@ fn device_words(dg: &DecodeGraph, logical: &[Vec<f32>]) -> Vec<Vec<f32>> {
 }
 
 /// `QWEN_LOAD_DUTY` (0..1, unset = 1): the fraction of wall time the
-/// checkpoint read and conversion may keep a core busy. A robot without
+/// checkpoint conversion may keep a core busy. A robot without
 /// cooling trips its thermal limit while loading at full speed.
 fn load_duty() -> f64 {
     std::env::var("QWEN_LOAD_DUTY")
@@ -422,27 +416,6 @@ fn pace(start: Instant) {
     if d < 1.0 {
         std::thread::sleep(start.elapsed().mul_f64(1.0 / d - 1.0));
     }
-}
-
-/// `std::fs::read`, in 64 MB pieces paced by [`pace`].
-fn read_paced(path: &str) -> Vec<u8> {
-    use std::io::Read;
-    if load_duty() >= 1.0 {
-        return std::fs::read(path).expect("read safetensors");
-    }
-    let mut f = std::fs::File::open(path).expect("open safetensors");
-    let mut bytes = Vec::with_capacity(f.metadata().map_or(0, |m| m.len() as usize));
-    let mut buf = vec![0u8; 64 << 20];
-    loop {
-        let t = Instant::now();
-        let n = f.read(&mut buf).expect("read safetensors");
-        if n == 0 {
-            break;
-        }
-        bytes.extend_from_slice(&buf[..n]);
-        pace(t);
-    }
-    bytes
 }
 
 /// Worst relative error of `got` against `want`.
@@ -647,14 +620,17 @@ fn tiny() {
 // MLX checkpoint
 
 struct St {
-    bytes: Vec<u8>,
+    // mapped, not read: on the 10 GB robot a read copy plus the converted
+    // words overflow RAM into zram, whose compression heats every core
+    bytes: memmap2::Mmap,
     base: usize,
     index: HashMap<String, (String, Vec<usize>, usize, usize)>,
 }
 
 impl St {
     fn open(path: &str) -> Self {
-        let bytes = read_paced(path);
+        let f = std::fs::File::open(path).expect("open safetensors");
+        let bytes = unsafe { memmap2::Mmap::map(&f) }.expect("map safetensors");
         let n = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
         let header: serde_json::Value = serde_json::from_slice(&bytes[8..8 + n]).unwrap();
         let mut index = HashMap::new();
@@ -728,8 +704,13 @@ impl St {
     }
 }
 
-/// Device inputs for a step graph from an MLX checkpoint.
-fn load_inputs(st: &St, dims: &QwenDims, dg: &DecodeGraph) -> Vec<Vec<f32>> {
+/// Device inputs for a step graph from an MLX checkpoint, converted as the
+/// iterator is drawn (empty for state, which starts zeroed).
+fn load_inputs<'a>(
+    st: &'a St,
+    dims: &'a QwenDims,
+    dg: &'a DecodeGraph,
+) -> impl Iterator<Item = Vec<f32>> + 'a {
     let proj = |p: &str| -> &'static [&'static str] {
         match p {
             "qkv" => &["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"],
@@ -746,11 +727,11 @@ fn load_inputs(st: &St, dims: &QwenDims, dg: &DecodeGraph) -> Vec<Vec<f32>> {
         "b" => "biases",
         _ => unreachable!(),
     };
-    let one = |s: &InputSpec| -> Vec<f32> {
+    let one = move |s: &InputSpec| -> Vec<f32> {
         let n: usize = s.shape.iter().product();
         let name = &s.name;
         if name == "state" || name == "chunk" || name.ends_with("cache") {
-            return vec![0.0; s.packing.map_or(n, |p| p.words(n))];
+            return Vec::new();
         }
         if name == "rope" {
             return rope_table(dims);
@@ -805,15 +786,12 @@ fn load_inputs(st: &St, dims: &QwenDims, dg: &DecodeGraph) -> Vec<Vec<f32>> {
         }
     };
     // QWEN_LOAD_DUTY: hold the conversion to a CPU duty cycle (a hot robot)
-    dg.inputs
-        .iter()
-        .map(|s| {
-            let t = Instant::now();
-            let v = one(s);
-            pace(t);
-            v
-        })
-        .collect()
+    dg.inputs.iter().map(move |s| {
+        let t = Instant::now();
+        let v = one(s);
+        pace(t);
+        v
+    })
 }
 
 fn read_ids(path: &str) -> Vec<usize> {
@@ -864,7 +842,16 @@ fn model(args: &[String]) {
     let t = Instant::now();
     let st = St::open(&format!("{dir}/model.safetensors"));
     eprintln!("checkpoint read in {:.1}s", t.elapsed().as_secs_f64());
-    let dec = Step::new(&rt, &dims, 1, ctx, &|dg| load_inputs(&st, &dims, dg), None);
+    // weights stream in one tensor at a time: converting them all first
+    // would hold a second 4.6 GB copy, which the 10 GB robot swaps to zram
+    let dec = Step::new(&rt, &dims, 1, ctx, &|dg| vec![Vec::new(); dg.inputs.len()], None);
+    let t = Instant::now();
+    for (k, v) in load_inputs(&st, &dims, &dec.dg).enumerate() {
+        if !v.is_empty() {
+            dec.prog.write(&rt, dec.prog.input(k), &v);
+        }
+    }
+    eprintln!("weights uploaded in {:.1}s", t.elapsed().as_secs_f64());
     let mut total = dec.bytes;
 
     if let Some(force) = opt("--force") {
