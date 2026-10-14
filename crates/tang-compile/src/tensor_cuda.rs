@@ -1822,7 +1822,7 @@ __device__ __forceinline__ unsigned min(unsigned a, unsigned b) { return a < b ?
 "#;
 
 /// Split on `, ` outside angle brackets (`a: array<f32, 2>, b: f32`).
-fn split_top(s: &str) -> Vec<&str> {
+pub(super) fn split_top(s: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let (mut depth, mut start) = (0usize, 0usize);
     let b = s.as_bytes();
@@ -1887,7 +1887,7 @@ fn cuda_array_decl(name: &str, ty: &str) -> String {
 }
 
 /// Float literals get an `f` suffix so the math stays single precision.
-fn float_literals(s: &str) -> String {
+pub(super) fn float_literals(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = String::with_capacity(s.len() + 8);
     let mut i = 0;
