@@ -22,7 +22,9 @@
 //!   `subgroupShuffleXor` computes the same sums as on a 32-lane warp
 //!   (subgroups being contiguous runs of invocations).
 //! - **`shared` arrays move to global scope**, and the 16-bit conversions
-//!   are `packHalf2x16` / `unpackHalf2x16` (no `shaderFloat16` needed).
+//!   are integer ops with explicit round-to-nearest-even (`packHalf2x16`'s
+//!   rounding is the driver's choice) and `unpackHalf2x16` (exact); no
+//!   `shaderFloat16` needed.
 //!
 //! Unlowered kernels stay WGSL, which wgpu compiles itself; they never
 //! read packed inputs (`to_decode` checks).
@@ -40,7 +42,23 @@ pub const GLSL_VERSION: &str = "#version 450";
 const GLSL_PRELUDE: &str = r#"#define tang_u4(b, a) (float((b[(a) >> 3] >> (((a) & 7) * 4)) & 15u))
 #define tang_bf16(b, a) uintBitsToFloat((((a) & 1) != 0) ? (b[(a) >> 1] & 0xffff0000u) : (b[(a) >> 1] << 16))
 float tang_h2f(uint h) { return unpackHalf2x16(h & 0xffffu).x; }
-uint tang_f2h(float f) { return packHalf2x16(vec2(f, 0.0)) & 0xffffu; }
+uint tang_f2h(float f) {
+    // round-to-nearest-even in integer ops (Giesen's float_to_half_fast3_rtne):
+    // GLSL leaves packHalf2x16's rounding to the driver, and the Adreno's
+    // differs from CUDA's cvt.rn, which biases every cached value alike
+    uint x = floatBitsToUint(f);
+    uint sign = (x >> 16) & 0x8000u;
+    x &= 0x7fffffffu;
+    uint h;
+    if (x >= 0x47800000u) {
+        h = (x > 0x7f800000u) ? 0x7e00u : 0x7c00u;
+    } else if (x < 0x38800000u) {
+        h = floatBitsToUint(uintBitsToFloat(x) + 0.5) - 0x3f000000u;
+    } else {
+        h = (x + 0xc8000fffu + ((x >> 13) & 1u)) >> 13;
+    }
+    return sign | h;
+}
 uint tang_f2bf(float f) { uint b = floatBitsToUint(f); return (b + 0x7fffu + ((b >> 16) & 1u)) >> 16; }
 #define tang_f16(b, a) tang_h2f((((a) & 1) != 0) ? (b[(a) >> 1] >> 16) : (b[(a) >> 1] & 0xffffu))
 "#;
@@ -378,6 +396,73 @@ fn rename_ident(s: &str, from: &str, to: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `tang_f2h` of [`GLSL_PRELUDE`], step for step (the float add in the
+    /// subnormal branch is an f32 add, which GPUs round to nearest even).
+    fn f2h(f: f32) -> u16 {
+        let mut x = f.to_bits();
+        let sign = (x >> 16) & 0x8000;
+        x &= 0x7fff_ffff;
+        let h = if x >= 0x4780_0000 {
+            if x > 0x7f80_0000 {
+                0x7e00
+            } else {
+                0x7c00
+            }
+        } else if x < 0x3880_0000 {
+            (f32::from_bits(x) + 0.5)
+                .to_bits()
+                .wrapping_sub(0x3f00_0000)
+        } else {
+            x.wrapping_add(0xc800_0fff).wrapping_add((x >> 13) & 1) >> 13
+        };
+        (sign | h) as u16
+    }
+
+    #[test]
+    fn f16_conversion_rounds_to_nearest_even() {
+        let check = |f: f32| {
+            let want = half::f16::from_f32(f);
+            let got = f2h(f);
+            if want.is_nan() {
+                assert!(
+                    half::f16::from_bits(got).is_nan(),
+                    "{f:e}: {got:#06x} not NaN"
+                );
+            } else {
+                assert_eq!(got, want.to_bits(), "{f:e} ({:#010x})", f.to_bits());
+            }
+        };
+        // every f16 halfway point (and its neighbours), both signs
+        for m in 0u32..(1 << 16) {
+            let tie = (m << 13) | 0x1000;
+            for b in [tie - 1, tie, tie + 1] {
+                check(f32::from_bits(b));
+                check(f32::from_bits(b | 0x8000_0000));
+            }
+        }
+        // a pseudo-random sweep of all f32 bit patterns
+        let mut s = 0x9e37_79b9u32;
+        for _ in 0..2_000_000 {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            check(f32::from_bits(s));
+        }
+        for f in [
+            0.0,
+            -0.0,
+            65504.0,
+            65519.99,
+            65520.0,
+            6.1e-5,
+            5.96e-8,
+            2.98e-8,
+            f32::INFINITY,
+        ] {
+            check(f);
+        }
+    }
 
     #[test]
     fn transliterates_loads_shuffles_and_stores() {

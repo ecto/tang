@@ -1007,7 +1007,32 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Native MSL (from tang-compile's simdgroup-matrix lowering)
         // goes straight to the Metal compiler; bindings map to buffer
         // indices in order, which is how the kernel declares them.
-        let module = if wgsl.starts_with("#version") {
+        // Adreno's Vulkan driver miscompiles naga's SPIR-V for some tang
+        // kernels (a RoPE map in Qwen decode came out wrong on the K1's
+        // Adreno 740, right on NVIDIA and Metal); through naga's GLSL writer
+        // and glslang it is right. Default there; TANG_WGSL_VIA_GLSL=0/1 forces.
+        let via_glsl = !wgsl.starts_with('#')
+            && device.spirv_passthrough
+            && match std::env::var("TANG_WGSL_VIA_GLSL").as_deref() {
+                Ok("1") => true,
+                Ok("0") => false,
+                _ => device.name.contains("Adreno"),
+            };
+        let module = if via_glsl {
+            // a WGSL kernel through naga's GLSL writer and shaderc instead
+            // of naga's SPIR-V writer
+            let spirv = compile_glsl(&wgsl_to_glsl(wgsl));
+            unsafe {
+                device.device.create_shader_module_passthrough(
+                    wgpu::ShaderModuleDescriptorPassthrough::SpirV(
+                        wgpu::ShaderModuleDescriptorSpirV {
+                            label: Some("tang-gpu kernel wgsl via glsl"),
+                            source: spirv.into(),
+                        },
+                    ),
+                )
+            }
+        } else if wgsl.starts_with("#version") {
             // GLSL compute (tang-compile's Vulkan decode lowering):
             // compiled to SPIR-V here and passed straight to the driver;
             // bindings are declared in the order `bindings` lists them.
@@ -1138,7 +1163,13 @@ fn compile_glsl(src: &str) -> Vec<u32> {
         shaderc::TargetEnv::Vulkan,
         shaderc::EnvVersion::Vulkan1_1 as u32,
     );
-    opts.set_optimization_level(shaderc::OptimizationLevel::Performance);
+    // TANG_GLSL_OPT=0 hands the driver unoptimized SPIR-V
+    let level = if std::env::var("TANG_GLSL_OPT").as_deref() == Ok("0") {
+        shaderc::OptimizationLevel::Zero
+    } else {
+        shaderc::OptimizationLevel::Performance
+    };
+    opts.set_optimization_level(level);
     match compiler.compile_into_spirv(
         src,
         shaderc::ShaderKind::Compute,
@@ -1155,4 +1186,53 @@ fn compile_glsl(src: &str) -> Vec<u32> {
 #[cfg(not(feature = "glsl"))]
 fn compile_glsl(_src: &str) -> Vec<u32> {
     panic!("a GLSL kernel needs tang-gpu built with the `glsl` feature")
+}
+
+/// A WGSL compute kernel as desktop GLSL 450 (naga's GLSL writer), its
+/// `@group(0) @binding(i)` resources at `binding = i`.
+#[cfg(feature = "glsl")]
+fn wgsl_to_glsl(wgsl: &str) -> String {
+    use naga::back::glsl;
+    let module = naga::front::wgsl::parse_str(wgsl).expect("WGSL kernel parses");
+    let info = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .expect("WGSL kernel validates");
+    let mut binding_map = glsl::BindingMap::default();
+    for (_, gv) in module.global_variables.iter() {
+        if let Some(rb) = &gv.binding {
+            binding_map.insert(rb.clone(), rb.binding as u8);
+        }
+    }
+    let options = glsl::Options {
+        version: glsl::Version::Desktop(450),
+        writer_flags: glsl::WriterFlags::empty(),
+        binding_map,
+        zero_initialize_workgroup_memory: true,
+    };
+    let pipeline = glsl::PipelineOptions {
+        shader_stage: naga::ShaderStage::Compute,
+        entry_point: "main".into(),
+        multiview: None,
+    };
+    let mut out = String::new();
+    glsl::Writer::new(
+        &mut out,
+        &module,
+        &info,
+        &options,
+        &pipeline,
+        naga::proc::BoundsCheckPolicies::default(),
+    )
+    .expect("GLSL writer")
+    .write()
+    .expect("GLSL from WGSL");
+    out
+}
+
+#[cfg(not(feature = "glsl"))]
+fn wgsl_to_glsl(_wgsl: &str) -> String {
+    panic!("TANG_WGSL_VIA_GLSL needs tang-gpu built with the `glsl` feature")
 }

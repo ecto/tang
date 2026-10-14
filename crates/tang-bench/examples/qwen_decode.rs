@@ -104,8 +104,13 @@ fn slot_plan(
 struct Step {
     dg: DecodeGraph,
     prog: Program,
-    /// `dg.outputs` in the compiled graph, then `dg.keep`.
+    /// `dg.outputs` in the compiled graph, then `dg.keep`; with
+    /// `QWEN_KEEP_ALL`, every kernel's result after those (from `named`).
     outs: Vec<TensorId>,
+    /// How many of `outs` are the step's own outputs.
+    named: usize,
+    /// The compiled graph `outs` index (for checking kernels one by one).
+    g: TensorGraph,
     native: Vec<bool>,
     /// Bytes this program allocated (shared buffers count for their owner).
     bytes: usize,
@@ -125,13 +130,30 @@ impl Step {
     ) -> Self {
         let t = Instant::now();
         let dg = step_graph(dims, seq, kctx);
-        let (g, outs) = compiled_decode(&dg, rt.kind() == BackendKind::Cuda);
-        let mut opts = decode_opts(&dg, &outs);
-        opts.rows = env("TANG_DECODE_ROWS");
-        opts.warps = env("TANG_DECODE_WARPS");
-        opts.unroll = env("TANG_DECODE_UNROLL");
-        opts.mma_shape = env("TANG_MMA_SHAPE");
-        let dp = lower(rt, &g, &outs, &opts);
+        let (g, mut outs) = compiled_decode(&dg, rt.kind() == BackendKind::Cuda);
+        let named = outs.len();
+        let options = |outs: &[TensorId]| {
+            let mut opts = decode_opts(&dg, outs);
+            opts.rows = env("TANG_DECODE_ROWS");
+            opts.warps = env("TANG_DECODE_WARPS");
+            opts.unroll = env("TANG_DECODE_UNROLL");
+            opts.mma_shape = env("TANG_MMA_SHAPE");
+            opts
+        };
+        let mut opts = options(&outs);
+        let mut dp = lower(rt, &g, &outs, &opts);
+        // QWEN_KEEP_ALL=POS: every kernel's result is an output too, so a
+        // test can compare each against the interpreter (debugging aid;
+        // it changes fusion where a result had been inlined)
+        if std::env::var_os("QWEN_KEEP_ALL").is_some() {
+            for k in &dp.program.kernels {
+                if !outs.contains(&k.node) {
+                    outs.push(k.node);
+                }
+            }
+            opts = options(&outs);
+            dp = lower(rt, &g, &outs, &opts);
+        }
         let native = dp.native.clone();
         let mut program = dp.program;
         if seq > 1 {
@@ -210,6 +232,8 @@ impl Step {
             dg,
             prog,
             outs,
+            named,
+            g,
             native,
             bytes: owned,
         }
@@ -450,6 +474,23 @@ fn tiny() {
         cpu[dg.input("state")] = vec![tok as f64, pos as f64];
         let res = gref.eval_emulated(&cpu, &dg.outputs);
         worst = worst.max(rel_err(&got, &res[0]));
+        let check_at: usize = std::env::var("QWEN_KEEP_ALL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if pos == check_at && dec.outs.len() > dec.named {
+            // QWEN_KEEP_ALL=POS: each kernel's result against the interpreter
+            let extra = &dec.outs[dec.named..];
+            let want = dec.g.eval_emulated(&cpu, extra);
+            for (i, (&t, w)) in extra.iter().zip(&want).enumerate() {
+                let got: Vec<f32> = dec.prog.read(&rt, t);
+                let e = rel_err(&got, w);
+                println!(
+                    "  kernel result {i:3} ({t:?}, {} values): rel err {e:.2e}",
+                    w.len()
+                );
+            }
+        }
         if dims.kv_f16 {
             check_caches(&dec, &res, &mut cache_ulps);
         }

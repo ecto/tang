@@ -29,11 +29,14 @@ cudarc = { version = "0.16", default-features = false, features = ["std", "drive
 # GLSL -> SPIR-V for the Vulkan decode kernels (`to_glsl_decode`), built
 # from source so the binary needs no shaderc on the target (the K1 has none).
 shaderc = { version = "0.10", features = ["build-from-source"], optional = true }
+# WGSL kernels to GLSL (then shaderc), for drivers that mishandle naga's
+# SPIR-V (`TANG_WGSL_VIA_GLSL`); the same naga wgpu uses.
+naga = { version = "25", features = ["wgsl-in", "glsl-out"], optional = true }
 
 [features]
 default = []
 cuda = ["dep:cudarc"]
-glsl = ["dep:shaderc"]
+glsl = ["dep:shaderc", "dep:naga"]
 
 [[example]]
 name = "physics_surrogate"

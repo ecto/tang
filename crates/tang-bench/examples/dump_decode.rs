@@ -17,8 +17,18 @@ fn main() {
         kv_f16: true,
     };
     let dg = decode_graph(&dims);
-    let (g, outs) = compiled_decode(&dg, true);
-    let opts = decode_opts(&dg, &outs);
+    let (g, mut outs) = compiled_decode(&dg, true);
+    let mut opts = decode_opts(&dg, &outs);
+    // KEEP_ALL: every kernel's result an output, as qwen_decode's QWEN_KEEP_ALL
+    if std::env::var_os("KEEP_ALL").is_some() {
+        let p = g.to_cuda_decode(&outs, &opts);
+        for k in &p.program.kernels {
+            if !outs.contains(&k.node) {
+                outs.push(k.node);
+            }
+        }
+        opts = decode_opts(&dg, &outs);
+    }
     let p = match std::env::var("DUMP_TARGET").as_deref() {
         Ok("glsl") => g.to_glsl_decode(&outs, &opts),
         _ => g.to_cuda_decode(&outs, &opts),
@@ -30,7 +40,11 @@ fn main() {
     };
     for (i, k) in p.program.kernels.iter().enumerate() {
         let ext = if p.native[i] { native_ext } else { "wgsl" };
-        std::fs::write(format!("{dir}/k{i:03}.{ext}"), &k.source).unwrap();
+        std::fs::write(
+            format!("{dir}/k{i:03}_n{}.{ext}", k.node.index()),
+            &k.source,
+        )
+        .unwrap();
     }
     println!(
         "{} kernels, {} native",

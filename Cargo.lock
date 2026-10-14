@@ -6042,6 +6042,7 @@ dependencies = [
 name = "tang-compile"
 version = "0.1.0"
 dependencies = [
+ "half",
  "tang",
  "tang-expr",
 ]
@@ -6073,6 +6074,7 @@ dependencies = [
  "bytemuck",
  "cudarc 0.16.6",
  "libloading",
+ "naga",
  "pollster",
  "safetensors",
  "shaderc",
