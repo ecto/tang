@@ -32,6 +32,7 @@ pub mod display;
 pub mod eval;
 pub mod graph;
 pub mod node;
+pub mod reverse;
 mod scalar;
 pub mod simplify;
 pub mod sparsity;
