@@ -144,15 +144,16 @@ mod tests {
         let outs = [o0, o1];
         let seeds = [g.var(3), g.var(4)];
         let grad = g.vjp(&outs, &seeds, 3);
-        let fwd: Vec<_> = (0..3u16)
-            .map(|k| [g.diff(o0, k), g.diff(o1, k)])
-            .collect();
+        let fwd: Vec<_> = (0..3u16).map(|k| [g.diff(o0, k), g.diff(o1, k)]).collect();
         for pt in [[0.7, -0.4, 2.3, 1.5, -0.25], [-1.2, 0.9, 0.6, -0.5, 2.0]] {
             for k in 0..3 {
-                let want: f64 = pt[3] * g.eval::<f64>(fwd[k][0], &pt)
-                    + pt[4] * g.eval::<f64>(fwd[k][1], &pt);
+                let want: f64 =
+                    pt[3] * g.eval::<f64>(fwd[k][0], &pt) + pt[4] * g.eval::<f64>(fwd[k][1], &pt);
                 let got: f64 = g.eval(grad[k], &pt);
-                assert!((got - want).abs() < 1e-12 * want.abs().max(1.0), "var {k}: {got} vs {want}");
+                assert!(
+                    (got - want).abs() < 1e-12 * want.abs().max(1.0),
+                    "var {k}: {got} vs {want}"
+                );
             }
         }
     }
