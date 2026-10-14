@@ -107,9 +107,11 @@ impl Scalar for ExprId {
 
     #[inline]
     fn abs(self) -> Self {
-        // abs(x) = sqrt(x * x)
-        let xx = with_graph(|g| g.mul(self, self));
-        with_graph(|g| g.sqrt(xx))
+        // abs(x) = select(x, x, -x). Not sqrt(x * x): that overflows for
+        // |x| > ~1e154 (f64) or ~1e19 (f32) and underflows to 0 below their
+        // square roots of the smallest normal.
+        let neg = with_graph(|g| g.neg(self));
+        with_graph(|g| g.select(self, self, neg))
     }
 
     #[inline]
@@ -172,27 +174,18 @@ impl Scalar for ExprId {
 
     #[inline]
     fn min(self, other: Self) -> Self {
-        // min(a, b) = 0.5 * (a + b - sqrt((a-b)^2))
-        let half = Self::from_f64(0.5);
-        let sum = self + other;
+        // min(a, b) = select(a - b, b, a): exact. The old
+        // 0.5 * (a + b - sqrt((a-b)^2)) rounded (min(1, 1e-17) was 0) and
+        // squared the difference, which under/overflows in f32.
         let diff = self - other;
-        let diff_sq = with_graph(|g| g.mul(diff, diff));
-        let abs_diff = with_graph(|g| g.sqrt(diff_sq));
-        let neg_abs = with_graph(|g| g.neg(abs_diff));
-        let inner = with_graph(|g| g.add(sum, neg_abs));
-        with_graph(|g| g.mul(half, inner))
+        with_graph(|g| g.select(diff, other, self))
     }
 
     #[inline]
     fn max(self, other: Self) -> Self {
-        // max(a, b) = 0.5 * (a + b + sqrt((a-b)^2))
-        let half = Self::from_f64(0.5);
-        let sum = self + other;
+        // max(a, b) = select(a - b, a, b): exact (see `min`).
         let diff = self - other;
-        let diff_sq = with_graph(|g| g.mul(diff, diff));
-        let abs_diff = with_graph(|g| g.sqrt(diff_sq));
-        let inner = with_graph(|g| g.add(sum, abs_diff));
-        with_graph(|g| g.mul(half, inner))
+        with_graph(|g| g.select(diff, self, other))
     }
 
     #[inline]
@@ -327,11 +320,23 @@ impl Scalar for ExprId {
 
     #[inline]
     fn tanh(self) -> Self {
-        // tanh(x) = sinh(x) / cosh(x)
-        let s = self.sinh();
-        let c = self.cosh();
-        let rc = with_graph(|g| g.recip(c));
-        with_graph(|g| g.mul(s, rc))
+        // sinh(x) / cosh(x) is inf / inf = NaN once |x| > ~710 (f64; ~89 in
+        // f32). Instead, with a = min(|x|, 20) (tanh is 1 to f64 precision
+        // past 20, with slope 0):
+        // - a < 0.05: the odd series to a^9, truncation < 1e-16 relative;
+        // - else 1 - 2 / (e^(2a) + 1), cancellation <= ~2e-15 relative there.
+        let lit = Self::from_f64;
+        let a = self.abs().min(lit(20.0));
+        let e = (a * Self::TWO).exp();
+        let big = Self::ONE - Self::TWO / (e + Self::ONE);
+        let a2 = a * a;
+        let series = a
+            * (Self::ONE
+                + a2 * (lit(-1.0 / 3.0)
+                    + a2 * (lit(2.0 / 15.0)
+                        + a2 * (lit(-17.0 / 315.0) + a2 * lit(62.0 / 2835.0)))));
+        let r = Self::select(a - lit(0.05), big, series);
+        Self::select(self, r, -r)
     }
 
     #[inline]
@@ -400,6 +405,41 @@ impl Scalar for ExprId {
 #[cfg(test)]
 mod tests {
     use tang::Scalar;
+
+    /// Evaluate `f` traced over one input.
+    fn eval1(f: impl Fn(crate::ExprId) -> crate::ExprId, x: f64) -> f64 {
+        let (g, out) = crate::trace(|| f(crate::ExprId::var(0)));
+        g.compile(out)(&[x])
+    }
+
+    #[test]
+    fn min_max_abs_are_exact() {
+        for (a, b) in [(1.0, 1e-17), (-3.0, 2.5), (1e200, -1e200), (1e-30, 2e-30)] {
+            let lo = eval1(|x| x.min(crate::ExprId::from_f64(b)), a);
+            let hi = eval1(|x| x.max(crate::ExprId::from_f64(b)), a);
+            assert_eq!(lo, a.min(b), "min({a}, {b})");
+            assert_eq!(hi, a.max(b), "max({a}, {b})");
+        }
+        for x in [-1e200, -2.5, 0.0, 1e-300, 3.0] {
+            assert_eq!(eval1(|v| v.abs(), x), x.abs(), "abs({x})");
+        }
+    }
+
+    #[test]
+    fn tanh_is_finite_and_accurate() {
+        for x in [
+            -2000.0, -30.0, -1.0, -0.04, -1e-8, 0.0, 1e-8, 0.03, 0.05, 0.5, 5.0, 25.0, 2000.0,
+        ] {
+            let got = eval1(|v| v.tanh(), x);
+            let want: f64 = x.tanh();
+            assert!(got.is_finite(), "tanh({x}) = {got}");
+            let err = (got - want).abs() / want.abs().max(1e-300);
+            assert!(
+                want == 0.0 && got == 0.0 || err < 4e-15,
+                "tanh({x}): {got} vs {want}, rel {err:e}"
+            );
+        }
+    }
 
     use crate::{trace, ExprId};
 
