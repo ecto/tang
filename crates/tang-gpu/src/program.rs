@@ -230,7 +230,7 @@ fn words(b: &tang_compile::tensor::wgsl::BufferSpec) -> usize {
     .max(1)
 }
 
-fn check_plan(program: &WgslProgram, inputs: &[&[f32]], plan: &BufferPlan) {
+fn check_plan(program: &WgslProgram, inputs: &[&[f32]], plan: &BufferPlan, shared: &[usize]) {
     assert_eq!(plan.slot.len(), program.buffers.len(), "plan size");
     let mut order = plan.order.clone();
     order.sort_unstable();
@@ -240,17 +240,37 @@ fn check_plan(program: &WgslProgram, inputs: &[&[f32]], plan: &BufferPlan) {
     );
     for (i, b) in program.buffers.iter().enumerate() {
         assert!(words(b) <= plan.slot_len[plan.slot[i]], "slot too small");
-        if let Some(k) = b.input {
+        if let Some(k) = b.input.filter(|k| !shared.contains(k)) {
             assert_eq!(inputs[k].len(), b.len, "input {k} has wrong length");
         }
     }
+}
+
+/// One input of a program bound to another program's buffer instead of
+/// an allocation of its own ([`Program::with_shared`]): weights and
+/// caches shared by a prefill and a decode program.
+#[derive(Clone, Copy)]
+pub struct Shared<'a> {
+    /// Graph input of the program being built.
+    pub input: usize,
+    /// The program that owns the buffer, and its tensor.
+    pub from: &'a Program,
+    pub tensor: TensorId,
+}
+
+/// A wgpu program recorded once ([`Program::capture`]): pipelines, bind
+/// groups and uniforms built, so a run is one compute pass.
+struct WgpuRecording {
+    passes: Vec<(wgpu::ComputePipeline, wgpu::BindGroup, u32, u32)>,
 }
 
 enum Storage {
     Wgpu(Vec<GpuBuffer>),
     #[cfg(feature = "cuda")]
     Cuda {
-        slots: Vec<cudarc::driver::CudaSlice<f32>>,
+        /// Reference counted: programs over shared buffers hold the same
+        /// slots ([`Program::with_shared`]).
+        slots: Vec<std::rc::Rc<cudarc::driver::CudaSlice<f32>>>,
         functions: Vec<cudarc::driver::CudaFunction>,
         /// One captured run ([`Program::capture`]).
         graph: Option<cudarc::driver::CudaGraph>,
@@ -267,6 +287,8 @@ pub struct Program {
     args: Vec<Vec<usize>>,
     /// Kernel indices in the order [`run`](Self::run) launches them.
     order: Vec<usize>,
+    /// wgpu: the run recorded by [`capture`](Self::capture).
+    recording: Option<WgpuRecording>,
 }
 
 /// What [`Program::tuned`] did.
@@ -299,20 +321,68 @@ impl Program {
         inputs: &[&[f32]],
         plan: &BufferPlan,
     ) -> Self {
+        Self::with_shared(rt, program, inputs, plan, &[])
+    }
+
+    /// [`with_plan`](Self::with_plan) with some inputs bound to other
+    /// programs' buffers (same runtime): nothing is allocated or uploaded
+    /// for them (their `inputs` entries may be empty), and writes either
+    /// program makes — an in-place cache update — are seen by both. The
+    /// shared tensor must have the input's length and format.
+    pub fn with_shared(
+        rt: &Runtime,
+        program: WgslProgram,
+        inputs: &[&[f32]],
+        plan: &BufferPlan,
+        shared: &[Shared<'_>],
+    ) -> Self {
+        let ks: Vec<usize> = shared.iter().map(|s| s.input).collect();
+        check_plan(&program, inputs, plan, &ks);
+        // slot of this program -> (program, its slot)
+        let mut borrowed: Vec<Option<(&Program, usize)>> = vec![None; plan.slot_len.len()];
+        for sh in shared {
+            let i = program
+                .buffers
+                .iter()
+                .position(|b| b.input == Some(sh.input))
+                .expect("shared input not bound");
+            let (b, theirs) = (
+                &program.buffers[i],
+                &sh.from.program.buffers[sh.from.buffer_index(sh.tensor)],
+            );
+            assert_eq!(
+                (words(b), b.format),
+                (words(theirs), theirs.format),
+                "shared input {} differs from its buffer",
+                sh.input
+            );
+            borrowed[plan.slot[i]] = Some((sh.from, sh.from.slot_of(sh.tensor)));
+        }
+        let own = |k: usize| !ks.contains(&k);
         match rt {
-            Runtime::Wgpu { device, .. } => Self::wgpu_with_plan(device, program, inputs, plan),
+            Runtime::Wgpu { device, .. } => {
+                Self::wgpu_with_plan(device, program, inputs, plan, &borrowed, &own)
+            }
             #[cfg(feature = "cuda")]
             Runtime::Cuda(d) => {
-                check_plan(&program, inputs, plan);
-                let mut slots: Vec<_> = plan
+                use std::rc::Rc;
+                let mut slots: Vec<Rc<_>> = plan
                     .slot_len
                     .iter()
-                    .map(|&n| d.stream.alloc_zeros::<f32>(n).expect("alloc"))
+                    .zip(&borrowed)
+                    .map(|(&n, b)| match b {
+                        Some((p, s)) => match &p.storage {
+                            Storage::Cuda { slots, .. } => slots[*s].clone(),
+                            _ => panic!("programs on different backends"),
+                        },
+                        None => Rc::new(d.stream.alloc_zeros::<f32>(n).expect("alloc")),
+                    })
                     .collect();
                 for (i, b) in program.buffers.iter().enumerate() {
-                    if let Some(k) = b.input {
+                    if let Some(k) = b.input.filter(|&k| own(k)) {
                         let host = pack_words(b.format, inputs[k]);
-                        let mut view = slots[plan.slot[i]].slice_mut(0..host.len());
+                        let slot = Rc::get_mut(&mut slots[plan.slot[i]]).expect("own slot");
+                        let mut view = slot.slice_mut(0..host.len());
                         d.stream.memcpy_htod(&host[..], &mut view).expect("upload");
                     }
                 }
@@ -349,7 +419,9 @@ impl Program {
     /// [`dispatch`](Self::dispatch)).
     pub fn on_wgpu(device: &GpuDevice, program: WgslProgram, inputs: &[&[f32]]) -> Self {
         let plan = BufferPlan::identity(&program);
-        Self::wgpu_with_plan(device, program, inputs, &plan)
+        check_plan(&program, inputs, &plan, &[]);
+        let borrowed = vec![None; plan.slot_len.len()];
+        Self::wgpu_with_plan(device, program, inputs, &plan, &borrowed, &|_| true)
     }
 
     fn wgpu_with_plan(
@@ -357,15 +429,29 @@ impl Program {
         program: WgslProgram,
         inputs: &[&[f32]],
         plan: &BufferPlan,
+        borrowed: &[Option<(&Program, usize)>],
+        own: &dyn Fn(usize) -> bool,
     ) -> Self {
-        check_plan(&program, inputs, plan);
         let mut slots: Vec<GpuBuffer> = plan
             .slot_len
             .iter()
-            .map(|&n| GpuBuffer::uninit(device, n))
+            .zip(borrowed)
+            .map(|(&n, b)| match b {
+                Some((p, s)) => match &p.storage {
+                    Storage::Wgpu(slots) => GpuBuffer {
+                        buffer: slots[*s].buffer.clone(),
+                        len: slots[*s].len,
+                    },
+                    #[cfg(feature = "cuda")]
+                    _ => panic!("programs on different backends"),
+                },
+                None => GpuBuffer::uninit(device, n),
+            })
             .collect();
         for (i, b) in program.buffers.iter().enumerate() {
-            let Some(k) = b.input else { continue };
+            let Some(k) = b.input.filter(|&k| own(k)) else {
+                continue;
+            };
             let s = plan.slot[i];
             // a whole-slot input is uploaded as its own buffer, as the old
             // executor did
@@ -399,6 +485,7 @@ impl Program {
             slot: plan.slot.clone(),
             args: Vec::new(),
             order: plan.order.clone(),
+            recording: None,
         };
         p.args = p
             .program
@@ -457,7 +544,28 @@ impl Program {
     /// [`capture`](Self::capture)d).
     pub fn run(&self, rt: &Runtime) {
         match rt {
-            Runtime::Wgpu { device, cache } => self.dispatch(device, &mut cache.borrow_mut()),
+            Runtime::Wgpu { device, cache } => match &self.recording {
+                Some(rec) => {
+                    let mut cache = cache.borrow_mut();
+                    cache.flush(device);
+                    let mut enc = device
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+                    {
+                        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("tang-gpu program"),
+                            timestamp_writes: None,
+                        });
+                        for (pipe, bind, x, y) in &rec.passes {
+                            pass.set_pipeline(pipe);
+                            pass.set_bind_group(0, bind, &[]);
+                            pass.dispatch_workgroups(*x, *y, 1);
+                        }
+                    }
+                    device.queue.submit(std::iter::once(enc.finish()));
+                }
+                None => self.dispatch(device, &mut cache.borrow_mut()),
+            },
             #[cfg(feature = "cuda")]
             Runtime::Cuda(d) => {
                 if let Storage::Cuda { graph: Some(g), .. } = &self.storage {
@@ -496,7 +604,9 @@ impl Program {
 
     /// Record one run as a CUDA graph; later [`run`](Self::run)s replay
     /// it (same kernels, same slots — host writes between runs are seen).
-    /// Needs a runtime from [`Runtime::cuda_capturable`]. A no-op on wgpu.
+    /// Needs a runtime from [`Runtime::cuda_capturable`]. On wgpu: build
+    /// every kernel's pipeline, bind group and uniform once, so a run is
+    /// one command buffer with one compute pass (the kernels in order).
     pub fn capture(&mut self, rt: &Runtime) {
         #[cfg(feature = "cuda")]
         if let Runtime::Cuda(d) = rt {
@@ -524,7 +634,33 @@ impl Program {
             }
             return;
         }
-        let _ = rt;
+        #[allow(irrefutable_let_patterns)]
+        if let Runtime::Wgpu { device, cache } = rt {
+            self.recording = None;
+            let Storage::Wgpu(slots) = &self.storage else {
+                panic!("program and runtime are on different backends")
+            };
+            let mut cache = cache.borrow_mut();
+            let passes = self
+                .order
+                .iter()
+                .map(|&i| {
+                    let k = &self.program.kernels[i];
+                    let bufs: Vec<&GpuBuffer> = self.args[i].iter().map(|&s| &slots[s]).collect();
+                    let (pipe, layout) = cache.pipeline(
+                        device,
+                        &k.source,
+                        bufs.len(),
+                        &[bufs.len() - 1],
+                        k.workgroup_size,
+                    );
+                    let bind = cache.bind(device, &layout, &bufs, &[k.points, 0, 0, 0]);
+                    let groups = k.count.div_ceil(k.workgroup_size);
+                    (pipe, bind, groups.min(65535), groups.div_ceil(65535))
+                })
+                .collect();
+            self.recording = Some(WgpuRecording { passes });
+        }
     }
 
     /// Run kernel `i` only (its inputs must already be computed).
@@ -572,7 +708,7 @@ impl Program {
         };
         let mut launch = d.stream.launch_builder(&functions[i]);
         for &s in &self.args[i] {
-            launch.arg(&slots[s]);
+            launch.arg(&*slots[s]);
         }
         launch.arg(&k.points);
         unsafe { launch.launch(cfg) }.expect("launch");

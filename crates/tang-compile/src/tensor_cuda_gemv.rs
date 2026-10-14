@@ -87,6 +87,13 @@ impl Packing {
     }
 }
 
+/// Which backend a decode lowering spells its kernels for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DecodeTarget {
+    Cuda,
+    Msl,
+}
+
 /// Options of [`TensorGraph::to_cuda_decode`].
 #[derive(Clone, Debug, Default)]
 pub struct DecodeOpts {
@@ -131,6 +138,9 @@ enum Val {
         out: ExprId,
         args: Vec<Val>,
     },
+    /// A value already computed into a variable (an inlined reduction
+    /// of an in-place update, evaluated before the body).
+    Var(String),
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -150,13 +160,13 @@ struct Cond {
     rt: Vec<(f64, usize)>,
 }
 
-struct Kernel {
-    source: String,
-    threads: usize,
-    blocks: usize,
+pub(super) struct Kernel {
+    pub source: String,
+    pub threads: usize,
+    pub blocks: usize,
 }
 
-const PRELUDE: &str = r#"#define select(f, t, c) ((c) ? (t) : (f))
+pub(super) const PRELUDE: &str = r#"#define select(f, t, c) ((c) ? (t) : (f))
 __device__ __forceinline__ float tang_u4(const float* b, int a) {
     unsigned q = (__ldg((const unsigned*)b + (a >> 3)) >> ((a & 7) * 4)) & 15u;
     return __uint_as_float(0x4b000000u | q) - 8388608.0f;
@@ -192,6 +202,19 @@ impl TensorGraph {
     /// in-place updates (see the module docs); everything else WGSL
     /// transpiled. Buffers of packed inputs are sized in words.
     pub fn to_cuda_decode(&self, outputs: &[TensorId], opts: &DecodeOpts) -> DecodeProgram {
+        self.to_decode(outputs, opts, DecodeTarget::Cuda)
+    }
+
+    /// The decode lowering for `target`: the kernels are generated once
+    /// (in CUDA spelling) and transliterated for Metal
+    /// (`tensor_msl_gemv.rs`); kernels with no lowering here stay WGSL
+    /// on Metal and are transpiled on CUDA.
+    pub(super) fn to_decode(
+        &self,
+        outputs: &[TensorId],
+        opts: &DecodeOpts,
+        target: DecodeTarget,
+    ) -> DecodeProgram {
         let mut program = self.to_program_numbered(outputs, Target::Wgsl);
         let input_node = |k: usize| {
             (0..self.nodes.len())
@@ -230,6 +253,9 @@ impl TensorGraph {
                 if !opts.mma || reads.iter().any(|j| packed.contains_key(j)) {
                     return None;
                 }
+                if target == DecodeTarget::Msl {
+                    return super::msl_gemv::mma_kernel(self, root, &reads);
+                }
                 let shape = super::cuda::MMA_SHAPES[opts.mma_shape % super::cuda::MMA_SHAPES.len()];
                 let source = self.cuda_mma_kernel_shaped(root, &reads, shape)?;
                 let define = |name: &str| -> usize {
@@ -254,7 +280,18 @@ impl TensorGraph {
             };
             match got {
                 Some(kern) => {
-                    k.source = kern.source;
+                    k.source = match target {
+                        DecodeTarget::Cuda => kern.source,
+                        DecodeTarget::Msl => {
+                            // Metal binds the donor once, read-write, as
+                            // `out` (wgpu refuses one buffer bound both ways)
+                            if let Some(d) = donor {
+                                k.reads.retain(|t| t.index() != d);
+                            }
+                            let kept: Vec<usize> = k.reads.iter().map(|t| t.index()).collect();
+                            super::msl_gemv::transliterate(&kern.source, &kept, donor)
+                        }
+                    };
                     k.workgroup_size = kern.threads as u32;
                     k.count = (kern.blocks * kern.threads) as u32;
                     native.push(true);
@@ -270,7 +307,9 @@ impl TensorGraph {
                         donor.is_none(),
                         "to_cuda_decode: in-place output is not a predicated update"
                     );
-                    k.source = super::cuda::wgsl_to_cuda(&k.source, k.workgroup_size);
+                    if target == DecodeTarget::Cuda {
+                        k.source = super::cuda::wgsl_to_cuda(&k.source, k.workgroup_size);
+                    }
                     native.push(false);
                 }
             }
@@ -566,7 +605,9 @@ impl Lowering<'_> {
         })
     }
 
-    /// `e` of `body` (vars: `args`) as an affine condition.
+    /// `e` of `body` (vars: `args`) as an affine condition. A runtime
+    /// scalar is a leaf whose address depends on none of the coordinates
+    /// `pk..` (the reduce coords): it is loaded once per point.
     fn cond(
         &self,
         body: &ExprGraph,
@@ -574,6 +615,7 @@ impl Lowering<'_> {
         args: &[Val],
         leaves: &[Leaf],
         rank: usize,
+        pk: usize,
     ) -> Option<Cond> {
         let nodes = body.nodes_slice();
         let lit = |e: ExprId| nodes[e.index() as usize].as_f64();
@@ -599,25 +641,25 @@ impl Lowering<'_> {
                     konst: f.offset as f64,
                     rt: Vec::new(),
                 }),
-                Val::Leaf(i) if leaves[*i].addr.coefs.iter().all(|&c| c == 0) => Some(Cond {
+                Val::Leaf(i) if leaves[*i].addr.coefs[pk..].iter().all(|&c| c == 0) => Some(Cond {
                     rt: vec![(1.0, *i)],
                     ..zero()
                 }),
-                Val::Map { body, out, args } => self.cond(body, *out, args, leaves, rank),
+                Val::Map { body, out, args } => self.cond(body, *out, args, leaves, rank, pk),
                 _ => None,
             },
             Node::Add(x, y) => {
-                let mut a = self.cond(body, x, args, leaves, rank)?;
-                let b = self.cond(body, y, args, leaves, rank)?;
+                let mut a = self.cond(body, x, args, leaves, rank, pk)?;
+                let b = self.cond(body, y, args, leaves, rank, pk)?;
                 a.konst += b.konst;
                 a.coefs.iter_mut().zip(&b.coefs).for_each(|(p, q)| *p += q);
                 a.rt.extend(b.rt);
                 Some(a)
             }
-            Node::Neg(x) => Some(scale(self.cond(body, x, args, leaves, rank)?, -1.0)),
+            Node::Neg(x) => Some(scale(self.cond(body, x, args, leaves, rank, pk)?, -1.0)),
             Node::Mul(x, y) => match (lit(x), lit(y)) {
-                (Some(k), _) => Some(scale(self.cond(body, y, args, leaves, rank)?, k)),
-                (_, Some(k)) => Some(scale(self.cond(body, x, args, leaves, rank)?, k)),
+                (Some(k), _) => Some(scale(self.cond(body, y, args, leaves, rank, pk)?, k)),
+                (_, Some(k)) => Some(scale(self.cond(body, x, args, leaves, rank, pk)?, k)),
                 _ => None,
             },
             _ => None,
@@ -629,13 +671,12 @@ impl Lowering<'_> {
         let mut e = flit(c.konst);
         for (k, i) in &c.rt {
             let l = &leaves[*i];
-            write!(
-                e,
-                " + {} * {}",
-                flit(*k),
-                load(l.buf, l.pack, &format!("{}", l.addr.offset))
-            )
-            .unwrap();
+            let a = if l.addr.coefs.iter().all(|&c| c == 0) {
+                format!("{}", l.addr.offset)
+            } else {
+                addr_expr(&l.addr, coords)
+            };
+            write!(e, " + {} * {}", flit(*k), load(l.buf, l.pack, &a)).unwrap();
         }
         for &d in dims {
             if c.coefs[d] != 0.0 {
@@ -656,6 +697,7 @@ impl Lowering<'_> {
         leaf: &dyn Fn(usize) -> String,
     ) -> String {
         match v {
+            Val::Var(name) => name.clone(),
             Val::Leaf(i) => leaf(*i),
             Val::Iota(f) => format!("(float)({})", form_expr(f, coords)),
             Val::Map { body, out, args } => {
@@ -717,27 +759,46 @@ impl Lowering<'_> {
             .collect::<Option<Vec<_>>>()?;
         let nodes = rc.body.nodes_slice();
 
-        // runtime bounds: body `select(cond, x, identity)`
-        let mut point_cond: Option<Cond> = None;
+        // runtime bounds: body `select(c₁, select(c₂, …x…, id), id)` with
+        // `id` the identity — every `cᵢ` on that chain: those over point
+        // coords skip a point, one bounding the (single) reduce coord
+        // from above and one from below set the loop bounds
+        let mut point_conds: Vec<Cond> = Vec::new();
         let mut red_cond: Option<Cond> = None;
+        let mut red_lo: Option<Cond> = None;
         if w == 1 {
-            if let Node::Select(cnd, _, f) = nodes[rc.body_outs[0].index() as usize] {
-                if nodes[f.index() as usize]
+            let mut e = rc.body_outs[0];
+            while let Node::Select(cnd, t, f) = nodes[e.index() as usize] {
+                if !nodes[f.index() as usize]
                     .as_f64()
                     .is_some_and(|v| is_identity_lit(monoid, 0, v))
                 {
-                    if let Some(cd) = self.cond(&rc.body, cnd, &args, &leaves, rank) {
-                        let red_dims: Vec<usize> =
-                            (pk..rank).filter(|&d| cd.coefs[d] != 0.0).collect();
-                        if red_dims.is_empty() {
-                            point_cond = Some(cd);
-                        } else if red_dims == [rank - 1] && red.len() == 1 {
-                            red_cond = Some(cd);
+                    break;
+                }
+                if let Some(cd) = self.cond(&rc.body, cnd, &args, &leaves, rank, pk) {
+                    let red_dims: Vec<usize> = (pk..rank).filter(|&d| cd.coefs[d] != 0.0).collect();
+                    if red_dims.is_empty() {
+                        point_conds.push(cd);
+                    } else if red_dims == [rank - 1] && red.len() == 1 {
+                        let slot = if cd.coefs[rank - 1] < 0.0 {
+                            &mut red_cond
+                        } else {
+                            &mut red_lo
+                        };
+                        if slot.is_none() {
+                            *slot = Some(cd);
                         }
                     }
                 }
+                e = t;
             }
         }
+        // (the first bound found keeps its old name: `hi` or `lo`)
+        let (red_cond, red_lo) = match (red_cond, red_lo) {
+            (None, lo) => (lo, None),
+            (hi, lo) => (hi, lo),
+        };
+        let point_cond = point_conds.first().cloned();
 
         // vector width along the inner reduce dim
         let kin = rank - 1;
@@ -787,10 +848,20 @@ impl Lowering<'_> {
         // the GEMV rows
         let heaviest = (0..leaves.len()).max_by_key(|&i| numel(&g.nodes[leaves[i].buf].shape));
         let mut reg: Option<(usize, usize)> = None;
+        // a bound may not depend on the register dim (it is per group)
+        let free = |d: usize| {
+            point_conds
+                .iter()
+                .chain(&red_cond)
+                .chain(&red_lo)
+                .all(|cd| {
+                    cd.coefs[d] == 0.0 && cd.rt.iter().all(|&(_, i)| leaves[i].addr.coefs[d] == 0)
+                })
+        };
         if let Some(h) = heaviest {
             let hl = &leaves[h];
             reg = (0..pk)
-                .filter(|&d| (2..=8).contains(&pts[d]) && hl.addr.coefs[d] == 0)
+                .filter(|&d| (2..=8).contains(&pts[d]) && hl.addr.coefs[d] == 0 && free(d))
                 .max_by_key(|&d| pts[d])
                 .map(|d| (d, pts[d]));
             if reg.is_none() {
@@ -802,17 +873,24 @@ impl Lowering<'_> {
                 reg = (0..pk)
                     .rev()
                     .find(|&d| pts[d] > 1)
-                    .filter(|&d| rows > 1 && pts[d].is_multiple_of(rows) && hl.addr.coefs[d] != 0)
+                    .filter(|&d| {
+                        rows > 1 && pts[d].is_multiple_of(rows) && hl.addr.coefs[d] != 0 && free(d)
+                    })
                     .map(|d| (d, rows));
             }
         }
         let rt = reg.map_or(1, |r| r.1);
-        if point_cond
-            .as_ref()
-            .is_some_and(|cd| reg.is_some_and(|(d, _)| cd.coefs[d] != 0.0))
-            || red_cond
-                .as_ref()
-                .is_some_and(|cd| reg.is_some_and(|(d, _)| cd.coefs[d] != 0.0))
+        let on_reg = |cd: &Cond| reg.is_some_and(|(d, _)| cd.coefs[d] != 0.0);
+        // a runtime scalar of a bound is loaded per point group: it may not
+        // vary along the register dim
+        let rt_on_reg = |cd: &Cond| {
+            reg.is_some_and(|(d, _)| cd.rt.iter().any(|&(_, i)| leaves[i].addr.coefs[d] != 0))
+        };
+        if point_conds
+            .iter()
+            .chain(&red_cond)
+            .chain(&red_lo)
+            .any(|cd| on_reg(cd) || rt_on_reg(cd))
         {
             return None;
         }
@@ -828,7 +906,7 @@ impl Lowering<'_> {
         let ks = if groups < 512 { 8.max(warps) } else { 1 };
         let threads = if ks > 1 { 32 * ks } else { 32 * warps };
         let gpb = threads / 32 / ks;
-        let blocks = if point_cond.is_some() && ks == 1 {
+        let blocks = if !point_conds.is_empty() && ks == 1 {
             // a grid-stride loop over the live groups
             groups.div_ceil(gpb).min(2048)
         } else {
@@ -876,8 +954,14 @@ impl Lowering<'_> {
         // loop stops at the bound
         let dyn_dim = point_cond.as_ref().and_then(|cd| {
             let dims: Vec<usize> = (0..pk).filter(|&d| cd.coefs[d] != 0.0).collect();
+            let constant_rt = cd
+                .rt
+                .iter()
+                .all(|&(_, i)| leaves[i].addr.coefs.iter().all(|&c| c == 0));
             match dims[..] {
-                [d] if cd.coefs[d] < 0.0 && ks == 1 => Some(d),
+                [d] if cd.coefs[d] < 0.0 && ks == 1 && point_conds.len() == 1 && constant_rt => {
+                    Some(d)
+                }
                 _ => None,
             }
         });
@@ -956,9 +1040,17 @@ impl Lowering<'_> {
         let pt_dims: Vec<usize> = (0..pk).collect();
         let mut lo_chunk = "0".to_string();
         let mut hi_chunk = format!("{n_chunks}");
-        if let Some(cd) = &point_cond {
-            let e = self.cond_base(cd, &leaves, &pt_dims, &coords);
-            writeln!(s, "    const bool live = ({e}) > 0.0f;").unwrap();
+        if !point_conds.is_empty() {
+            let all: Vec<String> = point_conds
+                .iter()
+                .map(|cd| {
+                    format!(
+                        "({}) > 0.0f",
+                        self.cond_base(cd, &leaves, &pt_dims, &coords)
+                    )
+                })
+                .collect();
+            writeln!(s, "    const bool live = {};", all.join(" && ")).unwrap();
         } else {
             writeln!(s, "    const bool live = true;").unwrap();
         }
@@ -983,6 +1075,18 @@ impl Lowering<'_> {
                 .unwrap();
                 lo_chunk = format!("(lo / {vec})");
             }
+        }
+        if let Some(cd) = &red_lo {
+            // the second bound, from below (the first was from above)
+            let a = cd.coefs[kin];
+            let base = self.cond_base(cd, &leaves, &pt_dims, &coords);
+            writeln!(
+                s,
+                "    const int lo = min({ri}, max(0, (int)floorf(-({base}) / {}) + 1));",
+                flit(a)
+            )
+            .unwrap();
+            lo_chunk = format!("(lo / {vec})");
         }
         writeln!(s, "    if (live) {{").unwrap();
         if self.opts.unroll > 1 {
@@ -1337,12 +1441,64 @@ impl Lowering<'_> {
         }
         let pts = fixed(c.points());
         let pk = pts.len();
+        // an inlined reduction over one coord, read point for point (the
+        // one-hot sum that picks a chunk's token for each cache row): a
+        // loop at every point, with runtime bounds from its body's
+        // `select(cond, x, identity)` chain; its coord follows the points
+        let red_arg = c.args.iter().position(|a| {
+            let p = a.src.n();
+            g.nodes[p].inline && g.comp_at(p).is_some_and(|pc| pc.monoid.is_some())
+        });
+        let red = match red_arg {
+            Some(ai) => {
+                let p = c.args[ai].src.n();
+                let rc = g.comp_at(p)?;
+                let one = c.args.iter().filter(|a| a.src.n() == p).count() == 1;
+                if !one
+                    || rc.red.len() != 1
+                    || rc.width() != 1
+                    || rc.tuple != 0
+                    || rc.points().len() != pk
+                    || c.args[ai].view != super::View::identity(pk, pk)
+                {
+                    return None;
+                }
+                Some((ai, rc))
+            }
+            None => None,
+        };
+        let rank = pk + usize::from(red.is_some());
+        // the in-place map's args over `rank` coords (none on the loop's)
+        let widen = |a: &Arg| {
+            let mut a = a.clone();
+            for f in &mut a.view.forms {
+                f.coefs.resize(rank, 0);
+            }
+            a
+        };
         let mut leaves = Vec::new();
         let args = c
             .args
             .iter()
-            .map(|a| self.tree(a, pk, &mut leaves))
+            .enumerate()
+            .map(|(ai, a)| {
+                if red.is_some_and(|(r, _)| r == ai) {
+                    Some(Val::Var(String::new()))
+                } else {
+                    self.tree(&widen(a), rank, &mut leaves)
+                }
+            })
             .collect::<Option<Vec<_>>>()?;
+        // the reduction's args are over its own space: the points, then its coord
+        let red_args = match red {
+            Some((_, rc)) => Some(
+                rc.args
+                    .iter()
+                    .map(|a| self.tree(a, rank, &mut leaves))
+                    .collect::<Option<Vec<_>>>()?,
+            ),
+            None => None,
+        };
         let nodes = c.body.nodes_slice();
         let is_old = |e: ExprId| match nodes[e.index() as usize] {
             Node::Var(v) => {
@@ -1357,7 +1513,7 @@ impl Lowering<'_> {
             if !is_old(f) {
                 break;
             }
-            conds.push(self.cond(&c.body, cnd, &args, &leaves, pk)?);
+            conds.push(self.cond(&c.body, cnd, &args, &leaves, rank, pk)?);
             e = t;
         }
         if conds.is_empty() {
@@ -1368,6 +1524,34 @@ impl Lowering<'_> {
             .filter(|&d| conds.iter().any(|cd| cd.coefs[d] != 0.0))
             .collect();
         let [dp] = dims[..] else { return None };
+        // the bounds are computed before the loop over `dp`
+        if conds
+            .iter()
+            .any(|cd| cd.rt.iter().any(|&(_, i)| leaves[i].addr.coefs[dp] != 0))
+        {
+            return None;
+        }
+        // the reduction's loop bounds: lo ≤ x < hi from its select chain
+        let mut red_bounds: Vec<Cond> = Vec::new();
+        if let (Some((_, rc)), Some(ra)) = (red, &red_args) {
+            let monoid = rc.monoid.as_ref().unwrap();
+            let rn = rc.body.nodes_slice();
+            let mut e = rc.body_outs[0];
+            while let Node::Select(cnd, t, f) = rn[e.index() as usize] {
+                if !rn[f.index() as usize]
+                    .as_f64()
+                    .is_some_and(|v| is_identity_lit(monoid, 0, v))
+                {
+                    break;
+                }
+                if let Some(cd) = self.cond(&rc.body, cnd, ra, &leaves, rank, pk) {
+                    if cd.coefs[pk] != 0.0 {
+                        red_bounds.push(cd);
+                    }
+                }
+                e = t;
+            }
+        }
         // a 16-bit output: a thread writes whole words — two neighbours
         // along the innermost dim, or (when that is the bounded dim, whose
         // points are all this thread's) one half by read-modify-write
@@ -1420,7 +1604,7 @@ impl Lowering<'_> {
             writeln!(s, "    const int p{d} = (({rem}) % {}){mul};", extent(d)).unwrap();
             rem = format!("({rem}) / {}", extent(d));
         }
-        let coords: Vec<String> = (0..pk).map(|d| format!("p{d}")).collect();
+        let coords: Vec<String> = (0..rank).map(|d| format!("p{d}")).collect();
         let others: Vec<usize> = (0..pk).filter(|&d| d != dp).collect();
         writeln!(s, "    int lo = 0, hi = {};", pts[dp]).unwrap();
         for cd in &conds {
@@ -1439,14 +1623,66 @@ impl Lowering<'_> {
         }
         writeln!(s, "    for (int p{dp} = lo; p{dp} < hi; p{dp}++) {{").unwrap();
         let mut ctr = 0usize;
+        let all_pts: Vec<usize> = (0..pk).collect();
         let mut value = |s: &mut String, coords: &[String], prefix: &str| {
             let el = |i: usize| {
                 let l: &Leaf = &leaves[i];
                 load(l.buf, l.pack, &addr_expr(&l.addr, coords))
             };
+            // the inlined reduction first, as a loop over its coord
+            let red_val = match (red, &red_args) {
+                (Some((_, rc)), Some(ra)) => {
+                    let monoid = rc.monoid.as_ref().unwrap();
+                    let acc = format!("{prefix}r");
+                    let ind = "            ";
+                    writeln!(s, "        float {acc} = {};", flit(monoid.identity[0])).unwrap();
+                    writeln!(s, "        {{").unwrap();
+                    writeln!(s, "        int rlo = 0, rhi = {};", rc.red[0].n()).unwrap();
+                    for cd in &red_bounds {
+                        let a = cd.coefs[pk];
+                        let base = self.cond_base(cd, &leaves, &all_pts, coords);
+                        if a < 0.0 {
+                            writeln!(
+                                s,
+                                "        rhi = min(rhi, (int)ceilf(({base}) / {}));",
+                                flit(-a)
+                            )
+                            .unwrap();
+                        } else {
+                            writeln!(
+                                s,
+                                "        rlo = max(rlo, (int)floorf(-({base}) / {}) + 1);",
+                                flit(a)
+                            )
+                            .unwrap();
+                        }
+                    }
+                    writeln!(s, "        for (int p{pk} = rlo; p{pk} < rhi; p{pk}++) {{").unwrap();
+                    let rv: Vec<String> = ra
+                        .iter()
+                        .map(|a| self.emit_val(s, a, coords, ind, &mut ctr, &el))
+                        .collect();
+                    let x = emit(
+                        s,
+                        &rc.body,
+                        &rc.body_outs,
+                        &format!("{prefix}e_"),
+                        ind,
+                        &|v| rv[v as usize].clone(),
+                    );
+                    self.combine(s, monoid, 1, ind, |_| acc.clone(), &x);
+                    writeln!(s, "        }}").unwrap();
+                    writeln!(s, "        }}").unwrap();
+                    Some(acc)
+                }
+                _ => None,
+            };
             let vals: Vec<String> = args
                 .iter()
-                .map(|a| self.emit_val(s, a, coords, "        ", &mut ctr, &el))
+                .map(|a| match a {
+                    Val::Var(_) => red_val.clone().unwrap(),
+                    _ => self.emit_val(s, a, coords, "        ", &mut ctr, &el),
+                })
                 .collect();
             emit(s, &c.body, &[e], prefix, "        ", &|v| {
                 vals[v as usize].clone()
