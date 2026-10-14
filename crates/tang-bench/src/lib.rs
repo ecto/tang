@@ -263,6 +263,8 @@ pub mod ir_control;
 #[cfg(feature = "metal")]
 #[path = "ir_msl.rs"]
 pub mod ir_msl;
+#[path = "ir_qwen.rs"]
+pub mod ir_qwen;
 
 /// Precision search through `tang_gpu::program::Program` (CUDA or wgpu).
 #[path = "ir_precision.rs"]

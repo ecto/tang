@@ -43,6 +43,8 @@ use tang_expr::{trace, ExprGraph, ExprId, Node};
 pub mod c;
 #[path = "tensor_cuda.rs"]
 pub mod cuda;
+#[path = "tensor_cuda_gemv.rs"]
+pub mod cuda_gemv;
 #[path = "tensor_grad.rs"]
 mod grad;
 #[path = "tensor_memplan.rs"]
