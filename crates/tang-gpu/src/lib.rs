@@ -65,6 +65,8 @@
 
 pub mod backward;
 pub mod buffer;
+/// CPU runtime: `to_c` compiled by the system compiler and `dlopen`ed.
+pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 /// The driver bindings tang-gpu's CUDA backend is built on, for code that

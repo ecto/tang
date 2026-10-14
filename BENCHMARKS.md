@@ -2091,3 +2091,119 @@ split six short reductions across more groups. Wall times are dominated
 by the 0.1–0.6 ms submit-and-wait floor and vary by ±0.2 ms from run to
 run, so fused versus unfused wall time is not resolved at batch 1. The
 latency conclusion above still holds.
+
+## CPU backend: `to_c` on the Booster K1's Cortex-X3 (and the M4)
+
+`to_c` turns a program into one C file (`docs/tensor-ir.md`, "CPU backend
+(C)"). `cargo run --release -p tang-bench --example cpu_export -- export
+ROOT` writes the cases. On the robot, `tools/cpu-runner/run_all.sh ROOT 7`
+builds each one with gcc 11.4 (`-O3 -march=armv8.6-a+fp16+fp16fml
+-mtune=cortex-x1`; gcc 11 knows neither the X3 nor the A715) and runs it.
+`cpu_export check ROOT` then compares the results with the f64 `eval` on
+the Mac.
+
+Each run is single-threaded, pinned with `sched_setaffinity` to cpu7, the
+QCS8550's one Cortex-X3 (3.19 GHz). It is `nice -n 10` and back to back:
+`tang_run()` is timed with `CLOCK_MONOTONIC` around every step, after a
+warm-up of up to 500 steps / 0.5 s. A run is capped at 4 s, and the script
+waits for the hottest thermal zone to be ≤ 78 °C before each one. Vendor
+services kept load at 6–16 and cpu7 about 22% busy. `SCHED_FIFO` works
+without root on this image (`TANG_FIFO=1`), so it was used only for short
+batch-1 runs (≤ 0.35 s). In longer runs RT throttling stalls the task for
+~50–100 ms once a second, and it would starve whatever else is on the
+core.
+
+Inputs are uniform in ±0.2. The GRU is ipse-world's `GruCell` (obs 64,
+hidden 256, PyTorch gate convention). The MLP is a locomotion-style
+policy: 64 → 256 → 256 → 12, ELU. All times are µs per step.
+
+**Batch 1, `SCHED_FIFO`, 10 000 steps**
+
+| case | min | median | p99 | p99.9 | max | rel err vs f64 |
+|---|---|---|---|---|---|---|
+| GRU step (1 kernel) | 19.5 | **22.5** | 36.6 | 48.7 | 62 | 1.8e-7 |
+| GRU, f16 storage | 28.4 | 30.9 | 40.7 | 61.3 | 89 | 4.1e-4 |
+| GRU, `grufused` graph | 25.3 | 30.9 | 56.8 | 68.3 | 132 | 1.8e-7 |
+| MLP policy (3 kernels) | 5.8 | **6.7** | 12.7 | 25.7 | 57 | 5.5e-7 |
+| MLP, f16 storage | 10.1 | 10.5 | 16.5 | 30.9 | 58 | 3.7e-5 |
+
+A second FIFO pass under heavier vendor load (load 16) gave GRU 20.2 /
+23.9 / 36.8 / 49.8 and MLP 5.9 / 7.0 / 10.8 / 17.3 (min / median / p99 /
+p99.9).
+
+**Batch 1, `SCHED_OTHER` (niced), 20 000 steps, load 6–11**
+
+| case | min | median | p99 | p99.9 | max |
+|---|---|---|---|---|---|
+| GRU step | 19.3 | 22.8 | 81.5 | 318 | 11 209 |
+| MLP policy | 5.8 | 6.5 | 35.3 | 83 | 455 |
+
+The niced tail is scheduling: the vendor processes preempt a nice-10 task
+for up to 11 ms. The FIFO rows are what a real-time control thread sees.
+
+**Against the hand-written loop and the other devices (GRU, batch 1)**
+
+| | min | median | p99 | p99.9 |
+|---|---|---|---|---|
+| `to_c`, X3, FIFO | 19.5 | **22.5** | 36.6 | 48.7 |
+| naive C, dot per output (strided `W` column), X3 | 226 | 263 | 503 | 772 |
+| naive C, k outside j (row of `W` inner, vectorized), X3 | 25.5 | 30.8 | 79.7 | 287 |
+| `to_c`, M4 (P-core, no pinning), f32 / f16 storage | 10 / 8 | 15 / 9 | 20 / 12 | 28 / 21 |
+| Adreno 740, tuned, f16 storage (#59): device time | | 86 | | |
+| Adreno 740, same: wall (enqueue + finish), min of 20 | 267 | | | |
+| Adreno 740 submit-and-wait floor (`launch.c`) | 109–200 | 380–606 | p95 900–1570 | |
+
+The M4 GRU numbers are from a quiet run. Later runs on the loaded Mac
+were 1.5–2× slower (see the host notes). The naive loops are checked too:
+1.8e-7, the same as `to_c`.
+
+**Batch 64 and the block (single core)**
+
+| case | `to_c`, X3 | `to_c`, M4 | Adreno 740 (#59) |
+|---|---|---|---|
+| GRU step, batch 64 | 1.34 ms median (1.06 min, FIFO); 1.8–2.8 ms niced at load 7–16 | 0.46 ms | 0.42 ms device, 0.95 ms wall |
+| MLP policy, batch 64 | 0.43 ms median (FIFO); 0.54–0.84 ms niced | 0.32 ms | — |
+| block forward, seq 128 (no flash; 20 kernels) | 50–66 ms | 30 ms | **6.13 ms** (tuned) |
+| block forward, seq 128, GPU pass order (flash) | 84–113 ms | 50 ms | 6.13 ms |
+
+All cases agree with the f64 `eval`: 2.0e-7 (GRU b64), 2.9e-7 (MLP b64),
+8.0e-7 (block), and 4e-4 / 8e-4 with f16 storage.
+
+What the numbers say:
+- **Batch-1 control belongs on the CPU.** One X3 core runs the GRU
+  world-model step in 22 µs and the policy in 7 µs, with a FIFO p99.9 of
+  49 µs and 26 µs. A 1 kHz tick (1000 µs) has a 20× margin for both
+  together. The Adreno spends 86 µs of device time on the same GRU step,
+  and its submit-and-wait alone has a median of 380–606 µs, with a p95
+  above 1 ms.
+- **The lowering beats the hand-written loop.** It is 12× faster than
+  the textbook dot product and 1.35× faster than a cache-friendly
+  hand-written loop. It comes from the IR with no GRU-specific code.
+- **Batched rollouts and the transformer belong on the GPU**, off the
+  control thread. GRU batch 64 takes 1.3 ms on one X3 core against 0.42
+  ms of Adreno device time. The seq-128 block takes 50–66 ms against
+  6.13 ms. The CPU lowering is register-blocked GEMM at ~15–20
+  GFLOP/s, with no cache tiling and no threads.
+- **f16 storage is slower on the X3.** With gcc 11 the `__fp16 → f32`
+  widening costs more than the halved bytes save, even though the f16 GRU
+  (0.5 MB) fits the X3's 1 MB L2 and the f32 one (0.98 MB) does not quite.
+  On the M4 it helps (15 → 9 µs). f16 arithmetic (`fmla .8h`) was not tried.
+- **Register block size is device-dependent.** The batch-64 GRU is
+  1.34 ms with a 128-float accumulator block, 1.5–1.8 ms at 64 and 1.66
+  ms at 32. Batch 1 is fastest at 64 floats (the defaults now). gcc 11
+  spills the 64-float block when unrolling: the inner loop reloads the
+  `W` pointers from the stack.
+- The `grufused` graph (one guarded reduction over `obs + hidden`) is
+  slower on the CPU (31 vs 22 µs at batch 1, 10–20 ms vs 1.3–2.8 ms at
+  batch 64). Its guards sit in the inner loop and its 4-wide tuple state
+  shrinks the vector chunk. The plain graph already fuses to one kernel
+  on the CPU.
+
+Thermals and load: idle the hottest zone sits at 73–76 °C. A 4 s run on
+the X3 takes it to 80–86 °C (89 °C once, with the vendor stack also busy).
+So the script cools to ≤ 78 °C before every run. Each run is one core for
+≤ 4.5 s, so the 1-minute load moved only with the vendor stack: 6–11 for
+most runs, and 15–16 near the end, when vendor processes (`motion`,
+`hippocampus`, `optic`, …) were busier. `~/tang-probe/cpu/` was 66 MB
+during the runs. The cases were deleted afterwards, and only the runner
+sources remain.
