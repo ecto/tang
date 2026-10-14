@@ -406,6 +406,45 @@ fn device_words(dg: &DecodeGraph, logical: &[Vec<f32>]) -> Vec<Vec<f32>> {
         .collect()
 }
 
+/// `QWEN_LOAD_DUTY` (0..1, unset = 1): the fraction of wall time the
+/// checkpoint read and conversion may keep a core busy. A robot without
+/// cooling trips its thermal limit while loading at full speed.
+fn load_duty() -> f64 {
+    std::env::var("QWEN_LOAD_DUTY")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map_or(1.0, |d| d.clamp(0.01, 1.0))
+}
+
+/// Sleep so the work since `start` was `load_duty()` of the time.
+fn pace(start: Instant) {
+    let d = load_duty();
+    if d < 1.0 {
+        std::thread::sleep(start.elapsed().mul_f64(1.0 / d - 1.0));
+    }
+}
+
+/// `std::fs::read`, in 64 MB pieces paced by [`pace`].
+fn read_paced(path: &str) -> Vec<u8> {
+    use std::io::Read;
+    if load_duty() >= 1.0 {
+        return std::fs::read(path).expect("read safetensors");
+    }
+    let mut f = std::fs::File::open(path).expect("open safetensors");
+    let mut bytes = Vec::with_capacity(f.metadata().map_or(0, |m| m.len() as usize));
+    let mut buf = vec![0u8; 64 << 20];
+    loop {
+        let t = Instant::now();
+        let n = f.read(&mut buf).expect("read safetensors");
+        if n == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buf[..n]);
+        pace(t);
+    }
+    bytes
+}
+
 /// Worst relative error of `got` against `want`.
 fn rel_err(got: &[f32], want: &[f64]) -> f64 {
     let scale = want.iter().fold(0.0f64, |m, v| m.max(v.abs()));
@@ -615,7 +654,7 @@ struct St {
 
 impl St {
     fn open(path: &str) -> Self {
-        let bytes = std::fs::read(path).expect("read safetensors");
+        let bytes = read_paced(path);
         let n = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
         let header: serde_json::Value = serde_json::from_slice(&bytes[8..8 + n]).unwrap();
         let mut index = HashMap::new();
@@ -707,65 +746,72 @@ fn load_inputs(st: &St, dims: &QwenDims, dg: &DecodeGraph) -> Vec<Vec<f32>> {
         "b" => "biases",
         _ => unreachable!(),
     };
+    let one = |s: &InputSpec| -> Vec<f32> {
+        let n: usize = s.shape.iter().product();
+        let name = &s.name;
+        if name == "state" || name == "chunk" || name.ends_with("cache") {
+            return vec![0.0; s.packing.map_or(n, |p| p.words(n))];
+        }
+        if name == "rope" {
+            return rope_table(dims);
+        }
+        if name == "model.norm" {
+            return st.bf16("model.norm.weight");
+        }
+        // the embedding and LM head, whole (`embed.q`) or as row block
+        // `c` of `dims.vocab_chunks` (`embed.2.q`): rows are contiguous
+        // in the packed words
+        let block = |base: &str, rest: &str| -> Vec<f32> {
+            let (c, part) = match rest.split_once('.') {
+                Some((c, part)) => (c.parse::<usize>().ok(), part),
+                None => (None, rest),
+            };
+            let w = st.words(&format!("{base}.{}", suffix(part)));
+            match c {
+                None => w,
+                Some(c) => {
+                    let per = w.len() / dims.vocab_chunks;
+                    w[c * per..(c + 1) * per].to_vec()
+                }
+            }
+        };
+        if let Some(rest) = name.strip_prefix("lm_head.") {
+            return block("lm_head", rest);
+        }
+        if let Some(rest) = name.strip_prefix("embed.") {
+            return block("model.embed_tokens", rest);
+        }
+        // model.layers.{l}.{what}
+        let rest = name.strip_prefix("model.layers.").unwrap();
+        let (l, what) = rest.split_once('.').unwrap();
+        let pre = format!("model.layers.{l}.");
+        match what {
+            "ln1" => st.bf16(&format!("{pre}input_layernorm.weight")),
+            "ln2" => st.bf16(&format!("{pre}post_attention_layernorm.weight")),
+            "q_norm" => st.bf16(&format!("{pre}self_attn.q_norm.weight")),
+            "k_norm" => st.bf16(&format!("{pre}self_attn.k_norm.weight")),
+            _ => {
+                let (p, part) = what.split_once('.').unwrap();
+                // row-major [rows, …]: concatenating rows is
+                // concatenating the word arrays
+                let mut v = Vec::new();
+                for t in proj(p) {
+                    v.extend(st.words(&format!("{pre}{t}.{}", suffix(part))));
+                }
+                let want = s.packing.unwrap().words(n);
+                assert_eq!(v.len(), want, "{name}");
+                v
+            }
+        }
+    };
+    // QWEN_LOAD_DUTY: hold the conversion to a CPU duty cycle (a hot robot)
     dg.inputs
         .iter()
         .map(|s| {
-            let n: usize = s.shape.iter().product();
-            let name = &s.name;
-            if name == "state" || name == "chunk" || name.ends_with("cache") {
-                return vec![0.0; s.packing.map_or(n, |p| p.words(n))];
-            }
-            if name == "rope" {
-                return rope_table(dims);
-            }
-            if name == "model.norm" {
-                return st.bf16("model.norm.weight");
-            }
-            // the embedding and LM head, whole (`embed.q`) or as row block
-            // `c` of `dims.vocab_chunks` (`embed.2.q`): rows are contiguous
-            // in the packed words
-            let block = |base: &str, rest: &str| -> Vec<f32> {
-                let (c, part) = match rest.split_once('.') {
-                    Some((c, part)) => (c.parse::<usize>().ok(), part),
-                    None => (None, rest),
-                };
-                let w = st.words(&format!("{base}.{}", suffix(part)));
-                match c {
-                    None => w,
-                    Some(c) => {
-                        let per = w.len() / dims.vocab_chunks;
-                        w[c * per..(c + 1) * per].to_vec()
-                    }
-                }
-            };
-            if let Some(rest) = name.strip_prefix("lm_head.") {
-                return block("lm_head", rest);
-            }
-            if let Some(rest) = name.strip_prefix("embed.") {
-                return block("model.embed_tokens", rest);
-            }
-            // model.layers.{l}.{what}
-            let rest = name.strip_prefix("model.layers.").unwrap();
-            let (l, what) = rest.split_once('.').unwrap();
-            let pre = format!("model.layers.{l}.");
-            match what {
-                "ln1" => st.bf16(&format!("{pre}input_layernorm.weight")),
-                "ln2" => st.bf16(&format!("{pre}post_attention_layernorm.weight")),
-                "q_norm" => st.bf16(&format!("{pre}self_attn.q_norm.weight")),
-                "k_norm" => st.bf16(&format!("{pre}self_attn.k_norm.weight")),
-                _ => {
-                    let (p, part) = what.split_once('.').unwrap();
-                    // row-major [rows, …]: concatenating rows is
-                    // concatenating the word arrays
-                    let mut v = Vec::new();
-                    for t in proj(p) {
-                        v.extend(st.words(&format!("{pre}{t}.{}", suffix(part))));
-                    }
-                    let want = s.packing.unwrap().words(n);
-                    assert_eq!(v.len(), want, "{name}");
-                    v
-                }
-            }
+            let t = Instant::now();
+            let v = one(s);
+            pace(t);
+            v
         })
         .collect()
 }

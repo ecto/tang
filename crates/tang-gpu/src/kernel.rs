@@ -1154,9 +1154,38 @@ impl Default for KernelCache {
     }
 }
 
-/// GLSL compute source to SPIR-V words (Vulkan 1.1), with shaderc.
+/// GLSL compute source to SPIR-V words (Vulkan 1.1), with shaderc, through
+/// the on-disk cache ([`spirv_cache_dir`]): a decode program is ~500
+/// kernels, minutes of CPU on a phone-class SoC, so each compiles once.
+/// `TANG_COMPILE_DUTY` (0..1) paces compiles that do run, for boards that
+/// overheat at full load.
 #[cfg(feature = "glsl")]
 fn compile_glsl(src: &str) -> Vec<u32> {
+    let level = if std::env::var("TANG_GLSL_OPT").as_deref() == Ok("0") {
+        shaderc::OptimizationLevel::Zero
+    } else {
+        shaderc::OptimizationLevel::Performance
+    };
+    let paths = spirv_cache_dir().map(|dir| {
+        let stem = format!("{:016x}", fnv64(&[src, "vulkan1.1", &format!("{level:?}")]));
+        (
+            dir.join(format!("{stem}.spv")),
+            dir.join(format!("{stem}.comp")),
+        )
+    });
+    if let Some((spv, comp)) = &paths {
+        if std::fs::read_to_string(comp).is_ok_and(|s| s == src) {
+            if let Ok(bytes) = std::fs::read(spv) {
+                if bytes.len() % 4 == 0 && !bytes.is_empty() {
+                    return bytes
+                        .chunks_exact(4)
+                        .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+                        .collect();
+                }
+            }
+        }
+    }
+    let t = std::time::Instant::now();
     let compiler = shaderc::Compiler::new().expect("shaderc");
     let mut opts = shaderc::CompileOptions::new().expect("shaderc options");
     opts.set_target_env(
@@ -1164,13 +1193,8 @@ fn compile_glsl(src: &str) -> Vec<u32> {
         shaderc::EnvVersion::Vulkan1_1 as u32,
     );
     // TANG_GLSL_OPT=0 hands the driver unoptimized SPIR-V
-    let level = if std::env::var("TANG_GLSL_OPT").as_deref() == Ok("0") {
-        shaderc::OptimizationLevel::Zero
-    } else {
-        shaderc::OptimizationLevel::Performance
-    };
     opts.set_optimization_level(level);
-    match compiler.compile_into_spirv(
+    let words = match compiler.compile_into_spirv(
         src,
         shaderc::ShaderKind::Compute,
         "tang.comp",
@@ -1179,7 +1203,54 @@ fn compile_glsl(src: &str) -> Vec<u32> {
     ) {
         Ok(a) => a.as_binary().to_vec(),
         Err(e) => panic!("GLSL kernel failed to compile: {e}\n{src}"),
+    };
+    if let Some((spv, comp)) = &paths {
+        if let Some(dir) = spv.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        // the binary first: a reader trusts the pair only once the source matches
+        if std::fs::write(spv, bytes).is_ok() {
+            let _ = std::fs::write(comp, src);
+        }
     }
+    if let Some(d) = std::env::var("TANG_COMPILE_DUTY")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|d| d.clamp(0.01, 1.0))
+    {
+        std::thread::sleep(t.elapsed().mul_f64(1.0 / d - 1.0));
+    }
+    words
+}
+
+/// The on-disk SPIR-V cache: `$TANG_SPIRV_CACHE`, else
+/// `$XDG_CACHE_HOME/tang/spirv` or `~/.cache/tang/spirv`; `None` (no disk
+/// cache) when `TANG_SPIRV_CACHE` is empty or there is no home.
+#[cfg(feature = "glsl")]
+pub fn spirv_cache_dir() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    match std::env::var_os("TANG_SPIRV_CACHE") {
+        Some(d) if d.is_empty() => None,
+        Some(d) => Some(PathBuf::from(d)),
+        None => std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+            .map(|c| c.join("tang/spirv")),
+    }
+}
+
+/// FNV-1a over `parts`, each followed by a 0 byte.
+#[cfg(feature = "glsl")]
+fn fnv64(parts: &[&str]) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for p in parts {
+        for b in p.bytes().chain([0]) {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    }
+    h
 }
 
 /// Without the `glsl` feature there is no GLSL compiler to hand a kernel to.
