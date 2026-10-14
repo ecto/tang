@@ -452,7 +452,7 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
                 // `pick(row, token - off)`, not `pick(row + off, token)`: the
                 // decode lowering reads a pick of the reduce index as loop
                 // bounds (one row, or none in another block) only in this form
-                move |v| vec![pick(v[4], v[3] - lit(off), v[0] * v[1] + v[2])],
+                move |v| vec![pick(v[4], v[3] + lit(-off), v[0] * v[1] + v[2])],
             )
             .unwrap();
         parts.push(xc);
@@ -508,6 +508,12 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
     let scale = 1.0 / (hd as f64).sqrt();
     let mut outputs = Vec::new();
     let mut keep = Vec::new();
+    // each block's embedding gather its own kernel: merged into one
+    // multi-output kernel, the gathers lose their runtime row bounds and
+    // read every row of every block
+    if vocab_chunks > 1 {
+        keep.extend(&parts);
+    }
     let mut x = Rows {
         src: x0,
         off: 0,
