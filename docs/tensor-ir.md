@@ -370,6 +370,50 @@ column as a point dim) recomputes its exponentials for every column, so
 the CPU pass order skips `stabilize_softmax`. There is also no f16
 arithmetic and no multi-core split.
 
+## Vulkan backend (GLSL)
+
+GPUs with neither CUDA nor Metal (the Booster K1's Adreno 740, Mali, …)
+run tang programs through wgpu's Vulkan backend. Generic kernels are WGSL
+as everywhere else. The decode lowering's tuned kernels (warp GEMVs that
+decode 4-bit weights as they load, in-place cache updates) are written in
+CUDA spelling, and Vulkan cannot take CUDA or MSL. `to_glsl_decode`
+transliterates them to GLSL 450. tang-gpu, with feature `glsl`, compiles
+the GLSL to SPIR-V with shaderc and dispatches it through wgpu's SPIR-V
+passthrough.
+
+- **Every buffer is a `uint[]`.** GLSL has no pointers, so a cast load
+  `(const float4*)(b + e)` becomes four indexed words, and float reads are
+  `uintBitsToFloat`. Packed nibbles and halves are never loaded as floats
+  first.
+- **Warps stay 32 lanes.** Adreno subgroups are 64 wide. The butterflies
+  shuffle by XOR offsets of at most 16, which stay inside an aligned run
+  of 32, so `subgroupShuffleXor` gives the same sums.
+  `examples/subgroup_probe` checks a device's layout.
+- **f16 is converted in integer ops** with round-to-nearest-even.
+  `packHalf2x16` rounds however the driver likes, and the Adreno's choice
+  biased every cached value.
+- **On Adreno, WGSL goes through GLSL too.** naga's SPIR-V for a Qwen
+  RoPE map came out wrong on the Adreno (right on NVIDIA and Metal), and
+  naga's GLSL writer plus glslang is right. That route is the default on
+  Adreno; `TANG_WGSL_VIA_GLSL=0/1` forces it off or on.
+- **Bindings top out at 128 MiB** on the Adreno, smaller than Qwen3-8B's
+  4-bit LM head (311 MB). `QwenDims::vocab_chunks` splits the embedding
+  and LM head into vocabulary blocks.
+
+On the K1, Vulkan itself needs `tools/adreno-vulkan/rnshim.c`. The vendor
+driver opens a DRM render node that the kgsl-only kernel does not have,
+and the shim answers that open with `/dev/null`. Vulkan then offers
+10.9 GiB of device memory, against OpenCL's 1 GiB.
+
+`qwen_decode tiny` on the Adreno matches the interpreter to 2.8e-6 at every
+decode position, which is the agreement CUDA, Metal and NVIDIA Vulkan
+reach. `QWEN_KEEP_ALL=POS` checks every kernel's result at decode position
+`POS`, which is how both Adreno issues were found.
+
+Not done yet: the full Qwen3-8B on the K1 (its startup trips the thermal
+limit; cooling pending), a matrix-tile prefill in GLSL (prefill uses the
+warp kernels), and timings.
+
 ## Running programs: one API, wgpu or CUDA
 
 `tang_gpu::program` runs a lowered program on whichever backend the
