@@ -6032,6 +6032,7 @@ dependencies = [
  "approx",
  "bytemuck",
  "cudarc 0.16.6",
+ "libloading",
  "pollster",
  "safetensors",
  "tang",
