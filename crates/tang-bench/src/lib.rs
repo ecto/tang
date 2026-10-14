@@ -256,6 +256,9 @@ pub fn random_spd_flat(size: usize) -> Vec<f64> {
     result
 }
 
+/// GRU world-model step and MLP policy graphs (control-loop cases).
+pub mod ir_control;
+
 /// Run tang-compile tensor graphs on the GPU, for the kernels-vs-IR benches.
 #[cfg(feature = "metal")]
 #[path = "ir_msl.rs"]

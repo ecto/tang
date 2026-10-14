@@ -38,6 +38,9 @@ use std::collections::HashMap;
 use tang::Scalar;
 use tang_expr::{trace, ExprGraph, ExprId, Node};
 
+/// Plain C for CPUs (`to_c`): comps lowered directly to loops.
+#[path = "tensor_c.rs"]
+pub mod c;
 #[path = "tensor_cuda.rs"]
 pub mod cuda;
 #[path = "tensor_grad.rs"]
