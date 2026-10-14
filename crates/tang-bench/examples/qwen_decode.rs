@@ -844,7 +844,14 @@ fn model(args: &[String]) {
     eprintln!("checkpoint read in {:.1}s", t.elapsed().as_secs_f64());
     // weights stream in one tensor at a time: converting them all first
     // would hold a second 4.6 GB copy, which the 10 GB robot swaps to zram
-    let dec = Step::new(&rt, &dims, 1, ctx, &|dg| vec![Vec::new(); dg.inputs.len()], None);
+    let dec = Step::new(
+        &rt,
+        &dims,
+        1,
+        ctx,
+        &|dg| vec![Vec::new(); dg.inputs.len()],
+        None,
+    );
     let t = Instant::now();
     for (k, v) in load_inputs(&st, &dims, &dec.dg).enumerate() {
         if !v.is_empty() {
