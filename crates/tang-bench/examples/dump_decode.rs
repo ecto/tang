@@ -15,6 +15,7 @@ fn main() {
         eps: 1e-6,
         theta: 1e4,
         kv_f16: true,
+        vocab_chunks: 1,
     };
     let dg = decode_graph(&dims);
     let (g, mut outs) = compiled_decode(&dg, true);

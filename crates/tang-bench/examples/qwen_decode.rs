@@ -254,8 +254,14 @@ impl Step {
             .write(rt, self.tensor("state"), &[tok as f32, pos as f32]);
     }
 
+    /// The full logits: block 0, then the other vocabulary blocks.
     fn logits(&self, rt: &Runtime) -> Vec<f32> {
-        self.prog.read(rt, self.outs[0])
+        let mut l = self.prog.read(rt, self.outs[0]);
+        let first = self.dg.outputs.len() + self.dg.keep.len();
+        for i in 0..self.dg.logit_chunks.len() {
+            l.extend(self.prog.read(rt, self.outs[first + i]));
+        }
+        l
     }
 
     /// Prefill: `tokens` at positions `p0..`, then `state` holds the next
@@ -340,7 +346,21 @@ fn tiny_dims() -> QwenDims {
         eps: 1e-6,
         theta: 1e4,
         kv_f16: std::env::var("TANG_KV_F32").is_err(),
+        // QWEN_VOCAB_CHUNKS=2 exercises the split embedding and LM head
+        vocab_chunks: env("QWEN_VOCAB_CHUNKS").max(1),
     }
+}
+
+/// The interpreter's `dg.outputs`, with `[0]` the full logits (every
+/// vocabulary block concatenated).
+fn eval_full(g: &TensorGraph, inputs: &[Vec<f64>], dg: &DecodeGraph) -> Vec<Vec<f64>> {
+    let all: Vec<TensorId> = dg.outputs.iter().chain(&dg.logit_chunks).copied().collect();
+    let mut res = g.eval_emulated(inputs, &all);
+    let extra: Vec<Vec<f64>> = res.split_off(dg.outputs.len());
+    for e in extra {
+        res[0].extend(e);
+    }
+    res
 }
 
 /// Random logical inputs for `dg` (caches and the step inputs zero).
@@ -472,7 +492,7 @@ fn tiny() {
         let got = dec.logits(&rt);
         let (next, npos) = dec.state(&rt);
         cpu[dg.input("state")] = vec![tok as f64, pos as f64];
-        let res = gref.eval_emulated(&cpu, &dg.outputs);
+        let res = eval_full(&gref, &cpu, &dg);
         worst = worst.max(rel_err(&got, &res[0]));
         let check_at: usize = std::env::var("QWEN_KEEP_ALL")
             .ok()
@@ -538,7 +558,7 @@ fn tiny() {
             }
         })
         .collect();
-    let res = pg.eval_emulated(&pcpu, &pre.dg.outputs);
+    let res = eval_full(&pg, &pcpu, &pre.dg);
     let perr = rel_err(&got, &res[0]);
     let mut pre_ulps = 0.0;
     // (f32 caches hold f32 arithmetic: compared through the logits)
@@ -565,7 +585,7 @@ fn tiny() {
     dec.prog.run(&rt);
     let got = dec.logits(&rt);
     cpu[dg.input("state")] = vec![next as f64, npos as f64];
-    let res = gref.eval_emulated(&cpu, &dg.outputs);
+    let res = eval_full(&gref, &cpu, &dg);
     let derr = rel_err(&got, &res[0]);
     println!("decode after the prefill: rel logit err {derr:.2e}");
     pcpu.clear();
@@ -701,11 +721,28 @@ fn load_inputs(st: &St, dims: &QwenDims, dg: &DecodeGraph) -> Vec<Vec<f32>> {
             if name == "model.norm" {
                 return st.bf16("model.norm.weight");
             }
+            // the embedding and LM head, whole (`embed.q`) or as row block
+            // `c` of `dims.vocab_chunks` (`embed.2.q`): rows are contiguous
+            // in the packed words
+            let block = |base: &str, rest: &str| -> Vec<f32> {
+                let (c, part) = match rest.split_once('.') {
+                    Some((c, part)) => (c.parse::<usize>().ok(), part),
+                    None => (None, rest),
+                };
+                let w = st.words(&format!("{base}.{}", suffix(part)));
+                match c {
+                    None => w,
+                    Some(c) => {
+                        let per = w.len() / dims.vocab_chunks;
+                        w[c * per..(c + 1) * per].to_vec()
+                    }
+                }
+            };
             if let Some(rest) = name.strip_prefix("lm_head.") {
-                return st.words(&format!("lm_head.{}", suffix(rest)));
+                return block("lm_head", rest);
             }
             if let Some(rest) = name.strip_prefix("embed.") {
-                return st.words(&format!("model.embed_tokens.{}", suffix(rest)));
+                return block("model.embed_tokens", rest);
             }
             // model.layers.{l}.{what}
             let rest = name.strip_prefix("model.layers.").unwrap();
@@ -767,6 +804,16 @@ fn model(args: &[String]) {
     let mut dims = QwenDims::qwen3_8b(ctx);
     dims.kv_f16 = std::env::var("TANG_KV_F32").is_err();
     let rt = runtime();
+    // a 311 MB 4-bit LM head exceeds Vulkan's 128 MiB storage binding on
+    // the Adreno: four blocks of the vocabulary there (QWEN_VOCAB_CHUNKS
+    // overrides)
+    dims.vocab_chunks = match env("QWEN_VOCAB_CHUNKS") {
+        0 => match &rt {
+            Runtime::Wgpu { device, .. } if !device.msl_passthrough => 4,
+            _ => 1,
+        },
+        n => n,
+    };
     eprintln!("runtime: {}", rt.name());
     let t = Instant::now();
     let st = St::open(&format!("{dir}/model.safetensors"));

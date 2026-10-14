@@ -61,6 +61,11 @@ pub struct QwenDims {
     pub theta: f64,
     /// KV caches stored as f16 (`Packing::F16`) instead of f32.
     pub kv_f16: bool,
+    /// The embedding and LM head as this many row blocks of the
+    /// vocabulary, each its own input: a GPU's largest storage binding can
+    /// be smaller than one 4-bit `[vocab, d]` matrix (311 MB for
+    /// Qwen3-8B; Vulkan on the Adreno binds at most 128 MiB). 1 is whole.
+    pub vocab_chunks: usize,
 }
 
 impl QwenDims {
@@ -78,6 +83,7 @@ impl QwenDims {
             eps: 1e-6,
             theta: 1e6,
             kv_f16: true,
+            vocab_chunks: 1,
         }
     }
 
@@ -116,6 +122,9 @@ pub struct DecodeGraph {
     /// substituted into its readers, and the stream would become a sum
     /// over every earlier layer.
     pub keep: Vec<TensorId>,
+    /// Logits of vocabulary blocks 1.. when `vocab_chunks > 1` (`outputs[0]`
+    /// holds block 0): the full logits are their concatenation.
+    pub logit_chunks: Vec<TensorId>,
     pub inputs: Vec<InputSpec>,
 }
 
@@ -228,6 +237,22 @@ impl Builder {
     }
 
     /// A 4-bit projection `[rows, cols]`: nibbles, scales, biases.
+    /// [`Self::q4`] as `chunks` row blocks, named `{name}.{c}` when split.
+    fn q4_chunks(
+        &mut self,
+        name: &str,
+        rows: usize,
+        cols: usize,
+        chunks: usize,
+    ) -> Vec<[TensorId; 3]> {
+        if chunks == 1 {
+            return vec![self.q4(name, rows, cols)];
+        }
+        (0..chunks)
+            .map(|c| self.q4(&format!("{name}.{c}"), rows / chunks, cols))
+            .collect()
+    }
+
     fn q4(&mut self, name: &str, rows: usize, cols: usize) -> [TensorId; 3] {
         let groups = cols / GROUP;
         [
@@ -363,8 +388,14 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
         layers,
         ctx,
         eps,
+        vocab_chunks,
         ..
     } = *dims;
+    assert!(
+        vocab_chunks >= 1 && vocab % vocab_chunks == 0,
+        "vocab_chunks must divide the vocabulary"
+    );
+    let vc = vocab / vocab_chunks;
     assert!(
         seq <= kctx && kctx <= ctx,
         "a step's positions must fit the window"
@@ -395,24 +426,46 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
     };
 
     // x[t, g, j] = Σ_v pick(v, tok_t, E[v, g, j]): the embedding row
-    let ew = b.q4("embed", vocab, d);
-    let esp = [seq, groups, GROUP, vocab];
-    let v_iota = b.g.iota(&esp, 3);
-    let x3 =
+    // (summed over vocabulary blocks when the table is split)
+    let mut parts = Vec::with_capacity(vocab_chunks);
+    for (c, ew) in b
+        .q4_chunks("embed", vocab, d, vocab_chunks)
+        .into_iter()
+        .enumerate()
+    {
+        let esp = [seq, groups, GROUP, vc];
+        let v_iota = b.g.iota(&esp, 3);
+        // a plain number: literals belong to the closure's own trace
+        let off = (c * vc) as f64;
+        let xc =
+            b.g.comp(
+                &[seq, groups, GROUP],
+                &[vc],
+                vec![
+                    arg(ew[0], vec![unit(4, 3), unit(4, 1), unit(4, 2)]),
+                    arg(ew[1], vec![unit(4, 3), unit(4, 1)]),
+                    arg(ew[2], vec![unit(4, 3), unit(4, 1)]),
+                    tok_at(4, unit(4, 0)),
+                    arg(v_iota, ident(4)),
+                ],
+                Some(Monoid::sum()),
+                move |v| vec![pick(v[4] + lit(off), v[3], v[0] * v[1] + v[2])],
+            )
+            .unwrap();
+        parts.push(xc);
+    }
+    let x3 = if parts.len() == 1 {
+        parts[0]
+    } else {
         b.g.comp(
             &[seq, groups, GROUP],
-            &[vocab],
-            vec![
-                arg(ew[0], vec![unit(4, 3), unit(4, 1), unit(4, 2)]),
-                arg(ew[1], vec![unit(4, 3), unit(4, 1)]),
-                arg(ew[2], vec![unit(4, 3), unit(4, 1)]),
-                tok_at(4, unit(4, 0)),
-                arg(v_iota, ident(4)),
-            ],
-            Some(Monoid::sum()),
-            |v| vec![pick(v[4], v[3], v[0] * v[1] + v[2])],
+            &[],
+            parts.iter().map(|&p| arg(p, ident(3))).collect(),
+            None,
+            |v| vec![v.iter().skip(1).fold(v[0], |a, &x| a + x)],
         )
-        .unwrap();
+        .unwrap()
+    };
     let x0 = b.g.reshape(x3, &[seq, d]).unwrap();
     // rope angles of each token's position, from a [cos | sin][ctx, half] table
     let rope = b.input("rope".into(), &[2, ctx, half], None);
@@ -798,28 +851,62 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
     }
     // logits of the last token only
     let norm = b.input("model.norm".into(), &[d], None);
-    let lm = b.q4("lm_head", vocab, d);
+    let lms = b.q4_chunks("lm_head", vocab, d, vocab_chunks);
     let normed = b.rms_norm(x, 1, seq as i64 - 1, d, norm, eps);
     let normed = Rows {
         src: normed,
         off: 0,
         stride: d as i64,
     };
-    let logits = b.linear(normed, 1, 0, lm);
-    // greedy: (index, value) of the first maximum
-    let vi = b.g.iota(&[vocab], 0);
-    let am =
+    let logits: Vec<TensorId> = lms.iter().map(|&lm| b.linear(normed, 1, 0, lm)).collect();
+    // greedy: (index, value) of the first maximum, per block then across
+    // blocks (in order, so ties still go to the first)
+    let vi = b.g.iota(&[vc], 0);
+    let ams: Vec<TensorId> = logits
+        .iter()
+        .enumerate()
+        .map(|(c, &l)| {
+            let off = (c * vc) as f64;
+            b.g.comp_tuple(
+                &[2],
+                &[vc],
+                vec![arg(l, vec![Form::zero(1), unit(1, 0)]), arg(vi, ident(1))],
+                Some(Monoid::argmax()),
+                move |v| vec![v[1] + lit(off), v[0]],
+            )
+            .unwrap()
+        })
+        .collect();
+    let am = if ams.len() == 1 {
+        ams[0]
+    } else {
+        // [block, (index, value)], then the argmax over blocks
+        let k = ams.len();
+        let bi = b.g.iota(&[k, 2], 0);
+        let mut args: Vec<_> = ams.iter().map(|&a| arg(a, vec![unit(2, 1)])).collect();
+        args.push(arg(bi, ident(2)));
+        let stacked =
+            b.g.comp(&[k, 2], &[], args, None, move |v| {
+                let c = v[k];
+                let mut acc = lit(0.0);
+                for (j, &x) in v[..k].iter().enumerate() {
+                    acc += pick(c, lit(j as f64), x);
+                }
+                vec![acc]
+            })
+            .unwrap();
         b.g.comp_tuple(
             &[2],
-            &[vocab],
+            &[k],
             vec![
-                arg(logits, vec![Form::zero(1), unit(1, 0)]),
-                arg(vi, ident(1)),
+                arg(stacked, vec![unit(1, 0), Form::constant(1, 0)]),
+                arg(stacked, vec![unit(1, 0), Form::constant(1, 1)]),
             ],
             Some(Monoid::argmax()),
-            |v| vec![v[1], v[0]],
+            |v| vec![v[0], v[1]],
         )
-        .unwrap();
+        .unwrap()
+    };
     // state ← (argmax, len): the next step's token and its position
     let si = b.g.iota(&[2], 0);
     let state_new =
@@ -840,13 +927,15 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
         )
         .unwrap();
     outputs.insert(0, state_new);
-    outputs.insert(0, logits);
+    outputs.insert(0, logits[0]);
+    let logit_chunks = logits[1..].to_vec();
     DecodeGraph {
         g: b.g,
         seq,
         kctx,
         outputs,
         keep,
+        logit_chunks,
         inputs: b.inputs,
     }
 }
@@ -856,9 +945,15 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
 /// merged, so they are tensor-core tiles over the dequantized weights,
 /// stored f16 when `half_tiles` (CUDA's m16n8k16 tiles; Metal's
 /// simdgroup tile stages f32). Returns the graph and its outputs:
-/// `dg.outputs` (same order), then `dg.keep`.
+/// `dg.outputs` (same order), then `dg.keep`, then `dg.logit_chunks`.
 pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<TensorId>) {
-    let all: Vec<TensorId> = dg.outputs.iter().chain(&dg.keep).copied().collect();
+    let all: Vec<TensorId> = dg
+        .outputs
+        .iter()
+        .chain(&dg.keep)
+        .chain(&dg.logit_chunks)
+        .copied()
+        .collect();
     let (g, outs) = dg.g.substitute_maps(&all);
     let (g, outs) = g.eliminate_common(&outs);
     // gate|up as one tuple-valued matmul: CUDA's tiles take it; Metal's
@@ -1108,7 +1203,79 @@ mod tests {
             eps: 1e-6,
             theta: 1e4,
             kv_f16: false,
+            vocab_chunks: 1,
         }
+    }
+
+    /// The embedding and LM head split into vocabulary blocks compute what
+    /// the whole matrices do: same full logits and next token, given the
+    /// same weights cut into row blocks.
+    #[test]
+    fn vocab_chunks_match_whole() {
+        let whole = tiny();
+        let split = QwenDims {
+            vocab_chunks: 2,
+            ..whole
+        };
+        let (gw, gs) = (decode_graph(&whole), decode_graph(&split));
+        let mut seed = 7u64;
+        let mut rnd = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let inputs_w: Vec<Vec<f64>> = gw
+            .inputs
+            .iter()
+            .map(|s| {
+                let n: usize = s.shape.iter().product();
+                match s.name.as_str() {
+                    "state" => vec![37.0, 3.0],
+                    "rope" => (0..n).map(|i| ((i % 7) as f64 * 0.3).cos()).collect(),
+                    _ if s.name.ends_with("cache") => (0..n).map(|_| rnd() - 0.5).collect(),
+                    _ => match s.packing {
+                        Some(Packing::U4) => (0..n).map(|_| (rnd() * 15.999).floor()).collect(),
+                        Some(_) => (0..n).map(|_| 0.01 + 0.02 * rnd()).collect(),
+                        None => (0..n).map(|_| 1.0 + 0.2 * rnd()).collect(),
+                    },
+                }
+            })
+            .collect();
+        // block c of `embed.q` (etc.) is rows c·V/2.. of the whole tensor
+        let inputs_s: Vec<Vec<f64>> = gs
+            .inputs
+            .iter()
+            .map(|s| {
+                for base in ["embed", "lm_head"] {
+                    if let Some(rest) = s.name.strip_prefix(&format!("{base}.")) {
+                        if let Some((c, part)) = rest.split_once('.') {
+                            let c: usize = c.parse().unwrap();
+                            let w = &inputs_w[gw.input(&format!("{base}.{part}"))];
+                            let per = w.len() / split.vocab_chunks;
+                            return w[c * per..(c + 1) * per].to_vec();
+                        }
+                    }
+                }
+                inputs_w[gw.input(&s.name)].clone()
+            })
+            .collect();
+        let rw = gw.g.eval(&inputs_w, &gw.outputs[..2]);
+        let mut outs = vec![gs.outputs[0], gs.outputs[1]];
+        outs.extend(&gs.logit_chunks);
+        let rs = gs.g.eval(&inputs_s, &outs);
+        let mut logits = rs[0].clone();
+        for c in &rs[2..] {
+            logits.extend(c);
+        }
+        assert_eq!(logits.len(), whole.vocab);
+        let scale = rw[0].iter().fold(0.0f64, |m, x| m.max(x.abs()));
+        let err = logits
+            .iter()
+            .zip(&rw[0])
+            .fold(0.0f64, |m, (a, b)| m.max((a - b).abs()));
+        assert!(err <= 1e-9 * scale, "logits differ: {err:e} of {scale:e}");
+        assert_eq!(rs[1], rw[1], "next token and position");
     }
 
     #[test]
@@ -1120,6 +1287,7 @@ mod tests {
         for p in [
             g.to_cuda_decode(&outs, &opts),
             g.to_msl_decode(&outs, &opts),
+            g.to_glsl_decode(&outs, &opts),
         ] {
             let transpiled = p.native.iter().filter(|n| !**n).count();
             assert!(p.native.iter().filter(|n| **n).count() >= 10 * dims.layers);
