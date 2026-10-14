@@ -1,6 +1,9 @@
 // Hand-written GRU step (batch 1, obs 64, hidden 256), the sanity floor
-// for the `to_c` lowering: the textbook loop, a dot product per output
-// over the column of W ([in, hidden] row-major, as tang stores it).
+// for the `to_c` lowering, in two loop orders:
+// - `dot`: the textbook loop, a dot product per output over the column of
+//   W ([in, hidden] row-major, as tang stores it): strided loads;
+// - `axpy`: the same sums with k outside j, so the inner loop streams a
+//   row of W (what a careful hand writer does; gcc vectorizes it).
 //
 //   gcc -O3 -mcpu=native -o naive_gru naive_gru.c -lm
 //   ./naive_gru CASE_DIR [STEPS] [CORE]     # CASE_DIR = an exported gru_b1
@@ -29,8 +32,9 @@ static void load(const char* dir, int k, float* dst, size_t n) {
     fclose(f);
 }
 
-static void step(void) {
-    float g[3][2][H];
+static float g[3][2][H];
+
+static void gates_dot(void) {
     for (int q = 0; q < 3; q++)
         for (int j = 0; j < H; j++) {
             float si = bi[q][j], sh = bh[q][j];
@@ -39,6 +43,24 @@ static void step(void) {
             g[q][0][j] = si;
             g[q][1][j] = sh;
         }
+}
+
+static void gates_axpy(void) {
+    for (int q = 0; q < 3; q++) {
+        float* restrict si = g[q][0];
+        float* restrict sh = g[q][1];
+        for (int j = 0; j < H; j++) si[j] = bi[q][j], sh[j] = bh[q][j];
+        for (int k = 0; k < OBS; k++)
+            for (int j = 0; j < H; j++) si[j] += x[k] * wi[q][k * H + j];
+        for (int k = 0; k < H; k++)
+            for (int j = 0; j < H; j++) sh[j] += h[k] * wh[q][k * H + j];
+    }
+}
+
+static void (*gates)(void) = gates_dot;
+
+static void step(void) {
+    gates();
     for (int j = 0; j < H; j++) {
         float r = 1.0f / (1.0f + expf(-(g[0][0][j] + g[0][1][j])));
         float z = 1.0f / (1.0f + expf(-(g[1][0][j] + g[1][1][j])));
@@ -77,21 +99,25 @@ int main(int argc, char** argv) {
         load(dir, 4 + 4 * q, bi[q], H);
         load(dir, 5 + 4 * q, bh[q], H);
     }
-    for (int i = 0; i < 500; i++) step();
     double* t = malloc(steps * sizeof *t);
-    double t0 = now_ns();
-    long n = 0;
-    for (; n < steps; n++) {
-        double a = now_ns();
-        step();
-        double b = now_ns();
-        t[n] = b - a;
-        if (b - t0 > 4e9) { n++; break; }
-    }
-    qsort(t, n, sizeof *t, cmp);
+    for (int mode = 0; mode < 2; mode++) {
+        gates = mode ? gates_axpy : gates_dot;
+        for (int i = 0; i < 500; i++) step();
+        double t0 = now_ns();
+        long n = 0;
+        for (; n < steps; n++) {
+            double a = now_ns();
+            step();
+            double b = now_ns();
+            t[n] = b - a;
+            if (b - t0 > 2e9) { n++; break; }
+        }
+        qsort(t, n, sizeof *t, cmp);
 #define Q(p) t[(long)((p) * (n - 1))]
-    printf("naive gru: %ld steps  min %.2f  med %.2f  p99 %.2f  p99.9 %.2f  max %.2f us\n", n,
-           t[0] / 1e3, Q(0.5) / 1e3, Q(0.99) / 1e3, Q(0.999) / 1e3, t[n - 1] / 1e3);
+        printf("naive gru %s: %ld steps  min %.2f  med %.2f  p99 %.2f  p99.9 %.2f  max %.2f us\n",
+               mode ? "axpy" : "dot", n, t[0] / 1e3, Q(0.5) / 1e3, Q(0.99) / 1e3, Q(0.999) / 1e3,
+               t[n - 1] / 1e3);
+    }
     char p[4096];
     snprintf(p, sizeof p, "%s/out_naive.bin", dir);
     FILE* f = fopen(p, "wb");

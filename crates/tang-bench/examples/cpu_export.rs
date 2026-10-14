@@ -5,6 +5,7 @@
 //!
 //!   cpu_export export ROOT [CASE...]   # ROOT/CASE/{model.c,in*.bin,info.txt}
 //!   cpu_export check  ROOT [CASE...]   # reads ROOT/CASE/out*.bin
+//!                                      # (CHECK_FILE=out_naive.bin: naive_gru's)
 //!   cpu_export local  ROOT [CASE...]   # export, build with cc, run, check (host)
 //!
 //! Cases: `gru_b1`, `grufused_b1`, `gru_b64`, `grufused_b64`, `mlp_b1`,
@@ -181,7 +182,11 @@ fn check(root: &Path, c: &Case) -> Option<f64> {
     let want = c.reference.eval(&f64_in, &c.outs);
     let mut worst = 0.0f64;
     for (i, w) in want.iter().enumerate() {
-        let raw = std::fs::read(dir.join(format!("out{i}.bin"))).ok()?;
+        let file = match std::env::var("CHECK_FILE") {
+            Ok(f) => f,
+            Err(_) => format!("out{i}.bin"),
+        };
+        let raw = std::fs::read(dir.join(file)).ok()?;
         let got: Vec<f32> = raw
             .chunks(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))

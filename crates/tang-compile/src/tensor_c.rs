@@ -69,8 +69,18 @@ pub struct CProgram {
     pub unique_kernels: usize,
 }
 
-/// Accumulator registers per kernel: `JB · RB · width ≤ ACC_FLOATS`.
-const ACC_FLOATS: usize = 64;
+/// Accumulator floats per register block, `JB · RB · width ≤` this: 64
+/// (16 NEON registers) without a row block, 128 with one (measured on
+/// the Cortex-X3 with gcc 11: the batch-64 GRU is 1.34 ms at 128, 1.5–1.8
+/// at 64, 1.66 at 32; batch 1 is fastest at 64). `$TANG_C_ACC_FLOATS`
+/// overrides both, for tuning.
+fn acc_floats(rb: usize) -> usize {
+    std::env::var("TANG_C_ACC_FLOATS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(if rb > 1 { 128 } else { 64 })
+}
+
 /// Partial accumulators per point in lane mode (one f32 NEON vector).
 const VL: usize = 4;
 /// Chunk of a map's vector dim (no accumulators to keep in registers).
@@ -308,7 +318,7 @@ impl TensorGraph {
                 return false;
             };
             let d = np + red.len() - 1;
-            last % VL == 0
+            last.is_multiple_of(VL)
                 && ca.args.iter().any(|x| {
                     !matches!(self.nodes[x.src.n()].op, Op::Iota(_))
                         && !self.nodes[x.src.n()].inline
@@ -322,20 +332,20 @@ impl TensorGraph {
         } else {
             (0..np)
                 .rev()
-                .find(|&d| Some(d) != jdim && pts[d] >= 4 && pts[d] % 4 == 0)
+                .find(|&d| Some(d) != jdim && pts[d] >= 4 && pts[d].is_multiple_of(4))
         };
         let rb = if rdim.is_some() { 4 } else { 1 };
         let jb = jdim.map_or(1, |d| {
             let cap = if accs.is_empty() {
                 MAP_CHUNK
             } else if lane {
-                (ACC_FLOATS / (rb * wmax * VL)).clamp(1, 4)
+                (acc_floats(rb) / (rb * wmax * VL)).clamp(1, 4)
             } else {
-                (ACC_FLOATS / (rb * wmax)).max(1)
+                (acc_floats(rb) / (rb * wmax)).max(1)
             };
             (1..=cap.min(pts[d]))
                 .rev()
-                .find(|b| pts[d] % b == 0)
+                .find(|b| pts[d].is_multiple_of(*b))
                 .unwrap()
         });
 
@@ -1048,7 +1058,8 @@ mod tests {
         let z = g
             .map(&[y, bb], |v| {
                 let s = v[0] + v[1];
-                tang_expr::with_graph(|g| g.select(s, s, ExprId::from_f64(0.0)))
+                let zero = ExprId::from_f64(0.0);
+                tang_expr::with_graph(|g| g.select(s, s, zero))
             })
             .unwrap();
         let (g, outs) = g.substitute_maps(&[z]);

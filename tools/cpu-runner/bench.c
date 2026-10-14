@@ -5,8 +5,8 @@
 //   ./bench CASE_DIR [STEPS] [CORE]
 //
 // Reads CASE_DIR/in{k}.bin (f32; converted to each input's storage format),
-// pins to CORE (sched_setaffinity, Linux), tries SCHED_FIFO (works only
-// with the privilege; reported, never required), runs 500 warm-up steps (at most 0.5 s),
+// pins to CORE (sched_setaffinity, Linux), with TANG_FIFO=1 tries
+// SCHED_FIFO (reported, never required), runs 500 warm-up steps (at most 0.5 s),
 // then up to STEPS back-to-back single-threaded steps capped at 4 s, and
 // prints min / median / p99 / p99.9 / max per-step latency (CLOCK_MONOTONIC
 // around each tang_run). Writes CASE_DIR/out{i}.bin (f32) from the last step
@@ -60,9 +60,17 @@ int main(int argc, char** argv) {
         CPU_SET(core, &set);
         if (sched_setaffinity(0, sizeof set, &set) != 0) perror("sched_setaffinity");
     }
-    struct sched_param sp = {.sched_priority = 10};
-    int fifo = sched_setscheduler(0, SCHED_FIFO, &sp) == 0;
-    printf("pinned core %d, SCHED_FIFO %s\n", core, fifo ? "on" : strerror(errno));
+    // SCHED_FIFO only on request (TANG_FIFO=1): it starves whatever else
+    // runs on the core, and RT throttling (sched_rt_runtime_us) then stalls
+    // the benchmark itself for ~50 ms every second.
+    const char* want = getenv("TANG_FIFO");
+    if (want && *want == '1') {
+        struct sched_param sp = {.sched_priority = 10};
+        int fifo = sched_setscheduler(0, SCHED_FIFO, &sp) == 0;
+        printf("pinned core %d, SCHED_FIFO %s\n", core, fifo ? "on" : strerror(errno));
+    } else {
+        printf("pinned core %d, SCHED_OTHER\n", core);
+    }
 #else
     (void)core;
 #endif
