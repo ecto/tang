@@ -449,7 +449,10 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
                     arg(v_iota, ident(4)),
                 ],
                 Some(Monoid::sum()),
-                move |v| vec![pick(v[4] + lit(off), v[3], v[0] * v[1] + v[2])],
+                // `pick(row, token - off)`, not `pick(row + off, token)`: the
+                // decode lowering reads a pick of the reduce index as loop
+                // bounds (one row, or none in another block) only in this form
+                move |v| vec![pick(v[4], v[3] - lit(off), v[0] * v[1] + v[2])],
             )
             .unwrap();
         parts.push(xc);
