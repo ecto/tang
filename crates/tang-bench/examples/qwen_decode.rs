@@ -408,8 +408,11 @@ fn tiny() {
     };
     let check_caches = |step: &Step, res: &[Vec<f64>], ulps: &mut f64| {
         // the device caches against the reference's (layer 0), in units
-        // of the cache format's rounding (f16: an f32 difference in the
-        // value can flip it by one ulp)
+        // of the cache format's rounding at the cache's own scale (its
+        // rms): an entry that is small after cancellation carries the
+        // absolute error of its inputs, so a per-entry relative bound
+        // would read a 1e-3 absolute slip on a 2e-3 entry as hundreds of
+        // ulps.
         for which in [2usize, 3] {
             let raw = step.prog.read(&rt, step.outs[which]);
             let dev: Vec<f64> = if dims.kv_f16 {
@@ -417,8 +420,13 @@ fn tiny() {
             } else {
                 raw.iter().map(|&x| x as f64).collect()
             };
+            let (ss, n) = res[which]
+                .iter()
+                .filter(|b| **b != 0.0)
+                .fold((0.0f64, 0usize), |(s, n), b| (s + b * b, n + 1));
+            let rms = (ss / n.max(1) as f64).sqrt().max(1e-3);
             for (&a, &b) in dev.iter().zip(&res[which]) {
-                *ulps = ulps.max((a - b).abs() / (b.abs().max(1e-3) * ulp));
+                *ulps = ulps.max((a - b).abs() / (b.abs().max(rms) * ulp));
             }
         }
     };
