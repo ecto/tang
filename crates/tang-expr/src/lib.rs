@@ -36,6 +36,7 @@ pub mod reverse;
 mod scalar;
 pub mod simplify;
 pub mod sparsity;
+pub mod split;
 pub mod wgsl;
 
 pub use graph::ExprGraph;
