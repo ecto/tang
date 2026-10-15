@@ -156,7 +156,7 @@ impl ExprGraph {
                 if f64 {
                     for f in ["sin(", "exp2(", "log2(", "atan2("] {
                         if let Some(args) = rhs.strip_prefix(f) {
-                            rhs = format!("{}64({args}", &f[..f.len() - 1]);
+                            rhs = format!("{}_64({args}", &f[..f.len() - 1]);
                             break;
                         }
                     }
@@ -196,7 +196,7 @@ impl ExprGraph {
 /// f64 `sin`, `exp2`, `log2`, `atan2` for WGSL on Vulkan (GLSL.std.450 has
 /// them for 16- and 32-bit floats only): Cody-Waite reduction and
 /// polynomials to a few ulp; `atan2` refines the f32 one by Newton steps.
-const F64_HELPERS: &str = "fn sin64(x: f64) -> f64 {
+const F64_HELPERS: &str = "fn sin_64(x: f64) -> f64 {
     let k = round(x * 0.6366197723675814lf);
     let r = (x - k * 1.5707963267948966lf) - k * 6.123233995736766e-17lf;
     let r2 = r * r;
@@ -248,8 +248,8 @@ fn log2_64(x: f64) -> f64 {
 fn atan2_64(y: f64, x: f64) -> f64 {
     var th = f64(atan2(f32(y), f32(x)));
     for (var i = 0; i < 2; i++) {
-        let s = sin64(th);
-        let c = sin64(th + 1.5707963267948966lf);
+        let s = sin_64(th);
+        let c = sin_64(th + 1.5707963267948966lf);
         th = th + (y * c - x * s) / (x * c + y * s);
     }
     return th;
