@@ -47,7 +47,31 @@ impl ExprGraph {
         n_inputs: usize,
         max_nodes: usize,
     ) -> SplitKernels {
+        self.split_wgsl(outputs, n_inputs, max_nodes, false)
+    }
+
+    /// [`to_wgsl_split`](Self::to_wgsl_split) in `f64` (buffers, scratch and
+    /// arithmetic), for a device with wgpu's `SHADER_F64`. Vulkan has no f64
+    /// `sin`/`exp2`/`log2`/`atan2`, so those come from WGSL helpers accurate
+    /// to a few ulp. A buffer of `n` values takes `2n` f32 slots.
+    pub fn to_wgsl_split_f64(
+        &self,
+        outputs: &[ExprId],
+        n_inputs: usize,
+        max_nodes: usize,
+    ) -> SplitKernels {
+        self.split_wgsl(outputs, n_inputs, max_nodes, true)
+    }
+
+    fn split_wgsl(
+        &self,
+        outputs: &[ExprId],
+        n_inputs: usize,
+        max_nodes: usize,
+        f64: bool,
+    ) -> SplitKernels {
         let wg = 256u32;
+        let (ty, suffix) = if f64 { ("f64", "lf") } else { ("f32", "") };
         let live = self.live_set(outputs);
         let mut order: Vec<usize> = live
             .iter()
@@ -85,11 +109,12 @@ impl ExprGraph {
             need(o.0 as usize, nparts - 1, &mut slot);
         }
         let ns = slot.len().max(1);
+        let helpers = if f64 { F64_HELPERS } else { "" };
         let header = format!(
-            "struct Params {{ count: u32, _p1: u32, _p2: u32, _p3: u32 }}\n\
-             @group(0) @binding(0) var<storage, read> inputs: array<f32>;\n\
-             @group(0) @binding(1) var<storage, read_write> scratch: array<f32>;\n\
-             @group(0) @binding(2) var<storage, read_write> outputs: array<f32>;\n\
+            "{helpers}struct Params {{ count: u32, _p1: u32, _p2: u32, _p3: u32 }}\n\
+             @group(0) @binding(0) var<storage, read> inputs: array<{ty}>;\n\
+             @group(0) @binding(1) var<storage, read_write> scratch: array<{ty}>;\n\
+             @group(0) @binding(2) var<storage, read_write> outputs: array<{ty}>;\n\
              @group(0) @binding(3) var<uniform> params: Params;\n\
              @compute @workgroup_size({wg})\n\
              fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{\n    let idx = gid.x;\n    if (idx >= params.count) {{ return; }}\n"
@@ -127,12 +152,16 @@ impl ExprGraph {
                     load(ch, &mut pre, &mut loaded);
                 }
                 loaded.insert(i);
-                writeln!(
-                    body,
-                    "    let t{i} = {};",
-                    expr_str(self, node, "", crate::codegen::Dialect::Wgsl)
-                )
-                .unwrap();
+                let mut rhs = expr_str(self, node, suffix, crate::codegen::Dialect::Wgsl);
+                if f64 {
+                    for f in ["sin(", "exp2(", "log2(", "atan2("] {
+                        if let Some(args) = rhs.strip_prefix(f) {
+                            rhs = format!("{}64({args}", &f[..f.len() - 1]);
+                            break;
+                        }
+                    }
+                }
+                writeln!(body, "    let t{i} = {rhs};").unwrap();
                 if let Some(s) = slot.get(&i) {
                     writeln!(body, "    scratch[idx * {ns}u + {s}u] = t{i};").unwrap();
                 }
@@ -146,7 +175,7 @@ impl ExprGraph {
                     writeln!(
                         body,
                         "    outputs[idx * {no}u + {k}u] = {};",
-                        ref_str(self, *o, "")
+                        ref_str(self, *o, suffix)
                     )
                     .unwrap();
                 }
@@ -163,3 +192,66 @@ impl ExprGraph {
         }
     }
 }
+
+/// f64 `sin`, `exp2`, `log2`, `atan2` for WGSL on Vulkan (GLSL.std.450 has
+/// them for 16- and 32-bit floats only): Cody-Waite reduction and
+/// polynomials to a few ulp; `atan2` refines the f32 one by Newton steps.
+const F64_HELPERS: &str = "fn sin64(x: f64) -> f64 {
+    let k = round(x * 0.6366197723675814lf);
+    let r = (x - k * 1.5707963267948966lf) - k * 6.123233995736766e-17lf;
+    let r2 = r * r;
+    let s = r * (1.0lf + r2 * (-0.16666666666666666lf + r2 * (0.008333333333333333lf + r2 * (-0.0001984126984126984lf
+        + r2 * (2.755731922398589e-6lf + r2 * (-2.505210838544172e-8lf + r2 * (1.6059043836821613e-10lf
+        + r2 * (-7.647163731819816e-13lf))))))));
+    let c = 1.0lf + r2 * (-0.5lf + r2 * (0.041666666666666664lf + r2 * (-0.001388888888888889lf
+        + r2 * (2.48015873015873e-5lf + r2 * (-2.755731922398589e-7lf + r2 * (2.08767569878681e-9lf
+        + r2 * (-1.1470745597729725e-11lf)))))));
+    let q = i32(k - 4.0lf * floor(k * 0.25lf));
+    if (q == 0) { return s; }
+    if (q == 1) { return c; }
+    if (q == 2) { return -s; }
+    return -c;
+}
+fn pow2i64(n: i32) -> f64 {
+    var m = n;
+    var b = 2.0lf;
+    if (m < 0) { b = 0.5lf; m = -m; }
+    var p = 1.0lf;
+    for (var i = 0; i < 11; i++) {
+        if ((m & 1) == 1) { p = p * b; }
+        b = b * b;
+        m = m >> 1u;
+    }
+    return p;
+}
+fn exp2_64(x: f64) -> f64 {
+    let n = floor(clamp(x, -1070.0lf, 1023.0lf) + 0.5lf);
+    let y = (x - n) * 0.6931471805599453lf;
+    var e = 1.0lf;
+    var term = 1.0lf;
+    for (var i = 1; i < 18; i++) { term = term * y / f64(i); e = e + term; }
+    return e * pow2i64(i32(n));
+}
+fn log2_64(x: f64) -> f64 {
+    var m = x;
+    var e = 0.0lf;
+    for (var i = 0; i < 20 && m >= 1.8446744073709552e19lf; i++) { m = m * 5.421010862427522e-20lf; e = e + 64.0lf; }
+    for (var i = 0; i < 20 && m < 5.421010862427522e-20lf; i++) { m = m * 1.8446744073709552e19lf; e = e - 64.0lf; }
+    for (var i = 0; i < 70 && m >= 1.4142135623730951lf; i++) { m = m * 0.5lf; e = e + 1.0lf; }
+    for (var i = 0; i < 70 && m < 0.7071067811865476lf; i++) { m = m * 2.0lf; e = e - 1.0lf; }
+    let t = (m - 1.0lf) / (m + 1.0lf);
+    let t2 = t * t;
+    var acc = 0.0lf;
+    for (var k = 12; k >= 0; k--) { acc = acc * t2 + 1.0lf / f64(2 * k + 1); }
+    return e + 2.0lf * t * acc * 1.4426950408889634lf;
+}
+fn atan2_64(y: f64, x: f64) -> f64 {
+    var th = f64(atan2(f32(y), f32(x)));
+    for (var i = 0; i < 2; i++) {
+        let s = sin64(th);
+        let c = sin64(th + 1.5707963267948966lf);
+        th = th + (y * c - x * s) / (x * c + y * s);
+    }
+    return th;
+}
+";

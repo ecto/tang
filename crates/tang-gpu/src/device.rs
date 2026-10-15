@@ -40,6 +40,9 @@ pub struct GpuDevice {
     /// SPIR-V can be dispatched as-is (Vulkan): the GLSL decode kernels,
     /// when built with the `glsl` feature.
     pub spirv_passthrough: bool,
+    /// WGSL kernels may use `f64` (wgpu `SHADER_F64`: Vulkan and DX12 on
+    /// most desktop GPUs; not Metal).
+    pub shader_f64: bool,
 }
 
 impl GpuDevice {
@@ -74,8 +77,12 @@ impl GpuDevice {
 
         // Native shader passthrough (MSL on Metal) lets generated kernels
         // use what WGSL cannot express — simdgroup matrices.
+        // f64 for simulation kernels that f32 cannot carry (a stiff contact
+        // solve drifts off the f64 trajectory within a few steps).
         let required_features = adapter.features()
-            & (wgpu::Features::MSL_SHADER_PASSTHROUGH | wgpu::Features::SPIRV_SHADER_PASSTHROUGH);
+            & (wgpu::Features::MSL_SHADER_PASSTHROUGH
+                | wgpu::Features::SPIRV_SHADER_PASSTHROUGH
+                | wgpu::Features::SHADER_F64);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("tang-gpu"),
@@ -97,6 +104,7 @@ impl GpuDevice {
             name,
             msl_passthrough,
             spirv_passthrough,
+            shader_f64: required_features.contains(wgpu::Features::SHADER_F64),
         })
     }
 
