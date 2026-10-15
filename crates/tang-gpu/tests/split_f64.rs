@@ -7,7 +7,9 @@ use tang_gpu::{GpuBuffer, GpuDevice, KernelCache};
 
 #[test]
 fn split_f64_matches_cpu() {
-    let Ok(device) = GpuDevice::new_sync() else { return };
+    let Ok(device) = GpuDevice::new_sync() else {
+        return;
+    };
     if !device.shader_f64 {
         eprintln!("skipped: {} has no SHADER_F64", device.name);
         return;
@@ -32,7 +34,11 @@ fn split_f64_matches_cpu() {
     let a3 = g.add(a2, l);
     let outs = [a3, s, e, l, at, xy];
     let split = g.to_wgsl_split_f64(&outs, 2, 4);
-    assert!(split.parts.len() > 2, "split into {} parts", split.parts.len());
+    assert!(
+        split.parts.len() > 2,
+        "split into {} parts",
+        split.parts.len()
+    );
     let pts: Vec<[f64; 2]> = (0..512)
         .map(|i| {
             let t = i as f64 / 511.0;
@@ -47,7 +53,15 @@ fn split_f64_matches_cpu() {
     let mut cache = KernelCache::new();
     let b = pts.len() as u32;
     for src in &split.parts {
-        cache.dispatch_buffers(&device, src, &[&inputs, &scratch, &out], &[1, 2], &[b, 0, 0, 0], b, 256);
+        cache.dispatch_buffers(
+            &device,
+            src,
+            &[&inputs, &scratch, &out],
+            &[1, 2],
+            &[b, 0, 0, 0],
+            b,
+            256,
+        );
     }
     cache.flush(&device);
     let got32 = out.to_vec_sync(&device);
@@ -60,6 +74,10 @@ fn split_f64_matches_cpu() {
             worst = worst.max(err);
         }
     }
-    eprintln!("{}: {} parts, worst relative error {worst:e}", device.name, split.parts.len());
+    eprintln!(
+        "{}: {} parts, worst relative error {worst:e}",
+        device.name,
+        split.parts.len()
+    );
     assert!(worst < 1e-13, "worst {worst:e}");
 }
