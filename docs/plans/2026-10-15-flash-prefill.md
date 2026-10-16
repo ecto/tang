@@ -43,6 +43,17 @@ exact but slower than dp4a (187 vs ~100 µs at T=32).
   either keep it bitwise-equal to dp4a (int8 activations in the mma) or accept it under the
   KL band and re-run `flash-tcheck` with a prefill/decode split check.
 
+Code read (2026-10-16): the wide dense GEMV already has eight token-tile × rows-per-warp dp4a
+variants (default 16x4, measured best), a decoded-weight-reuse variant (`fl_natw2`) and the mma
+one, and HC has a tiled wide kernel (`fl_hc_fusedw`). `fl_natmma` keeps every chunk's float
+scale-and-accumulate chain in decode order for bitwise equality, so the tensor cores only replace
+the 8 dp4a per chunk while the scalar epilogue (2 scale loads, ~3 FMA per row×token×chunk) stays,
+and at T=64 it decodes the weights twice (32-token passes). Under the bitwise contract the
+headroom looks small. The real lever is relaxing it for prefill only (dequant tile → bf16 mma,
+per-row scale after the K sum): prefill then commits slightly different KV/GDN state than
+narrow windows would, which breaks `flash-tcheck`'s width invariance for prefill but not
+drafts-on == drafts-off in decode. That's a contract change to decide, not a tuning task.
+
 ## Phase 3: cold misses beyond seeding (only if phase 0 misses the target)
 
 - Wider windows (128/256) so each missed expert blob is read once per more tokens.
