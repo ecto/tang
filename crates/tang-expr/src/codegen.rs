@@ -203,7 +203,7 @@ fn emit_body(
 }
 
 /// Generate expression string for a node.
-fn expr_str(graph: &ExprGraph, node: Node, suffix: &str, dialect: Dialect) -> String {
+pub(crate) fn expr_str(graph: &ExprGraph, node: Node, suffix: &str, dialect: Dialect) -> String {
     match node {
         Node::Var(n) => format!("x{n}"),
         Node::Lit(bits) => format_literal(f64::from_bits(bits), suffix),
@@ -255,7 +255,7 @@ fn expr_str(graph: &ExprGraph, node: Node, suffix: &str, dialect: Dialect) -> St
 }
 
 /// Reference a node inline: Var → x{n}, Lit → literal, others → t{index}.
-fn ref_str(graph: &ExprGraph, id: ExprId, suffix: &str) -> String {
+pub(crate) fn ref_str(graph: &ExprGraph, id: ExprId, suffix: &str) -> String {
     match graph.node(id) {
         Node::Var(n) => format!("x{n}"),
         Node::Lit(bits) => format_literal(f64::from_bits(bits), suffix),
