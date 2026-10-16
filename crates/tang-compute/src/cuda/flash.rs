@@ -73,6 +73,20 @@ fn natw_variant() -> Option<(usize, usize)> {
     })
 }
 
+/// `TANG_FLASH_NATST=TTxGR`: wide stacked native GEMV as token tiles of TT columns, GR rows a
+/// warp (default 16x4, `fl_natw`'s best); `off` runs the plain T-column body (A/B).
+fn natst_tile() -> Option<(usize, usize)> {
+    static U: std::sync::OnceLock<Option<(usize, usize)>> = std::sync::OnceLock::new();
+    *U.get_or_init(|| match std::env::var("TANG_FLASH_NATST") {
+        Err(_) => Some((16, 4)),
+        Ok(v) if v == "off" => None,
+        Ok(v) => {
+            let (a, b) = v.split_once('x')?;
+            Some((a.parse().ok()?, b.parse().ok()?))
+        }
+    })
+}
+
 /// Prefill-only window widths beyond `MAX_T` (instantiated for some kernels only).
 pub const WIDE_T: [usize; 3] = [16, 32, 64]; // hc_fused: 16, 32 only (t64 exceeds 48 KB static smem)
 
@@ -540,7 +554,10 @@ impl CudaComputeDevice {
                     } else {
                         1
                     },
-                    |t| t.rows_per_warp(m),
+                    |t| match natst_tile() {
+                        Some((_, gr)) if m > MAX_T => gr,
+                        _ => t.rows_per_warp(m),
+                    },
                 );
                 g.rows.div_ceil(gr * 8 / Self::stack_ks(g.ty, g.rows, s.k))
             })
@@ -557,7 +574,10 @@ impl CudaComputeDevice {
         let f = f.unwrap_or_else(|| {
             let src: &'static str = Box::leak(
                 format!(
-                    "#define NAT_STACK\n{}",
+                    "#define NAT_STACK\n{}{}",
+                    natst_tile().map_or(String::new(), |(tt, gr)| format!(
+                        "#define NATST_TT {tt}\n#define NATST_GR {gr}\n"
+                    )),
                     crate::kernels::native_cuda::NATIVE_CUDA
                 )
                 .into_boxed_str(),

@@ -1697,7 +1697,7 @@ pub fn sampler_test(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `tang-llm flash-serve-replay <gguf> --mtp M [--wide W] [--state-dir D|none] [--fresh] [--profile P] [--dump-routing P] IDS...`:
+/// `tang-llm flash-serve-replay <gguf> --mtp M [--wide W] [--state-dir D|none] [--fresh] [--profile P] [--dump-routing P] [--dump-logits P] IDS...`:
 /// the served prefill (`FlashServe::prefill`, saved states and all) over recorded prompts
 /// (`--dump-ids` files), each after dropping the live sequence (`--fresh`: and every saved
 /// state), with per-span timing (`TANG_FLASH_SPAN_LOG=1` is set).
@@ -1707,7 +1707,7 @@ pub fn serve_replay(args: &[String]) -> Result<()> {
     let (mut mtp, mut disk, mut files, mut fresh) = (None, None, Vec::new(), false);
     let mut wide: Option<usize> = None;
     let mut keep = usize::MAX;
-    let (mut profile, mut dump_routing) = (None, None);
+    let (mut profile, mut dump_routing, mut dump_logits) = (None, None, None);
     while let Some(a) = it.next() {
         let mut val = || it.next().with_context(|| format!("{a} needs a value"));
         match a.as_str() {
@@ -1721,6 +1721,8 @@ pub fn serve_replay(args: &[String]) -> Result<()> {
             "--keep-upto" => keep = val()?.parse()?,
             "--profile" => profile = Some(PathBuf::from(val()?)),
             "--dump-routing" => dump_routing = Some(PathBuf::from(val()?)),
+            // The head buffer's bits after each prompt (`P.N`), to compare variants with `cmp`.
+            "--dump-logits" => dump_logits = Some(PathBuf::from(val()?)),
             f => files.push(PathBuf::from(f)),
         }
     }
@@ -1758,6 +1760,15 @@ pub fn serve_replay(args: &[String]) -> Result<()> {
         let t = Instant::now();
         let (reused, next) = me.prefill(&ids, &text)?;
         let secs = t.elapsed().as_secs_f64();
+        if let Some(p) = &dump_logits {
+            let b: Vec<u8> =
+                me.e.logits(MAX_T)
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect();
+            let n = files.iter().position(|g| g == f).unwrap_or(0);
+            std::fs::write(p.with_extension(n.to_string()), b)?;
+        }
         println!(
             "{}: {} tokens, {reused} reused, {:.2} s = {:.0} tok/s (snapshots {:.0} ms, restore {:.0} ms), next {next}",
             f.display(),
