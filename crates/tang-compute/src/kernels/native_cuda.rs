@@ -536,11 +536,39 @@ __device__ __forceinline__ void bf16_body(unsigned int bx, const float* __restri
 // Segment table entry (flash::NatStack): 8 words.
 struct StSeg { u64 w; u64 hoff; u64 soff; unsigned int ty, n, ks, off; };
 
-// Blocks of segment s at window width T: rows per block (2 or 4 rows a warp) · 8 / KS.
+// Wide (T > 8) native segments run as token tiles of NATST_TT columns, NATST_GR rows a warp
+// (fl_natw's tiling; NATST_TT 0 = the plain T-column body). Bits are the T <= 8 kernels': the K
+// split comes from (n, k) alone and each column's chain doesn't depend on the tile.
+#ifndef NATST_TT
+#define NATST_TT 0
+#endif
+#ifndef NATST_GR
+#define NATST_GR 1
+#endif
+template <int T>
+__host__ __device__ constexpr int st_gr(int ty) {
+    return ty == 0 ? (T == 1 ? 2 : (T <= 8 ? 4 : 1)) : (T > 8 && NATST_TT > 0 ? NATST_GR : nat_gr(ty, T));
+}
+
+// Blocks of segment s at window width T: rows per block (rows a warp · 8 / KS).
 template <int T>
 __device__ __forceinline__ unsigned int st_blocks(const StSeg& s) {
-    unsigned int gr = s.ty == 0 ? (T == 1 ? 2 : (T <= 8 ? 4 : 1)) : nat_gr(s.ty, T);
+    unsigned int gr = st_gr<T>(s.ty);
     return (s.n + gr * 8 / s.ks - 1) / (gr * 8 / s.ks);
+}
+
+template <int TY, int T>
+__device__ __forceinline__ void st_nat(unsigned int b, const unsigned int* __restrict__ XQ, const unsigned char* __restrict__ W,
+                                       float* __restrict__ y, unsigned int K, const StSeg& sg, unsigned int OS) {
+    if (T > 8 && NATST_TT > 0) {
+        constexpr int TT = NATST_TT > 0 ? NATST_TT : 1;
+        for (unsigned int t0 = 0; t0 < T; t0 += TT) {
+            if (t0) __syncthreads();
+            nat_body<TY, TT, NATST_GR>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS, T, t0);
+        }
+    } else {
+        nat_body<TY, T, nat_gr(TY, T)>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS);
+    }
 }
 
 template <int T>
@@ -559,15 +587,15 @@ __device__ __forceinline__ void stack_body(const unsigned int* __restrict__ XQ, 
     const unsigned char* W = (const unsigned char*)sg.w;
     float* y = Y + sg.off;
     switch (sg.ty) {
-        case 2: nat_body<2, T, nat_gr(2, T)>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
-        case 6: nat_body<6, T, nat_gr(6, T)>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
-        case 42: nat_body<42, T, nat_gr(42, T)>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
-        case 20: nat_body<20, T, nat_gr(20, T)>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
-        case 23: nat_body<23, T, nat_gr(23, T)>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
-        case 11: nat_body<11, T, nat_gr(11, T)>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
-        case 12: nat_body<12, T, nat_gr(12, T)>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
-        case 13: nat_body<13, T, nat_gr(13, T)>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
-        case 14: nat_body<14, T, nat_gr(14, T)>(b, XQ, W, y, K, sg.n, sg.ks, sg.hoff, sg.soff, OS); break;
+        case 2: st_nat<2, T>(b, XQ, W, y, K, sg, OS); break;
+        case 6: st_nat<6, T>(b, XQ, W, y, K, sg, OS); break;
+        case 42: st_nat<42, T>(b, XQ, W, y, K, sg, OS); break;
+        case 20: st_nat<20, T>(b, XQ, W, y, K, sg, OS); break;
+        case 23: st_nat<23, T>(b, XQ, W, y, K, sg, OS); break;
+        case 11: st_nat<11, T>(b, XQ, W, y, K, sg, OS); break;
+        case 12: st_nat<12, T>(b, XQ, W, y, K, sg, OS); break;
+        case 13: st_nat<13, T>(b, XQ, W, y, K, sg, OS); break;
+        case 14: st_nat<14, T>(b, XQ, W, y, K, sg, OS); break;
         default: bf16_body<T, GB>(b, X, W, y, K, sg.n, sg.ks, OS); break;
     }
 }

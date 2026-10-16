@@ -378,6 +378,7 @@ fn serve_flash(args: &[String]) -> Result<()> {
         temp: 0.0,
         snapshots: 6,
         warm: Vec::new(),
+        profile: None,
         snapshot_bytes: std::env::var("TANG_FLASH_SNAP_GB")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
@@ -404,6 +405,7 @@ fn serve_flash(args: &[String]) -> Result<()> {
             }
             "--snapshots" => s.snapshots = val()?.parse()?,
             "--warm-request" => s.warm.push(PathBuf::from(val()?)),
+            "--profile" => s.profile = Some(PathBuf::from(val()?)),
             "--dump-ids" => s.dump = Some(PathBuf::from(val()?)),
             "--api-key-file" => {
                 let path = val()?;

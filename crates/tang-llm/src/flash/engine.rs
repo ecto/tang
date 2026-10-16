@@ -611,6 +611,24 @@ pub struct Engine {
     wide: bool,
     /// Captured wide prefill windows by width.
     wide_graphs: std::collections::HashMap<usize, Graph>,
+    /// Ping-pong prefill: the other half-window's scratch, staging and mailbox (swapped in
+    /// while its ops are enqueued or its misses served).
+    pp: Option<Box<PpHalf>>,
+    /// Captured ping-pong prefill windows by full width.
+    pp_graphs: std::collections::HashMap<usize, Graph>,
+}
+
+/// The second half-window of a ping-pong prefill window (see [`Engine::prefill_pp`]).
+struct PpHalf {
+    s: Scratch,
+    io: Io,
+    mb: Mailbox,
+}
+
+/// Wide prefill windows as two interleaved half-windows, so the CPU serves one half's misses
+/// while the GPU runs the other half's layer (`TANG_FLASH_PP=0`: one window, off).
+fn pp_enabled() -> bool {
+    std::env::var("TANG_FLASH_PP").map_or(true, |v| v != "0")
 }
 
 fn upload_entry(dev: &CudaComputeDevice, e: &Entry, b: &[u8]) -> B {
@@ -929,7 +947,7 @@ impl Engine {
             (dev.upload_f32(&c), dev.upload_f32(&s))
         };
         let z = |n: usize| dev.alloc_f32(n);
-        let s = Scratch {
+        let scratch = || Scratch {
             ctl: z(8),
             emb: z(WIDE * HIDDEN),
             ple_e: z(WIDE * HIDDEN),
@@ -971,6 +989,9 @@ impl Engine {
                 .is_ok_and(|v| v == "1")
                 .then(|| (z(STAGE_MAX * ExpertBlob::BYTES / 4), z(2 * (1 + STAGE_MAX)))),
         };
+        let s = scratch();
+        // Ping-pong prefill: the second half-window's scratch.
+        let s_b = pp_enabled().then(scratch);
         dev.sync();
         let t_dense = t1.elapsed().as_secs_f64();
         let (free1, _) = gpu.mem_info().map_err(|e| anyhow!("{e}"))?;
@@ -1066,19 +1087,31 @@ impl Engine {
             _m: m,
             _db: db,
         };
-        let mb = Mailbox::new(&gpu).map_err(|e| anyhow!("{e}"))?;
-        let mut io = Io {
-            arena: HostArena::new(
-                Io::BYTES,
-                ArenaOptions {
-                    try_hugetlb: false,
-                    thp: false,
-                },
-            )?,
+        let new_io = || -> Result<Io> {
+            let mut io = Io {
+                arena: HostArena::new(
+                    Io::BYTES,
+                    ArenaOptions {
+                        try_hugetlb: false,
+                        thp: false,
+                    },
+                )?,
+            };
+            io.arena
+                .register(&gpu.ctx, &[])
+                .map_err(|e| anyhow!("{e}"))?;
+            Ok(io)
         };
-        io.arena
-            .register(&gpu.ctx, &[])
-            .map_err(|e| anyhow!("{e}"))?;
+        let mb = Mailbox::new(&gpu).map_err(|e| anyhow!("{e}"))?;
+        let io = new_io()?;
+        let pp = match s_b {
+            Some(s_b) => Some(Box::new(PpHalf {
+                s: s_b,
+                io: new_io()?,
+                mb: Mailbox::new(&gpu).map_err(|e| anyhow!("{e}"))?,
+            })),
+            None => None,
+        };
         let stream = ManuallyDrop::new(Stream(dev.cu_stream()));
 
         // ---- MTP (before sizing the expert slots, so its VRAM is accounted for)
@@ -1223,6 +1256,8 @@ impl Engine {
             s,
             io,
             mb,
+            pp,
+            pp_graphs: Default::default(),
             gpu,
             k,
             nk,
@@ -1510,6 +1545,14 @@ impl Engine {
     /// Layer `l` of a window of `t` (every token kept). `fused`: the previous layer's MoE write
     /// is applied inside this layer's first hyper-connection read.
     fn enqueue_layer(&mut self, l: usize, t: usize, fused: bool, verify: bool) {
+        if self.enqueue_layer_p1(l, t, fused, verify) {
+            self.enqueue_layer_p2(l, t);
+        }
+    }
+
+    /// Layer `l` up to the CPU misses: mixer, router, publish, GPU hits and the shared expert.
+    /// Returns whether the CPU rows must still be waited for ([`enqueue_layer_p2`]).
+    fn enqueue_layer_p1(&mut self, l: usize, t: usize, fused: bool, verify: bool) -> bool {
         let dev = &self.dev;
         let share = self.pcie_share();
         let s = &mut self.s;
@@ -1819,9 +1862,18 @@ impl Engine {
                 .expect("launch")
             };
         }
-        if wide_pcie {
-            return;
-        }
+        !wide_pcie
+    }
+
+    /// Layer `l`'s CPU rows: wait for the host's FLAG_B, then copy its rows into `parts`.
+    fn enqueue_layer_p2(&mut self, l: usize, t: usize) {
+        let share = self.pcie_share();
+        let dev = &self.dev;
+        let s = &mut self.s;
+        let a = |b: &B| dev.buffer_addr(b);
+        let mbp = self.mb.device();
+        let ctlw = a(&s.ctl) + 8;
+        let li = l as i32;
         let st = 1 + 4 * l;
         for i in [st, st + 1] {
             if self.opts.split {
@@ -4274,8 +4326,190 @@ impl Engine {
     /// token kept, with its own graph per width (decode's graphs untouched). Routed experts
     /// missing from VRAM are read by the GPU from the mapped host arena (no doorbell, no CPU
     /// rows), and there is no head: for every prompt window but the last.
+    /// Swap the ping-pong half (B) in for the current one (A), or back.
+    fn pp_swap(&mut self) {
+        let h = self.pp.as_mut().expect("ping-pong half");
+        std::mem::swap(&mut self.s, &mut h.s);
+        std::mem::swap(&mut self.io, &mut h.io);
+        std::mem::swap(&mut self.mb, &mut h.mb);
+    }
+
+    /// Before layer `l` of the current half: the deferred MoE write and the PLE block at the
+    /// PLE layer. Returns whether layer `l` reads the previous layer's MoE write fused.
+    fn enqueue_pre(&mut self, l: usize, t: usize) -> bool {
+        let pl = self.ple.layer;
+        if l == pl {
+            if l > 0 {
+                self.apply_moe(t);
+            }
+            self.enqueue_ple(t);
+        }
+        l > 0 && l != pl
+    }
+
+    /// A ping-pong prefill window: halves A (current scratch) and B (`pp`) of `h` tokens each,
+    /// interleaved per layer as A.p1(0) B.p1(0) | A.p2(l) A.p1(l+1) B.p2(l) B.p1(l+1) | ...
+    /// B's mixer reads A's K/V and recurrent state of the same layer (enqueued before it), and
+    /// each half's next layer needs only its own MoE rows, so the GPU runs one half's layer
+    /// while the host computes the other half's misses. Every token's arithmetic is a width-`h`
+    /// window's, so the bits are a plain wide window's.
+    fn enqueue_window_pp(
+        &mut self,
+        h: usize,
+        between: &mut dyn FnMut(&mut Self, usize, bool) -> Result<()>,
+    ) -> Result<()> {
+        let n = self.layers.len();
+        for b in [false, true] {
+            if b {
+                self.pp_swap();
+            }
+            self.enqueue_inputs(h);
+            self.enqueue_embed(h);
+            let fused = self.enqueue_pre(0, h);
+            self.enqueue_layer_p1(0, h, fused, false);
+            if b {
+                self.pp_swap();
+            }
+        }
+        for l in 0..n {
+            for b in [false, true] {
+                if b {
+                    self.pp_swap();
+                }
+                self.enqueue_layer_p2(l, h);
+                if l + 1 < n {
+                    let fused = self.enqueue_pre(l + 1, h);
+                    self.enqueue_layer_p1(l + 1, h, fused, false);
+                }
+                if b {
+                    self.pp_swap();
+                }
+                between(self, l, b)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Serve layer `l`'s misses of half B (`b`) or A.
+    fn serve_half(&mut self, l: usize, b: bool, st: &mut WinStats) -> Result<()> {
+        if b {
+            self.pp_swap();
+        }
+        let r = self.serve(l, st);
+        if b {
+            self.pp_swap();
+        }
+        r
+    }
+
+    /// [`prefill_wide`](Self::prefill_wide) as a ping-pong window.
+    fn prefill_pp(&mut self, pos0: usize, t: usize) -> Result<WinStats> {
+        let h = t / 2;
+        let w0 = Instant::now();
+        let mut st = WinStats {
+            t,
+            ..Default::default()
+        };
+        self.stage(pos0, h)?;
+        self.pp_swap();
+        let staged = self.stage(pos0 + h, h);
+        self.pp_swap();
+        staged?;
+        self.keys.clear();
+        self.wide = true;
+        let r = (|| -> Result<()> {
+            self.start_gather(pos0, h);
+            self.pp_swap();
+            self.start_gather(pos0 + h, h);
+            self.pp_swap();
+            if let Some(g) = self.pp_graphs.get(&t) {
+                g.launch(&self.stream).map_err(|e| anyhow!("{e}"))?;
+                for l in 0..self.layers.len() {
+                    for b in [false, true] {
+                        self.serve_half(l, b, &mut st)?;
+                    }
+                }
+                Ok(())
+            } else {
+                // Eager: serve each half's layer right after its wait is enqueued.
+                let mut f = |me: &mut Self, l: usize, b: bool| me.serve_half(l, b, &mut st);
+                self.enqueue_window_pp(h, &mut f)
+            }
+        })();
+        self.wide = false;
+        r?;
+        self.dev.sync();
+        if let Some(e) = self.gather_err.lock().unwrap().take() {
+            bail!("n-gram rows: {e}");
+        }
+        for b in [false, true] {
+            if b {
+                self.pp_swap();
+            }
+            for l in 0..self.layers.len() {
+                let mut d: Vec<u32> = self
+                    .io
+                    .u32s(Io::LIDS + l * 4 * WIDE * TOPK, h * TOPK)
+                    .to_vec();
+                d.sort_unstable();
+                d.dedup();
+                st.routed += h * TOPK;
+                st.distinct += d.len();
+                let base = (l * EXPERTS) as u32;
+                for &e in &d {
+                    self.routing[(base + e) as usize] += 1;
+                    self.keys.push(base + e);
+                }
+            }
+            if b {
+                self.pp_swap();
+            }
+        }
+        self.keys.sort_unstable();
+        self.keys.dedup();
+        let every = std::env::var("TANG_FLASH_WIDE_ADAPT")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(1);
+        let mut old = None;
+        if let Experts::Resident(rc) = &mut self.experts {
+            let o = rc.policy.lfu.set_every(every);
+            if o == 0 || every == 0 {
+                rc.policy.lfu.set_every(o);
+            } else {
+                old = Some(o);
+            }
+        }
+        let r = self.boundary();
+        if let (Some(o), Experts::Resident(rc)) = (old, &mut self.experts) {
+            rc.policy.lfu.set_every(o);
+        }
+        st.swaps = r?;
+        self.counter = self.counter.wrapping_add(1);
+        if self.use_graphs && !self.pp_graphs.contains_key(&t) {
+            let stream = ManuallyDrop::new(Stream(self.dev.cu_stream()));
+            let me = self as *mut Self;
+            self.wide = true;
+            let g = Graph::capture(&stream, |_| {
+                // SAFETY: `self` is not otherwise touched during capture.
+                let me = unsafe { &mut *me };
+                me.enqueue_window_pp(h, &mut |_, _, _| Ok(()))
+                    .map_err(|e| tang_moe::gpu::Error(format!("{e}")))
+            });
+            self.wide = false;
+            self.pp_graphs
+                .insert(t, g.map_err(|e| anyhow!("capture ping-pong T={t}: {e}"))?);
+        }
+        st.wall_ms = w0.elapsed().as_secs_f64() * 1e3;
+        Ok(st)
+    }
+
     pub fn prefill_wide(&mut self, pos0: usize, t: usize) -> Result<WinStats> {
         ensure!(t > MAX_T && t <= WIDE && pos0 + t <= self.tokens.len());
+        if self.pp.is_some() && t == WIDE {
+            ensure!(pos0 + t <= self.opts.max_ctx, "context {} > max", pos0 + t);
+            return self.prefill_pp(pos0, t);
+        }
         ensure!(
             pos0 + t <= self.opts.max_ctx,
             "context {} > max {}",
