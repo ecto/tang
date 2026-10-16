@@ -33,6 +33,19 @@ Decode, mew (RTX 3090 24 GB, i9-12900K, 64 GB), 4K context, 512 tokens, greedy, 
   calls, thinking as `reasoning_content`, bitwise-exact prefix reuse (running + positional state
   snapshots, tools/system blocks pinned to disk), top-k/top-p/presence in the window graph.
   frog-bench find-answer, add-function and fix-rust-add pass.
+- **Cache seeding** (2026-10-16): `serve` writes routing counts to `<state dir>/routing.bin`
+  after every request and seeds the next load's VRAM expert cache from them (`--profile`
+  overrides). Cold replay of the 10,727-token frog prompt (`flash-serve-replay --fresh
+  --state-dir none`, 10,920 VRAM slots, two runs each): uniform seed 38.5 / 38.8 s (278 tok/s),
+  seeded from the other nine recorded requests 29.7 / 29.6 s (361 tok/s), the same as a cache
+  warmed in-process (363–373 tok/s). A cold server is now as fast as a warm one.
+- **Warm 64-token window profile** (nsys, seeded replay, `~/prefill/p1*` on mew): GPU waiting on
+  CPU expert misses (`fe_db_wait_if`) 35%, dense GEMV (`fl_natst_t64`) 20%, HC
+  (`fl_hc_fusedw_q8`, 221 µs a launch) 12.5%, GPU MoE 13%, `db_copy_rows` 5%, QSA + GDN ~7%.
+  Per span log: ~170 ms a window, ~76 ms of it CPU misses. The cache is at capacity when warm,
+  so the misses are capacity misses. HC tile sweep (`TANG_FL_DEFS`, seeded replay, two runs
+  each): defaults 363/366 tok/s; `HW_TT` 4/16, `HW_T2` 8/32 all 356–367 (noise); `HW_MINB 2`
+  148/211 (spills). The defaults stand.
 
 ## Architecture in one paragraph
 
