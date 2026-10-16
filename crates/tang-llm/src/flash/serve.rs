@@ -58,6 +58,9 @@ pub struct Settings {
     /// Chat completion bodies (JSON files) to prefill at start, so their tools block and
     /// system prompt states are saved before the first real request.
     pub warm: Vec<PathBuf>,
+    /// Seed the expert cache from this routing profile. Without one, `routing.bin` in `disk`
+    /// (written after every request) seeds it.
+    pub profile: Option<PathBuf>,
 }
 
 /// A saved running state and the tokens it follows.
@@ -267,9 +270,15 @@ fn hash(ids: &[u32]) -> u64 {
 impl FlashServe {
     pub fn load(s: &Settings) -> Result<Self> {
         let t = Instant::now();
+        let saved = s.disk.as_ref().map(|d| d.join(ROUTING));
+        let profile = s
+            .profile
+            .clone()
+            .or_else(|| saved.clone().filter(|p| p.exists()));
         let opts = Opts {
             max_ctx: s.ctx,
             mtp: s.mtp.clone(),
+            profile: profile.clone(),
             ..Opts::default()
         };
         let mut e = Engine::load(&s.gguf, opts)?;
@@ -278,6 +287,19 @@ impl FlashServe {
         e.use_mtp = e.has_mtp();
         e.enable_sampler()?;
         e.warm()?;
+        // Keep counting from the saved profile, not from the warm-up's routing.
+        e.routing.fill(0);
+        if let Some(p) = profile.as_ref().filter(|p| Some(*p) == saved.as_ref()) {
+            let b = std::fs::read(p)?;
+            if b.len() == e.routing.len() * 4 {
+                for (r, c) in e.routing.iter_mut().zip(b.chunks(4)) {
+                    *r = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                }
+            }
+        }
+        if let Some(p) = &profile {
+            eprintln!("tang-llm: expert cache seeded from {}", p.display());
+        }
         let tok = FlashTokenizer::from_gguf(e.gguf())?;
         let id = |p: &str| tok.token_id(p).with_context(|| format!("no {p} token"));
         let mut eos: Vec<u32> = ["<|im_end|>", "<|endoftext|>"]
@@ -572,6 +594,23 @@ impl FlashServe {
                 .as_ref()?
                 .join(format!("{}-{:016x}.state", ids.len(), hash(ids))),
         )
+    }
+
+    /// Write the routing counts to `disk` (seeds the next load's expert cache). Halves them
+    /// before they can overflow, so the profile also follows recent use.
+    fn save_routing(&mut self) {
+        let Some(d) = &self.disk else { return };
+        if self.e.routing.iter().any(|&c| c > 1 << 30) {
+            self.e.routing.iter_mut().for_each(|c| *c /= 2);
+        }
+        let tmp = d.join(format!("{ROUTING}.tmp"));
+        if let Err(err) = self
+            .e
+            .save_routing(&tmp)
+            .and_then(|_| Ok(std::fs::rename(&tmp, d.join(ROUTING))?))
+        {
+            eprintln!("tang-llm: saving routing counts: {err:#}");
+        }
     }
 
     /// Write a pinned state to disk (on a thread; the file appears complete or not at all).
@@ -1123,6 +1162,7 @@ impl Backend for FlashServe {
             // Whatever the engine holds now is unknown: start over next time.
             self.e.reset();
         }
+        self.save_routing();
         r
     }
 
@@ -1286,6 +1326,9 @@ pub fn resume_test(args: &[String]) -> Result<()> {
     );
     Ok(())
 }
+
+/// The routing-count profile in the state directory.
+const ROUTING: &str = "routing.bin";
 
 /// `TANG_FLASH_STATE_DIR` or `~/.cache/tang/flash-serve/<model>`.
 pub fn default_disk(gguf: &Path) -> Option<PathBuf> {
@@ -1654,7 +1697,7 @@ pub fn sampler_test(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `tang-llm flash-serve-replay <gguf> --mtp M [--wide W] [--state-dir D|none] [--fresh] IDS...`:
+/// `tang-llm flash-serve-replay <gguf> --mtp M [--wide W] [--state-dir D|none] [--fresh] [--profile P] [--dump-routing P] IDS...`:
 /// the served prefill (`FlashServe::prefill`, saved states and all) over recorded prompts
 /// (`--dump-ids` files), each after dropping the live sequence (`--fresh`: and every saved
 /// state), with per-span timing (`TANG_FLASH_SPAN_LOG=1` is set).
@@ -1664,6 +1707,7 @@ pub fn serve_replay(args: &[String]) -> Result<()> {
     let (mut mtp, mut disk, mut files, mut fresh) = (None, None, Vec::new(), false);
     let mut wide: Option<usize> = None;
     let mut keep = usize::MAX;
+    let (mut profile, mut dump_routing) = (None, None);
     while let Some(a) = it.next() {
         let mut val = || it.next().with_context(|| format!("{a} needs a value"));
         match a.as_str() {
@@ -1675,6 +1719,8 @@ pub fn serve_replay(args: &[String]) -> Result<()> {
             }
             "--fresh" => fresh = true,
             "--keep-upto" => keep = val()?.parse()?,
+            "--profile" => profile = Some(PathBuf::from(val()?)),
+            "--dump-routing" => dump_routing = Some(PathBuf::from(val()?)),
             f => files.push(PathBuf::from(f)),
         }
     }
@@ -1693,6 +1739,7 @@ pub fn serve_replay(args: &[String]) -> Result<()> {
         disk,
         dump: None,
         warm: Vec::new(),
+        profile,
     };
     let mut me = FlashServe::load(&s)?;
     for f in &files {
@@ -1720,6 +1767,9 @@ pub fn serve_replay(args: &[String]) -> Result<()> {
             me.line.snap_ms,
             me.line.restore_ms
         );
+    }
+    if let Some(p) = &dump_routing {
+        me.e.save_routing(p)?;
     }
     Ok(())
 }
