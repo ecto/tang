@@ -6,9 +6,11 @@
 //! decrypt), each checked by the secrecy pass: secrets never steer an
 //! address or a count, and the only places a secret-derived value becomes
 //! public are named `declassify` nodes whose proof is the MLWE assumption.
-//! Hashing, sampling, packing and the Fujisaki–Okamoto transform are host
-//! Rust around the graphs (moving SHAKE and sampling into the graph is the
-//! next step).
+//! The secret noise — SHAKE-256 of the seed, then binomial or uniform
+//! sampling — is a fourth graph ([`sample`], over [`keccak`]), so no secret
+//! byte is touched outside a checked graph except by copying. The hashes
+//! of the Fujisaki–Okamoto transform (G, H, J on m and z), sampling the
+//! public matrix, and packing are still host Rust.
 //!
 //! ```
 //! let ryng = ryng::Ryng::new(ryng::Params::RYNG);
@@ -17,6 +19,9 @@
 //! assert_eq!(ryng.open(&sk, &ct), k1);
 //! assert_eq!((pk.len(), ct.len()), (1312, 1440));
 //! ```
+
+pub mod keccak;
+pub mod sample;
 
 use sha3::digest::{ExtendableOutput, Update, XofReader};
 use sha3::{Digest, Sha3_256, Sha3_512, Shake128, Shake256};
@@ -99,6 +104,11 @@ pub struct Ryng {
     keygen: Keygen,
     enc: Encrypt,
     dec: Decrypt,
+    /// s, e from σ: k binomial + k uniform polys. `None` for the toy set,
+    /// which is driven by hand through the `pke_*` calls.
+    keygen_noise: Option<sample::Sampler>,
+    /// r, e₁, e₂ from the coins: k binomial + (k + 1) uniform polys.
+    enc_noise: Option<sample::Sampler>,
 }
 
 fn row(g: &mut ModGraph, x: ModId, i: usize, n: usize) -> ModId {
@@ -278,16 +288,24 @@ impl Ryng {
         let m = each(&mut g, w, |b, x| b.compress(x, 1));
         let dec = Decrypt { g, m, w };
 
+        let full = p.n == 256;
+        let keygen_noise = full.then(|| sample::Sampler::new(p.q, p.n, k, k));
+        let enc_noise = full.then(|| sample::Sampler::new(p.q, p.n, k, k + 1));
         Self {
             p,
             keygen,
             enc,
             dec,
+            keygen_noise,
+            enc_noise,
         }
     }
 
     /// The secrecy check on all three graphs: the proofs each one relies on.
     pub fn check(&self) -> Result<[Vec<&'static str>; 3], tang_compile::tensor::modq::TaintError> {
+        for s in self.keygen_noise.iter().chain(&self.enc_noise) {
+            assert!(s.check()?.is_empty(), "sampling declassifies nothing");
+        }
         let kg: Vec<_> = self.keygen.t1.iter().map(|&t| (t, Label::Public)).collect();
         let mut en: Vec<_> = self.enc.u.iter().map(|&t| (t, Label::Public)).collect();
         en.push((self.enc.v, Label::Public));
@@ -352,8 +370,11 @@ impl Ryng {
         let rs = hash512(b"keygen", d);
         let (rho, sigma) = rs.split_at(32);
         let a = sample_a(p, rho);
-        let s = cbd2(p, sigma, 0);
-        let e = uniform12(p, sigma, p.k as u8);
+        let (s, e) = self
+            .keygen_noise
+            .as_ref()
+            .expect("n = 256")
+            .run(prf_states(sigma, 2 * p.k));
         let t1 = self.pke_keygen(&a, &s, &e);
         let mut pk = rho.to_vec();
         pk.extend(pack(&t1, bits(p.q) - p.dt));
@@ -403,11 +424,14 @@ impl Ryng {
         let (rho, t1b) = pk.split_at(32);
         let a = sample_a(p, rho);
         let t1 = unpack(t1b, bits(p.q) - p.dt, p.k * p.n);
-        let r = cbd2(p, coins, 0);
-        let e1 = uniform12(p, coins, p.k as u8);
-        let e2 = uniform12(p, coins, 2 * p.k as u8);
+        let (r, e12) = self
+            .enc_noise
+            .as_ref()
+            .expect("n = 256")
+            .run(prf_states(coins, 2 * p.k + 1));
+        let (e1, e2) = e12.split_at(p.k * p.n);
         let mbits = bytes_to_bits(m, p.n);
-        let (u, v) = self.pke_encrypt(&a, &t1, &r, &e1, &e2, &mbits);
+        let (u, v) = self.pke_encrypt(&a, &t1, &r, e1, e2, &mbits);
         let mut ct = pack(&u, p.du);
         ct.extend(pack(&v, p.dv));
         (key.try_into().expect("32"), ct)
@@ -458,6 +482,17 @@ fn shake256_32(name: &[u8], data: &[u8]) -> [u8; 32] {
     out
 }
 
+/// The absorbed SHAKE-256 states of PRF(seed, 0), …, PRF(seed, count − 1),
+/// for the sampler graph to squeeze.
+fn prf_states(seed: &[u8], count: usize) -> Vec<u32> {
+    (0..count as u8)
+        .flat_map(|nonce| {
+            keccak::absorb_one_block(&[&sep(b"prf")[..], seed, &[nonce]].concat(), 136)
+        })
+        .collect()
+}
+
+#[cfg(test)]
 fn prf(seed: &[u8], nonce: u8, len: usize) -> Vec<u8> {
     let mut x = Shake256::default();
     x.update(&sep(b"prf"));
@@ -495,7 +530,9 @@ fn sample_a(p: &Params, rho: &[u8]) -> Vec<u32> {
     out
 }
 
-/// k polynomials, centred binomial η = 2: (b₀ + b₁) − (b₂ + b₃) per coefficient.
+/// Host reference for the sampler graph: k polynomials, centred binomial
+/// η = 2, (b₀ + b₁) − (b₂ + b₃) per coefficient.
+#[cfg(test)]
 fn cbd2(p: &Params, seed: &[u8], nonce0: u8) -> Vec<u32> {
     let mut out = Vec::with_capacity(p.k * p.n);
     for i in 0..p.k {
@@ -511,8 +548,9 @@ fn cbd2(p: &Params, seed: &[u8], nonce0: u8) -> Vec<u32> {
     out
 }
 
-/// Uniform on [−2¹¹, 2¹¹): 12 masked bits, no rejection. k polys from nonce0
-/// on, or one poly when nonce0 is `2k` (e₂).
+/// Host reference: uniform on [−2¹¹, 2¹¹), 12 masked bits, no rejection. k
+/// polys from nonce0 on, or one poly when nonce0 is `2k` (e₂).
+#[cfg(test)]
 fn uniform12(p: &Params, seed: &[u8], nonce0: u8) -> Vec<u32> {
     let polys = if nonce0 as usize == 2 * p.k { 1 } else { p.k };
     let mut out = Vec::with_capacity(polys * p.n);

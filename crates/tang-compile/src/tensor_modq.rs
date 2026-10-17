@@ -63,6 +63,14 @@ enum BOp {
     Decompress(usize, u32),
     /// round(x / 2^d), ties down: the high part when the low d bits are dropped.
     Power2Round(usize, u32),
+    // Word ops on raw u32, for hashing and bit extraction. Shift amounts are
+    // taken mod 32; a shift is constant-time on every target we lower to.
+    Xor(usize, usize),
+    And(usize, usize),
+    Or(usize, usize),
+    Not(usize),
+    Shl(usize, usize),
+    Shr(usize, usize),
 }
 
 /// A branch-free scalar program over residues mod q.
@@ -82,6 +90,7 @@ impl Body {
     pub fn arg(&mut self, i: usize) -> BVal {
         self.push(BOp::Arg(i))
     }
+    /// A raw word. Mod-q ops expect residues, so a literal fed to one must be < q.
     pub fn lit(&mut self, v: u32) -> BVal {
         self.push(BOp::Lit(v))
     }
@@ -109,10 +118,29 @@ impl Body {
     pub fn power2round(&mut self, x: BVal, d: u32) -> BVal {
         self.push(BOp::Power2Round(x.0, d))
     }
+    pub fn xor(&mut self, a: BVal, b: BVal) -> BVal {
+        self.push(BOp::Xor(a.0, b.0))
+    }
+    pub fn and(&mut self, a: BVal, b: BVal) -> BVal {
+        self.push(BOp::And(a.0, b.0))
+    }
+    pub fn or(&mut self, a: BVal, b: BVal) -> BVal {
+        self.push(BOp::Or(a.0, b.0))
+    }
+    pub fn not(&mut self, a: BVal) -> BVal {
+        self.push(BOp::Not(a.0))
+    }
+    pub fn shl(&mut self, a: BVal, by: BVal) -> BVal {
+        self.push(BOp::Shl(a.0, by.0))
+    }
+    pub fn shr(&mut self, a: BVal, by: BVal) -> BVal {
+        self.push(BOp::Shr(a.0, by.0))
+    }
 }
 
 enum MOp {
-    Input(usize),
+    /// Input index, and whether it holds residues (reduced mod q) or raw words.
+    Input(usize, bool),
     Const(Vec<u32>),
     Reshape(ModId),
     Map {
@@ -288,7 +316,18 @@ impl ModGraph {
 
     pub fn input(&mut self, shape: &[usize], label: Label) -> ModId {
         self.inputs += 1;
-        self.push(MOp::Input(self.inputs - 1), shape.to_vec(), label)
+        self.push(MOp::Input(self.inputs - 1, true), shape.to_vec(), label)
+    }
+
+    /// An input of raw 32-bit words (hash states, random bytes), not reduced.
+    pub fn input_words(&mut self, shape: &[usize], label: Label) -> ModId {
+        self.inputs += 1;
+        self.push(MOp::Input(self.inputs - 1, false), shape.to_vec(), label)
+    }
+
+    /// A public table of raw words, not reduced.
+    pub fn constant_words(&mut self, values: &[u32]) -> ModId {
+        self.push(MOp::Const(values.to_vec()), vec![values.len()], Label::Public)
     }
 
     /// A public table, reduced mod q.
@@ -366,7 +405,7 @@ impl ModGraph {
         let mut l: Vec<Label> = Vec::with_capacity(self.nodes.len());
         for n in &self.nodes {
             let label = match &n.op {
-                MOp::Input(_) => n.label,
+                MOp::Input(..) => n.label,
                 MOp::Const(_) | MOp::Declassify { .. } => Label::Public,
                 MOp::Reshape(s) | MOp::Filter { src: s, .. } => l[s.0 as usize],
                 MOp::Map { args, .. } => args
@@ -413,9 +452,13 @@ impl ModGraph {
         for n in &self.nodes {
             let size: usize = n.shape.iter().product();
             let v = match &n.op {
-                MOp::Input(i) => {
+                MOp::Input(i, reduce) => {
                     assert_eq!(inputs[*i].len(), size, "input {i} has the wrong length");
-                    inputs[*i].iter().map(|x| x % f.q).collect()
+                    if *reduce {
+                        inputs[*i].iter().map(|x| x % f.q).collect()
+                    } else {
+                        inputs[*i].clone()
+                    }
                 }
                 MOp::Const(c) => c.clone(),
                 MOp::Reshape(s) | MOp::Declassify { src: s, .. } => vals[s.0 as usize].clone(),
@@ -447,7 +490,7 @@ impl ModGraph {
                                     let at = flat(&view.coords(&idx), self.shape(*src));
                                     vals[src.0 as usize][at]
                                 }
-                                BOp::Lit(x) => x % f.q,
+                                BOp::Lit(x) => x,
                                 BOp::Coord(d) => idx[d] as u32,
                                 BOp::Add(a, b) => f.add(reg[a], reg[b]),
                                 BOp::Sub(a, b) => f.sub(reg[a], reg[b]),
@@ -456,6 +499,12 @@ impl ModGraph {
                                 BOp::Compress(a, d) => f.compress(reg[a], d),
                                 BOp::Decompress(a, d) => f.decompress(reg[a], d),
                                 BOp::Power2Round(a, d) => f.power2round(reg[a], d),
+                                BOp::Xor(a, b) => reg[a] ^ reg[b],
+                                BOp::And(a, b) => reg[a] & reg[b],
+                                BOp::Or(a, b) => reg[a] | reg[b],
+                                BOp::Not(a) => !reg[a],
+                                BOp::Shl(a, b) => reg[a] << (reg[b] & 31),
+                                BOp::Shr(a, b) => reg[a] >> (reg[b] & 31),
                             };
                         }
                         out.push(reg[body.ops.len() - 1]);

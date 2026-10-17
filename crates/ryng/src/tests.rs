@@ -129,3 +129,66 @@ fn ct_eq_is_a_mask() {
     assert_eq!(ct_eq(b"abc", b"abc"), 0xff);
     assert_eq!(ct_eq(b"abc", b"abd"), 0x00);
 }
+
+/// SHA3-256 over (pk ‖ sk ‖ ct ‖ key) for three seeds: any change to what the
+/// KEM computes changes this.
+fn kat() -> String {
+    let r = Ryng::new(Params::RYNG);
+    let mut h = Sha3_256::new();
+    for i in 0..3u8 {
+        let (pk, sk) = r.keygen(&[i; 64]);
+        let (ct, key) = r.seal(&pk, &[i + 100; 32]);
+        for part in [&pk[..], &sk, &ct, &key] {
+            Digest::update(&mut h, part);
+        }
+    }
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[test]
+fn known_answer() {
+    assert_eq!(
+        kat(),
+        "3cc1d807609d6b76fa22cbb8727fdf325c9d928463ca46af7dd1b76e4ba8c6d7"
+    );
+}
+
+#[test]
+fn keccak_graph_matches_sha3_shake256() {
+    use keccak::*;
+    let mut g = ModGraph::new(Params::RYNG.q);
+    let t = Tables::new(&mut g);
+    let st = g.input_words(&[50], Label::Secret);
+    let out = squeeze(&mut g, &t, st, SHAKE256_RATE, 3);
+    assert_eq!(
+        g.check(&[(out, Label::Secret)]),
+        Ok(vec![]),
+        "π's gather index is public"
+    );
+    assert!(
+        g.check(&[(out, Label::Public)]).is_err(),
+        "a hash of a secret is still secret"
+    );
+    for len in [0usize, 1, 33, 65, 135] {
+        let msg: Vec<u8> = (0..len).map(|i| (i * 31 + len) as u8).collect();
+        let words = g.eval(&[absorb_one_block(&msg, 136)], &[out]).remove(0);
+        let mut want = vec![0u8; 3 * 136];
+        let mut x = Shake256::default();
+        x.update(&msg);
+        x.finalize_xof().read(&mut want);
+        assert_eq!(words_to_bytes(&words), want, "len {len}");
+    }
+}
+
+#[test]
+fn sampler_graph_matches_host_reference() {
+    let p = Params::RYNG;
+    let s = sample::Sampler::new(p.q, p.n, p.k, p.k + 1);
+    assert_eq!(s.check(), Ok(vec![]));
+    let seed = [0x5au8; 32];
+    let (c, u) = s.run(prf_states(&seed, 2 * p.k + 1));
+    assert_eq!(c, cbd2(&p, &seed, 0));
+    let mut want = uniform12(&p, &seed, p.k as u8);
+    want.extend(uniform12(&p, &seed, 2 * p.k as u8));
+    assert_eq!(u, want);
+}
