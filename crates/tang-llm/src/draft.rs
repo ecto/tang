@@ -434,11 +434,13 @@ pub const COST_CUDA: &[(usize, f32)] = &[
     (16, 3.28),
     (32, 6.22),
 ];
+/// Up to 8: Qwen3-32B-4bit, M4 Max, 512 context, with the small-row Q4 kernels (2026-10-17).
 pub const COST_METAL: &[(usize, f32)] = &[
     (1, 1.0),
-    (2, 1.19),
-    (4, 1.63),
-    (8, 1.82),
+    (2, 1.14),
+    (3, 1.83),
+    (4, 2.2),
+    (8, 2.33),
     (16, 2.86),
     (32, 4.63),
 ];
@@ -667,6 +669,11 @@ impl<'a> Session<'a> {
             local,
             gm,
         }
+    }
+
+    /// A forward over `width` tokens relative to one (measured as decoding goes).
+    pub fn cost(&self, width: usize) -> f32 {
+        self.cost.get(width).copied().unwrap_or(f32::INFINITY)
     }
 
     /// A token was generated (or injected).

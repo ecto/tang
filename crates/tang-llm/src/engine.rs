@@ -1038,7 +1038,7 @@ impl<D: ComputeDevice> Engine<D> {
                     let d = s.propose(room);
                     match self.drafter.as_mut() {
                         Some(m) if d.tokens.is_empty() => crate::draft::Draft {
-                            tokens: m.propose(&ids, &out, room)?,
+                            tokens: m.propose(&ids, &out, room, |k| s.cost(k))?,
                             from_model: true,
                             ..Default::default()
                         },

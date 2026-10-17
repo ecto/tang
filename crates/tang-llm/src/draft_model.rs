@@ -19,10 +19,8 @@ pub struct DraftModel<D: ComputeDevice> {
     cache: Cache<D::Buffer>,
     /// Most tokens a draft holds.
     pub max: usize,
-    /// Stop drafting once the drafter gives the whole draft less than this chance of being
-    /// right (the product of its tokens' probabilities): a wide verify costs more than a
-    /// narrow one, so long shaky drafts lose.
-    pub min_prob: f32,
+    /// One drafter forward's time relative to one target forward.
+    pub step_cost: f32,
 }
 
 impl<D: ComputeDevice> DraftModel<D> {
@@ -40,17 +38,24 @@ impl<D: ComputeDevice> DraftModel<D> {
             model,
             cache,
             max: get("MAX").and_then(|v| v.parse().ok()).unwrap_or(8),
-            min_prob: get("MIN_PROB").and_then(|v| v.parse().ok()).unwrap_or(0.5),
+            step_cost: get("COST").and_then(|v| v.parse().ok()).unwrap_or(0.07),
         };
         // Warm up (kernel compilation, first allocations) here rather than in a request.
-        let min_prob = std::mem::replace(&mut d.min_prob, 0.0);
-        d.propose(&[0; 16], &[], 4)?;
-        d.min_prob = min_prob;
+        d.propose(&[0; 16], &[], 4, |k| 0.5 + k as f32 * 0.5)?;
         Ok(d)
     }
 
-    /// Guess up to `room` tokens following `prompt` then `out`.
-    pub fn propose(&mut self, prompt: &[u32], out: &[u32], room: usize) -> Result<Vec<u32>> {
+    /// Guess up to `room` tokens following `prompt` then `out`. `cost(k)`: a target forward
+    /// over k tokens relative to one. The draft grows while the expected tokens per unit of
+    /// time (verify plus drafting) improve, with the drafter's own probabilities as the odds
+    /// that each token survives.
+    pub fn propose(
+        &mut self,
+        prompt: &[u32],
+        out: &[u32],
+        room: usize,
+        cost: impl Fn(usize) -> f32,
+    ) -> Result<Vec<u32>> {
         let room = room.min(self.max);
         let n = prompt.len() + out.len();
         if room == 0 || n == 0 || n + room > self.model.max_ctx() {
@@ -75,13 +80,17 @@ impl<D: ComputeDevice> DraftModel<D> {
             logits = self.model.forward(chunk, &mut self.cache, false)?;
         }
         let mut draft = Vec::with_capacity(room);
-        let mut q = 1.0;
+        // Odds the draft so far survives, expected tokens it yields, and its rate.
+        let (mut q, mut gain, mut best) = (1.0f32, 1.0f32, 1.0 / cost(1));
         loop {
             let (tok, p) = top(&logits);
             q *= p;
-            if q < self.min_prob {
+            let n = draft.len() + 1;
+            let rate = (gain + q) / (cost(n + 1) + self.step_cost * n as f32);
+            if rate <= best {
                 break;
             }
+            (gain, best) = (gain + q, rate);
             draft.push(tok);
             if draft.len() == room {
                 break;

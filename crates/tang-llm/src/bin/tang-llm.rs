@@ -24,7 +24,8 @@
 //! `TANG_DRAFT_MAX`, `_ALPHA`, `_MIN_PROB`, `_MIN_MATCH`, `_GLOBAL`, `_COST` tune drafting.
 //! `--draft-model <model>` (or `TANG_DRAFT_MODEL`) adds a small model with the same tokenizer
 //! (Qwen3-0.6B for Qwen3-32B) that drafts when the suffix drafter has nothing;
-//! `TANG_DRAFT_MODEL_MAX` (8) and `_MIN_PROB` (0.5, the whole draft's odds) bound its drafts.
+//! `TANG_DRAFT_MODEL_MAX` (8) caps its drafts and `_COST` (0.07) is its step's time relative to
+//! the target's; drafts grow while expected tokens per unit time improve.
 //! `tang-llm image-features <model-dir> <pixels.f32>` — the projector's output for an image
 //! (`[896, 896, 3]` f32, normalized), as JSON.
 //! `tang-llm logits-image <model-dir> <pixels.f32> <token ids...> [--last N]` — logits with the
@@ -65,8 +66,8 @@ use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 use std::time::Instant;
 use tang_compute::{ComputeDevice, CpuDevice};
-use tang_llm::{Dtype, Engine, Model};
 use tang_llm::draft_model::DraftModel;
+use tang_llm::{Dtype, Engine, Model};
 
 /// Where the model runs.
 #[derive(Clone, Copy, Debug)]
@@ -465,7 +466,9 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
         Ok(_) => true,
         Err(_) => !matches!(backend, Backend::Cpu),
     };
-    let mut draft_model = std::env::var("TANG_DRAFT_MODEL").ok().filter(|m| !m.is_empty());
+    let mut draft_model = std::env::var("TANG_DRAFT_MODEL")
+        .ok()
+        .filter(|m| !m.is_empty());
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -706,8 +709,8 @@ fn serve_on<D: ComputeDevice + 'static>(
         if let Some(m) = draft_model.as_ref().filter(|_| speculate) {
             let d = DraftModel::load(make()?, &tang_llm::resolve_model(m)?, ctx, e.vocab_size())?;
             eprintln!(
-                "tang-llm: draft model {m} (up to {} tokens, min p {})",
-                d.max, d.min_prob
+                "tang-llm: draft model {m} (up to {} tokens, a step {:.2} of the target's)",
+                d.max, d.step_cost
             );
             e.set_draft_model(Some(d));
         }
