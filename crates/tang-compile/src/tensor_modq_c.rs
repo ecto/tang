@@ -21,7 +21,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-const PRELUDE: &str = r#"#include <stdint.h>
+const PRELUDE: &str = r#"#ifndef __APPLE__
+#define _POSIX_C_SOURCE 200809L
+#endif
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -282,7 +285,11 @@ static const size_t OUT_SIZES[] = {{{outs}}};
 #define N_IN {nin}
 #define N_OUT {nout}
 #define TOTAL_IN {total_in}
+#ifdef __APPLE__
 static uint64_t now_ns(void) {{ return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }}
+#else
+static uint64_t now_ns(void) {{ struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }}
+#endif
 int main(int argc, char **argv) {{
     static uint32_t inbuf[TOTAL_IN + 1];
     const uint32_t *in[N_IN + 1];
