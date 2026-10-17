@@ -275,3 +275,28 @@ mod signature {
         }
     }
 }
+
+/// Rejection rates per condition (run with RYNG_DIAG=<attempts>, --nocapture).
+#[test]
+fn rejection_rates() {
+    use crate::sig::*;
+    let Some(n) = std::env::var("RYNG_DIAG")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    else {
+        return;
+    };
+    let s = Sig::new();
+    let (_, sk) = s.keygen(&[9; 32]);
+    let rows = s.diagnose(&sk, b"rates", n);
+    let rate = |i: usize| rows.iter().filter(|r| r[i] == 1).count() as f64 / n as f64;
+    let all = rows
+        .iter()
+        .filter(|r| r[..4].iter().all(|&x| x == 1))
+        .count() as f64
+        / n as f64;
+    let mean_h = rows.iter().map(|r| r[4] as f64).sum::<f64>() / n as f64;
+    let max_h = rows.iter().map(|r| r[4]).max().unwrap_or(0);
+    eprintln!("attempts {n}: z ok {:.3}  r0 ok {:.3}  ct0 ok {:.3}  hints ok {:.3}  all {:.3}  hints mean {:.1} max {}",
+        rate(0), rate(1), rate(2), rate(3), all, mean_h, max_h);
+}

@@ -198,6 +198,8 @@ struct Attempt {
     ctilde: ModId,
     z: Vec<ModId>,
     h: Vec<ModId>,
+    /// Ungated, for diagnostics only: (z ok, r₀ ok, c·t₀ ok, hints ok, hint count).
+    checks: [ModId; 5],
 }
 
 struct Verify {
@@ -442,6 +444,12 @@ impl Sig {
             b.lt(v, bound)
         });
         oks.push(ok_h);
+        let ok_z = combine(&mut g, &oks[..L], Fold::And);
+        let r0s: Vec<ModId> = (0..K).map(|i| oks[L + 2 * i]).collect();
+        let ct0s: Vec<ModId> = (0..K).map(|i| oks[L + 2 * i + 1]).collect();
+        let ok_r0 = combine(&mut g, &r0s, Fold::And);
+        let ok_ct0 = combine(&mut g, &ct0s, Fold::And);
+        let checks = [ok_z, ok_r0, ok_ct0, ok_h, count];
         let accept = combine(&mut g, &oks, Fold::And);
 
         // publish only what an accepted attempt would publish
@@ -470,6 +478,7 @@ impl Sig {
             ctilde,
             z,
             h,
+            checks,
         }
     }
 
@@ -542,22 +551,7 @@ impl Sig {
         outs.extend(&at.z);
         outs.extend(&at.h);
         for attempt in 0..1000usize {
-            let mut y_tails = Vec::new();
-            for i in 0..L {
-                let nonce = ((attempt * L + i) as u16).to_le_bytes();
-                let (ti, _) = tail(32 + 64 + 2, &[(0, &sep(b"sig/y")), (96, &nonce)]);
-                y_tails.extend(ti);
-            }
-            let ins = [
-                a.clone(),
-                sk.s1.clone(),
-                sk.s2.clone(),
-                sk.t0.clone(),
-                sk.key.clone(),
-                rho2_tail.clone(),
-                y_tails,
-                c_tail.clone(),
-            ];
+            let ins = attempt_inputs(sk, &a, &rho2_tail, &c_tail, attempt);
             let res = at.g.eval(&ins, &outs);
             if res[0][0] != 1 {
                 continue;
@@ -570,6 +564,25 @@ impl Sig {
             return (sig, attempt + 1);
         }
         panic!("no signature in 1000 attempts (expected ~5)");
+    }
+
+    /// Diagnostics: every rejection condition, attempt by attempt, ignoring
+    /// acceptance — `[z ok, r₀ ok, c·t₀ ok, hints ok, hint count]`. Reads
+    /// secret-derived flags, so it is for tests, never for a real key.
+    #[doc(hidden)]
+    pub fn diagnose(&self, sk: &SigningKey, msg: &[u8], attempts: usize) -> Vec<[u32; 5]> {
+        let mu = shake(b"sig/mu", &[&sk.tr, msg], 64);
+        let a = sample_mat(&sk.rho, K, L);
+        let (rho2_tail, _) = tail(160, &[(0, &sep(b"sig/rho2")), (96, &mu)]);
+        let (c_tail, _) = tail(32 + 64 + K * N / 2, &[(0, &sep(b"sig/c")), (32, &mu)]);
+        let at = &self.attempt;
+        (0..attempts)
+            .map(|attempt| {
+                let ins = attempt_inputs(sk, &a, &rho2_tail, &c_tail, attempt);
+                let r = at.g.eval(&ins, &at.checks);
+                [r[0][0], r[1][0], r[2][0], r[3][0], r[4][0]]
+            })
+            .collect()
     }
 
     pub fn verify(&self, pk: &[u8], msg: &[u8], sig: &[u8]) -> bool {
@@ -606,6 +619,32 @@ impl Sig {
         // ctilde is public; an ordinary compare is fine here
         want == ctilde
     }
+}
+
+/// The attempt graph's inputs for attempt number `attempt`.
+fn attempt_inputs(
+    sk: &SigningKey,
+    a: &[u32],
+    rho2_tail: &[u32],
+    c_tail: &[u32],
+    attempt: usize,
+) -> [Vec<u32>; 8] {
+    let mut y_tails = Vec::new();
+    for i in 0..L {
+        let nonce = ((attempt * L + i) as u16).to_le_bytes();
+        let (ti, _) = tail(32 + 64 + 2, &[(0, &sep(b"sig/y")), (96, &nonce)]);
+        y_tails.extend(ti);
+    }
+    [
+        a.to_vec(),
+        sk.s1.clone(),
+        sk.s2.clone(),
+        sk.t0.clone(),
+        sk.key.clone(),
+        rho2_tail.to_vec(),
+        y_tails,
+        c_tail.to_vec(),
+    ]
 }
 
 fn centred(v: u32) -> i64 {
