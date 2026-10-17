@@ -52,6 +52,8 @@ pub mod glsl_gemv;
 mod grad;
 #[path = "tensor_memplan.rs"]
 pub mod memplan;
+#[path = "tensor_modq.rs"]
+pub mod modq;
 #[path = "tensor_msl.rs"]
 pub mod msl;
 /// #34's f32 simdgroup-matrix tile (`to_msl_mma`, opt-in via TANG_NATIVE)
