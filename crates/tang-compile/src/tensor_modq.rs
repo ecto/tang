@@ -295,8 +295,13 @@ impl Field {
         let r0 = r0 - edge as i64;
         (r1, self.csub((r0 + self.q as i64) as u32))
     }
+    /// round(x / 2^d), ties down. d is a constant of the op (public); d = 0
+    /// is the identity.
     fn power2round(&self, x: u32, d: u32) -> u32 {
-        (x + (1 << d >> 1) - 1) >> d
+        if d == 0 {
+            return x;
+        }
+        (x + (1 << (d - 1)) - 1) >> d
     }
     fn sel(&self, c: u32, a: u32, b: u32) -> u32 {
         let mask = 0u32.wrapping_sub(c & 1);
@@ -361,6 +366,7 @@ impl ModGraph {
         }
     }
 
+    /// A residue input. Values must be canonical (< q): no backend reduces them.
     pub fn input(&mut self, shape: &[usize], label: Label) -> ModId {
         self.inputs += 1;
         self.push(MOp::Input(self.inputs - 1, true), shape.to_vec(), label)
@@ -492,7 +498,7 @@ impl ModGraph {
         Ok(proofs)
     }
 
-    /// Run the graph. Inputs are reduced mod q.
+    /// Run the graph. Residue inputs must be canonical (< q), as in every backend.
     pub fn eval(&self, inputs: &[Vec<u32>], outputs: &[ModId]) -> Vec<Vec<u32>> {
         let f = self.f;
         let mut vals: Vec<Vec<u32>> = Vec::with_capacity(self.nodes.len());
@@ -501,11 +507,15 @@ impl ModGraph {
             let v = match &n.op {
                 MOp::Input(i, reduce) => {
                     assert_eq!(inputs[*i].len(), size, "input {i} has the wrong length");
+                    // residues must arrive canonical: the C and GPU lowerings use
+                    // them as given (reducing a secret with `%` would divide)
                     if *reduce {
-                        inputs[*i].iter().map(|x| x % f.q).collect()
-                    } else {
-                        inputs[*i].clone()
+                        assert!(
+                            inputs[*i].iter().all(|&x| x < f.q),
+                            "input {i} holds a value ≥ q; residue inputs must be canonical"
+                        );
                     }
+                    inputs[*i].clone()
                 }
                 MOp::Const(c) => c.clone(),
                 MOp::Reshape(s) | MOp::Declassify { src: s, .. } => vals[s.0 as usize].clone(),
@@ -756,6 +766,10 @@ mod tests {
                     ((((x as u128) << d) + Q as u128 / 2) / Q as u128) as u32 & ((1 << d) - 1);
                 assert_eq!(f.compress(x, d), want, "x={x} d={d}");
             }
+        }
+        // d = 0 drops nothing
+        for x in [0, 1, Q - 1] {
+            assert_eq!(f.power2round(x, 0), x);
         }
         // dropping 13 bits leaves an error in (−2^12, 2^12]
         for x in [0, 4095, 4096, 4097, Q - 1] {

@@ -49,7 +49,7 @@ AI uint32_t ct_compress(uint32_t x, uint32_t d) {
 AI uint32_t ct_decompress(uint32_t y, uint32_t d) {
     return (uint32_t)(((uint64_t)y * Q + ((1ull << d) >> 1)) >> d);
 }
-AI uint32_t ct_p2r(uint32_t x, uint32_t d) { return (x + ((1u << d) >> 1) - 1) >> d; }
+AI uint32_t ct_p2r(uint32_t x, uint32_t d) { return d ? (x + (1u << (d - 1)) - 1) >> d : x; }
 AI uint32_t ct_sel(uint32_t c, uint32_t a, uint32_t b) { uint32_t m = 0u - (c & 1); return (a & m) | (b & ~m); }
 AI uint32_t ct_eq(uint32_t a, uint32_t b) { uint32_t d = a ^ b; return ((d | (0u - d)) >> 31) ^ 1; }
 AI void ct_decompose(uint32_t r, uint64_t g2, uint64_t m, uint32_t *hi, uint32_t *lo) {
@@ -407,13 +407,24 @@ impl Compiled {
             .arg("run")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()?;
-        child
+        // a runner that fails early closes stdin; its status says why
+        let _ = child
             .stdin
             .take()
             .expect("stdin")
-            .write_all(&le_bytes(inputs))?;
+            .write_all(&le_bytes(inputs));
         let out = child.wait_with_output()?;
+        let want: usize = self.out_sizes.iter().sum::<usize>() * 4;
+        if !out.status.success() || out.stdout.len() != want {
+            return Err(io::Error::other(format!(
+                "runner failed ({}), {} of {want} output bytes: {}",
+                out.status,
+                out.stdout.len(),
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
         let words: Vec<u32> = out
             .stdout
             .chunks(4)
@@ -600,6 +611,15 @@ mod tests {
             "a branch too: {bad:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_run_is_an_error_not_a_panic() {
+        let (g, c) = ntt_graph();
+        let built = g.compile(&[c]).expect("a C compiler");
+        // too few input words: the runner exits before writing anything
+        let err = built.run(&[vec![1; 10]]).expect_err("short input");
+        assert!(err.to_string().contains("runner failed"), "{err}");
     }
 
     #[test]

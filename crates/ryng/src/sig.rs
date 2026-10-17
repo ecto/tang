@@ -680,14 +680,24 @@ impl Prepared {
 
     /// Only the per-message, per-attempt inputs: ρ″'s tail, the y tails, c̃'s tail.
     pub(crate) fn tails(&self, attempt: usize) -> Vec<Vec<u32>> {
-        let mut y_tails = Vec::new();
-        for i in 0..L {
-            let nonce = ((attempt * L + i) as u16).to_le_bytes();
-            let (ti, _) = tail(32 + 64 + 2, &[(0, &sep(b"sig/y")), (96, &nonce)]);
-            y_tails.extend(ti);
-        }
-        vec![self.rho2_tail.clone(), y_tails, self.c_tail.clone()]
+        vec![
+            self.rho2_tail.clone(),
+            y_tails(attempt),
+            self.c_tail.clone(),
+        ]
     }
+}
+
+/// The public tails of attempt `attempt`'s y expansions: one per poly, nonce
+/// `attempt · ℓ + i`. The one place the attempt nonces are defined.
+fn y_tails(attempt: usize) -> Vec<u32> {
+    let mut out = Vec::new();
+    for i in 0..L {
+        let nonce = ((attempt * L + i) as u16).to_le_bytes();
+        let (ti, _) = tail(32 + 64 + 2, &[(0, &sep(b"sig/y")), (96, &nonce)]);
+        out.extend(ti);
+    }
+    out
 }
 
 /// The key-fixed attempt inputs, in the order of [`Sig::attempt_key_inputs`].
@@ -793,12 +803,6 @@ fn attempt_inputs(
     c_tail: &[u32],
     attempt: usize,
 ) -> [Vec<u32>; 8] {
-    let mut y_tails = Vec::new();
-    for i in 0..L {
-        let nonce = ((attempt * L + i) as u16).to_le_bytes();
-        let (ti, _) = tail(32 + 64 + 2, &[(0, &sep(b"sig/y")), (96, &nonce)]);
-        y_tails.extend(ti);
-    }
     [
         a.to_vec(),
         sk.s1.clone(),
@@ -806,7 +810,7 @@ fn attempt_inputs(
         sk.t0.clone(),
         sk.key.clone(),
         rho2_tail.to_vec(),
-        y_tails,
+        y_tails(attempt),
         c_tail.to_vec(),
     ]
 }

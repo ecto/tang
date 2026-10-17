@@ -15,7 +15,7 @@
 //! let ryng = ryng::Ryng::new(ryng::Params::RYNG);
 //! let (pk, sk) = ryng.keygen(&[7; 64]);
 //! let (ct, k1) = ryng.seal(&pk, &[9; 32]);
-//! assert_eq!(ryng.open(&sk, &ct), k1);
+//! assert_eq!(ryng.open(&sk, &ct), Ok(k1));
 //! assert_eq!((pk.len(), ct.len()), (1312, 1440));
 //! ```
 
@@ -662,16 +662,33 @@ impl Ryng {
         (ct, bytes(&res[p.k + 1]).try_into().expect("32"))
     }
 
-    /// Decapsulate. Never fails: a tampered ciphertext yields J(z ‖ ct)
-    /// (implicit rejection), chosen by mask inside the graph.
-    pub fn open(&self, sk: &[u8], ct: &[u8]) -> [u8; 32] {
+    /// Decapsulate. A well-formed but tampered ciphertext yields J(z ‖ ct)
+    /// (implicit rejection), chosen by mask inside the graph. A ciphertext of
+    /// the wrong length, or a malformed secret key, is an error — both are
+    /// public facts, so refusing them leaks nothing.
+    pub fn open(&self, sk: &[u8], ct: &[u8]) -> Result<[u8; 32], KemError> {
         let (p, fo) = (&self.p, self.fo());
+        if ct.len() != p.ct_bytes() {
+            return Err(KemError::CiphertextLength);
+        }
         let s_len = p.k * p.n * bits(p.q) as usize / 8;
         let pk_len = p.pk_bytes();
+        if sk.len() != s_len + pk_len + 64 {
+            return Err(KemError::SecretKey);
+        }
         let s = unpack(&sk[..s_len], bits(p.q), p.k * p.n);
         let pk = &sk[s_len..s_len + pk_len];
         let h = &sk[s_len + pk_len..s_len + pk_len + 32];
         let z = &sk[s_len + pk_len + 32..];
+        // s must be canonical residues and h must be H(pk): checked as a
+        // whole, so the verdict is one bit about a malformed key, not about s
+        let canonical = s
+            .iter()
+            .fold(0u32, |acc, &x| acc | (x.wrapping_sub(p.q) >> 31 ^ 1))
+            == 0;
+        if !canonical || hash256(b"pk", pk)[..] != *h {
+            return Err(KemError::SecretKey);
+        }
         let (rho, t1b) = pk.split_at(32);
         let a = sample_a(p, rho);
         let t1 = unpack(t1b, bits(p.q) - p.dt, p.k * p.n);
@@ -679,7 +696,7 @@ impl Ryng {
         let (jt, _) = graph::tail(32 + 32 + ct.len(), &[(0, &sep(b"reject")), (64, ct)]);
         let ins = [a, t1, s, words(z), u, v, g_tail(h), jt];
         let key = fo.open.g.eval(&ins, &[fo.open.key]).remove(0);
-        bytes(&key).try_into().expect("32")
+        Ok(bytes(&key).try_into().expect("32"))
     }
 
     fn unpack_ct(&self, ct: &[u8]) -> (Vec<u32>, Vec<u32>) {
@@ -690,6 +707,16 @@ impl Ryng {
             unpack(&ct[ub..], p.dv, p.n),
         )
     }
+}
+
+/// Why [`Ryng::open`] refused its inputs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KemError {
+    /// The ciphertext is not `Params::ct_bytes` long.
+    CiphertextLength,
+    /// The secret key has the wrong length, a coefficient of s that is not
+    /// a residue below q, or an H(pk) that does not match its pk.
+    SecretKey,
 }
 
 /// G's public tail: sep("seal") ‖ (m, filled in the graph) ‖ H(pk).

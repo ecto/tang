@@ -53,6 +53,15 @@ impl SigMetal {
         })
     }
 
+    /// Size every runner for batches of up to `batch` messages and touch the
+    /// memory now, so the first real batch runs at full speed.
+    pub fn reserve(&self, batch: usize) -> io::Result<()> {
+        // signing rounds stay about `max(batch, 32)` attempts wide
+        self.attempt.reserve(batch.max(32))?;
+        self.verify.reserve(batch)?;
+        self.verify_one_key.reserve(batch)
+    }
+
     /// Sign every message under one key. Returns the signatures in order.
     pub fn sign_batch(
         &self,
@@ -88,7 +97,14 @@ impl SigMetal {
             }
             let sets: Vec<Vec<Vec<u32>>> =
                 slots.par_iter().map(|&(i, a)| preps[i].tails(a)).collect();
-            let (outs, ns) = self.attempt.run_shared(&shared, &sets)?;
+            let bound: Vec<_> = self
+                .attempt
+                .shared_inputs()
+                .iter()
+                .copied()
+                .zip(shared.iter().map(Vec::as_slice))
+                .collect();
+            let (outs, ns) = self.attempt.run_shared(&bound, &sets)?;
             stats.device_ns += ns;
             stats.rounds += 1;
             // each message's lowest accepted attempt, exactly as the CPU loop
@@ -119,45 +135,67 @@ impl SigMetal {
         &self,
         items: &[(&[u8], &[u8], &[u8])],
     ) -> io::Result<(Vec<bool>, BatchStats)> {
-        // A once per distinct public key in the batch, sampled in parallel
-        let mut rhos: Vec<&[u8]> = items
-            .iter()
-            .filter(|(pk, _, _)| pk.len() >= 32)
-            .map(|(pk, _, _)| &pk[..32])
-            .collect();
-        rhos.sort();
-        rhos.dedup();
-        let cache: std::collections::HashMap<&[u8], Vec<u32>> =
-            rhos.par_iter().map(|rho| (*rho, matrix(rho))).collect();
-        let starts: Vec<_> = items
-            .par_iter()
-            .map(|(pk, m, s)| verify_start_with(pk, m, s, &mut |rho| cache[rho].clone()))
-            .collect();
         let mut stats = BatchStats::default();
-        let started: Vec<&Vec<Vec<u32>>> = starts.iter().flatten().map(|(ins, _)| ins).collect();
-        // one public key for the whole batch: A and t₁ go once
-        let one_key = started.len() > 1
-            && started
-                .iter()
-                .all(|ins| ins[1] == started[0][1] && ins[0] == started[0][0]);
-        let ws = if started.is_empty() {
-            Vec::new()
-        } else if one_key {
-            let shared = vec![started[0][0].clone(), started[0][1].clone()];
-            let sets: Vec<Vec<Vec<u32>>> = started
+        // one public key for the whole batch (by its bytes): A and t₁ go
+        // once, and no item carries its own copy of A
+        let one_key = items.len() > 1 && items.iter().all(|(pk, _, _)| *pk == items[0].0);
+        let (starts, ws): (Vec<_>, Vec<Vec<Vec<u32>>>) = if one_key {
+            let pk = items[0].0;
+            let a = if pk.len() >= 32 {
+                matrix(&pk[..32])
+            } else {
+                Vec::new()
+            };
+            let starts: Vec<_> = items
                 .par_iter()
-                .map(|ins| vec![ins[2].clone(), ins[3].clone()])
+                .map(|(pk, m, s)| verify_start_with(pk, m, s, &mut |_| Vec::new()))
                 .collect();
-            let (ws, ns) = self.verify_one_key.run_shared(&shared, &sets)?;
-            stats.device_ns = ns;
-            stats.rounds = 1;
-            ws
+            let started: Vec<&Vec<Vec<u32>>> =
+                starts.iter().flatten().map(|(ins, _)| ins).collect();
+            let ws = if started.is_empty() {
+                Vec::new()
+            } else {
+                let ids = self.verify_one_key.shared_inputs(); // [A, t₁]
+                let shared = [(ids[0], a.as_slice()), (ids[1], started[0][1].as_slice())];
+                let sets: Vec<Vec<Vec<u32>>> = started
+                    .par_iter()
+                    .map(|ins| vec![ins[2].clone(), ins[3].clone()])
+                    .collect();
+                let (ws, ns) = self.verify_one_key.run_shared(&shared, &sets)?;
+                stats.device_ns = ns;
+                stats.rounds = 1;
+                ws
+            };
+            (starts, ws)
         } else {
-            let sets: Vec<Vec<Vec<u32>>> = started.par_iter().map(|ins| (*ins).clone()).collect();
-            let (ws, ns) = self.verify.run(&sets)?;
-            stats.device_ns = ns;
-            stats.rounds = 1;
-            ws
+            // A once per distinct public key in the batch, sampled in parallel
+            let mut rhos: Vec<&[u8]> = items
+                .iter()
+                .filter(|(pk, _, _)| pk.len() >= 32)
+                .map(|(pk, _, _)| &pk[..32])
+                .collect();
+            rhos.sort();
+            rhos.dedup();
+            let cache: std::collections::HashMap<&[u8], Vec<u32>> =
+                rhos.par_iter().map(|rho| (*rho, matrix(rho))).collect();
+            let starts: Vec<_> = items
+                .par_iter()
+                .map(|(pk, m, s)| verify_start_with(pk, m, s, &mut |rho| cache[rho].clone()))
+                .collect();
+            let sets: Vec<Vec<Vec<u32>>> = starts
+                .par_iter()
+                .flatten()
+                .map(|(ins, _)| ins.clone())
+                .collect();
+            let ws = if sets.is_empty() {
+                Vec::new()
+            } else {
+                let (ws, ns) = self.verify.run(&sets)?;
+                stats.device_ns = ns;
+                stats.rounds = 1;
+                ws
+            };
+            (starts, ws)
         };
         // each started item's w, by position among the started ones
         let mut slot = Vec::with_capacity(starts.len());

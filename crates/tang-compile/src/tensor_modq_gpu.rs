@@ -53,7 +53,7 @@ DEV uint32_t ct_compress(uint32_t x, uint32_t d) {
 DEV uint32_t ct_decompress(uint32_t y, uint32_t d) {
     return (uint32_t)(((uint64_t)y * Q + (((uint64_t)1 << d) >> 1)) >> d);
 }
-DEV uint32_t ct_p2r(uint32_t x, uint32_t d) { return (x + ((1u << d) >> 1) - 1) >> d; }
+DEV uint32_t ct_p2r(uint32_t x, uint32_t d) { return d ? (x + (1u << (d - 1)) - 1) >> d : x; }
 DEV uint32_t ct_sel(uint32_t c, uint32_t a, uint32_t b) { uint32_t m = 0u - (c & 1); return (a & m) | (b & ~m); }
 DEV uint32_t ct_eq(uint32_t a, uint32_t b) { uint32_t d = a ^ b; return ((d | (0u - d)) >> 31) ^ 1; }
 DEV uint32_t ct_high(uint32_t r, uint64_t g2, uint64_t m) {
@@ -587,6 +587,16 @@ impl ModGraph {
         }
         let in_sizes = sizes.iter().filter(|s| !s.1).map(|s| s.0).collect();
         let shared_sizes = sizes.iter().filter(|s| s.1).map(|s| s.0).collect();
+        // shared inputs in input order: the order the runner reads them
+        let mut shared_ids: Vec<(usize, ModId)> = shared
+            .iter()
+            .map(|id| match self.nodes[id.0 as usize].op {
+                MOp::Input(k, _) => (k, *id),
+                _ => unreachable!("checked by shared_flags"),
+            })
+            .collect();
+        shared_ids.sort_by_key(|p| p.0);
+        let shared_ids = shared_ids.into_iter().map(|p| p.1).collect();
         let out_sizes = outputs
             .iter()
             .map(|o| self.shape(*o).iter().product())
@@ -597,6 +607,7 @@ impl ModGraph {
             extra,
             in_sizes,
             shared_sizes,
+            shared_ids,
             out_sizes,
             server: std::sync::Mutex::new(None),
         })
@@ -622,10 +633,10 @@ fn scratch(kind: &str) -> io::Result<PathBuf> {
 /// compiles the kernels once and keeps its buffers, then answers batches
 /// over a pipe until this value is dropped.
 ///
-/// The arena grows to the largest batch seen. The first batch after it
-/// grows pays for mapping the new memory (on an M4 Max, ~75 ms at 5 GB),
-/// which device timestamps do not show; send one batch of the largest size
-/// you will use before timing or serving. `TANG_MODQ_PROFILE=1` prints a
+/// The arena grows to the largest batch seen and is touched when it grows,
+/// so mapping fresh memory (on an M4 Max, ~75 ms at 5 GB) is paid there and
+/// not inside a later run. Call [`reserve`](Self::reserve) with the largest
+/// batch you will use to pay it up front. `TANG_MODQ_PROFILE=1` prints a
 /// per-batch breakdown (pack, server read/scatter/encode, commit-to-done).
 pub struct GpuCompiled {
     pub dir: PathBuf,
@@ -636,6 +647,8 @@ pub struct GpuCompiled {
     in_sizes: Vec<usize>,
     /// batch-wide inputs, in input order
     shared_sizes: Vec<usize>,
+    /// which inputs those are
+    shared_ids: Vec<ModId>,
     out_sizes: Vec<usize>,
     server: std::sync::Mutex<Option<Server>>,
 }
@@ -695,19 +708,64 @@ impl GpuCompiled {
         self.run_shared(&[], sets)
     }
 
-    /// Run a batch whose shared inputs are `shared` (in input order) and
-    /// whose per-instance inputs are `sets[b]` (the rest, in input order).
+    /// Grow the runner's arena to `batch` instances and touch its memory now,
+    /// so later batches up to that size run at device speed from the first.
+    pub fn reserve(&self, batch: usize) -> io::Result<()> {
+        use std::io::{Read, Write};
+        assert!(batch > 0 && batch < 1 << 31, "batch size");
+        let mut guard = self
+            .server
+            .lock()
+            .map_err(|_| io::Error::other("runner lock poisoned"))?;
+        if guard.is_none() {
+            *guard = Some(self.start()?);
+        }
+        let srv = guard.as_mut().expect("started");
+        let res = (|| -> io::Result<()> {
+            srv.stdin
+                .write_all(&(batch as u32 | 0x8000_0000).to_le_bytes())?;
+            srv.stdin.flush()?;
+            let mut ack = [0u8; 8];
+            srv.stdout.read_exact(&mut ack)
+        })();
+        if let Err(e) = res {
+            if let Some(mut dead) = guard.take() {
+                let _ = dead.child.kill();
+                let _ = dead.child.wait();
+            }
+            return Err(self.failure(e));
+        }
+        Ok(())
+    }
+
+    /// The shared inputs, in the order the runner reads them.
+    pub fn shared_inputs(&self) -> &[ModId] {
+        &self.shared_ids
+    }
+
+    /// Run a batch whose shared inputs are given as `(input, values)` pairs,
+    /// in any order, and whose per-instance inputs are `sets[b]` (the rest,
+    /// in input order). Every shared input must be given exactly once.
     pub fn run_shared(
         &self,
-        shared: &[Vec<u32>],
+        shared: &[(ModId, &[u32])],
         sets: &[Vec<Vec<u32>>],
     ) -> io::Result<(Vec<Vec<Vec<u32>>>, u64)> {
         use std::io::{Read, Write};
-        assert_eq!(
-            shared.iter().map(Vec::len).collect::<Vec<_>>(),
-            self.shared_sizes,
-            "shared input shapes"
-        );
+        assert_eq!(shared.len(), self.shared_ids.len(), "shared inputs given");
+        let shared: Vec<Vec<u32>> = self
+            .shared_ids
+            .iter()
+            .zip(&self.shared_sizes)
+            .map(|(id, &size)| {
+                let (_, v) = shared
+                    .iter()
+                    .find(|(given, _)| given == id)
+                    .unwrap_or_else(|| panic!("shared input {id:?} not given"));
+                assert_eq!(v.len(), size, "shared input {id:?} has the wrong length");
+                v.to_vec()
+            })
+            .collect();
         for set in sets {
             assert_eq!(
                 set.iter().map(Vec::len).collect::<Vec<_>>(),
@@ -731,7 +789,7 @@ impl GpuCompiled {
         let t0 = std::time::Instant::now();
         let mut req = Vec::with_capacity(4 + b * self.in_sizes.iter().sum::<usize>() * 4);
         req.extend((b as u32).to_le_bytes());
-        req.extend(le_bytes(shared));
+        req.extend(le_bytes(&shared));
         for set in sets {
             req.extend(le_bytes(set));
         }
@@ -746,7 +804,11 @@ impl GpuCompiled {
         let reply = match reply {
             Ok(r) => r,
             Err(e) => {
-                *guard = None; // a dead server is restarted on the next call
+                // a dead or wedged server: kill and reap it; the next call restarts it
+                if let Some(mut dead) = guard.take() {
+                    let _ = dead.child.kill();
+                    let _ = dead.child.wait();
+                }
                 return Err(self.failure(e));
             }
         };
@@ -831,11 +893,22 @@ int main(int argc, char **argv) {
       uint32_t B;
       if (!read_all(&B, 4) || B == 0) break;
       uint64_t T0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+      int reserve_only = (B & 0x80000000u) != 0; // grow the arena, run nothing
+      B &= 0x7fffffffu;
       if (B > cap) {
         arena = [dev newBufferWithLength:(DATA_TOTAL * B + 1) * 4 options:MTLResourceStorageModeShared];
         if (!arena) { fprintf(stderr, "arena of %llu MB: allocation failed\n", DATA_TOTAL * B * 4 / 1000000); return 8; }
+        // touch every page from the GPU now (a blit fill), so the first batch
+        // at this size does not pay for mapping fresh memory inside its run
+        id<MTLCommandBuffer> fill = [q commandBuffer];
+        id<MTLBlitCommandEncoder> bl = [fill blitCommandEncoder];
+        [bl fillBuffer:arena range:NSMakeRange(0, (DATA_TOTAL * B + 1) * 4) value:0];
+        [bl endEncoding];
+        [fill commit];
+        [fill waitUntilCompleted];
         cap = B;
       }
+      if (reserve_only) { uint64_t z = 0; fwrite(&z, 8, 1, stdout); fflush(stdout); continue; }
       // shared inputs: once per batch, into the constants arena
       for (int k = 1; k <= N_IN; k++)
         for (int i = 0; i < NODES; i++) if (KIND[i] == k && SHARED[i])
@@ -927,7 +1000,15 @@ int main(int argc, char **argv) {
   for (;;) {
     uint32_t B;
     if (!read_all(&B, 4) || B == 0) break;
-    if (B > cap) { if (arena) cudaFree(arena); cudaMalloc((void **)&arena, (DATA_TOTAL * B + 1) * 4); cap = B; }
+    int reserve_only = (B & 0x80000000u) != 0;
+    B &= 0x7fffffffu;
+    if (B > cap) {
+      if (arena) cudaFree(arena);
+      cudaMalloc((void **)&arena, (DATA_TOTAL * B + 1) * 4);
+      cudaMemset(arena, 0, (DATA_TOTAL * B + 1) * 4);
+      cap = B;
+    }
+    if (reserve_only) { uint64_t z = 0; fwrite(&z, 8, 1, stdout); fflush(stdout); continue; }
     for (int k = 1; k <= N_IN; k++)
       for (int i = 0; i < NODES; i++) if (KIND[i] == k && SHARED[i]) {
         if (!read_all(shbuf, SIZE[i] * 4)) return 5;
@@ -1083,7 +1164,7 @@ mod tests {
             .map(|_| vec![(0..256).map(|_| lcg(&mut st)).collect()])
             .collect();
         let (got, _) = built
-            .run_shared(std::slice::from_ref(&shared), &per)
+            .run_shared(&[(b, &shared)], &per)
             .expect("a Metal device");
         for (i, set) in per.iter().enumerate() {
             assert_eq!(
@@ -1092,11 +1173,11 @@ mod tests {
                 "instance {i}"
             );
         }
+        // reserve grows the arena without running; batches still answer
+        built.reserve(256).expect("reserve");
         // the server is reused: a second batch with a different shared value
         let shared2: Vec<u32> = (0..256).map(|_| lcg(&mut st)).collect();
-        let (got, _) = built
-            .run_shared(std::slice::from_ref(&shared2), &per[..5])
-            .unwrap();
+        let (got, _) = built.run_shared(&[(b, &shared2)], &per[..5]).unwrap();
         for (i, set) in per[..5].iter().enumerate() {
             assert_eq!(
                 got[i],
