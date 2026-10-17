@@ -124,7 +124,8 @@ struct Open {
     g: ModGraph,
     key: ModId,
     /// A, t₁, s, z and G's tail: fixed by the key, shared by a GPU batch
-    #[cfg_attr(not(all(test, target_os = "macos")), allow(dead_code))] // read by the Metal tests
+    /// (read only by the Metal tests, so unused off macOS)
+    #[cfg_attr(not(all(test, target_os = "macos")), allow(dead_code))]
     key_inputs: Vec<ModId>,
 }
 
