@@ -200,6 +200,8 @@ struct Attempt {
     h: Vec<ModId>,
     /// Ungated, for diagnostics only: (z ok, r₀ ok, c·t₀ ok, hints ok, hint count).
     checks: [ModId; 5],
+    /// The inputs fixed by the key — A, s₁, s₂, t₀, K — shared by a batch.
+    key_inputs: Vec<ModId>,
 }
 
 struct Verify {
@@ -223,6 +225,13 @@ pub struct SigningKey {
     s1: Vec<u32>,
     s2: Vec<u32>,
     t0: Vec<u32>,
+}
+
+impl SigningKey {
+    /// The public seed ρ (A is sampled from it).
+    pub fn rho(&self) -> &[u8] {
+        &self.rho
+    }
 }
 
 impl Default for Sig {
@@ -479,6 +488,7 @@ impl Sig {
             z,
             h,
             checks,
+            key_inputs: vec![a, s1, s2, t0, key],
         }
     }
 
@@ -591,6 +601,12 @@ impl Sig {
         (&at.g, outs)
     }
 
+    /// The attempt graph's key-fixed inputs (A, s₁, s₂, t₀, K), which a GPU
+    /// batch under one key sends once.
+    pub(crate) fn attempt_key_inputs(&self) -> Vec<ModId> {
+        self.attempt.key_inputs.clone()
+    }
+
     pub(crate) fn verify_graph(&self) -> (&ModGraph, Vec<ModId>) {
         (&self.verify.g, self.verify.w.clone())
     }
@@ -625,15 +641,19 @@ impl Sig {
 
 /// Per-message signing state: the public matrix and the two hash tails.
 pub(crate) struct Prepared {
-    a: Vec<u32>,
+    a: std::sync::Arc<Vec<u32>>,
     rho2_tail: Vec<u32>,
     c_tail: Vec<u32>,
 }
 
 impl Prepared {
     pub(crate) fn new(sk: &SigningKey, msg: &[u8]) -> Self {
+        Self::with_matrix(sk, msg, std::sync::Arc::new(sample_mat(&sk.rho, K, L)))
+    }
+
+    /// As [`new`](Self::new) with A already sampled — once per key, not per message.
+    pub(crate) fn with_matrix(sk: &SigningKey, msg: &[u8], a: std::sync::Arc<Vec<u32>>) -> Self {
         let mu = shake(b"sig/mu", &[&sk.tr, msg], 64);
-        let a = sample_mat(&sk.rho, K, L);
         let (rho2_tail, _) = tail(160, &[(0, &sep(b"sig/rho2")), (96, &mu)]);
         let (c_tail, _) = tail(32 + 64 + K * N / 2, &[(0, &sep(b"sig/c")), (32, &mu)]);
         Self {
@@ -646,6 +666,33 @@ impl Prepared {
     pub(crate) fn inputs(&self, sk: &SigningKey, attempt: usize) -> Vec<Vec<u32>> {
         attempt_inputs(sk, &self.a, &self.rho2_tail, &self.c_tail, attempt).to_vec()
     }
+
+    /// Only the per-message, per-attempt inputs: ρ″'s tail, the y tails, c̃'s tail.
+    pub(crate) fn tails(&self, attempt: usize) -> Vec<Vec<u32>> {
+        let mut y_tails = Vec::new();
+        for i in 0..L {
+            let nonce = ((attempt * L + i) as u16).to_le_bytes();
+            let (ti, _) = tail(32 + 64 + 2, &[(0, &sep(b"sig/y")), (96, &nonce)]);
+            y_tails.extend(ti);
+        }
+        vec![self.rho2_tail.clone(), y_tails, self.c_tail.clone()]
+    }
+}
+
+/// The key-fixed attempt inputs, in the order of [`Sig::attempt_key_inputs`].
+pub(crate) fn key_values(sk: &SigningKey, a: &[u32]) -> Vec<Vec<u32>> {
+    vec![
+        a.to_vec(),
+        sk.s1.clone(),
+        sk.s2.clone(),
+        sk.t0.clone(),
+        sk.key.clone(),
+    ]
+}
+
+/// A, sampled from a public key's ρ (public work; cache it per key).
+pub(crate) fn matrix(rho: &[u8]) -> Vec<u32> {
+    sample_mat(rho, K, L)
 }
 
 /// An attempt's outputs → the encoded signature, or `None` if it was rejected.
@@ -686,6 +733,16 @@ pub(crate) fn verify_start(
     msg: &[u8],
     sig: &[u8],
 ) -> Option<(Vec<Vec<u32>>, VerifyRest)> {
+    verify_start_with(pk, msg, sig, &mut |rho| sample_mat(rho, K, L))
+}
+
+/// As [`verify_start`], sampling A through `matrix` (so a batch can cache it).
+pub(crate) fn verify_start_with(
+    pk: &[u8],
+    msg: &[u8],
+    sig: &[u8],
+    matrix: &mut dyn FnMut(&[u8]) -> Vec<u32>,
+) -> Option<(Vec<Vec<u32>>, VerifyRest)> {
     if pk.len() != PK_BYTES || sig.len() != SIG_BYTES {
         return None;
     }
@@ -704,7 +761,7 @@ pub(crate) fn verify_start(
         return None;
     }
     let c = sample_in_ball_host(ctilde);
-    let a = sample_mat(rho, K, L);
+    let a = matrix(rho);
     let tr = shake(b"sig/tr", &[pk], 64);
     let mu = shake(b"sig/mu", &[&tr, msg], 64);
     Some((

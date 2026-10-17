@@ -376,9 +376,14 @@ mod compiled {
     use tang_compile::tensor::modq::c::welch_t;
 
     fn open_inputs(r: &Ryng, seed: u8) -> (Vec<Vec<u32>>, [u8; 32]) {
-        let p = r.p;
         let (pk, sk) = r.keygen(&[seed; 64]);
-        let (ct, key) = r.seal(&pk, &[seed ^ 0x55; 32]);
+        open_inputs_for(r, &pk, &sk, seed)
+    }
+
+    /// open's inputs for a fresh ciphertext (message byte `m`) under one key.
+    fn open_inputs_for(r: &Ryng, pk: &[u8], sk: &[u8], m: u8) -> (Vec<Vec<u32>>, [u8; 32]) {
+        let p = r.p;
+        let (ct, key) = r.seal(pk, &[m ^ 0x55; 32]);
         let s_len = p.k * p.n * bits(p.q) as usize / 8;
         let s = unpack(&sk[..s_len], bits(p.q), p.k * p.n);
         let pk_len = p.pk_bytes();
@@ -501,34 +506,59 @@ mod compiled {
                 "open, C -O2 (noinline bodies), one core: {:.1} µs",
                 cpu / 1e3
             );
-            // grouped (one dispatch per kernel per level) against ungrouped (one per
-            // launch), alternated so drift hits both
-            for round in 0..3 {
-                for mode in ["grouped", "ungrouped"] {
-                    if mode == "ungrouped" {
-                        std::env::set_var("TANG_MODQ_UNGROUPED", "1");
-                    } else {
-                        std::env::remove_var("TANG_MODQ_UNGROUPED");
-                    }
-                    for b in [1usize, 2048] {
-                        let sets: Vec<_> = (0..b).map(|i| cases[i % 4].0.clone()).collect();
-                        let (_, ns) = built.run(&sets).unwrap();
-                        eprintln!(
-                            "round {round} {mode:9} batch {b:4}: {:6.2} ms",
-                            ns as f64 / 1e6
-                        );
-                    }
-                }
+            // one key for the whole batch: its inputs go once, each instance
+            // sends only its ciphertext (u, v) and rejection tail
+            let shared_built = fo
+                .open
+                .g
+                .compile_metal_shared(&[fo.open.key], &fo.open.key_inputs)
+                .expect("clang with Metal");
+            let (pk, sk) = r.keygen(&[44; 64]);
+            let per_key: Vec<(Vec<Vec<u32>>, [u8; 32])> = (0..4u8)
+                .map(|i| {
+                    let (ins, key) = open_inputs_for(&r, &pk, &sk, i);
+                    (ins, key)
+                })
+                .collect();
+            let shared: Vec<Vec<u32>> = [0, 1, 2, 3, 6]
+                .iter()
+                .map(|&k| per_key[0].0[k].clone())
+                .collect();
+            let per = |i: usize| -> Vec<Vec<u32>> {
+                [4, 5, 7]
+                    .iter()
+                    .map(|&k| per_key[i % 4].0[k].clone())
+                    .collect()
+            };
+            let (got, _) = shared_built
+                .run_shared(&shared, &(0..8).map(per).collect::<Vec<_>>())
+                .unwrap();
+            for (i, out) in got.iter().enumerate() {
+                assert_eq!(bytes(&out[0]), per_key[i % 4].1, "shared-key instance {i}");
             }
-            std::env::remove_var("TANG_MODQ_UNGROUPED");
+            for b in [1usize, 32, 128, 512, 2048] {
+                let sets: Vec<_> = (0..b).map(per).collect();
+                let t0 = std::time::Instant::now();
+                let (_, ns) = shared_built.run_shared(&shared, &sets).unwrap();
+                let wall = t0.elapsed().as_nanos() as f64;
+                eprintln!(
+                    "open, Metal one key, batch {b:4}: {:8.2} ms device, {:8.2} ms wall, {:7.1} µs per open (wall)",
+                    ns as f64 / 1e6,
+                    wall / 1e6,
+                    wall / 1e3 / b as f64
+                );
+            }
             for b in [1usize, 32, 128, 512, 2048] {
                 let sets: Vec<_> = (0..b).map(|i| cases[i % 4].0.clone()).collect();
+                let t0 = std::time::Instant::now();
                 let (_, ns) = built.run(&sets).unwrap();
+                let wall = t0.elapsed().as_nanos() as f64;
                 eprintln!(
-                    "open, Metal batch {b:4}: {:8.2} ms device, {:7.1} µs per open, {:5.1}× one C core",
+                    "open, Metal batch {b:4}: {:8.2} ms device, {:8.2} ms wall, {:7.1} µs per open (wall), {:5.1}× one C core",
                     ns as f64 / 1e6,
-                    ns as f64 / 1e3 / b as f64,
-                    cpu * b as f64 / ns as f64
+                    wall / 1e6,
+                    wall / 1e3 / b as f64,
+                    cpu * b as f64 / wall
                 );
             }
         }
@@ -694,28 +724,34 @@ fn signature_on_metal() {
     for b in [1usize, 64, 512, 1024] {
         let ms: Vec<Vec<u8>> = (0..b).map(|i| (i as u32).to_le_bytes().to_vec()).collect();
         let rs: Vec<&[u8]> = ms.iter().map(|m| m.as_slice()).collect();
+        let t0 = std::time::Instant::now();
         let (sg, st) = gpu.sign_batch(&sk, &rs).unwrap();
+        let wall = t0.elapsed().as_nanos() as f64;
         let per = st.device_ns as f64 / b as f64;
         eprintln!(
-            "Metal sign   batch {b:4}: {:3} rounds, {:7.2} ms device, {:7.1} µs/signature, {:5.1}× one C core",
+            "Metal sign   batch {b:4}: {:3} rounds, {:7.2} ms device, {:7.2} ms wall, {:7.1} µs/signature device, {:7.1} wall",
             st.rounds,
             st.device_ns as f64 / 1e6,
+            wall / 1e6,
             per / 1e3,
-            c_attempt * mean_attempts / per
+            wall / 1e3 / b as f64
         );
         let items: Vec<(&[u8], &[u8], &[u8])> = rs
             .iter()
             .zip(&sg)
             .map(|(m, g)| (&pk[..], *m, &g[..]))
             .collect();
+        let t0 = std::time::Instant::now();
         let (ok, vt) = gpu.verify_batch(&items).unwrap();
+        let wall = t0.elapsed().as_nanos() as f64;
         assert!(ok.iter().all(|&x| x));
         let per = vt.device_ns as f64 / b as f64;
         eprintln!(
-            "Metal verify batch {b:4}:            {:7.2} ms device, {:7.1} µs/verify,    {:5.1}× one C core",
+            "Metal verify batch {b:4}:             {:7.2} ms device, {:7.2} ms wall, {:7.1} µs/verify device,    {:7.1} wall",
             vt.device_ns as f64 / 1e6,
+            wall / 1e6,
             per / 1e3,
-            c_verify / per
+            wall / 1e3 / b as f64
         );
     }
 }

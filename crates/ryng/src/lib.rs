@@ -123,6 +123,9 @@ struct Seal {
 struct Open {
     g: ModGraph,
     key: ModId,
+    /// A, t₁, s, z and G's tail: fixed by the key, shared by a GPU batch
+    #[cfg_attr(not(test), allow(dead_code))]
+    key_inputs: Vec<ModId>,
 }
 
 /// The Fujisaki–Okamoto KEM as graphs: every hash of m, z, σ or d is Keccak
@@ -468,7 +471,11 @@ impl Fo {
                 b.sel(ok, kk, rj)
             },
         );
-        let open = Open { g, key };
+        let open = Open {
+            g,
+            key,
+            key_inputs: vec![a, t1, s, z, g_tail],
+        };
 
         Self {
             seeds,

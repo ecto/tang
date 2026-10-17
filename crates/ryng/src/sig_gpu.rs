@@ -11,7 +11,9 @@
 //! Verification is the public verify graph, batched; parsing, hint
 //! decoding and the final hash stay on the host.
 
-use crate::sig::{finish_signature, verify_start, Prepared, Sig, SigningKey};
+use crate::sig::{
+    finish_signature, key_values, matrix, verify_start_with, Prepared, Sig, SigningKey,
+};
 use std::io;
 use tang_compile::tensor::modq::gpu::GpuCompiled;
 
@@ -36,7 +38,8 @@ pub struct BatchStats {
 impl SigMetal {
     pub fn new(sig: &Sig) -> io::Result<Self> {
         let (g, outs) = sig.attempt_graph_outputs();
-        let attempt = g.compile_metal(&outs)?;
+        // A, s₁, s₂, t₀, K go once per batch: one key signs the whole batch
+        let attempt = g.compile_metal_shared(&outs, &sig.attempt_key_inputs())?;
         let (g, outs) = sig.verify_graph();
         let verify = g.compile_metal(&outs)?;
         Ok(Self { attempt, verify })
@@ -48,7 +51,13 @@ impl SigMetal {
         sk: &SigningKey,
         msgs: &[&[u8]],
     ) -> io::Result<(Vec<Vec<u8>>, BatchStats)> {
-        let preps: Vec<Prepared> = msgs.iter().map(|m| Prepared::new(sk, m)).collect();
+        // A once per key, not once per message
+        let a = std::sync::Arc::new(matrix(sk.rho()));
+        let shared = key_values(sk, &a);
+        let preps: Vec<Prepared> = msgs
+            .iter()
+            .map(|m| Prepared::with_matrix(sk, m, a.clone()))
+            .collect();
         let mut sigs: Vec<Option<Vec<u8>>> = vec![None; msgs.len()];
         let mut pending: Vec<usize> = (0..msgs.len()).collect();
         let mut stats = BatchStats::default();
@@ -69,9 +78,8 @@ impl SigMetal {
                     slots.push((i, next[i] + j));
                 }
             }
-            let sets: Vec<Vec<Vec<u32>>> =
-                slots.iter().map(|&(i, a)| preps[i].inputs(sk, a)).collect();
-            let (outs, ns) = self.attempt.run(&sets)?;
+            let sets: Vec<Vec<Vec<u32>>> = slots.iter().map(|&(i, a)| preps[i].tails(a)).collect();
+            let (outs, ns) = self.attempt.run_shared(&shared, &sets)?;
             stats.device_ns += ns;
             stats.rounds += 1;
             // each message's lowest accepted attempt, exactly as the CPU loop
@@ -100,9 +108,17 @@ impl SigMetal {
         &self,
         items: &[(&[u8], &[u8], &[u8])],
     ) -> io::Result<(Vec<bool>, BatchStats)> {
+        // A once per distinct public key in the batch
+        let mut cache: std::collections::HashMap<Vec<u8>, Vec<u32>> = Default::default();
+        let mut sample = |rho: &[u8]| {
+            cache
+                .entry(rho.to_vec())
+                .or_insert_with(|| matrix(rho))
+                .clone()
+        };
         let starts: Vec<_> = items
             .iter()
-            .map(|(pk, m, s)| verify_start(pk, m, s))
+            .map(|(pk, m, s)| verify_start_with(pk, m, s, &mut sample))
             .collect();
         let sets: Vec<Vec<Vec<u32>>> = starts
             .iter()

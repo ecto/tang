@@ -104,8 +104,24 @@ impl ModGraph {
         }
     }
 
-    fn is_const(&self, i: usize) -> bool {
-        matches!(self.nodes[self.storage(i)].op, MOp::Const(_))
+    /// Read without a batch offset: a constant, or an input shared by the
+    /// whole batch (`shared[node]`).
+    fn batchwide(&self, i: usize, shared: &[bool]) -> bool {
+        let j = self.storage(i);
+        matches!(self.nodes[j].op, MOp::Const(_)) || shared[j]
+    }
+
+    /// Node-indexed flags for a list of shared input ids.
+    fn shared_flags(&self, shared: &[ModId]) -> Vec<bool> {
+        let mut f = vec![false; self.nodes.len()];
+        for id in shared {
+            assert!(
+                matches!(self.nodes[id.0 as usize].op, MOp::Input(..)),
+                "only inputs can be shared"
+            );
+            f[id.0 as usize] = true;
+        }
+        f
     }
 
     /// Each node's level: 0 for inputs and constants, else one past the
@@ -130,7 +146,7 @@ impl ModGraph {
 
     /// Arena offsets: a data node's region starts at `batch · data[i]`, a
     /// constant's at `consts[i]` in the constants arena. Aliases get none.
-    fn arena(&self) -> (Vec<u64>, Vec<u64>, u64, u64) {
+    fn arena(&self, shared: &[bool]) -> (Vec<u64>, Vec<u64>, u64, u64) {
         let (mut data, mut consts) = (vec![0u64; self.nodes.len()], vec![0u64; self.nodes.len()]);
         let (mut d, mut c) = (0u64, 0u64);
         for (i, n) in self.nodes.iter().enumerate() {
@@ -138,6 +154,10 @@ impl ModGraph {
             match n.op {
                 MOp::Reshape(_) | MOp::Declassify { .. } => {}
                 MOp::Const(_) => {
+                    consts[i] = c;
+                    c += size;
+                }
+                MOp::Input(..) if shared[i] => {
                     consts[i] = c;
                     c += size;
                 }
@@ -154,7 +174,7 @@ impl ModGraph {
     /// offset — where a node's data, a constant table, or a view starts — is a
     /// runtime parameter, so the 24 rounds of a Keccak, or two NTTs, share
     /// one kernel; launches differ only in their parameter slices.
-    fn gpu_kernels(&self, dialect: Gpu) -> (String, Vec<Launch>, usize) {
+    fn gpu_kernels(&self, dialect: Gpu, shared: &[bool]) -> (String, Vec<Launch>, usize) {
         let f = self.f;
         let mut s = String::new();
         match dialect {
@@ -180,7 +200,7 @@ impl ModGraph {
             "DEV void kf@K@(uint32_t g, {dev_c} uint32_t *cst, {dev_d} uint32_t *arena, uint32_t batch, {dev_c} uint64_t *P)"
         );
         let gid = "";
-        let (data_off, const_off, _, _) = self.arena();
+        let (data_off, const_off, _, _) = self.arena(shared);
         let levels = self.levels();
         let mut kernels: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
@@ -214,7 +234,7 @@ impl ModGraph {
             let mut k = String::new();
             // where source `src`'s element `flat` of instance b lives
             let at = |src: usize, flat: &str, param: &mut dyn FnMut(u64) -> String| -> String {
-                if self.is_const(src) {
+                if self.batchwide(src, shared) {
                     format!("cst[{} + (uint64_t)({flat})]", param(const_off[src]))
                 } else {
                     let sz: usize = self.nodes[src].shape.iter().product();
@@ -347,7 +367,7 @@ impl ModGraph {
 
     /// The tables a host needs: node sizes, which nodes are inputs or
     /// constants, and the launch list.
-    fn host_tables(&self, outputs: &[ModId], launches: &[Launch]) -> String {
+    fn host_tables(&self, outputs: &[ModId], launches: &[Launch], shared: &[bool]) -> String {
         let mut s = String::new();
         let sizes: Vec<String> = self
             .nodes
@@ -395,6 +415,8 @@ impl ModGraph {
             sizes.join(",")
         );
         let _ = writeln!(s, "static const int KIND[] = {{{}}};", kind.join(","));
+        let sh: Vec<&str> = shared.iter().map(|&b| if b { "1" } else { "0" }).collect();
+        let _ = writeln!(s, "static const char SHARED[] = {{{}}};", sh.join(","));
         let _ = writeln!(
             s,
             "static const uint32_t *CONSTS[] = {{{}}};",
@@ -404,7 +426,7 @@ impl ModGraph {
             .map(|i| self.storage(i).to_string())
             .collect();
         let _ = writeln!(s, "static const int STORAGE[] = {{{}}};", storage.join(","));
-        let (data, consts_off, dt, ct) = self.arena();
+        let (data, consts_off, dt, ct) = self.arena(shared);
         let join = |v: &[u64]| {
             v.iter()
                 .map(|x| format!("{x}ull"))
@@ -451,8 +473,15 @@ impl ModGraph {
 
     /// The Metal shader source and its Objective-C host.
     pub fn to_metal(&self, outputs: &[ModId]) -> (String, String) {
-        let (msl, launches, kernels) = self.gpu_kernels(Gpu::Metal);
-        let tables = self.host_tables(outputs, &launches);
+        self.to_metal_shared(outputs, &[])
+    }
+
+    /// As [`to_metal`](Self::to_metal), with `shared` inputs sent once per
+    /// batch instead of once per instance.
+    pub fn to_metal_shared(&self, outputs: &[ModId], shared: &[ModId]) -> (String, String) {
+        let shared = self.shared_flags(shared);
+        let (msl, launches, kernels) = self.gpu_kernels(Gpu::Metal, &shared);
+        let tables = self.host_tables(outputs, &launches, &shared);
         let host = format!(
             "#include <stdint.h>\n#include <stddef.h>\n#include <string.h>\n{tables}#define KERNELS_N {kernels}\n{METAL_HOST}"
         );
@@ -462,7 +491,12 @@ impl ModGraph {
     /// One CUDA translation unit: kernels and a host `main` with the same
     /// stdin/stdout protocol as the Metal and C runners.
     pub fn to_cuda(&self, outputs: &[ModId]) -> String {
-        let (cu, launches, kernels) = self.gpu_kernels(Gpu::Cuda);
+        self.to_cuda_shared(outputs, &[])
+    }
+
+    pub fn to_cuda_shared(&self, outputs: &[ModId], shared: &[ModId]) -> String {
+        let flags = self.shared_flags(shared);
+        let (cu, launches, kernels) = self.gpu_kernels(Gpu::Cuda, &flags);
         let mut table = String::from("static void *KERNELS[] = {");
         for k in 0..kernels {
             let _ = write!(table, "(void *)k{k},");
@@ -470,14 +504,24 @@ impl ModGraph {
         table.push_str("};\n");
         format!(
             "{cu}\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n{}{table}{CUDA_HOST}",
-            self.host_tables(outputs, &launches)
+            self.host_tables(outputs, &launches, &flags)
         )
     }
 
     /// Build the Metal runner (clang, Foundation + Metal frameworks).
     pub fn compile_metal(&self, outputs: &[ModId]) -> io::Result<GpuCompiled> {
+        self.compile_metal_shared(outputs, &[])
+    }
+
+    /// Build the Metal runner with `shared` inputs: one value per batch,
+    /// passed to [`GpuCompiled::run_shared`].
+    pub fn compile_metal_shared(
+        &self,
+        outputs: &[ModId],
+        shared: &[ModId],
+    ) -> io::Result<GpuCompiled> {
         let dir = scratch("metal")?;
-        let (msl, host) = self.to_metal(outputs);
+        let (msl, host) = self.to_metal_shared(outputs, shared);
         std::fs::write(dir.join("graph.metal"), msl)?;
         std::fs::write(dir.join("host.m"), host)?;
         let exe = dir.join("graph");
@@ -498,13 +542,21 @@ impl ModGraph {
         if !st.success() {
             return Err(io::Error::other("clang failed on the Metal host"));
         }
-        self.gpu_compiled(dir, exe, vec![dir_arg("graph.metal")], outputs)
+        self.gpu_compiled(dir, exe, vec![dir_arg("graph.metal")], outputs, shared)
     }
 
     /// Build the CUDA runner with `nvcc` (`$NVCC`, else `nvcc`).
     pub fn compile_cuda(&self, outputs: &[ModId]) -> io::Result<GpuCompiled> {
+        self.compile_cuda_shared(outputs, &[])
+    }
+
+    pub fn compile_cuda_shared(
+        &self,
+        outputs: &[ModId],
+        shared: &[ModId],
+    ) -> io::Result<GpuCompiled> {
         let dir = scratch("cuda")?;
-        std::fs::write(dir.join("graph.cu"), self.to_cuda(outputs))?;
+        std::fs::write(dir.join("graph.cu"), self.to_cuda_shared(outputs, shared))?;
         let exe = dir.join("graph");
         let nvcc = std::env::var("NVCC").unwrap_or_else(|_| "nvcc".into());
         let st = Command::new(nvcc)
@@ -515,7 +567,7 @@ impl ModGraph {
         if !st.success() {
             return Err(io::Error::other("nvcc failed"));
         }
-        self.gpu_compiled(dir, exe, vec![], outputs)
+        self.gpu_compiled(dir, exe, vec![], outputs, shared)
     }
 
     fn gpu_compiled(
@@ -524,13 +576,17 @@ impl ModGraph {
         exe: PathBuf,
         extra: Vec<String>,
         outputs: &[ModId],
+        shared: &[ModId],
     ) -> io::Result<GpuCompiled> {
-        let mut in_sizes = vec![0; self.inputs];
-        for n in &self.nodes {
+        let flags = self.shared_flags(shared);
+        let mut sizes = vec![(0usize, false); self.inputs];
+        for (i, n) in self.nodes.iter().enumerate() {
             if let MOp::Input(k, _) = n.op {
-                in_sizes[k] = n.shape.iter().product();
+                sizes[k] = (n.shape.iter().product(), flags[i]);
             }
         }
+        let in_sizes = sizes.iter().filter(|s| !s.1).map(|s| s.0).collect();
+        let shared_sizes = sizes.iter().filter(|s| s.1).map(|s| s.0).collect();
         let out_sizes = outputs
             .iter()
             .map(|o| self.shape(*o).iter().product())
@@ -540,7 +596,9 @@ impl ModGraph {
             exe,
             extra,
             in_sizes,
+            shared_sizes,
             out_sizes,
+            server: std::sync::Mutex::new(None),
         })
     }
 }
@@ -560,18 +618,36 @@ fn scratch(kind: &str) -> io::Result<PathBuf> {
     Ok(dir)
 }
 
-/// A built GPU runner.
+/// A built GPU runner. The runner is a server: started on first use, it
+/// compiles the kernels once and keeps its buffers, then answers batches
+/// over a pipe until this value is dropped.
 pub struct GpuCompiled {
     pub dir: PathBuf,
     exe: PathBuf,
     /// files the runner reads, relative to `dir` (the Metal source)
     extra: Vec<String>,
+    /// per-instance inputs, in input order
     in_sizes: Vec<usize>,
+    /// batch-wide inputs, in input order
+    shared_sizes: Vec<usize>,
     out_sizes: Vec<usize>,
+    server: std::sync::Mutex<Option<Server>>,
+}
+
+struct Server {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    stdout: std::io::BufReader<std::process::ChildStdout>,
 }
 
 impl Drop for GpuCompiled {
     fn drop(&mut self) {
+        if let Ok(mut s) = self.server.lock() {
+            if let Some(mut srv) = s.take() {
+                drop(srv.stdin); // EOF: the server exits
+                let _ = srv.child.wait();
+            }
+        }
         if std::env::var_os("TANG_MODQ_KEEP").is_none() {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
@@ -579,10 +655,53 @@ impl Drop for GpuCompiled {
 }
 
 impl GpuCompiled {
+    fn start(&self) -> io::Result<Server> {
+        let log = std::fs::File::create(self.dir.join("stderr.log"))?;
+        let mut child = Command::new(&self.exe)
+            .args(self.extra.iter().map(|e| self.dir.join(e)))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(log))
+            .spawn()?;
+        let stdin = child.stdin.take().expect("stdin");
+        let stdout =
+            std::io::BufReader::with_capacity(1 << 20, child.stdout.take().expect("stdout"));
+        Ok(Server {
+            child,
+            stdin,
+            stdout,
+        })
+    }
+
+    fn failure(&self, e: io::Error) -> io::Error {
+        let log = std::fs::read_to_string(self.dir.join("stderr.log")).unwrap_or_default();
+        if log.is_empty() {
+            e
+        } else {
+            io::Error::other(log)
+        }
+    }
+
     /// Run a batch: `sets[b]` is instance b's inputs. Returns each
     /// instance's outputs and the device time of the whole batch in ns.
+    /// The first call also pays for compiling the kernels.
     pub fn run(&self, sets: &[Vec<Vec<u32>>]) -> io::Result<(Vec<Vec<Vec<u32>>>, u64)> {
-        use std::io::Write;
+        self.run_shared(&[], sets)
+    }
+
+    /// Run a batch whose shared inputs are `shared` (in input order) and
+    /// whose per-instance inputs are `sets[b]` (the rest, in input order).
+    pub fn run_shared(
+        &self,
+        shared: &[Vec<u32>],
+        sets: &[Vec<Vec<u32>>],
+    ) -> io::Result<(Vec<Vec<Vec<u32>>>, u64)> {
+        use std::io::{Read, Write};
+        assert_eq!(
+            shared.iter().map(Vec::len).collect::<Vec<_>>(),
+            self.shared_sizes,
+            "shared input shapes"
+        );
         for set in sets {
             assert_eq!(
                 set.iter().map(Vec::len).collect::<Vec<_>>(),
@@ -590,33 +709,45 @@ impl GpuCompiled {
                 "input shapes"
             );
         }
-        let mut child = Command::new(&self.exe)
-            .arg(sets.len().to_string())
-            .args(self.extra.iter().map(|e| self.dir.join(e)))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let bytes: Vec<u8> = sets.iter().flat_map(|s| le_bytes(s)).collect();
-        // a runner that fails early closes stdin; its stderr says why
-        let _ = child.stdin.take().expect("stdin").write_all(&bytes);
-        let out = child.wait_with_output()?;
-        if !out.status.success() {
-            return Err(io::Error::other(
-                String::from_utf8_lossy(&out.stderr).into_owned(),
-            ));
+        if sets.is_empty() {
+            return Ok((Vec::new(), 0));
         }
-        if std::env::var_os("TANG_MODQ_VERBOSE").is_some() {
-            eprint!("{}", String::from_utf8_lossy(&out.stderr));
+        let mut guard = self
+            .server
+            .lock()
+            .map_err(|_| io::Error::other("runner lock poisoned"))?;
+        if guard.is_none() {
+            *guard = Some(self.start()?);
         }
-        let (time, rest) = out.stdout.split_at(8);
+        let srv = guard.as_mut().expect("started");
+        let b = sets.len();
+        let mut req = Vec::with_capacity(4 + b * self.in_sizes.iter().sum::<usize>() * 4);
+        req.extend((b as u32).to_le_bytes());
+        req.extend(le_bytes(shared));
+        for set in sets {
+            req.extend(le_bytes(set));
+        }
+        let reply = (|| -> io::Result<Vec<u8>> {
+            srv.stdin.write_all(&req)?;
+            srv.stdin.flush()?;
+            let mut buf = vec![0u8; 8 + 4 * b * self.out_sizes.iter().sum::<usize>()];
+            srv.stdout.read_exact(&mut buf)?;
+            Ok(buf)
+        })();
+        let reply = match reply {
+            Ok(r) => r,
+            Err(e) => {
+                *guard = None; // a dead server is restarted on the next call
+                return Err(self.failure(e));
+            }
+        };
+        let (time, rest) = reply.split_at(8);
         let ns = u64::from_le_bytes(time.try_into().expect("8 bytes"));
         let words: Vec<u32> = rest
             .chunks(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         // the runner writes outputs as [output][batch][size]
-        let b = sets.len();
         let mut res = vec![Vec::new(); b];
         let mut at = 0;
         for &n in &self.out_sizes {
@@ -633,91 +764,103 @@ const METAL_HOST: &str = r#"
 #import <Metal/Metal.h>
 #include <stdio.h>
 #include <stdlib.h>
+// A server: compile once, then answer batches until stdin closes.
+// Request: u32 B, then B instances' inputs. Reply: u64 device ns, then outputs.
+static int read_all(void *p, size_t n) { return fread(p, 1, n, stdin) == n; }
 int main(int argc, char **argv) {
   @autoreleasepool {
-    if (argc < 3) return 2;
-    uint32_t B = (uint32_t)atoi(argv[1]);
+    if (argc < 2) return 2;
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     NSError *err = nil;
-    NSString *src = [NSString stringWithContentsOfFile:[NSString stringWithUTF8String:argv[2]] encoding:NSUTF8StringEncoding error:&err];
+    NSString *src = [NSString stringWithContentsOfFile:[NSString stringWithUTF8String:argv[1]] encoding:NSUTF8StringEncoding error:&err];
     if (!src) { fprintf(stderr, "read: %s\n", [[err description] UTF8String]); return 3; }
-    MTLCompileOptions *opt = [MTLCompileOptions new];
-    id<MTLLibrary> lib = [dev newLibraryWithSource:src options:opt error:&err];
+    id<MTLLibrary> lib = [dev newLibraryWithSource:src options:[MTLCompileOptions new] error:&err];
     if (!lib) { fprintf(stderr, "compile: %s\n", [[err description] UTF8String]); return 4; }
-    // inputs arrive per instance: [batch][input][size]; buffers want [input][batch][size]
-    size_t per_set = 0; for (int i = 0; i < NODES; i++) if (KIND[i] > 0) per_set += SIZE[i];
-    uint32_t *raw = malloc(per_set * B * 4 + 4);
-    if (fread(raw, 4, per_set * B, stdin) != per_set * B) return 5;
-    id<MTLBuffer> cst = [dev newBufferWithLength:(CONST_TOTAL + 1) * 4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> arena = [dev newBufferWithLength:(DATA_TOTAL * B + 1) * 4 options:MTLResourceStorageModeShared];
-    if (!arena) { fprintf(stderr, "arena of %llu MB: allocation failed\n", DATA_TOTAL * B * 4 / 1000000); return 8; }
-    uint32_t *cp = [cst contents], *ap = [arena contents];
-    for (int i = 0; i < NODES; i++) if (KIND[i] == -1) memcpy(cp + CONST_OFF[i], CONSTS[i], SIZE[i] * 4);
-    for (int k = 1; k <= N_IN; k++) {
-      size_t off = 0;
-      for (int i = 0; i < NODES; i++) if (KIND[i] > 0 && KIND[i] < k) off += SIZE[i];
-      for (int i = 0; i < NODES; i++) if (KIND[i] == k)
-        for (uint32_t b = 0; b < B; b++) memcpy(ap + B * DATA_OFF[i] + (uint64_t)b * SIZE[i], raw + b * per_set + off, SIZE[i] * 4);
-    }
     static id<MTLComputePipelineState> pipes[KERNELS_N];
     for (int k = 0; k < KERNELS_N; k++) {
       id<MTLFunction> fn = [lib newFunctionWithName:[NSString stringWithFormat:@"k%d", k]];
       pipes[k] = [dev newComputePipelineStateWithFunction:fn error:&err];
       if (!pipes[k]) { fprintf(stderr, "pipeline %d: %s\n", k, [[err description] UTF8String]); return 6; }
     }
+    id<MTLBuffer> cst = [dev newBufferWithLength:(CONST_TOTAL + 1) * 4 options:MTLResourceStorageModeShared];
+    uint32_t *cp = [cst contents];
+    for (int i = 0; i < NODES; i++) if (KIND[i] == -1) memcpy(cp + CONST_OFF[i], CONSTS[i], SIZE[i] * 4);
     id<MTLBuffer> pbuf = [dev newBufferWithBytes:PARAMS length:(N_PARAMS ? N_PARAMS : 1) * 8 options:MTLResourceStorageModeShared];
-    // groups: for each level, for each kernel, its launches as (kernel, first thread, params offset)
     id<MTLBuffer> lvb = [dev newBufferWithLength:(LAUNCHES * 3 + 3) * 4 options:MTLResourceStorageModeShared];
     uint32_t *lv = [lvb contents];
     int *by_level = malloc(sizeof(int) * (LAUNCHES + 1));
     size_t nb = 0;
     for (int L = 0; L < LEVELS; L++) for (int l = 0; l < LAUNCHES; l++) if (L_LEVEL[l] == L) by_level[nb++] = l;
-    id<MTLCommandQueue> q = [dev newCommandQueue];
-    id<MTLCommandBuffer> cb = [q commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-    [enc setBuffer:cst offset:0 atIndex:0];
-    [enc setBuffer:arena offset:0 atIndex:1];
-    [enc setBytes:&B length:4 atIndex:2];
-    [enc setBuffer:pbuf offset:0 atIndex:3];
-    int dispatches = 0;
-    size_t w = 0, at = 0;
-    char *used = calloc(LAUNCHES, 1);
+    char *used = malloc(LAUNCHES + 1);
     int ungroup = getenv("TANG_MODQ_UNGROUPED") != NULL; // one launch per dispatch, for comparison
-    while (at < nb) {
-      int L = L_LEVEL[by_level[at]];
-      size_t end = at; while (end < nb && L_LEVEL[by_level[end]] == L) end++;
-      for (size_t a = at; a < end; a++) {
-        int l0 = by_level[a]; if (used[l0]) continue;
-        int k = L_KERNEL[l0];
-        size_t first = w; uint32_t start = 0, n = 0;
-        for (size_t c = a; c < end; c++) {
-          int l = by_level[c]; if (used[l] || L_KERNEL[l] != k || (ungroup && l != l0)) continue;
-          used[l] = 1;
-          lv[3 * w] = k; lv[3 * w + 1] = start; lv[3 * w + 2] = (uint32_t)L_POFF[l];
-          start += (uint32_t)(L_PER[l] * B); w++; n++;
-        }
-        id<MTLComputePipelineState> pl = pipes[k];
-        [enc setComputePipelineState:pl];
-        [enc setBuffer:lvb offset:first * 12 atIndex:4];
-        [enc setBytes:&n length:4 atIndex:5];
-        NSUInteger tg = pl.maxTotalThreadsPerThreadgroup; if (tg > 256) tg = 256;
-        [enc dispatchThreads:MTLSizeMake(start, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-        dispatches++;
+    size_t per_set = 0; for (int i = 0; i < NODES; i++) if (KIND[i] > 0 && !SHARED[i]) per_set += SIZE[i];
+    size_t in_off[N_IN + 2];
+    for (int k = 1; k <= N_IN; k++) { in_off[k] = 0; for (int i = 0; i < NODES; i++) if (KIND[i] > 0 && !SHARED[i] && KIND[i] < k) in_off[k] += SIZE[i]; }
+    id<MTLCommandQueue> q = [dev newCommandQueue];
+    id<MTLBuffer> arena = nil; uint32_t cap = 0;
+    uint32_t *raw = NULL; size_t raw_cap = 0;
+    static char obuf[1 << 20]; setvbuf(stdout, obuf, _IOFBF, sizeof obuf);
+    for (;;) @autoreleasepool {
+      uint32_t B;
+      if (!read_all(&B, 4) || B == 0) break;
+      if (B > cap) {
+        arena = [dev newBufferWithLength:(DATA_TOTAL * B + 1) * 4 options:MTLResourceStorageModeShared];
+        if (!arena) { fprintf(stderr, "arena of %llu MB: allocation failed\n", DATA_TOTAL * B * 4 / 1000000); return 8; }
+        cap = B;
       }
-      at = end;
-    }
-    fprintf(stderr, "dispatches: %d\n", dispatches);
-    [enc endEncoding];
-    [cb commit];
-    [cb waitUntilCompleted];
-    if (cb.error) { fprintf(stderr, "gpu: %s\n", [[cb.error description] UTF8String]); return 7; }
-    uint64_t ns = (uint64_t)((cb.GPUEndTime - cb.GPUStartTime) * 1e9);
-    fwrite(&ns, 8, 1, stdout);
-    for (int o = 0; o < N_OUT; o++) {
-      int i = STORAGE[OUTS[o]];
-      size_t n = SIZE[i];
-      if (KIND[i] == -1) { for (uint32_t b = 0; b < B; b++) fwrite(cp + CONST_OFF[i], 4, n, stdout); }
-      else fwrite(ap + B * DATA_OFF[i], 4, n * B, stdout);
+      // shared inputs: once per batch, into the constants arena
+      for (int k = 1; k <= N_IN; k++)
+        for (int i = 0; i < NODES; i++) if (KIND[i] == k && SHARED[i])
+          if (!read_all(cp + CONST_OFF[i], SIZE[i] * 4)) return 5;
+      if (per_set * B > raw_cap) { raw_cap = per_set * B; raw = realloc(raw, raw_cap * 4 + 4); }
+      if (!read_all(raw, per_set * B * 4)) return 5;
+      uint32_t *ap = [arena contents];
+      for (int k = 1; k <= N_IN; k++)
+        for (int i = 0; i < NODES; i++) if (KIND[i] == k && !SHARED[i])
+          for (uint32_t b = 0; b < B; b++) memcpy(ap + B * DATA_OFF[i] + (uint64_t)b * SIZE[i], raw + b * per_set + in_off[k], SIZE[i] * 4);
+      id<MTLCommandBuffer> cb = [q commandBuffer];
+      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+      [enc setBuffer:cst offset:0 atIndex:0];
+      [enc setBuffer:arena offset:0 atIndex:1];
+      [enc setBytes:&B length:4 atIndex:2];
+      [enc setBuffer:pbuf offset:0 atIndex:3];
+      memset(used, 0, LAUNCHES + 1);
+      size_t w = 0, at = 0;
+      while (at < nb) {
+        int L = L_LEVEL[by_level[at]];
+        size_t end = at; while (end < nb && L_LEVEL[by_level[end]] == L) end++;
+        for (size_t a = at; a < end; a++) {
+          int l0 = by_level[a]; if (used[l0]) continue;
+          int k = L_KERNEL[l0];
+          size_t first = w; uint32_t start = 0, n = 0;
+          for (size_t c = a; c < end; c++) {
+            int l = by_level[c]; if (used[l] || L_KERNEL[l] != k || (ungroup && l != l0)) continue;
+            used[l] = 1;
+            lv[3 * w] = k; lv[3 * w + 1] = start; lv[3 * w + 2] = (uint32_t)L_POFF[l];
+            start += (uint32_t)(L_PER[l] * B); w++; n++;
+          }
+          id<MTLComputePipelineState> pl = pipes[k];
+          [enc setComputePipelineState:pl];
+          [enc setBuffer:lvb offset:first * 12 atIndex:4];
+          [enc setBytes:&n length:4 atIndex:5];
+          NSUInteger tg = pl.maxTotalThreadsPerThreadgroup; if (tg > 256) tg = 256;
+          [enc dispatchThreads:MTLSizeMake(start, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        }
+        at = end;
+      }
+      [enc endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+      if (cb.error) { fprintf(stderr, "gpu: %s\n", [[cb.error description] UTF8String]); return 7; }
+      uint64_t ns = (uint64_t)((cb.GPUEndTime - cb.GPUStartTime) * 1e9);
+      fwrite(&ns, 8, 1, stdout);
+      for (int o = 0; o < N_OUT; o++) {
+        int i = STORAGE[OUTS[o]];
+        size_t n = SIZE[i];
+        if (KIND[i] == -1) { for (uint32_t b = 0; b < B; b++) fwrite(cp + CONST_OFF[i], 4, n, stdout); }
+        else fwrite(ap + B * DATA_OFF[i], 4, n * B, stdout);
+      }
+      fflush(stdout);
     }
   }
   return 0;
@@ -725,74 +868,87 @@ int main(int argc, char **argv) {
 "#;
 
 const CUDA_HOST: &str = r#"
+// A server, like the Metal host: request u32 B then inputs; reply u64 ns then outputs.
+static int read_all(void *p, size_t n) { return fread(p, 1, n, stdin) == n; }
 int main(int argc, char **argv) {
-  if (argc < 2) return 2;
-  uint32_t B = (uint32_t)atoi(argv[1]);
-  size_t per_set = 0; for (int i = 0; i < NODES; i++) if (KIND[i] > 0) per_set += SIZE[i];
-  uint32_t *raw = (uint32_t *)malloc(per_set * B * 4 + 4);
-  if (fread(raw, 4, per_set * B, stdin) != per_set * B) return 5;
-  uint32_t *cst = 0, *arena = 0;
+  uint32_t *cst = 0, *dparams = 0, *dlv = 0, *arena = 0; uint32_t cap = 0;
   cudaMalloc((void **)&cst, (CONST_TOTAL + 1) * 4);
-  cudaMalloc((void **)&arena, (DATA_TOTAL * B + 1) * 4);
   for (int i = 0; i < NODES; i++) if (KIND[i] == -1) cudaMemcpy(cst + CONST_OFF[i], CONSTS[i], SIZE[i] * 4, cudaMemcpyHostToDevice);
-  for (int k = 1; k <= N_IN; k++) {
-    size_t off = 0;
-    for (int i = 0; i < NODES; i++) if (KIND[i] > 0 && KIND[i] < k) off += SIZE[i];
-    for (int i = 0; i < NODES; i++) if (KIND[i] == k)
-      for (uint32_t b = 0; b < B; b++) cudaMemcpy(arena + B * DATA_OFF[i] + (uint64_t)b * SIZE[i], raw + b * per_set + off, SIZE[i] * 4, cudaMemcpyHostToDevice);
-  }
-  uint64_t *dparams = 0;
-  cudaMalloc((void **)&dparams, (N_PARAMS ? N_PARAMS : 1) * 8);
-  cudaMemcpy(dparams, PARAMS, N_PARAMS * 8, cudaMemcpyHostToDevice);
-  uint32_t *hlv = (uint32_t *)malloc((LAUNCHES * 3 + 3) * 4), *dlv = 0;
+  uint64_t *dp = 0;
+  cudaMalloc((void **)&dp, (N_PARAMS ? N_PARAMS : 1) * 8);
+  cudaMemcpy(dp, PARAMS, N_PARAMS * 8, cudaMemcpyHostToDevice);
+  cudaMalloc((void **)&dlv, (LAUNCHES * 3 + 3) * 4);
+  uint32_t *hlv = (uint32_t *)malloc((LAUNCHES * 3 + 3) * 4);
   int *by_level = (int *)malloc(sizeof(int) * (LAUNCHES + 1));
   size_t nb = 0;
   for (int L = 0; L < LEVELS; L++) for (int l = 0; l < LAUNCHES; l++) if (L_LEVEL[l] == L) by_level[nb++] = l;
-  // plan the groups first so the table uploads once
   int *g_kernel = (int *)malloc(sizeof(int) * (LAUNCHES + 1));
   uint32_t *g_first = (uint32_t *)malloc(4 * (LAUNCHES + 1)), *g_n = (uint32_t *)malloc(4 * (LAUNCHES + 1)), *g_total = (uint32_t *)malloc(4 * (LAUNCHES + 1));
-  char *used = (char *)calloc(LAUNCHES, 1);
-  size_t w = 0, at = 0, ng = 0;
-  while (at < nb) {
-    int L = L_LEVEL[by_level[at]];
-    size_t end = at; while (end < nb && L_LEVEL[by_level[end]] == L) end++;
-    for (size_t a = at; a < end; a++) {
-      int l0 = by_level[a]; if (used[l0]) continue;
-      int k = L_KERNEL[l0];
-      g_kernel[ng] = k; g_first[ng] = (uint32_t)w; uint32_t start = 0, n = 0;
-      for (size_t c = a; c < end; c++) {
-        int l = by_level[c]; if (used[l] || L_KERNEL[l] != k) continue;
-        used[l] = 1;
-        hlv[3 * w] = k; hlv[3 * w + 1] = start; hlv[3 * w + 2] = (uint32_t)L_POFF[l];
-        start += (uint32_t)(L_PER[l] * B); w++; n++;
+  char *used = (char *)malloc(LAUNCHES + 1);
+  size_t per_set = 0; for (int i = 0; i < NODES; i++) if (KIND[i] > 0 && !SHARED[i]) per_set += SIZE[i];
+  size_t in_off[N_IN + 2];
+  for (int k = 1; k <= N_IN; k++) { in_off[k] = 0; for (int i = 0; i < NODES; i++) if (KIND[i] > 0 && !SHARED[i] && KIND[i] < k) in_off[k] += SIZE[i]; }
+  uint32_t *raw = 0; size_t raw_cap = 0;
+  uint32_t *shbuf = (uint32_t *)malloc(4 * (CONST_TOTAL + 1));
+  (void)dparams;
+  for (;;) {
+    uint32_t B;
+    if (!read_all(&B, 4) || B == 0) break;
+    if (B > cap) { if (arena) cudaFree(arena); cudaMalloc((void **)&arena, (DATA_TOTAL * B + 1) * 4); cap = B; }
+    for (int k = 1; k <= N_IN; k++)
+      for (int i = 0; i < NODES; i++) if (KIND[i] == k && SHARED[i]) {
+        if (!read_all(shbuf, SIZE[i] * 4)) return 5;
+        cudaMemcpy(cst + CONST_OFF[i], shbuf, SIZE[i] * 4, cudaMemcpyHostToDevice);
       }
-      g_n[ng] = n; g_total[ng] = start; ng++;
+    if (per_set * B > raw_cap) { raw_cap = per_set * B; raw = (uint32_t *)realloc(raw, raw_cap * 4 + 4); }
+    if (!read_all(raw, per_set * B * 4)) return 5;
+    for (int k = 1; k <= N_IN; k++)
+      for (int i = 0; i < NODES; i++) if (KIND[i] == k && !SHARED[i])
+        for (uint32_t b = 0; b < B; b++) cudaMemcpy(arena + B * DATA_OFF[i] + (uint64_t)b * SIZE[i], raw + b * per_set + in_off[k], SIZE[i] * 4, cudaMemcpyHostToDevice);
+    memset(used, 0, LAUNCHES + 1);
+    size_t w = 0, at = 0, ng = 0;
+    while (at < nb) {
+      int L = L_LEVEL[by_level[at]];
+      size_t end = at; while (end < nb && L_LEVEL[by_level[end]] == L) end++;
+      for (size_t a = at; a < end; a++) {
+        int l0 = by_level[a]; if (used[l0]) continue;
+        int k = L_KERNEL[l0];
+        g_kernel[ng] = k; g_first[ng] = (uint32_t)w; uint32_t start = 0, n = 0;
+        for (size_t c = a; c < end; c++) {
+          int l = by_level[c]; if (used[l] || L_KERNEL[l] != k) continue;
+          used[l] = 1;
+          hlv[3 * w] = k; hlv[3 * w + 1] = start; hlv[3 * w + 2] = (uint32_t)L_POFF[l];
+          start += (uint32_t)(L_PER[l] * B); w++; n++;
+        }
+        g_n[ng] = n; g_total[ng] = start; ng++;
+      }
+      at = end;
     }
-    at = end;
-  }
-  cudaMalloc((void **)&dlv, (LAUNCHES * 3 + 3) * 4);
-  cudaMemcpy(dlv, hlv, (LAUNCHES * 3 + 3) * 4, cudaMemcpyHostToDevice);
-  cudaEvent_t t0, t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
-  cudaEventRecord(t0);
-  for (size_t gi = 0; gi < ng; gi++) {
-    const uint32_t *lvp = dlv + 3 * g_first[gi];
-    uint32_t n = g_n[gi], total = g_total[gi];
-    const uint64_t *P = dparams;
-    void *args[7] = {&cst, &arena, &B, &P, &lvp, &n, &total};
-    unsigned tb = 256, blocks = (total + tb - 1) / tb;
-    cudaLaunchKernel(KERNELS[g_kernel[gi]], dim3(blocks), dim3(tb), args, 0, 0);
-  }
-  cudaEventRecord(t1); cudaEventSynchronize(t1);
-  float ms = 0; cudaEventElapsedTime(&ms, t0, t1);
-  uint64_t ns = (uint64_t)(ms * 1e6);
-  fwrite(&ns, 8, 1, stdout);
-  for (int o = 0; o < N_OUT; o++) {
-    int i = STORAGE[OUTS[o]];
-    size_t n = SIZE[i];
-    size_t total = KIND[i] == -1 ? n : n * B;
-    uint32_t *h = (uint32_t *)malloc(total * 4 + 4);
-    cudaMemcpy(h, KIND[i] == -1 ? cst + CONST_OFF[i] : arena + B * DATA_OFF[i], total * 4, cudaMemcpyDeviceToHost);
-    if (KIND[i] == -1) { for (uint32_t b = 0; b < B; b++) fwrite(h, 4, n, stdout); } else fwrite(h, 4, total, stdout);
+    cudaMemcpy(dlv, hlv, (LAUNCHES * 3 + 3) * 4, cudaMemcpyHostToDevice);
+    cudaEvent_t t0, t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
+    cudaEventRecord(t0);
+    for (size_t gi = 0; gi < ng; gi++) {
+      const uint32_t *lvp = dlv + 3 * g_first[gi];
+      uint32_t n = g_n[gi], total = g_total[gi];
+      const uint64_t *P = dp;
+      void *args[7] = {&cst, &arena, &B, &P, &lvp, &n, &total};
+      unsigned tb = 256, blocks = (total + tb - 1) / tb;
+      cudaLaunchKernel(KERNELS[g_kernel[gi]], dim3(blocks), dim3(tb), args, 0, 0);
+    }
+    cudaEventRecord(t1); cudaEventSynchronize(t1);
+    float ms = 0; cudaEventElapsedTime(&ms, t0, t1);
+    uint64_t ns = (uint64_t)(ms * 1e6);
+    fwrite(&ns, 8, 1, stdout);
+    for (int o = 0; o < N_OUT; o++) {
+      int i = STORAGE[OUTS[o]];
+      size_t n = SIZE[i];
+      size_t total = KIND[i] == -1 ? n : n * B;
+      uint32_t *h = (uint32_t *)malloc(total * 4 + 4);
+      cudaMemcpy(h, KIND[i] == -1 ? cst + CONST_OFF[i] : arena + B * DATA_OFF[i], total * 4, cudaMemcpyDeviceToHost);
+      if (KIND[i] == -1) { for (uint32_t b = 0; b < B; b++) fwrite(h, 4, n, stdout); } else fwrite(h, 4, total, stdout);
+      free(h);
+    }
+    fflush(stdout);
   }
   return 0;
 }
@@ -863,6 +1019,57 @@ mod tests {
         let (got, _ns) = built.run(&batch).expect("a Metal device");
         for (b, set) in batch.iter().enumerate() {
             assert_eq!(got[b], g.eval(set, &[c]), "instance {b}");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn metal_shared_inputs_are_sent_once() {
+        // b is shared by the whole batch; a varies per instance
+        let mut g = ModGraph::new(Q);
+        let (a, b) = (
+            g.input(&[256], Label::Secret),
+            g.input(&[256], Label::Public),
+        );
+        let (fa, fb) = (ntt(&mut g, a, 1753), ntt(&mut g, b, 1753));
+        let p = g.map(
+            &[256],
+            &[(fa, ModGraph::id(1)), (fb, ModGraph::id(1))],
+            |bd| {
+                let (x, y) = (bd.arg(0), bd.arg(1));
+                bd.mul(x, y)
+            },
+        );
+        let c = intt(&mut g, p, 1753);
+        let built = g
+            .compile_metal_shared(&[c], &[b])
+            .expect("clang with Metal");
+        let mut st = 3;
+        let shared: Vec<u32> = (0..256).map(|_| lcg(&mut st)).collect();
+        let per: Vec<Vec<Vec<u32>>> = (0..48)
+            .map(|_| vec![(0..256).map(|_| lcg(&mut st)).collect()])
+            .collect();
+        let (got, _) = built
+            .run_shared(std::slice::from_ref(&shared), &per)
+            .expect("a Metal device");
+        for (i, set) in per.iter().enumerate() {
+            assert_eq!(
+                got[i],
+                g.eval(&[set[0].clone(), shared.clone()], &[c]),
+                "instance {i}"
+            );
+        }
+        // the server is reused: a second batch with a different shared value
+        let shared2: Vec<u32> = (0..256).map(|_| lcg(&mut st)).collect();
+        let (got, _) = built
+            .run_shared(std::slice::from_ref(&shared2), &per[..5])
+            .unwrap();
+        for (i, set) in per[..5].iter().enumerate() {
+            assert_eq!(
+                got[i],
+                g.eval(&[set[0].clone(), shared2.clone()], &[c]),
+                "second batch {i}"
+            );
         }
     }
 
