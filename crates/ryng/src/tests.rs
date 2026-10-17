@@ -456,9 +456,12 @@ mod compiled {
         let fo = r.fo.as_ref().unwrap();
         let (msl, _) = fo.open.g.to_metal(&[fo.open.key]);
         eprintln!(
-            "open: {} nodes → {} distinct Metal kernels",
+            "open: {} nodes → {} distinct kernels, depth {}",
             fo.open.g.nodes_sizes().len(),
-            msl.matches("kernel void").count()
+            msl.matches("DEV void kf")
+                .count()
+                .max(msl.matches("kernel void k").count()),
+            fo.open.g.levels().iter().max().unwrap()
         );
         let built = fo
             .open
@@ -498,6 +501,26 @@ mod compiled {
                 "open, C -O2 (noinline bodies), one core: {:.1} µs",
                 cpu / 1e3
             );
+            // grouped (one dispatch per kernel per level) against ungrouped (one per
+            // launch), alternated so drift hits both
+            for round in 0..3 {
+                for mode in ["grouped", "ungrouped"] {
+                    if mode == "ungrouped" {
+                        std::env::set_var("TANG_MODQ_UNGROUPED", "1");
+                    } else {
+                        std::env::remove_var("TANG_MODQ_UNGROUPED");
+                    }
+                    for b in [1usize, 2048] {
+                        let sets: Vec<_> = (0..b).map(|i| cases[i % 4].0.clone()).collect();
+                        let (_, ns) = built.run(&sets).unwrap();
+                        eprintln!(
+                            "round {round} {mode:9} batch {b:4}: {:6.2} ms",
+                            ns as f64 / 1e6
+                        );
+                    }
+                }
+            }
+            std::env::remove_var("TANG_MODQ_UNGROUPED");
             for b in [1usize, 32, 128, 512, 2048] {
                 let sets: Vec<_> = (0..b).map(|i| cases[i % 4].0.clone()).collect();
                 let (_, ns) = built.run(&sets).unwrap();

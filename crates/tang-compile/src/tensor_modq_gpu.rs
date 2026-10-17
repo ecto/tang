@@ -85,6 +85,8 @@ DEV uint32_t ct_low(uint32_t r, uint64_t g2, uint64_t m) {
 /// How one kernel binds: its node, its argument buffers, and its kind.
 struct Launch {
     kernel: usize,
+    /// dependency level: launches on one level run in one dispatch
+    level: usize,
     /// offsets the kernel reads: its own data, its sources, its views
     params: Vec<u64>,
     /// threads per instance (the node's size), or 1 for a filter
@@ -104,6 +106,26 @@ impl ModGraph {
 
     fn is_const(&self, i: usize) -> bool {
         matches!(self.nodes[self.storage(i)].op, MOp::Const(_))
+    }
+
+    /// Each node's level: 0 for inputs and constants, else one past the
+    /// deepest node it reads. Nodes on one level can run in one dispatch.
+    pub fn levels(&self) -> Vec<usize> {
+        let mut lv = vec![0usize; self.nodes.len()];
+        for (i, n) in self.nodes.iter().enumerate() {
+            let srcs: Vec<usize> = match &n.op {
+                MOp::Map { args, .. } => args.iter().map(|(a, _)| a.0 as usize).collect(),
+                MOp::Gather { table, index } => vec![table.0 as usize, index.0 as usize],
+                MOp::Filter { src, .. } => vec![src.0 as usize],
+                MOp::Reshape(s) | MOp::Declassify { src: s, .. } => {
+                    lv[i] = lv[s.0 as usize];
+                    continue;
+                }
+                _ => continue,
+            };
+            lv[i] = 1 + srcs.iter().map(|&s| lv[s]).max().unwrap_or(0);
+        }
+        lv
     }
 
     /// Arena offsets: a data node's region starts at `batch · data[i]`, a
@@ -148,15 +170,18 @@ impl ModGraph {
             "#define Q {}u\n#define QNEG_INV {}u\n#define R2 {}u\n#define BARRETT {}ull{HELPERS}",
             f.q, f.qneg_inv, f.r2, f.barrett
         );
-        let head = match dialect {
-            Gpu::Metal => "kernel void k@K@(device const uint32_t *cst [[buffer(0)]], device uint32_t *arena [[buffer(1)]], constant uint32_t &batch [[buffer(2)]], device const uint64_t *P [[buffer(3)]], uint g [[thread_position_in_grid]])".to_string(),
-            Gpu::Cuda => "extern \"C\" __global__ void k@K@(const uint32_t *cst, uint32_t *arena, uint32_t batch, const uint64_t *P)".to_string(),
+        // each distinct node shape is a device function; one `uber` kernel
+        // runs every node of a level, routing each thread to its node
+        let (dev_c, dev_d) = match dialect {
+            Gpu::Metal => ("device const", "device"),
+            Gpu::Cuda => ("const", ""),
         };
-        let gid = match dialect {
-            Gpu::Metal => "",
-            Gpu::Cuda => "  uint32_t g = blockIdx.x * blockDim.x + threadIdx.x;\n",
-        };
+        let head = format!(
+            "DEV void kf@K@(uint32_t g, {dev_c} uint32_t *cst, {dev_d} uint32_t *arena, uint32_t batch, {dev_c} uint64_t *P)"
+        );
+        let gid = "";
         let (data_off, const_off, _, _) = self.arena();
+        let levels = self.levels();
         let mut kernels: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         let mut launches = Vec::new();
@@ -289,11 +314,34 @@ impl ModGraph {
             });
             launches.push(Launch {
                 kernel: id,
+                level: levels[i],
                 params,
                 per,
             });
         }
         let count = kernels.len();
+        // one entry point per distinct kernel: it runs every launch of that
+        // kernel on a level, finding its own launch by binary search over the
+        // launches' first threads (public), so no switch, no shared registers
+        for k in 0..count {
+            let route = format!(
+                "  uint32_t lo = 0, hi = n;\n  while (hi - lo > 1) {{ uint32_t mid = (lo + hi) / 2; if (LV[3 * mid + 1] <= g) lo = mid; else hi = mid; }}\n  kf{k}(g - LV[3 * lo + 1], cst, arena, batch, P + LV[3 * lo + 2]);\n}}\n"
+            );
+            match dialect {
+                Gpu::Metal => {
+                    let _ = write!(
+                        s,
+                        "kernel void k{k}(device const uint32_t *cst [[buffer(0)]], device uint32_t *arena [[buffer(1)]], constant uint32_t &batch [[buffer(2)]], device const uint64_t *P [[buffer(3)]], device const uint32_t *LV [[buffer(4)]], constant uint32_t &n [[buffer(5)]], uint g [[thread_position_in_grid]]) {{\n{route}"
+                    );
+                }
+                Gpu::Cuda => {
+                    let _ = write!(
+                        s,
+                        "extern \"C\" __global__ void k{k}(const uint32_t *cst, uint32_t *arena, uint32_t batch, const uint64_t *P, const uint32_t *LV, uint32_t n, uint32_t total) {{\n  uint32_t g = blockIdx.x * blockDim.x + threadIdx.x;\n  if (g >= total) return;\n{route}"
+                    );
+                }
+            }
+        }
         (s, launches, count)
     }
 
@@ -377,7 +425,9 @@ impl ModGraph {
         }
         let _ = writeln!(
             s,
-            "#define LAUNCHES {}\nstatic const int L_KERNEL[] = {{{}}};\nstatic const size_t L_PER[] = {{{}}};\nstatic const size_t L_POFF[] = {{{}}};\n#define N_PARAMS {}\nstatic const uint64_t PARAMS[] = {{{}}};",
+            "#define LEVELS {}\nstatic const int L_LEVEL[] = {{{}}};\n#define LAUNCHES {}\nstatic const int L_KERNEL[] = {{{}}};\nstatic const size_t L_PER[] = {{{}}};\nstatic const size_t L_POFF[] = {{{}}};\n#define N_PARAMS {}\nstatic const uint64_t PARAMS[] = {{{}}};",
+            launches.iter().map(|l| l.level).max().unwrap_or(0) + 1,
+            launches.iter().map(|l| l.level.to_string()).collect::<Vec<_>>().join(","),
             launches.len(),
             launches.iter().map(|l| l.kernel.to_string()).collect::<Vec<_>>().join(","),
             launches.iter().map(|l| l.per.to_string()).collect::<Vec<_>>().join(","),
@@ -556,6 +606,9 @@ impl GpuCompiled {
                 String::from_utf8_lossy(&out.stderr).into_owned(),
             ));
         }
+        if std::env::var_os("TANG_MODQ_VERBOSE").is_some() {
+            eprint!("{}", String::from_utf8_lossy(&out.stderr));
+        }
         let (time, rest) = out.stdout.split_at(8);
         let ns = u64::from_le_bytes(time.try_into().expect("8 bytes"));
         let words: Vec<u32> = rest
@@ -606,28 +659,54 @@ int main(int argc, char **argv) {
       for (int i = 0; i < NODES; i++) if (KIND[i] == k)
         for (uint32_t b = 0; b < B; b++) memcpy(ap + B * DATA_OFF[i] + (uint64_t)b * SIZE[i], raw + b * per_set + off, SIZE[i] * 4);
     }
-    id<MTLComputePipelineState> pipes[KERNELS_N];
+    static id<MTLComputePipelineState> pipes[KERNELS_N];
     for (int k = 0; k < KERNELS_N; k++) {
-      NSString *name = [NSString stringWithFormat:@"k%d", k];
-      id<MTLFunction> fn = [lib newFunctionWithName:name];
+      id<MTLFunction> fn = [lib newFunctionWithName:[NSString stringWithFormat:@"k%d", k]];
       pipes[k] = [dev newComputePipelineStateWithFunction:fn error:&err];
       if (!pipes[k]) { fprintf(stderr, "pipeline %d: %s\n", k, [[err description] UTF8String]); return 6; }
     }
     id<MTLBuffer> pbuf = [dev newBufferWithBytes:PARAMS length:(N_PARAMS ? N_PARAMS : 1) * 8 options:MTLResourceStorageModeShared];
+    // groups: for each level, for each kernel, its launches as (kernel, first thread, params offset)
+    id<MTLBuffer> lvb = [dev newBufferWithLength:(LAUNCHES * 3 + 3) * 4 options:MTLResourceStorageModeShared];
+    uint32_t *lv = [lvb contents];
+    int *by_level = malloc(sizeof(int) * (LAUNCHES + 1));
+    size_t nb = 0;
+    for (int L = 0; L < LEVELS; L++) for (int l = 0; l < LAUNCHES; l++) if (L_LEVEL[l] == L) by_level[nb++] = l;
     id<MTLCommandQueue> q = [dev newCommandQueue];
     id<MTLCommandBuffer> cb = [q commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     [enc setBuffer:cst offset:0 atIndex:0];
     [enc setBuffer:arena offset:0 atIndex:1];
     [enc setBytes:&B length:4 atIndex:2];
-    for (int l = 0; l < LAUNCHES; l++) {
-      id<MTLComputePipelineState> pl = pipes[L_KERNEL[l]];
-      [enc setComputePipelineState:pl];
-      [enc setBuffer:pbuf offset:L_POFF[l] * 8 atIndex:3];
-      NSUInteger threads = L_PER[l] * B;
-      NSUInteger tg = pl.maxTotalThreadsPerThreadgroup; if (tg > 256) tg = 256;
-      [enc dispatchThreads:MTLSizeMake(threads, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    [enc setBuffer:pbuf offset:0 atIndex:3];
+    int dispatches = 0;
+    size_t w = 0, at = 0;
+    char *used = calloc(LAUNCHES, 1);
+    int ungroup = getenv("TANG_MODQ_UNGROUPED") != NULL; // one launch per dispatch, for comparison
+    while (at < nb) {
+      int L = L_LEVEL[by_level[at]];
+      size_t end = at; while (end < nb && L_LEVEL[by_level[end]] == L) end++;
+      for (size_t a = at; a < end; a++) {
+        int l0 = by_level[a]; if (used[l0]) continue;
+        int k = L_KERNEL[l0];
+        size_t first = w; uint32_t start = 0, n = 0;
+        for (size_t c = a; c < end; c++) {
+          int l = by_level[c]; if (used[l] || L_KERNEL[l] != k || (ungroup && l != l0)) continue;
+          used[l] = 1;
+          lv[3 * w] = k; lv[3 * w + 1] = start; lv[3 * w + 2] = (uint32_t)L_POFF[l];
+          start += (uint32_t)(L_PER[l] * B); w++; n++;
+        }
+        id<MTLComputePipelineState> pl = pipes[k];
+        [enc setComputePipelineState:pl];
+        [enc setBuffer:lvb offset:first * 12 atIndex:4];
+        [enc setBytes:&n length:4 atIndex:5];
+        NSUInteger tg = pl.maxTotalThreadsPerThreadgroup; if (tg > 256) tg = 256;
+        [enc dispatchThreads:MTLSizeMake(start, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        dispatches++;
+      }
+      at = end;
     }
+    fprintf(stderr, "dispatches: %d\n", dispatches);
     [enc endEncoding];
     [cb commit];
     [cb waitUntilCompleted];
@@ -665,13 +744,43 @@ int main(int argc, char **argv) {
   uint64_t *dparams = 0;
   cudaMalloc((void **)&dparams, (N_PARAMS ? N_PARAMS : 1) * 8);
   cudaMemcpy(dparams, PARAMS, N_PARAMS * 8, cudaMemcpyHostToDevice);
+  uint32_t *hlv = (uint32_t *)malloc((LAUNCHES * 3 + 3) * 4), *dlv = 0;
+  int *by_level = (int *)malloc(sizeof(int) * (LAUNCHES + 1));
+  size_t nb = 0;
+  for (int L = 0; L < LEVELS; L++) for (int l = 0; l < LAUNCHES; l++) if (L_LEVEL[l] == L) by_level[nb++] = l;
+  // plan the groups first so the table uploads once
+  int *g_kernel = (int *)malloc(sizeof(int) * (LAUNCHES + 1));
+  uint32_t *g_first = (uint32_t *)malloc(4 * (LAUNCHES + 1)), *g_n = (uint32_t *)malloc(4 * (LAUNCHES + 1)), *g_total = (uint32_t *)malloc(4 * (LAUNCHES + 1));
+  char *used = (char *)calloc(LAUNCHES, 1);
+  size_t w = 0, at = 0, ng = 0;
+  while (at < nb) {
+    int L = L_LEVEL[by_level[at]];
+    size_t end = at; while (end < nb && L_LEVEL[by_level[end]] == L) end++;
+    for (size_t a = at; a < end; a++) {
+      int l0 = by_level[a]; if (used[l0]) continue;
+      int k = L_KERNEL[l0];
+      g_kernel[ng] = k; g_first[ng] = (uint32_t)w; uint32_t start = 0, n = 0;
+      for (size_t c = a; c < end; c++) {
+        int l = by_level[c]; if (used[l] || L_KERNEL[l] != k) continue;
+        used[l] = 1;
+        hlv[3 * w] = k; hlv[3 * w + 1] = start; hlv[3 * w + 2] = (uint32_t)L_POFF[l];
+        start += (uint32_t)(L_PER[l] * B); w++; n++;
+      }
+      g_n[ng] = n; g_total[ng] = start; ng++;
+    }
+    at = end;
+  }
+  cudaMalloc((void **)&dlv, (LAUNCHES * 3 + 3) * 4);
+  cudaMemcpy(dlv, hlv, (LAUNCHES * 3 + 3) * 4, cudaMemcpyHostToDevice);
   cudaEvent_t t0, t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
   cudaEventRecord(t0);
-  for (int l = 0; l < LAUNCHES; l++) {
-    const uint64_t *p = dparams + L_POFF[l];
-    void *args[4] = {&cst, &arena, &B, &p};
-    unsigned threads = (unsigned)(L_PER[l] * B), tb = 256, blocks = (threads + tb - 1) / tb;
-    cudaLaunchKernel(KERNELS[L_KERNEL[l]], dim3(blocks), dim3(tb), args, 0, 0);
+  for (size_t gi = 0; gi < ng; gi++) {
+    const uint32_t *lvp = dlv + 3 * g_first[gi];
+    uint32_t n = g_n[gi], total = g_total[gi];
+    const uint64_t *P = dparams;
+    void *args[7] = {&cst, &arena, &B, &P, &lvp, &n, &total};
+    unsigned tb = 256, blocks = (total + tb - 1) / tb;
+    cudaLaunchKernel(KERNELS[g_kernel[gi]], dim3(blocks), dim3(tb), args, 0, 0);
   }
   cudaEventRecord(t1); cudaEventSynchronize(t1);
   float ms = 0; cudaEventElapsedTime(&ms, t0, t1);
@@ -738,7 +847,11 @@ mod tests {
     fn cuda_source_is_emitted() {
         let (g, c) = ntt_graph();
         let cu = g.to_cuda(&[c]);
-        assert!(cu.contains("__global__ void k") && cu.contains("cudaLaunchKernel"));
+        assert!(
+            cu.contains("__global__ void k0")
+                && cu.contains("cudaLaunchKernel")
+                && cu.contains("__device__")
+        );
     }
 
     #[test]
