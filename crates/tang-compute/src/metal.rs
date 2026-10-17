@@ -2274,6 +2274,56 @@ kernel void bias_add(
     ) -> MetalBuffer {
         if let Kind::Q4 { group } = w.kind {
             let out = self.make_buffer_empty(m * n * 4);
+            // TANG_Q4_SMALL=old: the previous small-row paths (for comparison).
+            let new_small = std::env::var("TANG_Q4_SMALL").as_deref() != Ok("old");
+            if new_small && (4..=8).contains(&m) && k % 128 == 0 && group % 64 == 0 {
+                // A few rows (a verify forward): the matrix units, weights streamed once.
+                let pipeline = self.get_pipeline(llm_msl::Q4_MSL, "qmv_mma");
+                let (so, bo) = w.q4_offsets(group as usize);
+                let params = self.make_buffer_u32(&[m as u32, k as u32, n as u32, group]);
+                self.with_encoder(|enc| {
+                    enc.set_compute_pipeline_state(&pipeline);
+                    enc.set_buffer(0, Some(&x.buffer), 0);
+                    enc.set_buffer(1, Some(&w.buffer), 0);
+                    enc.set_buffer(2, Some(&w.buffer), so);
+                    enc.set_buffer(3, Some(&w.buffer), bo);
+                    enc.set_buffer(4, Some(&out), 0);
+                    enc.set_buffer(5, Some(&params), 0);
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(n.div_ceil(32) as u64, 1, 1),
+                        MTLSize::new(256, 1, 1),
+                    );
+                });
+                return MetalBuffer {
+                    buffer: out,
+                    len: m * n,
+                    kind: Kind::F32,
+                };
+            }
+            if new_small && (2..=3).contains(&m) && k % 16 == 0 {
+                // Two or three rows: each weight unpacked once and applied to every row.
+                let pipeline = self.get_pipeline(llm_msl::Q4_MSL, &format!("gemv_q4_m{m}"));
+                let (so, bo) = w.q4_offsets(group as usize);
+                let params = self.make_buffer_u32(&[m as u32, k as u32, n as u32, group]);
+                self.with_encoder(|enc| {
+                    enc.set_compute_pipeline_state(&pipeline);
+                    enc.set_buffer(0, Some(&x.buffer), 0);
+                    enc.set_buffer(1, Some(&w.buffer), 0);
+                    enc.set_buffer(2, Some(&w.buffer), so);
+                    enc.set_buffer(3, Some(&w.buffer), bo);
+                    enc.set_buffer(4, Some(&out), 0);
+                    enc.set_buffer(5, Some(&params), 0);
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(n.div_ceil(8) as u64, 1, 1),
+                        MTLSize::new(128, 1, 1),
+                    );
+                });
+                return MetalBuffer {
+                    buffer: out,
+                    len: m * n,
+                    kind: Kind::F32,
+                };
+            }
             if (2..=4).contains(&m) && k % 16 == 0 {
                 // A few rows: the GEMV that unpacks each weight once for all of them.
                 let pipeline = self.get_pipeline(llm_msl::Q4_MSL, "gemv_q4_rows");

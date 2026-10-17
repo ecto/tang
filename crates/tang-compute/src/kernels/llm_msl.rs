@@ -745,6 +745,157 @@ kernel void gemv_q4(
     }
 }
 
+// Eight nibbles unpacked once (exact in half) and dotted with eight activations in fused
+// multiply-adds.
+struct nib8 { half4 lo, hi; };
+inline nib8 unpack8(uint w) {
+    return { half4(half(w & 0xf), half((w >> 4) & 0xf), half((w >> 8) & 0xf), half((w >> 12) & 0xf)),
+             half4(half((w >> 16) & 0xf), half((w >> 20) & 0xf), half((w >> 24) & 0xf), half(w >> 28)) };
+}
+inline float dot8u(nib8 w, float4 a, float4 b) {
+    return dot(float4(w.lo), a) + dot(float4(w.hi), b);
+}
+
+// R rows at once (speculative-decoding verify, R = 2 or 3): each lane reads and unpacks its 16
+// weights of a column once and applies them to every row (gemv_q4's lanes and k order). 2
+// columns a simdgroup keeps registers low; past 3 rows it runs out of ALU (see qmv_mma). Needs K % 16 == 0.
+// Dispatch: threadgroups = ceil(N / 8), 128 threads (4 simdgroups).
+template <uint R>
+kernel void gemv_q4_multi(
+    device const float* X [[buffer(0)]],
+    device const uint* W [[buffer(1)]],
+    device const ushort* S [[buffer(2)]],
+    device const ushort* B [[buffer(3)]],
+    device float* Y [[buffer(4)]],
+    device const uint* params [[buffer(5)]],  // [M, K, N, group], M == R
+    uint tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    uint K = params[1], N = params[2], group = params[3];
+    uint n0 = tg * 8 + sg * 2;
+    if (n0 >= N) return;
+    uint cols = min(2u, N - n0);
+    uint G = K / group;
+    uint words = K / 8;
+
+    float acc[R][2];
+    for (uint r = 0; r < R; r++) { acc[r][0] = 0.0f; acc[r][1] = 0.0f; }
+    for (uint k = lane * 16; k < K; k += 512) {
+        nib8 w[2][2];
+        float sc[2], bi[2];
+        for (uint j = 0; j < 2; j++) {
+            uint n = n0 + min(j, cols - 1);
+            uint2 q = *(device const uint2*)(W + (ulong)n * words + k / 8);
+            uint g = n * G + k / group;
+            sc[j] = bf(S[g]);
+            bi[j] = bf(B[g]);
+            w[j][0] = unpack8(q.x);
+            w[j][1] = unpack8(q.y);
+        }
+        for (uint r = 0; r < R; r++) {
+            device const float4* xp = (device const float4*)(X + (ulong)r * K + k);
+            float4 x0 = xp[0], x1 = xp[1], x2 = xp[2], x3 = xp[3];
+            float4 xs4 = x0 + x1 + x2 + x3;
+            float xs = xs4.x + xs4.y + xs4.z + xs4.w;
+            for (uint j = 0; j < 2; j++) {
+                float d = dot8u(w[j][0], x0, x1) + dot8u(w[j][1], x2, x3);
+                acc[r][j] += sc[j] * d + bi[j] * xs;
+            }
+        }
+    }
+    for (uint r = 0; r < R; r++) {
+        for (uint j = 0; j < cols; j++) {
+            float v = simd_sum(acc[r][j]);
+            if (lane == 0) Y[r * N + n0 + j] = v;
+        }
+    }
+}
+#define GEMV_Q4_M(R) template [[host_name("gemv_q4_m" #R)]] kernel void gemv_q4_multi<R>( \
+    device const float*, device const uint*, device const ushort*, device const ushort*, \
+    device float*, device const uint*, uint, uint, uint);
+GEMV_Q4_M(2) GEMV_Q4_M(3)
+
+// 2..8 rows (a verify forward) on the matrix units: Y^T = W X^T in 8x8 tiles. A simdgroup
+// covers 32 columns: each lane loads one column's next 128 weights (64 contiguous bytes) and
+// shuffles each lane the nibbles its fragment needs, so weights stream with no threadgroup
+// staging or barriers in the loop, and each activation tile serves 32 columns. A threadgroup:
+// 32 columns; its 8 simdgroups split K, summed at the end. Needs K % 128 == 0, group % 64 == 0.
+// Dispatch: threadgroups = ceil(N / 32), 256 threads.
+kernel void qmv_mma(
+    device const float* X [[buffer(0)]],
+    device const uint* W [[buffer(1)]],
+    device const ushort* S [[buffer(2)]],
+    device const ushort* B [[buffer(3)]],
+    device float* Y [[buffer(4)]],
+    device const uint* params [[buffer(5)]],  // [M, K, N, group]
+    uint tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    uint M = params[0], K = params[1], N = params[2], group = params[3];
+    uint n0 = tg * 32;
+    // This lane's elements of an 8x8 fragment: row fm, columns fn and fn + 1.
+    uint qid = lane / 4;
+    uint fm = (qid & 4) + ((lane / 2) % 4);
+    uint fn = (qid & 2) * 2 + (lane % 2) * 2;
+    uint words = K / 8, G = K / group, chunks = K / 128;
+    uint c0 = sg * chunks / 8, c1 = (sg + 1) * chunks / 8;
+    device const uint4* wl = (device const uint4*)(W + (ulong)min(n0 + lane, N - 1) * words);
+    bool r0 = fn < M, r1 = fn + 1 < M;
+    device const float* x0p = X + (ulong)(r0 ? fn : 0) * K;
+    device const float* x1p = X + (ulong)(r1 ? fn + 1 : 0) * K;
+
+    simdgroup_float8x8 acc[4];
+    for (uint t = 0; t < 4; t++) acc[t] = simdgroup_float8x8(0);
+    uint4 nx[4];
+    for (uint i = 0; i < 4; i++) nx[i] = wl[c0 * 4 + i];
+    for (uint c = c0; c < c1; c++) {
+        uint k0 = c * 128;
+        uint held[16];
+        for (uint i = 0; i < 4; i++) {
+            held[4 * i] = nx[i].x; held[4 * i + 1] = nx[i].y;
+            held[4 * i + 2] = nx[i].z; held[4 * i + 3] = nx[i].w;
+        }
+        uint cn = min(c + 1, chunks - 1);
+        for (uint i = 0; i < 4; i++) nx[i] = wl[cn * 4 + i];
+        for (uint h = 0; h < 2; h++) {
+            float sc[4], bi[4];
+            for (uint t = 0; t < 4; t++) {
+                uint g = min(n0 + 8 * t + fm, N - 1) * G + (k0 + 64 * h) / group;
+                sc[t] = bf(S[g]);
+                bi[t] = bf(B[g]);
+            }
+            for (uint s8 = 0; s8 < 8; s8++) {
+                uint k = k0 + 64 * h + 8 * s8 + fm;
+                simdgroup_float8x8 xb;
+                xb.thread_elements()[0] = r0 ? x0p[k] : 0.0f;
+                xb.thread_elements()[1] = r1 ? x1p[k] : 0.0f;
+                for (uint t = 0; t < 4; t++) {
+                    uint q = simd_shuffle(held[8 * h + s8], 8 * t + fm) >> (4 * fn);
+                    simdgroup_float8x8 wa;
+                    wa.thread_elements()[0] = sc[t] * float(q & 0xf) + bi[t];
+                    wa.thread_elements()[1] = sc[t] * float((q >> 4) & 0xf) + bi[t];
+                    simdgroup_multiply_accumulate(acc[t], wa, xb, acc[t]);
+                }
+            }
+        }
+    }
+    threadgroup float part[8][4][64];
+    for (uint t = 0; t < 4; t++) {
+        part[sg][t][fm * 8 + fn] = acc[t].thread_elements()[0];
+        part[sg][t][fm * 8 + fn + 1] = acc[t].thread_elements()[1];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+        uint t = tid / 64, e = tid % 64, n = n0 + 8 * t + e / 8, m = e % 8;
+        float v = 0.0f;
+        for (uint p = 0; p < 8; p++) v += part[p][t][e];
+        if (m < M && n < N) Y[(ulong)m * N + n] = v;
+    }
+}
+
 // A few rows at once (M <= 8, speculative-decoding verify and short prefills): like gemv_q4,
 // but each lane widens its 16 weights of each of the 4 columns once and applies them to every
 // row, so the weights are read and unpacked once for the whole batch. Needs K % 16 == 0.
