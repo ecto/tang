@@ -629,6 +629,8 @@ pub struct Draft {
     pub shares: Vec<f32>,
     /// Match length it came from (for calibration).
     pub match_len: usize,
+    /// From a draft model rather than a suffix match (not calibrated).
+    pub from_model: bool,
 }
 
 /// The drafter for one request: the request's automaton plus a matcher into the global one.
@@ -714,6 +716,7 @@ impl<'a> Session<'a> {
                         tokens: cont[..len].iter().map(|c| c.0).collect(),
                         shares: cont[..len].iter().map(|c| c.1).collect(),
                         match_len: n,
+                        from_model: false,
                     },
                     score,
                 );

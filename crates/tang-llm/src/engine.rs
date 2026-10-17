@@ -200,6 +200,8 @@ pub struct Engine<D: ComputeDevice> {
     wrap_up: Vec<u32>,
     /// Suffix drafting with verification, when on.
     spec: Option<Speculation>,
+    /// A small model drafting when suffix drafting has nothing (needs `spec` on).
+    drafter: Option<crate::draft_model::DraftModel<D>>,
     /// The last request's prompt and completion tokens (for offline drafting studies).
     last: (Vec<u32>, Vec<u32>),
     /// Decode forwards so far by width: (count, seconds).
@@ -334,6 +336,7 @@ impl<D: ComputeDevice> Engine<D> {
             think_tags,
             wrap_up,
             spec: None,
+            drafter: None,
             last: (Vec::new(), Vec::new()),
             forwards: vec![(0, 0.0); 65],
         })
@@ -347,6 +350,15 @@ impl<D: ComputeDevice> Engine<D> {
             cost: CostModel::new(cfg.max_draft + 1),
             cfg,
         });
+    }
+
+    /// Draft with a small model when suffix drafting finds nothing (speculation must be on).
+    pub fn set_draft_model(&mut self, d: Option<crate::draft_model::DraftModel<D>>) {
+        self.drafter = d;
+    }
+
+    pub fn vocab_size(&self) -> usize {
+        self.model.cfg.vocab_size
     }
 
     pub fn speculation(&self) -> Option<&Speculation> {
@@ -940,7 +952,7 @@ impl<D: ComputeDevice> Engine<D> {
             }
             let next = sampler.sample(logits);
             let hit = draft.tokens.get(row) == Some(&next);
-            if row < draft.tokens.len() {
+            if row < draft.tokens.len() && !draft.from_model {
                 if let Some(s) = sess.as_mut() {
                     s.calib.observe(draft.match_len, draft.shares[row], hit);
                 }
@@ -1023,7 +1035,15 @@ impl<D: ComputeDevice> Engine<D> {
                 Some(s) if !wrap => {
                     let room =
                         (limit - out.len()).min(max_ctx.saturating_sub(self.cache.len + fed.len()));
-                    s.propose(room)
+                    let d = s.propose(room);
+                    match self.drafter.as_mut() {
+                        Some(m) if d.tokens.is_empty() => crate::draft::Draft {
+                            tokens: m.propose(&ids, &out, room)?,
+                            from_model: true,
+                            ..Default::default()
+                        },
+                        _ => d,
+                    }
                 }
                 _ => crate::draft::Draft::default(),
             };

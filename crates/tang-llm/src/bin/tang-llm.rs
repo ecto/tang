@@ -22,6 +22,9 @@
 //! off, `--speculate` forces it on. Earlier completions are kept in
 //! `~/.cache/tang/drafts/<model>.tok` (`TANG_DRAFT_STORE=<file>`, or `0` for memory only);
 //! `TANG_DRAFT_MAX`, `_ALPHA`, `_MIN_PROB`, `_MIN_MATCH`, `_GLOBAL`, `_COST` tune drafting.
+//! `--draft-model <model>` (or `TANG_DRAFT_MODEL`) adds a small model with the same tokenizer
+//! (Qwen3-0.6B for Qwen3-32B) that drafts when the suffix drafter has nothing;
+//! `TANG_DRAFT_MODEL_MAX` (8) and `_MIN_PROB` (0.5, the whole draft's odds) bound its drafts.
 //! `tang-llm image-features <model-dir> <pixels.f32>` — the projector's output for an image
 //! (`[896, 896, 3]` f32, normalized), as JSON.
 //! `tang-llm logits-image <model-dir> <pixels.f32> <token ids...> [--last N]` — logits with the
@@ -63,6 +66,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 use tang_compute::{ComputeDevice, CpuDevice};
 use tang_llm::{Dtype, Engine, Model};
+use tang_llm::draft_model::DraftModel;
 
 /// Where the model runs.
 #[derive(Clone, Copy, Debug)]
@@ -447,7 +451,7 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
     }
     let spec = args
         .first()
-        .context("usage: tang-llm serve <model> [--host H] [--port P] [--ctx N] [--api-key-file F] [--f32 | --q4] [--no-speculate] [--kv-slots N|auto]")?
+        .context("usage: tang-llm serve <model> [--host H] [--port P] [--ctx N] [--api-key-file F] [--f32 | --q4] [--no-speculate] [--draft-model M] [--kv-slots N|auto]")?
         .clone();
     let (mut port, mut ctx, mut dtype) = (8911u16, 32_768usize, Dtype::Bf16);
     let mut host = "127.0.0.1".to_string();
@@ -461,6 +465,7 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
         Ok(_) => true,
         Err(_) => !matches!(backend, Backend::Cpu),
     };
+    let mut draft_model = std::env::var("TANG_DRAFT_MODEL").ok().filter(|m| !m.is_empty());
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -480,6 +485,9 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
             "--q4" => dtype = Dtype::Q4,
             "--speculate" => speculate = true,
             "--no-speculate" => speculate = false,
+            "--draft-model" => {
+                draft_model = Some(it.next().context("--draft-model <model>")?.clone())
+            }
             other => bail!("unknown option {other}"),
         }
     }
@@ -491,6 +499,9 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
     };
     let key = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
     tang_llm::resolve_model(&spec)?;
+    if let Some(m) = &draft_model {
+        tang_llm::resolve_model(m)?;
+    }
     let addr = format!("{host}:{port}");
     if key.is_none() && !host.starts_with("127.") && host != "localhost" {
         eprintln!("tang-llm: warning: listening on {host} without an API key; anyone who can reach it can use it");
@@ -509,6 +520,7 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
             backend,
             ctx,
             speculate,
+            draft_model,
             slots,
             unified,
             image_pipeline
@@ -669,6 +681,7 @@ fn serve_on<D: ComputeDevice + 'static>(
     backend: Backend,
     ctx: usize,
     speculate: bool,
+    draft_model: Option<String>,
     slots: Option<usize>,
     unified: bool,
     image_pipeline: Option<PathBuf>,
@@ -690,6 +703,14 @@ fn serve_on<D: ComputeDevice + 'static>(
             );
         }
         e.set_speculation(draft);
+        if let Some(m) = draft_model.as_ref().filter(|_| speculate) {
+            let d = DraftModel::load(make()?, &tang_llm::resolve_model(m)?, ctx, e.vocab_size())?;
+            eprintln!(
+                "tang-llm: draft model {m} (up to {} tokens, min p {})",
+                d.max, d.min_prob
+            );
+            e.set_draft_model(Some(d));
+        }
         let (n, budget) = slots.map_or_else(|| auto_slots(unified), |n| (n, None));
         let budget = std::env::var("TANG_KV_BUDGET")
             .ok()

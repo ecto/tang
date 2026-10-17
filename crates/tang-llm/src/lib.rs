@@ -10,6 +10,7 @@ pub mod chat;
 pub mod config;
 pub mod dit;
 pub mod draft;
+pub mod draft_model;
 pub mod engine;
 pub mod flash;
 pub mod gguf;
