@@ -18,7 +18,7 @@
 //! - Separators are ryng's, so signatures are not FIPS 204 signatures.
 
 use crate::graph::{
-    abs_centred, absorb, combine, extract_bits, fold, mux_read, pack_nibbles, stream, tail, Fold,
+    abs_centred, absorb, combine, extract_bits, fold, mux_read, pack_fields, stream, tail, Fold,
 };
 use crate::keccak::{squeeze, Tables, SHAKE256_RATE};
 use crate::{each, pack, row, sep, unpack, zip};
@@ -374,7 +374,7 @@ impl Sig {
             .enumerate()
             .map(|(i, &wi)| {
                 let w1 = each(&mut g, wi, |b, v| b.high_bits(v, GAMMA2));
-                (pack_nibbles(&mut g, w1), 24 + 32 * i)
+                (pack_fields(&mut g, w1, 4), 24 + 32 * i)
             })
             .collect();
         let st = stream(&mut g, c_tail, &parts);

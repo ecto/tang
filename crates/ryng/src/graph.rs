@@ -212,17 +212,19 @@ pub fn abs_centred(b: &mut Body, x: BVal, q: u32) -> BVal {
     b.sel(big, neg, x)
 }
 
-/// 4-bit fields packed eight to a word (FIPS 204 w₁Encode for γ₂ = (q−1)/32).
-pub fn pack_nibbles(g: &mut ModGraph, poly: ModId) -> ModId {
+/// `width`-bit fields packed `32 / width` to a word, low field first (FIPS 204
+/// w₁Encode at width 4; message bits at width 1).
+pub fn pack_fields(g: &mut ModGraph, poly: ModId, width: u32) -> ModId {
     let n = g.shape(poly)[0];
-    let args: Vec<_> = (0..8)
-        .map(|m| (poly, ModGraph::view(&[&[8]], &[m])))
+    let per = (32 / width) as usize;
+    let args: Vec<_> = (0..per)
+        .map(|m| (poly, ModGraph::view(&[&[per as i64]], &[m as i64])))
         .collect();
-    g.map(&[n / 8], &args, |b| {
+    g.map(&[n / per], &args, |b| {
         let mut acc = b.arg(0);
-        for m in 1..8 {
+        for m in 1..per {
             let v = b.arg(m);
-            let s = b.lit(4 * m as u32);
+            let s = b.lit(width * m as u32);
             let v = b.shl(v, s);
             acc = b.or(acc, v);
         }

@@ -6,7 +6,7 @@ use crate::keccak::{squeeze, Tables, SHAKE256_RATE};
 use tang_compile::tensor::modq::{Label, ModGraph, ModId};
 
 /// k CBD(2) polys from one squeeze each.
-fn cbd2(g: &mut ModGraph, words: ModId, n: usize) -> ModId {
+pub(crate) fn cbd2(g: &mut ModGraph, words: ModId, n: usize) -> ModId {
     let wpp = n / 8; // 8 nibbles per word
     let out = g.map(
         &[wpp, 8],
@@ -34,7 +34,7 @@ fn cbd2(g: &mut ModGraph, words: ModId, n: usize) -> ModId {
 }
 
 /// One poly uniform on [−2¹¹, 2¹¹): 12 bits per coefficient, 8 per 3 words.
-fn uniform12(g: &mut ModGraph, words: ModId, n: usize) -> ModId {
+pub(crate) fn uniform12(g: &mut ModGraph, words: ModId, n: usize) -> ModId {
     let (mut f1, mut f2, mut sh) = ([0u32; 8], [0u32; 8], [0u32; 8]);
     for j in 0..8 {
         let (w, s) = (12 * j / 32, 12 * j % 32);

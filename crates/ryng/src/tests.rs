@@ -95,8 +95,7 @@ fn decryption_noise_stays_far_inside_the_bound() {
     for i in 0..4u8 {
         let (pk, sk) = r.keygen(&[i + 10; 64]);
         let m = [0xa5u8; 32];
-        let h = hash256(b"pk", &pk);
-        let (_, ct) = r.encrypt_fo(&pk, &m, &h);
+        let (ct, _) = r.seal(&pk, &m);
         let s_len = p.k * p.n * bits(p.q) as usize / 8;
         let s = unpack(&sk[..s_len], bits(p.q), p.k * p.n);
         let (u, v) = r.unpack_ct(&ct);
@@ -113,6 +112,73 @@ fn decryption_noise_stays_far_inside_the_bound() {
     assert!(
         worst < 0.25,
         "worst noise used {worst:.3} of the q/4 margin"
+    );
+}
+
+/// The FO transform on the host — SHAKE-256 G and J, host samplers, the PKE
+/// graphs — as an independent check on the in-graph seal and open.
+fn host_seal(r: &Ryng, pk: &[u8], m: &[u8; 32]) -> (Vec<u8>, [u8; 32]) {
+    let p = r.p;
+    let h = hash256(b"pk", pk);
+    let kc = shake(b"seal", &[&m[..], &h], 64);
+    let (key, coins) = kc.split_at(32);
+    let (rho, t1b) = pk.split_at(32);
+    let a = sample_a(&p, rho);
+    let t1 = unpack(t1b, bits(p.q) - p.dt, p.k * p.n);
+    let rr = cbd2(&p, coins, 0);
+    let e1 = uniform12(&p, coins, p.k as u8);
+    let e2 = uniform12(&p, coins, 2 * p.k as u8);
+    let (u, v) = r.pke_encrypt(&a, &t1, &rr, &e1, &e2, &bytes_to_bits(m, p.n));
+    let mut ct = pack(&u, p.du);
+    ct.extend(pack(&v, p.dv));
+    (ct, key.try_into().unwrap())
+}
+
+fn shake(name: &[u8], parts: &[&[u8]], len: usize) -> Vec<u8> {
+    let mut x = Shake256::default();
+    x.update(&sep(name));
+    for p in parts {
+        x.update(p);
+    }
+    let mut out = vec![0; len];
+    x.finalize_xof().read(&mut out);
+    out
+}
+
+#[test]
+fn in_graph_fo_matches_the_host_reference() {
+    let r = Ryng::new(Params::RYNG);
+    let p = r.p;
+    let (pk, sk) = r.keygen(&[21; 64]);
+    // keygen: ρ ‖ σ = SHAKE-256(sep ‖ d), s from σ by the host sampler
+    let rs = shake(b"keygen", &[&[21u8; 32]], 64);
+    assert_eq!(&pk[..32], &rs[..32]);
+    let s_len = p.k * p.n * bits(p.q) as usize / 8;
+    assert_eq!(
+        unpack(&sk[..s_len], bits(p.q), p.k * p.n),
+        cbd2(&p, &rs[32..], 0)
+    );
+    for i in 0..3u8 {
+        let m = [i.wrapping_mul(91); 32];
+        let (ct, key) = r.seal(&pk, &m);
+        assert_eq!((ct.clone(), key), host_seal(&r, &pk, &m), "seal {i}");
+        assert_eq!(r.open(&sk, &ct), key, "open {i}");
+    }
+}
+
+#[test]
+fn every_kem_graph_passes_the_secrecy_check() {
+    let r = Ryng::new(Params::RYNG);
+    let k = r.p.k;
+    let proofs = r
+        .check_kem()
+        .expect("no secret steers an address or a count");
+    assert_eq!(proofs[0], vec![RHO_PROOF]);
+    assert_eq!(proofs[1], vec![PK_PROOF; k]);
+    assert_eq!(proofs[2], vec![CT_PROOF; k + 1]);
+    assert!(
+        proofs[3].is_empty(),
+        "open declassifies nothing: the key and the verdict stay secret"
     );
 }
 
@@ -147,9 +213,11 @@ fn kat() -> String {
 
 #[test]
 fn known_answer() {
+    // Re-pinned when G moved from SHA3-512 to SHAKE-256 (the in-graph FO);
+    // `in_graph_fo_matches_the_host_reference` ties it to an independent host computation.
     assert_eq!(
         kat(),
-        "3cc1d807609d6b76fa22cbb8727fdf325c9d928463ca46af7dd1b76e4ba8c6d7"
+        "95e7754edebac9caa2e3328748d68f45594897e462315e0c997b25fb979af481"
     );
 }
 
