@@ -20,8 +20,10 @@
 //! assert_eq!((pk.len(), ct.len()), (1312, 1440));
 //! ```
 
+pub mod graph;
 pub mod keccak;
 pub mod sample;
+pub mod sig;
 
 use sha3::digest::{ExtendableOutput, Update, XofReader};
 use sha3::{Digest, Sha3_256, Sha3_512, Shake128, Shake256};
@@ -75,7 +77,7 @@ impl Params {
     }
 }
 
-fn bits(q: u32) -> u32 {
+pub(crate) fn bits(q: u32) -> u32 {
     32 - (q - 1).leading_zeros()
 }
 
@@ -111,12 +113,12 @@ pub struct Ryng {
     enc_noise: Option<sample::Sampler>,
 }
 
-fn row(g: &mut ModGraph, x: ModId, i: usize, n: usize) -> ModId {
+pub(crate) fn row(g: &mut ModGraph, x: ModId, i: usize, n: usize) -> ModId {
     let v = ModGraph::view(&[&[1]], &[(i * n) as i64]);
     g.map(&[n], &[(x, v)], |b| b.arg(0))
 }
 
-fn zip(
+pub(crate) fn zip(
     g: &mut ModGraph,
     a: ModId,
     b: ModId,
@@ -129,7 +131,7 @@ fn zip(
     })
 }
 
-fn each(g: &mut ModGraph, a: ModId, f: impl FnOnce(&mut Body, BVal) -> BVal) -> ModId {
+pub(crate) fn each(g: &mut ModGraph, a: ModId, f: impl FnOnce(&mut Body, BVal) -> BVal) -> ModId {
     let n = g.shape(a)[0];
     g.map(&[n], &[(a, ModGraph::id(1))], |bd| {
         let x = bd.arg(0);
@@ -450,7 +452,7 @@ impl Ryng {
 // -- symmetric primitives: SHA-3 with ryng's domain separators ----------------
 
 /// `SHAKE-256("ryng/" ‖ name)`, the only byte strings the scheme invents.
-fn sep(name: &[u8]) -> [u8; 32] {
+pub(crate) fn sep(name: &[u8]) -> [u8; 32] {
     let mut x = Shake256::default();
     x.update(b"ryng/");
     x.update(name);
@@ -568,7 +570,7 @@ fn uniform12(p: &Params, seed: &[u8], nonce0: u8) -> Vec<u32> {
 
 // -- packing -------------------------------------------------------------------
 
-fn pack(v: &[u32], w: u32) -> Vec<u8> {
+pub(crate) fn pack(v: &[u32], w: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * w as usize / 8);
     let (mut acc, mut n) = (0u64, 0u32);
     for &x in v {
@@ -583,7 +585,7 @@ fn pack(v: &[u32], w: u32) -> Vec<u8> {
     out
 }
 
-fn unpack(b: &[u8], w: u32, count: usize) -> Vec<u32> {
+pub(crate) fn unpack(b: &[u8], w: u32, count: usize) -> Vec<u32> {
     let mut out = Vec::with_capacity(count);
     let (mut acc, mut n) = (0u64, 0u32);
     let mut it = b.iter();
@@ -599,11 +601,11 @@ fn unpack(b: &[u8], w: u32, count: usize) -> Vec<u32> {
     out
 }
 
-fn bytes_to_bits(m: &[u8], n: usize) -> Vec<u32> {
+pub(crate) fn bytes_to_bits(m: &[u8], n: usize) -> Vec<u32> {
     (0..n).map(|i| (m[i / 8] >> (i % 8) & 1) as u32).collect()
 }
 
-fn bits_to_bytes(b: &[u32]) -> Vec<u8> {
+pub(crate) fn bits_to_bytes(b: &[u32]) -> Vec<u8> {
     b.chunks(8)
         .map(|c| {
             c.iter()

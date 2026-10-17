@@ -71,6 +71,15 @@ enum BOp {
     Not(usize),
     Shl(usize, usize),
     Shr(usize, usize),
+    /// 1 if equal, else 0, by mask.
+    Eq(usize, usize),
+    /// 1 if a < b, else 0, for a, b < 2^31.
+    Lt(usize, usize),
+    /// floor(a·b / 2^32).
+    MulHi(usize, usize),
+    /// HighBits / LowBits of FIPS 204's Decompose for α = 2γ₂: (r₁, r₀ mod q).
+    HighBits(usize, u32),
+    LowBits(usize, u32),
 }
 
 /// A branch-free scalar program over residues mod q.
@@ -136,6 +145,23 @@ impl Body {
     pub fn shr(&mut self, a: BVal, by: BVal) -> BVal {
         self.push(BOp::Shr(a.0, by.0))
     }
+    pub fn eq(&mut self, a: BVal, b: BVal) -> BVal {
+        self.push(BOp::Eq(a.0, b.0))
+    }
+    pub fn lt(&mut self, a: BVal, b: BVal) -> BVal {
+        self.push(BOp::Lt(a.0, b.0))
+    }
+    pub fn mulhi(&mut self, a: BVal, b: BVal) -> BVal {
+        self.push(BOp::MulHi(a.0, b.0))
+    }
+    /// r₁ with r ≡ r₁·2γ₂ + r₀, −γ₂ < r₀ ≤ γ₂ (and r₁ = 0 at the q − 1 edge).
+    pub fn high_bits(&mut self, r: BVal, gamma2: u32) -> BVal {
+        self.push(BOp::HighBits(r.0, gamma2))
+    }
+    /// r₀ as a residue.
+    pub fn low_bits(&mut self, r: BVal, gamma2: u32) -> BVal {
+        self.push(BOp::LowBits(r.0, gamma2))
+    }
 }
 
 enum MOp {
@@ -146,6 +172,8 @@ enum MOp {
     Map {
         args: Vec<(ModId, View)>,
         body: Body,
+        /// Which body op is the result.
+        out: usize,
     },
     Gather {
         table: ModId,
@@ -242,6 +270,26 @@ impl Field {
     fn decompress(&self, y: u32, d: u32) -> u32 {
         ((y as u64 * self.q as u64 + (1u64 << d >> 1)) >> d) as u32
     }
+    /// FIPS 204 Decompose(r) for α = 2γ₂, branch-free: (r₁, r₀ mod q).
+    fn decompose(&self, r: u32, gamma2: u32) -> (u32, u32) {
+        let alpha = 2 * gamma2 as u64;
+        let m = (1u64 << 40) / alpha;
+        let mut r1 = (r as u64 * m) >> 40;
+        let rem = r as u64 - r1 * alpha;
+        let ge = ((alpha - 1).wrapping_sub(rem) >> 63) & 1; // rem ≥ α
+        r1 += ge;
+        let rp = r as u64 - r1 * alpha; // in [0, α)
+        let up = ((gamma2 as u64).wrapping_sub(rp) >> 63) & 1; // rp > γ₂
+        r1 += up;
+        let r0 = (rp as i64) - (up as i64) * alpha as i64; // in (−γ₂, γ₂]
+                                                           // the edge r − r₀ = q − 1: r₁ = 0, r₀ − 1
+        let d = (r1 * alpha) as u32 ^ (self.q - 1);
+        let edge = ((d | d.wrapping_neg()) >> 31) ^ 1;
+        let emask = 0u32.wrapping_sub(edge);
+        let r1 = (r1 as u32) & !emask;
+        let r0 = r0 - edge as i64;
+        (r1, self.csub((r0 + self.q as i64) as u32))
+    }
     fn power2round(&self, x: u32, d: u32) -> u32 {
         (x + (1 << d >> 1) - 1) >> d
     }
@@ -256,20 +304,6 @@ pub struct ModGraph {
     f: Field,
     nodes: Vec<MNode>,
     inputs: usize,
-}
-
-fn row_major(i: usize, shape: &[usize]) -> Vec<usize> {
-    let mut idx = vec![0; shape.len()];
-    let mut r = i;
-    for d in (0..shape.len()).rev() {
-        idx[d] = r % shape[d];
-        r /= shape[d];
-    }
-    idx
-}
-
-fn flat(idx: &[usize], shape: &[usize]) -> usize {
-    idx.iter().zip(shape).fold(0, |acc, (i, n)| acc * n + i)
 }
 
 impl ModGraph {
@@ -327,7 +361,11 @@ impl ModGraph {
 
     /// A public table of raw words, not reduced.
     pub fn constant_words(&mut self, values: &[u32]) -> ModId {
-        self.push(MOp::Const(values.to_vec()), vec![values.len()], Label::Public)
+        self.push(
+            MOp::Const(values.to_vec()),
+            vec![values.len()],
+            Label::Public,
+        )
     }
 
     /// A public table, reduced mod q.
@@ -367,15 +405,11 @@ impl ModGraph {
             );
         }
         let mut body = Body { ops: Vec::new() };
-        let out = f(&mut body);
-        assert_eq!(
-            out.0,
-            body.ops.len() - 1,
-            "the body's last op is its result"
-        );
+        let out = f(&mut body).0;
         let op = MOp::Map {
             args: args.to_vec(),
             body,
+            out,
         };
         self.push(op, shape.to_vec(), Label::Public)
     }
@@ -478,17 +512,46 @@ impl ModGraph {
                     kept.resize(size, 0);
                     kept
                 }
-                MOp::Map { args, body } => {
+                MOp::Map {
+                    args,
+                    body,
+                    out: res,
+                } => {
                     let mut out = Vec::with_capacity(size);
                     let mut reg = vec![0u32; body.ops.len()];
+                    let mut idx = vec![0usize; n.shape.len()];
                     for p in 0..size {
-                        let idx = row_major(p, &n.shape);
+                        if p > 0 {
+                            // odometer step to the next row-major point
+                            for d in (0..idx.len()).rev() {
+                                idx[d] += 1;
+                                if idx[d] < n.shape[d] {
+                                    break;
+                                }
+                                idx[d] = 0;
+                            }
+                        }
                         for (k, op) in body.ops.iter().enumerate() {
                             reg[k] = match *op {
                                 BOp::Arg(a) => {
                                     let (src, view) = &args[a];
-                                    let at = flat(&view.coords(&idx), self.shape(*src));
-                                    vals[src.0 as usize][at]
+                                    let shape = self.shape(*src);
+                                    let mut at = 0usize;
+                                    let mut inside = true;
+                                    for (form, &len) in view.forms.iter().zip(shape) {
+                                        let c = form.eval(&idx);
+                                        inside &= (0..len as i64).contains(&c);
+                                        at = at * len + c.clamp(0, len as i64 - 1) as usize;
+                                    }
+                                    assert!(
+                                        inside || view.guard,
+                                        "unguarded view reads off the edge"
+                                    );
+                                    if inside {
+                                        vals[src.0 as usize][at]
+                                    } else {
+                                        0 // a guarded read off the edge
+                                    }
                                 }
                                 BOp::Lit(x) => x,
                                 BOp::Coord(d) => idx[d] as u32,
@@ -505,9 +568,17 @@ impl ModGraph {
                                 BOp::Not(a) => !reg[a],
                                 BOp::Shl(a, b) => reg[a] << (reg[b] & 31),
                                 BOp::Shr(a, b) => reg[a] >> (reg[b] & 31),
+                                BOp::Eq(a, b) => {
+                                    let d = reg[a] ^ reg[b];
+                                    ((d | d.wrapping_neg()) >> 31) ^ 1
+                                }
+                                BOp::Lt(a, b) => reg[a].wrapping_sub(reg[b]) >> 31,
+                                BOp::MulHi(a, b) => ((reg[a] as u64 * reg[b] as u64) >> 32) as u32,
+                                BOp::HighBits(a, g2) => f.decompose(reg[a], g2).0,
+                                BOp::LowBits(a, g2) => f.decompose(reg[a], g2).1,
                             };
                         }
-                        out.push(reg[body.ops.len() - 1]);
+                        out.push(reg[*res]);
                     }
                     out
                 }
@@ -677,6 +748,30 @@ mod tests {
         for x in [0, 4095, 4096, 4097, Q - 1] {
             let e = x as i64 - ((f.power2round(x, 13) as i64) << 13);
             assert!(-(1 << 12) < e && e <= 1 << 12, "x={x} e={e}");
+        }
+    }
+
+    #[test]
+    fn decompose_matches_fips204() {
+        // the reference: r₀ = r mod± α; if r − r₀ = q − 1 then (0, r₀ − 1)
+        let f = Field::new(Q);
+        let g2 = (Q - 1) / 32;
+        let alpha = 2 * g2 as i64;
+        let mut s = 11;
+        let mut xs: Vec<u32> = (0..20_000).map(|_| lcg(&mut s)).collect();
+        xs.extend([0, 1, g2, g2 + 1, Q - 1, Q - 2, Q - 1 - g2, Q - g2]);
+        for r in xs {
+            let mut r0 = r as i64 % alpha;
+            if r0 > alpha / 2 {
+                r0 -= alpha;
+            }
+            let (r1, r0) = if r as i64 - r0 == Q as i64 - 1 {
+                (0, r0 - 1)
+            } else {
+                ((r as i64 - r0) / alpha, r0)
+            };
+            let got = f.decompose(r, g2);
+            assert_eq!(got, (r1 as u32, r0.rem_euclid(Q as i64) as u32), "r = {r}");
         }
     }
 

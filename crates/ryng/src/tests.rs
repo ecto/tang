@@ -192,3 +192,86 @@ fn sampler_graph_matches_host_reference() {
     want.extend(uniform12(&p, &seed, 2 * p.k as u8));
     assert_eq!(u, want);
 }
+
+mod signature {
+    use crate::sig::*;
+    use tang_compile::tensor::modq::{Label, ModGraph};
+
+    #[test]
+    fn sign_verify_round_trips_and_rejects_forgeries() {
+        let s = Sig::new();
+        let (pk, sk) = s.keygen(&[7; 32]);
+        assert_eq!(pk.len(), PK_BYTES);
+        let msg = b"ryng: one ring to sign them all";
+        let (sig, attempts) = s.sign(&sk, msg);
+        eprintln!("signed in {attempts} attempt(s)");
+        assert_eq!(sig.len(), SIG_BYTES);
+        assert!(s.verify(&pk, msg, &sig));
+        assert!(!s.verify(&pk, b"another message", &sig));
+        let mut bad = sig.clone();
+        bad[100] ^= 1;
+        assert!(!s.verify(&pk, msg, &bad));
+        let (pk2, _) = s.keygen(&[8; 32]);
+        assert!(!s.verify(&pk2, msg, &sig));
+        assert_eq!(s.sign(&sk, msg).0, sig, "deterministic");
+    }
+
+    #[test]
+    fn attempts_average_near_the_predicted_5_09() {
+        // FIPS 204 predicts exp(256·β·(ℓ/γ₁ + k/γ₂)) ≈ 5.09 for these parameters
+        let s = Sig::new();
+        let (_, sk) = s.keygen(&[9; 32]);
+        let runs: usize = std::env::var("RYNG_RUNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16);
+        let total: usize = (0..runs).map(|i| s.sign(&sk, &[i as u8; 8]).1).sum();
+        let mean = total as f64 / runs as f64;
+        eprintln!("mean attempts over {runs} signatures: {mean:.2}");
+        // geometric with p ≈ 0.2: the mean of 16 is within [2.5, 9] except with tiny probability
+        assert!((2.5..=9.0).contains(&mean), "mean {mean}");
+    }
+
+    #[test]
+    fn every_signature_graph_passes_the_secrecy_check() {
+        let s = Sig::new();
+        let proofs = s.check().expect("no secret steers an address or a count");
+        assert_eq!(proofs[0], vec![RHO_PROOF]);
+        assert!(proofs[1].iter().all(|&p| p == PK_PROOF) && proofs[1].len() == K);
+        // the attempt graph: z, h, c̃ gated by acceptance, plus the attempt count
+        let mut want = vec![SIG_PROOF; L + K + 1];
+        want.push(ATTEMPT_PROOF);
+        let mut got = proofs[2].clone();
+        got.sort();
+        want.sort();
+        assert_eq!(got, want);
+        assert!(proofs[3].is_empty(), "verification is public end to end");
+    }
+
+    #[test]
+    fn sample_in_ball_graph_matches_host() {
+        let mut g = ModGraph::new(Q);
+        let t = crate::keccak::Tables::new(&mut g);
+        let ct = g.input_words(&[12], Label::Secret);
+        let c = sample_in_ball(&mut g, &t, ct);
+        assert_eq!(
+            g.check(&[(c, Label::Secret)]),
+            Ok(vec![]),
+            "secret index reads go through the mux"
+        );
+        for seed in 0..4u8 {
+            let bytes: Vec<u8> = (0..48).map(|i| i as u8 ^ seed.wrapping_mul(77)).collect();
+            let words: Vec<u32> = bytes
+                .chunks(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let got = g.eval(&[words], &[c]).remove(0);
+            assert_eq!(got, sample_in_ball_host(&bytes));
+            assert_eq!(
+                got.iter().filter(|&&x| x != 0).count(),
+                49,
+                "τ = 49 nonzero"
+            );
+        }
+    }
+}

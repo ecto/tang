@@ -211,32 +211,22 @@ pub const SHAKE256_RATE: usize = 34;
 /// `[blocks · rate]`.
 pub fn squeeze(g: &mut ModGraph, t: &Tables, absorbed: ModId, rate: usize, blocks: usize) -> ModId {
     assert!(
-        (1..=4).contains(&blocks),
-        "squeeze joins at most four blocks"
+        (1..=8).contains(&blocks),
+        "squeeze joins at most eight blocks"
     );
     let mut states = vec![keccak_f(g, t, absorbed)];
     while states.len() < blocks {
         let next = keccak_f(g, t, *states.last().expect("one state"));
         states.push(next);
     }
-    let pad = states[0];
-    let args: Vec<_> = (0..4)
-        .map(|i| {
-            (
-                *states.get(i).unwrap_or(&pad),
-                ModGraph::view(&[&[0, 1]], &[0]),
-            )
-        })
+    let args: Vec<_> = states
+        .iter()
+        .map(|&s| (s, ModGraph::view(&[&[0, 1]], &[0])))
         .collect();
     let joined = g.map(&[blocks, rate], &args, |b| {
-        let (s0, s1, s2, s3) = (b.arg(0), b.arg(1), b.arg(2), b.arg(3));
+        let vals: Vec<BVal> = (0..blocks).map(|i| b.arg(i)).collect();
         let blk = b.coord(0);
-        let one = b.lit(1);
-        let lowbit = b.and(blk, one);
-        let highbit = b.shr(blk, one);
-        let lo = b.sel(lowbit, s1, s0);
-        let hi = b.sel(lowbit, s3, s2);
-        b.sel(highbit, hi, lo)
+        crate::graph::mux(b, blk, &vals)
     });
     g.reshape(joined, &[blocks * rate])
 }
