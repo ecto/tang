@@ -57,6 +57,12 @@ enum BOp {
     Mul(usize, usize),
     /// `a` where `c == 1`, `b` where `c == 0`, by mask.
     Sel(usize, usize, usize),
+    /// round(x·2^d / q) mod 2^d: keep the top d bits of a residue.
+    Compress(usize, u32),
+    /// round(y·q / 2^d): back to a residue.
+    Decompress(usize, u32),
+    /// round(x / 2^d), ties down: the high part when the low d bits are dropped.
+    Power2Round(usize, u32),
 }
 
 /// A branch-free scalar program over residues mod q.
@@ -93,6 +99,15 @@ impl Body {
     }
     pub fn sel(&mut self, c: BVal, a: BVal, b: BVal) -> BVal {
         self.push(BOp::Sel(c.0, a.0, b.0))
+    }
+    pub fn compress(&mut self, x: BVal, d: u32) -> BVal {
+        self.push(BOp::Compress(x.0, d))
+    }
+    pub fn decompress(&mut self, y: BVal, d: u32) -> BVal {
+        self.push(BOp::Decompress(y.0, d))
+    }
+    pub fn power2round(&mut self, x: BVal, d: u32) -> BVal {
+        self.push(BOp::Power2Round(x.0, d))
     }
 }
 
@@ -144,6 +159,8 @@ struct Field {
     qneg_inv: u32,
     /// R² mod q, to leave the Montgomery domain after one product.
     r2: u32,
+    /// floor(2^64 / q), for division by q without a divide instruction.
+    barrett: u64,
 }
 
 impl Field {
@@ -158,6 +175,7 @@ impl Field {
             q,
             qneg_inv: inv.wrapping_neg(),
             r2,
+            barrett: ((1u128 << 64) / q as u128) as u64,
         }
     }
     /// x − q if x ≥ q, for x < 2q, by mask.
@@ -180,6 +198,24 @@ impl Field {
     }
     fn mul(&self, a: u32, b: u32) -> u32 {
         self.mont(self.mont(a, b), self.r2)
+    }
+    /// floor(v / q) for v < 2^56: the Barrett estimate is low by at most one,
+    /// fixed by mask.
+    fn div_q(&self, v: u64) -> u64 {
+        let est = ((v as u128 * self.barrett as u128) >> 64) as u64;
+        let r = v - est * self.q as u64;
+        let ge = (((self.q as u64).wrapping_sub(1).wrapping_sub(r)) >> 63) & 1;
+        est + ge
+    }
+    fn compress(&self, x: u32, d: u32) -> u32 {
+        let v = ((x as u64) << d) + (self.q as u64 >> 1);
+        (self.div_q(v) as u32) & ((1u32 << d) - 1)
+    }
+    fn decompress(&self, y: u32, d: u32) -> u32 {
+        ((y as u64 * self.q as u64 + (1u64 << d >> 1)) >> d) as u32
+    }
+    fn power2round(&self, x: u32, d: u32) -> u32 {
+        (x + (1 << d >> 1) - 1) >> d
     }
     fn sel(&self, c: u32, a: u32, b: u32) -> u32 {
         let mask = 0u32.wrapping_sub(c & 1);
@@ -417,6 +453,9 @@ impl ModGraph {
                                 BOp::Sub(a, b) => f.sub(reg[a], reg[b]),
                                 BOp::Mul(a, b) => f.mul(reg[a], reg[b]),
                                 BOp::Sel(c, a, b) => f.sel(reg[c], reg[a], reg[b]),
+                                BOp::Compress(a, d) => f.compress(reg[a], d),
+                                BOp::Decompress(a, d) => f.decompress(reg[a], d),
+                                BOp::Power2Round(a, d) => f.power2round(reg[a], d),
                             };
                         }
                         out.push(reg[body.ops.len() - 1]);
@@ -563,6 +602,33 @@ mod tests {
             assert_eq!(f.mul(a, b) as u64, a as u64 * b as u64 % Q as u64);
         }
         assert_eq!(f.mul(Q - 1, Q - 1), 1);
+    }
+
+    #[test]
+    fn compress_matches_rounding() {
+        let f = Field::new(Q);
+        let mut s = 3;
+        for d in [1, 5, 10, 11] {
+            for _ in 0..5_000 {
+                let x = lcg(&mut s);
+                let want =
+                    ((((x as u128) << d) + Q as u128 / 2) / Q as u128) as u32 & ((1 << d) - 1);
+                assert_eq!(f.compress(x, d), want);
+                let y = x & ((1 << d) - 1);
+                let back = ((y as u128 * Q as u128 + (1 << d >> 1)) >> d) as u32;
+                assert_eq!(f.decompress(y, d), back);
+            }
+            for x in [0, 1, Q / 2, Q / 2 + 1, Q - 1] {
+                let want =
+                    ((((x as u128) << d) + Q as u128 / 2) / Q as u128) as u32 & ((1 << d) - 1);
+                assert_eq!(f.compress(x, d), want, "x={x} d={d}");
+            }
+        }
+        // dropping 13 bits leaves an error in (−2^12, 2^12]
+        for x in [0, 4095, 4096, 4097, Q - 1] {
+            let e = x as i64 - ((f.power2round(x, 13) as i64) << 13);
+            assert!(-(1 << 12) < e && e <= 1 << 12, "x={x} e={e}");
+        }
     }
 
     #[test]
