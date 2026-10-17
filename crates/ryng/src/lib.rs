@@ -23,6 +23,7 @@ pub mod graph;
 pub mod keccak;
 pub mod sample;
 pub mod sig;
+pub mod sig_gpu;
 
 use sha3::digest::{ExtendableOutput, Update, XofReader};
 use sha3::{Digest, Sha3_256, Shake128, Shake256};

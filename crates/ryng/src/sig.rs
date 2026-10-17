@@ -571,28 +571,28 @@ impl Sig {
 
     /// Sign. Returns the signature and how many attempts it took.
     pub fn sign(&self, sk: &SigningKey, msg: &[u8]) -> (Vec<u8>, usize) {
-        let mu = shake(b"sig/mu", &[&sk.tr, msg], 64);
-        let a = sample_mat(&sk.rho, K, L);
-        let (rho2_tail, _) = tail(160, &[(0, &sep(b"sig/rho2")), (96, &mu)]);
-        let (c_tail, _) = tail(32 + 64 + K * N / 2, &[(0, &sep(b"sig/c")), (32, &mu)]);
+        let prep = Prepared::new(sk, msg);
+        let (g, outs) = self.attempt_graph_outputs();
+        for attempt in 0..1000usize {
+            let res = g.eval(&prep.inputs(sk, attempt), &outs);
+            if let Some(sig) = finish_signature(&res) {
+                return (sig, attempt + 1);
+            }
+        }
+        panic!("no signature in 1000 attempts (expected ~5)");
+    }
+
+    /// The attempt graph and its outputs in the order [`finish_signature`] reads.
+    pub(crate) fn attempt_graph_outputs(&self) -> (&ModGraph, Vec<ModId>) {
         let at = &self.attempt;
         let mut outs = vec![at.accept, at.ctilde];
         outs.extend(&at.z);
         outs.extend(&at.h);
-        for attempt in 0..1000usize {
-            let ins = attempt_inputs(sk, &a, &rho2_tail, &c_tail, attempt);
-            let res = at.g.eval(&ins, &outs);
-            if res[0][0] != 1 {
-                continue;
-            }
-            let mut sig = bytes(&res[1]);
-            let z = res[2..2 + L].concat();
-            let zenc: Vec<u32> = z.iter().map(|&v| (GAMMA1 + Q - v) % Q).collect();
-            sig.extend(pack(&zenc, 20));
-            sig.extend(encode_hint(&res[2 + L..]));
-            return (sig, attempt + 1);
-        }
-        panic!("no signature in 1000 attempts (expected ~5)");
+        (&at.g, outs)
+    }
+
+    pub(crate) fn verify_graph(&self) -> (&ModGraph, Vec<ModId>) {
+        (&self.verify.g, self.verify.w.clone())
     }
 
     /// Diagnostics: every rejection condition, attempt by attempt, ignoring
@@ -615,39 +615,106 @@ impl Sig {
     }
 
     pub fn verify(&self, pk: &[u8], msg: &[u8], sig: &[u8]) -> bool {
-        if pk.len() != PK_BYTES || sig.len() != SIG_BYTES {
-            return false;
-        }
-        let (rho, t1b) = pk.split_at(32);
-        let t1 = unpack(t1b, 10, K * N);
-        let ctilde = &sig[..CTILDE_WORDS * 4];
-        let zb = &sig[CTILDE_WORDS * 4..CTILDE_WORDS * 4 + L * N * 20 / 8];
-        let z: Vec<u32> = unpack(zb, 20, L * N)
-            .iter()
-            .map(|&e| (GAMMA1 + Q - e) % Q)
-            .collect();
-        let Some(h) = decode_hint(&sig[sig.len() - OMEGA - K..]) else {
+        let Some((ins, rest)) = verify_start(pk, msg, sig) else {
             return false;
         };
-        if z.iter()
-            .any(|&v| centred(v).unsigned_abs() >= (GAMMA1 - BETA) as u64)
-        {
-            return false;
+        let w = self.verify.g.eval(&ins, &self.verify.w);
+        rest.finish(&w)
+    }
+}
+
+/// Per-message signing state: the public matrix and the two hash tails.
+pub(crate) struct Prepared {
+    a: Vec<u32>,
+    rho2_tail: Vec<u32>,
+    c_tail: Vec<u32>,
+}
+
+impl Prepared {
+    pub(crate) fn new(sk: &SigningKey, msg: &[u8]) -> Self {
+        let mu = shake(b"sig/mu", &[&sk.tr, msg], 64);
+        let a = sample_mat(&sk.rho, K, L);
+        let (rho2_tail, _) = tail(160, &[(0, &sep(b"sig/rho2")), (96, &mu)]);
+        let (c_tail, _) = tail(32 + 64 + K * N / 2, &[(0, &sep(b"sig/c")), (32, &mu)]);
+        Self {
+            a,
+            rho2_tail,
+            c_tail,
         }
-        let c = sample_in_ball_host(ctilde);
-        let a = sample_mat(rho, K, L);
-        let w = self.verify.g.eval(&[a, t1, z, c], &self.verify.w);
+    }
+
+    pub(crate) fn inputs(&self, sk: &SigningKey, attempt: usize) -> Vec<Vec<u32>> {
+        attempt_inputs(sk, &self.a, &self.rho2_tail, &self.c_tail, attempt).to_vec()
+    }
+}
+
+/// An attempt's outputs → the encoded signature, or `None` if it was rejected.
+pub(crate) fn finish_signature(res: &[Vec<u32>]) -> Option<Vec<u8>> {
+    if res[0][0] != 1 {
+        return None;
+    }
+    let mut sig = bytes(&res[1]);
+    let z = res[2..2 + L].concat();
+    let zenc: Vec<u32> = z.iter().map(|&v| (GAMMA1 + Q - v) % Q).collect();
+    sig.extend(pack(&zenc, 20));
+    sig.extend(encode_hint(&res[2 + L..]));
+    Some(sig)
+}
+
+/// What verification needs after the graph: the hints, c̃ and μ.
+pub(crate) struct VerifyRest {
+    h: Vec<Vec<u32>>,
+    ctilde: Vec<u8>,
+    mu: Vec<u8>,
+}
+
+impl VerifyRest {
+    pub(crate) fn finish(&self, w: &[Vec<u32>]) -> bool {
         let mut w1 = Vec::with_capacity(K * N);
-        for (wi, hi) in w.iter().zip(&h) {
+        for (wi, hi) in w.iter().zip(&self.h) {
             w1.extend(wi.iter().zip(hi).map(|(&r, &hb)| use_hint(hb, r)));
         }
-        let tr = shake(b"sig/tr", &[pk], 64);
-        let mu = shake(b"sig/mu", &[&tr, msg], 64);
-        let w1b = pack(&w1, 4);
-        let want = shake(b"sig/c", &[&mu, &w1b], 48);
-        // ctilde is public; an ordinary compare is fine here
-        want == ctilde
+        let want = shake(b"sig/c", &[&self.mu, &pack(&w1, 4)], 48);
+        // c̃ is public; an ordinary compare is fine here
+        want == self.ctilde
     }
+}
+
+/// Parse and range-check a signature; return the verify graph's inputs.
+pub(crate) fn verify_start(
+    pk: &[u8],
+    msg: &[u8],
+    sig: &[u8],
+) -> Option<(Vec<Vec<u32>>, VerifyRest)> {
+    if pk.len() != PK_BYTES || sig.len() != SIG_BYTES {
+        return None;
+    }
+    let (rho, t1b) = pk.split_at(32);
+    let t1 = unpack(t1b, 10, K * N);
+    let ctilde = &sig[..CTILDE_WORDS * 4];
+    let zb = &sig[CTILDE_WORDS * 4..CTILDE_WORDS * 4 + L * N * 20 / 8];
+    let z: Vec<u32> = unpack(zb, 20, L * N)
+        .iter()
+        .map(|&e| (GAMMA1 + Q - e) % Q)
+        .collect();
+    let h = decode_hint(&sig[sig.len() - OMEGA - K..])?;
+    if z.iter()
+        .any(|&v| centred(v).unsigned_abs() >= (GAMMA1 - BETA) as u64)
+    {
+        return None;
+    }
+    let c = sample_in_ball_host(ctilde);
+    let a = sample_mat(rho, K, L);
+    let tr = shake(b"sig/tr", &[pk], 64);
+    let mu = shake(b"sig/mu", &[&tr, msg], 64);
+    Some((
+        vec![a, t1, z, c],
+        VerifyRest {
+            h,
+            ctilde: ctilde.to_vec(),
+            mu,
+        },
+    ))
 }
 
 /// The attempt graph's inputs for attempt number `attempt`.

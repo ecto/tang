@@ -628,3 +628,94 @@ fn graph_sizes() {
         );
     }
 }
+
+/// Signing and verifying in batches on Metal: identical signatures to the
+/// CPU path, the same verdicts, and (with RYNG_BENCH) throughput.
+#[test]
+#[cfg(target_os = "macos")]
+fn signature_on_metal() {
+    use crate::sig::*;
+    use crate::sig_gpu::SigMetal;
+    let s = Sig::new();
+    let gpu = SigMetal::new(&s).expect("clang with Metal");
+    let (pk, sk) = s.keygen(&[5; 32]);
+    let msgs: Vec<Vec<u8>> = (0..12u8).map(|i| vec![i; 1 + i as usize]).collect();
+    let refs: Vec<&[u8]> = msgs.iter().map(|m| m.as_slice()).collect();
+    let (sigs, st) = gpu.sign_batch(&sk, &refs).expect("a Metal device");
+    let mut cpu_attempts = 0;
+    for (m, sig) in msgs.iter().zip(&sigs) {
+        let (want, n) = s.sign(&sk, m);
+        assert_eq!(sig, &want, "GPU and CPU signatures differ");
+        cpu_attempts += n;
+    }
+    assert_eq!(st.attempts, cpu_attempts);
+
+    // verdicts: valid, flipped bit, wrong message, wrong length
+    let mut bad = sigs[0].clone();
+    bad[200] ^= 4;
+    let short = sigs[1][..100].to_vec();
+    let mut items: Vec<(&[u8], &[u8], &[u8])> = msgs
+        .iter()
+        .zip(&sigs)
+        .map(|(m, g)| (&pk[..], &m[..], &g[..]))
+        .collect();
+    items.push((&pk, &msgs[0], &bad));
+    items.push((&pk, b"not this one", &sigs[2]));
+    items.push((&pk, &msgs[1], &short));
+    let (ok, _) = gpu.verify_batch(&items).expect("a Metal device");
+    let want: Vec<bool> = items.iter().map(|(p, m, g)| s.verify(p, m, g)).collect();
+    assert_eq!(ok, want);
+    assert_eq!(ok.iter().filter(|&&b| b).count(), 12);
+
+    if std::env::var_os("RYNG_BENCH").is_none() {
+        return;
+    }
+    // C baselines: one attempt, one verify-graph run
+    let (g, outs) = s.graphs().swap_remove(2);
+    let c = g.compile(&outs).expect("cc");
+    let mut t = c
+        .time(&vec![s.attempt_example(&sk, b"x").to_vec(); 32])
+        .unwrap();
+    t.sort();
+    let c_attempt = t[t.len() / 2] as f64;
+    let (vg, vouts) = s.graphs().swap_remove(3);
+    let vc = vg.compile(&vouts).expect("cc");
+    let vins = crate::sig::verify_start(&pk, &msgs[0], &sigs[0]).unwrap().0;
+    let mut t = vc.time(&vec![vins; 32]).unwrap();
+    t.sort();
+    let c_verify = t[t.len() / 2] as f64;
+    let mean_attempts = cpu_attempts as f64 / msgs.len() as f64;
+    eprintln!(
+        "C one core: attempt {:.0} µs (× {mean_attempts:.2} mean attempts = {:.0} µs/signature), verify graph {:.0} µs",
+        c_attempt / 1e3,
+        c_attempt * mean_attempts / 1e3,
+        c_verify / 1e3
+    );
+    for b in [1usize, 64, 512, 1024] {
+        let ms: Vec<Vec<u8>> = (0..b).map(|i| (i as u32).to_le_bytes().to_vec()).collect();
+        let rs: Vec<&[u8]> = ms.iter().map(|m| m.as_slice()).collect();
+        let (sg, st) = gpu.sign_batch(&sk, &rs).unwrap();
+        let per = st.device_ns as f64 / b as f64;
+        eprintln!(
+            "Metal sign   batch {b:4}: {:3} rounds, {:7.2} ms device, {:7.1} µs/signature, {:5.1}× one C core",
+            st.rounds,
+            st.device_ns as f64 / 1e6,
+            per / 1e3,
+            c_attempt * mean_attempts / per
+        );
+        let items: Vec<(&[u8], &[u8], &[u8])> = rs
+            .iter()
+            .zip(&sg)
+            .map(|(m, g)| (&pk[..], *m, &g[..]))
+            .collect();
+        let (ok, vt) = gpu.verify_batch(&items).unwrap();
+        assert!(ok.iter().all(|&x| x));
+        let per = vt.device_ns as f64 / b as f64;
+        eprintln!(
+            "Metal verify batch {b:4}:            {:7.2} ms device, {:7.1} µs/verify,    {:5.1}× one C core",
+            vt.device_ns as f64 / 1e6,
+            per / 1e3,
+            c_verify / per
+        );
+    }
+}
