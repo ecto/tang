@@ -207,6 +207,8 @@ struct Attempt {
 struct Verify {
     g: ModGraph,
     w: Vec<ModId>,
+    /// A and t₁: fixed by the public key, shared by a one-key GPU batch
+    key_inputs: Vec<ModId>,
 }
 
 /// The signature's graphs, built once.
@@ -325,7 +327,11 @@ impl Sig {
                 zip(&mut g, az[i], ct, |b, u, v| b.sub(u, v))
             })
             .collect();
-        let verify = Verify { g, w };
+        let verify = Verify {
+            g,
+            w,
+            key_inputs: vec![a, t1],
+        };
 
         Self {
             seeds,
@@ -605,6 +611,11 @@ impl Sig {
     /// batch under one key sends once.
     pub(crate) fn attempt_key_inputs(&self) -> Vec<ModId> {
         self.attempt.key_inputs.clone()
+    }
+
+    /// The verify graph's key-fixed inputs (A, t₁).
+    pub(crate) fn verify_key_inputs(&self) -> Vec<ModId> {
+        self.verify.key_inputs.clone()
     }
 
     pub(crate) fn verify_graph(&self) -> (&ModGraph, Vec<ModId>) {

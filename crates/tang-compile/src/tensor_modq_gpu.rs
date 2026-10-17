@@ -621,6 +621,12 @@ fn scratch(kind: &str) -> io::Result<PathBuf> {
 /// A built GPU runner. The runner is a server: started on first use, it
 /// compiles the kernels once and keeps its buffers, then answers batches
 /// over a pipe until this value is dropped.
+///
+/// The arena grows to the largest batch seen. The first batch after it
+/// grows pays for mapping the new memory (on an M4 Max, ~75 ms at 5 GB),
+/// which device timestamps do not show; send one batch of the largest size
+/// you will use before timing or serving. `TANG_MODQ_PROFILE=1` prints a
+/// per-batch breakdown (pack, server read/scatter/encode, commit-to-done).
 pub struct GpuCompiled {
     pub dir: PathBuf,
     exe: PathBuf,
@@ -721,12 +727,15 @@ impl GpuCompiled {
         }
         let srv = guard.as_mut().expect("started");
         let b = sets.len();
+        let profile = std::env::var_os("TANG_MODQ_PROFILE").is_some();
+        let t0 = std::time::Instant::now();
         let mut req = Vec::with_capacity(4 + b * self.in_sizes.iter().sum::<usize>() * 4);
         req.extend((b as u32).to_le_bytes());
         req.extend(le_bytes(shared));
         for set in sets {
             req.extend(le_bytes(set));
         }
+        let t_pack = t0.elapsed();
         let reply = (|| -> io::Result<Vec<u8>> {
             srv.stdin.write_all(&req)?;
             srv.stdin.flush()?;
@@ -741,6 +750,7 @@ impl GpuCompiled {
                 return Err(self.failure(e));
             }
         };
+        let t_round = t0.elapsed();
         let (time, rest) = reply.split_at(8);
         let ns = u64::from_le_bytes(time.try_into().expect("8 bytes"));
         let words: Vec<u32> = rest
@@ -755,6 +765,22 @@ impl GpuCompiled {
                 r.push(words[at..at + n].to_vec());
                 at += n;
             }
+        }
+        if profile {
+            if let Ok(log) = std::fs::read_to_string(self.dir.join("stderr.log")) {
+                if let Some(last) = log.lines().last() {
+                    eprintln!("{last}");
+                }
+            }
+            let t_all = t0.elapsed();
+            eprintln!(
+                "modq gpu batch {b}: pack {:.2} ms, pipe + server + device {:.2} ms (device {:.2}), unpack {:.2} ms, {:.1} MB in",
+                t_pack.as_secs_f64() * 1e3,
+                (t_round - t_pack).as_secs_f64() * 1e3,
+                ns as f64 / 1e6,
+                (t_all - t_round).as_secs_f64() * 1e3,
+                req.len() as f64 / 1e6
+            );
         }
         Ok((res, ns))
     }
@@ -800,9 +826,11 @@ int main(int argc, char **argv) {
     id<MTLBuffer> arena = nil; uint32_t cap = 0;
     uint32_t *raw = NULL; size_t raw_cap = 0;
     static char obuf[1 << 20]; setvbuf(stdout, obuf, _IOFBF, sizeof obuf);
+    int profile = getenv("TANG_MODQ_PROFILE") != NULL;
     for (;;) @autoreleasepool {
       uint32_t B;
       if (!read_all(&B, 4) || B == 0) break;
+      uint64_t T0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
       if (B > cap) {
         arena = [dev newBufferWithLength:(DATA_TOTAL * B + 1) * 4 options:MTLResourceStorageModeShared];
         if (!arena) { fprintf(stderr, "arena of %llu MB: allocation failed\n", DATA_TOTAL * B * 4 / 1000000); return 8; }
@@ -814,10 +842,12 @@ int main(int argc, char **argv) {
           if (!read_all(cp + CONST_OFF[i], SIZE[i] * 4)) return 5;
       if (per_set * B > raw_cap) { raw_cap = per_set * B; raw = realloc(raw, raw_cap * 4 + 4); }
       if (!read_all(raw, per_set * B * 4)) return 5;
+      uint64_t T1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
       uint32_t *ap = [arena contents];
       for (int k = 1; k <= N_IN; k++)
         for (int i = 0; i < NODES; i++) if (KIND[i] == k && !SHARED[i])
           for (uint32_t b = 0; b < B; b++) memcpy(ap + B * DATA_OFF[i] + (uint64_t)b * SIZE[i], raw + b * per_set + in_off[k], SIZE[i] * 4);
+      uint64_t T2 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
       id<MTLCommandBuffer> cb = [q commandBuffer];
       id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
       [enc setBuffer:cst offset:0 atIndex:0];
@@ -849,10 +879,13 @@ int main(int argc, char **argv) {
         at = end;
       }
       [enc endEncoding];
+      uint64_t T3 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
       [cb commit];
       [cb waitUntilCompleted];
+      uint64_t T4 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
       if (cb.error) { fprintf(stderr, "gpu: %s\n", [[cb.error description] UTF8String]); return 7; }
       uint64_t ns = (uint64_t)((cb.GPUEndTime - cb.GPUStartTime) * 1e9);
+      if (profile) { fprintf(stderr, "server B=%u: read %.2f ms, scatter %.2f ms, encode %.2f ms, commit-to-done %.2f ms (device %.2f)\n", B, (T1 - T0) / 1e6, (T2 - T1) / 1e6, (T3 - T2) / 1e6, (T4 - T3) / 1e6, ns / 1e6); fflush(stderr); }
       fwrite(&ns, 8, 1, stdout);
       for (int o = 0; o < N_OUT; o++) {
         int i = STORAGE[OUTS[o]];

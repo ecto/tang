@@ -10,3 +10,4 @@ publish = false
 [dependencies]
 tang-compile = { workspace = true }
 sha3 = "0.10"
+rayon = "1"

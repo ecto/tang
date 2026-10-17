@@ -538,6 +538,8 @@ mod compiled {
             }
             for b in [1usize, 32, 128, 512, 2048] {
                 let sets: Vec<_> = (0..b).map(per).collect();
+                // a first batch at a new size grows the arena; time a warm one
+                shared_built.run_shared(&shared, &sets).unwrap();
                 let t0 = std::time::Instant::now();
                 let (_, ns) = shared_built.run_shared(&shared, &sets).unwrap();
                 let wall = t0.elapsed().as_nanos() as f64;
@@ -550,6 +552,7 @@ mod compiled {
             }
             for b in [1usize, 32, 128, 512, 2048] {
                 let sets: Vec<_> = (0..b).map(|i| cases[i % 4].0.clone()).collect();
+                built.run(&sets).unwrap(); // warm the arena at this size
                 let t0 = std::time::Instant::now();
                 let (_, ns) = built.run(&sets).unwrap();
                 let wall = t0.elapsed().as_nanos() as f64;
@@ -724,6 +727,7 @@ fn signature_on_metal() {
     for b in [1usize, 64, 512, 1024] {
         let ms: Vec<Vec<u8>> = (0..b).map(|i| (i as u32).to_le_bytes().to_vec()).collect();
         let rs: Vec<&[u8]> = ms.iter().map(|m| m.as_slice()).collect();
+        gpu.sign_batch(&sk, &rs).unwrap(); // warm the arenas at this size
         let t0 = std::time::Instant::now();
         let (sg, st) = gpu.sign_batch(&sk, &rs).unwrap();
         let wall = t0.elapsed().as_nanos() as f64;
@@ -741,6 +745,7 @@ fn signature_on_metal() {
             .zip(&sg)
             .map(|(m, g)| (&pk[..], *m, &g[..]))
             .collect();
+        gpu.verify_batch(&items).unwrap(); // warm
         let t0 = std::time::Instant::now();
         let (ok, vt) = gpu.verify_batch(&items).unwrap();
         let wall = t0.elapsed().as_nanos() as f64;
