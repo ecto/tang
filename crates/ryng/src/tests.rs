@@ -447,6 +447,70 @@ mod compiled {
         eprintln!("{total} body functions across 8 graphs: no conditional branch, no divide");
     }
 
+    /// The KEM's open on the GPU: the same keys as the interpreter for every
+    /// instance of a batch, and throughput against the C build.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn open_on_metal() {
+        let r = Ryng::new(Params::RYNG);
+        let fo = r.fo.as_ref().unwrap();
+        let (msl, _) = fo.open.g.to_metal(&[fo.open.key]);
+        eprintln!(
+            "open: {} nodes → {} distinct Metal kernels",
+            fo.open.g.nodes_sizes().len(),
+            msl.matches("kernel void").count()
+        );
+        let built = fo
+            .open
+            .g
+            .compile_metal(&[fo.open.key])
+            .expect("clang with Metal");
+        let cases: Vec<_> = (0..4u8).map(|i| open_inputs(&r, 40 + i)).collect();
+        // a tampered ciphertext too: the rejection key, on the GPU
+        let mut bad = cases[0].0.clone();
+        bad[4][7] ^= 1;
+        let want_bad = fo.open.g.eval(&bad, &[fo.open.key]).remove(0);
+        let batch: Vec<Vec<Vec<u32>>> = (0..32)
+            .map(|i| {
+                if i == 31 {
+                    bad.clone()
+                } else {
+                    cases[i % 4].0.clone()
+                }
+            })
+            .collect();
+        let (got, _) = built.run(&batch).expect("a Metal device");
+        for (i, out) in got.iter().enumerate() {
+            let want = if i == 31 {
+                want_bad.clone()
+            } else {
+                words(&cases[i % 4].1)
+            };
+            assert_eq!(out[0], want, "instance {i}");
+        }
+        if std::env::var_os("RYNG_BENCH").is_some() {
+            let c = fo.open.g.compile(&[fo.open.key]).expect("cc");
+            let one = vec![cases[0].0.clone(); 64];
+            let mut t = c.time(&one).unwrap();
+            t.sort();
+            let cpu = t[t.len() / 2] as f64;
+            eprintln!(
+                "open, C -O2 (noinline bodies), one core: {:.1} µs",
+                cpu / 1e3
+            );
+            for b in [1usize, 32, 128, 512, 2048] {
+                let sets: Vec<_> = (0..b).map(|i| cases[i % 4].0.clone()).collect();
+                let (_, ns) = built.run(&sets).unwrap();
+                eprintln!(
+                    "open, Metal batch {b:4}: {:8.2} ms device, {:7.1} µs per open, {:5.1}× one C core",
+                    ns as f64 / 1e6,
+                    ns as f64 / 1e3 / b as f64,
+                    cpu * b as f64 / ns as f64
+                );
+            }
+        }
+    }
+
     /// dudect: does open's running time depend on the secret key, or on
     /// whether the ciphertext was valid? Fixed class: the key the ciphertext
     /// was made for (re-encryption matches). Random class: random s and z
@@ -516,6 +580,28 @@ mod compiled {
         assert!(
             ts.iter().all(|t| t.abs() < 4.5),
             "timing depends on the secret: t = {ts:?}"
+        );
+    }
+}
+
+#[test]
+fn graph_sizes() {
+    if std::env::var_os("RYNG_SIZES").is_none() {
+        return;
+    }
+    let r = Ryng::new(Params::RYNG);
+    let fo = r.fo.as_ref().unwrap();
+    for (name, g) in [
+        ("seeds", &fo.seeds.g),
+        ("keyt", &fo.keyt.g),
+        ("seal", &fo.seal.g),
+        ("open", &fo.open.g),
+    ] {
+        let words: usize = g.nodes_sizes().iter().sum();
+        eprintln!(
+            "{name}: {} nodes, {:.1} MB of buffers per instance",
+            g.nodes_sizes().len(),
+            words as f64 * 4.0 / 1e6
         );
     }
 }

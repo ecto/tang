@@ -37,6 +37,8 @@ use super::{Form, View};
 
 #[path = "tensor_modq_c.rs"]
 pub mod c;
+#[path = "tensor_modq_gpu.rs"]
+pub mod gpu;
 
 /// Who may learn a value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -316,6 +318,14 @@ impl ModGraph {
             nodes: Vec::new(),
             inputs: 0,
         }
+    }
+
+    /// Every node's element count, in graph order.
+    pub fn nodes_sizes(&self) -> Vec<usize> {
+        self.nodes
+            .iter()
+            .map(|n| n.shape.iter().product())
+            .collect()
     }
 
     pub fn q(&self) -> u32 {

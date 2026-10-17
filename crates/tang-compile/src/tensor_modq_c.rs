@@ -70,7 +70,7 @@ AI uint32_t ct_high(uint32_t r, uint64_t g2, uint64_t m) { uint32_t h, l; ct_dec
 AI uint32_t ct_low(uint32_t r, uint64_t g2, uint64_t m) { uint32_t h, l; ct_decompose(r, g2, m, &h, &l); return l; }
 "#;
 
-fn op_c(op: &BOp, out: &mut String, i: usize) {
+pub(super) fn op_c(op: &BOp, out: &mut String, i: usize) {
     let r = |k: usize| format!("r{k}");
     let e = match *op {
         BOp::Arg(a) => format!("a{a}"),
@@ -391,7 +391,7 @@ impl Drop for Compiled {
     }
 }
 
-fn le_bytes(inputs: &[Vec<u32>]) -> Vec<u8> {
+pub(super) fn le_bytes(inputs: &[Vec<u32>]) -> Vec<u8> {
     inputs
         .iter()
         .flatten()
