@@ -368,3 +368,154 @@ fn rejection_rates() {
     eprintln!("attempts {n}: z ok {:.3}  r0 ok {:.3}  ct0 ok {:.3}  hints ok {:.3}  all {:.3}  hints mean {:.1} max {}",
         rate(0), rate(1), rate(2), rate(3), all, mean_h, max_h);
 }
+
+/// Compiled C: the same answers as the interpreter, and bodies that the
+/// machine-code lint passes.
+mod compiled {
+    use super::*;
+    use tang_compile::tensor::modq::c::welch_t;
+
+    fn open_inputs(r: &Ryng, seed: u8) -> (Vec<Vec<u32>>, [u8; 32]) {
+        let p = r.p;
+        let (pk, sk) = r.keygen(&[seed; 64]);
+        let (ct, key) = r.seal(&pk, &[seed ^ 0x55; 32]);
+        let s_len = p.k * p.n * bits(p.q) as usize / 8;
+        let s = unpack(&sk[..s_len], bits(p.q), p.k * p.n);
+        let pk_len = p.pk_bytes();
+        let h = &sk[s_len + pk_len..s_len + pk_len + 32];
+        let z = &sk[s_len + pk_len + 32..];
+        let a = sample_a(&p, &pk[..32]);
+        let t1 = unpack(&pk[32..], bits(p.q) - p.dt, p.k * p.n);
+        let (u, v) = r.unpack_ct(&ct);
+        let (jt, _) = graph::tail(64 + ct.len(), &[(0, &sep(b"reject")), (64, &ct)]);
+        (vec![a, t1, s, words(z), u, v, g_tail(h), jt], key)
+    }
+
+    #[test]
+    fn open_in_c_matches_the_interpreter() {
+        let r = Ryng::new(Params::RYNG);
+        let fo = r.fo.as_ref().unwrap();
+        let built = fo.open.g.compile(&[fo.open.key]).expect("a C compiler");
+        let (ins, key) = open_inputs(&r, 3);
+        let c = built.run(&ins).unwrap();
+        assert_eq!(c, fo.open.g.eval(&ins, &[fo.open.key]));
+        assert_eq!(bytes(&c[0]), key);
+    }
+
+    #[test]
+    fn signing_attempt_in_c_matches_the_interpreter() {
+        let s = sig::Sig::new();
+        let (_, sk) = s.keygen(&[4; 32]);
+        let ins = s.attempt_example(&sk, b"compiled");
+        let graphs = s.graphs();
+        let (g, outs) = &graphs[2];
+        let built = g.compile(outs).expect("a C compiler");
+        assert_eq!(built.run(&ins).unwrap(), g.eval(&ins, outs));
+    }
+
+    #[test]
+    fn every_ryng_graph_lints_clean() {
+        let r = Ryng::new(Params::RYNG);
+        let fo = r.fo.as_ref().unwrap();
+        let mut kem: Vec<(&ModGraph, Vec<ModId>)> = vec![
+            (&fo.seeds.g, vec![fo.seeds.rho, fo.seeds.sigma]),
+            (
+                &fo.keyt.g,
+                fo.keyt.t1.iter().chain(&fo.keyt.s).copied().collect(),
+            ),
+            (
+                &fo.seal.g,
+                fo.seal
+                    .u
+                    .iter()
+                    .copied()
+                    .chain([fo.seal.v, fo.seal.key])
+                    .collect(),
+            ),
+            (&fo.open.g, vec![fo.open.key]),
+        ];
+        let s = sig::Sig::new();
+        kem.extend(s.graphs());
+        let mut total = 0;
+        for (i, (g, outs)) in kem.iter().enumerate() {
+            let built = g.compile(outs).expect("a C compiler");
+            let n = built.lint().unwrap_or_else(|bad| {
+                panic!("graph {i} leaks:\n{}", bad[..bad.len().min(20)].join("\n"))
+            });
+            total += n;
+        }
+        eprintln!("{total} body functions across 8 graphs: no conditional branch, no divide");
+    }
+
+    /// dudect: does open's running time depend on the secret key, or on
+    /// whether the ciphertext was valid? Fixed class: the key the ciphertext
+    /// was made for (re-encryption matches). Random class: random s and z
+    /// (re-encryption mismatches, implicit rejection). |t| < 4.5 passes.
+    #[test]
+    fn open_runs_in_constant_time() {
+        let n: usize = std::env::var("RYNG_DUDECT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
+        let r = Ryng::new(Params::RYNG);
+        let p = r.p;
+        let fo = r.fo.as_ref().unwrap();
+        let built = fo.open.g.compile(&[fo.open.key]).expect("a C compiler");
+        let (fixed, _) = open_inputs(&r, 7);
+        let mut st = 0x1234_5678_u64;
+        let mut next = || {
+            st = st
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (st >> 33) as u32
+        };
+        let mut sets = Vec::with_capacity(2 * n);
+        let mut class = Vec::with_capacity(2 * n);
+        for _ in 0..2 * n {
+            let c = next() & 1;
+            let mut ins = fixed.clone();
+            if c == 1 {
+                ins[2] = (0..p.k * p.n).map(|_| next() % p.q).collect();
+                ins[3] = (0..8).map(|_| next()).collect();
+            }
+            sets.push(ins);
+            class.push(c);
+        }
+        let times = built.time(&sets).unwrap();
+        let (a, b): (Vec<u64>, Vec<u64>) = {
+            let mut a = Vec::new();
+            let mut b = Vec::new();
+            for (t, c) in times.iter().zip(&class) {
+                if *c == 0 {
+                    a.push(*t)
+                } else {
+                    b.push(*t)
+                }
+            }
+            (a, b)
+        };
+        let med = |v: &[u64]| {
+            let mut v = v.to_vec();
+            v.sort();
+            v[v.len() / 2]
+        };
+        let ts: Vec<f64> = [0.0, 0.1, 0.3]
+            .iter()
+            .map(|&c| welch_t(&a, &b, c))
+            .collect();
+        eprintln!(
+            "open: {} vs {} runs, median {} vs {} ns, t at crop 0/0.1/0.3 = {:.2} / {:.2} / {:.2}",
+            a.len(),
+            b.len(),
+            med(&a),
+            med(&b),
+            ts[0],
+            ts[1],
+            ts[2]
+        );
+        assert!(
+            ts.iter().all(|t| t.abs() < 4.5),
+            "timing depends on the secret: t = {ts:?}"
+        );
+    }
+}

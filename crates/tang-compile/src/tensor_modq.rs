@@ -35,6 +35,9 @@
 
 use super::{Form, View};
 
+#[path = "tensor_modq_c.rs"]
+pub mod c;
+
 /// Who may learn a value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Label {

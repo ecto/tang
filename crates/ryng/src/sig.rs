@@ -482,6 +482,35 @@ impl Sig {
         }
     }
 
+    /// Every signature graph with its outputs, for compiling and linting.
+    #[doc(hidden)]
+    pub fn graphs(&self) -> Vec<(&ModGraph, Vec<ModId>)> {
+        let s = &self.seeds;
+        let mut so = vec![s.rho, s.key];
+        so.extend(&s.s);
+        let mut ko = self.keyt.t1.clone();
+        ko.extend(&self.keyt.t0);
+        let a = &self.attempt;
+        let mut ao = vec![a.accept, a.ctilde];
+        ao.extend(a.z.iter().chain(&a.h));
+        vec![
+            (&s.g, so),
+            (&self.keyt.g, ko),
+            (&a.g, ao),
+            (&self.verify.g, self.verify.w.clone()),
+        ]
+    }
+
+    /// The attempt graph's inputs for one attempt, for differential testing.
+    #[doc(hidden)]
+    pub fn attempt_example(&self, sk: &SigningKey, msg: &[u8]) -> [Vec<u32>; 8] {
+        let mu = shake(b"sig/mu", &[&sk.tr, msg], 64);
+        let a = sample_mat(&sk.rho, K, L);
+        let (rho2_tail, _) = tail(160, &[(0, &sep(b"sig/rho2")), (96, &mu)]);
+        let (c_tail, _) = tail(32 + 64 + K * N / 2, &[(0, &sep(b"sig/c")), (32, &mu)]);
+        attempt_inputs(sk, &a, &rho2_tail, &c_tail, 0)
+    }
+
     /// The secrecy check on every signature graph, and the proofs each relies on.
     pub fn check(&self) -> Result<Vec<Vec<&'static str>>, TaintError> {
         let s = &self.seeds;
