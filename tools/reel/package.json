@@ -1,0 +1,9 @@
+{
+  "name": "tang-reel",
+  "private": true,
+  "type": "module",
+  "description": "Beat-synced hype reel rendered from tang's own WASM demos",
+  "dependencies": {
+    "puppeteer-core": "23.11.1"
+  }
+}

@@ -1,0 +1,355 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>tang reel</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  html, body { margin: 0; background: #0b0907; overflow: hidden; }
+  svg { display: block; }
+  text { font-family: "IBM Plex Sans", sans-serif; }
+  .mono { font-family: "IBM Plex Mono", monospace; }
+</style>
+</head>
+<body>
+<svg id="stage" xmlns="http://www.w3.org/2000/svg"></svg>
+<script type="module">
+import init, { dual_eval, expr_kernel, orbit_eval, arm_ik_step, graph_layout, graph_values } from '../../site/pkg/tang/tang_site_wasm.js';
+
+const P = new URLSearchParams(location.search);
+const W = +(P.get('w') || 1920), H = +(P.get('h') || 1080);
+const BPM = 135, BEAT = 60 / BPM, BEATS = 104, OFFSET = 0.8624; // first downbeat in the spliced audio
+const C = { bg: '#0b0907', surface: '#15110d', raised: '#1e1813', line: '#2a2119', lineHi: '#4a3a2a', text: '#e8e1d2', label: '#a08d70', orange: '#ff5f00', green: '#39ff14', amber: '#ffd400', red: '#ff2052', cyan: '#00f0ff' };
+const svg = document.getElementById('stage');
+svg.setAttribute('width', W); svg.setAttribute('height', H);
+if (P.get('fit')) { svg.style.width = '100vw'; svg.style.height = 'auto'; } svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+
+// the stage is a 1080×1080 square, centred; landscape gets ambient grid at the sides
+const SQ = Math.min(W, H), OX = (W - SQ) / 2, OY = (H - SQ) / 2;
+const clamp = (x, a = 0, b = 1) => Math.max(a, Math.min(b, x));
+const ease = t => 1 - Math.pow(1 - clamp(t), 3);
+const pop = t => { t = clamp(t); return t < 1 ? 1 + 0.18 * Math.sin(t * Math.PI) * (1 - t) : 1; };
+const esc = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+
+let G = {};
+
+async function prepare() {
+  await init({ module_or_path: '../../site/pkg/tang/tang_site_wasm_bg.wasm' });
+  await document.fonts.load('600 40px "IBM Plex Sans"'); await document.fonts.load('400 20px "IBM Plex Mono"');
+  // kernel source for x·sin x in four dialects
+  G.code = Object.fromEntries(['cuda', 'wgsl', 'msl', 'c'].map(d => [d, expr_kernel('x * sin(x)', d, true).split('\n').filter(l => l.trim())]));
+  // graph of x·sin x and its derivative
+  G.graph = JSON.parse(graph_layout('dual'));
+  // kernel graphs exported from the IR
+  G.arcs = await fetch('../../site/graphs.json').then(r => r.json());
+  // orbit: a target, a few rough shots, then gradient descent, all precomputed
+  const target = [-2.4, 1.6];
+  const shots = [[1.15, 2.2], [1.0, 2.9]].map(([s, h]) => Array.from(orbit_eval(s, h, ...target).slice(3)));
+  let best = Infinity, p;
+  for (const sp of [0.8, 0.95, 1.1, 1.25, 1.4]) for (let h = 0.15; h < Math.PI; h += 0.3) { const m = orbit_eval(sp, h, ...target)[0]; if (m < best) { best = m; p = [sp, h]; } }
+  const descent = []; let m = [0, 0], v = [0, 0];
+  for (let it = 1; it <= 60; it++) {
+    const r = orbit_eval(p[0], p[1], ...target); descent.push({ path: Array.from(r.slice(3)), miss: Math.sqrt(r[0]) });
+    if (Math.sqrt(r[0]) < 0.01) break;
+    for (let k = 0; k < 2; k++) { const g = r[1 + k]; m[k] = 0.9 * m[k] + 0.1 * g; v[k] = 0.999 * v[k] + 0.001 * g * g; p[k] -= 0.02 * (m[k] / (1 - 0.9 ** it)) / (Math.sqrt(v[k] / (1 - 0.999 ** it)) + 1e-8); }
+  }
+  G.orbit = { target, shots, descent };
+  G.arm = { q: [0.2, 0.5] };
+  window.READY = true;
+}
+
+// ---- scene helpers ----
+const T = (x, y, s, txt, o = {}) => `<text x="${x}" y="${y}" font-size="${s}" fill="${o.fill || C.text}" font-weight="${o.w || 600}" text-anchor="${o.a || 'middle'}" ${o.mono ? 'class="mono"' : ''} opacity="${o.op ?? 1}" letter-spacing="${o.ls ?? 0}">${txt}</text>`;
+const scaleAt = (cx, cy, s, inner) => `<g transform="translate(${cx},${cy}) scale(${s}) translate(${-cx},${-cy})">${inner}</g>`;
+
+function ambient(b) {
+  let g = '';
+  const step = 60, shift = (b * 6) % step;
+  for (let x = -step; x < W + step; x += step) g += `<path d="M${x + shift},0 V${H}" stroke="${C.line}" stroke-width="1" opacity=".55"/>`;
+  for (let y = -step; y < H + step; y += step) g += `<path d="M0,${y + shift} H${W}" stroke="${C.line}" stroke-width="1" opacity=".55"/>`;
+  return g;
+}
+function beatPulse(b) { const f = b - Math.floor(b); return Math.exp(-f * 6); }
+
+// 0–8: brand slam
+function sBrand(b) {
+  const cx = W / 2, cy = H / 2;
+  let o = '';
+  const s = pop(b * 2.2), pre = clamp(1 + b / 1.9);
+  o += scaleAt(cx, cy - 40, b < 0 ? 0.92 + 0.08 * pre : s, T(cx + 40, cy - 10, 220, `tang<tspan fill="${C.orange}">.</tspan>`, { ls: -6, op: b < 0 ? pre * 0.35 : 1 }));
+  o += `<image href="../../site/tang-mascot.svg" x="${cx - 330}" y="${cy - 190}" width="140" height="140" opacity="${clamp(1 + b / 1.9)}" transform="rotate(${Math.sin(b * Math.PI) * 6} ${cx - 260} ${cy - 120})"/>`;
+  const words = ['Write', 'math', 'in', 'Rust.'];
+  if (b >= 4) o += `<text x="${cx}" y="${cy + 150}" font-size="80" font-weight="600" text-anchor="middle" fill="${C.text}">` + words.map((w, i) => `<tspan opacity="${b >= 4 + i ? 1 : 0}" fill="${i === 3 ? C.orange : C.text}">${w}${i < 3 ? ' ' : ''}</tspan>`).join('') + '</text>';
+  return o;
+}
+
+// 16–24: dual number curve with the tangent sweeping
+function sDual(b) {
+  const t = (b - 16) * 2, cx = W / 2, cy = H / 2 + 30, w = Math.min(1500, W - 160), h = 520;
+  const X0 = -8, X1 = 8, Y0 = -7, Y1 = 9;
+  const sx = x => cx - w / 2 + (x - X0) / (X1 - X0) * w, sy = y => cy + h / 2 - (y - Y0) / (Y1 - Y0) * h;
+  let d = '';
+  for (let i = 0; i <= 400; i++) { const x = X0 + (X1 - X0) * i / 400; d += (i ? 'L' : 'M') + sx(x).toFixed(1) + ',' + sy(x * Math.sin(x)).toFixed(1); }
+  const reveal = ease(t / 2);
+  const x = X0 + 1.5 + (X1 - X0 - 3) * clamp(t / 8), [val, dv] = dual_eval(x);
+  const L = 2.2, x1 = x - L, x2 = x + L;
+  let o = `<rect x="${cx - w / 2}" y="${cy - h / 2}" width="${w}" height="${h}" fill="${C.surface}"/>`
+    + `<path d="M${sx(X0)},${sy(0)} H${sx(X1)} M${sx(0)},${sy(Y0)} V${sy(Y1)}" stroke="${C.lineHi}"/>`
+    + `<path d="${d}" fill="none" stroke="${C.orange}" stroke-width="5" stroke-dasharray="4000" stroke-dashoffset="${4000 * (1 - reveal)}"/>`;
+  o += `<clipPath id="plot"><rect x="${cx - w / 2}" y="${cy - h / 2}" width="${w}" height="${h}"/></clipPath>`;
+  if (t >= 2) o += `<g clip-path="url(#plot)"><path d="M${sx(x1)},${sy(val + dv * (x1 - x))} L${sx(x2)},${sy(val + dv * (x2 - x))}" stroke="${C.cyan}" stroke-width="4" stroke-dasharray="12 8"/>`
+    + `<circle cx="${sx(x)}" cy="${sy(val)}" r="12" fill="${C.bg}" stroke="${C.orange}" stroke-width="5"/></g>`;
+  o += T(cx - w / 2, cy - h / 2 - 60, 56, 'Dual&lt;f64&gt;', { a: 'start', mono: true, w: 500 });
+  o += T(cx + w / 2, cy - h / 2 - 60, 44, `f(x) = x·sin x`, { a: 'end', fill: C.label, w: 400 });
+  o += T(cx - w / 2, cy + h / 2 + 80, 48, `value <tspan fill="${C.orange}">${val.toFixed(2)}</tspan>   exact slope <tspan fill="${C.cyan}">${dv.toFixed(2)}</tspan>`, { a: 'start', w: 500, mono: true });
+  return o;
+}
+
+// 24–32: the graph lights up node by node
+function sGraph(b) {
+  const t = b - 24, g = G.graph, n = g.nodes.length;
+  const depth = []; g.nodes.forEach((nd, i) => depth[i] = nd.args.length ? 1 + Math.max(...nd.args.map(a => depth[a])) : 0);
+  const cols = Math.max(...depth) + 1, byCol = Array.from({ length: cols }, () => []); g.nodes.forEach((nd, i) => byCol[depth[i]].push(i));
+  const NW = 190, NH = 96, gw = Math.min(W - 160, 1600), colW = (gw - NW) / (cols - 1), x0 = (W - gw) / 2;
+  const pos = []; byCol.forEach((c, ci) => c.forEach((i, ri) => { pos[i] = [x0 + ci * colW, H / 2 + 20 + (ri - (c.length - 1) / 2) * (NH + 40) - NH / 2]; }));
+  const xv = 1.2 + Math.sin(b * 0.6) * 1.5, vals = graph_values('dual', new Float64Array([xv]));
+  const lit = Math.min(n, Math.floor(t * 2) + 1);
+  let o = T(W / 2, 150, 64, 'One graph. Exact gradients.', { w: 600 });
+  g.nodes.forEach((nd, i) => nd.args.forEach(a => {
+    const [x1, y1] = pos[a], [x2, y2] = pos[i], on = i < lit;
+    o += `<path d="M${x1 + NW},${y1 + NH / 2} C${(x1 + NW + x2) / 2},${y1 + NH / 2} ${(x1 + NW + x2) / 2},${y2 + NH / 2} ${x2},${y2 + NH / 2}" fill="none" stroke="${on ? C.orange : C.lineHi}" stroke-width="${on ? 3 : 2}" ${on ? `stroke-dasharray="10 10" stroke-dashoffset="${-b * 40}"` : ''}/>`;
+  }));
+  g.nodes.forEach((nd, i) => {
+    const [x, y] = pos[i], on = i < lit, oi = g.outputs.indexOf(i), col = oi === 0 ? C.orange : oi > 0 ? C.cyan : on ? C.text : C.lineHi;
+    const s = on ? pop((lit - i) * 0.9) : 1;
+    o += scaleAt(x + NW / 2, y + NH / 2, s, `<rect x="${x}" y="${y}" width="${NW}" height="${NH}" fill="${C.bg}" stroke="${col}" stroke-width="${oi >= 0 ? 4 : 2}"/>`
+      + T(x + NW / 2, y + 42, 36, esc(nd.op), { mono: true, w: 500, fill: on ? C.text : C.label })
+      + (nd.kind !== 'lit' && on ? T(x + NW / 2, y + 80, 26, vals[i].toFixed(2), { mono: true, w: 400, fill: oi >= 0 ? col : C.label }) : ''));
+  });
+  return o;
+}
+
+// 32–40: the kernel types itself, then flips dialects on the beat
+function sCode(b) {
+  const t = b - 32, dialects = ['cuda', 'cuda', 'wgsl', 'msl', 'c'];
+  const d = t < 2 ? 'cuda' : dialects[clamp(Math.floor(t * 2) - 2, 0, 4)], lines = G.code[d].slice(0, 16);
+  const shown = t < 2 ? Math.min(lines.length, Math.floor(t * 8) + 1) : lines.length;
+  const fs = 30, lh = 44, x = (W - 1500) / 2, y = 230;
+  let o = T(W / 2, 140, 64, 'Every chip.', { w: 600 });
+  const names = { cuda: 'CUDA', wgsl: 'WGSL', msl: 'Metal', c: 'C' };
+  ['cuda', 'wgsl', 'msl', 'c'].forEach((k, i) => o += T(x + i * 170, y - 20, 34, names[k], { a: 'start', w: 500, fill: k === d ? C.orange : C.label }));
+  o += `<rect x="${x - 30}" y="${y}" width="1560" height="${lh * 16 + 40}" fill="${C.surface}"/>`;
+  lines.slice(0, shown).forEach((l, i) => {
+    const hl = /t5 =|t14 =/.test(l);
+    o += T(x, y + 50 + i * lh, fs, esc(l.slice(0, 80)), { a: 'start', mono: true, w: 400, fill: /t5 =/.test(l) ? C.orange : /t14 =/.test(l) ? C.cyan : /^\s*\/\//.test(l) ? C.label : C.text });
+  });
+  if (t < 2) o += `<rect x="${x + (lines[shown] || '').length * 18}" y="${y + 24 + shown * lh}" width="16" height="34" fill="${C.text}" opacity="${Math.floor(b * 4) % 2}"/>`;
+  return o;
+}
+
+// 40–48: 47 kernels collapse to 17, flash attention appears
+function sArcs(b) {
+  const t = b - 40, key = t < 2 ? 'block_written' : 'block_compiled', g = G.arcs[key];
+  const ks = g.nodes.map((n, i) => ({ ...n, i })).filter(n => n.kind === 'kernel'), idx = new Map(ks.map((k, j) => [k.i, j]));
+  const COL = { 'flash attention': C.orange, matmul: C.cyan, reduce: C.amber, max: C.amber, sum: C.amber, map: C.label };
+  const span = Math.min(W - 200, 1600), step = span / ks.length, size = Math.min(70, step - 8), x = j => (W - span) / 2 + j * step + (step - size) / 2, base = H / 2 + 120;
+  const play = Math.floor(t * 2) % ks.length;
+  let o = T(W / 2, 120, 56, key === 'block_written' ? 'A transformer block, as written' : 'Compiled by tang', { w: 600 });
+  o += T(W / 2, 300, 150, `${ks.length}`, { fill: key === 'block_written' ? C.label : C.orange, w: 600, mono: true });
+  o += T(W / 2 + 140, 300, 40, 'kernels', { a: 'start', fill: C.label, w: 400 });
+  ks.forEach((k, j) => (k.args || []).forEach(a => { if (!idx.has(a)) return; const s = idx.get(a), x1 = x(s) + size / 2, x2 = x(j) + size / 2, hh = Math.min(260, 20 + (x2 - x1) * 0.4);
+    o += `<path d="M${x1},${base} C${x1},${base - hh} ${x2},${base - hh} ${x2},${base}" fill="none" stroke="${Math.floor(play) === j ? C.orange : C.lineHi}" stroke-width="${Math.floor(play) === j ? 3 : 1.5}"/>`; }));
+  ks.forEach((k, j) => { const c = COL[k.op] || C.label, on = Math.floor(play) === j, s = key === 'block_compiled' ? pop((t - 2) * 3 - j * 0.05) : 1;
+    o += scaleAt(x(j) + size / 2, base + size / 2, s, `<rect x="${x(j)}" y="${base}" width="${size}" height="${size}" fill="${c}" fill-opacity="${on ? 0.9 : 0.25}" stroke="${c}" stroke-width="2"/>`); });
+  const fl = ks.findIndex(k => k.op === 'flash attention');
+  if (fl >= 0 && t >= 3) o += T(x(fl) + size / 2, base + size + 70, 40, 'flash attention, derived', { fill: C.orange, w: 600 });
+  return o;
+}
+
+
+const MUNI = (x, y, w, col = C.orange) => `<svg x="${x - w / 2}" y="${y - w * 400 / 880 / 2}" width="${w}" height="${w * 400 / 880}" viewBox="-60 -60 880 400" fill="none"><g stroke="${col}" stroke-width="40" stroke-linecap="round" stroke-linejoin="round" fill="none"> <path d="M 20 240 L 20 100 C 20 50, 80 50, 100 50 C 140 50, 160 70, 160 100"/> <path d="M 160 240 L 160 100"/> <path d="M 160 100 C 160 50, 220 50, 240 50 C 280 50, 300 70, 300 100 L 300 240 C 300 270, 330 280, 370 280 C 410 280, 440 270, 440 240 L 440 100"/> <path d="M 440 100 C 440 50, 500 50, 520 50 C 560 50, 600 70, 600 100 L 600 240 C 600 270, 630 280, 670 280 C 710 280, 740 270, 740 240 L 740 100"/> </g></svg>`;
+const title = (txt, y = 150, col = C.text) => T(W / 2, y, 64, txt, { w: 600, fill: col });
+const foot = txt => T(W / 2, H - 70, 28, txt, { fill: C.label, w: 400 });
+
+// intro: muni logo flash, then the build
+function sMuni(t) {
+  return `<rect width="${W}" height="${H}" fill="#000"/>` + scaleAt(W / 2, H / 2 - 30, pop(t * 3), MUNI(W / 2, H / 2 - 30, 520))
+    + (t >= 1 ? T(W / 2, H / 2 + 190, 40, 'Municipal Robotics presents', { fill: C.label, w: 500 }) : '');
+}
+function sBuild(t) {
+  let o = '';
+  if (t >= 0) o += scaleAt(W / 2, H / 2, pop(t * 3), T(W / 2, H / 2 + 20, 180, t >= 1 ? `Compile <tspan fill="${C.orange}">it.</tspan>` : 'Compile', { w: 600, ls: -4 }));
+  ['3', '2', '1'].forEach((n, i) => { if (Math.floor(t) === 3 + i) o += T(W / 2, H / 2 + 220, 90, n, { fill: C.orange, mono: true, w: 600 }); });
+  return o;
+}
+// drop reveal: three slams, then every backend
+function sReveal(t) {
+  const cx = W / 2, cy = H / 2 - 60;
+  let o = T(cx, cy - 120, 64, 'Compile it to', { fill: C.label, w: 500 });
+  [['derivatives', C.cyan, 0], ['GPU kernels', C.orange, 2], ['every chip.', C.text, 4]].forEach(([w, c, at], i) => { const k = t - at; if (k >= 0) o += scaleAt(cx, cy + i * 110, pop(k * 3), T(cx, cy + 20 + i * 110, 104, w, { fill: c })); });
+  if (t >= 6) ['CUDA', 'Metal', 'Vulkan', 'WGSL', 'OpenCL', 'C'].forEach((n, i) => { const c = [C.amber, C.red, C.orange, C.green, C.cyan, C.amber][i], x = cx - 615 + i * 210, on = t >= 6 + i / 4;
+    if (on) o += `<rect x="${x}" y="${cy + 360}" width="190" height="70" fill="${c}" fill-opacity=".16"/>` + T(x + 95, cy + 407, 34, n, { fill: c, w: 500 }); });
+  return o;
+}
+
+// performance: a race, a ratio, a gauge, a correctness grid, a block, the backends
+function bar(x, y, w, h, frac, col, label, val) {
+  return `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="${C.surface}"/><rect x="${x}" y="${y}" width="${w * clamp(frac)}" height="${h}" fill="${col}"/>`
+    + T(x - 24, y + h / 2 + 14, 40, label, { a: 'end', w: 500 }) + (frac >= 1 ? T(x + w + 24, y + h / 2 + 14, 40, val, { a: 'start', mono: true, w: 500, fill: col }) : '');
+}
+function sRace(t) {
+  const x = 520, w = 900; let o = title('Transformer block, train step');
+  o += bar(x, 380, w * 0.376 / 1.329, 70, t / 1, C.orange, 'tang', '0.38 ms') + bar(x, 500, w, 70, t / 3.5, C.label, 'PyTorch', '1.33 ms');
+  if (t >= 1) o += scaleAt(W / 2, 720, pop((t - 1) * 3), T(W / 2, 760, 150, '3.5× faster', { fill: C.orange }));
+  return o + foot('fwd + bwd, seq 128, half-precision tiles vs. PyTorch bf16 autocast, RTX 3090');
+}
+function sFlashPerf(t) {
+  const x = 520, w = 900; let o = title('Flash attention, derived by the compiler');
+  o += bar(x, 380, w / 7.6, 70, t / 0.5, C.orange, 'derived', '1×') + bar(x, 500, w, 70, t / 3, C.label, 'hand-written', '7.6×');
+  if (t >= 1) o += scaleAt(W / 2, 720, pop((t - 1) * 3), T(W / 2, 760, 150, '7.6× faster', { fill: C.orange }));
+  return o + foot('n = 1024, against tang\'s own hand-written kernel. No attention-specific code in the compiler.');
+}
+function sDecode(t) {
+  const x = W / 2 - 520, w = 1040, f = 0.55 * ease(t / 2), tok = Math.round(220 * f);
+  let o = title('Qwen3-8B, 4-bit, one RTX 3090');
+  o += T(W / 2, 470, 220, `${tok}`, { fill: C.cyan, mono: true, w: 600 }) + T(W / 2 + 260, 470, 54, 'tok/s', { a: 'start', fill: C.label, w: 400 });
+  o += `<rect x="${x}" y="560" width="${w}" height="26" fill="${C.surface}"/><rect x="${x}" y="560" width="${w * f}" height="26" fill="${C.cyan}"/><path d="M${x + w},545 V600" stroke="${C.text}" stroke-width="3"/>`;
+  o += T(x + w, 640, 30, 'speed of light, 220 tok/s', { a: 'end', fill: C.label, w: 400 }) + T(x, 640, 30, `${Math.round(f * 100)}% of the memory bound`, { a: 'start', fill: C.cyan, w: 500 });
+  if (t >= 2) o += T(W / 2, 800, 64, `<tspan fill="${C.orange}">774 tok/s</tspan> prefill on f16 tensor cores`, { w: 500 });
+  return o;
+}
+function sCorrect(t) {
+  let o = title('Exact enough to trust');
+  const n = Math.min(64, Math.floor(t * 16)), x0 = W / 2 - 16 * 34 / 2;
+  for (let i = 0; i < 64; i++) { const x = x0 + (i % 16) * 34, y = 300 + Math.floor(i / 16) * 34;
+    o += `<rect x="${x}" y="${y}" width="28" height="28" fill="${i < n ? C.green : C.surface}" fill-opacity="${i < n ? 0.8 : 1}"/>`; }
+  o += T(W / 2, 560, 110, `${n} / 64`, { fill: C.green, mono: true, w: 600 }) + T(W / 2, 630, 40, 'greedy tokens identical to a PyTorch reference', { fill: C.label, w: 400 });
+  if (t >= 2) o += T(W / 2, 780, 60, `max logit error <tspan fill="${C.cyan}" class="mono">1.7 × 10⁻⁴</tspan>`, { w: 500 });
+  return o;
+}
+function sBlockPerf(t) {
+  let o = title('No hand-written kernels');
+  if (t >= 0) o += scaleAt(W / 2 - 330, 480, pop(t * 3), T(W / 2 - 330, 520, 200, '+18%', { fill: C.orange }) + T(W / 2 - 330, 600, 34, 'whole block, derived vs. hand-written', { fill: C.label, w: 400 }));
+  if (t >= 2) o += scaleAt(W / 2 + 330, 480, pop((t - 2) * 3), T(W / 2 + 330, 520, 200, '0', { fill: C.cyan, mono: true }) + T(W / 2 + 330, 600, 34, 'lines of op-specific compiler code', { fill: C.label, w: 400 }));
+  return o;
+}
+function sSix(t) {
+  let o = scaleAt(W / 2, H / 2 - 80, pop(t * 3), T(W / 2, H / 2 - 40, 260, '6', { fill: C.green, mono: true }));
+  o += T(W / 2, H / 2 + 60, 48, 'backends from one IR', { fill: C.label, w: 400 });
+  ['CUDA', 'Metal', 'Vulkan', 'WGSL', 'OpenCL', 'C'].forEach((n, i) => { const c = [C.amber, C.red, C.orange, C.green, C.cyan, C.amber][i], x = W / 2 - 615 + i * 210;
+    if (t >= 1 + i / 4) o += `<rect x="${x}" y="${H / 2 + 130}" width="190" height="70" fill="${c}" fill-opacity=".16"/>` + T(x + 95, H / 2 + 177, 34, n, { fill: c, w: 500 }); });
+  return o;
+}
+
+// use cases: eight, three beats each
+const USES = [
+  ['Serve an LLM', C.orange, 'tang-llm serve Qwen/Qwen3-8B --port 8080', (t, x, y, w, h) => {
+    let o = `<rect x="${x}" y="${y + 20}" width="${w * 0.45}" height="70" fill="none" stroke="${C.label}" stroke-width="2"/>` + T(x + 24, y + 66, 30, 'why is the sky blue?', { a: 'start', fill: C.label, w: 400 });
+    for (let i = 0; i < 4; i++) { const k = clamp((t - 0.5 - i * 0.5) / 0.5); o += `<rect x="${x + w * 0.3}" y="${y + 130 + i * 44}" width="${w * 0.7 * k * (i === 3 ? 0.5 : 1)}" height="26" fill="${C.orange}" fill-opacity=".8"/>`; }
+    return o + T(x + w, y + h, 40, '122 tok/s', { a: 'end', fill: C.orange, mono: true, w: 500 });
+  }],
+  ['Train a network', C.green, 'cargo run --example quantum_poet -p tang-gpu', (t, x, y, w, h) => {
+    let d = ''; const k = clamp(t / 2.5);
+    for (let i = 0; i <= 100 * k; i++) { const u = i / 100; d += (i ? 'L' : 'M') + (x + u * w).toFixed(1) + ',' + (y + 20 + (h - 40) * (1 - Math.exp(-u * 4) * 0.95 - 0.03 * Math.sin(u * 40) * (1 - u))).toFixed(1); }
+    return `<path d="M${x},${y} V${y + h} H${x + w}" stroke="${C.lineHi}" fill="none" stroke-width="2"/><path d="${d}" fill="none" stroke="${C.green}" stroke-width="5"/>` + T(x + w, y + 10, 30, 'loss', { a: 'end', fill: C.label, w: 400 });
+  }],
+  ['Robot arms', C.orange, 'rose: IK by damped least squares, dual Jacobians', (t, x, y, w, h) => {
+    const S = 820, sx = x + w * 0.22, sy = y + 60, px = u => sx + u * S, py = v => sy - v * S;
+    const tgt = [0.22 + 0.16 * Math.sin(t * 2.2), -0.25 + 0.12 * Math.sin(t * 4.4)];
+    let r; for (let k = 0; k < 6; k++) { r = arm_ik_step(G.arm.q[0], G.arm.q[1], tgt[0], tgt[1]); G.arm.q = [r[0], r[1]]; }
+    const [, , , ex, ey, tx, ty] = r;
+    return `<circle cx="${px(0)}" cy="${py(0)}" r="${0.463 * S}" fill="none" stroke="${C.lineHi}" stroke-dasharray="4 8"/>`
+      + `<path d="M${px(0)},${py(0)} L${px(ex)},${py(ey)} L${px(tx)},${py(ty)}" stroke="${C.orange}" stroke-width="26" stroke-linecap="round" stroke-linejoin="round" fill="none"/>`
+      + [[0, 0], [ex, ey]].map(([u, v]) => `<circle cx="${px(u)}" cy="${py(v)}" r="16" fill="${C.bg}" stroke="${C.text}" stroke-width="4"/>`).join('')
+      + `<g transform="translate(${px(tgt[0])},${py(tgt[1])})" stroke="${C.cyan}" stroke-width="3"><path d="M-18 0H18M0 -18V18"/></g>`;
+  }],
+  ['Orbital transfers', C.cyan, 'gradients through 1,600 leapfrog steps', (t, x, y, w, h) => {
+    const { target, descent } = G.orbit, R = 70, cx = x + w / 2 + 120, cy = y + h / 2 + 40, px = u => cx + u * R, py = v => cy - v * R;
+    const toD = a => { let d = ''; for (let i = 0; i < a.length; i += 2) d += (i ? 'L' : 'M') + px(a[i]).toFixed(1) + ',' + py(a[i + 1]).toFixed(1); return d; };
+    const k = Math.min(descent.length - 1, Math.floor(clamp(t / 2.5) * descent.length));
+    let o = '';
+    for (let i = Math.max(0, k - 8); i < k; i++) o += `<path d="${toD(descent[i].path)}" fill="none" stroke="${C.cyan}" stroke-width="2" opacity=".25"/>`;
+    return o + `<path d="${toD(descent[k].path)}" fill="none" stroke="${C.cyan}" stroke-width="5"/><circle cx="${px(0)}" cy="${py(0)}" r="${R}" fill="${C.surface}" stroke="${C.lineHi}"/><circle cx="${px(target[0])}" cy="${py(target[1])}" r="14" fill="${C.orange}"/>`;
+  }],
+  ['3D Gaussian splatting', C.red, 'cargo run --example train_image -p tang-3dgs', (t, x, y, w, h) => {
+    let o = ''; const n = Math.floor(t * 8);
+    for (let i = 0; i < Math.min(n, 22); i++) { const u = ((i * 37) % 100) / 100, v = ((i * 61) % 100) / 100, a = (i * 47) % 180;
+      o += `<ellipse cx="${x + w * (0.2 + 0.6 * u)}" cy="${y + h * (0.15 + 0.7 * v)}" rx="${60 + (i % 5) * 18}" ry="${18 + (i % 4) * 8}" transform="rotate(${a} ${x + w * (0.2 + 0.6 * u)} ${y + h * (0.15 + 0.7 * v)})" fill="${[C.red, C.orange, C.amber][i % 3]}" fill-opacity=".35"/>`; }
+    return o;
+  }],
+  ['Your own kernels', '#ae81ff', 'describe the math once, lower to every backend', (t, x, y, w, h) => {
+    let o = ''; const cols = 16, rows = 7, cw = w / cols;
+    for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) { const ph = (t * 4 - c * 0.25 - r * 0.15) % 2; const on = ph > 0 && ph < 0.5;
+      o += `<rect x="${x + c * cw + 4}" y="${y + r * cw + 4}" width="${cw - 8}" height="${cw - 8}" fill="#ae81ff" fill-opacity="${on ? 0.85 : 0.12}"/>`; }
+    return o;
+  }],
+  ['Discover formulas', C.amber, 'symbolic regression over expression graphs', (t, x, y, w, h) => {
+    let o = '', d = ''; const f = u => Math.sin(u * 2.6 * Math.PI) * (0.25 + u * 0.75);
+    for (let i = 0; i < 30; i++) { const u = i / 29; o += `<circle cx="${x + u * w}" cy="${y + h / 2 - f(u) * h * 0.42 + ((i * 37) % 11 - 5) * 3}" r="7" fill="${C.label}"/>`; }
+    const k = clamp(t / 2.5);
+    for (let i = 0; i <= 120 * k; i++) { const u = i / 120; d += (i ? 'L' : 'M') + (x + u * w).toFixed(1) + ',' + (y + h / 2 - f(u) * h * 0.42).toFixed(1); }
+    return o + `<path d="${d}" fill="none" stroke="${C.amber}" stroke-width="5"/>` + (t >= 2 ? T(x + w, y + h, 40, 'f(x) = x²·sin x', { a: 'end', fill: C.amber, w: 500 }) : '');
+  }],
+  ['Distributed', '#71a9f7', 'ship expression graphs over QUIC', (t, x, y, w, h) => {
+    const cx = x + w / 2, cy = y + h / 2, nodes = [[-1, -1], [1, -1], [-1, 1], [1, 1]].map(([a, b]) => [cx + a * w * 0.35, cy + b * h * 0.35]);
+    let o = nodes.map(([nx, ny]) => `<path d="M${cx},${cy} L${nx},${ny}" stroke="${C.lineHi}" stroke-width="2" stroke-dasharray="6 8"/>`).join('');
+    nodes.forEach(([nx, ny], i) => { const k = ((t * 1.5 + i * 0.25) % 1); o += `<circle cx="${cx + (nx - cx) * k}" cy="${cy + (ny - cy) * k}" r="10" fill="#71a9f7"/>`; });
+    o += `<rect x="${cx - 70}" y="${cy - 40}" width="140" height="80" fill="${C.bg}" stroke="#71a9f7" stroke-width="3"/>` + T(cx, cy + 12, 32, 'graph', { fill: '#71a9f7', w: 500 });
+    nodes.forEach(([nx, ny], i) => o += `<rect x="${nx - 80}" y="${ny - 34}" width="160" height="68" fill="${C.bg}" stroke="${C.label}" stroke-width="2"/>` + T(nx, ny + 12, 30, ['CUDA', 'Metal', 'Vulkan', 'CPU'][i], { fill: C.label, w: 500 }));
+    return o;
+  }],
+];
+function sUse(t, i) {
+  const [name, col, cmd, draw] = USES[i];
+  const x = 1000, y = 250, w = 800, h = 560;
+  let o = T(120, 200, 28, `Use case ${i + 1} of 8`, { a: 'start', fill: C.label, w: 400 })
+    + scaleAt(120, 300, pop(t * 3), T(120, 320, 84, name, { a: 'start', fill: col, w: 600 }))
+    + `<rect x="120" y="360" width="${180 * ease(t * 2)}" height="6" fill="${col}"/>`
+    + (t >= 1 ? T(120, 450, 24, esc(cmd), { a: 'start', mono: true, w: 400, fill: C.text }) : '');
+  return o + `<g>${draw(t, x, y, w, h)}</g>`;
+}
+
+// close
+function sCloseTang(t) {
+  const cx = W / 2, cy = H / 2;
+  let o = scaleAt(cx, cy - 80, pop(t * 3), T(cx, cy - 40, 200, `tang<tspan fill="${C.orange}">.</tspan>`, { ls: -6 }));
+  if (t >= 1) o += `<rect x="${cx - 230}" y="${cy + 20}" width="460" height="84" fill="${C.surface}"/>` + T(cx, cy + 75, 42, `<tspan fill="${C.label}">$</tspan> cargo add tang`, { mono: true, w: 500 });
+  if (t >= 2) o += T(cx, cy + 190, 40, 'github.com/ecto/tang', { fill: C.cyan, w: 500 });
+  return o;
+}
+function sCloseMuni(t, b) {
+  const fade = clamp((BEATS - b) / 2);
+  return `<rect width="${W}" height="${H}" fill="#000"/>` + `<g opacity="${fade}">` + scaleAt(W / 2, H / 2 - 60, pop(t * 3), MUNI(W / 2, H / 2 - 60, 600))
+    + (t >= 1 ? T(W / 2, H / 2 + 200, 44, 'Municipal Robotics', { w: 600 }) : '') + (t >= 2 ? T(W / 2, H / 2 + 260, 36, 'muni.works', { fill: C.orange, w: 500 }) : '') + '</g>';
+}
+
+// [start beat, render(localBeat, absoluteBeat), original start for the reused scenes]
+const SCENES = [
+  [0, (t, b) => sBrand(b)], [8, sMuni], [10, sBuild],
+  [16, sReveal],
+  [24, (t, b) => sDual(t + 16)], [28, (t) => sGraph(t + 24)], [32, (t) => sCode(t + 32)], [36, (t) => sArcs(t + 40)],
+  [40, sRace], [44, sFlashPerf], [48, sDecode], [52, sCorrect], [56, sBlockPerf], [60, sSix],
+  ...USES.map((_, i) => [64 + i * 3, t => sUse(t, i)]),
+  [88, sCloseTang], [96, sCloseMuni],
+];
+const DARK = new Set([sMuni, sCloseMuni]);
+
+window.renderAt = sec => {
+  const b = (sec - OFFSET) / BEAT;
+  let i = SCENES.findLastIndex(([s]) => b >= s); if (i < 0) i = 0;
+  const [start, fn] = SCENES[i], t = b - start;
+  const cut = b - start, flash = start > 0 && cut >= 0 && cut < 0.2 ? (1 - cut / 0.2) * 0.35 : 0;
+  const kick = 1 + 0.012 * beatPulse(Math.max(0, b));
+  const bug = b >= 16 && b < 88 ? `<g opacity=".85">${MUNI(W - 110, H - 60, 110)}</g>` : '';
+  svg.innerHTML = `<defs><radialGradient id="vig" cx="50%" cy="50%" r="75%"><stop offset="55%" stop-color="#000" stop-opacity="0"/><stop offset="100%" stop-color="#000" stop-opacity=".7"/></radialGradient></defs>`
+    + `<rect width="${W}" height="${H}" fill="${C.bg}"/>` + (DARK.has(fn) ? '' : ambient(b))
+    + scaleAt(W / 2, H / 2, kick, fn(t, b))
+    + `<rect width="${W}" height="${H}" fill="url(#vig)"/>` + bug
+    + `<rect x="0" y="${H - 6}" width="${W * clamp(b / BEATS)}" height="6" fill="${C.orange}"/>`
+    + (flash ? `<rect width="${W}" height="${H}" fill="${C.text}" opacity="${flash}"/>` : '');
+};
+
+prepare().then(() => renderAt(+(P.get('t') || 0)));
+</script>
+</body>
+</html>
