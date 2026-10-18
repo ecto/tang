@@ -28,7 +28,8 @@ if (P.get('fit')) { svg.style.width = '100vw'; svg.style.height = 'auto'; } svg.
 const SQ = Math.min(W, H), OX = (W - SQ) / 2, OY = (H - SQ) / 2;
 const clamp = (x, a = 0, b = 1) => Math.max(a, Math.min(b, x));
 const ease = t => 1 - Math.pow(1 - clamp(t), 3);
-const pop = t => { t = clamp(t); return t < 1 ? 1 + 0.18 * Math.sin(t * Math.PI) * (1 - t) : 1; };
+// entrance progress: a long, quiet ease-out (no overshoot); callers pass beats × speed
+const pop = t => 1 - Math.pow(1 - clamp(t * 0.55), 4);
 const esc = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
 
 let G = {};
@@ -60,13 +61,15 @@ async function prepare() {
 
 // ---- scene helpers ----
 const T = (x, y, s, txt, o = {}) => `<text x="${x}" y="${y}" font-size="${s}" fill="${o.fill || C.text}" font-weight="${o.w || 600}" text-anchor="${o.a || 'middle'}" ${o.mono ? 'class="mono"' : ''} opacity="${o.op ?? 1}" letter-spacing="${o.ls ?? 0}">${txt}</text>`;
-const scaleAt = (cx, cy, s, inner) => `<g transform="translate(${cx},${cy}) scale(${s}) translate(${-cx},${-cy})">${inner}</g>`;
+// rise into place: slides up 28px and fades in as p goes 0 → 1
+const scaleAt = (cx, cy, p, inner) => p >= 1 ? inner : `<g transform="translate(0,${(28 * (1 - p)).toFixed(2)})" opacity="${p.toFixed(3)}">${inner}</g>`;
+const zoomAt = (cx, cy, s, inner) => `<g transform="translate(${cx},${cy}) scale(${s}) translate(${-cx},${-cy})">${inner}</g>`;
 
 function ambient(b) {
   let g = '';
-  const step = 60, shift = (b * 6) % step;
-  for (let x = -step; x < W + step; x += step) g += `<path d="M${x + shift},0 V${H}" stroke="${C.line}" stroke-width="1" opacity=".55"/>`;
-  for (let y = -step; y < H + step; y += step) g += `<path d="M0,${y + shift} H${W}" stroke="${C.line}" stroke-width="1" opacity=".55"/>`;
+  const step = 60, shift = (b * 1.5) % step;
+  for (let x = -step; x < W + step; x += step) g += `<path d="M${x + shift},0 V${H}" stroke="${C.line}" stroke-width="1" opacity=".3"/>`;
+  for (let y = -step; y < H + step; y += step) g += `<path d="M0,${y + shift} H${W}" stroke="${C.line}" stroke-width="1" opacity=".3"/>`;
   return g;
 }
 function beatPulse(b) { const f = b - Math.floor(b); return Math.exp(-f * 6); }
@@ -76,10 +79,11 @@ function sBrand(b) {
   const cx = W / 2, cy = H / 2;
   let o = '';
   const s = pop(b * 2.2), pre = clamp(1 + b / 1.9);
-  o += scaleAt(cx, cy - 40, b < 0 ? 0.92 + 0.08 * pre : s, T(cx + 40, cy - 10, 220, `tang<tspan fill="${C.orange}">.</tspan>`, { ls: -6, op: b < 0 ? pre * 0.35 : 1 }));
+  // the wordmark rises during the pre-roll and is settled on the first downbeat
+  o += scaleAt(cx, cy - 40, pop((b + 1.9) * 1.1), T(cx + 40, cy - 10, 220, `tang<tspan fill="${C.orange}">.</tspan>`, { ls: -6 }));
   o += `<image href="../../site/tang-mascot.svg" x="${cx - 330}" y="${cy - 190}" width="140" height="140" opacity="${clamp(1 + b / 1.9)}" transform="rotate(${Math.sin(b * Math.PI) * 6} ${cx - 260} ${cy - 120})"/>`;
   const words = ['Write', 'math', 'in', 'Rust.'];
-  if (b >= 4) o += `<text x="${cx}" y="${cy + 150}" font-size="80" font-weight="600" text-anchor="middle" fill="${C.text}">` + words.map((w, i) => `<tspan opacity="${b >= 4 + i ? 1 : 0}" fill="${i === 3 ? C.orange : C.text}">${w}${i < 3 ? ' ' : ''}</tspan>`).join('') + '</text>';
+  if (b >= 4) o += `<text x="${cx}" y="${cy + 150}" font-size="80" font-weight="600" text-anchor="middle" fill="${C.text}">` + words.map((w, i) => `<tspan opacity="${clamp((b - 4 - i) * 2).toFixed(3)}" fill="${i === 3 ? C.orange : C.text}">${w}${i < 3 ? ' ' : ''}</tspan>`).join('') + '</text>';
   return o;
 }
 
@@ -338,15 +342,14 @@ window.renderAt = sec => {
   const b = (sec - OFFSET) / BEAT;
   let i = SCENES.findLastIndex(([s]) => b >= s); if (i < 0) i = 0;
   const [start, fn] = SCENES[i], t = b - start;
-  const cut = b - start, flash = start > 0 && cut >= 0 && cut < 0.2 ? (1 - cut / 0.2) * 0.35 : 0;
-  const kick = 1 + 0.012 * beatPulse(Math.max(0, b));
+  // a slow push-in across each scene, hard cuts between them
+  const end = SCENES[i + 1]?.[0] ?? BEATS, push = 1 + 0.035 * clamp(t / (end - start));
   const bug = b >= 16 && b < 88 ? `<g opacity=".85">${MUNI(W - 110, H - 60, 110)}</g>` : '';
   svg.innerHTML = `<defs><radialGradient id="vig" cx="50%" cy="50%" r="75%"><stop offset="55%" stop-color="#000" stop-opacity="0"/><stop offset="100%" stop-color="#000" stop-opacity=".7"/></radialGradient></defs>`
     + `<rect width="${W}" height="${H}" fill="${C.bg}"/>` + (DARK.has(fn) ? '' : ambient(b))
-    + scaleAt(W / 2, H / 2, kick, fn(t, b))
+    + zoomAt(W / 2, H / 2, push, fn(t, b))
     + `<rect width="${W}" height="${H}" fill="url(#vig)"/>` + bug
-    + `<rect x="0" y="${H - 6}" width="${W * clamp(b / BEATS)}" height="6" fill="${C.orange}"/>`
-    + (flash ? `<rect width="${W}" height="${H}" fill="${C.text}" opacity="${flash}"/>` : '');
+    + `<rect x="0" y="${H - 6}" width="${W * clamp(b / BEATS)}" height="6" fill="${C.orange}"/>`;
 };
 
 prepare().then(() => renderAt(+(P.get('t') || 0)));
