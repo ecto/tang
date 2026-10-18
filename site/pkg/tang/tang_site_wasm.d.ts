@@ -2,6 +2,12 @@
 /* eslint-disable */
 
 /**
+ * One damped-least-squares IK step toward (tx, ty), with the Jacobian from
+ * two dual passes through `arm_tip`. Returns [q1, q2, error, elbow x, elbow y, tip x, tip y].
+ */
+export function arm_ik_step(q1: number, q2: number, tx: number, ty: number): Float64Array;
+
+/**
  * Generate SVG path `d` attribute for f(x) = x * sin(x).
  * Maps math coordinates to SVG pixel coordinates.
  */
@@ -12,6 +18,30 @@ export function curve_svg_path(x_min: number, x_max: number, y_min: number, y_ma
  * Returns [value, derivative].
  */
 export function dual_eval(x: number): Float64Array;
+
+/**
+ * Parse `src` in x, y, z, optionally append its gradient, and emit a kernel.
+ * Returns the source, or a line starting with `error:`.
+ */
+export function expr_kernel(src: string, dialect: string, grad: boolean): string;
+
+/**
+ * The live part of a demo's graph, as JSON:
+ * `{"nodes":[{"op":"×","args":[0,1],"lit":false}],"outputs":[5,9]}` with
+ * indices into `nodes`, which are in topological order.
+ */
+export function graph_layout(kind: string): string;
+
+/**
+ * Every live node's value for these inputs, in `graph_layout` order.
+ */
+export function graph_values(kind: string, inputs: Float64Array): Float64Array;
+
+/**
+ * Score a launch and its gradient, one dual pass per parameter.
+ * Returns [miss², ∂/∂speed, ∂/∂heading, path xy...].
+ */
+export function orbit_eval(speed: number, heading: number, tx: number, ty: number): Float64Array;
 
 /**
  * Generate text from a seed string with temperature sampling.
@@ -44,13 +74,18 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
+    readonly arm_ik_step: (a: number, b: number, c: number, d: number) => [number, number];
     readonly curve_svg_path: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number];
     readonly dual_eval: (a: number) => [number, number];
+    readonly orbit_eval: (a: number, b: number, c: number, d: number) => [number, number];
     readonly poet_generate: (a: number, b: number, c: number) => [number, number];
     readonly poet_init: () => void;
     readonly poet_train_epoch: () => number;
     readonly tangent_svg: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number];
     readonly to_svg: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number];
+    readonly graph_layout: (a: number, b: number) => [number, number];
+    readonly graph_values: (a: number, b: number, c: number, d: number) => [number, number];
+    readonly expr_kernel: (a: number, b: number, c: number, d: number, e: number) => [number, number];
     readonly __wbindgen_externrefs: WebAssembly.Table;
     readonly __wbindgen_free: (a: number, b: number, c: number) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;

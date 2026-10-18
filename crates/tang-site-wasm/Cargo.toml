@@ -12,6 +12,7 @@ crate-type = ["cdylib"]
 tang = { workspace = true }
 tang-tensor = { workspace = true }
 tang-train = { workspace = true }
+tang-expr = { workspace = true }
 wasm-bindgen = "0.2"
 
 [profile.release]
