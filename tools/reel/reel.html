@@ -144,8 +144,10 @@ function sCode(b) {
   ['cuda', 'wgsl', 'msl', 'c'].forEach((k, i) => o += T(x + i * 170, y - 20, 34, names[k], { a: 'start', w: 500, fill: k === d ? C.orange : C.label }));
   o += `<rect x="${x - 30}" y="${y}" width="1560" height="${lh * 16 + 40}" fill="${C.surface}"/>`;
   lines.slice(0, shown).forEach((l, i) => {
-    const hl = /t5 =|t14 =/.test(l);
-    o += T(x, y + 50 + i * lh, fs, esc(l.slice(0, 80)), { a: 'start', mono: true, w: 400, fill: /t5 =/.test(l) ? C.orange : /t14 =/.test(l) ? C.cyan : /^\s*\/\//.test(l) ? C.label : C.text });
+    // f and f' rows get a quiet band in their color; everything else is syntax-highlighted
+    const band = /\bt5 =/.test(l) ? C.orange : /\bt14 =/.test(l) ? C.cyan : null;
+    if (band) o += `<rect x="${x - 16}" y="${y + 50 + i * lh - 32}" width="1530" height="${lh}" fill="${band}" fill-opacity=".12"/>`;
+    o += `<text x="${x}" y="${y + 50 + i * lh}" font-size="${fs}" class="mono" xml:space="preserve" style="white-space: pre">${hlSvg(l.slice(0, 80))}</text>`;
   });
   if (t < 2) o += `<rect x="${x + (lines[shown] || '').length * 18}" y="${y + 24 + shown * lh}" width="16" height="34" fill="${C.text}" opacity="${Math.floor(b * 4) % 2}"/>`;
   return o;
@@ -328,6 +330,22 @@ function sCloseMuni(t, b) {
 }
 
 // [start beat, render(localBeat, absoluteBeat), original start for the reused scenes]
+// syntax colors for generated kernels, as tspans; leading spaces are kept (xml:space)
+const SYN = { kw: '#c38bff', ty: '#3fd8e4', fn: '#ffa267', num: '#ff7a6b', str: '#ffd400', cm: C.label, tx: C.text };
+const KW = new Set('fn let var const return if else for struct extern void kernel device constant thread inline unsigned __global__ __restrict__ include'.split(' '));
+function hlSvg(code) {
+  const re = /(\/\/.*)|(@[a-z_]+|#\s*[a-z]+)|(\b\d+(?:\.\d+)?(?:e[-+]?\d+)?[fu]?\b)|([A-Za-z_][A-Za-z0-9_]*)(\s*\()?|(\s+)|([^\w\s])/g;
+  let out = '', m;
+  const span = (t, c) => `<tspan fill="${c}">${esc(t)}</tspan>`;
+  while ((m = re.exec(code))) {
+    const [, cm, kw, num, id, call, ws, p] = m;
+    if (cm) out += span(cm, SYN.cm); else if (kw) out += span(kw, SYN.kw); else if (num) out += span(num, SYN.num);
+    else if (id) out += span(id, KW.has(id) ? SYN.kw : call ? SYN.fn : /^(f32|f64|float|double|int|u32|i32|half|bool|vec[234]|array|uniform|storage|read|read_write|[A-Z]\w*)$/.test(id) ? SYN.ty : SYN.tx) + (call ? span(call, SYN.tx) : '');
+    else if (ws) out += ws; else out += span(p, SYN.tx);
+  }
+  return out;
+}
+
 const SCENES = [
   [0, (t, b) => sBrand(b)], [8, sMuni], [10, sBuild],
   [16, sReveal],

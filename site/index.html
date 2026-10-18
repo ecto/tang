@@ -12,6 +12,46 @@
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css">
   <script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js" onload="document.querySelectorAll('[data-tex]').forEach(el => katex.render(el.dataset.tex, el, { displayMode: el.tagName === 'DIV', throwOnError: false }))"></script>
+  <script>
+    // Small syntax highlighter for the page's code: Rust, the generated
+    // kernels (CUDA, WGSL, Metal, C) and shell commands. Emits spans with the
+    // same classes as the hand-highlighted snippets (.kw .ty .fn .num .str .cm).
+    window.hl = (code, lang = 'c') => {
+      const esc = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const KW = new Set(('fn let mut pub use mod impl struct enum const static return if else for while loop match in as ref move where '
+        + 'extern void kernel device constant thread threadgroup inline unsigned signed var override struct '
+        + '__global__ __device__ __restrict__ __shared__ include using namespace').split(' '));
+      const TY = /^(f16|f32|f64|i32|u32|u64|i64|usize|isize|bool|float|double|int|half|uint|vec[234]<?.*|array|uniform|storage|read|read_write|Self|[A-Z][A-Za-z0-9_]*)$/;
+      if (lang === 'sh') return code.split('\n').map(line => {
+        const m = line.match(/^(\s*)(\$ )?(.*)$/), [, ind, prompt = '', rest] = m;
+        let first = true;
+        return esc(ind) + (prompt ? '<span class="cm">$ </span>' : '') + rest.split(/(\s+)/).map(w => {
+          if (/^\s+$/.test(w) || !w) return w;
+          if (/^'.*'?$|^".*"?$|^.*'$/.test(w)) return `<span class="str">${esc(w)}</span>`;
+          if (first && !/^[\\-]/.test(w)) { first = false; return `<span class="fn">${esc(w)}</span>`; }
+          if (/^--?[a-zA-Z]/.test(w)) return `<span class="kw">${esc(w)}</span>`;
+          if (/^\d/.test(w)) return `<span class="num">${esc(w)}</span>`;
+          if (w === '&&' || w === '\\') return `<span class="cm">${esc(w)}</span>`;
+          return esc(w);
+        }).join('');
+      }).join('\n');
+      const re = /(\/\/[^\n]*)|("(?:[^"\\]|\\.)*")|(@[a-z_]+)|(#\s*[a-z]+)|(\b\d+(?:\.\d+)?(?:e[-+]?\d+)?[fu]?\b)|([A-Za-z_][A-Za-z0-9_]*)(\s*\()?|([^\w\s])/g;
+      let out = '', last = 0, m;
+      while ((m = re.exec(code))) {
+        out += esc(code.slice(last, m.index)); last = re.lastIndex;
+        const [all, cm, str, attr, pre, num, id, call, punct] = m;
+        if (cm) out += `<span class="cm">${esc(cm)}</span>`;
+        else if (str) out += `<span class="str">${esc(str)}</span>`;
+        else if (attr || pre) out += `<span class="kw">${esc(attr || pre)}</span>`;
+        else if (num) out += `<span class="num">${num}</span>`;
+        else if (id) {
+          const cls = KW.has(id) ? 'kw' : call ? 'fn' : TY.test(id) ? 'ty' : /^t\d+$/.test(id) ? 'tv' : '';
+          out += (cls ? `<span class="${cls}">${id}</span>` : id) + (call ? esc(call) : '');
+        } else out += esc(punct);
+      }
+      return out + esc(code.slice(last));
+    };
+  </script>
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
     tailwind.config = {
@@ -480,6 +520,12 @@
     #agent-panel { margin: 0 0 1rem !important; }
     #agent-panel[hidden] { display: none; }
     .hero .agent { margin-bottom: 1rem !important; }
+
+    /* code: one palette everywhere, generous indentation */
+    pre { tab-size: 4; }
+    pre, pre code { color: var(--m-fg); line-height: 1.7 !important; }
+    .tv { color: var(--m-fg); }
+    #kd-out, #ml-code, #build-code { font-size: 12.5px !important; }
   </style>
 </head>
 <body class="antialiased">
@@ -490,7 +536,7 @@
     try { localStorage.setItem('theme', r.dataset.theme); } catch (e) {}
   })()"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 0 0 18z" fill="currentColor"/></svg></button>
 
-  <script type="module" src="./boot.js?v=hero2"></script>
+  <script type="module" src="./boot.js?v=code"></script>
 
   <!-- ═══════════════════════════════════════════════ -->
   <!-- // hero                                        -->
@@ -640,7 +686,7 @@ How to proceed:
           <label class="ml-auto flex items-center gap-2 text-muted cursor-pointer"><input id="kd-grad" type="checkbox" checked class="accent-amber-500"> + Gradient</label>
         </div>
         <div class="px-4 py-3 overflow-auto max-h-[300px]" style="background:#1a1a2e">
-          <pre id="kd-out" class="font-mono text-xs leading-relaxed text-green-400">loading…</pre>
+          <pre id="kd-out" class="font-mono text-xs leading-relaxed">loading…</pre>
         </div>
       </div>
       <div class="gpanel" data-graph="kernel"></div>
@@ -737,9 +783,12 @@ How to proceed:
     <span class="ty">Box</span>::<span class="fn">new</span>(<span class="ty">Linear</span>::<span class="fn">new</span>(<span class="num">64</span>, <span class="num">30</span>, <span class="num">256</span>)),
 ]);
 
-<span class="cm">// train</span>
-<span class="kw">let</span> losses = <span class="ty">Trainer</span>::<span class="fn">new</span>(&amp;<span class="kw">mut</span> model, <span class="ty">ModuleAdam</span>::<span class="fn">new</span>(<span class="num">0.005</span>))
-    .<span class="fn">loss_fn</span>(|p, t| (<span class="fn">cross_entropy_loss</span>(p, t), <span class="fn">cross_entropy_loss_grad</span>(p, t)))
+<span class="cm">// train: Trainer takes the model, an optimizer and a loss</span>
+<span class="kw">fn</span> <span class="fn">loss</span>(p: &amp;<span class="ty">Tensor</span>&lt;<span class="ty">f64</span>&gt;, t: &amp;<span class="ty">Tensor</span>&lt;<span class="ty">f64</span>&gt;) -&gt; (<span class="ty">f64</span>, <span class="ty">Tensor</span>&lt;<span class="ty">f64</span>&gt;) {
+    (<span class="fn">cross_entropy_loss</span>(p, t), <span class="fn">cross_entropy_loss_grad</span>(p, t))
+}
+
+<span class="kw">let</span> losses = <span class="ty">Trainer</span>::<span class="fn">new</span>(&amp;<span class="kw">mut</span> model, <span class="ty">ModuleAdam</span>::<span class="fn">new</span>(<span class="num">0.005</span>), loss)
     .<span class="fn">epochs</span>(<span class="num">200</span>)
     .<span class="fn">fit</span>(&amp;<span class="kw">mut</span> loader);</pre>
         </div>
@@ -874,7 +923,7 @@ How to proceed:
           </div>
           <div id="build-illo" class="border-b border-white/5" style="color: var(--illo-c)"></div>
           <p id="build-pitch" class="px-5 pt-5 pb-1 text-lg sm:text-xl font-semibold leading-snug"></p>
-          <pre id="build-code" class="font-mono text-xs sm:text-[13px] leading-relaxed text-green-400 px-5 pb-6 pt-2 min-h-[150px] overflow-x-auto whitespace-pre"></pre>
+          <pre id="build-code" class="font-mono text-xs sm:text-[13px] leading-relaxed px-5 pb-6 pt-2 min-h-[150px] overflow-x-auto whitespace-pre"></pre>
           <div class="px-5 py-3 border-t border-white/5">
             <a id="build-link" href="#" class="text-xs font-mono hover:underline"></a>
           </div>
@@ -894,7 +943,7 @@ How to proceed:
         const gh = 'https://github.com/ecto/tang/tree/main/crates/';
         const items = [
           { tab: 'Serve an LLM', pitch: 'Your own OpenAI-compatible endpoint. No Python stack.',
-            code: 'git clone https://github.com/ecto/tang && cd tang\ncargo install --path crates/tang-llm\ntang-llm serve Qwen/Qwen3-8B --port 8080\n\ncurl localhost:8080/v1/chat/completions \\\n  -d \'{"messages":[{"role":"user","content":"hi"}]}\'',
+            code: 'git clone https://github.com/ecto/tang && cd tang\ncargo install --path crates/tang-llm\ntang-llm serve Qwen/Qwen3-8B --port 8080\n\ncurl localhost:8080/v1/chat/completions \\\n  -H \'Content-Type: application/json\' \\\n  -d \'{"messages":[{"role":"user","content":"hi"}]}\'',
             link: ['tang-llm', gh + 'tang-llm'] },
           { tab: 'Train a net', pitch: 'A full training stack: layers, losses, optimizers, on CPU or GPU.',
             code: 'cargo run --example quantum_poet -p tang-gpu',
@@ -999,9 +1048,7 @@ How to proceed:
           const step = () => {
             if (id !== typing) return;
             n = Math.min(lines.length, n + 2);
-            out.innerHTML = '';
-            out.append(lines.slice(0, n));
-            const cur = document.createElement('span'); cur.className = 'cursor'; out.append(cur);
+            out.innerHTML = window.hl(lines.slice(0, n), 'sh') + '<span class="cursor"></span>';
             if (n < lines.length) setTimeout(step, 12);
           };
           step();

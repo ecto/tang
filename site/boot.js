@@ -4,7 +4,7 @@
 // loon renders: all SVG visualizations
 // boot.js: animation loop + glue (no visualization logic)
 
-import tangInit, { dual_eval, curve_svg_path, tangent_svg, to_svg, poet_init, poet_train_epoch, poet_generate, expr_kernel, orbit_eval, arm_ik_step, graph_layout, graph_values } from './pkg/tang/tang_site_wasm.js?v=hero2';
+import tangInit, { dual_eval, curve_svg_path, tangent_svg, to_svg, poet_init, poet_train_epoch, poet_generate, expr_kernel, orbit_eval, arm_ik_step, graph_layout, graph_values } from './pkg/tang/tang_site_wasm.js?v=code';
 import loonInit, { init_dom_bridge, eval_ui } from './pkg/loon/loon_wasm.js';
 
 // --- DOM Bridge (minimal, just what viz.loon needs) ---
@@ -103,7 +103,7 @@ function visibleLoop(el, fn) {
 
 async function boot() {
   // Load both WASM modules in parallel
-  await Promise.all([tangInit({ module_or_path: './pkg/tang/tang_site_wasm_bg.wasm?v=hero2' }), loonInit()]);
+  await Promise.all([tangInit({ module_or_path: './pkg/tang/tang_site_wasm_bg.wasm?v=code' }), loonInit()]);
   setupKernelDemo();
   const agentToggle = document.getElementById('agent-toggle'), agentPanel = document.getElementById('agent-panel');
   if (agentToggle) agentToggle.onclick = () => { const open = agentPanel.hidden; agentPanel.hidden = !open; agentToggle.setAttribute('aria-expanded', open); };
@@ -325,7 +325,7 @@ function setupKernelDemo() {
   const render = () => {
     const src = expr_kernel(input.value, dialect, grad.checked);
     const err = src.startsWith('error:');
-    out.textContent = src;
+    if (err) out.textContent = src; else out.innerHTML = window.hl(src);
     out.classList.toggle('text-red-400', err);
     out.classList.toggle('text-green-400', !err);
     tabs.forEach(t => t.classList.toggle('text-accent', t.dataset.kdDialect === dialect));
@@ -885,8 +885,7 @@ function setupMech() {
       code.innerHTML = src.split('\n').map(line => {
         const ids = [...line.matchAll(/\bt(\d+)\b/g)].map(m => +m[1]);
         if (/\bx0\b/.test(line)) ids.push(...panel.nodes.filter(n => n.kind === 'var').map(n => n.id));
-        const esc = line.replace(/&/g, '&amp;').replace(/</g, '&lt;');
-        return `<span class="ln" data-ids="${ids.join(',')}">${esc || ' '}</span>`;
+        return `<span class="ln" data-ids="${ids.join(',')}">${window.hl(line) || ' '}</span>`;
       }).join('');
     };
     renderCode();
