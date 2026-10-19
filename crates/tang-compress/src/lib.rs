@@ -40,6 +40,7 @@ pub mod abac;
 pub mod bitio;
 pub mod coefcode;
 pub mod codec;
+pub mod gpuwav;
 pub mod learned;
 pub mod linalg;
 pub mod rans;
