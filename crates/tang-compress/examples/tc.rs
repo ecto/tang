@@ -79,6 +79,15 @@ fn main() {
                     );
                     (b, j)
                 }
+                "auto" => {
+                    let mut cfg = wavcodec::WavConfig::new(bound);
+                    if let Some(r) = rho {
+                        cfg.rho = r;
+                    }
+                    cfg.model = tang_compress::learned::parse_model_arg(&model);
+                    let (b, tk) = tang_compress::encode_auto_f32(&x, &dims, &cfg);
+                    (b, format!("\"chose\":\"{}\"", if tk { "tucker" } else { "wavelet" }))
+                }
                 _ => usage(),
             };
             let enc = t.elapsed().as_secs_f64();

@@ -171,12 +171,14 @@ def run_sperr(x: np.ndarray, mode: str, val: float, omp: int = 1) -> dict:
     src, bs, out = OUT / "sp_in.f32", OUT / "sp.bs", OUT / "sp_out.f32"
     if x.ndim == 1:
         exe, dims = SPERR2, ["1024", "1024"]
+    elif x.ndim == 2:
+        exe, dims = SPERR2, [str(d) for d in x.shape[::-1]]
     else:
         exe, dims = SPERR3, [str(d) for d in x.shape[::-1]]
     x.astype("<f4").tofile(src)
     knob = ["--pwe", repr(val)] if mode == "pwe" else ["--psnr", repr(val)]
-    enc = _timed([str(exe), "-c", "--ftype", "32", "--dims", *dims, *knob, "--bitstream", str(bs), *(["--omp", str(omp)] if x.ndim > 1 else []), str(src)])
-    dec = _timed([str(exe), "-d", "--decomp_f", str(out), *(["--omp", str(omp)] if x.ndim > 1 else []), str(bs)])
+    enc = _timed([str(exe), "-c", "--ftype", "32", "--dims", *dims, *knob, "--bitstream", str(bs), *(["--omp", str(omp)] if x.ndim > 2 else []), str(src)])
+    dec = _timed([str(exe), "-d", "--decomp_f", str(out), *(["--omp", str(omp)] if x.ndim > 2 else []), str(bs)])
     y = np.fromfile(out, dtype="<f4").reshape(x.shape)
     rmse, psnr, mx = metrics(x, y)
     return {"bpv": 8 * bs.stat().st_size / x.size, "psnr": psnr, "max_abs": mx, "rmse": rmse, "enc_s": enc, "dec_s": dec, "extra": f"{mode}={val:.4g} omp={omp}"}
@@ -211,12 +213,12 @@ def run_tc(x: np.ndarray, codec: str, bound_args: list[str], model: str = "hand"
     dec = time.perf_counter() - t
     y = np.fromfile(out, dtype="<f4").reshape(x.shape)
     rmse, psnr, mx = metrics(x, y)
-    extra = " ".join(f"{k}={j[k]}" for k in ("coef_bytes", "model_bytes", "outlier_bytes", "n_outliers", "core_bytes", "factor_bytes", "ranks") if k in j)
+    extra = " ".join(f"{k}={j[k]}" for k in ("coef_bytes", "model_bytes", "outlier_bytes", "n_outliers", "core_bytes", "factor_bytes", "ranks", "chose") if k in j)
     return {"bpv": 8 * bs.stat().st_size / x.size, "psnr": psnr, "max_abs": mx, "rmse": rmse,
             "enc_s": j["encode_s"], "dec_s": d["decode_s"], "enc_wall_s": enc, "dec_wall_s": dec, "extra": extra}
 
 
-def tang_extra(name, x, rows, models=("hand",)):
+def tang_extra(name, x, rows, models=("hand",), auto_model=None):
     """tang-compress M1 codecs: wavelet (PSNR + max-abs) and Tucker (PSNR)."""
     rng = float(x.max() - x.min())
     def add(codec, r, kind, **kw):
@@ -232,6 +234,11 @@ def tang_extra(name, x, rows, models=("hand",)):
     if x.ndim > 1 and "hand" in models:
         for p in [30, 40, 50, 60, 70, 80, 90, 100]:
             add("tc-tucker", run_tc(x, "tucker", ["--psnr", str(p)]), "psnr")
+    if auto_model:
+        for p in [30, 40, 50, 60, 70, 80, 90, 100]:
+            add("tc-auto", run_tc(x, "auto", ["--psnr", str(p)], auto_model), "psnr")
+        for rel in [1e-2, 1e-3, 1e-4]:
+            add("tc-auto", run_tc(x, "auto", ["--max-rel", repr(rel)], auto_model), "maxabs", bound_rel=rel)
 
 
 def frontier_extra(name, x, rows):
@@ -310,7 +317,13 @@ def bpv_at(front, target):
     return None
 
 
-def sweep(name: str, x: np.ndarray, rows: list, quick: bool):
+def heldout_fields() -> dict[str, np.ndarray]:
+    """Held-out SDRBench crops written by fetch_heldout.py (never used for tuning)."""
+    man = json.load(open(DATA / "heldout" / "manifest.json"))
+    return {m["name"]: np.fromfile(DATA / "heldout" / f"{m['name']}.f32", dtype="<f4").reshape(m["shape"]) for m in man}
+
+
+def sweep(name: str, x: np.ndarray, rows: list, quick: bool, orders=None):
     rng = float(x.max() - x.min())
     psnrs = [30, 40, 50, 60, 70, 80, 90, 100] if not quick else [40, 60, 80]
     def add(codec, r, kind):
@@ -321,7 +334,7 @@ def sweep(name: str, x: np.ndarray, rows: list, quick: bool):
         rows.append(r)
         print(f"  {codec:14s} {kind:6s} bpv={r['bpv']:.4f} psnr={r['psnr']:.2f} max={r['max_abs']/rng:.2e}·R enc={r['enc_s']:.2f}s {r.get('extra','')}", flush=True)
         return r
-    for order in ["morton", "row"] if x.ndim > 1 else ["row"]:
+    for order in orders or (["morton", "row"] if x.ndim > 1 else ["row"]):
         for p in psnrs:
             r = run_qtt(x, ["--psnr", str(p)], order=order)
             r["ranks"] = "-".join(map(str, r["ranks"]))
@@ -341,7 +354,7 @@ def sweep(name: str, x: np.ndarray, rows: list, quick: bool):
     # fixed max-abs bounds
     for rel in [1e-2, 1e-3, 1e-4]:
         b = rel * rng
-        for order in ["morton", "row"] if x.ndim > 1 else ["row"]:
+        for order in orders or (["morton", "row"] if x.ndim > 1 else ["row"]):
             r = run_qtt(x, ["--max-abs", repr(b)], order=order)
             r["ranks"] = "-".join(map(str, r["ranks"]))
             add(f"qtt-{order}", {**r, "bound_rel": rel}, "maxabs")
@@ -386,16 +399,43 @@ def main():
             w.writeheader()
             w.writerows(rows)
         return
+    if "--heldout" in sys.argv:
+        only = [a for a in sys.argv[1:] if not a.startswith("--")]
+        pre = str(HERE / "models" / "pre_ALL.tcm")
+        for name, x in heldout_fields().items():
+            if only and not any(o in name for o in only):
+                continue
+            path = OUT / f"heldout_{name}.csv"
+            if path.exists():
+                continue
+            rows = []
+            print(f"== {name} {x.shape}", flush=True)
+            for stage in (lambda: sweep(name, x, rows, False, orders=["row"]),
+                          lambda: frontier_extra(name, x, rows),
+                          lambda: tang_extra(name, x, rows, ["hand", "overfit", "pretrained:" + pre], "overfit")):
+                try:
+                    stage()
+                except subprocess.CalledProcessError as e:
+                    print("  STAGE FAILED", e.cmd[:3], (e.stderr or "")[-300:], flush=True)
+            keys = sorted({k for r in rows for k in r})
+            with open(path, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=keys)
+                w.writeheader()
+                w.writerows(rows)
+        return
     if "--tang" in sys.argv:
         rows = []
         only = [a for a in sys.argv[1:] if not a.startswith("--")]
         models = next((a.split("=", 1)[1].split(",") for a in sys.argv if a.startswith("--models=")), ["hand"])
         tag = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--tag=")), "tang")
+        auto = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--auto=")), None)
+        if "--models=" in " ".join(sys.argv) and models == [""]:
+            models = []
         for name, x in {**synthetic(), **real_fields()}.items():
             if only and not any(o in name for o in only):
                 continue
             print(f"== {name} {x.shape}", flush=True)
-            tang_extra(name, x, rows, models)
+            tang_extra(name, x, rows, models, auto)
         keys = sorted({k for r in rows for k in r})
         with open(OUT / f"results_{tag}.csv", "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=keys)

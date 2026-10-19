@@ -55,9 +55,55 @@ pub use tt::{tt_svd, TensorTrain, Truncation};
 
 /// Decode any tang-compress stream (QTT, wavelet or Tucker), by magic.
 pub fn decode_any(bytes: &[u8]) -> Result<Decoded, bitio::DecodeError> {
+    if let Some(&t) = bytes.first() {
+        if t == 0xA0 || t == 0xA1 {
+            return decode_any(&bytes[1..]);
+        }
+    }
     match bytes.get(..4) {
         Some(m) if m == wavcodec::MAGIC => wavcodec::decode(bytes),
         Some(m) if m == tucker::MAGIC => tucker::decode(bytes),
         _ => codec::decode(bytes),
+    }
+}
+
+/// Automatic transform choice: encode with the wavelet codec (with `cfg`'s
+/// coefficient model) and, for PSNR/RMSE targets on 2D/3D data, with the
+/// Tucker codec; keep the smaller stream. The output is one tag byte
+/// (`0xA0` wavelet, `0xA1` Tucker — counted in the rate) followed by the
+/// chosen stream. Returns `(bytes, chose_tucker)`.
+pub fn encode_auto_f32(x: &[f32], dims: &[usize], cfg: &wavcodec::WavConfig) -> (Vec<u8>, bool) {
+    let (w, _) = wavcodec::encode_f32(x, dims, cfg);
+    let tucker_ok = !matches!(cfg.bound, codec::ErrorBound::MaxAbs(_)) && dims.iter().filter(|&&d| d > 1).count() >= 2;
+    let t = tucker_ok.then(|| tucker::encode_f32(x, dims, cfg.bound).0);
+    let (tag, body) = match t {
+        Some(t) if t.len() < w.len() => (0xA1u8, t),
+        _ => (0xA0u8, w),
+    };
+    let mut out = Vec::with_capacity(body.len() + 1);
+    out.push(tag);
+    out.extend(body);
+    (out, tag == 0xA1)
+}
+
+#[cfg(test)]
+mod auto_tests {
+    use super::*;
+
+    #[test]
+    fn auto_round_trips_and_keeps_the_smaller() {
+        let d = [16, 24, 20];
+        let x: Vec<f32> = (0..d.iter().product::<usize>()).map(|i| ((i % 20) as f32 * 0.3).sin() + ((i / 480) as f32 * 0.2).cos()).collect();
+        for b in [codec::ErrorBound::Psnr(70.0), codec::ErrorBound::MaxAbs(1e-3)] {
+            let cfg = wavcodec::WavConfig::new(b);
+            let (bytes, _) = encode_auto_f32(&x, &d, &cfg);
+            let w = wavcodec::encode_f32(&x, &d, &cfg).0.len();
+            assert!(bytes.len() <= w + 1);
+            let Decoded::F32 { data, .. } = decode_any(&bytes).unwrap() else { panic!() };
+            assert_eq!(data.len(), x.len());
+            if let codec::ErrorBound::MaxAbs(e) = b {
+                assert!(x.iter().zip(&data).all(|(a, c)| ((a - c) as f64).abs() <= e));
+            }
+        }
     }
 }
