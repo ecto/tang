@@ -1,0 +1,6 @@
+numpy
+matplotlib
+zfpy
+pywavelets
+zstandard
+pysz
