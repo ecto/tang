@@ -1,0 +1,17 @@
+[package]
+name = "tang-compress"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Error-bounded scientific-data compression: bit-accounted quantized tensor train (QTT) codec"
+repository.workspace = true
+readme = "README.md"
+keywords = ["compression", "tensor-train", "qtt", "scientific-data", "lossy"]
+categories = ["compression", "science", "mathematics"]
+include = ["src/**/*", "README.md", "examples/**/*"]
+
+[dependencies]
+tang-la = { workspace = true }
+
+[dev-dependencies]

@@ -6049,6 +6049,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tang-compress"
+version = "0.1.0"
+dependencies = [
+ "tang-la",
+]
+
+[[package]]
 name = "tang-compute"
 version = "0.1.0"
 dependencies = [

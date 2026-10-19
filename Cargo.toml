@@ -26,6 +26,7 @@ members = [
     "crates/tang-llm",
     "crates/tang-moe",
     "crates/tang-llm-ios",
+    "crates/tang-compress",
 ]
 
 [workspace.package]
@@ -72,6 +73,7 @@ tang-3dgs = { version = "0.1", path = "crates/tang-3dgs" }
 tang-holo = { version = "0.1", path = "crates/tang-holo" }
 tang-sheffer = { version = "0.1", path = "crates/tang-sheffer" }
 tang-llm = { version = "0.1", path = "crates/tang-llm" }
+tang-compress = { version = "0.1", path = "crates/tang-compress" }
 iroh = "0.96"
 tarpc = { version = "0.35", features = ["tokio1", "serde-transport"] }
 tokio = { version = "1", features = ["full"] }
