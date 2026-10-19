@@ -118,6 +118,8 @@ pub struct Feat {
     pub mask: u8,
     /// Whether a parent band exists.
     pub has_par: bool,
+    /// Capped magnitude of the in-band prediction (0 when prediction is off).
+    pub pm: u16,
 }
 
 /// Subband class of a band.
@@ -154,6 +156,7 @@ pub fn mag_scale(f: &Feat) -> usize {
     let n = f.nb.map(|v| v as u64);
     let mut s = 2 * (n[0] + n[1] + n[2]) + n[3] + n[4] + n[5] + n[6];
     let mut w = 10;
+    s += 2 * f.pm as u64;
     if f.has_par {
         s += 2 * f.par as u64;
         w += 2;
@@ -194,7 +197,7 @@ pub fn activity(f: &Feat) -> u32 {
 impl CoefModel for HandModel {
     fn code<B: Bits>(&mut self, b: &mut B, f: &Feat, v: i32) -> i32 {
         let c = f.class as usize;
-        let a = activity(f);
+        let a = activity(f) + f.pm.min(15) as u32;
         let pa = 4 * f.par.min(15) as u32 + f.pnb.min(60) as u32;
         let ab = bucket(a, &A_TH);
         let pb = if f.has_par { 1 + bucket(pa, &P_TH[..NP - 2]) } else { 0 };
@@ -484,8 +487,9 @@ fn traverse(p: &Pyramid, q: &mut [i32], res: &mut [i32], preds: &[Pred], mut f: 
             for y in band.start[1]..band.end[1] {
                 for x in band.start[2]..band.end[2] {
                     let i = (z * ny + y) * nx + x;
-                    let ft = features(p, bi, pbi, res, z, y, x);
+                    let mut ft = features(p, bi, pbi, res, z, y, x);
                     let pv = if pr.on { predict(&pr.w, &taps(p, bi, pbi, q, z, y, x)) } else { 0 };
+                    ft.pm = pv.unsigned_abs().min(CAP as u32) as u16;
                     let r = f(&ft, pv, q[i].wrapping_sub(pv));
                     res[i] = r;
                     q[i] = r + pv;
