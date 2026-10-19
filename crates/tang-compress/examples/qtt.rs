@@ -22,9 +22,7 @@ fn usage() -> ! {
 
 fn read_f32(path: &str) -> Vec<f32> {
     let b = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-    b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-        .collect()
+    b.as_chunks::<4>().0.iter().map(|&c| f32::from_le_bytes(c)).collect()
 }
 
 fn parse(args: &[String], data: &[f32]) -> (Vec<usize>, Config) {
