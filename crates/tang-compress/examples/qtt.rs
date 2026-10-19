@@ -132,7 +132,7 @@ fn main() {
             let mx = x
                 .iter()
                 .zip(&data)
-                .map(|(a, b)| (a - b).abs() as f64)
+                .map(|(&a, &b)| (a as f64 - b as f64).abs())
                 .fold(0.0, f64::max);
             assert_eq!(
                 mx, st.max_abs,

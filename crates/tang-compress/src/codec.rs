@@ -49,7 +49,8 @@
 
 use crate::bitio::{ByteReader, ByteWriter, DecodeError};
 use crate::linalg::{
-    cholesky, gram_rows, matmul, matmul_tn, solve_lower, solve_lower_t, sym_eig_desc,
+    cholesky, gram_rows, kron_eye_apply, matmul, matmul_tn, solve_lower, solve_lower_t,
+    sym_eig_desc,
 };
 use crate::rans::{decode_blocks, encode_blocks};
 use crate::tensorize::{DigitOrder, Layout, PadPolicy};
@@ -230,7 +231,7 @@ fn quantized_pass(x: &[f64], modes: &[usize], delta: f64, gd: bool, max_rank: us
             solve_lower_t(&l, &mut g, m, kc);
             (sig, g, kc, energy)
         } else {
-            let htc = matmul(&ht, &c, m, m, cols);
+            let htc = kron_eye_apply(&h, r_prev, nk, &c, cols);
             let gw = matmul_tn(&c, &htc, m, cols, cols);
             let (lam, v) = sym_eig_desc(&gw, cols);
             let sig: Vec<f64> = lam.iter().map(|&v| v.max(0.0).sqrt()).collect();
@@ -279,18 +280,26 @@ fn quantized_pass(x: &[f64], modes: &[usize], delta: f64, gd: bool, max_rank: us
                     qm[i * r + j] = col[i] as f64 * step;
                 }
             }
-            let htq = matmul(&ht, &qm, m, m, r);
+            let htq = kron_eye_apply(&h, r_prev, nk, &qm, r);
             let hk = matmul_tn(&qm, &htq, m, r, r);
             let Some(lk) = cholesky(&hk, r) else {
                 keep.pop();
                 continue;
             };
-            let mut b = matmul_tn(&htq, &c, m, r, cols);
-            solve_lower(&lk, &mut b, r, cols);
-            let proj: f64 = b.iter().map(|v| v * v).sum();
-            solve_lower_t(&lk, &mut b, r, cols);
+            let b = matmul_tn(&htq, &c, m, r, cols);
+            // W = Hk⁻¹ B through an explicit inverse (Hk ≈ I, well conditioned)
+            // so the r×cols product is one GEMM instead of two triangular
+            // sweeps; projected energy = ⟨B, W⟩.
+            let mut hinv = vec![0.0; r * r];
+            for i in 0..r {
+                hinv[i * r + i] = 1.0;
+            }
+            solve_lower(&lk, &mut hinv, r, r);
+            solve_lower_t(&lk, &mut hinv, r, r);
+            let w = matmul(&hinv, &b, r, r, cols);
+            let proj: f64 = b.iter().zip(&w).map(|(x, y)| x * y).sum();
             sse += (c_energy - proj).max(0.0);
-            c = b;
+            c = w;
             h = hk;
             break;
         }
@@ -426,7 +435,7 @@ fn search_delta(
         }
         delta = match (&lo, &hi) {
             (Some((dl, sl, _)), Some((dh, sh))) => {
-                if dh / dl < 1.015 {
+                if dh / dl < 1.03 {
                     break;
                 }
                 // log–log secant inside the bracket, kept away from the ends.
@@ -646,7 +655,12 @@ fn encode_impl(x: &[f64], dims: &[usize], cfg: &Config, dt: Dtype) -> (Vec<u8>, 
         ErrorBound::MaxAbs(bound) => {
             let mut best: Option<(usize, Built, Residual)> = None;
             let mut guess = bound;
-            for f in [0.2, 0.3, 0.45, 0.65] {
+            let mut prev_f = 0.0;
+            for f in [0.25, 0.4, 0.6] {
+                if prev_f > 0.0 {
+                    guess *= f / prev_f;
+                }
+                prev_f = f;
                 let b = l2_build(f * bound, guess, &mut passes);
                 guess = b.delta;
                 let rec = reconstruct(&layout, &b.pass, b.delta);

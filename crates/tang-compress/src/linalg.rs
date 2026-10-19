@@ -1,8 +1,10 @@
 //! Small dense helpers on row-major `f64` buffers.
 //!
-//! Heavy products go through `tang_la::gemm_*` (NEON microkernels on
-//! aarch64); symmetric eigendecompositions through `tang_la::SymmetricEigen`
-//! (Householder tridiagonalisation + implicit QR). Truncated SVDs of the
+//! Heavy products and symmetric eigendecompositions go through faer
+//! (`Par::Seq`). `tang_la::gemm_*` and `tang_la::SymmetricEigen` were the
+//! first choice; on the codec's shapes (m ≈ 700, k ≈ 10⁴) the eigensolver
+//! took >95% of encode time and the GEMMs were the next bottleneck, so the
+//! hot paths moved to faer, which tang-la already bridges behind a feature. Truncated SVDs of the
 //! `m × n` TT unfoldings are computed from the Gram matrix of the *smaller*
 //! side (`min(m,n) ≤ 2·r_max`), which is what makes TT-SVD of a 2^24-entry
 //! tensor cheap: one-sided Jacobi (`tang_la::Svd`) on a 2 × 2^23 unfolding
@@ -10,20 +12,40 @@
 //! that leaves singular values down to ~1e-7·σ₁ resolved, well below any
 //! truncation tolerance the codec uses (see the crate docs).
 
-use tang_la::{gemm_nn, gemm_nt, gemm_tn, DMat, SymmetricEigen};
+use tang_la::{DMat, SymmetricEigen};
+
+fn fmat(a: &[f64], m: usize, n: usize) -> faer::MatRef<'_, f64> {
+    faer::MatRef::from_row_major_slice(a, m, n)
+}
+
+/// `C = op(A)·op(B)` into a fresh row-major buffer, single threaded.
+fn gemm(lhs: faer::MatRef<'_, f64>, rhs: faer::MatRef<'_, f64>) -> Vec<f64> {
+    let (m, n) = (lhs.nrows(), rhs.ncols());
+    let mut c = vec![0.0; m * n];
+    if m == 0 || n == 0 || lhs.ncols() == 0 {
+        return c;
+    }
+    faer::linalg::matmul::matmul(
+        faer::MatMut::from_row_major_slice_mut(&mut c, m, n),
+        faer::Accum::Replace,
+        lhs,
+        rhs,
+        1.0,
+        faer::Par::Seq,
+    );
+    c
+}
 
 /// `A·Aᵀ` for row-major `a` (m × n).
 pub fn gram_rows(a: &[f64], m: usize, n: usize) -> Vec<f64> {
-    let mut g = vec![0.0; m * m];
-    gemm_nt(m, m, n, a, n, a, n, &mut g, m);
+    let mut g = gemm(fmat(a, m, n), fmat(a, m, n).transpose());
     symmetrize(&mut g, m);
     g
 }
 
 /// `Aᵀ·A` for row-major `a` (m × n).
 pub fn gram_cols(a: &[f64], m: usize, n: usize) -> Vec<f64> {
-    let mut g = vec![0.0; n * n];
-    gemm_tn(n, n, m, a, n, a, n, &mut g, n);
+    let mut g = gemm(fmat(a, m, n).transpose(), fmat(a, m, n));
     symmetrize(&mut g, n);
     g
 }
@@ -40,21 +62,63 @@ fn symmetrize(g: &mut [f64], n: usize) {
 
 /// `C = A·B` (A: m×k, B: k×n), row-major.
 pub fn matmul(a: &[f64], b: &[f64], m: usize, k: usize, n: usize) -> Vec<f64> {
-    let mut c = vec![0.0; m * n];
-    gemm_nn(m, n, k, a, k, b, n, &mut c, n);
-    c
+    gemm(fmat(a, m, k), fmat(b, k, n))
 }
 
 /// `C = Aᵀ·B` (A: k×m, B: k×n), row-major.
 pub fn matmul_tn(a: &[f64], b: &[f64], k: usize, m: usize, n: usize) -> Vec<f64> {
-    let mut c = vec![0.0; m * n];
-    gemm_tn(m, n, k, a, m, b, n, &mut c, n);
-    c
+    gemm(fmat(a, k, m).transpose(), fmat(b, k, n))
+}
+
+/// `(H ⊗ I_n)·X` for `H` r×r and `X` (r·n)×p, row-major — computed as
+/// `H · X'` with `X'` the free r×(n·p) reshape, `n`× cheaper than the dense
+/// Kronecker product.
+pub fn kron_eye_apply(h: &[f64], r: usize, n: usize, x: &[f64], p: usize) -> Vec<f64> {
+    matmul(h, x, r, r, n * p)
 }
 
 /// Eigenpairs of a symmetric matrix, **descending**: (values, vectors as
 /// row-major n×n with eigenvector j in column j).
+///
+/// Uses faer's blocked self-adjoint EVD with `Par::Seq`. `tang_la::SymmetricEigen`
+/// (unblocked Householder + implicit QR) was tried first and spent >95% of
+/// encode time at n ≈ 700; it is kept as the fallback if faer reports failure.
 pub fn sym_eig_desc(g: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
+    use faer::dyn_stack::{MemBuffer, MemStack};
+    use faer::linalg::evd;
+    let a = faer::Mat::<f64>::from_fn(n, n, |i, j| g[i * n + j]);
+    let mut u = faer::Mat::<f64>::zeros(n, n);
+    let mut s = faer::diag::Diag::<f64>::zeros(n);
+    let par = faer::Par::Seq;
+    let scratch = evd::self_adjoint_evd_scratch::<f64>(
+        n,
+        evd::ComputeEigenvectors::Yes,
+        par,
+        Default::default(),
+    );
+    let ok = evd::self_adjoint_evd(
+        a.as_ref(),
+        s.as_mut(),
+        Some(u.as_mut()),
+        par,
+        MemStack::new(&mut MemBuffer::new(scratch)),
+        Default::default(),
+    );
+    if ok.is_err() {
+        return sym_eig_desc_tang(g, n);
+    }
+    let mut vals = Vec::with_capacity(n);
+    let mut vecs = vec![0.0; n * n];
+    for (jj, j) in (0..n).rev().enumerate() {
+        vals.push(s[j]);
+        for i in 0..n {
+            vecs[i * n + jj] = u[(i, j)];
+        }
+    }
+    (vals, vecs)
+}
+
+fn sym_eig_desc_tang(g: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
     // Symmetric, so the column-major DMat sees the same matrix.
     let e = SymmetricEigen::new(&DMat::from_raw(n, n, g.to_vec()));
     let mut vals = Vec::with_capacity(n);

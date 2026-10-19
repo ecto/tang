@@ -6052,6 +6052,7 @@ dependencies = [
 name = "tang-compress"
 version = "0.1.0"
 dependencies = [
+ "faer 0.24.0",
  "tang-la",
 ]
 

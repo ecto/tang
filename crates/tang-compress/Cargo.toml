@@ -13,5 +13,8 @@ include = ["src/**/*", "README.md", "examples/**/*"]
 
 [dependencies]
 tang-la = { workspace = true }
+# Blocked symmetric eigensolver (tang-la already bridges faer 0.24 behind a
+# feature). No rayon: the codec is single threaded by design.
+faer = { version = "0.24", default-features = false, features = ["std"] }
 
 [dev-dependencies]
