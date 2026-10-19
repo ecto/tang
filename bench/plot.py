@@ -25,6 +25,8 @@ STYLE = {
     "zfp": ("#27ae60", "-", "^"),
     "wavelet-H0": ("#7d3c98", ":", "d"),
     "wavelet-zstd": ("#a569bd", "-.", "d"),
+    "sperr": ("#17202a", "-", "P"),
+    "tthresh": ("#7f8c8d", "-", "X"),
 }
 
 
@@ -100,6 +102,33 @@ def main():
     for r in sorted(rows, key=lambda r: (r["dataset"], r["codec"], r["psnr"])):
         if r["codec"].startswith("qtt") and r["kind"] == "psnr" and r.get("ranks"):
             md.append(f"| {r['dataset']} | {r['codec']} | {r['psnr']:.1f} | {r['ranks']} |")
+    # frontier: best codec per dataset/target, excluding the idealized wavelet-H0
+    md.append("")
+    md.append("| dataset | PSNR | frontier codec | bpv | QTT-row bpv | QTT / frontier | runner-up |")
+    md.append("|---|---|---|---|---|---|---|")
+    for ds in sorted(by):
+        for t in [40, 60, 80, 100]:
+            vals = {}
+            for codec in by[ds]:
+                if codec in ("wavelet-H0", "qtt-morton"):
+                    continue
+                b = bpv_at(pareto(by[ds][codec]), t)
+                if b is not None:
+                    vals[codec] = b
+            if not vals:
+                continue
+            order = sorted(vals, key=vals.get)
+            q = vals.get("qtt-row")
+            ru = f"{order[1]} {vals[order[1]]:.4g}" if len(order) > 1 else "–"
+            md.append(f"| {ds} | {t} | {order[0]} | {vals[order[0]]:.4g} | {q:.4g} | {q / vals[order[0]]:.2f}× |  {ru} |" if q else f"| {ds} | {t} | {order[0]} | {vals[order[0]]:.4g} | – | – | {ru} |")
+    md.append("")
+    md.append("| dataset | SPERR omp=1 enc/dec s | SPERR all-threads enc/dec s (60 dB) |")
+    md.append("|---|---|---|")
+    sp = [r for r in rows if r["codec"] == "sperr-mt"]
+    for r in sp:
+        one = min((x for x in rows if x["codec"] == "sperr" and x["dataset"] == r["dataset"] and x.get("extra", "").startswith("psnr=60")), key=lambda x: 0, default=None)
+        if one:
+            md.append(f"| {r['dataset']} | {one['enc_s']:.3f} / {one['dec_s']:.3f} | {r['enc_s']:.3f} / {r['dec_s']:.3f} |")
     (OUT / "summary.md").write_text("\n".join(md) + "\n")
     print("\n".join(md[:60]))
 

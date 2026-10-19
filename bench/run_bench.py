@@ -146,6 +146,74 @@ def run_zfp(x: np.ndarray, mode: str, val: float) -> dict:
     return {"bpv": 8 * len(b) / x.size, "psnr": psnr, "max_abs": mx, "rmse": rmse, "enc_s": enc, "dec_s": dec, "extra": f"{mode}={val:.3g}"}
 
 
+TP = HERE / "third_party"
+SPERR3 = TP / "SPERR" / "build" / "bin" / "sperr3d"
+SPERR2 = TP / "SPERR" / "build" / "bin" / "sperr2d"
+TTHRESH = TP / "tthresh" / "build" / "tthresh"
+
+
+def _as3d(x):
+    """1D inputs are reshaped (C order) for the 2D/3D-only tools; noted in the report."""
+    if x.ndim == 1:
+        return x.reshape(64, 128, 128) if x.size == 1 << 20 else x.reshape(1, 1, -1)
+    return x
+
+
+def _timed(cmd):
+    t = time.perf_counter()
+    subprocess.run(cmd, check=True, capture_output=True)
+    return time.perf_counter() - t
+
+
+def run_sperr(x: np.ndarray, mode: str, val: float, omp: int = 1) -> dict:
+    """SPERR 3D (sperr3d); 1D inputs go through sperr2d as 1024x1024."""
+    src, bs, out = OUT / "sp_in.f32", OUT / "sp.bs", OUT / "sp_out.f32"
+    if x.ndim == 1:
+        exe, dims = SPERR2, ["1024", "1024"]
+    else:
+        exe, dims = SPERR3, [str(d) for d in x.shape[::-1]]
+    x.astype("<f4").tofile(src)
+    knob = ["--pwe", repr(val)] if mode == "pwe" else ["--psnr", repr(val)]
+    enc = _timed([str(exe), "-c", "--ftype", "32", "--dims", *dims, *knob, "--bitstream", str(bs), *(["--omp", str(omp)] if x.ndim > 1 else []), str(src)])
+    dec = _timed([str(exe), "-d", "--decomp_f", str(out), *(["--omp", str(omp)] if x.ndim > 1 else []), str(bs)])
+    y = np.fromfile(out, dtype="<f4").reshape(x.shape)
+    rmse, psnr, mx = metrics(x, y)
+    return {"bpv": 8 * bs.stat().st_size / x.size, "psnr": psnr, "max_abs": mx, "rmse": rmse, "enc_s": enc, "dec_s": dec, "extra": f"{mode}={val:.4g} omp={omp}"}
+
+
+def run_tthresh(x: np.ndarray, psnr_target: float) -> dict:
+    src, bs, out = OUT / "tt_in.f32", OUT / "tt.bs", OUT / "tt_out.f32"
+    x3 = _as3d(x)
+    x3.astype("<f4").tofile(src)
+    dims = [str(d) for d in x3.shape[::-1]]
+    enc = _timed([str(TTHRESH), "-i", str(src), "-t", "float", "-s", *dims, "-p", repr(psnr_target), "-c", str(bs)])
+    dec = _timed([str(TTHRESH), "-c", str(bs), "-o", str(out)])
+    y = np.fromfile(out, dtype="<f4").reshape(x.shape)
+    rmse, psnr, mx = metrics(x, y)
+    return {"bpv": 8 * bs.stat().st_size / x.size, "psnr": psnr, "max_abs": mx, "rmse": rmse, "enc_s": enc, "dec_s": dec, "extra": f"p={psnr_target:g}"}
+
+
+def frontier_extra(name, x, rows):
+    """SPERR (PSNR + PWE, 1 thread; default threads at ~60 dB) and TTHRESH (PSNR)."""
+    rng = float(x.max() - x.min())
+    def add(codec, r, kind, **kw):
+        r = {"dataset": name, "n": x.size, "codec": codec, "kind": kind, **kw, **r}
+        rows.append(r)
+        print(f"  {codec:14s} {kind:6s} bpv={r['bpv']:.4f} psnr={r['psnr']:.2f} max={r['max_abs']/rng:.2e}R enc={r['enc_s']:.2f}s {r['extra']}", flush=True)
+    for p in [30, 40, 50, 60, 70, 80, 90, 100]:
+        add("sperr", run_sperr(x, "psnr", p), "psnr")
+        # PWE sweep also traces the PSNR front (SPERR's PWE mode is its native one)
+        add("sperr", run_sperr(x, "pwe", rng * 10 ** (-p / 20) * math.sqrt(3)), "psnr")
+        try:
+            add("tthresh", run_tthresh(x, p), "psnr")
+        except subprocess.CalledProcessError as e:
+            print("  tthresh failed", p, e.stderr[-200:] if e.stderr else "", flush=True)
+    if x.ndim > 1:
+        add("sperr-mt", run_sperr(x, "psnr", 60, omp=0), "speed")
+    for rel in [1e-2, 1e-3, 1e-4]:
+        add("sperr", run_sperr(x, "pwe", rel * rng), "maxabs", bound_rel=rel)
+
+
 def entropy_bits(q: np.ndarray) -> float:
     _, counts = np.unique(q, return_counts=True)
     p = counts / q.size
@@ -263,6 +331,20 @@ def wavelet_only(name, x, rows):
 
 def main():
     quick = "--quick" in sys.argv
+    if "--frontier" in sys.argv:
+        rows = []
+        only = [a for a in sys.argv[1:] if not a.startswith("--")]
+        for name, x in {**synthetic(), **real_fields()}.items():
+            if only and not any(o in name for o in only):
+                continue
+            print(f"== {name} {x.shape}", flush=True)
+            frontier_extra(name, x, rows)
+        keys = sorted({k for r in rows for k in r})
+        with open(OUT / "results_frontier.csv", "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=keys)
+            w.writeheader()
+            w.writerows(rows)
+        return
     if "--wavelet-only" in sys.argv:
         rows = []
         for name, x in {**synthetic(), **real_fields()}.items():
