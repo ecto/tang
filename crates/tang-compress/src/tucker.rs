@@ -252,7 +252,21 @@ fn ls_core(x: &[f64], d: [usize; 3], us: &[Vec<f64>], rs: [usize; 3]) -> Vec<f64
     for k in 0..3 {
         let (n, r) = (d[k], rs[k]);
         let g = matmul_tn(&us[k], &us[k], n, r, r);
-        let l = cholesky(&g, r).expect("factor Gram not SPD");
+        // quantized columns can be (numerically) dependent on tiny-range
+        // fields: retry with a growing ridge (encoder-side only; the decoder
+        // never solves this system, so streams that factor cleanly are unchanged)
+        let tr = (0..r).map(|i| g[i * r + i]).sum::<f64>() / r as f64;
+        let l = cholesky(&g, r)
+            .or_else(|| {
+                (1..=12).find_map(|e| {
+                    let mut gg = g.clone();
+                    for i in 0..r {
+                        gg[i * r + i] += tr * 10f64.powi(e - 16);
+                    }
+                    cholesky(&gg, r)
+                })
+            })
+            .expect("factor Gram not SPD even with ridge");
         // Z = (UᵀU)⁻¹Uᵀ (r × n); mode_mul wants M = Zᵀ (n × r)
         let mut z = transpose(&us[k], n, r);
         solve_lower(&l, &mut z, r, n);
