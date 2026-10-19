@@ -58,7 +58,7 @@ pub enum Finish {
     Cancelled,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Usage {
     pub prompt_tokens: usize,
     pub cached_tokens: usize,
@@ -111,6 +111,12 @@ pub trait Control {
 
     /// After each prefill chunk and each generated token.
     fn progress(&mut self, _p: Progress) {}
+
+    /// Asked between prefill chunks and before each decode step: true stops the run there
+    /// with [`Finish::Cancelled`] (the client went away). What's in the cache stays usable.
+    fn cancelled(&mut self) -> bool {
+        false
+    }
 }
 
 /// Never yields; ignores progress.
@@ -848,6 +854,20 @@ impl<D: ComputeDevice> Engine<D> {
         };
         if runs.is_empty() {
             for (i, chunk) in ids[reuse..].chunks(PREFILL_CHUNK).enumerate() {
+                if i > 0 && ctl.cancelled() {
+                    self.cache_images.clear();
+                    self.seal();
+                    return Ok(Outcome::Done(
+                        Finish::Cancelled,
+                        Usage {
+                            prompt_tokens: ids.len(),
+                            cached_tokens: reuse,
+                            prefill_tok_s: progress.prefilled as f64
+                                / t.elapsed().as_secs_f64().max(1e-9),
+                            ..Usage::default()
+                        },
+                    ));
+                }
                 if i > 0 && !ctl.keep_prefilling() {
                     // Seal what's done so another conversation can't lose it for us, even if
                     // this cache is dropped before the request comes back.
@@ -946,6 +966,10 @@ impl<D: ComputeDevice> Engine<D> {
         let (mut drafted, mut accepted) = (0usize, 0usize);
 
         while out.len() < limit {
+            if ctl.cancelled() {
+                finish = Finish::Cancelled;
+                break;
+            }
             let logits = &mut rows[row * vocab..(row + 1) * vocab];
             if let Some(grammar) = constraint.as_mut() {
                 crate::structured::mask(grammar, logits, &self.eos)?;
