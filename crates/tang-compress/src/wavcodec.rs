@@ -108,19 +108,22 @@ pub struct Coeffs {
     pub w: Vec<f64>,
     /// Class of each cell's band.
     pub cls: Vec<u8>,
+    /// Mean removed before the transform (keeps the LL band small).
+    pub mean: f64,
 }
 
 impl Coeffs {
     /// Transform `x` with shape `dims`.
     pub fn new(x: &[f64], dims: &[usize]) -> Self {
         let p = Pyramid::new(as3(dims), max_levels(dims));
-        let mut c = x.to_vec();
+        let mean = x.iter().sum::<f64>() / x.len().max(1) as f64;
+        let mut c: Vec<f64> = x.iter().map(|&v| v - mean).collect();
         forward_97(&p, &mut c);
         let (w, cls) = band_maps(&p);
         for (v, wi) in c.iter_mut().zip(&w) {
             *v *= wi;
         }
-        Self { p, c, w, cls }
+        Self { p, c, w, cls, mean }
     }
 }
 
@@ -181,7 +184,7 @@ pub fn quantize(co: &Coeffs, delta: f64, rho: f64) -> (Vec<i32>, [u8; NDELTA]) {
 }
 
 /// Dequantize + inverse transform → reconstruction (f64, row-major).
-pub fn reconstruct(p: &Pyramid, q: &[i32], delta: f64, d: &[u8; NDELTA]) -> Vec<f64> {
+pub fn reconstruct(p: &Pyramid, q: &[i32], delta: f64, d: &[u8; NDELTA], mean: f64) -> Vec<f64> {
     let (w, cls) = band_maps(p);
     let mut c: Vec<f64> = q
         .iter()
@@ -201,6 +204,9 @@ pub fn reconstruct(p: &Pyramid, q: &[i32], delta: f64, d: &[u8; NDELTA]) -> Vec<
         })
         .collect();
     inverse_97(p, &mut c);
+    for v in c.iter_mut() {
+        *v += mean;
+    }
     c
 }
 
@@ -352,11 +358,12 @@ fn encode_at(
     let mut w = ByteWriter::new();
     write_header(&mut w, h);
     w.f64(delta);
+    w.f64(co.mean);
     w.bytes(&d);
     let b0 = w.buf.len();
     let model_bytes = code_coefs(&co.p, &q, &cfg.model, &mut w);
     let coef_bytes = w.buf.len() - b0 - model_bytes;
-    let mut y = cast(&reconstruct(&co.p, &q, delta, &d), h.dt);
+    let mut y = cast(&reconstruct(&co.p, &q, delta, &d, co.mean), h.dt);
     let mut st = WavStats { delta, coef_bytes, model_bytes, ..Default::default() };
     if let Some(b) = maxabs {
         let b0 = w.buf.len();
@@ -411,7 +418,7 @@ fn encode_at(
 /// Error of the lossy layer alone at step `delta` (no entropy coding).
 fn trial_rmse(x: &[f64], co: &Coeffs, delta: f64, rho: f64, dt: Dtype) -> f64 {
     let (q, d) = quantize(co, delta, rho);
-    err_stats(x, &cast(&reconstruct(&co.p, &q, delta, &d), dt)).0
+    err_stats(x, &cast(&reconstruct(&co.p, &q, delta, &d, co.mean), dt)).0
 }
 
 fn encode_impl(x: &[f64], dims: &[usize], dt: Dtype, cfg: &WavConfig) -> (Vec<u8>, WavStats) {
@@ -547,10 +554,11 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
     }
     let p = Pyramid::new(as3(&dims), max_levels(&dims));
     let delta = r.f64()?;
+    let mean = r.f64()?;
     let mut d = [0u8; NDELTA];
     d.copy_from_slice(r.take(NDELTA)?);
     let q = decode_coefs(&p, &mut r)?;
-    let mut y = cast(&reconstruct(&p, &q, delta, &d), dt);
+    let mut y = cast(&reconstruct(&p, &q, delta, &d, mean), dt);
     if r.u8()? == 1 {
         let b = r.f64()?;
         {

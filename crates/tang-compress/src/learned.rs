@@ -316,22 +316,26 @@ pub struct Net {
 impl Net {
     /// Integer forward pass (outputs in Q8).
     pub fn infer(&self, x: &[i32; NF]) -> [i32; NO] {
-        let mut a: Vec<i64> = x.iter().map(|&v| v as i64).collect();
+        let mut a = [0i64; 256];
+        let mut b = [0i64; 256];
+        for (d, &v) in a.iter_mut().zip(x) {
+            *d = v as i64;
+        }
         let nl = self.sizes.len() - 1;
         for l in 0..nl {
             let (ni, no) = (self.sizes[l], self.sizes[l + 1]);
             let w = &self.wq[l];
-            let mut out = Vec::with_capacity(no);
+            let src = &a[..ni];
             for o in 0..no {
                 let row = &w[o * ni..(o + 1) * ni];
                 let mut acc = self.bq[l][o] as i64;
-                for i in 0..ni {
-                    acc += row[i] as i64 * a[i];
+                for (&wi, &ai) in row.iter().zip(src) {
+                    acc += wi as i64 * ai;
                 }
                 let v = (acc + 128) >> 8;
-                out.push(if l + 1 < nl { v.clamp(0, 1 << 22) } else { v.clamp(-(1 << 22), 1 << 22) });
+                b[o] = if l + 1 < nl { v.clamp(0, 1 << 22) } else { v.clamp(-(1 << 22), 1 << 22) };
             }
-            a = out;
+            std::mem::swap(&mut a, &mut b);
         }
         let mut o = [0i32; NO];
         for k in 0..NO {
@@ -604,8 +608,7 @@ pub struct TrainConfig {
 impl TrainConfig {
     /// Small network for per-file overfitting (its weights are shipped).
     pub fn overfit() -> Self {
-        let ev = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-        Self { hidden: vec![16], epochs: ev("TC_EPOCHS", 4.0) as usize, per_epoch: ev("TC_PER", 200_000.0) as usize, batch: ev("TC_BATCH", 256.0) as usize, lr: ev("TC_LR", 4e-3), apm: ev("TC_APM", 1.0) > 0.0, seed: 1 }
+        Self { hidden: vec![16], epochs: 4, per_epoch: 200_000, batch: 256, lr: 4e-3, apm: true, seed: 1 }
     }
     /// Larger network for offline pretraining.
     pub fn pretrain() -> Self {

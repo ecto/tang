@@ -206,7 +206,8 @@ def run_tc(x: np.ndarray, codec: str, bound_args: list[str], model: str = "hand"
     enc = time.perf_counter() - t
     j = json.loads(res.stdout.strip().splitlines()[-1])
     t = time.perf_counter()
-    d = json.loads(subprocess.run([str(TC), "decode", str(bs), str(out)], capture_output=True, text=True, check=True).stdout)
+    ex = ["--model", model] if model.startswith("pretrained:") else []
+    d = json.loads(subprocess.run([str(TC), "decode", str(bs), str(out), *ex], capture_output=True, text=True, check=True).stdout)
     dec = time.perf_counter() - t
     y = np.fromfile(out, dtype="<f4").reshape(x.shape)
     rmse, psnr, mx = metrics(x, y)

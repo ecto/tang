@@ -16,7 +16,7 @@ use tang_compress::codec::ErrorBound;
 use tang_compress::{decode_any, wavcodec, Decoded};
 
 fn usage() -> ! {
-    eprintln!("usage: tc encode IN.f32 OUT --dims AxBxC --codec wavelet|tucker BOUND [--rho r] [--model m]\n       tc decode IN OUT.f32");
+    eprintln!("usage: tc encode IN.f32 OUT --dims AxBxC --codec wavelet|tucker BOUND [--rho r] [--model m]\n       tc decode IN OUT.f32 [--model pretrained:PATH]");
     std::process::exit(2)
 }
 
@@ -85,7 +85,11 @@ fn main() {
             std::fs::write(&args[2], &bytes).unwrap();
             println!("{{\"bytes\":{},\"bpv\":{},\"encode_s\":{enc},{json}}}", bytes.len(), 8.0 * bytes.len() as f64 / x.len() as f64);
         }
-        Some("decode") if args.len() == 3 => {
+        Some("decode") if args.len() == 3 || (args.len() == 5 && args[3] == "--model") => {
+            if args.len() == 5 {
+                // registers a pretrained network so the decoder can resolve it
+                let _ = tang_compress::learned::parse_model_arg(&args[4]);
+            }
             let bytes = std::fs::read(&args[1]).unwrap();
             let t = Instant::now();
             let Decoded::F32 { data, .. } = decode_any(&bytes).expect("decode") else { panic!("not an f32 stream") };
