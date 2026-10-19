@@ -82,9 +82,18 @@ pub fn gd_omega(beta: f64) -> f64 {
 
 /// Number of singular values above the Gavish–Donoho threshold for an
 /// `m × n` matrix with spectrum `s` (descending, length `min(m,n)`).
+///
+/// The rule needs a bulk of noise singular values to estimate the median
+/// from; QTT's leading unfoldings are `2 × 2^{d−1}`, `4 × …` (two or four
+/// singular values), where the median is a *signal* value and the cap
+/// collapses the rank to 1 (measured: Miranda 64×128×128 at a 60 dB target
+/// fell to 12 dB). Unfoldings with `min(m,n) < GD_MIN_DIM` are left uncapped.
 pub fn gd_rank(s: &[f64], m: usize, n: usize) -> usize {
     if s.is_empty() {
         return 0;
+    }
+    if m.min(n) < GD_MIN_DIM {
+        return s.len();
     }
     let beta = m.min(n) as f64 / m.max(n) as f64;
     let mut sorted = s.to_vec();
@@ -98,6 +107,9 @@ pub fn gd_rank(s: &[f64], m: usize, n: usize) -> usize {
     let tau = gd_omega(beta) * med;
     s.iter().filter(|&&x| x > tau).count().max(1)
 }
+
+/// Smallest unfolding side on which [`gd_rank`] applies its cap.
+pub const GD_MIN_DIM: usize = 32;
 
 /// Smallest rank whose discarded tail energy `Σ_{j≥r} σ_j²` is ≤ `delta2`.
 pub fn tail_rank(s: &[f64], delta2: f64) -> usize {
