@@ -20,7 +20,7 @@
 use super::engine::{Engine, Opts, Positional, RunningState};
 use super::tokenize::FlashTokenizer;
 use crate::chat::{Parser, Piece};
-use crate::engine::{Finish, Request, ThinkBudget, Usage, WRAP_UP};
+use crate::engine::{Control, Finish, Outcome, Request, ThinkBudget, Usage, WRAP_UP};
 use crate::server::Backend;
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
@@ -385,7 +385,7 @@ impl FlashServe {
                 .with_context(|| format!("reading {}", f.display()))?;
             let mut req = crate::server::parse(&body).map_err(|e| anyhow::anyhow!(e))?;
             req.prefill_only = true;
-            me.generate(&req, &mut |_| true)?;
+            me.generate(&req, &mut |_| true, &mut ())?;
             eprintln!(
                 "tang-llm: warmed {} ({} tokens, {} reused) in {:.1} s",
                 f.display(),
@@ -880,6 +880,7 @@ impl FlashServe {
         &mut self,
         req: &Request,
         on: &mut dyn FnMut(Piece) -> bool,
+        ctl: &mut dyn Control,
     ) -> Result<(Finish, Usage)> {
         let t0 = Instant::now();
         self.line = Line::default();
@@ -1010,6 +1011,11 @@ impl FlashServe {
             true
         };
         'gen: loop {
+            // The prefill can't stop part way; decode stops between windows.
+            if ctl.cancelled() {
+                finish = Finish::Cancelled;
+                break 'gen;
+            }
             let mut wrap = false;
             for &tok in &pending {
                 if self.eos.contains(&tok) {
@@ -1147,6 +1153,23 @@ impl FlashServe {
     }
 }
 
+impl FlashServe {
+    fn run(
+        &mut self,
+        req: &Request,
+        on: &mut dyn FnMut(Piece) -> bool,
+        ctl: &mut dyn Control,
+    ) -> Result<(Finish, Usage)> {
+        let r = self.generate(req, on, ctl);
+        if r.is_err() {
+            // Whatever the engine holds now is unknown: start over next time.
+            self.e.reset();
+        }
+        self.save_routing();
+        r
+    }
+}
+
 impl Backend for FlashServe {
     fn model_path(&self, _spec: &str) -> Result<PathBuf> {
         Ok(self.gguf.clone())
@@ -1157,13 +1180,17 @@ impl Backend for FlashServe {
         req: &Request,
         on: &mut dyn FnMut(Piece) -> bool,
     ) -> Result<(Finish, Usage)> {
-        let r = self.generate(req, on);
-        if r.is_err() {
-            // Whatever the engine holds now is unknown: start over next time.
-            self.e.reset();
-        }
-        self.save_routing();
-        r
+        self.run(req, on, &mut ())
+    }
+
+    fn complete_with(
+        &mut self,
+        req: &Request,
+        _prompt: Option<(String, Vec<u32>)>,
+        on: &mut dyn FnMut(Piece) -> bool,
+        ctl: &mut dyn Control,
+    ) -> Result<Outcome> {
+        self.run(req, on, ctl).map(|(f, u)| Outcome::Done(f, u))
     }
 
     fn context_window(&self) -> usize {

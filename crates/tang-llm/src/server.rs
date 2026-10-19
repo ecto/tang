@@ -57,6 +57,8 @@ enum Job {
         model: String,
         /// What earlier runs did before giving way.
         before: Option<Before>,
+        /// The client's `x-request-id`, logged with the request's usage.
+        request_id: Option<String>,
     },
     Load {
         spec: String,
@@ -369,6 +371,8 @@ struct Worker<B: Backend, F> {
 struct Ctl<'a> {
     node: &'a Node,
     background: bool,
+    /// Closed once the client goes away: the run stops there.
+    tx: &'a mpsc::UnboundedSender<Out>,
 }
 
 impl Control for Ctl<'_> {
@@ -380,6 +384,10 @@ impl Control for Ctl<'_> {
         if let Some(r) = self.node.state().running.as_mut() {
             r.progress = p;
         }
+    }
+
+    fn cancelled(&mut self) -> bool {
+        self.tx.is_closed()
     }
 }
 
@@ -400,7 +408,8 @@ where
                     tx,
                     model,
                     before,
-                } => self.complete(ticket, req, prompt, tx, model, before),
+                    request_id,
+                } => self.complete(ticket, req, prompt, tx, model, before, request_id),
                 Job::Load { spec, reply } => {
                     let _ = reply.send(self.swap(&spec));
                 }
@@ -419,6 +428,7 @@ where
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn complete(
         &mut self,
         mut ticket: Ticket,
@@ -427,9 +437,13 @@ where
         tx: mpsc::UnboundedSender<Out>,
         model: String,
         before: Option<Before>,
+        request_id: Option<String>,
     ) {
+        let rid = request_id.as_deref();
         if tx.is_closed() {
-            return; // the client went away while it waited
+            // The client went away while it waited.
+            log_usage(rid, &model, &Usage::default(), "cancelled");
+            return;
         }
         let engine = match &mut self.engine {
             Some((name, e)) if *name == model => e,
@@ -437,10 +451,12 @@ where
                 let _ = tx.send(Out::Error(format!(
                     "model {model} was unloaded ({name} is loaded now)"
                 )));
+                log_usage(rid, &model, &Usage::default(), "error");
                 return;
             }
             None => {
                 let _ = tx.send(Out::Error(format!("model {model} was unloaded")));
+                log_usage(rid, &model, &Usage::default(), "error");
                 return;
             }
         };
@@ -455,6 +471,7 @@ where
         let mut ctl = Ctl {
             node: &self.node,
             background: ticket.priority == Priority::Background,
+            tx: &tx,
         };
         let piece_tx = tx.clone();
         // A background request may give way; it keeps its prompt for when it goes on.
@@ -499,6 +516,7 @@ where
                     tx,
                     model,
                     before: Some(before),
+                    request_id,
                 };
                 self.node.queue.push_front(ticket, job);
             }
@@ -521,11 +539,18 @@ where
                     usage.prefill_tok_s =
                         (usage.prompt_tokens - b.cached_tokens) as f64 / (b.secs + secs).max(1e-9);
                 }
+                let outcome = if finish == Finish::Cancelled {
+                    "cancelled"
+                } else {
+                    "ok"
+                };
+                log_usage(rid, &model, &usage, outcome);
                 let engine = &mut self.engine.as_mut().expect("the engine that ran it").1;
                 let _ = tx.send(Out::Done(finish, usage.clone()));
                 engine.after(&req, &Ok((finish, usage)));
             }
             Err(e) => {
+                log_usage(rid, &model, &Usage::default(), "error");
                 let _ = tx.send(Out::Error(format!("{e:#}")));
                 self.engine
                     .as_mut()
@@ -903,6 +928,38 @@ async fn control(app: &App, job: impl FnOnce(oneshot::Sender<Reply>) -> Job) -> 
     }
 }
 
+/// One line per request, for reconciling with a gateway's records by request id:
+/// `tang-llm: usage request_id=… model=… prompt_tokens=… cached_tokens=… completion_tokens=… outcome=ok|cancelled|error`.
+/// Tokens are what ran: a cancelled request counts its prompt and what it generated.
+fn log_usage(request_id: Option<&str>, model: &str, u: &Usage, outcome: &str) {
+    eprintln!("{}", usage_line(request_id, model, u, outcome));
+}
+
+fn usage_line(request_id: Option<&str>, model: &str, u: &Usage, outcome: &str) -> String {
+    format!(
+        "tang-llm: usage request_id={} model={} prompt_tokens={} cached_tokens={} completion_tokens={} outcome={outcome}",
+        request_id.unwrap_or("-"),
+        model.replace(char::is_whitespace, "_"),
+        u.prompt_tokens,
+        u.cached_tokens,
+        u.completion_tokens,
+    )
+}
+
+/// `x-request-id`, kept to printable ASCII without spaces (so the log line stays one token
+/// per field) and at most 128 bytes.
+fn request_id(headers: &HeaderMap) -> Option<String> {
+    let id: String = headers
+        .get("x-request-id")?
+        .to_str()
+        .ok()?
+        .chars()
+        .filter(|c| c.is_ascii_graphic())
+        .take(128)
+        .collect();
+    (!id.is_empty()).then_some(id)
+}
+
 /// Queue a request for the loaded model, at its `x-frog-priority`, with its prompt counted.
 #[allow(clippy::result_large_err)]
 async fn submit(
@@ -937,6 +994,7 @@ async fn submit(
         tx,
         model: model.clone(),
         before: None,
+        request_id: request_id(headers),
     };
     app.node.queue.push(priority, n, job);
     Ok((model, rx))
@@ -1189,6 +1247,153 @@ mod tests {
         let unique: std::collections::HashSet<_> = ids.iter().collect();
         assert_eq!(unique.len(), ids.len(), "{ids:?}");
     }
+
+    #[tokio::test]
+    async fn include_usage_ends_with_an_openai_usage_chunk() {
+        let r = stream_response("m".into(), "id".into(), 7, true, two_calls()).into_response();
+        let text = body(r).await;
+        let data: Vec<&str> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .collect();
+        assert_eq!(data.last(), Some(&"[DONE]"));
+        let evs: Vec<Value> = data
+            .iter()
+            .filter_map(|d| serde_json::from_str(d).ok())
+            .collect();
+        let (usage, rest) = evs.split_last().unwrap();
+        assert_eq!(usage["object"], "chat.completion.chunk");
+        assert_eq!(usage["id"], "id");
+        assert_eq!(usage["model"], "m");
+        assert_eq!(usage["created"], 7);
+        assert_eq!(usage["choices"], json!([]));
+        assert_eq!(usage["usage"]["prompt_tokens"], 1);
+        assert_eq!(usage["usage"]["completion_tokens"], 1);
+        assert_eq!(usage["usage"]["prompt_tokens_details"]["cached_tokens"], 0);
+        // The finish chunk comes before it, without usage; no other chunk carries usage.
+        let finish = rest.last().unwrap();
+        assert_eq!(finish["choices"][0]["finish_reason"], "tool_calls");
+        assert!(rest.iter().all(|e| e.get("usage").is_none()));
+    }
+
+    #[test]
+    fn usage_line_and_request_id() {
+        let mut h = axum::http::HeaderMap::new();
+        assert_eq!(super::request_id(&h), None);
+        h.insert("x-request-id", "req 42\tab".parse().unwrap());
+        assert_eq!(super::request_id(&h).as_deref(), Some("req42ab"));
+        let u = Usage {
+            prompt_tokens: 10,
+            cached_tokens: 4,
+            completion_tokens: 3,
+            ..Usage::default()
+        };
+        assert_eq!(
+            super::usage_line(Some("req42"), "qwen 3", &u, "cancelled"),
+            "tang-llm: usage request_id=req42 model=qwen_3 prompt_tokens=10 cached_tokens=4 completion_tokens=3 outcome=cancelled"
+        );
+        assert!(super::usage_line(None, "m", &u, "ok").contains("request_id=- "));
+    }
+
+    /// Generates silently (as while a tool call is buffered, or during a long prefill) until
+    /// its Control says stop, counting steps.
+    struct Endless {
+        steps: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    const ENDLESS: usize = 100_000;
+    impl Backend for Endless {
+        fn context_window(&self) -> usize {
+            1024
+        }
+        fn complete(
+            &mut self,
+            _: &Request,
+            _: &mut dyn FnMut(Piece) -> bool,
+        ) -> anyhow::Result<(Finish, Usage)> {
+            unreachable!()
+        }
+        fn complete_with(
+            &mut self,
+            _: &Request,
+            _: Option<(String, Vec<u32>)>,
+            _: &mut dyn FnMut(Piece) -> bool,
+            ctl: &mut dyn super::Control,
+        ) -> anyhow::Result<Outcome> {
+            use std::sync::atomic::Ordering;
+            self.steps.store(0, Ordering::SeqCst);
+            let mut finish = Finish::Length;
+            for _ in 0..ENDLESS {
+                if ctl.cancelled() {
+                    finish = Finish::Cancelled;
+                    break;
+                }
+                self.steps.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Ok(Outcome::Done(
+                finish,
+                Usage {
+                    prompt_tokens: 5,
+                    completion_tokens: self.steps.load(Ordering::SeqCst),
+                    ..Usage::default()
+                },
+            ))
+        }
+        fn model_path(&self, _: &str) -> anyhow::Result<std::path::PathBuf> {
+            Ok("/m".into())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_stream_stops_generation() {
+        use std::sync::atomic::Ordering;
+        let steps = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let node = std::sync::Arc::new(super::Node {
+            id: "test".into(),
+            queue: crate::queue::Queue::new(),
+            state: std::sync::Mutex::new(super::NodeState::default()),
+            hardware: std::sync::Arc::new(crate::node::Hardware::default),
+            dtype: crate::model::Dtype::F32,
+            resources: Default::default(),
+            image: None,
+        });
+        let mut worker = super::Worker {
+            node,
+            engine: Some((
+                "m".into(),
+                Endless {
+                    steps: steps.clone(),
+                },
+            )),
+            load: |_: &str| -> anyhow::Result<Endless> { unreachable!() },
+        };
+        let req = Box::new(super::parse(&json!({"messages": []})).unwrap());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let ticket = crate::queue::Ticket {
+            id: 1,
+            priority: crate::queue::Priority::Interactive,
+            prompt_tokens: None,
+            since: std::time::Instant::now(),
+            yields: 0,
+        };
+        let run = std::thread::spawn(move || {
+            let t = std::time::Instant::now();
+            worker.complete(ticket, req, None, tx, "m".into(), None, Some("rid".into()));
+            (t.elapsed(), worker)
+        });
+        // The client reads nothing and goes away while the run is under way.
+        let sse = stream_response("m".into(), "id".into(), 0, true, rx).into_response();
+        while steps.load(Ordering::SeqCst) < 20 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        drop(sse);
+        let took = tokio::task::spawn_blocking(move || run.join().unwrap().0)
+            .await
+            .unwrap();
+        let n = steps.load(Ordering::SeqCst);
+        assert!(n < 2_000, "ran {n} steps after the client left");
+        assert!(took < std::time::Duration::from_secs(10), "{took:?}");
+    }
 }
 
 /// A chat completion body as an engine request.
@@ -1358,7 +1563,16 @@ fn stream_response(
     let mut first = true;
     let (sse_tx, sse_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        while let Some(out) = rx.recv().await {
+        loop {
+            // Watch for the client going away even while nothing is generated (a long
+            // prefill, buffered tool-call text): dropping rx stops the run.
+            let out = tokio::select! {
+                out = rx.recv() => match out {
+                    Some(out) => out,
+                    None => return,
+                },
+                _ = sse_tx.closed() => return,
+            };
             let mut evs: Vec<Value> = Vec::new();
             let role = if first {
                 json!("assistant")
@@ -1387,7 +1601,10 @@ fn stream_response(
                     let mut last = chunk(json!({}), Some(finish_reason(finish)));
                     if include_usage {
                         evs.push(last);
-                        last = json!({ "id": last_id(&evs), "object": "chat.completion.chunk", "choices": [], "usage": usage_json(&usage) });
+                        let mut u = chunk(json!({}), None);
+                        u["choices"] = json!([]);
+                        u["usage"] = usage_json(&usage);
+                        last = u;
                     } else {
                         last["usage"] = usage_json(&usage);
                     }
@@ -1440,10 +1657,6 @@ fn tool_call_id() -> String {
     });
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
     format!("call_{prefix:016x}{n:08x}")
-}
-
-fn last_id(evs: &[Value]) -> Value {
-    evs.last().map(|e| e["id"].clone()).unwrap_or(Value::Null)
 }
 
 async fn collect_response(
