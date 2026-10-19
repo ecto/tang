@@ -1,0 +1,10 @@
+# the soundtrack is not ours to commit; bring your own
+audio/
+*.wav
+*.mp3
+*.webm
+frames/
+*.mp4
+*.jpg
+node_modules/
+package-lock.json

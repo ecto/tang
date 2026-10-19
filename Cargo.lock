@@ -6257,6 +6257,7 @@ name = "tang-site-wasm"
 version = "0.1.0"
 dependencies = [
  "tang",
+ "tang-expr",
  "tang-tensor",
  "tang-train",
  "wasm-bindgen",

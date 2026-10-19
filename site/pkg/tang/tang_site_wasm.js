@@ -1,6 +1,22 @@
 /* @ts-self-types="./tang_site_wasm.d.ts" */
 
 /**
+ * One damped-least-squares IK step toward (tx, ty), with the Jacobian from
+ * two dual passes through `arm_tip`. Returns [q1, q2, error, elbow x, elbow y, tip x, tip y].
+ * @param {number} q1
+ * @param {number} q2
+ * @param {number} tx
+ * @param {number} ty
+ * @returns {Float64Array}
+ */
+export function arm_ik_step(q1, q2, tx, ty) {
+    const ret = wasm.arm_ik_step(q1, q2, tx, ty);
+    var v1 = getArrayF64FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 8, 8);
+    return v1;
+}
+
+/**
  * Generate SVG path `d` attribute for f(x) = x * sin(x).
  * Maps math coordinates to SVG pixel coordinates.
  * @param {number} x_min
@@ -33,6 +49,86 @@ export function curve_svg_path(x_min, x_max, y_min, y_max, w, h, steps) {
  */
 export function dual_eval(x) {
     const ret = wasm.dual_eval(x);
+    var v1 = getArrayF64FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 8, 8);
+    return v1;
+}
+
+/**
+ * Parse `src` in x, y, z, optionally append its gradient, and emit a kernel.
+ * Returns the source, or a line starting with `error:`.
+ * @param {string} src
+ * @param {string} dialect
+ * @param {boolean} grad
+ * @returns {string}
+ */
+export function expr_kernel(src, dialect, grad) {
+    let deferred3_0;
+    let deferred3_1;
+    try {
+        const ptr0 = passStringToWasm0(src, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(dialect, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.expr_kernel(ptr0, len0, ptr1, len1, grad);
+        deferred3_0 = ret[0];
+        deferred3_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+    }
+}
+
+/**
+ * The live part of a demo's graph, as JSON:
+ * `{"nodes":[{"op":"×","args":[0,1],"lit":false}],"outputs":[5,9]}` with
+ * indices into `nodes`, which are in topological order.
+ * @param {string} kind
+ * @returns {string}
+ */
+export function graph_layout(kind) {
+    let deferred2_0;
+    let deferred2_1;
+    try {
+        const ptr0 = passStringToWasm0(kind, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.graph_layout(ptr0, len0);
+        deferred2_0 = ret[0];
+        deferred2_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+    }
+}
+
+/**
+ * Every live node's value for these inputs, in `graph_layout` order.
+ * @param {string} kind
+ * @param {Float64Array} inputs
+ * @returns {Float64Array}
+ */
+export function graph_values(kind, inputs) {
+    const ptr0 = passStringToWasm0(kind, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passArrayF64ToWasm0(inputs, wasm.__wbindgen_malloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.graph_values(ptr0, len0, ptr1, len1);
+    var v3 = getArrayF64FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 8, 8);
+    return v3;
+}
+
+/**
+ * Score a launch and its gradient, one dual pass per parameter.
+ * Returns [miss², ∂/∂speed, ∂/∂heading, path xy...].
+ * @param {number} speed
+ * @param {number} heading
+ * @param {number} tx
+ * @param {number} ty
+ * @returns {Float64Array}
+ */
+export function orbit_eval(speed, heading, tx, ty) {
+    const ret = wasm.orbit_eval(speed, heading, tx, ty);
     var v1 = getArrayF64FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 8, 8);
     return v1;
@@ -158,6 +254,13 @@ function getUint8ArrayMemory0() {
         cachedUint8ArrayMemory0 = new Uint8Array(wasm.memory.buffer);
     }
     return cachedUint8ArrayMemory0;
+}
+
+function passArrayF64ToWasm0(arg, malloc) {
+    const ptr = malloc(arg.length * 8, 8) >>> 0;
+    getFloat64ArrayMemory0().set(arg, ptr / 8);
+    WASM_VECTOR_LEN = arg.length;
+    return ptr;
 }
 
 function passStringToWasm0(arg, malloc, realloc) {

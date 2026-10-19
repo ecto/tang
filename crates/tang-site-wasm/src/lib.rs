@@ -350,3 +350,112 @@ pub fn tangent_svg(
 
     Box::new([sx1, sy1, sx2, sy2])
 }
+mod graph;
+mod kernel;
+
+/// Acceleration toward a unit-mass planet at the origin (GM = 1).
+pub(crate) fn gravity<S: Scalar>(x: S, y: S) -> (S, S) {
+    let r2 = x * x + y * y;
+    let inv_r3 = S::from_f64(1.0) / (r2 * r2.sqrt());
+    (S::from_f64(0.0) - x * inv_r3, S::from_f64(0.0) - y * inv_r3)
+}
+
+/// One orbit-transfer attempt, written once over `S: Scalar`: launch from the
+/// top of a unit planet (GM = 1) with `speed` and `heading` (radians above the
+/// local horizon), integrate with leapfrog, and score the closest approach to
+/// the target. With `Dual<f64>` the score carries one exact partial derivative.
+fn orbit_miss<S: Scalar>(speed: S, heading: S, tx: f64, ty: f64, path: &mut Vec<f64>) -> S {
+    let dt = S::from_f64(0.01);
+    let half = S::from_f64(0.5);
+    let (s, c) = heading.sin_cos();
+    let (mut x, mut y) = (S::from_f64(0.0), S::from_f64(1.0));
+    let (mut vx, mut vy) = (speed * c, speed * s);
+    let acc = gravity::<S>;
+    let (mut ax, mut ay) = acc(x, y);
+    let mut best = S::from_f64(f64::INFINITY);
+    for k in 0..1600 {
+        let (dx, dy) = (x - S::from_f64(tx), y - S::from_f64(ty));
+        let d2 = dx * dx + dy * dy;
+        if d2.to_f64() < best.to_f64() {
+            best = d2;
+        }
+        if k % 8 == 0 {
+            path.push(x.to_f64());
+            path.push(y.to_f64());
+        }
+        vx = vx + ax * dt * half;
+        vy = vy + ay * dt * half;
+        x = x + vx * dt;
+        y = y + vy * dt;
+        (ax, ay) = acc(x, y);
+        vx = vx + ax * dt * half;
+        vy = vy + ay * dt * half;
+        let r2 = (x * x + y * y).to_f64();
+        if r2 < 1.0 || r2 > 64.0 {
+            break;
+        }
+    }
+    best
+}
+
+/// Score a launch and its gradient, one dual pass per parameter.
+/// Returns [miss², ∂/∂speed, ∂/∂heading, path xy...].
+#[wasm_bindgen]
+pub fn orbit_eval(speed: f64, heading: f64, tx: f64, ty: f64) -> Box<[f64]> {
+    let mut path = Vec::new();
+    let ds = orbit_miss(Dual::var(speed), Dual::constant(heading), tx, ty, &mut path);
+    let mut scratch = Vec::new();
+    let dh = orbit_miss(
+        Dual::constant(speed),
+        Dual::var(heading),
+        tx,
+        ty,
+        &mut scratch,
+    );
+    let mut out = vec![ds.real, ds.dual, dh.dual];
+    out.extend(path);
+    out.into_boxed_slice()
+}
+
+/// Planar forward kinematics for a rose full arm (side view): shoulder pitch
+/// `q1` from hanging straight down, elbow `q2`. Links from rose_full_layout.py.
+pub(crate) fn arm_tip<S: Scalar>(q1: S, q2: S) -> (S, S) {
+    let (l1, l2) = (S::from_f64(0.227), S::from_f64(0.236));
+    let (s1, c1) = q1.sin_cos();
+    let (s12, c12) = (q1 + q2).sin_cos();
+    (l1 * s1 + l2 * s12, S::from_f64(0.0) - l1 * c1 - l2 * c12)
+}
+
+/// One damped-least-squares IK step toward (tx, ty), with the Jacobian from
+/// two dual passes through `arm_tip`. Returns [q1, q2, error, elbow x, elbow y, tip x, tip y].
+#[wasm_bindgen]
+pub fn arm_ik_step(q1: f64, q2: f64, tx: f64, ty: f64) -> Box<[f64]> {
+    let (a, b) = arm_tip(Dual::var(q1), Dual::constant(q2));
+    let (c, d) = arm_tip(Dual::constant(q1), Dual::var(q2));
+    let (j11, j21, j12, j22) = (a.dual, b.dual, c.dual, d.dual);
+    let (ex, ey) = (tx - a.real, ty - b.real);
+    // (JᵀJ + λ²I)⁻¹ Jᵀ e
+    let lam2 = 0.0004;
+    let (m11, m12, m22) = (
+        j11 * j11 + j21 * j21 + lam2,
+        j11 * j12 + j21 * j22,
+        j12 * j12 + j22 * j22 + lam2,
+    );
+    let (g1, g2) = (j11 * ex + j21 * ey, j12 * ex + j22 * ey);
+    let det = m11 * m22 - m12 * m12;
+    let dq1 = (m22 * g1 - m12 * g2) / det;
+    let dq2 = (m11 * g2 - m12 * g1) / det;
+    let nq1 = (q1 + 0.5 * dq1).clamp(-1.0, 3.0);
+    let nq2 = (q2 + 0.5 * dq2).clamp(0.0, 2.6);
+    let (tipx, tipy) = arm_tip(nq1, nq2);
+    let err = ((tx - tipx).powi(2) + (ty - tipy).powi(2)).sqrt();
+    Box::new([
+        nq1,
+        nq2,
+        err,
+        0.227 * nq1.sin(),
+        -0.227 * nq1.cos(),
+        tipx,
+        tipy,
+    ])
+}

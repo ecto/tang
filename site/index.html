@@ -2,13 +2,56 @@
 <html lang="en" class="scroll-smooth">
 <head>
   <meta charset="UTF-8">
+  <script>try { const t = localStorage.getItem('theme'); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>tang — differentiable computing in Rust</title>
-  <meta name="description" content="Scalar-generic Rust math library — exact derivatives, spatial algebra, dense LA, optimizers, and training. no_std, WASM-ready.">
+  <meta name="description" content="Differentiable computing in Rust — exact derivatives, a tensor IR that derives its own kernels for CUDA, Metal, Vulkan and CPU, training, and LLM inference.">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css">
+  <script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js" onload="document.querySelectorAll('[data-tex]').forEach(el => katex.render(el.dataset.tex, el, { displayMode: el.tagName === 'DIV', throwOnError: false }))"></script>
+  <script>
+    // Small syntax highlighter for the page's code: Rust, the generated
+    // kernels (CUDA, WGSL, Metal, C) and shell commands. Emits spans with the
+    // same classes as the hand-highlighted snippets (.kw .ty .fn .num .str .cm).
+    window.hl = (code, lang = 'c') => {
+      const esc = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const KW = new Set(('fn let mut pub use mod impl struct enum const static return if else for while loop match in as ref move where '
+        + 'extern void kernel device constant thread threadgroup inline unsigned signed var override struct '
+        + '__global__ __device__ __restrict__ __shared__ include using namespace').split(' '));
+      const TY = /^(f16|f32|f64|i32|u32|u64|i64|usize|isize|bool|float|double|int|half|uint|vec[234]<?.*|array|uniform|storage|read|read_write|Self|[A-Z][A-Za-z0-9_]*)$/;
+      if (lang === 'sh') return code.split('\n').map(line => {
+        const m = line.match(/^(\s*)(\$ )?(.*)$/), [, ind, prompt = '', rest] = m;
+        let first = true;
+        return esc(ind) + (prompt ? '<span class="cm">$ </span>' : '') + rest.split(/(\s+)/).map(w => {
+          if (/^\s+$/.test(w) || !w) return w;
+          if (/^'.*'?$|^".*"?$|^.*'$/.test(w)) return `<span class="str">${esc(w)}</span>`;
+          if (first && !/^[\\-]/.test(w)) { first = false; return `<span class="fn">${esc(w)}</span>`; }
+          if (/^--?[a-zA-Z]/.test(w)) return `<span class="kw">${esc(w)}</span>`;
+          if (/^\d/.test(w)) return `<span class="num">${esc(w)}</span>`;
+          if (w === '&&' || w === '\\') return `<span class="cm">${esc(w)}</span>`;
+          return esc(w);
+        }).join('');
+      }).join('\n');
+      const re = /(\/\/[^\n]*)|("(?:[^"\\]|\\.)*")|(@[a-z_]+)|(#\s*[a-z]+)|(\b\d+(?:\.\d+)?(?:e[-+]?\d+)?[fu]?\b)|([A-Za-z_][A-Za-z0-9_]*)(\s*\()?|([^\w\s])/g;
+      let out = '', last = 0, m;
+      while ((m = re.exec(code))) {
+        out += esc(code.slice(last, m.index)); last = re.lastIndex;
+        const [all, cm, str, attr, pre, num, id, call, punct] = m;
+        if (cm) out += `<span class="cm">${esc(cm)}</span>`;
+        else if (str) out += `<span class="str">${esc(str)}</span>`;
+        else if (attr || pre) out += `<span class="kw">${esc(attr || pre)}</span>`;
+        else if (num) out += `<span class="num">${num}</span>`;
+        else if (id) {
+          const cls = KW.has(id) ? 'kw' : call ? 'fn' : TY.test(id) ? 'ty' : /^t\d+$/.test(id) ? 'tv' : '';
+          out += (cls ? `<span class="${cls}">${id}</span>` : id) + (call ? esc(call) : '');
+        } else out += esc(punct);
+      }
+      return out + esc(code.slice(last));
+    };
+  </script>
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
     tailwind.config = {
@@ -65,7 +108,7 @@
     .ty { color: #66D9EF; }      /* types */
     .str { color: #E6DB74; }     /* strings */
     .cm { color: #75715E; }      /* comments */
-    .fn { color: #A6E22E; }      /* functions */
+    .fn { color: #0891b2; }      /* functions */
     .num { color: #AE81FF; }     /* numbers */
     .op { color: #F8F8F2; }      /* operators */
     .mac { color: #66D9EF; font-style: italic; } /* macros */
@@ -86,74 +129,638 @@
       0%, 100% { transform: translateY(0); }
       50% { transform: translateY(-6px); }
     }
+    .flow-arrow { width: 28px; align-self: center; height: 2px; background: repeating-linear-gradient(90deg, rgb(var(--c-accent)) 0 6px, transparent 6px 12px); background-size: 24px 2px; animation: flow 0.8s linear infinite; justify-self: center; }
+    @media (max-width: 767px) { .flow-arrow { width: 2px; height: 24px; background: repeating-linear-gradient(180deg, rgb(var(--c-accent)) 0 6px, transparent 6px 12px); background-size: 2px 24px; animation-name: flow-v; } }
+    @keyframes flow { to { background-position: 24px 0; } }
+    @keyframes flow-v { to { background-position: 0 24px; } }
+    .grad-node, .grad-edge { animation: grad-pulse 3s ease-in-out infinite; }
+    .grad-edge { stroke: #0891b2; stroke-dasharray: 3 3; }
+    @keyframes grad-pulse { 0%, 15% { opacity: 0; } 45%, 85% { opacity: 1; } 100% { opacity: 0; } }
+    details > summary { list-style: none; } details > summary::-webkit-details-marker { display: none; }
+
+    /* ── muni palette: white, stone, safety orange; IBM Plex Sans, Plex Mono only for code ── */
+    :root, :root:not(#x) {
+      --m-bg: #ffffff; --m-fg: oklch(0.147 0.004 49.25); --m-muted: oklch(0.553 0.013 106.424);
+      --m-surface: oklch(0.985 0.001 106.424); --m-border: oklch(0.869 0.005 106.424); --m-border-muted: oklch(0.923 0.003 106.424);
+      --m-orange: oklch(0.705 0.213 47.604); --m-orange-700: oklch(0.54 0.16 47.604); --m-orange-50: oklch(0.97 0.02 47.604);
+      --m-cyan: oklch(0.62 0.17 195); --m-amber: oklch(0.70 0.17 85); --m-purple: oklch(0.58 0.22 300); --m-coral: oklch(0.65 0.21 25);
+      --c-bg: 255 255 255; --c-text: 28 25 23; --c-muted: 120 113 108; --c-accent: 255 102 0; --c-surface: 250 250 249; --c-code-bg: 250 250 249;
+    }
+    html, body { background: var(--m-bg) !important; color: var(--m-fg) !important; }
+    body, body * { font-family: "IBM Plex Sans", system-ui, sans-serif !important; }
+    body * { border-radius: 0 !important; box-shadow: none !important; }
+    pre, pre *, code, code *, input#kd-input, #kd-out, #build-code, #build-code * { font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace !important; }
+    .max-w-3xl, .max-w-5xl { max-width: 720px !important; }
+    [class*="border-white"] { border-color: var(--m-border-muted) !important; }
+    [style*="#1a1a2e"], [style*="#14141f"], #build-term { background: var(--m-surface) !important; }
+    #build-term, #build-term * { border-color: var(--m-border-muted) !important; }
+    .text-green-400 { color: var(--m-fg) !important; }
+    .text-muted { color: var(--m-muted) !important; }
+    .text-accent { color: var(--m-orange) !important; }
+    .bg-accent { background: var(--m-orange) !important; }
+    a { color: var(--m-orange-700) !important; text-decoration: none !important; border-bottom: 1px solid currentColor; }
+    a:hover { color: var(--m-orange) !important; }
+    a:has(> .text-2xl), a:has(> div), a.group { border-bottom: 0; color: inherit !important; }
+    a:has(> .text-2xl):hover, a.group:hover { background: var(--m-orange-50) !important; }
+    h1 { font-weight: 700 !important; letter-spacing: -0.03em !important; }
+    h2 { font-weight: 700 !important; letter-spacing: -0.02em !important; text-align: left !important; }
+    .text-center { text-align: left !important; }
+    .kw { color: var(--m-purple); } .ty { color: var(--m-cyan); } .str { color: var(--m-amber); } .cm { color: var(--m-muted); } .fn { color: var(--m-orange-700); } .num { color: var(--m-coral); } .op { color: var(--m-fg); } .mac { color: var(--m-cyan); }
+    svg text { font-family: "IBM Plex Sans", system-ui, sans-serif !important; }
+    svg circle[fill="#ffffff"] { fill: var(--m-bg); }
+    .flow-arrow { background: none !important; width: auto !important; height: auto !important; animation: none !important; color: var(--m-orange); }
+    .flow-arrow::after { content: "→"; font-size: 1.6rem; }
+    @media (max-width: 767px) { .flow-arrow::after { content: "↓"; } }
+    .bg-surface { background: var(--m-surface) !important; }
+    .build-card[aria-pressed="true"] { outline: 1.5px solid var(--c); }
+    div:has(> #build-cards) { grid-template-columns: 1fr !important; }
+    #build-cards { grid-template-columns: repeat(3, minmax(0,1fr)) !important; }
+    @media (max-width: 640px) { #build-cards { grid-template-columns: repeat(2, minmax(0,1fr)) !important; } }
+    .bench-bar, #poet-progress-bar { background: var(--m-orange) !important; }
+    /* ── dark mode: muni dark theme (black, stone-950 surfaces) ── */
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme="light"]):not(#x) { --m-bg: #0b0907; --m-fg: #e8e1d2; --m-muted: #a08d70;
+      --m-surface: #15110d; --m-raised: #1e1813; --m-border: #4a3a2a; --m-border-muted: #2a2119; --m-orange: #ff5f00;
+      --m-orange-700: oklch(0.80 0.13 47.604); --m-orange-50: oklch(0.27 0.07 47.604);
+      --m-cyan: oklch(0.75 0.20 195); --m-amber: oklch(0.82 0.19 85); --m-purple: oklch(0.72 0.20 300); --m-coral: oklch(0.72 0.21 25);
+      --c-bg: 11 9 7; --c-text: 232 225 210; --c-muted: 160 141 112; --c-surface: 21 17 13; --c-code-bg: 21 17 13; }
+      :root:not([data-theme="light"]) {
+        #dual-viz { background: var(--m-bg) !important; }
+        #dual-viz line[stroke="#e7e5e4"] { stroke: #2a2119; }
+        svg text[fill="#1c1917"] { fill: var(--m-fg); }
+        .text-\[\#0891b2\] { color: var(--m-cyan) !important; }
+        img[src*="mascot"] { filter: none; }
+      }
+    }
+    :root[data-theme="dark"]:not(#x) { --m-bg: #0b0907; --m-fg: #e8e1d2; --m-muted: #a08d70;
+      --m-surface: #15110d; --m-raised: #1e1813; --m-border: #4a3a2a; --m-border-muted: #2a2119; --m-orange: #ff5f00;
+      --m-orange-700: oklch(0.80 0.13 47.604); --m-orange-50: oklch(0.27 0.07 47.604);
+      --m-cyan: oklch(0.75 0.20 195); --m-amber: oklch(0.82 0.19 85); --m-purple: oklch(0.72 0.20 300); --m-coral: oklch(0.72 0.21 25);
+      --c-bg: 11 9 7; --c-text: 232 225 210; --c-muted: 160 141 112; --c-surface: 21 17 13; --c-code-bg: 21 17 13; }
+    :root[data-theme="dark"] {
+      #dual-viz { background: var(--m-bg) !important; }
+      #dual-viz line[stroke="#e7e5e4"] { stroke: #2a2119; }
+      svg text[fill="#1c1917"] { fill: var(--m-fg); }
+      .text-\[\#0891b2\] { color: var(--m-cyan) !important; }
+      img[src*="mascot"] { filter: none; }
+    }
+    #theme-toggle { position: fixed; top: 16px; right: 16px; z-index: 50; width: 36px; height: 36px; display: grid; place-items: center; border: 1px solid var(--m-border-muted); background: var(--m-bg) !important; color: var(--m-fg); cursor: pointer; }
+    #theme-toggle:hover { color: var(--m-orange); }
+    /* ── master-plan.typ language: caps labels, hairlines, readouts, one flame ── */
+    :root { --track: 0.12em; }
+    :root:not(#x) { --m-muted: #8a7658; --m-border: #cfc4b2; --m-border-muted: #e6dfd3; }
+    @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]):not(#x) { --m-muted: #a08d70; --m-border: #4a3a2a; --m-border-muted: #2a2119; } }
+    :root[data-theme="dark"]:not(#x) { --m-muted: #a08d70; --m-border: #4a3a2a; --m-border-muted: #2a2119; }
+    [class*="border-white"], #build-term, #build-term * , .build-card { border-color: var(--m-border) !important; border-width: 0.5px; }
+    .font-mono.text-xs:not(a):not(pre):not(code):not([data-kd-example]):not(#kd-input), th, #build-title, details > summary {
+      font-weight: 500; font-size: var(--s-xs, 10.5px) !important; color: var(--m-muted) !important;
+    }
+    .font-mono.text-xs.text-accent, .text-accent .font-mono.text-xs { color: var(--m-orange) !important; }
+    h1 { font-weight: 600 !important; }
+    h2 { font-weight: 600 !important; letter-spacing: -0.01em !important; border-top: 0.5px solid var(--m-border); padding-top: 1.1rem; }
+    .hero-sub { color: var(--m-muted); font-weight: 400; }
+    .flame-rule { width: 22%; height: 2px; background: var(--m-orange); margin: 0 0 1.25rem; }
+    /* readouts: hairline left edge, caps label, mono value */
+    a:has(> .text-2xl), div:has(> .text-2xl.font-mono) { border: 0 !important; border-left: 0.5px solid var(--m-border) !important; display: flex; flex-direction: column-reverse; justify-content: flex-end; gap: .45rem; }
+    a:has(> .text-2xl) > .text-xs, div:has(> .text-2xl.font-mono) > .text-xs { font-weight: 500;   font-size: 10px !important; line-height: 1.5; color: var(--m-muted) !important; margin: 0 !important; }
+    .text-2xl.font-mono { font-weight: 500 !important; color: var(--m-fg) !important; font-variant-numeric: tabular-nums; }
+    .text-2xl.font-mono span { color: var(--m-muted) !important; }
+    div:has(> a:has(> .text-2xl)), div:has(> div > .text-2xl.font-mono) { border: 0 !important; gap: 0 1.25rem; }
+    table { font-size: 13px; font-variant-numeric: tabular-nums; }
+    
+    .bench-bar { height: 4px; }
+
+    /* ── type scale (1.25, from master-plan.typ), leading, weights ── */
+    :root { --s-xs: 10.5px; --s-sm: 12.5px; --s-body: 15px; --s-md: 17px; --s-lg: 21px; --s-xl: 26px; --s-display: 56px; }
+    body { font-size: var(--s-body) !important; line-height: 1.62; font-variant-numeric: tabular-nums; }
+    .text-xs { font-size: var(--s-xs) !important; line-height: 1.55; }
+    .text-sm { font-size: var(--s-sm) !important; line-height: 1.55; }
+    .text-base { font-size: var(--s-body) !important; }
+    .text-lg { font-size: var(--s-md) !important; line-height: 1.5; }
+    .text-xl, .sm\:text-xl { font-size: var(--s-lg) !important; line-height: 1.35; }
+    .text-2xl, .sm\:text-2xl { font-size: var(--s-xl) !important; line-height: 1.2; }
+    h1 { font-size: var(--s-display) !important; line-height: 1 !important; font-weight: 600 !important; letter-spacing: -0.02em !important; }
+    h1 + * , section:first-of-type p.text-2xl { }
+    h2 { font-size: var(--s-lg) !important; line-height: 1.3 !important; margin-bottom: .6rem !important; }
+    .fig-title { font-size: var(--s-md); font-weight: 500; margin: 0 0 .9rem; }
+    p.text-2xl, p.sm\:text-4xl { font-size: var(--s-xl) !important; font-weight: 500 !important; line-height: 1.25 !important; }
+    .font-semibold { font-weight: 600 !important; }
+    .lead { font-size: var(--s-body); color: var(--m-fg); max-width: 60ch; margin: 0 0 2.5rem; line-height: 1.62; }
+    .fig { margin: 0 0 4.5rem; }
+    .fig-cap { font-size: var(--s-sm); color: var(--m-muted); max-width: 72%; margin-top: .85rem; line-height: 1.6; }
+    @media (max-width: 640px) { .fig-cap { max-width: 100%; } }
+    .fig-n { font-weight: 600;   font-size: var(--s-xs); color: var(--m-fg); margin-right: .7em; }
+    .fig-lead { color: var(--m-fg); font-weight: 500; }
+    .unboxed table { border-top: 0.5px solid var(--m-border); }
+    .unboxed tr { border-color: var(--m-border-muted) !important; }
+    .unboxed > div:last-child { background: none !important; border-top: 0 !important; padding-left: 0; }
+    /* color discipline: badges and card icons go quiet, color stays in data and code */
+    [data-backends="badges"] span, .bg-green-500\/10, .bg-purple-500\/10 { background: none !important; color: var(--m-muted) !important; border: 0.5px solid var(--m-border); }
+    .build-card svg { filter: saturate(.6); }
+    .build-card[aria-pressed="true"] svg { filter: none; }
+    button.bg-accent, button.bg-green-500 { color: #000 !important; }
+
+    /* ── rules: none, except the outer frame of each figure ── */
+    body *, body *::before, body *::after { border-width: 0 !important; }
+    .border.rounded-xl.overflow-hidden, #build-term { border-width: 0.5px !important; border-style: solid !important; }
+    details, details .border, .unboxed, .unboxed * { border-width: 0 !important; }
+    h2 { border-top: 0 !important; padding-top: 0 !important; }
+    .build-card { background: var(--m-surface) !important; }
+    .build-card[aria-pressed="true"] { outline: 1px solid var(--c); background: var(--m-bg) !important; }
+    details { background: var(--m-surface) !important; }
+    .unboxed th, .unboxed td { padding-left: 0 !important; }
+
+    /* pills: master-plan neon, tinted fill, no rule */
+    .pill { --ink: color-mix(in oklab, var(--pill) 55%, #000); display: inline-block; padding: 3px 9px; font-size: var(--s-xs); font-weight: 500; color: var(--ink) !important; background: color-mix(in oklab, var(--pill) 16%, transparent) !important; border: 0 !important; }
+    @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .pill { --ink: var(--pill); background: color-mix(in oklab, var(--pill) 12%, transparent) !important; } }
+    :root[data-theme="dark"] .pill { --ink: var(--pill); background: color-mix(in oklab, var(--pill) 12%, transparent) !important; }
+
+    /* surfaces from master-plan.typ: warm, and only where a figure needs one */
+    :root:not(#x) { --c-surface: 250 247 241; --c-code-bg: 250 247 241; --m-surface: #faf7f1; }
+    @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]):not(#x) { --c-surface: 21 17 13; --c-code-bg: 21 17 13; --m-surface: #15110d; } }
+    :root[data-theme="dark"]:not(#x) { --c-surface: 21 17 13; --c-code-bg: 21 17 13; --m-surface: #15110d; }
+    /* figure header/footer bars sit on the figure, not on a grey strip */
+    div.flex[style*="--c-code-bg"], div.px-4[style*="--c-code-bg"]:not(:has(pre)) { background: transparent !important; }
+
+    /* go deeper: illustrated entries */
+    a.deeper { display: block; color: var(--m-fg) !important; border-bottom: 0 !important; }
+    .deeper-art { background: var(--m-surface); padding: 14px; margin-bottom: 14px; transition: background .2s; }
+
+    .deeper-h { font-size: var(--s-lg); font-weight: 600; margin: 2rem 0 .8rem; }
+    .deeper-title { font-size: var(--s-md); font-weight: 600; margin-bottom: 4px; }
+    .deeper-desc { color: var(--m-muted); font-size: var(--s-sm); line-height: 1.6; margin-bottom: 8px; }
+    .deeper-link { font-size: var(--s-sm); color: var(--m-orange-700); }
+    a.deeper:hover .deeper-link { color: var(--m-orange); }
+    :root:not([data-theme="dark"]) .deeper-art svg { filter: saturate(.85) brightness(.85); }
+    @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .deeper-art svg { filter: none; } }
+
+    /* comparison: coverage matrix of Harvey balls */
+    .cmp-head, .cmp-row { display: grid; grid-template-columns: minmax(0,1.6fr) repeat(4, minmax(0,1fr)); align-items: center; gap: 8px; }
+    .cmp-head { font-size: var(--s-sm); color: var(--m-muted); padding-bottom: 10px; }
+    .cmp-head .cmp-tang { color: var(--m-orange); font-weight: 600; }
+    .cmp-row { padding: 9px 0; font-size: var(--s-sm); }
+    .cmp-row:nth-child(even) { background: var(--m-surface); }
+    .cmp-name { color: var(--m-fg); padding-left: 8px; }
+    .cmp-cell { position: relative; display: flex; align-items: center; }
+    .cmp-note { display: none; }
+    .hb { display: inline-block; width: 14px; height: 14px; border-radius: 50% !important; border: 1.5px solid var(--hb) !important; vertical-align: -2px; margin: 0 4px; }
+    .hb-2 { background: var(--hb) !important; }
+    .hb-1 { background: linear-gradient(90deg, var(--hb) 50%, transparent 50%) !important; }
+    .hb-0 { opacity: .55; }
+    .cmp-row .cmp-cell:first-of-type .hb { width: 16px; height: 16px; }
+    .cmp-key { font-size: var(--s-sm); color: var(--m-muted); margin-top: 18px; line-height: 2; }
+    @media (min-width: 640px) { .cmp-cell:hover .cmp-note { display: block; position: absolute; left: 24px; top: 50%; transform: translateY(-50%); z-index: 5; white-space: nowrap; background: var(--m-raised, var(--m-surface)); color: var(--m-fg); padding: 4px 8px; font-size: var(--s-xs); } }
+
+    /* proof strip: three visual stats */
+    .proof { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 28px; }
+    @media (max-width: 640px) { .proof { grid-template-columns: 1fr; } }
+    a.proof-item { display: flex; flex-direction: column; gap: 6px; color: var(--m-fg) !important; border-bottom: 0 !important; }
+    .proof-val { font-size: var(--s-xl); font-weight: 500; line-height: 1.1; font-variant-numeric: tabular-nums; }
+    .proof-val small { font-size: var(--s-sm); color: var(--m-muted); }
+    .proof-val sup { font-size: var(--s-xs); color: var(--m-muted); }
+    .proof-label { font-size: var(--s-sm); color: var(--m-muted); line-height: 1.5; min-height: 3em; }
+    .proof-viz { margin-top: 4px; }
+    .pv-row { display: grid; grid-template-columns: 56px 1fr auto; align-items: center; gap: 8px; font-size: var(--s-xs); color: var(--m-muted); margin-bottom: 6px; }
+    .pv-row i { display: block; height: 8px; width: var(--w); background: var(--c); }
+    .pv-row em { font-style: normal; font-variant-numeric: tabular-nums; }
+    .pv-gauge { position: relative; height: 8px; background: var(--m-surface); }
+    .pv-gauge i { position: absolute; inset: 0 auto 0 0; width: var(--w); background: var(--m-orange); }
+    .pv-scale { display: flex; justify-content: space-between; font-size: var(--s-xs); color: var(--m-muted); margin-top: 6px; }
+    .pv-dots { display: flex; flex-wrap: wrap; gap: 6px; }
+
+    /* how tang works: numbered parts, equations, auto figure numbers */
+    body { counter-reset: fig; }
+    .fig-cap { counter-increment: fig; }
+    .fig-n::before { content: "Fig " counter(fig); }
+    .mech { margin-top: 3.5rem; }
+    .mech p { max-width: 62ch; margin-bottom: 1rem; line-height: 1.65; }
+    .mech-h { font-size: var(--s-md); font-weight: 600; margin-bottom: .9rem; display: flex; gap: .75rem; align-items: baseline; }
+    .mech-n { color: var(--m-orange); font-weight: 600; font-variant-numeric: tabular-nums; }
+    .mech code { font-family: "IBM Plex Mono", monospace !important; font-size: .9em; color: var(--m-orange-700); }
+    .eq { display: grid; grid-template-columns: 1fr auto; align-items: center; margin: 1.1rem 0 1.4rem; overflow-x: auto; overflow-y: hidden; }
+    .eq .katex-display { margin: 0; }
+    .eq-n { color: var(--m-muted); font-size: var(--s-sm); padding-left: 1rem; font-variant-numeric: tabular-nums; }
+    .katex { font-size: 1.08em; color: var(--m-fg); }
+    .mech-fig { margin: 1.5rem 0 1rem; }
+    .mech-fig svg { background: var(--m-surface); padding: 12px; }
+    .mech-code { background: var(--m-surface); padding: 16px 18px; font-size: 13px; line-height: 1.7; overflow-x: auto; color: var(--m-fg); }
+    .mech-code .l-f { color: var(--m-orange); }
+    .mech-code .l-d { color: var(--m-cyan); }
+
+    .llm-data { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 16px 20px; padding: 16px; font-size: var(--s-xs); color: var(--m-muted); line-height: 1.45; }
+    @media (max-width: 640px) { .llm-data { grid-template-columns: repeat(2, minmax(0,1fr)); } }
+    .llm-data span { display: block; font-size: var(--s-md); color: var(--m-fg); font-weight: 500; margin-bottom: 2px; font-variant-numeric: tabular-nums; }
+
+    /* live tang graph panels */
+    .gpanel { margin-top: 10px; background: var(--m-surface); padding: 10px 12px 6px; }
+    .gp-head { display: flex; justify-content: space-between; font-size: var(--s-xs); color: var(--m-muted); margin-bottom: 4px; }
+    .gp-head span:first-child { color: var(--m-fg); font-weight: 500; }
+    .gp-svg { width: 100%; height: auto; display: block; font-family: "IBM Plex Mono", monospace; }
+    .gp-svg text { font-family: "IBM Plex Mono", monospace !important; text-anchor: middle; }
+    .gp-node rect { fill: var(--m-bg); stroke: var(--m-border); stroke-width: .75; }
+    .gp-op { font-size: 12px; fill: var(--m-fg); font-weight: 500; }
+    .gp-val { font-size: 10.5px; fill: var(--m-muted); font-variant-numeric: tabular-nums; }
+    .gp-var rect { stroke: var(--m-fg); }
+    .gp-lit rect { stroke-dasharray: 2 2; fill: none; } .gp-lit .gp-op { fill: var(--m-muted); font-size: 9px; } .gp-lit text.gp-op { transform: translateY(4px); }
+    .gp-out rect { stroke: var(--m-orange); stroke-width: 1.5; } .gp-out .gp-val { fill: var(--m-orange); }
+    .gp-out2 rect { stroke: var(--m-cyan); stroke-width: 1.5; } .gp-out2 .gp-val { fill: var(--m-cyan); }
+    .gp-edge { fill: none; stroke: var(--m-border); stroke-width: 1; }
+    .gp-edge.gp-live { stroke: var(--m-orange); stroke-opacity: .55; stroke-dasharray: 3 5; animation: gp-flow .6s linear infinite; }
+    @keyframes gp-flow { to { stroke-dashoffset: -8; } }
+
+    .ka-arc { fill: none; stroke: var(--m-border); stroke-width: 1; }
+    .ka-arc.ka-on { stroke: var(--m-orange); stroke-width: 1.5; }
+    .ka-k rect { transition: fill-opacity .15s; }
+    .ka-k.ka-on rect { fill-opacity: .9; }
+    .ka-f { font-size: 9px; fill: var(--m-fg); text-anchor: middle; }
+    .ka-note { font-size: 10px; fill: var(--m-orange); }
+    .ka-tabs { display: flex; gap: 14px; font-size: var(--s-xs); margin: 2px 0 4px; }
+    .ka-tabs button { color: var(--m-muted); cursor: pointer; } .ka-tabs button.on { color: var(--m-fg); text-decoration: underline; text-underline-offset: 4px; }
+    .ka-key { display: flex; flex-wrap: wrap; gap: 12px; font-size: var(--s-xs); color: var(--m-muted); margin-top: 2px; }
+    .ka-key i { display: inline-block; width: 9px; height: 9px; margin-right: 5px; vertical-align: -1px; opacity: .8; }
+
+    .tip { position: fixed; left: 0; top: 0; z-index: 100; max-width: 280px; padding: 8px 10px; background: var(--m-raised, var(--m-surface)); color: var(--m-fg); font-size: var(--s-xs); line-height: 1.5; pointer-events: none; opacity: 0; transition: opacity .15s; box-shadow: 0 0 0 0.5px var(--m-border) !important; }
+    .tip b { font-weight: 600; }
+    .tip-role { color: var(--m-orange); }
+    .tip-dim { color: var(--m-muted); }
+    :root:not([data-theme="dark"]) .tip { background: #fff; }
+    @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .tip { background: #1e1813; } }
+    :root[data-theme="dark"] .tip { background: #1e1813; }
+    .gp-node, .ka-k { cursor: help; }
+
+    /* breathing room between sections */
+    body > section:not(:first-of-type) { padding-top: clamp(5rem, 11vw, 9rem) !important; padding-bottom: clamp(5rem, 11vw, 9rem) !important; }
+    body > section:nth-of-type(2) { padding-top: 2rem !important; }
+    .fig { margin-bottom: clamp(5rem, 9vw, 7.5rem) !important; }
+    .lead { margin-bottom: 3.25rem !important; }
+    h2 { margin-bottom: 1rem !important; }
+
+    /* offscreen: pause CSS animation too */
+    .offscreen, .offscreen * { animation-play-state: paused !important; }
+
+    /* agent prompt */
+    .agent { margin-top: 1.5rem; background: var(--m-surface); }
+    .agent-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 10px 14px; font-size: var(--s-sm); color: var(--m-muted); }
+    .agent-head button { color: var(--m-orange-700); font-size: var(--s-sm); cursor: pointer; }
+    .agent-head button:hover { color: var(--m-orange); }
+    .agent-body { font-size: 12px !important; line-height: 1.6; color: var(--m-fg); padding: 0 14px 12px; white-space: pre-wrap; max-height: 5.2em; overflow: hidden; position: relative; -webkit-mask-image: linear-gradient(#000 55%, transparent); mask-image: linear-gradient(#000 55%, transparent); cursor: pointer; transition: max-height .3s; }
+    .agent.open .agent-body { max-height: 40em; -webkit-mask-image: none; mask-image: none; }
+
+    .ob-btn { font-size: var(--s-sm); color: var(--m-orange-700); cursor: pointer; }
+    .ob-btn:hover { color: var(--m-orange); }
+    .ob-primary { background: var(--m-orange) !important; color: #000 !important; padding: 4px 10px; }
+    .ob-btn:disabled { opacity: .4; cursor: default; }
+
+    /* go deeper hover: only the text half moves */
+    .deeper-art { margin-bottom: 0 !important; }
+    .deeper-text { padding: 14px 16px 16px; transition: background .25s ease; }
+    a.deeper:hover .deeper-text { background: var(--m-surface); }
+    .deeper-link { display: inline-block; transition: transform .25s ease, color .25s ease; }
+    a.deeper:hover .deeper-link { transform: translateX(4px); color: var(--dc) !important; }
+    .deeper-title { transition: color .25s ease; }
+
+    /* how tang works: hanging section numerals, paper-style rhythm */
+    .mech { margin-top: 4rem !important; }
+    .mech-h { position: relative; font-size: var(--s-lg) !important; font-weight: 600; letter-spacing: -0.01em; margin-bottom: 1rem !important; }
+    .mech-n { font-weight: 500; color: var(--m-orange); }
+    @media (min-width: 900px) { .mech-n { position: absolute; right: calc(100% + 1.1rem); top: 0; } }
+    .mech p { font-size: var(--s-body); color: var(--m-fg); }
+    .mech p + .eq, .eq + p { margin-top: 0; }
+
+    /* how tang works: interactive figures */
+    .mech-fig { background: var(--m-surface); padding: 18px 18px 6px; }
+    .mech-fig .fig-cap { margin-top: 14px; }
+    .mech-fig svg { background: none !important; padding: 0 !important; }
+    .mech-fig .gpanel { margin: 0; padding: 0; background: none; }
+    .md-ctl { display: flex; align-items: center; gap: 12px; font-size: var(--s-sm); color: var(--m-muted); margin-bottom: 14px; }
+    .md-ctl input { flex: 1; accent-color: var(--m-orange); }
+    .md-num { font-variant-numeric: tabular-nums; color: var(--m-fg); width: 4em; text-align: right; }
+    .md-grid { display: grid; grid-template-columns: 120px 1fr 1fr; gap: 10px 18px; align-items: center; }
+    .md-h { font-size: var(--s-xs); color: var(--m-muted); }
+    .md-l { color: var(--m-fg); }
+    .md-c { position: relative; height: 26px; }
+    .md-c::before { content: ""; position: absolute; left: 50%; top: 2px; bottom: 2px; width: 1px; background: var(--m-border); }
+    .md-c i { position: absolute; top: 6px; height: 14px; transition: left .08s, width .08s; }
+    .md-c[data-p="v"] i { background: var(--m-orange); } .md-c[data-p="e"] i { background: var(--m-cyan); }
+    .md-c b { position: absolute; right: 0; top: 4px; font-weight: 400; font-size: var(--s-sm); font-variant-numeric: tabular-nums; color: var(--m-fg); }
+    .ml-tabs { display: flex; gap: 16px; font-size: var(--s-sm); margin: 14px 0 8px; }
+    .ml-tabs button { color: var(--m-muted); cursor: pointer; } .ml-tabs button.on { color: var(--m-fg); text-decoration: underline; text-underline-offset: 4px; }
+    #ml-code { background: var(--m-bg) !important; max-height: 360px; }
+    #ml-code .ln { display: block; padding: 0 6px; margin: 0 -6px; transition: background .15s; }
+    #ml-code .ln.hit { background: color-mix(in oklab, var(--m-orange) 18%, transparent); }
+    .gp-node.hit rect { stroke: var(--m-orange) !important; stroke-width: 2 !important; }
+
+    /* footer */
+    .site-foot { text-align: center; padding: clamp(5rem, 11vw, 9rem) 1rem 4rem; color: var(--m-muted); font-size: var(--s-sm); }
+    .foot-logo { display: inline-block; border-bottom: 0 !important; color: var(--m-orange) !important; margin-bottom: 1.25rem; transition: opacity .2s; }
+    .foot-logo svg { width: 96px; height: auto; display: block; }
+    .foot-logo:hover { opacity: .8; }
+    .site-foot p { margin: 0 auto .6rem; max-width: 52ch; }
+    .foot-links { display: flex; justify-content: center; gap: .6rem; }
+
+    /* links, as in master-plan.typ: text color, hairline underline; orange only on hover */
+    a, a:visited { color: var(--m-fg) !important; border-bottom: 0 !important; text-decoration: underline !important; text-decoration-color: var(--m-border) !important; text-decoration-thickness: 1px !important; text-underline-offset: 3px; transition: text-decoration-color .15s, color .15s; }
+    a:hover { color: var(--m-fg) !important; text-decoration-color: var(--m-orange) !important; }
+    a.deeper, a.proof-item, a.foot-logo, a:has(> .text-2xl), a.group, .gp-head a { text-decoration: none !important; }
+    .deeper-link, .agent-head button, .ob-btn:not(.ob-primary) { color: var(--m-fg) !important; }
+    a.deeper:hover .deeper-link { color: var(--dc) !important; }
+    .agent-head button:hover, .ob-btn:not(.ob-primary):hover { color: var(--m-orange) !important; }
+    .foot-logo { color: var(--m-orange) !important; }
+
+    /* links: master-plan info cyan (#00f0ff), darkened for light backgrounds */
+    :root { --m-link: color-mix(in oklab, #00f0ff 55%, #000); }
+    @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --m-link: #00f0ff; } }
+    :root[data-theme="dark"] { --m-link: #00f0ff; }
+    a, a:visited, a:hover { color: var(--m-link) !important; text-decoration-color: color-mix(in oklab, var(--m-link) 35%, transparent) !important; }
+    a:hover { text-decoration-color: var(--m-link) !important; }
+    a.deeper, a.proof-item, a:has(> .text-2xl), a.group { color: var(--m-fg) !important; }
+    .deeper-link { color: var(--m-link) !important; }
+    .foot-logo, .foot-logo:hover { color: var(--m-orange) !important; }
+
+    /* links: no underline; hover fills with cyan, black text (master-plan "flame" box) */
+    a, a:visited, a:hover { text-decoration: none !important; }
+    a:not(.deeper):not(.proof-item):not(.foot-logo):not(.group):not(:has(> .text-2xl)) { padding: 0 2px; margin: 0 -2px; transition: background .12s, color .12s; }
+    a:not(.deeper):not(.proof-item):not(.foot-logo):not(.group):not(:has(> .text-2xl)):hover { background: var(--m-link) !important; color: #000 !important; }
+
+    /* hero */
+    .hero { margin-bottom: 3.5rem; }
+    .hero-brand { display: flex; align-items: center; gap: 18px; margin-bottom: 2rem; }
+    .hero-mascot { width: 72px; height: 72px; }
+    .hero h1 { font-size: 72px !important; line-height: 1 !important; letter-spacing: -0.035em !important; font-weight: 600 !important; }
+    .hero-claim { font-size: var(--s-xl); font-weight: 600; line-height: 1.25; letter-spacing: -0.01em; margin-bottom: 1.1rem; }
+    .hero-claim .hero-sub { font-weight: 500; }
+    .hero .flame-rule { margin-bottom: 1.1rem; }
+    .hero-note { color: var(--m-muted); font-size: var(--s-body); margin-bottom: 2rem; }
+    .hero-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 1rem; }
+    .hero-cmd, a.hero-btn { display: inline-flex; align-items: center; gap: 10px; height: 40px; padding: 0 14px !important; margin: 0 !important; background: var(--m-surface) !important; color: var(--m-fg) !important; font-size: var(--s-sm); cursor: pointer; transition: background .15s, color .15s; }
+    .hero-cmd code { font-family: "IBM Plex Mono", monospace !important; font-size: 13px; }
+    .hero-dollar { color: var(--m-muted); font-family: "IBM Plex Mono", monospace !important; }
+    .hero-hint { color: var(--m-muted); font-size: var(--s-xs); margin-left: 6px; }
+    .hero-cmd:hover .hero-hint { color: var(--m-link); }
+    a.hero-btn:hover { background: var(--m-link) !important; color: #000 !important; }
+    .hero-pills { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 2rem; }
+    .agent { background: var(--m-surface); margin: 0 !important; padding: 16px 18px; }
+    .agent-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; padding: 0 !important; margin-bottom: 12px; }
+    .agent-title { color: var(--m-fg); font-weight: 600; font-size: var(--s-sm); }
+    .agent-sub { color: var(--m-muted); font-size: var(--s-xs); }
+    .agent-head button { background: var(--m-bg) !important; color: var(--m-fg) !important; padding: 6px 12px; font-size: var(--s-xs); }
+    .agent-head button:hover { background: var(--m-link) !important; color: #000 !important; }
+    .agent-body { font-family: "IBM Plex Sans", sans-serif !important; font-size: var(--s-sm) !important; line-height: 1.6; color: var(--m-fg); white-space: pre-wrap; padding: 0 !important; max-height: none !important; -webkit-mask-image: none !important; mask-image: none !important; cursor: auto !important; }
+    .agent-first { margin: 0; }
+    .agent-rest { color: var(--m-muted); margin-top: .8rem; display: none; }
+    .agent.open .agent-rest { display: block; }
+    .agent-more { margin-top: 10px; font-size: var(--s-xs); color: var(--m-link); cursor: pointer; }
+    .fig-cap-hero { margin-bottom: 0; }
+    section:first-of-type { padding-bottom: clamp(4rem, 8vw, 7rem) !important; }
+
+    .hero-agent { border: 0; }
+    .hero-agent[aria-expanded="true"] { background: var(--m-link) !important; color: #000 !important; }
+    button.hero-btn { display: inline-flex; align-items: center; height: 40px; padding: 0 14px; background: var(--m-surface) !important; color: var(--m-fg) !important; font-size: var(--s-sm); cursor: pointer; }
+    button.hero-btn:hover { background: var(--m-link) !important; color: #000 !important; }
+    #agent-panel { margin: 0 0 1rem !important; }
+    #agent-panel[hidden] { display: none; }
+    .hero .agent { margin-bottom: 1rem !important; }
+
+    /* code: one palette everywhere, generous indentation */
+    pre { tab-size: 4; }
+    pre, pre code { color: var(--m-fg); line-height: 1.7 !important; }
+    .tv { color: var(--m-fg); }
+    #kd-out, #ml-code, #build-code { font-size: 12.5px !important; }
   </style>
 </head>
 <body class="antialiased">
+  <button id="theme-toggle" aria-label="Toggle dark mode" onclick="(() => {
+    const r = document.documentElement;
+    const dark = r.dataset.theme ? r.dataset.theme === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+    r.dataset.theme = dark ? 'light' : 'dark';
+    try { localStorage.setItem('theme', r.dataset.theme); } catch (e) {}
+  })()"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 0 0 18z" fill="currentColor"/></svg></button>
+
+  <script type="module" src="./boot.js?v=code"></script>
 
   <!-- ═══════════════════════════════════════════════ -->
   <!-- // hero                                        -->
   <!-- ═══════════════════════════════════════════════ -->
-  <section class="min-h-[70vh] sm:min-h-[90vh] flex flex-col justify-center px-4 sm:px-6">
+  <section class="pt-24 sm:pt-32 px-4 sm:px-6">
     <div class="max-w-3xl mx-auto w-full">
-      <div class="mb-8 sm:mb-12">
-        <div class="flex items-center gap-4 sm:gap-5 mb-4">
-          <img src="tang-mascot.svg" alt="tang mascot" class="w-16 h-16 sm:w-24 sm:h-24 drop-shadow-lg" />
-          <h1 class="text-5xl sm:text-8xl font-bold tracking-tight font-mono">
-            tang<span class="text-accent">.</span>
-          </h1>
+      <header class="hero">
+        <div class="hero-brand">
+          <img src="tang-mascot.svg" alt="" class="hero-mascot" />
+          <h1>tang<span class="text-accent">.</span></h1>
         </div>
-        <p class="text-xl sm:text-2xl text-muted mb-6">differentiable computing in Rust.</p>
+        <p class="hero-claim">Write math in Rust.<br><span class="hero-sub">Compile it to derivatives and GPU kernels.</span></p>
+        <div class="flame-rule"></div>
+        <p class="hero-note">From one scalar to an 8B-parameter LLM, on every chip.</p>
+        <div class="hero-actions">
+          <button class="hero-cmd" id="cargo-copy" title="Copy"><span class="hero-dollar">$</span><code>cargo add tang</code><span class="hero-hint" id="cargo-hint">Copy</span></button>
+          <a class="hero-btn" href="https://github.com/ecto/tang">GitHub →</a>
+          <a class="hero-btn" href="https://www.youtube.com/watch?v=M3ujv8xdK2w">Quick mafs →</a>
+          <button class="hero-btn hero-agent" id="agent-toggle" aria-expanded="false" aria-controls="agent-panel">Using an agent?</button>
+        </div>
+        <div class="agent" id="agent-panel" hidden>
+          <div class="agent-head">
+            <div><div class="agent-title">Using an agent?</div><div class="agent-sub">Paste this prompt into Claude Code, Codex or Cursor.</div></div>
+            <button id="agent-copy">Copy prompt</button>
+          </div>
+          <div id="agent-prompt" class="agent-body"><p class="agent-first">Add tang (https://github.com/ecto/tang) to this Rust project where it helps.</p><div class="agent-rest">What tang is: a differentiable computing library. Math written generic over `S: tang::Scalar` runs with `f64` for values or `tang::Dual&lt;f64&gt;` for exact derivatives. `tang-expr` traces the same code into a graph you can differentiate (`diff`, reverse mode with `vjp`) and compile to CUDA, Metal, WGSL or C. `tang-la` has dense linear algebra, `tang-optim` has Adam, L-BFGS and Levenberg–Marquardt, and `tang-train` has layers and a Trainer.
 
-        <div class="flex flex-wrap items-center gap-3 sm:gap-4">
-          <button onclick="navigator.clipboard.writeText('cargo add tang')" class="copy-btn flex items-center gap-2 bg-surface rounded-xl glow px-4 py-2.5 sm:px-5 sm:py-3 font-mono text-sm hover:bg-accent/10 transition-all">
-            <span class="text-muted">$</span>
-            <span>cargo add tang</span>
-            <svg class="w-4 h-4 text-muted ml-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
-          </button>
-          <a href="https://github.com/ecto/tang" class="flex items-center gap-2 bg-surface rounded-xl glow px-4 py-2.5 sm:px-5 sm:py-3 text-sm hover:bg-accent/10 transition-all">
-            GitHub
-            <span class="text-muted">→</span>
-          </a>
-          <a href="https://www.youtube.com/watch?v=M3ujv8xdK2w" class="flex items-center gap-2 bg-surface rounded-xl glow px-4 py-2.5 sm:px-5 sm:py-3 text-sm hover:bg-accent/10 transition-all">
-            quick mafs
-            <span class="text-muted">→</span>
-          </a>
-          <div class="flex gap-2 ml-1">
-            <span class="bg-green-500/10 text-green-400 text-xs font-mono px-2 py-1 rounded">no_std</span>
-            <span class="bg-purple-500/10 text-purple-400 text-xs font-mono px-2 py-1 rounded">WASM</span>
-            <span class="bg-accent/10 text-accent text-xs font-mono px-2 py-1 rounded">GPU</span>
-          </div>
+How to proceed:
+1. Read the tang README and the examples in the crates you plan to use.
+2. Find places in this codebase where exact derivatives, optimization, linear algebra or GPU kernels would replace hand-written or numerical code.
+3. Propose one small, self-contained change and explain the benefit.
+4. After I approve, run `cargo add tang` (plus `tang-la`, `tang-expr`, `tang-optim` or `tang-train` as needed), make the change, and run the tests.</div></div>
+          <button id="agent-more" class="agent-more">Show the full prompt</button>
         </div>
-      </div>
 
-      <!-- Dual number visualization -->
-      <div class="relative">
-        <div class="overflow-hidden">
-          <div class="flex items-center gap-2 px-4 py-2.5 border-b border-white/5">
-            <span class="font-mono text-xs text-muted">Dual&lt;f64&gt;</span>
-            <span class="text-xs text-muted/60 ml-auto">f(x) = x &middot; sin(x)</span>
-          </div>
-          <div id="dual-viz" class="w-full h-[240px] sm:h-[320px]" style="background: #18181b;"></div>
-          <div id="dual-readout" class="flex gap-6 px-4 py-3 border-t border-white/5 font-mono text-xs">
-            <div><span class="text-muted">x =</span> <span id="ro-x" class="text-txt">0.00</span></div>
-            <div><span class="text-muted">val =</span> <span id="ro-val" class="text-accent">0.00</span></div>
-            <div><span class="text-muted">dual =</span> <span id="ro-dual" class="text-[#A6E22E]">0.00</span></div>
-          </div>
+        <div class="hero-pills">
+          <span class="pill" style="--pill:#39ff14">no_std</span>
+          <span class="pill" style="--pill:#00f0ff">WASM</span>
+          <span data-backends="badges" class="contents"></span>
         </div>
-        <p class="text-muted text-xs mt-3 leading-relaxed">Evaluating <code class="font-mono text-accent">f(x) = x&middot;sin(x)</code> with <code class="font-mono text-accent">Dual&lt;f64&gt;</code> computes the <span class="text-txt">value</span> and <span class="text-[#A6E22E]">exact derivative</span> in a single pass — no finite differences, no symbolic engine. The green tangent line is the <code class="font-mono text-accent">dual</code> field: the slope, computed exactly for free.</p>
-      </div>
+      </header>
+
+
     </div>
   </section>
 
   <!-- ═══════════════════════════════════════════════ -->
-  <!-- // quantum-poet                                -->
+  <!-- // proof                                       -->
+  <!-- ═══════════════════════════════════════════════ -->
+  <section class="px-4 sm:px-6 pb-8 sm:pb-12">
+    <div class="max-w-3xl mx-auto">
+      <div class="proof">
+        <a class="proof-item" href="https://github.com/ecto/tang/blob/main/BENCHMARKS.md">
+          <div class="proof-val">3.5×<sup>*</sup></div>
+          <div class="proof-label">Faster than PyTorch on a transformer block train step</div>
+          <div class="proof-viz">
+            <div class="pv-row"><span>tang</span><i style="--w:28%;--c:var(--m-orange)"></i><em>0.38&nbsp;ms</em></div>
+            <div class="pv-row"><span>PyTorch</span><i style="--w:100%;--c:var(--m-muted)"></i><em>1.33&nbsp;ms</em></div>
+          </div>
+        </a>
+        <a class="proof-item" href="https://github.com/ecto/tang/blob/main/BENCHMARKS.md">
+          <div class="proof-val">122<small>&nbsp;tok/s</small></div>
+          <div class="proof-label">Qwen3-8B 4-bit decode on an RTX&nbsp;3090</div>
+          <div class="proof-viz">
+            <div class="pv-gauge"><i style="--w:55%"></i><b style="left:100%"></b></div>
+            <div class="pv-scale"><span>0</span><span>55% of speed of light</span><span>220</span></div>
+          </div>
+        </a>
+        <a class="proof-item" href="https://github.com/ecto/tang/blob/main/docs/tensor-ir.md">
+          <div class="proof-val" data-backends="count">6</div>
+          <div class="proof-label">Backends lowered from one IR</div>
+          <div class="proof-viz"><div data-backends="dots" class="pv-dots"></div></div>
+        </a>
+      </div>
+      <p class="text-muted/70 text-[11px] mt-2 font-mono">* Forward + backward, seq&nbsp;128, half-precision tiles vs. PyTorch bf16 autocast (0.376 vs. 1.329&nbsp;ms), RTX 3090. Full 4-layer step: 5.05&nbsp;ms vs. PyTorch 4.40.</p>
+    </div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════ -->
+  <!-- // how-it-works                                -->
+  <!-- ═══════════════════════════════════════════════ -->
+  <section class="px-4 sm:px-6 py-16 sm:py-24">
+    <div class="max-w-5xl mx-auto">
+      <h2 class="text-3xl sm:text-4xl font-semibold mb-10 text-center">How it works</h2>
+      <div class="grid grid-cols-1 md:grid-cols-[1fr_auto_1fr_auto_1fr] items-stretch gap-3">
+        <div class="border border-white/10 rounded-xl overflow-hidden flex flex-col">
+          <div class="px-4 py-2.5 border-b border-white/10 font-mono text-xs">Trace</div>
+          <div class="p-4 flex-1 flex items-center" style="background: rgb(var(--c-code-bg))">
+<pre class="font-mono text-xs leading-relaxed"><span class="kw">fn</span> <span class="fn">f</span>&lt;<span class="ty">S</span>: <span class="ty">Scalar</span>&gt;(
+    x: <span class="ty">S</span>,
+) -&gt; <span class="ty">S</span> {
+    x * x.<span class="fn">sin</span>()
+}</pre>
+          </div>
+          <div class="px-4 py-2 text-xs text-muted border-t border-white/10">Plain Rust, generic over the number type</div>
+        </div>
+        <div class="flow-arrow"></div>
+        <div class="border border-white/10 rounded-xl overflow-hidden flex flex-col">
+          <div class="px-4 py-2.5 border-b border-white/10 font-mono text-xs">Transform</div>
+          <div class="p-2 flex-1 flex items-center justify-center" style="background: rgb(var(--c-code-bg))">
+            <svg viewBox="10 0 210 150" class="w-full max-w-[260px]" font-family="ui-monospace,monospace" font-size="10">
+              <g stroke="rgb(var(--c-muted))" stroke-width="1.2" fill="none">
+                <path d="M40 125 L40 85"/><path d="M40 125 Q80 110 95 85"/><path d="M40 85 L70 45"/><path d="M95 85 L70 45"/>
+                <path class="grad-edge" d="M95 85 Q130 100 145 85"/><path class="grad-edge" d="M40 125 Q140 135 195 85"/><path class="grad-edge" d="M145 85 L170 45"/><path class="grad-edge" d="M195 85 L170 45"/>
+              </g>
+              <g text-anchor="middle" dominant-baseline="central">
+                <circle cx="40" cy="125" r="13" fill="#ffffff" stroke="#ff6600"/><text x="40" y="125" fill="#ff6600">x</text>
+                <circle cx="95" cy="85" r="13" fill="#ffffff" stroke="rgb(var(--c-muted))"/><text x="95" y="85" fill="#1c1917">sin</text>
+                <circle cx="40" cy="85" r="0"/>
+                <circle cx="70" cy="45" r="13" fill="#ffffff" stroke="#ff6600"/><text x="70" y="45" fill="#ff6600">×</text>
+                <g class="grad-node"><circle cx="145" cy="85" r="13" fill="#ffffff" stroke="#0891b2"/><text x="145" y="85" fill="#0891b2" font-size="8">x·cos</text></g>
+                <g class="grad-node"><circle cx="195" cy="85" r="13" fill="#ffffff" stroke="#0891b2"/><text x="195" y="85" fill="#0891b2">sin</text></g>
+                <g class="grad-node"><circle cx="170" cy="45" r="13" fill="#ffffff" stroke="#0891b2"/><text x="170" y="45" fill="#0891b2">+</text></g>
+                <text x="70" y="18" fill="#ff6600" font-size="9">f(x)</text>
+                <text x="170" y="18" fill="#0891b2" font-size="9">f′(x)</text>
+              </g>
+            </svg>
+          </div>
+          <div class="px-4 py-2 text-xs text-muted border-t border-white/10">A graph you can differentiate, fuse and tile</div>
+        </div>
+        <div class="flow-arrow"></div>
+        <div class="border border-white/10 rounded-xl overflow-hidden flex flex-col">
+          <div class="px-4 py-2.5 border-b border-white/10 font-mono text-xs">Lower</div>
+          <div data-backends="chips" class="p-4 flex-1 grid grid-cols-2 gap-2 content-center font-mono text-xs" style="background: rgb(var(--c-code-bg))"></div>
+          <div class="px-4 py-2 text-xs text-muted border-t border-white/10">Native code for whatever chip you have</div>
+        </div>
+      </div>
+      <p class="fig-cap"><span class="fig-n"></span><span class="fig-lead">One pipeline.</span> Rust traces to a graph; the graph is differentiated, fused and tiled; the result lowers to native code for each backend.</p>
+
+      <div style="margin-top:4.5rem"></div>
+      <div class="border border-accent/30 rounded-xl overflow-hidden shadow-2xl shadow-amber-500/5">
+        <div class="flex items-center gap-3 px-4 py-3 border-b border-white/10">
+          <span class="font-mono text-sm text-muted">f(x, y, z) =</span>
+          <input id="kd-input" value="x * sin(x)" spellcheck="false" autocomplete="off" class="flex-1 min-w-0 bg-transparent font-mono text-sm text-txt focus:outline-none">
+        </div>
+        <div class="flex flex-wrap items-center gap-2 px-4 py-2 border-b border-white/10 font-mono text-xs">
+          <button data-kd-example="x * sin(x)" class="px-2 py-1 rounded bg-surface text-muted hover:text-accent cursor-pointer">x * sin(x)</button>
+          <button data-kd-example="sqrt(x^2 + y^2)" class="px-2 py-1 rounded bg-surface text-muted hover:text-accent cursor-pointer">sqrt(x^2 + y^2)</button>
+          <button data-kd-example="tanh(x*y + z)" class="px-2 py-1 rounded bg-surface text-muted hover:text-accent cursor-pointer">tanh(x*y + z)</button>
+          <button data-kd-example="exp(-x^2) / (1 + y^2)" class="px-2 py-1 rounded bg-surface text-muted hover:text-accent cursor-pointer">exp(-x^2) / (1 + y^2)</button>
+        </div>
+        <div class="flex items-center gap-4 px-4 py-2 border-b border-white/10 font-mono text-xs">
+          <button data-kd-dialect="wgsl" class="text-muted hover:text-txt cursor-pointer">WGSL</button>
+          <button data-kd-dialect="cuda" class="text-muted hover:text-txt cursor-pointer">CUDA</button>
+          <button data-kd-dialect="msl" class="text-muted hover:text-txt cursor-pointer">Metal</button>
+          <button data-kd-dialect="c" class="text-muted hover:text-txt cursor-pointer">C</button>
+          <label class="ml-auto flex items-center gap-2 text-muted cursor-pointer"><input id="kd-grad" type="checkbox" checked class="accent-amber-500"> + Gradient</label>
+        </div>
+        <div class="px-4 py-3 overflow-auto max-h-[300px]" style="background:#1a1a2e">
+          <pre id="kd-out" class="font-mono text-xs leading-relaxed">loading…</pre>
+        </div>
+      </div>
+      <div class="gpanel" data-graph="kernel"></div>
+      <p class="fig-cap fig-cap-hero"><span class="fig-n"></span><span class="fig-lead">Try it.</span> The whole pipeline, compiled to WASM and running in this tab. Edit the expression; the kernel and its gradient regenerate as you type.</p>
+
+
+    </div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════ -->
+  <!-- // scales                                      -->
   <!-- ═══════════════════════════════════════════════ -->
   <section class="px-4 sm:px-6 py-16 sm:py-24">
     <div class="max-w-3xl mx-auto">
+      <h2 class="text-3xl sm:text-4xl font-semibold mb-3">Same idea, every scale</h2>
+      <p class="lead">The same three steps run from a single dual number to an eight-billion-parameter model. Nothing below uses a separate code path.</p>
+      <figure class="fig">
+        <h3 class="fig-title">A scalar</h3>
+      <!-- Dual number visualization -->
+      <div class="relative">
+        <div class="overflow-hidden border border-white/10 rounded-xl">
+          <div class="flex items-center gap-2 px-4 py-2.5 border-b border-white/5">
+            <span class="font-mono text-xs text-muted">Dual&lt;f64&gt;</span>
+            <span class="text-xs text-muted/60 ml-auto">f(x) = x &middot; sin(x)</span>
+          </div>
+          <div id="dual-viz" class="w-full h-[240px] sm:h-[320px]" style="background: #ffffff;"></div>
+          <div id="dual-readout" class="flex gap-6 px-4 py-3 border-t border-white/5 font-mono text-xs">
+            <div><span class="text-muted">x =</span> <span id="ro-x" class="text-txt">0.00</span></div>
+            <div><span class="text-muted">val =</span> <span id="ro-val" class="text-accent">0.00</span></div>
+            <div><span class="text-muted">dual =</span> <span id="ro-dual" class="text-[#0891b2]">0.00</span></div>
+          </div>
+        </div>
+      </div>
+
+              <div class="gpanel" data-graph="dual"></div>
+        <p class="fig-cap"><span class="fig-n"></span><span class="fig-lead">A scalar.</span> Dual&lt;f64&gt;: value and exact slope in one pass.</p>
+      </figure>
+
+      <figure class="fig">
+        <h3 class="fig-title">A robot arm</h3>
+        <div class="border border-white/10 rounded-xl overflow-hidden">
+          <svg id="arm-viz" viewBox="0 0 800 420" class="w-full h-auto block" style="background: var(--m-bg); cursor: crosshair; touch-action: none"></svg>
+          <div class="grid grid-cols-3 gap-2 px-4 py-3 text-xs">
+            <div><div class="text-muted">Mode / score</div><div id="arm-score" class="text-sm" style="color: var(--m-orange)">–</div></div>
+            <div><div class="text-muted">Shoulder / elbow</div><div id="arm-q1" class="text-sm">–</div></div>
+            <div><div class="text-muted">Hand error</div><div id="arm-err" class="text-sm">–</div></div>
+          </div>
+        </div>
+        <div class="gpanel" data-graph="arm"></div>
+        <p class="fig-cap"><span class="fig-n"></span><span class="fig-lead">Catch.</span> Move the pointer over the panel to steer the hand of rose, our humanoid: a 227&nbsp;mm upper arm and 236&nbsp;mm forearm with joint limits. You choose where the hand goes; tang solves the joint angles every frame by damped least squares, with the Jacobian from two dual passes through the forward kinematics. Left alone, it runs a pick-and-place loop.</p>
+      </figure>
+
+      <figure class="fig">
+        <h3 class="fig-title">An orbit</h3>
+        <div class="border border-white/10 rounded-xl overflow-hidden">
+          <svg id="orbit-viz" viewBox="0 0 800 420" class="w-full h-auto block" style="background: var(--m-bg); cursor: crosshair; touch-action: none"></svg>
+          <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 px-4 py-3 text-xs items-end">
+            <div><div class="text-muted">Status</div><div id="ob-shots" class="text-sm">–</div></div>
+            <div><div class="text-muted">Your best miss</div><div id="ob-you" class="text-sm" style="color: var(--m-amber)">–</div></div>
+            <div><div class="text-muted">tang's miss</div><div id="ob-tang" class="text-sm" style="color: var(--m-cyan)">–</div></div>
+            <div class="flex gap-3 justify-end"><button id="ob-solve" class="ob-btn ob-primary">Let tang try</button><button id="ob-new" class="ob-btn">New target</button></div>
+          </div>
+        </div>
+        <div class="gpanel" data-graph="orbit"></div>
+        <p class="fig-cap"><span class="fig-n"></span><span class="fig-lead">Beat the optimizer.</span> Drag from the launch pad to fling a probe at the target: three shots, gravity does the rest. Then let tang try. It differentiates the miss distance through 1,600 leapfrog steps of the same gravity code with <code>Dual&lt;f64&gt;</code> and walks speed and heading downhill.</p>
+      </figure>
+
+      <figure class="fig">
+        <h3 class="fig-title">A model</h3>
+
       <div class="relative">
       <!-- mascot peek -->
       <div id="poet-mascot" class="absolute -right-2 sm:right-4 -bottom-6 flex items-end gap-2 opacity-0 translate-y-8 pointer-events-none" style="transition: opacity 0.6s ease, transform 0.6s ease; z-index: 10;">
-        <div class="bg-surface border border-white/10 rounded-xl px-3 py-2 text-xs font-mono text-muted max-w-[200px] leading-relaxed shadow-lg mb-4">this is actually Rust code running in your browser!</div>
+        <div class="bg-surface border border-white/10 rounded-xl px-3 py-2 text-xs font-mono text-muted max-w-[200px] leading-relaxed shadow-lg mb-4">This is actually Rust code running in your browser!</div>
         <img src="tang-mascot.svg" alt="" class="w-12 h-12 sm:w-16 sm:h-16 drop-shadow-lg" style="animation: mascot-bob 2s ease-in-out infinite;" />
       </div>
       <div class="border border-white/10 rounded-xl overflow-hidden">
@@ -176,9 +783,12 @@
     <span class="ty">Box</span>::<span class="fn">new</span>(<span class="ty">Linear</span>::<span class="fn">new</span>(<span class="num">64</span>, <span class="num">30</span>, <span class="num">256</span>)),
 ]);
 
-<span class="cm">// train</span>
-<span class="kw">let</span> losses = <span class="ty">Trainer</span>::<span class="fn">new</span>(&amp;<span class="kw">mut</span> model, <span class="ty">ModuleAdam</span>::<span class="fn">new</span>(<span class="num">0.005</span>))
-    .<span class="fn">loss_fn</span>(|p, t| (<span class="fn">cross_entropy_loss</span>(p, t), <span class="fn">cross_entropy_loss_grad</span>(p, t)))
+<span class="cm">// train: Trainer takes the model, an optimizer and a loss</span>
+<span class="kw">fn</span> <span class="fn">loss</span>(p: &amp;<span class="ty">Tensor</span>&lt;<span class="ty">f64</span>&gt;, t: &amp;<span class="ty">Tensor</span>&lt;<span class="ty">f64</span>&gt;) -&gt; (<span class="ty">f64</span>, <span class="ty">Tensor</span>&lt;<span class="ty">f64</span>&gt;) {
+    (<span class="fn">cross_entropy_loss</span>(p, t), <span class="fn">cross_entropy_loss_grad</span>(p, t))
+}
+
+<span class="kw">let</span> losses = <span class="ty">Trainer</span>::<span class="fn">new</span>(&amp;<span class="kw">mut</span> model, <span class="ty">ModuleAdam</span>::<span class="fn">new</span>(<span class="num">0.005</span>), loss)
     .<span class="fn">epochs</span>(<span class="num">200</span>)
     .<span class="fn">fit</span>(&amp;<span class="kw">mut</span> loader);</pre>
         </div>
@@ -186,7 +796,7 @@
         <!-- terminal -->
         <div class="px-4 py-3" style="background: #1a1a2e">
           <div id="poet-terminal" class="font-mono text-xs leading-relaxed text-green-400">
-            <span class="text-muted">click Train to start...</span>
+            <span class="text-muted">Click Train to start…</span>
           </div>
           <div id="poet-progress-wrap" class="mt-3 hidden">
             <div class="flex items-center gap-3 mb-1.5">
@@ -197,7 +807,7 @@
               <div id="poet-progress-bar" class="bg-accent h-full transition-all duration-100" style="width: 0%"></div>
             </div>
             <svg id="poet-sparkline" class="mt-3 w-full" height="40" viewBox="0 0 200 40" preserveAspectRatio="none">
-              <polyline id="poet-sparkline-line" fill="none" stroke="#F59E0B" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" points=""/>
+              <polyline id="poet-sparkline-line" fill="none" stroke="#ff6600" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" points=""/>
             </svg>
           </div>
         </div>
@@ -218,199 +828,381 @@
         <!-- footer -->
         <div class="flex items-center gap-4 px-4 py-2.5 border-t border-white/10" style="background: rgb(var(--c-code-bg))">
           <a href="https://github.com/ecto/tang/blob/main/crates/tang-train/examples/quantum_poet.rs" class="text-accent hover:underline text-xs font-mono">quantum_poet.rs &rarr;</a>
-          <a href="https://github.com/ecto/tang/tree/main/crates/tang-train/examples" class="text-muted hover:text-accent text-xs font-mono ml-auto">more examples &rarr;</a>
+          <a href="https://github.com/ecto/tang/tree/main/crates/tang-train/examples" class="text-muted hover:text-accent text-xs font-mono ml-auto">More examples &rarr;</a>
         </div>
       </div>
       </div>
-    </div>
-  </section>
+    
+              <div class="gpanel" data-graph-module="poet"></div>
+        <p class="fig-cap"><span class="fig-n"></span><span class="fig-lead">A model.</span> Train a network in this tab, in Rust compiled to WASM.</p>
+      </figure>
 
-  <!-- ═══════════════════════════════════════════════ -->
-  <!-- // the-scalar-trick                            -->
-  <!-- ═══════════════════════════════════════════════ -->
-  <section class="px-4 sm:px-6 py-16 sm:py-24">
-    <div class="max-w-3xl mx-auto">
-      <h2 class="text-3xl sm:text-4xl font-bold mb-4">The Scalar trick<span class="text-accent">.</span></h2>
-      <p class="text-muted text-lg mb-12 max-w-2xl">Write your math once with <code class="text-accent font-mono text-base">S: Scalar</code>. Swap the type to change what it does.</p>
-
-      <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
-        <!-- Compute -->
-        <div class="border border-white/10 rounded-xl overflow-hidden">
-          <div class="flex items-center gap-2 px-4 py-2.5 border-b border-white/10">
-            <span class="w-2 h-2 rounded-full bg-green-500"></span>
-            <span class="font-mono text-sm font-semibold">Compute</span>
-          </div>
-          <div class="p-4 overflow-x-auto" style="background: rgb(var(--c-code-bg))">
-<pre class="font-mono text-xs leading-relaxed"><span class="kw">fn</span> <span class="fn">spring_energy</span>&lt;<span class="ty">S</span>: <span class="ty">Scalar</span>&gt;(
-    k: <span class="ty">S</span>, x: <span class="ty">S</span>
-) -&gt; <span class="ty">S</span> {
-    k * x * x * <span class="ty">S</span>::<span class="fn">from_f64</span>(<span class="num">0.5</span>)
-}
-
-<span class="fn">spring_energy</span>(<span class="num">10.0_f64</span>, <span class="num">0.3</span>)
-<span class="cm">// → 0.45</span></pre>
-          </div>
-        </div>
-
-        <!-- Differentiate -->
-        <div class="border border-white/10 rounded-xl overflow-hidden">
-          <div class="flex items-center gap-2 px-4 py-2.5 border-b border-white/10">
-            <span class="w-2 h-2 rounded-full bg-accent"></span>
-            <span class="font-mono text-sm font-semibold text-accent">Differentiate</span>
-          </div>
-          <div class="p-4 overflow-x-auto" style="background: rgb(var(--c-code-bg))">
-<pre class="font-mono text-xs leading-relaxed"><span class="cm">// same function, different type</span>
-<span class="kw">let</span> x = <span class="ty">Dual</span>::<span class="fn">var</span>(<span class="num">0.3</span>);
-
-<span class="fn">spring_energy</span>(<span class="num">10.0</span>.<span class="fn">into</span>(), x)
-<span class="cm">// → Dual {</span>
-<span class="cm">//     val:  0.45,  // energy</span>
-<span class="cm">//     dual: 3.0,   // ∂E/∂x = kx</span>
-<span class="cm">// }</span></pre>
-          </div>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- ═══════════════════════════════════════════════ -->
-  <!-- // the-stack                                   -->
-  <!-- ═══════════════════════════════════════════════ -->
-  <section class="px-4 sm:px-6 py-16 sm:py-24">
-    <div class="max-w-3xl mx-auto">
-      <h2 class="text-3xl sm:text-4xl font-bold mb-4">Crates<span class="text-accent">.</span></h2>
-      <p class="text-muted text-lg mb-12 max-w-2xl">Use only what you need.</p>
-
+      <figure class="fig">
+        <h3 class="fig-title">A transformer</h3>
       <div class="border border-white/10 rounded-xl overflow-hidden">
-        <a href="https://github.com/ecto/tang/tree/main/crates/tang-train" class="flex items-center justify-between px-4 py-3 border-b border-white/10 hover:bg-surface/50 transition-colors group">
-          <div class="flex items-center gap-3">
-            <span class="font-mono text-sm font-semibold text-accent">tang-train</span>
-            <span class="text-muted text-sm">Module trait, layers, loss functions, Trainer</span>
+        <div class="grid grid-cols-1 sm:grid-cols-3">
+          <div class="px-4 py-4 sm:border-r border-b sm:border-b-0 border-white/10">
+            <div class="font-mono text-2xl font-semibold text-accent">7.6×</div>
+            <div class="text-muted text-xs mt-1">Derived flash attention vs. the hand kernel, n&nbsp;=&nbsp;1024</div>
           </div>
-          <span class="text-xs text-muted font-mono opacity-0 group-hover:opacity-100 transition-opacity">→</span>
-        </a>
-        <a href="https://github.com/ecto/tang/tree/main/crates/tang-optim" class="flex items-center justify-between px-4 py-3 border-b border-white/10 hover:bg-surface/50 transition-colors group">
-          <div class="flex items-center gap-3">
-            <span class="font-mono text-sm font-semibold text-accent">tang-optim</span>
-            <span class="text-muted text-sm">SGD, Adam/AdamW, L-BFGS, Newton, Levenberg-Marquardt</span>
+          <div class="px-4 py-4 sm:border-r border-b sm:border-b-0 border-white/10">
+            <div class="font-mono text-2xl font-semibold text-accent">+18%</div>
+            <div class="text-muted text-xs mt-1">Whole transformer block, derived vs. hand-written, seq&nbsp;512</div>
           </div>
-          <span class="text-xs text-muted font-mono opacity-0 group-hover:opacity-100 transition-opacity">→</span>
-        </a>
-        <a href="https://github.com/ecto/tang/tree/main/crates/tang-tensor" class="flex items-center justify-between px-4 py-3 border-b border-white/10 hover:bg-surface/50 transition-colors group">
-          <div class="flex items-center gap-3">
-            <span class="font-mono text-sm font-semibold text-accent">tang-tensor</span>
-            <span class="text-muted text-sm">N-d arrays with broadcasting, slicing, matmul, reductions</span>
+          <div class="px-4 py-4">
+            <div class="font-mono text-2xl font-semibold text-accent">0</div>
+            <div class="text-muted text-xs mt-1">Lines of op-specific code in the compiler</div>
           </div>
-          <span class="text-xs text-muted font-mono opacity-0 group-hover:opacity-100 transition-opacity">→</span>
-        </a>
-        <a href="https://github.com/ecto/tang/tree/main/crates/tang-gpu" class="flex items-center justify-between px-4 py-3 border-b border-white/10 hover:bg-surface/50 transition-colors group">
-          <div class="flex items-center gap-3">
-            <span class="font-mono text-sm font-semibold text-accent">tang-gpu</span>
-            <span class="text-muted text-sm">GPU compute &amp; training via wgpu — fused kernels, matmul, backward</span>
-          </div>
-          <span class="text-xs text-muted font-mono opacity-0 group-hover:opacity-100 transition-opacity">→</span>
-        </a>
-        <a href="https://github.com/ecto/tang/tree/main/crates/tang-sparse" class="flex items-center justify-between px-4 py-3 border-b border-white/10 hover:bg-surface/50 transition-colors group">
-          <div class="flex items-center gap-3">
-            <span class="font-mono text-sm font-semibold text-accent">tang-sparse</span>
-            <span class="text-muted text-sm">Sparse matrices — CSR, CSC, COO, SpMV</span>
-          </div>
-          <span class="text-xs text-muted font-mono opacity-0 group-hover:opacity-100 transition-opacity">→</span>
-        </a>
-        <a href="https://github.com/ecto/tang/tree/main/crates/tang-ad" class="flex items-center justify-between px-4 py-3 border-b border-white/10 hover:bg-surface/50 transition-colors group">
-          <div class="flex items-center gap-3">
-            <span class="font-mono text-sm font-semibold text-accent">tang-ad</span>
-            <span class="text-muted text-sm">Reverse-mode autodiff — tape, grad, jacobian, hessian</span>
-          </div>
-          <span class="text-xs text-muted font-mono opacity-0 group-hover:opacity-100 transition-opacity">→</span>
-        </a>
-        <a href="https://github.com/ecto/tang/tree/main/crates/tang-la" class="flex items-center justify-between px-4 py-3 border-b border-white/10 hover:bg-surface/50 transition-colors group">
-          <div class="flex items-center gap-3">
-            <span class="font-mono text-sm font-semibold text-accent">tang-la</span>
-            <span class="text-muted text-sm">Dynamic linear algebra — DVec, DMat, LU, SVD, Cholesky, QR, Eigen</span>
-          </div>
-          <span class="text-xs text-muted font-mono opacity-0 group-hover:opacity-100 transition-opacity">→</span>
-        </a>
-        <a href="https://github.com/ecto/tang/tree/main/crates/tang" class="flex items-center justify-between px-4 py-3 hover:bg-surface/50 transition-colors group">
-          <div class="flex items-center gap-3">
-            <span class="font-mono text-sm font-semibold text-accent">tang</span>
-            <span class="text-muted text-sm">Vec2/3/4, Mat3/4, Quat, Transform, Dual&lt;S&gt;, spatial algebra</span>
-          </div>
-          <span class="text-xs text-muted font-mono opacity-0 group-hover:opacity-100 transition-opacity">→</span>
-        </a>
-      </div>
-    </div>
-  </section>
-
-  <!-- ═══════════════════════════════════════════════ -->
-  <!-- // benchmarks                                  -->
-  <!-- ═══════════════════════════════════════════════ -->
-  <section class="px-4 sm:px-6 py-16 sm:py-24">
-    <div class="max-w-3xl mx-auto">
-      <h2 class="text-3xl sm:text-4xl font-bold mb-4">Benchmarks<span class="text-accent">.</span></h2>
-      <p class="text-muted text-lg mb-4 max-w-2xl">Apple M-series, single-threaded. <code class="font-mono text-sm text-accent">cargo bench -p tang-bench</code></p>
-      <p class="mb-12"><a href="https://github.com/ecto/tang/tree/main/crates/tang-bench" class="text-accent text-sm hover:underline font-mono">view benchmark source →</a></p>
-
-      <!-- Geometry primitives chart -->
-      <div class="border border-white/10 rounded-xl overflow-hidden">
-        <div class="flex items-center gap-3 px-4 py-2.5 border-b border-white/10">
-          <span class="font-mono text-sm font-semibold">Geometry &amp; physics primitives</span>
-          <span class="text-muted text-xs font-mono">(f64 unless noted)</span>
-          <span class="text-muted text-xs ml-auto hidden sm:inline">lower is better</span>
-        </div>
-        <div class="hidden sm:block p-3 sm:p-6 overflow-x-auto">
-          <div id="bench-geom-container" class="min-w-[500px] w-full"></div>
-        </div>
-        <div class="sm:hidden p-3">
-          <div id="bench-geom-compact" class="w-full"></div>
         </div>
         <div class="flex items-center gap-4 px-4 py-2.5 border-t border-white/10" style="background: rgb(var(--c-code-bg))">
-          <div class="hidden sm:flex flex-wrap gap-6 text-xs font-mono">
-            <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#F59E0B"></span> tang</span>
-            <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#71717a"></span> nalgebra</span>
-            <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#3B82F6"></span> glam (f32)</span>
-          </div>
-          <div class="sm:hidden flex flex-wrap gap-4 text-xs font-mono">
-            <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#F59E0B"></span> tang</span>
-            <span class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#71717a"></span> nalgebra</span>
-          </div>
-          <a href="https://github.com/ecto/tang/tree/main/crates/tang-bench" class="text-accent hover:underline text-xs font-mono ml-auto">source &rarr;</a>
+          <span class="text-muted text-xs">RMSNorm, RoPE, GQA attention, SwiGLU: forward and backward, all derived</span>
+          <a href="https://github.com/ecto/tang/blob/main/docs/tensor-ir.md" class="text-accent hover:underline text-xs font-mono ml-auto">tensor-ir.md &rarr;</a>
         </div>
+      </div>
+              <div class="gpanel" data-arcs="block_written,block_compiled"></div>
+        <p class="fig-cap"><span class="fig-n"></span><span class="fig-lead">A transformer.</span> Kernels derived from the IR beat hand-written ones.</p>
+      </figure>
+
+      <figure class="fig">
+        <h3 class="fig-title">An LLM</h3>
+
+
+      <div class="border border-white/10 rounded-xl overflow-hidden">
+        <div class="flex items-center gap-3 px-4 py-2.5 border-b border-white/10">
+          <span class="text-accent text-xs font-mono">tang-llm</span>
+          <span class="font-semibold text-sm">RTX 3090</span>
+          <span class="text-muted text-xs ml-auto hidden sm:inline">Speed of light: 220&nbsp;tok/s</span>
+        </div>
+        <div class="p-4 sm:p-6 space-y-4 font-mono text-xs">
+          <div>
+            <div class="flex justify-between mb-1.5"><span>Decode, device step</span><span class="text-accent">122&nbsp;tok/s · 55% SOL</span></div>
+            <div class="w-full bg-white/5 rounded h-1.5"><div class="bench-bar" style="width:55%"></div></div>
+          </div>
+          <div>
+            <div class="flex justify-between mb-1.5"><span>Decode, 4k context</span><span class="text-accent">104&nbsp;tok/s · 54% SOL</span></div>
+            <div class="w-full bg-white/5 rounded h-1.5"><div class="bench-bar" style="width:54%"></div></div>
+          </div>
+          <div>
+            <div class="flex justify-between mb-1.5"><span>Prefill 512, f16 tensor cores</span><span class="text-accent">774&nbsp;tok/s</span></div>
+          </div>
+        </div>
+        <div class="llm-data">
+          <div><span>8.2&nbsp;ms</span>Device step per token</div>
+          <div><span>506</span>Kernels per decode step, 470 lowered by the IR</div>
+          <div><span>52–217&nbsp;tok/s</span>Resident server with speculative drafting, by acceptance rate</div>
+          <div><span>535–757&nbsp;tok/s</span>Server prefill</div>
+          <div><span>1.7&nbsp;×&nbsp;10⁻⁴</span>Max logit error vs. an f32 PyTorch reference</div>
+          <div><span>64&nbsp;/&nbsp;64</span>Greedy tokens matching the reference</div>
+        </div>
+        <div class="px-4 py-3 border-t border-white/10 text-xs text-muted leading-relaxed">
+          + speculative decoding · MoE offload · iOS · Vulkan on Adreno
+        </div>
+      </div>
+    
+              <div class="gpanel" data-arcs="decode_compiled" data-layers="36" data-note="one Qwen3-8B-shaped decode block, unquantized"></div>
+        <p class="fig-cap"><span class="fig-n"></span><span class="fig-lead">An LLM.</span> Qwen3-8B, 4-bit, batch&nbsp;1, on an RTX 3090.</p>
+      </figure>
+
+    </div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════ -->
+  <!-- // build                                       -->
+  <!-- ═══════════════════════════════════════════════ -->
+  <section class="px-4 sm:px-6 py-16 sm:py-24">
+    <div class="max-w-5xl mx-auto">
+      <h2 class="text-3xl sm:text-5xl font-semibold mb-3 text-center">What you can build</h2>
+      <p class="lead">Each of these is an example in the repository. Pick one, paste the command, and it runs in about a minute.</p>
+      <div class="grid grid-cols-1 lg:grid-cols-[1fr_1.1fr] gap-5 items-start">
+        <div id="build-cards" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-2 gap-3"></div>
+        <div class="lg:sticky lg:top-8 rounded-2xl overflow-hidden border border-white/10 shadow-2xl" id="build-term" style="background:#14141f">
+          <div class="flex items-center gap-2 px-4 py-3 border-b border-white/5">
+            <span class="w-3 h-3 rounded-full bg-[#ff5f57]"></span><span class="w-3 h-3 rounded-full bg-[#febc2e]"></span><span class="w-3 h-3 rounded-full bg-[#28c840]"></span>
+            <span id="build-title" class="font-mono text-xs text-muted ml-3"></span>
+            <button id="build-copy" class="ml-auto text-muted hover:text-txt text-xs font-mono cursor-pointer">Copy</button>
+          </div>
+          <div id="build-illo" class="border-b border-white/5" style="color: var(--illo-c)"></div>
+          <p id="build-pitch" class="px-5 pt-5 pb-1 text-lg sm:text-xl font-semibold leading-snug"></p>
+          <pre id="build-code" class="font-mono text-xs sm:text-[13px] leading-relaxed px-5 pb-6 pt-2 min-h-[150px] overflow-x-auto whitespace-pre"></pre>
+          <div class="px-5 py-3 border-t border-white/5">
+            <a id="build-link" href="#" class="text-xs font-mono hover:underline"></a>
+          </div>
+        </div>
+      </div>
+      <p class="fig-cap"><span class="fig-n"></span><span class="fig-lead">Seven starting points.</span> Each command runs from a fresh clone of the repository.</p>
+    </div>
+    <style>
+      .build-card { transition: transform .2s ease, border-color .2s ease, background .2s ease; }
+      .build-card:hover { transform: translateY(-2px); }
+      .build-card[aria-pressed="true"] { border-color: var(--c); background: color-mix(in srgb, var(--c) 8%, transparent); }
+      #build-code .cursor { display:inline-block; width:.55em; height:1.1em; vertical-align:text-bottom; background: currentColor; animation: blink 1s steps(1) infinite; }
+      @keyframes blink { 50% { opacity: 0; } }
+    </style>
+    <script>
+      (() => {
+        const gh = 'https://github.com/ecto/tang/tree/main/crates/';
+        const items = [
+          { tab: 'Serve an LLM', pitch: 'Your own OpenAI-compatible endpoint. No Python stack.',
+            code: 'git clone https://github.com/ecto/tang && cd tang\ncargo install --path crates/tang-llm\ntang-llm serve Qwen/Qwen3-8B --port 8080\n\ncurl localhost:8080/v1/chat/completions \\\n  -H \'Content-Type: application/json\' \\\n  -d \'{"messages":[{"role":"user","content":"hi"}]}\'',
+            link: ['tang-llm', gh + 'tang-llm'] },
+          { tab: 'Train a net', pitch: 'A full training stack: layers, losses, optimizers, on CPU or GPU.',
+            code: 'cargo run --example quantum_poet -p tang-gpu',
+            link: ['quantum_poet.rs', 'https://github.com/ecto/tang/blob/main/crates/tang-gpu/examples/quantum_poet.rs'] },
+          { tab: 'Physics surrogates', pitch: 'Write the physics as math. Get exact gradients and a trained GPU surrogate.',
+            code: 'cargo run --example physics_surrogate -p tang-gpu',
+            link: ['physics_surrogate.rs', 'https://github.com/ecto/tang/blob/main/crates/tang-gpu/examples/physics_surrogate.rs'] },
+          { tab: '3D splatting', pitch: 'Fit a 3D Gaussian Splatting scene from images, differentiably, on any GPU.',
+            code: 'cargo run --release --example train_image -p tang-3dgs -- photo.png --iters 5000',
+            link: ['tang-3dgs', gh + 'tang-3dgs'] },
+          { tab: 'Your own kernels', pitch: 'Describe the math once. Get every backend.',
+            code: 'cargo run --release --example dump_flash_wgsl -p tang-bench\ncargo run --release --example dump_cuda_program -p tang-bench',
+            link: ['tensor-ir.md', 'https://github.com/ecto/tang/blob/main/docs/tensor-ir.md'] },
+          { tab: 'Discover formulas', pitch: 'Recover equations from data with symbolic regression.',
+            code: 'cargo run --example symbolic_regression -p tang-expr',
+            link: ['symbolic_regression.rs', 'https://github.com/ecto/tang/blob/main/crates/tang-expr/examples/symbolic_regression.rs'] },
+          { tab: 'Distribute', pitch: 'Ship expression graphs, not tensors, across machines over QUIC.',
+            code: 'cargo run -p tang-mesh --example coded_mesh -- local',
+            link: ['tang-mesh', gh + 'tang-mesh'] },
+        ];
+        const art = {
+          'Serve an LLM': ['#ff6600', '<rect x="6" y="10" width="34" height="16" rx="8" fill="none" stroke="C" stroke-width="2"/><rect x="20" y="30" width="34" height="16" rx="8" fill="C" opacity=".35"/><circle cx="16" cy="18" r="2" fill="C"/><circle cx="23" cy="18" r="2" fill="C"/><circle cx="30" cy="18" r="2" fill="C"/>'],
+          'Train a net': ['#0891b2', '<path d="M6 12 Q16 40 28 42 T56 48" fill="none" stroke="C" stroke-width="2.5" stroke-linecap="round"/><path d="M6 52 H58 M6 8 V52" stroke="C" opacity=".3" stroke-width="1.5"/>'],
+          'Physics surrogates': ['#66D9EF', '<circle cx="22" cy="30" r="5" fill="C"/><circle cx="44" cy="22" r="3" fill="C"/><circle cx="22" cy="30" r="12" fill="none" stroke="C" opacity=".5"/><circle cx="22" cy="30" r="20" fill="none" stroke="C" opacity=".25"/><circle cx="44" cy="22" r="9" fill="none" stroke="C" opacity=".4"/>'],
+          '3D splatting': ['#F92672', '<ellipse cx="22" cy="24" rx="14" ry="8" transform="rotate(-25 22 24)" fill="C" opacity=".5"/><ellipse cx="40" cy="34" rx="12" ry="6" transform="rotate(30 40 34)" fill="C" opacity=".35"/><ellipse cx="30" cy="44" rx="9" ry="5" fill="C" opacity=".6"/>'],
+          'Your own kernels': ['#AE81FF', '<rect x="16" y="16" width="30" height="30" rx="4" fill="none" stroke="C" stroke-width="2"/><rect x="24" y="24" width="14" height="14" rx="2" fill="C" opacity=".5"/><path d="M22 10v6M31 10v6M40 10v6M22 46v6M31 46v6M40 46v6M10 22h6M10 31h6M10 40h6M46 22h6M46 31h6M46 40h6" stroke="C" stroke-width="2"/>'],
+          'Discover formulas': ['#ca8a04', '<text x="31" y="38" text-anchor="middle" font-family="ui-monospace,monospace" font-size="20" font-weight="700" fill="C">ƒ(x)</text><path d="M8 50 Q31 42 54 50" fill="none" stroke="C" opacity=".4" stroke-width="1.5"/>'],
+          'Distribute': ['#71A9F7', '<circle cx="31" cy="14" r="5" fill="C"/><circle cx="12" cy="46" r="5" fill="C"/><circle cx="50" cy="46" r="5" fill="C"/><path d="M31 14 L12 46 L50 46 Z" fill="none" stroke="C" opacity=".5" stroke-width="1.5" stroke-dasharray="3 3"/>'],
+        };
+        const illo = {
+          'Serve an LLM': `<g font-size="11">
+ <rect x="24" y="22" width="150" height="30" fill="none" stroke="var(--m-muted)"/><text x="36" y="41" fill="var(--m-muted)">why is the sky blue?</text>
+ <rect x="226" y="66" width="270" height="62" fill="currentColor" fill-opacity=".12" stroke="currentColor"/>
+ <g fill="currentColor">
+  <rect x="240" y="80" width="0" height="8"><animate attributeName="width" values="0;240;240" keyTimes="0;.5;1" dur="3s" repeatCount="indefinite"/></rect>
+  <rect x="240" y="96" width="0" height="8"><animate attributeName="width" values="0;0;210;210" keyTimes="0;.3;.75;1" dur="3s" repeatCount="indefinite"/></rect>
+  <rect x="240" y="112" width="0" height="8"><animate attributeName="width" values="0;0;120;120" keyTimes="0;.55;.9;1" dur="3s" repeatCount="indefinite"/></rect>
+ </g>
+ <text x="24" y="150" fill="var(--m-muted)">POST /v1/chat/completions</text>
+ <text x="496" y="150" text-anchor="end" fill="currentColor">122 tok/s</text>
+</g>`,
+          'Train a net': `<g fill="none">
+ <path d="M30 20 V140 H500" stroke="var(--m-muted)" stroke-opacity=".5"/>
+ <path d="M30 30 C 70 40, 90 110, 150 118 S 300 128, 500 131" stroke="currentColor" stroke-width="2.5" stroke-dasharray="600" stroke-dashoffset="600">
+  <animate attributeName="stroke-dashoffset" values="600;0;0" keyTimes="0;.7;1" dur="3.5s" repeatCount="indefinite"/></path>
+ <g fill="currentColor" stroke="none" opacity=".35">
+  <circle cx="60" cy="52" r="2.5"/><circle cx="95" cy="88" r="2.5"/><circle cx="130" cy="110" r="2.5"/><circle cx="190" cy="121" r="2.5"/><circle cx="260" cy="125" r="2.5"/><circle cx="340" cy="128" r="2.5"/><circle cx="420" cy="130" r="2.5"/>
+ </g>
+ <text x="500" y="20" text-anchor="end" fill="var(--m-muted)" stroke="none" font-size="11">loss</text>
+ <text x="500" y="155" text-anchor="end" fill="var(--m-muted)" stroke="none" font-size="11">epoch</text>
+</g>`,
+          'Physics surrogates': `<g fill="none" stroke="currentColor">
+ <circle cx="170" cy="85" r="14" stroke-opacity="0.78"/><circle cx="170" cy="85" r="28" stroke-opacity="0.67"/><circle cx="170" cy="85" r="44" stroke-opacity="0.53"/><circle cx="170" cy="85" r="56" stroke-opacity="0.38"/><circle cx="170" cy="85" r="70" stroke-opacity="0.22"/>
+ <circle cx="360" cy="70" r="10" stroke-opacity="0.69"/><circle cx="360" cy="70" r="22" stroke-opacity="0.56"/><circle cx="360" cy="70" r="36" stroke-opacity="0.40"/><circle cx="360" cy="70" r="52" stroke-opacity="0.22"/>
+ <circle cx="170" cy="85" r="7" fill="currentColor"/><circle cx="360" cy="70" r="5" fill="currentColor"/>
+ <circle r="3.5" fill="var(--m-fg)" stroke="none"><animateMotion dur="5s" repeatCount="indefinite" path="M170 15 C 290 0, 450 60, 360 125 S 60 170, 100 60 S 120 20, 170 15"/></circle>
+</g>
+<text x="496" y="150" text-anchor="end" fill="var(--m-muted)" font-size="11">∇V(x, y), exact</text>`,
+          '3D splatting': `<g fill="currentColor">
+ <ellipse cx="200" cy="80" rx="70" ry="26" transform="rotate(-20 200 80)" fill-opacity="0.18"><animate attributeName="fill-opacity" values="0;0.18;0.18" keyTimes="0;0.1;1" dur="3s" repeatCount="indefinite"/></ellipse><ellipse cx="250" cy="95" rx="55" ry="20" transform="rotate(25 250 95)" fill-opacity="0.25"><animate attributeName="fill-opacity" values="0;0.25;0.25" keyTimes="0;0.2;1" dur="3s" repeatCount="indefinite"/></ellipse><ellipse cx="310" cy="70" rx="60" ry="18" transform="rotate(-35 310 70)" fill-opacity="0.22"><animate attributeName="fill-opacity" values="0;0.22;0.22" keyTimes="0;0.3;1" dur="3s" repeatCount="indefinite"/></ellipse><ellipse cx="180" cy="110" rx="40" ry="14" transform="rotate(10 180 110)" fill-opacity="0.3"><animate attributeName="fill-opacity" values="0;0.3;0.3" keyTimes="0;0.4;1" dur="3s" repeatCount="indefinite"/></ellipse><ellipse cx="330" cy="105" rx="45" ry="16" transform="rotate(40 330 105)" fill-opacity="0.28"><animate attributeName="fill-opacity" values="0;0.28;0.28" keyTimes="0;0.5;1" dur="3s" repeatCount="indefinite"/></ellipse><ellipse cx="270" cy="60" rx="30" ry="10" transform="rotate(-10 270 60)" fill-opacity="0.4"><animate attributeName="fill-opacity" values="0;0.4;0.4" keyTimes="0;0.6;1" dur="3s" repeatCount="indefinite"/></ellipse><ellipse cx="230" cy="120" rx="25" ry="9" transform="rotate(30 230 120)" fill-opacity="0.45"><animate attributeName="fill-opacity" values="0;0.45;0.45" keyTimes="0;0.65;1" dur="3s" repeatCount="indefinite"/></ellipse><ellipse cx="300" cy="90" rx="20" ry="7" transform="rotate(0 300 90)" fill-opacity="0.6"><animate attributeName="fill-opacity" values="0;0.6;0.6" keyTimes="0;0.75;1" dur="3s" repeatCount="indefinite"/></ellipse><ellipse cx="260" cy="85" rx="14" ry="6" transform="rotate(-40 260 85)" fill-opacity="0.7"><animate attributeName="fill-opacity" values="0;0.7;0.7" keyTimes="0;0.85;1" dur="3s" repeatCount="indefinite"/></ellipse>
+</g>
+<text x="496" y="150" text-anchor="end" fill="var(--m-muted)" font-size="11">gaussians → pixels, differentiably</text>`,
+          'Your own kernels': `<g font-size="10" text-anchor="middle" dominant-baseline="central">
+ <g stroke="var(--m-muted)" fill="none"><path d="M60 120 L95 60 L130 120 M95 60 L95 30"/></g>
+ <circle cx="60" cy="120" r="11" fill="var(--m-bg)" stroke="currentColor"/><text x="60" y="120" fill="currentColor">x</text>
+ <circle cx="130" cy="120" r="11" fill="var(--m-bg)" stroke="currentColor"/><text x="130" y="120" fill="currentColor">y</text>
+ <circle cx="95" cy="60" r="11" fill="var(--m-bg)" stroke="currentColor"/><text x="95" y="60" fill="currentColor">·</text>
+ <path d="M170 80 H230" stroke="currentColor" stroke-dasharray="4 4"><animate attributeName="stroke-dashoffset" values="8;0" dur=".6s" repeatCount="indefinite"/></path>
+ <rect x="250" y="25" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.00s" repeatCount="indefinite"/></rect><rect x="275" y="25" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.08s" repeatCount="indefinite"/></rect><rect x="300" y="25" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.16s" repeatCount="indefinite"/></rect><rect x="325" y="25" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.24s" repeatCount="indefinite"/></rect><rect x="350" y="25" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.32s" repeatCount="indefinite"/></rect><rect x="375" y="25" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.40s" repeatCount="indefinite"/></rect><rect x="400" y="25" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.48s" repeatCount="indefinite"/></rect><rect x="425" y="25" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.56s" repeatCount="indefinite"/></rect><rect x="450" y="25" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.64s" repeatCount="indefinite"/></rect><rect x="475" y="25" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.72s" repeatCount="indefinite"/></rect><rect x="250" y="50" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.12s" repeatCount="indefinite"/></rect><rect x="275" y="50" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.20s" repeatCount="indefinite"/></rect><rect x="300" y="50" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.28s" repeatCount="indefinite"/></rect><rect x="325" y="50" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.36s" repeatCount="indefinite"/></rect><rect x="350" y="50" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.44s" repeatCount="indefinite"/></rect><rect x="375" y="50" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.52s" repeatCount="indefinite"/></rect><rect x="400" y="50" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.60s" repeatCount="indefinite"/></rect><rect x="425" y="50" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.68s" repeatCount="indefinite"/></rect><rect x="450" y="50" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.76s" repeatCount="indefinite"/></rect><rect x="475" y="50" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.84s" repeatCount="indefinite"/></rect><rect x="250" y="75" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.24s" repeatCount="indefinite"/></rect><rect x="275" y="75" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.32s" repeatCount="indefinite"/></rect><rect x="300" y="75" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.40s" repeatCount="indefinite"/></rect><rect x="325" y="75" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.48s" repeatCount="indefinite"/></rect><rect x="350" y="75" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.56s" repeatCount="indefinite"/></rect><rect x="375" y="75" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.64s" repeatCount="indefinite"/></rect><rect x="400" y="75" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.72s" repeatCount="indefinite"/></rect><rect x="425" y="75" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.80s" repeatCount="indefinite"/></rect><rect x="450" y="75" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.88s" repeatCount="indefinite"/></rect><rect x="475" y="75" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.96s" repeatCount="indefinite"/></rect><rect x="250" y="100" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.36s" repeatCount="indefinite"/></rect><rect x="275" y="100" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.44s" repeatCount="indefinite"/></rect><rect x="300" y="100" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.52s" repeatCount="indefinite"/></rect><rect x="325" y="100" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.60s" repeatCount="indefinite"/></rect><rect x="350" y="100" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.68s" repeatCount="indefinite"/></rect><rect x="375" y="100" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.76s" repeatCount="indefinite"/></rect><rect x="400" y="100" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.84s" repeatCount="indefinite"/></rect><rect x="425" y="100" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.92s" repeatCount="indefinite"/></rect><rect x="450" y="100" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="1.00s" repeatCount="indefinite"/></rect><rect x="475" y="100" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="1.08s" repeatCount="indefinite"/></rect><rect x="250" y="125" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.48s" repeatCount="indefinite"/></rect><rect x="275" y="125" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.56s" repeatCount="indefinite"/></rect><rect x="300" y="125" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.64s" repeatCount="indefinite"/></rect><rect x="325" y="125" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.72s" repeatCount="indefinite"/></rect><rect x="350" y="125" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.80s" repeatCount="indefinite"/></rect><rect x="375" y="125" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.88s" repeatCount="indefinite"/></rect><rect x="400" y="125" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="0.96s" repeatCount="indefinite"/></rect><rect x="425" y="125" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="1.04s" repeatCount="indefinite"/></rect><rect x="450" y="125" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="1.12s" repeatCount="indefinite"/></rect><rect x="475" y="125" width="20" height="20" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-opacity=".4"><animate attributeName="fill-opacity" values=".1;.8;.1" dur="1.6s" begin="1.20s" repeatCount="indefinite"/></rect>
+</g>`,
+          'Discover formulas': `<g>
+ <circle cx="30" cy="80.0" r="2.5" fill="var(--m-muted)"/><circle cx="46" cy="77.14204385089097" r="2.5" fill="var(--m-muted)"/><circle cx="62" cy="73.82721088077079" r="2.5" fill="var(--m-muted)"/><circle cx="78" cy="60.181842585743595" r="2.5" fill="var(--m-muted)"/><circle cx="94" cy="59.378307020300035" r="2.5" fill="var(--m-muted)"/><circle cx="110" cy="61.44839348752976" r="2.5" fill="var(--m-muted)"/><circle cx="126" cy="56.103719000533786" r="2.5" fill="var(--m-muted)"/><circle cx="142" cy="65.59152953169587" r="2.5" fill="var(--m-muted)"/><circle cx="158" cy="78.61040289469922" r="2.5" fill="var(--m-muted)"/><circle cx="174" cy="83.30266090521735" r="2.5" fill="var(--m-muted)"/><circle cx="190" cy="100.32976265220555" r="2.5" fill="var(--m-muted)"/><circle cx="206" cy="106.02500548260667" r="2.5" fill="var(--m-muted)"/><circle cx="222" cy="120.60618244137069" r="2.5" fill="var(--m-muted)"/><circle cx="238" cy="131.4211297741424" r="2.5" fill="var(--m-muted)"/><circle cx="254" cy="126.19282018071931" r="2.5" fill="var(--m-muted)"/><circle cx="270" cy="126.22885568447643" r="2.5" fill="var(--m-muted)"/><circle cx="286" cy="120.56333189361608" r="2.5" fill="var(--m-muted)"/><circle cx="302" cy="99.00685037322656" r="2.5" fill="var(--m-muted)"/><circle cx="318" cy="85.09204937384511" r="2.5" fill="var(--m-muted)"/><circle cx="334" cy="69.91594420440323" r="2.5" fill="var(--m-muted)"/><circle cx="350" cy="44.894777274310236" r="2.5" fill="var(--m-muted)"/><circle cx="366" cy="34.45999718442707" r="2.5" fill="var(--m-muted)"/><circle cx="382" cy="18.733569499625986" r="2.5" fill="var(--m-muted)"/><circle cx="398" cy="21.225610520294417" r="2.5" fill="var(--m-muted)"/><circle cx="414" cy="31.59647206617342" r="2.5" fill="var(--m-muted)"/><circle cx="430" cy="38.51877114471491" r="2.5" fill="var(--m-muted)"/><circle cx="446" cy="62.66311463554535" r="2.5" fill="var(--m-muted)"/><circle cx="462" cy="90.81579429034343" r="2.5" fill="var(--m-muted)"/><circle cx="478" cy="109.11945556464258" r="2.5" fill="var(--m-muted)"/><circle cx="494" cy="136.41092331387574" r="2.5" fill="var(--m-muted)"/>
+ <path d="M30 85.0 L34 83.4 L38 81.7 L42 79.9 L46 78.1 L50 76.3 L54 74.5 L58 72.6 L62 70.8 L66 69.1 L70 67.3 L74 65.7 L78 64.2 L82 62.8 L86 61.5 L90 60.3 L94 59.4 L98 58.6 L102 58.0 L106 57.6 L110 57.4 L114 57.5 L118 57.8 L122 58.3 L126 59.1 L130 60.1 L134 61.4 L138 62.9 L142 64.6 L146 66.5 L150 68.7 L154 71.1 L158 73.6 L162 76.3 L166 79.2 L170 82.2 L174 85.3 L178 88.5 L182 91.7 L186 95.0 L190 98.3 L194 101.6 L198 104.8 L202 108.0 L206 111.0 L210 113.9 L214 116.7 L218 119.3 L222 121.6 L226 123.7 L230 125.6 L234 127.1 L238 128.4 L242 129.4 L246 130.0 L250 130.3 L254 130.2 L258 129.8 L262 128.9 L266 127.8 L270 126.2 L274 124.3 L278 122.1 L282 119.5 L286 116.6 L290 113.3 L294 109.8 L298 106.0 L302 102.0 L306 97.8 L310 93.3 L314 88.8 L318 84.1 L322 79.3 L326 74.5 L330 69.7 L334 64.9 L338 60.2 L342 55.6 L346 51.2 L350 46.9 L354 42.9 L358 39.1 L362 35.6 L366 32.5 L370 29.7 L374 27.3 L378 25.3 L382 23.7 L386 22.6 L390 22.0 L394 21.9 L398 22.2 L402 23.1 L406 24.4 L410 26.3 L414 28.6 L418 31.4 L422 34.7 L426 38.4 L430 42.5 L434 47.0 L438 51.9 L442 57.2 L446 62.7 L450 68.4 L454 74.4 L458 80.6 L462 86.8 L466 93.2 L470 99.5 L474 105.9 L478 112.1 L482 118.3 L486 124.2 L490 130.0 L494 135.4" fill="none" stroke="currentColor" stroke-width="2.5" stroke-dasharray="900" stroke-dashoffset="900">
+  <animate attributeName="stroke-dashoffset" values="900;0;0" keyTimes="0;.6;1" dur="4s" repeatCount="indefinite"/></path>
+ <text x="496" y="150" text-anchor="end" fill="currentColor" font-size="12">f(x) = x²·sin(x)</text>
+</g>`,
+          'Distribute': `<g>
+ <path d="M260 80 L110 40" stroke="var(--m-muted)" stroke-opacity=".5" stroke-dasharray="3 4"/><path d="M260 80 L110 125" stroke="var(--m-muted)" stroke-opacity=".5" stroke-dasharray="3 4"/><path d="M260 80 L410 40" stroke="var(--m-muted)" stroke-opacity=".5" stroke-dasharray="3 4"/><path d="M260 80 L410 125" stroke="var(--m-muted)" stroke-opacity=".5" stroke-dasharray="3 4"/>
+ <circle r="3.5" fill="currentColor"><animateMotion dur="1.8s" begin="0s" repeatCount="indefinite" path="M260 80 L110 40"/></circle><circle r="3.5" fill="currentColor"><animateMotion dur="1.8s" begin="0.45s" repeatCount="indefinite" path="M260 80 L110 125"/></circle><circle r="3.5" fill="currentColor"><animateMotion dur="1.8s" begin="0.9s" repeatCount="indefinite" path="M260 80 L410 40"/></circle><circle r="3.5" fill="currentColor"><animateMotion dur="1.8s" begin="1.35s" repeatCount="indefinite" path="M260 80 L410 125"/></circle>
+ <rect x="235" y="62" width="50" height="36" fill="var(--m-bg)" stroke="currentColor"/><text x="260" y="84" text-anchor="middle" fill="currentColor" font-size="10">graph</text>
+ <rect x="86" y="26" width="48" height="28" fill="var(--m-bg)" stroke="var(--m-muted)"/><text x="110" y="44" text-anchor="middle" fill="var(--m-muted)" font-size="10">CUDA</text><rect x="86" y="111" width="48" height="28" fill="var(--m-bg)" stroke="var(--m-muted)"/><text x="110" y="129" text-anchor="middle" fill="var(--m-muted)" font-size="10">Metal</text><rect x="386" y="26" width="48" height="28" fill="var(--m-bg)" stroke="var(--m-muted)"/><text x="410" y="44" text-anchor="middle" fill="var(--m-muted)" font-size="10">Vulkan</text><rect x="386" y="111" width="48" height="28" fill="var(--m-bg)" stroke="var(--m-muted)"/><text x="410" y="129" text-anchor="middle" fill="var(--m-muted)" font-size="10">CPU</text>
+</g>`,
+        };
+        const $ = id => document.getElementById(id);
+        const cards = $('build-cards');
+        const svg = (k, c) => art[k][1].replaceAll('"C"', `"${c}"`);
+        let typing = 0;
+        const show = i => {
+          const it = items[i], c = art[it.tab][0];
+          [...cards.children].forEach((b, j) => b.setAttribute('aria-pressed', j === i));
+          $('build-title').textContent = it.tab;
+          $('build-pitch').textContent = it.pitch;
+          $('build-illo').style.setProperty('--illo-c', c);
+          $('build-illo').innerHTML = `<svg viewBox="0 0 520 165" class="w-full h-auto block" font-family="IBM Plex Sans, sans-serif">${illo[it.tab]}</svg>`;
+          $('build-term').style.boxShadow = `0 25px 60px -20px ${c}40`;
+          $('build-link').textContent = it.link[0] + ' →';
+          $('build-link').href = it.link[1];
+          $('build-link').style.color = c;
+          const lines = it.code.split('\n').map(l => l && !l.startsWith(' ') && !l.startsWith('-') ? '$ ' + l : l).join('\n');
+          const id = ++typing, out = $('build-code');
+          let n = 0;
+          const step = () => {
+            if (id !== typing) return;
+            n = Math.min(lines.length, n + 2);
+            out.innerHTML = window.hl(lines.slice(0, n), 'sh') + '<span class="cursor"></span>';
+            if (n < lines.length) setTimeout(step, 12);
+          };
+          step();
+        };
+        items.forEach((it, i) => {
+          const c = art[it.tab][0];
+          const b = document.createElement('button');
+          b.className = 'build-card text-left border border-white/10 rounded-xl p-4 cursor-pointer';
+          b.style.setProperty('--c', c);
+          if (i === items.length - 1) b.classList.add('col-span-2', 'sm:col-span-3');
+          b.innerHTML = `<svg viewBox="0 0 62 62" class="w-10 h-10 mb-3">${svg(it.tab, c)}</svg><div class="font-semibold text-sm mb-1">${it.tab}</div><div class="text-muted text-xs leading-snug">${it.pitch}</div>`;
+          b.onclick = () => show(i);
+          cards.appendChild(b);
+        });
+        $('build-copy').onclick = () => {
+          navigator.clipboard.writeText(items.find(it => it.tab === $('build-title').textContent).code);
+          $('build-copy').textContent = 'Copied';
+          setTimeout(() => $('build-copy').textContent = 'Copy', 1200);
+        };
+        show(0);
+      })();
+    </script>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════ -->
+  <!-- // compare                                     -->
+  <!-- ═══════════════════════════════════════════════ -->
+  <section class="px-4 sm:px-6 py-16 sm:py-24">
+    <div class="max-w-3xl mx-auto">
+      <h2 class="text-3xl sm:text-4xl font-semibold mb-4">How it compares</h2>
+      <p class="lead">PyTorch is the reference for machine learning; candle and burn are strong Rust frameworks. tang covers more ground: math, physics and ML on one differentiable core.</p>
+      <div class="cmp">
+        <div class="cmp-head"><span></span><span class="cmp-tang">tang</span><span class="">PyTorch</span><span class="">candle</span><span class="">burn</span></div>
+        <div class="cmp-row"><span class="cmp-name">Kernels derived from one IR</span><span class="cmp-cell"><span class="hb hb-2" style="--hb:var(--m-orange)" title="Six backends from one tensor IR"></span><span class="cmp-note">Six backends from one tensor IR</span></span><span class="cmp-cell"><span class="hb hb-1" style="--hb:var(--m-muted)" title="torch.compile generates Triton; most ops hand-written"></span><span class="cmp-note">torch.compile generates Triton; most ops hand-written</span></span><span class="cmp-cell"><span class="hb hb-0" style="--hb:var(--m-muted)" title="Hand-written per backend"></span><span class="cmp-note">Hand-written per backend</span></span><span class="cmp-cell"><span class="hb hb-1" style="--hb:var(--m-muted)" title="CubeCL kernels generated from Rust"></span><span class="cmp-note">CubeCL kernels generated from Rust</span></span></div>
+        <div class="cmp-row"><span class="cmp-name">GPU backends</span><span class="cmp-cell"><span class="hb hb-2" style="--hb:var(--m-orange)" title="" data-backends="title"></span><span class="cmp-note">CUDA, Metal, Vulkan, WGSL, OpenCL, C</span></span><span class="cmp-cell"><span class="hb hb-2" style="--hb:var(--m-muted)" title="CUDA, ROCm, MPS, CPU"></span><span class="cmp-note">CUDA, ROCm, MPS, CPU</span></span><span class="cmp-cell"><span class="hb hb-1" style="--hb:var(--m-muted)" title="CUDA, Metal, CPU"></span><span class="cmp-note">CUDA, Metal, CPU</span></span><span class="cmp-cell"><span class="hb hb-2" style="--hb:var(--m-muted)" title="CUDA, ROCm, Metal, Vulkan, WGPU, CPU"></span><span class="cmp-note">CUDA, ROCm, Metal, Vulkan, WGPU, CPU</span></span></div>
+        <div class="cmp-row"><span class="cmp-name">Forward-mode duals</span><span class="cmp-cell"><span class="hb hb-2" style="--hb:var(--m-orange)" title="Any S: Scalar"></span><span class="cmp-note">Any S: Scalar</span></span><span class="cmp-cell"><span class="hb hb-1" style="--hb:var(--m-muted)" title="torch.func.jvp"></span><span class="cmp-note">torch.func.jvp</span></span><span class="cmp-cell"><span class="hb hb-0" style="--hb:var(--m-muted)" title="Not a built-in focus"></span><span class="cmp-note">Not a built-in focus</span></span><span class="cmp-cell"><span class="hb hb-0" style="--hb:var(--m-muted)" title="Not a built-in focus"></span><span class="cmp-note">Not a built-in focus</span></span></div>
+        <div class="cmp-row"><span class="cmp-name">Symbolic graphs + diff</span><span class="cmp-cell"><span class="hb hb-2" style="--hb:var(--m-orange)" title="tang-expr"></span><span class="cmp-note">tang-expr</span></span><span class="cmp-cell"><span class="hb hb-0" style="--hb:var(--m-muted)" title="Not a built-in focus"></span><span class="cmp-note">Not a built-in focus</span></span><span class="cmp-cell"><span class="hb hb-0" style="--hb:var(--m-muted)" title="Not a built-in focus"></span><span class="cmp-note">Not a built-in focus</span></span><span class="cmp-cell"><span class="hb hb-0" style="--hb:var(--m-muted)" title="Not a built-in focus"></span><span class="cmp-note">Not a built-in focus</span></span></div>
+        <div class="cmp-row"><span class="cmp-name">Geometry &amp; spatial algebra</span><span class="cmp-cell"><span class="hb hb-2" style="--hb:var(--m-orange)" title="Vec/Quat/Mat, exact predicates"></span><span class="cmp-note">Vec/Quat/Mat, exact predicates</span></span><span class="cmp-cell"><span class="hb hb-0" style="--hb:var(--m-muted)" title="Not a built-in focus"></span><span class="cmp-note">Not a built-in focus</span></span><span class="cmp-cell"><span class="hb hb-0" style="--hb:var(--m-muted)" title="Not a built-in focus"></span><span class="cmp-note">Not a built-in focus</span></span><span class="cmp-cell"><span class="hb hb-0" style="--hb:var(--m-muted)" title="Not a built-in focus"></span><span class="cmp-note">Not a built-in focus</span></span></div>
+        <div class="cmp-row"><span class="cmp-name">Dense &amp; sparse solvers</span><span class="cmp-cell"><span class="hb hb-2" style="--hb:var(--m-orange)" title="LU, SVD, QR, Eigen, L-BFGS, LM"></span><span class="cmp-note">LU, SVD, QR, Eigen, L-BFGS, LM</span></span><span class="cmp-cell"><span class="hb hb-2" style="--hb:var(--m-muted)" title="torch.linalg"></span><span class="cmp-note">torch.linalg</span></span><span class="cmp-cell"><span class="hb hb-1" style="--hb:var(--m-muted)" title="Partial"></span><span class="cmp-note">Partial</span></span><span class="cmp-cell"><span class="hb hb-0" style="--hb:var(--m-muted)" title="Not a built-in focus"></span><span class="cmp-note">Not a built-in focus</span></span></div>
+        <div class="cmp-row"><span class="cmp-name">Constant-time crypto</span><span class="cmp-cell"><span class="hb hb-2" style="--hb:var(--m-orange)" title="Mod-q tensors, taint-checked"></span><span class="cmp-note">Mod-q tensors, taint-checked</span></span><span class="cmp-cell"><span class="hb hb-0" style="--hb:var(--m-muted)" title="Not a built-in focus"></span><span class="cmp-note">Not a built-in focus</span></span><span class="cmp-cell"><span class="hb hb-0" style="--hb:var(--m-muted)" title="Not a built-in focus"></span><span class="cmp-note">Not a built-in focus</span></span><span class="cmp-cell"><span class="hb hb-0" style="--hb:var(--m-muted)" title="Not a built-in focus"></span><span class="cmp-note">Not a built-in focus</span></span></div>
+        <div class="cmp-row"><span class="cmp-name">LLM serving</span><span class="cmp-cell"><span class="hb hb-2" style="--hb:var(--m-orange)" title="OpenAI-compatible, speculative"></span><span class="cmp-note">OpenAI-compatible, speculative</span></span><span class="cmp-cell"><span class="hb hb-1" style="--hb:var(--m-muted)" title="Via vLLM and others"></span><span class="cmp-note">Via vLLM and others</span></span><span class="cmp-cell"><span class="hb hb-1" style="--hb:var(--m-muted)" title="Examples"></span><span class="cmp-note">Examples</span></span><span class="cmp-cell"><span class="hb hb-0" style="--hb:var(--m-muted)" title="Not a built-in focus"></span><span class="cmp-note">Not a built-in focus</span></span></div>
+        <div class="cmp-row"><span class="cmp-name">no_std / WASM</span><span class="cmp-cell"><span class="hb hb-2" style="--hb:var(--m-orange)" title="Both"></span><span class="cmp-note">Both</span></span><span class="cmp-cell"><span class="hb hb-0" style="--hb:var(--m-muted)" title="Neither"></span><span class="cmp-note">Neither</span></span><span class="cmp-cell"><span class="hb hb-1" style="--hb:var(--m-muted)" title="WASM"></span><span class="cmp-note">WASM</span></span><span class="cmp-cell"><span class="hb hb-2" style="--hb:var(--m-muted)" title="Both"></span><span class="cmp-note">Both</span></span></div>
+        <div class="cmp-row"><span class="cmp-name">Ecosystem maturity</span><span class="cmp-cell"><span class="hb hb-0" style="--hb:var(--m-orange)" title="Young"></span><span class="cmp-note">Young</span></span><span class="cmp-cell"><span class="hb hb-2" style="--hb:var(--m-muted)" title="Enormous"></span><span class="cmp-note">Enormous</span></span><span class="cmp-cell"><span class="hb hb-1" style="--hb:var(--m-muted)" title="Growing"></span><span class="cmp-note">Growing</span></span><span class="cmp-cell"><span class="hb hb-1" style="--hb:var(--m-muted)" title="Growing"></span><span class="cmp-note">Growing</span></span></div>
+        <p class="cmp-key"><span class="hb hb-2" style="--hb:var(--m-muted)"></span> built in <span class="hb hb-1" style="--hb:var(--m-muted)"></span> partial or via another project <span class="hb hb-0" style="--hb:var(--m-muted)"></span> not a built-in focus. Hover a mark for detail. Spot something wrong? <a href="https://github.com/ecto/tang/issues">Open an issue</a>.</p>
       </div>
     </div>
   </section>
 
-  <!-- Charts rendered by loon WASM (see viz.loon), math by tang WASM -->
-  <script type="module" src="./boot.js"></script>
-
   <!-- ═══════════════════════════════════════════════ -->
-  <!-- // migration                                   -->
+  <!-- // how-tang-works                              -->
   <!-- ═══════════════════════════════════════════════ -->
   <section class="px-4 sm:px-6 py-16 sm:py-24">
     <div class="max-w-3xl mx-auto">
-      <h2 class="text-3xl sm:text-4xl font-bold mb-4">nalgebra → tang<span class="text-accent">.</span></h2>
-      <p class="text-muted text-lg mb-12 max-w-2xl">Drop-in aliases. Minimal call-site changes.</p>
+      <h2 class="text-3xl sm:text-4xl font-semibold">How tang works</h2>
+      <p class="lead">Four ideas carry the whole library. Each is small enough to state in one equation, and one example, <span data-tex="f(x) = x\sin x"></span>, runs through all of them.</p>
+      <article class="mech">
+        <h3 class="mech-h"><span class="mech-n">1</span>Dual numbers carry the derivative</h3>
+        <p>Extend every number with an infinitesimal part <span data-tex="\varepsilon"></span>, where <span data-tex="\varepsilon^2 = 0"></span>. Taylor expansion then stops after one term, so evaluating a function on a dual number returns its value and its exact derivative together:</p>
+      <div class="eq"><div data-tex="f(a + \varepsilon) = f(a) + f^{\prime}(a)\,\varepsilon"></div><span class="eq-n">(1)</span></div>
+        <p>For the running example, ordinary arithmetic on duals gives</p>
+      <div class="eq"><div data-tex="(a+\varepsilon)\sin(a+\varepsilon) = a\sin a + (\sin a + a\cos a)\,\varepsilon"></div><span class="eq-n">(2)</span></div>
+        <figure class="mech-fig" id="m-dual">
+          <div class="md-ctl"><span>a</span><input id="md-a" type="range" min="-6" max="6" step="0.01" value="2"><span id="md-a-v" class="md-num"></span></div>
+          <div class="md-grid">
+            <div class="md-h"></div><div class="md-h">value part</div><div class="md-h">ε part, the derivative</div>
+            <div class="md-l" data-tex="x = a + 1\,\varepsilon"></div><div class="md-c" data-r="0" data-p="v"></div><div class="md-c" data-r="0" data-p="e"></div>
+            <div class="md-l" data-tex="\sin x"></div><div class="md-c" data-r="1" data-p="v"></div><div class="md-c" data-r="1" data-p="e"></div>
+            <div class="md-l" data-tex="x \cdot \sin x"></div><div class="md-c" data-r="2" data-p="v"></div><div class="md-c" data-r="2" data-p="e"></div>
+          </div>
+          <p class="fig-cap"><span class="fig-n"></span><span class="fig-lead">Two numbers per number.</span> Drag <span data-tex="a"></span>. Each operation updates the value part as usual and the ε part by its derivative rule: <span data-tex="\sin"></span> multiplies by <span data-tex="\cos a"></span>, and the product rule adds <span data-tex="1\cdot\sin a + a\cos a"></span>.</p>
+        </figure>
+        <p>In tang this is just a type. Code written once over <code>S: Scalar</code> computes values with <code>f64</code> and derivatives with <code>Dual&lt;f64&gt;</code>, with no tape and no symbolic engine. For many inputs, the same functions trace into a graph instead, and <code>tang-expr</code> runs reverse mode over it.</p>
+      </article>
 
-      <div class="border border-white/10 rounded-xl overflow-hidden">
-        <div class="overflow-x-auto">
-          <table class="w-full text-sm min-w-[320px]">
-            <thead>
-              <tr class="border-b border-white/10">
-                <th class="p-2.5 sm:p-3 text-left font-mono text-muted font-normal">nalgebra</th>
-                <th class="p-2.5 sm:p-3 text-left font-mono text-accent font-normal">tang</th>
-              </tr>
-            </thead>
-            <tbody class="font-mono">
-              <tr class="border-b border-white/[0.05]"><td class="p-3 text-muted">Vector3&lt;f64&gt;</td><td class="p-3">Vec3&lt;f64&gt;</td></tr>
-              <tr class="border-b border-white/[0.05]"><td class="p-3 text-muted">Point3&lt;f64&gt;</td><td class="p-3">Point3&lt;f64&gt;</td></tr>
-              <tr class="border-b border-white/[0.05]"><td class="p-3 text-muted">Unit&lt;Vector3&gt;</td><td class="p-3">Dir3&lt;f64&gt;</td></tr>
-              <tr class="border-b border-white/[0.05]"><td class="p-3 text-muted">Matrix4&lt;f64&gt;</td><td class="p-3">Mat4&lt;f64&gt;</td></tr>
-              <tr class="border-b border-white/[0.05]"><td class="p-3 text-muted">UnitQuaternion</td><td class="p-3">Quat&lt;f64&gt;</td></tr>
-              <tr class="border-b border-white/[0.05]"><td class="p-3 text-muted">DVector&lt;f64&gt;</td><td class="p-3">DVec&lt;f64&gt;</td></tr>
-              <tr><td class="p-3 text-muted">DMatrix&lt;f64&gt;</td><td class="p-3">DMat&lt;f64&gt;</td></tr>
-            </tbody>
-          </table>
-        </div>
+      <article class="mech">
+        <h3 class="mech-h"><span class="mech-n">2</span>Two primitives: views and comprehensions</h3>
+        <p>Above the scalar level, every tensor operation is one form. A <em>comprehension</em> maps each output index to a reduction over some inputs, each read through a <em>view</em>, an affine map from indices to memory:</p>
+      <div class="eq"><div data-tex="\mathrm{out}[\,i\,] \;=\; \bigoplus_{k}\; \mathrm{body}\big(x_0[\,v_0(i,k)\,],\; x_1[\,v_1(i,k)\,],\; \dots\big)"></div><span class="eq-n">(3)</span></div>
+        <p>Matmul, softmax, convolution, gather and attention differ only in their views and their monoid <span data-tex="\oplus"></span>:</p>
+      <div class="eq"><div data-tex="C_{ij} = \sum_k A_{ik}\,B_{kj} \qquad y_i = \max_j\, s_{ij} \qquad \mathrm{conv}_{ct} = \sum_{k} w_{k}\, x_{c,\,t+k}"></div><span class="eq-n">(4)</span></div>
+        <figure class="mech-fig">
+          <svg id="m-views" viewBox="0 0 520 170" class="w-full h-auto block" font-family="IBM Plex Sans, sans-serif" font-size="11"></svg>
+          <p class="fig-cap"><span class="fig-n"></span><span class="fig-lead">Views are index maps.</span> Hover a cell on the right to see which source element it reads. Transpose, broadcast, slice and stride compose by substitution and never touch memory, so every layout choice stays visible to the compiler.</p>
+        </figure>
+      </article>
+
+      <article class="mech">
+        <h3 class="mech-h"><span class="mech-n">3</span>Optimizations are derived, not written</h3>
+        <p>Because everything is one form, the compiler's passes are rewrites over that form. Fusion is a single rule: substitute a map into its consumer. Gradients are comprehensions too. The most striking rewrite turns softmax attention into flash attention. Written naively, attention needs the row maximum before the exponentials:</p>
+      <div class="eq"><div data-tex="o_i = \frac{\sum_j e^{\,s_{ij} - m_i}\, v_j}{\sum_j e^{\,s_{ij} - m_i}}, \qquad m_i = \max_j s_{ij}"></div><span class="eq-n">(5)</span></div>
+        <p>The <code>stabilize_softmax</code> pass rewrites the max and the two sums into one reduction whose state <span data-tex="(m, \ell, \mathbf{o})"></span> is updated per key, so the scores never reach memory:</p>
+      <div class="eq"><div data-tex="m^{\prime} = \max(m, s_j), \quad \ell^{\prime} = \ell\, e^{\,m - m^{\prime}} + e^{\,s_j - m^{\prime}}, \quad \mathbf{o}^{\prime} = \mathbf{o}\, e^{\,m - m^{\prime}} + e^{\,s_j - m^{\prime}}\, v_j"></div><span class="eq-n">(6)</span></div>
+        <figure class="mech-fig">
+          <svg id="m-flash" viewBox="0 0 620 230" class="w-full h-auto block" font-family="IBM Plex Sans, sans-serif" font-size="11"></svg>
+          <p class="fig-cap"><span class="fig-n"></span><span class="fig-lead">Same answer, no score matrix.</span> Left, attention as written: every score is stored, then read back for the max and both sums. Right, the derived reduction: keys stream past once while three running values carry everything needed. Memory written per query row is shown below each.</p>
+        </figure>
+        <p>That combine is associative, so it tiles and parallelizes like any sum. The derived kernel runs 7.6× faster than tang's hand-written attention at <span data-tex="n = 1024"></span>, and the compiler contains no attention-specific code.</p>
+      </article>
+
+      <article class="mech">
+        <h3 class="mech-h"><span class="mech-n">4</span>Lowering to each chip</h3>
+        <p>A scheduled graph prints directly as source for each backend. Here is the running example with its derivative, exactly as the live demo at the top emits it. Each line is one node of the graph, and shared subexpressions are computed once:</p>
+      <div class="eq"><div data-tex="\textcolor{#ff5f00}{f} = x \sin x, \qquad \textcolor{#00b8c4}{f^{\prime}} = \sin x + x \cos x"></div><span class="eq-n">(7)</span></div>
+        <figure class="mech-fig" id="m-lower">
+          <div class="gpanel" data-graph="lower"></div>
+          <div class="ml-tabs"><button data-ml="cuda" class="on">CUDA</button><button data-ml="wgsl">WGSL</button><button data-ml="msl">Metal</button><button data-ml="c">C</button></div>
+          <pre id="ml-code" class="mech-code"></pre>
+          <p class="fig-cap"><span class="fig-n"></span><span class="fig-lead">One graph, any backend.</span> Hover a node to find its line, or a line to find its node: each <code>t</code> variable is one node. The same nodes print as CUDA, WGSL, Metal or C; for tensor graphs, schedules add tiling, tensor-core fragments and fused epilogues.</p>
+        </figure>
+      </article>
+
+    </div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════ -->
+  <!-- // further-reading                             -->
+  <!-- ═══════════════════════════════════════════════ -->
+  <section class="px-4 sm:px-6 py-16 sm:py-24">
+    <div class="max-w-3xl mx-auto">
+      <h2 class="text-3xl sm:text-4xl font-semibold">Further reading</h2>
+      <p class="lead">The same IR reaches further than this page shows. Four places to start.</p>
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-10">
+        <a href="https://github.com/ecto/tang/blob/main/crates/tang-compile/src/tensor_modq.rs" class="deeper group" style="--dc:#ff5f00">
+          <div class="deeper-art"><svg viewBox="0 0 300 145" class="w-full h-auto block" style="color: var(--dc)" font-family="IBM Plex Sans, sans-serif"><defs><marker id="ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0 L10 5 L0 10z" fill="#ff5f00"/></marker><marker id="ahc" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0 L10 5 L0 10z" fill="#00f0ff"/></marker><marker id="ahy" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0 L10 5 L0 10z" fill="#ffd400"/></marker></defs><circle cx="40" cy="22" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="76" cy="22" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="112" cy="22" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="148" cy="22" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="184" cy="22" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="220" cy="22" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="256" cy="22" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="54" cy="46" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="90" cy="46" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="126" cy="46" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="162" cy="46" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="198" cy="46" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="234" cy="46" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="270" cy="46" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="68" cy="70" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="104" cy="70" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="140" cy="70" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="176" cy="70" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="212" cy="70" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="248" cy="70" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="284" cy="70" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="82" cy="94" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="118" cy="94" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="154" cy="94" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="190" cy="94" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="226" cy="94" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="262" cy="94" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="298" cy="94" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="96" cy="118" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="132" cy="118" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="168" cy="118" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="204" cy="118" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="240" cy="118" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="276" cy="118" r="2" fill="var(--m-muted)" opacity=".6"/><circle cx="312" cy="118" r="2" fill="var(--m-muted)" opacity=".6"/><path d="M68 70 L132 46" stroke="currentColor" stroke-width="2.5" marker-end="url(#ah)"/><path d="M68 70 L110 118" stroke="#00f0ff" stroke-width="2.5" marker-end="url(#ahc)"/><circle cx="68" cy="70" r="4" fill="currentColor"/><g transform="translate(232 52)"><rect x="0" y="22" width="44" height="34" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 22 V12 a14 14 0 0 1 28 0 V22" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="22" cy="38" r="4" fill="currentColor"/></g></svg></div>
+          <div class="deeper-text">
+            <div class="deeper-title">Constant-time lattice crypto</div>
+            <p class="deeper-desc">Integer tensors mod q with a secrecy label on every node. KEMs and signatures, checked for constant time down to machine code.</p>
+            <span class="deeper-link">tensor_modq.rs →</span>
+          </div>
+        </a>
+        <a href="https://github.com/ecto/tang/tree/main/crates" class="deeper group" style="--dc:#00f0ff">
+          <div class="deeper-art"><svg viewBox="0 0 300 145" class="w-full h-auto block" style="color: var(--dc)" font-family="IBM Plex Sans, sans-serif"><g fill="none" stroke="var(--m-muted)" stroke-width="1"><path d="M150 30 L60 72"/><path d="M150 30 L120 72"/><path d="M150 30 L180 72"/><path d="M150 30 L240 72"/><path d="M60 82 L40 120"/><path d="M60 82 L90 120"/><path d="M120 82 L90 120"/><path d="M180 82 L150 120"/><path d="M180 82 L210 120"/><path d="M240 82 L270 120"/></g><rect x="122" y="18" width="56" height="22" fill="var(--m-bg)" stroke="currentColor"/><text x="150" y="33" text-anchor="middle" font-size="10" fill="currentColor">tang</text><rect x="34" y="66" width="52" height="20" fill="var(--m-bg)" stroke="currentColor" stroke-opacity=".6"/><text x="60" y="80" text-anchor="middle" font-size="9" fill="currentColor">la</text><rect x="94" y="66" width="52" height="20" fill="var(--m-bg)" stroke="currentColor" stroke-opacity=".6"/><text x="120" y="80" text-anchor="middle" font-size="9" fill="currentColor">expr</text><rect x="154" y="66" width="52" height="20" fill="var(--m-bg)" stroke="currentColor" stroke-opacity=".6"/><text x="180" y="80" text-anchor="middle" font-size="9" fill="currentColor">compile</text><rect x="214" y="66" width="52" height="20" fill="var(--m-bg)" stroke="currentColor" stroke-opacity=".6"/><text x="240" y="80" text-anchor="middle" font-size="9" fill="currentColor">gpu</text><rect x="20" y="114" width="40" height="16" fill="currentColor" fill-opacity=".15"/><rect x="70" y="114" width="40" height="16" fill="currentColor" fill-opacity=".15"/><rect x="130" y="114" width="40" height="16" fill="currentColor" fill-opacity=".15"/><rect x="190" y="114" width="40" height="16" fill="currentColor" fill-opacity=".15"/><rect x="250" y="114" width="40" height="16" fill="currentColor" fill-opacity=".15"/></svg></div>
+          <div class="deeper-text">
+            <div class="deeper-title">All crates</div>
+            <p class="deeper-desc">Twenty crates, from scalar geometry to LLM serving. Each one depends only on what it needs.</p>
+            <span class="deeper-link">crates/ →</span>
+          </div>
+        </a>
+        <a href="https://github.com/ecto/tang/blob/main/BENCHMARKS.md" class="deeper group" style="--dc:#39ff14">
+          <div class="deeper-art"><svg viewBox="0 0 300 145" class="w-full h-auto block" style="color: var(--dc)" font-family="IBM Plex Sans, sans-serif"><text x="70" y="23" text-anchor="end" font-size="9" fill="var(--m-muted)">vec dot</text><rect x="80" y="14" width="40" height="5" fill="#ff5f00"><animate attributeName="width" from="0" to="40" dur="1.2s" fill="freeze"/></rect><rect x="80" y="21" width="62" height="5" fill="var(--m-muted)" opacity=".7"/><rect x="80" y="28" width="36" height="5" fill="#00f0ff" opacity=".8"/><text x="70" y="53" text-anchor="end" font-size="9" fill="var(--m-muted)">mat4 mul</text><rect x="80" y="44" width="70" height="5" fill="#ff5f00"><animate attributeName="width" from="0" to="70" dur="1.2s" fill="freeze"/></rect><rect x="80" y="51" width="118" height="5" fill="var(--m-muted)" opacity=".7"/><rect x="80" y="58" width="64" height="5" fill="#00f0ff" opacity=".8"/><text x="70" y="83" text-anchor="end" font-size="9" fill="var(--m-muted)">quat rot</text><rect x="80" y="74" width="52" height="5" fill="#ff5f00"><animate attributeName="width" from="0" to="52" dur="1.2s" fill="freeze"/></rect><rect x="80" y="81" width="90" height="5" fill="var(--m-muted)" opacity=".7"/><rect x="80" y="88" width="58" height="5" fill="#00f0ff" opacity=".8"/><text x="70" y="113" text-anchor="end" font-size="9" fill="var(--m-muted)">inverse</text><rect x="80" y="104" width="96" height="5" fill="#ff5f00"><animate attributeName="width" from="0" to="96" dur="1.2s" fill="freeze"/></rect><rect x="80" y="111" width="170" height="5" fill="var(--m-muted)" opacity=".7"/><rect x="80" y="118" width="88" height="5" fill="#00f0ff" opacity=".8"/><text x="290" y="138" text-anchor="end" font-size="9" fill="var(--m-muted)">tang · nalgebra · glam</text></svg></div>
+          <div class="deeper-text">
+            <div class="deeper-title">CPU benchmarks</div>
+            <p class="deeper-desc">Geometry and physics primitives, single-threaded, against nalgebra and glam.</p>
+            <span class="deeper-link">BENCHMARKS.md →</span>
+          </div>
+        </a>
+        <a href="https://github.com/ecto/tang#nalgebra-compatibility" class="deeper group" style="--dc:#ffd400">
+          <div class="deeper-art"><svg viewBox="0 0 300 145" class="w-full h-auto block" style="color: var(--dc)" font-family="IBM Plex Sans, sans-serif"><text x="20" y="34" font-size="11" fill="var(--m-muted)" font-family="IBM Plex Mono, monospace">Vector3&lt;f64&gt;</text><path d="M150 30 H178" stroke="currentColor" stroke-width="1.5" marker-end="url(#ahy)"/><text x="190" y="34" font-size="11" fill="currentColor" font-family="IBM Plex Mono, monospace">Vec3&lt;f64&gt;</text><text x="20" y="62" font-size="11" fill="var(--m-muted)" font-family="IBM Plex Mono, monospace">UnitQuaternion</text><path d="M150 58 H178" stroke="currentColor" stroke-width="1.5" marker-end="url(#ahy)"/><text x="190" y="62" font-size="11" fill="currentColor" font-family="IBM Plex Mono, monospace">Quat&lt;f64&gt;</text><text x="20" y="90" font-size="11" fill="var(--m-muted)" font-family="IBM Plex Mono, monospace">Matrix4&lt;f64&gt;</text><path d="M150 86 H178" stroke="currentColor" stroke-width="1.5" marker-end="url(#ahy)"/><text x="190" y="90" font-size="11" fill="currentColor" font-family="IBM Plex Mono, monospace">Mat4&lt;f64&gt;</text><text x="20" y="118" font-size="11" fill="var(--m-muted)" font-family="IBM Plex Mono, monospace">DMatrix&lt;f64&gt;</text><path d="M150 114 H178" stroke="currentColor" stroke-width="1.5" marker-end="url(#ahy)"/><text x="190" y="118" font-size="11" fill="currentColor" font-family="IBM Plex Mono, monospace">DMat&lt;f64&gt;</text></svg></div>
+          <div class="deeper-text">
+            <div class="deeper-title">Coming from nalgebra</div>
+            <p class="deeper-desc">Drop-in aliases for the types you already use. Both by-value and by-reference calls work.</p>
+            <span class="deeper-link">nalgebra compatibility →</span>
+          </div>
+        </a>
       </div>
     </div>
   </section>
@@ -418,16 +1210,38 @@
   <!-- ═══════════════════════════════════════════════ -->
   <!-- // footer                                      -->
   <!-- ═══════════════════════════════════════════════ -->
-  <footer class="px-4 sm:px-6 py-16 sm:py-24">
-    <div class="max-w-3xl mx-auto text-center">
-      <p class="font-mono text-lg mb-2">tang is <a href="https://github.com/ecto/tang/blob/main/LICENSE" class="text-accent hover:underline">MIT licensed</a>.</p>
-      <p class="text-muted mb-8">built for <a href="https://vcad.io" class="text-accent hover:underline">vcad</a>. usable by everyone.</p>
-      <a href="https://github.com/ecto/tang" class="inline-flex items-center gap-2 text-muted hover:text-txt transition-colors">
-        <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>
-        GitHub
-      </a>
-    </div>
+  <footer class="site-foot">
+    <a href="https://muni.works" class="foot-logo" aria-label="Municipal Robotics"><svg viewBox="-60 -60 880 400" fill="none"><g stroke="currentColor" stroke-width="40" stroke-linecap="round" stroke-linejoin="round" fill="none"> <path d="M 20 240 L 20 100 C 20 50, 80 50, 100 50 C 140 50, 160 70, 160 100"/> <path d="M 160 240 L 160 100"/> <path d="M 160 100 C 160 50, 220 50, 240 50 C 280 50, 300 70, 300 100 L 300 240 C 300 270, 330 280, 370 280 C 410 280, 440 270, 440 240 L 440 100"/> <path d="M 440 100 C 440 50, 500 50, 520 50 C 560 50, 600 70, 600 100 L 600 240 C 600 270, 630 280, 670 280 C 710 280, 740 270, 740 240 L 740 100"/> </g></svg></a>
+    <p>tang is built by <a href="https://muni.works">Municipal Robotics</a> for <a href="https://vcad.io">vcad</a>. Usable by everyone.</p>
+    <p class="foot-links"><a href="https://github.com/ecto/tang">GitHub</a><span>·</span><a href="https://github.com/ecto/tang/blob/main/LICENSE">MIT licensed</a><span>·</span><a href="https://muni.works">muni.works</a></p>
   </footer>
 
+  <script>
+    // single source of truth for backends: hero badges, proof strip, lowerings grid, compare table
+    // master-plan.typ neon: ok, info, warn, fault, flame
+    const PILL_COLORS = ['#39ff14', '#00f0ff', '#ffd400', '#ff2052', '#ff5f00'];
+    const BACKENDS = [
+      ['CUDA', 'wmma · mma.sync · cp.async'],
+      ['Metal', 'simdgroup matrices'],
+      ['Vulkan', 'incl. Adreno 740'],
+      ['WGSL', 'via wgpu, f64 split'],
+      ['OpenCL', ''],
+      ['C', 'cc + dlopen'],
+    ];
+    document.querySelectorAll('[data-backends]').forEach(el => {
+      const kind = el.dataset.backends;
+      if (kind === 'count') el.textContent = BACKENDS.length;
+      if (kind === 'dots') el.innerHTML = BACKENDS.map(([n], i) =>
+        `<span class="pill" style="--pill:${PILL_COLORS[(i + 2) % PILL_COLORS.length]}">${n}</span>`).join('');
+      if (kind === 'title') el.title = BACKENDS.map(b => b[0]).join(', ');
+      if (kind === 'list') el.textContent = BACKENDS.map(b => b[0]).join(', ');
+      if (kind === 'badges') el.innerHTML = BACKENDS.map(([n], i) =>
+        `<span class="pill" style="--pill:${PILL_COLORS[(i + 2) % PILL_COLORS.length]}">${n}</span>`).join('');
+      if (kind === 'chips') el.innerHTML = BACKENDS.map(([n]) =>
+        `<div class="px-3 py-2 rounded-lg border border-accent/30 bg-accent/5 text-accent text-center">${n}</div>`).join('');
+      if (kind === 'grid') el.innerHTML = BACKENDS.map(([n, note]) =>
+        `<div class="px-4 py-3 border-b border-r border-white/[0.05]"><span class="text-accent">${n}</span> <span class="text-muted">${note}</span></div>`).join('');
+    });
+  </script>
 </body>
 </html>
