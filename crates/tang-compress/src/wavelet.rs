@@ -79,8 +79,7 @@ impl Pyramid {
         let mut split = Vec::new();
         while split.len() < max_levels {
             let cur = *lens.last().unwrap();
-            let ml: usize = std::env::var("TC_MINLEN").ok().and_then(|v| v.parse().ok()).unwrap_or(MIN_LEN);
-            let s = [0, 1, 2].map(|a| cur[a] >= ml);
+            let s = [0, 1, 2].map(|a| cur[a] >= MIN_LEN);
             if !s.iter().any(|&b| b) {
                 break;
             }

@@ -94,7 +94,7 @@ fn max_levels(dims: &[usize]) -> usize {
     if dims.iter().filter(|&&d| d > 1).count() <= 1 {
         MAX_LEVELS_1D
     } else {
-        std::env::var("TC_MAXLEV").ok().and_then(|v| v.parse().ok()).unwrap_or(MAX_LEVELS)
+        MAX_LEVELS
     }
 }
 
@@ -454,15 +454,21 @@ fn encode_impl(x: &[f64], dims: &[usize], dt: Dtype, cfg: &WavConfig) -> (Vec<u8
         (b, s)
     } else {
         let ErrorBound::MaxAbs(b) = cfg.bound else { unreachable!() };
-        let mut best: Option<(Vec<u8>, WavStats)> = None;
+        // search the wavelet step with the hand model (cheap), then code the
+        // winner with the configured model
+        let hand = WavConfig { model: ModelChoice::Hand, ..cfg.clone() };
+        let mut best: Option<(usize, f64)> = None;
+        let mut passes = 0;
         for f in [1.0, 1.4, 1.8, 2.2, 2.7, 3.3, 4.0, 5.0] {
-            let (bytes, mut s, _) = encode_at(x, &co, &h, f * b, cfg, Some(b));
-            s.passes = 1;
-            if best.as_ref().is_none_or(|(bb, _)| bytes.len() < bb.len()) {
-                best = Some((bytes, s));
+            let (bytes, _, _) = encode_at(x, &co, &h, f * b, &hand, Some(b));
+            passes += 1;
+            if best.is_none_or(|(n, _)| bytes.len() < n) {
+                best = Some((bytes.len(), f));
             }
         }
-        best.unwrap()
+        let (bytes, mut s, _) = encode_at(x, &co, &h, best.unwrap().1 * b, cfg, Some(b));
+        s.passes = passes;
+        (bytes, s)
     };
     st.range = range;
     st.bits_per_value = 8.0 * bytes.len() as f64 / x.len() as f64;

@@ -120,7 +120,15 @@ pub struct Feat {
     pub has_par: bool,
     /// Capped magnitude of the in-band prediction (0 when prediction is off).
     pub pm: u16,
+    /// Signed context values: 0–7 behind `nb`, 8 parent, 9 NN, 10 UU,
+    /// 11 UE, 12–17 the parent's face neighbours (−/+ per axis).
+    pub sv: [i32; NSV],
+    /// Signed in-band prediction.
+    pub pv: i32,
 }
+
+/// Signed context values per coefficient.
+pub const NSV: usize = 18;
 
 /// Subband class of a band.
 pub fn band_class(b: &Band) -> u8 {
@@ -258,50 +266,63 @@ pub fn features(p: &Pyramid, bi: usize, pbi: Option<usize>, q: &[i32], z: usize,
     let mut f = Feat { class: band_class(b), mask: b.mask, ..Default::default() };
     if x > x0 {
         let w = at(z, y, x - 1);
-        f.nb[0] = mag(w);
+        { let t = w; f.nb[0] = mag(t); f.sv[0] = t; }
         f.sg[0] = sgn(w);
         if x > x0 + 1 {
-            f.nb[7] = mag(at(z, y, x - 2));
+            { let t = at(z, y, x - 2); f.nb[7] = mag(t); f.sv[7] = t; }
         }
+    }
+    if y > y0 + 1 {
+        f.sv[9] = at(z, y - 2, x);
+    }
+    if z > z0 + 1 {
+        f.sv[10] = at(z - 2, y, x);
+    }
+    if z > z0 && x + 1 < x1 {
+        f.sv[11] = at(z - 1, y, x + 1);
     }
     if y > y0 {
         let n = at(z, y - 1, x);
-        f.nb[1] = mag(n);
+        { let t = n; f.nb[1] = mag(t); f.sv[1] = t; }
         f.sg[1] = sgn(n);
         if x > x0 {
-            f.nb[3] = mag(at(z, y - 1, x - 1));
+            { let t = at(z, y - 1, x - 1); f.nb[3] = mag(t); f.sv[3] = t; }
         }
         if x + 1 < x1 {
-            f.nb[4] = mag(at(z, y - 1, x + 1));
+            { let t = at(z, y - 1, x + 1); f.nb[4] = mag(t); f.sv[4] = t; }
         }
     }
     if z > z0 {
         let u = at(z - 1, y, x);
-        f.nb[2] = mag(u);
+        { let t = u; f.nb[2] = mag(t); f.sv[2] = t; }
         f.sg[2] = sgn(u);
         if x > x0 {
-            f.nb[5] = mag(at(z - 1, y, x - 1));
+            { let t = at(z - 1, y, x - 1); f.nb[5] = mag(t); f.sv[5] = t; }
         }
         if y > y0 {
-            f.nb[6] = mag(at(z - 1, y - 1, x));
+            { let t = at(z - 1, y - 1, x); f.nb[6] = mag(t); f.sv[6] = t; }
         }
     }
     if let Some(pi) = pbi {
         let pb = &p.bands[pi];
         let pp = p.parent_pos(b, pb, [z, y, x]);
         f.has_par = true;
-        f.par = mag(at(pp[0], pp[1], pp[2]));
+        { let t = at(pp[0], pp[1], pp[2]); f.par = mag(t); f.sv[8] = t; }
         let mut s = 0u32;
         for a in 0..3 {
             let mut lo = pp;
             if lo[a] > pb.start[a] {
                 lo[a] -= 1;
-                s += at(lo[0], lo[1], lo[2]).unsigned_abs().min(CAP as u32);
+                let t = at(lo[0], lo[1], lo[2]);
+                f.sv[12 + 2 * a] = t;
+                s += t.unsigned_abs().min(CAP as u32);
             }
             let mut hi = pp;
             if hi[a] + 1 < pb.end[a] {
                 hi[a] += 1;
-                s += at(hi[0], hi[1], hi[2]).unsigned_abs().min(CAP as u32);
+                let t = at(hi[0], hi[1], hi[2]);
+                f.sv[13 + 2 * a] = t;
+                s += t.unsigned_abs().min(CAP as u32);
             }
         }
         f.pnb = s.min(CAP as u32) as u16;
@@ -490,6 +511,7 @@ fn traverse(p: &Pyramid, q: &mut [i32], res: &mut [i32], preds: &[Pred], mut f: 
                     let mut ft = features(p, bi, pbi, res, z, y, x);
                     let pv = if pr.on { predict(&pr.w, &taps(p, bi, pbi, q, z, y, x)) } else { 0 };
                     ft.pm = pv.unsigned_abs().min(CAP as u32) as u16;
+                    ft.pv = pv;
                     let r = f(&ft, pv, q[i].wrapping_sub(pv));
                     res[i] = r;
                     q[i] = r + pv;
