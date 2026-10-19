@@ -17,5 +17,12 @@ tang-optim = { workspace = true }
 # Blocked symmetric eigensolver (tang-la already bridges faer 0.24 behind a
 # feature). No rayon: the codec is single threaded by design.
 faer = { version = "0.24", default-features = false, features = ["std"] }
+# GPU decoder for the tc-gpu stream (hand-written WGSL kernels).
+wgpu = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+
+[features]
+default = []
+gpu = ["dep:wgpu", "dep:pollster"]
 
 [dev-dependencies]
