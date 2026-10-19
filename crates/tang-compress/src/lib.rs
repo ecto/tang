@@ -36,13 +36,28 @@
 // allows this lint workspace-wide too.
 #![allow(clippy::needless_range_loop)]
 
+pub mod abac;
 pub mod bitio;
+pub mod coefcode;
 pub mod codec;
+pub mod learned;
 pub mod linalg;
 pub mod rans;
 pub mod tensorize;
 pub mod tt;
+pub mod tucker;
+pub mod wavcodec;
+pub mod wavelet;
 
 pub use codec::{decode, encode_f32, encode_f64, Config, Decoded, Dtype, EncodeStats, ErrorBound};
 pub use tensorize::{DigitOrder, Layout, PadPolicy};
 pub use tt::{tt_svd, TensorTrain, Truncation};
+
+/// Decode any tang-compress stream (QTT, wavelet or Tucker), by magic.
+pub fn decode_any(bytes: &[u8]) -> Result<Decoded, bitio::DecodeError> {
+    match bytes.get(..4) {
+        Some(m) if m == wavcodec::MAGIC => wavcodec::decode(bytes),
+        Some(m) if m == tucker::MAGIC => tucker::decode(bytes),
+        _ => codec::decode(bytes),
+    }
+}
