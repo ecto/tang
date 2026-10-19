@@ -3,6 +3,8 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "tang",
+  // Municipal Robotics (cam@muni.works); pinned so deploys never land in a personal account
+  "account_id": "45c5b88a0c035f973b32e7e36f3d9f4a",
   "compatibility_date": "2026-05-01",
   "assets": {
     "directory": "./site",
