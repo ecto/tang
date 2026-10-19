@@ -85,14 +85,14 @@ pub struct Config {
 }
 
 impl Config {
-    /// Defaults (Morton, mixed radix, no GD, rank cap 512) for a bound.
+    /// Defaults (Morton, mixed radix, no GD, rank cap 1024) for a bound.
     pub fn new(bound: ErrorBound) -> Self {
         Self {
             bound,
             order: DigitOrder::Morton,
             pad: PadPolicy::MixedRadix,
             gavish_donoho: false,
-            max_rank: 512,
+            max_rank: 1024,
         }
     }
 }
@@ -438,6 +438,8 @@ fn search_delta(
     };
     let mut lo: Option<(f64, f64, QPass)> = None; // feasible (delta, sse, pass)
     let mut hi: Option<(f64, f64)> = None; // infeasible
+                                           // Lowest-SSE pass seen, returned if the target is unreachable (rank cap).
+    let mut best_infeasible: Option<(f64, f64, QPass)> = None;
     let mut delta = guess;
     for _ in 0..14 {
         let p = run(delta);
@@ -446,8 +448,16 @@ fn search_delta(
             if lo.as_ref().is_none_or(|l| delta > l.0) {
                 lo = Some((delta, s, p));
             }
-        } else if hi.is_none_or(|h| delta < h.0) {
-            hi = Some((delta, s));
+        } else {
+            if hi.is_none_or(|h| delta < h.0) {
+                hi = Some((delta, s));
+            }
+            if best_infeasible.as_ref().is_none_or(|b| s < b.1) {
+                best_infeasible = Some((delta, s, p));
+            } else if lo.is_none() {
+                // Shrinking Δ stopped helping: the rank cap binds.
+                break;
+            }
         }
         delta = match (&lo, &hi) {
             (Some((dl, sl, _)), Some((dh, sh))) => {
@@ -478,9 +488,7 @@ fn search_delta(
     match lo {
         Some((d, _, p)) => (d, p),
         None => {
-            // Fall back to a very fine step (never expected in practice).
-            let d = hi.map(|h| h.0).unwrap_or(guess) * 1e-3;
-            let p = run(d);
+            let (d, _, p) = best_infeasible.expect("at least one pass ran");
             (d, p)
         }
     }
@@ -538,7 +546,13 @@ fn write_stream(
         }
     }
     let header = w.buf.len();
-    let blocks: Vec<&[i64]> = b.pass.q.iter().map(|v| v.as_slice()).collect();
+    // A zero rank anywhere means an all-zero tensor: no core payload (the
+    // decoder expects none).
+    let blocks: Vec<&[i64]> = if b.pass.ranks.contains(&0) {
+        Vec::new()
+    } else {
+        b.pass.q.iter().map(|v| v.as_slice()).collect()
+    };
     encode_blocks(&mut w, &blocks);
     let core = w.buf.len() - header;
     match residual {
@@ -619,7 +633,9 @@ fn encode_impl(x: &[f64], dims: &[usize], cfg: &Config, dt: Dtype) -> (Vec<u8>, 
                 .map(|&v| cast(v, dt))
                 .collect();
             let (true_rmse, _) = errors(x, &rec);
-            let ok = true_rmse <= rmse;
+            // Stop if met, or if the search could not even meet its own
+            // (predicted) target — tightening further cannot help.
+            let ok = true_rmse <= rmse || pass.sse > target;
             out = Some(Built {
                 layout: layout.clone(),
                 delta,
@@ -672,13 +688,27 @@ fn encode_impl(x: &[f64], dims: &[usize], cfg: &Config, dt: Dtype) -> (Vec<u8>, 
             let mut best: Option<(usize, Built, Residual)> = None;
             let mut guess = bound;
             let mut prev_f = 0.0;
-            for f in [0.25, 0.4, 0.6] {
-                if prev_f > 0.0 {
-                    guess *= f / prev_f;
-                }
-                prev_f = f;
-                let b = l2_build(f * bound, guess, &mut passes);
-                guess = b.delta;
+            // f = 0 is the residual-only candidate (TT quantized to zero): it
+            // wins when the field has no low-rank structure (noise).
+            for f in [0.0, 0.25, 0.4, 0.6] {
+                let b = if f == 0.0 {
+                    passes += 1;
+                    let delta = 1e300;
+                    let pass = quantized_pass(&tensor, &layout.modes, delta, false, 0);
+                    Built {
+                        layout: layout.clone(),
+                        delta,
+                        pass,
+                    }
+                } else {
+                    if prev_f > 0.0 {
+                        guess *= f / prev_f;
+                    }
+                    prev_f = f;
+                    let b = l2_build(f * bound, guess, &mut passes);
+                    guess = b.delta;
+                    b
+                };
                 let rec = reconstruct(&layout, &b.pass, b.delta);
                 let mut pos = Vec::new();
                 let mut vals = Vec::new();
@@ -925,6 +955,28 @@ mod tests {
         let (bytes, st) = encode_f64(&x, &[n], &Config::new(ErrorBound::Psnr(80.0)));
         assert!(st.ranks.iter().all(|&r| r <= 6), "{:?}", st.ranks);
         assert!(bytes.len() < 2000, "{} bytes", bytes.len());
+    }
+
+    #[test]
+    fn rank_cap_and_zero_rank_still_meet_max_abs() {
+        // White noise at rank cap 4: the L2 target is unreachable, so the
+        // residual stream must carry the bound. A huge Δ quantizes everything
+        // to zero (rank 0); the stream must still parse.
+        let mut seed = 9u64;
+        let x: Vec<f64> = (0..4096)
+            .map(|_| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+            })
+            .collect();
+        let mut cfg = Config::new(ErrorBound::MaxAbs(1e-3));
+        cfg.max_rank = 4;
+        let (bytes, st) = encode_f64(&x, &[4096], &cfg);
+        let rec = as_f64(decode(&bytes).unwrap());
+        assert!(errors(&x, &rec).1 <= 1e-3, "{}", st.max_abs);
+        let (bytes, _) = encode_f64(&x, &[4096], &Config::new(ErrorBound::MaxAbs(0.45)));
+        let rec = as_f64(decode(&bytes).unwrap());
+        assert!(errors(&x, &rec).1 <= 0.45);
     }
 
     #[test]
