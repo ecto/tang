@@ -1,0 +1,20 @@
+# The page itself always revalidates, so a deploy shows up on the next load.
+/
+  Cache-Control: public, max-age=0, must-revalidate
+/index.html
+  Cache-Control: public, max-age=0, must-revalidate
+
+# boot.js is loaded with a ?v= cache-buster, so it can be cached for good.
+/boot.js
+  Cache-Control: public, max-age=31536000, immutable
+
+# The tang WASM is busted too, but loon's is not: cache for a day and
+# refresh in the background.
+/pkg/*
+  Cache-Control: public, max-age=86400, stale-while-revalidate=604800
+
+# Data and art change without a buster; cache briefly.
+/graphs.json
+  Cache-Control: public, max-age=3600
+/viz.loon
+  Cache-Control: public, max-age=3600

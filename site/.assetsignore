@@ -1,0 +1,5 @@
+_headers
+.assetsignore
+pkg/**/README.md
+pkg/**/package.json
+pkg/**/*.d.ts

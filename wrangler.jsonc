@@ -1,0 +1,11 @@
+// Cloudflare Workers static assets: serves the landing page in site/.
+// Deploy: npx wrangler deploy
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "tang",
+  "compatibility_date": "2026-05-01",
+  "assets": {
+    "directory": "./site",
+    "not_found_handling": "404-page"
+  }
+}
