@@ -282,9 +282,16 @@ fn quantized_pass(x: &[f64], modes: &[usize], delta: f64, gd: bool, max_rank: us
             }
             let htq = kron_eye_apply(&h, r_prev, nk, &qm, r);
             let hk = matmul_tn(&qm, &htq, m, r, r);
-            let Some(lk) = cholesky(&hk, r) else {
-                keep.pop();
-                continue;
+            // Drop trailing (smallest-σ) columns while the quantized Gram is
+            // singular or ill-conditioned: the metric bookkeeping (and the
+            // refit) degrade like cond(Hk), and a near-dependent column buys
+            // no rate anyway.
+            let lk = match cholesky(&hk, r) {
+                Some(lk) if chol_cond_ok(&lk, r) => lk,
+                _ => {
+                    keep.pop();
+                    continue;
+                }
             };
             let b = matmul_tn(&htq, &c, m, r, cols);
             // W = Hk⁻¹ B through an explicit inverse (Hk ≈ I, well conditioned)
@@ -344,6 +351,15 @@ fn quantized_pass(x: &[f64], modes: &[usize], delta: f64, gd: bool, max_rank: us
         q: qs,
         sse,
     }
+}
+
+/// `min/max` of the Cholesky diagonal ≥ 1e-3, i.e. cond(Hk) ≲ 1e6.
+fn chol_cond_ok(l: &[f64], r: usize) -> bool {
+    let d: Vec<f64> = (0..r).map(|i| l[i * r + i]).collect();
+    let (mn, mx) = d
+        .iter()
+        .fold((f64::INFINITY, 0.0f64), |(a, b), &v| (a.min(v), b.max(v)));
+    mn >= 1e-3 * mx
 }
 
 fn candidate_count(
