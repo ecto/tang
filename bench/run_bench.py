@@ -37,6 +37,7 @@ HERE = Path(__file__).resolve().parent
 OUT = HERE / "out"
 DATA = HERE / "data"
 QTT = HERE.parent / "target" / "release" / "examples" / "qtt"
+TC = HERE.parent / "target" / "release" / "examples" / "tc"
 OUT.mkdir(exist_ok=True)
 
 
@@ -193,6 +194,45 @@ def run_tthresh(x: np.ndarray, psnr_target: float) -> dict:
     return {"bpv": 8 * bs.stat().st_size / x.size, "psnr": psnr, "max_abs": mx, "rmse": rmse, "enc_s": enc, "dec_s": dec, "extra": f"p={psnr_target:g}"}
 
 
+def run_tc(x: np.ndarray, codec: str, bound_args: list[str], model: str = "hand") -> dict:
+    """tang-compress wavelet/Tucker via the `tc` example; decoded by the
+    binary's decoder and measured here, rate = stream file size."""
+    src, bs, out = OUT / "tc_in.f32", OUT / "tc.bs", OUT / "tc_out.f32"
+    x.astype("<f4").tofile(src)
+    dims = "x".join(str(d) for d in x.shape)
+    t = time.perf_counter()
+    res = subprocess.run([str(TC), "encode", str(src), str(bs), "--dims", dims, "--codec", codec, "--model", model, *bound_args],
+                         capture_output=True, text=True, check=True)
+    enc = time.perf_counter() - t
+    j = json.loads(res.stdout.strip().splitlines()[-1])
+    t = time.perf_counter()
+    d = json.loads(subprocess.run([str(TC), "decode", str(bs), str(out)], capture_output=True, text=True, check=True).stdout)
+    dec = time.perf_counter() - t
+    y = np.fromfile(out, dtype="<f4").reshape(x.shape)
+    rmse, psnr, mx = metrics(x, y)
+    extra = " ".join(f"{k}={j[k]}" for k in ("coef_bytes", "model_bytes", "outlier_bytes", "n_outliers", "core_bytes", "factor_bytes", "ranks") if k in j)
+    return {"bpv": 8 * bs.stat().st_size / x.size, "psnr": psnr, "max_abs": mx, "rmse": rmse,
+            "enc_s": j["encode_s"], "dec_s": d["decode_s"], "enc_wall_s": enc, "dec_wall_s": dec, "extra": extra}
+
+
+def tang_extra(name, x, rows, models=("hand",)):
+    """tang-compress M1 codecs: wavelet (PSNR + max-abs) and Tucker (PSNR)."""
+    rng = float(x.max() - x.min())
+    def add(codec, r, kind, **kw):
+        r = {"dataset": name, "n": x.size, "codec": codec, "kind": kind, **kw, **r}
+        rows.append(r)
+        print(f"  {codec:16s} {kind:6s} bpv={r['bpv']:.4f} psnr={r['psnr']:.2f} max={r['max_abs']/rng:.2e}R enc={r['enc_s']:.2f}s dec={r['dec_s']:.3f}s {r['extra']}", flush=True)
+    for model in models:
+        tag = "" if model == "hand" else "-" + model.split(":")[0]
+        for p in [30, 40, 50, 60, 70, 80, 90, 100]:
+            add("tc-wavelet" + tag, run_tc(x, "wavelet", ["--psnr", str(p)], model), "psnr")
+        for rel in [1e-2, 1e-3, 1e-4]:
+            add("tc-wavelet" + tag, run_tc(x, "wavelet", ["--max-rel", repr(rel)], model), "maxabs", bound_rel=rel)
+    if x.ndim > 1 and "hand" in models:
+        for p in [30, 40, 50, 60, 70, 80, 90, 100]:
+            add("tc-tucker", run_tc(x, "tucker", ["--psnr", str(p)]), "psnr")
+
+
 def frontier_extra(name, x, rows):
     """SPERR (PSNR + PWE, 1 thread; default threads at ~60 dB) and TTHRESH (PSNR)."""
     rng = float(x.max() - x.min())
@@ -341,6 +381,22 @@ def main():
             frontier_extra(name, x, rows)
         keys = sorted({k for r in rows for k in r})
         with open(OUT / "results_frontier.csv", "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=keys)
+            w.writeheader()
+            w.writerows(rows)
+        return
+    if "--tang" in sys.argv:
+        rows = []
+        only = [a for a in sys.argv[1:] if not a.startswith("--")]
+        models = next((a.split("=", 1)[1].split(",") for a in sys.argv if a.startswith("--models=")), ["hand"])
+        tag = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--tag=")), "tang")
+        for name, x in {**synthetic(), **real_fields()}.items():
+            if only and not any(o in name for o in only):
+                continue
+            print(f"== {name} {x.shape}", flush=True)
+            tang_extra(name, x, rows, models)
+        keys = sorted({k for r in rows for k in r})
+        with open(OUT / f"results_{tag}.csv", "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=keys)
             w.writeheader()
             w.writerows(rows)
