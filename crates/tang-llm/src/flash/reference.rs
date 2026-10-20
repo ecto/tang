@@ -22,6 +22,11 @@
 //! (48 × 128 × 128) start at zero; the PLE conv history (9 × 10240) starts at zero; QSA attends over
 //! every earlier cell of the sequence, through the indexer's block selection.
 //!
+//! The same file also runs GGUF architecture `qwen3next` (Qwen3-Next-80B-A3B, Qwen3-Coder-Next):
+//! one residual stream with pre-norms instead of hyper-connections, gated attention with no
+//! indexer, no PLE ([`Arch::Qwen3Next`], `FlashRef::forward_plain`). Its parity against Hugging
+//! Face is `scripts/qwen3next_tiny.py`.
+//!
 //! Routed experts are dequantised lazily, one (layer, expert) at a time, only for the experts some
 //! token picked. N-gram table rows are read with `pread` at their offsets (16 per token).
 
@@ -36,9 +41,23 @@ use std::time::Instant;
 /// `LLAMA_TOKEN_NULL`: a predecessor before the start of the sequence.
 const TOKEN_NULL: i64 = -1;
 
-/// The model geometry, from GGUF metadata (`qwen4exp.*`).
+/// Which GGUF architecture the file is: the block wiring and a few conventions differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Arch {
+    /// Qwen3.8-Flash-Next: hyper-connections, QSA, PLE; GDN v head `h` reads k head `h % hk`,
+    /// output gate sigmoid, `ssm_alpha` / `ssm_beta` separate.
+    Qwen4Exp,
+    /// Qwen3-Next and Qwen3-Coder-Next: one residual stream with pre-norms (`attn_norm`,
+    /// `post_attention_norm`, `output_norm`, all with the +1 folded in by the converter), dense
+    /// gated attention, GDN v head `h` reads k head `h / (hv / hk)` (grouped), output gate SiLU,
+    /// `ssm_ba` fused per k head as `[b × r | a × r]`.
+    Qwen3Next,
+}
+
+/// The model geometry, from GGUF metadata (`qwen4exp.*` or `qwen3next.*`).
 #[derive(Clone, Debug)]
 pub struct Hparams {
+    pub arch: Arch,
     pub n_embd: usize,
     pub n_layer: usize,
     pub n_vocab: usize,
@@ -128,7 +147,13 @@ impl PleParams {
 impl Hparams {
     pub fn from_gguf(g: &Gguf) -> Result<Self> {
         let arch = g.meta_str("general.architecture")?;
-        ensure!(arch == "qwen4exp", "architecture {arch}, want qwen4exp");
+        if arch == "qwen3next" {
+            return Self::from_gguf_qwen3next(g);
+        }
+        ensure!(
+            arch == "qwen4exp",
+            "architecture {arch}, want qwen4exp or qwen3next"
+        );
         let k = |s: &str| format!("qwen4exp.{s}");
         let u = |s: &str| g.meta_u64(&k(s)).map(|v| v as usize);
         let n_layer = u("block_count")?;
@@ -228,6 +253,7 @@ impl Hparams {
         };
 
         Ok(Self {
+            arch: Arch::Qwen4Exp,
             n_embd,
             n_layer,
             n_vocab,
@@ -259,6 +285,86 @@ impl Hparams {
             is_recurrent,
             ple,
         })
+    }
+}
+
+impl Hparams {
+    /// `qwen3next` (Qwen3-Next-80B-A3B, Qwen3-Coder-Next): no hyper-connections (`hc` = 1), no
+    /// indexer (`idx_heads` = 0: every full-attention layer attends to every earlier cell), no PLE.
+    fn from_gguf_qwen3next(g: &Gguf) -> Result<Self> {
+        let k = |s: &str| format!("qwen3next.{s}");
+        let u = |s: &str| g.meta_u64(&k(s)).map(|v| v as usize);
+        let n_layer = u("block_count")?;
+        let is_recurrent: Vec<bool> = match g.meta.get(&k("attention.recurrent_layers")) {
+            Some(v) => v
+                .as_array()
+                .context("attention.recurrent_layers is not an array")?
+                .iter()
+                .take(n_layer)
+                .map(|x| x.as_u64().unwrap_or(0) != 0)
+                .collect(),
+            None => {
+                let every = g
+                    .meta
+                    .get(&k("full_attention_interval"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(4) as usize;
+                ensure!(every > 0, "full_attention_interval is 0");
+                (0..n_layer).map(|i| (i + 1) % every != 0).collect()
+            }
+        };
+        let hp = Self {
+            arch: Arch::Qwen3Next,
+            n_embd: u("embedding_length")?,
+            n_layer,
+            n_vocab: g.info("token_embd.weight")?.dims[1] as usize,
+            eps: g.meta_f64(&k("attention.layer_norm_rms_epsilon"))? as f32,
+            hc: 1,
+            hc_lr: 0,
+            n_head: u("attention.head_count")?,
+            n_head_kv: u("attention.head_count_kv")?,
+            head_dim: u("attention.key_length")?,
+            n_rot: u("rope.dimension_count")?,
+            rope_base: g.meta_f64(&k("rope.freq_base"))? as f32,
+            rope_sections: [0; 4],
+            idx_heads: 0,
+            idx_dim: 0,
+            idx_top_k: 0,
+            kpool: 0,
+            ssm_d_conv: u("ssm.conv_kernel")?,
+            ssm_d_state: u("ssm.state_size")?,
+            ssm_k_heads: u("ssm.group_count")?,
+            ssm_v_heads: u("ssm.time_step_rank")?,
+            n_expert: u("expert_count")?,
+            n_expert_used: u("expert_used_count")?,
+            n_ff_exp: u("expert_feed_forward_length")?,
+            expert_weights_scale: g
+                .meta
+                .get(&k("expert_weights_scale"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0) as f32,
+            is_recurrent,
+            ple: None,
+        };
+        ensure!(
+            hp.ssm_v_heads.is_multiple_of(hp.ssm_k_heads),
+            "GDN v heads {} not a multiple of k heads {}",
+            hp.ssm_v_heads,
+            hp.ssm_k_heads
+        );
+        ensure!(
+            hp.n_head.is_multiple_of(hp.n_head_kv) && hp.n_rot <= hp.head_dim,
+            "attention head shapes"
+        );
+        Ok(hp)
+    }
+
+    /// The k head GDN value head `vh` reads.
+    pub fn gdn_k_head(&self, vh: usize) -> usize {
+        match self.arch {
+            Arch::Qwen4Exp => vh % self.ssm_k_heads,
+            Arch::Qwen3Next => vh / (self.ssm_v_heads / self.ssm_k_heads),
+        }
     }
 }
 
@@ -616,6 +722,8 @@ pub struct FlashRef {
     pub hc_act_int8: bool,
     /// Write the one-layer-ahead expert prediction study here (see [`lookahead`]).
     pub lookahead: Option<PathBuf>,
+    /// When set, every output position's full f32 logits are appended here (`[n_out][n_vocab]`).
+    pub logits: Option<std::sync::Mutex<Vec<f32>>>,
 }
 
 /// Predicted experts kept per method in the lookahead study.
@@ -674,6 +782,7 @@ impl FlashRef {
                 .collect(),
             hc_act_int8: false,
             lookahead: None,
+            logits: None,
         })
     }
 
@@ -755,6 +864,9 @@ impl FlashRef {
         k: usize,
         mut dump: Option<&mut Dump>,
     ) -> Result<(Vec<TopK>, Vec<f32>)> {
+        if self.hp.arch == Arch::Qwen3Next {
+            return self.forward_plain(tokens, out_from, k, dump);
+        }
         let hp = &self.hp;
         let (n, hc, t_len) = (hp.n_embd, hp.hc, tokens.len());
         ensure!(t_len > 0, "no tokens");
@@ -867,6 +979,9 @@ impl FlashRef {
         for c0 in (0..n_out).step_by(64) {
             let c1 = (c0 + 64).min(n_out);
             let logits = head.apply(&x[c0 * n..c1 * n], c1 - c0, false);
+            if let Some(sink) = &self.logits {
+                sink.lock().unwrap().extend_from_slice(&logits);
+            }
             for (j, lg) in logits.chunks(head.rows).enumerate() {
                 let pos = out_from + c0 + j;
                 tops.push(TopK {
@@ -889,6 +1004,100 @@ impl FlashRef {
                 "forward of {t_len} tokens: {:.1}s",
                 start.elapsed().as_secs_f64()
             );
+        }
+        Ok((tops, r))
+    }
+
+    /// [`forward_res`](Self::forward_res) for one residual stream with pre-norms (`qwen3next`):
+    ///
+    /// ```text
+    /// r = embed(t)
+    /// for l: r += mixer(rmsnorm(r) * attn_norm);  r += moe(rmsnorm(r) * post_attention_norm)
+    /// logits = output @ (rmsnorm(r) * output_norm)
+    /// ```
+    fn forward_plain(
+        &self,
+        tokens: &[u32],
+        out_from: usize,
+        k: usize,
+        mut dump: Option<&mut Dump>,
+    ) -> Result<(Vec<TopK>, Vec<f32>)> {
+        let hp = &self.hp;
+        let (n, t_len) = (hp.n_embd, tokens.len());
+        ensure!(t_len > 0, "no tokens");
+        ensure!(out_from < t_len, "no output positions");
+        let last = t_len - 1;
+        let start = Instant::now();
+        let embd = self.g.info("token_embd.weight")?;
+        let mut r = vec![0f32; t_len * n];
+        for (t, &tok) in tokens.iter().enumerate() {
+            ensure!((tok as usize) < hp.n_vocab, "token {tok} out of range");
+            r[t * n..(t + 1) * n].copy_from_slice(&self.g.rows(embd, tok as usize, 1)?);
+        }
+        if let Some(d) = dump.as_deref_mut() {
+            d.f32("embd", &[n], &r[last * n..])?;
+        }
+        let norm = |r: &[f32], w: &[f32]| -> Vec<f32> {
+            let mut x = r.to_vec();
+            x.par_chunks_mut(n).for_each(|s| rms_norm_mul(s, w, hp.eps));
+            x
+        };
+        for l in 0..hp.n_layer {
+            let lt = Instant::now();
+            let x = norm(&r, &self.vec(&self.t(l, "attn_norm.weight"))?);
+            let y = if hp.is_recurrent[l] {
+                self.gdn(l, &x, t_len, dump.as_deref_mut())?
+            } else {
+                self.qsa(l, &x, t_len, dump.as_deref_mut())?
+            };
+            r.iter_mut().zip(&y).for_each(|(a, b)| *a += b);
+            if let Some(d) = dump.as_deref_mut() {
+                d.f32(&format!("L{l:02}.mixer_out"), &[n], &y[last * n..])?;
+                d.f32(&format!("L{l:02}.post_mixer"), &[n], &r[last * n..])?;
+            }
+            let x = norm(&r, &self.vec(&self.t(l, "post_attention_norm.weight"))?);
+            let y = self.moe(l, &x, t_len, dump.as_deref_mut())?;
+            r.iter_mut().zip(&y).for_each(|(a, b)| *a += b);
+            if let Some(d) = dump.as_deref_mut() {
+                d.f32(&format!("L{l:02}.moe_out"), &[n], &y[last * n..])?;
+                d.f32(&format!("L{l:02}.post_moe"), &[n], &r[last * n..])?;
+            }
+            if self.verbose {
+                eprintln!(
+                    "layer {l:2} {} {:6.1}s (total {:6.1}s)",
+                    if hp.is_recurrent[l] { "gdn" } else { "attn" },
+                    lt.elapsed().as_secs_f64(),
+                    start.elapsed().as_secs_f64()
+                );
+            }
+        }
+        let x = norm(&r[out_from * n..], &self.vec("output_norm.weight")?);
+        let head = self.load("output.weight")?;
+        ensure!(head.cols == n, "output.weight is {} wide", head.cols);
+        let n_out = t_len - out_from;
+        let mut tops = Vec::with_capacity(n_out);
+        for c0 in (0..n_out).step_by(64) {
+            let c1 = (c0 + 64).min(n_out);
+            let logits = head.apply(&x[c0 * n..c1 * n], c1 - c0, false);
+            if let Some(sink) = &self.logits {
+                sink.lock().unwrap().extend_from_slice(&logits);
+            }
+            for (j, lg) in logits.chunks(head.rows).enumerate() {
+                let pos = out_from + c0 + j;
+                tops.push(TopK {
+                    pos,
+                    top: top_logprobs(lg, k),
+                });
+                if let Some(d) = dump.as_deref_mut() {
+                    if pos == last {
+                        d.f32("final_x", &[n], &x[(c0 + j) * n..(c0 + j + 1) * n])?;
+                        d.f32("logits", &[lg.len()], lg)?;
+                    }
+                }
+            }
+        }
+        if let Some(d) = dump {
+            d.finish(tokens, last)?;
         }
         Ok((tops, r))
     }
@@ -1017,8 +1226,6 @@ impl FlashRef {
         let d_conv = hp.ssm_d_conv;
         let w_qkv = self.mat(l, "attn_qkv.weight")?;
         let w_z = self.mat(l, "attn_gate.weight")?;
-        let w_a = self.mat(l, "ssm_alpha.weight")?;
-        let w_b = self.mat(l, "ssm_beta.weight")?;
         let conv = self.vec(&self.t(l, "ssm_conv1d.weight"))?; // [d_conv, ch]: tap i of channel c at c*d_conv + i
         let dt = self.vec(&self.t(l, "ssm_dt.bias"))?;
         let a = self.vec(&self.t(l, "ssm_a"))?; // already -exp(A_log)
@@ -1030,8 +1237,7 @@ impl FlashRef {
 
         let qkv = w_qkv.apply(x, t_len, false);
         let z = w_z.apply(x, t_len, false);
-        let alpha = w_a.apply(x, t_len, false);
-        let beta = w_b.apply(x, t_len, false);
+        let (alpha, beta) = self.gdn_alpha_beta(l, x, t_len)?;
 
         // causal conv over [3 zero columns | qkv] (tap 0 is the oldest), SiLU on all channels
         let cols: Vec<Vec<f32>> = (0..ch)
@@ -1073,7 +1279,7 @@ impl FlashRef {
         let results: Vec<(Vec<f32>, f32)> = (0..hv)
             .into_par_iter()
             .map(|vh| {
-                let kh = vh % hk; // GGUF order: v head h reads k head h % 16
+                let kh = hp.gdn_k_head(vh);
                 let mut st = vec![0f32; s * s]; // st[a * s + b]: a = key dim, b = value dim
                 let mut o = vec![0f32; t_len * s];
                 let mut sk = vec![0f32; s];
@@ -1121,8 +1327,13 @@ impl FlashRef {
                 let dst = &mut y[t * vd + vh * s..t * vd + (vh + 1) * s];
                 dst.copy_from_slice(&o[t * s..(t + 1) * s]);
                 rms_norm_mul(dst, &norm, eps);
+                let gate = if hp.arch == Arch::Qwen3Next {
+                    silu
+                } else {
+                    sigmoid
+                };
                 for (j, v) in dst.iter_mut().enumerate() {
-                    *v *= sigmoid(z[t * vd + vh * s + j]);
+                    *v *= gate(z[t * vd + vh * s + j]);
                 }
             }
         }
@@ -1132,6 +1343,33 @@ impl FlashRef {
         }
         let w_o = self.mat(l, "ssm_out.weight")?;
         Ok(w_o.apply(&y, t_len, false))
+    }
+
+    /// The GDN decay-gate and beta projections, `[T][hv]` each (`a`, `b` before softplus and
+    /// sigmoid): `ssm_alpha` and `ssm_beta`, or `qwen3next`'s fused `ssm_ba`, whose row for k head
+    /// `g` is `[b of v heads g·r .. g·r + r | a of the same]`, `r = hv / hk`.
+    fn gdn_alpha_beta(&self, l: usize, x: &[f32], t_len: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+        let hp = &self.hp;
+        if self.g.info(&self.t(l, "ssm_ba.weight")).is_err() {
+            let a = self.mat(l, "ssm_alpha.weight")?.apply(x, t_len, false);
+            let b = self.mat(l, "ssm_beta.weight")?.apply(x, t_len, false);
+            return Ok((a, b));
+        }
+        let (hk, hv) = (hp.ssm_k_heads, hp.ssm_v_heads);
+        let r = hv / hk;
+        let ba = self.mat(l, "ssm_ba.weight")?;
+        ensure!(ba.rows == 2 * hv, "blk.{l}.ssm_ba has {} rows", ba.rows);
+        let y = ba.apply(x, t_len, false);
+        let (mut a, mut b) = (vec![0f32; t_len * hv], vec![0f32; t_len * hv]);
+        for t in 0..t_len {
+            for g in 0..hk {
+                for j in 0..r {
+                    b[t * hv + g * r + j] = y[t * 2 * hv + g * 2 * r + j];
+                    a[t * hv + g * r + j] = y[t * 2 * hv + g * 2 * r + r + j];
+                }
+            }
+        }
+        Ok((a, b))
     }
 
     /// QSA: gated GQA over the cells the indexer selects (all of them until a token sees more
@@ -1144,16 +1382,24 @@ impl FlashRef {
         let q_full = self.mat(l, "attn_q.weight")?.apply(x, t_len, false); // [T][nh][q hd | gate hd]
         let mut kc = self.mat(l, "attn_k.weight")?.apply(x, t_len, false); // [T][nkv][hd]
         let vc = self.mat(l, "attn_v.weight")?.apply(x, t_len, false);
-        let mut k_raw = self.mat(l, "indexer.k_proj.weight")?.apply(x, t_len, false); // [T][idd]
-        let mut qi = self.mat(l, "indexer.q_proj.weight")?.apply(x, t_len, false); // [T][ih][idd]
         let qn = self.vec(&self.t(l, "attn_q_norm.weight"))?;
         let kn = self.vec(&self.t(l, "attn_k_norm.weight"))?;
-        let iqn = self.vec(&self.t(l, "indexer.q_norm.weight"))?;
-        let ikn = self.vec(&self.t(l, "indexer.k_norm.weight"))?;
         ensure!(
             q_full.len() == t_len * nh * 2 * hd && kc.len() == t_len * nkv * hd,
             "blk.{l} QSA shapes"
         );
+        // no indexer (qwen3next): plain causal gated attention over every earlier cell
+        let has_idx = ih > 0;
+        let (mut k_raw, mut qi, iqn, ikn) = if has_idx {
+            (
+                self.mat(l, "indexer.k_proj.weight")?.apply(x, t_len, false), // [T][idd]
+                self.mat(l, "indexer.q_proj.weight")?.apply(x, t_len, false), // [T][ih][idd]
+                self.vec(&self.t(l, "indexer.q_norm.weight"))?,
+                self.vec(&self.t(l, "indexer.k_norm.weight"))?,
+            )
+        } else {
+            Default::default()
+        };
         ensure!(
             qi.len() == t_len * ih * idd && k_raw.len() == t_len * idd,
             "blk.{l} indexer shapes"
@@ -1191,7 +1437,7 @@ impl FlashRef {
             }
         }
         // pooled indexer keys: mean of the block's raw keys, *then* norm, then rope at its first cell
-        let n_blocks = t_len / kp;
+        let n_blocks = if has_idx { t_len / kp } else { 0 };
         let mut pooled = vec![0f32; n_blocks * idd];
         for b in 0..n_blocks {
             let p = &mut pooled[b * idd..(b + 1) * idd];
@@ -1213,7 +1459,7 @@ impl FlashRef {
             }
         }
 
-        let max_blocks = hp.idx_top_k / kp;
+        let max_blocks = if has_idx { hp.idx_top_k / kp } else { 0 };
         let iscale = 1.0 / (idd as f32).sqrt();
         let kq_scale = 1.0 / (hd as f32).sqrt();
         let group = nh / nkv;
@@ -1222,7 +1468,7 @@ impl FlashRef {
             .into_par_iter()
             .map(|t| {
                 // the blocks complete at this token, then the tail cells after them (itself included)
-                let nv = (t + 1) / kp;
+                let nv = if has_idx { (t + 1) / kp } else { 0 };
                 let mut blocks: Vec<usize> = (0..nv).collect();
                 if nv > max_blocks && !self.qsa_dense {
                     // score = Σ_heads relu(q_h · pooled_b) / sqrt(idx_dim)
@@ -1285,7 +1531,7 @@ impl FlashRef {
                 sel_last = sel;
             }
         }
-        if let Some(d) = dump {
+        if let Some(d) = dump.filter(|_| has_idx) {
             d.u32(
                 &format!("L{l:02}.qsa_selected"),
                 &sel_last.unwrap_or_default(),
@@ -1617,7 +1863,7 @@ pub fn top_logprobs(logits: &[f32], k: usize) -> Vec<(u32, f64)> {
 /// contract to every matmul whose weight isn't bf16/f32.
 pub fn cli(args: &[String]) -> Result<()> {
     let usage =
-        "usage: flash-ref <gguf> <ids...> [--ids-file F] [--last N] [--top K] [--dump DIR] [-v]";
+        "usage: flash-ref <gguf> <ids...> [--ids-file F] [--last N] [--top K] [--dump DIR] [--logits FILE] [-v]";
     let mut it = args.iter();
     let path = PathBuf::from(it.next().context(usage)?);
     let mut ids: Vec<u32> = Vec::new();
@@ -1637,6 +1883,7 @@ pub fn cli(args: &[String]) -> Result<()> {
     let mut hc_act_int8 = false;
     let mut lookahead = None;
     let mut dense = DensePolicy::f32();
+    let mut logits_out: Option<PathBuf> = None;
     while let Some(a) = it.next() {
         match a.as_str() {
             "--last" => last = Some(it.next().context("--last N")?.parse().context("--last N")?),
@@ -1682,6 +1929,7 @@ pub fn cli(args: &[String]) -> Result<()> {
                 lookahead = Some(PathBuf::from(it.next().context("--lookahead FILE")?))
             }
             "--dense-as" => dense = DensePolicy::parse(it.next().context("--dense-as POLICY")?)?,
+            "--logits" => logits_out = Some(PathBuf::from(it.next().context("--logits FILE")?)),
             s => ids.push(
                 s.parse()
                     .with_context(|| format!("bad token id {s:?}; {usage}"))?,
@@ -1702,9 +1950,18 @@ pub fn cli(args: &[String]) -> Result<()> {
     m.hc_act_int8 = hc_act_int8;
     m.lookahead = lookahead;
     m.dense = dense;
+    m.logits = logits_out.as_ref().map(|_| Default::default());
     let from = ids.len() - last.unwrap_or(ids.len()).clamp(1, ids.len());
     let mut dump = dump_dir.as_deref().map(Dump::new).transpose()?;
     let tops = m.forward(&ids, from, top, dump.as_mut())?;
+    if let (Some(p), Some(l)) = (&logits_out, &m.logits) {
+        let l = l.lock().unwrap();
+        std::fs::write(
+            p,
+            l.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+        )
+        .with_context(|| format!("writing {}", p.display()))?;
+    }
     let mut out = String::new();
     for t in tops {
         let top: Vec<String> = t
@@ -1849,5 +2106,53 @@ mod tests {
         assert_eq!(t.iter().map(|x| x.0).collect::<Vec<_>>(), vec![1, 3, 2]);
         let z: f64 = lg.iter().map(|&v| (v as f64).exp()).sum();
         assert!((t[0].1 - (2.0f64 - z.ln())).abs() < 1e-9);
+    }
+
+    fn gdn_hparams(arch: Arch, hk: usize, hv: usize) -> Hparams {
+        Hparams {
+            arch,
+            n_embd: 0,
+            n_layer: 0,
+            n_vocab: 0,
+            eps: 1e-6,
+            hc: 1,
+            hc_lr: 0,
+            n_head: 0,
+            n_head_kv: 0,
+            head_dim: 0,
+            n_rot: 0,
+            rope_base: 0.0,
+            rope_sections: [0; 4],
+            idx_heads: 0,
+            idx_dim: 0,
+            idx_top_k: 0,
+            kpool: 0,
+            ssm_d_conv: 4,
+            ssm_d_state: 128,
+            ssm_k_heads: hk,
+            ssm_v_heads: hv,
+            n_expert: 0,
+            n_expert_used: 0,
+            n_ff_exp: 0,
+            expert_weights_scale: 0.0,
+            is_recurrent: Vec::new(),
+            ple: None,
+        }
+    }
+
+    /// qwen4exp tiles v heads over k heads (`h % hk`); qwen3next groups them (`h / r`). Mixing
+    /// the two up is silent and fatal (the tiny-model check gives KL 31 with the wrong one).
+    #[test]
+    fn gdn_v_to_k_head_order() {
+        let flash = gdn_hparams(Arch::Qwen4Exp, 16, 48);
+        assert_eq!(
+            [0, 15, 16, 17, 47].map(|h| flash.gdn_k_head(h)),
+            [0, 15, 0, 1, 15]
+        );
+        let next = gdn_hparams(Arch::Qwen3Next, 16, 32);
+        assert_eq!(
+            [0, 1, 2, 30, 31].map(|h| next.gdn_k_head(h)),
+            [0, 0, 1, 15, 15]
+        );
     }
 }

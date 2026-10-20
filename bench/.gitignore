@@ -1,0 +1,7 @@
+data/
+.venv/
+__pycache__/
+out/*.f32
+out/
+third_party/
+tensors/
