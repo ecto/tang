@@ -123,7 +123,7 @@ impl MetalDevice {
         let options = CompileOptions::new();
         if matches!(
             fn_name,
-            "rms_norm_modulation" | "group_norm_affine" | "channel_modulation"
+            "rms_norm_modulation" | "group_norm_affine" | "channel_modulation" | "tkv_decode"
         ) {
             options.set_fast_math_enabled(false);
         }
@@ -876,6 +876,60 @@ impl ComputeDevice for MetalDevice {
                 group: group as u32,
             },
         }
+    }
+
+    fn tkv_decode(
+        &self,
+        stream: &MetalBuffer,
+        lanes: &MetalBuffer,
+        chans: &MetalBuffer,
+        prior: &MetalBuffer,
+        scratch: &MetalBuffer,
+        out: &MetalBuffer,
+        rope: Option<(&MetalBuffer, &MetalBuffer)>,
+        n_lanes: usize,
+    ) {
+        assert!(matches!(out.kind, Kind::F32 | Kind::Bf16));
+        let pipe = self.get_pipeline(
+            llm_msl::kv_source(crate::kernels::kvdec_msl::KVDEC_MSL, out.kind == Kind::Bf16),
+            "tkv_decode",
+        );
+        let nl = self.make_buffer_u32(&[n_lanes as u32]);
+        let (cs, sn) = rope.map_or((&prior.buffer, &prior.buffer), |(c, s)| (&c.buffer, &s.buffer));
+        self.with_encoder(|enc| {
+            enc.set_compute_pipeline_state(&pipe);
+            for (i, b) in [&stream.buffer, &lanes.buffer, &chans.buffer, &prior.buffer, &scratch.buffer, &out.buffer, cs, sn, &nl]
+                .iter()
+                .enumerate()
+            {
+                enc.set_buffer(i as u64, Some(b), 0);
+            }
+            enc.dispatch_thread_groups(MTLSize::new(n_lanes.div_ceil(32) as u64, 1, 1), MTLSize::new(32, 1, 1));
+        });
+    }
+
+    fn kivi_dequant(
+        &self,
+        codes: &MetalBuffer,
+        sz: &MetalBuffer,
+        out: &MetalBuffer,
+        pages: Option<(&MetalBuffer, u32)>,
+        p: [u32; 6],
+    ) {
+        let pipe = self.get_pipeline(
+            llm_msl::kv_source(crate::kernels::kvdec_msl::KVDEC_MSL, out.kind == Kind::Bf16),
+            "kivi_dequant",
+        );
+        let prm = self.make_buffer_u32(&[p[0], p[1], p[2], p[3], p[4], p[5], pages.map_or(0, |x| x.1)]);
+        let t = pages.map_or(&prm, |x| &x.0.buffer);
+        let n = (p[2] * p[3] * p[4]) as u64;
+        self.with_encoder(|enc| {
+            enc.set_compute_pipeline_state(&pipe);
+            for (i, b) in [&codes.buffer, &sz.buffer, &out.buffer, &prm, t].iter().enumerate() {
+                enc.set_buffer(i as u64, Some(b), 0);
+            }
+            enc.dispatch_thread_groups(MTLSize::new(n.div_ceil(256), 1, 1), MTLSize::new(256, 1, 1));
+        });
     }
 
     fn upload_u32(&self, data: &[u32]) -> MetalBuffer {

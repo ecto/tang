@@ -55,6 +55,8 @@ pub struct Model<D: ComputeDevice> {
     /// attention still accumulates in f32) unless the device has no bf16 storage, or with
     /// `TANG_KV_F32=1`.
     pool: Shared<D::Buffer>,
+    /// Compressed KV decoded before each layer's attention (see [`crate::kvcomp`]).
+    pub kvcomp: std::sync::Mutex<Option<crate::kvcomp::KvComp<D::Buffer>>>,
 }
 
 pub use crate::blocks::Cache;
@@ -228,7 +230,25 @@ impl<D: ComputeDevice> Model<D> {
                 dev_bf16 && !std::env::var("TANG_KV_F32").is_ok_and(|v| v == "1"),
                 usize::MAX,
             ),
+            kvcomp: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Decoder layers.
+    pub fn n_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Layer `l`'s RoPE (cos, sin) device tables, `[pos][head_dim / 2]`.
+    pub(crate) fn rope_buffers(&self, l: usize) -> (&D::Buffer, &D::Buffer) {
+        let (c, s) = &self.ropes[self.layers[l].rope];
+        (c, s)
+    }
+
+    /// [`rope_buffers`](Self::rope_buffers) downloaded.
+    pub(crate) fn rope_tables(&self, l: usize) -> (Vec<f32>, Vec<f32>) {
+        let (c, s) = self.rope_buffers(l);
+        (self.dev.download(c), self.dev.download(s))
     }
 
     /// Keep KV in f32 instead of bf16 (for comparing the two), in a new pool: caches made
@@ -786,6 +806,9 @@ impl<D: ComputeDevice> Model<D> {
                 );
                 if query_scale != 1.0 {
                     dev.scale_buffer(&mut q, query_scale);
+                }
+                if let Some(kc) = self.kvcomp.lock().unwrap().as_ref() {
+                    self.restore_kv(kc, l, kp, vp, table);
                 }
                 let o = dev.kv_attention_paged(
                     &q,
