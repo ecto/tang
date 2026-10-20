@@ -19,6 +19,7 @@ pub mod gguf;
 pub mod image_pipeline;
 pub mod image_preview;
 pub mod image_server;
+pub mod kvcomp;
 pub mod kvstore;
 pub mod model;
 pub mod node;

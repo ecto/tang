@@ -78,6 +78,65 @@ let sparsity = graph.jacobian_sparsity(&outputs, n_vars);
 
 Supports up to 64 input variables.
 
+## Integer dialect (`tang_expr::int`)
+
+A separate graph (`IntGraph`) for exact 32-bit integer kernels, such as
+entropy decoders that must match a CPU reference bit for bit. The f64 RISC
+graph above is untouched.
+
+- **Types:** `i32`, `u32` and `bool`. `i8`/`u8` exist only as buffer
+  storage (`Elem`), widened on load and packed 4 per `u32` word.
+- **Ops:** wrapping `+ − ×`, `MulHi` (so `mul_wide` gives the exact 64-bit
+  product as `(lo, hi)`), `& | ^ ! <<`, and `>>` (arithmetic on `i32`).
+  Shift amounts are taken mod 32. Also `min`/`max`/`clamp`, `div`/`rem`
+  (WGSL semantics), `clz`, `== != < <=`, `select`, `bitcast`, and
+  read-only `load`.
+- **Scratch buffers:** `buffer_rw(name, elem, len, base)` declares a small
+  fixed-length read-write array (in WGSL, `name[base + i]` with `base` a host
+  expression, e.g. a workgroup array slice). `load_rw` and `store` thread an
+  effect token (`token()`, and each `store` returns the next one), so data
+  dependencies order the effects. Scratch loads and stores are never inlined
+  or moved: every backend runs them in the one shared schedule order, so
+  their results agree across backends for any graph. Out-of-range loads read
+  0 and out-of-range stores are dropped. tang-compress uses this for the
+  per-lane adaptive probability maps of its learned rANS coder.
+- **Loops:** `while_loop(init, |g, s| (cond, next))` is structured SSA, like
+  MLIR `scf.while`, with `for_range` as sugar. A loop's states are
+  `State(l, k)` nodes and its results are `LoopOut(l, k)` nodes. Loops nest,
+  and each node belongs to the innermost loop whose state it reads, so loop
+  invariants are hoisted by construction. Mixing the states of two sibling
+  loops is rejected.
+- **Contract:** nothing is reassociated or contracted. The only rewrite is
+  folding all-constant nodes, which uses the interpreter's own op functions.
+- **Lowerings,** all from one schedule:
+  - `Program`: register bytecode, the CPU reference.
+  - `to_wgsl_body` / `to_wgsl_fn`: WGSL. `MulHi` uses 16-bit-limb helpers in
+    `WGSL_PRELUDE`, because WGSL has no 64-bit integers.
+  - `to_rust`: Rust source.
+- **Emission:** a single-use node is inlined into its user when both are in
+  the same scope. Every other node becomes a `let`, and loop states become
+  `var`s that are snapshotted at the top of each iteration.
+- **Tests:** every op on both types against Rust's own semantics, and loops
+  (nested, data-dependent trip count, parallel state update, loads) against
+  plain Rust. The emitted WGSL is validated with naga 25, and the emitted
+  Rust is compiled with `rustc` and its output compared with the interpreter.
+
+**First user.** tang-compress builds its learned TCG3 MLP as an `IntGraph`
+(`lmodel3::Net32::graph`), with the stream's weights as constants. The GPU
+kernel's `mlp_gen` is `to_wgsl_body` of that graph, and `TC_CPU_IR=1` makes
+the CPU decoder evaluate the same graph through `Program`.
+
+**Not yet covered**, but needed to generate the whole rANS lane-decode
+kernel:
+- Stores and scatter into storage buffers (only lane-local scratch
+  buffers exist).
+- Barriers and `workgroupUniformLoad`.
+- Side effects ordered with loops, for example a data-dependent word fetch
+  that advances a stream pointer. This can be expressed today as loop state
+  plus `load`, but there is no write-back.
+- Kernel entry points and bindings.
+- A C lowering, which would need unsigned casts to avoid signed-overflow UB.
+
 ## Design
 
 - **Structural interning** — identical subexpressions always share the same `ExprId` (automatic CSE)

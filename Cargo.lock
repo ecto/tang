@@ -6145,6 +6145,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "tang-compress"
+version = "0.1.0"
+dependencies = [
+ "faer 0.24.0",
+ "pollster",
+ "tang-expr",
+ "tang-la",
+ "tang-optim",
+ "web-time",
+ "wgpu",
+]
+
+[[package]]
+name = "tang-compress-wasm"
+version = "0.1.0"
+dependencies = [
+ "js-sys",
+ "tang-compress",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wgpu",
+]
+
+[[package]]
 name = "tang-compute"
 version = "0.1.0"
 dependencies = [
@@ -6153,6 +6177,7 @@ dependencies = [
  "metal 0.33.0",
  "objc",
  "tang",
+ "tang-compress",
  "tang-expr",
 ]
 
@@ -6160,6 +6185,7 @@ dependencies = [
 name = "tang-expr"
 version = "0.1.1"
 dependencies = [
+ "naga",
  "tang",
 ]
 
@@ -6250,6 +6276,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tang-ad",
+ "tang-compress",
  "tang-compute",
  "tang-moe",
  "tang-tensor",
