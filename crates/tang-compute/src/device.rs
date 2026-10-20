@@ -2022,6 +2022,57 @@ pub trait ComputeDevice: Send + 'static {
         )
     }
 
+    /// [`attention_paged_rows`](Self::attention_paged_rows) with attention sinks and a
+    /// sliding window (0: none), as [`kv_attention_paged_sinks`](Self::kv_attention_paged_sinks)
+    /// does for each row alone. The default runs each row on its own.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_paged_rows_sinks(
+        &self,
+        qkv: &Self::Buffer,
+        cos: &Self::Buffer,
+        sin: &Self::Buffer,
+        k_pool: &mut Self::Buffer,
+        v_pool: &mut Self::Buffer,
+        rows: &PagedRows<Self::Buffer>,
+        (nh, nkv, hd): (usize, usize, usize),
+        window: usize,
+        sinks: &Self::Buffer,
+    ) -> Self::Buffer {
+        let (qd, w) = (nh * hd, (nh + 2 * nkv) * hd);
+        let mut out = self.alloc_uninit_f32(rows.pos.len() * qd);
+        for (i, (pages, &pos)) in rows.pages.iter().zip(rows.pos).enumerate() {
+            let row = self.slice_buffer(qkv, i * w, w);
+            let q = self.attention_prep_paged(
+                &row,
+                None,
+                None,
+                cos,
+                sin,
+                k_pool,
+                v_pool,
+                pages,
+                1,
+                (nh, nkv, hd),
+                pos,
+                0.0,
+            );
+            let o = self.kv_attention_paged_sinks(
+                &q,
+                k_pool,
+                v_pool,
+                pages,
+                pos,
+                1,
+                (nh, nkv, hd),
+                window,
+                true,
+                sinks,
+            );
+            self.write_into(&mut out, i * qd, &o);
+        }
+        out
+    }
+
     /// MoE router for a window: `logits [t][stride]` (experts in columns `0..n_expert`); writes
     /// `ids [t][TOPK]` (u32): the top `TOPK` by (logit desc, index asc); and `w [t][TOPK]`:
     /// `e_k / Σ_top e_j`, `e_k = exp(l_k − l_max)` in f64 summed in rank order, which is the

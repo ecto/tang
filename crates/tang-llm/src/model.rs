@@ -988,9 +988,10 @@ impl<D: ComputeDevice> Model<D> {
             let (cos, sin) = &self.ropes[w.rope];
             // Rows the fused call covers (all of them, or a leading run), then the rest one
             // part at a time.
+            // Sink layers fuse with any window (their kernel takes one); the rest only without.
             let fuse = fused
                 .as_ref()
-                .filter(|_| w.window == 0 && w.sinks.is_none());
+                .filter(|_| w.window == 0 || w.sinks.is_some());
             let skip = if fuse.is_some() { singles } else { 0 };
             let one = seqs.len() - skip == 1 && skip == 0;
             let mut att = if one || skip == seqs.len() {
@@ -1015,19 +1016,32 @@ impl<D: ComputeDevice> Model<D> {
                     offsets,
                     positions,
                 };
-                let o = dev.attention_paged_rows(
-                    rows_qkv,
-                    w.q_norm.as_ref(),
-                    w.k_norm.as_ref(),
-                    cos,
-                    sin,
-                    kp,
-                    vp,
-                    &rows,
-                    (nh, nkv, hd),
-                    eps,
-                    query_scale,
-                );
+                let o = match &w.sinks {
+                    Some(sinks) => dev.attention_paged_rows_sinks(
+                        rows_qkv,
+                        cos,
+                        sin,
+                        kp,
+                        vp,
+                        &rows,
+                        (nh, nkv, hd),
+                        w.window,
+                        sinks,
+                    ),
+                    None => dev.attention_paged_rows(
+                        rows_qkv,
+                        w.q_norm.as_ref(),
+                        w.k_norm.as_ref(),
+                        cos,
+                        sin,
+                        kp,
+                        vp,
+                        &rows,
+                        (nh, nkv, hd),
+                        eps,
+                        query_scale,
+                    ),
+                };
                 match att.as_mut() {
                     Some(all) => dev.write_into(all, 0, &o),
                     None => single = Some(o),
