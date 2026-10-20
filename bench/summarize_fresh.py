@@ -5,6 +5,8 @@
                              QTT/SZ3/ZFP/SPERR/TTHRESH from out/fresh_ext_*.csv at
                              40/60/80/100 dB and max-abs 1e-2/1e-3/1e-4: no point
                              > 1.05x) + fast gate -> out/summary_fresh.md
+  summarize_fresh.py fresh3  the same gates on the Phase-4 set
+                             (out/fresh3_*.csv, out/fresh3_ext_*.csv)
   summarize_fresh.py seen    fast gate only, on the seen fields (tuning check)
 
 Fast gate: geo-mean encode speed-up tc-portfolio / tc-fast >= 20x and geo-mean
@@ -18,8 +20,8 @@ which = sys.argv[1] if len(sys.argv) > 1 else "fresh"
 rows = []
 files = sorted(glob.glob(f"out/{which}_*.csv"))
 files = [f for f in files if "_ext_" not in f]
-if which == "fresh":
-    files += sorted(glob.glob("out/fresh_ext_*.csv"))
+if which in ("fresh", "fresh3"):
+    files += sorted(glob.glob(f"out/{which}_ext_*.csv"))
 for f in files:
     for r in csv.DictReader(open(f)):
         for k in ("bpv", "psnr", "max_abs", "enc_s"):
@@ -60,7 +62,7 @@ gm = lambda xs: math.exp(sum(map(math.log, xs)) / len(xs)) if xs else math.nan
 out = []
 P = out.append
 fails, ratios = [], defaultdict(list)
-if which == "fresh":
+if which in ("fresh", "fresh3"):
     P("| field | point | best external | bpv | tc-portfolio | ratio | pick |")
     P("|---|---|---|---|---|---|---|")
     for d in fields:

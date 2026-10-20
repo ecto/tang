@@ -4,7 +4,9 @@
   run_fresh.py --seen    the 19 seen fields (5 originals + 14 phase-1 held-out):
                          tc auto and tc --fast -> out/seen_<field>.csv (tuning check)
   run_fresh.py --fresh   the fresh held-out set (fetch_fresh.py): same runs
-                         -> out/fresh_<field>.csv (gate)
+                         -> out/fresh_<field>.csv (Phase-2 gate)
+  run_fresh.py --fresh3  the Phase-4 held-out set (fetch_fresh3.py)
+                         -> out/fresh3_<field>.csv (Phase-4 gate)
 
 Targets: PSNR 30..100 dB and max-rel 1e-2/1e-3/1e-4. auto uses the overfit
 wavelet model, --fast the static (hand) model. Error is measured on the
@@ -33,6 +35,8 @@ def run(fields, prefix):
 if __name__ == "__main__":
     if "--seen" in sys.argv:
         run({**real_fields(), **heldout_fields()}, "seen")
+    elif "--fresh3" in sys.argv:
+        run(fresh_fields("fresh3"), "fresh3")
     elif "--fresh" in sys.argv:
         run(fresh_fields(), "fresh")
     else:

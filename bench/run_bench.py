@@ -323,10 +323,11 @@ def heldout_fields() -> dict[str, np.ndarray]:
     return {m["name"]: np.fromfile(DATA / "heldout" / f"{m['name']}.f32", dtype="<f4").reshape(m["shape"]) for m in man}
 
 
-def fresh_fields() -> dict[str, np.ndarray]:
-    """Phase-2 fresh held-out crops written by fetch_fresh.py."""
-    man = json.load(open(HERE / "fresh" / "manifest.json"))
-    return {m["name"]: np.fromfile(HERE / "fresh" / f"{m['name']}.f32", dtype="<f4").reshape(m["shape"]) for m in man}
+def fresh_fields(sub: str = "fresh") -> dict[str, np.ndarray]:
+    """Fresh held-out crops: Phase 2 (fetch_fresh.py, `fresh`) or Phase 4
+    (fetch_fresh3.py, `fresh3`)."""
+    man = json.load(open(HERE / sub / "manifest.json"))
+    return {m["name"]: np.fromfile(HERE / sub / f"{m['name']}.f32", dtype="<f4").reshape(m["shape"]) for m in man}
 
 
 def sweep(name: str, x: np.ndarray, rows: list, quick: bool, orders=None):
@@ -405,9 +406,10 @@ def main():
             w.writeheader()
             w.writerows(rows)
         return
-    if "--fresh-ext" in sys.argv:
-        for name, x in fresh_fields().items():
-            path = OUT / f"fresh_ext_{name}.csv"
+    if "--fresh-ext" in sys.argv or "--fresh3-ext" in sys.argv:
+        sub = "fresh3" if "--fresh3-ext" in sys.argv else "fresh"
+        for name, x in fresh_fields(sub).items():
+            path = OUT / f"{sub}_ext_{name}.csv"
             if path.exists():
                 continue
             rows = []

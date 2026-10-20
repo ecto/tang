@@ -18,7 +18,7 @@ use tang_compress::codec::ErrorBound;
 use tang_compress::{decode_any, wavcodec, Decoded};
 
 fn usage() -> ! {
-    eprintln!("usage: tc encode IN.f32 OUT --dims AxBxC --codec wavelet|tucker|interp|qtt|auto|portfolio-all|fast BOUND [--rho r] [--model m]\n       tc decode IN OUT.f32 [--model pretrained:PATH]");
+    eprintln!("usage: tc encode IN.f32 OUT --dims AxBxC --codec wavelet|tucker|interp|lorenzo|qtt|auto|portfolio-all|fast BOUND [--rho r] [--model m]\n       tc decode IN OUT.f32 [--model pretrained:PATH]");
     std::process::exit(2)
 }
 
@@ -144,11 +144,12 @@ fn main() {
                         format!("\"probe_bytes\":{n},\"probe_rank\":{r},\"probe_s\":{t}"),
                     )
                 }
-                "interp" | "qtt" | "qtt-sparse" => {
+                "interp" | "lorenzo" | "qtt" | "qtt-sparse" => {
                     let cfg = wavcodec::WavConfig::new(bound);
                     let c = match codec.as_str() {
                         "qtt" => tang_compress::Candidate::Qtt,
                         "qtt-sparse" => tang_compress::Candidate::QttSparse,
+                        "lorenzo" => tang_compress::Candidate::Lorenzo,
                         _ => tang_compress::Candidate::Interp,
                     };
                     let mut b = vec![c.tag()];
