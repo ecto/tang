@@ -55,6 +55,8 @@ fn all_ops() -> (IntGraph, Vec<IId>) {
         outs.push(g.bitcast(IType::U32, n));
         let n = g.not(x);
         outs.push(g.bitcast(IType::U32, n));
+        let n = g.clz(x);
+        outs.push(g.bitcast(IType::U32, n));
         let lo = g.i32(-16384);
         let hi = g.i32(16384);
         let (lo, hi) = if g.ty(x) == IType::I32 { (lo, hi) } else { (g.u32(3), g.u32(1 << 20)) };
@@ -84,6 +86,7 @@ fn reference(a: u32, b: u32) -> Vec<u32> {
         (sa <= sb) as u32,
         sa.wrapping_neg() as u32,
         !a,
+        a.leading_zeros(),
         sa.clamp(-16384, 16384) as u32,
     ];
     v.extend([
@@ -104,6 +107,7 @@ fn reference(a: u32, b: u32) -> Vec<u32> {
         (a <= b) as u32,
         a.wrapping_neg(),
         !a,
+        a.leading_zeros(),
         a.clamp(3, 1 << 20),
     ]);
     v
@@ -367,7 +371,7 @@ fn div_rem_have_wgsl_semantics() {
         let sd = if y == 0 { x } else { x.wrapping_div(y) };
         let sr = if y == 0 { 0 } else { x.wrapping_rem(y) };
         let (ux, uy) = (x as u32, y as u32);
-        assert_eq!(out, [sd as u32, sr as u32, if uy == 0 { ux } else { ux / uy }, if uy == 0 { 0 } else { ux % uy }]);
+        assert_eq!(out, [sd as u32, sr as u32, ux.checked_div(uy).unwrap_or(ux), ux.checked_rem(uy).unwrap_or(0)]);
     }
 }
 
@@ -468,4 +472,84 @@ fn wire_rejects_bad_graphs() {
             let _ = h.to_wgsl_body_guarded(&ho, &["1u"], &["_"], 1);
         }
     }
+}
+
+/// A loop of read-modify-write steps on a scratch buffer: `scr[(7i + 3) % 13]
+/// += i` for `i < n`, returning the sum of the values read and the token.
+fn scratch() -> (IntGraph, Vec<IId>) {
+    let mut g = IntGraph::new();
+    let sb = g.buffer_rw("scr", Elem::U32, 13, "sb");
+    let n = g.param(0, IType::U32);
+    let z = g.u32(0);
+    let t0 = g.token();
+    let out = g.for_range(n, &[z, t0], |g, i, s| {
+        let (seven, three, m) = (g.u32(7), g.u32(3), g.u32(13));
+        let a = g.mul(i, seven);
+        let a = g.add(a, three);
+        let idx = g.rem(a, m);
+        let v = g.load_rw(sb, idx, s[1]);
+        let nv = g.add(v, i);
+        let t = g.store(sb, idx, nv, s[1]);
+        vec![g.add(s[0], v), t]
+    });
+    g.cap_loop(out[0], 64);
+    // an out-of-range store is dropped, an out-of-range load reads 0
+    let big = g.u32(99);
+    let one = g.u32(1);
+    let t = g.store(sb, big, one, out[1]);
+    let v = g.load_rw(sb, big, t);
+    let s = g.add(out[0], v);
+    (g, vec![s, t])
+}
+
+fn scratch_ref(n: u32, scr: &mut [u32]) -> u32 {
+    let mut s = 0u32;
+    for i in 0..n {
+        let idx = ((i * 7 + 3) % 13) as usize;
+        s = s.wrapping_add(scr[idx]);
+        scr[idx] = scr[idx].wrapping_add(i);
+    }
+    s
+}
+
+#[test]
+fn scratch_effects_are_ordered() {
+    let (g, o) = scratch();
+    let mut p = Program::new(&g, &o);
+    let bytes = g.to_bytes(&o);
+    let (g2, o2) = IntGraph::from_bytes_rw(&bytes, &[IType::U32], &[], &[("scr", Elem::U32, 13, "sb")], &[IType::U32, IType::U32], &Limits::default()).unwrap();
+    let mut p2 = Program::new(&g2, &o2);
+    for n in [0u32, 1, 5, 13, 40] {
+        let mut want = [5u32; 13];
+        let s = scratch_ref(n, &mut want);
+        for p in [&mut p, &mut p2] {
+            let mut scr = [5u32; 13];
+            let mut out = [0u32; 2];
+            p.run_rw(&[n], &[], &mut [&mut scr], &mut out);
+            assert_eq!(out, [s, 0]);
+            assert_eq!(scr, want);
+        }
+    }
+    // the WGSL lowerings (scratch in workgroup memory) validate
+    for guarded in [false, true] {
+        let body = if guarded { g.to_wgsl_body_guarded(&o, &["n"], &["a", "b"], 1) } else { g.to_wgsl_body(&o, &["n"], &["a", "b"], 1) };
+        assert!(body.contains("scr[(sb) + "), "{body}");
+        let src = format!("var<workgroup> scr: array<u32, 64>;\nvar<private> sb: u32;\nfn f(n: u32) {{\n    var a: u32;\n    var b: u32;\n{body}}}\n@compute @workgroup_size(1) fn main() {{ f(3u); }}\n");
+        let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{}\n{src}", e.emit_to_string(&src)));
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{e:?}\n{src}"));
+    }
+    assert!(g.to_rust("f", &o).contains("scr: &mut [u32]"));
+}
+
+#[test]
+fn scratch_needs_a_scratch_buffer() {
+    let mut g = IntGraph::new();
+    let b = g.buffer("ro", Elem::U32);
+    let (i, t) = (g.u32(0), g.token());
+    let n = INode::Store(b, i, i, t);
+    assert!(g.try_infer(n).is_err());
+    let sb = g.buffer_rw("scr", Elem::U32, 4, "0u");
+    assert!(g.try_infer(INode::Load(sb, i)).is_err());
 }

@@ -183,7 +183,7 @@ fn code_block<S: Sink>(
                         Some(p) => n.infer_ir(p, &x),
                         None => n.infer(&x),
                     };
-                    c.lres.res_learned(&mut c.lanes[lane], c.mt, c.sw, &o)
+                    c.lres.res_learned(&mut c.lanes[lane], c.mt, c.sw, &o, &mut c.adt[lane])
                 }
                 (None, None) => code_res::<S, false>(s, lane, m, b.class, &f, q[i].wrapping_sub(pred)),
                 (Some(n), None) => {
@@ -229,6 +229,8 @@ pub(crate) struct IrCtx<'a> {
     lres: crate::irdec::CpuRes,
     mlp: Option<tang_expr::int::Program>,
     lanes: Vec<crate::irdec::Lane>,
+    /// Per-lane adaptive state (fresh per block).
+    adt: Vec<[u32; crate::lmodel3::AC * crate::lmodel3::AB]>,
     mt: &'a [u32],
     sw: &'a [u32],
 }
@@ -243,10 +245,6 @@ struct IrBase {
 
 impl IrBase {
     fn new(ps: &Parsed3, bytes: &[u8]) -> Option<Self> {
-        // the IR graphs have no adaptive layer: adaptive streams use the hand path
-        if ps.ad.wa > 0 && ps.net.is_some() {
-            return None;
-        }
         let dec = ps.dec.clone().or_else(|| cpu_irres().then(builtin_decoder))?;
         let (mt, off) = crate::irdec::cpu_mt(&ps.init);
         Some(Self { dec, mt, off, sw: crate::irdec::stream_words(bytes) })
@@ -255,7 +253,7 @@ impl IrBase {
 
 fn builtin_decoder() -> std::sync::Arc<crate::shipdec::Decoder> {
     static D: std::sync::OnceLock<std::sync::Arc<crate::shipdec::Decoder>> = std::sync::OnceLock::new();
-    D.get_or_init(|| std::sync::Arc::new(crate::shipdec::compile(&crate::shipdec::builtin_program(None)).unwrap())).clone()
+    D.get_or_init(|| std::sync::Arc::new(crate::shipdec::compile(&crate::shipdec::builtin_program(None, false)).unwrap())).clone()
 }
 
 fn cpu_irres() -> bool {
@@ -834,10 +832,6 @@ pub fn parse3(bytes: &[u8]) -> Result<Parsed3, DecodeError> {
     let Some(dec) = dec else { return parse3_inner(bytes, false) };
     let base = bytes.len() - inner.len();
     let mut ps = parse3_inner(inner, dec.mlp.is_some())?;
-    if ps.ad.wa > 0 && dec.mlp.is_some() {
-        // the hand path needs the real model (not the graph's placeholder)
-        ps = parse3_inner(inner, false)?;
-    }
     for w in ps.block_words.iter_mut() {
         *w = (w.0 + base, w.1 + base);
     }
@@ -851,11 +845,7 @@ pub fn parse3(bytes: &[u8]) -> Result<Parsed3, DecodeError> {
         t.bytes = (t.bytes.0 + base, t.bytes.1 + base);
     }
     ps.header_bytes += base;
-    // shipped decoder graphs do not model the adaptive layer: adaptive
-    // streams decode through the built-in (hand) path on CPU and GPU
-    if ps.ad.wa == 0 {
-        ps.dec = Some(dec);
-    }
+    ps.dec = Some(dec);
     Ok(ps)
 }
 
@@ -1035,9 +1025,14 @@ fn decode_block(ps: &Parsed3, bytes: &[u8], bi: usize, q: Ptr, rs: Ptr, n: usize
         let d = &ib.dec;
         let mut c = IrCtx {
             res: crate::irdec::CpuRes::new(&d.stat.0, &d.stat.1, false, [0, 0]),
-            lres: crate::irdec::CpuRes::new(&d.learned.0, &d.learned.1, true, ib.off),
+            lres: if ps.ad.wa > 0 && ps.net.is_some() {
+                crate::irdec::CpuRes::new_ad(&d.learned_ad.0, &d.learned_ad.1, ib.off, ps.ad)
+            } else {
+                crate::irdec::CpuRes::new(&d.learned.0, &d.learned.1, true, ib.off)
+            },
             mlp: d.mlp_program(),
             lanes: ps.block_lanes[bi].iter().map(|&(a, b)| crate::irdec::Lane::new(&ib.sw, a as u32, b as u32)).collect(),
+            adt: vec![crate::lmodel3::ad_init(); ps.lanes.max(1)],
             mt: &ib.mt,
             sw: &ib.sw,
         };

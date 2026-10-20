@@ -20,10 +20,16 @@
 //!   (all `u32`);
 //! - learned: `p3..p7` = the net outputs `o0..o4` (`i32`), `p8 = off_sig`,
 //!   `p9 = off_pow` (`u32`);
+//! - adaptive learned (per-lane APM, [`crate::lmodel3::Adapt`]): the learned
+//!   params, then `p10 = off_stretch` (the stretch table in `mt`), `p11 = wa`,
+//!   `p12 = lim`, `p13 = mask` (`u32`), and scratch buffer 2 `adt` (136 `u32`
+//!   words, `(p << 8) | count` per bin, reset per block by the host);
 //!
-//! outputs `x'`, `pos'` (`u32`), `r` (`i32`).
+//! outputs `x'`, `pos'` (`u32`), `r` (`i32`), plus the final effect token
+//! (`u32`, always 0) for the adaptive role.
 
 use crate::coefcode::{KB, NE};
+use crate::lmodel3::{AB, AC};
 use crate::gpuwav::{ESC0, LOW0, MAG0, SGN0, SIG0};
 use tang_expr::int::{Elem, IId, IType, IntGraph};
 
@@ -36,6 +42,28 @@ pub const LEARNED_PARAMS: [IType; 10] =
     [IType::U32, IType::U32, IType::U32, IType::I32, IType::I32, IType::I32, IType::I32, IType::I32, IType::U32, IType::U32];
 /// Output types of both residual graphs.
 pub const OUTS: [IType; 3] = [IType::U32, IType::U32, IType::I32];
+/// Param types of the adaptive learned graph.
+pub const LEARNED_AD_PARAMS: [IType; 14] = [
+    IType::U32,
+    IType::U32,
+    IType::U32,
+    IType::I32,
+    IType::I32,
+    IType::I32,
+    IType::I32,
+    IType::I32,
+    IType::U32,
+    IType::U32,
+    IType::U32,
+    IType::U32,
+    IType::U32,
+    IType::U32,
+];
+/// Output types of the adaptive learned graph (the last is the effect token).
+pub const OUTS_AD: [IType; 4] = [IType::U32, IType::U32, IType::I32, IType::U32];
+/// Scratch-buffer ABI of the adaptive learned graph: the lane's APM bins
+/// (`adt[ad_b + i]` in the kernel's workgroup memory).
+pub const RW_AD: [(&str, Elem, u32, &str); 1] = [("adt", Elem::U32, (AC * AB) as u32, "ad_b")];
 
 /// rANS lane state in a graph.
 #[derive(Clone, Copy)]
@@ -44,11 +72,23 @@ struct St {
     pos: IId,
 }
 
+/// The adaptive layer's inputs in a graph.
+#[derive(Clone, Copy)]
+struct Ad {
+    buf: u16,
+    so: IId,
+    wa: IId,
+    lim: IId,
+    /// Per decision group: the layer is on.
+    en: [IId; 4],
+}
+
 struct B {
     g: IntGraph,
     mt: u16,
     stream: u16,
     end: IId,
+    ad: Option<Ad>,
 }
 
 impl B {
@@ -57,7 +97,7 @@ impl B {
         let mt = g.buffer(BUFS[0].0, BUFS[0].1);
         let stream = g.buffer(BUFS[1].0, BUFS[1].1);
         let end = g.param(2, IType::U32);
-        Self { g, mt, stream, end }
+        Self { g, mt, stream, end, ad: None }
     }
     fn u(&mut self, v: u32) -> IId {
         self.g.u32(v)
@@ -123,6 +163,84 @@ impl B {
         };
         (s, b)
     }
+    /// A decision through the lane's adaptive probability map on context
+    /// `ctx` (decision group `grp`), as [`crate::lmodel3::Adapt`]: the two
+    /// stretch-domain bins around `p1` are interpolated and mixed with `p1`,
+    /// then the nearer bin moves toward the bit. Returns the state, the bit
+    /// and the next effect token; nothing is written when `on` is false.
+    fn ad_bit(&mut self, s: St, tok: IId, ctx: IId, grp: usize, p1: IId, on: Option<IId>) -> (St, IId, IId) {
+        let a = self.ad.expect("adaptive graph");
+        let g = &mut self.g;
+        let (one, four, eight) = (g.u32(1), g.u32(4), g.u32(8));
+        let si = g.shr(p1, four);
+        let si = g.add(a.so, si);
+        let z = g.load(self.mt, si);
+        let z = g.bitcast(IType::I32, z);
+        let (lo, hi, off) = (g.i32(-2048), g.i32(2047), g.i32(2048));
+        let z = g.clamp(z, lo, hi);
+        let z = g.add(z, off);
+        let st = g.bitcast(IType::U32, z);
+        let j = g.shr(st, eight);
+        let m255 = g.u32(255);
+        let w = g.and(st, m255);
+        let kab = g.u32(AB as u32);
+        let b = g.mul(ctx, kab);
+        let b = g.add(b, j);
+        let b1 = g.add(b, one);
+        let e0 = g.load_rw(a.buf, b, tok);
+        let e1 = g.load_rw(a.buf, b1, tok);
+        let t0 = g.shr(e0, eight);
+        let t1 = g.shr(e1, eight);
+        let k256 = g.u32(256);
+        let wi = g.sub(k256, w);
+        let x = g.mul(t0, wi);
+        let y = g.mul(t1, w);
+        let pr = g.add(x, y);
+        let pr = g.shr(pr, eight);
+        let x = g.mul(pr, a.wa);
+        let k16 = g.u32(16);
+        let wb = g.sub(k16, a.wa);
+        let y = g.mul(p1, wb);
+        let pf = g.add(x, y);
+        let pf = g.shr(pf, four);
+        let (c32, c65504) = (g.u32(32), g.u32(65504));
+        let pf = g.clamp(pf, c32, c65504);
+        let en = a.en[grp];
+        let pu = g.select(en, pf, p1);
+        let (s, got) = self.bit(s, pu, on);
+        let g = &mut self.g;
+        let k128 = g.u32(128);
+        let near = g.lt(w, k128);
+        let k = g.select(near, b, b1);
+        let e = g.select(near, e0, e1);
+        let t = g.shr(e, eight);
+        let t = g.bitcast(IType::I32, t);
+        let n = g.and(e, m255);
+        let (zi, top) = (g.i32(0), g.i32(65535));
+        let tg = g.select(got, top, zi);
+        let d = g.sub(tg, t);
+        // rate 2^-⌊log₂(n+2)⌋
+        let two = g.u32(2);
+        let n2 = g.add(n, two);
+        let lz = g.clz(n2);
+        let c31 = g.u32(31);
+        let sh = g.sub(c31, lz);
+        let dd = g.shr(d, sh);
+        let t2 = g.add(t, dd);
+        let t2 = g.bitcast(IType::U32, t2);
+        let t2 = g.shl(t2, eight);
+        let more = g.lt(n, a.lim);
+        let n1 = g.add(n, one);
+        let nn = g.select(more, n1, n);
+        let ne = g.or(t2, nn);
+        let wr = match on {
+            None => en,
+            Some(c) => g.and(en, c),
+        };
+        let v = g.select(wr, ne, e);
+        let tok = g.store(a.buf, k, v, tok);
+        (s, got, tok)
+    }
     /// `n ≤ 16` raw bits.
     fn raw(&mut self, s: St, n: IId, on: Option<IId>) -> (St, IId) {
         let sixteen = self.u(16);
@@ -142,7 +260,7 @@ impl B {
         let mut b = std::mem::take(&mut self.g);
         let (stream, end, mt) = (self.stream, self.end, self.mt);
         let out = b.while_loop(&[n, z, s.x, s.pos], |g, st| {
-            let mut me = B { g: std::mem::take(g), mt, stream, end };
+            let mut me = B { g: std::mem::take(g), mt, stream, end, ad: None };
             let zero = me.u(0);
             let sixteen = me.u(16);
             let go = me.g.lt(zero, st[0]);
@@ -183,7 +301,7 @@ impl B {
         let mut b = std::mem::take(&mut self.g);
         let (stream, end, mt) = (self.stream, self.end, self.mt);
         let out = b.while_loop(&[z, s.x, s.pos, on], |g, st| {
-            let mut me = B { g: std::mem::take(g), mt, stream, end };
+            let mut me = B { g: std::mem::take(g), mt, stream, end, ad: None };
             let mx = me.u(max);
             let more = me.g.lt(st[0], mx);
             let go = me.g.and(st[3], more);
@@ -421,6 +539,16 @@ impl B {
 
 /// The learned-mixture residual decoder (`res_learned_gen`).
 pub fn learned_graph() -> (IntGraph, Vec<IId>) {
+    learned_graph_with(false)
+}
+
+/// The learned-mixture residual decoder through the per-lane adaptive
+/// probability maps (the adaptive role, see the module docs).
+pub fn learned_ad_graph() -> (IntGraph, Vec<IId>) {
+    learned_graph_with(true)
+}
+
+fn learned_graph_with(adaptive: bool) -> (IntGraph, Vec<IId>) {
     let mut b = B::new();
     let x = b.g.param(0, IType::U32);
     let pos = b.g.param(1, IType::U32);
@@ -428,6 +556,36 @@ pub fn learned_graph() -> (IntGraph, Vec<IId>) {
     let off_sig = b.g.param(8, IType::U32);
     let off_pow = b.g.param(9, IType::U32);
     let one = b.u(1);
+    let z = b.u(0);
+    let mut tok = z;
+    if adaptive {
+        let g = &mut b.g;
+        let buf = g.buffer_rw(RW_AD[0].0, RW_AD[0].1, RW_AD[0].2, RW_AD[0].3);
+        let so = g.param(10, IType::U32);
+        let wa = g.param(11, IType::U32);
+        let lim = g.param(12, IType::U32);
+        let mask = g.param(13, IType::U32);
+        let on = g.cmp(tang_expr::int::CmpOp::Ne, wa, z);
+        let en = std::array::from_fn(|k| {
+            let kk = g.u32(k as u32);
+            let m = g.shr(mask, kk);
+            let m = g.and(m, one);
+            let m = g.cmp(tang_expr::int::CmpOp::Ne, m, z);
+            g.and(on, m)
+        });
+        b.ad = Some(Ad { buf, so, wa, lim, en });
+        tok = b.g.token();
+    }
+    let ad = b.ad;
+    // one decision: adaptive (context `ctx`, group `grp`) or plain
+    let dec = |b: &mut B, s: St, tok: IId, ctx: IId, grp: usize, p: IId, on: Option<IId>| -> (St, IId, IId) {
+        if adaptive {
+            b.ad_bit(s, tok, ctx, grp, p, on)
+        } else {
+            let (s, bit) = b.bit(s, p, on);
+            (s, bit, tok)
+        }
+    };
     let pi = b.sig16(o[0], off_sig);
     let pi = b.g.shr(pi, one);
     let mx = Mix { pi, mu: [o[1], o[2]], ls: [o[3], o[4]], off_sig, off_pow };
@@ -438,24 +596,23 @@ pub fn learned_graph() -> (IntGraph, Vec<IId>) {
     let cm1 = b.lcdf(&mx, m1);
     let gt = b.g.lt(cm1, c0);
     let d = b.g.sub(c0, cm1);
-    let z = b.u(0);
     let pz = b.g.select(gt, d, z);
     let k = b.u(65536);
     let nzm = b.g.sub(k, pz);
     let p = b.ratio16(nzm, k);
-    let (s, en) = b.bit(s, p, None);
+    let (s, en, tok) = dec(&mut b, s, tok, z, 0, p, None);
     let posm = b.g.sub(k, c0);
     let den = b.g.add(cm1, posm);
     let p = b.ratio16(cm1, den);
-    let (s, neg) = b.bit(s, p, Some(en));
+    let (s, neg, tok) = dec(&mut b, s, tok, one, 1, p, Some(en));
     // tail(1) from the CDFs already at hand
     let ta0 = b.g.select(neg, cm1, posm);
     // exp-Golomb bucket: tails carried between steps
     let mut gb = std::mem::take(&mut b.g);
     let (stream, end, mt) = (b.stream, b.end, b.mt);
     let mxr = &mx;
-    let out = gb.while_loop(&[z, ta0, z, s.x, s.pos, en], |g, st| {
-        let mut me = B { g: std::mem::take(g), mt, stream, end };
+    let out = gb.while_loop(&[z, ta0, z, s.x, s.pos, en, tok], |g, st| {
+        let mut me = B { g: std::mem::take(g), mt, stream, end, ad };
         let c30 = me.u(30);
         let more = me.g.lt(st[0], c30);
         let go = me.g.and(st[5], more);
@@ -464,15 +621,18 @@ pub fn learned_graph() -> (IntGraph, Vec<IId>) {
         let m = me.g.shl(one, k1);
         let tb = me.ltail(mxr, m, neg);
         let p = me.ratio16(tb, st[1]);
-        let (s2, bit) = me.bit(St { x: st[3], pos: st[4] }, p, None);
+        let (two, three) = (me.u(2), me.u(3));
+        let ctx = me.g.min(st[0], three);
+        let ctx = me.g.add(ctx, two);
+        let (s2, bit, tk) = dec(&mut me, St { x: st[3], pos: st[4] }, st[6], ctx, 2, p, None);
         let ta = me.g.select(bit, tb, st[1]);
         let kk = me.g.select(bit, k1, st[0]);
         *g = me.g;
-        (go, vec![kk, ta, tb, s2.x, s2.pos, bit])
+        (go, vec![kk, ta, tb, s2.x, s2.pos, bit, tk])
     });
     gb.cap_loop(out[0], 31);
     b.g = gb;
-    let (kq, ta, tb) = (out[0], out[1], out[2]);
+    let (kq, ta, tb, tok) = (out[0], out[1], out[2], out[6]);
     let s = St { x: out[3], pos: out[4] };
     let lo = b.g.shl(one, kq);
     let lm1 = b.g.sub(lo, one);
@@ -480,10 +640,11 @@ pub fn learned_graph() -> (IntGraph, Vec<IId>) {
     let c30 = b.u(30);
     let lt30 = b.g.lt(kq, c30);
     let endv = b.g.select(lt30, tb, z);
-    // mantissa by bisection
+    // mantissa by bisection (context 6 for the first bit, then 7)
+    let first = b.g.bool(true);
     let mut gb = std::mem::take(&mut b.g);
-    let out = gb.while_loop(&[lo, hi, ta, endv, s.x, s.pos], |g, st| {
-        let mut me = B { g: std::mem::take(g), mt, stream, end };
+    let out = gb.while_loop(&[lo, hi, ta, endv, s.x, s.pos, tok, first], |g, st| {
+        let mut me = B { g: std::mem::take(g), mt, stream, end, ad };
         let lt = me.g.lt(st[0], st[1]);
         let go = me.g.and(en, lt);
         let one = me.u(1);
@@ -500,14 +661,17 @@ pub fn learned_graph() -> (IntGraph, Vec<IId>) {
         let d = me.g.sub(st[2], st[3]);
         let all = me.g.select(gt, d, z);
         let p = me.ratio16(up, all);
-        let (s2, bit) = me.bit(St { x: st[4], pos: st[5] }, p, None);
+        let (c6, c7) = (me.u(6), me.u(7));
+        let ctx = me.g.select(st[7], c6, c7);
+        let (s2, bit, tk) = dec(&mut me, St { x: st[4], pos: st[5] }, st[6], ctx, 3, p, None);
         let mm1 = me.g.sub(mid, one);
         let nlo = me.g.select(bit, mid, st[0]);
         let ntl = me.g.select(bit, tm, st[2]);
         let nhi = me.g.select(bit, st[1], mm1);
         let nend = me.g.select(bit, st[3], tm);
+        let nf = me.g.bool(false);
         *g = me.g;
-        (go, vec![nlo, nhi, ntl, nend, s2.x, s2.pos])
+        (go, vec![nlo, nhi, ntl, nend, s2.x, s2.pos, tk, nf])
     });
     gb.cap_loop(out[0], 31);
     b.g = gb;
@@ -516,23 +680,35 @@ pub fn learned_graph() -> (IntGraph, Vec<IId>) {
     let nl = b.g.neg(li);
     let r = b.g.select(neg, nl, li);
     let r = b.g.select(en, r, zi);
-    (b.g, vec![s.x, s.pos, r])
+    let mut outs = vec![s.x, s.pos, r];
+    if adaptive {
+        outs.push(out[6]);
+    }
+    (b.g, outs)
 }
 
 /// WGSL for `res_static_gen` / `res_learned_gen` from the given graphs
-/// (`guarded`: bounds-checked loads, for untrusted graphs).
+/// (`guarded`: bounds-checked loads, for untrusted graphs). A learned graph
+/// with four outputs is the adaptive role: it reads the kernel's `ad_*`
+/// state and `adt` bins (set up per block by `ad_reset`).
 pub fn wgsl(stat: (&IntGraph, &[IId]), learned: (&IntGraph, &[IId]), guarded: bool) -> String {
-    let body = |g: &IntGraph, o: &[IId], p: &[&str]| {
+    let body = |g: &IntGraph, o: &[IId], p: &[&str], d: &[&str]| {
         if guarded {
-            g.to_wgsl_body_guarded(o, p, &["rx", "rpos", "r"], 1)
+            g.to_wgsl_body_guarded(o, p, d, 1)
         } else {
-            g.to_wgsl_body(o, p, &["rx", "rpos", "r"], 1)
+            g.to_wgsl_body(o, p, d, 1)
         }
     };
+    let res = ["rx", "rpos", "r", "adk"];
     let mut s = String::from("fn res_static_gen(sig: u32, e: u32, cls: u32, sctx: u32) -> i32 {\n    var r: i32;\n");
-    s += &body(stat.0, stat.1, &["rx", "rpos", "rend", "sig", "e", "cls", "sctx", "P.off_init"]);
+    s += &body(stat.0, stat.1, &["rx", "rpos", "rend", "sig", "e", "cls", "sctx", "P.off_init"], &res[..3]);
     s += "    return r;\n}\n\nfn res_learned_gen(o0: i32, o1: i32, o2: i32, o3: i32, o4: i32) -> i32 {\n    var r: i32;\n";
-    s += &body(learned.0, learned.1, &["rx", "rpos", "rend", "o0", "o1", "o2", "o3", "o4", "mt[P.pad4]", "mt[P.pad4 + 1u]"]);
+    let mut p = vec!["rx", "rpos", "rend", "o0", "o1", "o2", "o3", "o4", "mt[P.pad4]", "mt[P.pad4 + 1u]"];
+    if learned.1.len() == OUTS_AD.len() {
+        s += "    var adk: u32;\n";
+        p.extend(["ad_so", "ad_wa", "ad_lim", "ad_mask"]);
+    }
+    s += &body(learned.0, learned.1, &p, &res[..learned.1.len()]);
     s += "    return r;\n}\n";
     s
 }
@@ -543,6 +719,16 @@ pub fn builtin_wgsl() -> &'static str {
     S.get_or_init(|| {
         let (a, ao) = static_graph();
         let (b, bo) = learned_graph();
+        wgsl((&a, &ao), (&b, &bo), false)
+    })
+}
+
+/// [`builtin_wgsl`] with the adaptive learned decoder.
+pub fn builtin_wgsl_ad() -> &'static str {
+    static S: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    S.get_or_init(|| {
+        let (a, ao) = static_graph();
+        let (b, bo) = learned_ad_graph();
         wgsl((&a, &ao), (&b, &bo), false)
     })
 }
@@ -601,13 +787,21 @@ pub struct CpuRes {
     prog: tang_expr::int::Program,
     learned: bool,
     off: [u32; 2],
+    /// Adaptive role: `[off_stretch, wa, lim, mask]`.
+    ad: Option<[u32; 4]>,
 }
 
 impl CpuRes {
     /// A static graph (`off_init` into `mt`) or a learned one
     /// (`off_sig`, `off_pow`).
     pub fn new(g: &IntGraph, outs: &[IId], learned: bool, off: [u32; 2]) -> Self {
-        Self { prog: tang_expr::int::Program::new(g, outs), learned, off }
+        Self { prog: tang_expr::int::Program::new(g, outs), learned, off, ad: None }
+    }
+    /// The adaptive learned role with settings `ad` (`off` as for a learned
+    /// graph; the stretch table follows the 2^x table, see [`cpu_mt`]).
+    pub fn new_ad(g: &IntGraph, outs: &[IId], off: [u32; 2], ad: crate::lmodel3::AdCfg) -> Self {
+        let so = off[1] + crate::lmodel3::tables().1.len() as u32;
+        Self { prog: tang_expr::int::Program::new(g, outs), learned: true, off, ad: Some([so, ad.wa, ad.lim, ad.mask]) }
     }
     /// Whether this is the learned role.
     pub fn learned(&self) -> bool {
@@ -619,10 +813,16 @@ impl CpuRes {
         let p = [l.x, l.pos, l.end, sig, e, cls, sctx, self.off[0]];
         self.run(l, &p, mt, stream)
     }
-    /// Decode one learned residual from the net outputs.
-    pub fn res_learned(&mut self, l: &mut Lane, mt: &[u32], stream: &[u32], o: &[i32; 5]) -> i32 {
-        let p = [l.x, l.pos, l.end, o[0] as u32, o[1] as u32, o[2] as u32, o[3] as u32, o[4] as u32, self.off[0], self.off[1]];
-        self.run(l, &p, mt, stream)
+    /// Decode one learned residual from the net outputs; `adt` is the lane's
+    /// adaptive state ([`crate::lmodel3::ad_init`], unused by the plain role).
+    pub fn res_learned(&mut self, l: &mut Lane, mt: &[u32], stream: &[u32], o: &[i32; 5], adt: &mut [u32]) -> i32 {
+        let a = self.ad.unwrap_or_default();
+        let p = [l.x, l.pos, l.end, o[0] as u32, o[1] as u32, o[2] as u32, o[3] as u32, o[4] as u32, self.off[0], self.off[1], a[0], a[1], a[2], a[3]];
+        let mut out = [0u32; 4];
+        self.prog.run_rw(&p, &[mt, stream], &mut [adt], &mut out);
+        l.x = out[0];
+        l.pos = out[1];
+        out[2] as i32
     }
     fn run(&mut self, l: &mut Lane, p: &[u32], mt: &[u32], stream: &[u32]) -> i32 {
         let mut o = [0u32; 3];
@@ -633,8 +833,8 @@ impl CpuRes {
     }
 }
 
-/// `mt` for CPU decoding: priors at 0, then the σ and 2^x tables; returns
-/// the buffer and `(off_sig, off_pow)`.
+/// `mt` for CPU decoding: priors at 0, then the σ, 2^x and stretch tables
+/// (the kernel's layout); returns the buffer and `(off_sig, off_pow)`.
 pub fn cpu_mt(init: &[u32]) -> (Vec<u32>, [u32; 2]) {
     let (sig, pw) = crate::lmodel3::tables();
     let mut v = init.to_vec();
@@ -642,6 +842,7 @@ pub fn cpu_mt(init: &[u32]) -> (Vec<u32>, [u32; 2]) {
     v.extend_from_slice(sig);
     let op = v.len() as u32;
     v.extend_from_slice(pw);
+    v.extend(crate::lmodel3::stretch_tab().iter().map(|&z| z as u32));
     (v, [os, op])
 }
 
@@ -724,8 +925,57 @@ mod tests {
         let mut cr = CpuRes::new(&g, &go, true, off);
         let mut l = Lane::new(&sw, 0, words.len() as u32);
         for (o, r) in items {
-            assert_eq!(cr.res_learned(&mut l, &mt, &sw, &o), r);
+            assert_eq!(cr.res_learned(&mut l, &mt, &sw, &o, &mut []), r);
         }
         assert_eq!(l.pos, l.end);
+    }
+
+    #[test]
+    fn learned_ad_graph_decodes_native_encoding() {
+        use crate::lmodel3::{ad_init, code_learned_ad, AdCfg, Adapt};
+        let (g, go) = learned_ad_graph();
+        // and through the wire (the shipped form)
+        let w = g.to_bytes(&go);
+        let (g2, go2) = IntGraph::from_bytes_rw(&w, &LEARNED_AD_PARAMS, &BUFS, &RW_AD, &OUTS_AD, &tang_expr::int::Limits::default()).unwrap();
+        for c in [AdCfg { wa: 10, lim: 14, mask: 15 }, AdCfg { wa: 16, lim: 3, mask: 5 }, AdCfg { wa: 0, lim: 0, mask: 0 }] {
+            let mut s = 3u64;
+            let mut syms = RecSink { syms: vec![Vec::new()] };
+            let mut ad = Adapt::new(c);
+            let mut items = Vec::new();
+            for i in 0..4000 {
+                if i % 1000 == 0 {
+                    ad = Adapt::new(c);
+                }
+                let o = [
+                    (rng(&mut s) % 4000) as i32 - 2000,
+                    (rng(&mut s) % 600) as i32 - 300,
+                    (rng(&mut s) % 6000) as i32 - 3000,
+                    (rng(&mut s) % 3000) as i32 - 1000,
+                    (rng(&mut s) % 9000) as i32 - 4096,
+                ];
+                let r = match rng(&mut s) % 3 {
+                    0 => 0,
+                    1 => (rng(&mut s) % 41) as i32 - 20,
+                    _ => (rng(&mut s) as i32) >> (rng(&mut s) % 31 + 1),
+                };
+                assert_eq!(code_learned_ad(&mut syms, 0, &Mix3::new(&o), r, &mut ad), r);
+                items.push((o, r));
+            }
+            let words = rans_encode(&syms.syms[0]);
+            let sw = stream_words(&to_bytes(&words));
+            let (mt, off) = cpu_mt(&[]);
+            for (g, go) in [(&g, &go), (&g2, &go2)] {
+                let mut cr = CpuRes::new_ad(g, go, off, c);
+                let mut l = Lane::new(&sw, 0, words.len() as u32);
+                let mut adt = ad_init();
+                for (i, (o, r)) in items.iter().enumerate() {
+                    if i % 1000 == 0 {
+                        adt = ad_init();
+                    }
+                    assert_eq!(cr.res_learned(&mut l, &mt, &sw, o, &mut adt), *r, "{c:?} item {i}");
+                }
+                assert_eq!(l.pos, l.end);
+            }
+        }
     }
 }

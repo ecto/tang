@@ -97,7 +97,7 @@ pub enum Candidate {
     Tucker,
     /// The QTT [`codec`] in row-major digit order.
     Qtt,
-    /// [`interp`] (max-abs targets).
+    /// [`interp`].
     Interp,
     /// The QTT codec's residual-only stream (max-abs; QTT tag and format).
     QttSparse,
@@ -201,8 +201,9 @@ pub const QTT_PROBE_CAP: usize = 64;
 ///
 /// - wavelet: always;
 /// - Tucker: PSNR/RMSE targets on ≥2D data;
-/// - interpolation and QTT residual-only: max-abs targets (each costs a few
-///   % of a wavelet encode);
+/// - interpolation: always (max-abs directly; RMSE/PSNR through its
+///   rate-controlled bound, about half a wavelet encode);
+/// - QTT residual-only: max-abs targets (a few % of a wavelet encode);
 /// - full QTT: only when [`qtt_probe`] (stride 2, ranks capped at
 ///   [`QTT_PROBE_CAP`]) keeps every rank below the cap — the field is
 ///   genuinely low-TT-rank, so QTT is both cheap and possibly smallest. At
@@ -223,8 +224,8 @@ pub fn prescreen(
     if !maxabs && multi {
         keep.push(Candidate::Tucker);
     }
+    keep.push(Candidate::Interp);
     if maxabs {
-        keep.push(Candidate::Interp);
         keep.push(Candidate::QttSparse);
     }
     if rank < QTT_PROBE_CAP && (!maxabs || rank > 1) {
@@ -252,7 +253,8 @@ pub fn encode_candidate_f32(
         }
         Candidate::Interp => match cfg.bound {
             codec::ErrorBound::MaxAbs(b) => interp::encode_f32(x, dims, b),
-            _ => panic!("interp codes max-abs bounds only"),
+            codec::ErrorBound::Rmse(r) => interp::encode_rmse_f32(x, dims, r),
+            codec::ErrorBound::Psnr(p) => interp::encode_psnr_f32(x, dims, p),
         },
         Candidate::QttSparse => {
             let mut q = codec::Config::new(cfg.bound);

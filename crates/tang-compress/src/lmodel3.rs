@@ -299,6 +299,12 @@ pub const AB: usize = 17;
 /// APM contexts.
 pub const AC: usize = 8;
 
+/// A lane's fresh adaptive state as the kernels hold it: `(p << 8) | count`
+/// per bin (count 0), the layout of the adaptive residual graph's `adt`.
+pub fn ad_init() -> [u32; AC * AB] {
+    std::array::from_fn(|i| sig16(((i % AB) as i32 - 8) * 256) << 8)
+}
+
 /// Per-lane adaptive state over the MLP output: an adaptive probability map
 /// (secondary estimation) per decision type, interpolated over [`AB`]
 /// stretch-domain bins, count-based power-of-two rate. Integer only; reset per block.

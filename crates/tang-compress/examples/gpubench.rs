@@ -88,7 +88,7 @@ fn main() {
         for f in args[1..].iter().filter(|a| a.ends_with(".tcg3")) {
             let b = std::fs::read(f).unwrap();
             let ps = gpuwav3::parse3(&b).unwrap();
-            let prog = tang_compress::shipdec::builtin_program(if mlp { ps.net.as_ref() } else { None });
+            let prog = tang_compress::shipdec::builtin_program(if mlp { ps.net.as_ref() } else { None }, ps.net.is_some() && ps.ad.wa > 0);
             let w = tang_compress::shipdec::wrap(&b, &prog);
             let out = format!("{}.tcs3", f.trim_end_matches(".tcg3"));
             std::fs::write(&out, &w).unwrap();

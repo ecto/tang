@@ -59,7 +59,7 @@ fn main() {
                     .iter()
                     .map(|(f, s)| {
                         let ps = gpuwav3::parse3(s).unwrap();
-                        (if *f == "tcg3s" { "tcs3s" } else { "tcs3l" }, tang_compress::shipdec::wrap(s, &tang_compress::shipdec::builtin_program(ps.net.as_ref())))
+                        (if *f == "tcg3s" { "tcs3s" } else { "tcs3l" }, tang_compress::shipdec::wrap(s, &tang_compress::shipdec::builtin_program(ps.net.as_ref(), ps.net.is_some() && ps.ad.wa > 0)))
                     })
                     .collect();
                 streams.extend(w);

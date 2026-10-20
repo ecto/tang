@@ -375,3 +375,7 @@ Caveat: the machine was shared with other sessions (load average 10–30) for al
 **Picks:** tc-fast maxabs/interp=17, tc-fast maxabs/qtt-sparse=3, tc-fast maxabs/wavelet=7, tc-fast psnr/tucker=24, tc-fast psnr/wavelet=48, tc-portfolio maxabs/interp=12, tc-portfolio maxabs/qtt-sparse=3, tc-portfolio maxabs/wavelet=12, tc-portfolio psnr/qtt=2, tc-portfolio psnr/tucker=34, tc-portfolio psnr/wavelet=36
 
 **Full QTT tried (probe passed):** 51 of 99 encodes
+
+## Phase 3 note: interp at PSNR targets
+
+Interp now runs at RMSE/PSNR targets through a rate-controlled bound and is a portfolio candidate at every bound. On the 19 seen fields it wins 5 of 146 PSNR points, all at 30–50 dB (portfolio geomean 0.998×). As a diagnostic only, it takes hacc-vx 100 dB to 11.76 bpv (0.97× SZ3) and xgc-dpot 100 dB to 11.42 (1.02× SPERR). Details: [tang-compress-tc3-cleanup.md](tang-compress-tc3-cleanup.md).

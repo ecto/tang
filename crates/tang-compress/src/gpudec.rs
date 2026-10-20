@@ -76,6 +76,11 @@ pub struct GpuTimes {
     pub readback_s: f64,
 }
 
+/// Words of adaptive-layer bins per workgroup.
+fn ad_wgn(lanes: usize) -> usize {
+    (lanes * (32 / lanes).max(1)).max(32) * crate::lmodel3::AC * crate::lmodel3::AB
+}
+
 fn shader_src(lanes: usize, maxl: usize) -> String {
     let k = gpuwav::lift_consts();
     let head = format!(
@@ -85,7 +90,7 @@ fn shader_src(lanes: usize, maxl: usize) -> String {
         (32 / lanes).max(1)
     );
     let body = include_str!("gpuwav.wgsl")
-        .replace("AD_WGN", &((lanes * (32 / lanes).max(1)).max(32) * crate::lmodel3::AC * crate::lmodel3::AB).to_string())
+        .replace("AD_WGN", &ad_wgn(lanes).to_string())
         .replace("LANES_WG3", &(lanes * (32 / lanes).max(1)).to_string())
         .replace("LANES_WG", &lanes.to_string())
         .replace("MAXL_N", &maxl.max(2).to_string())
@@ -116,15 +121,22 @@ impl GpuDecoder {
             .await
             .map_err(|e| format!("adapter: {e}"))?;
         let al = adapter.limits();
+        if lanes == 0 || lanes > MAX_LANES {
+            return Err(format!("tc-gpu GPU decode supports 1..={MAX_LANES} lanes"));
+        }
+        // the adaptive layer's per-invocation bins live in workgroup memory
+        // (17 KB at 32 invocations, over WebGPU's 16 KB default)
+        let wg = ad_wgn(lanes) as u32 * 4 + 1024;
+        if al.max_compute_workgroup_storage_size < wg {
+            return Err(format!("tc-gpu needs {wg} B of workgroup storage, the adapter has {}", al.max_compute_workgroup_storage_size));
+        }
         let limits = wgpu::Limits {
             max_buffer_size: al.max_buffer_size,
             max_storage_buffer_binding_size: al.max_storage_buffer_binding_size,
             max_compute_workgroups_per_dimension: al.max_compute_workgroups_per_dimension,
+            max_compute_workgroup_storage_size: al.max_compute_workgroup_storage_size,
             ..Default::default()
         };
-        if lanes == 0 || lanes > MAX_LANES {
-            return Err(format!("tc-gpu GPU decode supports 1..={MAX_LANES} lanes"));
-        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("tc-gpu"),
@@ -692,9 +704,10 @@ impl GpuDecoder {
         }
         let mut src = self.src.clone();
         if let Some(d) = dec {
-            src = crate::irdec::splice_res(&src, &d.wgsl_res);
-        }
-        if ad {
+            src = crate::irdec::splice_res(&src, if ad { &d.wgsl_res_ad } else { &d.wgsl_res });
+        } else if ad && std::env::var("TC_GPU_HANDRES").is_err() {
+            src = crate::irdec::splice_res(&src, crate::irdec::builtin_wgsl_ad());
+        } else if ad {
             let h = include_str!("gpuwav.wgsl");
             let a = h.find("// RES_BEGIN").unwrap();
             let a = a + h[a..].find('\n').unwrap() + 1;
@@ -967,8 +980,7 @@ pub struct Prepared3 {
     lanes: usize,
     net: Option<crate::lmodel3::Net32>,
     dec: Option<std::sync::Arc<crate::shipdec::Decoder>>,
-    /// Adaptive layer on: the learned residual decoder must be the
-    /// hand-written one (the generated graphs have no adaptive state).
+    /// Adaptive layer on: the learned residual decoder is the adaptive role.
     ad: bool,
 }
 
