@@ -210,7 +210,7 @@ impl Mix3 {
 /// `P(1)·2^16` from masses (`num ≤ den ≤ 2^16`), clamped for rANS.
 #[inline]
 pub fn ratio16(num: u32, den: u32) -> u32 {
-    let p = if den == 0 { 32768 } else { (num.min(den) * 65535) / den };
+    let p = (num.min(den) * 65535).checked_div(den).unwrap_or(32768);
     p.clamp(32, 65504)
 }
 

@@ -284,6 +284,10 @@ fn main() {
                     let cpu = full(threads);
                     let (gpu, _) = g.decode3(&b).unwrap();
                     let diff = cpu.iter().zip(&gpu).filter(|(a, b)| a != b).count();
+                    if diff > 0 {
+                        let i = cpu.iter().zip(&gpu).position(|(a, b)| a != b).unwrap();
+                        eprintln!("first diff at {i}: cpu {} gpu {}", f32::from_bits(cpu[i]), f32::from_bits(gpu[i]));
+                    }
                     let y: Vec<f32> = cpu.iter().map(|&v| f32::from_bits(v)).collect();
                     let (rmse, mx) = err(&x, &y);
                     let ok_bound = match bound {

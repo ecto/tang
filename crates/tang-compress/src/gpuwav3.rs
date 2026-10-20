@@ -320,7 +320,7 @@ fn collect3(sh: &Shape, blocks: &[BandInfo], q: &mut [i32], resctx: bool, preds:
                 let i = (z * ny + y) * nx + x;
                 let r = q[i].wrapping_sub(pred);
                 rs[i] = r;
-                if k % stride == 0 {
+                if k.is_multiple_of(stride) {
                     out.push(crate::learned::Sample { x: feat_vec3(&f, b.class), r });
                 }
                 k += 1;
