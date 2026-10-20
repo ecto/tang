@@ -51,5 +51,8 @@ name = "bench_ops"
 required-features = ["metal"]
 
 [[example]]
+name = "bench_batch"
+
+[[example]]
 name = "bench_prefill"
 required-features = ["metal"]

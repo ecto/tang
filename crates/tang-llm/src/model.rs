@@ -433,9 +433,7 @@ impl<D: ComputeDevice> Model<D> {
         let mut cache = self.new_cache();
         self.decode_layers(
             &mut x,
-            &mut cache,
-            tokens.len(),
-            0,
+            &mut [(&mut cache, tokens.len())],
             true,
             self.layers.len() - 1,
             true,
@@ -477,7 +475,13 @@ impl<D: ComputeDevice> Model<D> {
             self.max_ctx
         );
         let (h, eps) = (c.hidden_size, c.rms_norm_eps);
-        self.decode_layers(&mut x, cache, s, pos, causal, self.layers.len(), bound)?;
+        self.decode_layers(
+            &mut x,
+            &mut [(&mut *cache, s)],
+            causal,
+            self.layers.len(),
+            bound,
+        )?;
         let (rows, x) = if all {
             (s, x)
         } else {
@@ -494,14 +498,154 @@ impl<D: ComputeDevice> Model<D> {
 }
 
 impl<D: ComputeDevice> Model<D> {
-    /// The decoder layers over hidden states `x` (`[s, hidden]`) at positions `pos..`.
-    #[allow(clippy::too_many_arguments)]
+    /// Several sequences' tokens through the model in one pass, each after what its own cache
+    /// holds (see [`Segment`]). The projections and MLP run once over every segment's rows, so
+    /// the weights are read once for the batch; RoPE, the KV write and attention run per
+    /// segment over its own cache. Returns each segment's logits: its last row's, or every
+    /// row's if its `all` is set. A segment's logits are what [`forward`](Self::forward) would
+    /// return for it alone, up to the matmul kernel's summation order for this many rows.
+    pub fn forward_batch(&self, segs: &mut [Segment<'_, D::Buffer>]) -> Result<Vec<Vec<f32>>> {
+        let c = &self.cfg;
+        let dev = &self.dev;
+        anyhow::ensure!(!segs.is_empty(), "no segments");
+        for g in segs.iter() {
+            anyhow::ensure!(!g.tokens.is_empty(), "no tokens");
+            anyhow::ensure!(
+                g.cache.len + g.tokens.len() <= self.max_ctx,
+                "context full ({} tokens)",
+                self.max_ctx
+            );
+        }
+        // One-token segments first, so `decode_layers` can attend for them in one go, then the
+        // other short ones (verify windows), then prefill chunks (see `row_groups`).
+        let mut order: Vec<usize> = (0..segs.len()).collect();
+        order.sort_by_key(|&i| {
+            let n = segs[i].tokens.len();
+            (n > SHORT_ROWS, n != 1)
+        });
+        let tokens: Vec<u32> = order
+            .iter()
+            .flat_map(|&i| segs[i].tokens.iter().copied())
+            .collect();
+        let mut x = self.embed(&tokens)?;
+        let mut slots: Vec<Option<&mut Segment<'_, D::Buffer>>> =
+            segs.iter_mut().map(Some).collect();
+        let mut ordered: Vec<&mut Segment<'_, D::Buffer>> =
+            order.iter().map(|&i| slots[i].take().unwrap()).collect();
+        let mut parts: Vec<(&mut Cache<D::Buffer>, usize)> = ordered
+            .iter_mut()
+            .map(|g| (&mut *g.cache, g.tokens.len()))
+            .collect();
+        self.decode_layers(&mut x, &mut parts, true, self.layers.len(), false)?;
+        drop(parts);
+        // The rows whose logits are wanted, gathered so the head runs once.
+        let h = c.hidden_size;
+        let (mut at, mut rows) = (0usize, Vec::new());
+        for g in ordered.iter() {
+            let s = g.tokens.len();
+            if g.all {
+                rows.push((at, s));
+            } else {
+                rows.push((at + s - 1, 1));
+            }
+            at += s;
+        }
+        let n: usize = rows.iter().map(|r| r.1).sum();
+        let picked = if n == tokens.len() {
+            x
+        } else {
+            let mut picked = dev.alloc_uninit_f32(n * h);
+            let mut o = 0;
+            for &(r, len) in &rows {
+                let part = dev.slice_buffer(&x, r * h, len * h);
+                dev.write_into(&mut picked, o * h, &part);
+                o += len;
+            }
+            picked
+        };
+        let picked = dev.rms_norm(&picked, &self.norm, n, h, c.rms_norm_eps);
+        let head = self.lm_head.as_ref().unwrap_or(&self.embed);
+        // In pieces of at most SHORT_ROWS rows, so each row's logits come from the kernel a
+        // decode alone would use.
+        let pieces: Vec<(usize, usize)> = (0..n)
+            .step_by(SHORT_ROWS)
+            .map(|r| (r, SHORT_ROWS.min(n - r)))
+            .collect();
+        let logits = dev.download(&self.linear_rows(&picked, head, &pieces, h, c.vocab_size));
+        let v = c.vocab_size;
+        let mut out = vec![Vec::new(); order.len()];
+        let mut o = 0;
+        for ((g, &(_, len)), &i) in ordered.iter_mut().zip(&rows).zip(&order) {
+            out[i] = logits[o * v..(o + len) * v].to_vec();
+            o += len;
+            g.cache.len += g.tokens.len();
+            g.cache.tokens.extend_from_slice(g.tokens);
+        }
+        Ok(out)
+    }
+}
+
+/// Parts of a batch at most this long (decode, verify windows) share their matmuls; longer
+/// ones (prefill chunks) get their own. The 4-bit CUDA kernel for up to this many rows sums
+/// each row the same way whatever the count, so a row's numbers don't depend on its batch.
+const SHORT_ROWS: usize = 8;
+
+/// The row ranges a batch's matmuls run over, for parts `lens` long in order (short ones
+/// first): the short parts together, then each long one alone, at the size it has when its
+/// sequence runs alone.
+fn row_groups(lens: &[usize]) -> Vec<(usize, usize)> {
+    let short: usize = lens.iter().take_while(|&&n| n <= SHORT_ROWS).sum();
+    let mut groups = Vec::new();
+    if short > 0 {
+        groups.push((0, short));
+    }
+    let mut at = short;
+    for &n in lens.iter().skip_while(|&&n| n <= SHORT_ROWS) {
+        groups.push((at, n));
+        at += n;
+    }
+    groups
+}
+
+impl<D: ComputeDevice> Model<D> {
+    /// `x · wᵀ` over `x`'s rows, a separate matmul for each `(first row, rows)` group.
+    fn linear_rows(
+        &self,
+        x: &D::Buffer,
+        w: &D::Buffer,
+        groups: &[(usize, usize)],
+        k: usize,
+        n: usize,
+    ) -> D::Buffer {
+        let dev = &self.dev;
+        let rows: usize = groups.iter().map(|g| g.1).sum();
+        if groups.len() == 1 {
+            return dev.linear(x, w, rows, k, n);
+        }
+        let mut out = dev.alloc_uninit_f32(rows * n);
+        for &(r, m) in groups {
+            let part = dev.slice_buffer(x, r * k, m * k);
+            dev.write_into(&mut out, r * n, &dev.linear(&part, w, m, k, n));
+        }
+        out
+    }
+}
+
+/// One sequence's part of [`Model::forward_batch`]: tokens to run after what `cache` holds.
+pub struct Segment<'a, B> {
+    pub tokens: &'a [u32],
+    pub cache: &'a mut Cache<B>,
+    /// Logits for every token, not just the last.
+    pub all: bool,
+}
+
+impl<D: ComputeDevice> Model<D> {
+    /// The decoder layers over hidden states `x` (`[S, hidden]`): the rows of each
+    /// `(cache, s)` part in turn, `s` of them at that cache's positions `cache.len..`.
     fn decode_layers(
         &self,
         x: &mut D::Buffer,
-        cache: &mut Cache<D::Buffer>,
-        s: usize,
-        pos: usize,
+        parts: &mut [(&mut Cache<D::Buffer>, usize)],
         causal: bool,
         layer_limit: usize,
         bound: bool,
@@ -517,53 +661,163 @@ impl<D: ComputeDevice> Model<D> {
         let (qd, kvd, ff) = (c.q_dim(), c.kv_dim(), c.intermediate_size);
         let eps = c.rms_norm_eps;
         let query_scale = c.query_rescale()?;
-        let shared = cache.pool().clone();
+        let s: usize = parts.iter().map(|p| p.1).sum();
+        let shared = parts[0].0.pool().clone();
         let mut pool = blocks::lock(&shared);
-        let ids = blocks::prepare(dev, &mut pool, cache, pos, pos + s);
-        let table = dev.upload_u32(&ids);
-        let pages = tang_compute::Pages {
-            ids: &ids,
-            table: &table,
-            block: BLOCK,
+        // Each part's block table, and where its rows start in `x`.
+        let mut seqs = Vec::with_capacity(parts.len());
+        let mut row = 0;
+        for (cache, n) in parts.iter_mut() {
+            let pos = cache.len;
+            let ids = blocks::prepare(dev, &mut pool, cache, pos, pos + *n);
+            let table = dev.upload_u32(&ids);
+            seqs.push((ids, table, pos, *n, row));
+            row += *n;
+        }
+        let groups = row_groups(&seqs.iter().map(|q| q.3).collect::<Vec<_>>());
+        // Leading one-token parts (batched decode) attend in one call per layer.
+        let singles = if causal {
+            seqs.iter().take_while(|q| q.3 == 1).count()
+        } else {
+            0
         };
+        let fused = (singles >= 2).then(|| {
+            let mut all = Vec::new();
+            let mut offsets = Vec::with_capacity(singles);
+            for q in &seqs[..singles] {
+                offsets.push(all.len() as u32);
+                all.extend_from_slice(&q.0);
+            }
+            let pos: Vec<usize> = seqs[..singles].iter().map(|q| q.2).collect();
+            let pos32: Vec<u32> = pos.iter().map(|&p| p as u32).collect();
+            (
+                dev.upload_u32(&all),
+                dev.upload_u32(&offsets),
+                dev.upload_u32(&pos32),
+                pos,
+            )
+        });
+        let row_pages: Vec<tang_compute::Pages<D::Buffer>> = seqs
+            [..if fused.is_some() { singles } else { 0 }]
+            .iter()
+            .map(|q| tang_compute::Pages {
+                ids: &q.0,
+                table: &q.1,
+                block: BLOCK,
+            })
+            .collect();
         for (l, w) in self.layers.iter().take(layer_limit).enumerate() {
             let (kp, vp) = pool.layer(l);
             let a = dev.rms_norm(x, &w.attn_norm, s, h, eps);
-            let qkv = dev.linear(&a, &w.wqkv, s, h, qd + 2 * kvd);
+            let qkv = self.linear_rows(&a, &w.wqkv, &groups, h, qd + 2 * kvd);
             let (cos, sin) = &self.ropes[w.rope];
-            let mut q = dev.attention_prep_paged(
-                &qkv,
-                w.q_norm.as_ref(),
-                w.k_norm.as_ref(),
-                cos,
-                sin,
-                kp,
-                vp,
-                &pages,
-                s,
-                (nh, nkv, hd),
-                pos,
-                eps,
-            );
-            if query_scale != 1.0 {
-                dev.scale_buffer(&mut q, query_scale);
+            // Rows the fused call covers (all of them, or a leading run), then the rest one
+            // part at a time.
+            let fuse = fused.as_ref().filter(|_| w.window == 0);
+            let skip = if fuse.is_some() { singles } else { 0 };
+            let one = seqs.len() - skip == 1 && skip == 0;
+            let mut att = if one || skip == seqs.len() {
+                None
+            } else {
+                Some(dev.alloc_uninit_f32(s * qd))
+            };
+            let mut single = None;
+            if let Some((tables, offsets, positions, pos)) = fuse {
+                let w3 = qd + 2 * kvd;
+                let lead;
+                let rows_qkv = if skip == seqs.len() {
+                    &qkv
+                } else {
+                    lead = dev.slice_buffer(&qkv, 0, skip * w3);
+                    &lead
+                };
+                let rows = tang_compute::PagedRows {
+                    pages: &row_pages,
+                    pos,
+                    tables,
+                    offsets,
+                    positions,
+                };
+                let o = dev.attention_paged_rows(
+                    rows_qkv,
+                    w.q_norm.as_ref(),
+                    w.k_norm.as_ref(),
+                    cos,
+                    sin,
+                    kp,
+                    vp,
+                    &rows,
+                    (nh, nkv, hd),
+                    eps,
+                    query_scale,
+                );
+                match att.as_mut() {
+                    Some(all) => dev.write_into(all, 0, &o),
+                    None => single = Some(o),
+                }
             }
-            let att =
-                dev.kv_attention_paged(&q, kp, vp, &pages, pos, s, (nh, nkv, hd), w.window, causal);
-            let mut o = dev.linear(&att, &w.wo, s, qd, h);
+            for (ids, table, pos, n, row) in &seqs[skip..] {
+                let pages = tang_compute::Pages {
+                    ids,
+                    table,
+                    block: BLOCK,
+                };
+                let part;
+                let qkv = if one {
+                    &qkv
+                } else {
+                    let w3 = qd + 2 * kvd;
+                    part = dev.slice_buffer(&qkv, row * w3, n * w3);
+                    &part
+                };
+                let mut q = dev.attention_prep_paged(
+                    qkv,
+                    w.q_norm.as_ref(),
+                    w.k_norm.as_ref(),
+                    cos,
+                    sin,
+                    kp,
+                    vp,
+                    &pages,
+                    *n,
+                    (nh, nkv, hd),
+                    *pos,
+                    eps,
+                );
+                if query_scale != 1.0 {
+                    dev.scale_buffer(&mut q, query_scale);
+                }
+                let o = dev.kv_attention_paged(
+                    &q,
+                    kp,
+                    vp,
+                    &pages,
+                    *pos,
+                    *n,
+                    (nh, nkv, hd),
+                    w.window,
+                    causal,
+                );
+                match att.as_mut() {
+                    Some(all) => dev.write_into(all, row * qd, &o),
+                    None => single = Some(o),
+                }
+            }
+            let att = att.or(single).expect("a part");
+            let mut o = self.linear_rows(&att, &w.wo, &groups, qd, h);
             if let Some(n) = &w.post_attn_norm {
                 o = dev.rms_norm(&o, n, s, h, eps);
             }
             *x = dev.add_tensors_buf(x, &o, s * h);
 
             let m = dev.rms_norm(x, &w.mlp_norm, s, h, eps);
-            let gu = dev.linear(&m, &w.w_gate_up, s, h, 2 * ff);
+            let gu = self.linear_rows(&m, &w.w_gate_up, &groups, h, 2 * ff);
             let act = if c.is_gemma() {
                 dev.geglu_split(&gu, s, ff)
             } else {
                 dev.swiglu_split(&gu, s, ff)
             };
-            let mut d = dev.linear(&act, &w.w_down, s, ff, h);
+            let mut d = self.linear_rows(&act, &w.w_down, &groups, ff, h);
             if let Some(n) = &w.post_mlp_norm {
                 d = dev.rms_norm(&d, n, s, h, eps);
             }
@@ -653,6 +907,72 @@ mod conditioning_tests {
             max_ctx: 2048,
             pool: new_pool(2, 4, false, usize::MAX),
             dev,
+        }
+    }
+
+    /// `tiny_model` with every projection filled in, so attention and the head matter.
+    fn mixed_model() -> Model<CpuDevice> {
+        let mut m = tiny_model();
+        let dev = CpuDevice::new();
+        let mut seed = 1u32;
+        let mut fill = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    (seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+                })
+                .collect()
+        };
+        for l in &mut m.layers {
+            l.wqkv = dev.upload(&fill(48));
+            l.wo = dev.upload(&fill(16));
+        }
+        m.lm_head = Some(dev.upload(&fill(8)));
+        m
+    }
+
+    #[test]
+    fn a_batched_forward_matches_each_segment_alone() {
+        let m = mixed_model();
+        // One-token segments among longer ones: they're attended for together.
+        let prefixes: [&[u32]; 5] = [&[0, 1, 1], &[1], &[1, 0, 0, 1, 0], &[0, 0], &[1, 1, 1]];
+        let feeds: [&[u32]; 5] = [&[1, 0], &[0], &[1, 1, 0], &[1], &[0]];
+        let all = [true, false, false, false, true];
+        let mut alone = Vec::new();
+        for i in 0..5 {
+            let mut c = m.new_cache();
+            m.forward(prefixes[i], &mut c, false).unwrap();
+            alone.push((
+                m.forward(feeds[i], &mut c, all[i]).unwrap(),
+                c.tokens.clone(),
+            ));
+        }
+        let mut caches: Vec<_> = prefixes
+            .iter()
+            .map(|p| {
+                let mut c = m.new_cache();
+                m.forward(p, &mut c, false).unwrap();
+                c
+            })
+            .collect();
+        let mut segs: Vec<Segment<_>> = caches
+            .iter_mut()
+            .enumerate()
+            .map(|(i, cache)| Segment {
+                tokens: feeds[i],
+                cache,
+                all: all[i],
+            })
+            .collect();
+        let got = m.forward_batch(&mut segs).unwrap();
+        drop(segs);
+        for i in 0..5 {
+            assert_eq!(got[i].len(), alone[i].0.len());
+            for (a, b) in got[i].iter().zip(&alone[i].0) {
+                assert!((a - b).abs() < 1e-5, "segment {i}: {a} vs {b}");
+            }
+            assert_eq!(caches[i].tokens, alone[i].1);
+            assert_eq!(caches[i].len, alone[i].1.len());
         }
     }
 

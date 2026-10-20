@@ -94,7 +94,8 @@ struct NodeState {
     model: Option<Loaded>,
     /// A model being loaded, and since when.
     loading: Option<(String, Instant)>,
-    running: Option<Running>,
+    /// Requests running, oldest first (several when the backend batches).
+    running: Vec<Running>,
 }
 
 struct Loaded {
@@ -139,7 +140,7 @@ impl Node {
 
     /// Requests running or waiting.
     fn busy(&self) -> usize {
-        self.queue.len() + self.state().running.is_some() as usize
+        self.queue.len() + self.state().running.len()
     }
 }
 
@@ -194,6 +195,51 @@ pub trait Backend {
     fn flush_kv_store(&self) {}
     /// Runs after the reply goes out, including failed requests.
     fn after(&mut self, _req: &Request, _result: &anyhow::Result<(Finish, Usage)>) {}
+
+    /// Most requests it runs at once (see `docs/batching.md`); 1 runs them one at a time
+    /// with `complete_with`, and the methods below go unused.
+    fn max_batch(&self) -> usize {
+        1
+    }
+    /// A request in conversation `key` could start now (a slot is free and the conversation
+    /// isn't running).
+    fn can_admit(&self, _key: Option<&str>) -> bool {
+        false
+    }
+    /// The KV pool has room for another stream of `rows` positions.
+    fn kv_room(&self, _rows: usize) -> bool {
+        true
+    }
+    /// Start a request in the batch (see [`Engine::admit`]).
+    fn admit(
+        &mut self,
+        _req: &Request,
+        _prompt: Option<(String, Vec<u32>)>,
+    ) -> anyhow::Result<Inflight> {
+        anyhow::bail!("this backend doesn't batch")
+    }
+    /// One step for every lane (see [`Engine::step`]).
+    fn step(&mut self, _lanes: &mut [DynLane<'_>], _budget: usize) -> anyhow::Result<()> {
+        anyhow::bail!("this backend doesn't batch")
+    }
+    /// Done with a stream (see [`Engine::retire`]).
+    fn retire(&mut self, _s: Inflight) -> anyhow::Result<Outcome> {
+        anyhow::bail!("this backend doesn't batch")
+    }
+    /// A stream's state: (done, still prefilling).
+    fn stream_state(&self, _s: &Inflight) -> (bool, bool) {
+        (true, false)
+    }
+}
+
+/// A batching backend's stream, opaque to the worker.
+pub type Inflight = Box<dyn std::any::Any>;
+
+/// A stream in a [`Backend::step`], with where its pieces go and who controls it.
+pub struct DynLane<'a> {
+    pub stream: &'a mut Inflight,
+    pub on: &'a mut dyn FnMut(Piece) -> bool,
+    pub ctl: &'a mut dyn Control,
 }
 
 impl<D: ComputeDevice + 'static> Backend for Engine<D> {
@@ -254,6 +300,47 @@ impl<D: ComputeDevice + 'static> Backend for Engine<D> {
             self.save(req.cache_key.as_deref());
         }
     }
+    fn max_batch(&self) -> usize {
+        Engine::max_batch(self)
+    }
+    fn can_admit(&self, key: Option<&str>) -> bool {
+        Engine::can_admit(self, key)
+    }
+    fn kv_room(&self, rows: usize) -> bool {
+        Engine::kv_room(self, rows)
+    }
+    fn admit(
+        &mut self,
+        req: &Request,
+        prompt: Option<(String, Vec<u32>)>,
+    ) -> anyhow::Result<Inflight> {
+        Ok(Box::new(Engine::admit(self, req, prompt)?))
+    }
+    fn step(&mut self, lanes: &mut [DynLane<'_>], budget: usize) -> anyhow::Result<()> {
+        let mut typed: Vec<crate::engine::Lane<'_, D::Buffer>> = lanes
+            .iter_mut()
+            .map(|l| crate::engine::Lane {
+                stream: l
+                    .stream
+                    .downcast_mut()
+                    .expect("a stream this engine admitted"),
+                on: &mut *l.on,
+                ctl: &mut *l.ctl,
+            })
+            .collect();
+        Engine::step(self, &mut typed, budget)
+    }
+    fn retire(&mut self, s: Inflight) -> anyhow::Result<Outcome> {
+        let s = s
+            .downcast::<crate::engine::Stream<D::Buffer>>()
+            .expect("a stream this engine admitted");
+        Engine::retire(self, *s)
+    }
+    fn stream_state(&self, s: &Inflight) -> (bool, bool) {
+        let s: &crate::engine::Stream<D::Buffer> =
+            s.downcast_ref().expect("a stream this engine admitted");
+        (s.done(), s.prefilling())
+    }
 }
 
 /// How to serve.
@@ -311,6 +398,7 @@ where
             node: worker,
             engine: None,
             load,
+            batch: Vec::new(),
         };
         if let Some(spec) = first {
             let gate = w.node.resources.clone();
@@ -364,6 +452,21 @@ struct Worker<B: Backend, F> {
     node: Arc<Node>,
     engine: Option<(String, B)>,
     load: F,
+    /// Requests decoding together, when the backend batches.
+    batch: Vec<Active>,
+}
+
+/// A request in the batch.
+struct Active {
+    ticket: Ticket,
+    req: Box<Request>,
+    tx: mpsc::UnboundedSender<Out>,
+    model: String,
+    before: Option<Before>,
+    request_id: Option<String>,
+    /// A background request's prompt, kept in case it gives way.
+    kept: Option<(String, Vec<u32>)>,
+    stream: Inflight,
 }
 
 /// Lets a background request's prefill give way to waiting interactive work, and keeps
@@ -373,15 +476,29 @@ struct Ctl<'a> {
     background: bool,
     /// Closed once the client goes away: the run stops there.
     tx: &'a mpsc::UnboundedSender<Out>,
+    /// Its ticket's id, to find it among the running.
+    id: u64,
+    /// In a batch: whether interactive work is waiting that couldn't join (decided once per
+    /// step). Alone: `None`, and any waiting interactive work counts.
+    blocked: Option<bool>,
 }
 
 impl Control for Ctl<'_> {
     fn keep_prefilling(&mut self) -> bool {
-        !(self.background && self.node.queue.interactive_waiting())
+        let blocked = self
+            .blocked
+            .unwrap_or_else(|| self.node.queue.interactive_waiting());
+        !(self.background && blocked)
     }
 
     fn progress(&mut self, p: Progress) {
-        if let Some(r) = self.node.state().running.as_mut() {
+        if let Some(r) = self
+            .node
+            .state()
+            .running
+            .iter_mut()
+            .find(|r| r.ticket.id == self.id)
+        {
             r.progress = p;
         }
     }
@@ -398,7 +515,51 @@ where
 {
     fn run(&mut self) {
         loop {
+            if !self.batch.is_empty() {
+                // Between steps: whoever can join does, then one step for all.
+                while let Some((ticket, job)) = self.node.queue.pop_where(|t, j| self.joins(t, j)) {
+                    self.dispatch(ticket, job);
+                }
+                if !self.batch.is_empty() {
+                    self.step_batch();
+                }
+                continue;
+            }
             let (ticket, job) = self.node.queue.pop();
+            self.dispatch(ticket, job);
+        }
+    }
+
+    /// Whether a waiting job joins the running batch now.
+    fn joins(&self, ticket: &Ticket, job: &Job) -> bool {
+        let Job::Complete { req, model, tx, .. } = job else {
+            // Loads and unloads wait for the batch to drain.
+            return false;
+        };
+        let Some((name, e)) = &self.engine else {
+            return true;
+        };
+        if name != model || tx.is_closed() {
+            // It fails (or is dropped) without running.
+            return true;
+        }
+        let keys: Vec<&str> = self
+            .batch
+            .iter()
+            .filter_map(|a| a.req.cache_key.as_deref())
+            .collect();
+        let rows = ticket.prompt_tokens.unwrap_or(0) + req.max_tokens.unwrap_or(4096).min(4096);
+        let room = crate::batch::Room {
+            running: self.batch.len(),
+            max: e.max_batch(),
+            kv: e.kv_room(rows),
+        };
+        crate::batch::joins(req.cache_key.as_deref(), &keys, room)
+            && e.can_admit(req.cache_key.as_deref())
+    }
+
+    fn dispatch(&mut self, ticket: Ticket, job: Job) {
+        {
             let gate = self.node.resources.clone();
             let _guard = gate.lock();
             match job {
@@ -431,7 +592,7 @@ where
     #[allow(clippy::too_many_arguments)]
     fn complete(
         &mut self,
-        mut ticket: Ticket,
+        ticket: Ticket,
         req: Box<Request>,
         prompt: Option<(String, Vec<u32>)>,
         tx: mpsc::UnboundedSender<Out>,
@@ -460,7 +621,7 @@ where
                 return;
             }
         };
-        self.node.state().running = Some(Running {
+        self.node.state().running.push(Running {
             ticket: ticket.clone(),
             progress: Progress {
                 prompt_tokens: ticket.prompt_tokens.unwrap_or(0),
@@ -468,24 +629,145 @@ where
             },
             started: Instant::now(),
         });
-        let mut ctl = Ctl {
-            node: &self.node,
-            background: ticket.priority == Priority::Background,
-            tx: &tx,
-        };
-        let piece_tx = tx.clone();
         // A background request may give way; it keeps its prompt for when it goes on.
         let kept = match ticket.priority {
             Priority::Background => prompt.clone(),
             Priority::Interactive => None,
         };
+        if engine.max_batch() > 1 {
+            match engine.admit(&req, prompt) {
+                Ok(stream) => self.batch.push(Active {
+                    ticket,
+                    req,
+                    tx,
+                    model,
+                    before,
+                    request_id,
+                    kept,
+                    stream,
+                }),
+                Err(e) => self.conclude(ticket, req, tx, model, before, request_id, kept, Err(e)),
+            }
+            return;
+        }
+        let mut ctl = Ctl {
+            node: &self.node,
+            background: ticket.priority == Priority::Background,
+            tx: &tx,
+            id: ticket.id,
+            blocked: None,
+        };
+        let piece_tx = tx.clone();
         let result = engine.complete_with(
             &req,
             prompt,
             &mut |p| piece_tx.send(Out::Piece(p)).is_ok(),
             &mut ctl,
         );
-        self.node.state().running = None;
+        self.conclude(ticket, req, tx, model, before, request_id, kept, result);
+    }
+
+    /// One decode step for the batch, then the finished streams' replies.
+    fn step_batch(&mut self) {
+        let gate = self.node.resources.clone();
+        let _guard = gate.lock();
+        let Some((_, engine)) = self.engine.as_mut() else {
+            return;
+        };
+        // Interactive work still waiting now couldn't join this round; a stream giving way
+        // helps only if what it lacked was a slot.
+        let blocked =
+            self.node.queue.interactive_waiting() && self.batch.len() >= engine.max_batch();
+        let tickets: Vec<&Ticket> = self.batch.iter().map(|a| &a.ticket).collect();
+        let order = crate::batch::lane_order(&tickets);
+        let node = &*self.node;
+        let mut batch: Vec<Option<&mut Active>> = self.batch.iter_mut().map(Some).collect();
+        let mut picked: Vec<&mut Active> =
+            order.iter().map(|&i| batch[i].take().unwrap()).collect();
+        let txs: Vec<mpsc::UnboundedSender<Out>> = picked.iter().map(|a| a.tx.clone()).collect();
+        let mut ons: Vec<Box<dyn FnMut(Piece) -> bool>> = txs
+            .iter()
+            .map(|tx| {
+                let tx = tx.clone();
+                Box::new(move |p| tx.send(Out::Piece(p)).is_ok()) as Box<dyn FnMut(Piece) -> bool>
+            })
+            .collect();
+        let mut ctls: Vec<Ctl> = picked
+            .iter()
+            .zip(&txs)
+            .map(|(a, tx)| Ctl {
+                node,
+                background: a.ticket.priority == Priority::Background,
+                tx,
+                id: a.ticket.id,
+                blocked: Some(blocked),
+            })
+            .collect();
+        let mut lanes: Vec<DynLane> = picked
+            .iter_mut()
+            .zip(ons.iter_mut())
+            .zip(ctls.iter_mut())
+            .map(|((a, on), ctl)| DynLane {
+                stream: &mut a.stream,
+                on: &mut **on,
+                ctl,
+            })
+            .collect();
+        let result = engine.step(&mut lanes, crate::engine::PREFILL_CHUNK);
+        drop(lanes);
+        drop(ctls);
+        drop(picked);
+        drop(batch);
+        let failed = result.err().map(|e| format!("{e:#}"));
+        // Retire what's done (everything, if the step failed), oldest first.
+        let mut i = 0;
+        while i < self.batch.len() {
+            let engine = &self.engine.as_ref().expect("the engine that ran it").1;
+            let done = failed.is_some() || engine.stream_state(&self.batch[i].stream).0;
+            if !done {
+                i += 1;
+                continue;
+            }
+            let a = self.batch.remove(i);
+            let engine = &mut self.engine.as_mut().expect("the engine that ran it").1;
+            let result = match engine.retire(a.stream) {
+                Ok(o) => match &failed {
+                    Some(e) => Err(anyhow::anyhow!("{e}")),
+                    None => Ok(o),
+                },
+                Err(e) => Err(e),
+            };
+            self.conclude(
+                a.ticket,
+                a.req,
+                a.tx,
+                a.model,
+                a.before,
+                a.request_id,
+                a.kept,
+                result,
+            );
+        }
+    }
+
+    /// Reply for a run that's over (or requeue one that gave way).
+    #[allow(clippy::too_many_arguments)]
+    fn conclude(
+        &mut self,
+        mut ticket: Ticket,
+        req: Box<Request>,
+        tx: mpsc::UnboundedSender<Out>,
+        model: String,
+        before: Option<Before>,
+        request_id: Option<String>,
+        kept: Option<(String, Vec<u32>)>,
+        result: anyhow::Result<Outcome>,
+    ) {
+        let rid = request_id.as_deref();
+        self.node
+            .state()
+            .running
+            .retain(|r| r.ticket.id != ticket.id);
         // Before the reply goes out, so a client that asks `/node` next sees what it left.
         self.refresh_kv();
         match result {
@@ -1131,6 +1413,7 @@ mod tests {
             node,
             engine: Some(("flash".into(), FixedBackend { failed: false })),
             load: |_: &str| -> anyhow::Result<FixedBackend> { panic!("must not load") },
+            batch: Vec::new(),
         };
         let err = worker.swap("does-not-exist").unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
@@ -1357,15 +1640,15 @@ mod tests {
             resources: Default::default(),
             image: None,
         });
-        let mut worker = super::Worker {
+        let endless = Endless {
+            steps: steps.clone(),
+        };
+        // Built on its thread (a worker holds streams that stay on it).
+        let make = move || super::Worker {
             node,
-            engine: Some((
-                "m".into(),
-                Endless {
-                    steps: steps.clone(),
-                },
-            )),
+            engine: Some(("m".into(), endless)),
             load: |_: &str| -> anyhow::Result<Endless> { unreachable!() },
+            batch: Vec::new(),
         };
         let req = Box::new(super::parse(&json!({"messages": []})).unwrap());
         let (tx, rx) = mpsc::unbounded_channel();
@@ -1377,9 +1660,12 @@ mod tests {
             yields: 0,
         };
         let run = std::thread::spawn(move || {
+            let mut worker = make();
             let t = std::time::Instant::now();
             worker.complete(ticket, req, None, tx, "m".into(), None, Some("rid".into()));
-            (t.elapsed(), worker)
+            let took = t.elapsed();
+            drop(worker);
+            (took, ())
         });
         // The client reads nothing and goes away while the run is under way.
         let sse = stream_response("m".into(), "id".into(), 0, true, rx).into_response();

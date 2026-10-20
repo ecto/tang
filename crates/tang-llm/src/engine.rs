@@ -2,7 +2,7 @@
 //! reusing the KV cache for whatever prefix the new prompt shares with the previous one.
 
 use crate::chat::{Chunk, Detok, Parser, Piece, Tags, Template};
-use crate::draft::{Calibration, CostModel, DraftConfig, Global, Session};
+use crate::draft::{Calibration, CostModel, DraftConfig, Drafter, Global};
 use crate::model::{Cache, Dtype, Model};
 use crate::sample::{Sampler, Sampling};
 use crate::special::Shield;
@@ -15,7 +15,7 @@ use tang_compute::ComputeDevice;
 use tokenizers::Tokenizer;
 
 /// Prefill in chunks to bound scratch memory.
-const PREFILL_CHUNK: usize = 512;
+pub const PREFILL_CHUNK: usize = 512;
 
 /// Fewest leading positions of another conversation's block worth copying (fewer are just
 /// prefilled: a chat template's first few tokens are the same everywhere).
@@ -217,6 +217,132 @@ pub struct Engine<D: ComputeDevice> {
     last: (Vec<u32>, Vec<u32>),
     /// Decode forwards so far by width: (count, seconds).
     pub forwards: Vec<(usize, f64)>,
+    /// Streams admitted and not yet retired, and the conversations they run in.
+    out: usize,
+    running: Vec<String>,
+    max_batch: usize,
+    /// Finished streams' outputs, for the global draft automaton once no stream drafts.
+    global_pending: Vec<Vec<u32>>,
+}
+
+/// A request in flight, from [`Engine::admit`] to [`Engine::retire`]: its slot's KV cache
+/// (checked out of the engine while it runs) and everything its decoding carries between
+/// steps.
+pub struct Stream<B> {
+    cache: Cache<B>,
+    /// Images in `cache`, its conversation, and when its slot was last picked.
+    images: Vec<(usize, u64)>,
+    key: Option<String>,
+    used: u64,
+    ids: Vec<u32>,
+    progress: Progress,
+    /// Positions reused from caches.
+    reuse: usize,
+    limit: usize,
+    stop: Vec<String>,
+    prefill_only: bool,
+    phase: Phase,
+    error: Option<anyhow::Error>,
+    started: Instant,
+    prefill_s: f64,
+    decode_from: Option<Instant>,
+    constraint: Option<llguidance::Matcher>,
+    sampler: Sampler,
+    parser: Parser,
+    think: ThinkBudget,
+    out: Vec<u32>,
+    /// Incremental detokenization, tag tokens kept as tags.
+    detok: Detok,
+    text: String,
+    finish: Finish,
+    tool_calls: usize,
+    drafter: Option<Drafter>,
+    /// Logits rows from the last forward: row r follows the fed tokens and `draft[..r]`.
+    rows: Vec<f32>,
+    draft: crate::draft::Draft,
+    row: usize,
+    /// Draft tokens in the cache that aren't accepted yet.
+    pending: usize,
+    drafted: usize,
+    accepted: usize,
+    /// Its solo decode forwards by width: (width, seconds).
+    timed: Vec<(usize, f64)>,
+    /// What the next forward feeds: new tokens, then (decoding) the draft.
+    fed: Vec<u32>,
+    /// Of `fed`, the new tokens (the rest is draft).
+    fed_new: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Prefill,
+    Decode,
+    Done,
+    Yielded,
+}
+
+/// A stream in a [`Engine::step`], with where its pieces go and who controls it.
+pub struct Lane<'a, B> {
+    pub stream: &'a mut Stream<B>,
+    pub on: &'a mut dyn FnMut(Piece) -> bool,
+    pub ctl: &'a mut dyn Control,
+}
+
+impl<B> Stream<B> {
+    /// Finished, yielded or failed: ready for [`Engine::retire`].
+    pub fn done(&self) -> bool {
+        matches!(self.phase, Phase::Done | Phase::Yielded)
+    }
+
+    /// Still prefilling its prompt.
+    pub fn prefilling(&self) -> bool {
+        self.phase == Phase::Prefill
+    }
+
+    pub fn progress(&self) -> Progress {
+        self.progress
+    }
+
+    /// The conversation it runs in (`prompt_cache_key`).
+    pub fn key(&self) -> Option<&str> {
+        self.key.as_deref()
+    }
+
+    fn fail(&mut self, e: anyhow::Error) {
+        self.error = Some(e);
+        self.phase = Phase::Done;
+    }
+
+    fn end_prefill(&mut self) {
+        self.prefill_s = self.started.elapsed().as_secs_f64();
+    }
+
+    /// The prompt is in the cache; `logits` are its last position's.
+    fn prefilled(&mut self, logits: Vec<f32>) {
+        self.end_prefill();
+        if self.prefill_only {
+            self.finish = Finish::Stop;
+            self.phase = Phase::Done;
+            return;
+        }
+        self.rows = logits;
+        self.row = 0;
+        self.phase = Phase::Decode;
+        self.decode_from = Some(Instant::now());
+    }
+
+    /// Hand `pieces` to `on`; false once it refuses one (the client went away).
+    fn deliver(&mut self, pieces: Vec<Piece>, on: &mut dyn FnMut(Piece) -> bool) -> bool {
+        for p in pieces {
+            if matches!(p, Piece::ToolCall { .. }) {
+                self.tool_calls += 1;
+            }
+            if !on(p) {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// A KV cache parked while another conversation runs.
@@ -352,6 +478,10 @@ impl<D: ComputeDevice> Engine<D> {
             drafter: None,
             last: (Vec::new(), Vec::new()),
             forwards: vec![(0, 0.0); 65],
+            out: 0,
+            running: Vec::new(),
+            max_batch: usize::MAX,
+            global_pending: Vec::new(),
         })
     }
 
@@ -425,6 +555,16 @@ impl<D: ComputeDevice> Engine<D> {
 
     pub fn slots(&self) -> usize {
         self.slots
+    }
+
+    /// Run at most `n` requests at once (at least 1; never more than the slots).
+    pub fn set_max_batch(&mut self, n: usize) {
+        self.max_batch = n.max(1);
+    }
+
+    /// Most requests that run at once: one per slot, up to the cap.
+    pub fn max_batch(&self) -> usize {
+        self.slots.min(self.max_batch)
     }
 
     /// Cap the device memory all KV caches may hold together (caches grow with their
@@ -643,13 +783,6 @@ impl<D: ComputeDevice> Engine<D> {
         total
     }
 
-    /// Seal the active cache's full blocks (those before any image), so other conversations
-    /// can share them.
-    fn seal(&mut self) {
-        let upto = self.cache_images.first().map_or(usize::MAX, |&(s, _)| s);
-        self.cache.seal(upto);
-    }
-
     /// Make the slot for this request the active one.
     fn select(&mut self, key: Option<&str>, ids: &[u32]) {
         use crate::slots::{pick, Pick, View};
@@ -666,7 +799,7 @@ impl<D: ComputeDevice> Engine<D> {
             .map(|s| view(&s.key, &s.cache, s.used))
             .collect();
         let active = view(&self.cache_key, &self.cache, self.cache_used);
-        let room = self.parked.len() + 1 < self.slots;
+        let room = self.parked.len() + 1 + self.out < self.slots;
         let i = match pick(active, &parked, key, ids, room) {
             Pick::Active => None,
             Pick::Parked(i) => Some(i),
@@ -753,7 +886,8 @@ impl<D: ComputeDevice> Engine<D> {
     /// [`complete`](Self::complete), with `ctl` told the request's progress and asked between
     /// prefill chunks whether to go on (a prompt with images is prefilled in one go).
     /// `prompt`: the request's prompt and token ids if already made (by this model's
-    /// [`Prompter`]).
+    /// [`Prompter`]). This is [`admit`](Self::admit), [`step`](Self::step) on a batch of
+    /// one until it's done, then [`retire`](Self::retire).
     pub fn complete_with(
         &mut self,
         req: &Request,
@@ -761,7 +895,56 @@ impl<D: ComputeDevice> Engine<D> {
         mut on: impl FnMut(Piece) -> bool,
         ctl: &mut dyn Control,
     ) -> Result<Outcome> {
-        let mut constraint = if let Some(schema) = &req.response_schema {
+        let mut st = self.admit(req, prompt)?;
+        while !st.done() {
+            let mut lanes = [Lane {
+                stream: &mut st,
+                on: &mut on,
+                ctl: &mut *ctl,
+            }];
+            if let Err(e) = self.step(&mut lanes, PREFILL_CHUNK) {
+                self.retire(st).ok();
+                return Err(e);
+            }
+        }
+        self.retire(st)
+    }
+
+    /// Whether a request in conversation `key` can start now: a slot is free and that
+    /// conversation isn't already running (two streams can't share a cache).
+    pub fn can_admit(&self, key: Option<&str>) -> bool {
+        self.out < self.max_batch() && key.is_none_or(|k| !self.running.iter().any(|r| r == k))
+    }
+
+    /// Requests running (admitted and not yet retired).
+    pub fn running(&self) -> usize {
+        self.out
+    }
+
+    /// Whether the KV pool has room for another stream of `rows` positions without evicting
+    /// a running one's blocks (parked caches may go).
+    pub fn kv_room(&self, rows: usize) -> bool {
+        use crate::blocks::{lock, BLOCK};
+        let pool = lock(self.model.pool());
+        let parked: usize = self.parked.iter().map(|s| s.cache.blocks().len()).sum();
+        let active = self.cache.blocks().len();
+        pool.available() + parked + active > rows.min(self.model.max_ctx()).div_ceil(BLOCK)
+    }
+
+    /// Start a request: render its prompt, pick its slot (see [`crate::slots`]), reuse what
+    /// caches and the disk hold of it, and take the slot's cache into the returned stream,
+    /// which [`step`](Self::step) then prefills and decodes. Check [`can_admit`](Self::can_admit)
+    /// first. A prompt with images is prefilled here, in one go.
+    pub fn admit(
+        &mut self,
+        req: &Request,
+        prompt: Option<(String, Vec<u32>)>,
+    ) -> Result<Stream<D::Buffer>> {
+        anyhow::ensure!(
+            self.can_admit(req.cache_key.as_deref()),
+            "no free slot for this request"
+        );
+        let constraint = if let Some(schema) = &req.response_schema {
             anyhow::ensure!(
                 req.stop.is_empty(),
                 "stop strings cannot be combined with structured output"
@@ -821,13 +1004,7 @@ impl<D: ComputeDevice> Engine<D> {
             self.restore(req.cache_key.as_deref(), &ids);
         }
         // Reuse the shared prefix (at least one token must be fed to get logits).
-        let shared = self
-            .cache
-            .tokens
-            .iter()
-            .zip(&ids)
-            .take_while(|(a, b)| a == b)
-            .count();
+        let shared = shared_len(&self.cache.tokens, &ids);
         // Only as far as the images match, and never into the middle of an image's tokens.
         let differ = self
             .cache_images
@@ -844,47 +1021,69 @@ impl<D: ComputeDevice> Engine<D> {
         }
         self.cache.truncate(reuse);
 
-        let t = Instant::now();
-        let mut logits = Vec::new();
-        let mut progress = Progress {
-            prompt_tokens: ids.len(),
-            cached_tokens: reuse,
-            prefilled: 0,
-            generated: 0,
+        // The slot's cache goes with the stream; an empty one holds its place.
+        let cache = std::mem::replace(&mut self.cache, self.model.new_cache());
+        let images = std::mem::take(&mut self.cache_images);
+        let key = self.cache_key.take();
+        let used = self.cache_used;
+        self.parked
+            .retain(|s| s.key.is_some() || !s.cache.tokens.is_empty());
+        self.out += 1;
+        if let Some(k) = &key {
+            self.running.push(k.clone());
+        }
+
+        let opened = prompt.trim_end().ends_with("<think>");
+        let drafter = self
+            .spec
+            .as_ref()
+            .filter(|_| constraint.is_none())
+            .map(|s| {
+                let cost = s.cost.table(&s.cfg, s.cfg.max_draft + 1);
+                Drafter::new(&s.cfg, &s.global, s.calib.clone(), cost, &ids)
+            });
+        let mut st = Stream {
+            cache,
+            images,
+            key,
+            used,
+            progress: Progress {
+                prompt_tokens: ids.len(),
+                cached_tokens: reuse,
+                prefilled: 0,
+                generated: 0,
+            },
+            reuse,
+            limit,
+            stop: req.stop.clone(),
+            prefill_only: req.prefill_only,
+            phase: Phase::Prefill,
+            error: None,
+            started: Instant::now(),
+            prefill_s: 0.0,
+            decode_from: None,
+            constraint,
+            sampler: Sampler::new(req.sampling.clone()),
+            parser: Parser::new(opened),
+            think: ThinkBudget::new(self.think_tags, req.thinking_budget, opened),
+            out: Vec::new(),
+            detok: Detok::default(),
+            text: String::new(),
+            finish: Finish::Length,
+            tool_calls: 0,
+            drafter,
+            rows: Vec::new(),
+            draft: crate::draft::Draft::default(),
+            row: 0,
+            pending: 0,
+            drafted: 0,
+            accepted: 0,
+            timed: Vec::new(),
+            fed: Vec::new(),
+            fed_new: 0,
+            ids,
         };
-        if runs.is_empty() {
-            for (i, chunk) in ids[reuse..].chunks(PREFILL_CHUNK).enumerate() {
-                if i > 0 && ctl.cancelled() {
-                    self.cache_images.clear();
-                    self.seal();
-                    return Ok(Outcome::Done(
-                        Finish::Cancelled,
-                        Usage {
-                            prompt_tokens: ids.len(),
-                            cached_tokens: reuse,
-                            prefill_tok_s: progress.prefilled as f64
-                                / t.elapsed().as_secs_f64().max(1e-9),
-                            ..Usage::default()
-                        },
-                    ));
-                }
-                if i > 0 && !ctl.keep_prefilling() {
-                    // Seal what's done so another conversation can't lose it for us, even if
-                    // this cache is dropped before the request comes back.
-                    self.cache_images.clear();
-                    self.seal();
-                    return Ok(Outcome::Yielded {
-                        prompt_tokens: ids.len(),
-                        cached_tokens: reuse,
-                        prefilled: progress.prefilled,
-                        secs: t.elapsed().as_secs_f64(),
-                    });
-                }
-                logits = self.model.forward(chunk, &mut self.cache, false)?;
-                progress.prefilled += chunk.len();
-                ctl.progress(progress);
-            }
-        } else {
+        if !runs.is_empty() {
             let size = self.model.vision.as_ref().map_or(896, |v| v.cfg.image_size);
             let mut feats = Vec::new();
             for (i, &(start, _)) in runs.iter().enumerate() {
@@ -893,135 +1092,216 @@ impl<D: ComputeDevice> Engine<D> {
                     feats.push(self.model.encode_image(&px)?);
                 }
             }
-            logits = self
-                .model
-                .forward_images(&ids[reuse..], &feats, &mut self.cache, false)?;
-            progress.prefilled = ids.len() - reuse;
-            ctl.progress(progress);
+            let logits =
+                match self
+                    .model
+                    .forward_images(&st.ids[reuse..], &feats, &mut st.cache, false)
+                {
+                    Ok(l) => l,
+                    Err(e) => {
+                        self.retire(st).ok();
+                        return Err(e);
+                    }
+                };
+            st.progress.prefilled = st.ids.len() - reuse;
+            st.images = runs;
+            st.prefilled(logits);
         }
-        self.cache_images = runs;
-        let prefill_s = t.elapsed().as_secs_f64();
-        if req.prefill_only {
-            self.seal();
-            return Ok(Outcome::Done(
-                Finish::Stop,
-                Usage {
-                    prompt_tokens: ids.len(),
-                    cached_tokens: reuse,
-                    completion_tokens: 0,
-                    reasoning_tokens: 0,
-                    prefill_tok_s: (ids.len() - reuse) as f64 / prefill_s.max(1e-9),
-                    decode_tok_s: 0.0,
-                    draft_tokens: 0,
-                    accepted_tokens: 0,
+        Ok(st)
+    }
+
+    /// One forward pass for every stream in `lanes`, and what follows it: each decoding
+    /// stream samples from its last logits (accepting what it can of its draft) and feeds its
+    /// next token and draft; each prefilling stream feeds its next chunk of prompt, within
+    /// `budget` tokens across the prefills (decoding rows go first; prefills are served in
+    /// lane order). Pieces go to each lane's `on`; its `ctl` is told progress and asked whether
+    /// to go on. A stream that finishes, yields or fails is [`done`](Stream::done); hand it to
+    /// [`retire`](Self::retire). An error here is the forward's, and every stream in it is
+    /// lost (retire them all).
+    pub fn step(&mut self, lanes: &mut [Lane<'_, D::Buffer>], budget: usize) -> Result<()> {
+        // Each stream's segment, if it has one this step: (tokens fed, all rows).
+        let mut segs: Vec<Option<bool>> = Vec::with_capacity(lanes.len());
+        let mut decode_rows = 0;
+        for lane in lanes.iter_mut() {
+            let want = match lane.stream.phase {
+                Phase::Decode => match self.advance(lane) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        lane.stream.fail(e);
+                        None
+                    }
                 },
-            ));
+                _ => None,
+            };
+            if want.is_some() {
+                decode_rows += lane.stream.fed.len();
+            }
+            segs.push(want);
         }
-
-        let mut sampler = Sampler::new(req.sampling.clone());
-        let opened = prompt.trim_end().ends_with("<think>");
-        let mut parser = Parser::new(opened);
-        let mut think = ThinkBudget::new(self.think_tags, req.thinking_budget, opened);
-        let mut out: Vec<u32> = Vec::new();
-        let mut detok = Detok::default();
-        let mut text = String::new();
-        let mut finish = Finish::Length;
-        let mut tool_calls = 0;
-        let t = Instant::now();
-
-        let mut deliver = |pieces: Vec<Piece>, tool_calls: &mut usize| -> bool {
-            for p in pieces {
-                if matches!(p, Piece::ToolCall { .. }) {
-                    *tool_calls += 1;
+        // Prefill chunks share what's left of the budget: chunks go to streams in lane order
+        // while some is left (the first always gets one, so a prefill always moves).
+        let mut left = budget.saturating_sub(decode_rows).max(crate::blocks::BLOCK);
+        for (lane, seg) in lanes.iter_mut().zip(segs.iter_mut()) {
+            let st = &mut *lane.stream;
+            if st.phase != Phase::Prefill || left == 0 {
+                continue;
+            }
+            if st.progress.prefilled > 0 {
+                if lane.ctl.cancelled() {
+                    // Seal what's done (see `retire`); nothing past an image here.
+                    st.images.clear();
+                    st.end_prefill();
+                    st.finish = Finish::Cancelled;
+                    st.phase = Phase::Done;
+                    continue;
                 }
-                if !on(p) {
-                    return false;
+                if !lane.ctl.keep_prefilling() {
+                    st.images.clear();
+                    st.end_prefill();
+                    st.phase = Phase::Yielded;
+                    continue;
                 }
             }
-            true
-        };
+            // Whole chunks, as the prompt would be prefilled alone (so its cache holds the same
+            // numbers); the budget says how many streams get one this step.
+            let from = st.reuse + st.progress.prefilled;
+            let n = (st.ids.len() - from).min(PREFILL_CHUNK);
+            st.fed.clear();
+            st.fed.extend_from_slice(&st.ids[from..from + n]);
+            left = left.saturating_sub(n);
+            *seg = Some(false);
+        }
+        let mut idx = Vec::new();
+        let mut parts = Vec::new();
+        for (i, (lane, seg)) in lanes.iter_mut().zip(&segs).enumerate() {
+            if let Some(all) = *seg {
+                let st = &mut *lane.stream;
+                idx.push(i);
+                parts.push(crate::model::Segment {
+                    tokens: &st.fed,
+                    cache: &mut st.cache,
+                    all,
+                });
+            }
+        }
+        if parts.is_empty() {
+            return Ok(());
+        }
+        let solo = parts.len() == 1;
+        let tf = Instant::now();
+        let logits = self.model.forward_batch(&mut parts)?;
+        let secs = tf.elapsed().as_secs_f64();
+        drop(parts);
+        let vocab = self.model.cfg.vocab_size;
+        for (i, rows) in idx.into_iter().zip(logits) {
+            let lane = &mut lanes[i];
+            let st = &mut *lane.stream;
+            match st.phase {
+                Phase::Prefill => {
+                    st.progress.prefilled += st.fed.len();
+                    lane.ctl.progress(st.progress);
+                    if st.reuse + st.progress.prefilled == st.ids.len() {
+                        st.prefilled(rows);
+                    }
+                }
+                Phase::Decode => {
+                    let (m, k) = (st.fed_new, st.fed.len() - st.fed_new);
+                    if m == 1 && solo {
+                        st.timed.push((1 + k, secs));
+                    }
+                    st.rows = rows;
+                    if k > 0 {
+                        st.rows.drain(..(m - 1) * vocab);
+                    }
+                    st.row = 0;
+                    st.pending = k;
+                    st.drafted += k;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
 
-        // Speculation: each forward feeds the new token(s) plus a draft, and returns logits for
-        // every draft position. Every token is still sampled from the target's logits in order,
-        // with the same sampler state, so the output is what plain decoding would produce; a
-        // draft token only saves a forward when it equals the sampled token.
-        let mut sess = self
-            .spec
-            .as_ref()
-            .filter(|_| constraint.is_none())
-            .map(|s| {
-                let cost = s.cost.table(&s.cfg, s.cfg.max_draft + 1);
-                Session::new(&s.cfg, &s.global, s.calib.clone(), cost, &ids)
-            });
-        // Decode forwards timed by width, for the cost model and stats.
-        let mut timed: Vec<(usize, f64)> = Vec::new();
+    /// Sample a decoding stream forward from the logits it has until it needs a forward:
+    /// returns `Some(all)` with its next segment in `fed`, or `None` once it's done.
+    fn advance(&mut self, lane: &mut Lane<'_, D::Buffer>) -> Result<Option<bool>> {
+        let st = &mut *lane.stream;
         let vocab = self.model.cfg.vocab_size;
         let max_ctx = self.model.max_ctx();
-        // Logits rows from the last forward: row r follows the fed tokens and draft[..r].
-        let mut rows = logits;
-        let mut draft = crate::draft::Draft::default();
-        let mut row = 0usize;
-        // Draft tokens in the cache that aren't accepted yet.
-        let mut pending = 0usize;
-        let (mut drafted, mut accepted) = (0usize, 0usize);
-
-        'decode: while out.len() < limit {
-            if ctl.cancelled() {
-                finish = Finish::Cancelled;
+        let spec = self.spec.as_ref();
+        // Every token is still sampled from the target's logits in order, with the same
+        // sampler state, so the output is what plain decoding would produce; a draft token
+        // only saves a forward when it equals the sampled token.
+        'decode: loop {
+            if st.out.len() >= st.limit {
                 break;
             }
-            let logits = &mut rows[row * vocab..(row + 1) * vocab];
-            if let Some(grammar) = constraint.as_mut() {
+            if lane.ctl.cancelled() {
+                st.finish = Finish::Cancelled;
+                break;
+            }
+            let logits = &mut st.rows[st.row * vocab..(st.row + 1) * vocab];
+            if let Some(grammar) = st.constraint.as_mut() {
                 crate::structured::mask(grammar, logits, &self.eos)?;
             }
-            let next = sampler.sample(logits);
-            let hit = draft.tokens.get(row) == Some(&next);
-            if row < draft.tokens.len() && !draft.from_model {
-                if let Some(s) = sess.as_mut() {
-                    s.calib.observe(draft.match_len, draft.shares[row], hit);
+            let next = st.sampler.sample(logits);
+            let row = st.row;
+            let hit = st.draft.tokens.get(row) == Some(&next);
+            if row < st.draft.tokens.len() && !st.draft.from_model {
+                if let Some(d) = st.drafter.as_mut() {
+                    d.calib
+                        .observe(st.draft.match_len, st.draft.shares[row], hit);
                 }
             }
             if hit {
-                accepted += 1;
-                pending -= 1;
+                st.accepted += 1;
+                st.pending -= 1;
             }
             if self.eos.contains(&next) {
-                finish = Finish::Stop;
+                st.finish = Finish::Stop;
                 break;
             }
-            if let Some(grammar) = constraint.as_mut() {
+            if let Some(grammar) = st.constraint.as_mut() {
                 grammar.consume_token(next)?;
             }
-            out.push(next);
-            progress.generated = out.len();
-            ctl.progress(progress);
+            st.out.push(next);
+            st.progress.generated = st.out.len();
+            lane.ctl.progress(st.progress);
             // What the next forward must feed (a hit is already in the cache).
-            let mut fed = if hit { vec![] } else { vec![next] };
+            st.fed.clear();
+            if !hit {
+                st.fed.push(next);
+            }
             // Out of thinking budget: write the wrap-up and `</think>` for the model (into the
             // KV cache like its own tokens, and streamed as reasoning), then let it answer.
-            let wrap = think.step(next) && out.len() + self.wrap_up.len() < limit;
+            let wrap = st.think.step(next) && st.out.len() + self.wrap_up.len() < st.limit;
             if wrap {
-                out.extend(&self.wrap_up);
-                fed.extend(&self.wrap_up);
-                think.closed(self.wrap_up.len());
+                st.out.extend(&self.wrap_up);
+                st.fed.extend(&self.wrap_up);
+                st.think.closed(self.wrap_up.len());
             }
-            if let Some(s) = sess.as_mut() {
-                let n = out.len() - if wrap { self.wrap_up.len() } else { 0 };
-                for &tok in &out[n - 1..] {
-                    s.push(tok);
+            if let (Some(d), Some(s)) = (st.drafter.as_mut(), spec) {
+                let n = st.out.len() - if wrap { self.wrap_up.len() } else { 0 };
+                for &tok in &st.out[n - 1..] {
+                    d.push(&s.cfg, &s.global, tok);
                 }
             }
             // Tag tokens come out as tags, everything else as literal text (see `Parser`).
-            for chunk in detok.push(&out, &self.tags, |ids| self.decode(ids))? {
+            for chunk in st.detok.push(&st.out, &self.tags, |ids| self.decode(ids))? {
                 let (new, tag) = match chunk {
                     Chunk::Text(s) => (s, None),
                     Chunk::Tag(t) => (t.to_string(), Some(t)),
                 };
-                text.push_str(&new);
-                let stop_at = req.stop.iter().filter_map(|s| text.find(s.as_str())).min();
+                st.text.push_str(&new);
+                let stop_at = st
+                    .stop
+                    .iter()
+                    .filter_map(|s| st.text.find(s.as_str()))
+                    .min();
                 let new = match stop_at {
                     Some(i) => {
-                        let keep = new.len().saturating_sub(text.len() - i);
+                        let keep = new.len().saturating_sub(st.text.len() - i);
                         new[..keep].to_string()
                     }
                     None => new,
@@ -1029,100 +1309,149 @@ impl<D: ComputeDevice> Engine<D> {
                 // Constrained output is the grammar's JSON verbatim: tool-call or think
                 // markers inside a string value are data, not structure.
                 let pieces = match tag {
-                    _ if constraint.is_some() => vec![Piece::Text(new)],
-                    Some(t) if new == t => parser.push_tag(t),
-                    _ => parser.push_text(&new),
+                    _ if st.constraint.is_some() => vec![Piece::Text(new)],
+                    Some(t) if new == t => st.parser.push_tag(t),
+                    _ => st.parser.push_text(&new),
                 };
-                if !deliver(pieces, &mut tool_calls) {
-                    finish = Finish::Cancelled;
+                if !st.deliver(pieces, &mut *lane.on) {
+                    st.finish = Finish::Cancelled;
                     break 'decode;
                 }
                 if stop_at.is_some() {
-                    finish = Finish::Stop;
+                    st.finish = Finish::Stop;
                     break 'decode;
                 }
             }
-            if fed.is_empty() {
+            if st.fed.is_empty() {
                 // The draft was right: the next position's logits are already here.
-                row += 1;
+                st.row += 1;
                 continue;
             }
-            if out.len() >= limit {
+            if st.out.len() >= st.limit {
                 break;
             }
             // Drop the rejected rest of the draft from the cache.
-            self.cache.truncate(self.cache.len - pending);
+            st.cache.truncate(st.cache.len - st.pending);
+            st.pending = 0;
             // A new draft, unless the wrap-up was just forced in (don't draft across it).
-            draft = match sess.as_ref() {
-                Some(s) if !wrap => {
-                    let room =
-                        (limit - out.len()).min(max_ctx.saturating_sub(self.cache.len + fed.len()));
-                    let d = s.propose(room);
+            st.draft = match (st.drafter.as_ref(), spec) {
+                (Some(d), Some(s)) if !wrap => {
+                    let room = (st.limit - st.out.len())
+                        .min(max_ctx.saturating_sub(st.cache.len + st.fed.len()));
+                    let p = d.propose(&s.cfg, &s.global, room);
                     match self.drafter.as_mut() {
-                        Some(m) if d.tokens.is_empty() => crate::draft::Draft {
-                            tokens: m.propose(&ids, &out, room, |k| s.cost(k))?,
+                        Some(m) if p.tokens.is_empty() => crate::draft::Draft {
+                            tokens: m.propose(&st.ids, &st.out, room, |k| d.cost(k))?,
                             from_model: true,
                             ..Default::default()
                         },
-                        _ => d,
+                        _ => p,
                     }
                 }
                 _ => crate::draft::Draft::default(),
             };
-            let k = draft.tokens.len();
-            let m = fed.len();
-            fed.extend(&draft.tokens);
-            let tf = Instant::now();
-            rows = self.model.forward(&fed, &mut self.cache, k > 0)?;
-            if m == 1 {
-                timed.push((1 + k, tf.elapsed().as_secs_f64()));
-            }
-            if k > 0 {
-                rows.drain(..(m - 1) * vocab);
-            }
-            row = 0;
-            pending = k;
-            drafted += k;
+            st.fed_new = st.fed.len();
+            st.fed.extend(&st.draft.tokens);
+            return Ok(Some(!st.draft.tokens.is_empty()));
         }
-        // Leave only accepted tokens in the cache.
-        self.cache.truncate(self.cache.len - pending);
-        if finish != Finish::Cancelled {
-            deliver(parser.finish(), &mut tool_calls);
-            if tool_calls > 0 && finish == Finish::Stop {
-                finish = Finish::ToolCalls;
+        // Done: leave only accepted tokens in the cache.
+        st.cache.truncate(st.cache.len - st.pending);
+        st.pending = 0;
+        if st.finish != Finish::Cancelled {
+            let rest = st.parser.finish();
+            st.deliver(rest, &mut *lane.on);
+            if st.tool_calls > 0 && st.finish == Finish::Stop {
+                st.finish = Finish::ToolCalls;
             }
         }
-        let calib = sess.map(|s| s.calib);
-        for &(w, secs) in &timed {
+        st.phase = Phase::Done;
+        Ok(None)
+    }
+
+    /// Finish with a stream that's done (or abandon one that isn't): seal its blocks so
+    /// other conversations can share them, put its cache back as the active slot, fold what
+    /// its drafting learned into the engine's, and say how it went.
+    pub fn retire(&mut self, mut st: Stream<D::Buffer>) -> Result<Outcome> {
+        st.cache.truncate(st.cache.len - st.pending);
+        st.pending = 0;
+        let upto = st.images.first().map_or(usize::MAX, |&(s, _)| s);
+        st.cache.seal(upto);
+        // Back as the active slot (the conversation that ran last, as `save` expects).
+        self.out -= 1;
+        if let Some(k) = &st.key {
+            if let Some(i) = self.running.iter().position(|r| r == k) {
+                self.running.swap_remove(i);
+            }
+        }
+        let cache = std::mem::replace(&mut st.cache, self.model.new_cache());
+        let prev = Slot {
+            cache: std::mem::replace(&mut self.cache, cache),
+            images: std::mem::replace(&mut self.cache_images, std::mem::take(&mut st.images)),
+            key: std::mem::replace(&mut self.cache_key, st.key.take()),
+            used: std::mem::replace(&mut self.cache_used, st.used),
+        };
+        if prev.key.is_some() || !prev.cache.tokens.is_empty() {
+            self.parked.push(prev);
+        }
+        while 1 + self.parked.len() + self.out > self.slots {
+            let Some(lru) = (0..self.parked.len()).min_by_key(|&i| self.parked[i].used) else {
+                break;
+            };
+            self.parked.swap_remove(lru);
+        }
+        if let Some(e) = st.error.take() {
+            return Err(e);
+        }
+        if st.phase == Phase::Yielded {
+            return Ok(Outcome::Yielded {
+                prompt_tokens: st.ids.len(),
+                cached_tokens: st.reuse,
+                prefilled: st.progress.prefilled,
+                secs: st.prefill_s,
+            });
+        }
+        if st.phase == Phase::Prefill {
+            st.end_prefill();
+        }
+        for &(w, secs) in &st.timed {
             if let Some(slot) = self.forwards.get_mut(w) {
                 slot.0 += 1;
                 slot.1 += secs;
             }
         }
-        if let (Some(calib), Some(spec)) = (calib, self.spec.as_mut()) {
-            spec.calib = calib;
-            for &(w, secs) in &timed {
+        if let (Some(d), Some(spec)) = (st.drafter.take(), self.spec.as_mut()) {
+            spec.calib = d.calib;
+            for &(w, secs) in &st.timed {
                 spec.cost.observe(w, secs);
             }
-            spec.global.push(&out);
+            // Into the global automaton once nothing is drafting from it.
+            self.global_pending.push(st.out.clone());
         }
-        self.seal();
-        let decode_s = t.elapsed().as_secs_f64();
-        let prompt_tokens = ids.len();
-        self.last = (ids, out.clone());
-        Ok(Outcome::Done(
-            finish,
-            Usage {
-                prompt_tokens,
-                cached_tokens: reuse,
-                completion_tokens: out.len(),
-                reasoning_tokens: think.reasoning,
-                prefill_tok_s: (prompt_tokens - reuse) as f64 / prefill_s.max(1e-9),
-                decode_tok_s: out.len() as f64 / decode_s.max(1e-9),
-                draft_tokens: drafted,
-                accepted_tokens: accepted,
+        if self.out == 0 {
+            if let Some(spec) = self.spec.as_mut() {
+                for out in self.global_pending.drain(..) {
+                    spec.global.push(&out);
+                }
+            }
+        }
+        let decode_s = st.decode_from.map_or(0.0, |t| t.elapsed().as_secs_f64());
+        let prompt_tokens = st.ids.len();
+        let usage = Usage {
+            prompt_tokens,
+            cached_tokens: st.reuse,
+            completion_tokens: st.out.len(),
+            reasoning_tokens: st.think.reasoning,
+            prefill_tok_s: st.progress.prefilled as f64 / st.prefill_s.max(1e-9),
+            decode_tok_s: if st.decode_from.is_some() {
+                st.out.len() as f64 / decode_s.max(1e-9)
+            } else {
+                0.0
             },
-        ))
+            draft_tokens: st.drafted,
+            accepted_tokens: st.accepted,
+        };
+        self.last = (st.ids, st.out);
+        Ok(Outcome::Done(st.finish, usage))
     }
 
     fn decode(&self, ids: &[u32]) -> Result<String> {

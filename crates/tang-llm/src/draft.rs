@@ -636,9 +636,60 @@ pub struct Draft {
 }
 
 /// The drafter for one request: the request's automaton plus a matcher into the global one.
+/// It borrows the shared state it drafts from; a [`Drafter`] is the same without the borrow
+/// (handed the config and global automaton each call), for a request that outlives one.
 pub struct Session<'a> {
     cfg: &'a DraftConfig,
     global: &'a Global,
+    d: Drafter,
+}
+
+impl<'a> Session<'a> {
+    pub fn new(
+        cfg: &'a DraftConfig,
+        global: &'a Global,
+        calib: Calibration,
+        cost: Vec<f32>,
+        prompt: &[u32],
+    ) -> Self {
+        Self {
+            cfg,
+            global,
+            d: Drafter::new(cfg, global, calib, cost, prompt),
+        }
+    }
+
+    /// A forward over `width` tokens relative to one (measured as decoding goes).
+    pub fn cost(&self, width: usize) -> f32 {
+        self.d.cost(width)
+    }
+
+    /// A token was generated (or injected).
+    pub fn push(&mut self, t: u32) {
+        self.d.push(self.cfg, self.global, t)
+    }
+
+    /// The draft to verify next, at most `room` tokens.
+    pub fn propose(&self, room: usize) -> Draft {
+        self.d.propose(self.cfg, self.global, room)
+    }
+}
+
+impl std::ops::Deref for Session<'_> {
+    type Target = Drafter;
+    fn deref(&self) -> &Drafter {
+        &self.d
+    }
+}
+
+impl std::ops::DerefMut for Session<'_> {
+    fn deref_mut(&mut self) -> &mut Drafter {
+        &mut self.d
+    }
+}
+
+/// A [`Session`]'s own state.
+pub struct Drafter {
     /// The hit rates, updated as drafts are verified (the caller keeps them afterwards).
     pub calib: Calibration,
     /// Relative verify cost by forward width.
@@ -647,10 +698,10 @@ pub struct Session<'a> {
     gm: Matcher,
 }
 
-impl<'a> Session<'a> {
+impl Drafter {
     pub fn new(
-        cfg: &'a DraftConfig,
-        global: &'a Global,
+        cfg: &DraftConfig,
+        global: &Global,
         calib: Calibration,
         cost: Vec<f32>,
         prompt: &[u32],
@@ -662,8 +713,6 @@ impl<'a> Session<'a> {
             gm.feed(&global.sam, t, cfg.max_depth);
         }
         Self {
-            cfg,
-            global,
             calib,
             cost,
             local,
@@ -677,38 +726,35 @@ impl<'a> Session<'a> {
     }
 
     /// A token was generated (or injected).
-    pub fn push(&mut self, t: u32) {
+    pub fn push(&mut self, cfg: &DraftConfig, global: &Global, t: u32) {
         self.local.add(t);
-        self.gm.feed(&self.global.sam, t, self.cfg.max_depth);
+        self.gm.feed(&global.sam, t, cfg.max_depth);
     }
 
     /// The draft to verify next, at most `room` tokens: the best source's continuation, cut
     /// where expected tokens per verify cost peaks.
-    pub fn propose(&self, room: usize) -> Draft {
+    pub fn propose(&self, cfg: &DraftConfig, global: &Global, room: usize) -> Draft {
         let room = room
-            .min(self.cfg.max_draft)
+            .min(cfg.max_draft)
             .min(self.cost.len().saturating_sub(2));
         if room == 0 {
             return Draft::default();
         }
-        let (ls, ln) = self.local.self_match(self.cfg.max_depth);
+        let (ls, ln) = self.local.self_match(cfg.max_depth);
         let mut best = (Draft::default(), 0.0f32);
-        for (sam, s, n) in [
-            (&self.local, ls, ln),
-            (&self.global.sam, self.gm.s, self.gm.n),
-        ] {
-            if n == 0 || n < self.cfg.min_match {
+        for (sam, s, n) in [(&self.local, ls, ln), (&global.sam, self.gm.s, self.gm.n)] {
+            if n == 0 || n < cfg.min_match {
                 continue;
             }
-            let limit = room.min(((self.cfg.alpha * n as f32) as usize).max(1));
+            let limit = room.min(((cfg.alpha * n as f32) as usize).max(1));
             let rate = self.calib.rate(n);
             // Expected tokens per step for each draft length; keep the best.
             let (mut p, mut sum) = (1.0f32, 0.0f32);
-            let (mut len, mut score) = (0usize, 1.0 / self.cfg.cost(1));
+            let (mut len, mut score) = (0usize, 1.0 / cfg.cost(1));
             let cont = sam.continuation(s, limit);
             for (i, &(_, share)) in cont.iter().enumerate() {
                 p *= (rate * share).min(1.0);
-                if p < self.cfg.min_prob {
+                if p < cfg.min_prob {
                     break;
                 }
                 sum += p;
