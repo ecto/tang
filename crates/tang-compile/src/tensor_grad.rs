@@ -1179,3 +1179,84 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod softmax_backward_passes {
+    use super::*;
+    use crate::tensor::{Arg, Monoid, View};
+    use tang::Scalar;
+
+    /// A softmax and its backward over rows long enough for
+    /// split_reduce_dims to split, through the fusion passes: the compiled
+    /// graph computes the same values. (The merge_siblings dependency fix
+    /// is guarded by tang-native's `the_passes_compile_real_attention`,
+    /// which reproduces the cycle; this smaller graph does not.)
+    #[test]
+    fn softmax_backward_survives_split_and_merge() {
+        let (r, t) = (4usize, 64usize);
+        let mut g = TensorGraph::new();
+        let x = g.input(&[r, t]);
+        let w = g.input(&[r, t]);
+        let a = |s| Arg {
+            src: s,
+            view: View::pick(2, &[Some(0), Some(1)]),
+        };
+        let row = |s| Arg {
+            src: s,
+            view: View::pick(2, &[Some(0)]),
+        };
+        let mx = g
+            .comp(&[r], &[t], vec![a(x)], Some(Monoid::max()), |z| vec![z[0]])
+            .unwrap();
+        let e = g
+            .comp(&[r, t], &[], vec![a(x), row(mx)], None, |z| {
+                vec![(z[0] - z[1]).exp()]
+            })
+            .unwrap();
+        let den = g
+            .comp(&[r], &[t], vec![a(e)], Some(Monoid::sum()), |z| vec![z[0]])
+            .unwrap();
+        let p = g
+            .comp(&[r, t], &[], vec![a(e), row(den)], None, |z| {
+                vec![z[0] / z[1]]
+            })
+            .unwrap();
+        let y = g.map(&[p, w], |z| z[0] * z[1]).unwrap();
+        let flat = g.reshape(y, &[r * t]).unwrap();
+        let l = g
+            .comp(
+                &[1usize],
+                &[r * t],
+                vec![Arg {
+                    src: flat,
+                    view: View::pick(2, &[Some(1)]),
+                }],
+                Some(Monoid::sum()),
+                |z| vec![z[0]],
+            )
+            .unwrap();
+        let gx = g.backward(l, &[x]).unwrap()[0];
+        let outs = [l, gx];
+        let (g2, o) = g.stabilize_softmax(&outs);
+        let (g2, o) = g2.substitute_maps(&o);
+        let (g2, o) = g2.eliminate_common(&o);
+        let (g2, o) = g2.merge_siblings(&o);
+        let (g2, o) = g2.relayout(&o);
+        let (g2, o) = g2.merge_reduce_dims(&o);
+        let (g2, o) = g2.split_reduce_dims(&o);
+        let ins = [
+            (0..r * t)
+                .map(|i| ((i * 37) % 11) as f64 * 0.3 - 1.5)
+                .collect::<Vec<_>>(),
+            (0..r * t)
+                .map(|i| ((i * 13) % 7) as f64 * 0.2 - 0.6)
+                .collect::<Vec<_>>(),
+        ];
+        let (want, got) = (g.eval(&ins, &outs), g2.eval(&ins, &o));
+        for (a, b) in want.iter().zip(&got) {
+            for (x, y) in a.iter().zip(b) {
+                assert!((x - y).abs() <= 1e-9 * (1.0 + x.abs()), "{x} vs {y}");
+            }
+        }
+    }
+}

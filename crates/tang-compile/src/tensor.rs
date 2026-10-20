@@ -33,7 +33,7 @@
 //! Scope of this sketch: fixed shapes, f64, a reference interpreter that
 //! respects materialization decisions, no autodiff/codegen/sharding yet.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use tang::Scalar;
 use tang_expr::{trace, ExprGraph, ExprId, Node};
@@ -633,7 +633,7 @@ pub struct TensorGraph {
     nodes: Vec<TNode>,
     n_inputs: usize,
     /// nodes `backward` sends no gradient through (see [`TensorGraph::stop_grad`])
-    stopped: std::collections::HashSet<usize>,
+    stopped: HashSet<usize>,
 }
 
 impl TensorGraph {
@@ -2900,11 +2900,46 @@ impl TensorGraph {
             });
             g.push(i);
         }
+        // Never merge a member with one it depends on: the merged node
+        // would read its own output (a cycle). Siblings with the same
+        // readers can't depend on each other, but siblings that only share
+        // a recomputed operand can (softmax's backward reduces the same
+        // expression twice, once through the other). Split each group into
+        // buckets of mutually independent members.
+        let ancestors = |i: usize| -> HashSet<usize> {
+            let mut seen = HashSet::new();
+            let mut stack = self.deps(i);
+            while let Some(d) = stack.pop() {
+                if seen.insert(d) {
+                    stack.extend(self.deps(d));
+                }
+            }
+            seen
+        };
+        let mut buckets: Vec<Vec<usize>> = Vec::new();
+        for key in &order {
+            // (members, the union of their ancestors)
+            let mut mine: Vec<(Vec<usize>, HashSet<usize>)> = Vec::new();
+            for &i in &groups[key] {
+                let anc = ancestors(i);
+                match mine
+                    .iter_mut()
+                    .find(|(ms, up)| !up.contains(&i) && !ms.iter().any(|m| anc.contains(m)))
+                {
+                    Some((ms, up)) => {
+                        ms.push(i);
+                        up.extend(anc);
+                    }
+                    None => mine.push((vec![i], anc)),
+                }
+            }
+            buckets.extend(mine.into_iter().map(|(ms, _)| ms));
+        }
         let mut g = self.clone();
         // member -> (merged node, slot)
         let mut slot_of: Vec<Option<(usize, usize)>> = vec![None; n];
-        for key in &order {
-            for members in groups[key].chunks(MAX_GROUP).filter(|m| m.len() > 1) {
+        for bucket in &buckets {
+            for members in bucket.chunks(MAX_GROUP).filter(|m| m.len() > 1) {
                 let first = self.comp_at(members[0]).unwrap();
                 let k = members.len();
                 let mut args: Vec<Arg> = Vec::new();
