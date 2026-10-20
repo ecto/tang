@@ -38,6 +38,10 @@ impl BitModel {
         let p = clamp_p(p1) as u16;
         Self { fast: p, slow: p }
     }
+    /// `fast | slow << 16` (the GPU decoder's model word).
+    pub fn packed(&self) -> u32 {
+        self.fast as u32 | (self.slow as u32) << 16
+    }
     /// Current `P(1)` in 16-bit fixed point.
     #[inline]
     pub fn p1(&self) -> u32 {

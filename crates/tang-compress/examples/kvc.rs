@@ -42,6 +42,7 @@ fn main() {
             let mut p = KvParams::new(kind, h, d, 1.0);
             p.pre_rope = !args.iter().any(|a| a == "--post");
             p.ar = !args.iter().any(|a| a == "--noar");
+            p.gpu = args.iter().any(|a| a == "--gpu");
             if let Some(v) = flag(&args, "--sink") {
                 p.sink = v.parse().unwrap();
             }
