@@ -193,8 +193,8 @@ pub fn shader(m: &Model) -> (String, Vec<(String, u32, u32)>, Sizes) {
             k,
             "            let mu = clamp(o0, -16384, 16383);\n\
              \x20           let base = (mu + 128) >> 8u;\n\
-             \x20           let fbk = u32((mu - (base << 8u) + 128) >> 4u);\n\
-             \x20           let lb = u32(clamp((o1 + 1288) >> 4u, 0, {nlb1}));\n\
+             \x20           let fbk = u32((mu - (base << 8u) + 128) >> {fbs}u);\n\
+             \x20           let lb = u32(clamp((o1 + {lbo}) >> {lbs}u, 0, {nlb1}));\n\
              \x20           let tof = (fbk * {NLB}u + lb) * {ns1}u;\n\
              \x20           sbase[y - ylo] = base; soff[y - ylo] = tof;\n\
              \x20           sca[y - ylo] = vec4<u32>(ro[tof + {Rm2}u], ro[tof + {Rm1}u], ro[tof + {R}u], ro[tof + {R1}u]); scb[y - ylo] = vec4<u32>(ro[tof + {R2}u], ro[tof + {R3}u], ro[tof + {R4}u], ro[tof + {R5}u]);\n\
@@ -236,6 +236,9 @@ pub fn shader(m: &Model) -> (String, Vec<(String, u32, u32)>, Sizes) {
              \x20   if (lid < {L}u) {{ lanes[2u * gl] = st; lanes[2u * gl + 1u] = pos; }}\n\
              }}\n",
             nlb1 = NLB - 1,
+            fbs = img::FB_SHIFT,
+            lbs = img::LB_SHIFT,
+            lbo = 1280 + (1 << (img::LB_SHIFT - 1)),
             Rm2 = R - 2,
             Rm1 = R - 1,
             R = R,

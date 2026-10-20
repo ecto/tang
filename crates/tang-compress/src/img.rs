@@ -32,10 +32,14 @@ pub const MAGIC: &[u8; 4] = b"TCI1";
 pub const QA_ARM: u32 = 8;
 /// Fractional bits of upsampling / synthesis activations.
 pub const QA: u32 = 12;
-/// μ-fraction buckets (μ resolution 1/16).
-pub const NFB: usize = 16;
-/// Log-scale buckets: `ln b ∈ [−5, 5]` in steps of 1/16.
-pub const NLB: usize = 161;
+/// μ-fraction buckets.
+pub const NFB: usize = 256 >> FB_SHIFT;
+/// μ-fraction bucket width `2^FB_SHIFT / 256`.
+pub const FB_SHIFT: u32 = 3;
+/// Log-scale bucket width `2^LB_SHIFT / 256`.
+pub const LB_SHIFT: u32 = 3;
+/// Log-scale buckets over `ln b ∈ [−5, 5]`.
+pub const NLB: usize = (2560 >> LB_SHIFT) + 1;
 /// Residual alphabet `r ∈ [−R, R]` plus two escapes.
 pub const R: i32 = 31;
 /// Symbols per table.
@@ -122,7 +126,6 @@ impl QT {
     }
     fn write(&self, w: &mut BitWriter) {
         eg_put(w, self.s as u64, 0);
-        eg_put(w, self.k.len() as u64, 0);
         // Exp-Golomb order chosen per tensor
         let zz: Vec<u64> = self.k.iter().map(|&k| zigzag(k as i64)).collect();
         let cost = |o: u32| zz.iter().map(|&z| eg_len(z, o)).sum::<u64>();
@@ -132,19 +135,31 @@ impl QT {
             eg_put(w, z, o);
         }
     }
-    fn read(r: &mut BitReader) -> Result<Self, DecodeError> {
+    /// Read `n` values (the count comes from the layer shape).
+    fn read(r: &mut BitReader, n: usize) -> Result<Self, DecodeError> {
         let s = eg_get(r, 0)? as u32;
         if s > 24 {
             return Err(DecodeError::Invalid("qt exponent"));
-        }
-        let n = eg_get(r, 0)? as usize;
-        if n > 1 << 16 {
-            return Err(DecodeError::Invalid("qt size"));
         }
         let o = eg_get(r, 0)? as u32;
         let k = (0..n).map(|_| eg_get(r, o).map(|z| unzigzag(z) as i32)).collect::<Result<_, _>>()?;
         Ok(Self { s, k })
     }
+}
+
+/// Weight precision cap; precisions are sent as `FWMAX − fw`.
+const FWMAX: u32 = 16;
+
+fn put_fw(w: &mut BitWriter, fw: u32) {
+    eg_put(w, (FWMAX - fw) as u64, 0);
+}
+
+fn get_fw(r: &mut BitReader) -> Result<u32, DecodeError> {
+    let d = eg_get(r, 0)?;
+    if d > FWMAX as u64 {
+        return Err(DecodeError::Invalid("weight precision"));
+    }
+    Ok(FWMAX - d as u32)
 }
 
 fn eg_len(v: u64, o: u32) -> u64 {
@@ -325,10 +340,12 @@ impl Mlp {
     fn write(&self, w: &mut BitWriter) {
         eg_put(w, self.layers.len() as u64, 0);
         eg_put(w, (self.stab.is_some() as u8 | (self.residual as u8) << 1) as u64, 0);
+        // input width once; each layer's input is the previous output, the
+        // stabiliser's is the MLP input
+        eg_put(w, self.nin() as u64, 0);
         for l in self.layers.iter().chain(self.stab.iter()) {
             eg_put(w, l.out as u64, 0);
-            eg_put(w, l.inp as u64, 0);
-            eg_put(w, l.fw as u64, 0);
+            put_fw(w, l.fw);
             l.qw.write(w);
             l.qb.write(w);
         }
@@ -336,18 +353,16 @@ impl Mlp {
     fn read(r: &mut BitReader) -> Result<Self, DecodeError> {
         let nl = eg_get(r, 0)? as usize;
         let fl = eg_get(r, 0)? as u8;
-        let mut ls = vec![];
-        for _ in 0..nl + (fl & 1) as usize {
+        let mut ls: Vec<Lin> = vec![];
+        let nin = eg_get(r, 0)? as usize;
+        for li in 0..nl + (fl & 1) as usize {
             let out = eg_get(r, 0)? as usize;
-            let inp = eg_get(r, 0)? as usize;
-            let fw = eg_get(r, 0)? as u32;
-            if out > 64 || inp > 64 || fw > 24 {
+            let inp = if li == 0 || li == nl { nin } else { ls[li - 1].out };
+            let fw = get_fw(r)?;
+            if out > 64 || inp > 64 {
                 return Err(DecodeError::Invalid("mlp dims"));
             }
-            let (qw, qb) = (QT::read(r)?, QT::read(r)?);
-            if qw.k.len() != out * inp || qb.k.len() != out {
-                return Err(DecodeError::Invalid("mlp sizes"));
-            }
+            let (qw, qb) = (QT::read(r, out * inp)?, QT::read(r, out)?);
             let mut l = Lin::new(out, inp, qw, qb);
             l.set_fw(fw, QA_ARM);
             ls.push(l);
@@ -386,7 +401,7 @@ impl Conv {
         eg_put(w, self.cin() as u64, 0);
         eg_put(w, self.k as u64, 0);
         eg_put(w, (self.residual as u8 | (self.relu as u8) << 1) as u64, 0);
-        eg_put(w, self.lin.fw as u64, 0);
+        put_fw(w, self.lin.fw);
         self.lin.qw.write(w);
         self.lin.qb.write(w);
     }
@@ -395,14 +410,11 @@ impl Conv {
         let cin = eg_get(r, 0)? as usize;
         let k = eg_get(r, 0)? as usize;
         let fl = eg_get(r, 0)? as u8;
-        let fw = eg_get(r, 0)? as u32;
-        if out > 128 || cin > 128 || !(k == 1 || k == 3) || fw > 24 {
+        let fw = get_fw(r)?;
+        if out > 128 || cin > 128 || !(k == 1 || k == 3) {
             return Err(DecodeError::Invalid("conv dims"));
         }
-        let (qw, qb) = (QT::read(r)?, QT::read(r)?);
-        if qw.k.len() != out * cin * k * k || qb.k.len() != out {
-            return Err(DecodeError::Invalid("conv sizes"));
-        }
+        let (qw, qb) = (QT::read(r, out * cin * k * k)?, QT::read(r, out)?);
         let mut lin = Lin::new(out, cin * k * k, qw, qb);
         lin.set_fw(fw, QA);
         Ok(Self { lin, k, residual: fl & 1 != 0, relu: fl & 2 != 0 })
@@ -522,6 +534,19 @@ impl Model {
     }
 }
 
+/// Cool-chic's context priority order (`get_priority_order`, 9×9 causal mask)
+/// as `(dy, dx)`.
+pub const CTX_ORDER: [(i32, i32); 40] = {
+    const PRIO: [u8; 40] = [38, 35, 30, 25, 23, 31, 36, 37, 39, 33, 28, 21, 20, 6, 15, 22, 29, 34, 32, 18, 12, 10, 5, 9, 14, 19, 27, 24, 13, 8, 2, 1, 3, 11, 17, 26, 16, 7, 4, 0];
+    let mut out = [(0i32, 0i32); 40];
+    let mut k = 0;
+    while k < 40 {
+        out[PRIO[k] as usize] = ((k / 9) as i32 - 4, (k % 9) as i32 - 4);
+        k += 1;
+    }
+    out
+};
+
 /// Smallest `s` with `t(y, x) = x + s·y` strictly after every context.
 pub fn slope_of(ctx: &[(i32, i32)]) -> usize {
     let mut s = 1;
@@ -542,9 +567,10 @@ pub fn tables() -> &'static Vec<u32> {
     T.get_or_init(|| {
         let mut out = Vec::with_capacity(NFB * NLB * (NSYM + 1));
         for fb in 0..NFB {
-            let mu = (fb as f64 * 16.0 - 120.0) / 256.0;
+            let fbw = (1 << FB_SHIFT) as f64;
+            let mu = (fb as f64 * fbw - 128.0 + fbw / 2.0) / 256.0;
             for lb in 0..NLB {
-                let b = (lb as f64 / 16.0 - 5.0).exp();
+                let b = ((lb << LB_SHIFT) as f64 / 256.0 - 5.0).exp();
                 let cdf = |x: f64| {
                     let d = x - mu;
                     if d < 0.0 {
@@ -586,8 +612,8 @@ pub fn tables() -> &'static Vec<u32> {
 pub fn bucket(mu: i32, ls: i32) -> (i32, usize) {
     let mu = mu.clamp(-64 * 256, 64 * 256 - 1);
     let base = (mu + 128) >> 8;
-    let fb = ((mu - (base << 8) + 128) >> 4) as usize;
-    let lb = ((ls + 1280 + 8) >> 4).clamp(0, NLB as i32 - 1) as usize;
+    let fb = ((mu - (base << 8) + 128) >> FB_SHIFT) as usize;
+    let lb = ((ls + 1280 + (1 << (LB_SHIFT - 1))) >> LB_SHIFT).clamp(0, NLB as i32 - 1) as usize;
     (base, (fb * NLB + lb) * (NSYM + 1))
 }
 
@@ -844,13 +870,24 @@ fn write_model(m: &Model, w: &mut BitWriter) {
     eg_put(w, m.w as u64, 0);
     eg_put(w, m.sizes.len() as u64, 0);
     for (i, &(h, ww)) in m.sizes.iter().enumerate() {
-        eg_put(w, h as u64, 0);
-        eg_put(w, ww as u64, 0);
+        // usually (⌈H/2^d⌉, ⌈W/2^d⌉): send d; else d = 31 and the size
+        match (0..31).find(|&d| (h, ww) == (m.h.div_ceil(1 << d), m.w.div_ceil(1 << d))) {
+            Some(d) => eg_put(w, d as u64, 0),
+            None => {
+                eg_put(w, 31, 0);
+                eg_put(w, h as u64, 0);
+                eg_put(w, ww as u64, 0);
+            }
+        }
         eg_put(w, (m.hyper[i] as u8 | (m.ifce_of[i].map_or(0, |a| a as u8 + 1) << 1)) as u64, 0);
     }
-    eg_put(w, m.ctx.len() as u64, 0);
-    for &(dy, dx) in &m.ctx {
-        eg_put(w, (((-dy) as u8) << 4 | (dx + 8) as u8) as u64, 0);
+    // context: Cool-chic's priority order prefix (flag 1), or explicit
+    let canon = m.ctx.len() <= CTX_ORDER.len() && m.ctx.iter().zip(CTX_ORDER).all(|(a, b)| *a == b);
+    eg_put(w, (m.ctx.len() << 1 | canon as usize) as u64, 0);
+    if !canon {
+        for &(dy, dx) in &m.ctx {
+            eg_put(w, (((-dy) as u8) << 4 | (dx + 8) as u8) as u64, 0);
+        }
     }
     eg_put(w, m.nifce as u64, 0);
     eg_put(w, m.lanes as u64, 0);
@@ -864,8 +901,12 @@ fn write_model(m: &Model, w: &mut BitWriter) {
     for fs in [&m.tconv, &m.pconv] {
         eg_put(w, fs.len() as u64, 0);
         for f in fs {
-            eg_put(w, f.fw as u64, 0);
-            f.q.write(w);
+            // symmetric taps: send the first ⌈k/2⌉
+            let k = f.q.k.len();
+            assert!((0..k).all(|i| f.q.k[i] == f.q.k[k - 1 - i]), "upsampling filter not symmetric");
+            eg_put(w, k as u64, 0);
+            put_fw(w, f.fw);
+            QT { s: f.q.s, k: f.q.k[..k.div_ceil(2)].to_vec() }.write(w);
         }
     }
     eg_put(w, m.syn.len() as u64, 0);
@@ -889,7 +930,12 @@ fn read_model(r: &mut BitReader) -> Result<Model, DecodeError> {
     }
     let (mut sizes, mut hyper, mut ifce_of) = (vec![], vec![], vec![]);
     for _ in 0..n {
-        let (a, b) = (eg_get(r, 0)? as usize, eg_get(r, 0)? as usize);
+        let d = eg_get(r, 0)?;
+        let (a, b) = match d {
+            0..=30 => (h.div_ceil(1 << d), w.div_ceil(1 << d)),
+            31 => (eg_get(r, 0)? as usize, eg_get(r, 0)? as usize),
+            _ => return Err(bad("grid size")),
+        };
         if a == 0 || b == 0 || a > h || b > w {
             return Err(bad("grid size"));
         }
@@ -899,10 +945,16 @@ fn read_model(r: &mut BitReader) -> Result<Model, DecodeError> {
         ifce_of.push((f >> 1 != 0).then(|| (f >> 1) as usize - 1));
     }
     let nc = eg_get(r, 0)? as usize;
-    if nc > 40 {
+    let canon = nc & 1 == 1;
+    let nc = nc >> 1;
+    if nc > CTX_ORDER.len() {
         return Err(bad("ctx"));
     }
-    let ctx = (0..nc).map(|_| eg_get(r, 0).map(|b| (-((b >> 4) as i32), (b & 15) as i32 - 8))).collect::<Result<Vec<_>, _>>()?;
+    let ctx = if canon {
+        CTX_ORDER[..nc].to_vec()
+    } else {
+        (0..nc).map(|_| eg_get(r, 0).map(|b| (-((b >> 4) as i32), (b & 15) as i32 - 8))).collect::<Result<Vec<_>, _>>()?
+    };
     let nifce = eg_get(r, 0)? as usize;
     let lanes = eg_get(r, 0)? as usize;
     let tile_w = eg_get(r, 0)? as usize;
@@ -918,11 +970,17 @@ fn read_model(r: &mut BitReader) -> Result<Model, DecodeError> {
         let k = eg_get(r, 0)? as usize;
         let mut v = vec![];
         for _ in 0..k.min(32) {
-            let fw = eg_get(r, 0)? as u32;
-            if fw > 24 {
-                return Err(bad("filter fw"));
+            let k = eg_get(r, 0)? as usize;
+            let fw = get_fw(r)?;
+            if !(2..=16).contains(&k) {
+                return Err(bad("filter"));
             }
-            v.push(Filt::new(QT::read(r)?, fw));
+            let mut q = QT::read(r, k.div_ceil(2))?;
+            for i in (0..k / 2).rev() {
+                let v = q.k[i];
+                q.k.push(v);
+            }
+            v.push(Filt::new(q, fw));
         }
         fl.push(v);
     }
@@ -1491,7 +1549,8 @@ pub(crate) mod tests {
         for i in 0..2 {
             let a = [0.0351562, 0.1054687, -0.2617187, -0.8789063].map(|v: f64| -((v * 64.0).round() / 64.0));
             put(&mut t, &format!("ups.tconv.{i}"), &[8], [a[0], a[1], a[2], a[3], a[3], a[2], a[1], a[0]].to_vec());
-            put(&mut t, &format!("ups.conv.{i}"), &[7], (0..7).map(|k| if k == 3 { 0.25 } else { r.q(4) }).collect());
+            let h: Vec<f64> = (0..4).map(|k| if k == 3 { 0.25 } else { r.q(4) }).collect();
+            put(&mut t, &format!("ups.conv.{i}"), &[7], vec![h[0], h[1], h[2], h[3], h[2], h[1], h[0]]);
         }
         let conv = |t: &mut HashMap<_, _>, r: &mut Rng, p: &str, o: usize, i: usize, k: usize, res: bool, relu: bool| {
             put(t, &format!("{p}.w"), &[o, i, k, k], (0..o * i * k * k).map(|_| r.q(30)).collect());
