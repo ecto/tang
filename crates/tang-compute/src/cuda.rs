@@ -4688,7 +4688,9 @@ impl ComputeDevice for CudaComputeDevice {
         k: usize,
         router: crate::moe::Router,
     ) -> (CudaBuffer, CudaBuffer) {
-        self.moe_route_llm(logits, rows, experts, k, router)
+        (!moe::host_op("route"))
+            .then(|| self.moe_route_llm(logits, rows, experts, k, router))
+            .flatten()
             .unwrap_or_else(|| {
                 let (ids, w) =
                     crate::moe::route(&self.download(logits), rows, experts, k, router);
@@ -4709,8 +4711,9 @@ impl ComputeDevice for CudaComputeDevice {
         n: usize,
         per_pick: bool,
     ) -> CudaBuffer {
-        if let Some(y) =
-            self.moe_linear_llm(x, w, fmt, experts, bias, ids, k_top, k, n, per_pick)
+        if let Some(y) = (!moe::host_op("linear"))
+            .then(|| self.moe_linear_llm(x, w, fmt, experts, bias, ids, k_top, k, n, per_pick))
+            .flatten()
         {
             return y;
         }
@@ -4725,6 +4728,10 @@ impl ComputeDevice for CudaComputeDevice {
         alpha: f32,
         limit: f32,
     ) -> CudaBuffer {
+        if moe::host_op("swiglu") {
+            let y = crate::moe::swiglu_clamped(&self.download(gu), rows, ff, alpha, limit);
+            return self.upload(&y);
+        }
         self.swiglu_clamped_llm(gu, rows, ff, alpha, limit)
     }
 
@@ -4736,6 +4743,10 @@ impl ComputeDevice for CudaComputeDevice {
         k_top: usize,
         h: usize,
     ) -> CudaBuffer {
+        if moe::host_op("combine") {
+            let y = crate::moe::moe_combine(&self.download(parts), &self.download(w), rows, k_top, h);
+            return self.upload(&y);
+        }
         self.moe_combine_llm(parts, w, rows, k_top, h)
     }
 
@@ -4752,7 +4763,7 @@ impl ComputeDevice for CudaComputeDevice {
         causal: bool,
         sinks: &CudaBuffer,
     ) -> CudaBuffer {
-        if causal {
+        if causal && !moe::host_op("sinks") {
             if let Some(o) = self.attention_sinks_llm(
                 q,
                 k_pool,
