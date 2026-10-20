@@ -125,26 +125,31 @@ extern "C" __global__ void gemv_q4(
 // word's first and second four values in separate planes: conflict-free float4 reads at a lane
 // stride of 16 bytes). M is a template parameter, so the row loop has no branches. Each row's
 // sum runs in the same order whatever M is: a row decoded in a batch gets exactly the bits it
-// gets alone. Launch: grid ceil(N / (Q4_WARPS * CPW)), block Q4_WARPS * 32.
+// gets alone. A K split (gridDim.y > 1, `wsplit` words a split) writes its own [M, N] slice of
+// Y for `sum_splits`; the split depends on the shape alone, never on M, so this holds split
+// too. Launch: grid (ceil(N / (Q4_WARPS * CPW)), splits), block Q4_WARPS * 32.
 #define XW 128
 template <int CPW, int M, int WARPS>
 __device__ __forceinline__ void gemv_q4_xs_body(
     const float* __restrict__ X, const unsigned int* __restrict__ Wq,
     const unsigned short* __restrict__ S, const unsigned short* __restrict__ B,
-    float* __restrict__ Y, unsigned int K, unsigned int N, unsigned int group)
+    float* __restrict__ Y, unsigned int K, unsigned int N, unsigned int group,
+    unsigned int wsplit)
 {
     __shared__ __align__(16) float Xs[2][8][XW * 4];
     unsigned int tid = threadIdx.x, lane = tid & 31;
     unsigned int n0 = (blockIdx.x * WARPS + (tid >> 5)) * CPW;
     bool live = n0 < N;
     unsigned int words = K / 8, G = K / group;
+    unsigned int wb = blockIdx.y * wsplit, we = min(wb + wsplit, words);
+    Y += (u64)blockIdx.y * M * N;
     float acc[CPW][M];
     #pragma unroll
     for (int c = 0; c < CPW; c++)
         #pragma unroll
         for (int r = 0; r < M; r++) acc[c][r] = 0.0f;
-    for (unsigned int w0 = 0; w0 < words; w0 += XW) {
-        unsigned int nw = min(XW, words - w0);
+    for (unsigned int w0 = wb; w0 < we; w0 += XW) {
+        unsigned int nw = min(XW, we - w0);
         __syncthreads();
         // Fill: thread t takes half-words (float4s) t, t + 256, ... of each row.
         for (int r = 0; r < M; r++) {
@@ -200,13 +205,110 @@ __device__ __forceinline__ void gemv_q4_xs_body(
     }
 }
 
+// `gemv_q4_xs_body` with 128-bit weight loads, for K % 32 == 0 and group % 32 == 0 (every MLX
+// model): per XW-word stage, lane `l` takes words 4l .. 4l + 3 of each of its CPW columns as one
+// uint4 (32 weights, one scale group), issued before the stage's activations are staged so the
+// loads overlap the fill. Activations are staged as plain rows of floats, float4 `i` at
+// `i ^ ((i >> 3) & 7)` within its 8-float4 line, so a quarter-warp's eight float4 reads land on
+// eight different banks. Same split and batch-invariance contract as `gemv_q4_xs_body`.
+__device__ __forceinline__ unsigned int xv_swz(unsigned int i) { return i ^ ((i >> 3) & 7u); }
+template <int CPW, int M, int WARPS>
+__device__ __forceinline__ void gemv_q4_xv_body(
+    const float* __restrict__ X, const unsigned int* __restrict__ Wq,
+    const unsigned short* __restrict__ S, const unsigned short* __restrict__ B,
+    float* __restrict__ Y, unsigned int K, unsigned int N, unsigned int group,
+    unsigned int wsplit)
+{
+    __shared__ __align__(16) float4 Xs[M][XW * 2];
+    unsigned int tid = threadIdx.x, lane = tid & 31;
+    unsigned int n0 = (blockIdx.x * WARPS + (tid >> 5)) * CPW;
+    bool live = n0 < N;
+    unsigned int words = K / 8, G = K / group;
+    unsigned int wb = blockIdx.y * wsplit, we = min(wb + wsplit, words);
+    Y += (u64)blockIdx.y * M * N;
+    float acc[CPW][M];
+    #pragma unroll
+    for (int c = 0; c < CPW; c++)
+        #pragma unroll
+        for (int r = 0; r < M; r++) acc[c][r] = 0.0f;
+    for (unsigned int w0 = wb; w0 < we; w0 += XW) {
+        unsigned int nw = min(XW, we - w0);
+        unsigned int i = w0 + 4 * lane;        // this lane's first word
+        bool mine = live && 4 * lane < nw;
+        uint4 q[CPW];
+        float s[CPW], b[CPW];
+        if (mine) {
+            #pragma unroll
+            for (int c = 0; c < CPW; c++) {
+                unsigned int n = min(n0 + c, N - 1);
+                q[c] = *(const uint4*)(Wq + (u64)n * words + i);
+                u64 g = (u64)n * G + (i * 8) / group;
+                s[c] = bf(S[g]); b[c] = bf(B[g]);
+            }
+        }
+        __syncthreads();
+        for (int r = 0; r < M; r++) {
+            const float4* xr = (const float4*)(X + (u64)r * K + (u64)w0 * 8);
+            for (unsigned int h = tid; h < 2 * nw; h += WARPS * 32) Xs[r][xv_swz(h)] = xr[h];
+        }
+        __syncthreads();
+        if (!mine) continue;
+        #pragma unroll
+        for (int c = 0; c < CPW; c++) {
+            unsigned int qs[4] = {q[c].x, q[c].y, q[c].z, q[c].w};
+            #pragma unroll
+            for (int w = 0; w < 4; w++) {
+                float wf[8];
+                #pragma unroll
+                for (int e = 0; e < 8; e++) wf[e] = fmaf(nib(qs[w], e), s[c], b[c]);
+                unsigned int h = 8 * lane + 2 * w;
+                #pragma unroll
+                for (int r = 0; r < M; r++) {
+                    float4 a = Xs[r][xv_swz(h)], e = Xs[r][xv_swz(h + 1)];
+                    float t = acc[c][r];
+                    t = fmaf(wf[0], a.x, t); t = fmaf(wf[1], a.y, t);
+                    t = fmaf(wf[2], a.z, t); t = fmaf(wf[3], a.w, t);
+                    t = fmaf(wf[4], e.x, t); t = fmaf(wf[5], e.y, t);
+                    t = fmaf(wf[6], e.z, t); t = fmaf(wf[7], e.w, t);
+                    acc[c][r] = t;
+                }
+            }
+        }
+    }
+    if (!live) return;
+    #pragma unroll
+    for (int c = 0; c < CPW; c++) {
+        #pragma unroll
+        for (int r = 0; r < M; r++) {
+            float v = warp_sum(acc[c][r]);
+            if (lane == 0 && n0 + c < N) Y[(u64)r * N + n0 + c] = v;
+        }
+    }
+}
+
 #define Q4_WARPS 8
 #define GEMV_Q4_XS(CPW, M)                                                                    \
 extern "C" __global__ void __launch_bounds__(Q4_WARPS * 32) gemv_q4_xs##CPW##_m##M(           \
     const float* __restrict__ X, const unsigned int* __restrict__ Wq,                         \
     const unsigned short* __restrict__ S, const unsigned short* __restrict__ B,               \
-    float* __restrict__ Y, unsigned int K, unsigned int N, unsigned int group)                \
-{ gemv_q4_xs_body<CPW, M, Q4_WARPS>(X, Wq, S, B, Y, K, N, group); }
+    float* __restrict__ Y, unsigned int K, unsigned int N, unsigned int group,                \
+    unsigned int wsplit)                                                                      \
+{ gemv_q4_xs_body<CPW, M, Q4_WARPS>(X, Wq, S, B, Y, K, N, group, wsplit); }
+#define GEMV_Q4_XV(CPW, M)                                                                    \
+extern "C" __global__ void __launch_bounds__(Q4_WARPS * 32) gemv_q4_xv##CPW##_m##M(           \
+    const float* __restrict__ X, const unsigned int* __restrict__ Wq,                         \
+    const unsigned short* __restrict__ S, const unsigned short* __restrict__ B,               \
+    float* __restrict__ Y, unsigned int K, unsigned int N, unsigned int group,                \
+    unsigned int wsplit)                                                                      \
+{ gemv_q4_xv_body<CPW, M, Q4_WARPS>(X, Wq, S, B, Y, K, N, group, wsplit); }
+GEMV_Q4_XV(4, 1)
+GEMV_Q4_XV(4, 2)
+GEMV_Q4_XV(4, 3)
+GEMV_Q4_XV(4, 4)
+GEMV_Q4_XV(4, 5)
+GEMV_Q4_XV(4, 6)
+GEMV_Q4_XV(4, 7)
+GEMV_Q4_XV(4, 8)
 GEMV_Q4_XS(4, 1)
 GEMV_Q4_XS(4, 2)
 GEMV_Q4_XS(4, 3)
