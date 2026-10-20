@@ -99,6 +99,46 @@ extern "C" __global__ void rms_norm(
         output[base + i] = input[base + i] * rms * weight[i];
     }
 }
+
+// `rms_norm` for dim % 4 == 0: a block a row of up to 1024 threads, float4 loads, warp-shuffle
+// reduction. A decode row (4096 floats) is one float4 a thread and two barriers, where the
+// 256-thread tree above is 16 dependent loads and 8 barriers on one SM. Each row reduces in an
+// order fixed by dim and the block size alone (chosen from dim), never by n_groups.
+extern "C" __global__ void rms_norm_v4(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    float* __restrict__ output,
+    const unsigned int n_groups,
+    const unsigned int dim,
+    const float eps)
+{
+    __shared__ float warps[32];
+    unsigned int group = blockIdx.x, tid = threadIdx.x;
+    if (group >= n_groups) return;
+    const float4* in = (const float4*)(input + (unsigned long long)group * dim);
+    float4* out = (float4*)(output + (unsigned long long)group * dim);
+    const float4* w = (const float4*)weight;
+    unsigned int n4 = dim / 4;
+    float sq = 0.0f;
+    for (unsigned int i = tid; i < n4; i += blockDim.x) {
+        float4 v = in[i];
+        sq += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+    for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
+    if ((tid & 31) == 0) warps[tid >> 5] = sq;
+    __syncthreads();
+    if (tid < 32) {
+        float t = tid < (blockDim.x >> 5) ? warps[tid] : 0.0f;
+        for (int o = 16; o > 0; o >>= 1) t += __shfl_xor_sync(0xffffffffu, t, o);
+        if (tid == 0) warps[0] = t;
+    }
+    __syncthreads();
+    float rms = rsqrtf(warps[0] / float(dim) + eps);
+    for (unsigned int i = tid; i < n4; i += blockDim.x) {
+        float4 v = in[i], g = w[i];
+        out[i] = make_float4(v.x * rms * g.x, v.y * rms * g.y, v.z * rms * g.z, v.w * rms * g.w);
+    }
+}
 "#;
 
 /// bf16 row-wise softmax. Input/output are bf16, shared memory stays f32.

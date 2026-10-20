@@ -1499,8 +1499,20 @@ impl ComputeDevice for CudaComputeDevice {
 
             output
         } else {
-            let (_module, func) = self.get_func(reduce_cuda::RMS_NORM_CUDA, "rms_norm");
+            let v4 = dim % 4 == 0;
+            let name = if v4 { "rms_norm_v4" } else { "rms_norm" };
+            let (_module, func) = self.get_func(reduce_cuda::RMS_NORM_CUDA, name);
             let mut output = self.pool_alloc_uninit_f32(data.len);
+            let cfg = if v4 {
+                // A float4 a thread, whole warps, at most 1024: fixed by dim alone.
+                let threads = (dim / 4).div_ceil(32).clamp(1, 32) * 32;
+                LaunchConfig {
+                    block_dim: (threads as u32, 1, 1),
+                    ..cfg
+                }
+            } else {
+                cfg
+            };
 
             unsafe {
                 self.stream
