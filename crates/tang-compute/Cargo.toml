@@ -33,3 +33,7 @@ cudarc = { version = "0.16", features = ["nvrtc", "cublas", "cuda-version-from-b
 
 [dev-dependencies]
 tang-compress = { workspace = true }
+
+[[example]]
+name = "kvdec_bench"
+required-features = ["metal"]

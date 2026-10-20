@@ -930,6 +930,7 @@ mod conditioning_tests {
             max_ctx: 2048,
             pool: new_pool(2, 4, false, usize::MAX),
             dev,
+            kvcomp: std::sync::Mutex::new(None),
         }
     }
 

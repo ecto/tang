@@ -57,3 +57,7 @@ name = "bench_batch"
 [[example]]
 name = "bench_prefill"
 required-features = ["metal"]
+
+[[example]]
+name = "kvcomp_bench"
+required-features = ["metal"]

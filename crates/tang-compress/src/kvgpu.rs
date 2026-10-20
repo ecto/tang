@@ -58,7 +58,7 @@ impl Batch {
         let p = &s.params;
         let base = self.bytes.len();
         self.bytes.extend_from_slice(bytes);
-        while self.bytes.len() % 4 != 0 {
+        while !self.bytes.len().is_multiple_of(4) {
             self.bytes.push(0);
         }
         let chan0 = self.chans.len() / 4;
