@@ -46,6 +46,7 @@ pub mod gpuwav;
 pub mod gpuwav3;
 pub mod interp;
 pub mod irdec;
+pub mod kvcodec;
 pub mod learned;
 pub mod linalg;
 pub mod lmodel3;
