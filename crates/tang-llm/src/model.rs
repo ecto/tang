@@ -86,7 +86,9 @@ pub struct Model<D: ComputeDevice> {
     max_ctx: usize,
     /// Every cache's K and V blocks (see [`crate::blocks`]): bf16 (half the memory of f32;
     /// attention still accumulates in f32) unless the device has no bf16 storage, or with
-    /// `TANG_KV_F32=1`.
+    /// `TANG_KV_F32=1`. gpt-oss keeps f32 unless `TANG_KV_F32=0`: its sink attention is
+    /// sensitive to bf16 keys (max KL vs HF 0.18 instead of 4e-7 on gpt-oss-20b), and its 8 KV
+    /// heads make f32 cheap (2% of decode speed).
     pool: Shared<D::Buffer>,
     /// Compressed KV decoded before each layer's attention (see [`crate::kvcomp`]).
     pub kvcomp: std::sync::Mutex<Option<crate::kvcomp::KvComp<D::Buffer>>>,
@@ -300,6 +302,7 @@ impl<D: ComputeDevice> Model<D> {
             "f32"
         };
         let target = crate::ext::target(&dev, &cfg, quant);
+        let kv_bf16 = dev_bf16 && kv_bf16_default(&cfg);
         Ok(Self {
             ext: crate::ext::Ext::resolve(target),
             cfg,
@@ -312,12 +315,7 @@ impl<D: ComputeDevice> Model<D> {
             embed_scale,
             vision,
             max_ctx,
-            pool: new_pool(
-                n_layers,
-                kv_dim,
-                dev_bf16 && !std::env::var("TANG_KV_F32").is_ok_and(|v| v == "1"),
-                usize::MAX,
-            ),
+            pool: new_pool(n_layers, kv_dim, kv_bf16, usize::MAX),
             kvcomp: std::sync::Mutex::new(None),
         })
     }
@@ -1366,6 +1364,15 @@ fn rope_tables_inv(inv: &[f64], max_pos: usize, mscale: f64) -> (Vec<f32>, Vec<f
         }
     }
     (cos, sin)
+}
+
+/// Whether caches hold bf16 when the device can (see [`Model`]'s `pool`).
+fn kv_bf16_default(cfg: &Config) -> bool {
+    match std::env::var("TANG_KV_F32").as_deref() {
+        Ok("1") => false,
+        Ok("0") => true,
+        _ => !cfg.is_gpt_oss(),
+    }
 }
 
 fn new_pool<B>(layers: usize, kv_dim: usize, bf16: bool, max_blocks: usize) -> Shared<B> {
