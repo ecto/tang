@@ -124,6 +124,9 @@ pub struct Geometry {
     pub qsa_ring: usize,
     pub topk: usize,
     pub ff: usize,
+    /// GDN v head `h` reads k head `h / (hv / hk)` and the output gate is SiLU (qwen3next);
+    /// otherwise `h % hk` and a sigmoid (qwen4exp).
+    pub gdn_grouped: bool,
 }
 
 impl Geometry {
@@ -145,6 +148,7 @@ impl Geometry {
         qsa_ring: QSA_RING,
         topk: TOPK,
         ff: FF,
+        gdn_grouped: false,
     };
 
     pub const fn gdn_conv(&self) -> usize {
@@ -190,7 +194,7 @@ impl Geometry {
     pub fn cuda_prelude(&self) -> String {
         let [gu_c, gu_s, dn_c, dn_s] = self.blob_offsets();
         let inv_sqrt_d = (1.0f32 / (self.gdn_d as f32).sqrt()).to_bits();
-        format!(
+        let mut p = format!(
             "
 typedef unsigned long long u64;
 #define NEG_INF __uint_as_float(0xff800000u)
@@ -270,7 +274,11 @@ typedef unsigned long long u64;
             plan_cap = MAX_T * self.topk + MAX_T,
             shared_row = MAX_T * self.topk,
             wide_shared_row = MoePlan::WIDE_MAX * self.topk,
-        )
+        );
+        if self.gdn_grouped {
+            p.push_str("#define GDN_KH(h) ((h) / (GDN_HV / GDN_HK))\n#define GDN_GATE(z) ((z) * sigm(z))\n\n");
+        }
+        p
     }
 
     /// The full flash CUDA source for this geometry.

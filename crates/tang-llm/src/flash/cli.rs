@@ -1,8 +1,9 @@
 //! `tang-llm flash-generate`, `flash-parity` and `flash-bench`: the CUDA engine from the
 //! command line.
 
+use super::coder::{self, Coder, CoderOpts};
 use super::engine::{Engine, ExpertMode, Opts, Probe, WinStats};
-use super::reference::top_logprobs;
+use super::reference::{top_logprobs, Hparams};
 use anyhow::{bail, ensure, Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -30,6 +31,8 @@ struct Args {
     out: Option<PathBuf>,
     think: Option<bool>,
     dump_mtp_train: Option<PathBuf>,
+    /// Memory bandwidth for `flash-bench`'s speed-of-light line (GB/s; default H100 SXM).
+    bw: f64,
 }
 
 fn read_ids(f: &str) -> Result<Vec<u32>> {
@@ -63,6 +66,7 @@ fn parse(args: &[String]) -> Result<Args> {
         out: None,
         think: None,
         dump_mtp_train: None,
+        bw: 3350.0,
     };
     while let Some(x) = it.next() {
         let mut val = || it.next().with_context(|| format!("{x} needs a value"));
@@ -101,6 +105,7 @@ fn parse(args: &[String]) -> Result<Args> {
             "--temp" => a.temp = val()?.parse()?,
             "--seed" => a.seed = val()?.parse()?,
             "--out" => a.out = Some(PathBuf::from(val()?)),
+            "--bw" => a.bw = val()?.parse()?,
             s => bail!("unknown argument {s}"),
         }
     }
@@ -109,6 +114,199 @@ fn parse(args: &[String]) -> Result<Args> {
 
 fn load(a: &Args) -> Result<Engine> {
     let mut e = Engine::load(&a.path, a.opts.clone())?;
+    e.use_graphs = !a.eager;
+    e.temperature = a.temp;
+    e.seed = a.seed;
+    eprintln!("{}", e.load_report);
+    Ok(e)
+}
+
+/// What the decode, spec-test, tcheck and parity commands need from an engine: the Flash-Next
+/// [`Engine`] or the qwen3next [`Coder`].
+pub trait FlashModel {
+    fn reset(&mut self);
+    fn prefill(
+        &mut self,
+        ids: &[u32],
+        chunk: usize,
+        cb: Option<coder::LogitsCb<'_>>,
+    ) -> Result<u32>;
+    fn step(&mut self, tok: u32) -> Result<u32>;
+    fn verify(&mut self, cur: u32, drafts: &[u32]) -> Result<Vec<u32>>;
+    fn window(&mut self, pos0: usize, t: usize, probe: Option<&mut Probe>) -> Result<Vec<u32>>;
+    fn window_mode(
+        &mut self,
+        pos0: usize,
+        t: usize,
+        verify: bool,
+        probe: Option<&mut Probe>,
+    ) -> Result<Vec<u32>>;
+    fn logits(&self, t: usize) -> Vec<f32>;
+    fn last(&self) -> WinStats;
+    fn hp(&self) -> &Hparams;
+    fn tokens_mut(&mut self) -> &mut Vec<u32>;
+    fn set_sampling(&mut self, temperature: f32, seed: u32);
+    fn vocab(&self) -> Result<Vec<String>>;
+    fn last_commit_ms(&self) -> f64;
+    fn op_tcheck(&mut self, _l: usize) -> Result<()> {
+        Ok(())
+    }
+    fn has_mtp(&self) -> bool {
+        false
+    }
+    fn set_use_mtp(&mut self, _on: bool) {}
+    fn mtp_last(&self) -> Vec<(u32, f32)> {
+        Vec::new()
+    }
+    fn last_mtp_ms(&self) -> f64 {
+        0.0
+    }
+    fn last_mtp_gpu_ms(&self) -> f64 {
+        0.0
+    }
+}
+
+impl FlashModel for Engine {
+    fn reset(&mut self) {
+        Engine::reset(self)
+    }
+    fn prefill(
+        &mut self,
+        ids: &[u32],
+        chunk: usize,
+        cb: Option<coder::LogitsCb<'_>>,
+    ) -> Result<u32> {
+        Engine::prefill(self, ids, chunk, cb)
+    }
+    fn step(&mut self, tok: u32) -> Result<u32> {
+        Engine::step(self, tok)
+    }
+    fn verify(&mut self, cur: u32, drafts: &[u32]) -> Result<Vec<u32>> {
+        Engine::verify(self, cur, drafts)
+    }
+    fn window(&mut self, pos0: usize, t: usize, probe: Option<&mut Probe>) -> Result<Vec<u32>> {
+        Engine::window(self, pos0, t, probe)
+    }
+    fn window_mode(
+        &mut self,
+        pos0: usize,
+        t: usize,
+        verify: bool,
+        probe: Option<&mut Probe>,
+    ) -> Result<Vec<u32>> {
+        Engine::window_mode(self, pos0, t, verify, probe)
+    }
+    fn logits(&self, t: usize) -> Vec<f32> {
+        Engine::logits(self, t)
+    }
+    fn last(&self) -> WinStats {
+        self.last
+    }
+    fn hp(&self) -> &Hparams {
+        &self.hp
+    }
+    fn tokens_mut(&mut self) -> &mut Vec<u32> {
+        &mut self.tokens
+    }
+    fn set_sampling(&mut self, temperature: f32, seed: u32) {
+        self.temperature = temperature;
+        self.seed = seed;
+    }
+    fn vocab(&self) -> Result<Vec<String>> {
+        Engine::vocab(self)
+    }
+    fn last_commit_ms(&self) -> f64 {
+        self.last_commit_ms
+    }
+    fn op_tcheck(&mut self, l: usize) -> Result<()> {
+        Engine::op_tcheck(self, l)
+    }
+    fn has_mtp(&self) -> bool {
+        Engine::has_mtp(self)
+    }
+    fn set_use_mtp(&mut self, on: bool) {
+        self.use_mtp = on;
+    }
+    fn mtp_last(&self) -> Vec<(u32, f32)> {
+        self.mtp_last.clone()
+    }
+    fn last_mtp_ms(&self) -> f64 {
+        self.last_mtp_ms
+    }
+    fn last_mtp_gpu_ms(&self) -> f64 {
+        self.last_mtp_gpu_ms
+    }
+}
+
+impl FlashModel for Coder {
+    fn reset(&mut self) {
+        Coder::reset(self)
+    }
+    fn prefill(
+        &mut self,
+        ids: &[u32],
+        chunk: usize,
+        cb: Option<coder::LogitsCb<'_>>,
+    ) -> Result<u32> {
+        Coder::prefill(self, ids, chunk, cb)
+    }
+    fn step(&mut self, tok: u32) -> Result<u32> {
+        Coder::step(self, tok)
+    }
+    fn verify(&mut self, cur: u32, drafts: &[u32]) -> Result<Vec<u32>> {
+        Coder::verify(self, cur, drafts)
+    }
+    fn window(&mut self, pos0: usize, t: usize, probe: Option<&mut Probe>) -> Result<Vec<u32>> {
+        Coder::window(self, pos0, t, probe)
+    }
+    fn window_mode(
+        &mut self,
+        pos0: usize,
+        t: usize,
+        verify: bool,
+        probe: Option<&mut Probe>,
+    ) -> Result<Vec<u32>> {
+        Coder::window_mode(self, pos0, t, verify, probe)
+    }
+    fn logits(&self, t: usize) -> Vec<f32> {
+        Coder::logits(self, t)
+    }
+    fn last(&self) -> WinStats {
+        self.last
+    }
+    fn hp(&self) -> &Hparams {
+        &self.hp
+    }
+    fn tokens_mut(&mut self) -> &mut Vec<u32> {
+        &mut self.tokens
+    }
+    fn set_sampling(&mut self, temperature: f32, seed: u32) {
+        self.temperature = temperature;
+        self.seed = seed;
+    }
+    fn vocab(&self) -> Result<Vec<String>> {
+        Coder::vocab(self)
+    }
+    fn last_commit_ms(&self) -> f64 {
+        self.last_commit_ms
+    }
+}
+
+/// The engine for the GGUF's architecture: [`Coder`] for `qwen3next`, else [`Engine`].
+fn load_model(a: &Args) -> Result<Box<dyn FlashModel>> {
+    if coder::is_qwen3next(&a.path)? {
+        return Ok(Box::new(load_coder(a)?));
+    }
+    Ok(Box::new(load(a)?))
+}
+
+fn load_coder(a: &Args) -> Result<Coder> {
+    let mut e = Coder::load(
+        &a.path,
+        CoderOpts {
+            max_ctx: a.opts.max_ctx,
+        },
+    )?;
     e.use_graphs = !a.eager;
     e.temperature = a.temp;
     e.seed = a.seed;
@@ -184,7 +382,7 @@ fn split_line(s: &WinStats) -> String {
 
 /// Decode `n` greedy tokens after `ids`; returns (generated, per-step stats, decode seconds).
 fn decode(
-    e: &mut Engine,
+    e: &mut dyn FlashModel,
     ids: &[u32],
     n: usize,
     chunk: usize,
@@ -198,12 +396,12 @@ fn decode(
     // The first T=1 window captures its graph; time from the second.
     next = e.step(next)?;
     out.push(next);
-    stats.push(e.last);
+    stats.push(e.last());
     let t1 = Instant::now();
     for _ in 2..n {
         next = e.step(next)?;
         out.push(next);
-        stats.push(e.last);
+        stats.push(e.last());
     }
     let secs = t1.elapsed().as_secs_f64();
     out.truncate(n);
@@ -236,7 +434,7 @@ pub struct SpecStats {
 /// Decode `n` tokens after `ids` with verify windows and drafts from `kind` (`none`, `suffix`,
 /// `wrong`, `oracle:FILE`). Returns (tokens, per-window stats, prefill s, decode s, spec stats).
 fn decode_spec(
-    e: &mut Engine,
+    e: &mut dyn FlashModel,
     ids: &[u32],
     n: usize,
     chunk: usize,
@@ -245,7 +443,7 @@ fn decode_spec(
     decode_spec_options(e, ids, n, chunk, kind, None, None)
 }
 fn decode_spec_options(
-    e: &mut Engine,
+    e: &mut dyn FlashModel,
     ids: &[u32],
     n: usize,
     chunk: usize,
@@ -255,9 +453,9 @@ fn decode_spec_options(
 ) -> Result<(Vec<u32>, Vec<WinStats>, f64, f64, SpecStats)> {
     use crate::draft::{Calibration, DraftConfig, Global, Session};
     e.reset();
-    e.use_mtp = kind == "mtp" || kind == "hybrid";
-    ensure!(!e.use_mtp || e.has_mtp(), "--draft mtp needs --mtp FILE");
-    let is_mtp = e.use_mtp;
+    let is_mtp = kind == "mtp" || kind == "hybrid";
+    e.set_use_mtp(is_mtp);
+    ensure!(!is_mtp || e.has_mtp(), "--draft mtp needs --mtp FILE");
     let t0 = Instant::now();
     let mut cur = e.prefill(ids, chunk, None)?;
     let prefill_s = t0.elapsed().as_secs_f64();
@@ -273,6 +471,7 @@ fn decode_spec_options(
         },
     };
     let mut rng = 0x2545_F491_4F6C_DD1Du64;
+    let vocab = e.hp().n_vocab.min(248_000) as u64;
     let mut out = vec![cur];
     sess.push(cur);
     let mut stats = Vec::new();
@@ -357,7 +556,7 @@ fn decode_spec_options(
                 // calibration (10 buckets, prior from the truth track's measurements).
                 let mut best = (0usize, 1.0 / (wcost[1] + mtp_cost));
                 let (mut cum, mut exp) = (1.0f64, 1.0f64);
-                for (k, &(_, p)) in e.mtp_last.iter().enumerate().take(room) {
+                for (k, &(_, p)) in e.mtp_last().iter().enumerate().take(room) {
                     let b = ((p * 10.0) as usize).min(9);
                     cum *= calib[b].0 / calib[b].1;
                     exp += cum;
@@ -366,8 +565,8 @@ fn decode_spec_options(
                         best = (k + 1, rate);
                     }
                 }
-                let d: Vec<u32> = e.mtp_last.iter().take(best.0).map(|x| x.0).collect();
-                mtp_probs = e.mtp_last.iter().take(best.0).map(|x| x.1).collect();
+                let d: Vec<u32> = e.mtp_last().iter().take(best.0).map(|x| x.0).collect();
+                mtp_probs = e.mtp_last().iter().take(best.0).map(|x| x.1).collect();
                 // Hybrid: take the suffix drafter's longer proposal when it agrees with the
                 // MTP's first draft (a long earlier match: quoted text, code being repeated).
                 let sd = if kind == "hybrid" {
@@ -376,7 +575,7 @@ fn decode_spec_options(
                     Default::default()
                 };
                 if !sd.tokens.is_empty()
-                    && e.mtp_last.first().is_some_and(|x| x.0 == sd.tokens[0])
+                    && e.mtp_last().first().is_some_and(|x| x.0 == sd.tokens[0])
                     && sd.tokens.len() > d.len()
                 {
                     mtp_probs.clear();
@@ -394,7 +593,7 @@ fn decode_spec_options(
                 let k = 1 + (rng % room.max(1) as u64) as usize;
                 (
                     (0..k.min(room))
-                        .map(|i| ((rng >> (8 * i)) % 248_000) as u32)
+                        .map(|i| ((rng >> (8 * i)) % vocab) as u32)
                         .collect(),
                     None,
                 )
@@ -435,13 +634,13 @@ fn decode_spec_options(
             ("mtp" | "hybrid", Some(g)) => {
                 // Fixed gate (TANG_FLASH_GATE=0.5): keep drafts while p >= g.
                 let d: Vec<u32> = e
-                    .mtp_last
+                    .mtp_last()
                     .iter()
                     .take_while(|x| x.1 >= g)
                     .take(room)
                     .map(|x| x.0)
                     .collect();
-                mtp_probs = e.mtp_last.iter().take(d.len()).map(|x| x.1).collect();
+                mtp_probs = e.mtp_last().iter().take(d.len()).map(|x| x.1).collect();
                 d
             }
             _ => drafts,
@@ -457,8 +656,8 @@ fn decode_spec_options(
                 }
             }
             let w = drafts.len() + 1;
-            wcost[w] = 0.9 * wcost[w] + 0.1 * e.last.wall_ms;
-            mtp_cost = 0.9 * mtp_cost + 0.1 * e.last_mtp_ms;
+            wcost[w] = 0.9 * wcost[w] + 0.1 * e.last().wall_ms;
+            mtp_cost = 0.9 * mtp_cost + 0.1 * e.last_mtp_ms();
         }
         for (j, slot) in sp.by_pos.iter_mut().enumerate().take(drafts.len()) {
             slot.0 += 1;
@@ -488,12 +687,12 @@ fn decode_spec_options(
             }
         }
         sp.windows += 1;
-        sp.mtp_ms += e.last_mtp_ms;
-        sp.commit_ms += e.last_commit_ms;
-        sp.mtp_gpu_ms += e.last_mtp_gpu_ms;
+        sp.mtp_ms += e.last_mtp_ms();
+        sp.commit_ms += e.last_commit_ms();
+        sp.mtp_gpu_ms += e.last_mtp_gpu_ms();
         sp.widths[drafts.len() + 1] += 1;
         sp.tokens += kept.len();
-        stats.push(e.last);
+        stats.push(e.last());
         for &k in &kept {
             sess.push(k);
             if k == think_end {
@@ -663,7 +862,8 @@ pub fn generate(args: &[String]) -> Result<()> {
 pub fn parity(args: &[String]) -> Result<()> {
     let a = parse(args)?;
     let ids = prompt_ids(&a)?;
-    let mut e = load(&a)?;
+    let mut e = load_model(&a)?;
+    let e = &mut *e;
     e.reset();
     let refs: Vec<(usize, Vec<(u32, f64)>)> = match &a.reference {
         Some(p) => std::fs::read_to_string(p)?
@@ -733,7 +933,7 @@ pub fn parity(args: &[String]) -> Result<()> {
     }
     let mut probe = Probe::default();
     if probe_last {
-        e.tokens.push(ids[total - 1]);
+        e.tokens_mut().push(ids[total - 1]);
         e.window(total - 1, 1, Some(&mut probe))?;
         cb(total - 1, 1, &e.logits(1));
     }
@@ -759,19 +959,8 @@ pub fn parity(args: &[String]) -> Result<()> {
             );
         }
     }
-    if let Some(cs) = e.cache_stats() {
-        println!(
-            "cache: hit rate {:.3} ({} hits, {} misses)",
-            cs.hit_rate(),
-            cs.hits,
-            cs.misses
-        );
-    }
     if let Some(dir) = &a.dump {
-        compare_dump(&e, dir, &probe)?;
-    }
-    if let Some(p) = &a.dump_routing {
-        e.save_routing(p)?;
+        compare_dump(e, dir, &probe)?;
     }
     Ok(())
 }
@@ -799,9 +988,9 @@ fn rel(a: &[f32], b: &[f32]) -> f64 {
     (d / n.max(1e-30)).sqrt()
 }
 
-fn compare_dump(e: &Engine, dir: &Path, p: &Probe) -> Result<()> {
+fn compare_dump(e: &dyn FlashModel, dir: &Path, p: &Probe) -> Result<()> {
     println!("per layer, last position (relative L2 error vs flash-ref; router overlap of 10; QSA selection):");
-    for l in 0..e.hp.n_layer {
+    for l in 0..e.hp().n_layer {
         let pm = read_f32(dir, &format!("L{l:02}.post_mixer"))?;
         let po = read_f32(dir, &format!("L{l:02}.post_moe"))?;
         let mo = read_f32(dir, &format!("L{l:02}.mixer_out"))?;
@@ -854,6 +1043,9 @@ pub fn bench(args: &[String]) -> Result<()> {
     }
     if a.opts.max_ctx < ids.len() + a.n + 8 {
         a.opts.max_ctx = (ids.len() + a.n + 8).next_multiple_of(1024);
+    }
+    if coder::is_qwen3next(&a.path)? {
+        return bench_coder(&a, &ids);
     }
     let mut e = load(&a)?;
     // Warm-up: capture every graph (window sizes, commits, MTP cell counts) before timing.
@@ -965,6 +1157,65 @@ pub fn bench(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `flash-bench` for a qwen3next model: decode tok/s at the prompt's context and its share of
+/// the speed of light (bytes a step reads from VRAM over `--bw`).
+fn bench_coder(a: &Args, ids: &[u32]) -> Result<()> {
+    let mut e = load_coder(a)?;
+    let (out, stats, prefill_s, secs, sp) = decode_spec(&mut e, ids, a.n, a.chunk, &a.draft)?;
+    let m = mean(&stats);
+    let tps = sp.tokens as f64 / secs;
+    let mut walls: Vec<f64> = stats.iter().map(|s| s.wall_ms).collect();
+    walls.sort_by(|a, b| a.total_cmp(b));
+    let ctx = ids.len() + a.n / 2;
+    let bytes = e.step_bytes(ctx);
+    let sol = a.bw * 1e9 / bytes;
+    // A T=1 window's tokens per second against the speed of light (drafts aside).
+    let t1_tps = 1e3 / walls[walls.len() / 2];
+    println!(
+        "flash-bench (qwen3next): context {} + {} new tokens, temp {}, drafts {}, graphs {}",
+        ids.len(),
+        a.n,
+        a.temp,
+        a.draft,
+        e.use_graphs
+    );
+    println!(
+        "  prefill            {:8.2} s ({:.0} tok/s, chunk {})",
+        prefill_s,
+        ids.len() as f64 / prefill_s,
+        a.chunk
+    );
+    println!(
+        "  decode             {:8.1} tok/s ({} tokens in {:.3} s)",
+        tps, sp.tokens, secs
+    );
+    println!("  speculation        {}", spec_report(&sp));
+    println!(
+        "  window wall        {:8.3} ms mean, {:.3} median, {:.3} p90",
+        m.wall_ms,
+        walls[walls.len() / 2],
+        walls[walls.len() * 9 / 10]
+    );
+    println!(
+        "  speed of light     {:8.1} tok/s ({:.2} GB a step at context {ctx}, {:.0} GB/s); \
+         median window {:.1} tok/s = {:.1}% of it",
+        sol,
+        bytes / 1e9,
+        a.bw,
+        t1_tps,
+        100.0 * t1_tps / sol
+    );
+    println!(
+        "  first tokens: {}",
+        out.iter()
+            .take(16)
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    Ok(())
+}
+
 /// `flash-spec-test`: with one load, decode `-n` tokens without drafts, then with suffix drafts,
 /// forced-wrong drafts and an oracle (the no-draft output, corrupted now and then), greedy and
 /// at `--temp` (default 0.8), and check every output equals the no-draft one.
@@ -974,12 +1225,12 @@ pub fn spec_test(args: &[String]) -> Result<()> {
     if a.temp == 0.0 {
         a.temp = 0.8;
     }
-    let mut e = load(&a)?;
+    let mut e = load_model(&a)?;
+    let e = &mut *e;
     let mut ok = true;
     for temp in [0.0, a.temp] {
-        e.temperature = temp;
-        e.seed = a.seed;
-        let (base, _, _, s0, sp0) = decode_spec(&mut e, &ids, a.n, a.chunk, "none")?;
+        e.set_sampling(temp, a.seed);
+        let (base, _, _, s0, sp0) = decode_spec(e, &ids, a.n, a.chunk, "none")?;
         let f = std::env::temp_dir().join(format!("flash-oracle-{}.ids", std::process::id()));
         std::fs::write(
             &f,
@@ -1003,7 +1254,7 @@ pub fn spec_test(args: &[String]) -> Result<()> {
             kinds.insert(1, "hybrid".into());
         }
         for kind in kinds {
-            let (out, stats, _, secs, sp) = decode_spec(&mut e, &ids, a.n, a.chunk, &kind)?;
+            let (out, stats, _, secs, sp) = decode_spec(e, &ids, a.n, a.chunk, &kind)?;
             let same = out == base;
             ok &= same;
             let first_diff = out.iter().zip(&base).position(|(x, y)| x != y);
@@ -1038,18 +1289,19 @@ pub fn tcheck(args: &[String]) -> Result<()> {
     let a = parse(args)?;
     let ids = prompt_ids(&a)?;
     ensure!(ids.len() > 16, "need a longer prompt");
-    let mut e = load(&a)?;
+    let mut e = load_model(&a)?;
+    let e = &mut *e;
     for l in [0usize, 3] {
         println!("layer {l} ops:");
         e.op_tcheck(l)?;
     }
     let p = ids.len() - 8;
-    let v = e.hp.n_vocab;
+    let v = e.hp().n_vocab;
     let mut runs: Vec<(String, Vec<f32>, Probe)> = Vec::new();
     for mode in ["t1", "t8", "t8-verify"] {
         e.reset();
         e.prefill(&ids[..p], 8, None)?;
-        e.tokens.extend_from_slice(&ids[p..]);
+        e.tokens_mut().extend_from_slice(&ids[p..]);
         let mut probe = Probe::default();
         let logits = match mode {
             "t1" => {
@@ -1086,7 +1338,7 @@ pub fn tcheck(args: &[String]) -> Result<()> {
             v
         );
         let mut first = None;
-        for l in 0..e.hp.n_layer {
+        for l in 0..e.hp().n_layer {
             let d = [
                 ("mixer_out", bits(&a0.2.mixer_out[l], &b0.2.mixer_out[l])),
                 ("post_mixer", bits(&a0.2.post_mixer[l], &b0.2.post_mixer[l])),
