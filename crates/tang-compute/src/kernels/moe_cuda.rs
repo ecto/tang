@@ -305,6 +305,50 @@ extern "C" __global__ void moe_gemv_mxfp4(
     }
 }
 
+// Prefill: picks grouped by expert run as one GEMM per expert (see `moe_linear_llm`).
+// `moe_gather`: row i of XG is the input row of pick LIST[i]; grid (picks), block 256.
+extern "C" __global__ void moe_gather(
+    const float* __restrict__ X, const unsigned int* __restrict__ LIST, float* __restrict__ XG,
+    unsigned int k_top, unsigned int K, unsigned int per_pick)
+{
+    unsigned int i = blockIdx.x, p = LIST[i];
+    const float* x = X + (u64)(per_pick ? p : p / k_top) * K;
+    for (unsigned int c = threadIdx.x; c < K; c += blockDim.x) XG[(u64)i * K + c] = x[c];
+}
+
+// Expert `e`'s MXFP4 matrix `[N, K]` as f32; grid (ceil(N * K / 32 / 256)), block 256: a
+// thread per 32-weight block.
+extern "C" __global__ void moe_dequant_mxfp4(
+    const unsigned char* __restrict__ Wt, float* __restrict__ O, unsigned int e,
+    unsigned int K, unsigned int N, unsigned int E)
+{
+    const float lut[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+                           -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+    u64 b = (u64)blockIdx.x * blockDim.x + threadIdx.x, nb = (u64)N * (K / 32);
+    if (b >= nb) return;
+    const unsigned char* wb = Wt + (u64)e * N * (K / 2) + b * 16;
+    unsigned int s = Wt[(u64)E * N * (K / 2) + (u64)e * nb + b];
+    float sc = s == 0 ? __uint_as_float(1u << 22) : __uint_as_float(s << 23);
+    float* o = O + b * 32;
+    #pragma unroll
+    for (int j = 0; j < 16; j++) {
+        unsigned int q = wb[j];
+        o[2 * j] = lut[q & 15u] * sc;
+        o[2 * j + 1] = lut[q >> 4] * sc;
+    }
+}
+
+// Y[LIST[i]] = YG[i] + bias of pick LIST[i]'s expert; grid (picks), block 256.
+extern "C" __global__ void moe_scatter(
+    const float* __restrict__ YG, const unsigned int* __restrict__ LIST,
+    const unsigned int* __restrict__ IDS, const float* __restrict__ B, float* __restrict__ Y,
+    unsigned int N, unsigned int has_bias)
+{
+    unsigned int i = blockIdx.x, p = LIST[i], e = IDS[p];
+    for (unsigned int c = threadIdx.x; c < N; c += blockDim.x)
+        Y[(u64)p * N + c] = YG[(u64)i * N + c] + (has_bias ? B[(u64)e * N + c] : 0.0f);
+}
+
 extern "C" __global__ void swiglu_clamped(
     const float* __restrict__ GU, float* __restrict__ O, unsigned int rows, unsigned int ff,
     float alpha, float limit)
