@@ -319,7 +319,7 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
         || dims
             .iter()
             .try_fold(1usize, |a, &d| a.checked_mul(d))
-            .is_none_or(|n| n > 1 << 34)
+            .is_none_or(|n| n as u64 > 1 << 34)
     {
         return Err(DecodeError::Invalid("dims"));
     }
