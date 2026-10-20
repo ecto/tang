@@ -32,6 +32,8 @@ use super::{TensorGraph, TensorId};
 
 /// [`PRELUDE`] in OpenCL C.
 const OPENCL_PRELUDE: &str = r#"#define select(f, t, c) ((c) ? (t) : (f))
+#define TANG_EL4(v, i) (((i) & 3) == 0 ? (v).s0 : ((i) & 3) == 1 ? (v).s1 : ((i) & 3) == 2 ? (v).s2 : (v).s3)
+#define TANG_EL2(v, i) (((i) & 1) == 0 ? (v).s0 : (v).s1)
 inline float tang_u4(__global const float* b, int a) {
     uint q = (((__global const uint*)b)[a >> 3] >> ((a & 7) * 4)) & 15u;
     return as_float(0x4b000000u | q) - 8388608.0f;
@@ -60,8 +62,11 @@ inline float tang_f16(__global const float* b, int a) {
 "#;
 
 /// `TANG_SHFL_XOR` through local memory, for drivers without subgroup
-/// shuffles. Every work-item of the group must reach it (the butterflies
-/// of the warp kernels are uniform per group). Needs `TANG_THREADS`.
+/// shuffles. Its barriers need every work-item of the group to reach
+/// them, which a warp kernel's grid-stride loop over groups does not
+/// guarantee (warps of one group can run different trip counts): it was
+/// right on Apple's driver and wrong on the Adreno, so it is a fallback
+/// for checking on hosts, not a production path.
 pub const OPENCL_SHFL_LOCAL: &str = r#"#define TANG_SHFL_LOCAL 1
 #define TANG_SHFL_XOR(x, off) tang_shfl_xor(tang_xch, tang_tid, (x), (off))
 inline float tang_shfl_xor(__local float* xch, int tid, float x, int off) {
@@ -93,7 +98,8 @@ impl TensorGraph {
     }
 }
 
-/// Marker line a native kernel's shuffle definition replaces.
+/// Marker line (after the kernel's first line) that the runtime replaces
+/// with its shuffle definition.
 pub const SHFL_MARKER: &str = "// TANG_SHFL\n";
 
 /// Index of the `)` closing the `(` at `open`.
@@ -196,20 +202,46 @@ pub(super) fn transliterate(src: &str, reads: &[usize], donor: Option<usize>) ->
     }
     // __ldg(p) is *p
     let mut s = rewrite_calls(&body, "__ldg(", |a| format!("(*({a}))"));
-    // (&v.x)[i] — a vector's element by index — through a pointer to its elements
-    while let Some(i) = s.find("(&") {
-        let close = close_paren(&s, i);
-        let inner = &s[i + 2..close];
+    // (&v.x)[i] — a vector's element by index. The index is a constant once
+    // the loops unroll; a select chain folds to a register read, where
+    // taking the vector's address (`((T*)&v)[i]`) would put the whole
+    // register array in private memory (0.95 ms per GEMV on the Adreno,
+    // ~5x Vulkan). The width comes from the array's declaration.
+    let width = |name: &str| -> usize {
+        for (ty, w) in [("float4 ", 4), ("uint4 ", 4), ("uint2 ", 2)] {
+            if s.contains(&format!("{ty}{name}[")) {
+                return w;
+            }
+        }
+        panic!("vector element of an undeclared array `{name}` in a decode kernel")
+    };
+    let mut out = String::with_capacity(s.len());
+    let mut rest: &str = &s;
+    while let Some(i) = rest.find("(&") {
+        out.push_str(&rest[..i]);
+        let close = close_paren(rest, i);
+        let inner = &rest[i + 2..close];
         let Some(v) = inner.strip_suffix(".x") else {
             panic!("unexpected address-of in a decode kernel: {inner}")
         };
-        let v = v.to_string();
-        s = format!(
-            "{}((__private __typeof__(({v}).x)*)&({v})){}",
-            &s[..i],
-            &s[close + 1..]
-        );
+        let name: String = v
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        let after = &rest[close + 1..];
+        assert!(after.starts_with('['), "vector element without an index");
+        let iclose = after.find(']').expect("index ]");
+        let idx = &after[1..iclose];
+        let m = if width(&name) == 4 {
+            "TANG_EL4"
+        } else {
+            "TANG_EL2"
+        };
+        out.push_str(&format!("{m}({v}, {idx})"));
+        rest = &after[iclose + 1..];
     }
+    out.push_str(rest);
+    let mut s = out;
     let subs: [(&str, &str); 15] = [
         ("__shfl_xor_sync(0xffffffffu, ", "TANG_SHFL_XOR("),
         ("__syncthreads()", "barrier(CLK_LOCAL_MEM_FENCE)"),
@@ -247,7 +279,11 @@ pub(super) fn transliterate(src: &str, reads: &[usize], donor: Option<usize>) ->
             "untransliterated `{bad}` in a decode kernel:\n{s}"
         );
     }
-    format!("{SHFL_MARKER}{s}")
+    // after the kernel's first line (its `// … groups x … points` summary)
+    match s.split_once('\n') {
+        Some((first, rest)) if first.starts_with("//") => format!("{first}\n{SHFL_MARKER}{rest}"),
+        _ => format!("{SHFL_MARKER}{s}"),
+    }
 }
 
 #[cfg(test)]
@@ -257,15 +293,15 @@ mod tests {
     #[test]
     fn transliterates_loads_and_shuffles() {
         let src = format!(
-            "// k\n#define TANG_TILES 4\n#define TANG_THREADS 32\n{PRELUDE}extern \"C\" __global__ void __launch_bounds__(32) main0(const float* __restrict__ b3, float* __restrict__ out, unsigned count) {{\n    float x = __ldg((const float4*)(b3 + (2)) + 1).x;\n    float y = (&v0[0][e >> 2].x)[e & 3];\n    y = __shfl_xor_sync(0xffffffffu, y, 4);\n    out[0] = b3[0] + x + y;\n}}\n"
+            "// k\n#define TANG_TILES 4\n#define TANG_THREADS 32\n{PRELUDE}extern \"C\" __global__ void __launch_bounds__(32) main0(const float* __restrict__ b3, float* __restrict__ out, unsigned count) {{\n    float x = __ldg((const float4*)(b3 + (2)) + 1).x;\n    float4 v0[1][2];\n    float y = (&v0[0][e >> 2].x)[e & 3];\n    y = __shfl_xor_sync(0xffffffffu, y, 4);\n    out[0] = b3[0] + x + y;\n}}\n"
         );
         let m = transliterate(&src, &[], Some(3));
-        assert!(m.starts_with(SHFL_MARKER));
+        assert!(m.starts_with(&format!("// k\n{SHFL_MARKER}")));
         assert!(m.contains(
             "reqd_work_group_size(32, 1, 1))) void main0(__global float* restrict out, uint count)"
         ));
         assert!(m.contains("(*((__global const float4*)(out + (2)) + 1)).x"));
-        assert!(m.contains("((__private __typeof__((v0[0][e >> 2]).x)*)&(v0[0][e >> 2]))[e & 3]"));
+        assert!(m.contains("TANG_EL4(v0[0][e >> 2], e & 3)"));
         assert!(m.contains("TANG_SHFL_XOR(y, 4)"));
         assert!(m.contains("out[0] = out[0]"));
         assert!(!m.contains("b3"));

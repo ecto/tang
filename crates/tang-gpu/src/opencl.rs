@@ -358,17 +358,15 @@ impl ClDevice {
         use tang_compile::tensor::opencl_gemv::{
             OPENCL_SHFL_KHR, OPENCL_SHFL_LOCAL, OPENCL_SHFL_QCOM, SHFL_MARKER,
         };
-        match source.strip_prefix(SHFL_MARKER) {
-            None => source.to_string(),
-            Some(rest) => {
-                let def = match self.shfl {
-                    Shfl::Khr => OPENCL_SHFL_KHR,
-                    Shfl::Qcom => OPENCL_SHFL_QCOM,
-                    Shfl::Local => OPENCL_SHFL_LOCAL,
-                };
-                format!("{def}{rest}")
-            }
+        if !source.contains(SHFL_MARKER) {
+            return source.to_string();
         }
+        let def = match self.shfl {
+            Shfl::Khr => OPENCL_SHFL_KHR,
+            Shfl::Qcom => OPENCL_SHFL_QCOM,
+            Shfl::Local => OPENCL_SHFL_LOCAL,
+        };
+        source.replacen(SHFL_MARKER, def, 1)
     }
 
     fn build_log(&self, p: H) -> String {
@@ -392,7 +390,14 @@ impl ClDevice {
     /// else compiled and cached.
     fn program(&self, source: &str) -> Result<H, String> {
         use std::hash::{Hash, Hasher};
-        let opts = std::env::var("TANG_CL_OPTS").unwrap_or_default();
+        // the Adreno compiler takes cl_qcom_subgroup_shuffle only under OpenCL C 3.0
+        let opts = std::env::var("TANG_CL_OPTS").unwrap_or_else(|_| {
+            if self.shfl == Shfl::Qcom {
+                "-cl-std=CL3.0".into()
+            } else {
+                String::new()
+            }
+        });
         let mut h = std::collections::hash_map::DefaultHasher::new();
         (&self.name, &self.driver, &opts, source).hash(&mut h);
         let dir = cache_dir();
