@@ -276,12 +276,22 @@ impl Matcher {
 }
 
 /// A bounded store of earlier completions, as one automaton, optionally mirrored on disk.
+/// With a TTL (see [`crate::retention`]), a completion is dropped (from memory and the file)
+/// once it's that old.
 pub struct Global {
-    seqs: VecDeque<Vec<u32>>,
+    /// Each completion and when it was added (unix seconds).
+    seqs: VecDeque<(u64, Vec<u32>)>,
     tokens: usize,
     cap: usize,
     pub sam: Sam,
     file: Option<PathBuf>,
+    ttl: Option<std::time::Duration>,
+}
+
+/// Seconds since the epoch, by [`crate::retention::now`].
+fn unix(t: std::time::SystemTime) -> u64 {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 impl Global {
@@ -293,18 +303,47 @@ impl Global {
             cap,
             sam: Sam::new(),
             file,
+            ttl: crate::retention::ttl(),
         };
         if let Some(seqs) = g.file.as_ref().and_then(|f| read_seqs(f).ok()) {
             for s in seqs {
-                g.tokens += s.len();
+                g.tokens += s.1.len();
                 g.seqs.push_back(s);
             }
             g.trim(cap);
+            g.drop_expired();
             g.rebuild();
             // Compact the file to what's kept.
             g.save_all();
         }
         g
+    }
+
+    pub fn set_ttl(&mut self, ttl: Option<std::time::Duration>) {
+        self.ttl = ttl;
+    }
+
+    /// Drop the oldest completions past the TTL; whether any went.
+    fn drop_expired(&mut self) -> bool {
+        let Some(ttl) = self.ttl else { return false };
+        let before = self.seqs.len();
+        let cut = unix(crate::retention::now()).saturating_sub(ttl.as_secs());
+        while self.seqs.front().is_some_and(|s| s.0 < cut) {
+            let (_, s) = self.seqs.pop_front().unwrap();
+            self.tokens -= s.len();
+        }
+        self.seqs.len() != before
+    }
+
+    /// Drop completions past the TTL, rebuilding the automaton and rewriting the file (deleted
+    /// when nothing's left). Returns whether any went.
+    pub fn expire(&mut self) -> bool {
+        if !self.drop_expired() {
+            return false;
+        }
+        self.rebuild();
+        self.save_all();
+        true
     }
 
     pub fn tokens(&self) -> usize {
@@ -313,7 +352,7 @@ impl Global {
 
     fn trim(&mut self, to: usize) {
         while self.tokens > to {
-            let Some(s) = self.seqs.pop_front() else {
+            let Some((_, s)) = self.seqs.pop_front() else {
                 break;
             };
             self.tokens -= s.len();
@@ -322,7 +361,7 @@ impl Global {
 
     fn rebuild(&mut self) {
         let mut sam = Sam::with_capacity(self.tokens + self.seqs.len());
-        for s in &self.seqs {
+        for (_, s) in &self.seqs {
             sam.extend(s);
             sam.add(SEP);
         }
@@ -338,10 +377,11 @@ impl Global {
         self.sam.extend(&seq);
         self.sam.add(SEP);
         self.tokens += seq.len();
+        let at = unix(crate::retention::now());
         if let Some(f) = &self.file {
-            let _ = append_seq(f, &seq);
+            let _ = append_seq(f, at, &seq);
         }
-        self.seqs.push_back(seq);
+        self.seqs.push_back((at, seq));
         if self.tokens > self.cap {
             self.trim(self.cap * 3 / 4);
             self.rebuild();
@@ -351,11 +391,16 @@ impl Global {
 
     fn save_all(&self) {
         let Some(f) = &self.file else { return };
+        if self.seqs.is_empty() {
+            let _ = std::fs::remove_file(f);
+            return;
+        }
         let tmp = f.with_extension("tmp");
         let ok = (|| -> std::io::Result<()> {
             let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
-            for s in &self.seqs {
-                write_seq(&mut w, s)?;
+            w.write_all(&STORE_MAGIC.to_le_bytes())?;
+            for (at, s) in &self.seqs {
+                write_seq(&mut w, *at, s)?;
             }
             w.flush()?;
             std::fs::rename(&tmp, f)
@@ -366,13 +411,19 @@ impl Global {
     }
 }
 
-fn write_seq(w: &mut impl Write, s: &[u32]) -> std::io::Result<()> {
+/// The store file's first word: records are (unix seconds u64, length u32, tokens). A file
+/// without it is the older format, records (length, tokens), all dated by the file's
+/// modification time.
+const STORE_MAGIC: u32 = 0xffff_0002;
+
+fn write_seq(w: &mut impl Write, at: u64, s: &[u32]) -> std::io::Result<()> {
+    w.write_all(&at.to_le_bytes())?;
     w.write_all(&(s.len() as u32).to_le_bytes())?;
     let bytes: Vec<u8> = s.iter().flat_map(|t| t.to_le_bytes()).collect();
     w.write_all(&bytes)
 }
 
-fn append_seq(f: &PathBuf, s: &[u32]) -> std::io::Result<()> {
+fn append_seq(f: &PathBuf, at: u64, s: &[u32]) -> std::io::Result<()> {
     if let Some(dir) = f.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -380,23 +431,35 @@ fn append_seq(f: &PathBuf, s: &[u32]) -> std::io::Result<()> {
         .create(true)
         .append(true)
         .open(f)?;
-    let mut buf = Vec::with_capacity(4 * s.len() + 4);
-    write_seq(&mut buf, s)?;
+    let mut buf = Vec::with_capacity(4 * s.len() + 16);
+    if w.metadata()?.len() == 0 {
+        buf.extend_from_slice(&STORE_MAGIC.to_le_bytes());
+    }
+    write_seq(&mut buf, at, s)?;
     w.write_all(&buf)
 }
 
-fn read_seqs(f: &PathBuf) -> std::io::Result<Vec<Vec<u32>>> {
+fn read_seqs(f: &PathBuf) -> std::io::Result<Vec<(u64, Vec<u32>)>> {
+    let mut file = std::fs::File::open(f)?;
+    let mtime = unix(file.metadata()?.modified()?);
     let mut bytes = Vec::new();
-    std::fs::File::open(f)?.read_to_end(&mut bytes)?;
+    file.read_to_end(&mut bytes)?;
     let word = |i: usize| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
-    let (mut out, mut i) = (Vec::new(), 0);
-    while i + 4 <= bytes.len() {
-        let n = word(i) as usize;
-        i += 4;
+    let dated = bytes.len() >= 4 && word(0) == STORE_MAGIC;
+    let (mut out, mut i) = (Vec::new(), if dated { 4 } else { 0 });
+    let head = if dated { 12 } else { 4 };
+    while i + head <= bytes.len() {
+        let at = if dated {
+            u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap())
+        } else {
+            mtime
+        };
+        let n = word(i + head - 4) as usize;
+        i += head;
         if i + 4 * n > bytes.len() {
             break; // a torn write at the end
         }
-        out.push((0..n).map(|j| word(i + 4 * j)).collect());
+        out.push((at, (0..n).map(|j| word(i + 4 * j)).collect()));
         i += 4 * n;
     }
     Ok(out)
@@ -895,6 +958,45 @@ mod tests {
         g.push(&[5, 6, 7]);
         let g2 = Global::new(1000, Some(f.clone()));
         assert_eq!(g2.tokens(), 7);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn global_store_forgets_completions_past_the_ttl() {
+        use crate::retention::advance;
+        use std::time::Duration;
+        let dir = std::env::temp_dir().join(format!("tang-draft-ttl-{}", std::process::id()));
+        let f = dir.join("store.tok");
+        let _ = std::fs::remove_file(&f);
+        let mut g = Global::new(1000, Some(f.clone()));
+        g.set_ttl(Some(Duration::from_secs(60)));
+        g.push(&[1, 2, 3, 4]);
+        advance(Duration::from_secs(40));
+        g.push(&[5, 6, 7]);
+        assert!(!g.expire());
+        advance(Duration::from_secs(30));
+        // The first is past it, in memory and on disk.
+        assert!(g.expire());
+        assert_eq!(g.tokens(), 3);
+        assert_eq!(read_seqs(&f).unwrap().len(), 1);
+        advance(Duration::from_secs(40));
+        assert!(g.expire());
+        assert_eq!(g.tokens(), 0);
+        assert!(!f.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn global_store_reads_the_undated_format() {
+        let dir = std::env::temp_dir().join(format!("tang-draft-old-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("store.tok");
+        let old: Vec<u8> = [2u32, 8, 9].iter().flat_map(|w| w.to_le_bytes()).collect();
+        std::fs::write(&f, old).unwrap();
+        let g = Global::new(1000, Some(f.clone()));
+        assert_eq!(g.tokens(), 2);
+        // Rewritten dated.
+        assert_eq!(read_seqs(&f).unwrap()[0].1, vec![8, 9]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -198,6 +198,9 @@ pub trait Backend {
         0
     }
     fn flush_kv_store(&self) {}
+    /// Drop prompt-derived state unused for the TTL ([`crate::retention`]); the worker calls
+    /// it periodically, between requests.
+    fn expire(&mut self) {}
     /// Runs after the reply goes out, including failed requests.
     fn after(&mut self, _req: &Request, _result: &anyhow::Result<(Finish, Usage)>) {}
 
@@ -294,6 +297,9 @@ impl<D: ComputeDevice + 'static> Backend for Engine<D> {
     }
     fn flush_kv_store(&self) {
         Engine::flush_kv_store(self)
+    }
+    fn expire(&mut self) {
+        Engine::expire(self)
     }
     fn after(&mut self, req: &Request, result: &anyhow::Result<(Finish, Usage)>) {
         if let Ok((_, usage)) = result {
@@ -529,7 +535,13 @@ where
     F: Fn(&str) -> anyhow::Result<B>,
 {
     fn run(&mut self) {
+        let every = crate::retention::ttl().map(crate::retention::sweep_every);
+        let mut swept = Instant::now();
         loop {
+            if every.is_some_and(|e| swept.elapsed() >= e) {
+                self.expire();
+                swept = Instant::now();
+            }
             if !self.batch.is_empty() {
                 // Between steps: whoever can join does, then one step for all.
                 while let Some((ticket, job)) = self.node.queue.pop_where(|t, j| self.joins(t, j)) {
@@ -540,9 +552,31 @@ where
                 }
                 continue;
             }
-            let (ticket, job) = self.node.queue.pop();
+            let (ticket, job) = match every {
+                // Idle: wake for the next sweep.
+                Some(e) => match self
+                    .node
+                    .queue
+                    .pop_timeout(e.saturating_sub(swept.elapsed()))
+                {
+                    Some(x) => x,
+                    None => continue,
+                },
+                None => self.node.queue.pop(),
+            };
             self.dispatch(ticket, job);
         }
+    }
+
+    /// Drop what's past the TTL, and show `/node` what's left.
+    fn expire(&mut self) {
+        let Some((_, e)) = &mut self.engine else {
+            return;
+        };
+        let gate = self.node.resources.clone();
+        let _guard = gate.lock();
+        e.expire();
+        self.refresh_kv();
     }
 
     /// Whether a waiting job joins the running batch now.

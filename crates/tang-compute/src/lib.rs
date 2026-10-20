@@ -7,6 +7,7 @@
 
 pub mod cpu;
 pub mod device;
+pub mod ext;
 pub mod flash;
 pub mod flash_native;
 pub mod kernels;

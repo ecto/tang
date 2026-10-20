@@ -16,7 +16,8 @@ pub trait ComputeBuffer: Send {
 }
 
 /// Compute device abstraction over CPU, Metal, and CUDA backends.
-pub trait ComputeDevice: Send {
+/// `'static` so extensions can be registered per device type (see [`crate::ext`]).
+pub trait ComputeDevice: Send + 'static {
     /// The buffer type for this device.
     type Buffer: ComputeBuffer;
 
@@ -36,6 +37,16 @@ pub trait ComputeDevice: Send {
     /// The device's name (e.g. "Apple M4 Max", "NVIDIA GeForce RTX 3090"); empty if unknown.
     fn device_name(&self) -> String {
         String::new()
+    }
+
+    /// The architecture extensions are keyed by (see [`crate::ext`]): `sm_86`, `sm_90`, ... on
+    /// CUDA, otherwise `metal` or `cpu`.
+    fn arch(&self) -> String {
+        match self.dialect() {
+            Dialect::Msl => "metal".into(),
+            Dialect::Cuda => "cuda".into(),
+            _ => "cpu".into(),
+        }
     }
 
     /// Release cached buffers in the device memory pool. No-op on devices
@@ -1074,6 +1085,39 @@ pub trait ComputeDevice: Send {
     /// [`kv_attention_window`](Self::kv_attention_window) over a paged cache: key `j` is the
     /// row `pages` maps it to. The default ([`kv_attention_paged_default`]) gathers the keys
     /// into contiguous buffers.
+    /// Decode GPU-layout compressed-KV lanes (tables from `tang_compress::kvgpu::Batch`:
+    /// `stream`, `lanes`, `chans`, `prior` as u32 buffers, `scratch` of `scratch_words`) into
+    /// `out` (an f32 or bf16 cache). `rope` = the model's (cos, sin) `[pos][hd/2]` tables, used
+    /// by lanes with their RoPE flag set. Metal only.
+    #[allow(clippy::too_many_arguments)]
+    fn tkv_decode(
+        &self,
+        _stream: &Self::Buffer,
+        _lanes: &Self::Buffer,
+        _chans: &Self::Buffer,
+        _prior: &Self::Buffer,
+        _scratch: &Self::Buffer,
+        _out: &Self::Buffer,
+        _rope: Option<(&Self::Buffer, &Self::Buffer)>,
+        _n_lanes: usize,
+    ) {
+        unimplemented!("tkv_decode is implemented for Metal only")
+    }
+
+    /// KIVI-style integer dequant of one layer's K or V into `out` (f32 or bf16 cache, rows
+    /// through `pages` = (block table, page shift), or contiguous). `codes` u32-packed, `sz` half2
+    /// (scale, zero) per group as u32 words; `p = [bits, group, nkv, hd, tokens, is_key]`.
+    fn kivi_dequant(
+        &self,
+        _codes: &Self::Buffer,
+        _sz: &Self::Buffer,
+        _out: &Self::Buffer,
+        _pages: Option<(&Self::Buffer, u32)>,
+        _p: [u32; 6],
+    ) {
+        unimplemented!("kivi_dequant is implemented for Metal only")
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn kv_attention_paged(
         &self,
