@@ -4,13 +4,13 @@
 # lines to OUT. Usage: eval_runs.sh ROOT NITR IMGCODEC OUT
 set -u
 ROOT=$1; NITR=$2; BIN=$3; OUT=$4
-EXP=$(dirname "$0")/export_cc.py
+EXP=$(cd "$(dirname "$0")" && pwd)/export_cc.py
 touch $OUT
 for d in $ROOT/runs/n$NITR/*-*; do
-  [ -f $d/*.cool ] || continue
+  [ -f $d/0000-results_decoder.tsv ] || continue
   b=$(basename $d); img=${b%-*}; l=${b##*-}
   grep -q " $l $img " $OUT && continue
-  (cd $ROOT/Cool-Chic && PYTHONPATH=. $ROOT/venv/bin/python $EXP $d/$img.cool $d/$img.ccx $ROOT/kodak/$img.png > /dev/null 2>&1) || { echo "export failed $d"; continue; }
+  (cd $ROOT/Cool-Chic && PYTHONPATH=. CUDA_VISIBLE_DEVICES= $ROOT/venv/bin/python $EXP $d/$img.cool $d/$img.ccx $ROOT/kodak/$img.png > /dev/null 2>&1) || { echo "export failed $d"; continue; }
   for c in "serial:1:0" "L64:64:0" "L64-b128:64:0x128" "L128-t128:128:128x128"; do
     lab=${c%%:*}; rest=${c#*:}; L=${rest%%:*}; T=${rest#*:}
     o=$($BIN $d/$img.ccx $L $T 2>&1)
