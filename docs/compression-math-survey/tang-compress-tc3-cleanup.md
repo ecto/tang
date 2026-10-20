@@ -105,3 +105,26 @@ Five interleaved rounds, best of 3 per run, RTX 3090 via Vulkan, cores 4,5,7–1
 | 32×16, APM 10,14,15 | 0.760 | 0.752 | 0.892 |
 
 GPU tenants (nvidia-smi pmon, 1 s): the images Kodak campaign was still running (two Python processes, mean 30% SM, peaks 99%); ffmpeg mean 13%; tang-serve and broca showed no compute. The static baseline swings 1.16–1.52 with that load, so this is **contended and inconclusive** against the 1 GB/s gate. Even the least contended round (round 4) has every learned config below 1 GB/s (best 0.94). Re-run with `~/tc3-cleanup/retime.sh` once the images processes are gone.
+
+## Learned-path GPU speed (branch claude/tc4-learned-speed)
+
+**Cause.** The adaptive layer's bins (136 words × 32 invocations = 17 KB of workgroup memory) were declared in every v3 pipeline. On the 3090 that caps an SM at about 5 resident workgroups, and the decode is latency bound, so occupancy was the bottleneck. Doubling-work probes put the MLP at ~9% and the residual decoder at ~5% of learned kernel time; neither was the main cost.
+
+**Change** (`gpudec::AdMem`, no bitstream or output change):
+- Pipelines for non-adaptive streams (static, and learned without the APM) declare a 1-word stub.
+- Adaptive pipelines put the bins in a private array on Vulkan/DX12 and keep workgroup memory on Metal and browser WebGPU, where Track A2 measured private memory slower. `TC_GPU_ADT=workgroup|private` overrides.
+
+**3090, NYX 512³ 80 dB, 5 interleaved rounds, medians (kernel GB/s), every decode byte-identical:**
+
+| stream | before | after | ratio |
+|---|---|---|---|
+| 16-hidden, APM 10,14,15 | 0.956 | **1.101** | 1.15× |
+| 16-hidden, no APM | 1.010 | **1.191** | 1.18× |
+| 32×16, APM 10,14,15 | 0.914 | **1.058** | 1.16× |
+| static | 1.591 | 1.732 | 1.09× |
+
+The static stream gets faster too (it no longer carries the stub-free 17 KB array), so learned relative to static improves less: 1.06× for 16-hidden APM.
+
+**Gate (learned 16-hidden ≥ 1.0 GB/s or ≥ 1.15×): met** (1.10 GB/s, 1.15×). Rounds 1 and 5 each had one contended outlier (base 16-hidden no-APM 0.921, new static 1.417 and 16-hidden APM 0.906); medians exclude their effect.
+
+**Verified:** tang-compress GPU tests (Vulkan) with both placements, CPU tests, clippy with and without `gpu`, wasm32 build. **Not verified:** the browser gate (no Chrome on mew, no jobs on the Mac). The WebGPU path keeps workgroup bins for adaptive streams as before; only non-adaptive pipelines change, to the stub. Metal was not timed.
