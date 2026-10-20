@@ -103,13 +103,17 @@ def kvc_attention(module, query, key, value, attention_mask, scaling, dropout=0.
     causal = s <= t
     S = (q @ _rep(Kh, g).transpose(2, 3)) * scaling
     if R > 0:
+        # exact keys/values for the window: the capture's for the compressed span (rows
+        # before q0 are not computed in this pass, so `key`/`value` there are not the model's)
+        Kx = torch.cat([rec["Kx"].to(key.device, key.dtype)[None], key[:, :, tc:]], 2)
+        Vx = torch.cat([rec["Vx"].to(value.device, value.dtype)[None], value[:, :, tc:]], 2)
         near = causal & (t - s < R)
-        S = torch.where(near, (q @ _rep(key, g).transpose(2, 3)) * scaling, S)
+        S = torch.where(near, (q @ _rep(Kx, g).transpose(2, 3)) * scaling, S)
     S = S.masked_fill(~causal, float("-inf"))
     P = torch.softmax(S, -1)
     if R > 0:
         nf = near.to(P.dtype)
-        o = (P * nf) @ _rep(value, g) + (P * (1 - nf)) @ _rep(Vh, g)
+        o = (P * nf) @ _rep(Vx, g) + (P * (1 - nf)) @ _rep(Vh, g)
     else:
         o = P @ _rep(Vh, g)
     full = torch.zeros_like(query)
@@ -199,7 +203,7 @@ def compress(ex, name, cap, calib, tc=None):
                 dom_cal = c[0] if is_key else c[2]
             jobs.append((name, dict(pre=np.ascontiguousarray(pre), post=np.ascontiguousarray(post), key=is_key, calib=dom_cal)))
             keys.append((l, is_key))
-    rec = {l: {} for l in cap}
+    rec = {l: {"Kx": torch.from_numpy(np.ascontiguousarray(cap[l][1][:, :tc])), "Vx": torch.from_numpy(np.ascontiguousarray(cap[l][2][:, :tc]))} for l in cap}
     bits = nv = 0.0
     for (l, is_key), (job, (bpv, y, dom, _)) in zip(keys, zip(jobs, ex.map(_job, jobs))):
         bits += bpv * y.size
