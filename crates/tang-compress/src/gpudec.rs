@@ -21,6 +21,8 @@ const SHS: usize = 68;
 const BS: usize = 20;
 const BRS: usize = 8;
 const NPARAM: usize = 32;
+/// Largest lane count (one workgroup per brick, one invocation per lane).
+pub const MAX_LANES: usize = 256;
 
 /// A GPU device with the tc-gpu pipelines for one lane count / line length.
 pub struct GpuDecoder {
@@ -100,6 +102,9 @@ impl GpuDecoder {
         limits.max_buffer_size = al.max_buffer_size;
         limits.max_storage_buffer_binding_size = al.max_storage_buffer_binding_size;
         limits.max_compute_workgroups_per_dimension = al.max_compute_workgroups_per_dimension;
+        if lanes == 0 || lanes > MAX_LANES {
+            return Err(format!("tc-gpu GPU decode supports 1..={MAX_LANES} lanes"));
+        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("tc-gpu"),
@@ -181,6 +186,7 @@ impl GpuDecoder {
     pub fn prepare(&self, ps: &Parsed, bytes: &[u8], times: &mut GpuTimes) -> Prepared {
         let t0 = Instant::now();
         assert_eq!(ps.lanes, self.lanes, "decoder built for a different lane count");
+        assert!(!ps.adaptive, "the GPU decoder takes static-model streams (GpuConfig::adaptive = false)");
         let mut meta: Vec<u32> = Vec::new();
         let off_shapes = meta.len();
         let mut band_off = 0usize;
@@ -298,9 +304,7 @@ impl GpuDecoder {
         }
         times.parse_s += t0.elapsed().as_secs_f64();
         let t1 = Instant::now();
-        let per_brick = (self.lanes * NMODEL * 4) as u64;
-        let cap = (512u64 << 20).min(self.device.limits().max_storage_buffer_binding_size as u64);
-        let batch = ((cap / per_brick) as usize).clamp(1, nbricks).min(65535);
+        let batch = nbricks.clamp(1, 65535);
         let dev = &self.device;
         let init = |label: &str, data: &[u32], usage: wgpu::BufferUsages| {
             dev.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents: as_bytes(data), usage })
@@ -310,7 +314,9 @@ impl GpuDecoder {
         let mk = |label: &str, n: u64, usage: wgpu::BufferUsages| {
             dev.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: n.max(4), usage, mapped_at_creation: false })
         };
-        let models = mk("models", batch as u64 * per_brick, wgpu::BufferUsages::STORAGE);
+        // static context models need no per-lane state; the binding is kept
+        // for an adaptive-model kernel
+        let models = mk("models", 4, wgpu::BufferUsages::STORAGE);
         let coef = mk("coef", ncells as u64 * 4, wgpu::BufferUsages::STORAGE);
         let out = mk("out", ncells as u64 * 4, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC);
         self.queue.submit([]);
@@ -382,6 +388,27 @@ impl GpuDecoder {
             jobs.push(("escapes", pr.params.clone(), [pr.nesc.div_ceil(64) as u32, 1, 1]));
         }
         let binds: Vec<wgpu::BindGroup> = jobs.iter().map(|j| self.bind(pr, &j.1)).collect();
+        if std::env::var("TC_GPU_PROFILE").is_ok() {
+            let mut acc: Vec<(&str, f64)> = Vec::new();
+            for (j, bg) in jobs.iter().zip(&binds) {
+                let t0 = Instant::now();
+                let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+                {
+                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+                    pass.set_pipeline(self.pipe(j.0));
+                    pass.set_bind_group(0, bg, &[]);
+                    pass.dispatch_workgroups(j.2[0], j.2[1], j.2[2]);
+                }
+                self.queue.submit([enc.finish()]);
+                let _ = self.device.poll(wgpu::PollType::Wait);
+                let dt = t0.elapsed().as_secs_f64();
+                match acc.iter_mut().find(|a| a.0 == j.0) {
+                    Some(a) => a.1 += dt,
+                    None => acc.push((j.0, dt)),
+                }
+            }
+            eprintln!("tc-gpu kernel times: {acc:?}");
+        }
         let t0 = Instant::now();
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         for (j, bg) in jobs.iter().zip(&binds) {
