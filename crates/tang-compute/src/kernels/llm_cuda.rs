@@ -1351,6 +1351,122 @@ ATTN_MULTI(attn_multi_d256, 16, 16, 256)
 "#
 );
 
+/// `gemm_tc_q4_m{16,32}`: `y[r, n] = sum_k x[r, k] * W[n, k]` for 9..=32 rows off MLX 4-bit
+/// weights on tensor cores (TF32 `mma.sync.m16n8k8`, f32 accumulate; sm_80+). A block (8
+/// warps) takes 128 output columns and a K range: each 32-wide K stage it widens its columns'
+/// weights into shared memory (s * q + b) and stages the rows' activations, and each warp runs
+/// the 16- or 32-row by 16-column tile. Rows past M are zero. A row's sums go in an order fixed
+/// by K and the split alone (never by M), and a K split (gridDim.y > 1) writes its own [M, N]
+/// slice for `sum_splits`. Needs K % 32 == 0, group % 32 == 0, k_split % 32 == 0.
+/// Launch: grid (ceil(N / 128), splits), block 256.
+pub const TC_GEMM_CUDA: &str = with_common!(
+    r#"
+__device__ __forceinline__ float tc_nib(unsigned int q, int e) {
+    return __int_as_float(((q >> (4 * e)) & 0xfu) | 0x4B000000u) - 8388608.0f;
+}
+__device__ __forceinline__ unsigned int tf32(float f) {
+    unsigned int r;
+    asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(f));
+    return r;
+}
+template <int MT>
+__device__ __forceinline__ void gemm_tc_q4_body(
+    const float* __restrict__ X, const unsigned int* __restrict__ Wq,
+    const unsigned short* __restrict__ S, const unsigned short* __restrict__ B,
+    float* __restrict__ Y, unsigned int M, unsigned int K, unsigned int N, unsigned int group,
+    unsigned int k_split)
+{
+    __shared__ float Ws[128][36];
+    __shared__ float Xs[MT * 16][36];
+    unsigned int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+    unsigned int n0 = blockIdx.x * 128;
+    unsigned int kb = blockIdx.y * k_split, ke = min(kb + k_split, K);
+    Y += (u64)blockIdx.y * M * N;
+    unsigned int words = K / 8, G = K / group;
+    float acc[MT][2][4];
+    #pragma unroll
+    for (int a = 0; a < MT; a++)
+        #pragma unroll
+        for (int b = 0; b < 2; b++)
+            #pragma unroll
+            for (int c = 0; c < 4; c++) acc[a][b][c] = 0.0f;
+    for (unsigned int k0 = kb; k0 < ke; k0 += 32) {
+        __syncthreads();
+        // 128 columns x 4 words: two words a thread, widened to f32.
+        #pragma unroll
+        for (int h = 0; h < 2; h++) {
+            unsigned int w = tid + h * 256, col = w >> 2, wi = w & 3, n = n0 + col;
+            float* dst = &Ws[col][wi * 8];
+            if (n < N) {
+                unsigned int q = Wq[(u64)n * words + k0 / 8 + wi];
+                u64 gi = (u64)n * G + (k0 + wi * 8) / group;
+                float s = bf(S[gi]), b = bf(B[gi]);
+                #pragma unroll
+                for (int e = 0; e < 8; e++) dst[e] = fmaf(tc_nib(q, e), s, b);
+            } else {
+                #pragma unroll
+                for (int e = 0; e < 8; e++) dst[e] = 0.0f;
+            }
+        }
+        for (unsigned int i = tid; i < MT * 16 * 32; i += 256) {
+            unsigned int r = i >> 5, kk = i & 31;
+            Xs[r][kk] = r < M ? X[(u64)r * K + k0 + kk] : 0.0f;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int ks = 0; ks < 32; ks += 8) {
+            unsigned int a[MT][4], bb[2][2];
+            #pragma unroll
+            for (int mt = 0; mt < MT; mt++) {
+                a[mt][0] = tf32(Xs[mt * 16 + g][ks + t]);
+                a[mt][1] = tf32(Xs[mt * 16 + g + 8][ks + t]);
+                a[mt][2] = tf32(Xs[mt * 16 + g][ks + t + 4]);
+                a[mt][3] = tf32(Xs[mt * 16 + g + 8][ks + t + 4]);
+            }
+            #pragma unroll
+            for (int nt = 0; nt < 2; nt++) {
+                unsigned int col = warp * 16 + nt * 8 + g;
+                bb[nt][0] = tf32(Ws[col][ks + t]);
+                bb[nt][1] = tf32(Ws[col][ks + t + 4]);
+            }
+            #pragma unroll
+            for (int mt = 0; mt < MT; mt++)
+                #pragma unroll
+                for (int nt = 0; nt < 2; nt++)
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                        : "+f"(acc[mt][nt][0]), "+f"(acc[mt][nt][1]), "+f"(acc[mt][nt][2]),
+                          "+f"(acc[mt][nt][3])
+                        : "r"(a[mt][0]), "r"(a[mt][1]), "r"(a[mt][2]), "r"(a[mt][3]),
+                          "r"(bb[nt][0]), "r"(bb[nt][1]));
+        }
+    }
+    #pragma unroll
+    for (int mt = 0; mt < MT; mt++)
+        #pragma unroll
+        for (int nt = 0; nt < 2; nt++)
+            #pragma unroll
+            for (int c = 0; c < 4; c++) {
+                unsigned int r = mt * 16 + g + (c >> 1) * 8;
+                unsigned int n = n0 + warp * 16 + nt * 8 + 2 * t + (c & 1);
+                if (r < M && n < N) Y[(u64)r * N + n] = acc[mt][nt][c];
+            }
+}
+extern "C" __global__ void __launch_bounds__(256) gemm_tc_q4_m16(
+    const float* __restrict__ X, const unsigned int* __restrict__ Wq,
+    const unsigned short* __restrict__ S, const unsigned short* __restrict__ B,
+    float* __restrict__ Y, unsigned int M, unsigned int K, unsigned int N, unsigned int group,
+    unsigned int k_split)
+{ gemm_tc_q4_body<1>(X, Wq, S, B, Y, M, K, N, group, k_split); }
+extern "C" __global__ void __launch_bounds__(256) gemm_tc_q4_m32(
+    const float* __restrict__ X, const unsigned int* __restrict__ Wq,
+    const unsigned short* __restrict__ S, const unsigned short* __restrict__ B,
+    float* __restrict__ Y, unsigned int M, unsigned int K, unsigned int N, unsigned int group,
+    unsigned int k_split)
+{ gemm_tc_q4_body<2>(X, Wq, S, B, Y, M, K, N, group, k_split); }
+"#
+);
 /// `top_k_rows`: the K largest of each row of X `[rows, n]`, a block (1024 threads) a row.
 /// Floats map to order-preserving u32 keys; four 8-bit radix rounds find the K-th largest key
 /// T; then each thread, over its own contiguous range, keeps the keys above T and the first

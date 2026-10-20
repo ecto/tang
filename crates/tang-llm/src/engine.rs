@@ -24,6 +24,14 @@ const MIN_CHUNK: usize = 9;
 /// A step's default time budget, while anything decodes: 20 tokens a second for each stream.
 pub const STEP_BUDGET: f64 = 0.050;
 
+/// Draft only while at most this many streams decode in a step. Above it verify rows cost
+/// more than the forwards they save. Measured with zest-harness on an H100 (Qwen3-8B-4bit,
+/// total tok/s, drafting at most at 2 / 4 / always): 4 streams 408 / 304 / 296, 8 streams
+/// 542 / 500 / 337, 16 streams 600 / 595 / 314, while at 1-2 streams drafting still pays
+/// (1 stream: 174 off vs 320-350 on). Overridden by `TANG_SPEC_MAX_STREAMS`; drafting never
+/// changes outputs, only which forwards run.
+pub const SPEC_MAX_STREAMS: usize = 2;
+
 /// Fewest leading positions of another conversation's block worth copying (fewer are just
 /// prefilled: a chat template's first few tokens are the same everywhere).
 const MIN_PARTIAL: usize = 32;
@@ -252,6 +260,10 @@ pub struct Engine<D: ComputeDevice> {
     /// decode (prefill chunks are sized to fit), if limited.
     step_cost: crate::step_cost::StepCost,
     step_budget: Option<f64>,
+    /// Draft only while at most this many streams decode (see [`SPEC_MAX_STREAMS`]), and how
+    /// many decode in the current step.
+    spec_max_streams: usize,
+    decoding: usize,
     /// Sample from device-cut top candidates where a sampler allows (`TANG_TOP_SAMPLING=0`
     /// turns it off: whole rows come back as before).
     top_sampling: bool,
@@ -525,6 +537,11 @@ impl<D: ComputeDevice> Engine<D> {
             max_batch: usize::MAX,
             step_cost: crate::step_cost::StepCost::default(),
             step_budget: Some(STEP_BUDGET),
+            spec_max_streams: std::env::var("TANG_SPEC_MAX_STREAMS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(SPEC_MAX_STREAMS),
+            decoding: 0,
             top_sampling: std::env::var("TANG_TOP_SAMPLING").map_or(true, |v| v != "0"),
             global_pending: Vec::new(),
         })
@@ -609,6 +626,11 @@ impl<D: ComputeDevice> Engine<D> {
 
     /// Limit a step to `secs` while streams decode (prefill chunks shrink to fit), or don't
     /// (`None`: whole chunks always).
+    /// Draft only while at most `n` streams decode in a step (`usize::MAX`: always).
+    pub fn set_spec_max_streams(&mut self, n: usize) {
+        self.spec_max_streams = n;
+    }
+
     pub fn set_step_budget(&mut self, secs: Option<f64>) {
         self.step_budget = secs;
     }
@@ -1306,6 +1328,10 @@ impl<D: ComputeDevice> Engine<D> {
         // Each stream's segment, if it has one this step: (tokens fed, all rows).
         let mut segs: Vec<Option<bool>> = Vec::with_capacity(lanes.len());
         let mut decode_rows = 0;
+        self.decoding = lanes
+            .iter()
+            .filter(|l| l.stream.phase == Phase::Decode)
+            .count();
         for lane in lanes.iter_mut() {
             let want = match lane.stream.phase {
                 Phase::Decode => match self.advance(lane) {
@@ -1583,9 +1609,11 @@ impl<D: ComputeDevice> Engine<D> {
             // Drop the rejected rest of the draft from the cache.
             st.cache.truncate(st.cache.len - st.pending);
             st.pending = 0;
-            // A new draft, unless the wrap-up was just forced in (don't draft across it).
+            // A new draft, unless the wrap-up was just forced in (don't draft across it) or
+            // the batch is too wide for verify rows to pay.
+            let wide = self.decoding > self.spec_max_streams;
             st.draft = match (st.drafter.as_ref(), spec) {
-                (Some(d), Some(s)) if !wrap => {
+                (Some(d), Some(s)) if !wrap && !wide => {
                     let room = (st.limit - st.out.len())
                         .min(max_ctx.saturating_sub(st.cache.len + st.fed.len()));
                     let p = d.propose(&s.cfg, &s.global, room);
