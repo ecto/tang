@@ -16,7 +16,8 @@ pub trait ComputeBuffer: Send {
 }
 
 /// Compute device abstraction over CPU, Metal, and CUDA backends.
-pub trait ComputeDevice: Send {
+/// `'static` so extensions can be registered per device type (see [`crate::ext`]).
+pub trait ComputeDevice: Send + 'static {
     /// The buffer type for this device.
     type Buffer: ComputeBuffer;
 
@@ -36,6 +37,16 @@ pub trait ComputeDevice: Send {
     /// The device's name (e.g. "Apple M4 Max", "NVIDIA GeForce RTX 3090"); empty if unknown.
     fn device_name(&self) -> String {
         String::new()
+    }
+
+    /// The architecture extensions are keyed by (see [`crate::ext`]): `sm_86`, `sm_90`, ... on
+    /// CUDA, otherwise `metal` or `cpu`.
+    fn arch(&self) -> String {
+        match self.dialect() {
+            Dialect::Msl => "metal".into(),
+            Dialect::Cuda => "cuda".into(),
+            _ => "cpu".into(),
+        }
     }
 
     /// Release cached buffers in the device memory pool. No-op on devices
