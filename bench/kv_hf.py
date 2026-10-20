@@ -168,10 +168,10 @@ def wiki_ids(tok, model):
     return np.array(tok(text)["input_ids"], np.int64)
 
 
-def forward(m, ids, dev, mode, rec=None, R=0, q0=0):
+def forward(m, ids, dev, mode, rec=None, R=0, q0=0, keep=0):
     STATE.update(mode=mode, rec=rec, R=R, q0=q0, cap={} if mode == "capture" else None)
     with torch.no_grad():
-        lo = m(torch.from_numpy(ids)[None].to(m.model.embed_tokens.weight.device)).logits[0].float()
+        lo = m(torch.from_numpy(ids)[None].to(m.model.embed_tokens.weight.device), logits_to_keep=keep).logits[0].float()
     return lo, STATE["cap"]
 
 
@@ -312,12 +312,12 @@ def cmd_niah(a, tok, m, dev, ex):
                 full = np.concatenate([c["ctx"], c["q"]])
                 tc = len(c["ctx"])
                 if n == "exact":
-                    lo, _ = forward(m, full, dev, "clean")
+                    lo, _ = forward(m, full, dev, "clean", keep=len(c["q"]) + 1)
                     bpv = 16.0
                 else:
-                    _, cap = forward(m, full, dev, "capture")
+                    _, cap = forward(m, full, dev, "capture", keep=1)
                     rec, bpv = compress(ex, n, cap, calib, tc)
-                    lo, _ = forward(m, full, dev, "override", rec, window_of(n), q0=tc - 1)
+                    lo, _ = forward(m, full, dev, "override", rec, window_of(n), q0=tc - 1, keep=len(c["q"]) + 1)
                 na = c["nans"]
                 tgt = torch.from_numpy(full[-na:]).to(lo.device)
                 pl = lo[-na - 1 : -1]
@@ -344,6 +344,9 @@ def main():
     ap.add_argument("-c", "--configs", nargs="*", default=[], help="names; trailing * = prefix")
     a = ap.parse_args()
     torch.set_num_threads(int(os.environ.get("TORCH_THREADS", "6")))
+    if a.device.startswith("cuda") and os.environ.get("KV_GPU_GB"):  # hard cap on a shared GPU
+        tot = torch.cuda.get_device_properties(0).total_memory
+        torch.cuda.set_per_process_memory_fraction(float(os.environ["KV_GPU_GB"]) * 2**30 / tot)
     tok, m = load(a.model, a.device, getattr(torch, a.dtype))
     with ProcessPoolExecutor(int(os.environ.get("KV_PROCS", "6"))) as ex:
         (cmd_ppl if a.cmd == "ppl" else cmd_niah)(a, tok, m, a.device, ex)
