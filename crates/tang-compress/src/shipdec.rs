@@ -10,22 +10,26 @@
 //! caches the result by content hash. Plain TCG3 streams decode as before.
 //!
 //! Program layout: `"TCDP"`, version byte (1), flags byte (bit 0 static
-//! residual graph, bit 1 learned residual graph, bit 2 MLP graph), then per
-//! present section a varint length and a `TIR1` graph. A missing residual
-//! section falls back to the built-in graph.
+//! residual graph, bit 1 learned residual graph, bit 2 MLP graph, bit 3
+//! adaptive learned residual graph), then per present section a varint
+//! length and a `TIR1` graph. A missing residual section falls back to the
+//! built-in graph.
 //!
 //! Role ABIs (anything else is rejected):
 //! - static residual: params `u32 × 8`, buffers `mt`, `stream` (`u32`),
 //!   outputs `u32, u32, i32` (see [`crate::irdec`]);
 //! - learned residual: params `u32 × 3, i32 × 5, u32 × 2`, same buffers and
 //!   outputs;
-//! - MLP: params `i32 × NFL`, no buffers, outputs `i32 × NO`.
+//! - MLP: params `i32 × NFL`, no buffers, outputs `i32 × NO`;
+//! - adaptive learned residual (streams with the per-lane APM layer):
+//!   params `u32 × 3, i32 × 5, u32 × 6`, buffers `mt`, `stream` and the
+//!   scratch buffer `adt` (136 words), outputs `u32, u32, i32, u32`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::bitio::DecodeError;
-use crate::irdec::{BUFS, LEARNED_PARAMS, OUTS, STATIC_PARAMS};
+use crate::irdec::{BUFS, LEARNED_AD_PARAMS, LEARNED_PARAMS, OUTS, OUTS_AD, RW_AD, STATIC_PARAMS};
 use crate::learned::NO;
 use crate::lmodel3::{Net32, NFL};
 use tang_expr::int::{IId, IType, IntGraph, Limits, Program};
@@ -45,10 +49,14 @@ pub struct Decoder {
     pub stat: Graph,
     /// Learned residual graph.
     pub learned: Graph,
+    /// Adaptive learned residual graph.
+    pub learned_ad: Graph,
     /// Shipped MLP (replaces the stream's model).
     pub mlp: Option<Graph>,
     /// WGSL for the kernel's RES region (bounds-checked loads).
     pub wgsl_res: String,
+    /// The RES region for adaptive streams.
+    pub wgsl_res_ad: String,
     /// WGSL `fn mlp_gen()` when the MLP is shipped.
     pub wgsl_mlp: Option<String>,
     /// Content hash of the program bytes.
@@ -107,10 +115,10 @@ fn get(b: &[u8], p: &mut usize) -> Result<u64, DecodeError> {
 
 /// Serialize a decoder program from graphs (`None` sections are left to the
 /// receiver's built-ins).
-pub fn program_bytes(stat: Option<&Graph>, learned: Option<&Graph>, mlp: Option<&Graph>) -> Vec<u8> {
+pub fn program_bytes(stat: Option<&Graph>, learned: Option<&Graph>, mlp: Option<&Graph>, learned_ad: Option<&Graph>) -> Vec<u8> {
     let mut o = PMAGIC.to_vec();
     o.push(1);
-    let secs = [stat, learned, mlp];
+    let secs = [stat, learned, mlp, learned_ad];
     o.push(secs.iter().enumerate().map(|(i, s)| (s.is_some() as u8) << i).sum());
     for (g, outs) in secs.into_iter().flatten() {
         let b = g.to_bytes(outs);
@@ -120,11 +128,13 @@ pub fn program_bytes(stat: Option<&Graph>, learned: Option<&Graph>, mlp: Option<
     o
 }
 
-/// The built-in decoder as a program: both residual graphs, plus `net`'s
-/// MLP when given.
-pub fn builtin_program(net: Option<&Net32>) -> Vec<u8> {
+/// The built-in decoder as a program: the static residual graph, the
+/// learned one (adaptive when `ad`, for streams with the APM layer), plus
+/// `net`'s MLP when given.
+pub fn builtin_program(net: Option<&Net32>, ad: bool) -> Vec<u8> {
     let mlp = net.map(|n| n.graph());
-    program_bytes(Some(&crate::irdec::static_graph()), Some(&crate::irdec::learned_graph()), mlp.as_ref())
+    let (l, la) = if ad { (None, Some(crate::irdec::learned_ad_graph())) } else { (Some(crate::irdec::learned_graph()), None) };
+    program_bytes(Some(&crate::irdec::static_graph()), l.as_ref(), mlp.as_ref(), la.as_ref())
 }
 
 /// Wrap a TCG3 stream with a decoder program.
@@ -158,7 +168,7 @@ pub fn compile(prog: &[u8]) -> Result<Decoder, DecodeError> {
         return Err(DecodeError::Invalid("decoder program header"));
     }
     let flags = prog[5];
-    if flags & !7 != 0 {
+    if flags & !15 != 0 {
         return Err(DecodeError::Invalid("decoder program flags"));
     }
     let mut p = 6;
@@ -180,10 +190,15 @@ pub fn compile(prog: &[u8]) -> Result<Decoder, DecodeError> {
         0 => None,
         _ => Some(IntGraph::from_bytes(sec(&mut p)?, &[IType::I32; NFL], &[], &[IType::I32; NO], &mlp_limits()).map_err(bad)?),
     };
+    let learned_ad = match flags & 8 {
+        0 => crate::irdec::learned_ad_graph(),
+        _ => IntGraph::from_bytes_rw(sec(&mut p)?, &LEARNED_AD_PARAMS, &BUFS, &RW_AD, &OUTS_AD, &res_limits()).map_err(bad)?,
+    };
     if p != prog.len() {
         return Err(DecodeError::Invalid("decoder program trailing bytes"));
     }
     let wgsl_res = crate::irdec::wgsl((&stat.0, &stat.1), (&learned.0, &learned.1), true);
+    let wgsl_res_ad = crate::irdec::wgsl((&stat.0, &stat.1), (&learned_ad.0, &learned_ad.1), true);
     let wgsl_mlp = mlp.as_ref().map(|(g, o)| {
         let params: Vec<String> = (0..NFL).map(|i| format!("na[{i}]")).collect();
         let dests: Vec<String> = (0..o.len()).map(|k| format!("na[{k}]")).collect();
@@ -191,7 +206,7 @@ pub fn compile(prog: &[u8]) -> Result<Decoder, DecodeError> {
         let dr: Vec<&str> = dests.iter().map(|s| s.as_str()).collect();
         format!("fn mlp_gen() {{\n{}}}\n", g.to_wgsl_body_guarded(o, &pr, &dr, 1))
     });
-    Ok(Decoder { stat, learned, mlp, wgsl_res, wgsl_mlp, key: fnv1a(prog), size: prog.len() })
+    Ok(Decoder { stat, learned, learned_ad, mlp, wgsl_res, wgsl_res_ad, wgsl_mlp, key: fnv1a(prog), size: prog.len() })
 }
 
 type Cache = Mutex<HashMap<u64, Vec<(Vec<u8>, Arc<Decoder>)>>>;
@@ -272,6 +287,9 @@ mod tests {
             let model = Model3::Overfit { hidden: vec![8], per_epoch: 20_000, epochs: 2 };
             let cfg = Gpu3Config { block: 16, lanes, tile: 16, model, adapt: None, ..Gpu3Config::new(bound) };
             out.push((format!("learned lanes {lanes} {bound:?}"), encode3_f32(&x, &d, &cfg, 2).0));
+            let model = Model3::Overfit { hidden: vec![8], per_epoch: 20_000, epochs: 2 };
+            let cfg = Gpu3Config { block: 16, lanes, tile: 16, model, ..Gpu3Config::new(bound) };
+            out.push((format!("adaptive lanes {lanes} {bound:?}"), encode3_f32(&x, &d, &cfg, 2).0));
         }
         out
     }
@@ -279,22 +297,25 @@ mod tests {
     fn shipped(s: &[u8], with_mlp: bool) -> Vec<u8> {
         let ps = parse3(s).unwrap();
         let net = if with_mlp { ps.net.as_ref() } else { None };
-        wrap(s, &builtin_program(net))
+        wrap(s, &builtin_program(net, ps.net.is_some() && ps.ad.wa > 0))
     }
 
+    /// Adaptive (per-lane APM) streams decode through the IR graphs, with the
+    /// adaptive role shipped or (older programs without it) built in.
     #[test]
-    fn adaptive_streams_fall_back_to_the_hand_path() {
+    fn adaptive_streams_decode_through_the_ir() {
         let d = [20, 37, 45];
         let x = field(d);
         let model = Model3::Overfit { hidden: vec![8], per_epoch: 20_000, epochs: 2 };
         let cfg = Gpu3Config { block: 16, lanes: 8, tile: 16, model, ..Gpu3Config::new(ErrorBound::Psnr(80.0)) };
         let s = encode3_f32(&x, &d, &cfg, 2).0;
-        assert!(parse3(&s).unwrap().ad.wa > 0);
+        let ps = parse3(&s).unwrap();
+        assert!(ps.ad.wa > 0);
         let want = decode3_box(&s, [0; 3], d, 2).unwrap().bits;
-        for mlp in [false, true] {
-            let w = shipped(&s, mlp);
-            assert!(parse3(&w).unwrap().dec.is_none());
-            assert!(decode3_box(&w, [0; 3], d, 2).unwrap().bits == want, "mlp {mlp}");
+        for (mlp, ad) in [(false, true), (true, true), (false, false), (true, false)] {
+            let w = wrap(&s, &builtin_program(if mlp { ps.net.as_ref() } else { None }, ad));
+            assert!(parse3(&w).unwrap().dec.is_some());
+            assert!(decode3_box(&w, [0; 3], d, 2).unwrap().bits == want, "mlp {mlp} ad {ad}");
         }
     }
 
@@ -347,7 +368,7 @@ mod tests {
         let cfg = Gpu3Config { block: 16, lanes: 8, tile: 16, model: Model3::Pretrained(net.clone()), adapt: None, ..Gpu3Config::new(ErrorBound::Psnr(80.0)) };
         let (s, _) = encode3_f32(&field(d), &d, &cfg, 2);
         assert!(parse3(&s).is_err(), "model must not be registered yet");
-        let prog = builtin_program(Some(&Net32::new(&net)));
+        let prog = builtin_program(Some(&Net32::new(&net)), false);
         let w = wrap(&s, &prog);
         let got = decode3_box(&w, [0; 3], d, 2).unwrap().bits;
         #[cfg(feature = "gpu")]
@@ -364,7 +385,7 @@ mod tests {
     #[test]
     fn corrupt_programs_are_rejected_not_run() {
         let s = &streams()[1].1;
-        let prog = builtin_program(parse3(s).unwrap().net.as_ref());
+        let prog = builtin_program(parse3(s).unwrap().net.as_ref(), false);
         let mut seed = 5u64;
         let mut rnd = || {
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -404,7 +425,7 @@ mod tests {
             });
             g.cap_loop(out[0], cap);
             let z = g.i32(0);
-            program_bytes(Some(&(g, vec![out[0], x, z])), None, None)
+            program_bytes(Some(&(g, vec![out[0], x, z])), None, None, None)
         };
         assert!(compile(&spin(1 << 20)).is_err());
         // within the caps an infinite loop just stops (and garbage decodes to an error or garbage)

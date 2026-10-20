@@ -15,10 +15,13 @@
 //!   enclosing loops, is at most `max_cost`;
 //! - outputs are top-level and have the caller's types.
 //!
-//! The op set has no stores, no I/O and no unbounded control flow; loads are
-//! read-only and bounds-checked by the interpreter and by
-//! [`IntGraph::to_wgsl_body_guarded`]. So a verified graph is a total
-//! function of its parameters and buffers.
+//! The op set has no I/O and no unbounded control flow; loads are
+//! bounds-checked by the interpreter and by
+//! [`IntGraph::to_wgsl_body_guarded`]. The only writes go to the caller's
+//! fixed-length scratch buffers ([`IntGraph::from_bytes_rw`]), bounds-checked
+//! the same way (out-of-range stores are dropped) and executed in the shared
+//! schedule order. So a verified graph is a total, deterministic function of
+//! its parameters and buffers (and the scratch contents it starts from).
 //!
 //! Layout (all integers LEB128 varints unless noted):
 //! `"TIR1"`, `nloops`, per loop `parent+1 | 0`, `cap`, `n`, `init[n]`,
@@ -147,7 +150,7 @@ const BINS: [BinOp; 13] = [
     BinOp::Rem,
 ];
 const CMPS: [CmpOp; 4] = [CmpOp::Eq, CmpOp::Ne, CmpOp::Lt, CmpOp::Le];
-const UNS: [UnOp; 2] = [UnOp::Neg, UnOp::Not];
+const UNS: [UnOp; 3] = [UnOp::Neg, UnOp::Not, UnOp::Clz];
 
 impl IntGraph {
     /// Serialize the whole graph with `outputs` (see the module docs).
@@ -226,6 +229,20 @@ impl IntGraph {
                     put(&mut o, l as u64);
                     put(&mut o, k as u64);
                 }
+                INode::Tok => o.push(10),
+                INode::LoadRw(b, a, t) => {
+                    o.push(11);
+                    put(&mut o, b as u64);
+                    put(&mut o, d(a));
+                    put(&mut o, d(t));
+                }
+                INode::Store(b, a, v, t) => {
+                    o.push(12);
+                    put(&mut o, b as u64);
+                    put(&mut o, d(a));
+                    put(&mut o, d(v));
+                    put(&mut o, d(t));
+                }
             }
         }
         put(&mut o, outputs.len() as u64);
@@ -239,6 +256,19 @@ impl IntGraph {
     /// gives the type of each parameter, `bufs` the name and element type of
     /// each buffer, `outs` the output types. Returns the graph and its outputs.
     pub fn from_bytes(bytes: &[u8], params: &[IType], bufs: &[(&str, Elem)], outs: &[IType], lim: &Limits) -> Result<(IntGraph, Vec<IId>), WireError> {
+        Self::from_bytes_rw(bytes, params, bufs, &[], outs, lim)
+    }
+
+    /// [`Self::from_bytes`] with scratch buffers after the read-only ones:
+    /// `(name, elem, length, WGSL base expression)` each, all from the caller.
+    pub fn from_bytes_rw(
+        bytes: &[u8],
+        params: &[IType],
+        bufs: &[(&str, Elem)],
+        rw: &[(&str, Elem, u32, &str)],
+        outs: &[IType],
+        lim: &Limits,
+    ) -> Result<(IntGraph, Vec<IId>), WireError> {
         let mut r = Rd { b: bytes, p: 0 };
         if bytes.len() < 4 || &bytes[..4] != MAGIC {
             return err("magic");
@@ -248,6 +278,10 @@ impl IntGraph {
         for &(name, elem) in bufs {
             g.buffer(name, elem);
         }
+        for &(name, elem, len, base) in rw {
+            g.buffer_rw(name, elem, len, base);
+        }
+        let nbufs = g.bufs.len() as u64;
         let nl = r.n(lim.max_loops, "loops")?;
         let mut caps = Vec::with_capacity(nl);
         for l in 0..nl {
@@ -329,10 +363,24 @@ impl IntGraph {
                 }
                 7 => {
                     let b = r.var()?;
-                    if b >= bufs.len() as u64 {
+                    if b >= nbufs {
                         return err("buffer not in the ABI");
                     }
                     INode::Load(b as u16, opnd(&mut r)?)
+                }
+                10 => INode::Tok,
+                11 | 12 => {
+                    let b = r.var()?;
+                    if b >= nbufs {
+                        return err("buffer not in the ABI");
+                    }
+                    let i = opnd(&mut r)?;
+                    if tag == 11 {
+                        INode::LoadRw(b as u16, i, opnd(&mut r)?)
+                    } else {
+                        let v = opnd(&mut r)?;
+                        INode::Store(b as u16, i, v, opnd(&mut r)?)
+                    }
                 }
                 8 => {
                     let (l, k) = lk(&mut r, &g)?;

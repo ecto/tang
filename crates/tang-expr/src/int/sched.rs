@@ -26,12 +26,21 @@ impl IntGraph {
                 f(b);
             }
             INode::Un(_, a) | INode::Bitcast(_, a) | INode::Load(_, a) => f(a),
+            INode::LoadRw(_, i, t) => {
+                f(i);
+                f(t);
+            }
+            INode::Store(_, i, v, t) => {
+                f(i);
+                f(v);
+                f(t);
+            }
             INode::Select(c, a, b) => {
                 f(c);
                 f(a);
                 f(b);
             }
-            INode::Const(..) | INode::Param(..) | INode::State(..) | INode::LoopOut(..) => {}
+            INode::Const(..) | INode::Param(..) | INode::State(..) | INode::LoopOut(..) | INode::Tok => {}
         }
     }
 
@@ -79,7 +88,8 @@ impl IntGraph {
         }
         let mut inline: Vec<bool> = (0..n)
             .map(|i| {
-                let leaf = matches!(self.nodes[i], INode::State(..) | INode::LoopOut(..));
+                // effects stay at their place in the schedule
+                let leaf = matches!(self.nodes[i], INode::State(..) | INode::LoopOut(..) | INode::LoadRw(..) | INode::Store(..));
                 live[i] && !leaf && uses[i] == 1 && user_scope[i] == Some(self.scope[i])
             })
             .collect();

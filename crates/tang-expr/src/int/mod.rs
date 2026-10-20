@@ -18,8 +18,18 @@
 //!   Results are [`INode::LoopOut`] nodes. Loops nest; every node belongs to
 //!   the innermost loop whose state it depends on, so invariant code is
 //!   hoisted by construction.
-//! - The graph is pure: buffers are read-only ([`IntGraph::load`]); results
-//!   leave through the caller's bindings of the outputs.
+//! - Buffers are read-only ([`IntGraph::load`]), except scratch buffers
+//!   ([`IntGraph::buffer_rw`]): small fixed-length arrays read and written
+//!   through ordered effects. An effect token ([`IntGraph::token`]) is
+//!   threaded from store to store ([`IntGraph::store`] returns the next
+//!   token); a scratch load ([`IntGraph::load_rw`]) depends on a token. The
+//!   tokens only order the effects through data dependencies: every backend
+//!   executes scratch loads and stores in the one shared schedule order
+//!   (never inlined, never moved), so effects are deterministic and
+//!   identical across backends whatever the graph. A builder that wants
+//!   "load sees the state as of its token" makes every load of a token feed
+//!   the store that consumes it. Everything else is pure. Results leave
+//!   through the caller's bindings of the outputs.
 
 mod emit;
 mod eval;
@@ -130,6 +140,8 @@ pub enum UnOp {
     Neg,
     /// Bitwise not (logical not on `bool`).
     Not,
+    /// Count of leading zero bits (32 for 0).
+    Clz,
 }
 
 /// A node.
@@ -155,6 +167,13 @@ pub enum INode {
     State(u32, u16),
     /// Final state `k` of loop `l`, after it.
     LoopOut(u32, u16),
+    /// The initial effect token (`u32`, value 0).
+    Tok,
+    /// `buf[index]` from a scratch buffer, as of effect token `tok`.
+    LoadRw(u16, IId, IId),
+    /// `buf[index] = value` on a scratch buffer after effect token `tok`;
+    /// yields the next token.
+    Store(u16, IId, IId, IId),
 }
 
 /// A structured while loop: `s = init; while cond(s) { s = next(s) }`.
@@ -173,13 +192,17 @@ pub struct Loop {
     pub cap: Option<u32>,
 }
 
-/// A read-only buffer declaration.
+/// A buffer declaration.
 #[derive(Clone, Debug)]
 pub struct Buffer {
     /// Name used by the lowerings.
     pub name: String,
     /// Element type.
     pub elem: Elem,
+    /// Scratch buffer: `(length, base)`. Element `i < length` lives at
+    /// `name[base + i]` in WGSL (`base` is a host expression); out-of-range
+    /// loads read 0 and out-of-range stores are dropped.
+    pub rw: Option<(u32, String)>,
 }
 
 /// Integer expression graph with structural interning.
@@ -298,7 +321,7 @@ impl IntGraph {
                 (ta, self.try_inner(sc(a), sc(b))?)
             }
             INode::Un(op, a) => {
-                ok(op == UnOp::Not || self.ty(a) != IType::Bool, "negation of bool")?;
+                ok(op == UnOp::Not || self.ty(a) != IType::Bool, "integer op on bool")?;
                 (self.ty(a), sc(a))
             }
             INode::Cmp(_, a, b) => {
@@ -317,7 +340,27 @@ impl IntGraph {
             }
             INode::Load(b, i) => {
                 ok(self.ty(i) == IType::U32, "load index must be u32")?;
-                (self.bufs[b as usize].elem.ty(), sc(i))
+                let buf = self.bufs.get(b as usize).ok_or("buffer")?;
+                ok(buf.rw.is_none(), "plain load from a scratch buffer")?;
+                (buf.elem.ty(), sc(i))
+            }
+            INode::Tok => (IType::U32, None),
+            INode::LoadRw(b, i, t) => {
+                let buf = self.bufs.get(b as usize).ok_or("buffer")?;
+                ok(buf.rw.is_some(), "scratch load from a read-only buffer")?;
+                ok(self.ty(i) == IType::U32 && self.ty(t) == IType::U32, "scratch load index and token must be u32")?;
+                let s = self.try_inner(sc(i), sc(t))?;
+                ok(s == sc(t), "scratch load outside its token's scope")?;
+                (buf.elem.ty(), s)
+            }
+            INode::Store(b, i, v, t) => {
+                let buf = self.bufs.get(b as usize).ok_or("buffer")?;
+                ok(buf.rw.is_some(), "store to a read-only buffer")?;
+                ok(self.ty(i) == IType::U32 && self.ty(t) == IType::U32, "store index and token must be u32")?;
+                ok(self.ty(v) == buf.elem.ty(), "store value type")?;
+                let s = self.try_inner(self.try_inner(sc(i), sc(v))?, sc(t))?;
+                ok(s == sc(t), "store outside its token's scope")?;
+                (IType::U32, s)
             }
             INode::State(l, k) => (self.ty(self.loops[l as usize].init[k as usize]), Some(l)),
             INode::LoopOut(l, k) => (self.ty(self.loops[l as usize].init[k as usize]), self.loops[l as usize].parent),
@@ -371,8 +414,31 @@ impl IntGraph {
 
     /// Declare a read-only buffer; returns its index for [`load`](Self::load).
     pub fn buffer(&mut self, name: &str, elem: Elem) -> u16 {
-        self.bufs.push(Buffer { name: name.into(), elem });
+        self.bufs.push(Buffer { name: name.into(), elem, rw: None });
         (self.bufs.len() - 1) as u16
+    }
+
+    /// Declare a scratch buffer of `len` 32-bit elements (`elem` is `I32` or
+    /// `U32`), at `name[base + i]` in WGSL.
+    pub fn buffer_rw(&mut self, name: &str, elem: Elem, len: u32, base: &str) -> u16 {
+        assert!(matches!(elem, Elem::I32 | Elem::U32), "scratch buffers hold 32-bit elements");
+        self.bufs.push(Buffer { name: name.into(), elem, rw: Some((len, base.into())) });
+        (self.bufs.len() - 1) as u16
+    }
+
+    /// The initial effect token.
+    pub fn token(&mut self) -> IId {
+        self.insert(INode::Tok)
+    }
+
+    /// `buf[index]` of a scratch buffer as of effect token `tok`.
+    pub fn load_rw(&mut self, buf: u16, index: IId, tok: IId) -> IId {
+        self.insert(INode::LoadRw(buf, index, tok))
+    }
+
+    /// `buf[index] = value` after `tok`; returns the next token.
+    pub fn store(&mut self, buf: u16, index: IId, value: IId, tok: IId) -> IId {
+        self.insert(INode::Store(buf, index, value, tok))
     }
 
     /// `buf[index]`, widened per [`Elem`].
@@ -456,6 +522,11 @@ impl IntGraph {
     /// `!a` (bitwise on integers).
     pub fn not(&mut self, a: IId) -> IId {
         self.insert(INode::Un(UnOp::Not, a))
+    }
+
+    /// Leading zero bits of `a` (`firstLeadingBit(a) = 31 − clz(a)` for `a > 0`).
+    pub fn clz(&mut self, a: IId) -> IId {
+        self.insert(INode::Un(UnOp::Clz, a))
     }
 
     /// Comparison.

@@ -72,6 +72,7 @@ impl Em<'_> {
             INode::Param(p, _) => format!("({})", self.params[p as usize]),
             INode::State(l, k) => format!("st{l}_{k}"),
             INode::LoopOut(l, k) => format!("s{l}_{k}"),
+            INode::Tok => self.lit(IType::U32, 0),
             _ if self.sched.inline[id.index()] => self.def(id),
             _ => format!("t{}", id.0),
         }
@@ -130,6 +131,8 @@ impl Em<'_> {
                     (UnOp::Neg, _, Lang::Rust) => format!("{x}.wrapping_neg()"),
                     (UnOp::Not, IType::Bool, _) | (UnOp::Not, _, Lang::Rust) => format!("(!{x})"),
                     (UnOp::Not, _, Lang::Wgsl) => format!("(~{x})"),
+                    (UnOp::Clz, _, Lang::Wgsl) => format!("countLeadingZeros({x})"),
+                    (UnOp::Clz, t, Lang::Rust) => format!("({x}.leading_zeros() as {})", ty_name(Lang::Rust, t)),
                 }
             }
             INode::Cmp(op, a, b) => {
@@ -191,7 +194,34 @@ impl Em<'_> {
                     (Elem::I8, Lang::Rust) => format!("(({n}[({i} >> 2) as usize] >> (({i} & 3) * 8)) as u8 as i8 as i32)"),
                 }
             }
-            INode::Const(..) | INode::Param(..) | INode::State(..) | INode::LoopOut(..) => self.r(id),
+            INode::LoadRw(b, i, _) => {
+                let buf = &g.bufs[b as usize];
+                let (len, base) = buf.rw.as_ref().unwrap();
+                let (n, i) = (&buf.name, self.r(i));
+                if w {
+                    let z = if buf.elem == Elem::I32 { "0i" } else { "0u" };
+                    if self.guard {
+                        return format!("select({z}, {n}[({base}) + min({i}, {}u)], {i} < {len}u)", len.saturating_sub(1));
+                    }
+                    return format!("{n}[({base}) + {i}]");
+                }
+                let cast = if buf.elem == Elem::I32 { " as i32" } else { "" };
+                format!("((if {i} < {len}u32 {{ {n}.get({i} as usize).copied().unwrap_or(0) }} else {{ 0 }}){cast})")
+            }
+            INode::Store(..) => self.lit(IType::U32, 0),
+            INode::Const(..) | INode::Param(..) | INode::State(..) | INode::LoopOut(..) | INode::Tok => self.r(id),
+        }
+    }
+
+    /// The statement of a scratch store.
+    fn store(&self, b: u16, i: IId, v: IId) -> String {
+        let buf = &self.g.bufs[b as usize];
+        let (len, base) = buf.rw.as_ref().unwrap();
+        let (n, i, v) = (&buf.name, self.r(i), self.r(v));
+        match self.lang {
+            Lang::Wgsl if self.guard => format!("if ({i} < {len}u) {{ {n}[({base}) + {i}] = {v}; }}"),
+            Lang::Wgsl => format!("{n}[({base}) + {i}] = {v};"),
+            Lang::Rust => format!("if {i} < {len}u32 {{ if let Some(w) = {n}.get_mut({i} as usize) {{ *w = {v} as u32; }} }}"),
         }
     }
 
@@ -208,9 +238,13 @@ impl Em<'_> {
             match it {
                 Item::Node(id) => {
                     let id = *id;
-                    let skip = matches!(self.g.node(id), INode::Const(..) | INode::Param(..) | INode::State(..) | INode::LoopOut(..));
+                    let skip = matches!(self.g.node(id), INode::Const(..) | INode::Param(..) | INode::State(..) | INode::LoopOut(..) | INode::Tok);
                     if skip || self.sched.inline[id.index()] {
                         continue;
+                    }
+                    if let INode::Store(b, i, v, _) = self.g.node(id) {
+                        let s = self.store(b, i, v);
+                        self.line(depth, &s);
                     }
                     let s = format!("let t{}: {} = {};", id.0, ty_name(self.lang, self.g.ty(id)), self.def(id));
                     self.line(depth, &s);
@@ -351,7 +385,7 @@ impl IntGraph {
         let pn: Vec<String> = (0..pt.len()).map(|i| format!("p{i}")).collect();
         let pr: Vec<&str> = pn.iter().map(|s| s.as_str()).collect();
         let mut args: Vec<String> = pt.iter().enumerate().map(|(i, t)| format!("p{i}: {}", ty_name(Lang::Rust, *t))).collect();
-        args.extend(self.bufs.iter().map(|b| format!("{}: &[u32]", b.name)));
+        args.extend(self.bufs.iter().map(|b| format!("{}: &{}[u32]", b.name, if b.rw.is_some() { "mut " } else { "" })));
         let rt: Vec<&str> = outputs.iter().map(|o| ty_name(Lang::Rust, self.ty(*o))).collect();
         let mut e = self.emitter(Lang::Rust, outputs, &pr);
         // one type: an array; mixed: a tuple
