@@ -316,11 +316,13 @@ impl CudaComputeDevice {
     fn pool_alloc_f32(&self, len: usize) -> CudaBuffer {
         {
             let mut pool = self.pool.lock().unwrap();
-            pool.maybe_evict_under_pressure();
             if let Some(mut slice) = pool.get_f32(len) {
                 self.stream.memset_zeros(&mut slice).unwrap();
                 return self.make_buf(CudaStorage::F32(slice), len);
             }
+            // Only a miss allocates, so only a miss can push VRAM low: check here, not on
+            // every allocation (cuMemGetInfo cost ~6 µs of CPU a launch).
+            pool.maybe_evict_under_pressure();
         }
         match self.stream.alloc_zeros::<f32>(len) {
             Ok(slice) => self.make_buf(CudaStorage::F32(slice), len),
@@ -337,10 +339,12 @@ impl CudaComputeDevice {
     fn pool_alloc_uninit_f32(&self, len: usize) -> CudaBuffer {
         {
             let mut pool = self.pool.lock().unwrap();
-            pool.maybe_evict_under_pressure();
             if let Some(slice) = pool.get_f32(len) {
                 return self.make_buf(CudaStorage::F32(slice), len);
             }
+            // Only a miss allocates, so only a miss can push VRAM low: check here, not on
+            // every allocation (cuMemGetInfo cost ~6 µs of CPU a launch).
+            pool.maybe_evict_under_pressure();
         }
         match unsafe { self.stream.alloc::<f32>(len) } {
             Ok(slice) => self.make_buf(CudaStorage::F32(slice), len),
@@ -357,11 +361,13 @@ impl CudaComputeDevice {
     fn pool_alloc_bf16(&self, len: usize) -> CudaBuffer {
         {
             let mut pool = self.pool.lock().unwrap();
-            pool.maybe_evict_under_pressure();
             if let Some(mut slice) = pool.get_bf16(len) {
                 self.stream.memset_zeros(&mut slice).unwrap();
                 return self.make_buf(CudaStorage::Bf16(slice), len);
             }
+            // Only a miss allocates, so only a miss can push VRAM low: check here, not on
+            // every allocation (cuMemGetInfo cost ~6 µs of CPU a launch).
+            pool.maybe_evict_under_pressure();
         }
         match self.stream.alloc_zeros::<u16>(len) {
             Ok(slice) => self.make_buf(CudaStorage::Bf16(slice), len),
@@ -377,10 +383,12 @@ impl CudaComputeDevice {
     fn pool_alloc_uninit_bf16(&self, len: usize) -> CudaBuffer {
         {
             let mut pool = self.pool.lock().unwrap();
-            pool.maybe_evict_under_pressure();
             if let Some(slice) = pool.get_bf16(len) {
                 return self.make_buf(CudaStorage::Bf16(slice), len);
             }
+            // Only a miss allocates, so only a miss can push VRAM low: check here, not on
+            // every allocation (cuMemGetInfo cost ~6 µs of CPU a launch).
+            pool.maybe_evict_under_pressure();
         }
         match unsafe { self.stream.alloc::<u16>(len) } {
             Ok(slice) => self.make_buf(CudaStorage::Bf16(slice), len),
