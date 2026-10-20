@@ -1,10 +1,11 @@
 //! A loaded model plus tokenizer and chat template: turns chat requests into streamed pieces,
 //! reusing the KV cache for whatever prefix the new prompt shares with the previous one.
 
-use crate::chat::{Parser, Piece, Template};
+use crate::chat::{Chunk, Detok, Parser, Piece, Tags, Template};
 use crate::draft::{Calibration, CostModel, DraftConfig, Drafter, Global};
 use crate::model::{Cache, Dtype, Model};
 use crate::sample::{Sampler, Sampling};
+use crate::special::Shield;
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use std::path::Path;
@@ -27,8 +28,10 @@ pub const STEP_BUDGET: f64 = 0.050;
 /// prefilled: a chat template's first few tokens are the same everywhere).
 const MIN_PARTIAL: usize = 32;
 
-/// Where an image goes in a flattened message; expanded to the model's image tokens.
-pub const IMAGE_MARKER: &str = "<start_of_image>";
+/// Where an image goes in a flattened message; expanded to the model's image tokens. Not an
+/// added token itself, so it survives [`Shield::protect`] (a user can type it, but only as many
+/// times as there are images, and the images are theirs).
+pub const IMAGE_MARKER: &str = "\u{F8FF}tang-image\u{F8FF}";
 
 pub struct Request {
     pub messages: Value,
@@ -135,16 +138,20 @@ impl Control for () {}
 pub struct Prompter {
     tok: Arc<Tokenizer>,
     template: Arc<Template>,
+    shield: Arc<Shield>,
     /// Tokens an image takes, if the model sees images.
     image_tokens: Option<usize>,
 }
 
 impl Prompter {
-    /// The rendered prompt and its token ids.
+    /// The rendered prompt and its token ids. Request text (messages, tool results, tool-call
+    /// arguments, tool definitions) is only ever plain tokens; the template's own special
+    /// tokens are the only ones (see [`Shield`]).
     pub fn prompt(&self, req: &Request) -> Result<(String, Vec<u32>)> {
+        let tools = req.tools.as_ref().map(|t| self.shield.protect(t));
         let mut prompt = self.template.render(
-            &req.messages,
-            req.tools.as_ref(),
+            &self.shield.protect(&req.messages),
+            tools.as_ref(),
             if req.response_schema.is_some() {
                 Some(false)
             } else {
@@ -166,13 +173,8 @@ impl Prompter {
             );
             prompt = prompt.replace(IMAGE_MARKER, &block);
         }
-        let ids = self
-            .tok
-            .encode(prompt.as_str(), false)
-            .map_err(|e| anyhow!("tokenize: {e}"))?
-            .get_ids()
-            .to_vec();
-        Ok((prompt, ids))
+        let ids = self.shield.encode(&self.tok, &prompt)?;
+        Ok((self.shield.reveal(&prompt), ids))
     }
 }
 
@@ -188,6 +190,9 @@ pub struct Engine<D: ComputeDevice> {
     pub model: Model<D>,
     tok: Arc<Tokenizer>,
     template: Arc<Template>,
+    shield: Arc<Shield>,
+    /// Tag tokens the output parser splits on.
+    tags: Tags,
     cache: Cache<D::Buffer>,
     /// Images in the cache: where each image's tokens start, and a hash of the image, so a
     /// shared prefix is only reused when the images in it are the same.
@@ -257,9 +262,8 @@ pub struct Stream<B> {
     parser: Parser,
     think: ThinkBudget,
     out: Vec<u32>,
-    /// Incremental detokenization: the window `out[prefix..read]` decoded last.
-    prefix: usize,
-    read: usize,
+    /// Incremental detokenization, tag tokens kept as tags.
+    detok: Detok,
     text: String,
     finish: Finish,
     tool_calls: usize,
@@ -464,6 +468,8 @@ impl<D: ComputeDevice> Engine<D> {
         }
         Ok(Self {
             model,
+            shield: Arc::new(Shield::new(&tok)),
+            tags: Tags::new(|t| tok.token_to_id(t)),
             tok: Arc::new(tok),
             template: Arc::new(template),
             cache,
@@ -927,6 +933,7 @@ impl<D: ComputeDevice> Engine<D> {
         Prompter {
             tok: self.tok.clone(),
             template: self.template.clone(),
+            shield: self.shield.clone(),
             image_tokens: self.model.vision.as_ref().map(|v| v.tokens),
         }
     }
@@ -960,17 +967,9 @@ impl<D: ComputeDevice> Engine<D> {
         self.model.max_ctx()
     }
 
+    /// Tokens `text` takes as plain text (as a message's content would).
     pub fn count_tokens(&self, text: &str) -> Result<usize> {
-        Ok(self.encode(text)?.len())
-    }
-
-    fn encode(&self, text: &str) -> Result<Vec<u32>> {
-        Ok(self
-            .tok
-            .encode(text, false)
-            .map_err(|e| anyhow!("tokenize: {e}"))?
-            .get_ids()
-            .to_vec())
+        Ok(self.shield.plain(&self.tok, text)?.len())
     }
 
     /// Generate a reply. `on` gets each piece as it's decoded and returns false to stop.
@@ -1169,8 +1168,7 @@ impl<D: ComputeDevice> Engine<D> {
             parser: Parser::new(opened),
             think: ThinkBudget::new(self.think_tags, req.thinking_budget, opened),
             out: Vec::new(),
-            prefix: 0,
-            read: 0,
+            detok: Detok::default(),
             text: String::new(),
             finish: Finish::Length,
             tool_calls: 0,
@@ -1362,7 +1360,7 @@ impl<D: ComputeDevice> Engine<D> {
         // Every token is still sampled from the target's logits in order, with the same
         // sampler state, so the output is what plain decoding would produce; a draft token
         // only saves a forward when it equals the sampled token.
-        loop {
+        'decode: loop {
             if st.out.len() >= st.limit {
                 break;
             }
@@ -1416,14 +1414,12 @@ impl<D: ComputeDevice> Engine<D> {
                     d.push(&s.cfg, &s.global, tok);
                 }
             }
-            // Incremental detokenization: decode a small window and emit what's new, holding
-            // back incomplete UTF-8.
-            let before = self.decode(&st.out[st.prefix..st.read])?;
-            let after = self.decode(&st.out[st.prefix..])?;
-            if after.len() > before.len() && !after.ends_with('\u{fffd}') {
-                let new = after[before.len()..].to_string();
-                st.prefix = st.read;
-                st.read = st.out.len();
+            // Tag tokens come out as tags, everything else as literal text (see `Parser`).
+            for chunk in st.detok.push(&st.out, &self.tags, |ids| self.decode(ids))? {
+                let (new, tag) = match chunk {
+                    Chunk::Text(s) => (s, None),
+                    Chunk::Tag(t) => (t.to_string(), Some(t)),
+                };
                 st.text.push_str(&new);
                 let stop_at = st
                     .stop
@@ -1439,18 +1435,18 @@ impl<D: ComputeDevice> Engine<D> {
                 };
                 // Constrained output is the grammar's JSON verbatim: tool-call or think
                 // markers inside a string value are data, not structure.
-                let pieces = if st.constraint.is_some() {
-                    vec![Piece::Text(new)]
-                } else {
-                    st.parser.push(&new)
+                let pieces = match tag {
+                    _ if st.constraint.is_some() => vec![Piece::Text(new)],
+                    Some(t) if new == t => st.parser.push_tag(t),
+                    _ => st.parser.push_text(&new),
                 };
                 if !st.deliver(pieces, &mut *lane.on) {
                     st.finish = Finish::Cancelled;
-                    break;
+                    break 'decode;
                 }
                 if stop_at.is_some() {
                     st.finish = Finish::Stop;
-                    break;
+                    break 'decode;
                 }
             }
             if st.fed.is_empty() {
