@@ -632,6 +632,8 @@ fn dims<D: Into<Dim> + Copy>(d: &[D]) -> Vec<Dim> {
 pub struct TensorGraph {
     nodes: Vec<TNode>,
     n_inputs: usize,
+    /// nodes `backward` sends no gradient through (see [`TensorGraph::stop_grad`])
+    stopped: std::collections::HashSet<usize>,
 }
 
 impl TensorGraph {
@@ -908,6 +910,22 @@ impl TensorGraph {
     // -- conveniences, all sugar over `comp` ---------------------------------
 
     /// Elementwise over equally-shaped args.
+    /// The same values as `x`, but [`backward`](Self::backward) sends no
+    /// gradient through it. It is an ordinary identity map, so every backend
+    /// runs it unchanged. A straight-through estimator is
+    /// `w + stop_grad(q(w) − w)`: the forward value is `q(w)`, the gradient
+    /// with respect to `w` is the identity.
+    pub fn stop_grad(&mut self, x: TensorId) -> Result<TensorId, ShapeError> {
+        let y = self.map(&[x], |v| v[0])?;
+        self.stopped.insert(y.n());
+        Ok(y)
+    }
+
+    /// Whether `backward` treats `t` as a constant.
+    pub fn is_stopped(&self, t: TensorId) -> bool {
+        self.stopped.contains(&t.n())
+    }
+
     pub fn map(
         &mut self,
         args: &[TensorId],
@@ -1330,6 +1348,7 @@ impl TensorGraph {
         let mut ng = TensorGraph {
             nodes: Vec::new(),
             n_inputs: self.n_inputs,
+            stopped: Default::default(),
         };
         let mut remap: Vec<Option<usize>> = vec![None; n];
         // an affine reshape of an inlined map dissolves into its readers
@@ -1375,6 +1394,11 @@ impl TensorGraph {
                 precision: node.precision,
             });
             remap[i] = Some(ng.nodes.len() - 1);
+            if self.stopped.contains(&i) {
+                // a stop mark survives renumbering (inlining drops it: run
+                // `backward` before fusion passes, as codegen does)
+                ng.stopped.insert(ng.nodes.len() - 1);
+            }
         }
         let outs = outputs
             .iter()
@@ -1785,6 +1809,7 @@ impl TensorGraph {
         let mut ng = TensorGraph {
             nodes: Vec::new(),
             n_inputs: self.n_inputs,
+            stopped: Default::default(),
         };
         for i in self.topo(outputs) {
             let mut node = self.nodes[i].clone();
@@ -1799,6 +1824,11 @@ impl TensorGraph {
             }
             ng.nodes.push(node);
             remap[i] = Some(ng.nodes.len() - 1);
+            if self.stopped.contains(&i) {
+                // a stop mark survives renumbering (inlining drops it: run
+                // `backward` before fusion passes, as codegen does)
+                ng.stopped.insert(ng.nodes.len() - 1);
+            }
         }
         let outs = outputs
             .iter()

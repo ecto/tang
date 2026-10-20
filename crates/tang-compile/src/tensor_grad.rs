@@ -87,6 +87,9 @@ impl TensorGraph {
                 continue;
             }
             let Some(&dy) = grads.get(&j) else { continue };
+            if self.stopped.contains(&j) {
+                continue; // stop_grad: a constant to everything upstream
+            }
             if let Op::Reshape(src) = self.nodes[j].op {
                 let shape = self.shape(src).to_vec();
                 let g = self.reshape(dy, &shape)?;
@@ -627,6 +630,51 @@ fn go_degree(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn stop_grad_gives_a_straight_through_estimator() {
+        // ste(w) = w + stop_grad(sign(w) − w): the forward value is sign(w)
+        // (a BitNet-style quantizer), the gradient wrt w is the identity
+        let mut g = TensorGraph::new();
+        let w = g.input(&[4]);
+        let x = g.input(&[4]);
+        let q = g
+            .map(&[w], |v| {
+                tang_expr::with_graph(|eg| {
+                    let (one, neg) = (eg.lit(1.0), eg.lit(-1.0));
+                    eg.select(v[0], one, neg)
+                })
+            })
+            .unwrap();
+        let d = g.map(&[q, w], |v| v[0] - v[1]).unwrap();
+        let s = g.stop_grad(d).unwrap();
+        assert!(g.is_stopped(s) && !g.is_stopped(d));
+        let ste = g.map(&[w, s], |v| v[0] + v[1]).unwrap();
+        let y = g.map(&[ste, x], |v| v[0] * v[1]).unwrap();
+        let grads = g.backward(y, &[w, x]).unwrap();
+        // and a bare stop_grad(w) passes no gradient at all
+        let z = g.stop_grad(w).unwrap();
+        let y2 = g.map(&[z, x], |v| v[0] * v[1]).unwrap();
+        let g2 = g.backward(y2, &[w]).unwrap();
+        let ins = [vec![0.3, -0.7, 1.2, -0.1], vec![1.0, 2.0, 3.0, 4.0]];
+        let out = g.eval(&ins, &[y, grads[0], grads[1], g2[0]]);
+        assert_eq!(
+            out[0],
+            vec![1.0, -2.0, 3.0, -4.0],
+            "forward uses the quantized weights"
+        );
+        assert_eq!(
+            out[1],
+            vec![1.0, 2.0, 3.0, 4.0],
+            "d/dw passes straight through"
+        );
+        assert_eq!(
+            out[2],
+            vec![1.0, -1.0, 1.0, -1.0],
+            "d/dx sees the quantized weights"
+        );
+        assert_eq!(out[3], vec![0.0; 4], "stop_grad alone is a constant");
+    }
     use super::*;
     use tang::Scalar;
 
