@@ -33,6 +33,8 @@ fn device() -> impl ComputeDevice {
     return tang_compute::MetalDevice::new().expect("Metal");
     #[cfg(all(feature = "cuda", not(feature = "metal")))]
     return tang_compute::CudaComputeDevice::new().expect("CUDA");
+    #[cfg(not(any(feature = "metal", feature = "cuda")))]
+    return tang_compute::CpuDevice::new();
 }
 
 fn request(i: usize, tokens: usize) -> Request {
