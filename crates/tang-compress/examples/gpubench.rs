@@ -12,7 +12,7 @@ use tang_compress::gpuwav::{self, GpuConfig};
 use tang_compress::gpuwav3::{self, Gpu3Config};
 
 fn cfg3_of(bound: ErrorBound, bk: usize, args: &[String]) -> Gpu3Config {
-    Gpu3Config { block: bk, block2d: bk, resctx: !args.iter().any(|a| a == "--nores"), ..Gpu3Config::new(bound) }
+    Gpu3Config { block: bk, block2d: bk, resctx: !args.iter().any(|a| a == "--nores"), lanes: opt(args, "--l3", "1").parse().unwrap(), ..Gpu3Config::new(bound) }
 }
 use tang_compress::{wavcodec, Decoded};
 
@@ -242,6 +242,108 @@ fn main() {
                         st.bits_per_value,
                         x.len(),
                         mx / range
+                    );
+                    assert!(diff == 0 && ok_bound && ra_ok, "{name} {t} {bk}");
+                }
+            }
+        }
+        #[cfg(feature = "gpu")]
+        "verify3" | "speed3" => {
+            let speed = mode == "speed3";
+            let maxl = dims.iter().copied().max().unwrap();
+            let g = tang_compress::gpudec::GpuDecoder::new(lanes, maxl).expect("gpu");
+            let reps: usize = opt(&args, "--reps", "3").parse().unwrap();
+            let best = |f: &mut dyn FnMut() -> f64| (0..reps).map(|_| f()).fold(f64::INFINITY, f64::min);
+            let gb = x.len() as f64 * 4.0 / 1e9;
+            for t in targets.split(',') {
+                let bound = if let Some(p) = t.strip_prefix('p') {
+                    ErrorBound::Psnr(p.parse().unwrap())
+                } else {
+                    ErrorBound::MaxAbs(t[1..].parse::<f64>().unwrap() * range)
+                };
+                for &bk in &bricks {
+                    let cfg = cfg3_of(bound, bk, &args);
+                    let t0 = Instant::now();
+                    let (b, st) = gpuwav3::encode3_f32(&x, &dims, &cfg, threads);
+                    let enc_s = t0.elapsed().as_secs_f64();
+                    let ps = gpuwav3::parse3(&b).unwrap();
+                    let full = |th: usize| gpuwav3::decode3_box_parsed(&ps, &b, [0; 3], ps.d3, th).unwrap().bits;
+                    let cpu = full(threads);
+                    let (gpu, _) = g.decode3(&b).unwrap();
+                    let diff = cpu.iter().zip(&gpu).filter(|(a, b)| a != b).count();
+                    let y: Vec<f32> = cpu.iter().map(|&v| f32::from_bits(v)).collect();
+                    let (rmse, mx) = err(&x, &y);
+                    let ok_bound = match bound {
+                        ErrorBound::MaxAbs(bb) => mx <= bb,
+                        ErrorBound::Psnr(db) => 20.0 * (range / rmse).log10() >= db - 1e-9,
+                        _ => true,
+                    };
+                    // random access: 64^3 (2D: 64^2) box, off-centre so it straddles blocks
+                    let lo: [usize; 3] = std::array::from_fn(|a| if ps.d3[a] > 64 { ps.d3[a] / 3 } else { 0 });
+                    let hi: [usize; 3] = std::array::from_fn(|a| (lo[a] + 64).min(ps.d3[a]));
+                    let mut sub = None;
+                    let ra = best(&mut || {
+                        let t0 = Instant::now();
+                        sub = Some(gpuwav3::decode3_box(&b, lo, hi, 1).unwrap());
+                        t0.elapsed().as_secs_f64()
+                    });
+                    let ra_mt = best(&mut || {
+                        let t0 = Instant::now();
+                        let _ = gpuwav3::decode3_box(&b, lo, hi, threads).unwrap();
+                        t0.elapsed().as_secs_f64()
+                    });
+                    let sub = sub.unwrap();
+                    let mut ra_ok = true;
+                    let mut k = 0;
+                    for z in lo[0]..hi[0] {
+                        for yy in lo[1]..hi[1] {
+                            for xx in lo[2]..hi[2] {
+                                ra_ok &= sub.bits[k] == cpu[(z * ps.d3[1] + yy) * ps.d3[2] + xx];
+                                k += 1;
+                            }
+                        }
+                    }
+                    let mut sp = String::new();
+                    if speed {
+                        let cpu1 = best(&mut || {
+                            let t0 = Instant::now();
+                            let _ = full(1);
+                            t0.elapsed().as_secs_f64()
+                        });
+                        let cpumt = best(&mut || {
+                            let t0 = Instant::now();
+                            let _ = full(threads);
+                            t0.elapsed().as_secs_f64()
+                        });
+                        let mut tt = tang_compress::gpudec::GpuTimes::default();
+                        let tot = best(&mut || {
+                            let t0 = Instant::now();
+                            let (v, t) = g.decode3(&b).unwrap();
+                            assert!(v == cpu);
+                            tt = t;
+                            t0.elapsed().as_secs_f64()
+                        });
+                        let mut t2 = tang_compress::gpudec::GpuTimes::default();
+                        let pr = g.prepare3(&ps, &b, &mut t2);
+                        let kern = best(&mut || g.run3(&pr));
+                        sp = format!(
+                            ",\"enc_s\":{enc_s},\"cpu1_gbs\":{},\"cpumt_gbs\":{},\"gpu_kernels_gbs\":{},\"gpu_total_gbs\":{},\"gpu_readback_s\":{},\"ra_s\":{ra},\"ra_mt_s\":{ra_mt},\"ra_bytes\":{},\"ra_blocks\":{},\"total_blocks\":{}",
+                            gb / cpu1,
+                            gb / cpumt,
+                            gb / kern,
+                            gb / tot,
+                            tt.readback_s,
+                            sub.bytes_read,
+                            sub.blocks,
+                            ps.blocks.len()
+                        );
+                    }
+                    println!(
+                        "{{\"field\":\"{name}\",\"target\":\"{t}\",\"block\":{bk},\"bpv\":{},\"bytes\":{},\"cells\":{},\"gpu_diff_cells\":{diff},\"bound_ok\":{ok_bound},\"ra_ok\":{ra_ok},\"ra_bytes\":{},\"ra_s\":{ra}{sp}}}",
+                        st.bits_per_value,
+                        b.len(),
+                        x.len(),
+                        sub.bytes_read
                     );
                     assert!(diff == 0 && ok_bound && ra_ok, "{name} {t} {bk}");
                 }

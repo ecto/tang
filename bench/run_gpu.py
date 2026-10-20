@@ -9,7 +9,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 GB = HERE.parent / "target" / "release" / "examples" / "gpubench"
-OUT = HERE / "out" / "gpu_ratio.jsonl"
+V3 = "--v3" in sys.argv
+OUT = HERE / "out" / ("gpu3_ratio.jsonl" if V3 else "gpu_ratio.jsonl")
 
 ORIG = ["miranda-density", "miranda-velocityx", "hurricane-TC", "hurricane-U", "nyx-temperature"]
 
@@ -23,8 +24,13 @@ def fields():
 
 def run(item):
     path, shape = item
-    bricks = "256,512,1024" if len(shape) == 2 else "32,64,128"
-    cmd = [str(GB), "ratio", str(path), "x".join(map(str, shape)), "--bricks", bricks, "--threads", "4", "--lanes", sys.argv[1] if len(sys.argv) > 1 else "32"]
+    if V3:
+        bricks = "64,128,4096" if len(shape) == 2 else "16,32,4096"
+        extra = ["--v3", "--no-serial"]
+    else:
+        bricks = "256,512,1024" if len(shape) == 2 else "32,64,128"
+        extra = []
+    cmd = [str(GB), "ratio", str(path), "x".join(map(str, shape)), "--bricks", bricks, "--threads", "4", "--lanes", "32", *extra]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         print(path.name, "FAILED", r.stderr[-2000:], flush=True)

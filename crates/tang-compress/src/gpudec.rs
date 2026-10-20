@@ -158,7 +158,7 @@ impl GpuDecoder {
             bind_group_layouts: &[&layout],
             push_constant_ranges: &[],
         });
-        let pipes = ["decode", "lift", "outliers", "finalize", "escapes", "decode3", "dequant3", "outliers3"]
+        let pipes = ["decode", "lift", "outliers", "finalize", "escapes", "decode3", "dequant3", "outliers3", "decode3l"]
             .iter()
             .map(|&e| {
                 let p = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -522,7 +522,9 @@ impl GpuDecoder {
             r[7] = b.parent.map_or(u32::MAX, |p| p as u32);
             r[8] = b.pshift[0] | b.pshift[1] << 1 | b.pshift[2] << 2;
             r[9] = 1;
-            r[10] = crate::gpuwav3::key3(pb.level, pb.mask) as u32;
+            for p in 0..8 {
+                r[10 + p] = (crate::gpuwav3::key3(pb.level, pb.mask) + if ps.lanes > 1 { p } else { 0 }) as u32;
+            }
             r[18] = b.m as u32;
             r[19] = b.sh;
             meta.extend(r);
@@ -537,13 +539,20 @@ impl GpuDecoder {
         meta.extend(ps.dl.iter().map(|&v| v as u32));
         let off_bricks = meta.len();
         meta.extend([0, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(ps.lanes == 1 || ps.lanes == self.lanes, "decoder built for a different lane count");
+        let off_ltab = meta.len();
+        for lv in &ps.block_lanes {
+            meta.extend(lv.iter().map(|&(a, _)| a as u32));
+            meta.push(lv.last().unwrap().1 as u32);
+        }
         let off_blocks = meta.len();
         for (i, b) in ps.blocks.iter().enumerate() {
             meta.push(ps.block_band[i] as u32);
             meta.extend(b.start.iter().map(|&v| v as u32));
             meta.extend(b.end.iter().map(|&v| v as u32));
-            meta.push(ps.block_words[i].0 as u32);
-            meta.push(ps.block_words[i].1 as u32);
+            meta.push(ps.block_lanes[i][0].0 as u32);
+            meta.push(ps.block_lanes[i][0].1 as u32);
+            meta.push((off_ltab + i * (ps.lanes + 1)) as u32);
         }
         let off_tiles = meta.len();
         let mut escs: Vec<u32> = Vec::new();
@@ -617,7 +626,7 @@ impl GpuDecoder {
         };
         let _ = self.device.poll(wgpu::PollType::Wait);
         times.upload_s += t1.elapsed().as_secs_f64();
-        Prepared3 { base, groups: ps.level_groups(), nblocks: ps.blocks.len(), ntiles: ps.tiles.len() }
+        Prepared3 { base, groups: ps.level_groups(), nblocks: ps.blocks.len(), ntiles: ps.tiles.len(), lanes: ps.lanes }
     }
 
     /// Run the v3 kernels; returns the kernel wall time.
@@ -629,7 +638,11 @@ impl GpuDecoder {
             let mut p = b.params.clone();
             p[9] = g0 as u32;
             p[10] = n as u32;
-            jobs.push(("decode3", p, [n.div_ceil(64) as u32, 1, 1]));
+            if pr.lanes > 1 {
+                jobs.push(("decode3l", p, [n as u32, 1, 1]));
+            } else {
+                jobs.push(("decode3", p, [n.div_ceil(64) as u32, 1, 1]));
+            }
         }
         let mut p = b.params.clone();
         p[10] = pr.nblocks as u32;
@@ -660,6 +673,7 @@ pub struct Prepared3 {
     groups: Vec<(usize, usize)>,
     nblocks: usize,
     ntiles: usize,
+    lanes: usize,
 }
 
 fn as_bytes(v: &[u32]) -> &[u8] {
@@ -713,8 +727,8 @@ mod tests {
         // v3 code-blocks
         use crate::gpuwav3::{decode3_box, encode3_f32, Gpu3Config};
         for bound in [ErrorBound::Psnr(50.0), ErrorBound::Psnr(100.0), ErrorBound::MaxAbs(1e-3), ErrorBound::MaxAbs(1e-5)] {
-            for (block, resctx) in [(8, true), (16, false), (64, true)] {
-                let cfg = Gpu3Config { block, resctx, tile: 16, ..Gpu3Config::new(bound) };
+            for (block, resctx, lanes) in [(8, true, 1), (16, false, 1), (64, true, 1), (16, true, 8), (32, true, 8)] {
+                let cfg = Gpu3Config { block, resctx, lanes, tile: 16, ..Gpu3Config::new(bound) };
                 let (bytes, _) = encode3_f32(&x, &d, &cfg, 2);
                 let cpu = decode3_box(&bytes, [0; 3], [d[0], d[1], d[2]], 1).unwrap().bits;
                 let (gpu, _) = g.decode3(&bytes).unwrap();

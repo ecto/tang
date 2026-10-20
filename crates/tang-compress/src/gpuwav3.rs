@@ -48,22 +48,27 @@ pub struct Gpu3Config {
     pub resctx: bool,
     /// Deadzone rounding offset.
     pub rho: f64,
+    /// rANS lanes per code-block: 1 = raster order (best ratio); more
+    /// splits a block's lines into parity passes dealt to the lanes (more
+    /// GPU parallelism, TCG1's rule inside the block).
+    pub lanes: usize,
 }
 
 impl Gpu3Config {
     /// Defaults: 32³ / 128² blocks, 64³ outlier tiles, residual contexts.
     pub fn new(bound: ErrorBound) -> Self {
-        Self { bound, block: 32, block2d: 128, tile: 64, resctx: true, rho: 0.45 }
+        Self { bound, block: 32, block2d: 128, tile: 64, resctx: true, rho: 0.45, lanes: 1 }
     }
 }
 
+/// Predictor key of a code-block band (pass 0; passes add `p`).
 pub fn key3(level: usize, mask: u8) -> usize {
     let l = if mask == 0 { 15 } else { level.min(14) };
     (l * 8 + mask as usize) * 8
 }
 
 /// Code-blocks of a shape in coding order.
-pub fn blocks_of(sh: &Shape, cb: [usize; 3]) -> (Vec<BandInfo>, Vec<usize>) {
+pub fn blocks_of(sh: &Shape, cb: [usize; 3], lanes: usize) -> (Vec<BandInfo>, Vec<usize>) {
     let mut v = Vec::new();
     let mut band = Vec::new();
     for (bi, b) in sh.bands.iter().enumerate() {
@@ -75,9 +80,16 @@ pub fn blocks_of(sh: &Shape, cb: [usize; 3]) -> (Vec<BandInfo>, Vec<usize>) {
                     k.start = [z, y, x];
                     k.end = [(z + cb[0]).min(b.end[0]), (y + cb[1]).min(b.end[1]), (x + cb[2]).min(b.end[2])];
                     k.org = b.start;
-                    k.raster = true;
-                    k.npass = 1;
-                    k.pkey = [key3(pb.level, pb.mask); 8];
+                    let base = key3(pb.level, pb.mask);
+                    if lanes <= 1 {
+                        k.raster = true;
+                        k.npass = 1;
+                        k.pkey = [base; 8];
+                    } else {
+                        k.raster = false;
+                        k.npass = crate::gpuwav::npass_of(k.start, k.end);
+                        k.pkey = std::array::from_fn(|p| base + p);
+                    }
                     v.push(k);
                     band.push(bi);
                 }
@@ -88,15 +100,16 @@ pub fn blocks_of(sh: &Shape, cb: [usize; 3]) -> (Vec<BandInfo>, Vec<usize>) {
 }
 
 /// Code one block (one lane, static models). `rs` receives residuals.
-fn code_block<S: Sink>(sh: &Shape, b: &BandInfo, q: &mut [i32], mut rs: Option<&mut [i32]>, preds: &[[i32; NTAP]], m: &mut [u32], s: &mut S) {
+#[allow(clippy::too_many_arguments)]
+fn code_block<S: Sink>(sh: &Shape, b: &BandInfo, q: &mut [i32], mut rs: Option<&mut [i32]>, preds: &[[i32; NTAP]], m: &mut [u32], lanes: usize, s: &mut S) {
     let [_, ny, nx] = sh.dims;
-    let w = &preds[b.pkey[0]];
-    for_lines(b, 1, |p, _, z, y| {
+    for_lines(b, lanes.max(1), |p, lane, z, y| {
+        let w = &preds[b.pkey[p]];
         let rc = row_ctx(sh, b, p, z, y);
         for x in b.start[2]..b.end[2] {
             let (f, pred) = feats(sh, b, &rc, q, rs.as_deref(), z, y, x, w);
             let i = (z * ny + y) * nx + x;
-            let r = code_res::<S, false>(s, 0, m, b.class, &f, q[i].wrapping_sub(pred));
+            let r = code_res::<S, false>(s, lane, m, b.class, &f, q[i].wrapping_sub(pred));
             q[i] = r.wrapping_add(pred);
             if let Some(rs) = rs.as_deref_mut() {
                 rs[i] = r;
@@ -167,8 +180,8 @@ fn fit3(sh: &Shape, blocks: &[BandInfo], q: &[i32]) -> Vec<Option<[i32; NTAP]>> 
     let zero = [0i32; NTAP];
     let [_, ny, nx] = sh.dims;
     for b in blocks {
-        let k = b.pkey[0];
         for_lines(b, 1, |p, _, z, y| {
+            let k = b.pkey[p];
             let rc = row_ctx(sh, b, p, z, y);
             for x in b.start[2]..b.end[2] {
                 let (f, _) = feats(sh, b, &rc, q, None, z, y, x, &zero);
@@ -239,7 +252,7 @@ fn fit3(sh: &Shape, blocks: &[BandInfo], q: &[i32]) -> Vec<Option<[i32; NTAP]>> 
 }
 
 fn used_keys3(blocks: &[BandInfo]) -> Vec<usize> {
-    let mut k: Vec<usize> = blocks.iter().map(|b| b.pkey[0]).collect();
+    let mut k: Vec<usize> = blocks.iter().flat_map(|b| b.pkey[..b.npass].to_vec()).collect();
     k.sort_unstable();
     k.dedup();
     k
@@ -265,7 +278,7 @@ fn encode_at3(enc: &Enc, dims: &[usize], cfg: &Gpu3Config, dg: f64, maxabs: Opti
     let d3 = sh.dims;
     let (qs, dl) = enc.quantize(dg, cfg.rho);
     let cb = block_dims(d3, cfg.block, cfg.block2d);
-    let (blocks, _) = blocks_of(sh, cb);
+    let (blocks, _) = blocks_of(sh, cb, cfg.lanes);
     let fitted = if std::env::var("TC_NOPRED").is_ok() { vec![None; crate::gpuwav::NKEY] } else { fit3(sh, &blocks, &qs[0]) };
     let preds: Vec<[i32; NTAP]> = fitted.iter().map(|p| p.unwrap_or([0; NTAP])).collect();
     let mut cs = enc.reconstruct(&shapes, &qs, &dl);
@@ -312,15 +325,29 @@ fn encode_at3(enc: &Enc, dims: &[usize], cfg: &Gpu3Config, dg: f64, maxabs: Opti
     let mut cnt = CountSink { n: vec![[0; 2]; NMODEL] };
     let mut m0 = vec![MINIT; NMODEL];
     for b in &blocks {
-        code_block(sh, b, &mut q, cfg.resctx.then_some(&mut rs[..]), &preds, &mut m0, &mut cnt);
+        code_block(sh, b, &mut q, cfg.resctx.then_some(&mut rs[..]), &preds, &mut m0, cfg.lanes, &mut cnt);
     }
     let priors = choose_priors3(&cnt.n);
     let mut init = init_of(&priors);
-    let mut bw: Vec<Vec<u16>> = Vec::with_capacity(blocks.len());
+    let mut bw: Vec<Vec<u8>> = Vec::with_capacity(blocks.len());
     for b in &blocks {
-        let mut sink = RecSink { syms: vec![Vec::new()] };
-        code_block(sh, b, &mut q, cfg.resctx.then_some(&mut rs[..]), &preds, &mut init, &mut sink);
-        bw.push(crate::gpuwav::rans_encode(&sink.syms[0]));
+        let nl = cfg.lanes.max(1);
+        let mut sink = RecSink { syms: vec![Vec::new(); nl] };
+        code_block(sh, b, &mut q, cfg.resctx.then_some(&mut rs[..]), &preds, &mut init, nl, &mut sink);
+        let lw: Vec<Vec<u16>> = sink.syms.iter().map(|s| crate::gpuwav::rans_encode(s)).collect();
+        let mut w = ByteWriter::new();
+        if nl > 1 {
+            for l in &lw {
+                w.varint(l.len() as u64);
+            }
+            if w.buf.len() % 2 == 1 {
+                w.u8(0);
+            }
+        }
+        for l in &lw {
+            words_le(l, &mut w);
+        }
+        bw.push(w.buf);
     }
     // outlier tiles
     let mut tp: Vec<Vec<u8>> = Vec::with_capacity(tiles.len());
@@ -367,6 +394,7 @@ fn encode_at3(enc: &Enc, dims: &[usize], cfg: &Gpu3Config, dg: f64, maxabs: Opti
         w.varint(td[a] as u64);
     }
     w.u8(cfg.resctx as u8);
+    w.varint(cfg.lanes.max(1) as u64);
     w.svarint(enc.e as i64);
     w.svarint(enc.mean_fix as i64);
     w.f64(dg);
@@ -396,7 +424,7 @@ fn encode_at3(enc: &Enc, dims: &[usize], cfg: &Gpu3Config, dg: f64, maxabs: Opti
     }
     let header_bytes = w.buf.len();
     for b in &bw {
-        words_le(b, &mut w);
+        w.bytes(b);
     }
     for t in &tp {
         w.bytes(t);
@@ -484,8 +512,12 @@ pub struct Parsed3 {
     pub blocks: Vec<BandInfo>,
     /// Band index of each block.
     pub block_band: Vec<usize>,
-    /// Word range of each block.
+    /// Byte range of each block payload.
     pub block_words: Vec<(usize, usize)>,
+    /// Lanes per block.
+    pub lanes: usize,
+    /// Word ranges of each block's lanes.
+    pub block_lanes: Vec<Vec<(usize, usize)>>,
     /// Outlier tiles.
     pub tiles: Vec<TileRef>,
     /// Header + index bytes.
@@ -535,6 +567,10 @@ pub fn parse3(bytes: &[u8]) -> Result<Parsed3, DecodeError> {
         }
     }
     let resctx = r.u8()? != 0;
+    let lanes = r.varint()? as usize;
+    if lanes == 0 || lanes > 256 {
+        return Err(DecodeError::Invalid("lanes"));
+    }
     let e = r.svarint()? as i32;
     let mean_fix = r.svarint()? as i32;
     let delta_g = r.f64()?;
@@ -543,7 +579,7 @@ pub fn parse3(bytes: &[u8]) -> Result<Parsed3, DecodeError> {
     let corr = r.varint()? as i32;
     let mut sh = Shape::new(d3);
     sh.set_steps(delta_g);
-    let (blocks, block_band) = blocks_of(&sh, cb);
+    let (blocks, block_band) = blocks_of(&sh, cb, lanes);
     let mut preds = vec![[0i32; NTAP]; crate::gpuwav::NKEY];
     for k in used_keys3(&blocks) {
         if r.u8()? != 0 {
@@ -557,13 +593,33 @@ pub fn parse3(bytes: &[u8]) -> Result<Parsed3, DecodeError> {
     let bsz: Vec<usize> = (0..blocks.len()).map(|_| r.varint().map(|v| v as usize)).collect::<Result<_, _>>()?;
     let tsz: Vec<usize> = (0..tg.len()).map(|_| r.varint().map(|v| v as usize)).collect::<Result<_, _>>()?;
     let header_bytes = r.position().next_multiple_of(2);
-    let mut w = header_bytes / 2;
+    let mut off = header_bytes;
     let mut block_words = Vec::with_capacity(blocks.len());
+    let mut block_lanes = Vec::with_capacity(blocks.len());
     for &n in &bsz {
-        block_words.push((w, w + n));
-        w += n;
+        let end = off + n;
+        if end > bytes.len() || n % 2 == 1 {
+            return Err(DecodeError::Truncated);
+        }
+        let mut lv = Vec::with_capacity(lanes);
+        if lanes == 1 {
+            lv.push((off / 2, end / 2));
+        } else {
+            let mut br = ByteReader::new(&bytes[off..end]);
+            let nw: Vec<usize> = (0..lanes).map(|_| br.varint().map(|v| v as usize)).collect::<Result<_, _>>()?;
+            let mut w = (off + br.position().next_multiple_of(2)) / 2;
+            for &k in &nw {
+                lv.push((w, w + k));
+                w += k;
+            }
+            if w * 2 > end {
+                return Err(DecodeError::Truncated);
+            }
+        }
+        block_words.push((off, end));
+        block_lanes.push(lv);
+        off = end;
     }
-    let mut off = w * 2;
     let mut tiles = Vec::with_capacity(tg.len());
     for (ti, (o, d)) in tg.iter().enumerate() {
         let end = off + tsz[ti];
@@ -589,7 +645,7 @@ pub fn parse3(bytes: &[u8]) -> Result<Parsed3, DecodeError> {
         tiles.push(TileRef { origin: *o, dims: *d, words: (ws, ws + nw), bytes: (off, end), esc });
         off = end;
     }
-    Ok(Parsed3 { dims, d3, cb, resctx, e, mean_fix, dl, corr, preds, init, sh, blocks, block_band, block_words, tiles, header_bytes })
+    Ok(Parsed3 { dims, d3, cb, resctx, e, mean_fix, dl, corr, preds, init, sh, blocks, block_band, block_words, lanes, block_lanes, tiles, header_bytes })
 }
 
 // ------------------------------------------------------------------ decode
@@ -610,16 +666,15 @@ impl Ptr {
 }
 
 fn decode_block(ps: &Parsed3, bytes: &[u8], bi: usize, q: Ptr, rs: Ptr, n: usize) -> Result<(), DecodeError> {
-    let (a, b) = ps.block_words[bi];
-    let w = words(bytes, a, b);
-    let mut sink = DecSink { lanes: vec![RansDec::new(&w)] };
+    let lw: Vec<Vec<u16>> = ps.block_lanes[bi].iter().map(|&(a, b)| words(bytes, a, b)).collect();
+    let mut sink = DecSink { lanes: lw.iter().map(|w| RansDec::new(w)).collect() };
     let mut m = ps.init.clone();
     // blocks write disjoint cells and read only coarser levels (decoded
     // before this level started) and their own cells
     let q = unsafe { std::slice::from_raw_parts_mut(q.get(), n) };
     let rs = unsafe { std::slice::from_raw_parts_mut(rs.get(), n) };
-    code_block(&ps.sh, &ps.blocks[bi], q, ps.resctx.then_some(rs), &ps.preds, &mut m, &mut sink);
-    if sink.lanes[0].overrun() {
+    code_block(&ps.sh, &ps.blocks[bi], q, ps.resctx.then_some(rs), &ps.preds, &mut m, ps.lanes, &mut sink);
+    if sink.lanes.iter().any(|l| l.overrun()) {
         return Err(DecodeError::Truncated);
     }
     Ok(())
@@ -852,7 +907,7 @@ pub fn decode3_box_parsed(ps: &Parsed3, bytes: &[u8], lo: [usize; 3], hi: [usize
     for (g0, g1) in ps.level_groups() {
         let items: Vec<usize> = (g0..g1).filter(|&i| want[i]).collect();
         for &i in &items {
-            bytes_read += 2 * (ps.block_words[i].1 - ps.block_words[i].0);
+            bytes_read += ps.block_words[i].1 - ps.block_words[i].0;
         }
         nblk += items.len();
         run_par(&items, threads, |i| decode_block(ps, bytes, i, qp, rp, n))?;
@@ -945,8 +1000,8 @@ mod tests {
         let d = [24, 37, 45];
         let x = field(d);
         for bound in [ErrorBound::Psnr(60.0), ErrorBound::Psnr(95.0), ErrorBound::MaxAbs(1e-3), ErrorBound::MaxAbs(2e-5)] {
-            for (block, resctx) in [(8, true), (16, false), (64, true)] {
-                let cfg = Gpu3Config { block, resctx, tile: 16, ..Gpu3Config::new(bound) };
+            for (block, resctx, lanes) in [(8, true, 1), (16, false, 1), (64, true, 1), (16, true, 4)] {
+                let cfg = Gpu3Config { block, resctx, lanes, tile: 16, ..Gpu3Config::new(bound) };
                 let (bytes, st) = encode3_f32(&x, &d, &cfg, 2);
                 let (_, y) = decode3_f32(&bytes, 1).unwrap();
                 let (rmse, mx) = err(&x, &y);
