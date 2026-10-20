@@ -64,6 +64,8 @@ const DEQUANT_CHUNK: usize = 32 << 20;
 /// Batches up to this many rows run the small-batch GEMM straight off the packed weights
 /// (`gemm_small_*`) instead of dequantizing for cuBLAS; up to 8 rows use the GEMV.
 const SMALL_GEMM_ROWS: usize = 32;
+/// Warps a block of `gemv_q4_xs*` (the kernel source's `Q4_WARPS`).
+const Q4_WARPS: usize = 8;
 
 /// Forwards of up to this many queries use split-KV attention (`attn_multi_*`) instead of the
 /// tiled prefill kernel, which launches too few blocks to stream a long cache quickly.
@@ -249,6 +251,41 @@ impl CudaComputeDevice {
             CudaStorage::Q4(q) => m >= 4 && q.group % 64 == 0 && k % 128 == 0,
             _ => m >= 9 && k % 128 == 0,
         };
+        // 4-bit, up to 8 rows: `gemv_q4_xs4_m{m}`, the same sums whatever m is.
+        if q4 && m <= 8 && k % 8 == 0 {
+            const NAMES: [&str; 8] = [
+                "gemv_q4_xs4_m1",
+                "gemv_q4_xs4_m2",
+                "gemv_q4_xs4_m3",
+                "gemv_q4_xs4_m4",
+                "gemv_q4_xs4_m5",
+                "gemv_q4_xs4_m6",
+                "gemv_q4_xs4_m7",
+                "gemv_q4_xs4_m8",
+            ];
+            if let CudaStorage::Q4(q) = w.storage() {
+                let f = self.llm_func(llm_cuda::GEMV_CUDA, NAMES[m - 1]);
+                let group = q.group as u32;
+                unsafe {
+                    self.stream
+                        .launch_builder(&f)
+                        .arg(x.f32_data())
+                        .arg(&q.packed)
+                        .arg(&q.scales)
+                        .arg(&q.biases)
+                        .arg(out.f32_data_mut())
+                        .arg(&ku)
+                        .arg(&nu)
+                        .arg(&group)
+                        .launch(blocks(
+                            (n.div_ceil(Q4_WARPS * 4), 1, 1),
+                            Q4_WARPS as u32 * 32,
+                        ))
+                        .unwrap();
+                }
+                return Some(self.finish(out));
+            }
+        }
         if m <= SMALL_GEMM_ROWS && cols_ok {
             self.gemm_cols(x, w, &mut out, m, k, n);
             return Some(self.finish(out));

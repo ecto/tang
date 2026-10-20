@@ -1140,8 +1140,8 @@ impl<D: ComputeDevice> Engine<D> {
             }
             segs.push(want);
         }
-        // Prefill chunks share what's left of the budget (at least a block, so a prefill
-        // always moves).
+        // Prefill chunks share what's left of the budget: chunks go to streams in lane order
+        // while some is left (the first always gets one, so a prefill always moves).
         let mut left = budget.saturating_sub(decode_rows).max(crate::blocks::BLOCK);
         for (lane, seg) in lanes.iter_mut().zip(segs.iter_mut()) {
             let st = &mut *lane.stream;
@@ -1164,11 +1164,13 @@ impl<D: ComputeDevice> Engine<D> {
                     continue;
                 }
             }
+            // Whole chunks, as the prompt would be prefilled alone (so its cache holds the same
+            // numbers); the budget says how many streams get one this step.
             let from = st.reuse + st.progress.prefilled;
-            let n = (st.ids.len() - from).min(PREFILL_CHUNK).min(left);
+            let n = (st.ids.len() - from).min(PREFILL_CHUNK);
             st.fed.clear();
             st.fed.extend_from_slice(&st.ids[from..from + n]);
-            left -= n;
+            left = left.saturating_sub(n);
             *seg = Some(false);
         }
         let mut idx = Vec::new();

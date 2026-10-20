@@ -516,9 +516,13 @@ impl<D: ComputeDevice> Model<D> {
                 self.max_ctx
             );
         }
-        // One-token segments first, so `decode_layers` can attend for them in one go.
+        // One-token segments first, so `decode_layers` can attend for them in one go, then the
+        // other short ones (verify windows), then prefill chunks (see `row_groups`).
         let mut order: Vec<usize> = (0..segs.len()).collect();
-        order.sort_by_key(|&i| segs[i].tokens.len() != 1);
+        order.sort_by_key(|&i| {
+            let n = segs[i].tokens.len();
+            (n > SHORT_ROWS, n != 1)
+        });
         let tokens: Vec<u32> = order
             .iter()
             .flat_map(|&i| segs[i].tokens.iter().copied())
@@ -561,7 +565,13 @@ impl<D: ComputeDevice> Model<D> {
         };
         let picked = dev.rms_norm(&picked, &self.norm, n, h, c.rms_norm_eps);
         let head = self.lm_head.as_ref().unwrap_or(&self.embed);
-        let logits = dev.download(&dev.linear(&picked, head, n, h, c.vocab_size));
+        // In pieces of at most SHORT_ROWS rows, so each row's logits come from the kernel a
+        // decode alone would use.
+        let pieces: Vec<(usize, usize)> = (0..n)
+            .step_by(SHORT_ROWS)
+            .map(|r| (r, SHORT_ROWS.min(n - r)))
+            .collect();
+        let logits = dev.download(&self.linear_rows(&picked, head, &pieces, h, c.vocab_size));
         let v = c.vocab_size;
         let mut out = vec![Vec::new(); order.len()];
         let mut o = 0;
@@ -572,6 +582,52 @@ impl<D: ComputeDevice> Model<D> {
             g.cache.tokens.extend_from_slice(g.tokens);
         }
         Ok(out)
+    }
+}
+
+/// Parts of a batch at most this long (decode, verify windows) share their matmuls; longer
+/// ones (prefill chunks) get their own. The 4-bit CUDA kernel for up to this many rows sums
+/// each row the same way whatever the count, so a row's numbers don't depend on its batch.
+const SHORT_ROWS: usize = 8;
+
+/// The row ranges a batch's matmuls run over, for parts `lens` long in order (short ones
+/// first): the short parts together, then each long one alone, at the size it has when its
+/// sequence runs alone.
+fn row_groups(lens: &[usize]) -> Vec<(usize, usize)> {
+    let short: usize = lens.iter().take_while(|&&n| n <= SHORT_ROWS).sum();
+    let mut groups = Vec::new();
+    if short > 0 {
+        groups.push((0, short));
+    }
+    let mut at = short;
+    for &n in lens.iter().skip_while(|&&n| n <= SHORT_ROWS) {
+        groups.push((at, n));
+        at += n;
+    }
+    groups
+}
+
+impl<D: ComputeDevice> Model<D> {
+    /// `x · wᵀ` over `x`'s rows, a separate matmul for each `(first row, rows)` group.
+    fn linear_rows(
+        &self,
+        x: &D::Buffer,
+        w: &D::Buffer,
+        groups: &[(usize, usize)],
+        k: usize,
+        n: usize,
+    ) -> D::Buffer {
+        let dev = &self.dev;
+        let rows: usize = groups.iter().map(|g| g.1).sum();
+        if groups.len() == 1 {
+            return dev.linear(x, w, rows, k, n);
+        }
+        let mut out = dev.alloc_uninit_f32(rows * n);
+        for &(r, m) in groups {
+            let part = dev.slice_buffer(x, r * k, m * k);
+            dev.write_into(&mut out, r * n, &dev.linear(&part, w, m, k, n));
+        }
+        out
     }
 }
 
@@ -618,6 +674,7 @@ impl<D: ComputeDevice> Model<D> {
             seqs.push((ids, table, pos, *n, row));
             row += *n;
         }
+        let groups = row_groups(&seqs.iter().map(|q| q.3).collect::<Vec<_>>());
         // Leading one-token parts (batched decode) attend in one call per layer.
         let singles = if causal {
             seqs.iter().take_while(|q| q.3 == 1).count()
@@ -652,7 +709,7 @@ impl<D: ComputeDevice> Model<D> {
         for (l, w) in self.layers.iter().take(layer_limit).enumerate() {
             let (kp, vp) = pool.layer(l);
             let a = dev.rms_norm(x, &w.attn_norm, s, h, eps);
-            let qkv = dev.linear(&a, &w.wqkv, s, h, qd + 2 * kvd);
+            let qkv = self.linear_rows(&a, &w.wqkv, &groups, h, qd + 2 * kvd);
             let (cos, sin) = &self.ropes[w.rope];
             // Rows the fused call covers (all of them, or a leading run), then the rest one
             // part at a time.
@@ -747,20 +804,20 @@ impl<D: ComputeDevice> Model<D> {
                 }
             }
             let att = att.or(single).expect("a part");
-            let mut o = dev.linear(&att, &w.wo, s, qd, h);
+            let mut o = self.linear_rows(&att, &w.wo, &groups, qd, h);
             if let Some(n) = &w.post_attn_norm {
                 o = dev.rms_norm(&o, n, s, h, eps);
             }
             *x = dev.add_tensors_buf(x, &o, s * h);
 
             let m = dev.rms_norm(x, &w.mlp_norm, s, h, eps);
-            let gu = dev.linear(&m, &w.w_gate_up, s, h, 2 * ff);
+            let gu = self.linear_rows(&m, &w.w_gate_up, &groups, h, 2 * ff);
             let act = if c.is_gemma() {
                 dev.geglu_split(&gu, s, ff)
             } else {
                 dev.swiglu_split(&gu, s, ff)
             };
-            let mut d = dev.linear(&act, &w.w_down, s, ff, h);
+            let mut d = self.linear_rows(&act, &w.w_down, &groups, ff, h);
             if let Some(n) = &w.post_mlp_norm {
                 d = dev.rms_norm(&d, n, s, h, eps);
             }

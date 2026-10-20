@@ -46,10 +46,11 @@ slot's cache out; parked caches stay where they are. The rules:
 every row's logits or just the last). The tokens of all segments are concatenated into
 `[S, hidden]`, one-token segments first. Per layer:
 
-- norms, the QKV projection, the output projection and the MLP run once over all `S` rows: a
-  matrix-vector product becomes a skinny matmul. On CUDA, `linear` already picks the 4-bit GEMV
-  for up to 3 rows, column GEMM (`gemm_cols8/16/32`) up to 32, and cuBLAS above; the weights are
-  read once for all rows. Metal's `linear` likewise. No new matmul kernels.
+- norms, the QKV projection, the output projection and the MLP run once over the short
+  segments' rows (decode and verify windows, up to 8 tokens each): a matrix-vector product
+  becomes a skinny matmul that reads the weights once for all of them. On CUDA, 4-bit weights
+  at 1–8 rows go through `gemv_q4_xs4_m{1..8}`, below. A prefill chunk gets its own matmul at
+  the size it would have alone.
 - the one-token segments (plain decode) go through `ComputeDevice::attention_paged_rows`: QK
   norm, RoPE, the KV write and causal paged attention for every row at its own position over its
   own block table. On CUDA that's three launches per layer for the whole batch
@@ -72,9 +73,10 @@ streams' outputs go into the global automaton once no stream is drafting from it
 
 ### Prefill under a token budget
 
-A prefilling stream's segment is its next chunk. Each step has a token budget (512, the old
-`PREFILL_CHUNK`): decoding streams' rows go in first, then prefill chunks fill what's left (at
-least a block), in lane order. So a long prompt arriving doesn't stall the streams already
+A prefilling stream's segment is its next chunk, always a whole `PREFILL_CHUNK` (512) as when it
+runs alone. Each step has a token budget (512): decoding streams' rows count first, then
+prefilling streams get chunks in lane order while some budget is left (the first always gets
+one, so a step overshoots by at most a chunk). So a long prompt arriving doesn't stall the streams already
 decoding for its whole prefill: they get a token every step while it goes in chunk by chunk.
 
 Images keep the old path: a stream with images prefills in one go inside `admit`.
@@ -113,38 +115,65 @@ serial path. `/node`'s `queue.running` lists every running request. The HTTP API
 
 ## Exactness
 
-A row's numbers must not depend on the other rows. Embedding, norms, activations and the
-attention path are per row. The matmuls aren't always: the CUDA 4-bit GEMV (1–3 rows) and
-`gemm_cols8` (4–8) sum in different orders, so a stream decoded in a batch of 4 sees logits a few
-ulps off its solo ones; cuBLAS (prefill chunks, which now may hold several streams' tokens) picks
-its algorithm by shape. With f32 KV caches (the tests) every output matched on CUDA and Metal.
-With bf16 caches, those ulps can round a key to the neighbouring bf16 value and, over a few hundred
-tokens, flip a near tie: the 256-token bench saw 1 of 8 streams diverge (late) at batch 8 on
-Metal, and some at batch 2–8 on CUDA before the fused attention landed. This is the same effect
-`tests/speculate.rs` documents for verify windows; both outputs are the model's. Making decode
-bitwise batch-invariant would take one matmul kernel for 1–8 rows with a fixed summation order.
+A row's numbers must not depend on the other rows. Embedding, norms, activations and attention
+run per row (the fused decode attention splits each row's keys as its solo decode does). For
+the matmuls:
+
+- `gemv_q4_xs4_m{M}` (CUDA, 4-bit, 1–8 rows) sums each row in the same order for every M, so a
+  decode row in a batch of up to 8 streams gets the bits it gets alone.
+- Prefill chunks get their own matmul at their solo size, and the head runs in pieces of at most
+  8 rows.
+
+So on CUDA with 4-bit weights, plain batched decode matches solo byte for byte, bf16 KV
+included (the bench's 8 streams × 256 tokens: 8/8). What still isn't batch-invariant: verify
+windows when the batch's short rows total more than 8 (`gemm_cols16/32`), bf16 weights
+(`gemv_bf16` vs `gemm_cols`), and Metal's kernels. With bf16 KV those differences can flip a near
+tie late in a long reply, the same effect `tests/speculate.rs` documents for verify windows;
+with f32 KV (the tests) every output matched on CUDA and Metal.
 
 ## Results
 
 `bench_batch`: greedy, essays, 128 tokens per stream after prefill; per-stream is a stream's
 tokens over the decode time, total is the batch's.
 
-Qwen3-8B (mlx-community 4-bit) on the RTX 3090 (`mew`), bf16 KV:
+Qwen3-8B (mlx-community 4-bit) on the RTX 3090 (`mew`), bf16 KV, 256 tokens a stream:
 
 | batch | per-stream tok/s | total tok/s | ms/step | same as alone |
 |------:|-----------------:|------------:|--------:|--------------:|
-| 1 | 97.9 | 97.9 | 10.2 | 1/1 |
-| 2 | 77.5 | 155.0 | 12.9 | 2/2 |
-| 4 | 52.7 | 210.8 | 19.0 | 4/4 |
-| 8 | 49.4 | 395.4 | 20.2 | 8/8 |
+| 1 | 108.3 | 108.3 | 9.2 | 1/1 |
+| 2 | 92.3 | 184.6 | 10.8 | 2/2 |
+| 4 | 71.4 | 285.5 | 14.0 | 4/4 |
+| 8 | 49.4 | 395.0 | 20.3 | 8/8 |
 
-Before the fused decode attention, batch 8 was 309 tok/s (25.9 ms a step).
+How it got there (total tok/s at batch 1 / 2 / 4 / 8, 128-token runs):
+
+| | 1 | 2 | 4 | 8 |
+|--|--:|--:|--:|--:|
+| per-stream attention, `gemv_q4` / `gemm_cols8` | 95 | 141 | 179 | 288 |
+| + fused decode attention | 98 | 155 | 211 | 395 |
+| + `gemv_q4_xs4` | 113 | 191 | 295 | 405 |
+
+`gemv_q4_xs4` (one 4-bit Qwen3-8B matmul, µs; `examples/q4_rows`, old kernel in brackets):
+
+| K × N | m=1 | m=2 | m=4 | m=8 |
+|--|--:|--:|--:|--:|
+| 4096 × 6144 (qkv) | 26.6 [30.9] | 31.5 [37.5] | 44.8 [55.5] | 65.3 [57.2] |
+| 4096 × 4096 (o) | 19.6 [22.9] | 23.9 [31.9] | 30.0 [41.1] | 43.5 [43.3] |
+| 4096 × 24576 (gate+up) | 77.9 [101.3] | 92.0 [119.2] | 128.7 [218.5] | 196.0 [214.0] |
+| 12288 × 4096 (down) | 52.8 [60.3] | 63.5 [101.1] | 78.8 [119.1] | 125.3 [132.1] |
+
+It's a warp per 4 output columns, each word dequantized once for all rows, the rows'
+activations staged in shared memory, and the row count a template parameter (no branches in the
+row loop). At 8 rows it's compute-bound (~2.5x its 1-row time: 8 FMAs a weight plus decode,
+~38% of the 3090's issue rate), so batch 8 barely moves; batches 2–4, where the old kernels paid
+for padding to 8 rows, gain the most. Things that didn't help: replacing the int-to-float
+convert alone, loading activations straight from L1 (they miss to L2: ~800 MB a call at 8 rows),
+and 16-warp blocks. Tensor cores don't buy much on a GA102: with f32 accumulation they run at the
+FP32 FMA rate.
 
 Qwen3-0.6B 4-bit on the M4 (Metal, default per-row attention; M4 times drift ±2x): 279 / 403 /
 450 / 569 tok/s total at batch 1 / 2 / 4 / 8.
 
-Where batch 8's 20 ms goes (nsys): `gemm_cols8_q4` is ~15.6 ms of it (~2x the 1-row GEMV for
-the same weights, ~220 GB/s against the 3090's 936), the rest is norms, adds and launch gaps. The
-batch-4 step costs about what batch 8 does because both use `gemm_cols8`. So the next win is the
-skinny 4-bit matmul itself (e.g. two columns a thread to halve the shared-memory loads per
-weight, or tensor-core MMA with the batch as N=8), not the scheduling.
+At batch 8 the 4-bit matmuls are still ~2/3 of the step. The next step there is a kernel that
+does fewer instructions per weight-row at 8 rows (e.g. two columns a thread with packed
+dequant), or bigger batches (16–32) on a GPU with more FP32 throughput per byte.
