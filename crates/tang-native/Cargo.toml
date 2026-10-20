@@ -12,9 +12,18 @@ tang = { workspace = true }
 tang-compile = { workspace = true }
 tang-expr = { workspace = true }
 tang-gpu = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+parquet = { version = "53", default-features = false, features = ["snap", "zstd", "flate2"], optional = true }
 
 [features]
 default = []
 # run the step on a GPU: wgpu (Metal here), or CUDA via NVRTC with `cuda`
 gpu = ["dep:tang-gpu"]
 cuda = ["gpu", "tang-gpu/cuda"]
+# corpus → token shards: text, and FineWeb-Edu parquet
+tokenize = ["dep:tokenizers"]
+parquet = ["tokenize", "dep:parquet"]
+
+[[bin]]
+name = "tang-native"
+path = "src/main.rs"

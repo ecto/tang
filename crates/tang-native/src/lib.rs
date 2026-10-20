@@ -20,6 +20,9 @@
 //! the same in both. Activations are not fake-quantized while training: the
 //! FHE-faithful eval quantizes them, and on BitNet ±112 cost +0.34%.
 
+pub mod ckpt;
+pub mod compile;
+pub mod data;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod train;

@@ -4,39 +4,11 @@
 //! with `cuda` and a driver is present (mew), wgpu otherwise.
 
 use crate::train::Step;
-use tang_compile::tensor::{Op, TensorGraph, TensorId};
+use tang_compile::tensor::{Op, TensorId};
 use tang_gpu::program::{Program, Runtime};
 // BackendKind is matched by path above
 
-/// The fusion pipeline, keeping `barriers` materialized (tang-bench's
-/// `compile_with_barriers`: the residual stream would otherwise be spliced
-/// into every later reader, O(layers²) work and too many bindings).
-pub fn compile(
-    g: &TensorGraph,
-    outputs: &[TensorId],
-    barriers: &[TensorId],
-) -> (TensorGraph, Vec<TensorId>) {
-    let all: Vec<TensorId> = outputs.iter().chain(barriers).copied().collect();
-    let (g, outs) = g.stabilize_softmax(&all);
-    let (g, outs) = g.substitute_maps(&outs);
-    let (g, outs) = g.eliminate_common(&outs);
-    let (g, outs) = g.merge_siblings(&outs);
-    let (g, outs) = g.relayout(&outs);
-    let (g, outs) = g.merge_reduce_dims(&outs);
-    let (mut g, mut outs) = g.split_reduce_dims(&outs);
-    g.schedule_auto(&outs);
-    outs.truncate(outputs.len());
-    (g, outs)
-}
-
-fn input_node(g: &TensorGraph, k: usize) -> TensorId {
-    let i = g
-        .nodes()
-        .iter()
-        .position(|n| matches!(n.op, Op::Input(j) if j == k))
-        .expect("every input survives the passes");
-    TensorId::from_index(i)
-}
+pub use crate::compile::{compile, input_node};
 
 pub struct GpuTrainer {
     pub rt: Runtime,
@@ -136,5 +108,59 @@ impl GpuTrainer {
     pub fn write_input(&self, t: TensorId, v: &[f32]) {
         let k = self.step.input_index(t);
         self.prog.write(&self.rt, self.prog.input(k), v);
+    }
+}
+
+/// The model's loss alone (no update), compiled once, for validation.
+pub struct GpuEval {
+    rt: Runtime,
+    prog: Program,
+    model: crate::Model,
+    loss: TensorId,
+}
+
+impl GpuEval {
+    pub fn new(model: crate::Model, values: &[Vec<f32>]) -> Result<GpuEval, String> {
+        let rt = Runtime::select().map_err(|e| format!("no GPU runtime: {e:?}"))?;
+        let (g, outs) = compile(
+            &model.graph,
+            &[model.loss],
+            &model.boundaries[..model.config.layers],
+        );
+        let lowered = rt.lower(&g, &outs);
+        let plan = g.plan_memory(&lowered, &outs, &[]);
+        let inputs: Vec<&[f32]> = values.iter().map(|v| v.as_slice()).collect();
+        let prog = Program::planned(&rt, lowered, &inputs, &plan);
+        Ok(GpuEval {
+            rt,
+            prog,
+            loss: outs[0],
+            model,
+        })
+    }
+
+    fn input_index(&self, t: TensorId) -> usize {
+        match self.model.graph.nodes()[t.index()].op {
+            Op::Input(k) => k,
+            _ => panic!("not an input"),
+        }
+    }
+
+    /// Set a parameter by name (from the trainer).
+    pub fn set(&self, name: &str, v: &[f32]) {
+        if let Some(p) = self.model.params.iter().find(|p| p.name == name) {
+            let k = self.input_index(p.id);
+            self.prog.write(&self.rt, self.prog.input(k), v);
+        }
+    }
+
+    pub fn loss(&self, tokens: &[u32], targets: &[u32]) -> f32 {
+        let tk: Vec<f32> = tokens.iter().map(|&x| x as f32).collect();
+        let tg: Vec<f32> = targets.iter().map(|&x| x as f32).collect();
+        let (rt, p) = (&self.rt, &self.prog);
+        p.write(rt, p.input(self.input_index(self.model.tokens)), &tk);
+        p.write(rt, p.input(self.input_index(self.model.targets)), &tg);
+        p.run(rt);
+        p.read(rt, self.loss)[0]
     }
 }

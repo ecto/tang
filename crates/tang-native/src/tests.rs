@@ -368,45 +368,33 @@ fn the_gpu_runner_matches_the_interpreter() {
     }
 }
 
-#[cfg(feature = "gpu")]
+/// The fusion passes compile the real step at realistic sequence lengths.
+/// Before tang-compile's merge_siblings fix this panicked from seq 16 up:
+/// softmax's backward reduces exp(x − max) twice, once through the other,
+/// and the two were merged into one node that read its own output.
 #[test]
-#[ignore]
-fn dump_wide_kernels() {
+fn the_passes_compile_real_attention() {
     use crate::train::{Hyper, Step};
-    let c = Config {
-        vocab: 7,
-        d: 16,
-        layers: 2,
-        heads: 2,
-        ff: 32,
-        seq: 8,
-        batch: 2,
-    };
-    let st = Step::new(c, Variant::TWIN, Hyper::default(), false);
-    let b: Vec<_> = st
-        .model
-        .boundaries
-        .iter()
-        .chain(&st.norm_partials)
-        .copied()
-        .collect();
-    let (g, outs) = crate::gpu::compile(&st.model.graph, &st.outputs(), &b);
-    let prog = g.to_wgsl(&outs);
-    for k in prog.kernels.iter().filter(|k| k.reads.len() + 1 > 16) {
-        let names: Vec<String> = k
-            .reads
-            .iter()
-            .map(|r| {
-                let n = &g.nodes()[r.index()];
-                format!("{}{:?}", r.index(), n.shape)
-            })
-            .collect();
-        eprintln!(
-            "node {} {:?} reads {}: {:?}",
-            k.node.index(),
-            g.nodes()[k.node.index()].shape,
-            k.reads.len(),
-            names
-        );
+    for v in [Variant::TWIN, Variant::NATIVE] {
+        for (seq, batch) in [(16, 2), (64, 1)] {
+            let c = Config {
+                vocab: 7,
+                d: 16,
+                layers: 1,
+                heads: 2,
+                ff: 64,
+                seq,
+                batch,
+            };
+            let st = Step::new(c, v, Hyper::default(), false);
+            let b: Vec<_> = st
+                .model
+                .boundaries
+                .iter()
+                .chain(&st.norm_partials)
+                .copied()
+                .collect();
+            let _ = crate::compile::compile(&st.model.graph, &st.outputs(), &b);
+        }
     }
 }
