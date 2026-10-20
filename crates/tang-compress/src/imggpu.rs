@@ -545,7 +545,7 @@ impl ImgGpu {
         rx.recv().unwrap().unwrap();
         let data = slice.get_mapped_range();
         let mut v = Vec::with_capacity(pr.npx * 3);
-        for c in data.chunks_exact(4) {
+        for c in data.as_chunks::<4>().0 {
             v.extend_from_slice(&c[..3]);
         }
         v

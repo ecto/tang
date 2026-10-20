@@ -69,7 +69,7 @@ impl Ccx {
             let nd = r.u8()? as usize;
             let shape: Vec<usize> = (0..nd).map(|_| le32(&mut r).map(|v| v as usize)).collect::<Result<_, _>>()?;
             let cnt: usize = shape.iter().product();
-            let data = r.take(cnt * 8)?.chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect();
+            let data = r.take(cnt * 8)?.as_chunks::<8>().0.iter().map(|c| f64::from_le_bytes(*c)).collect();
             t.insert(name, (shape, data));
         }
         Ok(Self { t })
@@ -335,7 +335,7 @@ impl Mlp {
     }
     fn read(r: &mut BitReader) -> Result<Self, DecodeError> {
         let nl = eg_get(r, 0)? as usize;
-        let fl = (eg_get(r, 0)? as u8);
+        let fl = eg_get(r, 0)? as u8;
         let mut ls = vec![];
         for _ in 0..nl + (fl & 1) as usize {
             let out = eg_get(r, 0)? as usize;
@@ -394,7 +394,7 @@ impl Conv {
         let out = eg_get(r, 0)? as usize;
         let cin = eg_get(r, 0)? as usize;
         let k = eg_get(r, 0)? as usize;
-        let fl = (eg_get(r, 0)? as u8);
+        let fl = eg_get(r, 0)? as u8;
         let fw = eg_get(r, 0)? as u32;
         if out > 128 || cin > 128 || !(k == 1 || k == 3) || fw > 24 {
             return Err(DecodeError::Invalid("conv dims"));
@@ -770,6 +770,7 @@ impl Layout {
 /// Gather the ARM input for global `(y, x)` of a grid (values so far in
 /// `lat`, context cut at the tile border) into `buf` (`Q8`).
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub fn arm_input(m: &Model, lay: &Layout, lat: &[i32], ifc: &[i32], y: usize, x: usize, tile: usize, buf: &mut [i32]) {
     let (y0, x0, th, tw) = lay.tile(tile);
     for (i, &(dy, dx)) in m.ctx.iter().enumerate() {
@@ -893,7 +894,7 @@ fn read_model(r: &mut BitReader) -> Result<Model, DecodeError> {
             return Err(bad("grid size"));
         }
         sizes.push((a, b));
-        let f = (eg_get(r, 0)? as u8);
+        let f = eg_get(r, 0)? as u8;
         hyper.push(f & 1 != 0);
         ifce_of.push((f >> 1 != 0).then(|| (f >> 1) as usize - 1));
     }
@@ -954,7 +955,7 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed, DecodeError> {
         acc = acc.checked_add(r.varint()? as u32).ok_or(DecodeError::Invalid("lanes"))?;
     }
     let raw = r.take(acc as usize * 2)?;
-    let words = raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let words = raw.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
     for g in 0..m.sizes.len() {
         let lay = Layout::new(m.sizes[g].0, m.sizes[g].1, &m);
         if lay.nt > m.lanes {
@@ -1094,6 +1095,7 @@ pub fn upsample(m: &Model, grids: &[Vec<i32>], gd: &mut Guard) -> Vec<Vec<i64>> 
     up
 }
 
+#[allow(clippy::too_many_arguments)]
 fn conv_px(c: &Conv, inp: &[Vec<i64>], h: usize, w: usize, y: usize, x: usize, o: usize, gd: &mut Guard) -> i64 {
     let l = &c.lin;
     let cin = c.cin();
@@ -1476,7 +1478,7 @@ pub(crate) mod tests {
         put(&mut t, "n_ifce_out", &[1], vec![2.0]);
         put(&mut t, "ifce.input_features", &[4], vec![3.0, 0.0, 0.0, 0.0]);
         put(&mut t, "ifce.index_to_arm", &[4], vec![0.0, -1.0, -1.0, -1.0]);
-        let mut lin = |t: &mut HashMap<_, _>, r: &mut Rng, p: &str, o: usize, i: usize, a: i64| {
+        let lin = |t: &mut HashMap<_, _>, r: &mut Rng, p: &str, o: usize, i: usize, a: i64| {
             put(t, &format!("{p}.w"), &[o, i], (0..o * i).map(|_| r.q(a)).collect());
             put(t, &format!("{p}.b"), &[o], (0..o).map(|_| r.q(a)).collect());
         };
@@ -1487,11 +1489,11 @@ pub(crate) mod tests {
         lin(&mut t, &mut r, "arm.L2", 2, nin, 30);
         lin(&mut t, &mut r, "arm.stab", 2, nin, 10);
         for i in 0..2 {
-            let a = [0.0351562, 0.1054687, -0.2617187, -0.8789063].map(|v: f64| (v * 64.0).round() / 64.0 * -1.0);
+            let a = [0.0351562, 0.1054687, -0.2617187, -0.8789063].map(|v: f64| -((v * 64.0).round() / 64.0));
             put(&mut t, &format!("ups.tconv.{i}"), &[8], [a[0], a[1], a[2], a[3], a[3], a[2], a[1], a[0]].to_vec());
             put(&mut t, &format!("ups.conv.{i}"), &[7], (0..7).map(|k| if k == 3 { 0.25 } else { r.q(4) }).collect());
         }
-        let mut conv = |t: &mut HashMap<_, _>, r: &mut Rng, p: &str, o: usize, i: usize, k: usize, res: bool, relu: bool| {
+        let conv = |t: &mut HashMap<_, _>, r: &mut Rng, p: &str, o: usize, i: usize, k: usize, res: bool, relu: bool| {
             put(t, &format!("{p}.w"), &[o, i, k, k], (0..o * i * k * k).map(|_| r.q(30)).collect());
             put(t, &format!("{p}.b"), &[o], (0..o).map(|_| r.q(30)).collect());
             put(t, &format!("{p}.meta"), &[2], vec![res as u8 as f64, relu as u8 as f64]);
