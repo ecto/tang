@@ -52,6 +52,34 @@ fn opt(args: &[String], k: &str, d: &str) -> String {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mode = args[0].as_str();
+    #[cfg(feature = "gpu")]
+    if mode == "gpu3" {
+        // gpubench gpu3 STREAM... [--model3 pretrained:PATH]: GPU decode vs saved hash, kernel timing
+        for p in args.iter().filter_map(|a| a.strip_prefix("pretrained:")) {
+            tang_compress::learned::register(std::sync::Arc::new(tang_compress::learned::Net::from_bytes(&std::fs::read(p).unwrap()).unwrap()));
+        }
+        let reps: usize = opt(&args, "--reps", "3").parse().unwrap();
+        for f in args[1..].iter().filter(|a| a.ends_with(".tcg3")) {
+            let b = std::fs::read(f).unwrap();
+            let want = std::fs::read_to_string(format!("{f}.hash")).unwrap();
+            let ps = gpuwav3::parse3(&b).unwrap();
+            let g = tang_compress::gpudec::GpuDecoder::new(ps.lanes, ps.d3.iter().copied().max().unwrap()).unwrap();
+            let (v, _) = g.decode3(&b).unwrap();
+            let h = v.iter().fold(0xcbf29ce484222325u64, |h, &x| (h ^ x as u64).wrapping_mul(0x100000001b3));
+            let mut t2 = tang_compress::gpudec::GpuTimes::default();
+            let pr = g.prepare3(&ps, &b, &mut t2);
+            let kern = (0..reps).map(|_| g.run3(&pr)).fold(f64::INFINITY, f64::min);
+            let mut tot = f64::INFINITY;
+            for _ in 0..reps {
+                let t0 = Instant::now();
+                let _ = g.decode3(&b).unwrap();
+                tot = tot.min(t0.elapsed().as_secs_f64());
+            }
+            let gb = v.len() as f64 * 4.0 / 1e9;
+            println!("{{\"stream\":\"{f}\",\"identical\":{},\"kernels_s\":{kern},\"kernels_gbs\":{},\"total_gbs\":{}}}", format!("{h:016x}") == want.trim(), gb / kern, gb / tot);
+        }
+        return;
+    }
     let x = read_f32(&args[1]);
     let dims: Vec<usize> = args[2].split('x').map(|s| s.parse().unwrap()).collect();
     let name = std::path::Path::new(&args[1]).file_stem().unwrap().to_string_lossy().to_string();
@@ -365,6 +393,18 @@ fn main() {
                     assert!(diff == 0 && ok_bound && ra_ok, "{name} {t} {bk}");
                 }
             }
+        }
+        "encode3" => {
+            // write a v3 stream for later GPU-only timing: gpubench encode3 FIELD dims OUT --bricks B --targets T ...
+            let out = opt(&args, "--out", "out.tcg3");
+            let t = targets.split(',').next().unwrap();
+            let bound = if let Some(p) = t.strip_prefix('p') { ErrorBound::Psnr(p.parse().unwrap()) } else { ErrorBound::MaxAbs(t[1..].parse::<f64>().unwrap() * range) };
+            let (b, st) = gpuwav3::encode3_f32(&x, &dims, &cfg3_of(bound, bricks[0], &args), threads);
+            std::fs::write(&out, &b).unwrap();
+            let (_, y) = gpuwav3::decode3_f32(&b, threads).unwrap();
+            let h = y.iter().fold(0xcbf29ce484222325u64, |h, v| (h ^ v.to_bits() as u64).wrapping_mul(0x100000001b3));
+            std::fs::write(format!("{out}.hash"), format!("{h:016x}")).unwrap();
+            println!("{{\"out\":\"{out}\",\"bpv\":{},\"hash\":\"{h:016x}\"}}", st.bits_per_value);
         }
         _ => panic!("mode"),
     }

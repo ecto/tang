@@ -34,6 +34,10 @@ pub struct GpuDecoder {
     pub name: String,
     lanes: usize,
     maxl: usize,
+    src: String,
+    pl: wgpu::PipelineLayout,
+    /// Pipelines specialized to a learned net (weights as literals), by flat net.
+    spec: std::sync::Mutex<Vec<(Vec<u32>, std::sync::Arc<(wgpu::ComputePipeline, wgpu::ComputePipeline)>)>>,
 }
 
 /// Stream state uploaded to the GPU.
@@ -119,10 +123,8 @@ impl GpuDecoder {
             .map_err(|e| format!("device: {e}"))?;
         let info = adapter.get_info();
         let name = format!("{} ({:?})", info.name, info.backend);
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("tc-gpu"),
-            source: wgpu::ShaderSource::Wgsl(shader_src(lanes, maxl).into()),
-        });
+        let src = shader_src(lanes, maxl);
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("tc-gpu"), source: wgpu::ShaderSource::Wgsl(src.clone().into()) });
         let st = |b: u32, ro: bool| wgpu::BindGroupLayoutEntry {
             binding: b,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -172,7 +174,7 @@ impl GpuDecoder {
                 (e.to_string(), p)
             })
             .collect();
-        Ok(Self { device, queue, layout, pipes, name, lanes, maxl })
+        Ok(Self { device, queue, layout, pipes, name, lanes, maxl, src, pl, spec: std::sync::Mutex::new(Vec::new()) })
     }
 
     fn pipe(&self, n: &str) -> &wgpu::ComputePipeline {
@@ -393,6 +395,18 @@ impl GpuDecoder {
     }
 
     fn submit(&self, pr: &Prepared, jobs: &[(&str, Vec<u32>, [u32; 3])]) -> f64 {
+        self.submit_with(pr, jobs, None)
+    }
+
+    fn pick<'a>(&'a self, n: &str, spec: Option<&'a (wgpu::ComputePipeline, wgpu::ComputePipeline)>) -> &'a wgpu::ComputePipeline {
+        match (n, spec) {
+            ("decode3", Some(p)) => &p.0,
+            ("decode3l", Some(p)) => &p.1,
+            _ => self.pipe(n),
+        }
+    }
+
+    fn submit_with(&self, pr: &Prepared, jobs: &[(&str, Vec<u32>, [u32; 3])], spec: Option<&(wgpu::ComputePipeline, wgpu::ComputePipeline)>) -> f64 {
         let binds: Vec<wgpu::BindGroup> = jobs.iter().map(|j| self.bind(pr, &j.1)).collect();
         if std::env::var("TC_GPU_PROFILE").is_ok() {
             let mut acc: Vec<(&str, f64)> = Vec::new();
@@ -401,7 +415,7 @@ impl GpuDecoder {
                 let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
                 {
                     let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
-                    pass.set_pipeline(self.pipe(j.0));
+                    pass.set_pipeline(self.pick(j.0, spec));
                     pass.set_bind_group(0, bg, &[]);
                     pass.dispatch_workgroups(j.2[0], j.2[1], j.2[2]);
                 }
@@ -419,7 +433,7 @@ impl GpuDecoder {
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         for (j, bg) in jobs.iter().zip(&binds) {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
-            pass.set_pipeline(self.pipe(j.0));
+            pass.set_pipeline(self.pick(j.0, spec));
             pass.set_bind_group(0, bg, &[]);
             pass.dispatch_workgroups(j.2[0], j.2[1], j.2[2]);
         }
@@ -640,7 +654,33 @@ impl GpuDecoder {
         };
         let _ = self.device.poll(wgpu::PollType::Wait);
         times.upload_s += t1.elapsed().as_secs_f64();
-        Prepared3 { base, groups: ps.level_groups(), nblocks: ps.blocks.len(), ntiles: ps.tiles.len(), lanes: ps.lanes }
+        Prepared3 { base, groups: ps.level_groups(), nblocks: ps.blocks.len(), ntiles: ps.tiles.len(), lanes: ps.lanes, net: ps.net.clone() }
+    }
+
+    /// decode3/decode3l pipelines with the net's MLP as straight-line code.
+    fn spec_pipes(&self, net: &crate::lmodel3::Net32) -> std::sync::Arc<(wgpu::ComputePipeline, wgpu::ComputePipeline)> {
+        let key = net.flat();
+        let mut c = self.spec.lock().unwrap();
+        if let Some(p) = c.iter().find(|e| e.0 == key) {
+            return p.1.clone();
+        }
+        let a = self.src.find("// MLP_BEGIN").unwrap();
+        let b = self.src.find("// MLP_END").unwrap();
+        let src = format!("{}{}{}", &self.src[..a], gen_mlp(net), &self.src[b..]);
+        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("tc-gpu-mlp"), source: wgpu::ShaderSource::Wgsl(src.into()) });
+        let mk = |e: &str| {
+            self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(e),
+                layout: Some(&self.pl),
+                module: &module,
+                entry_point: Some(e),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        let p = std::sync::Arc::new((mk("decode3"), mk("decode3l")));
+        c.push((key, p.clone()));
+        p
     }
 
     /// Run the v3 kernels; returns the kernel wall time.
@@ -677,8 +717,40 @@ impl GpuDecoder {
         if b.nesc > 0 {
             jobs.push(("escapes", b.params.clone(), [b.nesc.div_ceil(64) as u32, 1, 1]));
         }
-        self.submit(b, &jobs)
+        let spec = if std::env::var("TC_GPU_NOSPEC").is_ok() { None } else { pr.net.as_ref().map(|n| self.spec_pipes(n)) };
+        self.submit_with(b, &jobs, spec.as_deref())
     }
+}
+
+/// Straight-line WGSL for the net: weights and biases as literals, no
+/// memory traffic, same wrapping i32 arithmetic (integer addition is
+/// associative, so term order and dropped zero terms do not change a bit).
+fn gen_mlp(net: &crate::lmodel3::Net32) -> String {
+    use std::fmt::Write;
+    let mut s = String::from("fn mlp_gen() {\n");
+    for i in 0..net.sizes[0] {
+        let _ = writeln!(s, "    let a0_{i} = na[{i}];");
+    }
+    let nl = net.sizes.len() - 1;
+    for l in 0..nl {
+        let (ni, no) = (net.sizes[l], net.sizes[l + 1]);
+        let (lo, hi) = if l + 1 < nl { (0, 16384) } else { (-16384, 16384) };
+        for o in 0..no {
+            let mut e = format!("({})", net.b[l][o]);
+            for i in 0..ni {
+                let w = net.w[l][o * ni + i];
+                if w != 0 {
+                    let _ = write!(e, " + ({w}) * a{l}_{i}");
+                }
+            }
+            let _ = writeln!(s, "    let a{}_{o} = clamp(({e} + 128) >> 8u, {lo}, {hi});", l + 1);
+        }
+    }
+    for o in 0..net.sizes[nl] {
+        let _ = writeln!(s, "    na[{o}] = a{nl}_{o};");
+    }
+    s.push_str("}\n");
+    s
 }
 
 /// A v3 stream uploaded to the GPU.
@@ -688,6 +760,7 @@ pub struct Prepared3 {
     nblocks: usize,
     ntiles: usize,
     lanes: usize,
+    net: Option<crate::lmodel3::Net32>,
 }
 
 fn as_bytes(v: &[u32]) -> &[u8] {

@@ -991,7 +991,47 @@ fn learned_res(raw: array<i32, 18>, cls: u32) -> i32 {
     na[17] = raw[17] * 256;
     na[18u + min(cls, 9u)] = 256;
     for (var i = 0u; i < 28u; i = i + 1u) { na[i] = clamp(na[i], -16384, 16384); }
-    // MLP
+    mlp_gen();
+    mx_pi = sig16(na[0]) >> 1u;
+    mx_mu0 = na[1]; mx_mu1 = na[2]; mx_ls0 = na[3]; mx_ls1 = na[4];
+    // binarization
+    let c0 = lcdf(0);
+    let cm1 = lcdf(-1);
+    let pz = select(0u, c0 - cm1, c0 > cm1);
+    if (!dbit_p(ratio16(65536u - pz, 65536u))) { return 0; }
+    let posm = 65536u - c0;
+    l_neg = dbit_p(ratio16(cm1, cm1 + posm));
+    // tails are carried between steps: same values, fewer CDF evaluations
+    var k = 0u;
+    var ta = ltail(1u);
+    var tb = 0u;
+    loop {
+        if (k >= 30u) { break; }
+        tb = ltail(1u << (k + 1u));
+        if (!dbit_p(ratio16(tb, ta))) { break; }
+        ta = tb;
+        k = k + 1u;
+    }
+    var lo = 1u << k;
+    var hi = (1u << k) + ((1u << k) - 1u);
+    // tail(lo) = ta; tail(hi + 1) = tb (k < 30) or tail(2^31) = 0 (k = 30)
+    var tl = ta;
+    var end = select(0u, tb, k < 30u);
+    loop {
+        if (lo >= hi) { break; }
+        let mid = lo + (hi - lo + 1u) / 2u;
+        let tm = ltail(mid);
+        let up = select(0u, tm - end, tm > end);
+        let all = select(0u, tl - end, tl > end);
+        if (dbit_p(ratio16(up, all))) { lo = mid; tl = tm; } else { hi = mid - 1u; end = tm; }
+    }
+    if (l_neg) { return -bitcast<i32>(lo); }
+    return bitcast<i32>(lo);
+}
+
+// MLP_BEGIN (generic version; the host substitutes a straight-line version
+// with the stream's weights as literals)
+fn mlp_gen() {
     let base = P.pad4 + 2u;
     let nl = mt[base];
     var wo = base + 2u + nl;
@@ -1008,35 +1048,5 @@ fn learned_res(raw: array<i32, 18>, cls: u32) -> i32 {
         for (var o = 0u; o < no; o = o + 1u) { na[o] = nb[o]; }
         wo = bo + no;
     }
-    mx_pi = sig16(na[0]) >> 1u;
-    mx_mu0 = na[1]; mx_mu1 = na[2]; mx_ls0 = na[3]; mx_ls1 = na[4];
-    // binarization
-    let c0 = lcdf(0);
-    let cm1 = lcdf(-1);
-    let pz = select(0u, c0 - cm1, c0 > cm1);
-    if (!dbit_p(ratio16(65536u - pz, 65536u))) { return 0; }
-    let posm = 65536u - c0;
-    l_neg = dbit_p(ratio16(cm1, cm1 + posm));
-    var k = 0u;
-    loop {
-        if (k >= 30u) { break; }
-        let a = ltail(1u << k);
-        let bb = ltail(1u << (k + 1u));
-        if (!dbit_p(ratio16(bb, a))) { break; }
-        k = k + 1u;
-    }
-    var lo = 1u << k;
-    var hi = (1u << k) + ((1u << k) - 1u);
-    loop {
-        if (lo >= hi) { break; }
-        let mid = lo + (hi - lo + 1u) / 2u;
-        let end = ltail(hi + 1u);
-        let tm = ltail(mid);
-        let tl = ltail(lo);
-        let up = select(0u, tm - end, tm > end);
-        let all = select(0u, tl - end, tl > end);
-        if (dbit_p(ratio16(up, all))) { lo = mid; } else { hi = mid - 1u; }
-    }
-    if (l_neg) { return -bitcast<i32>(lo); }
-    return bitcast<i32>(lo);
 }
+// MLP_END
