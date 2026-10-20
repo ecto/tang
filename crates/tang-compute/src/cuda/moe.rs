@@ -12,6 +12,10 @@ pub(super) fn host_op(op: &str) -> bool {
     std::env::var("TANG_MOE_HOST").is_ok_and(|v| v.split(',').any(|o| o == op || o == "all"))
 }
 
+/// Launches with more picks than this (prefill chunks) run one GEMM per expert instead of
+/// the GEMV; decode and verify windows (up to 8 rows, so 32 picks at top-4) stay on the GEMV.
+const GEMM_PICKS: usize = 128;
+
 /// Rows a launch of the sink kernels covers (bounds the split partials' scratch).
 const SINK_ROWS: usize = 64;
 
@@ -253,6 +257,11 @@ impl CudaComputeDevice {
                 .launch(grid((1, 1, 1), 1024))
                 .unwrap();
         }
+        if picks > GEMM_PICKS && !host_op("gemm-off") {
+            return Some(
+                self.moe_gemm_mxfp4(x, w, experts, bias, ids, &off, &list, k_top, k, n, per_pick),
+            );
+        }
         let mut y = self.pool_alloc_uninit_f32(picks * n);
         let (kt, k_u, n_u, pp, hb) = (
             k_top as u32,
@@ -281,6 +290,96 @@ impl CudaComputeDevice {
                 .unwrap();
         }
         Some(y)
+    }
+
+    /// [`moe_linear_llm`](Self::moe_linear_llm) for many picks: gather each expert's input
+    /// rows, widen the expert to f32 once, one `linear` (cuBLAS) per expert, scatter back.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_gemm_mxfp4(
+        &self,
+        x: &CudaBuffer,
+        w: &CudaBuffer,
+        experts: usize,
+        bias: Option<&CudaBuffer>,
+        ids: &CudaBuffer,
+        off: &CudaBuffer,
+        list: &CudaBuffer,
+        k_top: usize,
+        k: usize,
+        n: usize,
+        per_pick: bool,
+    ) -> CudaBuffer {
+        use crate::ComputeDevice as _;
+        let picks = ids.len;
+        let offs: Vec<usize> = self
+            .download(off)
+            .iter()
+            .map(|v| v.to_bits() as usize)
+            .collect();
+        let gather = self.llm_func(moe_cuda::MOE_CUDA, "moe_gather");
+        let deq = self.llm_func(moe_cuda::MOE_CUDA, "moe_dequant_mxfp4");
+        let scatter = self.llm_func(moe_cuda::MOE_CUDA, "moe_scatter");
+        let mut xg = self.pool_alloc_uninit_f32(picks * k);
+        let (kt, k_u, n_u, e_u, pp) = (
+            k_top as u32,
+            k as u32,
+            n as u32,
+            experts as u32,
+            per_pick as u32,
+        );
+        unsafe {
+            self.stream
+                .launch_builder(&gather)
+                .arg(x.f32_data())
+                .arg(list.f32_data())
+                .arg(xg.f32_data_mut())
+                .arg(&kt)
+                .arg(&k_u)
+                .arg(&pp)
+                .launch(grid((picks, 1, 1), 256))
+                .unwrap();
+        }
+        let mut yg = self.pool_alloc_uninit_f32(picks * n);
+        let mut wf = self.pool_alloc_uninit_f32(n * k);
+        for e in 0..experts {
+            let (p0, p1) = (offs[e], offs[e + 1]);
+            if p0 == p1 {
+                continue;
+            }
+            let eu = e as u32;
+            unsafe {
+                self.stream
+                    .launch_builder(&deq)
+                    .arg(w.f32_data())
+                    .arg(wf.f32_data_mut())
+                    .arg(&eu)
+                    .arg(&k_u)
+                    .arg(&n_u)
+                    .arg(&e_u)
+                    .launch(per_elem(n * k / 32))
+                    .unwrap();
+            }
+            let xe = self.slice_buffer(&xg, p0 * k, (p1 - p0) * k);
+            let ye = self.linear(&xe, &wf, p1 - p0, k, n);
+            self.write_into(&mut yg, p0 * n, &ye);
+        }
+        let mut y = self.pool_alloc_uninit_f32(picks * n);
+        let hb = bias.is_some() as u32;
+        let b = bias.unwrap_or(x);
+        unsafe {
+            self.stream
+                .launch_builder(&scatter)
+                .arg(yg.f32_data())
+                .arg(list.f32_data())
+                .arg(ids.f32_data())
+                .arg(b.f32_data())
+                .arg(y.f32_data_mut())
+                .arg(&n_u)
+                .arg(&hb)
+                .launch(grid((picks, 1, 1), 256))
+                .unwrap();
+        }
+        y
     }
 
     pub(super) fn swiglu_clamped_llm(
