@@ -41,7 +41,11 @@ pub(crate) fn un(op: UnOp, t: IType, a: u32) -> u32 {
 }
 
 pub(crate) fn cmp(op: CmpOp, t: IType, a: u32, b: u32) -> u32 {
-    let o = if t == IType::I32 { (a as i32).cmp(&(b as i32)) } else { a.cmp(&b) };
+    let o = if t == IType::I32 {
+        (a as i32).cmp(&(b as i32))
+    } else {
+        a.cmp(&b)
+    };
     (match op {
         CmpOp::Eq => o.is_eq(),
         CmpOp::Ne => o.is_ne(),
@@ -125,13 +129,26 @@ impl Program {
                 *c - 1
             })
             .collect();
-        let mut c = Compiler { g, ops: Vec::new(), state, nregs: n as u32 + 1, consts: vec![(n as u32, 1)], one: n as u32, bidx };
+        let mut c = Compiler {
+            g,
+            ops: Vec::new(),
+            state,
+            nregs: n as u32 + 1,
+            consts: vec![(n as u32, 1)],
+            one: n as u32,
+            bidx,
+        };
         c.items(&sched.items);
         regs.resize(c.nregs as usize, 0);
         for &(r, v) in &c.consts {
             regs[r as usize] = v;
         }
-        Self { ops: c.ops, regs, params, outs: outputs.iter().map(|o| o.0).collect() }
+        Self {
+            ops: c.ops,
+            regs,
+            params,
+            outs: outputs.iter().map(|o| o.0).collect(),
+        }
     }
 
     /// Run with `params` (bits, by param index) and buffers; writes the
@@ -142,7 +159,13 @@ impl Program {
 
     /// [`Self::run`] for a graph with scratch buffers: `bufs` are the
     /// read-only buffers and `rw` the scratch ones, each in declaration order.
-    pub fn run_rw(&mut self, params: &[u32], bufs: &[&[u32]], rw: &mut [&mut [u32]], out: &mut [u32]) {
+    pub fn run_rw(
+        &mut self,
+        params: &[u32],
+        bufs: &[&[u32]],
+        rw: &mut [&mut [u32]],
+        out: &mut [u32],
+    ) {
         let r = &mut self.regs;
         for &(p, i) in &self.params {
             r[i as usize] = params[p as usize];
@@ -153,12 +176,22 @@ impl Program {
                 Op::Bin(op, t, d, a, b) => r[d as usize] = bin(op, t, r[a as usize], r[b as usize]),
                 Op::Un(op, t, d, a) => r[d as usize] = un(op, t, r[a as usize]),
                 Op::Cmp(op, t, d, a, b) => r[d as usize] = cmp(op, t, r[a as usize], r[b as usize]),
-                Op::Sel(d, c, a, b) => r[d as usize] = if r[c as usize] != 0 { r[a as usize] } else { r[b as usize] },
+                Op::Sel(d, c, a, b) => {
+                    r[d as usize] = if r[c as usize] != 0 {
+                        r[a as usize]
+                    } else {
+                        r[b as usize]
+                    }
+                }
                 Op::Mov(d, a) => r[d as usize] = r[a as usize],
                 Op::Load(e, b, d, i) => r[d as usize] = load(e, bufs[b as usize], r[i as usize]),
                 Op::LoadRw(b, n, d, i) => {
                     let i = r[i as usize];
-                    r[d as usize] = if i < n { rw[b as usize].get(i as usize).copied().unwrap_or(0) } else { 0 };
+                    r[d as usize] = if i < n {
+                        rw[b as usize].get(i as usize).copied().unwrap_or(0)
+                    } else {
+                        0
+                    };
                 }
                 Op::Store(b, n, i, v, d) => {
                     let i = r[i as usize];
@@ -222,8 +255,19 @@ impl Compiler<'_> {
             INode::Select(c, a, b) => Op::Sel(d, c.0, a.0, b.0),
             INode::Bitcast(_, a) => Op::Mov(d, a.0),
             INode::Load(b, i) => Op::Load(g.bufs[b as usize].elem, self.bidx[b as usize], d, i.0),
-            INode::LoadRw(b, i, _) => Op::LoadRw(self.bidx[b as usize], g.bufs[b as usize].rw.as_ref().unwrap().0, d, i.0),
-            INode::Store(b, i, v, _) => Op::Store(self.bidx[b as usize], g.bufs[b as usize].rw.as_ref().unwrap().0, i.0, v.0, d),
+            INode::LoadRw(b, i, _) => Op::LoadRw(
+                self.bidx[b as usize],
+                g.bufs[b as usize].rw.as_ref().unwrap().0,
+                d,
+                i.0,
+            ),
+            INode::Store(b, i, v, _) => Op::Store(
+                self.bidx[b as usize],
+                g.bufs[b as usize].rw.as_ref().unwrap().0,
+                i.0,
+                v.0,
+                d,
+            ),
             INode::LoopOut(l, k) => Op::Mov(d, self.state[l as usize][k as usize]),
         };
         self.ops.push(op);
@@ -240,7 +284,8 @@ impl Compiler<'_> {
             let (ctr, lim, ok) = (self.nregs, self.nregs + 1, self.nregs + 2);
             self.nregs += 3;
             self.consts.push((lim, c));
-            self.ops.push(Op::Bin(BinOp::Xor, IType::U32, ctr, ctr, ctr));
+            self.ops
+                .push(Op::Bin(BinOp::Xor, IType::U32, ctr, ctr, ctr));
             (ctr, lim, ok)
         });
         let top = self.ops.len() as u32;
@@ -248,7 +293,8 @@ impl Compiler<'_> {
             self.ops.push(Op::Cmp(CmpOp::Lt, IType::U32, ok, ctr, lim));
             let j = self.ops.len();
             self.ops.push(Op::JmpIfZero(ok, 0));
-            self.ops.push(Op::Bin(BinOp::Add, IType::U32, ctr, ctr, self.one));
+            self.ops
+                .push(Op::Bin(BinOp::Add, IType::U32, ctr, ctr, self.one));
             j
         });
         self.items(pre);

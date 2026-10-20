@@ -39,17 +39,39 @@ impl KvMode {
     pub fn parse(s: &str) -> Option<Self> {
         let p: Vec<&str> = s.split(':').collect();
         match p.as_slice() {
-            ["tkv", r] => Some(Self::Tkv { rel: r.parse().ok()?, block: 128 }),
-            ["tkv", r, b] => Some(Self::Tkv { rel: r.parse().ok()?, block: b.parse().ok()? }),
-            ["kivi", b, g] => Some(Self::Kivi { bits: b.parse().ok()?, g: g.parse().ok()? }),
+            ["tkv", r] => Some(Self::Tkv {
+                rel: r.parse().ok()?,
+                block: 128,
+            }),
+            ["tkv", r, b] => Some(Self::Tkv {
+                rel: r.parse().ok()?,
+                block: b.parse().ok()?,
+            }),
+            ["kivi", b, g] => Some(Self::Kivi {
+                bits: b.parse().ok()?,
+                g: g.parse().ok()?,
+            }),
             _ => None,
         }
     }
 }
 
 enum Layer<B> {
-    Tkv { stream: B, lanes: B, chans: B, scratch: B, n_lanes: usize, rope_k: bool },
-    Kivi { kc: B, ksz: B, vc: B, vsz: B, p: [u32; 6] },
+    Tkv {
+        stream: B,
+        lanes: B,
+        chans: B,
+        scratch: B,
+        n_lanes: usize,
+        rope_k: bool,
+    },
+    Kivi {
+        kc: B,
+        ksz: B,
+        vc: B,
+        vsz: B,
+        p: [u32; 6],
+    },
 }
 
 /// A cache's compressed rows, per layer (see the module docs).
@@ -88,7 +110,11 @@ fn f16_bits(x: f32) -> u16 {
         return sign | r as u16;
     }
     let r = m + 0xfff + ((m >> 13) & 1);
-    let (e, r) = if r & 0x80_0000 != 0 { (e + 1, 0) } else { (e, r >> 13) };
+    let (e, r) = if r & 0x80_0000 != 0 {
+        (e + 1, 0)
+    } else {
+        (e, r >> 13)
+    };
     if e >= 31 {
         return sign | 0x7c00;
     }
@@ -99,16 +125,35 @@ fn f16_val(h: u16) -> f32 {
     let s = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
     let e = ((h >> 10) & 0x1f) as i32;
     let m = (h & 0x3ff) as f32;
-    s * if e == 0 { m * 2f32.powi(-24) } else { (1.0 + m / 1024.0) * 2f32.powi(e - 15) }
+    s * if e == 0 {
+        m * 2f32.powi(-24)
+    } else {
+        (1.0 + m / 1024.0) * 2f32.powi(e - 15)
+    }
 }
 
 /// KIVI groups on `x` (`[t][kvd]`, kvd = nkv·hd): (packed codes, half2 (scale, zero) words).
-fn kivi_quant(x: &[f32], n: usize, kvd: usize, bits: u32, g: usize, key: bool) -> (Vec<u32>, Vec<u32>) {
+fn kivi_quant(
+    x: &[f32],
+    n: usize,
+    kvd: usize,
+    bits: u32,
+    g: usize,
+    key: bool,
+) -> (Vec<u32>, Vec<u32>) {
     let qmax = ((1u32 << bits) - 1) as f32;
     let groups: Vec<Vec<usize>> = if key {
-        (0..n / g).flat_map(|tg| (0..kvd).map(move |c| (tg * g..tg * g + g).map(|t| t * kvd + c).collect())).collect()
+        (0..n / g)
+            .flat_map(|tg| {
+                (0..kvd).map(move |c| (tg * g..tg * g + g).map(|t| t * kvd + c).collect())
+            })
+            .collect()
     } else {
-        (0..n).flat_map(|t| (0..kvd / g).map(move |cg| (cg * g..cg * g + g).map(|c| t * kvd + c).collect())).collect()
+        (0..n)
+            .flat_map(|t| {
+                (0..kvd / g).map(move |cg| (cg * g..cg * g + g).map(|c| t * kvd + c).collect())
+            })
+            .collect()
     };
     let mut codes = vec![0u32; (n * kvd * bits as usize).div_ceil(32)];
     let mut sz = Vec::with_capacity(groups.len());
@@ -118,7 +163,11 @@ fn kivi_quant(x: &[f32], n: usize, kvd: usize, bits: u32, g: usize, key: bool) -
         let (sh, zh) = (f16_bits((hi - lo) / qmax), f16_bits(lo));
         let (s, z) = (f16_val(sh), f16_val(zh));
         for &i in idx {
-            let q = if s > 0.0 { ((x[i] - z) / s).round().clamp(0.0, qmax) as u32 } else { 0 };
+            let q = if s > 0.0 {
+                ((x[i] - z) / s).round().clamp(0.0, qmax) as u32
+            } else {
+                0
+            };
             let b = i * bits as usize;
             codes[b >> 5] |= q << (b & 31);
         }
@@ -129,7 +178,11 @@ fn kivi_quant(x: &[f32], n: usize, kvd: usize, bits: u32, g: usize, key: bool) -
 
 impl<D: ComputeDevice> Model<D> {
     /// Compress `cache` positions `0..upto` (rounded down to 128) in every layer.
-    pub fn compress_kv(&self, cache: &crate::model::Cache<D::Buffer>, mode: KvMode) -> KvComp<D::Buffer> {
+    pub fn compress_kv(
+        &self,
+        cache: &crate::model::Cache<D::Buffer>,
+        mode: KvMode,
+    ) -> KvComp<D::Buffer> {
         let dev = &self.dev;
         let c = &self.cfg;
         let (nkv, hd, kvd, nl) = (c.kv_heads(), c.head_dim(), c.kv_dim(), self.n_layers());
@@ -143,15 +196,29 @@ impl<D: ComputeDevice> Model<D> {
         let mut layers = Vec::with_capacity(nl);
         for l in 0..nl {
             // [t][kvd] post-RoPE K and V
-            let k: Vec<f32> = (0..upto).flat_map(|t| rows[t * re + 2 * l * kvd..][..kvd].iter().map(|&b| bf(b))).collect();
-            let v: Vec<f32> = (0..upto).flat_map(|t| rows[t * re + (2 * l + 1) * kvd..][..kvd].iter().map(|&b| bf(b))).collect();
+            let k: Vec<f32> = (0..upto)
+                .flat_map(|t| rows[t * re + 2 * l * kvd..][..kvd].iter().map(|&b| bf(b)))
+                .collect();
+            let v: Vec<f32> = (0..upto)
+                .flat_map(|t| {
+                    rows[t * re + (2 * l + 1) * kvd..][..kvd]
+                        .iter()
+                        .map(|&b| bf(b))
+                })
+                .collect();
             match mode {
                 KvMode::Kivi { bits, g } => {
                     let (kc, ksz) = kivi_quant(&k, upto, kvd, bits, g, true);
                     let (vc, vsz) = kivi_quant(&v, upto, kvd, bits, g, false);
                     bytes += 4 * (kc.len() + vc.len()) + 4 * (ksz.len() + vsz.len());
                     let p = [bits, g as u32, nkv as u32, hd as u32, upto as u32, 1];
-                    let kl = Layer::Kivi { kc: dev.upload_u32(&kc), ksz: dev.upload_u32(&ksz), vc: dev.upload_u32(&vc), vsz: dev.upload_u32(&vsz), p };
+                    let kl = Layer::Kivi {
+                        kc: dev.upload_u32(&kc),
+                        ksz: dev.upload_u32(&ksz),
+                        vc: dev.upload_u32(&vc),
+                        vsz: dev.upload_u32(&vsz),
+                        p,
+                    };
                     layers.push((kl, None));
                 }
                 KvMode::Tkv { rel, block } => {
@@ -185,7 +252,8 @@ impl<D: ComputeDevice> Model<D> {
                         }
                         let r = if key { 0.5 * rel } else { 2.0 * rel };
                         let step = r * (sse / y.len() as f64).sqrt() * 12f64.sqrt();
-                        let mut p = KvParams::new(if key { Kind::K } else { Kind::V }, nkv, hd, step);
+                        let mut p =
+                            KvParams::new(if key { Kind::K } else { Kind::V }, nkv, hd, step);
                         p.pre_rope = false;
                         p.gpu = true;
                         p.block = block;
@@ -193,7 +261,16 @@ impl<D: ComputeDevice> Model<D> {
                         let ph = &phys;
                         let row = move |h: usize, t: usize| ph(t) + h * hd;
                         let mut b = Batch::new();
-                        b.add(&s, &Placement { row: &row, rope_theta: key.then_some(0.0) }, 0, upto).unwrap();
+                        b.add(
+                            &s,
+                            &Placement {
+                                row: &row,
+                                rope_theta: key.then_some(0.0),
+                            },
+                            0,
+                            upto,
+                        )
+                        .unwrap();
                         bytes += s.len();
                         Layer::Tkv {
                             stream: dev.upload_u32(&b.stream),
@@ -211,18 +288,51 @@ impl<D: ComputeDevice> Model<D> {
             }
         }
         let prior = matches!(mode, KvMode::Tkv { .. }).then(|| dev.upload_u32(&Batch::prior()));
-        KvComp { layers, prior, upto, bytes, values: upto * nl * 2 * kvd }
+        KvComp {
+            layers,
+            prior,
+            upto,
+            bytes,
+            values: upto * nl * 2 * kvd,
+        }
     }
 
     /// Decode layer `l` of `kc` into the pool (call before that layer's attention).
-    pub(crate) fn restore_kv(&self, kc: &KvComp<D::Buffer>, l: usize, kp: &D::Buffer, vp: &D::Buffer, table: &D::Buffer) {
+    pub(crate) fn restore_kv(
+        &self,
+        kc: &KvComp<D::Buffer>,
+        l: usize,
+        kp: &D::Buffer,
+        vp: &D::Buffer,
+        table: &D::Buffer,
+    ) {
         let dev = &self.dev;
         let (cos, sin) = self.rope_buffers(l);
         let run = |lay: &Layer<D::Buffer>, out: &D::Buffer| match lay {
-            Layer::Tkv { stream, lanes, chans, scratch, n_lanes, rope_k } => {
-                dev.tkv_decode(stream, lanes, chans, kc.prior.as_ref().unwrap(), scratch, out, rope_k.then_some((cos, sin)), *n_lanes)
-            }
-            Layer::Kivi { kc: c, ksz, vc, vsz, p } => {
+            Layer::Tkv {
+                stream,
+                lanes,
+                chans,
+                scratch,
+                n_lanes,
+                rope_k,
+            } => dev.tkv_decode(
+                stream,
+                lanes,
+                chans,
+                kc.prior.as_ref().unwrap(),
+                scratch,
+                out,
+                rope_k.then_some((cos, sin)),
+                *n_lanes,
+            ),
+            Layer::Kivi {
+                kc: c,
+                ksz,
+                vc,
+                vsz,
+                p,
+            } => {
                 let sh = BLOCK.trailing_zeros();
                 dev.kivi_dequant(c, ksz, kp, Some((table, sh)), *p);
                 let mut pv = *p;

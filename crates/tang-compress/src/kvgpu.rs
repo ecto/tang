@@ -52,9 +52,17 @@ impl Batch {
 
     /// Add one stream; every lane writes `row(head, t) + c` for its tokens.
     /// Lanes covering `[t0, t1)` only (whole blocks) are added.
-    pub fn add(&mut self, bytes: &[u8], place: &Placement, t0: usize, t1: usize) -> Result<(), DecodeError> {
+    pub fn add(
+        &mut self,
+        bytes: &[u8],
+        place: &Placement,
+        t0: usize,
+        t1: usize,
+    ) -> Result<(), DecodeError> {
         let s = KvStream::parse(bytes)?;
-        let tb = s.gpu_tables().ok_or(DecodeError::Invalid("not a gpu-layout stream"))?;
+        let tb = s
+            .gpu_tables()
+            .ok_or(DecodeError::Invalid("not a gpu-layout stream"))?;
         let p = &s.params;
         let base = self.bytes.len();
         self.bytes.extend_from_slice(bytes);
@@ -73,7 +81,8 @@ impl Batch {
                     seen.push(cl);
                     seen.len() - 1
                 });
-                self.chans.extend_from_slice(&[tb.mu[j] as u32, tb.rho[j], cl, di as u32]);
+                self.chans
+                    .extend_from_slice(&[tb.mu[j] as u32, tb.rho[j], cl, di as u32]);
             }
             ncls[hh] = seen.len();
         }
@@ -85,7 +94,11 @@ impl Batch {
                 continue;
             }
             let row0 = (place.row)(hh, pos0);
-            let stride = if n > 1 { (place.row)(hh, pos0 + 1) - row0 } else { p.hd };
+            let stride = if n > 1 {
+                (place.row)(hh, pos0 + 1) - row0
+            } else {
+                p.hd
+            };
             self.lanes.extend_from_slice(&[
                 (base + off as usize) as u32,
                 len,
@@ -104,7 +117,11 @@ impl Batch {
             ]);
             self.scratch_words += ncls[hh] * ctx_words;
         }
-        self.stream = self.bytes.chunks(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect();
+        self.stream = self
+            .bytes
+            .chunks(4)
+            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            .collect();
         Ok(())
     }
 

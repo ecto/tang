@@ -16,7 +16,11 @@ fn flag(a: &[String], f: &str) -> Option<String> {
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
-    let x: Vec<f32> = std::fs::read(&a[1]).unwrap().chunks(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+    let x: Vec<f32> = std::fs::read(&a[1])
+        .unwrap()
+        .chunks(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
     let sh: Vec<usize> = a[2].split('x').map(|v| v.parse().unwrap()).collect();
     let (h, n, d) = (sh[0], sh[1], sh[2]);
     let kind = if a[3] == "k" { Kind::K } else { Kind::V };
@@ -28,10 +32,17 @@ fn main() {
     for hh in 0..h {
         for c in 0..d {
             let m: f64 = (0..n).map(|t| x[(hh * n + t) * d + c] as f64).sum::<f64>() / n as f64;
-            sse += (0..n).map(|t| (x[(hh * n + t) * d + c] as f64 - m).powi(2)).sum::<f64>();
+            sse += (0..n)
+                .map(|t| (x[(hh * n + t) * d + c] as f64 - m).powi(2))
+                .sum::<f64>();
         }
     }
-    let mut p = KvParams::new(kind, h, d, rel * (sse / x.len() as f64).sqrt() * 12f64.sqrt());
+    let mut p = KvParams::new(
+        kind,
+        h,
+        d,
+        rel * (sse / x.len() as f64).sqrt() * 12f64.sqrt(),
+    );
     p.pre_rope = false;
     p.gpu = true;
     if let Some(b) = flag(&a, "--block") {
@@ -45,16 +56,35 @@ fn main() {
     let mut b = Batch::new();
     for i in 0..copies {
         let row = move |hh: usize, tt: usize| ((i * h + hh) * n + tt) * d;
-        b.add(&bytes, &Placement { row: &row, rope_theta: None }, 0, n).unwrap();
+        b.add(
+            &bytes,
+            &Placement {
+                row: &row,
+                rope_theta: None,
+            },
+            0,
+            n,
+        )
+        .unwrap();
     }
     let dev = MetalDevice::new().expect("metal");
     let up = |v: &[u32]| dev.upload_u32(v);
-    let (sb, lb, cb, pb) = (up(&b.stream), up(&b.lanes), up(&b.chans), up(&Batch::prior()));
+    let (sb, lb, cb, pb) = (
+        up(&b.stream),
+        up(&b.lanes),
+        up(&b.chans),
+        up(&Batch::prior()),
+    );
     let scr = dev.alloc(b.scratch_words.max(1));
     let out = dev.alloc(copies * x.len());
     dev.tkv_decode(&sb, &lb, &cb, &pb, &scr, &out, None, b.n_lanes());
     let g = dev.download(&out);
-    let same = (0..copies).all(|i| g[i * x.len()..(i + 1) * x.len()].iter().zip(&cpu).all(|(u, v)| u.to_bits() == v.to_bits()));
+    let same = (0..copies).all(|i| {
+        g[i * x.len()..(i + 1) * x.len()]
+            .iter()
+            .zip(&cpu)
+            .all(|(u, v)| u.to_bits() == v.to_bits())
+    });
     let t = Instant::now();
     for _ in 0..reps {
         dev.tkv_decode(&sb, &lb, &cb, &pb, &scr, &out, None, b.n_lanes());

@@ -61,7 +61,14 @@ const KAPPA: f64 = 1.149_604_398_860_241;
 
 /// Inverse-lifting constants (Q24): `1/κ, κ, −δ, −γ, −β, −α`.
 pub fn lift_consts() -> [i32; 6] {
-    [qc(1.0 / KAPPA), qc(KAPPA), qc(-DELTA), qc(-GAMMA), qc(-BETA), qc(-ALPHA)]
+    [
+        qc(1.0 / KAPPA),
+        qc(KAPPA),
+        qc(-DELTA),
+        qc(-GAMMA),
+        qc(-BETA),
+        qc(-ALPHA),
+    ]
 }
 
 /// `⌊(a·b + 2^(s−1)) / 2^s⌋`, low 32 bits (the GPU emulates the 64-bit product).
@@ -187,12 +194,18 @@ pub struct RansDec<'a> {
 impl<'a> RansDec<'a> {
     /// Start decoding `w` (empty lanes are allowed and never read).
     pub fn new(w: &'a [u16]) -> Self {
-        let x = if w.len() >= 2 { w[0] as u32 | (w[1] as u32) << 16 } else { 1 << 16 };
+        let x = if w.len() >= 2 {
+            w[0] as u32 | (w[1] as u32) << 16
+        } else {
+            1 << 16
+        };
         Self { w, pos: 2, x }
     }
     #[inline]
     fn step(&mut self, cum: u32, f: u32) {
-        self.x = f.wrapping_mul(self.x >> 16).wrapping_add((self.x & 0xFFFF).wrapping_sub(cum));
+        self.x = f
+            .wrapping_mul(self.x >> 16)
+            .wrapping_add((self.x & 0xFFFF).wrapping_sub(cum));
         if self.x < 1 << 16 {
             let v = self.w.get(self.pos).copied().unwrap_or(0) as u32;
             self.pos += 1;
@@ -242,7 +255,13 @@ impl Sink for DecSink<'_> {
 }
 
 #[inline]
-pub(crate) fn bitm<S: Sink, const A: bool>(s: &mut S, lane: usize, m: &mut [u32], idx: usize, bit: bool) -> bool {
+pub(crate) fn bitm<S: Sink, const A: bool>(
+    s: &mut S,
+    lane: usize,
+    m: &mut [u32],
+    idx: usize,
+    bit: bool,
+) -> bool {
     let b = s.bit(lane, bit, mp1(m[idx]));
     if A {
         m[idx] = mupd(m[idx], b);
@@ -266,7 +285,13 @@ pub(crate) fn raw_n<S: Sink>(s: &mut S, lane: usize, v: u32, mut n: u32) -> u32 
 
 /// Adaptive Elias-gamma for `v < 2^31`.
 #[inline]
-pub(crate) fn gamma<S: Sink, const A: bool>(s: &mut S, lane: usize, m: &mut [u32], base: usize, v: u32) -> u32 {
+pub(crate) fn gamma<S: Sink, const A: bool>(
+    s: &mut S,
+    lane: usize,
+    m: &mut [u32],
+    base: usize,
+    v: u32,
+) -> u32 {
     let w = v.wrapping_add(1);
     let nbe = 31 - w.max(1).leading_zeros();
     let mut nb = 0u32;
@@ -328,7 +353,10 @@ impl Sink for CountSink {
 
 /// Choose priors (index into [`prior_table`]) from pooled counts.
 pub(crate) fn choose_priors(n: &[[u32; 2]], adaptive: bool) -> Vec<Option<u8>> {
-    let th: u32 = std::env::var("TC_PRIOR_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(if adaptive { 16 } else { 4 });
+    let th: u32 = std::env::var("TC_PRIOR_MIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(if adaptive { 16 } else { 4 });
     let t = prior_table();
     n.iter()
         .map(|&[n0, n1]| {
@@ -386,7 +414,9 @@ pub(crate) fn read_priors(r: &mut ByteReader) -> Result<Vec<u32>, DecodeError> {
 
 pub(crate) fn init_of(pr: &[Option<u8>]) -> Vec<u32> {
     let t = prior_table();
-    pr.iter().map(|p| p.map_or(MINIT, |k| t[k as usize] | t[k as usize] << 16)).collect()
+    pr.iter()
+        .map(|p| p.map_or(MINIT, |k| t[k as usize] | t[k as usize] << 16))
+        .collect()
 }
 
 // ------------------------------------------------------------------ shapes
@@ -560,7 +590,9 @@ impl Shape {
 pub(crate) fn step_repr(step: f64) -> (i32, u32) {
     let lg = step.log2().floor() as i32;
     let sh = (29 - lg).clamp(1, 52);
-    let m = (step * 2f64.powi(sh)).round().clamp(1.0, (1u64 << 31) as f64 - 1.0) as i32;
+    let m = (step * 2f64.powi(sh))
+        .round()
+        .clamp(1.0, (1u64 << 31) as f64 - 1.0) as i32;
     (m, sh as u32)
 }
 
@@ -609,7 +641,11 @@ pub(crate) fn row_ctx(sh: &Shape, b: &BandInfo, p: usize, z: usize, y: usize) ->
     let mut rc = RowCtx::default();
     for &(dz, dy, cat) in &ROWNB {
         let (z2, y2) = (z as i32 + dz, y as i32 + dy);
-        if z2 < b.start[0] as i32 || z2 >= b.end[0] as i32 || y2 < b.start[1] as i32 || y2 >= b.end[1] as i32 {
+        if z2 < b.start[0] as i32
+            || z2 >= b.end[0] as i32
+            || y2 < b.start[1] as i32
+            || y2 >= b.end[1] as i32
+        {
             continue;
         }
         let (z2, y2) = (z2 as usize, y2 as usize);
@@ -659,7 +695,17 @@ pub(crate) fn cap(v: i32) -> u32 {
 
 #[inline]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn feats(sh: &Shape, b: &BandInfo, rc: &RowCtx, q: &[i32], rs: Option<&[i32]>, z: usize, y: usize, x: usize, w: &[i32; NTAP]) -> (Feats, i32) {
+pub(crate) fn feats(
+    sh: &Shape,
+    b: &BandInfo,
+    rc: &RowCtx,
+    q: &[i32],
+    rs: Option<&[i32]>,
+    z: usize,
+    y: usize,
+    x: usize,
+    w: &[i32; NTAP],
+) -> (Feats, i32) {
     // magnitudes/signs for contexts come from `m` (the residuals when given)
     let m = rs.unwrap_or(q);
     let [_, ny, nx] = sh.dims;
@@ -745,7 +791,11 @@ pub(crate) fn feats(sh: &Shape, b: &BandInfo, rc: &RowCtx, q: &[i32], rs: Option
     let ws = 3 + 2 * nf + nd + nr + 2 * has_p as u32 + 2;
     let a = 12 * s / ws;
     let ab = bucket(a, &A_TH);
-    let pb = if has_p { 1 + bucket(4 * cap(pm).min(15) + pnb.min(60), &P_TH) } else { 0 };
+    let pb = if has_p {
+        1 + bucket(4 * cap(pm).min(15) + pnb.min(60), &P_TH)
+    } else {
+        0
+    };
     let g = (nf + nd + nr > 0) as usize;
     let c = b.class;
     let e = ((1 + 2 * s / ws).ilog2() as usize).min(NE - 1);
@@ -781,7 +831,14 @@ pub(crate) fn feats(sh: &Shape, b: &BandInfo, rc: &RowCtx, q: &[i32], rs: Option
 
 /// Code one residual.
 #[inline]
-pub(crate) fn code_res<S: Sink, const A: bool>(s: &mut S, lane: usize, m: &mut [u32], c: usize, f: &Feats, r: i32) -> i32 {
+pub(crate) fn code_res<S: Sink, const A: bool>(
+    s: &mut S,
+    lane: usize,
+    m: &mut [u32],
+    c: usize,
+    f: &Feats,
+    r: i32,
+) -> i32 {
     let mag = r.unsigned_abs();
     if !bitm::<S, A>(s, lane, m, SIG0 + f.sig, mag > 0) {
         return 0;
@@ -799,7 +856,13 @@ pub(crate) fn code_res<S: Sink, const A: bool>(s: &mut S, lane: usize, m: &mut [
     }
     let mut hv = h as u32;
     if h == KB {
-        hv = hv.wrapping_add(gamma::<S, A>(s, lane, m, ESC0 + c * 32, hi.wrapping_sub(KB as u32)));
+        hv = hv.wrapping_add(gamma::<S, A>(
+            s,
+            lane,
+            m,
+            ESC0 + c * 32,
+            hi.wrapping_sub(KB as u32),
+        ));
     }
     let mut lo = 0u32;
     let mut j = k;
@@ -829,7 +892,15 @@ pub(crate) fn code_res<S: Sink, const A: bool>(s: &mut S, lane: usize, m: &mut [
 /// (band-relative): returns `(rz, sz, ry, sy)`.
 pub fn pass_lattice(npass: usize, zy_is_y: bool, p: usize) -> (usize, usize, usize, usize) {
     match npass {
-        7 => [(0, 4, 0, 4), (2, 4, 2, 4), (0, 4, 2, 4), (2, 4, 0, 4), (1, 2, 1, 2), (0, 2, 1, 2), (1, 2, 0, 2)][p],
+        7 => [
+            (0, 4, 0, 4),
+            (2, 4, 2, 4),
+            (0, 4, 2, 4),
+            (2, 4, 0, 4),
+            (1, 2, 1, 2),
+            (0, 2, 1, 2),
+            (1, 2, 0, 2),
+        ][p],
         4 => {
             let (r, st) = [(0, 8), (4, 8), (2, 4), (1, 2)][p];
             if zy_is_y {
@@ -863,14 +934,27 @@ pub(crate) fn for_lines(b: &BandInfo, lanes: usize, mut f: impl FnMut(usize, usi
         let cy = (ey - ry).div_ceil(sy);
         let n = (ez - rz).div_ceil(sz) * cy;
         for j in 0..n {
-            f(p, j % lanes, b.start[0] + rz + (j / cy) * sz, b.start[1] + ry + (j % cy) * sy);
+            f(
+                p,
+                j % lanes,
+                b.start[0] + rz + (j / cy) * sz,
+                b.start[1] + ry + (j % cy) * sy,
+            );
         }
     }
 }
 
 /// Code (encode or decode) a brick's coefficients `q`; `adapt` selects
 /// per-lane adaptive models (else the priors are static probabilities).
-pub fn code_brick<S: Sink>(sh: &Shape, q: &mut [i32], preds: &[[i32; NTAP]], init: &[u32], lanes: usize, adapt: bool, s: &mut S) {
+pub fn code_brick<S: Sink>(
+    sh: &Shape,
+    q: &mut [i32],
+    preds: &[[i32; NTAP]],
+    init: &[u32],
+    lanes: usize,
+    adapt: bool,
+    s: &mut S,
+) {
     if adapt {
         code_brick_impl::<S, true>(sh, q, preds, init, lanes, s)
     } else {
@@ -878,7 +962,14 @@ pub fn code_brick<S: Sink>(sh: &Shape, q: &mut [i32], preds: &[[i32; NTAP]], ini
     }
 }
 
-fn code_brick_impl<S: Sink, const A: bool>(sh: &Shape, q: &mut [i32], preds: &[[i32; NTAP]], init: &[u32], lanes: usize, s: &mut S) {
+fn code_brick_impl<S: Sink, const A: bool>(
+    sh: &Shape,
+    q: &mut [i32],
+    preds: &[[i32; NTAP]],
+    init: &[u32],
+    lanes: usize,
+    s: &mut S,
+) {
     let [_, ny, nx] = sh.dims;
     let mut models: Vec<u32> = (0..lanes).flat_map(|_| init.iter().copied()).collect();
     for b in &sh.bands {
@@ -1017,7 +1108,13 @@ pub struct GpuConfig {
 impl GpuConfig {
     /// Defaults (64³ bricks, 32 lanes).
     pub fn new(bound: ErrorBound) -> Self {
-        Self { bound, brick: 64, lanes: 32, rho: 0.45, adaptive: false }
+        Self {
+            bound,
+            brick: 64,
+            lanes: 32,
+            rho: 0.45,
+            adaptive: false,
+        }
     }
 }
 
@@ -1143,7 +1240,10 @@ fn shapes_for(grid: &[([usize; 3], [usize; 3])]) -> (Vec<Shape>, Vec<usize>) {
 
 /// Keys used by any shape, sorted.
 fn used_keys(shapes: &[Shape]) -> Vec<usize> {
-    let mut k: Vec<usize> = shapes.iter().flat_map(|s| s.bands.iter().flat_map(|b| b.pkey[..b.npass].to_vec())).collect();
+    let mut k: Vec<usize> = shapes
+        .iter()
+        .flat_map(|s| s.bands.iter().flat_map(|b| b.pkey[..b.npass].to_vec()))
+        .collect();
     k.sort_unstable();
     k.dedup();
     k
@@ -1159,7 +1259,9 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed, DecodeError> {
     if nd == 0 || nd > 3 {
         return Err(DecodeError::Invalid("rank"));
     }
-    let dims: Vec<usize> = (0..nd).map(|_| r.varint().map(|v| v as usize)).collect::<Result<_, _>>()?;
+    let dims: Vec<usize> = (0..nd)
+        .map(|_| r.varint().map(|v| v as usize))
+        .collect::<Result<_, _>>()?;
     let d3 = crate::wavelet::as3(&dims);
     let mut bdims = [0usize; 3];
     for v in bdims.iter_mut() {
@@ -1193,7 +1295,9 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed, DecodeError> {
         }
     }
     let init = read_priors(&mut r)?;
-    let sizes: Vec<usize> = (0..grid.len()).map(|_| r.varint().map(|v| v as usize)).collect::<Result<_, _>>()?;
+    let sizes: Vec<usize> = (0..grid.len())
+        .map(|_| r.varint().map(|v| v as usize))
+        .collect::<Result<_, _>>()?;
     let mut off = r.position().next_multiple_of(2);
     let mut bricks = Vec::with_capacity(grid.len());
     for (bi, (o, _)) in grid.iter().enumerate() {
@@ -1202,7 +1306,9 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed, DecodeError> {
             return Err(DecodeError::Truncated);
         }
         let mut br = ByteReader::new(&bytes[off..end]);
-        let nw: Vec<usize> = (0..=lanes).map(|_| br.varint().map(|v| v as usize)).collect::<Result<_, _>>()?;
+        let nw: Vec<usize> = (0..=lanes)
+            .map(|_| br.varint().map(|v| v as usize))
+            .collect::<Result<_, _>>()?;
         let ne = br.varint()? as usize;
         let mut esc = Vec::with_capacity(ne);
         let mut last = 0usize;
@@ -1223,14 +1329,37 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed, DecodeError> {
         if w * 2 > end {
             return Err(DecodeError::Truncated);
         }
-        bricks.push(BrickRef { origin: *o, shape: ids[bi], off, lane_word, esc });
+        bricks.push(BrickRef {
+            origin: *o,
+            shape: ids[bi],
+            off,
+            lane_word,
+            esc,
+        });
         off = end;
     }
-    Ok(Parsed { dims, d3, bdims, lanes, adaptive, e, mean_fix, delta_g, dl, corr, preds, init, shapes, bricks })
+    Ok(Parsed {
+        dims,
+        d3,
+        bdims,
+        lanes,
+        adaptive,
+        e,
+        mean_fix,
+        delta_g,
+        dl,
+        corr,
+        preds,
+        init,
+        shapes,
+        bricks,
+    })
 }
 
 fn words(bytes: &[u8], a: usize, b: usize) -> Vec<u16> {
-    (a..b).map(|i| u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]])).collect()
+    (a..b)
+        .map(|i| u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]))
+        .collect()
 }
 
 /// Decode one brick to fixed-point values after corrections (brick-local
@@ -1238,10 +1367,22 @@ fn words(bytes: &[u8], a: usize, b: usize) -> Vec<u16> {
 pub fn decode_brick_fix(ps: &Parsed, bytes: &[u8], bi: usize) -> Result<Vec<i32>, DecodeError> {
     let br = &ps.bricks[bi];
     let sh = &ps.shapes[br.shape];
-    let lw: Vec<Vec<u16>> = (0..=ps.lanes).map(|l| words(bytes, br.lane_word[l], br.lane_word[l + 1])).collect();
-    let mut sink = DecSink { lanes: lw.iter().map(|w| RansDec::new(w)).collect() };
+    let lw: Vec<Vec<u16>> = (0..=ps.lanes)
+        .map(|l| words(bytes, br.lane_word[l], br.lane_word[l + 1]))
+        .collect();
+    let mut sink = DecSink {
+        lanes: lw.iter().map(|w| RansDec::new(w)).collect(),
+    };
     let mut q = vec![0i32; sh.len()];
-    code_brick(sh, &mut q, &ps.preds, &ps.init, ps.lanes, ps.adaptive, &mut sink);
+    code_brick(
+        sh,
+        &mut q,
+        &ps.preds,
+        &ps.init,
+        ps.lanes,
+        ps.adaptive,
+        &mut sink,
+    );
     let mut c = dequant_brick(sh, &q, &ps.dl);
     inverse_int(&sh.p, &mut c);
     // outlier lane
@@ -1323,20 +1464,33 @@ fn intersects(ps: &Parsed, bi: usize, lo: [usize; 3], hi: [usize; 3]) -> bool {
 
 /// Decode the sub-box `[lo, hi)` (3D coordinates) with `threads` threads;
 /// returns `f32` bits in box layout.
-pub fn decode_box_bits(bytes: &[u8], lo: [usize; 3], hi: [usize; 3], threads: usize) -> Result<Vec<u32>, DecodeError> {
+pub fn decode_box_bits(
+    bytes: &[u8],
+    lo: [usize; 3],
+    hi: [usize; 3],
+    threads: usize,
+) -> Result<Vec<u32>, DecodeError> {
     let ps = parse(bytes)?;
     decode_box_parsed(&ps, bytes, lo, hi, threads)
 }
 
 /// [`decode_box_bits`] on an already parsed stream.
-pub fn decode_box_parsed(ps: &Parsed, bytes: &[u8], lo: [usize; 3], hi: [usize; 3], threads: usize) -> Result<Vec<u32>, DecodeError> {
+pub fn decode_box_parsed(
+    ps: &Parsed,
+    bytes: &[u8],
+    lo: [usize; 3],
+    hi: [usize; 3],
+    threads: usize,
+) -> Result<Vec<u32>, DecodeError> {
     for a in 0..3 {
         if lo[a] >= hi[a] || hi[a] > ps.d3[a] {
             return Err(DecodeError::Invalid("box"));
         }
     }
     let n: usize = (0..3).map(|a| hi[a] - lo[a]).product();
-    let todo: Vec<usize> = (0..ps.bricks.len()).filter(|&b| intersects(ps, b, lo, hi)).collect();
+    let todo: Vec<usize> = (0..ps.bricks.len())
+        .filter(|&b| intersects(ps, b, lo, hi))
+        .collect();
     let mut out = vec![0u32; n];
     if threads <= 1 || todo.len() <= 1 {
         for &bi in &todo {
@@ -1385,7 +1539,10 @@ unsafe impl Send for SendPtr {}
 pub fn decode_f32(bytes: &[u8], threads: usize) -> Result<(Vec<usize>, Vec<f32>), DecodeError> {
     let ps = parse(bytes)?;
     let bits = decode_box_parsed(&ps, bytes, [0; 3], ps.d3, threads)?;
-    Ok((ps.dims.clone(), bits.into_iter().map(f32::from_bits).collect()))
+    Ok((
+        ps.dims.clone(),
+        bits.into_iter().map(f32::from_bits).collect(),
+    ))
 }
 
 // ------------------------------------------------------------------ encoder
@@ -1408,7 +1565,11 @@ pub(crate) struct Enc<'a> {
     pub(crate) threads: usize,
 }
 
-pub(crate) fn par_map<T: Send + Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+pub(crate) fn par_map<T: Send + Sync, R: Send>(
+    items: &[T],
+    threads: usize,
+    f: impl Fn(&T) -> R + Sync,
+) -> Vec<R> {
     if threads <= 1 || items.len() <= 1 {
         return items.iter().map(f).collect();
     }
@@ -1428,7 +1589,11 @@ pub(crate) fn par_map<T: Send + Sync, R: Send>(items: &[T], threads: usize, f: i
             });
         }
     });
-    res.into_inner().unwrap().into_iter().map(|r| r.unwrap()).collect()
+    res.into_inner()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect()
 }
 
 impl<'a> Enc<'a> {
@@ -1440,11 +1605,19 @@ impl<'a> Enc<'a> {
         let n = x.len() as f64;
         let mean = x.iter().map(|&v| v as f64).sum::<f64>() / n;
         let amax = x.iter().fold(0.0f64, |m, &v| m.max((v as f64).abs()));
-        let dmax = x.iter().fold(0.0f64, |m, &v| m.max((v as f64 - mean).abs()));
+        let dmax = x
+            .iter()
+            .fold(0.0f64, |m, &v| m.max((v as f64 - mean).abs()));
         let need = |v: f64, lim: f64| {
-            if v > 0.0 { (v / lim).log2().ceil() as i32 } else { -126 }
+            if v > 0.0 {
+                (v / lim).log2().ceil() as i32
+            } else {
+                -126
+            }
         };
-        let e = need(amax, (1u32 << 23) as f64).max(need(dmax, (1u32 << 20) as f64)).clamp(-126, 100);
+        let e = need(amax, (1u32 << 23) as f64)
+            .max(need(dmax, (1u32 << 20) as f64))
+            .clamp(-126, 100);
         let sc = 2f64.powi(-e);
         let mean_fix = (mean * sc).round() as i32;
         type Item = (usize, ([usize; 3], [usize; 3]));
@@ -1461,9 +1634,22 @@ impl<'a> Enc<'a> {
                 }
             }
             forward_97(&sh.p, &mut c);
-            EncBrick { shape: sid, origin: o, c }
+            EncBrick {
+                shape: sid,
+                origin: o,
+                c,
+            }
         });
-        Self { x, d3, bdims, shapes, bricks, e, mean_fix, threads }
+        Self {
+            x,
+            d3,
+            bdims,
+            shapes,
+            bricks,
+            e,
+            mean_fix,
+            threads,
+        }
     }
 
     pub(crate) fn scale(&self) -> f32 {
@@ -1517,7 +1703,12 @@ impl<'a> Enc<'a> {
     }
 
     /// Integer reconstruction per brick (before corrections).
-    pub(crate) fn reconstruct(&self, shapes: &[Shape], qs: &[Vec<i32>], dl: &[u8; NDL]) -> Vec<Vec<i32>> {
+    pub(crate) fn reconstruct(
+        &self,
+        shapes: &[Shape],
+        qs: &[Vec<i32>],
+        dl: &[u8; NDL],
+    ) -> Vec<Vec<i32>> {
         let idx: Vec<usize> = (0..self.bricks.len()).collect();
         par_map(&idx, self.threads, |&bi| {
             let sh = &shapes[self.bricks[bi].shape];
@@ -1549,7 +1740,9 @@ impl<'a> Enc<'a> {
             }
             (se, mx)
         });
-        parts.iter().fold((0.0, 0.0), |(a, b), &(s, m)| (a + s, b.max(m)))
+        parts
+            .iter()
+            .fold((0.0, 0.0), |(a, b), &(s, m)| (a + s, b.max(m)))
     }
 
     pub(crate) fn shapes_at(&self, dg: f64) -> Vec<Shape> {
@@ -1569,7 +1762,12 @@ impl<'a> Enc<'a> {
 }
 
 /// Fit predictors per key on the quantized values (pooled over bricks).
-fn fit_preds(shapes: &[Shape], bricks: &[EncBrick], qs: &[Vec<i32>], lanes: usize) -> Vec<Option<[i32; NTAP]>> {
+fn fit_preds(
+    shapes: &[Shape],
+    bricks: &[EncBrick],
+    qs: &[Vec<i32>],
+    lanes: usize,
+) -> Vec<Option<[i32; NTAP]>> {
     let mut g = vec![[[0.0f64; NTAP]; NTAP]; NKEY];
     let mut h = vec![[0.0f64; NTAP]; NKEY];
     let mut n = vec![0usize; NKEY];
@@ -1630,7 +1828,11 @@ fn fit_preds(shapes: &[Shape], bricks: &[EncBrick], qs: &[Vec<i32>], lanes: usiz
             }
             let mut w = [0i32; NTAP];
             for i in 0..NTAP {
-                let wi = if a[i][i].abs() > 1e-12 { r[i] / a[i][i] } else { 0.0 };
+                let wi = if a[i][i].abs() > 1e-12 {
+                    r[i] / a[i][i]
+                } else {
+                    0.0
+                };
                 w[i] = (wi * 4096.0).round().clamp(-32767.0, 32767.0) as i32;
             }
             let (mut c0, mut c1) = (0.0f64, 0.0f64);
@@ -1659,9 +1861,22 @@ pub fn encode_f32(x: &[f32], dims: &[usize], cfg: &GpuConfig) -> (Vec<u8>, GpuSt
 
 /// [`encode_f32`] with `threads` worker threads (output bytes are identical
 /// for any thread count).
-pub fn encode_f32_mt(x: &[f32], dims: &[usize], cfg: &GpuConfig, threads: usize) -> (Vec<u8>, GpuStats) {
+pub fn encode_f32_mt(
+    x: &[f32],
+    dims: &[usize],
+    cfg: &GpuConfig,
+    threads: usize,
+) -> (Vec<u8>, GpuStats) {
     assert!(cfg.lanes >= 1 && cfg.lanes <= 1024 && cfg.brick >= 1);
-    rate_control(x, dims, cfg.brick, cfg.bound, cfg.rho, threads, |enc, dg, mx| encode_at(enc, dims, cfg, dg, mx))
+    rate_control(
+        x,
+        dims,
+        cfg.brick,
+        cfg.bound,
+        cfg.rho,
+        threads,
+        |enc, dg, mx| encode_at(enc, dims, cfg, dg, mx),
+    )
 }
 
 /// Shared rate control: bisect the grid step on the measured error of the
@@ -1678,7 +1893,11 @@ pub(crate) fn rate_control(
 ) -> (Vec<u8>, GpuStats) {
     assert_eq!(dims.iter().product::<usize>(), x.len());
     let enc = Enc::new(x, dims, brick, threads);
-    let (lo, hi) = x.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &v| (a.min(v as f64), b.max(v as f64)));
+    let (lo, hi) = x
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &v| {
+            (a.min(v as f64), b.max(v as f64))
+        });
     let range = hi - lo;
     let g = 2f64.powi(enc.e);
     match bound {
@@ -1726,16 +1945,28 @@ pub(crate) fn rate_control(
     }
 }
 
-pub(crate) fn encode_at(enc: &Enc, dims: &[usize], cfg: &GpuConfig, dg: f64, maxabs: Option<f64>) -> (Vec<u8>, GpuStats) {
+pub(crate) fn encode_at(
+    enc: &Enc,
+    dims: &[usize],
+    cfg: &GpuConfig,
+    dg: f64,
+    maxabs: Option<f64>,
+) -> (Vec<u8>, GpuStats) {
     let shapes = enc.shapes_at(dg);
     let (qs, dl) = enc.quantize(dg, cfg.rho);
-    let fitted = if std::env::var("TC_NOPRED").is_ok() { vec![None; NKEY] } else { fit_preds(&shapes, &enc.bricks, &qs, cfg.lanes) };
+    let fitted = if std::env::var("TC_NOPRED").is_ok() {
+        vec![None; NKEY]
+    } else {
+        fit_preds(&shapes, &enc.bricks, &qs, cfg.lanes)
+    };
     let preds: Vec<[i32; NTAP]> = fitted.iter().map(|p| p.unwrap_or([0; NTAP])).collect();
     let mut cs = enc.reconstruct(&shapes, &qs, &dl);
     let scale = enc.scale();
     let g = 2f64.powi(enc.e);
     // max-abs: corrections k·corr on the grid, then raw escapes
-    let corr = maxabs.map(|b| ((2.0 * b / g).floor() as i64).clamp(0, 1 << 30) as i32).unwrap_or(0);
+    let corr = maxabs
+        .map(|b| ((2.0 * b / g).floor() as i64).clamp(0, 1 << 30) as i32)
+        .unwrap_or(0);
     let nb = enc.bricks.len();
     let mut outl: Vec<Vec<(usize, i32)>> = vec![Vec::new(); nb];
     let mut escs: Vec<Vec<(usize, u32)>> = vec![Vec::new(); nb];
@@ -1743,16 +1974,21 @@ pub(crate) fn encode_at(enc: &Enc, dims: &[usize], cfg: &GpuConfig, dg: f64, max
         for bi in 0..nb {
             for i in 0..cs[bi].len() {
                 let xv = enc.x[enc.global_index(bi, i)];
-                let y = f32::from_bits(to_f32_bits(cs[bi][i].wrapping_add(enc.mean_fix), scale)) as f64;
+                let y =
+                    f32::from_bits(to_f32_bits(cs[bi][i].wrapping_add(enc.mean_fix), scale)) as f64;
                 let r = xv as f64 - y;
                 if r.abs() > b && corr > 0 {
-                    let k = (r / g / corr as f64).round().clamp(-(1 << 20) as f64, (1 << 20) as f64) as i32;
+                    let k = (r / g / corr as f64)
+                        .round()
+                        .clamp(-(1 << 20) as f64, (1 << 20) as f64)
+                        as i32;
                     if k != 0 {
                         cs[bi][i] = cs[bi][i].wrapping_add(k.wrapping_mul(corr));
                         outl[bi].push((i, k));
                     }
                 }
-                let y = f32::from_bits(to_f32_bits(cs[bi][i].wrapping_add(enc.mean_fix), scale)) as f64;
+                let y =
+                    f32::from_bits(to_f32_bits(cs[bi][i].wrapping_add(enc.mean_fix), scale)) as f64;
                 if (xv as f64 - y).abs() > b {
                     escs[bi].push((i, xv.to_bits()));
                 }
@@ -1763,9 +1999,19 @@ pub(crate) fn encode_at(enc: &Enc, dims: &[usize], cfg: &GpuConfig, dg: f64, max
     let idx: Vec<usize> = (0..nb).collect();
     let counts = par_map(&idx, enc.threads, |&bi| {
         let sh = &shapes[enc.bricks[bi].shape];
-        let mut cs = CountSink { n: vec![[0; 2]; NMODEL] };
+        let mut cs = CountSink {
+            n: vec![[0; 2]; NMODEL],
+        };
         let mut q = qs[bi].clone();
-        code_brick(sh, &mut q, &preds, &vec![MINIT; NMODEL], cfg.lanes, cfg.adaptive, &mut cs);
+        code_brick(
+            sh,
+            &mut q,
+            &preds,
+            &vec![MINIT; NMODEL],
+            cfg.lanes,
+            cfg.adaptive,
+            &mut cs,
+        );
         cs.n
     });
     let mut n = vec![[0u32; 2]; NMODEL];
@@ -1775,14 +2021,28 @@ pub(crate) fn encode_at(enc: &Enc, dims: &[usize], cfg: &GpuConfig, dg: f64, max
             a[1] += b[1];
         }
     }
-    let priors = if std::env::var("TC_NOPRIOR").is_ok() { vec![None; NMODEL] } else { choose_priors(&n, cfg.adaptive) };
+    let priors = if std::env::var("TC_NOPRIOR").is_ok() {
+        vec![None; NMODEL]
+    } else {
+        choose_priors(&n, cfg.adaptive)
+    };
     let init = init_of(&priors);
     // entropy-code bricks
     let payloads: Vec<(Vec<u8>, usize, usize)> = par_map(&idx, enc.threads, |&bi| {
         let sh = &shapes[enc.bricks[bi].shape];
-        let mut sink = RecSink { syms: vec![Vec::new(); cfg.lanes + 1] };
+        let mut sink = RecSink {
+            syms: vec![Vec::new(); cfg.lanes + 1],
+        };
         let mut q = qs[bi].clone();
-        code_brick(sh, &mut q, &preds, &init, cfg.lanes, cfg.adaptive, &mut sink);
+        code_brick(
+            sh,
+            &mut q,
+            &preds,
+            &init,
+            cfg.lanes,
+            cfg.adaptive,
+            &mut sink,
+        );
         let ol = cfg.lanes;
         let mut om = vec![MINIT; NOMODEL];
         let ov = &outl[bi];
@@ -1869,7 +2129,8 @@ pub(crate) fn encode_at(enc: &Enc, dims: &[usize], cfg: &GpuConfig, dg: f64, max
             let mut e = escs[bi].iter().peekable();
             for i in 0..cs[bi].len() {
                 let xv = enc.x[enc.global_index(bi, i)] as f64;
-                let y = f32::from_bits(to_f32_bits(cs[bi][i].wrapping_add(enc.mean_fix), scale)) as f64;
+                let y =
+                    f32::from_bits(to_f32_bits(cs[bi][i].wrapping_add(enc.mean_fix), scale)) as f64;
                 if e.peek().is_some_and(|&&(ei, _)| ei == i) {
                     e.next();
                     se -= (xv - y) * (xv - y);
@@ -1906,7 +2167,11 @@ mod tests {
             for j in 0..d[1] {
                 for k in 0..d[2] {
                     let (x, y, z) = (i as f64, j as f64, k as f64);
-                    v.push(((0.3 * x).sin() + (0.11 * y * z / 8.0).cos() + 0.01 * x * y - (k % 7) as f64 * 0.01 + 3.0) as f32);
+                    v.push(
+                        ((0.3 * x).sin() + (0.11 * y * z / 8.0).cos() + 0.01 * x * y
+                            - (k % 7) as f64 * 0.01
+                            + 3.0) as f32,
+                    );
                 }
             }
         }
@@ -1926,7 +2191,9 @@ mod tests {
 
     #[test]
     fn rans_round_trip() {
-        let mut s = RecSink { syms: vec![Vec::new()] };
+        let mut s = RecSink {
+            syms: vec![Vec::new()],
+        };
         let mut st = 12345u32;
         let mut vals = Vec::new();
         for i in 0..20000 {
@@ -1960,18 +2227,30 @@ mod tests {
         let x = field(d);
         for brick in [8, 16, 64] {
             for db in [50.0, 90.0] {
-                let cfg = GpuConfig { brick, lanes: 4, ..GpuConfig::new(ErrorBound::Psnr(db)) };
+                let cfg = GpuConfig {
+                    brick,
+                    lanes: 4,
+                    ..GpuConfig::new(ErrorBound::Psnr(db))
+                };
                 let (bytes, st) = encode_f32(&x, &d, &cfg);
                 let (dd, y) = decode_f32(&bytes, 1).unwrap();
                 assert_eq!(dd, d.to_vec());
                 let (rmse, mx) = err(&x, &y);
                 assert!((rmse - st.rmse).abs() <= 1e-12 * rmse, "brick {brick} {db}");
                 assert_eq!(mx, st.max_abs);
-                let range = x.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b)) - x.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+                let range = x.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b))
+                    - x.iter().fold(f32::INFINITY, |a, &b| a.min(b));
                 assert!(20.0 * (range as f64 / rmse).log10() >= db - 1e-6);
                 let (_, y4) = decode_f32(&bytes, 4).unwrap();
-                assert_eq!(y.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), y4.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
-                assert_eq!(encode_f32_mt(&x, &d, &cfg, 3).0, bytes, "thread-count independent");
+                assert_eq!(
+                    y.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    y4.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    encode_f32_mt(&x, &d, &cfg, 3).0,
+                    bytes,
+                    "thread-count independent"
+                );
             }
         }
     }
@@ -1982,7 +2261,11 @@ mod tests {
         let x = field(d);
         for rel in [1e-2, 1e-4] {
             let b = rel * 2.5;
-            let cfg = GpuConfig { brick: 16, lanes: 8, ..GpuConfig::new(ErrorBound::MaxAbs(b)) };
+            let cfg = GpuConfig {
+                brick: 16,
+                lanes: 8,
+                ..GpuConfig::new(ErrorBound::MaxAbs(b))
+            };
             let (bytes, st) = encode_f32(&x, &d, &cfg);
             let (_, y) = decode_f32(&bytes, 2).unwrap();
             let (_, mx) = err(&x, &y);
@@ -2004,12 +2287,30 @@ mod tests {
 
     #[test]
     fn two_d_and_one_d() {
-        let x2: Vec<f32> = (0..70 * 90).map(|i| ((i % 90) as f32 * 0.07).sin() * ((i / 90) as f32 * 0.05).cos()).collect();
-        let (b, st) = encode_f32(&x2, &[70, 90], &GpuConfig { brick: 32, lanes: 8, ..GpuConfig::new(ErrorBound::Psnr(70.0)) });
+        let x2: Vec<f32> = (0..70 * 90)
+            .map(|i| ((i % 90) as f32 * 0.07).sin() * ((i / 90) as f32 * 0.05).cos())
+            .collect();
+        let (b, st) = encode_f32(
+            &x2,
+            &[70, 90],
+            &GpuConfig {
+                brick: 32,
+                lanes: 8,
+                ..GpuConfig::new(ErrorBound::Psnr(70.0))
+            },
+        );
         let (_, y) = decode_f32(&b, 1).unwrap();
         assert!((err(&x2, &y).0 - st.rmse).abs() <= 1e-12 * st.rmse);
         let x1: Vec<f32> = (0..3000).map(|i| (i as f32 * 0.01).sin()).collect();
-        let (b, st) = encode_f32(&x1, &[3000], &GpuConfig { brick: 16, lanes: 2, ..GpuConfig::new(ErrorBound::Psnr(70.0)) });
+        let (b, st) = encode_f32(
+            &x1,
+            &[3000],
+            &GpuConfig {
+                brick: 16,
+                lanes: 2,
+                ..GpuConfig::new(ErrorBound::Psnr(70.0))
+            },
+        );
         let (_, y) = decode_f32(&b, 1).unwrap();
         assert!((err(&x1, &y).0 - st.rmse).abs() <= 1e-12 * st.rmse);
     }
@@ -2055,7 +2356,9 @@ mod tests {
     fn mulsh_matches_wide() {
         let mut s = 7u64;
         for _ in 0..10000 {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let a = (s >> 33) as i32;
             let b = (s as i32) >> 1;
             let sh = 1 + (s >> 58) as u32 % 60;

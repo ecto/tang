@@ -44,7 +44,10 @@ pub fn decoder_key(bytes: &[u8]) -> Result<(usize, usize), String> {
     Ok(match format_of(bytes)? {
         Format::V1 => {
             let ps = gpuwav::parse(bytes).map_err(|e| format!("{e:?}"))?;
-            (ps.lanes, ps.shapes.iter().flat_map(|s| s.dims).max().unwrap_or(2))
+            (
+                ps.lanes,
+                ps.shapes.iter().flat_map(|s| s.dims).max().unwrap_or(2),
+            )
         }
         Format::V3 => {
             let ps = gpuwav3::parse3(bytes).map_err(|e| format!("{e:?}"))?;
@@ -63,14 +66,18 @@ pub fn decode_cpu_bits(bytes: &[u8]) -> Result<Vec<u32>, String> {
         }
         Format::V3 => {
             let ps = gpuwav3::parse3(bytes).map_err(e)?;
-            Ok(gpuwav3::decode3_box_parsed(&ps, bytes, [0; 3], ps.d3, 1).map_err(e)?.bits)
+            Ok(gpuwav3::decode3_box_parsed(&ps, bytes, [0; 3], ps.d3, 1)
+                .map_err(e)?
+                .bits)
         }
     }
 }
 
 /// FNV-1a 64 of `f32` bit patterns (same as `gpubench encode3`'s `.hash`).
 pub fn fnv1a_bits(v: &[u32]) -> u64 {
-    v.iter().fold(0xcbf29ce484222325u64, |h, &x| (h ^ x as u64).wrapping_mul(0x100000001b3))
+    v.iter().fold(0xcbf29ce484222325u64, |h, &x| {
+        (h ^ x as u64).wrapping_mul(0x100000001b3)
+    })
 }
 
 fn bits_to_f32(v: Vec<u32>) -> js_sys::Float32Array {
@@ -81,7 +88,8 @@ fn bits_to_f32(v: Vec<u32>) -> js_sys::Float32Array {
 }
 
 fn f32_bits(a: &js_sys::Float32Array) -> Vec<u32> {
-    js_sys::Uint32Array::new_with_byte_offset_and_length(&a.buffer(), a.byte_offset(), a.length()).to_vec()
+    js_sys::Uint32Array::new_with_byte_offset_and_length(&a.buffer(), a.byte_offset(), a.length())
+        .to_vec()
 }
 
 #[wasm_bindgen]
@@ -131,7 +139,9 @@ pub fn stream_info(bytes: &[u8]) -> Result<String, JsError> {
 /// CPU (WASM, one thread) decode.
 #[wasm_bindgen(js_name = decodeCpu)]
 pub fn decode_cpu(bytes: &[u8]) -> Result<js_sys::Float32Array, JsError> {
-    decode_cpu_bits(bytes).map(bits_to_f32).map_err(|e| JsError::new(&e))
+    decode_cpu_bits(bytes)
+        .map(bits_to_f32)
+        .map_err(|e| JsError::new(&e))
 }
 
 /// FNV-1a 64 (hex) of a decoded array's bit patterns.
@@ -154,9 +164,15 @@ impl TcGpu {
     /// Open the WebGPU adapter (fails where `navigator.gpu` is missing).
     pub async fn create() -> Result<TcGpu, JsError> {
         // a throwaway decoder proves the adapter + kernels compile
-        let d = GpuDecoder::new_async(8, 64).await.map_err(|e| JsError::new(&e))?;
+        let d = GpuDecoder::new_async(8, 64)
+            .await
+            .map_err(|e| JsError::new(&e))?;
         let adapter = d.name.clone();
-        Ok(TcGpu { decs: vec![((8, 64), Arc::new(d))], last: GpuTimes::default(), adapter })
+        Ok(TcGpu {
+            decs: vec![((8, 64), Arc::new(d))],
+            last: GpuTimes::default(),
+            adapter,
+        })
     }
 
     /// Adapter description.
@@ -170,7 +186,11 @@ impl TcGpu {
         if let Some(d) = self.decs.iter().find(|d| d.0 == key) {
             return Ok(d.1.clone());
         }
-        let d = Arc::new(GpuDecoder::new_async(key.0, key.1).await.map_err(|e| JsError::new(&e))?);
+        let d = Arc::new(
+            GpuDecoder::new_async(key.0, key.1)
+                .await
+                .map_err(|e| JsError::new(&e))?,
+        );
         self.decs.push((key, d.clone()));
         Ok(d)
     }
@@ -199,6 +219,9 @@ impl TcGpu {
     #[wasm_bindgen(js_name = lastTimes)]
     pub fn last_times(&self) -> String {
         let t = self.last;
-        format!("{{\"parse_s\":{},\"upload_s\":{},\"kernels_s\":{},\"readback_s\":{}}}", t.parse_s, t.upload_s, t.kernels_s, t.readback_s)
+        format!(
+            "{{\"parse_s\":{},\"upload_s\":{},\"kernels_s\":{},\"readback_s\":{}}}",
+            t.parse_s, t.upload_s, t.kernels_s, t.readback_s
+        )
     }
 }

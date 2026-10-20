@@ -42,7 +42,12 @@ fn main() {
     let mut seed = 12345u64;
     for f in &files {
         let b = std::fs::read(f).unwrap();
-        let x: Vec<f32> = b.as_chunks::<4>().0.iter().map(|&c| f32::from_le_bytes(c)).collect();
+        let x: Vec<f32> = b
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| f32::from_le_bytes(c))
+            .collect();
         let xd: Vec<f64> = x.iter().map(|&v| v as f64).collect();
         let co = Coeffs::new(&xd, &dims);
         for &p in &psnrs {
@@ -54,18 +59,31 @@ fn main() {
             // seeded partial Fisher–Yates subsample
             let k = per.min(s.len());
             for j in 0..k {
-                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let r = j + (seed >> 11) as usize % (s.len() - j);
                 s.swap(j, r);
             }
             s.truncate(k);
-            eprintln!("{f} psnr {p}: delta {:.4e}, hand {:.4} bpv, {} samples", st.delta, st.bits_per_value, s.len());
+            eprintln!(
+                "{f} psnr {p}: delta {:.4e}, hand {:.4} bpv, {} samples",
+                st.delta,
+                st.bits_per_value,
+                s.len()
+            );
             samples.extend(s);
         }
     }
     let t = std::time::Instant::now();
     let net = train(&samples, &cfg);
-    eprintln!("trained {} params on {} samples in {:.1}s: {:.4} bits/sample (float view)", net.num_params(), samples.len(), t.elapsed().as_secs_f64(), mean_bits_float(&net, &samples));
+    eprintln!(
+        "trained {} params on {} samples in {:.1}s: {:.4} bits/sample (float view)",
+        net.num_params(),
+        samples.len(),
+        t.elapsed().as_secs_f64(),
+        mean_bits_float(&net, &samples)
+    );
     std::fs::write(out, Arc::new(net).to_bytes()).unwrap();
     let _ = Net::from_bytes(&std::fs::read(out).unwrap()).unwrap();
 }

@@ -9,7 +9,7 @@
 
 use std::time::Instant;
 
-use tang_compress::kvcodec::{step_for_bpv, KvEncoder, KvParams, KvStream, Kind};
+use tang_compress::kvcodec::{step_for_bpv, Kind, KvEncoder, KvParams, KvStream};
 
 fn usage() -> ! {
     eprintln!("usage: kvc encode IN OUT --shape HxTxD --kind k|v (--rmse r|--maxabs e|--bpv b) [--post] [--sink n] [--sinkdiv n] [--block n] [--noar] [--theta t] [--prefill n]\n       kvc decode IN OUT [--range t0:t1] [--reps n]");
@@ -17,11 +17,19 @@ fn usage() -> ! {
 }
 
 fn flag(args: &[String], name: &str) -> Option<String> {
-    args.iter().position(|a| a == name).map(|i| args.get(i + 1).cloned().unwrap_or_else(|| usage()))
+    args.iter()
+        .position(|a| a == name)
+        .map(|i| args.get(i + 1).cloned().unwrap_or_else(|| usage()))
 }
 
 fn read_f32(path: &str) -> Vec<f32> {
-    std::fs::read(path).unwrap().as_chunks::<4>().0.iter().map(|&c| f32::from_le_bytes(c)).collect()
+    std::fs::read(path)
+        .unwrap()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&c| f32::from_le_bytes(c))
+        .collect()
 }
 
 fn main() {
@@ -32,7 +40,11 @@ fn main() {
     match args[1].as_str() {
         "encode" => {
             let x = read_f32(&args[2]);
-            let shape: Vec<usize> = flag(&args, "--shape").unwrap_or_else(|| usage()).split('x').map(|s| s.parse().unwrap()).collect();
+            let shape: Vec<usize> = flag(&args, "--shape")
+                .unwrap_or_else(|| usage())
+                .split('x')
+                .map(|s| s.parse().unwrap())
+                .collect();
             let (h, n, d) = (shape[0], shape[1], shape[2]);
             let kind = match flag(&args, "--kind").as_deref() {
                 Some("k") => Kind::K,
@@ -71,7 +83,9 @@ fn main() {
             } else {
                 usage()
             };
-            let pre: usize = flag(&args, "--prefill").map(|v| v.parse().unwrap()).unwrap_or(n);
+            let pre: usize = flag(&args, "--prefill")
+                .map(|v| v.parse().unwrap())
+                .unwrap_or(n);
             let slice = |t0: usize, t1: usize| -> Vec<f32> {
                 let mut v = Vec::with_capacity(h * (t1 - t0) * d);
                 for hh in 0..h {
@@ -106,7 +120,9 @@ fn main() {
                 }
                 None => (0, s.tokens),
             };
-            let reps: usize = flag(&args, "--reps").map(|v| v.parse().unwrap()).unwrap_or(1);
+            let reps: usize = flag(&args, "--reps")
+                .map(|v| v.parse().unwrap())
+                .unwrap_or(1);
             let t = Instant::now();
             let mut y = Vec::new();
             for _ in 0..reps {
@@ -115,7 +131,10 @@ fn main() {
             let dec = t.elapsed().as_secs_f64() / reps as f64;
             let out: Vec<u8> = y.iter().flat_map(|v| v.to_le_bytes()).collect();
             std::fs::write(&args[3], out).unwrap();
-            println!("{{\"decode_s\":{dec},\"ns_per_value\":{}}}", 1e9 * dec / y.len().max(1) as f64);
+            println!(
+                "{{\"decode_s\":{dec},\"ns_per_value\":{}}}",
+                1e9 * dec / y.len().max(1) as f64
+            );
         }
         _ => usage(),
     }

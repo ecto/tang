@@ -29,8 +29,8 @@
 //! (`u32`, always 0) for the adaptive role.
 
 use crate::coefcode::{KB, NE};
-use crate::lmodel3::{AB, AC};
 use crate::gpuwav::{ESC0, LOW0, MAG0, SGN0, SIG0};
+use crate::lmodel3::{AB, AC};
 use tang_expr::int::{Elem, IId, IType, IntGraph};
 
 /// Buffer ABI of the residual graphs.
@@ -38,8 +38,18 @@ pub const BUFS: [(&str, Elem); 2] = [("mt", Elem::U32), ("stream", Elem::U32)];
 /// Param types of the static graph.
 pub const STATIC_PARAMS: [IType; 8] = [IType::U32; 8];
 /// Param types of the learned graph.
-pub const LEARNED_PARAMS: [IType; 10] =
-    [IType::U32, IType::U32, IType::U32, IType::I32, IType::I32, IType::I32, IType::I32, IType::I32, IType::U32, IType::U32];
+pub const LEARNED_PARAMS: [IType; 10] = [
+    IType::U32,
+    IType::U32,
+    IType::U32,
+    IType::I32,
+    IType::I32,
+    IType::I32,
+    IType::I32,
+    IType::I32,
+    IType::U32,
+    IType::U32,
+];
 /// Output types of both residual graphs.
 pub const OUTS: [IType; 3] = [IType::U32, IType::U32, IType::I32];
 /// Param types of the adaptive learned graph.
@@ -97,7 +107,13 @@ impl B {
         let mt = g.buffer(BUFS[0].0, BUFS[0].1);
         let stream = g.buffer(BUFS[1].0, BUFS[1].1);
         let end = g.param(2, IType::U32);
-        Self { g, mt, stream, end, ad: None }
+        Self {
+            g,
+            mt,
+            stream,
+            end,
+            ad: None,
+        }
     }
     fn u(&mut self, v: u32) -> IId {
         self.g.u32(v)
@@ -142,7 +158,10 @@ impl B {
         let p2 = g.select(ren, p1, s.pos);
         match on {
             None => St { x: x2, pos: p2 },
-            Some(c) => St { x: g.select(c, x2, s.x), pos: g.select(c, p2, s.pos) },
+            Some(c) => St {
+                x: g.select(c, x2, s.x),
+                pos: g.select(c, p2, s.pos),
+            },
         }
     }
     /// A binary decision at `P(1) = p1/2^16`; the bit is false when off.
@@ -168,7 +187,15 @@ impl B {
     /// stretch-domain bins around `p1` are interpolated and mixed with `p1`,
     /// then the nearer bin moves toward the bit. Returns the state, the bit
     /// and the next effect token; nothing is written when `on` is false.
-    fn ad_bit(&mut self, s: St, tok: IId, ctx: IId, grp: usize, p1: IId, on: Option<IId>) -> (St, IId, IId) {
+    fn ad_bit(
+        &mut self,
+        s: St,
+        tok: IId,
+        ctx: IId,
+        grp: usize,
+        p1: IId,
+        on: Option<IId>,
+    ) -> (St, IId, IId) {
         let a = self.ad.expect("adaptive graph");
         let g = &mut self.g;
         let (one, four, eight) = (g.u32(1), g.u32(4), g.u32(8));
@@ -260,12 +287,25 @@ impl B {
         let mut b = std::mem::take(&mut self.g);
         let (stream, end, mt) = (self.stream, self.end, self.mt);
         let out = b.while_loop(&[n, z, s.x, s.pos], |g, st| {
-            let mut me = B { g: std::mem::take(g), mt, stream, end, ad: None };
+            let mut me = B {
+                g: std::mem::take(g),
+                mt,
+                stream,
+                end,
+                ad: None,
+            };
             let zero = me.u(0);
             let sixteen = me.u(16);
             let go = me.g.lt(zero, st[0]);
             let c = me.g.min(st[0], sixteen);
-            let (s2, v) = me.raw(St { x: st[2], pos: st[3] }, c, None);
+            let (s2, v) = me.raw(
+                St {
+                    x: st[2],
+                    pos: st[3],
+                },
+                c,
+                None,
+            );
             let o = me.g.shl(st[1], c);
             let o = me.g.or(o, v);
             let n2 = me.g.sub(st[0], c);
@@ -274,7 +314,13 @@ impl B {
         });
         b.cap_loop(out[0], 3);
         self.g = b;
-        (St { x: out[2], pos: out[3] }, out[1])
+        (
+            St {
+                x: out[2],
+                pos: out[3],
+            },
+            out[1],
+        )
     }
     fn prior(&mut self, idx: IId, off: IId) -> IId {
         let g = &mut self.g;
@@ -301,12 +347,26 @@ impl B {
         let mut b = std::mem::take(&mut self.g);
         let (stream, end, mt) = (self.stream, self.end, self.mt);
         let out = b.while_loop(&[z, s.x, s.pos, on], |g, st| {
-            let mut me = B { g: std::mem::take(g), mt, stream, end, ad: None };
+            let mut me = B {
+                g: std::mem::take(g),
+                mt,
+                stream,
+                end,
+                ad: None,
+            };
             let mx = me.u(max);
             let more = me.g.lt(st[0], mx);
             let go = me.g.and(st[3], more);
             let idx = me.g.add(base, st[0]);
-            let (s2, bit) = me.sbit(St { x: st[1], pos: st[2] }, idx, off, None);
+            let (s2, bit) = me.sbit(
+                St {
+                    x: st[1],
+                    pos: st[2],
+                },
+                idx,
+                off,
+                None,
+            );
             let one = me.u(1);
             let h1 = me.g.add(st[0], one);
             let h = me.g.select(bit, h1, st[0]);
@@ -315,7 +375,13 @@ impl B {
         });
         b.cap_loop(out[0], max + 1);
         self.g = b;
-        (St { x: out[1], pos: out[2] }, out[0])
+        (
+            St {
+                x: out[1],
+                pos: out[2],
+            },
+            out[0],
+        )
     }
 }
 
@@ -573,12 +639,25 @@ fn learned_graph_with(adaptive: bool) -> (IntGraph, Vec<IId>) {
             let m = g.cmp(tang_expr::int::CmpOp::Ne, m, z);
             g.and(on, m)
         });
-        b.ad = Some(Ad { buf, so, wa, lim, en });
+        b.ad = Some(Ad {
+            buf,
+            so,
+            wa,
+            lim,
+            en,
+        });
         tok = b.g.token();
     }
     let ad = b.ad;
     // one decision: adaptive (context `ctx`, group `grp`) or plain
-    let dec = |b: &mut B, s: St, tok: IId, ctx: IId, grp: usize, p: IId, on: Option<IId>| -> (St, IId, IId) {
+    let dec = |b: &mut B,
+               s: St,
+               tok: IId,
+               ctx: IId,
+               grp: usize,
+               p: IId,
+               on: Option<IId>|
+     -> (St, IId, IId) {
         if adaptive {
             b.ad_bit(s, tok, ctx, grp, p, on)
         } else {
@@ -588,7 +667,13 @@ fn learned_graph_with(adaptive: bool) -> (IntGraph, Vec<IId>) {
     };
     let pi = b.sig16(o[0], off_sig);
     let pi = b.g.shr(pi, one);
-    let mx = Mix { pi, mu: [o[1], o[2]], ls: [o[3], o[4]], off_sig, off_pow };
+    let mx = Mix {
+        pi,
+        mu: [o[1], o[2]],
+        ls: [o[3], o[4]],
+        off_sig,
+        off_pow,
+    };
     let s = St { x, pos };
     let zi = b.i(0);
     let m1 = b.i(-1);
@@ -612,7 +697,13 @@ fn learned_graph_with(adaptive: bool) -> (IntGraph, Vec<IId>) {
     let (stream, end, mt) = (b.stream, b.end, b.mt);
     let mxr = &mx;
     let out = gb.while_loop(&[z, ta0, z, s.x, s.pos, en, tok], |g, st| {
-        let mut me = B { g: std::mem::take(g), mt, stream, end, ad };
+        let mut me = B {
+            g: std::mem::take(g),
+            mt,
+            stream,
+            end,
+            ad,
+        };
         let c30 = me.u(30);
         let more = me.g.lt(st[0], c30);
         let go = me.g.and(st[5], more);
@@ -624,7 +715,18 @@ fn learned_graph_with(adaptive: bool) -> (IntGraph, Vec<IId>) {
         let (two, three) = (me.u(2), me.u(3));
         let ctx = me.g.min(st[0], three);
         let ctx = me.g.add(ctx, two);
-        let (s2, bit, tk) = dec(&mut me, St { x: st[3], pos: st[4] }, st[6], ctx, 2, p, None);
+        let (s2, bit, tk) = dec(
+            &mut me,
+            St {
+                x: st[3],
+                pos: st[4],
+            },
+            st[6],
+            ctx,
+            2,
+            p,
+            None,
+        );
         let ta = me.g.select(bit, tb, st[1]);
         let kk = me.g.select(bit, k1, st[0]);
         *g = me.g;
@@ -633,7 +735,10 @@ fn learned_graph_with(adaptive: bool) -> (IntGraph, Vec<IId>) {
     gb.cap_loop(out[0], 31);
     b.g = gb;
     let (kq, ta, tb, tok) = (out[0], out[1], out[2], out[6]);
-    let s = St { x: out[3], pos: out[4] };
+    let s = St {
+        x: out[3],
+        pos: out[4],
+    };
     let lo = b.g.shl(one, kq);
     let lm1 = b.g.sub(lo, one);
     let hi = b.g.add(lo, lm1);
@@ -644,7 +749,13 @@ fn learned_graph_with(adaptive: bool) -> (IntGraph, Vec<IId>) {
     let first = b.g.bool(true);
     let mut gb = std::mem::take(&mut b.g);
     let out = gb.while_loop(&[lo, hi, ta, endv, s.x, s.pos, tok, first], |g, st| {
-        let mut me = B { g: std::mem::take(g), mt, stream, end, ad };
+        let mut me = B {
+            g: std::mem::take(g),
+            mt,
+            stream,
+            end,
+            ad,
+        };
         let lt = me.g.lt(st[0], st[1]);
         let go = me.g.and(en, lt);
         let one = me.u(1);
@@ -663,7 +774,18 @@ fn learned_graph_with(adaptive: bool) -> (IntGraph, Vec<IId>) {
         let p = me.ratio16(up, all);
         let (c6, c7) = (me.u(6), me.u(7));
         let ctx = me.g.select(st[7], c6, c7);
-        let (s2, bit, tk) = dec(&mut me, St { x: st[4], pos: st[5] }, st[6], ctx, 3, p, None);
+        let (s2, bit, tk) = dec(
+            &mut me,
+            St {
+                x: st[4],
+                pos: st[5],
+            },
+            st[6],
+            ctx,
+            3,
+            p,
+            None,
+        );
         let mm1 = me.g.sub(mid, one);
         let nlo = me.g.select(bit, mid, st[0]);
         let ntl = me.g.select(bit, tm, st[2]);
@@ -675,7 +797,10 @@ fn learned_graph_with(adaptive: bool) -> (IntGraph, Vec<IId>) {
     });
     gb.cap_loop(out[0], 31);
     b.g = gb;
-    let s = St { x: out[4], pos: out[5] };
+    let s = St {
+        x: out[4],
+        pos: out[5],
+    };
     let li = b.g.bitcast(IType::I32, out[0]);
     let nl = b.g.neg(li);
     let r = b.g.select(neg, nl, li);
@@ -700,10 +825,37 @@ pub fn wgsl(stat: (&IntGraph, &[IId]), learned: (&IntGraph, &[IId]), guarded: bo
         }
     };
     let res = ["rx", "rpos", "r", "adk"];
-    let mut s = String::from("fn res_static_gen(sig: u32, e: u32, cls: u32, sctx: u32) -> i32 {\n    var r: i32;\n");
-    s += &body(stat.0, stat.1, &["rx", "rpos", "rend", "sig", "e", "cls", "sctx", "P.off_init"], &res[..3]);
+    let mut s = String::from(
+        "fn res_static_gen(sig: u32, e: u32, cls: u32, sctx: u32) -> i32 {\n    var r: i32;\n",
+    );
+    s += &body(
+        stat.0,
+        stat.1,
+        &[
+            "rx",
+            "rpos",
+            "rend",
+            "sig",
+            "e",
+            "cls",
+            "sctx",
+            "P.off_init",
+        ],
+        &res[..3],
+    );
     s += "    return r;\n}\n\nfn res_learned_gen(o0: i32, o1: i32, o2: i32, o3: i32, o4: i32) -> i32 {\n    var r: i32;\n";
-    let mut p = vec!["rx", "rpos", "rend", "o0", "o1", "o2", "o3", "o4", "mt[P.pad4]", "mt[P.pad4 + 1u]"];
+    let mut p = vec![
+        "rx",
+        "rpos",
+        "rend",
+        "o0",
+        "o1",
+        "o2",
+        "o3",
+        "o4",
+        "mt[P.pad4]",
+        "mt[P.pad4 + 1u]",
+    ];
     if learned.1.len() == OUTS_AD.len() {
         s += "    var adk: u32;\n";
         p.extend(["ad_so", "ad_wa", "ad_lim", "ad_mask"]);
@@ -771,9 +923,24 @@ pub struct Lane {
 impl Lane {
     /// Lane over 16-bit words `lo..hi` of `stream`.
     pub fn new(stream: &[u32], lo: u32, hi: u32) -> Self {
-        let w = |i: u32| if i < hi { (stream.get((i >> 1) as usize).copied().unwrap_or(0) >> ((i & 1) * 16)) & 0xFFFF } else { 0 };
-        let x = if hi.wrapping_sub(lo) >= 2 && hi >= lo { w(lo) | w(lo + 1) << 16 } else { 1 << 16 };
-        Self { x, pos: lo + 2, end: hi, lo }
+        let w = |i: u32| {
+            if i < hi {
+                (stream.get((i >> 1) as usize).copied().unwrap_or(0) >> ((i & 1) * 16)) & 0xFFFF
+            } else {
+                0
+            }
+        };
+        let x = if hi.wrapping_sub(lo) >= 2 && hi >= lo {
+            w(lo) | w(lo + 1) << 16
+        } else {
+            1 << 16
+        };
+        Self {
+            x,
+            pos: lo + 2,
+            end: hi,
+            lo,
+        }
     }
     /// Whether more words were consumed than the lane holds.
     pub fn overrun(&self) -> bool {
@@ -795,13 +962,23 @@ impl CpuRes {
     /// A static graph (`off_init` into `mt`) or a learned one
     /// (`off_sig`, `off_pow`).
     pub fn new(g: &IntGraph, outs: &[IId], learned: bool, off: [u32; 2]) -> Self {
-        Self { prog: tang_expr::int::Program::new(g, outs), learned, off, ad: None }
+        Self {
+            prog: tang_expr::int::Program::new(g, outs),
+            learned,
+            off,
+            ad: None,
+        }
     }
     /// The adaptive learned role with settings `ad` (`off` as for a learned
     /// graph; the stretch table follows the 2^x table, see [`cpu_mt`]).
     pub fn new_ad(g: &IntGraph, outs: &[IId], off: [u32; 2], ad: crate::lmodel3::AdCfg) -> Self {
         let so = off[1] + crate::lmodel3::tables().1.len() as u32;
-        Self { prog: tang_expr::int::Program::new(g, outs), learned: true, off, ad: Some([so, ad.wa, ad.lim, ad.mask]) }
+        Self {
+            prog: tang_expr::int::Program::new(g, outs),
+            learned: true,
+            off,
+            ad: Some([so, ad.wa, ad.lim, ad.mask]),
+        }
     }
     /// Whether this is the learned role.
     pub fn learned(&self) -> bool {
@@ -809,15 +986,46 @@ impl CpuRes {
     }
     /// Decode one static-prior residual.
     #[allow(clippy::too_many_arguments)]
-    pub fn res_static(&mut self, l: &mut Lane, mt: &[u32], stream: &[u32], sig: u32, e: u32, cls: u32, sctx: u32) -> i32 {
+    pub fn res_static(
+        &mut self,
+        l: &mut Lane,
+        mt: &[u32],
+        stream: &[u32],
+        sig: u32,
+        e: u32,
+        cls: u32,
+        sctx: u32,
+    ) -> i32 {
         let p = [l.x, l.pos, l.end, sig, e, cls, sctx, self.off[0]];
         self.run(l, &p, mt, stream)
     }
     /// Decode one learned residual from the net outputs; `adt` is the lane's
     /// adaptive state ([`crate::lmodel3::ad_init`], unused by the plain role).
-    pub fn res_learned(&mut self, l: &mut Lane, mt: &[u32], stream: &[u32], o: &[i32; 5], adt: &mut [u32]) -> i32 {
+    pub fn res_learned(
+        &mut self,
+        l: &mut Lane,
+        mt: &[u32],
+        stream: &[u32],
+        o: &[i32; 5],
+        adt: &mut [u32],
+    ) -> i32 {
         let a = self.ad.unwrap_or_default();
-        let p = [l.x, l.pos, l.end, o[0] as u32, o[1] as u32, o[2] as u32, o[3] as u32, o[4] as u32, self.off[0], self.off[1], a[0], a[1], a[2], a[3]];
+        let p = [
+            l.x,
+            l.pos,
+            l.end,
+            o[0] as u32,
+            o[1] as u32,
+            o[2] as u32,
+            o[3] as u32,
+            o[4] as u32,
+            self.off[0],
+            self.off[1],
+            a[0],
+            a[1],
+            a[2],
+            a[3],
+        ];
         let mut out = [0u32; 4];
         self.prog.run_rw(&p, &[mt, stream], &mut [adt], &mut out);
         l.x = out[0];
@@ -853,7 +1061,9 @@ mod tests {
     use crate::lmodel3::{code_learned, Mix3};
 
     fn rng(s: &mut u64) -> u32 {
-        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (*s >> 33) as u32
     }
 
@@ -864,13 +1074,23 @@ mod tests {
     #[test]
     fn static_graph_decodes_native_encoding() {
         let mut s = 1u64;
-        let init: Vec<u32> = (0..NMODEL).map(|_| (rng(&mut s) & 0xFFFF) | (rng(&mut s) & 0xFFFF) << 16).collect();
-        let mut syms = RecSink { syms: vec![Vec::new()] };
+        let init: Vec<u32> = (0..NMODEL)
+            .map(|_| (rng(&mut s) & 0xFFFF) | (rng(&mut s) & 0xFFFF) << 16)
+            .collect();
+        let mut syms = RecSink {
+            syms: vec![Vec::new()],
+        };
         let mut items = Vec::new();
         for _ in 0..4000 {
             let e = (rng(&mut s) % NE as u32) as usize;
             let cls = (rng(&mut s) % 10) as usize;
-            let f = Feats { taps: [0; crate::gpuwav::NTAP], sig: (rng(&mut s) % 240) as usize, e, sctx: cls * 9 + (rng(&mut s) % 9) as usize, raw: [0; 18] };
+            let f = Feats {
+                taps: [0; crate::gpuwav::NTAP],
+                sig: (rng(&mut s) % 240) as usize,
+                e,
+                sctx: cls * 9 + (rng(&mut s) % 9) as usize,
+                raw: [0; 18],
+            };
             let r = match rng(&mut s) % 4 {
                 0 => 0,
                 1 => (rng(&mut s) % 7) as i32 - 3,
@@ -890,7 +1110,18 @@ mod tests {
         let mut cr = CpuRes::new(&g, &o, false, [0, 0]);
         let mut l = Lane::new(&sw, 3, 3 + words.len() as u32);
         for (f, cls, r) in items {
-            assert_eq!(cr.res_static(&mut l, &init, &sw, f.sig as u32, f.e as u32, cls as u32, f.sctx as u32), r);
+            assert_eq!(
+                cr.res_static(
+                    &mut l,
+                    &init,
+                    &sw,
+                    f.sig as u32,
+                    f.e as u32,
+                    cls as u32,
+                    f.sctx as u32
+                ),
+                r
+            );
         }
         assert!(!l.overrun());
         assert_eq!(l.pos, l.end);
@@ -899,7 +1130,9 @@ mod tests {
     #[test]
     fn learned_graph_decodes_native_encoding() {
         let mut s = 2u64;
-        let mut syms = RecSink { syms: vec![Vec::new()] };
+        let mut syms = RecSink {
+            syms: vec![Vec::new()],
+        };
         let mut items = Vec::new();
         for _ in 0..3000 {
             let o = [
@@ -936,10 +1169,36 @@ mod tests {
         let (g, go) = learned_ad_graph();
         // and through the wire (the shipped form)
         let w = g.to_bytes(&go);
-        let (g2, go2) = IntGraph::from_bytes_rw(&w, &LEARNED_AD_PARAMS, &BUFS, &RW_AD, &OUTS_AD, &tang_expr::int::Limits::default()).unwrap();
-        for c in [AdCfg { wa: 10, lim: 14, mask: 15 }, AdCfg { wa: 16, lim: 3, mask: 5 }, AdCfg { wa: 0, lim: 0, mask: 0 }] {
+        let (g2, go2) = IntGraph::from_bytes_rw(
+            &w,
+            &LEARNED_AD_PARAMS,
+            &BUFS,
+            &RW_AD,
+            &OUTS_AD,
+            &tang_expr::int::Limits::default(),
+        )
+        .unwrap();
+        for c in [
+            AdCfg {
+                wa: 10,
+                lim: 14,
+                mask: 15,
+            },
+            AdCfg {
+                wa: 16,
+                lim: 3,
+                mask: 5,
+            },
+            AdCfg {
+                wa: 0,
+                lim: 0,
+                mask: 0,
+            },
+        ] {
             let mut s = 3u64;
-            let mut syms = RecSink { syms: vec![Vec::new()] };
+            let mut syms = RecSink {
+                syms: vec![Vec::new()],
+            };
             let mut ad = Adapt::new(c);
             let mut items = Vec::new();
             for i in 0..4000 {
@@ -972,7 +1231,11 @@ mod tests {
                     if i % 1000 == 0 {
                         adt = ad_init();
                     }
-                    assert_eq!(cr.res_learned(&mut l, &mt, &sw, o, &mut adt), *r, "{c:?} item {i}");
+                    assert_eq!(
+                        cr.res_learned(&mut l, &mt, &sw, o, &mut adt),
+                        *r,
+                        "{c:?} item {i}"
+                    );
                 }
                 assert_eq!(l.pos, l.end);
             }

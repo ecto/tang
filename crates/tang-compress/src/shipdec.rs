@@ -67,7 +67,13 @@ pub struct Decoder {
 
 impl std::fmt::Debug for Decoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Decoder {{ key: {:016x}, size: {}, mlp: {} }}", self.key, self.size, self.mlp.is_some())
+        write!(
+            f,
+            "Decoder {{ key: {:016x}, size: {}, mlp: {} }}",
+            self.key,
+            self.size,
+            self.mlp.is_some()
+        )
     }
 }
 
@@ -115,11 +121,21 @@ fn get(b: &[u8], p: &mut usize) -> Result<u64, DecodeError> {
 
 /// Serialize a decoder program from graphs (`None` sections are left to the
 /// receiver's built-ins).
-pub fn program_bytes(stat: Option<&Graph>, learned: Option<&Graph>, mlp: Option<&Graph>, learned_ad: Option<&Graph>) -> Vec<u8> {
+pub fn program_bytes(
+    stat: Option<&Graph>,
+    learned: Option<&Graph>,
+    mlp: Option<&Graph>,
+    learned_ad: Option<&Graph>,
+) -> Vec<u8> {
     let mut o = PMAGIC.to_vec();
     o.push(1);
     let secs = [stat, learned, mlp, learned_ad];
-    o.push(secs.iter().enumerate().map(|(i, s)| (s.is_some() as u8) << i).sum());
+    o.push(
+        secs.iter()
+            .enumerate()
+            .map(|(i, s)| (s.is_some() as u8) << i)
+            .sum(),
+    );
     for (g, outs) in secs.into_iter().flatten() {
         let b = g.to_bytes(outs);
         put(&mut o, b.len() as u64);
@@ -133,8 +149,17 @@ pub fn program_bytes(stat: Option<&Graph>, learned: Option<&Graph>, mlp: Option<
 /// `net`'s MLP when given.
 pub fn builtin_program(net: Option<&Net32>, ad: bool) -> Vec<u8> {
     let mlp = net.map(|n| n.graph());
-    let (l, la) = if ad { (None, Some(crate::irdec::learned_ad_graph())) } else { (Some(crate::irdec::learned_graph()), None) };
-    program_bytes(Some(&crate::irdec::static_graph()), l.as_ref(), mlp.as_ref(), la.as_ref())
+    let (l, la) = if ad {
+        (None, Some(crate::irdec::learned_ad_graph()))
+    } else {
+        (Some(crate::irdec::learned_graph()), None)
+    };
+    program_bytes(
+        Some(&crate::irdec::static_graph()),
+        l.as_ref(),
+        mlp.as_ref(),
+        la.as_ref(),
+    )
 }
 
 /// Wrap a TCG3 stream with a decoder program.
@@ -151,11 +176,23 @@ pub fn wrap(stream: &[u8], program: &[u8]) -> Vec<u8> {
 }
 
 fn res_limits() -> Limits {
-    Limits { max_nodes: 1 << 14, max_loops: 16, max_depth: 2, max_trip: 64, max_cost: 1 << 16 }
+    Limits {
+        max_nodes: 1 << 14,
+        max_loops: 16,
+        max_depth: 2,
+        max_trip: 64,
+        max_cost: 1 << 16,
+    }
 }
 
 fn mlp_limits() -> Limits {
-    Limits { max_nodes: 1 << 16, max_loops: 0, max_depth: 0, max_trip: 0, max_cost: 1 << 16 }
+    Limits {
+        max_nodes: 1 << 16,
+        max_loops: 0,
+        max_depth: 0,
+        max_trip: 0,
+        max_cost: 1 << 16,
+    }
 }
 
 /// Verify and lower a program (no cache).
@@ -174,25 +211,46 @@ pub fn compile(prog: &[u8]) -> Result<Decoder, DecodeError> {
     let mut p = 6;
     let sec = |p: &mut usize| -> Result<&[u8], DecodeError> {
         let n = get(prog, p)? as usize;
-        let s = prog.get(*p..p.checked_add(n).ok_or(DecodeError::Truncated)?).ok_or(DecodeError::Truncated)?;
+        let s = prog
+            .get(*p..p.checked_add(n).ok_or(DecodeError::Truncated)?)
+            .ok_or(DecodeError::Truncated)?;
         *p += n;
         Ok(s)
     };
     let stat = match flags & 1 {
         0 => crate::irdec::static_graph(),
-        _ => IntGraph::from_bytes(sec(&mut p)?, &STATIC_PARAMS, &BUFS, &OUTS, &res_limits()).map_err(bad)?,
+        _ => IntGraph::from_bytes(sec(&mut p)?, &STATIC_PARAMS, &BUFS, &OUTS, &res_limits())
+            .map_err(bad)?,
     };
     let learned = match flags & 2 {
         0 => crate::irdec::learned_graph(),
-        _ => IntGraph::from_bytes(sec(&mut p)?, &LEARNED_PARAMS, &BUFS, &OUTS, &res_limits()).map_err(bad)?,
+        _ => IntGraph::from_bytes(sec(&mut p)?, &LEARNED_PARAMS, &BUFS, &OUTS, &res_limits())
+            .map_err(bad)?,
     };
     let mlp = match flags & 4 {
         0 => None,
-        _ => Some(IntGraph::from_bytes(sec(&mut p)?, &[IType::I32; NFL], &[], &[IType::I32; NO], &mlp_limits()).map_err(bad)?),
+        _ => Some(
+            IntGraph::from_bytes(
+                sec(&mut p)?,
+                &[IType::I32; NFL],
+                &[],
+                &[IType::I32; NO],
+                &mlp_limits(),
+            )
+            .map_err(bad)?,
+        ),
     };
     let learned_ad = match flags & 8 {
         0 => crate::irdec::learned_ad_graph(),
-        _ => IntGraph::from_bytes_rw(sec(&mut p)?, &LEARNED_AD_PARAMS, &BUFS, &RW_AD, &OUTS_AD, &res_limits()).map_err(bad)?,
+        _ => IntGraph::from_bytes_rw(
+            sec(&mut p)?,
+            &LEARNED_AD_PARAMS,
+            &BUFS,
+            &RW_AD,
+            &OUTS_AD,
+            &res_limits(),
+        )
+        .map_err(bad)?,
     };
     if p != prog.len() {
         return Err(DecodeError::Invalid("decoder program trailing bytes"));
@@ -204,9 +262,22 @@ pub fn compile(prog: &[u8]) -> Result<Decoder, DecodeError> {
         let dests: Vec<String> = (0..o.len()).map(|k| format!("na[{k}]")).collect();
         let pr: Vec<&str> = params.iter().map(|s| s.as_str()).collect();
         let dr: Vec<&str> = dests.iter().map(|s| s.as_str()).collect();
-        format!("fn mlp_gen() {{\n{}}}\n", g.to_wgsl_body_guarded(o, &pr, &dr, 1))
+        format!(
+            "fn mlp_gen() {{\n{}}}\n",
+            g.to_wgsl_body_guarded(o, &pr, &dr, 1)
+        )
     });
-    Ok(Decoder { stat, learned, learned_ad, mlp, wgsl_res, wgsl_res_ad, wgsl_mlp, key: fnv1a(prog), size: prog.len() })
+    Ok(Decoder {
+        stat,
+        learned,
+        learned_ad,
+        mlp,
+        wgsl_res,
+        wgsl_res_ad,
+        wgsl_mlp,
+        key: fnv1a(prog),
+        size: prog.len(),
+    })
 }
 
 type Cache = Mutex<HashMap<u64, Vec<(Vec<u8>, Arc<Decoder>)>>>;
@@ -255,7 +326,11 @@ pub fn open(bytes: &[u8]) -> Result<(Option<Arc<Decoder>>, &[u8]), DecodeError> 
 /// Placeholder net for a stream whose model is shipped as a graph (its
 /// weights are never used; the shipped MLP runs instead).
 pub fn placeholder_net() -> Net32 {
-    Net32 { sizes: vec![NFL, NO], w: vec![vec![0; NFL * NO]], b: vec![vec![0; NO]] }
+    Net32 {
+        sizes: vec![NFL, NO],
+        w: vec![vec![0; NFL * NO]],
+        b: vec![vec![0; NO]],
+    }
 }
 
 #[cfg(test)]
@@ -270,7 +345,12 @@ mod tests {
             for y in 0..d[1] {
                 for x in 0..d[2] {
                     let (fz, fy, fx) = (z as f32 * 0.21, y as f32 * 0.13, x as f32 * 0.17);
-                    v.push((fz.sin() * fy.cos() + (fx * 1.3).sin() * 0.5 + (fx * fy * 0.05).cos() * 0.25) * 3.0);
+                    v.push(
+                        (fz.sin() * fy.cos()
+                            + (fx * 1.3).sin() * 0.5
+                            + (fx * fy * 0.05).cos() * 0.25)
+                            * 3.0,
+                    );
                 }
             }
         }
@@ -281,15 +361,54 @@ mod tests {
         let d = [20, 37, 45];
         let x = field(d);
         let mut out = Vec::new();
-        for (lanes, bound) in [(1, ErrorBound::Psnr(60.0)), (8, ErrorBound::Psnr(100.0)), (8, ErrorBound::MaxAbs(1e-4))] {
-            let cfg = Gpu3Config { block: 16, lanes, tile: 16, ..Gpu3Config::new(bound) };
-            out.push((format!("static lanes {lanes} {bound:?}"), encode3_f32(&x, &d, &cfg, 2).0));
-            let model = Model3::Overfit { hidden: vec![8], per_epoch: 20_000, epochs: 2 };
-            let cfg = Gpu3Config { block: 16, lanes, tile: 16, model, adapt: None, ..Gpu3Config::new(bound) };
-            out.push((format!("learned lanes {lanes} {bound:?}"), encode3_f32(&x, &d, &cfg, 2).0));
-            let model = Model3::Overfit { hidden: vec![8], per_epoch: 20_000, epochs: 2 };
-            let cfg = Gpu3Config { block: 16, lanes, tile: 16, model, ..Gpu3Config::new(bound) };
-            out.push((format!("adaptive lanes {lanes} {bound:?}"), encode3_f32(&x, &d, &cfg, 2).0));
+        for (lanes, bound) in [
+            (1, ErrorBound::Psnr(60.0)),
+            (8, ErrorBound::Psnr(100.0)),
+            (8, ErrorBound::MaxAbs(1e-4)),
+        ] {
+            let cfg = Gpu3Config {
+                block: 16,
+                lanes,
+                tile: 16,
+                ..Gpu3Config::new(bound)
+            };
+            out.push((
+                format!("static lanes {lanes} {bound:?}"),
+                encode3_f32(&x, &d, &cfg, 2).0,
+            ));
+            let model = Model3::Overfit {
+                hidden: vec![8],
+                per_epoch: 20_000,
+                epochs: 2,
+            };
+            let cfg = Gpu3Config {
+                block: 16,
+                lanes,
+                tile: 16,
+                model,
+                adapt: None,
+                ..Gpu3Config::new(bound)
+            };
+            out.push((
+                format!("learned lanes {lanes} {bound:?}"),
+                encode3_f32(&x, &d, &cfg, 2).0,
+            ));
+            let model = Model3::Overfit {
+                hidden: vec![8],
+                per_epoch: 20_000,
+                epochs: 2,
+            };
+            let cfg = Gpu3Config {
+                block: 16,
+                lanes,
+                tile: 16,
+                model,
+                ..Gpu3Config::new(bound)
+            };
+            out.push((
+                format!("adaptive lanes {lanes} {bound:?}"),
+                encode3_f32(&x, &d, &cfg, 2).0,
+            ));
         }
         out
     }
@@ -306,16 +425,32 @@ mod tests {
     fn adaptive_streams_decode_through_the_ir() {
         let d = [20, 37, 45];
         let x = field(d);
-        let model = Model3::Overfit { hidden: vec![8], per_epoch: 20_000, epochs: 2 };
-        let cfg = Gpu3Config { block: 16, lanes: 8, tile: 16, model, ..Gpu3Config::new(ErrorBound::Psnr(80.0)) };
+        let model = Model3::Overfit {
+            hidden: vec![8],
+            per_epoch: 20_000,
+            epochs: 2,
+        };
+        let cfg = Gpu3Config {
+            block: 16,
+            lanes: 8,
+            tile: 16,
+            model,
+            ..Gpu3Config::new(ErrorBound::Psnr(80.0))
+        };
         let s = encode3_f32(&x, &d, &cfg, 2).0;
         let ps = parse3(&s).unwrap();
         assert!(ps.ad.wa > 0);
         let want = decode3_box(&s, [0; 3], d, 2).unwrap().bits;
         for (mlp, ad) in [(false, true), (true, true), (false, false), (true, false)] {
-            let w = wrap(&s, &builtin_program(if mlp { ps.net.as_ref() } else { None }, ad));
+            let w = wrap(
+                &s,
+                &builtin_program(if mlp { ps.net.as_ref() } else { None }, ad),
+            );
             assert!(parse3(&w).unwrap().dec.is_some());
-            assert!(decode3_box(&w, [0; 3], d, 2).unwrap().bits == want, "mlp {mlp} ad {ad}");
+            assert!(
+                decode3_box(&w, [0; 3], d, 2).unwrap().bits == want,
+                "mlp {mlp} ad {ad}"
+            );
         }
     }
 
@@ -349,7 +484,10 @@ mod tests {
             assert!(g.decode3(&s).unwrap().0 == want, "{name} builtin gpu");
             for mlp in [false, true] {
                 let w = shipped(&s, mlp);
-                assert!(g.decode3(&w).unwrap().0 == want, "{name} shipped gpu mlp {mlp}");
+                assert!(
+                    g.decode3(&w).unwrap().0 == want,
+                    "{name} shipped gpu mlp {mlp}"
+                );
             }
         }
     }
@@ -358,21 +496,32 @@ mod tests {
     /// registered model once the MLP ships as a graph.
     #[test]
     fn shipped_mlp_needs_no_registry() {
-        let path = std::env::var("TC_TEST_TCM").unwrap_or_else(|_| "/Users/cam/Developer/tang-compress/bench/models/pre3v4_16.tcm".into());
+        let path = std::env::var("TC_TEST_TCM").unwrap_or_else(|_| {
+            "/Users/cam/Developer/tang-compress/bench/models/pre3v4_16.tcm".into()
+        });
         let Ok(tcm) = std::fs::read(&path) else {
             eprintln!("no {path}; skipping");
             return;
         };
         let net = Arc::new(crate::learned::Net::from_bytes(&tcm).unwrap());
         let d = [20, 37, 45];
-        let cfg = Gpu3Config { block: 16, lanes: 8, tile: 16, model: Model3::Pretrained(net.clone()), adapt: None, ..Gpu3Config::new(ErrorBound::Psnr(80.0)) };
+        let cfg = Gpu3Config {
+            block: 16,
+            lanes: 8,
+            tile: 16,
+            model: Model3::Pretrained(net.clone()),
+            adapt: None,
+            ..Gpu3Config::new(ErrorBound::Psnr(80.0))
+        };
         let (s, _) = encode3_f32(&field(d), &d, &cfg, 2);
         assert!(parse3(&s).is_err(), "model must not be registered yet");
         let prog = builtin_program(Some(&Net32::new(&net)), false);
         let w = wrap(&s, &prog);
         let got = decode3_box(&w, [0; 3], d, 2).unwrap().bits;
         #[cfg(feature = "gpu")]
-        let gpu = crate::gpudec::GpuDecoder::new(8, 64).ok().map(|g| g.decode3(&w).unwrap().0);
+        let gpu = crate::gpudec::GpuDecoder::new(8, 64)
+            .ok()
+            .map(|g| g.decode3(&w).unwrap().0);
         crate::learned::register(net);
         let want = decode3_box(&s, [0; 3], d, 2).unwrap().bits;
         assert!(got == want);
@@ -388,7 +537,9 @@ mod tests {
         let prog = builtin_program(parse3(s).unwrap().net.as_ref(), false);
         let mut seed = 5u64;
         let mut rnd = || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (seed >> 33) as usize
         };
         let (mut ok, mut bad) = (0, 0);

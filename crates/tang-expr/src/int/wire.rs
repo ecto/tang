@@ -51,7 +51,13 @@ pub struct Limits {
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { max_nodes: 1 << 14, max_loops: 64, max_depth: 4, max_trip: 1 << 12, max_cost: 1 << 20 }
+        Self {
+            max_nodes: 1 << 14,
+            max_loops: 64,
+            max_depth: 4,
+            max_trip: 1 << 12,
+            max_cost: 1 << 20,
+        }
     }
 }
 
@@ -160,7 +166,10 @@ impl IntGraph {
         put(&mut o, self.loops.len() as u64);
         for lp in &self.loops {
             put(&mut o, lp.parent.map_or(0, |p| p as u64 + 1));
-            put(&mut o, lp.cap.expect("to_bytes: every loop needs a trip cap") as u64);
+            put(
+                &mut o,
+                lp.cap.expect("to_bytes: every loop needs a trip cap") as u64,
+            );
             put(&mut o, lp.init.len() as u64);
             for &x in &lp.init {
                 put(&mut o, x.0 as u64);
@@ -178,7 +187,11 @@ impl IntGraph {
                     o.push(0);
                     o.push(ty_code(t));
                     // small negative i32s as zigzag
-                    let z = if t == IType::I32 { ((v << 1) ^ (((v as i32) >> 31) as u32)) as u64 } else { v as u64 };
+                    let z = if t == IType::I32 {
+                        ((v << 1) ^ (((v as i32) >> 31) as u32)) as u64
+                    } else {
+                        v as u64
+                    };
                     put(&mut o, z);
                 }
                 INode::Param(p, t) => {
@@ -255,7 +268,13 @@ impl IntGraph {
     /// Read and verify an untrusted graph (see the module docs). `params`
     /// gives the type of each parameter, `bufs` the name and element type of
     /// each buffer, `outs` the output types. Returns the graph and its outputs.
-    pub fn from_bytes(bytes: &[u8], params: &[IType], bufs: &[(&str, Elem)], outs: &[IType], lim: &Limits) -> Result<(IntGraph, Vec<IId>), WireError> {
+    pub fn from_bytes(
+        bytes: &[u8],
+        params: &[IType],
+        bufs: &[(&str, Elem)],
+        outs: &[IType],
+        lim: &Limits,
+    ) -> Result<(IntGraph, Vec<IId>), WireError> {
         Self::from_bytes_rw(bytes, params, bufs, &[], outs, lim)
     }
 
@@ -296,18 +315,29 @@ impl IntGraph {
             }
             caps.push(cap);
             let k = r.n(256, "loop states")?;
-            let ids = |r: &mut Rd, k: usize| (0..k).map(|_| r.u32().map(IId)).collect::<Result<Vec<_>, _>>();
+            let ids = |r: &mut Rd, k: usize| {
+                (0..k)
+                    .map(|_| r.u32().map(IId))
+                    .collect::<Result<Vec<_>, _>>()
+            };
             let init = ids(&mut r, k)?;
             let cond = IId(r.u32()?);
             let next = ids(&mut r, k)?;
-            let lp = Loop { init, cond, next, parent, cap: Some(cap) };
+            let lp = Loop {
+                init,
+                cond,
+                next,
+                parent,
+                cap: Some(cap),
+            };
             if g.depth(parent) + 1 > lim.max_depth {
                 return err("loops nest too deep");
             }
             g.loops.push(lp);
         }
         let nn = r.n(lim.max_nodes, "nodes")?;
-        let mut state_seen: Vec<Vec<bool>> = g.loops.iter().map(|l| vec![false; l.init.len()]).collect();
+        let mut state_seen: Vec<Vec<bool>> =
+            g.loops.iter().map(|l| vec![false; l.init.len()]).collect();
         let mut intern: HashMap<INode, IId> = HashMap::new();
         for i in 0..nn {
             let tag = r.u8()?;
@@ -330,7 +360,11 @@ impl IntGraph {
                 0 => {
                     let t = ty_of(r.u8()?)?;
                     let z = r.u32()?;
-                    let v = if t == IType::I32 { (z >> 1) ^ (z & 1).wrapping_neg() } else { z };
+                    let v = if t == IType::I32 {
+                        (z >> 1) ^ (z & 1).wrapping_neg()
+                    } else {
+                        z
+                    };
                     if t == IType::Bool && v > 1 {
                         return err("bool constant");
                     }
@@ -426,7 +460,9 @@ impl IntGraph {
                 return err("loop condition must be bool");
             }
             let me = Some(l as u32);
-            let within = |g: &IntGraph, x: IId, s: Option<u32>| g.try_inner(g.scope[x.index()], s).ok() == Some(s);
+            let within = |g: &IntGraph, x: IId, s: Option<u32>| {
+                g.try_inner(g.scope[x.index()], s).ok() == Some(s)
+            };
             if !within(&g, lp.cond, me) || !lp.next.iter().all(|&x| within(&g, x, me)) {
                 return err("loop body uses an unrelated scope");
             }

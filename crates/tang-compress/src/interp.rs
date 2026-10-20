@@ -293,7 +293,11 @@ fn encode_sse(x: &[f32], dims: &[usize], b: f64, tune: (f64, f64)) -> (Vec<u8>, 
     w.u8(TUNE.iter().position(|&t| t == tune).unwrap() as u8);
     w.varint(kinds);
     w.bytes(&e.finish());
-    let sse = x.iter().zip(&r).map(|(&a, &b)| (a as f64 - b as f64).powi(2)).sum();
+    let sse = x
+        .iter()
+        .zip(&r)
+        .map(|(&a, &b)| (a as f64 - b as f64).powi(2))
+        .sum();
     (w.buf, sse)
 }
 
@@ -319,7 +323,11 @@ pub fn encode_f32(x: &[f32], dims: &[usize], b: f64) -> Vec<u8> {
 /// an ordinary max-abs stream at that `b`; the target is checked on the
 /// exact reconstruction the decoder computes.
 pub fn encode_rmse_f32(x: &[f32], dims: &[usize], rmse: f64) -> Vec<u8> {
-    assert_eq!(x.len(), dims.iter().product::<usize>(), "dims do not match data");
+    assert_eq!(
+        x.len(),
+        dims.iter().product::<usize>(),
+        "dims do not match data"
+    );
     assert!(!dims.is_empty() && dims.len() <= 255 && rmse > 0.0);
     TUNE.iter()
         .map(|&t| rate_controlled(x, dims, rmse, t))
@@ -329,7 +337,11 @@ pub fn encode_rmse_f32(x: &[f32], dims: &[usize], rmse: f64) -> Vec<u8> {
 
 /// [`encode_rmse_f32`] at `PSNR = 20 log₁₀(range / RMSE)` dB.
 pub fn encode_psnr_f32(x: &[f32], dims: &[usize], psnr: f64) -> Vec<u8> {
-    let (lo, hi) = x.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &v| (a.min(v as f64), b.max(v as f64)));
+    let (lo, hi) = x
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &v| {
+            (a.min(v as f64), b.max(v as f64))
+        });
     let range = if hi > lo { hi - lo } else { 1.0 };
     encode_rmse_f32(x, dims, range / 10f64.powf(psnr / 20.0))
 }
@@ -359,7 +371,11 @@ fn rate_controlled(x: &[f32], dims: &[usize], rmse: f64, tune: (f64, f64)) -> Ve
         b = match (&ok, bad) {
             (Some(o), Some(f)) => {
                 // secant on the bracket ends, kept strictly inside it
-                let t = if f.1 > o.1 { ((lt - o.1) / (f.1 - o.1)).clamp(0.1, 0.9) } else { 0.5 };
+                let t = if f.1 > o.1 {
+                    ((lt - o.1) / (f.1 - o.1)).clamp(0.1, 0.9)
+                } else {
+                    0.5
+                };
                 (o.0 + t * (f.0 - o.0)).exp()
             }
             // SSE ∝ b² away from escapes
@@ -393,9 +409,16 @@ pub const FAST_TUNE: usize = 1;
 
 /// [`encode_f32`] with a single `(α, β)` preset ([`FAST_TUNE`]).
 pub fn encode_fast_f32(x: &[f32], dims: &[usize], b: f64) -> Vec<u8> {
-    assert_eq!(x.len(), dims.iter().product::<usize>(), "dims do not match data");
+    assert_eq!(
+        x.len(),
+        dims.iter().product::<usize>(),
+        "dims do not match data"
+    );
     assert!(!dims.is_empty() && dims.len() <= 255 && b > 0.0);
-    let i = std::env::var("TC_FAST_TUNE").ok().and_then(|v| v.parse().ok()).unwrap_or(FAST_TUNE);
+    let i = std::env::var("TC_FAST_TUNE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(FAST_TUNE);
     encode_with(x, dims, b, TUNE[i])
 }
 
@@ -485,12 +508,23 @@ mod tests {
     fn psnr_targets_are_met() {
         for d in [vec![40, 33, 29], vec![3000]] {
             let x = field(&d);
-            let (lo, hi) = x.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &v| (a.min(v as f64), b.max(v as f64)));
+            let (lo, hi) = x
+                .iter()
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &v| {
+                    (a.min(v as f64), b.max(v as f64))
+                });
             let mut last = 0;
             for p in [40.0, 60.0, 80.0, 100.0] {
                 let s = encode_psnr_f32(&x, &d, p);
-                let Decoded::F32 { data: y, .. } = decode(&s).unwrap() else { panic!("f32") };
-                let mse = x.iter().zip(&y).map(|(&a, &b)| (a as f64 - b as f64).powi(2)).sum::<f64>() / x.len() as f64;
+                let Decoded::F32 { data: y, .. } = decode(&s).unwrap() else {
+                    panic!("f32")
+                };
+                let mse = x
+                    .iter()
+                    .zip(&y)
+                    .map(|(&a, &b)| (a as f64 - b as f64).powi(2))
+                    .sum::<f64>()
+                    / x.len() as f64;
                 let got = 20.0 * ((hi - lo) / mse.sqrt()).log10();
                 assert!(got >= p, "{d:?} {p} dB: got {got:.3}");
                 // rate control lands near the target, not far above it

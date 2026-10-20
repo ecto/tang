@@ -104,10 +104,17 @@ impl Net32 {
         let w = (0..sizes.len() - 1)
             .map(|l| {
                 let (ni_full, ni, no) = (net.sizes[l], sizes[l], sizes[l + 1]);
-                (0..no).flat_map(|o| (0..ni).map(move |i| (o, i))).map(|(o, i)| net.wq[l][o * ni_full + i].clamp(-2047, 2047)).collect()
+                (0..no)
+                    .flat_map(|o| (0..ni).map(move |i| (o, i)))
+                    .map(|(o, i)| net.wq[l][o * ni_full + i].clamp(-2047, 2047))
+                    .collect()
             })
             .collect();
-        let b = net.bq.iter().map(|v| v.iter().map(|&x| x.clamp(-(1 << 24), 1 << 24)).collect()).collect();
+        let b = net
+            .bq
+            .iter()
+            .map(|v| v.iter().map(|&x| x.clamp(-(1 << 24), 1 << 24)).collect())
+            .collect();
         Self { sizes, w, b }
     }
 
@@ -127,7 +134,11 @@ impl Net32 {
                     acc = acc.wrapping_add(self.w[l][o * ni + i].wrapping_mul(a[i]));
                 }
                 let v = acc.wrapping_add(128) >> 8;
-                nb[o] = if l + 1 < nl { v.clamp(0, 1 << 14) } else { v.clamp(-(1 << 14), 1 << 14) };
+                nb[o] = if l + 1 < nl {
+                    v.clamp(0, 1 << 14)
+                } else {
+                    v.clamp(-(1 << 14), 1 << 14)
+                };
             }
             std::mem::swap(&mut a, &mut nb);
         }
@@ -146,7 +157,11 @@ impl Net32 {
         let (r, sh) = (g.i32(128), g.u32(8));
         for l in 0..nl {
             let (ni, no) = (self.sizes[l], self.sizes[l + 1]);
-            let (lo, hi) = if l + 1 < nl { (g.i32(0), g.i32(1 << 14)) } else { (g.i32(-(1 << 14)), g.i32(1 << 14)) };
+            let (lo, hi) = if l + 1 < nl {
+                (g.i32(0), g.i32(1 << 14))
+            } else {
+                (g.i32(-(1 << 14)), g.i32(1 << 14))
+            };
             a = (0..no)
                 .map(|o| {
                     let mut acc = g.i32(self.b[l][o]);
@@ -246,7 +261,11 @@ pub struct Mix3 {
 impl Mix3 {
     /// From network outputs.
     pub fn new(o: &[i32; NO]) -> Self {
-        Self { pi15: sig16(o[0]) >> 1, mu: [o[1], o[2]], ls: [o[3], o[4]] }
+        Self {
+            pi15: sig16(o[0]) >> 1,
+            mu: [o[1], o[2]],
+            ls: [o[3], o[4]],
+        }
     }
 
     /// `P(r ≤ m)` in Q16.
@@ -320,7 +339,11 @@ impl Adapt {
     /// Fresh state.
     pub fn new(c: AdCfg) -> Self {
         let t = std::array::from_fn(|i| sig16(((i % AB) as i32 - 8) * 256));
-        Self { c, t, n: [0; AC * AB] }
+        Self {
+            c,
+            t,
+            n: [0; AC * AB],
+        }
     }
 
     /// Code `bit` with model `P(1) = p1` on context `ctx`.
@@ -344,7 +367,8 @@ impl Adapt {
         let tgt = if got { 65535 } else { 0 };
         let d = tgt - self.t[k] as i32;
         // rate 2^-⌊log₂(n+2)⌋ (≈ 1/(n+1.5) within 2×, no divide on the GPU)
-        self.t[k] = (self.t[k] as i32 + (d >> (31 - (self.n[k] as u32 + 2).leading_zeros()))) as u32;
+        self.t[k] =
+            (self.t[k] as i32 + (d >> (31 - (self.n[k] as u32 + 2).leading_zeros()))) as u32;
         if (self.n[k] as u32) < self.c.lim {
             self.n[k] += 1;
         }
@@ -354,7 +378,11 @@ impl Adapt {
 
 /// Code residual `r` under `mx` on `lane`.
 pub fn code_learned<S: Sink>(s: &mut S, lane: usize, mx: &Mix3, r: i32) -> i32 {
-    let mut ad = Adapt::new(AdCfg { wa: 0, lim: 0, mask: 0 });
+    let mut ad = Adapt::new(AdCfg {
+        wa: 0,
+        lim: 0,
+        mask: 0,
+    });
     code_learned_ad(s, lane, mx, r, &mut ad)
 }
 
@@ -384,7 +412,13 @@ pub fn code_learned_ad<S: Sink>(s: &mut S, lane: usize, mx: &Mix3, r: i32, ad: &
     while k < 30 {
         let a = tail(1 << k);
         let bb = tail(1 << (k + 1));
-        if !ad.bit(s, lane, 2 + k.min(3) as usize, mag >= 1 << (k + 1), ratio16(bb, a)) {
+        if !ad.bit(
+            s,
+            lane,
+            2 + k.min(3) as usize,
+            mag >= 1 << (k + 1),
+            ratio16(bb, a),
+        ) {
             break;
         }
         k += 1;
@@ -420,14 +454,26 @@ mod tests {
     fn ir_graph_matches_infer() {
         let mut st = 7u64;
         let mut rnd = || {
-            st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            st = st
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (st >> 33) as i32
         };
         for sizes in [vec![NFL, 16, NO], vec![NFL, 32, 16, NO]] {
             let w = (0..sizes.len() - 1)
-                .map(|l| (0..sizes[l] * sizes[l + 1]).map(|k| if k % 5 == 0 { 0 } else { rnd() % 4095 - 2047 }).collect())
+                .map(|l| {
+                    (0..sizes[l] * sizes[l + 1])
+                        .map(|k| if k % 5 == 0 { 0 } else { rnd() % 4095 - 2047 })
+                        .collect()
+                })
                 .collect();
-            let b = (1..sizes.len()).map(|l| (0..sizes[l]).map(|_| rnd() % (1 << 25) - (1 << 24)).collect()).collect();
+            let b = (1..sizes.len())
+                .map(|l| {
+                    (0..sizes[l])
+                        .map(|_| rnd() % (1 << 25) - (1 << 24))
+                        .collect()
+                })
+                .collect();
             let net = Net32 { sizes, w, b };
             let mut p = net.program();
             for k in 0..5000 {
@@ -448,12 +494,20 @@ mod tests {
     fn learned_round_trip() {
         let mut st = 99u64;
         let mut rnd = || {
-            st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            st = st
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (st >> 33) as i32
         };
         let cases: Vec<(Mix3, i32)> = (0..20000)
             .map(|i| {
-                let o = [rnd() % 2000, rnd() % 3000, rnd() % 600, rnd() % 4000 - 600, rnd() % 2500];
+                let o = [
+                    rnd() % 2000,
+                    rnd() % 3000,
+                    rnd() % 600,
+                    rnd() % 4000 - 600,
+                    rnd() % 2500,
+                ];
                 let r = match i % 5 {
                     0 => 0,
                     1 => rnd() % 7 - 3,
@@ -464,12 +518,16 @@ mod tests {
                 (Mix3::new(&o), r)
             })
             .collect();
-        let mut s = RecSink { syms: vec![Vec::new()] };
+        let mut s = RecSink {
+            syms: vec![Vec::new()],
+        };
         for (m, r) in &cases {
             assert_eq!(code_learned(&mut s, 0, m, *r), *r);
         }
         let w = rans_encode(&s.syms[0]);
-        let mut d = DecSink { lanes: vec![RansDec::new(&w)] };
+        let mut d = DecSink {
+            lanes: vec![RansDec::new(&w)],
+        };
         for (m, r) in &cases {
             assert_eq!(code_learned(&mut d, 0, m, 0), *r);
         }

@@ -24,12 +24,28 @@ fn nll(logits: &[f32], tgt: u32) -> f64 {
 
 fn main() -> anyhow::Result<()> {
     let a: Vec<String> = std::env::args().collect();
-    let ids: Vec<u32> = std::fs::read(&a[2])?.chunks(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
-    let ctxs: Vec<usize> = flag(&a, "--ctx").unwrap_or("2048".into()).split(',').map(|v| v.parse().unwrap()).collect();
+    let ids: Vec<u32> = std::fs::read(&a[2])?
+        .chunks(4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    let ctxs: Vec<usize> = flag(&a, "--ctx")
+        .unwrap_or("2048".into())
+        .split(',')
+        .map(|v| v.parse().unwrap())
+        .collect();
     let n: usize = flag(&a, "--n").map_or(64, |v| v.parse().unwrap());
-    let modes: Vec<String> = flag(&a, "--modes").unwrap_or("bf16".into()).split(',').map(String::from).collect();
+    let modes: Vec<String> = flag(&a, "--modes")
+        .unwrap_or("bf16".into())
+        .split(',')
+        .map(String::from)
+        .collect();
     let maxc = ctxs.iter().max().unwrap() + n + 8;
-    let model = Model::load(MetalDevice::new().unwrap(), std::path::Path::new(&a[1]), maxc, tang_llm::model::Dtype::Bf16)?;
+    let model = Model::load(
+        MetalDevice::new().unwrap(),
+        std::path::Path::new(&a[1]),
+        maxc,
+        tang_llm::model::Dtype::Bf16,
+    )?;
     for &ctx in &ctxs {
         for m in &modes {
             *model.kvcomp.lock().unwrap() = None;

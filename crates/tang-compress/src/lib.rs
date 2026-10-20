@@ -142,7 +142,10 @@ pub struct AutoReport {
 /// Every-`stride`-th sample along each axis longer than `4·stride`
 /// (row-major), with the new shape.
 pub fn decimate(x: &[f32], dims: &[usize], stride: usize) -> (Vec<f32>, Vec<usize>) {
-    let st: Vec<usize> = dims.iter().map(|&d| if d >= 4 * stride { stride } else { 1 }).collect();
+    let st: Vec<usize> = dims
+        .iter()
+        .map(|&d| if d >= 4 * stride { stride } else { 1 })
+        .collect();
     let nd: Vec<usize> = dims.iter().zip(&st).map(|(&d, &s)| d.div_ceil(s)).collect();
     let n: usize = nd.iter().product();
     let mut out = Vec::with_capacity(n);
@@ -179,7 +182,9 @@ pub fn qtt_probe(
         codec::ErrorBound::Psnr(p) => {
             let (lo, hi) = x
                 .iter()
-                .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &v| (a.min(v), b.max(v)));
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &v| {
+                    (a.min(v), b.max(v))
+                });
             codec::ErrorBound::Rmse((hi - lo) as f64 / 10f64.powf(p / 20.0))
         }
         b => b,
@@ -306,8 +311,15 @@ pub fn encode_portfolio_f32(
 /// Centered crop with every axis of length ≥ 16 halved (1D: the middle
 /// eighth), and its shape.
 pub fn center_crop(x: &[f32], dims: &[usize]) -> (Vec<f32>, Vec<usize>) {
-    let f = if dims.iter().filter(|&&d| d > 1).count() == 1 { 8 } else { 2 };
-    let nd: Vec<usize> = dims.iter().map(|&d| if d >= 16 { d / f } else { d }).collect();
+    let f = if dims.iter().filter(|&&d| d > 1).count() == 1 {
+        8
+    } else {
+        2
+    };
+    let nd: Vec<usize> = dims
+        .iter()
+        .map(|&d| if d >= 16 { d / f } else { d })
+        .collect();
     let lo: Vec<usize> = dims.iter().zip(&nd).map(|(&d, &n)| (d - n) / 2).collect();
     let n: usize = nd.iter().product();
     let mut out = Vec::with_capacity(n);
@@ -338,19 +350,26 @@ pub fn fast_pick(x: &[f32], dims: &[usize], cfg: &wavcodec::WavConfig) -> Candid
         codec::ErrorBound::Psnr(p) => {
             let (lo, hi) = x
                 .iter()
-                .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &v| (a.min(v), b.max(v)));
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &v| {
+                    (a.min(v), b.max(v))
+                });
             codec::ErrorBound::Rmse((hi - lo) as f64 / 10f64.powf(p / 20.0))
         }
         b => b,
     };
     let three = dims.iter().filter(|&&d| d > 1).count() == 3;
     let cands: Vec<Candidate> = match bound {
-        codec::ErrorBound::MaxAbs(_) => vec![Candidate::Wavelet, Candidate::Interp, Candidate::QttSparse],
+        codec::ErrorBound::MaxAbs(_) => {
+            vec![Candidate::Wavelet, Candidate::Interp, Candidate::QttSparse]
+        }
         _ if three => vec![Candidate::Wavelet, Candidate::Tucker],
         _ => return Candidate::Wavelet,
     };
     let (y, nd) = center_crop(x, dims);
-    let c = wavcodec::WavConfig { bound, ..cfg.clone() };
+    let c = wavcodec::WavConfig {
+        bound,
+        ..cfg.clone()
+    };
     cands
         .into_iter()
         .min_by_key(|&k| encode_candidate_fast_f32(k, &y, &nd, &c).len())
@@ -368,7 +387,10 @@ pub fn encode_candidate_fast_f32(
 ) -> Vec<u8> {
     match c {
         Candidate::Wavelet => {
-            let cfg = wavcodec::WavConfig { fast: true, ..cfg.clone() };
+            let cfg = wavcodec::WavConfig {
+                fast: true,
+                ..cfg.clone()
+            };
             wavcodec::encode_f32(x, dims, &cfg).0
         }
         Candidate::Tucker => tucker::encode_fast_f32(x, dims, cfg.bound).0,

@@ -84,7 +84,19 @@ pub struct KvParams {
 impl KvParams {
     /// Defaults for a cache with `heads` × `hd` per token (SmolLM2 RoPE base).
     pub fn new(kind: Kind, heads: usize, hd: usize, step: f64) -> Self {
-        Self { kind, heads, hd, theta: 1e5, pre_rope: true, step, sink: 4, sink_div: 16, block: 128, ar: true, gpu: false }
+        Self {
+            kind,
+            heads,
+            hd,
+            theta: 1e5,
+            pre_rope: true,
+            step,
+            sink: 4,
+            sink_div: 16,
+            block: 128,
+            ar: true,
+            gpu: false,
+        }
     }
     fn rotated(&self) -> bool {
         self.kind == Kind::K && self.pre_rope && !self.gpu
@@ -143,10 +155,18 @@ impl Ctx {
         for i in 0..UBITS {
             let ri = r.powf((1u64 << i.min(40)) as f64);
             unary[i] = BitModel::new(p(ri));
-            let rh = if i == 0 { 0.5 } else { r.powf((1u64 << (i - 1)) as f64) };
+            let rh = if i == 0 {
+                0.5
+            } else {
+                r.powf((1u64 << (i - 1)) as f64)
+            };
             mant[i] = BitModel::new(p(rh / (1.0 + rh)));
         }
-        Self { zero: BitModel::new(p(pz)), unary, mant }
+        Self {
+            zero: BitModel::new(p(pz)),
+            unary,
+            mant,
+        }
     }
 }
 
@@ -202,7 +222,11 @@ fn get(d: &mut Decoder, m: &mut Ctx) -> i64 {
     }
     let mut w = 1u64;
     for i in (0..k).rev() {
-        let bit = if i + 1 == k { d.decode(&mut m.mant[k]) } else { d.decode_p(ONE / 2) };
+        let bit = if i + 1 == k {
+            d.decode(&mut m.mant[k])
+        } else {
+            d.decode_p(ONE / 2)
+        };
         w = (w << 1) | bit as u64;
     }
     if neg {
@@ -227,7 +251,15 @@ struct Lane<'a> {
 impl<'a> Lane<'a> {
     fn new(p: &'a KvParams, s: &'a Stats, step: &'a [f64]) -> Self {
         let n = p.heads * p.hd;
-        Self { p, s, step, prev: vec![0.0; n], act: vec![0; n], models: fresh_models(p.heads), first: true }
+        Self {
+            p,
+            s,
+            step,
+            prev: vec![0.0; n],
+            act: vec![0; n],
+            models: fresh_models(p.heads),
+            first: true,
+        }
     }
     #[inline]
     fn pred(&self, j: usize) -> f64 {
@@ -265,7 +297,14 @@ fn tok_step(p: &KvParams, pos: usize) -> f64 {
 
 /// Encode tokens `[pos0, pos0 + n)` (row-major `[n][heads*hd]`, already in the
 /// coded domain) as one independent block.
-fn encode_block(p: &KvParams, s: &Stats, step: &[f64], y: &[f64], pos0: usize, n: usize) -> Vec<u8> {
+fn encode_block(
+    p: &KvParams,
+    s: &Stats,
+    step: &[f64],
+    y: &[f64],
+    pos0: usize,
+    n: usize,
+) -> Vec<u8> {
     let m = p.heads * p.hd;
     let mut lane = Lane::new(p, s, step);
     let mut e = Encoder::new();
@@ -285,7 +324,15 @@ fn encode_block(p: &KvParams, s: &Stats, step: &[f64], y: &[f64], pos0: usize, n
     e.finish()
 }
 
-fn decode_block(p: &KvParams, s: &Stats, step: &[f64], bytes: &[u8], pos0: usize, n: usize, out: &mut [f64]) {
+fn decode_block(
+    p: &KvParams,
+    s: &Stats,
+    step: &[f64],
+    bytes: &[u8],
+    pos0: usize,
+    n: usize,
+    out: &mut [f64],
+) {
     let m = p.heads * p.hd;
     let mut lane = Lane::new(p, s, step);
     let mut d = Decoder::new(bytes);
@@ -314,16 +361,27 @@ fn encode_block_gpu(p: &KvParams, s: &Stats, y: &[f64], pos0: usize, n: usize) -
             let mut prev = vec![0i64; d];
             let mut act = vec![0u8; d];
             for t in 0..n {
-                let ts = if pos0 + t < p.sink { 1 } else { p.sink_div as i64 };
+                let ts = if pos0 + t < p.sink {
+                    1
+                } else {
+                    p.sink_div as i64
+                };
                 for c in 0..d {
                     let j = hh * d + c;
                     let mu = s.mu[j];
-                    let pred = if t == 0 { mu } else { mu + ((s.rho[j] as i64 * (prev[c] - mu)) >> 4) };
+                    let pred = if t == 0 {
+                        mu
+                    } else {
+                        mu + ((s.rho[j] as i64 * (prev[c] - mu)) >> 4)
+                    };
                     let q = ((y[t * m + j] / u - pred as f64) / ts as f64).round() as i64;
                     let ci = s.class[j] as usize * NACT + act[c] as usize;
                     put(&mut e, &mut models[ci], q);
                     let r = pred + q * ts;
-                    assert!(r.abs() < 1 << 24, "kv gpu layout: value out of i24 range (step too small)");
+                    assert!(
+                        r.abs() < 1 << 24,
+                        "kv gpu layout: value out of i24 range (step too small)"
+                    );
                     prev[c] = r;
                     act[c] = q.unsigned_abs().min(2) as u8;
                 }
@@ -335,7 +393,15 @@ fn encode_block_gpu(p: &KvParams, s: &Stats, y: &[f64], pos0: usize, n: usize) -
 
 /// GPU layout decode of one (block, head) substream into `out[t][c]`
 /// (`n × hd`, f32). This is the reference the WGSL kernel matches.
-fn decode_lane_gpu(p: &KvParams, s: &Stats, hh: usize, bytes: &[u8], pos0: usize, n: usize, out: &mut [f32]) {
+fn decode_lane_gpu(
+    p: &KvParams,
+    s: &Stats,
+    hh: usize,
+    bytes: &[u8],
+    pos0: usize,
+    n: usize,
+    out: &mut [f32],
+) {
     let d = p.hd;
     let u = p.unit();
     let mut models = fresh_models(1);
@@ -343,11 +409,19 @@ fn decode_lane_gpu(p: &KvParams, s: &Stats, hh: usize, bytes: &[u8], pos0: usize
     let mut prev = vec![0i64; d];
     let mut act = vec![0u8; d];
     for t in 0..n {
-        let ts = if pos0 + t < p.sink { 1 } else { p.sink_div as i64 };
+        let ts = if pos0 + t < p.sink {
+            1
+        } else {
+            p.sink_div as i64
+        };
         for c in 0..d {
             let j = hh * d + c;
             let mu = s.mu[j];
-            let pred = if t == 0 { mu } else { mu + ((s.rho[j] as i64 * (prev[c] - mu)) >> 4) };
+            let pred = if t == 0 {
+                mu
+            } else {
+                mu + ((s.rho[j] as i64 * (prev[c] - mu)) >> 4)
+            };
             let ci = s.class[j] as usize * NACT + act[c] as usize;
             let q = get(&mut dec, &mut models[ci]);
             let r = pred + q * ts;
@@ -371,7 +445,14 @@ fn to_coded(p: &KvParams, x: &[f32], n: usize, pos0: usize) -> Vec<f64> {
             }
         }
         if p.rotated() {
-            rope_token(&mut y[t * h * d..(t + 1) * h * d], h, d, p.theta, pos0 + t, -1.0);
+            rope_token(
+                &mut y[t * h * d..(t + 1) * h * d],
+                h,
+                d,
+                p.theta,
+                pos0 + t,
+                -1.0,
+            );
         }
     }
     y
@@ -382,7 +463,14 @@ fn from_coded(p: &KvParams, y: &mut [f64], n: usize, pos0: usize) -> Vec<f32> {
     let mut x = vec![0f32; n * h * d];
     for t in 0..n {
         if p.rotated() {
-            rope_token(&mut y[t * h * d..(t + 1) * h * d], h, d, p.theta, pos0 + t, 1.0);
+            rope_token(
+                &mut y[t * h * d..(t + 1) * h * d],
+                h,
+                d,
+                p.theta,
+                pos0 + t,
+                1.0,
+            );
         }
         for hh in 0..h {
             for c in 0..d {
@@ -416,7 +504,11 @@ fn fit_stats(p: &KvParams, y: &[f64], n: usize, step: &[f64]) -> Stats {
     let mut rho = vec![0u8; m];
     let mut var = vec![0.0; m];
     for j in 0..m {
-        let a = if p.ar && c0[j] > 0.0 { c1[j] / c0[j] } else { 0.0 };
+        let a = if p.ar && c0[j] > 0.0 {
+            c1[j] / c0[j]
+        } else {
+            0.0
+        };
         let a = (a * 16.0).round().clamp(0.0, 15.0);
         rho[j] = a as u8;
         let a = a / 16.0;
@@ -425,8 +517,16 @@ fn fit_stats(p: &KvParams, y: &[f64], n: usize, step: &[f64]) -> Stats {
     }
     let mut class = vec![0u8; m];
     for j in 0..m {
-        let pair = if p.kind == Kind::K { j - (j % p.hd) + (j % p.hd + half) % p.hd } else { j };
-        let v = if p.kind == Kind::K { 0.5 * (var[j] + var[pair]) } else { var[j] };
+        let pair = if p.kind == Kind::K {
+            j - (j % p.hd) + (j % p.hd + half) % p.hd
+        } else {
+            j
+        };
+        let v = if p.kind == Kind::K {
+            0.5 * (var[j] + var[pair])
+        } else {
+            var[j]
+        };
         let r = v.sqrt() / step[j];
         class[j] = ((4.0 * r.max(1e-9).log2()).round() + 8.0).clamp(0.0, NCLASS as f64 - 1.0) as u8;
     }
@@ -462,9 +562,20 @@ impl KvEncoder {
         let y = to_coded(&params, prefill, n, 0);
         let stats = fit_stats(&params, &y, n, &step);
         if params.gpu {
-            assert!(!(params.kind == Kind::K && params.pre_rope), "gpu layout codes pre-RoPE K given by the caller (set pre_rope = false)");
+            assert!(
+                !(params.kind == Kind::K && params.pre_rope),
+                "gpu layout codes pre-RoPE K given by the caller (set pre_rope = false)"
+            );
         }
-        let mut e = Self { params, stats, step, blocks: Vec::new(), gblocks: Vec::new(), tail: Vec::new(), tokens: 0 };
+        let mut e = Self {
+            params,
+            stats,
+            step,
+            blocks: Vec::new(),
+            gblocks: Vec::new(),
+            tail: Vec::new(),
+            tokens: 0,
+        };
         e.push_coded(y, n);
         e
     }
@@ -486,7 +597,14 @@ impl KvEncoder {
                 let blk = encode_block_gpu(&self.params, &self.stats, &self.tail[..b * m], pos0, b);
                 self.gblocks.push(blk);
             } else {
-                let blk = encode_block(&self.params, &self.stats, &self.step, &self.tail[..b * m], pos0, b);
+                let blk = encode_block(
+                    &self.params,
+                    &self.stats,
+                    &self.step,
+                    &self.tail[..b * m],
+                    pos0,
+                    b,
+                );
                 self.blocks.push(blk);
             }
             self.tail.drain(..b * m);
@@ -542,9 +660,18 @@ impl KvEncoder {
         if nt > 0 {
             let pos0 = self.sealed_blocks() * p.block;
             if p.gpu {
-                encode_block_gpu(p, &self.stats, &self.tail, pos0, nt).iter().for_each(|sub| w.block(sub));
+                encode_block_gpu(p, &self.stats, &self.tail, pos0, nt)
+                    .iter()
+                    .for_each(|sub| w.block(sub));
             } else {
-                w.block(&encode_block(p, &self.stats, &self.step, &self.tail, pos0, nt));
+                w.block(&encode_block(
+                    p,
+                    &self.stats,
+                    &self.step,
+                    &self.tail,
+                    pos0,
+                    nt,
+                ));
             }
         }
         w.buf
@@ -585,9 +712,25 @@ impl<'a> KvStream<'a> {
         }
         let ar = f & 4 != 0;
         let gpu = f & 8 != 0;
-        let params = KvParams { kind, heads, hd, theta, pre_rope: f & 2 != 0, step, sink, sink_div, block, ar, gpu };
+        let params = KvParams {
+            kind,
+            heads,
+            hd,
+            theta,
+            pre_rope: f & 2 != 0,
+            step,
+            sink,
+            sink_div,
+            block,
+            ar,
+            gpu,
+        };
         let m = heads * hd;
-        let (mut mu, mut rho, mut class) = (Vec::with_capacity(m), Vec::with_capacity(m), Vec::with_capacity(m));
+        let (mut mu, mut rho, mut class) = (
+            Vec::with_capacity(m),
+            Vec::with_capacity(m),
+            Vec::with_capacity(m),
+        );
         for _ in 0..m {
             mu.push(r.svarint()?);
             class.push(r.u8()? & 0x7f);
@@ -607,7 +750,13 @@ impl<'a> KvStream<'a> {
         if gpu && mu.iter().any(|&v| v.abs() >= 1 << 24) {
             return Err(DecodeError::Invalid("mean out of range"));
         }
-        Ok(Self { params, tokens, stats: Stats { mu, rho, class }, blocks, offsets })
+        Ok(Self {
+            params,
+            tokens,
+            stats: Stats { mu, rho, class },
+            blocks,
+            offsets,
+        })
     }
 
     /// Decode tokens `[t0, t1)` as `[heads][t1-t0][hd]`, decoding only the
@@ -626,7 +775,15 @@ impl<'a> KvStream<'a> {
         for b in b0..b1 {
             let pos0 = b * p.block;
             let n = p.block.min(self.tokens - pos0);
-            decode_block(p, &self.stats, &step, self.blocks[b], pos0, n, &mut buf[..n * m]);
+            decode_block(
+                p,
+                &self.stats,
+                &step,
+                self.blocks[b],
+                pos0,
+                n,
+                &mut buf[..n * m],
+            );
             y.extend_from_slice(&buf[..n * m]);
         }
         let off = t0 - b0 * p.block;
@@ -643,7 +800,15 @@ impl<'a> KvStream<'a> {
             let pos0 = b * p.block;
             let n = p.block.min(self.tokens - pos0);
             for hh in 0..h {
-                decode_lane_gpu(p, &self.stats, hh, self.blocks[b * h + hh], pos0, n, &mut buf[..n * d]);
+                decode_lane_gpu(
+                    p,
+                    &self.stats,
+                    hh,
+                    self.blocks[b * h + hh],
+                    pos0,
+                    n,
+                    &mut buf[..n * d],
+                );
                 for t in pos0.max(t0)..(pos0 + n).min(t1) {
                     let dst = (hh * nt + t - t0) * d;
                     x[dst..dst + d].copy_from_slice(&buf[(t - pos0) * d..(t - pos0 + 1) * d]);
@@ -665,7 +830,13 @@ impl<'a> KvStream<'a> {
             .map(|i| {
                 let (b, hh) = (i / p.heads, i % p.heads);
                 let pos0 = b * p.block;
-                [self.offsets[i] as u32, self.blocks[i].len() as u32, (pos0) as u32, p.block.min(self.tokens - pos0) as u32, hh as u32]
+                [
+                    self.offsets[i] as u32,
+                    self.blocks[i].len() as u32,
+                    (pos0) as u32,
+                    p.block.min(self.tokens - pos0) as u32,
+                    hh as u32,
+                ]
             })
             .collect();
         Some(GpuTables {
@@ -695,7 +866,10 @@ pub struct GpuTables {
 pub fn gpu_prior_table() -> Vec<u32> {
     let mut v = Vec::with_capacity(NCLASS * NACT * (1 + 2 * UBITS));
     for c in fresh_models(1) {
-        for m in std::iter::once(&c.zero).chain(c.unary.iter()).chain(c.mant.iter()) {
+        for m in std::iter::once(&c.zero)
+            .chain(c.unary.iter())
+            .chain(c.mant.iter())
+        {
             v.push(m.packed());
         }
     }
@@ -723,7 +897,9 @@ pub fn decode(bytes: &[u8]) -> Result<(KvParams, usize, Vec<f32>), DecodeError> 
 /// above) `bpv` bits per value, by bisection on log(step).
 pub fn step_for_bpv(mut params: KvParams, x: &[f32], n: usize, bpv: f64) -> f64 {
     let vals = x.len() as f64;
-    let rms = (x.iter().map(|&v| v as f64 * v as f64).sum::<f64>() / vals).sqrt().max(1e-30);
+    let rms = (x.iter().map(|&v| v as f64 * v as f64).sum::<f64>() / vals)
+        .sqrt()
+        .max(1e-30);
     let (mut lo, mut hi) = ((rms * 1e-5).ln(), (rms * 10.0).ln());
     for _ in 0..30 {
         let mid = 0.5 * (lo + hi);
@@ -745,7 +921,9 @@ mod tests {
     fn synth(h: usize, n: usize, d: usize, seed: u64) -> Vec<f32> {
         let mut s = seed;
         let mut rnd = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 11) as f64 / (1u64 << 53) as f64) - 0.5
         };
         let mut x = vec![0f32; h * n * d];
@@ -811,13 +989,20 @@ mod tests {
                 for hh in 0..h {
                     for t in t0..t1 {
                         for c in 0..d {
-                            assert_eq!(r[(hh * (t1 - t0) + t - t0) * d + c], full[(hh * n + t) * d + c]);
+                            assert_eq!(
+                                r[(hh * (t1 - t0) + t - t0) * d + c],
+                                full[(hh * n + t) * d + c]
+                            );
                         }
                     }
                 }
             }
             let (a, b) = (pre(&p, &x, n), pre(&p, &full, n));
-            let me = a.iter().zip(&b).map(|(u, v)| (u - v).abs()).fold(0.0, f64::max);
+            let me = a
+                .iter()
+                .zip(&b)
+                .map(|(u, v)| (u - v).abs())
+                .fold(0.0, f64::max);
             assert!(me <= p.step / 2.0 + 1e-4);
         }
     }
@@ -847,7 +1032,10 @@ mod tests {
                 let r = s.decode_range(t0, t1);
                 for hh in 0..h {
                     for t in t0..t1 {
-                        assert_eq!(r[(hh * (t1 - t0) + t - t0) * d..][..d], y[(hh * n + t) * d..][..d]);
+                        assert_eq!(
+                            r[(hh * (t1 - t0) + t - t0) * d..][..d],
+                            y[(hh * n + t) * d..][..d]
+                        );
                     }
                 }
             }

@@ -265,12 +265,17 @@ impl IntGraph {
 
     /// Innermost of two scopes, which must lie on one chain of nested loops.
     fn inner(&self, a: Option<u32>, b: Option<u32>) -> Option<u32> {
-        self.try_inner(a, b).expect("int graph: node mixes states of unrelated loops")
+        self.try_inner(a, b)
+            .expect("int graph: node mixes states of unrelated loops")
     }
 
     fn try_inner(&self, a: Option<u32>, b: Option<u32>) -> Result<Option<u32>, &'static str> {
         let (da, db) = (self.depth(a), self.depth(b));
-        let (deep, shallow, mut d, ds) = if da >= db { (a, b, da, db) } else { (b, a, db, da) };
+        let (deep, shallow, mut d, ds) = if da >= db {
+            (a, b, da, db)
+        } else {
+            (b, a, db, da)
+        };
         let mut x = deep;
         while d > ds {
             x = self.loops[x.unwrap() as usize].parent;
@@ -299,7 +304,8 @@ impl IntGraph {
     }
 
     fn infer(&self, n: INode) -> (IType, Option<u32>) {
-        self.try_infer(n).unwrap_or_else(|e| panic!("int graph: {e}"))
+        self.try_infer(n)
+            .unwrap_or_else(|e| panic!("int graph: {e}"))
     }
 
     fn try_infer(&self, n: INode) -> Result<(IType, Option<u32>), &'static str> {
@@ -311,8 +317,12 @@ impl IntGraph {
             INode::Bin(op, a, b) => {
                 let (ta, tb) = (self.ty(a), self.ty(b));
                 match op {
-                    BinOp::Shl | BinOp::Shr => ok(ta != IType::Bool && tb != IType::Bool, "shift of bool")?,
-                    BinOp::And | BinOp::Or | BinOp::Xor => ok(ta == tb, "bitwise op type mismatch")?,
+                    BinOp::Shl | BinOp::Shr => {
+                        ok(ta != IType::Bool && tb != IType::Bool, "shift of bool")?
+                    }
+                    BinOp::And | BinOp::Or | BinOp::Xor => {
+                        ok(ta == tb, "bitwise op type mismatch")?
+                    }
                     _ => {
                         ok(ta == tb, "arithmetic type mismatch")?;
                         ok(ta != IType::Bool, "arithmetic on bool")?;
@@ -321,7 +331,10 @@ impl IntGraph {
                 (ta, self.try_inner(sc(a), sc(b))?)
             }
             INode::Un(op, a) => {
-                ok(op == UnOp::Not || self.ty(a) != IType::Bool, "integer op on bool")?;
+                ok(
+                    op == UnOp::Not || self.ty(a) != IType::Bool,
+                    "integer op on bool",
+                )?;
                 (self.ty(a), sc(a))
             }
             INode::Cmp(_, a, b) => {
@@ -335,7 +348,10 @@ impl IntGraph {
                 (self.ty(a), self.try_inner(s, sc(c))?)
             }
             INode::Bitcast(t, a) => {
-                ok(t != IType::Bool && self.ty(a) != IType::Bool, "bitcast of bool")?;
+                ok(
+                    t != IType::Bool && self.ty(a) != IType::Bool,
+                    "bitcast of bool",
+                )?;
                 (t, sc(a))
             }
             INode::Load(b, i) => {
@@ -348,7 +364,10 @@ impl IntGraph {
             INode::LoadRw(b, i, t) => {
                 let buf = self.bufs.get(b as usize).ok_or("buffer")?;
                 ok(buf.rw.is_some(), "scratch load from a read-only buffer")?;
-                ok(self.ty(i) == IType::U32 && self.ty(t) == IType::U32, "scratch load index and token must be u32")?;
+                ok(
+                    self.ty(i) == IType::U32 && self.ty(t) == IType::U32,
+                    "scratch load index and token must be u32",
+                )?;
                 let s = self.try_inner(sc(i), sc(t))?;
                 ok(s == sc(t), "scratch load outside its token's scope")?;
                 (buf.elem.ty(), s)
@@ -356,14 +375,20 @@ impl IntGraph {
             INode::Store(b, i, v, t) => {
                 let buf = self.bufs.get(b as usize).ok_or("buffer")?;
                 ok(buf.rw.is_some(), "store to a read-only buffer")?;
-                ok(self.ty(i) == IType::U32 && self.ty(t) == IType::U32, "store index and token must be u32")?;
+                ok(
+                    self.ty(i) == IType::U32 && self.ty(t) == IType::U32,
+                    "store index and token must be u32",
+                )?;
                 ok(self.ty(v) == buf.elem.ty(), "store value type")?;
                 let s = self.try_inner(self.try_inner(sc(i), sc(v))?, sc(t))?;
                 ok(s == sc(t), "store outside its token's scope")?;
                 (IType::U32, s)
             }
             INode::State(l, k) => (self.ty(self.loops[l as usize].init[k as usize]), Some(l)),
-            INode::LoopOut(l, k) => (self.ty(self.loops[l as usize].init[k as usize]), self.loops[l as usize].parent),
+            INode::LoopOut(l, k) => (
+                self.ty(self.loops[l as usize].init[k as usize]),
+                self.loops[l as usize].parent,
+            ),
         })
     }
 
@@ -414,15 +439,26 @@ impl IntGraph {
 
     /// Declare a read-only buffer; returns its index for [`load`](Self::load).
     pub fn buffer(&mut self, name: &str, elem: Elem) -> u16 {
-        self.bufs.push(Buffer { name: name.into(), elem, rw: None });
+        self.bufs.push(Buffer {
+            name: name.into(),
+            elem,
+            rw: None,
+        });
         (self.bufs.len() - 1) as u16
     }
 
     /// Declare a scratch buffer of `len` 32-bit elements (`elem` is `I32` or
     /// `U32`), at `name[base + i]` in WGSL.
     pub fn buffer_rw(&mut self, name: &str, elem: Elem, len: u32, base: &str) -> u16 {
-        assert!(matches!(elem, Elem::I32 | Elem::U32), "scratch buffers hold 32-bit elements");
-        self.bufs.push(Buffer { name: name.into(), elem, rw: Some((len, base.into())) });
+        assert!(
+            matches!(elem, Elem::I32 | Elem::U32),
+            "scratch buffers hold 32-bit elements"
+        );
+        self.bufs.push(Buffer {
+            name: name.into(),
+            elem,
+            rw: Some((len, base.into())),
+        });
         (self.bufs.len() - 1) as u16
     }
 
@@ -567,16 +603,28 @@ impl IntGraph {
     /// `s = init; while cond(s) { s = next(s) }`; returns the final states.
     ///
     /// `body` gets the state nodes and returns `(cond, next)`.
-    pub fn while_loop(&mut self, init: &[IId], body: impl FnOnce(&mut Self, &[IId]) -> (IId, Vec<IId>)) -> Vec<IId> {
+    pub fn while_loop(
+        &mut self,
+        init: &[IId],
+        body: impl FnOnce(&mut Self, &[IId]) -> (IId, Vec<IId>),
+    ) -> Vec<IId> {
         let l = self.loops.len() as u32;
         let parent = self.building.last().copied();
         for &x in init {
             // inits live in the enclosing scope
             self.inner(self.scope[x.index()], parent);
         }
-        self.loops.push(Loop { init: init.to_vec(), cond: IId(0), next: Vec::new(), parent, cap: None });
+        self.loops.push(Loop {
+            init: init.to_vec(),
+            cond: IId(0),
+            next: Vec::new(),
+            parent,
+            cap: None,
+        });
         self.building.push(l);
-        let st: Vec<IId> = (0..init.len()).map(|k| self.insert(INode::State(l, k as u16))).collect();
+        let st: Vec<IId> = (0..init.len())
+            .map(|k| self.insert(INode::State(l, k as u16)))
+            .collect();
         let (cond, next) = body(self, &st);
         self.building.pop();
         assert_eq!(self.ty(cond), IType::Bool, "loop condition must be bool");
@@ -586,7 +634,9 @@ impl IntGraph {
         }
         self.loops[l as usize].cond = cond;
         self.loops[l as usize].next = next;
-        (0..init.len()).map(|k| self.insert(INode::LoopOut(l, k as u16))).collect()
+        (0..init.len())
+            .map(|k| self.insert(INode::LoopOut(l, k as u16)))
+            .collect()
     }
 
     /// Cap the trip count of the loop that produced `out` (a loop result).
@@ -608,7 +658,12 @@ impl IntGraph {
     }
 
     /// `for i in 0..n` (`n: u32`) over states; `body(g, i, s)` returns next states.
-    pub fn for_range(&mut self, n: IId, init: &[IId], body: impl FnOnce(&mut Self, IId, &[IId]) -> Vec<IId>) -> Vec<IId> {
+    pub fn for_range(
+        &mut self,
+        n: IId,
+        init: &[IId],
+        body: impl FnOnce(&mut Self, IId, &[IId]) -> Vec<IId>,
+    ) -> Vec<IId> {
         let zero = self.u32(0);
         let mut s0 = vec![zero];
         s0.extend_from_slice(init);

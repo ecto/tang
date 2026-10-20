@@ -126,9 +126,23 @@ fn main() {
                     (b, format!("\"chose\":\"{}\"", c.name()))
                 }
                 "qtt-probe" => {
-                    let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-                    let (n, r, t) = tang_compress::qtt_probe(&x, &dims, bound, env("PROBE_STRIDE", 2), env("PROBE_CAP", 32));
-                    (vec![0u8; n], format!("\"probe_bytes\":{n},\"probe_rank\":{r},\"probe_s\":{t}"))
+                    let env = |k: &str, d: usize| {
+                        std::env::var(k)
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(d)
+                    };
+                    let (n, r, t) = tang_compress::qtt_probe(
+                        &x,
+                        &dims,
+                        bound,
+                        env("PROBE_STRIDE", 2),
+                        env("PROBE_CAP", 32),
+                    );
+                    (
+                        vec![0u8; n],
+                        format!("\"probe_bytes\":{n},\"probe_rank\":{r},\"probe_s\":{t}"),
+                    )
                 }
                 "interp" | "qtt" | "qtt-sparse" => {
                     let cfg = wavcodec::WavConfig::new(bound);

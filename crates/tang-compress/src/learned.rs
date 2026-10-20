@@ -59,13 +59,23 @@ const ZMAX: i64 = 16 * 256; // logistic table covers |z| ≤ 16 (Q8)
 pub fn lg_q8(v: u32) -> i32 {
     let w = v as u64 + 1;
     let e = w.ilog2();
-    let m = if e >= 8 { (w >> (e - 8)) & 0xFF } else { (w << (8 - e)) & 0xFF };
+    let m = if e >= 8 {
+        (w >> (e - 8)) & 0xFF
+    } else {
+        (w << (8 - e)) & 0xFF
+    };
     (e as i32) * 256 + m as i32
 }
 
 /// Integer feature vector (`Q8`).
 pub fn feat_vec(f: &Feat) -> [i32; NF] {
-    let slg = |v: i32| if v < 0 { -lg_q8(v.unsigned_abs()) } else { lg_q8(v as u32) };
+    let slg = |v: i32| {
+        if v < 0 {
+            -lg_q8(v.unsigned_abs())
+        } else {
+            lg_q8(v as u32)
+        }
+    };
     let mut x = [0i32; NF];
     for i in 0..9 {
         x[i] = slg(f.sv[i]);
@@ -237,7 +247,11 @@ fn code_mix<B: Bits>(b: &mut B, mx: &Mix, v: i32, apm: &mut Apm, cls: usize) -> 
         let up = tail(mid).saturating_sub(end);
         let all = tail(lo).saturating_sub(end);
         let p = ratio(up, all);
-        let bit = if first { apm.code(b, mag >= mid, p, cls * 4 + 3) } else { b.bitp(mag >= mid, p) };
+        let bit = if first {
+            apm.code(b, mag >= mid, p, cls * 4 + 3)
+        } else {
+            b.bitp(mag >= mid, p)
+        };
         first = false;
         if bit {
             lo = mid;
@@ -267,13 +281,19 @@ const APM_N: usize = 33;
 fn stretch_tab() -> &'static Vec<i32> {
     // bucket centres p = σ((i−16)/2), Q16, from the Q24 logistic table
     static S: OnceLock<Vec<i32>> = OnceLock::new();
-    S.get_or_init(|| (0..APM_N).map(|i| (sigmoid_q((i as i64 - 16) * 128) >> 8) as i32).collect())
+    S.get_or_init(|| {
+        (0..APM_N)
+            .map(|i| (sigmoid_q((i as i64 - 16) * 128) >> 8) as i32)
+            .collect()
+    })
 }
 
 impl Apm {
     fn new(on: bool) -> Self {
         let st = stretch_tab();
-        let t = (0..(NCLASS + 1) * 4).flat_map(|_| st.iter().map(|&p| BitModel::new(p as u32))).collect();
+        let t = (0..(NCLASS + 1) * 4)
+            .flat_map(|_| st.iter().map(|&p| BitModel::new(p as u32)))
+            .collect();
         Self { on, t }
     }
     #[inline]
@@ -285,7 +305,11 @@ impl Apm {
         let p = p1 as i32;
         let j = st.partition_point(|&s| s <= p).clamp(1, APM_N - 1) - 1;
         let (a, c) = (st[j], st[j + 1]);
-        let w = if c > a { ((p - a).clamp(0, c - a) as i64 * 4096 / (c - a) as i64) as u32 } else { 0 };
+        let w = if c > a {
+            ((p - a).clamp(0, c - a) as i64 * 4096 / (c - a) as i64) as u32
+        } else {
+            0
+        };
         let base = ctx * APM_N;
         let pa = self.t[base + j].p1();
         let pc = self.t[base + j + 1].p1();
@@ -333,7 +357,11 @@ impl Net {
                     acc += wi as i64 * ai;
                 }
                 let v = (acc + 128) >> 8;
-                b[o] = if l + 1 < nl { v.clamp(0, 1 << 22) } else { v.clamp(-(1 << 22), 1 << 22) };
+                b[o] = if l + 1 < nl {
+                    v.clamp(0, 1 << 22)
+                } else {
+                    v.clamp(-(1 << 22), 1 << 22)
+                };
             }
             std::mem::swap(&mut a, &mut b);
         }
@@ -346,7 +374,11 @@ impl Net {
 
     /// 64-bit FNV-1a fingerprint of the integer model.
     pub fn fingerprint(&self) -> u64 {
-        self.to_bytes().iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3))
+        self.to_bytes()
+            .iter()
+            .fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+                (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
+            })
     }
 
     /// Number of parameters.
@@ -440,8 +472,16 @@ impl Net {
         let mut wq = Vec::new();
         let mut bq = Vec::new();
         for l in 0..sizes.len() - 1 {
-            wq.push((0..sizes[l] * sizes[l + 1]).map(|_| unzz(mw.decode(&mut d)).clamp(-(1 << 30), 1 << 30) as i32).collect());
-            bq.push((0..sizes[l + 1]).map(|_| unzz(mb.decode(&mut d)).clamp(-(1 << 30), 1 << 30) as i32).collect());
+            wq.push(
+                (0..sizes[l] * sizes[l + 1])
+                    .map(|_| unzz(mw.decode(&mut d)).clamp(-(1 << 30), 1 << 30) as i32)
+                    .collect(),
+            );
+            bq.push(
+                (0..sizes[l + 1])
+                    .map(|_| unzz(mb.decode(&mut d)).clamp(-(1 << 30), 1 << 30) as i32)
+                    .collect(),
+            );
         }
         Ok(Self { sizes, wq, bq, apm })
     }
@@ -466,7 +506,11 @@ impl NetModel {
     /// Wrap a network.
     pub fn new(net: Arc<Net>) -> Self {
         let apm = Apm::new(net.apm);
-        Self { net, cache: vec![None; NCLASS * 8 * 2], apm }
+        Self {
+            net,
+            cache: vec![None; NCLASS * 8 * 2],
+            apm,
+        }
     }
 }
 
@@ -533,7 +577,12 @@ pub fn register(net: Arc<Net>) {
 
 /// A registered pretrained network by fingerprint.
 pub fn lookup(fp: u64) -> Option<Arc<Net>> {
-    registry().lock().unwrap().iter().find(|n| n.fingerprint() == fp).cloned()
+    registry()
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|n| n.fingerprint() == fp)
+        .cloned()
 }
 
 /// Read the model section for `tag` (after the tag byte).
@@ -542,7 +591,10 @@ pub fn read_model(tag: u8, r: &mut ByteReader) -> Result<NetModel, DecodeError> 
         TAG_PRETRAINED => {
             let fp = u64::from_le_bytes(r.take(8)?.try_into().unwrap());
             let reg = registry().lock().unwrap();
-            let net = reg.iter().find(|n| n.fingerprint() == fp).ok_or(DecodeError::Invalid("pretrained model not registered"))?;
+            let net = reg
+                .iter()
+                .find(|n| n.fingerprint() == fp)
+                .ok_or(DecodeError::Invalid("pretrained model not registered"))?;
             Ok(NetModel::new(net.clone()))
         }
         TAG_OVERFIT => Ok(NetModel::new(Arc::new(Net::read_coded(r)?))),
@@ -565,7 +617,9 @@ pub fn parse_model_arg(s: &str) -> crate::wavcodec::ModelChoice {
         return ModelChoice::Learned(LearnedSpec::Overfit(cfg));
     }
     if let Some(path) = s.strip_prefix("pretrained:") {
-        let net = Arc::new(Net::from_bytes(&std::fs::read(path).expect("read model")).expect("parse model"));
+        let net = Arc::new(
+            Net::from_bytes(&std::fs::read(path).expect("read model")).expect("parse model"),
+        );
         register(net.clone());
         return ModelChoice::Learned(LearnedSpec::Pretrained(net));
     }
@@ -613,11 +667,27 @@ pub struct TrainConfig {
 impl TrainConfig {
     /// Small network for per-file overfitting (its weights are shipped).
     pub fn overfit() -> Self {
-        Self { hidden: vec![16], epochs: 4, per_epoch: 200_000, batch: 256, lr: 4e-3, apm: true, seed: 1 }
+        Self {
+            hidden: vec![16],
+            epochs: 4,
+            per_epoch: 200_000,
+            batch: 256,
+            lr: 4e-3,
+            apm: true,
+            seed: 1,
+        }
     }
     /// Larger network for offline pretraining.
     pub fn pretrain() -> Self {
-        Self { hidden: vec![32, 16], epochs: 10, per_epoch: 500_000, batch: 256, lr: 3e-3, apm: true, seed: 7 }
+        Self {
+            hidden: vec![32, 16],
+            epochs: 10,
+            per_epoch: 500_000,
+            batch: 256,
+            lr: 3e-3,
+            apm: true,
+            seed: 7,
+        }
     }
 }
 
@@ -723,7 +793,9 @@ fn nll_grad(o: &[f64], r: i32) -> (f64, [f64; NO]) {
 }
 
 fn lcg(s: &mut u64) -> u64 {
-    *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *s = s
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     *s >> 11
 }
 
@@ -744,7 +816,11 @@ pub fn train(samples: &[Sample], cfg: &TrainConfig) -> Net {
         }
     }
     let n = samples.len();
-    let mean_abs = samples.iter().map(|s| s.r.unsigned_abs() as f64).sum::<f64>() / n.max(1) as f64;
+    let mean_abs = samples
+        .iter()
+        .map(|s| s.r.unsigned_abs() as f64)
+        .sum::<f64>()
+        / n.max(1) as f64;
     let (_, bo) = fnet.off[sizes.len() - 2];
     th[bo + 3] = -1.5;
     th[bo + 4] = (mean_abs + 0.5).log2();
@@ -790,10 +866,25 @@ fn quantize_net(f: &FNet, th: &[f64], apm: bool) -> Net {
     for l in 0..f.sizes.len() - 1 {
         let (wo, bo) = f.off[l];
         let no = f.sizes[l + 1];
-        wq.push(th[wo..bo].iter().map(|v| (v * 256.0).round().clamp(-1e9, 1e9) as i32).collect());
-        bq.push(th[bo..bo + no].iter().map(|v| (v * 65536.0).round().clamp(-1e9, 1e9) as i32).collect());
+        wq.push(
+            th[wo..bo]
+                .iter()
+                .map(|v| (v * 256.0).round().clamp(-1e9, 1e9) as i32)
+                .collect(),
+        );
+        bq.push(
+            th[bo..bo + no]
+                .iter()
+                .map(|v| (v * 65536.0).round().clamp(-1e9, 1e9) as i32)
+                .collect(),
+        );
     }
-    Net { sizes: f.sizes.clone(), wq, bq, apm }
+    Net {
+        sizes: f.sizes.clone(),
+        wq,
+        bq,
+        apm,
+    }
 }
 
 /// Mean ideal code length (bits/sample) of `samples` under the float view of
@@ -811,7 +902,18 @@ pub fn mean_bits_float(net: &Net, samples: &[Sample]) -> f64 {
             th[bo + i] = v as f64 / 65536.0;
         }
     }
-    let s: f64 = samples.iter().map(|s| nll_grad(f.forward(&th, &s.x.map(|v| v as f64 / 256.0)).last().unwrap(), s.r).0).sum();
+    let s: f64 = samples
+        .iter()
+        .map(|s| {
+            nll_grad(
+                f.forward(&th, &s.x.map(|v| v as f64 / 256.0))
+                    .last()
+                    .unwrap(),
+                s.r,
+            )
+            .0
+        })
+        .sum();
     s / samples.len().max(1) as f64 / std::f64::consts::LN_2
 }
 
@@ -866,7 +968,11 @@ mod tests {
                 a[k] += 1e-6;
                 b[k] -= 1e-6;
                 let fd = (nll_grad(&a, r).0 - nll_grad(&b, r).0) / 2e-6;
-                assert!((fd - g[k]).abs() < 1e-4 * (1.0 + fd.abs()), "r={r} k={k}: {fd} vs {}", g[k]);
+                assert!(
+                    (fd - g[k]).abs() < 1e-4 * (1.0 + fd.abs()),
+                    "r={r} k={k}: {fd} vs {}",
+                    g[k]
+                );
             }
         }
     }
@@ -875,12 +981,22 @@ mod tests {
     fn overfit_model_round_trips_bit_exact() {
         let d = [10, 24, 30];
         let p = Pyramid::new(d, MAX_LEVELS);
-        let mut x: Vec<f64> = (0..p.len()).map(|i| ((i as f64) * 0.021).sin() * 50.0 + ((i * 7) % 13) as f64).collect();
+        let mut x: Vec<f64> = (0..p.len())
+            .map(|i| ((i as f64) * 0.021).sin() * 50.0 + ((i * 7) % 13) as f64)
+            .collect();
         forward_97(&p, &mut x);
         let mut q: Vec<i32> = x.iter().map(|v| (v / 0.9).round() as i32).collect();
         q[3] = 2_000_000; // far tail
         let preds = fit_predictors(&p, &q);
-        let cfg = TrainConfig { hidden: vec![8], epochs: 2, per_epoch: 4000, batch: 128, lr: 5e-3, apm: true, seed: 3 };
+        let cfg = TrainConfig {
+            hidden: vec![8],
+            epochs: 2,
+            per_epoch: 4000,
+            batch: 128,
+            lr: 5e-3,
+            apm: true,
+            seed: 3,
+        };
         let mut w = ByteWriter::new();
         let mut m = LearnedSpec::Overfit(cfg.clone()).prepare(&p, &q, &preds, &mut w);
         let mut e = Encoder::new();

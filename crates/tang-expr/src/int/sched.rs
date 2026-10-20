@@ -9,7 +9,11 @@ pub(crate) enum Item {
     Node(IId),
     /// Run loop `l`: `pre` computes what the condition needs, then the
     /// condition is checked, then `post` and the state update.
-    Loop { l: u32, pre: Vec<Item>, post: Vec<Item> },
+    Loop {
+        l: u32,
+        pre: Vec<Item>,
+        post: Vec<Item>,
+    },
 }
 
 pub(crate) struct Sched {
@@ -40,7 +44,11 @@ impl IntGraph {
                 f(a);
                 f(b);
             }
-            INode::Const(..) | INode::Param(..) | INode::State(..) | INode::LoopOut(..) | INode::Tok => {}
+            INode::Const(..)
+            | INode::Param(..)
+            | INode::State(..)
+            | INode::LoopOut(..)
+            | INode::Tok => {}
         }
     }
 
@@ -51,13 +59,21 @@ impl IntGraph {
         let mut uses = vec![0u32; n];
         let mut user_scope: Vec<Option<Option<u32>>> = vec![None; n];
         let mut stack: Vec<IId> = Vec::new();
-        let use_at = |x: IId, s: Option<u32>, uses: &mut Vec<u32>, us: &mut Vec<Option<Option<u32>>>, st: &mut Vec<IId>| {
+        let use_at = |x: IId,
+                      s: Option<u32>,
+                      uses: &mut Vec<u32>,
+                      us: &mut Vec<Option<Option<u32>>>,
+                      st: &mut Vec<IId>| {
             uses[x.index()] += 1;
             us[x.index()] = Some(s);
             st.push(x);
         };
         for &o in outputs {
-            assert_eq!(self.scope[o.index()], None, "int graph: output inside a loop");
+            assert_eq!(
+                self.scope[o.index()],
+                None,
+                "int graph: output inside a loop"
+            );
             use_at(o, None, &mut uses, &mut user_scope, &mut stack);
         }
         while let Some(x) = stack.pop() {
@@ -89,7 +105,10 @@ impl IntGraph {
         let mut inline: Vec<bool> = (0..n)
             .map(|i| {
                 // effects stay at their place in the schedule
-                let leaf = matches!(self.nodes[i], INode::State(..) | INode::LoopOut(..) | INode::LoadRw(..) | INode::Store(..));
+                let leaf = matches!(
+                    self.nodes[i],
+                    INode::State(..) | INode::LoopOut(..) | INode::LoadRw(..) | INode::Store(..)
+                );
                 live[i] && !leaf && uses[i] == 1 && user_scope[i] == Some(self.scope[i])
             })
             .collect();
@@ -115,7 +134,13 @@ impl IntGraph {
 
     /// Items of `scope` in id order (a loop goes right before its first
     /// `LoopOut`), restricted to `only` when given.
-    fn scope_items(&self, scope: Option<u32>, live: &[bool], only: Option<&[bool]>, done: &mut Vec<bool>) -> Vec<Item> {
+    fn scope_items(
+        &self,
+        scope: Option<u32>,
+        live: &[bool],
+        only: Option<&[bool]>,
+        done: &mut Vec<bool>,
+    ) -> Vec<Item> {
         let mut items = Vec::new();
         for i in 0..self.nodes.len() {
             if !live[i] || self.scope[i] != scope || only.is_some_and(|m| !m[i]) {

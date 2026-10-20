@@ -29,7 +29,10 @@ use crate::abac::{Decoder, Encoder, UintModel, ONE};
 use crate::bitio::{ByteReader, ByteWriter, DecodeError};
 use crate::codec::{Decoded, ErrorBound};
 use crate::coefcode::{code_bands, fit_predictors, read_preds, write_preds, Bits, HandModel};
-use crate::linalg::{cholesky, gram_cols, gram_rows, matmul, matmul_tn, solve_lower, solve_lower_t, sym_eig_desc, transpose};
+use crate::linalg::{
+    cholesky, gram_cols, gram_rows, matmul, matmul_tn, solve_lower, solve_lower_t, sym_eig_desc,
+    transpose,
+};
 use crate::wavelet::{as3, Pyramid, MAX_LEVELS};
 
 /// Stream magic.
@@ -137,7 +140,13 @@ fn quantize_core(c: &[f64], delta: f64) -> (Vec<i32>, [u8; 2]) {
             }
         })
         .collect();
-    let d = [0, 1].map(|j| if n[j] > 0 { ((s[j] / n[j] as f64).clamp(0.0, 0.498) * 512.0).round() as u8 } else { 0 });
+    let d = [0, 1].map(|j| {
+        if n[j] > 0 {
+            ((s[j] / n[j] as f64).clamp(0.0, 0.498) * 512.0).round() as u8
+        } else {
+            0
+        }
+    });
     (q, d)
 }
 
@@ -220,12 +229,19 @@ fn code_factor<B: Bits>(b: &mut B, f: &mut QFactor, km: &mut UintModel, hm: &mut
     for j in 0..f.r {
         let col = f.q[j * f.n..(j + 1) * f.n].to_vec();
         // encoder picks the DPCM order and Rice parameter; the decoder reads them
-        let res_of = |o: usize| -> Vec<u64> { (0..col.len()).map(|i| zz(col[i] - dpcm_pred(&col, i, o))).collect() };
-        let bo = (0..3).min_by_key(|&o| res_of(o).iter().sum::<u64>()).unwrap();
+        let res_of = |o: usize| -> Vec<u64> {
+            (0..col.len())
+                .map(|i| zz(col[i] - dpcm_pred(&col, i, o)))
+                .collect()
+        };
+        let bo = (0..3)
+            .min_by_key(|&o| res_of(o).iter().sum::<u64>())
+            .unwrap();
         let res = res_of(bo);
         let mean = res.iter().sum::<u64>() / f.n.max(1) as u64;
         let k = if mean > 2 { (mean / 2).ilog2() } else { 0 };
-        let o = b.bitp(bo & 1 == 1, ONE / 2) as usize | (b.bitp(bo & 2 == 2, ONE / 2) as usize) << 1;
+        let o =
+            b.bitp(bo & 1 == 1, ONE / 2) as usize | (b.bitp(bo & 2 == 2, ONE / 2) as usize) << 1;
         let k = b.uint(k as u64, km) as u32;
         if k > 62 || o > 2 {
             return; // corrupt stream; decoder output is garbage but bounded
@@ -297,7 +313,9 @@ struct Hosvd {
 }
 
 fn hosvd(x: &[f64], d: [usize; 3]) -> Hosvd {
-    let us: Vec<Vec<f64>> = (0..3).map(|k| sym_eig_desc(&mode_gram(x, d, k), d[k]).1).collect();
+    let us: Vec<Vec<f64>> = (0..3)
+        .map(|k| sym_eig_desc(&mode_gram(x, d, k), d[k]).1)
+        .collect();
     let mut c = x.to_vec();
     let mut cd = d;
     for k in 0..3 {
@@ -331,7 +349,16 @@ fn trial(x: &[f64], h: &Hosvd, delta: f64) -> Trial {
         }
     }
     let facs: Vec<QFactor> = (0..3)
-        .map(|k| QFactor::quantize(&h.us[k], d[k], d[k], rs[k], &slice_norms(&h.core, d, k), delta))
+        .map(|k| {
+            QFactor::quantize(
+                &h.us[k],
+                d[k],
+                d[k],
+                rs[k],
+                &slice_norms(&h.core, d, k),
+                delta,
+            )
+        })
         .collect();
     let ud: Vec<Vec<f64>> = facs.iter().map(|f| f.dequantize()).collect();
     let core = ls_core(x, d, &ud, rs);
@@ -386,22 +413,37 @@ pub fn encode_fast_f32(x: &[f32], dims: &[usize], bound: ErrorBound) -> (Vec<u8>
     encode_f32_with(x, dims, bound, true)
 }
 
-fn encode_f32_with(x: &[f32], dims: &[usize], bound: ErrorBound, fast: bool) -> (Vec<u8>, TuckerStats) {
+fn encode_f32_with(
+    x: &[f32],
+    dims: &[usize],
+    bound: ErrorBound,
+    fast: bool,
+) -> (Vec<u8>, TuckerStats) {
     let x: Vec<f64> = x.iter().map(|&v| v as f64).collect();
     let d = as3(dims);
     assert_eq!(d.iter().product::<usize>(), x.len());
-    let (lo_v, hi_v) = x.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &v| (a.min(v), b.max(v)));
+    let (lo_v, hi_v) = x
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &v| {
+            (a.min(v), b.max(v))
+        });
     let target = match bound {
         ErrorBound::Rmse(r) => r,
         ErrorBound::Psnr(db) => (hi_v - lo_v) * 10f64.powf(-db / 20.0),
-        ErrorBound::MaxAbs(_) => panic!("the Tucker codec has no max-abs mode; use the wavelet codec"),
+        ErrorBound::MaxAbs(_) => {
+            panic!("the Tucker codec has no max-abs mode; use the wavelet codec")
+        }
     }
     .max(f64::MIN_POSITIVE);
     let h = hosvd(&x, d);
     let ok = |delta: f64| err_of(&x, &trial(&x, &h, delta).y).0 <= target;
     let delta = if fast {
         let (d, _) = crate::wavcodec::fast_step(target, 4, |d| err_of(&x, &trial(&x, &h, d).y).0);
-        if ok(d) { d } else { search(target, &ok) }
+        if ok(d) {
+            d
+        } else {
+            search(target, &ok)
+        }
     } else {
         search(target, &ok)
     };
@@ -445,7 +487,14 @@ fn encode_f32_with(x: &[f32], dims: &[usize], bound: ErrorBound, fast: bool) -> 
     w.block(&e.finish());
     let core_bytes = w.buf.len() - cb0;
     let (rmse, max_abs) = err_of(&x, &t.y);
-    let st = TuckerStats { core_bytes, factor_bytes, ranks: t.rs.to_vec(), delta, rmse, max_abs };
+    let st = TuckerStats {
+        core_bytes,
+        factor_bytes,
+        ranks: t.rs.to_vec(),
+        delta,
+        rmse,
+        max_abs,
+    };
     (w.buf, st)
 }
 
@@ -467,7 +516,10 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
         dims.push(r.varint()? as usize);
     }
     let d = as3(&dims);
-    if d.iter().try_fold(1usize, |a, &v| a.checked_mul(v)).is_none_or(|n| n == 0 || n as u64 > 1 << 34) {
+    if d.iter()
+        .try_fold(1usize, |a, &v| a.checked_mul(v))
+        .is_none_or(|n| n == 0 || n as u64 > 1 << 34)
+    {
         return Err(DecodeError::Invalid("dims"));
     }
     let delta = r.f64()?;
@@ -487,7 +539,12 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
             prev += r.svarint()?;
             exps.push(prev.clamp(-4000, 4000) as i32);
         }
-        facs.push(QFactor { n: d[k], r: rs[k], exps, q: vec![0; d[k] * rs[k]] });
+        facs.push(QFactor {
+            n: d[k],
+            r: rs[k],
+            exps,
+            q: vec![0; d[k] * rs[k]],
+        });
     }
     let buf = r.block()?;
     let mut dd = Decoder::new(buf);
@@ -506,7 +563,10 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
     let mut q = vec![0i32; p.len()];
     code_bands(&p, &mut q, &preds, &mut dd, &mut HandModel::default());
     let y = reconstruct(&dequantize_core(&q, delta, dl), rs, &ud, d);
-    Ok(Decoded::F32 { dims, data: y.iter().map(|&v| v as f32).collect() })
+    Ok(Decoded::F32 {
+        dims,
+        data: y.iter().map(|&v| v as f32).collect(),
+    })
 }
 
 #[cfg(test)]
@@ -527,11 +587,14 @@ mod tests {
         }
         for db in [50.0, 90.0] {
             let (bytes, st) = encode_f32(&x, &d, ErrorBound::Psnr(db));
-            let Decoded::F32 { data, .. } = decode(&bytes).unwrap() else { panic!() };
+            let Decoded::F32 { data, .. } = decode(&bytes).unwrap() else {
+                panic!()
+            };
             let xd: Vec<f64> = x.iter().map(|&v| v as f64).collect();
             let (rmse, _) = err_of(&xd, &data.iter().map(|&v| v as f64).collect::<Vec<_>>());
             assert_eq!(rmse, st.rmse);
-            let range = xd.iter().cloned().fold(f64::MIN, f64::max) - xd.iter().cloned().fold(f64::MAX, f64::min);
+            let range = xd.iter().cloned().fold(f64::MIN, f64::max)
+                - xd.iter().cloned().fold(f64::MAX, f64::min);
             assert!(20.0 * (range / rmse).log10() >= db - 1e-9);
             assert_eq!(encode_f32(&x, &d, ErrorBound::Psnr(db)).0, bytes);
         }
