@@ -76,7 +76,7 @@ pub fn mulsh(a: i32, b: i32, s: u32) -> i32 {
 pub const MINIT: u32 = 0x8000_8000;
 
 #[inline]
-fn mp1(m: u32) -> u32 {
+pub(crate) fn mp1(m: u32) -> u32 {
     (((m & 0xFFFF) + (m >> 16)) >> 1).clamp(32, 65504)
 }
 
@@ -242,7 +242,7 @@ impl Sink for DecSink<'_> {
 }
 
 #[inline]
-fn bitm<S: Sink, const A: bool>(s: &mut S, lane: usize, m: &mut [u32], idx: usize, bit: bool) -> bool {
+pub(crate) fn bitm<S: Sink, const A: bool>(s: &mut S, lane: usize, m: &mut [u32], idx: usize, bit: bool) -> bool {
     let b = s.bit(lane, bit, mp1(m[idx]));
     if A {
         m[idx] = mupd(m[idx], b);
@@ -252,7 +252,7 @@ fn bitm<S: Sink, const A: bool>(s: &mut S, lane: usize, m: &mut [u32], idx: usiz
 }
 
 #[inline]
-fn raw_n<S: Sink>(s: &mut S, lane: usize, v: u32, mut n: u32) -> u32 {
+pub(crate) fn raw_n<S: Sink>(s: &mut S, lane: usize, v: u32, mut n: u32) -> u32 {
     let mut out = 0u32;
     while n > 16 {
         out = (out << 16) | s.raw(lane, v >> (n - 16), 16);
@@ -266,7 +266,7 @@ fn raw_n<S: Sink>(s: &mut S, lane: usize, v: u32, mut n: u32) -> u32 {
 
 /// Adaptive Elias-gamma for `v < 2^31`.
 #[inline]
-fn gamma<S: Sink, const A: bool>(s: &mut S, lane: usize, m: &mut [u32], base: usize, v: u32) -> u32 {
+pub(crate) fn gamma<S: Sink, const A: bool>(s: &mut S, lane: usize, m: &mut [u32], base: usize, v: u32) -> u32 {
     let w = v.wrapping_add(1);
     let nbe = 31 - w.max(1).leading_zeros();
     let mut nb = 0u32;
@@ -307,8 +307,8 @@ pub fn prior_table() -> &'static [u32; 64] {
 }
 
 /// Counts decisions per model.
-struct CountSink {
-    n: Vec<[u32; 2]>,
+pub(crate) struct CountSink {
+    pub(crate) n: Vec<[u32; 2]>,
 }
 
 impl Sink for CountSink {
@@ -327,7 +327,7 @@ impl Sink for CountSink {
 }
 
 /// Choose priors (index into [`prior_table`]) from pooled counts.
-fn choose_priors(n: &[[u32; 2]], adaptive: bool) -> Vec<Option<u8>> {
+pub(crate) fn choose_priors(n: &[[u32; 2]], adaptive: bool) -> Vec<Option<u8>> {
     let th: u32 = std::env::var("TC_PRIOR_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(if adaptive { 16 } else { 4 });
     let t = prior_table();
     n.iter()
@@ -344,7 +344,7 @@ fn choose_priors(n: &[[u32; 2]], adaptive: bool) -> Vec<Option<u8>> {
         .collect()
 }
 
-fn write_priors(w: &mut ByteWriter, pr: &[Option<u8>]) {
+pub(crate) fn write_priors(w: &mut ByteWriter, pr: &[Option<u8>]) {
     use crate::abac::{BitModel, Encoder, UintModel};
     let mut e = Encoder::new();
     let mut pm = [BitModel::default(); 2];
@@ -361,7 +361,7 @@ fn write_priors(w: &mut ByteWriter, pr: &[Option<u8>]) {
     w.block(&e.finish());
 }
 
-fn read_priors(r: &mut ByteReader) -> Result<Vec<u32>, DecodeError> {
+pub(crate) fn read_priors(r: &mut ByteReader) -> Result<Vec<u32>, DecodeError> {
     use crate::abac::{BitModel, Decoder, UintModel};
     let buf = r.block()?;
     let mut d = Decoder::new(buf);
@@ -384,7 +384,7 @@ fn read_priors(r: &mut ByteReader) -> Result<Vec<u32>, DecodeError> {
     Ok(init)
 }
 
-fn init_of(pr: &[Option<u8>]) -> Vec<u32> {
+pub(crate) fn init_of(pr: &[Option<u8>]) -> Vec<u32> {
     let t = prior_table();
     pr.iter().map(|p| p.map_or(MINIT, |k| t[k as usize] | t[k as usize] << 16)).collect()
 }
@@ -414,6 +414,12 @@ pub struct BandInfo {
     pub sh: u32,
     /// Synthesis-basis weight.
     pub w: f64,
+    /// Origin of the subband this region belongs to (parent mapping); equal
+    /// to `start` for whole bands, the band start for a code-block.
+    pub org: [usize; 3],
+    /// Raster order inside the region (one lane, every earlier line
+    /// visible) instead of parity passes.
+    pub raster: bool,
 }
 
 /// A brick shape and its pyramid.
@@ -427,7 +433,7 @@ pub struct Shape {
     pub bands: Vec<BandInfo>,
 }
 
-fn max_levels(dims: [usize; 3]) -> usize {
+pub(crate) fn max_levels(dims: [usize; 3]) -> usize {
     if dims.iter().filter(|&&d| d > 1).count() <= 1 {
         MAX_LEVELS_1D
     } else {
@@ -492,7 +498,7 @@ fn key_id(level: usize, mask: u8, pass: usize, nlev: usize) -> usize {
 pub const NKEY: usize = 16 * 8 * 8;
 
 impl Shape {
-    fn new(dims: [usize; 3]) -> Self {
+    pub(crate) fn new(dims: [usize; 3]) -> Self {
         let p = Pyramid::new(dims, max_levels(dims));
         let bands = (0..p.bands.len())
             .map(|bi| {
@@ -521,13 +527,15 @@ impl Shape {
                     m: 0,
                     sh: 1,
                     w: p.band_weight(b),
+                    org: b.start,
+                    raster: false,
                 }
             })
             .collect();
         Self { dims, p, bands }
     }
 
-    fn set_steps(&mut self, delta_g: f64) {
+    pub(crate) fn set_steps(&mut self, delta_g: f64) {
         for b in self.bands.iter_mut() {
             let (m, sh) = step_repr(delta_g / b.w);
             b.m = m;
@@ -535,13 +543,13 @@ impl Shape {
         }
     }
 
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.dims.iter().product()
     }
 }
 
 /// `step ≈ m·2^−sh` with `m ∈ [2^29, 2^30]`.
-fn step_repr(step: f64) -> (i32, u32) {
+pub(crate) fn step_repr(step: f64) -> (i32, u32) {
     let lg = step.log2().floor() as i32;
     let sh = (29 - lg).clamp(1, 52);
     let m = (step * 2f64.powi(sh)).round().clamp(1.0, (1u64 << 31) as f64 - 1.0) as i32;
@@ -580,13 +588,13 @@ const TCLAMP: i32 = 1 << 13;
 
 /// Lines (as base indices of `(z, y, start_x)`) visible from a line.
 #[derive(Clone, Copy, Default)]
-struct RowCtx {
-    base: [usize; 20],
-    cat: [u8; 20],
-    n: usize,
+pub(crate) struct RowCtx {
+    pub(crate) base: [usize; 20],
+    pub(crate) cat: [u8; 20],
+    pub(crate) n: usize,
 }
 
-fn row_ctx(sh: &Shape, b: &BandInfo, p: usize, z: usize, y: usize) -> RowCtx {
+pub(crate) fn row_ctx(sh: &Shape, b: &BandInfo, p: usize, z: usize, y: usize) -> RowCtx {
     let [_, ny, nx] = sh.dims;
     let mut rc = RowCtx::default();
     for &(dz, dy, cat) in &ROWNB {
@@ -595,7 +603,11 @@ fn row_ctx(sh: &Shape, b: &BandInfo, p: usize, z: usize, y: usize) -> RowCtx {
             continue;
         }
         let (z2, y2) = (z2 as usize, y2 as usize);
-        if band_pass(b, z2 - b.start[0], y2 - b.start[1]) >= p {
+        if b.raster {
+            if (z2, y2) >= (z, y) {
+                continue;
+            }
+        } else if band_pass(b, z2 - b.start[0], y2 - b.start[1]) >= p {
             continue;
         }
         rc.base[rc.n] = (z2 * ny + y2) * nx;
@@ -619,51 +631,68 @@ pub struct Feats {
 }
 
 #[inline]
-fn cap(v: i32) -> u32 {
+pub(crate) fn cap(v: i32) -> u32 {
     v.unsigned_abs().min(65535)
 }
 
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn feats(sh: &Shape, b: &BandInfo, rc: &RowCtx, q: &[i32], z: usize, y: usize, x: usize, w: &[i32; NTAP]) -> (Feats, i32) {
+pub(crate) fn feats(sh: &Shape, b: &BandInfo, rc: &RowCtx, q: &[i32], rs: Option<&[i32]>, z: usize, y: usize, x: usize, w: &[i32; NTAP]) -> (Feats, i32) {
+    // magnitudes/signs for contexts come from `m` (the residuals when given)
+    let m = rs.unwrap_or(q);
     let [_, ny, nx] = sh.dims;
     let idx = (z * ny + y) * nx + x;
     let x0 = b.start[2];
     let wv = if x > x0 { q[idx - 1] } else { 0 };
     let wwv = if x > x0 + 1 { q[idx - 2] } else { 0 };
+    let wm = if x > x0 { m[idx - 1] } else { 0 };
+    let wwm = if x > x0 + 1 { m[idx - 2] } else { 0 };
     let (mut sf, mut sd, mut sr) = (0i32, 0i32, 0i32);
     let (mut af, mut ad, mut ar) = (0u32, 0u32, 0u32);
     let (mut nf, mut nd, mut nr) = (0u32, 0u32, 0u32);
     for j in 0..rc.n {
         let v = q[rc.base[j] + x];
+        let vm = m[rc.base[j] + x];
         match rc.cat[j] {
             0 => {
                 sf = sf.wrapping_add(v);
-                af += cap(v);
+                af += cap(vm);
+                if b.raster {
+                    // code-blocks: the face lines' x±1 neighbours feed the activity
+                    if x > x0 {
+                        ad += cap(m[rc.base[j] + x - 1]);
+                        nd += 1;
+                    }
+                    if x + 1 < b.end[2] {
+                        ad += cap(m[rc.base[j] + x + 1]);
+                        nd += 1;
+                    }
+                }
                 nf += 1;
             }
             1 => {
                 sd = sd.wrapping_add(v);
-                ad += cap(v);
+                ad += cap(vm);
                 nd += 1;
             }
             _ => {
                 sr = sr.wrapping_add(v);
-                ar += cap(v);
+                ar += cap(vm);
                 nr += 1;
             }
         }
     }
-    let (mut pv, mut pnb, mut has_p) = (0i32, 0u32, false);
+    let (mut pv, mut pm, mut pnb, mut has_p) = (0i32, 0i32, 0u32, false);
     if let Some(pi) = b.parent {
         let pb = &sh.bands[pi];
         let mut pp = [0usize; 3];
         let pos = [z, y, x];
         for a in 0..3 {
-            pp[a] = (pb.start[a] + ((pos[a] - b.start[a]) >> b.pshift[a])).min(pb.end[a] - 1);
+            pp[a] = (pb.start[a] + ((pos[a] - b.org[a]) >> b.pshift[a])).min(pb.end[a] - 1);
         }
-        let at = |p: [usize; 3]| q[(p[0] * ny + p[1]) * nx + p[2]];
-        pv = at(pp);
+        let at = |p: [usize; 3]| m[(p[0] * ny + p[1]) * nx + p[2]];
+        pv = q[(pp[0] * ny + pp[1]) * nx + pp[2]];
+        pm = at(pp);
         has_p = true;
         for a in 0..3 {
             if pp[a] > pb.start[a] {
@@ -685,11 +714,11 @@ fn feats(sh: &Shape, b: &BandInfo, rc: &RowCtx, q: &[i32], z: usize, y: usize, x
         acc = acc.wrapping_add(w[i].wrapping_mul(taps[i]));
     }
     let pred = acc.wrapping_add(2048) >> 12;
-    let s = 2 * cap(wv) + cap(wwv) + 2 * af + ad + ar + 2 * cap(pv) + 2 * cap(pred);
+    let s = 2 * cap(wm) + cap(wwm) + 2 * af + ad + ar + 2 * cap(pm) + 2 * cap(pred);
     let ws = 3 + 2 * nf + nd + nr + 2 * has_p as u32 + 2;
     let a = 12 * s / ws;
     let ab = bucket(a, &A_TH);
-    let pb = if has_p { 1 + bucket(4 * cap(pv).min(15) + pnb.min(60), &P_TH) } else { 0 };
+    let pb = if has_p { 1 + bucket(4 * cap(pm).min(15) + pnb.min(60), &P_TH) } else { 0 };
     let g = (nf + nd + nr > 0) as usize;
     let c = b.class;
     let e = ((1 + 2 * s / ws).ilog2() as usize).min(NE - 1);
@@ -698,14 +727,14 @@ fn feats(sh: &Shape, b: &BandInfo, rc: &RowCtx, q: &[i32], z: usize, y: usize, x
         taps,
         sig: ((c * 2 + g) * NA + ab) * NPB + pb,
         e,
-        sctx: c * 9 + sgn(wv) * 3 + sgn(sf.wrapping_add(sd)),
+        sctx: c * 9 + sgn(wm) * 3 + sgn(sf.wrapping_add(sd)),
     };
     (f, pred)
 }
 
 /// Code one residual.
 #[inline]
-fn code_res<S: Sink, const A: bool>(s: &mut S, lane: usize, m: &mut [u32], c: usize, f: &Feats, r: i32) -> i32 {
+pub(crate) fn code_res<S: Sink, const A: bool>(s: &mut S, lane: usize, m: &mut [u32], c: usize, f: &Feats, r: i32) -> i32 {
     let mag = r.unsigned_abs();
     if !bitm::<S, A>(s, lane, m, SIG0 + f.sig, mag > 0) {
         return 0;
@@ -768,7 +797,15 @@ pub fn pass_lattice(npass: usize, zy_is_y: bool, p: usize) -> (usize, usize, usi
 
 /// Visit the lines of `band` in coding order: `f(pass, lane, z, y)` — per
 /// pass, the pass's lines in raster order, dealt round-robin to the lanes.
-fn for_lines(b: &BandInfo, lanes: usize, mut f: impl FnMut(usize, usize, usize, usize)) {
+pub(crate) fn for_lines(b: &BandInfo, lanes: usize, mut f: impl FnMut(usize, usize, usize, usize)) {
+    if b.raster {
+        for z in b.start[0]..b.end[0] {
+            for y in b.start[1]..b.end[1] {
+                f(0, 0, z, y);
+            }
+        }
+        return;
+    }
     let (ez, ey) = (b.end[0] - b.start[0], b.end[1] - b.start[1]);
     for p in 0..b.npass {
         let (rz, sz, ry, sy) = pass_lattice(b.npass, ey > 1, p);
@@ -802,7 +839,7 @@ fn code_brick_impl<S: Sink, const A: bool>(sh: &Shape, q: &mut [i32], preds: &[[
             let w = &preds[b.pkey[p]];
             let m = &mut models[lane * NMODEL..(lane + 1) * NMODEL];
             for x in b.start[2]..b.end[2] {
-                let (f, pred) = feats(sh, b, &rc, q, z, y, x, w);
+                let (f, pred) = feats(sh, b, &rc, q, None, z, y, x, w);
                 let i = (z * ny + y) * nx + x;
                 let r = code_res::<S, A>(s, lane, m, b.class, &f, q[i].wrapping_sub(pred));
                 q[i] = r.wrapping_add(pred);
@@ -813,7 +850,7 @@ fn code_brick_impl<S: Sink, const A: bool>(sh: &Shape, q: &mut [i32], preds: &[[
 
 // ------------------------------------------------------------------ integer transform
 
-fn inv97_int(x: &mut [i32], tmp: &mut Vec<i32>, k: &[i32; 6]) {
+pub(crate) fn inv97_line(x: &mut [i32], tmp: &mut Vec<i32>, k: &[i32; 6]) {
     let n = x.len();
     if n < 2 {
         return;
@@ -872,7 +909,7 @@ pub fn inverse_int(p: &Pyramid, x: &mut [i32]) {
                     let off = i * st[o[0]] + j * st[o[1]];
                     line.clear();
                     line.extend((0..ext[a]).map(|t| x[off + t * st[a]]));
-                    inv97_int(&mut line, &mut tmp, &k);
+                    inv97_line(&mut line, &mut tmp, &k);
                     for (t, &v) in line.iter().enumerate() {
                         x[off + t * st[a]] = v;
                     }
@@ -1181,7 +1218,7 @@ pub fn decode_brick_fix(ps: &Parsed, bytes: &[u8], bi: usize) -> Result<Vec<i32>
     Ok(c)
 }
 
-fn dequant_brick(sh: &Shape, q: &[i32], dl: &[u8; NDL]) -> Vec<i32> {
+pub(crate) fn dequant_brick(sh: &Shape, q: &[i32], dl: &[u8; NDL]) -> Vec<i32> {
     let [_, ny, nx] = sh.dims;
     let mut c = vec![0i32; q.len()];
     for b in &sh.bands {
@@ -1305,25 +1342,25 @@ pub fn decode_f32(bytes: &[u8], threads: usize) -> Result<(Vec<usize>, Vec<f32>)
 
 // ------------------------------------------------------------------ encoder
 
-struct EncBrick {
-    shape: usize,
-    origin: [usize; 3],
+pub(crate) struct EncBrick {
+    pub(crate) shape: usize,
+    pub(crate) origin: [usize; 3],
     /// Float coefficients (grid units), brick layout.
-    c: Vec<f64>,
+    pub(crate) c: Vec<f64>,
 }
 
-struct Enc<'a> {
-    x: &'a [f32],
-    d3: [usize; 3],
-    bdims: [usize; 3],
-    shapes: Vec<Shape>,
-    bricks: Vec<EncBrick>,
-    e: i32,
-    mean_fix: i32,
-    threads: usize,
+pub(crate) struct Enc<'a> {
+    pub(crate) x: &'a [f32],
+    pub(crate) d3: [usize; 3],
+    pub(crate) bdims: [usize; 3],
+    pub(crate) shapes: Vec<Shape>,
+    pub(crate) bricks: Vec<EncBrick>,
+    pub(crate) e: i32,
+    pub(crate) mean_fix: i32,
+    pub(crate) threads: usize,
 }
 
-fn par_map<T: Send + Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+pub(crate) fn par_map<T: Send + Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     if threads <= 1 || items.len() <= 1 {
         return items.iter().map(f).collect();
     }
@@ -1347,7 +1384,7 @@ fn par_map<T: Send + Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) 
 }
 
 impl<'a> Enc<'a> {
-    fn new(x: &'a [f32], dims: &[usize], brick: usize, threads: usize) -> Self {
+    pub(crate) fn new(x: &'a [f32], dims: &[usize], brick: usize, threads: usize) -> Self {
         let d3 = crate::wavelet::as3(dims);
         let bdims = brick_dims(d3, brick);
         let grid = brick_grid(d3, bdims);
@@ -1379,12 +1416,12 @@ impl<'a> Enc<'a> {
         Self { x, d3, bdims, shapes, bricks, e, mean_fix, threads }
     }
 
-    fn scale(&self) -> f32 {
+    pub(crate) fn scale(&self) -> f32 {
         f32::from_bits(((self.e + 127) as u32) << 23)
     }
 
     /// Quantize all bricks at grid step `dg`; returns q per brick + centroids.
-    fn quantize(&self, dg: f64, rho: f64) -> (Vec<Vec<i32>>, [u8; NDL]) {
+    pub(crate) fn quantize(&self, dg: f64, rho: f64) -> (Vec<Vec<i32>>, [u8; NDL]) {
         let parts = par_map(&self.bricks, self.threads, |b| {
             let sh = &self.shapes[b.shape];
             let [_, ny, nx] = sh.dims;
@@ -1430,7 +1467,7 @@ impl<'a> Enc<'a> {
     }
 
     /// Integer reconstruction per brick (before corrections).
-    fn reconstruct(&self, shapes: &[Shape], qs: &[Vec<i32>], dl: &[u8; NDL]) -> Vec<Vec<i32>> {
+    pub(crate) fn reconstruct(&self, shapes: &[Shape], qs: &[Vec<i32>], dl: &[u8; NDL]) -> Vec<Vec<i32>> {
         let idx: Vec<usize> = (0..self.bricks.len()).collect();
         par_map(&idx, self.threads, |&bi| {
             let sh = &shapes[self.bricks[bi].shape];
@@ -1440,7 +1477,7 @@ impl<'a> Enc<'a> {
         })
     }
 
-    fn global_index(&self, bi: usize, i: usize) -> usize {
+    pub(crate) fn global_index(&self, bi: usize, i: usize) -> usize {
         let b = &self.bricks[bi];
         let d = self.shapes[b.shape].dims;
         let (z, y, x) = (i / (d[1] * d[2]), (i / d[2]) % d[1], i % d[2]);
@@ -1448,7 +1485,7 @@ impl<'a> Enc<'a> {
     }
 
     /// Squared error and max error of fixed-point reconstruction `cs`.
-    fn errors(&self, cs: &[Vec<i32>]) -> (f64, f64) {
+    pub(crate) fn errors(&self, cs: &[Vec<i32>]) -> (f64, f64) {
         let scale = self.scale();
         let idx: Vec<usize> = (0..cs.len()).collect();
         let parts = par_map(&idx, self.threads, |&bi| {
@@ -1465,7 +1502,7 @@ impl<'a> Enc<'a> {
         parts.iter().fold((0.0, 0.0), |(a, b), &(s, m)| (a + s, b.max(m)))
     }
 
-    fn shapes_at(&self, dg: f64) -> Vec<Shape> {
+    pub(crate) fn shapes_at(&self, dg: f64) -> Vec<Shape> {
         let mut s = self.shapes.clone();
         for sh in s.iter_mut() {
             sh.set_steps(dg);
@@ -1473,7 +1510,7 @@ impl<'a> Enc<'a> {
         s
     }
 
-    fn trial_rmse(&self, dg: f64, rho: f64) -> f64 {
+    pub(crate) fn trial_rmse(&self, dg: f64, rho: f64) -> f64 {
         let shapes = self.shapes_at(dg);
         let (q, d) = self.quantize(dg, rho);
         let cs = self.reconstruct(&shapes, &q, &d);
@@ -1497,7 +1534,7 @@ fn fit_preds(shapes: &[Shape], bricks: &[EncBrick], qs: &[Vec<i32>], lanes: usiz
                 let rc = row_ctx(sh, bd, p, z, y);
                 let k = bd.pkey[p];
                 for x in bd.start[2]..bd.end[2] {
-                    let (f, _) = feats(sh, bd, &rc, q, z, y, x, &zero);
+                    let (f, _) = feats(sh, bd, &rc, q, None, z, y, x, &zero);
                     let v = q[(z * ny + y) * nx + x];
                     if v == 0 && f.taps.iter().all(|&t| t == 0) {
                         continue;
@@ -1573,17 +1610,32 @@ pub fn encode_f32(x: &[f32], dims: &[usize], cfg: &GpuConfig) -> (Vec<u8>, GpuSt
 /// [`encode_f32`] with `threads` worker threads (output bytes are identical
 /// for any thread count).
 pub fn encode_f32_mt(x: &[f32], dims: &[usize], cfg: &GpuConfig, threads: usize) -> (Vec<u8>, GpuStats) {
-    assert_eq!(dims.iter().product::<usize>(), x.len());
     assert!(cfg.lanes >= 1 && cfg.lanes <= 1024 && cfg.brick >= 1);
-    let enc = Enc::new(x, dims, cfg.brick, threads);
+    rate_control(x, dims, cfg.brick, cfg.bound, cfg.rho, threads, |enc, dg, mx| encode_at(enc, dims, cfg, dg, mx))
+}
+
+/// Shared rate control: bisect the grid step on the measured error of the
+/// integer decoder (PSNR/RMSE), or try a ladder of steps (max-abs) and keep
+/// the smallest stream.
+pub(crate) fn rate_control(
+    x: &[f32],
+    dims: &[usize],
+    brick: usize,
+    bound: ErrorBound,
+    rho: f64,
+    threads: usize,
+    encode_at: impl Fn(&Enc, f64, Option<f64>) -> (Vec<u8>, GpuStats),
+) -> (Vec<u8>, GpuStats) {
+    assert_eq!(dims.iter().product::<usize>(), x.len());
+    let enc = Enc::new(x, dims, brick, threads);
     let (lo, hi) = x.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &v| (a.min(v as f64), b.max(v as f64)));
     let range = hi - lo;
     let g = 2f64.powi(enc.e);
-    match cfg.bound {
+    match bound {
         ErrorBound::MaxAbs(b) => {
             let mut best: Option<(Vec<u8>, GpuStats)> = None;
             for f in [1.0, 1.4, 1.8, 2.2, 2.7, 3.3, 4.0, 5.0] {
-                let r = encode_at(&enc, dims, cfg, (f * b / g).max(1.0), Some(b));
+                let r = encode_at(&enc, (f * b / g).max(1.0), Some(b));
                 if best.as_ref().is_none_or(|(bb, _)| r.0.len() < bb.len()) {
                     best = Some(r);
                 }
@@ -1591,22 +1643,21 @@ pub fn encode_f32_mt(x: &[f32], dims: &[usize], cfg: &GpuConfig, threads: usize)
             best.unwrap()
         }
         ErrorBound::Psnr(_) | ErrorBound::Rmse(_) => {
-            let t = match cfg.bound {
+            let t = match bound {
                 ErrorBound::Rmse(r) => r,
                 ErrorBound::Psnr(db) => range * 10f64.powf(-db / 20.0),
                 _ => unreachable!(),
             }
             .max(f64::MIN_POSITIVE);
-            // bisect log Δ (grid units) on the measured RMSE of the integer decoder
             let tg = t / g;
             let (mut lo, mut hi) = (tg * 0.5, tg * 8.0);
             let mut guard = 0;
-            while enc.trial_rmse(lo.max(1.0), cfg.rho) > t && guard < 40 && lo > 1.0 {
+            while enc.trial_rmse(lo.max(1.0), rho) > t && guard < 40 && lo > 1.0 {
                 hi = lo;
                 lo *= 0.5;
                 guard += 1;
             }
-            while enc.trial_rmse(hi, cfg.rho) <= t && guard < 80 {
+            while enc.trial_rmse(hi, rho) <= t && guard < 80 {
                 lo = hi;
                 hi *= 2.0;
                 guard += 1;
@@ -1614,18 +1665,18 @@ pub fn encode_f32_mt(x: &[f32], dims: &[usize], cfg: &GpuConfig, threads: usize)
             lo = lo.max(1.0);
             for _ in 0..14 {
                 let mid = (lo * hi).sqrt();
-                if enc.trial_rmse(mid, cfg.rho) <= t {
+                if enc.trial_rmse(mid, rho) <= t {
                     lo = mid;
                 } else {
                     hi = mid;
                 }
             }
-            encode_at(&enc, dims, cfg, lo, None)
+            encode_at(&enc, lo, None)
         }
     }
 }
 
-fn encode_at(enc: &Enc, dims: &[usize], cfg: &GpuConfig, dg: f64, maxabs: Option<f64>) -> (Vec<u8>, GpuStats) {
+pub(crate) fn encode_at(enc: &Enc, dims: &[usize], cfg: &GpuConfig, dg: f64, maxabs: Option<f64>) -> (Vec<u8>, GpuStats) {
     let shapes = enc.shapes_at(dg);
     let (qs, dl) = enc.quantize(dg, cfg.rho);
     let fitted = if std::env::var("TC_NOPRED").is_ok() { vec![None; NKEY] } else { fit_preds(&shapes, &enc.bricks, &qs, cfg.lanes) };
@@ -1927,6 +1978,8 @@ mod tests {
                 m: 1,
                 sh: 1,
                 w: 1.0,
+                org: [2, 3, 0],
+                raster: false,
             };
             let mut got = Vec::new();
             for_lines(&b, 3, |p, l, z, y| got.push((p, l, z, y)));

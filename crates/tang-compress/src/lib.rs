@@ -43,6 +43,7 @@ pub mod codec;
 #[cfg(feature = "gpu")]
 pub mod gpudec;
 pub mod gpuwav;
+pub mod gpuwav3;
 pub mod learned;
 pub mod linalg;
 pub mod rans;

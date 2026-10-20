@@ -158,7 +158,7 @@ impl GpuDecoder {
             bind_group_layouts: &[&layout],
             push_constant_ranges: &[],
         });
-        let pipes = ["decode", "lift", "outliers", "finalize", "escapes"]
+        let pipes = ["decode", "lift", "outliers", "finalize", "escapes", "decode3", "dequant3", "outliers3"]
             .iter()
             .map(|&e| {
                 let p = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -389,6 +389,10 @@ impl GpuDecoder {
         if pr.nesc > 0 {
             jobs.push(("escapes", pr.params.clone(), [pr.nesc.div_ceil(64) as u32, 1, 1]));
         }
+        self.submit(pr, &jobs)
+    }
+
+    fn submit(&self, pr: &Prepared, jobs: &[(&str, Vec<u32>, [u32; 3])]) -> f64 {
         let binds: Vec<wgpu::BindGroup> = jobs.iter().map(|j| self.bind(pr, &j.1)).collect();
         if std::env::var("TC_GPU_PROFILE").is_ok() {
             let mut acc: Vec<(&str, f64)> = Vec::new();
@@ -468,6 +472,196 @@ impl GpuDecoder {
     }
 }
 
+impl GpuDecoder {
+    /// Decode a whole v3 (code-block) stream; returns `f32` bits and timings.
+    pub fn decode3(&self, bytes: &[u8]) -> Result<(Vec<u32>, GpuTimes), crate::bitio::DecodeError> {
+        let mut t = GpuTimes::default();
+        let t0 = Instant::now();
+        let ps = crate::gpuwav3::parse3(bytes)?;
+        t.parse_s = t0.elapsed().as_secs_f64();
+        let pr = self.prepare3(&ps, bytes, &mut t);
+        t.kernels_s = self.run3(&pr);
+        let t1 = Instant::now();
+        let v = self.readback(&pr.base);
+        t.readback_s = t1.elapsed().as_secs_f64();
+        Ok((v, t))
+    }
+
+    /// Upload a parsed v3 stream.
+    pub fn prepare3(&self, ps: &crate::gpuwav3::Parsed3, bytes: &[u8], times: &mut GpuTimes) -> Prepared3 {
+        let t0 = Instant::now();
+        let sh = &ps.sh;
+        assert!(sh.dims.iter().all(|&d| d <= self.maxl.max(2)), "field axis longer than this decoder's line buffer (maxl)");
+        let mut meta: Vec<u32> = Vec::new();
+        // shape record (whole field)
+        let mut r = vec![0u32; SHS];
+        for a in 0..3 {
+            r[a] = sh.dims[a] as u32;
+        }
+        r[3] = sh.bands.len() as u32;
+        r[5] = sh.p.nlev() as u32;
+        for (l, ln) in sh.p.lens.iter().enumerate().take(15) {
+            for a in 0..3 {
+                r[6 + l * 3 + a] = ln[a] as u32;
+            }
+        }
+        for (l, s) in sh.p.split.iter().enumerate().take(15) {
+            r[6 + 45 + l] = (s[0] as u32) | (s[1] as u32) << 1 | (s[2] as u32) << 2;
+        }
+        let off_shapes = meta.len();
+        meta.extend(r);
+        let off_bands = meta.len();
+        for (bi, b) in sh.bands.iter().enumerate() {
+            let pb = &sh.p.bands[bi];
+            let mut r = vec![0u32; BS];
+            for a in 0..3 {
+                r[a] = b.start[a] as u32;
+                r[3 + a] = b.end[a] as u32;
+            }
+            r[6] = b.class as u32;
+            r[7] = b.parent.map_or(u32::MAX, |p| p as u32);
+            r[8] = b.pshift[0] | b.pshift[1] << 1 | b.pshift[2] << 2;
+            r[9] = 1;
+            r[10] = crate::gpuwav3::key3(pb.level, pb.mask) as u32;
+            r[18] = b.m as u32;
+            r[19] = b.sh;
+            meta.extend(r);
+        }
+        let off_preds = meta.len();
+        for p in &ps.preds {
+            meta.extend(p.iter().map(|&v| v as u32));
+        }
+        let off_init = meta.len();
+        meta.extend_from_slice(&ps.init);
+        let off_dl = meta.len();
+        meta.extend(ps.dl.iter().map(|&v| v as u32));
+        let off_bricks = meta.len();
+        meta.extend([0, 0, 0, 0, 0, 0, 0, 0]);
+        let off_blocks = meta.len();
+        for (i, b) in ps.blocks.iter().enumerate() {
+            meta.push(ps.block_band[i] as u32);
+            meta.extend(b.start.iter().map(|&v| v as u32));
+            meta.extend(b.end.iter().map(|&v| v as u32));
+            meta.push(ps.block_words[i].0 as u32);
+            meta.push(ps.block_words[i].1 as u32);
+        }
+        let off_tiles = meta.len();
+        let mut escs: Vec<u32> = Vec::new();
+        let d3 = ps.d3;
+        for t in &ps.tiles {
+            meta.extend(t.origin.iter().map(|&v| v as u32));
+            meta.extend(t.dims.iter().map(|&v| v as u32));
+            meta.push(t.words.0 as u32);
+            meta.push(t.words.1 as u32);
+            for &(li, bits) in &t.esc {
+                let (z, y, x) = (li / (t.dims[1] * t.dims[2]), (li / t.dims[2]) % t.dims[1], li % t.dims[2]);
+                escs.push((((t.origin[0] + z) * d3[1] + t.origin[1] + y) * d3[2] + t.origin[2] + x) as u32);
+                escs.push(bits);
+            }
+        }
+        let off_esc = meta.len();
+        meta.extend_from_slice(&escs);
+        let ncells: usize = d3.iter().product();
+        let mut params = vec![0u32; NPARAM];
+        params[0] = off_shapes as u32;
+        params[1] = off_bands as u32;
+        params[2] = off_preds as u32;
+        params[3] = off_init as u32;
+        params[4] = off_dl as u32;
+        params[5] = off_bricks as u32;
+        params[6] = off_esc as u32;
+        params[7] = (escs.len() / 2) as u32;
+        params[8] = 1;
+        params[13] = ps.mean_fix as u32;
+        params[14] = ps.scale().to_bits();
+        params[15] = ps.corr as u32;
+        for a in 0..3 {
+            params[16 + a] = d3[a] as u32;
+            params[19 + a] = d3[a] as u32;
+            params[22 + a] = 1;
+        }
+        params[25] = ncells as u32;
+        params[26] = off_blocks as u32;
+        params[27] = ps.resctx as u32;
+        params[28] = off_tiles as u32;
+        params[29] = ps.tiles.len() as u32;
+        let mut sw: Vec<u32> = Vec::with_capacity(bytes.len() / 4 + 1);
+        for c in bytes.chunks(4) {
+            let mut b = [0u8; 4];
+            b[..c.len()].copy_from_slice(c);
+            sw.push(u32::from_le_bytes(b));
+        }
+        times.parse_s += t0.elapsed().as_secs_f64();
+        let t1 = Instant::now();
+        let dev = &self.device;
+        let init = |label: &str, data: &[u32], usage: wgpu::BufferUsages| {
+            dev.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents: as_bytes(data), usage })
+        };
+        let mk = |label: &str, n: u64, usage: wgpu::BufferUsages| {
+            dev.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: n.max(4), usage, mapped_at_creation: false })
+        };
+        let base = Prepared {
+            meta: init("meta", &meta, wgpu::BufferUsages::STORAGE),
+            stream: init("stream", &sw, wgpu::BufferUsages::STORAGE),
+            models: mk("residuals", ncells as u64 * 4, wgpu::BufferUsages::STORAGE),
+            coef: mk("coef", ncells as u64 * 4, wgpu::BufferUsages::STORAGE),
+            out: mk("out", ncells as u64 * 4, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC),
+            params,
+            nbricks: 1,
+            batch: 1,
+            maxlev: sh.p.nlev(),
+            maxlines: (d3[0] * d3[1]).max(d3[0] * d3[2]).max(d3[1] * d3[2]),
+            ncells,
+            corr: ps.corr != 0,
+            nesc: escs.len() / 2,
+        };
+        let _ = self.device.poll(wgpu::PollType::Wait);
+        times.upload_s += t1.elapsed().as_secs_f64();
+        Prepared3 { base, groups: ps.level_groups(), nblocks: ps.blocks.len(), ntiles: ps.tiles.len() }
+    }
+
+    /// Run the v3 kernels; returns the kernel wall time.
+    pub fn run3(&self, pr: &Prepared3) -> f64 {
+        let b = &pr.base;
+        let mut jobs: Vec<(&str, Vec<u32>, [u32; 3])> = Vec::new();
+        for &(g0, g1) in &pr.groups {
+            let n = g1 - g0;
+            let mut p = b.params.clone();
+            p[9] = g0 as u32;
+            p[10] = n as u32;
+            jobs.push(("decode3", p, [n.div_ceil(64) as u32, 1, 1]));
+        }
+        let mut p = b.params.clone();
+        p[10] = pr.nblocks as u32;
+        jobs.push(("dequant3", p, [pr.nblocks.div_ceil(64) as u32, 1, 1]));
+        for l in (0..b.maxlev).rev() {
+            for ax in [2u32, 1, 0] {
+                let mut p = b.params.clone();
+                p[11] = l as u32;
+                p[12] = ax;
+                jobs.push(("lift", p, [b.maxlines.div_ceil(64) as u32, 1, 1]));
+            }
+        }
+        if b.corr {
+            jobs.push(("outliers3", b.params.clone(), [pr.ntiles.div_ceil(64) as u32, 1, 1]));
+        }
+        let groups = b.ncells.div_ceil(256);
+        jobs.push(("finalize", b.params.clone(), [groups.min(65535) as u32, groups.div_ceil(65535) as u32, 1]));
+        if b.nesc > 0 {
+            jobs.push(("escapes", b.params.clone(), [b.nesc.div_ceil(64) as u32, 1, 1]));
+        }
+        self.submit(b, &jobs)
+    }
+}
+
+/// A v3 stream uploaded to the GPU.
+pub struct Prepared3 {
+    base: Prepared,
+    groups: Vec<(usize, usize)>,
+    nblocks: usize,
+    ntiles: usize,
+}
+
 fn as_bytes(v: &[u32]) -> &[u8] {
     // u32 has no padding; reinterpreting as bytes is sound
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
@@ -494,7 +688,7 @@ mod tests {
 
     #[test]
     fn gpu_matches_cpu() {
-        let Ok(g) = GpuDecoder::new(8, 64) else {
+        let Ok(g) = GpuDecoder::new(8, 128) else {
             eprintln!("no GPU adapter; skipping");
             return;
         };
@@ -516,5 +710,20 @@ mod tests {
         let ps = parse(&bytes).unwrap();
         let cpu = decode_box_parsed(&ps, &bytes, [0; 3], ps.d3, 1).unwrap();
         assert_eq!(g.decode(&bytes).unwrap().0, cpu);
+        // v3 code-blocks
+        use crate::gpuwav3::{decode3_box, encode3_f32, Gpu3Config};
+        for bound in [ErrorBound::Psnr(50.0), ErrorBound::Psnr(100.0), ErrorBound::MaxAbs(1e-3), ErrorBound::MaxAbs(1e-5)] {
+            for (block, resctx) in [(8, true), (16, false), (64, true)] {
+                let cfg = Gpu3Config { block, resctx, tile: 16, ..Gpu3Config::new(bound) };
+                let (bytes, _) = encode3_f32(&x, &d, &cfg, 2);
+                let cpu = decode3_box(&bytes, [0; 3], [d[0], d[1], d[2]], 1).unwrap().bits;
+                let (gpu, _) = g.decode3(&bytes).unwrap();
+                let bad = cpu.iter().zip(&gpu).filter(|(a, b)| a != b).count();
+                assert_eq!(bad, 0, "v3 {bound:?} block {block}: {bad} cells differ");
+            }
+        }
+        let (bytes, _) = encode3_f32(&x2, &[70, 90], &Gpu3Config { block2d: 16, tile: 4, ..Gpu3Config::new(ErrorBound::MaxAbs(1e-4)) }, 1);
+        let cpu = decode3_box(&bytes, [0; 3], [1, 70, 90], 1).unwrap().bits;
+        assert_eq!(g.decode3(&bytes).unwrap().0, cpu);
     }
 }

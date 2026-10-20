@@ -559,3 +559,200 @@ fn escapes(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= P.nesc) { return; }
     outb[mt[P.off_esc + 2u * i]] = mt[P.off_esc + 2u * i + 1u];
 }
+
+// ================================================================ v3 (code-blocks)
+//
+// One global pyramid (single brick record / shape record), code-blocks
+// decoded one per invocation, dispatched level by level (coarse -> fine).
+// The `models` binding holds the residual buffer (i32 bits).
+// P.pad0 = off_blocks, P.pad1 = resctx, P.pad2 = off_tiles, P.pad3 = ntiles.
+
+fn mmag(i: u32, q: i32) -> i32 {
+    if (P.pad1 != 0u) { return bitcast<i32>(models[i]); }
+    return q;
+}
+
+@compute @workgroup_size(64)
+fn decode3(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= P.batch) { return; }
+    let rec = P.pad0 + (P.brick_base + gid.x) * 9u;
+    let b = mt[rec];
+    let z0 = mt[rec + 1u]; let y0 = mt[rec + 2u]; let x0 = mt[rec + 3u];
+    let z1 = mt[rec + 4u]; let y1 = mt[rec + 5u]; let x1 = mt[rec + 6u];
+    lane_start(mt[rec + 7u], mt[rec + 8u]);
+    let ny = P.d1;
+    let nx = P.d2;
+    let org = array<u32, 3>(bf(b, 0u), bf(b, 1u), bf(b, 2u));
+    let cls = bf(b, 6u);
+    let par = bf(b, 7u);
+    let psh = bf(b, 8u);
+    let pk = P.off_preds + bf(b, 10u) * 6u;
+    let w0 = bitcast<i32>(mt[pk]); let w1 = bitcast<i32>(mt[pk + 1u]); let w2 = bitcast<i32>(mt[pk + 2u]);
+    let w3 = bitcast<i32>(mt[pk + 3u]); let w4 = bitcast<i32>(mt[pk + 4u]); let w5 = bitcast<i32>(mt[pk + 5u]);
+    var pst = array<u32, 3>(0u, 0u, 0u);
+    var pen = array<u32, 3>(1u, 1u, 1u);
+    if (par != 0xFFFFFFFFu) {
+        pst = array<u32, 3>(bf(par, 0u), bf(par, 1u), bf(par, 2u));
+        pen = array<u32, 3>(bf(par, 3u), bf(par, 4u), bf(par, 5u));
+    }
+    let psx = (psh >> 2u) & 1u;
+    let sz_ = ny * nx;
+    for (var z = z0; z < z1; z = z + 1u) {
+        for (var y = y0; y < y1; y = y + 1u) {
+            var nr = 0u;
+            for (var t = 0u; t < 20u; t = t + 1u) {
+                let z2 = i32(z) + ROWNB_DZ[t];
+                let y2 = i32(y) + ROWNB_DY[t];
+                if (z2 >= i32(z0) && z2 < i32(z1) && y2 >= i32(y0) && y2 < i32(y1)) {
+                    if (z2 < i32(z) || (z2 == i32(z) && y2 < i32(y))) {
+                        rb_base[nr] = (u32(z2) * ny + u32(y2)) * nx;
+                        rb_cat[nr] = ROWNB_CAT[t];
+                        nr = nr + 1u;
+                    }
+                }
+            }
+            var prow = 0u;
+            var pz = 0u;
+            var py = 0u;
+            if (par != 0xFFFFFFFFu) {
+                pz = min(pst[0] + ((z - org[0]) >> (psh & 1u)), pen[0] - 1u);
+                py = min(pst[1] + ((y - org[1]) >> ((psh >> 1u) & 1u)), pen[1] - 1u);
+                prow = (pz * ny + py) * nx;
+            }
+            let rowb = (z * ny + y) * nx;
+            var wv = 0;
+            var wwv = 0;
+            var wm = 0;
+            var wwm = 0;
+            for (var x = x0; x < x1; x = x + 1u) {
+                var sf = 0; var sd = 0; var sr = 0;
+                var af = 0u; var ad = 0u; var ar = 0u;
+                var nf = 0u; var nd = 0u; var nrr = 0u;
+                for (var t = 0u; t < nr; t = t + 1u) {
+                    let i = rb_base[t] + x;
+                    let v = coef[i];
+                    let vm = mmag(i, v);
+                    let c = rb_cat[t];
+                    if (c == 0u) {
+                        sf = sf + v; af = af + cap(vm); nf = nf + 1u;
+                        if (x > x0) { ad = ad + cap(mmag(i - 1u, coef[i - 1u])); nd = nd + 1u; }
+                        if (x + 1u < x1) { ad = ad + cap(mmag(i + 1u, coef[i + 1u])); nd = nd + 1u; }
+                    }
+                    else if (c == 1u) { sd = sd + v; ad = ad + cap(vm); nd = nd + 1u; }
+                    else { sr = sr + v; ar = ar + cap(vm); nrr = nrr + 1u; }
+                }
+                var pv = 0;
+                var pm = 0;
+                var pnb = 0u;
+                var has_p = 0u;
+                if (par != 0xFFFFFFFFu) {
+                    let px = min(pst[2] + ((x - org[2]) >> psx), pen[2] - 1u);
+                    let pi = prow + px;
+                    pv = coef[pi];
+                    pm = mmag(pi, pv);
+                    has_p = 1u;
+                    if (pz > pst[0]) { pnb = pnb + cap(mmag(pi - sz_, coef[pi - sz_])); }
+                    if (pz + 1u < pen[0]) { pnb = pnb + cap(mmag(pi + sz_, coef[pi + sz_])); }
+                    if (py > pst[1]) { pnb = pnb + cap(mmag(pi - nx, coef[pi - nx])); }
+                    if (py + 1u < pen[1]) { pnb = pnb + cap(mmag(pi + nx, coef[pi + nx])); }
+                    if (px > pst[2]) { pnb = pnb + cap(mmag(pi - 1u, coef[pi - 1u])); }
+                    if (px + 1u < pen[2]) { pnb = pnb + cap(mmag(pi + 1u, coef[pi + 1u])); }
+                }
+                let acc = w0 * clamp(wv, -8192, 8192) + w1 * clamp(wwv, -8192, 8192) + w2 * clamp(sf, -8192, 8192)
+                        + w3 * clamp(sd, -8192, 8192) + w4 * clamp(sr, -8192, 8192) + w5 * clamp(pv, -8192, 8192);
+                let pred = (acc + 2048) >> 12u;
+                let s = 2u * cap(wm) + cap(wwm) + 2u * af + ad + ar + 2u * cap(pm) + 2u * cap(pred);
+                let ws = 3u + 2u * nf + nd + nrr + 2u * has_p + 2u;
+                let ab = bucket_a(12u * s / ws);
+                var pbk = 0u;
+                if (has_p == 1u) { pbk = 1u + bucket_p(4u * min(cap(pm), 15u) + min(pnb, 60u)); }
+                let g = select(0u, 1u, nf + nd + nrr > 0u);
+                let e = min(firstLeadingBit(1u + 2u * s / ws), NE_u - 1u);
+                let sig = ((cls * 2u + g) * NA_u + ab) * NPB_u + pbk;
+                var r = 0;
+                if (sbit(SIG0u + sig)) {
+                    let k = max(e, 2u) - 2u;
+                    var h = 0u;
+                    let mbase = MAG0u + (cls * NE_u + e) * KB_u;
+                    loop {
+                        if (h >= KB_u) { break; }
+                        if (!sbit(mbase + h)) { break; }
+                        h = h + 1u;
+                    }
+                    var hv = h;
+                    if (h == KB_u) { hv = hv + dgamma_s(ESC0u + cls * 32u); }
+                    var lo = 0u;
+                    if (k >= 1u) { lo = select(0u, 1u, sbit(LOW0u + e * 4u)); }
+                    if (k >= 2u) { lo = (lo << 1u) | select(0u, 1u, sbit(LOW0u + e * 4u + 2u + (lo & 1u))); }
+                    if (k >= 3u) { lo = (lo << (k - 2u)) | draw_n(k - 2u); }
+                    let mv = ((hv << k) | lo) + 1u;
+                    let sctx = cls * 9u + sgn3(wm) * 3u + sgn3(sf + sd);
+                    if (sbit(SGN0u + sctx)) { r = -bitcast<i32>(mv); } else { r = bitcast<i32>(mv); }
+                }
+                let qv = r + pred;
+                coef[rowb + x] = qv;
+                models[rowb + x] = bitcast<u32>(r);
+                wwv = wv;
+                wv = qv;
+                wwm = wm;
+                wm = mmag(rowb + x, qv);
+            }
+        }
+    }
+}
+
+@compute @workgroup_size(64)
+fn dequant3(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= P.batch) { return; }
+    let rec = P.pad0 + gid.x * 9u;
+    let b = mt[rec];
+    let cls = bf(b, 6u);
+    let m = bitcast<i32>(bf(b, 18u));
+    let sh = bf(b, 19u);
+    for (var z = mt[rec + 1u]; z < mt[rec + 4u]; z = z + 1u) {
+        for (var y = mt[rec + 2u]; y < mt[rec + 5u]; y = y + 1u) {
+            for (var x = mt[rec + 3u]; x < mt[rec + 6u]; x = x + 1u) {
+                let idx = (z * P.d1 + y) * P.d2 + x;
+                let v = coef[idx];
+                if (v != 0) {
+                    let av = u32(abs(v));
+                    let a = bitcast<i32>(min(av, 0x7FFFFFFFu));
+                    let d = bitcast<i32>(mt[P.off_dl + cls * 3u + min(av, 3u) - 1u]);
+                    var c = mulsh(a, m, sh) - mulsh(d, m, sh + 9u);
+                    if (v < 0) { c = -c; }
+                    coef[idx] = c;
+                }
+            }
+        }
+    }
+}
+
+@compute @workgroup_size(64)
+fn outliers3(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let ti = gid.x;
+    if (ti >= P.pad3) { return; }
+    let rec = P.pad2 + ti * 8u;
+    let o = array<u32, 3>(mt[rec], mt[rec + 1u], mt[rec + 2u]);
+    let td = array<u32, 3>(mt[rec + 3u], mt[rec + 4u], mt[rec + 5u]);
+    let ncell = td[0] * td[1] * td[2];
+    for (var i = 0u; i < 96u; i = i + 1u) { om[i] = 0x80008000u; }
+    lane_start(mt[rec + 6u], mt[rec + 7u]);
+    let n = ogamma(0u);
+    var last = -1;
+    let corr = bitcast<i32>(P.corr);
+    for (var i = 0u; i < n; i = i + 1u) {
+        let g = ogamma(32u);
+        let li = u32(last + 1 + bitcast<i32>(g));
+        last = bitcast<i32>(li);
+        let neg = draw(1u) == 1u;
+        var k = bitcast<i32>(ogamma(64u) + 1u);
+        if (neg) { k = -k; }
+        if (li < ncell) {
+            let z = li / (td[1] * td[2]);
+            let y = (li / td[2]) % td[1];
+            let x = li % td[2];
+            let gi = ((o[0] + z) * P.d1 + o[1] + y) * P.d2 + o[2] + x;
+            coef[gi] = coef[gi] + k * corr;
+        }
+    }
+}

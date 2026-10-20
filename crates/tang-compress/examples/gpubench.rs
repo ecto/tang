@@ -9,6 +9,11 @@
 use std::time::Instant;
 use tang_compress::codec::ErrorBound;
 use tang_compress::gpuwav::{self, GpuConfig};
+use tang_compress::gpuwav3::{self, Gpu3Config};
+
+fn cfg3_of(bound: ErrorBound, bk: usize, args: &[String]) -> Gpu3Config {
+    Gpu3Config { block: bk, block2d: bk, resctx: !args.iter().any(|a| a == "--nores"), ..Gpu3Config::new(bound) }
+}
 use tang_compress::{wavcodec, Decoded};
 
 fn read_f32(path: &str) -> Vec<f32> {
@@ -67,20 +72,23 @@ fn main() {
                         mx / range
                     );
                 }
+                let v3 = args.iter().any(|a| a == "--v3");
                 for &bk in &bricks {
                     let cfg = GpuConfig { brick: bk, lanes, adaptive: args.iter().any(|a| a == "--adaptive"), ..GpuConfig::new(bound) };
+                    let cfg3 = cfg3_of(bound, bk, &args);
                     let t0 = Instant::now();
-                    let (b, st) = gpuwav::encode_f32_mt(&x, &dims, &cfg, threads);
+                    let (b, st) = if v3 { gpuwav3::encode3_f32(&x, &dims, &cfg3, threads) } else { gpuwav::encode_f32_mt(&x, &dims, &cfg, threads) };
                     let enc_s = t0.elapsed().as_secs_f64();
                     let t0 = Instant::now();
-                    let (_, y) = gpuwav::decode_f32(&b, 1).unwrap();
+                    let (_, y) = if v3 { gpuwav3::decode3_f32(&b, 1).unwrap() } else { gpuwav::decode_f32(&b, 1).unwrap() };
                     let dec_s = t0.elapsed().as_secs_f64();
                     let (rmse, mx) = err(&x, &y);
                     if let ErrorBound::MaxAbs(bb) = bound {
                         assert!(mx <= bb, "{name} {t}: {mx} > {bb}");
                     }
                     println!(
-                        "{{\"field\":\"{name}\",\"target\":\"{t}\",\"codec\":\"tc-gpu\",\"brick\":{bk},\"lanes\":{lanes},\"bpv\":{},\"psnr\":{},\"max_abs_rel\":{},\"enc_s\":{enc_s},\"dec_s\":{dec_s},\"hdr\":{},\"idx\":{},\"outl\":{},\"esc\":{}}}",
+                        "{{\"field\":\"{name}\",\"target\":\"{t}\",\"codec\":\"{}\",\"brick\":{bk},\"lanes\":{lanes},\"bpv\":{},\"psnr\":{},\"max_abs_rel\":{},\"enc_s\":{enc_s},\"dec_s\":{dec_s},\"hdr\":{},\"idx\":{},\"outl\":{},\"esc\":{}}}",
+                        if v3 { "tc-gpu3" } else { "tc-gpu" },
                         st.bits_per_value,
                         20.0 * (range / rmse).log10(),
                         mx / range,
