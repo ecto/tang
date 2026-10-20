@@ -24,6 +24,9 @@ const NPARAM: usize = 32;
 /// Largest lane count (one workgroup per brick, one invocation per lane).
 pub const MAX_LANES: usize = 256;
 
+/// decode3 / decode3l pipelines specialized to one learned net.
+type SpecPipes = std::sync::Arc<(wgpu::ComputePipeline, wgpu::ComputePipeline)>;
+
 /// A GPU device with the tc-gpu pipelines for one lane count / line length.
 pub struct GpuDecoder {
     device: wgpu::Device,
@@ -37,7 +40,7 @@ pub struct GpuDecoder {
     src: String,
     pl: wgpu::PipelineLayout,
     /// Pipelines specialized to a learned net (weights as literals), by flat net.
-    spec: std::sync::Mutex<Vec<(Vec<u32>, std::sync::Arc<(wgpu::ComputePipeline, wgpu::ComputePipeline)>)>>,
+    spec: std::sync::Mutex<Vec<(Vec<u32>, SpecPipes)>>,
 }
 
 /// Stream state uploaded to the GPU.
@@ -660,7 +663,7 @@ impl GpuDecoder {
     }
 
     /// decode3/decode3l pipelines with the net's MLP as straight-line code.
-    fn spec_pipes(&self, net: &crate::lmodel3::Net32) -> std::sync::Arc<(wgpu::ComputePipeline, wgpu::ComputePipeline)> {
+    fn spec_pipes(&self, net: &crate::lmodel3::Net32) -> SpecPipes {
         let key = net.flat();
         let mut c = self.spec.lock().unwrap();
         if let Some(p) = c.iter().find(|e| e.0 == key) {
