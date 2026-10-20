@@ -26,6 +26,10 @@
 //!                                       CPU f32 forward (f64 accumulation), the
 //!                                       checkpoint dequantized exactly
 //! qwen_decode compare <a> <b> <vocab>   two logits files, row by row
+//! qwen_decode tune <dir> [budget_s=300]  measure the decode GEMV shape and the
+//!                                       OpenCL prefill block on this device, write
+//!                                       the winners to ~/.config/tang/tune.json
+//!                                       (`$TANG_TUNE`), read by `model` and Session
 //! ```
 //!
 //! `<ids>` is a file of whitespace-separated token ids (`qwen_tok`).
@@ -44,6 +48,10 @@ fn main() {
         Some("model") => model(&args[1..]),
         Some("reference") => reference(&args[1..]),
         Some("compare") => compare(&args[1..]),
+        Some("tune") => {
+            let budget = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(300.0);
+            tune(&args[1], budget);
+        }
         _ => eprintln!("usage: qwen_decode tiny | model | reference | compare (see the docs)"),
     }
 }
@@ -404,6 +412,9 @@ fn model(args: &[String]) {
     eprintln!("dims: {dims:?}");
     dims.kv_f16 = std::env::var("TANG_KV_F32").is_err();
     let rt = runtime();
+    for (k, v) in apply_tuning(&rt, &dims) {
+        eprintln!("tuned {k}={v}");
+    }
     // a 311 MB 4-bit LM head exceeds Vulkan's 128 MiB storage binding on
     // the Adreno: four blocks of the vocabulary there (QWEN_VOCAB_CHUNKS
     // overrides)

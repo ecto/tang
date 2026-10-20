@@ -279,8 +279,15 @@ impl TensorGraph {
                     return None;
                 }
                 // no matrix-tile lowering in GLSL yet: the warp kernels
-                if target == DecodeTarget::Glsl || target == DecodeTarget::OpenCl {
+                if target == DecodeTarget::Glsl {
                     return None;
+                }
+                if target == DecodeTarget::OpenCl {
+                    // TANG_CL_MM=off: the tiled WGSL fallback only
+                    if std::env::var("TANG_CL_MM").as_deref() == Ok("off") {
+                        return None;
+                    }
+                    return self.opencl_mma_kernel(root, &reads);
                 }
                 if target == DecodeTarget::Msl {
                     return super::msl_gemv::mma_kernel(self, root, &reads);
@@ -303,7 +310,8 @@ impl TensorGraph {
             };
             let got = match donor {
                 Some(d) => lw.inplace_update(root, d),
-                None if tiles.contains(&root) => None,
+                // OpenCL prefill: the register-block kernel, else the tiled WGSL one
+                None if tiles.contains(&root) => mma(),
                 None => mma()
                     .or_else(|| lw.warp_reduction(root))
                     .or_else(|| lw.point_map(root)),
@@ -328,6 +336,11 @@ impl TensorGraph {
                             }
                             let kept: Vec<usize> = k.reads.iter().map(|t| t.index()).collect();
                             super::glsl_gemv::transliterate(&kern.source, &kept, donor)
+                        }
+                        DecodeTarget::OpenCl
+                            if kern.source.starts_with(super::opencl_gemv::OPENCL_NATIVE) =>
+                        {
+                            kern.source
                         }
                         DecodeTarget::OpenCl => {
                             // as for Metal: the donor is read through `out`

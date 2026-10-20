@@ -357,3 +357,210 @@ mod tests {
         assert!(!m.contains("b3"));
     }
 }
+
+/// Register block and work-group of [`TensorGraph::opencl_mma_kernel`]:
+/// `TANG_CL_MM=RMxRNxWG` (rows per item, columns per item, work-group
+/// size); default 4x4x64.
+pub fn mm_shape() -> (usize, usize, usize) {
+    std::env::var("TANG_CL_MM")
+        .ok()
+        .and_then(|v| {
+            let p: Vec<usize> = v.split('x').filter_map(|x| x.parse().ok()).collect();
+            (p.len() == 3 && p.iter().all(|&x| x > 0)).then(|| (p[0], p[1], p[2]))
+        })
+        .unwrap_or((4, 4, 64))
+}
+
+/// First line of a kernel that is OpenCL C already (no transliteration).
+pub const OPENCL_NATIVE: &str = "// tang-compile: OpenCL C (native)";
+
+impl TensorGraph {
+    /// A prefill matmul (`C[m][n] = Σ_k A[m][k]·B[n][k]`, plus its
+    /// epilogue) as an OpenCL register-block kernel, when both operands are
+    /// contiguous along the reduce axis: each work-item keeps an RM×RN block
+    /// of sums ([`mm_shape`]) and walks k four at a time with `vload4`, so
+    /// every load is a contiguous 16-byte read and each pair of loaded
+    /// vectors feeds RM·RN dot products — the dot-product form of the
+    /// register-blocked sgemm the K1 probe ran at 510 GFLOP/s, without a
+    /// local-memory stage (the Adreno's tiled kernels ran at ~54 GFLOP/s).
+    pub(super) fn opencl_mma_kernel(
+        &self,
+        root: usize,
+        reads: &[usize],
+    ) -> Option<super::cuda_gemv::Kernel> {
+        use super::tile::emit_scalar;
+        let c = self.comp_at(root)?;
+        let t = self.bilinear_tile(root, reads)?;
+        if t.terms.len() != 1
+            || t.outs.len() != 1
+            || t.terms[0].map_a.is_some()
+            || t.terms[0].map_b.is_some()
+        {
+            return None;
+        }
+        let (dx, dy, kdim) = (t.dx, t.dy, t.kdim);
+        let (m, n, k_total) = (t.m, t.n, t.k_total);
+        let (addr_a, addr_b) = (&t.addr_a, &t.addr_b);
+        // both operands unit-stride along k, and a whole number of vec4s
+        if addr_a.coefs[kdim] != 1 || addr_b.coefs[kdim] != 1 || k_total % 4 != 0 {
+            return None;
+        }
+        let (rm, rn, wg) = mm_shape();
+        let storage = |j: usize| self.storage(TensorId(j as u32)).n();
+        let pts = &t.pts;
+        let mb = m.div_ceil(rm);
+        let nb = n.div_ceil(rn);
+        let lead: usize = t.others.iter().map(|&d| pts[d]).product();
+        let items = mb * nb * lead;
+        let w_out = c.width();
+        let lead_term = |addr: &super::msl_mma::Addr| -> String {
+            let mut s = format!("{}", addr.offset);
+            for &d in &t.others {
+                if addr.coefs[d] != 0 {
+                    s.push_str(&format!(" + {} * p{d}", addr.coefs[d]));
+                }
+            }
+            s
+        };
+        let mut s = String::new();
+        writeln!(
+            s,
+            "{OPENCL_NATIVE}: {m}x{n}x{k_total} matmul, {rm}x{rn} registers, groups of {wg}"
+        )
+        .unwrap();
+        s.push_str(OPENCL_PRELUDE);
+        let params: Vec<String> = reads
+            .iter()
+            .map(|j| format!("__global const float* restrict b{j}"))
+            .chain([
+                "__global float* restrict out".to_string(),
+                "uint count".to_string(),
+            ])
+            .collect();
+        writeln!(
+            s,
+            "__kernel __attribute__((reqd_work_group_size({wg}, 1, 1))) void main0({}) {{",
+            params.join(", ")
+        )
+        .unwrap();
+        writeln!(s, "    int g = (int)get_global_id(0);").unwrap();
+        writeln!(s, "    if (g >= {items}) return;").unwrap();
+        writeln!(
+            s,
+            "    int cb = g % {nb}, rb = (g / {nb}) % {mb}, lead = g / {};",
+            nb * mb
+        )
+        .unwrap();
+        for &d in t.others.iter().rev() {
+            writeln!(
+                s,
+                "    int p{d} = lead % {}; lead = lead / {};",
+                pts[d], pts[d]
+            )
+            .unwrap();
+        }
+        writeln!(s, "    int r0 = rb * {rm}, c0 = cb * {rn};").unwrap();
+        writeln!(
+            s,
+            "    int base_a = {}, base_b = {};",
+            lead_term(addr_a),
+            lead_term(addr_b)
+        )
+        .unwrap();
+        let (cpa, cpb) = (addr_a.coefs[dy], addr_b.coefs[dx]);
+        // row/column offsets, clamped at the edge (the stores are guarded)
+        for i in 0..rm {
+            writeln!(
+                s,
+                "    __global const float* a{i} = b{} + base_a + {cpa} * min(r0 + {i}, {});",
+                t.buf_a,
+                m - 1
+            )
+            .unwrap();
+        }
+        for j in 0..rn {
+            writeln!(
+                s,
+                "    __global const float* q{j} = b{} + base_b + {cpb} * min(c0 + {j}, {});",
+                t.buf_b,
+                n - 1
+            )
+            .unwrap();
+        }
+        for i in 0..rm {
+            for j in 0..rn {
+                writeln!(s, "    float acc{i}_{j} = 0.0f;").unwrap();
+            }
+        }
+        writeln!(s, "    for (int k = 0; k < {k_total}; k += 4) {{").unwrap();
+        for i in 0..rm {
+            writeln!(s, "        float4 x{i} = vload4(0, a{i} + k);").unwrap();
+        }
+        for j in 0..rn {
+            writeln!(s, "        float4 y{j} = vload4(0, q{j} + k);").unwrap();
+        }
+        for i in 0..rm {
+            for j in 0..rn {
+                writeln!(s, "        acc{i}_{j} += dot(x{i}, y{j});").unwrap();
+            }
+        }
+        writeln!(s, "    }}").unwrap();
+        // epilogue and stores
+        let prank = c.points().len();
+        for i in 0..rm {
+            for j in 0..rn {
+                writeln!(s, "    {{").unwrap();
+                writeln!(s, "        int p{dy} = r0 + {i}, p{dx} = c0 + {j};").unwrap();
+                writeln!(s, "        if (p{dy} < {m} && p{dx} < {n}) {{").unwrap();
+                writeln!(s, "            float red = acc{i}_{j};").unwrap();
+                let vals: Vec<String> = if t.epilogue {
+                    let mut arg_vals = Vec::new();
+                    for a in &c.args {
+                        if a.src.n() == t.red_node {
+                            arg_vals.push("red".to_string());
+                            continue;
+                        }
+                        let addr = self.flat_addr(a, prank);
+                        let mut e = format!("{}", addr.offset);
+                        for (d, &coef) in addr.coefs.iter().enumerate() {
+                            if coef != 0 {
+                                e.push_str(&format!(" + {coef} * p{d}"));
+                            }
+                        }
+                        arg_vals.push(format!("b{}[{e}]", storage(a.src.n())));
+                    }
+                    let mut body = String::new();
+                    let outs = emit_scalar(
+                        &mut body,
+                        &c.body,
+                        &c.body_outs,
+                        &format!("e{i}_{j}_"),
+                        &|v| arg_vals[v as usize].clone(),
+                    );
+                    for line in body.lines() {
+                        writeln!(s, "            {}", line.replacen("let ", "float ", 1)).unwrap();
+                    }
+                    outs
+                } else {
+                    vec!["red".to_string()]
+                };
+                let mut flat = String::from("0");
+                for (d, &np) in pts.iter().enumerate() {
+                    flat = format!("({flat}) * {np} + p{d}");
+                }
+                writeln!(s, "            int o = {flat};").unwrap();
+                for (slot, v) in vals.iter().enumerate() {
+                    writeln!(s, "            out[o * {w_out} + {slot}] = {v};").unwrap();
+                }
+                writeln!(s, "        }}").unwrap();
+                writeln!(s, "    }}").unwrap();
+            }
+        }
+        writeln!(s, "}}").unwrap();
+        Some(super::cuda_gemv::Kernel {
+            source: s,
+            threads: wg,
+            blocks: items.div_ceil(wg),
+        })
+    }
+}

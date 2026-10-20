@@ -575,6 +575,9 @@ impl Session {
         let mut dims = dims_for(dir, ctx);
         dims.kv_f16 = std::env::var("TANG_KV_F32").is_err();
         let rt = runtime();
+        for (k, v) in apply_tuning(&rt, &dims) {
+            eprintln!("tang: tuned {k}={v}");
+        }
         dims.vocab_chunks = match env("QWEN_VOCAB_CHUNKS") {
             0 => match &rt {
                 Runtime::Wgpu { device, .. } if !device.msl_passthrough => 4,
@@ -814,4 +817,245 @@ impl Session {
         }
         idx[n - 1].1
     }
+}
+
+// ---------------------------------------------------------------------------
+// tuning: per device and model shape, measured on the device (`tune`), read at
+// startup (`apply_tuning`)
+
+/// The tuning file: `$TANG_TUNE`, else `~/.config/tang/tune.json`. A JSON
+/// object keyed by [`tune_key`], each value the env knobs that won:
+/// `{"QUALCOMM Adreno(TM) 740|qwen3 d2048 ff6144 l28": {"TANG_DECODE_WARPS": "4", …}}`.
+pub fn tune_path() -> std::path::PathBuf {
+    if let Some(p) = std::env::var_os("TANG_TUNE") {
+        return p.into();
+    }
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    home.join(".config/tang/tune.json")
+}
+
+/// Device name and model shape: what a tuning result is valid for.
+pub fn tune_key(rt: &Runtime, dims: &QwenDims) -> String {
+    format!(
+        "{}|qwen3 d{} ff{} l{} h{} kv{}",
+        rt.name(),
+        dims.d_model,
+        dims.ff,
+        dims.layers,
+        dims.heads,
+        dims.kv_heads
+    )
+}
+
+/// The knobs the tuner sets (decode GEMV shape, OpenCL prefill register block).
+pub const TUNE_KNOBS: [&str; 3] = ["TANG_DECODE_WARPS", "TANG_DECODE_ROWS", "TANG_CL_MM"];
+
+/// Set this device and model's tuned knobs from [`tune_path`], except any
+/// already set in the environment (an explicit env var wins). Returns what
+/// it applied.
+pub fn apply_tuning(rt: &Runtime, dims: &QwenDims) -> Vec<(String, String)> {
+    let Ok(text) = std::fs::read_to_string(tune_path()) else {
+        return Vec::new();
+    };
+    let Ok(all) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    let mut applied = Vec::new();
+    if let Some(m) = all[tune_key(rt, dims)].as_object() {
+        for (k, v) in m {
+            let Some(v) = v.as_str() else { continue };
+            if TUNE_KNOBS.contains(&k.as_str()) && std::env::var_os(k).is_none() {
+                std::env::set_var(k, v);
+                applied.push((k.clone(), v.to_string()));
+            }
+        }
+    }
+    applied
+}
+
+/// Hottest GPU temperature in °C, if the board exposes one (kgsl on the K1).
+fn gpu_temp() -> Option<f64> {
+    let t: f64 = std::fs::read_to_string("/sys/class/kgsl/kgsl-3d0/temp")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(if t > 1000.0 { t / 1000.0 } else { t })
+}
+
+fn load1() -> Option<f64> {
+    std::fs::read_to_string("/proc/loadavg")
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Wait (bounded) for the GPU to cool below `cool` °C and the 1-minute load
+/// to fall below `load`; false when `deadline` passed first.
+fn settle(hot: f64, cool: f64, load: f64, deadline: Instant) -> bool {
+    let mut waited = false;
+    loop {
+        let t = gpu_temp().unwrap_or(0.0);
+        let l = load1().unwrap_or(0.0);
+        let too_hot = t >= hot || (waited && t > cool);
+        if !too_hot && l < load {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        if !waited {
+            eprintln!("tune: waiting (gpu {t:.1} C, load {l:.2})");
+        }
+        waited = true;
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
+/// Measure, on this device, the decode GEMV shape (`TANG_DECODE_WARPS` ×
+/// `TANG_DECODE_ROWS`) and, on OpenCL, the prefill register block
+/// (`TANG_CL_MM`) for the model in `dir`, within `budget` seconds; write the
+/// winners into [`tune_path`] under [`tune_key`]. Candidates share the first
+/// program's weights and caches (one upload). Pauses at `TANG_TUNE_HOT` °C
+/// (default 82) until 75, and while the load is above `TANG_TUNE_LOAD`
+/// (default 12). Returns the winners.
+pub fn tune(dir: &str, budget: f64) -> Vec<(String, String)> {
+    let t0 = Instant::now();
+    let deadline = t0 + std::time::Duration::from_secs_f64(budget);
+    let fenv = |k: &str, d: f64| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let (hot, load) = (fenv("TANG_TUNE_HOT", 82.0), fenv("TANG_TUNE_LOAD", 12.0));
+    for k in TUNE_KNOBS {
+        std::env::remove_var(k);
+    }
+    let ctx = 1024;
+    let mut dims = dims_for(dir, ctx);
+    dims.kv_f16 = true;
+    let rt = runtime();
+    if rt.kind() == BackendKind::OpenCl {
+        dims.vocab_chunks = (dims.vocab * dims.d_model / 2).div_ceil(255 << 20).max(1);
+    }
+    let key = tune_key(&rt, &dims);
+    eprintln!("tune: {key}, budget {budget:.0} s");
+    let st = St::open(&format!("{dir}/model.safetensors"));
+    let base = Step::new(
+        &rt,
+        &dims,
+        1,
+        ctx,
+        &|dg| vec![Vec::new(); dg.inputs.len()],
+        None,
+    );
+    for (k, v) in load_inputs(&st, &dims, &base.dg).enumerate() {
+        if !v.is_empty() {
+            base.prog.write(&rt, base.prog.input(k), &v);
+        }
+    }
+    let time_step = |s: &Step, pos: usize| -> f64 {
+        let mut best = f64::INFINITY;
+        for _ in 0..3 {
+            s.set_state(&rt, 1, pos);
+            best = best.min(s.prog.time(&rt, 10));
+        }
+        best
+    };
+    let mut won = Vec::new();
+    // decode: warps x rows
+    let mut best: Option<(f64, usize, usize)> = None;
+    for (w, r) in [(4, 2), (4, 4), (8, 4), (4, 8), (2, 4), (8, 2), (8, 8)] {
+        if !settle(hot, 75.0, load, deadline) {
+            eprintln!("tune: budget spent");
+            break;
+        }
+        std::env::set_var("TANG_DECODE_WARPS", w.to_string());
+        std::env::set_var("TANG_DECODE_ROWS", r.to_string());
+        let s = Step::new(
+            &rt,
+            &dims,
+            1,
+            ctx,
+            &|dg| vec![Vec::new(); dg.inputs.len()],
+            Some(&base),
+        );
+        let ms = time_step(&s, 64);
+        eprintln!(
+            "tune: decode warps {w} rows {r}: {ms:.2} ms (gpu {:.1} C)",
+            gpu_temp().unwrap_or(0.0)
+        );
+        if best.map_or(true, |b| ms < b.0) {
+            best = Some((ms, w, r));
+        }
+    }
+    std::env::remove_var("TANG_DECODE_WARPS");
+    std::env::remove_var("TANG_DECODE_ROWS");
+    if let Some((_, w, r)) = best {
+        won.push(("TANG_DECODE_WARPS".to_string(), w.to_string()));
+        won.push(("TANG_DECODE_ROWS".to_string(), r.to_string()));
+    }
+    // prefill register block (OpenCL)
+    if rt.kind() == BackendKind::OpenCl {
+        let seq = 64;
+        let toks: Vec<usize> = (0..seq).map(|i| 1000 + i).collect();
+        let mut best: Option<(f64, String)> = None;
+        for mm in [
+            "4x4x64", "4x8x64", "8x4x64", "2x8x64", "4x4x128", "4x4x32", "8x8x64", "2x4x64",
+        ] {
+            if !settle(hot, 75.0, load, deadline) {
+                eprintln!("tune: budget spent");
+                break;
+            }
+            std::env::set_var("TANG_CL_MM", mm);
+            let s = Step::new(
+                &rt,
+                &dims,
+                seq,
+                512,
+                &|dg| vec![Vec::new(); dg.inputs.len()],
+                Some(&base),
+            );
+            s.prefill(&rt, &toks, 0);
+            let ms = s.prog.time(&rt, 3);
+            eprintln!(
+                "tune: prefill {seq} tokens, block {mm}: {ms:.1} ms ({:.0} tok/s, gpu {:.1} C)",
+                seq as f64 * 1e3 / ms,
+                gpu_temp().unwrap_or(0.0)
+            );
+            if best.as_ref().map_or(true, |b| ms < b.0) {
+                best = Some((ms, mm.to_string()));
+            }
+        }
+        std::env::remove_var("TANG_CL_MM");
+        if let Some((_, mm)) = best {
+            won.push(("TANG_CL_MM".to_string(), mm));
+        }
+    }
+    // merge into the tuning file
+    let path = tune_path();
+    let mut all: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let entry: serde_json::Map<String, serde_json::Value> = won
+        .iter()
+        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+        .collect();
+    all[key.as_str()] = serde_json::Value::Object(entry);
+    if let Some(d) = path.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&all).unwrap()).expect("write tuning file");
+    eprintln!(
+        "tune: wrote {} in {:.0} s: {won:?}",
+        path.display(),
+        t0.elapsed().as_secs_f64()
+    );
+    won
 }
