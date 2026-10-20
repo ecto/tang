@@ -213,7 +213,7 @@ def run_tc(x: np.ndarray, codec: str, bound_args: list[str], model: str = "hand"
     dec = time.perf_counter() - t
     y = np.fromfile(out, dtype="<f4").reshape(x.shape)
     rmse, psnr, mx = metrics(x, y)
-    extra = " ".join(f"{k}={j[k]}" for k in ("coef_bytes", "model_bytes", "outlier_bytes", "n_outliers", "core_bytes", "factor_bytes", "ranks", "chose") if k in j)
+    extra = " ".join(f"{k}={j[k]}" for k in ("coef_bytes", "model_bytes", "outlier_bytes", "n_outliers", "core_bytes", "factor_bytes", "ranks", "chose", "peak", "tried") if k in j)
     return {"bpv": 8 * bs.stat().st_size / x.size, "psnr": psnr, "max_abs": mx, "rmse": rmse,
             "enc_s": j["encode_s"], "dec_s": d["decode_s"], "enc_wall_s": enc, "dec_wall_s": dec, "extra": extra}
 

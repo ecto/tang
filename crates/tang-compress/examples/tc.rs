@@ -1,5 +1,6 @@
 //! `tc` — encode/decode raw little-endian f32 files with the tang-compress
-//! wavelet or Tucker codecs (the QTT codec has its own `qtt` example).
+//! wavelet, Tucker, interpolation or QTT codecs, or the `auto` portfolio
+//! (`portfolio-all` = every candidate, no pre-screen).
 //!
 //! ```text
 //! tc encode IN.f32 OUT.tc --dims 64x128x128 --codec wavelet --psnr 60
@@ -16,13 +17,17 @@ use tang_compress::codec::ErrorBound;
 use tang_compress::{decode_any, wavcodec, Decoded};
 
 fn usage() -> ! {
-    eprintln!("usage: tc encode IN.f32 OUT --dims AxBxC --codec wavelet|tucker BOUND [--rho r] [--model m]\n       tc decode IN OUT.f32 [--model pretrained:PATH]");
+    eprintln!("usage: tc encode IN.f32 OUT --dims AxBxC --codec wavelet|tucker|interp|qtt|auto|portfolio-all BOUND [--rho r] [--model m]\n       tc decode IN OUT.f32 [--model pretrained:PATH]");
     std::process::exit(2)
 }
 
 fn read_f32(path: &str) -> Vec<f32> {
     let b = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-    b.as_chunks::<4>().0.iter().map(|&c| f32::from_le_bytes(c)).collect()
+    b.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&c| f32::from_le_bytes(c))
+        .collect()
 }
 
 fn main() {
@@ -31,7 +36,11 @@ fn main() {
         Some("encode") if args.len() >= 3 => {
             let x = read_f32(&args[1]);
             let range = {
-                let (a, b) = x.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &v| (a.min(v), b.max(v)));
+                let (a, b) = x
+                    .iter()
+                    .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &v| {
+                        (a.min(v), b.max(v))
+                    });
                 (b - a) as f64
             };
             let mut dims = vec![x.len()];
@@ -47,7 +56,9 @@ fn main() {
                     "--psnr" => bound = Some(ErrorBound::Psnr(v.parse().unwrap())),
                     "--rmse" => bound = Some(ErrorBound::Rmse(v.parse().unwrap())),
                     "--max-abs" => bound = Some(ErrorBound::MaxAbs(v.parse().unwrap())),
-                    "--max-rel" => bound = Some(ErrorBound::MaxAbs(v.parse::<f64>().unwrap() * range)),
+                    "--max-rel" => {
+                        bound = Some(ErrorBound::MaxAbs(v.parse::<f64>().unwrap() * range))
+                    }
                     "--codec" => codec = v,
                     "--rho" => rho = Some(v.parse().unwrap()),
                     "--model" => model = v,
@@ -79,20 +90,49 @@ fn main() {
                     );
                     (b, j)
                 }
-                "auto" => {
+                "auto" | "portfolio-all" => {
                     let mut cfg = wavcodec::WavConfig::new(bound);
                     if let Some(r) = rho {
                         cfg.rho = r;
                     }
                     cfg.model = tang_compress::learned::parse_model_arg(&model);
-                    let (b, tk) = tang_compress::encode_auto_f32(&x, &dims, &cfg);
-                    (b, format!("\"chose\":\"{}\"", if tk { "tucker" } else { "wavelet" }))
+                    let (b, rep) =
+                        tang_compress::encode_portfolio_f32(&x, &dims, &cfg, codec == "auto");
+                    let tried: Vec<String> = rep
+                        .tried
+                        .iter()
+                        .map(|(c, n, t)| format!("\"{}:{n}:{t:.3}\"", c.name()))
+                        .collect();
+                    (
+                        b,
+                        format!(
+                            "\"chose\":\"{}\",\"peak\":{},\"tried\":[{}]",
+                            rep.pick.name(),
+                            rep.peak,
+                            tried.join(",")
+                        ),
+                    )
+                }
+                "interp" | "qtt" => {
+                    let cfg = wavcodec::WavConfig::new(bound);
+                    let c = if codec == "qtt" {
+                        tang_compress::Candidate::Qtt
+                    } else {
+                        tang_compress::Candidate::Interp
+                    };
+                    let mut b = vec![c.tag()];
+                    b.extend(tang_compress::encode_candidate_f32(c, &x, &dims, &cfg));
+                    (b, format!("\"chose\":\"{codec}\""))
                 }
                 _ => usage(),
             };
             let enc = t.elapsed().as_secs_f64();
             std::fs::write(&args[2], &bytes).unwrap();
-            println!("{{\"bytes\":{},\"bpv\":{},\"encode_s\":{enc},{json}}}", bytes.len(), 8.0 * bytes.len() as f64 / x.len() as f64);
+            println!(
+                "{{\"bytes\":{},\"bpv\":{},\"encode_s\":{enc},{json}}}",
+                bytes.len(),
+                8.0 * bytes.len() as f64 / x.len() as f64
+            );
         }
         Some("decode") if args.len() == 3 || (args.len() == 5 && args[3] == "--model") => {
             if args.len() == 5 {
@@ -101,7 +141,9 @@ fn main() {
             }
             let bytes = std::fs::read(&args[1]).unwrap();
             let t = Instant::now();
-            let Decoded::F32 { data, .. } = decode_any(&bytes).expect("decode") else { panic!("not an f32 stream") };
+            let Decoded::F32 { data, .. } = decode_any(&bytes).expect("decode") else {
+                panic!("not an f32 stream")
+            };
             let dec = t.elapsed().as_secs_f64();
             let out: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
             std::fs::write(&args[2], out).unwrap();
