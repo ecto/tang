@@ -674,8 +674,10 @@ where
         let Some((_, engine)) = self.engine.as_mut() else {
             return;
         };
-        // Interactive work still waiting now couldn't join this round.
-        let blocked = self.node.queue.interactive_waiting();
+        // Interactive work still waiting now couldn't join this round; a stream giving way
+        // helps only if what it lacked was a slot.
+        let blocked =
+            self.node.queue.interactive_waiting() && self.batch.len() >= engine.max_batch();
         let tickets: Vec<&Ticket> = self.batch.iter().map(|a| &a.ticket).collect();
         let order = crate::batch::lane_order(&tickets);
         let node = &*self.node;
