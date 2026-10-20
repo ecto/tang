@@ -81,7 +81,51 @@ runs. It writes a dense and an MXFP4 checkpoint and compares tang (prefill and o
 time) to HF fp32 eager. Removing any one of the window, YaRN, the clamp or the sinks moves max
 KL to ~2.
 
-RESULTS
+| checkpoint | device | path | top-1 | max KL |
+| --- | --- | --- | ---: | ---: |
+| tiny, dense and MXFP4 | CPU | prefill / step | 100% | 6.9e-7 / 5.9e-7 |
+| tiny, MXFP4 | RTX 4090, f32 KV | prefill / step | 100% | 1.8e-5 / 7.3e-7 |
+
+The real gpt-oss-20b against transformers fp32 on its own dequantized weights (every MXFP4
+value is exact in fp32), on a harmony chat prompt plus 48 greedy tokens (138 positions),
+RTX 4090:
+
+| KV | TF32 (cuBLAS prefill) | path | top-1 | max KL | mean KL |
+| --- | --- | --- | ---: | ---: | ---: |
+| f32 | off | prefill | 100% | 3.5e-7 | ~0 |
+| f32 | off | step | 100% | 4.4e-7 | ~0 |
+| f32 | on (default) | prefill | 100% | 8.8e-2 | 1.0e-3 |
+| f32 | on (default) | step | 100% | 4.4e-7 | ~0 |
+| bf16 | off | step | 99.3% | 1.8e-1 | 3.2e-3 |
+
+Two things are not gpt-oss's: prefill chunks go through the existing cuBLAS GEMMs, which run
+TF32 (`NVIDIA_TF32_OVERRIDE=0` turns that off and prefill matches decode); and bf16 keys move
+the sink attention enough to flip a near-tie, so gpt-oss keeps an f32 cache by default
+(`TANG_KV_F32=0` for bf16). Its 8 KV heads make that cheap: 2% of decode speed, nothing in
+prefill.
+
+`tests/speculate.rs` on gpt-oss-20b (CUDA, RTX 4090): all three pass, every request byte-identical
+with drafting off and on, alone and batched, staggered or not (the edit task accepts 158 of 193
+short drafts, 236 of 283 default ones).
+
+## Speed
+
+Batch 1, greedy, 13-token prompt (`tang-llm generate`), and cold prefill (`bench-prefill`,
+512-token chunks):
+
+| model | GPU | decode | prefill 512 | 2048 | 8192 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| gpt-oss-20b | RTX 4090 | 157 tok/s | 3132 tok/s | 2760 | 1873 |
+| gpt-oss-20b | H100 SXM | 182 tok/s | 5399 tok/s | 4629 | 2864 |
+| gpt-oss-120b | H100 SXM | 119 tok/s | 1418 tok/s | 1305 | |
+
+A k-row forward (verify windows, batched decode) at 1024 context costs 1.05× one row at k = 4
+and 1.2× at k = 8 on the 4090; 1.8× and 3.0× on the H100, where 8 tokens wake most of the 32
+experts.
+
+Where decode time goes (20b, 4090, nsys): expert GEMV ~45%, bf16 GEMVs (attention and the
+201k-row head) ~35%, sink attention ~6%. On the H100 the step is launch-bound (~460 launches a
+token without CUDA graphs).
 
 ## Harmony
 
@@ -100,6 +144,9 @@ to transformers' `apply_chat_template` with tools and a tool round trip.
   `attention_paged_rows` has no sinks). `attn_sink_partial` already takes per-row positions and
   tables, so the fused path is a prep call plus this kernel.
 - Sliding layers keep a full-length cache; a ring of 128 would cut KV memory nearly in half.
-- Prefill MoE runs the GEMV kernel 8 picks at a time; a dequantize-and-GEMM path for long
-  chunks would be faster.
+- Prefill MoE widens each expert to f32 once per chunk and runs cuBLAS; a grouped GEMM straight
+  off MXFP4 would skip the scratch. Prefill attention with sinks isn't tiled over queries yet
+  (it shows at 8k).
+- Decode: CUDA graphs for the dense path, and a 4-bit head.
+- `reasoning_tokens` in usage counts think-tag tokens only, so it reads 0 for harmony.
 - 120b: same code. It needs ~65 GB, so an 80 GB GPU.
