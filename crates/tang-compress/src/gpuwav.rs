@@ -1323,10 +1323,7 @@ struct Enc<'a> {
     threads: usize,
 }
 
-fn par_map<T: Send, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R>
-where
-    T: Sync,
-{
+fn par_map<T: Send + Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     if threads <= 1 || items.len() <= 1 {
         return items.iter().map(f).collect();
     }
@@ -1363,7 +1360,8 @@ impl<'a> Enc<'a> {
         let e = need(amax, (1u32 << 23) as f64).max(need(dmax, (1u32 << 20) as f64)).clamp(-126, 100);
         let sc = 2f64.powi(-e);
         let mean_fix = (mean * sc).round() as i32;
-        let items: Vec<(usize, ([usize; 3], [usize; 3]))> = ids.iter().copied().zip(grid.iter().copied()).collect();
+        type Item = (usize, ([usize; 3], [usize; 3]));
+        let items: Vec<Item> = ids.iter().copied().zip(grid.iter().copied()).collect();
         let bricks = par_map(&items, threads, |&(sid, (o, bd))| {
             let sh = &shapes[sid];
             let mut c = vec![0.0f64; bd.iter().product()];

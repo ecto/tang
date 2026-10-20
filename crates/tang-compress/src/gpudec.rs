@@ -98,10 +98,12 @@ impl GpuDecoder {
             .await
             .map_err(|e| format!("adapter: {e}"))?;
         let al = adapter.limits();
-        let mut limits = wgpu::Limits::default();
-        limits.max_buffer_size = al.max_buffer_size;
-        limits.max_storage_buffer_binding_size = al.max_storage_buffer_binding_size;
-        limits.max_compute_workgroups_per_dimension = al.max_compute_workgroups_per_dimension;
+        let limits = wgpu::Limits {
+            max_buffer_size: al.max_buffer_size,
+            max_storage_buffer_binding_size: al.max_storage_buffer_binding_size,
+            max_compute_workgroups_per_dimension: al.max_compute_workgroups_per_dimension,
+            ..Default::default()
+        };
         if lanes == 0 || lanes > MAX_LANES {
             return Err(format!("tc-gpu GPU decode supports 1..={MAX_LANES} lanes"));
         }
@@ -443,8 +445,8 @@ impl GpuDecoder {
         rx.recv().unwrap().unwrap();
         let data = slice.get_mapped_range();
         let mut v = vec![0u32; pr.ncells];
-        for (o, c) in v.iter_mut().zip(data.chunks_exact(4)) {
-            *o = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        for (o, c) in v.iter_mut().zip(data.as_chunks::<4>().0) {
+            *o = u32::from_le_bytes(*c);
         }
         drop(data);
         st.unmap();

@@ -144,6 +144,7 @@ fn main() {
                         }
                     }
                 }
+                #[allow(unused_mut, unused_assignments)]
                 let mut gpu_json = String::new();
                 #[cfg(feature = "gpu")]
                 {
@@ -188,6 +189,54 @@ fn main() {
                     lo,
                     hi
                 );
+            }
+        }
+        #[cfg(feature = "gpu")]
+        "verify" => {
+            // CPU == GPU byte-for-byte, error bounds, and random-access crops
+            let g = tang_compress::gpudec::GpuDecoder::new(lanes, 1024).expect("gpu");
+            for t in targets.split(',') {
+                let bound = if let Some(p) = t.strip_prefix('p') {
+                    ErrorBound::Psnr(p.parse().unwrap())
+                } else {
+                    ErrorBound::MaxAbs(t[1..].parse::<f64>().unwrap() * range)
+                };
+                for &bk in &bricks {
+                    let cfg = GpuConfig { brick: bk, lanes, ..GpuConfig::new(bound) };
+                    let (b, st) = gpuwav::encode_f32_mt(&x, &dims, &cfg, threads);
+                    let ps = gpuwav::parse(&b).unwrap();
+                    let cpu = gpuwav::decode_box_parsed(&ps, &b, [0; 3], ps.d3, threads).unwrap();
+                    let (gpu, _) = g.decode(&b).unwrap();
+                    let diff = cpu.iter().zip(&gpu).filter(|(a, b)| a != b).count();
+                    let y: Vec<f32> = cpu.iter().map(|&v| f32::from_bits(v)).collect();
+                    let (rmse, mx) = err(&x, &y);
+                    let ok_bound = match bound {
+                        ErrorBound::MaxAbs(bb) => mx <= bb,
+                        ErrorBound::Psnr(db) => 20.0 * (range / rmse).log10() >= db - 1e-9,
+                        _ => true,
+                    };
+                    // random-access sub-box straddling bricks
+                    let lo: [usize; 3] = std::array::from_fn(|a| ps.d3[a] / 3);
+                    let hi: [usize; 3] = std::array::from_fn(|a| (lo[a] + 64).min(ps.d3[a]).max(lo[a] + 1));
+                    let sub = gpuwav::decode_box_bits(&b, lo, hi, 1).unwrap();
+                    let mut ra_ok = true;
+                    let mut k = 0;
+                    for z in lo[0]..hi[0] {
+                        for yy in lo[1]..hi[1] {
+                            for xx in lo[2]..hi[2] {
+                                ra_ok &= sub[k] == cpu[(z * ps.d3[1] + yy) * ps.d3[2] + xx];
+                                k += 1;
+                            }
+                        }
+                    }
+                    println!(
+                        "{{\"field\":\"{name}\",\"target\":\"{t}\",\"brick\":{bk},\"bpv\":{},\"cells\":{},\"gpu_diff_cells\":{diff},\"bound_ok\":{ok_bound},\"ra_ok\":{ra_ok},\"max_abs_rel\":{}}}",
+                        st.bits_per_value,
+                        x.len(),
+                        mx / range
+                    );
+                    assert!(diff == 0 && ok_bound && ra_ok, "{name} {t} {bk}");
+                }
             }
         }
         _ => panic!("mode"),
