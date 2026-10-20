@@ -115,7 +115,7 @@ impl Step {
                 view: View::pick(rank, &all(rank)),
             };
             let at = |t: TensorId, k: i64| {
-                let mut view = View::pick(rank, &vec![None; 1]);
+                let mut view = View::pick(rank, &[None; 1]);
                 view.forms[0].offset = k;
                 Arg { src: t, view }
             };
