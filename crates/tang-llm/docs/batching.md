@@ -71,15 +71,61 @@ from the target's logits in order with the stream's own sampler, so output doesn
 cost model learns only from solo forwards (a batched forward's time isn't one stream's). Finished
 streams' outputs go into the global automaton once no stream is drafting from it.
 
-### Prefill under a token budget
+### Prefill under a time budget
 
-A prefilling stream's segment is its next chunk, always a whole `PREFILL_CHUNK` (512) as when it
-runs alone. Each step has a token budget (512): decoding streams' rows count first, then
-prefilling streams get chunks in lane order while some budget is left (the first always gets
-one, so a step overshoots by at most a chunk). So a long prompt arriving doesn't stall the streams already
-decoding for its whole prefill: they get a token every step while it goes in chunk by chunk.
+A prefilling stream's segment is its next chunk. While anything decodes, a step has a time
+budget (`TANG_STEP_MS`, default 50 ms: 20 tokens a second for every decoding stream): decode
+rows go in first, then prefilling streams, in lane order, each get the largest chunk the
+budget's remainder fits, from a fitted model of step time ([`step_cost.rs`](../src/step_cost.rs)):
+
+```text
+secs = a + f·decode_rows + Σ_chunks (g_k + b_k·q + d_k·q·c + e_k·q²)
+```
+
+for a chunk of `q` new tokens after `c` cached, with separate coefficients for small chunks
+(≤ 32 tokens) and large ones, because the kernels differ: on CUDA a 9–32-token chunk runs
+`gemm_cols` and split-KV attention, a larger one dequantizes for cuBLAS and runs tiled prefill
+attention, and a 33-token chunk costs twice a 32-token one (`bench_batch --probe`; Qwen3-8B
+4-bit on the 3090, step ms with 4 decode rows):
+
+| prefix | q=0 | 4 | 9 | 32 | 33 | 64 | 128 | 256 | 512 |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 0 | 12.7 | 18.8 | 41.5 | 65.4 | 148 | 154 | 206 | 305 | 531 |
+| 4096 | 13.2 | 21.9 | 46.9 | 77.5 | 256 | 281 | 454 | 788 | 1365 |
+| 16000 | 12.8 | 27.6 | 64.9 | 112 | 622 | 664 | 1209 | 2313 | 4066 |
+
+The solver takes the larger of the two regimes' fits (`StepCost::fit_chunk`). A chunk is at
+least 9 tokens, past the decode rows' share of the matmuls; the first prefilling stream always
+gets one, so prefill moves even when the budget can't hold it. With nothing decoding, a chunk is
+a whole `PREFILL_CHUNK` (512), as a prompt gets alone.
+
+The model is calibrated at load (`Engine::calibrate`: decode at 1–8 rows and chunks of both
+regimes at two prefix lengths, ~4 s for Qwen3-8B on the 3090 once the kernels are compiled;
+`TANG_CALIBRATE=0` skips it) and refined from every step: least squares with older steps decayed,
+ridged toward the calibration so a long run of identical steps can't move the terms they don't
+constrain. `/node` shows it as `step_cost`.
 
 Images keep the old path: a stream with images prefills in one go inside `admit`.
+
+Decode inter-token latency while a 16k-token prompt prefills next to 4 decoding streams
+(Qwen3-8B 4-bit, RTX 3090; decode alone is 13.6 ms a step):
+
+| step budget | step p50 | p99 | max | prefill |
+|--|--:|--:|--:|--:|
+| none (whole 512-token chunks) | 2198 ms | 3943 | 3943 | 69 s (231 tok/s) |
+| 100 ms | 88.5 | 99.7 | 209 | 50 s (318 tok/s) |
+| 50 ms | 56.0 | 66.9 | 150 | 93 s (172 tok/s) |
+
+At 50 ms the steps run a little over: past ~8k of prefix even a 9-token chunk costs more than
+the 37 ms the decode rows leave, and prefill still has to move. A 100 ms budget prefills faster
+than whole chunks do, because 512-token chunks at a long prefix hit the slow tiled attention
+(`attn_prefill` with few query tiles over many keys), and 33–256-token chunks hit it less.
+That kernel, and the dequantize-for-cuBLAS path for 33+ rows, are what make prefill here slow;
+fixing them moves every number in these tables.
+
+The bigger chunks and varying sizes mean a prompt prefilled beside decoding streams isn't
+prefilled in the same chunks as alone, so its cache can differ from the solo one in the last
+bits (see Exactness). Decode rows are unaffected.
 
 ### Scheduler
 
@@ -121,11 +167,12 @@ the matmuls:
 
 - `gemv_q4_xs4_m{M}` (CUDA, 4-bit, 1–8 rows) sums each row in the same order for every M, so a
   decode row in a batch of up to 8 streams gets the bits it gets alone.
-- Prefill chunks get their own matmul at their solo size, and the head runs in pieces of at most
-  8 rows.
+- Prefill chunks get their own matmul, and the head runs in pieces of at most 8 rows. With
+  nothing decoding a chunk is the solo size; beside decoding streams the time budget sizes it.
 
 So on CUDA with 4-bit weights, plain batched decode matches solo byte for byte, bf16 KV
-included (the bench's 8 streams × 256 tokens: 8/8). What still isn't batch-invariant: verify
+included (the bench's 8 streams × 256 tokens: 8/8). A prompt prefilled beside decoding streams
+gets budget-sized chunks, so its own cache, and so its reply, can differ in the last bits. What still isn't batch-invariant: verify
 windows when the batch's short rows total more than 8 (`gemm_cols16/32`), bf16 weights
 (`gemv_bf16` vs `gemm_cols`), and Metal's kernels. With bf16 KV those differences can flip a near
 tie late in a long reply, the same effect `tests/speculate.rs` documents for verify windows;

@@ -17,6 +17,13 @@ use tokenizers::Tokenizer;
 /// Prefill in chunks to bound scratch memory.
 pub const PREFILL_CHUNK: usize = 512;
 
+/// Fewest tokens a prefill chunk sized to a time budget takes: past the decode rows' share of
+/// a step's matmuls (`SHORT_ROWS` in model.rs), so a chunk gets its own.
+const MIN_CHUNK: usize = 9;
+
+/// A step's default time budget, while anything decodes: 20 tokens a second for each stream.
+pub const STEP_BUDGET: f64 = 0.050;
+
 /// Fewest leading positions of another conversation's block worth copying (fewer are just
 /// prefilled: a chat template's first few tokens are the same everywhere).
 const MIN_PARTIAL: usize = 32;
@@ -221,6 +228,10 @@ pub struct Engine<D: ComputeDevice> {
     out: usize,
     running: Vec<String>,
     max_batch: usize,
+    /// How long steps take, fitted as they run; and how long one may take while streams
+    /// decode (prefill chunks are sized to fit), if limited.
+    step_cost: crate::step_cost::StepCost,
+    step_budget: Option<f64>,
     /// Finished streams' outputs, for the global draft automaton once no stream drafts.
     global_pending: Vec<Vec<u32>>,
 }
@@ -481,6 +492,8 @@ impl<D: ComputeDevice> Engine<D> {
             out: 0,
             running: Vec::new(),
             max_batch: usize::MAX,
+            step_cost: crate::step_cost::StepCost::default(),
+            step_budget: Some(STEP_BUDGET),
             global_pending: Vec::new(),
         })
     }
@@ -560,6 +573,94 @@ impl<D: ComputeDevice> Engine<D> {
     /// Run at most `n` requests at once (at least 1; never more than the slots).
     pub fn set_max_batch(&mut self, n: usize) {
         self.max_batch = n.max(1);
+    }
+
+    /// Limit a step to `secs` while streams decode (prefill chunks shrink to fit), or don't
+    /// (`None`: whole chunks always).
+    pub fn set_step_budget(&mut self, secs: Option<f64>) {
+        self.step_budget = secs;
+    }
+
+    /// The fitted step-time model.
+    pub fn step_cost(&self) -> &crate::step_cost::StepCost {
+        &self.step_cost
+    }
+
+    /// Time a few steps of different shapes (decode at 1-8 rows, prefill chunks at a few sizes
+    /// and prefix lengths, mixed) on scratch caches, and make the fit from them the prior.
+    /// A few seconds for a mid-sized model (most of it the 1k-token prefix).
+    pub fn calibrate(&mut self) -> Result<()> {
+        use crate::model::Segment;
+        use crate::step_cost::Shape;
+        let m = &self.model;
+        let ids: Vec<u32> = (0..1400).map(|i| (100 + i % 1000) as u32).collect();
+        let mut rows: Vec<Cache<D::Buffer>> = (0..8).map(|_| m.new_cache()).collect();
+        for c in rows.iter_mut() {
+            m.forward(&ids[..64], c, false)?;
+        }
+        let mut long = m.new_cache();
+        let one = [7u32];
+        // (decode rows, chunk tokens, prefix): both chunk regimes, two prefix lengths (the
+        // prefix terms extrapolate; real steps refine them).
+        let plan: &[(usize, usize, usize)] = &[
+            (1, 0, 0),
+            (2, 0, 0),
+            (4, 0, 0),
+            (8, 0, 0),
+            (0, 16, 0),
+            (4, 32, 0),
+            (1, 64, 0),
+            (8, 192, 0),
+            (2, 12, 1024),
+            (0, 32, 1024),
+            (4, 96, 1024),
+            (1, 256, 1024),
+            (8, 9, 1024),
+        ];
+        for warm in [true, false] {
+            for &(r, q, c) in plan {
+                if warm && c > 0 {
+                    continue;
+                }
+                while long.len < c {
+                    let k = long.len;
+                    m.forward(&ids[k..(k + 512).min(c)], &mut long, false)?;
+                }
+                long.truncate(c);
+                let mut segs: Vec<_> = rows[..r]
+                    .iter_mut()
+                    .map(|c| Segment {
+                        tokens: &one,
+                        cache: c,
+                        all: false,
+                    })
+                    .collect();
+                if q > 0 {
+                    segs.push(Segment {
+                        tokens: &ids[c..c + q],
+                        cache: &mut long,
+                        all: false,
+                    });
+                }
+                let t = Instant::now();
+                m.forward_batch(&mut segs)?;
+                let secs = t.elapsed().as_secs_f64();
+                drop(segs);
+                for c in rows.iter_mut() {
+                    c.truncate(64);
+                }
+                if !warm {
+                    let s = Shape {
+                        decode_rows: r,
+                        ..Shape::default()
+                    };
+                    let s = if q > 0 { s.chunk(q, c) } else { s };
+                    self.step_cost.observe(&s, secs);
+                }
+            }
+        }
+        self.step_cost.settle();
+        Ok(())
     }
 
     /// Most requests that run at once: one per slot, up to the cap.
@@ -902,7 +1003,7 @@ impl<D: ComputeDevice> Engine<D> {
                 on: &mut on,
                 ctl: &mut *ctl,
             }];
-            if let Err(e) = self.step(&mut lanes, PREFILL_CHUNK) {
+            if let Err(e) = self.step(&mut lanes) {
                 self.retire(st).ok();
                 return Err(e);
             }
@@ -1118,7 +1219,7 @@ impl<D: ComputeDevice> Engine<D> {
     /// to go on. A stream that finishes, yields or fails is [`done`](Stream::done); hand it to
     /// [`retire`](Self::retire). An error here is the forward's, and every stream in it is
     /// lost (retire them all).
-    pub fn step(&mut self, lanes: &mut [Lane<'_, D::Buffer>], budget: usize) -> Result<()> {
+    pub fn step(&mut self, lanes: &mut [Lane<'_, D::Buffer>]) -> Result<()> {
         // Each stream's segment, if it has one this step: (tokens fed, all rows).
         let mut segs: Vec<Option<bool>> = Vec::with_capacity(lanes.len());
         let mut decode_rows = 0;
@@ -1138,12 +1239,21 @@ impl<D: ComputeDevice> Engine<D> {
             }
             segs.push(want);
         }
-        // Prefill chunks share what's left of the budget: chunks go to streams in lane order
-        // while some is left (the first always gets one, so a prefill always moves).
-        let mut left = budget.saturating_sub(decode_rows).max(crate::blocks::BLOCK);
+        // Prefill chunks fill what's left of the step's time budget, in lane order, each as
+        // many tokens as the fitted step cost says fit (see `crate::step_cost`). With nothing
+        // decoding (or no budget) a chunk is a whole PREFILL_CHUNK, as a prompt alone gets.
+        let mut shape = crate::step_cost::Shape {
+            decode_rows,
+            ..Default::default()
+        };
+        let mut left = match self.step_budget {
+            Some(b) if decode_rows > 0 => Some(b - self.step_cost.predict(&shape)),
+            _ => None,
+        };
+        let mut first = true;
         for (lane, seg) in lanes.iter_mut().zip(segs.iter_mut()) {
             let st = &mut *lane.stream;
-            if st.phase != Phase::Prefill || left == 0 {
+            if st.phase != Phase::Prefill {
                 continue;
             }
             if st.progress.prefilled > 0 {
@@ -1162,13 +1272,29 @@ impl<D: ComputeDevice> Engine<D> {
                     continue;
                 }
             }
-            // Whole chunks, as the prompt would be prefilled alone (so its cache holds the same
-            // numbers); the budget says how many streams get one this step.
             let from = st.reuse + st.progress.prefilled;
-            let n = (st.ids.len() - from).min(PREFILL_CHUNK);
+            let rest = st.ids.len() - from;
+            let c = st.cache.len;
+            let n = match left {
+                None => rest.min(PREFILL_CHUNK),
+                Some(secs) => {
+                    let fit = self.step_cost.fit_chunk(secs, c, PREFILL_CHUNK.min(rest));
+                    // The first prefilling stream always moves, by at least MIN_CHUNK.
+                    let n = if first { fit.max(MIN_CHUNK) } else { fit };
+                    if n < MIN_CHUNK.min(rest) {
+                        continue;
+                    }
+                    n.min(rest)
+                }
+            };
+            first = false;
+            if let Some(secs) = left.as_mut() {
+                let one = crate::step_cost::Shape::default().chunk(n, c);
+                *secs -= self.step_cost.predict(&one) - self.step_cost.coef()[0];
+            }
+            shape = shape.chunk(n, c);
             st.fed.clear();
             st.fed.extend_from_slice(&st.ids[from..from + n]);
-            left = left.saturating_sub(n);
             *seg = Some(false);
         }
         let mut idx = Vec::new();
@@ -1191,6 +1317,7 @@ impl<D: ComputeDevice> Engine<D> {
         let tf = Instant::now();
         let logits = self.model.forward_batch(&mut parts)?;
         let secs = tf.elapsed().as_secs_f64();
+        self.step_cost.observe(&shape, secs);
         drop(parts);
         let vocab = self.model.cfg.vocab_size;
         for (i, rows) in idx.into_iter().zip(logits) {

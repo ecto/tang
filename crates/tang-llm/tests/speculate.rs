@@ -308,7 +308,7 @@ fn run_batch<D: ComputeDevice>(e: &mut Engine<D>, reqs: &[Request], stagger: boo
                 ctl: ctl as &mut dyn Control,
             })
             .collect();
-        e.step(&mut lanes, 512).unwrap();
+        e.step(&mut lanes).unwrap();
         drop(lanes);
         drop(refs);
         drop(ons);
