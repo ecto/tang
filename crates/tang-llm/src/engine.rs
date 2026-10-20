@@ -1,10 +1,11 @@
 //! A loaded model plus tokenizer and chat template: turns chat requests into streamed pieces,
 //! reusing the KV cache for whatever prefix the new prompt shares with the previous one.
 
-use crate::chat::{Parser, Piece, Template};
+use crate::chat::{Chunk, Detok, Parser, Piece, Tags, Template};
 use crate::draft::{Calibration, CostModel, DraftConfig, Global, Session};
 use crate::model::{Cache, Dtype, Model};
 use crate::sample::{Sampler, Sampling};
+use crate::special::Shield;
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use std::path::Path;
@@ -20,8 +21,10 @@ const PREFILL_CHUNK: usize = 512;
 /// prefilled: a chat template's first few tokens are the same everywhere).
 const MIN_PARTIAL: usize = 32;
 
-/// Where an image goes in a flattened message; expanded to the model's image tokens.
-pub const IMAGE_MARKER: &str = "<start_of_image>";
+/// Where an image goes in a flattened message; expanded to the model's image tokens. Not an
+/// added token itself, so it survives [`Shield::protect`] (a user can type it, but only as many
+/// times as there are images, and the images are theirs).
+pub const IMAGE_MARKER: &str = "\u{F8FF}tang-image\u{F8FF}";
 
 pub struct Request {
     pub messages: Value,
@@ -128,16 +131,20 @@ impl Control for () {}
 pub struct Prompter {
     tok: Arc<Tokenizer>,
     template: Arc<Template>,
+    shield: Arc<Shield>,
     /// Tokens an image takes, if the model sees images.
     image_tokens: Option<usize>,
 }
 
 impl Prompter {
-    /// The rendered prompt and its token ids.
+    /// The rendered prompt and its token ids. Request text (messages, tool results, tool-call
+    /// arguments, tool definitions) is only ever plain tokens; the template's own special
+    /// tokens are the only ones (see [`Shield`]).
     pub fn prompt(&self, req: &Request) -> Result<(String, Vec<u32>)> {
+        let tools = req.tools.as_ref().map(|t| self.shield.protect(t));
         let mut prompt = self.template.render(
-            &req.messages,
-            req.tools.as_ref(),
+            &self.shield.protect(&req.messages),
+            tools.as_ref(),
             if req.response_schema.is_some() {
                 Some(false)
             } else {
@@ -159,13 +166,8 @@ impl Prompter {
             );
             prompt = prompt.replace(IMAGE_MARKER, &block);
         }
-        let ids = self
-            .tok
-            .encode(prompt.as_str(), false)
-            .map_err(|e| anyhow!("tokenize: {e}"))?
-            .get_ids()
-            .to_vec();
-        Ok((prompt, ids))
+        let ids = self.shield.encode(&self.tok, &prompt)?;
+        Ok((self.shield.reveal(&prompt), ids))
     }
 }
 
@@ -181,6 +183,9 @@ pub struct Engine<D: ComputeDevice> {
     pub model: Model<D>,
     tok: Arc<Tokenizer>,
     template: Arc<Template>,
+    shield: Arc<Shield>,
+    /// Tag tokens the output parser splits on.
+    tags: Tags,
     cache: Cache<D::Buffer>,
     /// Images in the cache: where each image's tokens start, and a hash of the image, so a
     /// shared prefix is only reused when the images in it are the same.
@@ -326,6 +331,8 @@ impl<D: ComputeDevice> Engine<D> {
         }
         Ok(Self {
             model,
+            shield: Arc::new(Shield::new(&tok)),
+            tags: Tags::new(|t| tok.token_to_id(t)),
             tok: Arc::new(tok),
             template: Arc::new(template),
             cache,
@@ -692,6 +699,7 @@ impl<D: ComputeDevice> Engine<D> {
         Prompter {
             tok: self.tok.clone(),
             template: self.template.clone(),
+            shield: self.shield.clone(),
             image_tokens: self.model.vision.as_ref().map(|v| v.tokens),
         }
     }
@@ -725,17 +733,9 @@ impl<D: ComputeDevice> Engine<D> {
         self.model.max_ctx()
     }
 
+    /// Tokens `text` takes as plain text (as a message's content would).
     pub fn count_tokens(&self, text: &str) -> Result<usize> {
-        Ok(self.encode(text)?.len())
-    }
-
-    fn encode(&self, text: &str) -> Result<Vec<u32>> {
-        Ok(self
-            .tok
-            .encode(text, false)
-            .map_err(|e| anyhow!("tokenize: {e}"))?
-            .get_ids()
-            .to_vec())
+        Ok(self.shield.plain(&self.tok, text)?.len())
     }
 
     /// Generate a reply. `on` gets each piece as it's decoded and returns false to stop.
@@ -923,7 +923,7 @@ impl<D: ComputeDevice> Engine<D> {
         let mut parser = Parser::new(opened);
         let mut think = ThinkBudget::new(self.think_tags, req.thinking_budget, opened);
         let mut out: Vec<u32> = Vec::new();
-        let (mut prefix, mut read) = (0usize, 0usize);
+        let mut detok = Detok::default();
         let mut text = String::new();
         let mut finish = Finish::Length;
         let mut tool_calls = 0;
@@ -965,7 +965,7 @@ impl<D: ComputeDevice> Engine<D> {
         let mut pending = 0usize;
         let (mut drafted, mut accepted) = (0usize, 0usize);
 
-        while out.len() < limit {
+        'decode: while out.len() < limit {
             if ctl.cancelled() {
                 finish = Finish::Cancelled;
                 break;
@@ -1011,14 +1011,12 @@ impl<D: ComputeDevice> Engine<D> {
                     s.push(tok);
                 }
             }
-            // Incremental detokenization: decode a small window and emit what's new, holding
-            // back incomplete UTF-8.
-            let before = self.decode(&out[prefix..read])?;
-            let after = self.decode(&out[prefix..])?;
-            if after.len() > before.len() && !after.ends_with('\u{fffd}') {
-                let new = after[before.len()..].to_string();
-                prefix = read;
-                read = out.len();
+            // Tag tokens come out as tags, everything else as literal text (see `Parser`).
+            for chunk in detok.push(&out, &self.tags, |ids| self.decode(ids))? {
+                let (new, tag) = match chunk {
+                    Chunk::Text(s) => (s, None),
+                    Chunk::Tag(t) => (t.to_string(), Some(t)),
+                };
                 text.push_str(&new);
                 let stop_at = req.stop.iter().filter_map(|s| text.find(s.as_str())).min();
                 let new = match stop_at {
@@ -1030,18 +1028,18 @@ impl<D: ComputeDevice> Engine<D> {
                 };
                 // Constrained output is the grammar's JSON verbatim: tool-call or think
                 // markers inside a string value are data, not structure.
-                let pieces = if constraint.is_some() {
-                    vec![Piece::Text(new)]
-                } else {
-                    parser.push(&new)
+                let pieces = match tag {
+                    _ if constraint.is_some() => vec![Piece::Text(new)],
+                    Some(t) if new == t => parser.push_tag(t),
+                    _ => parser.push_text(&new),
                 };
                 if !deliver(pieces, &mut tool_calls) {
                     finish = Finish::Cancelled;
-                    break;
+                    break 'decode;
                 }
                 if stop_at.is_some() {
                     finish = Finish::Stop;
-                    break;
+                    break 'decode;
                 }
             }
             if fed.is_empty() {
