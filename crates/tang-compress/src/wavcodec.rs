@@ -538,7 +538,7 @@ fn read_header(r: &mut ByteReader) -> Result<(Dtype, Vec<usize>, bool), DecodeEr
     for _ in 0..nd {
         dims.push(r.varint()? as usize);
     }
-    if dims.contains(&0) || dims.iter().try_fold(1usize, |a, &d| a.checked_mul(d)).is_none_or(|n| n > 1 << 34) {
+    if dims.contains(&0) || dims.iter().try_fold(1usize, |a, &d| a.checked_mul(d)).is_none_or(|n| n as u64 > 1 << 34) {
         return Err(DecodeError::Invalid("dims"));
     }
     let lossless = r.u8()? != 0;

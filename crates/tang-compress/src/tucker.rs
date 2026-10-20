@@ -448,7 +448,7 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
         dims.push(r.varint()? as usize);
     }
     let d = as3(&dims);
-    if d.iter().try_fold(1usize, |a, &v| a.checked_mul(v)).is_none_or(|n| n == 0 || n > 1 << 34) {
+    if d.iter().try_fold(1usize, |a, &v| a.checked_mul(v)).is_none_or(|n| n == 0 || n as u64 > 1 << 34) {
         return Err(DecodeError::Invalid("dims"));
     }
     let delta = r.f64()?;
