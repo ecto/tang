@@ -342,6 +342,10 @@ impl CudaComputeDevice {
                 return Some(self.finish(out));
             }
         }
+        if (9..=SMALL_GEMM_ROWS).contains(&m) && k % 32 == 0 && self.tc_q4_ok(w) {
+            self.gemm_tc_q4(x, w, &mut out, m, k, n);
+            return Some(self.finish(out));
+        }
         if m <= SMALL_GEMM_ROWS && cols_ok {
             self.gemm_cols(x, w, &mut out, m, k, n);
             return Some(self.finish(out));
@@ -424,6 +428,95 @@ impl CudaComputeDevice {
             row0 += rows;
         }
         Some(self.finish(out))
+    }
+
+    /// Whether `gemm_tc_q4` can take `w`: 4-bit with groups of a multiple of 32, on sm_80+
+    /// (TF32 `mma.sync`), unless `TANG_TC_GEMM=0`.
+    fn tc_q4_ok(&self, w: &CudaBuffer) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| {
+            use cudarc::driver::sys;
+            let mut major: i32 = 0;
+            unsafe {
+                sys::cuDeviceGetAttribute(
+                    &mut major,
+                    sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                    0,
+                );
+            }
+            major >= 8 && std::env::var("TANG_TC_GEMM").map_or(true, |v| v != "0")
+        });
+        on && matches!(w.storage(), CudaStorage::Q4(q) if q.group % 32 == 0)
+    }
+
+    /// `out = x · wᵀ` for 9..=32 rows on tensor cores (`gemm_tc_q4_m{16,32}`), K split (by
+    /// shape alone, partials summed by `sum_splits`) so the column blocks fill the GPU.
+    fn gemm_tc_q4(
+        &self,
+        x: &CudaBuffer,
+        w: &CudaBuffer,
+        out: &mut CudaBuffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        let CudaStorage::Q4(q) = w.storage() else {
+            unreachable!()
+        };
+        let name = if m <= 16 {
+            "gemm_tc_q4_m16"
+        } else {
+            "gemm_tc_q4_m32"
+        };
+        let f = match self.llm_funcs.borrow().get(name) {
+            Some(f) => Some(f.clone()),
+            None => None,
+        };
+        let f = f.unwrap_or_else(|| {
+            let (_m, f) = self.get_func_with_arch(llm_cuda::TC_GEMM_CUDA, name, "sm_80");
+            self.llm_funcs.borrow_mut().insert(name, f.clone());
+            f
+        });
+        let col_blocks = n.div_ceil(128);
+        let stages = k / 32;
+        let want = (4 * sm_count()).div_ceil(col_blocks).clamp(1, stages);
+        let k_split = stages.div_ceil(want) * 32;
+        let splits = k.div_ceil(k_split);
+        let mut partial = (splits > 1).then(|| self.pool_alloc_uninit_f32(splits * m * n));
+        let (mu, ku, nu, gu, ks) = (m as u32, k as u32, n as u32, q.group as u32, k_split as u32);
+        unsafe {
+            self.stream
+                .launch_builder(&f)
+                .arg(x.f32_data())
+                .arg(&q.packed)
+                .arg(&q.scales)
+                .arg(&q.biases)
+                .arg(match partial.as_mut() {
+                    Some(p) => p.f32_data_mut(),
+                    None => out.f32_data_mut(),
+                })
+                .arg(&mu)
+                .arg(&ku)
+                .arg(&nu)
+                .arg(&gu)
+                .arg(&ks)
+                .launch(blocks((col_blocks, splits, 1), 256))
+                .unwrap();
+        }
+        if let Some(p) = partial {
+            let f = self.llm_func(llm_cuda::GEMV_CUDA, "sum_splits");
+            let (total, s) = ((m * n) as u32, splits as u32);
+            unsafe {
+                self.stream
+                    .launch_builder(&f)
+                    .arg(p.f32_data())
+                    .arg(out.f32_data_mut())
+                    .arg(&total)
+                    .arg(&s)
+                    .launch(per_elem(m * n))
+                    .unwrap();
+            }
+        }
     }
 
     /// `out = x · wᵀ` for 2..=32 rows with `gemm_cols{8,16,32}_*`: a thread per output
@@ -1258,7 +1351,9 @@ mod tests {
                 g.download(&g.linear(&g.upload(&x), &g.upload_q4(&p, &s, &b, group), m, k, n));
             let want =
                 c.download(&c.linear(&c.upload(&x), &c.upload_q4(&p, &s, &b, group), m, k, n));
-            close(&got, &want, 1e-4, &format!("q4 small gemm {m}x{k}x{n}"));
+            // 9+ rows run on tensor cores in TF32 (10-bit mantissas) on sm_80+.
+            let tol = if m >= 9 { 3e-3 } else { 1e-4 };
+            close(&got, &want, tol, &format!("q4 small gemm {m}x{k}x{n}"));
             let wb = bf16_bits(&vals(n * k, 31, 1.0));
             let got = g.download(&g.linear(&g.upload(&x), &g.upload_bf16(&wb), m, k, n));
             let want = c.download(&c.linear(&c.upload(&x), &c.upload_bf16(&wb), m, k, n));
@@ -1706,6 +1801,25 @@ mod tests {
             1e-5,
             "rope_half",
         );
+    }
+
+    /// A row of the 9..32-row 4-bit GEMM gets the same bits whatever the row count.
+    fn q4_small_gemm_rows_are_batch_invariant<D: ComputeDevice>(g: &D) {
+        let (k, n, group) = (4096, 1000, 64);
+        let x = vals(32 * k, 33, 2.0);
+        let (p, s, b) = q4(n, k, group);
+        let w = g.upload_q4(&p, &s, &b, group);
+        let all = g.download(&g.linear(&g.upload(&x), &w, 32, k, n));
+        for m in [9, 16, 17, 31] {
+            let got = g.download(&g.linear(&g.upload(&x[..m * k]), &w, m, k, n));
+            assert_eq!(got, all[..m * n], "{m} rows vs 32");
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_q4_small_gemm_rows_are_batch_invariant() {
+        on_gpu(|g| q4_small_gemm_rows_are_batch_invariant(g));
     }
 
     /// Timings of the small-k kernels (not a check) for a model shape
