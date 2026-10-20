@@ -423,13 +423,39 @@ impl ResidentCache {
         n_slots: usize,
         n_scratch: usize,
         ranking: impl IntoIterator<Item = u32>,
+        fill: impl FnMut(u32, &mut [u8]),
+    ) -> Result<Self> {
+        Self::new_fill_masked(
+            gpu,
+            geo,
+            params,
+            n_slots,
+            n_scratch,
+            ranking,
+            |_| true,
+            fill,
+        )
+    }
+
+    /// [`new_fill`](Self::new_fill) with never-routed padding keys (`live(key) == false`)
+    /// sharing one host blob, filled once; see [`ResidentPolicy::new_masked`]. TEMPORARY, for
+    /// the 256-expert Coder on the fixed 512-expert geometry (goes with PR #79).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_fill_masked(
+        gpu: &Gpu,
+        geo: Geometry,
+        params: AdaptParams,
+        n_slots: usize,
+        n_scratch: usize,
+        ranking: impl IntoIterator<Item = u32>,
+        live: impl Fn(u32) -> bool,
         mut fill: impl FnMut(u32, &mut [u8]),
     ) -> Result<Self> {
         use crate::arena::ArenaOptions;
         use crate::resident::{Loc, ResidentPolicy};
         gpu.bind()?;
         let blob = geo.blob_bytes;
-        let policy = ResidentPolicy::new(geo, n_slots, n_scratch, params, ranking);
+        let policy = ResidentPolicy::new_masked(geo, n_slots, n_scratch, params, ranking, &live);
         let mut host = HostArena::new(policy.host_slots().max(1) * blob, ArenaOptions::default())
             .map_err(|e| crate::gpu::Error(format!("mmap: {e}")))?;
         host.register(&gpu.ctx, &[1 << 30, 256 << 20])?;
@@ -442,6 +468,7 @@ impl ResidentCache {
                     fill(k, &mut stage);
                     vram.write(s as usize * blob, &stage)?
                 }
+                Loc::Host(_) if !live(k) => {} // shared padding blob: the arena's zeros
                 Loc::Host(h) => {
                     let hb = unsafe { host.bytes_mut() };
                     fill(k, &mut hb[h as usize * blob..(h as usize + 1) * blob]);

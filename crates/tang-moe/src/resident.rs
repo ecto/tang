@@ -91,6 +91,23 @@ impl ResidentPolicy {
         params: AdaptParams,
         ranking: impl IntoIterator<Item = u32>,
     ) -> Self {
+        Self::new_masked(geo, n_slots, n_scratch, params, ranking, |_| true)
+    }
+
+    /// [`new`](Self::new), but keys with `live(key) == false` (padding that is never routed)
+    /// all share one host slot instead of getting a slot each, so they cost one blob of host
+    /// memory in total. Keep them out of `ranking`.
+    ///
+    /// TEMPORARY: exists for the 256-expert Flash-Next Coder padded to the engine's fixed
+    /// 512-expert geometry; goes away once the Flash geometry is a runtime value (PR #79).
+    pub fn new_masked(
+        geo: Geometry,
+        n_slots: usize,
+        n_scratch: usize,
+        params: AdaptParams,
+        ranking: impl IntoIterator<Item = u32>,
+        live: impl Fn(u32) -> bool,
+    ) -> Self {
         let mut lfu = CachePolicy::new(geo, n_slots, params);
         let fills = lfu.seed(ranking);
         for f in &fills {
@@ -99,9 +116,14 @@ impl ResidentPolicy {
         lfu.drain_dirty();
         let mut loc = vec![Loc::Host(0); geo.keys()];
         let mut h = 0u32;
+        let mut dead = None;
         for (k, l) in loc.iter_mut().enumerate() {
             *l = match lfu.slot_of(k as u32) {
                 Some(s) => Loc::Slot(s),
+                None if !live(k as u32) => Loc::Host(*dead.get_or_insert_with(|| {
+                    h += 1;
+                    h - 1
+                })),
                 None => {
                     h += 1;
                     Loc::Host(h - 1)
@@ -119,12 +141,16 @@ impl ResidentPolicy {
         }
     }
 
-    /// Host slots needed: one per key not seeded into VRAM.
+    /// Host slots needed: one per key not seeded into VRAM (keys sharing a slot count once).
     pub fn host_slots(&self) -> usize {
         self.loc
             .iter()
-            .filter(|l| matches!(l, Loc::Host(_)))
-            .count()
+            .filter_map(|l| match l {
+                Loc::Host(h) => Some(*h as usize + 1),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     pub fn loc(&self, key: u32) -> Loc {
@@ -391,5 +417,30 @@ mod tests {
     #[test]
     fn works_with_a_single_scratch_slot() {
         run(99, 1);
+    }
+
+    #[test]
+    fn masked_keys_share_one_host_slot() {
+        let geo = Geometry {
+            layers: 2,
+            experts: 32,
+            blob_bytes: 1,
+        };
+        // Experts 16..32 of each layer are padding.
+        let live = |k: u32| k % 32 < 16;
+        let p = ResidentPolicy::new_masked(
+            geo,
+            4,
+            1,
+            AdaptParams::default(),
+            (0..64).filter(|&k| live(k)),
+            live,
+        );
+        // 32 live keys, 4 in VRAM, 28 on the host, plus one shared padding slot.
+        assert_eq!(p.host_slots(), 29);
+        let dead: Vec<Loc> = (0..64).filter(|&k| !live(k)).map(|k| p.loc(k)).collect();
+        assert!(dead
+            .iter()
+            .all(|&l| l == dead[0] && matches!(l, Loc::Host(_))));
     }
 }

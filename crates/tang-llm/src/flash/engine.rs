@@ -661,9 +661,20 @@ impl Engine {
         let g = Gguf::open(path)?;
         let hp = Hparams::from_gguf(&g)?;
         ensure!(
-            hp.n_embd == HIDDEN && hp.n_layer == 48 && hp.hc == HC && hp.n_expert == EXPERTS,
+            hp.n_embd == HIDDEN
+                && hp.n_layer == 48
+                && hp.hc == HC
+                && (hp.n_expert_used..=EXPERTS).contains(&hp.n_expert),
             "not the Flash-Next geometry the kernels are built for"
         );
+        // TEMPORARY: an expert-pruned model (ISTA's 256-expert Coder) runs on the fixed
+        // 512-expert geometry. Its router is padded with zero rows and its experts.bin with a
+        // hole (`pack`), top-k only sees the first `n_expert` logits, and the padding keys
+        // share one zero host blob. Remove once PR #79 makes the geometry a runtime value.
+        let n_live = hp.n_expert;
+        if n_live < EXPERTS {
+            eprintln!("flash: {n_live} of {EXPERTS} experts per layer (pruned model, padded)");
+        }
         let plep = hp.ple.clone().context("no PLE block")?;
         let dir = pack::cache_dir(path)?;
         let warm = dir
@@ -1150,8 +1161,8 @@ impl Engine {
                 let (free, _) = gpu.mem_info().map_err(|e| anyhow!("{e}"))?;
                 let budget = free.saturating_sub((opts.reserve_mb + mtp_reserve) << 20);
                 let fit = (budget / blob).saturating_sub(opts.scratch_slots);
-                let n_slots = opts.slots.unwrap_or(fit).min(fit).min(geo.keys());
-                let ranking = Self::ranking(opts.profile.as_deref(), hp.n_layer)?;
+                let n_slots = opts.slots.unwrap_or(fit).min(fit).min(hp.n_layer * n_live);
+                let ranking = Self::ranking(opts.profile.as_deref(), hp.n_layer, n_live)?;
                 let ef = std::fs::File::open(&experts_path)?;
                 let mut done = 0u64;
                 let fill = |key: u32, dst: &mut [u8]| {
@@ -1181,13 +1192,14 @@ impl Engine {
                         ..AdaptParams::default()
                     }
                 };
-                let rc = tang_moe::cache::ResidentCache::new_fill(
+                let rc = tang_moe::cache::ResidentCache::new_fill_masked(
                     &gpu,
                     geo,
                     params,
                     n_slots,
                     opts.scratch_slots,
                     ranking,
+                    |k| (k as usize % EXPERTS) < n_live,
                     fill,
                 )
                 .map_err(|e| anyhow!("{e}"))?;
@@ -1234,7 +1246,7 @@ impl Engine {
             (n_slots * blob) as f64 / 1e9,
             if opts.experts == ExpertMode::Cache { opts.scratch_slots } else { 0 },
             if opts.experts == ExpertMode::Cache {
-                ((geo.keys() - n_slots) * blob) as f64 / 1e9
+                ((hp.n_layer * n_live - n_slots) * blob) as f64 / 1e9
             } else {
                 0.0
             },
@@ -1315,8 +1327,8 @@ impl Engine {
 
     /// Hottest first: a saved profile's order, then (and without one) layer-uniform order so
     /// every layer gets the same share of slots.
-    fn ranking(profile: Option<&Path>, n_layer: usize) -> Result<Vec<u32>> {
-        let uniform: Vec<u32> = (0..EXPERTS)
+    fn ranking(profile: Option<&Path>, n_layer: usize, n_live: usize) -> Result<Vec<u32>> {
+        let uniform: Vec<u32> = (0..n_live)
             .flat_map(|e| (0..n_layer).map(move |l| (l * EXPERTS + e) as u32))
             .collect();
         let Some(p) = profile else {
@@ -1718,7 +1730,8 @@ impl Engine {
         dev.moe_route_into(
             &s.logits,
             ROUTER_ROWS,
-            EXPERTS,
+            // Live experts only: a pruned model's padding rows (TEMPORARY, see `Engine::load`).
+            self.hp.n_expert,
             None,
             &self.tables[l],
             0,

@@ -21,7 +21,7 @@ use crate::gguf::{GgmlType, Gguf, TensorInfo};
 use anyhow::{bail, ensure, Context, Result};
 use rayon::prelude::*;
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 use tang_compute::flash::shape::*;
 use tang_compute::flash::{self as fl, ExpertBlob};
@@ -576,6 +576,13 @@ fn run_job_plain(g: &Gguf, job: &Job) -> Result<(Fmt, usize, usize, Vec<u8>)> {
                 k = tk;
                 n += tn;
                 out.extend(bf16_of(g, t)?);
+                // TEMPORARY (expert-pruned Coder, until PR #79 makes the geometry a runtime
+                // value): a router with fewer than 512 experts gets zero rows up to 512, so the
+                // shared gate stays at row 512. The engine only top-k's the live experts.
+                if name.ends_with(".ffn_gate_inp.weight") && tn < EXPERTS {
+                    out.resize(out.len() + (EXPERTS - tn) * tk * 2, 0);
+                    n = n - tn + EXPERTS;
+                }
             }
             (Fmt::Bf16, n, k, out)
         }
@@ -727,6 +734,7 @@ pub fn experts(g: &Gguf, dir: &Path, n_layer: usize) -> Result<PathBuf> {
         .iter()
         .map(std::fs::File::open)
         .collect::<std::io::Result<_>>()?;
+    let mut live = EXPERTS;
     for l in 0..n_layer {
         let mut raw: Vec<Vec<u8>> = Vec::new();
         for s in ["gate", "up", "down"] {
@@ -734,6 +742,8 @@ pub fn experts(g: &Gguf, dir: &Path, n_layer: usize) -> Result<PathBuf> {
             if t.ty != GgmlType::Q2_0 {
                 bail!("{}: {:?} experts (only Q2_0 is supported)", t.name, t.ty);
             }
+            live = t.dims[2] as usize;
+            ensure!(live <= EXPERTS, "{}: {live} experts", t.name);
             let mut b = vec![0u8; t.nbytes as usize];
             pread(&shards[t.shard], t.offset, &mut b)?;
             drop_cache(&shards[t.shard], t.offset, t.nbytes);
@@ -741,7 +751,7 @@ pub fn experts(g: &Gguf, dir: &Path, n_layer: usize) -> Result<PathBuf> {
         }
         let per_gu = fl::q2_bytes(FF, HIDDEN);
         let per_d = fl::q2_bytes(HIDDEN, FF);
-        let blobs: Vec<Vec<u8>> = (0..EXPERTS)
+        let blobs: Vec<Vec<u8>> = (0..live)
             .into_par_iter()
             .map(|e| {
                 ExpertBlob::from_gguf(
@@ -754,6 +764,11 @@ pub fn experts(g: &Gguf, dir: &Path, n_layer: usize) -> Result<PathBuf> {
         for b in &blobs {
             out.write_all(b)?;
         }
+        // TEMPORARY (pruned Coder, until PR #79): experts past `live` are never routed; leave
+        // them as a hole in the file (zeros, no disk) so keys stay `layer · 512 + expert`.
+        out.seek(std::io::SeekFrom::Start(
+            ((l + 1) * EXPERTS * ExpertBlob::BYTES) as u64,
+        ))?;
         out.flush()?;
         let done = ((l + 1) * EXPERTS * ExpertBlob::BYTES) as u64;
         drop_cache(&out, 0, done);
@@ -765,6 +780,7 @@ pub fn experts(g: &Gguf, dir: &Path, n_layer: usize) -> Result<PathBuf> {
             );
         }
     }
+    out.set_len(want)?;
     out.sync_all()?;
     drop_cache(&out, 0, want);
     drop(out);
