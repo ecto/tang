@@ -251,7 +251,8 @@ pub fn encode_candidate_f32(
         }
         Candidate::Interp => match cfg.bound {
             codec::ErrorBound::MaxAbs(b) => interp::encode_f32(x, dims, b),
-            _ => panic!("interp codes max-abs bounds only"),
+            codec::ErrorBound::Rmse(r) => interp::encode_rmse_f32(x, dims, r),
+            codec::ErrorBound::Psnr(p) => interp::encode_psnr_f32(x, dims, p),
         },
         Candidate::QttSparse => {
             let mut q = codec::Config::new(cfg.bound);

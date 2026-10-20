@@ -88,8 +88,18 @@ graph above is untouched.
   storage (`Elem`), widened on load and packed 4 per `u32` word.
 - **Ops:** wrapping `+ − ×`, `MulHi` (so `mul_wide` gives the exact 64-bit
   product as `(lo, hi)`), `& | ^ ! <<`, and `>>` (arithmetic on `i32`).
-  Shift amounts are taken mod 32. Also `min`/`max`/`clamp`, `== != < <=`,
-  `select`, `bitcast`, and read-only `load`.
+  Shift amounts are taken mod 32. Also `min`/`max`/`clamp`, `div`/`rem`
+  (WGSL semantics), `clz`, `== != < <=`, `select`, `bitcast`, and
+  read-only `load`.
+- **Scratch buffers:** `buffer_rw(name, elem, len, base)` declares a small
+  fixed-length read-write array (in WGSL, `name[base + i]` with `base` a host
+  expression, e.g. a workgroup array slice). `load_rw` and `store` thread an
+  effect token (`token()`, and each `store` returns the next one), so data
+  dependencies order the effects. Scratch loads and stores are never inlined
+  or moved: every backend runs them in the one shared schedule order, so
+  their results agree across backends for any graph. Out-of-range loads read
+  0 and out-of-range stores are dropped. tang-compress uses this for the
+  per-lane adaptive probability maps of its learned rANS coder.
 - **Loops:** `while_loop(init, |g, s| (cond, next))` is structured SSA, like
   MLIR `scf.while`, with `for_range` as sugar. A loop's states are
   `State(l, k)` nodes and its results are `LoopOut(l, k)` nodes. Loops nest,
@@ -118,13 +128,13 @@ the CPU decoder evaluate the same graph through `Program`.
 
 **Not yet covered**, but needed to generate the whole rANS lane-decode
 kernel:
-- Stores and scatter into storage buffers.
-- Workgroup memory, barriers and `workgroupUniformLoad`.
+- Stores and scatter into storage buffers (only lane-local scratch
+  buffers exist).
+- Barriers and `workgroupUniformLoad`.
 - Side effects ordered with loops, for example a data-dependent word fetch
   that advances a stream pointer. This can be expressed today as loop state
   plus `load`, but there is no write-back.
 - Kernel entry points and bindings.
-- `firstLeadingBit` and integer division.
 - A C lowering, which would need unsigned casts to avoid signed-overflow UB.
 
 ## Design
