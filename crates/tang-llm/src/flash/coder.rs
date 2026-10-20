@@ -62,6 +62,35 @@ impl Default for CoderOpts {
 
 /// `TANG_CODER_GEMV=v1`: dense GEMVs on `fe_gemv8` (two rows a warp) instead of the K-split
 /// `cx_gemvk` (A/B).
+fn env_is(key: &str, val: &str) -> bool {
+    std::env::var(key).is_ok_and(|v| v == val)
+}
+
+/// Kernel variants for A/B on one build (defaults are the measured winners):
+/// `TANG_CODER_EXROWS=4` expert rows a warp (default 2), `TANG_CODER_SILU=sep` a separate
+/// SiLU+int8 launch (default fused into the down kernel), `TANG_CODER_KQ=8` warps a row in
+/// the K-split GEMV (default 4).
+#[derive(Clone, Copy, Debug)]
+struct Variants {
+    exrows: usize,
+    silu_sep: bool,
+    kq: usize,
+}
+
+impl Variants {
+    fn from_env() -> Self {
+        Variants {
+            exrows: if env_is("TANG_CODER_EXROWS", "4") {
+                4
+            } else {
+                2
+            },
+            silu_sep: env_is("TANG_CODER_SILU", "sep"),
+            kq: if env_is("TANG_CODER_KQ", "8") { 8 } else { 4 },
+        }
+    }
+}
+
 fn gemv_v1() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("TANG_CODER_GEMV").is_ok_and(|v| v == "v1"))
@@ -176,6 +205,10 @@ struct Kern {
     q8: Fun,
     gemv8: [Fun; MAX_T],
     gemvk: [Fun; MAX_T],
+    gemvk8: [Fun; MAX_T],
+    moe_gu4: Fun,
+    moe_down_f2: Fun,
+    moe_down_f4: Fun,
     norm_q8: Fun,
     route: Fun,
     moe_gu: Fun,
@@ -271,6 +304,9 @@ pub struct Coder {
     pub load_report: String,
     /// `TANG_CODER_PROF=1` (eager windows): GPU time per stage, by name, summed.
     prof: Option<std::cell::RefCell<Prof>>,
+    /// Stage sweep: enqueue only this stage's launches (`stage_sweep`).
+    only: std::cell::Cell<Option<&'static str>>,
+    var: Variants,
 }
 
 #[derive(Default)]
@@ -557,6 +593,16 @@ impl Coder {
             q8: f(&cm, "fe_q8")?,
             gemv8,
             gemvk,
+            gemvk8: {
+                let mut a = [std::ptr::null_mut(); MAX_T];
+                for (i, slot) in a.iter_mut().enumerate() {
+                    *slot = f(&cm, &format!("cx_gemvk8_t{}", i + 1))?;
+                }
+                a
+            },
+            moe_gu4: f(&cm, "cx_moe_gu_r4")?,
+            moe_down_f2: f(&cm, "cx_moe_down_f2")?,
+            moe_down_f4: f(&cm, "cx_moe_down_f4")?,
             norm_q8: f(&cm, "cx_norm_q8")?,
             route: f(&cm, "cx_route")?,
             moe_gu: f(&cm, "cx_moe_gu")?,
@@ -573,6 +619,25 @@ impl Coder {
             argmax2: f(&em, "fe_argmax2")?,
             _mods: vec![cm, fm, em],
         };
+        for f in [
+            k.moe_gu,
+            k.moe_gu4,
+            k.moe_down,
+            k.moe_down_f2,
+            k.moe_down_f4,
+        ] {
+            unsafe {
+                gpu::check(
+                    cudarc::driver::sys::cuFuncSetAttribute(
+                        f,
+                        cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        200 * 1024,
+                    ),
+                    "cuFuncSetAttribute",
+                )
+                .map_err(|e| anyhow!("{e}"))?;
+            }
+        }
         let t_kernels = t2.elapsed().as_secs_f64();
 
         let mut io = Io {
@@ -632,6 +697,8 @@ impl Coder {
             prof: std::env::var("TANG_CODER_PROF")
                 .is_ok_and(|v| v == "1")
                 .then(|| std::cell::RefCell::new(Prof::default())),
+            only: std::cell::Cell::new(None),
+            var: Variants::from_env(),
         })
     }
 
@@ -659,6 +726,9 @@ impl Coder {
         block: u32,
         args: &mut [*mut std::ffi::c_void],
     ) {
+        if self.skip(self.kname(f)) {
+            return;
+        }
         gpu::launch(f, grid, (block, 1, 1), 0, &self.stream, args).expect("launch");
         if self.prof.is_some() {
             self.mark(self.kname(f));
@@ -673,10 +743,18 @@ impl Coder {
         smem: u32,
         args: &mut [*mut std::ffi::c_void],
     ) {
+        if self.skip(self.kname(f)) {
+            return;
+        }
         gpu::launch(f, grid, (block, 1, 1), smem, &self.stream, args).expect("launch");
         if self.prof.is_some() {
             self.mark(self.kname(f));
         }
+    }
+
+    /// Stage sweep: is `name` filtered out?
+    fn skip(&self, name: &'static str) -> bool {
+        self.only.get().is_some_and(|o| o != name)
     }
 
     fn kname(&self, f: Fun) -> &'static str {
@@ -687,6 +765,9 @@ impl Coder {
             (k.moe_gu, "moe_gu"),
             (k.silu_q, "silu_q"),
             (k.moe_down, "moe_down"),
+            (k.moe_down_f2, "moe_down"),
+            (k.moe_down_f4, "moe_down"),
+            (k.moe_gu4, "moe_gu"),
             (k.moe_add_norm, "moe_add_norm"),
             (k.prep, "attn_prep"),
             (k.part, "attn_part"),
@@ -770,6 +851,9 @@ impl Coder {
         t: usize,
         ostride: usize,
     ) {
+        if self.skip(name) {
+            return;
+        }
         let (sp, ns, os, r16, ki) = (self.a(&w.segs), w.nseg, ostride as i32, w.row16, w.k as i32);
         let xq = match xq {
             Some(q) => q,
@@ -789,11 +873,17 @@ impl Coder {
                 q
             }
         };
-        if w.k.is_multiple_of(1024) && !gemv_v1() {
+        let kq = self.var.kq;
+        if w.k.is_multiple_of(kq * 256) && !gemv_v1() {
+            let f = if kq == 8 {
+                self.k.gemvk8[t - 1]
+            } else {
+                self.k.gemvk[t - 1]
+            };
             unsafe {
                 gpu::launch(
-                    self.k.gemvk[t - 1],
-                    (w.rows.div_ceil(2) as u32, 1, 1),
+                    f,
+                    (w.rows.div_ceil(8 / kq) as u32, 1, 1),
                     (256, 1, 1),
                     0,
                     &self.stream,
@@ -1007,26 +1097,45 @@ impl Coder {
                 32,
                 tang_moe::args![lg, lsi, ids, w, scale],
             );
+            let rg = self.var.exrows as u32;
             self.launch_smem(
-                self.k.moe_gu,
-                ((2 * ff / 16) as u32, np, 1),
+                if rg == 4 {
+                    self.k.moe_gu4
+                } else {
+                    self.k.moe_gu
+                },
+                ((2 * ff) as u32 / (8 * rg), np, 1),
                 256,
-                (16 * 16 * r16g) as u32,
+                8 * rg * 16 * r16g as u32,
                 tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti, r16g],
             );
-            self.launch(
-                self.k.silu_q,
-                ((ff / 32) as u32, np, 1),
-                32,
-                tang_moe::args![egu, hq],
-            );
-            self.launch_smem(
-                self.k.moe_down,
-                ((n / 16) as u32, np, 1),
-                256,
-                (16 * 16 * r16d) as u32,
-                tang_moe::args![dw, sd, ids, hq, parts, ti, r16d],
-            );
+            if self.var.silu_sep {
+                self.launch(
+                    self.k.silu_q,
+                    ((ff / 32) as u32, np, 1),
+                    32,
+                    tang_moe::args![egu, hq],
+                );
+                self.launch_smem(
+                    self.k.moe_down,
+                    ((n / 16) as u32, np, 1),
+                    256,
+                    (16 * 16 * r16d) as u32,
+                    tang_moe::args![dw, sd, ids, hq, parts, ti, r16d],
+                );
+            } else {
+                self.launch_smem(
+                    if rg == 4 {
+                        self.k.moe_down_f4
+                    } else {
+                        self.k.moe_down_f2
+                    },
+                    (n as u32 / (8 * rg), np, 1),
+                    256,
+                    8 * rg * 16 * r16d as u32,
+                    tang_moe::args![dw, sd, ids, egu, parts, ti, r16d],
+                );
+            }
             self.launch(
                 self.k.moe_add_norm,
                 (t as u32, 1, 1),
@@ -1322,6 +1431,148 @@ impl Coder {
         Ok(a.iter()
             .map(|x| x.as_str().unwrap_or("").to_string())
             .collect())
+    }
+
+    /// Time each stage of a T=1 window alone: a graph of that stage's launches for every layer
+    /// (the window with every other launch filtered out), replayed back to back. Returns
+    /// (stage, µs a step, bytes a step), the whole window first. Run after a decode (the
+    /// routing buffers then hold real expert ids).
+    pub fn stage_sweep(&mut self) -> Result<Vec<(&'static str, f64, f64)>> {
+        ensure!(!self.tokens.is_empty(), "decode something first");
+        let pos0 = self.tokens.len() - 1;
+        self.stage(pos0, 1)?;
+        let nchunk = self.nchunk(pos0 + 1);
+        self.enqueue_window(1, false, nchunk, None)?;
+        self.dev.sync();
+        let hp = &self.hp;
+        let lb = |f: &dyn Fn(&Layer) -> f64| -> f64 { self.layers.iter().map(f).sum() };
+        let ex = |e: &Experts, n: usize| e.w.estride as f64 * n as f64;
+        let k = hp.n_expert_used;
+        let stages: Vec<(&'static str, f64)> = vec![
+            ("", self.step_bytes(pos0 + 1)),
+            (
+                "gdn_in",
+                lb(&|l| {
+                    if l.gdn.is_some() {
+                        dense_bytes(&l.w_in)
+                    } else {
+                        0.0
+                    }
+                }),
+            ),
+            ("gdn_conv_step", 0.0),
+            ("gdn_commit", 0.0),
+            (
+                "gdn_out",
+                lb(&|l| {
+                    if l.gdn.is_some() {
+                        dense_bytes(&l.w_out)
+                    } else {
+                        0.0
+                    }
+                }),
+            ),
+            (
+                "attn_in",
+                lb(&|l| {
+                    if l.attn.is_some() {
+                        dense_bytes(&l.w_in)
+                    } else {
+                        0.0
+                    }
+                }),
+            ),
+            ("attn_prep", 0.0),
+            (
+                "attn_part",
+                lb(&|l| {
+                    if l.attn.is_some() {
+                        (pos0 * hp.n_head_kv * hp.head_dim * 4) as f64
+                    } else {
+                        0.0
+                    }
+                }),
+            ),
+            ("attn_merge", 0.0),
+            (
+                "attn_out",
+                lb(&|l| {
+                    if l.attn.is_some() {
+                        dense_bytes(&l.w_out)
+                    } else {
+                        0.0
+                    }
+                }),
+            ),
+            ("norm_q8", 0.0),
+            ("router", lb(&|l| dense_bytes(&l.router))),
+            ("route", 0.0),
+            (
+                "moe_gu",
+                lb(&|l| ex(&l.gate, k) + ex(&l.up, k) + ex(&l.sh_gate, 1) + ex(&l.sh_up, 1)),
+            ),
+            ("silu_q", 0.0),
+            ("moe_down", lb(&|l| ex(&l.down, k) + ex(&l.sh_down, 1))),
+            ("moe_add_norm", 0.0),
+            ("head", dense_bytes(&self.head)),
+            ("argmax", 0.0),
+        ];
+        const REPS: usize = 4;
+        const RUNS: usize = 10;
+        let mut out = Vec::new();
+        for (name, bytes) in stages {
+            self.only
+                .set(if name.is_empty() { None } else { Some(name) });
+            let stream = ManuallyDrop::new(Stream(self.dev.cu_stream()));
+            let me = self as *const Self;
+            let gr = Graph::capture(&stream, |_| {
+                for _ in 0..REPS {
+                    // SAFETY: `self` is not otherwise touched during capture.
+                    unsafe { &*me }
+                        .enqueue_window(1, false, nchunk, None)
+                        .map_err(|e| tang_moe::gpu::Error(format!("{e}")))?;
+                }
+                Ok(())
+            });
+            self.only.set(None);
+            let gr = gr.map_err(|e| anyhow!("capture {name}: {e}"))?;
+            gr.launch(&self.stream).map_err(|e| anyhow!("{e}"))?;
+            let (e0, e1) = (
+                gpu::Event::new(true).map_err(|e| anyhow!("{e}"))?,
+                gpu::Event::new(true).map_err(|e| anyhow!("{e}"))?,
+            );
+            e0.record(&self.stream).map_err(|e| anyhow!("{e}"))?;
+            for _ in 0..RUNS {
+                gr.launch(&self.stream).map_err(|e| anyhow!("{e}"))?;
+            }
+            e1.record(&self.stream).map_err(|e| anyhow!("{e}"))?;
+            e1.sync().map_err(|e| anyhow!("{e}"))?;
+            let us = e1.since(&e0).map_err(|e| anyhow!("{e}"))? as f64 * 1e3 / (REPS * RUNS) as f64;
+            out.push((if name.is_empty() { "window" } else { name }, us, bytes));
+        }
+        Ok(out)
+    }
+
+    /// Switch kernel variants (`exrows=4`, `silu=sep`, `kq=8`, comma-separated; empty for the
+    /// defaults) and drop the captured graphs.
+    pub fn set_variants(&mut self, spec: &str) -> Result<()> {
+        let mut v = Variants {
+            exrows: 2,
+            silu_sep: false,
+            kq: 4,
+        };
+        for kv in spec.split(',').filter(|x| !x.is_empty()) {
+            match kv {
+                "exrows=4" => v.exrows = 4,
+                "silu=sep" => v.silu_sep = true,
+                "kq=8" => v.kq = 8,
+                _ => anyhow::bail!("unknown variant {kv}"),
+            }
+        }
+        self.var = v;
+        self.dev.sync();
+        self.graphs.clear();
+        Ok(())
     }
 
     /// Bytes one decode step reads from VRAM at context `ctx`: every dense weight, the

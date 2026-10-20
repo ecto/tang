@@ -1213,8 +1213,121 @@ fn bench_coder(a: &Args, ids: &[u32]) -> Result<()> {
             .collect::<Vec<_>>()
             .join(" ")
     );
+    if std::env::var("TANG_CODER_STAGES").is_ok_and(|v| v == "1") {
+        let st = e.stage_sweep()?;
+        let win = st[0].1;
+        println!("  stages (T=1 graph replay of each stage alone, µs a step; GB/s achieved):");
+        for (name, us, bytes) in &st {
+            println!(
+                "    {name:14} {us:8.1} µs {:5.1}%  {}",
+                100.0 * us / win,
+                if *bytes > 0.0 {
+                    format!("{:6.0} GB/s", bytes / us / 1e3)
+                } else {
+                    String::new()
+                }
+            );
+        }
+        let sum: f64 = st[1..].iter().map(|x| x.1).sum();
+        println!("    (sum of stages {sum:.1} µs vs window {win:.1} µs)");
+    }
     if let Some(r) = e.prof_report() {
         println!("  GPU time by stage (TANG_CODER_PROF, eager):\n{r}");
+    }
+    Ok(())
+}
+
+/// `flash-aa`: Artificial-Analysis-style decode speed for a qwen3next model with one load.
+/// For each `--ids-file` prompt (comma-separated list), `-n` output tokens, drafts off and
+/// suffix: output tok/s after the first token. Then, on the first prompt without drafts, each
+/// kernel variant in `TANG_CODER_AB` (`;`-separated specs, see `Coder::set_variants`), and with
+/// `TANG_CODER_STAGES=1` the stage sweep. `--out DIR` saves each run's ids.
+pub fn aa(args: &[String]) -> Result<()> {
+    let mut it: Vec<String> = Vec::new();
+    let mut files = Vec::new();
+    let mut k = 0;
+    while k < args.len() {
+        if args[k] == "--ids-files" {
+            files = args[k + 1].split(',').map(String::from).collect::<Vec<_>>();
+            k += 2;
+        } else {
+            it.push(args[k].clone());
+            k += 1;
+        }
+    }
+    let mut a = parse(&it)?;
+    ensure!(!files.is_empty(), "--ids-files A,B,..");
+    a.opts.max_ctx = a.opts.max_ctx.max(4096);
+    let mut e = load_coder(&a)?;
+    let mut row = |e: &mut Coder, name: &str, ids: &[u32], draft: &str| -> Result<f64> {
+        let (out, _, prefill_s, secs, sp) = decode_spec(e, ids, a.n, a.chunk, draft)?;
+        let tps = sp.tokens as f64 / secs;
+        println!(
+            "  {name:12} prompt {:5} drafts {draft:7} {tps:7.1} tok/s  ({} tokens/window, prefill {:.2} s)",
+            ids.len(),
+            format!("{:.2}", sp.tokens as f64 / sp.windows.max(1) as f64),
+            prefill_s
+        );
+        if let Some(d) = &a.out {
+            std::fs::create_dir_all(d)?;
+            std::fs::write(
+                d.join(format!("{name}.{draft}.out")),
+                out.iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )?;
+        }
+        Ok(tps)
+    };
+    println!("flash-aa: {} output tokens a prompt, single stream", a.n);
+    let mut prompts = Vec::new();
+    for f in &files {
+        let name = Path::new(f)
+            .file_stem()
+            .map_or(f.clone(), |s| s.to_string_lossy().into_owned());
+        prompts.push((name, read_ids(f)?));
+    }
+    for (name, ids) in &prompts {
+        for draft in ["none", "suffix"] {
+            row(&mut e, name, ids, draft)?;
+        }
+    }
+    let ab = std::env::var("TANG_CODER_AB").unwrap_or_default();
+    if !ab.is_empty() {
+        println!("kernel variants (first prompt, no drafts):");
+        for spec in std::iter::once("").chain(ab.split(';')) {
+            e.set_variants(spec)?;
+            let (name, ids) = &prompts[0];
+            // one untimed run captures the graphs
+            decode_spec(&mut e, ids, 16, a.chunk, "none")?;
+            print!("  [{:>16}]", if spec.is_empty() { "default" } else { spec });
+            row(&mut e, name, ids, "none")?;
+        }
+        e.set_variants("")?;
+    }
+    if std::env::var("TANG_CODER_STAGES").is_ok_and(|v| v == "1") {
+        let (_, ids) = &prompts[0];
+        decode_spec(&mut e, ids, 64, a.chunk, "none")?;
+        let st = e.stage_sweep()?;
+        let win = st[0].1;
+        println!(
+            "stages at context {} (T=1, each stage alone in a graph, µs a step):",
+            ids.len() + 64
+        );
+        for (name, us, bytes) in &st {
+            println!(
+                "  {name:14} {us:8.1} µs {:5.1}%  {}",
+                100.0 * us / win,
+                if *bytes > 0.0 {
+                    format!("{:6.0} GB/s", bytes / us / 1e3)
+                } else {
+                    String::new()
+                }
+            );
+        }
+        let sum: f64 = st[1..].iter().map(|x| x.1).sum();
+        println!("  (sum of stages {sum:.1} µs vs window {win:.1} µs)");
     }
     Ok(())
 }
