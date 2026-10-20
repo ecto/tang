@@ -44,6 +44,11 @@ mod imp {
     pub struct Trace;
 
     impl Trace {
+        /// No trace (a request that wasn't received over HTTP).
+        #[inline(always)]
+        pub fn none() -> Self {
+            Trace
+        }
         #[inline(always)]
         pub fn incoming(_: &HeaderMap, _: &str, _: &str, _: Option<&str>) -> Self {
             Trace
@@ -242,6 +247,11 @@ mod imp {
     }
 
     impl Trace {
+        /// No trace (a request that wasn't received over HTTP).
+        pub fn none() -> Self {
+            Trace(None)
+        }
+
         pub fn incoming(
             headers: &HeaderMap,
             priority: &str,

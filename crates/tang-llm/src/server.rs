@@ -1930,7 +1930,7 @@ mod tests {
                 "m".into(),
                 None,
                 Some("rid".into()),
-                Trace::default(),
+                Trace::none(),
             );
             let took = t.elapsed();
             drop(worker);
