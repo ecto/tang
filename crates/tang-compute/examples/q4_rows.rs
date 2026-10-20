@@ -1,10 +1,20 @@
 //! Q4 `linear` at a few rows (speculative-decoding verify) vs one: time and agreement.
-//! `cargo run --release --example q4_rows --features metal [K N]...`
+//! `cargo run --release --example q4_rows --features metal [K N]...` (or
+//! `--no-default-features --features cuda`).
 use std::time::Instant;
-use tang_compute::{ComputeDevice, MetalDevice};
+use tang_compute::ComputeDevice;
 
 fn main() {
-    let dev = MetalDevice::new().expect("metal");
+    #[cfg(feature = "metal")]
+    let dev = tang_compute::MetalDevice::new().expect("metal");
+    #[cfg(all(feature = "cuda", not(feature = "metal")))]
+    let dev = tang_compute::CudaComputeDevice::new().expect("cuda");
+    #[cfg(not(any(feature = "metal", feature = "cuda")))]
+    let dev = tang_compute::CpuDevice::new();
+    run(&dev);
+}
+
+fn run<D: ComputeDevice>(dev: &D) {
     let args: Vec<usize> = std::env::args()
         .skip(1)
         .filter_map(|a| a.parse().ok())
@@ -61,8 +71,9 @@ fn main() {
             }
             let gbs = (n * k / 2) as f64 / us / 1e3;
             println!(
-                "K={k:6} N={n:6} m={m}: {us:8.1} us  {:.2}x  {gbs:6.0} GB/s  max|d| {err:.2e}",
-                us / base
+                "K={k:6} N={n:6} m={m}: {us:8.1} us  {:.2}x  {gbs:6.0} GB/s  max|d| {err:.2e}{}",
+                us / base,
+                if err == 0.0 { "  exact" } else { "" }
             );
         }
     }

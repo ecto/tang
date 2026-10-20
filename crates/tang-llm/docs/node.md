@@ -35,6 +35,13 @@ machine that runs `tang-llm serve`. All of it sits behind the same API key as `/
           "prefill_tok_s": 794.9, "prefill_samples": 2,
           "decode_tok_s": 352.4, "decode_samples": 1
         },
+        "step_cost": {
+          "model": "secs = a + f*decode_rows + sum over prefill chunks of (g + b*q + d*q*c + e*q^2), …",
+          "a": 8.6, "f": 1.1,
+          "small": { "g": 18.8, "b": 539, "d": 317, "e": 0 },
+          "large": { "g": 96.6, "b": 795, "d": 357, "e": 0 },
+          "samples": 1890
+        },
         "kv": {
           "block_positions": 256,
           "memory_blocks": ["09cc3dc1a601afcb", "41c5f0e12cfd940c", "…"],
@@ -174,8 +181,11 @@ work is mostly prefill-only warming), and a prompt with images is prefilled in o
   tokenizes (one tokenizer per model family), or a node endpoint answers "how much of this
   prompt do you hold" for a candidate prompt.
 - **Rates vary with length.** Prefill tok/s falls as the context grows (attention is
-  quadratic), and short prefills are overhead-bound. One EMA mixes them; the scheduler may want
-  rates bucketed by context length, or a fitted cost curve.
+  quadratic), and short prefills are overhead-bound. One EMA mixes them. Answered in part by
+  `step_cost` (a model of a batched step's time in decode rows and prefill chunks, `q` new
+  tokens after `c` cached; see `docs/batching.md`): a prefill of `n` tokens after `c` costs
+  about `g + b·n + d·n·c + e·n²` ms (thousands of tokens) in its regime. It's fitted per model
+  and device from a calibration at load and the steps the node runs.
 - **Background decode isn't preempted.** If frog sends subagents or compaction (which decode)
   as background, an interactive request can wait a whole background generation. Preempting
   decode means keeping sampler and parser state across the gap.

@@ -4598,6 +4598,51 @@ impl ComputeDevice for CudaComputeDevice {
         )
     }
 
+    fn attention_paged_rows(
+        &self,
+        qkv: &CudaBuffer,
+        q_norm: Option<&CudaBuffer>,
+        k_norm: Option<&CudaBuffer>,
+        cos: &CudaBuffer,
+        sin: &CudaBuffer,
+        k_pool: &mut CudaBuffer,
+        v_pool: &mut CudaBuffer,
+        rows: &crate::PagedRows<CudaBuffer>,
+        shape: (usize, usize, usize),
+        eps: f32,
+        query_scale: f32,
+    ) -> CudaBuffer {
+        if let Some(out) = self.attention_rows_llm(
+            qkv,
+            q_norm,
+            k_norm,
+            cos,
+            sin,
+            k_pool,
+            v_pool,
+            rows,
+            shape,
+            eps,
+            query_scale,
+        ) {
+            return out;
+        }
+        crate::device::attention_paged_rows_default(
+            self,
+            qkv,
+            q_norm,
+            k_norm,
+            cos,
+            sin,
+            k_pool,
+            v_pool,
+            rows,
+            shape,
+            eps,
+            query_scale,
+        )
+    }
+
     fn attention_full(
         &self,
         q: &CudaBuffer,

@@ -5,6 +5,7 @@
 //! with a device-resident KV cache, the checkpoint's own chat template, and an
 //! OpenAI-compatible server.
 
+pub mod batch;
 pub mod blocks;
 pub mod chat;
 pub mod config;
@@ -25,6 +26,8 @@ pub mod sample;
 pub mod scheduler;
 pub mod server;
 pub mod slots;
+pub mod special;
+pub mod step_cost;
 mod structured;
 pub mod vae;
 pub mod vision;

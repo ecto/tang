@@ -19,9 +19,10 @@
 
 use super::engine::{Engine, Opts, Positional, RunningState};
 use super::tokenize::FlashTokenizer;
-use crate::chat::{Parser, Piece};
-use crate::engine::{Finish, Request, ThinkBudget, Usage, WRAP_UP};
+use crate::chat::{Chunk, Detok, Parser, Piece, Tags};
+use crate::engine::{Control, Finish, Outcome, Request, ThinkBudget, Usage, WRAP_UP};
 use crate::server::Backend;
+use crate::special::Shield;
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -160,27 +161,6 @@ impl Policy {
     }
 }
 
-/// Incremental detokenization: decode a small window, emit what's new, hold back broken UTF-8.
-#[derive(Default)]
-struct Detok {
-    prefix: usize,
-    read: usize,
-}
-
-impl Detok {
-    fn push(&mut self, tok: &FlashTokenizer, out: &[u32]) -> Result<Option<String>> {
-        let before = tok.decode(&out[self.prefix..self.read])?;
-        let after = tok.decode(&out[self.prefix..])?;
-        if after.len() > before.len() && !after.ends_with('\u{fffd}') {
-            let new = after[before.len()..].to_string();
-            self.prefix = self.read;
-            self.read = out.len();
-            return Ok(Some(new));
-        }
-        Ok(None)
-    }
-}
-
 /// What one request did, for the server log.
 #[derive(Default)]
 struct Line {
@@ -205,6 +185,10 @@ pub struct FlashServe {
     gguf: PathBuf,
     e: Engine,
     tok: FlashTokenizer,
+    /// Keeps request text out of the special tokens (see [`Shield`]).
+    shield: Shield,
+    /// Tag tokens the output parser splits on.
+    tags: Tags,
     ctx: usize,
     eos: Vec<u32>,
     think: (u32, u32),
@@ -340,6 +324,8 @@ impl FlashServe {
             drafts_mode: if e.use_mtp { "mtp" } else { "none" },
             e,
             im_start: id("<|im_start|>")?,
+            shield: Shield::new(&tok.tok),
+            tags: Tags::new(|t| tok.token_id(t)),
             tok,
             ctx: s.ctx,
             eos,
@@ -385,7 +371,7 @@ impl FlashServe {
                 .with_context(|| format!("reading {}", f.display()))?;
             let mut req = crate::server::parse(&body).map_err(|e| anyhow::anyhow!(e))?;
             req.prefill_only = true;
-            me.generate(&req, &mut |_| true)?;
+            me.generate(&req, &mut |_| true, &mut ())?;
             eprintln!(
                 "tang-llm: warmed {} ({} tokens, {} reused) in {:.1} s",
                 f.display(),
@@ -451,15 +437,18 @@ impl FlashServe {
     /// switches thinking per turn (frog does) would otherwise invalidate every cached token.
     /// Thinking off then only closes the generation prompt's `<think>` block, as the template
     /// does (`TANG_FLASH_STABLE_SYSTEM=0`: the template exactly).
+    /// Request text is protected (see [`Shield`]): encode the result with [`Self::encode`].
     fn render(&self, msgs: &Value, req: &Request) -> Result<String> {
+        let msgs = &self.shield.protect(msgs);
+        let tools = req.tools.as_ref().map(|t| self.shield.protect(t));
         let stable = std::env::var("TANG_FLASH_STABLE_SYSTEM").map_or(true, |v| v != "0");
         if !stable || req.think != Some(false) {
-            return self.tok.render(msgs, req.tools.as_ref(), req.think);
+            return self.tok.render(msgs, tools.as_ref(), req.think);
         }
-        let text = self.tok.render(msgs, req.tools.as_ref(), Some(true))?;
+        let text = self.tok.render(msgs, tools.as_ref(), Some(true))?;
         match text.strip_suffix("<think>\n") {
             Some(head) => Ok(format!("{head}<think>\n\n</think>\n\n")),
-            None => self.tok.render(msgs, req.tools.as_ref(), req.think),
+            None => self.tok.render(msgs, tools.as_ref(), req.think),
         }
     }
 
@@ -503,14 +492,20 @@ impl FlashServe {
             eprintln!(
                 "tang-llm: splicing skipped (template rendered generated turns unexpectedly)"
             );
-            return Ok((self.tok.encode(&text)?, text, 0));
+            return Ok((self.encode(&text)?, text, 0));
         }
         for (piece, mi) in pieces {
-            ids.extend(self.tok.encode(&piece)?);
+            ids.extend(self.encode(&piece)?);
             ids.extend_from_slice(&self.memo[mi].ids);
         }
-        ids.extend(self.tok.encode(&text[at..])?);
+        ids.extend(self.encode(&text[at..])?);
         Ok((ids, text, n))
+    }
+
+    /// Rendered (protected) prompt text to ids: the template's special tokens by id, request
+    /// text as plain tokens.
+    fn encode(&self, text: &str) -> Result<Vec<u32>> {
+        self.shield.encode(&self.tok.tok, text)
     }
 
     /// Keep a copy of the running state after `tokens` (the engine's sequence now).
@@ -805,7 +800,7 @@ impl FlashServe {
         // The end of the tools block, which the template puts before the system text (that
         // has the working directory in it): the same for every session of a client.
         if let Some(i) = text.find("</IMPORTANT>").filter(|&i| i < 200_000) {
-            if let Ok(head) = self.tok.encode(&text[..i + "</IMPORTANT>".len()]) {
+            if let Ok(head) = self.encode(&text[..i + "</IMPORTANT>".len()]) {
                 if head.len() > 1 && ids.starts_with(&head[..head.len() - 1]) {
                     // The last token may merge with what follows; stop one short.
                     marks.push((head.len() - 1, true));
@@ -880,6 +875,7 @@ impl FlashServe {
         &mut self,
         req: &Request,
         on: &mut dyn FnMut(Piece) -> bool,
+        ctl: &mut dyn Control,
     ) -> Result<(Finish, Usage)> {
         let t0 = Instant::now();
         self.line = Line::default();
@@ -1010,6 +1006,11 @@ impl FlashServe {
             true
         };
         'gen: loop {
+            // The prefill can't stop part way; decode stops between windows.
+            if ctl.cancelled() {
+                finish = Finish::Cancelled;
+                break 'gen;
+            }
             let mut wrap = false;
             for &tok in &pending {
                 if self.eos.contains(&tok) {
@@ -1025,7 +1026,12 @@ impl FlashServe {
                     spent += 1;
                 }
                 wrap |= think.step(tok);
-                if let Some(new) = detok.push(&self.tok, &out)? {
+                // Tag tokens come out as tags, everything else as literal text (see `Parser`).
+                for chunk in detok.push(&out, &self.tags, |ids| self.tok.decode(ids))? {
+                    let (new, tag) = match chunk {
+                        Chunk::Text(s) => (s, None),
+                        Chunk::Tag(t) => (t.to_string(), Some(t)),
+                    };
                     text_out.push_str(&new);
                     let stop_at = req
                         .stop
@@ -1036,7 +1042,11 @@ impl FlashServe {
                         Some(i) => new[..new.len().saturating_sub(text_out.len() - i)].to_string(),
                         None => new,
                     };
-                    if !deliver(parser.push(&new), &mut content, &mut calls, &mut first) {
+                    let pieces = match tag {
+                        Some(t) if new == t => parser.push_tag(t),
+                        _ => parser.push_text(&new),
+                    };
+                    if !deliver(pieces, &mut content, &mut calls, &mut first) {
                         finish = Finish::Cancelled;
                         break 'gen;
                     }
@@ -1055,9 +1065,13 @@ impl FlashServe {
                 think.closed(self.wrap_up.len());
                 for &w in &self.wrap_up.clone() {
                     out.push(w);
-                    if let Some(new) = detok.push(&self.tok, &out)? {
-                        text_out.push_str(&new);
-                        if !deliver(parser.push(&new), &mut content, &mut calls, &mut first) {
+                    for chunk in detok.push(&out, &self.tags, |ids| self.tok.decode(ids))? {
+                        text_out.push_str(match &chunk {
+                            Chunk::Text(s) => s,
+                            Chunk::Tag(t) => t,
+                        });
+                        let pieces = parser.push_chunk(&chunk);
+                        if !deliver(pieces, &mut content, &mut calls, &mut first) {
                             finish = Finish::Cancelled;
                             break 'gen;
                         }
@@ -1147,6 +1161,23 @@ impl FlashServe {
     }
 }
 
+impl FlashServe {
+    fn run(
+        &mut self,
+        req: &Request,
+        on: &mut dyn FnMut(Piece) -> bool,
+        ctl: &mut dyn Control,
+    ) -> Result<(Finish, Usage)> {
+        let r = self.generate(req, on, ctl);
+        if r.is_err() {
+            // Whatever the engine holds now is unknown: start over next time.
+            self.e.reset();
+        }
+        self.save_routing();
+        r
+    }
+}
+
 impl Backend for FlashServe {
     fn model_path(&self, _spec: &str) -> Result<PathBuf> {
         Ok(self.gguf.clone())
@@ -1157,13 +1188,17 @@ impl Backend for FlashServe {
         req: &Request,
         on: &mut dyn FnMut(Piece) -> bool,
     ) -> Result<(Finish, Usage)> {
-        let r = self.generate(req, on);
-        if r.is_err() {
-            // Whatever the engine holds now is unknown: start over next time.
-            self.e.reset();
-        }
-        self.save_routing();
-        r
+        self.run(req, on, &mut ())
+    }
+
+    fn complete_with(
+        &mut self,
+        req: &Request,
+        _prompt: Option<(String, Vec<u32>)>,
+        on: &mut dyn FnMut(Piece) -> bool,
+        ctl: &mut dyn Control,
+    ) -> Result<Outcome> {
+        self.run(req, on, ctl).map(|(f, u)| Outcome::Done(f, u))
     }
 
     fn context_window(&self) -> usize {

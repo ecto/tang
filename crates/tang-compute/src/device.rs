@@ -1101,6 +1101,43 @@ pub trait ComputeDevice: Send {
         )
     }
 
+    /// Attention for one new token from each of several sequences (batched decode): row `i`
+    /// of `qkv` (`[rows, (nh + 2*nkv) * hd]`) is at position `rows.pos[i]` of its own paged
+    /// cache. Does what [`attention_prep_paged`](Self::attention_prep_paged), a
+    /// `query_scale`, and causal [`kv_attention_paged`](Self::kv_attention_paged) (no window)
+    /// do for each row alone, and returns the `[rows, nh * hd]` outputs. The default
+    /// ([`attention_paged_rows_default`]) runs exactly that, row by row.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_paged_rows(
+        &self,
+        qkv: &Self::Buffer,
+        q_norm: Option<&Self::Buffer>,
+        k_norm: Option<&Self::Buffer>,
+        cos: &Self::Buffer,
+        sin: &Self::Buffer,
+        k_pool: &mut Self::Buffer,
+        v_pool: &mut Self::Buffer,
+        rows: &PagedRows<Self::Buffer>,
+        shape: (usize, usize, usize),
+        eps: f32,
+        query_scale: f32,
+    ) -> Self::Buffer {
+        attention_paged_rows_default(
+            self,
+            qkv,
+            q_norm,
+            k_norm,
+            cos,
+            sin,
+            k_pool,
+            v_pool,
+            rows,
+            shape,
+            eps,
+            query_scale,
+        )
+    }
+
     /// `kv_attention` where each query sees only the last `window` keys (0: all of them), as in
     /// Gemma's local layers. The portable fallback runs on the host.
     #[allow(clippy::too_many_arguments)]
@@ -2128,6 +2165,64 @@ pub trait ComputeDevice: Send {
         weight_decay: f32,
         step_t: usize,
     );
+}
+
+/// One row each from several sequences in paged caches (see
+/// [`ComputeDevice::attention_paged_rows`]).
+pub struct PagedRows<'a, B> {
+    /// Each row's sequence's blocks.
+    pub pages: &'a [Pages<'a, B>],
+    /// Each row's position.
+    pub pos: &'a [usize],
+    /// On the device: every row's block table, end to end; each row's offset into it; each
+    /// row's position (u32 each, from [`ComputeDevice::upload_u32`]).
+    pub tables: &'a B,
+    pub offsets: &'a B,
+    pub positions: &'a B,
+}
+
+/// The portable [`ComputeDevice::attention_paged_rows`]: each row on its own.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_paged_rows_default<D: ComputeDevice + ?Sized>(
+    dev: &D,
+    qkv: &D::Buffer,
+    q_norm: Option<&D::Buffer>,
+    k_norm: Option<&D::Buffer>,
+    cos: &D::Buffer,
+    sin: &D::Buffer,
+    k_pool: &mut D::Buffer,
+    v_pool: &mut D::Buffer,
+    rows: &PagedRows<D::Buffer>,
+    (nh, nkv, hd): (usize, usize, usize),
+    eps: f32,
+    query_scale: f32,
+) -> D::Buffer {
+    let (qd, w) = (nh * hd, (nh + 2 * nkv) * hd);
+    let n = rows.pos.len();
+    let mut out = dev.alloc_uninit_f32(n * qd);
+    for (i, (pages, &pos)) in rows.pages.iter().zip(rows.pos).enumerate() {
+        let row = dev.slice_buffer(qkv, i * w, w);
+        let mut q = dev.attention_prep_paged(
+            &row,
+            q_norm,
+            k_norm,
+            cos,
+            sin,
+            k_pool,
+            v_pool,
+            pages,
+            1,
+            (nh, nkv, hd),
+            pos,
+            eps,
+        );
+        if query_scale != 1.0 {
+            dev.scale_buffer(&mut q, query_scale);
+        }
+        let o = dev.kv_attention_paged(&q, k_pool, v_pool, pages, pos, 1, (nh, nkv, hd), 0, true);
+        dev.write_into(&mut out, i * qd, &o);
+    }
+    out
 }
 
 /// Where a sequence's positions live in a paged KV cache: position `p` is row
