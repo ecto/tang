@@ -170,6 +170,7 @@ use crate::pool::BufferPool;
 
 mod flash;
 mod llm;
+mod moe;
 
 /// Extended pool diagnostics.
 pub struct PoolStats {
@@ -4677,6 +4678,110 @@ impl ComputeDevice for CudaComputeDevice {
 
     fn swiglu_split(&self, gu: &CudaBuffer, rows: usize, ff: usize) -> CudaBuffer {
         self.gated_split_llm("swiglu_split", gu, rows, ff)
+    }
+
+    fn moe_route(
+        &self,
+        logits: &CudaBuffer,
+        rows: usize,
+        experts: usize,
+        k: usize,
+        router: crate::moe::Router,
+    ) -> (CudaBuffer, CudaBuffer) {
+        self.moe_route_llm(logits, rows, experts, k, router)
+            .unwrap_or_else(|| {
+                let (ids, w) =
+                    crate::moe::route(&self.download(logits), rows, experts, k, router);
+                (self.upload_u32(&ids), self.upload(&w))
+            })
+    }
+
+    fn moe_linear(
+        &self,
+        x: &CudaBuffer,
+        w: &CudaBuffer,
+        fmt: crate::moe::ExpertFmt,
+        experts: usize,
+        bias: Option<&CudaBuffer>,
+        ids: &CudaBuffer,
+        k_top: usize,
+        k: usize,
+        n: usize,
+        per_pick: bool,
+    ) -> CudaBuffer {
+        if let Some(y) =
+            self.moe_linear_llm(x, w, fmt, experts, bias, ids, k_top, k, n, per_pick)
+        {
+            return y;
+        }
+        crate::device::moe_linear_default(self, x, w, fmt, experts, bias, ids, k_top, k, n, per_pick)
+    }
+
+    fn swiglu_clamped(
+        &self,
+        gu: &CudaBuffer,
+        rows: usize,
+        ff: usize,
+        alpha: f32,
+        limit: f32,
+    ) -> CudaBuffer {
+        self.swiglu_clamped_llm(gu, rows, ff, alpha, limit)
+    }
+
+    fn moe_combine(
+        &self,
+        parts: &CudaBuffer,
+        w: &CudaBuffer,
+        rows: usize,
+        k_top: usize,
+        h: usize,
+    ) -> CudaBuffer {
+        self.moe_combine_llm(parts, w, rows, k_top, h)
+    }
+
+    fn kv_attention_paged_sinks(
+        &self,
+        q: &CudaBuffer,
+        k_pool: &CudaBuffer,
+        v_pool: &CudaBuffer,
+        pages: &crate::Pages<CudaBuffer>,
+        cache_start: usize,
+        q_len: usize,
+        shape: (usize, usize, usize),
+        window: usize,
+        causal: bool,
+        sinks: &CudaBuffer,
+    ) -> CudaBuffer {
+        if causal {
+            if let Some(o) = self.attention_sinks_llm(
+                q,
+                k_pool,
+                v_pool,
+                pages.table,
+                pages.shift(),
+                cache_start,
+                q_len,
+                shape,
+                window,
+                sinks,
+                None,
+            ) {
+                return o;
+            }
+        }
+        crate::device::kv_attention_paged_sinks_default(
+            self,
+            q,
+            k_pool,
+            v_pool,
+            pages,
+            cache_start,
+            q_len,
+            shape,
+            window,
+            causal,
+            sinks,
+        )
     }
 
     fn rope_half_cached(
