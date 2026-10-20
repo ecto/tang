@@ -1,0 +1,13 @@
+[package]
+name = "tang-native"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Train FHE-native language models (ternary, DyT, squared ReLU, retention) against a standard twin, as one tang tensor graph. Research code."
+publish = false
+
+[dependencies]
+tang = { workspace = true }
+tang-compile = { workspace = true }
+tang-expr = { workspace = true }

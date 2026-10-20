@@ -6202,6 +6202,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tang-native"
+version = "0.0.0"
+dependencies = [
+ "tang",
+ "tang-compile",
+ "tang-expr",
+]
+
+[[package]]
 name = "tang-onnx"
 version = "0.1.0"
 dependencies = [
