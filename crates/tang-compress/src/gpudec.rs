@@ -85,6 +85,7 @@ fn shader_src(lanes: usize, maxl: usize) -> String {
         (32 / lanes).max(1)
     );
     let body = include_str!("gpuwav.wgsl")
+        .replace("AD_WGN", &((lanes * (32 / lanes).max(1)).max(32) * crate::lmodel3::AC * crate::lmodel3::AB).to_string())
         .replace("LANES_WG3", &(lanes * (32 / lanes).max(1)).to_string())
         .replace("LANES_WG", &lanes.to_string())
         .replace("MAXL_N", &maxl.max(2).to_string())
@@ -610,6 +611,9 @@ impl GpuDecoder {
             meta.extend(f);
             meta.extend_from_slice(sig);
             meta.extend_from_slice(pw);
+            // adaptive layer: stretch table at off_pow + 257, then its settings
+            meta.extend(crate::lmodel3::stretch_tab().iter().map(|&z| z as u32));
+            meta.push(ps.ad.wa | ps.ad.lim << 5 | ps.ad.mask << 13);
         }
         let ncells: usize = d3.iter().product();
         let mut params = vec![0u32; NPARAM];
@@ -711,7 +715,7 @@ impl GpuDecoder {
             if pr.lanes > 1 {
                 jobs.push(("decode3l", p, [n.div_ceil((32 / self.lanes).max(1)) as u32, 1, 1]));
             } else {
-                jobs.push(("decode3", p, [n.div_ceil(64) as u32, 1, 1]));
+                jobs.push(("decode3", p, [n.div_ceil(32) as u32, 1, 1]));
             }
         }
         let mut p = b.params.clone();

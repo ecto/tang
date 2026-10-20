@@ -24,7 +24,7 @@
 //! on the lines inside the needed region at each level.
 
 use crate::bitio::{ByteReader, ByteWriter, DecodeError};
-use crate::lmodel3::{code_learned, feat_vec3, Mix3, Net32};
+use crate::lmodel3::{code_learned_ad, feat_vec3, AdCfg, Adapt, Mix3, Net32};
 use crate::codec::ErrorBound;
 use crate::gpuwav::{
     code_res, dequant, feats, for_lines, gamma, init_of, lift_consts, prior_table, rate_control, read_priors, row_ctx, to_f32_bits, write_priors,
@@ -63,6 +63,9 @@ pub struct Gpu3Config {
     pub compact: bool,
     /// Axis-grouped line taps ([`crate::gpuwav::BandInfo::ax`]).
     pub axis: bool,
+    /// Per-lane adaptive probability maps over the learned model
+    /// ([`crate::lmodel3::Adapt`]); ignored by static models.
+    pub adapt: Option<AdCfg>,
 }
 
 /// Probability model of a v3 stream.
@@ -88,7 +91,7 @@ pub enum Model3 {
 impl Gpu3Config {
     /// Defaults: 32³ / 128² blocks, 64³ outlier tiles, residual contexts.
     pub fn new(bound: ErrorBound) -> Self {
-        Self { bound, block: 32, block2d: 128, tile: 64, resctx: true, rho: 0.45, lanes: 1, model: Model3::Static, compact: true, axis: true }
+        Self { bound, block: 32, block2d: 128, tile: 64, resctx: true, rho: 0.45, lanes: 1, model: Model3::Static, compact: true, axis: true, adapt: Some(ad_default()) }
     }
 }
 
@@ -157,11 +160,13 @@ fn code_block<S: Sink>(
     m: &mut [u32],
     lanes: usize,
     net: Option<&Net32>,
+    adc: AdCfg,
     s: &mut S,
 ) {
     let [_, ny, nx] = sh.dims;
     // TC_CPU_IR: evaluate the net with the tang-expr integer interpreter
     let mut prog = net.filter(|_| cpu_ir()).map(|n| n.program());
+    let mut ad = vec![Adapt::new(adc); lanes.max(1)];
     for_lines(b, lanes.max(1), |p, lane, z, y| {
         let w = &preds[b.pkey[p]];
         let rc = row_ctx(sh, b, p, z, y);
@@ -177,7 +182,7 @@ fn code_block<S: Sink>(
                         None => n.infer(&x),
                     };
                     let mx = Mix3::new(&o);
-                    code_learned(s, lane, &mx, q[i].wrapping_sub(pred))
+                    code_learned_ad(s, lane, &mx, q[i].wrapping_sub(pred), &mut ad[lane])
                 }
             };
             q[i] = r.wrapping_add(pred);
@@ -186,6 +191,25 @@ fn code_block<S: Sink>(
             }
         }
     });
+}
+
+/// Default adaptive layer (`TC_AD=wa,lim,mask` overrides, for sweeps).
+pub fn ad_default() -> AdCfg {
+    static V: std::sync::OnceLock<AdCfg> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let v: Vec<u32> = std::env::var("TC_AD").unwrap_or("10,14,15".into()).split(',').map(|x| x.parse().unwrap()).collect();
+        AdCfg { wa: v[0].min(16), lim: v[1].min(255), mask: v[2] & 15 }
+    })
+}
+
+const AD_OFF: AdCfg = AdCfg { wa: 0, lim: 0, mask: 0 };
+
+fn ad_pack(a: AdCfg) -> u64 {
+    (a.wa | a.lim << 5 | a.mask << 13) as u64
+}
+
+fn ad_unpack(v: u64) -> AdCfg {
+    AdCfg { wa: (v & 31).min(16) as u32, lim: (v >> 5 & 255) as u32, mask: (v >> 13 & 15) as u32 }
 }
 
 fn cpu_ir() -> bool {
@@ -449,7 +473,7 @@ fn encode_at3(enc: &Enc, dims: &[usize], cfg: &Gpu3Config, dg: f64, maxabs: Opti
     let mut cnt = CountSink { n: vec![[0; 2]; NMODEL] };
     let mut m0 = vec![MINIT; NMODEL];
     for b in &blocks {
-        code_block(sh, b, &mut q, cfg.resctx.then_some(&mut rs[..]), &preds, &mut m0, cfg.lanes, None, &mut cnt);
+        code_block(sh, b, &mut q, cfg.resctx.then_some(&mut rs[..]), &preds, &mut m0, cfg.lanes, None, AD_OFF, &mut cnt);
     }
     // learned model (overfit: trained here on this field's coefficients)
     let mut q2 = qs[0].clone();
@@ -471,6 +495,7 @@ fn encode_at3(enc: &Enc, dims: &[usize], cfg: &Gpu3Config, dg: f64, maxabs: Opti
             (Some(Net32::new(&n)), v)
         }
     };
+    let adc = if net.is_some() { cfg.adapt.unwrap_or(AD_OFF) } else { AD_OFF };
     let priors = if net.is_some() { vec![None; NMODEL] } else { choose_priors3(&cnt.n) };
     let mut init = init_of(&priors);
     let mut bw: Vec<Vec<u8>> = Vec::with_capacity(blocks.len());
@@ -479,7 +504,7 @@ fn encode_at3(enc: &Enc, dims: &[usize], cfg: &Gpu3Config, dg: f64, maxabs: Opti
     for b in &blocks {
         let nl = cfg.lanes.max(1);
         let mut sink = RecSink { syms: vec![Vec::new(); nl] };
-        code_block(sh, b, &mut q, cfg.resctx.then_some(&mut rs[..]), &preds, &mut init, nl, net.as_ref(), &mut sink);
+        code_block(sh, b, &mut q, cfg.resctx.then_some(&mut rs[..]), &preds, &mut init, nl, net.as_ref(), adc, &mut sink);
         let lw: Vec<Vec<u16>> = sink.syms.iter().map(|s| crate::gpuwav::rans_encode(s)).collect();
         if dbg {
             ideal += sink.syms.iter().flatten().map(|&(_, f)| 16.0 - (f as f64).log2()).sum::<f64>();
@@ -556,9 +581,13 @@ fn encode_at3(enc: &Enc, dims: &[usize], cfg: &Gpu3Config, dg: f64, maxabs: Opti
         w.varint(td[a] as u64);
     }
     w.u8(cfg.resctx as u8);
-    if lc > 0 || cfg.axis {
-        w.varint((cfg.lanes.max(1) | 1 << 9 | (cfg.axis as usize) << 10) as u64);
+    let has_ad = adc.wa > 0;
+    if lc > 0 || cfg.axis || has_ad {
+        w.varint((cfg.lanes.max(1) | 1 << 9 | (cfg.axis as usize) << 10 | (has_ad as usize) << 11) as u64);
         w.u8(if lc > 0 { lc.trailing_zeros() as u8 + 1 } else { 0 });
+        if has_ad {
+            w.varint(ad_pack(adc));
+        }
     } else {
         w.varint(cfg.lanes.max(1) as u64);
     }
@@ -717,6 +746,8 @@ pub struct Parsed3 {
     pub tiles: Vec<TileRef>,
     /// Learned model (None = static priors).
     pub net: Option<Net32>,
+    /// Adaptive layer of the learned model.
+    pub ad: AdCfg,
     /// Header + index bytes.
     pub header_bytes: usize,
 }
@@ -765,11 +796,12 @@ pub fn parse3(bytes: &[u8]) -> Result<Parsed3, DecodeError> {
     }
     let resctx = r.u8()? != 0;
     let lv = r.varint()? as usize;
-    let (lanes, lane_cells, axis) = if lv & 1 << 9 != 0 {
+    let (lanes, lane_cells, axis, ad) = if lv & 1 << 9 != 0 {
         let t = r.u8()?;
-        (lv & 511, if t > 0 { 1usize << (t - 1).min(30) } else { 0 }, lv & 1 << 10 != 0)
+        let ad = if lv & 1 << 11 != 0 { ad_unpack(r.varint()?) } else { AD_OFF };
+        (lv & 511, if t > 0 { 1usize << (t - 1).min(30) } else { 0 }, lv & 1 << 10 != 0, ad)
     } else {
-        (lv, 0, false)
+        (lv, 0, false, AD_OFF)
     };
     if lanes == 0 || lanes > 256 {
         return Err(DecodeError::Invalid("lanes"));
@@ -888,7 +920,7 @@ pub fn parse3(bytes: &[u8]) -> Result<Parsed3, DecodeError> {
         tiles.push(TileRef { origin: *o, dims: *d, words: (ws, ws + nw), bytes: (off, end), esc });
         off = end;
     }
-    Ok(Parsed3 { dims, d3, cb, resctx, e, mean_fix, dl, corr, preds, init, sh, blocks, block_band, block_words, lanes, block_lanes, tiles, header_bytes, net })
+    Ok(Parsed3 { dims, d3, cb, resctx, e, mean_fix, dl, corr, preds, init, sh, blocks, block_band, block_words, lanes, block_lanes, tiles, header_bytes, net, ad })
 }
 
 // ------------------------------------------------------------------ decode
@@ -916,7 +948,7 @@ fn decode_block(ps: &Parsed3, bytes: &[u8], bi: usize, q: Ptr, rs: Ptr, n: usize
     // before this level started) and their own cells
     let q = unsafe { std::slice::from_raw_parts_mut(q.get(), n) };
     let rs = unsafe { std::slice::from_raw_parts_mut(rs.get(), n) };
-    code_block(&ps.sh, &ps.blocks[bi], q, ps.resctx.then_some(rs), &ps.preds, &mut m, ps.lanes, ps.net.as_ref(), &mut sink);
+    code_block(&ps.sh, &ps.blocks[bi], q, ps.resctx.then_some(rs), &ps.preds, &mut m, ps.lanes, ps.net.as_ref(), ps.ad, &mut sink);
     if sink.lanes.iter().any(|l| l.overrun()) {
         return Err(DecodeError::Truncated);
     }

@@ -573,14 +573,15 @@ fn mmag(i: u32, q: i32) -> i32 {
     return q;
 }
 
-@compute @workgroup_size(64)
-fn decode3(@builtin(global_invocation_id) gid: vec3<u32>) {
+@compute @workgroup_size(32)
+fn decode3(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid3: vec3<u32>) {
     if (gid.x >= P.batch) { return; }
     let rec = P.pad0 + (P.brick_base + gid.x) * 10u;
     let b = mt[rec];
     let z0 = mt[rec + 1u]; let y0 = mt[rec + 2u]; let x0 = mt[rec + 3u];
     let z1 = mt[rec + 4u]; let y1 = mt[rec + 5u]; let x1 = mt[rec + 6u];
     lane_start(mt[rec + 7u], mt[rec + 8u]);
+    ad_reset(lid3.x);
     let ny = P.d1;
     let nx = P.d2;
     let org = array<u32, 3>(bf(b, 0u), bf(b, 1u), bf(b, 2u));
@@ -791,6 +792,7 @@ fn decode3l(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id)
     let ltab = lt9 & 0xFFFFFFu;
     let nlb = max(lt9 >> 24u, 1u);
     lane_start(mt[ltab + lane], mt[ltab + lane + 1u]);
+    ad_reset(lid.x);
     let npass_b = select(0u, npass_blk(mt[rec + 4u] - mt[rec + 1u], mt[rec + 5u] - mt[rec + 2u]), blk_on);
     if (lid.x == 0u) {
         var mxp = 0u;
@@ -1005,6 +1007,48 @@ fn ltail(m: u32) -> u32 {
     return 65536u - lcdf(i32(m) - 1);
 }
 
+// per-lane adaptive probability maps (lmodel3::Adapt): (p << 8) | count,
+// 136 words per invocation in workgroup memory (a private array spills)
+var<workgroup> adt: array<u32, AD_WGN>;
+var<private> ad_b: u32;
+var<private> ad_wa: u32;
+var<private> ad_lim: u32;
+var<private> ad_mask: u32;
+var<private> ad_so: u32;
+
+fn ad_reset(li: u32) {
+    ad_wa = 0u;
+    ad_b = li * 136u;
+    if (P.pad4 == 0u) { return; }
+    ad_so = mt[P.pad4 + 1u] + 257u;
+    let c = mt[ad_so + 4096u];
+    ad_wa = c & 31u;
+    ad_lim = (c >> 5u) & 255u;
+    ad_mask = (c >> 13u) & 15u;
+    if (ad_wa == 0u) { return; }
+    for (var i = 0u; i < 136u; i = i + 1u) { adt[ad_b + i] = sig16((i32(i % 17u) - 8) * 256) << 8u; }
+}
+
+fn ad_bit(ctx: u32, p1: u32) -> bool {
+    var grp = ctx;
+    if (ctx >= 2u) { grp = select(3u, 2u, ctx <= 5u); }
+    if (ad_wa == 0u || ((ad_mask >> grp) & 1u) == 0u) { return dbit_p(p1); }
+    let st = u32(clamp(bitcast<i32>(mt[ad_so + (p1 >> 4u)]), -2048, 2047) + 2048);
+    let j = st >> 8u;
+    let w = st & 255u;
+    let b = ad_b + ctx * 17u + j;
+    let pr = ((adt[b] >> 8u) * (256u - w) + (adt[b + 1u] >> 8u) * w) >> 8u;
+    let pf = (pr * ad_wa + p1 * (16u - ad_wa)) >> 4u;
+    let got = dbit_p(clamp(pf, 32u, 65504u));
+    let k = select(b + 1u, b, w < 128u);
+    let e = adt[k];
+    let t = i32(e >> 8u);
+    let n = e & 255u;
+    let d = select(0, 65535, got) - t;
+    adt[k] = (u32(t + (d >> firstLeadingBit(n + 2u))) << 8u) | select(n, n + 1u, n < ad_lim);
+    return got;
+}
+
 var<private> na: array<i32, 64>;
 var<private> nb: array<i32, 64>;
 
@@ -1026,9 +1070,9 @@ fn learned_res(raw: array<i32, 18>, cls: u32) -> i32 {
     let c0 = lcdf(0);
     let cm1 = lcdf(-1);
     let pz = select(0u, c0 - cm1, c0 > cm1);
-    if (!dbit_p(ratio16(65536u - pz, 65536u))) { return 0; }
+    if (!ad_bit(0u, ratio16(65536u - pz, 65536u))) { return 0; }
     let posm = 65536u - c0;
-    l_neg = dbit_p(ratio16(cm1, cm1 + posm));
+    l_neg = ad_bit(1u, ratio16(cm1, cm1 + posm));
     // tails are carried between steps: same values, fewer CDF evaluations
     var k = 0u;
     var ta = ltail(1u);
@@ -1036,7 +1080,7 @@ fn learned_res(raw: array<i32, 18>, cls: u32) -> i32 {
     loop {
         if (k >= 30u) { break; }
         tb = ltail(1u << (k + 1u));
-        if (!dbit_p(ratio16(tb, ta))) { break; }
+        if (!ad_bit(2u + min(k, 3u), ratio16(tb, ta))) { break; }
         ta = tb;
         k = k + 1u;
     }
@@ -1045,13 +1089,16 @@ fn learned_res(raw: array<i32, 18>, cls: u32) -> i32 {
     // tail(lo) = ta; tail(hi + 1) = tb (k < 30) or tail(2^31) = 0 (k = 30)
     var tl = ta;
     var end = select(0u, tb, k < 30u);
+    var mctx = 6u;
     loop {
         if (lo >= hi) { break; }
         let mid = lo + (hi - lo + 1u) / 2u;
         let tm = ltail(mid);
         let up = select(0u, tm - end, tm > end);
         let all = select(0u, tl - end, tl > end);
-        if (dbit_p(ratio16(up, all))) { lo = mid; tl = tm; } else { hi = mid - 1u; end = tm; }
+        let bt = ad_bit(mctx, ratio16(up, all));
+        mctx = 7u;
+        if (bt) { lo = mid; tl = tm; } else { hi = mid - 1u; end = tm; }
     }
     if (l_neg) { return -bitcast<i32>(lo); }
     return bitcast<i32>(lo);
