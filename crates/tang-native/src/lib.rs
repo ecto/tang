@@ -1,6 +1,6 @@
 //! FHE-native language models and their standard twin, built as one tang
 //! [`TensorGraph`]: the forward pass, a cross-entropy loss and the backward
-//! pass (and, in [`train`], an AdamW step) for one sequence.
+//! pass (and, in [`train`], an AdamW step) for one batch of sequences.
 //!
 //! Four switches turn the standard twin into the FHE-native model, one
 //! constraint at a time, each chosen because it is cheap under encryption
@@ -83,9 +83,16 @@ pub struct Config {
     pub ff: usize,
     /// tokens per sequence
     pub seq: usize,
+    /// sequences per step
+    pub batch: usize,
 }
 
 impl Config {
+    /// Token rows per step: batch × seq.
+    pub fn rows(&self) -> usize {
+        self.batch * self.seq
+    }
+
     pub fn head_dim(&self) -> usize {
         self.d / self.heads
     }
@@ -106,7 +113,8 @@ impl Config {
             layers: 12,
             heads: 12,
             ff: 3072,
-            seq: 1024,
+            seq: 512,
+            batch: 8,
         }
     }
 
@@ -118,7 +126,8 @@ impl Config {
             layers: 28,
             heads: 8,
             ff: 4096,
-            seq: 2048,
+            seq: 1024,
+            batch: 4,
         }
     }
 }
@@ -145,9 +154,9 @@ pub struct Model {
     pub graph: TensorGraph,
     pub config: Config,
     pub variant: Variant,
-    /// token ids, as f32/f64 values, `[seq]`
+    /// token ids, as f32/f64 values, `[batch·seq]`, sequence-major
     pub tokens: TensorId,
-    /// next-token ids, `[seq]`
+    /// next-token ids, `[batch·seq]`
     pub targets: TensorId,
     /// RoPE tables `[seq, head_dim/2]` (twin attention only)
     pub rope: Option<(TensorId, TensorId)>,
@@ -331,27 +340,27 @@ fn relu2(x: ExprId) -> ExprId {
     select(x, x * x, lit(0.0))
 }
 
-/// Rotate (even, odd) pairs of `x` `[T, H, hd]` by RoPE tables `[T, hd/2]`.
+/// Rotate (even, odd) pairs of `x` `[B, T, H, hd]` by RoPE tables `[T, hd/2]`.
 fn rope(g: &mut TensorGraph, x: TensorId, cos: TensorId, sin: TensorId, c: &Config) -> TensorId {
-    let (t, h, hd) = (c.seq, c.heads, c.head_dim());
+    let (bt, t, h, hd) = (c.batch, c.seq, c.heads, c.head_dim());
     let half = hd / 2;
-    let x4 = g.reshape(x, &[t, h, half, 2]).unwrap();
+    let x5 = g.reshape(x, &[bt, t, h, half, 2]).unwrap();
     let at = |parity: i64| {
-        let mut v = View::pick(4, &[Some(0), Some(1), Some(2), None]);
-        v.forms[3].offset = parity;
-        Arg { src: x4, view: v }
+        let mut v = View::pick(5, &[Some(0), Some(1), Some(2), Some(3), None]);
+        v.forms[4].offset = parity;
+        Arg { src: x5, view: v }
     };
-    let par = g.iota(&[t, h, half, 2], 3);
+    let par = g.iota(&[bt, t, h, half, 2], 4);
     let out = g
         .comp(
-            &[t, h, half, 2],
+            &[bt, t, h, half, 2],
             &[],
             vec![
                 at(0),
                 at(1),
-                arg(cos, 4, &[Some(0), Some(2)]),
-                arg(sin, 4, &[Some(0), Some(2)]),
-                arg(par, 4, &[Some(0), Some(1), Some(2), Some(3)]),
+                arg(cos, 5, &[Some(1), Some(3)]),
+                arg(sin, 5, &[Some(1), Some(3)]),
+                arg(par, 5, &[Some(0), Some(1), Some(2), Some(3), Some(4)]),
             ],
             None,
             |v| {
@@ -360,10 +369,62 @@ fn rope(g: &mut TensorGraph, x: TensorId, cos: TensorId, sin: TensorId, c: &Conf
             },
         )
         .unwrap();
-    g.reshape(out, &[t, h, hd]).unwrap()
+    g.reshape(out, &[bt, t, h, hd]).unwrap()
 }
 
-/// Build the model's forward, loss and backward for one sequence.
+/// `[B, H, T, T]` scores Σ_e a[b,t,h,e]·c[b,s,h,e]·scale, a and c `[B, T, H, hd]`.
+fn scores(g: &mut TensorGraph, a: TensorId, c: TensorId, cf: &Config, scale: f64) -> TensorId {
+    let (bt, t, h, hd) = (cf.batch, cf.seq, cf.heads, cf.head_dim());
+    g.comp(
+        &[bt, h, t, t],
+        &[hd],
+        vec![
+            arg(a, 5, &[Some(0), Some(2), Some(1), Some(4)]),
+            arg(c, 5, &[Some(0), Some(3), Some(1), Some(4)]),
+        ],
+        Some(Monoid::sum()),
+        |x| vec![x[0] * x[1] * lit(scale)],
+    )
+    .unwrap()
+}
+
+/// Reduce the last axis of a `[B, H, T, T]` tensor to `[B, H, T]`.
+fn last_axis(g: &mut TensorGraph, x: TensorId, cf: &Config, m: Monoid) -> TensorId {
+    let (bt, t, h) = (cf.batch, cf.seq, cf.heads);
+    g.comp(
+        &[bt, h, t],
+        &[t],
+        vec![arg(x, 4, &[Some(0), Some(1), Some(2), Some(3)])],
+        Some(m),
+        |z| vec![z[0]],
+    )
+    .unwrap()
+}
+
+/// `[B, H, T, T]` with a `[B, H, T]` value per row, combined elementwise.
+fn per_row(
+    g: &mut TensorGraph,
+    x: TensorId,
+    r: TensorId,
+    cf: &Config,
+    f: impl FnOnce(ExprId, ExprId) -> ExprId,
+) -> TensorId {
+    let (bt, t, h) = (cf.batch, cf.seq, cf.heads);
+    g.comp(
+        &[bt, h, t, t],
+        &[],
+        vec![
+            arg(x, 4, &[Some(0), Some(1), Some(2), Some(3)]),
+            arg(r, 4, &[Some(0), Some(1), Some(2)]),
+        ],
+        None,
+        |z| vec![f(z[0], z[1])],
+    )
+    .unwrap()
+}
+
+/// Build the model's forward, loss and backward for one step of
+/// `batch` sequences of `seq` tokens.
 pub fn build(c: Config, v: Variant) -> Model {
     assert!(
         c.d.is_multiple_of(c.heads) && c.head_dim().is_multiple_of(2),
@@ -371,8 +432,9 @@ pub fn build(c: Config, v: Variant) -> Model {
     );
     let mut graph = TensorGraph::new();
     let (t, d, h, hd, vocab) = (c.seq, c.d, c.heads, c.head_dim(), c.vocab);
-    let tokens = graph.input(&[t]);
-    let targets = graph.input(&[t]);
+    let (bt, rows) = (c.batch, c.rows());
+    let tokens = graph.input(&[rows]);
+    let targets = graph.input(&[rows]);
     let rope_tables =
         (!v.retention).then(|| (graph.input(&[t, hd / 2]), graph.input(&[t, hd / 2])));
     let mut b = B {
@@ -381,11 +443,11 @@ pub fn build(c: Config, v: Variant) -> Model {
         v,
     };
     let emb = b.param("embed".into(), &[vocab, d], Init::Normal(0.02), true);
-    // embedding as a one-hot sum: x[t, e] = Σ_v [v = tok_t]·E[v, e]
+    // embedding as a one-hot sum: x[r, e] = Σ_v [v = tok_r]·E[v, e]
     let viota = b.g.iota(&[vocab], 0);
     let mut x =
         b.g.comp(
-            &[t, d],
+            &[rows, d],
             &[vocab],
             vec![
                 arg(tokens, 3, &[Some(0)]),
@@ -396,9 +458,9 @@ pub fn build(c: Config, v: Variant) -> Model {
             |v| vec![select(lit(0.5) - (v[0] - v[1]).abs(), v[2], lit(0.0))],
         )
         .unwrap();
-    let it = b.g.iota(&[h, t, t], 1);
-    let is = b.g.iota(&[h, t, t], 2);
-    let ih = b.g.iota(&[h, t, t], 0);
+    let ih = b.g.iota(&[bt, h, t, t], 1);
+    let it = b.g.iota(&[bt, h, t, t], 2);
+    let is = b.g.iota(&[bt, h, t, t], 3);
     for l in 0..c.layers {
         // attention
         let n = b.norm(x, format!("l{l}.attn_norm"), 0.5);
@@ -406,28 +468,16 @@ pub fn build(c: Config, v: Variant) -> Model {
         let k = b.linear(n, format!("l{l}.wk"), d);
         let vv = b.linear(n, format!("l{l}.wv"), d);
         let g = &mut *b.g;
-        let (q3, k3, v3) = (
-            g.reshape(q, &[t, h, hd]).unwrap(),
-            g.reshape(k, &[t, h, hd]).unwrap(),
-            g.reshape(vv, &[t, h, hd]).unwrap(),
+        let (q4, k4, v4) = (
+            g.reshape(q, &[bt, t, h, hd]).unwrap(),
+            g.reshape(k, &[bt, t, h, hd]).unwrap(),
+            g.reshape(vv, &[bt, t, h, hd]).unwrap(),
         );
         let p = if v.retention {
-            let fq = g.map(&[q3], |x| relu2(x[0])).unwrap();
-            let fk = g.map(&[k3], |x| relu2(x[0])).unwrap();
-            let sc = 1.0 / hd as f64;
-            let s = g
-                .comp(
-                    &[h, t, t],
-                    &[hd],
-                    vec![
-                        arg(fq, 4, &[Some(1), Some(0), Some(3)]),
-                        arg(fk, 4, &[Some(2), Some(0), Some(3)]),
-                    ],
-                    Some(Monoid::sum()),
-                    |x| vec![x[0] * x[1] * lit(sc)],
-                )
-                .unwrap();
-            // D[h,t,s] = γ_h^(t−s) for s ≤ t, γ_h = 1 − 2^(−5 − 7h/(H−1))
+            let fq = g.map(&[q4], |x| relu2(x[0])).unwrap();
+            let fk = g.map(&[k4], |x| relu2(x[0])).unwrap();
+            let s = scores(g, fq, fk, &c, 1.0 / hd as f64);
+            // D[b,h,t,s] = γ_h^(t−s) for s ≤ t, γ_h = 1 − 2^(−5 − 7h/(H−1))
             let span = if h > 1 { 7.0 / (h - 1) as f64 } else { 0.0 };
             g.map(&[s, ih, it, is], |x| {
                 let lg = (lit(1.0) - (lit(-5.0) - x[1] * lit(span)).exp2_()).ln()
@@ -438,79 +488,30 @@ pub fn build(c: Config, v: Variant) -> Model {
             .unwrap()
         } else {
             let (cos, sin) = rope_tables.expect("twin attention has RoPE tables");
-            let (rq, rk) = (rope(g, q3, cos, sin, &c), rope(g, k3, cos, sin, &c));
-            let sc = 1.0 / (hd as f64).sqrt();
-            let s = g
-                .comp(
-                    &[h, t, t],
-                    &[hd],
-                    vec![
-                        arg(rq, 4, &[Some(1), Some(0), Some(3)]),
-                        arg(rk, 4, &[Some(2), Some(0), Some(3)]),
-                    ],
-                    Some(Monoid::sum()),
-                    |x| vec![x[0] * x[1] * lit(sc)],
-                )
-                .unwrap();
+            let (rq, rk) = (rope(g, q4, cos, sin, &c), rope(g, k4, cos, sin, &c));
+            let s = scores(g, rq, rk, &c, 1.0 / (hd as f64).sqrt());
             let masked = g
                 .map(&[s, it, is], |x| select(x[2] - x[1], lit(-1e30), x[0]))
                 .unwrap();
-            let mx = g
-                .comp(
-                    &[h, t],
-                    &[t],
-                    vec![arg(masked, 3, &[Some(0), Some(1), Some(2)])],
-                    Some(Monoid::max()),
-                    |x| vec![x[0]],
-                )
-                .unwrap();
-            let e = g
-                .comp(
-                    &[h, t, t],
-                    &[],
-                    vec![
-                        arg(masked, 3, &[Some(0), Some(1), Some(2)]),
-                        arg(mx, 3, &[Some(0), Some(1)]),
-                    ],
-                    None,
-                    |x| vec![(x[0] - x[1]).exp()],
-                )
-                .unwrap();
-            let den = g
-                .comp(
-                    &[h, t],
-                    &[t],
-                    vec![arg(e, 3, &[Some(0), Some(1), Some(2)])],
-                    Some(Monoid::sum()),
-                    |x| vec![x[0]],
-                )
-                .unwrap();
-            g.comp(
-                &[h, t, t],
-                &[],
-                vec![
-                    arg(e, 3, &[Some(0), Some(1), Some(2)]),
-                    arg(den, 3, &[Some(0), Some(1)]),
-                ],
-                None,
-                |x| vec![x[0] / x[1]],
-            )
-            .unwrap()
+            let mx = last_axis(g, masked, &c, Monoid::max());
+            let e = per_row(g, masked, mx, &c, |a, m| (a - m).exp());
+            let den = last_axis(g, e, &c, Monoid::sum());
+            per_row(g, e, den, &c, |a, s| a / s)
         };
-        // o[t,h,e] = Σ_s P[h,t,s]·V[s,h,e]
+        // o[b,t,h,e] = Σ_s P[b,h,t,s]·V[b,s,h,e]
         let o = g
             .comp(
-                &[t, h, hd],
+                &[bt, t, h, hd],
                 &[t],
                 vec![
-                    arg(p, 4, &[Some(1), Some(0), Some(3)]),
-                    arg(v3, 4, &[Some(3), Some(1), Some(2)]),
+                    arg(p, 5, &[Some(0), Some(2), Some(1), Some(4)]),
+                    arg(v4, 5, &[Some(0), Some(4), Some(2), Some(3)]),
                 ],
                 Some(Monoid::sum()),
                 |x| vec![x[0] * x[1]],
             )
             .unwrap();
-        let o = g.reshape(o, &[t, d]).unwrap();
+        let o = g.reshape(o, &[rows, d]).unwrap();
         let o = if v.retention {
             b.dyt(o, format!("l{l}.ret_norm"), 0.5)
         } else {
@@ -539,7 +540,7 @@ pub fn build(c: Config, v: Variant) -> Model {
     // tied head: logits = x · Eᵀ
     let logits = g
         .comp(
-            &[t, vocab],
+            &[rows, vocab],
             &[d],
             vec![
                 arg(x, 3, &[Some(0), Some(2)]),
@@ -551,7 +552,7 @@ pub fn build(c: Config, v: Variant) -> Model {
         .unwrap();
     let mx = g
         .comp(
-            &[t],
+            &[rows],
             &[vocab],
             vec![arg(logits, 2, &[Some(0), Some(1)])],
             Some(Monoid::max()),
@@ -561,7 +562,7 @@ pub fn build(c: Config, v: Variant) -> Model {
     let mxs = g.stop_grad(mx).unwrap(); // the max shift is a constant to the loss
     let sum = g
         .comp(
-            &[t],
+            &[rows],
             &[vocab],
             vec![arg(logits, 2, &[Some(0), Some(1)]), arg(mxs, 2, &[Some(0)])],
             Some(Monoid::sum()),
@@ -570,7 +571,7 @@ pub fn build(c: Config, v: Variant) -> Model {
         .unwrap();
     let tgt = g
         .comp(
-            &[t],
+            &[rows],
             &[vocab],
             vec![
                 arg(logits, 2, &[Some(0), Some(1)]),
@@ -584,14 +585,14 @@ pub fn build(c: Config, v: Variant) -> Model {
     let loss = g
         .comp(
             &[1usize],
-            &[t],
+            &[rows],
             vec![
                 arg(sum, 2, &[Some(1)]),
                 arg(mxs, 2, &[Some(1)]),
                 arg(tgt, 2, &[Some(1)]),
             ],
             Some(Monoid::sum()),
-            |z| vec![(z[0].ln() + z[1] - z[2]) / lit(t as f64)],
+            |z| vec![(z[0].ln() + z[1] - z[2]) / lit(rows as f64)],
         )
         .unwrap();
     let ids: Vec<TensorId> = params.iter().map(|p| p.id).collect();

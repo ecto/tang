@@ -9,6 +9,7 @@ fn tiny() -> Config {
         heads: 2,
         ff: 12,
         seq: 5,
+        batch: 1,
     }
 }
 
@@ -41,8 +42,12 @@ fn inputs(m: &Model, seed: u64) -> Vec<Vec<f64>> {
     let mut ins = vec![Vec::new(); n];
     let mut r = Rng(seed);
     let c = m.config;
-    ins[input_index(g, m.tokens)] = (0..c.seq).map(|i| ((i * 7 + 3) % c.vocab) as f64).collect();
-    ins[input_index(g, m.targets)] = (0..c.seq).map(|i| ((i * 5 + 1) % c.vocab) as f64).collect();
+    ins[input_index(g, m.tokens)] = (0..c.rows())
+        .map(|i| ((i * 7 + 3) % c.vocab) as f64)
+        .collect();
+    ins[input_index(g, m.targets)] = (0..c.rows())
+        .map(|i| ((i * 5 + 1) % c.vocab) as f64)
+        .collect();
     if let Some((cos, sin)) = m.rope {
         let (cv, sv) = rope_tables(&c);
         ins[input_index(g, cos)] = cv;
@@ -216,6 +221,7 @@ fn every_variant_learns_a_periodic_sequence() {
         heads: 2,
         ff: 32,
         seq: 8,
+        batch: 1,
     };
     let seq: Vec<u32> = (0..c.seq + 1).map(|i| (i % 5) as u32 + 1).collect();
     let (x, y) = (&seq[..c.seq], &seq[1..]);
@@ -232,5 +238,75 @@ fn every_variant_learns_a_periodic_sequence() {
             last.is_finite() && last < 0.5 * first,
             "{name} did not learn: {first} → {last}"
         );
+    }
+}
+
+/// A batch of two is the mean of the two sequences run alone: in loss and
+/// in every gradient, for both attention kinds. Attention never mixes
+/// sequences.
+#[test]
+fn a_batch_is_the_mean_of_its_sequences() {
+    for v in [Variant::TWIN, Variant::NATIVE] {
+        let one = build(tiny(), v);
+        let two = build(Config { batch: 2, ..tiny() }, v);
+        let base = inputs(&one, 4);
+        let seqs: [(Vec<f64>, Vec<f64>); 2] = [
+            (
+                (0..5).map(|i| ((i * 3 + 1) % 11) as f64).collect(),
+                (0..5).map(|i| ((i * 2 + 5) % 11) as f64).collect(),
+            ),
+            (
+                (0..5).map(|i| ((i * 4 + 2) % 11) as f64).collect(),
+                (0..5).map(|i| ((i + 7) % 11) as f64).collect(),
+            ),
+        ];
+        let mut want_loss = 0.0;
+        let mut want_grads: Vec<Vec<f64>> = Vec::new();
+        for (tk, tg) in &seqs {
+            let mut ins = base.clone();
+            ins[input_index(&one.graph, one.tokens)] = tk.clone();
+            ins[input_index(&one.graph, one.targets)] = tg.clone();
+            want_loss += loss_at(&one, &ins) / 2.0;
+            let gs = one.graph.eval(&ins, &one.grads);
+            if want_grads.is_empty() {
+                want_grads = gs
+                    .iter()
+                    .map(|g| g.iter().map(|x| x / 2.0).collect())
+                    .collect();
+            } else {
+                for (w, g) in want_grads.iter_mut().zip(&gs) {
+                    for (a, b) in w.iter_mut().zip(g) {
+                        *a += b / 2.0;
+                    }
+                }
+            }
+        }
+        // the batch-of-two graph: same parameters, sequences stacked
+        let mut ins2 = inputs(&two, 4);
+        for (p1, p2) in one.params.iter().zip(&two.params) {
+            ins2[input_index(&two.graph, p2.id)] = base[input_index(&one.graph, p1.id)].clone();
+        }
+        if let (Some((c1, s1)), Some((c2, s2))) = (one.rope, two.rope) {
+            ins2[input_index(&two.graph, c2)] = base[input_index(&one.graph, c1)].clone();
+            ins2[input_index(&two.graph, s2)] = base[input_index(&one.graph, s1)].clone();
+        }
+        ins2[input_index(&two.graph, two.tokens)] = [seqs[0].0.clone(), seqs[1].0.clone()].concat();
+        ins2[input_index(&two.graph, two.targets)] =
+            [seqs[0].1.clone(), seqs[1].1.clone()].concat();
+        let got = loss_at(&two, &ins2);
+        assert!(
+            (got - want_loss).abs() < 1e-9,
+            "{v:?}: batch loss {got} vs {want_loss}"
+        );
+        let g2 = two.graph.eval(&ins2, &two.grads);
+        for (p, (a, b)) in two.params.iter().zip(g2.iter().zip(&want_grads)) {
+            for (x, y) in a.iter().zip(b) {
+                assert!(
+                    (x - y).abs() < 1e-9,
+                    "{v:?} {}: batch grad {x} vs {y}",
+                    p.name
+                );
+            }
+        }
     }
 }

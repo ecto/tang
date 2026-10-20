@@ -226,8 +226,8 @@ impl Trainer {
         let mut values = vec![Vec::new(); n];
         let mut rng = Rng(seed);
         let c = step.model.config;
-        values[step.input_index(step.model.tokens)] = vec![0.0; c.seq];
-        values[step.input_index(step.model.targets)] = vec![0.0; c.seq];
+        values[step.input_index(step.model.tokens)] = vec![0.0; c.rows()];
+        values[step.input_index(step.model.targets)] = vec![0.0; c.rows()];
         if let Some((cos, sin)) = step.model.rope {
             let (cv, sv) = rope_tables(&c);
             values[step.input_index(cos)] = cv;
