@@ -366,9 +366,9 @@ impl IntGraph {
         g.intern = intern;
         let n = g.nodes.len();
         // loops: closed, typed, scoped
-        for l in 0..g.loops.len() {
+        for (l, seen) in state_seen.iter().enumerate().take(g.loops.len()) {
             let lp = g.loops[l].clone();
-            if !state_seen[l].iter().all(|&s| s) {
+            if !seen.iter().all(|&s| s) {
                 return err("loop without all its states");
             }
             if lp.cond.index() >= n || lp.next.iter().chain(&lp.init).any(|x| x.index() >= n) {

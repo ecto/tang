@@ -160,8 +160,8 @@ impl Em<'_> {
                 let (n, i) = (&buf.name, self.r(i));
                 if w && self.guard {
                     let (word, z) = match buf.elem {
-                        Elem::I32 => (format!("{i}"), "0i"),
-                        Elem::U32 => (format!("{i}"), "0u"),
+                        Elem::I32 => (i.to_string(), "0i"),
+                        Elem::U32 => (i.to_string(), "0u"),
                         Elem::U8 => (format!("({i} >> 2u)"), "0u"),
                         Elem::I8 => (format!("({i} >> 2u)"), "0i"),
                     };
