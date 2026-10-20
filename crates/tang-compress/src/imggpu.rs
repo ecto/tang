@@ -93,7 +93,7 @@ pub fn shader(m: &Model) -> (String, Vec<(String, u32, u32)>, Sizes) {
     let mut s = String::new();
     let mut plan: Vec<(String, u32, u32)> = vec![];
     let tab = tables();
-    let woff = tab.len();
+    let woff = tab.len() + slots().len();
     let _ = writeln!(
         s,
         "@group(0) @binding(0) var<storage, read> ro: array<u32>;\n\
@@ -197,20 +197,22 @@ pub fn shader(m: &Model) -> (String, Vec<(String, u32, u32)>, Sizes) {
              \x20           let lb = u32(clamp((o1 + 1288) >> 4u, 0, {nlb1}));\n\
              \x20           let tof = (fbk * {NLB}u + lb) * {ns1}u;\n\
              \x20           sbase[y - ylo] = base; soff[y - ylo] = tof;\n\
-             \x20           scum[y - ylo] = vec4<u32>(ro[tof + {R}u], ro[tof + {R1}u], ro[tof + {R2}u], ro[tof + {R3}u]);\n\
+             \x20           sca[y - ylo] = vec4<u32>(ro[tof + {Rm2}u], ro[tof + {Rm1}u], ro[tof + {R}u], ro[tof + {R1}u]); scb[y - ylo] = vec4<u32>(ro[tof + {R2}u], ro[tof + {R3}u], ro[tof + {R4}u], ro[tof + {R5}u]);\n\
              \x20       }}\n\
              \x20       storageBarrier(); workgroupBarrier();\n\
              \x20       if (lid < {L}u) {{\n\
              \x20           for (var y = ylo + (lid + {L}u - ylo % {L}u) % {L}u; y <= yhi; y += {L}u) {{\n\
              \x20               let off = soff[y - ylo]; let base = sbase[y - ylo];\n\
              \x20               let v = st & 32767u;\n\
-             \x20               let cc = scum[y - ylo];\n\
+             \x20               let ca = sca[y - ylo]; let cb = scb[y - ylo];\n\
              \x20               var lo: u32; var c0: u32; var c1: u32;\n\
-             \x20               if (v >= cc.x && v < cc.w) {{\n\
-             \x20                   if (v < cc.y) {{ lo = {R}u; c0 = cc.x; c1 = cc.y; }} else if (v < cc.z) {{ lo = {R1}u; c0 = cc.y; c1 = cc.z; }} else {{ lo = {R2}u; c0 = cc.z; c1 = cc.w; }}\n\
+             \x20               if (v >= ca.x && v < cb.w) {{\n\
+             \x20                   let cs = array<u32, 8>(ca.x, ca.y, ca.z, ca.w, cb.x, cb.y, cb.z, cb.w);\n\
+             \x20                   let k = u32(v >= ca.y) + u32(v >= ca.z) + u32(v >= ca.w) + u32(v >= cb.x) + u32(v >= cb.y) + u32(v >= cb.z);\n\
+             \x20                   lo = {Rm2}u + k; c0 = cs[k]; c1 = cs[k + 1u];\n\
              \x20               }} else {{\n\
-             \x20                   lo = 0u; var hi = {NSYM}u;\n\
-             \x20                   while (hi - lo > 1u) {{ let mid = (lo + hi) / 2u; if (ro[off + mid] <= v) {{ lo = mid; }} else {{ hi = mid; }} }}\n\
+             \x20                   lo = ro[{soff}u + off / {ns1}u * 128u + (v >> 8u)];\n\
+             \x20                   while (ro[off + lo + 1u] <= v) {{ lo += 1u; }}\n\
              \x20                   c0 = ro[off + lo]; c1 = ro[off + lo + 1u];\n\
              \x20               }}\n\
              \x20               st = (c1 - c0) * (st >> 15u) + v - c0;\n\
@@ -234,10 +236,15 @@ pub fn shader(m: &Model) -> (String, Vec<(String, u32, u32)>, Sizes) {
              \x20   if (lid < {L}u) {{ lanes[2u * gl] = st; lanes[2u * gl + 1u] = pos; }}\n\
              }}\n",
             nlb1 = NLB - 1,
+            Rm2 = R - 2,
+            Rm1 = R - 1,
             R = R,
             R1 = R + 1,
             R2 = R + 2,
             R3 = R + 3,
+            R4 = R + 4,
+            R5 = R + 5,
+            soff = tables().len(),
             ns1 = NSYM + 1,
             L = lay.lanes,
             r1 = R + 1,
@@ -248,7 +255,7 @@ pub fn shader(m: &Model) -> (String, Vec<(String, u32, u32)>, Sizes) {
         s += &k;
         plan.push((format!("lat{g}"), lay.nt as u32, 1));
     }
-    let _ = writeln!(s, "var<workgroup> sbase: array<i32, {maxa}>;\nvar<workgroup> soff: array<u32, {maxa}>;\nvar<workgroup> scum: array<vec4<u32>, {maxa}>;");
+    let _ = writeln!(s, "var<workgroup> sbase: array<i32, {maxa}>;\nvar<workgroup> soff: array<u32, {maxa}>;\nvar<workgroup> sca: array<vec4<u32>, {maxa}>;\nvar<workgroup> scb: array<vec4<u32>, {maxa}>;");
 
     // ---- upsampling pyramid
     let idx: Vec<usize> = (0..n).filter(|&i| !m.hyper[i]).collect();
@@ -466,6 +473,7 @@ impl ImgGpu {
         let compile_s = t0.elapsed().as_secs_f64();
         // read-only data: tables then packed words (+ zero pad)
         let mut ro: Vec<u32> = tables().clone();
+        ro.extend_from_slice(slots());
         assert_eq!(ro.len(), sz.woff);
         let w = &p.words;
         for c in w.chunks(2) {
@@ -542,6 +550,26 @@ impl ImgGpu {
         }
         v
     }
+}
+
+/// Per table, 128 slots of `2^{PB−7}`: the first symbol whose CDF interval
+/// reaches the slot (the GPU's fallback search starts there).
+fn slots() -> &'static Vec<u32> {
+    static S: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    S.get_or_init(|| {
+        let t = tables();
+        let mut out = vec![];
+        for cum in t.chunks(NSYM + 1) {
+            let mut sym = 0;
+            for j in 0..128u32 {
+                while cum[sym + 1] <= j << 8 {
+                    sym += 1;
+                }
+                out.push(sym as u32);
+            }
+        }
+        out
+    })
 }
 
 fn bytemuck_u32(v: &[u32]) -> &[u8] {
