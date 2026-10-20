@@ -44,6 +44,7 @@ pub mod coefcode;
 pub mod gpudec;
 pub mod gpuwav;
 pub mod gpuwav3;
+pub mod img;
 pub mod interp;
 pub mod learned;
 pub mod linalg;
