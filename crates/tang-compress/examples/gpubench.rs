@@ -67,7 +67,7 @@ fn main() {
             tang_compress::learned::register(std::sync::Arc::new(tang_compress::learned::Net::from_bytes(&std::fs::read(p).unwrap()).unwrap()));
         }
         let threads: usize = opt(&args, "--threads", "16").parse().unwrap();
-        for f in args[1..].iter().filter(|a| a.ends_with(".tcg3")) {
+        for f in args[1..].iter().filter(|a| a.ends_with(".tcg3") || a.ends_with(".tcs3")) {
             let b = std::fs::read(f).unwrap();
             let want = std::fs::read_to_string(format!("{f}.hash")).unwrap();
             let t0 = Instant::now();
@@ -78,6 +78,53 @@ fn main() {
         }
         return;
     }
+    if mode == "ship3" {
+        // gpubench ship3 STREAM.tcg3... [--mlp] [pretrained:PATH]: write STREAM.tcs3 carrying the
+        // built-in decoder (with the net's MLP as a graph when --mlp); report bytes and compile/cache time
+        for p in args.iter().filter_map(|a| a.strip_prefix("pretrained:")) {
+            tang_compress::learned::register(std::sync::Arc::new(tang_compress::learned::Net::from_bytes(&std::fs::read(p).unwrap()).unwrap()));
+        }
+        let mlp = args.iter().any(|a| a == "--mlp");
+        for f in args[1..].iter().filter(|a| a.ends_with(".tcg3")) {
+            let b = std::fs::read(f).unwrap();
+            let ps = gpuwav3::parse3(&b).unwrap();
+            let prog = tang_compress::shipdec::builtin_program(if mlp { ps.net.as_ref() } else { None });
+            let w = tang_compress::shipdec::wrap(&b, &prog);
+            let out = format!("{}.tcs3", f.trim_end_matches(".tcg3"));
+            std::fs::write(&out, &w).unwrap();
+            std::fs::copy(format!("{f}.hash"), format!("{out}.hash")).unwrap();
+            let t0 = Instant::now();
+            let d = tang_compress::shipdec::compile(&prog).unwrap();
+            let verify_lower_s = t0.elapsed().as_secs_f64();
+            let t1 = Instant::now();
+            let _ = tang_compress::shipdec::compile_cached(&prog).unwrap();
+            let first_s = t1.elapsed().as_secs_f64();
+            let t2 = Instant::now();
+            let _ = tang_compress::shipdec::compile_cached(&prog).unwrap();
+            let hit_s = t2.elapsed().as_secs_f64();
+            #[cfg(not(feature = "gpu"))]
+            let gpu = String::new();
+            #[cfg(feature = "gpu")]
+            let gpu = {
+                let ws = gpuwav3::parse3(&w).unwrap();
+                let g = tang_compress::gpudec::GpuDecoder::new(ws.lanes, ws.d3.iter().copied().max().unwrap()).unwrap();
+                let mut tt = tang_compress::gpudec::GpuTimes::default();
+                let pr = g.prepare3(&ws, &w, &mut tt);
+                let cold = g.warm3(&pr);
+                let hot = g.warm3(&pr);
+                format!(",\"gpu_pipeline_cold_s\":{cold},\"gpu_pipeline_hit_s\":{hot}")
+            };
+            println!(
+                "{{\"out\":\"{out}\",\"stream_bytes\":{},\"program_bytes\":{},\"added_bytes\":{},\"mlp\":{},\"verify_lower_s\":{verify_lower_s},\"cache_miss_s\":{first_s},\"cache_hit_s\":{hit_s},\"wgsl_chars\":{}{gpu}}}",
+                b.len(),
+                prog.len(),
+                w.len() - b.len(),
+                d.mlp.is_some(),
+                d.wgsl_res.len() + d.wgsl_mlp.as_ref().map_or(0, |m| m.len())
+            );
+        }
+        return;
+    }
     #[cfg(feature = "gpu")]
     if mode == "gpu3" {
         // gpubench gpu3 STREAM... [--model3 pretrained:PATH]: GPU decode vs saved hash, kernel timing
@@ -85,7 +132,7 @@ fn main() {
             tang_compress::learned::register(std::sync::Arc::new(tang_compress::learned::Net::from_bytes(&std::fs::read(p).unwrap()).unwrap()));
         }
         let reps: usize = opt(&args, "--reps", "3").parse().unwrap();
-        for f in args[1..].iter().filter(|a| a.ends_with(".tcg3")) {
+        for f in args[1..].iter().filter(|a| a.ends_with(".tcg3") || a.ends_with(".tcs3")) {
             let b = std::fs::read(f).unwrap();
             let want = std::fs::read_to_string(format!("{f}.hash")).unwrap();
             let ps = gpuwav3::parse3(&b).unwrap();

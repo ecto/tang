@@ -352,3 +352,120 @@ fn rust_lowering_matches_eval() {
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(got, want);
 }
+
+#[test]
+fn div_rem_have_wgsl_semantics() {
+    let mut g = IntGraph::new();
+    let a = g.param(0, IType::I32);
+    let b = g.param(1, IType::I32);
+    let (ua, ub) = (g.bitcast(IType::U32, a), g.bitcast(IType::U32, b));
+    let o = vec![g.div(a, b), g.rem(a, b), g.div(ua, ub), g.rem(ua, ub)];
+    let mut p = Program::new(&g, &o);
+    for &(x, y) in &[(7i32, 2i32), (-7, 2), (7, -2), (5, 0), (i32::MIN, -1), (i32::MIN, 0), (-1, 3)] {
+        let mut out = [0u32; 4];
+        p.run(&[x as u32, y as u32], &[], &mut out);
+        let sd = if y == 0 { x } else { x.wrapping_div(y) };
+        let sr = if y == 0 { 0 } else { x.wrapping_rem(y) };
+        let (ux, uy) = (x as u32, y as u32);
+        assert_eq!(out, [sd as u32, sr as u32, if uy == 0 { ux } else { ux / uy }, if uy == 0 { 0 } else { ux % uy }]);
+    }
+}
+
+fn capped_collatz(cap: u32) -> (IntGraph, Vec<IId>) {
+    let (mut g, o) = collatz();
+    g.cap_loop(o[0], cap);
+    (g, o)
+}
+
+#[test]
+fn loop_caps_bound_trips() {
+    let (g, o) = capped_collatz(5);
+    let (h, _) = collatz();
+    let ho = collatz().1;
+    for x in [1u32, 2, 3, 27, 97] {
+        let c = g.eval(&o, &[x], &[]);
+        let u = h.eval(&ho, &[x], &[]);
+        assert_eq!(c[0], u[0].min(5), "x={x}");
+    }
+    // nested: inner loops re-arm their counter on every entry
+    let (mut g, o) = nested();
+    let inner = g.loops.iter().position(|l| l.parent.is_some()).unwrap();
+    g.loops[inner].cap = Some(3);
+    let n = 9u32;
+    let mut s = 0u32;
+    for i in 0..n {
+        for j in 0..i.min(3) {
+            s = s.wrapping_add(i.wrapping_mul(j) ^ 25);
+        }
+    }
+    assert_eq!(g.eval(&o, &[n, 5], &[]), vec![s]);
+}
+
+fn abi() -> (Vec<IType>, Vec<(&'static str, Elem)>) {
+    (vec![IType::U32, IType::U32], vec![("bi8", Elem::I8), ("bu8", Elem::U8), ("bw", Elem::I32)])
+}
+
+#[test]
+fn wire_round_trip_and_guarded_wgsl() {
+    let (mut g, o) = nested();
+    for l in 0..g.loops.len() {
+        g.loops[l].cap = Some(64);
+    }
+    let (pt, bufs) = abi();
+    let bytes = g.to_bytes(&o);
+    let (h, ho) = IntGraph::from_bytes(&bytes, &pt, &bufs, &[IType::U32], &Limits::default()).unwrap();
+    for (n, k) in [(0u32, 3u32), (5, 7), (40, 1)] {
+        assert_eq!(h.eval(&ho, &[n, k], &[]), g.eval(&o, &[n, k], &[]));
+    }
+    let (mut lg, lo) = loads();
+    for l in 0..lg.loops.len() {
+        lg.loops[l].cap = Some(64);
+    }
+    let lb = lg.to_bytes(&lo);
+    let (lh, lho) = IntGraph::from_bytes(&lb, &pt[..lg.nparams().len()], &bufs, &vec![IType::I32; lo.len()].iter().zip(&lo).map(|(_, &x)| lg.ty(x)).collect::<Vec<_>>(), &Limits::default()).unwrap();
+    let body = lh.to_wgsl_body_guarded(&lho, &["0u", "1u"], &(0..lho.len()).map(|_| "_").collect::<Vec<_>>(), 1);
+    let src = wgsl_module(&format!("fn guarded() {{\n{body}}}\n"));
+    let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{}\n{src}", e.emit_to_string(&src)));
+    naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("{e:?}\n{src}"));
+    // out-of-bounds loads read 0
+    assert!(lh.eval(&lho, &[1 << 30, 1 << 30], &[&[], &[], &[]]).iter().all(|&v| v == 0));
+}
+
+#[test]
+fn wire_rejects_bad_graphs() {
+    let (pt, bufs) = abi();
+    let lim = Limits::default();
+    let rd = |b: &[u8], p: &[IType]| IntGraph::from_bytes(b, p, &bufs, &[IType::U32], &lim);
+    let (g, o) = capped_collatz(100);
+    let good = g.to_bytes(&o[..1]);
+    assert!(rd(&good, &pt[..1]).is_ok());
+    // wrong param type
+    assert!(rd(&good, &[IType::I32]).is_err());
+    // over the trip limit / cost limit
+    let (g2, o2) = capped_collatz(1 << 13);
+    assert!(rd(&g2.to_bytes(&o2[..1]), &pt[..1]).is_err());
+    let tight = Limits { max_cost: 10, ..lim };
+    assert!(IntGraph::from_bytes(&good, &pt[..1], &bufs, &[IType::U32], &tight).is_err());
+    // truncations, trailing bytes and random corruption never panic
+    for n in 0..good.len() {
+        assert!(rd(&good[..n], &pt[..1]).is_err());
+    }
+    let mut t = good.clone();
+    t.push(0);
+    assert!(rd(&t, &pt[..1]).is_err());
+    let mut seed = 99u64;
+    for _ in 0..20000 {
+        let mut b = good.clone();
+        for _ in 0..1 + rng(&mut seed) % 4 {
+            let i = 4 + rng(&mut seed) as usize % (b.len() - 4);
+            b[i] = rng(&mut seed) as u8;
+        }
+        if let Ok((h, ho)) = rd(&b, &pt[..1]) {
+            // whatever passes is total and terminates
+            let _ = h.eval(&ho, &[27], &[&[], &[], &[]]);
+            let _ = h.to_wgsl_body_guarded(&ho, &["1u"], &["_"], 1);
+        }
+    }
+}

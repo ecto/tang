@@ -48,11 +48,22 @@ fn main() {
         for t in targets.split(',') {
             let bound = if let Some(p) = t.strip_prefix('p') { ErrorBound::Psnr(p.parse().unwrap()) } else { ErrorBound::MaxAbs(t[1..].parse::<f64>().unwrap() * range) };
             let bk = if two_d { 128 } else { 32 };
-            let streams: [(&str, Vec<u8>); 3] = [
+            let mut streams: Vec<(&str, Vec<u8>)> = vec![
                 ("tcg1", gpuwav::encode_f32_mt(&x, &dims, &GpuConfig { brick: if two_d { 512 } else { 64 }, lanes: 32, ..GpuConfig::new(bound) }, threads).0),
                 ("tcg3s", gpuwav3::encode3_f32(&x, &dims, &Gpu3Config { block: bk, block2d: bk, lanes: 1, ..Gpu3Config::new(bound) }, threads).0),
                 ("tcg3l", gpuwav3::encode3_f32(&x, &dims, &Gpu3Config { block: bk, block2d: bk, lanes: 8, model: Model3::Pretrained(net.clone()), ..Gpu3Config::new(bound) }, threads).0),
             ];
+            // --ship: the TCG3 streams again, carrying their decoder (learned: with the MLP)
+            if args.iter().any(|a| a == "--ship") {
+                let w: Vec<(&str, Vec<u8>)> = streams[1..]
+                    .iter()
+                    .map(|(f, s)| {
+                        let ps = gpuwav3::parse3(s).unwrap();
+                        (if *f == "tcg3s" { "tcs3s" } else { "tcs3l" }, tang_compress::shipdec::wrap(s, &tang_compress::shipdec::builtin_program(ps.net.as_ref())))
+                    })
+                    .collect();
+                streams.extend(w);
+            }
             for (fmt, s) in streams {
                 let file = format!("{name}_{t}_{fmt}.tc");
                 std::fs::write(out.join(&file), &s).unwrap();
