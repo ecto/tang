@@ -227,6 +227,7 @@ pub fn tokenize(
             #[cfg(feature = "parquet")]
             Some("parquet") => {
                 use parquet::file::reader::{FileReader, SerializedFileReader};
+                use parquet::record::RowAccessor;
                 let f = File::open(p).map_err(|e| format!("{}: {e}", p.display()))?;
                 let r =
                     SerializedFileReader::new(f).map_err(|e| format!("{}: {e}", p.display()))?;
