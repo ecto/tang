@@ -237,6 +237,27 @@ extern "C" __global__ void moe_sort(
 }
 
 #define MAXP 8
+#define MAXB 4   // blocks a lane preloads: rows up to K = 32 * 32 * MAXB = 4096
+
+// Pick `i`'s partial dot over one 32-weight block (`q`: its 16 bytes of nibbles).
+__device__ __forceinline__ float block_dot(const float* lut, uint4 q, const float* x) {
+    unsigned int qs[4] = {q.x, q.y, q.z, q.w};
+    const float4* x4 = (const float4*)x;
+    float d = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        float4 a = x4[2 * j], b = x4[2 * j + 1];
+        unsigned int v = qs[j];
+        d += lut[v & 15u] * a.x + lut[(v >> 4) & 15u] * a.y + lut[(v >> 8) & 15u] * a.z
+           + lut[(v >> 12) & 15u] * a.w + lut[(v >> 16) & 15u] * b.x
+           + lut[(v >> 20) & 15u] * b.y + lut[(v >> 24) & 15u] * b.z + lut[v >> 28] * b.w;
+    }
+    return d;
+}
+
+__device__ __forceinline__ float e8m0f(unsigned int s) {
+    return s == 0 ? __uint_as_float(1u << 22) : __uint_as_float(s << 23);
+}
 
 extern "C" __global__ void moe_gemv_mxfp4(
     const float* __restrict__ X, const unsigned char* __restrict__ Wt,
@@ -260,6 +281,20 @@ extern "C" __global__ void moe_gemv_mxfp4(
     const unsigned char* wb = Wt + ((u64)e * N + n) * (K / 2);
     const unsigned char* ws = Wt + (u64)E * N * (K / 2) + ((u64)e * N + n) * nb;
     float bias = has_bias ? B[(u64)e * N + n] : 0.0f;
+    // Rows that fit: every load of the row in flight at once, before any arithmetic.
+    bool pre = nb <= 32 * MAXB;
+    uint4 qv[MAXB];
+    float sv[MAXB];
+    if (pre) {
+        #pragma unroll
+        for (int t = 0; t < MAXB; t++) {
+            unsigned int b = lane + 32 * t;
+            if (b < nb) {
+                qv[t] = *(const uint4*)(wb + (u64)b * 16);
+                sv[t] = e8m0f(ws[b]);
+            }
+        }
+    }
     for (unsigned int c0 = p0; c0 < p1; c0 += MAXP) {
         unsigned int cnt = min((unsigned int)MAXP, p1 - c0);
         const float* xr[MAXP];
@@ -271,29 +306,26 @@ extern "C" __global__ void moe_gemv_mxfp4(
         float acc[MAXP];
         #pragma unroll
         for (unsigned int i = 0; i < MAXP; i++) acc[i] = 0.0f;
-        for (unsigned int b = lane; b < nb; b += 32) {
-            uint4 q = *(const uint4*)(wb + (u64)b * 16);
-            unsigned int s = ws[b];
-            float sc = s == 0 ? __uint_as_float(1u << 22) : __uint_as_float(s << 23);
-            float w[32];
-            unsigned int qs[4] = {q.x, q.y, q.z, q.w};
+        if (pre) {
             #pragma unroll
-            for (int j = 0; j < 4; j++) {
+            for (int t = 0; t < MAXB; t++) {
+                unsigned int b = lane + 32 * t;
+                if (b >= nb) break;
                 #pragma unroll
-                for (int t = 0; t < 8; t++) w[j * 8 + t] = lut[(qs[j] >> (4 * t)) & 15u];
-            }
-            #pragma unroll
-            for (unsigned int i = 0; i < MAXP; i++) {
-                if (i >= cnt) break;
-                const float4* x4 = (const float4*)(xr[i] + (u64)b * 32);
-                float d = 0.0f;
-                #pragma unroll
-                for (int t = 0; t < 8; t++) {
-                    float4 xv = x4[t];
-                    d += w[4 * t] * xv.x + w[4 * t + 1] * xv.y + w[4 * t + 2] * xv.z
-                       + w[4 * t + 3] * xv.w;
+                for (unsigned int i = 0; i < MAXP; i++) {
+                    if (i >= cnt) break;
+                    acc[i] += sv[t] * block_dot(lut, qv[t], xr[i] + (u64)b * 32);
                 }
-                acc[i] += sc * d;
+            }
+        } else {
+            for (unsigned int b = lane; b < nb; b += 32) {
+                uint4 q = *(const uint4*)(wb + (u64)b * 16);
+                float sc = e8m0f(ws[b]);
+                #pragma unroll
+                for (unsigned int i = 0; i < MAXP; i++) {
+                    if (i >= cnt) break;
+                    acc[i] += sc * block_dot(lut, q, xr[i] + (u64)b * 32);
+                }
             }
         }
         #pragma unroll
