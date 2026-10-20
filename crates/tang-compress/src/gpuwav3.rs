@@ -136,6 +136,8 @@ fn code_block<S: Sink>(
     s: &mut S,
 ) {
     let [_, ny, nx] = sh.dims;
+    // TC_CPU_IR: evaluate the net with the tang-expr integer interpreter
+    let mut prog = net.filter(|_| cpu_ir()).map(|n| n.program());
     for_lines(b, lanes.max(1), |p, lane, z, y| {
         let w = &preds[b.pkey[p]];
         let rc = row_ctx(sh, b, p, z, y);
@@ -145,7 +147,12 @@ fn code_block<S: Sink>(
             let r = match net {
                 None => code_res::<S, false>(s, lane, m, b.class, &f, q[i].wrapping_sub(pred)),
                 Some(n) => {
-                    let mx = Mix3::new(&n.infer(&feat_vec3(&f, b.class)));
+                    let x = feat_vec3(&f, b.class);
+                    let o = match prog.as_mut() {
+                        Some(p) => n.infer_ir(p, &x),
+                        None => n.infer(&x),
+                    };
+                    let mx = Mix3::new(&o);
                     code_learned(s, lane, &mx, q[i].wrapping_sub(pred))
                 }
             };
@@ -155,6 +162,11 @@ fn code_block<S: Sink>(
             }
         }
     });
+}
+
+fn cpu_ir() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TC_CPU_IR").is_ok())
 }
 
 fn block_dims(d3: [usize; 3], cfg_block: usize, block2d: usize) -> [usize; 3] {

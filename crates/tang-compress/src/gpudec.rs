@@ -671,7 +671,8 @@ impl GpuDecoder {
         }
         let a = self.src.find("// MLP_BEGIN").unwrap();
         let b = self.src.find("// MLP_END").unwrap();
-        let src = format!("{}{}{}", &self.src[..a], gen_mlp(net), &self.src[b..]);
+        let mlp = if std::env::var("TC_GPU_HANDMLP").is_ok() { gen_mlp(net) } else { ir_mlp(net) };
+        let src = format!("{}{}{}", &self.src[..a], mlp, &self.src[b..]);
         let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("tc-gpu-mlp"), source: wgpu::ShaderSource::Wgsl(src.into()) });
         let mk = |e: &str| {
             self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -727,6 +728,19 @@ impl GpuDecoder {
     }
 }
 
+/// The net's MLP lowered from its `tang-expr` integer graph
+/// ([`Net32::graph`](crate::lmodel3::Net32::graph)): straight-line WGSL with
+/// the weights as literals, reading `na[0..NFL]` and writing `na[0..NO]`.
+fn ir_mlp(net: &crate::lmodel3::Net32) -> String {
+    let (g, outs) = net.graph();
+    let params: Vec<String> = (0..crate::lmodel3::NFL).map(|i| format!("na[{i}]")).collect();
+    let dests: Vec<String> = (0..outs.len()).map(|o| format!("na[{o}]")).collect();
+    let p: Vec<&str> = params.iter().map(|s| s.as_str()).collect();
+    let d: Vec<&str> = dests.iter().map(|s| s.as_str()).collect();
+    format!("fn mlp_gen() {{\n{}}}\n", g.to_wgsl_body(&outs, &p, &d, 1))
+}
+
+/// Hand-written generator kept for A/B (`TC_GPU_HANDMLP`).
 /// Straight-line WGSL for the net: weights and biases as literals, no
 /// memory traffic, same wrapping i32 arithmetic (integer addition is
 /// associative, so term order and dropped zero terms do not change a bit).

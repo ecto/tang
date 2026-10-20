@@ -19,6 +19,7 @@
 use crate::gpuwav::{Feats, Sink};
 use crate::learned::{lg_q8, Net, NF, NO};
 use std::sync::OnceLock;
+use tang_expr::int::{IId, IType, IntGraph, Program};
 
 /// Features actually used (the rest of the `NF` inputs are zero).
 pub const NFL: usize = 28;
@@ -131,6 +132,56 @@ impl Net32 {
             std::mem::swap(&mut a, &mut nb);
         }
         [a[0], a[1], a[2], a[3], a[4]]
+    }
+
+    /// The forward pass as a `tang-expr` integer graph: params are the
+    /// [`NFL`] clamped inputs, outputs the [`NO`] mixture parameters. Zero
+    /// weights are dropped (integer addition is associative, so no bit
+    /// changes). This one graph is lowered to the GPU kernel's MLP and
+    /// evaluated as the CPU reference ([`Net32::program`]).
+    pub fn graph(&self) -> (IntGraph, Vec<IId>) {
+        let mut g = IntGraph::new();
+        let mut a: Vec<IId> = (0..NFL).map(|i| g.param(i as u16, IType::I32)).collect();
+        let nl = self.sizes.len() - 1;
+        let (r, sh) = (g.i32(128), g.u32(8));
+        for l in 0..nl {
+            let (ni, no) = (self.sizes[l], self.sizes[l + 1]);
+            let (lo, hi) = if l + 1 < nl { (g.i32(0), g.i32(1 << 14)) } else { (g.i32(-(1 << 14)), g.i32(1 << 14)) };
+            a = (0..no)
+                .map(|o| {
+                    let mut acc = g.i32(self.b[l][o]);
+                    for (i, &ai) in a.iter().enumerate().take(ni) {
+                        let w = self.w[l][o * ni + i];
+                        if w != 0 {
+                            let w = g.i32(w);
+                            let t = g.mul(w, ai);
+                            acc = g.add(acc, t);
+                        }
+                    }
+                    let v = g.add(acc, r);
+                    let v = g.shr(v, sh);
+                    g.clamp(v, lo, hi)
+                })
+                .collect();
+        }
+        (g, a)
+    }
+
+    /// [`Net32::graph`] compiled for [`Net32::infer_ir`].
+    pub fn program(&self) -> Program {
+        let (g, o) = self.graph();
+        Program::new(&g, &o)
+    }
+
+    /// [`Net32::infer`] through the integer-graph interpreter (bit-identical).
+    pub fn infer_ir(&self, p: &mut Program, x: &[i32; NF]) -> [i32; NO] {
+        let mut inp = [0u32; NFL];
+        for i in 0..NFL {
+            inp[i] = x[i].clamp(-(1 << 14), 1 << 14) as u32;
+        }
+        let mut o = [0u32; NO];
+        p.run(&inp, &[], &mut o);
+        o.map(|v| v as i32)
     }
 
     /// Flattened `[nl, sizes…, w₀, b₀, w₁, b₁, …]` for the GPU.
@@ -268,6 +319,34 @@ pub fn code_learned<S: Sink>(s: &mut S, lane: usize, mx: &Mix3, r: i32) -> i32 {
 mod tests {
     use super::*;
     use crate::gpuwav::{rans_encode, DecSink, RansDec, RecSink};
+
+    #[test]
+    fn ir_graph_matches_infer() {
+        let mut st = 7u64;
+        let mut rnd = || {
+            st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (st >> 33) as i32
+        };
+        for sizes in [vec![NFL, 16, NO], vec![NFL, 32, 16, NO]] {
+            let w = (0..sizes.len() - 1)
+                .map(|l| (0..sizes[l] * sizes[l + 1]).map(|k| if k % 5 == 0 { 0 } else { rnd() % 4095 - 2047 }).collect())
+                .collect();
+            let b = (1..sizes.len()).map(|l| (0..sizes[l]).map(|_| rnd() % (1 << 25) - (1 << 24)).collect()).collect();
+            let net = Net32 { sizes, w, b };
+            let mut p = net.program();
+            for k in 0..5000 {
+                let mut x = [0i32; NF];
+                for v in x.iter_mut() {
+                    *v = match k % 3 {
+                        0 => rnd() % 40000 - 20000,
+                        1 => rnd() % 512,
+                        _ => [16384, -16384, i32::MAX, i32::MIN][(rnd() & 3) as usize],
+                    };
+                }
+                assert_eq!(net.infer_ir(&mut p, &x), net.infer(&x));
+            }
+        }
+    }
 
     #[test]
     fn learned_round_trip() {
