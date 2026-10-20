@@ -55,9 +55,30 @@ pub struct Model<D: ComputeDevice> {
     /// attention still accumulates in f32) unless the device has no bf16 storage, or with
     /// `TANG_KV_F32=1`.
     pool: Shared<D::Buffer>,
+    /// Faster implementations registered for this device and model (see [`crate::ext`]).
+    ext: crate::ext::Ext<D>,
 }
 
 pub use crate::blocks::Cache;
+
+/// One layer's weights (see [`Model::layer_weights`]). Matrices are in the load dtype, shaped
+/// as [`Layer`]'s fields describe; norms are f32 (Gemma's `1 + w` already folded in).
+pub struct LayerWeights<'a, B> {
+    pub attn_norm: &'a B,
+    pub wqkv: &'a B,
+    pub wo: &'a B,
+    pub q_norm: Option<&'a B>,
+    pub k_norm: Option<&'a B>,
+    pub mlp_norm: &'a B,
+    pub w_gate_up: &'a B,
+    pub w_down: &'a B,
+    pub post_attn_norm: Option<&'a B>,
+    pub post_mlp_norm: Option<&'a B>,
+    /// Sliding window (0: global).
+    pub window: usize,
+    /// This layer's RoPE (cos, sin) tables.
+    pub rope: (&'a B, &'a B),
+}
 
 impl<D: ComputeDevice> Model<D> {
     /// Load a checkpoint directory. Matrices are kept in `dtype` on device; norms stay f32.
@@ -211,7 +232,16 @@ impl<D: ComputeDevice> Model<D> {
             }
             _ => None,
         };
+        let quant = if quant.is_some() || dtype == Dtype::Q4 {
+            "q4"
+        } else if dtype == Dtype::Bf16 {
+            "bf16"
+        } else {
+            "f32"
+        };
+        let target = crate::ext::target(&dev, &cfg, quant);
         Ok(Self {
+            ext: crate::ext::Ext::resolve(target),
             cfg,
             dev,
             embed,
@@ -258,6 +288,65 @@ impl<D: ComputeDevice> Model<D> {
         let mut pool = blocks::lock(&self.pool);
         let max = bytes.map_or(usize::MAX, |b| (b / pool.block_bytes()).max(1));
         pool.set_max_blocks(max);
+    }
+
+    /// What this model resolved from the extension registry (see [`crate::ext`]).
+    pub fn ext(&self) -> &crate::ext::Ext<D> {
+        &self.ext
+    }
+
+    /// Resolve the registry again (after registering something since load).
+    pub fn resolve_ext(&mut self) {
+        let t = self.ext.target.clone();
+        self.ext = crate::ext::Ext::resolve(t);
+    }
+
+    /// Remove the resolved extensions, leaving the built-in kernels (and the target).
+    pub fn take_ext(&mut self) -> crate::ext::Ext<D> {
+        let t = self.ext.target.clone();
+        std::mem::replace(
+            &mut self.ext,
+            crate::ext::Ext {
+                target: t,
+                ..Default::default()
+            },
+        )
+    }
+
+    pub fn set_ext(&mut self, e: crate::ext::Ext<D>) {
+        self.ext = e;
+    }
+
+    /// Layer `l`'s weights, read-only, for step overrides that run the layers themselves.
+    pub fn layer_weights(&self, l: usize) -> LayerWeights<'_, D::Buffer> {
+        let w = &self.layers[l];
+        LayerWeights {
+            attn_norm: &w.attn_norm,
+            wqkv: &w.wqkv,
+            wo: &w.wo,
+            q_norm: w.q_norm.as_ref(),
+            k_norm: w.k_norm.as_ref(),
+            mlp_norm: &w.mlp_norm,
+            w_gate_up: &w.w_gate_up,
+            w_down: &w.w_down,
+            post_attn_norm: w.post_attn_norm.as_ref(),
+            post_mlp_norm: w.post_mlp_norm.as_ref(),
+            window: w.window,
+            rope: self
+                .ropes
+                .get(w.rope)
+                .map(|(c, s)| (c, s))
+                .expect("rope table"),
+        }
+    }
+
+    /// The embedding table, final norm and output head (the embedding when tied).
+    pub fn io_weights(&self) -> (&D::Buffer, &D::Buffer, &D::Buffer) {
+        (
+            &self.embed,
+            &self.norm,
+            self.lm_head.as_ref().unwrap_or(&self.embed),
+        )
     }
 
     pub fn max_ctx(&self) -> usize {
@@ -505,6 +594,17 @@ impl<D: ComputeDevice> Model<D> {
     /// row's if its `all` is set. A segment's logits are what [`forward`](Self::forward) would
     /// return for it alone, up to the matmul kernel's summation order for this many rows.
     pub fn forward_batch(&self, segs: &mut [Segment<'_, D::Buffer>]) -> Result<Vec<Vec<f32>>> {
+        if let Some(r) = self.ext.step.as_ref().and_then(|e| (e.imp.0)(self, segs)) {
+            return r;
+        }
+        self.forward_batch_builtin(segs)
+    }
+
+    /// [`forward_batch`](Self::forward_batch) without a step override (what one falls back to).
+    pub fn forward_batch_builtin(
+        &self,
+        segs: &mut [Segment<'_, D::Buffer>],
+    ) -> Result<Vec<Vec<f32>>> {
         let c = &self.cfg;
         let dev = &self.dev;
         anyhow::ensure!(!segs.is_empty(), "no segments");
@@ -619,13 +719,14 @@ impl<D: ComputeDevice> Model<D> {
     ) -> D::Buffer {
         let dev = &self.dev;
         let rows: usize = groups.iter().map(|g| g.1).sum();
+        let ops = &self.ext.ops;
         if groups.len() == 1 {
-            return dev.linear(x, w, rows, k, n);
+            return ops.linear(dev, x, w, rows, k, n);
         }
         let mut out = dev.alloc_uninit_f32(rows * n);
         for &(r, m) in groups {
             let part = dev.slice_buffer(x, r * k, m * k);
-            dev.write_into(&mut out, r * n, &dev.linear(&part, w, m, k, n));
+            dev.write_into(&mut out, r * n, &ops.linear(dev, &part, w, m, k, n));
         }
         out
     }
@@ -652,6 +753,7 @@ impl<D: ComputeDevice> Model<D> {
     ) -> Result<()> {
         let c = &self.cfg;
         let dev = &self.dev;
+        let ops = &self.ext.ops;
         let (h, hd, nh, nkv) = (
             c.hidden_size,
             c.head_dim(),
@@ -708,7 +810,7 @@ impl<D: ComputeDevice> Model<D> {
             .collect();
         for (l, w) in self.layers.iter().take(layer_limit).enumerate() {
             let (kp, vp) = pool.layer(l);
-            let a = dev.rms_norm(x, &w.attn_norm, s, h, eps);
+            let a = ops.rms_norm(dev, x, &w.attn_norm, s, h, eps);
             let qkv = self.linear_rows(&a, &w.wqkv, &groups, h, qd + 2 * kvd);
             let (cos, sin) = &self.ropes[w.rope];
             // Rows the fused call covers (all of them, or a leading run), then the rest one
@@ -787,16 +889,19 @@ impl<D: ComputeDevice> Model<D> {
                 if query_scale != 1.0 {
                     dev.scale_buffer(&mut q, query_scale);
                 }
-                let o = dev.kv_attention_paged(
-                    &q,
-                    kp,
-                    vp,
-                    &pages,
-                    *pos,
-                    *n,
-                    (nh, nkv, hd),
-                    w.window,
-                    causal,
+                let o = ops.kv_attention_paged(
+                    dev,
+                    &crate::ext::PagedAttention {
+                        q: &q,
+                        k_pool: kp,
+                        v_pool: vp,
+                        pages: &pages,
+                        start: *pos,
+                        rows: *n,
+                        heads: (nh, nkv, hd),
+                        window: w.window,
+                        causal,
+                    },
                 );
                 match att.as_mut() {
                     Some(all) => dev.write_into(all, row * qd, &o),
@@ -806,11 +911,11 @@ impl<D: ComputeDevice> Model<D> {
             let att = att.or(single).expect("a part");
             let mut o = self.linear_rows(&att, &w.wo, &groups, qd, h);
             if let Some(n) = &w.post_attn_norm {
-                o = dev.rms_norm(&o, n, s, h, eps);
+                o = ops.rms_norm(dev, &o, n, s, h, eps);
             }
             *x = dev.add_tensors_buf(x, &o, s * h);
 
-            let m = dev.rms_norm(x, &w.mlp_norm, s, h, eps);
+            let m = ops.rms_norm(dev, x, &w.mlp_norm, s, h, eps);
             let gu = self.linear_rows(&m, &w.w_gate_up, &groups, h, 2 * ff);
             let act = if c.is_gemma() {
                 dev.geglu_split(&gu, s, ff)
@@ -819,7 +924,7 @@ impl<D: ComputeDevice> Model<D> {
             };
             let mut d = self.linear_rows(&act, &w.w_down, &groups, ff, h);
             if let Some(n) = &w.post_mlp_norm {
-                d = dev.rms_norm(&d, n, s, h, eps);
+                d = ops.rms_norm(dev, &d, n, s, h, eps);
             }
             *x = dev.add_tensors_buf(x, &d, s * h);
             // Large multimodal and conditioning pieces retain every temporary until their
@@ -906,6 +1011,7 @@ mod conditioning_tests {
             vision: None,
             max_ctx: 2048,
             pool: new_pool(2, 4, false, usize::MAX),
+            ext: Default::default(),
             dev,
         }
     }

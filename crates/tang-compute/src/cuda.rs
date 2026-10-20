@@ -1207,6 +1207,16 @@ impl ComputeDevice for CudaComputeDevice {
         self.ctx.name().unwrap_or_default()
     }
 
+    fn arch(&self) -> String {
+        use cudarc::driver::sys::CUdevice_attribute as A;
+        let cc = |a| self.ctx.attribute(a).unwrap_or(0);
+        format!(
+            "sm_{}{}",
+            cc(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR),
+            cc(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
+        )
+    }
+
     fn pool_clear(&self) {
         CudaComputeDevice::pool_clear(self);
     }

@@ -13,6 +13,7 @@ pub mod dit;
 pub mod draft;
 pub mod draft_model;
 pub mod engine;
+pub mod ext;
 pub mod flash;
 pub mod gguf;
 pub mod image_pipeline;
