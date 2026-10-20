@@ -3521,8 +3521,11 @@ impl Mtp {
                     None
                 }
             },
+            // head2's kernel reads a Q5_K head; other heads (the Coder's Q6_K) take the
+            // generic path.
             head2: if vocab_lo.is_some()
                 && !std::env::var("TANG_FLASH_MTP_HEAD2").is_ok_and(|v| v == "0")
+                && main.info("output.weight")?.ty == GgmlType::Q5K
             {
                 let n_lo =
                     vocab_lo.context("TANG_FLASH_MTP_HEAD2 needs a pruned draft vocabulary")?;
