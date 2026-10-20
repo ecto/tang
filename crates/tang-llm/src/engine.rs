@@ -264,6 +264,9 @@ pub struct Engine<D: ComputeDevice> {
     /// many decode in the current step.
     spec_max_streams: usize,
     decoding: usize,
+    /// Sample from device-cut top candidates where a sampler allows (`TANG_TOP_SAMPLING=0`
+    /// turns it off: whole rows come back as before).
+    top_sampling: bool,
     /// Finished streams' outputs, for the global draft automaton once no stream drafts.
     global_pending: Vec<Vec<u32>>,
 }
@@ -301,7 +304,7 @@ pub struct Stream<B> {
     tool_calls: usize,
     drafter: Option<Drafter>,
     /// Logits rows from the last forward: row r follows the fed tokens and `draft[..r]`.
-    rows: Vec<f32>,
+    rows: crate::model::Logits,
     draft: crate::draft::Draft,
     row: usize,
     /// Draft tokens in the cache that aren't accepted yet.
@@ -365,7 +368,7 @@ impl<B> Stream<B> {
     }
 
     /// The prompt is in the cache; `logits` are its last position's.
-    fn prefilled(&mut self, logits: Vec<f32>) {
+    fn prefilled(&mut self, logits: crate::model::Logits) {
         self.end_prefill();
         if self.prefill_only {
             self.finish = Finish::Stop;
@@ -539,6 +542,7 @@ impl<D: ComputeDevice> Engine<D> {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(SPEC_MAX_STREAMS),
             decoding: 0,
+            top_sampling: std::env::var("TANG_TOP_SAMPLING").map_or(true, |v| v != "0"),
             global_pending: Vec::new(),
         })
     }
@@ -1270,7 +1274,7 @@ impl<D: ComputeDevice> Engine<D> {
             finish: Finish::Length,
             tool_calls: 0,
             drafter,
-            rows: Vec::new(),
+            rows: Default::default(),
             draft: crate::draft::Draft::default(),
             row: 0,
             pending: 0,
@@ -1306,7 +1310,7 @@ impl<D: ComputeDevice> Engine<D> {
                 };
             st.progress.prefilled = st.ids.len() - reuse;
             st.images = runs;
-            st.prefilled(logits);
+            st.prefilled(crate::model::Logits::Full(logits));
         }
         Ok(st)
     }
@@ -1402,6 +1406,23 @@ impl<D: ComputeDevice> Engine<D> {
             st.fed.extend_from_slice(&st.ids[from..from + n]);
             *seg = Some(false);
         }
+        // Rows a stream's sampler can draw from their top candidates are cut on the device
+        // (see `Logits::Top`); a grammar needs the whole row to mask. A lone stream samples
+        // its one row on the host as fast (measured on an H100), and either way picks the same
+        // token, so only batches cut.
+        let batched = segs.iter().filter(|s| s.is_some()).count() > 1;
+        let top: Vec<bool> = lanes
+            .iter()
+            .zip(&segs)
+            .filter(|(_, seg)| seg.is_some())
+            .map(|(lane, _)| {
+                let st = &lane.stream;
+                self.top_sampling
+                    && batched
+                    && st.constraint.is_none()
+                    && st.sampler.top_needed(crate::model::TOP_LOGITS).is_some()
+            })
+            .collect();
         let mut idx = Vec::new();
         let mut parts = Vec::new();
         for (i, (lane, seg)) in lanes.iter_mut().zip(&segs).enumerate() {
@@ -1420,7 +1441,7 @@ impl<D: ComputeDevice> Engine<D> {
         }
         let solo = parts.len() == 1;
         let tf = Instant::now();
-        let logits = self.model.forward_batch(&mut parts)?;
+        let logits = self.model.forward_batch_top(&mut parts, &top)?;
         let secs = tf.elapsed().as_secs_f64();
         self.step_cost.observe(&shape, secs);
         drop(parts);
@@ -1455,7 +1476,7 @@ impl<D: ComputeDevice> Engine<D> {
                     }
                     st.rows = rows;
                     if k > 0 {
-                        st.rows.drain(..(m - 1) * vocab);
+                        st.rows.skip_rows(m - 1, vocab);
                     }
                     st.row = 0;
                     st.pending = k;
@@ -1487,11 +1508,20 @@ impl<D: ComputeDevice> Engine<D> {
                 st.finish = Finish::Cancelled;
                 break;
             }
-            let logits = &mut st.rows[st.row * vocab..(st.row + 1) * vocab];
-            if let Some(grammar) = st.constraint.as_mut() {
-                crate::structured::mask(grammar, logits, &self.eos)?;
-            }
-            let next = st.sampler.sample(logits);
+            let next = match &mut st.rows {
+                crate::model::Logits::Full(rows) => {
+                    let logits = &mut rows[st.row * vocab..(st.row + 1) * vocab];
+                    if let Some(grammar) = st.constraint.as_mut() {
+                        crate::structured::mask(grammar, logits, &self.eos)?;
+                    }
+                    st.sampler.sample(logits)
+                }
+                crate::model::Logits::Top { vals, idx } => {
+                    let k = crate::model::TOP_LOGITS.min(vocab);
+                    let r = st.row * k..(st.row + 1) * k;
+                    st.sampler.sample_top(&vals[r.clone()], &idx[r])
+                }
+            };
             let row = st.row;
             let hit = st.draft.tokens.get(row) == Some(&next);
             if row < st.draft.tokens.len() && !st.draft.from_model {

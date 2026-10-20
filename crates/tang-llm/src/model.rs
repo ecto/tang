@@ -625,6 +625,33 @@ impl<D: ComputeDevice> Model<D> {
         &self,
         segs: &mut [Segment<'_, D::Buffer>],
     ) -> Result<Vec<Vec<f32>>> {
+        let full = vec![false; segs.len()];
+        Ok(self
+            .forward_batch_top_builtin(segs, &full)?
+            .into_iter()
+            .map(Logits::into_full)
+            .collect())
+    }
+
+    /// [`forward_batch`](Self::forward_batch), with the logits of each segment whose `top` is
+    /// set cut to their [`TOP_LOGITS`] largest on the device ([`Logits::Top`]): a few hundred
+    /// bytes a row come back instead of the vocabulary. A step override returns whole rows.
+    pub fn forward_batch_top(
+        &self,
+        segs: &mut [Segment<'_, D::Buffer>],
+        top: &[bool],
+    ) -> Result<Vec<Logits>> {
+        if let Some(r) = self.ext.step.as_ref().and_then(|e| (e.imp.0)(self, segs)) {
+            return Ok(r?.into_iter().map(Logits::Full).collect());
+        }
+        self.forward_batch_top_builtin(segs, top)
+    }
+
+    fn forward_batch_top_builtin(
+        &self,
+        segs: &mut [Segment<'_, D::Buffer>],
+        top: &[bool],
+    ) -> Result<Vec<Logits>> {
         let c = &self.cfg;
         let dev = &self.dev;
         anyhow::ensure!(!segs.is_empty(), "no segments");
@@ -691,12 +718,30 @@ impl<D: ComputeDevice> Model<D> {
             .step_by(SHORT_ROWS)
             .map(|r| (r, SHORT_ROWS.min(n - r)))
             .collect();
-        let logits = dev.download(&self.linear_rows(&picked, head, &pieces, h, c.vocab_size));
+        let lg = self.linear_rows(&picked, head, &pieces, h, c.vocab_size);
         let v = c.vocab_size;
-        let mut out = vec![Vec::new(); order.len()];
+        let k = TOP_LOGITS.min(v);
+        let tops = if order.iter().any(|&i| top[i]) {
+            dev.top_k_rows(&lg, n, v, k)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let logits = if order.iter().any(|&i| !top[i]) {
+            dev.download(&lg)
+        } else {
+            Vec::new()
+        };
+        let mut out = vec![Logits::default(); order.len()];
         let mut o = 0;
         for ((g, &(_, len)), &i) in ordered.iter_mut().zip(&rows).zip(&order) {
-            out[i] = logits[o * v..(o + len) * v].to_vec();
+            out[i] = if top[i] {
+                Logits::Top {
+                    vals: tops.0[o * k..(o + len) * k].to_vec(),
+                    idx: tops.1[o * k..(o + len) * k].to_vec(),
+                }
+            } else {
+                Logits::Full(logits[o * v..(o + len) * v].to_vec())
+            };
             o += len;
             g.cache.len += g.tokens.len();
             g.cache.tokens.extend_from_slice(g.tokens);
@@ -749,6 +794,45 @@ impl<D: ComputeDevice> Model<D> {
             dev.write_into(&mut out, r * n, &ops.linear(dev, &part, w, m, k, n));
         }
         out
+    }
+}
+
+/// Candidates a row's logits are cut to on the device when its sampler allows
+/// ([`Logits::Top`]): fixed, so a row gets the same candidates whatever it's batched with.
+pub const TOP_LOGITS: usize = 64;
+
+/// A segment's logits from [`Model::forward_batch_top`]: whole rows, or each row's
+/// [`TOP_LOGITS`] largest, descending with their columns (ties to the lower column).
+#[derive(Debug, Clone)]
+pub enum Logits {
+    Full(Vec<f32>),
+    Top { vals: Vec<f32>, idx: Vec<u32> },
+}
+
+impl Default for Logits {
+    fn default() -> Self {
+        Logits::Full(Vec::new())
+    }
+}
+
+impl Logits {
+    /// Drop the first `n` rows.
+    pub fn skip_rows(&mut self, n: usize, vocab: usize) {
+        match self {
+            Logits::Full(v) => drop(v.drain(..n * vocab)),
+            Logits::Top { vals, idx } => {
+                vals.drain(..n * TOP_LOGITS);
+                idx.drain(..n * TOP_LOGITS);
+            }
+        }
+    }
+
+    /// Whole rows (panics on [`Logits::Top`]).
+    pub fn into_full(self) -> Vec<f32> {
+        match self {
+            Logits::Full(v) => v,
+            Logits::Top { .. } => panic!("logits were cut to the top candidates"),
+        }
     }
 }
 
