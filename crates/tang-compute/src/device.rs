@@ -1959,30 +1959,7 @@ pub trait ComputeDevice: Send + 'static {
         n: usize,
         per_pick: bool,
     ) -> Self::Buffer {
-        use crate::moe::{ExpertFmt, ExpertWeights};
-        let (x, ids) = (self.download(x), crate::flash::u32s(&self.download(ids)));
-        let bias = bias.map(|b| self.download(b));
-        let wv = self.download(w);
-        let bytes: Vec<u8>;
-        let weights = match fmt {
-            ExpertFmt::F32 | ExpertFmt::Bf16 => ExpertWeights::F32(&wv),
-            ExpertFmt::Mxfp4 => {
-                bytes = wv.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
-                ExpertWeights::Mxfp4(&bytes)
-            }
-        };
-        let y = crate::moe::moe_linear(
-            &x,
-            weights,
-            experts,
-            bias.as_deref(),
-            &ids,
-            k_top,
-            k,
-            n,
-            per_pick,
-        );
-        self.upload(&y)
+        moe_linear_default(self, x, w, fmt, experts, bias, ids, k_top, k, n, per_pick)
     }
 
     /// gpt-oss's clamped SwiGLU ([`crate::moe::swiglu_clamped`]) over `gu` `[rows, 2 * ff]`
@@ -2030,26 +2007,19 @@ pub trait ComputeDevice: Send + 'static {
         causal: bool,
         sinks: &Self::Buffer,
     ) -> Self::Buffer {
-        let kvd = shape.1 * shape.2;
-        let total = cache_start + q_len;
-        let (kp, vp) = (self.download(k_pool), self.download(v_pool));
-        let (mut k, mut v) = (vec![0f32; total * kvd], vec![0f32; total * kvd]);
-        for (from, row, n) in pages.runs(0, total) {
-            k[from * kvd..][..n * kvd].copy_from_slice(&kp[row * kvd..][..n * kvd]);
-            v[from * kvd..][..n * kvd].copy_from_slice(&vp[row * kvd..][..n * kvd]);
-        }
-        let o = crate::moe::attention_sinks(
-            &self.download(q),
-            &k,
-            &v,
+        kv_attention_paged_sinks_default(
+            self,
+            q,
+            k_pool,
+            v_pool,
+            pages,
             cache_start,
             q_len,
             shape,
             window,
             causal,
-            Some(&self.download(sinks)),
-        );
-        self.upload(&o)
+            sinks,
+        )
     }
 
     /// MoE router for a window: `logits [t][stride]` (experts in columns `0..n_expert`); writes
@@ -2581,4 +2551,83 @@ pub fn top_k_rows_host(v: &[f32], n: usize, k: usize) -> (Vec<f32>, Vec<u32>) {
         idx.extend_from_slice(&order);
     }
     (vals, idx)
+}
+
+/// The portable [`ComputeDevice::moe_linear`]: the host reference.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_linear_default<D: ComputeDevice + ?Sized>(
+    dev: &D,
+    x: &D::Buffer,
+    w: &D::Buffer,
+    fmt: crate::moe::ExpertFmt,
+    experts: usize,
+    bias: Option<&D::Buffer>,
+    ids: &D::Buffer,
+    k_top: usize,
+    k: usize,
+    n: usize,
+    per_pick: bool,
+) -> D::Buffer {
+    use crate::moe::{ExpertFmt, ExpertWeights};
+    let (x, ids) = (dev.download(x), crate::flash::u32s(&dev.download(ids)));
+    let bias = bias.map(|b| dev.download(b));
+    let wv = dev.download(w);
+    let bytes: Vec<u8>;
+    let weights = match fmt {
+        ExpertFmt::F32 | ExpertFmt::Bf16 => ExpertWeights::F32(&wv),
+        ExpertFmt::Mxfp4 => {
+            bytes = wv.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+            ExpertWeights::Mxfp4(&bytes)
+        }
+    };
+    let y = crate::moe::moe_linear(
+        &x,
+        weights,
+        experts,
+        bias.as_deref(),
+        &ids,
+        k_top,
+        k,
+        n,
+        per_pick,
+    );
+    dev.upload(&y)
+}
+
+/// The portable [`ComputeDevice::kv_attention_paged_sinks`]: gathers the keys and runs the
+/// host reference.
+#[allow(clippy::too_many_arguments)]
+pub fn kv_attention_paged_sinks_default<D: ComputeDevice + ?Sized>(
+    dev: &D,
+    q: &D::Buffer,
+    k_pool: &D::Buffer,
+    v_pool: &D::Buffer,
+    pages: &Pages<D::Buffer>,
+    cache_start: usize,
+    q_len: usize,
+    shape: (usize, usize, usize),
+    window: usize,
+    causal: bool,
+    sinks: &D::Buffer,
+) -> D::Buffer {
+    let kvd = shape.1 * shape.2;
+    let total = cache_start + q_len;
+    let (kp, vp) = (dev.download(k_pool), dev.download(v_pool));
+    let (mut k, mut v) = (vec![0f32; total * kvd], vec![0f32; total * kvd]);
+    for (from, row, n) in pages.runs(0, total) {
+        k[from * kvd..][..n * kvd].copy_from_slice(&kp[row * kvd..][..n * kvd]);
+        v[from * kvd..][..n * kvd].copy_from_slice(&vp[row * kvd..][..n * kvd]);
+    }
+    let o = crate::moe::attention_sinks(
+        &dev.download(q),
+        &k,
+        &v,
+        cache_start,
+        q_len,
+        shape,
+        window,
+        causal,
+        Some(&dev.download(sinks)),
+    );
+    dev.upload(&o)
 }
