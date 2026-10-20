@@ -16,7 +16,8 @@ Kernel throughput (GB/s of f32 output), best of 7, IR-generated residual decoder
 | pre3v4_32x16, no APM | 0.74 / 0.81 | 0.78 / 0.78 |
 | pre3v4_32x16, APM 10,14,15 | 0.70 / 0.77 | 0.75 / 0.74 |
 
-- **1 GB/s gate: NOT met.** Best adaptive 16-hidden number is 0.96 GB/s on a quiet M4
+- **Status: pending re-timing.** The 3090 was saturated by other jobs throughout, so these are not clean numbers; NYX 512³ will be re-timed on an idle GPU.
+- **1 GB/s gate: NOT met so far.** Best adaptive 16-hidden number is 0.96 GB/s on a quiet M4
   (one window where the vcad app had let go; static ran at the Track A2 quiet level), so
   the APM layer costs ~1–14% and the 16-hidden learned path sits just under the gate
   with or without it. 32×16 is 0.77.
