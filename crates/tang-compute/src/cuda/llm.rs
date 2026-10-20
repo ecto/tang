@@ -740,6 +740,104 @@ impl CudaComputeDevice {
         self.finish(out)
     }
 
+    /// Batched decode attention (see `ComputeDevice::attention_paged_rows`): one launch each
+    /// of `attention_prep_rows`, `attn_partial_rows` and `attn_combine` for every row. None
+    /// when the shape or precision isn't covered.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn attention_rows_llm(
+        &self,
+        qkv: &CudaBuffer,
+        q_norm: Option<&CudaBuffer>,
+        k_norm: Option<&CudaBuffer>,
+        cos: &CudaBuffer,
+        sin: &CudaBuffer,
+        k_pool: &mut CudaBuffer,
+        v_pool: &mut CudaBuffer,
+        rows: &crate::PagedRows<CudaBuffer>,
+        (nh, nkv, hd): (usize, usize, usize),
+        eps: f32,
+        query_scale: f32,
+    ) -> Option<CudaBuffer> {
+        let n = rows.pos.len();
+        let Some(first) = rows.pages.first() else {
+            return None;
+        };
+        if qkv.is_bf16() || hd % 2 != 0 || hd > 256 || nh % nkv != 0 {
+            return None;
+        }
+        let sh = first.shift();
+        let bf16 = Self::kv_bf16(k_pool, v_pool);
+        let mut q = self.pool_alloc_uninit_f32(n * nh * hd);
+        let f = self.kv_func(llm_cuda::ATTN_PREP_CUDA, "attention_prep_rows", bf16);
+        let qn = q_norm.unwrap_or(qkv);
+        let kn = k_norm.unwrap_or(qkv);
+        let (nh_u, nkv_u, hd_u) = (nh as u32, nkv as u32, hd as u32);
+        let (has_qn, has_kn) = (q_norm.is_some() as u32, k_norm.is_some() as u32);
+        let mut lb = self.stream.launch_builder(&f);
+        lb.arg(qkv.f32_data())
+            .arg(qn.f32_data())
+            .arg(kn.f32_data())
+            .arg(cos.f32_data())
+            .arg(sin.f32_data())
+            .arg(q.f32_data_mut());
+        kv_arg_mut(&mut lb, k_pool);
+        kv_arg_mut(&mut lb, v_pool);
+        unsafe {
+            lb.arg(&nh_u)
+                .arg(&nkv_u)
+                .arg(&hd_u)
+                .arg(&eps)
+                .arg(&has_qn)
+                .arg(&has_kn)
+                .arg(rows.tables.f32_data())
+                .arg(&sh)
+                .arg(rows.positions.f32_data())
+                .arg(rows.offsets.f32_data())
+                .launch(blocks((nh + 2 * nkv, n, 1), 32))
+                .unwrap();
+        }
+        if query_scale != 1.0 {
+            crate::ComputeDevice::scale_buffer(self, &mut q, query_scale);
+        }
+        // As many splits as the longest row's decode would use; each row uses its own.
+        let span = rows.pos.iter().max().map_or(1, |p| p + 1);
+        let n_splits = span.div_ceil(256).clamp(1, 64);
+        let mut partial = self.pool_alloc_uninit_f32(n * nh * n_splits * (hd + 2));
+        let ns = n_splits as u32;
+        let f = self.kv_func(llm_cuda::ATTENTION_CUDA, "attn_partial_rows", bf16);
+        let mut lb = self.stream.launch_builder(&f);
+        lb.arg(q.f32_data());
+        kv_arg(&mut lb, k_pool);
+        kv_arg(&mut lb, v_pool);
+        unsafe {
+            lb.arg(partial.f32_data_mut())
+                .arg(&nh_u)
+                .arg(&nkv_u)
+                .arg(&hd_u)
+                .arg(&ns)
+                .arg(rows.tables.f32_data())
+                .arg(&sh)
+                .arg(rows.positions.f32_data())
+                .arg(rows.offsets.f32_data())
+                .launch(blocks((nh, n_splits, n), 256))
+                .unwrap();
+        }
+        let mut out = self.pool_alloc_uninit_f32(n * nh * hd);
+        let f = self.kv_func(llm_cuda::ATTENTION_CUDA, "attn_combine", false);
+        unsafe {
+            self.stream
+                .launch_builder(&f)
+                .arg(partial.f32_data())
+                .arg(out.f32_data_mut())
+                .arg(&nh_u)
+                .arg(&hd_u)
+                .arg(&ns)
+                .launch(blocks((nh, n, 1), hd.next_multiple_of(32).min(256) as u32))
+                .unwrap();
+        }
+        Some(self.finish(out))
+    }
+
     /// Split-KV attention for a few queries (`attn_multi_*` then `attn_combine`): blocks over
     /// (KV head, key split, group of (query, head) rows), each reading its split's keys once
     /// for all the rows.

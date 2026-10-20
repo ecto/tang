@@ -516,9 +516,19 @@ impl<D: ComputeDevice> Model<D> {
                 self.max_ctx
             );
         }
-        let tokens: Vec<u32> = segs.iter().flat_map(|g| g.tokens.iter().copied()).collect();
+        // One-token segments first, so `decode_layers` can attend for them in one go.
+        let mut order: Vec<usize> = (0..segs.len()).collect();
+        order.sort_by_key(|&i| segs[i].tokens.len() != 1);
+        let tokens: Vec<u32> = order
+            .iter()
+            .flat_map(|&i| segs[i].tokens.iter().copied())
+            .collect();
         let mut x = self.embed(&tokens)?;
-        let mut parts: Vec<(&mut Cache<D::Buffer>, usize)> = segs
+        let mut slots: Vec<Option<&mut Segment<'_, D::Buffer>>> =
+            segs.iter_mut().map(Some).collect();
+        let mut ordered: Vec<&mut Segment<'_, D::Buffer>> =
+            order.iter().map(|&i| slots[i].take().unwrap()).collect();
+        let mut parts: Vec<(&mut Cache<D::Buffer>, usize)> = ordered
             .iter_mut()
             .map(|g| (&mut *g.cache, g.tokens.len()))
             .collect();
@@ -527,7 +537,7 @@ impl<D: ComputeDevice> Model<D> {
         // The rows whose logits are wanted, gathered so the head runs once.
         let h = c.hidden_size;
         let (mut at, mut rows) = (0usize, Vec::new());
-        for g in segs.iter() {
+        for g in ordered.iter() {
             let s = g.tokens.len();
             if g.all {
                 rows.push((at, s));
@@ -553,10 +563,10 @@ impl<D: ComputeDevice> Model<D> {
         let head = self.lm_head.as_ref().unwrap_or(&self.embed);
         let logits = dev.download(&dev.linear(&picked, head, n, h, c.vocab_size));
         let v = c.vocab_size;
-        let mut out = Vec::with_capacity(segs.len());
+        let mut out = vec![Vec::new(); order.len()];
         let mut o = 0;
-        for (g, &(_, len)) in segs.iter_mut().zip(&rows) {
-            out.push(logits[o * v..(o + len) * v].to_vec());
+        for ((g, &(_, len)), &i) in ordered.iter_mut().zip(&rows).zip(&order) {
+            out[i] = logits[o * v..(o + len) * v].to_vec();
             o += len;
             g.cache.len += g.tokens.len();
             g.cache.tokens.extend_from_slice(g.tokens);
@@ -608,19 +618,88 @@ impl<D: ComputeDevice> Model<D> {
             seqs.push((ids, table, pos, *n, row));
             row += *n;
         }
+        // Leading one-token parts (batched decode) attend in one call per layer.
+        let singles = if causal {
+            seqs.iter().take_while(|q| q.3 == 1).count()
+        } else {
+            0
+        };
+        let fused = (singles >= 2).then(|| {
+            let mut all = Vec::new();
+            let mut offsets = Vec::with_capacity(singles);
+            for q in &seqs[..singles] {
+                offsets.push(all.len() as u32);
+                all.extend_from_slice(&q.0);
+            }
+            let pos: Vec<usize> = seqs[..singles].iter().map(|q| q.2).collect();
+            let pos32: Vec<u32> = pos.iter().map(|&p| p as u32).collect();
+            (
+                dev.upload_u32(&all),
+                dev.upload_u32(&offsets),
+                dev.upload_u32(&pos32),
+                pos,
+            )
+        });
+        let row_pages: Vec<tang_compute::Pages<D::Buffer>> = seqs
+            [..if fused.is_some() { singles } else { 0 }]
+            .iter()
+            .map(|q| tang_compute::Pages {
+                ids: &q.0,
+                table: &q.1,
+                block: BLOCK,
+            })
+            .collect();
         for (l, w) in self.layers.iter().take(layer_limit).enumerate() {
             let (kp, vp) = pool.layer(l);
             let a = dev.rms_norm(x, &w.attn_norm, s, h, eps);
             let qkv = dev.linear(&a, &w.wqkv, s, h, qd + 2 * kvd);
             let (cos, sin) = &self.ropes[w.rope];
-            let one = seqs.len() == 1;
-            let mut att = if one {
+            // Rows the fused call covers (all of them, or a leading run), then the rest one
+            // part at a time.
+            let fuse = fused.as_ref().filter(|_| w.window == 0);
+            let skip = if fuse.is_some() { singles } else { 0 };
+            let one = seqs.len() - skip == 1 && skip == 0;
+            let mut att = if one || skip == seqs.len() {
                 None
             } else {
                 Some(dev.alloc_uninit_f32(s * qd))
             };
             let mut single = None;
-            for (ids, table, pos, n, row) in &seqs {
+            if let Some((tables, offsets, positions, pos)) = fuse {
+                let w3 = qd + 2 * kvd;
+                let lead;
+                let rows_qkv = if skip == seqs.len() {
+                    &qkv
+                } else {
+                    lead = dev.slice_buffer(&qkv, 0, skip * w3);
+                    &lead
+                };
+                let rows = tang_compute::PagedRows {
+                    pages: &row_pages,
+                    pos,
+                    tables,
+                    offsets,
+                    positions,
+                };
+                let o = dev.attention_paged_rows(
+                    rows_qkv,
+                    w.q_norm.as_ref(),
+                    w.k_norm.as_ref(),
+                    cos,
+                    sin,
+                    kp,
+                    vp,
+                    &rows,
+                    (nh, nkv, hd),
+                    eps,
+                    query_scale,
+                );
+                match att.as_mut() {
+                    Some(all) => dev.write_into(all, 0, &o),
+                    None => single = Some(o),
+                }
+            }
+            for (ids, table, pos, n, row) in &seqs[skip..] {
                 let pages = tang_compute::Pages {
                     ids,
                     table,
@@ -798,11 +877,12 @@ mod conditioning_tests {
     #[test]
     fn a_batched_forward_matches_each_segment_alone() {
         let m = mixed_model();
-        let prefixes: [&[u32]; 3] = [&[0, 1, 1], &[1], &[1, 0, 0, 1, 0]];
-        let feeds: [&[u32]; 3] = [&[1, 0], &[0], &[1, 1, 0]];
-        let all = [true, false, false];
+        // One-token segments among longer ones: they're attended for together.
+        let prefixes: [&[u32]; 5] = [&[0, 1, 1], &[1], &[1, 0, 0, 1, 0], &[0, 0], &[1, 1, 1]];
+        let feeds: [&[u32]; 5] = [&[1, 0], &[0], &[1, 1, 0], &[1], &[0]];
+        let all = [true, false, false, false, true];
         let mut alone = Vec::new();
-        for i in 0..3 {
+        for i in 0..5 {
             let mut c = m.new_cache();
             m.forward(prefixes[i], &mut c, false).unwrap();
             alone.push((
@@ -829,7 +909,7 @@ mod conditioning_tests {
             .collect();
         let got = m.forward_batch(&mut segs).unwrap();
         drop(segs);
-        for i in 0..3 {
+        for i in 0..5 {
             assert_eq!(got[i].len(), alone[i].0.len());
             for (a, b) in got[i].iter().zip(&alone[i].0) {
                 assert!((a - b).abs() < 1e-5, "segment {i}: {a} vs {b}");

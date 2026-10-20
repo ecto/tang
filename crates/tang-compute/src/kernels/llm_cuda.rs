@@ -494,21 +494,21 @@ pub fn kv_source(src: &'static str, bf16: bool) -> &'static str {
 /// the caches (`kv_t`, see [`kv_source`]) at `pos + s`. Any even head dim up to 256.
 pub const ATTN_PREP_CUDA: &str = with_common!(
     r#"
-extern "C" __global__ void attention_prep(
+// Head `h` of row `s`, at position `p` of the cache whose block table is `T`.
+__device__ __forceinline__ void prep_one(
     const float* __restrict__ QKV, const float* __restrict__ QN, const float* __restrict__ KN,
     const float* __restrict__ COS, const float* __restrict__ SIN,
     float* __restrict__ Qo, kv_t* __restrict__ KC, kv_t* __restrict__ VC,
-    unsigned int nh, unsigned int nkv, unsigned int hd, unsigned int pos, float eps,
+    unsigned int nh, unsigned int nkv, unsigned int hd, unsigned int p, float eps,
     unsigned int has_qn, unsigned int has_kn, const unsigned int* __restrict__ T,
-    unsigned int sh)
+    unsigned int sh, unsigned int h, unsigned int s, float* xs)
 {
-    __shared__ float xs[256];
-    unsigned int h = blockIdx.x, s = blockIdx.y, lane = threadIdx.x;
+    unsigned int lane = threadIdx.x;
     unsigned int qd = nh * hd, kvd = nkv * hd, row = qd + 2 * kvd, half = hd / 2;
     const float* src = QKV + (u64)s * row + (u64)h * hd;  // heads are contiguous: q.., k.., v..
 
     if (h >= nh + nkv) {  // v head: straight into the cache
-        kv_t* dst = VC + kv_row(T, sh, pos + s) * kvd + (u64)(h - nh - nkv) * hd;
+        kv_t* dst = VC + kv_row(T, sh, p) * kvd + (u64)(h - nh - nkv) * hd;
         for (unsigned int d = lane; d < hd; d += 32) kv_st(dst + d, src[d]);
         return;
     }
@@ -522,7 +522,7 @@ extern "C" __global__ void attention_prep(
         for (unsigned int d = lane; d < hd; d += 32) xs[d] *= r * w[d];
     }
     __syncwarp();
-    u64 t = (u64)(pos + s) * half;
+    u64 t = (u64)p * half;
     if (is_q) {
         float* dst = Qo + (u64)s * qd + (u64)h * hd;
         for (unsigned int i = lane; i < half; i += 32) {
@@ -533,13 +533,42 @@ extern "C" __global__ void attention_prep(
         }
         return;
     }
-    kv_t* dst = KC + kv_row(T, sh, pos + s) * kvd + (u64)(h - nh) * hd;
+    kv_t* dst = KC + kv_row(T, sh, p) * kvd + (u64)(h - nh) * hd;
     for (unsigned int i = lane; i < half; i += 32) {
         float c = COS[t + i], sn = SIN[t + i];
         float x0 = xs[i], x1 = xs[i + half];
         kv_st(dst + i, x0 * c - x1 * sn);
         kv_st(dst + i + half, x1 * c + x0 * sn);
     }
+}
+
+extern "C" __global__ void attention_prep(
+    const float* __restrict__ QKV, const float* __restrict__ QN, const float* __restrict__ KN,
+    const float* __restrict__ COS, const float* __restrict__ SIN,
+    float* __restrict__ Qo, kv_t* __restrict__ KC, kv_t* __restrict__ VC,
+    unsigned int nh, unsigned int nkv, unsigned int hd, unsigned int pos, float eps,
+    unsigned int has_qn, unsigned int has_kn, const unsigned int* __restrict__ T,
+    unsigned int sh)
+{
+    __shared__ float xs[256];
+    prep_one(QKV, QN, KN, COS, SIN, Qo, KC, VC, nh, nkv, hd, pos + blockIdx.y, eps, has_qn,
+             has_kn, T, sh, blockIdx.x, blockIdx.y, xs);
+}
+
+// Rows of different sequences (batched decode): row `s` is at position `RP[s]` of the cache
+// whose block table starts at `T + RT[s]`.
+extern "C" __global__ void attention_prep_rows(
+    const float* __restrict__ QKV, const float* __restrict__ QN, const float* __restrict__ KN,
+    const float* __restrict__ COS, const float* __restrict__ SIN,
+    float* __restrict__ Qo, kv_t* __restrict__ KC, kv_t* __restrict__ VC,
+    unsigned int nh, unsigned int nkv, unsigned int hd, float eps,
+    unsigned int has_qn, unsigned int has_kn, const unsigned int* __restrict__ T,
+    unsigned int sh, const unsigned int* __restrict__ RP, const unsigned int* __restrict__ RT)
+{
+    __shared__ float xs[256];
+    unsigned int s = blockIdx.y;
+    prep_one(QKV, QN, KN, COS, SIN, Qo, KC, VC, nh, nkv, hd, RP[s], eps, has_qn, has_kn,
+             T + RT[s], sh, blockIdx.x, s, xs);
 }
 "#
 );
@@ -658,25 +687,17 @@ pub const ATTENTION_CUDA: &str = with_common!(
     r#"
 #define MAXV 8   // max D / 32
 
-extern "C" __global__ void attn_partial(
+// Query `qi`'s keys `j0..j1` (one split of them) for head `head`, into its split's slot of P.
+__device__ __forceinline__ void attn_partial_one(
     const float* __restrict__ Q, const kv_t* __restrict__ K, const kv_t* __restrict__ V,
-    float* __restrict__ P,   // [q_len, nh, n_splits, D + 2]
-    unsigned int cache_start, unsigned int q_len, unsigned int nh, unsigned int nkv,
-    unsigned int D, unsigned int n_splits, unsigned int split_len, unsigned int window,
-    unsigned int base, unsigned int bidir, const unsigned int* __restrict__ T, unsigned int sh)
+    float* __restrict__ P, unsigned int nh, unsigned int nkv, unsigned int D,
+    unsigned int n_splits, const unsigned int* __restrict__ T, unsigned int sh,
+    unsigned int head, unsigned int split, unsigned int qi, unsigned int j0, unsigned int j1)
 {
-    unsigned int head = blockIdx.x, split = blockIdx.y, qi = blockIdx.z;
     unsigned int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     unsigned int kvh = head / (nh / nkv);
     u64 kvd = (u64)nkv * D;
     unsigned int per = (D + 31) / 32;
-
-    unsigned int qpos = cache_start + qi + 1;
-    unsigned int attend = bidir ? cache_start + q_len : qpos;
-    unsigned int lo = (window > 0 && qpos > window) ? qpos - window : 0;
-    unsigned int s0 = base + split * split_len;
-    unsigned int j0 = max(s0, lo);
-    unsigned int j1 = min(s0 + split_len, attend);
 
     float q[MAXV], acc[MAXV];
     float scale = rsqrtf((float)D);
@@ -744,6 +765,45 @@ extern "C" __global__ void attn_partial(
         if (v < per && d < D) pp[2 + d] = out[v];
     }
     if (lane == 0) { pp[0] = M; pp[1] = L; }
+}
+
+extern "C" __global__ void attn_partial(
+    const float* __restrict__ Q, const kv_t* __restrict__ K, const kv_t* __restrict__ V,
+    float* __restrict__ P,   // [q_len, nh, n_splits, D + 2]
+    unsigned int cache_start, unsigned int q_len, unsigned int nh, unsigned int nkv,
+    unsigned int D, unsigned int n_splits, unsigned int split_len, unsigned int window,
+    unsigned int base, unsigned int bidir, const unsigned int* __restrict__ T, unsigned int sh)
+{
+    unsigned int split = blockIdx.y, qi = blockIdx.z;
+    unsigned int qpos = cache_start + qi + 1;
+    unsigned int attend = bidir ? cache_start + q_len : qpos;
+    unsigned int lo = (window > 0 && qpos > window) ? qpos - window : 0;
+    unsigned int s0 = base + split * split_len;
+    unsigned int j0 = max(s0, lo);
+    unsigned int j1 = min(s0 + split_len, attend);
+    attn_partial_one(Q, K, V, P, nh, nkv, D, n_splits, T, sh, blockIdx.x, split, qi, j0, j1);
+}
+
+// One query each from several sequences (batched decode): query `qi` is at position `RP[qi]`
+// of the cache whose block table starts at `T + RT[qi]`, and sees keys `0 ..= RP[qi]`. Each
+// splits its keys as a decode of that sequence alone would; splits past its own count are
+// empty (attn_combine skips them), so its output is that decode's to the bit. `n_splits`:
+// the most any query has (P's stride).
+extern "C" __global__ void attn_partial_rows(
+    const float* __restrict__ Q, const kv_t* __restrict__ K, const kv_t* __restrict__ V,
+    float* __restrict__ P, unsigned int nh, unsigned int nkv, unsigned int D,
+    unsigned int n_splits, const unsigned int* __restrict__ T, unsigned int sh,
+    const unsigned int* __restrict__ RP, const unsigned int* __restrict__ RT)
+{
+    unsigned int split = blockIdx.y, qi = blockIdx.z;
+    unsigned int span = RP[qi] + 1;
+    unsigned int mine = min(max((span + 255) / 256, 1u), 64u);
+    unsigned int split_len = (span + mine - 1) / mine;
+    unsigned int s0 = split * split_len;
+    unsigned int j0 = split < mine ? s0 : 0;
+    unsigned int j1 = split < mine ? min(s0 + split_len, span) : 0;
+    attn_partial_one(Q, K, V, P, nh, nkv, D, n_splits, T + RT[qi], sh, blockIdx.x, split, qi,
+                     j0, j1);
 }
 
 extern "C" __global__ void attn_combine(
