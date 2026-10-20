@@ -115,6 +115,8 @@ Fields:
   of block `i`). A prompt whose block-`i` id is in either list skips prefilling the first
   `(i + 1) * 256` positions here. Ids are per model (they hash tokens only).
 - `kv.prompt_cache_keys`: conversations with a cache in memory and the positions each holds.
+  With `--kv-ttl` set, blocks, files and keys past the TTL are left out of all three lists
+  (see [retention.md](retention.md)).
 
 ### A list, not a Bloom filter
 
