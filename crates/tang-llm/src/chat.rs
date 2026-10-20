@@ -39,6 +39,7 @@ impl Template {
         minijinja_contrib::add_to_environment(&mut env);
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
         env.add_filter("tojson", tojson);
+        env.add_function("strftime_now", strftime_now);
         env.add_template_owned("chat", source)?;
         Ok(Self {
             env,
@@ -53,6 +54,7 @@ impl Template {
         minijinja_contrib::add_to_environment(&mut env);
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
         env.add_filter("tojson", tojson);
+        env.add_function("strftime_now", strftime_now);
         env.add_template_owned("chat", source)?;
         Ok(Self { env, bos, eos })
     }
@@ -74,6 +76,67 @@ impl Template {
             eos_token => self.eos,
         })?)
     }
+}
+
+/// transformers' `strftime_now` for templates that print today's date (gpt-oss): UTC, with
+/// `%Y %m %d %B %b %H %M %S`.
+fn strftime_now(fmt: String) -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs()) as i64;
+    strftime(&fmt, secs)
+}
+
+fn strftime(fmt: &str, secs: i64) -> String {
+    const MONTHS: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    // Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    let mut out = String::new();
+    let mut it = fmt.chars();
+    while let Some(c) = it.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('Y') => out.push_str(&y.to_string()),
+            Some('m') => out.push_str(&format!("{m:02}")),
+            Some('d') => out.push_str(&format!("{d:02}")),
+            Some('B') => out.push_str(MONTHS[m as usize - 1]),
+            Some('b') => out.push_str(&MONTHS[m as usize - 1][..3]),
+            Some('H') => out.push_str(&format!("{:02}", rem / 3600)),
+            Some('M') => out.push_str(&format!("{:02}", rem / 60 % 60)),
+            Some('S') => out.push_str(&format!("{:02}", rem % 60)),
+            Some(o) => {
+                out.push('%');
+                out.push(o);
+            }
+            None => out.push('%'),
+        }
+    }
+    out
 }
 
 /// Python's `json.dumps` spacing (`", "` and `": "`), which is what templates were trained with.
@@ -149,6 +212,8 @@ enum Mode {
 /// `</tool_call>` only closes it once the body parses, so values may contain any of the tags.
 /// Inside `<think>`, tool-call tags are reasoning text.
 pub struct Parser {
+    /// gpt-oss's harmony format instead of think/tool-call tags.
+    harmony: Option<Harmony>,
     mode: Mode,
     tool: String,
     /// Text seen so far (to trim the blank lines the template puts around tags).
@@ -159,6 +224,38 @@ pub struct Parser {
 
 pub const TAGS: [&str; 4] = ["<think>", "</think>", "<tool_call>", "</tool_call>"];
 
+/// gpt-oss's harmony format: every message is `<|start|>{header}<|message|>{body}` closed by
+/// `<|end|>`, `<|call|>` (a tool call) or `<|return|>` (the last one). The header names the
+/// channel (`<|channel|>analysis`, `commentary` or `final`) and, for a tool call, the recipient
+/// (`to=functions.NAME`, with `<|constrain|>json`).
+pub const HARMONY_TAGS: [&str; 7] = [
+    "<|start|>",
+    "<|end|>",
+    "<|message|>",
+    "<|channel|>",
+    "<|constrain|>",
+    "<|call|>",
+    "<|return|>",
+];
+
+/// Where a harmony completion is: in a header (collecting it) or in a message body.
+#[derive(Debug, Clone, PartialEq)]
+enum Harmony {
+    Header(String),
+    Body(Body),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Body {
+    Reasoning,
+    Text,
+    /// A call to `name`, its arguments so far.
+    Tool {
+        name: String,
+        args: String,
+    },
+}
+
 /// The model's tag tokens: id → tag. A tag the vocabulary has no single token for is never
 /// recognised.
 #[derive(Debug, Clone, Default)]
@@ -166,7 +263,17 @@ pub struct Tags(Vec<(u32, &'static str)>);
 
 impl Tags {
     pub fn new(id: impl Fn(&str) -> Option<u32>) -> Self {
-        Self(TAGS.iter().filter_map(|t| Some((id(t)?, *t))).collect())
+        Self(
+            TAGS.iter()
+                .chain(&HARMONY_TAGS)
+                .filter_map(|t| Some((id(t)?, *t)))
+                .collect(),
+        )
+    }
+
+    /// Whether the vocabulary speaks harmony (gpt-oss).
+    pub fn harmony(&self) -> bool {
+        self.0.iter().any(|(_, t)| *t == "<|channel|>")
     }
 
     pub fn get(&self, id: u32) -> Option<&'static str> {
@@ -234,10 +341,28 @@ impl Parser {
     /// `thinking`: the prompt already opened a `<think>` block (some templates do).
     pub fn new(thinking: bool) -> Self {
         Self {
+            harmony: None,
             mode: if thinking { Mode::Think } else { Mode::Text },
             tool: String::new(),
             text_started: false,
             schemas: Default::default(),
+        }
+    }
+
+    /// A parser for harmony output (gpt-oss), after a prompt that ends `<|start|>assistant`.
+    pub fn harmony() -> Self {
+        Self {
+            harmony: Some(Harmony::Header("assistant".into())),
+            ..Self::new(false)
+        }
+    }
+
+    /// [`harmony`](Self::harmony) if `tags` are harmony's, else [`new`](Self::new).
+    pub fn for_tags(tags: &Tags, thinking: bool) -> Self {
+        if tags.harmony() {
+            Self::harmony()
+        } else {
+            Self::new(thinking)
         }
     }
 
@@ -260,6 +385,10 @@ impl Parser {
     /// Text from ordinary tokens: never a tag, whatever it spells.
     pub fn push_text(&mut self, s: &str) -> Vec<Piece> {
         let mut out = Vec::new();
+        if self.harmony.is_some() {
+            self.harmony_text(s, &mut out);
+            return out;
+        }
         self.emit(s, &mut out);
         out
     }
@@ -267,6 +396,10 @@ impl Parser {
     /// A tag token.
     pub fn push_tag(&mut self, tag: &str) -> Vec<Piece> {
         let mut out = Vec::new();
+        if self.harmony.is_some() {
+            self.harmony_tag(tag, &mut out);
+            return out;
+        }
         if self.is_text(tag) {
             self.emit(tag, &mut out);
         } else {
@@ -286,6 +419,11 @@ impl Parser {
     /// a complete XML call that only lacks its `</tool_call>`).
     pub fn finish(&mut self) -> Vec<Piece> {
         let mut out = Vec::new();
+        if self.harmony.is_some() {
+            // Generation stops at `<|call|>` or `<|return|>` before the parser sees them.
+            self.harmony_close(&mut out);
+            return out;
+        }
         if self.mode == Mode::Tool && !self.tool.trim().is_empty() {
             let body = std::mem::take(&mut self.tool);
             match parse_xml_call(&body, &self.schemas) {
@@ -342,6 +480,48 @@ impl Parser {
         }
     }
 
+    fn harmony_text(&mut self, s: &str, out: &mut Vec<Piece>) {
+        match self.harmony.as_mut() {
+            Some(Harmony::Header(h)) => h.push_str(s),
+            Some(Harmony::Body(Body::Tool { args, .. })) => args.push_str(s),
+            Some(Harmony::Body(Body::Reasoning)) => push(out, Piece::Reasoning(s.to_string())),
+            Some(Harmony::Body(Body::Text)) => self.emit(s, out),
+            None => {}
+        }
+    }
+
+    fn harmony_tag(&mut self, tag: &str, out: &mut Vec<Piece>) {
+        match (self.harmony.as_mut(), tag) {
+            (Some(Harmony::Header(h)), "<|channel|>" | "<|constrain|>") => {
+                h.push(' ');
+                h.push_str(tag);
+            }
+            (Some(Harmony::Header(h)), "<|message|>") => {
+                let body = harmony_body(h);
+                self.harmony = Some(Harmony::Body(body));
+            }
+            (_, "<|start|>") => {
+                self.harmony_close(out);
+                self.harmony = Some(Harmony::Header(String::new()));
+            }
+            (_, "<|end|>" | "<|call|>" | "<|return|>") => {
+                self.harmony_close(out);
+                self.harmony = Some(Harmony::Header(String::new()));
+            }
+            // A tag where it means nothing (a `<|channel|>` in a body): keep it as text.
+            _ => self.harmony_text(tag, out),
+        }
+    }
+
+    /// End the current message: a tool call's arguments become a [`Piece::ToolCall`].
+    fn harmony_close(&mut self, out: &mut Vec<Piece>) {
+        if let Some(Harmony::Body(Body::Tool { name, args })) = self.harmony.take() {
+            let arguments = serde_json::from_str(args.trim()).unwrap_or(Value::String(args));
+            out.push(Piece::ToolCall { name, arguments });
+        }
+        self.harmony = Some(Harmony::Header(String::new()));
+    }
+
     fn emit(&mut self, s: &str, out: &mut Vec<Piece>) {
         if s.is_empty() {
             return;
@@ -357,6 +537,30 @@ impl Parser {
                 }
             }
         }
+    }
+}
+
+/// What a harmony header opens: `to=functions.NAME` anywhere in it is a tool call (to a
+/// built-in like `browser.search` too, named as written); else the analysis channel is
+/// reasoning, and `final`, `commentary` (preambles to tool calls) or no channel is text.
+fn harmony_body(header: &str) -> Body {
+    let words = header.split(|c: char| c.is_whitespace() || c == '<' || c == '>');
+    for w in words.clone() {
+        if let Some(to) = w.strip_prefix("to=") {
+            let name = to.strip_prefix("functions.").unwrap_or(to);
+            return Body::Tool {
+                name: name.to_string(),
+                args: String::new(),
+            };
+        }
+    }
+    let channel = header
+        .split("<|channel|>")
+        .nth(1)
+        .and_then(|c| c.split_whitespace().next());
+    match channel {
+        Some("analysis") => Body::Reasoning,
+        _ => Body::Text,
     }
 }
 
@@ -463,6 +667,7 @@ mod tests {
         while !rest.is_empty() {
             let next = TAGS
                 .iter()
+                .chain(&HARMONY_TAGS)
                 .filter_map(|t| rest.find(t).map(|i| (i, *t)))
                 .min_by_key(|(i, t)| (*i, std::cmp::Reverse(t.len())));
             match next {
@@ -497,6 +702,63 @@ mod tests {
 
     fn run(chunks: &[&str]) -> Vec<Piece> {
         run_parser(Parser::new(false), chunks)
+    }
+
+    #[test]
+    fn strftime_formats_utc_dates() {
+        // 2026-10-20 16:49:05 UTC.
+        assert_eq!(
+            strftime("%Y-%m-%d %H:%M:%S", 1_792_514_945),
+            "2026-10-20 16:49:05"
+        );
+        assert_eq!(
+            strftime("%d %B %Y, %b", 951_782_400),
+            "29 February 2000, Feb"
+        );
+    }
+
+    #[test]
+    fn harmony_channels_become_reasoning_text_and_tool_calls() {
+        // After `<|start|>assistant`: reasoning, a preamble, a call; generation stops at
+        // `<|call|>` (the parser never sees it).
+        let out = run_parser(
+            Parser::harmony(),
+            &[
+                "<|channel|>analysis<|message|>Need weather. <|channel|> is fine here.<|end|>",
+                "<|start|>assistant<|channel|>commentary<|message|>Checking.<|end|>",
+                "<|start|>assistant<|channel|>commentary to=functions.get_weather <|constrain|>json",
+                "<|message|>{\"city\": \"Paris\"}",
+            ],
+        );
+        assert_eq!(
+            out,
+            vec![
+                Piece::Reasoning("Need weather. <|channel|> is fine here.".into()),
+                Piece::Text("Checking.".into()),
+                Piece::ToolCall {
+                    name: "get_weather".into(),
+                    arguments: serde_json::json!({"city": "Paris"}),
+                },
+            ]
+        );
+        // The recipient may come before the channel; the final answer is text.
+        let out = run_parser(
+            Parser::harmony(),
+            &[
+                " to=functions.ls<|channel|>commentary json<|message|>{}<|call|>",
+                "<|start|>assistant<|channel|>final<|message|>Done: 2 files.",
+            ],
+        );
+        assert_eq!(
+            out,
+            vec![
+                Piece::ToolCall {
+                    name: "ls".into(),
+                    arguments: serde_json::json!({}),
+                },
+                Piece::Text("Done: 2 files.".into()),
+            ]
+        );
     }
 
     #[test]

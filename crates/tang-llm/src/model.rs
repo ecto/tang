@@ -1,12 +1,15 @@
 //! Qwen3-family decoder (also Llama-shaped models: q/k norm is used only when present), and
 //! Gemma 3: GeGLU, `(1 + w)` RMSNorms around both attention and MLP, a scaled embedding, and
-//! local sliding-window layers (own RoPE base) between global ones (scaled RoPE).
+//! local sliding-window layers (own RoPE base) between global ones (scaled RoPE). And gpt-oss:
+//! Q/K/V and output biases, attention sinks, alternating sliding-window and full layers, YaRN,
+//! and a routed MoE ([`Mlp::Moe`], with MXFP4 experts as the checkpoints ship them).
 
 use crate::blocks::{self, Shared, BLOCK};
 use crate::config::Config;
 use crate::weights::Weights;
 use anyhow::Result;
 use std::path::Path;
+use tang_compute::moe::{ExpertFmt, Mxfp4, Router};
 use tang_compute::ComputeDevice;
 
 /// How matrices are stored on device.
@@ -26,15 +29,45 @@ struct Layer<B> {
     q_norm: Option<B>,
     k_norm: Option<B>,
     mlp_norm: B,
-    /// Gate and up projections stacked: `[2 * ff, hidden]`.
-    w_gate_up: B,
-    w_down: B,
+    mlp: Mlp<B>,
+    /// gpt-oss: biases on the stacked Q/K/V projection and the output projection, and one
+    /// attention-sink logit per head.
+    bqkv: Option<B>,
+    bo: Option<B>,
+    sinks: Option<B>,
     /// Gemma: norms on the attention and MLP outputs, before the residual adds.
     post_attn_norm: Option<B>,
     post_mlp_norm: Option<B>,
     /// Sliding window (0: global attention), and which RoPE tables (0 global, 1 local).
     window: usize,
     rope: usize,
+}
+
+enum Mlp<B> {
+    Dense {
+        /// Gate and up projections stacked: `[2 * ff, hidden]`.
+        w_gate_up: B,
+        w_down: B,
+    },
+    Moe(Moe<B>),
+}
+
+/// A routed mixture of experts. Expert matrices are stacked `[experts, n, k]` in `fmt`; each
+/// expert's gate/up rows are gate then up (gpt-oss interleaves them; we split at load).
+struct Moe<B> {
+    router: B,
+    router_bias: Option<B>,
+    route: Router,
+    experts: usize,
+    top_k: usize,
+    ff: usize,
+    fmt: ExpertFmt,
+    gate_up: B,
+    gate_up_bias: Option<B>,
+    down: B,
+    down_bias: Option<B>,
+    /// gpt-oss's clamped SwiGLU `(alpha, limit)`; plain SwiGLU when `None`.
+    clamp: Option<(f32, f32)>,
 }
 
 pub struct Model<D: ComputeDevice> {
@@ -183,8 +216,27 @@ impl<D: ComputeDevice> Model<D> {
                 } else {
                     "post_attention_layernorm"
                 })?,
-                w_gate_up: up_cat(&["gate", "up"].map(|x| format!("{p}.mlp.{x}_proj.weight")))?,
-                w_down: up(&format!("{p}.mlp.down_proj.weight"))?,
+                mlp: if cfg.num_local_experts.is_some() {
+                    Mlp::Moe(load_moe(&dev, &w, &cfg, &p, dtype)?)
+                } else {
+                    Mlp::Dense {
+                        w_gate_up: up_cat(
+                            &["gate", "up"].map(|x| format!("{p}.mlp.{x}_proj.weight")),
+                        )?,
+                        w_down: up(&format!("{p}.mlp.down_proj.weight"))?,
+                    }
+                },
+                bqkv: if w.has(&format!("{p}.self_attn.q_proj.bias")) {
+                    let mut b = Vec::new();
+                    for x in ["q", "k", "v"] {
+                        b.extend(w.f32(&format!("{p}.self_attn.{x}_proj.bias"))?.0);
+                    }
+                    Some(dev.upload(&b))
+                } else {
+                    None
+                },
+                bo: opt_vec(&format!("{p}.self_attn.o_proj.bias"))?,
+                sinks: opt_vec(&format!("{p}.self_attn.sinks"))?,
                 post_attn_norm: if gemma {
                     Some(norm("post_attention_layernorm")?)
                 } else {
@@ -212,7 +264,13 @@ impl<D: ComputeDevice> Model<D> {
         let hd = cfg.head_dim();
         let scale = cfg.rope_scaling.as_ref().map_or(1.0, |s| s.factor);
         let mut ropes = Vec::new();
-        let (cos, sin) = rope_tables(hd, max_ctx, cfg.rope_theta, scale);
+        let (cos, sin) = match cfg.rope_scaling.as_ref() {
+            Some(y) if y.rope_type.as_deref() == Some("yarn") => {
+                let (inv, mscale) = yarn(hd, cfg.rope_theta, y, cfg.max_position_embeddings);
+                rope_tables_inv(&inv, max_ctx, mscale)
+            }
+            _ => rope_tables(hd, max_ctx, cfg.rope_theta, scale),
+        };
         ropes.push((dev.upload(&cos), dev.upload(&sin)));
         if gemma {
             let base = cfg.rope_local_base_freq.unwrap_or(10_000.0);
@@ -338,17 +396,25 @@ impl<D: ComputeDevice> Model<D> {
     }
 
     /// Layer `l`'s weights, read-only, for step overrides that run the layers themselves.
-    pub fn layer_weights(&self, l: usize) -> LayerWeights<'_, D::Buffer> {
+    /// `None` for a layer these don't describe: a MoE layer, or attention with biases or sinks
+    /// (gpt-oss).
+    pub fn layer_weights(&self, l: usize) -> Option<LayerWeights<'_, D::Buffer>> {
         let w = &self.layers[l];
-        LayerWeights {
+        let Mlp::Dense { w_gate_up, w_down } = &w.mlp else {
+            return None;
+        };
+        if w.bqkv.is_some() || w.bo.is_some() || w.sinks.is_some() {
+            return None;
+        }
+        Some(LayerWeights {
             attn_norm: &w.attn_norm,
             wqkv: &w.wqkv,
             wo: &w.wo,
             q_norm: w.q_norm.as_ref(),
             k_norm: w.k_norm.as_ref(),
             mlp_norm: &w.mlp_norm,
-            w_gate_up: &w.w_gate_up,
-            w_down: &w.w_down,
+            w_gate_up,
+            w_down,
             post_attn_norm: w.post_attn_norm.as_ref(),
             post_mlp_norm: w.post_mlp_norm.as_ref(),
             window: w.window,
@@ -357,7 +423,7 @@ impl<D: ComputeDevice> Model<D> {
                 .get(w.rope)
                 .map(|(c, s)| (c, s))
                 .expect("rope table"),
-        }
+        })
     }
 
     /// The embedding table, final norm and output head (the embedding when tied).
@@ -915,11 +981,16 @@ impl<D: ComputeDevice> Model<D> {
         for (l, w) in self.layers.iter().take(layer_limit).enumerate() {
             let (kp, vp) = pool.layer(l);
             let a = ops.rms_norm(dev, x, &w.attn_norm, s, h, eps);
-            let qkv = self.linear_rows(&a, &w.wqkv, &groups, h, qd + 2 * kvd);
+            let mut qkv = self.linear_rows(&a, &w.wqkv, &groups, h, qd + 2 * kvd);
+            if let Some(b) = &w.bqkv {
+                qkv = dev.bias_add(&qkv, b, s * (qd + 2 * kvd), qd + 2 * kvd);
+            }
             let (cos, sin) = &self.ropes[w.rope];
             // Rows the fused call covers (all of them, or a leading run), then the rest one
             // part at a time.
-            let fuse = fused.as_ref().filter(|_| w.window == 0);
+            let fuse = fused
+                .as_ref()
+                .filter(|_| w.window == 0 && w.sinks.is_none());
             let skip = if fuse.is_some() { singles } else { 0 };
             let one = seqs.len() - skip == 1 && skip == 0;
             let mut att = if one || skip == seqs.len() {
@@ -996,20 +1067,34 @@ impl<D: ComputeDevice> Model<D> {
                 if let Some(kc) = self.kvcomp.lock().unwrap().as_ref() {
                     self.restore_kv(kc, l, kp, vp, table);
                 }
-                let o = ops.kv_attention_paged(
-                    dev,
-                    &crate::ext::PagedAttention {
-                        q: &q,
-                        k_pool: kp,
-                        v_pool: vp,
-                        pages: &pages,
-                        start: *pos,
-                        rows: *n,
-                        heads: (nh, nkv, hd),
-                        window: w.window,
+                let o = match &w.sinks {
+                    Some(sinks) => dev.kv_attention_paged_sinks(
+                        &q,
+                        kp,
+                        vp,
+                        &pages,
+                        *pos,
+                        *n,
+                        (nh, nkv, hd),
+                        w.window,
                         causal,
-                    },
-                );
+                        sinks,
+                    ),
+                    None => ops.kv_attention_paged(
+                        dev,
+                        &crate::ext::PagedAttention {
+                            q: &q,
+                            k_pool: kp,
+                            v_pool: vp,
+                            pages: &pages,
+                            start: *pos,
+                            rows: *n,
+                            heads: (nh, nkv, hd),
+                            window: w.window,
+                            causal,
+                        },
+                    ),
+                };
                 match att.as_mut() {
                     Some(all) => dev.write_into(all, row * qd, &o),
                     None => single = Some(o),
@@ -1017,19 +1102,27 @@ impl<D: ComputeDevice> Model<D> {
             }
             let att = att.or(single).expect("a part");
             let mut o = self.linear_rows(&att, &w.wo, &groups, qd, h);
+            if let Some(b) = &w.bo {
+                o = dev.bias_add(&o, b, s * h, h);
+            }
             if let Some(n) = &w.post_attn_norm {
                 o = ops.rms_norm(dev, &o, n, s, h, eps);
             }
             *x = dev.add_tensors_buf(x, &o, s * h);
 
             let m = ops.rms_norm(dev, x, &w.mlp_norm, s, h, eps);
-            let gu = self.linear_rows(&m, &w.w_gate_up, &groups, h, 2 * ff);
-            let act = if c.is_gemma() {
-                dev.geglu_split(&gu, s, ff)
-            } else {
-                dev.swiglu_split(&gu, s, ff)
+            let mut d = match &w.mlp {
+                Mlp::Dense { w_gate_up, w_down } => {
+                    let gu = self.linear_rows(&m, w_gate_up, &groups, h, 2 * ff);
+                    let act = if c.is_gemma() {
+                        dev.geglu_split(&gu, s, ff)
+                    } else {
+                        dev.swiglu_split(&gu, s, ff)
+                    };
+                    self.linear_rows(&act, w_down, &groups, ff, h)
+                }
+                Mlp::Moe(e) => self.moe(e, &m, &groups, s),
             };
-            let mut d = self.linear_rows(&act, &w.w_down, &groups, ff, h);
             if let Some(n) = &w.post_mlp_norm {
                 d = ops.rms_norm(dev, &d, n, s, h, eps);
             }
@@ -1047,6 +1140,218 @@ impl<D: ComputeDevice> Model<D> {
         }
         Ok(())
     }
+}
+
+impl<D: ComputeDevice> Model<D> {
+    /// A routed MoE over normed hidden states `m` (`[s, hidden]`). Each row's experts run on
+    /// that row alone, so a row's output doesn't depend on what else is in the batch.
+    fn moe(
+        &self,
+        e: &Moe<D::Buffer>,
+        m: &D::Buffer,
+        groups: &[(usize, usize)],
+        s: usize,
+    ) -> D::Buffer {
+        let dev = &self.dev;
+        let h = self.cfg.hidden_size;
+        let (k, ff) = (e.top_k, e.ff);
+        let mut logits = self.linear_rows(m, &e.router, groups, h, e.experts);
+        if let Some(b) = &e.router_bias {
+            logits = dev.bias_add(&logits, b, s * e.experts, e.experts);
+        }
+        let (ids, wts) = dev.moe_route(&logits, s, e.experts, k, e.route);
+        let gu = dev.moe_linear(
+            m,
+            &e.gate_up,
+            e.fmt,
+            e.experts,
+            e.gate_up_bias.as_ref(),
+            &ids,
+            k,
+            h,
+            2 * ff,
+            false,
+        );
+        let act = match e.clamp {
+            Some((alpha, limit)) => dev.swiglu_clamped(&gu, s * k, ff, alpha, limit),
+            None => dev.swiglu_split(&gu, s * k, ff),
+        };
+        let parts = dev.moe_linear(
+            &act,
+            &e.down,
+            e.fmt,
+            e.experts,
+            e.down_bias.as_ref(),
+            &ids,
+            k,
+            ff,
+            h,
+            true,
+        );
+        dev.moe_combine(&parts, &wts, s, k, h)
+    }
+}
+
+/// Load layer `p`'s MoE: gpt-oss (`mlp.router`, `mlp.experts.*`, MXFP4 `_blocks`/`_scales` or
+/// dense `[experts, in, out]` as transformers saves it).
+fn load_moe<D: ComputeDevice>(
+    dev: &D,
+    w: &Weights,
+    cfg: &Config,
+    p: &str,
+    dtype: Dtype,
+) -> Result<Moe<D::Buffer>> {
+    let (h, ff) = (cfg.hidden_size, cfg.intermediate_size);
+    let experts = cfg.num_local_experts.unwrap_or(0);
+    let top_k = cfg.num_experts_per_tok.unwrap_or(0);
+    anyhow::ensure!(
+        cfg.is_gpt_oss() && experts > 0 && top_k > 0 && top_k <= experts,
+        "MoE layers are only supported for gpt-oss so far"
+    );
+    let x = format!("{p}.mlp.experts");
+    // gpt-oss interleaves gate and up rows (gate 2j, up 2j + 1): gate rows first, then up.
+    let split: Vec<usize> = (0..ff)
+        .map(|j| 2 * j)
+        .chain((0..ff).map(|j| 2 * j + 1))
+        .collect();
+    let per_expert = |v: &[f32], n: usize, perm: Option<&[usize]>| -> Vec<f32> {
+        let Some(perm) = perm else { return v.to_vec() };
+        let mut out = Vec::with_capacity(v.len());
+        for e in 0..experts {
+            for &r in perm {
+                out.extend_from_slice(
+                    &v[(e * n + r) * (v.len() / experts / n)..][..v.len() / experts / n],
+                );
+            }
+        }
+        out
+    };
+    let bias = |name: &str, n: usize, perm: Option<&[usize]>| -> Result<Option<D::Buffer>> {
+        let name = format!("{x}.{name}");
+        if !w.has(&name) {
+            return Ok(None);
+        }
+        Ok(Some(dev.upload(&per_expert(&w.f32(&name)?.0, n, perm))))
+    };
+    let (fmt, gate_up, down) = if w.has(&format!("{x}.gate_up_proj_blocks")) {
+        let mx = |name: &str, n: usize, k: usize, perm: Option<&[usize]>| -> Result<D::Buffer> {
+            let (blocks, _) = w.bytes(&format!("{x}.{name}_blocks"))?;
+            let (scales, _) = w.bytes(&format!("{x}.{name}_scales"))?;
+            let mut packed = Mxfp4::pack(&blocks, &scales, experts, n, k);
+            if let Some(perm) = perm {
+                packed = Mxfp4::permute_rows(&packed, experts, n, k, perm);
+            }
+            Ok(dev.upload_bytes(&packed))
+        };
+        (
+            ExpertFmt::Mxfp4,
+            mx("gate_up_proj", 2 * ff, h, Some(&split))?,
+            mx("down_proj", h, ff, None)?,
+        )
+    } else {
+        // transformers' layout: `[experts, in, out]`; to `[experts, out, in]`.
+        let dense = |name: &str, k: usize, n: usize, perm: Option<&[usize]>| -> Result<D::Buffer> {
+            let (v, _) = w.f32(&format!("{x}.{name}"))?;
+            let mut t = vec![0f32; v.len()];
+            for e in 0..experts {
+                for i in 0..k {
+                    for o in 0..n {
+                        t[(e * n + o) * k + i] = v[(e * k + i) * n + o];
+                    }
+                }
+            }
+            let t = per_expert(&t, n, perm);
+            Ok(match dtype {
+                Dtype::Bf16 => dev.upload_bf16(
+                    &t.iter()
+                        .map(|&f| tang_compute::f32_to_bf16(f))
+                        .collect::<Vec<_>>(),
+                ),
+                _ => dev.upload(&t),
+            })
+        };
+        let fmt = if dtype == Dtype::Bf16 && dev.bf16_storage() {
+            ExpertFmt::Bf16
+        } else {
+            ExpertFmt::F32
+        };
+        (
+            fmt,
+            dense("gate_up_proj", h, 2 * ff, Some(&split))?,
+            dense("down_proj", ff, h, None)?,
+        )
+    };
+    Ok(Moe {
+        router: dev.upload(&w.f32(&format!("{p}.mlp.router.weight"))?.0),
+        router_bias: if w.has(&format!("{p}.mlp.router.bias")) {
+            Some(dev.upload(&w.f32(&format!("{p}.mlp.router.bias"))?.0))
+        } else {
+            None
+        },
+        route: Router::TopKSoftmax,
+        experts,
+        top_k,
+        ff,
+        fmt,
+        gate_up,
+        gate_up_bias: bias("gate_up_proj_bias", 2 * ff, Some(&split))?,
+        down,
+        down_bias: bias("down_proj_bias", h, None)?,
+        clamp: Some((
+            cfg.swiglu_alpha.unwrap_or(1.702),
+            cfg.swiglu_limit.unwrap_or(7.0),
+        )),
+    })
+}
+
+/// YaRN inverse frequencies and attention factor (transformers' `_compute_yarn_parameters`).
+fn yarn(
+    head_dim: usize,
+    theta: f32,
+    y: &crate::config::RopeScaling,
+    max_pos: usize,
+) -> (Vec<f64>, f64) {
+    let (dim, base, factor) = (head_dim as f64, theta as f64, y.factor as f64);
+    let orig = y.original_max_position_embeddings.unwrap_or(max_pos) as f64;
+    let mscale = |s: f64| if s <= 1.0 { 1.0 } else { 0.1 * s.ln() + 1.0 };
+    let attention = y.attention_factor.map_or(mscale(factor), |a| a as f64);
+    let (fast, slow) = (
+        y.beta_fast.unwrap_or(32.0) as f64,
+        y.beta_slow.unwrap_or(1.0) as f64,
+    );
+    let corr =
+        |rot: f64| dim * (orig / (rot * 2.0 * std::f64::consts::PI)).ln() / (2.0 * base.ln());
+    let (mut lo, mut hi) = (corr(fast), corr(slow));
+    if y.truncate.unwrap_or(true) {
+        (lo, hi) = (lo.floor(), hi.ceil());
+    }
+    let (lo, mut hi) = (lo.max(0.0), hi.min(dim - 1.0));
+    if lo == hi {
+        hi += 0.001;
+    }
+    let inv = (0..head_dim / 2)
+        .map(|i| {
+            let pos = base.powf(2.0 * i as f64 / dim);
+            let ramp = ((i as f64 - lo) / (hi - lo)).clamp(0.0, 1.0);
+            let extra = 1.0 - ramp;
+            1.0 / (factor * pos) * (1.0 - extra) + 1.0 / pos * extra
+        })
+        .collect();
+    (inv, attention)
+}
+
+/// cos/sin tables `[max_pos, inv.len()]` from inverse frequencies, both scaled by `mscale`.
+fn rope_tables_inv(inv: &[f64], max_pos: usize, mscale: f64) -> (Vec<f32>, Vec<f32>) {
+    let mut cos = Vec::with_capacity(max_pos * inv.len());
+    let mut sin = Vec::with_capacity(max_pos * inv.len());
+    for p in 0..max_pos {
+        for &f in inv {
+            let a = p as f64 * f;
+            cos.push((a.cos() * mscale) as f32);
+            sin.push((a.sin() * mscale) as f32);
+        }
+    }
+    (cos, sin)
 }
 
 fn new_pool<B>(layers: usize, kv_dim: usize, bf16: bool, max_blocks: usize) -> Shared<B> {
@@ -1093,13 +1398,18 @@ mod conditioning_tests {
             q_norm: None,
             k_norm: None,
             mlp_norm: dev.upload(&[1.; 4]),
-            w_gate_up: dev.upload(&[
-                1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 1., 0., 0., 0., 0.,
-                1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
-            ]),
-            w_down: dev.upload(&[
-                scale, 0., 0., 0., 0., scale, 0., 0., 0., 0., scale, 0., 0., 0., 0., scale,
-            ]),
+            mlp: Mlp::Dense {
+                w_gate_up: dev.upload(&[
+                    1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 1., 0., 0., 0.,
+                    0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
+                ]),
+                w_down: dev.upload(&[
+                    scale, 0., 0., 0., 0., scale, 0., 0., 0., 0., scale, 0., 0., 0., 0., scale,
+                ]),
+            },
+            bqkv: None,
+            bo: None,
+            sinks: None,
             post_attn_norm: None,
             post_mlp_norm: None,
             window: 0,
