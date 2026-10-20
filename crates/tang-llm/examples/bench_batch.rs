@@ -130,10 +130,14 @@ fn main() -> Result<()> {
             "--speculate" => speculate = true,
             "--long" => long = Some(args.next().unwrap().parse::<usize>()?),
             "--step-ms" => step_ms = Some(args.next().unwrap().parse()?),
+            "--hook-cost" => return hook_cost(),
             "--probe" => return probe(&tang_llm::resolve_model(&model)?, dtype),
             o => anyhow::bail!("unknown option {o}"),
         }
     }
+    // With `--features otel` and OTEL_EXPORTER_OTLP_ENDPOINT set, steps record metrics (to
+    // measure their cost; see docs/observability.md).
+    let _otel = tang_llm::telemetry::init();
     let dir = tang_llm::resolve_model(&model)?;
     let ctx = long.map_or(4096, |n| (n + 2048).max(4096));
     let mut e = Engine::load(device(), &dir, ctx, dtype)?;
@@ -175,6 +179,31 @@ fn main() -> Result<()> {
             n as f64 / b as f64 / secs,
             n as f64 / secs,
             secs * 1e3 / steps.max(1) as f64,
+        );
+    }
+    Ok(())
+}
+
+/// What the per-step telemetry hook costs, alone: ns per `telemetry::step` call (exporting
+/// with `--features otel` and OTEL_EXPORTER_OTLP_ENDPOINT set; an empty call otherwise).
+fn hook_cost() -> Result<()> {
+    let _otel = tang_llm::telemetry::init();
+    let stats = tang_llm::engine::StepStats {
+        decode_rows: 8,
+        decode_streams: 7,
+        prefill_tokens: 256,
+        prefill_chunks: 1,
+        secs: 0.012,
+    };
+    let n = 2_000_000;
+    for _ in 0..2 {
+        let t = Instant::now();
+        for _ in 0..n {
+            tang_llm::telemetry::step(std::hint::black_box(&stats));
+        }
+        println!(
+            "telemetry::step: {:.1} ns/call",
+            t.elapsed().as_secs_f64() * 1e9 / n as f64
         );
     }
     Ok(())

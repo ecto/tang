@@ -22,6 +22,7 @@ use crate::model::Dtype;
 use crate::node::{Need, Probe, Rates};
 use crate::queue::{Priority, Queue, Ticket};
 use crate::sample::Sampling;
+use crate::telemetry::{End, Trace};
 use axum::extract::{Request as HttpRequest, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
@@ -59,6 +60,8 @@ enum Job {
         before: Option<Before>,
         /// The client's `x-request-id`, logged with the request's usage.
         request_id: Option<String>,
+        /// Its OpenTelemetry trace (empty unless the `otel` feature exports).
+        trace: Trace,
     },
     Load {
         spec: String,
@@ -388,6 +391,8 @@ where
     D: ComputeDevice + 'static,
     F: Fn(&str) -> anyhow::Result<B> + Send + 'static,
 {
+    // Before any async runtime: the OTLP exporter's blocking client builds its own.
+    let _otel = crate::telemetry::init();
     let resources = Arc::<crate::image_server::Gate>::default();
     let image = image.map(|(root, make)| crate::image_server::mount(root, make, resources.clone()));
     let node = Arc::new(Node {
@@ -473,6 +478,7 @@ struct Active {
     model: String,
     before: Option<Before>,
     request_id: Option<String>,
+    trace: Trace,
     /// A background request's prompt, kept in case it gives way.
     kept: Option<(String, Vec<u32>)>,
     stream: Inflight,
@@ -579,7 +585,8 @@ where
                     model,
                     before,
                     request_id,
-                } => self.complete(ticket, req, prompt, tx, model, before, request_id),
+                    trace,
+                } => self.complete(ticket, req, prompt, tx, model, before, request_id, trace),
                 Job::Load { spec, reply } => {
                     let _ = reply.send(self.swap(&spec));
                 }
@@ -608,25 +615,30 @@ where
         model: String,
         before: Option<Before>,
         request_id: Option<String>,
+        mut trace: Trace,
     ) {
         let rid = request_id.as_deref();
+        trace.dequeued(|| self.node.queue.len());
         if tx.is_closed() {
             // The client went away while it waited.
             log_usage(rid, &model, &Usage::default(), "cancelled");
+            trace.finish(&Usage::default(), End::Cancelled, ticket.yields, None);
             return;
         }
         let engine = match &mut self.engine {
             Some((name, e)) if *name == model => e,
             Some((name, _)) => {
-                let _ = tx.send(Out::Error(format!(
-                    "model {model} was unloaded ({name} is loaded now)"
-                )));
+                let msg = format!("model {model} was unloaded ({name} is loaded now)");
                 log_usage(rid, &model, &Usage::default(), "error");
+                trace.finish(&Usage::default(), End::Error, ticket.yields, Some(&msg));
+                let _ = tx.send(Out::Error(msg));
                 return;
             }
             None => {
-                let _ = tx.send(Out::Error(format!("model {model} was unloaded")));
+                let msg = format!("model {model} was unloaded");
                 log_usage(rid, &model, &Usage::default(), "error");
+                trace.finish(&Usage::default(), End::Error, ticket.yields, Some(&msg));
+                let _ = tx.send(Out::Error(msg));
                 return;
             }
         };
@@ -652,10 +664,21 @@ where
                     model,
                     before,
                     request_id,
+                    trace,
                     kept,
                     stream,
                 }),
-                Err(e) => self.conclude(ticket, req, tx, model, before, request_id, kept, Err(e)),
+                Err(e) => self.conclude(
+                    ticket,
+                    req,
+                    tx,
+                    model,
+                    before,
+                    request_id,
+                    trace,
+                    kept,
+                    Err(e),
+                ),
             }
             return;
         }
@@ -673,7 +696,9 @@ where
             &mut |p| piece_tx.send(Out::Piece(p)).is_ok(),
             &mut ctl,
         );
-        self.conclude(ticket, req, tx, model, before, request_id, kept, result);
+        self.conclude(
+            ticket, req, tx, model, before, request_id, trace, kept, result,
+        );
     }
 
     /// One decode step for the batch, then the finished streams' replies.
@@ -723,6 +748,7 @@ where
             })
             .collect();
         let result = engine.step(&mut lanes);
+        crate::telemetry::queue_depth(|| node.queue.len());
         drop(lanes);
         drop(ctls);
         drop(picked);
@@ -753,6 +779,7 @@ where
                 a.model,
                 a.before,
                 a.request_id,
+                a.trace,
                 a.kept,
                 result,
             );
@@ -769,6 +796,7 @@ where
         model: String,
         before: Option<Before>,
         request_id: Option<String>,
+        trace: Trace,
         kept: Option<(String, Vec<u32>)>,
         result: anyhow::Result<Outcome>,
     ) {
@@ -808,6 +836,7 @@ where
                     model,
                     before: Some(before),
                     request_id,
+                    trace,
                 };
                 self.node.queue.push_front(ticket, job);
             }
@@ -830,19 +859,22 @@ where
                     usage.prefill_tok_s =
                         (usage.prompt_tokens - b.cached_tokens) as f64 / (b.secs + secs).max(1e-9);
                 }
-                let outcome = if finish == Finish::Cancelled {
-                    "cancelled"
+                let end = if finish == Finish::Cancelled {
+                    End::Cancelled
                 } else {
-                    "ok"
+                    End::Ok
                 };
-                log_usage(rid, &model, &usage, outcome);
+                log_usage(rid, &model, &usage, end.as_str());
+                trace.finish(&usage, end, ticket.yields, None);
                 let engine = &mut self.engine.as_mut().expect("the engine that ran it").1;
                 let _ = tx.send(Out::Done(finish, usage.clone()));
                 engine.after(&req, &Ok((finish, usage)));
             }
             Err(e) => {
+                let msg = format!("{e:#}");
                 log_usage(rid, &model, &Usage::default(), "error");
-                let _ = tx.send(Out::Error(format!("{e:#}")));
+                trace.finish(&Usage::default(), End::Error, ticket.yields, Some(&msg));
+                let _ = tx.send(Out::Error(msg));
                 self.engine
                     .as_mut()
                     .expect("the engine that ran it")
@@ -1281,13 +1313,16 @@ async fn submit(
     let prompt = prompt.map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let (tx, rx) = mpsc::unbounded_channel();
     let n = prompt.as_ref().map(|p| p.1.len());
+    let request_id = request_id(headers);
+    let trace = Trace::incoming(headers, priority.as_str(), &model, request_id.as_deref());
     let job = Job::Complete {
         req: Box::new(req),
         prompt,
         tx,
         model: model.clone(),
         before: None,
-        request_id: request_id(headers),
+        request_id,
+        trace,
     };
     app.node.queue.push(priority, n, job);
     Ok((model, rx))
@@ -1366,8 +1401,7 @@ mod tests {
                     reasoning_tokens: 0,
                     prefill_tok_s: 10.0,
                     decode_tok_s: 20.0,
-                    draft_tokens: 0,
-                    accepted_tokens: 0,
+                    ..Usage::default()
                 },
             ))
         }
@@ -1467,6 +1501,9 @@ mod tests {
     use super::{collect_response, stream_response, Out};
     use crate::chat::Piece;
     use crate::engine::{Finish, Usage};
+    use crate::telemetry::Trace;
+    #[cfg(feature = "otel")]
+    use axum::http::HeaderMap;
     use axum::response::IntoResponse;
     use serde_json::{json, Value};
     use tokio::sync::mpsc;
@@ -1487,8 +1524,7 @@ mod tests {
             reasoning_tokens: 0,
             prefill_tok_s: 0.0,
             decode_tok_s: 0.0,
-            draft_tokens: 0,
-            accepted_tokens: 0,
+            ..Usage::default()
         };
         tx.send(Out::Done(Finish::ToolCalls, usage)).unwrap();
         rx
@@ -1638,6 +1674,217 @@ mod tests {
         }
     }
 
+    /// Spans and step metrics through the worker, to in-memory exporters.
+    #[cfg(feature = "otel")]
+    #[test]
+    fn otel_spans_continue_the_incoming_trace() {
+        use opentelemetry::trace::{SpanKind, Status, TraceId};
+        use opentelemetry::Value as V;
+        use opentelemetry_sdk::error::OTelSdkResult;
+        use opentelemetry_sdk::metrics::data::ResourceMetrics;
+        use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
+        use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider, Temporality};
+        use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Debug, Clone, Default)]
+        struct Spans(Arc<Mutex<Vec<SpanData>>>);
+        impl SpanExporter for Spans {
+            async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+                self.0.lock().unwrap().extend(batch);
+                Ok(())
+            }
+        }
+        #[derive(Clone, Default)]
+        struct Metrics(Arc<Mutex<Vec<String>>>);
+        impl PushMetricExporter for Metrics {
+            async fn export(&self, m: &ResourceMetrics) -> OTelSdkResult {
+                let mut names = self.0.lock().unwrap();
+                for sm in m.scope_metrics() {
+                    names.extend(sm.metrics().map(|m| m.name().to_string()));
+                }
+                Ok(())
+            }
+            fn force_flush(&self) -> OTelSdkResult {
+                Ok(())
+            }
+            fn shutdown_with_timeout(&self, _: std::time::Duration) -> OTelSdkResult {
+                Ok(())
+            }
+            fn temporality(&self) -> Temporality {
+                Temporality::Cumulative
+            }
+        }
+
+        struct Traced;
+        impl Backend for Traced {
+            fn context_window(&self) -> usize {
+                1024
+            }
+            fn complete(
+                &mut self,
+                _: &Request,
+                on: &mut dyn FnMut(Piece) -> bool,
+            ) -> anyhow::Result<(Finish, Usage)> {
+                // Longer than its decode, so the prefill span has room before it.
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                on(Piece::Text("ok".into()));
+                Ok((
+                    Finish::Stop,
+                    Usage {
+                        prompt_tokens: 32,
+                        cached_tokens: 8,
+                        completion_tokens: 6,
+                        decode_tok_s: 120.0,
+                        prefill_tok_s: 1000.0,
+                        draft_tokens: 4,
+                        accepted_tokens: 2,
+                        prefill_chunks: 3,
+                        decode_steps: 4,
+                        shared_streams: 6,
+                        ..Usage::default()
+                    },
+                ))
+            }
+            fn model_path(&self, _: &str) -> anyhow::Result<std::path::PathBuf> {
+                Ok("/weights/model.gguf".into())
+            }
+        }
+
+        let spans = Spans::default();
+        let metrics = Metrics::default();
+        let tp = SdkTracerProvider::builder()
+            .with_simple_exporter(spans.clone())
+            .build();
+        let mp = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(metrics.clone()).build())
+            .build();
+        crate::telemetry::install(&tp, &mp);
+
+        let node = std::sync::Arc::new(super::Node {
+            id: "test".into(),
+            queue: crate::queue::Queue::new(),
+            state: std::sync::Mutex::new(super::NodeState::default()),
+            hardware: std::sync::Arc::new(crate::node::Hardware::default),
+            dtype: crate::model::Dtype::F32,
+            resources: Default::default(),
+            image: None,
+        });
+        let mut worker = super::Worker {
+            node,
+            engine: Some(("m".into(), Traced)),
+            load: |_: &str| -> anyhow::Result<Traced> { unreachable!() },
+            batch: Vec::new(),
+        };
+        let run = |worker: &mut super::Worker<Traced, _>, headers: &HeaderMap, model: &str| {
+            let rid = super::request_id(headers);
+            let trace = Trace::incoming(headers, "background", model, rid.as_deref());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let ticket = crate::queue::Ticket {
+                id: 1,
+                priority: crate::queue::Priority::Background,
+                prompt_tokens: Some(32),
+                since: std::time::Instant::now(),
+                yields: 0,
+            };
+            let req = Box::new(super::parse(&json!({"messages": []})).unwrap());
+            worker.complete(ticket, req, None, tx, model.into(), None, rid, trace);
+            while rx.try_recv().is_ok() {}
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "traceparent",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("x-request-id", "req-7".parse().unwrap());
+        run(&mut worker, &headers, "m");
+        // A model that's gone: an error, a fresh trace.
+        run(&mut worker, &HeaderMap::new(), "other");
+        crate::telemetry::step(&crate::engine::StepStats {
+            decode_rows: 3,
+            decode_streams: 3,
+            prefill_tokens: 512,
+            prefill_chunks: 1,
+            secs: 0.02,
+        });
+        crate::telemetry::queue_depth(|| 2);
+
+        let got = spans.0.lock().unwrap().clone();
+        let attr = |s: &SpanData, k: &str| {
+            s.attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == k)
+                .map(|kv| kv.value.clone())
+        };
+        let named = |n: &str| -> Vec<&SpanData> { got.iter().filter(|s| s.name == n).collect() };
+        let trace_id = TraceId::from_hex("4bf92f3577b34da6a3ce929d0e0e4736").unwrap();
+        let roots = named("chat.completions");
+        assert_eq!(roots.len(), 2);
+        let root = roots
+            .iter()
+            .find(|s| s.span_context.trace_id() == trace_id)
+            .expect("the incoming trace continued");
+        assert_eq!(root.parent_span_id.to_string(), "00f067aa0ba902b7");
+        assert_eq!(root.span_kind, SpanKind::Server);
+        assert_eq!(attr(root, "request.id"), Some(V::from("req-7")));
+        assert_eq!(attr(root, "gen_ai.request.model"), Some(V::from("m")));
+        assert_eq!(attr(root, "outcome"), Some(V::from("ok")));
+        let child = |n: &str| {
+            *named(n)
+                .iter()
+                .find(|s| s.span_context.trace_id() == trace_id)
+                .unwrap_or_else(|| panic!("no {n} span"))
+        };
+        for n in ["queued", "prefill", "decode", "finish"] {
+            let s = child(n);
+            assert_eq!(s.parent_span_id, root.span_context.span_id(), "{n}");
+            assert_eq!(attr(s, "request.id"), Some(V::from("req-7")), "{n}");
+            assert!(s.start_time <= s.end_time, "{n}");
+        }
+        let q = child("queued");
+        assert_eq!(attr(q, "priority"), Some(V::from("background")));
+        assert!(attr(q, "queue.wait_ms").is_some());
+        let p = child("prefill");
+        assert_eq!(attr(p, "prompt_tokens"), Some(V::I64(32)));
+        assert_eq!(attr(p, "cached_tokens"), Some(V::I64(8)));
+        assert_eq!(attr(p, "new_tokens"), Some(V::I64(24)));
+        assert_eq!(attr(p, "chunks"), Some(V::I64(3)));
+        let d = child("decode");
+        assert_eq!(attr(d, "completion_tokens"), Some(V::I64(6)));
+        assert_eq!(attr(d, "accepted_draft_tokens"), Some(V::I64(2)));
+        assert_eq!(attr(d, "tokens_per_verify_window"), Some(V::F64(1.5)));
+        assert_eq!(attr(d, "shared_streams_avg"), Some(V::F64(1.5)));
+        // 6 tokens at 120/s: the decode span is the last 50 ms.
+        let ms = d.end_time.duration_since(d.start_time).unwrap().as_millis();
+        assert!((49..=51).contains(&ms), "{ms}");
+        assert_eq!(p.end_time, d.start_time);
+        assert_eq!(attr(child("finish"), "outcome"), Some(V::from("ok")));
+
+        let failed = roots
+            .iter()
+            .find(|s| s.span_context.trace_id() != trace_id)
+            .unwrap();
+        assert_eq!(failed.parent_span_id.to_string(), "0000000000000000");
+        assert_eq!(attr(failed, "outcome"), Some(V::from("error")));
+        assert!(matches!(failed.status, Status::Error { .. }));
+        assert!(attr(failed, "request.id").is_none());
+
+        mp.force_flush().unwrap();
+        let names = metrics.0.lock().unwrap().clone();
+        for m in [
+            "tang_llm.step.duration",
+            "tang_llm.step.rows",
+            "tang_llm.prefill.chunk_tokens",
+            "tang_llm.prefix.hit_ratio",
+            "tang_llm.queue.depth",
+            "tang_llm.stream.tokens_per_second",
+        ] {
+            assert!(names.iter().any(|n| n == m), "{m} missing from {names:?}");
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_dropped_stream_stops_generation() {
         use std::sync::atomic::Ordering;
@@ -1673,7 +1920,16 @@ mod tests {
         let run = std::thread::spawn(move || {
             let mut worker = make();
             let t = std::time::Instant::now();
-            worker.complete(ticket, req, None, tx, "m".into(), None, Some("rid".into()));
+            worker.complete(
+                ticket,
+                req,
+                None,
+                tx,
+                "m".into(),
+                None,
+                Some("rid".into()),
+                Trace::none(),
+            );
             let took = t.elapsed();
             drop(worker);
             (took, ())

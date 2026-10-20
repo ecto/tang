@@ -16,6 +16,9 @@ metal = ["tang-compute/metal"]
 # NVIDIA GPUs. On Linux, build with `--no-default-features --features cuda` (Metal is macOS-only).
 cuda = ["tang-compute/cuda", "dep:tang-moe", "tang-moe/cuda", "dep:cudarc"]
 
+# OpenTelemetry traces and metrics over OTLP/HTTP (see docs/observability.md). Off by default.
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
+
 mtp-train = ["dep:tang-ad", "dep:tang-train", "dep:tang-tensor"]
 
 [dependencies]
@@ -41,6 +44,9 @@ sha2 = "0.10"
 llguidance = { version = "=1.9.1", default-features = false }
 libc = "0.2"
 tang-moe = { path = "../tang-moe", optional = true }
+opentelemetry = { version = "0.30", default-features = false, features = ["trace", "metrics"], optional = true }
+opentelemetry_sdk = { version = "0.30", default-features = false, features = ["trace", "metrics"], optional = true }
+opentelemetry-otlp = { version = "0.30", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls", "trace", "metrics"], optional = true }
 cudarc = { version = "0.16", features = ["nvrtc", "cuda-version-from-build-system"], optional = true }
 
 [target.'cfg(all(target_arch = "aarch64", target_os = "macos"))'.dependencies]

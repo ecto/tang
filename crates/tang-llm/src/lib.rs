@@ -29,6 +29,7 @@ pub mod slots;
 pub mod special;
 pub mod step_cost;
 mod structured;
+pub mod telemetry;
 pub mod vae;
 pub mod vision;
 pub mod weights;
