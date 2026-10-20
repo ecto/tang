@@ -59,7 +59,7 @@ def main():
         print(f"| {name} | " + " | ".join(cells) + " |")
     for bd in bounds:
         t = res.get(("tang kvcodec, any K/V split", bd))
-        others = {k[0]: v for k, v in res.items() if k[1] == bd and not k[0].startswith("tkv") and v}
+        others = {k[0]: v for k, v in res.items() if k[1] == bd and not k[0].startswith(("tkv", "tang")) and v}
         if t and others:
             bn, bv = min(others.items(), key=lambda kv: kv[1])
             print(f"Δ≤{bd}: tkv {t:.2f} vs best baseline {bn} {bv:.2f}: {100 * (1 - t / bv):.1f}% fewer bits (interp.)")
