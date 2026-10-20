@@ -55,6 +55,14 @@ pub struct Gpu3Config {
     pub lanes: usize,
     /// Coefficient probability model.
     pub model: Model3,
+    /// Compact lanes: a multi-lane block of `v` coefficients uses
+    /// `clamp(8·v·lanes / V, 1, lanes)` lanes, `V` the full block volume
+    /// (small coarse-level blocks stop paying `lanes` lanes of rANS framing,
+    /// while no lane runs longer than 1/8 of a full block's lane), and the
+    /// last lane's length is implied by the block size.
+    pub compact: bool,
+    /// Axis-grouped line taps ([`crate::gpuwav::BandInfo::ax`]).
+    pub axis: bool,
 }
 
 /// Probability model of a v3 stream.
@@ -80,7 +88,7 @@ pub enum Model3 {
 impl Gpu3Config {
     /// Defaults: 32³ / 128² blocks, 64³ outlier tiles, residual contexts.
     pub fn new(bound: ErrorBound) -> Self {
-        Self { bound, block: 32, block2d: 128, tile: 64, resctx: true, rho: 0.45, lanes: 1, model: Model3::Static }
+        Self { bound, block: 32, block2d: 128, tile: 64, resctx: true, rho: 0.45, lanes: 1, model: Model3::Static, compact: true, axis: true }
     }
 }
 
@@ -90,8 +98,22 @@ pub fn key3(level: usize, mask: u8) -> usize {
     (l * 8 + mask as usize) * 8
 }
 
+/// Compact streams store predictor taps in units of `2^TAPQ` (Q12 → Q8).
+const TAPQ: u32 = 4;
+
+/// Cells per lane of compact-lane streams (0 = not compact).
+fn lane_cells(cfg: &Gpu3Config, cb: [usize; 3]) -> usize {
+    if cfg.compact && cfg.lanes > 1 {
+        // a coarse block's per-lane chain stays ≤ 1/8 of a full block's, so
+        // the coarse levels (decoded one after another) add little latency
+        (cb.iter().product::<usize>() / (8 * cfg.lanes)).max(1).next_power_of_two()
+    } else {
+        0
+    }
+}
+
 /// Code-blocks of a shape in coding order.
-pub fn blocks_of(sh: &Shape, cb: [usize; 3], lanes: usize) -> (Vec<BandInfo>, Vec<usize>) {
+pub fn blocks_of(sh: &Shape, cb: [usize; 3], lanes: usize, lane_cells: usize, axis: bool) -> (Vec<BandInfo>, Vec<usize>) {
     let mut v = Vec::new();
     let mut band = Vec::new();
     for (bi, b) in sh.bands.iter().enumerate() {
@@ -103,6 +125,7 @@ pub fn blocks_of(sh: &Shape, cb: [usize; 3], lanes: usize) -> (Vec<BandInfo>, Ve
                     k.start = [z, y, x];
                     k.end = [(z + cb[0]).min(b.end[0]), (y + cb[1]).min(b.end[1]), (x + cb[2]).min(b.end[2])];
                     k.org = b.start;
+                    k.ax = axis;
                     let base = key3(pb.level, pb.mask);
                     if lanes <= 1 {
                         k.raster = true;
@@ -112,6 +135,7 @@ pub fn blocks_of(sh: &Shape, cb: [usize; 3], lanes: usize) -> (Vec<BandInfo>, Ve
                         k.raster = false;
                         k.npass = crate::gpuwav::npass_of(k.start, k.end);
                         k.pkey = std::array::from_fn(|p| base + p);
+                        k.nl = k.end.iter().zip(&k.start).map(|(e, s)| e - s).product::<usize>().checked_div(lane_cells).map_or(lanes, |v| v.clamp(1, lanes));
                     }
                     v.push(k);
                     band.push(bi);
@@ -222,7 +246,7 @@ fn choose_priors3(n: &[[u32; 2]]) -> Vec<Option<u8>> {
 }
 
 /// LS predictor fit per key over the blocks.
-fn fit3(sh: &Shape, blocks: &[BandInfo], q: &[i32]) -> Vec<Option<[i32; NTAP]>> {
+fn fit3(sh: &Shape, blocks: &[BandInfo], q: &[i32], tq: u32) -> Vec<Option<[i32; NTAP]>> {
     let nkey = crate::gpuwav::NKEY;
     let mut g = vec![[[0.0f64; NTAP]; NTAP]; nkey];
     let mut h = vec![[0.0f64; NTAP]; nkey];
@@ -281,7 +305,7 @@ fn fit3(sh: &Shape, blocks: &[BandInfo], q: &[i32]) -> Vec<Option<[i32; NTAP]>> 
             let mut w = [0i32; NTAP];
             for i in 0..NTAP {
                 let wi = if a[i][i].abs() > 1e-12 { r[i] / a[i][i] } else { 0.0 };
-                w[i] = (wi * 4096.0).round().clamp(-32767.0, 32767.0) as i32;
+                w[i] = ((wi * 4096.0 / (1 << tq) as f64).round().clamp(-(32767 >> tq) as f64, (32767 >> tq) as f64) as i32) << tq;
             }
             let (mut c0, mut c1) = (0.0f64, 0.0f64);
             for &(t, v) in &obs[k] {
@@ -351,8 +375,10 @@ pub fn samples3(x: &[f32], dims: &[usize], cfg: &Gpu3Config, threads: usize, max
         let shapes = enc.shapes_at(dg);
         let sh = &shapes[0];
         let (qs, _) = enc.quantize(dg, cfg.rho);
-        let (blocks, _) = blocks_of(sh, block_dims(sh.dims, cfg.block, cfg.block2d), cfg.lanes);
-        let fitted = fit3(sh, &blocks, &qs[0]);
+        let cb = block_dims(sh.dims, cfg.block, cfg.block2d);
+        let lc = lane_cells(cfg, cb);
+        let (blocks, _) = blocks_of(sh, cb, cfg.lanes, lc, cfg.axis);
+        let fitted = fit3(sh, &blocks, &qs[0], if lc > 0 { TAPQ } else { 0 });
         let preds: Vec<[i32; NTAP]> = fitted.iter().map(|p| p.unwrap_or([0; NTAP])).collect();
         let mut q = qs[0].clone();
         *got.lock().unwrap() = collect3(sh, &blocks, &mut q, cfg.resctx, &preds, cfg.lanes, max);
@@ -375,8 +401,9 @@ fn encode_at3(enc: &Enc, dims: &[usize], cfg: &Gpu3Config, dg: f64, maxabs: Opti
     let d3 = sh.dims;
     let (qs, dl) = enc.quantize(dg, cfg.rho);
     let cb = block_dims(d3, cfg.block, cfg.block2d);
-    let (blocks, _) = blocks_of(sh, cb, cfg.lanes);
-    let fitted = if std::env::var("TC_NOPRED").is_ok() { vec![None; crate::gpuwav::NKEY] } else { fit3(sh, &blocks, &qs[0]) };
+    let lc = lane_cells(cfg, cb);
+    let (blocks, _) = blocks_of(sh, cb, cfg.lanes, lc, cfg.axis);
+    let fitted = if std::env::var("TC_NOPRED").is_ok() { vec![None; crate::gpuwav::NKEY] } else { fit3(sh, &blocks, &qs[0], if lc > 0 { TAPQ } else { 0 }) };
     let preds: Vec<[i32; NTAP]> = fitted.iter().map(|p| p.unwrap_or([0; NTAP])).collect();
     let mut cs = enc.reconstruct(&shapes, &qs, &dl);
     let scale = enc.scale();
@@ -447,15 +474,33 @@ fn encode_at3(enc: &Enc, dims: &[usize], cfg: &Gpu3Config, dg: f64, maxabs: Opti
     let priors = if net.is_some() { vec![None; NMODEL] } else { choose_priors3(&cnt.n) };
     let mut init = init_of(&priors);
     let mut bw: Vec<Vec<u8>> = Vec::with_capacity(blocks.len());
+    let dbg = std::env::var("TC_STATS").is_ok();
+    let (mut ideal, mut nlanes, mut wbytes) = (0f64, 0usize, 0usize);
     for b in &blocks {
         let nl = cfg.lanes.max(1);
         let mut sink = RecSink { syms: vec![Vec::new(); nl] };
         code_block(sh, b, &mut q, cfg.resctx.then_some(&mut rs[..]), &preds, &mut init, nl, net.as_ref(), &mut sink);
         let lw: Vec<Vec<u16>> = sink.syms.iter().map(|s| crate::gpuwav::rans_encode(s)).collect();
+        if dbg {
+            ideal += sink.syms.iter().flatten().map(|&(_, f)| 16.0 - (f as f64).log2()).sum::<f64>();
+            nlanes += lw.iter().filter(|l| !l.is_empty()).count();
+            wbytes += 2 * lw.iter().map(|l| l.len()).sum::<usize>();
+        }
         let mut w = ByteWriter::new();
         if nl > 1 {
-            for l in &lw {
-                w.varint(l.len() as u64);
+            let used = if lc > 0 { b.nl } else { nl };
+            debug_assert!(lw[used..].iter().all(|l| l.is_empty()));
+            let nv = if lc > 0 { used - 1 } else { used };
+            let mut prev = 0i64;
+            for l in &lw[..nv] {
+                if lc > 0 {
+                    // compact: zig-zag delta from the previous lane (lanes
+                    // get rows round-robin, so their lengths are close)
+                    w.svarint(l.len() as i64 - prev);
+                    prev = l.len() as i64;
+                } else {
+                    w.varint(l.len() as u64);
+                }
             }
             if w.buf.len() % 2 == 1 {
                 w.u8(0);
@@ -511,24 +556,44 @@ fn encode_at3(enc: &Enc, dims: &[usize], cfg: &Gpu3Config, dg: f64, maxabs: Opti
         w.varint(td[a] as u64);
     }
     w.u8(cfg.resctx as u8);
-    w.varint(cfg.lanes.max(1) as u64);
+    if lc > 0 || cfg.axis {
+        w.varint((cfg.lanes.max(1) | 1 << 9 | (cfg.axis as usize) << 10) as u64);
+        w.u8(if lc > 0 { lc.trailing_zeros() as u8 + 1 } else { 0 });
+    } else {
+        w.varint(cfg.lanes.max(1) as u64);
+    }
     w.bytes(&net_bytes);
     w.svarint(enc.e as i64);
     w.svarint(enc.mean_fix as i64);
     w.f64(dg);
     w.bytes(&dl);
     w.varint(corr as u64);
-    for k in used_keys3(&blocks) {
-        match fitted[k] {
-            Some(p) => {
-                w.u8(1);
-                for &t in &p {
-                    w.svarint(t as i64);
-                }
+    let uk = used_keys3(&blocks);
+    let pred_at = w.buf.len();
+    if lc > 0 {
+        // compact layout: presence bitset, then the taps
+        for c in uk.chunks(8) {
+            w.u8(c.iter().enumerate().map(|(i, &k)| (fitted[k].is_some() as u8) << i).sum());
+        }
+        for &k in &uk {
+            for &t in fitted[k].iter().flatten() {
+                w.svarint((t >> TAPQ) as i64);
             }
-            None => w.u8(0),
+        }
+    } else {
+        for &k in &uk {
+            match fitted[k] {
+                Some(p) => {
+                    w.u8(1);
+                    for &t in &p {
+                        w.svarint(t as i64);
+                    }
+                }
+                None => w.u8(0),
+            }
         }
     }
+    let pred_bytes = w.buf.len() - pred_at;
     write_priors(&mut w, &priors);
     let hdr_fixed = w.buf.len();
     for b in &bw {
@@ -541,6 +606,18 @@ fn encode_at3(enc: &Enc, dims: &[usize], cfg: &Gpu3Config, dg: f64, maxabs: Opti
         w.u8(0);
     }
     let header_bytes = w.buf.len();
+    if dbg {
+        let bb: usize = bw.iter().map(|b| b.len()).sum();
+        eprintln!(
+            "STATS hdr_fixed {hdr_fixed} index {} blocks {} block_bytes {bb} ideal_bytes {:.0} pred_bytes {pred_bytes} nkeys {} nfit {} nonempty_lanes {nlanes} word_bytes {wbytes} tiles_bytes {}",
+            header_bytes - hdr_fixed,
+            blocks.len(),
+            ideal / 8.0,
+            uk.len(),
+            uk.iter().filter(|&&k| fitted[k].is_some()).count(),
+            tp.iter().map(|t| t.len()).sum::<usize>()
+        );
+    }
     for b in &bw {
         w.bytes(b);
     }
@@ -687,7 +764,13 @@ pub fn parse3(bytes: &[u8]) -> Result<Parsed3, DecodeError> {
         }
     }
     let resctx = r.u8()? != 0;
-    let lanes = r.varint()? as usize;
+    let lv = r.varint()? as usize;
+    let (lanes, lane_cells, axis) = if lv & 1 << 9 != 0 {
+        let t = r.u8()?;
+        (lv & 511, if t > 0 { 1usize << (t - 1).min(30) } else { 0 }, lv & 1 << 10 != 0)
+    } else {
+        (lv, 0, false)
+    };
     if lanes == 0 || lanes > 256 {
         return Err(DecodeError::Invalid("lanes"));
     }
@@ -713,12 +796,20 @@ pub fn parse3(bytes: &[u8]) -> Result<Parsed3, DecodeError> {
     let corr = r.varint()? as i32;
     let mut sh = Shape::new(d3);
     sh.set_steps(delta_g);
-    let (blocks, block_band) = blocks_of(&sh, cb, lanes);
+    let (blocks, block_band) = blocks_of(&sh, cb, lanes, lane_cells, axis);
     let mut preds = vec![[0i32; NTAP]; crate::gpuwav::NKEY];
-    for k in used_keys3(&blocks) {
-        if r.u8()? != 0 {
+    let uk = used_keys3(&blocks);
+    let has: Vec<bool> = if lane_cells > 0 {
+        let bits: Vec<u8> = (0..uk.len().div_ceil(8)).map(|_| r.u8()).collect::<Result<_, _>>()?;
+        (0..uk.len()).map(|i| bits[i / 8] >> (i % 8) & 1 != 0).collect()
+    } else {
+        Vec::new()
+    };
+    for (i, &k) in uk.iter().enumerate() {
+        if if lane_cells > 0 { has[i] } else { r.u8()? != 0 } {
             for t in preds[k].iter_mut() {
-                *t = r.svarint()? as i32;
+                let v = r.svarint()?;
+                *t = if lane_cells > 0 { (v.clamp(-32767 >> TAPQ, 32767 >> TAPQ) as i32) << TAPQ } else { v as i32 };
             }
         }
     }
@@ -730,7 +821,7 @@ pub fn parse3(bytes: &[u8]) -> Result<Parsed3, DecodeError> {
     let mut off = header_bytes;
     let mut block_words = Vec::with_capacity(blocks.len());
     let mut block_lanes = Vec::with_capacity(blocks.len());
-    for &n in &bsz {
+    for (bi, &n) in bsz.iter().enumerate() {
         let end = off + n;
         if end > bytes.len() || n % 2 == 1 {
             return Err(DecodeError::Truncated);
@@ -740,7 +831,18 @@ pub fn parse3(bytes: &[u8]) -> Result<Parsed3, DecodeError> {
             lv.push((off / 2, end / 2));
         } else {
             let mut br = ByteReader::new(&bytes[off..end]);
-            let nw: Vec<usize> = (0..lanes).map(|_| br.varint().map(|v| v as usize)).collect::<Result<_, _>>()?;
+            let used = if lane_cells > 0 { blocks[bi].nl } else { lanes };
+            let nv = if lane_cells > 0 { used - 1 } else { used };
+            let mut nw = Vec::with_capacity(nv);
+            let mut prev = 0i64;
+            for _ in 0..nv {
+                let k = if lane_cells > 0 { prev + br.svarint()? } else { br.varint()? as i64 };
+                if k < 0 {
+                    return Err(DecodeError::Invalid("lane length"));
+                }
+                nw.push(k as usize);
+                prev = k;
+            }
             let mut w = (off + br.position().next_multiple_of(2)) / 2;
             for &k in &nw {
                 lv.push((w, w + k));
@@ -748,6 +850,13 @@ pub fn parse3(bytes: &[u8]) -> Result<Parsed3, DecodeError> {
             }
             if w * 2 > end {
                 return Err(DecodeError::Truncated);
+            }
+            if nv < used {
+                lv.push((w, end / 2));
+                w = end / 2;
+            }
+            while lv.len() < lanes {
+                lv.push((w, w));
             }
         }
         block_words.push((off, end));

@@ -571,7 +571,10 @@ impl GpuDecoder {
             meta.extend(b.end.iter().map(|&v| v as u32));
             meta.push(ps.block_lanes[i][0].0 as u32);
             meta.push(ps.block_lanes[i][0].1 as u32);
-            meta.push((off_ltab + i * (ps.lanes + 1)) as u32);
+            let lt = off_ltab + i * (ps.lanes + 1);
+            assert!(lt < 1 << 24, "lane table offset");
+            let nl = if b.nl > 0 { b.nl.min(ps.lanes) } else { ps.lanes };
+            meta.push((lt | nl << 24) as u32);
         }
         let off_tiles = meta.len();
         let mut escs: Vec<u32> = Vec::new();
@@ -627,6 +630,7 @@ impl GpuDecoder {
         params[28] = off_tiles as u32;
         params[29] = ps.tiles.len() as u32;
         params[30] = off_net as u32;
+        params[31] = ps.blocks.first().is_some_and(|b| b.ax) as u32;
         let mut sw: Vec<u32> = Vec::with_capacity(bytes.len() / 4 + 1);
         for c in bytes.chunks(4) {
             let mut b = [0u8; 4];
@@ -833,8 +837,9 @@ mod tests {
         // v3 code-blocks
         use crate::gpuwav3::{decode3_box, encode3_f32, Gpu3Config};
         for bound in [ErrorBound::Psnr(50.0), ErrorBound::Psnr(100.0), ErrorBound::MaxAbs(1e-3), ErrorBound::MaxAbs(1e-5)] {
-            for (block, resctx, lanes) in [(8, true, 1), (16, false, 1), (64, true, 1), (16, true, 8), (32, true, 8)] {
-                let cfg = Gpu3Config { block, resctx, lanes, tile: 16, ..Gpu3Config::new(bound) };
+            // compact lanes + axis taps (default), and the older layout
+            for (block, resctx, lanes, new) in [(8, true, 1, true), (16, false, 1, true), (64, true, 1, true), (16, true, 8, true), (32, true, 8, true), (8, true, 1, false), (16, true, 8, false)] {
+                let cfg = Gpu3Config { block, resctx, lanes, tile: 16, compact: new, axis: new, ..Gpu3Config::new(bound) };
                 let (bytes, _) = encode3_f32(&x, &d, &cfg, 2);
                 let cpu = decode3_box(&bytes, [0; 3], [d[0], d[1], d[2]], 1).unwrap().bits;
                 let (gpu, _) = g.decode3(&bytes).unwrap();
@@ -843,9 +848,9 @@ mod tests {
             }
         }
         // learned (overfit) probabilities, 1 and 8 lanes
-        for (lanes, bound) in [(1, ErrorBound::Psnr(80.0)), (8, ErrorBound::Psnr(100.0)), (8, ErrorBound::MaxAbs(1e-4))] {
+        for (lanes, bound, new) in [(1, ErrorBound::Psnr(80.0), true), (8, ErrorBound::Psnr(100.0), true), (8, ErrorBound::MaxAbs(1e-4), true), (8, ErrorBound::Psnr(80.0), false)] {
             let model = crate::gpuwav3::Model3::Overfit { hidden: vec![8], per_epoch: 20_000, epochs: 2 };
-            let cfg = Gpu3Config { block: 16, lanes, tile: 16, model, ..Gpu3Config::new(bound) };
+            let cfg = Gpu3Config { block: 16, lanes, tile: 16, model, compact: new, axis: new, ..Gpu3Config::new(bound) };
             let (bytes, _) = encode3_f32(&x, &d, &cfg, 2);
             let cpu = decode3_box(&bytes, [0; 3], [d[0], d[1], d[2]], 1).unwrap().bits;
             let (gpu, _) = g.decode3(&bytes).unwrap();

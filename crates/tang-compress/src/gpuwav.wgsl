@@ -173,6 +173,7 @@ const A_TH = array<u32, 11>(0u, 1u, 2u, 3u, 5u, 7u, 10u, 14u, 20u, 30u, 48u);
 const P_TH = array<u32, 3>(0u, 2u, 6u);
 const ROWNB_DZ = array<i32, 20>(0, 0, -1, 1, -1, -1, 1, 1, 0, 0, -2, 2, -2, -2, 2, 2, 0, 0, -4, 4);
 const ROWNB_DY = array<i32, 20>(-1, 1, 0, 0, -1, 1, -1, 1, -2, 2, 0, 0, -2, 2, -2, 2, -4, 4, 0, 0);
+const ROWNB_AX = array<u32, 20>(1u, 1u, 0u, 0u, 2u, 2u, 2u, 2u, 1u, 1u, 0u, 0u, 2u, 2u, 2u, 2u, 1u, 1u, 0u, 0u);
 const ROWNB_CAT = array<u32, 20>(0u, 0u, 0u, 0u, 1u, 1u, 1u, 1u, 2u, 2u, 2u, 2u, 2u, 2u, 2u, 2u, 2u, 2u, 2u, 2u);
 
 fn bucket_a(a: u32) -> u32 {
@@ -606,7 +607,7 @@ fn decode3(@builtin(global_invocation_id) gid: vec3<u32>) {
                 if (z2 >= i32(z0) && z2 < i32(z1) && y2 >= i32(y0) && y2 < i32(y1)) {
                     if (z2 < i32(z) || (z2 == i32(z) && y2 < i32(y))) {
                         rb_base[nr] = (u32(z2) * ny + u32(y2)) * nx;
-                        rb_cat[nr] = ROWNB_CAT[t];
+                        rb_cat[nr] = ROWNB_CAT[t] | (select(ROWNB_CAT[t], ROWNB_AX[t], P.pad5 != 0u) << 4u);
                         nr = nr + 1u;
                     }
                 }
@@ -632,14 +633,16 @@ fn decode3(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let i = rb_base[t] + x;
                     let v = coef[i];
                     let vm = mmag(i, v);
-                    let c = rb_cat[t];
+                    let c = rb_cat[t] & 15u;
+                    let gv = rb_cat[t] >> 4u;
+                    sf = sf + select(0, v, gv == 0u); sd = sd + select(0, v, gv == 1u); sr = sr + select(0, v, gv == 2u);
                     if (c == 0u) {
-                        sf = sf + v; af = af + cap(vm); nf = nf + 1u;
+                        af = af + cap(vm); nf = nf + 1u;
                         if (x > x0) { ad = ad + cap(mmag(i - 1u, coef[i - 1u])); nd = nd + 1u; }
                         if (x + 1u < x1) { ad = ad + cap(mmag(i + 1u, coef[i + 1u])); nd = nd + 1u; }
                     }
-                    else if (c == 1u) { sd = sd + v; ad = ad + cap(vm); nd = nd + 1u; }
-                    else { sr = sr + v; ar = ar + cap(vm); nrr = nrr + 1u; }
+                    else if (c == 1u) { ad = ad + cap(vm); nd = nd + 1u; }
+                    else { ar = ar + cap(vm); nrr = nrr + 1u; }
                 }
                 var pv = 0;
                 var pm = 0;
@@ -784,7 +787,9 @@ fn decode3l(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id)
     let b = mt[rec];
     let x0 = mt[rec + 3u];
     let x1 = mt[rec + 6u];
-    let ltab = mt[rec + 9u];
+    let lt9 = mt[rec + 9u];
+    let ltab = lt9 & 0xFFFFFFu;
+    let nlb = max(lt9 >> 24u, 1u);
     lane_start(mt[ltab + lane], mt[ltab + lane + 1u]);
     let npass_b = select(0u, npass_blk(mt[rec + 4u] - mt[rec + 1u], mt[rec + 5u] - mt[rec + 2u]), blk_on);
     if (lid.x == 0u) {
@@ -828,7 +833,7 @@ fn decode3l(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id)
             cy = (ey - lt.z + lt.w - 1u) / lt.w;
             nrows = ((ez - lt.x + lt.y - 1u) / lt.y) * cy;
         }
-        for (var j = lane; j < nrows; j = j + LANESu) {
+        for (var j = select(lane, nrows, lane >= nlb); j < nrows; j = j + nlb) {
             let z = z0 + lt.x + (j / cy) * lt.y;
             let y = y0 + lt.z + (j % cy) * lt.w;
             var nr = 0u;
@@ -838,7 +843,7 @@ fn decode3l(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id)
                 if (z2 >= i32(z0) && z2 < i32(z1) && y2 >= i32(y0) && y2 < i32(y1)) {
                     if (pass_of(npass_b, zy_is_y, u32(z2) - z0, u32(y2) - y0) < p) {
                         rb_base[nr] = (u32(z2) * ny + u32(y2)) * nx;
-                        rb_cat[nr] = ROWNB_CAT[t];
+                        rb_cat[nr] = ROWNB_CAT[t] | (select(ROWNB_CAT[t], ROWNB_AX[t], P.pad5 != 0u) << 4u);
                         nr = nr + 1u;
                     }
                 }
@@ -861,10 +866,12 @@ fn decode3l(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id)
                     let i = rb_base[t] + x;
                     let v = coef[i];
                     let vm = mmag(i, v);
-                    let c = rb_cat[t];
-                    if (c == 0u) { sf = sf + v; af = af + cap(vm); nf = nf + 1u; }
-                    else if (c == 1u) { sd = sd + v; ad = ad + cap(vm); nd = nd + 1u; }
-                    else { sr = sr + v; ar = ar + cap(vm); nrr = nrr + 1u; }
+                    let c = rb_cat[t] & 15u;
+                    let gv = rb_cat[t] >> 4u;
+                    sf = sf + select(0, v, gv == 0u); sd = sd + select(0, v, gv == 1u); sr = sr + select(0, v, gv == 2u);
+                    if (c == 0u) { af = af + cap(vm); nf = nf + 1u; }
+                    else if (c == 1u) { ad = ad + cap(vm); nd = nd + 1u; }
+                    else { ar = ar + cap(vm); nrr = nrr + 1u; }
                 }
                 var pv = 0; var pm = 0; var pnb = 0u; var has_p = 0u;
                 if (par != 0xFFFFFFFFu) {
