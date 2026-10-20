@@ -1431,6 +1431,21 @@ pub trait ComputeDevice: Send + 'static {
         self.swiglu_fused_buf(&self.upload(&g), &self.upload(&u), rows * ff)
     }
 
+    /// The `k` largest of each of `rows` rows of `n` floats: per row, `k` values in
+    /// descending order with their column indices, ties broken by the lower index (so the
+    /// first is what a first-max argmax picks). Backends may do this on the device so only
+    /// `rows * k` pairs come back instead of the rows. Needs `k <= n`.
+    fn top_k_rows(
+        &self,
+        x: &Self::Buffer,
+        rows: usize,
+        n: usize,
+        k: usize,
+    ) -> (Vec<f32>, Vec<u32>) {
+        let v = self.download(x);
+        top_k_rows_host(&v[..rows * n], n, k)
+    }
+
     /// Linear layer: `y[m, n] = x[m, k] @ w[n, k]^T`, with `w` stored the way checkpoints store
     /// it (`[out, in]` row-major). Backends specialize small `m` (decode) as a GEMV.
     fn linear(
@@ -2422,4 +2437,23 @@ pub fn attention_prep_default<D: ComputeDevice + ?Sized>(
 pub fn f32_to_bf16(x: f32) -> u16 {
     let b = x.to_bits();
     (b.wrapping_add(0x7fff + ((b >> 16) & 1)) >> 16) as u16
+}
+
+/// [`ComputeDevice::top_k_rows`] on the host: the reference every backend must match.
+pub fn top_k_rows_host(v: &[f32], n: usize, k: usize) -> (Vec<f32>, Vec<u32>) {
+    let rows = v.len() / n;
+    let (mut vals, mut idx) = (Vec::with_capacity(rows * k), Vec::with_capacity(rows * k));
+    for r in 0..rows {
+        let row = &v[r * n..(r + 1) * n];
+        let mut order: Vec<u32> = (0..n as u32).collect();
+        let cmp = |a: &u32, b: &u32| row[*b as usize].total_cmp(&row[*a as usize]).then(a.cmp(b));
+        if k < n {
+            order.select_nth_unstable_by(k - 1, cmp);
+            order.truncate(k);
+        }
+        order.sort_unstable_by(cmp);
+        vals.extend(order.iter().map(|&i| row[i as usize]));
+        idx.extend_from_slice(&order);
+    }
+    (vals, idx)
 }

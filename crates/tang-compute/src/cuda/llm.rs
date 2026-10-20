@@ -1059,6 +1059,40 @@ impl CudaComputeDevice {
     }
 
     /// `a + b` over f32 buffers. None for bf16 inputs.
+    /// `ComputeDevice::top_k_rows` on the device (`top_k_rows` kernel) for k <= 64 and f32
+    /// rows; None otherwise. Downloads `rows * 2k` floats instead of the rows.
+    pub(super) fn top_k_rows_llm(
+        &self,
+        x: &CudaBuffer,
+        rows: usize,
+        n: usize,
+        k: usize,
+    ) -> Option<(Vec<f32>, Vec<u32>)> {
+        if k == 0 || k > 64 || k > n || !matches!(x.storage(), CudaStorage::F32(_)) {
+            return None;
+        }
+        let mut out = self.pool_alloc_uninit_f32(rows * 2 * k);
+        let f = self.llm_func(llm_cuda::TOPK_CUDA, "top_k_rows");
+        let (nu, ku) = (n as u32, k as u32);
+        unsafe {
+            self.stream
+                .launch_builder(&f)
+                .arg(x.f32_data())
+                .arg(out.f32_data_mut())
+                .arg(&nu)
+                .arg(&ku)
+                .launch(blocks((rows, 1, 1), 1024))
+                .unwrap();
+        }
+        let v = crate::ComputeDevice::download(self, &out);
+        let (mut vals, mut idx) = (Vec::with_capacity(rows * k), Vec::with_capacity(rows * k));
+        for r in v.chunks(2 * k) {
+            vals.extend_from_slice(&r[..k]);
+            idx.extend(r[k..].iter().map(|f| f.to_bits()));
+        }
+        Some((vals, idx))
+    }
+
     pub(super) fn add_llm(&self, a: &CudaBuffer, b: &CudaBuffer, n: usize) -> Option<CudaBuffer> {
         if a.is_bf16() || b.is_bf16() {
             return None;
@@ -1706,6 +1740,20 @@ mod tests {
             1e-5,
             "rope_half",
         );
+    }
+
+    #[test]
+    fn cuda_top_k_rows_vs_host() {
+        on_gpu(|g| {
+            for &(rows, n, k) in &[(1, 151936, 20), (3, 1000, 64), (2, 64, 64), (4, 5000, 1)] {
+                // `vals` repeats every 1009 columns: plenty of ties, at the K-th place too.
+                let v = vals(rows * n, 9, 4.0);
+                let want = crate::top_k_rows_host(&v, n, k);
+                let got = g.top_k_rows(&g.upload(&v), rows, n, k);
+                assert_eq!(got.1, want.1, "top_k_rows idx {rows}x{n} k{k}");
+                assert_eq!(got.0, want.0, "top_k_rows vals {rows}x{n} k{k}");
+            }
+        });
     }
 
     /// Timings of the small-k kernels (not a check) for a model shape

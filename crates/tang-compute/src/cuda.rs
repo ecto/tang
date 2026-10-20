@@ -4509,6 +4509,13 @@ impl ComputeDevice for CudaComputeDevice {
         self.upload_q4_impl(packed, scales, biases, group)
     }
 
+    fn top_k_rows(&self, x: &CudaBuffer, rows: usize, n: usize, k: usize) -> (Vec<f32>, Vec<u32>) {
+        self.top_k_rows_llm(x, rows, n, k).unwrap_or_else(|| {
+            let v = self.download(x);
+            crate::top_k_rows_host(&v[..rows * n], n, k)
+        })
+    }
+
     fn linear(&self, x: &CudaBuffer, w: &CudaBuffer, m: usize, k: usize, n: usize) -> CudaBuffer {
         self.linear_llm(x, w, m, k, n)
             .unwrap_or_else(|| self.matmul_b_transposed(x, w, m, k, n))

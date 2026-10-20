@@ -1350,3 +1350,98 @@ ATTN_MULTI(attn_multi_r32, 32, 32, 128)
 ATTN_MULTI(attn_multi_d256, 16, 16, 256)
 "#
 );
+
+/// `top_k_rows`: the K largest of each row of X `[rows, n]`, a block (1024 threads) a row.
+/// Floats map to order-preserving u32 keys; four 8-bit radix rounds find the K-th largest key
+/// T; then each thread, over its own contiguous range, keeps the keys above T and the first
+/// ties at T, placed by a block-wide prefix count, so the kept set (and its order after the
+/// final sort: value descending, index ascending) never depends on thread timing.
+/// Out `[rows, 2K]`: K values, then K indices as float bits. Needs K <= 64 and K <= n.
+pub const TOPK_CUDA: &str = r#"
+#define TK_T 1024
+__device__ __forceinline__ unsigned int tk_key(float f) {
+    unsigned int u = __float_as_uint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+// Exclusive prefix sum of v over the block (TK_T threads); returns this thread's offset and
+// the total in *tot.
+__device__ __forceinline__ unsigned int tk_scan(unsigned int v, unsigned int* sh, unsigned int* tot) {
+    unsigned int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    unsigned int x = v;
+    for (int o = 1; o < 32; o <<= 1) { unsigned int y = __shfl_up_sync(0xffffffffu, x, o); if (lane >= o) x += y; }
+    if (lane == 31) sh[w] = x;
+    __syncthreads();
+    if (w == 0) {
+        unsigned int s = sh[lane];
+        for (int o = 1; o < 32; o <<= 1) { unsigned int y = __shfl_up_sync(0xffffffffu, s, o); if (lane >= o) s += y; }
+        sh[lane] = s;
+    }
+    __syncthreads();
+    unsigned int before = (w ? sh[w - 1] : 0) + x - v;
+    *tot = sh[31];
+    __syncthreads();
+    return before;
+}
+extern "C" __global__ void __launch_bounds__(TK_T) top_k_rows(
+    const float* __restrict__ X, float* __restrict__ Out, unsigned int n, unsigned int K)
+{
+    __shared__ unsigned int hist[256];
+    __shared__ unsigned int sh[32];
+    __shared__ unsigned int sel[2];
+    __shared__ unsigned int ck[64], ci[64];
+    const float* x = X + (unsigned long long)blockIdx.x * n;
+    unsigned int tid = threadIdx.x;
+    unsigned int per = (n + TK_T - 1) / TK_T, b = tid * per, e = min(b + per, n);
+    unsigned int prefix = 0, pmask = 0, want = K;   // want: how many at-or-above still needed
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (unsigned int i = tid; i < 256; i += TK_T) hist[i] = 0;
+        __syncthreads();
+        for (unsigned int i = tid; i < n; i += TK_T) {   // coalesced; order doesn't matter here
+            unsigned int key = tk_key(x[i]);
+            if ((key & pmask) == prefix) atomicAdd(&hist[(key >> shift) & 255u], 1u);
+        }
+        __syncthreads();
+        if (tid == 0) {
+            unsigned int acc = 0, d = 255;
+            for (;; d--) {
+                if (acc + hist[d] >= want || d == 0) break;
+                acc += hist[d];
+            }
+            sel[0] = d; sel[1] = want - acc;
+        }
+        __syncthreads();
+        prefix |= sel[0] << shift; pmask |= 255u << shift; want = sel[1];
+        __syncthreads();
+    }
+    // prefix = T; keys above T: K - want of them; then the first `want` ties by index.
+    unsigned int above = 0, ties = 0;
+    for (unsigned int i = b; i < e; i++) {
+        unsigned int key = tk_key(x[i]);
+        above += key > prefix; ties += key == prefix;
+    }
+    unsigned int tot, oa = tk_scan(above, sh, &tot);
+    unsigned int ot = tk_scan(ties, sh, &tot);
+    unsigned int na = K - want;
+    for (unsigned int i = b; i < e; i++) {
+        unsigned int key = tk_key(x[i]);
+        if (key > prefix) { ck[oa] = key; ci[oa] = i; oa++; }
+        else if (key == prefix) { if (ot < want) { ck[na + ot] = key; ci[na + ot] = i; } ot++; }
+    }
+    __syncthreads();
+    if (tid == 0) {
+        for (unsigned int a = 1; a < K; a++) {
+            unsigned int k0 = ck[a], i0 = ci[a]; int j = a - 1;
+            while (j >= 0 && (ck[j] < k0 || (ck[j] == k0 && ci[j] > i0))) { ck[j + 1] = ck[j]; ci[j + 1] = ci[j]; j--; }
+            ck[j + 1] = k0; ci[j + 1] = i0;
+        }
+    }
+    __syncthreads();
+    float* o = Out + (unsigned long long)blockIdx.x * 2 * K;
+    for (unsigned int a = tid; a < K; a += TK_T) {
+        unsigned int key = ck[a];
+        unsigned int u = (key & 0x80000000u) ? (key & 0x7fffffffu) : ~key;
+        o[a] = __uint_as_float(u);
+        o[K + a] = __uint_as_float(ci[a]);
+    }
+}
+"#;

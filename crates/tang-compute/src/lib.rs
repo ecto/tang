@@ -24,7 +24,7 @@ pub mod cuda;
 pub mod pool;
 
 pub use cpu::CpuDevice;
-pub use device::{f32_to_bf16, ComputeBuffer, ComputeDevice, PagedRows, Pages};
+pub use device::{f32_to_bf16, top_k_rows_host, ComputeBuffer, ComputeDevice, PagedRows, Pages};
 pub use tang_expr::codegen::Dialect;
 
 pub use modules::{
