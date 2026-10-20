@@ -83,6 +83,14 @@ fn gemv_q4_splits(col_blocks: usize, words: usize) -> (usize, usize) {
     (words.div_ceil(wsplit), wsplit)
 }
 
+/// Split-KV decode: how many splits a query seeing `span` keys uses. A split per 64 keys, at
+/// most 128 (`ATTN_SPLIT_KEYS` / `ATTN_MAX_SPLITS` in the kernel source, which must agree: a
+/// row of a batched decode splits in-kernel the way a decode alone does here). It depends on
+/// the span only, so a row's sums never depend on what it's batched with.
+fn decode_splits(span: usize) -> usize {
+    span.div_ceil(64).clamp(1, 128)
+}
+
 /// Streaming multiprocessors on the current device (for sizing split-KV / split-K grids).
 pub(super) fn sm_count() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -784,7 +792,7 @@ impl CudaComputeDevice {
             0
         };
         let span = longest - base;
-        let n_splits = span.div_ceil(256).clamp(1, 64);
+        let n_splits = decode_splits(span);
         let split_len = span.div_ceil(n_splits);
         let mut partial = self.pool_alloc_uninit_f32(nh * n_splits * (d + 2));
         let (ns, sl, base_u) = (n_splits as u32, split_len as u32, base as u32);
@@ -886,7 +894,7 @@ impl CudaComputeDevice {
         }
         // As many splits as the longest row's decode would use; each row uses its own.
         let span = rows.pos.iter().max().map_or(1, |p| p + 1);
-        let n_splits = span.div_ceil(256).clamp(1, 64);
+        let n_splits = decode_splits(span);
         let mut partial = self.pool_alloc_uninit_f32(n * nh * n_splits * (hd + 2));
         let ns = n_splits as u32;
         let f = self.kv_func(llm_cuda::ATTENTION_CUDA, "attn_partial_rows", bf16);

@@ -892,6 +892,10 @@ extern "C" __global__ void layer_norm(
 pub const ATTENTION_CUDA: &str = with_common!(
     r#"
 #define MAXV 8   // max D / 32
+// Decode splits: one per ATTN_SPLIT_KEYS keys, at most ATTN_MAX_SPLITS (`decode_splits` in
+// cuda/llm.rs, which must agree). 64 keys fills an H200 from a context of ~250 at 32 heads.
+#define ATTN_SPLIT_KEYS 64
+#define ATTN_MAX_SPLITS 128
 
 // Query `qi`'s keys `j0..j1` (one split of them) for head `head`, into its split's slot of P.
 __device__ __forceinline__ void attn_partial_one(
@@ -1003,7 +1007,8 @@ extern "C" __global__ void attn_partial_rows(
 {
     unsigned int split = blockIdx.y, qi = blockIdx.z;
     unsigned int span = RP[qi] + 1;
-    unsigned int mine = min(max((span + 255) / 256, 1u), 64u);
+    unsigned int mine = min(max((span + ATTN_SPLIT_KEYS - 1) / ATTN_SPLIT_KEYS, 1u),
+                            (unsigned int)ATTN_MAX_SPLITS);
     unsigned int split_len = (span + mine - 1) / mine;
     unsigned int s0 = split * split_len;
     unsigned int j0 = split < mine ? s0 : 0;
