@@ -233,7 +233,7 @@ impl CoefModel for HandModel {
             h += 1;
         }
         if h as usize == KB {
-            h += b.uint((hi - h) as u64, &mut self.esc[c]) as u32;
+            h += b.uint(hi.wrapping_sub(h) as u64, &mut self.esc[c]) as u32;
         }
         let mut lo = 0u32;
         b.tag(2);
