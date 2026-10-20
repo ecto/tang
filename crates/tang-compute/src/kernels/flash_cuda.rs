@@ -1,59 +1,11 @@
 //! CUDA kernels for the Flash-Next decode ops (`crate::flash` has the contracts, `cpu::flash`
 //! the reference). One NVRTC module; every kernel is `fl_*` so names never collide with the
-//! other LLM kernels in the per-name function cache. Shapes are the model's, baked in as
-//! constants; the window size `T` (1..=8) is a kernel argument, per-window values come from the
-//! `win` record in device memory.
+//! other LLM kernels in the per-name function cache. Shapes come from the `#define` prelude that
+//! [`Geometry::cuda_prelude`](crate::flash::Geometry::cuda_prelude) generates; the window size
+//! `T` (1..=8) is a kernel argument, per-window values come from the `win` record in device
+//! memory.
 
-pub const FLASH_CUDA: &str = r#"
-typedef unsigned long long u64;
-#define NEG_INF __uint_as_float(0xff800000u)
-
-#define HIDDEN 2560
-#define HC 4
-#define HC_LR 320
-#define GDN_HK 16
-#define GDN_HV 48
-#define GDN_D 128
-#define GDN_CONV 10240
-#define GDN_V 6144
-#define GDN_Z 10240
-#define GDN_A 16384
-#define GDN_B 16432
-#define QSA_HEADS 24
-#define QSA_KV 2
-#define QSA_D 256
-#define IDX_HEADS 4
-#define IDX_D 128
-#define QSA_WIDTH 2051
-#define QSA_K 12288
-#define QSA_V 12800
-#define QSA_IQ 13312
-#define QSA_IK 13824
-#define QSA_CHUNK 64
-#define QSA_NCH 33
-#define TOPK 10
-#define QSA_RING 128
-#define FF 640
-#ifndef PLAN_CAP
-#define PLAN_CAP 88
-#endif
-#define PLAN_GP 4
-#define PLAN_GS (PLAN_GP + 2 * PLAN_CAP)
-#define PLAN_ET (PLAN_GS + PLAN_CAP + 1)
-#define PLAN_ED (PLAN_ET + PLAN_CAP)
-#define PLAN_MISS (PLAN_ED + PLAN_CAP)
-#ifndef SHARED_ROW
-#define SHARED_ROW 80
-#endif
-// The shared expert's first parts row in a wide (prefill, T > 8) window: 64 · TOPK.
-#define WIDE_SHARED_ROW 640
-#define GU_CODES 0
-#define GU_SCALES 819200
-#define DOWN_CODES 921600
-#define DOWN_SCALES 1331200
-#define INV_SQRT_D __int_as_float(0x3db504f3)
-
-__device__ __forceinline__ float bf(unsigned short b) { return __uint_as_float(((unsigned int)b) << 16); }
+pub const FLASH_CUDA_BODY: &str = r#"__device__ __forceinline__ float bf(unsigned short b) { return __uint_as_float(((unsigned int)b) << 16); }
 __device__ __forceinline__ unsigned short to_bf16(float x) {
     unsigned int b = __float_as_uint(x);
     return (unsigned short)((b + 0x7fffu + ((b >> 16) & 1u)) >> 16);
