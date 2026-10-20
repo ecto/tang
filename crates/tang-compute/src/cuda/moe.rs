@@ -286,7 +286,7 @@ impl CudaComputeDevice {
                 .arg(&e_u)
                 .arg(&pp)
                 .arg(&hb)
-                .launch(grid((n.div_ceil(8), experts, 1), 256))
+                .launch(grid((n.div_ceil(32), experts, 1), 256))
                 .unwrap();
         }
         Some(y)
