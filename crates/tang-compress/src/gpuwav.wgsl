@@ -940,7 +940,12 @@ fn zval(d0: i32, ls0: i32) -> i32 {
     let i = (ls - ((ls % 256) + 256) % 256) / 256;
     let f = ls - i * 256;
     let m = bitcast<i32>(mt[mt[P.pad4 + 1u] + u32(256 - f)]);
-    let t = mulsh(clamp(d0, -33554432, 33554432), m, 16u);
+    // exact 32-bit form of mulsh(d, m, 16) for |d| <= 2^25, m in [2^16, 2^17]:
+    // d·m + 2^15 = dh·m·2^16 + dl·2^16 + dl·(m − 2^16) + 2^15
+    let d = clamp(d0, -33554432, 33554432);
+    let dh = d >> 16u;
+    let dl = u32(d) & 0xFFFFu;
+    let t = dh * m + i32(dl) + i32((dl * u32(m - 65536) + 32768u) >> 16u);
     let sh = i + 1;
     if (sh >= 0) { return t >> u32(min(sh, 31)); }
     let k = u32(-sh);
