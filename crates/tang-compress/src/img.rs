@@ -466,12 +466,14 @@ pub struct Model {
     pub lanes: usize,
     /// Tile width (0 = whole grid).
     pub tile_w: usize,
+    /// Tile height (0 = whole grid).
+    pub tile_h: usize,
 }
 
 impl Model {
     /// Build from an export, with the given lane / tile layout. Weight
     /// precisions are placeholders until [`encode`] fits them.
-    pub fn from_ccx(c: &Ccx, lanes: usize, tile_w: usize) -> Self {
+    pub fn from_ccx(c: &Ccx, lanes: usize, tile_w: usize, tile_h: usize) -> Self {
         let isz = c.ints("img_size");
         let sz = c.ints("sizes");
         let sizes: Vec<(usize, usize)> = sz.chunks(2).map(|p| (p[0] as usize, p[1] as usize)).collect();
@@ -510,6 +512,7 @@ impl Model {
             outt: Conv::from_ccx(c, "syn.out"),
             lanes,
             tile_w,
+            tile_h,
         };
         m.slope = slope_of(&m.ctx);
         // NB: the export already carries Cool-chic's −4 log-scale shift in the
@@ -703,18 +706,22 @@ fn enc_syms(v: i32, base: i32, off: usize, out: &mut Vec<(u32, u32)>) {
 
 // --------------------------------------------------------------- schedule
 
-/// Wavefront layout of one grid: tiles of `tw` columns, `lanes` lanes per tile.
+/// Wavefront layout of one grid: tiles of `th × tw`, `lanes` lanes per tile.
 #[derive(Clone, Copy, Debug)]
 pub struct Layout {
     /// Grid height, width.
     pub h: usize,
     /// Width.
     pub w: usize,
+    /// Tile height, width.
+    pub th: usize,
     /// Tile width.
     pub tw: usize,
+    /// Tile columns.
+    pub ntx: usize,
     /// Tiles.
     pub nt: usize,
-    /// Lanes per tile (≤ h); tile `j` uses global lanes `j·lanes ..`.
+    /// Lanes per tile (≤ th); tile `j` uses global lanes `j·lanes ..`.
     pub lanes: usize,
     /// Slope.
     pub s: usize,
@@ -726,24 +733,32 @@ impl Layout {
     /// Layout for an `h × w` grid.
     pub fn new(h: usize, w: usize, m: &Model) -> Self {
         let tw = if m.tile_w == 0 { w } else { m.tile_w.min(w) };
-        let nt = w.div_ceil(tw);
+        let th = if m.tile_h == 0 { h } else { m.tile_h.min(h) };
+        let ntx = w.div_ceil(tw);
+        let nt = ntx * h.div_ceil(th);
         assert!(nt <= m.lanes, "more tiles than lanes");
-        let lanes = (m.lanes / nt).min(h).max(1);
-        Self { h, w, tw, nt, lanes, s: m.slope, steps: tw + m.slope * (h - 1) }
+        let lanes = (m.lanes / nt).min(th).max(1);
+        Self { h, w, th, tw, ntx, nt, lanes, s: m.slope, steps: tw + m.slope * (th - 1) }
     }
-    /// Rows of lane `l` active at step `t`, as `(y, x_in_tile)`, in decode order.
+    /// Tile origin and extent `(y0, x0, th, tw)`.
+    #[inline]
+    pub fn tile(&self, tile: usize) -> (usize, usize, usize, usize) {
+        let (y0, x0) = ((tile / self.ntx) * self.th, (tile % self.ntx) * self.tw);
+        (y0, x0, self.th.min(self.h - y0), self.tw.min(self.w - x0))
+    }
+    /// Pixels of lane `l` active at step `t`, as global `(y, x)`, in decode order.
     #[inline]
     pub fn active(&self, l: usize, t: usize, tile: usize, mut f: impl FnMut(usize, usize)) {
-        let tw = self.tw.min(self.w - tile * self.tw);
+        let (y0, x0, th, tw) = self.tile(tile);
         let mut y = l;
-        while y < self.h {
+        while y < th {
             let sy = self.s * y;
             if sy > t {
                 break;
             }
             let x = t - sy;
             if x < tw {
-                f(y, x);
+                f(y0 + y, x0 + x);
             }
             y += self.lanes;
         }
@@ -752,20 +767,18 @@ impl Layout {
 
 // ----------------------------------------------------------- latent model
 
-/// Gather the ARM input for `(y, x)` of grid `g` (values so far in `lat`,
-/// context cut at the tile border) into `buf` (`Q8`).
+/// Gather the ARM input for global `(y, x)` of a grid (values so far in
+/// `lat`, context cut at the tile border) into `buf` (`Q8`).
 #[inline]
 pub fn arm_input(m: &Model, lay: &Layout, lat: &[i32], ifc: &[i32], y: usize, x: usize, tile: usize, buf: &mut [i32]) {
-    let x0 = tile * lay.tw;
-    let x1 = (x0 + lay.tw).min(lay.w);
-    let gx = x0 + x;
+    let (y0, x0, th, tw) = lay.tile(tile);
     for (i, &(dy, dx)) in m.ctx.iter().enumerate() {
-        let (yy, xx) = (y as i32 + dy, gx as i32 + dx);
-        buf[i] = if yy >= 0 && xx >= x0 as i32 && xx < x1 as i32 { lat[yy as usize * lay.w + xx as usize] << QA_ARM } else { 0 };
+        let (yy, xx) = (y as i32 + dy, x as i32 + dx);
+        buf[i] = if yy >= y0 as i32 && yy < (y0 + th) as i32 && xx >= x0 as i32 && xx < (x0 + tw) as i32 { lat[yy as usize * lay.w + xx as usize] << QA_ARM } else { 0 };
     }
     let nc = m.ctx.len();
     for j in 0..m.nifce {
-        buf[nc + j] = if ifc.is_empty() { 0 } else { ifc[(y * lay.w + gx) * m.nifce + j] };
+        buf[nc + j] = if ifc.is_empty() { 0 } else { ifc[(y * lay.w + x) * m.nifce + j] };
     }
 }
 
@@ -841,6 +854,7 @@ fn write_model(m: &Model, w: &mut BitWriter) {
     eg_put(w, m.nifce as u64, 0);
     eg_put(w, m.lanes as u64, 0);
     eg_put(w, m.tile_w as u64, 0);
+    eg_put(w, m.tile_h as u64, 0);
     m.arm.write(w);
     eg_put(w, m.ifces.len() as u64, 0);
     for f in &m.ifces {
@@ -891,6 +905,7 @@ fn read_model(r: &mut BitReader) -> Result<Model, DecodeError> {
     let nifce = eg_get(r, 0)? as usize;
     let lanes = eg_get(r, 0)? as usize;
     let tile_w = eg_get(r, 0)? as usize;
+    let tile_h = eg_get(r, 0)? as usize;
     if nifce > 16 || lanes == 0 || lanes > 1024 {
         return Err(bad("lanes"));
     }
@@ -917,7 +932,7 @@ fn read_model(r: &mut BitReader) -> Result<Model, DecodeError> {
     let pconv = fl.pop().unwrap();
     let tconv = fl.pop().unwrap();
     let slope = slope_of(&ctx);
-    let m = Model { h, w, sizes, hyper, ctx, nifce, ifce_of, arm, ifces, tconv, pconv, syn, stab, outt, slope, lanes, tile_w };
+    let m = Model { h, w, sizes, hyper, ctx, nifce, ifce_of, arm, ifces, tconv, pconv, syn, stab, outt, slope, lanes, tile_w, tile_h };
     if m.arm.nin() != m.ctx.len() + m.nifce || m.arm.nout() != 2 || m.ifce_of.iter().flatten().any(|&a| a >= m.ifces.len()) {
         return Err(bad("model shape"));
     }
@@ -974,7 +989,7 @@ pub fn decode_latents(p: &Parsed, gd: &mut Guard) -> Vec<Vec<i32>> {
                         arm_input(m, &lay, &lat, &ifc, y, x, tile, &mut inb);
                         m.arm.run(&inb, &mut o, gd);
                         let (base, off) = bucket(o[0], o[1]);
-                        lat[y * w + tile * lay.tw + x] = dec_sym(d, &p.words, tab, base, off);
+                        lat[y * w + x] = dec_sym(d, &p.words, tab, base, off);
                     });
                 }
             }
@@ -1127,7 +1142,7 @@ pub fn synthesize(m: &Model, dense: &[Vec<i64>], gd: &mut Guard) -> Vec<u8> {
     let mut out = vec![0u8; h * w * 3];
     for i in 0..h * w {
         for c in 0..3 {
-            out[i * 3 + c] = rshift(y[c][i] * 255, QA).clamp(0, 255) as u8;
+            out[i * 3 + c] = rshift(gd.see(y[c][i] * 255), QA).clamp(0, 255) as u8;
         }
     }
     out
@@ -1165,8 +1180,8 @@ pub struct Stats {
 }
 
 /// Encode an export into a `TCI1` stream with the given lanes / tile width.
-pub fn encode(c: &Ccx, lanes: usize, tile_w: usize) -> (Vec<u8>, Stats) {
-    let mut m = Model::from_ccx(c, lanes, tile_w);
+pub fn encode(c: &Ccx, lanes: usize, tile_w: usize, tile_h: usize) -> (Vec<u8>, Stats) {
+    let mut m = Model::from_ccx(c, lanes, tile_w, tile_h);
     let n = m.sizes.len();
     let grids: Vec<Vec<i32>> = (0..n).map(|g| c.ints(&format!("latent.{g}")).iter().map(|&v| v as i32).collect()).collect();
     for g in 0..n {
@@ -1201,8 +1216,9 @@ pub fn encode(c: &Ccx, lanes: usize, tile_w: usize) -> (Vec<u8>, Stats) {
             let lay = Layout::new(h, w, &m);
             let ifc = ifce_ctx(&m, g, &grids, &mut gd);
             for tile in 0..lay.nt {
-                for y in 0..h {
-                    for x in 0..lay.tw.min(w - tile * lay.tw) {
+                let (y0, x0, th, tw) = lay.tile(tile);
+                for y in y0..y0 + th {
+                    for x in x0..x0 + tw {
                         arm_input(&m, &lay, &grids[g], &ifc, y, x, tile, &mut inb);
                         m.arm.run(&inb, &mut o, &mut gd);
                     }
@@ -1244,7 +1260,7 @@ pub fn encode(c: &Ccx, lanes: usize, tile_w: usize) -> (Vec<u8>, Stats) {
                         arm_input(&m, &lay, lat, &ifc, y, x, tile, &mut inb);
                         m.arm.run(&inb, &mut o, &mut gd);
                         let (base, off) = bucket(o[0], o[1]);
-                        let v = lat[y * ww + tile * lay.tw + x];
+                        let v = lat[y * ww + x];
                         let k0 = sl.len();
                         enc_syms(v, base, off, sl);
                         for &(_, f) in &sl[k0..] {
@@ -1283,4 +1299,280 @@ pub fn encode(c: &Ccx, lanes: usize, tile_w: usize) -> (Vec<u8>, Stats) {
 pub fn psnr(a: &[u8], b: &[u8]) -> f64 {
     let mse: f64 = a.iter().zip(b).map(|(&x, &y)| (x as f64 - y as f64).powi(2)).sum::<f64>() / a.len() as f64;
     10.0 * (255.0f64 * 255.0 / mse).log10()
+}
+
+// ----------------------------------------------------- integer graphs (GPU)
+
+use tang_expr::int::{IId, IType, IntGraph};
+
+fn g_layer(g: &mut IntGraph, l: &Lin, inp: &[IId], residual: bool, relu: bool) -> Vec<IId> {
+    let zero = g.i32(0);
+    (0..l.out)
+        .map(|o| {
+            let mut acc = g.i32(l.b[o]);
+            for i in 0..l.inp {
+                let w = l.w[o * l.inp + i];
+                if w != 0 {
+                    let wc = g.i32(w);
+                    let t = g.mul(wc, inp[i]);
+                    acc = g.add(acc, t);
+                }
+            }
+            let mut v = g_rshift(g, acc, l.fw);
+            if residual {
+                v = g.add(v, inp[o]);
+            }
+            if relu {
+                v = g.max(v, zero);
+            }
+            v
+        })
+        .collect()
+}
+
+fn g_rshift(g: &mut IntGraph, v: IId, f: u32) -> IId {
+    if f == 0 {
+        return v;
+    }
+    let h = g.i32(1 << (f - 1));
+    let s = g.u32(f);
+    let t = g.add(v, h);
+    g.shr(t, s)
+}
+
+impl Mlp {
+    /// [`Mlp::run`] as an integer graph: params `0..nin`, outputs `0..nout`.
+    pub fn graph(&self) -> (IntGraph, Vec<IId>) {
+        let mut g = IntGraph::new();
+        let x: Vec<IId> = (0..self.nin()).map(|i| g.param(i as u16, IType::I32)).collect();
+        let mut a = x.clone();
+        let nl = self.layers.len();
+        for (li, l) in self.layers.iter().enumerate() {
+            let hidden = li + 1 < nl;
+            a = g_layer(&mut g, l, &a, hidden && self.residual && l.inp == l.out, hidden);
+        }
+        if let Some(s) = &self.stab {
+            let sb = g_layer(&mut g, s, &x, false, false);
+            a = a.iter().zip(sb).map(|(&p, q)| g.add(p, q)).collect();
+        }
+        (g, a)
+    }
+}
+
+/// A synthesis segment: one (possibly 3×3) conv followed by 1×1 convs.
+/// Params: the first conv's taps `[cin][k][k]` (replicate-padded gather),
+/// then (if it is residual) its `cin` centre values; when `last`, then the
+/// `stab` input channels. Outputs: the segment's channels, or (when `last`)
+/// the three 8-bit pixel values.
+pub fn segment_graph(m: &Model, convs: &[&Conv], last: bool) -> (IntGraph, Vec<IId>) {
+    let mut g = IntGraph::new();
+    let c0 = convs[0];
+    let nt = c0.lin.inp;
+    let mut np = 0u16;
+    let mut par = |g: &mut IntGraph| {
+        let p = g.param(np, IType::I32);
+        np += 1;
+        p
+    };
+    let taps: Vec<IId> = (0..nt).map(|_| par(&mut g)).collect();
+    let centre: Vec<IId> = if c0.residual { (0..c0.cin()).map(|_| par(&mut g)).collect() } else { vec![] };
+    let mut a = {
+        let zero = g.i32(0);
+        let l = &c0.lin;
+        (0..l.out)
+            .map(|o| {
+                let mut acc = g.i32(l.b[o]);
+                for i in 0..l.inp {
+                    let w = l.w[o * l.inp + i];
+                    if w != 0 {
+                        let wc = g.i32(w);
+                        let t = g.mul(wc, taps[i]);
+                        acc = g.add(acc, t);
+                    }
+                }
+                let mut v = g_rshift(&mut g, acc, l.fw);
+                if c0.residual {
+                    v = g.add(v, centre[o]);
+                }
+                if c0.relu {
+                    v = g.max(v, zero);
+                }
+                v
+            })
+            .collect::<Vec<_>>()
+    };
+    for c in &convs[1..] {
+        assert_eq!(c.k, 1);
+        a = g_layer(&mut g, &c.lin, &a, c.residual, c.relu);
+    }
+    if last {
+        if let Some(s) = &m.stab {
+            let si: Vec<IId> = (0..s.cin()).map(|_| par(&mut g)).collect();
+            let sb = g_layer(&mut g, &s.lin, &si, false, false);
+            a = a.iter().zip(sb).map(|(&p, q)| g.add(p, q)).collect();
+        }
+        a = g_layer(&mut g, &m.outt.lin, &a, m.outt.residual, m.outt.relu);
+        let (k255, lo, hi) = (g.i32(255), g.i32(0), g.i32(255));
+        a = a
+            .iter()
+            .map(|&v| {
+                let t = g.mul(v, k255);
+                let t = g_rshift(&mut g, t, QA);
+                g.clamp(t, lo, hi)
+            })
+            .collect();
+    }
+    (g, a)
+}
+
+/// Synthesis split into segments (each starts at a 3×3 conv or the input).
+pub fn segments(m: &Model) -> Vec<Vec<&Conv>> {
+    let mut segs: Vec<Vec<&Conv>> = vec![];
+    for c in &m.syn {
+        if c.k != 1 || segs.is_empty() {
+            segs.push(vec![c]);
+        } else {
+            segs.last_mut().unwrap().push(c);
+        }
+    }
+    segs
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use tang_expr::int::Program;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        /// Quantized value k/64 with |k| ≤ a.
+        fn q(&mut self, a: i64) -> f64 {
+            ((self.next() % (2 * a as u64 + 1)) as i64 - a) as f64 / 64.0
+        }
+    }
+
+    fn put(t: &mut HashMap<String, (Vec<usize>, Vec<f64>)>, k: &str, sh: &[usize], v: Vec<f64>) {
+        assert_eq!(sh.iter().product::<usize>(), v.len());
+        t.insert(k.into(), (sh.to_vec(), v));
+    }
+
+    /// A small Cool-chic-shaped model with random weights and latents.
+    pub(crate) fn synth(seed: u64) -> Ccx {
+        let mut r = Rng(seed);
+        let mut t = HashMap::new();
+        let sizes = [(16usize, 24usize), (8, 12), (4, 6), (4, 6)];
+        put(&mut t, "img_size", &[2], vec![16.0, 24.0]);
+        put(&mut t, "sizes", &[4, 2], sizes.iter().flat_map(|&(a, b)| [a as f64, b as f64]).collect());
+        put(&mut t, "is_hyper", &[4], vec![0.0, 0.0, 0.0, 1.0]);
+        let ctx = [(0, -1), (-1, 0), (-1, -1), (-1, 1), (0, -2), (-2, 0), (-1, 2)];
+        put(&mut t, "ctx_index", &[ctx.len()], ctx.iter().map(|&(dy, dx): &(i32, i32)| ((dy + 4) * 9 + dx + 4) as f64).collect());
+        put(&mut t, "mask_size", &[1], vec![9.0]);
+        put(&mut t, "n_ifce_out", &[1], vec![2.0]);
+        put(&mut t, "ifce.input_features", &[4], vec![3.0, 0.0, 0.0, 0.0]);
+        put(&mut t, "ifce.index_to_arm", &[4], vec![0.0, -1.0, -1.0, -1.0]);
+        let mut lin = |t: &mut HashMap<_, _>, r: &mut Rng, p: &str, o: usize, i: usize, a: i64| {
+            put(t, &format!("{p}.w"), &[o, i], (0..o * i).map(|_| r.q(a)).collect());
+            put(t, &format!("{p}.b"), &[o], (0..o).map(|_| r.q(a)).collect());
+        };
+        lin(&mut t, &mut r, "ifce.A0.L0", 2, 3, 40);
+        let nin = ctx.len() + 2;
+        lin(&mut t, &mut r, "arm.L0", nin, nin, 20);
+        lin(&mut t, &mut r, "arm.L1", nin, nin, 20);
+        lin(&mut t, &mut r, "arm.L2", 2, nin, 30);
+        lin(&mut t, &mut r, "arm.stab", 2, nin, 10);
+        for i in 0..2 {
+            let a = [0.0351562, 0.1054687, -0.2617187, -0.8789063].map(|v: f64| (v * 64.0).round() / 64.0 * -1.0);
+            put(&mut t, &format!("ups.tconv.{i}"), &[8], [a[0], a[1], a[2], a[3], a[3], a[2], a[1], a[0]].to_vec());
+            put(&mut t, &format!("ups.conv.{i}"), &[7], (0..7).map(|k| if k == 3 { 0.25 } else { r.q(4) }).collect());
+        }
+        let mut conv = |t: &mut HashMap<_, _>, r: &mut Rng, p: &str, o: usize, i: usize, k: usize, res: bool, relu: bool| {
+            put(t, &format!("{p}.w"), &[o, i, k, k], (0..o * i * k * k).map(|_| r.q(30)).collect());
+            put(t, &format!("{p}.b"), &[o], (0..o).map(|_| r.q(30)).collect());
+            put(t, &format!("{p}.meta"), &[2], vec![res as u8 as f64, relu as u8 as f64]);
+        };
+        conv(&mut t, &mut r, "syn.L0", 8, 3, 1, false, true);
+        conv(&mut t, &mut r, "syn.L1", 3, 8, 1, false, false);
+        conv(&mut t, &mut r, "syn.L2", 3, 3, 3, true, true);
+        conv(&mut t, &mut r, "syn.stab", 3, 3, 1, false, false);
+        put(&mut t, "syn.out.w", &[3, 3, 1, 1], vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+        put(&mut t, "syn.out.b", &[3], vec![0.5; 3]);
+        put(&mut t, "syn.out.meta", &[2], vec![0.0, 0.0]);
+        for (g, &(h, w)) in sizes.iter().enumerate() {
+            // mostly small, a few escapes
+            let v = (0..h * w).map(|_| match r.next() % 40 { 0 => 40.0, 1 => -37.0, k => (k % 5) as f64 - 2.0 }).collect();
+            put(&mut t, &format!("latent.{g}"), &[h, w], v);
+        }
+        Ccx { t }
+    }
+
+    #[test]
+    fn tables_are_normalized() {
+        let t = tables();
+        for c in t.chunks(NSYM + 1) {
+            assert_eq!(c[0], 0);
+            assert_eq!(c[NSYM], PM);
+            assert!(c.windows(2).all(|w| w[1] > w[0]));
+        }
+    }
+
+    #[test]
+    fn roundtrip_layouts() {
+        let c = synth(7);
+        let n = 4;
+        let truth: Vec<Vec<i32>> = (0..n).map(|g| c.ints(&format!("latent.{g}")).iter().map(|&v| v as i32).collect()).collect();
+        let mut first: Option<Vec<u8>> = None;
+        for (lanes, tw, th) in [(1, 0, 0), (4, 0, 0), (16, 0, 0), (16, 8, 0), (16, 0, 4), (32, 8, 8)] {
+            let (bytes, st) = encode(&c, lanes, tw, th);
+            assert_eq!(st.bytes, bytes.len());
+            let p = parse(&bytes).unwrap();
+            let mut gd = Guard::default();
+            assert_eq!(decode_latents(&p, &mut gd), truth, "lanes {lanes} tile {tw}x{th}");
+            let (h, w, rgb) = decode(&bytes).unwrap();
+            assert_eq!((h, w), (16, 24));
+            // the image depends on the latents only, not on the layout
+            match &first {
+                None => first = Some(rgb),
+                Some(f) => assert_eq!(f, &rgb),
+            }
+        }
+    }
+
+    #[test]
+    fn graphs_match_native() {
+        let c = synth(11);
+        let (bytes, _) = encode(&c, 4, 0, 0);
+        let p = parse(&bytes).unwrap();
+        let m = &p.m;
+        let mut r = Rng(3);
+        for mlp in std::iter::once(&m.arm).chain(&m.ifces) {
+            let (g, o) = mlp.graph();
+            let mut prog = Program::new(&g, &o);
+            for _ in 0..200 {
+                let x: Vec<i32> = (0..mlp.nin()).map(|_| (r.next() % 2049) as i32 - 1024).collect();
+                let mut want = vec![0i32; mlp.nout()];
+                mlp.run(&x, &mut want, &mut Guard::default());
+                let xin: Vec<u32> = x.iter().map(|&v| v as u32).collect();
+                let mut got = vec![0u32; mlp.nout()];
+                prog.run(&xin, &[], &mut got);
+                assert_eq!(got.iter().map(|&v| v as i32).collect::<Vec<_>>(), want);
+            }
+        }
+        // the last synthesis segment (taps + centre + stab inputs) against conv_px
+        let segs = segments(m);
+        assert!(!segs.is_empty());
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert!(parse(b"TCI1").is_err());
+        let (mut bytes, _) = encode(&synth(5), 4, 0, 0);
+        bytes.truncate(bytes.len() / 2);
+        assert!(parse(&bytes).is_err());
+    }
 }
