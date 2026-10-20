@@ -91,3 +91,17 @@ seen data. Cost: ~0.8–1.5 s more per PSNR encode of a 1M-value field.
 
 Baselines from the Phase 2 fresh table. Interp takes both 100 dB points from the
 wavelet; HACC would pass and XGC stays a narrow miss.
+
+## (a) Re-timing on mew, 2026-10-20 23:2x: contended, inconclusive
+
+Five interleaved rounds, best of 3 per run, RTX 3090 via Vulkan, cores 4,5,7–11. Kernel GB/s, every decode byte-identical:
+
+| config | median | min | max |
+|---|---|---|---|
+| static (contention baseline) | 1.199 | 1.161 | 1.521 |
+| 16-hidden, no APM | 0.830 | 0.816 | 0.933 |
+| 16-hidden, APM 10,14,15 | 0.787 | 0.778 | 0.929 |
+| 32×16, no APM | 0.796 | 0.785 | 0.942 |
+| 32×16, APM 10,14,15 | 0.760 | 0.752 | 0.892 |
+
+GPU tenants (nvidia-smi pmon, 1 s): the images Kodak campaign was still running (two Python processes, mean 30% SM, peaks 99%); ffmpeg mean 13%; tang-serve and broca showed no compute. The static baseline swings 1.16–1.52 with that load, so this is **contended and inconclusive** against the 1 GB/s gate. Even the least contended round (round 4) has every learned config below 1 GB/s (best 0.94). Re-run with `~/tc3-cleanup/retime.sh` once the images processes are gone.
