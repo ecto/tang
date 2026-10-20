@@ -53,6 +53,23 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mode = args[0].as_str();
     #[cfg(feature = "gpu")]
+    if mode == "cpu3" {
+        // gpubench cpu3 STREAM... [pretrained:PATH]: CPU decode vs saved hash (TC_CPU_IR=1: net via tang-expr)
+        for p in args.iter().filter_map(|a| a.strip_prefix("pretrained:")) {
+            tang_compress::learned::register(std::sync::Arc::new(tang_compress::learned::Net::from_bytes(&std::fs::read(p).unwrap()).unwrap()));
+        }
+        let threads: usize = opt(&args, "--threads", "16").parse().unwrap();
+        for f in args[1..].iter().filter(|a| a.ends_with(".tcg3")) {
+            let b = std::fs::read(f).unwrap();
+            let want = std::fs::read_to_string(format!("{f}.hash")).unwrap();
+            let t0 = Instant::now();
+            let (_, y) = gpuwav3::decode3_f32(&b, threads).unwrap();
+            let s = t0.elapsed().as_secs_f64();
+            let h = y.iter().fold(0xcbf29ce484222325u64, |h, v| (h ^ v.to_bits() as u64).wrapping_mul(0x100000001b3));
+            println!("{{\"stream\":\"{f}\",\"identical\":{},\"dec_s\":{s},\"gbs\":{}}}", format!("{h:016x}") == want.trim(), y.len() as f64 * 4.0 / 1e9 / s);
+        }
+        return;
+    }
     if mode == "gpu3" {
         // gpubench gpu3 STREAM... [--model3 pretrained:PATH]: GPU decode vs saved hash, kernel timing
         for p in args.iter().filter_map(|a| a.strip_prefix("pretrained:")) {

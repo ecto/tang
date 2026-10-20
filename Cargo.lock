@@ -6054,6 +6054,7 @@ version = "0.1.0"
 dependencies = [
  "faer 0.24.0",
  "pollster",
+ "tang-expr",
  "tang-la",
  "tang-optim",
  "wgpu",
@@ -6075,6 +6076,7 @@ dependencies = [
 name = "tang-expr"
 version = "0.1.1"
 dependencies = [
+ "naga",
  "tang",
 ]
 
