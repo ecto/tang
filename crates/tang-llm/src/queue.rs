@@ -132,6 +132,27 @@ impl<T> Queue<T> {
         }
     }
 
+    /// The next item (interactive first), waiting up to `wait` for one.
+    pub fn pop_timeout(&self, wait: std::time::Duration) -> Option<(Ticket, T)> {
+        let deadline = std::time::Instant::now() + wait;
+        let mut l = self.lock();
+        loop {
+            if let Some(x) = l
+                .interactive
+                .pop_front()
+                .or_else(|| l.background.pop_front())
+            {
+                return Some(x);
+            }
+            let left = deadline.checked_duration_since(std::time::Instant::now())?;
+            l = self
+                .ready
+                .wait_timeout(l, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+
     /// The next item, if any (interactive first).
     pub fn try_pop(&self) -> Option<(Ticket, T)> {
         let mut l = self.lock();
