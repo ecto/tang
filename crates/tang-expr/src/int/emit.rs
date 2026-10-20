@@ -38,6 +38,8 @@ struct Em<'a> {
     sched: Sched,
     params: Vec<String>,
     out: String,
+    /// Bounds-checked loads (out of bounds reads 0, like the interpreter).
+    guard: bool,
 }
 
 fn ty_name(lang: Lang, t: IType) -> &'static str {
@@ -98,6 +100,8 @@ impl Em<'_> {
                         BinOp::Shr => format!("({x} >> {})", amt(y)),
                         BinOp::Min => format!("min({x}, {y})"),
                         BinOp::Max => format!("max({x}, {y})"),
+                        BinOp::Div => format!("({x} / {y})"),
+                        BinOp::Rem => format!("({x} % {y})"),
                     }
                 } else {
                     match op {
@@ -113,6 +117,8 @@ impl Em<'_> {
                         BinOp::Shr => format!("{x}.wrapping_shr({y} as u32)"),
                         BinOp::Min => format!("{x}.min({y})"),
                         BinOp::Max => format!("{x}.max({y})"),
+                        BinOp::Div => format!("(if {y} == 0 {{ {x} }} else {{ {x}.wrapping_div({y}) }})"),
+                        BinOp::Rem => format!("(if {y} == 0 {{ 0 }} else {{ {x}.wrapping_rem({y}) }})"),
                     }
                 }
             }
@@ -152,6 +158,29 @@ impl Em<'_> {
             INode::Load(b, i) => {
                 let buf = &g.bufs[b as usize];
                 let (n, i) = (&buf.name, self.r(i));
+                if w && self.guard {
+                    let (word, z) = match buf.elem {
+                        Elem::I32 => (format!("{i}"), "0i"),
+                        Elem::U32 => (format!("{i}"), "0u"),
+                        Elem::U8 => (format!("({i} >> 2u)"), "0u"),
+                        Elem::I8 => (format!("({i} >> 2u)"), "0i"),
+                    };
+                    let v = match buf.elem {
+                        Elem::I32 | Elem::U32 => format!("{n}[{i}]"),
+                        Elem::U8 => format!("extractBits({n}[{i} >> 2u], ({i} & 3u) * 8u, 8u)"),
+                        Elem::I8 => format!("extractBits(bitcast<i32>({n}[{i} >> 2u]), ({i} & 3u) * 8u, 8u)"),
+                    };
+                    return format!("select({z}, {v}, {word} < arrayLength(&{n}))");
+                }
+                if !w {
+                    let get = |j: String| format!("{n}.get({j} as usize).copied().unwrap_or(0)");
+                    return match buf.elem {
+                        Elem::U32 => get(i.clone()),
+                        Elem::I32 => format!("({} as i32)", get(i.clone())),
+                        Elem::U8 => format!("(({} >> (({i} & 3) * 8)) & 255)", get(format!("({i} >> 2)"))),
+                        Elem::I8 => format!("(({} >> (({i} & 3) * 8)) as u8 as i8 as i32)", get(format!("({i} >> 2)"))),
+                    };
+                }
                 match (buf.elem, self.lang) {
                     (Elem::I32 | Elem::U32, Lang::Wgsl) => format!("{n}[{i}]"),
                     (Elem::U8, Lang::Wgsl) => format!("extractBits({n}[{i} >> 2u], ({i} & 3u) * 8u, 8u)"),
@@ -202,7 +231,18 @@ impl Em<'_> {
             };
             self.line(depth, &s);
         }
+        if lp.cap.is_some() {
+            let s = match self.lang {
+                Lang::Wgsl => format!("var c{l}: u32 = 0u;"),
+                Lang::Rust => format!("let mut c{l}: u32 = 0;"),
+            };
+            self.line(depth, &s);
+        }
         self.line(depth, "loop {");
+        if let Some(cap) = lp.cap {
+            self.line(depth + 1, &format!("if c{l} >= {} {{ break; }}", self.lit(IType::U32, cap)));
+            self.line(depth + 1, &format!("c{l} = c{l} + {};", self.lit(IType::U32, 1)));
+        }
         for k in 0..lp.init.len() {
             self.line(depth + 1, &format!("let st{l}_{k} = s{l}_{k};"));
         }
@@ -228,10 +268,10 @@ fn paren(s: &str) -> String {
 
 impl IntGraph {
     fn emitter(&self, lang: Lang, outputs: &[IId], params: &[&str]) -> Em<'_> {
-        Em { g: self, lang, sched: self.schedule(outputs), params: params.iter().map(|s| s.to_string()).collect(), out: String::new() }
+        Em { g: self, lang, sched: self.schedule(outputs), params: params.iter().map(|s| s.to_string()).collect(), out: String::new(), guard: false }
     }
 
-    fn nparams(&self) -> Vec<IType> {
+    pub(crate) fn nparams(&self) -> Vec<IType> {
         let mut t: Vec<IType> = Vec::new();
         for n in &self.nodes {
             if let INode::Param(p, ty) = *n {
@@ -254,6 +294,24 @@ impl IntGraph {
         e.items(&items, depth);
         // all outputs are computed before any destination is written (a
         // destination may be a param's source)
+        let rs: Vec<String> = outputs.iter().map(|o| e.r(*o)).collect();
+        for (k, r) in rs.iter().enumerate() {
+            e.line(depth, &format!("let r{k} = {r};"));
+        }
+        for (k, d) in dests.iter().enumerate().take(outputs.len()) {
+            e.line(depth, &format!("{d} = r{k};"));
+        }
+        e.out
+    }
+
+    /// [`Self::to_wgsl_body`] with every load bounds-checked against
+    /// `arrayLength` (out of bounds reads 0, as in [`Program`](super::Program)).
+    /// For untrusted graphs; buffers must be runtime-sized storage arrays.
+    pub fn to_wgsl_body_guarded(&self, outputs: &[IId], params: &[&str], dests: &[&str], depth: usize) -> String {
+        let mut e = self.emitter(Lang::Wgsl, outputs, params);
+        e.guard = true;
+        let items = std::mem::take(&mut e.sched.items);
+        e.items(&items, depth);
         let rs: Vec<String> = outputs.iter().map(|o| e.r(*o)).collect();
         for (k, r) in rs.iter().enumerate() {
             e.line(depth, &format!("let r{k} = {r};"));
