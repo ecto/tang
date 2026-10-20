@@ -61,7 +61,6 @@ fn opt(args: &[String], k: &str, d: &str) -> String {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mode = args[0].as_str();
-    #[cfg(feature = "gpu")]
     if mode == "cpu3" {
         // gpubench cpu3 STREAM... [pretrained:PATH]: CPU decode vs saved hash (TC_CPU_IR=1: net via tang-expr)
         for p in args.iter().filter_map(|a| a.strip_prefix("pretrained:")) {
@@ -79,6 +78,7 @@ fn main() {
         }
         return;
     }
+    #[cfg(feature = "gpu")]
     if mode == "gpu3" {
         // gpubench gpu3 STREAM... [--model3 pretrained:PATH]: GPU decode vs saved hash, kernel timing
         for p in args.iter().filter_map(|a| a.strip_prefix("pretrained:")) {
