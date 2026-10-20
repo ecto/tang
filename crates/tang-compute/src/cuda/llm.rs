@@ -71,6 +71,18 @@ const Q4_WARPS: usize = 8;
 /// tiled prefill kernel, which launches too few blocks to stream a long cache quickly.
 const SMALL_ATTN_ROWS: usize = 32;
 
+/// K split for `gemv_q4_xs4_m*`: `(splits, words a split)` so `col_blocks` column blocks
+/// launch about 4 blocks an SM (a 4096-wide output is 128 column blocks, one an SM on an H200,
+/// too few loads in flight to cover HBM latency). Splits are whole 128-word stages. It depends
+/// on the shape alone, never on the row count, so a row's sum order is batch-invariant.
+fn gemv_q4_splits(col_blocks: usize, words: usize) -> (usize, usize) {
+    const XW: usize = 128;
+    let stages = words.div_ceil(XW);
+    let want = (4 * sm_count()).div_ceil(col_blocks).clamp(1, stages);
+    let wsplit = stages.div_ceil(want) * XW;
+    (words.div_ceil(wsplit), wsplit)
+}
+
 /// Streaming multiprocessors on the current device (for sizing split-KV / split-K grids).
 pub(super) fn sm_count() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -251,7 +263,7 @@ impl CudaComputeDevice {
             CudaStorage::Q4(q) => m >= 4 && q.group % 64 == 0 && k % 128 == 0,
             _ => m >= 9 && k % 128 == 0,
         };
-        // 4-bit, up to 8 rows: `gemv_q4_xs4_m{m}`, the same sums whatever m is.
+        // 4-bit, up to 8 rows: `gemv_q4_x{v,s}4_m{m}`, the same sums whatever m is.
         if q4 && m <= 8 && k % 8 == 0 {
             const NAMES: [&str; 8] = [
                 "gemv_q4_xs4_m1",
@@ -263,9 +275,30 @@ impl CudaComputeDevice {
                 "gemv_q4_xs4_m7",
                 "gemv_q4_xs4_m8",
             ];
+            const XV_NAMES: [&str; 8] = [
+                "gemv_q4_xv4_m1",
+                "gemv_q4_xv4_m2",
+                "gemv_q4_xv4_m3",
+                "gemv_q4_xv4_m4",
+                "gemv_q4_xv4_m5",
+                "gemv_q4_xv4_m6",
+                "gemv_q4_xv4_m7",
+                "gemv_q4_xv4_m8",
+            ];
             if let CudaStorage::Q4(q) = w.storage() {
-                let f = self.llm_func(llm_cuda::GEMV_CUDA, NAMES[m - 1]);
+                // 128-bit weight loads when the groups allow (every MLX model). The pick
+                // depends on the shape alone, never m.
+                let names = if k % 32 == 0 && q.group % 32 == 0 {
+                    &XV_NAMES
+                } else {
+                    &NAMES
+                };
+                let f = self.llm_func(llm_cuda::GEMV_CUDA, names[m - 1]);
                 let group = q.group as u32;
+                let col_blocks = n.div_ceil(Q4_WARPS * 4);
+                let (splits, wsplit) = gemv_q4_splits(col_blocks, k / 8);
+                let mut partial = (splits > 1).then(|| self.pool_alloc_uninit_f32(splits * m * n));
+                let ws = wsplit as u32;
                 unsafe {
                     self.stream
                         .launch_builder(&f)
@@ -273,15 +306,30 @@ impl CudaComputeDevice {
                         .arg(&q.packed)
                         .arg(&q.scales)
                         .arg(&q.biases)
-                        .arg(out.f32_data_mut())
+                        .arg(match partial.as_mut() {
+                            Some(p) => p.f32_data_mut(),
+                            None => out.f32_data_mut(),
+                        })
                         .arg(&ku)
                         .arg(&nu)
                         .arg(&group)
-                        .launch(blocks(
-                            (n.div_ceil(Q4_WARPS * 4), 1, 1),
-                            Q4_WARPS as u32 * 32,
-                        ))
+                        .arg(&ws)
+                        .launch(blocks((col_blocks, splits, 1), Q4_WARPS as u32 * 32))
                         .unwrap();
+                }
+                if let Some(p) = partial {
+                    let f = self.llm_func(llm_cuda::GEMV_CUDA, "sum_splits");
+                    let (total, s) = ((m * n) as u32, splits as u32);
+                    unsafe {
+                        self.stream
+                            .launch_builder(&f)
+                            .arg(p.f32_data())
+                            .arg(out.f32_data_mut())
+                            .arg(&total)
+                            .arg(&s)
+                            .launch(per_elem(m * n))
+                            .unwrap();
+                    }
                 }
                 return Some(self.finish(out));
             }
@@ -1154,7 +1202,14 @@ mod tests {
 
     fn q4_and_bf16_linear_and_embedding_vs_cpu<D: ComputeDevice>(g: &D) {
         let c = CpuDevice::new();
-        for &(m, k, n, group) in &[(1, 256, 96, 64), (8, 512, 40, 32), (37, 128, 72, 128)] {
+        // (k 4096 and 2048, few columns: the 4-bit GEMV's K split, even and ragged.)
+        for &(m, k, n, group) in &[
+            (1, 256, 96, 64),
+            (8, 512, 40, 32),
+            (37, 128, 72, 128),
+            (1, 4096, 96, 64),
+            (3, 2560, 40, 64),
+        ] {
             let x = vals(m * k, 3, 2.0);
             let (p, s, b) = q4(n, k, group);
             let (gw, cw) = (
@@ -1701,6 +1756,40 @@ mod tests {
     }
 
     /// `cargo test --release -p tang-compute --features cuda --lib bench_small_k -- --ignored --nocapture`
+    /// 4-bit decode GEMV timings at Qwen3-8B shapes (not a check).
+    #[test]
+    #[ignore]
+    fn bench_q4_gemv_cuda() {
+        on_gpu(|g| {
+            for &(k, n) in &[
+                (4096, 4096),
+                (4096, 6144),
+                (4096, 24576),
+                (12288, 4096),
+                (4096, 151936),
+            ] {
+                let (p, s, b) = q4(n, k, 64);
+                let w = g.upload_q4(&p, &s, &b, 64);
+                let bytes = n * k / 2 + n * k / 64 * 4;
+                for m in [1, 8] {
+                    let x = g.upload(&vals(m * k, 3, 2.0));
+                    g.linear(&x, &w, m, k, n);
+                    g.sync();
+                    let t = std::time::Instant::now();
+                    for _ in 0..50 {
+                        g.linear(&x, &w, m, k, n);
+                    }
+                    g.sync();
+                    let us = t.elapsed().as_secs_f64() * 1e6 / 50.0;
+                    println!(
+                        "q4 gemv m{m} {k}x{n}: {us:7.1} us {:6.0} GB/s",
+                        bytes as f64 / us / 1e3
+                    );
+                }
+            }
+        });
+    }
+
     #[test]
     #[ignore]
     fn bench_small_k_cuda() {
