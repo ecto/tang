@@ -321,11 +321,13 @@ impl CudaComputeDevice {
     fn pool_alloc_f32(&self, len: usize) -> CudaBuffer {
         {
             let mut pool = self.pool.lock().unwrap();
-            pool.maybe_evict_under_pressure();
             if let Some(mut slice) = pool.get_f32(len) {
                 self.stream.memset_zeros(&mut slice).unwrap();
                 return self.make_buf(CudaStorage::F32(slice), len);
             }
+            // Only a miss allocates, so only a miss can push VRAM low: check here, not on
+            // every allocation (cuMemGetInfo cost ~6 µs of CPU a launch).
+            pool.maybe_evict_under_pressure();
         }
         match self.stream.alloc_zeros::<f32>(len) {
             Ok(slice) => self.make_buf(CudaStorage::F32(slice), len),
@@ -342,10 +344,12 @@ impl CudaComputeDevice {
     fn pool_alloc_uninit_f32(&self, len: usize) -> CudaBuffer {
         {
             let mut pool = self.pool.lock().unwrap();
-            pool.maybe_evict_under_pressure();
             if let Some(slice) = pool.get_f32(len) {
                 return self.make_buf(CudaStorage::F32(slice), len);
             }
+            // Only a miss allocates, so only a miss can push VRAM low: check here, not on
+            // every allocation (cuMemGetInfo cost ~6 µs of CPU a launch).
+            pool.maybe_evict_under_pressure();
         }
         match unsafe { self.stream.alloc::<f32>(len) } {
             Ok(slice) => self.make_buf(CudaStorage::F32(slice), len),
@@ -362,11 +366,13 @@ impl CudaComputeDevice {
     fn pool_alloc_bf16(&self, len: usize) -> CudaBuffer {
         {
             let mut pool = self.pool.lock().unwrap();
-            pool.maybe_evict_under_pressure();
             if let Some(mut slice) = pool.get_bf16(len) {
                 self.stream.memset_zeros(&mut slice).unwrap();
                 return self.make_buf(CudaStorage::Bf16(slice), len);
             }
+            // Only a miss allocates, so only a miss can push VRAM low: check here, not on
+            // every allocation (cuMemGetInfo cost ~6 µs of CPU a launch).
+            pool.maybe_evict_under_pressure();
         }
         match self.stream.alloc_zeros::<u16>(len) {
             Ok(slice) => self.make_buf(CudaStorage::Bf16(slice), len),
@@ -382,10 +388,12 @@ impl CudaComputeDevice {
     fn pool_alloc_uninit_bf16(&self, len: usize) -> CudaBuffer {
         {
             let mut pool = self.pool.lock().unwrap();
-            pool.maybe_evict_under_pressure();
             if let Some(slice) = pool.get_bf16(len) {
                 return self.make_buf(CudaStorage::Bf16(slice), len);
             }
+            // Only a miss allocates, so only a miss can push VRAM low: check here, not on
+            // every allocation (cuMemGetInfo cost ~6 µs of CPU a launch).
+            pool.maybe_evict_under_pressure();
         }
         match unsafe { self.stream.alloc::<u16>(len) } {
             Ok(slice) => self.make_buf(CudaStorage::Bf16(slice), len),
@@ -1212,6 +1220,16 @@ impl ComputeDevice for CudaComputeDevice {
         self.ctx.name().unwrap_or_default()
     }
 
+    fn arch(&self) -> String {
+        use cudarc::driver::sys::CUdevice_attribute as A;
+        let cc = |a| self.ctx.attribute(a).unwrap_or(0);
+        format!(
+            "sm_{}{}",
+            cc(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR),
+            cc(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
+        )
+    }
+
     fn pool_clear(&self) {
         CudaComputeDevice::pool_clear(self);
     }
@@ -1504,8 +1522,20 @@ impl ComputeDevice for CudaComputeDevice {
 
             output
         } else {
-            let (_module, func) = self.get_func(reduce_cuda::RMS_NORM_CUDA, "rms_norm");
+            let v4 = dim % 4 == 0;
+            let name = if v4 { "rms_norm_v4" } else { "rms_norm" };
+            let (_module, func) = self.get_func(reduce_cuda::RMS_NORM_CUDA, name);
             let mut output = self.pool_alloc_uninit_f32(data.len);
+            let cfg = if v4 {
+                // A float4 a thread, whole warps, at most 1024: fixed by dim alone.
+                let threads = (dim / 4).div_ceil(32).clamp(1, 32) * 32;
+                LaunchConfig {
+                    block_dim: (threads as u32, 1, 1),
+                    ..cfg
+                }
+            } else {
+                cfg
+            };
 
             unsafe {
                 self.stream

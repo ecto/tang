@@ -23,6 +23,7 @@ mtp-train = ["dep:tang-ad", "dep:tang-train", "dep:tang-tensor"]
 
 [dependencies]
 tang-compute = { workspace = true }
+tang-compress = { workspace = true }
 tang-ad = { workspace = true, optional = true }
 tang-train = { workspace = true, optional = true }
 tang-tensor = { workspace = true, optional = true }
@@ -61,4 +62,8 @@ name = "bench_batch"
 
 [[example]]
 name = "bench_prefill"
+required-features = ["metal"]
+
+[[example]]
+name = "kvcomp_bench"
 required-features = ["metal"]

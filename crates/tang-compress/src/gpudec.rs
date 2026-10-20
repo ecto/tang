@@ -1,0 +1,1381 @@
+//! GPU decoder for tc-gpu streams ([`crate::gpuwav`]) — wgpu + hand-written
+//! WGSL compute kernels (`gpuwav.wgsl`). Output is bit-identical to
+//! [`crate::gpuwav::decode_box_parsed`]: every kernel is integer only.
+//!
+//! Kernels, in order:
+//! 1. `decode` — one workgroup per brick, one invocation per rANS lane:
+//!    coefficient decode pass by pass (barrier between passes), then
+//!    in-place fixed-point dequantization.
+//! 2. `lift` — one dispatch per (level, axis), one invocation per line:
+//!    inverse CDF 9/7 integer lifting.
+//! 3. `outliers` — one invocation per brick: decodes the max-abs correction
+//!    lane and adds `k·corr` in the integer domain.
+//! 4. `finalize` — one invocation per cell: `(v + mean) as f32 · 2^e`.
+//! 5. `escapes` — raw `f32` overrides.
+
+use crate::gpuwav::{self, Parsed, ESC0, LOW0, MAG0, NKEY, NMODEL, NTAP, SGN0, SIG0};
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
+use wgpu::util::DeviceExt;
+
+const SHS: usize = 68;
+const BS: usize = 20;
+const BRS: usize = 8;
+const NPARAM: usize = 32;
+/// Largest lane count (one workgroup per brick, one invocation per lane).
+pub const MAX_LANES: usize = 256;
+
+/// decode3 / decode3l pipelines specialized to one learned net.
+type SpecPipes = std::sync::Arc<(wgpu::ComputePipeline, wgpu::ComputePipeline)>;
+
+/// A GPU device with the tc-gpu pipelines for one lane count / line length.
+pub struct GpuDecoder {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    layout: wgpu::BindGroupLayout,
+    pipes: Vec<(String, wgpu::ComputePipeline)>,
+    /// Adapter description.
+    pub name: String,
+    lanes: usize,
+    maxl: usize,
+    src: String,
+    pl: wgpu::PipelineLayout,
+    /// Pipelines specialized to a learned net (weights as literals), by flat net.
+    spec: std::sync::Mutex<Vec<(Vec<u32>, SpecPipes)>>,
+}
+
+/// Stream state uploaded to the GPU.
+pub struct Prepared {
+    meta: wgpu::Buffer,
+    stream: wgpu::Buffer,
+    models: wgpu::Buffer,
+    coef: wgpu::Buffer,
+    out: wgpu::Buffer,
+    params: Vec<u32>,
+    nbricks: usize,
+    batch: usize,
+    maxlev: usize,
+    maxlines: usize,
+    ncells: usize,
+    corr: bool,
+    nesc: usize,
+}
+
+/// Wall-clock split of a GPU decode.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GpuTimes {
+    /// Header parse + host tables.
+    pub parse_s: f64,
+    /// Buffer creation + upload.
+    pub upload_s: f64,
+    /// Kernel execution (submit → done).
+    pub kernels_s: f64,
+    /// Readback to host.
+    pub readback_s: f64,
+}
+
+/// Words of adaptive-layer bins per workgroup.
+fn ad_wgn(lanes: usize) -> usize {
+    (lanes * (32 / lanes).max(1)).max(32) * crate::lmodel3::AC * crate::lmodel3::AB
+}
+
+fn shader_src(lanes: usize, maxl: usize) -> String {
+    let k = gpuwav::lift_consts();
+    let head = format!(
+        "const LANESu: u32 = {lanes}u;\nconst NMODELu: u32 = {NMODEL}u;\nconst SIG0u: u32 = {SIG0}u;\nconst MAG0u: u32 = {MAG0}u;\nconst LOW0u: u32 = {LOW0}u;\nconst SGN0u: u32 = {SGN0}u;\nconst ESC0u: u32 = {ESC0}u;\nconst KB_u: u32 = {}u;\nconst NE_u: u32 = {}u;\nconst NA_u: u32 = 12u;\nconst NPB_u: u32 = 5u;\nconst BSu: u32 = {BS}u;\nconst SHSu: u32 = {SHS}u;\nconst BRSu: u32 = {BRS}u;\nconst BPW: u32 = {}u;\n",
+        crate::coefcode::KB,
+        crate::coefcode::NE,
+        (32 / lanes).max(1)
+    );
+    let body = include_str!("gpuwav.wgsl")
+        .replace("AD_WGN", &ad_wgn(lanes).to_string())
+        .replace("LANES_WG3", &(lanes * (32 / lanes).max(1)).to_string())
+        .replace("LANES_WG", &lanes.to_string())
+        .replace("MAXL_N", &maxl.max(2).to_string())
+        .replace(
+            "KK_LIST",
+            &k.iter()
+                .map(|v| format!("{v}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    // residual decoders generated from the tang-expr graphs (TC_GPU_HANDRES: hand-written)
+    let body = if std::env::var("TC_GPU_HANDRES").is_ok() {
+        body
+    } else {
+        crate::irdec::splice_res(&body, crate::irdec::builtin_wgsl())
+    };
+    head + &body
+}
+
+impl GpuDecoder {
+    /// Open the default high-performance adapter and build the pipelines
+    /// for `lanes` lanes per brick and lines up to `maxl` samples.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn new(lanes: usize, maxl: usize) -> Result<Self, String> {
+        pollster::block_on(Self::new_async(lanes, maxl))
+    }
+
+    /// [`Self::new`] without blocking (the only constructor on wasm32 /
+    /// WebGPU, where the adapter and device arrive as promises).
+    pub async fn new_async(lanes: usize, maxl: usize) -> Result<Self, String> {
+        let instance = wgpu::Instance::default();
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+            .await
+            .map_err(|e| format!("adapter: {e}"))?;
+        let al = adapter.limits();
+        if lanes == 0 || lanes > MAX_LANES {
+            return Err(format!("tc-gpu GPU decode supports 1..={MAX_LANES} lanes"));
+        }
+        // the adaptive layer's per-invocation bins live in workgroup memory
+        // (17 KB at 32 invocations, over WebGPU's 16 KB default)
+        let wg = ad_wgn(lanes) as u32 * 4 + 1024;
+        if al.max_compute_workgroup_storage_size < wg {
+            return Err(format!(
+                "tc-gpu needs {wg} B of workgroup storage, the adapter has {}",
+                al.max_compute_workgroup_storage_size
+            ));
+        }
+        let limits = wgpu::Limits {
+            max_buffer_size: al.max_buffer_size,
+            max_storage_buffer_binding_size: al.max_storage_buffer_binding_size,
+            max_compute_workgroups_per_dimension: al.max_compute_workgroups_per_dimension,
+            max_compute_workgroup_storage_size: al.max_compute_workgroup_storage_size,
+            ..Default::default()
+        };
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("tc-gpu"),
+                required_features: wgpu::Features::empty(),
+                required_limits: limits,
+                memory_hints: wgpu::MemoryHints::Performance,
+                trace: wgpu::Trace::Off,
+            })
+            .await
+            .map_err(|e| format!("device: {e}"))?;
+        let info = adapter.get_info();
+        let name = format!("{} ({:?})", info.name, info.backend);
+        let src = shader_src(lanes, maxl);
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("tc-gpu"),
+            source: wgpu::ShaderSource::Wgsl(src.clone().into()),
+        });
+        let st = |b: u32, ro: bool| wgpu::BindGroupLayoutEntry {
+            binding: b,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: ro },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("tc-gpu"),
+            entries: &[
+                st(0, true),
+                st(1, true),
+                st(2, false),
+                st(3, false),
+                st(4, false),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("tc-gpu"),
+            bind_group_layouts: &[&layout],
+            push_constant_ranges: &[],
+        });
+        let pipes = [
+            "decode",
+            "lift",
+            "outliers",
+            "finalize",
+            "escapes",
+            "decode3",
+            "dequant3",
+            "outliers3",
+            "decode3l",
+        ]
+        .iter()
+        .map(|&e| {
+            let p = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(e),
+                layout: Some(&pl),
+                module: &module,
+                entry_point: Some(e),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+            (e.to_string(), p)
+        })
+        .collect();
+        Ok(Self {
+            device,
+            queue,
+            layout,
+            pipes,
+            name,
+            lanes,
+            maxl,
+            src,
+            pl,
+            spec: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn pipe(&self, n: &str) -> &wgpu::ComputePipeline {
+        &self.pipes.iter().find(|p| p.0 == n).unwrap().1
+    }
+
+    /// Lanes this decoder was built for.
+    pub fn lanes(&self) -> usize {
+        self.lanes
+    }
+
+    /// Build host tables and upload a parsed stream.
+    pub fn prepare(&self, ps: &Parsed, bytes: &[u8], times: &mut GpuTimes) -> Prepared {
+        let t0 = Instant::now();
+        assert_eq!(
+            ps.lanes, self.lanes,
+            "decoder built for a different lane count"
+        );
+        assert!(
+            !ps.adaptive,
+            "the GPU decoder takes static-model streams (GpuConfig::adaptive = false)"
+        );
+        let mut meta: Vec<u32> = Vec::new();
+        let off_shapes = meta.len();
+        let mut band_off = 0usize;
+        let mut maxlev = 0usize;
+        let mut maxlines = 1usize;
+        for sh in &ps.shapes {
+            let mut r = vec![0u32; SHS];
+            for a in 0..3 {
+                r[a] = sh.dims[a] as u32;
+                assert!(
+                    sh.dims[a] <= self.maxl.max(2)
+                        || sh.dims.iter().filter(|&&d| d > 1).count() == 0,
+                    "line too long for this decoder"
+                );
+            }
+            r[3] = sh.bands.len() as u32;
+            r[4] = band_off as u32;
+            r[5] = sh.p.nlev() as u32;
+            maxlev = maxlev.max(sh.p.nlev());
+            for (l, ln) in sh.p.lens.iter().enumerate().take(15) {
+                for a in 0..3 {
+                    r[6 + l * 3 + a] = ln[a] as u32;
+                }
+            }
+            for (l, s) in sh.p.split.iter().enumerate().take(15) {
+                r[6 + 45 + l] = (s[0] as u32) | (s[1] as u32) << 1 | (s[2] as u32) << 2;
+            }
+            maxlines = maxlines
+                .max(sh.dims[0] * sh.dims[1])
+                .max(sh.dims[0] * sh.dims[2])
+                .max(sh.dims[1] * sh.dims[2]);
+            band_off += sh.bands.len();
+            meta.extend(r);
+        }
+        let off_bands = meta.len();
+        for sh in &ps.shapes {
+            for b in &sh.bands {
+                let mut r = vec![0u32; BS];
+                for a in 0..3 {
+                    r[a] = b.start[a] as u32;
+                    r[3 + a] = b.end[a] as u32;
+                }
+                r[6] = b.class as u32;
+                r[7] = b.parent.map_or(u32::MAX, |p| p as u32);
+                r[8] = b.pshift[0] | b.pshift[1] << 1 | b.pshift[2] << 2;
+                r[9] = b.npass as u32;
+                for p in 0..8 {
+                    r[10 + p] = b.pkey[p] as u32;
+                }
+                r[18] = b.m as u32;
+                r[19] = b.sh;
+                meta.extend(r);
+            }
+        }
+        let off_preds = meta.len();
+        assert_eq!(ps.preds.len(), NKEY);
+        for p in &ps.preds {
+            meta.extend(p.iter().map(|&v| v as u32));
+            debug_assert_eq!(p.len(), NTAP);
+        }
+        let off_init = meta.len();
+        meta.extend_from_slice(&ps.init);
+        let off_dl = meta.len();
+        meta.extend(ps.dl.iter().map(|&v| v as u32));
+        let off_bricks = meta.len();
+        let nbricks = ps.bricks.len();
+        meta.resize(off_bricks + nbricks * BRS, 0);
+        let mut cbase = 0usize;
+        let mut escs: Vec<u32> = Vec::new();
+        for (bi, br) in ps.bricks.iter().enumerate() {
+            let sh = &ps.shapes[br.shape];
+            let ltab = meta.len();
+            meta.extend(br.lane_word.iter().map(|&w| w as u32));
+            let r = off_bricks + bi * BRS;
+            for a in 0..3 {
+                meta[r + a] = br.origin[a] as u32;
+            }
+            meta[r + 3] = br.shape as u32;
+            meta[r + 4] = cbase as u32;
+            meta[r + 5] = ltab as u32;
+            let d = sh.dims;
+            for &(li, bits) in &br.esc {
+                let (z, y, x) = (li / (d[1] * d[2]), (li / d[2]) % d[1], li % d[2]);
+                let g = ((br.origin[0] + z) * ps.d3[1] + br.origin[1] + y) * ps.d3[2]
+                    + br.origin[2]
+                    + x;
+                escs.push(g as u32);
+                escs.push(bits);
+            }
+            cbase += sh.dims.iter().product::<usize>();
+        }
+        let off_esc = meta.len();
+        meta.extend_from_slice(&escs);
+        let ncells: usize = ps.d3.iter().product();
+        assert_eq!(cbase, ncells);
+        let mut params = vec![0u32; NPARAM];
+        params[0] = off_shapes as u32;
+        params[1] = off_bands as u32;
+        params[2] = off_preds as u32;
+        params[3] = off_init as u32;
+        params[4] = off_dl as u32;
+        params[5] = off_bricks as u32;
+        params[6] = off_esc as u32;
+        params[7] = (escs.len() / 2) as u32;
+        params[8] = nbricks as u32;
+        params[13] = ps.mean_fix as u32;
+        params[14] = ps.scale().to_bits();
+        params[15] = ps.corr as u32;
+        for a in 0..3 {
+            params[16 + a] = ps.d3[a] as u32;
+        }
+        params[19] = ps.bdims[0] as u32;
+        params[20] = ps.bdims[1] as u32;
+        params[21] = ps.bdims[2] as u32;
+        for a in 0..3 {
+            params[22 + a] = ps.d3[a].div_ceil(ps.bdims[a]) as u32;
+        }
+        params[25] = ncells as u32;
+        let mut sw: Vec<u32> = Vec::with_capacity(bytes.len() / 4 + 1);
+        for c in bytes.chunks(4) {
+            let mut b = [0u8; 4];
+            b[..c.len()].copy_from_slice(c);
+            sw.push(u32::from_le_bytes(b));
+        }
+        times.parse_s += t0.elapsed().as_secs_f64();
+        let t1 = Instant::now();
+        let batch = nbricks.clamp(1, 65535);
+        let dev = &self.device;
+        let init = |label: &str, data: &[u32], usage: wgpu::BufferUsages| {
+            dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: as_bytes(data),
+                usage,
+            })
+        };
+        let meta_b = init("meta", &meta, wgpu::BufferUsages::STORAGE);
+        let stream_b = init("stream", &sw, wgpu::BufferUsages::STORAGE);
+        let mk = |label: &str, n: u64, usage: wgpu::BufferUsages| {
+            dev.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: n.max(4),
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        // static context models need no per-lane state; the binding is kept
+        // for an adaptive-model kernel
+        let models = mk("models", 4, wgpu::BufferUsages::STORAGE);
+        let coef = mk("coef", ncells as u64 * 4, wgpu::BufferUsages::STORAGE);
+        let out = mk(
+            "out",
+            ncells as u64 * 4,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+        self.queue.submit([]);
+        let _ = self.device.poll(wgpu::PollType::Wait);
+        times.upload_s += t1.elapsed().as_secs_f64();
+        Prepared {
+            meta: meta_b,
+            stream: stream_b,
+            models,
+            coef,
+            out,
+            params,
+            nbricks,
+            batch,
+            maxlev,
+            maxlines,
+            ncells,
+            corr: ps.corr != 0,
+            nesc: escs.len() / 2,
+        }
+    }
+
+    fn bind(&self, pr: &Prepared, params: &[u32]) -> wgpu::BindGroup {
+        let ub = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("params"),
+                contents: as_bytes(params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: pr.meta.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: pr.stream.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: pr.models.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: pr.coef.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: pr.out.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: ub.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
+    /// Run every kernel; returns the kernel wall time in seconds.
+    pub fn run(&self, pr: &Prepared) -> f64 {
+        let mut jobs: Vec<(&str, Vec<u32>, [u32; 3])> = Vec::new();
+        let mut b0 = 0;
+        while b0 < pr.nbricks {
+            let n = pr.batch.min(pr.nbricks - b0);
+            let mut p = pr.params.clone();
+            p[9] = b0 as u32;
+            p[10] = n as u32;
+            jobs.push(("decode", p, [n as u32, 1, 1]));
+            b0 += n;
+        }
+        for l in (0..pr.maxlev).rev() {
+            for ax in [2u32, 1, 0] {
+                let mut p = pr.params.clone();
+                p[11] = l as u32;
+                p[12] = ax;
+                jobs.push((
+                    "lift",
+                    p,
+                    [pr.maxlines.div_ceil(64) as u32, pr.nbricks as u32, 1],
+                ));
+            }
+        }
+        if pr.corr {
+            jobs.push((
+                "outliers",
+                pr.params.clone(),
+                [pr.nbricks.div_ceil(64) as u32, 1, 1],
+            ));
+        }
+        let groups = pr.ncells.div_ceil(256);
+        jobs.push((
+            "finalize",
+            pr.params.clone(),
+            [groups.min(65535) as u32, groups.div_ceil(65535) as u32, 1],
+        ));
+        if pr.nesc > 0 {
+            jobs.push((
+                "escapes",
+                pr.params.clone(),
+                [pr.nesc.div_ceil(64) as u32, 1, 1],
+            ));
+        }
+        self.submit(pr, &jobs)
+    }
+
+    fn submit(&self, pr: &Prepared, jobs: &[(&str, Vec<u32>, [u32; 3])]) -> f64 {
+        self.submit_with(pr, jobs, None)
+    }
+
+    fn pick<'a>(
+        &'a self,
+        n: &str,
+        spec: Option<&'a (wgpu::ComputePipeline, wgpu::ComputePipeline)>,
+    ) -> &'a wgpu::ComputePipeline {
+        match (n, spec) {
+            ("decode3", Some(p)) => &p.0,
+            ("decode3l", Some(p)) => &p.1,
+            _ => self.pipe(n),
+        }
+    }
+
+    fn submit_with(
+        &self,
+        pr: &Prepared,
+        jobs: &[(&str, Vec<u32>, [u32; 3])],
+        spec: Option<&(wgpu::ComputePipeline, wgpu::ComputePipeline)>,
+    ) -> f64 {
+        let binds: Vec<wgpu::BindGroup> = jobs.iter().map(|j| self.bind(pr, &j.1)).collect();
+        if std::env::var("TC_GPU_PROFILE").is_ok() {
+            let mut acc: Vec<(&str, f64)> = Vec::new();
+            for (j, bg) in jobs.iter().zip(&binds) {
+                let t0 = Instant::now();
+                let mut enc = self
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+                {
+                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: None,
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(self.pick(j.0, spec));
+                    pass.set_bind_group(0, bg, &[]);
+                    pass.dispatch_workgroups(j.2[0], j.2[1], j.2[2]);
+                }
+                self.queue.submit([enc.finish()]);
+                let _ = self.device.poll(wgpu::PollType::Wait);
+                let dt = t0.elapsed().as_secs_f64();
+                match acc.iter_mut().find(|a| a.0 == j.0) {
+                    Some(a) => a.1 += dt,
+                    None => acc.push((j.0, dt)),
+                }
+            }
+            eprintln!("tc-gpu kernel times: {acc:?}");
+        }
+        let t0 = Instant::now();
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        for (j, bg) in jobs.iter().zip(&binds) {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(self.pick(j.0, spec));
+            pass.set_bind_group(0, bg, &[]);
+            pass.dispatch_workgroups(j.2[0], j.2[1], j.2[2]);
+        }
+        self.queue.submit([enc.finish()]);
+        let _ = self.device.poll(wgpu::PollType::Wait);
+        t0.elapsed().as_secs_f64()
+    }
+
+    /// Copy the decoded `f32` bits back to the host.
+    pub fn readback(&self, pr: &Prepared) -> Vec<u32> {
+        let size = pr.ncells as u64 * 4;
+        let st = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("staging"),
+            size: size.max(4),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc.copy_buffer_to_buffer(&pr.out, 0, &st, 0, size);
+        self.queue.submit([enc.finish()]);
+        let slice = st.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            tx.send(r).ok();
+        });
+        let _ = self.device.poll(wgpu::PollType::Wait);
+        rx.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range();
+        let mut v = vec![0u32; pr.ncells];
+        for (o, c) in v.iter_mut().zip(data.as_chunks::<4>().0) {
+            *o = u32::from_le_bytes(*c);
+        }
+        drop(data);
+        st.unmap();
+        v
+    }
+
+    /// Decode a whole stream; returns `f32` bits (field layout) and timings.
+    pub fn decode(&self, bytes: &[u8]) -> Result<(Vec<u32>, GpuTimes), crate::bitio::DecodeError> {
+        let mut t = GpuTimes::default();
+        let t0 = Instant::now();
+        let ps = gpuwav::parse(bytes)?;
+        t.parse_s = t0.elapsed().as_secs_f64();
+        let pr = self.prepare(&ps, bytes, &mut t);
+        t.kernels_s = self.run(&pr);
+        let t1 = Instant::now();
+        let v = self.readback(&pr);
+        t.readback_s = t1.elapsed().as_secs_f64();
+        Ok((v, t))
+    }
+}
+
+impl GpuDecoder {
+    /// Decode a whole v3 (code-block) stream; returns `f32` bits and timings.
+    pub fn decode3(&self, bytes: &[u8]) -> Result<(Vec<u32>, GpuTimes), crate::bitio::DecodeError> {
+        let mut t = GpuTimes::default();
+        let t0 = Instant::now();
+        let ps = crate::gpuwav3::parse3(bytes)?;
+        t.parse_s = t0.elapsed().as_secs_f64();
+        let pr = self.prepare3(&ps, bytes, &mut t);
+        t.kernels_s = self.run3(&pr);
+        let t1 = Instant::now();
+        let v = self.readback(&pr.base);
+        t.readback_s = t1.elapsed().as_secs_f64();
+        Ok((v, t))
+    }
+
+    /// Upload a parsed v3 stream.
+    pub fn prepare3(
+        &self,
+        ps: &crate::gpuwav3::Parsed3,
+        bytes: &[u8],
+        times: &mut GpuTimes,
+    ) -> Prepared3 {
+        let t0 = Instant::now();
+        let sh = &ps.sh;
+        assert!(
+            sh.dims.iter().all(|&d| d <= self.maxl.max(2)),
+            "field axis longer than this decoder's line buffer (maxl)"
+        );
+        let mut meta: Vec<u32> = Vec::new();
+        // shape record (whole field)
+        let mut r = vec![0u32; SHS];
+        for a in 0..3 {
+            r[a] = sh.dims[a] as u32;
+        }
+        r[3] = sh.bands.len() as u32;
+        r[5] = sh.p.nlev() as u32;
+        for (l, ln) in sh.p.lens.iter().enumerate().take(15) {
+            for a in 0..3 {
+                r[6 + l * 3 + a] = ln[a] as u32;
+            }
+        }
+        for (l, s) in sh.p.split.iter().enumerate().take(15) {
+            r[6 + 45 + l] = (s[0] as u32) | (s[1] as u32) << 1 | (s[2] as u32) << 2;
+        }
+        let off_shapes = meta.len();
+        meta.extend(r);
+        let off_bands = meta.len();
+        for (bi, b) in sh.bands.iter().enumerate() {
+            let pb = &sh.p.bands[bi];
+            let mut r = vec![0u32; BS];
+            for a in 0..3 {
+                r[a] = b.start[a] as u32;
+                r[3 + a] = b.end[a] as u32;
+            }
+            r[6] = b.class as u32;
+            r[7] = b.parent.map_or(u32::MAX, |p| p as u32);
+            r[8] = b.pshift[0] | b.pshift[1] << 1 | b.pshift[2] << 2;
+            r[9] = 1;
+            for p in 0..8 {
+                r[10 + p] = (crate::gpuwav3::key3(pb.level, pb.mask)
+                    + if ps.lanes > 1 { p } else { 0 }) as u32;
+            }
+            r[18] = b.m as u32;
+            r[19] = b.sh;
+            meta.extend(r);
+        }
+        let off_preds = meta.len();
+        for p in &ps.preds {
+            meta.extend(p.iter().map(|&v| v as u32));
+        }
+        let off_init = meta.len();
+        meta.extend_from_slice(&ps.init);
+        let off_dl = meta.len();
+        meta.extend(ps.dl.iter().map(|&v| v as u32));
+        let off_bricks = meta.len();
+        meta.extend([0, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(
+            ps.lanes == 1 || ps.lanes == self.lanes,
+            "decoder built for a different lane count"
+        );
+        let off_ltab = meta.len();
+        for lv in &ps.block_lanes {
+            meta.extend(lv.iter().map(|&(a, _)| a as u32));
+            meta.push(lv.last().unwrap().1 as u32);
+        }
+        let off_blocks = meta.len();
+        for (i, b) in ps.blocks.iter().enumerate() {
+            meta.push(ps.block_band[i] as u32);
+            meta.extend(b.start.iter().map(|&v| v as u32));
+            meta.extend(b.end.iter().map(|&v| v as u32));
+            meta.push(ps.block_lanes[i][0].0 as u32);
+            meta.push(ps.block_lanes[i][0].1 as u32);
+            let lt = off_ltab + i * (ps.lanes + 1);
+            assert!(lt < 1 << 24, "lane table offset");
+            let nl = if b.nl > 0 {
+                b.nl.min(ps.lanes)
+            } else {
+                ps.lanes
+            };
+            meta.push((lt | nl << 24) as u32);
+        }
+        let off_tiles = meta.len();
+        let mut escs: Vec<u32> = Vec::new();
+        let d3 = ps.d3;
+        for t in &ps.tiles {
+            meta.extend(t.origin.iter().map(|&v| v as u32));
+            meta.extend(t.dims.iter().map(|&v| v as u32));
+            meta.push(t.words.0 as u32);
+            meta.push(t.words.1 as u32);
+            for &(li, bits) in &t.esc {
+                let (z, y, x) = (
+                    li / (t.dims[1] * t.dims[2]),
+                    (li / t.dims[2]) % t.dims[1],
+                    li % t.dims[2],
+                );
+                escs.push(
+                    (((t.origin[0] + z) * d3[1] + t.origin[1] + y) * d3[2] + t.origin[2] + x)
+                        as u32,
+                );
+                escs.push(bits);
+            }
+        }
+        let off_esc = meta.len();
+        meta.extend_from_slice(&escs);
+        let mut off_net = 0usize;
+        if let Some(net) = &ps.net {
+            let (sig, pw) = crate::lmodel3::tables();
+            off_net = meta.len();
+            let f = net.flat();
+            let off_sig = off_net + 2 + f.len();
+            let off_pow = off_sig + sig.len();
+            meta.push(off_sig as u32);
+            meta.push(off_pow as u32);
+            meta.extend(f);
+            meta.extend_from_slice(sig);
+            meta.extend_from_slice(pw);
+            // adaptive layer: stretch table at off_pow + 257, then its settings
+            meta.extend(crate::lmodel3::stretch_tab().iter().map(|&z| z as u32));
+            meta.push(ps.ad.wa | ps.ad.lim << 5 | ps.ad.mask << 13);
+        }
+        let ncells: usize = d3.iter().product();
+        let mut params = vec![0u32; NPARAM];
+        params[0] = off_shapes as u32;
+        params[1] = off_bands as u32;
+        params[2] = off_preds as u32;
+        params[3] = off_init as u32;
+        params[4] = off_dl as u32;
+        params[5] = off_bricks as u32;
+        params[6] = off_esc as u32;
+        params[7] = (escs.len() / 2) as u32;
+        params[8] = 1;
+        params[13] = ps.mean_fix as u32;
+        params[14] = ps.scale().to_bits();
+        params[15] = ps.corr as u32;
+        for a in 0..3 {
+            params[16 + a] = d3[a] as u32;
+            params[19 + a] = d3[a] as u32;
+            params[22 + a] = 1;
+        }
+        params[25] = ncells as u32;
+        params[26] = off_blocks as u32;
+        params[27] = ps.resctx as u32;
+        params[28] = off_tiles as u32;
+        params[29] = ps.tiles.len() as u32;
+        params[30] = off_net as u32;
+        params[31] = ps.blocks.first().is_some_and(|b| b.ax) as u32;
+        let mut sw: Vec<u32> = Vec::with_capacity(bytes.len() / 4 + 1);
+        for c in bytes.chunks(4) {
+            let mut b = [0u8; 4];
+            b[..c.len()].copy_from_slice(c);
+            sw.push(u32::from_le_bytes(b));
+        }
+        times.parse_s += t0.elapsed().as_secs_f64();
+        let t1 = Instant::now();
+        let dev = &self.device;
+        let init = |label: &str, data: &[u32], usage: wgpu::BufferUsages| {
+            dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: as_bytes(data),
+                usage,
+            })
+        };
+        let mk = |label: &str, n: u64, usage: wgpu::BufferUsages| {
+            dev.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: n.max(4),
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        let base = Prepared {
+            meta: init("meta", &meta, wgpu::BufferUsages::STORAGE),
+            stream: init("stream", &sw, wgpu::BufferUsages::STORAGE),
+            models: mk("residuals", ncells as u64 * 4, wgpu::BufferUsages::STORAGE),
+            coef: mk("coef", ncells as u64 * 4, wgpu::BufferUsages::STORAGE),
+            out: mk(
+                "out",
+                ncells as u64 * 4,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            ),
+            params,
+            nbricks: 1,
+            batch: 1,
+            maxlev: sh.p.nlev(),
+            maxlines: (d3[0] * d3[1]).max(d3[0] * d3[2]).max(d3[1] * d3[2]),
+            ncells,
+            corr: ps.corr != 0,
+            nesc: escs.len() / 2,
+        };
+        let _ = self.device.poll(wgpu::PollType::Wait);
+        times.upload_s += t1.elapsed().as_secs_f64();
+        Prepared3 {
+            base,
+            groups: ps.level_groups(),
+            nblocks: ps.blocks.len(),
+            ntiles: ps.tiles.len(),
+            lanes: ps.lanes,
+            net: ps.net.clone(),
+            dec: ps.dec.clone(),
+            ad: ps.net.is_some() && ps.ad.wa > 0,
+        }
+    }
+
+    /// decode3/decode3l pipelines with the net's MLP as straight-line code,
+    /// and/or a stream's shipped decoder (cached by program hash).
+    fn spec_pipes(
+        &self,
+        net: Option<&crate::lmodel3::Net32>,
+        dec: Option<&crate::shipdec::Decoder>,
+        ad: bool,
+    ) -> SpecPipes {
+        let mut key = net.map_or(Vec::new(), |n| n.flat());
+        key.push(ad as u32);
+        if let Some(d) = dec {
+            key.extend([u32::MAX, d.key as u32, (d.key >> 32) as u32, d.size as u32]);
+        }
+        let mut c = self.spec.lock().unwrap();
+        if let Some(p) = c.iter().find(|e| e.0 == key) {
+            return p.1.clone();
+        }
+        let mut src = self.src.clone();
+        if let Some(d) = dec {
+            src = crate::irdec::splice_res(&src, if ad { &d.wgsl_res_ad } else { &d.wgsl_res });
+        } else if ad && std::env::var("TC_GPU_HANDRES").is_err() {
+            src = crate::irdec::splice_res(&src, crate::irdec::builtin_wgsl_ad());
+        } else if ad {
+            let h = include_str!("gpuwav.wgsl");
+            let a = h.find("// RES_BEGIN").unwrap();
+            let a = a + h[a..].find('\n').unwrap() + 1;
+            src = crate::irdec::splice_res(&src, &h[a..h.find("// RES_END").unwrap()]);
+        }
+        let shipped = dec.and_then(|d| d.wgsl_mlp.clone());
+        if net.is_some() || shipped.is_some() {
+            let a = src.find("// MLP_BEGIN").unwrap();
+            let b = src.find("// MLP_END").unwrap();
+            let mlp = match (shipped, net) {
+                (Some(m), _) => m,
+                (None, Some(n)) if std::env::var("TC_GPU_HANDMLP").is_ok() => gen_mlp(n),
+                (None, Some(n)) => ir_mlp(n),
+                (None, None) => unreachable!(),
+            };
+            src = format!("{}{}{}", &src[..a], mlp, &src[b..]);
+        }
+        let module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("tc-gpu-spec"),
+                source: wgpu::ShaderSource::Wgsl(src.into()),
+            });
+        let mk = |e: &str| {
+            self.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(e),
+                    layout: Some(&self.pl),
+                    module: &module,
+                    entry_point: Some(e),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+        };
+        let p = std::sync::Arc::new((mk("decode3"), mk("decode3l")));
+        c.push((key, p.clone()));
+        p
+    }
+
+    /// Build (or fetch) the pipelines a prepared stream needs, without
+    /// running anything; returns the seconds spent.
+    pub fn warm3(&self, pr: &Prepared3) -> f64 {
+        let t = Instant::now();
+        if pr.net.is_some() || pr.dec.is_some() {
+            let _ = self.spec_pipes(pr.net.as_ref(), pr.dec.as_deref(), pr.ad);
+            let _ = self.device.poll(wgpu::PollType::Wait);
+        }
+        t.elapsed().as_secs_f64()
+    }
+
+    /// Run the v3 kernels; returns the kernel wall time.
+    pub fn run3(&self, pr: &Prepared3) -> f64 {
+        let b = &pr.base;
+        let mut jobs: Vec<(&str, Vec<u32>, [u32; 3])> = Vec::new();
+        for &(g0, g1) in &pr.groups {
+            let n = g1 - g0;
+            let mut p = b.params.clone();
+            p[9] = g0 as u32;
+            p[10] = n as u32;
+            if pr.lanes > 1 {
+                jobs.push((
+                    "decode3l",
+                    p,
+                    [n.div_ceil((32 / self.lanes).max(1)) as u32, 1, 1],
+                ));
+            } else {
+                jobs.push(("decode3", p, [n.div_ceil(32) as u32, 1, 1]));
+            }
+        }
+        let mut p = b.params.clone();
+        p[10] = pr.nblocks as u32;
+        jobs.push(("dequant3", p, [pr.nblocks.div_ceil(64) as u32, 1, 1]));
+        for l in (0..b.maxlev).rev() {
+            for ax in [2u32, 1, 0] {
+                let mut p = b.params.clone();
+                p[11] = l as u32;
+                p[12] = ax;
+                jobs.push(("lift", p, [b.maxlines.div_ceil(64) as u32, 1, 1]));
+            }
+        }
+        if b.corr {
+            jobs.push((
+                "outliers3",
+                b.params.clone(),
+                [pr.ntiles.div_ceil(64) as u32, 1, 1],
+            ));
+        }
+        let groups = b.ncells.div_ceil(256);
+        jobs.push((
+            "finalize",
+            b.params.clone(),
+            [groups.min(65535) as u32, groups.div_ceil(65535) as u32, 1],
+        ));
+        if b.nesc > 0 {
+            jobs.push((
+                "escapes",
+                b.params.clone(),
+                [b.nesc.div_ceil(64) as u32, 1, 1],
+            ));
+        }
+        let spec = if pr.dec.is_some() || pr.ad {
+            Some(self.spec_pipes(pr.net.as_ref(), pr.dec.as_deref(), pr.ad))
+        } else if std::env::var("TC_GPU_NOSPEC").is_ok() {
+            None
+        } else {
+            pr.net
+                .as_ref()
+                .map(|n| self.spec_pipes(Some(n), None, false))
+        };
+        self.submit_with(b, &jobs, spec.as_deref())
+    }
+}
+
+/// The net's MLP lowered from its `tang-expr` integer graph
+/// ([`Net32::graph`](crate::lmodel3::Net32::graph)): straight-line WGSL with
+/// the weights as literals, reading `na[0..NFL]` and writing `na[0..NO]`.
+fn ir_mlp(net: &crate::lmodel3::Net32) -> String {
+    let (g, outs) = net.graph();
+    let params: Vec<String> = (0..crate::lmodel3::NFL)
+        .map(|i| format!("na[{i}]"))
+        .collect();
+    let dests: Vec<String> = (0..outs.len()).map(|o| format!("na[{o}]")).collect();
+    let p: Vec<&str> = params.iter().map(|s| s.as_str()).collect();
+    let d: Vec<&str> = dests.iter().map(|s| s.as_str()).collect();
+    format!("fn mlp_gen() {{\n{}}}\n", g.to_wgsl_body(&outs, &p, &d, 1))
+}
+
+/// Hand-written generator kept for A/B (`TC_GPU_HANDMLP`).
+/// Straight-line WGSL for the net: weights and biases as literals, no
+/// memory traffic, same wrapping i32 arithmetic (integer addition is
+/// associative, so term order and dropped zero terms do not change a bit).
+fn gen_mlp(net: &crate::lmodel3::Net32) -> String {
+    use std::fmt::Write;
+    let mut s = String::from("fn mlp_gen() {\n");
+    for i in 0..net.sizes[0] {
+        let _ = writeln!(s, "    let a0_{i} = na[{i}];");
+    }
+    let nl = net.sizes.len() - 1;
+    for l in 0..nl {
+        let (ni, no) = (net.sizes[l], net.sizes[l + 1]);
+        let (lo, hi) = if l + 1 < nl {
+            (0, 16384)
+        } else {
+            (-16384, 16384)
+        };
+        for o in 0..no {
+            let mut e = format!("({})", net.b[l][o]);
+            for i in 0..ni {
+                let w = net.w[l][o * ni + i];
+                if w != 0 {
+                    let _ = write!(e, " + ({w}) * a{l}_{i}");
+                }
+            }
+            let _ = writeln!(
+                s,
+                "    let a{}_{o} = clamp(({e} + 128) >> 8u, {lo}, {hi});",
+                l + 1
+            );
+        }
+    }
+    for o in 0..net.sizes[nl] {
+        let _ = writeln!(s, "    na[{o}] = a{nl}_{o};");
+    }
+    s.push_str("}\n");
+    s
+}
+
+/// Async decode (WebGPU / wasm32, where nothing may block): the same
+/// kernels and bits as [`GpuDecoder::decode`] / [`GpuDecoder::decode3`],
+/// awaiting the queue and the buffer map instead of polling with `Wait`.
+impl GpuDecoder {
+    /// Wait until the kernels writing `pr.out` are done: copy one word of it
+    /// to a mappable buffer and await the map (wgpu 25's WebGPU backend has
+    /// no `on_submitted_work_done`; a map of a buffer the copy writes cannot
+    /// resolve before that copy, hence before the kernels).
+    async fn idle(&self, pr: &Prepared) {
+        let st = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fence"),
+            size: 4,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc.copy_buffer_to_buffer(&pr.out, 0, &st, 0, 4);
+        self.queue.submit([enc.finish()]);
+        let (tx, rx) = oneshot();
+        st.slice(..)
+            .map_async(wgpu::MapMode::Read, move |r| tx.send(r));
+        let _ = self.device.poll(wgpu::PollType::Wait);
+        rx.await.expect("map fence buffer");
+    }
+
+    /// Kernels of a prepared v1 stream, awaited; returns kernel wall seconds.
+    pub async fn run_async(&self, pr: &Prepared) -> f64 {
+        let t0 = Instant::now();
+        self.run(pr);
+        self.idle(pr).await;
+        t0.elapsed().as_secs_f64()
+    }
+
+    /// Kernels of a prepared v3 stream, awaited; returns kernel wall seconds.
+    pub async fn run3_async(&self, pr: &Prepared3) -> f64 {
+        let t0 = Instant::now();
+        self.run3(pr);
+        self.idle(&pr.base).await;
+        t0.elapsed().as_secs_f64()
+    }
+
+    /// [`Self::readback`] without blocking.
+    pub async fn readback_async(&self, pr: &Prepared) -> Vec<u32> {
+        let size = pr.ncells as u64 * 4;
+        let st = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("staging"),
+            size: size.max(4),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc.copy_buffer_to_buffer(&pr.out, 0, &st, 0, size);
+        self.queue.submit([enc.finish()]);
+        let slice = st.slice(..);
+        let (tx, rx) = oneshot();
+        slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r));
+        let _ = self.device.poll(wgpu::PollType::Wait);
+        rx.await.expect("map staging buffer");
+        let data = slice.get_mapped_range();
+        let mut v = vec![0u32; pr.ncells];
+        for (o, c) in v.iter_mut().zip(data.as_chunks::<4>().0) {
+            *o = u32::from_le_bytes(*c);
+        }
+        drop(data);
+        st.unmap();
+        v
+    }
+
+    /// [`Self::decode`] without blocking.
+    pub async fn decode_async(
+        &self,
+        bytes: &[u8],
+    ) -> Result<(Vec<u32>, GpuTimes), crate::bitio::DecodeError> {
+        let mut t = GpuTimes::default();
+        let t0 = Instant::now();
+        let ps = gpuwav::parse(bytes)?;
+        t.parse_s = t0.elapsed().as_secs_f64();
+        let pr = self.prepare(&ps, bytes, &mut t);
+        t.kernels_s = self.run_async(&pr).await;
+        let t1 = Instant::now();
+        let v = self.readback_async(&pr).await;
+        t.readback_s = t1.elapsed().as_secs_f64();
+        Ok((v, t))
+    }
+
+    /// [`Self::decode3`] without blocking.
+    pub async fn decode3_async(
+        &self,
+        bytes: &[u8],
+    ) -> Result<(Vec<u32>, GpuTimes), crate::bitio::DecodeError> {
+        let mut t = GpuTimes::default();
+        let t0 = Instant::now();
+        let ps = crate::gpuwav3::parse3(bytes)?;
+        t.parse_s = t0.elapsed().as_secs_f64();
+        let pr = self.prepare3(&ps, bytes, &mut t);
+        t.kernels_s = self.run3_async(&pr).await;
+        let t1 = Instant::now();
+        let v = self.readback_async(&pr.base).await;
+        t.readback_s = t1.elapsed().as_secs_f64();
+        Ok((v, t))
+    }
+}
+
+/// One-value channel whose receiver is a future (wgpu callbacks are `Send`
+/// on native, plain closures on the web; this works for both).
+struct OneTx<T>(std::sync::Arc<std::sync::Mutex<(Option<T>, Option<std::task::Waker>)>>);
+struct OneRx<T>(std::sync::Arc<std::sync::Mutex<(Option<T>, Option<std::task::Waker>)>>);
+
+fn oneshot<T>() -> (OneTx<T>, OneRx<T>) {
+    let s = std::sync::Arc::new(std::sync::Mutex::new((None, None)));
+    (OneTx(s.clone()), OneRx(s))
+}
+
+impl<T> OneTx<T> {
+    fn send(self, v: T) {
+        let mut g = self.0.lock().unwrap();
+        g.0 = Some(v);
+        if let Some(w) = g.1.take() {
+            w.wake();
+        }
+    }
+}
+
+impl<T> std::future::Future for OneRx<T> {
+    type Output = T;
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<T> {
+        let mut g = self.0.lock().unwrap();
+        match g.0.take() {
+            Some(v) => std::task::Poll::Ready(v),
+            None => {
+                g.1 = Some(cx.waker().clone());
+                std::task::Poll::Pending
+            }
+        }
+    }
+}
+
+/// A v3 stream uploaded to the GPU.
+pub struct Prepared3 {
+    base: Prepared,
+    groups: Vec<(usize, usize)>,
+    nblocks: usize,
+    ntiles: usize,
+    lanes: usize,
+    net: Option<crate::lmodel3::Net32>,
+    dec: Option<std::sync::Arc<crate::shipdec::Decoder>>,
+    /// Adaptive layer on: the learned residual decoder is the adaptive role.
+    ad: bool,
+}
+
+fn as_bytes(v: &[u32]) -> &[u8] {
+    // u32 has no padding; reinterpreting as bytes is sound
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::ErrorBound;
+    use crate::gpuwav::{decode_box_parsed, encode_f32, parse, GpuConfig};
+
+    fn field(d: [usize; 3]) -> Vec<f32> {
+        let mut v = Vec::new();
+        for i in 0..d[0] {
+            for j in 0..d[1] {
+                for k in 0..d[2] {
+                    let (x, y, z) = (i as f64, j as f64, k as f64);
+                    v.push(
+                        ((0.3 * x).sin() + (0.11 * y * z / 8.0).cos() + 0.01 * x * y
+                            - ((k * 7 + j * 3) % 11) as f64 * 0.003
+                            + 3.0) as f32,
+                    );
+                }
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn gpu_matches_cpu() {
+        let Ok(g) = GpuDecoder::new(8, 128) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let d = [20, 37, 45];
+        let x = field(d);
+        for bound in [
+            ErrorBound::Psnr(50.0),
+            ErrorBound::Psnr(100.0),
+            ErrorBound::MaxAbs(1e-3),
+            ErrorBound::MaxAbs(1e-5),
+        ] {
+            for brick in [8, 16, 64] {
+                let cfg = GpuConfig {
+                    brick,
+                    lanes: 8,
+                    ..GpuConfig::new(bound)
+                };
+                let (bytes, _) = encode_f32(&x, &d, &cfg);
+                let ps = parse(&bytes).unwrap();
+                let cpu = decode_box_parsed(&ps, &bytes, [0; 3], ps.d3, 1).unwrap();
+                let (gpu, _) = g.decode(&bytes).unwrap();
+                let bad = cpu.iter().zip(&gpu).filter(|(a, b)| a != b).count();
+                assert_eq!(bad, 0, "{bound:?} brick {brick}: {bad} cells differ");
+            }
+        }
+        let x2: Vec<f32> = (0..70 * 90)
+            .map(|i| ((i % 90) as f32 * 0.07).sin() * ((i / 90) as f32 * 0.05).cos())
+            .collect();
+        let (bytes, _) = encode_f32(
+            &x2,
+            &[70, 90],
+            &GpuConfig {
+                brick: 32,
+                lanes: 8,
+                ..GpuConfig::new(ErrorBound::Psnr(70.0))
+            },
+        );
+        let ps = parse(&bytes).unwrap();
+        let cpu = decode_box_parsed(&ps, &bytes, [0; 3], ps.d3, 1).unwrap();
+        assert_eq!(g.decode(&bytes).unwrap().0, cpu);
+        // v3 code-blocks
+        use crate::gpuwav3::{decode3_box, encode3_f32, Gpu3Config};
+        for bound in [
+            ErrorBound::Psnr(50.0),
+            ErrorBound::Psnr(100.0),
+            ErrorBound::MaxAbs(1e-3),
+            ErrorBound::MaxAbs(1e-5),
+        ] {
+            // compact lanes + axis taps (default), and the older layout
+            for (block, resctx, lanes, new) in [
+                (8, true, 1, true),
+                (16, false, 1, true),
+                (64, true, 1, true),
+                (16, true, 8, true),
+                (32, true, 8, true),
+                (8, true, 1, false),
+                (16, true, 8, false),
+            ] {
+                let cfg = Gpu3Config {
+                    block,
+                    resctx,
+                    lanes,
+                    tile: 16,
+                    compact: new,
+                    axis: new,
+                    ..Gpu3Config::new(bound)
+                };
+                let (bytes, _) = encode3_f32(&x, &d, &cfg, 2);
+                let cpu = decode3_box(&bytes, [0; 3], [d[0], d[1], d[2]], 1)
+                    .unwrap()
+                    .bits;
+                let (gpu, _) = g.decode3(&bytes).unwrap();
+                let bad = cpu.iter().zip(&gpu).filter(|(a, b)| a != b).count();
+                assert_eq!(bad, 0, "v3 {bound:?} block {block}: {bad} cells differ");
+            }
+        }
+        // learned (overfit) probabilities, 1 and 8 lanes
+        // (adaptive layer on by default; off in the last two)
+        for (lanes, bound, new, ad) in [
+            (1, ErrorBound::Psnr(80.0), true, true),
+            (8, ErrorBound::Psnr(100.0), true, true),
+            (8, ErrorBound::MaxAbs(1e-4), true, true),
+            (8, ErrorBound::Psnr(80.0), false, true),
+            (1, ErrorBound::Psnr(80.0), true, false),
+            (8, ErrorBound::Psnr(80.0), true, false),
+        ] {
+            let model = crate::gpuwav3::Model3::Overfit {
+                hidden: vec![8],
+                per_epoch: 20_000,
+                epochs: 2,
+            };
+            let adapt = if ad {
+                Some(crate::gpuwav3::ad_default())
+            } else {
+                None
+            };
+            let cfg = Gpu3Config {
+                block: 16,
+                lanes,
+                tile: 16,
+                model,
+                compact: new,
+                axis: new,
+                adapt,
+                ..Gpu3Config::new(bound)
+            };
+            let (bytes, _) = encode3_f32(&x, &d, &cfg, 2);
+            let cpu = decode3_box(&bytes, [0; 3], [d[0], d[1], d[2]], 1)
+                .unwrap()
+                .bits;
+            let (gpu, _) = g.decode3(&bytes).unwrap();
+            let bad = cpu.iter().zip(&gpu).filter(|(a, b)| a != b).count();
+            assert_eq!(
+                bad, 0,
+                "learned v3 lanes {lanes} {bound:?}: {bad} cells differ"
+            );
+        }
+        let (bytes, _) = encode3_f32(
+            &x2,
+            &[70, 90],
+            &Gpu3Config {
+                block2d: 16,
+                tile: 4,
+                ..Gpu3Config::new(ErrorBound::MaxAbs(1e-4))
+            },
+            1,
+        );
+        let cpu = decode3_box(&bytes, [0; 3], [1, 70, 90], 1).unwrap().bits;
+        assert_eq!(g.decode3(&bytes).unwrap().0, cpu);
+        // the async (WebGPU) path, driven by pollster here
+        assert_eq!(pollster::block_on(g.decode3_async(&bytes)).unwrap().0, cpu);
+        let (bytes, _) = encode_f32(
+            &x2,
+            &[70, 90],
+            &GpuConfig {
+                brick: 32,
+                lanes: 8,
+                ..GpuConfig::new(ErrorBound::Psnr(70.0))
+            },
+        );
+        let ps = parse(&bytes).unwrap();
+        assert_eq!(
+            pollster::block_on(g.decode_async(&bytes)).unwrap().0,
+            decode_box_parsed(&ps, &bytes, [0; 3], ps.d3, 1).unwrap()
+        );
+    }
+}

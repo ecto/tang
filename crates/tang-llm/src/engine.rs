@@ -24,6 +24,14 @@ const MIN_CHUNK: usize = 9;
 /// A step's default time budget, while anything decodes: 20 tokens a second for each stream.
 pub const STEP_BUDGET: f64 = 0.050;
 
+/// Draft only while at most this many streams decode in a step. Above it verify rows cost
+/// more than the forwards they save. Measured with zest-harness on an H100 (Qwen3-8B-4bit,
+/// total tok/s, drafting at most at 2 / 4 / always): 4 streams 408 / 304 / 296, 8 streams
+/// 542 / 500 / 337, 16 streams 600 / 595 / 314, while at 1-2 streams drafting still pays
+/// (1 stream: 174 off vs 320-350 on). Overridden by `TANG_SPEC_MAX_STREAMS`; drafting never
+/// changes outputs, only which forwards run.
+pub const SPEC_MAX_STREAMS: usize = 2;
+
 /// Fewest leading positions of another conversation's block worth copying (fewer are just
 /// prefilled: a chat template's first few tokens are the same everywhere).
 const MIN_PARTIAL: usize = 32;
@@ -216,6 +224,8 @@ pub struct Engine<D: ComputeDevice> {
     /// The active slot's conversation, and when it last ran (see [`crate::slots`]).
     cache_key: Option<String>,
     cache_used: u64,
+    /// When the active slot was last used, by the wall clock (for the TTL).
+    cache_at: std::time::SystemTime,
     /// Other conversations' caches, swapped in when a request names them.
     parked: Vec<Slot<D::Buffer>>,
     /// Most caches to keep, the active one included. Each is allocated on first use.
@@ -250,6 +260,10 @@ pub struct Engine<D: ComputeDevice> {
     /// decode (prefill chunks are sized to fit), if limited.
     step_cost: crate::step_cost::StepCost,
     step_budget: Option<f64>,
+    /// Draft only while at most this many streams decode (see [`SPEC_MAX_STREAMS`]), and how
+    /// many decode in the current step.
+    spec_max_streams: usize,
+    decoding: usize,
     /// Finished streams' outputs, for the global draft automaton once no stream drafts.
     global_pending: Vec<Vec<u32>>,
 }
@@ -384,6 +398,8 @@ struct Slot<B> {
     images: Vec<(usize, u64)>,
     key: Option<String>,
     used: u64,
+    /// Last used, by the wall clock (see [`crate::retention`]).
+    at: std::time::SystemTime,
 }
 
 /// Qwen3's suggested way to end reasoning early: say so, then close the block.
@@ -498,6 +514,7 @@ impl<D: ComputeDevice> Engine<D> {
             cache_images: Vec::new(),
             cache_key: None,
             cache_used: 0,
+            cache_at: crate::retention::now(),
             parked: Vec::new(),
             slots: 1,
             kv_budget: None,
@@ -517,6 +534,11 @@ impl<D: ComputeDevice> Engine<D> {
             max_batch: usize::MAX,
             step_cost: crate::step_cost::StepCost::default(),
             step_budget: Some(STEP_BUDGET),
+            spec_max_streams: std::env::var("TANG_SPEC_MAX_STREAMS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(SPEC_MAX_STREAMS),
+            decoding: 0,
             global_pending: Vec::new(),
         })
     }
@@ -600,6 +622,11 @@ impl<D: ComputeDevice> Engine<D> {
 
     /// Limit a step to `secs` while streams decode (prefill chunks shrink to fit), or don't
     /// (`None`: whole chunks always).
+    /// Draft only while at most `n` streams decode in a step (`usize::MAX`: always).
+    pub fn set_spec_max_streams(&mut self, n: usize) {
+        self.spec_max_streams = n;
+    }
+
     pub fn set_step_budget(&mut self, secs: Option<f64>) {
         self.step_budget = secs;
     }
@@ -839,6 +866,48 @@ impl<D: ComputeDevice> Engine<D> {
         pool.stats().capacity * pool.block_bytes()
     }
 
+    /// Drop conversations (parked, or the idle active one) unused for the TTL.
+    fn expire_slots(&mut self) -> bool {
+        let ttl = crate::retention::ttl();
+        let stale = |at| crate::retention::expired(at, ttl);
+        let before = self.parked.len();
+        self.parked.retain(|s| !stale(s.at));
+        let mut gone = self.parked.len() != before;
+        if stale(self.cache_at) && (self.cache.len > 0 || self.cache_key.is_some()) {
+            self.cache.truncate(0);
+            self.cache_images.clear();
+            self.cache_key = None;
+            self.last = Default::default();
+            gone = true;
+        }
+        gone
+    }
+
+    /// Drop everything derived from prompts that has gone unused for the TTL (see
+    /// [`crate::retention`]): conversations, cached blocks, files in the disk tier, completions
+    /// in the draft store, the draft model's cache. Running requests keep theirs.
+    pub fn expire(&mut self) {
+        let ttl = crate::retention::ttl();
+        if ttl.is_none() {
+            return;
+        }
+        let idle = self.out == 0 && crate::retention::expired(self.cache_at, ttl);
+        self.expire_slots();
+        crate::blocks::lock(self.model.pool()).expire();
+        if let Some(s) = &self.store {
+            s.expire();
+        }
+        if let Some(s) = &mut self.spec {
+            s.global.expire();
+        }
+        if idle {
+            self.global_pending.clear();
+            if let Some(d) = &mut self.drafter {
+                d.forget();
+            }
+        }
+    }
+
     /// What the KV block pool holds, in blocks.
     pub fn kv_stats(&self) -> crate::blocks::Stats {
         crate::blocks::lock(self.model.pool()).stats()
@@ -917,6 +986,8 @@ impl<D: ComputeDevice> Engine<D> {
                 used,
             }
         }
+        // Conversations past the TTL aren't picked up again.
+        self.expire_slots();
         let parked: Vec<View> = self
             .parked
             .iter()
@@ -933,6 +1004,7 @@ impl<D: ComputeDevice> Engine<D> {
                     images: Vec::new(),
                     key: None,
                     used: 0,
+                    at: crate::retention::now(),
                 });
                 Some(self.parked.len() - 1)
             }
@@ -943,12 +1015,14 @@ impl<D: ComputeDevice> Engine<D> {
             std::mem::swap(&mut self.cache_images, &mut s.images);
             std::mem::swap(&mut self.cache_key, &mut s.key);
             std::mem::swap(&mut self.cache_used, &mut s.used);
+            std::mem::swap(&mut self.cache_at, &mut s.at);
         }
         if let Some(k) = key {
             self.cache_key = Some(k.to_string());
         }
         self.clock += 1;
         self.cache_used = self.clock;
+        self.cache_at = crate::retention::now();
     }
 
     /// The template and tokenizer, to count prompts elsewhere.
@@ -1250,6 +1324,10 @@ impl<D: ComputeDevice> Engine<D> {
         // Each stream's segment, if it has one this step: (tokens fed, all rows).
         let mut segs: Vec<Option<bool>> = Vec::with_capacity(lanes.len());
         let mut decode_rows = 0;
+        self.decoding = lanes
+            .iter()
+            .filter(|l| l.stream.phase == Phase::Decode)
+            .count();
         for lane in lanes.iter_mut() {
             let want = match lane.stream.phase {
                 Phase::Decode => match self.advance(lane) {
@@ -1501,9 +1579,11 @@ impl<D: ComputeDevice> Engine<D> {
             // Drop the rejected rest of the draft from the cache.
             st.cache.truncate(st.cache.len - st.pending);
             st.pending = 0;
-            // A new draft, unless the wrap-up was just forced in (don't draft across it).
+            // A new draft, unless the wrap-up was just forced in (don't draft across it) or
+            // the batch is too wide for verify rows to pay.
+            let wide = self.decoding > self.spec_max_streams;
             st.draft = match (st.drafter.as_ref(), spec) {
-                (Some(d), Some(s)) if !wrap => {
+                (Some(d), Some(s)) if !wrap && !wide => {
                     let room = (st.limit - st.out.len())
                         .min(max_ctx.saturating_sub(st.cache.len + st.fed.len()));
                     let p = d.propose(&s.cfg, &s.global, room);
@@ -1557,6 +1637,7 @@ impl<D: ComputeDevice> Engine<D> {
             images: std::mem::replace(&mut self.cache_images, std::mem::take(&mut st.images)),
             key: std::mem::replace(&mut self.cache_key, st.key.take()),
             used: std::mem::replace(&mut self.cache_used, st.used),
+            at: std::mem::replace(&mut self.cache_at, crate::retention::now()),
         };
         if prev.key.is_some() || !prev.cache.tokens.is_empty() {
             self.parked.push(prev);

@@ -1,0 +1,10 @@
+{"ctx":2048,"mode":"bf16","bpv":16.000,"ms_per_step":6.597,"tok_s":151.58,"nll":1.9295,"compress_s":0.00}
+{"ctx":2048,"mode":"kivi:4:32","bpv":5.000,"ms_per_step":9.624,"tok_s":103.90,"nll":1.9151,"compress_s":0.74}
+{"ctx":2048,"mode":"kivi:2:32","bpv":3.000,"ms_per_step":9.832,"tok_s":101.71,"nll":1.9117,"compress_s":0.70}
+{"ctx":2048,"mode":"tkv:0.07:32","bpv":3.566,"ms_per_step":569.192,"tok_s":1.76,"nll":1.9228,"compress_s":5.32}
+{"ctx":2048,"mode":"tkv:0.07:16","bpv":3.592,"ms_per_step":349.201,"tok_s":2.86,"nll":1.9111,"compress_s":7.86}
+{"ctx":8192,"mode":"bf16","bpv":16.000,"ms_per_step":19.669,"tok_s":50.84,"nll":2.3128,"compress_s":0.00}
+{"ctx":8192,"mode":"kivi:4:32","bpv":5.000,"ms_per_step":22.641,"tok_s":44.17,"nll":2.3304,"compress_s":4.55}
+{"ctx":8192,"mode":"kivi:2:32","bpv":3.000,"ms_per_step":29.163,"tok_s":34.29,"nll":2.4267,"compress_s":5.30}
+{"ctx":8192,"mode":"tkv:0.07:32","bpv":3.557,"ms_per_step":657.152,"tok_s":1.52,"nll":2.3125,"compress_s":30.18}
+{"ctx":8192,"mode":"tkv:0.07:16","bpv":3.583,"ms_per_step":493.094,"tok_s":2.03,"nll":2.3182,"compress_s":44.75}
