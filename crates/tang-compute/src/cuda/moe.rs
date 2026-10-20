@@ -36,8 +36,14 @@ fn sinks_source(bf16: bool) -> &'static str {
         } else {
             llm_cuda::KV_F32_CUDA
         };
-        let s = moe_cuda::ATTN_SINKS_CUDA
-            .replace("attn_sink_partial(", if bf16 { "attn_sink_partial_bf16(" } else { "attn_sink_partial_f32(" });
+        let s = moe_cuda::ATTN_SINKS_CUDA.replace(
+            "attn_sink_partial(",
+            if bf16 {
+                "attn_sink_partial_bf16("
+            } else {
+                "attn_sink_partial_f32("
+            },
+        );
         Box::leak(format!("{head}{}{s}", llm_cuda::KV_ROW_CUDA).into_boxed_str())
     };
     SRC.get_or_init(|| [build(false), build(true)])[bf16 as usize]
@@ -93,7 +99,11 @@ impl CudaComputeDevice {
         let comb = self.llm_func(sinks_source(false), "attn_sink_combine");
         let mut out = self.pool_alloc_uninit_f32(q_len * nh * d);
         let splits = |end: usize| {
-            let lo = if window > 0 { end.saturating_sub(window) } else { 0 };
+            let lo = if window > 0 {
+                end.saturating_sub(window)
+            } else {
+                0
+            };
             (end - lo).div_ceil(256).clamp(1, 64)
         };
         let (nh_u, nkv_u, d_u, win) = (nh as u32, nkv as u32, d as u32, window as u32);
@@ -113,7 +123,10 @@ impl CudaComputeDevice {
                     crate::ComputeDevice::slice_buffer(self, rp, r0, n),
                     crate::ComputeDevice::slice_buffer(self, rt, r0, n),
                 ),
-                None => (crate::ComputeDevice::slice_buffer(self, table, 0, 1), crate::ComputeDevice::slice_buffer(self, table, 0, 1)),
+                None => (
+                    crate::ComputeDevice::slice_buffer(self, table, 0, 1),
+                    crate::ComputeDevice::slice_buffer(self, table, 0, 1),
+                ),
             };
             let mut lb = self.stream.launch_builder(&part);
             lb.arg(qs.f32_data());
