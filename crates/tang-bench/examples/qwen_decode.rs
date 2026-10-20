@@ -663,6 +663,7 @@ impl St {
         let (_, _, a, b) = self
             .index
             .get(name)
+            .or_else(|| self.index.get(&tied(name)))
             .unwrap_or_else(|| panic!("missing tensor {name}"));
         &self.bytes[self.base + a..self.base + b]
     }
@@ -687,7 +688,8 @@ impl St {
         let q = self.raw(&format!("{stem}.weight"));
         let s = self.bf16(&format!("{stem}.scales"));
         let b = self.bf16(&format!("{stem}.biases"));
-        let (_, shape, _, _) = &self.index[&format!("{stem}.weight")];
+        let w = format!("{stem}.weight");
+        let (_, shape, _, _) = self.index.get(&w).unwrap_or_else(|| &self.index[&tied(&w)]);
         let (rows, cols) = (shape[0], shape[1] * 8);
         let groups = cols / GROUP;
         let mut w = vec![0.0f32; rows * cols];
@@ -702,6 +704,44 @@ impl St {
         }
         (w, rows, cols)
     }
+}
+
+/// Tied embeddings (`tie_word_embeddings`, e.g. Qwen3-0.6B/1.7B/4B): no
+/// `lm_head.*` tensors, the LM head is the embedding.
+fn tied(name: &str) -> String {
+    match name.strip_prefix("lm_head.") {
+        Some(rest) => format!("model.embed_tokens.{rest}"),
+        None => name.to_string(),
+    }
+}
+
+/// The model's dims from `DIR/config.json` (any Qwen3 size), with a cache
+/// of `ctx` positions; Qwen3-8B's when there is no config.
+fn dims_for(dir: &str, ctx: usize) -> QwenDims {
+    let mut d = QwenDims::qwen3_8b(ctx);
+    let Ok(text) = std::fs::read_to_string(format!("{dir}/config.json")) else {
+        return d;
+    };
+    let c: serde_json::Value = serde_json::from_str(&text).expect("config.json");
+    let u = |k: &str, v: &mut usize| {
+        if let Some(x) = c[k].as_u64() {
+            *v = x as usize;
+        }
+    };
+    u("hidden_size", &mut d.d_model);
+    u("num_attention_heads", &mut d.heads);
+    u("num_key_value_heads", &mut d.kv_heads);
+    u("head_dim", &mut d.head_dim);
+    u("intermediate_size", &mut d.ff);
+    u("vocab_size", &mut d.vocab);
+    u("num_hidden_layers", &mut d.layers);
+    if let Some(x) = c["rms_norm_eps"].as_f64() {
+        d.eps = x;
+    }
+    if let Some(x) = c["rope_theta"].as_f64() {
+        d.theta = x;
+    }
+    d
 }
 
 /// Device inputs for a step graph from an MLX checkpoint, converted as the
@@ -825,7 +865,8 @@ fn model(args: &[String]) {
     };
     let gen: usize = opt("--gen").map_or(64, |v| v.parse().unwrap());
     let ctx: usize = opt("--ctx").map_or(4352, |v| v.parse().unwrap());
-    let mut dims = QwenDims::qwen3_8b(ctx);
+    let mut dims = dims_for(dir, ctx);
+    eprintln!("dims: {dims:?}");
     dims.kv_f16 = std::env::var("TANG_KV_F32").is_err();
     let rt = runtime();
     // a 311 MB 4-bit LM head exceeds Vulkan's 128 MiB storage binding on
@@ -1095,7 +1136,7 @@ fn reference(args: &[String]) {
         .iter()
         .position(|a| a == "--from")
         .map_or(0, |i| args[i + 1].parse().unwrap());
-    let dims = QwenDims::qwen3_8b(ids.len());
+    let dims = dims_for(dir, ids.len());
     let QwenDims {
         d_model: d,
         heads,
