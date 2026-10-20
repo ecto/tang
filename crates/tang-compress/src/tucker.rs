@@ -351,20 +351,7 @@ fn err_of(x: &[f64], y: &[f64]) -> (f64, f64) {
     ((se / x.len() as f64).sqrt(), mx)
 }
 
-/// Encode f32 samples (1D–3D, row-major) at a PSNR or RMSE target.
-pub fn encode_f32(x: &[f32], dims: &[usize], bound: ErrorBound) -> (Vec<u8>, TuckerStats) {
-    let x: Vec<f64> = x.iter().map(|&v| v as f64).collect();
-    let d = as3(dims);
-    assert_eq!(d.iter().product::<usize>(), x.len());
-    let (lo_v, hi_v) = x.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &v| (a.min(v), b.max(v)));
-    let target = match bound {
-        ErrorBound::Rmse(r) => r,
-        ErrorBound::Psnr(db) => (hi_v - lo_v) * 10f64.powf(-db / 20.0),
-        ErrorBound::MaxAbs(_) => panic!("the Tucker codec has no max-abs mode; use the wavelet codec"),
-    }
-    .max(f64::MIN_POSITIVE);
-    let h = hosvd(&x, d);
-    let ok = |delta: f64| err_of(&x, &trial(&x, &h, delta).y).0 <= target;
+fn search(target: f64, ok: &impl Fn(f64) -> bool) -> f64 {
     let (mut lo, mut hi) = (target * 0.5, target * 6.0);
     let mut guard = 0;
     while !ok(lo) && guard < 40 {
@@ -385,7 +372,39 @@ pub fn encode_f32(x: &[f32], dims: &[usize], bound: ErrorBound) -> (Vec<u8>, Tuc
             hi = mid;
         }
     }
-    let delta = lo;
+    lo
+}
+
+/// Encode f32 samples (1D–3D, row-major) at a PSNR or RMSE target.
+pub fn encode_f32(x: &[f32], dims: &[usize], bound: ErrorBound) -> (Vec<u8>, TuckerStats) {
+    encode_f32_with(x, dims, bound, false)
+}
+
+/// [`encode_f32`] with the core step from [`crate::wavcodec::fast_step`]
+/// (a formula plus a few error checks) instead of a bisection search.
+pub fn encode_fast_f32(x: &[f32], dims: &[usize], bound: ErrorBound) -> (Vec<u8>, TuckerStats) {
+    encode_f32_with(x, dims, bound, true)
+}
+
+fn encode_f32_with(x: &[f32], dims: &[usize], bound: ErrorBound, fast: bool) -> (Vec<u8>, TuckerStats) {
+    let x: Vec<f64> = x.iter().map(|&v| v as f64).collect();
+    let d = as3(dims);
+    assert_eq!(d.iter().product::<usize>(), x.len());
+    let (lo_v, hi_v) = x.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &v| (a.min(v), b.max(v)));
+    let target = match bound {
+        ErrorBound::Rmse(r) => r,
+        ErrorBound::Psnr(db) => (hi_v - lo_v) * 10f64.powf(-db / 20.0),
+        ErrorBound::MaxAbs(_) => panic!("the Tucker codec has no max-abs mode; use the wavelet codec"),
+    }
+    .max(f64::MIN_POSITIVE);
+    let h = hosvd(&x, d);
+    let ok = |delta: f64| err_of(&x, &trial(&x, &h, delta).y).0 <= target;
+    let delta = if fast {
+        let (d, _) = crate::wavcodec::fast_step(target, 4, |d| err_of(&x, &trial(&x, &h, d).y).0);
+        if ok(d) { d } else { search(target, &ok) }
+    } else {
+        search(target, &ok)
+    };
     let t = trial(&x, &h, delta);
     let mut w = ByteWriter::new();
     w.bytes(MAGIC);
