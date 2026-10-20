@@ -1,0 +1,35 @@
+window 6440.6 ms, kernels 180579, DtoH copies 481 (steps), HtoD 4727, other memcpy 4094, memsets 0
+per step: 13.390 ms, kernels/step 375.4, GPU busy 72.7% (9.738 ms/step), idle 3.652 ms/step
+DtoH bytes/copy avg 3981876, DtoH time/step 214.2 us; HtoD/step 9.8 copies 7.7 us
+
+kernel families (per step): count, us, share of busy, avg us
+  gemv_q4_xs4_m8                                                116.7   7308.6us  75.1%   62.65
+  attn_partial_rows                                              29.3    894.5us   9.2%   30.49
+  rms_norm                                                       62.1    604.5us   6.2%    9.74
+  gemm_cols32_q4                                                  2.4    377.9us   3.9%  157.77
+  gemv_q4_xs4_m1                                                  4.5    149.4us   1.5%   33.00
+  attention_prep_rows                                            29.3     95.2us   1.0%    3.24
+  add_f32                                                        61.2     78.0us   0.8%    1.27
+  attn_combine                                                   31.1     61.7us   0.6%    1.99
+  swiglu_split                                                   30.6     60.1us   0.6%    1.96
+  gemv_q4_xs4_m7                                                  0.3     18.0us   0.2%   59.73
+  gemv_q4_xs4_m6                                                  0.3     16.8us   0.2%   55.75
+  gemv_q4_xs4_m2                                                  0.3     15.4us   0.2%   51.49
+  gemv_q4_xs4_m5                                                  0.3     15.3us   0.2%   50.78
+  gemv_q4_xs4_m3                                                  0.3     12.2us   0.1%   40.59
+  attn_partial                                                    1.1     11.0us   0.1%    9.83
+  sum_splits                                                      2.4      7.4us   0.1%    3.11
+  attn_multi_r32                                                  0.6      5.9us   0.1%    9.79
+  attention_prep                                                  1.7      4.7us   0.0%    2.75
+  embedding_q4                                                    0.9      1.6us   0.0%    1.88
+
+gaps: n=180578 median 1.15us p90 2.14us; gaps>20us: 1.7/step totalling 2.909 ms/step; small gaps total 0.535 ms/step
+
+CUDA API (per step): count, us
+  cuMemcpyDtoHAsync_v2                                   1.0   6675.2us
+  cuMemGetInfo_v2                                      381.6   2305.3us
+  cuLaunchKernel                                       375.4   1140.9us
+  cuMemcpyDtoDAsync_v2                                   8.5     56.5us
+  cuMemcpyHtoDAsync_v2                                   9.8     30.4us
+  cuMemAllocAsync                                       10.0     10.9us
+  cuMemFreeAsync                                         9.8      7.2us

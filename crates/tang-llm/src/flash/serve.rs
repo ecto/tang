@@ -958,6 +958,7 @@ impl FlashServe {
                 decode_tok_s: out as f64 / decode_s.max(1e-9),
                 draft_tokens: drafted,
                 accepted_tokens: accepted,
+                ..Default::default()
             };
         if req.prefill_only {
             self.line.finish = "prefill";
