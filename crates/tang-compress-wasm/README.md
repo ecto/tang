@@ -85,3 +85,30 @@ The corpus uses these formats:
 - **32-bit `usize`.** Two size guards (`n > 1 << 34`) overflowed on wasm32 and
   now compare in `u64`. Fields above 4G cells cannot be addressed on wasm32
   anyway.
+
+## Results (M4, Chrome 155 headless, 2026-10-20)
+
+- **Gate:** 285/285 byte-identical. That is 19 fields × p60/p80/p100/m1e-3/m1e-4
+  × {tcg1, tcg3s, tcg3l}, with the WebGPU decode and the WASM CPU decode each
+  hashed against the native CPU decode.
+- **Throughput:** GB/s of decoded f32, total cells over total time across the
+  95 streams per format. "End-to-end" is parse, upload, kernels and readback.
+  The browser figures are the best of 3 runs after the pipelines were built.
+
+| format | web GPU end-to-end | native GPU end-to-end | web CPU, 1 thread | native CPU, 1 thread |
+|---|---|---|---|---|
+| tcg1  | 0.114 | 0.067 | 0.067 | 0.068 |
+| tcg3s | 0.021 | 0.013 | 0.060 | 0.070 |
+| tcg3l | 0.030 | 0.019 | 0.0049 | 0.0065 |
+
+- **Treat the native GPU column as a pessimistic baseline, not a fair
+  comparison.** Native GPU times were taken inside `corpus` while it was
+  encoding with 6 threads, so the machine was loaded (M4 timings also drift by
+  up to ±2×). The browser ran on an idle machine.
+- **What the numbers do show:**
+  - WebGPU adds no visible overhead over native wgpu/Metal on these streams.
+  - WASM CPU runs at 0.75–0.86× native single-thread speed.
+- **Absolute GB/s is low because the fields are small** (1M cells, or 1M for
+  1024²). Fixed per-dispatch costs dominate: about 45 lift dispatches, and
+  1-lane tcg3s decodes one block per invocation. The report's 512³ numbers
+  (0.6–7 GB/s) are the large-field regime.
