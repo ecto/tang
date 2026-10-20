@@ -524,6 +524,10 @@ pub struct Sampling {
     pub top_p: f32,
     /// > 1 discourages tokens already in the context (HF convention).
     pub repetition_penalty: f32,
+    /// OpenAI's: subtracted from a token's logit once if it is in the reply
+    /// so far, and per occurrence.
+    pub presence_penalty: f32,
+    pub frequency_penalty: f32,
     pub seed: u64,
 }
 
@@ -533,6 +537,8 @@ impl Default for Sampling {
             temperature: 0.0,
             top_p: 1.0,
             repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
             seed: 0,
         }
     }
@@ -552,6 +558,8 @@ pub struct Session {
     cached: Vec<u32>,
     /// The token the next decode step consumes, and its position.
     next: (u32, usize),
+    /// Where the current reply starts in `cached` (presence/frequency penalties).
+    reply_start: usize,
     /// The prefill program that ran last (`None`: the decode step).
     last: Option<(usize, usize)>,
     rng: u64,
@@ -600,6 +608,7 @@ impl Session {
             cached: Vec::new(),
             next: (0, 0),
             last: None,
+            reply_start: 0,
             rng: 0x9e37_79b9_7f4a_7c15,
         })
     }
@@ -627,6 +636,11 @@ impl Session {
 
     pub fn cached(&self) -> &[u32] {
         &self.cached
+    }
+
+    /// Reply tokens that fit after a prompt of `n` tokens.
+    pub fn room_for(&self, n: usize) -> usize {
+        self.dims.ctx.saturating_sub(n + 1)
     }
 
     /// Positions still free in the cache.
@@ -699,6 +713,7 @@ impl Session {
             }
         }
         self.cached = tokens.to_vec();
+        self.reply_start = tokens.len();
         let first = self.choose(sampling);
         (first, lcp)
     }
@@ -718,7 +733,9 @@ impl Session {
     /// argmax) or by sampling its logits; records it as `next`.
     fn choose(&mut self, s: &Sampling) -> u32 {
         let (argmax_tok, pos) = self.dec.state(&self.rt);
-        let tok = if s.temperature <= 0.0 && s.repetition_penalty == 1.0 {
+        let plain =
+            s.repetition_penalty == 1.0 && s.presence_penalty == 0.0 && s.frequency_penalty == 0.0;
+        let tok = if s.temperature <= 0.0 && plain {
             argmax_tok as u32
         } else {
             let mut l = self.last_logits();
@@ -749,6 +766,15 @@ impl Session {
                         *x * s.repetition_penalty
                     };
                 }
+            }
+        }
+        if s.presence_penalty != 0.0 || s.frequency_penalty != 0.0 {
+            let mut count: HashMap<u32, f32> = HashMap::new();
+            for &t in &self.cached[self.reply_start.min(self.cached.len())..] {
+                *count.entry(t).or_default() += 1.0;
+            }
+            for (t, n) in count {
+                l[t as usize] -= s.presence_penalty + s.frequency_penalty * n;
             }
         }
         if s.temperature <= 0.0 {
