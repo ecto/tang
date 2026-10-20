@@ -1019,6 +1019,15 @@ extern "C" __global__ void __launch_bounds__(512, HW_MINB) fl_hc_fusedw_q8(
 
 // ---- Gated DeltaNet ----
 
+// The k head v head `h` reads and the output gate: qwen4exp tiles v heads over k heads and
+// gates with a sigmoid; a grouped geometry (qwen3next) defines both in the prelude.
+#ifndef GDN_KH
+#define GDN_KH(h) ((h) % GDN_HK)
+#endif
+#ifndef GDN_GATE
+#define GDN_GATE(z) sigm(z)
+#endif
+
 // Grid GDN_CONV / 128 (one block per 128-channel head), block 128.
 extern "C" __global__ void fl_gdn_conv(const float* __restrict__ P, unsigned int stride,
                                        const float* __restrict__ H0, const float* __restrict__ Wc,
@@ -1091,7 +1100,7 @@ __device__ __forceinline__ void gdn_step_body(
     __shared__ float sg[8], sb[8];
     __shared__ float red[4][128];
     __shared__ float red2[4];
-    unsigned int hv = blockIdx.x, hk = hv % GDN_HK, tid = threadIdx.x, j = tid & 127, rg = tid >> 7;
+    unsigned int hv = blockIdx.x, hk = GDN_KH(hv), tid = threadIdx.x, j = tid & 127, rg = tid >> 7;
     unsigned int n = commit ? min(win[1], T) : T;
     float st[32];
     #pragma unroll
@@ -1178,7 +1187,7 @@ __device__ __forceinline__ void gdn_step_body(
         if (rg == 0) {
             float ss = ((red2[0] + red2[1]) + red2[2]) + red2[3];
             float rs = 1.0f / sqrtf(ss / 128.0f + eps);
-            float y = o * rs * NW[j] * sigm(sz[t][j]);
+            float y = o * rs * NW[j] * GDN_GATE(sz[t][j]);
             Y[(u64)(t0 + t) * GDN_V + hv * 128 + j] = y;
             if (quant) quant_chunk(y, YQ, T, GDN_V, t0 + t, hv * 4 + (j >> 5), j & 31);
         }

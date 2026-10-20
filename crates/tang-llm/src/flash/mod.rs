@@ -8,6 +8,10 @@
 #[cfg(feature = "cuda")]
 pub mod cli;
 #[cfg(feature = "cuda")]
+pub mod coder;
+#[cfg(feature = "cuda")]
+pub mod coder_kernels;
+#[cfg(feature = "cuda")]
 pub mod engine;
 #[cfg(feature = "cuda")]
 pub mod kernels;

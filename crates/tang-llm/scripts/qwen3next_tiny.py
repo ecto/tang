@@ -15,6 +15,14 @@ tiny random-init Qwen3-Next (the architecture of Qwen3-Next-80B-A3B and Qwen3-Co
    every position's full distribution: top-1 agreement and KL(HF || tang).
 
 The bar is the repo's for fp32 references: top-1 agreement 100% and max KL < 1e-3.
+
+`--real-shapes` builds the same 4 layers at Qwen3-Coder-Next's widths instead (hidden 2048; GDN 16
+k / 32 v heads of 128; attention 16 q / 2 kv heads of 256; experts FF 512, top-10 of 16; shared
+FF 512), which the CUDA engine's kernels are compiled for, and `--outtype q8_0` quantises it the
+way the engine reads real files. Then also run the engine against flash-ref:
+
+    tang-llm flash-ref GGUF IDS... --top 40 > ref.jsonl
+    tang-llm flash-parity GGUF --prompt-ids "IDS" --ref ref.jsonl
 """
 import argparse
 import os
@@ -36,28 +44,47 @@ PROMPT = (
 )
 
 
-def build(out, seed):
+TINY = dict(
+    hidden_size=128,
+    num_attention_heads=4,
+    num_key_value_heads=2,
+    head_dim=64,
+    linear_key_head_dim=32,
+    linear_value_head_dim=32,
+    linear_num_key_heads=2,
+    linear_num_value_heads=4,
+    num_experts=8,
+    num_experts_per_tok=2,
+    moe_intermediate_size=64,
+    shared_expert_intermediate_size=64,
+)
+REAL = dict(
+    hidden_size=2048,
+    num_attention_heads=16,
+    num_key_value_heads=2,
+    head_dim=256,
+    linear_key_head_dim=128,
+    linear_value_head_dim=128,
+    linear_num_key_heads=16,
+    linear_num_value_heads=32,
+    num_experts=16,
+    num_experts_per_tok=10,
+    moe_intermediate_size=512,
+    shared_expert_intermediate_size=512,
+)
+
+
+def build(out, seed, shapes):
     torch.manual_seed(seed)
     cfg = Qwen3NextConfig(
         vocab_size=151936,
-        hidden_size=128,
         intermediate_size=256,
         num_hidden_layers=4,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=64,
         partial_rotary_factor=0.25,
         rope_theta=5_000_000.0,
         rms_norm_eps=1e-6,
         linear_conv_kernel_dim=4,
-        linear_key_head_dim=32,
-        linear_value_head_dim=32,
-        linear_num_key_heads=2,
-        linear_num_value_heads=4,
-        num_experts=8,
-        num_experts_per_tok=2,
-        moe_intermediate_size=64,
-        shared_expert_intermediate_size=64,
+        **shapes,
         norm_topk_prob=True,
         decoder_sparse_step=1,
         mlp_only_layers=[],
@@ -96,18 +123,21 @@ def main():
     ap.add_argument("--llama-cpp", required=True, help="llama.cpp checkout (for the converter)")
     ap.add_argument("--out", required=True, help="work dir")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--real-shapes", action="store_true", help="Qwen3-Coder-Next's widths")
+    ap.add_argument("--outtype", default="f32", help="converter --outtype (f32, q8_0, ...)")
     a = ap.parse_args()
 
     hf_dir = os.path.join(a.out, "hf")
-    gguf = os.path.join(a.out, "qwen3next-tiny-f32.gguf")
-    model = build(hf_dir, a.seed)
+    gguf = os.path.join(a.out, f"qwen3next-{'real' if a.real_shapes else 'tiny'}-{a.outtype}.gguf")
+    model = build(hf_dir, a.seed, REAL if a.real_shapes else TINY)
     subprocess.run(
         [sys.executable, os.path.join(a.llama_cpp, "convert_hf_to_gguf.py"), hf_dir,
-         "--outtype", "f32", "--no-mtp", "--outfile", gguf],
+         "--outtype", a.outtype, "--no-mtp", "--outfile", gguf],
         check=True, stdout=subprocess.DEVNULL,
     )
 
     ids = AutoTokenizer.from_pretrained(hf_dir)(PROMPT)["input_ids"]
+    print("ids:", " ".join(map(str, ids)))
     with torch.no_grad():
         ref = model(torch.tensor([ids])).logits[0].double()
 
