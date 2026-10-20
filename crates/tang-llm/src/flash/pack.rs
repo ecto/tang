@@ -408,8 +408,12 @@ fn jobs(
     }
     if let Some(l) = ple_layer {
         let key = b(l, "ple_key.weight");
-        if g.info(&key)?.ty == GgmlType::Q2_0 {
+        let ty = g.info(&key)?.ty;
+        if ty == GgmlType::Q2_0 {
             v.push(("ple.key".into(), Job::Q2(key)));
+        } else if ty == GgmlType::Bf16 {
+            // ISTA's Coder keeps it bf16; native bf16 is width-invariant too.
+            v.push(("ple.key".into(), Job::Bf16Stack { names: vec![key] }));
         } else {
             v.push((
                 "ple.key".into(),

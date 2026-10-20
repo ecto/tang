@@ -352,7 +352,7 @@ struct Layer {
 
 struct Ple {
     layer: usize,
-    /// `ple_key` as a native Q2_0 segment (`fe_gemv8`), so a token's PLE output doesn't depend
+    /// `ple_key` as a native Q2_0 segment (`fe_gemv8`) or native bf16, so a token's PLE output doesn't depend
     /// on the window width.
     key: Dw,
     value: Dw,
@@ -935,13 +935,20 @@ impl Engine {
             layer: plep.layer,
             key: {
                 let e = by.get("ple.key").context("pack has no ple.key")?;
-                ensure!(e.fmt == Fmt::Q2Raw, "ple.key must be Q2_0");
-                let raw = pack::read_entry(&std::fs::File::open(&dense_path)?, e)?;
-                let nt = tang_compute::flash_native::NatType::Q2_0;
-                Dw::Kn(
-                    vec![(KSeg::Nat(dev.upload_native(nt, &raw, e.n, e.k), nt), e.n, 0)],
-                    e.n,
-                )
+                ensure!(
+                    matches!(e.fmt, Fmt::Q2Raw | Fmt::Bf16),
+                    "ple.key must be Q2_0 or bf16"
+                );
+                if e.fmt == Fmt::Bf16 {
+                    bf16_native("ple.key")?
+                } else {
+                    let raw = pack::read_entry(&std::fs::File::open(&dense_path)?, e)?;
+                    let nt = tang_compute::flash_native::NatType::Q2_0;
+                    Dw::Kn(
+                        vec![(KSeg::Nat(dev.upload_native(nt, &raw, e.n, e.k), nt), e.n, 0)],
+                        e.n,
+                    )
+                }
             },
             value: bf16_native("ple.value")?,
             nk: get("ple.nk")?,
