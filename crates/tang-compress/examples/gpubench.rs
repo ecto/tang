@@ -25,7 +25,16 @@ fn cfg3_of(bound: ErrorBound, bk: usize, args: &[String]) -> Gpu3Config {
     } else {
         panic!("model3 {m}")
     };
-    Gpu3Config { block: bk, block2d: bk, resctx: !args.iter().any(|a| a == "--nores"), lanes: opt(args, "--l3", "1").parse().unwrap(), model, ..Gpu3Config::new(bound) }
+    Gpu3Config {
+        block: bk,
+        block2d: bk,
+        resctx: !args.iter().any(|a| a == "--nores"),
+        lanes: opt(args, "--l3", "1").parse().unwrap(),
+        compact: !args.iter().any(|a| a == "--nocompact"),
+        axis: !args.iter().any(|a| a == "--noaxis"),
+        model,
+        ..Gpu3Config::new(bound)
+    }
 }
 use tang_compress::{wavcodec, Decoded};
 

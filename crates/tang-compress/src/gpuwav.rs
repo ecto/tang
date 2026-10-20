@@ -420,6 +420,12 @@ pub struct BandInfo {
     /// Raster order inside the region (one lane, every earlier line
     /// visible) instead of parity passes.
     pub raster: bool,
+    /// Axis-grouped value taps: the three line taps (and the learned model's
+    /// line values) sum z-axis / y-axis / diagonal lines instead of face /
+    /// diagonal / far lines.
+    pub ax: bool,
+    /// Lanes this region's lines are dealt to (0 = all of the coder's lanes).
+    pub nl: usize,
 }
 
 /// A brick shape and its pyramid.
@@ -529,6 +535,8 @@ impl Shape {
                     w: p.band_weight(b),
                     org: b.start,
                     raster: false,
+                    ax: false,
+                    nl: 0,
                 }
             })
             .collect();
@@ -591,6 +599,8 @@ const TCLAMP: i32 = 1 << 13;
 pub(crate) struct RowCtx {
     pub(crate) base: [usize; 20],
     pub(crate) cat: [u8; 20],
+    /// Axis group of the line: 0 = same y (z-axis), 1 = same z (y-axis), 2 = diagonal.
+    pub(crate) ax: [u8; 20],
     pub(crate) n: usize,
 }
 
@@ -612,6 +622,13 @@ pub(crate) fn row_ctx(sh: &Shape, b: &BandInfo, p: usize, z: usize, y: usize) ->
         }
         rc.base[rc.n] = (z2 * ny + y2) * nx;
         rc.cat[rc.n] = cat;
+        rc.ax[rc.n] = if dy == 0 {
+            0
+        } else if dz == 0 {
+            1
+        } else {
+            2
+        };
         rc.n += 1;
     }
     rc
@@ -655,8 +672,10 @@ pub(crate) fn feats(sh: &Shape, b: &BandInfo, rc: &RowCtx, q: &[i32], rs: Option
     let (mut sf, mut sd, mut sr) = (0i32, 0i32, 0i32);
     let (mut af, mut ad, mut ar) = (0u32, 0u32, 0u32);
     let (mut nf, mut nd, mut nr) = (0u32, 0u32, 0u32);
+    let mut sa = [0i32; 3];
     for j in 0..rc.n {
         let v = q[rc.base[j] + x];
+        sa[rc.ax[j] as usize] = sa[rc.ax[j] as usize].wrapping_add(v);
         let vm = m[rc.base[j] + x];
         match rc.cat[j] {
             0 => {
@@ -713,6 +732,9 @@ pub(crate) fn feats(sh: &Shape, b: &BandInfo, rc: &RowCtx, q: &[i32], rs: Option
         }
     }
     let cl = |v: i32| v.clamp(-TCLAMP, TCLAMP);
+    if b.ax {
+        (sf, sd, sr) = (sa[0], sa[1], sa[2]);
+    }
     let taps = [cl(wv), cl(wwv), cl(sf), cl(sd), cl(sr), cl(pv)];
     let mut acc = 0i32;
     for i in 0..NTAP {
@@ -831,6 +853,7 @@ pub(crate) fn for_lines(b: &BandInfo, lanes: usize, mut f: impl FnMut(usize, usi
         }
         return;
     }
+    let lanes = if b.nl > 0 { b.nl.min(lanes) } else { lanes };
     let (ez, ey) = (b.end[0] - b.start[0], b.end[1] - b.start[1]);
     for p in 0..b.npass {
         let (rz, sz, ry, sy) = pass_lattice(b.npass, ey > 1, p);
@@ -1418,7 +1441,9 @@ impl<'a> Enc<'a> {
         let mean = x.iter().map(|&v| v as f64).sum::<f64>() / n;
         let amax = x.iter().fold(0.0f64, |m, &v| m.max((v as f64).abs()));
         let dmax = x.iter().fold(0.0f64, |m, &v| m.max((v as f64 - mean).abs()));
-        let need = |v: f64, lim: f64| if v > 0.0 { (v / lim).log2().ceil() as i32 } else { -126 };
+        let need = |v: f64, lim: f64| {
+            if v > 0.0 { (v / lim).log2().ceil() as i32 } else { -126 }
+        };
         let e = need(amax, (1u32 << 23) as f64).max(need(dmax, (1u32 << 20) as f64)).clamp(-126, 100);
         let sc = 2f64.powi(-e);
         let mean_fix = (mean * sc).round() as i32;
@@ -2005,6 +2030,8 @@ mod tests {
                 w: 1.0,
                 org: [2, 3, 0],
                 raster: false,
+                ax: false,
+                nl: 0,
             };
             let mut got = Vec::new();
             for_lines(&b, 3, |p, l, z, y| got.push((p, l, z, y)));
