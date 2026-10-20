@@ -7,6 +7,9 @@
 //! For frog's scheduler it also serves `GET /node` (hardware, free memory, model, measured
 //! rates, queue, KV blocks), `POST /models/load` / `/models/unload` (swap the model, only into
 //! free memory) and takes `x-frog-priority: interactive | background` (see `docs/node.md`).
+//! `--kv-ttl <secs>` (or `TANG_KV_TTL`) drops everything derived from prompts (KV caches in
+//! memory and on disk, saved states, the draft store) once unused that long (default: off;
+//! see `docs/retention.md`).
 //! `--kv-slots N` keeps N conversations' KV caches (default 1); a request's `prompt_cache_key`
 //! picks its conversation's cache. Caches grow with their conversations. `--kv-slots auto`
 //! keeps up to 8 within half of RAM where the GPU shares it (Metal, CPU), dropping the least
@@ -450,13 +453,32 @@ fn serve_flash(args: &[String]) -> Result<()> {
 }
 
 fn serve(backend: Backend, args: &[String]) -> Result<()> {
+    // `--kv-ttl <secs>` (or TANG_KV_TTL): how long prompt-derived state outlives its last use,
+    // for every backend (see `docs/retention.md`).
+    let mut ttl = tang_llm::retention::parse(&std::env::var("TANG_KV_TTL").unwrap_or_default())?;
+    let mut rest = Vec::with_capacity(args.len());
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--kv-ttl" => ttl = tang_llm::retention::parse(it.next().context("--kv-ttl <secs>")?)?,
+            _ => rest.push(a.clone()),
+        }
+    }
+    let args = &rest[..];
+    tang_llm::retention::set_ttl(ttl);
+    if let Some(t) = ttl {
+        eprintln!(
+            "tang-llm: prompt-derived state (KV caches, saved states, drafts) dropped {} s after last use",
+            t.as_secs()
+        );
+    }
     #[cfg(feature = "cuda")]
     if args.first().is_some_and(|a| a.ends_with(".gguf")) {
         return serve_flash(args);
     }
     let spec = args
         .first()
-        .context("usage: tang-llm serve <model> [--host H] [--port P] [--ctx N] [--api-key-file F] [--f32 | --q4] [--no-speculate] [--draft-model M] [--kv-slots N|auto]")?
+        .context("usage: tang-llm serve <model> [--host H] [--port P] [--ctx N] [--api-key-file F] [--f32 | --q4] [--no-speculate] [--draft-model M] [--kv-slots N|auto] [--kv-ttl SECS]")?
         .clone();
     let (mut port, mut ctx, mut dtype) = (8911u16, 32_768usize, Dtype::Bf16);
     let mut host = "127.0.0.1".to_string();

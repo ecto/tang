@@ -14,5 +14,9 @@ include = ["src/**/*", "README.md", "examples/**/*"]
 [dependencies]
 tang = { workspace = true, features = ["std"] }
 
+[dev-dependencies]
+# validates the integer dialect's WGSL (same naga as the workspace wgpu)
+naga = { version = "25", features = ["wgsl-in"] }
+
 [[example]]
 name = "symbolic_regression"

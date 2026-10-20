@@ -11,6 +11,9 @@
 //! directory passes its budget (files from the older per-conversation format, `.kv` and
 //! `.json`, are only ever trimmed).
 //!
+//! With a TTL (see [`crate::retention`]), a file unused that long is deleted: skipped and
+//! removed when looked up, and swept by [`Store::expire`].
+//!
 //! [`Writer`] does the writing on its own thread, so a turn never waits on the disk.
 
 use anyhow::{bail, Context, Result};
@@ -29,6 +32,8 @@ pub struct Store {
     budget: u64,
     /// bf16 elements per position.
     row: usize,
+    /// Files unused this long are deleted.
+    ttl: Option<std::time::Duration>,
 }
 
 /// FNV-1a: stable across builds, unlike std's hasher.
@@ -81,14 +86,35 @@ fn write_whole(path: &Path, bytes: &[u8]) -> Result<()> {
     f.write_all(bytes)?;
     drop(f);
     fs::rename(&tmp, path)?;
+    touch(path);
     Ok(())
 }
 
-/// Mark `path` as just used (the budget drops the least recently used first).
-fn touch(path: &Path) {
-    if let Ok(f) = fs::File::options().append(true).open(path) {
-        let _ = f.set_modified(std::time::SystemTime::now());
+use crate::retention::{stale_file as stale, touch};
+
+/// Every file the store keeps (blocks, tails, and the older format's).
+fn files(dir: &Path) -> Vec<PathBuf> {
+    let list = |d: &Path| -> Vec<PathBuf> {
+        fs::read_dir(d)
+            .map(|r| r.filter_map(|e| e.ok().map(|e| e.path())).collect())
+            .unwrap_or_default()
+    };
+    list(dir)
+        .into_iter()
+        .chain(list(&dir.join("blocks")))
+        .filter(|p| {
+            p.extension()
+                .is_some_and(|x| x == "kvb" || x == "tail" || x == "kv")
+        })
+        .collect()
+}
+
+/// Delete the file at `path` (and an old-format `.kv`'s `.json`).
+fn remove(path: &Path) {
+    if path.extension().is_some_and(|x| x == "kv") {
+        let _ = fs::remove_file(path.with_extension("json"));
     }
+    let _ = fs::remove_file(path);
 }
 
 impl Store {
@@ -97,20 +123,56 @@ impl Store {
     pub fn new(dir: PathBuf, budget: u64, row: usize) -> Result<Self> {
         fs::create_dir_all(dir.join("blocks"))
             .with_context(|| format!("creating {}", dir.display()))?;
-        Ok(Self { dir, budget, row })
+        Ok(Self {
+            dir,
+            budget,
+            row,
+            ttl: crate::retention::ttl(),
+        })
+    }
+
+    pub fn set_ttl(&mut self, ttl: Option<std::time::Duration>) {
+        self.ttl = ttl;
+    }
+
+    /// Delete files unused for the TTL. Returns how many went.
+    pub fn expire(&self) -> usize {
+        if self.ttl.is_none() {
+            return 0;
+        }
+        files(&self.dir)
+            .into_iter()
+            .filter(|p| stale(p, self.ttl))
+            .inspect(|p| remove(p))
+            .count()
+    }
+
+    /// Whether `path` is past the TTL; if so it's deleted.
+    fn expired(&self, path: &Path) -> bool {
+        let gone = stale(path, self.ttl);
+        if gone {
+            remove(path);
+        }
+        gone
     }
 
     pub fn dir(&self) -> &Path {
         &self.dir
     }
 
-    /// The ids of the blocks on disk (from their file names).
+    /// The ids of the blocks on disk (from their file names), leaving out those past the
+    /// process's TTL.
     pub fn block_hashes(dir: &Path) -> Vec<u64> {
         let Ok(rd) = fs::read_dir(dir.join("blocks")) else {
             return Vec::new();
         };
+        let ttl = crate::retention::ttl();
         rd.filter_map(|e| {
-            let name = e.ok()?.file_name();
+            let e = e.ok()?;
+            if stale(&e.path(), ttl) {
+                return None;
+            }
+            let name = e.file_name();
             let hex = name.to_str()?.strip_suffix(".kvb")?;
             u64::from_str_radix(hex, 16).ok()
         })
@@ -127,12 +189,16 @@ impl Store {
 
     /// Whether block `hash` is on disk.
     pub fn has_block(&self, hash: u64) -> bool {
-        self.block_path(hash).exists()
+        let path = self.block_path(hash);
+        path.exists() && !self.expired(&path)
     }
 
     /// Block `hash`'s rows, if it's on disk and holds `tokens`.
     pub fn read_block(&self, hash: u64, tokens: &[u32]) -> Result<Option<Vec<u16>>> {
         let path = self.block_path(hash);
+        if self.expired(&path) {
+            return Ok(None);
+        }
         let Ok(bytes) = fs::read(&path) else {
             return Ok(None);
         };
@@ -153,7 +219,7 @@ impl Store {
     pub fn write_block(&self, hash: u64, tokens: &[u32], rows: &[u16]) -> Result<()> {
         debug_assert_eq!(rows.len(), tokens.len() * self.row);
         let path = self.block_path(hash);
-        if path.exists() {
+        if path.exists() && !self.expired(&path) {
             touch(&path);
             return Ok(());
         }
@@ -173,7 +239,11 @@ impl Store {
     /// `key`'s tail: the conversation's tokens, and where the tail's rows start (a block
     /// boundary).
     pub fn tail(&self, key: &str) -> Option<(Vec<u32>, usize)> {
-        let mut f = fs::File::open(self.tail_path(key)).ok()?;
+        let path = self.tail_path(key);
+        if self.expired(&path) {
+            return None;
+        }
+        let mut f = fs::File::open(path).ok()?;
         let mut head = vec![0u8; 16 + key.len() + 8];
         f.read_exact(&mut head).ok()?;
         let mut b = Bytes(&head);
@@ -232,18 +302,8 @@ impl Store {
 
     /// Drop the least recently used files past the budget, never `keep`.
     fn trim(&self, keep: &Path) {
-        let list = |d: &Path| -> Vec<PathBuf> {
-            fs::read_dir(d)
-                .map(|r| r.filter_map(|e| e.ok().map(|e| e.path())).collect())
-                .unwrap_or_default()
-        };
-        let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = list(&self.dir)
+        let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = files(&self.dir)
             .into_iter()
-            .chain(list(&self.dir.join("blocks")))
-            .filter(|p| {
-                p.extension()
-                    .is_some_and(|x| x == "kvb" || x == "tail" || x == "kv")
-            })
             .filter_map(|p| {
                 let m = fs::metadata(&p).ok()?;
                 Some((m.modified().ok()?, m.len(), p))
@@ -258,10 +318,7 @@ impl Store {
             if p == keep {
                 continue;
             }
-            if p.extension().is_some_and(|x| x == "kv") {
-                let _ = fs::remove_file(p.with_extension("json"));
-            }
-            let _ = fs::remove_file(&p);
+            remove(&p);
             total -= len;
         }
     }
@@ -280,6 +337,8 @@ enum Job {
         start: usize,
         rows: Vec<u16>,
     },
+    /// Delete files past the TTL.
+    Expire,
     /// Answer once every earlier write is done.
     Flush(std::sync::mpsc::SyncSender<()>),
 }
@@ -305,6 +364,10 @@ impl Writer {
                         start,
                         rows,
                     } => s.write_tail(&key, &tokens, start, &rows),
+                    Job::Expire => {
+                        s.expire();
+                        Ok(())
+                    }
                     Job::Flush(done) => {
                         let _ = done.send(());
                         Ok(())
@@ -337,6 +400,11 @@ impl Writer {
             start,
             rows,
         });
+    }
+
+    /// [`Store::expire`], in the background (after writes already sent).
+    pub fn expire(&self) {
+        let _ = self.jobs.send(Job::Expire);
     }
 
     /// Wait for writes already sent.
@@ -398,6 +466,41 @@ mod tests {
         assert_eq!(w.store().tail("a"), Some((vec![1, 3], 1)));
         assert_eq!(w.store().read_tail("a", 1).unwrap(), vec![5, 6]);
         assert!(w.store().has_block(3));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn files_past_the_ttl_are_deleted_and_a_hit_refreshes_them() {
+        use crate::retention::advance;
+        use std::time::Duration;
+        let (mut s, dir) = store(1 << 20, "ttl");
+        s.set_ttl(Some(Duration::from_secs(60)));
+        s.write_block(1, &[1, 2], &[0; 4]).unwrap();
+        s.write_block(2, &[1, 2], &[0; 4]).unwrap();
+        s.write_tail("a", &[1, 2, 3], 2, &[5, 6]).unwrap();
+        let block = |h: u64| dir.join("blocks").join(format!("{h:016x}.kvb"));
+        // Reused before the TTL: block 1 and the tail are read, refreshing them.
+        advance(Duration::from_secs(50));
+        assert!(s.read_block(1, &[1, 2]).unwrap().is_some());
+        assert_eq!(s.read_tail("a", 1).unwrap(), vec![5, 6]);
+        advance(Duration::from_secs(20));
+        // Block 2 is past it: skipped and its file deleted when looked up.
+        assert!(block(2).exists());
+        assert!(!s.has_block(2));
+        assert!(!block(2).exists());
+        // The others are swept once they're past it too.
+        assert_eq!(s.expire(), 0);
+        assert!(s.tail("a").is_some());
+        advance(Duration::from_secs(61));
+        assert_eq!(s.expire(), 2);
+        assert!(!block(1).exists());
+        assert!(s.tail("a").is_none());
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("blocks")]);
         let _ = std::fs::remove_dir_all(dir);
     }
 
