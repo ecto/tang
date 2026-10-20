@@ -19,6 +19,8 @@ const BASE: u32 = 0xF0000;
 pub struct Shield {
     /// Added tokens' text, longest first (so the longest match wins).
     markers: Vec<String>,
+    /// Every marker's first character, so most of the text skips the marker scan.
+    firsts: HashSet<char>,
     ids: HashSet<u32>,
 }
 
@@ -33,8 +35,10 @@ impl Shield {
         markers.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
         markers.dedup();
         markers.truncate(0xFFFD);
+        let firsts = markers.iter().filter_map(|m| m.chars().next()).collect();
         Self {
             markers,
+            firsts,
             ids: added.keys().copied().collect(),
         }
     }
@@ -46,6 +50,11 @@ impl Shield {
 
     /// The added token whose text starts `s`, longest first.
     fn marker_at(&self, s: &str) -> Option<usize> {
+        // Tokenizers can carry thousands of added tokens (Gemma's unused ones); checking each
+        // at every character would make long prompts slow to build.
+        if !s.chars().next().is_some_and(|c| self.firsts.contains(&c)) {
+            return None;
+        }
         self.markers.iter().position(|m| s.starts_with(m.as_str()))
     }
 
