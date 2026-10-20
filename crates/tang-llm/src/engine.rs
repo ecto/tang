@@ -80,6 +80,22 @@ pub struct Usage {
     /// Speculative decoding: draft tokens verified, and how many of them were kept.
     pub draft_tokens: usize,
     pub accepted_tokens: usize,
+    /// Prefill chunks this run fed, decode forwards (verify windows) it took, and summed over
+    /// those forwards how many other streams shared each one.
+    pub prefill_chunks: usize,
+    pub decode_steps: usize,
+    pub shared_streams: usize,
+}
+
+/// What the last [`Engine::step`] ran: its forward's decode rows and streams, prefill tokens
+/// and chunks, and seconds (all zero when it ran no forward).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StepStats {
+    pub decode_rows: usize,
+    pub decode_streams: usize,
+    pub prefill_tokens: usize,
+    pub prefill_chunks: usize,
+    pub secs: f64,
 }
 
 /// How a run went: finished, or stopped part way through its prefill because its
@@ -224,6 +240,8 @@ pub struct Engine<D: ComputeDevice> {
     last: (Vec<u32>, Vec<u32>),
     /// Decode forwards so far by width: (count, seconds).
     pub forwards: Vec<(usize, f64)>,
+    /// The last [`step`](Self::step)'s shape and time.
+    pub last_step: StepStats,
     /// Streams admitted and not yet retired, and the conversations they run in.
     out: usize,
     running: Vec<String>,
@@ -278,6 +296,10 @@ pub struct Stream<B> {
     accepted: usize,
     /// Its solo decode forwards by width: (width, seconds).
     timed: Vec<(usize, f64)>,
+    /// Prefill chunks fed, decode forwards, and other streams sharing those forwards.
+    chunks: usize,
+    verifies: usize,
+    shared: usize,
     /// What the next forward feeds: new tokens, then (decoding) the draft.
     fed: Vec<u32>,
     /// Of `fed`, the new tokens (the rest is draft).
@@ -489,6 +511,7 @@ impl<D: ComputeDevice> Engine<D> {
             drafter: None,
             last: (Vec::new(), Vec::new()),
             forwards: vec![(0, 0.0); 65],
+            last_step: StepStats::default(),
             out: 0,
             running: Vec::new(),
             max_batch: usize::MAX,
@@ -1180,6 +1203,9 @@ impl<D: ComputeDevice> Engine<D> {
             drafted: 0,
             accepted: 0,
             timed: Vec::new(),
+            chunks: 0,
+            verifies: 0,
+            shared: 0,
             fed: Vec::new(),
             fed_new: 0,
             ids,
@@ -1220,6 +1246,7 @@ impl<D: ComputeDevice> Engine<D> {
     /// [`retire`](Self::retire). An error here is the forward's, and every stream in it is
     /// lost (retire them all).
     pub fn step(&mut self, lanes: &mut [Lane<'_, D::Buffer>]) -> Result<()> {
+        self.last_step = StepStats::default();
         // Each stream's segment, if it has one this step: (tokens fed, all rows).
         let mut segs: Vec<Option<bool>> = Vec::with_capacity(lanes.len());
         let mut decode_rows = 0;
@@ -1319,12 +1346,21 @@ impl<D: ComputeDevice> Engine<D> {
         let secs = tf.elapsed().as_secs_f64();
         self.step_cost.observe(&shape, secs);
         drop(parts);
+        let others = idx.len() - 1;
+        let mut stats = StepStats {
+            decode_rows,
+            secs,
+            ..StepStats::default()
+        };
         let vocab = self.model.cfg.vocab_size;
         for (i, rows) in idx.into_iter().zip(logits) {
             let lane = &mut lanes[i];
             let st = &mut *lane.stream;
             match st.phase {
                 Phase::Prefill => {
+                    st.chunks += 1;
+                    stats.prefill_chunks += 1;
+                    stats.prefill_tokens += st.fed.len();
                     st.progress.prefilled += st.fed.len();
                     lane.ctl.progress(st.progress);
                     if st.reuse + st.progress.prefilled == st.ids.len() {
@@ -1333,6 +1369,9 @@ impl<D: ComputeDevice> Engine<D> {
                 }
                 Phase::Decode => {
                     let (m, k) = (st.fed_new, st.fed.len() - st.fed_new);
+                    st.verifies += 1;
+                    st.shared += others;
+                    stats.decode_streams += 1;
                     if m == 1 && solo {
                         st.timed.push((1 + k, secs));
                     }
@@ -1347,6 +1386,8 @@ impl<D: ComputeDevice> Engine<D> {
                 _ => {}
             }
         }
+        self.last_step = stats;
+        crate::telemetry::step(&stats);
         Ok(())
     }
 
@@ -1576,6 +1617,9 @@ impl<D: ComputeDevice> Engine<D> {
             },
             draft_tokens: st.drafted,
             accepted_tokens: st.accepted,
+            prefill_chunks: st.chunks,
+            decode_steps: st.verifies,
+            shared_streams: st.shared,
         };
         self.last = (st.ids, st.out);
         Ok(Outcome::Done(st.finish, usage))
