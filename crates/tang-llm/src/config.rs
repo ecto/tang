@@ -54,6 +54,24 @@ pub struct Config {
     pub image_token: Option<u32>,
     #[serde(skip)]
     pub mm_tokens_per_image: usize,
+
+    // gpt-oss (and other MoE checkpoints on the dense path).
+    /// Per layer: `"sliding_attention"` or `"full_attention"` (overrides the Gemma pattern).
+    #[serde(default)]
+    pub layer_types: Option<Vec<String>>,
+    /// Biases on the Q/K/V and output projections.
+    #[serde(default)]
+    pub attention_bias: bool,
+    /// Routed experts per MoE layer (`num_local_experts`, or `num_experts` in Qwen3 MoE).
+    #[serde(default, alias = "num_experts")]
+    pub num_local_experts: Option<usize>,
+    #[serde(default)]
+    pub num_experts_per_tok: Option<usize>,
+    /// gpt-oss's clamped SwiGLU: gate clamped above, up to ±limit; `σ(alpha · gate)`.
+    #[serde(default)]
+    pub swiglu_limit: Option<f32>,
+    #[serde(default)]
+    pub swiglu_alpha: Option<f32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -62,6 +80,17 @@ pub struct RopeScaling {
     pub factor: f32,
     #[serde(default)]
     pub rope_type: Option<String>,
+    // YaRN (`rope_type: "yarn"`), with transformers' defaults.
+    #[serde(default)]
+    pub beta_fast: Option<f32>,
+    #[serde(default)]
+    pub beta_slow: Option<f32>,
+    #[serde(default)]
+    pub original_max_position_embeddings: Option<usize>,
+    #[serde(default)]
+    pub attention_factor: Option<f32>,
+    #[serde(default)]
+    pub truncate: Option<bool>,
 }
 
 fn one() -> f32 {
@@ -112,7 +141,26 @@ impl Config {
     /// Parse `config.json`. Gemma 3 multimodal checkpoints keep the language model in
     /// `text_config`, with transformers' Gemma3TextConfig defaults for what's left out.
     pub fn from_json(bytes: &[u8]) -> anyhow::Result<Self> {
-        let top: serde_json::Value = serde_json::from_slice(bytes)?;
+        let mut top: serde_json::Value = serde_json::from_slice(bytes)?;
+        // transformers 5 writes `rope_parameters` (theta inside) for `rope_theta`/`rope_scaling`.
+        if let Some(rp) = top
+            .get("rope_parameters")
+            .filter(|r| r.is_object())
+            .cloned()
+        {
+            if top.get("rope_theta").is_none() {
+                if let Some(t) = rp.get("rope_theta") {
+                    top["rope_theta"] = t.clone();
+                }
+            }
+            let kind = rp
+                .get("rope_type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("default");
+            if top.get("rope_scaling").is_none_or(|r| r.is_null()) && kind != "default" {
+                top["rope_scaling"] = rp;
+            }
+        }
         let Some(text) = top.get("text_config").filter(|t| t.is_object()) else {
             return Ok(serde_json::from_value(top)?);
         };
@@ -179,10 +227,20 @@ impl Config {
 
     /// Sliding window for layer `l` (0 = global attention).
     pub fn window(&self, l: usize) -> usize {
+        if let Some(types) = &self.layer_types {
+            return match (types.get(l).map(String::as_str), self.sliding_window) {
+                (Some("sliding_attention"), Some(w)) => w,
+                _ => 0,
+            };
+        }
         match (self.sliding_window, self.sliding_window_pattern) {
             (Some(w), Some(p)) if p > 1 && !(l + 1).is_multiple_of(p) => w,
             _ => 0,
         }
+    }
+
+    pub fn is_gpt_oss(&self) -> bool {
+        self.model_type == "gpt_oss"
     }
 
     pub fn head_dim(&self) -> usize {

@@ -1879,6 +1879,131 @@ pub trait ComputeDevice: Send + 'static {
         self.gdn_step(state, &h, proj, stride, p, y, yq, t, mode, eps);
     }
 
+    /// Dense-path MoE routing ([`crate::moe::route`]): `(ids, weights)`, each `[rows, k]`
+    /// (ids as u32), from router logits `[rows, experts]`.
+    fn moe_route(
+        &self,
+        logits: &Self::Buffer,
+        rows: usize,
+        experts: usize,
+        k: usize,
+        router: crate::moe::Router,
+    ) -> (Self::Buffer, Self::Buffer) {
+        let (ids, w) = crate::moe::route(&self.download(logits), rows, experts, k, router);
+        (self.upload_u32(&ids), self.upload(&w))
+    }
+
+    /// Each row's picked experts applied to it ([`crate::moe::moe_linear`]): `w` is a stack of
+    /// `experts` matrices `[n, k]` in `fmt`, `bias` `[experts, n]`, `ids` `[rows, k_top]` from
+    /// [`moe_route`](Self::moe_route). `x` is `[rows, k]`, or with `per_pick`
+    /// `[rows * k_top, k]`; returns `[rows * k_top, n]`.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_linear(
+        &self,
+        x: &Self::Buffer,
+        w: &Self::Buffer,
+        fmt: crate::moe::ExpertFmt,
+        experts: usize,
+        bias: Option<&Self::Buffer>,
+        ids: &Self::Buffer,
+        k_top: usize,
+        k: usize,
+        n: usize,
+        per_pick: bool,
+    ) -> Self::Buffer {
+        use crate::moe::{ExpertFmt, ExpertWeights};
+        let (x, ids) = (self.download(x), crate::flash::u32s(&self.download(ids)));
+        let bias = bias.map(|b| self.download(b));
+        let wv = self.download(w);
+        let bytes: Vec<u8>;
+        let weights = match fmt {
+            ExpertFmt::F32 | ExpertFmt::Bf16 => ExpertWeights::F32(&wv),
+            ExpertFmt::Mxfp4 => {
+                bytes = wv.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+                ExpertWeights::Mxfp4(&bytes)
+            }
+        };
+        let y = crate::moe::moe_linear(
+            &x,
+            weights,
+            experts,
+            bias.as_deref(),
+            &ids,
+            k_top,
+            k,
+            n,
+            per_pick,
+        );
+        self.upload(&y)
+    }
+
+    /// gpt-oss's clamped SwiGLU ([`crate::moe::swiglu_clamped`]) over `gu` `[rows, 2 * ff]`
+    /// (gate then up); returns `[rows, ff]`.
+    fn swiglu_clamped(
+        &self,
+        gu: &Self::Buffer,
+        rows: usize,
+        ff: usize,
+        alpha: f32,
+        limit: f32,
+    ) -> Self::Buffer {
+        let y = crate::moe::swiglu_clamped(&self.download(gu), rows, ff, alpha, limit);
+        self.upload(&y)
+    }
+
+    /// The weighted sum of each row's expert outputs ([`crate::moe::moe_combine`]): `parts`
+    /// `[rows * k_top, h]`, `w` `[rows, k_top]`; returns `[rows, h]`.
+    fn moe_combine(
+        &self,
+        parts: &Self::Buffer,
+        w: &Self::Buffer,
+        rows: usize,
+        k_top: usize,
+        h: usize,
+    ) -> Self::Buffer {
+        let y = crate::moe::moe_combine(&self.download(parts), &self.download(w), rows, k_top, h);
+        self.upload(&y)
+    }
+
+    /// [`kv_attention_paged`](Self::kv_attention_paged) with attention sinks: one more logit
+    /// per head, `sinks[h]`, with a zero value ([`crate::moe::attention_sinks`], gpt-oss). The
+    /// default gathers the keys and runs the reference on the host.
+    #[allow(clippy::too_many_arguments)]
+    fn kv_attention_paged_sinks(
+        &self,
+        q: &Self::Buffer,
+        k_pool: &Self::Buffer,
+        v_pool: &Self::Buffer,
+        pages: &Pages<Self::Buffer>,
+        cache_start: usize,
+        q_len: usize,
+        shape: (usize, usize, usize),
+        window: usize,
+        causal: bool,
+        sinks: &Self::Buffer,
+    ) -> Self::Buffer {
+        let kvd = shape.1 * shape.2;
+        let total = cache_start + q_len;
+        let (kp, vp) = (self.download(k_pool), self.download(v_pool));
+        let (mut k, mut v) = (vec![0f32; total * kvd], vec![0f32; total * kvd]);
+        for (from, row, n) in pages.runs(0, total) {
+            k[from * kvd..][..n * kvd].copy_from_slice(&kp[row * kvd..][..n * kvd]);
+            v[from * kvd..][..n * kvd].copy_from_slice(&vp[row * kvd..][..n * kvd]);
+        }
+        let o = crate::moe::attention_sinks(
+            &self.download(q),
+            &k,
+            &v,
+            cache_start,
+            q_len,
+            shape,
+            window,
+            causal,
+            Some(&self.download(sinks)),
+        );
+        self.upload(&o)
+    }
+
     /// MoE router for a window: `logits [t][stride]` (experts in columns `0..n_expert`); writes
     /// `ids [t][TOPK]` (u32): the top `TOPK` by (logit desc, index asc); and `w [t][TOPK]`:
     /// `e_k / Σ_top e_j`, `e_k = exp(l_k − l_max)` in f64 summed in rank order, which is the

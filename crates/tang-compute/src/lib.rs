@@ -12,6 +12,7 @@ pub mod flash;
 pub mod flash_native;
 pub mod kernels;
 pub mod modules;
+pub mod moe;
 pub mod ops;
 pub mod tensor;
 
