@@ -27,6 +27,7 @@ members = [
     "crates/tang-moe",
     "crates/tang-llm-ios",
     "crates/tang-compress",
+    "crates/tang-compress-wasm",
 ]
 
 [workspace.package]

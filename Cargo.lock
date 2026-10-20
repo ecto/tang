@@ -6057,6 +6057,18 @@ dependencies = [
  "tang-expr",
  "tang-la",
  "tang-optim",
+ "web-time",
+ "wgpu",
+]
+
+[[package]]
+name = "tang-compress-wasm"
+version = "0.1.0"
+dependencies = [
+ "js-sys",
+ "tang-compress",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
  "wgpu",
 ]
 

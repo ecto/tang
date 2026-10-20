@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tang-compress WebGPU decode</title>
+<style>
+  :root { --bg: #fff; --fg: #111; --muted: #666; --ok: #0a7d2c; --bad: #c0262d; --line: #ddd; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #111; --fg: #eee; --muted: #999; --ok: #4ade80; --bad: #f87171; --line: #333; } }
+  body { background: var(--bg); color: var(--fg); font: 14px/1.4 ui-monospace, Menlo, monospace; margin: 16px; }
+  h1 { font-size: 16px; } .muted { color: var(--muted); }
+  canvas { image-rendering: pixelated; border: 1px solid var(--line); max-width: 100%; }
+  table { border-collapse: collapse; margin-top: 8px; } td, th { padding: 2px 8px; border-bottom: 1px solid var(--line); text-align: right; }
+  td:first-child, th:first-child { text-align: left; } .ok { color: var(--ok); } .bad { color: var(--bad); }
+  button, select, input { font: inherit; }
+</style>
+</head>
+<body>
+<h1>tang-compress — TCG1 / TCG3 decode on WebGPU</h1>
+<p id="status" class="muted">loading…</p>
+<p>
+  <select id="pick"></select> <button id="show">decode + show</button>
+  <label>or a file <input type="file" id="file" accept=".tc,.tcg1,.tcg3"></label>
+  <button id="gate">run gate (all streams)</button>
+</p>
+<p>slice z <input type="range" id="z" min="0" max="0" value="0"> <span id="zv"></span></p>
+<canvas id="cv" width="16" height="16"></canvas>
+<pre id="info"></pre>
+<div id="out"></div>
+<script type="module">
+import init, { TcGpu, decodeCpu, fnv1a, registerModel, streamInfo } from "./pkg/tang_compress_wasm.js";
+
+const $ = (id) => document.getElementById(id);
+const status = (s) => ($("status").textContent = s);
+let gpu = null, manifest = [], cur = null;
+
+async function bytesOf(url) { return new Uint8Array(await (await fetch(url)).arrayBuffer()); }
+
+function draw() {
+  if (!cur) return;
+  const d = cur.dims.length === 2 ? [1, ...cur.dims] : cur.dims;
+  const z = Math.min(+$("z").value, d[0] - 1);
+  $("z").max = d[0] - 1; $("zv").textContent = `${z}/${d[0] - 1}`;
+  const [h, w] = [d[1], d[2]], off = z * h * w, v = cur.data.subarray(off, off + h * w);
+  let lo = Infinity, hi = -Infinity;
+  for (const x of v) { if (x < lo) lo = x; if (x > hi) hi = x; }
+  const cv = $("cv"); cv.width = w; cv.height = h;
+  cv.style.width = Math.min(768, w * Math.max(1, Math.floor(512 / w))) + "px";
+  const ctx = cv.getContext("2d"), img = ctx.createImageData(w, h);
+  for (let i = 0; i < h * w; i++) {
+    const t = hi > lo ? (v[i] - lo) / (hi - lo) : 0.5;
+    // viridis-ish ramp
+    img.data[4 * i] = 255 * Math.min(1, Math.max(0, 1.6 * t - 0.4));
+    img.data[4 * i + 1] = 255 * Math.min(1, 0.15 + 0.85 * t);
+    img.data[4 * i + 2] = 255 * Math.min(1, Math.max(0, 0.55 + 0.6 * t - 1.1 * t * t));
+    img.data[4 * i + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+}
+
+async function show(bytes, label) {
+  const info = JSON.parse(streamInfo(bytes));
+  const t0 = performance.now();
+  const data = gpu ? await gpu.decode(bytes) : decodeCpu(bytes);
+  const ms = performance.now() - t0;
+  cur = { dims: info.dims, data };
+  $("info").textContent = `${label}\n${JSON.stringify(info)}\n${gpu ? "WebGPU" : "CPU (WASM)"} decode ${ms.toFixed(1)} ms` +
+    (gpu ? `  ${gpu.lastTimes()}` : "") + `\nhash ${fnv1a(data)}`;
+  $("z").value = Math.floor((info.dims.length === 3 ? info.dims[0] : 1) / 2);
+  draw();
+}
+
+// Gate: every manifest stream decoded on WebGPU and on the WASM CPU path,
+// FNV-1a of the f32 bits compared with the native CPU decode's hash.
+async function gate() {
+  const q = new URLSearchParams(location.search), reps = +(q.get("reps") || 3), post = q.has("post");
+  const rows = [], t00 = performance.now();
+  for (const [i, m] of manifest.entries()) {
+    status(`gate ${i + 1}/${manifest.length}: ${m.file}`);
+    if (post) fetch("/progress", { method: "POST", body: `${i + 1}/${manifest.length} ${m.file}` });
+    const b = await bytesOf("corpus/" + m.file);
+    await gpu.warm(b);
+    const first = await gpu.decode(b);
+    const gpuHash = fnv1a(first);
+    let best = Infinity, kern = Infinity;
+    for (let r = 0; r < reps; r++) {
+      const t0 = performance.now();
+      await gpu.decode(b);
+      best = Math.min(best, (performance.now() - t0) / 1e3);
+      kern = Math.min(kern, JSON.parse(gpu.lastTimes()).kernels_s);
+    }
+    const t1 = performance.now();
+    const cpu = decodeCpu(b);
+    const cpuS = (performance.now() - t1) / 1e3;
+    const cpuHash = fnv1a(cpu);
+    rows.push({ ...m, gpu_hash: gpuHash, cpu_hash: cpuHash, gpu_ok: gpuHash === m.hash, cpu_ok: cpuHash === m.hash,
+      web_gpu_s: best, web_gpu_kernels_s: kern, web_cpu1_s: cpuS });
+  }
+  const ok = rows.filter((r) => r.gpu_ok && r.cpu_ok).length;
+  const gb = (r) => (r.cells * 4) / 1e9;
+  const geo = (f) => Math.exp(rows.reduce((a, r) => a + Math.log(f(r)), 0) / rows.length);
+  const summary = { adapter: gpu.adapter(), streams: rows.length, identical: ok, wall_s: (performance.now() - t00) / 1e3 };
+  for (const fmt of ["tcg1", "tcg3s", "tcg3l"]) {
+    const rs = rows.filter((r) => r.format === fmt);
+    if (!rs.length) continue;
+    const sum = (k) => rs.reduce((a, r) => a + r[k], 0), cells = rs.reduce((a, r) => a + gb(r), 0);
+    summary[fmt] = {
+      n: rs.length, identical: rs.filter((r) => r.gpu_ok && r.cpu_ok).length,
+      web_gpu_gbs: cells / sum("web_gpu_s"), native_gpu_gbs: cells / sum("native_gpu_s"),
+      web_kernels_gbs: cells / sum("web_gpu_kernels_s"), native_kernels_gbs: cells / sum("native_gpu_kernels_s"),
+      web_cpu1_gbs: cells / sum("web_cpu1_s"), native_cpu1_gbs: cells / sum("native_cpu1_s"),
+    };
+  }
+  window.__gate = { summary, rows };
+  if (post) await fetch("/result", { method: "POST", body: JSON.stringify(window.__gate) });
+  status(`gate: ${ok}/${rows.length} byte-identical (GPU and CPU) — ${summary.wall_s.toFixed(1)} s`);
+  $("status").className = ok === rows.length ? "ok" : "bad";
+  const f = (x, d = 3) => x.toFixed(d);
+  $("out").innerHTML = `<pre>${JSON.stringify(summary, null, 1)}</pre><table><tr><th>stream</th><th>KB</th><th>gpu</th><th>cpu</th>` +
+    `<th>web GPU GB/s</th><th>native GPU GB/s</th><th>web CPU GB/s</th><th>native CPU GB/s</th></tr>` +
+    rows.map((r) => `<tr><td>${r.file}</td><td>${f(r.bytes / 1024, 1)}</td><td class="${r.gpu_ok ? "ok" : "bad"}">${r.gpu_ok ? "=" : "≠"}</td>` +
+      `<td class="${r.cpu_ok ? "ok" : "bad"}">${r.cpu_ok ? "=" : "≠"}</td><td>${f(gb(r) / r.web_gpu_s)}</td><td>${f(gb(r) / r.native_gpu_s)}</td>` +
+      `<td>${f(gb(r) / r.web_cpu1_s)}</td><td>${f(gb(r) / r.native_cpu1_s)}</td></tr>`).join("") + "</table>";
+  return window.__gate;
+}
+window.runGate = gate;
+
+await init();
+try { registerModel(await bytesOf("corpus/model.tcm")); } catch (e) { console.warn("no corpus/model.tcm:", e); }
+try { gpu = await TcGpu.create(); } catch (e) { console.warn("WebGPU unavailable, CPU fallback:", e); }
+try { manifest = await (await fetch("corpus/manifest.json")).json(); } catch { manifest = []; }
+for (const m of manifest) $("pick").add(new Option(`${m.file} (${(m.bytes / 1024).toFixed(1)} KB)`, m.file));
+status(gpu ? `WebGPU: ${gpu.adapter()} — ${manifest.length} corpus streams` : "no WebGPU — CPU (WASM) fallback");
+$("show").onclick = async () => show(await bytesOf("corpus/" + $("pick").value), $("pick").value);
+$("file").onchange = async (e) => { const f = e.target.files[0]; if (f) show(new Uint8Array(await f.arrayBuffer()), f.name); };
+$("gate").onclick = () => gate();
+$("z").oninput = draw;
+if (manifest.length && !location.search.includes("gate")) await show(await bytesOf("corpus/" + manifest[0].file), manifest[0].file);
+if (new URLSearchParams(location.search).has("gate")) {
+  if (!gpu) {
+    const err = { summary: { adapter: "none", streams: manifest.length, identical: 0, error: "no WebGPU" }, rows: [] };
+    if (new URLSearchParams(location.search).has("post")) fetch("/result", { method: "POST", body: JSON.stringify(err) });
+  } else gate();
+}
+</script>
+</body>
+</html>

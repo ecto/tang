@@ -14,7 +14,10 @@
 //! 5. `escapes` — raw `f32` overrides.
 
 use crate::gpuwav::{self, Parsed, ESC0, LOW0, MAG0, NKEY, NMODEL, NTAP, SGN0, SIG0};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 use wgpu::util::DeviceExt;
 
 const SHS: usize = 68;
@@ -92,11 +95,14 @@ fn shader_src(lanes: usize, maxl: usize) -> String {
 impl GpuDecoder {
     /// Open the default high-performance adapter and build the pipelines
     /// for `lanes` lanes per brick and lines up to `maxl` samples.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(lanes: usize, maxl: usize) -> Result<Self, String> {
         pollster::block_on(Self::new_async(lanes, maxl))
     }
 
-    async fn new_async(lanes: usize, maxl: usize) -> Result<Self, String> {
+    /// [`Self::new`] without blocking (the only constructor on wasm32 /
+    /// WebGPU, where the adapter and device arrive as promises).
+    pub async fn new_async(lanes: usize, maxl: usize) -> Result<Self, String> {
         let instance = wgpu::Instance::default();
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -776,6 +782,136 @@ fn gen_mlp(net: &crate::lmodel3::Net32) -> String {
     s
 }
 
+/// Async decode (WebGPU / wasm32, where nothing may block): the same
+/// kernels and bits as [`GpuDecoder::decode`] / [`GpuDecoder::decode3`],
+/// awaiting the queue and the buffer map instead of polling with `Wait`.
+impl GpuDecoder {
+    /// Wait until the kernels writing `pr.out` are done: copy one word of it
+    /// to a mappable buffer and await the map (wgpu 25's WebGPU backend has
+    /// no `on_submitted_work_done`; a map of a buffer the copy writes cannot
+    /// resolve before that copy, hence before the kernels).
+    async fn idle(&self, pr: &Prepared) {
+        let st = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fence"),
+            size: 4,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc.copy_buffer_to_buffer(&pr.out, 0, &st, 0, 4);
+        self.queue.submit([enc.finish()]);
+        let (tx, rx) = oneshot();
+        st.slice(..).map_async(wgpu::MapMode::Read, move |r| tx.send(r));
+        let _ = self.device.poll(wgpu::PollType::Wait);
+        rx.await.expect("map fence buffer");
+    }
+
+    /// Kernels of a prepared v1 stream, awaited; returns kernel wall seconds.
+    pub async fn run_async(&self, pr: &Prepared) -> f64 {
+        let t0 = Instant::now();
+        self.run(pr);
+        self.idle(pr).await;
+        t0.elapsed().as_secs_f64()
+    }
+
+    /// Kernels of a prepared v3 stream, awaited; returns kernel wall seconds.
+    pub async fn run3_async(&self, pr: &Prepared3) -> f64 {
+        let t0 = Instant::now();
+        self.run3(pr);
+        self.idle(&pr.base).await;
+        t0.elapsed().as_secs_f64()
+    }
+
+    /// [`Self::readback`] without blocking.
+    pub async fn readback_async(&self, pr: &Prepared) -> Vec<u32> {
+        let size = pr.ncells as u64 * 4;
+        let st = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("staging"),
+            size: size.max(4),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc.copy_buffer_to_buffer(&pr.out, 0, &st, 0, size);
+        self.queue.submit([enc.finish()]);
+        let slice = st.slice(..);
+        let (tx, rx) = oneshot();
+        slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r));
+        let _ = self.device.poll(wgpu::PollType::Wait);
+        rx.await.expect("map staging buffer");
+        let data = slice.get_mapped_range();
+        let mut v = vec![0u32; pr.ncells];
+        for (o, c) in v.iter_mut().zip(data.as_chunks::<4>().0) {
+            *o = u32::from_le_bytes(*c);
+        }
+        drop(data);
+        st.unmap();
+        v
+    }
+
+    /// [`Self::decode`] without blocking.
+    pub async fn decode_async(&self, bytes: &[u8]) -> Result<(Vec<u32>, GpuTimes), crate::bitio::DecodeError> {
+        let mut t = GpuTimes::default();
+        let t0 = Instant::now();
+        let ps = gpuwav::parse(bytes)?;
+        t.parse_s = t0.elapsed().as_secs_f64();
+        let pr = self.prepare(&ps, bytes, &mut t);
+        t.kernels_s = self.run_async(&pr).await;
+        let t1 = Instant::now();
+        let v = self.readback_async(&pr).await;
+        t.readback_s = t1.elapsed().as_secs_f64();
+        Ok((v, t))
+    }
+
+    /// [`Self::decode3`] without blocking.
+    pub async fn decode3_async(&self, bytes: &[u8]) -> Result<(Vec<u32>, GpuTimes), crate::bitio::DecodeError> {
+        let mut t = GpuTimes::default();
+        let t0 = Instant::now();
+        let ps = crate::gpuwav3::parse3(bytes)?;
+        t.parse_s = t0.elapsed().as_secs_f64();
+        let pr = self.prepare3(&ps, bytes, &mut t);
+        t.kernels_s = self.run3_async(&pr).await;
+        let t1 = Instant::now();
+        let v = self.readback_async(&pr.base).await;
+        t.readback_s = t1.elapsed().as_secs_f64();
+        Ok((v, t))
+    }
+}
+
+/// One-value channel whose receiver is a future (wgpu callbacks are `Send`
+/// on native, plain closures on the web; this works for both).
+struct OneTx<T>(std::sync::Arc<std::sync::Mutex<(Option<T>, Option<std::task::Waker>)>>);
+struct OneRx<T>(std::sync::Arc<std::sync::Mutex<(Option<T>, Option<std::task::Waker>)>>);
+
+fn oneshot<T>() -> (OneTx<T>, OneRx<T>) {
+    let s = std::sync::Arc::new(std::sync::Mutex::new((None, None)));
+    (OneTx(s.clone()), OneRx(s))
+}
+
+impl<T> OneTx<T> {
+    fn send(self, v: T) {
+        let mut g = self.0.lock().unwrap();
+        g.0 = Some(v);
+        if let Some(w) = g.1.take() {
+            w.wake();
+        }
+    }
+}
+
+impl<T> std::future::Future for OneRx<T> {
+    type Output = T;
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<T> {
+        let mut g = self.0.lock().unwrap();
+        match g.0.take() {
+            Some(v) => std::task::Poll::Ready(v),
+            None => {
+                g.1 = Some(cx.waker().clone());
+                std::task::Poll::Pending
+            }
+        }
+    }
+}
+
 /// A v3 stream uploaded to the GPU.
 pub struct Prepared3 {
     base: Prepared,
@@ -860,5 +996,10 @@ mod tests {
         let (bytes, _) = encode3_f32(&x2, &[70, 90], &Gpu3Config { block2d: 16, tile: 4, ..Gpu3Config::new(ErrorBound::MaxAbs(1e-4)) }, 1);
         let cpu = decode3_box(&bytes, [0; 3], [1, 70, 90], 1).unwrap().bits;
         assert_eq!(g.decode3(&bytes).unwrap().0, cpu);
+        // the async (WebGPU) path, driven by pollster here
+        assert_eq!(pollster::block_on(g.decode3_async(&bytes)).unwrap().0, cpu);
+        let (bytes, _) = encode_f32(&x2, &[70, 90], &GpuConfig { brick: 32, lanes: 8, ..GpuConfig::new(ErrorBound::Psnr(70.0)) });
+        let ps = parse(&bytes).unwrap();
+        assert_eq!(pollster::block_on(g.decode_async(&bytes)).unwrap().0, decode_box_parsed(&ps, &bytes, [0; 3], ps.d3, 1).unwrap());
     }
 }
