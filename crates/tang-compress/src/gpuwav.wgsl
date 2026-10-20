@@ -677,25 +677,7 @@ fn decode3(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let rawv = array<i32, 18>(wv, wwv, sf, sd, sr, pv, pred, i32(cap(wm)), i32(cap(wwm)), i32(af), i32(ad), i32(ar), i32(cap(pm)), i32(pnb), i32(nf), i32(nd), i32(nrr), i32(has_p));
                     r = learned_res(rawv, cls);
                 } else {
-                    if (sbit(SIG0u + sig)) {
-                        let k = max(e, 2u) - 2u;
-                        var h = 0u;
-                        let mbase = MAG0u + (cls * NE_u + e) * KB_u;
-                        loop {
-                            if (h >= KB_u) { break; }
-                            if (!sbit(mbase + h)) { break; }
-                            h = h + 1u;
-                        }
-                        var hv = h;
-                        if (h == KB_u) { hv = hv + dgamma_s(ESC0u + cls * 32u); }
-                        var lo = 0u;
-                        if (k >= 1u) { lo = select(0u, 1u, sbit(LOW0u + e * 4u)); }
-                        if (k >= 2u) { lo = (lo << 1u) | select(0u, 1u, sbit(LOW0u + e * 4u + 2u + (lo & 1u))); }
-                        if (k >= 3u) { lo = (lo << (k - 2u)) | draw_n(k - 2u); }
-                        let mv = ((hv << k) | lo) + 1u;
-                        let sctx = cls * 9u + sgn3(wm) * 3u + sgn3(sf + sd);
-                        if (sbit(SGN0u + sctx)) { r = -bitcast<i32>(mv); } else { r = bitcast<i32>(mv); }
-                    }
+                    r = res_static_gen(sig, e, cls, cls * 9u + sgn3(wm) * 3u + sgn3(sf + sd));
                 }
                 let qv = r + pred;
                 coef[rowb + x] = qv;
@@ -903,25 +885,7 @@ fn decode3l(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id)
                     let rawv = array<i32, 18>(wv, wwv, sf, sd, sr, pv, pred, i32(cap(wm)), i32(cap(wwm)), i32(af), i32(ad), i32(ar), i32(cap(pm)), i32(pnb), i32(nf), i32(nd), i32(nrr), i32(has_p));
                     r = learned_res(rawv, cls);
                 } else {
-                    if (sbit(SIG0u + sig)) {
-                        let k = max(e, 2u) - 2u;
-                        var h = 0u;
-                        let mbase = MAG0u + (cls * NE_u + e) * KB_u;
-                        loop {
-                            if (h >= KB_u) { break; }
-                            if (!sbit(mbase + h)) { break; }
-                            h = h + 1u;
-                        }
-                        var hv = h;
-                        if (h == KB_u) { hv = hv + dgamma_s(ESC0u + cls * 32u); }
-                        var lo = 0u;
-                        if (k >= 1u) { lo = select(0u, 1u, sbit(LOW0u + e * 4u)); }
-                        if (k >= 2u) { lo = (lo << 1u) | select(0u, 1u, sbit(LOW0u + e * 4u + 2u + (lo & 1u))); }
-                        if (k >= 3u) { lo = (lo << (k - 2u)) | draw_n(k - 2u); }
-                        let mv = ((hv << k) | lo) + 1u;
-                        let sctx = cls * 9u + sgn3(wm) * 3u + sgn3(sf + sd);
-                        if (sbit(SGN0u + sctx)) { r = -bitcast<i32>(mv); } else { r = bitcast<i32>(mv); }
-                    }
+                    r = res_static_gen(sig, e, cls, cls * 9u + sgn3(wm) * 3u + sgn3(sf + sd));
                 }
                 let qv = r + pred;
                 coef[rowb + x] = qv;
@@ -1020,8 +984,37 @@ fn learned_res(raw: array<i32, 18>, cls: u32) -> i32 {
     na[18u + min(cls, 9u)] = 256;
     for (var i = 0u; i < 28u; i = i + 1u) { na[i] = clamp(na[i], -16384, 16384); }
     mlp_gen();
-    mx_pi = sig16(na[0]) >> 1u;
-    mx_mu0 = na[1]; mx_mu1 = na[2]; mx_ls0 = na[3]; mx_ls1 = na[4];
+    return res_learned_gen(na[0], na[1], na[2], na[3], na[4]);
+}
+
+// RES_BEGIN (hand-written residual decoders; the host substitutes the
+// tang-expr-generated ones, or a stream's own)
+fn res_static_gen(sig: u32, e: u32, cls: u32, sctx: u32) -> i32 {
+    var r = 0;
+    if (sbit(SIG0u + sig)) {
+        let k = max(e, 2u) - 2u;
+        var h = 0u;
+        let mbase = MAG0u + (cls * NE_u + e) * KB_u;
+        loop {
+            if (h >= KB_u) { break; }
+            if (!sbit(mbase + h)) { break; }
+            h = h + 1u;
+        }
+        var hv = h;
+        if (h == KB_u) { hv = hv + dgamma_s(ESC0u + cls * 32u); }
+        var lo = 0u;
+        if (k >= 1u) { lo = select(0u, 1u, sbit(LOW0u + e * 4u)); }
+        if (k >= 2u) { lo = (lo << 1u) | select(0u, 1u, sbit(LOW0u + e * 4u + 2u + (lo & 1u))); }
+        if (k >= 3u) { lo = (lo << (k - 2u)) | draw_n(k - 2u); }
+        let mv = ((hv << k) | lo) + 1u;
+        if (sbit(SGN0u + sctx)) { r = -bitcast<i32>(mv); } else { r = bitcast<i32>(mv); }
+    }
+    return r;
+}
+
+fn res_learned_gen(o0: i32, o1: i32, o2: i32, o3: i32, o4: i32) -> i32 {
+    mx_pi = sig16(o0) >> 1u;
+    mx_mu0 = o1; mx_mu1 = o2; mx_ls0 = o3; mx_ls1 = o4;
     // binarization
     let c0 = lcdf(0);
     let cm1 = lcdf(-1);
@@ -1056,6 +1049,7 @@ fn learned_res(raw: array<i32, 18>, cls: u32) -> i32 {
     if (l_neg) { return -bitcast<i32>(lo); }
     return bitcast<i32>(lo);
 }
+// RES_END
 
 // MLP_BEGIN (generic version; the host substitutes a straight-line version
 // with the stream's weights as literals)

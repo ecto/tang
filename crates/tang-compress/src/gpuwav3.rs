@@ -158,6 +158,7 @@ fn code_block<S: Sink>(
     lanes: usize,
     net: Option<&Net32>,
     s: &mut S,
+    mut ir: Option<&mut IrCtx>,
 ) {
     let [_, ny, nx] = sh.dims;
     // TC_CPU_IR: evaluate the net with the tang-expr integer interpreter
@@ -168,9 +169,19 @@ fn code_block<S: Sink>(
         for x in b.start[2]..b.end[2] {
             let (f, pred) = feats(sh, b, &rc, q, rs.as_deref(), z, y, x, w);
             let i = (z * ny + y) * nx + x;
-            let r = match net {
-                None => code_res::<S, false>(s, lane, m, b.class, &f, q[i].wrapping_sub(pred)),
-                Some(n) => {
+            let r = match (net, ir.as_deref_mut()) {
+                // decoding through tang-expr graphs (shipped or TC_CPU_IRRES)
+                (None, Some(c)) => c.res.res_static(&mut c.lanes[lane], c.mt, c.sw, f.sig as u32, f.e as u32, b.class as u32, f.sctx as u32),
+                (Some(n), Some(c)) => {
+                    let x = feat_vec3(&f, b.class);
+                    let o = match c.mlp.as_mut() {
+                        Some(p) => n.infer_ir(p, &x),
+                        None => n.infer(&x),
+                    };
+                    c.lres.res_learned(&mut c.lanes[lane], c.mt, c.sw, &o)
+                }
+                (None, None) => code_res::<S, false>(s, lane, m, b.class, &f, q[i].wrapping_sub(pred)),
+                (Some(n), None) => {
                     let x = feat_vec3(&f, b.class);
                     let o = match prog.as_mut() {
                         Some(p) => n.infer_ir(p, &x),
@@ -186,6 +197,42 @@ fn code_block<S: Sink>(
             }
         }
     });
+}
+
+/// CPU decoding state for tang-expr residual graphs.
+pub(crate) struct IrCtx<'a> {
+    res: crate::irdec::CpuRes,
+    lres: crate::irdec::CpuRes,
+    mlp: Option<tang_expr::int::Program>,
+    lanes: Vec<crate::irdec::Lane>,
+    mt: &'a [u32],
+    sw: &'a [u32],
+}
+
+/// Per-decode buffers shared by the blocks.
+struct IrBase {
+    dec: std::sync::Arc<crate::shipdec::Decoder>,
+    mt: Vec<u32>,
+    off: [u32; 2],
+    sw: Vec<u32>,
+}
+
+impl IrBase {
+    fn new(ps: &Parsed3, bytes: &[u8]) -> Option<Self> {
+        let dec = ps.dec.clone().or_else(|| cpu_irres().then(builtin_decoder))?;
+        let (mt, off) = crate::irdec::cpu_mt(&ps.init);
+        Some(Self { dec, mt, off, sw: crate::irdec::stream_words(bytes) })
+    }
+}
+
+fn builtin_decoder() -> std::sync::Arc<crate::shipdec::Decoder> {
+    static D: std::sync::OnceLock<std::sync::Arc<crate::shipdec::Decoder>> = std::sync::OnceLock::new();
+    D.get_or_init(|| std::sync::Arc::new(crate::shipdec::compile(&crate::shipdec::builtin_program(None)).unwrap())).clone()
+}
+
+fn cpu_irres() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TC_CPU_IRRES").is_ok())
 }
 
 fn cpu_ir() -> bool {
@@ -449,7 +496,7 @@ fn encode_at3(enc: &Enc, dims: &[usize], cfg: &Gpu3Config, dg: f64, maxabs: Opti
     let mut cnt = CountSink { n: vec![[0; 2]; NMODEL] };
     let mut m0 = vec![MINIT; NMODEL];
     for b in &blocks {
-        code_block(sh, b, &mut q, cfg.resctx.then_some(&mut rs[..]), &preds, &mut m0, cfg.lanes, None, &mut cnt);
+        code_block(sh, b, &mut q, cfg.resctx.then_some(&mut rs[..]), &preds, &mut m0, cfg.lanes, None, &mut cnt, None);
     }
     // learned model (overfit: trained here on this field's coefficients)
     let mut q2 = qs[0].clone();
@@ -479,7 +526,7 @@ fn encode_at3(enc: &Enc, dims: &[usize], cfg: &Gpu3Config, dg: f64, maxabs: Opti
     for b in &blocks {
         let nl = cfg.lanes.max(1);
         let mut sink = RecSink { syms: vec![Vec::new(); nl] };
-        code_block(sh, b, &mut q, cfg.resctx.then_some(&mut rs[..]), &preds, &mut init, nl, net.as_ref(), &mut sink);
+        code_block(sh, b, &mut q, cfg.resctx.then_some(&mut rs[..]), &preds, &mut init, nl, net.as_ref(), &mut sink, None);
         let lw: Vec<Vec<u16>> = sink.syms.iter().map(|s| crate::gpuwav::rans_encode(s)).collect();
         if dbg {
             ideal += sink.syms.iter().flatten().map(|&(_, f)| 16.0 - (f as f64).log2()).sum::<f64>();
@@ -719,6 +766,8 @@ pub struct Parsed3 {
     pub net: Option<Net32>,
     /// Header + index bytes.
     pub header_bytes: usize,
+    /// Decoder shipped in the stream (`TCS1`), replacing the built-in coding path.
+    pub dec: Option<std::sync::Arc<crate::shipdec::Decoder>>,
 }
 
 impl Parsed3 {
@@ -743,8 +792,33 @@ impl Parsed3 {
     }
 }
 
-/// Parse a v3 stream.
+/// Parse a v3 stream, plain (`TCG3`) or carrying its decoder (`TCS1`, see
+/// [`crate::shipdec`]). Offsets in the result index `bytes` either way.
 pub fn parse3(bytes: &[u8]) -> Result<Parsed3, DecodeError> {
+    let (dec, inner) = crate::shipdec::open(bytes)?;
+    let Some(dec) = dec else { return parse3_inner(bytes, false) };
+    let base = bytes.len() - inner.len();
+    let mut ps = parse3_inner(inner, dec.mlp.is_some())?;
+    for w in ps.block_words.iter_mut() {
+        *w = (w.0 + base, w.1 + base);
+    }
+    for lv in ps.block_lanes.iter_mut() {
+        for w in lv.iter_mut() {
+            *w = (w.0 + base / 2, w.1 + base / 2);
+        }
+    }
+    for t in ps.tiles.iter_mut() {
+        t.words = (t.words.0 + base / 2, t.words.1 + base / 2);
+        t.bytes = (t.bytes.0 + base, t.bytes.1 + base);
+    }
+    ps.header_bytes += base;
+    ps.dec = Some(dec);
+    Ok(ps)
+}
+
+/// Parse a plain v3 stream; `ext_net`: the model is shipped as a graph, so
+/// an unregistered fingerprint is not an error.
+fn parse3_inner(bytes: &[u8], ext_net: bool) -> Result<Parsed3, DecodeError> {
     let mut r = ByteReader::new(bytes);
     if r.take(4)? != MAGIC3 {
         return Err(DecodeError::Invalid("not a tc-gpu v3 stream"));
@@ -779,7 +853,11 @@ pub fn parse3(bytes: &[u8]) -> Result<Parsed3, DecodeError> {
         1 => {
             let b = r.take(8)?;
             let fp = u64::from_le_bytes(b.try_into().unwrap());
-            Some(Net32::new(&*crate::learned::lookup(fp).ok_or(DecodeError::Invalid("pretrained model not registered"))?))
+            match crate::learned::lookup(fp) {
+                Some(n) => Some(Net32::new(&n)),
+                None if ext_net => Some(crate::shipdec::placeholder_net()),
+                None => return Err(DecodeError::Invalid("pretrained model not registered")),
+            }
         }
         2 => {
             let b = r.take(4)?;
@@ -888,7 +966,7 @@ pub fn parse3(bytes: &[u8]) -> Result<Parsed3, DecodeError> {
         tiles.push(TileRef { origin: *o, dims: *d, words: (ws, ws + nw), bytes: (off, end), esc });
         off = end;
     }
-    Ok(Parsed3 { dims, d3, cb, resctx, e, mean_fix, dl, corr, preds, init, sh, blocks, block_band, block_words, lanes, block_lanes, tiles, header_bytes, net })
+    Ok(Parsed3 { dims, d3, cb, resctx, e, mean_fix, dl, corr, preds, init, sh, blocks, block_band, block_words, lanes, block_lanes, tiles, header_bytes, net, dec: None })
 }
 
 // ------------------------------------------------------------------ decode
@@ -908,7 +986,27 @@ impl Ptr {
     }
 }
 
-fn decode_block(ps: &Parsed3, bytes: &[u8], bi: usize, q: Ptr, rs: Ptr, n: usize) -> Result<(), DecodeError> {
+fn decode_block(ps: &Parsed3, bytes: &[u8], bi: usize, q: Ptr, rs: Ptr, n: usize, irb: Option<&IrBase>) -> Result<(), DecodeError> {
+    if let Some(ib) = irb {
+        let d = &ib.dec;
+        let mut c = IrCtx {
+            res: crate::irdec::CpuRes::new(&d.stat.0, &d.stat.1, false, [0, 0]),
+            lres: crate::irdec::CpuRes::new(&d.learned.0, &d.learned.1, true, ib.off),
+            mlp: d.mlp_program(),
+            lanes: ps.block_lanes[bi].iter().map(|&(a, b)| crate::irdec::Lane::new(&ib.sw, a as u32, b as u32)).collect(),
+            mt: &ib.mt,
+            sw: &ib.sw,
+        };
+        let q = unsafe { std::slice::from_raw_parts_mut(q.get(), n) };
+        let rs = unsafe { std::slice::from_raw_parts_mut(rs.get(), n) };
+        let mut m = ps.init.clone();
+        let mut sink = DecSink { lanes: Vec::new() };
+        code_block(&ps.sh, &ps.blocks[bi], q, ps.resctx.then_some(rs), &ps.preds, &mut m, ps.lanes, ps.net.as_ref(), &mut sink, Some(&mut c));
+        if c.lanes.iter().any(|l| l.overrun()) {
+            return Err(DecodeError::Truncated);
+        }
+        return Ok(());
+    }
     let lw: Vec<Vec<u16>> = ps.block_lanes[bi].iter().map(|&(a, b)| words(bytes, a, b)).collect();
     let mut sink = DecSink { lanes: lw.iter().map(|w| RansDec::new(w)).collect() };
     let mut m = ps.init.clone();
@@ -916,7 +1014,7 @@ fn decode_block(ps: &Parsed3, bytes: &[u8], bi: usize, q: Ptr, rs: Ptr, n: usize
     // before this level started) and their own cells
     let q = unsafe { std::slice::from_raw_parts_mut(q.get(), n) };
     let rs = unsafe { std::slice::from_raw_parts_mut(rs.get(), n) };
-    code_block(&ps.sh, &ps.blocks[bi], q, ps.resctx.then_some(rs), &ps.preds, &mut m, ps.lanes, ps.net.as_ref(), &mut sink);
+    code_block(&ps.sh, &ps.blocks[bi], q, ps.resctx.then_some(rs), &ps.preds, &mut m, ps.lanes, ps.net.as_ref(), &mut sink, None);
     if sink.lanes.iter().any(|l| l.overrun()) {
         return Err(DecodeError::Truncated);
     }
@@ -1147,13 +1245,14 @@ pub fn decode3_box_parsed(ps: &Parsed3, bytes: &[u8], lo: [usize; 3], hi: [usize
     let (qp, rp) = (Ptr(q.as_mut_ptr()), Ptr(rs.as_mut_ptr()));
     let mut bytes_read = ps.header_bytes;
     let mut nblk = 0;
+    let irb = IrBase::new(ps, bytes);
     for (g0, g1) in ps.level_groups() {
         let items: Vec<usize> = (g0..g1).filter(|&i| want[i]).collect();
         for &i in &items {
             bytes_read += ps.block_words[i].1 - ps.block_words[i].0;
         }
         nblk += items.len();
-        run_par(&items, threads, |i| decode_block(ps, bytes, i, qp, rp, n))?;
+        run_par(&items, threads, |i| decode_block(ps, bytes, i, qp, rp, n, irb.as_ref()))?;
     }
     drop(rs);
     // dequantize the decoded blocks

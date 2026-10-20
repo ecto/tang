@@ -89,6 +89,8 @@ fn shader_src(lanes: usize, maxl: usize) -> String {
         .replace("LANES_WG", &lanes.to_string())
         .replace("MAXL_N", &maxl.max(2).to_string())
         .replace("KK_LIST", &k.iter().map(|v| format!("{v}")).collect::<Vec<_>>().join(", "));
+    // residual decoders generated from the tang-expr graphs (TC_GPU_HANDRES: hand-written)
+    let body = if std::env::var("TC_GPU_HANDRES").is_ok() { body } else { crate::irdec::splice_res(&body, crate::irdec::builtin_wgsl()) };
     head + &body
 }
 
@@ -669,21 +671,37 @@ impl GpuDecoder {
         };
         let _ = self.device.poll(wgpu::PollType::Wait);
         times.upload_s += t1.elapsed().as_secs_f64();
-        Prepared3 { base, groups: ps.level_groups(), nblocks: ps.blocks.len(), ntiles: ps.tiles.len(), lanes: ps.lanes, net: ps.net.clone() }
+        Prepared3 { base, groups: ps.level_groups(), nblocks: ps.blocks.len(), ntiles: ps.tiles.len(), lanes: ps.lanes, net: ps.net.clone(), dec: ps.dec.clone() }
     }
 
-    /// decode3/decode3l pipelines with the net's MLP as straight-line code.
-    fn spec_pipes(&self, net: &crate::lmodel3::Net32) -> SpecPipes {
-        let key = net.flat();
+    /// decode3/decode3l pipelines with the net's MLP as straight-line code,
+    /// and/or a stream's shipped decoder (cached by program hash).
+    fn spec_pipes(&self, net: Option<&crate::lmodel3::Net32>, dec: Option<&crate::shipdec::Decoder>) -> SpecPipes {
+        let mut key = net.map_or(Vec::new(), |n| n.flat());
+        if let Some(d) = dec {
+            key.extend([u32::MAX, d.key as u32, (d.key >> 32) as u32, d.size as u32]);
+        }
         let mut c = self.spec.lock().unwrap();
         if let Some(p) = c.iter().find(|e| e.0 == key) {
             return p.1.clone();
         }
-        let a = self.src.find("// MLP_BEGIN").unwrap();
-        let b = self.src.find("// MLP_END").unwrap();
-        let mlp = if std::env::var("TC_GPU_HANDMLP").is_ok() { gen_mlp(net) } else { ir_mlp(net) };
-        let src = format!("{}{}{}", &self.src[..a], mlp, &self.src[b..]);
-        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("tc-gpu-mlp"), source: wgpu::ShaderSource::Wgsl(src.into()) });
+        let mut src = self.src.clone();
+        if let Some(d) = dec {
+            src = crate::irdec::splice_res(&src, &d.wgsl_res);
+        }
+        let shipped = dec.and_then(|d| d.wgsl_mlp.clone());
+        if net.is_some() || shipped.is_some() {
+            let a = src.find("// MLP_BEGIN").unwrap();
+            let b = src.find("// MLP_END").unwrap();
+            let mlp = match (shipped, net) {
+                (Some(m), _) => m,
+                (None, Some(n)) if std::env::var("TC_GPU_HANDMLP").is_ok() => gen_mlp(n),
+                (None, Some(n)) => ir_mlp(n),
+                (None, None) => unreachable!(),
+            };
+            src = format!("{}{}{}", &src[..a], mlp, &src[b..]);
+        }
+        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("tc-gpu-spec"), source: wgpu::ShaderSource::Wgsl(src.into()) });
         let mk = |e: &str| {
             self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(e),
@@ -697,6 +715,17 @@ impl GpuDecoder {
         let p = std::sync::Arc::new((mk("decode3"), mk("decode3l")));
         c.push((key, p.clone()));
         p
+    }
+
+    /// Build (or fetch) the pipelines a prepared stream needs, without
+    /// running anything; returns the seconds spent.
+    pub fn warm3(&self, pr: &Prepared3) -> f64 {
+        let t = Instant::now();
+        if pr.net.is_some() || pr.dec.is_some() {
+            let _ = self.spec_pipes(pr.net.as_ref(), pr.dec.as_deref());
+            let _ = self.device.poll(wgpu::PollType::Wait);
+        }
+        t.elapsed().as_secs_f64()
     }
 
     /// Run the v3 kernels; returns the kernel wall time.
@@ -733,7 +762,13 @@ impl GpuDecoder {
         if b.nesc > 0 {
             jobs.push(("escapes", b.params.clone(), [b.nesc.div_ceil(64) as u32, 1, 1]));
         }
-        let spec = if std::env::var("TC_GPU_NOSPEC").is_ok() { None } else { pr.net.as_ref().map(|n| self.spec_pipes(n)) };
+        let spec = if pr.dec.is_some() {
+            Some(self.spec_pipes(pr.net.as_ref(), pr.dec.as_deref()))
+        } else if std::env::var("TC_GPU_NOSPEC").is_ok() {
+            None
+        } else {
+            pr.net.as_ref().map(|n| self.spec_pipes(Some(n), None))
+        };
         self.submit_with(b, &jobs, spec.as_deref())
     }
 }
@@ -920,6 +955,7 @@ pub struct Prepared3 {
     ntiles: usize,
     lanes: usize,
     net: Option<crate::lmodel3::Net32>,
+    dec: Option<std::sync::Arc<crate::shipdec::Decoder>>,
 }
 
 fn as_bytes(v: &[u32]) -> &[u8] {

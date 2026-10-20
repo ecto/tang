@@ -77,12 +77,27 @@ impl IntGraph {
                 }
             }
         }
-        let inline = (0..n)
+        let mut inline: Vec<bool> = (0..n)
             .map(|i| {
                 let leaf = matches!(self.nodes[i], INode::State(..) | INode::LoopOut(..));
                 live[i] && !leaf && uses[i] == 1 && user_scope[i] == Some(self.scope[i])
             })
             .collect();
+        // bound the nesting of inlined expressions (lowerings recurse on it)
+        let mut depth = vec![0u32; n];
+        for i in 0..n {
+            let mut d = 0;
+            self.operands(self.nodes[i], |a| {
+                if inline[a.index()] {
+                    d = d.max(depth[a.index()]);
+                }
+            });
+            depth[i] = d + 1;
+            if depth[i] >= 32 {
+                inline[i] = false;
+                depth[i] = 0;
+            }
+        }
         let mut done = vec![false; self.loops.len()];
         let items = self.scope_items(None, &live, None, &mut done);
         Sched { items, inline }

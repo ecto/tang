@@ -22,6 +22,12 @@ pub(crate) fn bin(op: BinOp, t: IType, a: u32, b: u32) -> u32 {
         BinOp::Min => a.min(b),
         BinOp::Max if s => (a as i32).max(b as i32) as u32,
         BinOp::Max => a.max(b),
+        BinOp::Div if b == 0 => a,
+        BinOp::Div if s => (a as i32).wrapping_div(b as i32) as u32,
+        BinOp::Div => a / b,
+        BinOp::Rem if b == 0 => 0,
+        BinOp::Rem if s => (a as i32).wrapping_rem(b as i32) as u32,
+        BinOp::Rem => a % b,
     }
 }
 
@@ -44,11 +50,13 @@ pub(crate) fn cmp(op: CmpOp, t: IType, a: u32, b: u32) -> u32 {
 }
 
 pub(crate) fn load(elem: Elem, buf: &[u32], i: u32) -> u32 {
+    // out of bounds reads 0 (the guarded WGSL lowering does the same)
     let i = i as usize;
+    let w = |j: usize| buf.get(j).copied().unwrap_or(0);
     match elem {
-        Elem::I32 | Elem::U32 => buf[i],
-        Elem::U8 => (buf[i >> 2] >> ((i & 3) * 8)) & 0xff,
-        Elem::I8 => ((buf[i >> 2] >> ((i & 3) * 8)) as u8 as i8) as i32 as u32,
+        Elem::I32 | Elem::U32 => w(i),
+        Elem::U8 => (w(i >> 2) >> ((i & 3) * 8)) & 0xff,
+        Elem::I8 => ((w(i >> 2) >> ((i & 3) * 8)) as u8 as i8) as i32 as u32,
     }
 }
 
@@ -101,9 +109,12 @@ impl Program {
                 s[k as usize] = i as u32;
             }
         }
-        let mut c = Compiler { g, ops: Vec::new(), state, nregs: n as u32 };
+        let mut c = Compiler { g, ops: Vec::new(), state, nregs: n as u32 + 1, consts: vec![(n as u32, 1)], one: n as u32 };
         c.items(&sched.items);
         regs.resize(c.nregs as usize, 0);
+        for &(r, v) in &c.consts {
+            regs[r as usize] = v;
+        }
         Self { ops: c.ops, regs, params, outs: outputs.iter().map(|o| o.0).collect() }
     }
 
@@ -147,6 +158,10 @@ struct Compiler<'a> {
     ops: Vec<Op>,
     state: Vec<Vec<u32>>,
     nregs: u32,
+    /// Registers preset to constants (loop caps).
+    consts: Vec<(u32, u32)>,
+    /// Register holding 1u.
+    one: u32,
 }
 
 impl Compiler<'_> {
@@ -181,7 +196,22 @@ impl Compiler<'_> {
         for (k, &i) in lp.init.iter().enumerate() {
             self.ops.push(Op::Mov(st[k], i.0));
         }
+        // trip cap: a counter register, a constant register and a flag
+        let capr = lp.cap.map(|c| {
+            let (ctr, lim, ok) = (self.nregs, self.nregs + 1, self.nregs + 2);
+            self.nregs += 3;
+            self.consts.push((lim, c));
+            self.ops.push(Op::Bin(BinOp::Xor, IType::U32, ctr, ctr, ctr));
+            (ctr, lim, ok)
+        });
         let top = self.ops.len() as u32;
+        let jcap = capr.map(|(ctr, lim, ok)| {
+            self.ops.push(Op::Cmp(CmpOp::Lt, IType::U32, ok, ctr, lim));
+            let j = self.ops.len();
+            self.ops.push(Op::JmpIfZero(ok, 0));
+            self.ops.push(Op::Bin(BinOp::Add, IType::U32, ctr, ctr, self.one));
+            j
+        });
         self.items(pre);
         let jz = self.ops.len();
         self.ops.push(Op::JmpIfZero(lp.cond.0, 0));
@@ -198,6 +228,9 @@ impl Compiler<'_> {
         self.ops.push(Op::Jmp(top));
         let end = self.ops.len() as u32;
         self.ops[jz] = Op::JmpIfZero(lp.cond.0, end);
+        if let (Some(j), Some((_, _, ok))) = (jcap, capr) {
+            self.ops[j] = Op::JmpIfZero(ok, end);
+        }
     }
 }
 

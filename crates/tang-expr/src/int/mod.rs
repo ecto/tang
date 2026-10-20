@@ -24,9 +24,11 @@
 mod emit;
 mod eval;
 mod sched;
+mod wire;
 
 pub use emit::WGSL_PRELUDE;
 pub use eval::Program;
+pub use wire::{Limits, WireError};
 
 use std::collections::HashMap;
 
@@ -100,6 +102,12 @@ pub enum BinOp {
     Min,
     /// Maximum.
     Max,
+    /// Division, WGSL semantics: `x / 0 = x`, `i32::MIN / −1 = i32::MIN`;
+    /// signed division truncates.
+    Div,
+    /// Remainder, WGSL semantics: `x % 0 = 0`, `i32::MIN % −1 = 0`; the sign
+    /// follows the dividend.
+    Rem,
 }
 
 /// Comparisons (produce `bool`).
@@ -160,6 +168,9 @@ pub struct Loop {
     pub next: Vec<IId>,
     /// Enclosing loop, if nested.
     pub parent: Option<u32>,
+    /// Trip cap: when set, the loop also exits after this many iterations
+    /// (every backend counts the same way). Untrusted graphs always carry one.
+    pub cap: Option<u32>,
 }
 
 /// A read-only buffer declaration.
@@ -231,6 +242,10 @@ impl IntGraph {
 
     /// Innermost of two scopes, which must lie on one chain of nested loops.
     fn inner(&self, a: Option<u32>, b: Option<u32>) -> Option<u32> {
+        self.try_inner(a, b).expect("int graph: node mixes states of unrelated loops")
+    }
+
+    fn try_inner(&self, a: Option<u32>, b: Option<u32>) -> Result<Option<u32>, &'static str> {
         let (da, db) = (self.depth(a), self.depth(b));
         let (deep, shallow, mut d, ds) = if da >= db { (a, b, da, db) } else { (b, a, db, da) };
         let mut x = deep;
@@ -238,8 +253,10 @@ impl IntGraph {
             x = self.loops[x.unwrap() as usize].parent;
             d -= 1;
         }
-        assert_eq!(x, shallow, "int graph: node mixes states of unrelated loops");
-        deep
+        if x != shallow {
+            return Err("node mixes states of unrelated loops");
+        }
+        Ok(deep)
     }
 
     fn insert(&mut self, n: INode) -> IId {
@@ -259,47 +276,52 @@ impl IntGraph {
     }
 
     fn infer(&self, n: INode) -> (IType, Option<u32>) {
+        self.try_infer(n).unwrap_or_else(|e| panic!("int graph: {e}"))
+    }
+
+    fn try_infer(&self, n: INode) -> Result<(IType, Option<u32>), &'static str> {
         let sc = |a: IId| self.scope[a.index()];
-        match n {
+        let ok = |c: bool, e: &'static str| if c { Ok(()) } else { Err(e) };
+        Ok(match n {
             INode::Const(t, _) => (t, None),
             INode::Param(_, t) => (t, None),
             INode::Bin(op, a, b) => {
                 let (ta, tb) = (self.ty(a), self.ty(b));
                 match op {
-                    BinOp::Shl | BinOp::Shr => assert!(ta != IType::Bool && tb != IType::Bool, "shift of bool"),
-                    BinOp::And | BinOp::Or | BinOp::Xor => assert_eq!(ta, tb, "{op:?} type mismatch"),
+                    BinOp::Shl | BinOp::Shr => ok(ta != IType::Bool && tb != IType::Bool, "shift of bool")?,
+                    BinOp::And | BinOp::Or | BinOp::Xor => ok(ta == tb, "bitwise op type mismatch")?,
                     _ => {
-                        assert_eq!(ta, tb, "{op:?} type mismatch");
-                        assert!(ta != IType::Bool, "{op:?} on bool");
+                        ok(ta == tb, "arithmetic type mismatch")?;
+                        ok(ta != IType::Bool, "arithmetic on bool")?;
                     }
                 }
-                (ta, self.inner(sc(a), sc(b)))
+                (ta, self.try_inner(sc(a), sc(b))?)
             }
             INode::Un(op, a) => {
-                assert!(op == UnOp::Not || self.ty(a) != IType::Bool, "negation of bool");
+                ok(op == UnOp::Not || self.ty(a) != IType::Bool, "negation of bool")?;
                 (self.ty(a), sc(a))
             }
             INode::Cmp(_, a, b) => {
-                assert_eq!(self.ty(a), self.ty(b), "compare type mismatch");
-                (IType::Bool, self.inner(sc(a), sc(b)))
+                ok(self.ty(a) == self.ty(b), "compare type mismatch")?;
+                (IType::Bool, self.try_inner(sc(a), sc(b))?)
             }
             INode::Select(c, a, b) => {
-                assert_eq!(self.ty(c), IType::Bool, "select condition must be bool");
-                assert_eq!(self.ty(a), self.ty(b), "select type mismatch");
-                let s = self.inner(sc(a), sc(b));
-                (self.ty(a), self.inner(s, sc(c)))
+                ok(self.ty(c) == IType::Bool, "select condition must be bool")?;
+                ok(self.ty(a) == self.ty(b), "select type mismatch")?;
+                let s = self.try_inner(sc(a), sc(b))?;
+                (self.ty(a), self.try_inner(s, sc(c))?)
             }
             INode::Bitcast(t, a) => {
-                assert!(t != IType::Bool && self.ty(a) != IType::Bool, "bitcast of bool");
+                ok(t != IType::Bool && self.ty(a) != IType::Bool, "bitcast of bool")?;
                 (t, sc(a))
             }
             INode::Load(b, i) => {
-                assert_eq!(self.ty(i), IType::U32, "load index must be u32");
+                ok(self.ty(i) == IType::U32, "load index must be u32")?;
                 (self.bufs[b as usize].elem.ty(), sc(i))
             }
             INode::State(l, k) => (self.ty(self.loops[l as usize].init[k as usize]), Some(l)),
             INode::LoopOut(l, k) => (self.ty(self.loops[l as usize].init[k as usize]), self.loops[l as usize].parent),
-        }
+        })
     }
 
     /// Fold nodes whose operands are all constants (same semantics as eval).
@@ -481,7 +503,7 @@ impl IntGraph {
             // inits live in the enclosing scope
             self.inner(self.scope[x.index()], parent);
         }
-        self.loops.push(Loop { init: init.to_vec(), cond: IId(0), next: Vec::new(), parent });
+        self.loops.push(Loop { init: init.to_vec(), cond: IId(0), next: Vec::new(), parent, cap: None });
         self.building.push(l);
         let st: Vec<IId> = (0..init.len()).map(|k| self.insert(INode::State(l, k as u16))).collect();
         let (cond, next) = body(self, &st);
@@ -494,6 +516,24 @@ impl IntGraph {
         self.loops[l as usize].cond = cond;
         self.loops[l as usize].next = next;
         (0..init.len()).map(|k| self.insert(INode::LoopOut(l, k as u16))).collect()
+    }
+
+    /// Cap the trip count of the loop that produced `out` (a loop result).
+    pub fn cap_loop(&mut self, out: IId, cap: u32) {
+        match self.node(out) {
+            INode::LoopOut(l, _) => self.loops[l as usize].cap = Some(cap),
+            _ => panic!("cap_loop: not a loop result"),
+        }
+    }
+
+    /// Unsigned / signed division (WGSL semantics, see [`BinOp::Div`]).
+    pub fn div(&mut self, a: IId, b: IId) -> IId {
+        self.bin(BinOp::Div, a, b)
+    }
+
+    /// Remainder (WGSL semantics, see [`BinOp::Rem`]).
+    pub fn rem(&mut self, a: IId, b: IId) -> IId {
+        self.bin(BinOp::Rem, a, b)
     }
 
     /// `for i in 0..n` (`n: u32`) over states; `body(g, i, s)` returns next states.
