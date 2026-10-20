@@ -310,3 +310,103 @@ fn a_batch_is_the_mean_of_its_sequences() {
         }
     }
 }
+
+/// The GPU runner (compiled, memory-planned, updated in place) follows the
+/// f64 interpreter step for step.
+#[cfg(feature = "gpu")]
+#[test]
+fn the_gpu_runner_matches_the_interpreter() {
+    use crate::gpu::GpuTrainer;
+    use crate::train::{Hyper, Step, Trainer};
+    let c = Config {
+        vocab: 7,
+        d: 16,
+        layers: 2,
+        heads: 2,
+        ff: 32,
+        seq: 8,
+        batch: 2,
+    };
+    let toks: Vec<u32> = (0..c.rows() + 1).map(|i| (i % 5) as u32 + 1).collect();
+    let (x, y) = (&toks[..c.rows()], &toks[1..]);
+    for v in [Variant::TWIN, Variant::NATIVE] {
+        let mut cpu = Trainer::new(Step::new(c, v, Hyper::default(), false), 5);
+        let init: Vec<Vec<f32>> = cpu
+            .values
+            .iter()
+            .map(|v| v.iter().map(|&x| x as f32).collect())
+            .collect();
+        let mut gpu =
+            GpuTrainer::new(Step::new(c, v, Hyper::default(), false), &init).expect("a GPU");
+        eprintln!(
+            "{v:?} on {} ({} of {} updates in place)",
+            gpu.backend(),
+            gpu.donated(),
+            3 * gpu.step.slots.len()
+        );
+        for s in 0..4 {
+            let (lc, gc) = cpu.step(x, y, 1e-2);
+            let (lg, gg) = gpu.step(x, y, 1e-2);
+            eprintln!("  step {s}: loss cpu {lc:.6} gpu {lg:.6} · grad norm {gc:.4} / {gg:.4}");
+            assert!(
+                (lc - lg as f64).abs() < 1e-3 * (1.0 + lc.abs()),
+                "loss diverged at step {s}"
+            );
+        }
+        let p = &cpu.step.model.params[1];
+        let (a, b) = (
+            &cpu.values[cpu.step.input_index(p.id)],
+            gpu.read_input(p.id),
+        );
+        for (x, y) in a.iter().zip(&b) {
+            assert!(
+                (x - *y as f64).abs() < 1e-3 * (1.0 + x.abs()),
+                "{}: {x} vs {y}",
+                p.name
+            );
+        }
+    }
+}
+
+#[cfg(feature = "gpu")]
+#[test]
+#[ignore]
+fn dump_wide_kernels() {
+    use crate::train::{Hyper, Step};
+    let c = Config {
+        vocab: 7,
+        d: 16,
+        layers: 2,
+        heads: 2,
+        ff: 32,
+        seq: 8,
+        batch: 2,
+    };
+    let st = Step::new(c, Variant::TWIN, Hyper::default(), false);
+    let b: Vec<_> = st
+        .model
+        .boundaries
+        .iter()
+        .chain(&st.norm_partials)
+        .copied()
+        .collect();
+    let (g, outs) = crate::gpu::compile(&st.model.graph, &st.outputs(), &b);
+    let prog = g.to_wgsl(&outs);
+    for k in prog.kernels.iter().filter(|k| k.reads.len() + 1 > 16) {
+        let names: Vec<String> = k
+            .reads
+            .iter()
+            .map(|r| {
+                let n = &g.nodes()[r.index()];
+                format!("{}{:?}", r.index(), n.shape)
+            })
+            .collect();
+        eprintln!(
+            "node {} {:?} reads {}: {:?}",
+            k.node.index(),
+            g.nodes()[k.node.index()].shape,
+            k.reads.len(),
+            names
+        );
+    }
+}

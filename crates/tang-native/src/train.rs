@@ -50,6 +50,9 @@ pub struct Step {
     pub slots: Vec<Slot>,
     /// the global gradient norm before clipping, `[1]`
     pub grad_norm: TensorId,
+    /// the running sums of squared gradients: compile barriers, so fusion
+    /// doesn't read every gradient in one kernel (wgpu allows 16 bindings)
+    pub norm_partials: Vec<TensorId>,
     pub hyper: Hyper,
 }
 
@@ -71,6 +74,7 @@ impl Step {
         let hyper_in = g.input(&[3usize]);
         // global norm: Σ over every gradient of Σ g²
         let mut sq: Option<TensorId> = None;
+        let mut norm_partials = Vec::new();
         for &gr in &model.grads {
             let shape = g.shape(gr).to_vec();
             let n = tang_compile::tensor::numel(&shape);
@@ -91,6 +95,7 @@ impl Step {
                 Some(acc) => g.map(&[acc, s], |x| x[0] + x[1]).unwrap(),
                 None => s,
             });
+            norm_partials.extend(sq);
         }
         let sq = sq.expect("a model has parameters");
         let grad_norm = g.map(&[sq], |x| x[0].sqrt()).unwrap();
@@ -167,6 +172,7 @@ impl Step {
             hyper_in,
             slots,
             grad_norm,
+            norm_partials,
             hyper: h,
         }
     }

@@ -6208,6 +6208,7 @@ dependencies = [
  "tang",
  "tang-compile",
  "tang-expr",
+ "tang-gpu",
 ]
 
 [[package]]

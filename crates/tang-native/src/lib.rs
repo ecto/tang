@@ -20,6 +20,8 @@
 //! the same in both. Activations are not fake-quantized while training: the
 //! FHE-faithful eval quantizes them, and on BitNet ±112 cost +0.34%.
 
+#[cfg(feature = "gpu")]
+pub mod gpu;
 pub mod train;
 
 use tang::Scalar;
@@ -166,6 +168,10 @@ pub struct Model {
     pub loss: TensorId,
     /// d loss / d param, in `params` order
     pub grads: Vec<TensorId>,
+    /// the residual stream after each block, then the loss gradient wrt
+    /// each: compile barriers, so fusion never splices one block's sum (or
+    /// its gradient's) into every later reader
+    pub boundaries: Vec<TensorId>,
 }
 
 fn lit(x: f64) -> ExprId {
@@ -461,6 +467,7 @@ pub fn build(c: Config, v: Variant) -> Model {
     let ih = b.g.iota(&[bt, h, t, t], 1);
     let it = b.g.iota(&[bt, h, t, t], 2);
     let is = b.g.iota(&[bt, h, t, t], 3);
+    let mut boundaries = Vec::new();
     for l in 0..c.layers {
         // attention
         let n = b.norm(x, format!("l{l}.attn_norm"), 0.5);
@@ -533,6 +540,7 @@ pub fn build(c: Config, v: Variant) -> Model {
         };
         let dn = b.linear(m, format!("l{l}.down"), d);
         x = b.g.map(&[x, dn], |z| z[0] + z[1]).unwrap();
+        boundaries.push(x);
     }
     let x = b.norm(x, "final_norm".into(), 0.5);
     let params = std::mem::take(&mut b.params);
@@ -595,8 +603,16 @@ pub fn build(c: Config, v: Variant) -> Model {
             |z| vec![(z[0].ln() + z[1] - z[2]) / lit(rows as f64)],
         )
         .unwrap();
-    let ids: Vec<TensorId> = params.iter().map(|p| p.id).collect();
-    let grads = g.backward(loss, &ids).unwrap();
+    // differentiate wrt the residual stream too: its gradients are the
+    // backward pass's own chain of adds, so they become barriers as well
+    let ids: Vec<TensorId> = params
+        .iter()
+        .map(|p| p.id)
+        .chain(boundaries.iter().copied())
+        .collect();
+    let mut grads = g.backward(loss, &ids).unwrap();
+    let dboundaries = grads.split_off(params.len());
+    boundaries.extend(dboundaries);
     Model {
         graph,
         config: c,
@@ -608,6 +624,7 @@ pub fn build(c: Config, v: Variant) -> Model {
         logits,
         loss,
         grads,
+        boundaries,
     }
 }
 
