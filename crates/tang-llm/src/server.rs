@@ -1886,6 +1886,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    // `Trace` is a unit struct without the `otel` feature.
+    #[allow(clippy::default_constructed_unit_structs)]
     async fn a_dropped_stream_stops_generation() {
         use std::sync::atomic::Ordering;
         let steps = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
