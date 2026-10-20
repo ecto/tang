@@ -65,6 +65,11 @@ and the built-in kernel runs that call. A step override that declines falls back
   return the same logits. `Model::layer_weights(l)` and `Model::io_weights()` hand it the
   weights (read-only, in the load format), `Model::pool()` the KV blocks. A persistent
   megakernel or captured graph builds its launch state once, keyed by the model, and reuses it.
+- **Raw access (CUDA)**: an implementation typed against `CudaComputeDevice` gets its
+  context and stream (`cuda_context`, `cuda_stream`; launch on that stream, or capture it,
+  so the work orders with the built-in ops) and each buffer's storage (`CudaBuffer::raw`:
+  f32, bf16, 4-bit packed/scales/biases, Q2), so it can launch its own kernels, or tang's
+  (`tang_compute::kernels::*_cuda`), on the model's weights and KV pool.
 - **Multi-GPU** (`AllReduce`): tang has no tensor-parallel path yet. The slot is defined so the
   path that grows one resolves its reduction the same way (built-in: copy through host or NCCL;
   extension: a fused one-shot all-reduce).

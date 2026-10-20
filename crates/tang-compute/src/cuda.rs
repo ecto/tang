@@ -93,6 +93,47 @@ impl CudaBuffer {
     }
 }
 
+/// A [`CudaBuffer`]'s storage, read-only, for extensions that launch their own kernels on it
+/// (see [`CudaBuffer::raw`]). A kernel may write through these (a KV cache, say) only where the
+/// matching built-in op would.
+pub enum RawCuda<'a> {
+    F32(&'a CudaSlice<f32>),
+    /// bf16 bits.
+    Bf16(&'a CudaSlice<u16>),
+    /// MLX 4-bit `[n, k]`: `packed` 8 weights a u32 (low nibble first), bf16 `scales` and
+    /// `biases` one per `group` weights.
+    Q4 {
+        packed: &'a CudaSlice<u32>,
+        scales: &'a CudaSlice<u16>,
+        biases: &'a CudaSlice<u16>,
+        group: usize,
+    },
+    /// Repacked Q2_0 (`crate::flash::q2_repack`): `[n][k/4]` code bytes, then `[n][k/64]`
+    /// fp16 scales.
+    Q2 { data: &'a CudaSlice<u8>, n: usize, k: usize },
+}
+
+impl CudaBuffer {
+    /// The storage behind this buffer.
+    pub fn raw(&self) -> RawCuda<'_> {
+        match self.storage() {
+            CudaStorage::F32(s) => RawCuda::F32(s),
+            CudaStorage::Bf16(s) => RawCuda::Bf16(s),
+            CudaStorage::Q4(q) => RawCuda::Q4 {
+                packed: &q.packed,
+                scales: &q.scales,
+                biases: &q.biases,
+                group: q.group,
+            },
+            CudaStorage::Q2(q) => RawCuda::Q2 {
+                data: &q.data,
+                n: q.n,
+                k: q.k,
+            },
+        }
+    }
+}
+
 impl ComputeBuffer for CudaBuffer {
     fn len(&self) -> usize {
         self.len
@@ -434,6 +475,13 @@ impl CudaComputeDevice {
     /// Drop all cached buffers in the pool, returning memory to CUDA.
     pub fn pool_clear(&self) {
         self.pool.lock().unwrap().clear();
+    }
+
+    // ---- Raw access, for extensions (`crate::ext`) ----
+
+    /// Whether activations are bf16 (`new_mixed_precision`) rather than f32.
+    pub fn is_mixed_precision(&self) -> bool {
+        self.mixed_precision
     }
 
     // ---- CUDA Graph capture ----

@@ -40,7 +40,7 @@ pub use tensor::ComputeTensor;
 pub use metal::MetalDevice;
 
 #[cfg(feature = "cuda")]
-pub use cuda::{cuda_memory_info, CudaComputeDevice};
+pub use cuda::{cuda_memory_info, CudaComputeDevice, RawCuda};
 
 #[cfg(feature = "cuda")]
 pub use cudarc::driver::CudaGraph;
