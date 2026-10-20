@@ -6,6 +6,12 @@ use cudarc::driver::{LaunchConfig, PushKernelArg};
 use super::{CudaBuffer, CudaComputeDevice, CudaStorage};
 use crate::kernels::{llm_cuda, moe_cuda};
 
+/// Whether `TANG_MOE_HOST` (comma-separated op names, or `all`) sends `op` to the host
+/// reference instead of its kernel (for bisecting a mismatch).
+pub(super) fn host_op(op: &str) -> bool {
+    std::env::var("TANG_MOE_HOST").is_ok_and(|v| v.split(',').any(|o| o == op || o == "all"))
+}
+
 /// Rows a launch of the sink kernels covers (bounds the split partials' scratch).
 const SINK_ROWS: usize = 64;
 
