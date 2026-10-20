@@ -9,9 +9,8 @@ use cudarc::driver::{CudaFunction, DevicePtr, LaunchConfig, PushKernelArg};
 use super::{CudaBuffer, CudaComputeDevice, CudaStorage, Q2Weight};
 use crate::flash::shape::*;
 use crate::flash::{
-    GdnMode, GdnParams, HcPending, HcWeights, MoePlan, QAct, QsaCache, QsaNorms, MAX_T,
+    GdnMode, GdnParams, Geometry, HcPending, HcWeights, MoePlan, QAct, QsaCache, QsaNorms, MAX_T,
 };
-use crate::kernels::flash_cuda::FLASH_CUDA;
 
 /// A null device pointer for kernel arguments a mode never reads.
 const NULL: u64 = 0;
@@ -175,16 +174,33 @@ const GEMV_NAMES: [[&str; 8]; 4] = [
 ];
 
 impl CudaComputeDevice {
-    /// Kernel `name` of `FLASH_CUDA` (compiled once for sm_86, as the tensor-core kernels are:
+    /// Compile the flash kernels for `g` from now on (drops the flash kernels already loaded).
+    pub fn set_flash_geometry(&self, g: &Geometry) {
+        *self.flash_src.borrow_mut() = Some(Box::leak(g.cuda_source().into_boxed_str()));
+        self.llm_funcs
+            .borrow_mut()
+            .retain(|k, _| !(k.starts_with("fl_") || k.starts_with("wide:fl_")));
+    }
+
+    /// The flash module's source (Flash-Next unless `set_flash_geometry` said otherwise).
+    fn flash_source(&self) -> &'static str {
+        *self
+            .flash_src
+            .borrow_mut()
+            .get_or_insert_with(|| Box::leak(Geometry::FLASH_NEXT.cuda_source().into_boxed_str()))
+    }
+
+    /// Kernel `name` of the flash module (compiled once for sm_86, as the tensor-core kernels are:
     /// `__dp4a` needs an explicit architecture).
     fn fl(&self, name: &'static str) -> CudaFunction {
         if let Some(f) = self.llm_funcs.borrow().get(name) {
             return f.clone();
         }
         // TANG_FL_DEFS="#define X;#define Y": experiment defines prepended to the flash source.
+        let flash = self.flash_source();
         let src: &'static str = match std::env::var("TANG_FL_DEFS") {
-            Ok(d) => Box::leak(format!("{}\n{FLASH_CUDA}", d.replace(';', "\n")).into_boxed_str()),
-            Err(_) => FLASH_CUDA,
+            Ok(d) => Box::leak(format!("{}\n{flash}", d.replace(';', "\n")).into_boxed_str()),
+            Err(_) => flash,
         };
         let (_module, f) = self.get_func_with_arch(src, name, "sm_86");
         self.llm_funcs.borrow_mut().insert(name, f.clone());
@@ -199,10 +215,13 @@ impl CudaComputeDevice {
         }
         let src: &'static str = Box::leak(
             format!(
-                "{}\n#define FLASH_WIDE 1\n#define PLAN_CAP {}\n#define SHARED_ROW {}\n{FLASH_CUDA}",
-                std::env::var("TANG_FL_DEFS").unwrap_or_default().replace(';', "\n"),
+                "{}\n#define FLASH_WIDE 1\n#define PLAN_CAP {}\n#define SHARED_ROW {}\n{}",
+                std::env::var("TANG_FL_DEFS")
+                    .unwrap_or_default()
+                    .replace(';', "\n"),
                 MoePlan::WIDE_CAP,
-                MoePlan::shared_row(MAX_T + 1)
+                MoePlan::shared_row(MAX_T + 1),
+                self.flash_source()
             )
             .into_boxed_str(),
         );

@@ -100,6 +100,190 @@ pub mod shape {
 
 use shape::*;
 
+/// The model shapes the flash kernels are compiled for, as data: the NVRTC `#define` prelude
+/// of [`kernels::flash_cuda`](crate::kernels::flash_cuda) is generated from it.
+/// [`Geometry::FLASH_NEXT`] reproduces the [`shape`] consts (and the source the kernels were
+/// written against) byte for byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Geometry {
+    pub hidden: usize,
+    pub hc: usize,
+    pub hc_lr: usize,
+    pub gdn_hk: usize,
+    pub gdn_hv: usize,
+    pub gdn_d: usize,
+    pub qsa_heads: usize,
+    pub qsa_kv: usize,
+    pub qsa_d: usize,
+    pub idx_heads: usize,
+    pub idx_d: usize,
+    /// Selection capacity (attention width cap).
+    pub qsa_width: usize,
+    /// Cells a split-K attention block reads.
+    pub qsa_chunk: usize,
+    pub qsa_ring: usize,
+    pub topk: usize,
+    pub ff: usize,
+}
+
+impl Geometry {
+    /// Qwen3.8-Flash-Next (`qwen4exp`).
+    pub const FLASH_NEXT: Geometry = Geometry {
+        hidden: HIDDEN,
+        hc: HC,
+        hc_lr: HC_LR,
+        gdn_hk: GDN_HK,
+        gdn_hv: GDN_HV,
+        gdn_d: GDN_D,
+        qsa_heads: QSA_HEADS,
+        qsa_kv: QSA_KV,
+        qsa_d: QSA_D,
+        idx_heads: IDX_HEADS,
+        idx_d: IDX_D,
+        qsa_width: QSA_WIDTH,
+        qsa_chunk: 64,
+        qsa_ring: QSA_RING,
+        topk: TOPK,
+        ff: FF,
+    };
+
+    pub const fn gdn_conv(&self) -> usize {
+        2 * self.gdn_hk * self.gdn_d + self.gdn_hv * self.gdn_d
+    }
+    pub const fn gdn_v(&self) -> usize {
+        self.gdn_hv * self.gdn_d
+    }
+    pub const fn gdn_z(&self) -> usize {
+        self.gdn_conv()
+    }
+    pub const fn gdn_a(&self) -> usize {
+        self.gdn_z() + self.gdn_v()
+    }
+    pub const fn gdn_b(&self) -> usize {
+        self.gdn_a() + self.gdn_hv
+    }
+    pub const fn qsa_k(&self) -> usize {
+        self.qsa_heads * 2 * self.qsa_d
+    }
+    pub const fn qsa_v(&self) -> usize {
+        self.qsa_k() + self.qsa_kv * self.qsa_d
+    }
+    pub const fn qsa_iq(&self) -> usize {
+        self.qsa_v() + self.qsa_kv * self.qsa_d
+    }
+    pub const fn qsa_ik(&self) -> usize {
+        self.qsa_iq() + self.idx_heads * self.idx_d
+    }
+    /// Split-K chunks covering one selection.
+    pub const fn qsa_nch(&self) -> usize {
+        self.qsa_width.div_ceil(self.qsa_chunk)
+    }
+    /// Byte offsets in a Q2 expert blob: `[gate|up codes | scales | down codes | scales]`
+    /// (2-bit codes, one byte of scale per 32 weights).
+    pub const fn blob_offsets(&self) -> [usize; 4] {
+        let gu = 2 * self.ff * self.hidden;
+        let dn = self.ff * self.hidden;
+        [0, gu / 4, gu / 4 + gu / 32, gu / 4 + gu / 32 + dn / 4]
+    }
+
+    /// The `#define` prelude of the flash CUDA module (everything before the first kernel).
+    pub fn cuda_prelude(&self) -> String {
+        let [gu_c, gu_s, dn_c, dn_s] = self.blob_offsets();
+        let inv_sqrt_d = (1.0f32 / (self.gdn_d as f32).sqrt()).to_bits();
+        format!(
+            "
+typedef unsigned long long u64;
+#define NEG_INF __uint_as_float(0xff800000u)
+
+#define HIDDEN {hidden}
+#define HC {hc}
+#define HC_LR {hc_lr}
+#define GDN_HK {gdn_hk}
+#define GDN_HV {gdn_hv}
+#define GDN_D {gdn_d}
+#define GDN_CONV {gdn_conv}
+#define GDN_V {gdn_v}
+#define GDN_Z {gdn_z}
+#define GDN_A {gdn_a}
+#define GDN_B {gdn_b}
+#define QSA_HEADS {qsa_heads}
+#define QSA_KV {qsa_kv}
+#define QSA_D {qsa_d}
+#define IDX_HEADS {idx_heads}
+#define IDX_D {idx_d}
+#define QSA_WIDTH {qsa_width}
+#define QSA_K {qsa_k}
+#define QSA_V {qsa_v}
+#define QSA_IQ {qsa_iq}
+#define QSA_IK {qsa_ik}
+#define QSA_CHUNK {qsa_chunk}
+#define QSA_NCH {qsa_nch}
+#define TOPK {topk}
+#define QSA_RING {qsa_ring}
+#define FF {ff}
+#ifndef PLAN_CAP
+#define PLAN_CAP {plan_cap}
+#endif
+#define PLAN_GP 4
+#define PLAN_GS (PLAN_GP + 2 * PLAN_CAP)
+#define PLAN_ET (PLAN_GS + PLAN_CAP + 1)
+#define PLAN_ED (PLAN_ET + PLAN_CAP)
+#define PLAN_MISS (PLAN_ED + PLAN_CAP)
+#ifndef SHARED_ROW
+#define SHARED_ROW {shared_row}
+#endif
+// The shared expert's first parts row in a wide (prefill, T > 8) window: 64 · TOPK.
+#define WIDE_SHARED_ROW {wide_shared_row}
+#define GU_CODES {gu_c}
+#define GU_SCALES {gu_s}
+#define DOWN_CODES {dn_c}
+#define DOWN_SCALES {dn_s}
+#define INV_SQRT_D __int_as_float({inv_sqrt_d:#010x})
+
+",
+            hidden = self.hidden,
+            hc = self.hc,
+            hc_lr = self.hc_lr,
+            gdn_hk = self.gdn_hk,
+            gdn_hv = self.gdn_hv,
+            gdn_d = self.gdn_d,
+            gdn_conv = self.gdn_conv(),
+            gdn_v = self.gdn_v(),
+            gdn_z = self.gdn_z(),
+            gdn_a = self.gdn_a(),
+            gdn_b = self.gdn_b(),
+            qsa_heads = self.qsa_heads,
+            qsa_kv = self.qsa_kv,
+            qsa_d = self.qsa_d,
+            idx_heads = self.idx_heads,
+            idx_d = self.idx_d,
+            qsa_width = self.qsa_width,
+            qsa_k = self.qsa_k(),
+            qsa_v = self.qsa_v(),
+            qsa_iq = self.qsa_iq(),
+            qsa_ik = self.qsa_ik(),
+            qsa_chunk = self.qsa_chunk,
+            qsa_nch = self.qsa_nch(),
+            topk = self.topk,
+            qsa_ring = self.qsa_ring,
+            ff = self.ff,
+            plan_cap = MAX_T * self.topk + MAX_T,
+            shared_row = MAX_T * self.topk,
+            wide_shared_row = MoePlan::WIDE_MAX * self.topk,
+        )
+    }
+
+    /// The full flash CUDA source for this geometry.
+    #[cfg(feature = "cuda")]
+    pub fn cuda_source(&self) -> String {
+        format!(
+            "{}{}",
+            self.cuda_prelude(),
+            crate::kernels::flash_cuda::FLASH_CUDA_BODY
+        )
+    }
+}
+
 /// The per-window record in device memory (u32 words), written by the host before each window
 /// (one 12-byte H2D copy on the graph's stream, which a graph replays from its source).
 ///
@@ -836,4 +1020,31 @@ pub fn f32_to_f16(x: f32) -> u16 {
         v += 1;
     }
     s | v as u16
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+
+    /// The generated prelude reproduces the consts the Flash-Next kernels were written against.
+    #[test]
+    fn flash_next_prelude_matches_shape() {
+        let g = Geometry::FLASH_NEXT;
+        let p = g.cuda_prelude();
+        for (name, v) in [
+            ("GDN_CONV", GDN_CONV),
+            ("GDN_B", GDN_B),
+            ("QSA_IK", QSA_IK),
+            ("QSA_NCH", 33),
+            ("PLAN_CAP", MoePlan::CAP),
+            ("SHARED_ROW", MoePlan::SHARED_ROW),
+            ("DOWN_SCALES", 1_331_200),
+        ] {
+            assert!(p.contains(&format!("#define {name} {v}\n")), "{name}");
+        }
+        assert!(p.contains("__int_as_float(0x3db504f3)"));
+        if let Ok(out) = std::env::var("TANG_DUMP_FLASH_SRC") {
+            std::fs::write(out, &p[1..]).unwrap();
+        }
+    }
 }

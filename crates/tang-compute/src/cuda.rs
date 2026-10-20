@@ -195,6 +195,9 @@ pub struct CudaComputeDevice {
     /// Self-resetting grid-barrier and completion counters for the fused Flash-Next kernels
     /// (`cuda/flash.rs`), allocated on first use.
     flash_sync: RefCell<Option<CudaSlice<u32>>>,
+    /// The flash module's source for the current [`crate::flash::Geometry`] (Flash-Next until
+    /// `set_flash_geometry`).
+    flash_src: RefCell<Option<&'static str>>,
 }
 
 /// GPU 0's name, free and total memory, without making a device (no stream or cuBLAS handle):
@@ -239,6 +242,7 @@ impl CudaComputeDevice {
             pool: Arc::new(Mutex::new(BufferPool::new())),
             llm_funcs: RefCell::new(HashMap::new()),
             flash_sync: RefCell::new(None),
+            flash_src: RefCell::new(None),
         })
     }
 
@@ -290,6 +294,7 @@ impl CudaComputeDevice {
             pool: Arc::new(Mutex::new(BufferPool::new())),
             llm_funcs: RefCell::new(HashMap::new()),
             flash_sync: RefCell::new(None),
+            flash_src: RefCell::new(None),
         })
     }
 
