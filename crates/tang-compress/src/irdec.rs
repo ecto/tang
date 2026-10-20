@@ -614,6 +614,7 @@ impl CpuRes {
         self.learned
     }
     /// Decode one static-prior residual.
+    #[allow(clippy::too_many_arguments)]
     pub fn res_static(&mut self, l: &mut Lane, mt: &[u32], stream: &[u32], sig: u32, e: u32, cls: u32, sctx: u32) -> i32 {
         let p = [l.x, l.pos, l.end, sig, e, cls, sctx, self.off[0]];
         self.run(l, &p, mt, stream)
