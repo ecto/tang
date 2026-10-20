@@ -24,6 +24,7 @@
 //! on the lines inside the needed region at each level.
 
 use crate::bitio::{ByteReader, ByteWriter, DecodeError};
+use crate::lmodel3::{code_learned, feat_vec3, Mix3, Net32};
 use crate::codec::ErrorBound;
 use crate::gpuwav::{
     code_res, dequant, feats, for_lines, gamma, init_of, lift_consts, prior_table, rate_control, read_priors, row_ctx, to_f32_bits, write_priors,
@@ -52,12 +53,34 @@ pub struct Gpu3Config {
     /// splits a block's lines into parity passes dealt to the lanes (more
     /// GPU parallelism, TCG1's rule inside the block).
     pub lanes: usize,
+    /// Coefficient probability model.
+    pub model: Model3,
+}
+
+/// Probability model of a v3 stream.
+#[derive(Clone, Debug, Default)]
+pub enum Model3 {
+    /// Static per-context priors (hand contexts).
+    #[default]
+    Static,
+    /// A pretrained integer MLP, referenced by fingerprint (register it with
+    /// [`crate::learned::register`] before decoding).
+    Pretrained(std::sync::Arc<crate::learned::Net>),
+    /// An MLP trained at encode time; its weights are shipped in the stream.
+    Overfit {
+        /// Hidden widths.
+        hidden: Vec<usize>,
+        /// Samples per epoch.
+        per_epoch: usize,
+        /// Epochs.
+        epochs: usize,
+    },
 }
 
 impl Gpu3Config {
     /// Defaults: 32³ / 128² blocks, 64³ outlier tiles, residual contexts.
     pub fn new(bound: ErrorBound) -> Self {
-        Self { bound, block: 32, block2d: 128, tile: 64, resctx: true, rho: 0.45, lanes: 1 }
+        Self { bound, block: 32, block2d: 128, tile: 64, resctx: true, rho: 0.45, lanes: 1, model: Model3::Static }
     }
 }
 
@@ -101,7 +124,17 @@ pub fn blocks_of(sh: &Shape, cb: [usize; 3], lanes: usize) -> (Vec<BandInfo>, Ve
 
 /// Code one block (one lane, static models). `rs` receives residuals.
 #[allow(clippy::too_many_arguments)]
-fn code_block<S: Sink>(sh: &Shape, b: &BandInfo, q: &mut [i32], mut rs: Option<&mut [i32]>, preds: &[[i32; NTAP]], m: &mut [u32], lanes: usize, s: &mut S) {
+fn code_block<S: Sink>(
+    sh: &Shape,
+    b: &BandInfo,
+    q: &mut [i32],
+    mut rs: Option<&mut [i32]>,
+    preds: &[[i32; NTAP]],
+    m: &mut [u32],
+    lanes: usize,
+    net: Option<&Net32>,
+    s: &mut S,
+) {
     let [_, ny, nx] = sh.dims;
     for_lines(b, lanes.max(1), |p, lane, z, y| {
         let w = &preds[b.pkey[p]];
@@ -109,7 +142,13 @@ fn code_block<S: Sink>(sh: &Shape, b: &BandInfo, q: &mut [i32], mut rs: Option<&
         for x in b.start[2]..b.end[2] {
             let (f, pred) = feats(sh, b, &rc, q, rs.as_deref(), z, y, x, w);
             let i = (z * ny + y) * nx + x;
-            let r = code_res::<S, false>(s, lane, m, b.class, &f, q[i].wrapping_sub(pred));
+            let r = match net {
+                None => code_res::<S, false>(s, lane, m, b.class, &f, q[i].wrapping_sub(pred)),
+                Some(n) => {
+                    let mx = Mix3::new(&n.infer(&feat_vec3(&f, b.class)));
+                    code_learned(s, lane, &mx, q[i].wrapping_sub(pred))
+                }
+            };
             q[i] = r.wrapping_add(pred);
             if let Some(rs) = rs.as_deref_mut() {
                 rs[i] = r;
@@ -264,6 +303,52 @@ fn words_le(v: &[u16], w: &mut ByteWriter) {
     }
 }
 
+/// `(features, residual)` of every coefficient in coding order (strided down
+/// to at most `max` samples).
+fn collect3(sh: &Shape, blocks: &[BandInfo], q: &mut [i32], resctx: bool, preds: &[[i32; NTAP]], lanes: usize, max: usize) -> Vec<crate::learned::Sample> {
+    let n: usize = q.len();
+    let stride = n.div_ceil(max.max(1)).max(1);
+    let mut rs = vec![0i32; n];
+    let mut out = Vec::new();
+    let [_, ny, nx] = sh.dims;
+    let mut k = 0usize;
+    for b in blocks {
+        for_lines(b, lanes.max(1), |p, _, z, y| {
+            let rc = row_ctx(sh, b, p, z, y);
+            for x in b.start[2]..b.end[2] {
+                let (f, pred) = feats(sh, b, &rc, q, resctx.then_some(&rs[..]), z, y, x, &preds[b.pkey[p]]);
+                let i = (z * ny + y) * nx + x;
+                let r = q[i].wrapping_sub(pred);
+                rs[i] = r;
+                if k % stride == 0 {
+                    out.push(crate::learned::Sample { x: feat_vec3(&f, b.class), r });
+                }
+                k += 1;
+            }
+        });
+    }
+    out
+}
+
+/// Training samples for a field at a PSNR/RMSE target (the coefficients the
+/// v3 coder would see at the rate-controlled step).
+pub fn samples3(x: &[f32], dims: &[usize], cfg: &Gpu3Config, threads: usize, max: usize) -> Vec<crate::learned::Sample> {
+    let big = dims.iter().copied().max().unwrap_or(1).max(2) * 2;
+    let got = std::sync::Mutex::new(Vec::new());
+    rate_control(x, dims, big, cfg.bound, cfg.rho, threads, |enc, dg, _| {
+        let shapes = enc.shapes_at(dg);
+        let sh = &shapes[0];
+        let (qs, _) = enc.quantize(dg, cfg.rho);
+        let (blocks, _) = blocks_of(sh, block_dims(sh.dims, cfg.block, cfg.block2d), cfg.lanes);
+        let fitted = fit3(sh, &blocks, &qs[0]);
+        let preds: Vec<[i32; NTAP]> = fitted.iter().map(|p| p.unwrap_or([0; NTAP])).collect();
+        let mut q = qs[0].clone();
+        *got.lock().unwrap() = collect3(sh, &blocks, &mut q, cfg.resctx, &preds, cfg.lanes, max);
+        (Vec::new(), GpuStats::default())
+    });
+    got.into_inner().unwrap()
+}
+
 /// Encode as a v3 stream.
 pub fn encode3_f32(x: &[f32], dims: &[usize], cfg: &Gpu3Config, threads: usize) -> (Vec<u8>, GpuStats) {
     // a brick larger than every axis: Enc then holds the global transform
@@ -325,15 +410,35 @@ fn encode_at3(enc: &Enc, dims: &[usize], cfg: &Gpu3Config, dg: f64, maxabs: Opti
     let mut cnt = CountSink { n: vec![[0; 2]; NMODEL] };
     let mut m0 = vec![MINIT; NMODEL];
     for b in &blocks {
-        code_block(sh, b, &mut q, cfg.resctx.then_some(&mut rs[..]), &preds, &mut m0, cfg.lanes, &mut cnt);
+        code_block(sh, b, &mut q, cfg.resctx.then_some(&mut rs[..]), &preds, &mut m0, cfg.lanes, None, &mut cnt);
     }
-    let priors = choose_priors3(&cnt.n);
+    // learned model (overfit: trained here on this field's coefficients)
+    let mut q2 = qs[0].clone();
+    let (net, net_bytes): (Option<Net32>, Vec<u8>) = match &cfg.model {
+        Model3::Static => (None, vec![0]),
+        Model3::Pretrained(n) => {
+            let mut v = vec![1];
+            v.extend(n.fingerprint().to_le_bytes());
+            (Some(Net32::new(n)), v)
+        }
+        Model3::Overfit { hidden, per_epoch, epochs } => {
+            let smp = collect3(sh, &blocks, &mut q2, cfg.resctx, &preds, cfg.lanes, 2_000_000);
+            let tc = crate::learned::TrainConfig { hidden: hidden.clone(), epochs: *epochs, per_epoch: *per_epoch, batch: 256, lr: 4e-3, apm: false, seed: 1 };
+            let n = crate::learned::train(&smp, &tc);
+            let mut v = vec![2];
+            let nb = n.to_bytes();
+            v.extend((nb.len() as u32).to_le_bytes());
+            v.extend(nb);
+            (Some(Net32::new(&n)), v)
+        }
+    };
+    let priors = if net.is_some() { vec![None; NMODEL] } else { choose_priors3(&cnt.n) };
     let mut init = init_of(&priors);
     let mut bw: Vec<Vec<u8>> = Vec::with_capacity(blocks.len());
     for b in &blocks {
         let nl = cfg.lanes.max(1);
         let mut sink = RecSink { syms: vec![Vec::new(); nl] };
-        code_block(sh, b, &mut q, cfg.resctx.then_some(&mut rs[..]), &preds, &mut init, nl, &mut sink);
+        code_block(sh, b, &mut q, cfg.resctx.then_some(&mut rs[..]), &preds, &mut init, nl, net.as_ref(), &mut sink);
         let lw: Vec<Vec<u16>> = sink.syms.iter().map(|s| crate::gpuwav::rans_encode(s)).collect();
         let mut w = ByteWriter::new();
         if nl > 1 {
@@ -395,6 +500,7 @@ fn encode_at3(enc: &Enc, dims: &[usize], cfg: &Gpu3Config, dg: f64, maxabs: Opti
     }
     w.u8(cfg.resctx as u8);
     w.varint(cfg.lanes.max(1) as u64);
+    w.bytes(&net_bytes);
     w.svarint(enc.e as i64);
     w.svarint(enc.mean_fix as i64);
     w.f64(dg);
@@ -520,6 +626,8 @@ pub struct Parsed3 {
     pub block_lanes: Vec<Vec<(usize, usize)>>,
     /// Outlier tiles.
     pub tiles: Vec<TileRef>,
+    /// Learned model (None = static priors).
+    pub net: Option<Net32>,
     /// Header + index bytes.
     pub header_bytes: usize,
 }
@@ -571,6 +679,20 @@ pub fn parse3(bytes: &[u8]) -> Result<Parsed3, DecodeError> {
     if lanes == 0 || lanes > 256 {
         return Err(DecodeError::Invalid("lanes"));
     }
+    let net = match r.u8()? {
+        0 => None,
+        1 => {
+            let b = r.take(8)?;
+            let fp = u64::from_le_bytes(b.try_into().unwrap());
+            Some(Net32::new(&*crate::learned::lookup(fp).ok_or(DecodeError::Invalid("pretrained model not registered"))?))
+        }
+        2 => {
+            let b = r.take(4)?;
+            let n = u32::from_le_bytes(b.try_into().unwrap()) as usize;
+            Some(Net32::new(&crate::learned::Net::from_bytes(r.take(n)?)?))
+        }
+        _ => return Err(DecodeError::Invalid("model tag")),
+    };
     let e = r.svarint()? as i32;
     let mean_fix = r.svarint()? as i32;
     let delta_g = r.f64()?;
@@ -645,7 +767,7 @@ pub fn parse3(bytes: &[u8]) -> Result<Parsed3, DecodeError> {
         tiles.push(TileRef { origin: *o, dims: *d, words: (ws, ws + nw), bytes: (off, end), esc });
         off = end;
     }
-    Ok(Parsed3 { dims, d3, cb, resctx, e, mean_fix, dl, corr, preds, init, sh, blocks, block_band, block_words, lanes, block_lanes, tiles, header_bytes })
+    Ok(Parsed3 { dims, d3, cb, resctx, e, mean_fix, dl, corr, preds, init, sh, blocks, block_band, block_words, lanes, block_lanes, tiles, header_bytes, net })
 }
 
 // ------------------------------------------------------------------ decode
@@ -673,7 +795,7 @@ fn decode_block(ps: &Parsed3, bytes: &[u8], bi: usize, q: Ptr, rs: Ptr, n: usize
     // before this level started) and their own cells
     let q = unsafe { std::slice::from_raw_parts_mut(q.get(), n) };
     let rs = unsafe { std::slice::from_raw_parts_mut(rs.get(), n) };
-    code_block(&ps.sh, &ps.blocks[bi], q, ps.resctx.then_some(rs), &ps.preds, &mut m, ps.lanes, &mut sink);
+    code_block(&ps.sh, &ps.blocks[bi], q, ps.resctx.then_some(rs), &ps.preds, &mut m, ps.lanes, ps.net.as_ref(), &mut sink);
     if sink.lanes.iter().any(|l| l.overrun()) {
         return Err(DecodeError::Truncated);
     }

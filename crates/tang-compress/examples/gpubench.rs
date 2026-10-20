@@ -9,10 +9,23 @@
 use std::time::Instant;
 use tang_compress::codec::ErrorBound;
 use tang_compress::gpuwav::{self, GpuConfig};
-use tang_compress::gpuwav3::{self, Gpu3Config};
+use tang_compress::gpuwav3::{self, Gpu3Config, Model3};
 
 fn cfg3_of(bound: ErrorBound, bk: usize, args: &[String]) -> Gpu3Config {
-    Gpu3Config { block: bk, block2d: bk, resctx: !args.iter().any(|a| a == "--nores"), lanes: opt(args, "--l3", "1").parse().unwrap(), ..Gpu3Config::new(bound) }
+    let m = opt(args, "--model3", "static");
+    let model = if m == "static" {
+        Model3::Static
+    } else if let Some(h) = m.strip_prefix("overfit") {
+        let hidden = h.strip_prefix(':').map_or(vec![16], |h| h.split(',').map(|v| v.parse().unwrap()).collect());
+        Model3::Overfit { hidden, per_epoch: 200_000, epochs: 4 }
+    } else if let Some(p) = m.strip_prefix("pretrained:") {
+        let net = std::sync::Arc::new(tang_compress::learned::Net::from_bytes(&std::fs::read(p).expect("model")).expect("parse"));
+        tang_compress::learned::register(net.clone());
+        Model3::Pretrained(net)
+    } else {
+        panic!("model3 {m}")
+    };
+    Gpu3Config { block: bk, block2d: bk, resctx: !args.iter().any(|a| a == "--nores"), lanes: opt(args, "--l3", "1").parse().unwrap(), model, ..Gpu3Config::new(bound) }
 }
 use tang_compress::{wavcodec, Decoded};
 

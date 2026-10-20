@@ -628,6 +628,11 @@ pub struct Feats {
     pub e: usize,
     /// Sign context.
     pub sctx: usize,
+    /// Raw context quantities for a learned model: W, WW, Σfaces, Σdiag,
+    /// Σfar, parent, prediction (values); |W|, |WW|, Σ|faces|, Σ|diag|,
+    /// Σ|far|, |parent|, Σ|parent nbrs| (context magnitudes); counts of
+    /// visible face/diag/far lines; has-parent.
+    pub raw: [i32; 18],
 }
 
 #[inline]
@@ -728,6 +733,26 @@ pub(crate) fn feats(sh: &Shape, b: &BandInfo, rc: &RowCtx, q: &[i32], rs: Option
         sig: ((c * 2 + g) * NA + ab) * NPB + pb,
         e,
         sctx: c * 9 + sgn(wm) * 3 + sgn(sf.wrapping_add(sd)),
+        raw: [
+            wv,
+            wwv,
+            sf,
+            sd,
+            sr,
+            pv,
+            pred,
+            cap(wm) as i32,
+            cap(wwm) as i32,
+            af as i32,
+            ad as i32,
+            ar as i32,
+            cap(pm) as i32,
+            pnb as i32,
+            nf as i32,
+            nd as i32,
+            nr as i32,
+            has_p as i32,
+        ],
     };
     (f, pred)
 }

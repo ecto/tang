@@ -570,6 +570,19 @@ impl GpuDecoder {
         }
         let off_esc = meta.len();
         meta.extend_from_slice(&escs);
+        let mut off_net = 0usize;
+        if let Some(net) = &ps.net {
+            let (sig, pw) = crate::lmodel3::tables();
+            off_net = meta.len();
+            let f = net.flat();
+            let off_sig = off_net + 2 + f.len();
+            let off_pow = off_sig + sig.len();
+            meta.push(off_sig as u32);
+            meta.push(off_pow as u32);
+            meta.extend(f);
+            meta.extend_from_slice(sig);
+            meta.extend_from_slice(pw);
+        }
         let ncells: usize = d3.iter().product();
         let mut params = vec![0u32; NPARAM];
         params[0] = off_shapes as u32;
@@ -594,6 +607,7 @@ impl GpuDecoder {
         params[27] = ps.resctx as u32;
         params[28] = off_tiles as u32;
         params[29] = ps.tiles.len() as u32;
+        params[30] = off_net as u32;
         let mut sw: Vec<u32> = Vec::with_capacity(bytes.len() / 4 + 1);
         for c in bytes.chunks(4) {
             let mut b = [0u8; 4];
@@ -735,6 +749,16 @@ mod tests {
                 let bad = cpu.iter().zip(&gpu).filter(|(a, b)| a != b).count();
                 assert_eq!(bad, 0, "v3 {bound:?} block {block}: {bad} cells differ");
             }
+        }
+        // learned (overfit) probabilities, 1 and 8 lanes
+        for (lanes, bound) in [(1, ErrorBound::Psnr(80.0)), (8, ErrorBound::Psnr(100.0)), (8, ErrorBound::MaxAbs(1e-4))] {
+            let model = crate::gpuwav3::Model3::Overfit { hidden: vec![8], per_epoch: 20_000, epochs: 2 };
+            let cfg = Gpu3Config { block: 16, lanes, tile: 16, model, ..Gpu3Config::new(bound) };
+            let (bytes, _) = encode3_f32(&x, &d, &cfg, 2);
+            let cpu = decode3_box(&bytes, [0; 3], [d[0], d[1], d[2]], 1).unwrap().bits;
+            let (gpu, _) = g.decode3(&bytes).unwrap();
+            let bad = cpu.iter().zip(&gpu).filter(|(a, b)| a != b).count();
+            assert_eq!(bad, 0, "learned v3 lanes {lanes} {bound:?}: {bad} cells differ");
         }
         let (bytes, _) = encode3_f32(&x2, &[70, 90], &Gpu3Config { block2d: 16, tile: 4, ..Gpu3Config::new(ErrorBound::MaxAbs(1e-4)) }, 1);
         let cpu = decode3_box(&bytes, [0; 3], [1, 70, 90], 1).unwrap().bits;

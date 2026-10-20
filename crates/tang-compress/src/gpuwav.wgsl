@@ -670,24 +670,29 @@ fn decode3(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let e = min(firstLeadingBit(1u + 2u * s / ws), NE_u - 1u);
                 let sig = ((cls * 2u + g) * NA_u + ab) * NPB_u + pbk;
                 var r = 0;
-                if (sbit(SIG0u + sig)) {
-                    let k = max(e, 2u) - 2u;
-                    var h = 0u;
-                    let mbase = MAG0u + (cls * NE_u + e) * KB_u;
-                    loop {
-                        if (h >= KB_u) { break; }
-                        if (!sbit(mbase + h)) { break; }
-                        h = h + 1u;
+                if (P.pad4 != 0u) {
+                    let rawv = array<i32, 18>(wv, wwv, sf, sd, sr, pv, pred, i32(cap(wm)), i32(cap(wwm)), i32(af), i32(ad), i32(ar), i32(cap(pm)), i32(pnb), i32(nf), i32(nd), i32(nrr), i32(has_p));
+                    r = learned_res(rawv, cls);
+                } else {
+                    if (sbit(SIG0u + sig)) {
+                        let k = max(e, 2u) - 2u;
+                        var h = 0u;
+                        let mbase = MAG0u + (cls * NE_u + e) * KB_u;
+                        loop {
+                            if (h >= KB_u) { break; }
+                            if (!sbit(mbase + h)) { break; }
+                            h = h + 1u;
+                        }
+                        var hv = h;
+                        if (h == KB_u) { hv = hv + dgamma_s(ESC0u + cls * 32u); }
+                        var lo = 0u;
+                        if (k >= 1u) { lo = select(0u, 1u, sbit(LOW0u + e * 4u)); }
+                        if (k >= 2u) { lo = (lo << 1u) | select(0u, 1u, sbit(LOW0u + e * 4u + 2u + (lo & 1u))); }
+                        if (k >= 3u) { lo = (lo << (k - 2u)) | draw_n(k - 2u); }
+                        let mv = ((hv << k) | lo) + 1u;
+                        let sctx = cls * 9u + sgn3(wm) * 3u + sgn3(sf + sd);
+                        if (sbit(SGN0u + sctx)) { r = -bitcast<i32>(mv); } else { r = bitcast<i32>(mv); }
                     }
-                    var hv = h;
-                    if (h == KB_u) { hv = hv + dgamma_s(ESC0u + cls * 32u); }
-                    var lo = 0u;
-                    if (k >= 1u) { lo = select(0u, 1u, sbit(LOW0u + e * 4u)); }
-                    if (k >= 2u) { lo = (lo << 1u) | select(0u, 1u, sbit(LOW0u + e * 4u + 2u + (lo & 1u))); }
-                    if (k >= 3u) { lo = (lo << (k - 2u)) | draw_n(k - 2u); }
-                    let mv = ((hv << k) | lo) + 1u;
-                    let sctx = cls * 9u + sgn3(wm) * 3u + sgn3(sf + sd);
-                    if (sbit(SGN0u + sctx)) { r = -bitcast<i32>(mv); } else { r = bitcast<i32>(mv); }
                 }
                 let qv = r + pred;
                 coef[rowb + x] = qv;
@@ -871,24 +876,29 @@ fn decode3l(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id)
                 let e = min(firstLeadingBit(1u + 2u * s / ws), NE_u - 1u);
                 let sig = ((cls * 2u + g) * NA_u + ab) * NPB_u + pbk;
                 var r = 0;
-                if (sbit(SIG0u + sig)) {
-                    let k = max(e, 2u) - 2u;
-                    var h = 0u;
-                    let mbase = MAG0u + (cls * NE_u + e) * KB_u;
-                    loop {
-                        if (h >= KB_u) { break; }
-                        if (!sbit(mbase + h)) { break; }
-                        h = h + 1u;
+                if (P.pad4 != 0u) {
+                    let rawv = array<i32, 18>(wv, wwv, sf, sd, sr, pv, pred, i32(cap(wm)), i32(cap(wwm)), i32(af), i32(ad), i32(ar), i32(cap(pm)), i32(pnb), i32(nf), i32(nd), i32(nrr), i32(has_p));
+                    r = learned_res(rawv, cls);
+                } else {
+                    if (sbit(SIG0u + sig)) {
+                        let k = max(e, 2u) - 2u;
+                        var h = 0u;
+                        let mbase = MAG0u + (cls * NE_u + e) * KB_u;
+                        loop {
+                            if (h >= KB_u) { break; }
+                            if (!sbit(mbase + h)) { break; }
+                            h = h + 1u;
+                        }
+                        var hv = h;
+                        if (h == KB_u) { hv = hv + dgamma_s(ESC0u + cls * 32u); }
+                        var lo = 0u;
+                        if (k >= 1u) { lo = select(0u, 1u, sbit(LOW0u + e * 4u)); }
+                        if (k >= 2u) { lo = (lo << 1u) | select(0u, 1u, sbit(LOW0u + e * 4u + 2u + (lo & 1u))); }
+                        if (k >= 3u) { lo = (lo << (k - 2u)) | draw_n(k - 2u); }
+                        let mv = ((hv << k) | lo) + 1u;
+                        let sctx = cls * 9u + sgn3(wm) * 3u + sgn3(sf + sd);
+                        if (sbit(SGN0u + sctx)) { r = -bitcast<i32>(mv); } else { r = bitcast<i32>(mv); }
                     }
-                    var hv = h;
-                    if (h == KB_u) { hv = hv + dgamma_s(ESC0u + cls * 32u); }
-                    var lo = 0u;
-                    if (k >= 1u) { lo = select(0u, 1u, sbit(LOW0u + e * 4u)); }
-                    if (k >= 2u) { lo = (lo << 1u) | select(0u, 1u, sbit(LOW0u + e * 4u + 2u + (lo & 1u))); }
-                    if (k >= 3u) { lo = (lo << (k - 2u)) | draw_n(k - 2u); }
-                    let mv = ((hv << k) | lo) + 1u;
-                    let sctx = cls * 9u + sgn3(wm) * 3u + sgn3(sf + sd);
-                    if (sbit(SGN0u + sctx)) { r = -bitcast<i32>(mv); } else { r = bitcast<i32>(mv); }
                 }
                 let qv = r + pred;
                 coef[rowb + x] = qv;
@@ -900,4 +910,133 @@ fn decode3l(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id)
         storageBarrier();
         workgroupBarrier();
     }
+}
+
+// ---------------------------------------------------------------- learned model (v3)
+// Net at P.pad4: [off_sig, off_pow, nl, sizes(nl+1), per layer W (out x in), b].
+
+fn lg8(v: u32) -> i32 {
+    let w = v + 1u;
+    let e = firstLeadingBit(w);
+    var m = 0u;
+    if (e >= 8u) { m = (w >> (e - 8u)) & 0xFFu; } else { m = (w << (8u - e)) & 0xFFu; }
+    return i32(e) * 256 + i32(m);
+}
+
+fn slg8(v: i32) -> i32 {
+    if (v < 0) { return -lg8(u32(-v)); }
+    return lg8(u32(v));
+}
+
+fn sig16(z: i32) -> u32 {
+    let a = min(u32(abs(z)), 4096u);
+    let s = mt[mt[P.pad4] + a];
+    if (z >= 0) { return s; }
+    return 65536u - s;
+}
+
+fn zval(d0: i32, ls0: i32) -> i32 {
+    let ls = clamp(ls0, -4096, 6144);
+    let i = (ls - ((ls % 256) + 256) % 256) / 256;
+    let f = ls - i * 256;
+    let m = bitcast<i32>(mt[mt[P.pad4 + 1u] + u32(256 - f)]);
+    let t = mulsh(clamp(d0, -33554432, 33554432), m, 16u);
+    let sh = i + 1;
+    if (sh >= 0) { return t >> u32(min(sh, 31)); }
+    let k = u32(-sh);
+    let lim = 4097 >> k;
+    if (t > lim) { return 4097; }
+    if (t < -lim) { return -4097; }
+    return t << k;
+}
+
+var<private> mx_pi: u32;
+var<private> mx_mu0: i32;
+var<private> mx_mu1: i32;
+var<private> mx_ls0: i32;
+var<private> mx_ls1: i32;
+
+fn lcdf(m: i32) -> u32 {
+    let t = clamp(m, -65535, 65535) * 256 + 128;
+    let c0 = sig16(zval(t - mx_mu0, mx_ls0));
+    let c1 = sig16(zval(t - mx_mu1, mx_ls1));
+    return (mx_pi * c0 + (32768u - mx_pi) * c1) >> 15u;
+}
+
+fn ratio16(num: u32, den: u32) -> u32 {
+    var p = 32768u;
+    if (den != 0u) { p = (min(num, den) * 65535u) / den; }
+    return clamp(p, 32u, 65504u);
+}
+
+var<private> l_neg: bool;
+
+fn ltail(m: u32) -> u32 {
+    if (m > (1u << 30u)) { return 0u; }
+    if (l_neg) { return lcdf(-i32(m)); }
+    return 65536u - lcdf(i32(m) - 1);
+}
+
+var<private> na: array<i32, 64>;
+var<private> nb: array<i32, 64>;
+
+fn learned_res(raw: array<i32, 18>, cls: u32) -> i32 {
+    // features (Q8)
+    for (var i = 0u; i < 64u; i = i + 1u) { na[i] = 0; }
+    for (var i = 0u; i < 7u; i = i + 1u) { na[i] = slg8(raw[i]); }
+    for (var i = 7u; i < 14u; i = i + 1u) { na[i] = lg8(u32(raw[i])); }
+    na[14] = raw[14] * 64;
+    na[15] = raw[15] * 32;
+    na[16] = raw[16] * 32;
+    na[17] = raw[17] * 256;
+    na[18u + min(cls, 9u)] = 256;
+    for (var i = 0u; i < 28u; i = i + 1u) { na[i] = clamp(na[i], -16384, 16384); }
+    // MLP
+    let base = P.pad4 + 2u;
+    let nl = mt[base];
+    var wo = base + 2u + nl;
+    for (var l = 0u; l < nl; l = l + 1u) {
+        let ni = mt[base + 1u + l];
+        let no = mt[base + 2u + l];
+        let bo = wo + ni * no;
+        for (var o = 0u; o < no; o = o + 1u) {
+            var acc = bitcast<i32>(mt[bo + o]);
+            for (var i = 0u; i < ni; i = i + 1u) { acc = acc + bitcast<i32>(mt[wo + o * ni + i]) * na[i]; }
+            let v = (acc + 128) >> 8u;
+            if (l + 1u < nl) { nb[o] = clamp(v, 0, 16384); } else { nb[o] = clamp(v, -16384, 16384); }
+        }
+        for (var o = 0u; o < no; o = o + 1u) { na[o] = nb[o]; }
+        wo = bo + no;
+    }
+    mx_pi = sig16(na[0]) >> 1u;
+    mx_mu0 = na[1]; mx_mu1 = na[2]; mx_ls0 = na[3]; mx_ls1 = na[4];
+    // binarization
+    let c0 = lcdf(0);
+    let cm1 = lcdf(-1);
+    let pz = select(0u, c0 - cm1, c0 > cm1);
+    if (!dbit_p(ratio16(65536u - pz, 65536u))) { return 0; }
+    let posm = 65536u - c0;
+    l_neg = dbit_p(ratio16(cm1, cm1 + posm));
+    var k = 0u;
+    loop {
+        if (k >= 30u) { break; }
+        let a = ltail(1u << k);
+        let bb = ltail(1u << (k + 1u));
+        if (!dbit_p(ratio16(bb, a))) { break; }
+        k = k + 1u;
+    }
+    var lo = 1u << k;
+    var hi = (1u << k) + ((1u << k) - 1u);
+    loop {
+        if (lo >= hi) { break; }
+        let mid = lo + (hi - lo + 1u) / 2u;
+        let end = ltail(hi + 1u);
+        let tm = ltail(mid);
+        let tl = ltail(lo);
+        let up = select(0u, tm - end, tm > end);
+        let all = select(0u, tl - end, tl > end);
+        if (dbit_p(ratio16(up, all))) { lo = mid; } else { hi = mid - 1u; }
+    }
+    if (l_neg) { return -bitcast<i32>(lo); }
+    return bitcast<i32>(lo);
 }

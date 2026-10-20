@@ -531,6 +531,11 @@ pub fn register(net: Arc<Net>) {
     }
 }
 
+/// A registered pretrained network by fingerprint.
+pub fn lookup(fp: u64) -> Option<Arc<Net>> {
+    registry().lock().unwrap().iter().find(|n| n.fingerprint() == fp).cloned()
+}
+
 /// Read the model section for `tag` (after the tag byte).
 pub fn read_model(tag: u8, r: &mut ByteReader) -> Result<NetModel, DecodeError> {
     match tag {
