@@ -785,8 +785,9 @@ __device__ void embed_rows(const unsigned char* table, int row_bytes, const unsi
     }
 }
 // A pruned table holds token rows [0, n_lo) then [hi_base, ...): map ids to rows.
-extern "C" __global__ void fe_embed_q3k(const unsigned char* table, int row_bytes, const unsigned* toks, float* out, int k,
-                                        int n_lo, int hi_base) {
+template <int TY>
+__device__ void embed_pruned(const unsigned char* table, int row_bytes, const unsigned* toks, float* out, int k,
+                             int n_lo, int hi_base) {
     __shared__ unsigned row[8];
     if (threadIdx.x == 0) {
         const unsigned t = toks[blockIdx.x];
@@ -796,9 +797,18 @@ extern "C" __global__ void fe_embed_q3k(const unsigned char* table, int row_byte
     const unsigned char* r = table + (size_t)row[0] * row_bytes;
     for (int e0 = threadIdx.x * 8; e0 < k; e0 += blockDim.x * 8) {
         float v[8];
-        decode8<11>(r, e0, v);
+        decode8<TY>(r, e0, v);
         for (int i = 0; i < 8; i++) out[(size_t)blockIdx.x * k + e0 + i] = v[i];
     }
+}
+extern "C" __global__ void fe_embed_q3k(const unsigned char* table, int row_bytes, const unsigned* toks, float* out, int k,
+                                        int n_lo, int hi_base) {
+    embed_pruned<11>(table, row_bytes, toks, out, k, n_lo, hi_base);
+}
+// ISTA's Coder stores the main embedding as IQ4_XS.
+extern "C" __global__ void fe_embed_iq4xs(const unsigned char* table, int row_bytes, const unsigned* toks, float* out, int k,
+                                          int n_lo, int hi_base) {
+    embed_pruned<23>(table, row_bytes, toks, out, k, n_lo, hi_base);
 }
 
 // cat[c][s] = [rmsnorm(e[c]) * enorm ; rmsnorm(h[c][s]) * hnorm[s]] (one block per (cell, stream)).

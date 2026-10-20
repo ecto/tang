@@ -426,6 +426,7 @@ struct Kern {
     stage_copy: Fun,
     wait_if: Fun,
     m_embed: Fun,
+    m_embed_iq4xs: Fun,
     m_cat: Fun,
     m_prep: Fun,
     m_attn: Fun,
@@ -1075,6 +1076,7 @@ impl Engine {
         };
         let k = Kern {
             m_embed: f(&gm, "fe_embed_q3k")?,
+            m_embed_iq4xs: f(&gm, "fe_embed_iq4xs")?,
             m_cat: f(&gm, "fe_mtp_cat")?,
             m_prep: f(&gm, "fe_mtp_prep")?,
             m_attn: f(&gm, "fe_mtp_attn")?,
@@ -3274,6 +3276,8 @@ struct Mtp {
     /// teacher-forced cells' rows come from the host.
     embed: B,
     embed_rb: usize,
+    /// The main embedding is IQ4_XS (ISTA's Coder) rather than Q3_K.
+    embed_iq4xs: bool,
     emb_lo: i32,
     emb_hi: i32,
     /// The draft head: the main head's rows for tokens [0, n_lo) and [hi_base, vocab)
@@ -3424,8 +3428,8 @@ impl Mtp {
         }
         let emb_t = main.info("token_embd.weight")?;
         ensure!(
-            emb_t.ty == GgmlType::Q3K,
-            "main embedding is {:?} (Q3_K expected)",
+            matches!(emb_t.ty, GgmlType::Q3K | GgmlType::Iq4Xs),
+            "main embedding is {:?} (Q3_K or IQ4_XS expected)",
             emb_t.ty
         );
         let z = |n: usize| dev.alloc_f32(n);
@@ -3568,6 +3572,7 @@ impl Mtp {
             },
             short: z(64 * 10 + 256),
             embed_rb: emb_t.row_bytes()?,
+            embed_iq4xs: emb_t.ty == GgmlType::Iq4Xs,
             kc: z(max_ctx * QSA_KV * QSA_D),
             vc: z(max_ctx * QSA_KV * QSA_D),
             part: z(MAX_T * QSA_KV * max_ctx.div_ceil(32) * 12 * 258),
@@ -3624,7 +3629,11 @@ impl Engine {
             );
             if step > 0 {
                 launch(
-                    self.k.m_embed,
+                    if mt.embed_iq4xs {
+                        self.k.m_embed_iq4xs
+                    } else {
+                        self.k.m_embed
+                    },
                     (c as u32, 1, 1),
                     256,
                     tang_moe::args![tb, rb, tk, e, k, lo, hi],
