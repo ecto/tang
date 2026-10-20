@@ -73,11 +73,13 @@ pub struct GpuTimes {
 fn shader_src(lanes: usize, maxl: usize) -> String {
     let k = gpuwav::lift_consts();
     let head = format!(
-        "const LANESu: u32 = {lanes}u;\nconst NMODELu: u32 = {NMODEL}u;\nconst SIG0u: u32 = {SIG0}u;\nconst MAG0u: u32 = {MAG0}u;\nconst LOW0u: u32 = {LOW0}u;\nconst SGN0u: u32 = {SGN0}u;\nconst ESC0u: u32 = {ESC0}u;\nconst KB_u: u32 = {}u;\nconst NE_u: u32 = {}u;\nconst NA_u: u32 = 12u;\nconst NPB_u: u32 = 5u;\nconst BSu: u32 = {BS}u;\nconst SHSu: u32 = {SHS}u;\nconst BRSu: u32 = {BRS}u;\n",
+        "const LANESu: u32 = {lanes}u;\nconst NMODELu: u32 = {NMODEL}u;\nconst SIG0u: u32 = {SIG0}u;\nconst MAG0u: u32 = {MAG0}u;\nconst LOW0u: u32 = {LOW0}u;\nconst SGN0u: u32 = {SGN0}u;\nconst ESC0u: u32 = {ESC0}u;\nconst KB_u: u32 = {}u;\nconst NE_u: u32 = {}u;\nconst NA_u: u32 = 12u;\nconst NPB_u: u32 = 5u;\nconst BSu: u32 = {BS}u;\nconst SHSu: u32 = {SHS}u;\nconst BRSu: u32 = {BRS}u;\nconst BPW: u32 = {}u;\n",
         crate::coefcode::KB,
-        crate::coefcode::NE
+        crate::coefcode::NE,
+        (32 / lanes).max(1)
     );
     let body = include_str!("gpuwav.wgsl")
+        .replace("LANES_WG3", &(lanes * (32 / lanes).max(1)).to_string())
         .replace("LANES_WG", &lanes.to_string())
         .replace("MAXL_N", &maxl.max(2).to_string())
         .replace("KK_LIST", &k.iter().map(|v| format!("{v}")).collect::<Vec<_>>().join(", "));
@@ -693,7 +695,7 @@ impl GpuDecoder {
             p[9] = g0 as u32;
             p[10] = n as u32;
             if pr.lanes > 1 {
-                jobs.push(("decode3l", p, [n as u32, 1, 1]));
+                jobs.push(("decode3l", p, [n.div_ceil((32 / self.lanes).max(1)) as u32, 1, 1]));
             } else {
                 jobs.push(("decode3", p, [n.div_ceil(64) as u32, 1, 1]));
             }

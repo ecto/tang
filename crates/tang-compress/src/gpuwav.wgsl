@@ -771,16 +771,32 @@ fn npass_blk(ez: u32, ey: u32) -> u32 {
     return 1u;
 }
 
-@compute @workgroup_size(LANES_WG)
+// BPW blocks per workgroup (LANES invocations each) fill a 32-wide SIMD group;
+// the pass loop runs to the group's largest pass count, a block with fewer
+// passes just has no lines in the extra passes.
+@compute @workgroup_size(LANES_WG3)
 fn decode3l(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let lane = lid.x;
-    let rec = P.pad0 + (P.brick_base + wid.x) * 10u;
+    let lane = lid.x % LANESu;
+    let slot = lid.x / LANESu;
+    let bidx = wid.x * BPW + slot;
+    let blk_on = bidx < P.batch;
+    let rec = P.pad0 + (P.brick_base + min(bidx, P.batch - 1u)) * 10u;
     let b = mt[rec];
     let x0 = mt[rec + 3u];
     let x1 = mt[rec + 6u];
     let ltab = mt[rec + 9u];
     lane_start(mt[ltab + lane], mt[ltab + lane + 1u]);
-    if (lane == 0u) { wg_u = npass_blk(mt[rec + 4u] - mt[rec + 1u], mt[rec + 5u] - mt[rec + 2u]); }
+    let npass_b = select(0u, npass_blk(mt[rec + 4u] - mt[rec + 1u], mt[rec + 5u] - mt[rec + 2u]), blk_on);
+    if (lid.x == 0u) {
+        var mxp = 0u;
+        for (var k = 0u; k < BPW; k = k + 1u) {
+            if (wid.x * BPW + k < P.batch) {
+                let r2 = P.pad0 + (P.brick_base + wid.x * BPW + k) * 10u;
+                mxp = max(mxp, npass_blk(mt[r2 + 4u] - mt[r2 + 1u], mt[r2 + 5u] - mt[r2 + 2u]));
+            }
+        }
+        wg_u = mxp;
+    }
     let npass = workgroupUniformLoad(&wg_u);
     let ny = P.d1;
     let nx = P.d2;
@@ -802,13 +818,13 @@ fn decode3l(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id)
     let psx = (psh >> 2u) & 1u;
     let sz_ = ny * nx;
     for (var p = 0u; p < npass; p = p + 1u) {
-        let pk = P.off_preds + bf(b, 10u + p) * 6u;
+        let pk = P.off_preds + bf(b, 10u + min(p, 7u)) * 6u;
         let w0 = bitcast<i32>(mt[pk]); let w1 = bitcast<i32>(mt[pk + 1u]); let w2 = bitcast<i32>(mt[pk + 2u]);
         let w3 = bitcast<i32>(mt[pk + 3u]); let w4 = bitcast<i32>(mt[pk + 4u]); let w5 = bitcast<i32>(mt[pk + 5u]);
-        let lt = lattice(npass, zy_is_y, p);
+        let lt = lattice(npass_b, zy_is_y, p);
         var nrows = 0u;
         var cy = 1u;
-        if (lt.x < ez && lt.z < ey) {
+        if (p < npass_b && lt.x < ez && lt.z < ey) {
             cy = (ey - lt.z + lt.w - 1u) / lt.w;
             nrows = ((ez - lt.x + lt.y - 1u) / lt.y) * cy;
         }
@@ -820,7 +836,7 @@ fn decode3l(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id)
                 let z2 = i32(z) + ROWNB_DZ[t];
                 let y2 = i32(y) + ROWNB_DY[t];
                 if (z2 >= i32(z0) && z2 < i32(z1) && y2 >= i32(y0) && y2 < i32(y1)) {
-                    if (pass_of(npass, zy_is_y, u32(z2) - z0, u32(y2) - y0) < p) {
+                    if (pass_of(npass_b, zy_is_y, u32(z2) - z0, u32(y2) - y0) < p) {
                         rb_base[nr] = (u32(z2) * ny + u32(y2)) * nx;
                         rb_cat[nr] = ROWNB_CAT[t];
                         nr = nr + 1u;
