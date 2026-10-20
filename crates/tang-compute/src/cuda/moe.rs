@@ -356,7 +356,7 @@ impl CudaComputeDevice {
                     .arg(&k_u)
                     .arg(&n_u)
                     .arg(&e_u)
-                    .launch(per_elem(n * k / 32))
+                    .launch(per_elem(n * k / 2))
                     .unwrap();
             }
             let xe = self.slice_buffer(&xg, p0 * k, (p1 - p0) * k);

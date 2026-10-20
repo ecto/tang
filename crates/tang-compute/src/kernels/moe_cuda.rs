@@ -316,26 +316,24 @@ extern "C" __global__ void moe_gather(
     for (unsigned int c = threadIdx.x; c < K; c += blockDim.x) XG[(u64)i * K + c] = x[c];
 }
 
-// Expert `e`'s MXFP4 matrix `[N, K]` as f32; grid (ceil(N * K / 32 / 256)), block 256: a
-// thread per 32-weight block.
+// Expert `e`'s MXFP4 matrix `[N, K]` as f32; grid (ceil(N * K / 2 / 256)), block 256: a
+// thread per byte (two weights), so neighbouring threads write neighbouring float2s.
+__device__ __forceinline__ float e2m1(unsigned int q) {
+    unsigned int e = (q >> 1) & 3u, m = q & 1u;
+    float v = e == 0 ? 0.5f * (float)m : __uint_as_float(((e + 126u) << 23) | (m << 22));
+    return (q & 8u) ? -v : v;
+}
+
 extern "C" __global__ void moe_dequant_mxfp4(
     const unsigned char* __restrict__ Wt, float* __restrict__ O, unsigned int e,
     unsigned int K, unsigned int N, unsigned int E)
 {
-    const float lut[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-                           -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
-    u64 b = (u64)blockIdx.x * blockDim.x + threadIdx.x, nb = (u64)N * (K / 32);
-    if (b >= nb) return;
-    const unsigned char* wb = Wt + (u64)e * N * (K / 2) + b * 16;
-    unsigned int s = Wt[(u64)E * N * (K / 2) + (u64)e * nb + b];
+    u64 t = (u64)blockIdx.x * blockDim.x + threadIdx.x, nbytes = (u64)N * (K / 2);
+    if (t >= nbytes) return;
+    unsigned int q = Wt[(u64)e * nbytes + t];
+    unsigned int s = Wt[(u64)E * nbytes + (u64)e * (nbytes / 16) + t / 16];
     float sc = s == 0 ? __uint_as_float(1u << 22) : __uint_as_float(s << 23);
-    float* o = O + b * 32;
-    #pragma unroll
-    for (int j = 0; j < 16; j++) {
-        unsigned int q = wb[j];
-        o[2 * j] = lut[q & 15u] * sc;
-        o[2 * j + 1] = lut[q >> 4] * sc;
-    }
+    ((float2*)O)[t] = make_float2(e2m1(q & 15u) * sc, e2m1(q >> 4) * sc);
 }
 
 // Y[LIST[i]] = YG[i] + bias of pick LIST[i]'s expert; grid (picks), block 256.
