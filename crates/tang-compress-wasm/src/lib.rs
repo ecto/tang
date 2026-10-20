@@ -33,6 +33,8 @@ pub fn format_of(bytes: &[u8]) -> Result<Format, String> {
     match bytes.get(..4) {
         Some(m) if m == gpuwav::MAGIC => Ok(Format::V1),
         Some(m) if m == gpuwav3::MAGIC3 => Ok(Format::V3),
+        // TCG3 carrying its own decoder (verified + compiled by parse3)
+        Some(m) if m == tang_compress::shipdec::MAGIC => Ok(Format::V3),
         _ => Err("not a TCG1/TCG3 stream".into()),
     }
 }

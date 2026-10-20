@@ -317,6 +317,34 @@ mod tests {
         }
     }
 
+    /// A pretrained-model stream (only the fingerprint inside) decodes with no
+    /// registered model once the MLP ships as a graph.
+    #[test]
+    fn shipped_mlp_needs_no_registry() {
+        let path = std::env::var("TC_TEST_TCM").unwrap_or_else(|_| "/Users/cam/Developer/tang-compress/bench/models/pre3v4_16.tcm".into());
+        let Ok(tcm) = std::fs::read(&path) else {
+            eprintln!("no {path}; skipping");
+            return;
+        };
+        let net = Arc::new(crate::learned::Net::from_bytes(&tcm).unwrap());
+        let d = [20, 37, 45];
+        let cfg = Gpu3Config { block: 16, lanes: 8, tile: 16, model: Model3::Pretrained(net.clone()), ..Gpu3Config::new(ErrorBound::Psnr(80.0)) };
+        let (s, _) = encode3_f32(&field(d), &d, &cfg, 2);
+        assert!(parse3(&s).is_err(), "model must not be registered yet");
+        let prog = builtin_program(Some(&Net32::new(&net)));
+        let w = wrap(&s, &prog);
+        let got = decode3_box(&w, [0; 3], d, 2).unwrap().bits;
+        #[cfg(feature = "gpu")]
+        let gpu = crate::gpudec::GpuDecoder::new(8, 64).ok().map(|g| g.decode3(&w).unwrap().0);
+        crate::learned::register(net);
+        let want = decode3_box(&s, [0; 3], d, 2).unwrap().bits;
+        assert!(got == want);
+        #[cfg(feature = "gpu")]
+        if let Some(gv) = gpu {
+            assert!(gv == want, "gpu, shipped MLP");
+        }
+    }
+
     #[test]
     fn corrupt_programs_are_rejected_not_run() {
         let s = &streams()[1].1;

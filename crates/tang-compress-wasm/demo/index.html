@@ -20,7 +20,7 @@
 <p id="status" class="muted">loading…</p>
 <p>
   <select id="pick"></select> <button id="show">decode + show</button>
-  <label>or a file <input type="file" id="file" accept=".tc,.tcg1,.tcg3"></label>
+  <label>or a file <input type="file" id="file" accept=".tc,.tcg1,.tcg3,.tcs3"></label>
   <button id="gate">run gate (all streams)</button>
 </p>
 <p>slice z <input type="range" id="z" min="0" max="0" value="0"> <span id="zv"></span></p>
@@ -100,7 +100,7 @@ async function gate() {
   const gb = (r) => (r.cells * 4) / 1e9;
   const geo = (f) => Math.exp(rows.reduce((a, r) => a + Math.log(f(r)), 0) / rows.length);
   const summary = { adapter: gpu.adapter(), streams: rows.length, identical: ok, wall_s: (performance.now() - t00) / 1e3 };
-  for (const fmt of ["tcg1", "tcg3s", "tcg3l"]) {
+  for (const fmt of ["tcg1", "tcg3s", "tcg3l", "tcs3s", "tcs3l"]) {
     const rs = rows.filter((r) => r.format === fmt);
     if (!rs.length) continue;
     const sum = (k) => rs.reduce((a, r) => a + r[k], 0), cells = rs.reduce((a, r) => a + gb(r), 0);
