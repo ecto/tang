@@ -26,6 +26,7 @@ pub mod sample;
 pub mod scheduler;
 pub mod server;
 pub mod slots;
+pub mod step_cost;
 mod structured;
 pub mod vae;
 pub mod vision;

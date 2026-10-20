@@ -13,7 +13,9 @@
 //! recently used to make room, and keeps 1 on CUDA. `TANG_KV_SLOTS` sets the default;
 //! `TANG_KV_BUDGET=<GB>` sets the memory cap (with any slot count). Up to one request per slot
 //! decodes at once, batched into the same forward passes (`TANG_MAX_BATCH` caps it; see
-//! `docs/batching.md`). KV is kept in 256-position
+//! `docs/batching.md`). While streams decode, a step takes at most `TANG_STEP_MS` (default 50;
+//! 0 for no limit): prefill chunks shrink to fit, sized by a step-time model calibrated at load
+//! (`TANG_CALIBRATE=0` skips that) and refined as steps run. KV is kept in 256-position
 //! blocks shared by content: a conversation whose prompt starts like another's reuses that one's
 //! blocks instead of prefilling them. Keyed conversations' blocks are also saved to
 //! `~/.cache/tang/kv/` after each turn (each block once) and read back instead of prefilled;
@@ -729,6 +731,27 @@ fn serve_on<D: ComputeDevice + 'static>(
             .and_then(|b| b.parse().ok())
         {
             e.set_max_batch(b);
+        }
+        // A step's time budget while streams decode, in ms (0: whole prefill chunks always).
+        let step_ms = std::env::var("TANG_STEP_MS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(tang_llm::engine::STEP_BUDGET * 1e3);
+        e.set_step_budget((step_ms > 0.0).then_some(step_ms / 1e3));
+        if e.max_batch() > 1 && std::env::var("TANG_CALIBRATE").as_deref() != Ok("0") {
+            let t = std::time::Instant::now();
+            e.calibrate()?;
+            let c = e.step_cost().coef();
+            eprintln!(
+                "tang-llm: step cost calibrated in {:.1}s: {:.1} ms + {:.2} ms a decode row; a prefill chunk {:.1} ms + {:.2} ms a token (+{:.3} per 1k of prefix); step budget {}",
+                t.elapsed().as_secs_f32(),
+                c[0] * 1e3,
+                c[1] * 1e3,
+                c[2] * 1e3,
+                c[3],
+                c[4],
+                if step_ms > 0.0 { format!("{step_ms:.0} ms") } else { "off".into() },
+            );
         }
         if let Some((dir, bytes)) = disk {
             e.set_kv_store(dir.clone(), bytes)?;

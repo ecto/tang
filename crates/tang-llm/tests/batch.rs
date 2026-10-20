@@ -106,7 +106,7 @@ fn step<D: ComputeDevice>(
             ctl: &mut **c,
         });
     }
-    e.step(&mut lanes, 512).unwrap();
+    e.step(&mut lanes).unwrap();
 }
 
 fn alone<D: ComputeDevice>(e: &mut Engine<D>, r: &Request) -> Vec<u32> {
@@ -336,4 +336,65 @@ fn the_server_decodes_concurrent_requests_together() {
         watch.join().unwrap() > 1,
         "/node never showed more than one running"
     );
+}
+
+#[test]
+fn decode_steps_keep_their_time_budget_while_a_long_prompt_prefills() {
+    let Some(spec) = model() else { return };
+    let mut e = engine(&spec, 3);
+    e.calibrate().unwrap();
+    e.calibrate().unwrap();
+    let mut streams: Vec<Option<Stream<_>>> = vec![
+        Some(
+            e.admit(&req("Count from one to a thousand in words.", 4000), None)
+                .unwrap(),
+        ),
+        Some(
+            e.admit(
+                &req("Tell a very long story about a lighthouse.", 4000),
+                None,
+            )
+            .unwrap(),
+        ),
+        None,
+    ];
+    let mut ctls: Vec<Ctl> = (0..3).map(|_| Ctl::default()).collect();
+    let timed = |e: &mut Engine<_>, streams: &mut [Option<Stream<_>>], ctls: &mut [Ctl]| {
+        let t = std::time::Instant::now();
+        step(e, streams, ctls);
+        t.elapsed().as_secs_f64()
+    };
+    let mut plain = Vec::new();
+    for i in 0..40 {
+        let s = timed(&mut e, &mut streams, &mut ctls);
+        if i >= 10 {
+            plain.push(s);
+        }
+    }
+    plain.sort_by(f64::total_cmp);
+    // A budget a few decode steps long: room for small chunks.
+    let budget = (4.0 * plain[plain.len() / 2]).max(0.015);
+    e.set_step_budget(Some(budget));
+    streams[2] = Some(e.admit(&req(&long_text(), 4), None).unwrap());
+    let mut during = Vec::new();
+    while streams[2].as_ref().unwrap().prefilling() {
+        during.push(timed(&mut e, &mut streams, &mut ctls));
+        assert!(during.len() < 100_000);
+    }
+    during.sort_by(f64::total_cmp);
+    let p90 = during[during.len() * 9 / 10];
+    eprintln!(
+        "decode {:.1} ms; budget {:.1} ms; during prefill p50 {:.1} p90 {p90:.4} max {:.1} ({} steps)",
+        plain[plain.len() / 2] * 1e3,
+        budget * 1e3,
+        during[during.len() / 2] * 1e3,
+        during.last().unwrap() * 1e3,
+        during.len()
+    );
+    assert!(
+        during.len() > 4,
+        "the prompt went in {} steps",
+        during.len()
+    );
+    assert!(p90 <= 1.3 * budget, "p90 {p90} over a {budget} budget");
 }

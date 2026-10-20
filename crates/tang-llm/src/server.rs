@@ -125,6 +125,8 @@ struct Kv {
     store: Option<PathBuf>,
     /// Device memory the block pool holds.
     pool_bytes: usize,
+    /// The fitted step-time model (see `crate::step_cost`), if the backend keeps one.
+    step_cost: Option<Value>,
 }
 
 struct Running {
@@ -219,12 +221,16 @@ pub trait Backend {
         anyhow::bail!("this backend doesn't batch")
     }
     /// One step for every lane (see [`Engine::step`]).
-    fn step(&mut self, _lanes: &mut [DynLane<'_>], _budget: usize) -> anyhow::Result<()> {
+    fn step(&mut self, _lanes: &mut [DynLane<'_>]) -> anyhow::Result<()> {
         anyhow::bail!("this backend doesn't batch")
     }
     /// Done with a stream (see [`Engine::retire`]).
     fn retire(&mut self, _s: Inflight) -> anyhow::Result<Outcome> {
         anyhow::bail!("this backend doesn't batch")
+    }
+    /// The fitted step-time model, for `/node`.
+    fn step_cost(&self) -> Option<Value> {
+        None
     }
     /// A stream's state: (done, still prefilling).
     fn stream_state(&self, _s: &Inflight) -> (bool, bool) {
@@ -316,7 +322,7 @@ impl<D: ComputeDevice + 'static> Backend for Engine<D> {
     ) -> anyhow::Result<Inflight> {
         Ok(Box::new(Engine::admit(self, req, prompt)?))
     }
-    fn step(&mut self, lanes: &mut [DynLane<'_>], budget: usize) -> anyhow::Result<()> {
+    fn step(&mut self, lanes: &mut [DynLane<'_>]) -> anyhow::Result<()> {
         let mut typed: Vec<crate::engine::Lane<'_, D::Buffer>> = lanes
             .iter_mut()
             .map(|l| crate::engine::Lane {
@@ -328,13 +334,16 @@ impl<D: ComputeDevice + 'static> Backend for Engine<D> {
                 ctl: &mut *l.ctl,
             })
             .collect();
-        Engine::step(self, &mut typed, budget)
+        Engine::step(self, &mut typed)
     }
     fn retire(&mut self, s: Inflight) -> anyhow::Result<Outcome> {
         let s = s
             .downcast::<crate::engine::Stream<D::Buffer>>()
             .expect("a stream this engine admitted");
         Engine::retire(self, *s)
+    }
+    fn step_cost(&self) -> Option<Value> {
+        Some(Engine::step_cost(self).json())
     }
     fn stream_state(&self, s: &Inflight) -> (bool, bool) {
         let s: &crate::engine::Stream<D::Buffer> =
@@ -713,7 +722,7 @@ where
                 ctl,
             })
             .collect();
-        let result = engine.step(&mut lanes, crate::engine::PREFILL_CHUNK);
+        let result = engine.step(&mut lanes);
         drop(lanes);
         drop(ctls);
         drop(picked);
@@ -857,6 +866,7 @@ where
             keys: e.cached_keys(),
             store: e.kv_store_dir().map(PathBuf::from),
             pool_bytes: e.kv_bytes(),
+            step_cost: e.step_cost(),
         };
         self.with_loaded(|l| l.kv = kv);
     }
@@ -1092,6 +1102,7 @@ fn describe(node: &Node) -> Value {
                     "kv_bytes": m.kv.pool_bytes,
                 },
                 "rates": m.rates.json(),
+                "step_cost": m.kv.step_cost,
                 "kv": {
                     "block_positions": crate::blocks::BLOCK,
                     "memory_blocks": blocks.iter().map(hex).collect::<Vec<_>>(),
