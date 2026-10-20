@@ -98,6 +98,56 @@ impl TensorGraph {
     }
 }
 
+/// Prefill on OpenCL: the reductions to run as register tiles, and the
+/// graph with their schedules. A sum over at least 64 terms whose two
+/// innermost point dims are both at least 16 wide (tokens × outputs) and
+/// that reads no packed input — the dequantized weights of a prefill are
+/// materialized f32 maps — gets `TANG_CL_PREFILL_TILE` (default 8x8x16:
+/// 8×8 threads, k chunk 16) with `TANG_CL_PREFILL_REG` registers (default
+/// 4x8), the shape the Adreno 740 ran fastest for hear's projections. The
+/// warp GEMV it replaces re-reads the weight once per token.
+pub(super) fn prefill_tiles(g: &TensorGraph, opts: &DecodeOpts) -> (TensorGraph, Vec<usize>) {
+    let parse = |k: &str, d: &[u32]| -> Vec<u32> {
+        std::env::var(k)
+            .ok()
+            .map(|v| {
+                v.split('x')
+                    .filter_map(|x| x.parse().ok())
+                    .collect::<Vec<u32>>()
+            })
+            .filter(|v| v.len() == d.len())
+            .unwrap_or_else(|| d.to_vec())
+    };
+    let t = parse("TANG_CL_PREFILL_TILE", &[8, 8, 16]);
+    let r = parse("TANG_CL_PREFILL_REG", &[4, 8]);
+    let input_node = |k: usize| {
+        (0..g.nodes.len()).find(|&i| matches!(g.nodes[i].op, super::Op::Input(j) if j == k))
+    };
+    let packed: Vec<usize> = opts
+        .packed
+        .iter()
+        .filter_map(|&(k, _)| input_node(k))
+        .collect();
+    let mut out = g.clone();
+    let mut tiles = Vec::new();
+    for i in 0..g.nodes.len() {
+        let n = &g.nodes[i];
+        if n.inline {
+            continue;
+        }
+        let Some(c) = g.comp_at(i) else { continue };
+        let red: usize = c.red.iter().map(|d| d.n()).product();
+        let shape: Vec<usize> = n.shape.iter().map(|d| d.n()).collect();
+        let wide = shape.len() >= 2 && shape[shape.len() - 1] >= 16 && shape[shape.len() - 2] >= 16;
+        let reads_packed = g.deps(i).iter().any(|d| packed.contains(d));
+        if c.monoid.is_some() && red >= 64 && wide && !reads_packed {
+            out.set_schedule(TensorId::from_index(i), 0, (t[0], t[1], t[2]), (r[0], r[1]));
+            tiles.push(i);
+        }
+    }
+    (out, tiles)
+}
+
 /// Marker line (after the kernel's first line) that the runtime replaces
 /// with its shuffle definition.
 pub const SHFL_MARKER: &str = "// TANG_SHFL\n";
@@ -201,7 +251,7 @@ pub(super) fn transliterate(src: &str, reads: &[usize], donor: Option<usize>) ->
         body.push('\n');
     }
     // __ldg(p) is *p
-    let mut s = rewrite_calls(&body, "__ldg(", |a| format!("(*({a}))"));
+    let s = rewrite_calls(&body, "__ldg(", |a| format!("(*({a}))"));
     // (&v.x)[i] — a vector's element by index. The index is a constant once
     // the loops unroll; a select chain folds to a register read, where
     // taking the vector's address (`((T*)&v)[i]`) would put the whole

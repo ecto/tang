@@ -217,6 +217,29 @@ impl TensorGraph {
         opts: &DecodeOpts,
         target: DecodeTarget,
     ) -> DecodeProgram {
+        // OpenCL prefill: matmuls over unpacked operands as register tiles
+        // (super::opencl_gemv::prefill_tiles), lowered by the generic tile
+        // kernel and transpiled, not as per-token warp GEMVs
+        let tiled;
+        let mut tiles: Vec<usize> = Vec::new();
+        let this = if target == DecodeTarget::OpenCl && opts.mma {
+            let (g, t) = super::opencl_gemv::prefill_tiles(self, opts);
+            tiled = g;
+            tiles = t;
+            &tiled
+        } else {
+            self
+        };
+        this.to_decode_with(outputs, opts, target, &tiles)
+    }
+
+    fn to_decode_with(
+        &self,
+        outputs: &[TensorId],
+        opts: &DecodeOpts,
+        target: DecodeTarget,
+        tiles: &[usize],
+    ) -> DecodeProgram {
         let mut program = self.to_program_numbered(outputs, Target::Wgsl);
         let input_node = |k: usize| {
             (0..self.nodes.len())
@@ -280,6 +303,7 @@ impl TensorGraph {
             };
             let got = match donor {
                 Some(d) => lw.inplace_update(root, d),
+                None if tiles.contains(&root) => None,
                 None => mma()
                     .or_else(|| lw.warp_reduction(root))
                     .or_else(|| lw.point_map(root)),
