@@ -52,6 +52,11 @@ fn main() {
 /// CUDA when built with it and a device is present, else wgpu (Metal:
 /// the MSL decode kernels).
 fn runtime() -> Runtime {
+    // TANG_BACKEND=opencl: the OpenCL decode kernels (the K1's Adreno)
+    #[cfg(feature = "opencl")]
+    if std::env::var("TANG_BACKEND").as_deref() == Ok("opencl") {
+        return Runtime::opencl().expect("no OpenCL GPU");
+    }
     #[cfg(feature = "cuda")]
     if let Some(rt) = Runtime::cuda_capturable() {
         return rt;
@@ -74,6 +79,7 @@ fn lower(
         _ => match rt.kind() {
             BackendKind::Cuda => g.to_cuda_decode(outs, opts),
             BackendKind::Wgpu => g.to_msl_decode(outs, opts),
+            BackendKind::OpenCl => g.to_opencl_decode(outs, opts),
         },
     }
 }
@@ -165,6 +171,8 @@ impl Step {
                     "metal"
                 } else if rt.kind() == BackendKind::Cuda {
                     "cu"
+                } else if rt.kind() == BackendKind::OpenCl {
+                    "cl"
                 } else {
                     "wgsl"
                 };
@@ -875,6 +883,10 @@ fn model(args: &[String]) {
     dims.vocab_chunks = match env("QWEN_VOCAB_CHUNKS") {
         0 => match &rt {
             Runtime::Wgpu { device, .. } if !device.msl_passthrough => 4,
+            // OpenCL buffers top out at CL_DEVICE_MAX_MEM_ALLOC_SIZE (256 MiB on the Adreno)
+            _ if rt.kind() == BackendKind::OpenCl => {
+                (dims.vocab * dims.d_model / 2).div_ceil(255 << 20).max(1)
+            }
             _ => 1,
         },
         n => n,

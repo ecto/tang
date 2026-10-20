@@ -93,6 +93,7 @@ pub(super) enum DecodeTarget {
     Cuda,
     Msl,
     Glsl,
+    OpenCl,
 }
 
 /// Options of [`TensorGraph::to_cuda_decode`].
@@ -255,7 +256,7 @@ impl TensorGraph {
                     return None;
                 }
                 // no matrix-tile lowering in GLSL yet: the warp kernels
-                if target == DecodeTarget::Glsl {
+                if target == DecodeTarget::Glsl || target == DecodeTarget::OpenCl {
                     return None;
                 }
                 if target == DecodeTarget::Msl {
@@ -304,6 +305,14 @@ impl TensorGraph {
                             let kept: Vec<usize> = k.reads.iter().map(|t| t.index()).collect();
                             super::glsl_gemv::transliterate(&kern.source, &kept, donor)
                         }
+                        DecodeTarget::OpenCl => {
+                            // as for Metal: the donor is read through `out`
+                            if let Some(d) = donor {
+                                k.reads.retain(|t| t.index() != d);
+                            }
+                            let kept: Vec<usize> = k.reads.iter().map(|t| t.index()).collect();
+                            super::opencl_gemv::transliterate(&kern.source, &kept, donor)
+                        }
                     };
                     k.workgroup_size = kern.threads as u32;
                     k.count = (kern.blocks * kern.threads) as u32;
@@ -322,6 +331,9 @@ impl TensorGraph {
                     );
                     if target == DecodeTarget::Cuda {
                         k.source = super::cuda::wgsl_to_cuda(&k.source, k.workgroup_size);
+                    }
+                    if target == DecodeTarget::OpenCl {
+                        k.source = super::opencl::wgsl_to_opencl(&k.source, k.workgroup_size);
                     }
                     native.push(false);
                 }
