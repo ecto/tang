@@ -123,7 +123,7 @@ GPU tenants (nvidia-smi pmon, 1 s): the images Kodak campaign was still running 
 | 32×16, APM 10,14,15 | 0.914 | **1.058** | 1.16× |
 | static | 1.591 | 1.732 | 1.09× |
 
-The static stream gets faster too (it no longer carries the stub-free 17 KB array), so learned relative to static improves less: 1.06× for 16-hidden APM.
+The static stream gets faster too (its pipeline no longer carries the 17 KB array either), so learned relative to static improves less: 1.06× for 16-hidden APM.
 
 **Gate (learned 16-hidden ≥ 1.0 GB/s or ≥ 1.15×): met** (1.10 GB/s, 1.15×). Rounds 1 and 5 each had one contended outlier (base 16-hidden no-APM 0.921, new static 1.417 and 16-hidden APM 0.906); medians exclude their effect.
 
