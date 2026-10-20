@@ -13,3 +13,7 @@
 
 # per-device autotune cache written by tang-bench
 /crates/tang-bench/target
+/bench/fresh
+/bench/data
+/bench/.venv
+/bench/third_party

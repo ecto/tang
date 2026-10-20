@@ -304,6 +304,18 @@ pub fn encode_f32(x: &[f32], dims: &[usize], b: f64) -> Vec<u8> {
         .unwrap()
 }
 
+/// Fast-mode preset index into the `(α, β)` table (the one most often kept
+/// by [`encode_f32`] on the seen fields).
+pub const FAST_TUNE: usize = 1;
+
+/// [`encode_f32`] with a single `(α, β)` preset ([`FAST_TUNE`]).
+pub fn encode_fast_f32(x: &[f32], dims: &[usize], b: f64) -> Vec<u8> {
+    assert_eq!(x.len(), dims.iter().product::<usize>(), "dims do not match data");
+    assert!(!dims.is_empty() && dims.len() <= 255 && b > 0.0);
+    let i = std::env::var("TC_FAST_TUNE").ok().and_then(|v| v.parse().ok()).unwrap_or(FAST_TUNE);
+    encode_with(x, dims, b, TUNE[i])
+}
+
 /// Decode an interpolation stream.
 pub fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
     let mut rd = ByteReader::new(bytes);

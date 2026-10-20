@@ -52,12 +52,15 @@ pub struct WavConfig {
     pub rho: f64,
     /// Coefficient model.
     pub model: ModelChoice,
+    /// Fast mode: step from a formula on the target ([`fast_step`]) with at
+    /// most a few corrective error checks instead of a bisection search.
+    pub fast: bool,
 }
 
 impl WavConfig {
     /// Defaults for a bound.
     pub fn new(bound: ErrorBound) -> Self {
-        Self { bound, rho: 0.45, model: ModelChoice::Hand }
+        Self { bound, rho: 0.45, model: ModelChoice::Hand, fast: false }
     }
 }
 
@@ -415,6 +418,60 @@ fn encode_at(
     (w.buf, st, y)
 }
 
+/// Fast-mode step ratios `Δ / target`: RMSE targets (`Δ = k·rmse`) and
+/// max-abs bounds (`Δ = k·b`). Calibrated on the 19 seen fields.
+pub const FAST_K_RMSE: f64 = 4.0;
+/// See [`FAST_K_RMSE`].
+pub const FAST_K_MAXABS: f64 = 2.2;
+
+/// Step for an RMSE target: start from the formula `Δ = k·t`, then take
+/// log–log secant steps on the measured error (`rmse ∝ Δ^γ`), aiming 1% under
+/// the target, for at most `checks` trials. Returns the largest tried step
+/// that met the target (or the last one, halved, when none did) and the
+/// number of trials.
+pub fn fast_step(t: f64, checks: usize, rmse_at: impl Fn(f64) -> f64) -> (f64, usize) {
+    let k = std::env::var("TC_FAST_K").ok().and_then(|v| v.parse().ok()).unwrap_or(FAST_K_RMSE);
+    let aim = 0.99 * t;
+    let mut d = k * t;
+    let mut prev: Option<(f64, f64)> = None;
+    let mut best: Option<f64> = None;
+    let mut n = 0;
+    while n < checks {
+        let e = rmse_at(d).max(f64::MIN_POSITIVE);
+        n += 1;
+        if e <= t && best.is_none_or(|b| d > b) {
+            best = Some(d);
+        }
+        if (e - aim).abs() <= 0.01 * t {
+            break;
+        }
+        let g = match prev {
+            Some((d0, e0)) if (e / e0).ln().abs() > 1e-6 => ((e / e0).ln() / (d / d0).ln()).clamp(0.2, 2.0),
+            _ => 1.0,
+        };
+        prev = Some((d, e));
+        d *= (aim / e).powf(1.0 / g);
+    }
+    (best.unwrap_or(d * 0.5), n)
+}
+
+/// Coefficient-domain estimate of [`trial_rmse`]: the band-weighted
+/// quantization error, without the inverse transform.
+fn coef_rmse(co: &Coeffs, delta: f64, rho: f64) -> f64 {
+    let (q, d) = quantize(co, delta, rho);
+    let mut se = 0.0;
+    for ((&c, &v), &k) in co.c.iter().zip(&q).zip(&co.cls) {
+        let r = if v == 0 {
+            0.0
+        } else {
+            let j = k as usize * 3 + (v.unsigned_abs() as usize).min(3) - 1;
+            (v.unsigned_abs() as f64 - d[j] as f64 / 512.0) * delta * (v.signum() as f64)
+        };
+        se += (c - r) * (c - r);
+    }
+    (se / co.c.len().max(1) as f64).sqrt()
+}
+
 /// Error of the lossy layer alone at step `delta` (no entropy coding).
 fn trial_rmse(x: &[f64], co: &Coeffs, delta: f64, rho: f64, dt: Dtype) -> f64 {
     let (q, d) = quantize(co, delta, rho);
@@ -433,6 +490,28 @@ fn encode_impl(x: &[f64], dims: &[usize], dt: Dtype, cfg: &WavConfig) -> (Vec<u8
     };
     let (bytes, mut st) = if let Some(t) = rmse_target {
         let t = t.max(f64::MIN_POSITIVE);
+        if cfg.fast {
+            // secant on the coefficient-domain error, then verify for real
+            let (mut d, mut passes) = fast_step(t, 5, |d| coef_rmse(&co, d, cfg.rho));
+            for _ in 0..3 {
+                let e = trial_rmse(x, &co, d, cfg.rho, dt);
+                passes += 1;
+                if e <= t {
+                    break;
+                }
+                d *= 0.99 * t / e;
+            }
+            // last resort: halve until met (never taken on the seen fields)
+            while trial_rmse(x, &co, d, cfg.rho, dt) > t && passes < 60 {
+                d *= 0.5;
+                passes += 1;
+            }
+            let (b, mut s, _) = encode_at(x, &co, &h, d, cfg, None);
+            s.passes = passes;
+            s.range = range;
+            s.bits_per_value = 8.0 * b.len() as f64 / x.len() as f64;
+            return (b, s);
+        }
         // bracket then bisect log Δ on the measured RMSE
         let mut lo = t * 0.5;
         let mut hi = t * 8.0;
@@ -461,6 +540,14 @@ fn encode_impl(x: &[f64], dims: &[usize], dt: Dtype, cfg: &WavConfig) -> (Vec<u8
         (b, s)
     } else {
         let ErrorBound::MaxAbs(b) = cfg.bound else { unreachable!() };
+        if cfg.fast {
+            let k = std::env::var("TC_FAST_KM").ok().and_then(|v| v.parse().ok()).unwrap_or(FAST_K_MAXABS);
+            let (bytes, mut s, _) = encode_at(x, &co, &h, k * b, cfg, Some(b));
+            s.passes = 1;
+            s.range = range;
+            s.bits_per_value = 8.0 * bytes.len() as f64 / x.len() as f64;
+            return (bytes, s);
+        }
         // search the wavelet step with the hand model (cheap), then code the
         // winner with the configured model
         let hand = WavConfig { model: ModelChoice::Hand, ..cfg.clone() };
