@@ -265,6 +265,14 @@ pub struct Coder {
     pub last: WinStats,
     pub last_commit_ms: f64,
     pub load_report: String,
+    /// `TANG_CODER_PROF=1` (eager windows): GPU time per stage, by name, summed.
+    prof: Option<std::cell::RefCell<Prof>>,
+}
+
+#[derive(Default)]
+struct Prof {
+    marks: Vec<(&'static str, gpu::Event)>,
+    total: std::collections::BTreeMap<&'static str, (f64, usize)>,
 }
 
 impl Coder {
@@ -609,6 +617,9 @@ impl Coder {
             last: WinStats::default(),
             last_commit_ms: 0.0,
             load_report,
+            prof: std::env::var("TANG_CODER_PROF")
+                .is_ok_and(|v| v == "1")
+                .then(|| std::cell::RefCell::new(Prof::default())),
         })
     }
 
@@ -637,6 +648,72 @@ impl Coder {
         args: &mut [*mut std::ffi::c_void],
     ) {
         gpu::launch(f, grid, (block, 1, 1), 0, &self.stream, args).expect("launch");
+        if self.prof.is_some() {
+            self.mark(self.kname(f));
+        }
+    }
+
+    fn kname(&self, f: Fun) -> &'static str {
+        let k = &self.k;
+        [
+            (k.add_norm, "add_norm"),
+            (k.route, "route"),
+            (k.moe_gu, "moe_gu"),
+            (k.silu_q, "silu_q"),
+            (k.moe_down, "moe_down"),
+            (k.silu, "sh_silu"),
+            (k.moe_add, "moe_add"),
+            (k.prep, "attn_prep"),
+            (k.part, "attn_part"),
+            (k.merge, "attn_merge"),
+            (k.gdn_conv, "gdn_conv"),
+            (k.gdn_step, "gdn_step"),
+            (k.gdn_commit, "gdn_commit"),
+            (k.copy, "copy"),
+            (k.argmax1, "argmax"),
+            (k.argmax2, "argmax"),
+            (k.q8, "moe_q8"),
+        ]
+        .into_iter()
+        .find(|(g, _)| *g == f)
+        .map_or("other", |(_, n)| n)
+    }
+
+    /// Profiling: everything enqueued since the previous mark is charged to `name`.
+    fn mark(&self, name: &'static str) {
+        if let Some(p) = &self.prof {
+            let ev = gpu::Event::new(true).expect("event");
+            ev.record(&self.stream).expect("record");
+            p.borrow_mut().marks.push((name, ev));
+        }
+    }
+
+    /// Fold the window's marks into the totals.
+    fn prof_collect(&self) {
+        let Some(p) = &self.prof else { return };
+        let mut p = p.borrow_mut();
+        let marks = std::mem::take(&mut p.marks);
+        for w in marks.windows(2) {
+            let ms = w[1].1.since(&w[0].1).unwrap_or(0.0) as f64;
+            let e = p.total.entry(w[1].0).or_default();
+            e.0 += ms;
+            e.1 += 1;
+        }
+    }
+
+    /// The profile so far, by stage (`TANG_CODER_PROF=1`).
+    pub fn prof_report(&self) -> Option<String> {
+        let p = self.prof.as_ref()?.borrow();
+        let tot: f64 = p.total.values().map(|v| v.0).sum();
+        let mut v: Vec<_> = p.total.iter().collect();
+        v.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0));
+        Some(
+            v.iter()
+                .map(|(k, (ms, n))| {
+                    format!("  {k:14} {ms:9.2} ms  x{n:<6} {:5.1}%\n", 100.0 * ms / tot)
+                })
+                .collect(),
+        )
     }
 
     fn io_dev(&self, off: usize) -> u64 {
@@ -658,7 +735,7 @@ impl Coder {
 
     /// `out[t][off + row] = W · x[t]` for every row of `w` (f32 `x`, `w.k` wide), outputs
     /// `ostride` apart.
-    fn gemv(&self, w: &Dense, x: u64, out: u64, t: usize, ostride: usize) {
+    fn gemv(&self, name: &'static str, w: &Dense, x: u64, out: u64, t: usize, ostride: usize) {
         let (sp, ns, os, r16, xq, ki) = (
             self.a(&w.segs),
             w.nseg,
@@ -687,6 +764,7 @@ impl Coder {
             )
             .expect("fe_gemv8")
         };
+        self.mark(name);
     }
 
     fn add_norm(&self, add: Option<u64>, w: &B, t: usize) {
@@ -719,6 +797,7 @@ impl Coder {
     // ---- the window
 
     fn enqueue_inputs(&self, t: usize) {
+        self.mark("start");
         self.kcopy(self.a(&self.s.ctl), self.io_dev(Io::CTL), 32);
         self.kcopy(
             self.a(&self.s.r),
@@ -735,7 +814,7 @@ impl Coder {
         let (ctl, eps) = (self.a(&s.ctl), self.eps);
         if let Some(g) = &layer.gdn {
             let stride = layer.w_in.rows;
-            self.gemv(&layer.w_in, x, self.a(&g.proj), t, stride);
+            self.gemv("gdn_in", &layer.w_in, x, self.a(&g.proj), t, stride);
             let (p, st, h0, wc, h, tu) = (
                 self.a(&g.proj),
                 stride as u32,
@@ -757,6 +836,7 @@ impl Coder {
                 self.gdn_commit(g, stride, t);
             }
             self.gemv(
+                "gdn_out",
                 &layer.w_out,
                 self.a(&s.y),
                 self.a(&s.mix),
@@ -766,7 +846,7 @@ impl Coder {
         }
         if let Some(at) = &layer.attn {
             let stride = layer.w_in.rows;
-            self.gemv(&layer.w_in, x, self.a(&at.proj), t, stride);
+            self.gemv("attn_in", &layer.w_in, x, self.a(&at.proj), t, stride);
             let hp = &self.hp;
             let (proj, st, qn, kn, rc, rs, q, kc, vc) = (
                 self.a(&at.proj),
@@ -800,7 +880,14 @@ impl Coder {
                     tang_moe::args![part, nc, proj, st, attn],
                 );
             }
-            self.gemv(&layer.w_out, attn, self.a(&s.mix), t, self.hp.n_embd);
+            self.gemv(
+                "attn_out",
+                &layer.w_out,
+                attn,
+                self.a(&s.mix),
+                t,
+                self.hp.n_embd,
+            );
         }
     }
 
@@ -857,7 +944,7 @@ impl Coder {
         let (n, ne, kk, ff) = (hp.n_embd, hp.n_expert, hp.n_expert_used, hp.n_ff_exp);
         let x = self.a(&s.x);
         let ls = ne + 1;
-        self.gemv(&layer.router, x, self.a(&s.lg), t, ls);
+        self.gemv("router", &layer.router, x, self.a(&s.lg), t, ls);
         let (lg, lsi, ids, w, scale) = (
             self.a(&s.lg),
             ls as i32,
@@ -901,7 +988,7 @@ impl Coder {
                 tang_moe::args![dw, ids, hq, parts],
             );
         }
-        self.gemv(&layer.sh_gu, x, self.a(&s.shgu), t, 2 * self.ff_sh);
+        self.gemv("sh_gu", &layer.sh_gu, x, self.a(&s.shgu), t, 2 * self.ff_sh);
         let (shgu, shh, ffs) = (self.a(&s.shgu), self.a(&s.shh), self.ff_sh as i32);
         unsafe {
             self.launch(
@@ -911,7 +998,7 @@ impl Coder {
                 tang_moe::args![shgu, shh, ffs],
             );
         }
-        self.gemv(&layer.sh_down, shh, self.a(&s.shy), t, n);
+        self.gemv("sh_down", &layer.sh_down, shh, self.a(&s.shy), t, n);
         let (r, shy, yo) = (
             self.a(&s.r),
             self.a(&s.shy),
@@ -930,7 +1017,14 @@ impl Coder {
     fn enqueue_head(&self, t: usize) {
         self.add_norm(None, &self.out_norm, t);
         let v = self.hp.n_vocab;
-        self.gemv(&self.head, self.a(&self.s.x), self.a(&self.s.head), t, v);
+        self.gemv(
+            "head",
+            &self.head,
+            self.a(&self.s.x),
+            self.a(&self.s.head),
+            t,
+            v,
+        );
         let (lg, ids, n, part, np, ctl) = (
             self.a(&self.s.head),
             self.a(&self.s.out_ids),
@@ -1083,6 +1177,7 @@ impl Coder {
             self.enqueue_window(t, verify, nchunk, probe.as_deref_mut())?;
         }
         self.dev.sync();
+        self.prof_collect();
         let ids = self.io.u32s(Io::IDS, t).to_vec();
         if let Some(p) = probe {
             let n = self.hp.n_embd;
@@ -1155,6 +1250,10 @@ impl Coder {
             }
             next = out[t - 1];
             pos += t;
+        }
+        // Profile decode only.
+        if let Some(p) = &self.prof {
+            p.borrow_mut().total.clear();
         }
         Ok(next)
     }

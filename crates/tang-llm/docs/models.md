@@ -110,7 +110,49 @@ Qwen3-Coder-Next's tokenizer). It converts the model with llama.cpp's `convert_h
 The bar is top-1 100% and max KL < 1e-3. With the wrong (tiled) v-head order the same check
 fails: top-1 agreement 0%, max KL 31.
 
-**Next: the GPU engine.** The order matters, because each step keeps Flash-Next bitwise
+**GPU engine: landed** (`src/flash/coder.rs`, kernels in `coder_kernels.rs`). It is a separate
+engine beside the Flash-Next one, so Flash-Next is untouched. `flash-parity`, `flash-spec-test`,
+`flash-tcheck` and `flash-bench` pick it for a `qwen3next` GGUF. What it does:
+
+- Plain residual with pre-norms. Gated GQA over every cell, split-K (64 positions a block) with a
+  sigmoid-gated merge.
+- GDN runs the flash module's kernels, compiled for a `Geometry` with `gdn_grouped`
+  (`GDN_KH(h) = h / r`, SiLU gate).
+- Every routed expert sits in VRAM in its GGUF type (Q8_0 if the kernels don't decode the type).
+  Dense weights go through the native GEMV with int8 activations, so the engine reads the same
+  bytes as flash-ref and llama.cpp. There is no requantisation, Q4X or otherwise.
+
+Measured on a RunPod H200 (no H100 was in stock), unsloth `Qwen3-Coder-Next-UD-Q4_K_XL.gguf`
+(49.6 GB), 2026-10-20:
+
+| Check | Result |
+|---|---|
+| flash-ref vs llama.cpp (CPU `llama-server`, `flash_llama_ref.py`), chat 33 pos | top-1 97.0%, KL mean 0.0042, p99 0.043 |
+| flash-ref vs llama.cpp, code (`ngram.rs` head) 702 pos | top-1 98.0%, KL mean 0.0047, p99 0.062 |
+| engine vs flash-ref, chat | top-1 100%, KL mean 0.0034 |
+| engine vs flash-ref, code | top-1 98.6%, KL mean 0.0047, p99 0.052 |
+| `flash-tcheck` | t1 = t8 = t8-verify, bitwise, every layer |
+| `flash-spec-test` (code, 128 tokens, greedy and temp 0.8) | PASS (suffix, wrong, oracle all SAME) |
+| `flash-bench --ctx 4096 -n 256` | **162 tok/s** decode (6.17 ms a token). One step reads 3.52 GB; at 4.8 TB/s that is 1,362 tok/s, so this is **11.9% of speed of light** |
+
+At real widths, a 4-layer random model (`qwen3next_tiny.py --real-shapes --outtype q8_0`) checks
+the kernels in a minute before the 50 GB download.
+
+**Where the time goes** (`TANG_CODER_PROF=1 flash-bench --eager`, GPU time per stage): about 25
+launches a layer × 48 layers. Each small kernel costs about 10 µs in eager mode, and the GEMVs
+reach only about 600 GB/s. The top stages are the routed gate|up (10%), add+norm (10%), the GDN
+input GEMV (9%), routed down (8%), GDN output (7%), shared expert (12%), router and top-k (12%).
+Next, in order:
+
+1. Fuse the per-layer glue: norm into the next GEMV's int8 quantisation; route + q8 + silu
+   into the expert kernels; shared gate|up|down into the routed launches; `moe_add` into the next
+   layer's norm.
+2. Expert GEMVs: stage rows through shared memory like `fe_gemv8` (they read global memory with
+   unaligned 8-byte loads now), several rows per warp, gate and up in one pass.
+3. Dense GEMVs at T = 1: a split-K or wider-row variant so 2048-wide rows fill the GPU.
+4. Prefill: windows of 8 (524 tok/s at 4K); a wide path like Flash-Next's `prefill_wide`.
+
+**The plan the engine followed.** The order matters, because each step keeps Flash-Next bitwise
 unchanged:
 
 1. **Geometry as data.** A `Geometry` struct (from `Hparams`) replaces `flash::shape` consts.

@@ -1213,6 +1213,9 @@ fn bench_coder(a: &Args, ids: &[u32]) -> Result<()> {
             .collect::<Vec<_>>()
             .join(" ")
     );
+    if let Some(r) = e.prof_report() {
+        println!("  GPU time by stage (TANG_CODER_PROF, eager):\n{r}");
+    }
     Ok(())
 }
 
