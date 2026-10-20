@@ -216,6 +216,8 @@ pub struct Engine<D: ComputeDevice> {
     /// The active slot's conversation, and when it last ran (see [`crate::slots`]).
     cache_key: Option<String>,
     cache_used: u64,
+    /// When the active slot was last used, by the wall clock (for the TTL).
+    cache_at: std::time::SystemTime,
     /// Other conversations' caches, swapped in when a request names them.
     parked: Vec<Slot<D::Buffer>>,
     /// Most caches to keep, the active one included. Each is allocated on first use.
@@ -384,6 +386,8 @@ struct Slot<B> {
     images: Vec<(usize, u64)>,
     key: Option<String>,
     used: u64,
+    /// Last used, by the wall clock (see [`crate::retention`]).
+    at: std::time::SystemTime,
 }
 
 /// Qwen3's suggested way to end reasoning early: say so, then close the block.
@@ -498,6 +502,7 @@ impl<D: ComputeDevice> Engine<D> {
             cache_images: Vec::new(),
             cache_key: None,
             cache_used: 0,
+            cache_at: crate::retention::now(),
             parked: Vec::new(),
             slots: 1,
             kv_budget: None,
@@ -839,6 +844,48 @@ impl<D: ComputeDevice> Engine<D> {
         pool.stats().capacity * pool.block_bytes()
     }
 
+    /// Drop conversations (parked, or the idle active one) unused for the TTL.
+    fn expire_slots(&mut self) -> bool {
+        let ttl = crate::retention::ttl();
+        let stale = |at| crate::retention::expired(at, ttl);
+        let before = self.parked.len();
+        self.parked.retain(|s| !stale(s.at));
+        let mut gone = self.parked.len() != before;
+        if stale(self.cache_at) && (self.cache.len > 0 || self.cache_key.is_some()) {
+            self.cache.truncate(0);
+            self.cache_images.clear();
+            self.cache_key = None;
+            self.last = Default::default();
+            gone = true;
+        }
+        gone
+    }
+
+    /// Drop everything derived from prompts that has gone unused for the TTL (see
+    /// [`crate::retention`]): conversations, cached blocks, files in the disk tier, completions
+    /// in the draft store, the draft model's cache. Running requests keep theirs.
+    pub fn expire(&mut self) {
+        let ttl = crate::retention::ttl();
+        if ttl.is_none() {
+            return;
+        }
+        let idle = self.out == 0 && crate::retention::expired(self.cache_at, ttl);
+        self.expire_slots();
+        crate::blocks::lock(self.model.pool()).expire();
+        if let Some(s) = &self.store {
+            s.expire();
+        }
+        if let Some(s) = &mut self.spec {
+            s.global.expire();
+        }
+        if idle {
+            self.global_pending.clear();
+            if let Some(d) = &mut self.drafter {
+                d.forget();
+            }
+        }
+    }
+
     /// What the KV block pool holds, in blocks.
     pub fn kv_stats(&self) -> crate::blocks::Stats {
         crate::blocks::lock(self.model.pool()).stats()
@@ -917,6 +964,8 @@ impl<D: ComputeDevice> Engine<D> {
                 used,
             }
         }
+        // Conversations past the TTL aren't picked up again.
+        self.expire_slots();
         let parked: Vec<View> = self
             .parked
             .iter()
@@ -933,6 +982,7 @@ impl<D: ComputeDevice> Engine<D> {
                     images: Vec::new(),
                     key: None,
                     used: 0,
+                    at: crate::retention::now(),
                 });
                 Some(self.parked.len() - 1)
             }
@@ -943,12 +993,14 @@ impl<D: ComputeDevice> Engine<D> {
             std::mem::swap(&mut self.cache_images, &mut s.images);
             std::mem::swap(&mut self.cache_key, &mut s.key);
             std::mem::swap(&mut self.cache_used, &mut s.used);
+            std::mem::swap(&mut self.cache_at, &mut s.at);
         }
         if let Some(k) = key {
             self.cache_key = Some(k.to_string());
         }
         self.clock += 1;
         self.cache_used = self.clock;
+        self.cache_at = crate::retention::now();
     }
 
     /// The template and tokenizer, to count prompts elsewhere.
@@ -1557,6 +1609,7 @@ impl<D: ComputeDevice> Engine<D> {
             images: std::mem::replace(&mut self.cache_images, std::mem::take(&mut st.images)),
             key: std::mem::replace(&mut self.cache_key, st.key.take()),
             used: std::mem::replace(&mut self.cache_used, st.used),
+            at: std::mem::replace(&mut self.cache_at, crate::retention::now()),
         };
         if prev.key.is_some() || !prev.cache.tokens.is_empty() {
             self.parked.push(prev);

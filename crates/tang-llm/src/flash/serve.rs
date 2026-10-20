@@ -73,6 +73,8 @@ struct Snap {
     pos: Vec<Arc<Positional>>,
     pinned: bool,
     used: u64,
+    /// Last used, by the wall clock (see [`crate::retention`]).
+    at: std::time::SystemTime,
 }
 
 /// A completion this server generated, to splice back into later prompts.
@@ -83,6 +85,7 @@ struct Memo {
     /// closed empty block with thinking off).
     tail: String,
     ids: Vec<u32>,
+    at: std::time::SystemTime,
 }
 
 /// Draft pricing (the `flash-generate --draft mtp` policy): expected tokens per ms of window
@@ -200,6 +203,8 @@ pub struct FlashServe {
     memo: VecDeque<Memo>,
     policy: Policy,
     clock: u64,
+    /// When the live sequence last ran (for the TTL).
+    live_at: std::time::SystemTime,
     temp: f32,
     sampling: SamplingMode,
     /// Widest prefill window (`TANG_FLASH_WIDE`, default 64; 0: decode-width windows only).
@@ -337,6 +342,7 @@ impl FlashServe {
             memo: VecDeque::new(),
             policy: Policy::new(),
             clock: 0,
+            live_at: crate::retention::now(),
             temp: s.temp,
             sampling: s.sampling,
             wide: std::env::var("TANG_FLASH_WIDE")
@@ -514,6 +520,7 @@ impl FlashServe {
         let clock = self.clock;
         if let Some(s) = self.snaps.iter_mut().find(|s| s.tokens == self.e.tokens) {
             s.used = clock;
+            s.at = crate::retention::now();
             s.pinned |= pinned;
             return Ok(());
         }
@@ -543,6 +550,7 @@ impl FlashServe {
             pos,
             pinned,
             used: clock,
+            at: crate::retention::now(),
         });
         let size = |snaps: &[Snap]| {
             let mut seen = std::collections::HashSet::new();
@@ -583,6 +591,34 @@ impl FlashServe {
         Ok(())
     }
 
+    /// Drop saved states, remembered replies and the live sequence unused for the TTL.
+    fn expire_memory(&mut self) {
+        let ttl = crate::retention::ttl();
+        let stale = |at| crate::retention::expired(at, ttl);
+        self.snaps.retain(|s| !stale(s.at));
+        self.memo.retain(|m| !stale(m.at));
+        if !self.e.tokens.is_empty() && stale(self.live_at) {
+            self.e.reset();
+        }
+    }
+
+    /// [`Self::expire_memory`], and delete saved states on disk unused for the TTL.
+    fn expire(&mut self) {
+        let ttl = crate::retention::ttl();
+        if ttl.is_none() {
+            return;
+        }
+        self.expire_memory();
+        let Some(dir) = &self.disk else { return };
+        for ent in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = ent.path();
+            if p.extension().is_some_and(|x| x == "state") && crate::retention::stale_file(&p, ttl)
+            {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+
     fn disk_path(&self, ids: &[u32]) -> Option<PathBuf> {
         Some(
             self.disk
@@ -614,6 +650,7 @@ impl FlashServe {
             return;
         };
         if path.exists() {
+            crate::retention::touch(&path);
             return;
         }
         let mut bytes: Vec<u8> = Vec::with_capacity(s.bytes() + 4 * ids.len() + 64);
@@ -686,11 +723,16 @@ impl FlashServe {
             let (Ok(n), Ok(h)) = (n.parse::<usize>(), u64::from_str_radix(h, 16)) else {
                 continue;
             };
+            if crate::retention::stale_file(&ent.path(), crate::retention::ttl()) {
+                let _ = std::fs::remove_file(ent.path());
+                continue;
+            }
             if n <= limit && n > best.as_ref().map_or(0, |b| b.0) && hash(&ids[..n]) == h {
                 best = Some((n, ent.path()));
             }
         }
         let (n, path) = best?;
+        crate::retention::touch(&path);
         let read = || -> Result<Snap> {
             let mut b = Vec::new();
             std::fs::File::open(&path)?.read_to_end(&mut b)?;
@@ -735,6 +777,7 @@ impl FlashServe {
                 pos: vec![Arc::new(Positional::from_parts(0, n, pos))],
                 pinned: true,
                 used: 0,
+                at: crate::retention::now(),
             })
         };
         match read() {
@@ -765,6 +808,12 @@ impl FlashServe {
             let i = best.unwrap();
             self.clock += 1;
             self.snaps[i].used = self.clock;
+            self.snaps[i].at = crate::retention::now();
+            if self.snaps[i].pinned {
+                if let Some(p) = self.disk_path(&self.snaps[i].tokens) {
+                    crate::retention::touch(&p);
+                }
+            }
             let valid = lcp(&self.e.tokens, &self.snaps[i].tokens);
             for p in &self.snaps[i].pos {
                 self.e.restore_positional(p, valid)?;
@@ -1128,6 +1177,7 @@ impl FlashServe {
                 calls: calls.clone(),
                 tail,
                 ids: out.clone(),
+                at: crate::retention::now(),
             });
             while self.memo.len() > 256 {
                 self.memo.pop_front();
@@ -1169,7 +1219,9 @@ impl FlashServe {
         on: &mut dyn FnMut(Piece) -> bool,
         ctl: &mut dyn Control,
     ) -> Result<(Finish, Usage)> {
+        self.expire_memory();
         let r = self.generate(req, on, ctl);
+        self.live_at = crate::retention::now();
         if r.is_err() {
             // Whatever the engine holds now is unknown: start over next time.
             self.e.reset();
@@ -1204,6 +1256,10 @@ impl Backend for FlashServe {
 
     fn context_window(&self) -> usize {
         self.ctx
+    }
+
+    fn expire(&mut self) {
+        FlashServe::expire(self)
     }
 
     fn after(&mut self, _req: &Request, result: &Result<(Finish, Usage)>) {

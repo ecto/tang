@@ -22,6 +22,7 @@ pub mod kvstore;
 pub mod model;
 pub mod node;
 pub mod queue;
+pub mod retention;
 pub mod sample;
 pub mod scheduler;
 pub mod server;
