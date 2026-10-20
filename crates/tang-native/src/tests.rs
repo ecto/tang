@@ -203,3 +203,34 @@ fn every_variant_builds_and_the_ladder_parses() {
     }
     assert!(Variant::parse("nope").is_none());
 }
+
+/// Every rung of the ladder learns a simple periodic sequence: the
+/// training step (clipping, AdamW, the schedule input) works end to end.
+#[test]
+fn every_variant_learns_a_periodic_sequence() {
+    use crate::train::{Hyper, Step, Trainer};
+    let c = Config {
+        vocab: 7,
+        d: 16,
+        layers: 1,
+        heads: 2,
+        ff: 32,
+        seq: 8,
+    };
+    let seq: Vec<u32> = (0..c.seq + 1).map(|i| (i % 5) as u32 + 1).collect();
+    let (x, y) = (&seq[..c.seq], &seq[1..]);
+    for name in ["twin", "ternary", "dyt", "relu2", "native"] {
+        let v = Variant::parse(name).unwrap();
+        let mut tr = Trainer::new(Step::new(c, v, Hyper::default(), false), 5);
+        let (first, _) = tr.step(x, y, 3e-2);
+        let mut last = first;
+        for _ in 0..60 {
+            last = tr.step(x, y, 3e-2).0;
+        }
+        eprintln!("{name:8} loss {first:.3} → {last:.3}");
+        assert!(
+            last.is_finite() && last < 0.5 * first,
+            "{name} did not learn: {first} → {last}"
+        );
+    }
+}
