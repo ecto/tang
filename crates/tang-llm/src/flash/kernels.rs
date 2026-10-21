@@ -462,7 +462,9 @@ __device__ __forceinline__ void rows_dot(const unsigned char* w, const float* x,
 
 // ---- int8-activation path (dp4a) ----
 
+#ifndef XQ8_T
 #define XQ8_T 8
+#endif
 
 // IQ4_NL grid for four nibbles (bytes 0..15) at once.
 __device__ __forceinline__ int iq4w(unsigned n) {
