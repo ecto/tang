@@ -240,9 +240,9 @@ impl CudaComputeDevice {
         let mut tx = None;
         let x = self.moe_f32(x, &mut tx);
         let sort = self.llm_func(moe_cuda::MOE_CUDA, "moe_sort");
-        // `TANG_MOE_GEMV=l1` keeps the input read through L1 (for A/B runs); the default
-        // stages it in shared memory when it fits.
-        let smem = k * 4 <= 48 << 10 && std::env::var("TANG_MOE_GEMV").as_deref() != Ok("l1");
+        // `TANG_MOE_GEMV=smem` stages the input in shared memory (not yet measured on a GPU,
+        // so opt-in); the default reads it through L1.
+        let smem = k * 4 <= 48 << 10 && std::env::var("TANG_MOE_GEMV").as_deref() == Ok("smem");
         let gemv = self.llm_func(
             moe_cuda::MOE_CUDA,
             if smem {

@@ -6,7 +6,7 @@
 #
 # Run from the repo root on a CUDA box with nsys on PATH (or NSYS=...). Prints markdown rows for
 # docs/speed-log.md, tagged with the commit. Variants compared on the same pod: the MXFP4 GEMV
-# with its input in shared memory (default) and read through L1 (TANG_MOE_GEMV=l1).
+# with its input read through L1 (default) and staged in shared memory (TANG_MOE_GEMV=smem).
 set -euo pipefail
 model=${1:?model dir}
 out=${2:-1000}
