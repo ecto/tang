@@ -353,6 +353,371 @@ pub fn mm_shape() -> (usize, usize, usize) {
 pub const OPENCL_NATIVE: &str = "// tang-compile: OpenCL C (native)";
 
 impl TensorGraph {
+    /// The stores of an RM×RN register block `acc{i}_{j}` (rows `r0..`,
+    /// columns `c0..`) of the reduction `red_node`, through the comp's
+    /// epilogue when `epilogue`.
+    #[allow(clippy::too_many_arguments)]
+    fn mm_stores(
+        &self,
+        s: &mut String,
+        c: &super::Comp,
+        red_node: usize,
+        epilogue: bool,
+        pts: &[usize],
+        (dy, dx): (usize, usize),
+        (m, n): (usize, usize),
+        (rm, rn): (usize, usize),
+    ) {
+        use super::tile::emit_scalar;
+        let storage = |j: usize| self.storage(TensorId(j as u32)).n();
+        let w_out = c.width();
+        let prank = c.points().len();
+        for i in 0..rm {
+            for j in 0..rn {
+                writeln!(s, "    {{").unwrap();
+                writeln!(s, "        int p{dy} = r0 + {i}, p{dx} = c0 + {j};").unwrap();
+                writeln!(s, "        if (p{dy} < {m} && p{dx} < {n}) {{").unwrap();
+                writeln!(s, "            float red = acc{i}_{j};").unwrap();
+                let vals: Vec<String> = if epilogue {
+                    let mut arg_vals = Vec::new();
+                    for a in &c.args {
+                        if a.src.n() == red_node {
+                            arg_vals.push("red".to_string());
+                            continue;
+                        }
+                        let addr = self.flat_addr(a, prank);
+                        let mut e = format!("{}", addr.offset);
+                        for (d, &coef) in addr.coefs.iter().enumerate() {
+                            if coef != 0 {
+                                e.push_str(&format!(" + {coef} * p{d}"));
+                            }
+                        }
+                        arg_vals.push(format!("b{}[{e}]", storage(a.src.n())));
+                    }
+                    let mut body = String::new();
+                    let outs = emit_scalar(
+                        &mut body,
+                        &c.body,
+                        &c.body_outs,
+                        &format!("e{i}_{j}_"),
+                        &|v| arg_vals[v as usize].clone(),
+                    );
+                    for line in body.lines() {
+                        writeln!(s, "            {}", line.replacen("let ", "float ", 1)).unwrap();
+                    }
+                    outs
+                } else {
+                    vec!["red".to_string()]
+                };
+                let mut flat = String::from("0");
+                for (d, &np) in pts.iter().enumerate() {
+                    flat = format!("({flat}) * {np} + p{d}");
+                }
+                writeln!(s, "            int o = {flat};").unwrap();
+                for (slot, v) in vals.iter().enumerate() {
+                    writeln!(s, "            out[o * {w_out} + {slot}] = {v};").unwrap();
+                }
+                writeln!(s, "        }}").unwrap();
+                writeln!(s, "    }}").unwrap();
+            }
+        }
+    }
+
+    /// A prefill matmul over 4-bit weights — `C[t][n] = Σ_{g,j} x[t][g·J+j]
+    /// · W(q[n][g][j], s[n][g], b[n][g])`, where `W` is the inlined
+    /// dequantization (MLX: `q·s + b`) of packed inputs — as the register
+    /// block of [`opencl_mma_kernel`](Self::opencl_mma_kernel) with the
+    /// dequantization at load: per k step of 8 each column's packed word
+    /// is read once (4 bytes for 8 weights), unpacked and dequantized in
+    /// registers and shared by the block's RM rows. No f32 copy of the
+    /// weight is ever written (a materialized map is 8x the packed bytes,
+    /// written and read once per pass). `packed`: storage node → packing.
+    /// Needs `x` and the nibbles unit-stride along `j`, `J` a multiple of
+    /// 8, and the per-group values constant along `j`.
+    pub(super) fn opencl_mma_kernel_q4(
+        &self,
+        root: usize,
+        reads: &[usize],
+        packed: &std::collections::HashMap<usize, super::cuda_gemv::Packing>,
+    ) -> Option<super::cuda_gemv::Kernel> {
+        use super::cuda_gemv::Packing;
+        use super::tile::emit_scalar;
+        use tang_expr::Node;
+        let c = self.comp_at(root)?;
+        let red_node = self.tiled_reduction(root)?;
+        let rc = self.comp_at(red_node)?;
+        let epilogue = red_node != root;
+        if rc.red.len() != 2 || rc.tuple != 0 || rc.body_outs.len() != 1 {
+            return None;
+        }
+        if rc.monoid.as_ref().map(super::Monoid::kind) != Some(super::MonoidKind::Sum) {
+            return None;
+        }
+        let pts: Vec<usize> = super::fixed(rc.points());
+        if pts.len() != 2 || c.points().len() != 2 {
+            return None;
+        }
+        if epilogue
+            && self.epilogue_read(c, red_node)?
+                != super::View::identity(2, 2).forms
+        {
+            return None;
+        }
+        let (gs, js) = (rc.red[0].n(), rc.red[1].n());
+        if js % 8 != 0 {
+            return None;
+        }
+        let storage = |j: usize| self.storage(TensorId(j as u32)).n();
+        let rank = 4;
+        // the body: x · E, E over packed args — substituted into the
+        // reduction's body, or an inlined map (the dequantization) it reads
+        let nodes = rc.body.nodes_slice();
+        let Node::Mul(l, r) = nodes[rc.body_outs[0].index() as usize] else {
+            return None;
+        };
+        let var_of = |e: tang_expr::ExprId| match nodes[e.index() as usize] {
+            Node::Var(v) => Some(v as usize),
+            _ => None,
+        };
+        let is_x = |v: usize| {
+            let a = &rc.args[v];
+            !a.view.guard
+                && reads.contains(&storage(a.src.n()))
+                && !packed.contains_key(&storage(a.src.n()))
+        };
+        let (vx, e) = match (var_of(l), var_of(r)) {
+            (Some(v), _) if is_x(v) => (v, r),
+            (_, Some(v)) if is_x(v) => (v, l),
+            _ => return None,
+        };
+        let map = var_of(e).and_then(|v| {
+            let a = &rc.args[v];
+            let p = a.src.n();
+            let mc = self.comp_at(p)?;
+            (self.nodes[p].inline && !a.view.guard && mc.monoid.is_none() && mc.red.is_empty())
+                .then_some((v, mc))
+        });
+        let (ebody, eout, eargs): (&tang_expr::ExprGraph, tang_expr::ExprId, Vec<Option<super::Arg>>) =
+            match map {
+                Some((v, mc)) if mc.body_outs.len() == 1 => {
+                    let outer = &rc.args[v];
+                    let args = mc
+                        .args
+                        .iter()
+                        .map(|s| {
+                            Some(super::Arg {
+                                src: s.src,
+                                view: s.view.compose(&outer.view, rank),
+                            })
+                        })
+                        .collect();
+                    (&mc.body, mc.body_outs[0], args)
+                }
+                Some(_) => return None,
+                None => {
+                    let live = rc.body.live_set(&[e]);
+                    if live
+                        .iter()
+                        .any(|&i| matches!(nodes[i], Node::Var(v) if v as usize == vx))
+                    {
+                        return None;
+                    }
+                    let args = rc
+                        .args
+                        .iter()
+                        .enumerate()
+                        .map(|(v, a)| (v != vx).then(|| a.clone()))
+                        .collect();
+                    (&rc.body, e, args)
+                }
+            };
+        let ax = self.flat_addr(&rc.args[vx], rank);
+        if ax.coefs[3] != 1 || ax.coefs[1] != 0 && ax.coefs[0] != 0 {
+            return None;
+        }
+        // which point dim is the token (x varies along it): rows dy, columns dx
+        let (dy, dx) = if ax.coefs[0] != 0 { (0, 1) } else { (1, 0) };
+        let (m, n) = (pts[dy], pts[dx]);
+        if m < 2 || ax.coefs[dx] != 0 {
+            return None;
+        }
+        // E's args: the nibbles (U4, along j) and per-group values
+        enum Role {
+            Nibble { buf: usize, addr: super::msl_mma::Addr },
+            Group { buf: usize, addr: super::msl_mma::Addr, pack: Packing },
+        }
+        let mut roles: Vec<Option<Role>> = Vec::new();
+        let mut nibbles = 0;
+        for a in &eargs {
+            let Some(a) = a else {
+                roles.push(None);
+                continue;
+            };
+            if a.view.guard {
+                return None;
+            }
+            let buf = storage(a.src.n());
+            if !reads.contains(&buf) {
+                return None;
+            }
+            let addr = self.flat_addr(a, rank);
+            if addr.coefs[dy] != 0 {
+                return None;
+            }
+            match packed.get(&buf) {
+                Some(Packing::U4) => {
+                    if addr.coefs[3] != 1
+                        || addr.offset % 8 != 0
+                        || addr.coefs[dx] % 8 != 0
+                        || addr.coefs[2] % 8 != 0
+                    {
+                        return None;
+                    }
+                    nibbles += 1;
+                    roles.push(Some(Role::Nibble { buf, addr }));
+                }
+                Some(&pack) if addr.coefs[3] == 0 => {
+                    roles.push(Some(Role::Group { buf, addr, pack }))
+                }
+                _ => return None,
+            }
+        }
+        if nibbles == 0 {
+            return None;
+        }
+        let (rm, rn, wg) = mm_shape();
+        let mb = m.div_ceil(rm);
+        let nb = n.div_ceil(rn);
+        let items = mb * nb;
+        let mut s = String::new();
+        writeln!(
+            s,
+            "{OPENCL_NATIVE}: {m}x{n}x{} matmul over 4-bit weights, {rm}x{rn} registers, groups of {wg}",
+            gs * js
+        )
+        .unwrap();
+        s.push_str(OPENCL_PRELUDE);
+        let params: Vec<String> = reads
+            .iter()
+            .map(|j| format!("__global const float* restrict b{j}"))
+            .chain([
+                "__global float* restrict out".to_string(),
+                "uint count".to_string(),
+            ])
+            .collect();
+        writeln!(
+            s,
+            "__kernel __attribute__((reqd_work_group_size({wg}, 1, 1))) void main0({}) {{",
+            params.join(", ")
+        )
+        .unwrap();
+        writeln!(s, "    int g = (int)get_global_id(0);").unwrap();
+        writeln!(s, "    if (g >= {items}) return;").unwrap();
+        writeln!(s, "    int cb = g % {nb}, rb = g / {nb};").unwrap();
+        writeln!(s, "    int r0 = rb * {rm}, c0 = cb * {rn};").unwrap();
+        let xbuf = storage(rc.args[vx].src.n());
+        for i in 0..rm {
+            writeln!(
+                s,
+                "    __global const float* a{i} = b{xbuf} + {} + {} * min(r0 + {i}, {});",
+                ax.offset,
+                ax.coefs[dy],
+                m - 1
+            )
+            .unwrap();
+        }
+        for j in 0..rn {
+            writeln!(s, "    int col{j} = min(c0 + {j}, {});", n - 1).unwrap();
+        }
+        for i in 0..rm {
+            for j in 0..rn {
+                writeln!(s, "    float acc{i}_{j} = 0.0f;").unwrap();
+            }
+        }
+        writeln!(s, "    for (int kg = 0; kg < {gs}; kg++) {{").unwrap();
+        // per-group values of each column
+        for (v, role) in roles.iter().enumerate() {
+            if let Some(Role::Group { buf, addr, pack }) = role {
+                let f = match pack {
+                    Packing::Bf16 => "tang_bf16",
+                    Packing::F16 => "tang_f16",
+                    Packing::U4 => "tang_u4",
+                };
+                for j in 0..rn {
+                    writeln!(
+                        s,
+                        "        float g{v}_{j} = {f}(b{buf}, {} + {} * col{j} + {} * kg);",
+                        addr.offset, addr.coefs[dx], addr.coefs[2]
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        writeln!(s, "        for (int kj = 0; kj < {js}; kj += 8) {{").unwrap();
+        writeln!(s, "            int kx = {} * kg + kj;", ax.coefs[2]).unwrap();
+        for i in 0..rm {
+            writeln!(
+                s,
+                "            float4 xl{i} = vload4(0, a{i} + kx), xh{i} = vload4(1, a{i} + kx);"
+            )
+            .unwrap();
+        }
+        for j in 0..rn {
+            for (v, role) in roles.iter().enumerate() {
+                if let Some(Role::Nibble { buf, addr }) = role {
+                    writeln!(
+                        s,
+                        "            uint w{v}_{j} = ((__global const uint*)b{buf})[({} + {} * col{j} + {} * kg + kj) >> 3];",
+                        addr.offset, addr.coefs[dx], addr.coefs[2]
+                    )
+                    .unwrap();
+                }
+            }
+            let mut ws = Vec::new();
+            for q in 0..8 {
+                let var = |v: u16| -> String {
+                    match &roles[v as usize] {
+                        Some(Role::Nibble { .. }) => {
+                            format!("(float)((w{v}_{j} >> {}) & 15u)", 4 * q)
+                        }
+                        Some(Role::Group { .. }) => format!("g{v}_{j}"),
+                        None => unreachable!("x in the dequantization"),
+                    }
+                };
+                let mut body = String::new();
+                let outs = emit_scalar(&mut body, ebody, &[eout], &format!("d{j}_{q}_"), &var);
+                for line in body.lines() {
+                    writeln!(s, "            {}", line.replacen("let ", "float ", 1)).unwrap();
+                }
+                ws.push(outs[0].clone());
+            }
+            writeln!(
+                s,
+                "            float4 wl{j} = (float4)({}, {}, {}, {}), wh{j} = (float4)({}, {}, {}, {});",
+                ws[0], ws[1], ws[2], ws[3], ws[4], ws[5], ws[6], ws[7]
+            )
+            .unwrap();
+        }
+        for i in 0..rm {
+            for j in 0..rn {
+                writeln!(
+                    s,
+                    "            acc{i}_{j} += dot(xl{i}, wl{j}) + dot(xh{i}, wh{j});"
+                )
+                .unwrap();
+            }
+        }
+        writeln!(s, "        }}").unwrap();
+        writeln!(s, "    }}").unwrap();
+        self.mm_stores(&mut s, c, red_node, epilogue, &pts, (dy, dx), (m, n), (rm, rn));
+        writeln!(s, "}}").unwrap();
+        Some(super::cuda_gemv::Kernel {
+            source: s,
+            threads: wg,
+            blocks: items.div_ceil(wg),
+        })
+    }
+
     /// A prefill matmul (`C[m][n] = Σ_k A[m][k]·B[n][k]`, plus its
     /// epilogue) as an OpenCL register-block kernel, when both operands are
     /// contiguous along the reduce axis: each work-item keeps an RM×RN block
@@ -366,7 +731,6 @@ impl TensorGraph {
         root: usize,
         reads: &[usize],
     ) -> Option<super::cuda_gemv::Kernel> {
-        use super::tile::emit_scalar;
         let c = self.comp_at(root)?;
         let t = self.bilinear_tile(root, reads)?;
         if t.terms.len() != 1
@@ -384,13 +748,11 @@ impl TensorGraph {
             return None;
         }
         let (rm, rn, wg) = mm_shape();
-        let storage = |j: usize| self.storage(TensorId(j as u32)).n();
         let pts = &t.pts;
         let mb = m.div_ceil(rm);
         let nb = n.div_ceil(rn);
         let lead: usize = t.others.iter().map(|&d| pts[d]).product();
         let items = mb * nb * lead;
-        let w_out = c.width();
         let lead_term = |addr: &super::msl_mma::Addr| -> String {
             let mut s = format!("{}", addr.offset);
             for &d in &t.others {
@@ -484,56 +846,7 @@ impl TensorGraph {
         }
         writeln!(s, "    }}").unwrap();
         // epilogue and stores
-        let prank = c.points().len();
-        for i in 0..rm {
-            for j in 0..rn {
-                writeln!(s, "    {{").unwrap();
-                writeln!(s, "        int p{dy} = r0 + {i}, p{dx} = c0 + {j};").unwrap();
-                writeln!(s, "        if (p{dy} < {m} && p{dx} < {n}) {{").unwrap();
-                writeln!(s, "            float red = acc{i}_{j};").unwrap();
-                let vals: Vec<String> = if t.epilogue {
-                    let mut arg_vals = Vec::new();
-                    for a in &c.args {
-                        if a.src.n() == t.red_node {
-                            arg_vals.push("red".to_string());
-                            continue;
-                        }
-                        let addr = self.flat_addr(a, prank);
-                        let mut e = format!("{}", addr.offset);
-                        for (d, &coef) in addr.coefs.iter().enumerate() {
-                            if coef != 0 {
-                                e.push_str(&format!(" + {coef} * p{d}"));
-                            }
-                        }
-                        arg_vals.push(format!("b{}[{e}]", storage(a.src.n())));
-                    }
-                    let mut body = String::new();
-                    let outs = emit_scalar(
-                        &mut body,
-                        &c.body,
-                        &c.body_outs,
-                        &format!("e{i}_{j}_"),
-                        &|v| arg_vals[v as usize].clone(),
-                    );
-                    for line in body.lines() {
-                        writeln!(s, "            {}", line.replacen("let ", "float ", 1)).unwrap();
-                    }
-                    outs
-                } else {
-                    vec!["red".to_string()]
-                };
-                let mut flat = String::from("0");
-                for (d, &np) in pts.iter().enumerate() {
-                    flat = format!("({flat}) * {np} + p{d}");
-                }
-                writeln!(s, "            int o = {flat};").unwrap();
-                for (slot, v) in vals.iter().enumerate() {
-                    writeln!(s, "            out[o * {w_out} + {slot}] = {v};").unwrap();
-                }
-                writeln!(s, "        }}").unwrap();
-                writeln!(s, "    }}").unwrap();
-            }
-        }
+        self.mm_stores(&mut s, c, t.red_node, t.epilogue, pts, (dy, dx), (m, n), (rm, rn));
         writeln!(s, "}}").unwrap();
         Some(super::cuda_gemv::Kernel {
             source: s,

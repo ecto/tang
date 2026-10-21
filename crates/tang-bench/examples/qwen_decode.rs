@@ -120,6 +120,7 @@ fn tiny_dims() -> QwenDims {
         kv_f16: std::env::var("TANG_KV_F32").is_err(),
         // QWEN_VOCAB_CHUNKS=2 exercises the split embedding and LM head
         vocab_chunks: env("QWEN_VOCAB_CHUNKS").max(1),
+        prefill_q4: false,
     }
 }
 

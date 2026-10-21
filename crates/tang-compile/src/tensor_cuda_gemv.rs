@@ -275,6 +275,15 @@ impl TensorGraph {
             };
             let donor = inplace.iter().find(|(o, _)| *o == root).map(|&(_, d)| d);
             let mma = || {
+                // OpenCL prefill over packed 4-bit weights: the register
+                // block with the dequantization at load
+                if opts.mma
+                    && target == DecodeTarget::OpenCl
+                    && std::env::var("TANG_CL_MM").as_deref() != Ok("off")
+                    && reads.iter().any(|j| packed.contains_key(j))
+                {
+                    return self.opencl_mma_kernel_q4(root, &reads, &packed);
+                }
                 if !opts.mma || reads.iter().any(|j| packed.contains_key(j)) {
                     return None;
                 }

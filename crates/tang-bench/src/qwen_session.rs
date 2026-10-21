@@ -48,6 +48,15 @@ pub fn lower(
     }
 }
 
+/// OpenCL prefill over the packed 4-bit weights (dequantized in the
+/// register-block kernel) instead of materialized f32 copies per pass;
+/// `TANG_CL_PREFILL_Q4=0` restores the f32 maps.
+pub fn prefill_q4(rt: &Runtime) -> bool {
+    rt.kind() == BackendKind::OpenCl
+        && std::env::var("TANG_CL_PREFILL_Q4").as_deref() != Ok("0")
+        && std::env::var("TANG_CL_MM").as_deref() != Ok("off")
+}
+
 pub fn env(k: &str) -> usize {
     std::env::var(k)
         .ok()
@@ -102,6 +111,10 @@ impl Step {
         base: Option<&Step>,
     ) -> Self {
         let t = Instant::now();
+        let dims = &QwenDims {
+            prefill_q4: dims.prefill_q4 || prefill_q4(rt),
+            ..dims.clone()
+        };
         let dg = step_graph(dims, seq, kctx);
         let (g, mut outs) = compiled_decode(&dg, rt.kind() == BackendKind::Cuda);
         let named = outs.len();
