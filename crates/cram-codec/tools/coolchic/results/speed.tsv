@@ -1,0 +1,28 @@
+# Wed Oct 21 12:18:04 PM UTC 2026  NVIDIA GeForce RTX 3090, 2 %, 13208 MiB
+# gpu-app 8118, /usr/bin/sunshine, 262 MiB
+# gpu-app 10021, python3, 256 MiB
+# gpu-app 3688444, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 289 MiB
+# gpu-app 3688438, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 289 MiB
+# gpu-app 2914123, /home/cam/Developer/tang-serve/target/release/tang-llm, 9132 MiB
+# gpu-app 3402010, /home/cam/Developer/broca-build/crates/broca/target/release/broca, 1844 MiB
+# gpu-app 3938233, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 290 MiB
+# gpu-app 3938239, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 296 MiB
+# gpu-app 3938228, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 296 MiB
+kodim01-0.001 L=64 T=0 bpp=0.7789 coolchic_cpu_s=0.98 ours_cpu_s=1.048 gpu_ms,identical=21.92 true
+kodim01-0.001 L=64 T=0x128 bpp=0.7839 coolchic_cpu_s=0.98 ours_cpu_s=1.040 gpu_ms,identical=13.09 true
+kodim01-0.001 L=128 T=128x128 bpp=0.7975 coolchic_cpu_s=0.98 ours_cpu_s=1.040 gpu_ms,identical=8.45 true
+kodim08-0.001 L=64 T=0 bpp=0.8626 coolchic_cpu_s=0.98 ours_cpu_s=1.050 gpu_ms,identical=23.16 true
+kodim08-0.001 L=64 T=0x128 bpp=0.8736 coolchic_cpu_s=0.98 ours_cpu_s=1.045 gpu_ms,identical=13.57 true
+kodim08-0.001 L=128 T=128x128 bpp=0.8915 coolchic_cpu_s=0.98 ours_cpu_s=1.042 gpu_ms,identical=9.23 true
+kodim14-0.001 L=64 T=0 bpp=0.6836 coolchic_cpu_s=0.96 ours_cpu_s=1.054 gpu_ms,identical=26.45 true
+kodim14-0.001 L=64 T=0x128 bpp=0.6878 coolchic_cpu_s=0.96 ours_cpu_s=1.048 gpu_ms,identical=14.35 true
+kodim14-0.001 L=128 T=128x128 bpp=0.7008 coolchic_cpu_s=0.96 ours_cpu_s=1.044 gpu_ms,identical=9.16 true
+kodim23-0.001 L=64 T=0 bpp=0.2446 coolchic_cpu_s=0.95 ours_cpu_s=1.051 gpu_ms,identical=20.40 true
+kodim23-0.001 L=64 T=0x128 bpp=0.2490 coolchic_cpu_s=0.95 ours_cpu_s=1.065 gpu_ms,identical=12.34 true
+kodim23-0.001 L=128 T=128x128 bpp=0.2601 coolchic_cpu_s=0.95 ours_cpu_s=1.056 gpu_ms,identical=8.44 true
+kodim01-0.02 L=64 T=0 bpp=0.1064 coolchic_cpu_s=2.28 ours_cpu_s=1.050 gpu_ms,identical=19.94 true
+kodim01-0.02 L=64 T=0x128 bpp=0.1069 coolchic_cpu_s=2.28 ours_cpu_s=1.047 gpu_ms,identical=12.05 true
+kodim01-0.02 L=128 T=128x128 bpp=0.1144 coolchic_cpu_s=2.28 ours_cpu_s=1.071 gpu_ms,identical=8.34 true
+kodim20-0.0001 L=64 T=0 bpp=0.9172 coolchic_cpu_s=2.16 ours_cpu_s=1.760 gpu_ms,identical=23.24 true
+kodim20-0.0001 L=64 T=0x128 bpp=0.9330 coolchic_cpu_s=2.16 ours_cpu_s=2.037 gpu_ms,identical=14.20 true
+kodim20-0.0001 L=128 T=128x128 bpp=0.9546 coolchic_cpu_s=2.16 ours_cpu_s=1.041 gpu_ms,identical=9.19 true

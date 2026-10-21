@@ -24,7 +24,7 @@ mtp-train = ["dep:tang-ad", "dep:tang-train", "dep:tang-tensor"]
 
 [dependencies]
 tang-compute = { workspace = true }
-tang-compress = { workspace = true }
+cram-codec = { workspace = true }
 tang-ad = { workspace = true, optional = true }
 tang-train = { workspace = true, optional = true }
 tang-tensor = { workspace = true, optional = true }

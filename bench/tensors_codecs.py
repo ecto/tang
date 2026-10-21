@@ -143,7 +143,7 @@ def zfp(x: np.ndarray, tol: float):
 
 
 def tang(x: np.ndarray, codec: str, rmse: float, tag: str):
-    """Run current tang-compress (tc wavelet/tucker or qtt) on x as-is."""
+    """Run current cram-codec (tc wavelet/tucker or qtt) on x as-is."""
     xc = np.ascontiguousarray(x, np.float32)
     dims = list(xc.shape) if xc.ndim <= 3 else [xc.shape[0], xc.shape[1], -1]
     if -1 in dims:

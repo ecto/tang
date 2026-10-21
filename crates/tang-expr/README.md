@@ -98,7 +98,7 @@ graph above is untouched.
   dependencies order the effects. Scratch loads and stores are never inlined
   or moved: every backend runs them in the one shared schedule order, so
   their results agree across backends for any graph. Out-of-range loads read
-  0 and out-of-range stores are dropped. tang-compress uses this for the
+  0 and out-of-range stores are dropped. cram-codec uses this for the
   per-lane adaptive probability maps of its learned rANS coder.
 - **Loops:** `while_loop(init, |g, s| (cond, next))` is structured SSA, like
   MLIR `scf.while`, with `for_range` as sugar. A loop's states are
@@ -121,7 +121,7 @@ graph above is untouched.
   plain Rust. The emitted WGSL is validated with naga 25, and the emitted
   Rust is compiled with `rustc` and its output compared with the interpreter.
 
-**First user.** tang-compress builds its learned TCG3 MLP as an `IntGraph`
+**First user.** cram-codec builds its learned TCG3 MLP as an `IntGraph`
 (`lmodel3::Net32::graph`), with the stream's weights as constants. The GPU
 kernel's `mlp_gen` is `to_wgsl_body` of that graph, and `TC_CPU_IR=1` makes
 the CPU decoder evaluate the same graph through `Program`.

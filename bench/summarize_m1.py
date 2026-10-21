@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M1 frontier tables: tang-compress wavelet/Tucker vs SPERR/TTHRESH/SZ3/QTT.
+"""M1 frontier tables: cram-codec wavelet/Tucker vs SPERR/TTHRESH/SZ3/QTT.
 
 Reads the M0 results (SPERR, TTHRESH, SZ3, ZFP, QTT; same crops, same
 harness error definitions) and the tang M1 runs (results_tang*.csv), builds

@@ -1,4 +1,4 @@
-# tang-compress KV codec in the attention loop: decode speed
+# cram-codec KV codec in the attention loop: decode speed
 
 Branch `claude/kv-decode-speed`. Question: can the KV codec from PR #73 (`kvcodec` GPU layout, 24–28% fewer bits than the best baseline at matched quality) be decoded every generation step without making generation 25–50× slower? Hardware: Apple M4 Max (40-core GPU), Metal, bf16 weights and KV pool. The machine was shared with other GPU apps; every key row was run twice (`*_rep.jsonl`), and the tables use the second run where the two disagree by more than ~10%.
 
@@ -146,8 +146,8 @@ To run inside the step, the entropy stage would have to change. For example: sta
 
 ## Code changes
 
-- `tang-compress::kvcodec`: `KvParams::lane_ch` and `lane_chan()`; GPU substreams per (block, head, channel group); header flag bit 4 plus a lane-width varint (old streams parse unchanged); `GpuTables::lanes` gains the group index.
-- `tang-compress::kvgpu`: per-group channel table and dense classes; `LANE_WORDS` 14 → 16 (lane-pair base, full head dim); `Placement::decode_only`.
+- `cram-codec::kvcodec`: `KvParams::lane_ch` and `lane_chan()`; GPU substreams per (block, head, channel group); header flag bit 4 plus a lane-width varint (old streams parse unchanged); `GpuTables::lanes` gains the group index.
+- `cram-codec::kvgpu`: per-group channel table and dense classes; `LANE_WORDS` 14 → 16 (lane-pair base, full head dim); `Placement::decode_only`.
 - `tang-compute` `tkv_decode` (MSL): channel-group lanes (RoPE pairs inside a lane), prior copied once per dense class, decode-only flag, per-lane arrays 256 → 128 (lane width capped at 128).
 - `tang-llm::kvcomp`: mode `tkv:rel:block:lane`; `KvOpts { window, cached, decode_only }` and `compress_kv_with`. The bench takes the `+cache`, `+win<N>` and `+nostore` suffixes.
 - `tang-llm::model`: **Qwen2 Q/K/V projection biases** (`*_proj.bias`), which were previously ignored. Without them Qwen2.5-1.5B ran with bf16 NLL 15.7 on this text; with them, 2.83. The earlier Qwen3-0.6B numbers are unaffected, since Qwen3 has no QKV bias.
