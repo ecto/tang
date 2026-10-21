@@ -1,4 +1,4 @@
-//! `tc` — encode/decode raw little-endian f32 files with the tang-compress
+//! `tc` — encode/decode raw little-endian f32 files with the cram-codec
 //! wavelet, Tucker, interpolation or QTT codecs, or the `auto` portfolio
 //! (`portfolio-all` = every candidate, no pre-screen).
 //!
@@ -14,8 +14,8 @@
 //! candidate picked before encoding, step from a formula, no overfit.
 
 use std::time::Instant;
-use tang_compress::codec::ErrorBound;
-use tang_compress::{decode_any, wavcodec, Decoded};
+use cram_codec::codec::ErrorBound;
+use cram_codec::{decode_any, wavcodec, Decoded};
 
 fn usage() -> ! {
     eprintln!("usage: tc encode IN.f32 OUT --dims AxBxC --codec wavelet|tucker|interp|lorenzo|qtt|auto|portfolio-all|fast BOUND [--rho r] [--model m]\n       tc decode IN OUT.f32 [--model pretrained:PATH]");
@@ -80,7 +80,7 @@ fn main() {
                     if let Some(r) = rho {
                         cfg.rho = r;
                     }
-                    cfg.model = tang_compress::learned::parse_model_arg(&model);
+                    cfg.model = cram_codec::learned::parse_model_arg(&model);
                     let (b, s) = wavcodec::encode_f32(&x, &dims, &cfg);
                     let j = format!(
                         "\"coef_bytes\":{},\"model_bytes\":{},\"outlier_bytes\":{},\"n_outliers\":{},\"delta\":{},\"rmse\":{},\"max_abs\":{},\"passes\":{}",
@@ -89,7 +89,7 @@ fn main() {
                     (b, j)
                 }
                 "tucker" => {
-                    let (b, s) = tang_compress::tucker::encode_f32(&x, &dims, bound);
+                    let (b, s) = cram_codec::tucker::encode_f32(&x, &dims, bound);
                     let j = format!(
                         "\"core_bytes\":{},\"factor_bytes\":{},\"ranks\":{:?},\"delta\":{},\"rmse\":{},\"max_abs\":{}",
                         s.core_bytes, s.factor_bytes, s.ranks, s.delta, s.rmse, s.max_abs
@@ -101,9 +101,9 @@ fn main() {
                     if let Some(r) = rho {
                         cfg.rho = r;
                     }
-                    cfg.model = tang_compress::learned::parse_model_arg(&model);
+                    cfg.model = cram_codec::learned::parse_model_arg(&model);
                     let (b, rep) =
-                        tang_compress::encode_portfolio_f32(&x, &dims, &cfg, codec == "auto");
+                        cram_codec::encode_portfolio_f32(&x, &dims, &cfg, codec == "auto");
                     let tried: Vec<String> = rep
                         .tried
                         .iter()
@@ -121,8 +121,8 @@ fn main() {
                 }
                 "fast" => {
                     let mut cfg = wavcodec::WavConfig::new(bound);
-                    cfg.model = tang_compress::learned::parse_model_arg(&model);
-                    let (b, c) = tang_compress::encode_fast_f32(&x, &dims, &cfg);
+                    cfg.model = cram_codec::learned::parse_model_arg(&model);
+                    let (b, c) = cram_codec::encode_fast_f32(&x, &dims, &cfg);
                     (b, format!("\"chose\":\"{}\"", c.name()))
                 }
                 "qtt-probe" => {
@@ -132,7 +132,7 @@ fn main() {
                             .and_then(|v| v.parse().ok())
                             .unwrap_or(d)
                     };
-                    let (n, r, t) = tang_compress::qtt_probe(
+                    let (n, r, t) = cram_codec::qtt_probe(
                         &x,
                         &dims,
                         bound,
@@ -147,13 +147,13 @@ fn main() {
                 "interp" | "lorenzo" | "qtt" | "qtt-sparse" => {
                     let cfg = wavcodec::WavConfig::new(bound);
                     let c = match codec.as_str() {
-                        "qtt" => tang_compress::Candidate::Qtt,
-                        "qtt-sparse" => tang_compress::Candidate::QttSparse,
-                        "lorenzo" => tang_compress::Candidate::Lorenzo,
-                        _ => tang_compress::Candidate::Interp,
+                        "qtt" => cram_codec::Candidate::Qtt,
+                        "qtt-sparse" => cram_codec::Candidate::QttSparse,
+                        "lorenzo" => cram_codec::Candidate::Lorenzo,
+                        _ => cram_codec::Candidate::Interp,
                     };
                     let mut b = vec![c.tag()];
-                    b.extend(tang_compress::encode_candidate_f32(c, &x, &dims, &cfg));
+                    b.extend(cram_codec::encode_candidate_f32(c, &x, &dims, &cfg));
                     (b, format!("\"chose\":\"{codec}\""))
                 }
                 _ => usage(),
@@ -169,7 +169,7 @@ fn main() {
         Some("decode") if args.len() == 3 || (args.len() == 5 && args[3] == "--model") => {
             if args.len() == 5 {
                 // registers a pretrained network so the decoder can resolve it
-                let _ = tang_compress::learned::parse_model_arg(&args[4]);
+                let _ = cram_codec::learned::parse_model_arg(&args[4]);
             }
             let bytes = std::fs::read(&args[1]).unwrap();
             let t = Instant::now();

@@ -8,7 +8,7 @@
 //! `upto` (the tail and newly generated tokens) stay bf16, like KIVI's fp16 residual.
 //!
 //! Modes:
-//! - `tkv`: `tang_compress::kvcodec` GPU layout. K is coded pre-RoPE (the pool's post-RoPE K is
+//! - `tkv`: `cram_codec::kvcodec` GPU layout. K is coded pre-RoPE (the pool's post-RoPE K is
 //!   rotated back with the model's own cos/sin tables; the kernel rotates the decoded rows
 //!   forward with the same tables), V as is. Step = `rel × centered rms × √12`, K at
 //!   `0.5 rel`, V at `2 rel` (the `tkv-<rel>` configs of `bench/kv_base.py`).
@@ -21,8 +21,8 @@
 //! compressed size that would be resident.
 use crate::blocks::{self, BLOCK};
 use crate::model::Model;
-use tang_compress::kvcodec::{encode, Kind, KvParams};
-use tang_compress::kvgpu::{Batch, Placement};
+use cram_codec::kvcodec::{encode, Kind, KvParams};
+use cram_codec::kvgpu::{Batch, Placement};
 use tang_compute::ComputeDevice;
 
 /// Which compressor.

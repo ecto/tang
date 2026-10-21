@@ -26,8 +26,8 @@ members = [
     "crates/tang-llm",
     "crates/tang-moe",
     "crates/tang-llm-ios",
-    "crates/tang-compress",
-    "crates/tang-compress-wasm",
+    "crates/cram-codec",
+    "crates/cram-codec-wasm",
 ]
 
 [workspace.package]
@@ -56,7 +56,7 @@ authors = ["Cam Pedersen <cam@campedersen.com>"]
 #                        abs/min/max/tanh lower to different graphs, so a
 #                        0.x minor bump, not 0.1.2)
 #   tang-compile  0.1.0 first publish
-#   tang-compress 0.1.0 first publish
+#   cram-codec 0.1.0 first publish
 # tang-la, tang-ad and tang-expr carry their own `version` because they moved
 # off the workspace number. Publish in the order in docs/publishing.md
 # (scripts/publish.sh).
@@ -82,7 +82,7 @@ tang-3dgs = { version = "0.1", path = "crates/tang-3dgs" }
 tang-holo = { version = "0.1", path = "crates/tang-holo" }
 tang-sheffer = { version = "0.1", path = "crates/tang-sheffer" }
 tang-llm = { version = "0.1", path = "crates/tang-llm" }
-tang-compress = { version = "0.1", path = "crates/tang-compress" }
+cram-codec = { version = "0.1", path = "crates/cram-codec" }
 tang-moe = { version = "0.1", path = "crates/tang-moe" }
 iroh = "0.96"
 tarpc = { version = "0.35", features = ["tokio1", "serde-transport"] }

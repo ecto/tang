@@ -1,4 +1,4 @@
-//! KV-cache codec CLI (see `tang_compress::kvcodec`).
+//! KV-cache codec CLI (see `cram_codec::kvcodec`).
 //!
 //!     kvc encode IN.f32 OUT --shape HxTxD --kind k|v (--rmse r | --maxabs e | --bpv b)
 //!         [--post] [--sink n] [--sinkdiv n] [--block n] [--noar] [--theta t] [--prefill n]
@@ -9,7 +9,7 @@
 
 use std::time::Instant;
 
-use tang_compress::kvcodec::{step_for_bpv, Kind, KvEncoder, KvParams, KvStream};
+use cram_codec::kvcodec::{step_for_bpv, Kind, KvEncoder, KvParams, KvStream};
 
 fn usage() -> ! {
     eprintln!("usage: kvc encode IN OUT --shape HxTxD --kind k|v (--rmse r|--maxabs e|--bpv b) [--post] [--sink n] [--sinkdiv n] [--block n] [--noar] [--theta t] [--prefill n]\n       kvc decode IN OUT [--range t0:t1] [--reps n]");

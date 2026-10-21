@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ML-tensor compression bench: lossless + lossy baselines + tang-compress.
+"""ML-tensor compression bench: lossless + lossy baselines + cram-codec.
 
     UVW="uv run --no-project --python 3.12 --with zipnn --with zfpy --with pysz --with zstandard --with numpy"
     $UVW python bench/tensors_prep.py     # (also --with tokenizers --with pyarrow)

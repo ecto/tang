@@ -10,12 +10,12 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Instant;
-use tang_compress::codec::ErrorBound;
-use tang_compress::gpudec::GpuDecoder;
-use tang_compress::gpuwav::{self, GpuConfig};
-use tang_compress::gpuwav3::{self, Gpu3Config, Model3};
-use tang_compress::learned;
-use tang_compress_wasm::{decode_cpu_bits, decoder_key, fnv1a_bits, format_of, Format};
+use cram_codec::codec::ErrorBound;
+use cram_codec::gpudec::GpuDecoder;
+use cram_codec::gpuwav::{self, GpuConfig};
+use cram_codec::gpuwav3::{self, Gpu3Config, Model3};
+use cram_codec::learned;
+use cram_codec_wasm::{decode_cpu_bits, decoder_key, fnv1a_bits, format_of, Format};
 
 fn opt(args: &[String], k: &str, d: &str) -> String {
     args.iter()
@@ -129,9 +129,9 @@ fn main() {
                         let ps = gpuwav3::parse3(s).unwrap();
                         (
                             if *f == "tcg3s" { "tcs3s" } else { "tcs3l" },
-                            tang_compress::shipdec::wrap(
+                            cram_codec::shipdec::wrap(
                                 s,
-                                &tang_compress::shipdec::builtin_program(
+                                &cram_codec::shipdec::builtin_program(
                                     ps.net.as_ref(),
                                     ps.net.is_some() && ps.ad.wa > 0,
                                 ),

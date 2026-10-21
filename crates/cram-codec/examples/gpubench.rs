@@ -7,9 +7,9 @@
 //! and tc-gpu per brick size, each verified by decoding.
 
 use std::time::Instant;
-use tang_compress::codec::ErrorBound;
-use tang_compress::gpuwav::{self, GpuConfig};
-use tang_compress::gpuwav3::{self, Gpu3Config, Model3};
+use cram_codec::codec::ErrorBound;
+use cram_codec::gpuwav::{self, GpuConfig};
+use cram_codec::gpuwav3::{self, Gpu3Config, Model3};
 
 fn cfg3_of(bound: ErrorBound, bk: usize, args: &[String]) -> Gpu3Config {
     let m = opt(args, "--model3", "static");
@@ -26,10 +26,10 @@ fn cfg3_of(bound: ErrorBound, bk: usize, args: &[String]) -> Gpu3Config {
         }
     } else if let Some(p) = m.strip_prefix("pretrained:") {
         let net = std::sync::Arc::new(
-            tang_compress::learned::Net::from_bytes(&std::fs::read(p).expect("model"))
+            cram_codec::learned::Net::from_bytes(&std::fs::read(p).expect("model"))
                 .expect("parse"),
         );
-        tang_compress::learned::register(net.clone());
+        cram_codec::learned::register(net.clone());
         Model3::Pretrained(net)
     } else {
         panic!("model3 {m}")
@@ -45,7 +45,7 @@ fn cfg3_of(bound: ErrorBound, bk: usize, args: &[String]) -> Gpu3Config {
         ..Gpu3Config::new(bound)
     }
 }
-use tang_compress::{wavcodec, Decoded};
+use cram_codec::{wavcodec, Decoded};
 
 fn read_f32(path: &str) -> Vec<f32> {
     let b = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
@@ -80,8 +80,8 @@ fn main() {
     if mode == "cpu3" {
         // gpubench cpu3 STREAM... [pretrained:PATH]: CPU decode vs saved hash (TC_CPU_IR=1: net via tang-expr)
         for p in args.iter().filter_map(|a| a.strip_prefix("pretrained:")) {
-            tang_compress::learned::register(std::sync::Arc::new(
-                tang_compress::learned::Net::from_bytes(&std::fs::read(p).unwrap()).unwrap(),
+            cram_codec::learned::register(std::sync::Arc::new(
+                cram_codec::learned::Net::from_bytes(&std::fs::read(p).unwrap()).unwrap(),
             ));
         }
         let threads: usize = opt(&args, "--threads", "16").parse().unwrap();
@@ -109,42 +109,42 @@ fn main() {
         // gpubench ship3 STREAM.tcg3... [--mlp] [pretrained:PATH]: write STREAM.tcs3 carrying the
         // built-in decoder (with the net's MLP as a graph when --mlp); report bytes and compile/cache time
         for p in args.iter().filter_map(|a| a.strip_prefix("pretrained:")) {
-            tang_compress::learned::register(std::sync::Arc::new(
-                tang_compress::learned::Net::from_bytes(&std::fs::read(p).unwrap()).unwrap(),
+            cram_codec::learned::register(std::sync::Arc::new(
+                cram_codec::learned::Net::from_bytes(&std::fs::read(p).unwrap()).unwrap(),
             ));
         }
         let mlp = args.iter().any(|a| a == "--mlp");
         for f in args[1..].iter().filter(|a| a.ends_with(".tcg3")) {
             let b = std::fs::read(f).unwrap();
             let ps = gpuwav3::parse3(&b).unwrap();
-            let prog = tang_compress::shipdec::builtin_program(
+            let prog = cram_codec::shipdec::builtin_program(
                 if mlp { ps.net.as_ref() } else { None },
                 ps.net.is_some() && ps.ad.wa > 0,
             );
-            let w = tang_compress::shipdec::wrap(&b, &prog);
+            let w = cram_codec::shipdec::wrap(&b, &prog);
             let out = format!("{}.tcs3", f.trim_end_matches(".tcg3"));
             std::fs::write(&out, &w).unwrap();
             std::fs::copy(format!("{f}.hash"), format!("{out}.hash")).unwrap();
             let t0 = Instant::now();
-            let d = tang_compress::shipdec::compile(&prog).unwrap();
+            let d = cram_codec::shipdec::compile(&prog).unwrap();
             let verify_lower_s = t0.elapsed().as_secs_f64();
             let t1 = Instant::now();
-            let _ = tang_compress::shipdec::compile_cached(&prog).unwrap();
+            let _ = cram_codec::shipdec::compile_cached(&prog).unwrap();
             let first_s = t1.elapsed().as_secs_f64();
             let t2 = Instant::now();
-            let _ = tang_compress::shipdec::compile_cached(&prog).unwrap();
+            let _ = cram_codec::shipdec::compile_cached(&prog).unwrap();
             let hit_s = t2.elapsed().as_secs_f64();
             #[cfg(not(feature = "gpu"))]
             let gpu = String::new();
             #[cfg(feature = "gpu")]
             let gpu = {
                 let ws = gpuwav3::parse3(&w).unwrap();
-                let g = tang_compress::gpudec::GpuDecoder::new(
+                let g = cram_codec::gpudec::GpuDecoder::new(
                     ws.lanes,
                     ws.d3.iter().copied().max().unwrap(),
                 )
                 .unwrap();
-                let mut tt = tang_compress::gpudec::GpuTimes::default();
+                let mut tt = cram_codec::gpudec::GpuTimes::default();
                 let pr = g.prepare3(&ws, &w, &mut tt);
                 let cold = g.warm3(&pr);
                 let hot = g.warm3(&pr);
@@ -165,8 +165,8 @@ fn main() {
     if mode == "gpu3" {
         // gpubench gpu3 STREAM... [--model3 pretrained:PATH]: GPU decode vs saved hash, kernel timing
         for p in args.iter().filter_map(|a| a.strip_prefix("pretrained:")) {
-            tang_compress::learned::register(std::sync::Arc::new(
-                tang_compress::learned::Net::from_bytes(&std::fs::read(p).unwrap()).unwrap(),
+            cram_codec::learned::register(std::sync::Arc::new(
+                cram_codec::learned::Net::from_bytes(&std::fs::read(p).unwrap()).unwrap(),
             ));
         }
         let reps: usize = opt(&args, "--reps", "3").parse().unwrap();
@@ -177,7 +177,7 @@ fn main() {
             let b = std::fs::read(f).unwrap();
             let want = std::fs::read_to_string(format!("{f}.hash")).unwrap();
             let ps = gpuwav3::parse3(&b).unwrap();
-            let g = tang_compress::gpudec::GpuDecoder::new(
+            let g = cram_codec::gpudec::GpuDecoder::new(
                 ps.lanes,
                 ps.d3.iter().copied().max().unwrap(),
             )
@@ -186,7 +186,7 @@ fn main() {
             let h = v.iter().fold(0xcbf29ce484222325u64, |h, &x| {
                 (h ^ x as u64).wrapping_mul(0x100000001b3)
             });
-            let mut t2 = tang_compress::gpudec::GpuTimes::default();
+            let mut t2 = cram_codec::gpudec::GpuTimes::default();
             let pr = g.prepare3(&ps, &b, &mut t2);
             let kern = (0..reps).map(|_| g.run3(&pr)).fold(f64::INFINITY, f64::min);
             let mut tot = f64::INFINITY;
@@ -356,12 +356,12 @@ fn main() {
                 #[cfg(feature = "gpu")]
                 {
                     let maxl = ps.shapes.iter().flat_map(|s| s.dims).max().unwrap();
-                    let g = tang_compress::gpudec::GpuDecoder::new(lanes, maxl).expect("gpu");
+                    let g = cram_codec::gpudec::GpuDecoder::new(lanes, maxl).expect("gpu");
                     // warm-up + check
                     let (v, _) = g.decode(&b).unwrap();
                     let diff = v.iter().zip(&cpu_bits).filter(|(a, b)| a != b).count();
                     assert_eq!(diff, 0, "GPU != CPU in {diff} cells");
-                    let mut tt = tang_compress::gpudec::GpuTimes::default();
+                    let mut tt = cram_codec::gpudec::GpuTimes::default();
                     let mut tot = f64::INFINITY;
                     for _ in 0..reps {
                         let t0 = Instant::now();
@@ -374,7 +374,7 @@ fn main() {
                         }
                     }
                     let ps2 = gpuwav::parse(&b).unwrap();
-                    let mut t2 = tang_compress::gpudec::GpuTimes::default();
+                    let mut t2 = cram_codec::gpudec::GpuTimes::default();
                     let pr = g.prepare(&ps2, &b, &mut t2);
                     let kern = best(&mut || g.run(&pr));
                     gpu_json = format!(
@@ -401,7 +401,7 @@ fn main() {
         #[cfg(feature = "gpu")]
         "verify" => {
             // CPU == GPU byte-for-byte, error bounds, and random-access crops
-            let g = tang_compress::gpudec::GpuDecoder::new(lanes, 1024).expect("gpu");
+            let g = cram_codec::gpudec::GpuDecoder::new(lanes, 1024).expect("gpu");
             for t in targets.split(',') {
                 let bound = if let Some(p) = t.strip_prefix('p') {
                     ErrorBound::Psnr(p.parse().unwrap())
@@ -455,7 +455,7 @@ fn main() {
         "verify3" | "speed3" => {
             let speed = mode == "speed3";
             let maxl = dims.iter().copied().max().unwrap();
-            let g = tang_compress::gpudec::GpuDecoder::new(lanes, maxl).expect("gpu");
+            let g = cram_codec::gpudec::GpuDecoder::new(lanes, maxl).expect("gpu");
             let reps: usize = opt(&args, "--reps", "3").parse().unwrap();
             let best =
                 |f: &mut dyn FnMut() -> f64| (0..reps).map(|_| f()).fold(f64::INFINITY, f64::min);
@@ -533,7 +533,7 @@ fn main() {
                             let _ = full(threads);
                             t0.elapsed().as_secs_f64()
                         });
-                        let mut tt = tang_compress::gpudec::GpuTimes::default();
+                        let mut tt = cram_codec::gpudec::GpuTimes::default();
                         let tot = best(&mut || {
                             let t0 = Instant::now();
                             let (v, t) = g.decode3(&b).unwrap();
@@ -541,7 +541,7 @@ fn main() {
                             tt = t;
                             t0.elapsed().as_secs_f64()
                         });
-                        let mut t2 = tang_compress::gpudec::GpuTimes::default();
+                        let mut t2 = cram_codec::gpudec::GpuTimes::default();
                         let pr = g.prepare3(&ps, &b, &mut t2);
                         let kern = best(&mut || g.run3(&pr));
                         sp = format!(

@@ -1,6 +1,6 @@
-# tang-compress portfolio codec (Track E, phase 1)
+# cram-codec portfolio codec (Track E, phase 1)
 
-Branch `claude/tc-portfolio-716321`. **Frozen code: `6b00aff`** (committed before any held-out run). Harness: `bench/run_portfolio.py`, `bench/summarize_portfolio.py`. External-codec rows are reused unchanged from the M1 held-out run (`bench/out/heldout_*.csv` from the `claude/tang-compress-qtt` worktree, copied to `bench/out/ext/`; QTT there is row-major, the same codec the portfolio calls).
+Branch `claude/tc-portfolio-716321`. **Frozen code: `6b00aff`** (committed before any held-out run). Harness: `bench/run_portfolio.py`, `bench/summarize_portfolio.py`. External-codec rows are reused unchanged from the M1 held-out run (`bench/out/heldout_*.csv` from the `claude/cram-codec-qtt` worktree, copied to `bench/out/ext/`; QTT there is row-major, the same codec the portfolio calls).
 
 ## What changed
 
@@ -378,4 +378,4 @@ Caveat: the machine was shared with other sessions (load average 10–30) for al
 
 ## Phase 3 note: interp at PSNR targets
 
-Interp now runs at RMSE/PSNR targets through a rate-controlled bound and is a portfolio candidate at every bound. On the 19 seen fields it wins 5 of 146 PSNR points, all at 30–50 dB (portfolio geomean 0.998×). As a diagnostic only, it takes hacc-vx 100 dB to 11.76 bpv (0.97× SZ3) and xgc-dpot 100 dB to 11.42 (1.02× SPERR). Details: [tang-compress-tc3-cleanup.md](tang-compress-tc3-cleanup.md).
+Interp now runs at RMSE/PSNR targets through a rate-controlled bound and is a portfolio candidate at every bound. On the 19 seen fields it wins 5 of 146 PSNR points, all at 30–50 dB (portfolio geomean 0.998×). As a diagnostic only, it takes hacc-vx 100 dB to 11.76 bpv (0.97× SZ3) and xgc-dpot 100 dB to 11.42 (1.02× SPERR). Details: [tang-compress-tc3-cleanup.md](cram-codec-tc3-cleanup.md).

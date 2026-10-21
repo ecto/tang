@@ -497,7 +497,7 @@ mod tests {
     #[test]
     fn shipped_mlp_needs_no_registry() {
         let path = std::env::var("TC_TEST_TCM").unwrap_or_else(|_| {
-            "/Users/cam/Developer/tang-compress/bench/models/pre3v4_16.tcm".into()
+            "/Users/cam/Developer/cram-codec/bench/models/pre3v4_16.tcm".into()
         });
         let Ok(tcm) = std::fs::read(&path) else {
             eprintln!("no {path}; skipping");

@@ -2,9 +2,9 @@
 //! check the bound.
 //!
 //! ```text
-//! cargo run --release -p tang-compress --example roundtrip
+//! cargo run --release -p cram-codec --example roundtrip
 //! ```
-use tang_compress::{decode, encode_f32, Config, Decoded, ErrorBound};
+use cram_codec::{decode, encode_f32, Config, Decoded, ErrorBound};
 
 fn main() {
     let (h, w) = (128, 128);

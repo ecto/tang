@@ -1,4 +1,4 @@
-//! Browser decoder for tang-compress GPU streams (TCG1, TCG3 static and
+//! Browser decoder for cram-codec GPU streams (TCG1, TCG3 static and
 //! learned): the native WGSL kernels through wgpu's WebGPU backend, plus a
 //! CPU fallback running the same integer reference decoder in WASM. Both
 //! paths are byte-identical to native `gpuwav::decode_box_parsed` /
@@ -14,8 +14,8 @@
 //! - `fnv1a(f32s)` — the gate hash (FNV-1a 64 over the `f32` bit patterns).
 
 use std::sync::Arc;
-use tang_compress::gpudec::{GpuDecoder, GpuTimes};
-use tang_compress::{gpuwav, gpuwav3, learned};
+use cram_codec::gpudec::{GpuDecoder, GpuTimes};
+use cram_codec::{gpuwav, gpuwav3, learned};
 use wasm_bindgen::prelude::*;
 
 /// Stream format, by magic (an `0xA0`/`0xA1` auto tag byte is not expected
@@ -34,7 +34,7 @@ pub fn format_of(bytes: &[u8]) -> Result<Format, String> {
         Some(m) if m == gpuwav::MAGIC => Ok(Format::V1),
         Some(m) if m == gpuwav3::MAGIC3 => Ok(Format::V3),
         // TCG3 carrying its own decoder (verified + compiled by parse3)
-        Some(m) if m == tang_compress::shipdec::MAGIC => Ok(Format::V3),
+        Some(m) if m == cram_codec::shipdec::MAGIC => Ok(Format::V3),
         _ => Err("not a TCG1/TCG3 stream".into()),
     }
 }

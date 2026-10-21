@@ -3,9 +3,9 @@
 //! ```text
 //! pretrain3 OUT.tcm --hidden 32,16 --psnr 40,60,80,100 --lanes 8 --block 32 a.f32:64x128x128 b.f32:64x128x128 ...
 //! ```
-use tang_compress::codec::ErrorBound;
-use tang_compress::gpuwav3::{samples3, Gpu3Config};
-use tang_compress::learned::{mean_bits_float, train, TrainConfig};
+use cram_codec::codec::ErrorBound;
+use cram_codec::gpuwav3::{samples3, Gpu3Config};
+use cram_codec::learned::{mean_bits_float, train, TrainConfig};
 
 fn opt(args: &[String], k: &str, d: &str) -> String {
     args.iter()
