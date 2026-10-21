@@ -119,3 +119,25 @@ HF fp32 (tang bf16) is ~2e-3 relative through block 25. It reaches 6e-2 at the l
 7e-2 at the merger, where the activations carry large outliers; the DeepStack features are at
 1.7e-3, 1.1e-2 and 1.7e-2. The 880-token image encodes in 1.2 s on the L40S, with the ViT
 running once per image.
+
+## Viewport eval
+
+`scripts/qwen3vl_eval.py` renders 20 CAD-viewport scenes with matplotlib: shaded cubes,
+cylinders, spheres and cones on a grid floor, with an axis triad, on a dark background like a
+vcad viewport. Each scene gets one question with a known answer: part count, the color of a
+named shape or of the leftmost/rightmost part, the shape of the leftmost part, or the color of
+the tallest part. tang answers through `tang-llm serve` (`/v1/chat/completions` with the image as
+a data URL), so the whole serving path runs. HF answers the same chat greedily in bf16.
+
+Results (L40S, 2026-10-21, bf16, greedy, `max_tokens` 8):
+
+| | answers |
+|---|---|
+| tang = HF | **19 / 20** |
+| tang vs ground truth | 16 / 20 |
+| HF vs ground truth | 17 / 20 |
+
+The one disagreement is a part count: tang said 5 and HF said 4 (truth 4). Both models make the
+same three ground-truth misses: they call a dark-shaded orange "brown", count 2 parts where the
+scene has 1, and pick the blue part as tallest. These are model or scene-labelling limits, not
+tang's. Per-scene answers: `results.json` in the output directory.
