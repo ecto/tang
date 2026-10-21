@@ -66,63 +66,36 @@ fn env_is(key: &str, val: &str) -> bool {
     std::env::var(key).is_ok_and(|v| v == val)
 }
 
-/// Kernel variants for A/B on one build (defaults are the measured winners):
-/// `TANG_CODER_EXROWS=4` expert rows a warp (default 2), `TANG_CODER_SILU=fused` the SiLU+int8
-/// in the down kernel (default a separate launch), `TANG_CODER_KQ` warps a row in the
-/// K-split GEMV (1, 2, 4 or 8; default 2).
+/// Kernel variants for A/B on one build (the defaults are the measured winners; the losers are
+/// in `docs/speed-log.md` under Dead ends): `TANG_CODER_KQ` warps a row in the K-split GEMV
+/// (1, 2, 4 or 8; default 2), `TANG_CODER_FASTK` the K-quant expert dot (0: 8 weights a lane,
+/// 1: 32 a lane, 2: also two down rows a warp; default 1), `TANG_CODER_SHPAR=1` the shared
+/// expert on a parallel graph branch.
 #[derive(Clone, Copy, Debug)]
 struct Variants {
-    exrows: usize,
-    silu_sep: bool,
     kq: usize,
-    /// K-split expert kernels: warps a row for gate|up and for down (0: the staged kernels).
-    guk: usize,
-    dnk: usize,
-    /// The top-k in the router GEMV's last block (one launch).
-    router_fused: bool,
-    /// Warps a row of the K-split GEMV for matrices with at least 4096 rows (0: `kq`).
-    kq_tall: usize,
-    /// The top-k in the gate|up kernel's prologue instead of its own launch.
-    route_gu: bool,
-    /// Threads a block of the norm kernels.
-    normt: u32,
-    /// Q4_K / Q5_K expert rows through `cx_dotq_fast` (32 weights a lane a step; default on,
-    /// `TANG_CODER_FASTK=0` / `fastk=0` for the 8-weight decoder).
-    fastk: bool,
+    fastk: i32,
+    shared_par: bool,
+}
+
+impl Default for Variants {
+    fn default() -> Self {
+        Variants {
+            kq: 2,
+            fastk: 1,
+            shared_par: false,
+        }
+    }
 }
 
 impl Variants {
     fn from_env() -> Self {
+        let num = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<i64>().ok());
+        let d = Variants::default();
         Variants {
-            exrows: if env_is("TANG_CODER_EXROWS", "4") {
-                4
-            } else {
-                2
-            },
-            silu_sep: !env_is("TANG_CODER_SILU", "fused"),
-            kq: std::env::var("TANG_CODER_KQ")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2),
-            guk: std::env::var("TANG_CODER_GUK")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
-            dnk: std::env::var("TANG_CODER_DNK")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
-            router_fused: env_is("TANG_CODER_ROUTER", "fused"),
-            fastk: !env_is("TANG_CODER_FASTK", "0"),
-            route_gu: env_is("TANG_CODER_ROUTE", "gu"),
-            normt: std::env::var("TANG_CODER_NORMT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1024),
-            kq_tall: std::env::var("TANG_CODER_KQTALL")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
+            kq: num("TANG_CODER_KQ").map_or(d.kq, |v| v as usize),
+            fastk: num("TANG_CODER_FASTK").map_or(d.fastk, |v| v as i32),
+            shared_par: env_is("TANG_CODER_SHPAR", "1"),
         }
     }
 }
@@ -244,12 +217,6 @@ struct Kern {
     gemvk8: [Fun; MAX_T],
     gemvk2: [Fun; MAX_T],
     gemvk1: [Fun; MAX_T],
-    moe_gu4: Fun,
-    guk: [Fun; 3],
-    dnk: [Fun; 3],
-    router: [Fun; MAX_T],
-    moe_down_f2: Fun,
-    moe_down_f4: Fun,
     norm_q8: Fun,
     route: Fun,
     moe_gu: Fun,
@@ -288,8 +255,6 @@ struct Scratch {
     head: B,
     out_ids: B,
     amax: B,
-    /// cx_router's block counter (zero between launches).
-    done: B,
 }
 
 /// Pinned staging: control words and embeddings in, sampled ids out.
@@ -333,6 +298,10 @@ pub struct Coder {
     io: Io,
     k: Kern,
     stream: ManuallyDrop<Stream>,
+    /// The shared expert's branch (`shared_par`), and its fork/join events.
+    side: Stream,
+    ev_fork: gpu::Event,
+    ev_join: gpu::Event,
     /// Window graphs by (t, verify, attention chunks).
     graphs: HashMap<(usize, bool, usize), Graph>,
     commit_graphs: Vec<Option<Graph>>,
@@ -597,7 +566,6 @@ impl Coder {
             head: z(MAX_T * hp.n_vocab),
             out_ids: z(MAX_T),
             amax: z(MAX_T * 64 * 2),
-            done: z(1),
         };
         dev.sync();
         let t_weights = t1.elapsed().as_secs_f64();
@@ -658,26 +626,6 @@ impl Coder {
                 }
                 a
             },
-            moe_gu4: f(&cm, "cx_moe_gu_r4")?,
-            guk: [
-                f(&cm, "cx_moe_guk1")?,
-                f(&cm, "cx_moe_guk2")?,
-                f(&cm, "cx_moe_guk4")?,
-            ],
-            dnk: [
-                f(&cm, "cx_moe_downk1")?,
-                f(&cm, "cx_moe_downk2")?,
-                f(&cm, "cx_moe_downk4")?,
-            ],
-            router: {
-                let mut a = [std::ptr::null_mut(); MAX_T];
-                for (i, slot) in a.iter_mut().enumerate() {
-                    *slot = f(&cm, &format!("cx_router_t{}", i + 1))?;
-                }
-                a
-            },
-            moe_down_f2: f(&cm, "cx_moe_down_f2")?,
-            moe_down_f4: f(&cm, "cx_moe_down_f4")?,
             norm_q8: f(&cm, "cx_norm_q8")?,
             route: f(&cm, "cx_route")?,
             moe_gu: f(&cm, "cx_moe_gu")?,
@@ -694,13 +642,7 @@ impl Coder {
             argmax2: f(&em, "fe_argmax2")?,
             _mods: vec![cm, fm, em],
         };
-        for f in [
-            k.moe_gu,
-            k.moe_gu4,
-            k.moe_down,
-            k.moe_down_f2,
-            k.moe_down_f4,
-        ] {
+        for f in [k.moe_gu, k.moe_down] {
             unsafe {
                 gpu::check(
                     cudarc::driver::sys::cuFuncSetAttribute(
@@ -758,6 +700,9 @@ impl Coder {
             io,
             k,
             stream,
+            side: Stream::new().map_err(|e| anyhow!("{e}"))?,
+            ev_fork: gpu::Event::new(false).map_err(|e| anyhow!("{e}"))?,
+            ev_join: gpu::Event::new(false).map_err(|e| anyhow!("{e}"))?,
             graphs: HashMap::new(),
             commit_graphs: (0..=MAX_T).map(|_| None).collect(),
             max_ctx,
@@ -810,8 +755,10 @@ impl Coder {
         }
     }
 
-    unsafe fn launch_smem(
+    /// A launch with dynamic shared memory on any stream.
+    unsafe fn launch_on(
         &self,
+        stream: &Stream,
         f: Fun,
         grid: (u32, u32, u32),
         block: u32,
@@ -821,8 +768,8 @@ impl Coder {
         if self.skip(self.kname(f)) {
             return;
         }
-        gpu::launch(f, grid, (block, 1, 1), smem, &self.stream, args).expect("launch");
-        if self.prof.is_some() {
+        gpu::launch(f, grid, (block, 1, 1), smem, stream, args).expect("launch");
+        if self.prof.is_some() && std::ptr::eq(stream, &*self.stream) {
             self.mark(self.kname(f));
         }
     }
@@ -840,15 +787,6 @@ impl Coder {
             (k.moe_gu, "moe_gu"),
             (k.silu_q, "silu_q"),
             (k.moe_down, "moe_down"),
-            (k.moe_down_f2, "moe_down"),
-            (k.moe_down_f4, "moe_down"),
-            (k.moe_gu4, "moe_gu"),
-            (k.guk[0], "moe_gu"),
-            (k.guk[1], "moe_gu"),
-            (k.guk[2], "moe_gu"),
-            (k.dnk[0], "moe_down"),
-            (k.dnk[1], "moe_down"),
-            (k.dnk[2], "moe_down"),
             (k.moe_add_norm, "moe_add_norm"),
             (k.prep, "attn_prep"),
             (k.part, "attn_part"),
@@ -861,7 +799,6 @@ impl Coder {
             (k.q8, "moe_q8"),
         ]
         .into_iter()
-        .chain(k.router.iter().map(|&r| (r, "router")))
         .find(|(g, _)| *g == f)
         .map_or("other", |(_, n)| n)
     }
@@ -955,11 +892,7 @@ impl Coder {
                 q
             }
         };
-        let kq = if self.var.kq_tall > 0 && w.rows >= 4096 {
-            self.var.kq_tall
-        } else {
-            self.var.kq
-        };
+        let kq = self.var.kq;
         if w.k.is_multiple_of(kq * 256) && !gemv_v1() {
             let f = match kq {
                 8 => self.k.gemvk8[t - 1],
@@ -1010,7 +943,7 @@ impl Coder {
             self.launch(
                 self.k.norm_q8,
                 (t as u32, 1, 1),
-                self.var.normt,
+                1024,
                 tang_moe::args![r, y, wp, x, xq, n, eps, ad],
             )
         };
@@ -1154,7 +1087,7 @@ impl Coder {
     fn enqueue_moe(&self, l: usize, t: usize, next: &B, keep_y: bool) {
         let layer = &self.layers[l];
         let (s, hp) = (&self.s, &self.hp);
-        let (n, ne, kk, ff) = (hp.n_embd, hp.n_expert, hp.n_expert_used, hp.n_ff_exp);
+        let (ne, kk) = (hp.n_expert, hp.n_expert_used);
         let (x, mxq) = (self.a(&s.x), self.a(&s.mxq));
         let ls = ne + 1;
         let (lg, lsi, ids, w, scale) = (
@@ -1164,37 +1097,22 @@ impl Coder {
             self.a(&s.w),
             hp.expert_weights_scale,
         );
-        if self.var.router_fused {
-            let rw = &layer.router;
-            let (sp, ns, ki, done) = (self.a(&rw.segs), rw.nseg, rw.k as i32, self.a(&s.done));
-            unsafe {
-                self.launch(
-                    self.k.router[t - 1],
-                    (rw.rows.div_ceil(2) as u32, 1, 1),
-                    256,
-                    tang_moe::args![sp, ns, x, mxq, ki, lg, lsi, done, ids, w, scale],
-                );
-            }
-        } else {
-            self.gemv("router", &layer.router, x, Some(mxq), lg, t, ls);
-        }
-        let (gw, uw, dw) = (layer.gate.w, layer.up.w, layer.down.w);
-        let (sg, su, sd) = (layer.sh_gate.w, layer.sh_up.w, layer.sh_down.w);
-        let (egu, hq, parts) = (self.a(&s.egu), self.a(&s.hq), self.a(&s.parts));
-        let np = (t * (kk + 1)) as u32;
-        let (ti, r16g, r16d) = (t as i32, layer.r16_gu, layer.r16_down);
-        let fastk = self.var.fastk as i32;
-        let (r, yo, wn, xo, eps) = (
+        let (r, yo, wn, xo, eps, ti) = (
             self.a(&s.r),
             if keep_y { self.a(&s.moe_y) } else { 0u64 },
             self.a(next),
             x,
             self.eps,
+            t as i32,
         );
-        let route_gu = self.var.route_gu && self.var.guk == 0;
-        let lg_in = if route_gu { lg } else { 0u64 };
-        unsafe {
-            if !self.var.router_fused && !route_gu {
+        let routed = t * kk;
+        if self.var.shared_par {
+            // The shared expert doesn't depend on the routing: fork it onto the side stream
+            // before the router, join before the combine.
+            self.fork();
+            self.experts(layer, t, routed, t, &self.side);
+            self.gemv("router", &layer.router, x, Some(mxq), lg, t, ls);
+            unsafe {
                 self.launch(
                     self.k.route,
                     (t as u32, 1, 1),
@@ -1202,83 +1120,94 @@ impl Coder {
                     tang_moe::args![lg, lsi, ids, w, scale],
                 );
             }
-            let rg = self.var.exrows as u32;
-            let kidx = |q: usize| match q {
-                1 => 0,
-                2 => 1,
-                _ => 2,
-            };
-            if self.var.guk > 0 {
-                let q = self.var.guk;
+            self.experts(layer, t, 0, routed, &self.stream);
+            self.join();
+        } else {
+            self.gemv("router", &layer.router, x, Some(mxq), lg, t, ls);
+            unsafe {
                 self.launch(
-                    self.k.guk[kidx(q)],
-                    ((2 * ff * q / 8) as u32, np, 1),
-                    256,
-                    tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti],
-                );
-            } else {
-                self.launch_smem(
-                    if rg == 4 {
-                        self.k.moe_gu4
-                    } else {
-                        self.k.moe_gu
-                    },
-                    ((2 * ff) as u32 / (8 * rg), np, 1),
-                    256,
-                    8 * rg * 16 * r16g as u32,
-                    tang_moe::args![
-                        gw, uw, sg, su, ids, mxq, egu, ti, r16g, fastk, lg_in, lsi, w, scale
-                    ],
+                    self.k.route,
+                    (t as u32, 1, 1),
+                    32,
+                    tang_moe::args![lg, lsi, ids, w, scale],
                 );
             }
-            if self.var.dnk > 0 {
-                let q = self.var.dnk;
-                self.launch(
-                    self.k.silu_q,
-                    ((ff / 32) as u32, np, 1),
-                    32,
-                    tang_moe::args![egu, hq],
-                );
-                self.launch(
-                    self.k.dnk[kidx(q)],
-                    ((n * q / 8) as u32, np, 1),
-                    256,
-                    tang_moe::args![dw, sd, ids, hq, parts, ti],
-                );
-            } else if self.var.silu_sep {
-                self.launch(
-                    self.k.silu_q,
-                    ((ff / 32) as u32, np, 1),
-                    32,
-                    tang_moe::args![egu, hq],
-                );
-                self.launch_smem(
-                    self.k.moe_down,
-                    ((n / 16) as u32, np, 1),
-                    256,
-                    (16 * 16 * r16d) as u32,
-                    tang_moe::args![dw, sd, ids, hq, parts, ti, r16d, fastk],
-                );
-            } else {
-                self.launch_smem(
-                    if rg == 4 {
-                        self.k.moe_down_f4
-                    } else {
-                        self.k.moe_down_f2
-                    },
-                    (n as u32 / (8 * rg), np, 1),
-                    256,
-                    8 * rg * 16 * r16d as u32,
-                    tang_moe::args![dw, sd, ids, egu, parts, ti, r16d, fastk],
-                );
-            }
+            self.experts(layer, t, 0, routed + t, &self.stream);
+        }
+        let parts = self.a(&s.parts);
+        unsafe {
             self.launch(
                 self.k.moe_add_norm,
                 (t as u32, 1, 1),
-                self.var.normt,
+                1024,
                 tang_moe::args![r, parts, w, lg, lsi, ti, yo, wn, xo, mxq, eps],
             );
         }
+    }
+
+    /// Expert pairs `pbase..pbase + n` (routed pairs first, then the shared expert per token):
+    /// gate|up rows, SiLU+int8, down rows, on `stream`.
+    fn experts(&self, layer: &Layer, t: usize, pbase: usize, n: usize, stream: &Stream) {
+        if n == 0 {
+            return;
+        }
+        let (s, hp) = (&self.s, &self.hp);
+        let (nh, ff) = (hp.n_embd, hp.n_ff_exp);
+        let (gw, uw, dw) = (layer.gate.w, layer.up.w, layer.down.w);
+        let (sg, su, sd) = (layer.sh_gate.w, layer.sh_up.w, layer.sh_down.w);
+        let (ids, mxq, egu, hq, parts) = (
+            self.a(&s.ids),
+            self.a(&s.mxq),
+            self.a(&s.egu),
+            self.a(&s.hq),
+            self.a(&s.parts),
+        );
+        let (ti, r16g, r16d, fastk, pb) = (
+            t as i32,
+            layer.r16_gu,
+            layer.r16_down,
+            self.var.fastk,
+            pbase as i32,
+        );
+        let np = n as u32;
+        unsafe {
+            self.launch_on(
+                stream,
+                self.k.moe_gu,
+                ((2 * ff / 16) as u32, np, 1),
+                256,
+                (16 * 16 * r16g) as u32,
+                tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti, r16g, fastk, pb],
+            );
+            self.launch_on(
+                stream,
+                self.k.silu_q,
+                ((ff / 32) as u32, np, 1),
+                32,
+                0,
+                tang_moe::args![egu, hq, pb],
+            );
+            self.launch_on(
+                stream,
+                self.k.moe_down,
+                ((nh / 16) as u32, np, 1),
+                256,
+                (16 * 16 * r16d) as u32,
+                tang_moe::args![dw, sd, ids, hq, parts, ti, r16d, fastk, pb],
+            );
+        }
+    }
+
+    /// Side stream: start after everything enqueued so far on the main stream.
+    fn fork(&self) {
+        self.ev_fork.record(&self.stream).expect("record");
+        self.side.wait(&self.ev_fork).expect("wait");
+    }
+
+    /// Main stream: wait for everything enqueued so far on the side stream.
+    fn join(&self) {
+        self.ev_join.record(&self.side).expect("record");
+        self.stream.wait(&self.ev_join).expect("wait");
     }
 
     fn enqueue_head(&self, t: usize) {
@@ -1689,33 +1618,15 @@ impl Coder {
         Ok(out)
     }
 
-    /// Switch kernel variants (`exrows=4`, `silu=fused`, `kq=8`, comma-separated; empty for the
+    /// Switch kernel variants (`kq=N`, `fastk=N`, `shpar=1`, comma-separated; empty for the
     /// defaults) and drop the captured graphs.
     pub fn set_variants(&mut self, spec: &str) -> Result<()> {
-        let mut v = Variants {
-            exrows: 2,
-            silu_sep: true,
-            kq: 2,
-            guk: 0,
-            dnk: 0,
-            router_fused: false,
-            kq_tall: 0,
-            fastk: true,
-            route_gu: false,
-            normt: 1024,
-        };
+        let mut v = Variants::default();
         for kv in spec.split(',').filter(|x| !x.is_empty()) {
-            match kv {
-                "exrows=4" => v.exrows = 4,
-                "silu=fused" => v.silu_sep = false,
-                "router=fused" => v.router_fused = true,
-                "fastk=0" => v.fastk = false,
-                "route=gu" => v.route_gu = true,
-                _ if kv.starts_with("normt=") => v.normt = kv[6..].parse()?,
-                _ if kv.starts_with("kqtall=") => v.kq_tall = kv[7..].parse()?,
-                _ if kv.starts_with("guk=") => v.guk = kv[4..].parse()?,
-                _ if kv.starts_with("dnk=") => v.dnk = kv[4..].parse()?,
-                _ if kv.starts_with("kq=") => v.kq = kv[3..].parse()?,
+            match kv.split_once('=') {
+                Some(("kq", n)) => v.kq = n.parse()?,
+                Some(("fastk", n)) => v.fastk = n.parse()?,
+                Some(("shpar", n)) => v.shared_par = n == "1",
                 _ => anyhow::bail!("unknown variant {kv}"),
             }
         }
