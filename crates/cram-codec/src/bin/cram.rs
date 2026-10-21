@@ -1,17 +1,17 @@
 //! `cram` — general-purpose compressor front door ([`cram_codec::container`]).
 //!
 //! ```text
-//! cram c IN OUT [--hint auto|bytes|text|f32:AxBxC[:maxabs=E|psnr=DB|rmse=E]]
+//! cram c IN OUT [--fast|--exhaustive] [--hint auto|bytes|text|f32:AxBxC[:maxabs=E|psnr=DB|rmse=E]]
 //! cram d IN OUT
-//! cram bench IN [--hint ...]     # CSV: every arm alone, then the container
+//! cram bench IN [--hint ...]     # CSV: every arm alone, then the container at each level
 //! ```
 
 use cram_codec::codec::ErrorBound;
-use cram_codec::container::{self, Arm, Hint};
+use cram_codec::container::{self, Arm, Hint, Level};
 use std::time::Instant;
 
 fn usage() -> ! {
-    eprintln!("usage: cram c IN OUT [--hint H] | cram d IN OUT | cram bench IN [--hint H]\n  H = auto|bytes|text|f32:AxBxC[:maxabs=E|psnr=DB|rmse=E]");
+    eprintln!("usage: cram c IN OUT [--fast|--exhaustive] [--hint H] | cram d IN OUT | cram bench IN [--hint H]\n  H = auto|bytes|text|f32:AxBxC[:maxabs=E|psnr=DB|rmse=E]");
     std::process::exit(2)
 }
 
@@ -53,6 +53,16 @@ fn hint_arg(args: &[String]) -> Hint {
         .unwrap_or(Hint::Auto)
 }
 
+fn level_arg(args: &[String]) -> Level {
+    if args.iter().any(|a| a == "--fast") {
+        Level::Fast
+    } else if args.iter().any(|a| a == "--exhaustive") {
+        Level::Exhaustive
+    } else {
+        Level::Default
+    }
+}
+
 fn read(p: &str) -> Vec<u8> {
     std::fs::read(p).unwrap_or_else(|e| {
         eprintln!("read {p}: {e}");
@@ -70,10 +80,11 @@ fn main() {
         Some("c") if args.len() >= 3 => {
             let x = read(&args[1]);
             let t = Instant::now();
-            let (c, rep) = container::compress_report(&x, &hint_arg(&args)).unwrap_or_else(|e| {
-                eprintln!("cram: {e}");
-                std::process::exit(1)
-            });
+            let (c, rep) = container::compress_report_level(&x, &hint_arg(&args), level_arg(&args))
+                .unwrap_or_else(|e| {
+                    eprintln!("cram: {e}");
+                    std::process::exit(1)
+                });
             let s = t.elapsed().as_secs_f64();
             std::fs::write(&args[2], &c).unwrap();
             let tried: Vec<String> = rep
@@ -140,25 +151,31 @@ fn main() {
                     mbs(x.len(), de)
                 );
             }
-            let t = Instant::now();
-            let (c, rep) = container::compress_report(&x, &hint).unwrap();
-            let ce = t.elapsed().as_secs_f64();
-            let t = Instant::now();
-            let y = container::decompress(&c).unwrap();
-            let de = t.elapsed().as_secs_f64();
-            assert!(
-                !rep.pick.is_lossless() || y == x,
-                "container did not round-trip"
-            );
-            println!(
-                "{name},cram,{},{},{:.4},{:.2},{:.2},{}",
-                x.len(),
-                c.len(),
-                x.len() as f64 / c.len() as f64,
-                mbs(x.len(), ce),
-                mbs(x.len(), de),
-                rep.pick.name()
-            );
+            for (label, level) in [
+                ("cram-fast", Level::Fast),
+                ("cram", Level::Default),
+                ("cram-exhaustive", Level::Exhaustive),
+            ] {
+                let t = Instant::now();
+                let (c, rep) = container::compress_report_level(&x, &hint, level).unwrap();
+                let ce = t.elapsed().as_secs_f64();
+                let t = Instant::now();
+                let y = container::decompress(&c).unwrap();
+                let de = t.elapsed().as_secs_f64();
+                assert!(
+                    !rep.pick.is_lossless() || y == x,
+                    "container did not round-trip"
+                );
+                println!(
+                    "{name},{label},{},{},{:.4},{:.2},{:.2},{}",
+                    x.len(),
+                    c.len(),
+                    x.len() as f64 / c.len() as f64,
+                    mbs(x.len(), ce),
+                    mbs(x.len(), de),
+                    rep.pick.name()
+                );
+            }
         }
         _ => usage(),
     }

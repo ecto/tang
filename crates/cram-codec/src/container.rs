@@ -21,8 +21,9 @@
 //!
 //! # Guarantee
 //!
-//! `compress(x).len() <= min(arm(x).len()) + header` over the enabled arms,
-//! where the header is `4 + 1 + varint(len) + 4` bytes. Lossless input (any
+//! `compress(x).len() <= min(arm(x).len()) + header`, the minimum taken over
+//! the arms *the chosen [`Level`] tries* (see [`plan`]), where the header is
+//! `4 + 1 + varint(len) + 4` bytes. Only [`Level::Exhaustive`] tries every arm. Lossless input (any
 //! hint without a bound) never takes the lossy arm.
 
 use crate::codec::ErrorBound;
@@ -51,6 +52,19 @@ pub enum Hint {
         /// Error bound for the lossy arm, or `None` for lossless.
         bound: Option<ErrorBound>,
     },
+}
+
+/// How hard [`compress_with`] tries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Level {
+    /// Stored + zstd-3 only (plus the lossy arm when the hint has a bound).
+    Fast,
+    /// Every lossless arm, except stored + zstd-3 only when the sniff says the
+    /// input is already compressed.
+    #[default]
+    Default,
+    /// Every arm, no sniff.
+    Exhaustive,
 }
 
 /// A compression method.
@@ -218,11 +232,16 @@ pub fn looks_compressed(x: &[u8]) -> bool {
         || p(MAGIC)
 }
 
-/// The arms [`compress`] tries for `x` under `hint`, in tie-break order.
+/// The arms [`compress`] tries for `x` under `hint` at [`Level::Default`].
 pub fn plan(x: &[u8], hint: &Hint) -> Vec<Arm> {
+    plan_level(x, hint, Level::Default)
+}
+
+/// The arms tried for `x` under `hint` at `level`, in tie-break order.
+pub fn plan_level(x: &[u8], hint: &Hint, level: Level) -> Vec<Arm> {
     let lossy = matches!(hint, Hint::F32Field { bound: Some(_), .. });
-    let sniff = matches!(hint, Hint::Auto | Hint::Bytes);
-    let mut arms: Vec<Arm> = if sniff && looks_compressed(x) {
+    let sniff = matches!(hint, Hint::Auto | Hint::Bytes) && level == Level::Default;
+    let mut arms: Vec<Arm> = if level == Level::Fast || (sniff && looks_compressed(x)) {
         vec![Arm::Stored, Arm::Zstd3]
     } else {
         LOSSLESS_ARMS.to_vec()
@@ -342,13 +361,28 @@ fn frame(arm: Arm, len: usize, crc: u32, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Compress `x`, keeping the smallest arm; see the module docs.
+/// Compress `x` at [`Level::Default`], keeping the smallest arm tried; see
+/// the module docs.
 pub fn compress(x: &[u8], hint: &Hint) -> Result<Vec<u8>, Error> {
-    compress_report(x, hint).map(|(b, _)| b)
+    compress_with(x, hint, Level::Default)
+}
+
+/// Compress `x` at `level`: size ≤ best arm that level tries + header.
+pub fn compress_with(x: &[u8], hint: &Hint, level: Level) -> Result<Vec<u8>, Error> {
+    compress_report_level(x, hint, level).map(|(b, _)| b)
 }
 
 /// [`compress`], also returning which arms ran and what each produced.
 pub fn compress_report(x: &[u8], hint: &Hint) -> Result<(Vec<u8>, Report), Error> {
+    compress_report_level(x, hint, Level::Default)
+}
+
+/// [`compress_with`], also returning which arms ran and what each produced.
+pub fn compress_report_level(
+    x: &[u8],
+    hint: &Hint,
+    level: Level,
+) -> Result<(Vec<u8>, Report), Error> {
     if let Hint::F32Field { dims, .. } = hint {
         if dims.iter().product::<usize>() * 4 != x.len() {
             return Err(Error::BadHint(format!(
@@ -359,7 +393,7 @@ pub fn compress_report(x: &[u8], hint: &Hint) -> Result<(Vec<u8>, Report), Error
     }
     let mut best: Option<(Arm, Vec<u8>)> = None;
     let mut tried = Vec::new();
-    for arm in plan(x, hint) {
+    for arm in plan_level(x, hint, level) {
         let p = encode_arm(arm, x, hint)?;
         tried.push((arm, p.len()));
         if best.as_ref().is_none_or(|(_, b)| p.len() < b.len()) {
@@ -484,6 +518,32 @@ mod tests {
             assert!(c.len() <= best + header_len(x.len()));
             // and never more than stored + header
             assert!(c.len() <= x.len() + header_len(x.len()));
+        }
+    }
+
+    #[test]
+    fn levels_bound_by_their_own_arms() {
+        let mut z = vec![b'P', b'K', 3, 4];
+        z.extend(b"abcabcabcabd".repeat(2000));
+        for x in inputs().into_iter().chain([z]) {
+            for level in [Level::Fast, Level::Default, Level::Exhaustive] {
+                let (c, _) = compress_report_level(&x, &Hint::Auto, level).unwrap();
+                let best = plan_level(&x, &Hint::Auto, level)
+                    .into_iter()
+                    .map(|a| encode_arm(a, &x, &Hint::Auto).unwrap().len())
+                    .min()
+                    .unwrap();
+                assert!(c.len() <= best + header_len(x.len()));
+                assert_eq!(decompress(&c).unwrap(), x);
+            }
+            assert_eq!(
+                plan_level(&x, &Hint::Auto, Level::Fast),
+                vec![Arm::Stored, Arm::Zstd3]
+            );
+            assert_eq!(
+                plan_level(&x, &Hint::Auto, Level::Exhaustive),
+                LOSSLESS_ARMS.to_vec()
+            );
         }
     }
 
