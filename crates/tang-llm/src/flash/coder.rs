@@ -697,13 +697,30 @@ impl Coder {
             argmax2: f(&em, "fe_argmax2")?,
             _mods: vec![cm, fm, em],
         };
+        // Up to 200 KB of staged expert rows, capped at what the device allows a block (99 KB on
+        // sm_86/89, 227 KB on sm_90), so the engine also loads on smaller GPUs.
+        let smem_max = {
+            let mut v = 0i32;
+            unsafe {
+                cudarc::driver::sys::cuDeviceGetAttribute(
+                    &mut v,
+                    cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+                    0,
+                )
+            };
+            if v > 0 {
+                v.min(200 * 1024)
+            } else {
+                99 * 1024
+            }
+        };
         for f in [k.moe_gu, k.moe_down, k.moe_gu_g, k.moe_down_g] {
             unsafe {
                 gpu::check(
                     cudarc::driver::sys::cuFuncSetAttribute(
                         f,
                         cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                        200 * 1024,
+                        smem_max,
                     ),
                     "cuFuncSetAttribute",
                 )
