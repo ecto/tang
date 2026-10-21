@@ -1,0 +1,16 @@
+[package]
+name = "cram-codec-wasm"
+version = "0.1.0"
+edition = "2021"
+# wasm-bindgen front end for the cram-codec TCG1/TCG3 decoders (WebGPU + CPU)
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+cram-codec = { workspace = true, features = ["gpu"] }
+wgpu = { workspace = true }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"

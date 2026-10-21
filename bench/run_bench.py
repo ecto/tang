@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""QTT vs SZ3 / ZFP / wavelet benchmark (tang-compress M0).
+"""QTT vs SZ3 / ZFP / wavelet benchmark (cram-codec M0).
 
 Every codec sees the same float32 array and the same error definitions:
 
@@ -197,7 +197,7 @@ def run_tthresh(x: np.ndarray, psnr_target: float) -> dict:
 
 
 def run_tc(x: np.ndarray, codec: str, bound_args: list[str], model: str = "hand") -> dict:
-    """tang-compress wavelet/Tucker via the `tc` example; decoded by the
+    """cram-codec wavelet/Tucker via the `tc` example; decoded by the
     binary's decoder and measured here, rate = stream file size."""
     src, bs, out = OUT / "tc_in.f32", OUT / "tc.bs", OUT / "tc_out.f32"
     x.astype("<f4").tofile(src)
@@ -219,7 +219,7 @@ def run_tc(x: np.ndarray, codec: str, bound_args: list[str], model: str = "hand"
 
 
 def tang_extra(name, x, rows, models=("hand",), auto_model=None):
-    """tang-compress M1 codecs: wavelet (PSNR + max-abs) and Tucker (PSNR)."""
+    """cram-codec M1 codecs: wavelet (PSNR + max-abs) and Tucker (PSNR)."""
     rng = float(x.max() - x.min())
     def add(codec, r, kind, **kw):
         r = {"dataset": name, "n": x.size, "codec": codec, "kind": kind, **kw, **r}

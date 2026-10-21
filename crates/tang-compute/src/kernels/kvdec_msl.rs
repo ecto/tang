@@ -1,15 +1,15 @@
 //! Compressed-KV decode kernels (MSL), built on [`super::llm_msl::kv_source`] so they write
 //! straight into f32 or bf16 KV caches.
 //!
-//! - `tkv_decode`: the GPU layout of `tang_compress::kvcodec` (TKV1, flag `gpu`). One thread
+//! - `tkv_decode`: the GPU layout of `cram_codec::kvcodec` (TKV1, flag `gpu`). One thread
 //!   per lane = one (stream, block, head) adaptive-binary-arithmetic substream; tables from
-//!   `tang_compress::kvgpu::Batch`. Integer only up to the final `float(q) * unit`, so with RoPE
+//!   `cram_codec::kvgpu::Batch`. Integer only up to the final `float(q) * unit`, so with RoPE
 //!   off and an f32 destination the output is bit-identical to the CPU decoder.
 //! - `kivi_dequant`: KIVI-style asymmetric integer groups (2/4/8-bit codes packed in `u32`,
 //!   half scale and zero per group; K grouped per channel along tokens, V per token along
 //!   channels). One thread per value.
 
-/// See the module docs. Lane descriptor layout: `tang_compress::kvgpu::LANE_WORDS`.
+/// See the module docs. Lane descriptor layout: `cram_codec::kvgpu::LANE_WORDS`.
 pub const KVDEC_MSL: &str = r#"
 inline uint tkv_rb(device const uint* s, uint a, uint end) {
     return a < end ? (s[a >> 2] >> ((a & 3u) * 8u)) & 0xffu : 0u;
