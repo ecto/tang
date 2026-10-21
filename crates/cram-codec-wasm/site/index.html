@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cram</title>
+<meta name="description" content="cram: error-bounded lossy compression for scientific floating-point data, with byte-identical decode on CPU, GPU and the browser.">
+<style>
+:root { --bg:#0b0907; --fg:#e8e1d2; --sub:#a08d70; --line:#2a2119; --accent:#ff5f00; }
+@media (prefers-color-scheme: light) { :root { --bg:#faf7f0; --fg:#1d1812; --sub:#6b5a42; --line:#e2d9c8; } }
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:17px/1.55 ui-sans-serif, system-ui, -apple-system, sans-serif; }
+main { max-width: 760px; margin: 0 auto; padding: 64px 16px 96px; }
+h1 { font-size: 64px; letter-spacing: -0.03em; margin: 0 0 8px; }
+h1 span { color: var(--accent); }
+.lede { font-size: 21px; color: var(--sub); margin: 0 0 40px; }
+h2 { font-size: 15px; text-transform: uppercase; letter-spacing: .08em; color: var(--sub); margin: 48px 0 12px; }
+ul { padding-left: 20px; } li { margin: 8px 0; }
+b { color: var(--fg); }
+code, pre { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+pre { background: color-mix(in srgb, var(--line) 50%, transparent); padding: 14px 16px; border-radius: 8px; overflow-x: auto; }
+.links a { display:inline-block; margin: 0 18px 10px 0; color: var(--accent); text-decoration: none; font-weight: 600; }
+.links a:hover { text-decoration: underline; }
+.note { color: var(--sub); font-size: 14px; }
+</style>
+</head>
+<body>
+<main>
+<h1>cram<span>.</span></h1>
+<p class="lede">Error-bounded lossy compression for scientific floating-point data. The bound you ask for is the bound you get, every byte is counted, and the decode is byte-identical on CPU, GPU and in your browser.</p>
+
+<div class="links">
+  <a href="/demo/">Live WebGPU demo →</a>
+  <a href="/docs">API docs</a>
+  <a href="https://crates.io/crates/cram-codec">crates.io</a>
+  <a href="https://github.com/ecto/tang/tree/main/crates/cram-codec">Source</a>
+</div>
+
+<h2>Measured</h2>
+<ul>
+  <li><b>0.67–0.72× SPERR's bits</b> at matched PSNR (60/80/100 dB) on 14 held-out SDRBench fields from four applications never used in tuning. It wins 54 of 55 PSNR points against the best external codec at each point (SPERR, TTHRESH, SZ3, ZFP).</li>
+  <li><b>24–28% fewer bits</b> than the best KV-cache quantizer at matched perplexity (Δppl ≤ 0.1) on SmolLM2-135M and Qwen2.5-1.5B/7B, for storage, offload and transfer.</li>
+  <li><b>Byte-identical decode</b> across CPU, Metal, Vulkan and WebGPU/WASM, from one integer-only decode path, at ≈1–2 GB/s on a consumer GPU.</li>
+  <li>Streams can <b>carry their own decoder</b>: a verified integer program in the tang IR, compiled per stream.</li>
+</ul>
+
+<h2>Use it</h2>
+<pre>cargo add cram-codec</pre>
+
+<p class="note">cram is built on <a href="https://github.com/ecto/tang" style="color:inherit">tang</a> and was formerly named tang-compress. It is MIT OR Apache-2.0. Every number above traces to a report in the repository. Not to be confused with the CRAM genomics format.</p>
+</main>
+</body>
+</html>
