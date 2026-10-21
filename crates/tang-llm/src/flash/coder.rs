@@ -67,8 +67,8 @@ fn env_is(key: &str, val: &str) -> bool {
 }
 
 /// Kernel variants for A/B on one build (defaults are the measured winners):
-/// `TANG_CODER_EXROWS=4` expert rows a warp (default 2), `TANG_CODER_SILU=sep` a separate
-/// SiLU+int8 launch (default fused into the down kernel), `TANG_CODER_KQ=8` warps a row in
+/// `TANG_CODER_EXROWS=4` expert rows a warp (default 2), `TANG_CODER_SILU=fused` the SiLU+int8
+/// in the down kernel (default a separate launch), `TANG_CODER_KQ=8` warps a row in
 /// the K-split GEMV (default 4).
 #[derive(Clone, Copy, Debug)]
 struct Variants {
@@ -85,7 +85,7 @@ impl Variants {
             } else {
                 2
             },
-            silu_sep: env_is("TANG_CODER_SILU", "sep"),
+            silu_sep: !env_is("TANG_CODER_SILU", "fused"),
             kq: if env_is("TANG_CODER_KQ", "8") { 8 } else { 4 },
         }
     }
@@ -1553,18 +1553,18 @@ impl Coder {
         Ok(out)
     }
 
-    /// Switch kernel variants (`exrows=4`, `silu=sep`, `kq=8`, comma-separated; empty for the
+    /// Switch kernel variants (`exrows=4`, `silu=fused`, `kq=8`, comma-separated; empty for the
     /// defaults) and drop the captured graphs.
     pub fn set_variants(&mut self, spec: &str) -> Result<()> {
         let mut v = Variants {
             exrows: 2,
-            silu_sep: false,
+            silu_sep: true,
             kq: 4,
         };
         for kv in spec.split(',').filter(|x| !x.is_empty()) {
             match kv {
                 "exrows=4" => v.exrows = 4,
-                "silu=sep" => v.silu_sep = true,
+                "silu=fused" => v.silu_sep = false,
                 "kq=8" => v.kq = 8,
                 _ => anyhow::bail!("unknown variant {kv}"),
             }
