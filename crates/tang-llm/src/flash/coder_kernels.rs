@@ -224,36 +224,45 @@ __device__ __forceinline__ const unsigned char* cx_stage(const unsigned char* sr
     return (const unsigned char*)sm + delta;
 }
 
-// Experts' gate and up rows, two rows a warp (both staged in shared memory before either is
-// decoded), 8 warps a block. Pairs p < T·K are (token p / K, rank p % K) with the routed expert
-// ids[p]; p >= T·K is the shared expert for token p − T·K. out[p][r]: r < FF gate, else up.
-// Grid (2 FF / 16, T · (K + 1)), block 256, dynamic smem 16 × r16 × 16 bytes.
-extern "C" __global__ void __launch_bounds__(256) cx_moe_gu(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
-                                                            const unsigned char* xq, float* out, int T, int r16) {
+// Experts' gate and up rows, R rows a warp (all staged in shared memory before any is decoded),
+// 8 warps a block. Pairs p < T·K are (token p / K, rank p % K) with the routed expert ids[p];
+// p >= T·K is the shared expert for token p − T·K. out[p][r]: r < FF gate, else up.
+// Grid (2 FF / (8 R), T · (K + 1)), block 256, dynamic smem 8 R × r16 × 16 bytes.
+template <int R>
+__device__ __forceinline__ void moe_gu_body(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
+                                            const unsigned char* xq, float* out, int T, int r16) {
     extern __shared__ uint4 dsm[];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, p = blockIdx.y;
     const bool shared = p >= T * CX_TOPK;
     const int t = shared ? p - T * CX_TOPK : p / CX_TOPK;
     const unsigned e = shared ? 0u : ids[p];
-    const unsigned char* w[2];
-    int ty[2], rr[2];
+    const unsigned char* w[R];
+    int ty[R], rr[R];
     #pragma unroll
-    for (int j = 0; j < 2; j++) {
-        const int r = (blockIdx.x * 8 + warp) * 2 + j;
+    for (int j = 0; j < R; j++) {
+        const int r = (blockIdx.x * 8 + warp) * R + j;
         rr[j] = r;
         const ExW& m = shared ? (r < CX_FF ? sg : su) : (r < CX_FF ? g : u);
         const int ro = r < CX_FF ? r : r - CX_FF;
         ty[j] = m.ty;
         const unsigned char* src = (const unsigned char*)m.base + (size_t)e * m.estride + (size_t)ro * m.row_bytes;
-        w[j] = cx_stage(src, m.row_bytes, dsm + (warp * 2 + j) * r16, lane);
+        w[j] = cx_stage(src, m.row_bytes, dsm + (warp * R + j) * r16, lane);
     }
     __syncwarp();
     const float* xd = (const float*)(xq + (size_t)XQ8_T * CX_HID);
     #pragma unroll
-    for (int j = 0; j < 2; j++) {
+    for (int j = 0; j < R; j++) {
         const float a = cx_dot(ty[j], w[j], xq + (size_t)t * CX_HID, xd + t * (CX_HID / 32), CX_HID);
         if (lane == 0) out[(size_t)p * 2 * CX_FF + rr[j]] = a;
     }
+}
+extern "C" __global__ void __launch_bounds__(256) cx_moe_gu(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
+                                                            const unsigned char* xq, float* out, int T, int r16) {
+    moe_gu_body<2>(g, u, sg, su, ids, xq, out, T, r16);
+}
+extern "C" __global__ void __launch_bounds__(256) cx_moe_gu_r4(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
+                                                               const unsigned char* xq, float* out, int T, int r16) {
+    moe_gu_body<4>(g, u, sg, su, ids, xq, out, T, r16);
 }
 
 // h = silu(gate) * up per pair, then int8 (fe_q8's rule) into hq: codes [CX_NP][FF], then
@@ -271,31 +280,68 @@ extern "C" __global__ void cx_silu_q(const float* gu, unsigned char* hq) {
     if (lane == 0) ((float*)(hq + (size_t)CX_NP * CX_FF))[p * (CX_FF / 32) + c] = d;
 }
 
-// Experts' down rows (shared expert for p >= T·K): out[p][r], two rows a warp, staged.
-// Grid (HID / 16, T · (K + 1)), block 256, dynamic smem 16 × r16 × 16 bytes.
-extern "C" __global__ void __launch_bounds__(256) cx_moe_down(ExW d, ExW sd, const unsigned* ids,
-                                                              const unsigned char* hq, float* out, int T, int r16) {
+// Experts' down rows (shared expert for p >= T·K): out[p][r], R rows a warp, staged. With
+// FUSE, the block first makes pair p's int8 h from gate|up itself (cx_silu_q's arithmetic, into
+// shared memory) instead of reading cx_silu_q's output.
+// Grid (HID / (8 R), T · (K + 1)), block 256, dynamic smem 8 R × r16 × 16 bytes.
+template <int R, bool FUSE>
+__device__ __forceinline__ void moe_down_body(ExW d, ExW sd, const unsigned* ids, const unsigned char* hq,
+                                              const float* gu, float* out, int T, int r16) {
     extern __shared__ uint4 dsm[];
+    __shared__ __align__(16) unsigned char hc[CX_FF];
+    __shared__ float hs[CX_FF / 32];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, p = blockIdx.y;
     const bool shared = p >= T * CX_TOPK;
     const ExW& m = shared ? sd : d;
     const unsigned e = shared ? 0u : ids[p];
-    const unsigned char* w[2];
-    int rr[2];
+    const unsigned char* w[R];
+    int rr[R];
     #pragma unroll
-    for (int j = 0; j < 2; j++) {
-        const int r = (blockIdx.x * 8 + warp) * 2 + j;
+    for (int j = 0; j < R; j++) {
+        const int r = (blockIdx.x * 8 + warp) * R + j;
         rr[j] = r;
         const unsigned char* src = (const unsigned char*)m.base + (size_t)e * m.estride + (size_t)r * m.row_bytes;
-        w[j] = cx_stage(src, m.row_bytes, dsm + (warp * 2 + j) * r16, lane);
+        w[j] = cx_stage(src, m.row_bytes, dsm + (warp * R + j) * r16, lane);
     }
-    __syncwarp();
-    const float* hd = (const float*)(hq + (size_t)CX_NP * CX_FF);
+    const unsigned char* hcodes;
+    const float* hd;
+    if (FUSE) {
+        for (int i = threadIdx.x; i < CX_FF; i += blockDim.x) {
+            const float g = gu[(size_t)p * 2 * CX_FF + i];
+            const float u = gu[(size_t)p * 2 * CX_FF + CX_FF + i];
+            const float v = silu_f2(g) * u;
+            float amax = fabsf(v);
+            for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+            const float dd = amax / 127.0f;
+            const int q = dd == 0.f ? 0 : (int)fminf(fmaxf(roundf(v / dd), -127.f), 127.f);
+            hc[i] = (unsigned char)(signed char)q;
+            if ((i & 31) == 0) hs[i / 32] = dd;
+        }
+        __syncthreads();
+        hcodes = hc;
+        hd = hs;
+    } else {
+        __syncwarp();
+        hcodes = hq + (size_t)p * CX_FF;
+        hd = (const float*)(hq + (size_t)CX_NP * CX_FF) + p * (CX_FF / 32);
+    }
     #pragma unroll
-    for (int j = 0; j < 2; j++) {
-        const float a = cx_dot(m.ty, w[j], hq + (size_t)p * CX_FF, hd + p * (CX_FF / 32), CX_FF);
+    for (int j = 0; j < R; j++) {
+        const float a = cx_dot(m.ty, w[j], hcodes, hd, CX_FF);
         if (lane == 0) out[(size_t)p * CX_HID + rr[j]] = a;
     }
+}
+extern "C" __global__ void __launch_bounds__(256) cx_moe_down(ExW d, ExW sd, const unsigned* ids,
+                                                              const unsigned char* hq, float* out, int T, int r16) {
+    moe_down_body<2, false>(d, sd, ids, hq, nullptr, out, T, r16);
+}
+extern "C" __global__ void __launch_bounds__(256) cx_moe_down_f2(ExW d, ExW sd, const unsigned* ids,
+                                                                 const float* gu, float* out, int T, int r16) {
+    moe_down_body<2, true>(d, sd, ids, nullptr, gu, out, T, r16);
+}
+extern "C" __global__ void __launch_bounds__(256) cx_moe_down_f4(ExW d, ExW sd, const unsigned* ids,
+                                                                 const float* gu, float* out, int T, int r16) {
+    moe_down_body<4, true>(d, sd, ids, nullptr, gu, out, T, r16);
 }
 
 // ---- K-split dense GEMV ----
@@ -342,12 +388,12 @@ __device__ __forceinline__ void dotkf(const unsigned char* w, const float* x, in
         }
     }
 }
-template <int T>
+template <int T, int Q>
 __device__ void gemvk_body(const Seg* segs, int nseg, const float* x, const unsigned char* xq, int k, float* out, int ostride) {
     __shared__ float part[8][MAXT];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int j = warp >> 2, q = warp & 3;
-    int row = blockIdx.x * 2 + j, s = 0;
+    const int j = warp / Q, q = warp % Q;
+    int row = blockIdx.x * (8 / Q) + j, s = 0;
     while (s < nseg && row >= segs[s].rows) { row -= segs[s].rows; s++; }
     float acc[T];
     #pragma unroll
@@ -356,7 +402,7 @@ __device__ void gemvk_body(const Seg* segs, int nseg, const float* x, const unsi
     if (ok) {
         const Seg sg = segs[s];
         const unsigned char* w = (const unsigned char*)sg.w + (size_t)row * sg.row_bytes;
-        const int k0 = q * (k / 4), k1 = k0 + k / 4;
+        const int k0 = q * (k / Q), k1 = k0 + k / Q;
         switch (sg.type) {
             case 30: dotkf<T, 30>(w, x, k, k0, k1, acc); break;
             case 0: dotkf<T, 0>(w, x, k, k0, k1, acc); break;
@@ -381,13 +427,18 @@ __device__ void gemvk_body(const Seg* segs, int nseg, const float* x, const unsi
     }
     __syncthreads();
     if (ok && q == 0 && lane < T) {
-        const float v = ((part[4 * j][lane] + part[4 * j + 1][lane]) + part[4 * j + 2][lane]) + part[4 * j + 3][lane];
+        float v = part[Q * j][lane];
+        #pragma unroll
+        for (int i = 1; i < Q; i++) v += part[Q * j + i][lane];
         out[(size_t)lane * ostride + segs[s].out_off + row] = v;
     }
 }
 #define GEMVK_T(T) extern "C" __global__ void __launch_bounds__(256) cx_gemvk_t##T( \
     const Seg* segs, int nseg, const float* x, const unsigned char* xq, int k, float* out, int ostride) { \
-    gemvk_body<T>(segs, nseg, x, xq, k, out, ostride); }
+    gemvk_body<T, 4>(segs, nseg, x, xq, k, out, ostride); } \
+    extern "C" __global__ void __launch_bounds__(256) cx_gemvk8_t##T( \
+    const Seg* segs, int nseg, const float* x, const unsigned char* xq, int k, float* out, int ostride) { \
+    gemvk_body<T, 8>(segs, nseg, x, xq, k, out, ostride); }
 GEMVK_T(1) GEMVK_T(2) GEMVK_T(3) GEMVK_T(4) GEMVK_T(5) GEMVK_T(6) GEMVK_T(7) GEMVK_T(8)
 
 // Gated attention prep: q heads (rmsnorm * qn, NeoX rope on CX_ROT dims) into q [t][NH][HD];

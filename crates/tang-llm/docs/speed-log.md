@@ -38,6 +38,52 @@ Measured on the same H100 pod, waiting to merge (each on top of c623ce1):
 | (same) | 32B | 16 | 282 | +21% |
 | all three | 8B / 32B | 16 | 1051 / 298 | +24% / +28% |
 
+## gpt-oss-20b
+
+Single stream, AA-style (a ~1k-token chat prompt, output tok/s; `scripts/gpt_oss_speed.sh`).
+The bar is Groq's claimed ~1,200 tok/s.
+
+**Bytes per decoded token** (what a step must read; gpt-oss-20b, 24 layers):
+
+| part | format | per token |
+|---|---|---:|
+| experts: 4 of 32 per layer, gate/up 5760×2880 + down 2880×2880 | MXFP4 (4.25 bits) | 1.27 GB |
+| attention Q/K/V/O, 26.5M a layer | bf16 | 1.27 GB |
+| output head 201088×2880 | bf16 | 1.16 GB |
+| KV at ~1.3k context (12 full layers ~1.3k keys, 12 sliding 128), f32 | | ~0.05 GB |
+| router, norms, biases | f32 | ~0.01 GB |
+| **total** | | **~3.75 GB** |
+
+Speed of light at that size: 1280 tok/s on an H200 (4.8 TB/s), 890 on an H100, 270 on a 4090.
+Groq's 1,200 is ~94% of the H200's. **To pass it, the weights have to shrink:** attention and
+the head at 4 bits (Q4, as the Qwen rows run) would take a token to ~1.95 GB, a 2460 tok/s ceiling
+on the H200. The experts are already 4-bit.
+
+**Per kernel** (4090 nsys, 256 decoded tokens, before the 4-rows-a-warp GEMV): the expert GEMV
+was 48% of GPU time at ~350 GB/s (a third of peak) and the bf16 GEMVs 36% at ~0.94 TB/s (at
+peak). Sink attention was 6%, rms_norm 4%. Host side: ~460 launches a token, with a
+host-to-device upload (ids, block tables) and a logits download every step.
+
+| kernel | bytes/token | at 4.8 TB/s | measured | what's left |
+|---|---:|---:|---|---|
+| `moe_gemv_mxfp4` (48 calls) | 1.27 GB | 0.26 ms | 4090: 3.6 ms → ~2.2 ms after 4 rows a warp | input staged in smem (new, A/B below); more columns a block |
+| `gemv_bf16` attention (48 calls) | 1.27 GB | 0.26 ms | at bandwidth | 4-bit attention weights |
+| `gemv_bf16` head (1 call) | 1.16 GB | 0.24 ms | at bandwidth | 4-bit head, or device top-k so only the argmax comes back |
+| `attn_sink_partial` + combine | ~0.05 GB | 0.01 ms | 6% (launch-bound) | fold into fewer launches |
+| everything else (~360 launches) | | | ~1.5 ms on H100 | CUDA graphs |
+
+Measured so far (before the rebase onto #88/#89):
+
+| date | commit | change | GPU | model | streams | tok/s | % SoL | vs prev |
+|---|---|---|---|---|---|---|---|---|
+| 2026-10-20 | 29221a7 | #95, 13-token prompt | RTX 4090 | gpt-oss-20b | 1 | 157 | 58% | |
+| 2026-10-20 | 1b8474c | #95, 13-token prompt | H100 | gpt-oss-20b | 1 | 182 | 20% | |
+| 2026-10-20 | 1b8474c | #95, 13-token prompt | H100 | gpt-oss-120b | 1 | 119 | | |
+
+The order to try on the H200: (1) the smem GEMV A/B in the script; (2) CUDA graphs over the decode
+step (launch-bound on Hopper); (3) a Q4 head and Q4 attention, which takes the ceiling from 1280
+to ~2460; (4) speculation, already exact for gpt-oss (`tests/speculate.rs`).
+
 ## Dead ends
 
 Tried and measured at under 3% (or worse):
@@ -53,3 +99,46 @@ Tried and measured at under 3% (or worse):
   only batches cut on the device.
 - **The VRAM-pressure check on pool misses only (#81)** measured +1.5% alone. It's kept because
   it takes ~2.6 ms of CPU off each step, which matters once kernels stop hiding host time.
+
+## Qwen3-Coder-Next (qwen3next Flash engine)
+
+`Qwen3-Coder-Next-UD-Q4_K_XL.gguf` (unsloth, 49.6 GB), the Flash engine's qwen3next path
+(`src/flash/coder.rs`), one stream, greedy. A step reads 3.42 GB at a 1.3k context (3.52 GB at
+4k): dense weights, 10 routed + 1 shared expert a layer, head, K/V. Speed of light is that over
+HBM bandwidth: 1,400 tok/s on an H200, 970 on an H100 SXM.
+
+AA rows are `flash-aa`, Artificial Analysis-style: a ~1.24k-token chat prompt (one of
+`explain` / `refactor` / `write`, the same 140-line Rust file with a different task), 512
+output tokens, tok/s after the first token. The fastest public API for this model is Novita at
+174 tok/s.
+
+| date | commit | change | GPU | prompt | drafts | tok/s | % SoL | vs prev |
+|---|---|---|---|---|---|---|---|---|
+| 2026-10-20 | c33c4df | engine (#84), flash-bench 4k ctx | H100 | code ×4k | none | 156 | 16.1% | |
+| 2026-10-20 | b9fbcad | fusions, K-split GEMV, 1024-thread norms (#90) | H100 | code ×4k | none | 198 | 20.4% | +27% |
+| 2026-10-21 | d9f1d29 | (same kernels) AA | H200 | explain | none | 205.5 | 14.7% | |
+| 2026-10-21 | d9f1d29 | | H200 | refactor | none | 205.3 | 14.7% | |
+| 2026-10-21 | d9f1d29 | | H200 | write | none | 205.3 | 14.7% | |
+| 2026-10-21 | d9f1d29 | | H200 | explain | suffix | 205.1 | | 1.15 tok/window |
+| 2026-10-21 | d9f1d29 | | H200 | refactor | suffix | 340.5 | | 2.71 tok/window |
+| 2026-10-21 | d9f1d29 | | H200 | write | suffix | 218.7 | | 1.28 tok/window |
+| 2026-10-21 | d9f1d29 | separate SiLU launch (now the default) | H200 | explain | none | 217.4 | 15.5% | +2% (noise) |
+
+Stage sweep on that H200 pod (`TANG_CODER_STAGES=1`: each stage alone in a CUDA graph, replayed;
+µs a step at a 1.3k context, window 4,856 µs): routed+shared gate|up 876 (771 GB/s), down 801
+(501 GB/s), GDN input GEMV 618 (1.6 TB/s), GDN output 301, top-k 286, GDN conv+step 238,
+moe combine+norm 214, attention split-K 207 (154 GB/s), router 176, head 174, post-mixer norm
+166, attention in/out 260. The stages sum to 4,461 µs, so launch gaps are ~8% of the window.
+
+### Dead ends (Coder-Next)
+
+- **22 → 12 launches a layer with no faster kernels:** +2% (156 → 159 on H100). The step is
+  kernel-latency-bound, not launch-bound.
+- **Expert GEMVs, 4 rows a warp** (all staged before decoding): −4% vs 2.
+- **K-split GEMV with 8 warps a row** instead of 4: −7%. Both together: −10%.
+- **SiLU + int8 of h fused into the down kernel:** −2% vs a separate launch (each down block
+  recomputes its pair's 512 values; the extra latency outweighs the saved launch).
+- **The eager event profiler** (`TANG_CODER_PROF`) put about 2× the graph's time on small
+  kernels. Use the stage sweep for decisions.
+- **nsys / ncu on the RunPod image:** ncu's injection lacks `cuTensorMapEncodeIm2colWide`,
+  which cudarc resolves at load, and nsys isn't installed (apt fails).
