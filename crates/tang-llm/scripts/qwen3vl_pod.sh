@@ -61,5 +61,16 @@ if [[ $STEPS == *llama* ]]; then
     | grep -vE "Warning|warn\("
   tail -3 /root/llama.log
 fi
+if [[ $STEPS == *eval* ]]; then
+  say eval
+  M="$(python -c "from huggingface_hub import snapshot_download as s; print(s('Qwen/Qwen3-VL-8B-Instruct'))" 2>/dev/null)"
+  pip install -q matplotlib 2>&1 | tail -1
+  $BIN serve "$M" --device cuda --port 8090 --ctx 8192 --kv-slots 2 >/root/serve.log 2>&1 &
+  SERVE=$!
+  for i in $(seq 120); do curl -sf localhost:8090/v1/models >/dev/null && break; sleep 5; done
+  python crates/tang-llm/scripts/qwen3vl_eval.py --model "$M" --server http://127.0.0.1:8090 --out /root/eval 2>&1 \
+    | grep --line-buffered -vE "Warning|warn\(|it/s\]|Loading"
+  kill $SERVE; tail -3 /root/serve.log
+fi
 say DONE
 sleep infinity
