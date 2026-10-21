@@ -17,7 +17,7 @@ command -v nvidia-smi >/dev/null || { echo "nvidia-smi is required; run this on 
 GPU=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
 [[ "$GPU" == *H200* ]] || { echo "expected an H200, found: $GPU" >&2; exit 2; }
 
-cargo build --release -p tang-llm --bin tang-llm
+cargo build --release -p tang-llm --no-default-features --features cuda --bin tang-llm
 X=${TANG_PREFILL_TILE_BIN:-target/release/tang-llm}
 [[ -x "$X" ]] || { echo "binary not executable: $X" >&2; exit 2; }
 
