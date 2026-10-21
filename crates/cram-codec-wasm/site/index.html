@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cram</title>
+<meta name="description" content="cram: error-bounded lossy compression for scientific floating-point data. Fewer bits at the same quality, and byte-identical decode on CPU, GPU and the browser.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+/* tang's site language (Plex, 720px column, hairlines, one flame), hue rotated:
+   tang = warm stone + orange flame + cyan links; cram = cool slate + cyan flame + amber links. */
+:root {
+  --bg: #ffffff; --fg: oklch(0.17 0.012 230); --muted: oklch(0.52 0.03 230);
+  --surface: oklch(0.975 0.008 220); --raised: #ffffff; --border: oklch(0.84 0.02 225); --border-muted: oklch(0.92 0.012 225);
+  --flame: oklch(0.62 0.15 205); --flame-ink: oklch(0.45 0.11 205);
+  --link: oklch(0.50 0.12 75);
+  --c1: oklch(0.62 0.15 205); --c2: oklch(0.55 0.03 230); --c3: oklch(0.65 0.21 25);
+  --s-xs: 10.5px; --s-sm: 12.5px; --s-body: 15px; --s-md: 17px; --s-lg: 21px; --s-xl: 26px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #07090b; --fg: #d6e2e8; --muted: #7d93a2; --surface: #0e1418; --raised: #141c21;
+    --border: #2a3a46; --border-muted: #17222a;
+    --flame: #00e5ff; --flame-ink: #00e5ff; --link: #ffc24a;
+    --c1: #00e5ff; --c2: #5b7180; --c3: oklch(0.72 0.21 25);
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #07090b; --fg: #d6e2e8; --muted: #7d93a2; --surface: #0e1418; --raised: #141c21;
+  --border: #2a3a46; --border-muted: #17222a;
+  --flame: #00e5ff; --flame-ink: #00e5ff; --link: #ffc24a;
+  --c1: #00e5ff; --c2: #5b7180; --c3: oklch(0.72 0.21 25);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { background: var(--bg); color: var(--fg); }
+body { font: 400 var(--s-body)/1.62 "IBM Plex Sans", system-ui, sans-serif; font-variant-numeric: tabular-nums; -webkit-font-smoothing: antialiased; }
+code, pre, .mono { font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace; }
+::selection { background: color-mix(in oklab, var(--flame) 25%, transparent); }
+.wrap { max-width: 720px; margin: 0 auto; padding: 0 16px; }
+section { padding: clamp(4.5rem, 10vw, 8rem) 0; }
+section.hero-s { padding-top: clamp(4rem, 12vw, 8rem); padding-bottom: clamp(3rem, 7vw, 5rem); }
+h2 { font-size: var(--s-lg); font-weight: 600; letter-spacing: -0.01em; line-height: 1.3; margin-bottom: 1rem; }
+.lead { max-width: 60ch; margin-bottom: 3rem; }
+a { color: var(--link); text-decoration: none; padding: 0 2px; margin: 0 -2px; transition: background .12s, color .12s; }
+a:hover { background: var(--link); color: #000; }
+
+/* hero */
+.hero h1 { font-size: clamp(56px, 13vw, 72px); line-height: 1; letter-spacing: -0.035em; font-weight: 600; margin-bottom: 2rem; }
+.hero h1 span { color: var(--flame); }
+.hero-claim { font-size: var(--s-xl); font-weight: 600; line-height: 1.25; letter-spacing: -0.01em; margin-bottom: 1.1rem; }
+.hero-sub { color: var(--muted); font-weight: 500; }
+.flame-rule { width: 22%; height: 2px; background: var(--flame); margin-bottom: 1.1rem; }
+.hero-note { color: var(--muted); margin-bottom: 2rem; max-width: 62ch; }
+.actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.btn { display: inline-flex; align-items: center; gap: 10px; height: 40px; padding: 0 14px; margin: 0; background: var(--surface); color: var(--fg); font-size: var(--s-sm); border: 0; cursor: pointer; font-family: inherit; }
+.btn:hover { background: var(--link); color: #000; }
+.btn code { font-size: 13px; }
+.btn .dollar { color: var(--muted); }
+.btn .hint { color: var(--muted); font-size: var(--s-xs); }
+.btn:hover .dollar, .btn:hover .hint { color: #000; }
+
+/* proof strip */
+.proof { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 28px; }
+@media (max-width: 640px) { .proof { grid-template-columns: 1fr; gap: 36px; } }
+.proof-val { font-size: var(--s-xl); font-weight: 500; line-height: 1.1; }
+.proof-val small { font-size: var(--s-sm); color: var(--muted); font-weight: 400; }
+.proof-label { font-size: var(--s-sm); color: var(--muted); line-height: 1.5; min-height: 3em; margin: 6px 0 10px; }
+.gauge { position: relative; height: 8px; background: var(--surface); }
+.gauge i { position: absolute; inset: 0 auto 0 0; width: var(--w); background: var(--flame); }
+.gauge b { position: absolute; top: -3px; bottom: -3px; left: 100%; width: 1px; background: var(--muted); }
+.scale { display: flex; justify-content: space-between; font-size: var(--s-xs); color: var(--muted); margin-top: 6px; }
+.dots { display: flex; flex-wrap: wrap; gap: 6px; }
+.dots span { font-size: var(--s-xs); padding: 3px 9px; color: var(--flame-ink); background: color-mix(in oklab, var(--flame) 14%, transparent); }
+
+/* figure: bars */
+.fig { background: var(--surface); padding: 20px 20px 16px; }
+.bars { display: grid; grid-template-columns: 88px 1fr 52px; gap: 10px 12px; align-items: center; font-size: var(--s-sm); }
+.bars .n { color: var(--muted); }
+.bars .n.me { color: var(--fg); font-weight: 600; }
+.bars i { display: block; height: 10px; width: var(--w); background: var(--c2); }
+.bars i.me { background: var(--flame); }
+.bars em { font-style: normal; text-align: right; color: var(--muted); }
+.bars em.me { color: var(--fg); font-weight: 500; }
+.ref { position: relative; }
+.ref::after { content: ""; position: absolute; top: -6px; bottom: -6px; left: calc(100% * 1 / 3.6); width: 1px; background: var(--border); }
+.fig-cap { font-size: var(--s-sm); color: var(--muted); margin-top: 14px; max-width: 72ch; line-height: 1.6; }
+.fig-n { color: var(--fg); font-weight: 600; font-size: var(--s-xs); margin-right: .7em; }
+
+/* how it works */
+.mech { margin-top: 3rem; }
+.mech-h { position: relative; font-size: var(--s-md); font-weight: 600; margin-bottom: .7rem; display: flex; gap: .75rem; align-items: baseline; }
+.mech-n { color: var(--flame); font-weight: 500; }
+@media (min-width: 900px) { .mech-n { position: absolute; right: calc(100% + 1.1rem); } }
+.mech p { max-width: 62ch; }
+.mech code { font-size: .9em; color: var(--flame-ink); }
+.pipe { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 2.5rem 0 0; font-size: var(--s-sm); }
+.pipe span { background: var(--surface); padding: 6px 10px; }
+.pipe span.on { background: color-mix(in oklab, var(--flame) 16%, transparent); color: var(--flame-ink); }
+.pipe b { color: var(--flame); font-weight: 400; }
+
+pre { background: var(--surface); padding: 16px 18px; font-size: 13px; line-height: 1.7; overflow-x: auto; }
+pre .kw { color: oklch(0.58 0.2 300); } pre .fn { color: var(--flame-ink); } pre .cm { color: var(--muted); } pre .num { color: var(--c3); } pre .ty { color: var(--link); }
+
+/* readouts */
+.readouts { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 0 1.25rem; margin-top: 2rem; }
+@media (max-width: 640px) { .readouts { grid-template-columns: repeat(2, minmax(0,1fr)); gap: 1.25rem; } }
+.ro { border-left: 0.5px solid var(--border); padding-left: 12px; }
+.ro .l { font-size: 10px; color: var(--muted); font-weight: 500; letter-spacing: .02em; }
+.ro .v { font-size: var(--s-lg); font-weight: 500; margin-top: 4px; }
+.ro .v span { color: var(--muted); font-size: var(--s-sm); }
+
+.foot { text-align: center; padding: clamp(4.5rem, 10vw, 8rem) 16px 4rem; color: var(--muted); font-size: var(--s-sm); }
+.foot .logo { font-size: 40px; font-weight: 600; letter-spacing: -0.03em; color: var(--fg); margin-bottom: 1rem; }
+.foot .logo span { color: var(--flame); }
+.foot p { max-width: 52ch; margin: 0 auto .6rem; }
+
+/* examples */
+.ex-tabs { display: flex; flex-wrap: wrap; gap: 16px; font-size: var(--s-sm); margin-bottom: 14px; }
+.ex-tabs button { background: none; border: 0; color: var(--muted); cursor: pointer; font: inherit; padding: 0; }
+.ex-tabs button.on { color: var(--fg); text-decoration: underline; text-decoration-color: var(--flame); text-underline-offset: 5px; }
+.ex-grid { display: grid; grid-template-columns: repeat(5, minmax(0,1fr)); gap: 8px; }
+@media (max-width: 640px) { .ex-grid { grid-template-columns: repeat(2, minmax(0,1fr)); } .ex-grid figure:first-child { grid-column: span 2; } }
+.ex-grid figure img { width: 100%; height: auto; aspect-ratio: 1; display: block; background: var(--bg); }
+.ex-grid figcaption { font-size: var(--s-xs); color: var(--muted); margin-top: 6px; line-height: 1.45; }
+.ex-grid figcaption b { color: var(--fg); font-weight: 500; }
+.ex-table { width: 100%; border-collapse: collapse; font-size: var(--s-sm); margin-top: 18px; }
+.ex-table th { text-align: left; font-weight: 500; font-size: var(--s-xs); color: var(--muted); padding: 0 8px 6px 0; }
+.ex-table td { padding: 6px 8px 6px 0; border-top: 0.5px solid var(--border-muted); }
+.ex-table td:not(:first-child), .ex-table th:not(:first-child) { text-align: right; }
+.ex-table tr.me td { color: var(--fg); font-weight: 600; }
+.ex-table tr.me td:first-child { color: var(--flame-ink); }
+.ex-note { font-size: var(--s-sm); color: var(--muted); margin-top: 12px; }
+.rd svg { width: 100%; height: auto; display: block; }
+.rd text { font-family: "IBM Plex Sans", sans-serif; font-size: 11px; fill: var(--muted); }
+.rd .ax { stroke: var(--border); stroke-width: .75; }
+.rd .ln { fill: none; stroke-width: 1.5; }
+.rd .lbl { font-size: 11.5px; font-weight: 500; }
+.demo-cta { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-top: 2.5rem; padding: 18px 20px; background: color-mix(in oklab, var(--flame) 10%, transparent); }
+.demo-cta p { color: var(--fg); max-width: 50ch; }
+#theme { position: fixed; top: 16px; right: 16px; width: 36px; height: 36px; display: grid; place-items: center; background: var(--bg); color: var(--fg); border: 0.5px solid var(--border-muted); cursor: pointer; }
+#theme:hover { color: var(--flame); }
+</style>
+</head>
+<body>
+<button id="theme" aria-label="Toggle color theme">◐</button>
+
+<section class="hero-s"><div class="wrap hero">
+  <h1>cram<span>.</span></h1>
+  <p class="hero-claim">Fewer bits at the same quality.<br><span class="hero-sub">Error-bounded compression for scientific float data, decoded bit-for-bit on any GPU.</span></p>
+  <div class="flame-rule"></div>
+  <p class="hero-note">You set a PSNR or a pointwise error bound, and that is the bound you get. Every byte counts toward the reported rate, and every error is measured on the decoder's actual output.</p>
+  <div class="actions">
+    <button class="btn" id="copy"><span class="dollar mono">$</span><code>cargo add cram-codec</code><span class="hint">copy</span></button>
+    <a class="btn" href="/demo/">Live WebGPU demo →</a>
+    <a class="btn" href="/docs">API docs</a>
+  </div>
+</div></section>
+
+<section style="padding-top:1rem"><div class="wrap">
+  <div class="proof">
+    <div>
+      <div class="proof-val">0.67× <small>SPERR's bits</small></div>
+      <div class="proof-label">at 80 dB PSNR on 14 held-out fields from four applications never used in tuning</div>
+      <div class="gauge" style="--w:67%"><i></i><b></b></div>
+      <div class="scale"><span>0</span><span>SPERR = 1</span></div>
+    </div>
+    <div>
+      <div class="proof-val">−24–28% <small>bits</small></div>
+      <div class="proof-label">for KV caches against the best KV quantizer at matched perplexity (Δppl ≤ 0.1)</div>
+      <div class="gauge" style="--w:74%"><i></i><b></b></div>
+      <div class="scale"><span>0</span><span>best baseline = 1</span></div>
+    </div>
+    <div>
+      <div class="proof-val">1 <small>decode result, every backend</small></div>
+      <div class="proof-label">byte-identical output from one integer-only decode path</div>
+      <div class="dots"><span>CPU</span><span>Metal</span><span>Vulkan</span><span>WebGPU</span><span>WASM</span></div>
+    </div>
+  </div>
+</div></section>
+
+<section><div class="wrap">
+  <h2>How it compares</h2>
+  <p class="lead">These are bits per value relative to SPERR, at matched 80 dB PSNR. The codec was frozen before it saw these fields. Lower is better.</p>
+  <div class="fig">
+    <div class="bars">
+      <span class="n me">cram</span><span class="ref"><i class="me" style="--w:calc(100% * 0.670 / 3.6)"></i></span><em class="me">0.67×</em>
+      <span class="n">TTHRESH</span><span class="ref"><i style="--w:calc(100% * 0.940 / 3.6)"></i></span><em>0.94×</em>
+      <span class="n">SPERR</span><span class="ref"><i style="--w:calc(100% * 1.000 / 3.6)"></i></span><em>1.00×</em>
+      <span class="n">SZ3</span><span class="ref"><i style="--w:calc(100% * 1.663 / 3.6)"></i></span><em>1.66×</em>
+      <span class="n">QTT</span><span class="ref"><i style="--w:calc(100% * 2.105 / 3.6)"></i></span><em>2.10×</em>
+      <span class="n">ZFP</span><span class="ref"><i style="--w:calc(100% * 3.438 / 3.6)"></i></span><em>3.44×</em>
+    </div>
+  </div>
+  <p class="fig-cap"><span class="fig-n">Fig 1</span>Geometric mean over 14 held-out SDRBench fields (SCALE-LETKF, CESM-ATM, EXAFEL, QMCPACK and controls). TTHRESH, QTT: fields where they reach 80 dB (9 and 11 of 14). cram wins 54 of 55 PSNR points against the best external codec at each point. Its GPU stream format decodes at ≈1–2 GB/s on a consumer GPU.</p>
+
+  <div class="readouts">
+    <div class="ro"><div class="l">vs SPERR · 60 dB</div><div class="v">0.72<span>×</span></div></div>
+    <div class="ro"><div class="l">vs SPERR · 80 dB</div><div class="v">0.67<span>×</span></div></div>
+    <div class="ro"><div class="l">vs SPERR · 100 dB</div><div class="v">0.69<span>×</span></div></div>
+    <div class="ro"><div class="l">GPU decode</div><div class="v">1.1–1.7<span> GB/s</span></div></div>
+  </div>
+</div></section>
+
+<section><div class="wrap">
+  <h2>See it on real data</h2>
+  <p class="lead">Each slice below comes from an actual encode and decode, with every codec tuned to its cheapest setting that reaches 60 dB PSNR on the decoded volume. All error maps for a field share one color scale, so brighter means larger error.</p>
+  <div class="ex-tabs" id="ex-tabs"></div>
+  <div class="fig"><div class="ex-grid" id="ex-grid"></div></div>
+  <table class="ex-table" id="ex-table"></table>
+  <p class="ex-note" id="ex-note"></p>
+
+  <div class="mech" style="margin-top:4.5rem">
+    <div class="mech-h">Rate vs. quality</div>
+    <p>The same field at five quality targets: bits per value against measured PSNR. Lower and further right is better.</p>
+  </div>
+  <div class="fig rd" id="rd" style="margin-top:1rem"></div>
+  <p class="fig-cap"><span class="fig-n">Fig 2</span>miranda-density, 64×128×128 f32. Each point is the cheapest setting that reaches its PSNR target, measured on the decoded output. At 100 dB, cram uses about half of SPERR's bits and about a quarter of SZ3's.</p>
+
+  <div class="demo-cta">
+    <p>Decode real cram streams in your browser. The WebGPU path and the WASM CPU path are compared byte for byte.</p>
+    <a class="btn" href="/demo/">Open the live demo →</a>
+  </div>
+</div></section>
+
+<section><div class="wrap">
+  <h2>How it works</h2>
+  <div class="pipe"><span>f32 field</span><b>→</b><span>CDF 9/7 wavelet</span><b>→</b><span>integer prediction</span><b>→</b><span>quantize</span><b>→</b><span class="on">context-mixed rANS</span><b>→</b><span>stream</span></div>
+  <div class="mech">
+    <div class="mech-h"><span class="mech-n">1</span>Predict, then pay only for surprise</div>
+    <p>A wavelet concentrates the field's energy. Per-band integer predictors and a deadzone quantizer then leave small residuals. Where they're needed, a correction stream enforces the pointwise bound. An encoder portfolio also tries Tucker, SZ-style interpolation and tensor-train candidates, and it keeps whichever stream is smallest.</p>
+  </div>
+  <div class="mech">
+    <div class="mech-h"><span class="mech-n">2</span>Learned contexts, integer arithmetic</div>
+    <p>Symbol probabilities come from hand-designed contexts or from a small integer MLP with an adaptive APM stage. The MLP is integer-only from end to end, so every machine computes the same probabilities. That makes the range coder's output, and the decoded field, identical down to the last bit.</p>
+  </div>
+  <div class="mech">
+    <div class="mech-h"><span class="mech-n">3</span>Streams that carry their decoder</div>
+    <p>A stream can embed its own decoder as a verified integer program in the <a href="https://github.com/ecto/tang">tang</a> IR. Each consumer compiles it for its backend, whether that's a GPU kernel, WGSL in the browser, or native Rust. The format can then change without breaking old readers.</p>
+  </div>
+  <pre style="margin-top:2.5rem"><span class="kw">use</span> cram_codec::{codec::<span class="ty">ErrorBound</span>, gpuwav3::{<span class="fn">decode3_box</span>, <span class="fn">encode3_f32</span>, <span class="ty">Gpu3Config</span>}};
+
+<span class="cm">// encode at 80 dB PSNR; decode the whole box, same bits on CPU and GPU</span>
+<span class="kw">let</span> cfg = <span class="ty">Gpu3Config</span>::<span class="fn">new</span>(<span class="ty">ErrorBound</span>::<span class="fn">Psnr</span>(<span class="num">80.0</span>));
+<span class="kw">let</span> (stream, _stats) = <span class="fn">encode3_f32</span>(&amp;field, &amp;[nz, ny, nx], &amp;cfg, <span class="num">8</span>);
+<span class="kw">let</span> out = <span class="fn">decode3_box</span>(&amp;stream, [<span class="num">0</span>; <span class="num">3</span>], [nz, ny, nx], <span class="num">8</span>)?;</pre>
+</div></section>
+
+<footer class="foot">
+  <div class="logo">cram<span>.</span></div>
+  <p>Built on <a href="https://github.com/ecto/tang">tang</a> and formerly named tang-compress. MIT OR Apache-2.0. Every number on this page traces to a report in the repository.</p>
+  <p><a href="https://crates.io/crates/cram-codec">crates.io</a> · <a href="https://github.com/ecto/tang/tree/main/crates/cram-codec">source</a> · <a href="/demo/">demo</a></p>
+</footer>
+
+<script>
+document.getElementById("copy").onclick = async (e) => {
+  const h = e.currentTarget.querySelector(".hint");
+  try { await navigator.clipboard.writeText("cargo add cram-codec"); h.textContent = "copied"; } catch { h.textContent = "select + copy"; }
+  setTimeout(() => (h.textContent = "copy"), 1500);
+};
+
+const C = { cram: "cram", sperr: "SPERR", sz3: "SZ3", zfp: "ZFP" };
+const kb = (b) => b < 1e6 ? (b / 1024).toFixed(1) + " KB" : (b / 1048576).toFixed(1) + " MB";
+fetch("/examples/examples.json").then((r) => r.json()).then((ex) => {
+  const tabs = document.getElementById("ex-tabs");
+  const show = (i) => {
+    const f = ex.fields[i], im = f.images, c = f.codecs;
+    [...tabs.children].forEach((b, j) => b.classList.toggle("on", j === i));
+    const cap = { original: `<b>original</b> ${kb(f.original_bytes)}`, cram: `<b>cram</b> ${kb(c.cram.bytes)}, ${c.cram.psnr.toFixed(1)} dB`,
+      "cram-err": "<b>cram</b> |error|", "sz3-err": "<b>SZ3</b> |error|", "zfp-err": "<b>ZFP</b> |error|" };
+    document.getElementById("ex-grid").innerHTML = Object.keys(cap).map((k) =>
+      `<figure><img loading="lazy" decoding="async" width="480" height="480" src="/examples/${im[k]}" alt="${f.name} ${k}"><figcaption>${cap[k]}</figcaption></figure>`).join("");
+    const rows = Object.keys(C).filter((k) => c[k]).sort((a, b) => c[a].bytes - c[b].bytes);
+    document.getElementById("ex-table").innerHTML =
+      `<tr><th>${f.name} · ${f.dims.join("×")}</th><th>size</th><th>ratio</th><th>PSNR</th><th>vs SPERR</th></tr>` +
+      rows.map((k) => `<tr class="${k === "cram" ? "me" : ""}"><td>${C[k]}</td><td>${kb(c[k].bytes)}</td><td>${c[k].ratio.toFixed(0)}×</td><td>${c[k].psnr.toFixed(1)} dB</td><td>${(1 / c[k].vs_sperr).toFixed(2)}× bits</td></tr>`).join("");
+    const best = rows[0];
+    document.getElementById("ex-note").textContent = best === "cram"
+      ? `cram is the smallest stream here, at ${(c.sperr.bytes / c.cram.bytes).toFixed(2)}× less data than SPERR.`
+      : `On this field ${C[best]} is ${((1 - c[best].bytes / c.cram.bytes) * 100).toFixed(0)}% smaller than cram. We show it because it's measured; cram doesn't win everywhere.`;
+  };
+  ex.fields.forEach((f, i) => { const b = document.createElement("button"); b.textContent = f.name; b.onclick = () => show(i); tabs.appendChild(b); });
+  show(0);
+}).catch(() => {});
+fetch("/examples/rd.json").then((r) => r.json()).then((rd) => {
+  const W = 680, H = 300, L = 44, R = 64, T = 12, B = 32;
+  const all = Object.values(rd.points).flat();
+  const xs = [38, 102], ymax = Math.ceil(Math.max(...all.map((p) => p.bpv)));
+  const X = (v) => L + (v - xs[0]) / (xs[1] - xs[0]) * (W - L - R), Y = (v) => H - B - v / ymax * (H - T - B);
+  const col = { cram: "var(--flame)", sperr: "var(--fg)", sz3: "var(--link)", zfp: "var(--c3)" };
+  let g = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="bits per value vs PSNR">`;
+  for (let v = 0; v <= ymax; v++) g += `<line class="ax" x1="${L}" x2="${W - R}" y1="${Y(v)}" y2="${Y(v)}" opacity=".5"/><text x="${L - 8}" y="${Y(v) + 4}" text-anchor="end">${v}</text>`;
+  for (let v = 40; v <= 100; v += 20) g += `<text x="${X(v)}" y="${H - 10}" text-anchor="middle">${v} dB</text>`;
+  g += `<text x="${L + 6}" y="${T + 4}">bits / value</text>`;
+  const ends = Object.entries(rd.points).map(([k, p]) => [k, Y(p[p.length - 1].bpv)]).sort((a, b) => a[1] - b[1]);
+  const ly = {}; let prev = -1e9;
+  for (const [k, y] of ends) { ly[k] = Math.max(y, prev + 13); prev = ly[k]; }
+  for (const [k, pts] of Object.entries(rd.points)) {
+    const d = pts.map((p, i) => `${i ? "L" : "M"}${X(p.psnr).toFixed(1)},${Y(p.bpv).toFixed(1)}`).join("");
+    const last = pts[pts.length - 1];
+    g += `<path class="ln" d="${d}" stroke="${col[k]}" ${k === "cram" ? 'stroke-width="2.5"' : 'opacity=".75"'}/>`;
+    g += pts.map((p) => `<circle cx="${X(p.psnr)}" cy="${Y(p.bpv)}" r="${k === "cram" ? 3 : 2}" fill="${col[k]}"/>`).join("");
+    g += `<text class="lbl" x="${X(last.psnr) + 8}" y="${ly[k] + 4}" style="fill:${col[k]}">${C[k]}</text>`;
+  }
+  document.getElementById("rd").innerHTML = g + "</svg>";
+}).catch(() => {});
+const root = document.documentElement;
+try { const t = localStorage.getItem("cram-theme"); if (t) root.dataset.theme = t; } catch {}
+document.getElementById("theme").onclick = () => {
+  const dark = root.dataset.theme ? root.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+  root.dataset.theme = dark ? "light" : "dark";
+  try { localStorage.setItem("cram-theme", root.dataset.theme); } catch {}
+};
+</script>
+</body>
+</html>
