@@ -17,6 +17,9 @@
 //!   the drafts. Temperature only (no top-k/top-p); greedy unless the request names one.
 //! - **Tool calls.** Qwen XML (`chat::parse_xml_call`), typed by the request's schemas.
 
+#[path = "serve_batch.rs"]
+mod batch;
+
 use super::engine::{Engine, Opts, Positional, RunningState};
 use super::tokenize::FlashTokenizer;
 use crate::chat::{Chunk, Detok, Parser, Piece, Tags};
@@ -65,6 +68,9 @@ pub struct Settings {
     /// request body (`tools-<hash>.json`), and every body here is prefilled at start, so a
     /// client's first turn after a restart reuses its tools block.
     pub warm_dir: Option<PathBuf>,
+    /// Continuous batching (`serve_batch.rs`): up to this many requests decode together, on an
+    /// engine with sequence slots (qwen3next). 0 or 1: one request at a time.
+    pub batch: usize,
     /// Seed the expert cache from this routing profile. Without one, `routing.bin` in `disk`
     /// (written after every request) seeds it.
     pub profile: Option<PathBuf>,
@@ -115,6 +121,23 @@ pub trait ServeEngine {
     }
     fn last_mtp_ms(&self) -> f64 {
         0.0
+    }
+    /// Sequence slots for batching (`--batch`); 1: none.
+    fn max_slots(&self) -> usize {
+        1
+    }
+    fn slot_tokens(&self, _slot: usize) -> &[u32] {
+        &[]
+    }
+    fn alloc_slot(&mut self) -> Result<usize> {
+        bail!("this engine has no sequence slots")
+    }
+    fn free_slot(&mut self, _slot: usize) {}
+    fn prefill_slot(&mut self, _slot: usize, _ids: &[u32]) -> Result<u32> {
+        bail!("this engine has no sequence slots")
+    }
+    fn decode_batch(&mut self, _rows: &[(usize, u32)]) -> Result<Vec<u32>> {
+        bail!("this engine has no sequence slots")
     }
     /// Verify-window cost by width relative to one token, for pricing suffix drafts.
     fn draft_cost(&self) -> Vec<(usize, f32)> {
@@ -248,6 +271,24 @@ impl ServeEngine for super::coder::Coder {
     }
     fn sampler_begin(&mut self, pos: usize) -> Result<()> {
         super::coder::Coder::sampler_begin(self, pos)
+    }
+    fn max_slots(&self) -> usize {
+        super::coder::MAX_SLOTS
+    }
+    fn slot_tokens(&self, slot: usize) -> &[u32] {
+        super::coder::Coder::slot_tokens(self, slot)
+    }
+    fn alloc_slot(&mut self) -> Result<usize> {
+        super::coder::Coder::alloc_slot(self)
+    }
+    fn free_slot(&mut self, slot: usize) {
+        super::coder::Coder::free_slot(self, slot)
+    }
+    fn prefill_slot(&mut self, slot: usize, ids: &[u32]) -> Result<u32> {
+        super::coder::Coder::prefill_slot(self, slot, ids)
+    }
+    fn decode_batch(&mut self, rows: &[(usize, u32)]) -> Result<Vec<u32>> {
+        super::coder::Coder::decode_batch(self, rows)
     }
     fn draft_cost(&self) -> Vec<(usize, f32)> {
         // H200, UD-Q4_K_XL: a T=8 verify window is ~3.3x a T=1 one (each token routes to its
@@ -387,6 +428,11 @@ pub struct FlashServe {
     dcalib: crate::draft::Calibration,
     /// See [`Settings::warm_dir`].
     warm_dir: Option<PathBuf>,
+    /// See [`Settings::batch`] (1: off), and the engine's sequence slots, parked or running.
+    batch: usize,
+    slots: Vec<batch::SlotInfo>,
+    /// Prefill seconds not yet matched by decode time (see `batch_step`).
+    prefill_debt: f64,
     tok: FlashTokenizer,
     /// Keeps request text out of the special tokens (see [`Shield`]).
     shield: Shield,
@@ -475,7 +521,9 @@ impl FlashServe {
                 super::coder::Coder::load(&s.gguf, super::coder::CoderOpts { max_ctx: s.ctx })?;
             eprintln!("{}", c.load_report);
             c.use_graphs = true;
-            c.enable_sampler()?;
+            if s.batch <= 1 {
+                c.enable_sampler()?;
+            }
             c.warm()?;
             Box::new(c)
         } else {
@@ -555,6 +603,9 @@ impl FlashServe {
             dglobal: crate::draft::Global::new(1 << 20, None),
             dcalib: crate::draft::Calibration::default(),
             warm_dir: None,
+            batch: 1,
+            slots: Vec::new(),
+            prefill_debt: 0.0,
             e,
             im_start: id("<|im_start|>")?,
             shield: Shield::new(&tok.tok),
@@ -611,6 +662,17 @@ impl FlashServe {
             warm.extend(v);
         }
         me.warm_dir = s.warm_dir.clone();
+        if s.batch > 1 {
+            ensure!(
+                me.e.max_slots() > 1,
+                "--batch needs an engine with sequence slots (qwen3next)"
+            );
+            me.batch = s.batch.min(me.e.max_slots() - 1);
+            eprintln!(
+                "tang-llm: continuous batching: up to {} requests at once (greedy, no drafts)",
+                me.batch
+            );
+        }
         for f in &warm {
             let t = Instant::now();
             let body: Value = serde_json::from_str(&std::fs::read_to_string(f)?)
@@ -1567,6 +1629,34 @@ impl Backend for FlashServe {
         self.ctx
     }
 
+    fn max_batch(&self) -> usize {
+        self.batch
+    }
+
+    fn can_admit(&self, key: Option<&str>) -> bool {
+        self.batch > 1 && self.batch_can_admit(key)
+    }
+
+    fn admit(
+        &mut self,
+        req: &Request,
+        _prompt: Option<(String, Vec<u32>)>,
+    ) -> Result<crate::server::Inflight> {
+        self.batch_admit(req)
+    }
+
+    fn step(&mut self, lanes: &mut [crate::server::DynLane<'_>]) -> Result<()> {
+        self.batch_step(lanes)
+    }
+
+    fn retire(&mut self, s: crate::server::Inflight) -> Result<Outcome> {
+        self.batch_retire(s)
+    }
+
+    fn stream_state(&self, s: &crate::server::Inflight) -> (bool, bool) {
+        FlashServe::batch_state(s)
+    }
+
     fn expire(&mut self) {
         FlashServe::expire(self)
     }
@@ -2145,6 +2235,7 @@ pub fn serve_replay(args: &[String]) -> Result<()> {
         warm: Vec::new(),
         suffix: false,
         warm_dir: None,
+        batch: 0,
         profile,
     };
     let mut me = FlashServe::load(&s)?;

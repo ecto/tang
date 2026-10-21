@@ -83,6 +83,15 @@ impl Template {
                 minijinja::Value::UNDEFINED,
                 minijinja::Value::from_serialize,
             );
+        // Null fields dropped, not passed as none: the same template takes
+        // `message.tool_calls | length` when `tool_calls is defined`, and a plain assistant turn
+        // arrives with `"tool_calls": null` from the request normalizer and many clients.
+        let mut messages = messages.clone();
+        if let Some(ms) = messages.as_array_mut() {
+            for m in ms.iter_mut().filter_map(Value::as_object_mut) {
+                m.retain(|_, v| !v.is_null());
+            }
+        }
         Ok(t.render(minijinja::context! {
             messages => messages,
             tools => tools,
@@ -675,6 +684,19 @@ fn push(out: &mut Vec<Piece>, p: Piece) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn null_message_fields_are_undefined_to_the_template() {
+        // Qwen3-Coder-Next's template checks `tool_calls is defined` and then takes its length.
+        let src = "{% for m in messages %}{{ m.role }}{% if m.tool_calls is defined %}:{{ m.tool_calls | length }}{% endif %};{% endfor %}";
+        let t = Template::from_source(src.into(), String::new(), String::new()).unwrap();
+        let ms = serde_json::json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "ok", "tool_calls": null},
+            {"role": "user", "content": "again"},
+        ]);
+        assert_eq!(t.render(&ms, None, None).unwrap(), "user;assistant;user;");
+    }
 
     /// `s` as a tokenizer with tag tokens would see it: every literal tag is a tag token.
     fn tokens(s: &str) -> Vec<Chunk> {
