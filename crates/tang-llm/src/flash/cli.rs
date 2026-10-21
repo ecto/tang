@@ -1397,6 +1397,128 @@ pub fn spec_test(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `flash-wide-check` (qwen3next): wide prefill against normal prefill. The prompt cycled to
+/// `--ctx` tokens (default 1000) is prefilled into one slot with `prefill_slot` (windows of
+/// `MAX_T`) and into another with `prefill_wide` (windows of `TANG_CODER_WIDE` rows, default
+/// 256), then each decodes `-n` greedy tokens: tokens and logits must be bitwise equal. Prints
+/// both prefills' times (the wide one twice: the first run warms it).
+pub fn wide_check(args: &[String]) -> Result<()> {
+    let mut a = parse(args)?;
+    let base = prompt_ids(&a)?;
+    // TANG_WIDE_CTXS=1000,8000,...: several prompt lengths on one load.
+    let lens: Vec<usize> = match std::env::var("TANG_WIDE_CTXS") {
+        Ok(v) => v.split(',').filter_map(|x| x.trim().parse().ok()).collect(),
+        Err(_) => vec![a.ctx.unwrap_or(1000)],
+    };
+    let longest = lens.iter().copied().max().unwrap_or(1000);
+    let steps = a.n.max(4);
+    if a.opts.max_ctx < longest + steps + 8 {
+        a.opts.max_ctx = (longest + steps + 8).next_multiple_of(1024);
+    }
+    let rows: usize = std::env::var("TANG_CODER_WIDE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256);
+    let mut e = load_coder(&a)?;
+    ensure!(e.temperature == 0.0, "wide-check is greedy");
+    // Free-running greedy decode, or (`forced`) fed these tokens instead of its own picks.
+    let decode = |e: &mut Coder,
+                  slot: usize,
+                  mut next: u32,
+                  forced: Option<&[u32]>|
+     -> Result<(Vec<u32>, Vec<f32>)> {
+        let (mut toks, mut lg) = (Vec::new(), Vec::new());
+        for i in 0..steps {
+            let got = e.decode_batch(&[(slot, next)])?[0];
+            lg.extend_from_slice(&e.logits(1));
+            toks.push(got);
+            next = forced.map_or(got, |f| f[i]);
+        }
+        Ok((toks, lg))
+    };
+    let t0 = std::time::Instant::now();
+    e.enable_wide(rows)?;
+    println!(
+        "wide kernels ({rows} rows) built in {:.1} s",
+        t0.elapsed().as_secs_f64()
+    );
+    let mut all_ok = true;
+    for len in lens {
+        let ids: Vec<u32> = base.iter().cycle().take(len).copied().collect();
+        let s1 = e.alloc_slot()?;
+        let t0 = std::time::Instant::now();
+        let n1 = e.prefill_slot(s1, &ids)?;
+        let narrow = t0.elapsed().as_secs_f64();
+        let (t1, l1) = decode(&mut e, s1, n1, None)?;
+        e.free_slot(s1);
+        let mut wide = Vec::new();
+        let mut got = None;
+        let mut forced = None;
+        for _ in 0..2 {
+            let s2 = e.alloc_slot()?;
+            let t0 = std::time::Instant::now();
+            let n2 = e.prefill_wide(s2, &ids)?;
+            wide.push(t0.elapsed().as_secs_f64());
+            if got.is_none() {
+                got = Some((n2, decode(&mut e, s2, n2, None)?));
+            } else {
+                // Teacher-forced on the narrow run's tokens: the logits measure the state
+                // (K/V, GDN) the wide prefill left against narrow's.
+                forced = Some(decode(&mut e, s2, n1, Some(&t1))?.1);
+            }
+            e.free_slot(s2);
+        }
+        let (n2, (t2, l2)) = got.unwrap();
+        if let Some(r) = e.prof_report() {
+            println!("  GPU time by stage (TANG_CODER_PROF, narrow + wide prefills):\n{r}");
+        }
+        let bits = l1
+            .iter()
+            .zip(&l2)
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
+        let v = e.hp.n_vocab;
+        let kl = |p: &[f32], q: &[f32]| -> f64 {
+            let ls = |l: &[f32]| -> Vec<f64> {
+                let m = l.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
+                let z = l.iter().map(|&x| (x as f64 - m).exp()).sum::<f64>().ln() + m;
+                l.iter().map(|&x| x as f64 - z).collect()
+            };
+            (0..p.len() / v)
+                .map(|r| {
+                    let (a, b) = (ls(&p[r * v..(r + 1) * v]), ls(&q[r * v..(r + 1) * v]));
+                    a.iter()
+                        .zip(&b)
+                        .map(|(x, y)| x.exp() * (x - y))
+                        .sum::<f64>()
+                })
+                .fold(0.0, f64::max)
+        };
+        let max_kl = forced.as_ref().map_or(0.0, |f| kl(&l1, f));
+        // Bitwise (grouped decode kernels), or the GEMM bar: same greedy tokens, KL <= 1e-3.
+        let ok = n1 == n2 && t1 == t2 && (bits == 0 || max_kl <= 1e-3);
+        println!("  teacher-forced max KL(narrow || wide) over {steps} steps: {max_kl:.2e}");
+        println!(
+            "prefill {len} tokens: narrow {:.2} s ({:.0} tok/s), wide {:.2} s cold / {:.2} s warm ({:.0} tok/s)",
+            narrow,
+            len as f64 / narrow,
+            wide[0],
+            wide[1],
+            len as f64 / wide[1]
+        );
+        println!(
+            "wide-check {len}: {} (next token {}, {steps} decoded tokens {}, logits differ in {bits} of {})",
+            if !ok { "FAIL" } else if bits == 0 { "PASS (bitwise)" } else { "PASS (greedy equal, KL <= 1e-3)" },
+            if n1 == n2 { "equal" } else { "DIFFERS" },
+            if t1 == t2 { "equal" } else { "DIFFER" },
+            l1.len()
+        );
+        all_ok &= ok;
+    }
+    ensure!(all_ok, "wide-check failed");
+    Ok(())
+}
+
 /// `flash-batch-check` (qwen3next): is a sequence's output independent of the batch it decodes
 /// in? Up to 8 sequences (the prompt truncated by different amounts, so their positions differ)
 /// each decode `-n` greedy tokens alone, then all together in one batched step per token, with
@@ -1413,19 +1535,23 @@ pub fn batch_check(args: &[String]) -> Result<()> {
     let seqs: Vec<Vec<u32>> = (0..nb).map(|i| ids[..ids.len() - 3 * i].to_vec()).collect();
     let steps = a.n.max(8);
     // TANG_CODER_MOE_SWEEP=0,2,4,8: repeat everything for each expert-kernel variant on one load.
-    let sweep: Vec<Option<usize>> = match std::env::var("TANG_CODER_MOE_SWEEP") {
+    // Entries are a variant, with `n` for SiLU unfused (`TANG_CODER_FUSE_SILU=0`): "2,4,4n".
+    let sweep: Vec<Option<(usize, bool)>> = match std::env::var("TANG_CODER_MOE_SWEEP") {
         Ok(s) => s
             .split(',')
-            .filter_map(|x| x.trim().parse().ok())
-            .map(Some)
+            .filter_map(|x| {
+                let x = x.trim();
+                let (num, fuse) = x.strip_suffix('n').map_or((x, true), |n| (n, false));
+                num.parse().ok().map(|v| Some((v, fuse)))
+            })
             .collect(),
         Err(_) => vec![None],
     };
     let mut all_ok = true;
     for variant in sweep {
-        if let Some(m) = variant {
-            e.set_moe_variant(m);
-            println!("== TANG_CODER_MOE={m}");
+        if let Some((m, fuse)) = variant {
+            e.set_moe_variant(m, fuse);
+            println!("== TANG_CODER_MOE={m} fuse_silu={fuse}");
         }
         // Alone.
         let mut alone: Vec<(Vec<u32>, Vec<f32>)> = Vec::new();
