@@ -1405,6 +1405,13 @@ pub trait ComputeDevice: Send + 'static {
         self.upload(&y)
     }
 
+    /// GELU, exact (erf) form, elementwise over `n` values: `0.5 x (1 + erf(x / sqrt 2))`.
+    fn gelu_erf(&self, x: &Self::Buffer, n: usize) -> Self::Buffer {
+        let x = self.download(x);
+        let y: Vec<f32> = x[..n].iter().map(|&g| gelu_erf_host(g)).collect();
+        self.upload(&y)
+    }
+
     /// GeGLU over a fused gate/up projection (Gemma): `gelu_tanh(gate) * up`, `[rows, ff]`.
     fn geglu_split(&self, gu: &Self::Buffer, rows: usize, ff: usize) -> Self::Buffer {
         let d = self.download(gu);
@@ -2469,6 +2476,64 @@ impl<B> Pages<'_, B> {
 /// The portable [`ComputeDevice::attention_prep_paged`]: `attention_prep` on scratch caches,
 /// then the new rows copied to where `pages` puts them.
 #[allow(clippy::too_many_arguments)]
+/// Exact GELU on the host, `0.5 x (1 + erf(x / sqrt 2))`, with erf to f32 precision.
+pub fn gelu_erf_host(x: f32) -> f32 {
+    let x = x as f64;
+    (0.5 * x * (1.0 + erf(x * std::f64::consts::FRAC_1_SQRT_2))) as f32
+}
+
+/// erf within 2e-8 (Cody-style rational approximations), below f32 resolution.
+#[allow(clippy::excessive_precision)]
+fn erf(x: f64) -> f64 {
+    let a = x.abs();
+    let r = if a < 0.5 {
+        let t = a * a;
+        let p = (((0.185_777_706_184_603_15 * t + 3.161_123_743_870_565_6) * t
+            + 113.864_154_151_050_16)
+            * t
+            + 377.485_237_685_302_02)
+            * t
+            + 3_209.377_589_138_469_4;
+        let q = (((t + 23.601_290_952_344_122) * t + 244.024_637_934_444_17) * t
+            + 1_282.616_526_077_372_3)
+            * t
+            + 2_844.236_833_439_170_6;
+        return x * p / q;
+    } else if a < 4.0 {
+        let p = [
+            2.153_115_354_744_038_3e-8,
+            0.564_188_496_988_670_9,
+            8.883_149_794_388_376,
+            66.119_190_637_141_63,
+            298.635_138_197_400_1,
+            881.952_221_241_769_1,
+            1_712.047_612_634_070_7,
+            2_051.078_377_826_071_6,
+            1_230.339_354_797_997_2,
+        ];
+        let q = [
+            1.0,
+            15.744_926_110_709_835,
+            117.693_950_891_312_5,
+            537.181_101_862_009_9,
+            1_621.389_574_566_690_2,
+            3_290.799_235_733_459_7,
+            4_362.619_090_143_247,
+            3_439.367_674_143_721_6,
+            1_230.339_354_803_749_4,
+        ];
+        let (mut n, mut d) = (0.0, 0.0);
+        for k in 0..9 {
+            n = n * a + p[k];
+            d = d * a + q[k];
+        }
+        1.0 - (-a * a).exp() * n / d
+    } else {
+        1.0
+    };
+    r.copysign(x)
+}
+
 pub fn attention_prep_paged_default<D: ComputeDevice + ?Sized>(
     dev: &D,
     qkv: &D::Buffer,

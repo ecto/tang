@@ -55,6 +55,14 @@ pub struct Config {
     #[serde(skip)]
     pub mm_tokens_per_image: usize,
 
+    // Qwen3-VL.
+    /// The Qwen3-VL vision tower (see [`crate::qwen3vl`]).
+    #[serde(skip)]
+    pub qwen_vision: Option<crate::qwen3vl::QwenVisionConfig>,
+    /// Interleaved M-RoPE: frequencies per axis (t, h, w), e.g. `[24, 20, 20]`.
+    #[serde(skip)]
+    pub mrope_section: Option<Vec<usize>>,
+
     // gpt-oss (and other MoE checkpoints on the dense path).
     /// Per layer: `"sliding_attention"` or `"full_attention"` (overrides the Gemma pattern).
     #[serde(default)]
@@ -164,6 +172,9 @@ impl Config {
         let Some(text) = top.get("text_config").filter(|t| t.is_object()) else {
             return Ok(serde_json::from_value(top)?);
         };
+        if top["model_type"] == "qwen3_vl" {
+            return Self::qwen3_vl(&top);
+        }
         let mut t = serde_json::json!({
             "model_type": "gemma3_text",
             "hidden_size": 2304,
@@ -196,6 +207,58 @@ impl Config {
             cfg.mm_tokens_per_image = top["mm_tokens_per_image"].as_u64().unwrap_or(256) as usize;
         }
         Ok(cfg)
+    }
+
+    /// Qwen3-VL: a Qwen3 language model in `text_config` (its RoPE in `rope_parameters`, with
+    /// the M-RoPE sections), the vision tower in `vision_config`.
+    fn qwen3_vl(top: &serde_json::Value) -> anyhow::Result<Self> {
+        let mut t = top["text_config"].clone();
+        let rp = t["rope_parameters"].clone();
+        let rp = if rp.is_object() {
+            rp
+        } else {
+            t["rope_scaling"].clone()
+        };
+        if t.get("rope_theta").is_none() {
+            if let Some(theta) = rp.get("rope_theta") {
+                t["rope_theta"] = theta.clone();
+            }
+        }
+        t["rope_scaling"] = serde_json::Value::Null;
+        for k in ["quantization", "eos_token_id", "tie_word_embeddings"] {
+            if let Some(v) = top.get(k).filter(|_| t.get(k).is_none()) {
+                t[k] = v.clone();
+            }
+        }
+        let mut cfg: Config = serde_json::from_value(t)?;
+        cfg.model_type = "qwen3_vl".into();
+        let section: Vec<usize> = rp["mrope_section"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_u64().map(|x| x as usize))
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![24, 20, 20]);
+        anyhow::ensure!(
+            section.len() == 3 && section.iter().sum::<usize>() == cfg.head_dim() / 2,
+            "mrope_section {section:?} doesn't cover head_dim {}",
+            cfg.head_dim()
+        );
+        anyhow::ensure!(
+            rp["mrope_interleaved"].as_bool().unwrap_or(true),
+            "only interleaved M-RoPE is supported"
+        );
+        cfg.mrope_section = Some(section);
+        cfg.qwen_vision = Some(crate::qwen3vl::QwenVisionConfig::from_value(
+            &top["vision_config"],
+        )?);
+        cfg.image_token = Some(top["image_token_id"].as_u64().unwrap_or(151_655) as u32);
+        Ok(cfg)
+    }
+
+    pub fn is_qwen3_vl(&self) -> bool {
+        self.qwen_vision.is_some()
     }
 
     /// Compensate for kernels whose attention scale is fixed to head_dim^-0.5.
