@@ -120,6 +120,20 @@ HF fp32 (tang bf16) is ~2e-3 relative through block 25. It reaches 6e-2 at the l
 1.7e-3, 1.1e-2 and 1.7e-2. The 880-token image encodes in 1.2 s on the L40S, with the ViT
 running once per image.
 
+### Against llama.cpp mtmd
+
+`scripts/qwen3vl_llamacpp.py` runs llama.cpp master (2026-10-21) `llama-server` with bf16 GGUFs
+from `convert_hf_to_gguf.py` (the model, and `--mmproj` for the tower). llama.cpp generates 32
+tokens greedily on the same viewport prompt, with its top-20 log-probabilities at each step. tang
+runs the same prompt with its own preprocessing and those tokens teacher-forced, and is
+compared at each generated position.
+
+| | top-1 | top-20 KL mean | p99 | max |
+|---|---|---|---|---|
+| tang (CUDA, bf16) vs llama.cpp mtmd (CUDA, bf16) | 100% | 2.7e-3 | 2.5e-2 | 2.6e-2 |
+
+The greedy continuations are identical, and both match HF fp32's.
+
 ## Viewport eval
 
 `scripts/qwen3vl_eval.py` renders 20 CAD-viewport scenes with matplotlib: shaded cubes,
