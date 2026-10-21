@@ -647,7 +647,12 @@ impl TensorGraph {
         }
         let f16 = prefill_f16();
         let (rm, rn, wg) = mm_shape();
-        let lanes = mm_lanes(wg);
+        // the partials' local array within 32 KB (the Adreno's local memory)
+        let lanes = if rm * rn * wg * 4 <= 32 << 10 {
+            mm_lanes(wg)
+        } else {
+            1
+        };
         let mb = m.div_ceil(rm);
         let nb = n.div_ceil(rn);
         let items = mb * nb;

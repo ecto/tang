@@ -889,7 +889,12 @@ pub fn tune_key(rt: &Runtime, dims: &QwenDims) -> String {
 }
 
 /// The knobs the tuner sets (decode GEMV shape, OpenCL prefill register block).
-pub const TUNE_KNOBS: [&str; 3] = ["TANG_DECODE_WARPS", "TANG_DECODE_ROWS", "TANG_CL_MM"];
+pub const TUNE_KNOBS: [&str; 4] = [
+    "TANG_DECODE_WARPS",
+    "TANG_DECODE_ROWS",
+    "TANG_CL_MM",
+    "TANG_CL_MM_LANES",
+];
 
 /// Set this device and model's tuned knobs from [`tune_path`], except any
 /// already set in the environment (an explicit env var wins). Returns what
@@ -1043,15 +1048,27 @@ pub fn tune(dir: &str, budget: f64) -> Vec<(String, String)> {
     if rt.kind() == BackendKind::OpenCl {
         let seq = 64;
         let toks: Vec<usize> = (0..seq).map(|i| 1000 + i).collect();
-        let mut best: Option<(f64, String)> = None;
-        for mm in [
-            "4x4x64", "4x8x64", "8x4x64", "2x8x64", "4x4x128", "4x4x32", "8x8x64", "2x4x64",
+        let mut best: Option<(f64, String, String)> = None;
+        // (block RMxRNxWG, lanes along k): work-groups of a wave (64) or
+        // two, local partials RM*RN*WG floats within the Adreno's 32 KB
+        for (mm, lanes) in [
+            ("4x4x64", "16"),
+            ("4x4x128", "16"),
+            ("4x4x128", "32"),
+            ("4x4x64", "8"),
+            ("4x8x64", "16"),
+            ("8x4x64", "16"),
+            ("2x8x128", "16"),
+            ("4x4x256", "32"),
+            ("8x8x64", "16"),
+            ("4x4x64", "1"),
         ] {
             if !settle(hot, 75.0, load, deadline) {
                 eprintln!("tune: budget spent");
                 break;
             }
             std::env::set_var("TANG_CL_MM", mm);
+            std::env::set_var("TANG_CL_MM_LANES", lanes);
             let s = Step::new(
                 &rt,
                 &dims,
@@ -1063,17 +1080,19 @@ pub fn tune(dir: &str, budget: f64) -> Vec<(String, String)> {
             s.prefill(&rt, &toks, 0);
             let ms = s.prog.time(&rt, 3);
             eprintln!(
-                "tune: prefill {seq} tokens, block {mm}: {ms:.1} ms ({:.0} tok/s, gpu {:.1} C)",
+                "tune: prefill {seq} tokens, block {mm} lanes {lanes}: {ms:.1} ms ({:.0} tok/s, gpu {:.1} C)",
                 seq as f64 * 1e3 / ms,
                 gpu_temp().unwrap_or(0.0)
             );
             if best.as_ref().is_none_or(|b| ms < b.0) {
-                best = Some((ms, mm.to_string()));
+                best = Some((ms, mm.to_string(), lanes.to_string()));
             }
         }
         std::env::remove_var("TANG_CL_MM");
-        if let Some((_, mm)) = best {
+        std::env::remove_var("TANG_CL_MM_LANES");
+        if let Some((_, mm, lanes)) = best {
             won.push(("TANG_CL_MM".to_string(), mm));
+            won.push(("TANG_CL_MM_LANES".to_string(), lanes));
         }
     }
     // merge into the tuning file
@@ -1130,6 +1149,12 @@ pub struct PrefillCheck {
 pub fn prefill_bench(dir: &str, sizes: &[usize], gen: usize, check: bool) -> Vec<PrefillCheck> {
     // QWEN_BENCH_TURN=0: skip the 20-token turn (two more programs)
     let turn_on = std::env::var("QWEN_BENCH_TURN").as_deref() != Ok("0");
+    // QWEN_BENCH_PROFILE=1: per-kernel device time of each size's prefill
+    let profile = std::env::var("QWEN_BENCH_PROFILE").is_ok_and(|v| v == "1");
+    let t_start = Instant::now();
+    let phase = |what: &str| {
+        println!("phase {:7.2} s: {what}", t_start.elapsed().as_secs_f64());
+    };
     let tokenizer =
         tokenizers::Tokenizer::from_file(format!("{dir}/tokenizer.json")).expect("tokenizer.json");
     let max = sizes.iter().copied().max().unwrap_or(1);
@@ -1141,12 +1166,14 @@ pub fn prefill_bench(dir: &str, sizes: &[usize], gen: usize, check: bool) -> Vec
         ids.extend(e.get_ids().iter().map(|&t| t as usize));
     }
     ids.truncate(max);
+    phase("tokenizer + prompt");
     let ctx = (max + gen + 1).next_power_of_two().max(1024);
     let mut dims = dims_for(dir, ctx);
     dims.kv_f16 = std::env::var("TANG_KV_F32").is_err();
     let rt = runtime();
+    phase("runtime");
     for (k, v) in apply_tuning(&rt, &dims) {
-        eprintln!("tang: tuned {k}={v}");
+        println!("tang: tuned {k}={v}");
     }
     if rt.kind() == BackendKind::OpenCl {
         dims.vocab_chunks = (dims.vocab * dims.d_model / 2).div_ceil(255 << 20).max(1);
@@ -1161,6 +1188,7 @@ pub fn prefill_bench(dir: &str, sizes: &[usize], gen: usize, check: bool) -> Vec
         tang_compile::tensor::opencl_gemv::prefill_f16()
     );
     let st = St::open(&format!("{dir}/model.safetensors"));
+    phase("checkpoint mapped");
     let dec = Step::new(
         &rt,
         &dims,
@@ -1169,11 +1197,14 @@ pub fn prefill_bench(dir: &str, sizes: &[usize], gen: usize, check: bool) -> Vec
         &|dg| vec![Vec::new(); dg.inputs.len()],
         None,
     );
+    phase("decode program built + buffers allocated");
     for (k, v) in load_inputs(&st, &dims, &dec.dg).enumerate() {
         if !v.is_empty() {
             dec.prog.write(&rt, dec.prog.input(k), &v);
         }
     }
+    rt.sync();
+    phase("weights converted + uploaded");
     let build = |seq: usize| {
         Step::new(
             &rt,
@@ -1205,6 +1236,11 @@ pub fn prefill_bench(dir: &str, sizes: &[usize], gen: usize, check: bool) -> Vec
             seq as f64 * 1e3 / ms,
             s.bytes as f64 / 1e6
         );
+        phase(&format!("prefill {seq} timed"));
+        if profile {
+            kernel_table(&rt, &s, 15);
+            phase(&format!("prefill {seq} profiled"));
+        }
         last = Some(s);
     }
     // a voice turn: 20 new tokens after the largest prompt, split as a
@@ -1313,4 +1349,40 @@ pub fn prefill_bench(dir: &str, sizes: &[usize], gen: usize, check: bool) -> Vec
         }
     }
     out
+}
+
+/// Device time per kernel of one run of `step`, summed by kernel kind (its
+/// first source line), the `top` largest: the per-kernel table of
+/// [`prefill_bench`] (`QWEN_BENCH_PROFILE=1`).
+pub fn kernel_table(rt: &Runtime, step: &Step, top: usize) {
+    let p = &step.prog;
+    let mut groups: Vec<(String, f64, usize)> = Vec::new();
+    let mut total = 0.0;
+    for (i, k) in p.program.kernels.iter().enumerate() {
+        let ms = p.time_kernel(rt, i, 1);
+        total += ms;
+        let name: String = k
+            .source
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(120)
+            .collect();
+        match groups.iter_mut().find(|g| g.0 == name) {
+            Some(g) => {
+                g.1 += ms;
+                g.2 += 1;
+            }
+            None => groups.push((name, ms, 1)),
+        }
+    }
+    groups.sort_by(|a, b| b.1.total_cmp(&a.1));
+    println!(
+        "kernels: {} launches, {total:.1} ms summed (each alone)",
+        p.program.kernels.len()
+    );
+    for (name, ms, n) in groups.iter().take(top) {
+        println!("  {ms:8.2} ms {:5.1}%  x{n:<4} {name}", 100.0 * ms / total);
+    }
 }
