@@ -424,7 +424,7 @@ pub fn mm_lanes(wg: usize) -> usize {
         .filter(|&l| l > 0)
         .unwrap_or(16)
         .min(wg);
-    if wg % l == 0 {
+    if wg.is_multiple_of(l) {
         l
     } else {
         1
@@ -1124,7 +1124,7 @@ impl TensorGraph {
             // nibbles as floats: 0x4b000000 | q is 2^23 + q
             let nib = |v: usize, j: usize, u: usize| {
                 let c = ["x", "y", "z", "w"][u / 2];
-                let sh = if u % 2 == 0 {
+                let sh = if u.is_multiple_of(2) {
                     "(uint4)(0u, 4u, 8u, 12u)"
                 } else {
                     "(uint4)(16u, 20u, 24u, 28u)"
