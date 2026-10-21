@@ -1413,19 +1413,23 @@ pub fn batch_check(args: &[String]) -> Result<()> {
     let seqs: Vec<Vec<u32>> = (0..nb).map(|i| ids[..ids.len() - 3 * i].to_vec()).collect();
     let steps = a.n.max(8);
     // TANG_CODER_MOE_SWEEP=0,2,4,8: repeat everything for each expert-kernel variant on one load.
-    let sweep: Vec<Option<usize>> = match std::env::var("TANG_CODER_MOE_SWEEP") {
+    // Entries are a variant, with `n` for SiLU unfused (`TANG_CODER_FUSE_SILU=0`): "2,4,4n".
+    let sweep: Vec<Option<(usize, bool)>> = match std::env::var("TANG_CODER_MOE_SWEEP") {
         Ok(s) => s
             .split(',')
-            .filter_map(|x| x.trim().parse().ok())
-            .map(Some)
+            .filter_map(|x| {
+                let x = x.trim();
+                let (num, fuse) = x.strip_suffix('n').map_or((x, true), |n| (n, false));
+                num.parse().ok().map(|v| Some((v, fuse)))
+            })
             .collect(),
         Err(_) => vec![None],
     };
     let mut all_ok = true;
     for variant in sweep {
-        if let Some(m) = variant {
-            e.set_moe_variant(m);
-            println!("== TANG_CODER_MOE={m}");
+        if let Some((m, fuse)) = variant {
+            e.set_moe_variant(m, fuse);
+            println!("== TANG_CODER_MOE={m} fuse_silu={fuse}");
         }
         // Alone.
         let mut alone: Vec<(Vec<u32>, Vec<f32>)> = Vec::new();

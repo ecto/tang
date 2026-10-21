@@ -94,6 +94,9 @@ struct Variants {
     /// d4 4.04/4.84/6.15/9.12, db 4.63/5.52/7.34/10.57.
     /// `TANG_CODER_MOE`. Bitwise the same outputs.
     moe: usize,
+    /// SiLU(gate) * up and its int8 made inside the direct down kernels (`_d2f` / `_d4f`) instead
+    /// of a `cx_silu_q` launch a layer; `TANG_CODER_FUSE_SILU=0` keeps the launch. Bitwise equal.
+    fuse_silu: bool,
 }
 
 impl Default for Variants {
@@ -104,6 +107,7 @@ impl Default for Variants {
             shared_par: false,
             grouped: false,
             moe: usize::MAX,
+            fuse_silu: true,
         }
     }
 }
@@ -118,6 +122,7 @@ impl Variants {
             shared_par: env_is("TANG_CODER_SHPAR", "1"),
             grouped: env_is("TANG_CODER_GROUPED", "1"),
             moe: num("TANG_CODER_MOE").map_or(d.moe, |v| v as usize),
+            fuse_silu: !env_is("TANG_CODER_FUSE_SILU", "0"),
         }
     }
 }
@@ -253,6 +258,7 @@ struct Kern {
     moe_plan: Fun,
     moe_gu_d: [Fun; 2],
     moe_down_d: [Fun; 2],
+    moe_down_df: [Fun; 2],
     moe_gu_db: Fun,
     moe_down_db: Fun,
     moe_gu_g: Fun,
@@ -705,6 +711,7 @@ impl Coder {
             moe_plan: f(&cm, "cx_moe_plan")?,
             moe_gu_d: [f(&cm, "cx_moe_gu_d2")?, f(&cm, "cx_moe_gu_d4")?],
             moe_down_d: [f(&cm, "cx_moe_down_d2")?, f(&cm, "cx_moe_down_d4")?],
+            moe_down_df: [f(&cm, "cx_moe_down_d2f")?, f(&cm, "cx_moe_down_d4f")?],
             moe_gu_db: f(&cm, "cx_moe_gu_db")?,
             moe_down_db: f(&cm, "cx_moe_down_db")?,
             moe_gu_g: f(&cm, "cx_moe_gu_g")?,
@@ -881,10 +888,11 @@ impl Coder {
         self.dev.sync();
     }
 
-    /// Switch the per-pair expert kernels (`TANG_CODER_MOE`'s values) without reloading; drops
+    /// Switch the per-pair expert kernels (`TANG_CODER_MOE`, `TANG_CODER_FUSE_SILU`) without reloading; drops
     /// the captured window graphs, which hold the old kernels.
-    pub fn set_moe_variant(&mut self, v: usize) {
+    pub fn set_moe_variant(&mut self, v: usize, fuse_silu: bool) {
         self.var.moe = v;
+        self.var.fuse_silu = fuse_silu;
         self.graphs.clear();
         self.commit_graphs.iter_mut().for_each(|g| *g = None);
     }
@@ -1112,6 +1120,8 @@ impl Coder {
             (k.moe_gu_d[1], "moe_gu"),
             (k.moe_down_d[0], "moe_down"),
             (k.moe_down_d[1], "moe_down"),
+            (k.moe_down_df[0], "moe_down"),
+            (k.moe_down_df[1], "moe_down"),
             (k.moe_gu_db, "moe_gu"),
             (k.moe_down_db, "moe_down"),
             (k.moe_plan, "route"),
@@ -1628,6 +1638,19 @@ impl Coder {
                 smem_g,
                 tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti, r16g, fastk, pb],
             );
+            // The direct down kernels can make SiLU(gate) * up's int8 themselves.
+            if self.var.fuse_silu && (moe == 2 || moe == 4) {
+                let df = self.k.moe_down_df[usize::from(moe == 4)];
+                self.launch_on(
+                    stream,
+                    df,
+                    ((nh / rows) as u32, np, 1),
+                    256,
+                    0,
+                    tang_moe::args![dw, sd, ids, egu, parts, ti, r16d, fastk, pb],
+                );
+                return;
+            }
             self.launch_on(
                 stream,
                 self.k.silu_q,

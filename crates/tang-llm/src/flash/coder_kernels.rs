@@ -499,6 +499,20 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_down_d4(ExW d, ExW sd, 
     moe_down_body<4, false, false>(d, sd, ids, hq, nullptr, out, T, r16, fast, pbase);
 }
 
+// cx_moe_down_d2 / _d4 with SiLU(gate) * up and its int8 made in the block from gate|up (FUSE:
+// cx_silu_q's arithmetic, a 32-wide chunk a warp), so the cx_silu_q launch goes away. hq is
+// unused. Bitwise the unfused kernels' outputs.
+extern "C" __global__ void __launch_bounds__(256) cx_moe_down_d2f(ExW d, ExW sd, const unsigned* ids,
+                                                                  const float* gu, float* out, int T, int r16,
+                                                                  int fast, int pbase) {
+    moe_down_body<2, true, false>(d, sd, ids, nullptr, gu, out, T, r16, fast, pbase);
+}
+extern "C" __global__ void __launch_bounds__(256) cx_moe_down_d4f(ExW d, ExW sd, const unsigned* ids,
+                                                                  const float* gu, float* out, int T, int r16,
+                                                                  int fast, int pbase) {
+    moe_down_body<4, true, false>(d, sd, ids, nullptr, gu, out, T, r16, fast, pbase);
+}
+
 // Per-pair expert kernels with the rows double-buffered: each warp runs L groups of R rows,
 // copying group i + 1 into shared memory (cp.async) while it decodes group i, so a warp always
 // has a group's loads in flight. Same rows and cx_dot (and the down kernel's half-warp path) as
