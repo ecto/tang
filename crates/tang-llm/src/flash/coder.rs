@@ -1226,6 +1226,7 @@ impl Coder {
                 .enumerate()
                 .map(|(i, &k)| (slot, pos + i, k))
                 .collect();
+            let w0 = Instant::now();
             self.in_wide.set(true);
             self.wide_pos0.set(pos);
             let r = self
@@ -1235,6 +1236,12 @@ impl Coder {
             self.dev.sync();
             self.in_wide.set(false);
             r?;
+            if std::env::var("TANG_WIDE_TIMES").is_ok_and(|v| v == "1") {
+                eprintln!(
+                    "wide window at {pos}+{t}: {:.1} ms",
+                    w0.elapsed().as_secs_f64() * 1e3
+                );
+            }
             pos += t;
             at += t;
         }

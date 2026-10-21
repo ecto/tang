@@ -1405,11 +1405,15 @@ pub fn spec_test(args: &[String]) -> Result<()> {
 pub fn wide_check(args: &[String]) -> Result<()> {
     let mut a = parse(args)?;
     let base = prompt_ids(&a)?;
-    let len = a.ctx.unwrap_or(1000);
-    let ids: Vec<u32> = base.iter().cycle().take(len).copied().collect();
+    // TANG_WIDE_CTXS=1000,8000,...: several prompt lengths on one load.
+    let lens: Vec<usize> = match std::env::var("TANG_WIDE_CTXS") {
+        Ok(v) => v.split(',').filter_map(|x| x.trim().parse().ok()).collect(),
+        Err(_) => vec![a.ctx.unwrap_or(1000)],
+    };
+    let longest = lens.iter().copied().max().unwrap_or(1000);
     let steps = a.n.max(4);
-    if a.opts.max_ctx < len + steps + 8 {
-        a.opts.max_ctx = (len + steps + 8).next_multiple_of(1024);
+    if a.opts.max_ctx < longest + steps + 8 {
+        a.opts.max_ctx = (longest + steps + 8).next_multiple_of(1024);
     }
     let rows: usize = std::env::var("TANG_CODER_WIDE")
         .ok()
@@ -1426,53 +1430,58 @@ pub fn wide_check(args: &[String]) -> Result<()> {
         }
         Ok((toks, lg))
     };
-    let s1 = e.alloc_slot()?;
-    let t0 = std::time::Instant::now();
-    let n1 = e.prefill_slot(s1, &ids)?;
-    let narrow = t0.elapsed().as_secs_f64();
-    let (t1, l1) = decode(&mut e, s1, n1)?;
-    e.free_slot(s1);
     let t0 = std::time::Instant::now();
     e.enable_wide(rows)?;
     println!(
         "wide kernels ({rows} rows) built in {:.1} s",
         t0.elapsed().as_secs_f64()
     );
-    let mut wide = Vec::new();
-    let mut got = None;
-    for _ in 0..2 {
-        let s2 = e.alloc_slot()?;
+    let mut all_ok = true;
+    for len in lens {
+        let ids: Vec<u32> = base.iter().cycle().take(len).copied().collect();
+        let s1 = e.alloc_slot()?;
         let t0 = std::time::Instant::now();
-        let n2 = e.prefill_wide(s2, &ids)?;
-        wide.push(t0.elapsed().as_secs_f64());
-        if got.is_none() {
-            got = Some((n2, decode(&mut e, s2, n2)?));
+        let n1 = e.prefill_slot(s1, &ids)?;
+        let narrow = t0.elapsed().as_secs_f64();
+        let (t1, l1) = decode(&mut e, s1, n1)?;
+        e.free_slot(s1);
+        let mut wide = Vec::new();
+        let mut got = None;
+        for _ in 0..2 {
+            let s2 = e.alloc_slot()?;
+            let t0 = std::time::Instant::now();
+            let n2 = e.prefill_wide(s2, &ids)?;
+            wide.push(t0.elapsed().as_secs_f64());
+            if got.is_none() {
+                got = Some((n2, decode(&mut e, s2, n2)?));
+            }
+            e.free_slot(s2);
         }
-        e.free_slot(s2);
+        let (n2, (t2, l2)) = got.unwrap();
+        let bits = l1
+            .iter()
+            .zip(&l2)
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
+        let ok = n1 == n2 && t1 == t2 && bits == 0;
+        println!(
+            "prefill {len} tokens: narrow {:.2} s ({:.0} tok/s), wide {:.2} s cold / {:.2} s warm ({:.0} tok/s)",
+            narrow,
+            len as f64 / narrow,
+            wide[0],
+            wide[1],
+            len as f64 / wide[1]
+        );
+        println!(
+            "wide-check {len}: {} (next token {}, {steps} decoded tokens {}, logits differ in {bits} of {})",
+            if ok { "PASS (bitwise)" } else { "FAIL" },
+            if n1 == n2 { "equal" } else { "DIFFERS" },
+            if t1 == t2 { "equal" } else { "DIFFER" },
+            l1.len()
+        );
+        all_ok &= ok;
     }
-    let (n2, (t2, l2)) = got.unwrap();
-    let bits = l1
-        .iter()
-        .zip(&l2)
-        .filter(|(x, y)| x.to_bits() != y.to_bits())
-        .count();
-    let ok = n1 == n2 && t1 == t2 && bits == 0;
-    println!(
-        "prefill {len} tokens: narrow {:.2} s ({:.0} tok/s), wide {:.2} s cold / {:.2} s warm ({:.0} tok/s)",
-        narrow,
-        len as f64 / narrow,
-        wide[0],
-        wide[1],
-        len as f64 / wide[1]
-    );
-    println!(
-        "wide-check: {} (next token {}, {steps} decoded tokens {}, logits differ in {bits} of {})",
-        if ok { "PASS (bitwise)" } else { "FAIL" },
-        if n1 == n2 { "equal" } else { "DIFFERS" },
-        if t1 == t2 { "equal" } else { "DIFFER" },
-        l1.len()
-    );
-    ensure!(ok, "wide-check failed");
+    ensure!(all_ok, "wide-check failed");
     Ok(())
 }
 
