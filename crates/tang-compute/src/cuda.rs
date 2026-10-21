@@ -110,7 +110,11 @@ pub enum RawCuda<'a> {
     },
     /// Repacked Q2_0 (`crate::flash::q2_repack`): `[n][k/4]` code bytes, then `[n][k/64]`
     /// fp16 scales.
-    Q2 { data: &'a CudaSlice<u8>, n: usize, k: usize },
+    Q2 {
+        data: &'a CudaSlice<u8>,
+        n: usize,
+        k: usize,
+    },
 }
 
 impl CudaBuffer {
