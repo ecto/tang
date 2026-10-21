@@ -105,6 +105,9 @@ struct Variants {
     /// Which GEMMs (`TANG_CODER_WGEMM=gu` / `down`; anything else: both). For localizing.
     wgemm_gu: bool,
     wgemm_down: bool,
+    /// Wide windows run attention tiled (`cx_attn_tile`: K/V tiles shared by a block of query
+    /// rows) instead of per-row split-K part/merge; `TANG_CODER_ATTN_TILE=0` for those.
+    attn_tile: bool,
 }
 
 impl Default for Variants {
@@ -119,6 +122,7 @@ impl Default for Variants {
             wgemm: true,
             wgemm_gu: true,
             wgemm_down: true,
+            attn_tile: true,
         }
     }
 }
@@ -137,6 +141,7 @@ impl Variants {
             wgemm: !env_is("TANG_CODER_WGEMM", "0"),
             wgemm_gu: !env_is("TANG_CODER_WGEMM", "down"),
             wgemm_down: !env_is("TANG_CODER_WGEMM", "gu"),
+            attn_tile: !env_is("TANG_CODER_ATTN_TILE", "0"),
         }
     }
 }
@@ -288,6 +293,7 @@ struct Kern {
     prep: Fun,
     part: Fun,
     merge: Fun,
+    tile: Fun,
     gdn_step: Fun,
     gdn_commit: Fun,
     gdn_step_seg: Fun,
@@ -329,6 +335,7 @@ impl Kern {
             prep: f("cx_attn_prep")?,
             part: f("cx_attn_part")?,
             merge: f("cx_attn_merge")?,
+            tile: f("cx_attn_tile")?,
             gdn_step: self.gdn_step,
             gdn_commit: self.gdn_commit,
             gdn_step_seg: self.gdn_step_seg,
@@ -880,6 +887,7 @@ impl Coder {
             prep: f(&cm, "cx_attn_prep")?,
             part: f(&cm, "cx_attn_part")?,
             merge: f(&cm, "cx_attn_merge")?,
+            tile: f(&cm, "cx_attn_tile")?,
             gdn_step: f(&fm, "fl_gdn_conv_step")?,
             gdn_commit: f(&fm, "fl_gdn_conv_commit")?,
             gdn_step_seg: f(&fm, "fl_gdn_conv_step_seg")?,
@@ -1427,6 +1435,7 @@ impl Coder {
             (k.prep, "attn_prep"),
             (k.part, "attn_part"),
             (k.merge, "attn_merge"),
+            (k.tile, "attn_tile"),
             (k.gdn_step, "gdn_conv_step"),
             (k.gdn_commit, "gdn_commit"),
             (k.gdn_step_seg, "gdn_conv_step"),
@@ -1779,6 +1788,19 @@ impl Coder {
                     hp.head_dim as u32,
                     tang_moe::args![proj, st, qn, kn, rc, rs, rows, q, kt, vt, eps],
                 );
+            }
+            if self.in_wide.get() && self.var.attn_tile {
+                let tq = 8; // CX_TQ
+                unsafe {
+                    self.launch(
+                        self.kn().tile,
+                        (t.div_ceil(tq) as u32, hp.n_head_kv as u32, 1),
+                        256,
+                        tang_moe::args![q, kt, vt, rows, t as i32, proj, st, attn],
+                    );
+                }
+                self.gemv("attn_out", &layer.w_out, attn, None, self.a(&s.mix), t, n);
+                return;
             }
             // Partials and merge a slice of rows at a time in wide windows (the partials buffer
             // holds WIDE_ATTN_ROWS rows), each slice over the chunks its last row reaches.
