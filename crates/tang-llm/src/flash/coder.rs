@@ -56,11 +56,17 @@ const ROWS_U32: usize = 6 * MAX_T;
 #[derive(Clone, Debug)]
 pub struct CoderOpts {
     pub max_ctx: usize,
+    /// An MTP sidecar GGUF (`scripts/qwen3next_mtp_sidecar.py`): its one MTP layer drafts the
+    /// next tokens. Default: `TANG_CODER_MTP`.
+    pub mtp: Option<std::path::PathBuf>,
 }
 
 impl Default for CoderOpts {
     fn default() -> Self {
-        CoderOpts { max_ctx: 8192 }
+        CoderOpts {
+            max_ctx: 8192,
+            mtp: None,
+        }
     }
 }
 
@@ -167,6 +173,90 @@ fn quantize_q8_0(v: &[f32]) -> Vec<u8> {
 }
 
 /// A dense weight for the native GEMV: one or more GGUF tensors stacked by rows.
+/// The MTP layer's index in [`Coder::lay`] (it lives outside `layers`).
+const MTP_L: usize = usize::MAX;
+
+/// The MTP layer's input (`cx_mtp_in`: `[rmsnorm(emb) * we | rmsnorm(h) * wh]` per row, grid
+/// `(t, 2)`) and its pick (`cx_mtp_pick`: argmax and its softmax probability per row of logits,
+/// grid `t`).
+const MTP_SRC: &str = r#"
+__device__ float mtp_block_sum(float v, float* red) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    __syncthreads();
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = v;
+    __syncthreads();
+    v = threadIdx.x < (blockDim.x >> 5) ? red[threadIdx.x] : 0.f;
+    if (threadIdx.x < 32)
+        for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    if (threadIdx.x == 0) red[0] = v;
+    __syncthreads();
+    return red[0];
+}
+
+extern "C" __global__ void __launch_bounds__(1024) cx_mtp_in(const float* emb, const float* h,
+        const float* we, const float* wh, float eps, int n, float* out) {
+    __shared__ float red[32];
+    const int c = blockIdx.x, half = blockIdx.y;
+    const float* src = (half ? h : emb) + (size_t)c * n;
+    const float* w = half ? wh : we;
+    float* dst = out + (size_t)c * 2 * n + (size_t)half * n;
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) ss += src[i] * src[i];
+    const float r = rsqrtf(mtp_block_sum(ss, red) / n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i] * r * w[i];
+}
+
+extern "C" __global__ void __launch_bounds__(1024) cx_mtp_pick(const float* lg, int v,
+        unsigned* ids, float* prob) {
+    __shared__ float red[32];
+    __shared__ float bm[32];
+    __shared__ int bi[32];
+    const float* row = lg + (size_t)blockIdx.x * v;
+    float m = -3.0e38f;
+    int mi = 0;
+    for (int i = threadIdx.x; i < v; i += blockDim.x)
+        if (row[i] > m) { m = row[i]; mi = i; }
+    for (int o = 16; o > 0; o >>= 1) {
+        const float om = __shfl_xor_sync(0xffffffffu, m, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, mi, o);
+        if (om > m || (om == m && oi < mi)) { m = om; mi = oi; }
+    }
+    if ((threadIdx.x & 31) == 0) { bm[threadIdx.x >> 5] = m; bi[threadIdx.x >> 5] = mi; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int w = 1; w < (blockDim.x >> 5); w++)
+            if (bm[w] > bm[0] || (bm[w] == bm[0] && bi[w] < bi[0])) { bm[0] = bm[w]; bi[0] = bi[w]; }
+    }
+    __syncthreads();
+    const float top = bm[0];
+    float se = 0.f;
+    for (int i = threadIdx.x; i < v; i += blockDim.x) se += __expf(row[i] - top);
+    se = mtp_block_sum(se, red);
+    if (threadIdx.x == 0) { ids[blockIdx.x] = (unsigned)bi[0]; prob[blockIdx.x] = 1.f / se; }
+}
+"#;
+
+/// The multi-token-prediction layer (an MTP sidecar): a gated-attention MoE layer whose input
+/// is `fc([rmsnorm(embed(next token)) | rmsnorm(final hidden)])`, its output normed and put
+/// through the model's head. Run after each window on the window's final hidden rows, then
+/// chained on its own output, it drafts the next tokens.
+struct Mtp {
+    layer: Layer,
+    fc: Dense,
+    enorm: B,
+    hnorm: B,
+    onorm: B,
+    /// Final hidden rows (normed): the last window's, then the MTP layer's own last row.
+    mh: B,
+    emb: B,
+    cat: B,
+    ids: B,
+    prob: B,
+    f_in: Fun,
+    f_pick: Fun,
+    _m: Module,
+}
+
 struct Dense {
     _w: Vec<B>,
     segs: B,
@@ -382,6 +472,16 @@ pub struct Coder {
     /// Stage sweep: enqueue only this stage's launches (`stage_sweep`).
     only: std::cell::Cell<Option<&'static str>>,
     var: Variants,
+    mtp: Option<Mtp>,
+    /// MTP pass graphs by (rows, attention chunks).
+    mtp_graphs: HashMap<(usize, usize), Graph>,
+    /// Draft with the MTP layer after each window (when loaded and greedy).
+    pub use_mtp: bool,
+    /// Chain length (`TANG_CODER_MTP_K`, default 2).
+    pub mtp_steps: usize,
+    /// The latest MTP chain: draft tokens and their probabilities, for the next verify.
+    pub mtp_last: Vec<(u32, f32)>,
+    pub last_mtp_ms: f64,
 }
 
 #[derive(Default)]
@@ -460,121 +560,20 @@ impl Coder {
             })
             .collect();
         for l in 0..hp.n_layer {
-            let t = |s: &str| format!("blk.{l}.{s}");
-            let rec = hp.is_recurrent[l];
-            let (w_in, gdn, attn) = if rec {
-                let w_in = upload_dense(
-                    &dev,
-                    &g,
-                    &[
-                        (info(&t("attn_qkv.weight"))?, None),
-                        (info(&t("attn_gate.weight"))?, None),
-                        (info(&t("ssm_ba.weight"))?, Some(&ba_perm[..])),
-                    ],
-                )?;
-                ensure!(
-                    w_in.rows == geo.gdn_b() + hv,
-                    "blk.{l} GDN input rows {}",
-                    w_in.rows
-                );
-                let gd = GdnL {
-                    conv: vecf(&t("ssm_conv1d.weight"))?,
-                    dt: vecf(&t("ssm_dt.bias"))?,
-                    a: vecf(&t("ssm_a"))?,
-                    norm: vecf(&t("ssm_norm.weight"))?,
-                    state: dev.alloc_f32(hv * 128 * 128),
-                    hist: dev.alloc_f32(3 * geo.gdn_conv()),
-                    proj: dev.alloc_f32(MAX_T * w_in.rows),
-                    stab: dev.alloc_f32(2 * MAX_SLOTS),
-                    htab: dev.alloc_f32(2 * MAX_SLOTS),
-                };
-                (w_in, Some(gd), None)
-            } else {
-                let w_in = upload_dense(
-                    &dev,
-                    &g,
-                    &[
-                        (info(&t("attn_q.weight"))?, None),
-                        (info(&t("attn_k.weight"))?, None),
-                        (info(&t("attn_v.weight"))?, None),
-                    ],
-                )?;
-                ensure!(
-                    w_in.rows == (2 * hp.n_head + 2 * hp.n_head_kv) * hp.head_dim,
-                    "blk.{l} attention input rows {}",
-                    w_in.rows
-                );
-                let at = AttnL {
-                    qn: vecf(&t("attn_q_norm.weight"))?,
-                    kn: vecf(&t("attn_k_norm.weight"))?,
-                    k: dev.alloc_bf16(max_ctx * hp.n_head_kv * hp.head_dim),
-                    v: dev.alloc_bf16(max_ctx * hp.n_head_kv * hp.head_dim),
-                    proj: dev.alloc_f32(MAX_T * w_in.rows),
-                    ktab: dev.alloc_f32(2 * MAX_SLOTS),
-                    vtab: dev.alloc_f32(2 * MAX_SLOTS),
-                };
-                (w_in, None, Some(at))
-            };
-            let w_out = upload_dense(
+            let layer = load_layer(
                 &dev,
                 &g,
-                &[(
-                    info(&t(if rec {
-                        "ssm_out.weight"
-                    } else {
-                        "attn_output.weight"
-                    }))?,
-                    None,
-                )],
+                &hp,
+                &geo,
+                &format!("blk.{l}."),
+                hp.is_recurrent[l],
+                &ba_perm,
+                max_ctx,
             )?;
-            let router = upload_dense(
-                &dev,
-                &g,
-                &[
-                    (info(&t("ffn_gate_inp.weight"))?, None),
-                    (info(&t("ffn_gate_inp_shexp.weight"))?, None),
-                ],
-            )?;
-            ensure!(router.rows == hp.n_expert + 1, "blk.{l} router rows");
-            let sh_gate = upload_experts(&dev, &g, &info(&t("ffn_gate_shexp.weight"))?)?;
-            let sh_up = upload_experts(&dev, &g, &info(&t("ffn_up_shexp.weight"))?)?;
-            let sh_down = upload_experts(&dev, &g, &info(&t("ffn_down_shexp.weight"))?)?;
-            ensure!(
-                sh_gate.w.estride as usize / sh_gate.w.row_bytes as usize == hp.n_ff_exp,
-                "blk.{l}: the shared expert's FF must equal the routed experts' ({})",
-                hp.n_ff_exp
-            );
-            let gate = upload_experts(&dev, &g, &info(&t("ffn_gate_exps.weight"))?)?;
-            let up = upload_experts(&dev, &g, &info(&t("ffn_up_exps.weight"))?)?;
-            let down = upload_experts(&dev, &g, &info(&t("ffn_down_exps.weight"))?)?;
-            for e in [&gate, &up, &down] {
+            for e in [&layer.gate, &layer.up, &layer.down] {
                 expert_bytes += e.w.estride as usize * hp.n_expert;
             }
-            layers.push(Layer {
-                attn_norm: vecf(&t("attn_norm.weight"))?,
-                post_norm: vecf(&t("post_attention_norm.weight"))?,
-                w_in,
-                w_out,
-                router,
-                r16_gu: [&gate, &up, &sh_gate, &sh_up]
-                    .iter()
-                    .map(|e| (e.w.row_bytes + 15) / 16 + 1)
-                    .max()
-                    .unwrap(),
-                r16_down: [&down, &sh_down]
-                    .iter()
-                    .map(|e| (e.w.row_bytes + 15) / 16 + 1)
-                    .max()
-                    .unwrap(),
-                sh_gate,
-                sh_up,
-                sh_down,
-                gate,
-                up,
-                down,
-                gdn,
-                attn,
-            });
+            layers.push(layer);
             if l % 8 == 7 {
                 eprintln!(
                     "coder: {} of {} layers in VRAM ({:.0} s)",
@@ -597,10 +596,36 @@ impl Coder {
             let (c, s) = fl::rope_table(max_ctx, hp.rope_base as f64);
             (dev.upload_f32(&c), dev.upload_f32(&s))
         };
+        let mtp_path = opts
+            .mtp
+            .clone()
+            .or_else(|| std::env::var_os("TANG_CODER_MTP").map(Into::into));
+        let mtp_parts = match &mtp_path {
+            Some(p) => {
+                let mg = Gguf::open(p).with_context(|| format!("MTP sidecar {}", p.display()))?;
+                let layer = load_layer(&dev, &mg, &hp, &geo, "mtp.", false, &ba_perm, max_ctx)?;
+                let fc = upload_dense(&dev, &mg, &[(mg.info("mtp.fc.weight")?.clone(), None)])?;
+                ensure!(
+                    fc.rows == hp.n_embd && fc.k == 2 * hp.n_embd,
+                    "MTP fc {}x{}",
+                    fc.rows,
+                    fc.k
+                );
+                let v = |name: &str| -> Result<B> { Ok(dev.upload_f32(&mg.tensor_f32(name)?)) };
+                Some((
+                    layer,
+                    fc,
+                    v("mtp.enorm.weight")?,
+                    v("mtp.hnorm.weight")?,
+                    v("mtp.norm.weight")?,
+                ))
+            }
+            None => None,
+        };
 
         // ---- scratch
         let n = hp.n_embd;
-        let kmax = [n, geo.gdn_v(), hp.n_head * hp.head_dim, ff_sh]
+        let kmax = [2 * n, geo.gdn_v(), hp.n_head * hp.head_dim, ff_sh]
             .into_iter()
             .max()
             .unwrap();
@@ -759,6 +784,29 @@ impl Coder {
                 .map_err(|e| anyhow!("{e}"))?;
             }
         }
+        let mtp = match mtp_parts {
+            Some((layer, fc, enorm, hnorm, onorm)) => {
+                let m = gpu
+                    .module(MTP_SRC)
+                    .map_err(|e| anyhow!("MTP kernels: {e}"))?;
+                Some(Mtp {
+                    layer,
+                    fc,
+                    enorm,
+                    hnorm,
+                    onorm,
+                    mh: dev.alloc_f32(MAX_T * n),
+                    emb: dev.alloc_f32(MAX_T * n),
+                    cat: dev.alloc_f32(MAX_T * 2 * n),
+                    ids: dev.alloc_f32(MAX_T),
+                    prob: dev.alloc_f32(MAX_T),
+                    f_in: f(&m, "cx_mtp_in")?,
+                    f_pick: f(&m, "cx_mtp_pick")?,
+                    _m: m,
+                })
+            }
+            None => None,
+        };
         let t_kernels = t2.elapsed().as_secs_f64();
 
         let mut io = Io {
@@ -827,6 +875,16 @@ impl Coder {
                 .then(|| std::cell::RefCell::new(Prof::default())),
             only: std::cell::Cell::new(None),
             var: Variants::from_env(),
+            use_mtp: mtp.is_some(),
+            mtp,
+            mtp_graphs: HashMap::new(),
+            mtp_steps: std::env::var("TANG_CODER_MTP_K")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2)
+                .clamp(1, MAX_T - 1),
+            mtp_last: Vec::new(),
+            last_mtp_ms: 0.0,
         };
         let mut c = c;
         c.write_slot_tables();
@@ -877,6 +935,23 @@ impl Coder {
             };
             self.dev.upload_into_f32(da, &wa);
             self.dev.upload_into_f32(db, &wb);
+        }
+        // The MTP layer drafts for slot 0 only.
+        let mk = self
+            .mtp
+            .as_ref()
+            .and_then(|m| m.layer.attn.as_ref())
+            .map(|at| (self.a(&at.k), self.a(&at.v)));
+        if let Some((k, v)) = mk {
+            let word = |v: u64| -> Vec<f32> {
+                let mut w = vec![0f32; 2 * MAX_SLOTS];
+                w[0] = f32::from_bits(v as u32);
+                w[1] = f32::from_bits((v >> 32) as u32);
+                w
+            };
+            let at = self.mtp.as_mut().unwrap().layer.attn.as_mut().unwrap();
+            self.dev.upload_into_f32(&mut at.ktab, &word(k));
+            self.dev.upload_into_f32(&mut at.vtab, &word(v));
         }
         self.dev.sync();
     }
@@ -1305,9 +1380,17 @@ impl Coder {
         );
     }
 
+    /// Decoder layer `l`, or the MTP layer for `MTP_L`.
+    fn lay(&self, l: usize) -> &Layer {
+        match (l, &self.mtp) {
+            (MTP_L, Some(m)) => &m.layer,
+            _ => &self.layers[l],
+        }
+    }
+
     /// Layer `l`'s mixer (input `s.x` / `s.mxq`) into `s.mix`.
     fn enqueue_mixer(&self, l: usize, t: usize, verify: bool, nchunk: usize, nseg: usize) {
-        let layer = &self.layers[l];
+        let layer = self.lay(l);
         let s = &self.s;
         let (x, xq) = (self.a(&s.x), Some(self.a(&s.mxq)));
         let eps = self.eps;
@@ -1467,7 +1550,7 @@ impl Coder {
     /// `attn_norm`, or `output_norm`) into `s.x` / `s.mxq`. `s.moe_y` gets the MoE output when
     /// `keep_y`.
     fn enqueue_moe(&self, l: usize, t: usize, next: &B, keep_y: bool) {
-        let layer = &self.layers[l];
+        let layer = self.lay(l);
         let (s, hp) = (&self.s, &self.hp);
         let (ne, kk) = (hp.n_expert, hp.n_expert_used);
         let (x, mxq) = (self.a(&s.x), self.a(&s.mxq));
@@ -1755,7 +1838,64 @@ impl Coder {
             }
         }
         self.enqueue_head(t);
+        if let Some(m) = &self.mtp {
+            self.kcopy(self.a(&m.mh), self.a(&self.s.x), t * n * 4);
+        }
         Ok(())
+    }
+
+    /// The MTP layer on `t` staged rows: input from `m.emb` (staged) and `m.mh`, attention over
+    /// `nchunk` chunks, then the head; ids and probabilities to the pinned `IDS` words, and the
+    /// last row's normed output into `m.mh` row 0 (the next chained step's input).
+    fn enqueue_mtp(&self, t: usize, nchunk: usize) {
+        let m = self.mtp.as_ref().expect("MTP layer");
+        let (s, n) = (&self.s, self.hp.n_embd);
+        self.kcopy(self.a(&s.rows), self.io_dev(Io::rows(n)), ROWS_U32 * 4);
+        self.kcopy(self.a(&m.emb), self.io_dev(Io::EMB), t * n * 4);
+        let (emb, mh, we, wh, eps, ni, cat) = (
+            self.a(&m.emb),
+            self.a(&m.mh),
+            self.a(&m.enorm),
+            self.a(&m.hnorm),
+            self.eps,
+            n as i32,
+            self.a(&m.cat),
+        );
+        unsafe {
+            self.launch(
+                m.f_in,
+                (t as u32, 2, 1),
+                1024,
+                tang_moe::args![emb, mh, we, wh, eps, ni, cat],
+            )
+        };
+        self.gemv("mtp_fc", &m.fc, cat, None, self.a(&s.r), t, n);
+        self.norm_q8(None, &m.layer.attn_norm, t);
+        self.enqueue_mixer(MTP_L, t, true, nchunk, 1);
+        self.norm_q8(Some(self.a(&s.mix)), &m.layer.post_norm, t);
+        self.enqueue_moe(MTP_L, t, &m.onorm, false);
+        let v = self.hp.n_vocab;
+        self.gemv(
+            "mtp_head",
+            &self.head,
+            self.a(&s.x),
+            Some(self.a(&s.mxq)),
+            self.a(&s.head),
+            t,
+            v,
+        );
+        let (lg, vi, ids, prob) = (self.a(&s.head), v as i32, self.a(&m.ids), self.a(&m.prob));
+        unsafe {
+            self.launch(
+                m.f_pick,
+                (t as u32, 1, 1),
+                1024,
+                tang_moe::args![lg, vi, ids, prob],
+            )
+        };
+        self.kcopy(self.io_dev(Io::IDS), ids, t * 4);
+        self.kcopy(self.io_dev(Io::IDS + 64), prob, t * 4);
+        self.kcopy(mh, self.a(&s.x) + ((t - 1) * n * 4) as u64, n * 4);
     }
 
     fn enqueue_commit(&self, t: usize) {
@@ -1795,6 +1935,92 @@ impl Coder {
         }
         rows[2 * MAX_T..2 * MAX_T + 4].copy_from_slice(&[0, t as u32, 0, t as u32]);
         Ok(())
+    }
+
+    /// The MTP layer on `next.len()` rows at positions `pos0 + 1..`: row `i` takes the final
+    /// hidden state `m.mh` holds for position `pos0 + i` and the token `next[i]` at
+    /// `pos0 + i + 1`, and guesses the token at `pos0 + i + 2`. Returns each row's guess and its
+    /// probability.
+    fn mtp_pass(&mut self, pos0: usize, next: &[u32]) -> Result<Vec<(u32, f32)>> {
+        let (t, n) = (next.len(), self.hp.n_embd);
+        ensure!((1..=MAX_T).contains(&t) && pos0 + t < self.max_ctx);
+        let emb_t = self.g.info("token_embd.weight")?.clone();
+        let emb = self.io.f32s(Io::EMB, t * n);
+        for (i, &tok) in next.iter().enumerate() {
+            let row = self.g.rows(&emb_t, tok as usize, 1)?;
+            emb[i * n..(i + 1) * n].copy_from_slice(&row);
+        }
+        let rows = self.io.u32s(Io::rows(n), ROWS_U32);
+        rows.fill(0);
+        for (i, r) in rows.iter_mut().take(t).enumerate() {
+            *r = (pos0 + 1 + i) as u32;
+        }
+        rows[2 * MAX_T..2 * MAX_T + 4].copy_from_slice(&[0, t as u32, 0, t as u32]);
+        let nchunk = self.nchunk(pos0 + t + 1);
+        if self.use_graphs && self.prof.is_none() {
+            let key = (t, nchunk);
+            if let Some(g) = self.mtp_graphs.get(&key) {
+                g.launch(&self.stream).map_err(|e| anyhow!("{e}"))?;
+            } else {
+                self.enqueue_mtp(t, nchunk);
+                self.dev.sync();
+                let out = self.mtp_read(t);
+                let stream = ManuallyDrop::new(Stream(self.dev.cu_stream()));
+                let me = self as *const Self;
+                let gr = Graph::capture(&stream, |_| {
+                    // SAFETY: `self` is not otherwise touched during capture.
+                    unsafe { &*me }.enqueue_mtp(t, nchunk);
+                    Ok(())
+                })
+                .map_err(|e| anyhow!("capture MTP T={t}: {e}"))?;
+                self.mtp_graphs.insert(key, gr);
+                return Ok(out);
+            }
+        } else {
+            self.enqueue_mtp(t, nchunk);
+        }
+        self.dev.sync();
+        Ok(self.mtp_read(t))
+    }
+
+    fn mtp_read(&self, t: usize) -> Vec<(u32, f32)> {
+        let ids = self.io.u32s(Io::IDS, t);
+        let p = self.io.f32s(Io::IDS + 64, t);
+        ids.iter().zip(p.iter()).map(|(&d, &p)| (d, p)).collect()
+    }
+
+    /// After a window over positions `pos..pos + next.len()` (whose final hidden rows `m.mh`
+    /// holds), feed the MTP layer the tokens that followed them (`next`), so its K/V cache
+    /// covers those positions; with `chain`, then draft `mtp_steps` tokens past the last one
+    /// into `mtp_last`.
+    fn mtp_after(&mut self, pos: usize, next: &[u32], chain: bool) -> Result<()> {
+        self.mtp_last.clear();
+        if self.mtp.is_none() || !self.use_mtp || !self.greedy.get() || next.is_empty() {
+            return Ok(());
+        }
+        let t0 = Instant::now();
+        let end = pos + next.len();
+        if end + self.mtp_steps + 1 >= self.max_ctx {
+            return Ok(());
+        }
+        let out = self.mtp_pass(pos, next)?;
+        if chain {
+            let mut d = *out.last().unwrap();
+            self.mtp_last.push(d);
+            for j in 1..self.mtp_steps {
+                d = self.mtp_pass(end + j - 1, &[d.0])?[0];
+                self.mtp_last.push(d);
+            }
+        }
+        self.last_mtp_ms = t0.elapsed().as_secs_f64() * 1e3;
+        Ok(())
+    }
+
+    /// After a [`window`](Self::window) over `pos0..pos0 + next.len()`: feed the MTP layer
+    /// the tokens that followed each row, drafting a chain when it reaches the sequence's end.
+    pub fn mtp_feed(&mut self, pos0: usize, next: &[u32]) -> Result<()> {
+        let end = pos0 + next.len() >= self.tokens.len();
+        self.mtp_after(pos0, next, end)
     }
 
     pub fn window(&mut self, pos0: usize, t: usize, probe: Option<&mut Probe>) -> Result<Vec<u32>> {
@@ -1944,6 +2170,12 @@ impl Coder {
                 cb(pos, t, &self.logits(t));
             }
             next = out[t - 1];
+            if self.mtp.is_some() {
+                let mut nx = self.tokens[pos + 1..pos + t].to_vec();
+                let last = pos + t == self.tokens.len();
+                nx.push(if last { next } else { self.tokens[pos + t] });
+                self.mtp_after(pos, &nx, last)?;
+            }
             pos += t;
         }
         // Profile decode only.
@@ -1962,7 +2194,9 @@ impl Coder {
         self.tokens.push(cur);
         self.tokens.extend_from_slice(drafts);
         if t == 1 {
-            return Ok(vec![self.window(pos, 1, None)?[0]]);
+            let next = self.window(pos, 1, None)?[0];
+            self.mtp_after(pos, &[next], true)?;
+            return Ok(vec![next]);
         }
         let targets = self.window_mode(pos, t, true, None)?;
         let mut n = 1;
@@ -1973,6 +2207,7 @@ impl Coder {
         self.commit(t, n)?;
         self.tokens.truncate(pos + n);
         self.last_commit_ms = tc.elapsed().as_secs_f64() * 1e3;
+        self.mtp_after(pos, &targets[..n], true)?;
         Ok(targets[..n].to_vec())
     }
 
@@ -1980,7 +2215,14 @@ impl Coder {
     pub fn step(&mut self, tok: u32) -> Result<u32> {
         self.tokens.push(tok);
         let pos = self.tokens.len() - 1;
-        Ok(self.window(pos, 1, None)?[0])
+        let next = self.window(pos, 1, None)?[0];
+        self.mtp_after(pos, &[next], true)?;
+        Ok(next)
+    }
+
+    /// An MTP layer is loaded (`CoderOpts::mtp`).
+    pub fn has_mtp(&self) -> bool {
+        self.mtp.is_some()
     }
 
     pub fn gguf(&self) -> &Gguf {
@@ -2159,6 +2401,135 @@ impl Coder {
         }
         b + dense_bytes(&self.head)
     }
+}
+
+/// One decoder layer's weights and state buffers from `g`, its tensors named `{pre}…` (a GDN
+/// layer when `rec`, else gated attention), with a K/V cache of `max_ctx`.
+#[allow(clippy::too_many_arguments)]
+fn load_layer(
+    dev: &CudaComputeDevice,
+    g: &Gguf,
+    hp: &Hparams,
+    geo: &Geometry,
+    pre: &str,
+    rec: bool,
+    ba_perm: &[usize],
+    max_ctx: usize,
+) -> Result<Layer> {
+    let info = |name: &str| -> Result<TensorInfo> { Ok(g.info(name)?.clone()) };
+    let vecf = |name: &str| -> Result<B> { Ok(dev.upload_f32(&g.tensor_f32(name)?)) };
+    let hv = hp.ssm_v_heads;
+    let t = |s: &str| format!("{pre}{s}");
+    let (w_in, gdn, attn) = if rec {
+        let w_in = upload_dense(
+            &dev,
+            &g,
+            &[
+                (info(&t("attn_qkv.weight"))?, None),
+                (info(&t("attn_gate.weight"))?, None),
+                (info(&t("ssm_ba.weight"))?, Some(&ba_perm[..])),
+            ],
+        )?;
+        ensure!(
+            w_in.rows == geo.gdn_b() + hv,
+            "{pre} GDN input rows {}",
+            w_in.rows
+        );
+        let gd = GdnL {
+            conv: vecf(&t("ssm_conv1d.weight"))?,
+            dt: vecf(&t("ssm_dt.bias"))?,
+            a: vecf(&t("ssm_a"))?,
+            norm: vecf(&t("ssm_norm.weight"))?,
+            state: dev.alloc_f32(hv * 128 * 128),
+            hist: dev.alloc_f32(3 * geo.gdn_conv()),
+            proj: dev.alloc_f32(MAX_T * w_in.rows),
+            stab: dev.alloc_f32(2 * MAX_SLOTS),
+            htab: dev.alloc_f32(2 * MAX_SLOTS),
+        };
+        (w_in, Some(gd), None)
+    } else {
+        let w_in = upload_dense(
+            &dev,
+            &g,
+            &[
+                (info(&t("attn_q.weight"))?, None),
+                (info(&t("attn_k.weight"))?, None),
+                (info(&t("attn_v.weight"))?, None),
+            ],
+        )?;
+        ensure!(
+            w_in.rows == (2 * hp.n_head + 2 * hp.n_head_kv) * hp.head_dim,
+            "{pre} attention input rows {}",
+            w_in.rows
+        );
+        let at = AttnL {
+            qn: vecf(&t("attn_q_norm.weight"))?,
+            kn: vecf(&t("attn_k_norm.weight"))?,
+            k: dev.alloc_bf16(max_ctx * hp.n_head_kv * hp.head_dim),
+            v: dev.alloc_bf16(max_ctx * hp.n_head_kv * hp.head_dim),
+            proj: dev.alloc_f32(MAX_T * w_in.rows),
+            ktab: dev.alloc_f32(2 * MAX_SLOTS),
+            vtab: dev.alloc_f32(2 * MAX_SLOTS),
+        };
+        (w_in, None, Some(at))
+    };
+    let w_out = upload_dense(
+        &dev,
+        &g,
+        &[(
+            info(&t(if rec {
+                "ssm_out.weight"
+            } else {
+                "attn_output.weight"
+            }))?,
+            None,
+        )],
+    )?;
+    let router = upload_dense(
+        &dev,
+        &g,
+        &[
+            (info(&t("ffn_gate_inp.weight"))?, None),
+            (info(&t("ffn_gate_inp_shexp.weight"))?, None),
+        ],
+    )?;
+    ensure!(router.rows == hp.n_expert + 1, "{pre} router rows");
+    let sh_gate = upload_experts(&dev, &g, &info(&t("ffn_gate_shexp.weight"))?)?;
+    let sh_up = upload_experts(&dev, &g, &info(&t("ffn_up_shexp.weight"))?)?;
+    let sh_down = upload_experts(&dev, &g, &info(&t("ffn_down_shexp.weight"))?)?;
+    ensure!(
+        sh_gate.w.estride as usize / sh_gate.w.row_bytes as usize == hp.n_ff_exp,
+        "{pre}: the shared expert's FF must equal the routed experts' ({})",
+        hp.n_ff_exp
+    );
+    let gate = upload_experts(&dev, &g, &info(&t("ffn_gate_exps.weight"))?)?;
+    let up = upload_experts(&dev, &g, &info(&t("ffn_up_exps.weight"))?)?;
+    let down = upload_experts(&dev, &g, &info(&t("ffn_down_exps.weight"))?)?;
+    Ok(Layer {
+        attn_norm: vecf(&t("attn_norm.weight"))?,
+        post_norm: vecf(&t("post_attention_norm.weight"))?,
+        w_in,
+        w_out,
+        router,
+        r16_gu: [&gate, &up, &sh_gate, &sh_up]
+            .iter()
+            .map(|e| (e.w.row_bytes + 15) / 16 + 1)
+            .max()
+            .unwrap(),
+        r16_down: [&down, &sh_down]
+            .iter()
+            .map(|e| (e.w.row_bytes + 15) / 16 + 1)
+            .max()
+            .unwrap(),
+        sh_gate,
+        sh_up,
+        sh_down,
+        gate,
+        up,
+        down,
+        gdn,
+        attn,
+    })
 }
 
 fn dense_bytes(d: &Dense) -> f64 {
@@ -2376,6 +2747,7 @@ impl Coder {
         let row = self.hp.n_head_kv * self.hp.head_dim * 2;
         self.layers
             .iter()
+            .chain(self.mtp.iter().map(|m| &m.layer))
             .filter_map(|l| l.attn.as_ref())
             .flat_map(|a| [(self.a(&a.k), row), (self.a(&a.v), row)])
             .collect()

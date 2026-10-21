@@ -290,6 +290,18 @@ impl ServeEngine for super::coder::Coder {
     fn decode_batch(&mut self, rows: &[(usize, u32)]) -> Result<Vec<u32>> {
         super::coder::Coder::decode_batch(self, rows)
     }
+    fn use_mtp(&self) -> bool {
+        self.use_mtp
+    }
+    fn mtp_last(&self) -> &[(u32, f32)] {
+        &self.mtp_last
+    }
+    fn mtp_draft(&mut self, pos0: usize, next: &[u32]) -> Result<()> {
+        super::coder::Coder::mtp_feed(self, pos0, next)
+    }
+    fn last_mtp_ms(&self) -> f64 {
+        self.last_mtp_ms
+    }
     fn draft_cost(&self) -> Vec<(usize, f32)> {
         // H200, UD-Q4_K_XL: a T=8 verify window is ~3.3x a T=1 one (each token routes to its
         // own experts), so long drafts only pay when they're very likely.
@@ -517,8 +529,13 @@ impl FlashServe {
             ..Opts::default()
         };
         let mut e: Box<dyn ServeEngine> = if super::coder::is_qwen3next(&s.gguf)? {
-            let mut c =
-                super::coder::Coder::load(&s.gguf, super::coder::CoderOpts { max_ctx: s.ctx })?;
+            let mut c = super::coder::Coder::load(
+                &s.gguf,
+                super::coder::CoderOpts {
+                    max_ctx: s.ctx,
+                    ..Default::default()
+                },
+            )?;
             eprintln!("{}", c.load_report);
             c.use_graphs = true;
             if s.batch <= 1 {
