@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Qwen3-VL GPU checks on a fresh RunPod pytorch pod, end to end, results to stdout (the pod log).
-# Pod entrypoint: bash -c "curl -fsSL https://raw.githubusercontent.com/ecto/tang/$BRANCH/crates/tang-llm/scripts/qwen3vl_pod.sh | BRANCH=$BRANCH bash"
+# Pod entrypoint (a fresh clone, not raw.githubusercontent.com, whose CDN can serve a stale copy):
+#   bash -c "git clone -q --depth 1 -b $BRANCH https://github.com/ecto/tang /root/boot && BRANCH=$BRANCH bash /root/boot/crates/tang-llm/scripts/qwen3vl_pod.sh"
 # STEPS (default "build tiny spec real") picks what runs.
 set -uo pipefail
 BRANCH=${BRANCH:-main}

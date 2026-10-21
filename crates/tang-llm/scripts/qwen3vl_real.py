@@ -135,6 +135,10 @@ def main():
     os.environ["GAIA_TF32"] = "0"
     got = tang("vl-logits", a.model, "--patches", pf, gh, gw, *ids, "--last", a.last, "--f32")
     kl_stats("tang f32 weights, no TF32", logits, got)
+    os.environ["TANG_KV_F32"] = "1"
+    got = tang("vl-logits", a.model, "--patches", pf, gh, gw, *ids, "--last", a.last, "--f32")
+    kl_stats("tang f32 weights and KV, no TF32", logits, got)
+    os.environ.pop("TANG_KV_F32")
     os.environ.pop("GAIA_TF32")
     got = tang("vl-logits", a.model, "--patches", pf, gh, gw, *ids, "--step", end + 1, "--last", a.last)
     kl_stats(f"tang prefill to {end + 1}, then decode", logits, got)
