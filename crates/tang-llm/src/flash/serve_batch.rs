@@ -92,6 +92,8 @@ pub(super) struct Stream {
     ids: Vec<u32>,
     /// Prompt tokens already in the slot (reused or prefilled).
     done_prompt: usize,
+    /// Where to save prefix states (`FlashServe::marks`) still ahead, and whether to pin each.
+    marks: Vec<(usize, bool)>,
     reused: usize,
     /// The sampled token not yet fed to the slot.
     pending: Option<u32>,
@@ -139,14 +141,36 @@ impl FlashServe {
                 (t.len() < ids.len() && ids.starts_with(t)).then_some((i, t.len()))
             })
             .max_by_key(|&(_, n)| n);
-        if let Some((i, n)) = best {
-            let s = &mut self.slots[i];
-            s.busy = true;
-            s.key = key.map(String::from);
-            s.used = self.clock;
-            return Ok((s.id, n));
+        let parked = best.map_or(0, |b| b.1);
+        // A saved prefix state (the end of a tools block or system prompt, from any session,
+        // in RAM or on disk) that reaches further: restore it into a fresh slot.
+        let limit = ids.len() - 1;
+        let mut snap = (0..self.snaps.len())
+            .filter(|&i| {
+                self.snaps[i].tokens.len() <= limit && ids.starts_with(&self.snaps[i].tokens)
+            })
+            .max_by_key(|&i| self.snaps[i].tokens.len());
+        if snap.is_none() && parked == 0 {
+            if let Some(sn) = self.load_disk(ids, limit).filter(|s| !s.tokens.is_empty()) {
+                eprintln!(
+                    "tang-llm: read the prefix state at {} from disk",
+                    sn.tokens.len()
+                );
+                self.snaps.push(sn);
+                snap = Some(self.snaps.len() - 1);
+            }
         }
-        // A miss: say how close the nearest parked slot came, so a client changing early tokens
+        let snap_len = snap.map_or(0, |i| self.snaps[i].tokens.len());
+        if snap_len <= parked {
+            if let Some((i, n)) = best {
+                let s = &mut self.slots[i];
+                s.busy = true;
+                s.key = key.map(String::from);
+                s.used = self.clock;
+                return Ok((s.id, n));
+            }
+        }
+        // No parked slot extends: say how close the nearest one came, so a client changing early tokens
         // (or a template re-rendering an earlier turn) shows up in the log.
         if let Some((id, common, len)) = self
             .slots
@@ -187,6 +211,22 @@ impl FlashServe {
             key: key.map(String::from),
             used: self.clock,
         });
+        if let Some(i) = snap.filter(|_| snap_len > parked) {
+            self.snaps[i].used = self.clock;
+            self.snaps[i].at = crate::retention::now();
+            let (sn, e) = (&self.snaps[i], &mut self.e);
+            let restored = sn
+                .pos
+                .iter()
+                .try_for_each(|p| e.restore_positional_at(id, p, 0))
+                .and_then(|()| e.restore_running_at(id, &sn.state, &sn.tokens));
+            match restored {
+                Ok(()) => return Ok((id, snap_len)),
+                // A state from another configuration (say, saved without the MTP layer):
+                // prefill instead.
+                Err(e) => eprintln!("tang-llm: prefix state at {snap_len} not restored: {e}"),
+            }
+        }
         Ok((id, 0))
     }
 
@@ -194,6 +234,7 @@ impl FlashServe {
         self.expire_memory();
         let t0 = Instant::now();
         let (ids, text, _spliced) = self.prompt(req)?;
+        self.record_warm(req);
         ensure!(
             ids.len() + 1 < self.ctx,
             "prompt is {} tokens; the context window is {}",
@@ -207,6 +248,8 @@ impl FlashServe {
             );
         }
         let (slot, reused) = self.take_slot(&ids, req.cache_key.as_deref())?;
+        let mut marks = self.marks(&ids, &text);
+        marks.retain(|&(p, _)| p > reused);
         let limit = req
             .max_tokens
             .unwrap_or(usize::MAX)
@@ -221,6 +264,7 @@ impl FlashServe {
             slot,
             key: req.cache_key.clone(),
             done_prompt: reused,
+            marks,
             reused,
             ids,
             pending: None,
@@ -337,6 +381,11 @@ impl FlashServe {
         for (i, n) in prefill_plan(&waiting, decoding, self.prefill_debt) {
             let l = &mut lanes[i];
             let s = l.stream.downcast_mut::<Stream>().expect("a flash stream");
+            // Stop at the next prefix-state mark, to save the state there.
+            let n = s
+                .marks
+                .first()
+                .map_or(n, |&(m, _)| n.min(m - s.done_prompt));
             let t = Instant::now();
             let next = self
                 .e
@@ -347,6 +396,16 @@ impl FlashServe {
                 self.prefill_debt += dt;
             }
             s.done_prompt += n;
+            if let Some(&(_, pinned)) = s.marks.first().filter(|m| m.0 == s.done_prompt) {
+                s.marks.remove(0);
+                let t = Instant::now();
+                let slot = s.slot;
+                self.snapshot_at(slot, pinned)?;
+                let s = lanes[i].stream.downcast_mut::<Stream>().unwrap();
+                s.prefill_s += t.elapsed().as_secs_f64();
+            }
+            let l = &mut lanes[i];
+            let s = l.stream.downcast_mut::<Stream>().expect("a flash stream");
             if s.done_prompt == s.ids.len() {
                 if s.prefill_only {
                     s.finish = Some(Finish::Stop);

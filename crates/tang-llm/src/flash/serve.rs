@@ -139,6 +139,23 @@ pub trait ServeEngine {
     fn decode_batch(&mut self, _rows: &[(usize, u32)]) -> Result<Vec<u32>> {
         bail!("this engine has no sequence slots")
     }
+    /// [`save_running`](Self::save_running) of a sequence slot (0: the single sequence).
+    fn save_running_at(&mut self, slot: usize) -> Result<RunningState> {
+        ensure!(slot == 0, "this engine has no sequence slots");
+        self.save_running()
+    }
+    fn restore_running_at(&mut self, slot: usize, s: &RunningState, prefix: &[u32]) -> Result<()> {
+        ensure!(slot == 0, "this engine has no sequence slots");
+        self.restore_running(s, prefix)
+    }
+    fn save_positional_at(&mut self, slot: usize, from: usize, to: usize) -> Result<Positional> {
+        ensure!(slot == 0, "this engine has no sequence slots");
+        self.save_positional(from, to)
+    }
+    fn restore_positional_at(&mut self, slot: usize, p: &Positional, from: usize) -> Result<()> {
+        ensure!(slot == 0, "this engine has no sequence slots");
+        self.restore_positional(p, from)
+    }
     /// One verify window for several slots: `(slot, token, drafts)` each; returns each one's
     /// kept tokens (`Coder::verify_batch`).
     fn verify_batch(&mut self, _items: &[(usize, u32, Vec<u32>)]) -> Result<Vec<Vec<u32>>> {
@@ -298,6 +315,18 @@ impl ServeEngine for super::coder::Coder {
     }
     fn decode_batch(&mut self, rows: &[(usize, u32)]) -> Result<Vec<u32>> {
         super::coder::Coder::decode_batch(self, rows)
+    }
+    fn save_running_at(&mut self, slot: usize) -> Result<RunningState> {
+        super::coder::Coder::save_running_at(self, slot)
+    }
+    fn restore_running_at(&mut self, slot: usize, s: &RunningState, prefix: &[u32]) -> Result<()> {
+        super::coder::Coder::restore_running_at(self, slot, s, prefix)
+    }
+    fn save_positional_at(&mut self, slot: usize, from: usize, to: usize) -> Result<Positional> {
+        super::coder::Coder::save_positional_at(self, slot, from, to)
+    }
+    fn restore_positional_at(&mut self, slot: usize, p: &Positional, from: usize) -> Result<()> {
+        super::coder::Coder::restore_positional_at(self, slot, p, from)
     }
     fn verify_batch(&mut self, items: &[(usize, u32, Vec<u32>)]) -> Result<Vec<Vec<u32>>> {
         super::coder::Coder::verify_batch(self, items)
@@ -853,31 +882,41 @@ impl FlashServe {
 
     /// Keep a copy of the running state after `tokens` (the engine's sequence now).
     fn snapshot(&mut self, pinned: bool) -> Result<()> {
+        self.snapshot_at(0, pinned)
+    }
+
+    /// Save sequence slot `slot`'s state (after its tokens) as a reusable prefix state.
+    pub(super) fn snapshot_at(&mut self, slot: usize, pinned: bool) -> Result<()> {
+        let toks: Vec<u32> = if slot == 0 {
+            self.e.tokens().clone()
+        } else {
+            self.e.slot_tokens(slot).to_vec()
+        };
         self.clock += 1;
         let clock = self.clock;
-        if let Some(s) = self.snaps.iter_mut().find(|s| s.tokens == *self.e.tokens()) {
+        if let Some(s) = self.snaps.iter_mut().find(|s| s.tokens == toks) {
             s.used = clock;
             s.at = crate::retention::now();
             s.pinned |= pinned;
             return Ok(());
         }
         let t = Instant::now();
-        let state = self.e.save_running()?;
-        let n = self.e.tokens().len();
+        let state = self.e.save_running_at(slot)?;
+        let n = toks.len();
         // Only the positions past the longest saved state this one extends are copied.
         let base = (0..self.snaps.len())
-            .filter(|&i| self.e.tokens().starts_with(&self.snaps[i].tokens))
+            .filter(|&i| toks.starts_with(&self.snaps[i].tokens))
             .max_by_key(|&i| self.snaps[i].tokens.len());
         let (mut pos, from) = match base {
             Some(i) => (self.snaps[i].pos.clone(), self.snaps[i].tokens.len()),
             None => (Vec::new(), 0),
         };
         if from < n {
-            pos.push(Arc::new(self.e.save_positional(from, n)?));
+            pos.push(Arc::new(self.e.save_positional_at(slot, from, n)?));
         }
-        let tokens = self.e.tokens().clone();
+        let tokens = toks;
         if pinned && self.disk_path(&tokens).is_some_and(|p| !p.exists()) {
-            let full = self.e.save_positional(0, n)?;
+            let full = self.e.save_positional_at(slot, 0, n)?;
             self.save_disk(&tokens, &state, &full);
         }
         self.line.snap_ms += t.elapsed().as_secs_f64() * 1e3;
@@ -1176,34 +1215,8 @@ impl FlashServe {
             }
         }
         self.line.restore_ms = t.elapsed().as_secs_f64() * 1e3;
-        // Where to save states: the end of the system prompt (the second `<|im_start|>`) and
-        // the last turn boundary (the last one, which opens the generation prompt).
-        let starts: Vec<usize> = ids
-            .iter()
-            .enumerate()
-            .filter(|(_, &t)| t == self.im_start)
-            .map(|(i, _)| i)
-            .collect();
-        let mut marks: Vec<(usize, bool)> = Vec::new();
-        // The end of the tools block, which the template puts before the system text (that
-        // has the working directory in it): the same for every session of a client.
-        if let Some(i) = text.find("</IMPORTANT>").filter(|&i| i < 200_000) {
-            if let Ok(head) = self.encode(&text[..i + "</IMPORTANT>".len()]) {
-                if head.len() > 1 && ids.starts_with(&head[..head.len() - 1]) {
-                    // The last token may merge with what follows; stop one short.
-                    marks.push((head.len() - 1, true));
-                }
-            }
-        }
-        if let Some(&p) = starts.get(1) {
-            marks.push((p, true));
-        }
-        if let Some(&p) = starts.last() {
-            marks.push((p, false));
-        }
-        marks.sort_by_key(|m| m.0);
-        marks.retain(|&(p, _)| p > start && p < ids.len());
-        marks.dedup_by_key(|m| m.0);
+        let mut marks = self.marks(ids, text);
+        marks.retain(|&(p, _)| p > start);
         // The MTP only over the prompt's last positions (`TANG_FLASH_MTP_PREFILL`, default 512).
         let mtp_from = ids.len().saturating_sub(
             std::env::var("TANG_FLASH_MTP_PREFILL")
@@ -1598,6 +1611,40 @@ impl FlashServe {
 }
 
 impl FlashServe {
+    /// Where to save prefix states in prompt `ids` (rendered from `text`), in order, with
+    /// whether to pin each: the end of the tools block, the end of the system prompt (the second
+    /// `<|im_start|>`) and the last turn boundary (the last one, which opens the generation
+    /// prompt).
+    pub(super) fn marks(&self, ids: &[u32], text: &str) -> Vec<(usize, bool)> {
+        let starts: Vec<usize> = ids
+            .iter()
+            .enumerate()
+            .filter(|(_, &t)| t == self.im_start)
+            .map(|(i, _)| i)
+            .collect();
+        let mut marks: Vec<(usize, bool)> = Vec::new();
+        // The end of the tools block, which the template puts before the system text (that
+        // has the working directory in it): the same for every session of a client.
+        if let Some(i) = text.find("</IMPORTANT>").filter(|&i| i < 200_000) {
+            if let Ok(head) = self.encode(&text[..i + "</IMPORTANT>".len()]) {
+                if head.len() > 1 && ids.starts_with(&head[..head.len() - 1]) {
+                    // The last token may merge with what follows; stop one short.
+                    marks.push((head.len() - 1, true));
+                }
+            }
+        }
+        if let Some(&p) = starts.get(1) {
+            marks.push((p, true));
+        }
+        if let Some(&p) = starts.last() {
+            marks.push((p, false));
+        }
+        marks.sort_by_key(|m| m.0);
+        marks.retain(|&(p, _)| p > 0 && p < ids.len());
+        marks.dedup_by_key(|m| m.0);
+        marks
+    }
+
     /// Record `req`'s tools block for the learned pre-warm (see [`Settings::warm_dir`]): a
     /// body with just its tools and a placeholder turn, once per distinct tool set.
     fn record_warm(&self, req: &Request) {

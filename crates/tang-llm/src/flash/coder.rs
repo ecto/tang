@@ -2979,20 +2979,56 @@ impl Coder {
     /// Copy the running state out: every GDN layer's recurrent state and conv history (the
     /// attention K/V is positional, see [`save_positional`](Self::save_positional)).
     pub fn save_running(&mut self) -> Result<super::engine::RunningState> {
+        self.save_running_at(0)
+    }
+
+    /// Slot `slot`'s GDN state and conv history buffers, per GDN layer.
+    fn running_bufs(&self, slot: usize) -> Result<Vec<(&B, &B)>> {
+        if slot == 0 {
+            return Ok(self
+                .layers
+                .iter()
+                .filter_map(|l| l.gdn.as_ref())
+                .map(|g| (&g.state, &g.hist))
+                .collect());
+        }
+        let sl = self.slots[slot]
+            .as_ref()
+            .ok_or_else(|| anyhow!("slot {slot} isn't allocated"))?;
+        Ok(sl
+            .gdn
+            .iter()
+            .filter_map(|x| x.as_ref())
+            .map(|(a, b)| (a, b))
+            .collect())
+    }
+
+    /// Slot `slot`'s recurrent state (after its tokens), to resume it later in any slot.
+    pub fn save_running_at(&mut self, slot: usize) -> Result<super::engine::RunningState> {
         self.dev.sync();
         let mut parts = Vec::new();
-        for g in self.layers.iter().filter_map(|l| l.gdn.as_ref()) {
-            parts.push(self.dev.download(&g.state));
-            parts.push(self.dev.download(&g.hist));
+        for (st, hist) in self.running_bufs(slot)? {
+            parts.push(self.dev.download(st));
+            parts.push(self.dev.download(hist));
         }
         let n = parts.len() / 2;
         parts.push(Vec::new());
-        super::engine::RunningState::from_parts(self.tokens.len(), n, parts)
+        super::engine::RunningState::from_parts(self.slot_tokens(slot).len(), n, parts)
     }
 
     /// Resume at `s.pos` with `prefix` (the `s.pos` tokens `s` was saved after).
     pub fn restore_running(
         &mut self,
+        s: &super::engine::RunningState,
+        prefix: &[u32],
+    ) -> Result<()> {
+        self.restore_running_at(0, s, prefix)
+    }
+
+    /// [`restore_running`](Self::restore_running) into slot `slot`.
+    pub fn restore_running_at(
+        &mut self,
+        slot: usize,
         s: &super::engine::RunningState,
         prefix: &[u32],
     ) -> Result<()> {
@@ -3003,43 +3039,69 @@ impl Coder {
             s.pos
         );
         let parts = s.parts();
-        let gdn: Vec<&mut GdnL> = self
-            .layers
-            .iter_mut()
-            .filter_map(|l| l.gdn.as_mut())
+        let bufs: Vec<(u64, u64)> = self
+            .running_bufs(slot)?
+            .into_iter()
+            .map(|(a, b)| (self.a(a), self.a(b)))
             .collect();
         ensure!(
-            s.gdn_layers() == gdn.len() && parts.len() == 2 * gdn.len() + 1,
+            s.gdn_layers() == bufs.len() && parts.len() == 2 * bufs.len() + 1,
             "state is for another model"
         );
         self.dev.sync();
-        for (i, g) in gdn.into_iter().enumerate() {
-            self.dev.upload_into_f32(&mut g.state, parts[2 * i]);
-            self.dev.upload_into_f32(&mut g.hist, parts[2 * i + 1]);
+        for (i, (st, hist)) in bufs.into_iter().enumerate() {
+            for (addr, host) in [(st, parts[2 * i]), (hist, parts[2 * i + 1])] {
+                htod(addr, bytemuck_f32(host))?;
+            }
         }
         self.dev.sync();
-        self.tokens.clear();
-        self.tokens.extend_from_slice(prefix);
+        let toks = self.slot_tokens_mut(slot)?;
+        toks.clear();
+        toks.extend_from_slice(prefix);
         Ok(())
     }
 
-    /// The positional buffers (attention K and V per layer): device address, bytes a position.
-    fn positional_bufs(&self) -> Vec<(u64, usize)> {
+    /// The positional buffers (attention K and V per layer, and the MTP layer's) of slot
+    /// `slot`: device address, bytes a position.
+    fn positional_bufs_at(&self, slot: usize) -> Result<Vec<(u64, usize)>> {
         let row = self.hp.n_head_kv * self.hp.head_dim * 2;
-        self.layers
+        if slot == 0 {
+            return Ok(self
+                .layers
+                .iter()
+                .chain(self.mtp.iter().map(|m| &m.layer))
+                .filter_map(|l| l.attn.as_ref())
+                .flat_map(|a| [(self.a(&a.k), row), (self.a(&a.v), row)])
+                .collect());
+        }
+        let sl = self.slots[slot]
+            .as_ref()
+            .ok_or_else(|| anyhow!("slot {slot} isn't allocated"))?;
+        Ok(sl
+            .kv
             .iter()
-            .chain(self.mtp.iter().map(|m| &m.layer))
-            .filter_map(|l| l.attn.as_ref())
-            .flat_map(|a| [(self.a(&a.k), row), (self.a(&a.v), row)])
-            .collect()
+            .filter_map(|x| x.as_ref())
+            .chain(sl.mtp_kv.iter())
+            .flat_map(|(k, v)| [(self.a(k), row), (self.a(v), row)])
+            .collect())
     }
 
     /// Copy positions `from..to` of the positional state out.
     pub fn save_positional(&mut self, from: usize, to: usize) -> Result<super::engine::Positional> {
+        self.save_positional_at(0, from, to)
+    }
+
+    /// [`save_positional`](Self::save_positional) of slot `slot`.
+    pub fn save_positional_at(
+        &mut self,
+        slot: usize,
+        from: usize,
+        to: usize,
+    ) -> Result<super::engine::Positional> {
         ensure!(from <= to && to <= self.max_ctx);
         self.dev.sync();
         let mut bufs = Vec::new();
-        for (addr, row) in self.positional_bufs() {
+        for (addr, row) in self.positional_bufs_at(slot)? {
             let mut host = vec![0u8; (to - from) * row];
             if !host.is_empty() {
                 let r = unsafe {
@@ -3061,7 +3123,17 @@ impl Coder {
 
     /// Write positions `from.max(p.from)..p.to` of `p` back.
     pub fn restore_positional(&mut self, p: &super::engine::Positional, from: usize) -> Result<()> {
-        let bufs = self.positional_bufs();
+        self.restore_positional_at(0, p, from)
+    }
+
+    /// [`restore_positional`](Self::restore_positional) into slot `slot`.
+    pub fn restore_positional_at(
+        &mut self,
+        slot: usize,
+        p: &super::engine::Positional,
+        from: usize,
+    ) -> Result<()> {
+        let bufs = self.positional_bufs_at(slot)?;
         ensure!(
             bufs.len() == p.parts().len(),
             "positional state is for another model"
@@ -3074,18 +3146,10 @@ impl Coder {
                 "positional state size differs"
             );
             if p.to > from {
-                let src = &host[(from - p.from) * row..];
-                let r = unsafe {
-                    cudarc::driver::sys::cuMemcpyHtoD_v2(
-                        addr + (from * row) as u64,
-                        src.as_ptr() as *const _,
-                        (p.to - from) * row,
-                    )
-                };
-                ensure!(
-                    r == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
-                    "cuMemcpyHtoD: {r:?}"
-                );
+                htod(
+                    addr + (from * row) as u64,
+                    &host[(from - p.from) * row..(p.to - p.from) * row],
+                )?;
             }
         }
         Ok(())
@@ -3131,4 +3195,23 @@ impl Coder {
         self.reset();
         Ok(())
     }
+}
+
+/// Copy `src` from the host to device address `addr`.
+fn htod(addr: u64, src: &[u8]) -> Result<()> {
+    if src.is_empty() {
+        return Ok(());
+    }
+    let r =
+        unsafe { cudarc::driver::sys::cuMemcpyHtoD_v2(addr, src.as_ptr() as *const _, src.len()) };
+    ensure!(
+        r == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+        "cuMemcpyHtoD: {r:?}"
+    );
+    Ok(())
+}
+
+/// `v`'s bytes.
+fn bytemuck_f32(v: &[f32]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
 }
