@@ -508,8 +508,13 @@ pub fn load_inputs<'a>(
 
 /// Prefill chunk sizes a [`Session`] builds programs for (largest first);
 /// a remainder below the smallest goes through decode steps.
-/// `QWEN_PREFILL_CHUNKS=64,8` (the default) overrides.
-fn chunk_sizes() -> Vec<usize> {
+/// `QWEN_PREFILL_CHUNKS=64,8` overrides. Default `64,8`; on OpenCL
+/// `64,32,16,8,4,2`: a voice turn's ~20 new tokens run as 16 + 4 (two
+/// prefill runs) instead of 8 + 8 and four decode steps (each a full pass
+/// over the weights at decode speed, ~55 ms on the K1), and a tail never
+/// needs more than one decode step. Each extra size is one more program
+/// per window (its own intermediates: ~0.55 MB per token for Qwen3-1.7B).
+fn chunk_sizes(rt: &Runtime) -> Vec<usize> {
     std::env::var("QWEN_PREFILL_CHUNKS")
         .ok()
         .map(|v| {
@@ -518,7 +523,13 @@ fn chunk_sizes() -> Vec<usize> {
                 .collect::<Vec<usize>>()
         })
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| vec![64, 8])
+        .unwrap_or_else(|| {
+            if rt.kind() == BackendKind::OpenCl {
+                vec![64, 32, 16, 8, 4, 2]
+            } else {
+                vec![64, 8]
+            }
+        })
 }
 
 /// The attention window of a prefill reaching position `end`: a power of
@@ -676,7 +687,7 @@ impl Session {
     /// Build the prefill programs a prompt of up to `end` positions uses
     /// (compile time off the first turn).
     pub fn warm(&mut self, end: usize) {
-        for seq in chunk_sizes() {
+        for seq in chunk_sizes(&self.rt) {
             let mut w = 512;
             while w <= window(end, self.dims.ctx) {
                 self.step_for(seq, w);
@@ -715,7 +726,7 @@ impl Session {
         // the last prompt token is always run: its logits pick the reply
         lcp = lcp.min(tokens.len() - 1);
         let mut p = lcp;
-        let sizes = chunk_sizes();
+        let sizes = chunk_sizes(&self.rt);
         while p < tokens.len() {
             let left = tokens.len() - p;
             match sizes.iter().copied().find(|&s| s <= left) {
@@ -1180,6 +1191,42 @@ pub fn prefill_bench(dir: &str, sizes: &[usize], gen: usize, check: bool) -> Vec
             "prefill {seq:4} tokens: {ms:8.1} ms device ({:6.0} tok/s), {:.0} MB own buffers",
             seq as f64 * 1e3 / ms,
             s.bytes as f64 / 1e6
+        );
+    }
+    // a voice turn: 20 new tokens after the largest prompt, split as a
+    // Session splits them (QWEN_PREFILL_CHUNKS), device time summed
+    if max + 20 < ctx {
+        let (mut p, mut ms, mut parts) = (max, 0.0, Vec::new());
+        let ladder = chunk_sizes(&rt);
+        let turn: Vec<usize> = (0..max + 20).map(|i| ids[i % max]).collect();
+        while p < max + 20 {
+            let left = max + 20 - p;
+            match ladder.iter().copied().find(|&c| c <= left) {
+                Some(seq) => {
+                    let s = Step::new(
+                        &rt,
+                        &dims,
+                        seq,
+                        window(p + seq, ctx),
+                        &|dg| vec![Vec::new(); dg.inputs.len()],
+                        Some(&dec),
+                    );
+                    s.prefill(&rt, &turn[p..p + seq], p);
+                    ms += s.prog.time(&rt, 5);
+                    parts.push(seq.to_string());
+                    p += seq;
+                }
+                None => {
+                    dec.set_state(&rt, turn[p], p);
+                    ms += dec.prog.time(&rt, 5);
+                    parts.push("1 (decode)".into());
+                    p += 1;
+                }
+            }
+        }
+        println!(
+            "turn: 20 new tokens after {max} as {}: {ms:.1} ms device",
+            parts.join(" + ")
         );
     }
     // decode after a prefill of the largest size
