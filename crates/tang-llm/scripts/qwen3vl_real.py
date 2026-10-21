@@ -85,9 +85,8 @@ def main():
     hf_embeds = vout.pooler_output.float().cpu().numpy()
     hf_ds = [d.float().cpu().numpy() for d in vout.deepstack_features]
     text_msgs = [{"role": "user", "content": "Write a Python function that returns the n-th Fibonacci number, with a docstring."}]
-    text_ids = proc.tokenizer.apply_chat_template(text_msgs, add_generation_prompt=True, tokenize=True)
-    if isinstance(text_ids, dict):
-        text_ids = text_ids["input_ids"]
+    text_ids = proc.tokenizer(proc.apply_chat_template(text_msgs, add_generation_prompt=True, tokenize=False),
+                              add_special_tokens=False)["input_ids"]
     with torch.no_grad():
         text_logits = model(input_ids=torch.tensor([text_ids], device="cuda")).logits[0].float().cpu().numpy()
         logits = model(**inputs).logits[0, -a.last:].float().cpu().numpy()
