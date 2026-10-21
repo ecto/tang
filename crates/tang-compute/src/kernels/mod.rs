@@ -54,3 +54,6 @@ pub mod flash_cuda;
 
 #[cfg(feature = "cuda")]
 pub mod native_cuda;
+
+#[cfg(feature = "cuda")]
+pub mod moe_cuda;

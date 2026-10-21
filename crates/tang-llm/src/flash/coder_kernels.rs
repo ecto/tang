@@ -24,7 +24,7 @@ pub fn prelude(c: &Shapes) -> String {
         ff = c.ff,
         topk = c.topk,
         ne = c.n_expert,
-        np = super::coder::MAX_T * c.topk,
+        np = super::coder::MAX_T * (c.topk + 1),
         chunk = ATTN_CHUNK,
     )
 }
@@ -70,20 +70,63 @@ __device__ float cx_bsum(float v, float* sh) {
     return s;
 }
 
-// r += y (when add), then x = rmsnorm(r) * w. Grid t, block 256.
-extern "C" __global__ void cx_add_norm(float* r, const float* y, const float* w, float* x, int n, float eps, int add) {
+// x = rmsnorm(r) * w and its int8 codes xq (fe_q8's layout and rule: codes [XQ8_T][n], then
+// per-32 f32 scales), after r += y when `add`. Grid t, block 1024 (or 256); n % blockDim == 0, n <= 16 blockDim.
+__device__ void norm_q8_body(float* rt, float (&v)[16], int nv, const float* w, float* x, unsigned char* xq,
+                             int n, float eps, int t) {
     __shared__ float sh[32];
-    const int t = blockIdx.x;
-    float* rt = r + (size_t)t * n;
     float ss = 0.f;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        float v = rt[i];
-        if (add) { v += y[(size_t)t * n + i]; rt[i] = v; }
-        ss = fmaf(v, v, ss);
-    }
+    for (int j = 0; j < nv; j++) ss = fmaf(v[j], v[j], ss);
     ss = cx_bsum(ss, sh);
     const float inv = 1.0f / sqrtf(ss / (float)n + eps);
-    for (int i = threadIdx.x; i < n; i += blockDim.x) x[(size_t)t * n + i] = rt[i] * inv * w[i];
+    const int lane = threadIdx.x & 31;
+    float* xd = (float*)(xq + (size_t)XQ8_T * n);
+    for (int j = 0; j < nv; j++) {
+        const int i = threadIdx.x + j * blockDim.x;
+        const float y = v[j] * inv * w[i];
+        x[(size_t)t * n + i] = y;
+        float amax = fabsf(y);
+        for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        const float d = amax / 127.0f;
+        const int q = d == 0.f ? 0 : (int)fminf(fmaxf(roundf(y / d), -127.f), 127.f);
+        xq[(size_t)t * n + i] = (unsigned char)(signed char)q;
+        if (lane == 0) xd[t * (n / 32) + i / 32] = d;
+    }
+}
+extern "C" __global__ void cx_norm_q8(float* r, const float* y, const float* w, float* x, unsigned char* xq,
+                                      int n, float eps, int add) {
+    const int t = blockIdx.x, nv = n / blockDim.x;
+    float* rt = r + (size_t)t * n;
+    float v[16];
+    for (int j = 0; j < nv; j++) {
+        const int i = threadIdx.x + j * blockDim.x;
+        float a = rt[i];
+        if (add) { a += y[(size_t)t * n + i]; rt[i] = a; }
+        v[j] = a;
+    }
+    norm_q8_body(rt, v, nv, w, x, xq, n, eps, t);
+}
+
+// r += Σ_k w_k parts[t·K + k] (rank order) + sigmoid(lg[t][NE]) parts[T·K + t] (the shared
+// expert), y (when given) gets that sum alone; then x, xq = the next norm of r (as
+// cx_norm_q8). Grid t, block 1024.
+extern "C" __global__ void cx_moe_add_norm(float* r, const float* parts, const float* wts, const float* lg, int ls,
+                                           int T, float* y, const float* w, float* x, unsigned char* xq, float eps) {
+    const int t = blockIdx.x, n = CX_HID, nv = CX_HID / (int)blockDim.x;
+    float* rt = r + (size_t)t * n;
+    const float g = sigm_f(lg[(size_t)t * ls + CX_NE]);
+    float v[16];
+    for (int j = 0; j < nv; j++) {
+        const int i = threadIdx.x + j * blockDim.x;
+        float acc = 0.f;
+        for (int k = 0; k < CX_TOPK; k++) acc += wts[t * CX_TOPK + k] * parts[((size_t)t * CX_TOPK + k) * n + i];
+        acc += g * parts[((size_t)T * CX_TOPK + t) * n + i];
+        if (y) y[(size_t)t * n + i] = acc;
+        const float a = rt[i] + acc;
+        rt[i] = a;
+        v[j] = a;
+    }
+    norm_q8_body(rt, v, nv, w, x, xq, n, eps, t);
 }
 
 // Softmax over the router logits, top CX_TOPK (ties to the lower id), renormalised in f64.
@@ -100,9 +143,8 @@ extern "C" __global__ void cx_route(const float* lg, int ls, unsigned* ids, floa
         mx = fmaxf(mx, v[i]);
     }
     for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
-    double sum = 0.0;
-    for (int i = 0; i < PER; i++) if (lane + 32 * i < CX_NE) sum += exp((double)v[i] - (double)mx);
-    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    // p_e = exp(l_e - max) / sum over all e; renormalised over the top-k the sum cancels.
+    const double sum = 1.0;
     unsigned used = 0;
     unsigned my_id = 0;
     double my_p = 0.0, wsum = 0.0;
@@ -123,7 +165,7 @@ extern "C" __global__ void cx_route(const float* lg, int ls, unsigned* ids, floa
         wsum += p;
         if (lane == k) { my_id = (unsigned)bi; my_p = p; }
     }
-    wsum = fmax(wsum, 6.103515625e-5);
+    // (flash-ref clamps Σ top p at 6.1e-5; the top-1 term alone is p_max / sum >= 1 / NE here.)
     if (lane < CX_TOPK) {
         float w = (float)(my_p / wsum);
         if (scale != 0.f && scale != 1.f) w *= scale;
@@ -172,24 +214,50 @@ __device__ __forceinline__ float cx_dot(int ty, const unsigned char* w, const un
 
 struct ExW { unsigned long long base; unsigned long long estride; int ty; int row_bytes; };
 
-// Routed experts' gate and up rows for each (token, rank) pair p = t * TOPK + k: out[p][r],
-// r < FF gate, else up. xq: the fe_q8 layout of the window's MoE input (XQ8_T rows).
-// Grid (2 FF / 8, t * TOPK), block 256 (a warp per row).
-extern "C" __global__ void cx_moe_gu(ExW g, ExW u, const unsigned* ids, const unsigned char* xq, float* out) {
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int r = blockIdx.x * 8 + warp, p = blockIdx.y, t = p / CX_TOPK;
-    if (r >= 2 * CX_FF) return;
-    const unsigned e = ids[p];
-    const ExW& m = r < CX_FF ? g : u;
-    const int rr = r < CX_FF ? r : r - CX_FF;
-    const unsigned char* w = (const unsigned char*)m.base + (size_t)e * m.estride + (size_t)rr * m.row_bytes;
+// Stage `nb` bytes at `src` into this warp's shared buffer with aligned 16-byte loads; returns
+// the row's first byte there.
+__device__ __forceinline__ const unsigned char* cx_stage(const unsigned char* src, int nb, uint4* sm, int lane) {
+    const unsigned long long a = (unsigned long long)src & ~15ull;
+    const int delta = (int)((unsigned long long)src - a);
+    const int n16 = (delta + nb + 15) >> 4;
+    for (int i = lane; i < n16; i += 32) sm[i] = __ldg((const uint4*)a + i);
+    return (const unsigned char*)sm + delta;
+}
+
+// Experts' gate and up rows, two rows a warp (both staged in shared memory before either is
+// decoded), 8 warps a block. Pairs p < T·K are (token p / K, rank p % K) with the routed expert
+// ids[p]; p >= T·K is the shared expert for token p − T·K. out[p][r]: r < FF gate, else up.
+// Grid (2 FF / 16, T · (K + 1)), block 256, dynamic smem 16 × r16 × 16 bytes.
+extern "C" __global__ void __launch_bounds__(256) cx_moe_gu(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
+                                                            const unsigned char* xq, float* out, int T, int r16) {
+    extern __shared__ uint4 dsm[];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, p = blockIdx.y;
+    const bool shared = p >= T * CX_TOPK;
+    const int t = shared ? p - T * CX_TOPK : p / CX_TOPK;
+    const unsigned e = shared ? 0u : ids[p];
+    const unsigned char* w[2];
+    int ty[2], rr[2];
+    #pragma unroll
+    for (int j = 0; j < 2; j++) {
+        const int r = (blockIdx.x * 8 + warp) * 2 + j;
+        rr[j] = r;
+        const ExW& m = shared ? (r < CX_FF ? sg : su) : (r < CX_FF ? g : u);
+        const int ro = r < CX_FF ? r : r - CX_FF;
+        ty[j] = m.ty;
+        const unsigned char* src = (const unsigned char*)m.base + (size_t)e * m.estride + (size_t)ro * m.row_bytes;
+        w[j] = cx_stage(src, m.row_bytes, dsm + (warp * 2 + j) * r16, lane);
+    }
+    __syncwarp();
     const float* xd = (const float*)(xq + (size_t)XQ8_T * CX_HID);
-    const float a = cx_dot(m.ty, w, xq + (size_t)t * CX_HID, xd + t * (CX_HID / 32), CX_HID);
-    if (lane == 0) out[(size_t)p * 2 * CX_FF + r] = a;
+    #pragma unroll
+    for (int j = 0; j < 2; j++) {
+        const float a = cx_dot(ty[j], w[j], xq + (size_t)t * CX_HID, xd + t * (CX_HID / 32), CX_HID);
+        if (lane == 0) out[(size_t)p * 2 * CX_FF + rr[j]] = a;
+    }
 }
 
 // h = silu(gate) * up per pair, then int8 (fe_q8's rule) into hq: codes [CX_NP][FF], then
-// scales [CX_NP][FF / 32]. Grid (FF / 32, t * TOPK), block 32.
+// scales [CX_NP][FF / 32]. Grid (FF / 32, T · (K + 1)), block 32.
 extern "C" __global__ void cx_silu_q(const float* gu, unsigned char* hq) {
     const int c = blockIdx.x, p = blockIdx.y, lane = threadIdx.x;
     const float g = gu[(size_t)p * 2 * CX_FF + c * 32 + lane];
@@ -203,37 +271,124 @@ extern "C" __global__ void cx_silu_q(const float* gu, unsigned char* hq) {
     if (lane == 0) ((float*)(hq + (size_t)CX_NP * CX_FF))[p * (CX_FF / 32) + c] = d;
 }
 
-// Routed experts' down rows: out[p][r]. Grid (HID / 8, t * TOPK), block 256.
-extern "C" __global__ void cx_moe_down(ExW d, const unsigned* ids, const unsigned char* hq, float* out) {
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int r = blockIdx.x * 8 + warp, p = blockIdx.y;
-    if (r >= CX_HID) return;
-    const unsigned char* w = (const unsigned char*)d.base + (size_t)ids[p] * d.estride + (size_t)r * d.row_bytes;
+// Experts' down rows (shared expert for p >= T·K): out[p][r], two rows a warp, staged.
+// Grid (HID / 16, T · (K + 1)), block 256, dynamic smem 16 × r16 × 16 bytes.
+extern "C" __global__ void __launch_bounds__(256) cx_moe_down(ExW d, ExW sd, const unsigned* ids,
+                                                              const unsigned char* hq, float* out, int T, int r16) {
+    extern __shared__ uint4 dsm[];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, p = blockIdx.y;
+    const bool shared = p >= T * CX_TOPK;
+    const ExW& m = shared ? sd : d;
+    const unsigned e = shared ? 0u : ids[p];
+    const unsigned char* w[2];
+    int rr[2];
+    #pragma unroll
+    for (int j = 0; j < 2; j++) {
+        const int r = (blockIdx.x * 8 + warp) * 2 + j;
+        rr[j] = r;
+        const unsigned char* src = (const unsigned char*)m.base + (size_t)e * m.estride + (size_t)r * m.row_bytes;
+        w[j] = cx_stage(src, m.row_bytes, dsm + (warp * 2 + j) * r16, lane);
+    }
+    __syncwarp();
     const float* hd = (const float*)(hq + (size_t)CX_NP * CX_FF);
-    const float a = cx_dot(d.ty, w, hq + (size_t)p * CX_FF, hd + p * (CX_FF / 32), CX_FF);
-    if (lane == 0) out[(size_t)p * CX_HID + r] = a;
+    #pragma unroll
+    for (int j = 0; j < 2; j++) {
+        const float a = cx_dot(m.ty, w[j], hq + (size_t)p * CX_FF, hd + p * (CX_FF / 32), CX_FF);
+        if (lane == 0) out[(size_t)p * CX_HID + rr[j]] = a;
+    }
 }
 
-// h = silu(gate) * up for the shared expert: gu [t][2 ff] -> h [t][ff]. Grid t, block 256.
-extern "C" __global__ void cx_silu(const float* gu, float* h, int ff) {
-    const int t = blockIdx.x;
-    for (int i = threadIdx.x; i < ff; i += blockDim.x)
-        h[(size_t)t * ff + i] = silu_f2(gu[(size_t)t * 2 * ff + i]) * gu[(size_t)t * 2 * ff + ff + i];
+// ---- K-split dense GEMV ----
+// A block of 8 warps handles 2 rows; the 4 warps of a row each take a contiguous quarter of k
+// (k % 1024 == 0) and their partial sums are added in warp order. Same segments, outputs and
+// activation formats as fe_gemv8 (int8 codes for quantized rows, f32 for F32/BF16 rows), so
+// it drops in for it; at T = 1 a 2048-row matrix gets 8192 warps instead of 1024.
+template <int T, int TY>
+__device__ __forceinline__ void dotk8(const unsigned char* w, const unsigned char* xq, int k, int k0, int k1, float* acc) {
+    const int lane = threadIdx.x & 31;
+    const float* xd = (const float*)(xq + (size_t)XQ8_T * k);
+    for (int e0 = k0 + lane * 8; e0 < k1; e0 += 256) {
+        int w0, w1;
+        float dw, mw;
+        decode8i<TY>(w, e0, w0, w1, dw, mw);
+        #pragma unroll
+        for (int t = 0; t < T; t++) {
+            const uint2 xv = *(const uint2*)(xq + (size_t)t * k + e0);
+            const float dx = xd[t * (k / 32) + e0 / 32];
+            const int s = __dp4a(w0, (int)xv.x, __dp4a(w1, (int)xv.y, 0));
+            if (TY == 12 || TY == 13) {
+                const int sx = __dp4a(0x01010101, (int)xv.x, __dp4a(0x01010101, (int)xv.y, 0));
+                acc[t] = fmaf(dx, fmaf(dw, i2f(s), -mw * i2f(sx)), acc[t]);
+            } else {
+                acc[t] = fmaf(dx * dw, i2f(s), acc[t]);
+            }
+        }
+    }
 }
-
-// r += Σ_k w_k parts[t][k] (rank order) + sigmoid(lg[t][NE]) shy[t]; y (when given) gets the
-// MoE output alone. Grid (HID / 256, t), block 256.
-extern "C" __global__ void cx_moe_add(float* r, const float* parts, const float* wts, const float* shy,
-                                      const float* lg, int ls, float* y) {
-    const int t = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= CX_HID) return;
-    float acc = 0.f;
-    for (int k = 0; k < CX_TOPK; k++) acc += wts[t * CX_TOPK + k] * parts[((size_t)t * CX_TOPK + k) * CX_HID + i];
-    const float g = sigm_f(lg[(size_t)t * ls + CX_NE]);
-    acc += g * shy[(size_t)t * CX_HID + i];
-    r[(size_t)t * CX_HID + i] += acc;
-    if (y) y[(size_t)t * CX_HID + i] = acc;
+template <int T, int TY>
+__device__ __forceinline__ void dotkf(const unsigned char* w, const float* x, int k, int k0, int k1, float* acc) {
+    const int lane = threadIdx.x & 31;
+    for (int e0 = k0 + lane * 8; e0 < k1; e0 += 256) {
+        float v[8];
+        decode8<TY>(w, e0, v);
+        #pragma unroll
+        for (int t = 0; t < T; t++) {
+            const float4 a = *(const float4*)(x + (size_t)t * k + e0);
+            const float4 c = *(const float4*)(x + (size_t)t * k + e0 + 4);
+            float s = acc[t];
+            s = fmaf(v[0], a.x, s); s = fmaf(v[1], a.y, s); s = fmaf(v[2], a.z, s); s = fmaf(v[3], a.w, s);
+            s = fmaf(v[4], c.x, s); s = fmaf(v[5], c.y, s); s = fmaf(v[6], c.z, s); s = fmaf(v[7], c.w, s);
+            acc[t] = s;
+        }
+    }
 }
+template <int T>
+__device__ void gemvk_body(const Seg* segs, int nseg, const float* x, const unsigned char* xq, int k, float* out, int ostride) {
+    __shared__ float part[8][MAXT];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int j = warp >> 2, q = warp & 3;
+    int row = blockIdx.x * 2 + j, s = 0;
+    while (s < nseg && row >= segs[s].rows) { row -= segs[s].rows; s++; }
+    float acc[T];
+    #pragma unroll
+    for (int t = 0; t < T; t++) acc[t] = 0.f;
+    const bool ok = s < nseg;
+    if (ok) {
+        const Seg sg = segs[s];
+        const unsigned char* w = (const unsigned char*)sg.w + (size_t)row * sg.row_bytes;
+        const int k0 = q * (k / 4), k1 = k0 + k / 4;
+        switch (sg.type) {
+            case 30: dotkf<T, 30>(w, x, k, k0, k1, acc); break;
+            case 0: dotkf<T, 0>(w, x, k, k0, k1, acc); break;
+            case 8: dotk8<T, 8>(w, xq, k, k0, k1, acc); break;
+            case 2: dotk8<T, 2>(w, xq, k, k0, k1, acc); break;
+            case 20: dotk8<T, 20>(w, xq, k, k0, k1, acc); break;
+            case 6: dotk8<T, 6>(w, xq, k, k0, k1, acc); break;
+            case 42: dotk8<T, 42>(w, xq, k, k0, k1, acc); break;
+            case 23: dotk8<T, 23>(w, xq, k, k0, k1, acc); break;
+            case 11: dotk8<T, 11>(w, xq, k, k0, k1, acc); break;
+            case 12: dotk8<T, 12>(w, xq, k, k0, k1, acc); break;
+            case 13: dotk8<T, 13>(w, xq, k, k0, k1, acc); break;
+            case 14: dotk8<T, 14>(w, xq, k, k0, k1, acc); break;
+            default: break;
+        }
+    }
+    #pragma unroll
+    for (int t = 0; t < T; t++) {
+        float a = acc[t];
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+        if (lane == 0) part[warp][t] = a;
+    }
+    __syncthreads();
+    if (ok && q == 0 && lane < T) {
+        const float v = ((part[4 * j][lane] + part[4 * j + 1][lane]) + part[4 * j + 2][lane]) + part[4 * j + 3][lane];
+        out[(size_t)lane * ostride + segs[s].out_off + row] = v;
+    }
+}
+#define GEMVK_T(T) extern "C" __global__ void __launch_bounds__(256) cx_gemvk_t##T( \
+    const Seg* segs, int nseg, const float* x, const unsigned char* xq, int k, float* out, int ostride) { \
+    gemvk_body<T>(segs, nseg, x, xq, k, out, ostride); }
+GEMVK_T(1) GEMVK_T(2) GEMVK_T(3) GEMVK_T(4) GEMVK_T(5) GEMVK_T(6) GEMVK_T(7) GEMVK_T(8)
 
 // Gated attention prep: q heads (rmsnorm * qn, NeoX rope on CX_ROT dims) into q [t][NH][HD];
 // k heads (rmsnorm * kn, rope) and v into the bf16 caches at position ctl[0] + t.

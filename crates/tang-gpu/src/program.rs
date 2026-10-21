@@ -41,7 +41,7 @@
 use std::cell::{RefCell, RefMut};
 
 use tang_compile::tensor::memplan::MemoryPlan;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "opencl"))]
 use tang_compile::tensor::precision::{bf16_bits, bf16_from_bits};
 use tang_compile::tensor::precision::{f16_bits, f16_from_bits};
 use tang_compile::tensor::wgsl::WgslProgram;
@@ -51,12 +51,15 @@ use crate::{GpuBuffer, GpuDevice, GpuError, KernelCache};
 
 #[cfg(feature = "cuda")]
 use crate::cuda::CudaDevice;
+#[cfg(feature = "opencl")]
+use crate::opencl::{ClDevice, ClKernels, ClMem};
 
 /// Which backend a [`Runtime`] runs on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendKind {
     Wgpu,
     Cuda,
+    OpenCl,
 }
 
 /// A device plus what running programs on it needs.
@@ -67,6 +70,9 @@ pub enum Runtime {
     },
     #[cfg(feature = "cuda")]
     Cuda(CudaDevice),
+    /// OpenCL (feature `opencl`): `src/opencl.rs`.
+    #[cfg(feature = "opencl")]
+    OpenCl(ClDevice),
 }
 
 impl Runtime {
@@ -74,6 +80,10 @@ impl Runtime {
     /// present, else wgpu. `TANG_BACKEND=wgpu` or `=cuda` forces one.
     pub fn select() -> Result<Self, GpuError> {
         let want = std::env::var("TANG_BACKEND").ok();
+        #[cfg(feature = "opencl")]
+        if want.as_deref() == Some("opencl") {
+            return Self::opencl().ok_or(GpuError::NoAdapter);
+        }
         if want.as_deref() != Some("wgpu") {
             #[cfg(feature = "cuda")]
             if let Some(rt) = Self::cuda() {
@@ -117,11 +127,27 @@ impl Runtime {
         CudaDevice::new_capturable(0).map(Self::Cuda)
     }
 
+    /// The first OpenCL GPU, if a driver and a device are present.
+    #[cfg(feature = "opencl")]
+    pub fn opencl() -> Option<Self> {
+        ClDevice::new().map(Self::OpenCl)
+    }
+
+    #[cfg(feature = "opencl")]
+    pub fn opencl_device(&self) -> Option<&ClDevice> {
+        match self {
+            Self::OpenCl(d) => Some(d),
+            _ => None,
+        }
+    }
+
     pub fn kind(&self) -> BackendKind {
         match self {
             Self::Wgpu { .. } => BackendKind::Wgpu,
             #[cfg(feature = "cuda")]
             Self::Cuda(_) => BackendKind::Cuda,
+            #[cfg(feature = "opencl")]
+            Self::OpenCl(_) => BackendKind::OpenCl,
         }
     }
 
@@ -130,6 +156,8 @@ impl Runtime {
             Self::Wgpu { device, .. } => &device.name,
             #[cfg(feature = "cuda")]
             Self::Cuda(d) => &d.name,
+            #[cfg(feature = "opencl")]
+            Self::OpenCl(d) => &d.name,
         }
     }
 
@@ -139,6 +167,8 @@ impl Runtime {
             Self::Wgpu { device, cache } => Some((device, cache.borrow_mut())),
             #[cfg(feature = "cuda")]
             Self::Cuda(_) => None,
+            #[cfg(feature = "opencl")]
+            Self::OpenCl(_) => None,
         }
     }
 
@@ -163,6 +193,8 @@ impl Runtime {
             }
             #[cfg(feature = "cuda")]
             Self::Cuda(_) => g.to_cuda(outputs),
+            #[cfg(feature = "opencl")]
+            Self::OpenCl(_) => g.to_opencl(outputs),
         }
     }
 
@@ -175,6 +207,8 @@ impl Runtime {
             }
             #[cfg(feature = "cuda")]
             Self::Cuda(d) => d.sync(),
+            #[cfg(feature = "opencl")]
+            Self::OpenCl(d) => d.sync(),
         }
     }
 }
@@ -277,6 +311,13 @@ enum Storage {
         functions: Vec<cudarc::driver::CudaFunction>,
         /// One captured run ([`Program::capture`]).
         graph: Option<cudarc::driver::CudaGraph>,
+    },
+    #[cfg(feature = "opencl")]
+    OpenCl {
+        /// Reference counted, as on CUDA (shared buffers).
+        slots: Vec<std::rc::Rc<ClMem>>,
+        /// One kernel object per kernel, arguments bound at construction.
+        kernels: ClKernels,
     },
 }
 
@@ -405,6 +446,37 @@ impl Program {
                 };
                 Self::assemble(program, storage, plan)
             }
+            #[cfg(feature = "opencl")]
+            Runtime::OpenCl(d) => {
+                use std::rc::Rc;
+                let slots: Vec<Rc<ClMem>> = plan
+                    .slot_len
+                    .iter()
+                    .zip(&borrowed)
+                    .map(|(&n, b)| match b {
+                        Some((p, s)) => match &p.storage {
+                            Storage::OpenCl { slots, .. } => slots[*s].clone(),
+                            _ => panic!("programs on different backends"),
+                        },
+                        None => Rc::new(d.alloc_zeros(n)),
+                    })
+                    .collect();
+                for (i, b) in program.buffers.iter().enumerate() {
+                    if let Some(k) = b.input.filter(|&k| own(k) && !inputs[k].is_empty()) {
+                        d.write(&slots[plan.slot[i]], &pack_words(b.format, inputs[k]));
+                    }
+                }
+                let kernels = d.kernels(program.kernels.iter().map(|k| k.source.as_str()));
+                let storage = Storage::OpenCl { slots, kernels };
+                let p = Self::assemble(program, storage, plan);
+                if let Storage::OpenCl { slots, kernels } = &p.storage {
+                    for (i, a) in p.args.iter().enumerate() {
+                        let bufs: Vec<&ClMem> = a.iter().map(|&s| &*slots[s]).collect();
+                        d.set_args(kernels, i, &bufs, p.program.kernels[i].points);
+                    }
+                }
+                p
+            }
         }
     }
 
@@ -447,7 +519,7 @@ impl Program {
                         buffer: slots[*s].buffer.clone(),
                         len: slots[*s].len,
                     },
-                    #[cfg(feature = "cuda")]
+                    #[cfg(any(feature = "cuda", feature = "opencl"))]
                     _ => panic!("programs on different backends"),
                 },
                 None => GpuBuffer::uninit(device, n),
@@ -539,7 +611,7 @@ impl Program {
     pub fn wgpu_buffer(&self, t: TensorId) -> Option<&GpuBuffer> {
         match &self.storage {
             Storage::Wgpu(s) => Some(&s[self.slot_of(t)]),
-            #[cfg(feature = "cuda")]
+            #[cfg(any(feature = "cuda", feature = "opencl"))]
             _ => None,
         }
     }
@@ -579,7 +651,30 @@ impl Program {
                 }
                 self.launch_all(d);
             }
+            #[cfg(feature = "opencl")]
+            Runtime::OpenCl(d) => {
+                for &i in &self.order {
+                    self.run_opencl(d, i, false);
+                }
+                d.flush();
+            }
         }
+    }
+
+    /// Enqueue kernel `i` (with `timed`: wait, and return its device ms).
+    #[cfg(feature = "opencl")]
+    fn run_opencl(&self, d: &ClDevice, i: usize, timed: bool) -> f64 {
+        let Storage::OpenCl { kernels, .. } = &self.storage else {
+            panic!("program and runtime are on different backends")
+        };
+        let k = &self.program.kernels[i];
+        d.launch(
+            kernels,
+            i,
+            k.count as usize,
+            k.workgroup_size as usize,
+            timed,
+        )
     }
 
     #[cfg(feature = "cuda")]
@@ -674,6 +769,10 @@ impl Program {
             Runtime::Wgpu { device, cache } => self.run_wgpu(device, &mut cache.borrow_mut(), i),
             #[cfg(feature = "cuda")]
             Runtime::Cuda(d) => self.run_cuda(d, i),
+            #[cfg(feature = "opencl")]
+            Runtime::OpenCl(d) => {
+                self.run_opencl(d, i, false);
+            }
         }
     }
 
@@ -737,6 +836,12 @@ impl Program {
                 d.sync();
                 unpack_words(b.format, &out, b.len)
             }
+            #[cfg(feature = "opencl")]
+            (Runtime::OpenCl(d), Storage::OpenCl { slots, .. }) => {
+                let b = &self.program.buffers[self.buffer_index(t)];
+                let out = d.read(&slots[self.slot_of(t)], words(b));
+                unpack_words(b.format, &out, b.len)
+            }
             #[allow(unreachable_patterns)]
             _ => panic!("program and runtime are on different backends"),
         }
@@ -783,6 +888,10 @@ impl Program {
                 // `data` is borrowed only for this call
                 d.sync();
             }
+            #[cfg(feature = "opencl")]
+            (Runtime::OpenCl(d), Storage::OpenCl { slots, .. }) => {
+                d.write(&slots[s], &pack_words(b.format, data));
+            }
             #[allow(unreachable_patterns)]
             _ => panic!("program and runtime are on different backends"),
         }
@@ -825,6 +934,12 @@ impl Program {
                 }
                 .expect("dtod");
             }
+            #[cfg(feature = "opencl")]
+            (
+                Runtime::OpenCl(dev),
+                Storage::OpenCl { slots: d, .. },
+                Storage::OpenCl { slots: s, .. },
+            ) => dev.copy(&d[ds], &s[ss], words(db)),
             #[allow(unreachable_patterns)]
             _ => panic!("programs and runtime are on different backends"),
         }
@@ -841,6 +956,16 @@ impl Program {
     /// time-sliced GPU a batch of launches almost always straddles another
     /// tenant's slice, a single short launch usually does not.
     pub fn time_kernel(&self, rt: &Runtime, i: usize, iters: usize) -> f64 {
+        #[cfg(feature = "opencl")]
+        if let Runtime::OpenCl(d) = rt {
+            for _ in 0..3 {
+                self.run_opencl(d, i, false);
+            }
+            d.sync();
+            return (0..5 * iters)
+                .map(|_| self.run_opencl(d, i, true))
+                .fold(f64::INFINITY, f64::min);
+        }
         #[cfg(feature = "cuda")]
         if let Runtime::Cuda(dev) = rt {
             use cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT;
@@ -921,6 +1046,9 @@ impl Program {
                     .collect();
                 Self::tune_variants(rt, variants, "tang-cuda-tuning", inputs, cache)
             }
+            // one lowering on OpenCL
+            #[cfg(feature = "opencl")]
+            Runtime::OpenCl(_) => (Self::compile(rt, g, outputs, inputs), TuneReport::default()),
         }
     }
 
@@ -1095,7 +1223,7 @@ fn copy_wgpu(
 
 /// Host values in a buffer's device layout, as f32 words (f16/bf16 two
 /// per word; f32 as is).
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "opencl"))]
 fn pack_words(format: Format, data: &[f32]) -> std::borrow::Cow<'_, [f32]> {
     let bits = |x: f32| match format {
         Format::BF16 => bf16_bits(x as f64) as u32,
@@ -1111,7 +1239,7 @@ fn pack_words(format: Format, data: &[f32]) -> std::borrow::Cow<'_, [f32]> {
 }
 
 /// Inverse of [`pack_words`]: the first `n` elements, widened to f32.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "opencl"))]
 fn unpack_words(format: Format, words: &[f32], n: usize) -> Vec<f32> {
     match format {
         Format::F32 => words[..n].to_vec(),

@@ -36,6 +36,8 @@ naga = { version = "25", features = ["wgsl-in", "glsl-out"], optional = true }
 [features]
 default = []
 cuda = ["dep:cudarc"]
+# OpenCL (dlopen'ed libOpenCL, binary cache): src/opencl.rs, e.g. the K1's Adreno 740
+opencl = []
 glsl = ["dep:shaderc", "dep:naga"]
 
 [[example]]

@@ -12,6 +12,7 @@ pub mod flash;
 pub mod flash_native;
 pub mod kernels;
 pub mod modules;
+pub mod moe;
 pub mod ops;
 pub mod tensor;
 
@@ -40,7 +41,7 @@ pub use tensor::ComputeTensor;
 pub use metal::MetalDevice;
 
 #[cfg(feature = "cuda")]
-pub use cuda::{cuda_memory_info, CudaComputeDevice};
+pub use cuda::{cuda_memory_info, CudaComputeDevice, RawCuda};
 
 #[cfg(feature = "cuda")]
 pub use cudarc::driver::CudaGraph;

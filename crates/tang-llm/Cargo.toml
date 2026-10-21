@@ -8,7 +8,8 @@ description = "LLM inference on tang-compute: Qwen3-family models, KV cache, sam
 repository.workspace = true
 keywords = ["llm", "inference", "metal", "qwen"]
 categories = ["science"]
-publish = false
+readme = "README.md"
+include = ["src/**/*", "README.md", "CUDA.md", "docs/**/*"]
 
 [features]
 default = []
@@ -44,7 +45,7 @@ base64 = "0.22"
 sha2 = "0.10"
 llguidance = { version = "=1.9.1", default-features = false }
 libc = "0.2"
-tang-moe = { path = "../tang-moe", optional = true }
+tang-moe = { workspace = true, optional = true }
 opentelemetry = { version = "0.30", default-features = false, features = ["trace", "metrics"], optional = true }
 opentelemetry_sdk = { version = "0.30", default-features = false, features = ["trace", "metrics"], optional = true }
 opentelemetry-otlp = { version = "0.30", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls", "trace", "metrics"], optional = true }
