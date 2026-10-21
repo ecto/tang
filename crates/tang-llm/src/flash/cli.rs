@@ -1458,6 +1458,9 @@ pub fn wide_check(args: &[String]) -> Result<()> {
             e.free_slot(s2);
         }
         let (n2, (t2, l2)) = got.unwrap();
+        if let Some(r) = e.prof_report() {
+            println!("  GPU time by stage (TANG_CODER_PROF, narrow + wide prefills):\n{r}");
+        }
         let bits = l1
             .iter()
             .zip(&l2)
