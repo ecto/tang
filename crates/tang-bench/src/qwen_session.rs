@@ -1052,6 +1052,9 @@ pub fn tune(dir: &str, budget: f64) -> Vec<(String, String)> {
         // (block RMxRNxWG, lanes along k): work-groups of a wave (64) or
         // two, local partials RM*RN*WG floats within the Adreno's 32 KB
         for (mm, lanes) in [
+            ("0x4x64", "16"),
+            ("0x4x128", "16"),
+            ("0x4x64", "8"),
             ("4x4x64", "16"),
             ("4x4x128", "16"),
             ("4x4x128", "32"),
@@ -1226,7 +1229,7 @@ pub fn prefill_bench(dir: &str, sizes: &[usize], gen: usize, check: bool) -> Vec
         s.prefill(&rt, &ids[..seq], 0);
         let _ = s.state(&rt);
         let first = t.elapsed().as_secs_f64();
-        let ms = s.prog.time(&rt, 5);
+        let ms = run_ms(&rt, &s.prog, 2);
         println!(
             "prefill {seq:4} tokens: built in {built:.1} s, first run {:.0} ms wall",
             first * 1e3
@@ -1238,7 +1241,7 @@ pub fn prefill_bench(dir: &str, sizes: &[usize], gen: usize, check: bool) -> Vec
         );
         phase(&format!("prefill {seq} timed"));
         if profile {
-            kernel_table(&rt, &s, 15);
+            kernel_table(&rt, &s, 25);
             phase(&format!("prefill {seq} profiled"));
         }
         last = Some(s);
@@ -1262,13 +1265,13 @@ pub fn prefill_bench(dir: &str, sizes: &[usize], gen: usize, check: bool) -> Vec
                         Some(&dec),
                     );
                     s.prefill(&rt, &turn[p..p + seq], p);
-                    ms += s.prog.time(&rt, 5);
+                    ms += run_ms(&rt, &s.prog, 2);
                     parts.push(seq.to_string());
                     p += seq;
                 }
                 None => {
                     dec.set_state(&rt, turn[p], p);
-                    ms += dec.prog.time(&rt, 5);
+                    ms += run_ms(&rt, &dec.prog, 2);
                     parts.push("1 (decode)".into());
                     p += 1;
                 }
@@ -1351,6 +1354,20 @@ pub fn prefill_bench(dir: &str, sizes: &[usize], gen: usize, check: bool) -> Vec
     out
 }
 
+/// Best of `reps` runs of `prog`, each synced, in ms of wall time (the
+/// bench's timing: `Program::time` makes 28 runs, ~22 s for one 0.8 s
+/// prefill on the K1).
+fn run_ms(rt: &Runtime, prog: &Program, reps: usize) -> f64 {
+    (0..reps.max(1))
+        .map(|_| {
+            let t = Instant::now();
+            prog.run(rt);
+            rt.sync();
+            t.elapsed().as_secs_f64() * 1e3
+        })
+        .fold(f64::INFINITY, f64::min)
+}
+
 /// Device time per kernel of one run of `step`, summed by kernel kind (its
 /// first source line), the `top` largest: the per-kernel table of
 /// [`prefill_bench`] (`QWEN_BENCH_PROFILE=1`).
@@ -1361,14 +1378,15 @@ pub fn kernel_table(rt: &Runtime, step: &Step, top: usize) {
     for (i, k) in p.program.kernels.iter().enumerate() {
         let ms = p.time_kernel(rt, i, 1);
         total += ms;
-        let name: String = k
+        let head: String = k
             .source
             .lines()
             .next()
             .unwrap_or("")
             .chars()
-            .take(120)
+            .take(110)
             .collect();
+        let name = format!("{head} [{} items]", k.count);
         match groups.iter_mut().find(|g| g.0 == name) {
             Some(g) => {
                 g.1 += ms;

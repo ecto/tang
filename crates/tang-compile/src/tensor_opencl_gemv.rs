@@ -349,6 +349,27 @@ pub fn mm_shape() -> (usize, usize, usize) {
         .unwrap_or((4, 4, 64))
 }
 
+/// Register block of [`TensorGraph::opencl_mma_kernel_q4`] for `m` rows
+/// (tokens): `TANG_CL_MM` when set (RM 0: automatic), else automatic rows
+/// by 4 columns in groups of 64. Automatic rows split `m` into the fewest
+/// blocks of at most 8 rows (20 tokens: 3 blocks of 7, so each packed
+/// weight is read 3 times instead of 5), padding at most a row per block.
+pub fn mm_shape_q4(m: usize) -> (usize, usize, usize) {
+    let (rm, rn, wg) = std::env::var("TANG_CL_MM")
+        .ok()
+        .and_then(|v| {
+            let p: Vec<usize> = v.split('x').filter_map(|x| x.parse().ok()).collect();
+            (p.len() == 3 && p[1] > 0 && p[2] > 0).then(|| (p[0], p[1], p[2]))
+        })
+        .unwrap_or((0, 4, 64));
+    let rm = if rm == 0 {
+        m.div_ceil(m.div_ceil(8))
+    } else {
+        rm
+    };
+    (rm.max(1), rn, wg)
+}
+
 /// fp16 arithmetic in the packed-weight prefill kernel
 /// ([`TensorGraph::opencl_mma_kernel_q4`]): `TANG_CL_PREFILL_F16=1`.
 /// Activations and dequantized weights are rounded to half and each
@@ -646,7 +667,7 @@ impl TensorGraph {
             return None;
         }
         let f16 = prefill_f16();
-        let (rm, rn, wg) = mm_shape();
+        let (rm, rn, wg) = mm_shape_q4(m);
         // the partials' local array within 32 KB (the Adreno's local memory)
         let lanes = if rm * rn * wg * 4 <= 32 << 10 {
             mm_lanes(wg)
