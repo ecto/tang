@@ -878,6 +878,14 @@ impl Coder {
         self.dev.sync();
     }
 
+    /// Switch the per-pair expert kernels (`TANG_CODER_MOE`'s values) without reloading; drops
+    /// the captured window graphs, which hold the old kernels.
+    pub fn set_moe_variant(&mut self, v: usize) {
+        self.var.moe = v;
+        self.graphs.clear();
+        self.commit_graphs.iter_mut().for_each(|g| *g = None);
+    }
+
     /// A free sequence slot (1..MAX_SLOTS), its state zeroed and no tokens.
     pub fn alloc_slot(&mut self) -> Result<usize> {
         let i = (1..MAX_SLOTS)

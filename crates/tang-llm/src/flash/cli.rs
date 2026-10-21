@@ -1412,108 +1412,125 @@ pub fn batch_check(args: &[String]) -> Result<()> {
     let nb = super::coder::MAX_T.min(8);
     let seqs: Vec<Vec<u32>> = (0..nb).map(|i| ids[..ids.len() - 3 * i].to_vec()).collect();
     let steps = a.n.max(8);
-    // Alone.
-    let mut alone: Vec<(Vec<u32>, Vec<f32>)> = Vec::new();
-    for s in &seqs {
-        let slot = e.alloc_slot()?;
-        let mut next = e.prefill_slot(slot, s)?;
-        let (mut toks, mut lg) = (Vec::new(), Vec::new());
-        for _ in 0..steps {
-            let out = e.decode_batch(&[(slot, next)])?;
-            lg.extend_from_slice(&e.logits(1));
-            next = out[0];
-            toks.push(next);
+    // TANG_CODER_MOE_SWEEP=0,2,4,8: repeat everything for each expert-kernel variant on one load.
+    let sweep: Vec<Option<usize>> = match std::env::var("TANG_CODER_MOE_SWEEP") {
+        Ok(s) => s
+            .split(',')
+            .filter_map(|x| x.trim().parse().ok())
+            .map(Some)
+            .collect(),
+        Err(_) => vec![None],
+    };
+    let mut all_ok = true;
+    for variant in sweep {
+        if let Some(m) = variant {
+            e.set_moe_variant(m);
+            println!("== TANG_CODER_MOE={m}");
         }
-        e.free_slot(slot);
-        alone.push((toks, lg));
-    }
-    // Batched.
-    let slots: Vec<usize> = (0..nb).map(|_| e.alloc_slot()).collect::<Result<_>>()?;
-    let mut next: Vec<u32> = Vec::new();
-    for (i, s) in seqs.iter().enumerate() {
-        next.push(e.prefill_slot(slots[i], s)?);
-    }
-    let mut got: Vec<(Vec<u32>, Vec<f32>)> = vec![(Vec::new(), Vec::new()); nb];
-    for step in 0..steps {
-        let order: Vec<usize> = if step % 2 == 0 {
-            (0..nb).collect()
-        } else {
-            (0..nb).rev().collect()
-        };
-        let rows: Vec<(usize, u32)> = order.iter().map(|&i| (slots[i], next[i])).collect();
-        let out = e.decode_batch(&rows)?;
-        let lg = e.logits(nb);
-        for (r, &i) in order.iter().enumerate() {
-            next[i] = out[r];
-            got[i].0.push(out[r]);
-            got[i].1.extend_from_slice(&lg[r * v..(r + 1) * v]);
-        }
-    }
-    for &s in &slots {
-        e.free_slot(s);
-    }
-    let mut ok = true;
-    for i in 0..nb {
-        let tok_eq = alone[i].0 == got[i].0;
-        let bits = alone[i]
-            .1
-            .iter()
-            .zip(&got[i].1)
-            .filter(|(x, y)| x.to_bits() != y.to_bits())
-            .count();
-        println!(
-            "seq {i} (prompt {} tokens): tokens {} , logits differ in {bits} of {} entries",
-            seqs[i].len(),
-            if tok_eq { "identical" } else { "DIFFER" },
-            steps * v
-        );
-        ok &= tok_eq && bits == 0;
-    }
-    // FNV-1a over every batched logit, to compare runs (e.g. TANG_CODER_GROUPED=0 against the
-    // grouped default): equal checksums, equal bits.
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for (_, lg) in &got {
-        for x in lg {
-            h = (h ^ x.to_bits() as u64).wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    }
-    println!(
-        "batch-check: {} (logits checksum {h:016x})",
-        if ok { "PASS (bitwise)" } else { "FAIL" }
-    );
-    // Speed.
-    for b in [1usize, 2, 4, 8].into_iter().filter(|&b| b <= nb) {
-        let slots: Vec<usize> = (0..b).map(|_| e.alloc_slot()).collect::<Result<_>>()?;
-        let mut next: Vec<u32> = Vec::new();
-        for (i, &s) in slots.iter().enumerate() {
-            next.push(e.prefill_slot(s, &seqs[i])?);
-        }
-        let run = |e: &mut Coder, next: &mut Vec<u32>, n: usize| -> Result<()> {
-            for _ in 0..n {
-                let rows: Vec<(usize, u32)> = slots
-                    .iter()
-                    .zip(next.iter())
-                    .map(|(&s, &t)| (s, t))
-                    .collect();
-                *next = e.decode_batch(&rows)?;
+        // Alone.
+        let mut alone: Vec<(Vec<u32>, Vec<f32>)> = Vec::new();
+        for s in &seqs {
+            let slot = e.alloc_slot()?;
+            let mut next = e.prefill_slot(slot, s)?;
+            let (mut toks, mut lg) = (Vec::new(), Vec::new());
+            for _ in 0..steps {
+                let out = e.decode_batch(&[(slot, next)])?;
+                lg.extend_from_slice(&e.logits(1));
+                next = out[0];
+                toks.push(next);
             }
-            Ok(())
-        };
-        run(&mut e, &mut next, 4)?; // capture the graphs
-        let t0 = std::time::Instant::now();
-        run(&mut e, &mut next, steps)?;
-        let dt = t0.elapsed().as_secs_f64();
-        let agg = (b * steps) as f64 / dt;
-        println!(
-            "batch {b}: {:.2} ms a step, {agg:.0} tok/s aggregate, {:.0} tok/s a stream",
-            dt * 1e3 / steps as f64,
-            agg / b as f64
-        );
+            e.free_slot(slot);
+            alone.push((toks, lg));
+        }
+        // Batched.
+        let slots: Vec<usize> = (0..nb).map(|_| e.alloc_slot()).collect::<Result<_>>()?;
+        let mut next: Vec<u32> = Vec::new();
+        for (i, s) in seqs.iter().enumerate() {
+            next.push(e.prefill_slot(slots[i], s)?);
+        }
+        let mut got: Vec<(Vec<u32>, Vec<f32>)> = vec![(Vec::new(), Vec::new()); nb];
+        for step in 0..steps {
+            let order: Vec<usize> = if step % 2 == 0 {
+                (0..nb).collect()
+            } else {
+                (0..nb).rev().collect()
+            };
+            let rows: Vec<(usize, u32)> = order.iter().map(|&i| (slots[i], next[i])).collect();
+            let out = e.decode_batch(&rows)?;
+            let lg = e.logits(nb);
+            for (r, &i) in order.iter().enumerate() {
+                next[i] = out[r];
+                got[i].0.push(out[r]);
+                got[i].1.extend_from_slice(&lg[r * v..(r + 1) * v]);
+            }
+        }
         for &s in &slots {
             e.free_slot(s);
         }
+        let mut ok = true;
+        for i in 0..nb {
+            let tok_eq = alone[i].0 == got[i].0;
+            let bits = alone[i]
+                .1
+                .iter()
+                .zip(&got[i].1)
+                .filter(|(x, y)| x.to_bits() != y.to_bits())
+                .count();
+            println!(
+                "seq {i} (prompt {} tokens): tokens {} , logits differ in {bits} of {} entries",
+                seqs[i].len(),
+                if tok_eq { "identical" } else { "DIFFER" },
+                steps * v
+            );
+            ok &= tok_eq && bits == 0;
+        }
+        // FNV-1a over every batched logit, to compare runs (e.g. TANG_CODER_GROUPED=0 against the
+        // grouped default): equal checksums, equal bits.
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for (_, lg) in &got {
+            for x in lg {
+                h = (h ^ x.to_bits() as u64).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        println!(
+            "batch-check: {} (logits checksum {h:016x})",
+            if ok { "PASS (bitwise)" } else { "FAIL" }
+        );
+        // Speed.
+        for b in [1usize, 2, 4, 8].into_iter().filter(|&b| b <= nb) {
+            let slots: Vec<usize> = (0..b).map(|_| e.alloc_slot()).collect::<Result<_>>()?;
+            let mut next: Vec<u32> = Vec::new();
+            for (i, &s) in slots.iter().enumerate() {
+                next.push(e.prefill_slot(s, &seqs[i])?);
+            }
+            let run = |e: &mut Coder, next: &mut Vec<u32>, n: usize| -> Result<()> {
+                for _ in 0..n {
+                    let rows: Vec<(usize, u32)> = slots
+                        .iter()
+                        .zip(next.iter())
+                        .map(|(&s, &t)| (s, t))
+                        .collect();
+                    *next = e.decode_batch(&rows)?;
+                }
+                Ok(())
+            };
+            run(&mut e, &mut next, 4)?; // capture the graphs
+            let t0 = std::time::Instant::now();
+            run(&mut e, &mut next, steps)?;
+            let dt = t0.elapsed().as_secs_f64();
+            let agg = (b * steps) as f64 / dt;
+            println!(
+                "batch {b}: {:.2} ms a step, {agg:.0} tok/s aggregate, {:.0} tok/s a stream",
+                dt * 1e3 / steps as f64,
+                agg / b as f64
+            );
+            for &s in &slots {
+                e.free_slot(s);
+            }
+        }
+        all_ok &= ok;
     }
-    ensure!(ok, "batch-check failed");
+    ensure!(all_ok, "batch-check failed");
     Ok(())
 }
 
