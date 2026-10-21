@@ -22,6 +22,8 @@ struct Layer<B> {
     attn_norm: B,
     /// Q, K and V projections stacked: `[(nh + 2*nkv) * hd, hidden]`.
     wqkv: B,
+    /// Qwen2: Q, K and V projection biases stacked like `wqkv`.
+    qkv_bias: Option<B>,
     wo: B,
     q_norm: Option<B>,
     k_norm: Option<B>,
@@ -174,6 +176,15 @@ impl<D: ComputeDevice> Model<D> {
             layers.push(Layer {
                 attn_norm: norm("input_layernorm")?,
                 wqkv: up_cat(&["q", "k", "v"].map(|x| format!("{p}.self_attn.{x}_proj.weight")))?,
+                qkv_bias: if w.has(&format!("{p}.self_attn.q_proj.bias")) {
+                    let mut b = Vec::new();
+                    for x in ["q", "k", "v"] {
+                        b.extend(w.f32(&format!("{p}.self_attn.{x}_proj.bias"))?.0);
+                    }
+                    Some(dev.upload(&b))
+                } else {
+                    None
+                },
                 wo: up(&format!("{p}.self_attn.o_proj.weight"))?,
                 q_norm: opt_vec(&format!("{p}.self_attn.q_norm.weight"))?,
                 k_norm: opt_vec(&format!("{p}.self_attn.k_norm.weight"))?,
@@ -831,7 +842,10 @@ impl<D: ComputeDevice> Model<D> {
         for (l, w) in self.layers.iter().take(layer_limit).enumerate() {
             let (kp, vp) = pool.layer(l);
             let a = ops.rms_norm(dev, x, &w.attn_norm, s, h, eps);
-            let qkv = self.linear_rows(&a, &w.wqkv, &groups, h, qd + 2 * kvd);
+            let mut qkv = self.linear_rows(&a, &w.wqkv, &groups, h, qd + 2 * kvd);
+            if let Some(b) = &w.qkv_bias {
+                qkv = dev.bias_add(&qkv, b, s * (qd + 2 * kvd), qd + 2 * kvd);
+            }
             let (cos, sin) = &self.ropes[w.rope];
             // Rows the fused call covers (all of them, or a leading run), then the rest one
             // part at a time.
@@ -1005,6 +1019,7 @@ mod conditioning_tests {
         let layer = |scale: f32| Layer {
             attn_norm: dev.upload(&[1.; 4]),
             wqkv: dev.upload(&[0.; 48]),
+            qkv_bias: None,
             wo: dev.upload(&[0.; 16]),
             q_norm: None,
             k_norm: None,

@@ -1,0 +1,10 @@
+{"ctx":2048,"mode":"bf16","bpv":16.000,"correct":5,"cases":5}
+{"ctx":8192,"mode":"bf16","bpv":16.000,"correct":5,"cases":5}
+{"ctx":2048,"mode":"kivi:4:32","bpv":5.000,"correct":5,"cases":5}
+{"ctx":8192,"mode":"kivi:4:32","bpv":5.000,"correct":5,"cases":5}
+{"ctx":2048,"mode":"kivi:2:32","bpv":3.000,"correct":5,"cases":5}
+{"ctx":8192,"mode":"kivi:2:32","bpv":3.000,"correct":5,"cases":5}
+{"ctx":2048,"mode":"tkv:0.07:128+cache","bpv":3.859,"correct":5,"cases":5}
+{"ctx":8192,"mode":"tkv:0.07:128+cache","bpv":3.785,"correct":5,"cases":5}
+{"ctx":2048,"mode":"tkv:0.07:16:2","bpv":5.049,"correct":5,"cases":5}
+{"ctx":8192,"mode":"tkv:0.07:16:2","bpv":4.973,"correct":5,"cases":5}
