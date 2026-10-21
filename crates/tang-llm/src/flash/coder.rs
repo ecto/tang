@@ -195,6 +195,9 @@ struct Dense {
     row16: i32,
     /// Weight bytes in VRAM.
     bytes: usize,
+    /// Whether the wide-window GEMM (`cx_gemm_dense`) takes it: every segment a type it
+    /// decodes, 16-row aligned.
+    gemm_ok: bool,
 }
 
 /// A routed-expert tensor (`[n_expert][rows][k]`, GGUF type) in VRAM, as the kernels take it.
@@ -280,6 +283,7 @@ struct Kern {
     /// Tensor-core grouped expert GEMM (wide windows).
     moe_gemm_gu: Fun,
     moe_gemm_down: Fun,
+    gemm_dense: Fun,
     moe_add_norm: Fun,
     prep: Fun,
     part: Fun,
@@ -320,6 +324,7 @@ impl Kern {
             moe_down_g: f("cx_moe_down_g")?,
             moe_gemm_gu: f("cx_moe_gemm_gu")?,
             moe_gemm_down: f("cx_moe_gemm_down")?,
+            gemm_dense: f("cx_gemm_dense")?,
             moe_add_norm: f("cx_moe_add_norm")?,
             prep: f("cx_attn_prep")?,
             part: f("cx_attn_part")?,
@@ -499,6 +504,8 @@ struct Wide {
     k: Kern,
     io: Io,
     proj: B,
+    /// int8 codes and scales of a dense GEMM's f32 input (`XQ8_T` = rows layout).
+    xq: B,
 }
 
 /// Attention partials are computed this many rows of a wide window at a time (their scratch
@@ -868,6 +875,7 @@ impl Coder {
             moe_down_g: f(&cm, "cx_moe_down_g")?,
             moe_gemm_gu: f(&cm, "cx_moe_gemm_gu")?,
             moe_gemm_down: f(&cm, "cx_moe_gemm_down")?,
+            gemm_dense: f(&cm, "cx_gemm_dense")?,
             moe_add_norm: f(&cm, "cx_moe_add_norm")?,
             prep: f(&cm, "cx_attn_prep")?,
             part: f(&cm, "cx_attn_part")?,
@@ -1189,6 +1197,15 @@ impl Coder {
             .map_err(|e| anyhow!("{e}"))?;
         let pr = self.layers.iter().map(|l| l.w_in.rows).max().unwrap_or(0);
         let proj = self.dev.alloc_f32(rows * pr);
+        let kmax = self
+            .layers
+            .iter()
+            .map(|l| l.w_out.k.max(l.w_in.k))
+            .max()
+            .unwrap_or(n);
+        let xq = self
+            .dev
+            .alloc_f32((rows * kmax + rows * kmax / 32 * 4).div_ceil(4));
         self.dev.sync();
         self.wide = Some(Wide {
             rows,
@@ -1196,6 +1213,7 @@ impl Coder {
             k,
             io,
             proj,
+            xq,
         });
         Ok(())
     }
@@ -1496,6 +1514,90 @@ impl Coder {
         if self.skip(name) {
             return;
         }
+        // Wide windows: the tensor-core GEMM over every row (TANG_CODER_WGEMM=0: the GEMVs below).
+        if t > MAX_T && self.var.wgemm && w.gemm_ok {
+            if let Some(wd) = self.wide_on() {
+                let xq = match xq {
+                    Some(q) => q,
+                    None => {
+                        let q = self.a(&wd.xq);
+                        let ki = w.k as i32;
+                        unsafe {
+                            gpu::launch(
+                                wd.k.q8,
+                                ((w.k / 32) as u32, t as u32, 1),
+                                (32, 1, 1),
+                                0,
+                                &self.stream,
+                                tang_moe::args![x, q, ki],
+                            )
+                            .expect("fe_q8");
+                        }
+                        q
+                    }
+                };
+                let (sp, ns, ki, os, ti) = (
+                    self.a(&w.segs),
+                    w.nseg,
+                    w.k as i32,
+                    ostride as i32,
+                    t as i32,
+                );
+                unsafe {
+                    gpu::launch(
+                        wd.k.gemm_dense,
+                        (w.rows.div_ceil(128) as u32, t.div_ceil(64) as u32, 1),
+                        (256, 1, 1),
+                        0,
+                        &self.stream,
+                        tang_moe::args![sp, ns, xq, ki, out, os, ti],
+                    )
+                    .expect("cx_gemm_dense");
+                }
+                // Debug: the GEMVs into a scratch, compared (first 2 rows' outputs of each kind).
+                if env_is("TANG_CODER_WGEMM_CHECK", "1") {
+                    let tmp = self.dev.alloc_f32(t * ostride);
+                    let tp = self.a(&tmp);
+                    for r0 in (0..t).step_by(MAX_T) {
+                        let c = MAX_T.min(t - r0);
+                        self.gemv_narrow(
+                            w,
+                            x + (r0 * w.k * 4) as u64,
+                            tp + (r0 * ostride * 4) as u64,
+                            c,
+                            ostride,
+                        );
+                    }
+                    self.dev.sync();
+                    let n_out = t * ostride;
+                    let mut a = vec![0f32; n_out];
+                    unsafe {
+                        cudarc::driver::sys::cuMemcpyDtoH_v2(
+                            a.as_mut_ptr() as *mut std::ffi::c_void,
+                            out,
+                            n_out * 4,
+                        );
+                    }
+                    let b = self.dev.download(&tmp);
+                    let (mut worst, mut sum, mut cnt) = (0f64, 0f64, 0usize);
+                    for tt in 0..t {
+                        for r in 0..w.rows {
+                            let i = tt * ostride + r;
+                            let (p, q) = (a[i] as f64, b[i] as f64);
+                            worst = worst.max((p - q).abs() / q.abs().max(1e-3));
+                            sum += (p - q).abs();
+                            cnt += 1;
+                        }
+                    }
+                    eprintln!(
+                        "WGEMM check dense {name}: {cnt} values, mean |diff| {:.3e}, worst rel {worst:.3e}",
+                        sum / cnt as f64
+                    );
+                }
+                self.mark(name);
+                return;
+            }
+        }
         // Wide windows: the same GEMV over MAX_T rows at a time, each chunk's int8 made here
         // (fe_q8's rule, the one norm_q8 applies), so every row's sum is the one a narrow window
         // gives it.
@@ -1566,6 +1668,13 @@ impl Coder {
             };
         }
         self.mark(name);
+    }
+
+    /// The narrow GEMV for `t <= MAX_T` rows (debug comparisons).
+    fn gemv_narrow(&self, w: &Dense, x: u64, out: u64, t: usize, ostride: usize) {
+        let wide = self.in_wide.replace(false);
+        self.gemv("check", w, x, None, out, t, ostride);
+        self.in_wide.set(wide);
     }
 
     /// `r += y` (when given), then `s.x = rmsnorm(r) * w` and its int8 codes in `s.mxq`.
@@ -2669,7 +2778,13 @@ fn upload_dense(
         off += rows;
     }
     let rb = segs16.into_iter().max().unwrap_or(0);
+    const GEMM_TYPES: [u32; 11] = [2, 6, 8, 11, 12, 13, 14, 20, 23, 42, 108];
+    let gemm_ok = k.is_multiple_of(32)
+        && words
+            .chunks(6)
+            .all(|w| GEMM_TYPES.contains(&w[2]) && (w[3] as usize).is_multiple_of(16));
     Ok(Dense {
+        gemm_ok,
         segs: dev.upload_u32(&words),
         nseg: parts.len() as i32,
         rows: off,
