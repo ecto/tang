@@ -82,6 +82,10 @@ struct Variants {
     router_fused: bool,
     /// Warps a row of the K-split GEMV for matrices with at least 4096 rows (0: `kq`).
     kq_tall: usize,
+    /// The top-k in the gate|up kernel's prologue instead of its own launch.
+    route_gu: bool,
+    /// Threads a block of the norm kernels.
+    normt: u32,
     /// Q4_K / Q5_K expert rows through `cx_dotq_fast` (32 weights a lane a step; default on,
     /// `TANG_CODER_FASTK=0` / `fastk=0` for the 8-weight decoder).
     fastk: bool,
@@ -110,6 +114,11 @@ impl Variants {
                 .unwrap_or(0),
             router_fused: env_is("TANG_CODER_ROUTER", "fused"),
             fastk: !env_is("TANG_CODER_FASTK", "0"),
+            route_gu: env_is("TANG_CODER_ROUTE", "gu"),
+            normt: std::env::var("TANG_CODER_NORMT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1024),
             kq_tall: std::env::var("TANG_CODER_KQTALL")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -391,7 +400,7 @@ impl Coder {
             gdn_grouped: true,
             ..Geometry::FLASH_NEXT
         };
-        let max_ctx = opts.max_ctx.next_multiple_of(ck::ATTN_CHUNK);
+        let max_ctx = opts.max_ctx.next_multiple_of(ck::attn_chunk());
         let eps = hp.eps;
 
         let dev = CudaComputeDevice::new().map_err(|e| anyhow!("CUDA: {e:?}"))?;
@@ -560,7 +569,7 @@ impl Coder {
             .max()
             .unwrap();
         let np = MAX_T * (hp.n_expert_used + 1);
-        let nchunk_max = max_ctx / ck::ATTN_CHUNK;
+        let nchunk_max = max_ctx / ck::attn_chunk();
         let z = |n: usize| dev.alloc_f32(n);
         let xq_words = |k: usize| (MAX_T * k + MAX_T * k / 32 * 4).div_ceil(4);
         let s = Scratch {
@@ -1001,7 +1010,7 @@ impl Coder {
             self.launch(
                 self.k.norm_q8,
                 (t as u32, 1, 1),
-                1024,
+                self.var.normt,
                 tang_moe::args![r, y, wp, x, xq, n, eps, ad],
             )
         };
@@ -1010,8 +1019,8 @@ impl Coder {
     /// Split-K chunks a window at `pos0 + t` runs over: a power-of-two bucket of the context,
     /// so a window graph is reused until the context doubles.
     fn nchunk(&self, end: usize) -> usize {
-        let bucket = end.next_power_of_two().max(4 * ck::ATTN_CHUNK);
-        bucket.min(self.max_ctx) / ck::ATTN_CHUNK
+        let bucket = end.next_power_of_two().max(4 * ck::attn_chunk());
+        bucket.min(self.max_ctx) / ck::attn_chunk()
     }
 
     // ---- the window
@@ -1182,8 +1191,10 @@ impl Coder {
             x,
             self.eps,
         );
+        let route_gu = self.var.route_gu && self.var.guk == 0;
+        let lg_in = if route_gu { lg } else { 0u64 };
         unsafe {
-            if !self.var.router_fused {
+            if !self.var.router_fused && !route_gu {
                 self.launch(
                     self.k.route,
                     (t as u32, 1, 1),
@@ -1215,7 +1226,9 @@ impl Coder {
                     ((2 * ff) as u32 / (8 * rg), np, 1),
                     256,
                     8 * rg * 16 * r16g as u32,
-                    tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti, r16g, fastk],
+                    tang_moe::args![
+                        gw, uw, sg, su, ids, mxq, egu, ti, r16g, fastk, lg_in, lsi, w, scale
+                    ],
                 );
             }
             if self.var.dnk > 0 {
@@ -1262,7 +1275,7 @@ impl Coder {
             self.launch(
                 self.k.moe_add_norm,
                 (t as u32, 1, 1),
-                1024,
+                self.var.normt,
                 tang_moe::args![r, parts, w, lg, lsi, ti, yo, wn, xo, mxq, eps],
             );
         }
@@ -1688,6 +1701,8 @@ impl Coder {
             router_fused: false,
             kq_tall: 0,
             fastk: true,
+            route_gu: false,
+            normt: 1024,
         };
         for kv in spec.split(',').filter(|x| !x.is_empty()) {
             match kv {
@@ -1695,6 +1710,8 @@ impl Coder {
                 "silu=fused" => v.silu_sep = false,
                 "router=fused" => v.router_fused = true,
                 "fastk=0" => v.fastk = false,
+                "route=gu" => v.route_gu = true,
+                _ if kv.starts_with("normt=") => v.normt = kv[6..].parse()?,
                 _ if kv.starts_with("kqtall=") => v.kq_tall = kv[7..].parse()?,
                 _ if kv.starts_with("guk=") => v.guk = kv[4..].parse()?,
                 _ if kv.starts_with("dnk=") => v.dnk = kv[4..].parse()?,

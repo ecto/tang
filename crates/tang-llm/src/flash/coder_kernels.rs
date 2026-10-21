@@ -25,12 +25,17 @@ pub fn prelude(c: &Shapes) -> String {
         topk = c.topk,
         ne = c.n_expert,
         np = super::coder::MAX_T * (c.topk + 1),
-        chunk = ATTN_CHUNK,
+        chunk = attn_chunk(),
     )
 }
 
-/// Positions per split-K attention block.
-pub const ATTN_CHUNK: usize = 64;
+/// Positions per split-K attention block (`TANG_CODER_CHUNK`, default 64).
+pub fn attn_chunk() -> usize {
+    std::env::var("TANG_CODER_CHUNK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64)
+}
 
 /// The shapes the kernels are compiled for.
 #[derive(Clone, Debug)]
@@ -134,7 +139,7 @@ extern "C" __global__ void cx_moe_add_norm(float* r, const float* parts, const f
 // One warp, token t: CG reads the logits through L2 only (written by other blocks of the same
 // launch, see cx_router).
 template <bool CG>
-__device__ __forceinline__ void route_warp(const float* lg, int ls, int t, unsigned* ids, float* wts, float scale) {
+__device__ __forceinline__ void route_core(const float* lg, int ls, int t, unsigned* id_out, float* w_out, float scale) {
     const int lane = threadIdx.x & 31;
     const float* l = lg + (size_t)t * ls;
     const int PER = (CX_NE + 31) / 32;
@@ -172,9 +177,13 @@ __device__ __forceinline__ void route_warp(const float* lg, int ls, int t, unsig
     if (lane < CX_TOPK) {
         float w = (float)(my_p / wsum);
         if (scale != 0.f && scale != 1.f) w *= scale;
-        ids[t * CX_TOPK + lane] = my_id;
-        wts[t * CX_TOPK + lane] = w;
+        id_out[lane] = my_id;
+        w_out[lane] = w;
     }
+}
+template <bool CG>
+__device__ __forceinline__ void route_warp(const float* lg, int ls, int t, unsigned* ids, float* wts, float scale) {
+    route_core<CG>(lg, ls, t, ids + t * CX_TOPK, wts + t * CX_TOPK, scale);
 }
 extern "C" __global__ void cx_route(const float* lg, int ls, unsigned* ids, float* wts, float scale) {
     route_warp<false>(lg, ls, blockIdx.x, ids, wts, scale);
@@ -282,13 +291,29 @@ __device__ __forceinline__ const unsigned char* cx_stage(const unsigned char* sr
 // p >= T·K is the shared expert for token p − T·K. out[p][r]: r < FF gate, else up.
 // Grid (2 FF / (8 R), T · (K + 1)), block 256, dynamic smem 8 R × r16 × 16 bytes.
 template <int R>
-__device__ __forceinline__ void moe_gu_body(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
-                                            const unsigned char* xq, float* out, int T, int r16, int fast) {
+__device__ __forceinline__ void moe_gu_body(ExW g, ExW u, ExW sg, ExW su, unsigned* ids,
+                                            const unsigned char* xq, float* out, int T, int r16, int fast,
+                                            const float* lg, int ls, float* wts, float scale) {
     extern __shared__ uint4 dsm[];
+    __shared__ unsigned s_id[CX_TOPK];
+    __shared__ float s_w[CX_TOPK];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, p = blockIdx.y;
     const bool shared = p >= T * CX_TOPK;
     const int t = shared ? p - T * CX_TOPK : p / CX_TOPK;
-    const unsigned e = shared ? 0u : ids[p];
+    unsigned e;
+    if (lg && !shared) {
+        // Route in the prologue (lg given): every block of token t runs the same top-k; the
+        // first block of its rank-0 pair publishes it for the down and combine kernels.
+        if (warp == 0) route_core<false>(lg, ls, t, s_id, s_w, scale);
+        __syncthreads();
+        e = s_id[p % CX_TOPK];
+        if (blockIdx.x == 0 && p % CX_TOPK == 0 && threadIdx.x < CX_TOPK) {
+            ids[t * CX_TOPK + threadIdx.x] = s_id[threadIdx.x];
+            wts[t * CX_TOPK + threadIdx.x] = s_w[threadIdx.x];
+        }
+    } else {
+        e = shared ? 0u : ids[p];
+    }
     const unsigned char* w[R];
     int ty[R], rr[R];
     #pragma unroll
@@ -309,13 +334,15 @@ __device__ __forceinline__ void moe_gu_body(ExW g, ExW u, ExW sg, ExW su, const 
         if (lane == 0) out[(size_t)p * 2 * CX_FF + rr[j]] = a;
     }
 }
-extern "C" __global__ void __launch_bounds__(256) cx_moe_gu(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
-                                                            const unsigned char* xq, float* out, int T, int r16, int fast) {
-    moe_gu_body<2>(g, u, sg, su, ids, xq, out, T, r16, fast);
+extern "C" __global__ void __launch_bounds__(256) cx_moe_gu(ExW g, ExW u, ExW sg, ExW su, unsigned* ids,
+                                                            const unsigned char* xq, float* out, int T, int r16, int fast,
+                                                            const float* lg, int ls, float* wts, float scale) {
+    moe_gu_body<2>(g, u, sg, su, ids, xq, out, T, r16, fast, lg, ls, wts, scale);
 }
-extern "C" __global__ void __launch_bounds__(256) cx_moe_gu_r4(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
-                                                               const unsigned char* xq, float* out, int T, int r16, int fast) {
-    moe_gu_body<4>(g, u, sg, su, ids, xq, out, T, r16, fast);
+extern "C" __global__ void __launch_bounds__(256) cx_moe_gu_r4(ExW g, ExW u, ExW sg, ExW su, unsigned* ids,
+                                                               const unsigned char* xq, float* out, int T, int r16, int fast,
+                                                               const float* lg, int ls, float* wts, float scale) {
+    moe_gu_body<4>(g, u, sg, su, ids, xq, out, T, r16, fast, lg, ls, wts, scale);
 }
 
 // h = silu(gate) * up per pair, then int8 (fe_q8's rule) into hq: codes [CX_NP][FF], then
