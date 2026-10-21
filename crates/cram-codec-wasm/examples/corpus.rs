@@ -7,15 +7,15 @@
 //! ```
 //! `FIELDS.txt`: one `path AxBxC` per line.
 
-use std::fmt::Write as _;
-use std::sync::Arc;
-use std::time::Instant;
 use cram_codec::codec::ErrorBound;
 use cram_codec::gpudec::GpuDecoder;
 use cram_codec::gpuwav::{self, GpuConfig};
 use cram_codec::gpuwav3::{self, Gpu3Config, Model3};
 use cram_codec::learned;
 use cram_codec_wasm::{decode_cpu_bits, decoder_key, fnv1a_bits, format_of, Format};
+use std::fmt::Write as _;
+use std::sync::Arc;
+use std::time::Instant;
 
 fn opt(args: &[String], k: &str, d: &str) -> String {
     args.iter()

@@ -33,8 +33,7 @@ fn main() {
         Model3::Static
     } else if let Some(p) = m.strip_prefix("pretrained:") {
         let net = std::sync::Arc::new(
-            cram_codec::learned::Net::from_bytes(&std::fs::read(p).expect("model"))
-                .expect("parse"),
+            cram_codec::learned::Net::from_bytes(&std::fs::read(p).expect("model")).expect("parse"),
         );
         cram_codec::learned::register(net.clone());
         Model3::Pretrained(net)

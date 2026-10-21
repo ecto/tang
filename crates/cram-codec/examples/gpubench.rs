@@ -6,10 +6,10 @@
 //! `ratio` prints one JSON line per (target, codec): serial tc-wavelet (hand)
 //! and tc-gpu per brick size, each verified by decoding.
 
-use std::time::Instant;
 use cram_codec::codec::ErrorBound;
 use cram_codec::gpuwav::{self, GpuConfig};
 use cram_codec::gpuwav3::{self, Gpu3Config, Model3};
+use std::time::Instant;
 
 fn cfg3_of(bound: ErrorBound, bk: usize, args: &[String]) -> Gpu3Config {
     let m = opt(args, "--model3", "static");
@@ -26,8 +26,7 @@ fn cfg3_of(bound: ErrorBound, bk: usize, args: &[String]) -> Gpu3Config {
         }
     } else if let Some(p) = m.strip_prefix("pretrained:") {
         let net = std::sync::Arc::new(
-            cram_codec::learned::Net::from_bytes(&std::fs::read(p).expect("model"))
-                .expect("parse"),
+            cram_codec::learned::Net::from_bytes(&std::fs::read(p).expect("model")).expect("parse"),
         );
         cram_codec::learned::register(net.clone());
         Model3::Pretrained(net)
@@ -177,11 +176,9 @@ fn main() {
             let b = std::fs::read(f).unwrap();
             let want = std::fs::read_to_string(format!("{f}.hash")).unwrap();
             let ps = gpuwav3::parse3(&b).unwrap();
-            let g = cram_codec::gpudec::GpuDecoder::new(
-                ps.lanes,
-                ps.d3.iter().copied().max().unwrap(),
-            )
-            .unwrap();
+            let g =
+                cram_codec::gpudec::GpuDecoder::new(ps.lanes, ps.d3.iter().copied().max().unwrap())
+                    .unwrap();
             let (v, _) = g.decode3(&b).unwrap();
             let h = v.iter().fold(0xcbf29ce484222325u64, |h, &x| {
                 (h ^ x as u64).wrapping_mul(0x100000001b3)

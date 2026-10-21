@@ -13,9 +13,9 @@
 //!   `gpu.lastTimes()` — JSON split of the last decode.
 //! - `fnv1a(f32s)` — the gate hash (FNV-1a 64 over the `f32` bit patterns).
 
-use std::sync::Arc;
 use cram_codec::gpudec::{GpuDecoder, GpuTimes};
 use cram_codec::{gpuwav, gpuwav3, learned};
+use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 
 /// Stream format, by magic (an `0xA0`/`0xA1` auto tag byte is not expected

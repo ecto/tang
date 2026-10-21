@@ -7,11 +7,11 @@
 //! the coefficients are quantized and in-band predicted exactly as when
 //! coding, and a seeded random subset of `(features, residual)` samples is
 //! kept. The network is trained on the union and written to OUT.
-use std::sync::Arc;
 use cram_codec::codec::ErrorBound;
 use cram_codec::coefcode::fit_predictors;
 use cram_codec::learned::{collect, mean_bits_float, train, Net, Sample, TrainConfig};
 use cram_codec::wavcodec::{encode_f32, quantize, Coeffs, WavConfig};
+use std::sync::Arc;
 
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();

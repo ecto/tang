@@ -13,9 +13,9 @@
 //! `--model hand|overfit|pretrained:PATH`. `--fast` (= `--codec fast`): one
 //! candidate picked before encoding, step from a formula, no overfit.
 
-use std::time::Instant;
 use cram_codec::codec::ErrorBound;
 use cram_codec::{decode_any, wavcodec, Decoded};
+use std::time::Instant;
 
 fn usage() -> ! {
     eprintln!("usage: tc encode IN.f32 OUT --dims AxBxC --codec wavelet|tucker|interp|lorenzo|qtt|auto|portfolio-all|fast BOUND [--rho r] [--model m]\n       tc decode IN OUT.f32 [--model pretrained:PATH]");

@@ -12,8 +12,8 @@
 //! `encode` and `bench` print one JSON line of stats (sizes, ranks, errors,
 //! single-thread wall times).
 
-use std::time::Instant;
 use cram_codec::{decode, encode_f32, Config, Decoded, DigitOrder, ErrorBound, PadPolicy};
+use std::time::Instant;
 
 fn usage() -> ! {
     eprintln!("usage: qtt encode IN.f32 OUT.qtt --dims AxBxC BOUND [opts]\n       qtt decode IN.qtt OUT.f32\n       qtt bench IN.f32 --dims AxBxC BOUND [opts]");
