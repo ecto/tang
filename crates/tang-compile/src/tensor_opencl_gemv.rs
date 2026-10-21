@@ -350,8 +350,8 @@ pub fn mm_shape() -> (usize, usize, usize) {
 }
 
 /// Register block of [`TensorGraph::opencl_mma_kernel_q4`] for `m` rows
-/// (tokens): `TANG_CL_MM` when set (RM 0: automatic), else automatic rows
-/// by 4 columns in groups of 64. Automatic rows split `m` into the fewest
+/// (tokens): `TANG_CL_MM` (default 4x4x64; RM 0: automatic rows, a tuner
+/// candidate — 7x4 ran 33% slower than 4x4 on the Adreno). Automatic rows split `m` into the fewest
 /// blocks of at most 8 rows (20 tokens: 3 blocks of 7, so each packed
 /// weight is read 3 times instead of 5), padding at most a row per block.
 pub fn mm_shape_q4(m: usize) -> (usize, usize, usize) {
@@ -361,7 +361,7 @@ pub fn mm_shape_q4(m: usize) -> (usize, usize, usize) {
             let p: Vec<usize> = v.split('x').filter_map(|x| x.parse().ok()).collect();
             (p.len() == 3 && p[1] > 0 && p[2] > 0).then(|| (p[0], p[1], p[2]))
         })
-        .unwrap_or((0, 4, 64));
+        .unwrap_or((4, 4, 64));
     let rm = if rm == 0 {
         m.div_ceil(m.div_ceil(8))
     } else {
@@ -421,6 +421,15 @@ pub fn mm_lanes(wg: usize) -> usize {
     } else {
         1
     }
+}
+
+/// `None` from [`TensorGraph::opencl_mma_kernel_q4`], logged with the
+/// line that rejected `root` under `TANG_CL_LOG=1`.
+fn q4_none(root: usize, line: u32) -> Option<super::cuda_gemv::Kernel> {
+    if std::env::var("TANG_CL_LOG").is_ok_and(|v| v == "1") {
+        eprintln!("tang-cl: node {root}: no q4 register block (tensor_opencl_gemv.rs:{line})");
+    }
+    None
 }
 
 /// First line of a kernel that is OpenCL C already (no transliteration).
@@ -518,25 +527,45 @@ impl TensorGraph {
         use super::tile::emit_scalar;
         use tang_expr::Node;
         let c = self.comp_at(root)?;
-        let red_node = self.tiled_reduction(root)?;
+        // the reduction: `root`, or the one inlined reduction its epilogue
+        // reads (any red dims: `tiled_reduction` caps the minor ones at 32,
+        // which a 6144-wide down projection's 96 groups exceed)
+        let red_node = if c.monoid.is_some() {
+            root
+        } else {
+            let mut found = None;
+            for a in &c.args {
+                let p = a.src.n();
+                if self.nodes[p].inline && self.comp_at(p).is_some_and(|pc| pc.monoid.is_some()) {
+                    if found.is_some_and(|f| f != p) {
+                        return q4_none(root, line!());
+                    }
+                    found = Some(p);
+                }
+            }
+            match found {
+                Some(p) => p,
+                None => return q4_none(root, line!()),
+            }
+        };
         let rc = self.comp_at(red_node)?;
         let epilogue = red_node != root;
         if rc.red.len() != 2 || rc.tuple != 0 || rc.body_outs.len() != 1 {
-            return None;
+            return q4_none(root, line!());
         }
         if rc.monoid.as_ref().map(super::Monoid::kind) != Some(super::MonoidKind::Sum) {
-            return None;
+            return q4_none(root, line!());
         }
         let pts: Vec<usize> = super::fixed(rc.points());
         if pts.len() != 2 || c.points().len() != 2 {
-            return None;
+            return q4_none(root, line!());
         }
         if epilogue && self.epilogue_read(c, red_node)? != super::View::identity(2, 2).forms {
-            return None;
+            return q4_none(root, line!());
         }
         let (gs, js) = (rc.red[0].n(), rc.red[1].n());
         if js % 8 != 0 {
-            return None;
+            return q4_none(root, line!());
         }
         let storage = |j: usize| self.storage(TensorId(j as u32)).n();
         let rank = 4;
@@ -544,7 +573,7 @@ impl TensorGraph {
         // reduction's body, or an inlined map (the dequantization) it reads
         let nodes = rc.body.nodes_slice();
         let Node::Mul(l, r) = nodes[rc.body_outs[0].index() as usize] else {
-            return None;
+            return q4_none(root, line!());
         };
         let var_of = |e: tang_expr::ExprId| match nodes[e.index() as usize] {
             Node::Var(v) => Some(v as usize),
@@ -594,7 +623,7 @@ impl TensorGraph {
                     .iter()
                     .any(|&i| matches!(nodes[i], Node::Var(v) if v as usize == vx))
                 {
-                    return None;
+                    return q4_none(root, line!());
                 }
                 let args = rc
                     .args
@@ -607,13 +636,13 @@ impl TensorGraph {
         };
         let ax = self.flat_addr(&rc.args[vx], rank);
         if ax.coefs[3] != 1 || ax.coefs[1] != 0 && ax.coefs[0] != 0 {
-            return None;
+            return q4_none(root, line!());
         }
         // which point dim is the token (x varies along it): rows dy, columns dx
         let (dy, dx) = if ax.coefs[0] != 0 { (0, 1) } else { (1, 0) };
         let (m, n) = (pts[dy], pts[dx]);
         if m < 2 || ax.coefs[dx] != 0 {
-            return None;
+            return q4_none(root, line!());
         }
         // E's args: the nibbles (U4, along j) and per-group values
         enum Role {
@@ -635,15 +664,15 @@ impl TensorGraph {
                 continue;
             };
             if a.view.guard {
-                return None;
+                return q4_none(root, line!());
             }
             let buf = storage(a.src.n());
             if !reads.contains(&buf) {
-                return None;
+                return q4_none(root, line!());
             }
             let addr = self.flat_addr(a, rank);
             if addr.coefs[dy] != 0 {
-                return None;
+                return q4_none(root, line!());
             }
             match packed.get(&buf) {
                 Some(Packing::U4) => {
@@ -652,7 +681,7 @@ impl TensorGraph {
                         || addr.coefs[dx] % 8 != 0
                         || addr.coefs[2] % 8 != 0
                     {
-                        return None;
+                        return q4_none(root, line!());
                     }
                     nibbles += 1;
                     roles.push(Some(Role::Nibble { buf, addr }));
@@ -664,7 +693,7 @@ impl TensorGraph {
             }
         }
         if nibbles == 0 {
-            return None;
+            return q4_none(root, line!());
         }
         let f16 = prefill_f16();
         let (rm, rn, wg) = mm_shape_q4(m);

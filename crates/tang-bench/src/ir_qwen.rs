@@ -1429,8 +1429,11 @@ mod tests {
     /// packed weights, and no kernel materializes a dequantized weight.
     #[test]
     fn opencl_prefill_q4_reads_packed_weights() {
+        // ff of 40 groups: the down projection's reduce dims [40, 64] are
+        // past `tiled_reduction`'s cap (Qwen3-1.7B's are [96, 64])
         let dims = QwenDims {
             prefill_q4: true,
+            ff: 40 * GROUP,
             ..tiny()
         };
         let heads = opencl_prefill_heads(&dims, 6);
