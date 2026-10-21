@@ -25,12 +25,27 @@ faer = { version = "0.24", default-features = false, features = ["std"] }
 wgpu = { workspace = true, optional = true }
 pollster = { workspace = true, optional = true }
 
+# Lossless container arms (`container` feature). Native only: zstd and xz2
+# wrap C libraries that do not build for wasm32-unknown-unknown.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+zstd = { workspace = true, optional = true }
+xz2 = { workspace = true, optional = true }
+brotli = { workspace = true, optional = true }
+crc32fast = { workspace = true, optional = true }
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # std::time::Instant panics on wasm32-unknown-unknown
 web-time = "1.1"
 
 [features]
-default = []
+default = ["container"]
+# `container::{compress, decompress}` and the `cram` binary (native only)
+container = ["dep:zstd", "dep:xz2", "dep:brotli", "dep:crc32fast"]
 gpu = ["dep:wgpu", "dep:pollster"]
+
+[[bin]]
+name = "cram"
+path = "src/bin/cram.rs"
+required-features = ["container"]
 
 [dev-dependencies]
