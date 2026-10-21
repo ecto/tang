@@ -1,6 +1,6 @@
 """Kodak RD summary + BD-rates (Bjontegaard, cubic in log-rate, PSNR domain).
 
-Usage: python rd.py COOLCHIC_PUBLISHED.tsv BASELINES.tsv [OURS.tsv ...]
+Usage: python rd.py [--ref LABEL] COOLCHIC_PUBLISHED.tsv BASELINES.tsv [OURS.tsv ...]
 
 - published Cool-chic tsv: lmbda seq_name n_pixels loss psnr_db rate_bpp
 - baselines tsv (baselines.py): codec q image bpp psnr
@@ -40,7 +40,15 @@ def curve(points, images):
     return np.array([o[0] for o in out]), np.array([o[1] for o in out])
 
 
+REF = None
+
+
 def main():
+    global REF
+    if "--ref" in sys.argv:
+        i = sys.argv.index("--ref")
+        REF = sys.argv[i + 1]
+        del sys.argv[i : i + 2]
     pub = defaultdict(dict)
     for line in open(sys.argv[1]).read().splitlines()[1:]:
         l, name, _, _, ps, bpp = line.split("\t")
@@ -55,6 +63,7 @@ def main():
                 continue
             lab, l, name, bpp, ps = line.split()
             curves[lab][l][name] = (float(bpp), float(ps))
+    ref = curves.get(REF) if REF else None
     for lab, pts in curves.items():
         imgs = sorted(set.intersection(*[set(d) for d in pts.values()]))
         if not imgs:
@@ -62,7 +71,11 @@ def main():
         r, p = curve(pts, imgs)
         rc, pc = curve(pub, imgs)
         bd = bd_rate(rc, pc, r, p)
-        print(f"{lab:>14}  n={len(imgs):2d}  BD-rate vs Cool-chic 5.0 (published): {bd:+6.1f} %")
+        extra = ""
+        if ref is not None and lab != REF:
+            rr, rp = curve(ref, imgs)
+            extra = f"   vs {REF}: {bd_rate(rr, rp, r, p):+6.1f} %"
+        print(f"{lab:>14}  n={len(imgs):2d}  BD-rate vs Cool-chic 5.0 (published): {bd:+6.1f} %{extra}")
         for a, b in zip(r, p):
             print(f"{'':>16}{a:7.4f} bpp  {b:6.2f} dB")
     rc, pc = curve(pub, sorted(next(iter(pub.values())).keys()))
