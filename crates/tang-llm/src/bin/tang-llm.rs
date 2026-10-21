@@ -365,6 +365,7 @@ fn main() -> Result<()> {
         "flash-bench" => return tang_llm::flash::cli::bench(&args[1..]),
         "flash-spec-test" => return tang_llm::flash::cli::spec_test(&args[1..]),
         "flash-tcheck" => return tang_llm::flash::cli::tcheck(&args[1..]),
+        "flash-aa" => return tang_llm::flash::cli::aa(&args[1..]),
         "flash-resume-test" => return tang_llm::flash::serve::resume_test(&args[1..]),
         "flash-sampler-test" => return tang_llm::flash::serve::sampler_test(&args[1..]),
         "flash-prefill-bench" => return tang_llm::flash::serve::prefill_bench(&args[1..]),

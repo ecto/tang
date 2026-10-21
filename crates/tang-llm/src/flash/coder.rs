@@ -62,6 +62,62 @@ impl Default for CoderOpts {
 
 /// `TANG_CODER_GEMV=v1`: dense GEMVs on `fe_gemv8` (two rows a warp) instead of the K-split
 /// `cx_gemvk` (A/B).
+fn env_is(key: &str, val: &str) -> bool {
+    std::env::var(key).is_ok_and(|v| v == val)
+}
+
+/// Kernel variants for A/B on one build (defaults are the measured winners):
+/// `TANG_CODER_EXROWS=4` expert rows a warp (default 2), `TANG_CODER_SILU=fused` the SiLU+int8
+/// in the down kernel (default a separate launch), `TANG_CODER_KQ` warps a row in the
+/// K-split GEMV (1, 2, 4 or 8; default 2).
+#[derive(Clone, Copy, Debug)]
+struct Variants {
+    exrows: usize,
+    silu_sep: bool,
+    kq: usize,
+    /// K-split expert kernels: warps a row for gate|up and for down (0: the staged kernels).
+    guk: usize,
+    dnk: usize,
+    /// The top-k in the router GEMV's last block (one launch).
+    router_fused: bool,
+    /// Warps a row of the K-split GEMV for matrices with at least 4096 rows (0: `kq`).
+    kq_tall: usize,
+    /// Q4_K / Q5_K expert rows through `cx_dotq_fast` (32 weights a lane a step; default on,
+    /// `TANG_CODER_FASTK=0` / `fastk=0` for the 8-weight decoder).
+    fastk: bool,
+}
+
+impl Variants {
+    fn from_env() -> Self {
+        Variants {
+            exrows: if env_is("TANG_CODER_EXROWS", "4") {
+                4
+            } else {
+                2
+            },
+            silu_sep: !env_is("TANG_CODER_SILU", "fused"),
+            kq: std::env::var("TANG_CODER_KQ")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2),
+            guk: std::env::var("TANG_CODER_GUK")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            dnk: std::env::var("TANG_CODER_DNK")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            router_fused: env_is("TANG_CODER_ROUTER", "fused"),
+            fastk: !env_is("TANG_CODER_FASTK", "0"),
+            kq_tall: std::env::var("TANG_CODER_KQTALL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+        }
+    }
+}
+
 fn gemv_v1() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("TANG_CODER_GEMV").is_ok_and(|v| v == "v1"))
@@ -176,6 +232,15 @@ struct Kern {
     q8: Fun,
     gemv8: [Fun; MAX_T],
     gemvk: [Fun; MAX_T],
+    gemvk8: [Fun; MAX_T],
+    gemvk2: [Fun; MAX_T],
+    gemvk1: [Fun; MAX_T],
+    moe_gu4: Fun,
+    guk: [Fun; 3],
+    dnk: [Fun; 3],
+    router: [Fun; MAX_T],
+    moe_down_f2: Fun,
+    moe_down_f4: Fun,
     norm_q8: Fun,
     route: Fun,
     moe_gu: Fun,
@@ -214,6 +279,8 @@ struct Scratch {
     head: B,
     out_ids: B,
     amax: B,
+    /// cx_router's block counter (zero between launches).
+    done: B,
 }
 
 /// Pinned staging: control words and embeddings in, sampled ids out.
@@ -271,6 +338,9 @@ pub struct Coder {
     pub load_report: String,
     /// `TANG_CODER_PROF=1` (eager windows): GPU time per stage, by name, summed.
     prof: Option<std::cell::RefCell<Prof>>,
+    /// Stage sweep: enqueue only this stage's launches (`stage_sweep`).
+    only: std::cell::Cell<Option<&'static str>>,
+    var: Variants,
 }
 
 #[derive(Default)]
@@ -518,6 +588,7 @@ impl Coder {
             head: z(MAX_T * hp.n_vocab),
             out_ids: z(MAX_T),
             amax: z(MAX_T * 64 * 2),
+            done: z(1),
         };
         dev.sync();
         let t_weights = t1.elapsed().as_secs_f64();
@@ -557,6 +628,47 @@ impl Coder {
             q8: f(&cm, "fe_q8")?,
             gemv8,
             gemvk,
+            gemvk1: {
+                let mut a = [std::ptr::null_mut(); MAX_T];
+                for (i, slot) in a.iter_mut().enumerate() {
+                    *slot = f(&cm, &format!("cx_gemvk1_t{}", i + 1))?;
+                }
+                a
+            },
+            gemvk2: {
+                let mut a = [std::ptr::null_mut(); MAX_T];
+                for (i, slot) in a.iter_mut().enumerate() {
+                    *slot = f(&cm, &format!("cx_gemvk2_t{}", i + 1))?;
+                }
+                a
+            },
+            gemvk8: {
+                let mut a = [std::ptr::null_mut(); MAX_T];
+                for (i, slot) in a.iter_mut().enumerate() {
+                    *slot = f(&cm, &format!("cx_gemvk8_t{}", i + 1))?;
+                }
+                a
+            },
+            moe_gu4: f(&cm, "cx_moe_gu_r4")?,
+            guk: [
+                f(&cm, "cx_moe_guk1")?,
+                f(&cm, "cx_moe_guk2")?,
+                f(&cm, "cx_moe_guk4")?,
+            ],
+            dnk: [
+                f(&cm, "cx_moe_downk1")?,
+                f(&cm, "cx_moe_downk2")?,
+                f(&cm, "cx_moe_downk4")?,
+            ],
+            router: {
+                let mut a = [std::ptr::null_mut(); MAX_T];
+                for (i, slot) in a.iter_mut().enumerate() {
+                    *slot = f(&cm, &format!("cx_router_t{}", i + 1))?;
+                }
+                a
+            },
+            moe_down_f2: f(&cm, "cx_moe_down_f2")?,
+            moe_down_f4: f(&cm, "cx_moe_down_f4")?,
             norm_q8: f(&cm, "cx_norm_q8")?,
             route: f(&cm, "cx_route")?,
             moe_gu: f(&cm, "cx_moe_gu")?,
@@ -573,6 +685,25 @@ impl Coder {
             argmax2: f(&em, "fe_argmax2")?,
             _mods: vec![cm, fm, em],
         };
+        for f in [
+            k.moe_gu,
+            k.moe_gu4,
+            k.moe_down,
+            k.moe_down_f2,
+            k.moe_down_f4,
+        ] {
+            unsafe {
+                gpu::check(
+                    cudarc::driver::sys::cuFuncSetAttribute(
+                        f,
+                        cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        200 * 1024,
+                    ),
+                    "cuFuncSetAttribute",
+                )
+                .map_err(|e| anyhow!("{e}"))?;
+            }
+        }
         let t_kernels = t2.elapsed().as_secs_f64();
 
         let mut io = Io {
@@ -632,6 +763,8 @@ impl Coder {
             prof: std::env::var("TANG_CODER_PROF")
                 .is_ok_and(|v| v == "1")
                 .then(|| std::cell::RefCell::new(Prof::default())),
+            only: std::cell::Cell::new(None),
+            var: Variants::from_env(),
         })
     }
 
@@ -659,6 +792,9 @@ impl Coder {
         block: u32,
         args: &mut [*mut std::ffi::c_void],
     ) {
+        if self.skip(self.kname(f)) {
+            return;
+        }
         gpu::launch(f, grid, (block, 1, 1), 0, &self.stream, args).expect("launch");
         if self.prof.is_some() {
             self.mark(self.kname(f));
@@ -673,10 +809,18 @@ impl Coder {
         smem: u32,
         args: &mut [*mut std::ffi::c_void],
     ) {
+        if self.skip(self.kname(f)) {
+            return;
+        }
         gpu::launch(f, grid, (block, 1, 1), smem, &self.stream, args).expect("launch");
         if self.prof.is_some() {
             self.mark(self.kname(f));
         }
+    }
+
+    /// Stage sweep: is `name` filtered out?
+    fn skip(&self, name: &'static str) -> bool {
+        self.only.get().is_some_and(|o| o != name)
     }
 
     fn kname(&self, f: Fun) -> &'static str {
@@ -687,6 +831,15 @@ impl Coder {
             (k.moe_gu, "moe_gu"),
             (k.silu_q, "silu_q"),
             (k.moe_down, "moe_down"),
+            (k.moe_down_f2, "moe_down"),
+            (k.moe_down_f4, "moe_down"),
+            (k.moe_gu4, "moe_gu"),
+            (k.guk[0], "moe_gu"),
+            (k.guk[1], "moe_gu"),
+            (k.guk[2], "moe_gu"),
+            (k.dnk[0], "moe_down"),
+            (k.dnk[1], "moe_down"),
+            (k.dnk[2], "moe_down"),
             (k.moe_add_norm, "moe_add_norm"),
             (k.prep, "attn_prep"),
             (k.part, "attn_part"),
@@ -699,6 +852,7 @@ impl Coder {
             (k.q8, "moe_q8"),
         ]
         .into_iter()
+        .chain(k.router.iter().map(|&r| (r, "router")))
         .find(|(g, _)| *g == f)
         .map_or("other", |(_, n)| n)
     }
@@ -770,6 +924,9 @@ impl Coder {
         t: usize,
         ostride: usize,
     ) {
+        if self.skip(name) {
+            return;
+        }
         let (sp, ns, os, r16, ki) = (self.a(&w.segs), w.nseg, ostride as i32, w.row16, w.k as i32);
         let xq = match xq {
             Some(q) => q,
@@ -789,11 +946,22 @@ impl Coder {
                 q
             }
         };
-        if w.k.is_multiple_of(1024) && !gemv_v1() {
+        let kq = if self.var.kq_tall > 0 && w.rows >= 4096 {
+            self.var.kq_tall
+        } else {
+            self.var.kq
+        };
+        if w.k.is_multiple_of(kq * 256) && !gemv_v1() {
+            let f = match kq {
+                8 => self.k.gemvk8[t - 1],
+                2 => self.k.gemvk2[t - 1],
+                1 => self.k.gemvk1[t - 1],
+                _ => self.k.gemvk[t - 1],
+            };
             unsafe {
                 gpu::launch(
-                    self.k.gemvk[t - 1],
-                    (w.rows.div_ceil(2) as u32, 1, 1),
+                    f,
+                    (w.rows.div_ceil(8 / kq) as u32, 1, 1),
                     (256, 1, 1),
                     0,
                     &self.stream,
@@ -980,7 +1148,6 @@ impl Coder {
         let (n, ne, kk, ff) = (hp.n_embd, hp.n_expert, hp.n_expert_used, hp.n_ff_exp);
         let (x, mxq) = (self.a(&s.x), self.a(&s.mxq));
         let ls = ne + 1;
-        self.gemv("router", &layer.router, x, Some(mxq), self.a(&s.lg), t, ls);
         let (lg, lsi, ids, w, scale) = (
             self.a(&s.lg),
             ls as i32,
@@ -988,11 +1155,26 @@ impl Coder {
             self.a(&s.w),
             hp.expert_weights_scale,
         );
+        if self.var.router_fused {
+            let rw = &layer.router;
+            let (sp, ns, ki, done) = (self.a(&rw.segs), rw.nseg, rw.k as i32, self.a(&s.done));
+            unsafe {
+                self.launch(
+                    self.k.router[t - 1],
+                    (rw.rows.div_ceil(2) as u32, 1, 1),
+                    256,
+                    tang_moe::args![sp, ns, x, mxq, ki, lg, lsi, done, ids, w, scale],
+                );
+            }
+        } else {
+            self.gemv("router", &layer.router, x, Some(mxq), lg, t, ls);
+        }
         let (gw, uw, dw) = (layer.gate.w, layer.up.w, layer.down.w);
         let (sg, su, sd) = (layer.sh_gate.w, layer.sh_up.w, layer.sh_down.w);
         let (egu, hq, parts) = (self.a(&s.egu), self.a(&s.hq), self.a(&s.parts));
         let np = (t * (kk + 1)) as u32;
         let (ti, r16g, r16d) = (t as i32, layer.r16_gu, layer.r16_down);
+        let fastk = self.var.fastk as i32;
         let (r, yo, wn, xo, eps) = (
             self.a(&s.r),
             if keep_y { self.a(&s.moe_y) } else { 0u64 },
@@ -1001,32 +1183,82 @@ impl Coder {
             self.eps,
         );
         unsafe {
-            self.launch(
-                self.k.route,
-                (t as u32, 1, 1),
-                32,
-                tang_moe::args![lg, lsi, ids, w, scale],
-            );
-            self.launch_smem(
-                self.k.moe_gu,
-                ((2 * ff / 16) as u32, np, 1),
-                256,
-                (16 * 16 * r16g) as u32,
-                tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti, r16g],
-            );
-            self.launch(
-                self.k.silu_q,
-                ((ff / 32) as u32, np, 1),
-                32,
-                tang_moe::args![egu, hq],
-            );
-            self.launch_smem(
-                self.k.moe_down,
-                ((n / 16) as u32, np, 1),
-                256,
-                (16 * 16 * r16d) as u32,
-                tang_moe::args![dw, sd, ids, hq, parts, ti, r16d],
-            );
+            if !self.var.router_fused {
+                self.launch(
+                    self.k.route,
+                    (t as u32, 1, 1),
+                    32,
+                    tang_moe::args![lg, lsi, ids, w, scale],
+                );
+            }
+            let rg = self.var.exrows as u32;
+            let kidx = |q: usize| match q {
+                1 => 0,
+                2 => 1,
+                _ => 2,
+            };
+            if self.var.guk > 0 {
+                let q = self.var.guk;
+                self.launch(
+                    self.k.guk[kidx(q)],
+                    ((2 * ff * q / 8) as u32, np, 1),
+                    256,
+                    tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti],
+                );
+            } else {
+                self.launch_smem(
+                    if rg == 4 {
+                        self.k.moe_gu4
+                    } else {
+                        self.k.moe_gu
+                    },
+                    ((2 * ff) as u32 / (8 * rg), np, 1),
+                    256,
+                    8 * rg * 16 * r16g as u32,
+                    tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti, r16g, fastk],
+                );
+            }
+            if self.var.dnk > 0 {
+                let q = self.var.dnk;
+                self.launch(
+                    self.k.silu_q,
+                    ((ff / 32) as u32, np, 1),
+                    32,
+                    tang_moe::args![egu, hq],
+                );
+                self.launch(
+                    self.k.dnk[kidx(q)],
+                    ((n * q / 8) as u32, np, 1),
+                    256,
+                    tang_moe::args![dw, sd, ids, hq, parts, ti],
+                );
+            } else if self.var.silu_sep {
+                self.launch(
+                    self.k.silu_q,
+                    ((ff / 32) as u32, np, 1),
+                    32,
+                    tang_moe::args![egu, hq],
+                );
+                self.launch_smem(
+                    self.k.moe_down,
+                    ((n / 16) as u32, np, 1),
+                    256,
+                    (16 * 16 * r16d) as u32,
+                    tang_moe::args![dw, sd, ids, hq, parts, ti, r16d, fastk],
+                );
+            } else {
+                self.launch_smem(
+                    if rg == 4 {
+                        self.k.moe_down_f4
+                    } else {
+                        self.k.moe_down_f2
+                    },
+                    (n as u32 / (8 * rg), np, 1),
+                    256,
+                    8 * rg * 16 * r16d as u32,
+                    tang_moe::args![dw, sd, ids, egu, parts, ti, r16d, fastk],
+                );
+            }
             self.launch(
                 self.k.moe_add_norm,
                 (t as u32, 1, 1),
@@ -1324,6 +1556,158 @@ impl Coder {
             .collect())
     }
 
+    /// Time each stage of a T=1 window alone: a graph of that stage's launches for every layer
+    /// (the window with every other launch filtered out), replayed back to back. Returns
+    /// (stage, µs a step, bytes a step), the whole window first. Run after a decode (the
+    /// routing buffers then hold real expert ids).
+    pub fn stage_sweep(&mut self) -> Result<Vec<(&'static str, f64, f64)>> {
+        ensure!(!self.tokens.is_empty(), "decode something first");
+        let pos0 = self.tokens.len() - 1;
+        self.stage(pos0, 1)?;
+        let nchunk = self.nchunk(pos0 + 1);
+        self.enqueue_window(1, false, nchunk, None)?;
+        self.dev.sync();
+        let hp = &self.hp;
+        let lb = |f: &dyn Fn(&Layer) -> f64| -> f64 { self.layers.iter().map(f).sum() };
+        let ex = |e: &Experts, n: usize| e.w.estride as f64 * n as f64;
+        let k = hp.n_expert_used;
+        let stages: Vec<(&'static str, f64)> = vec![
+            ("", self.step_bytes(pos0 + 1)),
+            (
+                "gdn_in",
+                lb(&|l| {
+                    if l.gdn.is_some() {
+                        dense_bytes(&l.w_in)
+                    } else {
+                        0.0
+                    }
+                }),
+            ),
+            ("gdn_conv_step", 0.0),
+            ("gdn_commit", 0.0),
+            (
+                "gdn_out",
+                lb(&|l| {
+                    if l.gdn.is_some() {
+                        dense_bytes(&l.w_out)
+                    } else {
+                        0.0
+                    }
+                }),
+            ),
+            (
+                "attn_in",
+                lb(&|l| {
+                    if l.attn.is_some() {
+                        dense_bytes(&l.w_in)
+                    } else {
+                        0.0
+                    }
+                }),
+            ),
+            ("attn_prep", 0.0),
+            (
+                "attn_part",
+                lb(&|l| {
+                    if l.attn.is_some() {
+                        (pos0 * hp.n_head_kv * hp.head_dim * 4) as f64
+                    } else {
+                        0.0
+                    }
+                }),
+            ),
+            ("attn_merge", 0.0),
+            (
+                "attn_out",
+                lb(&|l| {
+                    if l.attn.is_some() {
+                        dense_bytes(&l.w_out)
+                    } else {
+                        0.0
+                    }
+                }),
+            ),
+            ("norm_q8", 0.0),
+            ("router", lb(&|l| dense_bytes(&l.router))),
+            ("route", 0.0),
+            (
+                "moe_gu",
+                lb(&|l| ex(&l.gate, k) + ex(&l.up, k) + ex(&l.sh_gate, 1) + ex(&l.sh_up, 1)),
+            ),
+            ("silu_q", 0.0),
+            ("moe_down", lb(&|l| ex(&l.down, k) + ex(&l.sh_down, 1))),
+            ("moe_add_norm", 0.0),
+            ("head", dense_bytes(&self.head)),
+            ("argmax", 0.0),
+        ];
+        const REPS: usize = 4;
+        const RUNS: usize = 10;
+        let mut out = Vec::new();
+        for (name, bytes) in stages {
+            self.only
+                .set(if name.is_empty() { None } else { Some(name) });
+            let stream = ManuallyDrop::new(Stream(self.dev.cu_stream()));
+            let me = self as *const Self;
+            let gr = Graph::capture(&stream, |_| {
+                for _ in 0..REPS {
+                    // SAFETY: `self` is not otherwise touched during capture.
+                    unsafe { &*me }
+                        .enqueue_window(1, false, nchunk, None)
+                        .map_err(|e| tang_moe::gpu::Error(format!("{e}")))?;
+                }
+                Ok(())
+            });
+            self.only.set(None);
+            let gr = gr.map_err(|e| anyhow!("capture {name}: {e}"))?;
+            gr.launch(&self.stream).map_err(|e| anyhow!("{e}"))?;
+            let (e0, e1) = (
+                gpu::Event::new(true).map_err(|e| anyhow!("{e}"))?,
+                gpu::Event::new(true).map_err(|e| anyhow!("{e}"))?,
+            );
+            e0.record(&self.stream).map_err(|e| anyhow!("{e}"))?;
+            for _ in 0..RUNS {
+                gr.launch(&self.stream).map_err(|e| anyhow!("{e}"))?;
+            }
+            e1.record(&self.stream).map_err(|e| anyhow!("{e}"))?;
+            e1.sync().map_err(|e| anyhow!("{e}"))?;
+            let us = e1.since(&e0).map_err(|e| anyhow!("{e}"))? as f64 * 1e3 / (REPS * RUNS) as f64;
+            out.push((if name.is_empty() { "window" } else { name }, us, bytes));
+        }
+        Ok(out)
+    }
+
+    /// Switch kernel variants (`exrows=4`, `silu=fused`, `kq=8`, comma-separated; empty for the
+    /// defaults) and drop the captured graphs.
+    pub fn set_variants(&mut self, spec: &str) -> Result<()> {
+        let mut v = Variants {
+            exrows: 2,
+            silu_sep: true,
+            kq: 2,
+            guk: 0,
+            dnk: 0,
+            router_fused: false,
+            kq_tall: 0,
+            fastk: true,
+        };
+        for kv in spec.split(',').filter(|x| !x.is_empty()) {
+            match kv {
+                "exrows=4" => v.exrows = 4,
+                "silu=fused" => v.silu_sep = false,
+                "router=fused" => v.router_fused = true,
+                "fastk=0" => v.fastk = false,
+                _ if kv.starts_with("kqtall=") => v.kq_tall = kv[7..].parse()?,
+                _ if kv.starts_with("guk=") => v.guk = kv[4..].parse()?,
+                _ if kv.starts_with("dnk=") => v.dnk = kv[4..].parse()?,
+                _ if kv.starts_with("kq=") => v.kq = kv[3..].parse()?,
+                _ => anyhow::bail!("unknown variant {kv}"),
+            }
+        }
+        self.var = v;
+        self.dev.sync();
+        self.graphs.clear();
+        Ok(())
+    }
+
     /// Bytes one decode step reads from VRAM at context `ctx`: every dense weight, the
     /// routed experts a token uses (top-k per layer, at the layer's average expert size), and
     /// the attention cache. The speed-of-light denominator.
@@ -1396,6 +1780,35 @@ fn upload_dense(
                 bytes[i * rb..(i + 1) * rb].copy_from_slice(&src[j * rb..(j + 1) * rb]);
             }
         }
+        // TANG_CODER_ROUTER16=1: F32 rows (the router) as bf16, half the bytes.
+        let (ty, rb, bytes) = if ty == 0 && env_is("TANG_CODER_ROUTER16", "1") {
+            let b16: Vec<u8> = bytes
+                .chunks(4)
+                .flat_map(|c| {
+                    let x = f32::from_le_bytes([c[0], c[1], c[2], c[3]]).to_bits();
+                    (((x + 0x7fff + ((x >> 16) & 1)) >> 16) as u16).to_le_bytes()
+                })
+                .collect();
+            (30, k * 2, b16)
+        } else if ty == 8 && k.is_multiple_of(1024) && !env_is("TANG_CODER_Q8X", "0") {
+            // Q8X (type 108, default; TANG_CODER_Q8X=0 keeps Q8_0): [k codes][k / 32 f16 scales] a
+            // row, lossless.
+            let nb = k / 32;
+            let mut out = Vec::with_capacity(rows * (k + 2 * nb));
+            for r in 0..rows {
+                let row = &bytes[r * rb..(r + 1) * rb];
+                for b in 0..nb {
+                    out.extend_from_slice(&row[b * 34 + 2..b * 34 + 34]);
+                }
+                for b in 0..nb {
+                    out.extend_from_slice(&row[b * 34..b * 34 + 2]);
+                }
+            }
+            (108, k + 2 * nb, out)
+        } else {
+            (ty, rb, bytes)
+        };
+        let mut bytes = bytes;
         // 16 bytes of slack: the GEMV stages rows with aligned 16-byte loads.
         total += rows * rb;
         bytes.extend_from_slice(&[0u8; 16]);
@@ -1409,7 +1822,7 @@ fn upload_dense(
             rb as u32,
             off as u32,
         ]);
-        if ty != 0 && ty != 30 {
+        if ty != 0 && ty != 30 && ty != 108 {
             segs16.push(rb);
         }
         ws.push(w);

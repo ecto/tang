@@ -131,3 +131,74 @@ Tried and measured at under 3% (or worse):
   only batches cut on the device.
 - **The VRAM-pressure check on pool misses only (#81)** measured +1.5% alone. It's kept because
   it takes ~2.6 ms of CPU off each step, which matters once kernels stop hiding host time.
+
+## Qwen3-Coder-Next (qwen3next Flash engine)
+
+`Qwen3-Coder-Next-UD-Q4_K_XL.gguf` (unsloth, 49.6 GB), the Flash engine's qwen3next path
+(`src/flash/coder.rs`), one stream, greedy. A step reads 3.42 GB at a 1.3k context (3.52 GB at
+4k): dense weights, 10 routed + 1 shared expert a layer, head, K/V. Speed of light is that over
+HBM bandwidth: 1,400 tok/s on an H200, 970 on an H100 SXM.
+
+AA rows are `flash-aa`, Artificial Analysis-style: a ~1.24k-token chat prompt (one of
+`explain` / `refactor` / `write`, the same 140-line Rust file with a different task), 512
+output tokens, tok/s after the first token. The fastest public API for this model is Novita at
+174 tok/s.
+
+| date | commit | change | GPU | prompt | drafts | tok/s | % SoL | vs prev |
+|---|---|---|---|---|---|---|---|---|
+| 2026-10-20 | c33c4df | engine (#84), flash-bench 4k ctx | H100 | code ×4k | none | 156 | 16.1% | |
+| 2026-10-20 | b9fbcad | fusions, K-split GEMV, 1024-thread norms (#90) | H100 | code ×4k | none | 198 | 20.4% | +27% |
+| 2026-10-21 | d9f1d29 | (same kernels) AA | H200 | explain | none | 205.5 | 14.7% | |
+| 2026-10-21 | d9f1d29 | | H200 | refactor | none | 205.3 | 14.7% | |
+| 2026-10-21 | d9f1d29 | | H200 | write | none | 205.3 | 14.7% | |
+| 2026-10-21 | d9f1d29 | | H200 | explain | suffix | 205.1 | | 1.15 tok/window |
+| 2026-10-21 | d9f1d29 | | H200 | refactor | suffix | 340.5 | | 2.71 tok/window |
+| 2026-10-21 | d9f1d29 | | H200 | write | suffix | 218.7 | | 1.28 tok/window |
+| 2026-10-21 | d9f1d29 | separate SiLU launch (now the default) | H200 | explain | none | 217.4 | 15.5% | +2% (noise) |
+| 2026-10-21 | 4ac3171 | K-split GEMV, 2 warps a row (was 4) | H200 | explain | none | 227.2 | 16.2% | +4.4% |
+| 2026-10-21 | 4ac3171 | (same pod, 2 warps for 4k+-row matrices only) | H200 | explain | none | 226.9 | 16.2% | +4.3% |
+| 2026-10-21 | 4ac3171 | (same build, AA) | H200 | refactor | suffix | 370.2 | | 2.71 tok/window |
+| 2026-10-21 | 4ac3171 | | H200 | write | suffix | 229.0 | | 1.25 tok/window |
+| 2026-10-21 | 4ac3171 | | H200 | explain | suffix | 222.3 | | 1.16 tok/window |
+| 2026-10-21 | 2a723ae | (round-3 pod, defaults of 4ac3171) | H200 | explain | none | 222.3 | 15.9% | pod baseline |
+| 2026-10-21 | 2a723ae | fast Q4_K/Q5_K expert dot (32 weights a lane) | H200 | explain | none | 230.9 | 16.5% | +3.9% |
+| 2026-10-21 | 2a723ae | Q8X dense repack (aligned codes, separate scales) | H200 | explain | none | 231.8 | 16.6% | +4.3% |
+| 2026-10-21 | 8fdfd13 | Q8X + fast expert dot (the defaults now) | H200 | explain | none | 240.8 | 17.2% | +8.3% |
+| 2026-10-21 | 2a723ae | + bf16 router (opt-in) | H200 | explain | none | 243.1 | 17.4% | +1% |
+| 2026-10-21 | 2a723ae | (Q8X + bf16 router, AA) | H200 | refactor | suffix | 403.5 | | 2.71 tok/window |
+| 2026-10-21 | 2a723ae | | H200 | write | suffix | 252.0 | | 1.25 tok/window |
+
+Stage sweep on that H200 pod (`TANG_CODER_STAGES=1`: each stage alone in a CUDA graph, replayed;
+µs a step at a 1.3k context, window 4,856 µs): routed+shared gate|up 876 (771 GB/s), down 801
+(501 GB/s), GDN input GEMV 618 (1.6 TB/s), GDN output 301, top-k 286, GDN conv+step 238,
+moe combine+norm 214, attention split-K 207 (154 GB/s), router 176, head 174, post-mixer norm
+166, attention in/out 260. The stages sum to 4,461 µs, so launch gaps are ~8% of the window.
+
+### Dead ends (Coder-Next)
+
+- **22 → 12 launches a layer with no faster kernels:** +2% (156 → 159 on H100). The step is
+  kernel-latency-bound, not launch-bound.
+- **Expert GEMVs, 4 rows a warp** (all staged before decoding): −4% vs 2.
+- **K-split GEMV with 8 warps a row** instead of 4: −7%. Both together: −10%.
+- **SiLU + int8 of h fused into the down kernel:** −2% vs a separate launch (each down block
+  recomputes its pair's 512 values; the extra latency outweighs the saved launch).
+- **The eager event profiler** (`TANG_CODER_PROF`) put about 2× the graph's time on small
+  kernels. Use the stage sweep for decisions.
+- **Top-k in the router GEMV's last block** (atomic counter, one launch fewer): −2% (217 → 213).
+  The last block's serial top-k costs more than the launch it saves.
+- **K-split routed experts** (Q warps a row, unstaged, like `cx_gemvk`): gate|up −4% / −6% /
+  −16% at Q = 1 / 2 / 4, down +0.5% / −6% / −18%. Experts want the staged rows; the dense
+  matrices want the split.
+- **K-split GEMV, 1 warp a row** (no split): −1.5% vs 4, −6% vs 2.
+- **A Qwen3 drafter** (estimate, not built): teacher-forced top-1 agreement with the engine's
+  greedy output is 58 / 88 / 71% for Qwen3-0.6B and 62 / 90 / 77% for 1.7B
+  (explain / refactor / write). A verify window of 8 costs ~3× a T=1 step here (each token
+  routes to its own experts), so a drafter only pays on refactor-like text, which the free
+  suffix drafter already covers (2.7 tokens a window). Expected gain on fresh text ≤10%, for a
+  second model engine. Not worth building yet.
+- **First rows of a `flash-aa` run** read ~4% low (205 vs 213–217 for the same kernels later in
+  the run). Compare variants inside the A/B block, which warms up first.
+- **bf16 router weights** (`TANG_CODER_ROUTER16=1`): +1% (240.8 → 243.1), under the bar. The
+  router is 4.2 MB a layer of F32 but reads at ~1.1 TB/s either way. Kept opt-in.
+- **nsys / ncu on the RunPod image:** ncu's injection lacks `cuTensorMapEncodeIm2colWide`,
+  which cudarc resolves at load, and nsys isn't installed (apt fails).
