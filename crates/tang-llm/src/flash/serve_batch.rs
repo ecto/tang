@@ -30,15 +30,32 @@ use tang_compute::flash::MAX_T;
 const PREFILL_BUDGET: usize = 256;
 /// The same while some stream is decoding: a shorter chunk, so a decode window is never far off.
 const PREFILL_SLICE: usize = 64;
+/// With wide prefill windows (`ServeEngine::wide_rows`): a step's prompt tokens when nothing
+/// decodes (capped at the window width), and while something does (a wide window of this many
+/// tokens takes a few hundred ms; the time slice still keeps prefill to about half the GPU).
+const WIDE_BUDGET: usize = 2048;
+const WIDE_SLICE: usize = 256;
 
 /// This step's prefill chunks, as `(lane, tokens)`: shortest remaining prompt first, up to
 /// `PREFILL_BUDGET` tokens when nothing decodes. While something decodes, `PREFILL_SLICE` tokens,
 /// and none while prefill is ahead of decode on GPU time (`debt` seconds), which keeps prefill to
 /// about half the GPU: a cold prompt slows down but always finishes.
 fn prefill_plan(waiting: &[(usize, usize)], decoding: bool, debt: f64) -> Vec<(usize, usize)> {
+    prefill_plan_with(waiting, decoding, debt, PREFILL_BUDGET, PREFILL_SLICE)
+}
+
+/// [`prefill_plan`] with the budgets given: `full` tokens when nothing decodes, `slice` while
+/// something does (wide windows: `WIDE_BUDGET` / `WIDE_SLICE`).
+fn prefill_plan_with(
+    waiting: &[(usize, usize)],
+    decoding: bool,
+    debt: f64,
+    full: usize,
+    slice: usize,
+) -> Vec<(usize, usize)> {
     let mut budget = match (decoding, debt > 0.0) {
-        (false, _) => PREFILL_BUDGET,
-        (true, false) => PREFILL_SLICE,
+        (false, _) => full,
+        (true, false) => slice,
         (true, true) => 0,
     };
     let mut order = waiting.to_vec();
@@ -53,6 +70,28 @@ fn prefill_plan(waiting: &[(usize, usize)], decoding: bool, debt: f64) -> Vec<(u
         budget -= n;
     }
     plan
+}
+
+/// Draft rows per stream in one window, for streams wanting `want[i]` drafts: one row each for
+/// its token, and the window's spare rows (`MAX_T` minus the streams) shared out round-robin, so
+/// a lone stream can draft its whole chain and a full window drafts nothing.
+fn share_drafts(want: &[usize]) -> Vec<usize> {
+    let mut give = vec![0; want.len()];
+    let mut spare = MAX_T.saturating_sub(want.len());
+    while spare > 0 {
+        let mut moved = false;
+        for (g, &w) in give.iter_mut().zip(want) {
+            if spare > 0 && *g < w {
+                *g += 1;
+                spare -= 1;
+                moved = true;
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+    give
 }
 
 /// A parked or running sequence slot.
@@ -70,9 +109,17 @@ pub(super) struct Stream {
     ids: Vec<u32>,
     /// Prompt tokens already in the slot (reused or prefilled).
     done_prompt: usize,
+    /// Where to save prefix states (`FlashServe::marks`) still ahead, and whether to pin each.
+    marks: Vec<(usize, bool)>,
     reused: usize,
     /// The sampled token not yet fed to the slot.
     pending: Option<u32>,
+    /// MTP drafts for the next window (the engine's chain for this slot).
+    drafts: Vec<u32>,
+    /// Draft rows verified and accepted, and verify windows run.
+    drafted: usize,
+    accepted: usize,
+    windows: usize,
     out: Vec<u32>,
     limit: usize,
     stop: Vec<String>,
@@ -111,14 +158,36 @@ impl FlashServe {
                 (t.len() < ids.len() && ids.starts_with(t)).then_some((i, t.len()))
             })
             .max_by_key(|&(_, n)| n);
-        if let Some((i, n)) = best {
-            let s = &mut self.slots[i];
-            s.busy = true;
-            s.key = key.map(String::from);
-            s.used = self.clock;
-            return Ok((s.id, n));
+        let parked = best.map_or(0, |b| b.1);
+        // A saved prefix state (the end of a tools block or system prompt, from any session,
+        // in RAM or on disk) that reaches further: restore it into a fresh slot.
+        let limit = ids.len() - 1;
+        let mut snap = (0..self.snaps.len())
+            .filter(|&i| {
+                self.snaps[i].tokens.len() <= limit && ids.starts_with(&self.snaps[i].tokens)
+            })
+            .max_by_key(|&i| self.snaps[i].tokens.len());
+        if snap.is_none() && parked == 0 {
+            if let Some(sn) = self.load_disk(ids, limit).filter(|s| !s.tokens.is_empty()) {
+                eprintln!(
+                    "tang-llm: read the prefix state at {} from disk",
+                    sn.tokens.len()
+                );
+                self.snaps.push(sn);
+                snap = Some(self.snaps.len() - 1);
+            }
         }
-        // A miss: say how close the nearest parked slot came, so a client changing early tokens
+        let snap_len = snap.map_or(0, |i| self.snaps[i].tokens.len());
+        if snap_len <= parked {
+            if let Some((i, n)) = best {
+                let s = &mut self.slots[i];
+                s.busy = true;
+                s.key = key.map(String::from);
+                s.used = self.clock;
+                return Ok((s.id, n));
+            }
+        }
+        // No parked slot extends: say how close the nearest one came, so a client changing early tokens
         // (or a template re-rendering an earlier turn) shows up in the log.
         if let Some((id, common, len)) = self
             .slots
@@ -159,6 +228,22 @@ impl FlashServe {
             key: key.map(String::from),
             used: self.clock,
         });
+        if let Some(i) = snap.filter(|_| snap_len > parked) {
+            self.snaps[i].used = self.clock;
+            self.snaps[i].at = crate::retention::now();
+            let (sn, e) = (&self.snaps[i], &mut self.e);
+            let restored = sn
+                .pos
+                .iter()
+                .try_for_each(|p| e.restore_positional_at(id, p, 0))
+                .and_then(|()| e.restore_running_at(id, &sn.state, &sn.tokens));
+            match restored {
+                Ok(()) => return Ok((id, snap_len)),
+                // A state from another configuration (say, saved without the MTP layer):
+                // prefill instead.
+                Err(e) => eprintln!("tang-llm: prefix state at {snap_len} not restored: {e}"),
+            }
+        }
         Ok((id, 0))
     }
 
@@ -166,6 +251,7 @@ impl FlashServe {
         self.expire_memory();
         let t0 = Instant::now();
         let (ids, text, _spliced) = self.prompt(req)?;
+        self.record_warm(req);
         ensure!(
             ids.len() + 1 < self.ctx,
             "prompt is {} tokens; the context window is {}",
@@ -179,6 +265,8 @@ impl FlashServe {
             );
         }
         let (slot, reused) = self.take_slot(&ids, req.cache_key.as_deref())?;
+        let mut marks = self.marks(&ids, &text);
+        marks.retain(|&(p, _)| p > reused);
         let limit = req
             .max_tokens
             .unwrap_or(usize::MAX)
@@ -193,9 +281,14 @@ impl FlashServe {
             slot,
             key: req.cache_key.clone(),
             done_prompt: reused,
+            marks,
             reused,
             ids,
             pending: None,
+            drafts: Vec::new(),
+            drafted: 0,
+            accepted: 0,
+            windows: 0,
             out: Vec::new(),
             limit,
             stop: req.stop.clone(),
@@ -302,19 +395,49 @@ impl FlashServe {
                     .then(|| (s.ids.len() - s.done_prompt, i))
             })
             .collect();
-        for (i, n) in prefill_plan(&waiting, decoding, self.prefill_debt) {
+        let wide = self.e.wide_rows();
+        let plan = if wide > 0 {
+            prefill_plan_with(
+                &waiting,
+                decoding,
+                self.prefill_debt,
+                WIDE_BUDGET.min(wide),
+                WIDE_SLICE.min(wide),
+            )
+        } else {
+            prefill_plan(&waiting, decoding, self.prefill_debt)
+        };
+        for (i, n) in plan {
             let l = &mut lanes[i];
             let s = l.stream.downcast_mut::<Stream>().expect("a flash stream");
+            // Stop at the next prefix-state mark, to save the state there.
+            let n = s
+                .marks
+                .first()
+                .map_or(n, |&(m, _)| n.min(m - s.done_prompt));
             let t = Instant::now();
-            let next = self
-                .e
-                .prefill_slot(s.slot, &s.ids[s.done_prompt..s.done_prompt + n])?;
+            let chunk = &s.ids[s.done_prompt..s.done_prompt + n];
+            let next = if wide > 0 && n > 2 * MAX_T {
+                self.e.prefill_slot_wide(s.slot, chunk)?
+            } else {
+                self.e.prefill_slot(s.slot, chunk)?
+            };
             let dt = t.elapsed().as_secs_f64();
             s.prefill_s += dt;
             if decoding {
                 self.prefill_debt += dt;
             }
             s.done_prompt += n;
+            if let Some(&(_, pinned)) = s.marks.first().filter(|m| m.0 == s.done_prompt) {
+                s.marks.remove(0);
+                let t = Instant::now();
+                let slot = s.slot;
+                self.snapshot_at(slot, pinned)?;
+                let s = lanes[i].stream.downcast_mut::<Stream>().unwrap();
+                s.prefill_s += t.elapsed().as_secs_f64();
+            }
+            let l = &mut lanes[i];
+            let s = l.stream.downcast_mut::<Stream>().expect("a flash stream");
             if s.done_prompt == s.ids.len() {
                 if s.prefill_only {
                     s.finish = Some(Finish::Stop);
@@ -323,6 +446,7 @@ impl FlashServe {
                     self.batch_take(s, next, l.on)?;
                     if s.finish.is_none() {
                         s.pending = Some(next);
+                        s.drafts = self.e.slot_drafts(s.slot);
                     }
                 }
             }
@@ -336,24 +460,66 @@ impl FlashServe {
                 (s.finish.is_none() && s.pending.is_some()).then_some(i)
             })
             .collect();
+        let mtp = self.e.use_mtp();
         for group in ready.chunks(MAX_T) {
-            let rows: Vec<(usize, u32)> = group
+            // Drafts for each stream, cut at an end of turn and the token limit, then the
+            // window's spare rows shared out.
+            let want: Vec<Vec<u32>> = group
                 .iter()
                 .map(|&i| {
                     let s = lanes[i].stream.downcast_ref::<Stream>().unwrap();
-                    (s.slot, s.pending.unwrap())
+                    if !mtp {
+                        return Vec::new();
+                    }
+                    let room = s.limit.saturating_sub(s.out.len() + 1);
+                    let mut d: Vec<u32> = s.drafts.iter().take(room).copied().collect();
+                    if let Some(k) = d.iter().position(|x| self.eos.contains(x)) {
+                        d.truncate(k);
+                    }
+                    d
+                })
+                .collect();
+            let give = share_drafts(&want.iter().map(Vec::len).collect::<Vec<_>>());
+            let items: Vec<(usize, u32, Vec<u32>)> = group
+                .iter()
+                .zip(want.iter().zip(&give))
+                .map(|(&i, (d, &g))| {
+                    let s = lanes[i].stream.downcast_ref::<Stream>().unwrap();
+                    (s.slot, s.pending.unwrap(), d[..g].to_vec())
                 })
                 .collect();
             let t = Instant::now();
-            let next = self.e.decode_batch(&rows)?;
+            let kept = if mtp {
+                self.e.verify_batch(&items)?
+            } else {
+                let rows: Vec<(usize, u32)> = items.iter().map(|x| (x.0, x.1)).collect();
+                self.e
+                    .decode_batch(&rows)?
+                    .into_iter()
+                    .map(|k| vec![k])
+                    .collect()
+            };
             self.prefill_debt = (self.prefill_debt - t.elapsed().as_secs_f64()).max(0.0);
-            for (&i, &tok) in group.iter().zip(&next) {
+            for ((&i, toks), item) in group.iter().zip(&kept).zip(&items) {
                 let l = &mut lanes[i];
                 let s = l.stream.downcast_mut::<Stream>().unwrap();
                 s.pending = None;
-                self.batch_take(s, tok, l.on)?;
+                s.windows += 1;
+                s.drafted += item.2.len();
+                s.accepted += toks.len() - 1;
+                for &tok in toks {
+                    self.batch_take(s, tok, l.on)?;
+                    if s.finish.is_some() {
+                        break;
+                    }
+                }
                 if s.finish.is_none() {
-                    s.pending = Some(tok);
+                    s.pending = toks.last().copied();
+                    s.drafts = if mtp {
+                        self.e.slot_drafts(s.slot)
+                    } else {
+                        Vec::new()
+                    };
                 }
             }
         }
@@ -400,7 +566,7 @@ impl FlashServe {
         let decode_s = s.decode_from.map_or(0.0, |t| t.elapsed().as_secs_f64());
         let prefilled = s.ids.len() - s.reused;
         eprintln!(
-            "tang-llm: batch req: slot {} prompt {} (reused {}, prefilled {} in {:.0} ms) | ttft {:.0} ms | decode {} tokens in {:.2} s = {:.1} tok/s | {} tool calls",
+            "tang-llm: batch req: slot {} prompt {} (reused {}, prefilled {} in {:.0} ms) | ttft {:.0} ms | decode {} tokens in {:.2} s = {:.1} tok/s, {} windows, drafts {}/{} accepted | {} tool calls",
             s.slot,
             s.ids.len(),
             s.reused,
@@ -410,6 +576,9 @@ impl FlashServe {
             s.out.len(),
             decode_s,
             s.out.len() as f64 / decode_s.max(1e-9),
+            s.windows,
+            s.accepted,
+            s.drafted,
             s.calls.len()
         );
         Ok(Outcome::Done(
@@ -489,6 +658,29 @@ mod tests {
             "cold done {:.1} s vs solo {solo:.1} s",
             cold_done.unwrap()
         );
+    }
+
+    #[test]
+    fn wide_budgets_slice_while_decoding() {
+        let w = [(10_000, 0), (27, 1)];
+        assert_eq!(
+            prefill_plan_with(&w, false, 0.0, WIDE_BUDGET, WIDE_SLICE),
+            vec![(1, 27), (0, WIDE_BUDGET - 27)]
+        );
+        assert_eq!(
+            prefill_plan_with(&w, true, 0.0, WIDE_BUDGET, WIDE_SLICE),
+            vec![(1, 27), (0, WIDE_SLICE - 27)]
+        );
+        assert!(prefill_plan_with(&w, true, 0.5, WIDE_BUDGET, WIDE_SLICE).is_empty());
+    }
+
+    #[test]
+    fn spare_rows_go_to_drafts_round_robin() {
+        assert_eq!(share_drafts(&[2]), vec![2]);
+        assert_eq!(share_drafts(&[2, 2, 2]), vec![2, 2, 1]);
+        assert_eq!(share_drafts(&[0, 3, 1]), vec![0, 3, 1]);
+        assert_eq!(share_drafts(&[2; 8]), vec![0; 8]);
+        assert_eq!(share_drafts(&[2; 6]), vec![1, 1, 0, 0, 0, 0]);
     }
 
     #[test]

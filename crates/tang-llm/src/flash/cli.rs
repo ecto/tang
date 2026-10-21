@@ -242,6 +242,18 @@ impl FlashModel for Coder {
     fn reset(&mut self) {
         Coder::reset(self)
     }
+    fn has_mtp(&self) -> bool {
+        Coder::has_mtp(self)
+    }
+    fn set_use_mtp(&mut self, on: bool) {
+        self.use_mtp = on && Coder::has_mtp(self);
+    }
+    fn mtp_last(&self) -> Vec<(u32, f32)> {
+        self.mtp_last.clone()
+    }
+    fn last_mtp_ms(&self) -> f64 {
+        self.last_mtp_ms
+    }
     fn prefill(
         &mut self,
         ids: &[u32],
@@ -305,6 +317,7 @@ fn load_coder(a: &Args) -> Result<Coder> {
         &a.path,
         CoderOpts {
             max_ctx: a.opts.max_ctx,
+            mtp: a.opts.mtp.clone(),
         },
     )?;
     e.use_graphs = !a.eager;
@@ -1238,8 +1251,8 @@ fn bench_coder(a: &Args, ids: &[u32]) -> Result<()> {
 }
 
 /// `flash-aa`: Artificial-Analysis-style decode speed for a qwen3next model with one load.
-/// For each `--ids-file` prompt (comma-separated list), `-n` output tokens, drafts off and
-/// suffix: output tok/s after the first token. Then, on the first prompt without drafts, each
+/// For each `--ids-file` prompt (comma-separated list), `-n` output tokens, drafts off, suffix
+/// and (with `--mtp FILE`) MTP: output tok/s after the first token. Then, on the first prompt without drafts, each
 /// kernel variant in `TANG_CODER_AB` (`;`-separated specs, see `Coder::set_variants`), and with
 /// `TANG_CODER_STAGES=1` the stage sweep. `--out DIR` saves each run's ids.
 pub fn aa(args: &[String]) -> Result<()> {
@@ -1288,8 +1301,13 @@ pub fn aa(args: &[String]) -> Result<()> {
             .map_or(f.clone(), |s| s.to_string_lossy().into_owned());
         prompts.push((name, read_ids(f)?));
     }
+    let drafts: &[&str] = if e.has_mtp() {
+        &["none", "suffix", "mtp"]
+    } else {
+        &["none", "suffix"]
+    };
     for (name, ids) in &prompts {
-        for draft in ["none", "suffix"] {
+        for &draft in drafts {
             row(&mut e, name, ids, draft)?;
         }
     }
@@ -1622,6 +1640,62 @@ pub fn batch_check(args: &[String]) -> Result<()> {
             "batch-check: {} (logits checksum {h:016x})",
             if ok { "PASS (bitwise)" } else { "FAIL" }
         );
+        // With an MTP layer: up to 3 sequences in verify windows with their MTP drafts (the
+        // window's spare rows shared out) must give the same tokens as each one alone.
+        if e.has_mtp() {
+            let nm = nb.min(3);
+            let slots: Vec<usize> = (0..nm).map(|_| e.alloc_slot()).collect::<Result<_>>()?;
+            let mut cur: Vec<u32> = Vec::new();
+            for (i, &s) in slots.iter().enumerate() {
+                cur.push(e.prefill_slot(s, &seqs[i])?);
+            }
+            let mut got: Vec<Vec<u32>> = vec![Vec::new(); nm];
+            let (mut windows, mut drafted, mut accepted) = (0usize, 0usize, 0usize);
+            let t0 = std::time::Instant::now();
+            while got.iter().any(|g| g.len() < steps) {
+                let live: Vec<usize> = (0..nm).filter(|&i| got[i].len() < steps).collect();
+                let spare = (super::coder::MAX_T - live.len()) / live.len();
+                let items: Vec<(usize, u32, Vec<u32>)> = live
+                    .iter()
+                    .map(|&i| {
+                        let d: Vec<u32> = e
+                            .slot_drafts(slots[i])
+                            .iter()
+                            .take(spare.min(steps - got[i].len() - 1))
+                            .map(|x| x.0)
+                            .collect();
+                        (slots[i], cur[i], d)
+                    })
+                    .collect();
+                let kept = e.verify_batch(&items)?;
+                windows += 1;
+                for ((&i, k), it) in live.iter().zip(&kept).zip(&items) {
+                    drafted += it.2.len();
+                    accepted += k.len() - 1;
+                    got[i].extend_from_slice(k);
+                    cur[i] = *k.last().unwrap();
+                }
+            }
+            let dt = t0.elapsed().as_secs_f64();
+            for &s in &slots {
+                e.free_slot(s);
+            }
+            let mut mok = true;
+            for i in 0..nm {
+                let same = got[i][..steps] == alone[i].0[..steps];
+                mok &= same;
+                println!(
+                    "mtp seq {i}: tokens {}",
+                    if same { "identical" } else { "DIFFER" }
+                );
+            }
+            println!(
+                "batch-check mtp ({nm} sequences): {} | {windows} windows, drafts {accepted}/{drafted} accepted, {:.0} tok/s aggregate",
+                if mok { "PASS" } else { "FAIL" },
+                got.iter().map(|g| g.len()).sum::<usize>() as f64 / dt
+            );
+            ok &= mok;
+        }
         // Speed.
         for b in [1usize, 2, 4, 8].into_iter().filter(|&b| b <= nb) {
             let slots: Vec<usize> = (0..b).map(|_| e.alloc_slot()).collect::<Result<_>>()?;
