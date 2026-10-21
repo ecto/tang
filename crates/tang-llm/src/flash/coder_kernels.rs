@@ -634,6 +634,8 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_down_db(ExW d, ExW sd, 
 // for any routing. Each pair's dot is the per-pair kernels' (same staged rows, same cx_dot), so
 // outputs are bitwise those of cx_moe_gu / cx_moe_down. Block 128 (n <= CX_NP <= 128).
 #define CX_PLAN_LIST (2 + CX_NP)
+// (Only built where CX_NP fits its static shared memory; wide modules use cx_moe_plan_w.)
+#if CX_NP <= 4096
 extern "C" __global__ void cx_moe_plan(const unsigned* ids, int T, int pbase, int n, unsigned* plan) {
     const int i = threadIdx.x;
     __shared__ int key[CX_NP];
@@ -667,6 +669,8 @@ extern "C" __global__ void cx_moe_plan(const unsigned* ids, int T, int pbase, in
         plan[1 + ng] = (unsigned)n;
     }
 }
+
+#endif
 
 // cx_moe_plan for many pairs (wide prefill windows, up to CX_NP): one block of 1024 threads,
 // an expert histogram, a prefix over the keys, then a scatter. Pairs within a group land in any
