@@ -81,12 +81,15 @@ def main():
     first = px.reshape(-1, 3, 2, 16, 16)[:, :, 0].reshape(px.shape[0], -1).numpy()
     pf = os.path.join(a.out, "hf_px.f32")
     np.ascontiguousarray(first, dtype="<f4").tofile(pf)
+    pad = model.config.image_token_id
+    # tang needs the GPU's memory: drop HF first.
+    del model, inputs
+    torch.cuda.empty_cache()
 
     got = tang("vl-logits", a.model, "--patches", pf, gh, gw, *ids, "--last", a.last)
     kl_stats("tang prefill, HF pixels", logits, got)
     got = tang("vl-logits", a.model, "--image", png, *ids, "--last", a.last)
     kl_stats("tang prefill, tang preprocessing", logits, got)
-    pad = model.config.image_token_id
     end = max(i for i, t in enumerate(ids) if t == pad) + 1
     got = tang("vl-logits", a.model, "--patches", pf, gh, gw, *ids, "--step", end + 1, "--last", a.last)
     kl_stats(f"tang prefill to {end + 1}, then decode", logits, got)

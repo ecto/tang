@@ -27,14 +27,15 @@ if [[ $STEPS == *tiny* ]]; then
   for seed in 0 1; do
     say tiny seed $seed
     python crates/tang-llm/scripts/qwen3vl_tiny.py --tang $BIN --out /root/tiny$seed --seed $seed --device cuda 2>&1 \
-      | grep -E "^(images|preprocess|prefill|decode|\(HF|PASS|FAIL)|merger|deepstack|Error|error|failed"
+      | grep --line-buffered -E "^(images|preprocess|prefill|decode|\(HF|PASS|FAIL)|embed|block|merger|deepstack|Error|error|failed"
   done
 fi
 if [[ $STEPS == *spec* ]]; then
   say speculate
+  python -c "from huggingface_hub import snapshot_download as s; s('Qwen/Qwen3-0.6B')" >/dev/null 2>&1
   TANG_LLM_TEST_VL_MODEL=/root/tiny0/hf TANG_LLM_TEST_MODEL=Qwen/Qwen3-0.6B \
     cargo test -q --release -p tang-llm --no-default-features --features cuda --test speculate -- --nocapture 2>&1 \
-    | grep -E "identical=|test result|panicked|differ" | head -60
+    | grep --line-buffered -E "identical=|test result|panicked|differ" | head -60
 fi
 if [[ $STEPS == *real* ]]; then
   say download
