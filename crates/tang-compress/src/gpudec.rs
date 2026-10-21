@@ -41,6 +41,8 @@ pub struct GpuDecoder {
     lanes: usize,
     maxl: usize,
     src: String,
+    /// Storage of the adaptive bins in pipelines for adaptive streams.
+    ad_mem: AdMem,
     pl: wgpu::PipelineLayout,
     /// Pipelines specialized to a learned net (weights as literals), by flat net.
     spec: std::sync::Mutex<Vec<(Vec<u32>, SpecPipes)>>,
@@ -81,7 +83,50 @@ fn ad_wgn(lanes: usize) -> usize {
     (lanes * (32 / lanes).max(1)).max(32) * crate::lmodel3::AC * crate::lmodel3::AB
 }
 
-fn shader_src(lanes: usize, maxl: usize) -> String {
+/// Where the adaptive layer's per-invocation bins live in the v3 kernels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdMem {
+    /// Not needed: the pipeline never decodes adaptive streams.
+    None,
+    /// Workgroup memory (17 KB per 32 invocations): fastest on Metal.
+    Workgroup,
+    /// A private array per invocation: no occupancy cap; fastest on
+    /// discrete NVIDIA (Vulkan), about +15% on adaptive streams.
+    Private,
+}
+
+impl AdMem {
+    fn decl(self, lanes: usize) -> String {
+        match self {
+            AdMem::None => "var<workgroup> adt: array<u32, 1>;".into(),
+            AdMem::Workgroup => format!("var<workgroup> adt: array<u32, {}>;", ad_wgn(lanes)),
+            AdMem::Private => format!(
+                "var<private> adt: array<u32, {}>;",
+                crate::lmodel3::AC * crate::lmodel3::AB
+            ),
+        }
+    }
+    fn base(self) -> &'static str {
+        match self {
+            AdMem::Private => "0u",
+            _ => "li * 136u",
+        }
+    }
+    /// The choice for a backend (`TC_GPU_ADT=workgroup|private` overrides).
+    fn for_backend(b: wgpu::Backend) -> Self {
+        match std::env::var("TC_GPU_ADT").as_deref() {
+            Ok("workgroup") => return AdMem::Workgroup,
+            Ok("private") => return AdMem::Private,
+            _ => {}
+        }
+        match b {
+            wgpu::Backend::Vulkan | wgpu::Backend::Dx12 => AdMem::Private,
+            _ => AdMem::Workgroup,
+        }
+    }
+}
+
+fn shader_src(lanes: usize, maxl: usize, ad: AdMem) -> String {
     let k = gpuwav::lift_consts();
     let head = format!(
         "const LANESu: u32 = {lanes}u;\nconst NMODELu: u32 = {NMODEL}u;\nconst SIG0u: u32 = {SIG0}u;\nconst MAG0u: u32 = {MAG0}u;\nconst LOW0u: u32 = {LOW0}u;\nconst SGN0u: u32 = {SGN0}u;\nconst ESC0u: u32 = {ESC0}u;\nconst KB_u: u32 = {}u;\nconst NE_u: u32 = {}u;\nconst NA_u: u32 = 12u;\nconst NPB_u: u32 = 5u;\nconst BSu: u32 = {BS}u;\nconst SHSu: u32 = {SHS}u;\nconst BRSu: u32 = {BRS}u;\nconst BPW: u32 = {}u;\n",
@@ -90,7 +135,8 @@ fn shader_src(lanes: usize, maxl: usize) -> String {
         (32 / lanes).max(1)
     );
     let body = include_str!("gpuwav.wgsl")
-        .replace("AD_WGN", &ad_wgn(lanes).to_string())
+        .replace("AD_DECL", &ad.decl(lanes))
+        .replace("AD_BASE", ad.base())
         .replace("LANES_WG3", &(lanes * (32 / lanes).max(1)).to_string())
         .replace("LANES_WG", &lanes.to_string())
         .replace("MAXL_N", &maxl.max(2).to_string())
@@ -134,10 +180,12 @@ impl GpuDecoder {
         if lanes == 0 || lanes > MAX_LANES {
             return Err(format!("tc-gpu GPU decode supports 1..={MAX_LANES} lanes"));
         }
-        // the adaptive layer's per-invocation bins live in workgroup memory
-        // (17 KB at 32 invocations, over WebGPU's 16 KB default)
+        // in workgroup memory the adaptive layer's bins take 17 KB at 32
+        // invocations, over WebGPU's 16 KB default
         let wg = ad_wgn(lanes) as u32 * 4 + 1024;
-        if al.max_compute_workgroup_storage_size < wg {
+        if AdMem::for_backend(adapter.get_info().backend) == AdMem::Workgroup
+            && al.max_compute_workgroup_storage_size < wg
+        {
             return Err(format!(
                 "tc-gpu needs {wg} B of workgroup storage, the adapter has {}",
                 al.max_compute_workgroup_storage_size
@@ -162,7 +210,9 @@ impl GpuDecoder {
             .map_err(|e| format!("device: {e}"))?;
         let info = adapter.get_info();
         let name = format!("{} ({:?})", info.name, info.backend);
-        let src = shader_src(lanes, maxl);
+        let ad_mem = AdMem::for_backend(info.backend);
+        // pipelines for non-adaptive streams carry no bins (occupancy)
+        let src = shader_src(lanes, maxl, AdMem::None);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tc-gpu"),
             source: wgpu::ShaderSource::Wgsl(src.clone().into()),
@@ -235,6 +285,7 @@ impl GpuDecoder {
             lanes,
             maxl,
             src,
+            ad_mem,
             pl,
             spec: std::sync::Mutex::new(Vec::new()),
         })
@@ -874,7 +925,11 @@ impl GpuDecoder {
         if let Some(p) = c.iter().find(|e| e.0 == key) {
             return p.1.clone();
         }
-        let mut src = self.src.clone();
+        let mut src = if ad {
+            shader_src(self.lanes, self.maxl, self.ad_mem)
+        } else {
+            self.src.clone()
+        };
         if let Some(d) = dec {
             src = crate::irdec::splice_res(&src, if ad { &d.wgsl_res_ad } else { &d.wgsl_res });
         } else if ad && std::env::var("TC_GPU_HANDRES").is_err() {
