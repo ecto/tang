@@ -102,6 +102,9 @@ struct Variants {
     /// Wide windows run the experts as a tensor-core GEMM (`cx_moe_gemm_*`) instead of the
     /// grouped decode kernels; `TANG_CODER_WGEMM=0` for those (bitwise narrow).
     wgemm: bool,
+    /// Which GEMMs (`TANG_CODER_WGEMM=gu` / `down`; anything else: both). For localizing.
+    wgemm_gu: bool,
+    wgemm_down: bool,
 }
 
 impl Default for Variants {
@@ -114,6 +117,8 @@ impl Default for Variants {
             moe: usize::MAX,
             fuse_silu: true,
             wgemm: true,
+            wgemm_gu: true,
+            wgemm_down: true,
         }
     }
 }
@@ -130,6 +135,8 @@ impl Variants {
             moe: num("TANG_CODER_MOE").map_or(d.moe, |v| v as usize),
             fuse_silu: !env_is("TANG_CODER_FUSE_SILU", "0"),
             wgemm: !env_is("TANG_CODER_WGEMM", "0"),
+            wgemm_gu: !env_is("TANG_CODER_WGEMM", "down"),
+            wgemm_down: !env_is("TANG_CODER_WGEMM", "gu"),
         }
     }
 }
@@ -1904,7 +1911,7 @@ impl Coder {
                 // Wide windows: the tensor-core GEMM, 128 rows × 64 of a group's tokens a block.
                 let gemm = self.in_wide.get() && self.var.wgemm;
                 let tiles = t.div_ceil(64) as u32;
-                if gemm {
+                if gemm && self.var.wgemm_gu {
                     self.launch_on(
                         stream,
                         self.kn().moe_gemm_gu,
@@ -1931,7 +1938,7 @@ impl Coder {
                     0,
                     tang_moe::args![egu, hq, pb],
                 );
-                if gemm {
+                if gemm && self.var.wgemm_down {
                     self.launch_on(
                         stream,
                         self.kn().moe_gemm_down,
