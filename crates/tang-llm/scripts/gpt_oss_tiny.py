@@ -164,6 +164,8 @@ def main():
     ap.add_argument("--tang", required=True)
     ap.add_argument("--out", default="/tmp/gpt-oss-tiny")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--tang-flags", default="--f32",
+                    help="weight dtype flag for tang (--f32, or --q4 for 4-bit attention and head)")
     a = ap.parse_args()
     model, tok, dense, mx = build(a.out, a.seed)
     ids = tok(PROMPT)["input_ids"]
@@ -174,13 +176,13 @@ def main():
     ok = True
     for ckpt in (dense, mx):
         for cmd in ("logits", "logits-step"):
-            out = subprocess.run([a.tang, cmd, ckpt, *map(str, ids), "--f32"],
+            out = subprocess.run([a.tang, cmd, ckpt, *map(str, ids), *a.tang_flags.split()],
                                  capture_output=True, text=True)
             if out.returncode != 0:
                 print(out.stderr)
                 sys.exit(1)
             got = torch.tensor(json.loads(out.stdout))
-            ok &= compare(f"{os.path.basename(ckpt)} {cmd}", ref, got)
+            ok &= compare(f"{os.path.basename(ckpt)} {cmd} {a.tang_flags}", ref, got)
     sys.exit(0 if ok else 1)
 
 

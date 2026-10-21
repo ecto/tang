@@ -80,9 +80,24 @@ Measured so far (before the rebase onto #88/#89):
 | 2026-10-20 | 1b8474c | #95, 13-token prompt | H100 | gpt-oss-20b | 1 | 182 | 20% | |
 | 2026-10-20 | 1b8474c | #95, 13-token prompt | H100 | gpt-oss-120b | 1 | 119 | | |
 
-The order to try on the H200: (1) the smem GEMV A/B in the script; (2) CUDA graphs over the decode
-step (launch-bound on Hopper); (3) a Q4 head and Q4 attention, which takes the ceiling from 1280
-to ~2460; (4) speculation, already exact for gpt-oss (`tests/speculate.rs`).
+**Plan for when gpt-oss is back in focus** (on hold since 2026-10-21; 30% of zest goes to
+speed, all of it on Coder-Next and tang-pro for now). In order, each with what's ready:
+
+1. **Q4 attention and head**, the path past Groq: 3.75 → ~1.95 GB a token, H200 ceiling
+   1280 → ~2460 tok/s. `--q4` already quantizes attention, the embedding and the head at load
+   (affine 4-bit, group 64) and the 4-bit GEMV serves them. Correctness checked offline:
+   `scripts/gpt_oss_q4_check.py` applies the same rounding to transformers' weights, and tang
+   `--q4` matches it at max KL 1.1e-4 (tiny model, CPU). Still unmeasured: what Q4 costs the
+   real 20b. `gpt_oss_speed.sh` measures it (`--q4` vs bf16 KL, 256 positions) beside the speed.
+   If the head costs too much, keep the head bf16 and quantize attention only (1.27 GB saved of
+   the 1.8), or try group 32.
+2. **The MXFP4 GEMV A/B** (input via L1, the default, vs staged in shared memory,
+   `TANG_MOE_GEMV=smem`), in the same script. The smem kernel has not run on a GPU yet.
+3. **CUDA graphs over the decode step**: the H100 step is launch-bound (~460 launches a token).
+4. **Speculation**: already exact for gpt-oss (`tests/speculate.rs` passes on CUDA).
+
+One H200 hour covers 1 and 2 (`scripts/gpt_oss_speed.sh <gpt-oss-20b dir>`; it prints these
+rows and an nsys summary).
 
 ## Dead ends
 
