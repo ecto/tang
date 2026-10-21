@@ -58,6 +58,8 @@ if [[ $STEPS == *llama* ]]; then
   /root/llama.cpp/build/bin/llama-server -m /root/vl.gguf --mmproj /root/mmproj.gguf -ngl 99 -c 8192 --port 8080 >/root/llama.log 2>&1 &
   for i in $(seq 120); do curl -sf localhost:8080/health >/dev/null && break; sleep 5; done
   say llama.cpp compare
+  mkdir -p /root/real
+  [ -f /root/real/view.png ] || python -c "import sys; sys.path.insert(0, 'crates/tang-llm/scripts'); from qwen3vl_tiny import render; render(1280, 720, 7).save('/root/real/view.png')"
   python crates/tang-llm/scripts/qwen3vl_llamacpp.py --tang $BIN --model "$M" --image /root/real/view.png --device cuda 2>&1 \
     | grep -vE "Warning|warn\("
   tail -3 /root/llama.log
