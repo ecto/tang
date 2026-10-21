@@ -31,6 +31,30 @@ const PREFILL_BUDGET: usize = 256;
 /// The same while some stream is decoding: a shorter chunk, so a decode window is never far off.
 const PREFILL_SLICE: usize = 64;
 
+/// This step's prefill chunks, as `(lane, tokens)`: shortest remaining prompt first, up to
+/// `PREFILL_BUDGET` tokens when nothing decodes. While something decodes, `PREFILL_SLICE` tokens,
+/// and none while prefill is ahead of decode on GPU time (`debt` seconds), which keeps prefill to
+/// about half the GPU: a cold prompt slows down but always finishes.
+fn prefill_plan(waiting: &[(usize, usize)], decoding: bool, debt: f64) -> Vec<(usize, usize)> {
+    let mut budget = match (decoding, debt > 0.0) {
+        (false, _) => PREFILL_BUDGET,
+        (true, false) => PREFILL_SLICE,
+        (true, true) => 0,
+    };
+    let mut order = waiting.to_vec();
+    order.sort_unstable();
+    let mut plan = Vec::new();
+    for (rem, i) in order {
+        if budget == 0 {
+            break;
+        }
+        let n = rem.min(budget);
+        plan.push((i, n));
+        budget -= n;
+    }
+    plan
+}
+
 /// A parked or running sequence slot.
 pub(super) struct SlotInfo {
     pub id: usize,
@@ -93,6 +117,25 @@ impl FlashServe {
             s.key = key.map(String::from);
             s.used = self.clock;
             return Ok((s.id, n));
+        }
+        // A miss: say how close the nearest parked slot came, so a client changing early tokens
+        // (or a template re-rendering an earlier turn) shows up in the log.
+        if let Some((id, common, len)) = self
+            .slots
+            .iter()
+            .filter(|s| !s.busy)
+            .map(|s| {
+                let t = self.e.slot_tokens(s.id);
+                let common = t.iter().zip(ids).take_while(|(a, b)| a == b).count();
+                (s.id, common, t.len())
+            })
+            .max_by_key(|&(_, c, _)| c)
+        {
+            eprintln!(
+                "tang-llm: prefix miss: prompt {} tokens; nearest parked slot {id} has {len}, \
+                 diverging at token {common}",
+                ids.len()
+            );
         }
         let id = match self.e.alloc_slot() {
             Ok(id) => id,
@@ -247,15 +290,10 @@ impl FlashServe {
             let s = l.stream.downcast_ref::<Stream>().expect("a flash stream");
             s.finish.is_none() && s.pending.is_some()
         });
-        let mut budget = match (decoding, self.prefill_debt > 0.0) {
-            (false, _) => PREFILL_BUDGET,
-            (true, false) => PREFILL_SLICE,
-            (true, true) => 0,
-        };
         if !decoding {
             self.prefill_debt = 0.0;
         }
-        let mut order: Vec<(usize, usize)> = lanes
+        let waiting: Vec<(usize, usize)> = lanes
             .iter()
             .enumerate()
             .filter_map(|(i, l)| {
@@ -264,14 +302,9 @@ impl FlashServe {
                     .then(|| (s.ids.len() - s.done_prompt, i))
             })
             .collect();
-        order.sort_unstable();
-        for (_, i) in order {
-            if budget == 0 {
-                break;
-            }
+        for (i, n) in prefill_plan(&waiting, decoding, self.prefill_debt) {
             let l = &mut lanes[i];
             let s = l.stream.downcast_mut::<Stream>().expect("a flash stream");
-            let n = (s.ids.len() - s.done_prompt).min(budget);
             let t = Instant::now();
             let next = self
                 .e
@@ -282,7 +315,6 @@ impl FlashServe {
                 self.prefill_debt += dt;
             }
             s.done_prompt += n;
-            budget -= n;
             if s.done_prompt == s.ids.len() {
                 if s.prefill_only {
                     s.finish = Some(Finish::Stop);
@@ -391,5 +423,77 @@ impl FlashServe {
                 ..Default::default()
             },
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A simulated engine: prefill costs `PF` seconds a token, a decode window `DW` seconds.
+    /// Stream 0 is a cold 15k prompt, stream 1 decodes throughout, stream 2 is a cached agent
+    /// turn (27 new tokens) admitted 5 s in. Steps follow `batch_step`'s accounting.
+    #[test]
+    fn short_tails_jump_the_queue_and_decoders_keep_the_gpu() {
+        const PF: f64 = 1.0 / 590.0;
+        const DW: f64 = 0.006;
+        let mut rem = [15_000usize, 0, 0];
+        let (mut clock, mut debt) = (0.0f64, 0.0f64);
+        let (mut tail_admit, mut tail_ttft) = (None, None);
+        let (mut windows, mut chunks) = (0usize, 0usize);
+        let mut cold_done = None;
+        while cold_done.is_none() || tail_ttft.is_none() {
+            if tail_admit.is_none() && clock >= 5.0 {
+                rem[2] = 27;
+                tail_admit = Some(clock);
+            }
+            let waiting: Vec<(usize, usize)> = rem
+                .iter()
+                .enumerate()
+                .filter(|(_, &r)| r > 0)
+                .map(|(i, &r)| (r, i))
+                .collect();
+            for (i, n) in prefill_plan(&waiting, true, debt) {
+                let dt = n as f64 * PF;
+                clock += dt;
+                debt += dt;
+                rem[i] -= n;
+                chunks += 1;
+                if rem[i] == 0 && i == 2 {
+                    tail_ttft = Some(clock - tail_admit.unwrap());
+                }
+                if rem[i] == 0 && i == 0 {
+                    cold_done = Some(clock);
+                }
+            }
+            clock += DW;
+            debt = (debt - DW).max(0.0);
+            windows += 1;
+            assert!(clock < 120.0, "the cold prompt starved");
+        }
+        // The cached tail's first token comes within about one prefill slice of its admission.
+        let ttft = tail_ttft.unwrap();
+        assert!(ttft < 0.2, "tail ttft {ttft:.3} s");
+        // Decoders get about half the GPU: many windows a prefill chunk, ~80 tok/s or better.
+        let per_chunk = windows as f64 / chunks as f64;
+        assert!(per_chunk >= 10.0, "{per_chunk:.1} windows a chunk");
+        assert!(
+            windows as f64 / clock >= 80.0,
+            "{:.0} windows/s",
+            windows as f64 / clock
+        );
+        // And the cold prompt still finishes, at no worse than half its solo speed (+ slack).
+        let solo = 15_000.0 * PF;
+        assert!(
+            cold_done.unwrap() < 2.2 * solo,
+            "cold done {:.1} s vs solo {solo:.1} s",
+            cold_done.unwrap()
+        );
+    }
+
+    #[test]
+    fn nothing_decoding_gets_the_full_budget_shortest_first() {
+        let plan = prefill_plan(&[(1000, 0), (30, 1), (500, 2)], false, 5.0);
+        assert_eq!(plan, vec![(1, 30), (2, PREFILL_BUDGET - 30)]);
     }
 }
