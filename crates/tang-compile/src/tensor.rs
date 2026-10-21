@@ -65,6 +65,8 @@ mod msl_mma;
 /// OpenCL C (Adreno and other mobile GPUs): the WGSL kernels transpiled.
 #[path = "tensor_opencl.rs"]
 pub mod opencl;
+#[path = "tensor_opencl_gemv.rs"]
+pub mod opencl_gemv;
 #[path = "tensor_precision.rs"]
 pub mod precision;
 #[path = "tensor_tile.rs"]

@@ -6,7 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 description = "Offloaded MoE runtime substrate: pinned host arena, VRAM expert cache, pointer table"
 repository.workspace = true
-publish = false
+readme = "README.md"
+keywords = ["moe", "cuda", "inference", "offload"]
+categories = ["science"]
+include = ["src/**/*", "README.md", "DESIGN.md"]
 
 [features]
 default = []

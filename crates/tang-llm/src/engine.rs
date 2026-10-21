@@ -24,6 +24,14 @@ const MIN_CHUNK: usize = 9;
 /// A step's default time budget, while anything decodes: 20 tokens a second for each stream.
 pub const STEP_BUDGET: f64 = 0.050;
 
+/// Draft only while at most this many streams decode in a step. Above it verify rows cost
+/// more than the forwards they save. Measured with zest-harness on an H100 (Qwen3-8B-4bit,
+/// total tok/s, drafting at most at 2 / 4 / always): 4 streams 408 / 304 / 296, 8 streams
+/// 542 / 500 / 337, 16 streams 600 / 595 / 314, while at 1-2 streams drafting still pays
+/// (1 stream: 174 off vs 320-350 on). Overridden by `TANG_SPEC_MAX_STREAMS`; drafting never
+/// changes outputs, only which forwards run.
+pub const SPEC_MAX_STREAMS: usize = 2;
+
 /// Fewest leading positions of another conversation's block worth copying (fewer are just
 /// prefilled: a chat template's first few tokens are the same everywhere).
 const MIN_PARTIAL: usize = 32;
@@ -252,6 +260,13 @@ pub struct Engine<D: ComputeDevice> {
     /// decode (prefill chunks are sized to fit), if limited.
     step_cost: crate::step_cost::StepCost,
     step_budget: Option<f64>,
+    /// Draft only while at most this many streams decode (see [`SPEC_MAX_STREAMS`]), and how
+    /// many decode in the current step.
+    spec_max_streams: usize,
+    decoding: usize,
+    /// Sample from device-cut top candidates where a sampler allows (`TANG_TOP_SAMPLING=0`
+    /// turns it off: whole rows come back as before).
+    top_sampling: bool,
     /// Finished streams' outputs, for the global draft automaton once no stream drafts.
     global_pending: Vec<Vec<u32>>,
 }
@@ -289,7 +304,7 @@ pub struct Stream<B> {
     tool_calls: usize,
     drafter: Option<Drafter>,
     /// Logits rows from the last forward: row r follows the fed tokens and `draft[..r]`.
-    rows: Vec<f32>,
+    rows: crate::model::Logits,
     draft: crate::draft::Draft,
     row: usize,
     /// Draft tokens in the cache that aren't accepted yet.
@@ -353,7 +368,7 @@ impl<B> Stream<B> {
     }
 
     /// The prompt is in the cache; `logits` are its last position's.
-    fn prefilled(&mut self, logits: Vec<f32>) {
+    fn prefilled(&mut self, logits: crate::model::Logits) {
         self.end_prefill();
         if self.prefill_only {
             self.finish = Finish::Stop;
@@ -472,7 +487,14 @@ impl<D: ComputeDevice> Engine<D> {
                 _ => {}
             }
         }
-        for t in ["<|im_end|>", "<|endoftext|>", "<|eot_id|>"] {
+        // gpt-oss (harmony) ends a turn with `<|return|>` and stops for a tool at `<|call|>`.
+        for t in [
+            "<|im_end|>",
+            "<|endoftext|>",
+            "<|eot_id|>",
+            "<|return|>",
+            "<|call|>",
+        ] {
             eos.extend(tok.token_to_id(t));
         }
         eos.sort_unstable();
@@ -522,6 +544,12 @@ impl<D: ComputeDevice> Engine<D> {
             max_batch: usize::MAX,
             step_cost: crate::step_cost::StepCost::default(),
             step_budget: Some(STEP_BUDGET),
+            spec_max_streams: std::env::var("TANG_SPEC_MAX_STREAMS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(SPEC_MAX_STREAMS),
+            decoding: 0,
+            top_sampling: std::env::var("TANG_TOP_SAMPLING").map_or(true, |v| v != "0"),
             global_pending: Vec::new(),
         })
     }
@@ -605,6 +633,11 @@ impl<D: ComputeDevice> Engine<D> {
 
     /// Limit a step to `secs` while streams decode (prefill chunks shrink to fit), or don't
     /// (`None`: whole chunks always).
+    /// Draft only while at most `n` streams decode in a step (`usize::MAX`: always).
+    pub fn set_spec_max_streams(&mut self, n: usize) {
+        self.spec_max_streams = n;
+    }
+
     pub fn set_step_budget(&mut self, secs: Option<f64>) {
         self.step_budget = secs;
     }
@@ -1240,7 +1273,7 @@ impl<D: ComputeDevice> Engine<D> {
             decode_from: None,
             constraint,
             sampler: Sampler::new(req.sampling.clone()),
-            parser: Parser::new(opened),
+            parser: Parser::for_tags(&self.tags, opened),
             think: ThinkBudget::new(self.think_tags, req.thinking_budget, opened),
             out: Vec::new(),
             detok: Detok::default(),
@@ -1248,7 +1281,7 @@ impl<D: ComputeDevice> Engine<D> {
             finish: Finish::Length,
             tool_calls: 0,
             drafter,
-            rows: Vec::new(),
+            rows: Default::default(),
             draft: crate::draft::Draft::default(),
             row: 0,
             pending: 0,
@@ -1284,7 +1317,7 @@ impl<D: ComputeDevice> Engine<D> {
                 };
             st.progress.prefilled = st.ids.len() - reuse;
             st.images = runs;
-            st.prefilled(logits);
+            st.prefilled(crate::model::Logits::Full(logits));
         }
         Ok(st)
     }
@@ -1302,6 +1335,10 @@ impl<D: ComputeDevice> Engine<D> {
         // Each stream's segment, if it has one this step: (tokens fed, all rows).
         let mut segs: Vec<Option<bool>> = Vec::with_capacity(lanes.len());
         let mut decode_rows = 0;
+        self.decoding = lanes
+            .iter()
+            .filter(|l| l.stream.phase == Phase::Decode)
+            .count();
         for lane in lanes.iter_mut() {
             let want = match lane.stream.phase {
                 Phase::Decode => match self.advance(lane) {
@@ -1376,6 +1413,23 @@ impl<D: ComputeDevice> Engine<D> {
             st.fed.extend_from_slice(&st.ids[from..from + n]);
             *seg = Some(false);
         }
+        // Rows a stream's sampler can draw from their top candidates are cut on the device
+        // (see `Logits::Top`); a grammar needs the whole row to mask. A lone stream samples
+        // its one row on the host as fast (measured on an H100), and either way picks the same
+        // token, so only batches cut.
+        let batched = segs.iter().filter(|s| s.is_some()).count() > 1;
+        let top: Vec<bool> = lanes
+            .iter()
+            .zip(&segs)
+            .filter(|(_, seg)| seg.is_some())
+            .map(|(lane, _)| {
+                let st = &lane.stream;
+                self.top_sampling
+                    && batched
+                    && st.constraint.is_none()
+                    && st.sampler.top_needed(crate::model::TOP_LOGITS).is_some()
+            })
+            .collect();
         let mut idx = Vec::new();
         let mut parts = Vec::new();
         for (i, (lane, seg)) in lanes.iter_mut().zip(&segs).enumerate() {
@@ -1394,7 +1448,7 @@ impl<D: ComputeDevice> Engine<D> {
         }
         let solo = parts.len() == 1;
         let tf = Instant::now();
-        let logits = self.model.forward_batch(&mut parts)?;
+        let logits = self.model.forward_batch_top(&mut parts, &top)?;
         let secs = tf.elapsed().as_secs_f64();
         self.step_cost.observe(&shape, secs);
         drop(parts);
@@ -1429,7 +1483,7 @@ impl<D: ComputeDevice> Engine<D> {
                     }
                     st.rows = rows;
                     if k > 0 {
-                        st.rows.drain(..(m - 1) * vocab);
+                        st.rows.skip_rows(m - 1, vocab);
                     }
                     st.row = 0;
                     st.pending = k;
@@ -1461,11 +1515,20 @@ impl<D: ComputeDevice> Engine<D> {
                 st.finish = Finish::Cancelled;
                 break;
             }
-            let logits = &mut st.rows[st.row * vocab..(st.row + 1) * vocab];
-            if let Some(grammar) = st.constraint.as_mut() {
-                crate::structured::mask(grammar, logits, &self.eos)?;
-            }
-            let next = st.sampler.sample(logits);
+            let next = match &mut st.rows {
+                crate::model::Logits::Full(rows) => {
+                    let logits = &mut rows[st.row * vocab..(st.row + 1) * vocab];
+                    if let Some(grammar) = st.constraint.as_mut() {
+                        crate::structured::mask(grammar, logits, &self.eos)?;
+                    }
+                    st.sampler.sample(logits)
+                }
+                crate::model::Logits::Top { vals, idx } => {
+                    let k = crate::model::TOP_LOGITS.min(vocab);
+                    let r = st.row * k..(st.row + 1) * k;
+                    st.sampler.sample_top(&vals[r.clone()], &idx[r])
+                }
+            };
             let row = st.row;
             let hit = st.draft.tokens.get(row) == Some(&next);
             if row < st.draft.tokens.len() && !st.draft.from_model {
@@ -1553,9 +1616,11 @@ impl<D: ComputeDevice> Engine<D> {
             // Drop the rejected rest of the draft from the cache.
             st.cache.truncate(st.cache.len - st.pending);
             st.pending = 0;
-            // A new draft, unless the wrap-up was just forced in (don't draft across it).
+            // A new draft, unless the wrap-up was just forced in (don't draft across it) or
+            // the batch is too wide for verify rows to pay.
+            let wide = self.decoding > self.spec_max_streams;
             st.draft = match (st.drafter.as_ref(), spec) {
-                (Some(d), Some(s)) if !wrap => {
+                (Some(d), Some(s)) if !wrap && !wide => {
                     let room = (st.limit - st.out.len())
                         .min(max_ctx.saturating_sub(st.cache.len + st.fed.len()));
                     let p = d.propose(&s.cfg, &s.global, room);

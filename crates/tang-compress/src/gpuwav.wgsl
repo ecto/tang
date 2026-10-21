@@ -972,8 +972,11 @@ fn ltail(m: u32) -> u32 {
 }
 
 // per-lane adaptive probability maps (lmodel3::Adapt): (p << 8) | count,
-// 136 words per invocation in workgroup memory (a private array spills)
-var<workgroup> adt: array<u32, AD_WGN>;
+// 136 words per invocation. The host picks the storage (gpudec::AdMem):
+// workgroup memory (Metal, where a private array spills), a private array
+// (Vulkan/DX12, where 17 KB of workgroup memory caps occupancy), or a stub
+// for pipelines that never decode adaptive streams.
+AD_DECL
 var<private> ad_b: u32;
 var<private> ad_wa: u32;
 var<private> ad_lim: u32;
@@ -982,7 +985,7 @@ var<private> ad_so: u32;
 
 fn ad_reset(li: u32) {
     ad_wa = 0u;
-    ad_b = li * 136u;
+    ad_b = AD_BASE;
     if (P.pad4 == 0u) { return; }
     ad_so = mt[P.pad4 + 1u] + 257u;
     let c = mt[ad_so + 4096u];
