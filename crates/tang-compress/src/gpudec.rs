@@ -100,7 +100,10 @@ impl AdMem {
         match self {
             AdMem::None => "var<workgroup> adt: array<u32, 1>;".into(),
             AdMem::Workgroup => format!("var<workgroup> adt: array<u32, {}>;", ad_wgn(lanes)),
-            AdMem::Private => format!("var<private> adt: array<u32, {}>;", crate::lmodel3::AC * crate::lmodel3::AB),
+            AdMem::Private => format!(
+                "var<private> adt: array<u32, {}>;",
+                crate::lmodel3::AC * crate::lmodel3::AB
+            ),
         }
     }
     fn base(self) -> &'static str {
@@ -180,7 +183,9 @@ impl GpuDecoder {
         // in workgroup memory the adaptive layer's bins take 17 KB at 32
         // invocations, over WebGPU's 16 KB default
         let wg = ad_wgn(lanes) as u32 * 4 + 1024;
-        if AdMem::for_backend(adapter.get_info().backend) == AdMem::Workgroup && al.max_compute_workgroup_storage_size < wg {
+        if AdMem::for_backend(adapter.get_info().backend) == AdMem::Workgroup
+            && al.max_compute_workgroup_storage_size < wg
+        {
             return Err(format!(
                 "tc-gpu needs {wg} B of workgroup storage, the adapter has {}",
                 al.max_compute_workgroup_storage_size
@@ -920,7 +925,11 @@ impl GpuDecoder {
         if let Some(p) = c.iter().find(|e| e.0 == key) {
             return p.1.clone();
         }
-        let mut src = if ad { shader_src(self.lanes, self.maxl, self.ad_mem) } else { self.src.clone() };
+        let mut src = if ad {
+            shader_src(self.lanes, self.maxl, self.ad_mem)
+        } else {
+            self.src.clone()
+        };
         if let Some(d) = dec {
             src = crate::irdec::splice_res(&src, if ad { &d.wgsl_res_ad } else { &d.wgsl_res });
         } else if ad && std::env::var("TC_GPU_HANDRES").is_err() {
