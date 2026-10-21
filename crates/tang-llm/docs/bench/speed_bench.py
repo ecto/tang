@@ -1,5 +1,5 @@
 # AA-style single-stream output speed: ~1k-token prompt, stream, tok/s from first token to last.
-# usage: python3 -I aa.py <runs> [port]
+# usage: python3 -I speed_bench.py <runs> [port]
 import json, sys, time, urllib.request, random
 runs = int(sys.argv[1]); port = sys.argv[2] if len(sys.argv) > 2 else "8912"
 random.seed(1)

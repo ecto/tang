@@ -32,7 +32,7 @@ for the same GPU, model and streams; GPUs differ run to run (±5%), so treat cha
 
 AA-style single stream (`tang-llm serve`, speculation on as deployed, ~850-token prompt, 500
 output tokens, temperature 0.7, streamed; output tok/s from first token to last, median of 3;
-the probe is `docs/bench/aa.py`):
+the probe is `docs/bench/speed_bench.py`):
 
 | date | commit | GPU | model | AA output tok/s | bar (fastest public API) |
 |---|---|---|---|---|---|

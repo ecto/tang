@@ -78,7 +78,7 @@ the default only once the batch and speculate tests pass on GPU.
 1. `bench_q4_gemv_cuda` with `TANG_GEMV=xv` / `xp`: the five 8B shapes at m=1 and m=8. Go on only
    if the weighted bandwidth is ≥ 2.4 TB/s (+21% expected on the step).
 2. `bench_batch --q4` 8B and 32B at 1 and 8 streams, both kernels from one binary.
-3. `aa.py` on `tang-llm serve` for 8B and 32B (kill servers by the binary's full path).
+3. `speed_bench.py` on `tang-llm serve` for 8B and 32B (kill servers by the binary's full path).
 4. The `cuda_q4*` tests, plus batch and speculate.
 
 Expected: a clear ≥10% on 8B solo if the kernel reaches 2.2 TB/s or more. Below 2.0 TB/s,
