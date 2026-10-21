@@ -16,6 +16,7 @@ fn main() {
         theta: 1e4,
         kv_f16: true,
         vocab_chunks: 1,
+        prefill_q4: false,
     };
     let dg = decode_graph(&dims);
     let (g, mut outs) = compiled_decode(&dg, true);

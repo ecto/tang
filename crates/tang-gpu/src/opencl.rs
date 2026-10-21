@@ -357,8 +357,16 @@ impl ClDevice {
     /// kernel's marker (other sources unchanged).
     pub fn prepare(&self, source: &str) -> String {
         use tang_compile::tensor::opencl_gemv::{
-            OPENCL_SHFL_KHR, OPENCL_SHFL_LOCAL, OPENCL_SHFL_QCOM, SHFL_MARKER,
+            FP16_MARKER, OPENCL_SHFL_KHR, OPENCL_SHFL_LOCAL, OPENCL_SHFL_QCOM, SHFL_MARKER,
         };
+        if source.contains(FP16_MARKER) {
+            let def = if self.extensions.contains("cl_khr_fp16") {
+                "#define TANG_FP16 1\n"
+            } else {
+                "\n"
+            };
+            return source.replacen(FP16_MARKER, def, 1);
+        }
         if !source.contains(SHFL_MARKER) {
             return source.to_string();
         }
@@ -390,6 +398,27 @@ impl ClDevice {
     /// A built program for `source` (prepared): from the binary cache,
     /// else compiled and cached.
     fn program(&self, source: &str) -> Result<(H, bool), String> {
+        // TANG_CL_LOG=1: build time and binary-cache hits per program
+        let t = std::time::Instant::now();
+        let r = self.program_inner(source);
+        if std::env::var("TANG_CL_LOG").is_ok_and(|v| v == "1") {
+            eprintln!(
+                "tang-cl: program {:.1} ms {}: {}",
+                t.elapsed().as_secs_f64() * 1e3,
+                if r.is_ok() { "ok" } else { "FAILED" },
+                source
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(110)
+                    .collect::<String>()
+            );
+        }
+        r
+    }
+
+    fn program_inner(&self, source: &str) -> Result<(H, bool), String> {
         use std::hash::{Hash, Hasher};
         // the Adreno compiler takes cl_qcom_subgroup_shuffle only under OpenCL C 3.0
         let opts = std::env::var("TANG_CL_OPTS").unwrap_or_else(|_| {
@@ -425,6 +454,9 @@ impl ClDevice {
                     (self.api.clBuildProgram)(p, 1, &self.device, copts.as_ptr(), null(), null())
                 } == 0
             {
+                if std::env::var("TANG_CL_LOG").is_ok_and(|v| v == "1") {
+                    eprintln!("tang-cl: binary cache hit");
+                }
                 return Ok((p, true));
             }
             if !p.is_null() {

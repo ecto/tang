@@ -17,7 +17,9 @@
 //! decode it is inlined and evaluated where the packed words are loaded
 //! (`to_cuda_decode` / `to_msl_decode`, `Packing::U4`); in prefill, where
 //! each weight is read by `seq` tokens, it stays materialized and the
-//! matmul is a tensor-core (simdgroup-matrix) tile over it.
+//! matmul is a tensor-core (simdgroup-matrix) tile over it — except on
+//! OpenCL ([`QwenDims::prefill_q4`]), where the prefill's register-block
+//! kernel dequantizes at load as decode does and no f32 copy is written.
 //!
 //! **Data-dependent reads are bounded sums.** The IR's views are affine,
 //! so a read at a runtime index — the embedding row of a token, the rope
@@ -66,6 +68,12 @@ pub struct QwenDims {
     /// be smaller than one 4-bit `[vocab, d]` matrix (311 MB for
     /// Qwen3-8B; Vulkan on the Adreno binds at most 128 MiB). 1 is whole.
     pub vocab_chunks: usize,
+    /// Prefill matmuls read the 4-bit weights as decode does (the
+    /// dequantization inlined where the packed words are loaded) instead of
+    /// over a materialized f32 copy per pass: the OpenCL prefill's
+    /// register-block kernel over packed weights
+    /// (`opencl_mma_kernel_q4`). Off: the f32 maps (every other backend).
+    pub prefill_q4: bool,
 }
 
 impl QwenDims {
@@ -84,6 +92,7 @@ impl QwenDims {
             theta: 1e6,
             kv_f16: true,
             vocab_chunks: 1,
+            prefill_q4: false,
         }
     }
 
@@ -126,6 +135,8 @@ pub struct DecodeGraph {
     /// holds block 0): the full logits are their concatenation.
     pub logit_chunks: Vec<TensorId>,
     pub inputs: Vec<InputSpec>,
+    /// A prefill over the packed weights ([`QwenDims::prefill_q4`]).
+    pub q4: bool,
 }
 
 impl DecodeGraph {
@@ -207,6 +218,8 @@ struct Rows {
 struct Builder {
     g: TensorGraph,
     inputs: Vec<InputSpec>,
+    /// [`QwenDims::prefill_q4`]
+    q4: bool,
 }
 
 impl Builder {
@@ -287,7 +300,7 @@ impl Builder {
                 |v| vec![v[0] * v[1] + v[2]],
             )
             .unwrap();
-        if seq > 1 {
+        if seq > 1 && !self.q4 {
             // many rows: the weight is read by every one, so the
             // dequantized weight is materialized (seq-fold recompute
             // otherwise) and the matmul runs over one flat k — a
@@ -389,6 +402,7 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
         ctx,
         eps,
         vocab_chunks,
+        prefill_q4,
         ..
     } = *dims;
     assert!(
@@ -406,6 +420,7 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
     let mut b = Builder {
         g: TensorGraph::new(),
         inputs: Vec::new(),
+        q4: prefill_q4,
     };
     let state = b.input("state".into(), &[2], None);
     let chunk = (seq > 1).then(|| b.input("chunk".into(), &[seq + 1], None));
@@ -946,6 +961,7 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
         keep,
         logit_chunks,
         inputs: b.inputs,
+        q4: seq > 1 && prefill_q4,
     }
 }
 
@@ -990,6 +1006,47 @@ pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<
         .collect();
     let caches = outs[1..dg.outputs.len()].to_vec();
     g.schedule_decode_maps(&outs, &u4, &caches);
+    if dg.q4 {
+        // a prefill over packed weights: the dequantization maps are
+        // evaluated where the matmul loads the packed words, and the
+        // activations the matmuls read stay materialized (a norm would be
+        // recomputed per register block and k step otherwise)
+        use tang_compile::tensor::Op;
+        let n = g.nodes().len();
+        let u4n: Vec<usize> = (0..n)
+            .filter(|&i| matches!(g.nodes()[i].op, Op::Input(k) if u4.contains(&k)))
+            .collect();
+        let reads_any = |i: usize, set: &[usize]| {
+            g.comp_at(i)
+                .is_some_and(|c| c.args.iter().any(|a| set.contains(&a.src.index())))
+        };
+        let dq: Vec<usize> = (0..n)
+            .filter(|&i| g.comp_at(i).is_some_and(|c| c.monoid.is_none()) && reads_any(i, &u4n))
+            .collect();
+        let mm: Vec<usize> = (0..n)
+            .filter(|&i| {
+                g.comp_at(i)
+                    .is_some_and(|c| c.monoid.is_some() && c.red.len() == 2)
+                    && (reads_any(i, &dq) || reads_any(i, &u4n))
+            })
+            .collect();
+        let read_by_mm = |i: usize| mm.iter().any(|&r| reads_any(r, &[i]));
+        let undo: Vec<usize> = (0..n)
+            .filter(|&i| {
+                g.nodes()[i].inline
+                    && g.comp_at(i).is_some_and(|c| c.monoid.is_none())
+                    && !dq.contains(&i)
+                    && read_by_mm(i)
+            })
+            .collect();
+        let inl: Vec<usize> = dq.iter().copied().filter(|&i| read_by_mm(i)).collect();
+        for i in undo {
+            g.set_inline(TensorId::from_index(i), false);
+        }
+        for i in inl {
+            g.set_inline(TensorId::from_index(i), true);
+        }
+    }
     if dg.seq > 1 && half_tiles && std::env::var_os("TANG_PREFILL_TF32").is_none() {
         // prefill: the dequantized weights stored f16, so the matmuls run
         // on f16 tensor cores (the f32 activations are converted while
@@ -1213,6 +1270,7 @@ mod tests {
             theta: 1e4,
             kv_f16: false,
             vocab_chunks: 1,
+            prefill_q4: false,
         }
     }
 
@@ -1336,5 +1394,72 @@ mod tests {
             .filter(|k| k.source.contains("in-place"))
             .count();
         assert_eq!(inplace, 2 * dims.layers + 1);
+    }
+
+    /// Kernels of the OpenCL lowering of a prefill step whose first line
+    /// names them.
+    fn opencl_prefill_heads(dims: &QwenDims, seq: usize) -> Vec<String> {
+        let dg = step_graph(dims, seq, dims.ctx);
+        let (g, outs) = compiled_decode(&dg, false);
+        let opts = decode_opts(&dg, &outs);
+        g.to_opencl_decode(&outs, &opts)
+            .program
+            .kernels
+            .iter()
+            .map(|k| k.source.lines().next().unwrap_or("").to_string())
+            .collect()
+    }
+
+    /// Every projection of an OpenCL prefill (q|k|v, o, gate, up, down per
+    /// layer) is a register-block kernel (`opencl_mma_kernel`): both
+    /// operands contiguous along k — the activations `[token][k]`, the
+    /// weights `[row][k]`. The LM head is the last token's GEMV.
+    #[test]
+    fn opencl_prefill_projections_are_register_blocks() {
+        let dims = tiny();
+        let heads = opencl_prefill_heads(&dims, 6);
+        let mm = heads
+            .iter()
+            .filter(|h| h.starts_with("// tang-compile: OpenCL C (native)") && h.contains("matmul"))
+            .count();
+        assert_eq!(mm, 5 * dims.layers, "{heads:#?}");
+    }
+
+    /// With `prefill_q4` every projection is the register block over the
+    /// packed weights, and no kernel materializes a dequantized weight.
+    #[test]
+    fn opencl_prefill_q4_reads_packed_weights() {
+        // ff of 40 groups: the down projection's reduce dims [40, 64] are
+        // past `tiled_reduction`'s cap (Qwen3-1.7B's are [96, 64])
+        let dims = QwenDims {
+            prefill_q4: true,
+            ff: 40 * GROUP,
+            ..tiny()
+        };
+        let heads = opencl_prefill_heads(&dims, 6);
+        let q4 = heads
+            .iter()
+            .filter(|h| h.contains("matmul over 4-bit weights"))
+            .count();
+        assert_eq!(q4, 5 * dims.layers, "{heads:#?}");
+        assert!(
+            !heads.iter().any(|h| h.contains("map over packed inputs")),
+            "{heads:#?}"
+        );
+    }
+
+    /// `TANG_CL_MM_KIND=stage`: every projection is the staged kernel.
+    #[test]
+    fn opencl_prefill_staged_kernel_covers_projections() {
+        let dims = QwenDims {
+            prefill_q4: true,
+            ff: 40 * GROUP,
+            ..tiny()
+        };
+        std::env::set_var("TANG_CL_MM_KIND", "stage");
+        let heads = opencl_prefill_heads(&dims, 12);
+        std::env::remove_var("TANG_CL_MM_KIND");
+        let staged = heads.iter().filter(|h| h.contains("staged")).count();
+        assert_eq!(staged, 5 * dims.layers, "{heads:#?}");
     }
 }

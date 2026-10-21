@@ -48,6 +48,15 @@ pub fn lower(
     }
 }
 
+/// OpenCL prefill over the packed 4-bit weights (dequantized in the
+/// register-block kernel) instead of materialized f32 copies per pass;
+/// `TANG_CL_PREFILL_Q4=0` restores the f32 maps.
+pub fn prefill_q4(rt: &Runtime) -> bool {
+    rt.kind() == BackendKind::OpenCl
+        && std::env::var("TANG_CL_PREFILL_Q4").as_deref() != Ok("0")
+        && std::env::var("TANG_CL_MM").as_deref() != Ok("off")
+}
+
 pub fn env(k: &str) -> usize {
     std::env::var(k)
         .ok()
@@ -102,6 +111,10 @@ impl Step {
         base: Option<&Step>,
     ) -> Self {
         let t = Instant::now();
+        let dims = &QwenDims {
+            prefill_q4: dims.prefill_q4 || prefill_q4(rt),
+            ..dims.clone()
+        };
         let dg = step_graph(dims, seq, kctx);
         let (g, mut outs) = compiled_decode(&dg, rt.kind() == BackendKind::Cuda);
         let named = outs.len();
@@ -495,8 +508,13 @@ pub fn load_inputs<'a>(
 
 /// Prefill chunk sizes a [`Session`] builds programs for (largest first);
 /// a remainder below the smallest goes through decode steps.
-/// `QWEN_PREFILL_CHUNKS=64,8` (the default) overrides.
-fn chunk_sizes() -> Vec<usize> {
+/// `QWEN_PREFILL_CHUNKS=64,8` overrides. Default `64,8`; on OpenCL
+/// `64,32,16,8,4,2`: a voice turn's ~20 new tokens run as 16 + 4 (two
+/// prefill runs) instead of 8 + 8 and four decode steps (each a full pass
+/// over the weights at decode speed, ~55 ms on the K1), and a tail never
+/// needs more than one decode step. Each extra size is one more program
+/// per window (its own intermediates: ~0.55 MB per token for Qwen3-1.7B).
+fn chunk_sizes(rt: &Runtime) -> Vec<usize> {
     std::env::var("QWEN_PREFILL_CHUNKS")
         .ok()
         .map(|v| {
@@ -505,7 +523,13 @@ fn chunk_sizes() -> Vec<usize> {
                 .collect::<Vec<usize>>()
         })
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| vec![64, 8])
+        .unwrap_or_else(|| {
+            if rt.kind() == BackendKind::OpenCl {
+                vec![64, 32, 16, 8, 4, 2]
+            } else {
+                vec![64, 8]
+            }
+        })
 }
 
 /// The attention window of a prefill reaching position `end`: a power of
@@ -692,7 +716,7 @@ impl Session {
     /// Build the prefill programs a prompt of up to `end` positions uses
     /// (compile time off the first turn).
     pub fn warm(&mut self, end: usize) {
-        for seq in chunk_sizes() {
+        for seq in chunk_sizes(&self.rt) {
             let mut w = 512;
             while w <= window(end, self.dims.ctx) {
                 self.step_for(seq, w);
@@ -731,7 +755,7 @@ impl Session {
         // the last prompt token is always run: its logits pick the reply
         lcp = lcp.min(tokens.len() - 1);
         let mut p = lcp;
-        let sizes = chunk_sizes();
+        let sizes = chunk_sizes(&self.rt);
         #[cfg(feature = "otel")]
         let tel = tel::Op::start("qwen.prefill", &self.trace_parent);
         #[cfg(feature = "otel")]
@@ -925,7 +949,15 @@ pub fn tune_key(rt: &Runtime, dims: &QwenDims) -> String {
 }
 
 /// The knobs the tuner sets (decode GEMV shape, OpenCL prefill register block).
-pub const TUNE_KNOBS: [&str; 3] = ["TANG_DECODE_WARPS", "TANG_DECODE_ROWS", "TANG_CL_MM"];
+pub const TUNE_KNOBS: [&str; 7] = [
+    "TANG_DECODE_WARPS",
+    "TANG_DECODE_ROWS",
+    "TANG_CL_MM",
+    "TANG_CL_MM_LANES",
+    "TANG_CL_MM_VEC",
+    "TANG_CL_MM_KIND",
+    "TANG_CL_STAGE",
+];
 
 /// Set this device and model's tuned knobs from [`tune_path`], except any
 /// already set in the environment (an explicit env var wins). Returns what
@@ -967,6 +999,42 @@ fn load1() -> Option<f64> {
         .next()?
         .parse()
         .ok()
+}
+
+/// Prefill matmul candidates of [`tune`]: `(TANG_CL_MM_KIND, config,
+/// lanes)`. The first is the default (no knobs set), measured as the
+/// baseline; staged before register-block.
+const PREFILL_CANDIDATES: &[(&str, &str, &str)] = &[
+    ("", "stage 128x8x2x128", ""),
+    ("stage", "128x4x2x256", ""),
+    ("stage", "128x4x4x128", ""),
+    ("stage", "64x4x2x256", ""),
+    ("stage", "256x8x2x64", ""),
+    ("stage", "128x8x1x128", ""),
+    ("stage", "64x8x4x128", ""),
+    ("stage", "256x16x2x64", ""),
+    ("reg", "4x4x64", "16"),
+    ("reg", "4x4x128", "16"),
+    ("reg", "4x4x128", "32"),
+    ("reg", "4x4x64", "8"),
+    ("reg", "4x8x64", "16"),
+    ("reg", "8x4x64", "16"),
+    ("reg", "2x8x128", "16"),
+    ("reg", "0x4x64", "16"),
+    ("reg", "4x4x64", "1"),
+];
+
+/// The prefill winner among `results` (`(ms, candidate index)`): the
+/// fastest, and only if strictly faster than the measured default
+/// `baseline`; `None` keeps the default (also with no baseline or no
+/// results).
+fn pick_prefill(baseline: Option<f64>, results: &[(f64, usize)]) -> Option<(f64, usize)> {
+    let b = baseline.filter(|b| b.is_finite())?;
+    results
+        .iter()
+        .copied()
+        .filter(|(ms, _)| ms.is_finite() && *ms < b)
+        .min_by(|x, y| x.0.total_cmp(&y.0))
 }
 
 /// Wait (bounded) for the GPU to cool below `cool` °C and the 1-minute load
@@ -1049,6 +1117,8 @@ pub fn tune(dir: &str, budget: f64) -> Vec<(String, String)> {
         best
     };
     let mut won = Vec::new();
+    // prefill: (measured default ms, winning candidate ms if one beat it)
+    let mut prefill_ms: Option<(f64, Option<f64>)> = None;
     // decode: warps x rows
     let mut best: Option<(f64, usize, usize)> = None;
     for (w, r) in [(4, 2), (4, 4), (8, 4), (4, 8), (2, 4), (8, 2), (8, 8)] {
@@ -1088,21 +1158,30 @@ pub fn tune(dir: &str, budget: f64) -> Vec<(String, String)> {
         won.push(("TANG_DECODE_WARPS".to_string(), w.to_string()));
         won.push(("TANG_DECODE_ROWS".to_string(), r.to_string()));
     }
-    // prefill register block (OpenCL)
+    // prefill matmul kernel (OpenCL): the register block or the staged one
     if rt.kind() == BackendKind::OpenCl {
-        let seq = 64;
+        // a voice turn's size (QWEN_TUNE_SEQ overrides)
+        let seq = match env("QWEN_TUNE_SEQ") {
+            0 => 20,
+            n => n,
+        };
         let toks: Vec<usize> = (0..seq).map(|i| 1000 + i).collect();
-        let mut best: Option<(f64, String)> = None;
-        for mm in [
-            "4x4x64", "4x8x64", "8x4x64", "2x8x64", "4x4x128", "4x4x32", "8x8x64", "2x4x64",
-        ] {
-            if !settle(hot, 75.0, load, deadline) {
-                eprintln!("tune: budget spent");
-                break;
+        // register block: (RMxRNxWG, lanes along k), local partials
+        // RM*RN*WG floats within the Adreno's 32 KB. staged:
+        // WGxLANESxRNxKC, activations (<= 32/RN rows x KC) and partials in
+        // local memory, <= 32 accumulators per item. The default (no knobs:
+        // stage 128x8x2x128) is measured first as the baseline; staged
+        // candidates go before the register ones, which lost on the K1.
+        let measure = |kind: &str, cfg: &str, lanes: &str| -> f64 {
+            if !kind.is_empty() {
+                std::env::set_var("TANG_CL_MM_KIND", kind);
             }
-            std::env::set_var("TANG_CL_MM", mm);
-            #[cfg(feature = "otel")]
-            let c0 = std::time::SystemTime::now();
+            if kind == "stage" {
+                std::env::set_var("TANG_CL_STAGE", cfg);
+            } else if kind == "reg" {
+                std::env::set_var("TANG_CL_MM", cfg);
+                std::env::set_var("TANG_CL_MM_LANES", lanes);
+            }
             let s = Step::new(
                 &rt,
                 &dims,
@@ -1112,24 +1191,80 @@ pub fn tune(dir: &str, budget: f64) -> Vec<(String, String)> {
                 Some(&base),
             );
             s.prefill(&rt, &toks, 0);
-            let ms = s.prog.time(&rt, 3);
+            let ms = s.prog.time(&rt, 1);
+            for k in [
+                "TANG_CL_MM_KIND",
+                "TANG_CL_STAGE",
+                "TANG_CL_MM",
+                "TANG_CL_MM_LANES",
+            ] {
+                std::env::remove_var(k);
+            }
+            ms
+        };
+        let mut results: Vec<(f64, usize)> = Vec::new();
+        let mut baseline = None;
+        // wall time of the slowest candidate so far (build + run): a
+        // candidate starts only if one more of those fits the budget
+        let mut cost = std::time::Duration::ZERO;
+        for (i, &(kind, cfg, lanes)) in PREFILL_CANDIDATES.iter().enumerate() {
+            if i > 0 && Instant::now() + cost >= deadline {
+                eprintln!("tune: budget spent");
+                break;
+            }
+            if !settle(hot, 75.0, load, deadline) && i > 0 {
+                eprintln!("tune: budget spent");
+                break;
+            }
+            #[cfg(feature = "otel")]
+            let c0 = std::time::SystemTime::now();
+            let w0 = Instant::now();
+            let ms = measure(kind, cfg, lanes);
+            cost = cost.max(w0.elapsed());
+            let name = if i == 0 {
+                format!("default ({cfg})")
+            } else {
+                format!("{kind} {cfg} lanes {lanes}")
+            };
             eprintln!(
-                "tune: prefill {seq} tokens, block {mm}: {ms:.1} ms ({:.0} tok/s, gpu {:.1} C)",
+                "tune: prefill {seq} tokens, {name}: {ms:.1} ms ({:.0} tok/s, gpu {:.1} C)",
                 seq as f64 * 1e3 / ms,
                 gpu_temp().unwrap_or(0.0)
             );
             #[cfg(feature = "otel")]
             if let Some(t) = &tel {
                 candidates += 1;
-                t.candidate(c0, "prefill", mm, ms, gpu_temp());
+                t.candidate(c0, "prefill", &name, ms, gpu_temp());
             }
-            if best.as_ref().is_none_or(|b| ms < b.0) {
-                best = Some((ms, mm.to_string()));
+            if i == 0 {
+                baseline = Some(ms);
+            } else {
+                results.push((ms, i));
             }
         }
-        std::env::remove_var("TANG_CL_MM");
-        if let Some((_, mm)) = best {
-            won.push(("TANG_CL_MM".to_string(), mm));
+        let pick = pick_prefill(baseline, &results);
+        if let Some(b) = baseline {
+            prefill_ms = Some((b, pick.map(|(ms, _)| ms)));
+        }
+        match pick {
+            Some((ms, i)) => {
+                let (kind, cfg, lanes) = PREFILL_CANDIDATES[i];
+                eprintln!(
+                    "tune: prefill {kind} {cfg} {ms:.1} ms beats the default {:.1} ms",
+                    baseline.unwrap_or(f64::NAN)
+                );
+                won.push(("TANG_CL_MM_KIND".to_string(), kind.to_string()));
+                if kind == "stage" {
+                    won.push(("TANG_CL_STAGE".to_string(), cfg.to_string()));
+                } else {
+                    won.push(("TANG_CL_MM".to_string(), cfg.to_string()));
+                    won.push(("TANG_CL_MM_LANES".to_string(), lanes.to_string()));
+                }
+            }
+            None => eprintln!(
+                "tune: prefill keeps the default ({:.1} ms)",
+                baseline.unwrap_or(f64::NAN)
+            ),
         }
     }
     // merge into the tuning file
@@ -1138,10 +1273,17 @@ pub fn tune(dir: &str, budget: f64) -> Vec<(String, String)> {
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_else(|| serde_json::json!({}));
-    let entry: serde_json::Map<String, serde_json::Value> = won
+    let mut entry: serde_json::Map<String, serde_json::Value> = won
         .iter()
         .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
         .collect();
+    // numbers, not knobs: apply_tuning skips non-strings
+    if let Some((b, w)) = prefill_ms {
+        entry.insert("prefill_baseline_ms".into(), serde_json::json!(b));
+        if let Some(w) = w {
+            entry.insert("prefill_best_ms".into(), serde_json::json!(w));
+        }
+    }
     all[key.as_str()] = serde_json::Value::Object(entry);
     if let Some(d) = path.parent() {
         let _ = std::fs::create_dir_all(d);
@@ -1159,6 +1301,299 @@ pub fn tune(dir: &str, budget: f64) -> Vec<(String, String)> {
         tang_otel::flush();
     }
     won
+}
+
+/// Prompt text of [`prefill_bench`]: fixed, so runs on different devices
+/// see the same token ids.
+const BENCH_TEXT: &str = "The robot rolled into the kitchen, paused by the window, \
+and asked whether anyone wanted tea. Nobody answered, so it checked the kettle, \
+counted the cups on the shelf, and wrote a short note about the weather: cloudy \
+in the morning, clear by noon, a light wind from the west. ";
+
+/// One prefill variant against the f32-map baseline ([`prefill_bench`]).
+#[derive(Clone, Debug)]
+pub struct PrefillCheck {
+    pub variant: &'static str,
+    pub seq: usize,
+    /// Largest |logit − baseline logit| over the vocabulary (last token).
+    pub max_abs: f32,
+    pub max_logit: f32,
+    pub top1_agree: bool,
+}
+
+/// Prefill and decode timings for the model in `dir` on the default
+/// runtime ([`runtime`]: `TANG_BACKEND`), tuned knobs applied: for each of
+/// `sizes`, one prefill program of exactly that many tokens of a fixed
+/// prompt from position 0 (device time, best of 5 runs); then `gen` greedy
+/// decode steps after the largest, end to end (run + state readback).
+/// With `check` (OpenCL), each size's last-token logits also run through
+/// the f32-map prefill (`TANG_CL_PREFILL_Q4=0`, the baseline), the
+/// packed-weight one and the packed-weight fp16 one
+/// (`TANG_CL_PREFILL_F16=1`), returned as max |Δlogit| and top-1 agreement
+/// against the baseline. Prints as it goes.
+pub fn prefill_bench(dir: &str, sizes: &[usize], gen: usize, check: bool) -> Vec<PrefillCheck> {
+    // QWEN_BENCH_TURN=0: skip the 20-token turn (two more programs)
+    let turn_on = std::env::var("QWEN_BENCH_TURN").as_deref() != Ok("0");
+    // QWEN_BENCH_PROFILE=1: per-kernel device time of each size's prefill
+    let profile = std::env::var("QWEN_BENCH_PROFILE").is_ok_and(|v| v == "1");
+    let t_start = Instant::now();
+    let phase = |what: &str| {
+        println!("phase {:7.2} s: {what}", t_start.elapsed().as_secs_f64());
+    };
+    let tokenizer =
+        tokenizers::Tokenizer::from_file(format!("{dir}/tokenizer.json")).expect("tokenizer.json");
+    let max = sizes.iter().copied().max().unwrap_or(1);
+    let mut ids: Vec<usize> = Vec::new();
+    while ids.len() < max {
+        let e = tokenizer
+            .encode(BENCH_TEXT.repeat(8), false)
+            .expect("encode");
+        ids.extend(e.get_ids().iter().map(|&t| t as usize));
+    }
+    ids.truncate(max);
+    phase("tokenizer + prompt");
+    let ctx = (max + gen + 1).next_power_of_two().max(1024);
+    let mut dims = dims_for(dir, ctx);
+    dims.kv_f16 = std::env::var("TANG_KV_F32").is_err();
+    let rt = runtime();
+    phase("runtime");
+    for (k, v) in apply_tuning(&rt, &dims) {
+        println!("tang: tuned {k}={v}");
+    }
+    if rt.kind() == BackendKind::OpenCl {
+        dims.vocab_chunks = (dims.vocab * dims.d_model / 2).div_ceil(255 << 20).max(1);
+    }
+    println!(
+        "bench: {} | d{} ff{} l{} | prefill_q4 {} fp16 {}",
+        rt.name(),
+        dims.d_model,
+        dims.ff,
+        dims.layers,
+        prefill_q4(&rt),
+        tang_compile::tensor::opencl_gemv::prefill_f16()
+    );
+    let st = St::open(&format!("{dir}/model.safetensors"));
+    phase("checkpoint mapped");
+    let dec = Step::new(
+        &rt,
+        &dims,
+        1,
+        ctx,
+        &|dg| vec![Vec::new(); dg.inputs.len()],
+        None,
+    );
+    phase("decode program built + buffers allocated");
+    for (k, v) in load_inputs(&st, &dims, &dec.dg).enumerate() {
+        if !v.is_empty() {
+            dec.prog.write(&rt, dec.prog.input(k), &v);
+        }
+    }
+    rt.sync();
+    phase("weights converted + uploaded");
+    let build = |seq: usize| {
+        Step::new(
+            &rt,
+            &dims,
+            seq,
+            window(seq, ctx),
+            &|dg| vec![Vec::new(); dg.inputs.len()],
+            Some(&dec),
+        )
+    };
+    let mut sorted = sizes.to_vec();
+    sorted.sort_unstable();
+    let mut last = None;
+    for &seq in &sorted {
+        let t = Instant::now();
+        let s = build(seq);
+        let built = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        s.prefill(&rt, &ids[..seq], 0);
+        let _ = s.state(&rt);
+        let first = t.elapsed().as_secs_f64();
+        let ms = run_ms(&rt, &s.prog, 2);
+        println!(
+            "prefill {seq:4} tokens: built in {built:.1} s, first run {:.0} ms wall",
+            first * 1e3
+        );
+        println!(
+            "prefill {seq:4} tokens: {ms:8.1} ms device ({:6.0} tok/s), {:.0} MB own buffers",
+            seq as f64 * 1e3 / ms,
+            s.bytes as f64 / 1e6
+        );
+        phase(&format!("prefill {seq} timed"));
+        if profile {
+            kernel_table(&rt, &s, 25);
+            phase(&format!("prefill {seq} profiled"));
+        }
+        last = Some(s);
+    }
+    // a voice turn: 20 new tokens after the largest prompt, split as a
+    // Session splits them (QWEN_PREFILL_CHUNKS), device time summed
+    if turn_on && max + 20 < ctx {
+        let (mut p, mut ms, mut parts) = (max, 0.0, Vec::new());
+        let ladder = chunk_sizes(&rt);
+        let turn: Vec<usize> = (0..max + 20).map(|i| ids[i % max]).collect();
+        while p < max + 20 {
+            let left = max + 20 - p;
+            match ladder.iter().copied().find(|&c| c <= left) {
+                Some(seq) => {
+                    let s = Step::new(
+                        &rt,
+                        &dims,
+                        seq,
+                        window(p + seq, ctx),
+                        &|dg| vec![Vec::new(); dg.inputs.len()],
+                        Some(&dec),
+                    );
+                    s.prefill(&rt, &turn[p..p + seq], p);
+                    ms += run_ms(&rt, &s.prog, 2);
+                    parts.push(seq.to_string());
+                    p += seq;
+                }
+                None => {
+                    dec.set_state(&rt, turn[p], p);
+                    ms += run_ms(&rt, &dec.prog, 2);
+                    parts.push("1 (decode)".into());
+                    p += 1;
+                }
+            }
+        }
+        println!(
+            "turn: 20 new tokens after {max} as {}: {ms:.1} ms device",
+            parts.join(" + ")
+        );
+    }
+    // decode after a prefill of the largest size
+    if gen > 0 {
+        let s = last.take().unwrap_or_else(|| build(max));
+        s.prefill(&rt, &ids[..max], 0);
+        let _ = s.state(&rt);
+        drop(s);
+        let t = Instant::now();
+        let mut n = 0;
+        for _ in 0..gen {
+            dec.prog.run(&rt);
+            let (_, p) = dec.state(&rt);
+            n += 1;
+            if p + 1 >= ctx {
+                break;
+            }
+        }
+        let secs = t.elapsed().as_secs_f64();
+        println!(
+            "decode {n} tokens after {max}: {:.1} ms/token ({:.1} tok/s end to end)",
+            secs * 1e3 / n as f64,
+            n as f64 / secs
+        );
+    }
+    let mut out = Vec::new();
+    if !check || rt.kind() != BackendKind::OpenCl {
+        return out;
+    }
+    let saved: Vec<(&str, Option<String>)> = [
+        "TANG_CL_PREFILL_Q4",
+        "TANG_CL_PREFILL_F16",
+        "TANG_CL_MM_VEC",
+    ]
+    .into_iter()
+    .map(|k| (k, std::env::var(k).ok()))
+    .collect();
+    let variant = |q4: &str, f16: &str, vec: &str, seq: usize| -> Vec<f32> {
+        std::env::set_var("TANG_CL_PREFILL_Q4", q4);
+        std::env::set_var("TANG_CL_PREFILL_F16", f16);
+        std::env::set_var("TANG_CL_MM_VEC", vec);
+        let s = build(seq);
+        s.prefill(&rt, &ids[..seq], 0);
+        s.logits(&rt)
+    };
+    for &seq in &sorted {
+        let base = variant("0", "0", "1", seq);
+        let top = argmax(&base);
+        let max_logit = base.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        for (name, q4, f16, vec) in [
+            ("q4", "1", "0", "1"),
+            ("q4 uint4", "1", "0", "4"),
+            ("q4+fp16", "1", "1", "1"),
+        ] {
+            let l = variant(q4, f16, vec, seq);
+            let max_abs = l
+                .iter()
+                .zip(&base)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            let c = PrefillCheck {
+                variant: name,
+                seq,
+                max_abs,
+                max_logit,
+                top1_agree: argmax(&l) == top,
+            };
+            println!(
+                "check {name:8} {seq:4} tokens vs f32 maps: max |dlogit| {max_abs:.2e} (|logit| <= {max_logit:.1}), top-1 {}",
+                if c.top1_agree { "agrees" } else { "DIFFERS" }
+            );
+            out.push(c);
+        }
+    }
+    for (k, v) in saved {
+        match v {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        }
+    }
+    out
+}
+
+/// Best of `reps` runs of `prog`, each synced, in ms of wall time (the
+/// bench's timing: `Program::time` makes 28 runs, ~22 s for one 0.8 s
+/// prefill on the K1).
+fn run_ms(rt: &Runtime, prog: &Program, reps: usize) -> f64 {
+    (0..reps.max(1))
+        .map(|_| {
+            let t = Instant::now();
+            prog.run(rt);
+            rt.sync();
+            t.elapsed().as_secs_f64() * 1e3
+        })
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// Device time per kernel of one run of `step`, summed by kernel kind (its
+/// first source line), the `top` largest: the per-kernel table of
+/// [`prefill_bench`] (`QWEN_BENCH_PROFILE=1`).
+pub fn kernel_table(rt: &Runtime, step: &Step, top: usize) {
+    let p = &step.prog;
+    let mut groups: Vec<(String, f64, usize)> = Vec::new();
+    let mut total = 0.0;
+    for (i, k) in p.program.kernels.iter().enumerate() {
+        let ms = p.time_kernel(rt, i, 1);
+        total += ms;
+        let head: String = k
+            .source
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(110)
+            .collect();
+        let name = format!("{head} [{} items]", k.count);
+        match groups.iter_mut().find(|g| g.0 == name) {
+            Some(g) => {
+                g.1 += ms;
+                g.2 += 1;
+            }
+            None => groups.push((name, ms, 1)),
+        }
+    }
+    groups.sort_by(|a, b| b.1.total_cmp(&a.1));
+    println!(
+        "kernels: {} launches, {total:.1} ms summed (each alone)",
+        p.program.kernels.len()
+    );
+    for (name, ms, n) in groups.iter().take(top) {
+        println!("  {ms:8.2} ms {:5.1}%  x{n:<4} {name}", 100.0 * ms / total);
+    }
 }
 
 /// OpenTelemetry for [`Session`] and [`tune`] (feature `otel`).
@@ -1287,5 +1722,28 @@ mod tel {
             s.set_attribute(KeyValue::new("tang.tune.chosen", chosen.join(" ")));
             s.end();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pick_prefill;
+
+    #[test]
+    fn slower_than_baseline_never_wins() {
+        // the K1 case: reg at 568 ms vs the staged default at 374 ms
+        assert_eq!(pick_prefill(Some(374.0), &[(568.0, 9), (400.0, 2)]), None);
+        assert_eq!(pick_prefill(Some(374.0), &[(374.0, 3)]), None);
+        assert_eq!(
+            pick_prefill(Some(374.0), &[(568.0, 9), (350.0, 2), (360.0, 4)]),
+            Some((350.0, 2))
+        );
+    }
+
+    #[test]
+    fn empty_or_timed_out_sweep_keeps_default() {
+        assert_eq!(pick_prefill(Some(374.0), &[]), None);
+        assert_eq!(pick_prefill(None, &[(100.0, 1)]), None);
+        assert_eq!(pick_prefill(Some(f64::NAN), &[(100.0, 1)]), None);
     }
 }

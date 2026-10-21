@@ -2355,3 +2355,26 @@ at 57–77 °C. Times are device times from `--bench` / `--time-prefill`.
   register-blocked sgemm at 510. `opencl_mma_kernel` (register block, `vload4` along k, no local
   stage) is the replacement: on the Mac 0.6B goes 38.6 → 29.2 ms per 49 tokens. Its K1 number is
   pending, as is the per-device choice by `qwen_decode tune`.
+
+**Prefill over packed weights, fp16, tail chunks** (branch `mind/prefill-kmajor`; K1 numbers
+pending)
+- All five projections per layer already lower to `opencl_mma_kernel` (activations `[token][k]`,
+  weights `[row][k]`; 140/140 on 0.6B). The LM head stays the last token's GEMV.
+- `opencl_mma_kernel_q4` reads the 4-bit words and dequantizes them in registers, so the per-pass
+  f32 weight maps are gone. For 1.7B those maps were ~5.6 GB of traffic per prefill. This is the
+  default on OpenCL; `TANG_CL_PREFILL_Q4=0` brings the maps back. No weight copy is cached, and a
+  49-token step's own buffers drop from 111 to 27 MB (1.7B).
+- `TANG_CL_PREFILL_F16=1` uses half operands with 8-term half partials summed in f32
+  (`cl_khr_fp16`; the Mac emulates the roundings).
+- On OpenCL the Session chunk ladder is `64,32,16,8,4,2`, so a 20-token turn is 16 + 4 rather than
+  8 + 8 plus 4 decode steps.
+- Mac (M4 Max OpenCL), 1.7B, 49 tokens: 81 → 61–75 ms. A 20-token turn after 49 cached:
+  138 → 59 ms.
+- Accuracy against the f32 maps, last-token logits: q4 4–11e-3, fp16 1.6–3.3e-2 (|logit| ≤ 32),
+  top-1 agrees at 20/49/512.
+- Robot bench, run after `qwen_decode tune`: `scripts/k1-prefill-bench.sh
+  ~/models/qwen3-1.7b-4bit`. It covers maps/q4/fp16 × prefill 20/49/512, a 20-token turn,
+  decode 128, and the check.
+- Expected on the K1 (1.7B, estimates): 49 tokens 3451 ms → ~500–700 ms (maps, register block),
+  ~250–400 ms (q4), ~150–250 ms (fp16). A 20-token turn ~100–250 ms. 512 tokens ~2–5 s. Decode is
+  unchanged at ~55 ms/token.
