@@ -678,7 +678,7 @@ pub fn code_bands_tiled<B: Bits, M: CoefModel>(
     let [_, ny, nx] = p.dims;
     let nd = p.dims.iter().filter(|&&d| d > 1).count();
     let mut res = vec![0i32; q.len()];
-    let mut flag = vec![BitModel::new(1 << 15); NCLASS * 2];
+    let mut flag = [BitModel::new(1 << 15); NCLASS * 2];
     for bi in 0..p.bands.len() {
         let pbi = p.parent_band(bi);
         let band = p.bands[bi].clone();
