@@ -242,6 +242,18 @@ impl FlashModel for Coder {
     fn reset(&mut self) {
         Coder::reset(self)
     }
+    fn has_mtp(&self) -> bool {
+        Coder::has_mtp(self)
+    }
+    fn set_use_mtp(&mut self, on: bool) {
+        self.use_mtp = on && Coder::has_mtp(self);
+    }
+    fn mtp_last(&self) -> Vec<(u32, f32)> {
+        self.mtp_last.clone()
+    }
+    fn last_mtp_ms(&self) -> f64 {
+        self.last_mtp_ms
+    }
     fn prefill(
         &mut self,
         ids: &[u32],
@@ -305,6 +317,7 @@ fn load_coder(a: &Args) -> Result<Coder> {
         &a.path,
         CoderOpts {
             max_ctx: a.opts.max_ctx,
+            mtp: a.opts.mtp.clone(),
         },
     )?;
     e.use_graphs = !a.eager;
@@ -1238,8 +1251,8 @@ fn bench_coder(a: &Args, ids: &[u32]) -> Result<()> {
 }
 
 /// `flash-aa`: Artificial-Analysis-style decode speed for a qwen3next model with one load.
-/// For each `--ids-file` prompt (comma-separated list), `-n` output tokens, drafts off and
-/// suffix: output tok/s after the first token. Then, on the first prompt without drafts, each
+/// For each `--ids-file` prompt (comma-separated list), `-n` output tokens, drafts off, suffix
+/// and (with `--mtp FILE`) MTP: output tok/s after the first token. Then, on the first prompt without drafts, each
 /// kernel variant in `TANG_CODER_AB` (`;`-separated specs, see `Coder::set_variants`), and with
 /// `TANG_CODER_STAGES=1` the stage sweep. `--out DIR` saves each run's ids.
 pub fn aa(args: &[String]) -> Result<()> {
@@ -1288,8 +1301,13 @@ pub fn aa(args: &[String]) -> Result<()> {
             .map_or(f.clone(), |s| s.to_string_lossy().into_owned());
         prompts.push((name, read_ids(f)?));
     }
+    let drafts: &[&str] = if e.has_mtp() {
+        &["none", "suffix", "mtp"]
+    } else {
+        &["none", "suffix"]
+    };
     for (name, ids) in &prompts {
-        for draft in ["none", "suffix"] {
+        for &draft in drafts {
             row(&mut e, name, ids, draft)?;
         }
     }
