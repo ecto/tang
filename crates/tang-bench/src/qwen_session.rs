@@ -562,6 +562,8 @@ pub struct Session {
     reply_start: usize,
     /// The prefill program that ran last (`None`: the decode step).
     last: Option<(usize, usize)>,
+    /// Tokens the next pick may not be ([`ban_next`](Self::ban_next)).
+    ban: Vec<u32>,
     rng: u64,
 }
 
@@ -611,6 +613,7 @@ impl Session {
             cached: Vec::new(),
             next: (0, 0),
             last: None,
+            ban: Vec::new(),
             reply_start: 0,
             rng: 0x9e37_79b9_7f4a_7c15,
         })
@@ -630,6 +633,14 @@ impl Session {
     /// The single id of a special token such as `<|im_end|>`.
     pub fn token_id(&self, s: &str) -> Option<u32> {
         self.tokenizer.token_to_id(s)
+    }
+
+    /// Forbid `toks` for the next token picked (by [`prompt`](Self::prompt)
+    /// or [`step`](Self::step)) only, e.g. to block a reply from copying a
+    /// span of an earlier turn. Forces the logits readback for that pick.
+    pub fn ban_next(&mut self, toks: &[u32]) {
+        self.ban.clear();
+        self.ban.extend_from_slice(toks);
     }
 
     /// Forget the cache (the next prompt prefills from position 0).
@@ -738,12 +749,18 @@ impl Session {
         let (argmax_tok, pos) = self.dec.state(&self.rt);
         let plain =
             s.repetition_penalty == 1.0 && s.presence_penalty == 0.0 && s.frequency_penalty == 0.0;
-        let tok = if s.temperature <= 0.0 && plain {
+        let tok = if s.temperature <= 0.0 && plain && self.ban.is_empty() {
             argmax_tok as u32
         } else {
             let mut l = self.last_logits();
+            for &t in &self.ban {
+                if let Some(x) = l.get_mut(t as usize) {
+                    *x = f32::NEG_INFINITY;
+                }
+            }
             self.sample(&mut l, s)
         };
+        self.ban.clear();
         self.next = (tok, pos);
         tok
     }
