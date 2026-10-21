@@ -26,6 +26,10 @@
 //!                                       CPU f32 forward (f64 accumulation), the
 //!                                       checkpoint dequantized exactly
 //! qwen_decode compare <a> <b> <vocab>   two logits files, row by row
+//! qwen_decode bench <dir> [--sizes 20,49,512] [--gen 128] [--check]
+//!                                       prefill of each size (device ms, tok/s), then
+//!                                       decode; --check: the OpenCL prefill variants'
+//!                                       logits against the f32-map one
 //! qwen_decode tune <dir> [budget_s=300]  measure the decode GEMV shape and the
 //!                                       OpenCL prefill block on this device, write
 //!                                       the winners to ~/.config/tang/tune.json
@@ -48,6 +52,22 @@ fn main() {
         Some("model") => model(&args[1..]),
         Some("reference") => reference(&args[1..]),
         Some("compare") => compare(&args[1..]),
+        // the K1 prefill/decode bench: see prefill_bench
+        Some("bench") => {
+            let dir = &args[1];
+            let opt = |k: &str| {
+                args.iter()
+                    .position(|a| a == k)
+                    .map(|i| args[i + 1].clone())
+            };
+            let sizes: Vec<usize> = opt("--sizes")
+                .unwrap_or_else(|| "20,49,512".into())
+                .split(',')
+                .map(|v| v.parse().unwrap())
+                .collect();
+            let gen = opt("--gen").map_or(128, |v| v.parse().unwrap());
+            prefill_bench(dir, &sizes, gen, args.iter().any(|a| a == "--check"));
+        }
         Some("tune") => {
             let budget = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(300.0);
             tune(&args[1], budget);

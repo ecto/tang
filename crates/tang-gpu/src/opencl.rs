@@ -356,8 +356,16 @@ impl ClDevice {
     /// kernel's marker (other sources unchanged).
     pub fn prepare(&self, source: &str) -> String {
         use tang_compile::tensor::opencl_gemv::{
-            OPENCL_SHFL_KHR, OPENCL_SHFL_LOCAL, OPENCL_SHFL_QCOM, SHFL_MARKER,
+            FP16_MARKER, OPENCL_SHFL_KHR, OPENCL_SHFL_LOCAL, OPENCL_SHFL_QCOM, SHFL_MARKER,
         };
+        if source.contains(FP16_MARKER) {
+            let def = if self.extensions.contains("cl_khr_fp16") {
+                "#define TANG_FP16 1\n"
+            } else {
+                "\n"
+            };
+            return source.replacen(FP16_MARKER, def, 1);
+        }
         if !source.contains(SHFL_MARKER) {
             return source.to_string();
         }

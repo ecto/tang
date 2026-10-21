@@ -1087,3 +1087,169 @@ pub fn tune(dir: &str, budget: f64) -> Vec<(String, String)> {
     );
     won
 }
+
+/// Prompt text of [`prefill_bench`]: fixed, so runs on different devices
+/// see the same token ids.
+const BENCH_TEXT: &str = "The robot rolled into the kitchen, paused by the window, \
+and asked whether anyone wanted tea. Nobody answered, so it checked the kettle, \
+counted the cups on the shelf, and wrote a short note about the weather: cloudy \
+in the morning, clear by noon, a light wind from the west. ";
+
+/// One prefill variant against the f32-map baseline ([`prefill_bench`]).
+#[derive(Clone, Debug)]
+pub struct PrefillCheck {
+    pub variant: &'static str,
+    pub seq: usize,
+    /// Largest |logit − baseline logit| over the vocabulary (last token).
+    pub max_abs: f32,
+    pub max_logit: f32,
+    pub top1_agree: bool,
+}
+
+/// Prefill and decode timings for the model in `dir` on the default
+/// runtime ([`runtime`]: `TANG_BACKEND`), tuned knobs applied: for each of
+/// `sizes`, one prefill program of exactly that many tokens of a fixed
+/// prompt from position 0 (device time, best of 5 runs); then `gen` greedy
+/// decode steps after the largest, end to end (run + state readback).
+/// With `check` (OpenCL), each size's last-token logits also run through
+/// the f32-map prefill (`TANG_CL_PREFILL_Q4=0`, the baseline), the
+/// packed-weight one and the packed-weight fp16 one
+/// (`TANG_CL_PREFILL_F16=1`), returned as max |Δlogit| and top-1 agreement
+/// against the baseline. Prints as it goes.
+pub fn prefill_bench(dir: &str, sizes: &[usize], gen: usize, check: bool) -> Vec<PrefillCheck> {
+    let tokenizer =
+        tokenizers::Tokenizer::from_file(format!("{dir}/tokenizer.json")).expect("tokenizer.json");
+    let max = sizes.iter().copied().max().unwrap_or(1);
+    let mut ids: Vec<usize> = Vec::new();
+    while ids.len() < max {
+        let e = tokenizer.encode(BENCH_TEXT.repeat(8), false).expect("encode");
+        ids.extend(e.get_ids().iter().map(|&t| t as usize));
+    }
+    ids.truncate(max);
+    let ctx = (max + gen + 1).next_power_of_two().max(1024);
+    let mut dims = dims_for(dir, ctx);
+    dims.kv_f16 = std::env::var("TANG_KV_F32").is_err();
+    let rt = runtime();
+    for (k, v) in apply_tuning(&rt, &dims) {
+        eprintln!("tang: tuned {k}={v}");
+    }
+    if rt.kind() == BackendKind::OpenCl {
+        dims.vocab_chunks = (dims.vocab * dims.d_model / 2).div_ceil(255 << 20).max(1);
+    }
+    println!(
+        "bench: {} | d{} ff{} l{} | prefill_q4 {} fp16 {}",
+        rt.name(),
+        dims.d_model,
+        dims.ff,
+        dims.layers,
+        prefill_q4(&rt),
+        tang_compile::tensor::opencl_gemv::prefill_f16()
+    );
+    let st = St::open(&format!("{dir}/model.safetensors"));
+    let dec = Step::new(
+        &rt,
+        &dims,
+        1,
+        ctx,
+        &|dg| vec![Vec::new(); dg.inputs.len()],
+        None,
+    );
+    for (k, v) in load_inputs(&st, &dims, &dec.dg).enumerate() {
+        if !v.is_empty() {
+            dec.prog.write(&rt, dec.prog.input(k), &v);
+        }
+    }
+    let build = |seq: usize| {
+        Step::new(
+            &rt,
+            &dims,
+            seq,
+            window(seq, ctx),
+            &|dg| vec![Vec::new(); dg.inputs.len()],
+            Some(&dec),
+        )
+    };
+    let mut sorted = sizes.to_vec();
+    sorted.sort_unstable();
+    for &seq in &sorted {
+        let s = build(seq);
+        s.prefill(&rt, &ids[..seq], 0);
+        let _ = s.state(&rt);
+        let ms = s.prog.time(&rt, 5);
+        println!(
+            "prefill {seq:4} tokens: {ms:8.1} ms device ({:6.0} tok/s), {:.0} MB own buffers",
+            seq as f64 * 1e3 / ms,
+            s.bytes as f64 / 1e6
+        );
+    }
+    // decode after a prefill of the largest size
+    if gen > 0 {
+        let s = build(max);
+        s.prefill(&rt, &ids[..max], 0);
+        let _ = s.state(&rt);
+        drop(s);
+        let t = Instant::now();
+        let mut n = 0;
+        for _ in 0..gen {
+            dec.prog.run(&rt);
+            let (_, p) = dec.state(&rt);
+            n += 1;
+            if p + 1 >= ctx {
+                break;
+            }
+        }
+        let secs = t.elapsed().as_secs_f64();
+        println!(
+            "decode {n} tokens after {max}: {:.1} ms/token ({:.1} tok/s end to end)",
+            secs * 1e3 / n as f64,
+            n as f64 / secs
+        );
+    }
+    let mut out = Vec::new();
+    if !check || rt.kind() != BackendKind::OpenCl {
+        return out;
+    }
+    let saved: Vec<(&str, Option<String>)> = ["TANG_CL_PREFILL_Q4", "TANG_CL_PREFILL_F16"]
+        .into_iter()
+        .map(|k| (k, std::env::var(k).ok()))
+        .collect();
+    let variant = |q4: &str, f16: &str, seq: usize| -> Vec<f32> {
+        std::env::set_var("TANG_CL_PREFILL_Q4", q4);
+        std::env::set_var("TANG_CL_PREFILL_F16", f16);
+        let s = build(seq);
+        s.prefill(&rt, &ids[..seq], 0);
+        s.logits(&rt)
+    };
+    for &seq in &sorted {
+        let base = variant("0", "0", seq);
+        let top = argmax(&base);
+        let max_logit = base.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        for (name, q4, f16) in [("q4", "1", "0"), ("q4+fp16", "1", "1")] {
+            let l = variant(q4, f16, seq);
+            let max_abs = l
+                .iter()
+                .zip(&base)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            let c = PrefillCheck {
+                variant: name,
+                seq,
+                max_abs,
+                max_logit,
+                top1_agree: argmax(&l) == top,
+            };
+            println!(
+                "check {name:8} {seq:4} tokens vs f32 maps: max |dlogit| {max_abs:.2e} (|logit| <= {max_logit:.1}), top-1 {}",
+                if c.top1_agree { "agrees" } else { "DIFFERS" }
+            );
+            out.push(c);
+        }
+    }
+    for (k, v) in saved {
+        match v {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        }
+    }
+    out
+}

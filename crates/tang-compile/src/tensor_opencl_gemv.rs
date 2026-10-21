@@ -349,6 +349,42 @@ pub fn mm_shape() -> (usize, usize, usize) {
         .unwrap_or((4, 4, 64))
 }
 
+/// fp16 arithmetic in the packed-weight prefill kernel
+/// ([`TensorGraph::opencl_mma_kernel_q4`]): `TANG_CL_PREFILL_F16=1`.
+/// Activations and dequantized weights are rounded to half and each
+/// 8-term partial dot product is taken in half (`cl_khr_fp16`); the
+/// partials accumulate in f32. Without `cl_khr_fp16` (hosts) the kernel
+/// rounds the operands and partials to half and computes in f32 — the
+/// same roundings, for accuracy checks.
+pub fn prefill_f16() -> bool {
+    std::env::var("TANG_CL_PREFILL_F16").is_ok_and(|v| v == "1")
+}
+
+/// The line of a kernel the runtime precedes with `#define TANG_FP16 1`
+/// when the device lists `cl_khr_fp16` (Apple's compiler defines the
+/// `cl_khr_fp16` macro without supporting half arithmetic).
+pub const FP16_MARKER: &str = "// TANG_FP16?\n";
+
+/// fp16 helpers of the packed-weight prefill kernel (see [`prefill_f16`]),
+/// after [`FP16_MARKER`].
+const OPENCL_F16: &str = r#"#ifdef TANG_FP16
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+typedef half4 tang_h4;
+#define TANG_H4(v) convert_half4(v)
+#define TANG_HDOT(a, b, c, d) ((float)(dot((a), (b)) + dot((c), (d))))
+#else
+typedef float4 tang_h4;
+inline float tang_r1(float v) {
+    return tang_h2f(tang_f2h(v));
+}
+inline float4 tang_r4(float4 v) {
+    return (float4)(tang_r1(v.x), tang_r1(v.y), tang_r1(v.z), tang_r1(v.w));
+}
+#define TANG_H4(v) tang_r4(v)
+#define TANG_HDOT(a, b, c, d) tang_r1(tang_r1(dot((a), (b))) + tang_r1(dot((c), (d))))
+#endif
+"#;
+
 /// First line of a kernel that is OpenCL C already (no transliteration).
 pub const OPENCL_NATIVE: &str = "// tang-compile: OpenCL C (native)";
 
@@ -585,6 +621,7 @@ impl TensorGraph {
         if nibbles == 0 {
             return None;
         }
+        let f16 = prefill_f16();
         let (rm, rn, wg) = mm_shape();
         let mb = m.div_ceil(rm);
         let nb = n.div_ceil(rn);
@@ -592,11 +629,16 @@ impl TensorGraph {
         let mut s = String::new();
         writeln!(
             s,
-            "{OPENCL_NATIVE}: {m}x{n}x{} matmul over 4-bit weights, {rm}x{rn} registers, groups of {wg}",
-            gs * js
+            "{OPENCL_NATIVE}: {m}x{n}x{} matmul over 4-bit weights, {rm}x{rn} registers, groups of {wg}{}",
+            gs * js,
+            if f16 { ", fp16" } else { "" }
         )
         .unwrap();
         s.push_str(OPENCL_PRELUDE);
+        if f16 {
+            s.push_str(FP16_MARKER);
+            s.push_str(OPENCL_F16);
+        }
         let params: Vec<String> = reads
             .iter()
             .map(|j| format!("__global const float* restrict b{j}"))
@@ -656,11 +698,19 @@ impl TensorGraph {
         writeln!(s, "        for (int kj = 0; kj < {js}; kj += 8) {{").unwrap();
         writeln!(s, "            int kx = {} * kg + kj;", ax.coefs[2]).unwrap();
         for i in 0..rm {
-            writeln!(
-                s,
-                "            float4 xl{i} = vload4(0, a{i} + kx), xh{i} = vload4(1, a{i} + kx);"
-            )
-            .unwrap();
+            if f16 {
+                writeln!(
+                    s,
+                    "            tang_h4 xl{i} = TANG_H4(vload4(0, a{i} + kx)), xh{i} = TANG_H4(vload4(1, a{i} + kx));"
+                )
+                .unwrap();
+            } else {
+                writeln!(
+                    s,
+                    "            float4 xl{i} = vload4(0, a{i} + kx), xh{i} = vload4(1, a{i} + kx);"
+                )
+                .unwrap();
+            }
         }
         for j in 0..rn {
             for (v, role) in roles.iter().enumerate() {
@@ -691,20 +741,31 @@ impl TensorGraph {
                 }
                 ws.push(outs[0].clone());
             }
+            let ty = if f16 { "tang_h4" } else { "float4" };
+            let wrap = |v: String| if f16 { format!("TANG_H4({v})") } else { v };
             writeln!(
                 s,
-                "            float4 wl{j} = (float4)({}, {}, {}, {}), wh{j} = (float4)({}, {}, {}, {});",
-                ws[0], ws[1], ws[2], ws[3], ws[4], ws[5], ws[6], ws[7]
+                "            {ty} wl{j} = {}, wh{j} = {};",
+                wrap(format!("(float4)({}, {}, {}, {})", ws[0], ws[1], ws[2], ws[3])),
+                wrap(format!("(float4)({}, {}, {}, {})", ws[4], ws[5], ws[6], ws[7]))
             )
             .unwrap();
         }
         for i in 0..rm {
             for j in 0..rn {
-                writeln!(
-                    s,
-                    "            acc{i}_{j} += dot(xl{i}, wl{j}) + dot(xh{i}, wh{j});"
-                )
-                .unwrap();
+                if f16 {
+                    writeln!(
+                        s,
+                        "            acc{i}_{j} += TANG_HDOT(xl{i}, wl{j}, xh{i}, wh{j});"
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(
+                        s,
+                        "            acc{i}_{j} += dot(xl{i}, wl{j}) + dot(xh{i}, wh{j});"
+                    )
+                    .unwrap();
+                }
             }
         }
         writeln!(s, "        }}").unwrap();
