@@ -493,10 +493,7 @@ impl TensorGraph {
         if pts.len() != 2 || c.points().len() != 2 {
             return None;
         }
-        if epilogue
-            && self.epilogue_read(c, red_node)?
-                != super::View::identity(2, 2).forms
-        {
+        if epilogue && self.epilogue_read(c, red_node)? != super::View::identity(2, 2).forms {
             return None;
         }
         let (gs, js) = (rc.red[0].n(), rc.red[1].n());
@@ -533,40 +530,43 @@ impl TensorGraph {
             (self.nodes[p].inline && !a.view.guard && mc.monoid.is_none() && mc.red.is_empty())
                 .then_some((v, mc))
         });
-        let (ebody, eout, eargs): (&tang_expr::ExprGraph, tang_expr::ExprId, Vec<Option<super::Arg>>) =
-            match map {
-                Some((v, mc)) if mc.body_outs.len() == 1 => {
-                    let outer = &rc.args[v];
-                    let args = mc
-                        .args
-                        .iter()
-                        .map(|s| {
-                            Some(super::Arg {
-                                src: s.src,
-                                view: s.view.compose(&outer.view, rank),
-                            })
+        let (ebody, eout, eargs): (
+            &tang_expr::ExprGraph,
+            tang_expr::ExprId,
+            Vec<Option<super::Arg>>,
+        ) = match map {
+            Some((v, mc)) if mc.body_outs.len() == 1 => {
+                let outer = &rc.args[v];
+                let args = mc
+                    .args
+                    .iter()
+                    .map(|s| {
+                        Some(super::Arg {
+                            src: s.src,
+                            view: s.view.compose(&outer.view, rank),
                         })
-                        .collect();
-                    (&mc.body, mc.body_outs[0], args)
+                    })
+                    .collect();
+                (&mc.body, mc.body_outs[0], args)
+            }
+            Some(_) => return None,
+            None => {
+                let live = rc.body.live_set(&[e]);
+                if live
+                    .iter()
+                    .any(|&i| matches!(nodes[i], Node::Var(v) if v as usize == vx))
+                {
+                    return None;
                 }
-                Some(_) => return None,
-                None => {
-                    let live = rc.body.live_set(&[e]);
-                    if live
-                        .iter()
-                        .any(|&i| matches!(nodes[i], Node::Var(v) if v as usize == vx))
-                    {
-                        return None;
-                    }
-                    let args = rc
-                        .args
-                        .iter()
-                        .enumerate()
-                        .map(|(v, a)| (v != vx).then(|| a.clone()))
-                        .collect();
-                    (&rc.body, e, args)
-                }
-            };
+                let args = rc
+                    .args
+                    .iter()
+                    .enumerate()
+                    .map(|(v, a)| (v != vx).then(|| a.clone()))
+                    .collect();
+                (&rc.body, e, args)
+            }
+        };
         let ax = self.flat_addr(&rc.args[vx], rank);
         if ax.coefs[3] != 1 || ax.coefs[1] != 0 && ax.coefs[0] != 0 {
             return None;
@@ -579,8 +579,15 @@ impl TensorGraph {
         }
         // E's args: the nibbles (U4, along j) and per-group values
         enum Role {
-            Nibble { buf: usize, addr: super::msl_mma::Addr },
-            Group { buf: usize, addr: super::msl_mma::Addr, pack: Packing },
+            Nibble {
+                buf: usize,
+                addr: super::msl_mma::Addr,
+            },
+            Group {
+                buf: usize,
+                addr: super::msl_mma::Addr,
+                pack: Packing,
+            },
         }
         let mut roles: Vec<Option<Role>> = Vec::new();
         let mut nibbles = 0;
@@ -746,8 +753,14 @@ impl TensorGraph {
             writeln!(
                 s,
                 "            {ty} wl{j} = {}, wh{j} = {};",
-                wrap(format!("(float4)({}, {}, {}, {})", ws[0], ws[1], ws[2], ws[3])),
-                wrap(format!("(float4)({}, {}, {}, {})", ws[4], ws[5], ws[6], ws[7]))
+                wrap(format!(
+                    "(float4)({}, {}, {}, {})",
+                    ws[0], ws[1], ws[2], ws[3]
+                )),
+                wrap(format!(
+                    "(float4)({}, {}, {}, {})",
+                    ws[4], ws[5], ws[6], ws[7]
+                ))
             )
             .unwrap();
         }
@@ -770,7 +783,16 @@ impl TensorGraph {
         }
         writeln!(s, "        }}").unwrap();
         writeln!(s, "    }}").unwrap();
-        self.mm_stores(&mut s, c, red_node, epilogue, &pts, (dy, dx), (m, n), (rm, rn));
+        self.mm_stores(
+            &mut s,
+            c,
+            red_node,
+            epilogue,
+            &pts,
+            (dy, dx),
+            (m, n),
+            (rm, rn),
+        );
         writeln!(s, "}}").unwrap();
         Some(super::cuda_gemv::Kernel {
             source: s,
@@ -907,7 +929,16 @@ impl TensorGraph {
         }
         writeln!(s, "    }}").unwrap();
         // epilogue and stores
-        self.mm_stores(&mut s, c, t.red_node, t.epilogue, pts, (dy, dx), (m, n), (rm, rn));
+        self.mm_stores(
+            &mut s,
+            c,
+            t.red_node,
+            t.epilogue,
+            pts,
+            (dy, dx),
+            (m, n),
+            (rm, rn),
+        );
         writeln!(s, "}}").unwrap();
         Some(super::cuda_gemv::Kernel {
             source: s,

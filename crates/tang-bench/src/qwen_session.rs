@@ -1133,7 +1133,9 @@ pub fn prefill_bench(dir: &str, sizes: &[usize], gen: usize, check: bool) -> Vec
     let max = sizes.iter().copied().max().unwrap_or(1);
     let mut ids: Vec<usize> = Vec::new();
     while ids.len() < max {
-        let e = tokenizer.encode(BENCH_TEXT.repeat(8), false).expect("encode");
+        let e = tokenizer
+            .encode(BENCH_TEXT.repeat(8), false)
+            .expect("encode");
         ids.extend(e.get_ids().iter().map(|&t| t as usize));
     }
     ids.truncate(max);

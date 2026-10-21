@@ -1025,7 +1025,8 @@ pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<
             .collect();
         let mm: Vec<usize> = (0..n)
             .filter(|&i| {
-                g.comp_at(i).is_some_and(|c| c.monoid.is_some() && c.red.len() == 2)
+                g.comp_at(i)
+                    .is_some_and(|c| c.monoid.is_some() && c.red.len() == 2)
                     && (reads_any(i, &dq) || reads_any(i, &u4n))
             })
             .collect();
