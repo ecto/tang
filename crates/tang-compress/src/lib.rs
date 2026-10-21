@@ -20,6 +20,20 @@
 //! assert_eq!(stats.bytes, bytes.len());
 //! ```
 //!
+//! Other codecs — wavelet ([`wavcodec`]), Tucker ([`tucker`]),
+//! interpolation ([`interp`]) and the brick-parallel GPU layouts
+//! ([`gpuwav`], [`gpuwav3`]) — share the [`ErrorBound`] vocabulary, and
+//! [`decode_any`] decodes any of them by magic.
+//!
+//! # Features and targets
+//!
+//! - Default features are empty: CPU encode and decode only.
+//! - `gpu` adds `gpudec::GpuDecoder`, a wgpu decoder for tc-gpu / TCG3
+//!   streams whose output is bit-identical to the CPU decoder.
+//! - The crate builds for `wasm32-unknown-unknown`; the wasm-bindgen browser
+//!   front end is the (unpublished) `tang-compress-wasm` crate in the tang
+//!   repository.
+//!
 //! # Numerical notes
 //!
 //! Truncated SVDs use the Gram matrix of the smaller unfolding side with
@@ -51,6 +65,7 @@ pub mod kvgpu;
 pub mod learned;
 pub mod linalg;
 pub mod lmodel3;
+pub mod lorenzo;
 pub mod rans;
 pub mod shipdec;
 pub mod tensorize;
@@ -63,11 +78,11 @@ pub use codec::{decode, encode_f32, encode_f64, Config, Decoded, Dtype, EncodeSt
 pub use tensorize::{DigitOrder, Layout, PadPolicy};
 pub use tt::{tt_svd, TensorTrain, Truncation};
 
-/// Decode any tang-compress stream (QTT, wavelet, Tucker or interpolation),
+/// Decode any tang-compress stream (QTT, wavelet, Tucker, interpolation or Lorenzo),
 /// by magic; a leading portfolio tag byte is skipped.
 pub fn decode_any(bytes: &[u8]) -> Result<Decoded, bitio::DecodeError> {
     if let Some(&t) = bytes.first() {
-        if (TAG_WAVELET..=TAG_INTERP).contains(&t) {
+        if (TAG_WAVELET..=TAG_LORENZO).contains(&t) {
             return decode_any(&bytes[1..]);
         }
     }
@@ -75,6 +90,7 @@ pub fn decode_any(bytes: &[u8]) -> Result<Decoded, bitio::DecodeError> {
         Some(m) if m == wavcodec::MAGIC => wavcodec::decode(bytes),
         Some(m) if m == tucker::MAGIC => tucker::decode(bytes),
         Some(m) if m == interp::MAGIC => interp::decode(bytes),
+        Some(m) if m == lorenzo::MAGIC => lorenzo::decode(bytes),
         _ => codec::decode(bytes),
     }
 }
@@ -87,6 +103,8 @@ pub const TAG_TUCKER: u8 = 0xA1;
 pub const TAG_QTT: u8 = 0xA2;
 /// Portfolio tag: interpolation stream follows.
 pub const TAG_INTERP: u8 = 0xA3;
+/// Portfolio tag: Lorenzo stream follows.
+pub const TAG_LORENZO: u8 = 0xA4;
 
 /// A portfolio candidate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,6 +119,8 @@ pub enum Candidate {
     Interp,
     /// The QTT codec's residual-only stream (max-abs; QTT tag and format).
     QttSparse,
+    /// [`lorenzo`].
+    Lorenzo,
 }
 
 impl Candidate {
@@ -112,6 +132,7 @@ impl Candidate {
             Candidate::Qtt => TAG_QTT,
             Candidate::Interp => TAG_INTERP,
             Candidate::QttSparse => TAG_QTT,
+            Candidate::Lorenzo => TAG_LORENZO,
         }
     }
     /// Short name.
@@ -122,6 +143,7 @@ impl Candidate {
             Candidate::Qtt => "qtt",
             Candidate::Interp => "interp",
             Candidate::QttSparse => "qtt-sparse",
+            Candidate::Lorenzo => "lorenzo",
         }
     }
 }
@@ -204,10 +226,13 @@ pub const QTT_PROBE_CAP: usize = 64;
 
 /// Which candidates the pre-screen keeps for a bound, before any full encode.
 ///
-/// - wavelet: always;
+/// - wavelet: always (coded with `compact`: the configured model, the hand
+///   model or the tiled hand model, whichever is smallest);
 /// - Tucker: PSNR/RMSE targets on ≥2D data;
 /// - interpolation: always (max-abs directly; RMSE/PSNR through its
 ///   rate-controlled bound, about half a wavelet encode);
+/// - Lorenzo: always (one encode per prediction mode at max-abs, then rate
+///   control of one mode at RMSE/PSNR; cheaper than interpolation);
 /// - QTT residual-only: max-abs targets (a few % of a wavelet encode);
 /// - full QTT: only when [`qtt_probe`] (stride 2, ranks capped at
 ///   [`QTT_PROBE_CAP`]) keeps every rank below the cap — the field is
@@ -230,6 +255,7 @@ pub fn prescreen(
         keep.push(Candidate::Tucker);
     }
     keep.push(Candidate::Interp);
+    keep.push(Candidate::Lorenzo);
     if maxabs {
         keep.push(Candidate::QttSparse);
     }
@@ -249,7 +275,13 @@ pub fn encode_candidate_f32(
     cfg: &wavcodec::WavConfig,
 ) -> Vec<u8> {
     match c {
-        Candidate::Wavelet => wavcodec::encode_f32(x, dims, cfg).0,
+        Candidate::Wavelet => {
+            let cfg = wavcodec::WavConfig {
+                compact: true,
+                ..cfg.clone()
+            };
+            wavcodec::encode_f32(x, dims, &cfg).0
+        }
         Candidate::Tucker => tucker::encode_f32(x, dims, cfg.bound).0,
         Candidate::Qtt => {
             let mut q = codec::Config::new(cfg.bound);
@@ -267,6 +299,11 @@ pub fn encode_candidate_f32(
             q.residual_only = true;
             codec::encode_f32(x, dims, &q).0
         }
+        Candidate::Lorenzo => match cfg.bound {
+            codec::ErrorBound::MaxAbs(b) => lorenzo::encode_f32(x, dims, b),
+            codec::ErrorBound::Rmse(r) => lorenzo::encode_rmse_f32(x, dims, r),
+            codec::ErrorBound::Psnr(p) => lorenzo::encode_psnr_f32(x, dims, p),
+        },
     }
 }
 
@@ -287,7 +324,15 @@ pub fn encode_portfolio_f32(
     let mut tried = vec![];
     for c in keep {
         let t = std::time::Instant::now();
-        let s = encode_candidate_f32(c, x, dims, cfg);
+        // a candidate that fails on this input (e.g. a numerically singular
+        // Tucker factor) is skipped rather than aborting the encode; wavelet
+        // runs first and always codes
+        let Ok(s) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            encode_candidate_f32(c, x, dims, cfg)
+        })) else {
+            skip.push(c);
+            continue;
+        };
         tried.push((c, s.len(), t.elapsed().as_secs_f64()));
         if best.as_ref().is_none_or(|(_, b)| s.len() < b.len()) {
             best = Some((c, s));
@@ -342,7 +387,7 @@ pub fn center_crop(x: &[f32], dims: &[usize]) -> (Vec<f32>, Vec<usize>) {
 }
 
 /// Fast mode's single candidate: each fast variant that applies (max-abs:
-/// wavelet, interpolation, QTT residual-only; PSNR/RMSE: wavelet, plus
+/// wavelet, interpolation, Lorenzo, QTT residual-only; PSNR/RMSE: wavelet, plus
 /// Tucker on 3D) is trial-encoded on [`center_crop`] (an eighth of the
 /// field) at the same absolute bound, and the smallest stream names the pick.
 pub fn fast_pick(x: &[f32], dims: &[usize], cfg: &wavcodec::WavConfig) -> Candidate {
@@ -360,7 +405,12 @@ pub fn fast_pick(x: &[f32], dims: &[usize], cfg: &wavcodec::WavConfig) -> Candid
     let three = dims.iter().filter(|&&d| d > 1).count() == 3;
     let cands: Vec<Candidate> = match bound {
         codec::ErrorBound::MaxAbs(_) => {
-            vec![Candidate::Wavelet, Candidate::Interp, Candidate::QttSparse]
+            vec![
+                Candidate::Wavelet,
+                Candidate::Interp,
+                Candidate::Lorenzo,
+                Candidate::QttSparse,
+            ]
         }
         _ if three => vec![Candidate::Wavelet, Candidate::Tucker],
         _ => return Candidate::Wavelet,
@@ -372,8 +422,17 @@ pub fn fast_pick(x: &[f32], dims: &[usize], cfg: &wavcodec::WavConfig) -> Candid
     };
     cands
         .into_iter()
-        .min_by_key(|&k| encode_candidate_fast_f32(k, &y, &nd, &c).len())
+        .min_by_key(|&k| try_fast(k, &y, &nd, &c).map_or(usize::MAX, |s| s.len()))
         .unwrap()
+}
+
+/// [`encode_candidate_fast_f32`], or `None` when the candidate fails on this
+/// input (e.g. a numerically singular Tucker factor).
+fn try_fast(c: Candidate, x: &[f32], dims: &[usize], cfg: &wavcodec::WavConfig) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        encode_candidate_fast_f32(c, x, dims, cfg)
+    }))
+    .ok()
 }
 
 /// Encode with one candidate's fast variant (no tag byte): step from a
@@ -389,6 +448,7 @@ pub fn encode_candidate_fast_f32(
         Candidate::Wavelet => {
             let cfg = wavcodec::WavConfig {
                 fast: true,
+                compact: true,
                 ..cfg.clone()
             };
             wavcodec::encode_f32(x, dims, &cfg).0
@@ -397,6 +457,10 @@ pub fn encode_candidate_fast_f32(
         Candidate::Interp => match cfg.bound {
             codec::ErrorBound::MaxAbs(b) => interp::encode_fast_f32(x, dims, b),
             _ => panic!("interp codes max-abs bounds only"),
+        },
+        Candidate::Lorenzo => match cfg.bound {
+            codec::ErrorBound::MaxAbs(b) => lorenzo::encode_f32(x, dims, b),
+            _ => panic!("fast Lorenzo codes max-abs bounds only"),
         },
         Candidate::Qtt | Candidate::QttSparse => encode_candidate_f32(c, x, dims, cfg),
     }
@@ -414,9 +478,17 @@ pub fn encode_fast_f32(
         Some("wavelet") => Candidate::Wavelet,
         Some("tucker") => Candidate::Tucker,
         Some("interp") => Candidate::Interp,
+        Some("lorenzo") => Candidate::Lorenzo,
         _ => fast_pick(x, dims, cfg),
     };
-    let body = encode_candidate_fast_f32(pick, x, dims, cfg);
+    // the wavelet always codes, so it backs up a pick that fails at full size
+    let (pick, body) = match try_fast(pick, x, dims, cfg) {
+        Some(b) => (pick, b),
+        None => (
+            Candidate::Wavelet,
+            encode_candidate_fast_f32(Candidate::Wavelet, x, dims, cfg),
+        ),
+    };
     let mut out = Vec::with_capacity(body.len() + 1);
     out.push(pick.tag());
     out.extend(body);

@@ -26,17 +26,20 @@
 //!                                       CPU f32 forward (f64 accumulation), the
 //!                                       checkpoint dequantized exactly
 //! qwen_decode compare <a> <b> <vocab>   two logits files, row by row
+//! qwen_decode tune <dir> [budget_s=300]  measure the decode GEMV shape and the
+//!                                       OpenCL prefill block on this device, write
+//!                                       the winners to ~/.config/tang/tune.json
+//!                                       (`$TANG_TUNE`), read by `model` and Session
 //! ```
 //!
 //! `<ids>` is a file of whitespace-separated token ids (`qwen_tok`).
-use std::collections::HashMap;
 use std::time::Instant;
 
 use tang_bench::ir_qwen::*;
-use tang_compile::tensor::cuda_gemv::{DecodeProgram, Packing};
-use tang_compile::tensor::wgsl::WgslProgram;
+use tang_bench::qwen_session::*;
+use tang_compile::tensor::cuda_gemv::Packing;
 use tang_compile::tensor::{TensorGraph, TensorId};
-use tang_gpu::program::{BackendKind, BufferPlan, Program, Runtime, Shared};
+use tang_gpu::program::{BackendKind, Runtime};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -45,237 +48,12 @@ fn main() {
         Some("model") => model(&args[1..]),
         Some("reference") => reference(&args[1..]),
         Some("compare") => compare(&args[1..]),
+        Some("tune") => {
+            let budget = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(300.0);
+            tune(&args[1], budget);
+        }
         _ => eprintln!("usage: qwen_decode tiny | model | reference | compare (see the docs)"),
     }
-}
-
-/// CUDA when built with it and a device is present, else wgpu (Metal:
-/// the MSL decode kernels).
-fn runtime() -> Runtime {
-    #[cfg(feature = "cuda")]
-    if let Some(rt) = Runtime::cuda_capturable() {
-        return rt;
-    }
-    Runtime::wgpu().expect("no GPU")
-}
-
-fn lower(
-    rt: &Runtime,
-    g: &TensorGraph,
-    outs: &[TensorId],
-    opts: &tang_compile::tensor::cuda_gemv::DecodeOpts,
-) -> DecodeProgram {
-    match rt {
-        // Vulkan (the K1's Adreno, ...): the decode kernels as GLSL,
-        // compiled to SPIR-V by tang-gpu (feature `glsl`)
-        Runtime::Wgpu { device, .. } if !device.msl_passthrough && device.spirv_passthrough => {
-            g.to_glsl_decode(outs, opts)
-        }
-        _ => match rt.kind() {
-            BackendKind::Cuda => g.to_cuda_decode(outs, opts),
-            BackendKind::Wgpu => g.to_msl_decode(outs, opts),
-        },
-    }
-}
-
-fn env(k: &str) -> usize {
-    std::env::var(k)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0)
-}
-
-/// The program's buffers on slots (`ir_qwen::plan_slots`): in-place
-/// outputs share their donor's, intermediates are reused by liveness.
-fn slot_plan(
-    program: &WgslProgram,
-    outputs: &[TensorId],
-    inplace: &[(TensorId, usize)],
-) -> BufferPlan {
-    let (slot, slot_len) = plan_slots(program, outputs, inplace);
-    BufferPlan {
-        slot,
-        slot_len,
-        order: (0..program.kernels.len()).collect(),
-    }
-}
-
-/// One step program: decode (`seq == 1`) or a prefill of `seq` tokens.
-struct Step {
-    dg: DecodeGraph,
-    prog: Program,
-    /// `dg.outputs` in the compiled graph, then `dg.keep`; with
-    /// `QWEN_KEEP_ALL`, every kernel's result after those (from `named`).
-    outs: Vec<TensorId>,
-    /// How many of `outs` are the step's own outputs.
-    named: usize,
-    /// The compiled graph `outs` index (for checking kernels one by one).
-    g: TensorGraph,
-    native: Vec<bool>,
-    /// Bytes this program allocated (shared buffers count for their owner).
-    bytes: usize,
-}
-
-impl Step {
-    /// Lower and allocate the step; inputs from `inputs` (device words,
-    /// per graph input), or — every input named like one of `base`'s
-    /// — bound to `base`'s buffers.
-    fn new(
-        rt: &Runtime,
-        dims: &QwenDims,
-        seq: usize,
-        kctx: usize,
-        inputs: &dyn Fn(&DecodeGraph) -> Vec<Vec<f32>>,
-        base: Option<&Step>,
-    ) -> Self {
-        let t = Instant::now();
-        let dg = step_graph(dims, seq, kctx);
-        let (g, mut outs) = compiled_decode(&dg, rt.kind() == BackendKind::Cuda);
-        let named = outs.len();
-        let options = |outs: &[TensorId]| {
-            let mut opts = decode_opts(&dg, outs);
-            opts.rows = env("TANG_DECODE_ROWS");
-            opts.warps = env("TANG_DECODE_WARPS");
-            opts.unroll = env("TANG_DECODE_UNROLL");
-            opts.mma_shape = env("TANG_MMA_SHAPE");
-            opts
-        };
-        let mut opts = options(&outs);
-        let mut dp = lower(rt, &g, &outs, &opts);
-        // QWEN_KEEP_ALL=POS: every kernel's result is an output too, so a
-        // test can compare each against the interpreter (debugging aid;
-        // it changes fusion where a result had been inlined)
-        if std::env::var_os("QWEN_KEEP_ALL").is_some() {
-            for k in &dp.program.kernels {
-                if !outs.contains(&k.node) {
-                    outs.push(k.node);
-                }
-            }
-            opts = options(&outs);
-            dp = lower(rt, &g, &outs, &opts);
-        }
-        let native = dp.native.clone();
-        let mut program = dp.program;
-        if seq > 1 {
-            lazy_order(&mut program);
-        }
-        if let Ok(dir) = std::env::var("QWEN_DUMP") {
-            for (i, k) in program.kernels.iter().enumerate() {
-                let ext = if k.source.starts_with("#include") {
-                    "metal"
-                } else if rt.kind() == BackendKind::Cuda {
-                    "cu"
-                } else {
-                    "wgsl"
-                };
-                std::fs::write(format!("{dir}/s{seq}_k{i:03}.{ext}"), &k.source).unwrap();
-            }
-        }
-        let plan = slot_plan(&program, &outs, &opts.inplace);
-        let lowered = t.elapsed().as_secs_f64();
-        let shared: Vec<Shared> = match base {
-            Some(b) => dg
-                .inputs
-                .iter()
-                .enumerate()
-                .filter_map(|(k, s)| {
-                    let j = b.dg.inputs.iter().position(|bs| bs.name == s.name)?;
-                    Some(Shared {
-                        input: k,
-                        from: &b.prog,
-                        tensor: b.prog.input(j),
-                    })
-                })
-                .collect(),
-            None => Vec::new(),
-        };
-        // own inputs left empty (a prefill's chunk) start zeroed
-        let words = inputs(&dg);
-        let refs: Vec<&[f32]> = words.iter().map(|v| v.as_slice()).collect();
-        let owned: usize = {
-            let mut borrowed = vec![false; plan.slot_len.len()];
-            for sh in &shared {
-                let i = program
-                    .buffers
-                    .iter()
-                    .position(|b| b.input == Some(sh.input))
-                    .unwrap();
-                borrowed[plan.slot[i]] = true;
-            }
-            plan.slot_len
-                .iter()
-                .zip(&borrowed)
-                .filter(|(_, b)| !**b)
-                .map(|(n, _)| 4 * n)
-                .sum()
-        };
-        let t = Instant::now();
-        let mut prog = Program::with_shared(rt, program, &refs, &plan, &shared);
-        drop(words);
-        prog.capture(rt);
-        eprintln!(
-            "step seq {seq} (window {kctx}): {} kernels ({} native), lowered in {lowered:.2}s, \
-             compiled + bound in {:.2}s, {:.0} MB allocated ({} inputs shared)",
-            prog.program.kernels.len(),
-            native.iter().filter(|n| **n).count(),
-            t.elapsed().as_secs_f64(),
-            owned as f64 / 1e6,
-            shared.len()
-        );
-        Self {
-            dg,
-            prog,
-            outs,
-            named,
-            g,
-            native,
-            bytes: owned,
-        }
-    }
-
-    fn tensor(&self, name: &str) -> TensorId {
-        self.prog.input(self.dg.input(name))
-    }
-
-    /// `(next token, its position)`.
-    fn state(&self, rt: &Runtime) -> (usize, usize) {
-        let s = self.prog.read(rt, self.outs[1]);
-        (s[0] as usize, s[1] as usize)
-    }
-
-    fn set_state(&self, rt: &Runtime, tok: usize, pos: usize) {
-        self.prog
-            .write(rt, self.tensor("state"), &[tok as f32, pos as f32]);
-    }
-
-    /// The full logits: block 0, then the other vocabulary blocks.
-    fn logits(&self, rt: &Runtime) -> Vec<f32> {
-        let mut l = self.prog.read(rt, self.outs[0]);
-        let first = self.dg.outputs.len() + self.dg.keep.len();
-        for i in 0..self.dg.logit_chunks.len() {
-            l.extend(self.prog.read(rt, self.outs[first + i]));
-        }
-        l
-    }
-
-    /// Prefill: `tokens` at positions `p0..`, then `state` holds the next
-    /// token and its position.
-    fn prefill(&self, rt: &Runtime, tokens: &[usize], p0: usize) {
-        assert_eq!(tokens.len(), self.dg.seq);
-        self.prog
-            .write(rt, self.tensor("chunk"), &chunk_input(tokens, p0));
-        self.prog.run(rt);
-    }
-}
-
-fn argmax(v: &[f32]) -> usize {
-    let mut best = 0;
-    for (i, &x) in v.iter().enumerate() {
-        if x > v[best] {
-            best = i;
-        }
-    }
-    best
 }
 
 fn f16_round(x: f64) -> f64 {
@@ -400,25 +178,6 @@ fn device_words(dg: &DecodeGraph, logical: &[Vec<f32>]) -> Vec<Vec<f32>> {
         .collect()
 }
 
-/// `QWEN_LOAD_DUTY` (0..1, unset = 1): the fraction of wall time the
-/// checkpoint conversion may keep a core busy. A robot without
-/// cooling trips its thermal limit while loading at full speed.
-fn load_duty() -> f64 {
-    std::env::var("QWEN_LOAD_DUTY")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .map_or(1.0, |d| d.clamp(0.01, 1.0))
-}
-
-/// Sleep so the work since `start` was `load_duty()` of the time.
-fn pace(start: Instant) {
-    let d = load_duty();
-    if d < 1.0 {
-        std::thread::sleep(start.elapsed().mul_f64(1.0 / d - 1.0));
-    }
-}
-
-/// Worst relative error of `got` against `want`.
 fn rel_err(got: &[f32], want: &[f64]) -> f64 {
     let scale = want.iter().fold(0.0f64, |m, v| m.max(v.abs()));
     let err = got
@@ -618,182 +377,6 @@ fn tiny() {
 
 // ----------------------------------------------------------------------
 // MLX checkpoint
-
-struct St {
-    // mapped, not read: on the 10 GB robot a read copy plus the converted
-    // words overflow RAM into zram, whose compression heats every core
-    bytes: memmap2::Mmap,
-    base: usize,
-    index: HashMap<String, (String, Vec<usize>, usize, usize)>,
-}
-
-impl St {
-    fn open(path: &str) -> Self {
-        let f = std::fs::File::open(path).expect("open safetensors");
-        let bytes = unsafe { memmap2::Mmap::map(&f) }.expect("map safetensors");
-        let n = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
-        let header: serde_json::Value = serde_json::from_slice(&bytes[8..8 + n]).unwrap();
-        let mut index = HashMap::new();
-        for (k, v) in header.as_object().unwrap() {
-            if k == "__metadata__" {
-                continue;
-            }
-            let dtype = v["dtype"].as_str().unwrap().to_string();
-            let shape = v["shape"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|x| x.as_u64().unwrap() as usize)
-                .collect();
-            let o = v["data_offsets"].as_array().unwrap();
-            let (a, b) = (
-                o[0].as_u64().unwrap() as usize,
-                o[1].as_u64().unwrap() as usize,
-            );
-            index.insert(k.clone(), (dtype, shape, a, b));
-        }
-        Self {
-            bytes,
-            base: 8 + n,
-            index,
-        }
-    }
-
-    fn raw(&self, name: &str) -> &[u8] {
-        let (_, _, a, b) = self
-            .index
-            .get(name)
-            .unwrap_or_else(|| panic!("missing tensor {name}"));
-        &self.bytes[self.base + a..self.base + b]
-    }
-
-    /// 32-bit words of a tensor's bytes (u32 or packed bf16 pairs).
-    fn words(&self, name: &str) -> Vec<f32> {
-        self.raw(name)
-            .chunks(4)
-            .map(|c| f32::from_bits(u32::from_le_bytes(c.try_into().unwrap())))
-            .collect()
-    }
-
-    fn bf16(&self, name: &str) -> Vec<f32> {
-        self.raw(name)
-            .chunks(2)
-            .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
-            .collect()
-    }
-
-    /// A 4-bit matrix `[rows, cols]` dequantized exactly (f32).
-    fn dequant(&self, stem: &str) -> (Vec<f32>, usize, usize) {
-        let q = self.raw(&format!("{stem}.weight"));
-        let s = self.bf16(&format!("{stem}.scales"));
-        let b = self.bf16(&format!("{stem}.biases"));
-        let (_, shape, _, _) = &self.index[&format!("{stem}.weight")];
-        let (rows, cols) = (shape[0], shape[1] * 8);
-        let groups = cols / GROUP;
-        let mut w = vec![0.0f32; rows * cols];
-        for r in 0..rows {
-            for k in 0..cols {
-                let wi = r * (cols / 8) + k / 8;
-                let word = u32::from_le_bytes(q[4 * wi..4 * wi + 4].try_into().unwrap());
-                let n = ((word >> (4 * (k % 8))) & 15) as f32;
-                let g = r * groups + k / GROUP;
-                w[r * cols + k] = n * s[g] + b[g];
-            }
-        }
-        (w, rows, cols)
-    }
-}
-
-/// Device inputs for a step graph from an MLX checkpoint, converted as the
-/// iterator is drawn (empty for state, which starts zeroed).
-fn load_inputs<'a>(
-    st: &'a St,
-    dims: &'a QwenDims,
-    dg: &'a DecodeGraph,
-) -> impl Iterator<Item = Vec<f32>> + 'a {
-    let proj = |p: &str| -> &'static [&'static str] {
-        match p {
-            "qkv" => &["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"],
-            "o" => &["self_attn.o_proj"],
-            "gate" => &["mlp.gate_proj"],
-            "up" => &["mlp.up_proj"],
-            "down" => &["mlp.down_proj"],
-            _ => unreachable!(),
-        }
-    };
-    let suffix = |s: &str| match s {
-        "q" => "weight",
-        "s" => "scales",
-        "b" => "biases",
-        _ => unreachable!(),
-    };
-    let one = move |s: &InputSpec| -> Vec<f32> {
-        let n: usize = s.shape.iter().product();
-        let name = &s.name;
-        if name == "state" || name == "chunk" || name.ends_with("cache") {
-            return Vec::new();
-        }
-        if name == "rope" {
-            return rope_table(dims);
-        }
-        if name == "model.norm" {
-            return st.bf16("model.norm.weight");
-        }
-        // the embedding and LM head, whole (`embed.q`) or as row block
-        // `c` of `dims.vocab_chunks` (`embed.2.q`): rows are contiguous
-        // in the packed words
-        let block = |base: &str, rest: &str| -> Vec<f32> {
-            let (c, part) = match rest.split_once('.') {
-                Some((c, part)) => (c.parse::<usize>().ok(), part),
-                None => (None, rest),
-            };
-            let w = st.words(&format!("{base}.{}", suffix(part)));
-            match c {
-                None => w,
-                Some(c) => {
-                    let per = w.len() / dims.vocab_chunks;
-                    w[c * per..(c + 1) * per].to_vec()
-                }
-            }
-        };
-        if let Some(rest) = name.strip_prefix("lm_head.") {
-            return block("lm_head", rest);
-        }
-        if let Some(rest) = name.strip_prefix("embed.") {
-            return block("model.embed_tokens", rest);
-        }
-        // model.layers.{l}.{what}
-        let rest = name.strip_prefix("model.layers.").unwrap();
-        let (l, what) = rest.split_once('.').unwrap();
-        let pre = format!("model.layers.{l}.");
-        match what {
-            "ln1" => st.bf16(&format!("{pre}input_layernorm.weight")),
-            "ln2" => st.bf16(&format!("{pre}post_attention_layernorm.weight")),
-            "q_norm" => st.bf16(&format!("{pre}self_attn.q_norm.weight")),
-            "k_norm" => st.bf16(&format!("{pre}self_attn.k_norm.weight")),
-            _ => {
-                let (p, part) = what.split_once('.').unwrap();
-                // row-major [rows, …]: concatenating rows is
-                // concatenating the word arrays
-                let mut v = Vec::new();
-                for t in proj(p) {
-                    v.extend(st.words(&format!("{pre}{t}.{}", suffix(part))));
-                }
-                let want = s.packing.unwrap().words(n);
-                assert_eq!(v.len(), want, "{name}");
-                v
-            }
-        }
-    };
-    // QWEN_LOAD_DUTY: hold the conversion to a CPU duty cycle (a hot robot)
-    dg.inputs.iter().map(move |s| {
-        let t = Instant::now();
-        let v = one(s);
-        pace(t);
-        v
-    })
-}
-
 fn read_ids(path: &str) -> Vec<usize> {
     std::fs::read_to_string(path)
         .unwrap()
@@ -825,15 +408,23 @@ fn model(args: &[String]) {
     };
     let gen: usize = opt("--gen").map_or(64, |v| v.parse().unwrap());
     let ctx: usize = opt("--ctx").map_or(4352, |v| v.parse().unwrap());
-    let mut dims = QwenDims::qwen3_8b(ctx);
+    let mut dims = dims_for(dir, ctx);
+    eprintln!("dims: {dims:?}");
     dims.kv_f16 = std::env::var("TANG_KV_F32").is_err();
     let rt = runtime();
+    for (k, v) in apply_tuning(&rt, &dims) {
+        eprintln!("tuned {k}={v}");
+    }
     // a 311 MB 4-bit LM head exceeds Vulkan's 128 MiB storage binding on
     // the Adreno: four blocks of the vocabulary there (QWEN_VOCAB_CHUNKS
     // overrides)
     dims.vocab_chunks = match env("QWEN_VOCAB_CHUNKS") {
         0 => match &rt {
             Runtime::Wgpu { device, .. } if !device.msl_passthrough => 4,
+            // OpenCL buffers top out at CL_DEVICE_MAX_MEM_ALLOC_SIZE (256 MiB on the Adreno)
+            _ if rt.kind() == BackendKind::OpenCl => {
+                (dims.vocab * dims.d_model / 2).div_ceil(255 << 20).max(1)
+            }
             _ => 1,
         },
         n => n,
@@ -1095,7 +686,7 @@ fn reference(args: &[String]) {
         .iter()
         .position(|a| a == "--from")
         .map_or(0, |i| args[i + 1].parse().unwrap());
-    let dims = QwenDims::qwen3_8b(ids.len());
+    let dims = dims_for(dir, ids.len());
     let QwenDims {
         d_model: d,
         heads,

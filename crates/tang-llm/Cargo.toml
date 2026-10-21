@@ -8,7 +8,8 @@ description = "LLM inference on tang-compute: Qwen3-family models, KV cache, sam
 repository.workspace = true
 keywords = ["llm", "inference", "metal", "qwen"]
 categories = ["science"]
-publish = false
+readme = "README.md"
+include = ["src/**/*", "README.md", "CUDA.md", "docs/**/*"]
 
 [features]
 default = []
@@ -41,10 +42,12 @@ tokio = { workspace = true }
 tokio-stream = "0.1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 base64 = "0.22"
+# Fetching https `image_url`s (rustls; no native TLS).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 sha2 = "0.10"
 llguidance = { version = "=1.9.1", default-features = false }
 libc = "0.2"
-tang-moe = { path = "../tang-moe", optional = true }
+tang-moe = { workspace = true, optional = true }
 opentelemetry = { version = "0.30", default-features = false, features = ["trace", "metrics"], optional = true }
 opentelemetry_sdk = { version = "0.30", default-features = false, features = ["trace", "metrics"], optional = true }
 opentelemetry-otlp = { version = "0.30", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls", "trace", "metrics"], optional = true }
@@ -66,4 +69,8 @@ required-features = ["metal"]
 
 [[example]]
 name = "kvcomp_bench"
+required-features = ["metal"]
+
+[[example]]
+name = "kvcomp_niah"
 required-features = ["metal"]

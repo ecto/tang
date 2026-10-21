@@ -137,6 +137,30 @@ kernel:
 - Kernel entry points and bindings.
 - A C lowering, which would need unsigned casts to avoid signed-overflow UB.
 
+## Integer dialect (0.2)
+
+`tang_expr::int::IntGraph` is a separate, bit-exact 32-bit integer graph:
+`i32`/`u32`/`bool`, `i8`/`u8` storage, wrapping arithmetic, exact
+`mul_wide`, and structured `while` loops with invariant hoisting. The CPU
+interpreter, the generated WGSL and the generated Rust compute the same bits.
+
+```rust
+use tang_expr::int::{IType, IntGraph};
+
+// sum of i*i for i in 0..n
+let mut g = IntGraph::new();
+let n = g.param(0, IType::U32);
+let zero = g.u32(0);
+let s = g.for_range(n, &[zero], |g, i, s| {
+    let sq = g.mul(i, i);
+    vec![g.add(s[0], sq)]
+});
+assert_eq!(g.eval(&s, &[10], &[]), vec![285]);
+let wgsl = g.to_wgsl_fn("sum_sq", &s); // or g.to_rust("sum_sq", &s)
+```
+
+See `examples/int_dialect.rs`.
+
 ## Design
 
 - **Structural interning** — identical subexpressions always share the same `ExprId` (automatic CSE)
@@ -147,4 +171,4 @@ kernel:
 
 ## License
 
-[MIT](../../LICENSE)
+Licensed under either of [Apache License, Version 2.0](../../LICENSE-APACHE) or [MIT license](../../LICENSE-MIT) at your option. Contributions are accepted under the same terms with a DCO sign-off (see CONTRIBUTING.md).

@@ -9,17 +9,19 @@
 //! - `lanes`: [`LANE_WORDS`] words per lane: byte offset, byte length, first
 //!   token, tokens, channel-table base, output base (elements), output token
 //!   stride, scratch base (words), unit (`f32` bits), sink, sink divisor,
-//!   head dim, RoPE flag, RoPE theta (`f32` bits);
-//! - `chans`: 4 words per channel: mean (`i32`), rho, class, dense class
-//!   index within its (stream, head);
+//!   lane width (channels), RoPE flag, RoPE theta (`f32` bits), first RoPE
+//!   pair of the lane, head dim;
+//! - `chans`: 4 words per channel, in lane-local order per (stream, head,
+//!   channel group): mean (`i32`), rho, class, dense class index within the
+//!   group;
 //! - `prior`: [`crate::kvcodec::gpu_prior_table`];
 //! - scratch: `scratch_words` words of adaptive-model state.
 
 use crate::bitio::DecodeError;
-use crate::kvcodec::{gpu_prior_table, KvStream, GPU_CTX_MODELS};
+use crate::kvcodec::{gpu_prior_table, lane_chan, KvStream, GPU_CTX_MODELS};
 
 /// Words per lane descriptor.
-pub const LANE_WORDS: usize = 14;
+pub const LANE_WORDS: usize = 16;
 
 /// Flat decoder tables for a set of streams.
 #[derive(Default)]
@@ -42,6 +44,9 @@ pub struct Placement<'f> {
     pub row: &'f dyn Fn(usize, usize) -> usize,
     /// Apply half-split RoPE with this theta to each decoded token row.
     pub rope_theta: Option<f32>,
+    /// Decode without writing the output (benchmark: the cost a fused
+    /// decode + attention kernel cannot avoid).
+    pub decode_only: bool,
 }
 
 impl Batch {
@@ -70,12 +75,17 @@ impl Batch {
             self.bytes.push(0);
         }
         let chan0 = self.chans.len() / 4;
-        // dense class index per (head, channel)
-        let mut ncls = vec![0usize; p.heads];
-        for hh in 0..p.heads {
+        let (w, ng) = (p.lane_width(), p.lane_groups());
+        if w > 128 {
+            return Err(DecodeError::Invalid("gpu lane wider than 128 channels"));
+        }
+        // dense class index per (head, channel group), lane-local channel order
+        let mut ncls = vec![0usize; p.heads * ng];
+        for (hg, nc) in ncls.iter_mut().enumerate() {
+            let (hh, g) = (hg / ng, hg % ng);
             let mut seen: Vec<u32> = Vec::new();
-            for c in 0..p.hd {
-                let j = hh * p.hd + c;
+            for i in 0..w {
+                let j = hh * p.hd + lane_chan(p.hd, w, g, i);
                 let cl = tb.class[j];
                 let di = seen.iter().position(|&v| v == cl).unwrap_or_else(|| {
                     seen.push(cl);
@@ -84,12 +94,13 @@ impl Batch {
                 self.chans
                     .extend_from_slice(&[tb.mu[j] as u32, tb.rho[j], cl, di as u32]);
             }
-            ncls[hh] = seen.len();
+            *nc = seen.len();
         }
         let ctx_words = 3 * GPU_CTX_MODELS;
         for l in &tb.lanes {
-            let [off, len, pos0, n, hh] = *l;
-            let (pos0, n, hh) = (pos0 as usize, n as usize, hh as usize);
+            let [off, len, pos0, n, hh, g] = *l;
+            let (pos0, n, hh, g) = (pos0 as usize, n as usize, hh as usize, g as usize);
+            let hg = hh * ng + g;
             if pos0 + n <= t0 || pos0 >= t1 {
                 continue;
             }
@@ -104,18 +115,20 @@ impl Batch {
                 len,
                 pos0 as u32,
                 n as u32,
-                (chan0 + hh * p.hd) as u32,
+                (chan0 + hg * w) as u32,
                 row0 as u32,
                 stride as u32,
                 self.scratch_words as u32,
                 p.unit().to_bits(),
                 p.sink as u32,
                 p.sink_div,
-                p.hd as u32,
-                place.rope_theta.is_some() as u32,
+                w as u32,
+                place.rope_theta.is_some() as u32 | (place.decode_only as u32) << 1,
                 place.rope_theta.unwrap_or(0.0).to_bits(),
+                (g * w / 2) as u32,
+                p.hd as u32,
             ]);
-            self.scratch_words += ncls[hh] * ctx_words;
+            self.scratch_words += ncls[hg] * ctx_words;
         }
         self.stream = self
             .bytes

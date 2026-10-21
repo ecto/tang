@@ -79,6 +79,11 @@ pub struct KvParams {
     pub ar: bool,
     /// GPU layout: integer reconstruction, one substream per (block, head).
     pub gpu: bool,
+    /// GPU layout: channels per substream (even, divides `hd`; 0 = `hd`).
+    /// Each block then has `heads × hd / lane_ch` substreams; lane `g` of a
+    /// head holds the RoPE pairs `g·lane_ch/2 ..` (channels `c` and
+    /// `c + hd/2` together) so the decoder can rotate on write.
+    pub lane_ch: usize,
 }
 
 impl KvParams {
@@ -96,7 +101,20 @@ impl KvParams {
             block: 128,
             ar: true,
             gpu: false,
+            lane_ch: 0,
         }
+    }
+    /// Channels per GPU substream.
+    pub fn lane_width(&self) -> usize {
+        if self.lane_ch == 0 {
+            self.hd
+        } else {
+            self.lane_ch
+        }
+    }
+    /// GPU substreams per (block, head).
+    pub fn lane_groups(&self) -> usize {
+        self.hd / self.lane_width()
     }
     fn rotated(&self) -> bool {
         self.kind == Kind::K && self.pre_rope && !self.gpu
@@ -295,6 +313,17 @@ fn tok_step(p: &KvParams, pos: usize) -> f64 {
     }
 }
 
+/// Channel of lane-local index `i` in channel group `g` (see [`KvParams::lane_ch`]).
+#[inline]
+pub fn lane_chan(hd: usize, w: usize, g: usize, i: usize) -> usize {
+    let base = g * w / 2;
+    if i < w / 2 {
+        base + i
+    } else {
+        hd / 2 + base + i - w / 2
+    }
+}
+
 /// Encode tokens `[pos0, pos0 + n)` (row-major `[n][heads*hd]`, already in the
 /// coded domain) as one independent block.
 fn encode_block(
@@ -354,20 +383,22 @@ fn encode_block_gpu(p: &KvParams, s: &Stats, y: &[f64], pos0: usize, n: usize) -
     let (h, d) = (p.heads, p.hd);
     let m = h * d;
     let u = p.unit() as f64;
-    (0..h)
-        .map(|hh| {
+    let (w, ng) = (p.lane_width(), p.lane_groups());
+    (0..h * ng)
+        .map(|lane| {
+            let (hh, g) = (lane / ng, lane % ng);
             let mut models = fresh_models(1);
             let mut e = Encoder::new();
-            let mut prev = vec![0i64; d];
-            let mut act = vec![0u8; d];
+            let mut prev = vec![0i64; w];
+            let mut act = vec![0u8; w];
             for t in 0..n {
                 let ts = if pos0 + t < p.sink {
                     1
                 } else {
                     p.sink_div as i64
                 };
-                for c in 0..d {
-                    let j = hh * d + c;
+                for c in 0..w {
+                    let j = hh * d + lane_chan(d, w, g, c);
                     let mu = s.mu[j];
                     let pred = if t == 0 {
                         mu
@@ -391,12 +422,15 @@ fn encode_block_gpu(p: &KvParams, s: &Stats, y: &[f64], pos0: usize, n: usize) -
         .collect()
 }
 
-/// GPU layout decode of one (block, head) substream into `out[t][c]`
-/// (`n × hd`, f32). This is the reference the WGSL kernel matches.
+/// GPU layout decode of one (block, head, channel group) substream into
+/// `out[t][c]` (`n × hd`, f32; only the group's channels are written). This is
+/// the reference the GPU kernel matches.
+#[allow(clippy::too_many_arguments)]
 fn decode_lane_gpu(
     p: &KvParams,
     s: &Stats,
     hh: usize,
+    g: usize,
     bytes: &[u8],
     pos0: usize,
     n: usize,
@@ -406,16 +440,18 @@ fn decode_lane_gpu(
     let u = p.unit();
     let mut models = fresh_models(1);
     let mut dec = Decoder::new(bytes);
-    let mut prev = vec![0i64; d];
-    let mut act = vec![0u8; d];
+    let w = p.lane_width();
+    let mut prev = vec![0i64; w];
+    let mut act = vec![0u8; w];
     for t in 0..n {
         let ts = if pos0 + t < p.sink {
             1
         } else {
             p.sink_div as i64
         };
-        for c in 0..d {
-            let j = hh * d + c;
+        for c in 0..w {
+            let cc = lane_chan(d, w, g, c);
+            let j = hh * d + cc;
             let mu = s.mu[j];
             let pred = if t == 0 {
                 mu
@@ -427,7 +463,7 @@ fn decode_lane_gpu(
             let r = pred + q * ts;
             prev[c] = r;
             act[c] = q.unsigned_abs().min(2) as u8;
-            out[t * d + c] = (r as i32 as f32) * u;
+            out[t * d + cc] = (r as i32 as f32) * u;
         }
     }
 }
@@ -632,7 +668,8 @@ impl KvEncoder {
             Kind::V => 1,
         } | (p.pre_rope as u8) << 1
             | (p.ar as u8) << 2
-            | (p.gpu as u8) << 3);
+            | (p.gpu as u8) << 3
+            | ((p.gpu && p.lane_groups() > 1) as u8) << 4);
         w.varint(p.heads as u64);
         w.varint(p.hd as u64);
         w.f64(p.theta);
@@ -641,6 +678,9 @@ impl KvEncoder {
         w.varint(p.sink_div as u64);
         w.varint(p.block as u64);
         w.varint(self.tokens as u64);
+        if p.gpu && p.lane_groups() > 1 {
+            w.varint(p.lane_width() as u64);
+        }
         for j in 0..p.heads * p.hd {
             w.svarint(self.stats.mu[j]);
             w.u8(self.stats.class[j] | if p.ar { 0 } else { 0x80 });
@@ -707,8 +747,12 @@ impl<'a> KvStream<'a> {
         let sink_div = r.varint()? as u32;
         let block = r.varint()? as usize;
         let tokens = r.varint()? as usize;
+        let lane_ch = if f & 16 != 0 { r.varint()? as usize } else { 0 };
         if !hd.is_multiple_of(2) || block == 0 || heads == 0 || sink_div == 0 {
             return Err(DecodeError::Invalid("bad header"));
+        }
+        if lane_ch != 0 && (!lane_ch.is_multiple_of(2) || !hd.is_multiple_of(lane_ch)) {
+            return Err(DecodeError::Invalid("bad lane width"));
         }
         let ar = f & 4 != 0;
         let gpu = f & 8 != 0;
@@ -724,6 +768,7 @@ impl<'a> KvStream<'a> {
             block,
             ar,
             gpu,
+            lane_ch,
         };
         let m = heads * hd;
         let (mut mu, mut rho, mut class) = (
@@ -739,7 +784,7 @@ impl<'a> KvStream<'a> {
         if class.iter().any(|&c| c as usize >= NCLASS) {
             return Err(DecodeError::Invalid("class out of range"));
         }
-        let nb = tokens.div_ceil(block) * if gpu { heads } else { 1 };
+        let nb = tokens.div_ceil(block) * if gpu { heads * params.lane_groups() } else { 1 };
         let mut blocks = Vec::with_capacity(nb);
         let mut offsets = Vec::with_capacity(nb);
         for _ in 0..nb {
@@ -799,16 +844,20 @@ impl<'a> KvStream<'a> {
         for b in t0 / p.block..t1.div_ceil(p.block) {
             let pos0 = b * p.block;
             let n = p.block.min(self.tokens - pos0);
+            let ng = p.lane_groups();
             for hh in 0..h {
-                decode_lane_gpu(
-                    p,
-                    &self.stats,
-                    hh,
-                    self.blocks[b * h + hh],
-                    pos0,
-                    n,
-                    &mut buf[..n * d],
-                );
+                for g in 0..ng {
+                    decode_lane_gpu(
+                        p,
+                        &self.stats,
+                        hh,
+                        g,
+                        self.blocks[(b * h + hh) * ng + g],
+                        pos0,
+                        n,
+                        &mut buf[..n * d],
+                    );
+                }
                 for t in pos0.max(t0)..(pos0 + n).min(t1) {
                     let dst = (hh * nt + t - t0) * d;
                     x[dst..dst + d].copy_from_slice(&buf[(t - pos0) * d..(t - pos0 + 1) * d]);
@@ -826,9 +875,10 @@ impl<'a> KvStream<'a> {
         if !p.gpu {
             return None;
         }
+        let ng = p.lane_groups();
         let lanes = (0..self.blocks.len())
             .map(|i| {
-                let (b, hh) = (i / p.heads, i % p.heads);
+                let (b, hh, g) = (i / (p.heads * ng), i / ng % p.heads, i % ng);
                 let pos0 = b * p.block;
                 [
                     self.offsets[i] as u32,
@@ -836,6 +886,7 @@ impl<'a> KvStream<'a> {
                     (pos0) as u32,
                     p.block.min(self.tokens - pos0) as u32,
                     hh as u32,
+                    g as u32,
                 ]
             })
             .collect();
@@ -856,8 +907,9 @@ pub struct GpuTables {
     pub rho: Vec<u32>,
     /// Spread class.
     pub class: Vec<u32>,
-    /// `[byte offset, byte length, first token, tokens, head]` per lane.
-    pub lanes: Vec<[u32; 5]>,
+    /// `[byte offset, byte length, first token, tokens, head, channel group]`
+    /// per lane.
+    pub lanes: Vec<[u32; 6]>,
 }
 
 /// Initial adaptive-model table shared by every GPU-layout stream:
@@ -1010,12 +1062,13 @@ mod tests {
     #[test]
     fn gpu_layout_bound_ranges_append() {
         let (h, n, d) = (3, 300, 16);
-        for kind in [Kind::K, Kind::V] {
+        for (kind, lc) in [(Kind::K, 0), (Kind::V, 0), (Kind::K, 4), (Kind::V, 2)] {
             let x = synth(h, n, d, 11);
             let mut p = KvParams::new(kind, h, d, 0.05);
             p.block = 32;
             p.pre_rope = false;
             p.gpu = true;
+            p.lane_ch = lc;
             let bytes = encode(p.clone(), &x, n);
             let s = KvStream::parse(&bytes).unwrap();
             let y = s.decode_range(0, n);
@@ -1040,7 +1093,7 @@ mod tests {
                 }
             }
             let tb = s.gpu_tables().unwrap();
-            assert_eq!(tb.lanes.len(), n.div_ceil(32) * h);
+            assert_eq!(tb.lanes.len(), n.div_ceil(32) * h * p.lane_groups());
         }
     }
 

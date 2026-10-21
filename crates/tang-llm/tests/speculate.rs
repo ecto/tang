@@ -365,3 +365,120 @@ fn batched_matches_alone() {
     }
     assert!(bad.is_empty(), "batched outputs differ: {bad:?}");
 }
+
+/// A Qwen3-VL checkpoint (`TANG_LLM_TEST_VL_MODEL`, e.g. the tiny one `qwen3vl_tiny.py`
+/// writes, or Qwen3-VL-8B-Instruct); the image tests are skipped without it.
+fn vl_model() -> Option<std::path::PathBuf> {
+    let Ok(spec) = std::env::var("TANG_LLM_TEST_VL_MODEL") else {
+        eprintln!("TANG_LLM_TEST_VL_MODEL not set: skipping");
+        return None;
+    };
+    Some(tang_llm::resolve_model(&spec).expect("TANG_LLM_TEST_VL_MODEL"))
+}
+
+/// A small synthetic picture as a PNG data URL.
+fn png(w: u32, h: u32, seed: u32) -> String {
+    use base64::Engine as _;
+    let img = image::RgbImage::from_fn(w, h, |x, y| {
+        let v = (x * 7 + y * 13 + seed * 31) % 256;
+        if (x / 24 + y / 24 + seed).is_multiple_of(2) {
+            image::Rgb([v as u8, 90, 200 - (v as u8) / 2])
+        } else {
+            image::Rgb([30, (v as u8) / 2 + 60, 40])
+        }
+    });
+    let mut out = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+    let data = base64::engine::general_purpose::STANDARD.encode(out.into_inner());
+    format!("data:image/png;base64,{data}")
+}
+
+fn vl_requests() -> Vec<(&'static str, Request)> {
+    let body = |content: serde_json::Value, extra: serde_json::Value| {
+        let mut b = json!({"messages": [{"role": "user", "content": content}], "max_tokens": 80});
+        for (k, v) in extra.as_object().unwrap() {
+            b[k] = v.clone();
+        }
+        tang_llm::server::parse(&b).unwrap()
+    };
+    let img = |w, h, s| json!({"type": "image_url", "image_url": {"url": png(w, h, s)}});
+    let text = |t: &str| json!({"type": "text", "text": t});
+    let greedy = json!({"temperature": 0.0});
+    let seeded = json!({"temperature": 0.7, "top_k": 20, "top_p": 0.95, "seed": 42});
+    vec![
+        (
+            "image/greedy",
+            body(
+                json!([img(330, 200, 0), text("Describe this view.")]),
+                greedy.clone(),
+            ),
+        ),
+        (
+            "two-images/seeded",
+            body(
+                json!([
+                    img(260, 300, 1),
+                    text("and"),
+                    img(300, 260, 2),
+                    text("What changed?")
+                ]),
+                seeded,
+            ),
+        ),
+        (
+            "text-only/greedy",
+            body(json!("Name three CAD file formats."), greedy),
+        ),
+    ]
+}
+
+/// With images in the prompt (M-RoPE rows in the cache, DeepStack), speculative decoding and
+/// batching still give each request exactly what plain decoding gives it alone.
+#[test]
+fn images_drafts_and_batching_match() {
+    let Some(dir) = vl_model() else { return };
+    let mut e = Engine::load(device(), &dir, 4096, Dtype::Bf16).unwrap();
+    e.set_kv_f32(true);
+    e.set_slots(8);
+    let reqs = vl_requests();
+    let mut short = DraftConfig::new(COST_METAL);
+    short.max_draft = 3;
+    short.global_tokens = 0;
+    let mut bad = Vec::new();
+    let mut alone = Vec::new();
+    for (name, r) in &reqs {
+        e.set_speculation(None);
+        let (off, _, _) = run(&mut e, r);
+        e.set_speculation(Some(short.clone()));
+        let (on, u, _) = run(&mut e, r);
+        eprintln!(
+            "{name}: identical={} completion={} drafts {}/{} accepted",
+            off == on,
+            u.completion_tokens,
+            u.accepted_tokens,
+            u.draft_tokens
+        );
+        if off != on {
+            bad.push(format!("drafts/{name} at byte {}", first_diff(&off, &on)));
+        }
+        alone.push(off);
+    }
+    let rs: Vec<Request> = vl_requests().into_iter().map(|r| r.1).collect();
+    for spec in [None, Some(short)] {
+        for stagger in [false, true] {
+            e.set_speculation(spec.clone());
+            let together = run_batch(&mut e, &rs, stagger);
+            for (i, (a, b)) in alone.iter().zip(&together).enumerate() {
+                if a != b {
+                    bad.push(format!(
+                        "batch/{}/{stagger}/{} at byte {}",
+                        spec.is_some(),
+                        reqs[i].0,
+                        first_diff(a, b)
+                    ));
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "outputs differ: {bad:?}");
+}

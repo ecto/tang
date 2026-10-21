@@ -1342,6 +1342,24 @@ kernel void gelu_tanh(
     Y[gid] = 0.5f * g * (1.0f + t);
 }
 
+// GELU, exact: 0.5 x (1 + erf(x / sqrt 2)). Metal has no erf: Abramowitz & Stegun 7.1.26
+// (absolute error < 1.5e-7, below f32's resolution of the result).
+kernel void gelu_erf(
+    device const float* X [[buffer(0)]],
+    device float* Y [[buffer(1)]],
+    device const uint* params [[buffer(2)]],  // [n]
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= params[0]) return;
+    float g = X[gid];
+    float z = fabs(g) * 0.70710678118654752f;
+    float t = 1.0f / (1.0f + 0.3275911f * z);
+    float p = ((((1.061405429f * t - 1.453152027f) * t + 1.421413741f) * t - 0.284496736f) * t
+               + 0.254829592f) * t;
+    float e = 1.0f - p * exp(-z * z);
+    Y[gid] = 0.5f * g * (1.0f + copysign(e, g));
+}
+
 // LayerNorm with weight and bias: one threadgroup (256 threads) per row.
 kernel void layer_norm(
     device const float* X [[buffer(0)]],

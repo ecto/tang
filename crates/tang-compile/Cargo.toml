@@ -6,10 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 description = "Graph optimization and compilation passes for tang"
 repository.workspace = true
+documentation = "https://docs.rs/tang-compile"
 readme = "README.md"
 keywords = ["compiler", "graph", "optimization", "codegen"]
 categories = ["compilers", "mathematics"]
-include = ["src/**/*", "README.md"]
+include = ["src/**/*", "README.md", "LICENSE-MIT", "LICENSE-APACHE", "examples/**/*"]
 
 [dependencies]
 tang      = { workspace = true }

@@ -25,6 +25,18 @@ for the same GPU, model and streams; GPUs differ run to run (±5%), so treat cha
 | 2026-10-20 | c623ce1 | (same) | H100 | 32B | 1 | 67.6 | 37.1% | |
 | 2026-10-20 | c623ce1 | (same) | H100 | 32B | 8 | 213 | | |
 | 2026-10-20 | c623ce1 | (same) | H100 | 32B | 16 | 232 | | |
+| 2026-10-21 | 701af6c | #87 speculation ≤2 streams, #89 tensor-core GEMM (no change at 1/8 rows in bench_batch, as expected) | H200 | 8B | 1 | 207 | 18.5% | −0.5% |
+| 2026-10-21 | 701af6c | (same) | H200 | 8B | 8 | 711 | | +0.3% |
+| 2026-10-21 | 701af6c | (same) | H200 | 32B | 1 | 70.7 | 27.2% | +1.7% |
+| 2026-10-21 | 701af6c | (same) | H200 | 32B | 8 | 219 | | +1.9% |
+
+AA-style single stream (`tang-llm serve`, speculation on as deployed, ~850-token prompt, 500
+output tokens, temperature 0.7, streamed; output tok/s from first token to last, median of 3;
+the probe is `docs/bench/aa.py`):
+
+| date | commit | GPU | model | AA output tok/s | bar (fastest public API) |
+|---|---|---|---|---|---|
+| 2026-10-21 | 701af6c | H200 | 8B | 200.5 | Eigen 303 |
 
 Measured on the same H100 pod, waiting to merge (each on top of c623ce1):
 
@@ -80,9 +92,24 @@ Measured so far (before the rebase onto #88/#89):
 | 2026-10-20 | 1b8474c | #95, 13-token prompt | H100 | gpt-oss-20b | 1 | 182 | 20% | |
 | 2026-10-20 | 1b8474c | #95, 13-token prompt | H100 | gpt-oss-120b | 1 | 119 | | |
 
-The order to try on the H200: (1) the smem GEMV A/B in the script; (2) CUDA graphs over the decode
-step (launch-bound on Hopper); (3) a Q4 head and Q4 attention, which takes the ceiling from 1280
-to ~2460; (4) speculation, already exact for gpt-oss (`tests/speculate.rs`).
+**Plan for when gpt-oss is back in focus** (on hold since 2026-10-21; 30% of zest goes to
+speed, all of it on Coder-Next and tang-pro for now). In order, each with what's ready:
+
+1. **Q4 attention and head**, the path past Groq: 3.75 → ~1.95 GB a token, H200 ceiling
+   1280 → ~2460 tok/s. `--q4` already quantizes attention, the embedding and the head at load
+   (affine 4-bit, group 64) and the 4-bit GEMV serves them. Correctness checked offline:
+   `scripts/gpt_oss_q4_check.py` applies the same rounding to transformers' weights, and tang
+   `--q4` matches it at max KL 1.1e-4 (tiny model, CPU). Still unmeasured: what Q4 costs the
+   real 20b. `gpt_oss_speed.sh` measures it (`--q4` vs bf16 KL, 256 positions) beside the speed.
+   If the head costs too much, keep the head bf16 and quantize attention only (1.27 GB saved of
+   the 1.8), or try group 32.
+2. **The MXFP4 GEMV A/B** (input via L1, the default, vs staged in shared memory,
+   `TANG_MOE_GEMV=smem`), in the same script. The smem kernel has not run on a GPU yet.
+3. **CUDA graphs over the decode step**: the H100 step is launch-bound (~460 launches a token).
+4. **Speculation**: already exact for gpt-oss (`tests/speculate.rs` passes on CUDA).
+
+One H200 hour covers 1 and 2 (`scripts/gpt_oss_speed.sh <gpt-oss-20b dir>`; it prints these
+rows and an nsys summary).
 
 ## Dead ends
 
@@ -95,6 +122,11 @@ Tried and measured at under 3% (or worse):
 - **GEMV, 2 columns a warp instead of 4:** 2-10% slower.
 - **GEMV K-split sizing, 1 / 4 / 8 / 16 blocks an SM:** within 3% of each other once the
   128-bit loads are in; 4 kept.
+- **GEMV with the whole K slice of x resident in shared memory and every weight load issued up
+  front (`gemv_q4_xr`, 2026-10-21, H200):** 8B solo 207 → 130 tok/s, 32B 71 → 36. Registers
+  (16 uint4 of weights a lane) leave one 8-warp block an SM, and a block loads everything,
+  then computes: no overlap between one block's math and the next one's loads. The fix has to
+  keep several blocks (or a load pipeline) per SM.
 - **Device top-k for a lone stream:** 1.5% slower than sampling its one row on the host;
   only batches cut on the device.
 - **The VRAM-pressure check on pool misses only (#81)** measured +1.5% alone. It's kept because

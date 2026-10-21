@@ -612,7 +612,7 @@ impl ModGraph {
     }
 }
 
-/// The negacyclic NTT over Z_q[x]/(x^n + 1) as a graph of log2(n)
+/// The negacyclic NTT over `Z_q[x]/(x^n + 1)` as a graph of log2(n)
 /// Cooley–Tukey stages, output in bit-reversed order (the Dilithium order).
 /// `zeta` is a primitive 2n-th root of unity. Pointwise products of two
 /// transforms are the transform of the negacyclic product.

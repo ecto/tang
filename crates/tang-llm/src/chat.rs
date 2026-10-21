@@ -28,8 +28,17 @@ impl Template {
                 .and_then(|t| t["template"].as_str())
                 .context("chat_template list")?
                 .to_string(),
-            _ => std::fs::read_to_string(dir.join("chat_template.jinja"))
-                .context("no chat_template in tokenizer_config.json")?,
+            // Or beside it: `chat_template.jinja`, or `chat_template.json` (Qwen3-VL).
+            _ => match std::fs::read_to_string(dir.join("chat_template.jinja")) {
+                Ok(t) => t,
+                Err(_) => serde_json::from_slice::<Value>(
+                    &std::fs::read(dir.join("chat_template.json"))
+                        .context("no chat_template in tokenizer_config.json")?,
+                )?["chat_template"]
+                    .as_str()
+                    .context("chat_template.json has no chat_template")?
+                    .to_string(),
+            },
         };
         let special = |k: &str| match &cfg[k] {
             Value::String(s) => s.clone(),

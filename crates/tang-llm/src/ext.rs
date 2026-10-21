@@ -32,6 +32,30 @@ impl<D: ComputeDevice> Clone for Step<D> {
     }
 }
 
+/// What a [`Loader`] hands back: the KV width a layer's cache holds on this device (the
+/// model's `kv_dim`, or one tensor-parallel rank's shard of it), and whatever the extension
+/// keeps for its step override ([`Model::external`]: shards on other GPUs, its own formats).
+pub struct External {
+    pub kv_dim: usize,
+    pub state: Arc<dyn std::any::Any + Send + Sync>,
+}
+
+/// Load a model's weights instead of [`Model::load`] (say, sharded across GPUs, or in a format
+/// tang doesn't read): `(device, checkpoint dir, config, max_ctx)`. `None` declines and tang
+/// loads as usual. On `Some(Ok)`, the model keeps its config, RoPE tables and a KV pool of
+/// [`External::kv_dim`] per layer, holds no weights, and runs only through a [`Step`]
+/// override (which must not decline its calls).
+pub type LoaderFn<D> =
+    dyn Fn(&D, &std::path::Path, &crate::Config, usize) -> Option<Result<External>> + Send + Sync;
+
+pub struct Loader<D: ComputeDevice>(pub Arc<LoaderFn<D>>);
+
+impl<D: ComputeDevice> Clone for Loader<D> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
 /// What a model resolved: its target, the op slots, and a step override.
 pub struct Ext<D: ComputeDevice> {
     pub target: Target,

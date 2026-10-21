@@ -38,6 +38,13 @@
 //! (`[896, 896, 3]` f32, normalized), as JSON.
 //! `tang-llm logits-image <model-dir> <pixels.f32> <token ids...> [--last N]` — logits with the
 //! image standing in for its placeholder tokens.
+//! `tang-llm vl-trace <model-dir> <patches.f32> <grid-h> <grid-w> [--f32]` — Qwen3-VL's tower on
+//! preprocessed patches (`[n, 3·16·16]`, merge-block order): JSON with the hidden state after
+//! the patch embedding and each block, the merged embeddings and the DeepStack features.
+//! `tang-llm vl-logits <model-dir> (--image F | --patches F GH GW) <token ids...> [--step K]
+//! [--last N] [--f32]` — Qwen3-VL logits with the image in its placeholders; `--step K`
+//! prefills the first K ids (with the image) and feeds the rest one at a time.
+//! `tang-llm vl-preprocess <model-dir> <image> <out.f32>` — the patches the server would feed.
 //!
 //! `tang-llm bench-prefill <model> [--n 1024,4096,9216] [--reps R]` — cold prefill (empty
 //! cache, 512-token chunks like the server) of N synthetic tokens: ms and tok/s.
@@ -141,6 +148,141 @@ fn new_cuda() -> Result<tang_compute::CudaComputeDevice> {
         Ok(Err(e)) => bail!("no CUDA device: {e}"),
         Err(_) => bail!("no CUDA device (couldn't load the driver or cuBLAS)"),
     }
+}
+
+fn read_f32(path: &str) -> Result<Vec<f32>> {
+    Ok(std::fs::read(path)?
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
+        .collect())
+}
+
+/// Qwen3-VL checks (see the module docs: `vl-trace`, `vl-logits`, `vl-preprocess`).
+fn vl<D: ComputeDevice>(
+    make: fn() -> Result<D>,
+    cmd: &str,
+    dir: &std::path::Path,
+    args: &[String],
+) -> Result<()> {
+    use tang_llm::qwen3vl::Patches;
+    let mut dtype = Dtype::Bf16;
+    // Images in prompt order: encoded bytes, or preprocessed patches.
+    let mut images: Vec<Result<Vec<u8>, Patches>> = Vec::new();
+    let (mut step, mut last, mut ids) = (None, None, vec![]);
+    let mut pos = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--f32" => dtype = Dtype::F32,
+            "--image" => images.push(Ok(std::fs::read(it.next().context("--image FILE")?)?)),
+            "--patches" => {
+                let f = read_f32(it.next().context("--patches F GH GW")?)?;
+                let gh: usize = it.next().context("GH")?.parse()?;
+                let gw: usize = it.next().context("GW")?.parse()?;
+                images.push(Err(Patches {
+                    data: f,
+                    grid_h: gh,
+                    grid_w: gw,
+                }));
+            }
+            "--step" => step = Some(it.next().context("--step K")?.parse::<usize>()?),
+            "--last" => last = Some(it.next().context("--last N")?.parse::<usize>()?),
+            _ => pos.push(a.clone()),
+        }
+    }
+    let model = Model::load(make()?, dir, 8192, dtype)?;
+    let v = model
+        .qwen_vision
+        .as_ref()
+        .context("not a Qwen3-VL checkpoint")?;
+    match cmd {
+        "vl-preprocess" => {
+            let [img, out] = pos.as_slice() else {
+                bail!("vl-preprocess <dir> <image> <out.f32>")
+            };
+            let p = tang_llm::qwen3vl::preprocess(&std::fs::read(img)?, &v.sizing)?;
+            let bytes: Vec<u8> = p.data.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(out, bytes)?;
+            println!("{} {}", p.grid_h, p.grid_w);
+        }
+        "vl-trace" => {
+            let (f, gh, gw, out) = match pos.as_slice() {
+                [f, gh, gw] => (f, gh, gw, None),
+                [f, gh, gw, out] => (f, gh, gw, Some(out)),
+                _ => bail!("vl-trace <dir> <patches.f32> <grid-h> <grid-w> [out-dir]"),
+            };
+            let p = Patches {
+                data: read_f32(f)?,
+                grid_h: gh.parse()?,
+                grid_w: gw.parse()?,
+            };
+            let mut trace = Vec::new();
+            let t = Instant::now();
+            let e = v.encode_traced(&model.dev, &p, Some(&mut trace));
+            let embeds = model.dev.download(&e.embeds);
+            eprintln!(
+                "encoded {} patches in {:.0}ms",
+                p.count(),
+                t.elapsed().as_secs_f64() * 1e3
+            );
+            let ds: Vec<Vec<f32>> = e.deepstack.iter().map(|d| model.dev.download(d)).collect();
+            // With an output directory: raw f32 files (block_N, embeds, deepstack_N) instead
+            // of JSON, for real-size images.
+            if let Some(out) = out {
+                let write = |name: String, v: &[f32]| -> Result<()> {
+                    let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                    Ok(std::fs::write(std::path::Path::new(out).join(name), b)?)
+                };
+                for (i, b) in trace.iter().enumerate() {
+                    write(format!("block_{i}.f32"), b)?;
+                }
+                write("embeds.f32".into(), &embeds)?;
+                for (i, d) in ds.iter().enumerate() {
+                    write(format!("deepstack_{i}.f32"), d)?;
+                }
+                println!("{} {}", e.grid.0, e.grid.1);
+                return Ok(());
+            }
+            println!(
+                "{}",
+                serde_json::json!({"blocks": trace, "embeds": embeds, "deepstack": ds, "grid": [e.grid.0, e.grid.1]})
+            );
+        }
+        "vl-logits" => {
+            for a in &pos {
+                ids.push(a.parse::<u32>()?);
+            }
+            let t = Instant::now();
+            let mut feats = Vec::new();
+            for img in images {
+                feats.push(match img {
+                    Ok(b) => model.encode_image_bytes(&b)?,
+                    Err(p) => model.qwen_features(v.encode(&model.dev, &p)),
+                });
+            }
+            let n: usize = feats.iter().map(|f| f.tokens).sum();
+            eprintln!(
+                "images: {n} tokens in {:.0}ms",
+                t.elapsed().as_secs_f64() * 1e3
+            );
+            let mut cache = model.new_cache();
+            let k = step.unwrap_or(ids.len()).min(ids.len());
+            let mut logits = model.forward_images(&ids[..k], &feats, &mut cache, true)?;
+            for &id in &ids[k..] {
+                logits.extend(model.forward(&[id], &mut cache, true)?);
+            }
+            let vsz = model.cfg.vocab_size;
+            let mut rows: Vec<&[f32]> = logits.chunks(vsz).collect();
+            if let Some(n) = last {
+                rows = rows.split_off(rows.len().saturating_sub(n));
+            }
+            println!("{}", serde_json::to_string(&rows)?);
+        }
+        _ => bail!("unknown command {cmd}"),
+    }
+    Ok(())
 }
 
 fn new_cpu() -> Result<CpuDevice> {
@@ -256,6 +398,10 @@ fn main() -> Result<()> {
     if cmd == "bench-spec" {
         return bench_spec(backend, &args[1..]);
     }
+    if cmd.starts_with("vl-") {
+        let cmd = cmd.to_string();
+        return on_backend!(backend, vl(&cmd, &dir, &args[2..]));
+    }
     if matches!(cmd, "bench-prefill" | "bench-verify") {
         let cmd = cmd.to_string();
         return bench(backend, &cmd, &args[1..]);
@@ -321,6 +467,8 @@ fn run<D: ComputeDevice>(
         }
         "logits-image" => {
             let img = model.encode_image(pixels.as_ref().unwrap())?;
+            let v = model.vision.as_ref().context("no vision tower")?;
+            let img = tang_llm::model::ImageFeatures::plain(img, v.tokens);
             let logits = model.forward_images(&ids, &[img], &mut cache, true)?;
             let v = model.cfg.vocab_size;
             let mut rows: Vec<&[f32]> = logits.chunks(v).collect();

@@ -34,6 +34,7 @@ be replaced:
 | `KvAttentionPaged<D>` | `dev.kv_attention_paged` (prefill, verify windows, single decode) | tang-compute |
 | `AllReduce<D>` | tensor-parallel reduction across GPUs | tang-compute |
 | `Step<D>` | all of `Model::forward_batch` (megakernel, CUDA graph) | tang-llm |
+| `Loader<D>` | `Model::load`'s weights (sharded, external formats) | tang-llm |
 
 An implementation is registered as an `Entry { name, matches, priority, imp }`. `matches` is a
 `Match` over the **target**:
@@ -70,6 +71,15 @@ and the built-in kernel runs that call. A step override that declines falls back
   so the work orders with the built-in ops) and each buffer's storage (`CudaBuffer::raw`:
   f32, bf16, 4-bit packed/scales/biases, Q2), so it can launch its own kernels, or tang's
   (`tang_compute::kernels::*_cuda`), on the model's weights and KV pool.
+- **External weights** (`Loader`): an extension loads the checkpoint itself (sharded across
+  GPUs, or in a format tang doesn't read) and returns `External { kv_dim, state }`. The model
+  then keeps only its config, RoPE tables and a KV pool of `kv_dim` per layer (one
+  tensor-parallel rank's shard: the other ranks mirror its block ids in their own buffers, so
+  prefix sharing and sealing stay tang's), holds no weights (`n_layers() == 0`), and runs only
+  through a `Step` override, which `Model::forward` also goes through for such a model;
+  `Model::external()` hands the step its state. A loader returning `None` declines and tang
+  loads as usual. `tests/external.rs` is the example. KV saved to disk covers what this pool
+  holds, so a sharded extension turns that off (`TANG_KV_DISK=0`) or saves the other ranks.
 - **Multi-GPU** (`AllReduce`): tang has no tensor-parallel path yet. The slot is defined so the
   path that grows one resolves its reduction the same way (built-in: copy through host or NCCL;
   extension: a fused one-shot all-reduce).

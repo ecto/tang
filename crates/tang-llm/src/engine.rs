@@ -163,8 +163,37 @@ pub struct Prompter {
     tok: Arc<Tokenizer>,
     template: Arc<Template>,
     shield: Arc<Shield>,
-    /// Tokens an image takes, if the model sees images.
-    image_tokens: Option<usize>,
+    /// How images become placeholder tokens, if the model sees images.
+    image_tokens: Option<ImageSlots>,
+}
+
+/// How an image is laid out in the prompt.
+#[derive(Clone, Copy, Debug)]
+pub enum ImageSlots {
+    /// Gemma 3: a fixed number of soft tokens.
+    Gemma(usize),
+    /// Qwen3-VL: one `<|image_pad|>` per merged patch, by the image's size.
+    Qwen(crate::qwen3vl::Sizing),
+}
+
+impl ImageSlots {
+    /// The prompt text an image (encoded bytes) stands for, as the reference processor
+    /// writes it.
+    pub fn block(&self, bytes: &[u8]) -> Result<String> {
+        Ok(match self {
+            Self::Gemma(per) => format!(
+                "\n\n<start_of_image>{}<end_of_image>\n\n",
+                "<image_soft_token>".repeat(*per)
+            ),
+            Self::Qwen(sizing) => {
+                let (h, w) = crate::qwen3vl::image_size(bytes)?;
+                format!(
+                    "<|vision_start|>{}<|vision_end|>",
+                    "<|image_pad|>".repeat(sizing.tokens(h, w)?)
+                )
+            }
+        })
+    }
 }
 
 impl Prompter {
@@ -183,7 +212,7 @@ impl Prompter {
             },
         )?;
         if !req.images.is_empty() {
-            let per = self
+            let slots = self
                 .image_tokens
                 .ok_or_else(|| anyhow!("this model can't see images"))?;
             anyhow::ensure!(
@@ -191,11 +220,16 @@ impl Prompter {
                 "the chat template dropped some images"
             );
             // As the processor does: each marker becomes a block of image tokens.
-            let block = format!(
-                "\n\n<start_of_image>{}<end_of_image>\n\n",
-                "<image_soft_token>".repeat(per)
-            );
-            prompt = prompt.replace(IMAGE_MARKER, &block);
+            let mut out = String::with_capacity(prompt.len());
+            let mut rest = prompt.as_str();
+            for img in &req.images {
+                let (before, after) = rest.split_once(IMAGE_MARKER).expect("counted above");
+                out.push_str(before);
+                out.push_str(&slots.block(img)?);
+                rest = after;
+            }
+            out.push_str(rest);
+            prompt = out;
         }
         let ids = self.shield.encode(&self.tok, &prompt)?;
         Ok((self.shield.reveal(&prompt), ids))
@@ -1042,7 +1076,11 @@ impl<D: ComputeDevice> Engine<D> {
             tok: self.tok.clone(),
             template: self.template.clone(),
             shield: self.shield.clone(),
-            image_tokens: self.model.vision.as_ref().map(|v| v.tokens),
+            image_tokens: match (&self.model.vision, &self.model.qwen_vision) {
+                (Some(v), _) => Some(ImageSlots::Gemma(v.tokens)),
+                (None, Some(q)) => Some(ImageSlots::Qwen(q.sizing)),
+                _ => None,
+            },
         }
     }
 
@@ -1224,8 +1262,11 @@ impl<D: ComputeDevice> Engine<D> {
             .or_else(|| runs.get(self.cache_images.len()).map(|r| r.0))
             .unwrap_or(usize::MAX);
         let mut reuse = shared.min(ids.len() - 1).min(differ);
-        let per = self.model.vision.as_ref().map_or(0, |v| v.tokens);
-        if let Some(&(start, _)) = runs.iter().find(|(s, _)| *s < reuse && reuse < s + per) {
+        let run_len = |s: usize| ids[s..].iter().take_while(|&&t| Some(t) == img_tok).count();
+        if let Some(&(start, _)) = runs
+            .iter()
+            .find(|(s, _)| *s < reuse && reuse < s + run_len(*s))
+        {
             reuse = start;
         }
         self.cache.truncate(reuse);
@@ -1296,12 +1337,10 @@ impl<D: ComputeDevice> Engine<D> {
             ids,
         };
         if !runs.is_empty() {
-            let size = self.model.vision.as_ref().map_or(896, |v| v.cfg.image_size);
             let mut feats = Vec::new();
             for (i, &(start, _)) in runs.iter().enumerate() {
                 if start >= reuse {
-                    let px = crate::vision::preprocess(&req.images[i], size)?;
-                    feats.push(self.model.encode_image(&px)?);
+                    feats.push(self.model.encode_image_bytes(&req.images[i])?);
                 }
             }
             let logits =

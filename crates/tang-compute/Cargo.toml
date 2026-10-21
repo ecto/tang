@@ -32,7 +32,8 @@ cudarc = { version = "0.16", features = ["nvrtc", "cublas", "cuda-version-from-b
 [build-dependencies]
 
 [dev-dependencies]
-tang-compress = { workspace = true }
+# Path only, so publishing strips it: only the kvdec example uses it.
+tang-compress = { path = "../tang-compress" }
 
 [[example]]
 name = "kvdec_bench"
