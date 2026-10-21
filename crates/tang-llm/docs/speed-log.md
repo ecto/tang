@@ -128,6 +128,13 @@ output tokens, tok/s after the first token. The fastest public API for this mode
 | 2026-10-21 | 4ac3171 | (same build, AA) | H200 | refactor | suffix | 370.2 | | 2.71 tok/window |
 | 2026-10-21 | 4ac3171 | | H200 | write | suffix | 229.0 | | 1.25 tok/window |
 | 2026-10-21 | 4ac3171 | | H200 | explain | suffix | 222.3 | | 1.16 tok/window |
+| 2026-10-21 | 2a723ae | (round-3 pod, defaults of 4ac3171) | H200 | explain | none | 222.3 | 15.9% | pod baseline |
+| 2026-10-21 | 2a723ae | fast Q4_K/Q5_K expert dot (32 weights a lane) | H200 | explain | none | 230.9 | 16.5% | +3.9% |
+| 2026-10-21 | 2a723ae | Q8X dense repack (aligned codes, separate scales) | H200 | explain | none | 231.8 | 16.6% | +4.3% |
+| 2026-10-21 | 8fdfd13 | Q8X + fast expert dot (the defaults now) | H200 | explain | none | 240.8 | 17.2% | +8.3% |
+| 2026-10-21 | 2a723ae | + bf16 router (opt-in) | H200 | explain | none | 243.1 | 17.4% | +1% |
+| 2026-10-21 | 2a723ae | (Q8X + bf16 router, AA) | H200 | refactor | suffix | 403.5 | | 2.71 tok/window |
+| 2026-10-21 | 2a723ae | | H200 | write | suffix | 252.0 | | 1.25 tok/window |
 
 Stage sweep on that H200 pod (`TANG_CODER_STAGES=1`: each stage alone in a CUDA graph, replayed;
 µs a step at a 1.3k context, window 4,856 µs): routed+shared gate|up 876 (771 GB/s), down 801
@@ -159,5 +166,7 @@ moe combine+norm 214, attention split-K 207 (154 GB/s), router 176, head 174, po
   second model engine. Not worth building yet.
 - **First rows of a `flash-aa` run** read ~4% low (205 vs 213–217 for the same kernels later in
   the run). Compare variants inside the A/B block, which warms up first.
+- **bf16 router weights** (`TANG_CODER_ROUTER16=1`): +1% (240.8 → 243.1), under the bar. The
+  router is 4.2 MB a layer of F32 but reads at ~1.1 TB/s either way. Kept opt-in.
 - **nsys / ncu on the RunPod image:** ncu's injection lacks `cuTensorMapEncodeIm2colWide`,
   which cudarc resolves at load, and nsys isn't installed (apt fails).
