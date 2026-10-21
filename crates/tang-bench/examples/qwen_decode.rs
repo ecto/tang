@@ -46,6 +46,8 @@ use tang_compile::tensor::{TensorGraph, TensorId};
 use tang_gpu::program::{BackendKind, Runtime};
 
 fn main() {
+    #[cfg(feature = "otel")]
+    let _otel = tang_bench::otel_init("qwen_decode");
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("tiny") => tiny(),

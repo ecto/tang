@@ -587,6 +587,9 @@ pub struct Session {
     /// Tokens the next pick may not be ([`ban_next`](Self::ban_next)).
     ban: Vec<u32>,
     rng: u64,
+    /// Parent of this session's spans (feature `otel`): [`set_trace_parent`](Self::set_trace_parent).
+    #[cfg(feature = "otel")]
+    trace_parent: Option<tang_otel::Context>,
 }
 
 impl Session {
@@ -638,6 +641,8 @@ impl Session {
             ban: Vec::new(),
             reply_start: 0,
             rng: 0x9e37_79b9_7f4a_7c15,
+            #[cfg(feature = "otel")]
+            trace_parent: None,
         })
     }
 
@@ -663,6 +668,30 @@ impl Session {
     pub fn ban_next(&mut self, toks: &[u32]) {
         self.ban.clear();
         self.ban.extend_from_slice(toks);
+    }
+
+    /// Put this session's spans (prefill, decode steps, and the OpenCL runs
+    /// and builds under them) in the caller's trace: a W3C `traceparent`
+    /// (`00-<trace id>-<span id>-01`), e.g. broca's per-turn span. `None`:
+    /// spans start their own traces again. Without the `otel` feature this
+    /// does nothing. Returns whether the parent was accepted.
+    pub fn set_trace_parent(&mut self, traceparent: Option<&str>) -> bool {
+        #[cfg(feature = "otel")]
+        {
+            self.trace_parent = traceparent.and_then(tang_otel::parent_from_traceparent);
+            self.trace_parent.is_some() || traceparent.is_none()
+        }
+        #[cfg(not(feature = "otel"))]
+        {
+            let _ = traceparent;
+            false
+        }
+    }
+
+    /// [`set_trace_parent`](Self::set_trace_parent) from a trace id (32 hex)
+    /// and parent span id (16 hex).
+    pub fn set_trace_ids(&mut self, trace_id: &str, span_id: &str) -> bool {
+        self.set_trace_parent(Some(&format!("00-{trace_id}-{span_id}-01")))
     }
 
     /// Forget the cache (the next prompt prefills from position 0).
@@ -727,8 +756,16 @@ impl Session {
         lcp = lcp.min(tokens.len() - 1);
         let mut p = lcp;
         let sizes = chunk_sizes(&self.rt);
+        #[cfg(feature = "otel")]
+        let tel = tel::Op::start("qwen.prefill", &self.trace_parent);
+        #[cfg(feature = "otel")]
+        let _attached = tel.as_ref().map(|t| t.cx.clone().attach());
+        #[cfg(feature = "otel")]
+        let mut chunks: Vec<usize> = Vec::new();
         while p < tokens.len() {
             let left = tokens.len() - p;
+            #[cfg(feature = "otel")]
+            let c0 = std::time::SystemTime::now();
             match sizes.iter().copied().find(|&s| s <= left) {
                 Some(seq) => {
                     let kctx = window(p + seq, self.dims.ctx);
@@ -738,12 +775,22 @@ impl Session {
                     // SAFETY: `rt` outlives this call; step_for only borrows `prefill`
                     step.prefill(unsafe { &*rt }, &ids, p);
                     self.last = Some((seq, kctx));
+                    #[cfg(feature = "otel")]
+                    if let Some(t) = &tel {
+                        t.chunk(c0, seq, kctx, p);
+                        chunks.push(seq);
+                    }
                     p += seq;
                 }
                 None => {
                     self.dec.set_state(&self.rt, tokens[p] as usize, p);
                     self.dec.prog.run(&self.rt);
                     self.last = None;
+                    #[cfg(feature = "otel")]
+                    if let Some(t) = &tel {
+                        t.chunk(c0, 1, 0, p);
+                        chunks.push(1);
+                    }
                     p += 1;
                 }
             }
@@ -751,6 +798,10 @@ impl Session {
         self.cached = tokens.to_vec();
         self.reply_start = tokens.len();
         let first = self.choose(sampling);
+        #[cfg(feature = "otel")]
+        if let Some(t) = tel {
+            t.end_prefill(tokens.len(), lcp, &chunks);
+        }
         (first, lcp)
     }
 
@@ -758,11 +809,20 @@ impl Session {
     /// last `step` returned): runs one decode step.
     pub fn step(&mut self, sampling: &Sampling) -> u32 {
         let (tok, pos) = self.next;
+        #[cfg(feature = "otel")]
+        let tel = tel::Op::start_decode(&self.trace_parent);
+        #[cfg(feature = "otel")]
+        let _attached = tel.as_ref().map(|t| t.cx.clone().attach());
         self.dec.set_state(&self.rt, tok as usize, pos);
         self.dec.prog.run(&self.rt);
         self.last = None;
         self.cached.push(tok);
-        self.choose(sampling)
+        let next = self.choose(sampling);
+        #[cfg(feature = "otel")]
+        if let Some(t) = tel {
+            t.end_decode(pos);
+        }
+        next
     }
 
     /// The next token from the state the last run left (greedy: the device
@@ -941,6 +1001,42 @@ fn load1() -> Option<f64> {
         .ok()
 }
 
+/// Prefill matmul candidates of [`tune`]: `(TANG_CL_MM_KIND, config,
+/// lanes)`. The first is the default (no knobs set), measured as the
+/// baseline; staged before register-block.
+const PREFILL_CANDIDATES: &[(&str, &str, &str)] = &[
+    ("", "stage 128x8x2x128", ""),
+    ("stage", "128x4x2x256", ""),
+    ("stage", "128x4x4x128", ""),
+    ("stage", "64x4x2x256", ""),
+    ("stage", "256x8x2x64", ""),
+    ("stage", "128x8x1x128", ""),
+    ("stage", "64x8x4x128", ""),
+    ("stage", "256x16x2x64", ""),
+    ("reg", "4x4x64", "16"),
+    ("reg", "4x4x128", "16"),
+    ("reg", "4x4x128", "32"),
+    ("reg", "4x4x64", "8"),
+    ("reg", "4x8x64", "16"),
+    ("reg", "8x4x64", "16"),
+    ("reg", "2x8x128", "16"),
+    ("reg", "0x4x64", "16"),
+    ("reg", "4x4x64", "1"),
+];
+
+/// The prefill winner among `results` (`(ms, candidate index)`): the
+/// fastest, and only if strictly faster than the measured default
+/// `baseline`; `None` keeps the default (also with no baseline or no
+/// results).
+fn pick_prefill(baseline: Option<f64>, results: &[(f64, usize)]) -> Option<(f64, usize)> {
+    let b = baseline.filter(|b| b.is_finite())?;
+    results
+        .iter()
+        .copied()
+        .filter(|(ms, _)| ms.is_finite() && *ms < b)
+        .min_by(|x, y| x.0.total_cmp(&y.0))
+}
+
 /// Wait (bounded) for the GPU to cool below `cool` °C and the 1-minute load
 /// to fall below `load`; false when `deadline` passed first.
 fn settle(hot: f64, cool: f64, load: f64, deadline: Instant) -> bool {
@@ -992,6 +1088,12 @@ pub fn tune(dir: &str, budget: f64) -> Vec<(String, String)> {
     }
     let key = tune_key(&rt, &dims);
     eprintln!("tune: {key}, budget {budget:.0} s");
+    #[cfg(feature = "otel")]
+    let tel = tel::Op::start("qwen.tune", &None);
+    #[cfg(feature = "otel")]
+    let _attached = tel.as_ref().map(|t| t.cx.clone().attach());
+    #[cfg(feature = "otel")]
+    let mut candidates = 0i64;
     let st = St::open(&format!("{dir}/model.safetensors"));
     let base = Step::new(
         &rt,
@@ -1015,6 +1117,8 @@ pub fn tune(dir: &str, budget: f64) -> Vec<(String, String)> {
         best
     };
     let mut won = Vec::new();
+    // prefill: (measured default ms, winning candidate ms if one beat it)
+    let mut prefill_ms: Option<(f64, Option<f64>)> = None;
     // decode: warps x rows
     let mut best: Option<(f64, usize, usize)> = None;
     for (w, r) in [(4, 2), (4, 4), (8, 4), (4, 8), (2, 4), (8, 2), (8, 8)] {
@@ -1024,6 +1128,8 @@ pub fn tune(dir: &str, budget: f64) -> Vec<(String, String)> {
         }
         std::env::set_var("TANG_DECODE_WARPS", w.to_string());
         std::env::set_var("TANG_DECODE_ROWS", r.to_string());
+        #[cfg(feature = "otel")]
+        let c0 = std::time::SystemTime::now();
         let s = Step::new(
             &rt,
             &dims,
@@ -1037,6 +1143,11 @@ pub fn tune(dir: &str, budget: f64) -> Vec<(String, String)> {
             "tune: decode warps {w} rows {r}: {ms:.2} ms (gpu {:.1} C)",
             gpu_temp().unwrap_or(0.0)
         );
+        #[cfg(feature = "otel")]
+        if let Some(t) = &tel {
+            candidates += 1;
+            t.candidate(c0, "decode", &format!("warps={w} rows={r}"), ms, gpu_temp());
+        }
         if best.is_none_or(|b| ms < b.0) {
             best = Some((ms, w, r));
         }
@@ -1055,38 +1166,19 @@ pub fn tune(dir: &str, budget: f64) -> Vec<(String, String)> {
             n => n,
         };
         let toks: Vec<usize> = (0..seq).map(|i| 1000 + i).collect();
-        let mut best: Option<(f64, &str, &str, &str)> = None;
         // register block: (RMxRNxWG, lanes along k), local partials
         // RM*RN*WG floats within the Adreno's 32 KB. staged:
         // WGxLANESxRNxKC, activations (<= 32/RN rows x KC) and partials in
-        // local memory, <= 32 accumulators per item
-        for (kind, cfg, lanes) in [
-            ("reg", "4x4x64", "16"),
-            ("reg", "4x4x128", "16"),
-            ("reg", "4x4x128", "32"),
-            ("reg", "4x4x64", "8"),
-            ("reg", "4x8x64", "16"),
-            ("reg", "8x4x64", "16"),
-            ("reg", "2x8x128", "16"),
-            ("reg", "0x4x64", "16"),
-            ("reg", "4x4x64", "1"),
-            ("stage", "128x8x2x128", ""),
-            ("stage", "128x4x2x256", ""),
-            ("stage", "128x4x4x128", ""),
-            ("stage", "64x4x2x256", ""),
-            ("stage", "256x8x2x64", ""),
-            ("stage", "128x8x1x128", ""),
-            ("stage", "64x8x4x128", ""),
-            ("stage", "256x16x2x64", ""),
-        ] {
-            if !settle(hot, 75.0, load, deadline) {
-                eprintln!("tune: budget spent");
-                break;
+        // local memory, <= 32 accumulators per item. The default (no knobs:
+        // stage 128x8x2x128) is measured first as the baseline; staged
+        // candidates go before the register ones, which lost on the K1.
+        let measure = |kind: &str, cfg: &str, lanes: &str| -> f64 {
+            if !kind.is_empty() {
+                std::env::set_var("TANG_CL_MM_KIND", kind);
             }
-            std::env::set_var("TANG_CL_MM_KIND", kind);
             if kind == "stage" {
                 std::env::set_var("TANG_CL_STAGE", cfg);
-            } else {
+            } else if kind == "reg" {
                 std::env::set_var("TANG_CL_MM", cfg);
                 std::env::set_var("TANG_CL_MM_LANES", lanes);
             }
@@ -1100,14 +1192,6 @@ pub fn tune(dir: &str, budget: f64) -> Vec<(String, String)> {
             );
             s.prefill(&rt, &toks, 0);
             let ms = s.prog.time(&rt, 1);
-            eprintln!(
-                "tune: prefill {seq} tokens, {kind} {cfg} lanes {lanes}: {ms:.1} ms ({:.0} tok/s, gpu {:.1} C)",
-                seq as f64 * 1e3 / ms,
-                gpu_temp().unwrap_or(0.0)
-            );
-            if best.is_none_or(|b| ms < b.0) {
-                best = Some((ms, kind, cfg, lanes));
-            }
             for k in [
                 "TANG_CL_MM_KIND",
                 "TANG_CL_STAGE",
@@ -1116,15 +1200,71 @@ pub fn tune(dir: &str, budget: f64) -> Vec<(String, String)> {
             ] {
                 std::env::remove_var(k);
             }
-        }
-        if let Some((_, kind, cfg, lanes)) = best {
-            won.push(("TANG_CL_MM_KIND".to_string(), kind.to_string()));
-            if kind == "stage" {
-                won.push(("TANG_CL_STAGE".to_string(), cfg.to_string()));
-            } else {
-                won.push(("TANG_CL_MM".to_string(), cfg.to_string()));
-                won.push(("TANG_CL_MM_LANES".to_string(), lanes.to_string()));
+            ms
+        };
+        let mut results: Vec<(f64, usize)> = Vec::new();
+        let mut baseline = None;
+        // wall time of the slowest candidate so far (build + run): a
+        // candidate starts only if one more of those fits the budget
+        let mut cost = std::time::Duration::ZERO;
+        for (i, &(kind, cfg, lanes)) in PREFILL_CANDIDATES.iter().enumerate() {
+            if i > 0 && Instant::now() + cost >= deadline {
+                eprintln!("tune: budget spent");
+                break;
             }
+            if !settle(hot, 75.0, load, deadline) && i > 0 {
+                eprintln!("tune: budget spent");
+                break;
+            }
+            #[cfg(feature = "otel")]
+            let c0 = std::time::SystemTime::now();
+            let w0 = Instant::now();
+            let ms = measure(kind, cfg, lanes);
+            cost = cost.max(w0.elapsed());
+            let name = if i == 0 {
+                format!("default ({cfg})")
+            } else {
+                format!("{kind} {cfg} lanes {lanes}")
+            };
+            eprintln!(
+                "tune: prefill {seq} tokens, {name}: {ms:.1} ms ({:.0} tok/s, gpu {:.1} C)",
+                seq as f64 * 1e3 / ms,
+                gpu_temp().unwrap_or(0.0)
+            );
+            #[cfg(feature = "otel")]
+            if let Some(t) = &tel {
+                candidates += 1;
+                t.candidate(c0, "prefill", &name, ms, gpu_temp());
+            }
+            if i == 0 {
+                baseline = Some(ms);
+            } else {
+                results.push((ms, i));
+            }
+        }
+        let pick = pick_prefill(baseline, &results);
+        if let Some(b) = baseline {
+            prefill_ms = Some((b, pick.map(|(ms, _)| ms)));
+        }
+        match pick {
+            Some((ms, i)) => {
+                let (kind, cfg, lanes) = PREFILL_CANDIDATES[i];
+                eprintln!(
+                    "tune: prefill {kind} {cfg} {ms:.1} ms beats the default {:.1} ms",
+                    baseline.unwrap_or(f64::NAN)
+                );
+                won.push(("TANG_CL_MM_KIND".to_string(), kind.to_string()));
+                if kind == "stage" {
+                    won.push(("TANG_CL_STAGE".to_string(), cfg.to_string()));
+                } else {
+                    won.push(("TANG_CL_MM".to_string(), cfg.to_string()));
+                    won.push(("TANG_CL_MM_LANES".to_string(), lanes.to_string()));
+                }
+            }
+            None => eprintln!(
+                "tune: prefill keeps the default ({:.1} ms)",
+                baseline.unwrap_or(f64::NAN)
+            ),
         }
     }
     // merge into the tuning file
@@ -1133,10 +1273,17 @@ pub fn tune(dir: &str, budget: f64) -> Vec<(String, String)> {
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_else(|| serde_json::json!({}));
-    let entry: serde_json::Map<String, serde_json::Value> = won
+    let mut entry: serde_json::Map<String, serde_json::Value> = won
         .iter()
         .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
         .collect();
+    // numbers, not knobs: apply_tuning skips non-strings
+    if let Some((b, w)) = prefill_ms {
+        entry.insert("prefill_baseline_ms".into(), serde_json::json!(b));
+        if let Some(w) = w {
+            entry.insert("prefill_best_ms".into(), serde_json::json!(w));
+        }
+    }
     all[key.as_str()] = serde_json::Value::Object(entry);
     if let Some(d) = path.parent() {
         let _ = std::fs::create_dir_all(d);
@@ -1147,6 +1294,12 @@ pub fn tune(dir: &str, budget: f64) -> Vec<(String, String)> {
         path.display(),
         t0.elapsed().as_secs_f64()
     );
+    #[cfg(feature = "otel")]
+    if let Some(t) = tel {
+        t.end_tune(&key, budget, candidates, &won);
+        drop(_attached);
+        tang_otel::flush();
+    }
     won
 }
 
@@ -1440,5 +1593,157 @@ pub fn kernel_table(rt: &Runtime, step: &Step, top: usize) {
     );
     for (name, ms, n) in groups.iter().take(top) {
         println!("  {ms:8.2} ms {:5.1}%  x{n:<4} {name}", 100.0 * ms / total);
+    }
+}
+
+/// OpenTelemetry for [`Session`] and [`tune`] (feature `otel`).
+#[cfg(feature = "otel")]
+mod tel {
+    use std::sync::atomic::AtomicU64;
+    use std::time::SystemTime;
+    use tang_otel::{Context, KeyValue, TraceContextExt as _, Tracer as _};
+
+    /// A span in flight, current in `cx`.
+    pub struct Op {
+        pub cx: Context,
+        start: SystemTime,
+    }
+
+    impl Op {
+        pub fn start(name: &'static str, parent: &Option<Context>) -> Option<Self> {
+            let t = tang_otel::tracer()?;
+            let parent = parent.clone().unwrap_or_else(Context::current);
+            let span = t.span_builder(name).start_with_context(t, &parent);
+            Some(Op {
+                cx: parent.with_span(span),
+                start: SystemTime::now(),
+            })
+        }
+
+        /// A decode step's span: every `TANG_OTEL_DECODE_SAMPLE`th (default 1).
+        pub fn start_decode(parent: &Option<Context>) -> Option<Self> {
+            static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            static N: AtomicU64 = AtomicU64::new(0);
+            let every = *EVERY.get_or_init(|| {
+                if tang_otel::enabled() {
+                    tang_otel::env_u64("TANG_OTEL_DECODE_SAMPLE", 1)
+                } else {
+                    0
+                }
+            });
+            if !tang_otel::every(&N, every) {
+                return None;
+            }
+            Self::start("qwen.decode.step", parent)
+        }
+
+        fn ms(&self) -> f64 {
+            SystemTime::now()
+                .duration_since(self.start)
+                .unwrap_or_default()
+                .as_secs_f64()
+                * 1e3
+        }
+
+        /// One prefill chunk (host time: enqueue, plus whatever the device made it wait).
+        pub fn chunk(&self, c0: SystemTime, seq: usize, kctx: usize, pos: usize) {
+            let now = SystemTime::now();
+            tang_otel::span_at(
+                "qwen.prefill.chunk",
+                &self.cx,
+                c0,
+                now,
+                vec![
+                    KeyValue::new("tang.qwen.chunk_tokens", seq as i64),
+                    KeyValue::new("tang.qwen.kctx", kctx as i64),
+                    KeyValue::new("tang.qwen.pos", pos as i64),
+                    KeyValue::new(
+                        "tang.qwen.host_ms",
+                        now.duration_since(c0).unwrap_or_default().as_secs_f64() * 1e3,
+                    ),
+                ],
+            );
+        }
+
+        pub fn end_prefill(self, prompt: usize, reused: usize, chunks: &[usize]) {
+            let ms = self.ms();
+            let new = prompt - reused;
+            let s = self.cx.span();
+            s.set_attribute(KeyValue::new("tang.qwen.prompt_tokens", prompt as i64));
+            s.set_attribute(KeyValue::new("tang.qwen.reused_tokens", reused as i64));
+            s.set_attribute(KeyValue::new("tang.qwen.new_tokens", new as i64));
+            s.set_attribute(KeyValue::new("tang.qwen.chunks", chunks.len() as i64));
+            let sizes: Vec<String> = chunks.iter().map(|c| c.to_string()).collect();
+            s.set_attribute(KeyValue::new("tang.qwen.chunk_sizes", sizes.join(",")));
+            s.set_attribute(KeyValue::new("tang.qwen.ms", ms));
+            if ms > 0.0 {
+                s.set_attribute(KeyValue::new(
+                    "tang.qwen.tokens_per_second",
+                    new as f64 * 1e3 / ms,
+                ));
+            }
+            s.end();
+        }
+
+        pub fn end_decode(self, pos: usize) {
+            let ms = self.ms();
+            let s = self.cx.span();
+            s.set_attribute(KeyValue::new("tang.qwen.pos", pos as i64));
+            s.set_attribute(KeyValue::new("tang.qwen.tokens", 1i64));
+            s.set_attribute(KeyValue::new("tang.qwen.ms", ms));
+            s.end();
+        }
+
+        pub fn candidate(
+            &self,
+            c0: SystemTime,
+            kind: &str,
+            config: &str,
+            ms: f64,
+            temp: Option<f64>,
+        ) {
+            let mut a = vec![
+                KeyValue::new("tang.tune.kind", kind.to_string()),
+                KeyValue::new("tang.tune.config", config.to_string()),
+                KeyValue::new("tang.tune.ms", ms),
+            ];
+            if let Some(t) = temp {
+                a.push(KeyValue::new("tang.tune.gpu_temp_c", t));
+            }
+            tang_otel::span_at("qwen.tune.candidate", &self.cx, c0, SystemTime::now(), a);
+        }
+
+        pub fn end_tune(self, key: &str, budget: f64, candidates: i64, won: &[(String, String)]) {
+            let s = self.cx.span();
+            s.set_attribute(KeyValue::new("tang.tune.key", key.to_string()));
+            s.set_attribute(KeyValue::new("tang.tune.budget_s", budget));
+            s.set_attribute(KeyValue::new("tang.tune.candidates", candidates));
+            let chosen: Vec<String> = won.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            s.set_attribute(KeyValue::new("tang.tune.chosen", chosen.join(" ")));
+            s.end();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pick_prefill;
+
+    #[test]
+    fn slower_than_baseline_never_wins() {
+        // the K1 case: reg at 568 ms vs the staged default at 374 ms
+        assert_eq!(pick_prefill(Some(374.0), &[(568.0, 9), (400.0, 2)]), None);
+        assert_eq!(pick_prefill(Some(374.0), &[(374.0, 3)]), None);
+        assert_eq!(
+            pick_prefill(Some(374.0), &[(568.0, 9), (350.0, 2), (360.0, 4)]),
+            Some((350.0, 2))
+        );
+    }
+
+    #[test]
+    fn empty_or_timed_out_sweep_keeps_default() {
+        assert_eq!(pick_prefill(Some(374.0), &[]), None);
+        assert_eq!(pick_prefill(None, &[(100.0, 1)]), None);
+        assert_eq!(pick_prefill(Some(f64::NAN), &[(100.0, 1)]), None);
     }
 }

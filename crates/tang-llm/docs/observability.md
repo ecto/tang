@@ -1,23 +1,36 @@
 # Observability: OpenTelemetry traces and metrics
 
-`tang-llm serve` can export per-request traces and per-step metrics over OTLP/HTTP
-(protobuf). It's behind the cargo feature `otel`, off by default: the default build has no
-OpenTelemetry dependencies and every hook in `src/telemetry.rs` compiles to nothing.
+`tang-llm serve` records per-request traces and per-step metrics behind the cargo feature
+`otel`, off by default: the default build has no OpenTelemetry dependencies and every hook in
+`src/telemetry.rs` compiles to nothing.
+
+With the feature on, export goes through `crates/tang-otel` (shared with the OpenCL runtime
+and `qwen_session`). **The default exporter is a local file** of OTLP/JSON lines: one
+`ExportTraceServiceRequest` / `ExportMetricsServiceRequest` per line, the framing the
+collector's `otlpjsonfile` receiver reads (the same contract as ipse's trainer). **Nothing
+goes over the network** unless asked for with `TANG_OTEL_LIVE=1` or `serve --otel-live`.
 
 ```bash
 cargo build --release --features cuda,otel   # or metal,otel
-OTEL_EXPORTER_OTLP_ENDPOINT=https://api.honeycomb.io \
-OTEL_EXPORTER_OTLP_HEADERS="x-honeycomb-team=<key>" \
-OTEL_SERVICE_NAME=tang-llm \
-  tang-llm serve ...
+tang-llm serve ...                           # -> ~/.cache/tang/otel/tang-llm.otel.jsonl
+OTEL_FILE=/srv/otel/tang-llm.otel.jsonl tang-llm serve ...
+OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4328 tang-llm serve ... --otel-live   # file + live
 ```
 
 | Variable | Meaning |
 |---|---|
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | Base URL; `/v1/traces` and `/v1/metrics` are appended. Unset or empty: nothing is exported and the hooks return after one `OnceLock` check. |
+| `OTEL_FILE` (or `TANG_OTEL_FILE`) | The JSON-lines file (appended). Unset: `~/.cache/tang/otel/<service>.otel.jsonl`. `off`: no file. |
+| `TANG_OTEL_LIVE=1` / `--otel-live` | Also export over OTLP/HTTP (protobuf) to `OTEL_EXPORTER_OTLP_ENDPOINT`. Without it the endpoint is ignored (with a note on stderr). |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Base URL; `/v1/traces` and `/v1/metrics` are appended. Live export only. |
 | `OTEL_EXPORTER_OTLP_HEADERS` | `k=v,k2=v2`, e.g. the backend's API key. |
 | `OTEL_SERVICE_NAME` | Defaults to `tang-llm`. |
-| `OTEL_RESOURCE_ATTRIBUTES` | Extra resource attributes (`host.name=…,deployment.environment=…`). |
+| `OTEL_RESOURCE_ATTRIBUTES` | Extra resource attributes (`host.name` and `process.pid` are set already). |
+
+`OTEL_FILE=off` with no live export turns it all off: each hook is one check of an unset
+`OnceLock`.
+
+Earlier builds exported whenever `OTEL_EXPORTER_OTLP_ENDPOINT` was set; that now also needs
+`TANG_OTEL_LIVE=1` (or `--otel-live`).
 
 The other standard `OTEL_EXPORTER_OTLP_*` variables (per-signal endpoints, timeouts) are read by
 the exporter too. Spans go through a batch processor and metrics through a 10 s periodic
@@ -96,15 +109,62 @@ end-to-end runs bound nothing finer than that; the hook timing is the evidence f
 
 ```bash
 cargo build --release --example bench_batch --no-default-features --features cuda,otel
-OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 target/release/examples/bench_batch <model> --batches 1,4,8
+TANG_OTEL_LIVE=1 OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 target/release/examples/bench_batch <model> --batches 1,4,8
 ```
+
+## The OpenCL runtime and `qwen_session` (the K1)
+
+`tang-bench --features opencl,otel` (pulls `tang-gpu/otel`) writes the same file format
+(service `qwen_chat` / `qwen_decode`, or whatever the embedding process passes to
+`tang_otel::init`; hold its guard so spans flush at exit, or call `tang_otel::flush()`).
+
+```
+qwen.prefill        tang.qwen.prompt_tokens, reused_tokens, new_tokens, chunks, chunk_sizes, ms, tokens_per_second
+├─ qwen.prefill.chunk   chunk_tokens, kctx, pos, host_ms   (host time; the device syncs at the end)
+└─ opencl.run           (sampled, see below)
+qwen.decode.step    tang.qwen.pos, tokens, ms               (every TANG_OTEL_DECODE_SAMPLE-th step, default 1)
+└─ opencl.run
+opencl.build        tang.cl.device, kernels, programs, cache_hits, cache_misses, build_ms_total, wall_ms
+└─ opencl.program.compile   (cache misses only) source_bytes, build_ms
+qwen.tune           tang.tune.key, budget_s, candidates, chosen
+└─ qwen.tune.candidate      kind = decode | prefill, config, ms, gpu_temp_c
+```
+
+`opencl.run` is a program run with every kernel's profiling event kept and waited on:
+`tang.cl.kernels`, `enqueue_ms` (host), `queued_to_complete_ms` (first queued to last end,
+device clock), `device_busy_ms` (sum of kernel start-to-end), `top_kernel` / `top_kernel_ms`.
+One run in `TANG_OTEL_CL_SAMPLE` (default 64; 0 = never) is profiled, because waiting on
+hundreds of events costs a little; `TANG_OTEL_CL_KERNEL_SPANS=1` adds an `opencl.kernel`
+child per kernel (hundreds per step: debugging only).
+
+Metrics: `tang.opencl.program.build_ms` (histogram, `tang.cl.cache` = hit / miss),
+`tang.opencl.program.builds` (counter, same attribute), `tang.opencl.run.device_ms` and
+`tang.opencl.kernel.device_ms` (sampled histograms).
+
+**Parent context.** `Session::set_trace_parent(Some("00-<trace>-<span>-01"))` (or
+`set_trace_ids(trace, span)`) makes every later prefill / decode span, and the OpenCL spans
+under them, children of that span: broca sets it per turn to its turn span. `None` goes back
+to separate traces. Without the feature it returns `false` and does nothing, so callers
+compile either way. `qwen_chat --traceparent TP` exercises it. `Session::open`'s builds run
+before a parent can be set; they nest under whatever OpenTelemetry context is current on the
+calling thread.
+
+### Overhead (OpenCL decode)
+
+`qwen_chat` (Qwen3-0.6B MLX 4-bit, 3 turns, `--gen 128`, `TANG_BACKEND=opencl`) on an M4 Max
+through Apple's OpenCL, 16 interleaved pairs, a default build against `--features
+opencl,otel` writing the file with default sampling: decode tok/s median 131.1 (default) vs
+132.0 (`otel`), best 140.1 vs 141.3. No measurable cost; the machine was heavily loaded
+(load average 150-200) so pairwise spread was wide and nothing finer than ~1% is resolved.
+Rerun on the K1 to confirm on the Adreno.
 
 ## Tests
 
 `cargo test -p tang-llm --features otel --lib otel` runs a request through the worker with
 in-memory span and metric exporters, checking the traceparent continuation, the span tree,
-each phase's attributes and that every metric is exported. The default `cargo test` runs
-without it.
+each phase's attributes and that every metric is exported. `cargo test -p tang-otel` checks
+the file exporter's line format, the remote-parent continuation, and that an endpoint alone
+does not turn on network export. The default `cargo test` runs without either.
 
 ---
 
@@ -192,7 +252,7 @@ Env (router, in `~/.config/zest/zest.env` / the systemd unit): `OTEL_EXPORTER_OT
 
 ### tang-llm (on the node)
 
-Build with `--features cuda,otel`; set `OTEL_EXPORTER_OTLP_ENDPOINT`,
+Build with `--features cuda,otel`; set `TANG_OTEL_LIVE=1`, `OTEL_EXPORTER_OTLP_ENDPOINT`,
 `OTEL_EXPORTER_OTLP_HEADERS` (same secret as the router), `OTEL_SERVICE_NAME=tang-llm`.
 
 ### Backend values

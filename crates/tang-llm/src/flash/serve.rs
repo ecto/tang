@@ -17,6 +17,9 @@
 //!   the drafts. Temperature only (no top-k/top-p); greedy unless the request names one.
 //! - **Tool calls.** Qwen XML (`chat::parse_xml_call`), typed by the request's schemas.
 
+#[path = "serve_batch.rs"]
+mod batch;
+
 use super::engine::{Engine, Opts, Positional, RunningState};
 use super::tokenize::FlashTokenizer;
 use crate::chat::{Chunk, Detok, Parser, Piece, Tags};
@@ -65,6 +68,9 @@ pub struct Settings {
     /// request body (`tools-<hash>.json`), and every body here is prefilled at start, so a
     /// client's first turn after a restart reuses its tools block.
     pub warm_dir: Option<PathBuf>,
+    /// Continuous batching (`serve_batch.rs`): up to this many requests decode together, on an
+    /// engine with sequence slots (qwen3next). 0 or 1: one request at a time.
+    pub batch: usize,
     /// Seed the expert cache from this routing profile. Without one, `routing.bin` in `disk`
     /// (written after every request) seeds it.
     pub profile: Option<PathBuf>,
@@ -115,6 +121,61 @@ pub trait ServeEngine {
     }
     fn last_mtp_ms(&self) -> f64 {
         0.0
+    }
+    /// Sequence slots for batching (`--batch`); 1: none.
+    fn max_slots(&self) -> usize {
+        1
+    }
+    fn slot_tokens(&self, _slot: usize) -> &[u32] {
+        &[]
+    }
+    fn alloc_slot(&mut self) -> Result<usize> {
+        bail!("this engine has no sequence slots")
+    }
+    fn free_slot(&mut self, _slot: usize) {}
+    fn prefill_slot(&mut self, _slot: usize, _ids: &[u32]) -> Result<u32> {
+        bail!("this engine has no sequence slots")
+    }
+    fn decode_batch(&mut self, _rows: &[(usize, u32)]) -> Result<Vec<u32>> {
+        bail!("this engine has no sequence slots")
+    }
+    /// Wide prefill windows for sequence slots: build them (`rows` tokens a window).
+    fn enable_wide_rows(&mut self, _rows: usize) -> Result<()> {
+        bail!("this engine has no wide slot prefill")
+    }
+    /// The wide windows' width (0: none).
+    fn wide_rows(&self) -> usize {
+        0
+    }
+    /// [`prefill_slot`](Self::prefill_slot) through wide windows.
+    fn prefill_slot_wide(&mut self, slot: usize, ids: &[u32]) -> Result<u32> {
+        self.prefill_slot(slot, ids)
+    }
+    /// [`save_running`](Self::save_running) of a sequence slot (0: the single sequence).
+    fn save_running_at(&mut self, slot: usize) -> Result<RunningState> {
+        ensure!(slot == 0, "this engine has no sequence slots");
+        self.save_running()
+    }
+    fn restore_running_at(&mut self, slot: usize, s: &RunningState, prefix: &[u32]) -> Result<()> {
+        ensure!(slot == 0, "this engine has no sequence slots");
+        self.restore_running(s, prefix)
+    }
+    fn save_positional_at(&mut self, slot: usize, from: usize, to: usize) -> Result<Positional> {
+        ensure!(slot == 0, "this engine has no sequence slots");
+        self.save_positional(from, to)
+    }
+    fn restore_positional_at(&mut self, slot: usize, p: &Positional, from: usize) -> Result<()> {
+        ensure!(slot == 0, "this engine has no sequence slots");
+        self.restore_positional(p, from)
+    }
+    /// One verify window for several slots: `(slot, token, drafts)` each; returns each one's
+    /// kept tokens (`Coder::verify_batch`).
+    fn verify_batch(&mut self, _items: &[(usize, u32, Vec<u32>)]) -> Result<Vec<Vec<u32>>> {
+        bail!("this engine has no sequence slots")
+    }
+    /// A slot's latest MTP chain, for its next verify.
+    fn slot_drafts(&self, _slot: usize) -> Vec<u32> {
+        Vec::new()
     }
     /// Verify-window cost by width relative to one token, for pricing suffix drafts.
     fn draft_cost(&self) -> Vec<(usize, f32)> {
@@ -248,6 +309,66 @@ impl ServeEngine for super::coder::Coder {
     }
     fn sampler_begin(&mut self, pos: usize) -> Result<()> {
         super::coder::Coder::sampler_begin(self, pos)
+    }
+    fn max_slots(&self) -> usize {
+        super::coder::MAX_SLOTS
+    }
+    fn slot_tokens(&self, slot: usize) -> &[u32] {
+        super::coder::Coder::slot_tokens(self, slot)
+    }
+    fn alloc_slot(&mut self) -> Result<usize> {
+        super::coder::Coder::alloc_slot(self)
+    }
+    fn free_slot(&mut self, slot: usize) {
+        super::coder::Coder::free_slot(self, slot)
+    }
+    fn prefill_slot(&mut self, slot: usize, ids: &[u32]) -> Result<u32> {
+        super::coder::Coder::prefill_slot(self, slot, ids)
+    }
+    fn decode_batch(&mut self, rows: &[(usize, u32)]) -> Result<Vec<u32>> {
+        super::coder::Coder::decode_batch(self, rows)
+    }
+    fn enable_wide_rows(&mut self, rows: usize) -> Result<()> {
+        super::coder::Coder::enable_wide(self, rows)
+    }
+    fn wide_rows(&self) -> usize {
+        super::coder::Coder::wide_rows(self)
+    }
+    fn prefill_slot_wide(&mut self, slot: usize, ids: &[u32]) -> Result<u32> {
+        super::coder::Coder::prefill_wide(self, slot, ids)
+    }
+    fn save_running_at(&mut self, slot: usize) -> Result<RunningState> {
+        super::coder::Coder::save_running_at(self, slot)
+    }
+    fn restore_running_at(&mut self, slot: usize, s: &RunningState, prefix: &[u32]) -> Result<()> {
+        super::coder::Coder::restore_running_at(self, slot, s, prefix)
+    }
+    fn save_positional_at(&mut self, slot: usize, from: usize, to: usize) -> Result<Positional> {
+        super::coder::Coder::save_positional_at(self, slot, from, to)
+    }
+    fn restore_positional_at(&mut self, slot: usize, p: &Positional, from: usize) -> Result<()> {
+        super::coder::Coder::restore_positional_at(self, slot, p, from)
+    }
+    fn verify_batch(&mut self, items: &[(usize, u32, Vec<u32>)]) -> Result<Vec<Vec<u32>>> {
+        super::coder::Coder::verify_batch(self, items)
+    }
+    fn slot_drafts(&self, slot: usize) -> Vec<u32> {
+        super::coder::Coder::slot_drafts(self, slot)
+            .iter()
+            .map(|x| x.0)
+            .collect()
+    }
+    fn use_mtp(&self) -> bool {
+        self.use_mtp
+    }
+    fn mtp_last(&self) -> &[(u32, f32)] {
+        &self.mtp_last
+    }
+    fn mtp_draft(&mut self, pos0: usize, next: &[u32]) -> Result<()> {
+        super::coder::Coder::mtp_feed(self, pos0, next)
+    }
+    fn last_mtp_ms(&self) -> f64 {
+        self.last_mtp_ms
     }
     fn draft_cost(&self) -> Vec<(usize, f32)> {
         // H200, UD-Q4_K_XL: a T=8 verify window is ~3.3x a T=1 one (each token routes to its
@@ -387,6 +508,11 @@ pub struct FlashServe {
     dcalib: crate::draft::Calibration,
     /// See [`Settings::warm_dir`].
     warm_dir: Option<PathBuf>,
+    /// See [`Settings::batch`] (1: off), and the engine's sequence slots, parked or running.
+    batch: usize,
+    slots: Vec<batch::SlotInfo>,
+    /// Prefill seconds not yet matched by decode time (see `batch_step`).
+    prefill_debt: f64,
     tok: FlashTokenizer,
     /// Keeps request text out of the special tokens (see [`Shield`]).
     shield: Shield,
@@ -471,11 +597,18 @@ impl FlashServe {
             ..Opts::default()
         };
         let mut e: Box<dyn ServeEngine> = if super::coder::is_qwen3next(&s.gguf)? {
-            let mut c =
-                super::coder::Coder::load(&s.gguf, super::coder::CoderOpts { max_ctx: s.ctx })?;
+            let mut c = super::coder::Coder::load(
+                &s.gguf,
+                super::coder::CoderOpts {
+                    max_ctx: s.ctx,
+                    ..Default::default()
+                },
+            )?;
             eprintln!("{}", c.load_report);
             c.use_graphs = true;
-            c.enable_sampler()?;
+            if s.batch <= 1 {
+                c.enable_sampler()?;
+            }
             c.warm()?;
             Box::new(c)
         } else {
@@ -555,6 +688,9 @@ impl FlashServe {
             dglobal: crate::draft::Global::new(1 << 20, None),
             dcalib: crate::draft::Calibration::default(),
             warm_dir: None,
+            batch: 1,
+            slots: Vec::new(),
+            prefill_debt: 0.0,
             e,
             im_start: id("<|im_start|>")?,
             shield: Shield::new(&tok.tok),
@@ -611,6 +747,37 @@ impl FlashServe {
             warm.extend(v);
         }
         me.warm_dir = s.warm_dir.clone();
+        if s.batch > 1 {
+            ensure!(
+                me.e.max_slots() > 1,
+                "--batch needs an engine with sequence slots (qwen3next)"
+            );
+            me.batch = s.batch.min(me.e.max_slots() - 1);
+            eprintln!(
+                "tang-llm: continuous batching: up to {} requests at once (greedy{})",
+                me.batch,
+                if me.e.use_mtp() {
+                    ", MTP drafts"
+                } else {
+                    ", no drafts"
+                }
+            );
+            // Wide prefill windows for the slots (TANG_SERVE_WIDE rows, default 2048; 0: off).
+            let rows: usize = std::env::var("TANG_SERVE_WIDE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2048);
+            if rows > 0 {
+                let t = Instant::now();
+                match me.e.enable_wide_rows(rows) {
+                    Ok(()) => eprintln!(
+                        "tang-llm: wide prefill windows of {rows} rows built in {:.1} s",
+                        t.elapsed().as_secs_f64()
+                    ),
+                    Err(e) => eprintln!("tang-llm: no wide prefill ({e})"),
+                }
+            }
+        }
         for f in &warm {
             let t = Instant::now();
             let body: Value = serde_json::from_str(&std::fs::read_to_string(f)?)
@@ -756,31 +923,41 @@ impl FlashServe {
 
     /// Keep a copy of the running state after `tokens` (the engine's sequence now).
     fn snapshot(&mut self, pinned: bool) -> Result<()> {
+        self.snapshot_at(0, pinned)
+    }
+
+    /// Save sequence slot `slot`'s state (after its tokens) as a reusable prefix state.
+    pub(super) fn snapshot_at(&mut self, slot: usize, pinned: bool) -> Result<()> {
+        let toks: Vec<u32> = if slot == 0 {
+            self.e.tokens().clone()
+        } else {
+            self.e.slot_tokens(slot).to_vec()
+        };
         self.clock += 1;
         let clock = self.clock;
-        if let Some(s) = self.snaps.iter_mut().find(|s| s.tokens == *self.e.tokens()) {
+        if let Some(s) = self.snaps.iter_mut().find(|s| s.tokens == toks) {
             s.used = clock;
             s.at = crate::retention::now();
             s.pinned |= pinned;
             return Ok(());
         }
         let t = Instant::now();
-        let state = self.e.save_running()?;
-        let n = self.e.tokens().len();
+        let state = self.e.save_running_at(slot)?;
+        let n = toks.len();
         // Only the positions past the longest saved state this one extends are copied.
         let base = (0..self.snaps.len())
-            .filter(|&i| self.e.tokens().starts_with(&self.snaps[i].tokens))
+            .filter(|&i| toks.starts_with(&self.snaps[i].tokens))
             .max_by_key(|&i| self.snaps[i].tokens.len());
         let (mut pos, from) = match base {
             Some(i) => (self.snaps[i].pos.clone(), self.snaps[i].tokens.len()),
             None => (Vec::new(), 0),
         };
         if from < n {
-            pos.push(Arc::new(self.e.save_positional(from, n)?));
+            pos.push(Arc::new(self.e.save_positional_at(slot, from, n)?));
         }
-        let tokens = self.e.tokens().clone();
+        let tokens = toks;
         if pinned && self.disk_path(&tokens).is_some_and(|p| !p.exists()) {
-            let full = self.e.save_positional(0, n)?;
+            let full = self.e.save_positional_at(slot, 0, n)?;
             self.save_disk(&tokens, &state, &full);
         }
         self.line.snap_ms += t.elapsed().as_secs_f64() * 1e3;
@@ -1079,34 +1256,8 @@ impl FlashServe {
             }
         }
         self.line.restore_ms = t.elapsed().as_secs_f64() * 1e3;
-        // Where to save states: the end of the system prompt (the second `<|im_start|>`) and
-        // the last turn boundary (the last one, which opens the generation prompt).
-        let starts: Vec<usize> = ids
-            .iter()
-            .enumerate()
-            .filter(|(_, &t)| t == self.im_start)
-            .map(|(i, _)| i)
-            .collect();
-        let mut marks: Vec<(usize, bool)> = Vec::new();
-        // The end of the tools block, which the template puts before the system text (that
-        // has the working directory in it): the same for every session of a client.
-        if let Some(i) = text.find("</IMPORTANT>").filter(|&i| i < 200_000) {
-            if let Ok(head) = self.encode(&text[..i + "</IMPORTANT>".len()]) {
-                if head.len() > 1 && ids.starts_with(&head[..head.len() - 1]) {
-                    // The last token may merge with what follows; stop one short.
-                    marks.push((head.len() - 1, true));
-                }
-            }
-        }
-        if let Some(&p) = starts.get(1) {
-            marks.push((p, true));
-        }
-        if let Some(&p) = starts.last() {
-            marks.push((p, false));
-        }
-        marks.sort_by_key(|m| m.0);
-        marks.retain(|&(p, _)| p > start && p < ids.len());
-        marks.dedup_by_key(|m| m.0);
+        let mut marks = self.marks(ids, text);
+        marks.retain(|&(p, _)| p > start);
         // The MTP only over the prompt's last positions (`TANG_FLASH_MTP_PREFILL`, default 512).
         let mtp_from = ids.len().saturating_sub(
             std::env::var("TANG_FLASH_MTP_PREFILL")
@@ -1501,6 +1652,40 @@ impl FlashServe {
 }
 
 impl FlashServe {
+    /// Where to save prefix states in prompt `ids` (rendered from `text`), in order, with
+    /// whether to pin each: the end of the tools block, the end of the system prompt (the second
+    /// `<|im_start|>`) and the last turn boundary (the last one, which opens the generation
+    /// prompt).
+    pub(super) fn marks(&self, ids: &[u32], text: &str) -> Vec<(usize, bool)> {
+        let starts: Vec<usize> = ids
+            .iter()
+            .enumerate()
+            .filter(|(_, &t)| t == self.im_start)
+            .map(|(i, _)| i)
+            .collect();
+        let mut marks: Vec<(usize, bool)> = Vec::new();
+        // The end of the tools block, which the template puts before the system text (that
+        // has the working directory in it): the same for every session of a client.
+        if let Some(i) = text.find("</IMPORTANT>").filter(|&i| i < 200_000) {
+            if let Ok(head) = self.encode(&text[..i + "</IMPORTANT>".len()]) {
+                if head.len() > 1 && ids.starts_with(&head[..head.len() - 1]) {
+                    // The last token may merge with what follows; stop one short.
+                    marks.push((head.len() - 1, true));
+                }
+            }
+        }
+        if let Some(&p) = starts.get(1) {
+            marks.push((p, true));
+        }
+        if let Some(&p) = starts.last() {
+            marks.push((p, false));
+        }
+        marks.sort_by_key(|m| m.0);
+        marks.retain(|&(p, _)| p > 0 && p < ids.len());
+        marks.dedup_by_key(|m| m.0);
+        marks
+    }
+
     /// Record `req`'s tools block for the learned pre-warm (see [`Settings::warm_dir`]): a
     /// body with just its tools and a placeholder turn, once per distinct tool set.
     fn record_warm(&self, req: &Request) {
@@ -1565,6 +1750,34 @@ impl Backend for FlashServe {
 
     fn context_window(&self) -> usize {
         self.ctx
+    }
+
+    fn max_batch(&self) -> usize {
+        self.batch
+    }
+
+    fn can_admit(&self, key: Option<&str>) -> bool {
+        self.batch > 1 && self.batch_can_admit(key)
+    }
+
+    fn admit(
+        &mut self,
+        req: &Request,
+        _prompt: Option<(String, Vec<u32>)>,
+    ) -> Result<crate::server::Inflight> {
+        self.batch_admit(req)
+    }
+
+    fn step(&mut self, lanes: &mut [crate::server::DynLane<'_>]) -> Result<()> {
+        self.batch_step(lanes)
+    }
+
+    fn retire(&mut self, s: crate::server::Inflight) -> Result<Outcome> {
+        self.batch_retire(s)
+    }
+
+    fn stream_state(&self, s: &crate::server::Inflight) -> (bool, bool) {
+        FlashServe::batch_state(s)
     }
 
     fn expire(&mut self) {
@@ -2145,6 +2358,7 @@ pub fn serve_replay(args: &[String]) -> Result<()> {
         warm: Vec::new(),
         suffix: false,
         warm_dir: None,
+        batch: 0,
         profile,
     };
     let mut me = FlashServe::load(&s)?;

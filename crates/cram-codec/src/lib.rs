@@ -54,6 +54,8 @@ pub mod abac;
 pub mod bitio;
 pub mod codec;
 pub mod coefcode;
+#[cfg(all(feature = "container", not(target_arch = "wasm32")))]
+pub mod container;
 #[cfg(feature = "gpu")]
 pub mod gpudec;
 pub mod gpuwav;

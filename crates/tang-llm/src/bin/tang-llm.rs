@@ -385,6 +385,7 @@ fn main() -> Result<()> {
         "flash-spec-test" => return tang_llm::flash::cli::spec_test(&args[1..]),
         "flash-tcheck" => return tang_llm::flash::cli::tcheck(&args[1..]),
         "flash-batch-check" => return tang_llm::flash::cli::batch_check(&args[1..]),
+        "flash-wide-check" => return tang_llm::flash::cli::wide_check(&args[1..]),
         "flash-aa" => return tang_llm::flash::cli::aa(&args[1..]),
         "flash-resume-test" => return tang_llm::flash::serve::resume_test(&args[1..]),
         "flash-sampler-test" => return tang_llm::flash::serve::sampler_test(&args[1..]),
@@ -527,7 +528,7 @@ fn run<D: ComputeDevice>(
 }
 
 /// `tang-llm serve <first shard.gguf> [--mtp M] [--host H] [--port P] [--ctx N] [--api-key-file F]
-/// [--temp T] [--snapshots N] [--dump-ids DIR] [--no-suffix] [--warm-dir DIR]`: the Flash engine (`flash::serve`):
+/// [--temp T] [--snapshots N] [--dump-ids DIR] [--no-suffix] [--warm-dir DIR] [--batch N]`: the Flash engine (`flash::serve`):
 /// Flash-Next, or qwen3next (Qwen3-Coder-Next) by the GGUF's architecture. Without MTP, suffix
 /// drafts are on unless `--no-suffix`.
 #[cfg(feature = "cuda")]
@@ -546,6 +547,7 @@ fn serve_flash(args: &[String]) -> Result<()> {
         profile: None,
         suffix: true,
         warm_dir: None,
+        batch: 0,
         snapshot_bytes: std::env::var("TANG_FLASH_SNAP_GB")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
@@ -559,6 +561,8 @@ fn serve_flash(args: &[String]) -> Result<()> {
         let mut val = || it.next().with_context(|| format!("{a} needs a value"));
         match a.as_str() {
             "--host" => host = val()?.clone(),
+            // live OTLP/HTTP export (otel builds); the default is the local file only
+            "--otel-live" => std::env::set_var("TANG_OTEL_LIVE", "1"),
             "--port" => port = val()?.parse()?,
             "--ctx" => s.ctx = val()?.parse()?,
             "--mtp" => s.mtp = Some(PathBuf::from(val()?)),
@@ -576,6 +580,7 @@ fn serve_flash(args: &[String]) -> Result<()> {
             "--dump-ids" => s.dump = Some(PathBuf::from(val()?)),
             "--no-suffix" => s.suffix = false,
             "--warm-dir" => s.warm_dir = Some(PathBuf::from(val()?)),
+            "--batch" => s.batch = val()?.parse()?,
             "--api-key-file" => {
                 let path = val()?;
                 key =
@@ -635,7 +640,7 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
     }
     let spec = args
         .first()
-        .context("usage: tang-llm serve <model> [--host H] [--port P] [--ctx N] [--api-key-file F] [--f32 | --q4] [--no-speculate] [--draft-model M] [--kv-slots N|auto] [--kv-ttl SECS]")?
+        .context("usage: tang-llm serve <model> [--host H] [--port P] [--ctx N] [--api-key-file F] [--f32 | --q4] [--no-speculate] [--draft-model M] [--kv-slots N|auto] [--kv-ttl SECS] [--otel-live]")?
         .clone();
     let (mut port, mut ctx, mut dtype) = (8911u16, 32_768usize, Dtype::Bf16);
     let mut host = "127.0.0.1".to_string();
@@ -656,6 +661,8 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--host" => host = it.next().context("--host H")?.clone(),
+            // live OTLP/HTTP export (otel builds); the default is the local file only
+            "--otel-live" => std::env::set_var("TANG_OTEL_LIVE", "1"),
             "--port" => port = it.next().context("--port P")?.parse()?,
             "--ctx" => ctx = it.next().context("--ctx N")?.parse()?,
             "--image-pipeline" => {

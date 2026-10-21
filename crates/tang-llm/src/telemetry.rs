@@ -1,11 +1,13 @@
 //! Optional OpenTelemetry tracing and metrics (see `docs/observability.md`).
 //!
-//! With the `otel` feature and `OTEL_EXPORTER_OTLP_ENDPOINT` set, each chat request becomes
+//! With the `otel` feature, each chat request becomes
 //! a server span (continuing an incoming W3C `traceparent`) with `queued`, `prefill`,
 //! `decode` and `finish` children, and every batched step feeds a few metrics. Spans are
 //! built when the request concludes, from timestamps it carried, so nothing runs per token.
-//! Without the feature every type here is zero-sized and every call is empty; with it and
-//! no endpoint, each call is one check of an unset `OnceLock`.
+//! Export goes through `crates/tang-otel`: OTLP/JSON lines to a file by default, the
+//! network only with `TANG_OTEL_LIVE=1`. Without the feature every type here is
+//! zero-sized and every call is empty; with it and `OTEL_FILE=off`, each call is one
+//! check of an unset `OnceLock`.
 
 use crate::engine::{StepStats, Usage};
 use axum::http::HeaderMap;
@@ -75,10 +77,9 @@ mod imp {
         Span as _, SpanKind, Status, TraceContextExt, Tracer as _, TracerProvider as _,
     };
     use opentelemetry::{Context, KeyValue};
-    use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
+    use opentelemetry_sdk::metrics::SdkMeterProvider;
     use opentelemetry_sdk::propagation::TraceContextPropagator;
     use opentelemetry_sdk::trace::{SdkTracer, SdkTracerProvider};
-    use opentelemetry_sdk::Resource;
     use std::sync::OnceLock;
     use std::time::{Duration, SystemTime};
 
@@ -96,67 +97,18 @@ mod imp {
 
     static INST: OnceLock<Inst> = OnceLock::new();
 
-    /// The providers, flushed and shut down on drop.
-    pub struct Guard {
-        traces: SdkTracerProvider,
-        metrics: SdkMeterProvider,
-    }
+    /// The exporters (crates/tang-otel), flushed and shut down on drop.
+    pub struct Guard(#[allow(dead_code)] tang_otel::Guard);
 
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            let _ = self.traces.shutdown();
-            let _ = self.metrics.shutdown();
-        }
-    }
-
-    /// Exports over OTLP/HTTP (protobuf) when `OTEL_EXPORTER_OTLP_ENDPOINT` is set; reads
-    /// `OTEL_EXPORTER_OTLP_HEADERS` and `OTEL_SERVICE_NAME` (default `tang-llm`). Call off
-    /// any async runtime (the exporter's blocking HTTP client builds its own).
+    /// Starts telemetry through `tang-otel`: OTLP/JSON lines to `OTEL_FILE`
+    /// (default `~/.cache/tang/otel/tang-llm.otel.jsonl`; `OTEL_FILE=off` for none),
+    /// and over OTLP/HTTP to `OTEL_EXPORTER_OTLP_ENDPOINT` only with
+    /// `TANG_OTEL_LIVE=1` (`serve --otel-live`). Call off any async runtime.
     pub fn init() -> Option<Guard> {
-        let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").unwrap_or_default();
-        if endpoint.trim().is_empty() {
-            return None;
-        }
-        let built = (|| -> anyhow::Result<Guard> {
-            use opentelemetry_otlp::{MetricExporter, Protocol, SpanExporter, WithExportConfig};
-            let spans = SpanExporter::builder()
-                .with_http()
-                .with_protocol(Protocol::HttpBinary)
-                .build()?;
-            let metrics = MetricExporter::builder()
-                .with_http()
-                .with_protocol(Protocol::HttpBinary)
-                .build()?;
-            let mut resource = Resource::builder();
-            if std::env::var("OTEL_SERVICE_NAME").map_or(true, |s| s.is_empty()) {
-                resource = resource.with_service_name("tang-llm");
-            }
-            let resource = resource.build();
-            let traces = SdkTracerProvider::builder()
-                .with_batch_exporter(spans)
-                .with_resource(resource.clone())
-                .build();
-            let metrics = SdkMeterProvider::builder()
-                .with_reader(
-                    PeriodicReader::builder(metrics)
-                        .with_interval(Duration::from_secs(10))
-                        .build(),
-                )
-                .with_resource(resource)
-                .build();
-            Ok(Guard { traces, metrics })
-        })();
-        match built {
-            Ok(g) => {
-                install(&g.traces, &g.metrics);
-                eprintln!("tang-llm: exporting OpenTelemetry traces and metrics to {endpoint}");
-                Some(g)
-            }
-            Err(e) => {
-                eprintln!("tang-llm: OpenTelemetry off: {e:#}");
-                None
-            }
-        }
+        let g = tang_otel::init("tang-llm")?;
+        let (traces, metrics) = tang_otel::providers()?;
+        install(traces, metrics);
+        Some(Guard(g))
     }
 
     /// Record to these providers from now on (once per process; later calls are ignored).

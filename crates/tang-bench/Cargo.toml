@@ -55,6 +55,9 @@ cuda = ["tang-gpu/cuda"]
 glsl = ["tang-gpu/glsl"]
 # OpenCL decode kernels (`to_opencl_decode`) on tang-gpu's OpenCL runtime: TANG_BACKEND=opencl
 opencl = ["tang-gpu/opencl"]
+# OpenTelemetry (crates/tang-otel): qwen_session prefill/decode spans, tuner runs, and
+# tang-gpu's OpenCL builds and sampled kernel times. OTLP/JSON lines to a file by default.
+otel = ["dep:tang-otel", "tang-gpu/otel"]
 # Reassociable float ops in hot reductions. Requires Rust 1.98+.
 threads = ["tang-la/threads", "tang-tensor/threads", "tang-train/threads", "tang-infer/threads"]
 algebraic = [
@@ -83,6 +86,7 @@ metal       = { version = "0.33", optional = true }
 memmap2 = "0.9"
 serde_json = "1"
 tokenizers = { workspace = true }
+tang-otel = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
