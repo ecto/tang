@@ -58,6 +58,9 @@ pub mod coefcode;
 pub mod gpudec;
 pub mod gpuwav;
 pub mod gpuwav3;
+pub mod img;
+#[cfg(feature = "gpu")]
+pub mod imggpu;
 pub mod interp;
 pub mod irdec;
 pub mod kvcodec;
