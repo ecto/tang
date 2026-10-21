@@ -28,6 +28,9 @@ jobs:
     env:
       TAG: ${{ github.event.inputs.tag || github.ref_name }}
       ASSET: tang-llm-aarch64-apple-darwin.tar.gz
+      # Signing runs only once the Developer ID secrets exist; until then the release is unsigned
+      # (ad-hoc signed by the linker, as every arm64 binary is).
+      SIGN: ${{ secrets.MACOS_CERT_P12 != '' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -40,6 +43,7 @@ jobs:
           mkdir -p dist && cp target/aarch64-apple-darwin/release/tang-llm dist/
 
       - name: Import signing certificate
+        if: env.SIGN == 'true'
         env:
           MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
           MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
@@ -55,6 +59,7 @@ jobs:
           rm "$RUNNER_TEMP/cert.p12"
 
       - name: Sign
+        if: env.SIGN == 'true'
         env:
           MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
         run: |
@@ -62,6 +67,7 @@ jobs:
           codesign --verify --strict --verbose=2 dist/tang-llm
 
       - name: Notarize
+        if: env.SIGN == 'true'
         env:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}

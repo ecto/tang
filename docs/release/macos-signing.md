@@ -27,3 +27,13 @@ The same certificate and API key can sign other repos (for example vcad); add th
 or as organization secrets on ecto to share them.
 
 To release: push a `v*` tag, or run "mac release" by hand with an existing tag.
+
+## Until the certificate exists
+
+Without the secrets, the workflow skips signing and notarization and ships the binary unsigned
+(ad-hoc signed). Programs that download it with curl or URLSession get no quarantine flag, so it
+just runs. A copy downloaded in a browser is quarantined; clear it once with:
+
+    xattr -d com.apple.quarantine ./tang-llm
+
+or run it once, then System Settings → Privacy & Security → "Open Anyway".
