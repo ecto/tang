@@ -1,0 +1,23 @@
+window 3009.4 ms, kernels 157477, DtoH copies 362 (steps), HtoD 724, other memcpy 0, memsets 0
+per step: 8.313 ms, kernels/step 435.0, GPU busy 86.3% (7.174 ms/step), idle 1.139 ms/step
+DtoH bytes/copy avg 607744, DtoH time/step 14.1 us; HtoD/step 2.0 copies 1.6 us
+
+kernel families (per step): count, us, share of busy, avg us
+  gemv_q4_xs4_m1                                                145.0   4760.0us  66.3%   32.83
+  attn_partial                                                   36.0   1386.7us  19.3%   38.52
+  rms_norm                                                       73.0    732.2us  10.2%   10.03
+  attention_prep                                                 36.0     91.6us   1.3%    2.54
+  add_f32                                                        72.0     78.8us   1.1%    1.09
+  attn_combine                                                   36.0     68.8us   1.0%    1.91
+  swiglu_split                                                   36.0     54.4us   0.8%    1.51
+  embedding_q4                                                    1.0      1.6us   0.0%    1.59
+
+gaps: n=157476 median 1.12us p90 2.08us; gaps>20us: 1.3/step totalling 0.536 ms/step; small gaps total 0.603 ms/step
+
+CUDA API (per step): count, us
+  cuMemcpyDtoHAsync_v2                                   1.0   3119.4us
+  cuMemGetInfo_v2                                      435.2   2597.0us
+  cuLaunchKernel                                       435.2   1719.5us
+  cuMemcpyHtoDAsync_v2                                   2.0      9.1us
+  cuMemFreeAsync                                         2.0      2.1us
+  cuMemAllocAsync                                        2.0      1.9us

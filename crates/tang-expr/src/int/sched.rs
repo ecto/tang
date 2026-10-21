@@ -9,7 +9,11 @@ pub(crate) enum Item {
     Node(IId),
     /// Run loop `l`: `pre` computes what the condition needs, then the
     /// condition is checked, then `post` and the state update.
-    Loop { l: u32, pre: Vec<Item>, post: Vec<Item> },
+    Loop {
+        l: u32,
+        pre: Vec<Item>,
+        post: Vec<Item>,
+    },
 }
 
 pub(crate) struct Sched {
@@ -26,12 +30,25 @@ impl IntGraph {
                 f(b);
             }
             INode::Un(_, a) | INode::Bitcast(_, a) | INode::Load(_, a) => f(a),
+            INode::LoadRw(_, i, t) => {
+                f(i);
+                f(t);
+            }
+            INode::Store(_, i, v, t) => {
+                f(i);
+                f(v);
+                f(t);
+            }
             INode::Select(c, a, b) => {
                 f(c);
                 f(a);
                 f(b);
             }
-            INode::Const(..) | INode::Param(..) | INode::State(..) | INode::LoopOut(..) => {}
+            INode::Const(..)
+            | INode::Param(..)
+            | INode::State(..)
+            | INode::LoopOut(..)
+            | INode::Tok => {}
         }
     }
 
@@ -42,13 +59,21 @@ impl IntGraph {
         let mut uses = vec![0u32; n];
         let mut user_scope: Vec<Option<Option<u32>>> = vec![None; n];
         let mut stack: Vec<IId> = Vec::new();
-        let use_at = |x: IId, s: Option<u32>, uses: &mut Vec<u32>, us: &mut Vec<Option<Option<u32>>>, st: &mut Vec<IId>| {
+        let use_at = |x: IId,
+                      s: Option<u32>,
+                      uses: &mut Vec<u32>,
+                      us: &mut Vec<Option<Option<u32>>>,
+                      st: &mut Vec<IId>| {
             uses[x.index()] += 1;
             us[x.index()] = Some(s);
             st.push(x);
         };
         for &o in outputs {
-            assert_eq!(self.scope[o.index()], None, "int graph: output inside a loop");
+            assert_eq!(
+                self.scope[o.index()],
+                None,
+                "int graph: output inside a loop"
+            );
             use_at(o, None, &mut uses, &mut user_scope, &mut stack);
         }
         while let Some(x) = stack.pop() {
@@ -77,12 +102,31 @@ impl IntGraph {
                 }
             }
         }
-        let inline = (0..n)
+        let mut inline: Vec<bool> = (0..n)
             .map(|i| {
-                let leaf = matches!(self.nodes[i], INode::State(..) | INode::LoopOut(..));
+                // effects stay at their place in the schedule
+                let leaf = matches!(
+                    self.nodes[i],
+                    INode::State(..) | INode::LoopOut(..) | INode::LoadRw(..) | INode::Store(..)
+                );
                 live[i] && !leaf && uses[i] == 1 && user_scope[i] == Some(self.scope[i])
             })
             .collect();
+        // bound the nesting of inlined expressions (lowerings recurse on it)
+        let mut depth = vec![0u32; n];
+        for i in 0..n {
+            let mut d = 0;
+            self.operands(self.nodes[i], |a| {
+                if inline[a.index()] {
+                    d = d.max(depth[a.index()]);
+                }
+            });
+            depth[i] = d + 1;
+            if depth[i] >= 32 {
+                inline[i] = false;
+                depth[i] = 0;
+            }
+        }
         let mut done = vec![false; self.loops.len()];
         let items = self.scope_items(None, &live, None, &mut done);
         Sched { items, inline }
@@ -90,7 +134,13 @@ impl IntGraph {
 
     /// Items of `scope` in id order (a loop goes right before its first
     /// `LoopOut`), restricted to `only` when given.
-    fn scope_items(&self, scope: Option<u32>, live: &[bool], only: Option<&[bool]>, done: &mut Vec<bool>) -> Vec<Item> {
+    fn scope_items(
+        &self,
+        scope: Option<u32>,
+        live: &[bool],
+        only: Option<&[bool]>,
+        done: &mut Vec<bool>,
+    ) -> Vec<Item> {
         let mut items = Vec::new();
         for i in 0..self.nodes.len() {
             if !live[i] || self.scope[i] != scope || only.is_some_and(|m| !m[i]) {

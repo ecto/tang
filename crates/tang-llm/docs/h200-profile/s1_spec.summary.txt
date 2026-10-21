@@ -1,0 +1,28 @@
+window 2608.6 ms, kernels 130962, DtoH copies 301 (steps), HtoD 602, other memcpy 0, memsets 0
+per step: 8.666 ms, kernels/step 435.1, GPU busy 85.9% (7.447 ms/step), idle 1.219 ms/step
+DtoH bytes/copy avg 722832, DtoH time/step 19.0 us; HtoD/step 2.0 copies 1.7 us
+
+kernel families (per step): count, us, share of busy, avg us
+  gemv_q4_xs4_m1                                                121.9   4002.8us  53.7%   32.83
+  gemv_q4_xs4_m2                                                 22.2   1142.0us  15.3%   51.54
+  attn_partial                                                   30.3   1133.2us  15.2%   37.44
+  rms_norm                                                       73.0    732.8us   9.8%   10.04
+  attention_prep                                                 36.0     92.1us   1.2%    2.56
+  add_f32                                                        72.0     79.5us   1.1%    1.10
+  attn_multi_r8                                                   5.5     76.8us   1.0%   13.96
+  attn_combine                                                   36.0     72.5us   1.0%    2.01
+  swiglu_split                                                   36.0     54.5us   0.7%    1.51
+  gemv_q4_xs4_m7                                                  0.5     28.4us   0.4%   58.85
+  gemv_q4_xs4_m6                                                  0.5     26.5us   0.4%   54.96
+  attn_multi_r32                                                  0.2      4.7us   0.1%   19.53
+  embedding_q4                                                    1.0      1.7us   0.0%    1.67
+
+gaps: n=130961 median 1.12us p90 2.14us; gaps>20us: 1.2/step totalling 0.614 ms/step; small gaps total 0.605 ms/step
+
+CUDA API (per step): count, us
+  cuMemcpyDtoHAsync_v2                                   1.0   3693.5us
+  cuMemGetInfo_v2                                      435.3   2658.5us
+  cuLaunchKernel                                       435.3   1344.4us
+  cuMemcpyHtoDAsync_v2                                   2.0      7.6us
+  cuMemAllocAsync                                        2.1      3.3us
+  cuMemFreeAsync                                         2.0      2.1us

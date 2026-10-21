@@ -4,7 +4,7 @@
 //! float ops are untouched, and nothing here is ever reassociated, contracted
 //! or simplified beyond folding constant-only nodes with the interpreter's own
 //! semantics. The contract is bit-exactness: [`IntGraph::eval`] (the CPU
-//! reference), the generated WGSL ([`IntGraph::to_wgsl`]) and the generated
+//! reference), the generated WGSL ([`IntGraph::to_wgsl_fn`]) and the generated
 //! Rust ([`IntGraph::to_rust`]) compute the same bits.
 //!
 //! - Types: `i32`, `u32`, `bool`; `i8`/`u8` exist only as storage
@@ -18,15 +18,27 @@
 //!   Results are [`INode::LoopOut`] nodes. Loops nest; every node belongs to
 //!   the innermost loop whose state it depends on, so invariant code is
 //!   hoisted by construction.
-//! - The graph is pure: buffers are read-only ([`IntGraph::load`]); results
-//!   leave through the caller's bindings of the outputs.
+//! - Buffers are read-only ([`IntGraph::load`]), except scratch buffers
+//!   ([`IntGraph::buffer_rw`]): small fixed-length arrays read and written
+//!   through ordered effects. An effect token ([`IntGraph::token`]) is
+//!   threaded from store to store ([`IntGraph::store`] returns the next
+//!   token); a scratch load ([`IntGraph::load_rw`]) depends on a token. The
+//!   tokens only order the effects through data dependencies: every backend
+//!   executes scratch loads and stores in the one shared schedule order
+//!   (never inlined, never moved), so effects are deterministic and
+//!   identical across backends whatever the graph. A builder that wants
+//!   "load sees the state as of its token" makes every load of a token feed
+//!   the store that consumes it. Everything else is pure. Results leave
+//!   through the caller's bindings of the outputs.
 
 mod emit;
 mod eval;
 mod sched;
+mod wire;
 
 pub use emit::WGSL_PRELUDE;
 pub use eval::Program;
+pub use wire::{Limits, WireError};
 
 use std::collections::HashMap;
 
@@ -100,6 +112,12 @@ pub enum BinOp {
     Min,
     /// Maximum.
     Max,
+    /// Division, WGSL semantics: `x / 0 = x`, `i32::MIN / −1 = i32::MIN`;
+    /// signed division truncates.
+    Div,
+    /// Remainder, WGSL semantics: `x % 0 = 0`, `i32::MIN % −1 = 0`; the sign
+    /// follows the dividend.
+    Rem,
 }
 
 /// Comparisons (produce `bool`).
@@ -122,6 +140,8 @@ pub enum UnOp {
     Neg,
     /// Bitwise not (logical not on `bool`).
     Not,
+    /// Count of leading zero bits (32 for 0).
+    Clz,
 }
 
 /// A node.
@@ -147,6 +167,13 @@ pub enum INode {
     State(u32, u16),
     /// Final state `k` of loop `l`, after it.
     LoopOut(u32, u16),
+    /// The initial effect token (`u32`, value 0).
+    Tok,
+    /// `buf[index]` from a scratch buffer, as of effect token `tok`.
+    LoadRw(u16, IId, IId),
+    /// `buf[index] = value` on a scratch buffer after effect token `tok`;
+    /// yields the next token.
+    Store(u16, IId, IId, IId),
 }
 
 /// A structured while loop: `s = init; while cond(s) { s = next(s) }`.
@@ -160,15 +187,22 @@ pub struct Loop {
     pub next: Vec<IId>,
     /// Enclosing loop, if nested.
     pub parent: Option<u32>,
+    /// Trip cap: when set, the loop also exits after this many iterations
+    /// (every backend counts the same way). Untrusted graphs always carry one.
+    pub cap: Option<u32>,
 }
 
-/// A read-only buffer declaration.
+/// A buffer declaration.
 #[derive(Clone, Debug)]
 pub struct Buffer {
     /// Name used by the lowerings.
     pub name: String,
     /// Element type.
     pub elem: Elem,
+    /// Scratch buffer: `(length, base)`. Element `i < length` lives at
+    /// `name[base + i]` in WGSL (`base` is a host expression); out-of-range
+    /// loads read 0 and out-of-range stores are dropped.
+    pub rw: Option<(u32, String)>,
 }
 
 /// Integer expression graph with structural interning.
@@ -231,15 +265,26 @@ impl IntGraph {
 
     /// Innermost of two scopes, which must lie on one chain of nested loops.
     fn inner(&self, a: Option<u32>, b: Option<u32>) -> Option<u32> {
+        self.try_inner(a, b)
+            .expect("int graph: node mixes states of unrelated loops")
+    }
+
+    fn try_inner(&self, a: Option<u32>, b: Option<u32>) -> Result<Option<u32>, &'static str> {
         let (da, db) = (self.depth(a), self.depth(b));
-        let (deep, shallow, mut d, ds) = if da >= db { (a, b, da, db) } else { (b, a, db, da) };
+        let (deep, shallow, mut d, ds) = if da >= db {
+            (a, b, da, db)
+        } else {
+            (b, a, db, da)
+        };
         let mut x = deep;
         while d > ds {
             x = self.loops[x.unwrap() as usize].parent;
             d -= 1;
         }
-        assert_eq!(x, shallow, "int graph: node mixes states of unrelated loops");
-        deep
+        if x != shallow {
+            return Err("node mixes states of unrelated loops");
+        }
+        Ok(deep)
     }
 
     fn insert(&mut self, n: INode) -> IId {
@@ -259,47 +304,92 @@ impl IntGraph {
     }
 
     fn infer(&self, n: INode) -> (IType, Option<u32>) {
+        self.try_infer(n)
+            .unwrap_or_else(|e| panic!("int graph: {e}"))
+    }
+
+    fn try_infer(&self, n: INode) -> Result<(IType, Option<u32>), &'static str> {
         let sc = |a: IId| self.scope[a.index()];
-        match n {
+        let ok = |c: bool, e: &'static str| if c { Ok(()) } else { Err(e) };
+        Ok(match n {
             INode::Const(t, _) => (t, None),
             INode::Param(_, t) => (t, None),
             INode::Bin(op, a, b) => {
                 let (ta, tb) = (self.ty(a), self.ty(b));
                 match op {
-                    BinOp::Shl | BinOp::Shr => assert!(ta != IType::Bool && tb != IType::Bool, "shift of bool"),
-                    BinOp::And | BinOp::Or | BinOp::Xor => assert_eq!(ta, tb, "{op:?} type mismatch"),
+                    BinOp::Shl | BinOp::Shr => {
+                        ok(ta != IType::Bool && tb != IType::Bool, "shift of bool")?
+                    }
+                    BinOp::And | BinOp::Or | BinOp::Xor => {
+                        ok(ta == tb, "bitwise op type mismatch")?
+                    }
                     _ => {
-                        assert_eq!(ta, tb, "{op:?} type mismatch");
-                        assert!(ta != IType::Bool, "{op:?} on bool");
+                        ok(ta == tb, "arithmetic type mismatch")?;
+                        ok(ta != IType::Bool, "arithmetic on bool")?;
                     }
                 }
-                (ta, self.inner(sc(a), sc(b)))
+                (ta, self.try_inner(sc(a), sc(b))?)
             }
             INode::Un(op, a) => {
-                assert!(op == UnOp::Not || self.ty(a) != IType::Bool, "negation of bool");
+                ok(
+                    op == UnOp::Not || self.ty(a) != IType::Bool,
+                    "integer op on bool",
+                )?;
                 (self.ty(a), sc(a))
             }
             INode::Cmp(_, a, b) => {
-                assert_eq!(self.ty(a), self.ty(b), "compare type mismatch");
-                (IType::Bool, self.inner(sc(a), sc(b)))
+                ok(self.ty(a) == self.ty(b), "compare type mismatch")?;
+                (IType::Bool, self.try_inner(sc(a), sc(b))?)
             }
             INode::Select(c, a, b) => {
-                assert_eq!(self.ty(c), IType::Bool, "select condition must be bool");
-                assert_eq!(self.ty(a), self.ty(b), "select type mismatch");
-                let s = self.inner(sc(a), sc(b));
-                (self.ty(a), self.inner(s, sc(c)))
+                ok(self.ty(c) == IType::Bool, "select condition must be bool")?;
+                ok(self.ty(a) == self.ty(b), "select type mismatch")?;
+                let s = self.try_inner(sc(a), sc(b))?;
+                (self.ty(a), self.try_inner(s, sc(c))?)
             }
             INode::Bitcast(t, a) => {
-                assert!(t != IType::Bool && self.ty(a) != IType::Bool, "bitcast of bool");
+                ok(
+                    t != IType::Bool && self.ty(a) != IType::Bool,
+                    "bitcast of bool",
+                )?;
                 (t, sc(a))
             }
             INode::Load(b, i) => {
-                assert_eq!(self.ty(i), IType::U32, "load index must be u32");
-                (self.bufs[b as usize].elem.ty(), sc(i))
+                ok(self.ty(i) == IType::U32, "load index must be u32")?;
+                let buf = self.bufs.get(b as usize).ok_or("buffer")?;
+                ok(buf.rw.is_none(), "plain load from a scratch buffer")?;
+                (buf.elem.ty(), sc(i))
+            }
+            INode::Tok => (IType::U32, None),
+            INode::LoadRw(b, i, t) => {
+                let buf = self.bufs.get(b as usize).ok_or("buffer")?;
+                ok(buf.rw.is_some(), "scratch load from a read-only buffer")?;
+                ok(
+                    self.ty(i) == IType::U32 && self.ty(t) == IType::U32,
+                    "scratch load index and token must be u32",
+                )?;
+                let s = self.try_inner(sc(i), sc(t))?;
+                ok(s == sc(t), "scratch load outside its token's scope")?;
+                (buf.elem.ty(), s)
+            }
+            INode::Store(b, i, v, t) => {
+                let buf = self.bufs.get(b as usize).ok_or("buffer")?;
+                ok(buf.rw.is_some(), "store to a read-only buffer")?;
+                ok(
+                    self.ty(i) == IType::U32 && self.ty(t) == IType::U32,
+                    "store index and token must be u32",
+                )?;
+                ok(self.ty(v) == buf.elem.ty(), "store value type")?;
+                let s = self.try_inner(self.try_inner(sc(i), sc(v))?, sc(t))?;
+                ok(s == sc(t), "store outside its token's scope")?;
+                (IType::U32, s)
             }
             INode::State(l, k) => (self.ty(self.loops[l as usize].init[k as usize]), Some(l)),
-            INode::LoopOut(l, k) => (self.ty(self.loops[l as usize].init[k as usize]), self.loops[l as usize].parent),
-        }
+            INode::LoopOut(l, k) => (
+                self.ty(self.loops[l as usize].init[k as usize]),
+                self.loops[l as usize].parent,
+            ),
+        })
     }
 
     /// Fold nodes whose operands are all constants (same semantics as eval).
@@ -349,8 +439,42 @@ impl IntGraph {
 
     /// Declare a read-only buffer; returns its index for [`load`](Self::load).
     pub fn buffer(&mut self, name: &str, elem: Elem) -> u16 {
-        self.bufs.push(Buffer { name: name.into(), elem });
+        self.bufs.push(Buffer {
+            name: name.into(),
+            elem,
+            rw: None,
+        });
         (self.bufs.len() - 1) as u16
+    }
+
+    /// Declare a scratch buffer of `len` 32-bit elements (`elem` is `I32` or
+    /// `U32`), at `name[base + i]` in WGSL.
+    pub fn buffer_rw(&mut self, name: &str, elem: Elem, len: u32, base: &str) -> u16 {
+        assert!(
+            matches!(elem, Elem::I32 | Elem::U32),
+            "scratch buffers hold 32-bit elements"
+        );
+        self.bufs.push(Buffer {
+            name: name.into(),
+            elem,
+            rw: Some((len, base.into())),
+        });
+        (self.bufs.len() - 1) as u16
+    }
+
+    /// The initial effect token.
+    pub fn token(&mut self) -> IId {
+        self.insert(INode::Tok)
+    }
+
+    /// `buf[index]` of a scratch buffer as of effect token `tok`.
+    pub fn load_rw(&mut self, buf: u16, index: IId, tok: IId) -> IId {
+        self.insert(INode::LoadRw(buf, index, tok))
+    }
+
+    /// `buf[index] = value` after `tok`; returns the next token.
+    pub fn store(&mut self, buf: u16, index: IId, value: IId, tok: IId) -> IId {
+        self.insert(INode::Store(buf, index, value, tok))
     }
 
     /// `buf[index]`, widened per [`Elem`].
@@ -436,6 +560,11 @@ impl IntGraph {
         self.insert(INode::Un(UnOp::Not, a))
     }
 
+    /// Leading zero bits of `a` (`firstLeadingBit(a) = 31 − clz(a)` for `a > 0`).
+    pub fn clz(&mut self, a: IId) -> IId {
+        self.insert(INode::Un(UnOp::Clz, a))
+    }
+
     /// Comparison.
     pub fn cmp(&mut self, op: CmpOp, a: IId, b: IId) -> IId {
         self.insert(INode::Cmp(op, a, b))
@@ -474,16 +603,28 @@ impl IntGraph {
     /// `s = init; while cond(s) { s = next(s) }`; returns the final states.
     ///
     /// `body` gets the state nodes and returns `(cond, next)`.
-    pub fn while_loop(&mut self, init: &[IId], body: impl FnOnce(&mut Self, &[IId]) -> (IId, Vec<IId>)) -> Vec<IId> {
+    pub fn while_loop(
+        &mut self,
+        init: &[IId],
+        body: impl FnOnce(&mut Self, &[IId]) -> (IId, Vec<IId>),
+    ) -> Vec<IId> {
         let l = self.loops.len() as u32;
         let parent = self.building.last().copied();
         for &x in init {
             // inits live in the enclosing scope
             self.inner(self.scope[x.index()], parent);
         }
-        self.loops.push(Loop { init: init.to_vec(), cond: IId(0), next: Vec::new(), parent });
+        self.loops.push(Loop {
+            init: init.to_vec(),
+            cond: IId(0),
+            next: Vec::new(),
+            parent,
+            cap: None,
+        });
         self.building.push(l);
-        let st: Vec<IId> = (0..init.len()).map(|k| self.insert(INode::State(l, k as u16))).collect();
+        let st: Vec<IId> = (0..init.len())
+            .map(|k| self.insert(INode::State(l, k as u16)))
+            .collect();
         let (cond, next) = body(self, &st);
         self.building.pop();
         assert_eq!(self.ty(cond), IType::Bool, "loop condition must be bool");
@@ -493,11 +634,36 @@ impl IntGraph {
         }
         self.loops[l as usize].cond = cond;
         self.loops[l as usize].next = next;
-        (0..init.len()).map(|k| self.insert(INode::LoopOut(l, k as u16))).collect()
+        (0..init.len())
+            .map(|k| self.insert(INode::LoopOut(l, k as u16)))
+            .collect()
+    }
+
+    /// Cap the trip count of the loop that produced `out` (a loop result).
+    pub fn cap_loop(&mut self, out: IId, cap: u32) {
+        match self.node(out) {
+            INode::LoopOut(l, _) => self.loops[l as usize].cap = Some(cap),
+            _ => panic!("cap_loop: not a loop result"),
+        }
+    }
+
+    /// Unsigned / signed division (WGSL semantics, see [`BinOp::Div`]).
+    pub fn div(&mut self, a: IId, b: IId) -> IId {
+        self.bin(BinOp::Div, a, b)
+    }
+
+    /// Remainder (WGSL semantics, see [`BinOp::Rem`]).
+    pub fn rem(&mut self, a: IId, b: IId) -> IId {
+        self.bin(BinOp::Rem, a, b)
     }
 
     /// `for i in 0..n` (`n: u32`) over states; `body(g, i, s)` returns next states.
-    pub fn for_range(&mut self, n: IId, init: &[IId], body: impl FnOnce(&mut Self, IId, &[IId]) -> Vec<IId>) -> Vec<IId> {
+    pub fn for_range(
+        &mut self,
+        n: IId,
+        init: &[IId],
+        body: impl FnOnce(&mut Self, IId, &[IId]) -> Vec<IId>,
+    ) -> Vec<IId> {
         let zero = self.u32(0);
         let mut s0 = vec![zero];
         s0.extend_from_slice(init);

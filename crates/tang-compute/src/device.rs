@@ -16,7 +16,8 @@ pub trait ComputeBuffer: Send {
 }
 
 /// Compute device abstraction over CPU, Metal, and CUDA backends.
-pub trait ComputeDevice: Send {
+/// `'static` so extensions can be registered per device type (see [`crate::ext`]).
+pub trait ComputeDevice: Send + 'static {
     /// The buffer type for this device.
     type Buffer: ComputeBuffer;
 
@@ -36,6 +37,16 @@ pub trait ComputeDevice: Send {
     /// The device's name (e.g. "Apple M4 Max", "NVIDIA GeForce RTX 3090"); empty if unknown.
     fn device_name(&self) -> String {
         String::new()
+    }
+
+    /// The architecture extensions are keyed by (see [`crate::ext`]): `sm_86`, `sm_90`, ... on
+    /// CUDA, otherwise `metal` or `cpu`.
+    fn arch(&self) -> String {
+        match self.dialect() {
+            Dialect::Msl => "metal".into(),
+            Dialect::Cuda => "cuda".into(),
+            _ => "cpu".into(),
+        }
     }
 
     /// Release cached buffers in the device memory pool. No-op on devices
@@ -1074,6 +1085,39 @@ pub trait ComputeDevice: Send {
     /// [`kv_attention_window`](Self::kv_attention_window) over a paged cache: key `j` is the
     /// row `pages` maps it to. The default ([`kv_attention_paged_default`]) gathers the keys
     /// into contiguous buffers.
+    /// Decode GPU-layout compressed-KV lanes (tables from `tang_compress::kvgpu::Batch`:
+    /// `stream`, `lanes`, `chans`, `prior` as u32 buffers, `scratch` of `scratch_words`) into
+    /// `out` (an f32 or bf16 cache). `rope` = the model's (cos, sin) `[pos][hd/2]` tables, used
+    /// by lanes with their RoPE flag set. Metal only.
+    #[allow(clippy::too_many_arguments)]
+    fn tkv_decode(
+        &self,
+        _stream: &Self::Buffer,
+        _lanes: &Self::Buffer,
+        _chans: &Self::Buffer,
+        _prior: &Self::Buffer,
+        _scratch: &Self::Buffer,
+        _out: &Self::Buffer,
+        _rope: Option<(&Self::Buffer, &Self::Buffer)>,
+        _n_lanes: usize,
+    ) {
+        unimplemented!("tkv_decode is implemented for Metal only")
+    }
+
+    /// KIVI-style integer dequant of one layer's K or V into `out` (f32 or bf16 cache, rows
+    /// through `pages` = (block table, page shift), or contiguous). `codes` u32-packed, `sz` half2
+    /// (scale, zero) per group as u32 words; `p = [bits, group, nkv, hd, tokens, is_key]`.
+    fn kivi_dequant(
+        &self,
+        _codes: &Self::Buffer,
+        _sz: &Self::Buffer,
+        _out: &Self::Buffer,
+        _pages: Option<(&Self::Buffer, u32)>,
+        _p: [u32; 6],
+    ) {
+        unimplemented!("kivi_dequant is implemented for Metal only")
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn kv_attention_paged(
         &self,
@@ -1098,6 +1142,43 @@ pub trait ComputeDevice: Send {
             shape,
             window,
             causal,
+        )
+    }
+
+    /// Attention for one new token from each of several sequences (batched decode): row `i`
+    /// of `qkv` (`[rows, (nh + 2*nkv) * hd]`) is at position `rows.pos[i]` of its own paged
+    /// cache. Does what [`attention_prep_paged`](Self::attention_prep_paged), a
+    /// `query_scale`, and causal [`kv_attention_paged`](Self::kv_attention_paged) (no window)
+    /// do for each row alone, and returns the `[rows, nh * hd]` outputs. The default
+    /// ([`attention_paged_rows_default`]) runs exactly that, row by row.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_paged_rows(
+        &self,
+        qkv: &Self::Buffer,
+        q_norm: Option<&Self::Buffer>,
+        k_norm: Option<&Self::Buffer>,
+        cos: &Self::Buffer,
+        sin: &Self::Buffer,
+        k_pool: &mut Self::Buffer,
+        v_pool: &mut Self::Buffer,
+        rows: &PagedRows<Self::Buffer>,
+        shape: (usize, usize, usize),
+        eps: f32,
+        query_scale: f32,
+    ) -> Self::Buffer {
+        attention_paged_rows_default(
+            self,
+            qkv,
+            q_norm,
+            k_norm,
+            cos,
+            sin,
+            k_pool,
+            v_pool,
+            rows,
+            shape,
+            eps,
+            query_scale,
         )
     }
 
@@ -1324,6 +1405,13 @@ pub trait ComputeDevice: Send {
         self.upload(&y)
     }
 
+    /// GELU, exact (erf) form, elementwise over `n` values: `0.5 x (1 + erf(x / sqrt 2))`.
+    fn gelu_erf(&self, x: &Self::Buffer, n: usize) -> Self::Buffer {
+        let x = self.download(x);
+        let y: Vec<f32> = x[..n].iter().map(|&g| gelu_erf_host(g)).collect();
+        self.upload(&y)
+    }
+
     /// GeGLU over a fused gate/up projection (Gemma): `gelu_tanh(gate) * up`, `[rows, ff]`.
     fn geglu_split(&self, gu: &Self::Buffer, rows: usize, ff: usize) -> Self::Buffer {
         let d = self.download(gu);
@@ -1348,6 +1436,21 @@ pub trait ComputeDevice: Send {
             u.extend_from_slice(&d[r * 2 * ff + ff..(r + 1) * 2 * ff]);
         }
         self.swiglu_fused_buf(&self.upload(&g), &self.upload(&u), rows * ff)
+    }
+
+    /// The `k` largest of each of `rows` rows of `n` floats: per row, `k` values in
+    /// descending order with their column indices, ties broken by the lower index (so the
+    /// first is what a first-max argmax picks). Backends may do this on the device so only
+    /// `rows * k` pairs come back instead of the rows. Needs `k <= n`.
+    fn top_k_rows(
+        &self,
+        x: &Self::Buffer,
+        rows: usize,
+        n: usize,
+        k: usize,
+    ) -> (Vec<f32>, Vec<u32>) {
+        let v = self.download(x);
+        top_k_rows_host(&v[..rows * n], n, k)
     }
 
     /// Linear layer: `y[m, n] = x[m, k] @ w[n, k]^T`, with `w` stored the way checkpoints store
@@ -1831,6 +1934,152 @@ pub trait ComputeDevice: Send {
         self.gdn_step(state, &h, proj, stride, p, y, yq, t, mode, eps);
     }
 
+    /// Dense-path MoE routing ([`crate::moe::route`]): `(ids, weights)`, each `[rows, k]`
+    /// (ids as u32), from router logits `[rows, experts]`.
+    fn moe_route(
+        &self,
+        logits: &Self::Buffer,
+        rows: usize,
+        experts: usize,
+        k: usize,
+        router: crate::moe::Router,
+    ) -> (Self::Buffer, Self::Buffer) {
+        let (ids, w) = crate::moe::route(&self.download(logits), rows, experts, k, router);
+        (self.upload_u32(&ids), self.upload(&w))
+    }
+
+    /// Each row's picked experts applied to it ([`crate::moe::moe_linear`]): `w` is a stack of
+    /// `experts` matrices `[n, k]` in `fmt`, `bias` `[experts, n]`, `ids` `[rows, k_top]` from
+    /// [`moe_route`](Self::moe_route). `x` is `[rows, k]`, or with `per_pick`
+    /// `[rows * k_top, k]`; returns `[rows * k_top, n]`.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_linear(
+        &self,
+        x: &Self::Buffer,
+        w: &Self::Buffer,
+        fmt: crate::moe::ExpertFmt,
+        experts: usize,
+        bias: Option<&Self::Buffer>,
+        ids: &Self::Buffer,
+        k_top: usize,
+        k: usize,
+        n: usize,
+        per_pick: bool,
+    ) -> Self::Buffer {
+        moe_linear_default(self, x, w, fmt, experts, bias, ids, k_top, k, n, per_pick)
+    }
+
+    /// gpt-oss's clamped SwiGLU ([`crate::moe::swiglu_clamped`]) over `gu` `[rows, 2 * ff]`
+    /// (gate then up); returns `[rows, ff]`.
+    fn swiglu_clamped(
+        &self,
+        gu: &Self::Buffer,
+        rows: usize,
+        ff: usize,
+        alpha: f32,
+        limit: f32,
+    ) -> Self::Buffer {
+        let y = crate::moe::swiglu_clamped(&self.download(gu), rows, ff, alpha, limit);
+        self.upload(&y)
+    }
+
+    /// The weighted sum of each row's expert outputs ([`crate::moe::moe_combine`]): `parts`
+    /// `[rows * k_top, h]`, `w` `[rows, k_top]`; returns `[rows, h]`.
+    fn moe_combine(
+        &self,
+        parts: &Self::Buffer,
+        w: &Self::Buffer,
+        rows: usize,
+        k_top: usize,
+        h: usize,
+    ) -> Self::Buffer {
+        let y = crate::moe::moe_combine(&self.download(parts), &self.download(w), rows, k_top, h);
+        self.upload(&y)
+    }
+
+    /// [`kv_attention_paged`](Self::kv_attention_paged) with attention sinks: one more logit
+    /// per head, `sinks[h]`, with a zero value ([`crate::moe::attention_sinks`], gpt-oss). The
+    /// default gathers the keys and runs the reference on the host.
+    #[allow(clippy::too_many_arguments)]
+    fn kv_attention_paged_sinks(
+        &self,
+        q: &Self::Buffer,
+        k_pool: &Self::Buffer,
+        v_pool: &Self::Buffer,
+        pages: &Pages<Self::Buffer>,
+        cache_start: usize,
+        q_len: usize,
+        shape: (usize, usize, usize),
+        window: usize,
+        causal: bool,
+        sinks: &Self::Buffer,
+    ) -> Self::Buffer {
+        kv_attention_paged_sinks_default(
+            self,
+            q,
+            k_pool,
+            v_pool,
+            pages,
+            cache_start,
+            q_len,
+            shape,
+            window,
+            causal,
+            sinks,
+        )
+    }
+
+    /// [`attention_paged_rows`](Self::attention_paged_rows) with attention sinks and a
+    /// sliding window (0: none), as [`kv_attention_paged_sinks`](Self::kv_attention_paged_sinks)
+    /// does for each row alone. The default runs each row on its own.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_paged_rows_sinks(
+        &self,
+        qkv: &Self::Buffer,
+        cos: &Self::Buffer,
+        sin: &Self::Buffer,
+        k_pool: &mut Self::Buffer,
+        v_pool: &mut Self::Buffer,
+        rows: &PagedRows<Self::Buffer>,
+        (nh, nkv, hd): (usize, usize, usize),
+        window: usize,
+        sinks: &Self::Buffer,
+    ) -> Self::Buffer {
+        let (qd, w) = (nh * hd, (nh + 2 * nkv) * hd);
+        let mut out = self.alloc_uninit_f32(rows.pos.len() * qd);
+        for (i, (pages, &pos)) in rows.pages.iter().zip(rows.pos).enumerate() {
+            let row = self.slice_buffer(qkv, i * w, w);
+            let q = self.attention_prep_paged(
+                &row,
+                None,
+                None,
+                cos,
+                sin,
+                k_pool,
+                v_pool,
+                pages,
+                1,
+                (nh, nkv, hd),
+                pos,
+                0.0,
+            );
+            let o = self.kv_attention_paged_sinks(
+                &q,
+                k_pool,
+                v_pool,
+                pages,
+                pos,
+                1,
+                (nh, nkv, hd),
+                window,
+                true,
+                sinks,
+            );
+            self.write_into(&mut out, i * qd, &o);
+        }
+        out
+    }
+
     /// MoE router for a window: `logits [t][stride]` (experts in columns `0..n_expert`); writes
     /// `ids [t][TOPK]` (u32): the top `TOPK` by (logit desc, index asc); and `w [t][TOPK]`:
     /// `e_k / Σ_top e_j`, `e_k = exp(l_k − l_max)` in f64 summed in rank order, which is the
@@ -2130,6 +2379,64 @@ pub trait ComputeDevice: Send {
     );
 }
 
+/// One row each from several sequences in paged caches (see
+/// [`ComputeDevice::attention_paged_rows`]).
+pub struct PagedRows<'a, B> {
+    /// Each row's sequence's blocks.
+    pub pages: &'a [Pages<'a, B>],
+    /// Each row's position.
+    pub pos: &'a [usize],
+    /// On the device: every row's block table, end to end; each row's offset into it; each
+    /// row's position (u32 each, from [`ComputeDevice::upload_u32`]).
+    pub tables: &'a B,
+    pub offsets: &'a B,
+    pub positions: &'a B,
+}
+
+/// The portable [`ComputeDevice::attention_paged_rows`]: each row on its own.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_paged_rows_default<D: ComputeDevice + ?Sized>(
+    dev: &D,
+    qkv: &D::Buffer,
+    q_norm: Option<&D::Buffer>,
+    k_norm: Option<&D::Buffer>,
+    cos: &D::Buffer,
+    sin: &D::Buffer,
+    k_pool: &mut D::Buffer,
+    v_pool: &mut D::Buffer,
+    rows: &PagedRows<D::Buffer>,
+    (nh, nkv, hd): (usize, usize, usize),
+    eps: f32,
+    query_scale: f32,
+) -> D::Buffer {
+    let (qd, w) = (nh * hd, (nh + 2 * nkv) * hd);
+    let n = rows.pos.len();
+    let mut out = dev.alloc_uninit_f32(n * qd);
+    for (i, (pages, &pos)) in rows.pages.iter().zip(rows.pos).enumerate() {
+        let row = dev.slice_buffer(qkv, i * w, w);
+        let mut q = dev.attention_prep_paged(
+            &row,
+            q_norm,
+            k_norm,
+            cos,
+            sin,
+            k_pool,
+            v_pool,
+            pages,
+            1,
+            (nh, nkv, hd),
+            pos,
+            eps,
+        );
+        if query_scale != 1.0 {
+            dev.scale_buffer(&mut q, query_scale);
+        }
+        let o = dev.kv_attention_paged(&q, k_pool, v_pool, pages, pos, 1, (nh, nkv, hd), 0, true);
+        dev.write_into(&mut out, i * qd, &o);
+    }
+    out
+}
+
 /// Where a sequence's positions live in a paged KV cache: position `p` is row
 /// `ids[p / block] * block + p % block` of the cache buffers (each layer's K and V alike).
 pub struct Pages<'a, B> {
@@ -2169,6 +2476,64 @@ impl<B> Pages<'_, B> {
 /// The portable [`ComputeDevice::attention_prep_paged`]: `attention_prep` on scratch caches,
 /// then the new rows copied to where `pages` puts them.
 #[allow(clippy::too_many_arguments)]
+/// Exact GELU on the host, `0.5 x (1 + erf(x / sqrt 2))`, with erf to f32 precision.
+pub fn gelu_erf_host(x: f32) -> f32 {
+    let x = x as f64;
+    (0.5 * x * (1.0 + erf(x * std::f64::consts::FRAC_1_SQRT_2))) as f32
+}
+
+/// erf within 2e-8 (Cody-style rational approximations), below f32 resolution.
+#[allow(clippy::excessive_precision)]
+fn erf(x: f64) -> f64 {
+    let a = x.abs();
+    let r = if a < 0.5 {
+        let t = a * a;
+        let p = (((0.185_777_706_184_603_15 * t + 3.161_123_743_870_565_6) * t
+            + 113.864_154_151_050_16)
+            * t
+            + 377.485_237_685_302_02)
+            * t
+            + 3_209.377_589_138_469_4;
+        let q = (((t + 23.601_290_952_344_122) * t + 244.024_637_934_444_17) * t
+            + 1_282.616_526_077_372_3)
+            * t
+            + 2_844.236_833_439_170_6;
+        return x * p / q;
+    } else if a < 4.0 {
+        let p = [
+            2.153_115_354_744_038_3e-8,
+            0.564_188_496_988_670_9,
+            8.883_149_794_388_376,
+            66.119_190_637_141_63,
+            298.635_138_197_400_1,
+            881.952_221_241_769_1,
+            1_712.047_612_634_070_7,
+            2_051.078_377_826_071_6,
+            1_230.339_354_797_997_2,
+        ];
+        let q = [
+            1.0,
+            15.744_926_110_709_835,
+            117.693_950_891_312_5,
+            537.181_101_862_009_9,
+            1_621.389_574_566_690_2,
+            3_290.799_235_733_459_7,
+            4_362.619_090_143_247,
+            3_439.367_674_143_721_6,
+            1_230.339_354_803_749_4,
+        ];
+        let (mut n, mut d) = (0.0, 0.0);
+        for k in 0..9 {
+            n = n * a + p[k];
+            d = d * a + q[k];
+        }
+        1.0 - (-a * a).exp() * n / d
+    } else {
+        1.0
+    };
+    r.copysign(x)
+}
+
 pub fn attention_prep_paged_default<D: ComputeDevice + ?Sized>(
     dev: &D,
     qkv: &D::Buffer,
@@ -2283,4 +2648,102 @@ pub fn attention_prep_default<D: ComputeDevice + ?Sized>(
 pub fn f32_to_bf16(x: f32) -> u16 {
     let b = x.to_bits();
     (b.wrapping_add(0x7fff + ((b >> 16) & 1)) >> 16) as u16
+}
+
+/// [`ComputeDevice::top_k_rows`] on the host: the reference every backend must match.
+pub fn top_k_rows_host(v: &[f32], n: usize, k: usize) -> (Vec<f32>, Vec<u32>) {
+    let rows = v.len() / n;
+    let (mut vals, mut idx) = (Vec::with_capacity(rows * k), Vec::with_capacity(rows * k));
+    for r in 0..rows {
+        let row = &v[r * n..(r + 1) * n];
+        let mut order: Vec<u32> = (0..n as u32).collect();
+        let cmp = |a: &u32, b: &u32| row[*b as usize].total_cmp(&row[*a as usize]).then(a.cmp(b));
+        if k < n {
+            order.select_nth_unstable_by(k - 1, cmp);
+            order.truncate(k);
+        }
+        order.sort_unstable_by(cmp);
+        vals.extend(order.iter().map(|&i| row[i as usize]));
+        idx.extend_from_slice(&order);
+    }
+    (vals, idx)
+}
+
+/// The portable [`ComputeDevice::moe_linear`]: the host reference.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_linear_default<D: ComputeDevice + ?Sized>(
+    dev: &D,
+    x: &D::Buffer,
+    w: &D::Buffer,
+    fmt: crate::moe::ExpertFmt,
+    experts: usize,
+    bias: Option<&D::Buffer>,
+    ids: &D::Buffer,
+    k_top: usize,
+    k: usize,
+    n: usize,
+    per_pick: bool,
+) -> D::Buffer {
+    use crate::moe::{ExpertFmt, ExpertWeights};
+    let (x, ids) = (dev.download(x), crate::flash::u32s(&dev.download(ids)));
+    let bias = bias.map(|b| dev.download(b));
+    let wv = dev.download(w);
+    let bytes: Vec<u8>;
+    let weights = match fmt {
+        ExpertFmt::F32 | ExpertFmt::Bf16 => ExpertWeights::F32(&wv),
+        ExpertFmt::Mxfp4 => {
+            bytes = wv.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+            ExpertWeights::Mxfp4(&bytes)
+        }
+    };
+    let y = crate::moe::moe_linear(
+        &x,
+        weights,
+        experts,
+        bias.as_deref(),
+        &ids,
+        k_top,
+        k,
+        n,
+        per_pick,
+    );
+    dev.upload(&y)
+}
+
+/// The portable [`ComputeDevice::kv_attention_paged_sinks`]: gathers the keys and runs the
+/// host reference.
+#[allow(clippy::too_many_arguments)]
+pub fn kv_attention_paged_sinks_default<D: ComputeDevice + ?Sized>(
+    dev: &D,
+    q: &D::Buffer,
+    k_pool: &D::Buffer,
+    v_pool: &D::Buffer,
+    pages: &Pages<D::Buffer>,
+    cache_start: usize,
+    q_len: usize,
+    shape: (usize, usize, usize),
+    window: usize,
+    causal: bool,
+    sinks: &D::Buffer,
+) -> D::Buffer {
+    let kvd = shape.1 * shape.2;
+    let total = cache_start + q_len;
+    let (kp, vp) = (dev.download(k_pool), dev.download(v_pool));
+    let (mut k, mut v) = (vec![0f32; total * kvd], vec![0f32; total * kvd]);
+    for (from, row, n) in pages.runs(0, total) {
+        k[from * kvd..][..n * kvd].copy_from_slice(&kp[row * kvd..][..n * kvd]);
+        v[from * kvd..][..n * kvd].copy_from_slice(&vp[row * kvd..][..n * kvd]);
+    }
+    let o = crate::moe::attention_sinks(
+        &dev.download(q),
+        &k,
+        &v,
+        cache_start,
+        q_len,
+        shape,
+        window,
+        causal,
+        Some(&dev.download(sinks)),
+    );
+    dev.upload(&o)
 }

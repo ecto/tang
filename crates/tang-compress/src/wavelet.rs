@@ -87,7 +87,12 @@ impl Pyramid {
             lens.push([0, 1, 2].map(|a| if s[a] { cur[a].div_ceil(2) } else { cur[a] }));
         }
         let nlev = split.len();
-        let mut bands = vec![Band { level: nlev, mask: 0, start: [0; 3], end: lens[nlev] }];
+        let mut bands = vec![Band {
+            level: nlev,
+            mask: 0,
+            start: [0; 3],
+            end: lens[nlev],
+        }];
         for l in (0..nlev).rev() {
             for mask in 1u8..8 {
                 if (0..3).any(|a| mask >> a & 1 == 1 && !split[l][a]) {
@@ -103,13 +108,23 @@ impl Pyramid {
                         end[a] = lens[l + 1][a];
                     }
                 }
-                let b = Band { level: l, mask, start, end };
+                let b = Band {
+                    level: l,
+                    mask,
+                    start,
+                    end,
+                };
                 if !b.is_empty() {
                     bands.push(b);
                 }
             }
         }
-        Self { dims, lens, split, bands }
+        Self {
+            dims,
+            lens,
+            split,
+            bands,
+        }
     }
 
     /// Number of levels.
@@ -162,7 +177,9 @@ impl Pyramid {
         if b.mask == 0 || b.level + 1 >= self.nlev() {
             return None;
         }
-        self.bands.iter().position(|c| c.level == b.level + 1 && c.mask == b.mask)
+        self.bands
+            .iter()
+            .position(|c| c.level == b.level + 1 && c.mask == b.mask)
     }
 
     /// Map a position in band `b` to its parent position in band `pb`.
@@ -171,7 +188,11 @@ impl Pyramid {
         let mut q = [0; 3];
         for a in 0..3 {
             let rel = p[a] - b.start[a];
-            let r = if self.split[pb.level][a] { rel / 2 } else { rel };
+            let r = if self.split[pb.level][a] {
+                rel / 2
+            } else {
+                rel
+            };
             q[a] = (pb.start[a] + r).min(pb.end[a] - 1);
         }
         q
@@ -303,9 +324,17 @@ fn apply3<T: Copy + Default>(
 ) {
     let mut line = Vec::new();
     let mut tmp = Vec::new();
-    let levels: Vec<usize> = if inverse { (0..p.nlev()).rev().collect() } else { (0..p.nlev()).collect() };
+    let levels: Vec<usize> = if inverse {
+        (0..p.nlev()).rev().collect()
+    } else {
+        (0..p.nlev()).collect()
+    };
     for l in levels {
-        let axes: Vec<usize> = if inverse { vec![2, 1, 0] } else { vec![0, 1, 2] };
+        let axes: Vec<usize> = if inverse {
+            vec![2, 1, 0]
+        } else {
+            vec![0, 1, 2]
+        };
         for a in axes {
             if !p.split[l][a] {
                 continue;
@@ -408,7 +437,10 @@ mod tests {
             for j in 0..d[1] {
                 for k in 0..d[2] {
                     let (x, y, z) = (i as f64, j as f64, k as f64);
-                    v.push((0.3 * x).sin() + (0.11 * y * z).cos() + 0.01 * x * y - (k % 7) as f64 * 0.1);
+                    v.push(
+                        (0.3 * x).sin() + (0.11 * y * z).cos() + 0.01 * x * y
+                            - (k % 7) as f64 * 0.1,
+                    );
                 }
             }
         }
@@ -417,13 +449,25 @@ mod tests {
 
     #[test]
     fn perfect_reconstruction_97_any_size() {
-        for d in [[1, 1, 1], [1, 1, 2], [1, 1, 37], [3, 17, 9], [13, 8, 31], [16, 16, 16], [1, 50, 23]] {
+        for d in [
+            [1, 1, 1],
+            [1, 1, 2],
+            [1, 1, 37],
+            [3, 17, 9],
+            [13, 8, 31],
+            [16, 16, 16],
+            [1, 50, 23],
+        ] {
             let p = Pyramid::new(d, MAX_LEVELS);
             let x = field(d);
             let mut y = x.clone();
             forward_97(&p, &mut y);
             inverse_97(&p, &mut y);
-            let e = x.iter().zip(&y).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+            let e = x
+                .iter()
+                .zip(&y)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f64::max);
             assert!(e < 1e-11, "{d:?}: {e}");
             let cells: usize = p.bands.iter().map(|b| b.len()).sum();
             assert_eq!(cells, p.len(), "bands tile the array {d:?}");
@@ -434,7 +478,10 @@ mod tests {
     fn lossless_53_any_size() {
         for d in [[1, 1, 5], [7, 9, 11], [16, 32, 8], [2, 1, 64]] {
             let p = Pyramid::new(d, MAX_LEVELS);
-            let x: Vec<i64> = field(d).iter().map(|v| (v * 1000.0) as i64 ^ 0x5a).collect();
+            let x: Vec<i64> = field(d)
+                .iter()
+                .map(|v| (v * 1000.0) as i64 ^ 0x5a)
+                .collect();
             let mut y = x.clone();
             forward_53(&p, &mut y);
             if p.nlev() > 0 {
@@ -450,7 +497,12 @@ mod tests {
         let (lo, hi) = norms_97();
         // CDF 9/7 with this scaling is close to orthonormal
         for k in 1..=MAX_LEVELS {
-            assert!((lo[k] - 1.0).abs() < 0.1 && (hi[k] - 1.0).abs() < 0.15, "{k}: {} {}", lo[k], hi[k]);
+            assert!(
+                (lo[k] - 1.0).abs() < 0.1 && (hi[k] - 1.0).abs() < 0.15,
+                "{k}: {} {}",
+                lo[k],
+                hi[k]
+            );
         }
     }
 

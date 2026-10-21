@@ -16,10 +16,19 @@ fn cfg3_of(bound: ErrorBound, bk: usize, args: &[String]) -> Gpu3Config {
     let model = if m == "static" {
         Model3::Static
     } else if let Some(h) = m.strip_prefix("overfit") {
-        let hidden = h.strip_prefix(':').map_or(vec![16], |h| h.split(',').map(|v| v.parse().unwrap()).collect());
-        Model3::Overfit { hidden, per_epoch: 200_000, epochs: 4 }
+        let hidden = h.strip_prefix(':').map_or(vec![16], |h| {
+            h.split(',').map(|v| v.parse().unwrap()).collect()
+        });
+        Model3::Overfit {
+            hidden,
+            per_epoch: 200_000,
+            epochs: 4,
+        }
     } else if let Some(p) = m.strip_prefix("pretrained:") {
-        let net = std::sync::Arc::new(tang_compress::learned::Net::from_bytes(&std::fs::read(p).expect("model")).expect("parse"));
+        let net = std::sync::Arc::new(
+            tang_compress::learned::Net::from_bytes(&std::fs::read(p).expect("model"))
+                .expect("parse"),
+        );
         tang_compress::learned::register(net.clone());
         Model3::Pretrained(net)
     } else {
@@ -40,7 +49,11 @@ use tang_compress::{wavcodec, Decoded};
 
 fn read_f32(path: &str) -> Vec<f32> {
     let b = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-    b.as_chunks::<4>().0.iter().map(|&c| f32::from_le_bytes(c)).collect()
+    b.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&c| f32::from_le_bytes(c))
+        .collect()
 }
 
 fn err(x: &[f32], y: &[f32]) -> (f64, f64) {
@@ -55,7 +68,10 @@ fn err(x: &[f32], y: &[f32]) -> (f64, f64) {
 }
 
 fn opt(args: &[String], k: &str, d: &str) -> String {
-    args.iter().position(|a| a == k).map(|i| args[i + 1].clone()).unwrap_or_else(|| d.to_string())
+    args.iter()
+        .position(|a| a == k)
+        .map(|i| args[i + 1].clone())
+        .unwrap_or_else(|| d.to_string())
 }
 
 fn main() {
@@ -64,17 +80,84 @@ fn main() {
     if mode == "cpu3" {
         // gpubench cpu3 STREAM... [pretrained:PATH]: CPU decode vs saved hash (TC_CPU_IR=1: net via tang-expr)
         for p in args.iter().filter_map(|a| a.strip_prefix("pretrained:")) {
-            tang_compress::learned::register(std::sync::Arc::new(tang_compress::learned::Net::from_bytes(&std::fs::read(p).unwrap()).unwrap()));
+            tang_compress::learned::register(std::sync::Arc::new(
+                tang_compress::learned::Net::from_bytes(&std::fs::read(p).unwrap()).unwrap(),
+            ));
         }
         let threads: usize = opt(&args, "--threads", "16").parse().unwrap();
-        for f in args[1..].iter().filter(|a| a.ends_with(".tcg3")) {
+        for f in args[1..]
+            .iter()
+            .filter(|a| a.ends_with(".tcg3") || a.ends_with(".tcs3"))
+        {
             let b = std::fs::read(f).unwrap();
             let want = std::fs::read_to_string(format!("{f}.hash")).unwrap();
             let t0 = Instant::now();
             let (_, y) = gpuwav3::decode3_f32(&b, threads).unwrap();
             let s = t0.elapsed().as_secs_f64();
-            let h = y.iter().fold(0xcbf29ce484222325u64, |h, v| (h ^ v.to_bits() as u64).wrapping_mul(0x100000001b3));
-            println!("{{\"stream\":\"{f}\",\"identical\":{},\"dec_s\":{s},\"gbs\":{}}}", format!("{h:016x}") == want.trim(), y.len() as f64 * 4.0 / 1e9 / s);
+            let h = y.iter().fold(0xcbf29ce484222325u64, |h, v| {
+                (h ^ v.to_bits() as u64).wrapping_mul(0x100000001b3)
+            });
+            println!(
+                "{{\"stream\":\"{f}\",\"identical\":{},\"dec_s\":{s},\"gbs\":{}}}",
+                format!("{h:016x}") == want.trim(),
+                y.len() as f64 * 4.0 / 1e9 / s
+            );
+        }
+        return;
+    }
+    if mode == "ship3" {
+        // gpubench ship3 STREAM.tcg3... [--mlp] [pretrained:PATH]: write STREAM.tcs3 carrying the
+        // built-in decoder (with the net's MLP as a graph when --mlp); report bytes and compile/cache time
+        for p in args.iter().filter_map(|a| a.strip_prefix("pretrained:")) {
+            tang_compress::learned::register(std::sync::Arc::new(
+                tang_compress::learned::Net::from_bytes(&std::fs::read(p).unwrap()).unwrap(),
+            ));
+        }
+        let mlp = args.iter().any(|a| a == "--mlp");
+        for f in args[1..].iter().filter(|a| a.ends_with(".tcg3")) {
+            let b = std::fs::read(f).unwrap();
+            let ps = gpuwav3::parse3(&b).unwrap();
+            let prog = tang_compress::shipdec::builtin_program(
+                if mlp { ps.net.as_ref() } else { None },
+                ps.net.is_some() && ps.ad.wa > 0,
+            );
+            let w = tang_compress::shipdec::wrap(&b, &prog);
+            let out = format!("{}.tcs3", f.trim_end_matches(".tcg3"));
+            std::fs::write(&out, &w).unwrap();
+            std::fs::copy(format!("{f}.hash"), format!("{out}.hash")).unwrap();
+            let t0 = Instant::now();
+            let d = tang_compress::shipdec::compile(&prog).unwrap();
+            let verify_lower_s = t0.elapsed().as_secs_f64();
+            let t1 = Instant::now();
+            let _ = tang_compress::shipdec::compile_cached(&prog).unwrap();
+            let first_s = t1.elapsed().as_secs_f64();
+            let t2 = Instant::now();
+            let _ = tang_compress::shipdec::compile_cached(&prog).unwrap();
+            let hit_s = t2.elapsed().as_secs_f64();
+            #[cfg(not(feature = "gpu"))]
+            let gpu = String::new();
+            #[cfg(feature = "gpu")]
+            let gpu = {
+                let ws = gpuwav3::parse3(&w).unwrap();
+                let g = tang_compress::gpudec::GpuDecoder::new(
+                    ws.lanes,
+                    ws.d3.iter().copied().max().unwrap(),
+                )
+                .unwrap();
+                let mut tt = tang_compress::gpudec::GpuTimes::default();
+                let pr = g.prepare3(&ws, &w, &mut tt);
+                let cold = g.warm3(&pr);
+                let hot = g.warm3(&pr);
+                format!(",\"gpu_pipeline_cold_s\":{cold},\"gpu_pipeline_hit_s\":{hot}")
+            };
+            println!(
+                "{{\"out\":\"{out}\",\"stream_bytes\":{},\"program_bytes\":{},\"added_bytes\":{},\"mlp\":{},\"verify_lower_s\":{verify_lower_s},\"cache_miss_s\":{first_s},\"cache_hit_s\":{hit_s},\"wgsl_chars\":{}{gpu}}}",
+                b.len(),
+                prog.len(),
+                w.len() - b.len(),
+                d.mlp.is_some(),
+                d.wgsl_res.len() + d.wgsl_mlp.as_ref().map_or(0, |m| m.len())
+            );
         }
         return;
     }
@@ -82,16 +165,27 @@ fn main() {
     if mode == "gpu3" {
         // gpubench gpu3 STREAM... [--model3 pretrained:PATH]: GPU decode vs saved hash, kernel timing
         for p in args.iter().filter_map(|a| a.strip_prefix("pretrained:")) {
-            tang_compress::learned::register(std::sync::Arc::new(tang_compress::learned::Net::from_bytes(&std::fs::read(p).unwrap()).unwrap()));
+            tang_compress::learned::register(std::sync::Arc::new(
+                tang_compress::learned::Net::from_bytes(&std::fs::read(p).unwrap()).unwrap(),
+            ));
         }
         let reps: usize = opt(&args, "--reps", "3").parse().unwrap();
-        for f in args[1..].iter().filter(|a| a.ends_with(".tcg3")) {
+        for f in args[1..]
+            .iter()
+            .filter(|a| a.ends_with(".tcg3") || a.ends_with(".tcs3"))
+        {
             let b = std::fs::read(f).unwrap();
             let want = std::fs::read_to_string(format!("{f}.hash")).unwrap();
             let ps = gpuwav3::parse3(&b).unwrap();
-            let g = tang_compress::gpudec::GpuDecoder::new(ps.lanes, ps.d3.iter().copied().max().unwrap()).unwrap();
+            let g = tang_compress::gpudec::GpuDecoder::new(
+                ps.lanes,
+                ps.d3.iter().copied().max().unwrap(),
+            )
+            .unwrap();
             let (v, _) = g.decode3(&b).unwrap();
-            let h = v.iter().fold(0xcbf29ce484222325u64, |h, &x| (h ^ x as u64).wrapping_mul(0x100000001b3));
+            let h = v.iter().fold(0xcbf29ce484222325u64, |h, &x| {
+                (h ^ x as u64).wrapping_mul(0x100000001b3)
+            });
             let mut t2 = tang_compress::gpudec::GpuTimes::default();
             let pr = g.prepare3(&ps, &b, &mut t2);
             let kern = (0..reps).map(|_| g.run3(&pr)).fold(f64::INFINITY, f64::min);
@@ -108,13 +202,24 @@ fn main() {
     }
     let x = read_f32(&args[1]);
     let dims: Vec<usize> = args[2].split('x').map(|s| s.parse().unwrap()).collect();
-    let name = std::path::Path::new(&args[1]).file_stem().unwrap().to_string_lossy().to_string();
-    let bricks: Vec<usize> = opt(&args, "--bricks", "64").split(',').map(|s| s.parse().unwrap()).collect();
+    let name = std::path::Path::new(&args[1])
+        .file_stem()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let bricks: Vec<usize> = opt(&args, "--bricks", "64")
+        .split(',')
+        .map(|s| s.parse().unwrap())
+        .collect();
     let lanes: usize = opt(&args, "--lanes", "16").parse().unwrap();
     let threads: usize = opt(&args, "--threads", "16").parse().unwrap();
     let targets = opt(&args, "--targets", "p60,p80,p100,m1e-3,m1e-4");
     let serial = !args.iter().any(|a| a == "--no-serial");
-    let (lo, hi) = x.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &v| (a.min(v), b.max(v)));
+    let (lo, hi) = x
+        .iter()
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &v| {
+            (a.min(v), b.max(v))
+        });
     let range = (hi - lo) as f64;
     match mode {
         "ratio" => {
@@ -129,7 +234,9 @@ fn main() {
                     let (b, _) = wavcodec::encode_f32(&x, &dims, &wavcodec::WavConfig::new(bound));
                     let enc_s = t0.elapsed().as_secs_f64();
                     let t0 = Instant::now();
-                    let Decoded::F32 { data, .. } = wavcodec::decode(&b).unwrap() else { panic!() };
+                    let Decoded::F32 { data, .. } = wavcodec::decode(&b).unwrap() else {
+                        panic!()
+                    };
                     let dec_s = t0.elapsed().as_secs_f64();
                     let (rmse, mx) = err(&x, &data);
                     println!(
@@ -141,13 +248,26 @@ fn main() {
                 }
                 let v3 = args.iter().any(|a| a == "--v3");
                 for &bk in &bricks {
-                    let cfg = GpuConfig { brick: bk, lanes, adaptive: args.iter().any(|a| a == "--adaptive"), ..GpuConfig::new(bound) };
+                    let cfg = GpuConfig {
+                        brick: bk,
+                        lanes,
+                        adaptive: args.iter().any(|a| a == "--adaptive"),
+                        ..GpuConfig::new(bound)
+                    };
                     let cfg3 = cfg3_of(bound, bk, &args);
                     let t0 = Instant::now();
-                    let (b, st) = if v3 { gpuwav3::encode3_f32(&x, &dims, &cfg3, threads) } else { gpuwav::encode_f32_mt(&x, &dims, &cfg, threads) };
+                    let (b, st) = if v3 {
+                        gpuwav3::encode3_f32(&x, &dims, &cfg3, threads)
+                    } else {
+                        gpuwav::encode_f32_mt(&x, &dims, &cfg, threads)
+                    };
                     let enc_s = t0.elapsed().as_secs_f64();
                     let t0 = Instant::now();
-                    let (_, y) = if v3 { gpuwav3::decode3_f32(&b, 1).unwrap() } else { gpuwav::decode_f32(&b, 1).unwrap() };
+                    let (_, y) = if v3 {
+                        gpuwav3::decode3_f32(&b, 1).unwrap()
+                    } else {
+                        gpuwav::decode_f32(&b, 1).unwrap()
+                    };
                     let dec_s = t0.elapsed().as_secs_f64();
                     let (rmse, mx) = err(&x, &y);
                     if let ErrorBound::MaxAbs(bb) = bound {
@@ -177,12 +297,19 @@ fn main() {
             };
             let reps: usize = opt(&args, "--reps", "3").parse().unwrap();
             for &bk in &bricks {
-                let cfg = GpuConfig { brick: bk, lanes, adaptive: args.iter().any(|a| a == "--adaptive"), ..GpuConfig::new(bound) };
+                let cfg = GpuConfig {
+                    brick: bk,
+                    lanes,
+                    adaptive: args.iter().any(|a| a == "--adaptive"),
+                    ..GpuConfig::new(bound)
+                };
                 let t0 = Instant::now();
                 let (b, st) = gpuwav::encode_f32_mt(&x, &dims, &cfg, threads);
                 let enc_s = t0.elapsed().as_secs_f64();
                 let gb = x.len() as f64 * 4.0 / 1e9;
-                let best = |f: &mut dyn FnMut() -> f64| (0..reps).map(|_| f()).fold(f64::INFINITY, f64::min);
+                let best = |f: &mut dyn FnMut() -> f64| {
+                    (0..reps).map(|_| f()).fold(f64::INFINITY, f64::min)
+                };
                 let ps = gpuwav::parse(&b).unwrap();
                 let mut cpu_bits = Vec::new();
                 let cpu1 = best(&mut || {
@@ -197,7 +324,8 @@ fn main() {
                     t0.elapsed().as_secs_f64()
                 });
                 // random access: 64^3 (or 64^2) box at the field centre
-                let lo: [usize; 3] = std::array::from_fn(|a| if ps.d3[a] > 64 { ps.d3[a] / 2 - 32 } else { 0 });
+                let lo: [usize; 3] =
+                    std::array::from_fn(|a| if ps.d3[a] > 64 { ps.d3[a] / 2 - 32 } else { 0 });
                 let hi: [usize; 3] = std::array::from_fn(|a| (lo[a] + 64).min(ps.d3[a]));
                 let mut sub = Vec::new();
                 let ra = best(&mut || {
@@ -214,7 +342,11 @@ fn main() {
                 for z in lo[0]..hi[0] {
                     for y in lo[1]..hi[1] {
                         for xx in lo[2]..hi[2] {
-                            assert_eq!(sub[k], cpu_bits[(z * ps.d3[1] + y) * ps.d3[2] + xx], "random access mismatch");
+                            assert_eq!(
+                                sub[k],
+                                cpu_bits[(z * ps.d3[1] + y) * ps.d3[2] + xx],
+                                "random access mismatch"
+                            );
                             k += 1;
                         }
                     }
@@ -277,7 +409,11 @@ fn main() {
                     ErrorBound::MaxAbs(t[1..].parse::<f64>().unwrap() * range)
                 };
                 for &bk in &bricks {
-                    let cfg = GpuConfig { brick: bk, lanes, ..GpuConfig::new(bound) };
+                    let cfg = GpuConfig {
+                        brick: bk,
+                        lanes,
+                        ..GpuConfig::new(bound)
+                    };
                     let (b, st) = gpuwav::encode_f32_mt(&x, &dims, &cfg, threads);
                     let ps = gpuwav::parse(&b).unwrap();
                     let cpu = gpuwav::decode_box_parsed(&ps, &b, [0; 3], ps.d3, threads).unwrap();
@@ -292,7 +428,8 @@ fn main() {
                     };
                     // random-access sub-box straddling bricks
                     let lo: [usize; 3] = std::array::from_fn(|a| ps.d3[a] / 3);
-                    let hi: [usize; 3] = std::array::from_fn(|a| (lo[a] + 64).min(ps.d3[a]).max(lo[a] + 1));
+                    let hi: [usize; 3] =
+                        std::array::from_fn(|a| (lo[a] + 64).min(ps.d3[a]).max(lo[a] + 1));
                     let sub = gpuwav::decode_box_bits(&b, lo, hi, 1).unwrap();
                     let mut ra_ok = true;
                     let mut k = 0;
@@ -320,7 +457,8 @@ fn main() {
             let maxl = dims.iter().copied().max().unwrap();
             let g = tang_compress::gpudec::GpuDecoder::new(lanes, maxl).expect("gpu");
             let reps: usize = opt(&args, "--reps", "3").parse().unwrap();
-            let best = |f: &mut dyn FnMut() -> f64| (0..reps).map(|_| f()).fold(f64::INFINITY, f64::min);
+            let best =
+                |f: &mut dyn FnMut() -> f64| (0..reps).map(|_| f()).fold(f64::INFINITY, f64::min);
             let gb = x.len() as f64 * 4.0 / 1e9;
             for t in targets.split(',') {
                 let bound = if let Some(p) = t.strip_prefix('p') {
@@ -334,13 +472,21 @@ fn main() {
                     let (b, st) = gpuwav3::encode3_f32(&x, &dims, &cfg, threads);
                     let enc_s = t0.elapsed().as_secs_f64();
                     let ps = gpuwav3::parse3(&b).unwrap();
-                    let full = |th: usize| gpuwav3::decode3_box_parsed(&ps, &b, [0; 3], ps.d3, th).unwrap().bits;
+                    let full = |th: usize| {
+                        gpuwav3::decode3_box_parsed(&ps, &b, [0; 3], ps.d3, th)
+                            .unwrap()
+                            .bits
+                    };
                     let cpu = full(threads);
                     let (gpu, _) = g.decode3(&b).unwrap();
                     let diff = cpu.iter().zip(&gpu).filter(|(a, b)| a != b).count();
                     if diff > 0 {
                         let i = cpu.iter().zip(&gpu).position(|(a, b)| a != b).unwrap();
-                        eprintln!("first diff at {i}: cpu {} gpu {}", f32::from_bits(cpu[i]), f32::from_bits(gpu[i]));
+                        eprintln!(
+                            "first diff at {i}: cpu {} gpu {}",
+                            f32::from_bits(cpu[i]),
+                            f32::from_bits(gpu[i])
+                        );
                     }
                     let y: Vec<f32> = cpu.iter().map(|&v| f32::from_bits(v)).collect();
                     let (rmse, mx) = err(&x, &y);
@@ -350,7 +496,8 @@ fn main() {
                         _ => true,
                     };
                     // random access: 64^3 (2D: 64^2) box, off-centre so it straddles blocks
-                    let lo: [usize; 3] = std::array::from_fn(|a| if ps.d3[a] > 64 { ps.d3[a] / 3 } else { 0 });
+                    let lo: [usize; 3] =
+                        std::array::from_fn(|a| if ps.d3[a] > 64 { ps.d3[a] / 3 } else { 0 });
                     let hi: [usize; 3] = std::array::from_fn(|a| (lo[a] + 64).min(ps.d3[a]));
                     let mut sub = None;
                     let ra = best(&mut || {
@@ -424,13 +571,23 @@ fn main() {
             // write a v3 stream for later GPU-only timing: gpubench encode3 FIELD dims OUT --bricks B --targets T ...
             let out = opt(&args, "--out", "out.tcg3");
             let t = targets.split(',').next().unwrap();
-            let bound = if let Some(p) = t.strip_prefix('p') { ErrorBound::Psnr(p.parse().unwrap()) } else { ErrorBound::MaxAbs(t[1..].parse::<f64>().unwrap() * range) };
-            let (b, st) = gpuwav3::encode3_f32(&x, &dims, &cfg3_of(bound, bricks[0], &args), threads);
+            let bound = if let Some(p) = t.strip_prefix('p') {
+                ErrorBound::Psnr(p.parse().unwrap())
+            } else {
+                ErrorBound::MaxAbs(t[1..].parse::<f64>().unwrap() * range)
+            };
+            let (b, st) =
+                gpuwav3::encode3_f32(&x, &dims, &cfg3_of(bound, bricks[0], &args), threads);
             std::fs::write(&out, &b).unwrap();
             let (_, y) = gpuwav3::decode3_f32(&b, threads).unwrap();
-            let h = y.iter().fold(0xcbf29ce484222325u64, |h, v| (h ^ v.to_bits() as u64).wrapping_mul(0x100000001b3));
+            let h = y.iter().fold(0xcbf29ce484222325u64, |h, v| {
+                (h ^ v.to_bits() as u64).wrapping_mul(0x100000001b3)
+            });
             std::fs::write(format!("{out}.hash"), format!("{h:016x}")).unwrap();
-            println!("{{\"out\":\"{out}\",\"bpv\":{},\"hash\":\"{h:016x}\"}}", st.bits_per_value);
+            println!(
+                "{{\"out\":\"{out}\",\"bpv\":{},\"hash\":\"{h:016x}\"}}",
+                st.bits_per_value
+            );
         }
         _ => panic!("mode"),
     }

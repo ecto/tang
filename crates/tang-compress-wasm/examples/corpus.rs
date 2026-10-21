@@ -18,7 +18,10 @@ use tang_compress::learned;
 use tang_compress_wasm::{decode_cpu_bits, decoder_key, fnv1a_bits, format_of, Format};
 
 fn opt(args: &[String], k: &str, d: &str) -> String {
-    args.iter().position(|a| a == k).map(|i| args[i + 1].clone()).unwrap_or_else(|| d.to_string())
+    args.iter()
+        .position(|a| a == k)
+        .map(|i| args[i + 1].clone())
+        .unwrap_or_else(|| d.to_string())
 }
 
 fn best(reps: usize, mut f: impl FnMut() -> f64) -> f64 {
@@ -29,30 +32,115 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let out = std::path::PathBuf::from(&args[1]);
     std::fs::create_dir_all(&out).unwrap();
-    let net = Arc::new(learned::Net::from_bytes(&std::fs::read(&args[2]).expect("model")).expect("parse model"));
+    let net = Arc::new(
+        learned::Net::from_bytes(&std::fs::read(&args[2]).expect("model")).expect("parse model"),
+    );
     learned::register(net.clone());
     let targets = opt(&args, "--targets", "p60,p80,p100,m1e-3,m1e-4");
     let threads: usize = opt(&args, "--threads", "8").parse().unwrap();
     let mut decs: Vec<((usize, usize), GpuDecoder)> = Vec::new();
     let mut man = String::from("[\n");
-    for line in std::fs::read_to_string(&args[0]).unwrap().lines().filter(|l| !l.trim().is_empty()) {
+    for line in std::fs::read_to_string(&args[0])
+        .unwrap()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+    {
         let (path, d) = line.split_once(' ').unwrap();
         let dims: Vec<usize> = d.trim().split('x').map(|s| s.parse().unwrap()).collect();
-        let name = std::path::Path::new(path).file_stem().unwrap().to_string_lossy().replace("-64x128x128", "");
+        let name = std::path::Path::new(path)
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .replace("-64x128x128", "");
         let b = std::fs::read(path).unwrap();
-        let x: Vec<f32> = b.as_chunks::<4>().0.iter().map(|&c| f32::from_le_bytes(c)).collect();
+        let x: Vec<f32> = b
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| f32::from_le_bytes(c))
+            .collect();
         assert_eq!(x.len(), dims.iter().product::<usize>(), "{path}");
-        let (lo, hi) = x.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &v| (a.min(v), b.max(v)));
+        let (lo, hi) = x
+            .iter()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &v| {
+                (a.min(v), b.max(v))
+            });
         let range = (hi - lo) as f64;
         let two_d = dims.len() == 2;
         for t in targets.split(',') {
-            let bound = if let Some(p) = t.strip_prefix('p') { ErrorBound::Psnr(p.parse().unwrap()) } else { ErrorBound::MaxAbs(t[1..].parse::<f64>().unwrap() * range) };
+            let bound = if let Some(p) = t.strip_prefix('p') {
+                ErrorBound::Psnr(p.parse().unwrap())
+            } else {
+                ErrorBound::MaxAbs(t[1..].parse::<f64>().unwrap() * range)
+            };
             let bk = if two_d { 128 } else { 32 };
-            let streams: [(&str, Vec<u8>); 3] = [
-                ("tcg1", gpuwav::encode_f32_mt(&x, &dims, &GpuConfig { brick: if two_d { 512 } else { 64 }, lanes: 32, ..GpuConfig::new(bound) }, threads).0),
-                ("tcg3s", gpuwav3::encode3_f32(&x, &dims, &Gpu3Config { block: bk, block2d: bk, lanes: 1, ..Gpu3Config::new(bound) }, threads).0),
-                ("tcg3l", gpuwav3::encode3_f32(&x, &dims, &Gpu3Config { block: bk, block2d: bk, lanes: 8, model: Model3::Pretrained(net.clone()), ..Gpu3Config::new(bound) }, threads).0),
+            let mut streams: Vec<(&str, Vec<u8>)> = vec![
+                (
+                    "tcg1",
+                    gpuwav::encode_f32_mt(
+                        &x,
+                        &dims,
+                        &GpuConfig {
+                            brick: if two_d { 512 } else { 64 },
+                            lanes: 32,
+                            ..GpuConfig::new(bound)
+                        },
+                        threads,
+                    )
+                    .0,
+                ),
+                (
+                    "tcg3s",
+                    gpuwav3::encode3_f32(
+                        &x,
+                        &dims,
+                        &Gpu3Config {
+                            block: bk,
+                            block2d: bk,
+                            lanes: 1,
+                            ..Gpu3Config::new(bound)
+                        },
+                        threads,
+                    )
+                    .0,
+                ),
+                (
+                    "tcg3l",
+                    gpuwav3::encode3_f32(
+                        &x,
+                        &dims,
+                        &Gpu3Config {
+                            block: bk,
+                            block2d: bk,
+                            lanes: 8,
+                            model: Model3::Pretrained(net.clone()),
+                            ..Gpu3Config::new(bound)
+                        },
+                        threads,
+                    )
+                    .0,
+                ),
             ];
+            // --ship: the TCG3 streams again, carrying their decoder (learned: with the MLP)
+            if args.iter().any(|a| a == "--ship") {
+                let w: Vec<(&str, Vec<u8>)> = streams[1..]
+                    .iter()
+                    .map(|(f, s)| {
+                        let ps = gpuwav3::parse3(s).unwrap();
+                        (
+                            if *f == "tcg3s" { "tcs3s" } else { "tcs3l" },
+                            tang_compress::shipdec::wrap(
+                                s,
+                                &tang_compress::shipdec::builtin_program(
+                                    ps.net.as_ref(),
+                                    ps.net.is_some() && ps.ad.wa > 0,
+                                ),
+                            ),
+                        )
+                    })
+                    .collect();
+                streams.extend(w);
+            }
             for (fmt, s) in streams {
                 let file = format!("{name}_{t}_{fmt}.tc");
                 std::fs::write(out.join(&file), &s).unwrap();
@@ -70,7 +158,13 @@ fn main() {
                 }
                 let g = &decs.iter().find(|d| d.0 == key).unwrap().1;
                 let v3 = format_of(&s).unwrap() == Format::V3;
-                let dec = |s: &[u8]| if v3 { g.decode3(s).unwrap() } else { g.decode(s).unwrap() };
+                let dec = |s: &[u8]| {
+                    if v3 {
+                        g.decode3(s).unwrap()
+                    } else {
+                        g.decode(s).unwrap()
+                    }
+                };
                 let (gv, _) = dec(&s);
                 assert_eq!(fnv1a_bits(&gv), h, "native GPU != CPU on {file}");
                 let mut kern = f64::INFINITY;

@@ -19,9 +19,10 @@
 
 use super::engine::{Engine, Opts, Positional, RunningState};
 use super::tokenize::FlashTokenizer;
-use crate::chat::{Parser, Piece};
-use crate::engine::{Finish, Request, ThinkBudget, Usage, WRAP_UP};
+use crate::chat::{Chunk, Detok, Parser, Piece, Tags};
+use crate::engine::{Control, Finish, Outcome, Request, ThinkBudget, Usage, WRAP_UP};
 use crate::server::Backend;
+use crate::special::Shield;
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -58,9 +59,197 @@ pub struct Settings {
     /// Chat completion bodies (JSON files) to prefill at start, so their tools block and
     /// system prompt states are saved before the first real request.
     pub warm: Vec<PathBuf>,
+    /// Suffix drafts (the n-gram drafter over the sequence) for an engine without MTP.
+    pub suffix: bool,
     /// Seed the expert cache from this routing profile. Without one, `routing.bin` in `disk`
     /// (written after every request) seeds it.
     pub profile: Option<PathBuf>,
+}
+
+/// What the server needs from an engine: the Flash-Next [`Engine`] or the qwen3next
+/// [`Coder`](super::coder::Coder).
+pub trait ServeEngine {
+    fn tokens(&self) -> &Vec<u32>;
+    fn tokens_mut(&mut self) -> &mut Vec<u32>;
+    fn reset(&mut self);
+    fn gguf(&self) -> &crate::gguf::Gguf;
+    fn last(&self) -> super::engine::WinStats;
+    fn save_running(&mut self) -> Result<RunningState>;
+    fn restore_running(&mut self, s: &RunningState, prefix: &[u32]) -> Result<()>;
+    fn save_positional(&mut self, from: usize, to: usize) -> Result<Positional>;
+    fn restore_positional(&mut self, p: &Positional, from: usize) -> Result<()>;
+    fn prefill(&mut self, ids: &[u32], chunk: usize) -> Result<u32>;
+    fn window(&mut self, pos0: usize, t: usize) -> Result<Vec<u32>>;
+    fn verify(&mut self, cur: u32, drafts: &[u32]) -> Result<Vec<u32>>;
+    /// The last window's logits, `[t][vocab]`.
+    fn logits(&self, t: usize) -> Vec<f32>;
+    fn set_sampling(&mut self, temperature: f32, seed: u32);
+    fn sampler_mut(&mut self) -> Option<&mut super::sampler::Sampler>;
+    fn sampler_begin(&mut self, pos: usize) -> Result<()>;
+    /// Routing counts per expert key (the Flash-Next expert cache's profile).
+    fn routing(&mut self) -> Option<&mut Vec<u32>> {
+        None
+    }
+    fn save_routing(&self, _path: &Path) -> Result<()> {
+        Ok(())
+    }
+    /// Wide prefill windows (`Engine::prefill_wide`).
+    fn has_wide(&self) -> bool {
+        false
+    }
+    fn prefill_wide(&mut self, _pos0: usize, _t: usize) -> Result<super::engine::WinStats> {
+        bail!("no wide prefill")
+    }
+    fn use_mtp(&self) -> bool {
+        false
+    }
+    fn mtp_last(&self) -> &[(u32, f32)] {
+        &[]
+    }
+    fn mtp_draft(&mut self, _pos0: usize, _next: &[u32]) -> Result<()> {
+        bail!("no MTP")
+    }
+    fn last_mtp_ms(&self) -> f64 {
+        0.0
+    }
+    /// Verify-window cost by width relative to one token, for pricing suffix drafts.
+    fn draft_cost(&self) -> Vec<(usize, f32)> {
+        vec![(1, 1.0), (2, 1.12), (4, 1.35), (8, 1.9)]
+    }
+}
+
+impl ServeEngine for Engine {
+    fn tokens(&self) -> &Vec<u32> {
+        &self.tokens
+    }
+    fn tokens_mut(&mut self) -> &mut Vec<u32> {
+        &mut self.tokens
+    }
+    fn reset(&mut self) {
+        Engine::reset(self)
+    }
+    fn gguf(&self) -> &crate::gguf::Gguf {
+        Engine::gguf(self)
+    }
+    fn last(&self) -> super::engine::WinStats {
+        self.last
+    }
+    fn save_running(&mut self) -> Result<RunningState> {
+        Engine::save_running(self)
+    }
+    fn restore_running(&mut self, s: &RunningState, prefix: &[u32]) -> Result<()> {
+        Engine::restore_running(self, s, prefix)
+    }
+    fn save_positional(&mut self, from: usize, to: usize) -> Result<Positional> {
+        Engine::save_positional(self, from, to)
+    }
+    fn restore_positional(&mut self, p: &Positional, from: usize) -> Result<()> {
+        Engine::restore_positional(self, p, from)
+    }
+    fn prefill(&mut self, ids: &[u32], chunk: usize) -> Result<u32> {
+        Engine::prefill(self, ids, chunk, None)
+    }
+    fn window(&mut self, pos0: usize, t: usize) -> Result<Vec<u32>> {
+        Engine::window(self, pos0, t, None)
+    }
+    fn verify(&mut self, cur: u32, drafts: &[u32]) -> Result<Vec<u32>> {
+        Engine::verify(self, cur, drafts)
+    }
+    fn logits(&self, t: usize) -> Vec<f32> {
+        Engine::logits(self, t)
+    }
+    fn set_sampling(&mut self, temperature: f32, seed: u32) {
+        self.temperature = temperature;
+        self.seed = seed;
+    }
+    fn sampler_mut(&mut self) -> Option<&mut super::sampler::Sampler> {
+        Engine::sampler_mut(self)
+    }
+    fn sampler_begin(&mut self, pos: usize) -> Result<()> {
+        Engine::sampler_begin(self, pos)
+    }
+    fn routing(&mut self) -> Option<&mut Vec<u32>> {
+        Some(&mut self.routing)
+    }
+    fn save_routing(&self, path: &Path) -> Result<()> {
+        Engine::save_routing(self, path)
+    }
+    fn has_wide(&self) -> bool {
+        true
+    }
+    fn prefill_wide(&mut self, pos0: usize, t: usize) -> Result<super::engine::WinStats> {
+        Engine::prefill_wide(self, pos0, t)
+    }
+    fn use_mtp(&self) -> bool {
+        self.use_mtp && self.has_mtp()
+    }
+    fn mtp_last(&self) -> &[(u32, f32)] {
+        &self.mtp_last
+    }
+    fn mtp_draft(&mut self, pos0: usize, next: &[u32]) -> Result<()> {
+        self.mtp_last = Engine::mtp_draft(self, pos0, next)?;
+        Ok(())
+    }
+    fn last_mtp_ms(&self) -> f64 {
+        self.last_mtp_ms
+    }
+}
+
+impl ServeEngine for super::coder::Coder {
+    fn tokens(&self) -> &Vec<u32> {
+        &self.tokens
+    }
+    fn tokens_mut(&mut self) -> &mut Vec<u32> {
+        &mut self.tokens
+    }
+    fn reset(&mut self) {
+        super::coder::Coder::reset(self)
+    }
+    fn gguf(&self) -> &crate::gguf::Gguf {
+        super::coder::Coder::gguf(self)
+    }
+    fn last(&self) -> super::engine::WinStats {
+        self.last
+    }
+    fn save_running(&mut self) -> Result<RunningState> {
+        super::coder::Coder::save_running(self)
+    }
+    fn restore_running(&mut self, s: &RunningState, prefix: &[u32]) -> Result<()> {
+        super::coder::Coder::restore_running(self, s, prefix)
+    }
+    fn save_positional(&mut self, from: usize, to: usize) -> Result<Positional> {
+        super::coder::Coder::save_positional(self, from, to)
+    }
+    fn restore_positional(&mut self, p: &Positional, from: usize) -> Result<()> {
+        super::coder::Coder::restore_positional(self, p, from)
+    }
+    fn prefill(&mut self, ids: &[u32], chunk: usize) -> Result<u32> {
+        super::coder::Coder::prefill(self, ids, chunk, None)
+    }
+    fn window(&mut self, pos0: usize, t: usize) -> Result<Vec<u32>> {
+        super::coder::Coder::window(self, pos0, t, None)
+    }
+    fn verify(&mut self, cur: u32, drafts: &[u32]) -> Result<Vec<u32>> {
+        super::coder::Coder::verify(self, cur, drafts)
+    }
+    fn logits(&self, t: usize) -> Vec<f32> {
+        super::coder::Coder::logits(self, t)
+    }
+    fn set_sampling(&mut self, temperature: f32, seed: u32) {
+        self.temperature = temperature;
+        self.seed = seed;
+    }
+    fn sampler_mut(&mut self) -> Option<&mut super::sampler::Sampler> {
+        super::coder::Coder::sampler_mut(self)
+    }
+    fn sampler_begin(&mut self, pos: usize) -> Result<()> {
+        super::coder::Coder::sampler_begin(self, pos)
+    }
+    fn draft_cost(&self) -> Vec<(usize, f32)> {
+        // H200, UD-Q4_K_XL: a T=8 verify window is ~3.3x a T=1 one (each token routes to its
+        // own experts), so long drafts only pay when they're very likely.
+        vec![(1, 1.0), (2, 1.35), (4, 1.9), (8, 3.3)]
+    }
 }
 
 /// A saved running state and the tokens it follows.
@@ -72,6 +261,8 @@ struct Snap {
     pos: Vec<Arc<Positional>>,
     pinned: bool,
     used: u64,
+    /// Last used, by the wall clock (see [`crate::retention`]).
+    at: std::time::SystemTime,
 }
 
 /// A completion this server generated, to splice back into later prompts.
@@ -82,6 +273,7 @@ struct Memo {
     /// closed empty block with thinking off).
     tail: String,
     ids: Vec<u32>,
+    at: std::time::SystemTime,
 }
 
 /// Draft pricing (the `flash-generate --draft mtp` policy): expected tokens per ms of window
@@ -160,27 +352,6 @@ impl Policy {
     }
 }
 
-/// Incremental detokenization: decode a small window, emit what's new, hold back broken UTF-8.
-#[derive(Default)]
-struct Detok {
-    prefix: usize,
-    read: usize,
-}
-
-impl Detok {
-    fn push(&mut self, tok: &FlashTokenizer, out: &[u32]) -> Result<Option<String>> {
-        let before = tok.decode(&out[self.prefix..self.read])?;
-        let after = tok.decode(&out[self.prefix..])?;
-        if after.len() > before.len() && !after.ends_with('\u{fffd}') {
-            let new = after[before.len()..].to_string();
-            self.prefix = self.read;
-            self.read = out.len();
-            return Ok(Some(new));
-        }
-        Ok(None)
-    }
-}
-
 /// What one request did, for the server log.
 #[derive(Default)]
 struct Line {
@@ -203,8 +374,18 @@ struct Line {
 
 pub struct FlashServe {
     gguf: PathBuf,
-    e: Engine,
+    e: Box<dyn ServeEngine>,
+    /// Suffix drafts (the n-gram drafter over the sequence) when the engine has no MTP: its
+    /// config, the completions it also matches against (across requests), and its hit rates.
+    suffix: bool,
+    dcfg: crate::draft::DraftConfig,
+    dglobal: crate::draft::Global,
+    dcalib: crate::draft::Calibration,
     tok: FlashTokenizer,
+    /// Keeps request text out of the special tokens (see [`Shield`]).
+    shield: Shield,
+    /// Tag tokens the output parser splits on.
+    tags: Tags,
     ctx: usize,
     eos: Vec<u32>,
     think: (u32, u32),
@@ -216,6 +397,8 @@ pub struct FlashServe {
     memo: VecDeque<Memo>,
     policy: Policy,
     clock: u64,
+    /// When the live sequence last ran (for the TTL).
+    live_at: std::time::SystemTime,
     temp: f32,
     sampling: SamplingMode,
     /// Widest prefill window (`TANG_FLASH_WIDE`, default 64; 0: decode-width windows only).
@@ -281,25 +464,36 @@ impl FlashServe {
             profile: profile.clone(),
             ..Opts::default()
         };
-        let mut e = Engine::load(&s.gguf, opts)?;
-        eprintln!("{}", e.load_report);
-        e.use_graphs = true;
-        e.use_mtp = e.has_mtp();
-        e.enable_sampler()?;
-        e.warm()?;
-        // Keep counting from the saved profile, not from the warm-up's routing.
-        e.routing.fill(0);
-        if let Some(p) = profile.as_ref().filter(|p| Some(*p) == saved.as_ref()) {
-            let b = std::fs::read(p)?;
-            if b.len() == e.routing.len() * 4 {
-                for (r, c) in e.routing.iter_mut().zip(b.chunks(4)) {
-                    *r = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        let mut e: Box<dyn ServeEngine> = if super::coder::is_qwen3next(&s.gguf)? {
+            let mut c =
+                super::coder::Coder::load(&s.gguf, super::coder::CoderOpts { max_ctx: s.ctx })?;
+            eprintln!("{}", c.load_report);
+            c.use_graphs = true;
+            c.enable_sampler()?;
+            c.warm()?;
+            Box::new(c)
+        } else {
+            let mut e = Engine::load(&s.gguf, opts)?;
+            eprintln!("{}", e.load_report);
+            e.use_graphs = true;
+            e.use_mtp = e.has_mtp();
+            e.enable_sampler()?;
+            e.warm()?;
+            // Keep counting from the saved profile, not from the warm-up's routing.
+            e.routing.fill(0);
+            if let Some(p) = profile.as_ref().filter(|p| Some(*p) == saved.as_ref()) {
+                let b = std::fs::read(p)?;
+                if b.len() == e.routing.len() * 4 {
+                    for (r, c) in e.routing.iter_mut().zip(b.chunks(4)) {
+                        *r = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                    }
                 }
             }
-        }
-        if let Some(p) = &profile {
-            eprintln!("tang-llm: expert cache seeded from {}", p.display());
-        }
+            if let Some(p) = &profile {
+                eprintln!("tang-llm: expert cache seeded from {}", p.display());
+            }
+            Box::new(e)
+        };
         let tok = FlashTokenizer::from_gguf(e.gguf())?;
         let id = |p: &str| tok.token_id(p).with_context(|| format!("no {p} token"));
         let mut eos: Vec<u32> = ["<|im_end|>", "<|endoftext|>"]
@@ -330,16 +524,34 @@ impl FlashServe {
             "tang-llm: flash engine ready in {:.1} s: ctx {}, drafts {}, running state {:.0} MB, up to {} saved states{}",
             t.elapsed().as_secs_f64(),
             s.ctx,
-            if e.use_mtp { "mtp" } else { "none" },
+            if e.use_mtp() {
+                "mtp"
+            } else if s.suffix {
+                "suffix"
+            } else {
+                "none"
+            },
             state_mb,
             s.snapshots,
             s.disk.as_ref().map_or(String::new(), |d| format!(", system prompts saved in {}", d.display()))
         );
         let mut me = FlashServe {
             gguf: s.gguf.clone(),
-            drafts_mode: if e.use_mtp { "mtp" } else { "none" },
+            drafts_mode: if e.use_mtp() {
+                "mtp"
+            } else if s.suffix {
+                "suffix"
+            } else {
+                "none"
+            },
+            suffix: s.suffix && !e.use_mtp(),
+            dcfg: crate::draft::DraftConfig::new(&e.draft_cost()),
+            dglobal: crate::draft::Global::new(1 << 20, None),
+            dcalib: crate::draft::Calibration::default(),
             e,
             im_start: id("<|im_start|>")?,
+            shield: Shield::new(&tok.tok),
+            tags: Tags::new(|t| tok.token_id(t)),
             tok,
             ctx: s.ctx,
             eos,
@@ -351,6 +563,7 @@ impl FlashServe {
             memo: VecDeque::new(),
             policy: Policy::new(),
             clock: 0,
+            live_at: crate::retention::now(),
             temp: s.temp,
             sampling: s.sampling,
             wide: std::env::var("TANG_FLASH_WIDE")
@@ -370,7 +583,7 @@ impl FlashServe {
             let ids: Vec<u32> = (0..64 + 32 + 16 + 1).map(|i| 1000 + i as u32).collect();
             for _ in 0..2 {
                 me.e.reset();
-                prefill_span(&mut me.e, &ids, MAX_T, usize::MAX, me.wide, true)?;
+                prefill_span(&mut *me.e, &ids, MAX_T, usize::MAX, me.wide, true)?;
             }
             me.e.reset();
             eprintln!(
@@ -385,7 +598,7 @@ impl FlashServe {
                 .with_context(|| format!("reading {}", f.display()))?;
             let mut req = crate::server::parse(&body).map_err(|e| anyhow::anyhow!(e))?;
             req.prefill_only = true;
-            me.generate(&req, &mut |_| true)?;
+            me.generate(&req, &mut |_| true, &mut ())?;
             eprintln!(
                 "tang-llm: warmed {} ({} tokens, {} reused) in {:.1} s",
                 f.display(),
@@ -451,15 +664,18 @@ impl FlashServe {
     /// switches thinking per turn (frog does) would otherwise invalidate every cached token.
     /// Thinking off then only closes the generation prompt's `<think>` block, as the template
     /// does (`TANG_FLASH_STABLE_SYSTEM=0`: the template exactly).
+    /// Request text is protected (see [`Shield`]): encode the result with [`Self::encode`].
     fn render(&self, msgs: &Value, req: &Request) -> Result<String> {
+        let msgs = &self.shield.protect(msgs);
+        let tools = req.tools.as_ref().map(|t| self.shield.protect(t));
         let stable = std::env::var("TANG_FLASH_STABLE_SYSTEM").map_or(true, |v| v != "0");
         if !stable || req.think != Some(false) {
-            return self.tok.render(msgs, req.tools.as_ref(), req.think);
+            return self.tok.render(msgs, tools.as_ref(), req.think);
         }
-        let text = self.tok.render(msgs, req.tools.as_ref(), Some(true))?;
+        let text = self.tok.render(msgs, tools.as_ref(), Some(true))?;
         match text.strip_suffix("<think>\n") {
             Some(head) => Ok(format!("{head}<think>\n\n</think>\n\n")),
-            None => self.tok.render(msgs, req.tools.as_ref(), req.think),
+            None => self.tok.render(msgs, tools.as_ref(), req.think),
         }
     }
 
@@ -503,31 +719,38 @@ impl FlashServe {
             eprintln!(
                 "tang-llm: splicing skipped (template rendered generated turns unexpectedly)"
             );
-            return Ok((self.tok.encode(&text)?, text, 0));
+            return Ok((self.encode(&text)?, text, 0));
         }
         for (piece, mi) in pieces {
-            ids.extend(self.tok.encode(&piece)?);
+            ids.extend(self.encode(&piece)?);
             ids.extend_from_slice(&self.memo[mi].ids);
         }
-        ids.extend(self.tok.encode(&text[at..])?);
+        ids.extend(self.encode(&text[at..])?);
         Ok((ids, text, n))
+    }
+
+    /// Rendered (protected) prompt text to ids: the template's special tokens by id, request
+    /// text as plain tokens.
+    fn encode(&self, text: &str) -> Result<Vec<u32>> {
+        self.shield.encode(&self.tok.tok, text)
     }
 
     /// Keep a copy of the running state after `tokens` (the engine's sequence now).
     fn snapshot(&mut self, pinned: bool) -> Result<()> {
         self.clock += 1;
         let clock = self.clock;
-        if let Some(s) = self.snaps.iter_mut().find(|s| s.tokens == self.e.tokens) {
+        if let Some(s) = self.snaps.iter_mut().find(|s| s.tokens == *self.e.tokens()) {
             s.used = clock;
+            s.at = crate::retention::now();
             s.pinned |= pinned;
             return Ok(());
         }
         let t = Instant::now();
         let state = self.e.save_running()?;
-        let n = self.e.tokens.len();
+        let n = self.e.tokens().len();
         // Only the positions past the longest saved state this one extends are copied.
         let base = (0..self.snaps.len())
-            .filter(|&i| self.e.tokens.starts_with(&self.snaps[i].tokens))
+            .filter(|&i| self.e.tokens().starts_with(&self.snaps[i].tokens))
             .max_by_key(|&i| self.snaps[i].tokens.len());
         let (mut pos, from) = match base {
             Some(i) => (self.snaps[i].pos.clone(), self.snaps[i].tokens.len()),
@@ -536,7 +759,7 @@ impl FlashServe {
         if from < n {
             pos.push(Arc::new(self.e.save_positional(from, n)?));
         }
-        let tokens = self.e.tokens.clone();
+        let tokens = self.e.tokens().clone();
         if pinned && self.disk_path(&tokens).is_some_and(|p| !p.exists()) {
             let full = self.e.save_positional(0, n)?;
             self.save_disk(&tokens, &state, &full);
@@ -548,6 +771,7 @@ impl FlashServe {
             pos,
             pinned,
             used: clock,
+            at: crate::retention::now(),
         });
         let size = |snaps: &[Snap]| {
             let mut seen = std::collections::HashSet::new();
@@ -588,6 +812,34 @@ impl FlashServe {
         Ok(())
     }
 
+    /// Drop saved states, remembered replies and the live sequence unused for the TTL.
+    fn expire_memory(&mut self) {
+        let ttl = crate::retention::ttl();
+        let stale = |at| crate::retention::expired(at, ttl);
+        self.snaps.retain(|s| !stale(s.at));
+        self.memo.retain(|m| !stale(m.at));
+        if !self.e.tokens().is_empty() && stale(self.live_at) {
+            self.e.reset();
+        }
+    }
+
+    /// [`Self::expire_memory`], and delete saved states on disk unused for the TTL.
+    fn expire(&mut self) {
+        let ttl = crate::retention::ttl();
+        if ttl.is_none() {
+            return;
+        }
+        self.expire_memory();
+        let Some(dir) = &self.disk else { return };
+        for ent in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = ent.path();
+            if p.extension().is_some_and(|x| x == "state") && crate::retention::stale_file(&p, ttl)
+            {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+
     fn disk_path(&self, ids: &[u32]) -> Option<PathBuf> {
         Some(
             self.disk
@@ -600,8 +852,10 @@ impl FlashServe {
     /// before they can overflow, so the profile also follows recent use.
     fn save_routing(&mut self) {
         let Some(d) = &self.disk else { return };
-        if self.e.routing.iter().any(|&c| c > 1 << 30) {
-            self.e.routing.iter_mut().for_each(|c| *c /= 2);
+        if let Some(r) = self.e.routing() {
+            if r.iter().any(|&c| c > 1 << 30) {
+                r.iter_mut().for_each(|c| *c /= 2);
+            }
         }
         let tmp = d.join(format!("{ROUTING}.tmp"));
         if let Err(err) = self
@@ -619,6 +873,7 @@ impl FlashServe {
             return;
         };
         if path.exists() {
+            crate::retention::touch(&path);
             return;
         }
         let mut bytes: Vec<u8> = Vec::with_capacity(s.bytes() + 4 * ids.len() + 64);
@@ -691,11 +946,16 @@ impl FlashServe {
             let (Ok(n), Ok(h)) = (n.parse::<usize>(), u64::from_str_radix(h, 16)) else {
                 continue;
             };
+            if crate::retention::stale_file(&ent.path(), crate::retention::ttl()) {
+                let _ = std::fs::remove_file(ent.path());
+                continue;
+            }
             if n <= limit && n > best.as_ref().map_or(0, |b| b.0) && hash(&ids[..n]) == h {
                 best = Some((n, ent.path()));
             }
         }
         let (n, path) = best?;
+        crate::retention::touch(&path);
         let read = || -> Result<Snap> {
             let mut b = Vec::new();
             std::fs::File::open(&path)?.read_to_end(&mut b)?;
@@ -740,6 +1000,7 @@ impl FlashServe {
                 pos: vec![Arc::new(Positional::from_parts(0, n, pos))],
                 pinned: true,
                 used: 0,
+                at: crate::retention::now(),
             })
         };
         match read() {
@@ -756,8 +1017,8 @@ impl FlashServe {
     /// return (tokens reused, the sampled next token).
     fn prefill(&mut self, ids: &[u32], text: &str) -> Result<(usize, u32)> {
         let limit = ids.len() - 1;
-        let live = self.e.tokens.len();
-        let live_ok = live <= limit && lcp(&self.e.tokens, ids) == live;
+        let live = self.e.tokens().len();
+        let live_ok = live <= limit && lcp(self.e.tokens(), ids) == live;
         let best = (0..self.snaps.len())
             .filter(|&i| {
                 self.snaps[i].tokens.len() <= limit && ids.starts_with(&self.snaps[i].tokens)
@@ -770,7 +1031,13 @@ impl FlashServe {
             let i = best.unwrap();
             self.clock += 1;
             self.snaps[i].used = self.clock;
-            let valid = lcp(&self.e.tokens, &self.snaps[i].tokens);
+            self.snaps[i].at = crate::retention::now();
+            if self.snaps[i].pinned {
+                if let Some(p) = self.disk_path(&self.snaps[i].tokens) {
+                    crate::retention::touch(&p);
+                }
+            }
+            let valid = lcp(self.e.tokens(), &self.snaps[i].tokens);
             for p in &self.snaps[i].pos {
                 self.e.restore_positional(p, valid)?;
             }
@@ -780,7 +1047,7 @@ impl FlashServe {
         } else if !live_ok {
             match self.load_disk(ids, limit).filter(|s| s.tokens.len() > 0) {
                 Some(s) => {
-                    let valid = lcp(&self.e.tokens, &s.tokens);
+                    let valid = lcp(self.e.tokens(), &s.tokens);
                     for p in &s.pos {
                         self.e.restore_positional(p, valid)?;
                     }
@@ -805,7 +1072,7 @@ impl FlashServe {
         // The end of the tools block, which the template puts before the system text (that
         // has the working directory in it): the same for every session of a client.
         if let Some(i) = text.find("</IMPORTANT>").filter(|&i| i < 200_000) {
-            if let Ok(head) = self.tok.encode(&text[..i + "</IMPORTANT>".len()]) {
+            if let Ok(head) = self.encode(&text[..i + "</IMPORTANT>".len()]) {
                 if head.len() > 1 && ids.starts_with(&head[..head.len() - 1]) {
                     // The last token may merge with what follows; stop one short.
                     marks.push((head.len() - 1, true));
@@ -852,7 +1119,7 @@ impl FlashServe {
             if p > a {
                 let t = Instant::now();
                 let (_, st, mtp) =
-                    prefill_span(&mut self.e, &ids[a..p], MAX_T, mtp_from, self.wide, false)?;
+                    prefill_span(&mut *self.e, &ids[a..p], MAX_T, mtp_from, self.wide, false)?;
                 if log {
                     span_line(a, p, t.elapsed().as_secs_f64() * 1e3, &st, mtp);
                 }
@@ -869,7 +1136,7 @@ impl FlashServe {
         }
         let t = Instant::now();
         let (next, st, mtp) =
-            prefill_span(&mut self.e, &ids[a..], MAX_T, mtp_from, self.wide, true)?;
+            prefill_span(&mut *self.e, &ids[a..], MAX_T, mtp_from, self.wide, true)?;
         if log {
             span_line(a, ids.len(), t.elapsed().as_secs_f64() * 1e3, &st, mtp);
         }
@@ -880,6 +1147,7 @@ impl FlashServe {
         &mut self,
         req: &Request,
         on: &mut dyn FnMut(Piece) -> bool,
+        ctl: &mut dyn Control,
     ) -> Result<(Finish, Usage)> {
         let t0 = Instant::now();
         self.line = Line::default();
@@ -918,8 +1186,7 @@ impl FlashServe {
             card.2
         };
         let presence = req.presence_penalty.unwrap_or(card.3);
-        self.e.temperature = temp;
-        self.e.seed = req.sampling.seed as u32;
+        self.e.set_sampling(temp, req.sampling.seed as u32);
         if let Some(sp) = self.e.sampler_mut() {
             // top-k 0 (off) keeps the 64 best: the sampler's bound.
             sp.top_k = if top_k == 0 {
@@ -962,6 +1229,7 @@ impl FlashServe {
                 decode_tok_s: out as f64 / decode_s.max(1e-9),
                 draft_tokens: drafted,
                 accepted_tokens: accepted,
+                ..Default::default()
             };
         if req.prefill_only {
             self.line.finish = "prefill";
@@ -986,6 +1254,10 @@ impl FlashServe {
         let mut first = None;
         let t1 = Instant::now();
         let mut pending = vec![cur];
+        let mut sess = self.suffix.then(|| {
+            let cost: Vec<f32> = (0..=MAX_T).map(|k| self.dcfg.cost(k.max(1))).collect();
+            crate::draft::Session::new(&self.dcfg, &self.dglobal, self.dcalib.clone(), cost, &ids)
+        });
         // Deliver pieces; false when the client went away.
         let mut deliver = |pieces: Vec<Piece>,
                            content: &mut String,
@@ -1010,6 +1282,11 @@ impl FlashServe {
             true
         };
         'gen: loop {
+            // The prefill can't stop part way; decode stops between windows.
+            if ctl.cancelled() {
+                finish = Finish::Cancelled;
+                break 'gen;
+            }
             let mut wrap = false;
             for &tok in &pending {
                 if self.eos.contains(&tok) {
@@ -1017,6 +1294,9 @@ impl FlashServe {
                     break 'gen;
                 }
                 out.push(tok);
+                if let Some(ss) = sess.as_mut() {
+                    ss.push(tok);
+                }
                 if tok == self.think.0 {
                     in_think = true;
                 } else if tok == self.think.1 {
@@ -1025,7 +1305,12 @@ impl FlashServe {
                     spent += 1;
                 }
                 wrap |= think.step(tok);
-                if let Some(new) = detok.push(&self.tok, &out)? {
+                // Tag tokens come out as tags, everything else as literal text (see `Parser`).
+                for chunk in detok.push(&out, &self.tags, |ids| self.tok.decode(ids))? {
+                    let (new, tag) = match chunk {
+                        Chunk::Text(s) => (s, None),
+                        Chunk::Tag(t) => (t.to_string(), Some(t)),
+                    };
                     text_out.push_str(&new);
                     let stop_at = req
                         .stop
@@ -1036,7 +1321,11 @@ impl FlashServe {
                         Some(i) => new[..new.len().saturating_sub(text_out.len() - i)].to_string(),
                         None => new,
                     };
-                    if !deliver(parser.push(&new), &mut content, &mut calls, &mut first) {
+                    let pieces = match tag {
+                        Some(t) if new == t => parser.push_tag(t),
+                        _ => parser.push_text(&new),
+                    };
+                    if !deliver(pieces, &mut content, &mut calls, &mut first) {
                         finish = Finish::Cancelled;
                         break 'gen;
                     }
@@ -1055,9 +1344,16 @@ impl FlashServe {
                 think.closed(self.wrap_up.len());
                 for &w in &self.wrap_up.clone() {
                     out.push(w);
-                    if let Some(new) = detok.push(&self.tok, &out)? {
-                        text_out.push_str(&new);
-                        if !deliver(parser.push(&new), &mut content, &mut calls, &mut first) {
+                    if let Some(ss) = sess.as_mut() {
+                        ss.push(w);
+                    }
+                    for chunk in detok.push(&out, &self.tags, |ids| self.tok.decode(ids))? {
+                        text_out.push_str(match &chunk {
+                            Chunk::Text(s) => s,
+                            Chunk::Tag(t) => t,
+                        });
+                        let pieces = parser.push_chunk(&chunk);
+                        if !deliver(pieces, &mut content, &mut calls, &mut first) {
                             finish = Finish::Cancelled;
                             break 'gen;
                         }
@@ -1066,7 +1362,7 @@ impl FlashServe {
                 in_think = false;
                 let mut feed = vec![last];
                 feed.extend_from_slice(&self.wrap_up);
-                let next = self.e.prefill(&feed, MAX_T, None)?;
+                let next = self.e.prefill(&feed, MAX_T)?;
                 windows += feed.len().div_ceil(MAX_T);
                 pending = vec![next];
                 continue;
@@ -1080,17 +1376,27 @@ impl FlashServe {
                     room = room.min(b.saturating_sub(spent + 1));
                 }
             }
-            let (mut drafts, mut probs) = self.policy.choose(&self.e.mtp_last, room);
+            let proposal = sess.as_ref().map(|ss| ss.propose(room));
+            let (mut drafts, mut probs) = match &proposal {
+                Some(d) => (d.tokens.clone(), Vec::new()),
+                None => self.policy.choose(self.e.mtp_last(), room),
+            };
             if let Some(k) = drafts.iter().position(|d| self.eos.contains(d)) {
                 drafts.truncate(k);
                 probs.truncate(k);
             }
             let kept = self.e.verify(last, &drafts)?;
-            if self.e.use_mtp {
-                let wall = self.e.last.wall_ms;
-                let mtp = self.e.last_mtp_ms;
+            if self.e.use_mtp() {
+                let wall = self.e.last().wall_ms;
+                let mtp = self.e.last_mtp_ms();
                 self.policy
                     .observe(&probs, kept.len() - 1, drafts.len() + 1, wall, mtp);
+            }
+            if let (Some(ss), Some(d)) = (sess.as_mut(), &proposal) {
+                let acc = kept.len() - 1;
+                for j in 0..drafts.len().min(acc + 1) {
+                    ss.calib.observe(d.match_len, d.shares[j], j < acc);
+                }
             }
             windows += 1;
             drafted += drafts.len();
@@ -1104,6 +1410,11 @@ impl FlashServe {
             }
         }
         let decode_s = t1.elapsed().as_secs_f64();
+        if let Some(ss) = sess {
+            self.dcalib = ss.calib.clone();
+            drop(ss);
+            self.dglobal.push(&out);
+        }
         // A reply that ended on its own can be spliced into the next prompt.
         if matches!(finish, Finish::Stop | Finish::ToolCalls)
             && req.stop.iter().all(|s| !text_out.contains(s.as_str()))
@@ -1113,6 +1424,7 @@ impl FlashServe {
                 calls: calls.clone(),
                 tail,
                 ids: out.clone(),
+                at: crate::retention::now(),
             });
             while self.memo.len() > 256 {
                 self.memo.pop_front();
@@ -1147,6 +1459,25 @@ impl FlashServe {
     }
 }
 
+impl FlashServe {
+    fn run(
+        &mut self,
+        req: &Request,
+        on: &mut dyn FnMut(Piece) -> bool,
+        ctl: &mut dyn Control,
+    ) -> Result<(Finish, Usage)> {
+        self.expire_memory();
+        let r = self.generate(req, on, ctl);
+        self.live_at = crate::retention::now();
+        if r.is_err() {
+            // Whatever the engine holds now is unknown: start over next time.
+            self.e.reset();
+        }
+        self.save_routing();
+        r
+    }
+}
+
 impl Backend for FlashServe {
     fn model_path(&self, _spec: &str) -> Result<PathBuf> {
         Ok(self.gguf.clone())
@@ -1157,17 +1488,25 @@ impl Backend for FlashServe {
         req: &Request,
         on: &mut dyn FnMut(Piece) -> bool,
     ) -> Result<(Finish, Usage)> {
-        let r = self.generate(req, on);
-        if r.is_err() {
-            // Whatever the engine holds now is unknown: start over next time.
-            self.e.reset();
-        }
-        self.save_routing();
-        r
+        self.run(req, on, &mut ())
+    }
+
+    fn complete_with(
+        &mut self,
+        req: &Request,
+        _prompt: Option<(String, Vec<u32>)>,
+        on: &mut dyn FnMut(Piece) -> bool,
+        ctl: &mut dyn Control,
+    ) -> Result<Outcome> {
+        self.run(req, on, ctl).map(|(f, u)| Outcome::Done(f, u))
     }
 
     fn context_window(&self) -> usize {
         self.ctx
+    }
+
+    fn expire(&mut self) {
+        FlashServe::expire(self)
     }
 
     fn after(&mut self, _req: &Request, result: &Result<(Finish, Usage)>) {
@@ -1200,7 +1539,7 @@ impl Backend for FlashServe {
             Err(e) => eprintln!("tang-llm: req {}: error: {e:#}", self.requests),
         }
         // Keep the end of this conversation, in case another one runs next.
-        if result.is_ok() && !self.e.tokens.is_empty() {
+        if result.is_ok() && !self.e.tokens().is_empty() {
             let t = Instant::now();
             if let Err(e) = self.snapshot(false) {
                 eprintln!("tang-llm: saving the running state: {e:#}");
@@ -1209,7 +1548,7 @@ impl Backend for FlashServe {
             if ms > 50.0 {
                 eprintln!(
                     "tang-llm: saved the running state at {} in {ms:.0} ms",
-                    self.e.tokens.len()
+                    self.e.tokens().len()
                 );
             }
         }
@@ -1351,8 +1690,8 @@ pub fn default_disk(gguf: &Path) -> Option<PathBuf> {
 /// window's stats and the MTP time. The MTP's K/V for earlier positions stays unwritten: that
 /// only changes its drafts' acceptance, never the output (measured: no change in tokens/window
 /// at 2K and 10K with the last 512 positions).
-pub fn prefill_windows(
-    e: &mut Engine,
+pub fn prefill_windows<E: ServeEngine + ?Sized>(
+    e: &mut E,
     ids: &[u32],
     chunk: usize,
     mtp_from: usize,
@@ -1363,8 +1702,8 @@ pub fn prefill_windows(
 /// [`prefill_windows`] with wide prefill windows (`Engine::prefill_wide`, widths 16/32/64 up
 /// to `wide`; 0: none) for everything but the last `MAX_T` tokens when `last` (that window
 /// runs the head), or for all of it otherwise (the result's next token is then meaningless).
-pub fn prefill_span(
-    e: &mut Engine,
+pub fn prefill_span<E: ServeEngine + ?Sized>(
+    e: &mut E,
     ids: &[u32],
     chunk: usize,
     mtp_from: usize,
@@ -1372,9 +1711,10 @@ pub fn prefill_span(
     last: bool,
 ) -> Result<(u32, Vec<super::engine::WinStats>, f64)> {
     ensure!(!ids.is_empty(), "empty prompt");
-    let pos_start = e.tokens.len();
-    e.tokens.extend_from_slice(ids);
-    let end = e.tokens.len();
+    let pos_start = e.tokens().len();
+    e.tokens_mut().extend_from_slice(ids);
+    let end = e.tokens().len();
+    let wide = if e.has_wide() { wide } else { 0 };
     let (mut pos, mut next, mut stats, mut mtp_ms) = (pos_start, 0, Vec::new(), 0.0);
     while pos < end {
         let left = end - pos;
@@ -1385,14 +1725,14 @@ pub fn prefill_span(
             continue;
         }
         let t = chunk.min(left).clamp(1, MAX_T);
-        let out = e.window(pos, t, None)?;
-        stats.push(e.last);
-        if e.use_mtp && e.has_mtp() && pos + t > mtp_from {
+        let out = e.window(pos, t)?;
+        stats.push(e.last());
+        if e.use_mtp() && pos + t > mtp_from {
             let nexts: Vec<u32> = (0..t)
-                .map(|i| e.tokens.get(pos + i + 1).copied().unwrap_or(out[t - 1]))
+                .map(|i| e.tokens().get(pos + i + 1).copied().unwrap_or(out[t - 1]))
                 .collect();
             let t0 = Instant::now();
-            e.mtp_last = e.mtp_draft(pos, &nexts)?;
+            e.mtp_draft(pos, &nexts)?;
             mtp_ms += t0.elapsed().as_secs_f64() * 1e3;
         }
         next = out[t - 1];
@@ -1741,6 +2081,7 @@ pub fn serve_replay(args: &[String]) -> Result<()> {
         disk,
         dump: None,
         warm: Vec::new(),
+        suffix: false,
         profile,
     };
     let mut me = FlashServe::load(&s)?;

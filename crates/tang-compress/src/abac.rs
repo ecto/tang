@@ -38,6 +38,10 @@ impl BitModel {
         let p = clamp_p(p1) as u16;
         Self { fast: p, slow: p }
     }
+    /// `fast | slow << 16` (the GPU decoder's model word).
+    pub fn packed(&self) -> u32 {
+        self.fast as u32 | (self.slow as u32) << 16
+    }
     /// Current `P(1)` in 16-bit fixed point.
     #[inline]
     pub fn p1(&self) -> u32 {
@@ -75,7 +79,13 @@ impl Default for Encoder {
 impl Encoder {
     /// Fresh encoder.
     pub fn new() -> Self {
-        Self { low: 0, range: u32::MAX, cache: 0, cache_size: 1, out: Vec::new() }
+        Self {
+            low: 0,
+            range: u32::MAX,
+            cache: 0,
+            cache_size: 1,
+            out: Vec::new(),
+        }
     }
 
     fn shift_low(&mut self) {
@@ -150,7 +160,12 @@ pub struct Decoder<'a> {
 impl<'a> Decoder<'a> {
     /// Start decoding `buf` (as produced by [`Encoder::finish`]).
     pub fn new(buf: &'a [u8]) -> Self {
-        let mut d = Self { code: 0, range: u32::MAX, buf, pos: 0 };
+        let mut d = Self {
+            code: 0,
+            range: u32::MAX,
+            buf,
+            pos: 0,
+        };
         for _ in 0..4 {
             d.code = (d.code << 8) | d.next() as u32;
         }
@@ -221,7 +236,10 @@ const MODELED: usize = 2;
 
 impl Default for UintModel {
     fn default() -> Self {
-        Self { unary: vec![BitModel::default(); UBITS], mant: vec![BitModel::default(); UBITS * MODELED] }
+        Self {
+            unary: vec![BitModel::default(); UBITS],
+            mant: vec![BitModel::default(); UBITS * MODELED],
+        }
     }
 }
 
@@ -253,7 +271,11 @@ impl UintModel {
         }
         let mut w = 1u64;
         for j in 0..k {
-            let bit = if j < MODELED { d.decode(&mut self.mant[k * MODELED + j]) } else { d.decode_p(ONE / 2) };
+            let bit = if j < MODELED {
+                d.decode(&mut self.mant[k * MODELED + j])
+            } else {
+                d.decode_p(ONE / 2)
+            };
             w = (w << 1) | bit as u64;
         }
         w - 1
@@ -272,14 +294,18 @@ mod tests {
     use super::*;
 
     fn lcg(s: &mut u64) -> u64 {
-        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         *s >> 33
     }
 
     #[test]
     fn round_trip_models_and_raw() {
         let mut s = 7;
-        let bits: Vec<bool> = (0..200_000).map(|i| lcg(&mut s) % 100 < if i % 3 == 0 { 3 } else { 60 }).collect();
+        let bits: Vec<bool> = (0..200_000)
+            .map(|i| lcg(&mut s) % 100 < if i % 3 == 0 { 3 } else { 60 })
+            .collect();
         let vals: Vec<u64> = (0..5000).map(|_| lcg(&mut s) % 3000).collect();
         let mut e = Encoder::new();
         let mut ms = [BitModel::default(); 3];

@@ -9,7 +9,21 @@ fn rng(seed: &mut u64) -> u32 {
 
 /// Interesting 32-bit values plus random ones.
 fn samples(n: usize) -> Vec<u32> {
-    let mut v = vec![0, 1, 2, 31, 32, 33, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff, 0xffff, 0x1_0000, (-2047i32) as u32, 2047];
+    let mut v = vec![
+        0,
+        1,
+        2,
+        31,
+        32,
+        33,
+        0x7fff_ffff,
+        0x8000_0000,
+        0xffff_ffff,
+        0xffff,
+        0x1_0000,
+        (-2047i32) as u32,
+        2047,
+    ];
     let mut s = 0x9e37_79b9_7f4a_7c15;
     while v.len() < n {
         let x = rng(&mut s);
@@ -55,9 +69,15 @@ fn all_ops() -> (IntGraph, Vec<IId>) {
         outs.push(g.bitcast(IType::U32, n));
         let n = g.not(x);
         outs.push(g.bitcast(IType::U32, n));
+        let n = g.clz(x);
+        outs.push(g.bitcast(IType::U32, n));
         let lo = g.i32(-16384);
         let hi = g.i32(16384);
-        let (lo, hi) = if g.ty(x) == IType::I32 { (lo, hi) } else { (g.u32(3), g.u32(1 << 20)) };
+        let (lo, hi) = if g.ty(x) == IType::I32 {
+            (lo, hi)
+        } else {
+            (g.u32(3), g.u32(1 << 20))
+        };
         let c = g.clamp(x, lo, hi);
         outs.push(g.bitcast(IType::U32, c));
     }
@@ -84,6 +104,7 @@ fn reference(a: u32, b: u32) -> Vec<u32> {
         (sa <= sb) as u32,
         sa.wrapping_neg() as u32,
         !a,
+        a.leading_zeros(),
         sa.clamp(-16384, 16384) as u32,
     ];
     v.extend([
@@ -104,6 +125,7 @@ fn reference(a: u32, b: u32) -> Vec<u32> {
         (a <= b) as u32,
         a.wrapping_neg(),
         !a,
+        a.leading_zeros(),
         a.clamp(3, 1 << 20),
     ]);
     v
@@ -191,7 +213,11 @@ fn collatz() -> (IntGraph, Vec<IId>) {
 fn collatz_ref(mut x: u32) -> [u32; 2] {
     let (mut steps, mut a, mut b) = (0u32, 1u32, 0u32);
     while x > 1 {
-        x = if x & 1 == 1 { x.wrapping_mul(3).wrapping_add(1) } else { x >> 1 };
+        x = if x & 1 == 1 {
+            x.wrapping_mul(3).wrapping_add(1)
+        } else {
+            x >> 1
+        };
         steps += 1;
         (a, b) = (a.wrapping_add(b), a);
     }
@@ -235,7 +261,11 @@ fn loops_match_reference() {
     }
     let (g, o) = loads();
     let bytes: Vec<i8> = (0..64).map(|i: i32| (i * 37 - 100) as i8).collect();
-    let pack = |b: &[u8]| b.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<u32>>();
+    let pack = |b: &[u8]| {
+        b.chunks(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect::<Vec<u32>>()
+    };
     let raw: Vec<u8> = bytes.iter().map(|&b| b as u8).collect();
     let packed = pack(&raw);
     let words: Vec<u32> = (0..64).map(|i: i32| (i * -12345) as u32).collect();
@@ -244,7 +274,9 @@ fn loops_match_reference() {
     p.run(&[61], &[&packed, &packed, &words], &mut out);
     let r0: i32 = bytes[..61].iter().map(|&b| b as i32).sum();
     let r1: u32 = raw[..61].iter().map(|&b| b as u32).sum();
-    let r2 = words[..61].iter().fold(0i32, |a, &w| a.wrapping_add(w as i32));
+    let r2 = words[..61]
+        .iter()
+        .fold(0i32, |a, &w| a.wrapping_add(w as i32));
     assert_eq!(out, [r0 as u32, r1, r2 as u32]);
 }
 
@@ -282,14 +314,23 @@ fn wgsl_module(fns: &str) -> String {
 #[test]
 fn wgsl_validates() {
     let mut fns = String::new();
-    for (name, (g, o)) in [("all_ops", all_ops()), ("nested", nested()), ("collatz", collatz()), ("loads", loads())] {
+    for (name, (g, o)) in [
+        ("all_ops", all_ops()),
+        ("nested", nested()),
+        ("collatz", collatz()),
+        ("loads", loads()),
+    ] {
         fns.push_str(&g.to_wgsl_fn(name, &o));
     }
     let src = wgsl_module(&fns);
-    let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{}\n{src}", e.emit_to_string(&src)));
-    naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
-        .validate(&module)
-        .unwrap_or_else(|e| panic!("{e:?}\n{src}"));
+    let module = naga::front::wgsl::parse_str(&src)
+        .unwrap_or_else(|e| panic!("{}\n{src}", e.emit_to_string(&src)));
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .unwrap_or_else(|e| panic!("{e:?}\n{src}"));
 }
 
 /// The Rust lowering, compiled with rustc and run against the interpreter.
@@ -305,18 +346,31 @@ fn rust_lowering_matches_eval() {
     let s = samples(40);
     let bytes: Vec<u32> = (0..16u32).map(|i| i.wrapping_mul(0x9e37_79b9)).collect();
     let mut src = String::new();
-    for (n, (g, o)) in [("all_ops", (&g0, &o0)), ("nested", (&g1, &o1)), ("collatz", (&g2, &o2)), ("loads", (&g3, &o3))] {
+    for (n, (g, o)) in [
+        ("all_ops", (&g0, &o0)),
+        ("nested", (&g1, &o1)),
+        ("collatz", (&g2, &o2)),
+        ("loads", (&g3, &o3)),
+    ] {
         src.push_str(&g.to_rust(n, o));
     }
     src.push_str("fn main() {\n");
-    src.push_str(&format!("    let s: &[u32] = &{s:?};\n    let b: &[u32] = &{bytes:?};\n"));
-    src.push_str("    for &a in s { for &c in s { println!(\"{:?}\", all_ops(a as i32, c as i32)); } }\n");
+    src.push_str(&format!(
+        "    let s: &[u32] = &{s:?};\n    let b: &[u32] = &{bytes:?};\n"
+    ));
+    src.push_str(
+        "    for &a in s { for &c in s { println!(\"{:?}\", all_ops(a as i32, c as i32)); } }\n",
+    );
     src.push_str("    for &a in s { println!(\"{:?}\", nested(a % 23, a)); println!(\"{:?}\", collatz(a % 100000)); }\n");
     src.push_str("    for n in 0..17 { println!(\"{:?}\", loads(n, b, b, b)); }\n}\n");
     let file = dir.join("lowered.rs");
     std::fs::write(&file, &src).unwrap();
     let exe = dir.join("lowered");
-    let st = std::process::Command::new(&rustc).args(["-O", "--edition", "2021", "-o"]).arg(&exe).arg(&file).status();
+    let st = std::process::Command::new(&rustc)
+        .args(["-O", "--edition", "2021", "-o"])
+        .arg(&exe)
+        .arg(&file)
+        .status();
     let Ok(st) = st else {
         eprintln!("rustc not available; skipping");
         return;
@@ -325,7 +379,17 @@ fn rust_lowering_matches_eval() {
     let got = String::from_utf8(std::process::Command::new(&exe).output().unwrap().stdout).unwrap();
     let mut want = String::new();
     let fmt = |v: &[u32], ty: &[IType]| -> String {
-        let parts: Vec<String> = v.iter().zip(ty).map(|(&x, t)| if *t == IType::I32 { (x as i32).to_string() } else { x.to_string() }).collect();
+        let parts: Vec<String> = v
+            .iter()
+            .zip(ty)
+            .map(|(&x, t)| {
+                if *t == IType::I32 {
+                    (x as i32).to_string()
+                } else {
+                    x.to_string()
+                }
+            })
+            .collect();
         if ty.windows(2).all(|w| w[0] == w[1]) {
             format!("[{}]", parts.join(", "))
         } else {
@@ -346,9 +410,271 @@ fn rust_lowering_matches_eval() {
         want.push('\n');
     }
     for n in 0..17 {
-        want += &fmt(&g3.eval(&o3, &[n], &[&bytes, &bytes, &bytes]), &tys(&g3, &o3));
+        want += &fmt(
+            &g3.eval(&o3, &[n], &[&bytes, &bytes, &bytes]),
+            &tys(&g3, &o3),
+        );
         want.push('\n');
     }
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(got, want);
+}
+
+#[test]
+fn div_rem_have_wgsl_semantics() {
+    let mut g = IntGraph::new();
+    let a = g.param(0, IType::I32);
+    let b = g.param(1, IType::I32);
+    let (ua, ub) = (g.bitcast(IType::U32, a), g.bitcast(IType::U32, b));
+    let o = vec![g.div(a, b), g.rem(a, b), g.div(ua, ub), g.rem(ua, ub)];
+    let mut p = Program::new(&g, &o);
+    for &(x, y) in &[
+        (7i32, 2i32),
+        (-7, 2),
+        (7, -2),
+        (5, 0),
+        (i32::MIN, -1),
+        (i32::MIN, 0),
+        (-1, 3),
+    ] {
+        let mut out = [0u32; 4];
+        p.run(&[x as u32, y as u32], &[], &mut out);
+        let sd = if y == 0 { x } else { x.wrapping_div(y) };
+        let sr = if y == 0 { 0 } else { x.wrapping_rem(y) };
+        let (ux, uy) = (x as u32, y as u32);
+        assert_eq!(
+            out,
+            [
+                sd as u32,
+                sr as u32,
+                ux.checked_div(uy).unwrap_or(ux),
+                ux.checked_rem(uy).unwrap_or(0)
+            ]
+        );
+    }
+}
+
+fn capped_collatz(cap: u32) -> (IntGraph, Vec<IId>) {
+    let (mut g, o) = collatz();
+    g.cap_loop(o[0], cap);
+    (g, o)
+}
+
+#[test]
+fn loop_caps_bound_trips() {
+    let (g, o) = capped_collatz(5);
+    let (h, _) = collatz();
+    let ho = collatz().1;
+    for x in [1u32, 2, 3, 27, 97] {
+        let c = g.eval(&o, &[x], &[]);
+        let u = h.eval(&ho, &[x], &[]);
+        assert_eq!(c[0], u[0].min(5), "x={x}");
+    }
+    // nested: inner loops re-arm their counter on every entry
+    let (mut g, o) = nested();
+    let inner = g.loops.iter().position(|l| l.parent.is_some()).unwrap();
+    g.loops[inner].cap = Some(3);
+    let n = 9u32;
+    let mut s = 0u32;
+    for i in 0..n {
+        for j in 0..i.min(3) {
+            s = s.wrapping_add(i.wrapping_mul(j) ^ 25);
+        }
+    }
+    assert_eq!(g.eval(&o, &[n, 5], &[]), vec![s]);
+}
+
+fn abi() -> (Vec<IType>, Vec<(&'static str, Elem)>) {
+    (
+        vec![IType::U32, IType::U32],
+        vec![("bi8", Elem::I8), ("bu8", Elem::U8), ("bw", Elem::I32)],
+    )
+}
+
+#[test]
+fn wire_round_trip_and_guarded_wgsl() {
+    let (mut g, o) = nested();
+    for l in 0..g.loops.len() {
+        g.loops[l].cap = Some(64);
+    }
+    let (pt, bufs) = abi();
+    let bytes = g.to_bytes(&o);
+    let (h, ho) =
+        IntGraph::from_bytes(&bytes, &pt, &bufs, &[IType::U32], &Limits::default()).unwrap();
+    for (n, k) in [(0u32, 3u32), (5, 7), (40, 1)] {
+        assert_eq!(h.eval(&ho, &[n, k], &[]), g.eval(&o, &[n, k], &[]));
+    }
+    let (mut lg, lo) = loads();
+    for l in 0..lg.loops.len() {
+        lg.loops[l].cap = Some(64);
+    }
+    let lb = lg.to_bytes(&lo);
+    let (lh, lho) = IntGraph::from_bytes(
+        &lb,
+        &pt[..lg.nparams().len()],
+        &bufs,
+        &vec![IType::I32; lo.len()]
+            .iter()
+            .zip(&lo)
+            .map(|(_, &x)| lg.ty(x))
+            .collect::<Vec<_>>(),
+        &Limits::default(),
+    )
+    .unwrap();
+    let body = lh.to_wgsl_body_guarded(
+        &lho,
+        &["0u", "1u"],
+        &(0..lho.len()).map(|_| "_").collect::<Vec<_>>(),
+        1,
+    );
+    let src = wgsl_module(&format!("fn guarded() {{\n{body}}}\n"));
+    let module = naga::front::wgsl::parse_str(&src)
+        .unwrap_or_else(|e| panic!("{}\n{src}", e.emit_to_string(&src)));
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .unwrap_or_else(|e| panic!("{e:?}\n{src}"));
+    // out-of-bounds loads read 0
+    assert!(lh
+        .eval(&lho, &[1 << 30, 1 << 30], &[&[], &[], &[]])
+        .iter()
+        .all(|&v| v == 0));
+}
+
+#[test]
+fn wire_rejects_bad_graphs() {
+    let (pt, bufs) = abi();
+    let lim = Limits::default();
+    let rd = |b: &[u8], p: &[IType]| IntGraph::from_bytes(b, p, &bufs, &[IType::U32], &lim);
+    let (g, o) = capped_collatz(100);
+    let good = g.to_bytes(&o[..1]);
+    assert!(rd(&good, &pt[..1]).is_ok());
+    // wrong param type
+    assert!(rd(&good, &[IType::I32]).is_err());
+    // over the trip limit / cost limit
+    let (g2, o2) = capped_collatz(1 << 13);
+    assert!(rd(&g2.to_bytes(&o2[..1]), &pt[..1]).is_err());
+    let tight = Limits {
+        max_cost: 10,
+        ..lim
+    };
+    assert!(IntGraph::from_bytes(&good, &pt[..1], &bufs, &[IType::U32], &tight).is_err());
+    // truncations, trailing bytes and random corruption never panic
+    for n in 0..good.len() {
+        assert!(rd(&good[..n], &pt[..1]).is_err());
+    }
+    let mut t = good.clone();
+    t.push(0);
+    assert!(rd(&t, &pt[..1]).is_err());
+    let mut seed = 99u64;
+    for _ in 0..20000 {
+        let mut b = good.clone();
+        for _ in 0..1 + rng(&mut seed) % 4 {
+            let i = 4 + rng(&mut seed) as usize % (b.len() - 4);
+            b[i] = rng(&mut seed) as u8;
+        }
+        if let Ok((h, ho)) = rd(&b, &pt[..1]) {
+            // whatever passes is total and terminates
+            let _ = h.eval(&ho, &[27], &[&[], &[], &[]]);
+            let _ = h.to_wgsl_body_guarded(&ho, &["1u"], &["_"], 1);
+        }
+    }
+}
+
+/// A loop of read-modify-write steps on a scratch buffer: `scr[(7i + 3) % 13]
+/// += i` for `i < n`, returning the sum of the values read and the token.
+fn scratch() -> (IntGraph, Vec<IId>) {
+    let mut g = IntGraph::new();
+    let sb = g.buffer_rw("scr", Elem::U32, 13, "sb");
+    let n = g.param(0, IType::U32);
+    let z = g.u32(0);
+    let t0 = g.token();
+    let out = g.for_range(n, &[z, t0], |g, i, s| {
+        let (seven, three, m) = (g.u32(7), g.u32(3), g.u32(13));
+        let a = g.mul(i, seven);
+        let a = g.add(a, three);
+        let idx = g.rem(a, m);
+        let v = g.load_rw(sb, idx, s[1]);
+        let nv = g.add(v, i);
+        let t = g.store(sb, idx, nv, s[1]);
+        vec![g.add(s[0], v), t]
+    });
+    g.cap_loop(out[0], 64);
+    // an out-of-range store is dropped, an out-of-range load reads 0
+    let big = g.u32(99);
+    let one = g.u32(1);
+    let t = g.store(sb, big, one, out[1]);
+    let v = g.load_rw(sb, big, t);
+    let s = g.add(out[0], v);
+    (g, vec![s, t])
+}
+
+fn scratch_ref(n: u32, scr: &mut [u32]) -> u32 {
+    let mut s = 0u32;
+    for i in 0..n {
+        let idx = ((i * 7 + 3) % 13) as usize;
+        s = s.wrapping_add(scr[idx]);
+        scr[idx] = scr[idx].wrapping_add(i);
+    }
+    s
+}
+
+#[test]
+fn scratch_effects_are_ordered() {
+    let (g, o) = scratch();
+    let mut p = Program::new(&g, &o);
+    let bytes = g.to_bytes(&o);
+    let (g2, o2) = IntGraph::from_bytes_rw(
+        &bytes,
+        &[IType::U32],
+        &[],
+        &[("scr", Elem::U32, 13, "sb")],
+        &[IType::U32, IType::U32],
+        &Limits::default(),
+    )
+    .unwrap();
+    let mut p2 = Program::new(&g2, &o2);
+    for n in [0u32, 1, 5, 13, 40] {
+        let mut want = [5u32; 13];
+        let s = scratch_ref(n, &mut want);
+        for p in [&mut p, &mut p2] {
+            let mut scr = [5u32; 13];
+            let mut out = [0u32; 2];
+            p.run_rw(&[n], &[], &mut [&mut scr], &mut out);
+            assert_eq!(out, [s, 0]);
+            assert_eq!(scr, want);
+        }
+    }
+    // the WGSL lowerings (scratch in workgroup memory) validate
+    for guarded in [false, true] {
+        let body = if guarded {
+            g.to_wgsl_body_guarded(&o, &["n"], &["a", "b"], 1)
+        } else {
+            g.to_wgsl_body(&o, &["n"], &["a", "b"], 1)
+        };
+        assert!(body.contains("scr[(sb) + "), "{body}");
+        let src = format!("var<workgroup> scr: array<u32, 64>;\nvar<private> sb: u32;\nfn f(n: u32) {{\n    var a: u32;\n    var b: u32;\n{body}}}\n@compute @workgroup_size(1) fn main() {{ f(3u); }}\n");
+        let module = naga::front::wgsl::parse_str(&src)
+            .unwrap_or_else(|e| panic!("{}\n{src}", e.emit_to_string(&src)));
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("{e:?}\n{src}"));
+    }
+    assert!(g.to_rust("f", &o).contains("scr: &mut [u32]"));
+}
+
+#[test]
+fn scratch_needs_a_scratch_buffer() {
+    let mut g = IntGraph::new();
+    let b = g.buffer("ro", Elem::U32);
+    let (i, t) = (g.u32(0), g.token());
+    let n = INode::Store(b, i, i, t);
+    assert!(g.try_infer(n).is_err());
+    let sb = g.buffer_rw("scr", Elem::U32, 4, "0u");
+    assert!(g.try_infer(INode::Load(sb, i)).is_err());
 }

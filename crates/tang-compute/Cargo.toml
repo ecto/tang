@@ -30,3 +30,11 @@ objc = { version = "0.2", optional = true }
 cudarc = { version = "0.16", features = ["nvrtc", "cublas", "cuda-version-from-build-system"], optional = true }
 
 [build-dependencies]
+
+[dev-dependencies]
+# Path only, so publishing strips it: only the kvdec example uses it.
+tang-compress = { path = "../tang-compress" }
+
+[[example]]
+name = "kvdec_bench"
+required-features = ["metal"]

@@ -24,6 +24,30 @@
 //! let ddot_dx0 = g.diff(dot, 0);
 //! let ddot_dx0 = g.simplify(ddot_dx0);
 //! ```
+//!
+//! # Integer dialect
+//!
+//! [`int::IntGraph`] is a separate, bit-exact 32-bit integer graph
+//! (`i32`/`u32`/`bool`, wrapping arithmetic, `mul_wide`, structured loops)
+//! with three lowerings that compute the same bits: the CPU interpreter
+//! ([`int::IntGraph::eval`] / [`int::Program`]), WGSL and Rust source.
+//!
+//! ```
+//! use tang_expr::int::{IType, IntGraph};
+//!
+//! // sum of i*i for i in 0..n
+//! let mut g = IntGraph::new();
+//! let n = g.param(0, IType::U32);
+//! let zero = g.u32(0);
+//! let s = g.for_range(n, &[zero], |g, i, s| {
+//!     let sq = g.mul(i, i);
+//!     vec![g.add(s[0], sq)]
+//! });
+//! assert_eq!(g.eval(&s, &[10], &[]), vec![285]);
+//!
+//! let wgsl = g.to_wgsl_fn("sum_sq", &s);
+//! assert!(wgsl.contains("fn sum_sq"));
+//! ```
 
 pub mod codegen;
 pub mod compile;

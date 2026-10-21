@@ -1,4 +1,6 @@
-//! SZ3-style multilevel interpolation codec for pointwise (max-abs) bounds.
+//! SZ3-style multilevel interpolation codec for pointwise (max-abs) bounds,
+//! and for RMSE / PSNR targets through rate control of the bound
+//! ([`encode_rmse_f32`]).
 //!
 //! Aimed at loose bounds on smooth fields, where the wavelet codec's fixed
 //! overheads (centroids, band predictors, outlier map) dominate a tiny
@@ -33,7 +35,7 @@ use crate::codec::Decoded;
 pub const MAGIC: &[u8; 4] = b"TCI1";
 
 /// Magnitude that marks an escaped (raw f32) point.
-const ESC: u64 = 1 << 24;
+pub(crate) const ESC: u64 = 1 << 24;
 const LVL: usize = 4;
 const ACT: usize = 9;
 const PREV: usize = 3;
@@ -204,7 +206,7 @@ fn get(d: &mut Decoder, m: &mut Models, cx: Ctx) -> Result<i64, f32> {
 
 /// Quantize one point: `(q, reconstruction, escaped)`.
 #[inline]
-fn quant(x: f32, pred: f64, step: f64, b: f64) -> (i64, f32, bool) {
+pub(crate) fn quant(x: f32, pred: f64, step: f64, b: f64) -> (i64, f32, bool) {
     let qf = ((x as f64 - pred) / step).round();
     if qf.abs() < (ESC - 1) as f64 {
         let q = qf as i64;
@@ -217,6 +219,11 @@ fn quant(x: f32, pred: f64, step: f64, b: f64) -> (i64, f32, bool) {
 }
 
 fn encode_with(x: &[f32], dims: &[usize], b: f64, tune: (f64, f64)) -> Vec<u8> {
+    encode_sse(x, dims, b, tune).0
+}
+
+/// [`encode_with`], also returning the reconstruction's squared error.
+fn encode_sse(x: &[f32], dims: &[usize], b: f64, tune: (f64, f64)) -> (Vec<u8>, f64) {
     let nl = levels(dims);
     let mut r = vec![0f32; x.len()];
     let mut m = Models::new();
@@ -286,7 +293,12 @@ fn encode_with(x: &[f32], dims: &[usize], b: f64, tune: (f64, f64)) -> Vec<u8> {
     w.u8(TUNE.iter().position(|&t| t == tune).unwrap() as u8);
     w.varint(kinds);
     w.bytes(&e.finish());
-    w.buf
+    let sse = x
+        .iter()
+        .zip(&r)
+        .map(|(&a, &b)| (a as f64 - b as f64).powi(2))
+        .sum();
+    (w.buf, sse)
 }
 
 /// Encode `x` (row-major, shape `dims`) with `|x − x̂| ≤ b` everywhere,
@@ -304,6 +316,124 @@ pub fn encode_f32(x: &[f32], dims: &[usize], b: f64) -> Vec<u8> {
         .unwrap()
 }
 
+/// Encode for an RMSE target (`rmse` absolute): the bound `b` is rate
+/// controlled per `(α, β)` preset — the largest `b` whose reconstruction
+/// meets the squared-error budget, by secant steps on `log SSE(log b)`
+/// inside a bisection bracket — and the smallest stream wins. The stream is
+/// an ordinary max-abs stream at that `b`; the target is checked on the
+/// exact reconstruction the decoder computes.
+pub fn encode_rmse_f32(x: &[f32], dims: &[usize], rmse: f64) -> Vec<u8> {
+    assert_eq!(
+        x.len(),
+        dims.iter().product::<usize>(),
+        "dims do not match data"
+    );
+    assert!(!dims.is_empty() && dims.len() <= 255 && rmse > 0.0);
+    TUNE.iter()
+        .map(|&t| rate_controlled(x, dims, rmse, t))
+        .min_by_key(|v| v.len())
+        .unwrap()
+}
+
+/// [`encode_rmse_f32`] at `PSNR = 20 log₁₀(range / RMSE)` dB.
+pub fn encode_psnr_f32(x: &[f32], dims: &[usize], psnr: f64) -> Vec<u8> {
+    let (lo, hi) = x
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &v| {
+            (a.min(v as f64), b.max(v as f64))
+        });
+    let range = if hi > lo { hi - lo } else { 1.0 };
+    encode_rmse_f32(x, dims, range / 10f64.powf(psnr / 20.0))
+}
+
+fn rate_controlled(x: &[f32], dims: &[usize], rmse: f64, tune: (f64, f64)) -> Vec<u8> {
+    rate_control(x.len(), rmse, |b| encode_sse(x, dims, b, tune))
+}
+
+/// Rate control of a max-abs bound `b` for an RMSE target over `n` values:
+/// the largest `b` whose stream (`enc(b)` returns it with its exact squared
+/// error) meets the budget, by secant steps on `log SSE(log b)` inside a
+/// bisection bracket (≤ 12 encodes, then halving by 4 until it passes).
+pub(crate) fn rate_control(
+    n: usize,
+    rmse: f64,
+    mut enc: impl FnMut(f64) -> (Vec<u8>, f64),
+) -> Vec<u8> {
+    let budget = rmse * rmse * n as f64;
+    // uniform quantization error ≈ b/√3 at the finest level
+    let mut b = rmse * 3f64.sqrt();
+    // (log b, log sse) of the tightest pass and the loosest fail
+    let mut ok: Option<(f64, f64, Vec<u8>)> = None;
+    let mut bad: Option<(f64, f64)> = None;
+    for _ in 0..12 {
+        let (s, sse) = enc(b);
+        let (lb, ls) = (b.ln(), sse.max(1e-300).ln());
+        if sse <= budget {
+            let close = sse >= budget * 0.99;
+            if ok.as_ref().is_none_or(|o| lb > o.0) {
+                ok = Some((lb, ls, s));
+            }
+            if close {
+                break;
+            }
+        } else if bad.is_none_or(|o| lb < o.0) {
+            bad = Some((lb, ls));
+        }
+        let lt = budget.ln();
+        b = match (&ok, bad) {
+            (Some(o), Some(f)) => {
+                // secant on the bracket ends, kept strictly inside it
+                let t = if f.1 > o.1 {
+                    ((lt - o.1) / (f.1 - o.1)).clamp(0.1, 0.9)
+                } else {
+                    0.5
+                };
+                (o.0 + t * (f.0 - o.0)).exp()
+            }
+            // SSE ∝ b² away from escapes
+            (Some(o), None) => (o.0 + ((lt - o.1) / 2.0).clamp(0.05, 2.0)).exp(),
+            (None, Some(f)) => (f.0 + ((lt - f.1) / 2.0).clamp(-2.0, -0.05)).exp(),
+            (None, None) => unreachable!(),
+        };
+        if !b.is_finite() || b <= 0.0 {
+            break;
+        }
+    }
+    // the bound shrinks until it passes (tiny bounds escape every point: SSE 0)
+    match ok {
+        Some(o) => o.2,
+        None => {
+            let mut b = bad.map_or(rmse, |f| f.0.exp());
+            loop {
+                b *= 0.25;
+                let (s, sse) = enc(b);
+                if sse <= budget {
+                    return s;
+                }
+            }
+        }
+    }
+}
+
+/// Fast-mode preset index into the `(α, β)` table (the one most often kept
+/// by [`encode_f32`] on the seen fields).
+pub const FAST_TUNE: usize = 1;
+
+/// [`encode_f32`] with a single `(α, β)` preset ([`FAST_TUNE`]).
+pub fn encode_fast_f32(x: &[f32], dims: &[usize], b: f64) -> Vec<u8> {
+    assert_eq!(
+        x.len(),
+        dims.iter().product::<usize>(),
+        "dims do not match data"
+    );
+    assert!(!dims.is_empty() && dims.len() <= 255 && b > 0.0);
+    let i = std::env::var("TC_FAST_TUNE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(FAST_TUNE);
+    encode_with(x, dims, b, TUNE[i])
+}
+
 /// Decode an interpolation stream.
 pub fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
     let mut rd = ByteReader::new(bytes);
@@ -319,7 +449,7 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
         || dims
             .iter()
             .try_fold(1usize, |a, &d| a.checked_mul(d))
-            .is_none_or(|n| n > 1 << 34)
+            .is_none_or(|n| n as u64 > 1 << 34)
     {
         return Err(DecodeError::Invalid("dims"));
     }
@@ -385,6 +515,37 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn psnr_targets_are_met() {
+        for d in [vec![40, 33, 29], vec![3000]] {
+            let x = field(&d);
+            let (lo, hi) = x
+                .iter()
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &v| {
+                    (a.min(v as f64), b.max(v as f64))
+                });
+            let mut last = 0;
+            for p in [40.0, 60.0, 80.0, 100.0] {
+                let s = encode_psnr_f32(&x, &d, p);
+                let Decoded::F32 { data: y, .. } = decode(&s).unwrap() else {
+                    panic!("f32")
+                };
+                let mse = x
+                    .iter()
+                    .zip(&y)
+                    .map(|(&a, &b)| (a as f64 - b as f64).powi(2))
+                    .sum::<f64>()
+                    / x.len() as f64;
+                let got = 20.0 * ((hi - lo) / mse.sqrt()).log10();
+                assert!(got >= p, "{d:?} {p} dB: got {got:.3}");
+                // rate control lands near the target, not far above it
+                assert!(got < p + 3.0, "{d:?} {p} dB: got {got:.3}");
+                assert!(s.len() > last);
+                last = s.len();
+            }
+        }
+    }
 
     fn field(d: &[usize]) -> Vec<f32> {
         let n: usize = d.iter().product();

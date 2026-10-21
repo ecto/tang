@@ -10,14 +10,15 @@
 //!
 //! `encode` prints one JSON line (bytes, bpv, self-check errors, encode
 //! seconds); `decode` prints the decode seconds. Options: `--rho r`,
-//! `--model hand|overfit|pretrained:PATH`.
+//! `--model hand|overfit|pretrained:PATH`. `--fast` (= `--codec fast`): one
+//! candidate picked before encoding, step from a formula, no overfit.
 
 use std::time::Instant;
 use tang_compress::codec::ErrorBound;
 use tang_compress::{decode_any, wavcodec, Decoded};
 
 fn usage() -> ! {
-    eprintln!("usage: tc encode IN.f32 OUT --dims AxBxC --codec wavelet|tucker|interp|qtt|auto|portfolio-all BOUND [--rho r] [--model m]\n       tc decode IN OUT.f32 [--model pretrained:PATH]");
+    eprintln!("usage: tc encode IN.f32 OUT --dims AxBxC --codec wavelet|tucker|interp|lorenzo|qtt|auto|portfolio-all|fast BOUND [--rho r] [--model m]\n       tc decode IN OUT.f32 [--model pretrained:PATH]");
     std::process::exit(2)
 }
 
@@ -50,6 +51,11 @@ fn main() {
             let mut model = "hand".to_string();
             let mut i = 3;
             while i < args.len() {
+                if args[i] == "--fast" {
+                    codec = "fast".to_string();
+                    i += 1;
+                    continue;
+                }
                 let v = args.get(i + 1).cloned().unwrap_or_else(|| usage());
                 match args[i].as_str() {
                     "--dims" => dims = v.split('x').map(|s| s.parse().unwrap()).collect(),
@@ -106,19 +112,45 @@ fn main() {
                     (
                         b,
                         format!(
-                            "\"chose\":\"{}\",\"peak\":{},\"tried\":[{}]",
+                            "\"chose\":\"{}\",\"probe_rank\":{},\"tried\":[{}]",
                             rep.pick.name(),
-                            rep.peak,
+                            rep.probe_rank,
                             tried.join(",")
                         ),
                     )
                 }
-                "interp" | "qtt" => {
+                "fast" => {
+                    let mut cfg = wavcodec::WavConfig::new(bound);
+                    cfg.model = tang_compress::learned::parse_model_arg(&model);
+                    let (b, c) = tang_compress::encode_fast_f32(&x, &dims, &cfg);
+                    (b, format!("\"chose\":\"{}\"", c.name()))
+                }
+                "qtt-probe" => {
+                    let env = |k: &str, d: usize| {
+                        std::env::var(k)
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(d)
+                    };
+                    let (n, r, t) = tang_compress::qtt_probe(
+                        &x,
+                        &dims,
+                        bound,
+                        env("PROBE_STRIDE", 2),
+                        env("PROBE_CAP", 32),
+                    );
+                    (
+                        vec![0u8; n],
+                        format!("\"probe_bytes\":{n},\"probe_rank\":{r},\"probe_s\":{t}"),
+                    )
+                }
+                "interp" | "lorenzo" | "qtt" | "qtt-sparse" => {
                     let cfg = wavcodec::WavConfig::new(bound);
-                    let c = if codec == "qtt" {
-                        tang_compress::Candidate::Qtt
-                    } else {
-                        tang_compress::Candidate::Interp
+                    let c = match codec.as_str() {
+                        "qtt" => tang_compress::Candidate::Qtt,
+                        "qtt-sparse" => tang_compress::Candidate::QttSparse,
+                        "lorenzo" => tang_compress::Candidate::Lorenzo,
+                        _ => tang_compress::Candidate::Interp,
                     };
                     let mut b = vec![c.tag()];
                     b.extend(tang_compress::encode_candidate_f32(c, &x, &dims, &cfg));

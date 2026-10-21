@@ -31,6 +31,13 @@ typedef unsigned long long u64;
 /// and applies it to all `M` rows. Launch: grid ceil(N / 8), block 256 (8 warps).
 pub const GEMV_CUDA: &str = with_common!(
     r#"
+// Nibble `e` of `q` as a float, exactly (float)((q >> 4e) & 0xf): the nibble goes into the
+// mantissa of 2^23 and 2^23 comes off, a logic op and an add at full rate instead of a
+// quarter-rate int-to-float convert.
+__device__ __forceinline__ float nib(unsigned int q, int e) {
+    return __int_as_float(((q >> (4 * e)) & 0xfu) | 0x4B000000u) - 8388608.0f;
+}
+
 extern "C" __global__ void gemv_bf16(
     const float* __restrict__ X, const unsigned short* __restrict__ W, float* __restrict__ Y,
     unsigned int M, unsigned int K, unsigned int N)
@@ -90,7 +97,7 @@ extern "C" __global__ void gemv_q4(
         float s = bf(S[g]), b = bf(B[g]);
         float qf[8];
         #pragma unroll
-        for (int e = 0; e < 8; e++) qf[e] = (float)((q >> (4 * e)) & 0xf);
+        for (int e = 0; e < 8; e++) qf[e] = nib(q, e);
         #pragma unroll
         for (unsigned int r = 0; r < 8; r++) {
             if (r < M) {
@@ -111,6 +118,205 @@ extern "C" __global__ void gemv_q4(
         }
     }
 }
+
+// 4-bit `linear` for 1..8 rows (decode, batched decode): a warp per CPW output columns, lane
+// `l` taking words l, l + 32, ... of each. A word is dequantized once (s * q + b) for every row,
+// and the rows' activations are staged in shared memory a chunk of XW words at a time (each
+// word's first and second four values in separate planes: conflict-free float4 reads at a lane
+// stride of 16 bytes). M is a template parameter, so the row loop has no branches. Each row's
+// sum runs in the same order whatever M is: a row decoded in a batch gets exactly the bits it
+// gets alone. A K split (gridDim.y > 1, `wsplit` words a split) writes its own [M, N] slice of
+// Y for `sum_splits`; the split depends on the shape alone, never on M, so this holds split
+// too. Launch: grid (ceil(N / (Q4_WARPS * CPW)), splits), block Q4_WARPS * 32.
+#define XW 128
+template <int CPW, int M, int WARPS>
+__device__ __forceinline__ void gemv_q4_xs_body(
+    const float* __restrict__ X, const unsigned int* __restrict__ Wq,
+    const unsigned short* __restrict__ S, const unsigned short* __restrict__ B,
+    float* __restrict__ Y, unsigned int K, unsigned int N, unsigned int group,
+    unsigned int wsplit)
+{
+    __shared__ __align__(16) float Xs[2][8][XW * 4];
+    unsigned int tid = threadIdx.x, lane = tid & 31;
+    unsigned int n0 = (blockIdx.x * WARPS + (tid >> 5)) * CPW;
+    bool live = n0 < N;
+    unsigned int words = K / 8, G = K / group;
+    unsigned int wb = blockIdx.y * wsplit, we = min(wb + wsplit, words);
+    Y += (u64)blockIdx.y * M * N;
+    float acc[CPW][M];
+    #pragma unroll
+    for (int c = 0; c < CPW; c++)
+        #pragma unroll
+        for (int r = 0; r < M; r++) acc[c][r] = 0.0f;
+    for (unsigned int w0 = wb; w0 < we; w0 += XW) {
+        unsigned int nw = min(XW, we - w0);
+        __syncthreads();
+        // Fill: thread t takes half-words (float4s) t, t + 256, ... of each row.
+        for (int r = 0; r < M; r++) {
+            for (unsigned int h = tid; h < 2 * nw; h += WARPS * 32) {
+                float4 v = ((const float4*)(X + (u64)r * K + (u64)w0 * 8))[h];
+                ((float4*)Xs[h & 1][r])[h >> 1] = v;
+            }
+        }
+        __syncthreads();
+        if (!live) continue;
+        #pragma unroll 2
+        for (unsigned int j = lane; j < nw; j += 32) {
+            unsigned int i = w0 + j;
+            unsigned int q[CPW];
+            float s[CPW], b[CPW];
+            #pragma unroll
+            for (int c = 0; c < CPW; c++) {
+                unsigned int n = min(n0 + c, N - 1);
+                q[c] = Wq[(u64)n * words + i];
+                u64 g = (u64)n * G + (i * 8) / group;
+                s[c] = bf(S[g]); b[c] = bf(B[g]);
+            }
+            // Dequantize once a column (s * q + b), shared by every row.
+            float wf[CPW][8];
+            #pragma unroll
+            for (int c = 0; c < CPW; c++)
+                #pragma unroll
+                for (int e = 0; e < 8; e++) wf[c][e] = fmaf(nib(q[c], e), s[c], b[c]);
+            #pragma unroll
+            for (int r = 0; r < M; r++) {
+                float4 a = ((const float4*)Xs[0][r])[j], e = ((const float4*)Xs[1][r])[j];
+                #pragma unroll
+                for (int c = 0; c < CPW; c++) {
+                    float t = acc[c][r];
+                    t = fmaf(wf[c][0], a.x, t); t = fmaf(wf[c][1], a.y, t);
+                    t = fmaf(wf[c][2], a.z, t); t = fmaf(wf[c][3], a.w, t);
+                    t = fmaf(wf[c][4], e.x, t); t = fmaf(wf[c][5], e.y, t);
+                    t = fmaf(wf[c][6], e.z, t); t = fmaf(wf[c][7], e.w, t);
+                    acc[c][r] = t;
+                }
+            }
+
+        }
+    }
+    if (!live) return;
+    #pragma unroll
+    for (int c = 0; c < CPW; c++) {
+        #pragma unroll
+        for (int r = 0; r < M; r++) {
+            float v = warp_sum(acc[c][r]);
+            if (lane == 0 && n0 + c < N) Y[(u64)r * N + n0 + c] = v;
+        }
+    }
+}
+
+// `gemv_q4_xs_body` with 128-bit weight loads, for K % 32 == 0 and group % 32 == 0 (every MLX
+// model): per XW-word stage, lane `l` takes words 4l .. 4l + 3 of each of its CPW columns as one
+// uint4 (32 weights, one scale group), issued before the stage's activations are staged so the
+// loads overlap the fill. Activations are staged as plain rows of floats, float4 `i` at
+// `i ^ ((i >> 3) & 7)` within its 8-float4 line, so a quarter-warp's eight float4 reads land on
+// eight different banks. Same split and batch-invariance contract as `gemv_q4_xs_body`.
+__device__ __forceinline__ unsigned int xv_swz(unsigned int i) { return i ^ ((i >> 3) & 7u); }
+template <int CPW, int M, int WARPS>
+__device__ __forceinline__ void gemv_q4_xv_body(
+    const float* __restrict__ X, const unsigned int* __restrict__ Wq,
+    const unsigned short* __restrict__ S, const unsigned short* __restrict__ B,
+    float* __restrict__ Y, unsigned int K, unsigned int N, unsigned int group,
+    unsigned int wsplit)
+{
+    __shared__ __align__(16) float4 Xs[M][XW * 2];
+    unsigned int tid = threadIdx.x, lane = tid & 31;
+    unsigned int n0 = (blockIdx.x * WARPS + (tid >> 5)) * CPW;
+    bool live = n0 < N;
+    unsigned int words = K / 8, G = K / group;
+    unsigned int wb = blockIdx.y * wsplit, we = min(wb + wsplit, words);
+    Y += (u64)blockIdx.y * M * N;
+    float acc[CPW][M];
+    #pragma unroll
+    for (int c = 0; c < CPW; c++)
+        #pragma unroll
+        for (int r = 0; r < M; r++) acc[c][r] = 0.0f;
+    for (unsigned int w0 = wb; w0 < we; w0 += XW) {
+        unsigned int nw = min(XW, we - w0);
+        unsigned int i = w0 + 4 * lane;        // this lane's first word
+        bool mine = live && 4 * lane < nw;
+        uint4 q[CPW];
+        float s[CPW], b[CPW];
+        if (mine) {
+            #pragma unroll
+            for (int c = 0; c < CPW; c++) {
+                unsigned int n = min(n0 + c, N - 1);
+                q[c] = *(const uint4*)(Wq + (u64)n * words + i);
+                u64 g = (u64)n * G + (i * 8) / group;
+                s[c] = bf(S[g]); b[c] = bf(B[g]);
+            }
+        }
+        __syncthreads();
+        for (int r = 0; r < M; r++) {
+            const float4* xr = (const float4*)(X + (u64)r * K + (u64)w0 * 8);
+            for (unsigned int h = tid; h < 2 * nw; h += WARPS * 32) Xs[r][xv_swz(h)] = xr[h];
+        }
+        __syncthreads();
+        if (!mine) continue;
+        #pragma unroll
+        for (int c = 0; c < CPW; c++) {
+            unsigned int qs[4] = {q[c].x, q[c].y, q[c].z, q[c].w};
+            #pragma unroll
+            for (int w = 0; w < 4; w++) {
+                float wf[8];
+                #pragma unroll
+                for (int e = 0; e < 8; e++) wf[e] = fmaf(nib(qs[w], e), s[c], b[c]);
+                unsigned int h = 8 * lane + 2 * w;
+                #pragma unroll
+                for (int r = 0; r < M; r++) {
+                    float4 a = Xs[r][xv_swz(h)], e = Xs[r][xv_swz(h + 1)];
+                    float t = acc[c][r];
+                    t = fmaf(wf[0], a.x, t); t = fmaf(wf[1], a.y, t);
+                    t = fmaf(wf[2], a.z, t); t = fmaf(wf[3], a.w, t);
+                    t = fmaf(wf[4], e.x, t); t = fmaf(wf[5], e.y, t);
+                    t = fmaf(wf[6], e.z, t); t = fmaf(wf[7], e.w, t);
+                    acc[c][r] = t;
+                }
+            }
+        }
+    }
+    if (!live) return;
+    #pragma unroll
+    for (int c = 0; c < CPW; c++) {
+        #pragma unroll
+        for (int r = 0; r < M; r++) {
+            float v = warp_sum(acc[c][r]);
+            if (lane == 0 && n0 + c < N) Y[(u64)r * N + n0 + c] = v;
+        }
+    }
+}
+
+#define Q4_WARPS 8
+#define GEMV_Q4_XS(CPW, M)                                                                    \
+extern "C" __global__ void __launch_bounds__(Q4_WARPS * 32) gemv_q4_xs##CPW##_m##M(           \
+    const float* __restrict__ X, const unsigned int* __restrict__ Wq,                         \
+    const unsigned short* __restrict__ S, const unsigned short* __restrict__ B,               \
+    float* __restrict__ Y, unsigned int K, unsigned int N, unsigned int group,                \
+    unsigned int wsplit)                                                                      \
+{ gemv_q4_xs_body<CPW, M, Q4_WARPS>(X, Wq, S, B, Y, K, N, group, wsplit); }
+#define GEMV_Q4_XV(CPW, M)                                                                    \
+extern "C" __global__ void __launch_bounds__(Q4_WARPS * 32) gemv_q4_xv##CPW##_m##M(           \
+    const float* __restrict__ X, const unsigned int* __restrict__ Wq,                         \
+    const unsigned short* __restrict__ S, const unsigned short* __restrict__ B,               \
+    float* __restrict__ Y, unsigned int K, unsigned int N, unsigned int group,                \
+    unsigned int wsplit)                                                                      \
+{ gemv_q4_xv_body<CPW, M, Q4_WARPS>(X, Wq, S, B, Y, K, N, group, wsplit); }
+GEMV_Q4_XV(4, 1)
+GEMV_Q4_XV(4, 2)
+GEMV_Q4_XV(4, 3)
+GEMV_Q4_XV(4, 4)
+GEMV_Q4_XV(4, 5)
+GEMV_Q4_XV(4, 6)
+GEMV_Q4_XV(4, 7)
+GEMV_Q4_XV(4, 8)
+GEMV_Q4_XS(4, 1)
+GEMV_Q4_XS(4, 2)
+GEMV_Q4_XS(4, 3)
+GEMV_Q4_XS(4, 4)
+GEMV_Q4_XS(4, 5)
+GEMV_Q4_XS(4, 6)
+GEMV_Q4_XS(4, 7)
+GEMV_Q4_XS(4, 8)
 
 // A few rows (2..32: speculative-decoding verify, short incremental prefills), one output
 // column per thread: each thread streams its column's weights (64 K per step, prefetched a
@@ -184,7 +390,7 @@ __device__ __forceinline__ void gemm_cols_body(
             #pragma unroll
             for (int e = 0; e < (IS_Q4 ? 32 : 8); e++) {
                 float w;
-                if (IS_Q4) w = fmaf((float)((wv[e / 8] >> (4 * (e % 8))) & 0xf), s4[u / 2], b4[u / 2]);
+                if (IS_Q4) w = fmaf(nib(wv[e / 8], e % 8), s4[u / 2], b4[u / 2]);
                 else w = bf((unsigned short)(wv[e / 2] >> (16 * (e % 2))));
                 const float4* xr = (const float4*)(Xs + (u * (IS_Q4 ? 32 : 8) + e) * MR);
                 #pragma unroll
@@ -494,21 +700,21 @@ pub fn kv_source(src: &'static str, bf16: bool) -> &'static str {
 /// the caches (`kv_t`, see [`kv_source`]) at `pos + s`. Any even head dim up to 256.
 pub const ATTN_PREP_CUDA: &str = with_common!(
     r#"
-extern "C" __global__ void attention_prep(
+// Head `h` of row `s`, at position `p` of the cache whose block table is `T`.
+__device__ __forceinline__ void prep_one(
     const float* __restrict__ QKV, const float* __restrict__ QN, const float* __restrict__ KN,
     const float* __restrict__ COS, const float* __restrict__ SIN,
     float* __restrict__ Qo, kv_t* __restrict__ KC, kv_t* __restrict__ VC,
-    unsigned int nh, unsigned int nkv, unsigned int hd, unsigned int pos, float eps,
+    unsigned int nh, unsigned int nkv, unsigned int hd, unsigned int p, float eps,
     unsigned int has_qn, unsigned int has_kn, const unsigned int* __restrict__ T,
-    unsigned int sh)
+    unsigned int sh, unsigned int h, unsigned int s, float* xs)
 {
-    __shared__ float xs[256];
-    unsigned int h = blockIdx.x, s = blockIdx.y, lane = threadIdx.x;
+    unsigned int lane = threadIdx.x;
     unsigned int qd = nh * hd, kvd = nkv * hd, row = qd + 2 * kvd, half = hd / 2;
     const float* src = QKV + (u64)s * row + (u64)h * hd;  // heads are contiguous: q.., k.., v..
 
     if (h >= nh + nkv) {  // v head: straight into the cache
-        kv_t* dst = VC + kv_row(T, sh, pos + s) * kvd + (u64)(h - nh - nkv) * hd;
+        kv_t* dst = VC + kv_row(T, sh, p) * kvd + (u64)(h - nh - nkv) * hd;
         for (unsigned int d = lane; d < hd; d += 32) kv_st(dst + d, src[d]);
         return;
     }
@@ -522,7 +728,7 @@ extern "C" __global__ void attention_prep(
         for (unsigned int d = lane; d < hd; d += 32) xs[d] *= r * w[d];
     }
     __syncwarp();
-    u64 t = (u64)(pos + s) * half;
+    u64 t = (u64)p * half;
     if (is_q) {
         float* dst = Qo + (u64)s * qd + (u64)h * hd;
         for (unsigned int i = lane; i < half; i += 32) {
@@ -533,13 +739,42 @@ extern "C" __global__ void attention_prep(
         }
         return;
     }
-    kv_t* dst = KC + kv_row(T, sh, pos + s) * kvd + (u64)(h - nh) * hd;
+    kv_t* dst = KC + kv_row(T, sh, p) * kvd + (u64)(h - nh) * hd;
     for (unsigned int i = lane; i < half; i += 32) {
         float c = COS[t + i], sn = SIN[t + i];
         float x0 = xs[i], x1 = xs[i + half];
         kv_st(dst + i, x0 * c - x1 * sn);
         kv_st(dst + i + half, x1 * c + x0 * sn);
     }
+}
+
+extern "C" __global__ void attention_prep(
+    const float* __restrict__ QKV, const float* __restrict__ QN, const float* __restrict__ KN,
+    const float* __restrict__ COS, const float* __restrict__ SIN,
+    float* __restrict__ Qo, kv_t* __restrict__ KC, kv_t* __restrict__ VC,
+    unsigned int nh, unsigned int nkv, unsigned int hd, unsigned int pos, float eps,
+    unsigned int has_qn, unsigned int has_kn, const unsigned int* __restrict__ T,
+    unsigned int sh)
+{
+    __shared__ float xs[256];
+    prep_one(QKV, QN, KN, COS, SIN, Qo, KC, VC, nh, nkv, hd, pos + blockIdx.y, eps, has_qn,
+             has_kn, T, sh, blockIdx.x, blockIdx.y, xs);
+}
+
+// Rows of different sequences (batched decode): row `s` is at position `RP[s]` of the cache
+// whose block table starts at `T + RT[s]`.
+extern "C" __global__ void attention_prep_rows(
+    const float* __restrict__ QKV, const float* __restrict__ QN, const float* __restrict__ KN,
+    const float* __restrict__ COS, const float* __restrict__ SIN,
+    float* __restrict__ Qo, kv_t* __restrict__ KC, kv_t* __restrict__ VC,
+    unsigned int nh, unsigned int nkv, unsigned int hd, float eps,
+    unsigned int has_qn, unsigned int has_kn, const unsigned int* __restrict__ T,
+    unsigned int sh, const unsigned int* __restrict__ RP, const unsigned int* __restrict__ RT)
+{
+    __shared__ float xs[256];
+    unsigned int s = blockIdx.y;
+    prep_one(QKV, QN, KN, COS, SIN, Qo, KC, VC, nh, nkv, hd, RP[s], eps, has_qn, has_kn,
+             T + RT[s], sh, blockIdx.x, s, xs);
 }
 "#
 );
@@ -584,6 +819,13 @@ extern "C" __global__ void gelu_tanh(const float* __restrict__ X, float* __restr
 {
     u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) Y[i] = gelu(X[i]);
+}
+
+// GELU, exact: 0.5 x (1 + erf(x / sqrt 2)).
+extern "C" __global__ void gelu_erf(const float* __restrict__ X, float* __restrict__ Y, unsigned int n)
+{
+    u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) Y[i] = 0.5f * X[i] * (1.0f + erff(X[i] * 0.70710678118654752f));
 }
 
 // Over a fused gate/up projection `[rows, 2*ff]`: gelu_tanh(gate) * up and silu(gate) * up.
@@ -657,26 +899,22 @@ extern "C" __global__ void layer_norm(
 pub const ATTENTION_CUDA: &str = with_common!(
     r#"
 #define MAXV 8   // max D / 32
+// Decode splits: one per ATTN_SPLIT_KEYS keys, at most ATTN_MAX_SPLITS (`decode_splits` in
+// cuda/llm.rs, which must agree). 64 keys fills an H200 from a context of ~250 at 32 heads.
+#define ATTN_SPLIT_KEYS 64
+#define ATTN_MAX_SPLITS 128
 
-extern "C" __global__ void attn_partial(
+// Query `qi`'s keys `j0..j1` (one split of them) for head `head`, into its split's slot of P.
+__device__ __forceinline__ void attn_partial_one(
     const float* __restrict__ Q, const kv_t* __restrict__ K, const kv_t* __restrict__ V,
-    float* __restrict__ P,   // [q_len, nh, n_splits, D + 2]
-    unsigned int cache_start, unsigned int q_len, unsigned int nh, unsigned int nkv,
-    unsigned int D, unsigned int n_splits, unsigned int split_len, unsigned int window,
-    unsigned int base, unsigned int bidir, const unsigned int* __restrict__ T, unsigned int sh)
+    float* __restrict__ P, unsigned int nh, unsigned int nkv, unsigned int D,
+    unsigned int n_splits, const unsigned int* __restrict__ T, unsigned int sh,
+    unsigned int head, unsigned int split, unsigned int qi, unsigned int j0, unsigned int j1)
 {
-    unsigned int head = blockIdx.x, split = blockIdx.y, qi = blockIdx.z;
     unsigned int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     unsigned int kvh = head / (nh / nkv);
     u64 kvd = (u64)nkv * D;
     unsigned int per = (D + 31) / 32;
-
-    unsigned int qpos = cache_start + qi + 1;
-    unsigned int attend = bidir ? cache_start + q_len : qpos;
-    unsigned int lo = (window > 0 && qpos > window) ? qpos - window : 0;
-    unsigned int s0 = base + split * split_len;
-    unsigned int j0 = max(s0, lo);
-    unsigned int j1 = min(s0 + split_len, attend);
 
     float q[MAXV], acc[MAXV];
     float scale = rsqrtf((float)D);
@@ -744,6 +982,46 @@ extern "C" __global__ void attn_partial(
         if (v < per && d < D) pp[2 + d] = out[v];
     }
     if (lane == 0) { pp[0] = M; pp[1] = L; }
+}
+
+extern "C" __global__ void attn_partial(
+    const float* __restrict__ Q, const kv_t* __restrict__ K, const kv_t* __restrict__ V,
+    float* __restrict__ P,   // [q_len, nh, n_splits, D + 2]
+    unsigned int cache_start, unsigned int q_len, unsigned int nh, unsigned int nkv,
+    unsigned int D, unsigned int n_splits, unsigned int split_len, unsigned int window,
+    unsigned int base, unsigned int bidir, const unsigned int* __restrict__ T, unsigned int sh)
+{
+    unsigned int split = blockIdx.y, qi = blockIdx.z;
+    unsigned int qpos = cache_start + qi + 1;
+    unsigned int attend = bidir ? cache_start + q_len : qpos;
+    unsigned int lo = (window > 0 && qpos > window) ? qpos - window : 0;
+    unsigned int s0 = base + split * split_len;
+    unsigned int j0 = max(s0, lo);
+    unsigned int j1 = min(s0 + split_len, attend);
+    attn_partial_one(Q, K, V, P, nh, nkv, D, n_splits, T, sh, blockIdx.x, split, qi, j0, j1);
+}
+
+// One query each from several sequences (batched decode): query `qi` is at position `RP[qi]`
+// of the cache whose block table starts at `T + RT[qi]`, and sees keys `0 ..= RP[qi]`. Each
+// splits its keys as a decode of that sequence alone would; splits past its own count are
+// empty (attn_combine skips them), so its output is that decode's to the bit. `n_splits`:
+// the most any query has (P's stride).
+extern "C" __global__ void attn_partial_rows(
+    const float* __restrict__ Q, const kv_t* __restrict__ K, const kv_t* __restrict__ V,
+    float* __restrict__ P, unsigned int nh, unsigned int nkv, unsigned int D,
+    unsigned int n_splits, const unsigned int* __restrict__ T, unsigned int sh,
+    const unsigned int* __restrict__ RP, const unsigned int* __restrict__ RT)
+{
+    unsigned int split = blockIdx.y, qi = blockIdx.z;
+    unsigned int span = RP[qi] + 1;
+    unsigned int mine = min(max((span + ATTN_SPLIT_KEYS - 1) / ATTN_SPLIT_KEYS, 1u),
+                            (unsigned int)ATTN_MAX_SPLITS);
+    unsigned int split_len = (span + mine - 1) / mine;
+    unsigned int s0 = split * split_len;
+    unsigned int j0 = split < mine ? s0 : 0;
+    unsigned int j1 = split < mine ? min(s0 + split_len, span) : 0;
+    attn_partial_one(Q, K, V, P, nh, nkv, D, n_splits, T + RT[qi], sh, blockIdx.x, split, qi,
+                     j0, j1);
 }
 
 extern "C" __global__ void attn_combine(
@@ -1079,3 +1357,214 @@ ATTN_MULTI(attn_multi_r32, 32, 32, 128)
 ATTN_MULTI(attn_multi_d256, 16, 16, 256)
 "#
 );
+
+/// `gemm_tc_q4_m{16,32}`: `y[r, n] = sum_k x[r, k] * W[n, k]` for 9..=32 rows off MLX 4-bit
+/// weights on tensor cores (TF32 `mma.sync.m16n8k8`, f32 accumulate; sm_80+). A block (8
+/// warps) takes 128 output columns and a K range: each 32-wide K stage it widens its columns'
+/// weights into shared memory (s * q + b) and stages the rows' activations, and each warp runs
+/// the 16- or 32-row by 16-column tile. Rows past M are zero. A row's sums go in an order fixed
+/// by K and the split alone (never by M), and a K split (gridDim.y > 1) writes its own [M, N]
+/// slice for `sum_splits`. Needs K % 32 == 0, group % 32 == 0, k_split % 32 == 0.
+/// Launch: grid (ceil(N / 128), splits), block 256.
+pub const TC_GEMM_CUDA: &str = with_common!(
+    r#"
+__device__ __forceinline__ float tc_nib(unsigned int q, int e) {
+    return __int_as_float(((q >> (4 * e)) & 0xfu) | 0x4B000000u) - 8388608.0f;
+}
+__device__ __forceinline__ unsigned int tf32(float f) {
+    unsigned int r;
+    asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(f));
+    return r;
+}
+template <int MT>
+__device__ __forceinline__ void gemm_tc_q4_body(
+    const float* __restrict__ X, const unsigned int* __restrict__ Wq,
+    const unsigned short* __restrict__ S, const unsigned short* __restrict__ B,
+    float* __restrict__ Y, unsigned int M, unsigned int K, unsigned int N, unsigned int group,
+    unsigned int k_split)
+{
+    __shared__ float Ws[128][36];
+    __shared__ float Xs[MT * 16][36];
+    unsigned int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+    unsigned int n0 = blockIdx.x * 128;
+    unsigned int kb = blockIdx.y * k_split, ke = min(kb + k_split, K);
+    Y += (u64)blockIdx.y * M * N;
+    unsigned int words = K / 8, G = K / group;
+    float acc[MT][2][4];
+    #pragma unroll
+    for (int a = 0; a < MT; a++)
+        #pragma unroll
+        for (int b = 0; b < 2; b++)
+            #pragma unroll
+            for (int c = 0; c < 4; c++) acc[a][b][c] = 0.0f;
+    for (unsigned int k0 = kb; k0 < ke; k0 += 32) {
+        __syncthreads();
+        // 128 columns x 4 words: two words a thread, widened to f32.
+        #pragma unroll
+        for (int h = 0; h < 2; h++) {
+            unsigned int w = tid + h * 256, col = w >> 2, wi = w & 3, n = n0 + col;
+            float* dst = &Ws[col][wi * 8];
+            if (n < N) {
+                unsigned int q = Wq[(u64)n * words + k0 / 8 + wi];
+                u64 gi = (u64)n * G + (k0 + wi * 8) / group;
+                float s = bf(S[gi]), b = bf(B[gi]);
+                #pragma unroll
+                for (int e = 0; e < 8; e++) dst[e] = fmaf(tc_nib(q, e), s, b);
+            } else {
+                #pragma unroll
+                for (int e = 0; e < 8; e++) dst[e] = 0.0f;
+            }
+        }
+        for (unsigned int i = tid; i < MT * 16 * 32; i += 256) {
+            unsigned int r = i >> 5, kk = i & 31;
+            Xs[r][kk] = r < M ? X[(u64)r * K + k0 + kk] : 0.0f;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int ks = 0; ks < 32; ks += 8) {
+            unsigned int a[MT][4], bb[2][2];
+            #pragma unroll
+            for (int mt = 0; mt < MT; mt++) {
+                a[mt][0] = tf32(Xs[mt * 16 + g][ks + t]);
+                a[mt][1] = tf32(Xs[mt * 16 + g + 8][ks + t]);
+                a[mt][2] = tf32(Xs[mt * 16 + g][ks + t + 4]);
+                a[mt][3] = tf32(Xs[mt * 16 + g + 8][ks + t + 4]);
+            }
+            #pragma unroll
+            for (int nt = 0; nt < 2; nt++) {
+                unsigned int col = warp * 16 + nt * 8 + g;
+                bb[nt][0] = tf32(Ws[col][ks + t]);
+                bb[nt][1] = tf32(Ws[col][ks + t + 4]);
+            }
+            #pragma unroll
+            for (int mt = 0; mt < MT; mt++)
+                #pragma unroll
+                for (int nt = 0; nt < 2; nt++)
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                        : "+f"(acc[mt][nt][0]), "+f"(acc[mt][nt][1]), "+f"(acc[mt][nt][2]),
+                          "+f"(acc[mt][nt][3])
+                        : "r"(a[mt][0]), "r"(a[mt][1]), "r"(a[mt][2]), "r"(a[mt][3]),
+                          "r"(bb[nt][0]), "r"(bb[nt][1]));
+        }
+    }
+    #pragma unroll
+    for (int mt = 0; mt < MT; mt++)
+        #pragma unroll
+        for (int nt = 0; nt < 2; nt++)
+            #pragma unroll
+            for (int c = 0; c < 4; c++) {
+                unsigned int r = mt * 16 + g + (c >> 1) * 8;
+                unsigned int n = n0 + warp * 16 + nt * 8 + 2 * t + (c & 1);
+                if (r < M && n < N) Y[(u64)r * N + n] = acc[mt][nt][c];
+            }
+}
+extern "C" __global__ void __launch_bounds__(256) gemm_tc_q4_m16(
+    const float* __restrict__ X, const unsigned int* __restrict__ Wq,
+    const unsigned short* __restrict__ S, const unsigned short* __restrict__ B,
+    float* __restrict__ Y, unsigned int M, unsigned int K, unsigned int N, unsigned int group,
+    unsigned int k_split)
+{ gemm_tc_q4_body<1>(X, Wq, S, B, Y, M, K, N, group, k_split); }
+extern "C" __global__ void __launch_bounds__(256) gemm_tc_q4_m32(
+    const float* __restrict__ X, const unsigned int* __restrict__ Wq,
+    const unsigned short* __restrict__ S, const unsigned short* __restrict__ B,
+    float* __restrict__ Y, unsigned int M, unsigned int K, unsigned int N, unsigned int group,
+    unsigned int k_split)
+{ gemm_tc_q4_body<2>(X, Wq, S, B, Y, M, K, N, group, k_split); }
+"#
+);
+/// `top_k_rows`: the K largest of each row of X `[rows, n]`, a block (1024 threads) a row.
+/// Floats map to order-preserving u32 keys; four 8-bit radix rounds find the K-th largest key
+/// T; then each thread, over its own contiguous range, keeps the keys above T and the first
+/// ties at T, placed by a block-wide prefix count, so the kept set (and its order after the
+/// final sort: value descending, index ascending) never depends on thread timing.
+/// Out `[rows, 2K]`: K values, then K indices as float bits. Needs K <= 64 and K <= n.
+pub const TOPK_CUDA: &str = r#"
+#define TK_T 1024
+__device__ __forceinline__ unsigned int tk_key(float f) {
+    unsigned int u = __float_as_uint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+// Exclusive prefix sum of v over the block (TK_T threads); returns this thread's offset and
+// the total in *tot.
+__device__ __forceinline__ unsigned int tk_scan(unsigned int v, unsigned int* sh, unsigned int* tot) {
+    unsigned int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    unsigned int x = v;
+    for (int o = 1; o < 32; o <<= 1) { unsigned int y = __shfl_up_sync(0xffffffffu, x, o); if (lane >= o) x += y; }
+    if (lane == 31) sh[w] = x;
+    __syncthreads();
+    if (w == 0) {
+        unsigned int s = sh[lane];
+        for (int o = 1; o < 32; o <<= 1) { unsigned int y = __shfl_up_sync(0xffffffffu, s, o); if (lane >= o) s += y; }
+        sh[lane] = s;
+    }
+    __syncthreads();
+    unsigned int before = (w ? sh[w - 1] : 0) + x - v;
+    *tot = sh[31];
+    __syncthreads();
+    return before;
+}
+extern "C" __global__ void __launch_bounds__(TK_T) top_k_rows(
+    const float* __restrict__ X, float* __restrict__ Out, unsigned int n, unsigned int K)
+{
+    __shared__ unsigned int hist[256];
+    __shared__ unsigned int sh[32];
+    __shared__ unsigned int sel[2];
+    __shared__ unsigned int ck[64], ci[64];
+    const float* x = X + (unsigned long long)blockIdx.x * n;
+    unsigned int tid = threadIdx.x;
+    unsigned int per = (n + TK_T - 1) / TK_T, b = tid * per, e = min(b + per, n);
+    unsigned int prefix = 0, pmask = 0, want = K;   // want: how many at-or-above still needed
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (unsigned int i = tid; i < 256; i += TK_T) hist[i] = 0;
+        __syncthreads();
+        for (unsigned int i = tid; i < n; i += TK_T) {   // coalesced; order doesn't matter here
+            unsigned int key = tk_key(x[i]);
+            if ((key & pmask) == prefix) atomicAdd(&hist[(key >> shift) & 255u], 1u);
+        }
+        __syncthreads();
+        if (tid == 0) {
+            unsigned int acc = 0, d = 255;
+            for (;; d--) {
+                if (acc + hist[d] >= want || d == 0) break;
+                acc += hist[d];
+            }
+            sel[0] = d; sel[1] = want - acc;
+        }
+        __syncthreads();
+        prefix |= sel[0] << shift; pmask |= 255u << shift; want = sel[1];
+        __syncthreads();
+    }
+    // prefix = T; keys above T: K - want of them; then the first `want` ties by index.
+    unsigned int above = 0, ties = 0;
+    for (unsigned int i = b; i < e; i++) {
+        unsigned int key = tk_key(x[i]);
+        above += key > prefix; ties += key == prefix;
+    }
+    unsigned int tot, oa = tk_scan(above, sh, &tot);
+    unsigned int ot = tk_scan(ties, sh, &tot);
+    unsigned int na = K - want;
+    for (unsigned int i = b; i < e; i++) {
+        unsigned int key = tk_key(x[i]);
+        if (key > prefix) { ck[oa] = key; ci[oa] = i; oa++; }
+        else if (key == prefix) { if (ot < want) { ck[na + ot] = key; ci[na + ot] = i; } ot++; }
+    }
+    __syncthreads();
+    if (tid == 0) {
+        for (unsigned int a = 1; a < K; a++) {
+            unsigned int k0 = ck[a], i0 = ci[a]; int j = a - 1;
+            while (j >= 0 && (ck[j] < k0 || (ck[j] == k0 && ci[j] > i0))) { ck[j + 1] = ck[j]; ci[j + 1] = ci[j]; j--; }
+            ck[j + 1] = k0; ci[j + 1] = i0;
+        }
+    }
+    __syncthreads();
+    float* o = Out + (unsigned long long)blockIdx.x * 2 * K;
+    for (unsigned int a = tid; a < K; a += TK_T) {
+        unsigned int key = ck[a];
+        unsigned int u = (key & 0x80000000u) ? (key & 0x7fffffffu) : ~key;
+        o[a] = __uint_as_float(u);
+        o[K + a] = __uint_as_float(ci[a]);
+    }
+}
+"#;

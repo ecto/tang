@@ -2,7 +2,7 @@
 //!
 //! The scalar, split and tiled schedules share their emitters with WGSL:
 //! the index algebra, staging layouts and epilogue fusion are produced
-//! once (under [`Dialect::Msl`], which switches buffer access to native
+//! once (under `Dialect::Msl`, which switches buffer access to native
 //! `half` / `float` elements) and the WGSL surface syntax is rewritten to
 //! MSL here. MSL has no module-scope buffers, so every helper function
 //! takes the kernel's buffers as a `Bufs` struct.

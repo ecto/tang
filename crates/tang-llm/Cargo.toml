@@ -8,7 +8,8 @@ description = "LLM inference on tang-compute: Qwen3-family models, KV cache, sam
 repository.workspace = true
 keywords = ["llm", "inference", "metal", "qwen"]
 categories = ["science"]
-publish = false
+readme = "README.md"
+include = ["src/**/*", "README.md", "CUDA.md", "docs/**/*"]
 
 [features]
 default = []
@@ -16,10 +17,14 @@ metal = ["tang-compute/metal"]
 # NVIDIA GPUs. On Linux, build with `--no-default-features --features cuda` (Metal is macOS-only).
 cuda = ["tang-compute/cuda", "dep:tang-moe", "tang-moe/cuda", "dep:cudarc"]
 
+# OpenTelemetry traces and metrics over OTLP/HTTP (see docs/observability.md). Off by default.
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
+
 mtp-train = ["dep:tang-ad", "dep:tang-train", "dep:tang-tensor"]
 
 [dependencies]
 tang-compute = { workspace = true }
+tang-compress = { workspace = true }
 tang-ad = { workspace = true, optional = true }
 tang-train = { workspace = true, optional = true }
 tang-tensor = { workspace = true, optional = true }
@@ -37,10 +42,15 @@ tokio = { workspace = true }
 tokio-stream = "0.1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 base64 = "0.22"
+# Fetching https `image_url`s (rustls; no native TLS).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 sha2 = "0.10"
 llguidance = { version = "=1.9.1", default-features = false }
 libc = "0.2"
-tang-moe = { path = "../tang-moe", optional = true }
+tang-moe = { workspace = true, optional = true }
+opentelemetry = { version = "0.30", default-features = false, features = ["trace", "metrics"], optional = true }
+opentelemetry_sdk = { version = "0.30", default-features = false, features = ["trace", "metrics"], optional = true }
+opentelemetry-otlp = { version = "0.30", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls", "trace", "metrics"], optional = true }
 cudarc = { version = "0.16", features = ["nvrtc", "cuda-version-from-build-system"], optional = true }
 
 [target.'cfg(all(target_arch = "aarch64", target_os = "macos"))'.dependencies]
@@ -51,5 +61,16 @@ name = "bench_ops"
 required-features = ["metal"]
 
 [[example]]
+name = "bench_batch"
+
+[[example]]
 name = "bench_prefill"
+required-features = ["metal"]
+
+[[example]]
+name = "kvcomp_bench"
+required-features = ["metal"]
+
+[[example]]
+name = "kvcomp_niah"
 required-features = ["metal"]

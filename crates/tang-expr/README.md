@@ -88,8 +88,18 @@ graph above is untouched.
   storage (`Elem`), widened on load and packed 4 per `u32` word.
 - **Ops:** wrapping `+ − ×`, `MulHi` (so `mul_wide` gives the exact 64-bit
   product as `(lo, hi)`), `& | ^ ! <<`, and `>>` (arithmetic on `i32`).
-  Shift amounts are taken mod 32. Also `min`/`max`/`clamp`, `== != < <=`,
-  `select`, `bitcast`, and read-only `load`.
+  Shift amounts are taken mod 32. Also `min`/`max`/`clamp`, `div`/`rem`
+  (WGSL semantics), `clz`, `== != < <=`, `select`, `bitcast`, and
+  read-only `load`.
+- **Scratch buffers:** `buffer_rw(name, elem, len, base)` declares a small
+  fixed-length read-write array (in WGSL, `name[base + i]` with `base` a host
+  expression, e.g. a workgroup array slice). `load_rw` and `store` thread an
+  effect token (`token()`, and each `store` returns the next one), so data
+  dependencies order the effects. Scratch loads and stores are never inlined
+  or moved: every backend runs them in the one shared schedule order, so
+  their results agree across backends for any graph. Out-of-range loads read
+  0 and out-of-range stores are dropped. tang-compress uses this for the
+  per-lane adaptive probability maps of its learned rANS coder.
 - **Loops:** `while_loop(init, |g, s| (cond, next))` is structured SSA, like
   MLIR `scf.while`, with `for_range` as sugar. A loop's states are
   `State(l, k)` nodes and its results are `LoopOut(l, k)` nodes. Loops nest,
@@ -118,14 +128,38 @@ the CPU decoder evaluate the same graph through `Program`.
 
 **Not yet covered**, but needed to generate the whole rANS lane-decode
 kernel:
-- Stores and scatter into storage buffers.
-- Workgroup memory, barriers and `workgroupUniformLoad`.
+- Stores and scatter into storage buffers (only lane-local scratch
+  buffers exist).
+- Barriers and `workgroupUniformLoad`.
 - Side effects ordered with loops, for example a data-dependent word fetch
   that advances a stream pointer. This can be expressed today as loop state
   plus `load`, but there is no write-back.
 - Kernel entry points and bindings.
-- `firstLeadingBit` and integer division.
 - A C lowering, which would need unsigned casts to avoid signed-overflow UB.
+
+## Integer dialect (0.2)
+
+`tang_expr::int::IntGraph` is a separate, bit-exact 32-bit integer graph:
+`i32`/`u32`/`bool`, `i8`/`u8` storage, wrapping arithmetic, exact
+`mul_wide`, and structured `while` loops with invariant hoisting. The CPU
+interpreter, the generated WGSL and the generated Rust compute the same bits.
+
+```rust
+use tang_expr::int::{IType, IntGraph};
+
+// sum of i*i for i in 0..n
+let mut g = IntGraph::new();
+let n = g.param(0, IType::U32);
+let zero = g.u32(0);
+let s = g.for_range(n, &[zero], |g, i, s| {
+    let sq = g.mul(i, i);
+    vec![g.add(s[0], sq)]
+});
+assert_eq!(g.eval(&s, &[10], &[]), vec![285]);
+let wgsl = g.to_wgsl_fn("sum_sq", &s); // or g.to_rust("sum_sq", &s)
+```
+
+See `examples/int_dialect.rs`.
 
 ## Design
 
@@ -137,4 +171,4 @@ kernel:
 
 ## License
 
-[MIT](../../LICENSE)
+Licensed under either of [Apache License, Version 2.0](../../LICENSE-APACHE) or [MIT license](../../LICENSE-MIT) at your option. Contributions are accepted under the same terms with a DCO sign-off (see CONTRIBUTING.md).

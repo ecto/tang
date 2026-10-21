@@ -22,6 +22,7 @@ use crate::model::Dtype;
 use crate::node::{Need, Probe, Rates};
 use crate::queue::{Priority, Queue, Ticket};
 use crate::sample::Sampling;
+use crate::telemetry::{End, Trace};
 use axum::extract::{Request as HttpRequest, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
@@ -57,6 +58,10 @@ enum Job {
         model: String,
         /// What earlier runs did before giving way.
         before: Option<Before>,
+        /// The client's `x-request-id`, logged with the request's usage.
+        request_id: Option<String>,
+        /// Its OpenTelemetry trace (empty unless the `otel` feature exports).
+        trace: Trace,
     },
     Load {
         spec: String,
@@ -92,7 +97,8 @@ struct NodeState {
     model: Option<Loaded>,
     /// A model being loaded, and since when.
     loading: Option<(String, Instant)>,
-    running: Option<Running>,
+    /// Requests running, oldest first (several when the backend batches).
+    running: Vec<Running>,
 }
 
 struct Loaded {
@@ -122,6 +128,8 @@ struct Kv {
     store: Option<PathBuf>,
     /// Device memory the block pool holds.
     pool_bytes: usize,
+    /// The fitted step-time model (see `crate::step_cost`), if the backend keeps one.
+    step_cost: Option<Value>,
 }
 
 struct Running {
@@ -137,7 +145,7 @@ impl Node {
 
     /// Requests running or waiting.
     fn busy(&self) -> usize {
-        self.queue.len() + self.state().running.is_some() as usize
+        self.queue.len() + self.state().running.len()
     }
 }
 
@@ -190,8 +198,60 @@ pub trait Backend {
         0
     }
     fn flush_kv_store(&self) {}
+    /// Drop prompt-derived state unused for the TTL ([`crate::retention`]); the worker calls
+    /// it periodically, between requests.
+    fn expire(&mut self) {}
     /// Runs after the reply goes out, including failed requests.
     fn after(&mut self, _req: &Request, _result: &anyhow::Result<(Finish, Usage)>) {}
+
+    /// Most requests it runs at once (see `docs/batching.md`); 1 runs them one at a time
+    /// with `complete_with`, and the methods below go unused.
+    fn max_batch(&self) -> usize {
+        1
+    }
+    /// A request in conversation `key` could start now (a slot is free and the conversation
+    /// isn't running).
+    fn can_admit(&self, _key: Option<&str>) -> bool {
+        false
+    }
+    /// The KV pool has room for another stream of `rows` positions.
+    fn kv_room(&self, _rows: usize) -> bool {
+        true
+    }
+    /// Start a request in the batch (see [`Engine::admit`]).
+    fn admit(
+        &mut self,
+        _req: &Request,
+        _prompt: Option<(String, Vec<u32>)>,
+    ) -> anyhow::Result<Inflight> {
+        anyhow::bail!("this backend doesn't batch")
+    }
+    /// One step for every lane (see [`Engine::step`]).
+    fn step(&mut self, _lanes: &mut [DynLane<'_>]) -> anyhow::Result<()> {
+        anyhow::bail!("this backend doesn't batch")
+    }
+    /// Done with a stream (see [`Engine::retire`]).
+    fn retire(&mut self, _s: Inflight) -> anyhow::Result<Outcome> {
+        anyhow::bail!("this backend doesn't batch")
+    }
+    /// The fitted step-time model, for `/node`.
+    fn step_cost(&self) -> Option<Value> {
+        None
+    }
+    /// A stream's state: (done, still prefilling).
+    fn stream_state(&self, _s: &Inflight) -> (bool, bool) {
+        (true, false)
+    }
+}
+
+/// A batching backend's stream, opaque to the worker.
+pub type Inflight = Box<dyn std::any::Any>;
+
+/// A stream in a [`Backend::step`], with where its pieces go and who controls it.
+pub struct DynLane<'a> {
+    pub stream: &'a mut Inflight,
+    pub on: &'a mut dyn FnMut(Piece) -> bool,
+    pub ctl: &'a mut dyn Control,
 }
 
 impl<D: ComputeDevice + 'static> Backend for Engine<D> {
@@ -206,7 +266,7 @@ impl<D: ComputeDevice + 'static> Backend for Engine<D> {
         Engine::context_window(self)
     }
     fn vision(&self) -> bool {
-        self.model.vision.is_some()
+        self.model.sees_images()
     }
     fn prompter(&self) -> Option<Prompter> {
         Some(Engine::prompter(self))
@@ -238,6 +298,9 @@ impl<D: ComputeDevice + 'static> Backend for Engine<D> {
     fn flush_kv_store(&self) {
         Engine::flush_kv_store(self)
     }
+    fn expire(&mut self) {
+        Engine::expire(self)
+    }
     fn after(&mut self, req: &Request, result: &anyhow::Result<(Finish, Usage)>) {
         if let Ok((_, usage)) = result {
             if self.speculation().is_some() {
@@ -251,6 +314,50 @@ impl<D: ComputeDevice + 'static> Backend for Engine<D> {
             }
             self.save(req.cache_key.as_deref());
         }
+    }
+    fn max_batch(&self) -> usize {
+        Engine::max_batch(self)
+    }
+    fn can_admit(&self, key: Option<&str>) -> bool {
+        Engine::can_admit(self, key)
+    }
+    fn kv_room(&self, rows: usize) -> bool {
+        Engine::kv_room(self, rows)
+    }
+    fn admit(
+        &mut self,
+        req: &Request,
+        prompt: Option<(String, Vec<u32>)>,
+    ) -> anyhow::Result<Inflight> {
+        Ok(Box::new(Engine::admit(self, req, prompt)?))
+    }
+    fn step(&mut self, lanes: &mut [DynLane<'_>]) -> anyhow::Result<()> {
+        let mut typed: Vec<crate::engine::Lane<'_, D::Buffer>> = lanes
+            .iter_mut()
+            .map(|l| crate::engine::Lane {
+                stream: l
+                    .stream
+                    .downcast_mut()
+                    .expect("a stream this engine admitted"),
+                on: &mut *l.on,
+                ctl: &mut *l.ctl,
+            })
+            .collect();
+        Engine::step(self, &mut typed)
+    }
+    fn retire(&mut self, s: Inflight) -> anyhow::Result<Outcome> {
+        let s = s
+            .downcast::<crate::engine::Stream<D::Buffer>>()
+            .expect("a stream this engine admitted");
+        Engine::retire(self, *s)
+    }
+    fn step_cost(&self) -> Option<Value> {
+        Some(Engine::step_cost(self).json())
+    }
+    fn stream_state(&self, s: &Inflight) -> (bool, bool) {
+        let s: &crate::engine::Stream<D::Buffer> =
+            s.downcast_ref().expect("a stream this engine admitted");
+        (s.done(), s.prefilling())
     }
 }
 
@@ -290,6 +397,8 @@ where
     D: ComputeDevice + 'static,
     F: Fn(&str) -> anyhow::Result<B> + Send + 'static,
 {
+    // Before any async runtime: the OTLP exporter's blocking client builds its own.
+    let _otel = crate::telemetry::init();
     let resources = Arc::<crate::image_server::Gate>::default();
     let image = image.map(|(root, make)| crate::image_server::mount(root, make, resources.clone()));
     let node = Arc::new(Node {
@@ -309,6 +418,7 @@ where
             node: worker,
             engine: None,
             load,
+            batch: Vec::new(),
         };
         if let Some(spec) = first {
             let gate = w.node.resources.clone();
@@ -362,6 +472,22 @@ struct Worker<B: Backend, F> {
     node: Arc<Node>,
     engine: Option<(String, B)>,
     load: F,
+    /// Requests decoding together, when the backend batches.
+    batch: Vec<Active>,
+}
+
+/// A request in the batch.
+struct Active {
+    ticket: Ticket,
+    req: Box<Request>,
+    tx: mpsc::UnboundedSender<Out>,
+    model: String,
+    before: Option<Before>,
+    request_id: Option<String>,
+    trace: Trace,
+    /// A background request's prompt, kept in case it gives way.
+    kept: Option<(String, Vec<u32>)>,
+    stream: Inflight,
 }
 
 /// Lets a background request's prefill give way to waiting interactive work, and keeps
@@ -369,17 +495,37 @@ struct Worker<B: Backend, F> {
 struct Ctl<'a> {
     node: &'a Node,
     background: bool,
+    /// Closed once the client goes away: the run stops there.
+    tx: &'a mpsc::UnboundedSender<Out>,
+    /// Its ticket's id, to find it among the running.
+    id: u64,
+    /// In a batch: whether interactive work is waiting that couldn't join (decided once per
+    /// step). Alone: `None`, and any waiting interactive work counts.
+    blocked: Option<bool>,
 }
 
 impl Control for Ctl<'_> {
     fn keep_prefilling(&mut self) -> bool {
-        !(self.background && self.node.queue.interactive_waiting())
+        let blocked = self
+            .blocked
+            .unwrap_or_else(|| self.node.queue.interactive_waiting());
+        !(self.background && blocked)
     }
 
     fn progress(&mut self, p: Progress) {
-        if let Some(r) = self.node.state().running.as_mut() {
+        if let Some(r) = self
+            .node
+            .state()
+            .running
+            .iter_mut()
+            .find(|r| r.ticket.id == self.id)
+        {
             r.progress = p;
         }
+    }
+
+    fn cancelled(&mut self) -> bool {
+        self.tx.is_closed()
     }
 }
 
@@ -389,8 +535,80 @@ where
     F: Fn(&str) -> anyhow::Result<B>,
 {
     fn run(&mut self) {
+        let every = crate::retention::ttl().map(crate::retention::sweep_every);
+        let mut swept = Instant::now();
         loop {
-            let (ticket, job) = self.node.queue.pop();
+            if every.is_some_and(|e| swept.elapsed() >= e) {
+                self.expire();
+                swept = Instant::now();
+            }
+            if !self.batch.is_empty() {
+                // Between steps: whoever can join does, then one step for all.
+                while let Some((ticket, job)) = self.node.queue.pop_where(|t, j| self.joins(t, j)) {
+                    self.dispatch(ticket, job);
+                }
+                if !self.batch.is_empty() {
+                    self.step_batch();
+                }
+                continue;
+            }
+            let (ticket, job) = match every {
+                // Idle: wake for the next sweep.
+                Some(e) => match self
+                    .node
+                    .queue
+                    .pop_timeout(e.saturating_sub(swept.elapsed()))
+                {
+                    Some(x) => x,
+                    None => continue,
+                },
+                None => self.node.queue.pop(),
+            };
+            self.dispatch(ticket, job);
+        }
+    }
+
+    /// Drop what's past the TTL, and show `/node` what's left.
+    fn expire(&mut self) {
+        let Some((_, e)) = &mut self.engine else {
+            return;
+        };
+        let gate = self.node.resources.clone();
+        let _guard = gate.lock();
+        e.expire();
+        self.refresh_kv();
+    }
+
+    /// Whether a waiting job joins the running batch now.
+    fn joins(&self, ticket: &Ticket, job: &Job) -> bool {
+        let Job::Complete { req, model, tx, .. } = job else {
+            // Loads and unloads wait for the batch to drain.
+            return false;
+        };
+        let Some((name, e)) = &self.engine else {
+            return true;
+        };
+        if name != model || tx.is_closed() {
+            // It fails (or is dropped) without running.
+            return true;
+        }
+        let keys: Vec<&str> = self
+            .batch
+            .iter()
+            .filter_map(|a| a.req.cache_key.as_deref())
+            .collect();
+        let rows = ticket.prompt_tokens.unwrap_or(0) + req.max_tokens.unwrap_or(4096).min(4096);
+        let room = crate::batch::Room {
+            running: self.batch.len(),
+            max: e.max_batch(),
+            kv: e.kv_room(rows),
+        };
+        crate::batch::joins(req.cache_key.as_deref(), &keys, room)
+            && e.can_admit(req.cache_key.as_deref())
+    }
+
+    fn dispatch(&mut self, ticket: Ticket, job: Job) {
+        {
             let gate = self.node.resources.clone();
             let _guard = gate.lock();
             match job {
@@ -400,7 +618,9 @@ where
                     tx,
                     model,
                     before,
-                } => self.complete(ticket, req, prompt, tx, model, before),
+                    request_id,
+                    trace,
+                } => self.complete(ticket, req, prompt, tx, model, before, request_id, trace),
                 Job::Load { spec, reply } => {
                     let _ = reply.send(self.swap(&spec));
                 }
@@ -419,32 +639,44 @@ where
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn complete(
         &mut self,
-        mut ticket: Ticket,
+        ticket: Ticket,
         req: Box<Request>,
         prompt: Option<(String, Vec<u32>)>,
         tx: mpsc::UnboundedSender<Out>,
         model: String,
         before: Option<Before>,
+        request_id: Option<String>,
+        mut trace: Trace,
     ) {
+        let rid = request_id.as_deref();
+        trace.dequeued(|| self.node.queue.len());
         if tx.is_closed() {
-            return; // the client went away while it waited
+            // The client went away while it waited.
+            log_usage(rid, &model, &Usage::default(), "cancelled");
+            trace.finish(&Usage::default(), End::Cancelled, ticket.yields, None);
+            return;
         }
         let engine = match &mut self.engine {
             Some((name, e)) if *name == model => e,
             Some((name, _)) => {
-                let _ = tx.send(Out::Error(format!(
-                    "model {model} was unloaded ({name} is loaded now)"
-                )));
+                let msg = format!("model {model} was unloaded ({name} is loaded now)");
+                log_usage(rid, &model, &Usage::default(), "error");
+                trace.finish(&Usage::default(), End::Error, ticket.yields, Some(&msg));
+                let _ = tx.send(Out::Error(msg));
                 return;
             }
             None => {
-                let _ = tx.send(Out::Error(format!("model {model} was unloaded")));
+                let msg = format!("model {model} was unloaded");
+                log_usage(rid, &model, &Usage::default(), "error");
+                trace.finish(&Usage::default(), End::Error, ticket.yields, Some(&msg));
+                let _ = tx.send(Out::Error(msg));
                 return;
             }
         };
-        self.node.state().running = Some(Running {
+        self.node.state().running.push(Running {
             ticket: ticket.clone(),
             progress: Progress {
                 prompt_tokens: ticket.prompt_tokens.unwrap_or(0),
@@ -452,23 +684,161 @@ where
             },
             started: Instant::now(),
         });
-        let mut ctl = Ctl {
-            node: &self.node,
-            background: ticket.priority == Priority::Background,
-        };
-        let piece_tx = tx.clone();
         // A background request may give way; it keeps its prompt for when it goes on.
         let kept = match ticket.priority {
             Priority::Background => prompt.clone(),
             Priority::Interactive => None,
         };
+        if engine.max_batch() > 1 {
+            match engine.admit(&req, prompt) {
+                Ok(stream) => self.batch.push(Active {
+                    ticket,
+                    req,
+                    tx,
+                    model,
+                    before,
+                    request_id,
+                    trace,
+                    kept,
+                    stream,
+                }),
+                Err(e) => self.conclude(
+                    ticket,
+                    req,
+                    tx,
+                    model,
+                    before,
+                    request_id,
+                    trace,
+                    kept,
+                    Err(e),
+                ),
+            }
+            return;
+        }
+        let mut ctl = Ctl {
+            node: &self.node,
+            background: ticket.priority == Priority::Background,
+            tx: &tx,
+            id: ticket.id,
+            blocked: None,
+        };
+        let piece_tx = tx.clone();
         let result = engine.complete_with(
             &req,
             prompt,
             &mut |p| piece_tx.send(Out::Piece(p)).is_ok(),
             &mut ctl,
         );
-        self.node.state().running = None;
+        self.conclude(
+            ticket, req, tx, model, before, request_id, trace, kept, result,
+        );
+    }
+
+    /// One decode step for the batch, then the finished streams' replies.
+    fn step_batch(&mut self) {
+        let gate = self.node.resources.clone();
+        let _guard = gate.lock();
+        let Some((_, engine)) = self.engine.as_mut() else {
+            return;
+        };
+        // Interactive work still waiting now couldn't join this round; a stream giving way
+        // helps only if what it lacked was a slot.
+        let blocked =
+            self.node.queue.interactive_waiting() && self.batch.len() >= engine.max_batch();
+        let tickets: Vec<&Ticket> = self.batch.iter().map(|a| &a.ticket).collect();
+        let order = crate::batch::lane_order(&tickets);
+        let node = &*self.node;
+        let mut batch: Vec<Option<&mut Active>> = self.batch.iter_mut().map(Some).collect();
+        let mut picked: Vec<&mut Active> =
+            order.iter().map(|&i| batch[i].take().unwrap()).collect();
+        let txs: Vec<mpsc::UnboundedSender<Out>> = picked.iter().map(|a| a.tx.clone()).collect();
+        let mut ons: Vec<Box<dyn FnMut(Piece) -> bool>> = txs
+            .iter()
+            .map(|tx| {
+                let tx = tx.clone();
+                Box::new(move |p| tx.send(Out::Piece(p)).is_ok()) as Box<dyn FnMut(Piece) -> bool>
+            })
+            .collect();
+        let mut ctls: Vec<Ctl> = picked
+            .iter()
+            .zip(&txs)
+            .map(|(a, tx)| Ctl {
+                node,
+                background: a.ticket.priority == Priority::Background,
+                tx,
+                id: a.ticket.id,
+                blocked: Some(blocked),
+            })
+            .collect();
+        let mut lanes: Vec<DynLane> = picked
+            .iter_mut()
+            .zip(ons.iter_mut())
+            .zip(ctls.iter_mut())
+            .map(|((a, on), ctl)| DynLane {
+                stream: &mut a.stream,
+                on: &mut **on,
+                ctl,
+            })
+            .collect();
+        let result = engine.step(&mut lanes);
+        crate::telemetry::queue_depth(|| node.queue.len());
+        drop(lanes);
+        drop(ctls);
+        drop(picked);
+        drop(batch);
+        let failed = result.err().map(|e| format!("{e:#}"));
+        // Retire what's done (everything, if the step failed), oldest first.
+        let mut i = 0;
+        while i < self.batch.len() {
+            let engine = &self.engine.as_ref().expect("the engine that ran it").1;
+            let done = failed.is_some() || engine.stream_state(&self.batch[i].stream).0;
+            if !done {
+                i += 1;
+                continue;
+            }
+            let a = self.batch.remove(i);
+            let engine = &mut self.engine.as_mut().expect("the engine that ran it").1;
+            let result = match engine.retire(a.stream) {
+                Ok(o) => match &failed {
+                    Some(e) => Err(anyhow::anyhow!("{e}")),
+                    None => Ok(o),
+                },
+                Err(e) => Err(e),
+            };
+            self.conclude(
+                a.ticket,
+                a.req,
+                a.tx,
+                a.model,
+                a.before,
+                a.request_id,
+                a.trace,
+                a.kept,
+                result,
+            );
+        }
+    }
+
+    /// Reply for a run that's over (or requeue one that gave way).
+    #[allow(clippy::too_many_arguments)]
+    fn conclude(
+        &mut self,
+        mut ticket: Ticket,
+        req: Box<Request>,
+        tx: mpsc::UnboundedSender<Out>,
+        model: String,
+        before: Option<Before>,
+        request_id: Option<String>,
+        trace: Trace,
+        kept: Option<(String, Vec<u32>)>,
+        result: anyhow::Result<Outcome>,
+    ) {
+        let rid = request_id.as_deref();
+        self.node
+            .state()
+            .running
+            .retain(|r| r.ticket.id != ticket.id);
         // Before the reply goes out, so a client that asks `/node` next sees what it left.
         self.refresh_kv();
         match result {
@@ -499,6 +869,8 @@ where
                     tx,
                     model,
                     before: Some(before),
+                    request_id,
+                    trace,
                 };
                 self.node.queue.push_front(ticket, job);
             }
@@ -521,12 +893,22 @@ where
                     usage.prefill_tok_s =
                         (usage.prompt_tokens - b.cached_tokens) as f64 / (b.secs + secs).max(1e-9);
                 }
+                let end = if finish == Finish::Cancelled {
+                    End::Cancelled
+                } else {
+                    End::Ok
+                };
+                log_usage(rid, &model, &usage, end.as_str());
+                trace.finish(&usage, end, ticket.yields, None);
                 let engine = &mut self.engine.as_mut().expect("the engine that ran it").1;
                 let _ = tx.send(Out::Done(finish, usage.clone()));
                 engine.after(&req, &Ok((finish, usage)));
             }
             Err(e) => {
-                let _ = tx.send(Out::Error(format!("{e:#}")));
+                let msg = format!("{e:#}");
+                log_usage(rid, &model, &Usage::default(), "error");
+                trace.finish(&Usage::default(), End::Error, ticket.yields, Some(&msg));
+                let _ = tx.send(Out::Error(msg));
                 self.engine
                     .as_mut()
                     .expect("the engine that ran it")
@@ -550,6 +932,7 @@ where
             keys: e.cached_keys(),
             store: e.kv_store_dir().map(PathBuf::from),
             pool_bytes: e.kv_bytes(),
+            step_cost: e.step_cost(),
         };
         self.with_loaded(|l| l.kv = kv);
     }
@@ -785,6 +1168,7 @@ fn describe(node: &Node) -> Value {
                     "kv_bytes": m.kv.pool_bytes,
                 },
                 "rates": m.rates.json(),
+                "step_cost": m.kv.step_cost,
                 "kv": {
                     "block_positions": crate::blocks::BLOCK,
                     "memory_blocks": blocks.iter().map(hex).collect::<Vec<_>>(),
@@ -903,6 +1287,38 @@ async fn control(app: &App, job: impl FnOnce(oneshot::Sender<Reply>) -> Job) -> 
     }
 }
 
+/// One line per request, for reconciling with a gateway's records by request id:
+/// `tang-llm: usage request_id=… model=… prompt_tokens=… cached_tokens=… completion_tokens=… outcome=ok|cancelled|error`.
+/// Tokens are what ran: a cancelled request counts its prompt and what it generated.
+fn log_usage(request_id: Option<&str>, model: &str, u: &Usage, outcome: &str) {
+    eprintln!("{}", usage_line(request_id, model, u, outcome));
+}
+
+fn usage_line(request_id: Option<&str>, model: &str, u: &Usage, outcome: &str) -> String {
+    format!(
+        "tang-llm: usage request_id={} model={} prompt_tokens={} cached_tokens={} completion_tokens={} outcome={outcome}",
+        request_id.unwrap_or("-"),
+        model.replace(char::is_whitespace, "_"),
+        u.prompt_tokens,
+        u.cached_tokens,
+        u.completion_tokens,
+    )
+}
+
+/// `x-request-id`, kept to printable ASCII without spaces (so the log line stays one token
+/// per field) and at most 128 bytes.
+fn request_id(headers: &HeaderMap) -> Option<String> {
+    let id: String = headers
+        .get("x-request-id")?
+        .to_str()
+        .ok()?
+        .chars()
+        .filter(|c| c.is_ascii_graphic())
+        .take(128)
+        .collect();
+    (!id.is_empty()).then_some(id)
+}
+
 /// Queue a request for the loaded model, at its `x-frog-priority`, with its prompt counted.
 #[allow(clippy::result_large_err)]
 async fn submit(
@@ -931,12 +1347,16 @@ async fn submit(
     let prompt = prompt.map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let (tx, rx) = mpsc::unbounded_channel();
     let n = prompt.as_ref().map(|p| p.1.len());
+    let request_id = request_id(headers);
+    let trace = Trace::incoming(headers, priority.as_str(), &model, request_id.as_deref());
     let job = Job::Complete {
         req: Box::new(req),
         prompt,
         tx,
         model: model.clone(),
         before: None,
+        request_id,
+        trace,
     };
     app.node.queue.push(priority, n, job);
     Ok((model, rx))
@@ -948,6 +1368,127 @@ fn error(status: StatusCode, msg: impl Into<String>) -> Response {
         Json(json!({ "error": { "message": msg.into(), "type": "invalid_request_error" } })),
     )
         .into_response()
+}
+
+/// Images a request may carry, and the most bytes one may be.
+const MAX_IMAGES: usize = 16;
+const MAX_IMAGE_BYTES: usize = 20 << 20;
+
+/// Replace `https://` image URLs in a chat body with data URLs of what they point to. Only
+/// public addresses are fetched (the host is resolved once and pinned, redirects are refused),
+/// so a request can't make the server reach its own network. `TANG_IMAGE_FETCH=0` turns
+/// fetching off (then only data URLs are accepted).
+async fn fetch_images(body: &mut Value) -> Result<(), String> {
+    use base64::Engine as _;
+    // The image URL slots, in order: `image_url.url` or a bare `image_url` string.
+    fn slots(body: &mut Value) -> Vec<&mut Value> {
+        let mut out = Vec::new();
+        for m in body["messages"].as_array_mut().into_iter().flatten() {
+            for p in m["content"].as_array_mut().into_iter().flatten() {
+                let slot = if p["image_url"].is_object() {
+                    &mut p["image_url"]["url"]
+                } else {
+                    &mut p["image_url"]
+                };
+                if slot.as_str().is_some_and(|u| !u.starts_with("data:")) {
+                    out.push(slot);
+                }
+            }
+        }
+        out
+    }
+    let urls: Vec<String> = slots(body)
+        .iter()
+        .map(|s| s.as_str().unwrap_or_default().to_string())
+        .collect();
+    if urls.is_empty() {
+        return Ok(());
+    }
+    if std::env::var("TANG_IMAGE_FETCH").as_deref() == Ok("0") {
+        return Err("images must be data URLs (data:image/...;base64,...)".into());
+    }
+    if urls.len() > MAX_IMAGES {
+        return Err(format!("at most {MAX_IMAGES} images per request"));
+    }
+    let mut data = Vec::with_capacity(urls.len());
+    for url in &urls {
+        let bytes = fetch_image(url).await?;
+        data.push(base64::engine::general_purpose::STANDARD.encode(&bytes));
+    }
+    for (slot, d) in slots(body).into_iter().zip(data) {
+        *slot = json!(format!("data:image;base64,{d}"));
+    }
+    Ok(())
+}
+
+async fn fetch_image(url: &str) -> Result<Vec<u8>, String> {
+    let bad = |e: &dyn std::fmt::Display| format!("image {url}: {e}");
+    let parsed = reqwest::Url::parse(url).map_err(|e| bad(&e))?;
+    if parsed.scheme() != "https" {
+        return Err(bad(&"only https and data URLs are accepted"));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| bad(&"no host"))?
+        .to_string();
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let addr = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|e| bad(&e))?
+        .find(|a| public_ip(a.ip()))
+        .ok_or_else(|| bad(&"not a public address"))?;
+    let client = reqwest::Client::builder()
+        .resolve(&host, addr)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| bad(&e))?;
+    let mut resp = client.get(parsed).send().await.map_err(|e| bad(&e))?;
+    if !resp.status().is_success() {
+        return Err(bad(&resp.status()));
+    }
+    let mut out = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| bad(&e))? {
+        out.extend_from_slice(&chunk);
+        if out.len() > MAX_IMAGE_BYTES {
+            return Err(bad(&format!("over {} MiB", MAX_IMAGE_BYTES >> 20)));
+        }
+    }
+    Ok(out)
+}
+
+/// Whether an address is on the public internet (not loopback, private, link-local, CGNAT,
+/// unique-local, documentation, multicast or unspecified).
+fn public_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(a) => {
+            let o = a.octets();
+            !(a.is_loopback()
+                || a.is_private()
+                || a.is_link_local()
+                || a.is_unspecified()
+                || a.is_broadcast()
+                || a.is_multicast()
+                || a.is_documentation()
+                || o[0] == 0
+                || (o[0] == 100 && (o[1] & 0xc0) == 64)
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+                || o[0] >= 240)
+        }
+        IpAddr::V6(a) => {
+            if let Some(v4) = a.to_ipv4_mapped() {
+                return public_ip(IpAddr::V4(v4));
+            }
+            let s = a.segments();
+            !(a.is_loopback()
+                || a.is_unspecified()
+                || a.is_multicast()
+                || (s[0] & 0xfe00) == 0xfc00
+                || (s[0] & 0xffc0) == 0xfe80
+                || s[0] == 0x2001 && s[1] == 0xdb8)
+        }
+    }
 }
 
 /// Make content a string, which templates assume: flatten OpenAI content arrays
@@ -977,7 +1518,17 @@ fn normalize_messages(messages: &Value) -> Result<(Value, Vec<Vec<u8>>), String>
                     text.push(crate::engine::IMAGE_MARKER.to_string());
                 }
             }
-            m["content"] = json!(text.join("\n"));
+            // Parts join with newlines, but an image sits right against its neighbours (as
+            // the reference chat templates render image parts).
+            let marker = crate::engine::IMAGE_MARKER;
+            let mut joined = String::new();
+            for (i, t) in text.iter().enumerate() {
+                if i > 0 && t != marker && text[i - 1] != marker {
+                    joined.push('\n');
+                }
+                joined.push_str(t);
+            }
+            m["content"] = json!(joined);
         } else if !m["content"].is_string() && m.is_object() {
             m["content"] = json!("");
         }
@@ -1015,8 +1566,7 @@ mod tests {
                     reasoning_tokens: 0,
                     prefill_tok_s: 10.0,
                     decode_tok_s: 20.0,
-                    draft_tokens: 0,
-                    accepted_tokens: 0,
+                    ..Usage::default()
                 },
             ))
         }
@@ -1073,10 +1623,46 @@ mod tests {
             node,
             engine: Some(("flash".into(), FixedBackend { failed: false })),
             load: |_: &str| -> anyhow::Result<FixedBackend> { panic!("must not load") },
+            batch: Vec::new(),
         };
         let err = worker.swap("does-not-exist").unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
         assert_eq!(worker.engine.as_ref().unwrap().0, "flash");
+    }
+
+    #[test]
+    fn only_public_addresses_are_fetched() {
+        let p = |s: &str| super::public_ip(s.parse().unwrap());
+        assert!(p("1.1.1.1") && p("2606:4700::1111"));
+        for a in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "::1",
+            "fd00::1",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+        ] {
+            assert!(!p(a), "{a}");
+        }
+    }
+
+    #[test]
+    fn images_sit_against_their_text() {
+        let m = serde_json::json!([{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            {"type": "text", "text": "what is this?"},
+            {"type": "text", "text": "and this"},
+        ]}]);
+        let (n, imgs) = super::normalize_messages(&m).unwrap();
+        let mk = crate::engine::IMAGE_MARKER;
+        assert_eq!(n[0]["content"], format!("{mk}what is this?\nand this"));
+        assert_eq!(imgs.len(), 1);
     }
 
     #[test]
@@ -1115,6 +1701,9 @@ mod tests {
     use super::{collect_response, stream_response, Out};
     use crate::chat::Piece;
     use crate::engine::{Finish, Usage};
+    use crate::telemetry::Trace;
+    #[cfg(feature = "otel")]
+    use axum::http::HeaderMap;
     use axum::response::IntoResponse;
     use serde_json::{json, Value};
     use tokio::sync::mpsc;
@@ -1135,8 +1724,7 @@ mod tests {
             reasoning_tokens: 0,
             prefill_tok_s: 0.0,
             decode_tok_s: 0.0,
-            draft_tokens: 0,
-            accepted_tokens: 0,
+            ..Usage::default()
         };
         tx.send(Out::Done(Finish::ToolCalls, usage)).unwrap();
         rx
@@ -1188,6 +1776,376 @@ mod tests {
         }
         let unique: std::collections::HashSet<_> = ids.iter().collect();
         assert_eq!(unique.len(), ids.len(), "{ids:?}");
+    }
+
+    #[tokio::test]
+    async fn include_usage_ends_with_an_openai_usage_chunk() {
+        let r = stream_response("m".into(), "id".into(), 7, true, two_calls()).into_response();
+        let text = body(r).await;
+        let data: Vec<&str> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .collect();
+        assert_eq!(data.last(), Some(&"[DONE]"));
+        let evs: Vec<Value> = data
+            .iter()
+            .filter_map(|d| serde_json::from_str(d).ok())
+            .collect();
+        let (usage, rest) = evs.split_last().unwrap();
+        assert_eq!(usage["object"], "chat.completion.chunk");
+        assert_eq!(usage["id"], "id");
+        assert_eq!(usage["model"], "m");
+        assert_eq!(usage["created"], 7);
+        assert_eq!(usage["choices"], json!([]));
+        assert_eq!(usage["usage"]["prompt_tokens"], 1);
+        assert_eq!(usage["usage"]["completion_tokens"], 1);
+        assert_eq!(usage["usage"]["prompt_tokens_details"]["cached_tokens"], 0);
+        // The finish chunk comes before it, without usage; no other chunk carries usage.
+        let finish = rest.last().unwrap();
+        assert_eq!(finish["choices"][0]["finish_reason"], "tool_calls");
+        assert!(rest.iter().all(|e| e.get("usage").is_none()));
+    }
+
+    #[test]
+    fn usage_line_and_request_id() {
+        let mut h = axum::http::HeaderMap::new();
+        assert_eq!(super::request_id(&h), None);
+        h.insert("x-request-id", "req 42\tab".parse().unwrap());
+        assert_eq!(super::request_id(&h).as_deref(), Some("req42ab"));
+        let u = Usage {
+            prompt_tokens: 10,
+            cached_tokens: 4,
+            completion_tokens: 3,
+            ..Usage::default()
+        };
+        assert_eq!(
+            super::usage_line(Some("req42"), "qwen 3", &u, "cancelled"),
+            "tang-llm: usage request_id=req42 model=qwen_3 prompt_tokens=10 cached_tokens=4 completion_tokens=3 outcome=cancelled"
+        );
+        assert!(super::usage_line(None, "m", &u, "ok").contains("request_id=- "));
+    }
+
+    /// Generates silently (as while a tool call is buffered, or during a long prefill) until
+    /// its Control says stop, counting steps.
+    struct Endless {
+        steps: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    const ENDLESS: usize = 100_000;
+    impl Backend for Endless {
+        fn context_window(&self) -> usize {
+            1024
+        }
+        fn complete(
+            &mut self,
+            _: &Request,
+            _: &mut dyn FnMut(Piece) -> bool,
+        ) -> anyhow::Result<(Finish, Usage)> {
+            unreachable!()
+        }
+        fn complete_with(
+            &mut self,
+            _: &Request,
+            _: Option<(String, Vec<u32>)>,
+            _: &mut dyn FnMut(Piece) -> bool,
+            ctl: &mut dyn super::Control,
+        ) -> anyhow::Result<Outcome> {
+            use std::sync::atomic::Ordering;
+            self.steps.store(0, Ordering::SeqCst);
+            let mut finish = Finish::Length;
+            for _ in 0..ENDLESS {
+                if ctl.cancelled() {
+                    finish = Finish::Cancelled;
+                    break;
+                }
+                self.steps.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Ok(Outcome::Done(
+                finish,
+                Usage {
+                    prompt_tokens: 5,
+                    completion_tokens: self.steps.load(Ordering::SeqCst),
+                    ..Usage::default()
+                },
+            ))
+        }
+        fn model_path(&self, _: &str) -> anyhow::Result<std::path::PathBuf> {
+            Ok("/m".into())
+        }
+    }
+
+    /// Spans and step metrics through the worker, to in-memory exporters.
+    #[cfg(feature = "otel")]
+    #[test]
+    fn otel_spans_continue_the_incoming_trace() {
+        use opentelemetry::trace::{SpanKind, Status, TraceId};
+        use opentelemetry::Value as V;
+        use opentelemetry_sdk::error::OTelSdkResult;
+        use opentelemetry_sdk::metrics::data::ResourceMetrics;
+        use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
+        use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider, Temporality};
+        use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Debug, Clone, Default)]
+        struct Spans(Arc<Mutex<Vec<SpanData>>>);
+        impl SpanExporter for Spans {
+            async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+                self.0.lock().unwrap().extend(batch);
+                Ok(())
+            }
+        }
+        #[derive(Clone, Default)]
+        struct Metrics(Arc<Mutex<Vec<String>>>);
+        impl PushMetricExporter for Metrics {
+            async fn export(&self, m: &ResourceMetrics) -> OTelSdkResult {
+                let mut names = self.0.lock().unwrap();
+                for sm in m.scope_metrics() {
+                    names.extend(sm.metrics().map(|m| m.name().to_string()));
+                }
+                Ok(())
+            }
+            fn force_flush(&self) -> OTelSdkResult {
+                Ok(())
+            }
+            fn shutdown_with_timeout(&self, _: std::time::Duration) -> OTelSdkResult {
+                Ok(())
+            }
+            fn temporality(&self) -> Temporality {
+                Temporality::Cumulative
+            }
+        }
+
+        struct Traced;
+        impl Backend for Traced {
+            fn context_window(&self) -> usize {
+                1024
+            }
+            fn complete(
+                &mut self,
+                _: &Request,
+                on: &mut dyn FnMut(Piece) -> bool,
+            ) -> anyhow::Result<(Finish, Usage)> {
+                // Longer than its decode, so the prefill span has room before it.
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                on(Piece::Text("ok".into()));
+                Ok((
+                    Finish::Stop,
+                    Usage {
+                        prompt_tokens: 32,
+                        cached_tokens: 8,
+                        completion_tokens: 6,
+                        decode_tok_s: 120.0,
+                        prefill_tok_s: 1000.0,
+                        draft_tokens: 4,
+                        accepted_tokens: 2,
+                        prefill_chunks: 3,
+                        decode_steps: 4,
+                        shared_streams: 6,
+                        ..Usage::default()
+                    },
+                ))
+            }
+            fn model_path(&self, _: &str) -> anyhow::Result<std::path::PathBuf> {
+                Ok("/weights/model.gguf".into())
+            }
+        }
+
+        let spans = Spans::default();
+        let metrics = Metrics::default();
+        let tp = SdkTracerProvider::builder()
+            .with_simple_exporter(spans.clone())
+            .build();
+        let mp = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(metrics.clone()).build())
+            .build();
+        crate::telemetry::install(&tp, &mp);
+
+        let node = std::sync::Arc::new(super::Node {
+            id: "test".into(),
+            queue: crate::queue::Queue::new(),
+            state: std::sync::Mutex::new(super::NodeState::default()),
+            hardware: std::sync::Arc::new(crate::node::Hardware::default),
+            dtype: crate::model::Dtype::F32,
+            resources: Default::default(),
+            image: None,
+        });
+        let mut worker = super::Worker {
+            node,
+            engine: Some(("m".into(), Traced)),
+            load: |_: &str| -> anyhow::Result<Traced> { unreachable!() },
+            batch: Vec::new(),
+        };
+        let run = |worker: &mut super::Worker<Traced, _>, headers: &HeaderMap, model: &str| {
+            let rid = super::request_id(headers);
+            let trace = Trace::incoming(headers, "background", model, rid.as_deref());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let ticket = crate::queue::Ticket {
+                id: 1,
+                priority: crate::queue::Priority::Background,
+                prompt_tokens: Some(32),
+                since: std::time::Instant::now(),
+                yields: 0,
+            };
+            let req = Box::new(super::parse(&json!({"messages": []})).unwrap());
+            worker.complete(ticket, req, None, tx, model.into(), None, rid, trace);
+            while rx.try_recv().is_ok() {}
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "traceparent",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("x-request-id", "req-7".parse().unwrap());
+        run(&mut worker, &headers, "m");
+        // A model that's gone: an error, a fresh trace.
+        run(&mut worker, &HeaderMap::new(), "other");
+        crate::telemetry::step(&crate::engine::StepStats {
+            decode_rows: 3,
+            decode_streams: 3,
+            prefill_tokens: 512,
+            prefill_chunks: 1,
+            secs: 0.02,
+        });
+        crate::telemetry::queue_depth(|| 2);
+
+        let got = spans.0.lock().unwrap().clone();
+        let attr = |s: &SpanData, k: &str| {
+            s.attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == k)
+                .map(|kv| kv.value.clone())
+        };
+        let named = |n: &str| -> Vec<&SpanData> { got.iter().filter(|s| s.name == n).collect() };
+        let trace_id = TraceId::from_hex("4bf92f3577b34da6a3ce929d0e0e4736").unwrap();
+        let roots = named("chat.completions");
+        assert_eq!(roots.len(), 2);
+        let root = roots
+            .iter()
+            .find(|s| s.span_context.trace_id() == trace_id)
+            .expect("the incoming trace continued");
+        assert_eq!(root.parent_span_id.to_string(), "00f067aa0ba902b7");
+        assert_eq!(root.span_kind, SpanKind::Server);
+        assert_eq!(attr(root, "request.id"), Some(V::from("req-7")));
+        assert_eq!(attr(root, "gen_ai.request.model"), Some(V::from("m")));
+        assert_eq!(attr(root, "outcome"), Some(V::from("ok")));
+        let child = |n: &str| {
+            *named(n)
+                .iter()
+                .find(|s| s.span_context.trace_id() == trace_id)
+                .unwrap_or_else(|| panic!("no {n} span"))
+        };
+        for n in ["queued", "prefill", "decode", "finish"] {
+            let s = child(n);
+            assert_eq!(s.parent_span_id, root.span_context.span_id(), "{n}");
+            assert_eq!(attr(s, "request.id"), Some(V::from("req-7")), "{n}");
+            assert!(s.start_time <= s.end_time, "{n}");
+        }
+        let q = child("queued");
+        assert_eq!(attr(q, "priority"), Some(V::from("background")));
+        assert!(attr(q, "queue.wait_ms").is_some());
+        let p = child("prefill");
+        assert_eq!(attr(p, "prompt_tokens"), Some(V::I64(32)));
+        assert_eq!(attr(p, "cached_tokens"), Some(V::I64(8)));
+        assert_eq!(attr(p, "new_tokens"), Some(V::I64(24)));
+        assert_eq!(attr(p, "chunks"), Some(V::I64(3)));
+        let d = child("decode");
+        assert_eq!(attr(d, "completion_tokens"), Some(V::I64(6)));
+        assert_eq!(attr(d, "accepted_draft_tokens"), Some(V::I64(2)));
+        assert_eq!(attr(d, "tokens_per_verify_window"), Some(V::F64(1.5)));
+        assert_eq!(attr(d, "shared_streams_avg"), Some(V::F64(1.5)));
+        // 6 tokens at 120/s: the decode span is the last 50 ms.
+        let ms = d.end_time.duration_since(d.start_time).unwrap().as_millis();
+        assert!((49..=51).contains(&ms), "{ms}");
+        assert_eq!(p.end_time, d.start_time);
+        assert_eq!(attr(child("finish"), "outcome"), Some(V::from("ok")));
+
+        let failed = roots
+            .iter()
+            .find(|s| s.span_context.trace_id() != trace_id)
+            .unwrap();
+        assert_eq!(failed.parent_span_id.to_string(), "0000000000000000");
+        assert_eq!(attr(failed, "outcome"), Some(V::from("error")));
+        assert!(matches!(failed.status, Status::Error { .. }));
+        assert!(attr(failed, "request.id").is_none());
+
+        mp.force_flush().unwrap();
+        let names = metrics.0.lock().unwrap().clone();
+        for m in [
+            "tang_llm.step.duration",
+            "tang_llm.step.rows",
+            "tang_llm.prefill.chunk_tokens",
+            "tang_llm.prefix.hit_ratio",
+            "tang_llm.queue.depth",
+            "tang_llm.stream.tokens_per_second",
+        ] {
+            assert!(names.iter().any(|n| n == m), "{m} missing from {names:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_stream_stops_generation() {
+        use std::sync::atomic::Ordering;
+        let steps = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let node = std::sync::Arc::new(super::Node {
+            id: "test".into(),
+            queue: crate::queue::Queue::new(),
+            state: std::sync::Mutex::new(super::NodeState::default()),
+            hardware: std::sync::Arc::new(crate::node::Hardware::default),
+            dtype: crate::model::Dtype::F32,
+            resources: Default::default(),
+            image: None,
+        });
+        let endless = Endless {
+            steps: steps.clone(),
+        };
+        // Built on its thread (a worker holds streams that stay on it).
+        let make = move || super::Worker {
+            node,
+            engine: Some(("m".into(), endless)),
+            load: |_: &str| -> anyhow::Result<Endless> { unreachable!() },
+            batch: Vec::new(),
+        };
+        let req = Box::new(super::parse(&json!({"messages": []})).unwrap());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let ticket = crate::queue::Ticket {
+            id: 1,
+            priority: crate::queue::Priority::Interactive,
+            prompt_tokens: None,
+            since: std::time::Instant::now(),
+            yields: 0,
+        };
+        let run = std::thread::spawn(move || {
+            let mut worker = make();
+            let t = std::time::Instant::now();
+            worker.complete(
+                ticket,
+                req,
+                None,
+                tx,
+                "m".into(),
+                None,
+                Some("rid".into()),
+                Trace::none(),
+            );
+            let took = t.elapsed();
+            drop(worker);
+            (took, ())
+        });
+        // The client reads nothing and goes away while the run is under way.
+        let sse = stream_response("m".into(), "id".into(), 0, true, rx).into_response();
+        while steps.load(Ordering::SeqCst) < 20 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        drop(sse);
+        let took = tokio::task::spawn_blocking(move || run.join().unwrap().0)
+            .await
+            .unwrap();
+        let n = steps.load(Ordering::SeqCst);
+        assert!(n < 2_000, "ran {n} steps after the client left");
+        assert!(took < std::time::Duration::from_secs(10), "{took:?}");
     }
 }
 
@@ -1287,7 +2245,14 @@ fn usage_json(u: &Usage) -> Value {
 }
 
 /// Prefill a chat completion body without generating: `{usage}` once the cache holds it.
-async fn prefill(State(app): State<App>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
+async fn prefill(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(mut body): Json<Value>,
+) -> Response {
+    if let Err(e) = fetch_images(&mut body).await {
+        return error(StatusCode::BAD_REQUEST, e);
+    }
     let mut req = match parse(&body) {
         Ok(r) => r,
         Err(e) => return error(StatusCode::BAD_REQUEST, e),
@@ -1310,7 +2275,10 @@ async fn prefill(State(app): State<App>, headers: HeaderMap, Json(body): Json<Va
     error(StatusCode::SERVICE_UNAVAILABLE, "model worker stopped")
 }
 
-async fn chat(State(app): State<App>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
+async fn chat(State(app): State<App>, headers: HeaderMap, Json(mut body): Json<Value>) -> Response {
+    if let Err(e) = fetch_images(&mut body).await {
+        return error(StatusCode::BAD_REQUEST, e);
+    }
     let req = match parse(&body) {
         Ok(r) => r,
         Err(e) => return error(StatusCode::BAD_REQUEST, e),
@@ -1358,7 +2326,16 @@ fn stream_response(
     let mut first = true;
     let (sse_tx, sse_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        while let Some(out) = rx.recv().await {
+        loop {
+            // Watch for the client going away even while nothing is generated (a long
+            // prefill, buffered tool-call text): dropping rx stops the run.
+            let out = tokio::select! {
+                out = rx.recv() => match out {
+                    Some(out) => out,
+                    None => return,
+                },
+                _ = sse_tx.closed() => return,
+            };
             let mut evs: Vec<Value> = Vec::new();
             let role = if first {
                 json!("assistant")
@@ -1387,7 +2364,10 @@ fn stream_response(
                     let mut last = chunk(json!({}), Some(finish_reason(finish)));
                     if include_usage {
                         evs.push(last);
-                        last = json!({ "id": last_id(&evs), "object": "chat.completion.chunk", "choices": [], "usage": usage_json(&usage) });
+                        let mut u = chunk(json!({}), None);
+                        u["choices"] = json!([]);
+                        u["usage"] = usage_json(&usage);
+                        last = u;
                     } else {
                         last["usage"] = usage_json(&usage);
                     }
@@ -1440,10 +2420,6 @@ fn tool_call_id() -> String {
     });
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
     format!("call_{prefix:016x}{n:08x}")
-}
-
-fn last_id(evs: &[Value]) -> Value {
-    evs.last().map(|e| e["id"].clone()).unwrap_or(Value::Null)
 }
 
 async fn collect_response(

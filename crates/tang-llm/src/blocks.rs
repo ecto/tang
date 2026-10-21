@@ -59,6 +59,8 @@ struct Meta {
     tokens: Vec<u32>,
     /// Last attached or sealed (larger is later).
     used: u64,
+    /// Last attached or sealed, by the wall clock (see [`crate::retention`]).
+    at: Option<std::time::SystemTime>,
     /// Written to the disk tier already.
     pub on_disk: bool,
 }
@@ -79,6 +81,8 @@ pub struct Pool<B> {
     max_blocks: usize,
     /// Over budget at least once (reported once).
     overrun: bool,
+    /// Cached blocks unused this long are dropped (see [`crate::retention`]).
+    ttl: Option<std::time::Duration>,
 }
 
 /// What a pool holds, in blocks.
@@ -109,6 +113,7 @@ impl<B> Pool<B> {
             clock: 0,
             max_blocks: max_blocks.max(1),
             overrun: false,
+            ttl: crate::retention::ttl(),
         }
     }
 
@@ -155,6 +160,35 @@ impl<B> Pool<B> {
     fn touch(&mut self, b: u32) {
         self.clock += 1;
         self.meta[b as usize].used = self.clock;
+        self.meta[b as usize].at = Some(crate::retention::now());
+    }
+
+    pub fn set_ttl(&mut self, ttl: Option<std::time::Duration>) {
+        self.ttl = ttl;
+    }
+
+    /// Whether `b` is a cached block (sealed, held by no cache) past the TTL.
+    fn stale(&self, b: u32) -> bool {
+        let m = &self.meta[b as usize];
+        m.refs == 0
+            && m.hash.is_some()
+            && m.at
+                .is_some_and(|at| crate::retention::expired(at, self.ttl))
+    }
+
+    /// Drop cached blocks unused for the TTL. Returns how many went.
+    pub fn expire(&mut self) -> usize {
+        let stale: Vec<u32> = (0..self.meta.len() as u32)
+            .filter(|&b| self.stale(b))
+            .collect();
+        for &b in &stale {
+            if let Some(h) = self.meta[b as usize].hash {
+                self.by_hash.remove(&h);
+            }
+            self.meta[b as usize] = Meta::default();
+            self.free.push(b);
+        }
+        stale.len()
     }
 
     /// One more holder of `b`.
@@ -169,6 +203,8 @@ impl<B> Pool<B> {
         let m = &mut self.meta[b as usize];
         debug_assert!(m.refs > 0, "releasing an unheld block");
         m.refs -= 1;
+        // Held until now: the TTL counts from here.
+        m.at = Some(crate::retention::now());
         if m.refs == 0 && m.hash.is_none() {
             self.free.push(b);
         }
@@ -183,14 +219,14 @@ impl<B> Pool<B> {
     /// The sealed block with id `hash` holding `tokens`, if the pool has it.
     pub fn find(&self, hash: u64, tokens: &[u32]) -> Option<u32> {
         let &b = self.by_hash.get(&hash)?;
-        (self.meta[b as usize].tokens == tokens).then_some(b)
+        (self.meta[b as usize].tokens == tokens && !self.stale(b)).then_some(b)
     }
 
     /// Sealed blocks following the block with id `parent`, with their tokens.
     pub fn children(&self, parent: u64) -> Vec<(u32, &[u32])> {
         self.by_hash
             .values()
-            .filter(|&&b| self.meta[b as usize].parent == parent)
+            .filter(|&&b| self.meta[b as usize].parent == parent && !self.stale(b))
             .map(|&b| (b, &self.meta[b as usize].tokens[..]))
             .collect()
     }
@@ -232,7 +268,11 @@ impl<B> Pool<B> {
 
     /// The ids of every sealed block held, in no particular order.
     pub fn hashes(&self) -> Vec<u64> {
-        self.by_hash.keys().copied().collect()
+        self.by_hash
+            .iter()
+            .filter(|&(_, &b)| !self.stale(b))
+            .map(|(&h, _)| h)
+            .collect()
     }
 
     /// The id of sealed block `b`.
@@ -409,6 +449,32 @@ pub struct Cache<B> {
     /// Tokens already in the cache.
     pub len: usize,
     pub tokens: Vec<u32>,
+    /// Per-position RoPE rows, for a sequence whose positions aren't its cache indices
+    /// (Qwen3-VL's M-RoPE once an image is in it). `None`: the model's own table.
+    pub(crate) mrope: Option<MRope<B>>,
+}
+
+/// RoPE (cos, sin) rows `[capacity, head_dim / 2]` for one sequence, indexed by cache position,
+/// and where text positions stand relative to cache indices: after each image, text at cache
+/// index `i` takes the model's row `i + delta`.
+pub struct MRope<B> {
+    pub cos: B,
+    pub sin: B,
+    /// Rows `0..filled` are written.
+    pub filled: usize,
+    /// (cache index where it starts, delta), in order.
+    pub shifts: Vec<(usize, i64)>,
+}
+
+impl<B> MRope<B> {
+    /// The text delta at cache index `i`.
+    pub fn delta(&self, i: usize) -> i64 {
+        self.shifts
+            .iter()
+            .rev()
+            .find(|s| s.0 <= i)
+            .map_or(0, |s| s.1)
+    }
 }
 
 impl<B> Cache<B> {
@@ -418,6 +484,7 @@ impl<B> Cache<B> {
             table: Vec::new(),
             len: 0,
             tokens: Vec::new(),
+            mrope: None,
         }
     }
 
@@ -438,6 +505,13 @@ impl<B> Cache<B> {
     pub fn truncate(&mut self, len: usize) {
         self.len = self.len.min(len);
         self.tokens.truncate(self.len);
+        if let Some(m) = &mut self.mrope {
+            m.filled = m.filled.min(self.len);
+            m.shifts.retain(|s| s.0 <= self.len);
+            if m.shifts.is_empty() {
+                self.mrope = None;
+            }
+        }
         let keep = self.len.div_ceil(BLOCK);
         if self.table.len() > keep {
             let mut pool = lock(&self.pool);
@@ -621,6 +695,35 @@ mod tests {
         assert!(lock(&p).find(hb, &t2).is_some());
         assert_eq!(lock(&p).stats().capacity, 3);
         drop(c);
+    }
+
+    #[test]
+    fn cached_blocks_expire_after_the_ttl_and_a_hit_refreshes_them() {
+        use crate::retention::advance;
+        use std::time::Duration;
+        let (dev, p) = pool(8);
+        lock(&p).set_ttl(Some(Duration::from_secs(60)));
+        let t = toks(BLOCK, 3);
+        let mut a = filled(&dev, &p, &t);
+        a.seal(a.len);
+        let h = chain_all(&t)[0];
+        drop(a);
+        // Reused before the TTL; the hit (attach) refreshes it.
+        advance(Duration::from_secs(50));
+        let b = lock(&p).find(h, &t).unwrap();
+        let mut c = Cache::new(p.clone());
+        c.attach(&[b], &t);
+        drop(c);
+        advance(Duration::from_secs(50));
+        assert_eq!(lock(&p).expire(), 0);
+        assert!(lock(&p).find(h, &t).is_some());
+        assert_eq!(lock(&p).hashes(), vec![h]);
+        // Past it: invisible at once, freed by the sweep.
+        advance(Duration::from_secs(11));
+        assert!(lock(&p).find(h, &t).is_none());
+        assert!(lock(&p).hashes().is_empty());
+        assert_eq!(lock(&p).expire(), 1);
+        assert_eq!(lock(&p).stats().cached, 0);
     }
 
     #[test]

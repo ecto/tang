@@ -208,7 +208,11 @@ impl CoefModel for HandModel {
         let a = activity(f) + f.pm.min(15) as u32;
         let pa = 4 * f.par.min(15) as u32 + f.pnb.min(60) as u32;
         let ab = bucket(a, &A_TH);
-        let pb = if f.has_par { 1 + bucket(pa, &P_TH[..NP - 2]) } else { 0 };
+        let pb = if f.has_par {
+            1 + bucket(pa, &P_TH[..NP - 2])
+        } else {
+            0
+        };
         let mag = v.unsigned_abs();
         b.tag(0);
         if !b.bit(mag > 0, &mut self.sig[(c * NA + ab) * NP + pb]) {
@@ -217,7 +221,9 @@ impl CoefModel for HandModel {
         b.tag(1);
         let e = mag_scale(f);
         let k = e.saturating_sub(2) as u32;
-        let r = mag - 1;
+        // On decode `v` is a placeholder (mag == 0); the value is rebuilt from
+        // the decoded bits below, so wrap rather than trap in debug builds.
+        let r = mag.wrapping_sub(1);
         let hi = r >> k;
         let mut h = 0u32;
         while (h as usize) < KB {
@@ -227,7 +233,7 @@ impl CoefModel for HandModel {
             h += 1;
         }
         if h as usize == KB {
-            h += b.uint((hi - h) as u64, &mut self.esc[c]) as u32;
+            h += b.uint(hi.wrapping_sub(h) as u64, &mut self.esc[c]) as u32;
         }
         let mut lo = 0u32;
         b.tag(2);
@@ -235,7 +241,10 @@ impl CoefModel for HandModel {
             let bit = (r >> j) & 1 == 1;
             let pos = (k - 1 - j) as usize;
             let got = if pos < 2 {
-                b.bit(bit, &mut self.low[(e * 2 + pos) * 2 + (pos == 1 && lo & 1 == 1) as usize])
+                b.bit(
+                    bit,
+                    &mut self.low[(e * 2 + pos) * 2 + (pos == 1 && lo & 1 == 1) as usize],
+                )
             } else {
                 b.bitp(bit, crate::abac::ONE / 2)
             };
@@ -255,7 +264,15 @@ impl CoefModel for HandModel {
 
 /// Gather the features of position `(z, y, x)` in band `bi`.
 #[inline]
-pub fn features(p: &Pyramid, bi: usize, pbi: Option<usize>, q: &[i32], z: usize, y: usize, x: usize) -> Feat {
+pub fn features(
+    p: &Pyramid,
+    bi: usize,
+    pbi: Option<usize>,
+    q: &[i32],
+    z: usize,
+    y: usize,
+    x: usize,
+) -> Feat {
     let b = &p.bands[bi];
     let [_, ny, nx] = p.dims;
     let at = |z: usize, y: usize, x: usize| q[(z * ny + y) * nx + x];
@@ -263,13 +280,25 @@ pub fn features(p: &Pyramid, bi: usize, pbi: Option<usize>, q: &[i32], z: usize,
     let sgn = |v: i32| v.signum() as i8;
     let (z0, y0, x0) = (b.start[0], b.start[1], b.start[2]);
     let x1 = b.end[2];
-    let mut f = Feat { class: band_class(b), mask: b.mask, ..Default::default() };
+    let mut f = Feat {
+        class: band_class(b),
+        mask: b.mask,
+        ..Default::default()
+    };
     if x > x0 {
         let w = at(z, y, x - 1);
-        { let t = w; f.nb[0] = mag(t); f.sv[0] = t; }
+        {
+            let t = w;
+            f.nb[0] = mag(t);
+            f.sv[0] = t;
+        }
         f.sg[0] = sgn(w);
         if x > x0 + 1 {
-            { let t = at(z, y, x - 2); f.nb[7] = mag(t); f.sv[7] = t; }
+            {
+                let t = at(z, y, x - 2);
+                f.nb[7] = mag(t);
+                f.sv[7] = t;
+            }
         }
     }
     if y > y0 + 1 {
@@ -283,31 +312,59 @@ pub fn features(p: &Pyramid, bi: usize, pbi: Option<usize>, q: &[i32], z: usize,
     }
     if y > y0 {
         let n = at(z, y - 1, x);
-        { let t = n; f.nb[1] = mag(t); f.sv[1] = t; }
+        {
+            let t = n;
+            f.nb[1] = mag(t);
+            f.sv[1] = t;
+        }
         f.sg[1] = sgn(n);
         if x > x0 {
-            { let t = at(z, y - 1, x - 1); f.nb[3] = mag(t); f.sv[3] = t; }
+            {
+                let t = at(z, y - 1, x - 1);
+                f.nb[3] = mag(t);
+                f.sv[3] = t;
+            }
         }
         if x + 1 < x1 {
-            { let t = at(z, y - 1, x + 1); f.nb[4] = mag(t); f.sv[4] = t; }
+            {
+                let t = at(z, y - 1, x + 1);
+                f.nb[4] = mag(t);
+                f.sv[4] = t;
+            }
         }
     }
     if z > z0 {
         let u = at(z - 1, y, x);
-        { let t = u; f.nb[2] = mag(t); f.sv[2] = t; }
+        {
+            let t = u;
+            f.nb[2] = mag(t);
+            f.sv[2] = t;
+        }
         f.sg[2] = sgn(u);
         if x > x0 {
-            { let t = at(z - 1, y, x - 1); f.nb[5] = mag(t); f.sv[5] = t; }
+            {
+                let t = at(z - 1, y, x - 1);
+                f.nb[5] = mag(t);
+                f.sv[5] = t;
+            }
         }
         if y > y0 {
-            { let t = at(z - 1, y - 1, x); f.nb[6] = mag(t); f.sv[6] = t; }
+            {
+                let t = at(z - 1, y - 1, x);
+                f.nb[6] = mag(t);
+                f.sv[6] = t;
+            }
         }
     }
     if let Some(pi) = pbi {
         let pb = &p.bands[pi];
         let pp = p.parent_pos(b, pb, [z, y, x]);
         f.has_par = true;
-        { let t = at(pp[0], pp[1], pp[2]); f.par = mag(t); f.sv[8] = t; }
+        {
+            let t = at(pp[0], pp[1], pp[2]);
+            f.par = mag(t);
+            f.sv[8] = t;
+        }
         let mut s = 0u32;
         for a in 0..3 {
             let mut lo = pp;
@@ -350,7 +407,15 @@ pub struct Pred {
 }
 
 #[inline]
-fn taps(p: &Pyramid, bi: usize, pbi: Option<usize>, q: &[i32], z: usize, y: usize, x: usize) -> [i32; NTAP] {
+fn taps(
+    p: &Pyramid,
+    bi: usize,
+    pbi: Option<usize>,
+    q: &[i32],
+    z: usize,
+    y: usize,
+    x: usize,
+) -> [i32; NTAP] {
     let b = &p.bands[bi];
     let [_, ny, nx] = p.dims;
     let at = |z: usize, y: usize, x: usize| q[(z * ny + y) * nx + x];
@@ -444,7 +509,11 @@ pub fn fit_predictors(p: &Pyramid, q: &[i32]) -> Vec<Pred> {
             }
             let mut w = [0i16; NTAP];
             for i in 0..NTAP {
-                let wi = if a[i][i].abs() > 1e-12 { r[i] / a[i][i] } else { 0.0 };
+                let wi = if a[i][i].abs() > 1e-12 {
+                    r[i] / a[i][i]
+                } else {
+                    0.0
+                };
                 w[i] = (wi * (1 << PSHIFT) as f64).round().clamp(-32767.0, 32767.0) as i16;
             }
             let (mut c0, mut c1) = (0.0f64, 0.0f64);
@@ -480,10 +549,16 @@ pub fn write_preds(w: &mut crate::bitio::ByteWriter, preds: &[Pred]) {
 }
 
 /// Parse predictors for `nbands` bands.
-pub fn read_preds(r: &mut crate::bitio::ByteReader, nbands: usize) -> Result<Vec<Pred>, crate::bitio::DecodeError> {
+pub fn read_preds(
+    r: &mut crate::bitio::ByteReader,
+    nbands: usize,
+) -> Result<Vec<Pred>, crate::bitio::DecodeError> {
     (0..nbands)
         .map(|_| {
-            let mut pr = Pred { on: r.u8()? != 0, ..Default::default() };
+            let mut pr = Pred {
+                on: r.u8()? != 0,
+                ..Default::default()
+            };
             if pr.on {
                 for v in pr.w.iter_mut() {
                     *v = r.svarint()?.clamp(-32767, 32767) as i16;
@@ -498,7 +573,13 @@ pub fn read_preds(r: &mut crate::bitio::ByteReader, nbands: usize) -> Result<Vec
 /// when decoding), `res` the residuals `q − pred` (the context source).
 /// `f(features, band, predicted value, residual) -> residual` codes one
 /// coefficient.
-fn traverse(p: &Pyramid, q: &mut [i32], res: &mut [i32], preds: &[Pred], mut f: impl FnMut(&Feat, i32, i32) -> i32) {
+fn traverse(
+    p: &Pyramid,
+    q: &mut [i32],
+    res: &mut [i32],
+    preds: &[Pred],
+    mut f: impl FnMut(&Feat, i32, i32) -> i32,
+) {
     let [_, ny, nx] = p.dims;
     for bi in 0..p.bands.len() {
         let pbi = p.parent_band(bi);
@@ -509,7 +590,11 @@ fn traverse(p: &Pyramid, q: &mut [i32], res: &mut [i32], preds: &[Pred], mut f: 
                 for x in band.start[2]..band.end[2] {
                     let i = (z * ny + y) * nx + x;
                     let mut ft = features(p, bi, pbi, res, z, y, x);
-                    let pv = if pr.on { predict(&pr.w, &taps(p, bi, pbi, q, z, y, x)) } else { 0 };
+                    let pv = if pr.on {
+                        predict(&pr.w, &taps(p, bi, pbi, q, z, y, x))
+                    } else {
+                        0
+                    };
                     ft.pm = pv.unsigned_abs().min(CAP as u32) as u16;
                     ft.pv = pv;
                     let r = f(&ft, pv, q[i].wrapping_sub(pv));
@@ -521,10 +606,132 @@ fn traverse(p: &Pyramid, q: &mut [i32], res: &mut [i32], preds: &[Pred], mut f: 
     }
 }
 
+/// Tile edge for [`code_bands_tiled`]: about 256 cells per tile (1D 256,
+/// 2D 16×16, 3D 8³ = 512).
+fn tile_edge(nd: usize) -> usize {
+    match nd {
+        0 | 1 => 256,
+        2 => 16,
+        _ => 8,
+    }
+}
+
+/// Tiles of band `b`: `(per-axis edge, tiles per axis)`.
+fn band_tiles(b: &crate::wavelet::Band, nd: usize) -> ([usize; 3], [usize; 3]) {
+    let t = tile_edge(nd);
+    let mut e = [1usize; 3];
+    let mut n = [1usize; 3];
+    for k in 0..3 {
+        let len = b.end[k] - b.start[k];
+        if len > 1 {
+            e[k] = t;
+            n[k] = len.div_ceil(t);
+        }
+    }
+    (e, n)
+}
+
+/// Per band, which tiles hold a nonzero residual (encoder side of
+/// [`code_bands_tiled`]).
+pub fn tile_live(p: &Pyramid, q: &[i32], preds: &[Pred]) -> Vec<Vec<bool>> {
+    let [_, ny, nx] = p.dims;
+    let nd = p.dims.iter().filter(|&&d| d > 1).count();
+    let mut qq = q.to_vec();
+    let mut res = vec![0i32; q.len()];
+    traverse(p, &mut qq, &mut res, preds, |_, _, r| r);
+    p.bands
+        .iter()
+        .map(|b| {
+            let (e, n) = band_tiles(b, nd);
+            let mut live = vec![false; n[0] * n[1] * n[2]];
+            for z in b.start[0]..b.end[0] {
+                for y in b.start[1]..b.end[1] {
+                    for x in b.start[2]..b.end[2] {
+                        if res[(z * ny + y) * nx + x] != 0 {
+                            let t = (((z - b.start[0]) / e[0]) * n[1] + (y - b.start[1]) / e[1])
+                                * n[2]
+                                + (x - b.start[2]) / e[2];
+                            live[t] = true;
+                        }
+                    }
+                }
+            }
+            live
+        })
+        .collect()
+}
+
+/// [`code_bands`] with a tile layer: at the start of each band a flag per
+/// tile (context: band class × previous tile's flag) says whether any
+/// residual in it is nonzero, and the coefficients of dead tiles are skipped
+/// (residual 0, value = prediction). Large all-zero regions then cost one
+/// flag per tile instead of one significance decision per coefficient.
+/// `live` is [`tile_live`] when encoding and ignored (decoded) otherwise.
+pub fn code_bands_tiled<B: Bits, M: CoefModel>(
+    p: &Pyramid,
+    q: &mut [i32],
+    preds: &[Pred],
+    b: &mut B,
+    model: &mut M,
+    live: Option<&[Vec<bool>]>,
+) {
+    let [_, ny, nx] = p.dims;
+    let nd = p.dims.iter().filter(|&&d| d > 1).count();
+    let mut res = vec![0i32; q.len()];
+    let mut flag = [BitModel::new(1 << 15); NCLASS * 2];
+    for bi in 0..p.bands.len() {
+        let pbi = p.parent_band(bi);
+        let band = p.bands[bi].clone();
+        let (e, n) = band_tiles(&band, nd);
+        let c = band_class(&band) as usize;
+        let mut prev = 1usize;
+        let alive: Vec<bool> = (0..n[0] * n[1] * n[2])
+            .map(|t| {
+                let v = live.is_some_and(|l| l[bi][t]);
+                let v = b.bit(v, &mut flag[c * 2 + prev]);
+                prev = v as usize;
+                v
+            })
+            .collect();
+        let pr = preds.get(bi).copied().unwrap_or_default();
+        for z in band.start[0]..band.end[0] {
+            for y in band.start[1]..band.end[1] {
+                for x in band.start[2]..band.end[2] {
+                    let i = (z * ny + y) * nx + x;
+                    let t = (((z - band.start[0]) / e[0]) * n[1] + (y - band.start[1]) / e[1])
+                        * n[2]
+                        + (x - band.start[2]) / e[2];
+                    let pv = if pr.on {
+                        predict(&pr.w, &taps(p, bi, pbi, q, z, y, x))
+                    } else {
+                        0
+                    };
+                    let r = if alive[t] {
+                        let mut ft = features(p, bi, pbi, &res, z, y, x);
+                        ft.pm = pv.unsigned_abs().min(CAP as u32) as u16;
+                        ft.pv = pv;
+                        model.code(b, &ft, q[i].wrapping_sub(pv))
+                    } else {
+                        0
+                    };
+                    res[i] = r;
+                    q[i] = r.wrapping_add(pv);
+                }
+            }
+        }
+    }
+}
+
 /// Code (encode or decode) every band of `q` (volume layout) in pyramid
 /// order with per-band predictors. When decoding, `q` must be zeroed and is
 /// filled in.
-pub fn code_bands<B: Bits, M: CoefModel>(p: &Pyramid, q: &mut [i32], preds: &[Pred], b: &mut B, model: &mut M) {
+pub fn code_bands<B: Bits, M: CoefModel>(
+    p: &Pyramid,
+    q: &mut [i32],
+    preds: &[Pred],
+    b: &mut B,
+    model: &mut M,
+) {
     let mut res = vec![0i32; q.len()];
     traverse(p, q, &mut res, preds, |f, _, r| model.code(b, f, r));
 }
@@ -565,7 +772,9 @@ mod tests {
     fn round_trip_hand_model() {
         let d = [12, 20, 33];
         let p = Pyramid::new(d, MAX_LEVELS);
-        let mut x: Vec<f64> = (0..p.len()).map(|i| ((i as f64) * 0.013).sin() * 100.0 + (i % 17) as f64).collect();
+        let mut x: Vec<f64> = (0..p.len())
+            .map(|i| ((i as f64) * 0.013).sin() * 100.0 + (i % 17) as f64)
+            .collect();
         forward_97(&p, &mut x);
         let mut q: Vec<i32> = x.iter().map(|v| (v / 0.7).round() as i32).collect();
         q[5] = 1_000_000; // exercise the escape path

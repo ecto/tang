@@ -54,6 +54,32 @@ pub struct Config {
     pub image_token: Option<u32>,
     #[serde(skip)]
     pub mm_tokens_per_image: usize,
+
+    // Qwen3-VL.
+    /// The Qwen3-VL vision tower (see [`crate::qwen3vl`]).
+    #[serde(skip)]
+    pub qwen_vision: Option<crate::qwen3vl::QwenVisionConfig>,
+    /// Interleaved M-RoPE: frequencies per axis (t, h, w), e.g. `[24, 20, 20]`.
+    #[serde(skip)]
+    pub mrope_section: Option<Vec<usize>>,
+
+    // gpt-oss (and other MoE checkpoints on the dense path).
+    /// Per layer: `"sliding_attention"` or `"full_attention"` (overrides the Gemma pattern).
+    #[serde(default)]
+    pub layer_types: Option<Vec<String>>,
+    /// Biases on the Q/K/V and output projections.
+    #[serde(default)]
+    pub attention_bias: bool,
+    /// Routed experts per MoE layer (`num_local_experts`, or `num_experts` in Qwen3 MoE).
+    #[serde(default, alias = "num_experts")]
+    pub num_local_experts: Option<usize>,
+    #[serde(default)]
+    pub num_experts_per_tok: Option<usize>,
+    /// gpt-oss's clamped SwiGLU: gate clamped above, up to ±limit; `σ(alpha · gate)`.
+    #[serde(default)]
+    pub swiglu_limit: Option<f32>,
+    #[serde(default)]
+    pub swiglu_alpha: Option<f32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -62,6 +88,17 @@ pub struct RopeScaling {
     pub factor: f32,
     #[serde(default)]
     pub rope_type: Option<String>,
+    // YaRN (`rope_type: "yarn"`), with transformers' defaults.
+    #[serde(default)]
+    pub beta_fast: Option<f32>,
+    #[serde(default)]
+    pub beta_slow: Option<f32>,
+    #[serde(default)]
+    pub original_max_position_embeddings: Option<usize>,
+    #[serde(default)]
+    pub attention_factor: Option<f32>,
+    #[serde(default)]
+    pub truncate: Option<bool>,
 }
 
 fn one() -> f32 {
@@ -112,10 +149,32 @@ impl Config {
     /// Parse `config.json`. Gemma 3 multimodal checkpoints keep the language model in
     /// `text_config`, with transformers' Gemma3TextConfig defaults for what's left out.
     pub fn from_json(bytes: &[u8]) -> anyhow::Result<Self> {
-        let top: serde_json::Value = serde_json::from_slice(bytes)?;
+        let mut top: serde_json::Value = serde_json::from_slice(bytes)?;
+        // transformers 5 writes `rope_parameters` (theta inside) for `rope_theta`/`rope_scaling`.
+        if let Some(rp) = top
+            .get("rope_parameters")
+            .filter(|r| r.is_object())
+            .cloned()
+        {
+            if top.get("rope_theta").is_none() {
+                if let Some(t) = rp.get("rope_theta") {
+                    top["rope_theta"] = t.clone();
+                }
+            }
+            let kind = rp
+                .get("rope_type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("default");
+            if top.get("rope_scaling").is_none_or(|r| r.is_null()) && kind != "default" {
+                top["rope_scaling"] = rp;
+            }
+        }
         let Some(text) = top.get("text_config").filter(|t| t.is_object()) else {
             return Ok(serde_json::from_value(top)?);
         };
+        if top["model_type"] == "qwen3_vl" {
+            return Self::qwen3_vl(&top);
+        }
         let mut t = serde_json::json!({
             "model_type": "gemma3_text",
             "hidden_size": 2304,
@@ -150,6 +209,58 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Qwen3-VL: a Qwen3 language model in `text_config` (its RoPE in `rope_parameters`, with
+    /// the M-RoPE sections), the vision tower in `vision_config`.
+    fn qwen3_vl(top: &serde_json::Value) -> anyhow::Result<Self> {
+        let mut t = top["text_config"].clone();
+        let rp = t["rope_parameters"].clone();
+        let rp = if rp.is_object() {
+            rp
+        } else {
+            t["rope_scaling"].clone()
+        };
+        if t.get("rope_theta").is_none() {
+            if let Some(theta) = rp.get("rope_theta") {
+                t["rope_theta"] = theta.clone();
+            }
+        }
+        t["rope_scaling"] = serde_json::Value::Null;
+        for k in ["quantization", "eos_token_id", "tie_word_embeddings"] {
+            if let Some(v) = top.get(k).filter(|_| t.get(k).is_none()) {
+                t[k] = v.clone();
+            }
+        }
+        let mut cfg: Config = serde_json::from_value(t)?;
+        cfg.model_type = "qwen3_vl".into();
+        let section: Vec<usize> = rp["mrope_section"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_u64().map(|x| x as usize))
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![24, 20, 20]);
+        anyhow::ensure!(
+            section.len() == 3 && section.iter().sum::<usize>() == cfg.head_dim() / 2,
+            "mrope_section {section:?} doesn't cover head_dim {}",
+            cfg.head_dim()
+        );
+        anyhow::ensure!(
+            rp["mrope_interleaved"].as_bool().unwrap_or(true),
+            "only interleaved M-RoPE is supported"
+        );
+        cfg.mrope_section = Some(section);
+        cfg.qwen_vision = Some(crate::qwen3vl::QwenVisionConfig::from_value(
+            &top["vision_config"],
+        )?);
+        cfg.image_token = Some(top["image_token_id"].as_u64().unwrap_or(151_655) as u32);
+        Ok(cfg)
+    }
+
+    pub fn is_qwen3_vl(&self) -> bool {
+        self.qwen_vision.is_some()
+    }
+
     /// Compensate for kernels whose attention scale is fixed to head_dim^-0.5.
     pub fn query_rescale(&self) -> anyhow::Result<f32> {
         let Some(scalar) = self.query_pre_attn_scalar else {
@@ -179,10 +290,20 @@ impl Config {
 
     /// Sliding window for layer `l` (0 = global attention).
     pub fn window(&self, l: usize) -> usize {
+        if let Some(types) = &self.layer_types {
+            return match (types.get(l).map(String::as_str), self.sliding_window) {
+                (Some("sliding_attention"), Some(w)) => w,
+                _ => 0,
+            };
+        }
         match (self.sliding_window, self.sliding_window_pattern) {
             (Some(w), Some(p)) if p > 1 && !(l + 1).is_multiple_of(p) => w,
             _ => 0,
         }
+    }
+
+    pub fn is_gpt_oss(&self) -> bool {
+        self.model_type == "gpt_oss"
     }
 
     pub fn head_dim(&self) -> usize {

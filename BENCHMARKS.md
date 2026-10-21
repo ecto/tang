@@ -2319,3 +2319,39 @@ most runs, and 15–16 near the end, when vendor processes (`motion`,
 `hippocampus`, `optic`, …) were busier. `~/tang-probe/cpu/` was 66 MB
 during the runs. The cases were deleted afterwards, and only the runner
 sources remain.
+
+## OpenCL backend: Qwen3 decode and prefill on the Booster K1 (Adreno 740)
+
+`tang-gpu` feature `opencl` (`src/opencl.rs`, `Runtime::OpenCl`) and `to_opencl_decode`
+(`tensor_opencl_gemv.rs`). Run with `TANG_BACKEND=opencl`. MLX 4-bit checkpoints, a 49-token chat
+prompt, greedy. The host thread is pinned to an A510 at nice 10, with vendor load 7–15 and the GPU
+at 57–77 °C. Times are device times from `--bench` / `--time-prefill`.
+
+| | decode step at context 64 / 1024 | end to end | 49-token prefill |
+|---|---|---|---|
+| Qwen3-0.6B, Vulkan (rnshim, `to_glsl_decode`) | 61.9 / 63.4 ms | 13.6 tok/s | 1716 ms |
+| Qwen3-0.6B, OpenCL | **29.5 / 36.5 ms** | **31.9 tok/s** | 2168 ms (warp) → 1094 ms (tiled) |
+| Qwen3-1.7B, OpenCL, warps 4 × rows 2 | 79.2 / 86.2 ms | 12.2 tok/s | 6762 → 3451 ms |
+| Qwen3-1.7B, OpenCL, warps 4 × rows 4 | 55.5 ms | 18.0 tok/s | |
+| Qwen3-1.7B, warps 8 × rows 4 / 4 × 1 | 71.6 / 135 ms | | |
+| Qwen3-8B, OpenCL (vocab in 2 blocks) | 290 ms | 3.4 tok/s | |
+
+**Correctness**
+- Greedy ids are identical to Metal for 0.6B and 1.7B, and `qwen_decode tiny` gives 2.7e-6 (decode)
+  and 1.0e-6 (prefill).
+- On the Mac's OpenCL (local-memory shuffles), logits against the reference agree to 2.2e-2 (0.6B)
+  and 4.5e-2 (1.7B), argmax 20/20.
+
+**Adreno findings**
+- **Vector elements by index.** `(&v.x)[i]` written as `((T*)&v)[i]` put the register arrays in
+  private memory: 0.95 ms per GEMV and 298 ms per 0.6B step. A select chain (`TANG_EL4`) folds
+  once the loops unroll.
+- **Subgroup shuffle.** `cl_qcom_subgroup_shuffle` compiles only under `-cl-std=CL3.0`. The
+  `cl_khr_subgroup_shuffle` pragma asserts in Qualcomm's compiler. The local-memory shuffle is
+  wrong there, because its barrier sits in a per-warp grid-stride loop, so it is host-only.
+- **Memory.** `CL_DEVICE_MAX_MEM_ALLOC_SIZE` (256 MiB) is enforced per buffer, but the 1 GiB global
+  size is not a total limit: 4.7 GB allocated for 8B.
+- **Prefill compute.** Tiled prefill matmuls ran at about 54 GFLOP/s, against the probe's
+  register-blocked sgemm at 510. `opencl_mma_kernel` (register block, `vload4` along k, no local
+  stage) is the replacement: on the Mac 0.6B goes 38.6 → 29.2 ms per 49 tokens. Its K1 number is
+  pending, as is the per-device choice by `qwen_decode tune`.

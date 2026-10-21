@@ -22,6 +22,9 @@ pub mod adamw_msl;
 #[cfg(feature = "metal")]
 pub mod llm_msl;
 
+#[cfg(feature = "metal")]
+pub mod kvdec_msl;
+
 #[cfg(feature = "cuda")]
 pub mod matmul_cuda;
 
@@ -51,3 +54,6 @@ pub mod flash_cuda;
 
 #[cfg(feature = "cuda")]
 pub mod native_cuda;
+
+#[cfg(feature = "cuda")]
+pub mod moe_cuda;

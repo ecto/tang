@@ -27,8 +27,13 @@
 use crate::abac::{BitModel, Decoder, Encoder, UintModel};
 use crate::bitio::{ByteReader, ByteWriter, DecodeError};
 use crate::codec::{Decoded, Dtype, ErrorBound};
-use crate::coefcode::{band_class, code_bands, fit_predictors, read_preds, write_preds, Bits, HandModel, Pred, NCLASS};
-use crate::wavelet::{as3, forward_53, forward_97, inverse_53, inverse_97, Pyramid, MAX_LEVELS, MAX_LEVELS_1D};
+use crate::coefcode::{
+    band_class, code_bands, code_bands_tiled, fit_predictors, read_preds, tile_live, write_preds,
+    Bits, HandModel, Pred, NCLASS,
+};
+use crate::wavelet::{
+    as3, forward_53, forward_97, inverse_53, inverse_97, Pyramid, MAX_LEVELS, MAX_LEVELS_1D,
+};
 
 /// Stream magic of the wavelet codec.
 pub const MAGIC: &[u8; 4] = b"TCW1";
@@ -52,12 +57,26 @@ pub struct WavConfig {
     pub rho: f64,
     /// Coefficient model.
     pub model: ModelChoice,
+    /// Fast mode: step from a formula on the target ([`fast_step`]) with at
+    /// most a few corrective error checks instead of a bisection search.
+    pub fast: bool,
+    /// Code the final coefficients with the configured model, the hand model
+    /// and the hand model with all-zero tiles skipped (model tag 3; CPU
+    /// decoders only), and keep the smallest. Off by default so plain
+    /// wavelet streams stay GPU-decodable.
+    pub compact: bool,
 }
 
 impl WavConfig {
     /// Defaults for a bound.
     pub fn new(bound: ErrorBound) -> Self {
-        Self { bound, rho: 0.45, model: ModelChoice::Hand }
+        Self {
+            bound,
+            rho: 0.45,
+            model: ModelChoice::Hand,
+            fast: false,
+            compact: false,
+        }
     }
 }
 
@@ -152,28 +171,27 @@ pub fn quantize(co: &Coeffs, delta: f64, rho: f64) -> (Vec<i32>, [u8; NDELTA]) {
     let inv = 1.0 / delta;
     let mut sum = [0.0f64; NDELTA];
     let mut cnt = [0u64; NDELTA];
-    let q: Vec<i32> = co
-        .c
-        .iter()
-        .zip(&co.cls)
-        .map(|(&c, &k)| {
-            let a = c.abs() * inv;
-            let m = (a + rho).floor();
-            if m >= 1.0 {
-                let m = m.min(1.0e9);
-                let j = k as usize * 3 + (m as usize).min(3) - 1;
-                sum[j] += m - a;
-                cnt[j] += 1;
-                if c < 0.0 {
-                    -(m as i32)
+    let q: Vec<i32> =
+        co.c.iter()
+            .zip(&co.cls)
+            .map(|(&c, &k)| {
+                let a = c.abs() * inv;
+                let m = (a + rho).floor();
+                if m >= 1.0 {
+                    let m = m.min(1.0e9);
+                    let j = k as usize * 3 + (m as usize).min(3) - 1;
+                    sum[j] += m - a;
+                    cnt[j] += 1;
+                    if c < 0.0 {
+                        -(m as i32)
+                    } else {
+                        m as i32
+                    }
                 } else {
-                    m as i32
+                    0
                 }
-            } else {
-                0
-            }
-        })
-        .collect();
+            })
+            .collect();
     let mut d = [0u8; NDELTA];
     for j in 0..NDELTA {
         if cnt[j] > 0 {
@@ -229,29 +247,79 @@ fn err_stats(x: &[f64], y: &[f64]) -> (f64, f64) {
 }
 
 fn range_of(x: &[f64]) -> f64 {
-    let (lo, hi) = x.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &v| (a.min(v), b.max(v)));
+    let (lo, hi) = x
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &v| {
+            (a.min(v), b.max(v))
+        });
     hi - lo
 }
 
+/// Model tag of the hand model with the tile layer ([`code_bands_tiled`]).
+const TAG_HAND_TILED: u8 = 3;
+
 fn code_coefs(p: &Pyramid, q: &[i32], model: &ModelChoice, w: &mut ByteWriter) -> usize {
-    let mut e = Encoder::new();
-    let mut qq = q.to_vec();
-    let preds: Vec<Pred> = if std::env::var("TC_NOPRED").is_ok() { vec![Pred::default(); p.bands.len()] } else { fit_predictors(p, q) };
+    code_coefs_opt(p, q, model, false, w)
+}
+
+/// Coefficient section; `compact` keeps the smallest of the configured
+/// model, the hand model and the tiled hand model. Returns the model bytes.
+fn code_coefs_opt(
+    p: &Pyramid,
+    q: &[i32],
+    model: &ModelChoice,
+    compact: bool,
+    w: &mut ByteWriter,
+) -> usize {
+    let preds: Vec<Pred> = if std::env::var("TC_NOPRED").is_ok() {
+        vec![Pred::default(); p.bands.len()]
+    } else {
+        fit_predictors(p, q)
+    };
     write_preds(w, &preds);
-    let before = w.buf.len();
-    match model {
-        ModelChoice::Hand => {
-            w.u8(0);
-            code_bands(p, &mut qq, &preds, &mut e, &mut HandModel::default());
+    // (model tag + shipped model, payload) of one coder; None = tiled hand
+    let body = |m: Option<&ModelChoice>| -> (Vec<u8>, Vec<u8>) {
+        let mut h = ByteWriter::new();
+        let mut e = Encoder::new();
+        let mut qq = q.to_vec();
+        match m {
+            Some(ModelChoice::Hand) => {
+                h.u8(0);
+                code_bands(p, &mut qq, &preds, &mut e, &mut HandModel::default());
+            }
+            Some(ModelChoice::Learned(spec)) => {
+                let mut mm = spec.prepare(p, q, &preds, &mut h);
+                code_bands(p, &mut qq, &preds, &mut e, &mut mm);
+            }
+            None => {
+                h.u8(TAG_HAND_TILED);
+                let live = tile_live(p, q, &preds);
+                code_bands_tiled(
+                    p,
+                    &mut qq,
+                    &preds,
+                    &mut e,
+                    &mut HandModel::default(),
+                    Some(&live),
+                );
+            }
         }
-        ModelChoice::Learned(spec) => {
-            let mut m = spec.prepare(p, q, &preds, w);
-            code_bands(p, &mut qq, &preds, &mut e, &mut m);
+        (h.buf, e.finish())
+    };
+    let mut opts = vec![body(Some(model))];
+    if compact {
+        if !matches!(model, ModelChoice::Hand) {
+            opts.push(body(Some(&ModelChoice::Hand)));
         }
+        opts.push(body(None));
     }
-    let model_bytes = w.buf.len() - before;
-    w.block(&e.finish());
-    model_bytes
+    let (h, pay) = opts
+        .into_iter()
+        .min_by_key(|(h, p)| h.len() + p.len())
+        .unwrap();
+    w.bytes(&h);
+    w.block(&pay);
+    h.len()
 }
 
 fn decode_coefs(p: &Pyramid, r: &mut ByteReader) -> Result<Vec<i32>, DecodeError> {
@@ -259,6 +327,14 @@ fn decode_coefs(p: &Pyramid, r: &mut ByteReader) -> Result<Vec<i32>, DecodeError
     let tag = r.u8()?;
     let mut q = vec![0i32; p.len()];
     match tag {
+        TAG_HAND_TILED => {
+            let buf = r.block()?;
+            let mut d = Decoder::new(buf);
+            code_bands_tiled(p, &mut q, &preds, &mut d, &mut HandModel::default(), None);
+            if d.overrun() {
+                return Err(DecodeError::Truncated);
+            }
+        }
         0 => {
             let buf = r.block()?;
             let mut d = Decoder::new(buf);
@@ -290,7 +366,11 @@ struct OutlierModel {
 
 impl Default for OutlierModel {
     fn default() -> Self {
-        Self { flag: [BitModel::new(2000); 8], sign: BitModel::default(), mag: UintModel::default() }
+        Self {
+            flag: [BitModel::new(2000); 8],
+            sign: BitModel::default(),
+            mag: UintModel::default(),
+        }
     }
 }
 
@@ -361,10 +441,15 @@ fn encode_at(
     w.f64(co.mean);
     w.bytes(&d);
     let b0 = w.buf.len();
-    let model_bytes = code_coefs(&co.p, &q, &cfg.model, &mut w);
+    let model_bytes = code_coefs_opt(&co.p, &q, &cfg.model, cfg.compact, &mut w);
     let coef_bytes = w.buf.len() - b0 - model_bytes;
     let mut y = cast(&reconstruct(&co.p, &q, delta, &d, co.mean), h.dt);
-    let mut st = WavStats { delta, coef_bytes, model_bytes, ..Default::default() };
+    let mut st = WavStats {
+        delta,
+        coef_bytes,
+        model_bytes,
+        ..Default::default()
+    };
     if let Some(b) = maxabs {
         let b0 = w.buf.len();
         w.u8(1);
@@ -415,6 +500,65 @@ fn encode_at(
     (w.buf, st, y)
 }
 
+/// Fast-mode step ratios `Δ / target`: RMSE targets (`Δ = k·rmse`) and
+/// max-abs bounds (`Δ = k·b`). Calibrated on the 19 seen fields.
+pub const FAST_K_RMSE: f64 = 4.0;
+/// See [`FAST_K_RMSE`].
+pub const FAST_K_MAXABS: f64 = 2.2;
+
+/// Step for an RMSE target: start from the formula `Δ = k·t`, then take
+/// log–log secant steps on the measured error (`rmse ∝ Δ^γ`), aiming 1% under
+/// the target, for at most `checks` trials. Returns the largest tried step
+/// that met the target (or the last one, halved, when none did) and the
+/// number of trials.
+pub fn fast_step(t: f64, checks: usize, rmse_at: impl Fn(f64) -> f64) -> (f64, usize) {
+    let k = std::env::var("TC_FAST_K")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(FAST_K_RMSE);
+    let aim = 0.99 * t;
+    let mut d = k * t;
+    let mut prev: Option<(f64, f64)> = None;
+    let mut best: Option<f64> = None;
+    let mut n = 0;
+    while n < checks {
+        let e = rmse_at(d).max(f64::MIN_POSITIVE);
+        n += 1;
+        if e <= t && best.is_none_or(|b| d > b) {
+            best = Some(d);
+        }
+        if (e - aim).abs() <= 0.01 * t {
+            break;
+        }
+        let g = match prev {
+            Some((d0, e0)) if (e / e0).ln().abs() > 1e-6 => {
+                ((e / e0).ln() / (d / d0).ln()).clamp(0.2, 2.0)
+            }
+            _ => 1.0,
+        };
+        prev = Some((d, e));
+        d *= (aim / e).powf(1.0 / g);
+    }
+    (best.unwrap_or(d * 0.5), n)
+}
+
+/// Coefficient-domain estimate of [`trial_rmse`]: the band-weighted
+/// quantization error, without the inverse transform.
+fn coef_rmse(co: &Coeffs, delta: f64, rho: f64) -> f64 {
+    let (q, d) = quantize(co, delta, rho);
+    let mut se = 0.0;
+    for ((&c, &v), &k) in co.c.iter().zip(&q).zip(&co.cls) {
+        let r = if v == 0 {
+            0.0
+        } else {
+            let j = k as usize * 3 + (v.unsigned_abs() as usize).min(3) - 1;
+            (v.unsigned_abs() as f64 - d[j] as f64 / 512.0) * delta * (v.signum() as f64)
+        };
+        se += (c - r) * (c - r);
+    }
+    (se / co.c.len().max(1) as f64).sqrt()
+}
+
 /// Error of the lossy layer alone at step `delta` (no entropy coding).
 fn trial_rmse(x: &[f64], co: &Coeffs, delta: f64, rho: f64, dt: Dtype) -> f64 {
     let (q, d) = quantize(co, delta, rho);
@@ -425,7 +569,11 @@ fn encode_impl(x: &[f64], dims: &[usize], dt: Dtype, cfg: &WavConfig) -> (Vec<u8
     assert_eq!(dims.iter().product::<usize>(), x.len());
     let range = range_of(x);
     let co = Coeffs::new(x, dims);
-    let h = Header { dt, dims: dims.to_vec(), lossless: false };
+    let h = Header {
+        dt,
+        dims: dims.to_vec(),
+        lossless: false,
+    };
     let rmse_target = match cfg.bound {
         ErrorBound::Rmse(r) => Some(r),
         ErrorBound::Psnr(db) => Some(range * 10f64.powf(-db / 20.0)),
@@ -433,6 +581,28 @@ fn encode_impl(x: &[f64], dims: &[usize], dt: Dtype, cfg: &WavConfig) -> (Vec<u8
     };
     let (bytes, mut st) = if let Some(t) = rmse_target {
         let t = t.max(f64::MIN_POSITIVE);
+        if cfg.fast {
+            // secant on the coefficient-domain error, then verify for real
+            let (mut d, mut passes) = fast_step(t, 5, |d| coef_rmse(&co, d, cfg.rho));
+            for _ in 0..3 {
+                let e = trial_rmse(x, &co, d, cfg.rho, dt);
+                passes += 1;
+                if e <= t {
+                    break;
+                }
+                d *= 0.99 * t / e;
+            }
+            // last resort: halve until met (never taken on the seen fields)
+            while trial_rmse(x, &co, d, cfg.rho, dt) > t && passes < 60 {
+                d *= 0.5;
+                passes += 1;
+            }
+            let (b, mut s, _) = encode_at(x, &co, &h, d, cfg, None);
+            s.passes = passes;
+            s.range = range;
+            s.bits_per_value = 8.0 * b.len() as f64 / x.len() as f64;
+            return (b, s);
+        }
         // bracket then bisect log Δ on the measured RMSE
         let mut lo = t * 0.5;
         let mut hi = t * 8.0;
@@ -460,10 +630,26 @@ fn encode_impl(x: &[f64], dims: &[usize], dt: Dtype, cfg: &WavConfig) -> (Vec<u8
         s.passes = passes;
         (b, s)
     } else {
-        let ErrorBound::MaxAbs(b) = cfg.bound else { unreachable!() };
+        let ErrorBound::MaxAbs(b) = cfg.bound else {
+            unreachable!()
+        };
+        if cfg.fast {
+            let k = std::env::var("TC_FAST_KM")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(FAST_K_MAXABS);
+            let (bytes, mut s, _) = encode_at(x, &co, &h, k * b, cfg, Some(b));
+            s.passes = 1;
+            s.range = range;
+            s.bits_per_value = 8.0 * bytes.len() as f64 / x.len() as f64;
+            return (bytes, s);
+        }
         // search the wavelet step with the hand model (cheap), then code the
         // winner with the configured model
-        let hand = WavConfig { model: ModelChoice::Hand, ..cfg.clone() };
+        let hand = WavConfig {
+            model: ModelChoice::Hand,
+            ..cfg.clone()
+        };
         let mut best: Option<(usize, f64)> = None;
         let mut passes = 0;
         for f in [1.0, 1.4, 1.8, 2.2, 2.7, 3.3, 4.0, 5.0] {
@@ -499,9 +685,19 @@ pub fn encode_i32_lossless(x: &[i32], dims: &[usize]) -> Vec<u8> {
     let mut c: Vec<i64> = x.iter().map(|&v| v as i64).collect();
     forward_53(&p, &mut c);
     let mut w = ByteWriter::new();
-    write_header(&mut w, &Header { dt: Dtype::F32, dims: dims.to_vec(), lossless: true });
+    write_header(
+        &mut w,
+        &Header {
+            dt: Dtype::F32,
+            dims: dims.to_vec(),
+            lossless: true,
+        },
+    );
     // 5/3 coefficients of i32 data fit in i32 except for extreme inputs
-    assert!(c.iter().all(|v| v.unsigned_abs() < (1 << 30)), "input range too large for lossless mode");
+    assert!(
+        c.iter().all(|v| v.unsigned_abs() < (1 << 30)),
+        "input range too large for lossless mode"
+    );
     let q: Vec<i32> = c.iter().map(|&v| v as i32).collect();
     code_coefs(&p, &q, &ModelChoice::Hand, &mut w);
     w.buf
@@ -538,7 +734,12 @@ fn read_header(r: &mut ByteReader) -> Result<(Dtype, Vec<usize>, bool), DecodeEr
     for _ in 0..nd {
         dims.push(r.varint()? as usize);
     }
-    if dims.contains(&0) || dims.iter().try_fold(1usize, |a, &d| a.checked_mul(d)).is_none_or(|n| n as u64 > 1 << 34) {
+    if dims.contains(&0)
+        || dims
+            .iter()
+            .try_fold(1usize, |a, &d| a.checked_mul(d))
+            .is_none_or(|n| n as u64 > 1 << 34)
+    {
         return Err(DecodeError::Invalid("dims"));
     }
     let lossless = r.u8()? != 0;
@@ -550,7 +751,9 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
     let mut r = ByteReader::new(bytes);
     let (dt, dims, lossless) = read_header(&mut r)?;
     if lossless {
-        return Err(DecodeError::Invalid("lossless stream: use decode_i32_lossless"));
+        return Err(DecodeError::Invalid(
+            "lossless stream: use decode_i32_lossless",
+        ));
     }
     let p = Pyramid::new(as3(&dims), max_levels(&dims));
     let delta = r.f64()?;
@@ -583,7 +786,10 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
         }
     }
     Ok(match dt {
-        Dtype::F32 => Decoded::F32 { dims, data: y.iter().map(|&v| v as f32).collect() },
+        Dtype::F32 => Decoded::F32 {
+            dims,
+            data: y.iter().map(|&v| v as f32).collect(),
+        },
         Dtype::F64 => Decoded::F64 { dims, data: y },
     })
 }
@@ -597,8 +803,16 @@ mod tests {
         for i in 0..d[0] {
             for j in 0..d[1] {
                 for k in 0..d[2] {
-                    let (x, y, z) = (i as f64 / d[0] as f64, j as f64 / d[1] as f64, k as f64 / d[2] as f64);
-                    v.push(((6.0 * x + 3.0 * y).sin() * (4.0 * z).cos() + 0.3 * (20.0 * x * y).sin() + if z > 0.6 { 0.5 } else { 0.0 }) as f32);
+                    let (x, y, z) = (
+                        i as f64 / d[0] as f64,
+                        j as f64 / d[1] as f64,
+                        k as f64 / d[2] as f64,
+                    );
+                    v.push(
+                        ((6.0 * x + 3.0 * y).sin() * (4.0 * z).cos()
+                            + 0.3 * (20.0 * x * y).sin()
+                            + if z > 0.6 { 0.5 } else { 0.0 }) as f32,
+                    );
                 }
             }
         }
@@ -612,7 +826,9 @@ mod tests {
         for db in [40.0, 70.0, 100.0] {
             let cfg = WavConfig::new(ErrorBound::Psnr(db));
             let (bytes, st) = encode_f32(&x, &d, &cfg);
-            let Decoded::F32 { data, .. } = decode(&bytes).unwrap() else { panic!() };
+            let Decoded::F32 { data, .. } = decode(&bytes).unwrap() else {
+                panic!()
+            };
             let xd: Vec<f64> = x.iter().map(|&v| v as f64).collect();
             let yd: Vec<f64> = data.iter().map(|&v| v as f64).collect();
             let (rmse, _) = err_stats(&xd, &yd);
@@ -630,25 +846,96 @@ mod tests {
         for rel in [1e-2, 1e-4] {
             let b = rel * range;
             let (bytes, st) = encode_f32(&x, &d, &WavConfig::new(ErrorBound::MaxAbs(b)));
-            let Decoded::F32 { data, .. } = decode(&bytes).unwrap() else { panic!() };
-            let mx = x.iter().zip(&data).map(|(&a, &v)| (a as f64 - v as f64).abs()).fold(0.0, f64::max);
+            let Decoded::F32 { data, .. } = decode(&bytes).unwrap() else {
+                panic!()
+            };
+            let mx = x
+                .iter()
+                .zip(&data)
+                .map(|(&a, &v)| (a as f64 - v as f64).abs())
+                .fold(0.0, f64::max);
             assert!(mx <= b, "{mx} > {b}");
             assert_eq!(mx, st.max_abs);
         }
     }
 
     #[test]
+    fn compact_round_trips_and_never_grows() {
+        // a smooth 2D field at a loose target leaves most tiles empty
+        let d = [1, 200, 260];
+        let x = field(d);
+        for b in [
+            ErrorBound::Psnr(45.0),
+            ErrorBound::Psnr(90.0),
+            ErrorBound::MaxAbs(1e-3),
+        ] {
+            let plain = encode_f32(&x, &d, &WavConfig::new(b)).0;
+            let cfg = WavConfig {
+                compact: true,
+                ..WavConfig::new(b)
+            };
+            let (bytes, st) = encode_f32(&x, &d, &cfg);
+            assert!(bytes.len() <= plain.len());
+            let Decoded::F32 { data, .. } = decode(&bytes).unwrap() else {
+                panic!()
+            };
+            let xd: Vec<f64> = x.iter().map(|&v| v as f64).collect();
+            let yd: Vec<f64> = data.iter().map(|&v| v as f64).collect();
+            assert_eq!(err_stats(&xd, &yd), (st.rmse, st.max_abs));
+        }
+        // the tiled coder on its own, including a 1D and a 3D pyramid
+        for d in [[1, 1, 3000], [1, 200, 260], [20, 33, 47]] {
+            let x: Vec<f64> = field(d).iter().map(|&v| v as f64).collect();
+            let co = Coeffs::new(&x, &d);
+            let (q, _) = quantize(&co, 0.05, 0.45);
+            let preds = fit_predictors(&co.p, &q);
+            let live = tile_live(&co.p, &q, &preds);
+            let mut e = Encoder::new();
+            let mut qq = q.clone();
+            code_bands_tiled(
+                &co.p,
+                &mut qq,
+                &preds,
+                &mut e,
+                &mut HandModel::default(),
+                Some(&live),
+            );
+            assert_eq!(qq, q);
+            let buf = e.finish();
+            let mut got = vec![0i32; q.len()];
+            let mut dd = Decoder::new(&buf);
+            code_bands_tiled(
+                &co.p,
+                &mut got,
+                &preds,
+                &mut dd,
+                &mut HandModel::default(),
+                None,
+            );
+            assert_eq!(got, q, "{d:?}");
+        }
+    }
+
+    #[test]
     fn one_d_and_f64() {
-        let x: Vec<f64> = (0..5000).map(|i| (i as f64 * 0.01).sin() + (i as f64 * 0.37).cos() * 0.1).collect();
+        let x: Vec<f64> = (0..5000)
+            .map(|i| (i as f64 * 0.01).sin() + (i as f64 * 0.37).cos() * 0.1)
+            .collect();
         let (bytes, st) = encode_f64(&x, &[5000], &WavConfig::new(ErrorBound::Psnr(80.0)));
-        let Decoded::F64 { data, .. } = decode(&bytes).unwrap() else { panic!() };
+        let Decoded::F64 { data, .. } = decode(&bytes).unwrap() else {
+            panic!()
+        };
         assert_eq!(err_stats(&x, &data).0, st.rmse);
     }
 
     #[test]
     fn lossless_round_trip() {
         let d = [9, 17, 30];
-        let x: Vec<i32> = field(d).iter().enumerate().map(|(i, &v)| (v * 30000.0) as i32 + (i % 5) as i32).collect();
+        let x: Vec<i32> = field(d)
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| (v * 30000.0) as i32 + (i % 5) as i32)
+            .collect();
         let bytes = encode_i32_lossless(&x, &d);
         let (dd, y) = decode_i32_lossless(&bytes).unwrap();
         assert_eq!(dd, d.to_vec());

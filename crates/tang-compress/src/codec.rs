@@ -82,6 +82,10 @@ pub struct Config {
     pub gavish_donoho: bool,
     /// Hard rank cap.
     pub max_rank: usize,
+    /// Max-abs only: skip the TT candidates and code the field as the sparse
+    /// residual stream alone (the `f = 0` candidate; cheap, wins on sparse
+    /// peaky data).
+    pub residual_only: bool,
 }
 
 impl Config {
@@ -93,6 +97,7 @@ impl Config {
             pad: PadPolicy::MixedRadix,
             gavish_donoho: false,
             max_rank: 1024,
+            residual_only: false,
         }
     }
 }
@@ -690,7 +695,12 @@ fn encode_impl(x: &[f64], dims: &[usize], cfg: &Config, dt: Dtype) -> (Vec<u8>, 
             let mut prev_f = 0.0;
             // f = 0 is the residual-only candidate (TT quantized to zero): it
             // wins when the field has no low-rank structure (noise).
-            for f in [0.0, 0.25, 0.4, 0.6] {
+            let fracs: &[f64] = if cfg.residual_only {
+                &[0.0]
+            } else {
+                &[0.0, 0.25, 0.4, 0.6]
+            };
+            for &f in fracs {
                 let b = if f == 0.0 {
                     passes += 1;
                     let delta = 1e300;

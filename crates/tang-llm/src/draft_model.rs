@@ -45,6 +45,13 @@ impl<D: ComputeDevice> DraftModel<D> {
         Ok(d)
     }
 
+    /// Drop the drafter's cache and its pool's cached blocks (the conversation went idle past
+    /// the TTL).
+    pub fn forget(&mut self) {
+        self.cache.truncate(0);
+        crate::blocks::lock(self.model.pool()).forget();
+    }
+
     /// Guess up to `room` tokens following `prompt` then `out`. `cost(k)`: a target forward
     /// over k tokens relative to one. The draft grows while the expected tokens per unit of
     /// time (verify plus drafting) improve, with the drafter's own probabilities as the odds

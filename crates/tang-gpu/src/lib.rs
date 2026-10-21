@@ -80,6 +80,8 @@ pub mod llm;
 pub mod matmul;
 pub mod module;
 pub mod nn;
+#[cfg(feature = "opencl")]
+pub mod opencl;
 pub mod program;
 pub mod realize;
 pub mod reduce;

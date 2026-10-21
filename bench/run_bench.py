@@ -36,8 +36,8 @@ from pysz import sz, szConfig, szErrorBoundMode
 HERE = Path(__file__).resolve().parent
 OUT = HERE / "out"
 DATA = HERE / "data"
-QTT = HERE.parent / "target" / "release" / "examples" / "qtt"
-TC = HERE.parent / "target" / "release" / "examples" / "tc"
+QTT = Path(os.environ.get("QTT_BIN", HERE.parent / "target" / "release" / "examples" / "qtt"))
+TC = Path(os.environ.get("TC_BIN", HERE.parent / "target" / "release" / "examples" / "tc"))
 OUT.mkdir(exist_ok=True)
 
 
@@ -323,6 +323,13 @@ def heldout_fields() -> dict[str, np.ndarray]:
     return {m["name"]: np.fromfile(DATA / "heldout" / f"{m['name']}.f32", dtype="<f4").reshape(m["shape"]) for m in man}
 
 
+def fresh_fields(sub: str = "fresh") -> dict[str, np.ndarray]:
+    """Fresh held-out crops: Phase 2 (fetch_fresh.py, `fresh`) or Phase 4
+    (fetch_fresh3.py, `fresh3`)."""
+    man = json.load(open(HERE / sub / "manifest.json"))
+    return {m["name"]: np.fromfile(HERE / sub / f"{m['name']}.f32", dtype="<f4").reshape(m["shape"]) for m in man}
+
+
 def sweep(name: str, x: np.ndarray, rows: list, quick: bool, orders=None):
     rng = float(x.max() - x.min())
     psnrs = [30, 40, 50, 60, 70, 80, 90, 100] if not quick else [40, 60, 80]
@@ -398,6 +405,26 @@ def main():
             w = csv.DictWriter(f, fieldnames=keys)
             w.writeheader()
             w.writerows(rows)
+        return
+    if "--fresh-ext" in sys.argv or "--fresh3-ext" in sys.argv:
+        sub = "fresh3" if "--fresh3-ext" in sys.argv else "fresh"
+        for name, x in fresh_fields(sub).items():
+            path = OUT / f"{sub}_ext_{name}.csv"
+            if path.exists():
+                continue
+            rows = []
+            print(f"== {name} {x.shape}", flush=True)
+            for stage in (lambda: sweep(name, x, rows, False, orders=["row"]),
+                          lambda: frontier_extra(name, x, rows)):
+                try:
+                    stage()
+                except subprocess.CalledProcessError as e:
+                    print("  STAGE FAILED", e.cmd[:3], (e.stderr or "")[-300:], flush=True)
+            keys = sorted({k for r in rows for k in r})
+            with open(path, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=keys)
+                w.writeheader()
+                w.writerows(rows)
         return
     if "--heldout" in sys.argv:
         only = [a for a in sys.argv[1:] if not a.startswith("--")]
