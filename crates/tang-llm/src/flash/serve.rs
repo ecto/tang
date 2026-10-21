@@ -139,6 +139,15 @@ pub trait ServeEngine {
     fn decode_batch(&mut self, _rows: &[(usize, u32)]) -> Result<Vec<u32>> {
         bail!("this engine has no sequence slots")
     }
+    /// One verify window for several slots: `(slot, token, drafts)` each; returns each one's
+    /// kept tokens (`Coder::verify_batch`).
+    fn verify_batch(&mut self, _items: &[(usize, u32, Vec<u32>)]) -> Result<Vec<Vec<u32>>> {
+        bail!("this engine has no sequence slots")
+    }
+    /// A slot's latest MTP chain, for its next verify.
+    fn slot_drafts(&self, _slot: usize) -> Vec<u32> {
+        Vec::new()
+    }
     /// Verify-window cost by width relative to one token, for pricing suffix drafts.
     fn draft_cost(&self) -> Vec<(usize, f32)> {
         vec![(1, 1.0), (2, 1.12), (4, 1.35), (8, 1.9)]
@@ -289,6 +298,15 @@ impl ServeEngine for super::coder::Coder {
     }
     fn decode_batch(&mut self, rows: &[(usize, u32)]) -> Result<Vec<u32>> {
         super::coder::Coder::decode_batch(self, rows)
+    }
+    fn verify_batch(&mut self, items: &[(usize, u32, Vec<u32>)]) -> Result<Vec<Vec<u32>>> {
+        super::coder::Coder::verify_batch(self, items)
+    }
+    fn slot_drafts(&self, slot: usize) -> Vec<u32> {
+        super::coder::Coder::slot_drafts(self, slot)
+            .iter()
+            .map(|x| x.0)
+            .collect()
     }
     fn use_mtp(&self) -> bool {
         self.use_mtp

@@ -55,6 +55,28 @@ fn prefill_plan(waiting: &[(usize, usize)], decoding: bool, debt: f64) -> Vec<(u
     plan
 }
 
+/// Draft rows per stream in one window, for streams wanting `want[i]` drafts: one row each for
+/// its token, and the window's spare rows (`MAX_T` minus the streams) shared out round-robin, so
+/// a lone stream can draft its whole chain and a full window drafts nothing.
+fn share_drafts(want: &[usize]) -> Vec<usize> {
+    let mut give = vec![0; want.len()];
+    let mut spare = MAX_T.saturating_sub(want.len());
+    while spare > 0 {
+        let mut moved = false;
+        for (g, &w) in give.iter_mut().zip(want) {
+            if spare > 0 && *g < w {
+                *g += 1;
+                spare -= 1;
+                moved = true;
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+    give
+}
+
 /// A parked or running sequence slot.
 pub(super) struct SlotInfo {
     pub id: usize,
@@ -73,6 +95,12 @@ pub(super) struct Stream {
     reused: usize,
     /// The sampled token not yet fed to the slot.
     pending: Option<u32>,
+    /// MTP drafts for the next window (the engine's chain for this slot).
+    drafts: Vec<u32>,
+    /// Draft rows verified and accepted, and verify windows run.
+    drafted: usize,
+    accepted: usize,
+    windows: usize,
     out: Vec<u32>,
     limit: usize,
     stop: Vec<String>,
@@ -196,6 +224,10 @@ impl FlashServe {
             reused,
             ids,
             pending: None,
+            drafts: Vec::new(),
+            drafted: 0,
+            accepted: 0,
+            windows: 0,
             out: Vec::new(),
             limit,
             stop: req.stop.clone(),
@@ -323,6 +355,7 @@ impl FlashServe {
                     self.batch_take(s, next, l.on)?;
                     if s.finish.is_none() {
                         s.pending = Some(next);
+                        s.drafts = self.e.slot_drafts(s.slot);
                     }
                 }
             }
@@ -336,24 +369,66 @@ impl FlashServe {
                 (s.finish.is_none() && s.pending.is_some()).then_some(i)
             })
             .collect();
+        let mtp = self.e.use_mtp();
         for group in ready.chunks(MAX_T) {
-            let rows: Vec<(usize, u32)> = group
+            // Drafts for each stream, cut at an end of turn and the token limit, then the
+            // window's spare rows shared out.
+            let want: Vec<Vec<u32>> = group
                 .iter()
                 .map(|&i| {
                     let s = lanes[i].stream.downcast_ref::<Stream>().unwrap();
-                    (s.slot, s.pending.unwrap())
+                    if !mtp {
+                        return Vec::new();
+                    }
+                    let room = s.limit.saturating_sub(s.out.len() + 1);
+                    let mut d: Vec<u32> = s.drafts.iter().take(room).copied().collect();
+                    if let Some(k) = d.iter().position(|x| self.eos.contains(x)) {
+                        d.truncate(k);
+                    }
+                    d
+                })
+                .collect();
+            let give = share_drafts(&want.iter().map(Vec::len).collect::<Vec<_>>());
+            let items: Vec<(usize, u32, Vec<u32>)> = group
+                .iter()
+                .zip(want.iter().zip(&give))
+                .map(|(&i, (d, &g))| {
+                    let s = lanes[i].stream.downcast_ref::<Stream>().unwrap();
+                    (s.slot, s.pending.unwrap(), d[..g].to_vec())
                 })
                 .collect();
             let t = Instant::now();
-            let next = self.e.decode_batch(&rows)?;
+            let kept = if mtp {
+                self.e.verify_batch(&items)?
+            } else {
+                let rows: Vec<(usize, u32)> = items.iter().map(|x| (x.0, x.1)).collect();
+                self.e
+                    .decode_batch(&rows)?
+                    .into_iter()
+                    .map(|k| vec![k])
+                    .collect()
+            };
             self.prefill_debt = (self.prefill_debt - t.elapsed().as_secs_f64()).max(0.0);
-            for (&i, &tok) in group.iter().zip(&next) {
+            for ((&i, toks), item) in group.iter().zip(&kept).zip(&items) {
                 let l = &mut lanes[i];
                 let s = l.stream.downcast_mut::<Stream>().unwrap();
                 s.pending = None;
-                self.batch_take(s, tok, l.on)?;
+                s.windows += 1;
+                s.drafted += item.2.len();
+                s.accepted += toks.len() - 1;
+                for &tok in toks {
+                    self.batch_take(s, tok, l.on)?;
+                    if s.finish.is_some() {
+                        break;
+                    }
+                }
                 if s.finish.is_none() {
-                    s.pending = Some(tok);
+                    s.pending = toks.last().copied();
+                    s.drafts = if mtp {
+                        self.e.slot_drafts(s.slot)
+                    } else {
+                        Vec::new()
+                    };
                 }
             }
         }
@@ -400,7 +475,7 @@ impl FlashServe {
         let decode_s = s.decode_from.map_or(0.0, |t| t.elapsed().as_secs_f64());
         let prefilled = s.ids.len() - s.reused;
         eprintln!(
-            "tang-llm: batch req: slot {} prompt {} (reused {}, prefilled {} in {:.0} ms) | ttft {:.0} ms | decode {} tokens in {:.2} s = {:.1} tok/s | {} tool calls",
+            "tang-llm: batch req: slot {} prompt {} (reused {}, prefilled {} in {:.0} ms) | ttft {:.0} ms | decode {} tokens in {:.2} s = {:.1} tok/s, {} windows, drafts {}/{} accepted | {} tool calls",
             s.slot,
             s.ids.len(),
             s.reused,
@@ -410,6 +485,9 @@ impl FlashServe {
             s.out.len(),
             decode_s,
             s.out.len() as f64 / decode_s.max(1e-9),
+            s.windows,
+            s.accepted,
+            s.drafted,
             s.calls.len()
         );
         Ok(Outcome::Done(
@@ -489,6 +567,15 @@ mod tests {
             "cold done {:.1} s vs solo {solo:.1} s",
             cold_done.unwrap()
         );
+    }
+
+    #[test]
+    fn spare_rows_go_to_drafts_round_robin() {
+        assert_eq!(share_drafts(&[2]), vec![2]);
+        assert_eq!(share_drafts(&[2, 2, 2]), vec![2, 2, 1]);
+        assert_eq!(share_drafts(&[0, 3, 1]), vec![0, 3, 1]);
+        assert_eq!(share_drafts(&[2; 8]), vec![0; 8]);
+        assert_eq!(share_drafts(&[2; 6]), vec![1, 1, 0, 0, 0, 0]);
     }
 
     #[test]

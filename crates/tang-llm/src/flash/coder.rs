@@ -445,6 +445,8 @@ impl Io {
 struct Slot {
     gdn: Vec<Option<(B, B)>>,
     kv: Vec<Option<(B, B)>>,
+    /// The MTP layer's K/V (when one is loaded).
+    mtp_kv: Option<(B, B)>,
     tokens: Vec<u32>,
 }
 
@@ -503,6 +505,10 @@ pub struct Coder {
     pub mtp_last: Vec<(u32, f32)>,
     /// The MTP head's runner-up for `mtp_last[0]`'s position (a second tree branch).
     pub mtp_alt: Option<(u32, f32)>,
+    /// Each slot's latest MTP chain (batched decode; slot 0's is `mtp_last`).
+    slot_chain: Vec<Vec<(u32, f32)>>,
+    /// Per-segment commit graphs after a batched verify window, by segment count.
+    commit_seg_graphs: Vec<Option<Graph>>,
     pub last_mtp_ms: f64,
 }
 
@@ -907,6 +913,8 @@ impl Coder {
                 .clamp(1, MAX_T - 1),
             mtp_last: Vec::new(),
             mtp_alt: None,
+            slot_chain: vec![Vec::new(); MAX_SLOTS],
+            commit_seg_graphs: (0..=MAX_T).map(|_| None).collect(),
             last_mtp_ms: 0.0,
         };
         let mut c = c;
@@ -959,22 +967,30 @@ impl Coder {
             self.dev.upload_into_f32(da, &wa);
             self.dev.upload_into_f32(db, &wb);
         }
-        // The MTP layer drafts for slot 0 only.
-        let mk = self
-            .mtp
-            .as_ref()
-            .and_then(|m| m.layer.attn.as_ref())
-            .map(|at| (self.a(&at.k), self.a(&at.v)));
-        if let Some((k, v)) = mk {
-            let word = |v: u64| -> Vec<f32> {
-                let mut w = vec![0f32; 2 * MAX_SLOTS];
-                w[0] = f32::from_bits(v as u32);
-                w[1] = f32::from_bits((v >> 32) as u32);
-                w
+        // The MTP layer: slot 0 its own buffers, the others their `mtp_kv`.
+        if self.mtp.is_some() {
+            let mut ta = [0u64; MAX_SLOTS];
+            let mut tb = [0u64; MAX_SLOTS];
+            if let Some(at) = self.mtp.as_ref().and_then(|m| m.layer.attn.as_ref()) {
+                ta[0] = self.a(&at.k);
+                tb[0] = self.a(&at.v);
+            }
+            for (i, sl) in self.slots.iter().enumerate().skip(1) {
+                if let Some((a, b)) = sl.as_ref().and_then(|s| s.mtp_kv.as_ref()) {
+                    ta[i] = self.a(a);
+                    tb[i] = self.a(b);
+                }
+            }
+            let words = |t: &[u64; MAX_SLOTS]| -> Vec<f32> {
+                t.iter()
+                    .flat_map(|&v| [f32::from_bits(v as u32), f32::from_bits((v >> 32) as u32)])
+                    .collect()
             };
-            let at = self.mtp.as_mut().unwrap().layer.attn.as_mut().unwrap();
-            self.dev.upload_into_f32(&mut at.ktab, &word(k));
-            self.dev.upload_into_f32(&mut at.vtab, &word(v));
+            let (wa, wb) = (words(&ta), words(&tb));
+            if let Some(at) = self.mtp.as_mut().and_then(|m| m.layer.attn.as_mut()) {
+                self.dev.upload_into_f32(&mut at.ktab, &wa);
+                self.dev.upload_into_f32(&mut at.vtab, &wb);
+            }
         }
         self.dev.sync();
     }
@@ -1000,6 +1016,10 @@ impl Coder {
         let mut sl = Slot {
             gdn: Vec::with_capacity(self.layers.len()),
             kv: Vec::with_capacity(self.layers.len()),
+            mtp_kv: self
+                .mtp
+                .as_ref()
+                .map(|_| (self.dev.alloc_bf16(kv), self.dev.alloc_bf16(kv))),
             tokens: Vec::new(),
         };
         for layer in &self.layers {
@@ -1017,6 +1037,7 @@ impl Coder {
             );
         }
         self.slots[i] = Some(sl);
+        self.slot_chain[i].clear();
         self.write_slot_tables();
         Ok(i)
     }
@@ -1103,9 +1124,152 @@ impl Coder {
                 ..Default::default()
             };
             next = self.run_staged(st, w0, t, false, nchunk, 1, None)?[t - 1];
+            if self.mtp_on() {
+                let toks = self.slot_tokens(slot);
+                let mut nx = toks[pos + 1..pos + t].to_vec();
+                nx.push(if pos + t == end { next } else { toks[pos + t] });
+                let c = self.mtp_groups(&[(slot, pos, 0, &nx)], pos + t == end)?;
+                if pos + t == end {
+                    self.slot_chain[slot] = c[0].0.clone();
+                }
+            }
             pos += t;
         }
         Ok(next)
+    }
+
+    /// Slot `slot`'s latest MTP chain (draft tokens and probabilities), for its next verify.
+    pub fn slot_drafts(&self, slot: usize) -> &[(u32, f32)] {
+        if slot == 0 {
+            &self.mtp_last
+        } else {
+            &self.slot_chain[slot]
+        }
+    }
+
+    /// One verify window for several sequences: `(slot, token, drafts)` per sequence, distinct
+    /// slots, `1 + drafts` rows each, `MAX_T` rows in all. Feeds each slot its token and
+    /// drafts, keeps each slot's accepted drafts (its recurrent state committed per segment),
+    /// and returns each sequence's kept tokens (accepted drafts' successors plus the first
+    /// correction), as a lone `verify` of that sequence would. With an MTP layer, also drafts
+    /// each slot's next chain (`slot_drafts`).
+    pub fn verify_batch(&mut self, items: &[(usize, u32, Vec<u32>)]) -> Result<Vec<Vec<u32>>> {
+        let b = items.len();
+        let t: usize = items.iter().map(|x| 1 + x.2.len()).sum();
+        ensure!(b >= 1 && t <= MAX_T, "{b} sequences, {t} rows");
+        ensure!(self.sampler.is_none(), "batched windows are greedy for now");
+        if items.iter().all(|x| x.2.is_empty()) {
+            let rows: Vec<(usize, u32)> = items.iter().map(|x| (x.0, x.1)).collect();
+            return Ok(self
+                .decode_batch(&rows)?
+                .into_iter()
+                .map(|k| vec![k])
+                .collect());
+        }
+        let mut staged = Vec::with_capacity(t);
+        let mut segs = Vec::with_capacity(b);
+        let mut pos0 = Vec::with_capacity(b);
+        let mut end = 0;
+        for (i, (slot, cur, drafts)) in items.iter().enumerate() {
+            ensure!(
+                items[..i].iter().all(|r| r.0 != *slot),
+                "slot {slot} twice in one step"
+            );
+            let toks = self.slot_tokens_mut(*slot)?;
+            let pos = toks.len();
+            toks.push(*cur);
+            toks.extend_from_slice(drafts);
+            let len = 1 + drafts.len();
+            end = end.max(pos + len);
+            segs.push([staged.len() as u32, len as u32, *slot as u32, len as u32]);
+            staged.push((*slot, pos, *cur));
+            for (j, &d) in drafts.iter().enumerate() {
+                staged.push((*slot, pos + 1 + j, d));
+            }
+            pos0.push(pos);
+        }
+        ensure!(end <= self.max_ctx, "context {end} > max {}", self.max_ctx);
+        let w0 = Instant::now();
+        self.stage_rows(&staged, &segs)?;
+        let nchunk = self.nchunk(end);
+        let st = WinStats {
+            t,
+            ..Default::default()
+        };
+        let targets = self.run_staged(st, w0, t, true, nchunk, b, None)?;
+        // Each segment keeps its accepted drafts' rows: stage the counts, commit them.
+        let mut kept = Vec::with_capacity(b);
+        let rec = self.io.u32s(Io::rows(self.hp.n_embd), ROWS_U32);
+        for (i, (_, _, drafts)) in items.iter().enumerate() {
+            let r0 = segs[i][0] as usize;
+            let mut n = 1;
+            while n <= drafts.len() && drafts[n - 1] == targets[r0 + n - 1] {
+                n += 1;
+            }
+            rec[2 * MAX_T + 4 * i + 3] = n as u32;
+            kept.push(targets[r0..r0 + n].to_vec());
+        }
+        self.commit_batch(b)?;
+        // The commit reads the staged row record when it runs: let it, before restaging.
+        self.dev.sync();
+        for (i, (slot, _, _)) in items.iter().enumerate() {
+            let p = pos0[i] + kept[i].len();
+            self.slot_tokens_mut(*slot)?.truncate(p);
+        }
+        if self.mtp_on() {
+            let groups: Vec<(usize, usize, usize, &[u32])> = items
+                .iter()
+                .enumerate()
+                .map(|(i, x)| (x.0, pos0[i], segs[i][0] as usize, &kept[i][..]))
+                .collect();
+            let chains = self.mtp_groups(&groups, true)?;
+            for (x, c) in items.iter().zip(chains) {
+                self.slot_chain[x.0] = c.0;
+            }
+        }
+        Ok(kept)
+    }
+
+    /// After a batched verify window of `nseg` segments whose keep counts are staged: commit
+    /// each segment's kept rows of recurrent state and conv history.
+    fn commit_batch(&mut self, nseg: usize) -> Result<()> {
+        if !self.use_graphs {
+            self.enqueue_commit_seg(nseg);
+            return Ok(());
+        }
+        if self.commit_seg_graphs[nseg].is_none() {
+            self.enqueue_commit_seg(nseg);
+            self.dev.sync();
+            let stream = ManuallyDrop::new(Stream(self.dev.cu_stream()));
+            let me = self as *const Self;
+            let gr = Graph::capture(&stream, |_| {
+                // SAFETY: `self` is not otherwise touched during capture.
+                unsafe { &*me }.enqueue_commit_seg(nseg);
+                Ok(())
+            })
+            .map_err(|e| anyhow!("capture commit nseg={nseg}: {e}"))?;
+            self.commit_seg_graphs[nseg] = Some(gr);
+            return Ok(());
+        }
+        self.commit_seg_graphs[nseg]
+            .as_ref()
+            .unwrap()
+            .launch(&self.stream)
+            .map_err(|e| anyhow!("{e}"))
+    }
+
+    fn enqueue_commit_seg(&self, nseg: usize) {
+        self.kcopy(
+            self.a(&self.s.rows),
+            self.io_dev(Io::rows(self.hp.n_embd)),
+            ROWS_U32 * 4,
+        );
+        for layer in &self.layers {
+            if let Some(g) = &layer.gdn {
+                self.gdn_step_seg(g, layer.w_in.rows, nseg, true);
+                self.gdn_commit_seg(g, layer.w_in.rows, nseg);
+            }
+        }
     }
 
     /// One decode step for several sequences at once: `(slot, token)` per row, distinct
@@ -1138,7 +1302,20 @@ impl Coder {
             t: b,
             ..Default::default()
         };
-        self.run_staged(st, w0, b, false, nchunk, b, None)
+        let out = self.run_staged(st, w0, b, false, nchunk, b, None)?;
+        if self.mtp_on() {
+            let nexts: Vec<[u32; 1]> = out.iter().map(|&k| [k]).collect();
+            let groups: Vec<(usize, usize, usize, &[u32])> = staged
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (r.0, r.1, i, &nexts[i][..]))
+                .collect();
+            let chains = self.mtp_groups(&groups, true)?;
+            for (r, c) in staged.iter().zip(chains) {
+                self.slot_chain[r.0] = c.0;
+            }
+        }
+        Ok(out)
     }
 
     pub fn reset(&mut self) {
@@ -1868,8 +2045,8 @@ impl Coder {
     }
 
     /// The MTP layer on `t` staged rows: input from `m.emb` (staged) and `m.mh`, attention over
-    /// `nchunk` chunks, then the head; ids and probabilities to the pinned `IDS` words, and the
-    /// last row's normed output into `m.mh` row 0 (the next chained step's input).
+    /// `nchunk` chunks, then the head; ids and probabilities to the pinned `IDS` words. Its rows'
+    /// normed outputs stay in `s.x` (a chained step's input, gathered by the host).
     fn enqueue_mtp(&self, t: usize, nchunk: usize) {
         let m = self.mtp.as_ref().expect("MTP layer");
         let (s, n) = (&self.s, self.hp.n_embd);
@@ -1918,7 +2095,6 @@ impl Coder {
         };
         self.kcopy(self.io_dev(Io::IDS), ids, 2 * MAX_T * 4);
         self.kcopy(self.io_dev(Io::MTP_PROB), prob, 2 * MAX_T * 4);
-        self.kcopy(mh, self.a(&s.x) + ((t - 1) * n * 4) as u64, n * 4);
     }
 
     fn enqueue_commit(&self, t: usize) {
@@ -1960,26 +2136,26 @@ impl Coder {
         Ok(())
     }
 
-    /// The MTP layer on `next.len()` rows at positions `pos0 + 1..`: row `i` takes the final
-    /// hidden state `m.mh` holds for position `pos0 + i` and the token `next[i]` at
-    /// `pos0 + i + 1`, and guesses the token at `pos0 + i + 2`. Returns each row's guess and its
-    /// probability.
-    fn mtp_pass(&mut self, pos0: usize, next: &[u32]) -> Result<Vec<(u32, f32)>> {
-        let (t, n) = (next.len(), self.hp.n_embd);
-        ensure!((1..=MAX_T).contains(&t) && pos0 + t < self.max_ctx);
+    /// The MTP layer on rows `(slot, pos, next)`: each takes the final hidden state `m.mh` holds
+    /// (in row order) for position `pos` of `slot` and the token `next` at `pos + 1`, and
+    /// guesses the token at `pos + 2`. Returns each row's guess and its probability.
+    fn mtp_pass(&mut self, rows: &[(usize, usize, u32)]) -> Result<Vec<(u32, f32)>> {
+        let (t, n) = (rows.len(), self.hp.n_embd);
+        let end = rows.iter().map(|r| r.1 + 2).max().unwrap_or(0);
+        ensure!((1..=MAX_T).contains(&t) && end <= self.max_ctx);
         let emb_t = self.g.info("token_embd.weight")?.clone();
         let emb = self.io.f32s(Io::EMB, t * n);
-        for (i, &tok) in next.iter().enumerate() {
-            let row = self.g.rows(&emb_t, tok as usize, 1)?;
+        for (i, r) in rows.iter().enumerate() {
+            let row = self.g.rows(&emb_t, r.2 as usize, 1)?;
             emb[i * n..(i + 1) * n].copy_from_slice(&row);
         }
-        let rows = self.io.u32s(Io::rows(n), ROWS_U32);
-        rows.fill(0);
-        for (i, r) in rows.iter_mut().take(t).enumerate() {
-            *r = (pos0 + 1 + i) as u32;
+        let rec = self.io.u32s(Io::rows(n), ROWS_U32);
+        rec.fill(0);
+        for (i, r) in rows.iter().enumerate() {
+            rec[i] = (r.1 + 1) as u32;
+            rec[MAX_T + i] = r.0 as u32;
         }
-        rows[2 * MAX_T..2 * MAX_T + 4].copy_from_slice(&[0, t as u32, 0, t as u32]);
-        let nchunk = self.nchunk(pos0 + t + 1);
+        let nchunk = self.nchunk(end);
         if self.use_graphs && self.prof.is_none() {
             let key = (t, nchunk);
             if let Some(g) = self.mtp_graphs.get(&key) {
@@ -2004,6 +2180,71 @@ impl Coder {
         }
         self.dev.sync();
         Ok(self.mtp_read(t))
+    }
+
+    /// Copy rows `from[i]` of `src` (`n_embd` f32 each) to rows `i` of `m.mh`, through `m.cat`.
+    fn mtp_gather(&self, src: u64, from: &[usize]) {
+        let m = self.mtp.as_ref().expect("MTP layer");
+        let (mh, cat, b) = (self.a(&m.mh), self.a(&m.cat), self.hp.n_embd * 4);
+        if from.iter().enumerate().all(|(i, &f)| i == f) && src == mh {
+            return;
+        }
+        for (i, &f) in from.iter().enumerate() {
+            self.kcopy(cat + (i * b) as u64, src + (f * b) as u64, b);
+        }
+        self.kcopy(mh, cat, from.len() * b);
+    }
+
+    /// The MTP layer after a window, for groups `(slot, pos, r0, next)`: positions
+    /// `pos..pos + next.len()` of `slot` were window rows `r0..` (their final hidden rows in
+    /// `m.mh`), and `next[i]` followed position `pos + i`. Fills the MTP K/V for those
+    /// positions; with `chain`, drafts `mtp_steps` tokens past each group's end and returns
+    /// them (with the first draft's runner-up).
+    #[allow(clippy::type_complexity)]
+    fn mtp_groups(
+        &mut self,
+        groups: &[(usize, usize, usize, &[u32])],
+        chain: bool,
+    ) -> Result<Vec<(Vec<(u32, f32)>, Option<(u32, f32)>)>> {
+        let mut out = vec![(Vec::new(), None); groups.len()];
+        let total: usize = groups.iter().map(|g| g.3.len()).sum();
+        let end = groups.iter().map(|g| g.1 + g.3.len()).max().unwrap_or(0);
+        if total == 0 || total > MAX_T || end + self.mtp_steps + 1 >= self.max_ctx {
+            return Ok(out);
+        }
+        let from: Vec<usize> = groups.iter().flat_map(|g| g.2..g.2 + g.3.len()).collect();
+        let mh = self.a(&self.mtp.as_ref().unwrap().mh);
+        self.mtp_gather(mh, &from);
+        let rows: Vec<(usize, usize, u32)> = groups
+            .iter()
+            .flat_map(|g| g.3.iter().enumerate().map(move |(i, &k)| (g.0, g.1 + i, k)))
+            .collect();
+        let first = self.mtp_pass(&rows)?;
+        if !chain {
+            return Ok(out);
+        }
+        let mut last = Vec::with_capacity(groups.len());
+        let mut r = 0;
+        for (gi, g) in groups.iter().enumerate() {
+            r += g.3.len();
+            last.push(r - 1);
+            out[gi].0.push(first[r - 1]);
+            out[gi].1 = Some(self.mtp_read_alt(r - 1));
+        }
+        for j in 1..self.mtp_steps {
+            self.mtp_gather(self.a(&self.s.x), &last);
+            let rows: Vec<(usize, usize, u32)> = groups
+                .iter()
+                .zip(&out)
+                .map(|(g, o)| (g.0, g.1 + g.3.len() + j - 1, o.0[j - 1].0))
+                .collect();
+            let d = self.mtp_pass(&rows)?;
+            for (o, &x) in out.iter_mut().zip(&d) {
+                o.0.push(x);
+            }
+            last = (0..groups.len()).collect();
+        }
+        Ok(out)
     }
 
     fn mtp_read(&self, t: usize) -> Vec<(u32, f32)> {
@@ -2038,38 +2279,22 @@ impl Coder {
     fn mtp_after_rows(&mut self, pos: usize, r0: usize, next: &[u32], chain: bool) -> Result<()> {
         self.mtp_last.clear();
         self.mtp_alt = None;
-        if self.mtp.is_none() || !self.use_mtp || !self.greedy.get() || next.is_empty() {
+        if !self.mtp_on() || next.is_empty() {
             return Ok(());
         }
         ensure!(r0 + next.len() <= MAX_T, "rows {r0}+{}", next.len());
         let t0 = Instant::now();
-        let end = pos + next.len();
-        if end + self.mtp_steps + 1 >= self.max_ctx {
-            return Ok(());
-        }
-        if r0 > 0 {
-            // Move the kept rows to the front of `mh` (through `cat`, which the pass rewrites).
-            let m = self.mtp.as_ref().unwrap();
-            let (mh, cat, b) = (
-                self.a(&m.mh),
-                self.a(&m.cat),
-                next.len() * self.hp.n_embd * 4,
-            );
-            self.kcopy(cat, mh + (r0 * self.hp.n_embd * 4) as u64, b);
-            self.kcopy(mh, cat, b);
-        }
-        let out = self.mtp_pass(pos, next)?;
-        if chain {
-            let mut d = *out.last().unwrap();
-            self.mtp_alt = Some(self.mtp_read_alt(next.len() - 1));
-            self.mtp_last.push(d);
-            for j in 1..self.mtp_steps {
-                d = self.mtp_pass(end + j - 1, &[d.0])?[0];
-                self.mtp_last.push(d);
-            }
-        }
+        let mut g = self.mtp_groups(&[(0, pos, r0, next)], chain)?;
+        let (c, alt) = g.pop().unwrap();
+        self.mtp_last = c;
+        self.mtp_alt = alt;
         self.last_mtp_ms = t0.elapsed().as_secs_f64() * 1e3;
         Ok(())
+    }
+
+    /// MTP drafting applies: a layer is loaded, `use_mtp`, and the windows are greedy.
+    fn mtp_on(&self) -> bool {
+        self.mtp.is_some() && self.use_mtp && self.greedy.get()
     }
 
     /// After a [`window`](Self::window) over `pos0..pos0 + next.len()`: feed the MTP layer
