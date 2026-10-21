@@ -82,7 +82,8 @@ struct Variants {
     router_fused: bool,
     /// Warps a row of the K-split GEMV for matrices with at least 4096 rows (0: `kq`).
     kq_tall: usize,
-    /// Q4_K / Q5_K expert rows through `cx_dotq_fast` (32 weights a lane a step).
+    /// Q4_K / Q5_K expert rows through `cx_dotq_fast` (32 weights a lane a step; default on,
+    /// `TANG_CODER_FASTK=0` / `fastk=0` for the 8-weight decoder).
     fastk: bool,
 }
 
@@ -108,7 +109,7 @@ impl Variants {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
             router_fused: env_is("TANG_CODER_ROUTER", "fused"),
-            fastk: env_is("TANG_CODER_FASTK", "1"),
+            fastk: !env_is("TANG_CODER_FASTK", "0"),
             kq_tall: std::env::var("TANG_CODER_KQTALL")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -1686,14 +1687,14 @@ impl Coder {
             dnk: 0,
             router_fused: false,
             kq_tall: 0,
-            fastk: false,
+            fastk: true,
         };
         for kv in spec.split(',').filter(|x| !x.is_empty()) {
             match kv {
                 "exrows=4" => v.exrows = 4,
                 "silu=fused" => v.silu_sep = false,
                 "router=fused" => v.router_fused = true,
-                "fastk=1" => v.fastk = true,
+                "fastk=0" => v.fastk = false,
                 _ if kv.starts_with("kqtall=") => v.kq_tall = kv[7..].parse()?,
                 _ if kv.starts_with("guk=") => v.guk = kv[4..].parse()?,
                 _ if kv.starts_with("dnk=") => v.dnk = kv[4..].parse()?,
@@ -1789,8 +1790,9 @@ fn upload_dense(
                 })
                 .collect();
             (30, k * 2, b16)
-        } else if ty == 8 && k.is_multiple_of(1024) && env_is("TANG_CODER_Q8X", "1") {
-            // Q8X (type 108): [k codes][k / 32 f16 scales] a row, lossless.
+        } else if ty == 8 && k.is_multiple_of(1024) && !env_is("TANG_CODER_Q8X", "0") {
+            // Q8X (type 108, default; TANG_CODER_Q8X=0 keeps Q8_0): [k codes][k / 32 f16 scales] a
+            // row, lossless.
             let nb = k / 32;
             let mut out = Vec::with_capacity(rows * (k + 2 * nb));
             for r in 0..rows {
