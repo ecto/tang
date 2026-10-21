@@ -38,6 +38,52 @@ Measured on the same H100 pod, waiting to merge (each on top of c623ce1):
 | (same) | 32B | 16 | 282 | +21% |
 | all three | 8B / 32B | 16 | 1051 / 298 | +24% / +28% |
 
+## gpt-oss-20b
+
+Single stream, AA-style (a ~1k-token chat prompt, output tok/s; `scripts/gpt_oss_speed.sh`).
+The bar is Groq's claimed ~1,200 tok/s.
+
+**Bytes per decoded token** (what a step must read; gpt-oss-20b, 24 layers):
+
+| part | format | per token |
+|---|---|---:|
+| experts: 4 of 32 per layer, gate/up 5760×2880 + down 2880×2880 | MXFP4 (4.25 bits) | 1.27 GB |
+| attention Q/K/V/O, 26.5M a layer | bf16 | 1.27 GB |
+| output head 201088×2880 | bf16 | 1.16 GB |
+| KV at ~1.3k context (12 full layers ~1.3k keys, 12 sliding 128), f32 | | ~0.05 GB |
+| router, norms, biases | f32 | ~0.01 GB |
+| **total** | | **~3.75 GB** |
+
+Speed of light at that size: 1280 tok/s on an H200 (4.8 TB/s), 890 on an H100, 270 on a 4090.
+Groq's 1,200 is ~94% of the H200's. **To pass it, the weights have to shrink:** attention and
+the head at 4 bits (Q4, as the Qwen rows run) would take a token to ~1.95 GB, a 2460 tok/s ceiling
+on the H200. The experts are already 4-bit.
+
+**Per kernel** (4090 nsys, 256 decoded tokens, before the 4-rows-a-warp GEMV): the expert GEMV
+was 48% of GPU time at ~350 GB/s (a third of peak) and the bf16 GEMVs 36% at ~0.94 TB/s (at
+peak). Sink attention was 6%, rms_norm 4%. Host side: ~460 launches a token, with a
+host-to-device upload (ids, block tables) and a logits download every step.
+
+| kernel | bytes/token | at 4.8 TB/s | measured | what's left |
+|---|---:|---:|---|---|
+| `moe_gemv_mxfp4` (48 calls) | 1.27 GB | 0.26 ms | 4090: 3.6 ms → ~2.2 ms after 4 rows a warp | input staged in smem (new, A/B below); more columns a block |
+| `gemv_bf16` attention (48 calls) | 1.27 GB | 0.26 ms | at bandwidth | 4-bit attention weights |
+| `gemv_bf16` head (1 call) | 1.16 GB | 0.24 ms | at bandwidth | 4-bit head, or device top-k so only the argmax comes back |
+| `attn_sink_partial` + combine | ~0.05 GB | 0.01 ms | 6% (launch-bound) | fold into fewer launches |
+| everything else (~360 launches) | | | ~1.5 ms on H100 | CUDA graphs |
+
+Measured so far (before the rebase onto #88/#89):
+
+| date | commit | change | GPU | model | streams | tok/s | % SoL | vs prev |
+|---|---|---|---|---|---|---|---|---|
+| 2026-10-20 | 29221a7 | #95, 13-token prompt | RTX 4090 | gpt-oss-20b | 1 | 157 | 58% | |
+| 2026-10-20 | 1b8474c | #95, 13-token prompt | H100 | gpt-oss-20b | 1 | 182 | 20% | |
+| 2026-10-20 | 1b8474c | #95, 13-token prompt | H100 | gpt-oss-120b | 1 | 119 | | |
+
+The order to try on the H200: (1) the smem GEMV A/B in the script; (2) CUDA graphs over the decode
+step (launch-bound on Hopper); (3) a Q4 head and Q4 attention, which takes the ceiling from 1280
+to ~2460; (4) speculation, already exact for gpt-oss (`tests/speculate.rs`).
+
 ## Dead ends
 
 Tried and measured at under 3% (or worse):

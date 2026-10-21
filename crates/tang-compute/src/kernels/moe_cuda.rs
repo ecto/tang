@@ -305,6 +305,74 @@ extern "C" __global__ void moe_gemv_mxfp4(
     }
 }
 
+// `moe_gemv_mxfp4` with each pick's input row staged in shared memory (dynamic, K floats)
+// instead of read through L1 by every warp. Same lanes, blocks and summation order, so the same
+// bits.
+extern "C" __global__ void moe_gemv_mxfp4_smem(
+    const float* __restrict__ X, const unsigned char* __restrict__ Wt,
+    const float* __restrict__ B, const unsigned int* __restrict__ OFF,
+    const unsigned int* __restrict__ LIST, float* __restrict__ Y,
+    unsigned int k_top, unsigned int K, unsigned int N, unsigned int E,
+    unsigned int per_pick, unsigned int has_bias)
+{
+    extern __shared__ float xs[];
+    __shared__ float lut[16];
+    if (threadIdx.x < 16) {
+        const float f[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+                             -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+        lut[threadIdx.x] = f[threadIdx.x];
+    }
+    unsigned int e = blockIdx.y, lane = threadIdx.x & 31;
+    unsigned int p0 = OFF[e], p1 = OFF[e + 1];
+    if (p0 == p1) return;   // uniform across the block
+    unsigned int n0 = (blockIdx.x * 8 + (threadIdx.x >> 5)) * ROWS;
+    bool live = n0 < N;
+    unsigned int nb = K / 32, rows = live ? min((unsigned int)ROWS, N - n0) : 0;
+    const unsigned char* wb = Wt + ((u64)e * N + n0) * (K / 2);
+    const unsigned char* ws = Wt + (u64)E * N * (K / 2) + ((u64)e * N + n0) * nb;
+    for (unsigned int c = p0; c < p1; c++) {
+        unsigned int p = LIST[c];
+        const float4* x4g = (const float4*)(X + (u64)(per_pick ? p : p / k_top) * K);
+        __syncthreads();
+        for (unsigned int i = threadIdx.x; i < K / 4; i += blockDim.x) ((float4*)xs)[i] = x4g[i];
+        __syncthreads();
+        if (!live) continue;
+        float acc[ROWS];
+        #pragma unroll
+        for (int r = 0; r < ROWS; r++) acc[r] = 0.0f;
+        for (unsigned int b = lane; b < nb; b += 32) {
+            const float4* x4 = (const float4*)(xs + b * 32);
+            float xv[32];
+            #pragma unroll
+            for (int t = 0; t < 8; t++) {
+                float4 v = x4[t];
+                xv[4 * t] = v.x; xv[4 * t + 1] = v.y; xv[4 * t + 2] = v.z; xv[4 * t + 3] = v.w;
+            }
+            #pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                if (r >= rows) break;
+                uint4 q = *(const uint4*)(wb + ((u64)r * nb + b) * 16);
+                float sc = e8m0f(ws[(u64)r * nb + b]);
+                unsigned int qs[4] = {q.x, q.y, q.z, q.w};
+                float d = 0.0f;
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    #pragma unroll
+                    for (int t = 0; t < 8; t++) d += lut[(qs[j] >> (4 * t)) & 15u] * xv[8 * j + t];
+                }
+                acc[r] += sc * d;
+            }
+        }
+        #pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            if (r >= rows) break;
+            float s = warp_sum(acc[r]);
+            if (lane == 0)
+                Y[(u64)p * N + n0 + r] = s + (has_bias ? B[(u64)e * N + n0 + r] : 0.0f);
+        }
+    }
+}
+
 // Prefill: picks grouped by expert run as one GEMM per expert (see `moe_linear_llm`).
 // `moe_gather`: row i of XG is the input row of pick LIST[i]; grid (picks), block 256.
 extern "C" __global__ void moe_gather(

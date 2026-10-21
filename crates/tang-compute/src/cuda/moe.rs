@@ -240,7 +240,17 @@ impl CudaComputeDevice {
         let mut tx = None;
         let x = self.moe_f32(x, &mut tx);
         let sort = self.llm_func(moe_cuda::MOE_CUDA, "moe_sort");
-        let gemv = self.llm_func(moe_cuda::MOE_CUDA, "moe_gemv_mxfp4");
+        // `TANG_MOE_GEMV=l1` keeps the input read through L1 (for A/B runs); the default
+        // stages it in shared memory when it fits.
+        let smem = k * 4 <= 48 << 10 && std::env::var("TANG_MOE_GEMV").as_deref() != Ok("l1");
+        let gemv = self.llm_func(
+            moe_cuda::MOE_CUDA,
+            if smem {
+                "moe_gemv_mxfp4_smem"
+            } else {
+                "moe_gemv_mxfp4"
+            },
+        );
         let (mut off, mut list) = (
             self.pool_alloc_uninit_f32(experts + 1),
             self.pool_alloc_uninit_f32(picks),
@@ -286,7 +296,10 @@ impl CudaComputeDevice {
                 .arg(&e_u)
                 .arg(&pp)
                 .arg(&hb)
-                .launch(grid((n.div_ceil(32), experts, 1), 256))
+                .launch(LaunchConfig {
+                    shared_mem_bytes: if smem { (k * 4) as u32 } else { 0 },
+                    ..grid((n.div_ceil(32), experts, 1), 256)
+                })
                 .unwrap();
         }
         Some(y)
