@@ -1,5 +1,7 @@
 # cram-codec
 
+**cram** — [cram.sh](https://cram.sh) · [docs](https://docs.rs/cram-codec)
+
 Error-bounded lossy compression of scientific `f32`/`f64` arrays, in pure
 Rust. Every byte of the stream counts toward the reported rate, encoding is
 deterministic, and the error bound you ask for is the one you get.
