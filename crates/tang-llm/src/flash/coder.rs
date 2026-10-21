@@ -80,8 +80,11 @@ struct Variants {
     kq: usize,
     fastk: i32,
     shared_par: bool,
-    /// Grouped expert kernels (each distinct expert read once a window); `TANG_CODER_GROUPED=0`
-    /// for the per-pair ones. Bitwise the same outputs either way.
+    /// Grouped expert kernels (each distinct expert read once a window), `TANG_CODER_GROUPED=1`.
+    /// Bitwise the same outputs as the per-pair ones. Off by default: at decode widths (≤ 8 rows ×
+    /// top-10 of 512 experts) pairs rarely share an expert, and on an H200 the plan and the
+    /// serialized groups cost more than they save (8 streams: 10.98 ms a step per-pair, 12.49
+    /// grouped). They're for wide windows (prefill), where many rows share experts.
     grouped: bool,
 }
 
@@ -91,7 +94,7 @@ impl Default for Variants {
             kq: 2,
             fastk: 2,
             shared_par: false,
-            grouped: true,
+            grouped: false,
         }
     }
 }
@@ -104,7 +107,7 @@ impl Variants {
             kq: num("TANG_CODER_KQ").map_or(d.kq, |v| v as usize),
             fastk: num("TANG_CODER_FASTK").map_or(d.fastk, |v| v as i32),
             shared_par: env_is("TANG_CODER_SHPAR", "1"),
-            grouped: !env_is("TANG_CODER_GROUPED", "0"),
+            grouped: env_is("TANG_CODER_GROUPED", "1"),
         }
     }
 }
