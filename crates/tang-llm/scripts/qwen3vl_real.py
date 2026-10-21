@@ -72,7 +72,24 @@ def main():
     inputs = proc(text=[text], images=[img], return_tensors="pt").to("cuda")
     ids = inputs["input_ids"][0].tolist()
     _, gh, gw = inputs["image_grid_thw"][0].tolist()
+    # Per-block tower states (HF), to place any difference.
+    blocks = []
+    vis = model.model.visual
+    hooks = [vis.blocks[0].register_forward_pre_hook(lambda m, i: blocks.append(i[0].float().cpu().numpy()))]
+    for b in vis.blocks:
+        hooks.append(b.register_forward_hook(lambda m, i, o: blocks.append(o.float().cpu().numpy())))
     with torch.no_grad():
+        vout = vis(inputs["pixel_values"].to(vis.dtype), grid_thw=inputs["image_grid_thw"], return_dict=True)
+    for h in hooks:
+        h.remove()
+    hf_embeds = vout.pooler_output.float().cpu().numpy()
+    hf_ds = [d.float().cpu().numpy() for d in vout.deepstack_features]
+    text_msgs = [{"role": "user", "content": "Write a Python function that returns the n-th Fibonacci number, with a docstring."}]
+    text_ids = proc.tokenizer.apply_chat_template(text_msgs, add_generation_prompt=True, tokenize=True)
+    if isinstance(text_ids, dict):
+        text_ids = text_ids["input_ids"]
+    with torch.no_grad():
+        text_logits = model(input_ids=torch.tensor([text_ids], device="cuda")).logits[0].float().cpu().numpy()
         logits = model(**inputs).logits[0, -a.last:].float().cpu().numpy()
         gen = model.generate(**inputs, max_new_tokens=40, do_sample=False)
     print(f"prompt {len(ids)} tokens, image {gh}x{gw} patches ({gh * gw // 4} tokens), HF {a.hf_dtype}")
@@ -82,15 +99,44 @@ def main():
     pf = os.path.join(a.out, "hf_px.f32")
     np.ascontiguousarray(first, dtype="<f4").tofile(pf)
     pad = model.config.image_token_id
-    # tang needs the GPU's memory: drop HF first.
-    del model, inputs
+    # tang needs the GPU's memory: drop HF first. For scale: HF itself in bf16.
+    del model, vis
     torch.cuda.empty_cache()
+    m16 = Qwen3VLForConditionalGeneration.from_pretrained(
+        a.model, dtype=torch.bfloat16, attn_implementation="eager").to("cuda").eval()
+    with torch.no_grad():
+        l16 = m16(**inputs).logits[0, -a.last:].float().cpu().numpy()
+        t16 = m16(input_ids=torch.tensor([text_ids], device="cuda")).logits[0].float().cpu().numpy()
+    del m16, inputs
+    torch.cuda.empty_cache()
+    kl_stats("(HF bf16 vs HF fp32, image prompt)", logits, l16)
+    kl_stats("(HF bf16 vs HF fp32, text prompt)", text_logits, t16)
+
+    # Tower, per block (tang bf16 weights vs HF fp32).
+    td = os.path.join(a.out, "trace")
+    os.makedirs(td, exist_ok=True)
+    r = subprocess.run([a.tang, "vl-trace", a.model, pf, str(gh), str(gw), td, "--device", a.device],
+                       capture_output=True, text=True)
+    if r.returncode:
+        sys.exit(r.stderr[-3000:])
+    rel = lambda ref, f: np.abs(ref.ravel() - np.fromfile(os.path.join(td, f), "<f4")).max() / np.abs(ref).max()
+    errs = [rel(b, f"block_{i}.f32") for i, b in enumerate(blocks)]
+    print("tower rel max|Δ| by block: " + " ".join(f"{e:.1e}" for e in errs))
+    print(f"merger {rel(hf_embeds, 'embeds.f32'):.1e}, deepstack " +
+          " ".join(f"{rel(d, f'deepstack_{i}.f32'):.1e}" for i, d in enumerate(hf_ds)), flush=True)
+
+    got = tang("vl-logits", a.model, *text_ids, "--last", len(text_ids))
+    kl_stats("tang text-only prompt", text_logits, got)
 
     got = tang("vl-logits", a.model, "--patches", pf, gh, gw, *ids, "--last", a.last)
     kl_stats("tang prefill, HF pixels", logits, got)
     got = tang("vl-logits", a.model, "--image", png, *ids, "--last", a.last)
     kl_stats("tang prefill, tang preprocessing", logits, got)
     end = max(i for i, t in enumerate(ids) if t == pad) + 1
+    os.environ["GAIA_TF32"] = "0"
+    got = tang("vl-logits", a.model, "--patches", pf, gh, gw, *ids, "--last", a.last, "--f32")
+    kl_stats("tang f32 weights, no TF32", logits, got)
+    os.environ.pop("GAIA_TF32")
     got = tang("vl-logits", a.model, "--patches", pf, gh, gw, *ids, "--step", end + 1, "--last", a.last)
     kl_stats(f"tang prefill to {end + 1}, then decode", logits, got)
 
