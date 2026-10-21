@@ -69,7 +69,7 @@ fn env_is(key: &str, val: &str) -> bool {
 /// Kernel variants for A/B on one build (the defaults are the measured winners; the losers are
 /// in `docs/speed-log.md` under Dead ends): `TANG_CODER_KQ` warps a row in the K-split GEMV
 /// (1, 2, 4 or 8; default 2), `TANG_CODER_FASTK` the K-quant expert dot (0: 8 weights a lane,
-/// 1: 32 a lane, 2: also two down rows a warp; default 1), `TANG_CODER_SHPAR=1` the shared
+/// 1: 32 a lane, 2: also two down rows a warp; default 2), `TANG_CODER_SHPAR=1` the shared
 /// expert on a parallel graph branch.
 #[derive(Clone, Copy, Debug)]
 struct Variants {
@@ -82,7 +82,7 @@ impl Default for Variants {
     fn default() -> Self {
         Variants {
             kq: 2,
-            fastk: 1,
+            fastk: 2,
             shared_par: false,
         }
     }
