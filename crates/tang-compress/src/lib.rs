@@ -408,8 +408,17 @@ pub fn fast_pick(x: &[f32], dims: &[usize], cfg: &wavcodec::WavConfig) -> Candid
     };
     cands
         .into_iter()
-        .min_by_key(|&k| encode_candidate_fast_f32(k, &y, &nd, &c).len())
+        .min_by_key(|&k| try_fast(k, &y, &nd, &c).map_or(usize::MAX, |s| s.len()))
         .unwrap()
+}
+
+/// [`encode_candidate_fast_f32`], or `None` when the candidate fails on this
+/// input (e.g. a numerically singular Tucker factor).
+fn try_fast(c: Candidate, x: &[f32], dims: &[usize], cfg: &wavcodec::WavConfig) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        encode_candidate_fast_f32(c, x, dims, cfg)
+    }))
+    .ok()
 }
 
 /// Encode with one candidate's fast variant (no tag byte): step from a
@@ -458,7 +467,14 @@ pub fn encode_fast_f32(
         Some("lorenzo") => Candidate::Lorenzo,
         _ => fast_pick(x, dims, cfg),
     };
-    let body = encode_candidate_fast_f32(pick, x, dims, cfg);
+    // the wavelet always codes, so it backs up a pick that fails at full size
+    let (pick, body) = match try_fast(pick, x, dims, cfg) {
+        Some(b) => (pick, b),
+        None => (
+            Candidate::Wavelet,
+            encode_candidate_fast_f32(Candidate::Wavelet, x, dims, cfg),
+        ),
+    };
     let mut out = Vec::with_capacity(body.len() + 1);
     out.push(pick.tag());
     out.extend(body);
