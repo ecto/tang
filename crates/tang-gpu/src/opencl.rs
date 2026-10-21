@@ -42,6 +42,7 @@ const CL_MEM_READ_WRITE: u64 = 1;
 const CL_PROGRAM_BINARY_SIZES: u32 = 0x1165;
 const CL_PROGRAM_BINARIES: u32 = 0x1166;
 const CL_PROGRAM_BUILD_LOG: u32 = 0x1183;
+const CL_PROFILING_COMMAND_QUEUED: u32 = 0x1280;
 const CL_PROFILING_COMMAND_START: u32 = 0x1282;
 const CL_PROFILING_COMMAND_END: u32 = 0x1283;
 // A device is used from one thread at a time; kernel builds borrow it from
@@ -388,7 +389,7 @@ impl ClDevice {
 
     /// A built program for `source` (prepared): from the binary cache,
     /// else compiled and cached.
-    fn program(&self, source: &str) -> Result<H, String> {
+    fn program(&self, source: &str) -> Result<(H, bool), String> {
         use std::hash::{Hash, Hasher};
         // the Adreno compiler takes cl_qcom_subgroup_shuffle only under OpenCL C 3.0
         let opts = std::env::var("TANG_CL_OPTS").unwrap_or_else(|_| {
@@ -424,7 +425,7 @@ impl ClDevice {
                     (self.api.clBuildProgram)(p, 1, &self.device, copts.as_ptr(), null(), null())
                 } == 0
             {
-                return Ok(p);
+                return Ok((p, true));
             }
             if !p.is_null() {
                 unsafe { (self.api.clReleaseProgram)(p) };
@@ -476,7 +477,7 @@ impl ClDevice {
                 }
             }
         }
-        Ok(p)
+        Ok((p, false))
     }
 
     /// One kernel object per source (entry `main0`), the distinct sources
@@ -494,19 +495,32 @@ impl ClDevice {
             .unwrap_or(3usize)
             .max(1);
         let chunk = uniq.len().div_ceil(n).max(1);
+        #[cfg(feature = "otel")]
+        let tel = tel::Build::start(prepared.len(), uniq.len());
+        #[cfg(feature = "otel")]
+        let tel = &tel;
         let built: Vec<Send2> = std::thread::scope(|s| {
             let hs: Vec<_> = uniq
                 .chunks(chunk)
                 .map(|c| {
                     s.spawn(move || {
                         c.iter()
-                            .map(|src| Send2(self.program(src).unwrap_or_else(|e| panic!("{e}"))))
+                            .map(|src| {
+                                #[cfg(feature = "otel")]
+                                let t0 = std::time::SystemTime::now();
+                                let (p, _hit) = self.program(src).unwrap_or_else(|e| panic!("{e}"));
+                                #[cfg(feature = "otel")]
+                                tel.program(t0, _hit, src.len());
+                                Send2(p)
+                            })
                             .collect::<Vec<_>>()
                     })
                 })
                 .collect();
             hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
         });
+        #[cfg(feature = "otel")]
+        tel.end(&self.name);
         let programs: Vec<H> = built.into_iter().map(|b| b.0).collect();
         let entry = CString::new("main0").unwrap();
         let kernels = prepared
@@ -696,12 +710,286 @@ impl ClDevice {
         }
     }
 
+    /// Enqueue `k` like [`launch`](Self::launch), keeping its event for
+    /// [`event_times`](Self::event_times) (which releases it).
+    pub fn launch_event(&self, ks: &ClKernels, i: usize, items: usize, group: usize) -> ClEvent {
+        let global = items.div_ceil(group) * group;
+        let mut ev = null_mut();
+        check(
+            unsafe {
+                (self.api.clEnqueueNDRangeKernel)(
+                    self.queue,
+                    ks.kernels[i],
+                    1,
+                    null(),
+                    &global,
+                    &group,
+                    0,
+                    null(),
+                    &mut ev,
+                )
+            },
+            "enqueue",
+        );
+        ClEvent(ev)
+    }
+
+    /// Wait for `ev` and return its device (queued, start, end) in ns; releases it.
+    pub fn event_times(&self, ev: ClEvent) -> (u64, u64, u64) {
+        unsafe {
+            (self.api.clWaitForEvents)(1, &ev.0);
+            let q = |w: u32| {
+                let mut v = 0u64;
+                (self.api.clGetEventProfilingInfo)(
+                    ev.0,
+                    w,
+                    8,
+                    &mut v as *mut u64 as *mut c_void,
+                    null_mut(),
+                );
+                v
+            };
+            let t = (
+                q(CL_PROFILING_COMMAND_QUEUED),
+                q(CL_PROFILING_COMMAND_START),
+                q(CL_PROFILING_COMMAND_END),
+            );
+            (self.api.clReleaseEvent)(ev.0);
+            t
+        }
+    }
+
     pub fn flush(&self) {
         unsafe { (self.api.clFlush)(self.queue) };
     }
 
     pub fn sync(&self) {
         unsafe { (self.api.clFinish)(self.queue) };
+    }
+}
+
+/// A kernel's completion event ([`ClDevice::launch_event`]).
+pub struct ClEvent(H);
+
+/// OpenTelemetry for the OpenCL runtime (feature `otel`): program builds and
+/// sampled enqueue-to-complete times. Spans are children of the caller's
+/// current context, so a session that attaches its parent gets them nested.
+#[cfg(feature = "otel")]
+pub mod tel {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::OnceLock;
+    use std::time::SystemTime;
+    use tang_otel::opentelemetry::metrics::{Counter, Histogram};
+    use tang_otel::{Context, KeyValue, TraceContextExt as _, Tracer as _};
+
+    pub struct Inst {
+        pub build_ms: Histogram<f64>,
+        pub programs: Counter<u64>,
+        pub run_ms: Histogram<f64>,
+        pub kernel_ms: Histogram<f64>,
+        hit: [KeyValue; 1],
+        miss: [KeyValue; 1],
+    }
+
+    pub fn inst() -> Option<&'static Inst> {
+        static I: OnceLock<Option<Inst>> = OnceLock::new();
+        I.get_or_init(|| {
+            let m = tang_otel::meter()?;
+            Some(Inst {
+                build_ms: m
+                    .f64_histogram("tang.opencl.program.build_ms")
+                    .with_unit("ms")
+                    .with_description("One OpenCL program: binary-cache load + clBuildProgram, or a compile from source")
+                    .with_boundaries(vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 200.0, 400.0, 800.0, 1600.0])
+                    .build(),
+                programs: m
+                    .u64_counter("tang.opencl.program.builds")
+                    .with_description("OpenCL programs built, by binary-cache outcome")
+                    .build(),
+                run_ms: m
+                    .f64_histogram("tang.opencl.run.device_ms")
+                    .with_unit("ms")
+                    .with_description("Sampled program run: first kernel queued to last kernel complete (device clock)")
+                    .with_boundaries(vec![0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0, 80.0, 160.0, 320.0])
+                    .build(),
+                kernel_ms: m
+                    .f64_histogram("tang.opencl.kernel.device_ms")
+                    .with_unit("ms")
+                    .with_description("Sampled kernel execution (start to end, device clock)")
+                    .with_boundaries(vec![0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0])
+                    .build(),
+                hit: [KeyValue::new("tang.cl.cache", "hit")],
+                miss: [KeyValue::new("tang.cl.cache", "miss")],
+            })
+        })
+        .as_ref()
+    }
+
+    /// One `ClDevice::kernels` call.
+    pub struct Build {
+        cx: Context,
+        start: SystemTime,
+        kernels: usize,
+        unique: usize,
+        hits: AtomicUsize,
+        misses: AtomicUsize,
+        build_ns: AtomicU64,
+    }
+
+    impl Build {
+        pub fn start(kernels: usize, unique: usize) -> Self {
+            let parent = Context::current();
+            let cx = match tang_otel::tracer() {
+                Some(t) => parent.with_span(
+                    t.span_builder("opencl.build")
+                        .start_with_context(t, &parent),
+                ),
+                None => parent,
+            };
+            Self {
+                cx,
+                start: SystemTime::now(),
+                kernels,
+                unique,
+                hits: AtomicUsize::new(0),
+                misses: AtomicUsize::new(0),
+                build_ns: AtomicU64::new(0),
+            }
+        }
+
+        /// One program, from `t0` to now (on a build thread).
+        pub fn program(&self, t0: SystemTime, hit: bool, src_bytes: usize) {
+            let Some(i) = inst() else { return };
+            let now = SystemTime::now();
+            let ms = now.duration_since(t0).unwrap_or_default().as_secs_f64() * 1e3;
+            self.build_ns
+                .fetch_add((ms * 1e6) as u64, Ordering::Relaxed);
+            let kv = if hit { &i.hit } else { &i.miss };
+            i.build_ms.record(ms, kv);
+            i.programs.add(1, kv);
+            (if hit { &self.hits } else { &self.misses }).fetch_add(1, Ordering::Relaxed);
+            // only misses get a span each: a warm start loads hundreds of cached binaries
+            if !hit {
+                tang_otel::span_at(
+                    "opencl.program.compile",
+                    &self.cx,
+                    t0,
+                    now,
+                    vec![
+                        KeyValue::new("tang.cl.cache", "miss"),
+                        KeyValue::new("tang.cl.source_bytes", src_bytes as i64),
+                        KeyValue::new("tang.cl.build_ms", ms),
+                    ],
+                );
+            }
+        }
+
+        pub fn end(&self, device: &str) {
+            if inst().is_none() {
+                return;
+            }
+            let now = SystemTime::now();
+            let span = self.cx.span();
+            for kv in [
+                KeyValue::new("tang.cl.device", device.to_string()),
+                KeyValue::new("tang.cl.kernels", self.kernels as i64),
+                KeyValue::new("tang.cl.programs", self.unique as i64),
+                KeyValue::new(
+                    "tang.cl.cache_hits",
+                    self.hits.load(Ordering::Relaxed) as i64,
+                ),
+                KeyValue::new(
+                    "tang.cl.cache_misses",
+                    self.misses.load(Ordering::Relaxed) as i64,
+                ),
+                KeyValue::new(
+                    "tang.cl.build_ms_total",
+                    self.build_ns.load(Ordering::Relaxed) as f64 * 1e-6,
+                ),
+                KeyValue::new(
+                    "tang.cl.wall_ms",
+                    now.duration_since(self.start)
+                        .unwrap_or_default()
+                        .as_secs_f64()
+                        * 1e3,
+                ),
+            ] {
+                span.set_attribute(kv);
+            }
+            span.end();
+        }
+    }
+
+    /// Profile this program run? Every `TANG_OTEL_CL_SAMPLE`th run (default
+    /// 64; 0 = never), and only with telemetry on.
+    #[inline]
+    pub fn sample() -> bool {
+        static EVERY: OnceLock<u64> = OnceLock::new();
+        static N: AtomicU64 = AtomicU64::new(0);
+        let every = *EVERY.get_or_init(|| {
+            if tang_otel::enabled() {
+                tang_otel::env_u64("TANG_OTEL_CL_SAMPLE", 64)
+            } else {
+                0
+            }
+        });
+        tang_otel::every(&N, every)
+    }
+
+    /// A profiled run's kernels: `(kernel index, queued, start, end)` in device ns.
+    pub fn run(start: SystemTime, enqueue_ns: u64, times: &[(usize, u64, u64, u64)]) {
+        let Some(i) = inst() else { return };
+        if times.is_empty() {
+            return;
+        }
+        let end = SystemTime::now();
+        let first_q = times.iter().map(|t| t.1).min().unwrap_or(0);
+        let last_e = times.iter().map(|t| t.3).max().unwrap_or(0);
+        let mut busy = 0u64;
+        let mut top = (0usize, 0u64);
+        for &(k, _, s, e) in times {
+            let d = e.saturating_sub(s);
+            busy += d;
+            if d > top.1 {
+                top = (k, d);
+            }
+            i.kernel_ms.record(d as f64 * 1e-6, &[]);
+        }
+        let span_ms = last_e.saturating_sub(first_q) as f64 * 1e-6;
+        i.run_ms.record(span_ms, &[]);
+        let cx = Context::current();
+        tang_otel::span_at(
+            "opencl.run",
+            &cx,
+            start,
+            end,
+            vec![
+                KeyValue::new("tang.cl.kernels", times.len() as i64),
+                KeyValue::new("tang.cl.enqueue_ms", enqueue_ns as f64 * 1e-6),
+                KeyValue::new("tang.cl.queued_to_complete_ms", span_ms),
+                KeyValue::new("tang.cl.device_busy_ms", busy as f64 * 1e-6),
+                KeyValue::new("tang.cl.top_kernel", top.0 as i64),
+                KeyValue::new("tang.cl.top_kernel_ms", top.1 as f64 * 1e-6),
+            ],
+        );
+        // per-kernel children on request (hundreds per decode step)
+        if std::env::var("TANG_OTEL_CL_KERNEL_SPANS").as_deref() == Ok("1") {
+            // device clock -> wall: the last kernel ended (about) when the wait returned
+            let to_wall =
+                |ns: u64| end - std::time::Duration::from_nanos(last_e.saturating_sub(ns));
+            for &(k, q, s, e) in times {
+                tang_otel::span_at(
+                    "opencl.kernel",
+                    &cx,
+                    to_wall(s),
+                    to_wall(e),
+                    vec![
+                        KeyValue::new("tang.cl.kernel", k as i64),
+                        KeyValue::new("tang.cl.queued_ms", s.saturating_sub(q) as f64 * 1e-6),
+                    ],
+                );
+            }
+        }
     }
 }
 

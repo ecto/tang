@@ -653,6 +653,10 @@ impl Program {
             }
             #[cfg(feature = "opencl")]
             Runtime::OpenCl(d) => {
+                #[cfg(feature = "otel")]
+                if crate::opencl::tel::sample() {
+                    return self.run_opencl_profiled(d);
+                }
                 for &i in &self.order {
                     self.run_opencl(d, i, false);
                 }
@@ -675,6 +679,38 @@ impl Program {
             k.workgroup_size as usize,
             timed,
         )
+    }
+
+    /// [`run`](Self::run) with every kernel's event kept, then waited on
+    /// and reported (telemetry's sampled runs).
+    #[cfg(all(feature = "opencl", feature = "otel"))]
+    fn run_opencl_profiled(&self, d: &ClDevice) {
+        let Storage::OpenCl { kernels, .. } = &self.storage else {
+            panic!("program and runtime are on different backends")
+        };
+        let start = std::time::SystemTime::now();
+        let t0 = std::time::Instant::now();
+        let evs: Vec<_> = self
+            .order
+            .iter()
+            .map(|&i| {
+                let k = &self.program.kernels[i];
+                (
+                    i,
+                    d.launch_event(kernels, i, k.count as usize, k.workgroup_size as usize),
+                )
+            })
+            .collect();
+        let enqueue_ns = t0.elapsed().as_nanos() as u64;
+        d.flush();
+        let times: Vec<_> = evs
+            .into_iter()
+            .map(|(i, ev)| {
+                let (q, s, e) = d.event_times(ev);
+                (i, q, s, e)
+            })
+            .collect();
+        crate::opencl::tel::run(start, enqueue_ns, &times);
     }
 
     #[cfg(feature = "cuda")]

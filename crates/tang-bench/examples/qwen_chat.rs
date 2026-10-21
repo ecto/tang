@@ -6,6 +6,7 @@
 //! ```text
 //! qwen_chat <model dir> [--ctx 2048] [--gen 48] [--system FILE] [--temp 0] [--cold]
 //!     --cold: forget the cache every turn (check: replies must not change)
+//!     --traceparent TP: with `--features otel`, spans join that W3C trace
 //! ```
 use std::time::Instant;
 
@@ -31,8 +32,16 @@ fn main() {
         temperature: opt("--temp").map_or(0.0, |v| v.parse().unwrap()),
         ..Default::default()
     };
+    #[cfg(feature = "otel")]
+    let _otel = tang_bench::otel_init("qwen_chat");
     let t = Instant::now();
     let mut s = Session::open(&args[0], ctx).expect("open");
+    // --traceparent 00-<trace>-<span>-01: nest this run's spans under a caller's
+    if let Some(tp) = opt("--traceparent") {
+        if !s.set_trace_parent(Some(&tp)) {
+            eprintln!("traceparent ignored (bad, or built without otel)");
+        }
+    }
     eprintln!(
         "loaded in {:.1}s on {}",
         t.elapsed().as_secs_f64(),

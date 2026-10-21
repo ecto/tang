@@ -22,6 +22,7 @@ safetensors = { workspace = true }
 tang-compile = { workspace = true }
 # CPU runtime (`cpu::CpuProgram`): dlopen the compiled C
 libloading = "0.8"
+tang-otel = { workspace = true, optional = true }
 # CUDA backend: the driver and nvrtc are loaded at run time, so the
 # feature builds (and the binary runs, falling back to wgpu) on machines
 # without NVIDIA hardware or a CUDA toolkit.
@@ -39,6 +40,8 @@ cuda = ["dep:cudarc"]
 # OpenCL (dlopen'ed libOpenCL, binary cache): src/opencl.rs, e.g. the K1's Adreno 740
 opencl = []
 glsl = ["dep:shaderc", "dep:naga"]
+# OpenTelemetry (crates/tang-otel): OpenCL program builds and sampled kernel times
+otel = ["dep:tang-otel"]
 
 [[example]]
 name = "physics_surrogate"

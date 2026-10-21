@@ -24,6 +24,7 @@ members = [
     "crates/tang-sheffer",
     "crates/tang-sheffer-wasm",
     "crates/tang-llm",
+    "crates/tang-otel",
     "crates/tang-moe",
     "crates/tang-llm-ios",
     "crates/cram-codec",
@@ -82,6 +83,7 @@ tang-3dgs = { version = "0.1", path = "crates/tang-3dgs" }
 tang-holo = { version = "0.1", path = "crates/tang-holo" }
 tang-sheffer = { version = "0.1", path = "crates/tang-sheffer" }
 tang-llm = { version = "0.1", path = "crates/tang-llm" }
+tang-otel = { version = "0.1", path = "crates/tang-otel" }
 cram-codec = { version = "0.1", path = "crates/cram-codec" }
 tang-moe = { version = "0.1", path = "crates/tang-moe" }
 iroh = "0.96"

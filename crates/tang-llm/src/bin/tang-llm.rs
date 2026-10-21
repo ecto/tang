@@ -560,6 +560,8 @@ fn serve_flash(args: &[String]) -> Result<()> {
         let mut val = || it.next().with_context(|| format!("{a} needs a value"));
         match a.as_str() {
             "--host" => host = val()?.clone(),
+            // live OTLP/HTTP export (otel builds); the default is the local file only
+            "--otel-live" => std::env::set_var("TANG_OTEL_LIVE", "1"),
             "--port" => port = val()?.parse()?,
             "--ctx" => s.ctx = val()?.parse()?,
             "--mtp" => s.mtp = Some(PathBuf::from(val()?)),
@@ -637,7 +639,7 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
     }
     let spec = args
         .first()
-        .context("usage: tang-llm serve <model> [--host H] [--port P] [--ctx N] [--api-key-file F] [--f32 | --q4] [--no-speculate] [--draft-model M] [--kv-slots N|auto] [--kv-ttl SECS]")?
+        .context("usage: tang-llm serve <model> [--host H] [--port P] [--ctx N] [--api-key-file F] [--f32 | --q4] [--no-speculate] [--draft-model M] [--kv-slots N|auto] [--kv-ttl SECS] [--otel-live]")?
         .clone();
     let (mut port, mut ctx, mut dtype) = (8911u16, 32_768usize, Dtype::Bf16);
     let mut host = "127.0.0.1".to_string();
@@ -658,6 +660,8 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--host" => host = it.next().context("--host H")?.clone(),
+            // live OTLP/HTTP export (otel builds); the default is the local file only
+            "--otel-live" => std::env::set_var("TANG_OTEL_LIVE", "1"),
             "--port" => port = it.next().context("--port P")?.parse()?,
             "--ctx" => ctx = it.next().context("--ctx N")?.parse()?,
             "--image-pipeline" => {
