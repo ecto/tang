@@ -889,11 +889,12 @@ pub fn tune_key(rt: &Runtime, dims: &QwenDims) -> String {
 }
 
 /// The knobs the tuner sets (decode GEMV shape, OpenCL prefill register block).
-pub const TUNE_KNOBS: [&str; 4] = [
+pub const TUNE_KNOBS: [&str; 5] = [
     "TANG_DECODE_WARPS",
     "TANG_DECODE_ROWS",
     "TANG_CL_MM",
     "TANG_CL_MM_LANES",
+    "TANG_CL_MM_VEC",
 ];
 
 /// Set this device and model's tuned knobs from [`tune_path`], except any
@@ -1048,23 +1049,27 @@ pub fn tune(dir: &str, budget: f64) -> Vec<(String, String)> {
     if rt.kind() == BackendKind::OpenCl {
         let seq = 64;
         let toks: Vec<usize> = (0..seq).map(|i| 1000 + i).collect();
-        let mut best: Option<(f64, String, String)> = None;
+        let mut best: Option<(f64, String, String, String)> = None;
         // (block RMxRNxWG, lanes along k): work-groups of a wave (64) or
         // two, local partials RM*RN*WG floats within the Adreno's 32 KB
-        for (mm, lanes) in [
-            ("0x4x64", "16"),
-            ("0x4x128", "16"),
-            ("0x4x64", "8"),
-            ("4x4x64", "16"),
-            ("4x4x128", "16"),
-            ("4x4x128", "32"),
-            ("4x4x64", "8"),
-            ("4x8x64", "16"),
-            ("8x4x64", "16"),
-            ("2x8x128", "16"),
-            ("4x4x256", "32"),
-            ("8x8x64", "16"),
-            ("4x4x64", "1"),
+        for (mm, lanes, vec) in [
+            ("0x4x64", "16", "1"),
+            ("0x4x128", "16", "1"),
+            ("0x4x64", "8", "1"),
+            ("4x4x64", "16", "1"),
+            ("4x4x128", "16", "1"),
+            ("4x4x128", "32", "1"),
+            ("4x4x64", "8", "1"),
+            ("4x8x64", "16", "1"),
+            ("8x4x64", "16", "1"),
+            ("2x8x128", "16", "1"),
+            ("4x4x256", "32", "1"),
+            ("8x8x64", "16", "1"),
+            ("4x4x64", "1", "1"),
+            ("4x4x64", "16", "4"),
+            ("4x4x128", "16", "4"),
+            ("4x4x64", "8", "4"),
+            ("2x4x64", "16", "4"),
         ] {
             if !settle(hot, 75.0, load, deadline) {
                 eprintln!("tune: budget spent");
@@ -1072,6 +1077,7 @@ pub fn tune(dir: &str, budget: f64) -> Vec<(String, String)> {
             }
             std::env::set_var("TANG_CL_MM", mm);
             std::env::set_var("TANG_CL_MM_LANES", lanes);
+            std::env::set_var("TANG_CL_MM_VEC", vec);
             let s = Step::new(
                 &rt,
                 &dims,
@@ -1083,19 +1089,21 @@ pub fn tune(dir: &str, budget: f64) -> Vec<(String, String)> {
             s.prefill(&rt, &toks, 0);
             let ms = s.prog.time(&rt, 3);
             eprintln!(
-                "tune: prefill {seq} tokens, block {mm} lanes {lanes}: {ms:.1} ms ({:.0} tok/s, gpu {:.1} C)",
+                "tune: prefill {seq} tokens, block {mm} lanes {lanes} vec {vec}: {ms:.1} ms ({:.0} tok/s, gpu {:.1} C)",
                 seq as f64 * 1e3 / ms,
                 gpu_temp().unwrap_or(0.0)
             );
             if best.as_ref().is_none_or(|b| ms < b.0) {
-                best = Some((ms, mm.to_string(), lanes.to_string()));
+                best = Some((ms, mm.to_string(), lanes.to_string(), vec.to_string()));
             }
         }
         std::env::remove_var("TANG_CL_MM");
         std::env::remove_var("TANG_CL_MM_LANES");
-        if let Some((_, mm, lanes)) = best {
+        std::env::remove_var("TANG_CL_MM_VEC");
+        if let Some((_, mm, lanes, vec)) = best {
             won.push(("TANG_CL_MM".to_string(), mm));
             won.push(("TANG_CL_MM_LANES".to_string(), lanes));
+            won.push(("TANG_CL_MM_VEC".to_string(), vec));
         }
     }
     // merge into the tuning file
@@ -1309,23 +1317,32 @@ pub fn prefill_bench(dir: &str, sizes: &[usize], gen: usize, check: bool) -> Vec
     if !check || rt.kind() != BackendKind::OpenCl {
         return out;
     }
-    let saved: Vec<(&str, Option<String>)> = ["TANG_CL_PREFILL_Q4", "TANG_CL_PREFILL_F16"]
-        .into_iter()
-        .map(|k| (k, std::env::var(k).ok()))
-        .collect();
-    let variant = |q4: &str, f16: &str, seq: usize| -> Vec<f32> {
+    let saved: Vec<(&str, Option<String>)> = [
+        "TANG_CL_PREFILL_Q4",
+        "TANG_CL_PREFILL_F16",
+        "TANG_CL_MM_VEC",
+    ]
+    .into_iter()
+    .map(|k| (k, std::env::var(k).ok()))
+    .collect();
+    let variant = |q4: &str, f16: &str, vec: &str, seq: usize| -> Vec<f32> {
         std::env::set_var("TANG_CL_PREFILL_Q4", q4);
         std::env::set_var("TANG_CL_PREFILL_F16", f16);
+        std::env::set_var("TANG_CL_MM_VEC", vec);
         let s = build(seq);
         s.prefill(&rt, &ids[..seq], 0);
         s.logits(&rt)
     };
     for &seq in &sorted {
-        let base = variant("0", "0", seq);
+        let base = variant("0", "0", "1", seq);
         let top = argmax(&base);
         let max_logit = base.iter().fold(0.0f32, |m, x| m.max(x.abs()));
-        for (name, q4, f16) in [("q4", "1", "0"), ("q4+fp16", "1", "1")] {
-            let l = variant(q4, f16, seq);
+        for (name, q4, f16, vec) in [
+            ("q4", "1", "0", "1"),
+            ("q4 uint4", "1", "0", "4"),
+            ("q4+fp16", "1", "1", "1"),
+        ] {
+            let l = variant(q4, f16, vec, seq);
             let max_abs = l
                 .iter()
                 .zip(&base)

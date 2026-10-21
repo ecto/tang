@@ -140,7 +140,15 @@ pub(super) fn prefill_tiles(g: &TensorGraph, opts: &DecodeOpts) -> (TensorGraph,
         let shape: Vec<usize> = n.shape.iter().map(|d| d.n()).collect();
         let wide = shape.len() >= 2 && shape[shape.len() - 1] >= 16 && shape[shape.len() - 2] >= 16;
         let reads_packed = g.deps(i).iter().any(|d| packed.contains(d));
-        if c.monoid.is_some() && red >= 64 && wide && !reads_packed {
+        // a product of two tensors (a matmul), not a norm's Σ x² over one:
+        // the q/k head norms ([tokens, heads] over head_dim) ran as a
+        // 64-item WGSL tile, 1.2 ms each on the Adreno, where the warp
+        // reduction spreads them over every lane
+        let mut srcs: Vec<usize> = c.args.iter().map(|a| a.src.n()).collect();
+        srcs.sort_unstable();
+        srcs.dedup();
+        let bilinear = srcs.len() >= 2;
+        if c.monoid.is_some() && red >= 64 && wide && !reads_packed && bilinear {
             out.set_schedule(TensorId::from_index(i), 0, (t[0], t[1], t[2]), (r[0], r[1]));
             tiles.push(i);
         }
@@ -432,6 +440,16 @@ fn q4_none(root: usize, line: u32) -> Option<super::cuda_gemv::Kernel> {
     None
 }
 
+/// Packed words per lane step of the q4 prefill kernel: `TANG_CL_MM_VEC`
+/// (1, the default: one word; 4: a uint4 per column, 32 weights, with the
+/// affine `s·Σqx + b·Σx` form — 1.5x slower on the Mac, a tuner candidate).
+pub fn mm_vec() -> usize {
+    match std::env::var("TANG_CL_MM_VEC").as_deref() {
+        Ok("4") => 4,
+        _ => 1,
+    }
+}
+
 /// First line of a kernel that is OpenCL C already (no transliteration).
 pub const OPENCL_NATIVE: &str = "// tang-compile: OpenCL C (native)";
 
@@ -709,9 +727,10 @@ impl TensorGraph {
         let mut s = String::new();
         writeln!(
             s,
-            "{OPENCL_NATIVE}: {m}x{n}x{} matmul over 4-bit weights, {rm}x{rn} registers, {lanes} lanes along k, groups of {wg}{}",
+            "{OPENCL_NATIVE}: {m}x{n}x{} matmul over 4-bit weights, {rm}x{rn} registers, {lanes} lanes along k, groups of {wg}{}{}",
             gs * js,
-            if f16 { ", fp16" } else { "" }
+            if f16 { ", fp16" } else { "" },
+            if mm_vec() == 4 && !f16 && js % 32 == 0 { ", uint4" } else { "" }
         )
         .unwrap();
         s.push_str(OPENCL_PRELUDE);
@@ -766,10 +785,50 @@ impl TensorGraph {
             }
         }
         let wpg = js / 8;
+        // vec4: each lane takes 4 consecutive packed words (32 weights, one
+        // group) per step: a 16-byte load per column, 8 float4 of x per row
+        let vec4 = !f16 && wpg % 4 == 0 && mm_vec() == 4;
+        let step = if vec4 { 4 } else { 1 };
+        // affine dequantization `q·s + b` (MLX): Σ q·x and Σ x per step,
+        // scaled once — `affine` = (nibble var, scale var, bias var)
+        let affine = vec4
+            .then(|| {
+                let en = ebody.nodes_slice();
+                let var = |e: tang_expr::ExprId| match en[e.index() as usize] {
+                    Node::Var(v) => Some(v as usize),
+                    _ => None,
+                };
+                let Node::Add(l, r) = en[eout.index() as usize] else {
+                    return None;
+                };
+                let (m, b) = match (
+                    en[l.index() as usize],
+                    var(r),
+                    en[r.index() as usize],
+                    var(l),
+                ) {
+                    (Node::Mul(x, y), Some(b), _, _) => ((x, y), b),
+                    (_, _, Node::Mul(x, y), Some(b)) => ((x, y), b),
+                    _ => return None,
+                };
+                let (x, y) = (var(m.0)?, var(m.1)?);
+                let is_n = |v: usize| matches!(roles[v], Some(Role::Nibble { .. }));
+                let is_g = |v: usize| matches!(roles[v], Some(Role::Group { .. }));
+                let (q, sc) = if is_n(x) && is_g(y) {
+                    (x, y)
+                } else if is_n(y) && is_g(x) {
+                    (y, x)
+                } else {
+                    return None;
+                };
+                is_g(b).then_some((q, sc, b))
+            })
+            .flatten();
         writeln!(
             s,
-            "    for (int kw = lane; kw < {}; kw += {lanes}) {{",
-            gs * wpg
+            "    for (int kw = lane * {step}; kw < {}; kw += {}) {{",
+            gs * wpg,
+            lanes * step
         )
         .unwrap();
         writeln!(s, "        int kg = kw / {wpg}, kj = (kw % {wpg}) * 8;").unwrap();
@@ -791,82 +850,193 @@ impl TensorGraph {
                 }
             }
         }
-        writeln!(s, "        {{").unwrap();
-        writeln!(s, "            int kx = {} * kg + kj;", ax.coefs[2]).unwrap();
-        for i in 0..rm {
-            if f16 {
-                writeln!(
-                    s,
-                    "            tang_h4 xl{i} = TANG_H4(vload4(0, a{i} + kx)), xh{i} = TANG_H4(vload4(1, a{i} + kx));"
-                )
-                .unwrap();
-            } else {
-                writeln!(
-                    s,
-                    "            float4 xl{i} = vload4(0, a{i} + kx), xh{i} = vload4(1, a{i} + kx);"
-                )
-                .unwrap();
-            }
-        }
-        for j in 0..rn {
-            for (v, role) in roles.iter().enumerate() {
-                if let Some(Role::Nibble { buf, addr }) = role {
-                    writeln!(
-                        s,
-                        "            uint w{v}_{j} = ((__global const uint*)b{buf})[({} + {} * col{j} + {} * kg + kj) >> 3];",
-                        addr.offset, addr.coefs[dx], addr.coefs[2]
-                    )
-                    .unwrap();
-                }
-            }
-            let mut ws = Vec::new();
-            for q in 0..8 {
-                let var = |v: u16| -> String {
-                    match &roles[v as usize] {
-                        Some(Role::Nibble { .. }) => {
-                            format!("(float)((w{v}_{j} >> {}) & 15u)", 4 * q)
-                        }
-                        Some(Role::Group { .. }) => format!("g{v}_{j}"),
-                        None => unreachable!("x in the dequantization"),
-                    }
-                };
-                let mut body = String::new();
-                let outs = emit_scalar(&mut body, ebody, &[eout], &format!("d{j}_{q}_"), &var);
-                for line in body.lines() {
-                    writeln!(s, "            {}", line.replacen("let ", "float ", 1)).unwrap();
-                }
-                ws.push(outs[0].clone());
-            }
-            let ty = if f16 { "tang_h4" } else { "float4" };
-            let wrap = |v: String| if f16 { format!("TANG_H4({v})") } else { v };
-            writeln!(
-                s,
-                "            {ty} wl{j} = {}, wh{j} = {};",
-                wrap(format!(
-                    "(float4)({}, {}, {}, {})",
-                    ws[0], ws[1], ws[2], ws[3]
-                )),
-                wrap(format!(
-                    "(float4)({}, {}, {}, {})",
-                    ws[4], ws[5], ws[6], ws[7]
-                ))
-            )
-            .unwrap();
-        }
-        for i in 0..rm {
+        if vec4 {
+            writeln!(s, "        {{").unwrap();
+            writeln!(s, "            int kx = {} * kg + kj;", ax.coefs[2]).unwrap();
             for j in 0..rn {
+                for (v, role) in roles.iter().enumerate() {
+                    if let Some(Role::Nibble { buf, addr }) = role {
+                        writeln!(
+                            s,
+                            "            uint4 w{v}_{j} = vload4(0, (__global const uint*)b{buf} + (({} + {} * col{j} + {} * kg + kj) >> 3));",
+                            addr.offset, addr.coefs[dx], addr.coefs[2]
+                        )
+                        .unwrap();
+                    }
+                }
+            }
+            // partial sums of this step: Σ q·x (affine) or Σ w·x, and Σ x
+            for i in 0..rm {
+                for j in 0..rn {
+                    writeln!(s, "            float d{i}_{j} = 0.0f;").unwrap();
+                }
+                if affine.is_some() {
+                    writeln!(s, "            float4 xs{i} = (float4)(0.0f);").unwrap();
+                }
+            }
+            // nibbles as floats: 0x4b000000 | q is 2^23 + q
+            let nib = |v: usize, j: usize, u: usize| {
+                let c = ["x", "y", "z", "w"][u / 2];
+                let sh = if u % 2 == 0 {
+                    "(uint4)(0u, 4u, 8u, 12u)"
+                } else {
+                    "(uint4)(16u, 20u, 24u, 28u)"
+                };
+                format!("(as_float4((uint4)(0x4b000000u) | (((uint4)(w{v}_{j}.{c}) >> {sh}) & (uint4)(15u))) - (float4)(8388608.0f))")
+            };
+            // one float4 of k at a time: RM x and RN weight vectors live
+            for u in 0..8 {
+                writeln!(s, "            {{").unwrap();
+                for i in 0..rm {
+                    writeln!(s, "                float4 x{i} = vload4({u}, a{i} + kx);").unwrap();
+                    if affine.is_some() {
+                        writeln!(s, "                xs{i} += x{i};").unwrap();
+                    }
+                }
+                for j in 0..rn {
+                    match affine {
+                        Some((q, _, _)) => {
+                            writeln!(s, "                float4 q{j} = {};", nib(q, j, u)).unwrap();
+                        }
+                        None => {
+                            let mut ws = Vec::new();
+                            for e in 0..4 {
+                                let var = |v: u16| -> String {
+                                    match &roles[v as usize] {
+                                        Some(Role::Nibble { .. }) => {
+                                            format!("{}.s{e}", nib(v as usize, j, u))
+                                        }
+                                        Some(Role::Group { .. }) => format!("g{v}_{j}"),
+                                        None => unreachable!("x in the dequantization"),
+                                    }
+                                };
+                                let mut body = String::new();
+                                let outs = emit_scalar(
+                                    &mut body,
+                                    ebody,
+                                    &[eout],
+                                    &format!("d{j}_{u}_{e}_"),
+                                    &var,
+                                );
+                                for line in body.lines() {
+                                    writeln!(
+                                        s,
+                                        "                {}",
+                                        line.replacen("let ", "float ", 1)
+                                    )
+                                    .unwrap();
+                                }
+                                ws.push(outs[0].clone());
+                            }
+                            writeln!(
+                                s,
+                                "                float4 q{j} = (float4)({}, {}, {}, {});",
+                                ws[0], ws[1], ws[2], ws[3]
+                            )
+                            .unwrap();
+                        }
+                    }
+                }
+                for i in 0..rm {
+                    for j in 0..rn {
+                        writeln!(s, "                d{i}_{j} += dot(x{i}, q{j});").unwrap();
+                    }
+                }
+                writeln!(s, "            }}").unwrap();
+            }
+            for i in 0..rm {
+                if affine.is_some() {
+                    writeln!(s, "            float xt{i} = dot(xs{i}, (float4)(1.0f));").unwrap();
+                }
+                for j in 0..rn {
+                    match affine {
+                        Some((_, sc, bi)) => writeln!(
+                            s,
+                            "            acc{i}_{j} += g{sc}_{j} * d{i}_{j} + g{bi}_{j} * xt{i};"
+                        )
+                        .unwrap(),
+                        None => writeln!(s, "            acc{i}_{j} += d{i}_{j};").unwrap(),
+                    }
+                }
+            }
+        } else {
+            writeln!(s, "        {{").unwrap();
+            writeln!(s, "            int kx = {} * kg + kj;", ax.coefs[2]).unwrap();
+            for i in 0..rm {
                 if f16 {
                     writeln!(
                         s,
-                        "            acc{i}_{j} += TANG_HDOT(xl{i}, wl{j}, xh{i}, wh{j});"
+                        "            tang_h4 xl{i} = TANG_H4(vload4(0, a{i} + kx)), xh{i} = TANG_H4(vload4(1, a{i} + kx));"
                     )
                     .unwrap();
                 } else {
                     writeln!(
                         s,
-                        "            acc{i}_{j} += dot(xl{i}, wl{j}) + dot(xh{i}, wh{j});"
+                        "            float4 xl{i} = vload4(0, a{i} + kx), xh{i} = vload4(1, a{i} + kx);"
                     )
                     .unwrap();
+                }
+            }
+            for j in 0..rn {
+                for (v, role) in roles.iter().enumerate() {
+                    if let Some(Role::Nibble { buf, addr }) = role {
+                        writeln!(
+                            s,
+                            "            uint w{v}_{j} = ((__global const uint*)b{buf})[({} + {} * col{j} + {} * kg + kj) >> 3];",
+                            addr.offset, addr.coefs[dx], addr.coefs[2]
+                        )
+                        .unwrap();
+                    }
+                }
+                let mut ws = Vec::new();
+                for q in 0..8 {
+                    let var = |v: u16| -> String {
+                        match &roles[v as usize] {
+                            Some(Role::Nibble { .. }) => {
+                                format!("(float)((w{v}_{j} >> {}) & 15u)", 4 * q)
+                            }
+                            Some(Role::Group { .. }) => format!("g{v}_{j}"),
+                            None => unreachable!("x in the dequantization"),
+                        }
+                    };
+                    let mut body = String::new();
+                    let outs = emit_scalar(&mut body, ebody, &[eout], &format!("d{j}_{q}_"), &var);
+                    for line in body.lines() {
+                        writeln!(s, "            {}", line.replacen("let ", "float ", 1)).unwrap();
+                    }
+                    ws.push(outs[0].clone());
+                }
+                let ty = if f16 { "tang_h4" } else { "float4" };
+                let wrap = |v: String| if f16 { format!("TANG_H4({v})") } else { v };
+                writeln!(
+                    s,
+                    "            {ty} wl{j} = {}, wh{j} = {};",
+                    wrap(format!(
+                        "(float4)({}, {}, {}, {})",
+                        ws[0], ws[1], ws[2], ws[3]
+                    )),
+                    wrap(format!(
+                        "(float4)({}, {}, {}, {})",
+                        ws[4], ws[5], ws[6], ws[7]
+                    ))
+                )
+                .unwrap();
+            }
+            for i in 0..rm {
+                for j in 0..rn {
+                    if f16 {
+                        writeln!(
+                            s,
+                            "            acc{i}_{j} += TANG_HDOT(xl{i}, wl{j}, xh{i}, wh{j});"
+                        )
+                        .unwrap();
+                    } else {
+                        writeln!(
+                            s,
+                            "            acc{i}_{j} += dot(xl{i}, wl{j}) + dot(xh{i}, wh{j});"
+                        )
+                        .unwrap();
+                    }
                 }
             }
         }
