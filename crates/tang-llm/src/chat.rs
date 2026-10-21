@@ -79,7 +79,10 @@ impl Template {
         // whenever `tools is defined`).
         let tools = tools
             .filter(|t| t.as_array().is_some_and(|a| !a.is_empty()))
-            .map_or(minijinja::Value::UNDEFINED, minijinja::Value::from_serialize);
+            .map_or(
+                minijinja::Value::UNDEFINED,
+                minijinja::Value::from_serialize,
+            );
         Ok(t.render(minijinja::context! {
             messages => messages,
             tools => tools,
