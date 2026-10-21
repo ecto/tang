@@ -96,6 +96,9 @@ pub struct Model<D: ComputeDevice> {
     pub kvcomp: std::sync::Mutex<Option<crate::kvcomp::KvComp<D::Buffer>>>,
     /// Faster implementations registered for this device and model (see [`crate::ext`]).
     ext: crate::ext::Ext<D>,
+    /// Weights an extension loaded itself ([`crate::ext::Loader`]): `layers` is empty and
+    /// only its step override runs the model.
+    external: Option<crate::ext::External>,
 }
 
 pub use crate::blocks::Cache;
@@ -146,6 +149,19 @@ impl<D: ComputeDevice> Model<D> {
     pub fn load(dev: D, dir: &Path, max_ctx: usize, dtype: Dtype) -> Result<Self> {
         let cfg = Config::from_json(&std::fs::read(dir.join("config.json"))?)?;
         cfg.query_rescale()?;
+        let quant = match (&cfg.quantization, dtype) {
+            (Some(_), _) | (None, Dtype::Q4) => "q4",
+            (None, Dtype::Bf16) => "bf16",
+            (None, Dtype::F32) => "f32",
+        };
+        let target = crate::ext::target(&dev, &cfg, quant);
+        if let Some(e) = tang_compute::ext::select::<crate::ext::Loader<D>>(&target) {
+            let max_ctx = max_ctx.min(cfg.max_position_embeddings);
+            if let Some(r) = (e.imp.0)(&dev, dir, &cfg, max_ctx) {
+                eprintln!("tang-llm: weights loaded by {}", e.name);
+                return Ok(Self::external_shell(dev, cfg, max_ctx, target, r?));
+            }
+        }
         let w = Weights::open(dir)?;
         let gemma = cfg.is_gemma();
         // Multimodal checkpoints keep the language model under `language_model.`.
@@ -294,22 +310,7 @@ impl<D: ComputeDevice> Model<D> {
         let norm = vec(&format!("{base}norm.weight"))?;
 
         let max_ctx = max_ctx.min(cfg.max_position_embeddings);
-        let hd = cfg.head_dim();
-        let scale = cfg.rope_scaling.as_ref().map_or(1.0, |s| s.factor);
-        let mut ropes = Vec::new();
-        let (cos, sin) = match cfg.rope_scaling.as_ref() {
-            Some(y) if y.rope_type.as_deref() == Some("yarn") => {
-                let (inv, mscale) = yarn(hd, cfg.rope_theta, y, cfg.max_position_embeddings);
-                rope_tables_inv(&inv, max_ctx, mscale)
-            }
-            _ => rope_tables(hd, max_ctx, cfg.rope_theta, scale),
-        };
-        ropes.push((dev.upload(&cos), dev.upload(&sin)));
-        if gemma {
-            let base = cfg.rope_local_base_freq.unwrap_or(10_000.0);
-            let (cos, sin) = rope_tables(hd, max_ctx, base, 1.0);
-            ropes.push((dev.upload(&cos), dev.upload(&sin)));
-        }
+        let ropes = build_ropes(&dev, &cfg, max_ctx);
         let embed_scale = gemma.then(|| bf16_round((cfg.hidden_size as f32).sqrt()));
         let dev_bf16 = dev.bf16_storage();
         let (n_layers, kv_dim) = (layers.len(), cfg.kv_dim());
@@ -372,10 +373,57 @@ impl<D: ComputeDevice> Model<D> {
             max_ctx,
             pool: new_pool(n_layers, kv_dim, kv_bf16, usize::MAX),
             kvcomp: std::sync::Mutex::new(None),
+            external: None,
         })
     }
 
-    /// Decoder layers.
+    /// A model whose weights extension `e` loaded: config, RoPE tables and a KV pool of
+    /// `e.kv_dim` per layer, no weights of its own.
+    fn external_shell(
+        dev: D,
+        cfg: Config,
+        max_ctx: usize,
+        target: tang_compute::ext::Target,
+        e: crate::ext::External,
+    ) -> Self {
+        let ropes = build_ropes(&dev, &cfg, max_ctx);
+        let kv_bf16 = dev.bf16_storage() && kv_bf16_default(&cfg);
+        let pool = new_pool(cfg.num_hidden_layers, e.kv_dim, kv_bf16, usize::MAX);
+        let none = || dev.alloc(1);
+        Self {
+            ext: crate::ext::Ext::resolve(target),
+            embed: none(),
+            norm: none(),
+            layers: Vec::new(),
+            lm_head: None,
+            ropes,
+            embed_scale: None,
+            vision: None,
+            qwen_vision: None,
+            max_ctx,
+            pool,
+            kvcomp: std::sync::Mutex::new(None),
+            external: Some(e),
+            cfg,
+            dev,
+        }
+    }
+
+    /// What an extension's loader returned, when it loaded this model's weights.
+    pub fn external(&self) -> Option<&crate::ext::External> {
+        self.external.as_ref()
+    }
+
+    /// Layers in the KV cache, and each one's K (or V) width: the model's own, or what an
+    /// external loader asked for (one rank's shard, say).
+    fn kv_shape(&self) -> (usize, usize) {
+        match &self.external {
+            Some(e) => (self.cfg.num_hidden_layers, e.kv_dim),
+            None => (self.layers.len(), self.cfg.kv_dim()),
+        }
+    }
+
+    /// Decoder layers (0 when an extension holds the weights).
     pub fn n_layers(&self) -> usize {
         self.layers.len()
     }
@@ -396,12 +444,8 @@ impl<D: ComputeDevice> Model<D> {
     /// before keep the old one.
     pub fn set_kv_f32(&mut self, f32: bool) {
         let max = blocks::lock(&self.pool).stats().max;
-        self.pool = new_pool(
-            self.layers.len(),
-            self.cfg.kv_dim(),
-            !f32 && self.dev.bf16_storage(),
-            max,
-        );
+        let (layers, kv_dim) = self.kv_shape();
+        self.pool = new_pool(layers, kv_dim, !f32 && self.dev.bf16_storage(), max);
     }
 
     /// Whether caches hold bf16 (else f32).
@@ -509,7 +553,8 @@ impl<D: ComputeDevice> Model<D> {
 
     /// Elements per position in [`read_rows`](Self::read_rows): every layer's K and V.
     pub fn row_elems(&self) -> usize {
-        2 * self.layers.len() * self.cfg.kv_dim()
+        let (layers, kv_dim) = self.kv_shape();
+        2 * layers * kv_dim
     }
 
     /// Positions `from..to` of `cache` as bf16 bits (exact for a bf16 cache, rounded from an f32
@@ -557,6 +602,11 @@ impl<D: ComputeDevice> Model<D> {
         cache: &mut Cache<D::Buffer>,
         all: bool,
     ) -> Result<Vec<f32>> {
+        // A model an extension loaded runs only through its step override.
+        if self.external.is_some() {
+            let mut segs = [Segment { tokens, cache, all }];
+            return self.forward_batch(&mut segs).map(|mut v| v.remove(0));
+        }
         let x = self.embed(tokens)?;
         self.forward_layers(x, tokens, cache, all, true, false, &[])
     }
@@ -1104,6 +1154,10 @@ impl<D: ComputeDevice> Model<D> {
         bound: bool,
         deepstack: &[D::Buffer],
     ) -> Result<()> {
+        anyhow::ensure!(
+            self.external.is_none(),
+            "this model's weights belong to an extension, whose step declined the call"
+        );
         let half = self.cfg.head_dim() / 2;
         let mut lent = Vec::with_capacity(parts.len());
         for (cache, n) in parts.iter_mut() {
@@ -1618,6 +1672,31 @@ fn kv_bf16_default(cfg: &Config) -> bool {
     }
 }
 
+/// The RoPE tables a model of `cfg` uses up to `max_ctx`: global, and (Gemma) local.
+fn build_ropes<D: ComputeDevice>(
+    dev: &D,
+    cfg: &Config,
+    max_ctx: usize,
+) -> Vec<(D::Buffer, D::Buffer)> {
+    let hd = cfg.head_dim();
+    let scale = cfg.rope_scaling.as_ref().map_or(1.0, |s| s.factor);
+    let mut ropes = Vec::new();
+    let (cos, sin) = match cfg.rope_scaling.as_ref() {
+        Some(y) if y.rope_type.as_deref() == Some("yarn") => {
+            let (inv, mscale) = yarn(hd, cfg.rope_theta, y, cfg.max_position_embeddings);
+            rope_tables_inv(&inv, max_ctx, mscale)
+        }
+        _ => rope_tables(hd, max_ctx, cfg.rope_theta, scale),
+    };
+    ropes.push((dev.upload(&cos), dev.upload(&sin)));
+    if cfg.is_gemma() {
+        let base = cfg.rope_local_base_freq.unwrap_or(10_000.0);
+        let (cos, sin) = rope_tables(hd, max_ctx, base, 1.0);
+        ropes.push((dev.upload(&cos), dev.upload(&sin)));
+    }
+    ropes
+}
+
 fn new_pool<B>(layers: usize, kv_dim: usize, bf16: bool, max_blocks: usize) -> Shared<B> {
     std::sync::Arc::new(std::sync::Mutex::new(blocks::Pool::new(
         layers, kv_dim, bf16, max_blocks,
@@ -1729,6 +1808,7 @@ mod conditioning_tests {
             max_ctx: 2048,
             pool: new_pool(2, 4, false, usize::MAX),
             ext: Default::default(),
+            external: None,
             dev,
             kvcomp: std::sync::Mutex::new(None),
         }
