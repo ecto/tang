@@ -28,24 +28,36 @@ use tang_compute::ComputeDevice;
 /// Which compressor.
 #[derive(Clone, Copy, Debug)]
 pub enum KvMode {
-    /// tang kvcodec, GPU layout, at relative step `rel`, `block`-token lanes.
-    Tkv { rel: f64, block: usize },
+    /// tang kvcodec, GPU layout, at relative step `rel`, `block`-token lanes of `lane_ch`
+    /// channels (0 = whole head).
+    Tkv {
+        rel: f64,
+        block: usize,
+        lane_ch: usize,
+    },
     /// KIVI-style `bits`-bit groups of `g`.
     Kivi { bits: u32, g: usize },
 }
 
 impl KvMode {
-    /// `tkv:0.07`, `kivi:4:32`.
+    /// `tkv:0.07`, `tkv:0.07:16`, `tkv:0.07:16:4` (rel, block, lane channels), `kivi:4:32`.
     pub fn parse(s: &str) -> Option<Self> {
         let p: Vec<&str> = s.split(':').collect();
         match p.as_slice() {
             ["tkv", r] => Some(Self::Tkv {
                 rel: r.parse().ok()?,
                 block: 128,
+                lane_ch: 0,
             }),
             ["tkv", r, b] => Some(Self::Tkv {
                 rel: r.parse().ok()?,
                 block: b.parse().ok()?,
+                lane_ch: 0,
+            }),
+            ["tkv", r, b, w] => Some(Self::Tkv {
+                rel: r.parse().ok()?,
+                block: b.parse().ok()?,
+                lane_ch: w.parse().ok()?,
             }),
             ["kivi", b, g] => Some(Self::Kivi {
                 bits: b.parse().ok()?,
@@ -53,6 +65,40 @@ impl KvMode {
             }),
             _ => None,
         }
+    }
+}
+
+/// Decode-speed experiments on top of a [`KvMode`] (`docs/compression-math-survey/
+/// tang-compress-kv-decode-speed.md`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KvOpts {
+    /// Keep the newest `window` positions raw (bf16): only blocks older than that are
+    /// compressed and decoded each step.
+    pub window: usize,
+    /// Decode the compressed rows once at compression time and keep the decoded tiles
+    /// resident (no per-step decode; resident memory is bf16 plus the compressed copy).
+    pub cached: bool,
+    /// Run the per-step decode without writing its output (attention then reads the rows
+    /// decoded once at compression time): the decode cost a fused decode + attention kernel
+    /// would still pay.
+    pub decode_only: bool,
+}
+
+impl KvOpts {
+    /// Parse `+cache`, `+win<N>`, `+nostore` suffixes off a mode string.
+    pub fn split(s: &str) -> (&str, Self) {
+        let mut it = s.split('+');
+        let base = it.next().unwrap_or("");
+        let mut o = Self::default();
+        for f in it {
+            match f {
+                "cache" => o.cached = true,
+                "nostore" => o.decode_only = true,
+                w if w.starts_with("win") => o.window = w[3..].parse().expect("+win<N>"),
+                _ => panic!("unknown kv option {f}"),
+            }
+        }
+        (base, o)
     }
 }
 
@@ -80,6 +126,9 @@ pub struct KvComp<B> {
     prior: Option<B>,
     /// Positions covered.
     pub upto: usize,
+    /// Decoded once per layer (first step), then the decoded tiles are reused.
+    pub cached: bool,
+    decoded: Vec<std::sync::atomic::AtomicBool>,
     /// Compressed bytes (streams, side tables and per-stream headers).
     pub bytes: usize,
     /// Values covered (`upto × layers × 2 × kv_dim`).
@@ -183,10 +232,21 @@ impl<D: ComputeDevice> Model<D> {
         cache: &crate::model::Cache<D::Buffer>,
         mode: KvMode,
     ) -> KvComp<D::Buffer> {
+        self.compress_kv_with(cache, mode, KvOpts::default())
+    }
+
+    /// [`Self::compress_kv`] with the decode-speed options of [`KvOpts`].
+    pub fn compress_kv_with(
+        &self,
+        cache: &crate::model::Cache<D::Buffer>,
+        mode: KvMode,
+        opts: KvOpts,
+    ) -> KvComp<D::Buffer> {
         let dev = &self.dev;
         let c = &self.cfg;
         let (nkv, hd, kvd, nl) = (c.kv_heads(), c.head_dim(), c.kv_dim(), self.n_layers());
-        let upto = cache.len / 128 * 128; // codec blocks must not straddle a pool block
+        // codec blocks must not straddle a pool block
+        let upto = cache.len.saturating_sub(opts.window) / 128 * 128;
         let rows = self.read_rows(cache, 0, upto);
         let re = self.row_elems();
         let table = cache.table.clone();
@@ -221,7 +281,11 @@ impl<D: ComputeDevice> Model<D> {
                     };
                     layers.push((kl, None));
                 }
-                KvMode::Tkv { rel, block } => {
+                KvMode::Tkv {
+                    rel,
+                    block,
+                    lane_ch,
+                } => {
                     let (cos, sin) = self.rope_tables(l);
                     let mut one = |x: &[f32], key: bool| -> Layer<D::Buffer> {
                         // [t][h][c] -> [h][t][c], K rotated back to pre-RoPE
@@ -257,6 +321,7 @@ impl<D: ComputeDevice> Model<D> {
                         p.pre_rope = false;
                         p.gpu = true;
                         p.block = block;
+                        p.lane_ch = lane_ch;
                         let s = encode(p, &y, upto);
                         let ph = &phys;
                         let row = move |h: usize, t: usize| ph(t) + h * hd;
@@ -266,6 +331,7 @@ impl<D: ComputeDevice> Model<D> {
                             &Placement {
                                 row: &row,
                                 rope_theta: key.then_some(0.0),
+                                decode_only: opts.decode_only,
                             },
                             0,
                             upto,
@@ -292,6 +358,8 @@ impl<D: ComputeDevice> Model<D> {
             layers,
             prior,
             upto,
+            cached: opts.cached,
+            decoded: (0..nl).map(|_| Default::default()).collect(),
             bytes,
             values: upto * nl * 2 * kvd,
         }
@@ -306,6 +374,9 @@ impl<D: ComputeDevice> Model<D> {
         vp: &D::Buffer,
         table: &D::Buffer,
     ) {
+        if kc.cached && kc.decoded[l].swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         let dev = &self.dev;
         let (cos, sin) = self.rope_buffers(l);
         let run = |lay: &Layer<D::Buffer>, out: &D::Buffer| match lay {

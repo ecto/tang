@@ -9,7 +9,7 @@
 //! compressed size of the covered rows in bits per value.
 use std::time::Instant;
 use tang_compute::MetalDevice;
-use tang_llm::kvcomp::KvMode;
+use tang_llm::kvcomp::{KvMode, KvOpts};
 use tang_llm::model::Model;
 
 fn flag(a: &[String], f: &str) -> Option<String> {
@@ -53,10 +53,13 @@ fn main() -> anyhow::Result<()> {
             let mut lg = model.forward(&ids[..ctx], &mut cache, false)?;
             let mut bpv = 16.0;
             let mut ctime = 0.0;
+            let mut covered = 0;
             if m != "bf16" {
-                let mode = KvMode::parse(m).expect("mode");
+                let (base, opts) = KvOpts::split(m);
+                let mode = KvMode::parse(base).expect("mode");
                 let t = Instant::now();
-                let kc = model.compress_kv(&cache, mode);
+                let kc = model.compress_kv_with(&cache, mode, opts);
+                covered = kc.upto;
                 ctime = t.elapsed().as_secs_f64();
                 bpv = 8.0 * kc.bytes as f64 / kc.values as f64;
                 *model.kvcomp.lock().unwrap() = Some(kc);
@@ -72,7 +75,7 @@ fn main() -> anyhow::Result<()> {
             let st = &times[4.min(n - 1)..];
             let ms = 1e3 * st.iter().sum::<f64>() / st.len() as f64;
             println!(
-                "{{\"ctx\":{ctx},\"mode\":\"{m}\",\"bpv\":{bpv:.3},\"ms_per_step\":{ms:.3},\"tok_s\":{:.2},\"nll\":{:.4},\"compress_s\":{ctime:.2}}}",
+                "{{\"ctx\":{ctx},\"mode\":\"{m}\",\"bpv\":{bpv:.3},\"ms_per_step\":{ms:.3},\"tok_s\":{:.2},\"nll\":{:.4},\"compress_s\":{ctime:.2},\"covered\":{covered}}}",
                 1e3 / ms,
                 tot / n as f64
             );

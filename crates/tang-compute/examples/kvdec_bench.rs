@@ -1,7 +1,7 @@
 //! Metal TKV / KIVI decode: bit-identity vs the CPU decoder and throughput.
 //!
 //!     cargo run --release -p tang-compute --features metal --example kvdec_bench -- \
-//!         <x.f32> <heads>x<T>x<hd> <k|v> <rel> [--copies N] [--block B] [--reps R]
+//!         <x.f32> <heads>x<T>x<hd> <k|v> <rel> [--copies N] [--block B] [--lane W] [--reps R]
 //!
 //! `--copies N` decodes N copies of the stream in one dispatch (≈ N layer×kind streams of a
 //! model's cache) to measure whole-cache decode time.
@@ -45,6 +45,9 @@ fn main() {
     );
     p.pre_rope = false;
     p.gpu = true;
+    if let Some(w) = flag(&a, "--lane") {
+        p.lane_ch = w.parse().unwrap();
+    }
     if let Some(b) = flag(&a, "--block") {
         p.block = b.parse().unwrap();
     }
@@ -61,6 +64,7 @@ fn main() {
             &Placement {
                 row: &row,
                 rope_theta: None,
+                decode_only: false,
             },
             0,
             n,
