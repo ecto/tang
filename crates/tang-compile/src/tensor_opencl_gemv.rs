@@ -385,6 +385,23 @@ inline float4 tang_r4(float4 v) {
 #endif
 "#;
 
+/// Work-items per register block of the packed-weight prefill kernel,
+/// splitting k between them: `TANG_CL_MM_LANES` (default 16; 1 is one item
+/// per block), at most and dividing the work-group size.
+pub fn mm_lanes(wg: usize) -> usize {
+    let l = std::env::var("TANG_CL_MM_LANES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&l| l > 0)
+        .unwrap_or(16)
+        .min(wg);
+    if wg % l == 0 {
+        l
+    } else {
+        1
+    }
+}
+
 /// First line of a kernel that is OpenCL C already (no transliteration).
 pub const OPENCL_NATIVE: &str = "// tang-compile: OpenCL C (native)";
 
@@ -630,13 +647,14 @@ impl TensorGraph {
         }
         let f16 = prefill_f16();
         let (rm, rn, wg) = mm_shape();
+        let lanes = mm_lanes(wg);
         let mb = m.div_ceil(rm);
         let nb = n.div_ceil(rn);
         let items = mb * nb;
         let mut s = String::new();
         writeln!(
             s,
-            "{OPENCL_NATIVE}: {m}x{n}x{} matmul over 4-bit weights, {rm}x{rn} registers, groups of {wg}{}",
+            "{OPENCL_NATIVE}: {m}x{n}x{} matmul over 4-bit weights, {rm}x{rn} registers, {lanes} lanes along k, groups of {wg}{}",
             gs * js,
             if f16 { ", fp16" } else { "" }
         )
@@ -660,8 +678,17 @@ impl TensorGraph {
             params.join(", ")
         )
         .unwrap();
-        writeln!(s, "    int g = (int)get_global_id(0);").unwrap();
-        writeln!(s, "    if (g >= {items}) return;").unwrap();
+        // `lanes` adjacent work-items share a block and split k word by
+        // word, so a column's packed row is read in contiguous runs of
+        // 4·lanes bytes (one item per block strides whole rows apart: an
+        // uncoalesced 4-byte load per column, which small caches pay for)
+        writeln!(
+            s,
+            "    int gid = (int)get_global_id(0), lane = gid % {lanes};"
+        )
+        .unwrap();
+        writeln!(s, "    int blk = gid / {lanes}, live = blk < {items};").unwrap();
+        writeln!(s, "    int g = min(blk, {});", items - 1).unwrap();
         writeln!(s, "    int cb = g % {nb}, rb = g / {nb};").unwrap();
         writeln!(s, "    int r0 = rb * {rm}, c0 = cb * {rn};").unwrap();
         let xbuf = storage(rc.args[vx].src.n());
@@ -683,7 +710,14 @@ impl TensorGraph {
                 writeln!(s, "    float acc{i}_{j} = 0.0f;").unwrap();
             }
         }
-        writeln!(s, "    for (int kg = 0; kg < {gs}; kg++) {{").unwrap();
+        let wpg = js / 8;
+        writeln!(
+            s,
+            "    for (int kw = lane; kw < {}; kw += {lanes}) {{",
+            gs * wpg
+        )
+        .unwrap();
+        writeln!(s, "        int kg = kw / {wpg}, kj = (kw % {wpg}) * 8;").unwrap();
         // per-group values of each column
         for (v, role) in roles.iter().enumerate() {
             if let Some(Role::Group { buf, addr, pack }) = role {
@@ -702,7 +736,7 @@ impl TensorGraph {
                 }
             }
         }
-        writeln!(s, "        for (int kj = 0; kj < {js}; kj += 8) {{").unwrap();
+        writeln!(s, "        {{").unwrap();
         writeln!(s, "            int kx = {} * kg + kj;", ax.coefs[2]).unwrap();
         for i in 0..rm {
             if f16 {
@@ -783,6 +817,29 @@ impl TensorGraph {
         }
         writeln!(s, "        }}").unwrap();
         writeln!(s, "    }}").unwrap();
+        if lanes > 1 {
+            writeln!(s, "    __local float part[{}];", wg * rm * rn).unwrap();
+            writeln!(s, "    int t = (int)get_local_id(0);").unwrap();
+            for i in 0..rm {
+                for j in 0..rn {
+                    writeln!(s, "    part[{} + t] = acc{i}_{j};", (i * rn + j) * wg).unwrap();
+                }
+            }
+            writeln!(s, "    barrier(CLK_LOCAL_MEM_FENCE);").unwrap();
+            writeln!(s, "    if (lane != 0) return;").unwrap();
+            for i in 0..rm {
+                for j in 0..rn {
+                    writeln!(s, "    acc{i}_{j} = 0.0f;").unwrap();
+                    writeln!(
+                        s,
+                        "    for (int l = 0; l < {lanes}; l++) acc{i}_{j} += part[{} + t + l];",
+                        (i * rn + j) * wg
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        writeln!(s, "    if (!live) return;").unwrap();
         self.mm_stores(
             &mut s,
             c,
@@ -797,7 +854,7 @@ impl TensorGraph {
         Some(super::cuda_gemv::Kernel {
             source: s,
             threads: wg,
-            blocks: items.div_ceil(wg),
+            blocks: (items * lanes).div_ceil(wg),
         })
     }
 

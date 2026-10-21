@@ -1128,6 +1128,8 @@ pub struct PrefillCheck {
 /// (`TANG_CL_PREFILL_F16=1`), returned as max |Δlogit| and top-1 agreement
 /// against the baseline. Prints as it goes.
 pub fn prefill_bench(dir: &str, sizes: &[usize], gen: usize, check: bool) -> Vec<PrefillCheck> {
+    // QWEN_BENCH_TURN=0: skip the 20-token turn (two more programs)
+    let turn_on = std::env::var("QWEN_BENCH_TURN").as_deref() != Ok("0");
     let tokenizer =
         tokenizers::Tokenizer::from_file(format!("{dir}/tokenizer.json")).expect("tokenizer.json");
     let max = sizes.iter().copied().max().unwrap_or(1);
@@ -1184,20 +1186,30 @@ pub fn prefill_bench(dir: &str, sizes: &[usize], gen: usize, check: bool) -> Vec
     };
     let mut sorted = sizes.to_vec();
     sorted.sort_unstable();
+    let mut last = None;
     for &seq in &sorted {
+        let t = Instant::now();
         let s = build(seq);
+        let built = t.elapsed().as_secs_f64();
+        let t = Instant::now();
         s.prefill(&rt, &ids[..seq], 0);
         let _ = s.state(&rt);
+        let first = t.elapsed().as_secs_f64();
         let ms = s.prog.time(&rt, 5);
+        println!(
+            "prefill {seq:4} tokens: built in {built:.1} s, first run {:.0} ms wall",
+            first * 1e3
+        );
         println!(
             "prefill {seq:4} tokens: {ms:8.1} ms device ({:6.0} tok/s), {:.0} MB own buffers",
             seq as f64 * 1e3 / ms,
             s.bytes as f64 / 1e6
         );
+        last = Some(s);
     }
     // a voice turn: 20 new tokens after the largest prompt, split as a
     // Session splits them (QWEN_PREFILL_CHUNKS), device time summed
-    if max + 20 < ctx {
+    if turn_on && max + 20 < ctx {
         let (mut p, mut ms, mut parts) = (max, 0.0, Vec::new());
         let ladder = chunk_sizes(&rt);
         let turn: Vec<usize> = (0..max + 20).map(|i| ids[i % max]).collect();
@@ -1233,7 +1245,7 @@ pub fn prefill_bench(dir: &str, sizes: &[usize], gen: usize, check: bool) -> Vec
     }
     // decode after a prefill of the largest size
     if gen > 0 {
-        let s = build(max);
+        let s = last.take().unwrap_or_else(|| build(max));
         s.prefill(&rt, &ids[..max], 0);
         let _ = s.state(&rt);
         drop(s);

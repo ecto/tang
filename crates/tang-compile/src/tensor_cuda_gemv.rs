@@ -325,6 +325,25 @@ impl TensorGraph {
                     .or_else(|| lw.warp_reduction(root))
                     .or_else(|| lw.point_map(root)),
             };
+            // TANG_CL_LOG=1: which lowering each reduction got (prefill)
+            if target == DecodeTarget::OpenCl
+                && opts.mma
+                && std::env::var("TANG_CL_LOG").is_ok_and(|v| v == "1")
+                && self
+                    .comp_at(root)
+                    .is_some_and(|c| c.monoid.is_some() || self.tiled_reduction(root).is_some())
+            {
+                let what = match &got {
+                    Some(k) => k.source.lines().next().unwrap_or("").to_string(),
+                    None => "WGSL fallback (tiled or generic)".to_string(),
+                };
+                let packed_reads = reads.iter().filter(|j| packed.contains_key(j)).count();
+                eprintln!(
+                    "tang-cl: node {root} {:?} packed reads {packed_reads}, tile {}: {what}",
+                    self.nodes[root].shape,
+                    tiles.contains(&root)
+                );
+            }
             match got {
                 Some(kern) => {
                     k.source = match target {
