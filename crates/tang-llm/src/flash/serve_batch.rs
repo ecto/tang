@@ -7,9 +7,12 @@
 //!   extends the conversation), so only the new tokens are prefilled; otherwise a fresh slot,
 //!   evicting the least recently used parked one when all are taken. The recurrent state can't
 //!   rewind, so a slot is only ever extended.
-//! - **A step.** Prefilling streams advance by a chunk (at most `PREFILL_BUDGET` tokens a step
-//!   across them, so a long prompt doesn't stall the decoding ones), then one batched decode
-//!   window runs every decoding stream's next token (up to `MAX_T` rows a window).
+//! - **A step.** Prefilling streams advance by a chunk, shortest remaining prompt first (an
+//!   agent's cached turn prefills a few dozen tokens and shouldn't wait behind a cold 15k
+//!   prompt), then one batched decode window runs every decoding stream's next token (up to
+//!   `MAX_T` rows a window). While any stream is decoding, prefill gets `PREFILL_SLICE` tokens a
+//!   chunk and only as much GPU time as decode has had since, so decoders keep about half the
+//!   GPU instead of crawling at a token per prefill chunk.
 //! - **Greedy.** Batched windows sample greedily until the engine has per-row sampling; a
 //!   request that asks for a temperature is logged and runs greedy.
 //! - No drafts in batched windows yet (per-slot verify is engine work still to come).
@@ -23,8 +26,10 @@ use serde_json::Value;
 use std::time::Instant;
 use tang_compute::flash::MAX_T;
 
-/// Prompt tokens prefilled per step across all prefilling streams.
+/// Prompt tokens prefilled per step across all prefilling streams, when nothing is decoding.
 const PREFILL_BUDGET: usize = 256;
+/// The same while some stream is decoding: a shorter chunk, so a decode window is never far off.
+const PREFILL_SLICE: usize = 64;
 
 /// A parked or running sequence slot.
 pub(super) struct SlotInfo {
@@ -236,22 +241,46 @@ impl FlashServe {
                 s.finish = Some(Finish::Cancelled);
             }
         }
-        // Prefill: up to PREFILL_BUDGET prompt tokens across the prefilling streams.
-        let mut budget = PREFILL_BUDGET;
-        for l in lanes.iter_mut() {
+        // Prefill, shortest remaining prompt first. With streams decoding, a short chunk and only
+        // when decode has caught up on GPU time (prefill_debt), so both make progress.
+        let decoding = lanes.iter().any(|l| {
+            let s = l.stream.downcast_ref::<Stream>().expect("a flash stream");
+            s.finish.is_none() && s.pending.is_some()
+        });
+        let mut budget = match (decoding, self.prefill_debt > 0.0) {
+            (false, _) => PREFILL_BUDGET,
+            (true, false) => PREFILL_SLICE,
+            (true, true) => 0,
+        };
+        if !decoding {
+            self.prefill_debt = 0.0;
+        }
+        let mut order: Vec<(usize, usize)> = lanes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| {
+                let s = l.stream.downcast_ref::<Stream>().expect("a flash stream");
+                (s.finish.is_none() && s.done_prompt < s.ids.len())
+                    .then(|| (s.ids.len() - s.done_prompt, i))
+            })
+            .collect();
+        order.sort_unstable();
+        for (_, i) in order {
             if budget == 0 {
                 break;
             }
+            let l = &mut lanes[i];
             let s = l.stream.downcast_mut::<Stream>().expect("a flash stream");
-            if s.finish.is_some() || s.done_prompt >= s.ids.len() {
-                continue;
-            }
             let n = (s.ids.len() - s.done_prompt).min(budget);
             let t = Instant::now();
             let next = self
                 .e
                 .prefill_slot(s.slot, &s.ids[s.done_prompt..s.done_prompt + n])?;
-            s.prefill_s += t.elapsed().as_secs_f64();
+            let dt = t.elapsed().as_secs_f64();
+            s.prefill_s += dt;
+            if decoding {
+                self.prefill_debt += dt;
+            }
             s.done_prompt += n;
             budget -= n;
             if s.done_prompt == s.ids.len() {
@@ -283,7 +312,9 @@ impl FlashServe {
                     (s.slot, s.pending.unwrap())
                 })
                 .collect();
+            let t = Instant::now();
             let next = self.e.decode_batch(&rows)?;
+            self.prefill_debt = (self.prefill_debt - t.elapsed().as_secs_f64()).max(0.0);
             for (&i, &tok) in group.iter().zip(&next) {
                 let l = &mut lanes[i];
                 let s = l.stream.downcast_mut::<Stream>().unwrap();
