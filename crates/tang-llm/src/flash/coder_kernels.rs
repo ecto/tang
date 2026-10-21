@@ -328,7 +328,7 @@ __device__ __forceinline__ const unsigned char* cx_stage(const unsigned char* sr
 // 8 warps a block. Pairs p < T·K are (token p / K, rank p % K) with the routed expert ids[p];
 // p >= T·K is the shared expert for token p − T·K. out[p][r]: r < FF gate, else up.
 // Grid (2 FF / (8 R), T · (K + 1)), block 256, dynamic smem 8 R × r16 × 16 bytes.
-template <int R>
+template <int R, bool STAGE = true>
 __device__ __forceinline__ void moe_gu_body(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
                                             const unsigned char* xq, float* out, int T, int r16, int fast, int pbase) {
     extern __shared__ uint4 dsm[];
@@ -346,7 +346,7 @@ __device__ __forceinline__ void moe_gu_body(ExW g, ExW u, ExW sg, ExW su, const 
         const int ro = r < CX_FF ? r : r - CX_FF;
         ty[j] = m.ty;
         const unsigned char* src = (const unsigned char*)m.base + (size_t)e * m.estride + (size_t)ro * m.row_bytes;
-        w[j] = cx_stage(src, m.row_bytes, dsm + (warp * R + j) * r16, lane);
+        w[j] = STAGE ? cx_stage(src, m.row_bytes, dsm + (warp * R + j) * r16, lane) : src;
     }
     __syncwarp();
     const float* xd = (const float*)(xq + (size_t)XQ8_T * CX_HID);
@@ -381,7 +381,7 @@ extern "C" __global__ void cx_silu_q(const float* gu, unsigned char* hq, int pba
 // FUSE, the block first makes pair p's int8 h from gate|up itself (cx_silu_q's arithmetic, into
 // shared memory) instead of reading cx_silu_q's output.
 // Grid (HID / (8 R), T · (K + 1)), block 256, dynamic smem 8 R × r16 × 16 bytes.
-template <int R, bool FUSE>
+template <int R, bool FUSE, bool STAGE = true>
 __device__ __forceinline__ void moe_down_body(ExW d, ExW sd, const unsigned* ids, const unsigned char* hq,
                                               const float* gu, float* out, int T, int r16, int fast, int pbase) {
     extern __shared__ uint4 dsm[];
@@ -398,7 +398,7 @@ __device__ __forceinline__ void moe_down_body(ExW d, ExW sd, const unsigned* ids
         const int r = (blockIdx.x * 8 + warp) * R + j;
         rr[j] = r;
         const unsigned char* src = (const unsigned char*)m.base + (size_t)e * m.estride + (size_t)r * m.row_bytes;
-        w[j] = cx_stage(src, m.row_bytes, dsm + (warp * R + j) * r16, lane);
+        w[j] = STAGE ? cx_stage(src, m.row_bytes, dsm + (warp * R + j) * r16, lane) : src;
     }
     const unsigned char* hcodes;
     const float* hd;
@@ -423,11 +423,15 @@ __device__ __forceinline__ void moe_down_body(ExW d, ExW sd, const unsigned* ids
         hd = (const float*)(hq + (size_t)CX_NP * CX_FF) + p * (CX_FF / 32);
     }
     const bool aligned = ((((unsigned long long)w[0]) | ((unsigned long long)w[R - 1]) | (unsigned long long)hcodes) & 15) == 0;
-    if (R == 2 && fast >= 2 && CX_FF == 512 && (m.ty == 12 || m.ty == 13) && aligned) {
-        // fast = 2: the two rows on the two halves of the warp.
+    if (R % 2 == 0 && fast >= 2 && CX_FF == 512 && (m.ty == 12 || m.ty == 13) && aligned) {
+        // fast = 2: rows two at a time on the two halves of the warp.
         const int h = lane >> 4;
-        const float a = m.ty == 12 ? cx_dotq_half<12>(w[h], hcodes, hd, CX_FF) : cx_dotq_half<13>(w[h], hcodes, hd, CX_FF);
-        if ((lane & 15) == 0) out[(size_t)p * CX_HID + rr[h]] = a;
+        #pragma unroll
+        for (int j0 = 0; j0 < R; j0 += 2) {
+            const float a = m.ty == 12 ? cx_dotq_half<12>(w[j0 + h], hcodes, hd, CX_FF)
+                                       : cx_dotq_half<13>(w[j0 + h], hcodes, hd, CX_FF);
+            if ((lane & 15) == 0) out[(size_t)p * CX_HID + rr[j0 + h]] = a;
+        }
         return;
     }
     #pragma unroll
@@ -440,6 +444,31 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_down(ExW d, ExW sd, con
                                                               const unsigned char* hq, float* out, int T, int r16, int fast,
                                                               int pbase) {
     moe_down_body<2, false>(d, sd, ids, hq, nullptr, out, T, r16, fast, pbase);
+}
+
+// The same per-pair kernels reading expert rows straight from global memory instead of staging
+// them in shared memory first (at decode nothing reuses a staged row; staging adds a pass and
+// holds shared memory that limits blocks an SM), with 2 or 4 rows a warp. Same rows, same
+// cx_dot: outputs bitwise equal to the staged kernels. Grid x = rows / (8 R). TANG_CODER_MOE.
+extern "C" __global__ void __launch_bounds__(256) cx_moe_gu_d2(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
+                                                               const unsigned char* xq, float* out, int T, int r16,
+                                                               int fast, int pbase) {
+    moe_gu_body<2, false>(g, u, sg, su, ids, xq, out, T, r16, fast, pbase);
+}
+extern "C" __global__ void __launch_bounds__(256) cx_moe_gu_d4(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
+                                                               const unsigned char* xq, float* out, int T, int r16,
+                                                               int fast, int pbase) {
+    moe_gu_body<4, false>(g, u, sg, su, ids, xq, out, T, r16, fast, pbase);
+}
+extern "C" __global__ void __launch_bounds__(256) cx_moe_down_d2(ExW d, ExW sd, const unsigned* ids,
+                                                                 const unsigned char* hq, float* out, int T, int r16,
+                                                                 int fast, int pbase) {
+    moe_down_body<2, false, false>(d, sd, ids, hq, nullptr, out, T, r16, fast, pbase);
+}
+extern "C" __global__ void __launch_bounds__(256) cx_moe_down_d4(ExW d, ExW sd, const unsigned* ids,
+                                                                 const unsigned char* hq, float* out, int T, int r16,
+                                                                 int fast, int pbase) {
+    moe_down_body<4, false, false>(d, sd, ids, hq, nullptr, out, T, r16, fast, pbase);
 }
 
 // ---- grouped experts: each distinct expert's rows read once for all the pairs routed to it ----
