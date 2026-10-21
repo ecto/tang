@@ -24,9 +24,10 @@ if [[ $STEPS == *build* ]]; then
   cargo build -q --release -p tang-llm --no-default-features --features cuda --bin tang-llm 2>&1 | grep -E "^error" -A8 | head -40
 fi
 if [[ $STEPS == *tiny* ]]; then
+  # The fp32 bar: full-FP32 cuBLAS (tang-llm turns TF32 on for CUDA inference by default).
   for seed in 0 1; do
     say tiny seed $seed
-    python crates/tang-llm/scripts/qwen3vl_tiny.py --tang $BIN --out /root/tiny$seed --seed $seed --device cuda 2>&1 \
+    GAIA_TF32=0 python crates/tang-llm/scripts/qwen3vl_tiny.py --tang $BIN --out /root/tiny$seed --seed $seed --device cuda 2>&1 \
       | grep --line-buffered -E "^(images|preprocess|prefill|decode|\(HF|PASS|FAIL)|embed|block|merger|deepstack|Error|error|failed"
   done
 fi
@@ -43,6 +44,22 @@ if [[ $STEPS == *real* ]]; then
   say real
   python crates/tang-llm/scripts/qwen3vl_real.py --tang $BIN --model "$(cat /root/model_path)" --out /root/real --device cuda 2>&1 \
     | grep -vE "Warning|warn\(|it/s\]|Loading"
+fi
+if [[ $STEPS == *llama* ]]; then
+  say llama.cpp build
+  M="$(python -c "from huggingface_hub import snapshot_download as s; print(s('Qwen/Qwen3-VL-8B-Instruct'))" 2>/dev/null)"
+  [ -d /root/llama.cpp ] || git clone -q --depth 1 https://github.com/ggml-org/llama.cpp /root/llama.cpp
+  (cd /root/llama.cpp && cmake -B build -DGGML_CUDA=ON -DLLAMA_CURL=OFF >/dev/null && cmake --build build -j --target llama-server 2>&1 | grep -E "error" | head)
+  say llama.cpp convert
+  pip install -q gguf sentencepiece protobuf 2>&1 | tail -1
+  python /root/llama.cpp/convert_hf_to_gguf.py "$M" --outtype bf16 --outfile /root/vl.gguf 2>&1 | tail -1
+  python /root/llama.cpp/convert_hf_to_gguf.py "$M" --outtype bf16 --mmproj --outfile /root/mmproj.gguf 2>&1 | tail -1
+  /root/llama.cpp/build/bin/llama-server -m /root/vl.gguf --mmproj /root/mmproj.gguf -ngl 99 -c 8192 --port 8080 >/root/llama.log 2>&1 &
+  for i in $(seq 120); do curl -sf localhost:8080/health >/dev/null && break; sleep 5; done
+  say llama.cpp compare
+  python crates/tang-llm/scripts/qwen3vl_llamacpp.py --tang $BIN --model "$M" --image /root/real/view.png --device cuda 2>&1 \
+    | grep -vE "Warning|warn\("
+  tail -3 /root/llama.log
 fi
 say DONE
 sleep infinity
