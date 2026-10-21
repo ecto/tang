@@ -23,7 +23,8 @@
 //! blocks instead of prefilling them. Keyed conversations' blocks are also saved to
 //! `~/.cache/tang/kv/` after each turn (each block once) and read back instead of prefilled;
 //! `TANG_KV_DISK=<GB>` caps that (default 8, 0 turns it off). KV caches hold bf16 on the GPU
-//! (half of f32's memory; attention accumulates in f32); `TANG_KV_F32=1` keeps them f32.
+//! (half of f32's memory; attention accumulates in f32); `TANG_KV_F32=1` keeps them f32 (gpt-oss
+//! defaults to f32; `TANG_KV_F32=0` makes it bf16).
 //! Speculative decoding (suffix drafts from the prompt and earlier completions, verified in one
 //! forward; outputs unchanged) is on for GPUs: `--no-speculate` or `TANG_SPECULATE=0` turns it
 //! off, `--speculate` forces it on. Earlier completions are kept in

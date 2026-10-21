@@ -93,6 +93,51 @@ impl CudaBuffer {
     }
 }
 
+/// A [`CudaBuffer`]'s storage, read-only, for extensions that launch their own kernels on it
+/// (see [`CudaBuffer::raw`]). A kernel may write through these (a KV cache, say) only where the
+/// matching built-in op would.
+pub enum RawCuda<'a> {
+    F32(&'a CudaSlice<f32>),
+    /// bf16 bits.
+    Bf16(&'a CudaSlice<u16>),
+    /// MLX 4-bit `[n, k]`: `packed` 8 weights a u32 (low nibble first), bf16 `scales` and
+    /// `biases` one per `group` weights.
+    Q4 {
+        packed: &'a CudaSlice<u32>,
+        scales: &'a CudaSlice<u16>,
+        biases: &'a CudaSlice<u16>,
+        group: usize,
+    },
+    /// Repacked Q2_0 (`crate::flash::q2_repack`): `[n][k/4]` code bytes, then `[n][k/64]`
+    /// fp16 scales.
+    Q2 {
+        data: &'a CudaSlice<u8>,
+        n: usize,
+        k: usize,
+    },
+}
+
+impl CudaBuffer {
+    /// The storage behind this buffer.
+    pub fn raw(&self) -> RawCuda<'_> {
+        match self.storage() {
+            CudaStorage::F32(s) => RawCuda::F32(s),
+            CudaStorage::Bf16(s) => RawCuda::Bf16(s),
+            CudaStorage::Q4(q) => RawCuda::Q4 {
+                packed: &q.packed,
+                scales: &q.scales,
+                biases: &q.biases,
+                group: q.group,
+            },
+            CudaStorage::Q2(q) => RawCuda::Q2 {
+                data: &q.data,
+                n: q.n,
+                k: q.k,
+            },
+        }
+    }
+}
+
 impl ComputeBuffer for CudaBuffer {
     fn len(&self) -> usize {
         self.len
@@ -170,6 +215,7 @@ use crate::pool::BufferPool;
 
 mod flash;
 mod llm;
+mod moe;
 
 /// Extended pool diagnostics.
 pub struct PoolStats {
@@ -434,6 +480,13 @@ impl CudaComputeDevice {
     /// Drop all cached buffers in the pool, returning memory to CUDA.
     pub fn pool_clear(&self) {
         self.pool.lock().unwrap().clear();
+    }
+
+    // ---- Raw access, for extensions (`crate::ext`) ----
+
+    /// Whether activations are bf16 (`new_mixed_precision`) rather than f32.
+    pub fn is_mixed_precision(&self) -> bool {
+        self.mixed_precision
     }
 
     // ---- CUDA Graph capture ----
@@ -4514,6 +4567,13 @@ impl ComputeDevice for CudaComputeDevice {
         self.upload_q4_impl(packed, scales, biases, group)
     }
 
+    fn top_k_rows(&self, x: &CudaBuffer, rows: usize, n: usize, k: usize) -> (Vec<f32>, Vec<u32>) {
+        self.top_k_rows_llm(x, rows, n, k).unwrap_or_else(|| {
+            let v = self.download(x);
+            crate::top_k_rows_host(&v[..rows * n], n, k)
+        })
+    }
+
     fn linear(&self, x: &CudaBuffer, w: &CudaBuffer, m: usize, k: usize, n: usize) -> CudaBuffer {
         self.linear_llm(x, w, m, k, n)
             .unwrap_or_else(|| self.matmul_b_transposed(x, w, m, k, n))
@@ -4712,6 +4772,176 @@ impl ComputeDevice for CudaComputeDevice {
 
     fn swiglu_split(&self, gu: &CudaBuffer, rows: usize, ff: usize) -> CudaBuffer {
         self.gated_split_llm("swiglu_split", gu, rows, ff)
+    }
+
+    fn moe_route(
+        &self,
+        logits: &CudaBuffer,
+        rows: usize,
+        experts: usize,
+        k: usize,
+        router: crate::moe::Router,
+    ) -> (CudaBuffer, CudaBuffer) {
+        (!moe::host_op("route"))
+            .then(|| self.moe_route_llm(logits, rows, experts, k, router))
+            .flatten()
+            .unwrap_or_else(|| {
+                let (ids, w) = crate::moe::route(&self.download(logits), rows, experts, k, router);
+                (self.upload_u32(&ids), self.upload(&w))
+            })
+    }
+
+    fn moe_linear(
+        &self,
+        x: &CudaBuffer,
+        w: &CudaBuffer,
+        fmt: crate::moe::ExpertFmt,
+        experts: usize,
+        bias: Option<&CudaBuffer>,
+        ids: &CudaBuffer,
+        k_top: usize,
+        k: usize,
+        n: usize,
+        per_pick: bool,
+    ) -> CudaBuffer {
+        if let Some(y) = (!moe::host_op("linear"))
+            .then(|| self.moe_linear_llm(x, w, fmt, experts, bias, ids, k_top, k, n, per_pick))
+            .flatten()
+        {
+            return y;
+        }
+        crate::device::moe_linear_default(
+            self, x, w, fmt, experts, bias, ids, k_top, k, n, per_pick,
+        )
+    }
+
+    fn swiglu_clamped(
+        &self,
+        gu: &CudaBuffer,
+        rows: usize,
+        ff: usize,
+        alpha: f32,
+        limit: f32,
+    ) -> CudaBuffer {
+        if moe::host_op("swiglu") {
+            let y = crate::moe::swiglu_clamped(&self.download(gu), rows, ff, alpha, limit);
+            return self.upload(&y);
+        }
+        self.swiglu_clamped_llm(gu, rows, ff, alpha, limit)
+    }
+
+    fn moe_combine(
+        &self,
+        parts: &CudaBuffer,
+        w: &CudaBuffer,
+        rows: usize,
+        k_top: usize,
+        h: usize,
+    ) -> CudaBuffer {
+        if moe::host_op("combine") {
+            let y =
+                crate::moe::moe_combine(&self.download(parts), &self.download(w), rows, k_top, h);
+            return self.upload(&y);
+        }
+        self.moe_combine_llm(parts, w, rows, k_top, h)
+    }
+
+    fn attention_paged_rows_sinks(
+        &self,
+        qkv: &CudaBuffer,
+        cos: &CudaBuffer,
+        sin: &CudaBuffer,
+        k_pool: &mut CudaBuffer,
+        v_pool: &mut CudaBuffer,
+        rows: &crate::PagedRows<CudaBuffer>,
+        shape: (usize, usize, usize),
+        window: usize,
+        sinks: &CudaBuffer,
+    ) -> CudaBuffer {
+        let (nh, nkv, hd) = shape;
+        let (qd, w) = (nh * hd, (nh + 2 * nkv) * hd);
+        let n = rows.pos.len();
+        // Prep each row (RoPE, K/V into its cache), then one sink-attention launch for all.
+        let mut q = self.pool_alloc_uninit_f32(n * qd);
+        for (i, (pages, &pos)) in rows.pages.iter().zip(rows.pos).enumerate() {
+            let row = self.slice_buffer(qkv, i * w, w);
+            let qi = self.attention_prep_paged(
+                &row, None, None, cos, sin, k_pool, v_pool, pages, 1, shape, pos, 0.0,
+            );
+            self.write_into(&mut q, i * qd, &qi);
+        }
+        let sh = rows.pages.first().map_or(0, |p| p.shift());
+        if !moe::host_op("sinks") {
+            if let Some(o) = self.attention_sinks_llm(
+                &q,
+                k_pool,
+                v_pool,
+                rows.tables,
+                sh,
+                0,
+                n,
+                shape,
+                window,
+                sinks,
+                Some((rows.positions, rows.offsets, rows.pos)),
+            ) {
+                return o;
+            }
+        }
+        let mut out = self.pool_alloc_uninit_f32(n * qd);
+        for (i, (pages, &pos)) in rows.pages.iter().zip(rows.pos).enumerate() {
+            let qi = self.slice_buffer(&q, i * qd, qd);
+            let o = self.kv_attention_paged_sinks(
+                &qi, k_pool, v_pool, pages, pos, 1, shape, window, true, sinks,
+            );
+            self.write_into(&mut out, i * qd, &o);
+        }
+        out
+    }
+
+    fn kv_attention_paged_sinks(
+        &self,
+        q: &CudaBuffer,
+        k_pool: &CudaBuffer,
+        v_pool: &CudaBuffer,
+        pages: &crate::Pages<CudaBuffer>,
+        cache_start: usize,
+        q_len: usize,
+        shape: (usize, usize, usize),
+        window: usize,
+        causal: bool,
+        sinks: &CudaBuffer,
+    ) -> CudaBuffer {
+        if causal && !moe::host_op("sinks") {
+            if let Some(o) = self.attention_sinks_llm(
+                q,
+                k_pool,
+                v_pool,
+                pages.table,
+                pages.shift(),
+                cache_start,
+                q_len,
+                shape,
+                window,
+                sinks,
+                None,
+            ) {
+                return o;
+            }
+        }
+        crate::device::kv_attention_paged_sinks_default(
+            self,
+            q,
+            k_pool,
+            v_pool,
+            pages,
+            cache_start,
+            q_len,
+            shape,
+            window,
+            causal,
+            sinks,
+        )
     }
 
     fn rope_half_cached(

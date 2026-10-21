@@ -1431,6 +1431,21 @@ pub trait ComputeDevice: Send + 'static {
         self.swiglu_fused_buf(&self.upload(&g), &self.upload(&u), rows * ff)
     }
 
+    /// The `k` largest of each of `rows` rows of `n` floats: per row, `k` values in
+    /// descending order with their column indices, ties broken by the lower index (so the
+    /// first is what a first-max argmax picks). Backends may do this on the device so only
+    /// `rows * k` pairs come back instead of the rows. Needs `k <= n`.
+    fn top_k_rows(
+        &self,
+        x: &Self::Buffer,
+        rows: usize,
+        n: usize,
+        k: usize,
+    ) -> (Vec<f32>, Vec<u32>) {
+        let v = self.download(x);
+        top_k_rows_host(&v[..rows * n], n, k)
+    }
+
     /// Linear layer: `y[m, n] = x[m, k] @ w[n, k]^T`, with `w` stored the way checkpoints store
     /// it (`[out, in]` row-major). Backends specialize small `m` (decode) as a GEMV.
     fn linear(
@@ -1910,6 +1925,152 @@ pub trait ComputeDevice: Send + 'static {
         let mut h = self.alloc_f32(t * crate::flash::shape::GDN_CONV);
         self.gdn_conv_into(proj, stride, hist, p.conv, &mut h, t, eps);
         self.gdn_step(state, &h, proj, stride, p, y, yq, t, mode, eps);
+    }
+
+    /// Dense-path MoE routing ([`crate::moe::route`]): `(ids, weights)`, each `[rows, k]`
+    /// (ids as u32), from router logits `[rows, experts]`.
+    fn moe_route(
+        &self,
+        logits: &Self::Buffer,
+        rows: usize,
+        experts: usize,
+        k: usize,
+        router: crate::moe::Router,
+    ) -> (Self::Buffer, Self::Buffer) {
+        let (ids, w) = crate::moe::route(&self.download(logits), rows, experts, k, router);
+        (self.upload_u32(&ids), self.upload(&w))
+    }
+
+    /// Each row's picked experts applied to it ([`crate::moe::moe_linear`]): `w` is a stack of
+    /// `experts` matrices `[n, k]` in `fmt`, `bias` `[experts, n]`, `ids` `[rows, k_top]` from
+    /// [`moe_route`](Self::moe_route). `x` is `[rows, k]`, or with `per_pick`
+    /// `[rows * k_top, k]`; returns `[rows * k_top, n]`.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_linear(
+        &self,
+        x: &Self::Buffer,
+        w: &Self::Buffer,
+        fmt: crate::moe::ExpertFmt,
+        experts: usize,
+        bias: Option<&Self::Buffer>,
+        ids: &Self::Buffer,
+        k_top: usize,
+        k: usize,
+        n: usize,
+        per_pick: bool,
+    ) -> Self::Buffer {
+        moe_linear_default(self, x, w, fmt, experts, bias, ids, k_top, k, n, per_pick)
+    }
+
+    /// gpt-oss's clamped SwiGLU ([`crate::moe::swiglu_clamped`]) over `gu` `[rows, 2 * ff]`
+    /// (gate then up); returns `[rows, ff]`.
+    fn swiglu_clamped(
+        &self,
+        gu: &Self::Buffer,
+        rows: usize,
+        ff: usize,
+        alpha: f32,
+        limit: f32,
+    ) -> Self::Buffer {
+        let y = crate::moe::swiglu_clamped(&self.download(gu), rows, ff, alpha, limit);
+        self.upload(&y)
+    }
+
+    /// The weighted sum of each row's expert outputs ([`crate::moe::moe_combine`]): `parts`
+    /// `[rows * k_top, h]`, `w` `[rows, k_top]`; returns `[rows, h]`.
+    fn moe_combine(
+        &self,
+        parts: &Self::Buffer,
+        w: &Self::Buffer,
+        rows: usize,
+        k_top: usize,
+        h: usize,
+    ) -> Self::Buffer {
+        let y = crate::moe::moe_combine(&self.download(parts), &self.download(w), rows, k_top, h);
+        self.upload(&y)
+    }
+
+    /// [`kv_attention_paged`](Self::kv_attention_paged) with attention sinks: one more logit
+    /// per head, `sinks[h]`, with a zero value ([`crate::moe::attention_sinks`], gpt-oss). The
+    /// default gathers the keys and runs the reference on the host.
+    #[allow(clippy::too_many_arguments)]
+    fn kv_attention_paged_sinks(
+        &self,
+        q: &Self::Buffer,
+        k_pool: &Self::Buffer,
+        v_pool: &Self::Buffer,
+        pages: &Pages<Self::Buffer>,
+        cache_start: usize,
+        q_len: usize,
+        shape: (usize, usize, usize),
+        window: usize,
+        causal: bool,
+        sinks: &Self::Buffer,
+    ) -> Self::Buffer {
+        kv_attention_paged_sinks_default(
+            self,
+            q,
+            k_pool,
+            v_pool,
+            pages,
+            cache_start,
+            q_len,
+            shape,
+            window,
+            causal,
+            sinks,
+        )
+    }
+
+    /// [`attention_paged_rows`](Self::attention_paged_rows) with attention sinks and a
+    /// sliding window (0: none), as [`kv_attention_paged_sinks`](Self::kv_attention_paged_sinks)
+    /// does for each row alone. The default runs each row on its own.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_paged_rows_sinks(
+        &self,
+        qkv: &Self::Buffer,
+        cos: &Self::Buffer,
+        sin: &Self::Buffer,
+        k_pool: &mut Self::Buffer,
+        v_pool: &mut Self::Buffer,
+        rows: &PagedRows<Self::Buffer>,
+        (nh, nkv, hd): (usize, usize, usize),
+        window: usize,
+        sinks: &Self::Buffer,
+    ) -> Self::Buffer {
+        let (qd, w) = (nh * hd, (nh + 2 * nkv) * hd);
+        let mut out = self.alloc_uninit_f32(rows.pos.len() * qd);
+        for (i, (pages, &pos)) in rows.pages.iter().zip(rows.pos).enumerate() {
+            let row = self.slice_buffer(qkv, i * w, w);
+            let q = self.attention_prep_paged(
+                &row,
+                None,
+                None,
+                cos,
+                sin,
+                k_pool,
+                v_pool,
+                pages,
+                1,
+                (nh, nkv, hd),
+                pos,
+                0.0,
+            );
+            let o = self.kv_attention_paged_sinks(
+                &q,
+                k_pool,
+                v_pool,
+                pages,
+                pos,
+                1,
+                (nh, nkv, hd),
+                window,
+                true,
+                sinks,
+            );
+            self.write_into(&mut out, i * qd, &o);
+        }
+        out
     }
 
     /// MoE router for a window: `logits [t][stride]` (experts in columns `0..n_expert`); writes
@@ -2422,4 +2583,102 @@ pub fn attention_prep_default<D: ComputeDevice + ?Sized>(
 pub fn f32_to_bf16(x: f32) -> u16 {
     let b = x.to_bits();
     (b.wrapping_add(0x7fff + ((b >> 16) & 1)) >> 16) as u16
+}
+
+/// [`ComputeDevice::top_k_rows`] on the host: the reference every backend must match.
+pub fn top_k_rows_host(v: &[f32], n: usize, k: usize) -> (Vec<f32>, Vec<u32>) {
+    let rows = v.len() / n;
+    let (mut vals, mut idx) = (Vec::with_capacity(rows * k), Vec::with_capacity(rows * k));
+    for r in 0..rows {
+        let row = &v[r * n..(r + 1) * n];
+        let mut order: Vec<u32> = (0..n as u32).collect();
+        let cmp = |a: &u32, b: &u32| row[*b as usize].total_cmp(&row[*a as usize]).then(a.cmp(b));
+        if k < n {
+            order.select_nth_unstable_by(k - 1, cmp);
+            order.truncate(k);
+        }
+        order.sort_unstable_by(cmp);
+        vals.extend(order.iter().map(|&i| row[i as usize]));
+        idx.extend_from_slice(&order);
+    }
+    (vals, idx)
+}
+
+/// The portable [`ComputeDevice::moe_linear`]: the host reference.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_linear_default<D: ComputeDevice + ?Sized>(
+    dev: &D,
+    x: &D::Buffer,
+    w: &D::Buffer,
+    fmt: crate::moe::ExpertFmt,
+    experts: usize,
+    bias: Option<&D::Buffer>,
+    ids: &D::Buffer,
+    k_top: usize,
+    k: usize,
+    n: usize,
+    per_pick: bool,
+) -> D::Buffer {
+    use crate::moe::{ExpertFmt, ExpertWeights};
+    let (x, ids) = (dev.download(x), crate::flash::u32s(&dev.download(ids)));
+    let bias = bias.map(|b| dev.download(b));
+    let wv = dev.download(w);
+    let bytes: Vec<u8>;
+    let weights = match fmt {
+        ExpertFmt::F32 | ExpertFmt::Bf16 => ExpertWeights::F32(&wv),
+        ExpertFmt::Mxfp4 => {
+            bytes = wv.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+            ExpertWeights::Mxfp4(&bytes)
+        }
+    };
+    let y = crate::moe::moe_linear(
+        &x,
+        weights,
+        experts,
+        bias.as_deref(),
+        &ids,
+        k_top,
+        k,
+        n,
+        per_pick,
+    );
+    dev.upload(&y)
+}
+
+/// The portable [`ComputeDevice::kv_attention_paged_sinks`]: gathers the keys and runs the
+/// host reference.
+#[allow(clippy::too_many_arguments)]
+pub fn kv_attention_paged_sinks_default<D: ComputeDevice + ?Sized>(
+    dev: &D,
+    q: &D::Buffer,
+    k_pool: &D::Buffer,
+    v_pool: &D::Buffer,
+    pages: &Pages<D::Buffer>,
+    cache_start: usize,
+    q_len: usize,
+    shape: (usize, usize, usize),
+    window: usize,
+    causal: bool,
+    sinks: &D::Buffer,
+) -> D::Buffer {
+    let kvd = shape.1 * shape.2;
+    let total = cache_start + q_len;
+    let (kp, vp) = (dev.download(k_pool), dev.download(v_pool));
+    let (mut k, mut v) = (vec![0f32; total * kvd], vec![0f32; total * kvd]);
+    for (from, row, n) in pages.runs(0, total) {
+        k[from * kvd..][..n * kvd].copy_from_slice(&kp[row * kvd..][..n * kvd]);
+        v[from * kvd..][..n * kvd].copy_from_slice(&vp[row * kvd..][..n * kvd]);
+    }
+    let o = crate::moe::attention_sinks(
+        &dev.download(q),
+        &k,
+        &v,
+        cache_start,
+        q_len,
+        shape,
+        window,
+        causal,
+        Some(&dev.download(sinks)),
+    );
+    dev.upload(&o)
 }

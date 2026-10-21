@@ -59,6 +59,20 @@ impl Weights {
             .collect())
     }
 
+    /// A byte tensor (U8/I8: MXFP4 blocks and scales), with its shape.
+    pub fn bytes(&self, name: &str) -> Result<(Vec<u8>, Vec<usize>)> {
+        let i = *self
+            .index
+            .get(name)
+            .with_context(|| format!("missing tensor {name}"))?;
+        let st = SafeTensors::deserialize(&self.maps[i])?;
+        let t = st.tensor(name)?;
+        if !matches!(t.dtype(), Dtype::U8 | Dtype::I8) {
+            bail!("{name}: expected U8, got {:?}", t.dtype());
+        }
+        Ok((t.data().to_vec(), t.shape().to_vec()))
+    }
+
     /// A tensor as raw bfloat16 bits (f32/f16 are rounded), for weights kept in bf16 on device.
     pub fn bf16(&self, name: &str) -> Result<Vec<u16>> {
         let i = *self
