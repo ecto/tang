@@ -272,8 +272,6 @@ pub fn pace(start: Instant) {
     }
 }
 
-/// Worst relative error of `got` against `want`.
-
 pub struct St {
     // mapped, not read: on the 10 GB robot a read copy plus the converted
     // words overflow RAM into zram, whose compression heats every core
@@ -990,7 +988,7 @@ pub fn tune(dir: &str, budget: f64) -> Vec<(String, String)> {
             "tune: decode warps {w} rows {r}: {ms:.2} ms (gpu {:.1} C)",
             gpu_temp().unwrap_or(0.0)
         );
-        if best.map_or(true, |b| ms < b.0) {
+        if best.is_none_or(|b| ms < b.0) {
             best = Some((ms, w, r));
         }
     }
@@ -1028,7 +1026,7 @@ pub fn tune(dir: &str, budget: f64) -> Vec<(String, String)> {
                 seq as f64 * 1e3 / ms,
                 gpu_temp().unwrap_or(0.0)
             );
-            if best.as_ref().map_or(true, |b| ms < b.0) {
+            if best.as_ref().is_none_or(|b| ms < b.0) {
                 best = Some((ms, mm.to_string()));
             }
         }
