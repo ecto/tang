@@ -4,7 +4,7 @@
 //! [`TensorGraph::to_glsl_decode`] is `to_cuda_decode` for Vulkan GPUs
 //! that have no CUDA and no Metal (the Adreno on the Booster K1, Mali, …).
 //! As for Metal, the kernels are generated once in CUDA spelling and
-//! [`transliterate`]d. GLSL has no pointers, which decides the shape:
+//! `transliterate`d. GLSL has no pointers, which decides the shape:
 //!
 //! - **Every buffer is a `uint[]`.** Packed nibbles, bf16/f16 halves and
 //!   f32 words are all read as raw words, so a bit pattern is never
@@ -33,7 +33,7 @@ use std::fmt::Write;
 use super::cuda_gemv::{DecodeOpts, DecodeProgram, DecodeTarget, PRELUDE};
 use super::{TensorGraph, TensorId};
 
-/// First line of every kernel [`transliterate`] emits; the runtime keys
+/// First line of every kernel `transliterate` emits; the runtime keys
 /// SPIR-V compilation on it.
 pub const GLSL_VERSION: &str = "#version 450";
 

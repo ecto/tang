@@ -10,17 +10,19 @@
 # from the list if you need to resume.
 set -euo pipefail
 
-CRATES=(
-    tang
-    tang-expr
-    tang-la
-    tang-ad
-    tang-gpu
-    tang-tensor
-    tang-3dgs
-    tang-optim
-    tang-train
-)
+# Pass crate names to publish a subset; the default is the current release
+# (docs/publishing.md, "Next release"). The 0.2.1 / 0.1.1 wave (tang,
+# tang-la, tang-ad, tang-gpu, tang-tensor, tang-3dgs, tang-optim,
+# tang-train) is already on the index.
+if [ "$#" -gt 0 ]; then
+    CRATES=("$@")
+else
+    CRATES=(
+        tang-expr
+        tang-compile
+        tang-compress
+    )
+fi
 
 for crate in "${CRATES[@]}"; do
     echo "==> cargo publish -p $crate"

@@ -34,7 +34,7 @@
 //!   gate math are one kernel.
 //!
 //! Kernels are emitted with node-numbered names, made
-//! [canonical](super::wgsl::canonical_source), and deduplicated: the same
+//! [canonical](crate::tensor::wgsl::canonical_source), and deduplicated: the same
 //! comp in two layers is one C function. Buffers are static arrays
 //! (aligned, allocated once) laid out by [`TensorGraph::plan_memory`];
 //! `tang_run()` calls the kernels in plan order. Nothing allocates per

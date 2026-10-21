@@ -53,13 +53,22 @@
 //!
 //! Scalar-level passes over [`tang_expr`] graphs:
 //!
-//! ```ignore
-//! use tang_compile::{PassManager, FoldConstants, FuseElementwise, EliminateDeadCode};
+//! ```
+//! use tang::Scalar;
+//! use tang_compile::{EliminateDeadCode, FoldConstants, FuseElementwise, PassManager};
+//! use tang_expr::{trace, ExprId};
+//!
+//! let (graph, y) = trace(|| {
+//!     let x = ExprId::var(0);
+//!     (x + ExprId::from_f64(2.0) * ExprId::from_f64(3.0)) * ExprId::from_f64(1.0)
+//! });
 //! let mut pm = PassManager::new();
 //! pm.add(FoldConstants);
 //! pm.add(FuseElementwise);
 //! pm.add(EliminateDeadCode);
-//! let optimized = pm.run(&graph, &outputs);
+//! let (optimized, outs) = pm.run(&graph, &[y]);
+//! let f: f64 = optimized.eval(outs[0], &[1.0]);
+//! assert!((f - 7.0).abs() < 1e-12);
 //! ```
 
 mod fusion;

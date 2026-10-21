@@ -4,7 +4,7 @@
 //! float ops are untouched, and nothing here is ever reassociated, contracted
 //! or simplified beyond folding constant-only nodes with the interpreter's own
 //! semantics. The contract is bit-exactness: [`IntGraph::eval`] (the CPU
-//! reference), the generated WGSL ([`IntGraph::to_wgsl`]) and the generated
+//! reference), the generated WGSL ([`IntGraph::to_wgsl_fn`]) and the generated
 //! Rust ([`IntGraph::to_rust`]) compute the same bits.
 //!
 //! - Types: `i32`, `u32`, `bool`; `i8`/`u8` exist only as storage

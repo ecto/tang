@@ -89,6 +89,50 @@ published yet:
 Each one packages cleanly as soon as the crate ahead of it in the order lands,
 which is what `scripts/publish.sh` walks.
 
+## Next release: tang-expr 0.2.0, tang-compile 0.1.0, tang-compress 0.1.0
+
+| crate | crates.io now | this release | depends on (tang-*) |
+| --- | --- | --- | --- |
+| `tang-expr` | 0.1.0, 0.1.1 | **0.2.0** | `tang` 0.2 (0.2.1 on the index) |
+| `tang-compile` | — | 0.1.0 (first publish) | `tang` 0.2, `tang-expr` 0.2 |
+| `tang-compress` | — | 0.1.0 (first publish) | `tang-la` 0.1, `tang-optim` 0.1, `tang-expr` 0.2 |
+
+`tang-expr` goes to 0.2.0, not 0.1.2: besides the additive `int`, `reverse`
+and `split` modules, the public alias `compile::CompiledMany` gained a
+`Send + Sync` bound (a non-`Send` closure that fit it before no longer does)
+and `abs`/`min`/`max`/`tanh` now trace to different graphs (`select`
+instead of `sqrt` forms), which changes `diff`/sparsity output. In 0.x,
+cargo treats the minor as the breaking digit.
+
+`tang-la` 0.1.1, `tang-optim` 0.1.1 and `tang` 0.2.1 are already on the
+index and unchanged in the parts these crates use, so they are not
+republished. Order (`scripts/publish.sh`):
+
+```sh
+cargo publish -p tang-expr
+cargo publish -p tang-compile
+cargo publish -p tang-compress
+```
+
+`tang-expr` dry-runs against crates.io alone. The two dependents cannot
+until `tang-expr` 0.2.0 is on the index; they were verified by packaging
+`tang-expr` and patching crates.io to that unpacked tarball (its normalized
+manifest takes `tang` from crates.io, so the graph is the real one):
+
+```sh
+cargo package -p tang-expr
+cargo publish --dry-run -p tang-compile \
+  --config 'patch.crates-io.tang-expr.path="target/package/tang-expr-0.2.0"'
+```
+
+(Patching to `crates/tang-expr` instead pulls a second, path-sourced `tang`
+into the graph and fails with a spurious "multiple versions of `tang`"
+error.)
+
+Published crates still requiring `tang-expr` 0.1 (`tang-gpu`, `tang-3dgs`,
+`tang-mesh`, …) keep resolving to 0.1.1; the workspace requirement is now
+`0.2`, so their next publish takes 0.2.
+
 tang is the root of the stack: publish it before phyz, kosm-render, vcad, kosm.
 
 ## Local development against a sibling checkout

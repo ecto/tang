@@ -1530,7 +1530,7 @@ fn numel_pts(pts: &[usize]) -> usize {
     pts.iter().product()
 }
 
-/// The CUDA calling convention every kernel of a [`to_cuda`] program
+/// The CUDA calling convention every kernel of a [`to_cuda`](crate::tensor::TensorGraph::to_cuda) program
 /// follows: `extern "C" __global__ void main0(const float* b{j}…, float* out,
 /// unsigned count)` with the reads in `WgslKernel::reads` order, launched
 /// as `count / workgroup_size` blocks of `workgroup_size` threads.
