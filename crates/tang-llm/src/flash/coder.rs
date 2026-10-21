@@ -1920,6 +1920,42 @@ impl Coder {
                         0,
                         tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti, plan],
                     );
+                    // Debug: the grouped decode kernel into `parts` (free until the down
+                    // projection), then compare.
+                    if env_is("TANG_CODER_WGEMM_CHECK", "1") {
+                        let refb = parts;
+                        self.launch_on(
+                            stream,
+                            self.kn().moe_gu_g,
+                            ((2 * ff / 16) as u32, groups, 1),
+                            256,
+                            (16 * 16 * r16g) as u32,
+                            tang_moe::args![gw, uw, sg, su, ids, mxq, refb, ti, r16g, fastk, plan],
+                        );
+                        self.dev.sync();
+                        let a = self.dev.download(&s.egu);
+                        let b = self.dev.download(&s.parts);
+                        let rows = 2 * ff;
+                        let (mut worst, mut wi, mut sum, mut cnt) = (0f64, 0usize, 0f64, 0usize);
+                        for i in 0..n * rows {
+                            let (x, y) = (a[i] as f64, b[i] as f64);
+                            let e = (x - y).abs() / y.abs().max(1e-3);
+                            sum += (x - y).abs();
+                            cnt += 1;
+                            if e > worst {
+                                worst = e;
+                                wi = i;
+                            }
+                        }
+                        eprintln!(
+                            "WGEMM check gu: {cnt} values, mean |diff| {:.3e}, worst rel {worst:.3e} at pair {} row {} (gemm {} vs ref {})",
+                            sum / cnt as f64,
+                            wi / rows,
+                            wi % rows,
+                            a[wi],
+                            b[wi]
+                        );
+                    }
                 } else {
                     self.launch_on(
                         stream,
