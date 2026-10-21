@@ -72,15 +72,41 @@ Run `flash-ref` before or after a benchmark, never during one: it uses the GPU t
 
 ## Results
 
-So far each number is one run (n = 1) per prompt per setting. The release table needs n ≥ 3 on
-one pod. The rows are in `crates/tang-llm/docs/speed-log.md` (Qwen3-Coder-Next section).
+Release run: H200 SXM (RunPod secure), driver 595.91.07, CUDA 12.8.1 image,
+`Qwen3-Coder-Next-UD-Q4_K_XL.gguf`, tang commit 79461fc (#110). n = 3 fresh processes, each
+running every prompt × drafts setting once. 512 output tokens, greedy. Tok/s is measured after
+the first token.
 
-| commit | GPU | prompt | drafts | tok/s (n = 1) |
-|---|---|---|---|---|
-| 4a76565 | H200 | explain | none | 246.7 |
-| 4a76565 | H200 | explain | suffix | ~250 |
-| 4a76565 | H200 | write | suffix | 247.2 |
-| 4a76565 (Q8X + bf16 router build) | H200 | refactor | suffix | 403.5 (2.71 tokens a window) |
+| prompt | drafts | tok/s min / median / max (n = 3) | tokens a window |
+|---|---|---|---|
+| explain | none | 234.4 / 234.4 / 234.4 | 1.00 |
+| refactor | none | 234.3 / 234.4 / 234.4 | 1.00 |
+| write | none | 234.1 / 234.2 / 234.4 | 1.00 |
+| explain | suffix | 237.3 / 238.1 / 238.5 | 1.13 |
+| refactor | suffix | 411.3 / 411.4 / 411.4 | 2.71 |
+| write | suffix | 256.6 / 256.6 / 256.9 | 1.25 |
 
-Drafts-off is the honest headline. Drafts only pay when the output repeats text the drafter
-has seen: about +70% on refactor-style edits, +1–9% on fresh code and prose.
+**Headline (drafts off): 234 tok/s**, single stream, on all three prompts. Drafts change the
+speed but never the output. They add about +1% on prose, +10% on fresh code, and +75% on
+edit-style output that copies its input.
+
+Earlier rows (n = 1 per pod, other pods) are in `crates/tang-llm/docs/speed-log.md`: 241–247
+on kernel-variant runs, after a warm-up. Pods differ by a few percent.
+
+### Serving load (same pod, `zest-harness` straight at `tang-llm serve`)
+
+`zest-harness --levels 1,2,4,8 --rounds 3 --max-tokens 256` (its built-in prompts, streaming),
+with suffix drafts off:
+
+| streams | per-stream tok/s p10 / p50 / p90 | total tok/s | TTFT p50 / p90 ms |
+|---|---|---|---|
+| 1 | 205.0 / 205.5 / 205.5 | 186 | 107 / 126 |
+| 2 | 205.3 / 205.5 / 205.7 | 195 | 1,307 / 1,413 |
+| 4 | 205.5 / 205.6 / 205.7 | 200 | 3,070 / 3,854 |
+| 8 | 205.6 / 205.7 / 205.8 | 200 | 7,374 / 8,157 |
+
+`flash serve` decodes one sequence at a time, so requests queue. Per-stream speed holds,
+total throughput stays at one stream's, and time to first token grows with the queue.
+Batching is designed in `crates/tang-llm/docs/qwen3next-batching.md`. With suffix drafts on,
+the harness reads 400–590 tok/s total, but its prompts repeat, so the drafter replays
+memorized greedy completions (7.5 tokens a window). That's not representative.

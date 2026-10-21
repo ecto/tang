@@ -61,6 +61,10 @@ pub struct Settings {
     pub warm: Vec<PathBuf>,
     /// Suffix drafts (the n-gram drafter over the sequence) for an engine without MTP.
     pub suffix: bool,
+    /// Learned pre-warm: each distinct tools block a client sends is recorded here as a minimal
+    /// request body (`tools-<hash>.json`), and every body here is prefilled at start, so a
+    /// client's first turn after a restart reuses its tools block.
+    pub warm_dir: Option<PathBuf>,
     /// Seed the expert cache from this routing profile. Without one, `routing.bin` in `disk`
     /// (written after every request) seeds it.
     pub profile: Option<PathBuf>,
@@ -381,6 +385,8 @@ pub struct FlashServe {
     dcfg: crate::draft::DraftConfig,
     dglobal: crate::draft::Global,
     dcalib: crate::draft::Calibration,
+    /// See [`Settings::warm_dir`].
+    warm_dir: Option<PathBuf>,
     tok: FlashTokenizer,
     /// Keeps request text out of the special tokens (see [`Shield`]).
     shield: Shield,
@@ -548,6 +554,7 @@ impl FlashServe {
             dcfg: crate::draft::DraftConfig::new(&e.draft_cost()),
             dglobal: crate::draft::Global::new(1 << 20, None),
             dcalib: crate::draft::Calibration::default(),
+            warm_dir: None,
             e,
             im_start: id("<|im_start|>")?,
             shield: Shield::new(&tok.tok),
@@ -592,7 +599,19 @@ impl FlashServe {
                 t.elapsed().as_secs_f64()
             );
         }
-        for f in &s.warm {
+        let mut warm = s.warm.clone();
+        if let Some(d) = &s.warm_dir {
+            std::fs::create_dir_all(d)?;
+            let mut v: Vec<PathBuf> = std::fs::read_dir(d)?
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "json"))
+                .collect();
+            v.sort();
+            warm.extend(v);
+        }
+        me.warm_dir = s.warm_dir.clone();
+        for f in &warm {
             let t = Instant::now();
             let body: Value = serde_json::from_str(&std::fs::read_to_string(f)?)
                 .with_context(|| format!("reading {}", f.display()))?;
@@ -1469,12 +1488,55 @@ impl FlashServe {
         self.expire_memory();
         let r = self.generate(req, on, ctl);
         self.live_at = crate::retention::now();
+        if r.is_ok() {
+            self.record_warm(req);
+        }
         if r.is_err() {
             // Whatever the engine holds now is unknown: start over next time.
             self.e.reset();
         }
         self.save_routing();
         r
+    }
+}
+
+impl FlashServe {
+    /// Record `req`'s tools block for the learned pre-warm (see [`Settings::warm_dir`]): a
+    /// body with just its tools and a placeholder turn, once per distinct tool set.
+    fn record_warm(&self, req: &Request) {
+        let (Some(d), Some(tools)) = (&self.warm_dir, req.tools.as_ref()) else {
+            return;
+        };
+        if !tools.as_array().is_some_and(|a| !a.is_empty()) {
+            return;
+        }
+        let text = tools.to_string();
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for b in text.bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+        let p = d.join(format!("tools-{h:016x}.json"));
+        if p.exists() {
+            return;
+        }
+        // At most 32 learned tool sets.
+        let n = std::fs::read_dir(d).map_or(0, |r| r.count());
+        if n >= 32 {
+            return;
+        }
+        let body = json!({
+            "messages": [{"role": "system", "content": "."}, {"role": "user", "content": "."}],
+            "tools": tools,
+            "max_tokens": 1,
+        });
+        match std::fs::write(&p, body.to_string()) {
+            Ok(()) => eprintln!(
+                "tang-llm: learned a new tools block for the pre-warm: {}",
+                p.display()
+            ),
+            Err(e) => eprintln!("tang-llm: recording {}: {e}", p.display()),
+        }
     }
 }
 
@@ -2082,6 +2144,7 @@ pub fn serve_replay(args: &[String]) -> Result<()> {
         dump: None,
         warm: Vec::new(),
         suffix: false,
+        warm_dir: None,
         profile,
     };
     let mut me = FlashServe::load(&s)?;
