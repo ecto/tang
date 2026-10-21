@@ -82,6 +82,8 @@ struct Variants {
     router_fused: bool,
     /// Warps a row of the K-split GEMV for matrices with at least 4096 rows (0: `kq`).
     kq_tall: usize,
+    /// Q4_K / Q5_K expert rows through `cx_dotq_fast` (32 weights a lane a step).
+    fastk: bool,
 }
 
 impl Variants {
@@ -106,6 +108,7 @@ impl Variants {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
             router_fused: env_is("TANG_CODER_ROUTER", "fused"),
+            fastk: env_is("TANG_CODER_FASTK", "1"),
             kq_tall: std::env::var("TANG_CODER_KQTALL")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -1170,6 +1173,7 @@ impl Coder {
         let (egu, hq, parts) = (self.a(&s.egu), self.a(&s.hq), self.a(&s.parts));
         let np = (t * (kk + 1)) as u32;
         let (ti, r16g, r16d) = (t as i32, layer.r16_gu, layer.r16_down);
+        let fastk = self.var.fastk as i32;
         let (r, yo, wn, xo, eps) = (
             self.a(&s.r),
             if keep_y { self.a(&s.moe_y) } else { 0u64 },
@@ -1210,7 +1214,7 @@ impl Coder {
                     ((2 * ff) as u32 / (8 * rg), np, 1),
                     256,
                     8 * rg * 16 * r16g as u32,
-                    tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti, r16g],
+                    tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti, r16g, fastk],
                 );
             }
             if self.var.dnk > 0 {
@@ -1239,7 +1243,7 @@ impl Coder {
                     ((n / 16) as u32, np, 1),
                     256,
                     (16 * 16 * r16d) as u32,
-                    tang_moe::args![dw, sd, ids, hq, parts, ti, r16d],
+                    tang_moe::args![dw, sd, ids, hq, parts, ti, r16d, fastk],
                 );
             } else {
                 self.launch_smem(
@@ -1251,7 +1255,7 @@ impl Coder {
                     (n as u32 / (8 * rg), np, 1),
                     256,
                     8 * rg * 16 * r16d as u32,
-                    tang_moe::args![dw, sd, ids, egu, parts, ti, r16d],
+                    tang_moe::args![dw, sd, ids, egu, parts, ti, r16d, fastk],
                 );
             }
             self.launch(
@@ -1682,12 +1686,14 @@ impl Coder {
             dnk: 0,
             router_fused: false,
             kq_tall: 0,
+            fastk: false,
         };
         for kv in spec.split(',').filter(|x| !x.is_empty()) {
             match kv {
                 "exrows=4" => v.exrows = 4,
                 "silu=fused" => v.silu_sep = false,
                 "router=fused" => v.router_fused = true,
+                "fastk=1" => v.fastk = true,
                 _ if kv.starts_with("kqtall=") => v.kq_tall = kv[7..].parse()?,
                 _ if kv.starts_with("guk=") => v.guk = kv[4..].parse()?,
                 _ if kv.starts_with("dnk=") => v.dnk = kv[4..].parse()?,
@@ -1773,6 +1779,34 @@ fn upload_dense(
                 bytes[i * rb..(i + 1) * rb].copy_from_slice(&src[j * rb..(j + 1) * rb]);
             }
         }
+        // TANG_CODER_ROUTER16=1: F32 rows (the router) as bf16, half the bytes.
+        let (ty, rb, bytes) = if ty == 0 && env_is("TANG_CODER_ROUTER16", "1") {
+            let b16: Vec<u8> = bytes
+                .chunks(4)
+                .flat_map(|c| {
+                    let x = f32::from_le_bytes([c[0], c[1], c[2], c[3]]).to_bits();
+                    (((x + 0x7fff + ((x >> 16) & 1)) >> 16) as u16).to_le_bytes()
+                })
+                .collect();
+            (30, k * 2, b16)
+        } else if ty == 8 && k.is_multiple_of(1024) && env_is("TANG_CODER_Q8X", "1") {
+            // Q8X (type 108): [k codes][k / 32 f16 scales] a row, lossless.
+            let nb = k / 32;
+            let mut out = Vec::with_capacity(rows * (k + 2 * nb));
+            for r in 0..rows {
+                let row = &bytes[r * rb..(r + 1) * rb];
+                for b in 0..nb {
+                    out.extend_from_slice(&row[b * 34 + 2..b * 34 + 34]);
+                }
+                for b in 0..nb {
+                    out.extend_from_slice(&row[b * 34..b * 34 + 2]);
+                }
+            }
+            (108, k + 2 * nb, out)
+        } else {
+            (ty, rb, bytes)
+        };
+        let mut bytes = bytes;
         // 16 bytes of slack: the GEMV stages rows with aligned 16-byte loads.
         total += rows * rb;
         bytes.extend_from_slice(&[0u8; 16]);
@@ -1786,7 +1820,7 @@ fn upload_dense(
             rb as u32,
             off as u32,
         ]);
-        if ty != 0 && ty != 30 {
+        if ty != 0 && ty != 30 && ty != 108 {
             segs16.push(rb);
         }
         ws.push(w);

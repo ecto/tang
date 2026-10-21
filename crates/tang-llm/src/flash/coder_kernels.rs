@@ -202,7 +202,54 @@ __device__ __forceinline__ float cx_dot8(const unsigned char* w, const unsigned 
     for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
     return acc;
 }
-__device__ __forceinline__ float cx_dot(int ty, const unsigned char* w, const unsigned char* xc, const float* xd, int k) {
+// Q4_K / Q5_K with each lane on 32 weights a step: 16 bytes of qs (sub-blocks 2j and 2j + 1,
+// positions l0..l0 + 16, low and high nibbles), its two scale/min pairs unpacked once, 8 dp4a.
+// Lane → (superblock lane / 8 of each group of 4, pair j, half l0). Rows and x must be 16-byte
+// aligned (staged expert rows are).
+template <int TY>
+__device__ __forceinline__ float cx_dotq_fast(const unsigned char* w, const unsigned char* xc, const float* xd, int k) {
+    const int lane = threadIdx.x & 31;
+    const int BB = TY == 12 ? 144 : 176, QS = TY == 12 ? 16 : 48;
+    const int sbl = lane >> 3, j = (lane & 7) >> 1, l0 = (lane & 1) * 16;
+    float acc = 0.f;
+    for (int sb = sbl; sb < k / 256; sb += 4) {
+        const unsigned char* b = w + sb * BB;
+        const float d = h2f(rd16(b)), dmin = h2f(rd16(b + 2));
+        int s0, m0, s1, m1;
+        scale_min_k4(2 * j, b + 4, s0, m0);
+        scale_min_k4(2 * j + 1, b + 4, s1, m1);
+        const uint4 q = *(const uint4*)(b + QS + j * 32 + l0);
+        uint4 hb = make_uint4(0, 0, 0, 0);
+        if (TY == 13) hb = *(const uint4*)(b + 16 + l0);
+        const int e = sb * 256 + j * 64 + l0;
+        const uint4 x0 = *(const uint4*)(xc + e), x1 = *(const uint4*)(xc + e + 32);
+        const unsigned qw[4] = {q.x, q.y, q.z, q.w}, hw[4] = {hb.x, hb.y, hb.z, hb.w};
+        const unsigned xa[4] = {x0.x, x0.y, x0.z, x0.w}, xb[4] = {x1.x, x1.y, x1.z, x1.w};
+        int sa = 0, sh = 0, ca = 0, ch = 0;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            unsigned lo = qw[i] & 0x0F0F0F0Fu, hi = (qw[i] >> 4) & 0x0F0F0F0Fu;
+            if (TY == 13) {
+                lo |= ((hw[i] >> (2 * j)) & 0x01010101u) << 4;
+                hi |= ((hw[i] >> (2 * j + 1)) & 0x01010101u) << 4;
+            }
+            sa = __dp4a((int)lo, (int)xa[i], sa);
+            sh = __dp4a((int)hi, (int)xb[i], sh);
+            ca = __dp4a(0x01010101, (int)xa[i], ca);
+            ch = __dp4a(0x01010101, (int)xb[i], ch);
+        }
+        const float dx0 = xd[e / 32], dx1 = xd[e / 32 + 1];
+        acc = fmaf(dx0, fmaf(d * i2f(s0), i2f(sa), -dmin * i2f(m0) * i2f(ca)), acc);
+        acc = fmaf(dx1, fmaf(d * i2f(s1), i2f(sh), -dmin * i2f(m1) * i2f(ch)), acc);
+    }
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    return acc;
+}
+__device__ __forceinline__ float cx_dot(int ty, const unsigned char* w, const unsigned char* xc, const float* xd, int k, int fast) {
+    if (fast && (((unsigned long long)w | (unsigned long long)xc) & 15) == 0) {
+        if (ty == 12) return cx_dotq_fast<12>(w, xc, xd, k);
+        if (ty == 13) return cx_dotq_fast<13>(w, xc, xd, k);
+    }
     switch (ty) {
         case 8: return cx_dot8<8>(w, xc, xd, k);
         case 2: return cx_dot8<2>(w, xc, xd, k);
@@ -236,7 +283,7 @@ __device__ __forceinline__ const unsigned char* cx_stage(const unsigned char* sr
 // Grid (2 FF / (8 R), T · (K + 1)), block 256, dynamic smem 8 R × r16 × 16 bytes.
 template <int R>
 __device__ __forceinline__ void moe_gu_body(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
-                                            const unsigned char* xq, float* out, int T, int r16) {
+                                            const unsigned char* xq, float* out, int T, int r16, int fast) {
     extern __shared__ uint4 dsm[];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, p = blockIdx.y;
     const bool shared = p >= T * CX_TOPK;
@@ -258,17 +305,17 @@ __device__ __forceinline__ void moe_gu_body(ExW g, ExW u, ExW sg, ExW su, const 
     const float* xd = (const float*)(xq + (size_t)XQ8_T * CX_HID);
     #pragma unroll
     for (int j = 0; j < R; j++) {
-        const float a = cx_dot(ty[j], w[j], xq + (size_t)t * CX_HID, xd + t * (CX_HID / 32), CX_HID);
+        const float a = cx_dot(ty[j], w[j], xq + (size_t)t * CX_HID, xd + t * (CX_HID / 32), CX_HID, fast);
         if (lane == 0) out[(size_t)p * 2 * CX_FF + rr[j]] = a;
     }
 }
 extern "C" __global__ void __launch_bounds__(256) cx_moe_gu(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
-                                                            const unsigned char* xq, float* out, int T, int r16) {
-    moe_gu_body<2>(g, u, sg, su, ids, xq, out, T, r16);
+                                                            const unsigned char* xq, float* out, int T, int r16, int fast) {
+    moe_gu_body<2>(g, u, sg, su, ids, xq, out, T, r16, fast);
 }
 extern "C" __global__ void __launch_bounds__(256) cx_moe_gu_r4(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
-                                                               const unsigned char* xq, float* out, int T, int r16) {
-    moe_gu_body<4>(g, u, sg, su, ids, xq, out, T, r16);
+                                                               const unsigned char* xq, float* out, int T, int r16, int fast) {
+    moe_gu_body<4>(g, u, sg, su, ids, xq, out, T, r16, fast);
 }
 
 // h = silu(gate) * up per pair, then int8 (fe_q8's rule) into hq: codes [CX_NP][FF], then
@@ -292,7 +339,7 @@ extern "C" __global__ void cx_silu_q(const float* gu, unsigned char* hq) {
 // Grid (HID / (8 R), T · (K + 1)), block 256, dynamic smem 8 R × r16 × 16 bytes.
 template <int R, bool FUSE>
 __device__ __forceinline__ void moe_down_body(ExW d, ExW sd, const unsigned* ids, const unsigned char* hq,
-                                              const float* gu, float* out, int T, int r16) {
+                                              const float* gu, float* out, int T, int r16, int fast) {
     extern __shared__ uint4 dsm[];
     __shared__ __align__(16) unsigned char hc[CX_FF];
     __shared__ float hs[CX_FF / 32];
@@ -333,21 +380,21 @@ __device__ __forceinline__ void moe_down_body(ExW d, ExW sd, const unsigned* ids
     }
     #pragma unroll
     for (int j = 0; j < R; j++) {
-        const float a = cx_dot(m.ty, w[j], hcodes, hd, CX_FF);
+        const float a = cx_dot(m.ty, w[j], hcodes, hd, CX_FF, fast);
         if (lane == 0) out[(size_t)p * CX_HID + rr[j]] = a;
     }
 }
 extern "C" __global__ void __launch_bounds__(256) cx_moe_down(ExW d, ExW sd, const unsigned* ids,
-                                                              const unsigned char* hq, float* out, int T, int r16) {
-    moe_down_body<2, false>(d, sd, ids, hq, nullptr, out, T, r16);
+                                                              const unsigned char* hq, float* out, int T, int r16, int fast) {
+    moe_down_body<2, false>(d, sd, ids, hq, nullptr, out, T, r16, fast);
 }
 extern "C" __global__ void __launch_bounds__(256) cx_moe_down_f2(ExW d, ExW sd, const unsigned* ids,
-                                                                 const float* gu, float* out, int T, int r16) {
-    moe_down_body<2, true>(d, sd, ids, nullptr, gu, out, T, r16);
+                                                                 const float* gu, float* out, int T, int r16, int fast) {
+    moe_down_body<2, true>(d, sd, ids, nullptr, gu, out, T, r16, fast);
 }
 extern "C" __global__ void __launch_bounds__(256) cx_moe_down_f4(ExW d, ExW sd, const unsigned* ids,
-                                                                 const float* gu, float* out, int T, int r16) {
-    moe_down_body<4, true>(d, sd, ids, nullptr, gu, out, T, r16);
+                                                                 const float* gu, float* out, int T, int r16, int fast) {
+    moe_down_body<4, true>(d, sd, ids, nullptr, gu, out, T, r16, fast);
 }
 
 // ---- K-split dense GEMV ----
@@ -394,6 +441,26 @@ __device__ __forceinline__ void dotkf(const unsigned char* w, const float* x, in
         }
     }
 }
+// Q8X: Q8_0 rows repacked at load (lossless): [k int8 codes][k / 32 f16 scales], so a lane
+// reads 16 codes with one aligned load. Type id 108. (k / Q) % 512 == 0.
+template <int T>
+__device__ __forceinline__ void dotq8x(const unsigned char* w, const unsigned char* xq, int k, int k0, int k1, float* acc) {
+    const int lane = threadIdx.x & 31;
+    const float* xd = (const float*)(xq + (size_t)XQ8_T * k);
+    const unsigned short* sc = (const unsigned short*)(w + k);
+    for (int e0 = k0 + lane * 16; e0 < k1; e0 += 512) {
+        const uint4 c = *(const uint4*)(w + e0);
+        const float dw = h2f(sc[e0 / 32]);
+        #pragma unroll
+        for (int t = 0; t < T; t++) {
+            const uint4 xv = *(const uint4*)(xq + (size_t)t * k + e0);
+            const float dx = xd[t * (k / 32) + e0 / 32];
+            const int s = __dp4a((int)c.x, (int)xv.x, __dp4a((int)c.y, (int)xv.y,
+                          __dp4a((int)c.z, (int)xv.z, __dp4a((int)c.w, (int)xv.w, 0))));
+            acc[t] = fmaf(dx * dw, i2f(s), acc[t]);
+        }
+    }
+}
 template <int T, int Q>
 __device__ void gemvk_body(const Seg* segs, int nseg, const float* x, const unsigned char* xq, int k, float* out, int ostride) {
     __shared__ float part[8][MAXT];
@@ -412,6 +479,7 @@ __device__ void gemvk_body(const Seg* segs, int nseg, const float* x, const unsi
         switch (sg.type) {
             case 30: dotkf<T, 30>(w, x, k, k0, k1, acc); break;
             case 0: dotkf<T, 0>(w, x, k, k0, k1, acc); break;
+            case 108: dotq8x<T>(w, xq, k, k0, k1, acc); break;
             case 8: dotk8<T, 8>(w, xq, k, k0, k1, acc); break;
             case 2: dotk8<T, 2>(w, xq, k, k0, k1, acc); break;
             case 20: dotk8<T, 20>(w, xq, k, k0, k1, acc); break;
