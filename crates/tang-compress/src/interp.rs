@@ -35,7 +35,7 @@ use crate::codec::Decoded;
 pub const MAGIC: &[u8; 4] = b"TCI1";
 
 /// Magnitude that marks an escaped (raw f32) point.
-const ESC: u64 = 1 << 24;
+pub(crate) const ESC: u64 = 1 << 24;
 const LVL: usize = 4;
 const ACT: usize = 9;
 const PREV: usize = 3;
@@ -206,7 +206,7 @@ fn get(d: &mut Decoder, m: &mut Models, cx: Ctx) -> Result<i64, f32> {
 
 /// Quantize one point: `(q, reconstruction, escaped)`.
 #[inline]
-fn quant(x: f32, pred: f64, step: f64, b: f64) -> (i64, f32, bool) {
+pub(crate) fn quant(x: f32, pred: f64, step: f64, b: f64) -> (i64, f32, bool) {
     let qf = ((x as f64 - pred) / step).round();
     if qf.abs() < (ESC - 1) as f64 {
         let q = qf as i64;
@@ -347,14 +347,26 @@ pub fn encode_psnr_f32(x: &[f32], dims: &[usize], psnr: f64) -> Vec<u8> {
 }
 
 fn rate_controlled(x: &[f32], dims: &[usize], rmse: f64, tune: (f64, f64)) -> Vec<u8> {
-    let budget = rmse * rmse * x.len() as f64;
+    rate_control(x.len(), rmse, |b| encode_sse(x, dims, b, tune))
+}
+
+/// Rate control of a max-abs bound `b` for an RMSE target over `n` values:
+/// the largest `b` whose stream (`enc(b)` returns it with its exact squared
+/// error) meets the budget, by secant steps on `log SSE(log b)` inside a
+/// bisection bracket (≤ 12 encodes, then halving by 4 until it passes).
+pub(crate) fn rate_control(
+    n: usize,
+    rmse: f64,
+    mut enc: impl FnMut(f64) -> (Vec<u8>, f64),
+) -> Vec<u8> {
+    let budget = rmse * rmse * n as f64;
     // uniform quantization error ≈ b/√3 at the finest level
     let mut b = rmse * 3f64.sqrt();
     // (log b, log sse) of the tightest pass and the loosest fail
     let mut ok: Option<(f64, f64, Vec<u8>)> = None;
     let mut bad: Option<(f64, f64)> = None;
     for _ in 0..12 {
-        let (s, sse) = encode_sse(x, dims, b, tune);
+        let (s, sse) = enc(b);
         let (lb, ls) = (b.ln(), sse.max(1e-300).ln());
         if sse <= budget {
             let close = sse >= budget * 0.99;
@@ -394,7 +406,7 @@ fn rate_controlled(x: &[f32], dims: &[usize], rmse: f64, tune: (f64, f64)) -> Ve
             let mut b = bad.map_or(rmse, |f| f.0.exp());
             loop {
                 b *= 0.25;
-                let (s, sse) = encode_sse(x, dims, b, tune);
+                let (s, sse) = enc(b);
                 if sse <= budget {
                     return s;
                 }
