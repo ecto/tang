@@ -805,6 +805,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "cram-codec"
+version = "0.1.0"
+dependencies = [
+ "faer 0.24.0",
+ "pollster",
+ "tang-expr",
+ "tang-la",
+ "tang-optim",
+ "web-time",
+ "wgpu",
+]
+
+[[package]]
+name = "cram-codec-wasm"
+version = "0.1.0"
+dependencies = [
+ "cram-codec",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wgpu",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6145,39 +6169,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "cram-codec"
-version = "0.1.0"
-dependencies = [
- "faer 0.24.0",
- "pollster",
- "tang-expr",
- "tang-la",
- "tang-optim",
- "web-time",
- "wgpu",
-]
-
-[[package]]
-name = "cram-codec-wasm"
-version = "0.1.0"
-dependencies = [
- "js-sys",
- "cram-codec",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wgpu",
-]
-
-[[package]]
 name = "tang-compute"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "cram-codec",
  "cudarc 0.16.6",
  "metal 0.33.0",
  "objc",
  "tang",
- "cram-codec",
  "tang-expr",
 ]
 
@@ -6260,6 +6260,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.22.1",
+ "cram-codec",
  "cudarc 0.16.6",
  "image",
  "libc",
@@ -6277,7 +6278,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tang-ad",
- "cram-codec",
  "tang-compute",
  "tang-moe",
  "tang-tensor",
