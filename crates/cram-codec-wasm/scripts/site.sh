@@ -20,6 +20,7 @@ cp "$M" demo/corpus/model.tcm
   demo/fields.txt demo/corpus demo/corpus/model.tcm --threads ${THREADS:-6}
 rm -rf "$OUT" && mkdir -p "$OUT/demo"
 cp site/index.html "$OUT/"
+mkdir -p "$OUT/examples" && cp site/examples/*.webp site/examples/*.json "$OUT/examples/"
 cp demo/index.html "$OUT/demo/"
 cp -R demo/pkg demo/corpus "$OUT/demo/"
 rm -f "$OUT/demo/pkg/.gitignore" "$OUT/demo/pkg/package.json"

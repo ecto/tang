@@ -115,6 +115,30 @@ pre .kw { color: oklch(0.58 0.2 300); } pre .fn { color: var(--flame-ink); } pre
 .foot .logo { font-size: 40px; font-weight: 600; letter-spacing: -0.03em; color: var(--fg); margin-bottom: 1rem; }
 .foot .logo span { color: var(--flame); }
 .foot p { max-width: 52ch; margin: 0 auto .6rem; }
+
+/* examples */
+.ex-tabs { display: flex; flex-wrap: wrap; gap: 16px; font-size: var(--s-sm); margin-bottom: 14px; }
+.ex-tabs button { background: none; border: 0; color: var(--muted); cursor: pointer; font: inherit; padding: 0; }
+.ex-tabs button.on { color: var(--fg); text-decoration: underline; text-decoration-color: var(--flame); text-underline-offset: 5px; }
+.ex-grid { display: grid; grid-template-columns: repeat(5, minmax(0,1fr)); gap: 8px; }
+@media (max-width: 640px) { .ex-grid { grid-template-columns: repeat(2, minmax(0,1fr)); } .ex-grid figure:first-child { grid-column: span 2; } }
+.ex-grid figure img { width: 100%; aspect-ratio: 1; display: block; background: var(--bg); }
+.ex-grid figcaption { font-size: var(--s-xs); color: var(--muted); margin-top: 6px; line-height: 1.45; }
+.ex-grid figcaption b { color: var(--fg); font-weight: 500; }
+.ex-table { width: 100%; border-collapse: collapse; font-size: var(--s-sm); margin-top: 18px; }
+.ex-table th { text-align: left; font-weight: 500; font-size: var(--s-xs); color: var(--muted); padding: 0 8px 6px 0; }
+.ex-table td { padding: 6px 8px 6px 0; border-top: 0.5px solid var(--border-muted); }
+.ex-table td:not(:first-child), .ex-table th:not(:first-child) { text-align: right; }
+.ex-table tr.me td { color: var(--fg); font-weight: 600; }
+.ex-table tr.me td:first-child { color: var(--flame-ink); }
+.ex-note { font-size: var(--s-sm); color: var(--muted); margin-top: 12px; }
+.rd svg { width: 100%; height: auto; display: block; }
+.rd text { font-family: "IBM Plex Sans", sans-serif; font-size: 11px; fill: var(--muted); }
+.rd .ax { stroke: var(--border); stroke-width: .75; }
+.rd .ln { fill: none; stroke-width: 1.5; }
+.rd .lbl { font-size: 11.5px; font-weight: 500; }
+.demo-cta { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-top: 2.5rem; padding: 18px 20px; background: color-mix(in oklab, var(--flame) 10%, transparent); }
+.demo-cta p { color: var(--fg); max-width: 50ch; }
 #theme { position: fixed; top: 16px; right: 16px; width: 36px; height: 36px; display: grid; place-items: center; background: var(--bg); color: var(--fg); border: 0.5px solid var(--border-muted); cursor: pointer; }
 #theme:hover { color: var(--flame); }
 </style>
@@ -180,6 +204,27 @@ pre .kw { color: oklch(0.58 0.2 300); } pre .fn { color: var(--flame-ink); } pre
 </div></section>
 
 <section><div class="wrap">
+  <h2>See it on real data</h2>
+  <p class="lead">Each slice below comes from an actual encode and decode, with every codec tuned to its cheapest setting that reaches 60 dB PSNR on the decoded volume. All error maps for a field share one color scale, so brighter means larger error.</p>
+  <div class="ex-tabs" id="ex-tabs"></div>
+  <div class="fig"><div class="ex-grid" id="ex-grid"></div></div>
+  <table class="ex-table" id="ex-table"></table>
+  <p class="ex-note" id="ex-note"></p>
+
+  <div class="mech" style="margin-top:4.5rem">
+    <div class="mech-h">Rate vs. quality</div>
+    <p>The same field at five quality targets: bits per value against measured PSNR. Lower and further right is better.</p>
+  </div>
+  <div class="fig rd" id="rd" style="margin-top:1rem"></div>
+  <p class="fig-cap"><span class="fig-n">Fig 2</span>miranda-density, 64×128×128 f32. Each point is the cheapest setting that reaches its PSNR target, measured on the decoded output. At 100 dB, cram uses about half of SPERR's bits and about a quarter of SZ3's.</p>
+
+  <div class="demo-cta">
+    <p>Decode real cram streams in your browser. The WebGPU path and the WASM CPU path are compared byte for byte.</p>
+    <a class="btn" href="/demo/">Open the live demo →</a>
+  </div>
+</div></section>
+
+<section><div class="wrap">
   <h2>How it works</h2>
   <div class="pipe"><span>f32 field</span><b>→</b><span>CDF 9/7 wavelet</span><b>→</b><span>integer prediction</span><b>→</b><span>quantize</span><b>→</b><span class="on">context-mixed rANS</span><b>→</b><span>stream</span></div>
   <div class="mech">
@@ -214,6 +259,49 @@ document.getElementById("copy").onclick = async (e) => {
   try { await navigator.clipboard.writeText("cargo add cram-codec"); h.textContent = "copied"; } catch { h.textContent = "select + copy"; }
   setTimeout(() => (h.textContent = "copy"), 1500);
 };
+
+const C = { cram: "cram", sperr: "SPERR", sz3: "SZ3", zfp: "ZFP" };
+const kb = (b) => b < 1e6 ? (b / 1024).toFixed(1) + " KB" : (b / 1048576).toFixed(1) + " MB";
+fetch("/examples/examples.json").then((r) => r.json()).then((ex) => {
+  const tabs = document.getElementById("ex-tabs");
+  const show = (i) => {
+    const f = ex.fields[i], im = f.images, c = f.codecs;
+    [...tabs.children].forEach((b, j) => b.classList.toggle("on", j === i));
+    const cap = { original: `<b>original</b> ${kb(f.original_bytes)}`, cram: `<b>cram</b> ${kb(c.cram.bytes)}, ${c.cram.psnr.toFixed(1)} dB`,
+      "cram-err": "<b>cram</b> |error|", "sz3-err": "<b>SZ3</b> |error|", "zfp-err": "<b>ZFP</b> |error|" };
+    document.getElementById("ex-grid").innerHTML = Object.keys(cap).map((k) =>
+      `<figure><img loading="lazy" decoding="async" width="480" height="480" src="/examples/${im[k]}" alt="${f.name} ${k}"><figcaption>${cap[k]}</figcaption></figure>`).join("");
+    const rows = Object.keys(C).filter((k) => c[k]).sort((a, b) => c[a].bytes - c[b].bytes);
+    document.getElementById("ex-table").innerHTML =
+      `<tr><th>${f.name} · ${f.dims.join("×")}</th><th>size</th><th>ratio</th><th>PSNR</th><th>vs SPERR</th></tr>` +
+      rows.map((k) => `<tr class="${k === "cram" ? "me" : ""}"><td>${C[k]}</td><td>${kb(c[k].bytes)}</td><td>${c[k].ratio.toFixed(0)}×</td><td>${c[k].psnr.toFixed(1)} dB</td><td>${(1 / c[k].vs_sperr).toFixed(2)}× bits</td></tr>`).join("");
+    const best = rows[0];
+    document.getElementById("ex-note").textContent = best === "cram"
+      ? `cram is the smallest stream here, at ${(c.sperr.bytes / c.cram.bytes).toFixed(2)}× less data than SPERR.`
+      : `On this field ${C[best]} is ${((1 - c[best].bytes / c.cram.bytes) * 100).toFixed(0)}% smaller than cram. We show it because it's measured; cram doesn't win everywhere.`;
+  };
+  ex.fields.forEach((f, i) => { const b = document.createElement("button"); b.textContent = f.name; b.onclick = () => show(i); tabs.appendChild(b); });
+  show(0);
+}).catch(() => {});
+fetch("/examples/rd.json").then((r) => r.json()).then((rd) => {
+  const W = 680, H = 300, L = 44, R = 64, T = 12, B = 32;
+  const all = Object.values(rd.points).flat();
+  const xs = [38, 102], ymax = Math.ceil(Math.max(...all.map((p) => p.bpv)));
+  const X = (v) => L + (v - xs[0]) / (xs[1] - xs[0]) * (W - L - R), Y = (v) => H - B - v / ymax * (H - T - B);
+  const col = { cram: "var(--flame)", sperr: "var(--fg)", sz3: "var(--link)", zfp: "var(--c3)" };
+  let g = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="bits per value vs PSNR">`;
+  for (let v = 0; v <= ymax; v++) g += `<line class="ax" x1="${L}" x2="${W - R}" y1="${Y(v)}" y2="${Y(v)}" opacity=".5"/><text x="${L - 8}" y="${Y(v) + 4}" text-anchor="end">${v}</text>`;
+  for (let v = 40; v <= 100; v += 20) g += `<text x="${X(v)}" y="${H - 10}" text-anchor="middle">${v} dB</text>`;
+  g += `<text x="${L}" y="${T + 2}" dy="-2">bits / value</text>`;
+  for (const [k, pts] of Object.entries(rd.points)) {
+    const d = pts.map((p, i) => `${i ? "L" : "M"}${X(p.psnr).toFixed(1)},${Y(p.bpv).toFixed(1)}`).join("");
+    const last = pts[pts.length - 1];
+    g += `<path class="ln" d="${d}" stroke="${col[k]}" ${k === "cram" ? 'stroke-width="2.5"' : 'opacity=".75"'}/>`;
+    g += pts.map((p) => `<circle cx="${X(p.psnr)}" cy="${Y(p.bpv)}" r="${k === "cram" ? 3 : 2}" fill="${col[k]}"/>`).join("");
+    g += `<text class="lbl" x="${X(last.psnr) + 8}" y="${Y(last.bpv) + 4}" style="fill:${col[k]}">${C[k]}</text>`;
+  }
+  document.getElementById("rd").innerHTML = g + "</svg>";
+}).catch(() => {});
 const root = document.documentElement;
 try { const t = localStorage.getItem("cram-theme"); if (t) root.dataset.theme = t; } catch {}
 document.getElementById("theme").onclick = () => {

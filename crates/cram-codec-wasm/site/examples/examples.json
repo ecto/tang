@@ -1,0 +1,302 @@
+{
+ "target_psnr_db": 60.0,
+ "fields": [
+  {
+   "name": "miranda-density",
+   "dims": [
+    64,
+    128,
+    128
+   ],
+   "original_bytes": 4194304,
+   "slice_z": 32,
+   "codecs": {
+    "cram": {
+     "bytes": 28591,
+     "psnr": 60.002311820851155,
+     "max_abs": 0.014742136001586914,
+     "knob": "auto --model hand --psnr 60.00",
+     "chose": "tucker",
+     "ratio": 146.70015039697807,
+     "bpv": 0.21813201904296875,
+     "vs_sperr": 1.4072260501556433
+    },
+    "sperr": {
+     "bytes": 40234,
+     "psnr": 60.000966214475895,
+     "max_abs": 0.02144312858581543,
+     "knob": "--psnr 50.91",
+     "ratio": 104.24775065864692,
+     "bpv": 0.3069610595703125,
+     "vs_sperr": 1.0
+    },
+    "sz3": {
+     "bytes": 76144,
+     "psnr": 60.00079388492079,
+     "max_abs": 0.005181550979614258,
+     "knob": "PSNR mode 56.42",
+     "ratio": 55.08384114309729,
+     "bpv": 0.5809326171875,
+     "vs_sperr": 0.5283935700777475
+    },
+    "zfp": {
+     "bytes": 199048,
+     "psnr": 62.07865546660523,
+     "max_abs": 0.010347604751586914,
+     "knob": "tolerance 0.125",
+     "ratio": 21.07182187211125,
+     "bpv": 1.51861572265625,
+     "vs_sperr": 0.20213214902937984
+    }
+   },
+   "cram_other_model": {
+    "bytes": 28591,
+    "psnr": 60.002311820851155,
+    "max_abs": 0.014742136001586914,
+    "knob": "auto --model pre3_32x16.tcm --psnr 60.00",
+    "chose": "tucker"
+   },
+   "images": {
+    "original": "miranda-density-original.webp",
+    "cram": "miranda-density-cram.webp",
+    "cram-err": "miranda-density-cram-err.webp",
+    "sz3-err": "miranda-density-sz3-err.webp",
+    "zfp-err": "miranda-density-zfp-err.webp"
+   },
+   "image_scale": {
+    "field_cmap": "cividis",
+    "field_range": [
+     1.0075653791427612,
+     2.832500457763672
+    ],
+    "field_range_note": "0.5/99.5 percentile of original slice",
+    "error_cmap": "magma",
+    "error_range": [
+     0.0,
+     0.005751122236251826
+    ],
+    "error_range_note": "shared across cram/sz3/zfp error maps: 0..max of their 99.5th percentiles"
+   }
+  },
+  {
+   "name": "hurricane-TC",
+   "dims": [
+    64,
+    128,
+    128
+   ],
+   "original_bytes": 4194304,
+   "slice_z": 32,
+   "codecs": {
+    "cram": {
+     "bytes": 4089,
+     "psnr": 60.000211716003946,
+     "max_abs": 1.3070509433746338,
+     "knob": "auto --model hand --psnr 60.00",
+     "chose": "wavelet",
+     "ratio": 1025.7529958425043,
+     "bpv": 0.03119659423828125,
+     "vs_sperr": 0.942284177060406
+    },
+    "sperr": {
+     "bytes": 3853,
+     "psnr": 60.00229253602386,
+     "max_abs": 1.112930715084076,
+     "knob": "--pwe 1.14",
+     "ratio": 1088.5813651699973,
+     "bpv": 0.02939605712890625,
+     "vs_sperr": 1.0
+    },
+    "sz3": {
+     "bytes": 11342,
+     "psnr": 60.00191631591324,
+     "max_abs": 0.26882922649383545,
+     "knob": "ABS mode 0.2688",
+     "ratio": 369.8028566390407,
+     "bpv": 0.0865325927734375,
+     "vs_sperr": 0.3397108093810615
+    },
+    "zfp": {
+     "bytes": 109424,
+     "psnr": 62.251474683396786,
+     "max_abs": 0.5897984504699707,
+     "knob": "tolerance 8",
+     "ratio": 38.33075010966515,
+     "bpv": 0.8348388671875,
+     "vs_sperr": 0.03521165375054833
+    }
+   },
+   "cram_other_model": {
+    "bytes": 4089,
+    "psnr": 60.000211716003946,
+    "max_abs": 1.3070509433746338,
+    "knob": "auto --model pre3_32x16.tcm --psnr 60.00",
+    "chose": "wavelet"
+   },
+   "images": {
+    "original": "hurricane-TC-original.webp",
+    "cram": "hurricane-TC-cram.webp",
+    "cram-err": "hurricane-TC-cram-err.webp",
+    "sz3-err": "hurricane-TC-sz3-err.webp",
+    "zfp-err": "hurricane-TC-zfp-err.webp"
+   },
+   "image_scale": {
+    "field_cmap": "cividis",
+    "field_range": [
+     -33.438106536865234,
+     -30.65853500366211
+    ],
+    "field_range_note": "0.5/99.5 percentile of original slice",
+    "error_cmap": "magma",
+    "error_range": [
+     0.0,
+     0.20535419464111287
+    ],
+    "error_range_note": "shared across cram/sz3/zfp error maps: 0..max of their 99.5th percentiles"
+   }
+  },
+  {
+   "name": "nyx-temperature",
+   "dims": [
+    64,
+    128,
+    128
+   ],
+   "original_bytes": 4194304,
+   "slice_z": 32,
+   "codecs": {
+    "cram": {
+     "bytes": 58325,
+     "psnr": 60.00003491872741,
+     "max_abs": 872.71875,
+     "knob": "auto --model hand --psnr 60.00",
+     "chose": "wavelet",
+     "ratio": 71.9126275182169,
+     "bpv": 0.44498443603515625,
+     "vs_sperr": 1.2861380197171024
+    },
+    "sperr": {
+     "bytes": 75014,
+     "psnr": 60.00052587692608,
+     "max_abs": 1022.412109375,
+     "knob": "--psnr 54.84",
+     "ratio": 55.91361612499,
+     "bpv": 0.5723114013671875,
+     "vs_sperr": 1.0
+    },
+    "sz3": {
+     "bytes": 129776,
+     "psnr": 60.20022911318441,
+     "max_abs": 237.1142578125,
+     "knob": "PSNR mode 57.80",
+     "ratio": 32.319566021452346,
+     "bpv": 0.9901123046875,
+     "vs_sperr": 0.5780267537911479
+    },
+    "zfp": {
+     "bytes": 251648,
+     "psnr": 64.10438813528322,
+     "max_abs": 513.568359375,
+     "knob": "tolerance 4096",
+     "ratio": 16.66734486266531,
+     "bpv": 1.919921875,
+     "vs_sperr": 0.298090984231943
+    }
+   },
+   "cram_other_model": {
+    "bytes": 58325,
+    "psnr": 60.00003491872741,
+    "max_abs": 872.71875,
+    "knob": "auto --model pre3_32x16.tcm --psnr 60.00",
+    "chose": "wavelet"
+   },
+   "images": {
+    "original": "nyx-temperature-original.webp",
+    "cram": "nyx-temperature-cram.webp",
+    "cram-err": "nyx-temperature-cram-err.webp",
+    "sz3-err": "nyx-temperature-sz3-err.webp",
+    "zfp-err": "nyx-temperature-zfp-err.webp"
+   },
+   "image_scale": {
+    "field_cmap": "cividis",
+    "field_range": [
+     3171.21142578125,
+     37235.1796875
+    ],
+    "field_range_note": "0.5/99.5 percentile of original slice",
+    "error_cmap": "magma",
+    "error_range": [
+     0.0,
+     375.03162109374694
+    ],
+    "error_range_note": "shared across cram/sz3/zfp error maps: 0..max of their 99.5th percentiles"
+   }
+  }
+ ],
+ "provenance": {
+  "generated": "2026-10-21T14:57:19+0000",
+  "host": "mew",
+  "gpu": "GPU 0: NVIDIA GeForce RTX 3090 (UUID: GPU-5bc77d16-aa3a-4076-0bbd-ddc88eb7a3e3)",
+  "tang_commit": "f9a4af1452b35a4fa83c5096c7794257809c4f5f",
+  "cram_codec_version": "version.workspace = true",
+  "tc_build": "CARGO_TARGET_DIR=$HOME/tang-pub/target cargo build --release -p cram-codec --example tc",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+  "sperr": {
+   "version": "SPERR version       : 0.8.5",
+   "commit": "b8012586908aaabba993038d183b3937c8ea9c7c",
+   "source": "https://github.com/NCAR/SPERR (built Release, USE_OMP=ON, run --omp 1)"
+  },
+  "sz3": {
+   "pysz": "Version: 1.1.0"
+  },
+  "zfp": {
+   "zfpy": "Version: 1.0.1"
+  },
+  "psnr_def": "20*log10((max-min)/RMSE) over the full 64x128x128 volume, float64",
+  "matching": "every codec: bisection on its knob for the cheapest setting whose MEASURED PSNR >= target; SPERR = min(--psnr, --pwe), SZ3 = min(PSNR mode, ABS mode), ZFP = min(fixed-accuracy tolerance, fixed-precision 4..32); cram = min over --psnr knob in target+-3",
+  "cram_pick": "smaller of tc auto --model hand and --model pretrained:pre3_32x16.tcm (pretrained decode needs the same model file)",
+  "script": "mk_examples.py (this directory)",
+  "example_commands": [
+   "pysz sz.compress(PSNR=100.00)",
+   "pysz sz.compress(PSNR=115.00)",
+   "pysz sz.compress(PSNR=55.00)",
+   "pysz sz.compress(PSNR=70.00)",
+   "pysz sz.compress(PSNR=75.00)",
+   "pysz sz.compress(PSNR=85.00)",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 100 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 100.0 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 115 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 25.00011444091797 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 25.000228881835938 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 25.000457763671875 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 25.00091552734375 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 25.0018310546875 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 25.003662109375 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 25.00732421875 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 25.0146484375 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 25.029296875 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 25.05859375 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 25.1171875 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 25.234375 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 25.46875 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 25.9375 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 26.875 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 28.75 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 32.5 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 40.0 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 43.75 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 44.21875 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 44.27734375 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 44.306640625 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 44.3212890625 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 44.324951171875 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 44.3267822265625 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 44.32701110839844 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 44.327125549316406 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 44.327239990234375 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 44.32769775390625 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 44.32861328125 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32",
+   "~/cram-dist/work/SPERR/build/bin/sperr3d -c --ftype 32 --dims 128 128 64 --psnr 44.3359375 --bitstream ~/cram-dist/work/tmp/s.bs --omp 1 ~/cram-dist/work/tmp/s_in.f32"
+  ]
+ }
+}
