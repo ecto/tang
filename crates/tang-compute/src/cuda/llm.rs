@@ -1141,6 +1141,10 @@ impl CudaComputeDevice {
         self.fused_unary("gelu_tanh", x, n, n as u32, None)
     }
 
+    pub(super) fn gelu_erf_llm(&self, x: &CudaBuffer, n: usize) -> CudaBuffer {
+        self.fused_unary("gelu_erf", x, n, n as u32, None)
+    }
+
     pub(super) fn gated_split_llm(
         &self,
         name: &'static str,
@@ -1774,6 +1778,12 @@ mod tests {
             &c.download(&c.gelu_tanh(&c.upload(&gu), gu.len())),
             1e-5,
             "gelu_tanh",
+        );
+        close(
+            &g.download(&g.gelu_erf(&g.upload(&gu), gu.len())),
+            &c.download(&c.gelu_erf(&c.upload(&gu), gu.len())),
+            1e-5,
+            "gelu_erf",
         );
         let a = vals(rows * dim, 20, 3.0);
         let b = vals(rows * dim, 21, 3.0);

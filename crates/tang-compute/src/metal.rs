@@ -2205,6 +2205,18 @@ kernel void embedding(
         }
     }
 
+    fn gelu_erf(&self, x: &MetalBuffer, n: usize) -> MetalBuffer {
+        let pipeline = self.get_pipeline(llm_msl::FUSED_MSL, "gelu_erf");
+        let out = self.make_buffer_empty(n * 4);
+        let params = self.make_buffer_u32(&[n as u32]);
+        self.dispatch(&pipeline, &[&x.buffer, &out, &params], n as u64);
+        MetalBuffer {
+            buffer: out,
+            len: n,
+            kind: Kind::F32,
+        }
+    }
+
     fn geglu_split(&self, gu: &MetalBuffer, rows: usize, ff: usize) -> MetalBuffer {
         let pipeline = self.get_pipeline(llm_msl::FUSED_MSL, "geglu_split");
         let out = self.make_buffer_empty(rows * ff * 4);

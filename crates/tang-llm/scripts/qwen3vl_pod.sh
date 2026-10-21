@@ -9,6 +9,8 @@ export HF_HOME=/root/hf CARGO_TARGET_DIR=/root/target
 say() { echo "=== $* ($(date -u +%H:%M:%S))"; }
 
 say setup
+# The image's own start script runs sshd with PUBLIC_KEY (for direct SSH while this runs).
+[ -x /start.sh ] && (/start.sh >/dev/null 2>&1 &)
 command -v cargo >/dev/null || { curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal >/dev/null; }
 source "$HOME/.cargo/env"
 rm -rf /root/tang && git clone -q --depth 1 -b "$BRANCH" https://github.com/ecto/tang /root/tang
