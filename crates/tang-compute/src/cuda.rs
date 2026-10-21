@@ -4766,6 +4766,10 @@ impl ComputeDevice for CudaComputeDevice {
         self.gelu_tanh_llm(x, n)
     }
 
+    fn gelu_erf(&self, x: &CudaBuffer, n: usize) -> CudaBuffer {
+        self.gelu_erf_llm(x, n)
+    }
+
     fn geglu_split(&self, gu: &CudaBuffer, rows: usize, ff: usize) -> CudaBuffer {
         self.gated_split_llm("geglu_split", gu, rows, ff)
     }

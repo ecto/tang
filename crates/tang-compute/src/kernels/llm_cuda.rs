@@ -821,6 +821,13 @@ extern "C" __global__ void gelu_tanh(const float* __restrict__ X, float* __restr
     if (i < n) Y[i] = gelu(X[i]);
 }
 
+// GELU, exact: 0.5 x (1 + erf(x / sqrt 2)).
+extern "C" __global__ void gelu_erf(const float* __restrict__ X, float* __restrict__ Y, unsigned int n)
+{
+    u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) Y[i] = 0.5f * X[i] * (1.0f + erff(X[i] * 0.70710678118654752f));
+}
+
 // Over a fused gate/up projection `[rows, 2*ff]`: gelu_tanh(gate) * up and silu(gate) * up.
 extern "C" __global__ void geglu_split(
     const float* __restrict__ GU, float* __restrict__ Y, unsigned int rows, unsigned int ff)

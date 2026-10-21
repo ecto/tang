@@ -208,8 +208,10 @@ fn vl<D: ComputeDevice>(
             println!("{} {}", p.grid_h, p.grid_w);
         }
         "vl-trace" => {
-            let [f, gh, gw] = pos.as_slice() else {
-                bail!("vl-trace <dir> <patches.f32> <grid-h> <grid-w>")
+            let (f, gh, gw, out) = match pos.as_slice() {
+                [f, gh, gw] => (f, gh, gw, None),
+                [f, gh, gw, out] => (f, gh, gw, Some(out)),
+                _ => bail!("vl-trace <dir> <patches.f32> <grid-h> <grid-w> [out-dir]"),
             };
             let p = Patches {
                 data: read_f32(f)?,
@@ -226,6 +228,23 @@ fn vl<D: ComputeDevice>(
                 t.elapsed().as_secs_f64() * 1e3
             );
             let ds: Vec<Vec<f32>> = e.deepstack.iter().map(|d| model.dev.download(d)).collect();
+            // With an output directory: raw f32 files (block_N, embeds, deepstack_N) instead
+            // of JSON, for real-size images.
+            if let Some(out) = out {
+                let write = |name: String, v: &[f32]| -> Result<()> {
+                    let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                    Ok(std::fs::write(std::path::Path::new(out).join(name), b)?)
+                };
+                for (i, b) in trace.iter().enumerate() {
+                    write(format!("block_{i}.f32"), b)?;
+                }
+                write("embeds.f32".into(), &embeds)?;
+                for (i, d) in ds.iter().enumerate() {
+                    write(format!("deepstack_{i}.f32"), d)?;
+                }
+                println!("{} {}", e.grid.0, e.grid.1);
+                return Ok(());
+            }
             println!(
                 "{}",
                 serde_json::json!({"blocks": trace, "embeds": embeds, "deepstack": ds, "grid": [e.grid.0, e.grid.1]})
