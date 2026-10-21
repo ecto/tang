@@ -60,6 +60,13 @@ impl Default for CoderOpts {
     }
 }
 
+/// `TANG_CODER_GEMV=v1`: dense GEMVs on `fe_gemv8` (two rows a warp) instead of the K-split
+/// `cx_gemvk` (A/B).
+fn gemv_v1() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TANG_CODER_GEMV").is_ok_and(|v| v == "v1"))
+}
+
 /// The ggml type id the native GEMV decodes, if it does.
 fn native_id(ty: GgmlType) -> Option<u32> {
     use GgmlType::*;
@@ -135,7 +142,6 @@ struct GdnL {
     hist: B,
     /// The window's stacked projection and conv output, kept for a later commit.
     proj: B,
-    h: B,
 }
 
 struct AttnL {
@@ -152,8 +158,12 @@ struct Layer {
     w_in: Dense,
     w_out: Dense,
     router: Dense,
-    sh_gu: Dense,
-    sh_down: Dense,
+    sh_gate: Experts,
+    sh_up: Experts,
+    sh_down: Experts,
+    /// Shared-memory 16-byte units a staged expert row needs (gate|up, down).
+    r16_gu: i32,
+    r16_down: i32,
     gate: Experts,
     up: Experts,
     down: Experts,
@@ -165,17 +175,16 @@ struct Kern {
     _mods: Vec<Module>,
     q8: Fun,
     gemv8: [Fun; MAX_T],
-    add_norm: Fun,
+    gemvk: [Fun; MAX_T],
+    norm_q8: Fun,
     route: Fun,
     moe_gu: Fun,
     silu_q: Fun,
     moe_down: Fun,
-    silu: Fun,
-    moe_add: Fun,
+    moe_add_norm: Fun,
     prep: Fun,
     part: Fun,
     merge: Fun,
-    gdn_conv: Fun,
     gdn_step: Fun,
     gdn_commit: Fun,
     copy: Fun,
@@ -201,9 +210,6 @@ struct Scratch {
     egu: B,
     hq: B,
     parts: B,
-    shgu: B,
-    shh: B,
-    shy: B,
     moe_y: B,
     head: B,
     out_ids: B,
@@ -242,8 +248,6 @@ pub struct Coder {
     pub hp: Hparams,
     g: Gguf,
     geo: Geometry,
-    /// Shared-expert FF width.
-    ff_sh: usize,
     eps: f32,
     layers: Vec<Layer>,
     out_norm: B,
@@ -370,7 +374,6 @@ impl Coder {
                     state: dev.alloc_f32(hv * 128 * 128),
                     hist: dev.alloc_f32(3 * geo.gdn_conv()),
                     proj: dev.alloc_f32(MAX_T * w_in.rows),
-                    h: dev.alloc_f32(MAX_T * geo.gdn_conv()),
                 };
                 (w_in, Some(gd), None)
             } else {
@@ -418,15 +421,14 @@ impl Coder {
                 ],
             )?;
             ensure!(router.rows == hp.n_expert + 1, "blk.{l} router rows");
-            let sh_gu = upload_dense(
-                &dev,
-                &g,
-                &[
-                    (info(&t("ffn_gate_shexp.weight"))?, None),
-                    (info(&t("ffn_up_shexp.weight"))?, None),
-                ],
-            )?;
-            let sh_down = upload_dense(&dev, &g, &[(info(&t("ffn_down_shexp.weight"))?, None)])?;
+            let sh_gate = upload_experts(&dev, &g, &info(&t("ffn_gate_shexp.weight"))?)?;
+            let sh_up = upload_experts(&dev, &g, &info(&t("ffn_up_shexp.weight"))?)?;
+            let sh_down = upload_experts(&dev, &g, &info(&t("ffn_down_shexp.weight"))?)?;
+            ensure!(
+                sh_gate.w.estride as usize / sh_gate.w.row_bytes as usize == hp.n_ff_exp,
+                "blk.{l}: the shared expert's FF must equal the routed experts' ({})",
+                hp.n_ff_exp
+            );
             let gate = upload_experts(&dev, &g, &info(&t("ffn_gate_exps.weight"))?)?;
             let up = upload_experts(&dev, &g, &info(&t("ffn_up_exps.weight"))?)?;
             let down = upload_experts(&dev, &g, &info(&t("ffn_down_exps.weight"))?)?;
@@ -439,7 +441,18 @@ impl Coder {
                 w_in,
                 w_out,
                 router,
-                sh_gu,
+                r16_gu: [&gate, &up, &sh_gate, &sh_up]
+                    .iter()
+                    .map(|e| (e.w.row_bytes + 15) / 16 + 1)
+                    .max()
+                    .unwrap(),
+                r16_down: [&down, &sh_down]
+                    .iter()
+                    .map(|e| (e.w.row_bytes + 15) / 16 + 1)
+                    .max()
+                    .unwrap(),
+                sh_gate,
+                sh_up,
                 sh_down,
                 gate,
                 up,
@@ -456,7 +469,7 @@ impl Coder {
                 );
             }
         }
-        let ff_sh = layers[0].sh_down.k;
+        let ff_sh = hp.n_ff_exp;
         let out_norm = vecf("output_norm.weight")?;
         let head_name = if g.get("output.weight").is_some() {
             "output.weight"
@@ -476,7 +489,7 @@ impl Coder {
             .into_iter()
             .max()
             .unwrap();
-        let np = MAX_T * hp.n_expert_used;
+        let np = MAX_T * (hp.n_expert_used + 1);
         let nchunk_max = max_ctx / ck::ATTN_CHUNK;
         let z = |n: usize| dev.alloc_f32(n);
         let xq_words = |k: usize| (MAX_T * k + MAX_T * k / 32 * 4).div_ceil(4);
@@ -496,14 +509,11 @@ impl Coder {
                 * (hp.head_dim + 2)),
             attn: z(MAX_T * hp.n_head * hp.head_dim),
             lg: z(MAX_T * (hp.n_expert + 1)),
-            ids: z(np),
-            w: z(np),
+            ids: z(MAX_T * hp.n_expert_used),
+            w: z(MAX_T * hp.n_expert_used),
             egu: z(np * 2 * hp.n_ff_exp),
             hq: z((np * hp.n_ff_exp + np * hp.n_ff_exp / 32 * 4).div_ceil(4)),
             parts: z(np * n),
-            shgu: z(MAX_T * 2 * ff_sh),
-            shh: z(MAX_T * ff_sh),
-            shy: z(MAX_T * n),
             moe_y: z(MAX_T * n),
             head: z(MAX_T * hp.n_vocab),
             out_ids: z(MAX_T),
@@ -539,21 +549,24 @@ impl Coder {
                 .map_err(|e| anyhow!("{e}"))?;
             }
         }
+        let mut gemvk = [std::ptr::null_mut(); MAX_T];
+        for (i, slot) in gemvk.iter_mut().enumerate() {
+            *slot = f(&cm, &format!("cx_gemvk_t{}", i + 1))?;
+        }
         let k = Kern {
             q8: f(&cm, "fe_q8")?,
             gemv8,
-            add_norm: f(&cm, "cx_add_norm")?,
+            gemvk,
+            norm_q8: f(&cm, "cx_norm_q8")?,
             route: f(&cm, "cx_route")?,
             moe_gu: f(&cm, "cx_moe_gu")?,
             silu_q: f(&cm, "cx_silu_q")?,
             moe_down: f(&cm, "cx_moe_down")?,
-            silu: f(&cm, "cx_silu")?,
-            moe_add: f(&cm, "cx_moe_add")?,
+            moe_add_norm: f(&cm, "cx_moe_add_norm")?,
             prep: f(&cm, "cx_attn_prep")?,
             part: f(&cm, "cx_attn_part")?,
             merge: f(&cm, "cx_attn_merge")?,
-            gdn_conv: f(&fm, "fl_gdn_conv")?,
-            gdn_step: f(&fm, "fl_gdn_step")?,
+            gdn_step: f(&fm, "fl_gdn_conv_step")?,
             gdn_commit: f(&fm, "fl_gdn_conv_commit")?,
             copy: f(&em, "fe_copy")?,
             argmax1: f(&em, "fe_argmax1")?,
@@ -596,7 +609,6 @@ impl Coder {
             hp,
             g,
             geo,
-            ff_sh,
             eps,
             layers,
             out_norm,
@@ -653,21 +665,33 @@ impl Coder {
         }
     }
 
+    unsafe fn launch_smem(
+        &self,
+        f: Fun,
+        grid: (u32, u32, u32),
+        block: u32,
+        smem: u32,
+        args: &mut [*mut std::ffi::c_void],
+    ) {
+        gpu::launch(f, grid, (block, 1, 1), smem, &self.stream, args).expect("launch");
+        if self.prof.is_some() {
+            self.mark(self.kname(f));
+        }
+    }
+
     fn kname(&self, f: Fun) -> &'static str {
         let k = &self.k;
         [
-            (k.add_norm, "add_norm"),
+            (k.norm_q8, "norm_q8"),
             (k.route, "route"),
             (k.moe_gu, "moe_gu"),
             (k.silu_q, "silu_q"),
             (k.moe_down, "moe_down"),
-            (k.silu, "sh_silu"),
-            (k.moe_add, "moe_add"),
+            (k.moe_add_norm, "moe_add_norm"),
             (k.prep, "attn_prep"),
             (k.part, "attn_part"),
             (k.merge, "attn_merge"),
-            (k.gdn_conv, "gdn_conv"),
-            (k.gdn_step, "gdn_step"),
+            (k.gdn_step, "gdn_conv_step"),
             (k.gdn_commit, "gdn_commit"),
             (k.copy, "copy"),
             (k.argmax1, "argmax"),
@@ -734,55 +758,83 @@ impl Coder {
     }
 
     /// `out[t][off + row] = W · x[t]` for every row of `w` (f32 `x`, `w.k` wide), outputs
-    /// `ostride` apart.
-    fn gemv(&self, name: &'static str, w: &Dense, x: u64, out: u64, t: usize, ostride: usize) {
-        let (sp, ns, os, r16, xq, ki) = (
-            self.a(&w.segs),
-            w.nseg,
-            ostride as i32,
-            w.row16,
-            self.a(&self.s.xq8),
-            w.k as i32,
-        );
-        unsafe {
-            gpu::launch(
-                self.k.q8,
-                ((w.k / 32) as u32, t as u32, 1),
-                (32, 1, 1),
-                0,
-                &self.stream,
-                tang_moe::args![x, xq, ki],
-            )
-            .expect("fe_q8");
-            gpu::launch(
-                self.k.gemv8[t - 1],
-                (w.rows.div_ceil(8) as u32, 1, 1),
-                (128, 1, 1),
-                (8 * 16 * r16) as u32,
-                &self.stream,
-                tang_moe::args![sp, ns, x, xq, ki, out, os, r16],
-            )
-            .expect("fe_gemv8")
+    /// `ostride` apart; `x`'s int8 codes are made here (fe_q8) unless `xq` already holds them.
+    #[allow(clippy::too_many_arguments)]
+    fn gemv(
+        &self,
+        name: &'static str,
+        w: &Dense,
+        x: u64,
+        xq: Option<u64>,
+        out: u64,
+        t: usize,
+        ostride: usize,
+    ) {
+        let (sp, ns, os, r16, ki) = (self.a(&w.segs), w.nseg, ostride as i32, w.row16, w.k as i32);
+        let xq = match xq {
+            Some(q) => q,
+            None => {
+                let q = self.a(&self.s.xq8);
+                unsafe {
+                    gpu::launch(
+                        self.k.q8,
+                        ((w.k / 32) as u32, t as u32, 1),
+                        (32, 1, 1),
+                        0,
+                        &self.stream,
+                        tang_moe::args![x, q, ki],
+                    )
+                    .expect("fe_q8");
+                }
+                q
+            }
         };
+        if w.k.is_multiple_of(1024) && !gemv_v1() {
+            unsafe {
+                gpu::launch(
+                    self.k.gemvk[t - 1],
+                    (w.rows.div_ceil(2) as u32, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    &self.stream,
+                    tang_moe::args![sp, ns, x, xq, ki, out, os],
+                )
+                .expect("cx_gemvk")
+            };
+        } else {
+            unsafe {
+                gpu::launch(
+                    self.k.gemv8[t - 1],
+                    (w.rows.div_ceil(8) as u32, 1, 1),
+                    (128, 1, 1),
+                    (8 * 16 * r16) as u32,
+                    &self.stream,
+                    tang_moe::args![sp, ns, x, xq, ki, out, os, r16],
+                )
+                .expect("fe_gemv8")
+            };
+        }
         self.mark(name);
     }
 
-    fn add_norm(&self, add: Option<u64>, w: &B, t: usize) {
-        let (r, y, wp, x, n, eps, ad) = (
+    /// `r += y` (when given), then `s.x = rmsnorm(r) * w` and its int8 codes in `s.mxq`.
+    fn norm_q8(&self, add: Option<u64>, w: &B, t: usize) {
+        let (r, y, wp, x, xq, n, eps, ad) = (
             self.a(&self.s.r),
             add.unwrap_or(0),
             self.a(w),
             self.a(&self.s.x),
+            self.a(&self.s.mxq),
             self.hp.n_embd as i32,
             self.eps,
             add.is_some() as i32,
         );
         unsafe {
             self.launch(
-                self.k.add_norm,
+                self.k.norm_q8,
                 (t as u32, 1, 1),
-                256,
-                tang_moe::args![r, y, wp, x, n, eps, ad],
+                1024,
+                tang_moe::args![r, y, wp, x, xq, n, eps, ad],
             )
         };
     }
@@ -806,31 +858,16 @@ impl Coder {
         );
     }
 
-    /// Layer `l`'s mixer into `s.mix`.
+    /// Layer `l`'s mixer (input `s.x` / `s.mxq`) into `s.mix`.
     fn enqueue_mixer(&self, l: usize, t: usize, verify: bool, nchunk: usize) {
         let layer = &self.layers[l];
         let s = &self.s;
-        let x = self.a(&s.x);
+        let (x, xq) = (self.a(&s.x), Some(self.a(&s.mxq)));
         let (ctl, eps) = (self.a(&s.ctl), self.eps);
+        let n = self.hp.n_embd;
         if let Some(g) = &layer.gdn {
             let stride = layer.w_in.rows;
-            self.gemv("gdn_in", &layer.w_in, x, self.a(&g.proj), t, stride);
-            let (p, st, h0, wc, h, tu) = (
-                self.a(&g.proj),
-                stride as u32,
-                self.a(&g.hist),
-                self.a(&g.conv),
-                self.a(&g.h),
-                t as u32,
-            );
-            unsafe {
-                self.launch(
-                    self.k.gdn_conv,
-                    ((self.geo.gdn_conv() / 128) as u32, 1, 1),
-                    128,
-                    tang_moe::args![p, st, h0, wc, h, tu, eps],
-                );
-            }
+            self.gemv("gdn_in", &layer.w_in, x, xq, self.a(&g.proj), t, stride);
             self.gdn_step(g, stride, t, !verify);
             if !verify {
                 self.gdn_commit(g, stride, t);
@@ -839,14 +876,15 @@ impl Coder {
                 "gdn_out",
                 &layer.w_out,
                 self.a(&s.y),
+                None,
                 self.a(&s.mix),
                 t,
-                self.hp.n_embd,
+                n,
             );
         }
         if let Some(at) = &layer.attn {
             let stride = layer.w_in.rows;
-            self.gemv("attn_in", &layer.w_in, x, self.a(&at.proj), t, stride);
+            self.gemv("attn_in", &layer.w_in, x, xq, self.a(&at.proj), t, stride);
             let hp = &self.hp;
             let (proj, st, qn, kn, rc, rs, q, kc, vc) = (
                 self.a(&at.proj),
@@ -880,21 +918,15 @@ impl Coder {
                     tang_moe::args![part, nc, proj, st, attn],
                 );
             }
-            self.gemv(
-                "attn_out",
-                &layer.w_out,
-                attn,
-                self.a(&s.mix),
-                t,
-                self.hp.n_embd,
-            );
+            self.gemv("attn_out", &layer.w_out, attn, None, self.a(&s.mix), t, n);
         }
     }
 
+    /// The GDN conv and recurrence in one launch (`commit`: write the state for `win[1]`
+    /// tokens), from the stacked projection and the conv history.
     fn gdn_step(&self, g: &GdnL, stride: usize, t: usize, commit: bool) {
-        let (st, hc, p, sd, dt, sa, nw, y, tu, win, cm, eps, yq, quant) = (
+        let (st, p, sd, dt, sa, nw, y, tu, win, cm, eps, yq, quant, h0, wc) = (
             self.a(&g.state),
-            self.a(&g.h),
             self.a(&g.proj),
             stride as u32,
             self.a(&g.dt),
@@ -907,13 +939,15 @@ impl Coder {
             self.eps,
             0u64,
             0u32,
+            self.a(&g.hist),
+            self.a(&g.conv),
         );
         unsafe {
             self.launch(
                 self.k.gdn_step,
                 (self.geo.gdn_hv as u32, 1, 1),
                 512,
-                tang_moe::args![st, hc, p, sd, dt, sa, nw, y, tu, win, cm, eps, yq, quant],
+                tang_moe::args![st, p, sd, dt, sa, nw, y, tu, win, cm, eps, yq, quant, h0, wc],
             )
         };
     }
@@ -936,15 +970,17 @@ impl Coder {
         };
     }
 
-    /// Layer `l`'s MoE: router, top-k, routed and shared experts, `r +=` the result (`s.moe_y`
-    /// also gets it when `keep_y`).
-    fn enqueue_moe(&self, l: usize, t: usize, keep_y: bool) {
+    /// Layer `l`'s MoE (input `s.x` / `s.mxq`): router, top-k, routed and shared experts in the
+    /// same launches, then `r +=` the result and the next norm (`next`: the next layer's
+    /// `attn_norm`, or `output_norm`) into `s.x` / `s.mxq`. `s.moe_y` gets the MoE output when
+    /// `keep_y`.
+    fn enqueue_moe(&self, l: usize, t: usize, next: &B, keep_y: bool) {
         let layer = &self.layers[l];
         let (s, hp) = (&self.s, &self.hp);
         let (n, ne, kk, ff) = (hp.n_embd, hp.n_expert, hp.n_expert_used, hp.n_ff_exp);
-        let x = self.a(&s.x);
+        let (x, mxq) = (self.a(&s.x), self.a(&s.mxq));
         let ls = ne + 1;
-        self.gemv("router", &layer.router, x, self.a(&s.lg), t, ls);
+        self.gemv("router", &layer.router, x, Some(mxq), self.a(&s.lg), t, ls);
         let (lg, lsi, ids, w, scale) = (
             self.a(&s.lg),
             ls as i32,
@@ -952,10 +988,18 @@ impl Coder {
             self.a(&s.w),
             hp.expert_weights_scale,
         );
-        let (mxq, ni) = (self.a(&s.mxq), n as i32);
         let (gw, uw, dw) = (layer.gate.w, layer.up.w, layer.down.w);
+        let (sg, su, sd) = (layer.sh_gate.w, layer.sh_up.w, layer.sh_down.w);
         let (egu, hq, parts) = (self.a(&s.egu), self.a(&s.hq), self.a(&s.parts));
-        let np = (t * kk) as u32;
+        let np = (t * (kk + 1)) as u32;
+        let (ti, r16g, r16d) = (t as i32, layer.r16_gu, layer.r16_down);
+        let (r, yo, wn, xo, eps) = (
+            self.a(&s.r),
+            if keep_y { self.a(&s.moe_y) } else { 0u64 },
+            self.a(next),
+            x,
+            self.eps,
+        );
         unsafe {
             self.launch(
                 self.k.route,
@@ -963,17 +1007,12 @@ impl Coder {
                 32,
                 tang_moe::args![lg, lsi, ids, w, scale],
             );
-            self.launch(
-                self.k.q8,
-                ((n / 32) as u32, t as u32, 1),
-                32,
-                tang_moe::args![x, mxq, ni],
-            );
-            self.launch(
+            self.launch_smem(
                 self.k.moe_gu,
-                ((2 * ff / 8) as u32, np, 1),
+                ((2 * ff / 16) as u32, np, 1),
                 256,
-                tang_moe::args![gw, uw, ids, mxq, egu],
+                (16 * 16 * r16g) as u32,
+                tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti, r16g],
             );
             self.launch(
                 self.k.silu_q,
@@ -981,46 +1020,29 @@ impl Coder {
                 32,
                 tang_moe::args![egu, hq],
             );
-            self.launch(
+            self.launch_smem(
                 self.k.moe_down,
-                ((n / 8) as u32, np, 1),
+                ((n / 16) as u32, np, 1),
                 256,
-                tang_moe::args![dw, ids, hq, parts],
+                (16 * 16 * r16d) as u32,
+                tang_moe::args![dw, sd, ids, hq, parts, ti, r16d],
             );
-        }
-        self.gemv("sh_gu", &layer.sh_gu, x, self.a(&s.shgu), t, 2 * self.ff_sh);
-        let (shgu, shh, ffs) = (self.a(&s.shgu), self.a(&s.shh), self.ff_sh as i32);
-        unsafe {
             self.launch(
-                self.k.silu,
+                self.k.moe_add_norm,
                 (t as u32, 1, 1),
-                256,
-                tang_moe::args![shgu, shh, ffs],
-            );
-        }
-        self.gemv("sh_down", &layer.sh_down, shh, self.a(&s.shy), t, n);
-        let (r, shy, yo) = (
-            self.a(&s.r),
-            self.a(&s.shy),
-            if keep_y { self.a(&s.moe_y) } else { 0u64 },
-        );
-        unsafe {
-            self.launch(
-                self.k.moe_add,
-                ((n / 256) as u32, t as u32, 1),
-                256,
-                tang_moe::args![r, parts, w, shy, lg, lsi, yo],
+                1024,
+                tang_moe::args![r, parts, w, lg, lsi, ti, yo, wn, xo, mxq, eps],
             );
         }
     }
 
     fn enqueue_head(&self, t: usize) {
-        self.add_norm(None, &self.out_norm, t);
         let v = self.hp.n_vocab;
         self.gemv(
             "head",
             &self.head,
             self.a(&self.s.x),
+            Some(self.a(&self.s.mxq)),
             self.a(&self.s.head),
             t,
             v,
@@ -1062,17 +1084,23 @@ impl Coder {
         self.enqueue_inputs(t);
         let n = self.hp.n_embd;
         let last = |b: &B| -> Vec<f32> { self.dev.download(b)[(t - 1) * n..t * n].to_vec() };
-        for l in 0..self.layers.len() {
+        let nl = self.layers.len();
+        self.norm_q8(None, &self.layers[0].attn_norm, t);
+        for l in 0..nl {
             let layer = &self.layers[l];
-            self.add_norm(None, &layer.attn_norm, t);
             self.enqueue_mixer(l, t, verify, nchunk);
-            self.add_norm(Some(self.a(&self.s.mix)), &layer.post_norm, t);
+            self.norm_q8(Some(self.a(&self.s.mix)), &layer.post_norm, t);
             if let Some(p) = probe.as_deref_mut() {
                 self.dev.sync();
                 p.mixer_out.push(last(&self.s.mix));
                 p.post_mixer.push(last(&self.s.r));
             }
-            self.enqueue_moe(l, t, probe.is_some());
+            let next = if l + 1 < nl {
+                &self.layers[l + 1].attn_norm
+            } else {
+                &self.out_norm
+            };
+            self.enqueue_moe(l, t, next, probe.is_some());
             if let Some(p) = probe.as_deref_mut() {
                 self.dev.sync();
                 p.moe_out.push(last(&self.s.moe_y));
@@ -1303,8 +1331,11 @@ impl Coder {
         let hp = &self.hp;
         let mut b = 0f64;
         for l in &self.layers {
-            for d in [&l.w_in, &l.w_out, &l.router, &l.sh_gu, &l.sh_down] {
+            for d in [&l.w_in, &l.w_out, &l.router] {
                 b += dense_bytes(d);
+            }
+            for e in [&l.sh_gate, &l.sh_up, &l.sh_down] {
+                b += e.w.estride as f64;
             }
             for e in [&l.gate, &l.up, &l.down] {
                 b += e.w.estride as f64 * hp.n_expert_used as f64;
@@ -1399,14 +1430,24 @@ fn upload_dense(
 /// A `[n_expert][rows][k]` expert tensor into VRAM in its GGUF type (Q8_0 when the expert
 /// kernels don't decode it).
 fn upload_experts(dev: &CudaComputeDevice, g: &Gguf, t: &TensorInfo) -> Result<Experts> {
-    ensure!(t.dims.len() == 3, "{}: not an expert stack", t.name);
-    let (k, rows, ne) = (t.dims[0] as usize, t.dims[1] as usize, t.dims[2] as usize);
+    ensure!(
+        t.dims.len() == 3 || t.dims.len() == 2,
+        "{}: not an expert stack or matrix",
+        t.name
+    );
+    let (k, rows) = (t.dims[0] as usize, t.dims[1] as usize);
+    let ne = t.dims.get(2).map_or(1, |&d| d as usize);
     let (ty, rb, mut bytes) = match native_id(t.ty).filter(|&id| id != 0 && id != 30) {
         Some(id) => (id, t.row_bytes()?, g.bytes(t).to_vec()),
         None => {
             let mut out = Vec::with_capacity(ne * rows * k / 32 * 34);
             for e in 0..ne {
-                out.extend_from_slice(&quantize_q8_0(&g.expert(t, e)?));
+                let v = if ne == 1 {
+                    g.dequantize(t)?
+                } else {
+                    g.expert(t, e)?
+                };
+                out.extend_from_slice(&quantize_q8_0(&v));
             }
             (8, k / 32 * 34, out)
         }
