@@ -310,7 +310,15 @@ pub fn encode_portfolio_f32(
     let mut tried = vec![];
     for c in keep {
         let t = std::time::Instant::now();
-        let s = encode_candidate_f32(c, x, dims, cfg);
+        // a candidate that fails on this input (e.g. a numerically singular
+        // Tucker factor) is skipped rather than aborting the encode; wavelet
+        // runs first and always codes
+        let Ok(s) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            encode_candidate_f32(c, x, dims, cfg)
+        })) else {
+            skip.push(c);
+            continue;
+        };
         tried.push((c, s.len(), t.elapsed().as_secs_f64()));
         if best.as_ref().is_none_or(|(_, b)| s.len() < b.len()) {
             best = Some((c, s));
