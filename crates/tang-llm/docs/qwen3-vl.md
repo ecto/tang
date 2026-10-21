@@ -78,3 +78,44 @@ TANG_LLM_TEST_VL_MODEL=/tmp/vl-tiny/hf cargo test --release -p tang-llm --featur
 
 Debug commands: `tang-llm vl-preprocess`, `vl-trace` (per-block tower states as JSON),
 `vl-logits` (`--image` / `--patches`, `--step K` to decode after a prefix).
+
+## GPU
+
+The tower uses the dense path's existing kernels: GEMM, full attention (head dim 72),
+LayerNorm, half-split RoPE and tanh GELU. The only new kernel is `gelu_erf` for the mergers
+(CUDA `erff`, Metal via Abramowitz & Stegun 7.1.26). The image's M-RoPE rows go through the
+same paged attention prep and attention kernels as text.
+
+On the RunPod L40S (2026-10-21), `scripts/qwen3vl_pod.sh` runs every check below from a fresh
+clone:
+
+- **Tiny model, CUDA:** `tang-llm` turns TF32 on for cuBLAS by default on CUDA. With it on, the
+  tower sits at ~1e-3 relative and the logits at max KL 8e-4 / 1.1e-3. The bar runs with
+  `GAIA_TF32=0`.
+- **`tests/speculate.rs` on CUDA:** all 4 pass (Qwen3-0.6B, plus image prompts on the tiny VL
+  model). Drafting and batching are byte-exact.
+
+## Real checkpoint (Qwen3-VL-8B-Instruct)
+
+`scripts/qwen3vl_real.py` uses a 1280×720 synthetic viewport render (44×80 patches, 880 image
+tokens) with a 917-token prompt. It compares the last 48 positions (the image's end and all
+the text after it) against HF fp32 with eager attention. tang runs on CUDA (L40S).
+
+| run | top-1 | KL mean | p99 | max |
+|---|---|---|---|---|
+| HF's own bf16 (for scale) | 81.2% | 0.86 | 13 | 14 |
+| tang bf16 weights, bf16 KV, TF32 (production) | 91.7% | 0.022 | 0.37 | 0.51 |
+| same, tang's own preprocessing of the PNG | 91.7% | 0.022 | 0.37 | 0.51 |
+| same, prefill through the image, then decode one token at a time | 91.7% | 0.022 | 0.37 | 0.51 |
+| tang f32 weights, TF32 off | 97.9% | 3.1e-3 | 0.051 | 0.084 |
+| tang f32 weights and f32 KV, TF32 off | 100% | 1.5e-3 | 0.019 | 0.021 |
+| text-only prompt, tang bf16 production | 100% | 1.0e-5 | 7.5e-5 | 9.1e-5 |
+| text-only prompt, HF bf16 (for scale) | 100% | 1.1e-3 | 7.6e-3 | 9.2e-3 |
+
+This image prompt is unusually sensitive to precision: HF in bf16 moves it 40× further from fp32
+than tang in bf16 does. At f32 tang agrees on every position, and its production KL mean
+(0.022) is inside the repo's real-checkpoint bar (≤ 0.03). The tower's per-block error against
+HF fp32 (tang bf16) is ~2e-3 relative through block 25. It reaches 6e-2 at the last block and
+7e-2 at the merger, where the activations carry large outliers; the DeepStack features are at
+1.7e-3, 1.1e-2 and 1.7e-2. The 880-token image encodes in 1.2 s on the L40S, with the ViT
+running once per image.

@@ -61,6 +61,7 @@ if [[ $STEPS == *llama* ]]; then
   python crates/tang-llm/scripts/qwen3vl_llamacpp.py --tang $BIN --model "$M" --image /root/real/view.png --device cuda 2>&1 \
     | grep -vE "Warning|warn\("
   tail -3 /root/llama.log
+  pkill -f llama-server; sleep 3
 fi
 if [[ $STEPS == *eval* ]]; then
   say eval
@@ -69,9 +70,10 @@ if [[ $STEPS == *eval* ]]; then
   $BIN serve "$M" --device cuda --port 8090 --ctx 8192 --kv-slots 2 >/root/serve.log 2>&1 &
   SERVE=$!
   for i in $(seq 120); do curl -sf localhost:8090/v1/models >/dev/null && break; sleep 5; done
-  python crates/tang-llm/scripts/qwen3vl_eval.py --model "$M" --server http://127.0.0.1:8090 --out /root/eval 2>&1 \
+  python crates/tang-llm/scripts/qwen3vl_eval.py --phase tang --model "$M" --server http://127.0.0.1:8090 --out /root/eval 2>&1 | tail -3
+  kill $SERVE; sleep 5; tail -3 /root/serve.log
+  python crates/tang-llm/scripts/qwen3vl_eval.py --phase hf --model "$M" --out /root/eval 2>&1 \
     | grep --line-buffered -vE "Warning|warn\(|it/s\]|Loading"
-  kill $SERVE; tail -3 /root/serve.log
 fi
 say DONE
 sleep infinity

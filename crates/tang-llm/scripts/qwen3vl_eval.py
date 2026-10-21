@@ -122,6 +122,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--hf-dtype", default="bfloat16")
     ap.add_argument("-n", type=int, default=20)
+    ap.add_argument("--phase", choices=["tang", "hf"], required=True,
+                    help="tang: ask the server, save its answers; hf: run HF (the server stopped) and compare")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     items = [scene(i) for i in range(a.n)]
@@ -133,12 +135,19 @@ def main():
         return [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}},
                                              {"type": "text", "text": q}]}]
 
-    tang = []
-    for png, q, _ in items:
+    answers = os.path.join(a.out, "tang_answers.json")
+    if a.phase == "hf":
+        tang = json.load(open(answers))
+    else:
+        tang = []
+    for png, q, _ in (items if a.phase == "tang" else []):
         body = {"model": "qwen3-vl", "messages": chat(png, q), "max_tokens": 8, "temperature": 0}
         req = urllib.request.Request(a.server + "/v1/chat/completions", json.dumps(body).encode(),
                                      {"Content-Type": "application/json"})
         tang.append(json.load(urllib.request.urlopen(req, timeout=600))["choices"][0]["message"]["content"])
+    if a.phase == "tang":
+        json.dump(tang, open(answers, "w"))
+        return
 
     import torch
     from PIL import Image
