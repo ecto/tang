@@ -3439,3 +3439,10 @@ pub mod ir_block_gpu {
         }
     }
 }
+
+/// Start OpenTelemetry for `service` (feature `otel`; see `crates/tang-otel`):
+/// hold the guard for the life of the process so spans flush at exit.
+#[cfg(feature = "otel")]
+pub fn otel_init(service: &str) -> Option<tang_otel::Guard> {
+    tang_otel::init(service)
+}
