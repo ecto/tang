@@ -447,7 +447,10 @@ __device__ void gemvk_body(const Seg* segs, int nseg, const float* x, const unsi
     gemvk_body<T, 8>(segs, nseg, x, xq, k, out, ostride); } \
     extern "C" __global__ void __launch_bounds__(256) cx_gemvk2_t##T( \
     const Seg* segs, int nseg, const float* x, const unsigned char* xq, int k, float* out, int ostride) { \
-    gemvk_body<T, 2>(segs, nseg, x, xq, k, out, ostride); }
+    gemvk_body<T, 2>(segs, nseg, x, xq, k, out, ostride); } \
+    extern "C" __global__ void __launch_bounds__(256) cx_gemvk1_t##T( \
+    const Seg* segs, int nseg, const float* x, const unsigned char* xq, int k, float* out, int ostride) { \
+    gemvk_body<T, 1>(segs, nseg, x, xq, k, out, ostride); }
 GEMVK_T(1) GEMVK_T(2) GEMVK_T(3) GEMVK_T(4) GEMVK_T(5) GEMVK_T(6) GEMVK_T(7) GEMVK_T(8)
 
 // One token's dot over weights e0 in [k0, k1): int8 codes `xc` and per-32 scales `xd` of that

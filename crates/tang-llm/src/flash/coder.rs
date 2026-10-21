@@ -68,8 +68,8 @@ fn env_is(key: &str, val: &str) -> bool {
 
 /// Kernel variants for A/B on one build (defaults are the measured winners):
 /// `TANG_CODER_EXROWS=4` expert rows a warp (default 2), `TANG_CODER_SILU=fused` the SiLU+int8
-/// in the down kernel (default a separate launch), `TANG_CODER_KQ=8` warps a row in
-/// the K-split GEMV (default 4).
+/// in the down kernel (default a separate launch), `TANG_CODER_KQ` warps a row in the
+/// K-split GEMV (1, 2, 4 or 8; default 2).
 #[derive(Clone, Copy, Debug)]
 struct Variants {
     exrows: usize,
@@ -93,7 +93,10 @@ impl Variants {
                 2
             },
             silu_sep: !env_is("TANG_CODER_SILU", "fused"),
-            kq: if env_is("TANG_CODER_KQ", "8") { 8 } else { 4 },
+            kq: std::env::var("TANG_CODER_KQ")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2),
             guk: std::env::var("TANG_CODER_GUK")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -227,6 +230,7 @@ struct Kern {
     gemvk: [Fun; MAX_T],
     gemvk8: [Fun; MAX_T],
     gemvk2: [Fun; MAX_T],
+    gemvk1: [Fun; MAX_T],
     moe_gu4: Fun,
     guk: [Fun; 3],
     dnk: [Fun; 3],
@@ -620,6 +624,13 @@ impl Coder {
             q8: f(&cm, "fe_q8")?,
             gemv8,
             gemvk,
+            gemvk1: {
+                let mut a = [std::ptr::null_mut(); MAX_T];
+                for (i, slot) in a.iter_mut().enumerate() {
+                    *slot = f(&cm, &format!("cx_gemvk1_t{}", i + 1))?;
+                }
+                a
+            },
             gemvk2: {
                 let mut a = [std::ptr::null_mut(); MAX_T];
                 for (i, slot) in a.iter_mut().enumerate() {
@@ -931,12 +942,17 @@ impl Coder {
                 q
             }
         };
-        let kq = self.var.kq;
+        let kq = if self.var.kq_tall > 0 && w.rows >= 4096 {
+            self.var.kq_tall
+        } else {
+            self.var.kq
+        };
         if w.k.is_multiple_of(kq * 256) && !gemv_v1() {
-            let f = if kq == 8 {
-                self.k.gemvk8[t - 1]
-            } else {
-                self.k.gemvk[t - 1]
+            let f = match kq {
+                8 => self.k.gemvk8[t - 1],
+                2 => self.k.gemvk2[t - 1],
+                1 => self.k.gemvk1[t - 1],
+                _ => self.k.gemvk[t - 1],
             };
             unsafe {
                 gpu::launch(
@@ -1171,18 +1187,47 @@ impl Coder {
                 );
             }
             let rg = self.var.exrows as u32;
-            self.launch_smem(
-                if rg == 4 {
-                    self.k.moe_gu4
-                } else {
-                    self.k.moe_gu
-                },
-                ((2 * ff) as u32 / (8 * rg), np, 1),
-                256,
-                8 * rg * 16 * r16g as u32,
-                tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti, r16g],
-            );
-            if self.var.silu_sep {
+            let kidx = |q: usize| match q {
+                1 => 0,
+                2 => 1,
+                _ => 2,
+            };
+            if self.var.guk > 0 {
+                let q = self.var.guk;
+                self.launch(
+                    self.k.guk[kidx(q)],
+                    ((2 * ff * q / 8) as u32, np, 1),
+                    256,
+                    tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti],
+                );
+            } else {
+                self.launch_smem(
+                    if rg == 4 {
+                        self.k.moe_gu4
+                    } else {
+                        self.k.moe_gu
+                    },
+                    ((2 * ff) as u32 / (8 * rg), np, 1),
+                    256,
+                    8 * rg * 16 * r16g as u32,
+                    tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti, r16g],
+                );
+            }
+            if self.var.dnk > 0 {
+                let q = self.var.dnk;
+                self.launch(
+                    self.k.silu_q,
+                    ((ff / 32) as u32, np, 1),
+                    32,
+                    tang_moe::args![egu, hq],
+                );
+                self.launch(
+                    self.k.dnk[kidx(q)],
+                    ((n * q / 8) as u32, np, 1),
+                    256,
+                    tang_moe::args![dw, sd, ids, hq, parts, ti],
+                );
+            } else if self.var.silu_sep {
                 self.launch(
                     self.k.silu_q,
                     ((ff / 32) as u32, np, 1),
@@ -1632,7 +1677,7 @@ impl Coder {
         let mut v = Variants {
             exrows: 2,
             silu_sep: true,
-            kq: 4,
+            kq: 2,
             guk: 0,
             dnk: 0,
             router_fused: false,
@@ -1646,7 +1691,7 @@ impl Coder {
                 _ if kv.starts_with("kqtall=") => v.kq_tall = kv[7..].parse()?,
                 _ if kv.starts_with("guk=") => v.guk = kv[4..].parse()?,
                 _ if kv.starts_with("dnk=") => v.dnk = kv[4..].parse()?,
-                "kq=8" => v.kq = 8,
+                _ if kv.starts_with("kq=") => v.kq = kv[3..].parse()?,
                 _ => anyhow::bail!("unknown variant {kv}"),
             }
         }
