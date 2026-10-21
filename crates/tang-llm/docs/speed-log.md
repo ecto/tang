@@ -123,6 +123,11 @@ output tokens, tok/s after the first token. The fastest public API for this mode
 | 2026-10-21 | d9f1d29 | | H200 | refactor | suffix | 340.5 | | 2.71 tok/window |
 | 2026-10-21 | d9f1d29 | | H200 | write | suffix | 218.7 | | 1.28 tok/window |
 | 2026-10-21 | d9f1d29 | separate SiLU launch (now the default) | H200 | explain | none | 217.4 | 15.5% | +2% (noise) |
+| 2026-10-21 | 4ac3171 | K-split GEMV, 2 warps a row (was 4) | H200 | explain | none | 227.2 | 16.2% | +4.4% |
+| 2026-10-21 | 4ac3171 | (same pod, 2 warps for 4k+-row matrices only) | H200 | explain | none | 226.9 | 16.2% | +4.3% |
+| 2026-10-21 | 4ac3171 | (same build, AA) | H200 | refactor | suffix | 370.2 | | 2.71 tok/window |
+| 2026-10-21 | 4ac3171 | | H200 | write | suffix | 229.0 | | 1.25 tok/window |
+| 2026-10-21 | 4ac3171 | | H200 | explain | suffix | 222.3 | | 1.16 tok/window |
 
 Stage sweep on that H200 pod (`TANG_CODER_STAGES=1`: each stage alone in a CUDA graph, replayed;
 µs a step at a 1.3k context, window 4,856 µs): routed+shared gate|up 876 (771 GB/s), down 801
@@ -140,5 +145,19 @@ moe combine+norm 214, attention split-K 207 (154 GB/s), router 176, head 174, po
   recomputes its pair's 512 values; the extra latency outweighs the saved launch).
 - **The eager event profiler** (`TANG_CODER_PROF`) put about 2× the graph's time on small
   kernels. Use the stage sweep for decisions.
+- **Top-k in the router GEMV's last block** (atomic counter, one launch fewer): −2% (217 → 213).
+  The last block's serial top-k costs more than the launch it saves.
+- **K-split routed experts** (Q warps a row, unstaged, like `cx_gemvk`): gate|up −4% / −6% /
+  −16% at Q = 1 / 2 / 4, down +0.5% / −6% / −18%. Experts want the staged rows; the dense
+  matrices want the split.
+- **K-split GEMV, 1 warp a row** (no split): −1.5% vs 4, −6% vs 2.
+- **A Qwen3 drafter** (estimate, not built): teacher-forced top-1 agreement with the engine's
+  greedy output is 58 / 88 / 71% for Qwen3-0.6B and 62 / 90 / 77% for 1.7B
+  (explain / refactor / write). A verify window of 8 costs ~3× a T=1 step here (each token
+  routes to its own experts), so a drafter only pays on refactor-like text, which the free
+  suffix drafter already covers (2.7 tokens a window). Expected gain on fresh text ≤10%, for a
+  second model engine. Not worth building yet.
+- **First rows of a `flash-aa` run** read ~4% low (205 vs 213–217 for the same kernels later in
+  the run). Compare variants inside the A/B block, which warms up first.
 - **nsys / ncu on the RunPod image:** ncu's injection lacks `cuTensorMapEncodeIm2colWide`,
   which cudarc resolves at load, and nsys isn't installed (apt fails).
