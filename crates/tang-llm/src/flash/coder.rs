@@ -75,6 +75,13 @@ struct Variants {
     exrows: usize,
     silu_sep: bool,
     kq: usize,
+    /// K-split expert kernels: warps a row for gate|up and for down (0: the staged kernels).
+    guk: usize,
+    dnk: usize,
+    /// The top-k in the router GEMV's last block (one launch).
+    router_fused: bool,
+    /// Warps a row of the K-split GEMV for matrices with at least 4096 rows (0: `kq`).
+    kq_tall: usize,
 }
 
 impl Variants {
@@ -87,6 +94,19 @@ impl Variants {
             },
             silu_sep: !env_is("TANG_CODER_SILU", "fused"),
             kq: if env_is("TANG_CODER_KQ", "8") { 8 } else { 4 },
+            guk: std::env::var("TANG_CODER_GUK")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            dnk: std::env::var("TANG_CODER_DNK")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            router_fused: env_is("TANG_CODER_ROUTER", "fused"),
+            kq_tall: std::env::var("TANG_CODER_KQTALL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
         }
     }
 }
@@ -206,7 +226,11 @@ struct Kern {
     gemv8: [Fun; MAX_T],
     gemvk: [Fun; MAX_T],
     gemvk8: [Fun; MAX_T],
+    gemvk2: [Fun; MAX_T],
     moe_gu4: Fun,
+    guk: [Fun; 3],
+    dnk: [Fun; 3],
+    router: [Fun; MAX_T],
     moe_down_f2: Fun,
     moe_down_f4: Fun,
     norm_q8: Fun,
@@ -247,6 +271,8 @@ struct Scratch {
     head: B,
     out_ids: B,
     amax: B,
+    /// cx_router's block counter (zero between launches).
+    done: B,
 }
 
 /// Pinned staging: control words and embeddings in, sampled ids out.
@@ -554,6 +580,7 @@ impl Coder {
             head: z(MAX_T * hp.n_vocab),
             out_ids: z(MAX_T),
             amax: z(MAX_T * 64 * 2),
+            done: z(1),
         };
         dev.sync();
         let t_weights = t1.elapsed().as_secs_f64();
@@ -593,6 +620,13 @@ impl Coder {
             q8: f(&cm, "fe_q8")?,
             gemv8,
             gemvk,
+            gemvk2: {
+                let mut a = [std::ptr::null_mut(); MAX_T];
+                for (i, slot) in a.iter_mut().enumerate() {
+                    *slot = f(&cm, &format!("cx_gemvk2_t{}", i + 1))?;
+                }
+                a
+            },
             gemvk8: {
                 let mut a = [std::ptr::null_mut(); MAX_T];
                 for (i, slot) in a.iter_mut().enumerate() {
@@ -601,6 +635,23 @@ impl Coder {
                 a
             },
             moe_gu4: f(&cm, "cx_moe_gu_r4")?,
+            guk: [
+                f(&cm, "cx_moe_guk1")?,
+                f(&cm, "cx_moe_guk2")?,
+                f(&cm, "cx_moe_guk4")?,
+            ],
+            dnk: [
+                f(&cm, "cx_moe_downk1")?,
+                f(&cm, "cx_moe_downk2")?,
+                f(&cm, "cx_moe_downk4")?,
+            ],
+            router: {
+                let mut a = [std::ptr::null_mut(); MAX_T];
+                for (i, slot) in a.iter_mut().enumerate() {
+                    *slot = f(&cm, &format!("cx_router_t{}", i + 1))?;
+                }
+                a
+            },
             moe_down_f2: f(&cm, "cx_moe_down_f2")?,
             moe_down_f4: f(&cm, "cx_moe_down_f4")?,
             norm_q8: f(&cm, "cx_norm_q8")?,
@@ -768,6 +819,12 @@ impl Coder {
             (k.moe_down_f2, "moe_down"),
             (k.moe_down_f4, "moe_down"),
             (k.moe_gu4, "moe_gu"),
+            (k.guk[0], "moe_gu"),
+            (k.guk[1], "moe_gu"),
+            (k.guk[2], "moe_gu"),
+            (k.dnk[0], "moe_down"),
+            (k.dnk[1], "moe_down"),
+            (k.dnk[2], "moe_down"),
             (k.moe_add_norm, "moe_add_norm"),
             (k.prep, "attn_prep"),
             (k.part, "attn_part"),
@@ -780,6 +837,7 @@ impl Coder {
             (k.q8, "moe_q8"),
         ]
         .into_iter()
+        .chain(k.router.iter().map(|&r| (r, "router")))
         .find(|(g, _)| *g == f)
         .map_or("other", |(_, n)| n)
     }
@@ -1070,7 +1128,6 @@ impl Coder {
         let (n, ne, kk, ff) = (hp.n_embd, hp.n_expert, hp.n_expert_used, hp.n_ff_exp);
         let (x, mxq) = (self.a(&s.x), self.a(&s.mxq));
         let ls = ne + 1;
-        self.gemv("router", &layer.router, x, Some(mxq), self.a(&s.lg), t, ls);
         let (lg, lsi, ids, w, scale) = (
             self.a(&s.lg),
             ls as i32,
@@ -1078,6 +1135,20 @@ impl Coder {
             self.a(&s.w),
             hp.expert_weights_scale,
         );
+        if self.var.router_fused {
+            let rw = &layer.router;
+            let (sp, ns, ki, done) = (self.a(&rw.segs), rw.nseg, rw.k as i32, self.a(&s.done));
+            unsafe {
+                self.launch(
+                    self.k.router[t - 1],
+                    (rw.rows.div_ceil(2) as u32, 1, 1),
+                    256,
+                    tang_moe::args![sp, ns, x, mxq, ki, lg, lsi, done, ids, w, scale],
+                );
+            }
+        } else {
+            self.gemv("router", &layer.router, x, Some(mxq), lg, t, ls);
+        }
         let (gw, uw, dw) = (layer.gate.w, layer.up.w, layer.down.w);
         let (sg, su, sd) = (layer.sh_gate.w, layer.sh_up.w, layer.sh_down.w);
         let (egu, hq, parts) = (self.a(&s.egu), self.a(&s.hq), self.a(&s.parts));
@@ -1091,12 +1162,14 @@ impl Coder {
             self.eps,
         );
         unsafe {
-            self.launch(
-                self.k.route,
-                (t as u32, 1, 1),
-                32,
-                tang_moe::args![lg, lsi, ids, w, scale],
-            );
+            if !self.var.router_fused {
+                self.launch(
+                    self.k.route,
+                    (t as u32, 1, 1),
+                    32,
+                    tang_moe::args![lg, lsi, ids, w, scale],
+                );
+            }
             let rg = self.var.exrows as u32;
             self.launch_smem(
                 if rg == 4 {
@@ -1560,11 +1633,19 @@ impl Coder {
             exrows: 2,
             silu_sep: true,
             kq: 4,
+            guk: 0,
+            dnk: 0,
+            router_fused: false,
+            kq_tall: 0,
         };
         for kv in spec.split(',').filter(|x| !x.is_empty()) {
             match kv {
                 "exrows=4" => v.exrows = 4,
                 "silu=fused" => v.silu_sep = false,
+                "router=fused" => v.router_fused = true,
+                _ if kv.starts_with("kqtall=") => v.kq_tall = kv[7..].parse()?,
+                _ if kv.starts_with("guk=") => v.guk = kv[4..].parse()?,
+                _ if kv.starts_with("dnk=") => v.dnk = kv[4..].parse()?,
                 "kq=8" => v.kq = 8,
                 _ => anyhow::bail!("unknown variant {kv}"),
             }

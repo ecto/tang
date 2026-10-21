@@ -131,15 +131,18 @@ extern "C" __global__ void cx_moe_add_norm(float* r, const float* parts, const f
 
 // Softmax over the router logits, top CX_TOPK (ties to the lower id), renormalised in f64.
 // Grid t, block 32. Logits row stride `ls`; writes ids [t][TOPK], w [t][TOPK].
-extern "C" __global__ void cx_route(const float* lg, int ls, unsigned* ids, float* wts, float scale) {
-    const int t = blockIdx.x, lane = threadIdx.x;
+// One warp, token t: CG reads the logits through L2 only (written by other blocks of the same
+// launch, see cx_router).
+template <bool CG>
+__device__ __forceinline__ void route_warp(const float* lg, int ls, int t, unsigned* ids, float* wts, float scale) {
+    const int lane = threadIdx.x & 31;
     const float* l = lg + (size_t)t * ls;
     const int PER = (CX_NE + 31) / 32;
     float v[PER];
     float mx = NEG_INF_F;
     for (int i = 0; i < PER; i++) {
         const int e = lane + 32 * i;
-        v[i] = e < CX_NE ? l[e] : NEG_INF_F;
+        v[i] = e < CX_NE ? (CG ? __ldcg(l + e) : l[e]) : NEG_INF_F;
         mx = fmaxf(mx, v[i]);
     }
     for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
@@ -172,6 +175,9 @@ extern "C" __global__ void cx_route(const float* lg, int ls, unsigned* ids, floa
         ids[t * CX_TOPK + lane] = my_id;
         wts[t * CX_TOPK + lane] = w;
     }
+}
+extern "C" __global__ void cx_route(const float* lg, int ls, unsigned* ids, float* wts, float scale) {
+    route_warp<false>(lg, ls, blockIdx.x, ids, wts, scale);
 }
 
 // One row of a GGUF-typed weight against int8 codes `xc` (plain order) with per-32 scales `xd`.
@@ -438,8 +444,127 @@ __device__ void gemvk_body(const Seg* segs, int nseg, const float* x, const unsi
     gemvk_body<T, 4>(segs, nseg, x, xq, k, out, ostride); } \
     extern "C" __global__ void __launch_bounds__(256) cx_gemvk8_t##T( \
     const Seg* segs, int nseg, const float* x, const unsigned char* xq, int k, float* out, int ostride) { \
-    gemvk_body<T, 8>(segs, nseg, x, xq, k, out, ostride); }
+    gemvk_body<T, 8>(segs, nseg, x, xq, k, out, ostride); } \
+    extern "C" __global__ void __launch_bounds__(256) cx_gemvk2_t##T( \
+    const Seg* segs, int nseg, const float* x, const unsigned char* xq, int k, float* out, int ostride) { \
+    gemvk_body<T, 2>(segs, nseg, x, xq, k, out, ostride); }
 GEMVK_T(1) GEMVK_T(2) GEMVK_T(3) GEMVK_T(4) GEMVK_T(5) GEMVK_T(6) GEMVK_T(7) GEMVK_T(8)
+
+// One token's dot over weights e0 in [k0, k1): int8 codes `xc` and per-32 scales `xd` of that
+// token (indexed by absolute position).
+template <int TY>
+__device__ __forceinline__ void dotk1(const unsigned char* w, const unsigned char* xc, const float* xd, int k0, int k1, float* acc) {
+    const int lane = threadIdx.x & 31;
+    for (int e0 = k0 + lane * 8; e0 < k1; e0 += 256) {
+        int w0, w1;
+        float dw, mw;
+        decode8i<TY>(w, e0, w0, w1, dw, mw);
+        const uint2 xv = *(const uint2*)(xc + e0);
+        const float dx = xd[e0 / 32];
+        const int s = __dp4a(w0, (int)xv.x, __dp4a(w1, (int)xv.y, 0));
+        if (TY == 12 || TY == 13) {
+            const int sx = __dp4a(0x01010101, (int)xv.x, __dp4a(0x01010101, (int)xv.y, 0));
+            acc[0] = fmaf(dx, fmaf(dw, i2f(s), -mw * i2f(sx)), acc[0]);
+        } else {
+            acc[0] = fmaf(dx * dw, i2f(s), acc[0]);
+        }
+    }
+}
+// ---- K-split routed experts ----
+// Like cx_gemvk: Q warps share a row (each a contiguous k / Q), 8 / Q rows a block, read
+// straight from global memory (no staging). Pair p as in cx_moe_gu. The Q partials are added
+// in warp order.
+template <int Q>
+__device__ __forceinline__ void moe_k_store(float acc, float (&part)[8], int warp, int lane, int j, float* dst) {
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if (lane == 0) part[warp] = acc;
+    __syncthreads();
+    if ((warp % Q) == 0 && lane == 0) {
+        float v = part[warp];
+        #pragma unroll
+        for (int i = 1; i < Q; i++) v += part[warp + i];
+        *dst = v;
+    }
+}
+template <int Q>
+__device__ __forceinline__ void moe_guk_body(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
+                                             const unsigned char* xq, float* out, int T) {
+    __shared__ float part[8];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, p = blockIdx.y;
+    const int j = warp / Q, q = warp % Q;
+    const bool shared = p >= T * CX_TOPK;
+    const int t = shared ? p - T * CX_TOPK : p / CX_TOPK;
+    const unsigned e = shared ? 0u : ids[p];
+    const int r = blockIdx.x * (8 / Q) + j;
+    const ExW& m = shared ? (r < CX_FF ? sg : su) : (r < CX_FF ? g : u);
+    const int ro = r < CX_FF ? r : r - CX_FF;
+    const unsigned char* w = (const unsigned char*)m.base + (size_t)e * m.estride + (size_t)ro * m.row_bytes;
+    const float* xd = (const float*)(xq + (size_t)XQ8_T * CX_HID) + t * (CX_HID / 32);
+    // dotk8 indexes x by absolute position and its own k for the scales: pass this token's rows
+    // with k = HID and T = 1 (offsets folded into the pointers).
+    const unsigned char* xc = xq + (size_t)t * CX_HID;
+    const int k0 = q * (CX_HID / Q), k1 = k0 + CX_HID / Q;
+    float acc = 0.f;
+    switch (m.ty) {
+#define CXR(TY) case TY: { float a[1] = {0.f}; dotk1<TY>(w, xc, xd, k0, k1, a); acc = a[0]; break; }
+        CXR(8) CXR(2) CXR(20) CXR(6) CXR(42) CXR(23) CXR(11) CXR(12) CXR(13) CXR(14)
+#undef CXR
+        default: break;
+    }
+    moe_k_store<Q>(acc, part, warp, lane, j, out + (size_t)p * 2 * CX_FF + r);
+}
+template <int Q>
+__device__ __forceinline__ void moe_downk_body(ExW d, ExW sd, const unsigned* ids, const unsigned char* hq,
+                                               float* out, int T) {
+    __shared__ float part[8];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, p = blockIdx.y;
+    const int j = warp / Q, q = warp % Q;
+    const bool shared = p >= T * CX_TOPK;
+    const ExW& m = shared ? sd : d;
+    const unsigned e = shared ? 0u : ids[p];
+    const int r = blockIdx.x * (8 / Q) + j;
+    const unsigned char* w = (const unsigned char*)m.base + (size_t)e * m.estride + (size_t)r * m.row_bytes;
+    const unsigned char* xc = hq + (size_t)p * CX_FF;
+    const float* xd = (const float*)(hq + (size_t)CX_NP * CX_FF) + p * (CX_FF / 32);
+    const int k0 = q * (CX_FF / Q), k1 = k0 + CX_FF / Q;
+    float acc = 0.f;
+    switch (m.ty) {
+#define CXR(TY) case TY: { float a[1] = {0.f}; dotk1<TY>(w, xc, xd, k0, k1, a); acc = a[0]; break; }
+        CXR(8) CXR(2) CXR(20) CXR(6) CXR(42) CXR(23) CXR(11) CXR(12) CXR(13) CXR(14)
+#undef CXR
+        default: break;
+    }
+    moe_k_store<Q>(acc, part, warp, lane, j, out + (size_t)p * CX_HID + r);
+}
+#define MOEK(Q) \
+extern "C" __global__ void __launch_bounds__(256) cx_moe_guk##Q(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids, \
+    const unsigned char* xq, float* out, int T) { moe_guk_body<Q>(g, u, sg, su, ids, xq, out, T); } \
+extern "C" __global__ void __launch_bounds__(256) cx_moe_downk##Q(ExW d, ExW sd, const unsigned* ids, \
+    const unsigned char* hq, float* out, int T) { moe_downk_body<Q>(d, sd, ids, hq, out, T); }
+MOEK(1) MOEK(2) MOEK(4)
+
+// The router GEMV (cx_gemvk's arithmetic, Q = 4) whose last block to finish runs the top-k for
+// every token: one launch instead of two. `done` is a zeroed counter; the last block resets it.
+template <int T>
+__device__ void router_body(const Seg* segs, int nseg, const float* x, const unsigned char* xq, int k, float* out,
+                            int ostride, unsigned* done, unsigned* ids, float* wts, float scale) {
+    gemvk_body<T, 4>(segs, nseg, x, xq, k, out, ostride);
+    __shared__ unsigned last;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) last = atomicAdd(done, 1u) == gridDim.x - 1;
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    const int warp = threadIdx.x >> 5;
+    if (warp < T) route_warp<true>(out, ostride, warp, ids, wts, scale);
+    if (threadIdx.x == 0) *done = 0u;
+}
+#define ROUTER_T(T) extern "C" __global__ void __launch_bounds__(256) cx_router_t##T( \
+    const Seg* segs, int nseg, const float* x, const unsigned char* xq, int k, float* out, int ostride, \
+    unsigned* done, unsigned* ids, float* wts, float scale) { \
+    router_body<T>(segs, nseg, x, xq, k, out, ostride, done, ids, wts, scale); }
+ROUTER_T(1) ROUTER_T(2) ROUTER_T(3) ROUTER_T(4) ROUTER_T(5) ROUTER_T(6) ROUTER_T(7) ROUTER_T(8)
 
 // Gated attention prep: q heads (rmsnorm * qn, NeoX rope on CX_ROT dims) into q [t][NH][HD];
 // k heads (rmsnorm * kn, rope) and v into the bf16 caches at position ctl[0] + t.
