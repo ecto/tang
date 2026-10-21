@@ -336,28 +336,6 @@ pub(super) fn transliterate(src: &str, reads: &[usize], donor: Option<usize>) ->
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn transliterates_loads_and_shuffles() {
-        let src = format!(
-            "// k\n#define TANG_TILES 4\n#define TANG_THREADS 32\n{PRELUDE}extern \"C\" __global__ void __launch_bounds__(32) main0(const float* __restrict__ b3, float* __restrict__ out, unsigned count) {{\n    float x = __ldg((const float4*)(b3 + (2)) + 1).x;\n    float4 v0[1][2];\n    float y = (&v0[0][e >> 2].x)[e & 3];\n    y = __shfl_xor_sync(0xffffffffu, y, 4);\n    out[0] = b3[0] + x + y;\n}}\n"
-        );
-        let m = transliterate(&src, &[], Some(3));
-        assert!(m.starts_with(&format!("// k\n{SHFL_MARKER}")));
-        assert!(m.contains(
-            "reqd_work_group_size(32, 1, 1))) void main0(__global float* restrict out, uint count)"
-        ));
-        assert!(m.contains("(*((__global const float4*)(out + (2)) + 1)).x"));
-        assert!(m.contains("TANG_EL4(v0[0][e >> 2], e & 3)"));
-        assert!(m.contains("TANG_SHFL_XOR(y, 4)"));
-        assert!(m.contains("out[0] = out[0]"));
-        assert!(!m.contains("b3"));
-    }
-}
-
 /// Register block and work-group of [`TensorGraph::opencl_mma_kernel`]:
 /// `TANG_CL_MM=RMxRNxWG` (rows per item, columns per item, work-group
 /// size); default 4x4x64.
@@ -562,5 +540,27 @@ impl TensorGraph {
             threads: wg,
             blocks: items.div_ceil(wg),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transliterates_loads_and_shuffles() {
+        let src = format!(
+            "// k\n#define TANG_TILES 4\n#define TANG_THREADS 32\n{PRELUDE}extern \"C\" __global__ void __launch_bounds__(32) main0(const float* __restrict__ b3, float* __restrict__ out, unsigned count) {{\n    float x = __ldg((const float4*)(b3 + (2)) + 1).x;\n    float4 v0[1][2];\n    float y = (&v0[0][e >> 2].x)[e & 3];\n    y = __shfl_xor_sync(0xffffffffu, y, 4);\n    out[0] = b3[0] + x + y;\n}}\n"
+        );
+        let m = transliterate(&src, &[], Some(3));
+        assert!(m.starts_with(&format!("// k\n{SHFL_MARKER}")));
+        assert!(m.contains(
+            "reqd_work_group_size(32, 1, 1))) void main0(__global float* restrict out, uint count)"
+        ));
+        assert!(m.contains("(*((__global const float4*)(out + (2)) + 1)).x"));
+        assert!(m.contains("TANG_EL4(v0[0][e >> 2], e & 3)"));
+        assert!(m.contains("TANG_SHFL_XOR(y, 4)"));
+        assert!(m.contains("out[0] = out[0]"));
+        assert!(!m.contains("b3"));
     }
 }
