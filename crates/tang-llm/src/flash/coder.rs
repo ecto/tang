@@ -286,6 +286,9 @@ impl Io {
 
 pub struct Coder {
     pub dev: CudaComputeDevice,
+    gpu: Gpu,
+    /// Top-k / top-p / presence sampling in the head (`enable_sampler`); `None`: Gumbel-max.
+    sampler: Option<Box<super::sampler::Sampler>>,
     pub hp: Hparams,
     g: Gguf,
     geo: Geometry,
@@ -688,6 +691,8 @@ impl Coder {
         );
         Ok(Coder {
             dev,
+            gpu,
+            sampler: None,
             hp,
             g,
             geo,
@@ -1229,6 +1234,20 @@ impl Coder {
             64i32,
             self.a(&self.s.ctl),
         );
+        if let Some(sp) = self.sampler.as_ref() {
+            if !self.skip("argmax") {
+                sp.enqueue(
+                    &self.dev,
+                    &self.stream,
+                    &self.s.head,
+                    &self.s.ctl,
+                    &self.s.out_ids,
+                    t,
+                );
+            }
+            self.kcopy(self.io_dev(Io::IDS), ids, t * 4);
+            return;
+        }
         unsafe {
             self.launch(
                 self.k.argmax1,
@@ -1313,6 +1332,9 @@ impl Coder {
         ctl[2] = self.counter;
         ctl[3] = self.seed;
         ctl[4] = self.temperature.to_bits();
+        if let Some(sp) = self.sampler.as_mut() {
+            sp.stage(&self.dev, &self.tokens, pos0, t)?;
+        }
         let n = self.hp.n_embd;
         let emb_t = self.g.info("token_embd.weight")?.clone();
         let emb = self.io.f32s(Io::EMB, t * n);
@@ -1488,6 +1510,10 @@ impl Coder {
         self.tokens.push(tok);
         let pos = self.tokens.len() - 1;
         Ok(self.window(pos, 1, None)?[0])
+    }
+
+    pub fn gguf(&self) -> &Gguf {
+        &self.g
     }
 
     pub fn vocab(&self) -> Result<Vec<String>> {
@@ -1822,4 +1848,163 @@ pub fn is_qwen3next(path: &Path) -> Result<bool> {
     let g = Gguf::open(path)?;
     Ok(g.meta_str("general.architecture")
         .is_ok_and(|a| a == "qwen3next"))
+}
+
+// ---- serving: states, sampler, warm-up
+
+impl Coder {
+    /// Copy the running state out: every GDN layer's recurrent state and conv history (the
+    /// attention K/V is positional, see [`save_positional`](Self::save_positional)).
+    pub fn save_running(&mut self) -> Result<super::engine::RunningState> {
+        self.dev.sync();
+        let mut parts = Vec::new();
+        for g in self.layers.iter().filter_map(|l| l.gdn.as_ref()) {
+            parts.push(self.dev.download(&g.state));
+            parts.push(self.dev.download(&g.hist));
+        }
+        let n = parts.len() / 2;
+        parts.push(Vec::new());
+        super::engine::RunningState::from_parts(self.tokens.len(), n, parts)
+    }
+
+    /// Resume at `s.pos` with `prefix` (the `s.pos` tokens `s` was saved after).
+    pub fn restore_running(
+        &mut self,
+        s: &super::engine::RunningState,
+        prefix: &[u32],
+    ) -> Result<()> {
+        ensure!(
+            prefix.len() == s.pos,
+            "prefix of {} tokens for a state at {}",
+            prefix.len(),
+            s.pos
+        );
+        let parts = s.parts();
+        let gdn: Vec<&mut GdnL> = self
+            .layers
+            .iter_mut()
+            .filter_map(|l| l.gdn.as_mut())
+            .collect();
+        ensure!(
+            s.gdn_layers() == gdn.len() && parts.len() == 2 * gdn.len() + 1,
+            "state is for another model"
+        );
+        self.dev.sync();
+        for (i, g) in gdn.into_iter().enumerate() {
+            self.dev.upload_into_f32(&mut g.state, parts[2 * i]);
+            self.dev.upload_into_f32(&mut g.hist, parts[2 * i + 1]);
+        }
+        self.dev.sync();
+        self.tokens.clear();
+        self.tokens.extend_from_slice(prefix);
+        Ok(())
+    }
+
+    /// The positional buffers (attention K and V per layer): device address, bytes a position.
+    fn positional_bufs(&self) -> Vec<(u64, usize)> {
+        let row = self.hp.n_head_kv * self.hp.head_dim * 2;
+        self.layers
+            .iter()
+            .filter_map(|l| l.attn.as_ref())
+            .flat_map(|a| [(self.a(&a.k), row), (self.a(&a.v), row)])
+            .collect()
+    }
+
+    /// Copy positions `from..to` of the positional state out.
+    pub fn save_positional(&mut self, from: usize, to: usize) -> Result<super::engine::Positional> {
+        ensure!(from <= to && to <= self.max_ctx);
+        self.dev.sync();
+        let mut bufs = Vec::new();
+        for (addr, row) in self.positional_bufs() {
+            let mut host = vec![0u8; (to - from) * row];
+            if !host.is_empty() {
+                let r = unsafe {
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        host.as_mut_ptr() as *mut _,
+                        addr + (from * row) as u64,
+                        host.len(),
+                    )
+                };
+                ensure!(
+                    r == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+                    "cuMemcpyDtoH: {r:?}"
+                );
+            }
+            bufs.push(host);
+        }
+        Ok(super::engine::Positional::from_parts(from, to, bufs))
+    }
+
+    /// Write positions `from.max(p.from)..p.to` of `p` back.
+    pub fn restore_positional(&mut self, p: &super::engine::Positional, from: usize) -> Result<()> {
+        let bufs = self.positional_bufs();
+        ensure!(
+            bufs.len() == p.parts().len(),
+            "positional state is for another model"
+        );
+        self.dev.sync();
+        let from = from.max(p.from);
+        for ((addr, row), host) in bufs.into_iter().zip(p.parts()) {
+            ensure!(
+                host.len() == (p.to - p.from) * row,
+                "positional state size differs"
+            );
+            if p.to > from {
+                let src = &host[(from - p.from) * row..];
+                let r = unsafe {
+                    cudarc::driver::sys::cuMemcpyHtoD_v2(
+                        addr + (from * row) as u64,
+                        src.as_ptr() as *const _,
+                        (p.to - from) * row,
+                    )
+                };
+                ensure!(
+                    r == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+                    "cuMemcpyHtoD: {r:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Sample in the head with top-k / top-p / a presence penalty (`flash::sampler`) instead of
+    /// the Gumbel-max over the whole vocabulary. Window graphs are recaptured.
+    pub fn enable_sampler(&mut self) -> Result<()> {
+        if self.sampler.is_none() {
+            self.sampler = Some(Box::new(super::sampler::Sampler::new(
+                &self.gpu,
+                &self.dev,
+                self.hp.n_vocab,
+            )?));
+            self.dev.sync();
+            self.graphs.clear();
+        }
+        Ok(())
+    }
+
+    pub fn sampler_mut(&mut self) -> Option<&mut super::sampler::Sampler> {
+        self.sampler.as_deref_mut()
+    }
+
+    /// A new generation's output starts at position `pos` (penalties count output from there).
+    pub fn sampler_begin(&mut self, pos: usize) -> Result<()> {
+        match self.sampler.as_mut() {
+            Some(s) => s.begin(&self.dev, pos),
+            None => Ok(()),
+        }
+    }
+
+    /// Capture every window width's graphs (plain and verify) and the commits on a throwaway
+    /// sequence, then reset.
+    pub fn warm(&mut self) -> Result<()> {
+        self.reset();
+        let ids: Vec<u32> = (0..16).map(|i| 1000 + i).collect();
+        let mut cur = self.prefill(&ids, MAX_T, None)?;
+        for t in 1..=MAX_T {
+            let d: Vec<u32> = (0..t - 1).map(|i| 7 + i as u32).collect();
+            cur = *self.verify(cur, &d)?.last().unwrap();
+        }
+        self.reset();
+        Ok(())
+    }
 }

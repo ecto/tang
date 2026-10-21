@@ -378,7 +378,9 @@ fn run<D: ComputeDevice>(
 }
 
 /// `tang-llm serve <first shard.gguf> [--mtp M] [--host H] [--port P] [--ctx N] [--api-key-file F]
-/// [--temp T] [--snapshots N] [--dump-ids DIR]`: the Flash-Next engine (`flash::serve`).
+/// [--temp T] [--snapshots N] [--dump-ids DIR] [--no-suffix]`: the Flash engine (`flash::serve`):
+/// Flash-Next, or qwen3next (Qwen3-Coder-Next) by the GGUF's architecture. Without MTP, suffix
+/// drafts are on unless `--no-suffix`.
 #[cfg(feature = "cuda")]
 fn serve_flash(args: &[String]) -> Result<()> {
     use tang_llm::flash::serve::{default_disk, FlashServe, Settings};
@@ -393,6 +395,7 @@ fn serve_flash(args: &[String]) -> Result<()> {
         snapshots: 6,
         warm: Vec::new(),
         profile: None,
+        suffix: true,
         snapshot_bytes: std::env::var("TANG_FLASH_SNAP_GB")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
@@ -421,6 +424,7 @@ fn serve_flash(args: &[String]) -> Result<()> {
             "--warm-request" => s.warm.push(PathBuf::from(val()?)),
             "--profile" => s.profile = Some(PathBuf::from(val()?)),
             "--dump-ids" => s.dump = Some(PathBuf::from(val()?)),
+            "--no-suffix" => s.suffix = false,
             "--api-key-file" => {
                 let path = val()?;
                 key =
