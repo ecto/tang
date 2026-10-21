@@ -12,7 +12,7 @@ codebase.
 | **Flash** | `src/flash/` (CUDA), tang-compute `flash*`, tang-moe | Qwen3.8-Flash-Next (`qwen4exp`) only: GDN + QSA (indexer-sparse gated attention) + 4-stream hyper-connections + PLE n-gram table + 512×top-10 MoE with shared expert, MTP drafts, verify windows in CUDA graphs, experts offloaded to a pinned host arena with CPU misses | GGUF: dense tensors in native types (Q2_0…Q8_0, K-quants, IQ4_XS/NL, bf16), experts **Q2_0 only** |
 | **Flash reference** | `src/flash/reference.rs` (`tang-llm flash-ref`) | slow f32 CPU forward of any supported GGUF; the parity truth | every type `gguf.rs` dequantises |
 | **tang-moe** | `crates/tang-moe` | expert arena, VRAM cache policy, AVX-VNNI/AVX2 Q2_0 CPU experts, GPU↔CPU doorbell | Q2_0 blobs |
-| **Vision** | `vision.rs` | image encoder for the dense path | MLX safetensors |
+| **Vision** | `vision.rs` (Gemma 3 SigLIP), `qwen3vl.rs` (Qwen3-VL tower, DeepStack; M-RoPE in `model.rs`) | image encoders for the dense path; see [qwen3-vl.md](qwen3-vl.md) | HF and MLX safetensors |
 
 Two facts shape everything below:
 

@@ -266,7 +266,7 @@ impl<D: ComputeDevice + 'static> Backend for Engine<D> {
         Engine::context_window(self)
     }
     fn vision(&self) -> bool {
-        self.model.vision.is_some()
+        self.model.sees_images()
     }
     fn prompter(&self) -> Option<Prompter> {
         Some(Engine::prompter(self))
@@ -1370,6 +1370,127 @@ fn error(status: StatusCode, msg: impl Into<String>) -> Response {
         .into_response()
 }
 
+/// Images a request may carry, and the most bytes one may be.
+const MAX_IMAGES: usize = 16;
+const MAX_IMAGE_BYTES: usize = 20 << 20;
+
+/// Replace `https://` image URLs in a chat body with data URLs of what they point to. Only
+/// public addresses are fetched (the host is resolved once and pinned, redirects are refused),
+/// so a request can't make the server reach its own network. `TANG_IMAGE_FETCH=0` turns
+/// fetching off (then only data URLs are accepted).
+async fn fetch_images(body: &mut Value) -> Result<(), String> {
+    use base64::Engine as _;
+    // The image URL slots, in order: `image_url.url` or a bare `image_url` string.
+    fn slots(body: &mut Value) -> Vec<&mut Value> {
+        let mut out = Vec::new();
+        for m in body["messages"].as_array_mut().into_iter().flatten() {
+            for p in m["content"].as_array_mut().into_iter().flatten() {
+                let slot = if p["image_url"].is_object() {
+                    &mut p["image_url"]["url"]
+                } else {
+                    &mut p["image_url"]
+                };
+                if slot.as_str().is_some_and(|u| !u.starts_with("data:")) {
+                    out.push(slot);
+                }
+            }
+        }
+        out
+    }
+    let urls: Vec<String> = slots(body)
+        .iter()
+        .map(|s| s.as_str().unwrap_or_default().to_string())
+        .collect();
+    if urls.is_empty() {
+        return Ok(());
+    }
+    if std::env::var("TANG_IMAGE_FETCH").as_deref() == Ok("0") {
+        return Err("images must be data URLs (data:image/...;base64,...)".into());
+    }
+    if urls.len() > MAX_IMAGES {
+        return Err(format!("at most {MAX_IMAGES} images per request"));
+    }
+    let mut data = Vec::with_capacity(urls.len());
+    for url in &urls {
+        let bytes = fetch_image(url).await?;
+        data.push(base64::engine::general_purpose::STANDARD.encode(&bytes));
+    }
+    for (slot, d) in slots(body).into_iter().zip(data) {
+        *slot = json!(format!("data:image;base64,{d}"));
+    }
+    Ok(())
+}
+
+async fn fetch_image(url: &str) -> Result<Vec<u8>, String> {
+    let bad = |e: &dyn std::fmt::Display| format!("image {url}: {e}");
+    let parsed = reqwest::Url::parse(url).map_err(|e| bad(&e))?;
+    if parsed.scheme() != "https" {
+        return Err(bad(&"only https and data URLs are accepted"));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| bad(&"no host"))?
+        .to_string();
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let addr = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|e| bad(&e))?
+        .find(|a| public_ip(a.ip()))
+        .ok_or_else(|| bad(&"not a public address"))?;
+    let client = reqwest::Client::builder()
+        .resolve(&host, addr)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| bad(&e))?;
+    let mut resp = client.get(parsed).send().await.map_err(|e| bad(&e))?;
+    if !resp.status().is_success() {
+        return Err(bad(&resp.status()));
+    }
+    let mut out = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| bad(&e))? {
+        out.extend_from_slice(&chunk);
+        if out.len() > MAX_IMAGE_BYTES {
+            return Err(bad(&format!("over {} MiB", MAX_IMAGE_BYTES >> 20)));
+        }
+    }
+    Ok(out)
+}
+
+/// Whether an address is on the public internet (not loopback, private, link-local, CGNAT,
+/// unique-local, documentation, multicast or unspecified).
+fn public_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(a) => {
+            let o = a.octets();
+            !(a.is_loopback()
+                || a.is_private()
+                || a.is_link_local()
+                || a.is_unspecified()
+                || a.is_broadcast()
+                || a.is_multicast()
+                || a.is_documentation()
+                || o[0] == 0
+                || (o[0] == 100 && (o[1] & 0xc0) == 64)
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+                || o[0] >= 240)
+        }
+        IpAddr::V6(a) => {
+            if let Some(v4) = a.to_ipv4_mapped() {
+                return public_ip(IpAddr::V4(v4));
+            }
+            let s = a.segments();
+            !(a.is_loopback()
+                || a.is_unspecified()
+                || a.is_multicast()
+                || (s[0] & 0xfe00) == 0xfc00
+                || (s[0] & 0xffc0) == 0xfe80
+                || s[0] == 0x2001 && s[1] == 0xdb8)
+        }
+    }
+}
+
 /// Make content a string, which templates assume: flatten OpenAI content arrays
 /// (`[{type: text, text}]`), and turn a null/missing content (tool-call-only assistant turns)
 /// into "" (templates do things like `'</think>' in message.content`). Images (`image_url`
@@ -1397,7 +1518,17 @@ fn normalize_messages(messages: &Value) -> Result<(Value, Vec<Vec<u8>>), String>
                     text.push(crate::engine::IMAGE_MARKER.to_string());
                 }
             }
-            m["content"] = json!(text.join("\n"));
+            // Parts join with newlines, but an image sits right against its neighbours (as
+            // the reference chat templates render image parts).
+            let marker = crate::engine::IMAGE_MARKER;
+            let mut joined = String::new();
+            for (i, t) in text.iter().enumerate() {
+                if i > 0 && t != marker && text[i - 1] != marker {
+                    joined.push('\n');
+                }
+                joined.push_str(t);
+            }
+            m["content"] = json!(joined);
         } else if !m["content"].is_string() && m.is_object() {
             m["content"] = json!("");
         }
@@ -1497,6 +1628,41 @@ mod tests {
         let err = worker.swap("does-not-exist").unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
         assert_eq!(worker.engine.as_ref().unwrap().0, "flash");
+    }
+
+    #[test]
+    fn only_public_addresses_are_fetched() {
+        let p = |s: &str| super::public_ip(s.parse().unwrap());
+        assert!(p("1.1.1.1") && p("2606:4700::1111"));
+        for a in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "::1",
+            "fd00::1",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+        ] {
+            assert!(!p(a), "{a}");
+        }
+    }
+
+    #[test]
+    fn images_sit_against_their_text() {
+        let m = serde_json::json!([{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            {"type": "text", "text": "what is this?"},
+            {"type": "text", "text": "and this"},
+        ]}]);
+        let (n, imgs) = super::normalize_messages(&m).unwrap();
+        let mk = crate::engine::IMAGE_MARKER;
+        assert_eq!(n[0]["content"], format!("{mk}what is this?\nand this"));
+        assert_eq!(imgs.len(), 1);
     }
 
     #[test]
@@ -2079,7 +2245,14 @@ fn usage_json(u: &Usage) -> Value {
 }
 
 /// Prefill a chat completion body without generating: `{usage}` once the cache holds it.
-async fn prefill(State(app): State<App>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
+async fn prefill(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(mut body): Json<Value>,
+) -> Response {
+    if let Err(e) = fetch_images(&mut body).await {
+        return error(StatusCode::BAD_REQUEST, e);
+    }
     let mut req = match parse(&body) {
         Ok(r) => r,
         Err(e) => return error(StatusCode::BAD_REQUEST, e),
@@ -2102,7 +2275,10 @@ async fn prefill(State(app): State<App>, headers: HeaderMap, Json(body): Json<Va
     error(StatusCode::SERVICE_UNAVAILABLE, "model worker stopped")
 }
 
-async fn chat(State(app): State<App>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
+async fn chat(State(app): State<App>, headers: HeaderMap, Json(mut body): Json<Value>) -> Response {
+    if let Err(e) = fetch_images(&mut body).await {
+        return error(StatusCode::BAD_REQUEST, e);
+    }
     let req = match parse(&body) {
         Ok(r) => r,
         Err(e) => return error(StatusCode::BAD_REQUEST, e),

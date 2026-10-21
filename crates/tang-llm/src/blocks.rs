@@ -449,6 +449,32 @@ pub struct Cache<B> {
     /// Tokens already in the cache.
     pub len: usize,
     pub tokens: Vec<u32>,
+    /// Per-position RoPE rows, for a sequence whose positions aren't its cache indices
+    /// (Qwen3-VL's M-RoPE once an image is in it). `None`: the model's own table.
+    pub(crate) mrope: Option<MRope<B>>,
+}
+
+/// RoPE (cos, sin) rows `[capacity, head_dim / 2]` for one sequence, indexed by cache position,
+/// and where text positions stand relative to cache indices: after each image, text at cache
+/// index `i` takes the model's row `i + delta`.
+pub struct MRope<B> {
+    pub cos: B,
+    pub sin: B,
+    /// Rows `0..filled` are written.
+    pub filled: usize,
+    /// (cache index where it starts, delta), in order.
+    pub shifts: Vec<(usize, i64)>,
+}
+
+impl<B> MRope<B> {
+    /// The text delta at cache index `i`.
+    pub fn delta(&self, i: usize) -> i64 {
+        self.shifts
+            .iter()
+            .rev()
+            .find(|s| s.0 <= i)
+            .map_or(0, |s| s.1)
+    }
 }
 
 impl<B> Cache<B> {
@@ -458,6 +484,7 @@ impl<B> Cache<B> {
             table: Vec::new(),
             len: 0,
             tokens: Vec::new(),
+            mrope: None,
         }
     }
 
@@ -478,6 +505,13 @@ impl<B> Cache<B> {
     pub fn truncate(&mut self, len: usize) {
         self.len = self.len.min(len);
         self.tokens.truncate(self.len);
+        if let Some(m) = &mut self.mrope {
+            m.filled = m.filled.min(self.len);
+            m.shifts.retain(|s| s.0 <= self.len);
+            if m.shifts.is_empty() {
+                self.mrope = None;
+            }
+        }
         let keep = self.len.div_ceil(BLOCK);
         if self.table.len() > keep {
             let mut pool = lock(&self.pool);

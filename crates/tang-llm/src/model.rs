@@ -83,6 +83,8 @@ pub struct Model<D: ComputeDevice> {
     embed_scale: Option<f32>,
     /// The vision tower, for multimodal checkpoints.
     pub vision: Option<crate::vision::Vision<D::Buffer>>,
+    /// Qwen3-VL's vision tower.
+    pub qwen_vision: Option<crate::qwen3vl::QwenVision<D::Buffer>>,
     max_ctx: usize,
     /// Every cache's K and V blocks (see [`crate::blocks`]): bf16 (half the memory of f32;
     /// attention still accumulates in f32) unless the device has no bf16 storage, or with
@@ -97,6 +99,28 @@ pub struct Model<D: ComputeDevice> {
 }
 
 pub use crate::blocks::Cache;
+
+/// An encoded image, ready to stand in for its placeholder tokens.
+pub struct ImageFeatures<B> {
+    /// `[tokens, hidden]`.
+    pub embeds: B,
+    pub tokens: usize,
+    /// Qwen3-VL: DeepStack features (`[tokens, hidden]` each, added after layers 0, 1, ...).
+    pub deepstack: Vec<B>,
+    /// Qwen3-VL: the merged grid (rows, columns), for M-RoPE.
+    pub grid: Option<(usize, usize)>,
+}
+
+impl<B> ImageFeatures<B> {
+    pub fn plain(embeds: B, tokens: usize) -> Self {
+        Self {
+            embeds,
+            tokens,
+            deepstack: Vec::new(),
+            grid: None,
+        }
+    }
+}
 
 /// One layer's weights (see [`Model::layer_weights`]). Matrices are in the load dtype, shaped
 /// as [`Layer`]'s fields describe; norms are f32 (Gemma's `1 + w` already folded in).
@@ -125,12 +149,20 @@ impl<D: ComputeDevice> Model<D> {
         let w = Weights::open(dir)?;
         let gemma = cfg.is_gemma();
         // Multimodal checkpoints keep the language model under `language_model.`.
-        let lm = if w.has("language_model.model.embed_tokens.weight")
-            || w.has("language_model.model.embed_tokens.scales")
-        {
-            "language_model."
+        // (HF Qwen3-VL: `model.language_model.` for the decoder, `lm_head` at the top.)
+        let has = |n: &str| w.has(&format!("{n}.weight")) || w.has(&format!("{n}.scales"));
+        let (base, head_name) = if has("model.language_model.embed_tokens") {
+            (
+                "model.language_model.".to_string(),
+                "lm_head.weight".to_string(),
+            )
+        } else if has("language_model.model.embed_tokens") {
+            (
+                "language_model.model.".into(),
+                "language_model.lm_head.weight".into(),
+            )
         } else {
-            ""
+            ("model.".into(), "lm_head.weight".into())
         };
         // Gemma's RMSNorm scales by (1 + w): fold the 1 in at load.
         let vec = |name: &str| -> Result<D::Buffer> {
@@ -203,7 +235,7 @@ impl<D: ComputeDevice> Model<D> {
         };
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for l in 0..cfg.num_hidden_layers {
-            let p = format!("{lm}model.layers.{l}");
+            let p = format!("{base}layers.{l}");
             let norm = |n: &str| vec(&format!("{p}.{n}.weight"));
             let window = cfg.window(l);
             layers.push(Layer {
@@ -253,14 +285,13 @@ impl<D: ComputeDevice> Model<D> {
                 rope: usize::from(gemma && window > 0),
             });
         }
-        let embed = up(&format!("{lm}model.embed_tokens.weight"))?;
-        let head_name = format!("{lm}lm_head.weight");
+        let embed = up(&format!("{base}embed_tokens.weight"))?;
         let lm_head = if cfg.tie_word_embeddings || !w.has(&head_name) {
             None
         } else {
             opt(&head_name)?
         };
-        let norm = vec(&format!("{lm}model.norm.weight"))?;
+        let norm = vec(&format!("{base}norm.weight"))?;
 
         let max_ctx = max_ctx.min(cfg.max_position_embeddings);
         let hd = cfg.head_dim();
@@ -294,6 +325,29 @@ impl<D: ComputeDevice> Model<D> {
             }
             _ => None,
         };
+        let qwen_vision = match &cfg.qwen_vision {
+            Some(v) => {
+                let prefix = ["model.visual", "vision_tower", "visual"]
+                    .into_iter()
+                    .find(|p| w.has(&format!("{p}.pos_embed.weight")));
+                match prefix {
+                    Some(p) => {
+                        let mut t = crate::qwen3vl::QwenVision::load(
+                            &dev,
+                            &w,
+                            p,
+                            v.clone(),
+                            dtype != Dtype::F32,
+                        )?;
+                        let pre = std::fs::read(dir.join("preprocessor_config.json")).ok();
+                        t.sizing = t.sizing.with_preprocessor(pre.as_deref());
+                        Some(t)
+                    }
+                    None => None,
+                }
+            }
+            None => None,
+        };
         let quant = if quant.is_some() || dtype == Dtype::Q4 {
             "q4"
         } else if dtype == Dtype::Bf16 {
@@ -314,6 +368,7 @@ impl<D: ComputeDevice> Model<D> {
             ropes,
             embed_scale,
             vision,
+            qwen_vision,
             max_ctx,
             pool: new_pool(n_layers, kv_dim, kv_bf16, usize::MAX),
             kvcomp: std::sync::Mutex::new(None),
@@ -503,10 +558,11 @@ impl<D: ComputeDevice> Model<D> {
         all: bool,
     ) -> Result<Vec<f32>> {
         let x = self.embed(tokens)?;
-        self.forward_layers(x, tokens, cache, all, true, false)
+        self.forward_layers(x, tokens, cache, all, true, false, &[])
     }
 
-    /// An image's embeddings, ready to stand in for its placeholder tokens.
+    /// An image's embeddings, ready to stand in for its placeholder tokens (Gemma 3: pixels
+    /// from [`crate::vision::preprocess`]).
     pub fn encode_image(&self, pixels: &[f32]) -> Result<D::Buffer> {
         let v = self
             .vision
@@ -515,12 +571,57 @@ impl<D: ComputeDevice> Model<D> {
         Ok(v.encode(&self.dev, pixels, self.embed_scale.unwrap_or(1.0)))
     }
 
+    /// Whether the model takes images.
+    pub fn sees_images(&self) -> bool {
+        self.vision.is_some() || self.qwen_vision.is_some()
+    }
+
+    /// Placeholder tokens an image (encoded bytes) takes.
+    pub fn image_tokens(&self, bytes: &[u8]) -> Result<usize> {
+        if let Some(v) = &self.vision {
+            return Ok(v.tokens);
+        }
+        let v = self
+            .qwen_vision
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("this model can't see images"))?;
+        let (h, w) = crate::qwen3vl::image_size(bytes)?;
+        v.sizing.tokens(h, w)
+    }
+
+    /// An encoded image (PNG, JPEG, ...) through the vision tower.
+    pub fn encode_image_bytes(&self, bytes: &[u8]) -> Result<ImageFeatures<D::Buffer>> {
+        if let Some(v) = &self.vision {
+            let px = crate::vision::preprocess(bytes, v.cfg.image_size)?;
+            return Ok(ImageFeatures::plain(self.encode_image(&px)?, v.tokens));
+        }
+        let v = self
+            .qwen_vision
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("this model can't see images"))?;
+        let p = crate::qwen3vl::preprocess(bytes, &v.sizing)?;
+        Ok(self.qwen_features(v.encode(&self.dev, &p)))
+    }
+
+    /// Qwen3-VL tower output as decoder input.
+    pub fn qwen_features(&self, e: crate::qwen3vl::Encoded<D::Buffer>) -> ImageFeatures<D::Buffer> {
+        ImageFeatures {
+            tokens: e.tokens(),
+            embeds: e.embeds,
+            deepstack: e.deepstack,
+            grid: Some(e.grid),
+        }
+    }
+
     /// `forward` with images: each run of image placeholder tokens takes the next image's
-    /// embeddings, and attends bidirectionally within itself (text stays causal).
+    /// embeddings. Gemma 3 attends bidirectionally within an image (text stays causal); Qwen3-VL
+    /// is causal throughout, adds the image's DeepStack features after the first layers and
+    /// places it with M-RoPE (rows `t, t + row, t + column`; text after it continues from
+    /// `t + max(rows, columns)`).
     pub fn forward_images(
         &self,
         tokens: &[u32],
-        images: &[D::Buffer],
+        images: &[ImageFeatures<D::Buffer>],
         cache: &mut Cache<D::Buffer>,
         all: bool,
     ) -> Result<Vec<f32>> {
@@ -539,29 +640,25 @@ impl<D: ComputeDevice> Model<D> {
             }
         }
         let mut next = images.iter();
+        // Text runs go in chunks (bounded scratch memory); an image block never splits.
+        let mut pieces: Vec<(usize, usize, Option<&ImageFeatures<D::Buffer>>)> = Vec::new();
         for &(start, len, img) in &runs {
             if img {
                 let feat = next
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("more image placeholders than images"))?;
                 anyhow::ensure!(
-                    len == self.vision.as_ref().map_or(0, |v| v.tokens),
+                    len == feat.tokens,
                     "an image takes {} placeholders, got {len}",
-                    self.vision.as_ref().map_or(0, |v| v.tokens)
+                    feat.tokens
                 );
-                self.dev.write_into(&mut x, start * h, feat);
-            }
-        }
-        // Text runs go in chunks (bounded scratch memory); an image block never splits.
-        let mut pieces: Vec<(usize, usize, bool)> = Vec::new();
-        for &(start, len, img) in &runs {
-            if img {
-                pieces.push((start, len, true));
+                self.dev.write_into(&mut x, start * h, &feat.embeds);
+                pieces.push((start, len, Some(feat)));
             } else {
                 let mut s = start;
                 while s < start + len {
                     let n = (start + len - s).min(512);
-                    pieces.push((s, n, false));
+                    pieces.push((s, n, None));
                     s += n;
                 }
             }
@@ -570,8 +667,21 @@ impl<D: ComputeDevice> Model<D> {
         for (r, &(start, len, img)) in pieces.iter().enumerate() {
             let seg = self.dev.slice_buffer(&x, start * h, len * h);
             let last = r + 1 == pieces.len();
-            let logits =
-                self.forward_layers(seg, &tokens[start..start + len], cache, all, !img, true)?;
+            let mut deepstack: &[D::Buffer] = &[];
+            if let Some(f) = img.filter(|f| f.grid.is_some()) {
+                self.place_image(cache, f)?;
+                deepstack = &f.deepstack;
+            }
+            let causal = img.is_none() || self.qwen_vision.is_some();
+            let logits = self.forward_layers(
+                seg,
+                &tokens[start..start + len],
+                cache,
+                all,
+                causal,
+                true,
+                deepstack,
+            )?;
             if all {
                 out.extend(logits);
             } else if last {
@@ -579,6 +689,62 @@ impl<D: ComputeDevice> Model<D> {
             }
         }
         Ok(out)
+    }
+
+    /// Write an image's M-RoPE rows at the cache's next positions, and the text delta after it.
+    fn place_image(
+        &self,
+        cache: &mut Cache<D::Buffer>,
+        f: &ImageFeatures<D::Buffer>,
+    ) -> Result<()> {
+        let (gh, gw) = f.grid.expect("a grid");
+        // Compressed KV re-applies the model's RoPE table to restored keys.
+        anyhow::ensure!(
+            self.kvcomp.lock().unwrap().is_none(),
+            "KV compression doesn't support M-RoPE (images on Qwen3-VL) yet"
+        );
+        let section = self
+            .cfg
+            .mrope_section
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("no M-RoPE sections"))?;
+        let (hd, pos) = (self.cfg.head_dim(), cache.len);
+        let half = hd / 2;
+        anyhow::ensure!(pos + f.tokens <= self.max_ctx, "context full");
+        let dev = &self.dev;
+        let m = cache.mrope.get_or_insert_with(|| crate::blocks::MRope {
+            cos: dev.alloc_uninit_f32(self.max_ctx * half),
+            sin: dev.alloc_uninit_f32(self.max_ctx * half),
+            filled: 0,
+            shifts: Vec::new(),
+        });
+        // Text before the image, if not yet written.
+        if m.filled < pos {
+            let from = m.filled;
+            let at = (from as i64 + m.delta(from)) as usize;
+            let (gc, gs) = &self.ropes[0];
+            let len = (pos - from) * half;
+            dev.write_into(
+                &mut m.cos,
+                from * half,
+                &dev.slice_buffer(gc, at * half, len),
+            );
+            dev.write_into(
+                &mut m.sin,
+                from * half,
+                &dev.slice_buffer(gs, at * half, len),
+            );
+        }
+        let delta = m.delta(pos);
+        let t = pos as i64 + delta;
+        let (cos, sin) = mrope_rows(hd, self.cfg.rope_theta, &section, t, gh, gw);
+        dev.write_into(&mut m.cos, pos * half, &dev.upload(&cos));
+        dev.write_into(&mut m.sin, pos * half, &dev.upload(&sin));
+        m.filled = pos + f.tokens;
+        let next = delta + gh.max(gw) as i64 - f.tokens as i64;
+        m.shifts.retain(|s| s.0 < pos + f.tokens);
+        m.shifts.push((pos + f.tokens, next));
+        Ok(())
     }
 
     /// Token embeddings (scaled, for Gemma), `[tokens, hidden]` on device.
@@ -624,11 +790,12 @@ impl<D: ComputeDevice> Model<D> {
         all: bool,
         causal: bool,
     ) -> Result<Vec<f32>> {
-        self.forward_layers(x, tokens, cache, all, causal, false)
+        self.forward_layers(x, tokens, cache, all, causal, false, &[])
     }
 
     /// `forward_hidden`; `bound` waits for the GPU every few layers on large pieces, so
     /// multimodal and conditioning prefill don't retain every temporary at once.
+    #[allow(clippy::too_many_arguments)]
     fn forward_layers(
         &self,
         mut x: D::Buffer,
@@ -637,6 +804,7 @@ impl<D: ComputeDevice> Model<D> {
         all: bool,
         causal: bool,
         bound: bool,
+        deepstack: &[D::Buffer],
     ) -> Result<Vec<f32>> {
         let c = &self.cfg;
         let dev = &self.dev;
@@ -648,12 +816,13 @@ impl<D: ComputeDevice> Model<D> {
             self.max_ctx
         );
         let (h, eps) = (c.hidden_size, c.rms_norm_eps);
-        self.decode_layers(
+        self.decode_layers_ds(
             &mut x,
             &mut [(&mut *cache, s)],
             causal,
             self.layers.len(),
             bound,
+            deepstack,
         )?;
         let (rows, x) = if all {
             (s, x)
@@ -919,6 +1088,73 @@ impl<D: ComputeDevice> Model<D> {
         layer_limit: usize,
         bound: bool,
     ) -> Result<()> {
+        self.decode_layers_ds(x, parts, causal, layer_limit, bound, &[])
+    }
+
+    /// [`decode_layers`](Self::decode_layers), adding `deepstack[l]` to the hidden states after
+    /// layer `l` (Qwen3-VL: the image's intermediate vision features, when `x` is exactly an
+    /// image's tokens). Caches with their own RoPE rows (M-RoPE) get the rows for their new
+    /// positions here, and lend them to the layers for the pass.
+    fn decode_layers_ds(
+        &self,
+        x: &mut D::Buffer,
+        parts: &mut [(&mut Cache<D::Buffer>, usize)],
+        causal: bool,
+        layer_limit: usize,
+        bound: bool,
+        deepstack: &[D::Buffer],
+    ) -> Result<()> {
+        let half = self.cfg.head_dim() / 2;
+        let mut lent = Vec::with_capacity(parts.len());
+        for (cache, n) in parts.iter_mut() {
+            let end = cache.len + *n;
+            if let Some(m) = cache.mrope.as_mut() {
+                // Text past what's written: the model's rows, shifted by the text delta.
+                if m.filled < end {
+                    let (gc, gs) = &self.ropes[0];
+                    let from = m.filled;
+                    let at = from as i64 + m.delta(from);
+                    anyhow::ensure!(at >= 0, "negative M-RoPE position");
+                    let at = at as usize;
+                    let len = (end - from) * half;
+                    self.dev.write_into(
+                        &mut m.cos,
+                        from * half,
+                        &self.dev.slice_buffer(gc, at * half, len),
+                    );
+                    self.dev.write_into(
+                        &mut m.sin,
+                        from * half,
+                        &self.dev.slice_buffer(gs, at * half, len),
+                    );
+                    m.filled = end;
+                }
+            }
+            lent.push(cache.mrope.take());
+        }
+        let rows: Vec<Option<(&D::Buffer, &D::Buffer)>> = lent
+            .iter()
+            .map(|m| m.as_ref().map(|m| (&m.cos, &m.sin)))
+            .collect();
+        let r = self.decode_layers_inner(x, parts, causal, layer_limit, bound, deepstack, &rows);
+        drop(rows);
+        for ((cache, _), m) in parts.iter_mut().zip(lent) {
+            cache.mrope = m;
+        }
+        r
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_layers_inner(
+        &self,
+        x: &mut D::Buffer,
+        parts: &mut [(&mut Cache<D::Buffer>, usize)],
+        causal: bool,
+        layer_limit: usize,
+        bound: bool,
+        deepstack: &[D::Buffer],
+        own_rope: &[Option<(&D::Buffer, &D::Buffer)>],
+    ) -> Result<()> {
         let c = &self.cfg;
         let dev = &self.dev;
         let ops = &self.ext.ops;
@@ -947,7 +1183,10 @@ impl<D: ComputeDevice> Model<D> {
         let groups = row_groups(&seqs.iter().map(|q| q.3).collect::<Vec<_>>());
         // Leading one-token parts (batched decode) attend in one call per layer.
         let singles = if causal {
-            seqs.iter().take_while(|q| q.3 == 1).count()
+            seqs.iter()
+                .zip(own_rope)
+                .take_while(|(q, r)| q.3 == 1 && r.is_none())
+                .count()
         } else {
             0
         };
@@ -1045,7 +1284,8 @@ impl<D: ComputeDevice> Model<D> {
                     None => single = Some(o),
                 }
             }
-            for (ids, table, pos, n, row) in &seqs[skip..] {
+            for (si, (ids, table, pos, n, row)) in seqs.iter().enumerate().skip(skip) {
+                let (cos, sin) = own_rope[si].unwrap_or((cos, sin));
                 let pages = tang_compute::Pages {
                     ids,
                     table,
@@ -1139,6 +1379,9 @@ impl<D: ComputeDevice> Model<D> {
                 d = ops.rms_norm(dev, &d, n, s, h, eps);
             }
             *x = dev.add_tensors_buf(x, &d, s * h);
+            if let Some(ds) = deepstack.get(l) {
+                *x = dev.add_tensors_buf(x, ds, s * h);
+            }
             // Large multimodal and conditioning pieces retain every temporary until their
             // command buffers are released. Bound that retention across deep models;
             // text prefill and decode keep the asynchronous path.
@@ -1389,6 +1632,41 @@ fn bf16_round(x: f32) -> f32 {
 
 /// cos/sin for half-split RoPE, `[max_pos, head_dim / 2]`, positions divided by `scale`
 /// (linear RoPE scaling).
+/// Interleaved M-RoPE rows `[gh * gw, head_dim / 2]` (cos, sin) for an image whose temporal
+/// position is `t`: frequency `i` turns with the row (`t + r`) when `i % 3 == 1` and
+/// `i < 3 * section[1]`, with the column (`t + c`) when `i % 3 == 2` and `i < 3 * section[2]`,
+/// else with `t`. Tokens row-major over the merged grid.
+pub fn mrope_rows(
+    head_dim: usize,
+    theta: f32,
+    section: &[usize],
+    t: i64,
+    gh: usize,
+    gw: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let half = head_dim / 2;
+    let mut cos = Vec::with_capacity(gh * gw * half);
+    let mut sin = Vec::with_capacity(gh * gw * half);
+    for r in 0..gh {
+        for c in 0..gw {
+            for i in 0..half {
+                let p = if i % 3 == 1 && i < 3 * section[1] {
+                    t + r as i64
+                } else if i % 3 == 2 && i < 3 * section[2] {
+                    t + c as i64
+                } else {
+                    t
+                };
+                let inv = (theta as f64).powf(-(2.0 * i as f64) / head_dim as f64);
+                let a = p as f64 * inv;
+                cos.push(a.cos() as f32);
+                sin.push(a.sin() as f32);
+            }
+        }
+    }
+    (cos, sin)
+}
+
 fn rope_tables(head_dim: usize, max_pos: usize, theta: f32, scale: f32) -> (Vec<f32>, Vec<f32>) {
     let half = head_dim / 2;
     let mut cos = Vec::with_capacity(max_pos * half);
@@ -1447,6 +1725,7 @@ mod conditioning_tests {
             ropes: vec![(dev.upload(&cos), dev.upload(&sin))],
             embed_scale: None,
             vision: None,
+            qwen_vision: None,
             max_ctx: 2048,
             pool: new_pool(2, 4, false, usize::MAX),
             ext: Default::default(),
@@ -1605,7 +1884,10 @@ mod conditioning_tests {
         let mut tokens: Vec<u32> = (0..600).map(|i| i % 2).collect();
         tokens.splice(590..590, [2; 4]);
         tokens.splice(50..50, [2; 4]);
-        let features = [model.dev.upload(&[6.; 16]), model.dev.upload(&[9.; 16])];
+        let features = [
+            ImageFeatures::plain(model.dev.upload(&[6.; 16]), 4),
+            ImageFeatures::plain(model.dev.upload(&[9.; 16]), 4),
+        ];
         let mut full_cache = model.new_cache();
         let all = model
             .forward_images(&tokens, &features, &mut full_cache, true)
