@@ -442,6 +442,139 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_down(ExW d, ExW sd, con
     moe_down_body<2, false>(d, sd, ids, hq, nullptr, out, T, r16, fast, pbase);
 }
 
+// ---- grouped experts: each distinct expert's rows read once for all the pairs routed to it ----
+//
+// A plan (cx_moe_plan) groups pairs pbase .. pbase + n by expert (the shared expert is one more
+// key, CX_NE): plan[0] = groups, plan[1 + g] = group g's first index into the list, plan[1 + ng]
+// = n, and plan[CX_PLAN_LIST + i] the pairs in (expert, pair) order. The grouped kernels launch
+// a fixed grid of min(n, CX_NE + 1) groups (blocks past plan[0] return), so a window's graph holds
+// for any routing. Each pair's dot is the per-pair kernels' (same staged rows, same cx_dot), so
+// outputs are bitwise those of cx_moe_gu / cx_moe_down. Block 128 (n <= CX_NP <= 128).
+#define CX_PLAN_LIST (2 + CX_NP)
+extern "C" __global__ void cx_moe_plan(const unsigned* ids, int T, int pbase, int n, unsigned* plan) {
+    const int i = threadIdx.x;
+    __shared__ int key[CX_NP];
+    __shared__ int first[CX_NP];
+    if (i < n) {
+        const int p = pbase + i;
+        key[i] = p >= T * CX_TOPK ? CX_NE : (int)ids[p];
+    }
+    __syncthreads();
+    if (i < n) {
+        int f = 1;
+        for (int q = 0; q < i; q++) if (key[q] == key[i]) { f = 0; break; }
+        first[i] = f;
+    }
+    __syncthreads();
+    if (i < n) {
+        const int k = key[i];
+        int rank = 0, gid = 0;
+        for (int j = 0; j < n; j++) {
+            const int kj = key[j];
+            if (kj < k || (kj == k && j < i)) rank++;
+            if (kj < k && first[j]) gid++;
+        }
+        plan[CX_PLAN_LIST + rank] = (unsigned)(pbase + i);
+        if (first[i]) plan[1 + gid] = (unsigned)rank;
+    }
+    if (i == 0) {
+        int ng = 0;
+        for (int j = 0; j < n; j++) ng += first[j];
+        plan[0] = (unsigned)ng;
+        plan[1 + ng] = (unsigned)n;
+    }
+}
+
+// cx_moe_gu over groups: grid (2 FF / (8 R), groups).
+template <int R>
+__device__ __forceinline__ void moe_gu_grouped_body(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
+                                                    const unsigned char* xq, float* out, int T, int r16, int fast,
+                                                    const unsigned* plan) {
+    extern __shared__ uint4 dsm[];
+    const int gi = blockIdx.y;
+    if (gi >= (int)plan[0]) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int a = plan[1 + gi], b = plan[2 + gi];
+    const int p0 = plan[CX_PLAN_LIST + a];
+    const bool shared = p0 >= T * CX_TOPK;
+    const unsigned e = shared ? 0u : ids[p0];
+    const unsigned char* w[R];
+    int ty[R], rr[R];
+    #pragma unroll
+    for (int j = 0; j < R; j++) {
+        const int r = (blockIdx.x * 8 + warp) * R + j;
+        rr[j] = r;
+        const ExW& m = shared ? (r < CX_FF ? sg : su) : (r < CX_FF ? g : u);
+        const int ro = r < CX_FF ? r : r - CX_FF;
+        ty[j] = m.ty;
+        const unsigned char* src = (const unsigned char*)m.base + (size_t)e * m.estride + (size_t)ro * m.row_bytes;
+        w[j] = cx_stage(src, m.row_bytes, dsm + (warp * R + j) * r16, lane);
+    }
+    __syncwarp();
+    const float* xd = (const float*)(xq + (size_t)XQ8_T * CX_HID);
+    for (int q = a; q < b; q++) {
+        const int p = plan[CX_PLAN_LIST + q];
+        const int t = shared ? p - T * CX_TOPK : p / CX_TOPK;
+        #pragma unroll
+        for (int j = 0; j < R; j++) {
+            const float v = cx_dot(ty[j], w[j], xq + (size_t)t * CX_HID, xd + t * (CX_HID / 32), CX_HID, fast);
+            if (lane == 0) out[(size_t)p * 2 * CX_FF + rr[j]] = v;
+        }
+    }
+}
+extern "C" __global__ void __launch_bounds__(256) cx_moe_gu_g(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
+                                                              const unsigned char* xq, float* out, int T, int r16,
+                                                              int fast, const unsigned* plan) {
+    moe_gu_grouped_body<2>(g, u, sg, su, ids, xq, out, T, r16, fast, plan);
+}
+
+// cx_moe_down over groups: grid (HID / (8 R), groups).
+template <int R>
+__device__ __forceinline__ void moe_down_grouped_body(ExW d, ExW sd, const unsigned* ids, const unsigned char* hq,
+                                                      float* out, int T, int r16, int fast, const unsigned* plan) {
+    extern __shared__ uint4 dsm[];
+    const int gi = blockIdx.y;
+    if (gi >= (int)plan[0]) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int a = plan[1 + gi], b = plan[2 + gi];
+    const int p0 = plan[CX_PLAN_LIST + a];
+    const bool shared = p0 >= T * CX_TOPK;
+    const ExW& m = shared ? sd : d;
+    const unsigned e = shared ? 0u : ids[p0];
+    const unsigned char* w[R];
+    int rr[R];
+    #pragma unroll
+    for (int j = 0; j < R; j++) {
+        const int r = (blockIdx.x * 8 + warp) * R + j;
+        rr[j] = r;
+        const unsigned char* src = (const unsigned char*)m.base + (size_t)e * m.estride + (size_t)r * m.row_bytes;
+        w[j] = cx_stage(src, m.row_bytes, dsm + (warp * R + j) * r16, lane);
+    }
+    __syncwarp();
+    for (int q = a; q < b; q++) {
+        const int p = plan[CX_PLAN_LIST + q];
+        const unsigned char* hcodes = hq + (size_t)p * CX_FF;
+        const float* hd = (const float*)(hq + (size_t)CX_NP * CX_FF) + p * (CX_FF / 32);
+        const bool aligned = ((((unsigned long long)w[0]) | ((unsigned long long)w[R - 1]) | (unsigned long long)hcodes) & 15) == 0;
+        if (R == 2 && fast >= 2 && CX_FF == 512 && (m.ty == 12 || m.ty == 13) && aligned) {
+            const int h = lane >> 4;
+            const float v = m.ty == 12 ? cx_dotq_half<12>(w[h], hcodes, hd, CX_FF) : cx_dotq_half<13>(w[h], hcodes, hd, CX_FF);
+            if ((lane & 15) == 0) out[(size_t)p * CX_HID + rr[h]] = v;
+            continue;
+        }
+        #pragma unroll
+        for (int j = 0; j < R; j++) {
+            const float v = cx_dot(m.ty, w[j], hcodes, hd, CX_FF, fast);
+            if (lane == 0) out[(size_t)p * CX_HID + rr[j]] = v;
+        }
+    }
+}
+extern "C" __global__ void __launch_bounds__(256) cx_moe_down_g(ExW d, ExW sd, const unsigned* ids,
+                                                                const unsigned char* hq, float* out, int T, int r16,
+                                                                int fast, const unsigned* plan) {
+    moe_down_grouped_body<2>(d, sd, ids, hq, out, T, r16, fast, plan);
+}
+
 // ---- K-split dense GEMV ----
 // A block of 8 warps handles 2 rows; the 4 warps of a row each take a contiguous quarter of k
 // (k % 1024 == 0) and their partial sums are added in warp order. Same segments, outputs and

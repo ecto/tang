@@ -80,6 +80,9 @@ struct Variants {
     kq: usize,
     fastk: i32,
     shared_par: bool,
+    /// Grouped expert kernels (each distinct expert read once a window); `TANG_CODER_GROUPED=0`
+    /// for the per-pair ones. Bitwise the same outputs either way.
+    grouped: bool,
 }
 
 impl Default for Variants {
@@ -88,6 +91,7 @@ impl Default for Variants {
             kq: 2,
             fastk: 2,
             shared_par: false,
+            grouped: true,
         }
     }
 }
@@ -100,6 +104,7 @@ impl Variants {
             kq: num("TANG_CODER_KQ").map_or(d.kq, |v| v as usize),
             fastk: num("TANG_CODER_FASTK").map_or(d.fastk, |v| v as i32),
             shared_par: env_is("TANG_CODER_SHPAR", "1"),
+            grouped: !env_is("TANG_CODER_GROUPED", "0"),
         }
     }
 }
@@ -232,6 +237,9 @@ struct Kern {
     moe_gu: Fun,
     silu_q: Fun,
     moe_down: Fun,
+    moe_plan: Fun,
+    moe_gu_g: Fun,
+    moe_down_g: Fun,
     moe_add_norm: Fun,
     prep: Fun,
     part: Fun,
@@ -265,6 +273,8 @@ struct Scratch {
     w: B,
     egu: B,
     hq: B,
+    /// Grouped-expert plans (`cx_moe_plan`): one for the main stream, one for the side stream.
+    plan: B,
     parts: B,
     moe_y: B,
     head: B,
@@ -597,6 +607,7 @@ impl Coder {
             ids: z(MAX_T * hp.n_expert_used),
             w: z(MAX_T * hp.n_expert_used),
             egu: z(np * 2 * hp.n_ff_exp),
+            plan: z(2 * (2 + 2 * np)),
             hq: z((np * hp.n_ff_exp + np * hp.n_ff_exp / 32 * 4).div_ceil(4)),
             parts: z(np * n),
             moe_y: z(MAX_T * n),
@@ -670,6 +681,9 @@ impl Coder {
             moe_gu: f(&cm, "cx_moe_gu")?,
             silu_q: f(&cm, "cx_silu_q")?,
             moe_down: f(&cm, "cx_moe_down")?,
+            moe_plan: f(&cm, "cx_moe_plan")?,
+            moe_gu_g: f(&cm, "cx_moe_gu_g")?,
+            moe_down_g: f(&cm, "cx_moe_down_g")?,
             moe_add_norm: f(&cm, "cx_moe_add_norm")?,
             prep: f(&cm, "cx_attn_prep")?,
             part: f(&cm, "cx_attn_part")?,
@@ -683,7 +697,7 @@ impl Coder {
             argmax2: f(&em, "fe_argmax2")?,
             _mods: vec![cm, fm, em],
         };
-        for f in [k.moe_gu, k.moe_down] {
+        for f in [k.moe_gu, k.moe_down, k.moe_gu_g, k.moe_down_g] {
             unsafe {
                 gpu::check(
                     cudarc::driver::sys::cuFuncSetAttribute(
@@ -1036,6 +1050,9 @@ impl Coder {
             (k.moe_gu, "moe_gu"),
             (k.silu_q, "silu_q"),
             (k.moe_down, "moe_down"),
+            (k.moe_plan, "route"),
+            (k.moe_gu_g, "moe_gu"),
+            (k.moe_down_g, "moe_down"),
             (k.moe_add_norm, "moe_add_norm"),
             (k.prep, "attn_prep"),
             (k.part, "attn_part"),
@@ -1471,6 +1488,48 @@ impl Coder {
             pbase as i32,
         );
         let np = n as u32;
+        if self.var.grouped {
+            // One plan region per stream (the side stream's call is the one past the routed pairs).
+            let pw = 2 + 2 * MAX_T * (hp.n_expert_used + 1);
+            let plan = self.a(&s.plan) + if pbase > 0 { (pw * 4) as u64 } else { 0 };
+            let ni = n as i32;
+            let groups = n.min(hp.n_expert + 1) as u32;
+            unsafe {
+                self.launch_on(
+                    stream,
+                    self.k.moe_plan,
+                    (1, 1, 1),
+                    128,
+                    0,
+                    tang_moe::args![ids, ti, pb, ni, plan],
+                );
+                self.launch_on(
+                    stream,
+                    self.k.moe_gu_g,
+                    ((2 * ff / 16) as u32, groups, 1),
+                    256,
+                    (16 * 16 * r16g) as u32,
+                    tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti, r16g, fastk, plan],
+                );
+                self.launch_on(
+                    stream,
+                    self.k.silu_q,
+                    ((ff / 32) as u32, np, 1),
+                    32,
+                    0,
+                    tang_moe::args![egu, hq, pb],
+                );
+                self.launch_on(
+                    stream,
+                    self.k.moe_down_g,
+                    ((nh / 16) as u32, groups, 1),
+                    256,
+                    (16 * 16 * r16d) as u32,
+                    tang_moe::args![dw, sd, ids, hq, parts, ti, r16d, fastk, plan],
+                );
+            }
+            return;
+        }
         unsafe {
             self.launch_on(
                 stream,
