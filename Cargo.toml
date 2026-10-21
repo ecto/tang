@@ -33,7 +33,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/ecto/tang"
 # CI builds on 1.94.1 (.github/workflows); that is the MSRV we promise.
 rust-version = "1.94"
@@ -47,8 +47,16 @@ authors = ["Cam Pedersen <cam@campedersen.com>"]
 #   tang-la     0.1.1   (algebraic reductions, eigensolver fix)
 #   tang-ad     0.1.1
 #   tang-expr   0.1.1
-#   tang-tensor / tang-optim / tang-gpu / tang-train / tang-3dgs
+#   tang-tensor / tang-gpu / tang-train / tang-3dgs
 #               0.1.0, first publish — they take [workspace.package] version.
+#   tang-optim  0.1.1   (crates.io: 0.1.0, 0.1.1)
+# Next release (docs/publishing.md, "crates.io readiness"):
+#   tang-expr     0.2.0 (integer dialect `int`, `reverse`, `split`; the
+#                        `CompiledMany` alias gained `Send + Sync` and
+#                        abs/min/max/tanh lower to different graphs, so a
+#                        0.x minor bump, not 0.1.2)
+#   tang-compile  0.1.0 first publish
+#   tang-compress 0.1.0 first publish
 # tang-la, tang-ad and tang-expr carry their own `version` because they moved
 # off the workspace number. Publish in the order in docs/publishing.md
 # (scripts/publish.sh).
@@ -64,7 +72,7 @@ tang-optim = { version = "0.1", path = "crates/tang-optim" }
 tang-train = { version = "0.1", path = "crates/tang-train" }
 tang-safetensors = { version = "0.1", path = "crates/tang-safetensors" }
 tang-hub = { version = "0.1", path = "crates/tang-hub" }
-tang-expr = { version = "0.1", path = "crates/tang-expr" }
+tang-expr = { version = "0.2", path = "crates/tang-expr" }
 tang-mesh = { version = "0.1", path = "crates/tang-mesh" }
 tang-infer = { version = "0.1", path = "crates/tang-infer" }
 tang-onnx = { version = "0.1", path = "crates/tang-onnx" }

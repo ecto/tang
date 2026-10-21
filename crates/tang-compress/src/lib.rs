@@ -20,6 +20,20 @@
 //! assert_eq!(stats.bytes, bytes.len());
 //! ```
 //!
+//! Other codecs — wavelet ([`wavcodec`]), Tucker ([`tucker`]),
+//! interpolation ([`interp`]) and the brick-parallel GPU layouts
+//! ([`gpuwav`], [`gpuwav3`]) — share the [`ErrorBound`] vocabulary, and
+//! [`decode_any`] decodes any of them by magic.
+//!
+//! # Features and targets
+//!
+//! - Default features are empty: CPU encode and decode only.
+//! - `gpu` adds `gpudec::GpuDecoder`, a wgpu decoder for tc-gpu / TCG3
+//!   streams whose output is bit-identical to the CPU decoder.
+//! - The crate builds for `wasm32-unknown-unknown`; the wasm-bindgen browser
+//!   front end is the (unpublished) `tang-compress-wasm` crate in the tang
+//!   repository.
+//!
 //! # Numerical notes
 //!
 //! Truncated SVDs use the Gram matrix of the smaller unfolding side with
