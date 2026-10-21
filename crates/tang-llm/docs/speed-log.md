@@ -167,6 +167,10 @@ output tokens, tok/s after the first token. The fastest public API for this mode
 | 2026-10-21 | 2a723ae | + bf16 router (opt-in) | H200 | explain | none | 243.1 | 17.4% | +1% |
 | 2026-10-21 | 2a723ae | (Q8X + bf16 router, AA) | H200 | refactor | suffix | 403.5 | | 2.71 tok/window |
 | 2026-10-21 | 2a723ae | | H200 | write | suffix | 252.0 | | 1.25 tok/window |
+| 2026-10-21 | eed9069 | (round-4 pod, defaults) | H200 | explain | none | 242.0 | 17.3% | same as round 3 |
+| 2026-10-21 | 625db0d | (round-5 pod, defaults: Q8X loads two steps ahead) | H200 | explain | none | 241.5 | 17.2% | 0% |
+| 2026-10-21 | c4aad43 | two expert-down rows a warp (fastk=2, now the default) | H200 | explain | none | 246.7 | 17.6% | +2.2% |
+| 2026-10-21 | 625db0d | (same pod, AA) | H200 | write | suffix | 247.2 | | 1.25 tok/window |
 
 Stage sweep on that H200 pod (`TANG_CODER_STAGES=1`: each stage alone in a CUDA graph, replayed;
 µs a step at a 1.3k context, window 4,856 µs): routed+shared gate|up 876 (771 GB/s), down 801
@@ -200,5 +204,17 @@ moe combine+norm 214, attention split-K 207 (154 GB/s), router 176, head 174, po
   the run). Compare variants inside the A/B block, which warms up first.
 - **bf16 router weights** (`TANG_CODER_ROUTER16=1`): +1% (240.8 → 243.1), under the bar. The
   router is 4.2 MB a layer of F32 but reads at ~1.1 TB/s either way. Kept opt-in.
+- **Top-k in the expert gate|up kernel's prologue** (every block of a token reruns it; no
+  `route` launch): −9% (242 → 220, eed9069). The top-k latency now sits in front of every
+  expert block.
+- **Norm kernels at 512 / 256 threads** instead of 1024: −4% / −11%.
+- **Attention split-K chunks of 32 / 16 positions** (from 64): 0% / −3%. At 16 the merge
+  costs more (218 µs) than the split saves (153 vs 224 µs).
+- **The shared expert on a parallel graph branch** (forked before the router, joined before
+  the combine, so it overlaps the router and the one-warp top-k): −2% (241.5 → 236.9). The
+  fork/join costs more than the overlap gives.
+- **Q8X GEMV with both 512-wide steps' loads issued first:** 0% (241.5 vs 242). Left in (harmless).
+- **Running `flash-ref` while benchmarking:** flash-ref uses the GPU too, and halved every
+  kernel's speed for the length of the overlap. Run references before or after, never during.
 - **nsys / ncu on the RunPod image:** ncu's injection lacks `cuTensorMapEncodeIm2colWide`,
   which cudarc resolves at load, and nsys isn't installed (apt fails).
