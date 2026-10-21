@@ -44,8 +44,11 @@ def main():
 
     # llama.cpp: the same chat, its own template and preprocessing.
     data = base64.b64encode(open(a.image, "rb").read()).decode()
-    # The image as llama.cpp's media marker (mtmd adds the vision start/end tokens itself).
-    prompt, n = re.subn(r"<\|vision_start\|>(<\|image_pad\|>)*<\|vision_end\|>", "<__media__>", text)
+    # The image as the server's media marker (`/props`; recent servers randomize it). mtmd adds
+    # the vision start/end tokens itself.
+    props = json.load(urllib.request.urlopen(a.server + "/props", timeout=60))
+    marker = props.get("media_marker") or "<__media__>"
+    prompt, n = re.subn(r"<\|vision_start\|>(<\|image_pad\|>)*<\|vision_end\|>", lambda _: marker, text)
     assert n == 1, text
     body = {"prompt": {"prompt_string": prompt, "multimodal_data": [data]}, "n_predict": a.n,
             "temperature": 0, "n_probs": 20, "cache_prompt": False, "return_tokens": True}
