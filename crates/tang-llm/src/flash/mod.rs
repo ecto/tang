@@ -29,6 +29,7 @@ pub mod sampler;
 #[cfg(feature = "cuda")]
 pub mod serve;
 pub mod tokenize;
+pub mod tree;
 
 use crate::gguf::{Gguf, TensorInfo};
 use anyhow::Result;
