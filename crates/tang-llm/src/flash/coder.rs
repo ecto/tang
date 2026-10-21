@@ -87,7 +87,8 @@ struct Variants {
     /// grouped). They're for wide windows (prefill), where many rows share experts.
     grouped: bool,
     /// Per-pair expert kernels: 0 stage rows in shared memory (`cx_moe_gu` / `cx_moe_down`),
-    /// 2 or 4 read them from global memory with that many rows a warp (`_d2` / `_d4`).
+    /// 2 or 4 read them from global memory with that many rows a warp (`_d2` / `_d4`), 8
+    /// double-buffer them with cp.async (`_db`).
     /// `TANG_CODER_MOE`. Bitwise the same outputs.
     moe: usize,
 }
@@ -249,6 +250,8 @@ struct Kern {
     moe_plan: Fun,
     moe_gu_d: [Fun; 2],
     moe_down_d: [Fun; 2],
+    moe_gu_db: Fun,
+    moe_down_db: Fun,
     moe_gu_g: Fun,
     moe_down_g: Fun,
     moe_add_norm: Fun,
@@ -699,6 +702,8 @@ impl Coder {
             moe_plan: f(&cm, "cx_moe_plan")?,
             moe_gu_d: [f(&cm, "cx_moe_gu_d2")?, f(&cm, "cx_moe_gu_d4")?],
             moe_down_d: [f(&cm, "cx_moe_down_d2")?, f(&cm, "cx_moe_down_d4")?],
+            moe_gu_db: f(&cm, "cx_moe_gu_db")?,
+            moe_down_db: f(&cm, "cx_moe_down_db")?,
             moe_gu_g: f(&cm, "cx_moe_gu_g")?,
             moe_down_g: f(&cm, "cx_moe_down_g")?,
             moe_add_norm: f(&cm, "cx_moe_add_norm")?,
@@ -731,7 +736,14 @@ impl Coder {
                 99 * 1024
             }
         };
-        for f in [k.moe_gu, k.moe_down, k.moe_gu_g, k.moe_down_g] {
+        for f in [
+            k.moe_gu,
+            k.moe_down,
+            k.moe_gu_g,
+            k.moe_down_g,
+            k.moe_gu_db,
+            k.moe_down_db,
+        ] {
             unsafe {
                 gpu::check(
                     cudarc::driver::sys::cuFuncSetAttribute(
@@ -1089,6 +1101,8 @@ impl Coder {
             (k.moe_gu_d[1], "moe_gu"),
             (k.moe_down_d[0], "moe_down"),
             (k.moe_down_d[1], "moe_down"),
+            (k.moe_gu_db, "moe_gu"),
+            (k.moe_down_db, "moe_down"),
             (k.moe_plan, "route"),
             (k.moe_gu_g, "moe_gu"),
             (k.moe_down_g, "moe_down"),
@@ -1573,6 +1587,14 @@ impl Coder {
         let (gu_f, down_f, rows, smem_g, smem_d) = match self.var.moe {
             2 => (self.k.moe_gu_d[0], self.k.moe_down_d[0], 16, 0, 0),
             4 => (self.k.moe_gu_d[1], self.k.moe_down_d[1], 32, 0, 0),
+            // Double-buffered: 8 warps × 2 rows × 4 groups a block, two buffers.
+            8 => (
+                self.k.moe_gu_db,
+                self.k.moe_down_db,
+                64,
+                (2 * 16 * 16 * r16g) as u32,
+                (2 * 16 * 16 * r16d) as u32,
+            ),
             _ => (
                 self.k.moe_gu,
                 self.k.moe_down,

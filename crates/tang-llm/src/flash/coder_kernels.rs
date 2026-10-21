@@ -324,6 +324,34 @@ __device__ __forceinline__ const unsigned char* cx_stage(const unsigned char* sr
     return (const unsigned char*)sm + delta;
 }
 
+// cx_stage with cp.async (sm_80+; synchronous loads before that): the copy is in flight until
+// cx_async_wait<N>() and a __syncwarp().
+__device__ __forceinline__ const unsigned char* cx_stage_async(const unsigned char* src, int nb, uint4* sm, int lane) {
+    const unsigned long long a = (unsigned long long)src & ~15ull;
+    const int delta = (int)((unsigned long long)src - a);
+    const int n16 = (delta + nb + 15) >> 4;
+    for (int i = lane; i < n16; i += 32) {
+#if __CUDA_ARCH__ >= 800
+        const unsigned dst = (unsigned)__cvta_generic_to_shared(sm + i);
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"((const uint4*)a + i));
+#else
+        sm[i] = __ldg((const uint4*)a + i);
+#endif
+    }
+    return (const unsigned char*)sm + delta;
+}
+__device__ __forceinline__ void cx_async_commit() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+template <int N>
+__device__ __forceinline__ void cx_async_wait() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
+#endif
+}
+
 // Experts' gate and up rows, R rows a warp (all staged in shared memory before any is decoded),
 // 8 warps a block. Pairs p < T·K are (token p / K, rank p % K) with the routed expert ids[p];
 // p >= T·K is the shared expert for token p − T·K. out[p][r]: r < FF gate, else up.
@@ -469,6 +497,117 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_down_d4(ExW d, ExW sd, 
                                                                  const unsigned char* hq, float* out, int T, int r16,
                                                                  int fast, int pbase) {
     moe_down_body<4, false, false>(d, sd, ids, hq, nullptr, out, T, r16, fast, pbase);
+}
+
+// Per-pair expert kernels with the rows double-buffered: each warp runs L groups of R rows,
+// copying group i + 1 into shared memory (cp.async) while it decodes group i, so a warp always
+// has a group's loads in flight. Same rows and cx_dot (and the down kernel's half-warp path) as
+// the staged kernels: bitwise equal outputs. Grid x = rows / (8 R L); dynamic smem
+// 2 × 8 R × r16 × 16 bytes. TANG_CODER_MOE=8.
+template <int R, int L>
+__device__ __forceinline__ void moe_gu_db_body(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
+                                               const unsigned char* xq, float* out, int T, int r16, int fast, int pbase) {
+    extern __shared__ uint4 dsm[];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, p = pbase + blockIdx.y;
+    const bool shared = p >= T * CX_TOPK;
+    const int t = shared ? p - T * CX_TOPK : p / CX_TOPK;
+    const unsigned e = shared ? 0u : ids[p];
+    const float* xd = (const float*)(xq + (size_t)XQ8_T * CX_HID);
+    const unsigned char* w[2][R];
+    int ty[2][R], rr[2][R];
+    auto issue = [&](int it, int b) {
+        #pragma unroll
+        for (int j = 0; j < R; j++) {
+            const int r = ((blockIdx.x * L + it) * 8 + warp) * R + j;
+            rr[b][j] = r;
+            const ExW& m = shared ? (r < CX_FF ? sg : su) : (r < CX_FF ? g : u);
+            const int ro = r < CX_FF ? r : r - CX_FF;
+            ty[b][j] = m.ty;
+            const unsigned char* src = (const unsigned char*)m.base + (size_t)e * m.estride + (size_t)ro * m.row_bytes;
+            w[b][j] = cx_stage_async(src, m.row_bytes, dsm + ((b * 8 + warp) * R + j) * r16, lane);
+        }
+        cx_async_commit();
+    };
+    issue(0, 0);
+    #pragma unroll
+    for (int it = 0; it < L; it++) {
+        const int b = it & 1;
+        if (it + 1 < L) {
+            issue(it + 1, b ^ 1);
+            cx_async_wait<1>();
+        } else {
+            cx_async_wait<0>();
+        }
+        __syncwarp();
+        #pragma unroll
+        for (int j = 0; j < R; j++) {
+            const float a = cx_dot(ty[b][j], w[b][j], xq + (size_t)t * CX_HID, xd + t * (CX_HID / 32), CX_HID, fast);
+            if (lane == 0) out[(size_t)p * 2 * CX_FF + rr[b][j]] = a;
+        }
+        __syncwarp();
+    }
+}
+template <int R, int L>
+__device__ __forceinline__ void moe_down_db_body(ExW d, ExW sd, const unsigned* ids, const unsigned char* hq,
+                                                 float* out, int T, int r16, int fast, int pbase) {
+    extern __shared__ uint4 dsm[];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, p = pbase + blockIdx.y;
+    const bool shared = p >= T * CX_TOPK;
+    const ExW& m = shared ? sd : d;
+    const unsigned e = shared ? 0u : ids[p];
+    const unsigned char* hcodes = hq + (size_t)p * CX_FF;
+    const float* hd = (const float*)(hq + (size_t)CX_NP * CX_FF) + p * (CX_FF / 32);
+    const unsigned char* w[2][R];
+    int rr[2][R];
+    auto issue = [&](int it, int b) {
+        #pragma unroll
+        for (int j = 0; j < R; j++) {
+            const int r = ((blockIdx.x * L + it) * 8 + warp) * R + j;
+            rr[b][j] = r;
+            const unsigned char* src = (const unsigned char*)m.base + (size_t)e * m.estride + (size_t)r * m.row_bytes;
+            w[b][j] = cx_stage_async(src, m.row_bytes, dsm + ((b * 8 + warp) * R + j) * r16, lane);
+        }
+        cx_async_commit();
+    };
+    issue(0, 0);
+    #pragma unroll
+    for (int it = 0; it < L; it++) {
+        const int b = it & 1;
+        if (it + 1 < L) {
+            issue(it + 1, b ^ 1);
+            cx_async_wait<1>();
+        } else {
+            cx_async_wait<0>();
+        }
+        __syncwarp();
+        const bool aligned = ((((unsigned long long)w[b][0]) | ((unsigned long long)w[b][R - 1]) | (unsigned long long)hcodes) & 15) == 0;
+        if (R % 2 == 0 && fast >= 2 && CX_FF == 512 && (m.ty == 12 || m.ty == 13) && aligned) {
+            const int h = lane >> 4;
+            #pragma unroll
+            for (int j0 = 0; j0 < R; j0 += 2) {
+                const float a = m.ty == 12 ? cx_dotq_half<12>(w[b][j0 + h], hcodes, hd, CX_FF)
+                                           : cx_dotq_half<13>(w[b][j0 + h], hcodes, hd, CX_FF);
+                if ((lane & 15) == 0) out[(size_t)p * CX_HID + rr[b][j0 + h]] = a;
+            }
+        } else {
+            #pragma unroll
+            for (int j = 0; j < R; j++) {
+                const float a = cx_dot(m.ty, w[b][j], hcodes, hd, CX_FF, fast);
+                if (lane == 0) out[(size_t)p * CX_HID + rr[b][j]] = a;
+            }
+        }
+        __syncwarp();
+    }
+}
+extern "C" __global__ void __launch_bounds__(256) cx_moe_gu_db(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
+                                                               const unsigned char* xq, float* out, int T, int r16,
+                                                               int fast, int pbase) {
+    moe_gu_db_body<2, 4>(g, u, sg, su, ids, xq, out, T, r16, fast, pbase);
+}
+extern "C" __global__ void __launch_bounds__(256) cx_moe_down_db(ExW d, ExW sd, const unsigned* ids,
+                                                                 const unsigned char* hq, float* out, int T, int r16,
+                                                                 int fast, int pbase) {
+    moe_down_db_body<2, 4>(d, sd, ids, hq, out, T, r16, fast, pbase);
 }
 
 // ---- grouped experts: each distinct expert's rows read once for all the pairs routed to it ----
