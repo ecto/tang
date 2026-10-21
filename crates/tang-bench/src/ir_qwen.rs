@@ -1337,4 +1337,33 @@ mod tests {
             .count();
         assert_eq!(inplace, 2 * dims.layers + 1);
     }
+
+    /// Kernels of the OpenCL lowering of a prefill step whose first line
+    /// names them.
+    fn opencl_prefill_heads(dims: &QwenDims, seq: usize) -> Vec<String> {
+        let dg = step_graph(dims, seq, dims.ctx);
+        let (g, outs) = compiled_decode(&dg, false);
+        let opts = decode_opts(&dg, &outs);
+        g.to_opencl_decode(&outs, &opts)
+            .program
+            .kernels
+            .iter()
+            .map(|k| k.source.lines().next().unwrap_or("").to_string())
+            .collect()
+    }
+
+    /// Every projection of an OpenCL prefill (q|k|v, o, gate, up, down per
+    /// layer) is a register-block kernel (`opencl_mma_kernel`): both
+    /// operands contiguous along k — the activations `[token][k]`, the
+    /// weights `[row][k]`. The LM head is the last token's GEMV.
+    #[test]
+    fn opencl_prefill_projections_are_register_blocks() {
+        let dims = tiny();
+        let heads = opencl_prefill_heads(&dims, 6);
+        let mm = heads
+            .iter()
+            .filter(|h| h.starts_with("// tang-compile: OpenCL C (native)") && h.contains("matmul"))
+            .count();
+        assert_eq!(mm, 5 * dims.layers, "{heads:#?}");
+    }
 }
