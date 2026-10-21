@@ -1229,7 +1229,7 @@ impl Coder {
         let layer = &self.layers[l];
         let s = &self.s;
         let (x, xq) = (self.a(&s.x), Some(self.a(&s.mxq)));
-        let (ctl, eps) = (self.a(&s.ctl), self.eps);
+        let eps = self.eps;
         let n = self.hp.n_embd;
         if let Some(g) = &layer.gdn {
             let stride = layer.w_in.rows;
@@ -1660,7 +1660,7 @@ impl Coder {
         pos0: usize,
         t: usize,
         verify: bool,
-        mut probe: Option<&mut Probe>,
+        probe: Option<&mut Probe>,
     ) -> Result<Vec<u32>> {
         ensure!((1..=MAX_T).contains(&t) && pos0 + t <= self.tokens.len());
         ensure!(
