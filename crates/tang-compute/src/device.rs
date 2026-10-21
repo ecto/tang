@@ -1085,7 +1085,7 @@ pub trait ComputeDevice: Send + 'static {
     /// [`kv_attention_window`](Self::kv_attention_window) over a paged cache: key `j` is the
     /// row `pages` maps it to. The default ([`kv_attention_paged_default`]) gathers the keys
     /// into contiguous buffers.
-    /// Decode GPU-layout compressed-KV lanes (tables from `tang_compress::kvgpu::Batch`:
+    /// Decode GPU-layout compressed-KV lanes (tables from `cram_codec::kvgpu::Batch`:
     /// `stream`, `lanes`, `chans`, `prior` as u32 buffers, `scratch` of `scratch_words`) into
     /// `out` (an f32 or bf16 cache). `rope` = the model's (cos, sin) `[pos][hd/2]` tables, used
     /// by lanes with their RoPE flag set. Metal only.

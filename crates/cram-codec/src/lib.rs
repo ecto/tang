@@ -12,7 +12,7 @@
 //! and (in max-abs mode) the sparse residual-correction stream.
 //!
 //! ```
-//! use tang_compress::{decode, encode_f32, Config, Decoded, ErrorBound};
+//! use cram_codec::{decode, encode_f32, Config, Decoded, ErrorBound};
 //! let x: Vec<f32> = (0..4096).map(|i| (i as f32 * 0.01).sin()).collect();
 //! let (bytes, stats) = encode_f32(&x, &[64, 64], &Config::new(ErrorBound::MaxAbs(1e-3)));
 //! let Decoded::F32 { data, .. } = decode(&bytes).unwrap() else { unreachable!() };
@@ -31,7 +31,7 @@
 //! - `gpu` adds `gpudec::GpuDecoder`, a wgpu decoder for tc-gpu / TCG3
 //!   streams whose output is bit-identical to the CPU decoder.
 //! - The crate builds for `wasm32-unknown-unknown`; the wasm-bindgen browser
-//!   front end is the (unpublished) `tang-compress-wasm` crate in the tang
+//!   front end is the (unpublished) `cram-codec-wasm` crate in the tang
 //!   repository.
 //!
 //! # Numerical notes
@@ -78,7 +78,7 @@ pub use codec::{decode, encode_f32, encode_f64, Config, Decoded, Dtype, EncodeSt
 pub use tensorize::{DigitOrder, Layout, PadPolicy};
 pub use tt::{tt_svd, TensorTrain, Truncation};
 
-/// Decode any tang-compress stream (QTT, wavelet, Tucker, interpolation or Lorenzo),
+/// Decode any cram-codec stream (QTT, wavelet, Tucker, interpolation or Lorenzo),
 /// by magic; a leading portfolio tag byte is skipped.
 pub fn decode_any(bytes: &[u8]) -> Result<Decoded, bitio::DecodeError> {
     if let Some(&t) = bytes.first() {

@@ -1,7 +1,7 @@
 //! Bit breakdown of the hand context model on a raw f32 3D field.
 //! `analyze IN.f32 AxBxC PSNR`
-use tang_compress::coefcode::{code_bands, fit_predictors, HandModel, Meter};
-use tang_compress::wavcodec::{quantize, Coeffs};
+use cram_codec::coefcode::{code_bands, fit_predictors, HandModel, Meter};
+use cram_codec::wavcodec::{quantize, Coeffs};
 
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();

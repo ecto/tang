@@ -20,7 +20,7 @@ else
     CRATES=(
         tang-expr
         tang-compile
-        tang-compress
+        cram-codec
     )
 fi
 

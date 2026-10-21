@@ -89,13 +89,13 @@ published yet:
 Each one packages cleanly as soon as the crate ahead of it in the order lands,
 which is what `scripts/publish.sh` walks.
 
-## Next release: tang-expr 0.2.0, tang-compile 0.1.0, tang-compress 0.1.0
+## Next release: tang-expr 0.2.0, tang-compile 0.1.0, cram-codec 0.1.0
 
 | crate | crates.io now | this release | depends on (tang-*) |
 | --- | --- | --- | --- |
 | `tang-expr` | 0.1.0, 0.1.1 | **0.2.0** | `tang` 0.2 (0.2.1 on the index) |
 | `tang-compile` | — | 0.1.0 (first publish) | `tang` 0.2, `tang-expr` 0.2 |
-| `tang-compress` | — | 0.1.0 (first publish) | `tang-la` 0.1, `tang-optim` 0.1, `tang-expr` 0.2 |
+| `cram-codec` | — | 0.1.0 (first publish) | `tang-la` 0.1, `tang-optim` 0.1, `tang-expr` 0.2 |
 
 `tang-expr` goes to 0.2.0, not 0.1.2: besides the additive `int`, `reverse`
 and `split` modules, the public alias `compile::CompiledMany` gained a
@@ -111,7 +111,7 @@ republished. Order (`scripts/publish.sh`):
 ```sh
 cargo publish -p tang-expr
 cargo publish -p tang-compile
-cargo publish -p tang-compress
+cargo publish -p cram-codec
 ```
 
 `tang-expr` dry-runs against crates.io alone. The two dependents cannot

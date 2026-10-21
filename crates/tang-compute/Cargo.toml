@@ -33,7 +33,7 @@ cudarc = { version = "0.16", features = ["nvrtc", "cublas", "cuda-version-from-b
 
 [dev-dependencies]
 # Path only, so publishing strips it: only the kvdec example uses it.
-tang-compress = { path = "../tang-compress" }
+cram-codec = { path = "../cram-codec" }
 
 [[example]]
 name = "kvdec_bench"

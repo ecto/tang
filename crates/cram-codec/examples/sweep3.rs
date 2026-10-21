@@ -5,8 +5,8 @@
 //! ```
 //! Prints one JSON line per (field, target) and the geomean bpv ratio vs
 //! serial tc-wavelet (from `DATA_ROOT/out/gpu_ratio.jsonl`) on all / orig / held.
-use tang_compress::codec::ErrorBound;
-use tang_compress::gpuwav3::{self, Gpu3Config, Model3};
+use cram_codec::codec::ErrorBound;
+use cram_codec::gpuwav3::{self, Gpu3Config, Model3};
 
 fn opt(args: &[String], k: &str, d: &str) -> String {
     args.iter()
@@ -33,10 +33,9 @@ fn main() {
         Model3::Static
     } else if let Some(p) = m.strip_prefix("pretrained:") {
         let net = std::sync::Arc::new(
-            tang_compress::learned::Net::from_bytes(&std::fs::read(p).expect("model"))
-                .expect("parse"),
+            cram_codec::learned::Net::from_bytes(&std::fs::read(p).expect("model")).expect("parse"),
         );
-        tang_compress::learned::register(net.clone());
+        cram_codec::learned::register(net.clone());
         Model3::Pretrained(net)
     } else {
         panic!("model3 {m}")

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>tang-compress WebGPU decode</title>
+<title>cram-codec WebGPU decode</title>
 <style>
   :root { --bg: #fff; --fg: #111; --muted: #666; --ok: #0a7d2c; --bad: #c0262d; --line: #ddd; }
   @media (prefers-color-scheme: dark) { :root { --bg: #111; --fg: #eee; --muted: #999; --ok: #4ade80; --bad: #f87171; --line: #333; } }
@@ -16,7 +16,7 @@
 </style>
 </head>
 <body>
-<h1>tang-compress — TCG1 / TCG3 decode on WebGPU</h1>
+<h1>cram-codec — TCG1 / TCG3 decode on WebGPU</h1>
 <p id="status" class="muted">loading…</p>
 <p>
   <select id="pick"></select> <button id="show">decode + show</button>
@@ -28,7 +28,7 @@
 <pre id="info"></pre>
 <div id="out"></div>
 <script type="module">
-import init, { TcGpu, decodeCpu, fnv1a, registerModel, streamInfo } from "./pkg/tang_compress_wasm.js";
+import init, { TcGpu, decodeCpu, fnv1a, registerModel, streamInfo } from "./pkg/cram_codec_wasm.js";
 
 const $ = (id) => document.getElementById(id);
 const status = (s) => ($("status").textContent = s);

@@ -1,9 +1,9 @@
 //! `qtt` — encode/decode raw little-endian f32 files with the QTT codec.
 //!
 //! ```text
-//! cargo run --release -p tang-compress --example qtt -- encode in.f32 out.qtt --dims 256x384x384 --psnr 60
-//! cargo run --release -p tang-compress --example qtt -- decode out.qtt back.f32
-//! cargo run --release -p tang-compress --example qtt -- bench in.f32 --dims 512x512 --max-rel 1e-3
+//! cargo run --release -p cram-codec --example qtt -- encode in.f32 out.qtt --dims 256x384x384 --psnr 60
+//! cargo run --release -p cram-codec --example qtt -- decode out.qtt back.f32
+//! cargo run --release -p cram-codec --example qtt -- bench in.f32 --dims 512x512 --max-rel 1e-3
 //! ```
 //!
 //! Bounds: `--psnr dB` (range-normalised), `--rmse x`, `--max-abs x`,
@@ -12,8 +12,8 @@
 //! `encode` and `bench` print one JSON line of stats (sizes, ranks, errors,
 //! single-thread wall times).
 
+use cram_codec::{decode, encode_f32, Config, Decoded, DigitOrder, ErrorBound, PadPolicy};
 use std::time::Instant;
-use tang_compress::{decode, encode_f32, Config, Decoded, DigitOrder, ErrorBound, PadPolicy};
 
 fn usage() -> ! {
     eprintln!("usage: qtt encode IN.f32 OUT.qtt --dims AxBxC BOUND [opts]\n       qtt decode IN.qtt OUT.f32\n       qtt bench IN.f32 --dims AxBxC BOUND [opts]");
@@ -146,7 +146,7 @@ fn main() {
     }
 }
 
-fn json(st: &tang_compress::EncodeStats, enc: f64, dec: Option<f64>) -> String {
+fn json(st: &cram_codec::EncodeStats, enc: f64, dec: Option<f64>) -> String {
     let ranks: Vec<String> = st.ranks.iter().map(|r| r.to_string()).collect();
     let modes: Vec<String> = st.modes.iter().map(|r| r.to_string()).collect();
     let psnr = 20.0 * (st.range / st.rmse).log10();

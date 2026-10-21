@@ -1,12 +1,13 @@
 [package]
-name = "tang-compress"
+name = "cram-codec"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Error-bounded scientific-data compression: bit-accounted quantized tensor train (QTT) codec"
 repository.workspace = true
-documentation = "https://docs.rs/tang-compress"
+homepage = "https://cram.sh"
+documentation = "https://docs.rs/cram-codec"
 readme = "README.md"
 keywords = ["compression", "tensor-train", "qtt", "scientific-data", "lossy"]
 categories = ["compression", "science", "mathematics"]

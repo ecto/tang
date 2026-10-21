@@ -1,10 +1,12 @@
-# tang-compress
+# cram-codec
+
+**cram** — [cram.sh](https://cram.sh) · [docs](https://docs.rs/cram-codec)
 
 Error-bounded lossy compression of scientific `f32`/`f64` arrays, in pure
 Rust. Every byte of the stream counts toward the reported rate, encoding is
 deterministic, and the error bound you ask for is the one you get.
 
-Codecs (all decode through `tang_compress::decode_any`):
+Codecs (all decode through `cram_codec::decode_any`):
 
 - **QTT** (`codec`) — bit-accounted quantized tensor train: TT-SVD,
   error-feedback quantization, rate–distortion rank choice, static rANS.
@@ -19,7 +21,7 @@ Part of [tang](https://github.com/ecto/tang).
 ## Usage
 
 ```rust
-use tang_compress::{decode, encode_f32, Config, Decoded, ErrorBound};
+use cram_codec::{decode, encode_f32, Config, Decoded, ErrorBound};
 
 // a 64×64 field
 let x: Vec<f32> = (0..4096).map(|i| (i as f32 * 0.01).sin()).collect();
@@ -35,7 +37,7 @@ assert!(x.iter().zip(&data).all(|(a, b)| (a - b).abs() <= 1e-3));
 Error bounds: `ErrorBound::MaxAbs(e)` (pointwise), `ErrorBound::Rmse(r)`
 (absolute RMSE), `ErrorBound::Psnr(db)` (range-normalised PSNR).
 
-Examples (`cargo run --release -p tang-compress --example <name>`):
+Examples (`cargo run --release -p cram-codec --example <name>`):
 `roundtrip` (the snippet above, all bounds), `tc` / `qtt` (encode and decode
 raw little-endian `.f32` files from the command line).
 
@@ -51,8 +53,8 @@ raw little-endian `.f32` files from the command line).
 ## WebAssembly
 
 The decoders build for `wasm32-unknown-unknown`. The browser front end
-(wasm-bindgen, WebGPU with a CPU fallback) is the `tang-compress-wasm` crate in
-the [tang repository](https://github.com/ecto/tang/tree/main/crates/tang-compress-wasm);
+(wasm-bindgen, WebGPU with a CPU fallback) is the `cram-codec-wasm` crate in
+the [tang repository](https://github.com/ecto/tang/tree/main/crates/cram-codec-wasm);
 it is not published to crates.io.
 
 TCG3 streams can carry their own decoder as a checked `tang-expr` integer

@@ -5,9 +5,9 @@
 //!
 //! `--copies N` decodes N copies of the stream in one dispatch (≈ N layer×kind streams of a
 //! model's cache) to measure whole-cache decode time.
+use cram_codec::kvcodec::{encode, Kind, KvParams, KvStream};
+use cram_codec::kvgpu::{Batch, Placement};
 use std::time::Instant;
-use tang_compress::kvcodec::{encode, Kind, KvParams, KvStream};
-use tang_compress::kvgpu::{Batch, Placement};
 use tang_compute::{ComputeDevice, MetalDevice};
 
 fn flag(a: &[String], f: &str) -> Option<String> {
