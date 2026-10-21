@@ -111,6 +111,9 @@ struct Variants {
     /// Which GEMMs (`TANG_CODER_WGEMM=gu` / `down`; anything else: both). For localizing.
     wgemm_gu: bool,
     wgemm_down: bool,
+    /// Wide windows run attention tiled (`cx_attn_tile`: K/V tiles shared by a block of query
+    /// rows) instead of per-row split-K part/merge; `TANG_CODER_ATTN_TILE=0` for those.
+    attn_tile: bool,
 }
 
 impl Default for Variants {
@@ -125,6 +128,7 @@ impl Default for Variants {
             wgemm: true,
             wgemm_gu: true,
             wgemm_down: true,
+            attn_tile: true,
         }
     }
 }
@@ -143,6 +147,7 @@ impl Variants {
             wgemm: !env_is("TANG_CODER_WGEMM", "0"),
             wgemm_gu: !env_is("TANG_CODER_WGEMM", "down"),
             wgemm_down: !env_is("TANG_CODER_WGEMM", "gu"),
+            attn_tile: !env_is("TANG_CODER_ATTN_TILE", "0"),
         }
     }
 }
@@ -396,6 +401,7 @@ struct Kern {
     prep: Fun,
     part: Fun,
     merge: Fun,
+    tile: Fun,
     gdn_step: Fun,
     gdn_commit: Fun,
     gdn_step_seg: Fun,
@@ -437,6 +443,7 @@ impl Kern {
             prep: f("cx_attn_prep")?,
             part: f("cx_attn_part")?,
             merge: f("cx_attn_merge")?,
+            tile: f("cx_attn_tile")?,
             gdn_step: self.gdn_step,
             gdn_commit: self.gdn_commit,
             gdn_step_seg: self.gdn_step_seg,
@@ -933,6 +940,7 @@ impl Coder {
             prep: f(&cm, "cx_attn_prep")?,
             part: f(&cm, "cx_attn_part")?,
             merge: f(&cm, "cx_attn_merge")?,
+            tile: f(&cm, "cx_attn_tile")?,
             gdn_step: f(&fm, "fl_gdn_conv_step")?,
             gdn_commit: f(&fm, "fl_gdn_conv_commit")?,
             gdn_step_seg: f(&fm, "fl_gdn_conv_step_seg")?,
@@ -1707,6 +1715,7 @@ impl Coder {
             (k.prep, "attn_prep"),
             (k.part, "attn_part"),
             (k.merge, "attn_merge"),
+            (k.tile, "attn_tile"),
             (k.gdn_step, "gdn_conv_step"),
             (k.gdn_commit, "gdn_commit"),
             (k.gdn_step_seg, "gdn_conv_step"),
@@ -2076,33 +2085,68 @@ impl Coder {
                 t
             };
             let qrow = (hp.n_head * hp.head_dim * 4) as u64;
-            for r0 in (0..t).step_by(slice) {
-                let c = slice.min(t - r0);
-                let nc = if self.in_wide.get() {
-                    self.nchunk(self.wide_pos0.get() + r0 + c)
-                } else {
-                    nchunk
-                } as i32;
-                let (q0, rows0, proj0, attn0) = (
-                    q + r0 as u64 * qrow,
-                    rows + (r0 * 4) as u64,
-                    proj + (r0 * stride * 4) as u64,
-                    attn + r0 as u64 * qrow,
-                );
+            let split_k = |dst: u64| {
+                for r0 in (0..t).step_by(slice) {
+                    let c = slice.min(t - r0);
+                    let nc = if self.in_wide.get() {
+                        self.nchunk(self.wide_pos0.get() + r0 + c)
+                    } else {
+                        nchunk
+                    } as i32;
+                    let (q0, rows0, proj0, attn0) = (
+                        q + r0 as u64 * qrow,
+                        rows + (r0 * 4) as u64,
+                        proj + (r0 * stride * 4) as u64,
+                        dst + r0 as u64 * qrow,
+                    );
+                    unsafe {
+                        self.launch(
+                            self.kn().part,
+                            (c as u32, hp.n_head_kv as u32, nc as u32),
+                            128,
+                            tang_moe::args![q0, kt, vt, rows0, part, nc],
+                        );
+                        self.launch(
+                            self.kn().merge,
+                            (c as u32, hp.n_head as u32, 1),
+                            hp.head_dim as u32,
+                            tang_moe::args![part, nc, proj0, st, attn0],
+                        );
+                    }
+                }
+            };
+            let tiled = self.in_wide.get() && self.var.attn_tile;
+            if tiled {
+                let tq = 8; // CX_TQ
                 unsafe {
                     self.launch(
-                        self.kn().part,
-                        (c as u32, hp.n_head_kv as u32, nc as u32),
-                        128,
-                        tang_moe::args![q0, kt, vt, rows0, part, nc],
-                    );
-                    self.launch(
-                        self.kn().merge,
-                        (c as u32, hp.n_head as u32, 1),
-                        hp.head_dim as u32,
-                        tang_moe::args![part, nc, proj0, st, attn0],
+                        self.kn().tile,
+                        (t.div_ceil(tq) as u32, hp.n_head_kv as u32, 1),
+                        256,
+                        tang_moe::args![q, kt, vt, rows, t as i32, proj, st, attn],
                     );
                 }
+            }
+            if !tiled {
+                split_k(attn);
+            } else if env_is("TANG_CODER_ATTN_CHECK", "1") {
+                // Debug: split-K into a scratch, compared with the tiled output.
+                let tmp = self.dev.alloc_f32(t * hp.n_head * hp.head_dim);
+                split_k(self.a(&tmp));
+                self.dev.sync();
+                let a = self.dev.download(&s.attn);
+                let b = self.dev.download(&tmp);
+                let (mut worst, mut sum) = (0f64, 0f64);
+                for i in 0..b.len() {
+                    let (x, y) = (a[i] as f64, b[i] as f64);
+                    worst = worst.max((x - y).abs() / y.abs().max(1e-3));
+                    sum += (x - y).abs();
+                }
+                eprintln!(
+                    "ATTN check: {} values, mean |diff| {:.3e}, worst rel {worst:.3e}",
+                    b.len(),
+                    sum / b.len() as f64
+                );
             }
             self.gemv("attn_out", &layer.w_out, attn, None, self.a(&s.mix), t, n);
         }

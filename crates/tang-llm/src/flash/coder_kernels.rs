@@ -1293,4 +1293,70 @@ extern "C" __global__ void cx_attn_merge(const float* part, int nchunk, const fl
     const float gt = proj[(size_t)c * stride + h * 2 * CX_HD + CX_HD + d];
     out[((size_t)c * CX_NH + h) * CX_HD + d] = (o / L) * sigm_f(gt);
 }
+// Tiled causal attention for wide windows (one slot, consecutive positions): block (query tile b
+// of CX_TQ rows, kv group g); warp w owns row b*CX_TQ + w and its CX_G heads. The block stages
+// CX_TK positions of K/V at a time in smem, so each tile is read once per CX_TQ rows instead of
+// once per row. One online softmax per (row, head) over all its positions, then the sigmoid gate.
+#define CX_TQ 8
+#define CX_TK 32
+extern "C" __global__ void __launch_bounds__(256) cx_attn_tile(const float* q, const unsigned long long* ktab,
+                                                               const unsigned long long* vtab, const unsigned* rows,
+                                                               int t, const float* proj, int stride, float* out) {
+    __shared__ unsigned short sk[CX_TK][CX_HD], sv[CX_TK][CX_HD];
+    const int g = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int r0 = blockIdx.x * CX_TQ, c = r0 + warp, last = min(t, r0 + CX_TQ) - 1;
+    const bool live = c < t;
+    const int pos = live ? (int)rows[c] : -1, hi = (int)rows[last];
+    const unsigned slot = rows[CX_MAXT + r0];
+    const unsigned short* kc = (const unsigned short*)ktab[slot];
+    const unsigned short* vc = (const unsigned short*)vtab[slot];
+    const float scale = 1.0f / sqrtf((float)CX_HD);
+    float qv[CX_G][CX_DL], m[CX_G], l[CX_G], acc[CX_G][CX_DL];
+    for (int h = 0; h < CX_G; h++) {
+        m[h] = NEG_INF_F;
+        l[h] = 0.f;
+        for (int i = 0; i < CX_DL; i++) {
+            qv[h][i] = live ? q[((size_t)c * CX_NH + g * CX_G + h) * CX_HD + lane * CX_DL + i] * scale : 0.f;
+            acc[h][i] = 0.f;
+        }
+    }
+    for (int p0 = 0; p0 <= hi; p0 += CX_TK) {
+        __syncthreads();
+        const int np = min(CX_TK, hi + 1 - p0);
+        for (int e = threadIdx.x; e < np * (CX_HD / 8); e += 256) {
+            const int p = e / (CX_HD / 8), d = (e % (CX_HD / 8)) * 8;
+            const size_t o = ((size_t)(p0 + p) * CX_NKV + g) * CX_HD + d;
+            *(uint4*)&sk[p][d] = *(const uint4*)(kc + o);
+            *(uint4*)&sv[p][d] = *(const uint4*)(vc + o);
+        }
+        __syncthreads();
+        const int pe = min(np, pos + 1 - p0);
+        for (int p = 0; p < pe; p++) {
+            float kv[CX_DL], vv[CX_DL];
+            #pragma unroll
+            for (int i = 0; i < CX_DL; i++) { kv[i] = bf2f(sk[p][lane * CX_DL + i]); vv[i] = bf2f(sv[p][lane * CX_DL + i]); }
+            #pragma unroll
+            for (int h = 0; h < CX_G; h++) {
+                float sc = 0.f;
+                #pragma unroll
+                for (int i = 0; i < CX_DL; i++) sc = fmaf(qv[h][i], kv[i], sc);
+                for (int o = 16; o > 0; o >>= 1) sc += __shfl_xor_sync(0xffffffffu, sc, o);
+                const float mn = fmaxf(m[h], sc), corr = expf(m[h] - mn), pr = expf(sc - mn);
+                #pragma unroll
+                for (int i = 0; i < CX_DL; i++) acc[h][i] = fmaf(pr, vv[i], acc[h][i] * corr);
+                l[h] = l[h] * corr + pr;
+                m[h] = mn;
+            }
+        }
+    }
+    if (!live) return;
+    for (int h = 0; h < CX_G; h++) {
+        const int hh = g * CX_G + h;
+        for (int i = 0; i < CX_DL; i++) {
+            const int d = lane * CX_DL + i;
+            const float gt = proj[(size_t)c * stride + hh * 2 * CX_HD + CX_HD + d];
+            out[((size_t)c * CX_NH + hh) * CX_HD + d] = (acc[h][i] / l[h]) * sigm_f(gt);
+        }
+    }
+}
 "#;
