@@ -450,7 +450,7 @@ pub fn mm_vec() -> usize {
     }
 }
 
-/// The staged packed-weight prefill kernel, when `TANG_CL_MM_KIND=stage`:
+/// The staged packed-weight prefill kernel, the default (`TANG_CL_MM_KIND=reg`: the register block):
 /// `(WG, LANES, RN, KC)` from `TANG_CL_STAGE=WGxLANESxRNxKC` (default
 /// 128x8x2x128: 32 columns per group, the fastest on the Mac). A work-group owns `WG/LANES·RN` columns and stages the
 /// activations of up to `32/RN` rows (all of a 20-token chunk) through
@@ -459,7 +459,9 @@ pub fn mm_vec() -> usize {
 /// packed weight is read once per pass, coalesced, and dequantized once
 /// for every row.
 pub fn stage_shape() -> Option<(usize, usize, usize, usize)> {
-    if std::env::var("TANG_CL_MM_KIND").as_deref() != Ok("stage") {
+    // the default on OpenCL prefill (K1, 20 tokens: 374 vs 680 ms for the
+    // register block); TANG_CL_MM_KIND=reg for the register block
+    if std::env::var("TANG_CL_MM_KIND").as_deref() == Ok("reg") {
         return None;
     }
     let p: Vec<usize> = std::env::var("TANG_CL_STAGE")
