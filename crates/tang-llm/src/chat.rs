@@ -75,7 +75,11 @@ impl Template {
         think: Option<bool>,
     ) -> Result<String> {
         let t = self.env.get_template("chat")?;
-        let tools = tools.filter(|t| t.as_array().is_some_and(|a| !a.is_empty()));
+        // No tools: undefined, not none (Qwen3-Coder-Next's template takes `tools | length`
+        // whenever `tools is defined`).
+        let tools = tools
+            .filter(|t| t.as_array().is_some_and(|a| !a.is_empty()))
+            .map_or(minijinja::Value::UNDEFINED, minijinja::Value::from_serialize);
         Ok(t.render(minijinja::context! {
             messages => messages,
             tools => tools,
