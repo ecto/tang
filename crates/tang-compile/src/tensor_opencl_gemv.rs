@@ -450,6 +450,26 @@ pub fn mm_vec() -> usize {
     }
 }
 
+/// The staged packed-weight prefill kernel, when `TANG_CL_MM_KIND=stage`:
+/// `(WG, LANES, RN, KC)` from `TANG_CL_STAGE=WGxLANESxRNxKC` (default
+/// 128x8x2x128: 32 columns per group, the fastest on the Mac). A work-group owns `WG/LANES·RN` columns and stages the
+/// activations of up to `32/RN` rows (all of a 20-token chunk) through
+/// local memory in k chunks of `KC`; each item keeps RN columns × those
+/// rows in registers and its `LANES` take adjacent packed words, so each
+/// packed weight is read once per pass, coalesced, and dequantized once
+/// for every row.
+pub fn stage_shape() -> Option<(usize, usize, usize, usize)> {
+    if std::env::var("TANG_CL_MM_KIND").as_deref() != Ok("stage") {
+        return None;
+    }
+    let p: Vec<usize> = std::env::var("TANG_CL_STAGE")
+        .ok()
+        .map(|v| v.split('x').filter_map(|x| x.parse().ok()).collect())
+        .filter(|p: &Vec<usize>| p.len() == 4 && p.iter().all(|&x| x > 0))
+        .unwrap_or_else(|| vec![128, 8, 2, 128]);
+    Some((p[0], p[1], p[2], p[3]))
+}
+
 /// First line of a kernel that is OpenCL C already (no transliteration).
 pub const OPENCL_NATIVE: &str = "// tang-compile: OpenCL C (native)";
 
@@ -712,6 +732,231 @@ impl TensorGraph {
         }
         if nibbles == 0 {
             return q4_none(root, line!());
+        }
+        'stage: {
+            let Some((wg, lanes, rn, kc)) = stage_shape() else {
+                break 'stage;
+            };
+            // the staged kernel (see `stage_shape`)
+            let k_total = gs * js;
+            let kc = kc.min(k_total);
+            if lanes == 0
+                || wg % lanes != 0
+                || kc % (8 * lanes) != 0
+                || k_total % kc != 0
+                || kc % js.min(kc) != 0
+                || (js % kc != 0 && kc % js != 0)
+            {
+                // infeasible shape: the register-block kernel
+                q4_none(root, line!());
+                break 'stage;
+            }
+            let ci = wg / lanes; // column items per group
+            let tile = ci * rn; // columns per group
+            let rmax = (32 / rn).max(1);
+            let passes = m.div_ceil(rmax);
+            let rp = m.div_ceil(passes); // rows per pass
+            if rp * kc * 4 + wg * rp * rn * 4 > 32 << 10 {
+                // infeasible shape: the register-block kernel
+                q4_none(root, line!());
+                break 'stage;
+            }
+            let ntiles = n.div_ceil(tile);
+            let groups = ntiles * passes;
+            let xbuf = storage(rc.args[vx].src.n());
+            let mut s = String::new();
+            writeln!(
+                s,
+                "{OPENCL_NATIVE}: {m}x{n}x{k_total} matmul over 4-bit weights, staged: {rp} rows x {rn} cols per item, {lanes} lanes along k, k chunk {kc}, groups of {wg}"
+            )
+            .unwrap();
+            s.push_str(OPENCL_PRELUDE);
+            let params: Vec<String> = reads
+                .iter()
+                .map(|j| format!("__global const float* restrict b{j}"))
+                .chain([
+                    "__global float* restrict out".to_string(),
+                    "uint count".to_string(),
+                ])
+                .collect();
+            writeln!(
+                s,
+                "__kernel __attribute__((reqd_work_group_size({wg}, 1, 1))) void main0({}) {{",
+                params.join(", ")
+            )
+            .unwrap();
+            writeln!(s, "    __local float xs[{}];", rp * kc).unwrap();
+            writeln!(s, "    __local float part[{}];", wg * rp * rn).unwrap();
+            writeln!(
+                s,
+                "    int t = (int)get_local_id(0), grp = (int)get_group_id(0);"
+            )
+            .unwrap();
+            writeln!(s, "    int lane = t % {lanes}, ci = t / {lanes};").unwrap();
+            writeln!(s, "    int tile = grp % {ntiles}, pass = grp / {ntiles};").unwrap();
+            writeln!(
+                s,
+                "    int r0 = pass * {rp}, c0 = tile * {tile} + ci * {rn};"
+            )
+            .unwrap();
+            for j in 0..rn {
+                writeln!(s, "    int col{j} = min(c0 + {j}, {});", n - 1).unwrap();
+            }
+            for i in 0..rp {
+                for j in 0..rn {
+                    writeln!(s, "    float acc{i}_{j} = 0.0f;").unwrap();
+                }
+            }
+            writeln!(s, "    for (int k0 = 0; k0 < {k_total}; k0 += {kc}) {{").unwrap();
+            // stage x[r0.., k0..k0+kc] (rows clamped at the edge)
+            writeln!(s, "        barrier(CLK_LOCAL_MEM_FENCE);").unwrap();
+            writeln!(
+                s,
+                "        for (int e = t; e < {}; e += {wg}) {{",
+                rp * kc / 4
+            )
+            .unwrap();
+            writeln!(
+                s,
+                "            int r = e / {}, k4 = (e % {}) * 4;",
+                kc / 4,
+                kc / 4
+            )
+            .unwrap();
+            writeln!(
+                s,
+                "            int kk = k0 + k4, row = min(r0 + r, {});",
+                m - 1
+            )
+            .unwrap();
+            // x address: offset + coefs[dy]·row + coefs[2]·(k / J) + (k % J)
+            writeln!(
+                s,
+                "            vstore4(vload4(0, b{xbuf} + {} + {} * row + {} * (kk / {js}) + (kk % {js})), 0, xs + r * {kc} + k4);",
+                ax.offset, ax.coefs[dy], ax.coefs[2]
+            )
+            .unwrap();
+            writeln!(s, "        }}").unwrap();
+            writeln!(s, "        barrier(CLK_LOCAL_MEM_FENCE);").unwrap();
+            writeln!(
+                s,
+                "        for (int kw = lane; kw < {}; kw += {lanes}) {{",
+                kc / 8
+            )
+            .unwrap();
+            writeln!(
+                s,
+                "            int kk = k0 + kw * 8, kg = kk / {js}, kj = kk % {js};"
+            )
+            .unwrap();
+            for j in 0..rn {
+                for (v, role) in roles.iter().enumerate() {
+                    match role {
+                        Some(Role::Group { buf, addr, pack }) => {
+                            let f = match pack {
+                                Packing::Bf16 => "tang_bf16",
+                                Packing::F16 => "tang_f16",
+                                Packing::U4 => "tang_u4",
+                            };
+                            writeln!(
+                                s,
+                                "            float g{v}_{j} = {f}(b{buf}, {} + {} * col{j} + {} * kg);",
+                                addr.offset, addr.coefs[dx], addr.coefs[2]
+                            )
+                            .unwrap();
+                        }
+                        Some(Role::Nibble { buf, addr }) => {
+                            writeln!(
+                                s,
+                                "            uint w{v}_{j} = ((__global const uint*)b{buf})[({} + {} * col{j} + {} * kg + kj) >> 3];",
+                                addr.offset, addr.coefs[dx], addr.coefs[2]
+                            )
+                            .unwrap();
+                        }
+                        None => {}
+                    }
+                }
+                let mut ws = Vec::new();
+                for q in 0..8 {
+                    let var = |v: u16| -> String {
+                        match &roles[v as usize] {
+                            Some(Role::Nibble { .. }) => {
+                                format!("(float)((w{v}_{j} >> {}) & 15u)", 4 * q)
+                            }
+                            Some(Role::Group { .. }) => format!("g{v}_{j}"),
+                            None => unreachable!("x in the dequantization"),
+                        }
+                    };
+                    let mut body = String::new();
+                    let outs = emit_scalar(&mut body, ebody, &[eout], &format!("d{j}_{q}_"), &var);
+                    for line in body.lines() {
+                        writeln!(s, "            {}", line.replacen("let ", "float ", 1)).unwrap();
+                    }
+                    ws.push(outs[0].clone());
+                }
+                writeln!(
+                    s,
+                    "            float4 wl{j} = (float4)({}, {}, {}, {}), wh{j} = (float4)({}, {}, {}, {});",
+                    ws[0], ws[1], ws[2], ws[3], ws[4], ws[5], ws[6], ws[7]
+                )
+                .unwrap();
+            }
+            writeln!(s, "            __local const float* xk = xs + kw * 8;").unwrap();
+            for i in 0..rp {
+                writeln!(
+                    s,
+                    "            {{ float4 xl = vload4(0, xk + {}), xh = vload4(1, xk + {});",
+                    i * kc,
+                    i * kc
+                )
+                .unwrap();
+                for j in 0..rn {
+                    writeln!(
+                        s,
+                        "              acc{i}_{j} += dot(xl, wl{j}) + dot(xh, wh{j});"
+                    )
+                    .unwrap();
+                }
+                writeln!(s, "            }}").unwrap();
+            }
+            writeln!(s, "        }}").unwrap();
+            writeln!(s, "    }}").unwrap();
+            if lanes > 1 {
+                for i in 0..rp {
+                    for j in 0..rn {
+                        writeln!(s, "    part[{} + t] = acc{i}_{j};", (i * rn + j) * wg).unwrap();
+                    }
+                }
+                writeln!(s, "    barrier(CLK_LOCAL_MEM_FENCE);").unwrap();
+                writeln!(s, "    if (lane != 0) return;").unwrap();
+                for i in 0..rp {
+                    for j in 0..rn {
+                        writeln!(s, "    acc{i}_{j} = 0.0f;").unwrap();
+                        writeln!(
+                            s,
+                            "    for (int l = 0; l < {lanes}; l++) acc{i}_{j} += part[{} + t + l];",
+                            (i * rn + j) * wg
+                        )
+                        .unwrap();
+                    }
+                }
+            }
+            self.mm_stores(
+                &mut s,
+                c,
+                red_node,
+                epilogue,
+                &pts,
+                (dy, dx),
+                (m, n),
+                (rp, rn),
+            );
+            writeln!(s, "}}").unwrap();
+            return Some(super::cuda_gemv::Kernel {
+                source: s,
+                threads: wg,
+                blocks: groups,
+            });
         }
         let f16 = prefill_f16();
         let (rm, rn, wg) = mm_shape_q4(m);

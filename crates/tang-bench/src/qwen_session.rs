@@ -889,12 +889,14 @@ pub fn tune_key(rt: &Runtime, dims: &QwenDims) -> String {
 }
 
 /// The knobs the tuner sets (decode GEMV shape, OpenCL prefill register block).
-pub const TUNE_KNOBS: [&str; 5] = [
+pub const TUNE_KNOBS: [&str; 7] = [
     "TANG_DECODE_WARPS",
     "TANG_DECODE_ROWS",
     "TANG_CL_MM",
     "TANG_CL_MM_LANES",
     "TANG_CL_MM_VEC",
+    "TANG_CL_MM_KIND",
+    "TANG_CL_STAGE",
 ];
 
 /// Set this device and model's tuned knobs from [`tune_path`], except any
@@ -1045,39 +1047,49 @@ pub fn tune(dir: &str, budget: f64) -> Vec<(String, String)> {
         won.push(("TANG_DECODE_WARPS".to_string(), w.to_string()));
         won.push(("TANG_DECODE_ROWS".to_string(), r.to_string()));
     }
-    // prefill register block (OpenCL)
+    // prefill matmul kernel (OpenCL): the register block or the staged one
     if rt.kind() == BackendKind::OpenCl {
-        let seq = 64;
+        // a voice turn's size (QWEN_TUNE_SEQ overrides)
+        let seq = match env("QWEN_TUNE_SEQ") {
+            0 => 20,
+            n => n,
+        };
         let toks: Vec<usize> = (0..seq).map(|i| 1000 + i).collect();
-        let mut best: Option<(f64, String, String, String)> = None;
-        // (block RMxRNxWG, lanes along k): work-groups of a wave (64) or
-        // two, local partials RM*RN*WG floats within the Adreno's 32 KB
-        for (mm, lanes, vec) in [
-            ("0x4x64", "16", "1"),
-            ("0x4x128", "16", "1"),
-            ("0x4x64", "8", "1"),
-            ("4x4x64", "16", "1"),
-            ("4x4x128", "16", "1"),
-            ("4x4x128", "32", "1"),
-            ("4x4x64", "8", "1"),
-            ("4x8x64", "16", "1"),
-            ("8x4x64", "16", "1"),
-            ("2x8x128", "16", "1"),
-            ("4x4x256", "32", "1"),
-            ("8x8x64", "16", "1"),
-            ("4x4x64", "1", "1"),
-            ("4x4x64", "16", "4"),
-            ("4x4x128", "16", "4"),
-            ("4x4x64", "8", "4"),
-            ("2x4x64", "16", "4"),
+        let mut best: Option<(f64, &str, &str, &str)> = None;
+        // register block: (RMxRNxWG, lanes along k), local partials
+        // RM*RN*WG floats within the Adreno's 32 KB. staged:
+        // WGxLANESxRNxKC, activations (<= 32/RN rows x KC) and partials in
+        // local memory, <= 32 accumulators per item
+        for (kind, cfg, lanes) in [
+            ("reg", "4x4x64", "16"),
+            ("reg", "4x4x128", "16"),
+            ("reg", "4x4x128", "32"),
+            ("reg", "4x4x64", "8"),
+            ("reg", "4x8x64", "16"),
+            ("reg", "8x4x64", "16"),
+            ("reg", "2x8x128", "16"),
+            ("reg", "0x4x64", "16"),
+            ("reg", "4x4x64", "1"),
+            ("stage", "128x8x2x128", ""),
+            ("stage", "128x4x2x256", ""),
+            ("stage", "128x4x4x128", ""),
+            ("stage", "64x4x2x256", ""),
+            ("stage", "256x8x2x64", ""),
+            ("stage", "128x8x1x128", ""),
+            ("stage", "64x8x4x128", ""),
+            ("stage", "256x16x2x64", ""),
         ] {
             if !settle(hot, 75.0, load, deadline) {
                 eprintln!("tune: budget spent");
                 break;
             }
-            std::env::set_var("TANG_CL_MM", mm);
-            std::env::set_var("TANG_CL_MM_LANES", lanes);
-            std::env::set_var("TANG_CL_MM_VEC", vec);
+            std::env::set_var("TANG_CL_MM_KIND", kind);
+            if kind == "stage" {
+                std::env::set_var("TANG_CL_STAGE", cfg);
+            } else {
+                std::env::set_var("TANG_CL_MM", cfg);
+                std::env::set_var("TANG_CL_MM_LANES", lanes);
+            }
             let s = Step::new(
                 &rt,
                 &dims,
@@ -1087,23 +1099,32 @@ pub fn tune(dir: &str, budget: f64) -> Vec<(String, String)> {
                 Some(&base),
             );
             s.prefill(&rt, &toks, 0);
-            let ms = s.prog.time(&rt, 3);
+            let ms = s.prog.time(&rt, 1);
             eprintln!(
-                "tune: prefill {seq} tokens, block {mm} lanes {lanes} vec {vec}: {ms:.1} ms ({:.0} tok/s, gpu {:.1} C)",
+                "tune: prefill {seq} tokens, {kind} {cfg} lanes {lanes}: {ms:.1} ms ({:.0} tok/s, gpu {:.1} C)",
                 seq as f64 * 1e3 / ms,
                 gpu_temp().unwrap_or(0.0)
             );
-            if best.as_ref().is_none_or(|b| ms < b.0) {
-                best = Some((ms, mm.to_string(), lanes.to_string(), vec.to_string()));
+            if best.is_none_or(|b| ms < b.0) {
+                best = Some((ms, kind, cfg, lanes));
+            }
+            for k in [
+                "TANG_CL_MM_KIND",
+                "TANG_CL_STAGE",
+                "TANG_CL_MM",
+                "TANG_CL_MM_LANES",
+            ] {
+                std::env::remove_var(k);
             }
         }
-        std::env::remove_var("TANG_CL_MM");
-        std::env::remove_var("TANG_CL_MM_LANES");
-        std::env::remove_var("TANG_CL_MM_VEC");
-        if let Some((_, mm, lanes, vec)) = best {
-            won.push(("TANG_CL_MM".to_string(), mm));
-            won.push(("TANG_CL_MM_LANES".to_string(), lanes));
-            won.push(("TANG_CL_MM_VEC".to_string(), vec));
+        if let Some((_, kind, cfg, lanes)) = best {
+            won.push(("TANG_CL_MM_KIND".to_string(), kind.to_string()));
+            if kind == "stage" {
+                won.push(("TANG_CL_STAGE".to_string(), cfg.to_string()));
+            } else {
+                won.push(("TANG_CL_MM".to_string(), cfg.to_string()));
+                won.push(("TANG_CL_MM_LANES".to_string(), lanes.to_string()));
+            }
         }
     }
     // merge into the tuning file

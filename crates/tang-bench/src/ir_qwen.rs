@@ -1447,4 +1447,19 @@ mod tests {
             "{heads:#?}"
         );
     }
+
+    /// `TANG_CL_MM_KIND=stage`: every projection is the staged kernel.
+    #[test]
+    fn opencl_prefill_staged_kernel_covers_projections() {
+        let dims = QwenDims {
+            prefill_q4: true,
+            ff: 40 * GROUP,
+            ..tiny()
+        };
+        std::env::set_var("TANG_CL_MM_KIND", "stage");
+        let heads = opencl_prefill_heads(&dims, 12);
+        std::env::remove_var("TANG_CL_MM_KIND");
+        let staged = heads.iter().filter(|h| h.contains("staged")).count();
+        assert_eq!(staged, 5 * dims.layers, "{heads:#?}");
+    }
 }
