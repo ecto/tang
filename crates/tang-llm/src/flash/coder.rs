@@ -167,6 +167,7 @@ const MTP_L: usize = usize::MAX;
 /// `(t, 2)`) and its pick (`cx_mtp_pick`: argmax and its softmax probability per row of logits,
 /// grid `t`).
 const MTP_SRC: &str = r#"
+#define MTP_ALT 8
 __device__ float mtp_block_sum(float v, float* red) {
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
     __syncthreads();
@@ -193,21 +194,17 @@ extern "C" __global__ void __launch_bounds__(1024) cx_mtp_in(const float* emb, c
     for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i] * r * w[i];
 }
 
-extern "C" __global__ void __launch_bounds__(1024) cx_mtp_pick(const float* lg, int v,
-        unsigned* ids, float* prob) {
-    __shared__ float red[32];
-    __shared__ float bm[32];
-    __shared__ int bi[32];
-    const float* row = lg + (size_t)blockIdx.x * v;
+__device__ void mtp_argmax(const float* row, int v, int skip, float* bm, int* bi) {
     float m = -3.0e38f;
     int mi = 0;
     for (int i = threadIdx.x; i < v; i += blockDim.x)
-        if (row[i] > m) { m = row[i]; mi = i; }
+        if (i != skip && row[i] > m) { m = row[i]; mi = i; }
     for (int o = 16; o > 0; o >>= 1) {
         const float om = __shfl_xor_sync(0xffffffffu, m, o);
         const int oi = __shfl_xor_sync(0xffffffffu, mi, o);
         if (om > m || (om == m && oi < mi)) { m = om; mi = oi; }
     }
+    __syncthreads();
     if ((threadIdx.x & 31) == 0) { bm[threadIdx.x >> 5] = m; bi[threadIdx.x >> 5] = mi; }
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -215,11 +212,32 @@ extern "C" __global__ void __launch_bounds__(1024) cx_mtp_pick(const float* lg, 
             if (bm[w] > bm[0] || (bm[w] == bm[0] && bi[w] < bi[0])) { bm[0] = bm[w]; bi[0] = bi[w]; }
     }
     __syncthreads();
+}
+
+// Per row: the argmax and its probability, and the runner-up (`ids[MAX_T + row]`,
+// `prob[MAX_T + row]`).
+extern "C" __global__ void __launch_bounds__(1024) cx_mtp_pick(const float* lg, int v,
+        unsigned* ids, float* prob) {
+    __shared__ float red[32];
+    __shared__ float bm[32];
+    __shared__ int bi[32];
+    const float* row = lg + (size_t)blockIdx.x * v;
+    mtp_argmax(row, v, -1, bm, bi);
     const float top = bm[0];
+    const int i1 = bi[0];
+    __syncthreads();
+    mtp_argmax(row, v, i1, bm, bi);
+    const float second = bm[0];
+    const int i2 = bi[0];
     float se = 0.f;
     for (int i = threadIdx.x; i < v; i += blockDim.x) se += __expf(row[i] - top);
     se = mtp_block_sum(se, red);
-    if (threadIdx.x == 0) { ids[blockIdx.x] = (unsigned)bi[0]; prob[blockIdx.x] = 1.f / se; }
+    if (threadIdx.x == 0) {
+        ids[blockIdx.x] = (unsigned)i1;
+        prob[blockIdx.x] = 1.f / se;
+        ids[MTP_ALT + blockIdx.x] = (unsigned)i2;
+        prob[MTP_ALT + blockIdx.x] = __expf(second - top) / se;
+    }
 }
 "#;
 
@@ -382,6 +400,8 @@ impl Io {
     const CCTL: usize = 64;
     const IDS: usize = 128;
     const EMB: usize = 256;
+    /// The MTP pick's probabilities (`2 * MAX_T` f32), past the control words' slack.
+    const MTP_PROB: usize = 192;
 
     fn bytes(hidden: usize) -> usize {
         Self::rows(hidden) + ROWS_U32 * 4
@@ -464,6 +484,8 @@ pub struct Coder {
     pub mtp_steps: usize,
     /// The latest MTP chain: draft tokens and their probabilities, for the next verify.
     pub mtp_last: Vec<(u32, f32)>,
+    /// The MTP head's runner-up for `mtp_last[0]`'s position (a second tree branch).
+    pub mtp_alt: Option<(u32, f32)>,
     pub last_mtp_ms: f64,
 }
 
@@ -770,8 +792,8 @@ impl Coder {
                     mh: dev.alloc_f32(MAX_T * n),
                     emb: dev.alloc_f32(MAX_T * n),
                     cat: dev.alloc_f32(MAX_T * 2 * n),
-                    ids: dev.alloc_f32(MAX_T),
-                    prob: dev.alloc_f32(MAX_T),
+                    ids: dev.alloc_f32(2 * MAX_T),
+                    prob: dev.alloc_f32(2 * MAX_T),
                     f_in: f(&m, "cx_mtp_in")?,
                     f_pick: f(&m, "cx_mtp_pick")?,
                     _m: m,
@@ -856,6 +878,7 @@ impl Coder {
                 .unwrap_or(2)
                 .clamp(1, MAX_T - 1),
             mtp_last: Vec::new(),
+            mtp_alt: None,
             last_mtp_ms: 0.0,
         };
         let mut c = c;
@@ -1826,8 +1849,8 @@ impl Coder {
                 tang_moe::args![lg, vi, ids, prob],
             )
         };
-        self.kcopy(self.io_dev(Io::IDS), ids, t * 4);
-        self.kcopy(self.io_dev(Io::IDS + 64), prob, t * 4);
+        self.kcopy(self.io_dev(Io::IDS), ids, 2 * MAX_T * 4);
+        self.kcopy(self.io_dev(Io::MTP_PROB), prob, 2 * MAX_T * 4);
         self.kcopy(mh, self.a(&s.x) + ((t - 1) * n * 4) as u64, n * 4);
     }
 
@@ -1918,27 +1941,60 @@ impl Coder {
 
     fn mtp_read(&self, t: usize) -> Vec<(u32, f32)> {
         let ids = self.io.u32s(Io::IDS, t);
-        let p = self.io.f32s(Io::IDS + 64, t);
+        let p = self.io.f32s(Io::MTP_PROB, t);
         ids.iter().zip(p.iter()).map(|(&d, &p)| (d, p)).collect()
+    }
+
+    /// The last MTP pass's runner-up for row `r`.
+    fn mtp_read_alt(&self, r: usize) -> (u32, f32) {
+        (
+            self.io.u32s(Io::IDS, 2 * MAX_T)[MAX_T + r],
+            self.io.f32s(Io::MTP_PROB, 2 * MAX_T)[MAX_T + r],
+        )
     }
 
     /// After a window over positions `pos..pos + next.len()` (whose final hidden rows `m.mh`
     /// holds), feed the MTP layer the tokens that followed them (`next`), so its K/V cache
     /// covers those positions; with `chain`, then draft `mtp_steps` tokens past the last one
-    /// into `mtp_last`.
+    /// into `mtp_last` (and the first draft's runner-up into `mtp_alt`).
     fn mtp_after(&mut self, pos: usize, next: &[u32], chain: bool) -> Result<()> {
+        self.mtp_after_rows(pos, 0, next, chain)
+    }
+
+    /// [`mtp_after`](Self::mtp_after) for a window whose kept rows start at row `r0` (a tree
+    /// window keeps one branch's rows): positions `pos..pos + next.len()` are window rows
+    /// `r0..r0 + next.len()`. Drafts a chain into `mtp_last` / `mtp_alt`.
+    pub fn mtp_after_window(&mut self, pos: usize, r0: usize, next: &[u32]) -> Result<()> {
+        self.mtp_after_rows(pos, r0, next, true)
+    }
+
+    fn mtp_after_rows(&mut self, pos: usize, r0: usize, next: &[u32], chain: bool) -> Result<()> {
         self.mtp_last.clear();
+        self.mtp_alt = None;
         if self.mtp.is_none() || !self.use_mtp || !self.greedy.get() || next.is_empty() {
             return Ok(());
         }
+        ensure!(r0 + next.len() <= MAX_T, "rows {r0}+{}", next.len());
         let t0 = Instant::now();
         let end = pos + next.len();
         if end + self.mtp_steps + 1 >= self.max_ctx {
             return Ok(());
         }
+        if r0 > 0 {
+            // Move the kept rows to the front of `mh` (through `cat`, which the pass rewrites).
+            let m = self.mtp.as_ref().unwrap();
+            let (mh, cat, b) = (
+                self.a(&m.mh),
+                self.a(&m.cat),
+                next.len() * self.hp.n_embd * 4,
+            );
+            self.kcopy(cat, mh + (r0 * self.hp.n_embd * 4) as u64, b);
+            self.kcopy(mh, cat, b);
+        }
         let out = self.mtp_pass(pos, next)?;
         if chain {
             let mut d = *out.last().unwrap();
+            self.mtp_alt = Some(self.mtp_read_alt(next.len() - 1));
             self.mtp_last.push(d);
             for j in 1..self.mtp_steps {
                 d = self.mtp_pass(end + j - 1, &[d.0])?[0];
