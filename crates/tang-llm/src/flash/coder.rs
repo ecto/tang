@@ -1789,7 +1789,46 @@ impl Coder {
                     tang_moe::args![proj, st, qn, kn, rc, rs, rows, q, kt, vt, eps],
                 );
             }
-            if self.in_wide.get() && self.var.attn_tile {
+            // Partials and merge a slice of rows at a time in wide windows (the partials buffer
+            // holds WIDE_ATTN_ROWS rows), each slice over the chunks its last row reaches.
+            let slice = if self.in_wide.get() {
+                WIDE_ATTN_ROWS
+            } else {
+                t
+            };
+            let qrow = (hp.n_head * hp.head_dim * 4) as u64;
+            let split_k = |dst: u64| {
+                for r0 in (0..t).step_by(slice) {
+                    let c = slice.min(t - r0);
+                    let nc = if self.in_wide.get() {
+                        self.nchunk(self.wide_pos0.get() + r0 + c)
+                    } else {
+                        nchunk
+                    } as i32;
+                    let (q0, rows0, proj0, attn0) = (
+                        q + r0 as u64 * qrow,
+                        rows + (r0 * 4) as u64,
+                        proj + (r0 * stride * 4) as u64,
+                        dst + r0 as u64 * qrow,
+                    );
+                    unsafe {
+                        self.launch(
+                            self.kn().part,
+                            (c as u32, hp.n_head_kv as u32, nc as u32),
+                            128,
+                            tang_moe::args![q0, kt, vt, rows0, part, nc],
+                        );
+                        self.launch(
+                            self.kn().merge,
+                            (c as u32, hp.n_head as u32, 1),
+                            hp.head_dim as u32,
+                            tang_moe::args![part, nc, proj0, st, attn0],
+                        );
+                    }
+                }
+            };
+            let tiled = self.in_wide.get() && self.var.attn_tile;
+            if tiled {
                 let tq = 8; // CX_TQ
                 unsafe {
                     self.launch(
@@ -1799,44 +1838,27 @@ impl Coder {
                         tang_moe::args![q, kt, vt, rows, t as i32, proj, st, attn],
                     );
                 }
-                self.gemv("attn_out", &layer.w_out, attn, None, self.a(&s.mix), t, n);
-                return;
             }
-            // Partials and merge a slice of rows at a time in wide windows (the partials buffer
-            // holds WIDE_ATTN_ROWS rows), each slice over the chunks its last row reaches.
-            let slice = if self.in_wide.get() {
-                WIDE_ATTN_ROWS
-            } else {
-                t
-            };
-            let qrow = (hp.n_head * hp.head_dim * 4) as u64;
-            for r0 in (0..t).step_by(slice) {
-                let c = slice.min(t - r0);
-                let nc = if self.in_wide.get() {
-                    self.nchunk(self.wide_pos0.get() + r0 + c)
-                } else {
-                    nchunk
-                } as i32;
-                let (q0, rows0, proj0, attn0) = (
-                    q + r0 as u64 * qrow,
-                    rows + (r0 * 4) as u64,
-                    proj + (r0 * stride * 4) as u64,
-                    attn + r0 as u64 * qrow,
-                );
-                unsafe {
-                    self.launch(
-                        self.kn().part,
-                        (c as u32, hp.n_head_kv as u32, nc as u32),
-                        128,
-                        tang_moe::args![q0, kt, vt, rows0, part, nc],
-                    );
-                    self.launch(
-                        self.kn().merge,
-                        (c as u32, hp.n_head as u32, 1),
-                        hp.head_dim as u32,
-                        tang_moe::args![part, nc, proj0, st, attn0],
-                    );
+            if !tiled {
+                split_k(attn);
+            } else if env_is("TANG_CODER_ATTN_CHECK", "1") {
+                // Debug: split-K into a scratch, compared with the tiled output.
+                let tmp = self.dev.alloc_f32(t * hp.n_head * hp.head_dim);
+                split_k(self.a(&tmp));
+                self.dev.sync();
+                let a = self.dev.download(&s.attn);
+                let b = self.dev.download(&tmp);
+                let (mut worst, mut sum) = (0f64, 0f64);
+                for i in 0..b.len() {
+                    let (x, y) = (a[i] as f64, b[i] as f64);
+                    worst = worst.max((x - y).abs() / y.abs().max(1e-3));
+                    sum += (x - y).abs();
                 }
+                eprintln!(
+                    "ATTN check: {} values, mean |diff| {:.3e}, worst rel {worst:.3e}",
+                    b.len(),
+                    sum / b.len() as f64
+                );
             }
             self.gemv("attn_out", &layer.w_out, attn, None, self.a(&s.mix), t, n);
         }
