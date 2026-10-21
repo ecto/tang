@@ -1469,8 +1469,16 @@ pub fn batch_check(args: &[String]) -> Result<()> {
         );
         ok &= tok_eq && bits == 0;
     }
+    // FNV-1a over every batched logit, to compare runs (e.g. TANG_CODER_GROUPED=0 against the
+    // grouped default): equal checksums, equal bits.
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for (_, lg) in &got {
+        for x in lg {
+            h = (h ^ x.to_bits() as u64).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
     println!(
-        "batch-check: {}",
+        "batch-check: {} (logits checksum {h:016x})",
         if ok { "PASS (bitwise)" } else { "FAIL" }
     );
     // Speed.
