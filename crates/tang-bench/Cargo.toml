@@ -53,6 +53,8 @@ metal = ["dep:metal"]
 cuda = ["tang-gpu/cuda"]
 # Vulkan decode kernels as GLSL -> SPIR-V (shaderc, built from source).
 glsl = ["tang-gpu/glsl"]
+# OpenCL decode kernels (`to_opencl_decode`) on tang-gpu's OpenCL runtime: TANG_BACKEND=opencl
+opencl = ["tang-gpu/opencl"]
 # Reassociable float ops in hot reductions. Requires Rust 1.98+.
 threads = ["tang-la/threads", "tang-tensor/threads", "tang-train/threads", "tang-infer/threads"]
 algebraic = [
@@ -77,12 +79,13 @@ tang-train  = { workspace = true }
 tang-tensor = { workspace = true }
 tang-infer  = { workspace = true }
 metal       = { version = "0.33", optional = true }
-
-[dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+# qwen_session: the MLX checkpoint (mapped), config.json and the tokenizer
 memmap2 = "0.9"
 serde_json = "1"
 tokenizers = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 nalgebra  = "0.33"
 glam      = "0.29"
 rand      = "0.8"
