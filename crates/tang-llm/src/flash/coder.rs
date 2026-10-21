@@ -343,7 +343,11 @@ pub struct Coder {
     ev_fork: gpu::Event,
     ev_join: gpu::Event,
     /// Window graphs by (t, verify, attention chunks, segments).
-    graphs: HashMap<(usize, bool, usize, usize), Graph>,
+    graphs: HashMap<(usize, bool, usize, usize, bool), Graph>,
+    /// The staged window is greedy (temperature 0, no presence penalty): the head takes the
+    /// plain argmax even with the sampler enabled (its top-1 is the argmax then, ties to the
+    /// lower id either way). Part of the graph key.
+    greedy: std::cell::Cell<bool>,
     commit_graphs: Vec<Option<Graph>>,
     max_ctx: usize,
     counter: u32,
@@ -782,6 +786,7 @@ impl Coder {
             max_ctx,
             counter: 0,
             tokens: Vec::new(),
+            greedy: std::cell::Cell::new(true),
             slots: (0..MAX_SLOTS).map(|_| None).collect(),
             seed: 0,
             temperature: 0.0,
@@ -1606,7 +1611,7 @@ impl Coder {
             64i32,
             self.a(&self.s.ctl),
         );
-        if let Some(sp) = self.sampler.as_ref() {
+        if let Some(sp) = self.sampler.as_ref().filter(|_| !self.greedy.get()) {
             if !self.skip("argmax") {
                 sp.enqueue(
                     &self.dev,
@@ -1769,7 +1774,10 @@ impl Coder {
         nseg: usize,
         mut probe: Option<&mut Probe>,
     ) -> Result<Vec<u32>> {
-        let key = (t, verify, nchunk, nseg);
+        self.greedy.set(
+            self.temperature == 0.0 && self.sampler.as_ref().is_none_or(|s| s.presence == 0.0),
+        );
+        let key = (t, verify, nchunk, nseg, self.greedy.get());
         if probe.is_none() && self.use_graphs {
             if !self.graphs.contains_key(&key) {
                 // First use: run eagerly (loads every kernel), then capture.
