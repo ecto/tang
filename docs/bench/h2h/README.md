@@ -14,8 +14,15 @@ Four prompts, each run `--n` times (default 3), one request at a time, streaming
 
 | prompt | input | what it is |
 |---|---|---|
-| explain, refactor, write | ~1.2k tokens | the AA-style prompts in `../qwen3next-aa/` (the same Rust file, three tasks) |
-| agent | ~10k tokens | a system prompt, five tool schemas, a 34 KB Rust file (`agent_context.rs`), a review task |
+| explain, refactor, write | ~1.1–1.6k tokens | the AA-style tasks over a 140-line Rust file |
+| agent | ~10k tokens | a system prompt, five tool schemas, a ~35 KB Rust file, a review task |
+
+Run *i* of every prompt uses a different context file: `../qwen3next-aa/context.rs`,
+`context_2.rs` and `context_3.rs` for the short prompts, and `agent_context_{1,2,3}.rs` for the
+agent prompt. Repeating one prompt would let an endpoint's prefix cache (TTFT) or draft memory
+(speed) carry from run to run; these effects are real for agent traffic, but they'd measure
+the cache, not the model. Every endpoint gets the same files in the same order, so every TTFT
+is cold.
 
 Each run reports:
 - **TTFT:** time to the first content, reasoning or tool-call delta.

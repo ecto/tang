@@ -110,3 +110,41 @@ total throughput stays at one stream's, and time to first token grows with the q
 Batching is designed in `crates/tang-llm/docs/qwen3next-batching.md`. With suffix drafts on,
 the harness reads 400–590 tok/s total, but its prompts repeat, so the drafter replays
 memorized greedy completions (7.5 tokens a window). That's not representative.
+
+### Higher precision: Q8_0 (2026-10-21, H200 secure, same method, n = 3)
+
+FP8 doesn't load: the Flash engine reads GGUF, and FP8 Coder-Next is published only as
+safetensors. The closest is unsloth's `Q8_0` GGUF (84.8 GB in 3 shards, 84.8 GB of VRAM). Its
+8-bit experts take the generic Q8_0 dot, not the fast K-quant path.
+
+| prompt | drafts | Q8_0 tok/s min / median / max | UD-Q4_K_XL median |
+|---|---|---|---|
+| explain | none | 221.9 / 222.1 / 222.3 | 234.4 |
+| refactor | none | 222.0 / 222.2 / 222.2 | 234.4 |
+| write | none | 222.0 / 222.1 / 222.2 | 234.2 |
+| explain | suffix | 220.5 / 220.6 / 220.7 | 238.1 |
+| refactor | suffix | 374.8 / 374.9 / 374.9 | 411.4 |
+| write | suffix | 232.1 / 232.4 / 232.5 | 256.6 |
+
+Q8_0 is about 5% slower than the Q4 headline.
+
+KL of UD-Q4_K_XL against Q8_0 (`flash-parity`, Q8_0's top-40 per position as the reference,
+teacher-forced over the prompt):
+
+| prompt | positions | KL mean / median / p99 | top-1 agreement |
+|---|---|---|---|
+| explain | 1,235 | 0.0127 / 0.0005 / 0.171 | 96.8% |
+| write | 1,263 | 0.0180 / 0.0005 / 0.321 | 97.0% |
+
+### Through `tang-llm serve` (the head-to-head harness, `../h2h/`)
+
+Same pod, UD-Q4_K_XL, drafts off, n = 3, streaming over HTTP on localhost. Each run here used
+the same prompt; later runs vary the context file per run.
+
+| prompt | tok/s after first token, median | TTFT cold (first run) |
+|---|---|---|
+| explain / refactor / write | 211.5 / 211.6 / 211.5 | 1.85 / 0.11 / 0.13 s (the latter two had the shared file cached) |
+| agent (~10k tokens) | 174.5 | 16.4 s |
+
+pass@1 on the 20 tasks: 20/20. The served rate is ~10% below `flash-aa`'s (211.5 vs 234),
+because `serve` runs the top-k/top-p sampler even on greedy requests. A fix is planned.

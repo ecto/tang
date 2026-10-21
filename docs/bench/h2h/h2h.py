@@ -6,10 +6,12 @@
     h2h.py --selftest                      # check the quality tests against reference solutions
 
 Speed. Each prompt runs n times, streaming, temperature 0, one request at a time:
-  - `explain`, `refactor`, `write`: the AA-style prompts (`../qwen3next-aa/`, ~1.2k tokens in,
-    512 out);
+  - `explain`, `refactor`, `write`: AA-style prompts (~1.1–1.6k tokens in, 512 out);
   - `agent`: an agent-length prompt (~10k tokens in: a system prompt, five tool schemas, a
-    34 KB Rust file, a review task), 512 out.
+    ~35 KB Rust file, a review task), 512 out.
+Run i of each prompt uses a different context file (three of each size), so a prefix cache or a
+draft memory can't carry from one run to the next; every endpoint gets the same set in order.
+TTFT is therefore cold (no cached prefix) for every run.
 For each request it records the time to first token (the first content, reasoning or tool-call
 delta) and the output speed after the first token: (completion tokens − 1) / (last delta −
 first delta), with completion tokens from the final `usage` chunk (`stream_options.include_usage`)
@@ -30,8 +32,15 @@ sys.path.insert(0, HERE)
 from tasks import TASKS  # noqa: E402
 
 
-def aa_prompts():
-    code = open(os.path.join(HERE, "..", "qwen3next-aa", "context.rs")).read()
+# Run i of every prompt uses context file i, so no run can reuse an earlier run's prompt prefix
+# or output (prefix caches, draft memories): every endpoint sees the same set, in the same order.
+SHORT_CONTEXTS = [os.path.join(HERE, "..", "qwen3next-aa", "context.rs"),
+                  os.path.join(HERE, "context_2.rs"), os.path.join(HERE, "context_3.rs")]
+AGENT_CONTEXTS = [os.path.join(HERE, f"agent_context_{i}.rs") for i in (1, 2, 3)]
+
+
+def aa_prompts(run=0):
+    code = open(SHORT_CONTEXTS[run % len(SHORT_CONTEXTS)]).read()
     return {
         "explain": "Explain what this Rust module does, how its data structures fit together, and any performance pitfalls you see.\n\n```rust\n" + code + "\n```",
         "refactor": "Refactor this Rust module for readability: keep behaviour identical, add doc comments where missing, and return the complete updated file.\n\n```rust\n" + code + "\n```",
@@ -52,12 +61,13 @@ AGENT_TOOLS = [
 ]
 
 
-def agent_messages():
-    code = open(os.path.join(HERE, "agent_context.rs")).read()
+def agent_messages(run=0):
+    path = AGENT_CONTEXTS[run % len(AGENT_CONTEXTS)]
+    code = open(path).read()
     return [
         {"role": "system", "content": "You are a careful senior engineer working in a Rust repository. "
          "Use the tools when you need them. Be concise and concrete."},
-        {"role": "user", "content": "Here is crates/tang-llm/src/draft.rs:\n\n```rust\n" + code + "\n```\n\n"
+        {"role": "user", "content": "Here is a Rust module from the repository:\n\n```rust\n" + code + "\n```\n\n"
          "Review this module for correctness bugs and performance problems. For each finding give the "
          "function, what goes wrong, and a fix. Don't call any tools; answer directly."},
     ]
@@ -125,14 +135,14 @@ def summarize(xs):
 
 
 def run_speed(ep, n):
-    prompts = {k: [{"role": "user", "content": v}] for k, v in aa_prompts().items()}
-    prompts["agent"] = agent_messages()
     out = {}
-    for name, msgs in prompts.items():
+    for name in ["explain", "refactor", "write", "agent"]:
         runs = []
         for i in range(n):
+            msgs = agent_messages(i) if name == "agent" else [{"role": "user", "content": aa_prompts(i)[name]}]
             r = ep.stream(msgs, 512, tools=AGENT_TOOLS if name == "agent" else None)
             r.pop("text")
+            r["context"] = i % len(SHORT_CONTEXTS)
             runs.append(r)
             print(f"  {name:9} run {i + 1}: {r['tok_s'] or 0:7.1f} tok/s after first token, "
                   f"TTFT {r['ttft_ms'] or 0:7.0f} ms, {r['completion_tokens']} tokens"
