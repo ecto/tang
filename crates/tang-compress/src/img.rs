@@ -64,16 +64,26 @@ impl Ccx {
         if r.take(4)? != b"CCX1" {
             return Err(DecodeError::Invalid("not CCX1"));
         }
-        let le32 = |r: &mut ByteReader| -> Result<u32, DecodeError> { Ok(u32::from_le_bytes(r.take(4)?.try_into().unwrap())) };
+        let le32 = |r: &mut ByteReader| -> Result<u32, DecodeError> {
+            Ok(u32::from_le_bytes(r.take(4)?.try_into().unwrap()))
+        };
         let n = le32(&mut r)?;
         let mut t = HashMap::new();
         for _ in 0..n {
             let nl = u16::from_le_bytes(r.take(2)?.try_into().unwrap()) as usize;
             let name = String::from_utf8_lossy(r.take(nl)?).into_owned();
             let nd = r.u8()? as usize;
-            let shape: Vec<usize> = (0..nd).map(|_| le32(&mut r).map(|v| v as usize)).collect::<Result<_, _>>()?;
+            let shape: Vec<usize> = (0..nd)
+                .map(|_| le32(&mut r).map(|v| v as usize))
+                .collect::<Result<_, _>>()?;
             let cnt: usize = shape.iter().product();
-            let data = r.take(cnt * 8)?.as_chunks::<8>().0.iter().map(|c| f64::from_le_bytes(*c)).collect();
+            let data = r
+                .take(cnt * 8)?
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| f64::from_le_bytes(*c))
+                .collect();
             t.insert(name, (shape, data));
         }
         Ok(Self { t })
@@ -102,8 +112,15 @@ pub struct QT {
 
 impl QT {
     fn from_f64(v: &[f64]) -> Self {
-        let s = (0..=24u32).find(|&s| v.iter().all(|&x| (x * (1u64 << s) as f64).fract() == 0.0)).unwrap_or(24);
-        Self { s, k: v.iter().map(|&x| (x * (1u64 << s) as f64).round() as i32).collect() }
+        let s = (0..=24u32)
+            .find(|&s| v.iter().all(|&x| (x * (1u64 << s) as f64).fract() == 0.0))
+            .unwrap_or(24);
+        Self {
+            s,
+            k: v.iter()
+                .map(|&x| (x * (1u64 << s) as f64).round() as i32)
+                .collect(),
+        }
     }
     /// Fixed point with `f` fractional bits (round half away from zero when `f < s`).
     pub fn fixed(&self, f: u32) -> Vec<i32> {
@@ -142,7 +159,9 @@ impl QT {
             return Err(DecodeError::Invalid("qt exponent"));
         }
         let o = eg_get(r, 0)? as u32;
-        let k = (0..n).map(|_| eg_get(r, o).map(|z| unzigzag(z) as i32)).collect::<Result<_, _>>()?;
+        let k = (0..n)
+            .map(|_| eg_get(r, o).map(|z| unzigzag(z) as i32))
+            .collect::<Result<_, _>>()?;
         Ok(Self { s, k })
     }
 }
@@ -212,7 +231,15 @@ impl Lin {
     fn new(out: usize, inp: usize, qw: QT, qb: QT) -> Self {
         assert_eq!(qw.k.len(), out * inp);
         assert_eq!(qb.k.len(), out);
-        Self { out, inp, qw, qb, fw: 0, w: vec![], b: vec![] }
+        Self {
+            out,
+            inp,
+            qw,
+            qb,
+            fw: 0,
+            w: vec![],
+            b: vec![],
+        }
     }
     fn set_fw(&mut self, fw: u32, qa: u32) {
         self.fw = fw;
@@ -275,13 +302,27 @@ impl Mlp {
                 break;
             }
             let (sh, w) = c.get(&k);
-            layers.push(Lin::new(sh[0], sh[1], QT::from_f64(w), QT::from_f64(&c.get(&format!("{p}.L{i}.b")).1)));
+            layers.push(Lin::new(
+                sh[0],
+                sh[1],
+                QT::from_f64(w),
+                QT::from_f64(&c.get(&format!("{p}.L{i}.b")).1),
+            ));
         }
         let stab = c.has(&format!("{p}.stab.w")).then(|| {
             let (sh, w) = c.get(&format!("{p}.stab.w"));
-            Lin::new(sh[0], sh[1], QT::from_f64(w), QT::from_f64(&c.get(&format!("{p}.stab.b")).1))
+            Lin::new(
+                sh[0],
+                sh[1],
+                QT::from_f64(w),
+                QT::from_f64(&c.get(&format!("{p}.stab.b")).1),
+            )
         });
-        Self { layers, stab, residual }
+        Self {
+            layers,
+            stab,
+            residual,
+        }
     }
     fn set_fw(&mut self, fw: &[u32]) {
         for (l, &f) in self.layers.iter_mut().zip(fw) {
@@ -339,7 +380,11 @@ impl Mlp {
     }
     fn write(&self, w: &mut BitWriter) {
         eg_put(w, self.layers.len() as u64, 0);
-        eg_put(w, (self.stab.is_some() as u8 | (self.residual as u8) << 1) as u64, 0);
+        eg_put(
+            w,
+            (self.stab.is_some() as u8 | (self.residual as u8) << 1) as u64,
+            0,
+        );
         // input width once; each layer's input is the previous output, the
         // stabiliser's is the MLP input
         eg_put(w, self.nin() as u64, 0);
@@ -357,7 +402,11 @@ impl Mlp {
         let nin = eg_get(r, 0)? as usize;
         for li in 0..nl + (fl & 1) as usize {
             let out = eg_get(r, 0)? as usize;
-            let inp = if li == 0 || li == nl { nin } else { ls[li - 1].out };
+            let inp = if li == 0 || li == nl {
+                nin
+            } else {
+                ls[li - 1].out
+            };
             let fw = get_fw(r)?;
             if out > 64 || inp > 64 {
                 return Err(DecodeError::Invalid("mlp dims"));
@@ -368,7 +417,11 @@ impl Mlp {
             ls.push(l);
         }
         let stab = if fl & 1 == 1 { ls.pop() } else { None };
-        Ok(Self { layers: ls, stab, residual: fl & 2 != 0 })
+        Ok(Self {
+            layers: ls,
+            stab,
+            residual: fl & 2 != 0,
+        })
     }
 }
 
@@ -389,8 +442,18 @@ impl Conv {
     fn from_ccx(c: &Ccx, p: &str) -> Self {
         let (sh, w) = c.get(&format!("{p}.w"));
         let meta = &c.get(&format!("{p}.meta")).1;
-        let lin = Lin::new(sh[0], sh[1] * sh[2] * sh[3], QT::from_f64(w), QT::from_f64(&c.get(&format!("{p}.b")).1));
-        Self { lin, k: sh[2], residual: meta[0] != 0.0, relu: meta[1] != 0.0 }
+        let lin = Lin::new(
+            sh[0],
+            sh[1] * sh[2] * sh[3],
+            QT::from_f64(w),
+            QT::from_f64(&c.get(&format!("{p}.b")).1),
+        );
+        Self {
+            lin,
+            k: sh[2],
+            residual: meta[0] != 0.0,
+            relu: meta[1] != 0.0,
+        }
     }
     /// Input channels.
     pub fn cin(&self) -> usize {
@@ -417,7 +480,12 @@ impl Conv {
         let (qw, qb) = (QT::read(r, out * cin * k * k)?, QT::read(r, out)?);
         let mut lin = Lin::new(out, cin * k * k, qw, qb);
         lin.set_fw(fw, QA);
-        Ok(Self { lin, k, residual: fl & 1 != 0, relu: fl & 2 != 0 })
+        Ok(Self {
+            lin,
+            k,
+            residual: fl & 1 != 0,
+            relu: fl & 2 != 0,
+        })
     }
 }
 
@@ -488,23 +556,49 @@ impl Model {
     pub fn from_ccx(c: &Ccx, lanes: usize, tile_w: usize, tile_h: usize) -> Self {
         let isz = c.ints("img_size");
         let sz = c.ints("sizes");
-        let sizes: Vec<(usize, usize)> = sz.chunks(2).map(|p| (p[0] as usize, p[1] as usize)).collect();
+        let sizes: Vec<(usize, usize)> = sz
+            .chunks(2)
+            .map(|p| (p[0] as usize, p[1] as usize))
+            .collect();
         let hyper = c.get("is_hyper").1.iter().map(|&v| v != 0.0).collect();
         let ms = c.ints("mask_size")[0] as i32;
-        let ctx = c.ints("ctx_index").iter().map(|&k| ((k as i32) / ms - ms / 2, (k as i32) % ms - ms / 2)).collect::<Vec<_>>();
+        let ctx = c
+            .ints("ctx_index")
+            .iter()
+            .map(|&k| ((k as i32) / ms - ms / 2, (k as i32) % ms - ms / 2))
+            .collect::<Vec<_>>();
         let nifce = c.ints("n_ifce_out")[0] as usize;
         let n = sizes.len();
         let (ifce_of, ifces) = if c.has("ifce.index_to_arm") {
             let ia = c.ints("ifce.index_to_arm");
             let nf = c.ints("ifce.input_features");
-            let of = (0..n).map(|i| (nf[i] > 0 && ia[i] >= 0).then_some(ia[i] as usize)).collect();
+            let of = (0..n)
+                .map(|i| (nf[i] > 0 && ia[i] >= 0).then_some(ia[i] as usize))
+                .collect();
             let na = ia.iter().copied().max().unwrap_or(-1) + 1;
-            (of, (0..na).map(|j| Mlp::from_ccx(c, &format!("ifce.A{j}"), false)).collect())
+            (
+                of,
+                (0..na)
+                    .map(|j| Mlp::from_ccx(c, &format!("ifce.A{j}"), false))
+                    .collect(),
+            )
         } else {
             (vec![None; n], vec![])
         };
-        let filts = |p: &str| (0..).map_while(|i| c.has(&format!("{p}.{i}")).then(|| Filt::new(QT::from_f64(&c.get(&format!("{p}.{i}")).1), 12))).collect::<Vec<_>>();
-        let syn = (0..).map_while(|i| c.has(&format!("syn.L{i}.w")).then(|| Conv::from_ccx(c, &format!("syn.L{i}")))).collect();
+        let filts = |p: &str| {
+            (0..)
+                .map_while(|i| {
+                    c.has(&format!("{p}.{i}"))
+                        .then(|| Filt::new(QT::from_f64(&c.get(&format!("{p}.{i}")).1), 12))
+                })
+                .collect::<Vec<_>>()
+        };
+        let syn = (0..)
+            .map_while(|i| {
+                c.has(&format!("syn.L{i}.w"))
+                    .then(|| Conv::from_ccx(c, &format!("syn.L{i}")))
+            })
+            .collect();
         let stab = c.has("syn.stab.w").then(|| Conv::from_ccx(c, "syn.stab"));
         let mut m = Self {
             h: isz[0] as usize,
@@ -537,7 +631,10 @@ impl Model {
 /// Cool-chic's context priority order (`get_priority_order`, 9×9 causal mask)
 /// as `(dy, dx)`.
 pub const CTX_ORDER: [(i32, i32); 40] = {
-    const PRIO: [u8; 40] = [38, 35, 30, 25, 23, 31, 36, 37, 39, 33, 28, 21, 20, 6, 15, 22, 29, 34, 32, 18, 12, 10, 5, 9, 14, 19, 27, 24, 13, 8, 2, 1, 3, 11, 17, 26, 16, 7, 4, 0];
+    const PRIO: [u8; 40] = [
+        38, 35, 30, 25, 23, 31, 36, 37, 39, 33, 28, 21, 20, 6, 15, 22, 29, 34, 32, 18, 12, 10, 5,
+        9, 14, 19, 27, 24, 13, 8, 2, 1, 3, 11, 17, 26, 16, 7, 4, 0,
+    ];
     let mut out = [(0i32, 0i32); 40];
     let mut k = 0;
     while k < 40 {
@@ -626,7 +723,10 @@ struct RansEnc {
 
 impl RansEnc {
     fn new() -> Self {
-        Self { x: RL, words: vec![] }
+        Self {
+            x: RL,
+            words: vec![],
+        }
     }
     fn put(&mut self, start: u32, freq: u32) {
         let xmax = ((RL >> PB) << 16) * freq;
@@ -764,7 +864,17 @@ impl Layout {
         let nt = ntx * h.div_ceil(th);
         assert!(nt <= m.lanes, "more tiles than lanes");
         let lanes = (m.lanes / nt).min(th).max(1);
-        Self { h, w, th, tw, ntx, nt, lanes, s: m.slope, steps: tw + m.slope * (th - 1) }
+        Self {
+            h,
+            w,
+            th,
+            tw,
+            ntx,
+            nt,
+            lanes,
+            s: m.slope,
+            steps: tw + m.slope * (th - 1),
+        }
     }
     /// Tile origin and extent `(y0, x0, th, tw)`.
     #[inline]
@@ -797,15 +907,34 @@ impl Layout {
 /// `lat`, context cut at the tile border) into `buf` (`Q8`).
 #[inline]
 #[allow(clippy::too_many_arguments)]
-pub fn arm_input(m: &Model, lay: &Layout, lat: &[i32], ifc: &[i32], y: usize, x: usize, tile: usize, buf: &mut [i32]) {
+pub fn arm_input(
+    m: &Model,
+    lay: &Layout,
+    lat: &[i32],
+    ifc: &[i32],
+    y: usize,
+    x: usize,
+    tile: usize,
+    buf: &mut [i32],
+) {
     let (y0, x0, th, tw) = lay.tile(tile);
     for (i, &(dy, dx)) in m.ctx.iter().enumerate() {
         let (yy, xx) = (y as i32 + dy, x as i32 + dx);
-        buf[i] = if yy >= y0 as i32 && yy < (y0 + th) as i32 && xx >= x0 as i32 && xx < (x0 + tw) as i32 { lat[yy as usize * lay.w + xx as usize] << QA_ARM } else { 0 };
+        buf[i] =
+            if yy >= y0 as i32 && yy < (y0 + th) as i32 && xx >= x0 as i32 && xx < (x0 + tw) as i32
+            {
+                lat[yy as usize * lay.w + xx as usize] << QA_ARM
+            } else {
+                0
+            };
     }
     let nc = m.ctx.len();
     for j in 0..m.nifce {
-        buf[nc + j] = if ifc.is_empty() { 0 } else { ifc[(y * lay.w + x) * m.nifce + j] };
+        buf[nc + j] = if ifc.is_empty() {
+            0
+        } else {
+            ifc[(y * lay.w + x) * m.nifce + j]
+        };
     }
 }
 
@@ -824,7 +953,14 @@ pub fn ifce_ctx(m: &Model, g: usize, grids: &[Vec<i32>], gd: &mut Guard) -> Vec<
     for k in (g + 1..n - 1).rev() {
         let (th, tw) = m.sizes[k];
         if (th, tw) != (ch, cw) {
-            cur = cur.iter().map(|c| (0..th * tw).map(|i| c[(i / tw / 2).min(ch - 1) * cw + (i % tw / 2).min(cw - 1)]).collect()).collect();
+            cur = cur
+                .iter()
+                .map(|c| {
+                    (0..th * tw)
+                        .map(|i| c[(i / tw / 2).min(ch - 1) * cw + (i % tw / 2).min(cw - 1)])
+                        .collect()
+                })
+                .collect();
             (ch, cw) = (th, tw);
         }
         let mut nc = vec![grids[k].clone()];
@@ -879,7 +1015,11 @@ fn write_model(m: &Model, w: &mut BitWriter) {
                 eg_put(w, ww as u64, 0);
             }
         }
-        eg_put(w, (m.hyper[i] as u8 | (m.ifce_of[i].map_or(0, |a| a as u8 + 1) << 1)) as u64, 0);
+        eg_put(
+            w,
+            (m.hyper[i] as u8 | (m.ifce_of[i].map_or(0, |a| a as u8 + 1) << 1)) as u64,
+            0,
+        );
     }
     // context: Cool-chic's priority order prefix (flag 1), or explicit
     let canon = m.ctx.len() <= CTX_ORDER.len() && m.ctx.iter().zip(CTX_ORDER).all(|(a, b)| *a == b);
@@ -903,10 +1043,17 @@ fn write_model(m: &Model, w: &mut BitWriter) {
         for f in fs {
             // symmetric taps: send the first ⌈k/2⌉
             let k = f.q.k.len();
-            assert!((0..k).all(|i| f.q.k[i] == f.q.k[k - 1 - i]), "upsampling filter not symmetric");
+            assert!(
+                (0..k).all(|i| f.q.k[i] == f.q.k[k - 1 - i]),
+                "upsampling filter not symmetric"
+            );
             eg_put(w, k as u64, 0);
             put_fw(w, f.fw);
-            QT { s: f.q.s, k: f.q.k[..k.div_ceil(2)].to_vec() }.write(w);
+            QT {
+                s: f.q.s,
+                k: f.q.k[..k.div_ceil(2)].to_vec(),
+            }
+            .write(w);
         }
     }
     eg_put(w, m.syn.len() as u64, 0);
@@ -953,7 +1100,9 @@ fn read_model(r: &mut BitReader) -> Result<Model, DecodeError> {
     let ctx = if canon {
         CTX_ORDER[..nc].to_vec()
     } else {
-        (0..nc).map(|_| eg_get(r, 0).map(|b| (-((b >> 4) as i32), (b & 15) as i32 - 8))).collect::<Result<Vec<_>, _>>()?
+        (0..nc)
+            .map(|_| eg_get(r, 0).map(|b| (-((b >> 4) as i32), (b & 15) as i32 - 8)))
+            .collect::<Result<Vec<_>, _>>()?
     };
     let nifce = eg_get(r, 0)? as usize;
     let lanes = eg_get(r, 0)? as usize;
@@ -964,7 +1113,9 @@ fn read_model(r: &mut BitReader) -> Result<Model, DecodeError> {
     }
     let arm = Mlp::read(r)?;
     let ni = eg_get(r, 0)? as usize;
-    let ifces = (0..ni.min(16)).map(|_| Mlp::read(r)).collect::<Result<Vec<_>, _>>()?;
+    let ifces = (0..ni.min(16))
+        .map(|_| Mlp::read(r))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut fl = vec![];
     for _ in 0..2 {
         let k = eg_get(r, 0)? as usize;
@@ -985,14 +1136,42 @@ fn read_model(r: &mut BitReader) -> Result<Model, DecodeError> {
         fl.push(v);
     }
     let ns = eg_get(r, 0)? as usize;
-    let syn = (0..ns.min(16)).map(|_| Conv::read(r)).collect::<Result<Vec<_>, _>>()?;
-    let stab = if (eg_get(r, 0)? as u8) != 0 { Some(Conv::read(r)?) } else { None };
+    let syn = (0..ns.min(16))
+        .map(|_| Conv::read(r))
+        .collect::<Result<Vec<_>, _>>()?;
+    let stab = if (eg_get(r, 0)? as u8) != 0 {
+        Some(Conv::read(r)?)
+    } else {
+        None
+    };
     let outt = Conv::read(r)?;
     let pconv = fl.pop().unwrap();
     let tconv = fl.pop().unwrap();
     let slope = slope_of(&ctx);
-    let m = Model { h, w, sizes, hyper, ctx, nifce, ifce_of, arm, ifces, tconv, pconv, syn, stab, outt, slope, lanes, tile_w, tile_h };
-    if m.arm.nin() != m.ctx.len() + m.nifce || m.arm.nout() != 2 || m.ifce_of.iter().flatten().any(|&a| a >= m.ifces.len()) {
+    let m = Model {
+        h,
+        w,
+        sizes,
+        hyper,
+        ctx,
+        nifce,
+        ifce_of,
+        arm,
+        ifces,
+        tconv,
+        pconv,
+        syn,
+        stab,
+        outt,
+        slope,
+        lanes,
+        tile_w,
+        tile_h,
+    };
+    if m.arm.nin() != m.ctx.len() + m.nifce
+        || m.arm.nout() != 2
+        || m.ifce_of.iter().flatten().any(|&a| a >= m.ifces.len())
+    {
         return Err(bad("model shape"));
     }
     Ok(m)
@@ -1010,10 +1189,17 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed, DecodeError> {
     let mut acc = 0u32;
     for _ in 0..m.lanes {
         starts.push(acc);
-        acc = acc.checked_add(r.varint()? as u32).ok_or(DecodeError::Invalid("lanes"))?;
+        acc = acc
+            .checked_add(r.varint()? as u32)
+            .ok_or(DecodeError::Invalid("lanes"))?;
     }
     let raw = r.take(acc as usize * 2)?;
-    let words = raw.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
+    let words = raw
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
+        .collect();
     for g in 0..m.sizes.len() {
         let lay = Layout::new(m.sizes[g].0, m.sizes[g].1, &m);
         if lay.nt > m.lanes {
@@ -1034,7 +1220,11 @@ pub fn decode_latents(p: &Parsed, gd: &mut Guard) -> Vec<Vec<i32>> {
     let mut grids: Vec<Vec<i32>> = vec![vec![]; n];
     let mut inb = vec![0i32; m.arm.nin()];
     let mut o = [0i32; 2];
-    let mut decs: Vec<RansDec> = p.starts.iter().map(|&s| RansDec::new(&p.words, s as usize)).collect();
+    let mut decs: Vec<RansDec> = p
+        .starts
+        .iter()
+        .map(|&s| RansDec::new(&p.words, s as usize))
+        .collect();
     for g in (0..n).rev() {
         let (h, w) = m.sizes[g];
         let lay = Layout::new(h, w, m);
@@ -1060,7 +1250,15 @@ pub fn decode_latents(p: &Parsed, gd: &mut Guard) -> Vec<Vec<i32>> {
 
 /// Symmetric 1-D filter taps → index helpers for the 2× transposed conv.
 /// `out[m] = Σ_j xpad[j]·w[m + C − 2j]`, `xpad[j] = x[clamp(j − P0)]`.
-fn tconv_1d(x: &[i64], n: usize, stride: usize, f: &Filt, out: &mut [i64], ostride: usize, gd: &mut Guard) {
+fn tconv_1d(
+    x: &[i64],
+    n: usize,
+    stride: usize,
+    f: &Filt,
+    out: &mut [i64],
+    ostride: usize,
+    gd: &mut Guard,
+) {
     let k = f.w.len();
     let p0 = (k / 2) as i64;
     let c = 2 * p0 - 1 + p0;
@@ -1141,7 +1339,9 @@ pub fn upsample(m: &Model, grids: &[Vec<i32>], gd: &mut Guard) -> Vec<Vec<i64>> 
             .iter()
             .map(|c| {
                 let full = tconv2d(c, ch, cw, f, gd);
-                (0..th * tw).map(|i| full[(i / tw) * 2 * cw + i % tw]).collect()
+                (0..th * tw)
+                    .map(|i| full[(i / tw) * 2 * cw + i % tw])
+                    .collect()
             })
             .collect();
         let tgt: Vec<i64> = grids[g].iter().map(|&v| (v as i64) << QA).collect();
@@ -1154,7 +1354,16 @@ pub fn upsample(m: &Model, grids: &[Vec<i32>], gd: &mut Guard) -> Vec<Vec<i64>> 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn conv_px(c: &Conv, inp: &[Vec<i64>], h: usize, w: usize, y: usize, x: usize, o: usize, gd: &mut Guard) -> i64 {
+fn conv_px(
+    c: &Conv,
+    inp: &[Vec<i64>],
+    h: usize,
+    w: usize,
+    y: usize,
+    x: usize,
+    o: usize,
+    gd: &mut Guard,
+) -> i64 {
     let l = &c.lin;
     let cin = c.cin();
     let k = c.k;
@@ -1165,7 +1374,9 @@ fn conv_px(c: &Conv, inp: &[Vec<i64>], h: usize, w: usize, y: usize, x: usize, o
             let sy = (y as i64 + dy as i64 - p).clamp(0, h as i64 - 1) as usize;
             for dx in 0..k {
                 let sx = (x as i64 + dx as i64 - p).clamp(0, w as i64 - 1) as usize;
-                acc = gd.see(acc + l.w[((o * cin + ci) * k + dy) * k + dx] as i64 * inp[ci][sy * w + sx]);
+                acc = gd.see(
+                    acc + l.w[((o * cin + ci) * k + dy) * k + dx] as i64 * inp[ci][sy * w + sx],
+                );
             }
         }
     }
@@ -1180,7 +1391,13 @@ fn conv_px(c: &Conv, inp: &[Vec<i64>], h: usize, w: usize, y: usize, x: usize, o
 }
 
 fn conv_all(c: &Conv, inp: &[Vec<i64>], h: usize, w: usize, gd: &mut Guard) -> Vec<Vec<i64>> {
-    (0..c.lin.out).map(|o| (0..h * w).map(|i| conv_px(c, inp, h, w, i / w, i % w, o, gd)).collect()).collect()
+    (0..c.lin.out)
+        .map(|o| {
+            (0..h * w)
+                .map(|i| conv_px(c, inp, h, w, i / w, i % w, o, gd))
+                .collect()
+        })
+        .collect()
 }
 
 /// Synthesis → interleaved RGB8.
@@ -1243,7 +1460,14 @@ pub struct Stats {
 pub fn encode(c: &Ccx, lanes: usize, tile_w: usize, tile_h: usize) -> (Vec<u8>, Stats) {
     let mut m = Model::from_ccx(c, lanes, tile_w, tile_h);
     let n = m.sizes.len();
-    let grids: Vec<Vec<i32>> = (0..n).map(|g| c.ints(&format!("latent.{g}")).iter().map(|&v| v as i32).collect()).collect();
+    let grids: Vec<Vec<i32>> = (0..n)
+        .map(|g| {
+            c.ints(&format!("latent.{g}"))
+                .iter()
+                .map(|&v| v as i32)
+                .collect()
+        })
+        .collect();
     for g in 0..n {
         assert_eq!(grids[g].len(), m.sizes[g].0 * m.sizes[g].1);
     }
@@ -1259,7 +1483,12 @@ pub fn encode(c: &Ccx, lanes: usize, tile_w: usize, tile_h: usize) -> (Vec<u8>, 
         for f in m.tconv.iter_mut().chain(m.pconv.iter_mut()) {
             *f = Filt::new(f.q.clone(), cap.min(14));
         }
-        for cv in m.syn.iter_mut().chain(m.stab.iter_mut()).chain(std::iter::once(&mut m.outt)) {
+        for cv in m
+            .syn
+            .iter_mut()
+            .chain(m.stab.iter_mut())
+            .chain(std::iter::once(&mut m.outt))
+        {
             cv.lin.set_fw(cap.min(14), QA);
         }
     };
@@ -1302,7 +1531,11 @@ pub fn encode(c: &Ccx, lanes: usize, tile_w: usize, tile_h: usize) -> (Vec<u8>, 
     write_model(&m, &mut bw);
     w.block(&bw.finish());
     let model_bytes = w.buf.len();
-    let mut st = Stats { model_bytes, grid_bits: vec![0.0; n], ..Default::default() };
+    let mut st = Stats {
+        model_bytes,
+        grid_bits: vec![0.0; n],
+        ..Default::default()
+    };
     let mut gd = Guard::default();
     let mut inb = vec![0i32; m.arm.nin()];
     let mut o = [0i32; 2];
@@ -1357,7 +1590,12 @@ pub fn encode(c: &Ccx, lanes: usize, tile_w: usize, tile_h: usize) -> (Vec<u8>, 
 
 /// PSNR (dB) of two RGB8 buffers.
 pub fn psnr(a: &[u8], b: &[u8]) -> f64 {
-    let mse: f64 = a.iter().zip(b).map(|(&x, &y)| (x as f64 - y as f64).powi(2)).sum::<f64>() / a.len() as f64;
+    let mse: f64 = a
+        .iter()
+        .zip(b)
+        .map(|(&x, &y)| (x as f64 - y as f64).powi(2))
+        .sum::<f64>()
+        / a.len() as f64;
     10.0 * (255.0f64 * 255.0 / mse).log10()
 }
 
@@ -1404,12 +1642,20 @@ impl Mlp {
     /// [`Mlp::run`] as an integer graph: params `0..nin`, outputs `0..nout`.
     pub fn graph(&self) -> (IntGraph, Vec<IId>) {
         let mut g = IntGraph::new();
-        let x: Vec<IId> = (0..self.nin()).map(|i| g.param(i as u16, IType::I32)).collect();
+        let x: Vec<IId> = (0..self.nin())
+            .map(|i| g.param(i as u16, IType::I32))
+            .collect();
         let mut a = x.clone();
         let nl = self.layers.len();
         for (li, l) in self.layers.iter().enumerate() {
             let hidden = li + 1 < nl;
-            a = g_layer(&mut g, l, &a, hidden && self.residual && l.inp == l.out, hidden);
+            a = g_layer(
+                &mut g,
+                l,
+                &a,
+                hidden && self.residual && l.inp == l.out,
+                hidden,
+            );
         }
         if let Some(s) = &self.stab {
             let sb = g_layer(&mut g, s, &x, false, false);
@@ -1435,7 +1681,11 @@ pub fn segment_graph(m: &Model, convs: &[&Conv], last: bool) -> (IntGraph, Vec<I
         p
     };
     let taps: Vec<IId> = (0..nt).map(|_| par(&mut g)).collect();
-    let centre: Vec<IId> = if c0.residual { (0..c0.cin()).map(|_| par(&mut g)).collect() } else { vec![] };
+    let centre: Vec<IId> = if c0.residual {
+        (0..c0.cin()).map(|_| par(&mut g)).collect()
+    } else {
+        vec![]
+    };
     let mut a = {
         let zero = g.i32(0);
         let l = &c0.lin;
@@ -1528,16 +1778,54 @@ pub(crate) mod tests {
         let mut t = HashMap::new();
         let sizes = [(16usize, 24usize), (8, 12), (4, 6), (4, 6)];
         put(&mut t, "img_size", &[2], vec![16.0, 24.0]);
-        put(&mut t, "sizes", &[4, 2], sizes.iter().flat_map(|&(a, b)| [a as f64, b as f64]).collect());
+        put(
+            &mut t,
+            "sizes",
+            &[4, 2],
+            sizes
+                .iter()
+                .flat_map(|&(a, b)| [a as f64, b as f64])
+                .collect(),
+        );
         put(&mut t, "is_hyper", &[4], vec![0.0, 0.0, 0.0, 1.0]);
-        let ctx = [(0, -1), (-1, 0), (-1, -1), (-1, 1), (0, -2), (-2, 0), (-1, 2)];
-        put(&mut t, "ctx_index", &[ctx.len()], ctx.iter().map(|&(dy, dx): &(i32, i32)| ((dy + 4) * 9 + dx + 4) as f64).collect());
+        let ctx = [
+            (0, -1),
+            (-1, 0),
+            (-1, -1),
+            (-1, 1),
+            (0, -2),
+            (-2, 0),
+            (-1, 2),
+        ];
+        put(
+            &mut t,
+            "ctx_index",
+            &[ctx.len()],
+            ctx.iter()
+                .map(|&(dy, dx): &(i32, i32)| ((dy + 4) * 9 + dx + 4) as f64)
+                .collect(),
+        );
         put(&mut t, "mask_size", &[1], vec![9.0]);
         put(&mut t, "n_ifce_out", &[1], vec![2.0]);
-        put(&mut t, "ifce.input_features", &[4], vec![3.0, 0.0, 0.0, 0.0]);
-        put(&mut t, "ifce.index_to_arm", &[4], vec![0.0, -1.0, -1.0, -1.0]);
+        put(
+            &mut t,
+            "ifce.input_features",
+            &[4],
+            vec![3.0, 0.0, 0.0, 0.0],
+        );
+        put(
+            &mut t,
+            "ifce.index_to_arm",
+            &[4],
+            vec![0.0, -1.0, -1.0, -1.0],
+        );
         let lin = |t: &mut HashMap<_, _>, r: &mut Rng, p: &str, o: usize, i: usize, a: i64| {
-            put(t, &format!("{p}.w"), &[o, i], (0..o * i).map(|_| r.q(a)).collect());
+            put(
+                t,
+                &format!("{p}.w"),
+                &[o, i],
+                (0..o * i).map(|_| r.q(a)).collect(),
+            );
             put(t, &format!("{p}.b"), &[o], (0..o).map(|_| r.q(a)).collect());
         };
         lin(&mut t, &mut r, "ifce.A0.L0", 2, 3, 40);
@@ -1547,26 +1835,70 @@ pub(crate) mod tests {
         lin(&mut t, &mut r, "arm.L2", 2, nin, 30);
         lin(&mut t, &mut r, "arm.stab", 2, nin, 10);
         for i in 0..2 {
-            let a = [0.0351562, 0.1054687, -0.2617187, -0.8789063].map(|v: f64| -((v * 64.0).round() / 64.0));
-            put(&mut t, &format!("ups.tconv.{i}"), &[8], [a[0], a[1], a[2], a[3], a[3], a[2], a[1], a[0]].to_vec());
+            let a = [0.0351562, 0.1054687, -0.2617187, -0.8789063]
+                .map(|v: f64| -((v * 64.0).round() / 64.0));
+            put(
+                &mut t,
+                &format!("ups.tconv.{i}"),
+                &[8],
+                [a[0], a[1], a[2], a[3], a[3], a[2], a[1], a[0]].to_vec(),
+            );
             let h: Vec<f64> = (0..4).map(|k| if k == 3 { 0.25 } else { r.q(4) }).collect();
-            put(&mut t, &format!("ups.conv.{i}"), &[7], vec![h[0], h[1], h[2], h[3], h[2], h[1], h[0]]);
+            put(
+                &mut t,
+                &format!("ups.conv.{i}"),
+                &[7],
+                vec![h[0], h[1], h[2], h[3], h[2], h[1], h[0]],
+            );
         }
-        let conv = |t: &mut HashMap<_, _>, r: &mut Rng, p: &str, o: usize, i: usize, k: usize, res: bool, relu: bool| {
-            put(t, &format!("{p}.w"), &[o, i, k, k], (0..o * i * k * k).map(|_| r.q(30)).collect());
-            put(t, &format!("{p}.b"), &[o], (0..o).map(|_| r.q(30)).collect());
-            put(t, &format!("{p}.meta"), &[2], vec![res as u8 as f64, relu as u8 as f64]);
+        let conv = |t: &mut HashMap<_, _>,
+                    r: &mut Rng,
+                    p: &str,
+                    o: usize,
+                    i: usize,
+                    k: usize,
+                    res: bool,
+                    relu: bool| {
+            put(
+                t,
+                &format!("{p}.w"),
+                &[o, i, k, k],
+                (0..o * i * k * k).map(|_| r.q(30)).collect(),
+            );
+            put(
+                t,
+                &format!("{p}.b"),
+                &[o],
+                (0..o).map(|_| r.q(30)).collect(),
+            );
+            put(
+                t,
+                &format!("{p}.meta"),
+                &[2],
+                vec![res as u8 as f64, relu as u8 as f64],
+            );
         };
         conv(&mut t, &mut r, "syn.L0", 8, 3, 1, false, true);
         conv(&mut t, &mut r, "syn.L1", 3, 8, 1, false, false);
         conv(&mut t, &mut r, "syn.L2", 3, 3, 3, true, true);
         conv(&mut t, &mut r, "syn.stab", 3, 3, 1, false, false);
-        put(&mut t, "syn.out.w", &[3, 3, 1, 1], vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+        put(
+            &mut t,
+            "syn.out.w",
+            &[3, 3, 1, 1],
+            vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        );
         put(&mut t, "syn.out.b", &[3], vec![0.5; 3]);
         put(&mut t, "syn.out.meta", &[2], vec![0.0, 0.0]);
         for (g, &(h, w)) in sizes.iter().enumerate() {
             // mostly small, a few escapes
-            let v = (0..h * w).map(|_| match r.next() % 40 { 0 => 40.0, 1 => -37.0, k => (k % 5) as f64 - 2.0 }).collect();
+            let v = (0..h * w)
+                .map(|_| match r.next() % 40 {
+                    0 => 40.0,
+                    1 => -37.0,
+                    k => (k % 5) as f64 - 2.0,
+                })
+                .collect();
             put(&mut t, &format!("latent.{g}"), &[h, w], v);
         }
         Ccx { t }
@@ -1586,14 +1918,32 @@ pub(crate) mod tests {
     fn roundtrip_layouts() {
         let c = synth(7);
         let n = 4;
-        let truth: Vec<Vec<i32>> = (0..n).map(|g| c.ints(&format!("latent.{g}")).iter().map(|&v| v as i32).collect()).collect();
+        let truth: Vec<Vec<i32>> = (0..n)
+            .map(|g| {
+                c.ints(&format!("latent.{g}"))
+                    .iter()
+                    .map(|&v| v as i32)
+                    .collect()
+            })
+            .collect();
         let mut first: Option<Vec<u8>> = None;
-        for (lanes, tw, th) in [(1, 0, 0), (4, 0, 0), (16, 0, 0), (16, 8, 0), (16, 0, 4), (32, 8, 8)] {
+        for (lanes, tw, th) in [
+            (1, 0, 0),
+            (4, 0, 0),
+            (16, 0, 0),
+            (16, 8, 0),
+            (16, 0, 4),
+            (32, 8, 8),
+        ] {
             let (bytes, st) = encode(&c, lanes, tw, th);
             assert_eq!(st.bytes, bytes.len());
             let p = parse(&bytes).unwrap();
             let mut gd = Guard::default();
-            assert_eq!(decode_latents(&p, &mut gd), truth, "lanes {lanes} tile {tw}x{th}");
+            assert_eq!(
+                decode_latents(&p, &mut gd),
+                truth,
+                "lanes {lanes} tile {tw}x{th}"
+            );
             let (h, w, rgb) = decode(&bytes).unwrap();
             assert_eq!((h, w), (16, 24));
             // the image depends on the latents only, not on the layout
@@ -1615,7 +1965,9 @@ pub(crate) mod tests {
             let (g, o) = mlp.graph();
             let mut prog = Program::new(&g, &o);
             for _ in 0..200 {
-                let x: Vec<i32> = (0..mlp.nin()).map(|_| (r.next() % 2049) as i32 - 1024).collect();
+                let x: Vec<i32> = (0..mlp.nin())
+                    .map(|_| (r.next() % 2049) as i32 - 1024)
+                    .collect();
                 let mut want = vec![0i32; mlp.nout()];
                 mlp.run(&x, &mut want, &mut Guard::default());
                 let xin: Vec<u32> = x.iter().map(|&v| v as u32).collect();

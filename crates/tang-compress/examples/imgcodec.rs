@@ -27,7 +27,9 @@ fn main() {
     let px = (h * w) as f64;
     let cc = &c.t["bytes"].1;
     let refrgb: Vec<u8> = c.t["ref_rgb"].1.iter().map(|&v| v as u8).collect();
-    let orig: Option<Vec<u8>> = c.t.get("orig_rgb").map(|t| t.1.iter().map(|&v| v as u8).collect());
+    let orig: Option<Vec<u8>> =
+        c.t.get("orig_rgb")
+            .map(|t| t.1.iter().map(|&v| v as u8).collect());
     let lat = st.latent_bytes;
     println!(
         "{h}x{w} lanes {lanes} tile {tile_w}x{tile_h}: {} B = {:.4} bpp (model {} B, latents {} B, ideal {:.0} B) | coolchic {} B = {:.4} bpp (nn {} latent {})",
@@ -42,7 +44,12 @@ fn main() {
         cc[2]
     );
     if let Some(o) = &orig {
-        println!("PSNR ours {:.3} dB | coolchic ref {:.3} dB | ours vs ref {:.2} dB", img::psnr(&rgb, o), img::psnr(&refrgb, o), img::psnr(&rgb, &refrgb));
+        println!(
+            "PSNR ours {:.3} dB | coolchic ref {:.3} dB | ours vs ref {:.2} dB",
+            img::psnr(&rgb, o),
+            img::psnr(&refrgb, o),
+            img::psnr(&rgb, &refrgb)
+        );
     } else {
         println!("ours vs coolchic ref {:.2} dB", img::psnr(&rgb, &refrgb));
     }
@@ -62,8 +69,15 @@ fn main() {
             let names = gpu.plan_names(&pr);
             let mut prev = 0.0;
             for k in 1..=names.len() {
-                let t = (0..3).map(|_| gpu.run_upto(&pr, k)).fold(f64::MAX, f64::min);
-                println!("  {:>8} cum {:7.2} ms (+{:.2})", names[k - 1], t * 1e3, (t - prev) * 1e3);
+                let t = (0..3)
+                    .map(|_| gpu.run_upto(&pr, k))
+                    .fold(f64::MAX, f64::min);
+                println!(
+                    "  {:>8} cum {:7.2} ms (+{:.2})",
+                    names[k - 1],
+                    t * 1e3,
+                    (t - prev) * 1e3
+                );
                 prev = t;
             }
         }
@@ -72,5 +86,11 @@ fn main() {
         let diff = g.iter().zip(&rgb).filter(|(a, b)| a != b).count();
         println!("GPU {}: decode {:.2} ms (best of 5), compile {:.2} s, byte-identical to CPU: {same} ({diff} bytes differ)", gpu.name, best * 1e3, pr.compile_s);
     }
-    println!("encode {te:.2}s, CPU decode {td:.3}s; grid ideal bytes {:?}", st.grid_bits.iter().map(|b| (b / 8.0).round() as i64).collect::<Vec<_>>());
+    println!(
+        "encode {te:.2}s, CPU decode {td:.3}s; grid ideal bytes {:?}",
+        st.grid_bits
+            .iter()
+            .map(|b| (b / 8.0).round() as i64)
+            .collect::<Vec<_>>()
+    );
 }

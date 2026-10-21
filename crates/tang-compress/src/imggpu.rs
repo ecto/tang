@@ -15,13 +15,15 @@
 //!    filter) and `ph`/`pv` (pre-concatenation filter);
 //! 3. `seg{i}` synthesis segments; the last one writes RGBA8.
 
-use crate::img::{self, segment_graph, segments, tables, Layout, Mlp, Model, Parsed, NLB, NSYM, QA, QA_ARM, R};
+use crate::img::{
+    self, segment_graph, segments, tables, Layout, Mlp, Model, Parsed, NLB, NSYM, QA, QA_ARM, R,
+};
 use std::fmt::Write;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
+use tang_expr::int::{IId, IntGraph};
 #[cfg(target_arch = "wasm32")]
 use web_time::Instant;
-use tang_expr::int::{IId, IntGraph};
 use wgpu::util::DeviceExt;
 
 const WG: usize = 256;
@@ -85,7 +87,8 @@ fn groups(n: usize) -> (u32, u32) {
 }
 
 const GID: &str = "let i = wid.y * 65535u * 256u + wid.x * 256u + lid.x;";
-const ARGS: &str = "@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>";
+const ARGS: &str =
+    "@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>";
 
 /// Generate the per-stream WGSL module and the dispatch plan.
 pub fn shader(m: &Model) -> (String, Vec<(String, u32, u32)>, Sizes) {
@@ -131,10 +134,19 @@ pub fn shader(m: &Model) -> (String, Vec<(String, u32, u32)>, Sizes) {
                 for j in g + 1..kk {
                     if m.sizes[j] != m.sizes[j + 1] {
                         let (hh, ww) = m.sizes[j + 1];
-                        let _ = writeln!(k, "    y{c} = min(y{c} / 2u, {}u); x{c} = min(x{c} / 2u, {}u);", hh - 1, ww - 1);
+                        let _ = writeln!(
+                            k,
+                            "    y{c} = min(y{c} / 2u, {}u); x{c} = min(x{c} / 2u, {}u);",
+                            hh - 1,
+                            ww - 1
+                        );
                     }
                 }
-                let _ = writeln!(k, "    let q{c} = lat[{}u + y{c} * {}u + x{c}] << {QA_ARM}u;", loff[kk], m.sizes[kk].1);
+                let _ = writeln!(
+                    k,
+                    "    let q{c} = lat[{}u + y{c} * {}u + x{c}] << {QA_ARM}u;",
+                    loff[kk], m.sizes[kk].1
+                );
             }
             assert_eq!(mlp.nin(), n - g - 1);
             k += &mlp_body(mlp, 1);
@@ -179,7 +191,13 @@ pub fn shader(m: &Model) -> (String, Vec<(String, u32, u32)>, Sizes) {
         }
         if m.ifce_of[g].is_some() {
             let (h1, w1) = m.sizes[g + 1];
-            let _ = writeln!(k, "            let ib = (min(gy / 2u, {}u) * {w1}u + min(gx / 2u, {}u)) * {}u;", h1 - 1, w1 - 1, m.nifce);
+            let _ = writeln!(
+                k,
+                "            let ib = (min(gy / 2u, {}u) * {w1}u + min(gx / 2u, {}u)) * {}u;",
+                h1 - 1,
+                w1 - 1,
+                m.nifce
+            );
             for j in 0..m.nifce {
                 let _ = writeln!(k, "            let q{} = ifc[ib + {j}u];", nc + j);
             }
@@ -281,14 +299,32 @@ pub fn shader(m: &Model) -> (String, Vec<(String, u32, u32)>, Sizes) {
         let taps = |src: &str, idx: &dyn Fn(&str) -> String| -> String {
             let mut e = String::from("0");
             for i in 0..4 {
-                let _ = write!(e, " + select({}, {}, par == 1u) * {src}[{}]", we[i], wo[i], idx(&format!("u32(clamp(i32(q) - {i} - {p0}, 0, LIM))")));
+                let _ = write!(
+                    e,
+                    " + select({}, {}, par == 1u) * {src}[{}]",
+                    we[i],
+                    wo[i],
+                    idx(&format!("u32(clamp(i32(q) - {i} - {p0}, 0, LIM))"))
+                );
             }
             e
         };
-        let rsh = |e: &str, fw: u32| if fw == 0 { format!("({e})") } else { format!("((({e}) + {}) >> {fw}u)", 1i64 << (fw - 1)) };
+        let rsh = |e: &str, fw: u32| {
+            if fw == 0 {
+                format!("({e})")
+            } else {
+                format!("((({e}) + {}) >> {fw}u)", 1i64 << (fw - 1))
+            }
+        };
         // horizontal: T[c][y][x2], x2 < tw
         fb_len = fb_len.max(nchan * ch * tw);
-        let hx = taps("fa", &|j: &str| format!("c * {}u + y * {cw}u + {}", ch * cw, j.replace("LIM", &format!("{}", cw - 1))));
+        let hx = taps("fa", &|j: &str| {
+            format!(
+                "c * {}u + y * {cw}u + {}",
+                ch * cw,
+                j.replace("LIM", &format!("{}", cw - 1))
+            )
+        });
         let _ = writeln!(
             s,
             "@compute @workgroup_size(256) fn uh{k}({ARGS}) {{\n    {GID}\n    if (i >= {tot}u) {{ return; }}\n    let c = i / {cs}u; let r = i % {cs}u; let y = r / {tw}u; let x2 = r % {tw}u;\n    let q = (x2 + {cc}u) >> 1u; let par = (x2 + {cc}u) & 1u;\n    fb[i] = {};\n}}",
@@ -299,7 +335,13 @@ pub fn shader(m: &Model) -> (String, Vec<(String, u32, u32)>, Sizes) {
         let (gx, gy) = groups(nchan * ch * tw);
         plan.push((format!("uh{k}"), gx, gy));
         // vertical: A[c+1][y2][x2], y2 < th
-        let vx = taps("fb", &|j: &str| format!("c * {}u + {} * {tw}u + x2", ch * tw, j.replace("LIM", &format!("{}", ch - 1))));
+        let vx = taps("fb", &|j: &str| {
+            format!(
+                "c * {}u + {} * {tw}u + x2",
+                ch * tw,
+                j.replace("LIM", &format!("{}", ch - 1))
+            )
+        });
         let _ = writeln!(
             s,
             "@compute @workgroup_size(256) fn uv{k}({ARGS}) {{\n    {GID}\n    if (i >= {tot}u) {{ return; }}\n    let c = i / {cs}u; let r = i % {cs}u; let y2 = r / {tw}u; let x2 = r % {tw}u;\n    let q = (y2 + {cc}u) >> 1u; let par = (y2 + {cc}u) & 1u;\n    fa[(c + 1u) * {cs}u + r] = {};\n}}",
@@ -354,9 +396,22 @@ pub fn shader(m: &Model) -> (String, Vec<(String, u32, u32)>, Sizes) {
             for dy in 0..kk {
                 for dx in 0..kk {
                     let (oy, ox) = (dy as i64 - pad, dx as i64 - pad);
-                    let yy = if oy == 0 { "y".to_string() } else { format!("u32(clamp(i32(y) + ({oy}), 0, {}))", m.h - 1) };
-                    let xx = if ox == 0 { "x".to_string() } else { format!("u32(clamp(i32(x) + ({ox}), 0, {}))", m.w - 1) };
-                    let _ = writeln!(k, "    let q{np} = {src}[{}u + {yy} * {}u + {xx}];", ci * hw, m.w);
+                    let yy = if oy == 0 {
+                        "y".to_string()
+                    } else {
+                        format!("u32(clamp(i32(y) + ({oy}), 0, {}))", m.h - 1)
+                    };
+                    let xx = if ox == 0 {
+                        "x".to_string()
+                    } else {
+                        format!("u32(clamp(i32(x) + ({ox}), 0, {}))", m.w - 1)
+                    };
+                    let _ = writeln!(
+                        k,
+                        "    let q{np} = {src}[{}u + {yy} * {}u + {xx}];",
+                        ci * hw,
+                        m.w
+                    );
                     np += 1;
                 }
             }
@@ -397,7 +452,19 @@ pub fn shader(m: &Model) -> (String, Vec<(String, u32, u32)>, Sizes) {
         src = dst;
     }
     let fa_len = nchan * hw;
-    (s, plan, Sizes { lat: lat_len, ifc: ifc_len, fa: fa_len, fb: fb_len, fc: fc_len, out: hw, woff })
+    (
+        s,
+        plan,
+        Sizes {
+            lat: lat_len,
+            ifc: ifc_len,
+            fa: fa_len,
+            fb: fb_len,
+            fc: fc_len,
+            out: hw,
+            woff,
+        },
+    )
 }
 
 /// Buffer sizes (elements) for one stream.
@@ -418,7 +485,11 @@ impl ImgGpu {
         pollster::block_on(async {
             let instance = wgpu::Instance::default();
             let adapter = instance
-                .request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, compatible_surface: None, force_fallback_adapter: false })
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                })
                 .await
                 .map_err(|e| format!("adapter: {e}"))?;
             let al = adapter.limits();
@@ -429,7 +500,13 @@ impl ImgGpu {
                 ..Default::default()
             };
             let (device, queue) = adapter
-                .request_device(&wgpu::DeviceDescriptor { label: Some("tc-img"), required_features: wgpu::Features::empty(), required_limits: limits, memory_hints: wgpu::MemoryHints::Performance, trace: wgpu::Trace::Off })
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("tc-img"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: limits,
+                    memory_hints: wgpu::MemoryHints::Performance,
+                    trace: wgpu::Trace::Off,
+                })
                 .await
                 .map_err(|e| format!("device: {e}"))?;
             let info = adapter.get_info();
@@ -437,13 +514,30 @@ impl ImgGpu {
                 .map(|b| wgpu::BindGroupLayoutEntry {
                     binding: b,
                     visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: b == 0 }, has_dynamic_offset: false, min_binding_size: None },
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: b == 0 },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
                     count: None,
                 })
                 .collect();
-            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &entries });
-            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&layout], push_constant_ranges: &[] });
-            Ok(Self { device, queue, layout, pl, name: format!("{} ({:?})", info.name, info.backend) })
+            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: None,
+                entries: &entries,
+            });
+            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[&layout],
+                push_constant_ranges: &[],
+            });
+            Ok(Self {
+                device,
+                queue,
+                layout,
+                pl,
+                name: format!("{} ({:?})", info.name, info.backend),
+            })
         })
     }
 
@@ -451,7 +545,12 @@ impl ImgGpu {
     pub fn prepare(&self, p: &Parsed) -> Prepared {
         let t0 = Instant::now();
         let (src, plan, sz) = shader(&p.m);
-        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("tc-img"), source: wgpu::ShaderSource::Wgsl(src.clone().into()) });
+        let module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("tc-img"),
+                source: wgpu::ShaderSource::Wgsl(src.clone().into()),
+            });
         let mut names: Vec<String> = vec![];
         let mut pipes = vec![];
         let mut plan2 = vec![];
@@ -459,14 +558,16 @@ impl ImgGpu {
             let i = match names.iter().position(|n| *n == name) {
                 Some(i) => i,
                 None => {
-                    pipes.push(self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                        label: Some(&name),
-                        layout: Some(&self.pl),
-                        module: &module,
-                        entry_point: Some(&name),
-                        compilation_options: Default::default(),
-                        cache: None,
-                    }));
+                    pipes.push(self.device.create_compute_pipeline(
+                        &wgpu::ComputePipelineDescriptor {
+                            label: Some(&name),
+                            layout: Some(&self.pl),
+                            module: &module,
+                            entry_point: Some(&name),
+                            compilation_options: Default::default(),
+                            cache: None,
+                        },
+                    ));
                     names.push(name);
                     names.len() - 1
                 }
@@ -490,17 +591,62 @@ impl ImgGpu {
             lanes0.push(s as u32 + 2);
         }
         let d = &self.device;
-        let buf = |data: &[u32], usage: wgpu::BufferUsages| d.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck_u32(data), usage });
-        let st = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC;
+        let buf = |data: &[u32], usage: wgpu::BufferUsages| {
+            d.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck_u32(data),
+                usage,
+            })
+        };
+        let st = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC;
         let rob = buf(&ro, st);
         let lanes_buf = buf(&lanes0, st);
-        let mk = |n: usize| d.create_buffer(&wgpu::BufferDescriptor { label: None, size: (n.max(1) * 4) as u64, usage: st, mapped_at_creation: false });
-        let (lat, ifc, fa, fb, fc, out) = (mk(sz.lat), mk(sz.ifc), mk(sz.fa), mk(sz.fb), mk(sz.fc), mk(sz.out));
+        let mk = |n: usize| {
+            d.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (n.max(1) * 4) as u64,
+                usage: st,
+                mapped_at_creation: false,
+            })
+        };
+        let (lat, ifc, fa, fb, fc, out) = (
+            mk(sz.lat),
+            mk(sz.ifc),
+            mk(sz.fa),
+            mk(sz.fb),
+            mk(sz.fc),
+            mk(sz.out),
+        );
         let bufs = [&rob, &lanes_buf, &lat, &ifc, &fa, &fb, &fc, &out];
-        let entries: Vec<wgpu::BindGroupEntry> = bufs.iter().enumerate().map(|(i, b)| wgpu::BindGroupEntry { binding: i as u32, resource: b.as_entire_binding() }).collect();
-        let bind = d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.layout, entries: &entries });
+        let entries: Vec<wgpu::BindGroupEntry> = bufs
+            .iter()
+            .enumerate()
+            .map(|(i, b)| wgpu::BindGroupEntry {
+                binding: i as u32,
+                resource: b.as_entire_binding(),
+            })
+            .collect();
+        let bind = d.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.layout,
+            entries: &entries,
+        });
         let _ = self.device.poll(wgpu::PollType::Wait);
-        Prepared { pipes, names, plan: plan2, bind, lanes0, lanes_buf, out, npx: sz.out, hw: (p.m.h, p.m.w), src, compile_s }
+        Prepared {
+            pipes,
+            names,
+            plan: plan2,
+            bind,
+            lanes0,
+            lanes_buf,
+            out,
+            npx: sz.out,
+            hw: (p.m.h, p.m.w),
+            src,
+            compile_s,
+        }
     }
 
     /// Run the whole decode; returns GPU wall seconds (submit → done).
@@ -510,17 +656,26 @@ impl ImgGpu {
 
     /// Kernel names in dispatch order.
     pub fn plan_names(&self, pr: &Prepared) -> Vec<String> {
-        pr.plan.iter().map(|&(i, _, _)| pr.names[i].clone()).collect()
+        pr.plan
+            .iter()
+            .map(|&(i, _, _)| pr.names[i].clone())
+            .collect()
     }
 
     /// Run the first `k` dispatches only (profiling).
     pub fn run_upto(&self, pr: &Prepared, k: usize) -> f64 {
-        self.queue.write_buffer(&pr.lanes_buf, 0, bytemuck_u32(&pr.lanes0));
+        self.queue
+            .write_buffer(&pr.lanes_buf, 0, bytemuck_u32(&pr.lanes0));
         let _ = self.device.poll(wgpu::PollType::Wait);
         let t0 = Instant::now();
-        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         {
-            let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+            let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
             cp.set_bind_group(0, &pr.bind, &[]);
             for &(i, gx, gy) in &pr.plan[..k] {
                 cp.set_pipeline(&pr.pipes[i]);
@@ -535,8 +690,15 @@ impl ImgGpu {
     /// Decoded image as interleaved RGB8.
     pub fn readback(&self, pr: &Prepared) -> Vec<u8> {
         let size = (pr.npx * 4) as u64;
-        let st = self.device.create_buffer(&wgpu::BufferDescriptor { label: None, size, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let st = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         enc.copy_buffer_to_buffer(&pr.out, 0, &st, 0, size);
         self.queue.submit([enc.finish()]);
         let slice = st.slice(..);
@@ -581,7 +743,10 @@ fn bytemuck_u32(v: &[u32]) -> &[u8] {
 }
 
 /// Decode a `TCI1` stream on the GPU: (h, w, RGB8, prepared state).
-pub fn decode(gpu: &ImgGpu, bytes: &[u8]) -> Result<(usize, usize, Vec<u8>), crate::bitio::DecodeError> {
+pub fn decode(
+    gpu: &ImgGpu,
+    bytes: &[u8],
+) -> Result<(usize, usize, Vec<u8>), crate::bitio::DecodeError> {
     let p = img::parse(bytes)?;
     let pr = gpu.prepare(&p);
     gpu.run(&pr);
