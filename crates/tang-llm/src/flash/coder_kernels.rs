@@ -12,7 +12,7 @@ pub fn prelude(c: &Shapes) -> String {
         "#define CX_HID {hid}\n#define CX_NH {nh}\n#define CX_NKV {nkv}\n#define CX_HD {hd}\n\
          #define CX_ROT {rot}\n#define CX_G {g}\n#define CX_QK {qk}\n#define CX_QV {qv}\n\
          #define CX_FF {ff}\n#define CX_TOPK {topk}\n#define CX_NE {ne}\n#define CX_NP {np}\n\
-         #define CX_CHUNK {chunk}\n",
+         #define CX_CHUNK {chunk}\n#define CX_MAXT {maxt}\n",
         hid = c.hidden,
         nh = c.n_head,
         nkv = c.n_kv,
@@ -26,6 +26,7 @@ pub fn prelude(c: &Shapes) -> String {
         ne = c.n_expert,
         np = super::coder::MAX_T * (c.topk + 1),
         chunk = attn_chunk(),
+        maxt = super::coder::MAX_T,
     )
 }
 
@@ -577,16 +578,22 @@ __device__ void gemvk_body(const Seg* segs, int nseg, const float* x, const unsi
     gemvk_body<T, 1>(segs, nseg, x, xq, k, out, ostride); }
 GEMVK_T(1) GEMVK_T(2) GEMVK_T(3) GEMVK_T(4) GEMVK_T(5) GEMVK_T(6) GEMVK_T(7) GEMVK_T(8)
 
+// Rows of a window may belong to different sequences: row t is at position ROWS[t] of slot
+// ROWS[CX_MAXT + t], whose bf16 K/V caches for this layer are at ktab[slot] / vtab[slot].
+
 // Gated attention prep: q heads (rmsnorm * qn, NeoX rope on CX_ROT dims) into q [t][NH][HD];
-// k heads (rmsnorm * kn, rope) and v into the bf16 caches at position ctl[0] + t.
+// k heads (rmsnorm * kn, rope) and v into the row's slot caches at the row's position.
 // Grid (t, NH + NKV), block HD.
 extern "C" __global__ void cx_attn_prep(const float* proj, int stride, const float* qn, const float* kn,
-                                        const float* rc, const float* rs, const unsigned* ctl, float* q,
-                                        unsigned short* kc, unsigned short* vc, float eps) {
+                                        const float* rc, const float* rs, const unsigned* rows, float* q,
+                                        const unsigned long long* ktab, const unsigned long long* vtab,
+                                        float eps) {
     __shared__ float sh[32];
     __shared__ float sx[CX_HD];
     const int t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
-    const unsigned pos = ctl[0] + t;
+    const unsigned pos = rows[t], slot = rows[CX_MAXT + t];
+    unsigned short* kc = (unsigned short*)ktab[slot];
+    unsigned short* vc = (unsigned short*)vtab[slot];
     const float* row = proj + (size_t)t * stride;
     const bool isq = h < CX_NH;
     const int g = h - CX_NH;
@@ -613,14 +620,17 @@ extern "C" __global__ void cx_attn_prep(const float* proj, int stride, const flo
 // CX_G query heads of group g over its chunk (4 warps; lane owns HD / 32 dims) and writes per
 // head (m, l, acc[HD]) to part[c][g][j][G][HD + 2]. Chunks past the token's position write l = 0.
 #define CX_DL (CX_HD / 32)
-extern "C" __global__ void __launch_bounds__(128) cx_attn_part(const float* q, const unsigned short* kc,
-                                                               const unsigned short* vc, const unsigned* ctl,
+extern "C" __global__ void __launch_bounds__(128) cx_attn_part(const float* q, const unsigned long long* ktab,
+                                                               const unsigned long long* vtab, const unsigned* rows,
                                                                float* part, int nchunk) {
     __shared__ float wm[4][CX_G], wl[4][CX_G];
     __shared__ float wacc[4][CX_HD];
     const int c = blockIdx.x, g = blockIdx.y, j = blockIdx.z;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int pos = (int)ctl[0] + c;
+    const int pos = (int)rows[c];
+    const unsigned slot = rows[CX_MAXT + c];
+    const unsigned short* kc = (const unsigned short*)ktab[slot];
+    const unsigned short* vc = (const unsigned short*)vtab[slot];
     float* out = part + (((size_t)c * CX_NKV + g) * nchunk + j) * CX_G * (CX_HD + 2);
     const int lo = j * CX_CHUNK;
     if (lo > pos) {

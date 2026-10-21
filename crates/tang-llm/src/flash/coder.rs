@@ -47,6 +47,10 @@ pub type LogitsCb<'a> = &'a mut dyn FnMut(usize, usize, &[f32]);
 
 /// Widest window.
 pub const MAX_T: usize = fl::MAX_T;
+/// Sequences one engine holds at once (slot 0 is the one the single-sequence API uses).
+pub const MAX_SLOTS: usize = 16;
+/// u32s of the per-row record staged with each window: positions, slots, then segments.
+const ROWS_U32: usize = 6 * MAX_T;
 
 /// Options of a [`Coder`] load.
 #[derive(Clone, Debug)]
@@ -180,6 +184,9 @@ struct GdnL {
     hist: B,
     /// The window's stacked projection and conv output, kept for a later commit.
     proj: B,
+    /// Every slot's `state` and `hist` addresses (u64 each; slot 0: the two above).
+    stab: B,
+    htab: B,
 }
 
 struct AttnL {
@@ -188,6 +195,9 @@ struct AttnL {
     k: B,
     v: B,
     proj: B,
+    /// Every slot's K and V cache addresses (u64 each; slot 0: `k` and `v`).
+    ktab: B,
+    vtab: B,
 }
 
 struct Layer {
@@ -228,6 +238,8 @@ struct Kern {
     merge: Fun,
     gdn_step: Fun,
     gdn_commit: Fun,
+    gdn_step_seg: Fun,
+    gdn_commit_seg: Fun,
     copy: Fun,
     argmax1: Fun,
     argmax2: Fun,
@@ -236,6 +248,9 @@ struct Kern {
 /// Per-window scratch, sized for `MAX_T`.
 struct Scratch {
     ctl: B,
+    /// Per-row record (`ROWS_U32`): row positions, row slots, then `[start, len, slot, keep]`
+    /// per segment (a slot's consecutive rows).
+    rows: B,
     r: B,
     x: B,
     xq8: B,
@@ -269,6 +284,10 @@ impl Io {
     const EMB: usize = 256;
 
     fn bytes(hidden: usize) -> usize {
+        Self::rows(hidden) + ROWS_U32 * 4
+    }
+    /// Where the per-row record sits (after the embeddings).
+    fn rows(hidden: usize) -> usize {
         Self::EMB + MAX_T * hidden * 4
     }
     fn ptr(&self, off: usize) -> *mut u8 {
@@ -282,6 +301,14 @@ impl Io {
     fn u32s(&self, off: usize, n: usize) -> &mut [u32] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr(off) as *mut u32, n) }
     }
+}
+
+/// A sequence past slot 0: its own recurrent state, conv history and K/V caches (per layer:
+/// `gdn` for GDN layers, `kv` for attention layers), and its tokens.
+struct Slot {
+    gdn: Vec<Option<(B, B)>>,
+    kv: Vec<Option<(B, B)>>,
+    tokens: Vec<u32>,
 }
 
 pub struct Coder {
@@ -305,12 +332,14 @@ pub struct Coder {
     side: Stream,
     ev_fork: gpu::Event,
     ev_join: gpu::Event,
-    /// Window graphs by (t, verify, attention chunks).
-    graphs: HashMap<(usize, bool, usize), Graph>,
+    /// Window graphs by (t, verify, attention chunks, segments).
+    graphs: HashMap<(usize, bool, usize, usize), Graph>,
     commit_graphs: Vec<Option<Graph>>,
     max_ctx: usize,
     counter: u32,
     pub tokens: Vec<u32>,
+    /// Sequences past slot 0: their state buffers and tokens (`None`: free).
+    slots: Vec<Option<Slot>>,
     pub seed: u32,
     pub temperature: f32,
     pub use_graphs: bool,
@@ -425,6 +454,8 @@ impl Coder {
                     state: dev.alloc_f32(hv * 128 * 128),
                     hist: dev.alloc_f32(3 * geo.gdn_conv()),
                     proj: dev.alloc_f32(MAX_T * w_in.rows),
+                    stab: dev.alloc_f32(2 * MAX_SLOTS),
+                    htab: dev.alloc_f32(2 * MAX_SLOTS),
                 };
                 (w_in, Some(gd), None)
             } else {
@@ -448,6 +479,8 @@ impl Coder {
                     k: dev.alloc_bf16(max_ctx * hp.n_head_kv * hp.head_dim),
                     v: dev.alloc_bf16(max_ctx * hp.n_head_kv * hp.head_dim),
                     proj: dev.alloc_f32(MAX_T * w_in.rows),
+                    ktab: dev.alloc_f32(2 * MAX_SLOTS),
+                    vtab: dev.alloc_f32(2 * MAX_SLOTS),
                 };
                 (w_in, None, Some(at))
             };
@@ -546,6 +579,7 @@ impl Coder {
         let xq_words = |k: usize| (MAX_T * k + MAX_T * k / 32 * 4).div_ceil(4);
         let s = Scratch {
             ctl: z(8),
+            rows: z(ROWS_U32),
             r: z(MAX_T * n),
             x: z(MAX_T * n),
             xq8: z(xq_words(kmax)),
@@ -580,8 +614,10 @@ impl Coder {
         let cm = gpu
             .module(&src)
             .map_err(|e| anyhow!("coder kernels: {e}"))?;
+        // GDN_SLOTS: the per-segment GDN kernels (several sequences a window); Flash-Next builds
+        // without it, so its module is unchanged.
         let fm = gpu
-            .module(&geo.cuda_source())
+            .module(&format!("#define GDN_SLOTS 1\n{}", geo.cuda_source()))
             .map_err(|e| anyhow!("flash kernels: {e}"))?;
         let em = gpu.module(kernels::SRC).map_err(|e| anyhow!("{e}"))?;
         let f = |m: &Module, n: &str| m.func(n).map_err(|e| anyhow!("{n}: {e}"));
@@ -640,6 +676,8 @@ impl Coder {
             merge: f(&cm, "cx_attn_merge")?,
             gdn_step: f(&fm, "fl_gdn_conv_step")?,
             gdn_commit: f(&fm, "fl_gdn_conv_commit")?,
+            gdn_step_seg: f(&fm, "fl_gdn_conv_step_seg")?,
+            gdn_commit_seg: f(&fm, "fl_gdn_conv_commit_seg")?,
             copy: f(&em, "fe_copy")?,
             argmax1: f(&em, "fe_argmax1")?,
             argmax2: f(&em, "fe_argmax2")?,
@@ -689,7 +727,7 @@ impl Coder {
             t_kernels,
             t0.elapsed().as_secs_f64()
         );
-        Ok(Coder {
+        let c = Coder {
             dev,
             gpu,
             sampler: None,
@@ -713,6 +751,7 @@ impl Coder {
             max_ctx,
             counter: 0,
             tokens: Vec::new(),
+            slots: (0..MAX_SLOTS).map(|_| None).collect(),
             seed: 0,
             temperature: 0.0,
             use_graphs: true,
@@ -724,7 +763,212 @@ impl Coder {
                 .then(|| std::cell::RefCell::new(Prof::default())),
             only: std::cell::Cell::new(None),
             var: Variants::from_env(),
-        })
+        };
+        let mut c = c;
+        c.write_slot_tables();
+        Ok(c)
+    }
+
+    // ---- sequence slots (several sequences in one window)
+
+    /// Rewrite every layer's slot tables from the live slots (slot 0: the layer's own buffers;
+    /// a free slot: 0).
+    fn write_slot_tables(&mut self) {
+        let nl = self.layers.len();
+        for l in 0..nl {
+            let mut ta = [0u64; MAX_SLOTS];
+            let mut tb = [0u64; MAX_SLOTS];
+            let layer = &self.layers[l];
+            let (a0, b0) = match (&layer.gdn, &layer.attn) {
+                (Some(g), _) => (self.a(&g.state), self.a(&g.hist)),
+                (_, Some(at)) => (self.a(&at.k), self.a(&at.v)),
+                _ => continue,
+            };
+            ta[0] = a0;
+            tb[0] = b0;
+            for (i, sl) in self.slots.iter().enumerate().skip(1) {
+                if let Some(sl) = sl {
+                    let pair = if layer.gdn.is_some() {
+                        &sl.gdn[l]
+                    } else {
+                        &sl.kv[l]
+                    };
+                    if let Some((a, b)) = pair {
+                        ta[i] = self.a(a);
+                        tb[i] = self.a(b);
+                    }
+                }
+            }
+            let words = |t: &[u64; MAX_SLOTS]| -> Vec<f32> {
+                t.iter()
+                    .flat_map(|&v| [f32::from_bits(v as u32), f32::from_bits((v >> 32) as u32)])
+                    .collect()
+            };
+            let (wa, wb) = (words(&ta), words(&tb));
+            let layer = &mut self.layers[l];
+            let (da, db) = match (&mut layer.gdn, &mut layer.attn) {
+                (Some(g), _) => (&mut g.stab, &mut g.htab),
+                (_, Some(at)) => (&mut at.ktab, &mut at.vtab),
+                _ => continue,
+            };
+            self.dev.upload_into_f32(da, &wa);
+            self.dev.upload_into_f32(db, &wb);
+        }
+        self.dev.sync();
+    }
+
+    /// A free sequence slot (1..MAX_SLOTS), its state zeroed and no tokens.
+    pub fn alloc_slot(&mut self) -> Result<usize> {
+        let i = (1..MAX_SLOTS)
+            .find(|&i| self.slots[i].is_none())
+            .ok_or_else(|| anyhow!("all {} slots in use", MAX_SLOTS))?;
+        let (hv, conv, kv) = (
+            self.geo.gdn_hv,
+            self.geo.gdn_conv(),
+            self.max_ctx * self.hp.n_head_kv * self.hp.head_dim,
+        );
+        let mut sl = Slot {
+            gdn: Vec::with_capacity(self.layers.len()),
+            kv: Vec::with_capacity(self.layers.len()),
+            tokens: Vec::new(),
+        };
+        for layer in &self.layers {
+            sl.gdn.push(layer.gdn.as_ref().map(|_| {
+                (
+                    self.dev.alloc_f32(hv * 128 * 128),
+                    self.dev.alloc_f32(3 * conv),
+                )
+            }));
+            sl.kv.push(
+                layer
+                    .attn
+                    .as_ref()
+                    .map(|_| (self.dev.alloc_bf16(kv), self.dev.alloc_bf16(kv))),
+            );
+        }
+        self.slots[i] = Some(sl);
+        self.write_slot_tables();
+        Ok(i)
+    }
+
+    /// Release slot `i` (not 0) and its memory.
+    pub fn free_slot(&mut self, i: usize) {
+        if i > 0 && i < MAX_SLOTS && self.slots[i].take().is_some() {
+            self.write_slot_tables();
+        }
+    }
+
+    /// Slot `i`'s tokens (slot 0: [`tokens`](Self::tokens)).
+    pub fn slot_tokens(&self, i: usize) -> &[u32] {
+        if i == 0 {
+            &self.tokens
+        } else {
+            self.slots[i].as_ref().map_or(&[], |s| &s.tokens)
+        }
+    }
+
+    fn slot_tokens_mut(&mut self, i: usize) -> Result<&mut Vec<u32>> {
+        if i == 0 {
+            return Ok(&mut self.tokens);
+        }
+        self.slots
+            .get_mut(i)
+            .and_then(|s| s.as_mut())
+            .map(|s| &mut s.tokens)
+            .ok_or_else(|| anyhow!("slot {i} isn't allocated"))
+    }
+
+    /// Stage a window of rows `(slot, position, token)` in segments `[start, len, slot, keep]`.
+    fn stage_rows(&mut self, rows: &[(usize, usize, u32)], segs: &[[u32; 4]]) -> Result<()> {
+        let t = rows.len();
+        ensure!((1..=MAX_T).contains(&t) && segs.len() <= MAX_T);
+        let ctl = self.io.u32s(Io::CTL, 5);
+        ctl[0] = rows[0].1 as u32;
+        ctl[1] = t as u32;
+        ctl[2] = self.counter;
+        ctl[3] = self.seed;
+        ctl[4] = self.temperature.to_bits();
+        let n = self.hp.n_embd;
+        let emb_t = self.g.info("token_embd.weight")?.clone();
+        let emb = self.io.f32s(Io::EMB, t * n);
+        for (i, r) in rows.iter().enumerate() {
+            let row = self.g.rows(&emb_t, r.2 as usize, 1)?;
+            emb[i * n..(i + 1) * n].copy_from_slice(&row);
+        }
+        let rec = self.io.u32s(Io::rows(n), ROWS_U32);
+        rec.fill(0);
+        for (i, r) in rows.iter().enumerate() {
+            rec[i] = r.1 as u32;
+            rec[MAX_T + i] = r.0 as u32;
+        }
+        for (b, sg) in segs.iter().enumerate() {
+            rec[2 * MAX_T + 4 * b..2 * MAX_T + 4 * b + 4].copy_from_slice(sg);
+        }
+        Ok(())
+    }
+
+    /// Feed `ids` to slot `slot` (windows of up to `MAX_T` of its rows) and return the next
+    /// token. Greedy; the sampler isn't per slot yet.
+    pub fn prefill_slot(&mut self, slot: usize, ids: &[u32]) -> Result<u32> {
+        ensure!(!ids.is_empty(), "empty prompt");
+        ensure!(self.sampler.is_none(), "batched windows are greedy for now");
+        let mut pos = self.slot_tokens(slot).len();
+        self.slot_tokens_mut(slot)?.extend_from_slice(ids);
+        let end = pos + ids.len();
+        ensure!(end <= self.max_ctx, "context {end} > max {}", self.max_ctx);
+        let mut next = 0;
+        while pos < end {
+            let t = (end - pos).min(MAX_T);
+            let toks = &self.slot_tokens(slot)[pos..pos + t];
+            let rows: Vec<(usize, usize, u32)> = toks
+                .iter()
+                .enumerate()
+                .map(|(i, &k)| (slot, pos + i, k))
+                .collect();
+            let w0 = Instant::now();
+            self.stage_rows(&rows, &[[0, t as u32, slot as u32, t as u32]])?;
+            let nchunk = self.nchunk(pos + t);
+            let st = WinStats {
+                t,
+                ..Default::default()
+            };
+            next = self.run_staged(st, w0, t, false, nchunk, 1, None)?[t - 1];
+            pos += t;
+        }
+        Ok(next)
+    }
+
+    /// One decode step for several sequences at once: `(slot, token)` per row, distinct
+    /// slots, at most `MAX_T`. Feeds each slot its token and returns each row's next token
+    /// (greedy). A slot's result is the one a window of that slot alone would give.
+    pub fn decode_batch(&mut self, rows: &[(usize, u32)]) -> Result<Vec<u32>> {
+        let b = rows.len();
+        ensure!((1..=MAX_T).contains(&b), "{b} rows");
+        ensure!(self.sampler.is_none(), "batched windows are greedy for now");
+        let mut staged = Vec::with_capacity(b);
+        let mut segs = Vec::with_capacity(b);
+        let mut end = 0;
+        for (i, &(slot, tok)) in rows.iter().enumerate() {
+            ensure!(
+                rows[..i].iter().all(|r| r.0 != slot),
+                "slot {slot} twice in one step"
+            );
+            let toks = self.slot_tokens_mut(slot)?;
+            let pos = toks.len();
+            toks.push(tok);
+            end = end.max(pos + 1);
+            staged.push((slot, pos, tok));
+            segs.push([i as u32, 1, slot as u32, 1]);
+        }
+        ensure!(end <= self.max_ctx, "context {end} > max {}", self.max_ctx);
+        let w0 = Instant::now();
+        self.stage_rows(&staged, &segs)?;
+        let nchunk = self.nchunk(end);
+        let st = WinStats {
+            t: b,
+            ..Default::default()
+        };
+        self.run_staged(st, w0, b, false, nchunk, b, None)
     }
 
     pub fn reset(&mut self) {
@@ -798,6 +1042,8 @@ impl Coder {
             (k.merge, "attn_merge"),
             (k.gdn_step, "gdn_conv_step"),
             (k.gdn_commit, "gdn_commit"),
+            (k.gdn_step_seg, "gdn_conv_step"),
+            (k.gdn_commit_seg, "gdn_commit"),
             (k.copy, "copy"),
             (k.argmax1, "argmax"),
             (k.argmax2, "argmax"),
@@ -967,6 +1213,11 @@ impl Coder {
         self.mark("start");
         self.kcopy(self.a(&self.s.ctl), self.io_dev(Io::CTL), 32);
         self.kcopy(
+            self.a(&self.s.rows),
+            self.io_dev(Io::rows(self.hp.n_embd)),
+            ROWS_U32 * 4,
+        );
+        self.kcopy(
             self.a(&self.s.r),
             self.io_dev(Io::EMB),
             t * self.hp.n_embd * 4,
@@ -974,7 +1225,7 @@ impl Coder {
     }
 
     /// Layer `l`'s mixer (input `s.x` / `s.mxq`) into `s.mix`.
-    fn enqueue_mixer(&self, l: usize, t: usize, verify: bool, nchunk: usize) {
+    fn enqueue_mixer(&self, l: usize, t: usize, verify: bool, nchunk: usize, nseg: usize) {
         let layer = &self.layers[l];
         let s = &self.s;
         let (x, xq) = (self.a(&s.x), Some(self.a(&s.mxq)));
@@ -983,9 +1234,9 @@ impl Coder {
         if let Some(g) = &layer.gdn {
             let stride = layer.w_in.rows;
             self.gemv("gdn_in", &layer.w_in, x, xq, self.a(&g.proj), t, stride);
-            self.gdn_step(g, stride, t, !verify);
+            self.gdn_step_seg(g, stride, nseg, !verify);
             if !verify {
-                self.gdn_commit(g, stride, t);
+                self.gdn_commit_seg(g, stride, nseg);
             }
             self.gemv(
                 "gdn_out",
@@ -1001,7 +1252,7 @@ impl Coder {
             let stride = layer.w_in.rows;
             self.gemv("attn_in", &layer.w_in, x, xq, self.a(&at.proj), t, stride);
             let hp = &self.hp;
-            let (proj, st, qn, kn, rc, rs, q, kc, vc) = (
+            let (proj, st, qn, kn, rc, rs, q, kt, vt, rows) = (
                 self.a(&at.proj),
                 stride as i32,
                 self.a(&at.qn),
@@ -1009,8 +1260,9 @@ impl Coder {
                 self.a(&self.rope.0),
                 self.a(&self.rope.1),
                 self.a(&s.q),
-                self.a(&at.k),
-                self.a(&at.v),
+                self.a(&at.ktab),
+                self.a(&at.vtab),
+                self.a(&s.rows),
             );
             let (part, nc, attn) = (self.a(&s.part), nchunk as i32, self.a(&s.attn));
             unsafe {
@@ -1018,13 +1270,13 @@ impl Coder {
                     self.k.prep,
                     (t as u32, (hp.n_head + hp.n_head_kv) as u32, 1),
                     hp.head_dim as u32,
-                    tang_moe::args![proj, st, qn, kn, rc, rs, ctl, q, kc, vc, eps],
+                    tang_moe::args![proj, st, qn, kn, rc, rs, rows, q, kt, vt, eps],
                 );
                 self.launch(
                     self.k.part,
                     (t as u32, hp.n_head_kv as u32, nchunk as u32),
                     128,
-                    tang_moe::args![q, kc, vc, ctl, part, nc],
+                    tang_moe::args![q, kt, vt, rows, part, nc],
                 );
                 self.launch(
                     self.k.merge,
@@ -1081,6 +1333,50 @@ impl Coder {
                 (self.geo.gdn_conv().div_ceil(256) as u32, 1, 1),
                 256,
                 tang_moe::args![h0, p, sd, win, tu],
+            )
+        };
+    }
+
+    /// [`gdn_step`](Self::gdn_step) for every segment of the window (`s.rows`): each segment's
+    /// rows run against its slot's state and history.
+    fn gdn_step_seg(&self, g: &GdnL, stride: usize, nseg: usize, commit: bool) {
+        let (stab, htab, p, sd, dt, sa, nw, y, seg, cm, eps, wc) = (
+            self.a(&g.stab),
+            self.a(&g.htab),
+            self.a(&g.proj),
+            stride as u32,
+            self.a(&g.dt),
+            self.a(&g.a),
+            self.a(&g.norm),
+            self.a(&self.s.y),
+            self.a(&self.s.rows) + (2 * MAX_T * 4) as u64,
+            commit as u32,
+            self.eps,
+            self.a(&g.conv),
+        );
+        unsafe {
+            self.launch(
+                self.k.gdn_step_seg,
+                (self.geo.gdn_hv as u32, nseg as u32, 1),
+                512,
+                tang_moe::args![stab, htab, p, sd, dt, sa, nw, y, seg, cm, eps, wc],
+            )
+        };
+    }
+
+    fn gdn_commit_seg(&self, g: &GdnL, stride: usize, nseg: usize) {
+        let (htab, p, sd, seg) = (
+            self.a(&g.htab),
+            self.a(&g.proj),
+            stride as u32,
+            self.a(&self.s.rows) + (2 * MAX_T * 4) as u64,
+        );
+        unsafe {
+            self.launch(
+                self.k.gdn_commit_seg,
+                (self.geo.gdn_conv().div_ceil(256) as u32, nseg as u32, 1),
+                256,
+                tang_moe::args![htab, p, sd, seg],
             )
         };
     }
@@ -1272,6 +1568,7 @@ impl Coder {
         t: usize,
         verify: bool,
         nchunk: usize,
+        nseg: usize,
         mut probe: Option<&mut Probe>,
     ) -> Result<()> {
         self.enqueue_inputs(t);
@@ -1281,7 +1578,7 @@ impl Coder {
         self.norm_q8(None, &self.layers[0].attn_norm, t);
         for l in 0..nl {
             let layer = &self.layers[l];
-            self.enqueue_mixer(l, t, verify, nchunk);
+            self.enqueue_mixer(l, t, verify, nchunk, nseg);
             self.norm_q8(Some(self.a(&self.s.mix)), &layer.post_norm, t);
             if let Some(p) = probe.as_deref_mut() {
                 self.dev.sync();
@@ -1342,6 +1639,13 @@ impl Coder {
             let row = self.g.rows(&emb_t, self.tokens[pos0 + i] as usize, 1)?;
             emb[i * n..(i + 1) * n].copy_from_slice(&row);
         }
+        // One sequence (slot 0): rows at pos0.., one segment keeping all of them.
+        let rows = self.io.u32s(Io::rows(n), ROWS_U32);
+        rows.fill(0);
+        for i in 0..t {
+            rows[i] = (pos0 + i) as u32;
+        }
+        rows[2 * MAX_T..2 * MAX_T + 4].copy_from_slice(&[0, t as u32, 0, t as u32]);
         Ok(())
     }
 
@@ -1373,11 +1677,27 @@ impl Coder {
         self.stage(pos0, t)?;
         st.host_prep_ms = w0.elapsed().as_secs_f64() * 1e3;
         let nchunk = self.nchunk(pos0 + t);
-        let key = (t, verify, nchunk);
+        self.run_staged(st, w0, t, verify, nchunk, 1, probe)
+    }
+
+    /// Run the window `stage` / `stage_rows` staged: `t` rows in `nseg` segments, attention over
+    /// `nchunk` chunks. A graph per (t, verify, nchunk, nseg), captured on first use.
+    #[allow(clippy::too_many_arguments)]
+    fn run_staged(
+        &mut self,
+        st: WinStats,
+        w0: Instant,
+        t: usize,
+        verify: bool,
+        nchunk: usize,
+        nseg: usize,
+        mut probe: Option<&mut Probe>,
+    ) -> Result<Vec<u32>> {
+        let key = (t, verify, nchunk, nseg);
         if probe.is_none() && self.use_graphs {
             if !self.graphs.contains_key(&key) {
                 // First use: run eagerly (loads every kernel), then capture.
-                self.enqueue_window(t, verify, nchunk, None)?;
+                self.enqueue_window(t, verify, nchunk, nseg, None)?;
                 self.dev.sync();
                 let ids = self.io.u32s(Io::IDS, t).to_vec();
                 // Undo nothing: the eager run *was* this window. Capture for next time without
@@ -1387,7 +1707,7 @@ impl Coder {
                 let gr = Graph::capture(&stream, |_| {
                     // SAFETY: `self` is not otherwise touched during capture.
                     unsafe { &*me }
-                        .enqueue_window(t, verify, nchunk, None)
+                        .enqueue_window(t, verify, nchunk, nseg, None)
                         .map_err(|e| tang_moe::gpu::Error(format!("{e}")))
                 })
                 .map_err(|e| anyhow!("capture T={t}: {e}"))?;
@@ -1398,7 +1718,7 @@ impl Coder {
                 .launch(&self.stream)
                 .map_err(|e| anyhow!("{e}"))?;
         } else {
-            self.enqueue_window(t, verify, nchunk, probe.as_deref_mut())?;
+            self.enqueue_window(t, verify, nchunk, nseg, probe.as_deref_mut())?;
         }
         self.dev.sync();
         self.prof_collect();
@@ -1533,7 +1853,7 @@ impl Coder {
         let pos0 = self.tokens.len() - 1;
         self.stage(pos0, 1)?;
         let nchunk = self.nchunk(pos0 + 1);
-        self.enqueue_window(1, false, nchunk, None)?;
+        self.enqueue_window(1, false, nchunk, 1, None)?;
         self.dev.sync();
         let hp = &self.hp;
         let lb = |f: &dyn Fn(&Layer) -> f64| -> f64 { self.layers.iter().map(f).sum() };
@@ -1620,7 +1940,7 @@ impl Coder {
                 for _ in 0..REPS {
                     // SAFETY: `self` is not otherwise touched during capture.
                     unsafe { &*me }
-                        .enqueue_window(1, false, nchunk, None)
+                        .enqueue_window(1, false, nchunk, 1, None)
                         .map_err(|e| tang_moe::gpu::Error(format!("{e}")))?;
                 }
                 Ok(())
