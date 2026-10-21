@@ -10,7 +10,7 @@ documentation = "https://docs.rs/tang-compress"
 readme = "README.md"
 keywords = ["compression", "tensor-train", "qtt", "scientific-data", "lossy"]
 categories = ["compression", "science", "mathematics"]
-include = ["src/**/*", "README.md", "LICENSE", "SHIPPED_DECODER.md", "examples/**/*"]
+include = ["src/**/*", "README.md", "LICENSE-MIT", "LICENSE-APACHE", "SHIPPED_DECODER.md", "examples/**/*"]
 
 [dependencies]
 tang-la = { workspace = true }

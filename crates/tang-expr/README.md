@@ -171,4 +171,4 @@ See `examples/int_dialect.rs`.
 
 ## License
 
-[MIT](../../LICENSE)
+Licensed under either of [Apache License, Version 2.0](../../LICENSE-APACHE) or [MIT license](../../LICENSE-MIT) at your option. Contributions are accepted under the same terms with a DCO sign-off (see CONTRIBUTING.md).

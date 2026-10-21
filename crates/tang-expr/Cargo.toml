@@ -10,7 +10,7 @@ documentation = "https://docs.rs/tang-expr"
 readme = "README.md"
 keywords = ["expression", "symbolic", "graph", "codegen", "autodiff"]
 categories = ["mathematics", "science", "compilers"]
-include = ["src/**/*", "README.md", "LICENSE", "examples/**/*"]
+include = ["src/**/*", "README.md", "LICENSE-MIT", "LICENSE-APACHE", "examples/**/*"]
 
 [dependencies]
 tang = { workspace = true, features = ["std"] }

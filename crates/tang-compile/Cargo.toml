@@ -10,7 +10,7 @@ documentation = "https://docs.rs/tang-compile"
 readme = "README.md"
 keywords = ["compiler", "graph", "optimization", "codegen"]
 categories = ["compilers", "mathematics"]
-include = ["src/**/*", "README.md", "LICENSE", "examples/**/*"]
+include = ["src/**/*", "README.md", "LICENSE-MIT", "LICENSE-APACHE", "examples/**/*"]
 
 [dependencies]
 tang      = { workspace = true }
