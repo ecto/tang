@@ -30,15 +30,32 @@ use tang_compute::flash::MAX_T;
 const PREFILL_BUDGET: usize = 256;
 /// The same while some stream is decoding: a shorter chunk, so a decode window is never far off.
 const PREFILL_SLICE: usize = 64;
+/// With wide prefill windows (`ServeEngine::wide_rows`): a step's prompt tokens when nothing
+/// decodes (capped at the window width), and while something does (a wide window of this many
+/// tokens takes a few hundred ms; the time slice still keeps prefill to about half the GPU).
+const WIDE_BUDGET: usize = 2048;
+const WIDE_SLICE: usize = 256;
 
 /// This step's prefill chunks, as `(lane, tokens)`: shortest remaining prompt first, up to
 /// `PREFILL_BUDGET` tokens when nothing decodes. While something decodes, `PREFILL_SLICE` tokens,
 /// and none while prefill is ahead of decode on GPU time (`debt` seconds), which keeps prefill to
 /// about half the GPU: a cold prompt slows down but always finishes.
 fn prefill_plan(waiting: &[(usize, usize)], decoding: bool, debt: f64) -> Vec<(usize, usize)> {
+    prefill_plan_with(waiting, decoding, debt, PREFILL_BUDGET, PREFILL_SLICE)
+}
+
+/// [`prefill_plan`] with the budgets given: `full` tokens when nothing decodes, `slice` while
+/// something does (wide windows: `WIDE_BUDGET` / `WIDE_SLICE`).
+fn prefill_plan_with(
+    waiting: &[(usize, usize)],
+    decoding: bool,
+    debt: f64,
+    full: usize,
+    slice: usize,
+) -> Vec<(usize, usize)> {
     let mut budget = match (decoding, debt > 0.0) {
-        (false, _) => PREFILL_BUDGET,
-        (true, false) => PREFILL_SLICE,
+        (false, _) => full,
+        (true, false) => slice,
         (true, true) => 0,
     };
     let mut order = waiting.to_vec();
@@ -378,7 +395,19 @@ impl FlashServe {
                     .then(|| (s.ids.len() - s.done_prompt, i))
             })
             .collect();
-        for (i, n) in prefill_plan(&waiting, decoding, self.prefill_debt) {
+        let wide = self.e.wide_rows();
+        let plan = if wide > 0 {
+            prefill_plan_with(
+                &waiting,
+                decoding,
+                self.prefill_debt,
+                WIDE_BUDGET.min(wide),
+                WIDE_SLICE.min(wide),
+            )
+        } else {
+            prefill_plan(&waiting, decoding, self.prefill_debt)
+        };
+        for (i, n) in plan {
             let l = &mut lanes[i];
             let s = l.stream.downcast_mut::<Stream>().expect("a flash stream");
             // Stop at the next prefix-state mark, to save the state there.
@@ -387,9 +416,12 @@ impl FlashServe {
                 .first()
                 .map_or(n, |&(m, _)| n.min(m - s.done_prompt));
             let t = Instant::now();
-            let next = self
-                .e
-                .prefill_slot(s.slot, &s.ids[s.done_prompt..s.done_prompt + n])?;
+            let chunk = &s.ids[s.done_prompt..s.done_prompt + n];
+            let next = if wide > 0 && n > 2 * MAX_T {
+                self.e.prefill_slot_wide(s.slot, chunk)?
+            } else {
+                self.e.prefill_slot(s.slot, chunk)?
+            };
             let dt = t.elapsed().as_secs_f64();
             s.prefill_s += dt;
             if decoding {
@@ -626,6 +658,20 @@ mod tests {
             "cold done {:.1} s vs solo {solo:.1} s",
             cold_done.unwrap()
         );
+    }
+
+    #[test]
+    fn wide_budgets_slice_while_decoding() {
+        let w = [(10_000, 0), (27, 1)];
+        assert_eq!(
+            prefill_plan_with(&w, false, 0.0, WIDE_BUDGET, WIDE_SLICE),
+            vec![(1, 27), (0, WIDE_BUDGET - 27)]
+        );
+        assert_eq!(
+            prefill_plan_with(&w, true, 0.0, WIDE_BUDGET, WIDE_SLICE),
+            vec![(1, 27), (0, WIDE_SLICE - 27)]
+        );
+        assert!(prefill_plan_with(&w, true, 0.5, WIDE_BUDGET, WIDE_SLICE).is_empty());
     }
 
     #[test]

@@ -139,6 +139,18 @@ pub trait ServeEngine {
     fn decode_batch(&mut self, _rows: &[(usize, u32)]) -> Result<Vec<u32>> {
         bail!("this engine has no sequence slots")
     }
+    /// Wide prefill windows for sequence slots: build them (`rows` tokens a window).
+    fn enable_wide_rows(&mut self, _rows: usize) -> Result<()> {
+        bail!("this engine has no wide slot prefill")
+    }
+    /// The wide windows' width (0: none).
+    fn wide_rows(&self) -> usize {
+        0
+    }
+    /// [`prefill_slot`](Self::prefill_slot) through wide windows.
+    fn prefill_slot_wide(&mut self, slot: usize, ids: &[u32]) -> Result<u32> {
+        self.prefill_slot(slot, ids)
+    }
     /// [`save_running`](Self::save_running) of a sequence slot (0: the single sequence).
     fn save_running_at(&mut self, slot: usize) -> Result<RunningState> {
         ensure!(slot == 0, "this engine has no sequence slots");
@@ -315,6 +327,15 @@ impl ServeEngine for super::coder::Coder {
     }
     fn decode_batch(&mut self, rows: &[(usize, u32)]) -> Result<Vec<u32>> {
         super::coder::Coder::decode_batch(self, rows)
+    }
+    fn enable_wide_rows(&mut self, rows: usize) -> Result<()> {
+        super::coder::Coder::enable_wide(self, rows)
+    }
+    fn wide_rows(&self) -> usize {
+        super::coder::Coder::wide_rows(self)
+    }
+    fn prefill_slot_wide(&mut self, slot: usize, ids: &[u32]) -> Result<u32> {
+        super::coder::Coder::prefill_wide(self, slot, ids)
     }
     fn save_running_at(&mut self, slot: usize) -> Result<RunningState> {
         super::coder::Coder::save_running_at(self, slot)
@@ -733,9 +754,29 @@ impl FlashServe {
             );
             me.batch = s.batch.min(me.e.max_slots() - 1);
             eprintln!(
-                "tang-llm: continuous batching: up to {} requests at once (greedy, no drafts)",
-                me.batch
+                "tang-llm: continuous batching: up to {} requests at once (greedy{})",
+                me.batch,
+                if me.e.use_mtp() {
+                    ", MTP drafts"
+                } else {
+                    ", no drafts"
+                }
             );
+            // Wide prefill windows for the slots (TANG_SERVE_WIDE rows, default 2048; 0: off).
+            let rows: usize = std::env::var("TANG_SERVE_WIDE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2048);
+            if rows > 0 {
+                let t = Instant::now();
+                match me.e.enable_wide_rows(rows) {
+                    Ok(()) => eprintln!(
+                        "tang-llm: wide prefill windows of {rows} rows built in {:.1} s",
+                        t.elapsed().as_secs_f64()
+                    ),
+                    Err(e) => eprintln!("tang-llm: no wide prefill ({e})"),
+                }
+            }
         }
         for f in &warm {
             let t = Instant::now();

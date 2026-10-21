@@ -1503,6 +1503,11 @@ impl Coder {
     /// the wide width, then the last as a normal window, which gives the next token (and the
     /// logits) exactly as `prefill_slot` would. The state and K/V it leaves are bitwise
     /// `prefill_slot`'s: every row's arithmetic is the narrow kernels'.
+    /// The wide windows' width ([`enable_wide`](Self::enable_wide); 0: none).
+    pub fn wide_rows(&self) -> usize {
+        self.wide.as_ref().map_or(0, |w| w.rows)
+    }
+
     pub fn prefill_wide(&mut self, slot: usize, ids: &[u32]) -> Result<u32> {
         let Some(rows) = self.wide.as_ref().map(|w| w.rows) else {
             return self.prefill_slot(slot, ids);
@@ -2574,7 +2579,11 @@ impl Coder {
     fn enqueue_mtp(&self, t: usize, nchunk: usize) {
         let m = self.mtp.as_ref().expect("MTP layer");
         let (s, n) = (&self.s, self.hp.n_embd);
-        self.kcopy(self.a(&s.rows), self.io_dev(Io::rows(n, MAX_T)), ROWS_U32 * 4);
+        self.kcopy(
+            self.a(&s.rows),
+            self.io_dev(Io::rows(n, MAX_T)),
+            ROWS_U32 * 4,
+        );
         self.kcopy(self.a(&m.emb), self.io_dev(Io::EMB), t * n * 4);
         let (emb, mh, we, wh, eps, ni, cat) = (
             self.a(&m.emb),
