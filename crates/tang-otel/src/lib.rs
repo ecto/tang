@@ -367,7 +367,7 @@ pub fn traceparent(cx: &Context) -> Option<String> {
 /// Every `n`th call returns true (n = 0: never; n = 1: always).
 #[inline]
 pub fn every(counter: &AtomicU64, n: u64) -> bool {
-    n != 0 && counter.fetch_add(1, Ordering::Relaxed) % n == 0
+    n != 0 && counter.fetch_add(1, Ordering::Relaxed).is_multiple_of(n)
 }
 
 /// A `u64` from the environment, or `default`.
