@@ -1234,6 +1234,7 @@ impl Coder {
                 .map(|_| self.enqueue_wide(t));
             // The pinned staging is reused by the next window.
             self.dev.sync();
+            self.prof_collect();
             self.in_wide.set(false);
             r?;
             if std::env::var("TANG_WIDE_TIMES").is_ok_and(|v| v == "1") {
