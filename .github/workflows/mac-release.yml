@@ -1,0 +1,84 @@
+# Signed and notarized tang-llm for Apple Silicon, attached to a GitHub release.
+# Runs on a `v*` tag push, or by hand (workflow_dispatch) with an existing tag.
+#
+# Secrets (one-time setup, see docs/release/macos-signing.md):
+#   MACOS_CERT_P12        base64 of the "Developer ID Application" certificate + key (.p12)
+#   MACOS_CERT_PASSWORD   password of that .p12
+#   MACOS_SIGN_IDENTITY   e.g. "Developer ID Application: Municipal Robotics (TEAMID1234)"
+#   ASC_KEY_ID            App Store Connect API key id (notarytool)
+#   ASC_ISSUER_ID         App Store Connect issuer id
+#   ASC_KEY_P8            base64 of the AuthKey_<id>.p8 file
+name: mac release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "existing tag to build and attach to"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  tang-llm-macos:
+    runs-on: macos-15
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      ASSET: tang-llm-aarch64-apple-darwin.tar.gz
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Build
+        run: |
+          rustup target add aarch64-apple-darwin
+          cargo build --release -p tang-llm --features metal --target aarch64-apple-darwin
+          mkdir -p dist && cp target/aarch64-apple-darwin/release/tang-llm dist/
+
+      - name: Import signing certificate
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          kc="$RUNNER_TEMP/sign.keychain-db"; kcpw="$(openssl rand -hex 16)"
+          echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$kcpw" "$kc"
+          security set-keychain-settings -lut 3600 "$kc"
+          security unlock-keychain -p "$kcpw" "$kc"
+          security import "$RUNNER_TEMP/cert.p12" -k "$kc" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$kcpw" "$kc"
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/cert.p12"
+
+      - name: Sign
+        env:
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: |
+          codesign --force --timestamp --options runtime --sign "$MACOS_SIGN_IDENTITY" dist/tang-llm
+          codesign --verify --strict --verbose=2 dist/tang-llm
+
+      - name: Notarize
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          key="$RUNNER_TEMP/AuthKey.p8"; echo "$ASC_KEY_P8" | base64 --decode > "$key"
+          # A bare binary can't be stapled; notarize a zip of it so Gatekeeper finds the ticket online.
+          ditto -c -k dist/tang-llm "$RUNNER_TEMP/tang-llm.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/tang-llm.zip" --key "$key" --key-id "$ASC_KEY_ID" \
+            --issuer "$ASC_ISSUER_ID" --wait --timeout 30m
+          rm "$key"
+
+      - name: Package and attach
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tar -C dist -czf "$ASSET" tang-llm
+          shasum -a 256 "$ASSET" > "$ASSET.sha256"
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --notes "tang $TAG"
+          gh release upload "$TAG" "$ASSET" "$ASSET.sha256" --clobber
