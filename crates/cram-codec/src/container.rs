@@ -71,7 +71,13 @@ pub enum Arm {
 }
 
 /// Every lossless arm, in tie-break order.
-pub const LOSSLESS_ARMS: [Arm; 5] = [Arm::Stored, Arm::Zstd3, Arm::Zstd19, Arm::Xz9, Arm::Brotli11];
+pub const LOSSLESS_ARMS: [Arm; 5] = [
+    Arm::Stored,
+    Arm::Zstd3,
+    Arm::Zstd19,
+    Arm::Xz9,
+    Arm::Brotli11,
+];
 
 impl Arm {
     /// Method tag byte.
@@ -266,7 +272,9 @@ pub fn encode_arm(arm: Arm, x: &[u8], hint: &Hint) -> Result<Vec<u8>, Error> {
                 bound: Some(b),
             } = hint
             else {
-                return Err(Error::BadHint("cram-lossy needs F32Field with a bound".into()));
+                return Err(Error::BadHint(
+                    "cram-lossy needs F32Field with a bound".into(),
+                ));
             };
             if dims.iter().product::<usize>() * 4 != x.len() || dims.is_empty() {
                 return Err(Error::BadHint(format!(
@@ -435,7 +443,9 @@ mod tests {
             random(17, 2),
             random(4096, 3),
             random(200_000, 4),
-            "the quick brown fox jumps over the lazy dog\n".repeat(300).into_bytes(),
+            "the quick brown fox jumps over the lazy dog\n"
+                .repeat(300)
+                .into_bytes(),
         ];
         // property sweep: random lengths, random alphabet sizes
         let mut r = rng(99);
@@ -532,7 +542,10 @@ mod tests {
         let (c, rep) = compress_report(&x, &h).unwrap();
         assert_eq!(rep.pick, Arm::CramLossy);
         let y = f32s(&decompress(&c).unwrap());
-        assert!(v.iter().zip(&y).all(|(a, b)| ((a - b) as f64).abs() <= 1e-3));
+        assert!(v
+            .iter()
+            .zip(&y)
+            .all(|(a, b)| ((a - b) as f64).abs() <= 1e-3));
         // wrong dims fail
         let bad = Hint::F32Field {
             dims: vec![3],
@@ -573,7 +586,10 @@ mod tests {
             }
         }
         assert_eq!(decompress(b"nope"), Err(Error::BadMagic));
-        assert_eq!(decompress(b"CRM1\x09\x00\0\0\0\0"), Err(Error::UnknownMethod(9)));
+        assert_eq!(
+            decompress(b"CRM1\x09\x00\0\0\0\0"),
+            Err(Error::UnknownMethod(9))
+        );
         assert_eq!(decompress(b"CRM1\x00\xff"), Err(Error::Truncated));
     }
 

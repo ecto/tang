@@ -146,7 +146,10 @@ fn main() {
             let t = Instant::now();
             let y = container::decompress(&c).unwrap();
             let de = t.elapsed().as_secs_f64();
-            assert!(!rep.pick.is_lossless() || y == x, "container did not round-trip");
+            assert!(
+                !rep.pick.is_lossless() || y == x,
+                "container did not round-trip"
+            );
             println!(
                 "{name},cram,{},{},{:.4},{:.2},{:.2},{}",
                 x.len(),
