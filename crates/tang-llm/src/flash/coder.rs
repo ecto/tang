@@ -1155,7 +1155,7 @@ impl Coder {
     /// scratch. [`prefill_wide`](Self::prefill_wide) uses it.
     pub fn enable_wide(&mut self, rows: usize) -> Result<()> {
         ensure!(
-            (2 * MAX_T..=512).contains(&rows),
+            (2 * MAX_T..=4096).contains(&rows),
             "wide windows of {rows} rows"
         );
         if self.wide.as_ref().is_some_and(|w| w.rows == rows) {
