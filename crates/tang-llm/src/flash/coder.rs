@@ -50,7 +50,9 @@ pub const MAX_T: usize = fl::MAX_T;
 /// Sequences one engine holds at once (slot 0 is the one the single-sequence API uses).
 pub const MAX_SLOTS: usize = 16;
 /// u32s of the per-row record staged with each window: positions, slots, then segments.
-const ROWS_U32: usize = 6 * MAX_T;
+/// u32s of the per-row record per window row (positions, slots, segments).
+const ROWS_PER_T: usize = 6;
+const ROWS_U32: usize = ROWS_PER_T * MAX_T;
 
 /// Options of a [`Coder`] load.
 #[derive(Clone, Debug)]
@@ -276,6 +278,90 @@ struct Kern {
     argmax2: Fun,
 }
 
+impl Kern {
+    /// The Coder kernels (`cm`'s) from another build of the Coder source (the wide prefill
+    /// module, with more rows a window), the flash and engine kernels shared with `self`.
+    fn with_coder_module(&self, cm: Module) -> Result<Kern> {
+        let f = |n: &str| cm.func(n).map_err(|e| anyhow!("{n}: {e}"));
+        let k = Kern {
+            q8: f("fe_q8")?,
+            gemv8: self.gemv8,
+            gemvk: self.gemvk,
+            gemvk1: self.gemvk1,
+            gemvk2: self.gemvk2,
+            gemvk8: self.gemvk8,
+            norm_q8: f("cx_norm_q8")?,
+            route: f("cx_route")?,
+            moe_gu: f("cx_moe_gu")?,
+            silu_q: f("cx_silu_q")?,
+            moe_down: f("cx_moe_down")?,
+            moe_plan: f("cx_moe_plan_w")?,
+            moe_gu_d: [f("cx_moe_gu_d2")?, f("cx_moe_gu_d4")?],
+            moe_down_d: [f("cx_moe_down_d2")?, f("cx_moe_down_d4")?],
+            moe_down_df: [f("cx_moe_down_d2f")?, f("cx_moe_down_d4f")?],
+            moe_gu_db: f("cx_moe_gu_db")?,
+            moe_down_db: f("cx_moe_down_db")?,
+            moe_gu_g: f("cx_moe_gu_g")?,
+            moe_down_g: f("cx_moe_down_g")?,
+            moe_add_norm: f("cx_moe_add_norm")?,
+            prep: f("cx_attn_prep")?,
+            part: f("cx_attn_part")?,
+            merge: f("cx_attn_merge")?,
+            gdn_step: self.gdn_step,
+            gdn_commit: self.gdn_commit,
+            gdn_step_seg: self.gdn_step_seg,
+            gdn_commit_seg: self.gdn_commit_seg,
+            copy: self.copy,
+            argmax1: self.argmax1,
+            argmax2: self.argmax2,
+            _mods: vec![cm],
+        };
+        k.set_smem()?;
+        Ok(k)
+    }
+
+    /// Up to 200 KB of staged expert rows, capped at what the device allows a block (99 KB on
+    /// sm_86/89, 227 KB on sm_90), so the engine also loads on smaller GPUs.
+    fn set_smem(&self) -> Result<()> {
+        let smem_max = {
+            let mut v = 0i32;
+            unsafe {
+                cudarc::driver::sys::cuDeviceGetAttribute(
+                    &mut v,
+                    cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+                    0,
+                )
+            };
+            if v > 0 {
+                v.min(200 * 1024)
+            } else {
+                99 * 1024
+            }
+        };
+        for f in [
+            self.moe_gu,
+            self.moe_down,
+            self.moe_gu_g,
+            self.moe_down_g,
+            self.moe_gu_db,
+            self.moe_down_db,
+        ] {
+            unsafe {
+                gpu::check(
+                    cudarc::driver::sys::cuFuncSetAttribute(
+                        f,
+                        cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        smem_max,
+                    ),
+                    "cuFuncSetAttribute",
+                )
+                .map_err(|e| anyhow!("{e}"))?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Per-window scratch, sized for `MAX_T`.
 struct Scratch {
     ctl: B,
@@ -305,6 +391,56 @@ struct Scratch {
     amax: B,
 }
 
+impl Scratch {
+    /// Window scratch for windows of up to `rows` rows (`MAX_T`, or the wide prefill width),
+    /// attention partials for `attn_rows` of them at a time.
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        dev: &CudaComputeDevice,
+        hp: &Hparams,
+        geo: &Geometry,
+        kmax: usize,
+        max_ctx: usize,
+        rows: usize,
+        attn_rows: usize,
+    ) -> Self {
+        let np = rows * (hp.n_expert_used + 1);
+        let nchunk_max = max_ctx / ck::attn_chunk();
+        let z = |n: usize| dev.alloc_f32(n);
+        let xq_words = |k: usize| (rows * k + rows * k / 32 * 4).div_ceil(4);
+        let n = hp.n_embd;
+        Scratch {
+            ctl: z(8),
+            rows: z(ROWS_PER_T * rows),
+            r: z(rows * n),
+            x: z(rows * n),
+            // The dense GEMVs' own int8 staging: at most MAX_T rows a call, whatever the window.
+            xq8: z((MAX_T * kmax + MAX_T * kmax / 32 * 4).div_ceil(4)),
+            mxq: z(xq_words(n)),
+            mix: z(rows * n),
+            y: z(rows * geo.gdn_v()),
+            q: z(rows * hp.n_head * hp.head_dim),
+            part: z(attn_rows
+                * hp.n_head_kv
+                * nchunk_max
+                * (hp.n_head / hp.n_head_kv)
+                * (hp.head_dim + 2)),
+            attn: z(rows * hp.n_head * hp.head_dim),
+            lg: z(rows * (hp.n_expert + 1)),
+            ids: z(rows * hp.n_expert_used),
+            w: z(rows * hp.n_expert_used),
+            egu: z(np * 2 * hp.n_ff_exp),
+            plan: z(2 * (2 + 2 * np)),
+            hq: z((np * hp.n_ff_exp + np * hp.n_ff_exp / 32 * 4).div_ceil(4)),
+            parts: z(np * n),
+            moe_y: z(rows * n),
+            head: z(MAX_T * hp.n_vocab),
+            out_ids: z(MAX_T),
+            amax: z(MAX_T * 64 * 2),
+        }
+    }
+}
+
 /// Pinned staging: control words and embeddings in, sampled ids out.
 struct Io {
     arena: HostArena,
@@ -316,12 +452,13 @@ impl Io {
     const IDS: usize = 128;
     const EMB: usize = 256;
 
-    fn bytes(hidden: usize) -> usize {
-        Self::rows(hidden) + ROWS_U32 * 4
+    /// Bytes for windows of up to `rows` rows: control words, embeddings, the row record.
+    fn bytes(hidden: usize, rows: usize) -> usize {
+        Self::rows(hidden, rows) + ROWS_PER_T * rows * 4
     }
     /// Where the per-row record sits (after the embeddings).
-    fn rows(hidden: usize) -> usize {
-        Self::EMB + MAX_T * hidden * 4
+    fn rows(hidden: usize, rows: usize) -> usize {
+        Self::EMB + rows * hidden * 4
     }
     fn ptr(&self, off: usize) -> *mut u8 {
         unsafe { self.arena.as_ptr().add(off) }
@@ -335,6 +472,21 @@ impl Io {
         unsafe { std::slice::from_raw_parts_mut(self.ptr(off) as *mut u32, n) }
     }
 }
+
+/// Wide prefill windows (up to `rows` tokens of one sequence a window): the Coder kernels built
+/// for that many rows, their scratch and pinned staging, and one projection buffer the GDN and
+/// attention layers share (prefill windows never verify, so no layer needs its own kept).
+struct Wide {
+    rows: usize,
+    s: Scratch,
+    k: Kern,
+    io: Io,
+    proj: B,
+}
+
+/// Attention partials are computed this many rows of a wide window at a time (their scratch
+/// grows with rows × context).
+const WIDE_ATTN_ROWS: usize = 32;
 
 /// A sequence past slot 0: its own recurrent state, conv history and K/V caches (per layer:
 /// `gdn` for GDN layers, `kv` for attention layers), and its tokens.
@@ -377,6 +529,13 @@ pub struct Coder {
     pub tokens: Vec<u32>,
     /// Sequences past slot 0: their state buffers and tokens (`None`: free).
     slots: Vec<Option<Slot>>,
+    /// Wide prefill (`enable_wide`), and whether the window being enqueued is a wide one (the
+    /// window functions then read `wide`'s scratch, kernels and staging), with its first position.
+    wide: Option<Wide>,
+    in_wide: std::cell::Cell<bool>,
+    wide_pos0: std::cell::Cell<usize>,
+    /// The Coder kernels' shapes (for building the wide module).
+    shapes: Shapes,
     pub seed: u32,
     pub temperature: f32,
     pub use_graphs: bool,
@@ -610,45 +769,19 @@ impl Coder {
             .into_iter()
             .max()
             .unwrap();
-        let np = MAX_T * (hp.n_expert_used + 1);
-        let nchunk_max = max_ctx / ck::attn_chunk();
-        let z = |n: usize| dev.alloc_f32(n);
-        let xq_words = |k: usize| (MAX_T * k + MAX_T * k / 32 * 4).div_ceil(4);
-        let s = Scratch {
-            ctl: z(8),
-            rows: z(ROWS_U32),
-            r: z(MAX_T * n),
-            x: z(MAX_T * n),
-            xq8: z(xq_words(kmax)),
-            mxq: z(xq_words(n)),
-            mix: z(MAX_T * n),
-            y: z(MAX_T * geo.gdn_v()),
-            q: z(MAX_T * hp.n_head * hp.head_dim),
-            part: z(MAX_T
-                * hp.n_head_kv
-                * nchunk_max
-                * (hp.n_head / hp.n_head_kv)
-                * (hp.head_dim + 2)),
-            attn: z(MAX_T * hp.n_head * hp.head_dim),
-            lg: z(MAX_T * (hp.n_expert + 1)),
-            ids: z(MAX_T * hp.n_expert_used),
-            w: z(MAX_T * hp.n_expert_used),
-            egu: z(np * 2 * hp.n_ff_exp),
-            plan: z(2 * (2 + 2 * np)),
-            hq: z((np * hp.n_ff_exp + np * hp.n_ff_exp / 32 * 4).div_ceil(4)),
-            parts: z(np * n),
-            moe_y: z(MAX_T * n),
-            head: z(MAX_T * hp.n_vocab),
-            out_ids: z(MAX_T),
-            amax: z(MAX_T * 64 * 2),
-        };
+        let s = Scratch::new(&dev, &hp, &geo, kmax, max_ctx, MAX_T, MAX_T);
         dev.sync();
         let t_weights = t1.elapsed().as_secs_f64();
         let (free1, _) = gpu.mem_info().map_err(|e| anyhow!("{e}"))?;
 
         // ---- kernels
         let t2 = Instant::now();
-        let src = format!("{}{}{}", ck::prelude(&sh), kernels::GEMV_SRC, ck::SRC);
+        let src = format!(
+            "{}{}{}",
+            ck::prelude(&sh, MAX_T),
+            kernels::GEMV_SRC,
+            ck::SRC
+        );
         let cm = gpu
             .module(&src)
             .map_err(|e| anyhow!("coder kernels: {e}"))?;
@@ -729,48 +862,12 @@ impl Coder {
             argmax2: f(&em, "fe_argmax2")?,
             _mods: vec![cm, fm, em],
         };
-        // Up to 200 KB of staged expert rows, capped at what the device allows a block (99 KB on
-        // sm_86/89, 227 KB on sm_90), so the engine also loads on smaller GPUs.
-        let smem_max = {
-            let mut v = 0i32;
-            unsafe {
-                cudarc::driver::sys::cuDeviceGetAttribute(
-                    &mut v,
-                    cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
-                    0,
-                )
-            };
-            if v > 0 {
-                v.min(200 * 1024)
-            } else {
-                99 * 1024
-            }
-        };
-        for f in [
-            k.moe_gu,
-            k.moe_down,
-            k.moe_gu_g,
-            k.moe_down_g,
-            k.moe_gu_db,
-            k.moe_down_db,
-        ] {
-            unsafe {
-                gpu::check(
-                    cudarc::driver::sys::cuFuncSetAttribute(
-                        f,
-                        cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                        smem_max,
-                    ),
-                    "cuFuncSetAttribute",
-                )
-                .map_err(|e| anyhow!("{e}"))?;
-            }
-        }
+        k.set_smem()?;
         let t_kernels = t2.elapsed().as_secs_f64();
 
         let mut io = Io {
             arena: HostArena::new(
-                Io::bytes(n),
+                Io::bytes(n, MAX_T),
                 ArenaOptions {
                     try_hugetlb: false,
                     thp: false,
@@ -823,6 +920,10 @@ impl Coder {
             tokens: Vec::new(),
             greedy: std::cell::Cell::new(true),
             slots: (0..MAX_SLOTS).map(|_| None).collect(),
+            wide: None,
+            in_wide: std::cell::Cell::new(false),
+            wide_pos0: std::cell::Cell::new(0),
+            shapes: sh.clone(),
             seed: 0,
             temperature: 0.0,
             use_graphs: true,
@@ -961,8 +1062,9 @@ impl Coder {
     /// Stage a window of rows `(slot, position, token)` in segments `[start, len, slot, keep]`.
     fn stage_rows(&mut self, rows: &[(usize, usize, u32)], segs: &[[u32; 4]]) -> Result<()> {
         let t = rows.len();
-        ensure!((1..=MAX_T).contains(&t) && segs.len() <= MAX_T);
-        let ctl = self.io.u32s(Io::CTL, 5);
+        let tw = self.tw();
+        ensure!((1..=tw).contains(&t) && segs.len() <= tw);
+        let ctl = self.iox().u32s(Io::CTL, 5);
         ctl[0] = rows[0].1 as u32;
         ctl[1] = t as u32;
         ctl[2] = self.counter;
@@ -970,19 +1072,19 @@ impl Coder {
         ctl[4] = self.temperature.to_bits();
         let n = self.hp.n_embd;
         let emb_t = self.g.info("token_embd.weight")?.clone();
-        let emb = self.io.f32s(Io::EMB, t * n);
+        let emb = self.iox().f32s(Io::EMB, t * n);
         for (i, r) in rows.iter().enumerate() {
             let row = self.g.rows(&emb_t, r.2 as usize, 1)?;
             emb[i * n..(i + 1) * n].copy_from_slice(&row);
         }
-        let rec = self.io.u32s(Io::rows(n), ROWS_U32);
+        let rec = self.iox().u32s(Io::rows(n, tw), ROWS_PER_T * tw);
         rec.fill(0);
         for (i, r) in rows.iter().enumerate() {
             rec[i] = r.1 as u32;
-            rec[MAX_T + i] = r.0 as u32;
+            rec[tw + i] = r.0 as u32;
         }
         for (b, sg) in segs.iter().enumerate() {
-            rec[2 * MAX_T + 4 * b..2 * MAX_T + 4 * b + 4].copy_from_slice(sg);
+            rec[2 * tw + 4 * b..2 * tw + 4 * b + 4].copy_from_slice(sg);
         }
         Ok(())
     }
@@ -1016,6 +1118,127 @@ impl Coder {
             pos += t;
         }
         Ok(next)
+    }
+
+    /// Build the wide prefill path: windows of up to `rows` tokens (16..=512; 256 is the
+    /// target). Compiles the Coder kernels for that many rows (~1 min) and allocates their
+    /// scratch. [`prefill_wide`](Self::prefill_wide) uses it.
+    pub fn enable_wide(&mut self, rows: usize) -> Result<()> {
+        ensure!(
+            (2 * MAX_T..=512).contains(&rows),
+            "wide windows of {rows} rows"
+        );
+        if self.wide.as_ref().is_some_and(|w| w.rows == rows) {
+            return Ok(());
+        }
+        self.wide = None;
+        let src = format!(
+            "{}{}{}",
+            ck::prelude(&self.shapes, rows),
+            kernels::GEMV_SRC,
+            ck::SRC
+        );
+        let cm = self
+            .gpu
+            .module(&src)
+            .map_err(|e| anyhow!("coder kernels ({rows} rows): {e}"))?;
+        let k = self.k.with_coder_module(cm)?;
+        let n = self.hp.n_embd;
+        let s = Scratch::new(
+            &self.dev,
+            &self.hp,
+            &self.geo,
+            n,
+            self.max_ctx,
+            rows,
+            WIDE_ATTN_ROWS,
+        );
+        let mut io = Io {
+            arena: HostArena::new(
+                Io::bytes(n, rows),
+                ArenaOptions {
+                    try_hugetlb: false,
+                    thp: false,
+                },
+            )?,
+        };
+        io.arena
+            .register(&self.gpu.ctx, &[])
+            .map_err(|e| anyhow!("{e}"))?;
+        let pr = self.layers.iter().map(|l| l.w_in.rows).max().unwrap_or(0);
+        let proj = self.dev.alloc_f32(rows * pr);
+        self.dev.sync();
+        self.wide = Some(Wide {
+            rows,
+            s,
+            k,
+            io,
+            proj,
+        });
+        Ok(())
+    }
+
+    /// One wide window (staged by `stage_rows` with `in_wide` set): every layer over its `t`
+    /// rows. No head: prefill doesn't need these rows' logits.
+    fn enqueue_wide(&self, t: usize) {
+        self.enqueue_inputs(t);
+        self.norm_q8(None, &self.layers[0].attn_norm, t);
+        let nl = self.layers.len();
+        for l in 0..nl {
+            self.enqueue_mixer(l, t, false, 0, 1);
+            self.norm_q8(Some(self.a(&self.sc().mix)), &self.layers[l].post_norm, t);
+            let next = if l + 1 < nl {
+                &self.layers[l + 1].attn_norm
+            } else {
+                &self.out_norm
+            };
+            self.enqueue_moe(l, t, next, false);
+        }
+    }
+
+    /// [`prefill_slot`](Self::prefill_slot) in wide windows ([`enable_wide`](Self::enable_wide);
+    /// without it, the same as `prefill_slot`): every token but the last in windows of up to
+    /// the wide width, then the last as a normal window, which gives the next token (and the
+    /// logits) exactly as `prefill_slot` would. The state and K/V it leaves are bitwise
+    /// `prefill_slot`'s: every row's arithmetic is the narrow kernels'.
+    pub fn prefill_wide(&mut self, slot: usize, ids: &[u32]) -> Result<u32> {
+        let Some(rows) = self.wide.as_ref().map(|w| w.rows) else {
+            return self.prefill_slot(slot, ids);
+        };
+        ensure!(!ids.is_empty(), "empty prompt");
+        if ids.len() == 1 {
+            return self.prefill_slot(slot, ids);
+        }
+        let body = &ids[..ids.len() - 1];
+        let mut pos = self.slot_tokens(slot).len();
+        ensure!(
+            pos + ids.len() <= self.max_ctx,
+            "context {} > max {}",
+            pos + ids.len(),
+            self.max_ctx
+        );
+        self.slot_tokens_mut(slot)?.extend_from_slice(body);
+        let mut at = 0;
+        while at < body.len() {
+            let t = (body.len() - at).min(rows);
+            let rws: Vec<(usize, usize, u32)> = body[at..at + t]
+                .iter()
+                .enumerate()
+                .map(|(i, &k)| (slot, pos + i, k))
+                .collect();
+            self.in_wide.set(true);
+            self.wide_pos0.set(pos);
+            let r = self
+                .stage_rows(&rws, &[[0, t as u32, slot as u32, t as u32]])
+                .map(|_| self.enqueue_wide(t));
+            // The pinned staging is reused by the next window.
+            self.dev.sync();
+            self.in_wide.set(false);
+            r?;
+            pos += t;
+            at += t;
+        }
+        self.prefill_slot(slot, &ids[ids.len() - 1..])
     }
 
     /// One decode step for several sequences at once: `(slot, token)` per row, distinct
@@ -1066,6 +1289,29 @@ impl Coder {
 
     fn a(&self, b: &B) -> u64 {
         self.dev.buffer_addr(b)
+    }
+
+    /// The active window's scratch, Coder kernels, staging and row capacity: the wide set while
+    /// a wide prefill window is being enqueued, else the normal one.
+    fn wide_on(&self) -> Option<&Wide> {
+        self.wide.as_ref().filter(|_| self.in_wide.get())
+    }
+    fn sc(&self) -> &Scratch {
+        self.wide_on().map_or(&self.s, |w| &w.s)
+    }
+    fn kn(&self) -> &Kern {
+        self.wide_on().map_or(&self.k, |w| &w.k)
+    }
+    fn iox(&self) -> &Io {
+        self.wide_on().map_or(&self.io, |w| &w.io)
+    }
+    fn tw(&self) -> usize {
+        self.wide_on().map_or(MAX_T, |w| w.rows)
+    }
+    /// A layer's projection buffer, or the wide window's shared one.
+    fn proj(&self, b: &B) -> u64 {
+        self.wide_on()
+            .map_or_else(|| self.a(b), |w| self.a(&w.proj))
     }
 
     unsafe fn launch(
@@ -1183,7 +1429,10 @@ impl Coder {
     }
 
     fn io_dev(&self, off: usize) -> u64 {
-        self.io.arena.device_ptr(off).expect("io arena is mapped")
+        self.iox()
+            .arena
+            .device_ptr(off)
+            .expect("io arena is mapped")
     }
 
     /// `bytes` (a multiple of 4) from `src` to `dst` with a kernel (device or mapped host).
@@ -1213,6 +1462,24 @@ impl Coder {
         ostride: usize,
     ) {
         if self.skip(name) {
+            return;
+        }
+        // Wide windows: the same GEMV over MAX_T rows at a time, each chunk's int8 made here
+        // (fe_q8's rule, the one norm_q8 applies), so every row's sum is the one a narrow window
+        // gives it.
+        if t > MAX_T {
+            for r0 in (0..t).step_by(MAX_T) {
+                let c = MAX_T.min(t - r0);
+                self.gemv(
+                    name,
+                    w,
+                    x + (r0 * w.k * 4) as u64,
+                    None,
+                    out + (r0 * ostride * 4) as u64,
+                    c,
+                    ostride,
+                );
+            }
             return;
         }
         let (sp, ns, os, r16, ki) = (self.a(&w.segs), w.nseg, ostride as i32, w.row16, w.k as i32);
@@ -1272,18 +1539,18 @@ impl Coder {
     /// `r += y` (when given), then `s.x = rmsnorm(r) * w` and its int8 codes in `s.mxq`.
     fn norm_q8(&self, add: Option<u64>, w: &B, t: usize) {
         let (r, y, wp, x, xq, n, eps, ad) = (
-            self.a(&self.s.r),
+            self.a(&self.sc().r),
             add.unwrap_or(0),
             self.a(w),
-            self.a(&self.s.x),
-            self.a(&self.s.mxq),
+            self.a(&self.sc().x),
+            self.a(&self.sc().mxq),
             self.hp.n_embd as i32,
             self.eps,
             add.is_some() as i32,
         );
         unsafe {
             self.launch(
-                self.k.norm_q8,
+                self.kn().norm_q8,
                 (t as u32, 1, 1),
                 1024,
                 tang_moe::args![r, y, wp, x, xq, n, eps, ad],
@@ -1302,14 +1569,14 @@ impl Coder {
 
     fn enqueue_inputs(&self, t: usize) {
         self.mark("start");
-        self.kcopy(self.a(&self.s.ctl), self.io_dev(Io::CTL), 32);
+        self.kcopy(self.a(&self.sc().ctl), self.io_dev(Io::CTL), 32);
         self.kcopy(
-            self.a(&self.s.rows),
-            self.io_dev(Io::rows(self.hp.n_embd)),
-            ROWS_U32 * 4,
+            self.a(&self.sc().rows),
+            self.io_dev(Io::rows(self.hp.n_embd, self.tw())),
+            ROWS_PER_T * self.tw() * 4,
         );
         self.kcopy(
-            self.a(&self.s.r),
+            self.a(&self.sc().r),
             self.io_dev(Io::EMB),
             t * self.hp.n_embd * 4,
         );
@@ -1318,13 +1585,13 @@ impl Coder {
     /// Layer `l`'s mixer (input `s.x` / `s.mxq`) into `s.mix`.
     fn enqueue_mixer(&self, l: usize, t: usize, verify: bool, nchunk: usize, nseg: usize) {
         let layer = &self.layers[l];
-        let s = &self.s;
+        let s = self.sc();
         let (x, xq) = (self.a(&s.x), Some(self.a(&s.mxq)));
         let eps = self.eps;
         let n = self.hp.n_embd;
         if let Some(g) = &layer.gdn {
             let stride = layer.w_in.rows;
-            self.gemv("gdn_in", &layer.w_in, x, xq, self.a(&g.proj), t, stride);
+            self.gemv("gdn_in", &layer.w_in, x, xq, self.proj(&g.proj), t, stride);
             self.gdn_step_seg(g, stride, nseg, !verify);
             if !verify {
                 self.gdn_commit_seg(g, stride, nseg);
@@ -1341,10 +1608,18 @@ impl Coder {
         }
         if let Some(at) = &layer.attn {
             let stride = layer.w_in.rows;
-            self.gemv("attn_in", &layer.w_in, x, xq, self.a(&at.proj), t, stride);
+            self.gemv(
+                "attn_in",
+                &layer.w_in,
+                x,
+                xq,
+                self.proj(&at.proj),
+                t,
+                stride,
+            );
             let hp = &self.hp;
             let (proj, st, qn, kn, rc, rs, q, kt, vt, rows) = (
-                self.a(&at.proj),
+                self.proj(&at.proj),
                 stride as i32,
                 self.a(&at.qn),
                 self.a(&at.kn),
@@ -1355,26 +1630,50 @@ impl Coder {
                 self.a(&at.vtab),
                 self.a(&s.rows),
             );
-            let (part, nc, attn) = (self.a(&s.part), nchunk as i32, self.a(&s.attn));
+            let (part, attn) = (self.a(&s.part), self.a(&s.attn));
             unsafe {
                 self.launch(
-                    self.k.prep,
+                    self.kn().prep,
                     (t as u32, (hp.n_head + hp.n_head_kv) as u32, 1),
                     hp.head_dim as u32,
                     tang_moe::args![proj, st, qn, kn, rc, rs, rows, q, kt, vt, eps],
                 );
-                self.launch(
-                    self.k.part,
-                    (t as u32, hp.n_head_kv as u32, nchunk as u32),
-                    128,
-                    tang_moe::args![q, kt, vt, rows, part, nc],
+            }
+            // Partials and merge a slice of rows at a time in wide windows (the partials buffer
+            // holds WIDE_ATTN_ROWS rows), each slice over the chunks its last row reaches.
+            let slice = if self.in_wide.get() {
+                WIDE_ATTN_ROWS
+            } else {
+                t
+            };
+            let qrow = (hp.n_head * hp.head_dim * 4) as u64;
+            for r0 in (0..t).step_by(slice) {
+                let c = slice.min(t - r0);
+                let nc = if self.in_wide.get() {
+                    self.nchunk(self.wide_pos0.get() + r0 + c)
+                } else {
+                    nchunk
+                } as i32;
+                let (q0, rows0, proj0, attn0) = (
+                    q + r0 as u64 * qrow,
+                    rows + (r0 * 4) as u64,
+                    proj + (r0 * stride * 4) as u64,
+                    attn + r0 as u64 * qrow,
                 );
-                self.launch(
-                    self.k.merge,
-                    (t as u32, hp.n_head as u32, 1),
-                    hp.head_dim as u32,
-                    tang_moe::args![part, nc, proj, st, attn],
-                );
+                unsafe {
+                    self.launch(
+                        self.kn().part,
+                        (c as u32, hp.n_head_kv as u32, nc as u32),
+                        128,
+                        tang_moe::args![q0, kt, vt, rows0, part, nc],
+                    );
+                    self.launch(
+                        self.kn().merge,
+                        (c as u32, hp.n_head as u32, 1),
+                        hp.head_dim as u32,
+                        tang_moe::args![part, nc, proj0, st, attn0],
+                    );
+                }
             }
             self.gemv("attn_out", &layer.w_out, attn, None, self.a(&s.mix), t, n);
         }
@@ -1434,20 +1733,20 @@ impl Coder {
         let (stab, htab, p, sd, dt, sa, nw, y, seg, cm, eps, wc) = (
             self.a(&g.stab),
             self.a(&g.htab),
-            self.a(&g.proj),
+            self.proj(&g.proj),
             stride as u32,
             self.a(&g.dt),
             self.a(&g.a),
             self.a(&g.norm),
-            self.a(&self.s.y),
-            self.a(&self.s.rows) + (2 * MAX_T * 4) as u64,
+            self.a(&self.sc().y),
+            self.a(&self.sc().rows) + (2 * self.tw() * 4) as u64,
             commit as u32,
             self.eps,
             self.a(&g.conv),
         );
         unsafe {
             self.launch(
-                self.k.gdn_step_seg,
+                self.kn().gdn_step_seg,
                 (self.geo.gdn_hv as u32, nseg as u32, 1),
                 512,
                 tang_moe::args![stab, htab, p, sd, dt, sa, nw, y, seg, cm, eps, wc],
@@ -1458,13 +1757,13 @@ impl Coder {
     fn gdn_commit_seg(&self, g: &GdnL, stride: usize, nseg: usize) {
         let (htab, p, sd, seg) = (
             self.a(&g.htab),
-            self.a(&g.proj),
+            self.proj(&g.proj),
             stride as u32,
-            self.a(&self.s.rows) + (2 * MAX_T * 4) as u64,
+            self.a(&self.sc().rows) + (2 * self.tw() * 4) as u64,
         );
         unsafe {
             self.launch(
-                self.k.gdn_commit_seg,
+                self.kn().gdn_commit_seg,
                 (self.geo.gdn_conv().div_ceil(256) as u32, nseg as u32, 1),
                 256,
                 tang_moe::args![htab, p, sd, seg],
@@ -1478,7 +1777,7 @@ impl Coder {
     /// `keep_y`.
     fn enqueue_moe(&self, l: usize, t: usize, next: &B, keep_y: bool) {
         let layer = &self.layers[l];
-        let (s, hp) = (&self.s, &self.hp);
+        let (s, hp) = (self.sc(), &self.hp);
         let (ne, kk) = (hp.n_expert, hp.n_expert_used);
         let (x, mxq) = (self.a(&s.x), self.a(&s.mxq));
         let ls = ne + 1;
@@ -1506,7 +1805,7 @@ impl Coder {
             self.gemv("router", &layer.router, x, Some(mxq), lg, t, ls);
             unsafe {
                 self.launch(
-                    self.k.route,
+                    self.kn().route,
                     (t as u32, 1, 1),
                     32,
                     tang_moe::args![lg, lsi, ids, w, scale],
@@ -1518,7 +1817,7 @@ impl Coder {
             self.gemv("router", &layer.router, x, Some(mxq), lg, t, ls);
             unsafe {
                 self.launch(
-                    self.k.route,
+                    self.kn().route,
                     (t as u32, 1, 1),
                     32,
                     tang_moe::args![lg, lsi, ids, w, scale],
@@ -1529,7 +1828,7 @@ impl Coder {
         let parts = self.a(&s.parts);
         unsafe {
             self.launch(
-                self.k.moe_add_norm,
+                self.kn().moe_add_norm,
                 (t as u32, 1, 1),
                 1024,
                 tang_moe::args![r, parts, w, lg, lsi, ti, yo, wn, xo, mxq, eps],
@@ -1543,7 +1842,7 @@ impl Coder {
         if n == 0 {
             return;
         }
-        let (s, hp) = (&self.s, &self.hp);
+        let (s, hp) = (self.sc(), &self.hp);
         let (nh, ff) = (hp.n_embd, hp.n_ff_exp);
         let (gw, uw, dw) = (layer.gate.w, layer.up.w, layer.down.w);
         let (sg, su, sd) = (layer.sh_gate.w, layer.sh_up.w, layer.sh_down.w);
@@ -1562,24 +1861,24 @@ impl Coder {
             pbase as i32,
         );
         let np = n as u32;
-        if self.var.grouped {
+        if self.var.grouped || self.in_wide.get() {
             // One plan region per stream (the side stream's call is the one past the routed pairs).
-            let pw = 2 + 2 * MAX_T * (hp.n_expert_used + 1);
+            let pw = 2 + 2 * self.tw() * (hp.n_expert_used + 1);
             let plan = self.a(&s.plan) + if pbase > 0 { (pw * 4) as u64 } else { 0 };
             let ni = n as i32;
             let groups = n.min(hp.n_expert + 1) as u32;
             unsafe {
                 self.launch_on(
                     stream,
-                    self.k.moe_plan,
+                    self.kn().moe_plan,
                     (1, 1, 1),
-                    128,
+                    if self.in_wide.get() { 1024 } else { 128 },
                     0,
                     tang_moe::args![ids, ti, pb, ni, plan],
                 );
                 self.launch_on(
                     stream,
-                    self.k.moe_gu_g,
+                    self.kn().moe_gu_g,
                     ((2 * ff / 16) as u32, groups, 1),
                     256,
                     (16 * 16 * r16g) as u32,
@@ -1587,7 +1886,7 @@ impl Coder {
                 );
                 self.launch_on(
                     stream,
-                    self.k.silu_q,
+                    self.kn().silu_q,
                     ((ff / 32) as u32, np, 1),
                     32,
                     0,
@@ -1595,7 +1894,7 @@ impl Coder {
                 );
                 self.launch_on(
                     stream,
-                    self.k.moe_down_g,
+                    self.kn().moe_down_g,
                     ((nh / 16) as u32, groups, 1),
                     256,
                     (16 * 16 * r16d) as u32,
@@ -1611,19 +1910,19 @@ impl Coder {
             v => v,
         };
         let (gu_f, down_f, rows, smem_g, smem_d) = match moe {
-            2 => (self.k.moe_gu_d[0], self.k.moe_down_d[0], 16, 0, 0),
-            4 => (self.k.moe_gu_d[1], self.k.moe_down_d[1], 32, 0, 0),
+            2 => (self.kn().moe_gu_d[0], self.kn().moe_down_d[0], 16, 0, 0),
+            4 => (self.kn().moe_gu_d[1], self.kn().moe_down_d[1], 32, 0, 0),
             // Double-buffered: 8 warps × 2 rows × 4 groups a block, two buffers.
             8 => (
-                self.k.moe_gu_db,
-                self.k.moe_down_db,
+                self.kn().moe_gu_db,
+                self.kn().moe_down_db,
                 64,
                 (2 * 16 * 16 * r16g) as u32,
                 (2 * 16 * 16 * r16d) as u32,
             ),
             _ => (
-                self.k.moe_gu,
-                self.k.moe_down,
+                self.kn().moe_gu,
+                self.kn().moe_down,
                 16,
                 (16 * 16 * r16g) as u32,
                 (16 * 16 * r16d) as u32,
@@ -1640,7 +1939,7 @@ impl Coder {
             );
             // The direct down kernels can make SiLU(gate) * up's int8 themselves.
             if self.var.fuse_silu && (moe == 2 || moe == 4) {
-                let df = self.k.moe_down_df[usize::from(moe == 4)];
+                let df = self.kn().moe_down_df[usize::from(moe == 4)];
                 self.launch_on(
                     stream,
                     df,
@@ -1653,7 +1952,7 @@ impl Coder {
             }
             self.launch_on(
                 stream,
-                self.k.silu_q,
+                self.kn().silu_q,
                 ((ff / 32) as u32, np, 1),
                 32,
                 0,
@@ -1811,7 +2110,7 @@ impl Coder {
             emb[i * n..(i + 1) * n].copy_from_slice(&row);
         }
         // One sequence (slot 0): rows at pos0.., one segment keeping all of them.
-        let rows = self.io.u32s(Io::rows(n), ROWS_U32);
+        let rows = self.io.u32s(Io::rows(n, MAX_T), ROWS_U32);
         rows.fill(0);
         for i in 0..t {
             rows[i] = (pos0 + i) as u32;

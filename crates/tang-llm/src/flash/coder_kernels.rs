@@ -6,13 +6,14 @@
 //! reduction orders at any `t`), so a token's outputs are bitwise the same in a T=1 window, a
 //! T=8 window and a verify window (`flash-tcheck`).
 
-/// The `#define` prelude for a model's shapes.
-pub fn prelude(c: &Shapes) -> String {
+/// The `#define` prelude for a model's shapes, for windows of up to `maxt` rows (`MAX_T`, or the
+/// wide prefill width, which also sets the int8 activation layout `XQ8_T`).
+pub fn prelude(c: &Shapes, maxt: usize) -> String {
     format!(
         "#define CX_HID {hid}\n#define CX_NH {nh}\n#define CX_NKV {nkv}\n#define CX_HD {hd}\n\
          #define CX_ROT {rot}\n#define CX_G {g}\n#define CX_QK {qk}\n#define CX_QV {qv}\n\
          #define CX_FF {ff}\n#define CX_TOPK {topk}\n#define CX_NE {ne}\n#define CX_NP {np}\n\
-         #define CX_CHUNK {chunk}\n#define CX_MAXT {maxt}\n",
+         #define CX_CHUNK {chunk}\n#define CX_MAXT {maxt}\n#define XQ8_T {maxt}\n",
         hid = c.hidden,
         nh = c.n_head,
         nkv = c.n_kv,
@@ -24,9 +25,9 @@ pub fn prelude(c: &Shapes) -> String {
         ff = c.ff,
         topk = c.topk,
         ne = c.n_expert,
-        np = super::coder::MAX_T * (c.topk + 1),
+        np = maxt * (c.topk + 1),
         chunk = attn_chunk(),
-        maxt = super::coder::MAX_T,
+        maxt = maxt,
     )
 }
 
@@ -664,6 +665,39 @@ extern "C" __global__ void cx_moe_plan(const unsigned* ids, int T, int pbase, in
         for (int j = 0; j < n; j++) ng += first[j];
         plan[0] = (unsigned)ng;
         plan[1 + ng] = (unsigned)n;
+    }
+}
+
+// cx_moe_plan for many pairs (wide prefill windows, up to CX_NP): one block of 1024 threads,
+// an expert histogram, a prefix over the keys, then a scatter. Pairs within a group land in any
+// order, which can't change a result (each pair's dot is its own). Same plan layout.
+extern "C" __global__ void __launch_bounds__(1024) cx_moe_plan_w(const unsigned* ids, int T, int pbase, int n, unsigned* plan) {
+    __shared__ int cnt[CX_NE + 1], start[CX_NE + 1], gid[CX_NE + 1], fill[CX_NE + 1];
+    __shared__ int ng;
+    for (int k = threadIdx.x; k <= CX_NE; k += blockDim.x) { cnt[k] = 0; fill[k] = 0; }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const int p = pbase + i;
+        atomicAdd(&cnt[p >= T * CX_TOPK ? CX_NE : (int)ids[p]], 1);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int at = 0, g = 0;
+        for (int k = 0; k <= CX_NE; k++) {
+            start[k] = at;
+            gid[k] = g;
+            if (cnt[k] > 0) { plan[1 + g] = (unsigned)at; g++; }
+            at += cnt[k];
+        }
+        ng = g;
+        plan[0] = (unsigned)g;
+        plan[1 + g] = (unsigned)n;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const int p = pbase + i;
+        const int k = p >= T * CX_TOPK ? CX_NE : (int)ids[p];
+        plan[CX_PLAN_LIST + start[k] + atomicAdd(&fill[k], 1)] = (unsigned)p;
     }
 }
 

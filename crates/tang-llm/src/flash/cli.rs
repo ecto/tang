@@ -1397,6 +1397,85 @@ pub fn spec_test(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `flash-wide-check` (qwen3next): wide prefill against normal prefill. The prompt cycled to
+/// `--ctx` tokens (default 1000) is prefilled into one slot with `prefill_slot` (windows of
+/// `MAX_T`) and into another with `prefill_wide` (windows of `TANG_CODER_WIDE` rows, default
+/// 256), then each decodes `-n` greedy tokens: tokens and logits must be bitwise equal. Prints
+/// both prefills' times (the wide one twice: the first run warms it).
+pub fn wide_check(args: &[String]) -> Result<()> {
+    let mut a = parse(args)?;
+    let base = prompt_ids(&a)?;
+    let len = a.ctx.unwrap_or(1000);
+    let ids: Vec<u32> = base.iter().cycle().take(len).copied().collect();
+    let steps = a.n.max(4);
+    if a.opts.max_ctx < len + steps + 8 {
+        a.opts.max_ctx = (len + steps + 8).next_multiple_of(1024);
+    }
+    let rows: usize = std::env::var("TANG_CODER_WIDE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256);
+    let mut e = load_coder(&a)?;
+    ensure!(e.temperature == 0.0, "wide-check is greedy");
+    let decode = |e: &mut Coder, slot: usize, mut next: u32| -> Result<(Vec<u32>, Vec<f32>)> {
+        let (mut toks, mut lg) = (Vec::new(), Vec::new());
+        for _ in 0..steps {
+            next = e.decode_batch(&[(slot, next)])?[0];
+            lg.extend_from_slice(&e.logits(1));
+            toks.push(next);
+        }
+        Ok((toks, lg))
+    };
+    let s1 = e.alloc_slot()?;
+    let t0 = std::time::Instant::now();
+    let n1 = e.prefill_slot(s1, &ids)?;
+    let narrow = t0.elapsed().as_secs_f64();
+    let (t1, l1) = decode(&mut e, s1, n1)?;
+    e.free_slot(s1);
+    let t0 = std::time::Instant::now();
+    e.enable_wide(rows)?;
+    println!(
+        "wide kernels ({rows} rows) built in {:.1} s",
+        t0.elapsed().as_secs_f64()
+    );
+    let mut wide = Vec::new();
+    let mut got = None;
+    for _ in 0..2 {
+        let s2 = e.alloc_slot()?;
+        let t0 = std::time::Instant::now();
+        let n2 = e.prefill_wide(s2, &ids)?;
+        wide.push(t0.elapsed().as_secs_f64());
+        if got.is_none() {
+            got = Some((n2, decode(&mut e, s2, n2)?));
+        }
+        e.free_slot(s2);
+    }
+    let (n2, (t2, l2)) = got.unwrap();
+    let bits = l1
+        .iter()
+        .zip(&l2)
+        .filter(|(x, y)| x.to_bits() != y.to_bits())
+        .count();
+    let ok = n1 == n2 && t1 == t2 && bits == 0;
+    println!(
+        "prefill {len} tokens: narrow {:.2} s ({:.0} tok/s), wide {:.2} s cold / {:.2} s warm ({:.0} tok/s)",
+        narrow,
+        len as f64 / narrow,
+        wide[0],
+        wide[1],
+        len as f64 / wide[1]
+    );
+    println!(
+        "wide-check: {} (next token {}, {steps} decoded tokens {}, logits differ in {bits} of {})",
+        if ok { "PASS (bitwise)" } else { "FAIL" },
+        if n1 == n2 { "equal" } else { "DIFFERS" },
+        if t1 == t2 { "equal" } else { "DIFFER" },
+        l1.len()
+    );
+    ensure!(ok, "wide-check failed");
+    Ok(())
+}
+
 /// `flash-batch-check` (qwen3next): is a sequence's output independent of the batch it decodes
 /// in? Up to 8 sequences (the prompt truncated by different amounts, so their positions differ)
 /// each decode `-n` greedy tokens alone, then all together in one batched step per token, with
