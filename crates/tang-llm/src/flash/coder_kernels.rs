@@ -791,6 +791,189 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_down_g(ExW d, ExW sd, c
     moe_down_grouped_body<2>(d, sd, ids, hq, out, T, r16, fast, plan);
 }
 
+// ---- grouped expert GEMM on tensor cores (wide prefill) ----
+//
+// The grouped kernels above decode an expert's weights once per (token, expert) pair; at wide
+// windows that decode is the cost. Here each warp decodes a 16-row × 16-column weight tile once
+// (decode8i, plain order) and multiplies it by up to 64 of the group's tokens with int8 MMA
+// (mma.sync m16n8k16, s8 × s8 → s32), then applies the row's sub-block scale (and min) and the
+// token's activation scale per 16 columns, accumulating in f32. Not the GEMV's summation order:
+// gated against narrow prefill by greedy tokens and KL, not bitwise. Same plan as cx_moe_gu_g.
+// Grid (rows / 128, groups, 64-token tiles), block 256 (8 warps × 16 rows).
+__device__ __forceinline__ void mma_s8_16816(int* d, int a0, int a1, unsigned b0) {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%7,%7,%7};\n"
+                 : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+                 : "r"(a0), "r"(a1), "r"(b0), "r"(0));
+#else
+    d[0] = d[1] = d[2] = d[3] = 0;
+#endif
+}
+
+// One warp: rows wa / wb (16 apart... rows g and g + 8 of its tile) of a K-wide matrix against
+// the activation rows `xrow(c, n)` (int8 codes, scales xd per 32 columns) of up to nch chunks of
+// 8 columns; acc[c][0..1] = rows g × columns 2 tig, 2 tig + 1, acc[c][2..3] = row g + 8.
+template <int TY, int K>
+__device__ __forceinline__ void gemm_tile(const unsigned char* wa, const unsigned char* wb,
+                                          const unsigned char* const* xrow, const float* const* xd, int nch,
+                                          float acc[8][4]) {
+    const int lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
+    for (int k0 = 0; k0 < K; k0 += 16) {
+        int w0, w1;
+        float dwa, mwa, dwb, mwb;
+        const int e0 = k0 + 8 * (tig >> 1);
+        decode8i<TY>(wa, e0, w0, w1, dwa, mwa);
+        const int a0 = (tig & 1) ? w1 : w0;
+        decode8i<TY>(wb, e0, w0, w1, dwb, mwb);
+        const int a1 = (tig & 1) ? w1 : w0;
+        #pragma unroll
+        for (int c = 0; c < 8; c++) {
+            if (c >= nch) break;
+            const unsigned char* xr = xrow[c];  // this lane's B column (token g of chunk c)
+            const unsigned b0 = xr ? *(const unsigned*)(xr + k0 + 4 * tig) : 0u;
+            int d[4];
+            mma_s8_16816(d, a0, a1, b0);
+            int sx = __dp4a((int)b0, 0x01010101, 0);
+            sx += __shfl_xor_sync(0xffffffffu, sx, 1);
+            sx += __shfl_xor_sync(0xffffffffu, sx, 2);
+            #pragma unroll
+            for (int j = 0; j < 2; j++) {
+                const int col = 2 * tig + j;
+                const int sxc = __shfl_sync(0xffffffffu, sx, col * 4);
+                const float* xdc = xd[c * 8 + col];
+                const float dx = xdc ? xdc[k0 / 32] : 0.f;
+                if (TY == 12 || TY == 13) {
+                    acc[c][j] = fmaf(dx, fmaf(dwa, i2f(d[j]), -mwa * i2f(sxc)), acc[c][j]);
+                    acc[c][2 + j] = fmaf(dx, fmaf(dwb, i2f(d[2 + j]), -mwb * i2f(sxc)), acc[c][2 + j]);
+                } else {
+                    acc[c][j] = fmaf(dx * dwa, i2f(d[j]), acc[c][j]);
+                    acc[c][2 + j] = fmaf(dx * dwb, i2f(d[2 + j]), acc[c][2 + j]);
+                }
+            }
+        }
+    }
+}
+
+template <int K>
+__device__ __forceinline__ void gemm_tile_any(int ty, const unsigned char* wa, const unsigned char* wb,
+                                              const unsigned char* const* xrow, const float* const* xd, int nch,
+                                              float acc[8][4]) {
+    switch (ty) {
+        case 12: gemm_tile<12, K>(wa, wb, xrow, xd, nch, acc); break;
+        case 13: gemm_tile<13, K>(wa, wb, xrow, xd, nch, acc); break;
+        case 14: gemm_tile<14, K>(wa, wb, xrow, xd, nch, acc); break;
+        case 8: gemm_tile<8, K>(wa, wb, xrow, xd, nch, acc); break;
+        case 11: gemm_tile<11, K>(wa, wb, xrow, xd, nch, acc); break;
+        case 2: gemm_tile<2, K>(wa, wb, xrow, xd, nch, acc); break;
+        case 20: gemm_tile<20, K>(wa, wb, xrow, xd, nch, acc); break;
+        case 6: gemm_tile<6, K>(wa, wb, xrow, xd, nch, acc); break;
+        case 23: gemm_tile<23, K>(wa, wb, xrow, xd, nch, acc); break;
+        case 42: gemm_tile<42, K>(wa, wb, xrow, xd, nch, acc); break;
+        default: break;
+    }
+}
+
+// Gate|up: rows of [gate; up] (2 FF), K = hidden, columns the group's tokens (xq rows).
+extern "C" __global__ void __launch_bounds__(256) cx_moe_gemm_gu(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
+                                                                 const unsigned char* xq, float* out, int T,
+                                                                 const unsigned* plan) {
+    __shared__ const unsigned char* xrow_s[64];
+    __shared__ const float* xd_s[64];
+    __shared__ int pair_s[64];
+    const int gi = blockIdx.y;
+    if (gi >= (int)plan[0]) return;
+    const int a = plan[1 + gi], b = plan[2 + gi];
+    const int m0 = a + blockIdx.z * 64;
+    if (m0 >= b) return;
+    const int cnt = min(64, b - m0), nch = (cnt + 7) / 8;
+    const int p0 = plan[CX_PLAN_LIST + a];
+    const bool shared = p0 >= T * CX_TOPK;
+    const unsigned e = shared ? 0u : ids[p0];
+    const float* xdb = (const float*)(xq + (size_t)XQ8_T * CX_HID);
+    for (int i = threadIdx.x; i < 64; i += blockDim.x) {
+        const int p = i < cnt ? (int)plan[CX_PLAN_LIST + m0 + i] : -1;
+        const int t = p < 0 ? 0 : (shared ? p - T * CX_TOPK : p / CX_TOPK);
+        pair_s[i] = p;
+        xrow_s[i] = p < 0 ? nullptr : xq + (size_t)t * CX_HID;
+        xd_s[i] = p < 0 ? nullptr : xdb + (size_t)t * (CX_HID / 32);
+    }
+    __syncthreads();
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gq = lane >> 2, tig = lane & 3;
+    const int r0 = (blockIdx.x * 8 + warp) * 16;
+    const ExW& m = shared ? (r0 < CX_FF ? sg : su) : (r0 < CX_FF ? g : u);
+    const int ro = r0 < CX_FF ? r0 : r0 - CX_FF;
+    const unsigned char* wa = (const unsigned char*)m.base + (size_t)e * m.estride + (size_t)(ro + gq) * m.row_bytes;
+    const unsigned char* wb = wa + (size_t)8 * m.row_bytes;
+    const unsigned char* xr[8];
+    #pragma unroll
+    for (int c = 0; c < 8; c++) xr[c] = xrow_s[c * 8 + gq];
+    float acc[8][4];
+    #pragma unroll
+    for (int c = 0; c < 8; c++) acc[c][0] = acc[c][1] = acc[c][2] = acc[c][3] = 0.f;
+    gemm_tile_any<CX_HID>(m.ty, wa, wb, xr, xd_s, nch, acc);
+    #pragma unroll
+    for (int c = 0; c < 8; c++) {
+        if (c >= nch) break;
+        #pragma unroll
+        for (int j = 0; j < 2; j++) {
+            const int p = pair_s[c * 8 + 2 * tig + j];
+            if (p < 0) continue;
+            out[(size_t)p * 2 * CX_FF + r0 + gq] = acc[c][j];
+            out[(size_t)p * 2 * CX_FF + r0 + gq + 8] = acc[c][2 + j];
+        }
+    }
+}
+
+// Down: rows HID of the expert's down matrix, K = FF, columns the group's pairs (their int8 h
+// from cx_silu_q: codes [CX_NP][FF], then scales [CX_NP][FF / 32]).
+extern "C" __global__ void __launch_bounds__(256) cx_moe_gemm_down(ExW d, ExW sd, const unsigned* ids,
+                                                                   const unsigned char* hq, float* out, int T,
+                                                                   const unsigned* plan) {
+    __shared__ const unsigned char* xrow_s[64];
+    __shared__ const float* xd_s[64];
+    __shared__ int pair_s[64];
+    const int gi = blockIdx.y;
+    if (gi >= (int)plan[0]) return;
+    const int a = plan[1 + gi], b = plan[2 + gi];
+    const int m0 = a + blockIdx.z * 64;
+    if (m0 >= b) return;
+    const int cnt = min(64, b - m0), nch = (cnt + 7) / 8;
+    const int p0 = plan[CX_PLAN_LIST + a];
+    const bool shared = p0 >= T * CX_TOPK;
+    const unsigned e = shared ? 0u : ids[p0];
+    const float* hd = (const float*)(hq + (size_t)CX_NP * CX_FF);
+    for (int i = threadIdx.x; i < 64; i += blockDim.x) {
+        const int p = i < cnt ? (int)plan[CX_PLAN_LIST + m0 + i] : -1;
+        pair_s[i] = p;
+        xrow_s[i] = p < 0 ? nullptr : hq + (size_t)p * CX_FF;
+        xd_s[i] = p < 0 ? nullptr : hd + (size_t)p * (CX_FF / 32);
+    }
+    __syncthreads();
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gq = lane >> 2, tig = lane & 3;
+    const int r0 = (blockIdx.x * 8 + warp) * 16;
+    const ExW& m = shared ? sd : d;
+    const unsigned char* wa = (const unsigned char*)m.base + (size_t)e * m.estride + (size_t)(r0 + gq) * m.row_bytes;
+    const unsigned char* wb = wa + (size_t)8 * m.row_bytes;
+    const unsigned char* xr[8];
+    #pragma unroll
+    for (int c = 0; c < 8; c++) xr[c] = xrow_s[c * 8 + gq];
+    float acc[8][4];
+    #pragma unroll
+    for (int c = 0; c < 8; c++) acc[c][0] = acc[c][1] = acc[c][2] = acc[c][3] = 0.f;
+    gemm_tile_any<CX_FF>(m.ty, wa, wb, xr, xd_s, nch, acc);
+    #pragma unroll
+    for (int c = 0; c < 8; c++) {
+        if (c >= nch) break;
+        #pragma unroll
+        for (int j = 0; j < 2; j++) {
+            const int p = pair_s[c * 8 + 2 * tig + j];
+            if (p < 0) continue;
+            out[(size_t)p * CX_HID + r0 + gq] = acc[c][j];
+            out[(size_t)p * CX_HID + r0 + gq + 8] = acc[c][2 + j];
+        }
+    }
+}
+
 // ---- K-split dense GEMV ----
 // A block of 8 warps handles 2 rows; the 4 warps of a row each take a contiguous quarter of k
 // (k % 1024 == 0) and their partial sums are added in warp order. Same segments, outputs and

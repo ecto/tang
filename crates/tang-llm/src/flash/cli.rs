@@ -1421,12 +1421,18 @@ pub fn wide_check(args: &[String]) -> Result<()> {
         .unwrap_or(256);
     let mut e = load_coder(&a)?;
     ensure!(e.temperature == 0.0, "wide-check is greedy");
-    let decode = |e: &mut Coder, slot: usize, mut next: u32| -> Result<(Vec<u32>, Vec<f32>)> {
+    // Free-running greedy decode, or (`forced`) fed these tokens instead of its own picks.
+    let decode = |e: &mut Coder,
+                  slot: usize,
+                  mut next: u32,
+                  forced: Option<&[u32]>|
+     -> Result<(Vec<u32>, Vec<f32>)> {
         let (mut toks, mut lg) = (Vec::new(), Vec::new());
-        for _ in 0..steps {
-            next = e.decode_batch(&[(slot, next)])?[0];
+        for i in 0..steps {
+            let got = e.decode_batch(&[(slot, next)])?[0];
             lg.extend_from_slice(&e.logits(1));
-            toks.push(next);
+            toks.push(got);
+            next = forced.map_or(got, |f| f[i]);
         }
         Ok((toks, lg))
     };
@@ -1443,17 +1449,22 @@ pub fn wide_check(args: &[String]) -> Result<()> {
         let t0 = std::time::Instant::now();
         let n1 = e.prefill_slot(s1, &ids)?;
         let narrow = t0.elapsed().as_secs_f64();
-        let (t1, l1) = decode(&mut e, s1, n1)?;
+        let (t1, l1) = decode(&mut e, s1, n1, None)?;
         e.free_slot(s1);
         let mut wide = Vec::new();
         let mut got = None;
+        let mut forced = None;
         for _ in 0..2 {
             let s2 = e.alloc_slot()?;
             let t0 = std::time::Instant::now();
             let n2 = e.prefill_wide(s2, &ids)?;
             wide.push(t0.elapsed().as_secs_f64());
             if got.is_none() {
-                got = Some((n2, decode(&mut e, s2, n2)?));
+                got = Some((n2, decode(&mut e, s2, n2, None)?));
+            } else {
+                // Teacher-forced on the narrow run's tokens: the logits measure the state
+                // (K/V, GDN) the wide prefill left against narrow's.
+                forced = Some(decode(&mut e, s2, n1, Some(&t1))?.1);
             }
             e.free_slot(s2);
         }
@@ -1466,7 +1477,27 @@ pub fn wide_check(args: &[String]) -> Result<()> {
             .zip(&l2)
             .filter(|(x, y)| x.to_bits() != y.to_bits())
             .count();
-        let ok = n1 == n2 && t1 == t2 && bits == 0;
+        let v = e.hp.n_vocab;
+        let kl = |p: &[f32], q: &[f32]| -> f64 {
+            let ls = |l: &[f32]| -> Vec<f64> {
+                let m = l.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
+                let z = l.iter().map(|&x| (x as f64 - m).exp()).sum::<f64>().ln() + m;
+                l.iter().map(|&x| x as f64 - z).collect()
+            };
+            (0..p.len() / v)
+                .map(|r| {
+                    let (a, b) = (ls(&p[r * v..(r + 1) * v]), ls(&q[r * v..(r + 1) * v]));
+                    a.iter()
+                        .zip(&b)
+                        .map(|(x, y)| x.exp() * (x - y))
+                        .sum::<f64>()
+                })
+                .fold(0.0, f64::max)
+        };
+        let max_kl = forced.as_ref().map_or(0.0, |f| kl(&l1, f));
+        // Bitwise (grouped decode kernels), or the GEMM bar: same greedy tokens, KL <= 1e-3.
+        let ok = n1 == n2 && t1 == t2 && (bits == 0 || max_kl <= 1e-3);
+        println!("  teacher-forced max KL(narrow || wide) over {steps} steps: {max_kl:.2e}");
         println!(
             "prefill {len} tokens: narrow {:.2} s ({:.0} tok/s), wide {:.2} s cold / {:.2} s warm ({:.0} tok/s)",
             narrow,
@@ -1477,7 +1508,7 @@ pub fn wide_check(args: &[String]) -> Result<()> {
         );
         println!(
             "wide-check {len}: {} (next token {}, {steps} decoded tokens {}, logits differ in {bits} of {})",
-            if ok { "PASS (bitwise)" } else { "FAIL" },
+            if !ok { "FAIL" } else if bits == 0 { "PASS (bitwise)" } else { "PASS (greedy equal, KL <= 1e-3)" },
             if n1 == n2 { "equal" } else { "DIFFERS" },
             if t1 == t2 { "equal" } else { "DIFFER" },
             l1.len()

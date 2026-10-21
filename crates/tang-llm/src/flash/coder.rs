@@ -99,6 +99,9 @@ struct Variants {
     /// SiLU(gate) * up and its int8 made inside the direct down kernels (`_d2f` / `_d4f`) instead
     /// of a `cx_silu_q` launch a layer; `TANG_CODER_FUSE_SILU=0` keeps the launch. Bitwise equal.
     fuse_silu: bool,
+    /// Wide windows run the experts as a tensor-core GEMM (`cx_moe_gemm_*`) instead of the
+    /// grouped decode kernels; `TANG_CODER_WGEMM=0` for those (bitwise narrow).
+    wgemm: bool,
 }
 
 impl Default for Variants {
@@ -110,6 +113,7 @@ impl Default for Variants {
             grouped: false,
             moe: usize::MAX,
             fuse_silu: true,
+            wgemm: true,
         }
     }
 }
@@ -125,6 +129,7 @@ impl Variants {
             grouped: env_is("TANG_CODER_GROUPED", "1"),
             moe: num("TANG_CODER_MOE").map_or(d.moe, |v| v as usize),
             fuse_silu: !env_is("TANG_CODER_FUSE_SILU", "0"),
+            wgemm: !env_is("TANG_CODER_WGEMM", "0"),
         }
     }
 }
@@ -265,6 +270,9 @@ struct Kern {
     moe_down_db: Fun,
     moe_gu_g: Fun,
     moe_down_g: Fun,
+    /// Tensor-core grouped expert GEMM (wide windows).
+    moe_gemm_gu: Fun,
+    moe_gemm_down: Fun,
     moe_add_norm: Fun,
     prep: Fun,
     part: Fun,
@@ -303,6 +311,8 @@ impl Kern {
             moe_down_db: f("cx_moe_down_db")?,
             moe_gu_g: f("cx_moe_gu_g")?,
             moe_down_g: f("cx_moe_down_g")?,
+            moe_gemm_gu: f("cx_moe_gemm_gu")?,
+            moe_gemm_down: f("cx_moe_gemm_down")?,
             moe_add_norm: f("cx_moe_add_norm")?,
             prep: f("cx_attn_prep")?,
             part: f("cx_attn_part")?,
@@ -849,6 +859,8 @@ impl Coder {
             moe_down_db: f(&cm, "cx_moe_down_db")?,
             moe_gu_g: f(&cm, "cx_moe_gu_g")?,
             moe_down_g: f(&cm, "cx_moe_down_g")?,
+            moe_gemm_gu: f(&cm, "cx_moe_gemm_gu")?,
+            moe_gemm_down: f(&cm, "cx_moe_gemm_down")?,
             moe_add_norm: f(&cm, "cx_moe_add_norm")?,
             prep: f(&cm, "cx_attn_prep")?,
             part: f(&cm, "cx_attn_part")?,
@@ -1115,6 +1127,9 @@ impl Coder {
                 ..Default::default()
             };
             next = self.run_staged(st, w0, t, false, nchunk, 1, None)?[t - 1];
+            if (pos + t) % 1024 < t && std::env::var("TANG_WIDE_TIMES").is_ok_and(|v| v == "1") {
+                eprintln!("narrow prefill at {}", pos + t);
+            }
             pos += t;
         }
         Ok(next)
@@ -1381,6 +1396,8 @@ impl Coder {
             (k.moe_plan, "route"),
             (k.moe_gu_g, "moe_gu"),
             (k.moe_down_g, "moe_down"),
+            (k.moe_gemm_gu, "moe_gu"),
+            (k.moe_gemm_down, "moe_down"),
             (k.moe_add_norm, "moe_add_norm"),
             (k.prep, "attn_prep"),
             (k.part, "attn_part"),
@@ -1884,14 +1901,28 @@ impl Coder {
                     0,
                     tang_moe::args![ids, ti, pb, ni, plan],
                 );
-                self.launch_on(
-                    stream,
-                    self.kn().moe_gu_g,
-                    ((2 * ff / 16) as u32, groups, 1),
-                    256,
-                    (16 * 16 * r16g) as u32,
-                    tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti, r16g, fastk, plan],
-                );
+                // Wide windows: the tensor-core GEMM, 128 rows × 64 of a group's tokens a block.
+                let gemm = self.in_wide.get() && self.var.wgemm;
+                let tiles = t.div_ceil(64) as u32;
+                if gemm {
+                    self.launch_on(
+                        stream,
+                        self.kn().moe_gemm_gu,
+                        ((2 * ff / 128) as u32, groups, tiles),
+                        256,
+                        0,
+                        tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti, plan],
+                    );
+                } else {
+                    self.launch_on(
+                        stream,
+                        self.kn().moe_gu_g,
+                        ((2 * ff / 16) as u32, groups, 1),
+                        256,
+                        (16 * 16 * r16g) as u32,
+                        tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti, r16g, fastk, plan],
+                    );
+                }
                 self.launch_on(
                     stream,
                     self.kn().silu_q,
@@ -1900,14 +1931,25 @@ impl Coder {
                     0,
                     tang_moe::args![egu, hq, pb],
                 );
-                self.launch_on(
-                    stream,
-                    self.kn().moe_down_g,
-                    ((nh / 16) as u32, groups, 1),
-                    256,
-                    (16 * 16 * r16d) as u32,
-                    tang_moe::args![dw, sd, ids, hq, parts, ti, r16d, fastk, plan],
-                );
+                if gemm {
+                    self.launch_on(
+                        stream,
+                        self.kn().moe_gemm_down,
+                        ((nh / 128) as u32, groups, tiles),
+                        256,
+                        0,
+                        tang_moe::args![dw, sd, ids, hq, parts, ti, plan],
+                    );
+                } else {
+                    self.launch_on(
+                        stream,
+                        self.kn().moe_down_g,
+                        ((nh / 16) as u32, groups, 1),
+                        256,
+                        (16 * 16 * r16d) as u32,
+                        tang_moe::args![dw, sd, ids, hq, parts, ti, r16d, fastk, plan],
+                    );
+                }
             }
             return;
         }
