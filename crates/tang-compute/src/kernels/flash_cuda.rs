@@ -1221,6 +1221,45 @@ extern "C" __global__ void __launch_bounds__(512) fl_gdn_conv_step(
     gdn_step_body<true>(S, nullptr, P, stride, DT, SA, NW, Y, T, win, commit, eps, YQ, quant, H0, Wc);
 }
 
+#ifdef GDN_SLOTS
+// Several sequences in one window (the Coder engine's batched decode): segment b is rows
+// SEG[b][0] .. + SEG[b][1] of the window, all of sequence slot SEG[b][2], keeping SEG[b][3] of
+// them on commit. Its recurrent state and conv history are at Stab[slot] / Htab[slot]. Each
+// segment runs exactly as a lone window of its rows would (the same body). Grid (GDN_HV, nseg).
+extern "C" __global__ void __launch_bounds__(512) fl_gdn_conv_step_seg(
+    const u64* __restrict__ Stab, const u64* __restrict__ Htab, const float* __restrict__ P,
+    unsigned int stride, const float* __restrict__ DT, const float* __restrict__ SA,
+    const float* __restrict__ NW, float* __restrict__ Y, const unsigned int* __restrict__ SEG,
+    unsigned int commit, float eps, const float* __restrict__ Wc) {
+    const unsigned int* sg = SEG + blockIdx.y * 4;
+    const unsigned int r0 = sg[0], len = sg[1], slot = sg[2];
+    gdn_step_body<true>((float*)Stab[slot], nullptr, P + (u64)r0 * stride, stride, DT, SA, NW,
+                        Y + (u64)r0 * GDN_V, len, sg + 2, commit, eps, nullptr, 0,
+                        (const float*)Htab[slot], Wc);
+}
+
+// fl_gdn_conv_commit per segment (as above). Grid (ceil(GDN_CONV / 256), nseg), block 256.
+extern "C" __global__ void fl_gdn_conv_commit_seg(const u64* __restrict__ Htab, const float* __restrict__ P,
+                                                  unsigned int stride, const unsigned int* __restrict__ SEG) {
+    const unsigned int* sg = SEG + blockIdx.y * 4;
+    const unsigned int r0 = sg[0], len = sg[1], slot = sg[2];
+    unsigned int ch = blockIdx.x * 256 + threadIdx.x;
+    if (ch >= GDN_CONV) return;
+    float* H0 = (float*)Htab[slot];
+    const float* Pr = P + (u64)r0 * stride;
+    unsigned int n = min(sg[3], len);
+    float old[3] = {H0[ch], H0[GDN_CONV + ch], H0[2 * GDN_CONV + ch]};
+    float nw[3];
+    #pragma unroll
+    for (unsigned int s = 0; s < 3; s++) {
+        unsigned int e = n + s;
+        nw[s] = e < 3 ? old[e] : Pr[(u64)(e - 3) * stride + ch];
+    }
+    #pragma unroll
+    for (unsigned int s = 0; s < 3; s++) H0[s * GDN_CONV + ch] = nw[s];
+}
+#endif
+
 // ---- MoE ----
 
 // One warp, one token: top-10 by (logit desc, index asc) of `l`, weights e_k / Σ_top e_j with

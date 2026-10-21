@@ -1397,6 +1397,126 @@ pub fn spec_test(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `flash-batch-check` (qwen3next): is a sequence's output independent of the batch it decodes
+/// in? Up to 8 sequences (the prompt truncated by different amounts, so their positions differ)
+/// each decode `-n` greedy tokens alone, then all together in one batched step per token, with
+/// the batch order reversed every other step. Tokens and logits must be bitwise equal. Then
+/// decode speed at 1, 2, 4 and 8 sequences (tok/s aggregate and per stream).
+pub fn batch_check(args: &[String]) -> Result<()> {
+    let a = parse(args)?;
+    let ids = prompt_ids(&a)?;
+    ensure!(ids.len() > 32, "need a longer prompt");
+    let mut e = load_coder(&a)?;
+    ensure!(e.temperature == 0.0, "batch-check is greedy");
+    let v = e.hp.n_vocab;
+    let nb = super::coder::MAX_T.min(8);
+    let seqs: Vec<Vec<u32>> = (0..nb).map(|i| ids[..ids.len() - 3 * i].to_vec()).collect();
+    let steps = a.n.max(8);
+    // Alone.
+    let mut alone: Vec<(Vec<u32>, Vec<f32>)> = Vec::new();
+    for s in &seqs {
+        let slot = e.alloc_slot()?;
+        let mut next = e.prefill_slot(slot, s)?;
+        let (mut toks, mut lg) = (Vec::new(), Vec::new());
+        for _ in 0..steps {
+            let out = e.decode_batch(&[(slot, next)])?;
+            lg.extend_from_slice(&e.logits(1));
+            next = out[0];
+            toks.push(next);
+        }
+        e.free_slot(slot);
+        alone.push((toks, lg));
+    }
+    // Batched.
+    let slots: Vec<usize> = (0..nb).map(|_| e.alloc_slot()).collect::<Result<_>>()?;
+    let mut next: Vec<u32> = Vec::new();
+    for (i, s) in seqs.iter().enumerate() {
+        next.push(e.prefill_slot(slots[i], s)?);
+    }
+    let mut got: Vec<(Vec<u32>, Vec<f32>)> = vec![(Vec::new(), Vec::new()); nb];
+    for step in 0..steps {
+        let order: Vec<usize> = if step % 2 == 0 {
+            (0..nb).collect()
+        } else {
+            (0..nb).rev().collect()
+        };
+        let rows: Vec<(usize, u32)> = order.iter().map(|&i| (slots[i], next[i])).collect();
+        let out = e.decode_batch(&rows)?;
+        let lg = e.logits(nb);
+        for (r, &i) in order.iter().enumerate() {
+            next[i] = out[r];
+            got[i].0.push(out[r]);
+            got[i].1.extend_from_slice(&lg[r * v..(r + 1) * v]);
+        }
+    }
+    for &s in &slots {
+        e.free_slot(s);
+    }
+    let mut ok = true;
+    for i in 0..nb {
+        let tok_eq = alone[i].0 == got[i].0;
+        let bits = alone[i]
+            .1
+            .iter()
+            .zip(&got[i].1)
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
+        println!(
+            "seq {i} (prompt {} tokens): tokens {} , logits differ in {bits} of {} entries",
+            seqs[i].len(),
+            if tok_eq { "identical" } else { "DIFFER" },
+            steps * v
+        );
+        ok &= tok_eq && bits == 0;
+    }
+    // FNV-1a over every batched logit, to compare runs (e.g. TANG_CODER_GROUPED=0 against the
+    // grouped default): equal checksums, equal bits.
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for (_, lg) in &got {
+        for x in lg {
+            h = (h ^ x.to_bits() as u64).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    println!(
+        "batch-check: {} (logits checksum {h:016x})",
+        if ok { "PASS (bitwise)" } else { "FAIL" }
+    );
+    // Speed.
+    for b in [1usize, 2, 4, 8].into_iter().filter(|&b| b <= nb) {
+        let slots: Vec<usize> = (0..b).map(|_| e.alloc_slot()).collect::<Result<_>>()?;
+        let mut next: Vec<u32> = Vec::new();
+        for (i, &s) in slots.iter().enumerate() {
+            next.push(e.prefill_slot(s, &seqs[i])?);
+        }
+        let run = |e: &mut Coder, next: &mut Vec<u32>, n: usize| -> Result<()> {
+            for _ in 0..n {
+                let rows: Vec<(usize, u32)> = slots
+                    .iter()
+                    .zip(next.iter())
+                    .map(|(&s, &t)| (s, t))
+                    .collect();
+                *next = e.decode_batch(&rows)?;
+            }
+            Ok(())
+        };
+        run(&mut e, &mut next, 4)?; // capture the graphs
+        let t0 = std::time::Instant::now();
+        run(&mut e, &mut next, steps)?;
+        let dt = t0.elapsed().as_secs_f64();
+        let agg = (b * steps) as f64 / dt;
+        println!(
+            "batch {b}: {:.2} ms a step, {agg:.0} tok/s aggregate, {:.0} tok/s a stream",
+            dt * 1e3 / steps as f64,
+            agg / b as f64
+        );
+        for &s in &slots {
+            e.free_slot(s);
+        }
+    }
+    ensure!(ok, "batch-check failed");
+    Ok(())
+}
+
 /// `flash-tcheck`: is a token's output independent of the window it is computed in? After a
 /// shared prefix, runs the next 8 tokens as eight T=1 windows, as one T=8 window, and as one
 /// T=8 verify window, each with per-layer probes of the last token, and reports where they
