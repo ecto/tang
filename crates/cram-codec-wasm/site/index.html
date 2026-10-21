@@ -292,13 +292,16 @@ fetch("/examples/rd.json").then((r) => r.json()).then((rd) => {
   let g = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="bits per value vs PSNR">`;
   for (let v = 0; v <= ymax; v++) g += `<line class="ax" x1="${L}" x2="${W - R}" y1="${Y(v)}" y2="${Y(v)}" opacity=".5"/><text x="${L - 8}" y="${Y(v) + 4}" text-anchor="end">${v}</text>`;
   for (let v = 40; v <= 100; v += 20) g += `<text x="${X(v)}" y="${H - 10}" text-anchor="middle">${v} dB</text>`;
-  g += `<text x="${L}" y="${T + 2}" dy="-2">bits / value</text>`;
+  g += `<text x="${L + 6}" y="${T + 4}">bits / value</text>`;
+  const ends = Object.entries(rd.points).map(([k, p]) => [k, Y(p[p.length - 1].bpv)]).sort((a, b) => a[1] - b[1]);
+  const ly = {}; let prev = -1e9;
+  for (const [k, y] of ends) { ly[k] = Math.max(y, prev + 13); prev = ly[k]; }
   for (const [k, pts] of Object.entries(rd.points)) {
     const d = pts.map((p, i) => `${i ? "L" : "M"}${X(p.psnr).toFixed(1)},${Y(p.bpv).toFixed(1)}`).join("");
     const last = pts[pts.length - 1];
     g += `<path class="ln" d="${d}" stroke="${col[k]}" ${k === "cram" ? 'stroke-width="2.5"' : 'opacity=".75"'}/>`;
     g += pts.map((p) => `<circle cx="${X(p.psnr)}" cy="${Y(p.bpv)}" r="${k === "cram" ? 3 : 2}" fill="${col[k]}"/>`).join("");
-    g += `<text class="lbl" x="${X(last.psnr) + 8}" y="${Y(last.bpv) + 4}" style="fill:${col[k]}">${C[k]}</text>`;
+    g += `<text class="lbl" x="${X(last.psnr) + 8}" y="${ly[k] + 4}" style="fill:${col[k]}">${C[k]}</text>`;
   }
   document.getElementById("rd").innerHTML = g + "</svg>";
 }).catch(() => {});
