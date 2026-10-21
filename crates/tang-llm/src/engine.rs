@@ -487,7 +487,14 @@ impl<D: ComputeDevice> Engine<D> {
                 _ => {}
             }
         }
-        for t in ["<|im_end|>", "<|endoftext|>", "<|eot_id|>"] {
+        // gpt-oss (harmony) ends a turn with `<|return|>` and stops for a tool at `<|call|>`.
+        for t in [
+            "<|im_end|>",
+            "<|endoftext|>",
+            "<|eot_id|>",
+            "<|return|>",
+            "<|call|>",
+        ] {
             eos.extend(tok.token_to_id(t));
         }
         eos.sort_unstable();
@@ -1266,7 +1273,7 @@ impl<D: ComputeDevice> Engine<D> {
             decode_from: None,
             constraint,
             sampler: Sampler::new(req.sampling.clone()),
-            parser: Parser::new(opened),
+            parser: Parser::for_tags(&self.tags, opened),
             think: ThinkBudget::new(self.think_tags, req.thinking_budget, opened),
             out: Vec::new(),
             detok: Detok::default(),

@@ -170,6 +170,7 @@ use crate::pool::BufferPool;
 
 mod flash;
 mod llm;
+mod moe;
 
 /// Extended pool diagnostics.
 pub struct PoolStats {
@@ -4719,6 +4720,176 @@ impl ComputeDevice for CudaComputeDevice {
 
     fn swiglu_split(&self, gu: &CudaBuffer, rows: usize, ff: usize) -> CudaBuffer {
         self.gated_split_llm("swiglu_split", gu, rows, ff)
+    }
+
+    fn moe_route(
+        &self,
+        logits: &CudaBuffer,
+        rows: usize,
+        experts: usize,
+        k: usize,
+        router: crate::moe::Router,
+    ) -> (CudaBuffer, CudaBuffer) {
+        (!moe::host_op("route"))
+            .then(|| self.moe_route_llm(logits, rows, experts, k, router))
+            .flatten()
+            .unwrap_or_else(|| {
+                let (ids, w) = crate::moe::route(&self.download(logits), rows, experts, k, router);
+                (self.upload_u32(&ids), self.upload(&w))
+            })
+    }
+
+    fn moe_linear(
+        &self,
+        x: &CudaBuffer,
+        w: &CudaBuffer,
+        fmt: crate::moe::ExpertFmt,
+        experts: usize,
+        bias: Option<&CudaBuffer>,
+        ids: &CudaBuffer,
+        k_top: usize,
+        k: usize,
+        n: usize,
+        per_pick: bool,
+    ) -> CudaBuffer {
+        if let Some(y) = (!moe::host_op("linear"))
+            .then(|| self.moe_linear_llm(x, w, fmt, experts, bias, ids, k_top, k, n, per_pick))
+            .flatten()
+        {
+            return y;
+        }
+        crate::device::moe_linear_default(
+            self, x, w, fmt, experts, bias, ids, k_top, k, n, per_pick,
+        )
+    }
+
+    fn swiglu_clamped(
+        &self,
+        gu: &CudaBuffer,
+        rows: usize,
+        ff: usize,
+        alpha: f32,
+        limit: f32,
+    ) -> CudaBuffer {
+        if moe::host_op("swiglu") {
+            let y = crate::moe::swiglu_clamped(&self.download(gu), rows, ff, alpha, limit);
+            return self.upload(&y);
+        }
+        self.swiglu_clamped_llm(gu, rows, ff, alpha, limit)
+    }
+
+    fn moe_combine(
+        &self,
+        parts: &CudaBuffer,
+        w: &CudaBuffer,
+        rows: usize,
+        k_top: usize,
+        h: usize,
+    ) -> CudaBuffer {
+        if moe::host_op("combine") {
+            let y =
+                crate::moe::moe_combine(&self.download(parts), &self.download(w), rows, k_top, h);
+            return self.upload(&y);
+        }
+        self.moe_combine_llm(parts, w, rows, k_top, h)
+    }
+
+    fn attention_paged_rows_sinks(
+        &self,
+        qkv: &CudaBuffer,
+        cos: &CudaBuffer,
+        sin: &CudaBuffer,
+        k_pool: &mut CudaBuffer,
+        v_pool: &mut CudaBuffer,
+        rows: &crate::PagedRows<CudaBuffer>,
+        shape: (usize, usize, usize),
+        window: usize,
+        sinks: &CudaBuffer,
+    ) -> CudaBuffer {
+        let (nh, nkv, hd) = shape;
+        let (qd, w) = (nh * hd, (nh + 2 * nkv) * hd);
+        let n = rows.pos.len();
+        // Prep each row (RoPE, K/V into its cache), then one sink-attention launch for all.
+        let mut q = self.pool_alloc_uninit_f32(n * qd);
+        for (i, (pages, &pos)) in rows.pages.iter().zip(rows.pos).enumerate() {
+            let row = self.slice_buffer(qkv, i * w, w);
+            let qi = self.attention_prep_paged(
+                &row, None, None, cos, sin, k_pool, v_pool, pages, 1, shape, pos, 0.0,
+            );
+            self.write_into(&mut q, i * qd, &qi);
+        }
+        let sh = rows.pages.first().map_or(0, |p| p.shift());
+        if !moe::host_op("sinks") {
+            if let Some(o) = self.attention_sinks_llm(
+                &q,
+                k_pool,
+                v_pool,
+                rows.tables,
+                sh,
+                0,
+                n,
+                shape,
+                window,
+                sinks,
+                Some((rows.positions, rows.offsets, rows.pos)),
+            ) {
+                return o;
+            }
+        }
+        let mut out = self.pool_alloc_uninit_f32(n * qd);
+        for (i, (pages, &pos)) in rows.pages.iter().zip(rows.pos).enumerate() {
+            let qi = self.slice_buffer(&q, i * qd, qd);
+            let o = self.kv_attention_paged_sinks(
+                &qi, k_pool, v_pool, pages, pos, 1, shape, window, true, sinks,
+            );
+            self.write_into(&mut out, i * qd, &o);
+        }
+        out
+    }
+
+    fn kv_attention_paged_sinks(
+        &self,
+        q: &CudaBuffer,
+        k_pool: &CudaBuffer,
+        v_pool: &CudaBuffer,
+        pages: &crate::Pages<CudaBuffer>,
+        cache_start: usize,
+        q_len: usize,
+        shape: (usize, usize, usize),
+        window: usize,
+        causal: bool,
+        sinks: &CudaBuffer,
+    ) -> CudaBuffer {
+        if causal && !moe::host_op("sinks") {
+            if let Some(o) = self.attention_sinks_llm(
+                q,
+                k_pool,
+                v_pool,
+                pages.table,
+                pages.shift(),
+                cache_start,
+                q_len,
+                shape,
+                window,
+                sinks,
+                None,
+            ) {
+                return o;
+            }
+        }
+        crate::device::kv_attention_paged_sinks_default(
+            self,
+            q,
+            k_pool,
+            v_pool,
+            pages,
+            cache_start,
+            q_len,
+            shape,
+            window,
+            causal,
+            sinks,
+        )
     }
 
     fn rope_half_cached(
