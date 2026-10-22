@@ -1,0 +1,241 @@
+{
+ "dtype": "f32",
+ "endian": "little",
+ "tensors": {
+  "x": {
+   "file": "x.bin",
+   "shape": [
+    12,
+    64
+   ]
+  },
+  "router.weight": {
+   "file": "router_weight.bin",
+   "shape": [
+    16,
+    64
+   ]
+  },
+  "router.bias": {
+   "file": "router_bias.bin",
+   "shape": [
+    16
+   ]
+  },
+  "router_out.weights": {
+   "file": "router_weights.bin",
+   "shape": [
+    12,
+    4
+   ]
+  },
+  "router_out.indices": {
+   "file": "router_indices.bin",
+   "shape": [
+    12,
+    4
+   ]
+  },
+  "experts.gate_up_proj": {
+   "file": "experts_gate_up.bin",
+   "shape": [
+    16,
+    64,
+    64
+   ]
+  },
+  "experts.down_proj": {
+   "file": "experts_down.bin",
+   "shape": [
+    16,
+    64,
+    32
+   ]
+  },
+  "experts_out": {
+   "file": "experts_out.bin",
+   "shape": [
+    12,
+    64
+   ]
+  },
+  "shared.gate_proj": {
+   "file": "shared_gate.bin",
+   "shape": [
+    64,
+    64
+   ]
+  },
+  "shared.up_proj": {
+   "file": "shared_up.bin",
+   "shape": [
+    64,
+    64
+   ]
+  },
+  "shared.down_proj": {
+   "file": "shared_down.bin",
+   "shape": [
+    64,
+    64
+   ]
+  },
+  "shared_out": {
+   "file": "shared_out.bin",
+   "shape": [
+    12,
+    64
+   ]
+  },
+  "moe.experts.gate_up_proj": {
+   "file": "moe_experts_gate_up_proj.bin",
+   "shape": [
+    16,
+    64,
+    64
+   ]
+  },
+  "moe.experts.down_proj": {
+   "file": "moe_experts_down_proj.bin",
+   "shape": [
+    16,
+    64,
+    32
+   ]
+  },
+  "moe.gate.weight": {
+   "file": "moe_gate_weight.bin",
+   "shape": [
+    16,
+    64
+   ]
+  },
+  "moe.shared_experts.gate_proj.weight": {
+   "file": "moe_shared_experts_gate_proj_weight.bin",
+   "shape": [
+    32,
+    64
+   ]
+  },
+  "moe.shared_experts.up_proj.weight": {
+   "file": "moe_shared_experts_up_proj_weight.bin",
+   "shape": [
+    32,
+    64
+   ]
+  },
+  "moe.shared_experts.down_proj.weight": {
+   "file": "moe_shared_experts_down_proj_weight.bin",
+   "shape": [
+    64,
+    32
+   ]
+  },
+  "moe.gate.e_score_correction_bias": {
+   "file": "moe_gate_e_score_correction_bias.bin",
+   "shape": [
+    16
+   ]
+  },
+  "moe_out": {
+   "file": "moe_out.bin",
+   "shape": [
+    12,
+    64
+   ]
+  },
+  "dense.gate_proj.weight": {
+   "file": "dense_gate_proj_weight.bin",
+   "shape": [
+    256,
+    64
+   ]
+  },
+  "dense.up_proj.weight": {
+   "file": "dense_up_proj_weight.bin",
+   "shape": [
+    256,
+    64
+   ]
+  },
+  "dense.down_proj.weight": {
+   "file": "dense_down_proj_weight.bin",
+   "shape": [
+    64,
+    256
+   ]
+  },
+  "dense_out": {
+   "file": "dense_out.bin",
+   "shape": [
+    12,
+    64
+   ]
+  },
+  "dense_l1.gate_proj.weight": {
+   "file": "dense_l1_gate_proj_weight.bin",
+   "shape": [
+    256,
+    64
+   ]
+  },
+  "dense_l1.up_proj.weight": {
+   "file": "dense_l1_up_proj_weight.bin",
+   "shape": [
+    256,
+    64
+   ]
+  },
+  "dense_l1.down_proj.weight": {
+   "file": "dense_l1_down_proj_weight.bin",
+   "shape": [
+    64,
+    256
+   ]
+  },
+  "dense_l1_out": {
+   "file": "dense_l1_out.bin",
+   "shape": [
+    12,
+    64
+   ]
+  },
+  "experts_l1.gate_up_proj": {
+   "file": "experts_l1_gate_up.bin",
+   "shape": [
+    16,
+    64,
+    64
+   ]
+  },
+  "experts_l1.down_proj": {
+   "file": "experts_l1_down.bin",
+   "shape": [
+    16,
+    64,
+    32
+   ]
+  },
+  "experts_l1_out.weights": {
+   "file": "experts_l1_weights.bin",
+   "shape": [
+    12,
+    4
+   ]
+  },
+  "experts_l1_out.indices": {
+   "file": "experts_l1_indices.bin",
+   "shape": [
+    12,
+    4
+   ]
+  },
+  "experts_l1_out": {
+   "file": "experts_l1_out.bin",
+   "shape": [
+    12,
+    64
+   ]
+  }
+ }
+}
