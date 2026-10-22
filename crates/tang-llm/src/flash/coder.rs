@@ -111,7 +111,16 @@ struct Variants {
     /// Which GEMMs (`TANG_CODER_WGEMM=gu` / `down`; anything else: both). For localizing.
     wgemm_gu: bool,
     wgemm_down: bool,
+    /// `TANG_CODER_GDN=chunked`: windows of at least [`GDN_CHUNKED_MIN`] rows (prefill) run the
+    /// GDN recurrence chunkwise (`fl_gdn_chunk_step_seg`, the UT/WY form; CPU reference in
+    /// `gdn_chunked.rs`). Not bitwise: equal to the per-token kernel up to reassociation. Off
+    /// by default.
+    gdn_chunked: bool,
 }
+
+/// The narrowest window the chunked GDN kernel takes (two of its 16-token chunks); decode and
+/// verify windows keep the per-token kernel either way.
+const GDN_CHUNKED_MIN: usize = 32;
 
 impl Default for Variants {
     fn default() -> Self {
@@ -125,6 +134,7 @@ impl Default for Variants {
             wgemm: true,
             wgemm_gu: true,
             wgemm_down: true,
+            gdn_chunked: false,
         }
     }
 }
@@ -143,6 +153,7 @@ impl Variants {
             wgemm: !env_is("TANG_CODER_WGEMM", "0"),
             wgemm_gu: !env_is("TANG_CODER_WGEMM", "down"),
             wgemm_down: !env_is("TANG_CODER_WGEMM", "gu"),
+            gdn_chunked: env_is("TANG_CODER_GDN", "chunked"),
         }
     }
 }
@@ -400,6 +411,7 @@ struct Kern {
     gdn_commit: Fun,
     gdn_step_seg: Fun,
     gdn_commit_seg: Fun,
+    gdn_chunk_seg: Fun,
     copy: Fun,
     argmax1: Fun,
     argmax2: Fun,
@@ -441,6 +453,7 @@ impl Kern {
             gdn_commit: self.gdn_commit,
             gdn_step_seg: self.gdn_step_seg,
             gdn_commit_seg: self.gdn_commit_seg,
+            gdn_chunk_seg: self.gdn_chunk_seg,
             copy: self.copy,
             argmax1: self.argmax1,
             argmax2: self.argmax2,
@@ -937,6 +950,7 @@ impl Coder {
             gdn_commit: f(&fm, "fl_gdn_conv_commit")?,
             gdn_step_seg: f(&fm, "fl_gdn_conv_step_seg")?,
             gdn_commit_seg: f(&fm, "fl_gdn_conv_commit_seg")?,
+            gdn_chunk_seg: f(&fm, "fl_gdn_chunk_step_seg")?,
             copy: f(&em, "fe_copy")?,
             argmax1: f(&em, "fe_argmax1")?,
             argmax2: f(&em, "fe_argmax2")?,
@@ -1406,7 +1420,7 @@ impl Coder {
         );
         for layer in &self.layers {
             if let Some(g) = &layer.gdn {
-                self.gdn_step_seg(g, layer.w_in.rows, nseg, true);
+                self.gdn_step_seg(g, layer.w_in.rows, nseg, true, 0);
                 self.gdn_commit_seg(g, layer.w_in.rows, nseg);
             }
         }
@@ -1711,6 +1725,7 @@ impl Coder {
             (k.gdn_commit, "gdn_commit"),
             (k.gdn_step_seg, "gdn_conv_step"),
             (k.gdn_commit_seg, "gdn_commit"),
+            (k.gdn_chunk_seg, "gdn_conv_step"),
             (k.copy, "copy"),
             (k.argmax1, "argmax"),
             (k.argmax2, "argmax"),
@@ -2021,7 +2036,7 @@ impl Coder {
         if let Some(g) = &layer.gdn {
             let stride = layer.w_in.rows;
             self.gemv("gdn_in", &layer.w_in, x, xq, self.proj(&g.proj), t, stride);
-            self.gdn_step_seg(g, stride, nseg, !verify);
+            self.gdn_step_seg(g, stride, nseg, !verify, t);
             if !verify {
                 self.gdn_commit_seg(g, stride, nseg);
             }
@@ -2158,7 +2173,14 @@ impl Coder {
 
     /// [`gdn_step`](Self::gdn_step) for every segment of the window (`s.rows`): each segment's
     /// rows run against its slot's state and history.
-    fn gdn_step_seg(&self, g: &GdnL, stride: usize, nseg: usize, commit: bool) {
+    /// The GDN conv + recurrence for every segment of a `t`-row window (`t`: 0 when unknown,
+    /// which keeps the per-token kernel).
+    fn gdn_step_seg(&self, g: &GdnL, stride: usize, nseg: usize, commit: bool, t: usize) {
+        let kern = if self.var.gdn_chunked && t >= GDN_CHUNKED_MIN {
+            self.kn().gdn_chunk_seg
+        } else {
+            self.kn().gdn_step_seg
+        };
         let (stab, htab, p, sd, dt, sa, nw, y, seg, cm, eps, wc) = (
             self.a(&g.stab),
             self.a(&g.htab),
@@ -2175,7 +2197,7 @@ impl Coder {
         );
         unsafe {
             self.launch(
-                self.kn().gdn_step_seg,
+                kern,
                 (self.geo.gdn_hv as u32, nseg as u32, 1),
                 512,
                 tang_moe::args![stab, htab, p, sd, dt, sa, nw, y, seg, cm, eps, wc],
